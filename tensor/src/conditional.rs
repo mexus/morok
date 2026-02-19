@@ -33,7 +33,21 @@ impl Tensor {
     /// // result = [0.0, 0.0, 3.0, 4.0]
     /// ```
     pub fn where_(&self, condition: &Tensor, other: &Tensor) -> Result<Self> {
-        let result = UOp::try_where(condition.uop(), self.uop(), other.uop()).context(UOpSnafu)?;
+        use morok_ir::shape::{align_shapes_left, broadcast_shapes};
+
+        let cond_shape = condition.shape()?;
+        let self_shape = self.shape()?;
+        let other_shape = other.shape()?;
+
+        // Broadcast all three to a common shape
+        let aligned = align_shapes_left(&[cond_shape.clone(), self_shape.clone(), other_shape.clone()]);
+        let target = broadcast_shapes(&aligned).context(UOpSnafu)?;
+
+        let cond_bc = condition.broadcast_to(&target)?;
+        let self_bc = self.broadcast_to(&target)?;
+        let other_bc = other.broadcast_to(&target)?;
+
+        let result = UOp::try_where(cond_bc.uop(), self_bc.uop(), other_bc.uop()).context(UOpSnafu)?;
         Ok(Self::new(result))
     }
 

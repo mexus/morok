@@ -3,6 +3,7 @@ pub mod arithmetic;
 pub mod bitwise;
 pub mod broadcast;
 pub mod conditional;
+pub mod indexing;
 pub mod math;
 pub mod matmul;
 pub mod realize_binary;

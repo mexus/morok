@@ -397,6 +397,59 @@ impl Tensor {
         Ok(Tensor::from_slice(&dims))
     }
 
+    /// Shrink (slice) tensor along each dimension.
+    ///
+    /// Each tuple in `ranges` specifies (begin, end) for a dimension.
+    /// Use (0, size) to keep full dimension.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use morok_tensor::Tensor;
+    /// let t = Tensor::from_slice(&[1.0f32, 2.0, 3.0, 4.0, 5.0]);
+    /// let sliced = t.try_shrink(&[(1, 4)])?;  // Elements [2, 3, 4]
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns error if negative indices are used with symbolic shape dimensions.
+    #[track_caller]
+    pub fn try_shrink(&self, ranges: &[(isize, isize)]) -> Result<Tensor> {
+        let shape = self.shape()?;
+
+        // Empty ranges (scalar) → identity
+        if ranges.is_empty() {
+            return Ok(self.clone());
+        }
+
+        // Convert to SInt and handle negative indices
+        let ranges_sint: Vec<(SInt, SInt)> = ranges
+            .iter()
+            .enumerate()
+            .map(|(dim_idx, &(begin, end))| {
+                // Only need dimension size if we have negative indices
+                let (normalized_begin, normalized_end) = if begin < 0 || end < 0 {
+                    let dim_size = shape[dim_idx].as_const().ok_or_else(|| {
+                        Error::SymbolicShapeUnsupported { operation: "shrink with negative indices".to_string() }
+                    })? as isize;
+
+                    let nb = if begin < 0 { dim_size + begin } else { begin };
+                    let ne = if end < 0 { dim_size + end } else { end };
+                    (nb, ne)
+                } else {
+                    (begin, end)
+                };
+
+                Ok((SInt::Const(normalized_begin as usize), SInt::Const(normalized_end as usize)))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        self.uop()
+            .try_shrink(&ranges_sint)
+            .map(|uop| self.with_same_buffer(uop))
+            .context(UOpSnafu)
+    }
+
     // =========================================================================
     // Helper Methods
     // =========================================================================
