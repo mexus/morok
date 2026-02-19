@@ -44,57 +44,27 @@ pub fn tensor_from_proto(tensor: &TensorProto) -> Result<Tensor> {
 
 /// Create Tensor from raw bytes, shape, and dtype.
 fn create_tensor_from_raw(data: &[u8], dims: &[usize], dtype: DType) -> Result<Tensor> {
-    let num_elements: usize = dims.iter().product();
-
-    // Create tensor based on dtype
+    let shape: Vec<isize> = dims.iter().map(|&d| d as isize).collect();
+    macro_rules! typed {
+        ($ty:ty) => {{
+            let values: Vec<$ty> = bytemuck::cast_slice(data).to_vec();
+            Tensor::from_slice(&values).try_reshape(&shape)
+        }};
+    }
     let tensor = match dtype.base() {
-        ScalarDType::Float32 => {
-            let values: Vec<f32> = bytemuck::cast_slice(data).to_vec();
-            if values.len() != num_elements {
-                return Err(Error::ShapeMismatch {
-                    context: "tensor_from_proto".to_string(),
-                    expected: num_elements.to_string(),
-                    actual: values.len().to_string(),
-                });
-            }
-            let t = Tensor::from_slice(&values);
-            // Convert usize to isize for reshape
-            let shape: Vec<isize> = dims.iter().map(|&d| d as isize).collect();
-            t.try_reshape(&shape)
-        }
-        ScalarDType::Float64 => {
-            let values: Vec<f64> = bytemuck::cast_slice(data).to_vec();
-            let t = Tensor::from_slice(&values);
-            let shape: Vec<isize> = dims.iter().map(|&d| d as isize).collect();
-            t.try_reshape(&shape)
-        }
-        ScalarDType::Int32 => {
-            let values: Vec<i32> = bytemuck::cast_slice(data).to_vec();
-            let t = Tensor::from_slice(&values);
-            let shape: Vec<isize> = dims.iter().map(|&d| d as isize).collect();
-            t.try_reshape(&shape)
-        }
-        ScalarDType::Int64 => {
-            let values: Vec<i64> = bytemuck::cast_slice(data).to_vec();
-            let t = Tensor::from_slice(&values);
-            let shape: Vec<isize> = dims.iter().map(|&d| d as isize).collect();
-            t.try_reshape(&shape)
-        }
+        ScalarDType::Float32 => typed!(f32),
+        ScalarDType::Float64 => typed!(f64),
+        ScalarDType::Int32 => typed!(i32),
+        ScalarDType::Int64 => typed!(i64),
         ScalarDType::Bool => {
             // ONNX stores bools as int32
-            let int_values: Vec<i32> = bytemuck::cast_slice(data).to_vec();
-            let bool_values: Vec<bool> = int_values.iter().map(|&v| v != 0).collect();
-            let t = Tensor::from_slice(&bool_values);
-            let shape: Vec<isize> = dims.iter().map(|&d| d as isize).collect();
-            t.try_reshape(&shape)
+            let values: Vec<bool> = bytemuck::cast_slice::<_, i32>(data).iter().map(|&v| v != 0).collect();
+            Tensor::from_slice(&values).try_reshape(&shape)
         }
-        _ => {
-            return Err(Error::IrConstruction {
-                details: format!("Unsupported dtype for tensor creation: {:?}", dtype),
-            });
-        }
+        _ => return Err(Error::IrConstruction {
+            details: format!("Unsupported dtype for tensor creation: {dtype:?}"),
+        }),
     };
-
     tensor.map_err(Error::from)
 }
 
@@ -123,42 +93,34 @@ pub fn extract_tensor_data(tensor: &TensorProto) -> Result<Vec<u8>> {
     Ok(data)
 }
 
-/// Get attribute from NodeProto by name.
 pub fn get_attr<'a>(node: &'a NodeProto, name: &str) -> Option<&'a AttributeProto> {
     node.attribute.iter().find(|a| a.name == name)
 }
 
-/// Get int attribute value.
 pub fn get_attr_int(node: &NodeProto, name: &str, default: i64) -> i64 {
     get_attr(node, name).map(|a| a.i).unwrap_or(default)
 }
 
-/// Get float attribute value.
 pub fn get_attr_float(node: &NodeProto, name: &str, default: f32) -> f32 {
     get_attr(node, name).map(|a| a.f).unwrap_or(default)
 }
 
-/// Get string attribute value as bytes.
 pub fn get_attr_bytes<'a>(node: &'a NodeProto, name: &str) -> Option<&'a [u8]> {
     get_attr(node, name).map(|a| a.s.as_slice())
 }
 
-/// Get string attribute value as String.
 pub fn get_attr_string(node: &NodeProto, name: &str, default: &str) -> String {
     get_attr_bytes(node, name).map(|b| String::from_utf8_lossy(b).into_owned()).unwrap_or_else(|| default.to_string())
 }
 
-/// Get ints attribute value.
 pub fn get_attr_ints(node: &NodeProto, name: &str) -> Vec<i64> {
     get_attr(node, name).map(|a| a.ints.clone()).unwrap_or_default()
 }
 
-/// Get floats attribute value.
 pub fn get_attr_floats(node: &NodeProto, name: &str) -> Vec<f32> {
     get_attr(node, name).map(|a| a.floats.clone()).unwrap_or_default()
 }
 
-/// Get tensor attribute value (reference).
 pub fn get_attr_tensor<'a>(node: &'a NodeProto, name: &str) -> Option<&'a TensorProto> {
     get_attr(node, name).and_then(|a| a.t.as_ref())
 }
@@ -177,18 +139,25 @@ pub struct OpRegistry {
     opsets: Vec<OpSetId>,
 }
 
-/// Extract required input tensor at `idx`. Panics if input is missing (None).
 fn inp(inputs: &[Option<Tensor>], idx: usize) -> &Tensor {
     inputs[idx].as_ref().expect("missing required ONNX input")
 }
 
-/// Parse reduction attributes (axes + keepdims) from ONNX node.
 fn reduce_attrs(node: &NodeProto) -> (AxisSpec, bool) {
     let axes = get_attr_ints(node, "axes");
     let keepdims = get_attr_int(node, "keepdims", 1) == 1;
     let spec =
         if axes.is_empty() { AxisSpec::All } else { AxisSpec::Multiple(axes.iter().map(|&a| a as isize).collect()) };
     (spec, keepdims)
+}
+
+/// Extract concrete i64 values from a tensor (shape/indices/pads inputs).
+fn tensor_to_i64_vec(t: &Tensor) -> Result<Vec<i64>> {
+    let arr = t
+        .cast(DType::Int64)?
+        .to_ndarray::<i64>()
+        .map_err(|e| Error::IrConstruction { details: format!("tensor_to_i64_vec: {e}") })?;
+    Ok(arr.iter().copied().collect())
 }
 
 impl OpRegistry {
@@ -225,6 +194,57 @@ impl OpRegistry {
             "Neg" => inp(inputs, 0).try_neg()?,
             "Abs" => inp(inputs, 0).try_abs()?,
             "Pow" => inp(inputs, 0).try_pow(inp(inputs, 1))?,
+            "Mod" => {
+                let fmod = get_attr_int(node, "fmod", 0);
+                if fmod == 1 {
+                    inp(inputs, 0).try_mod(inp(inputs, 1))?
+                } else {
+                    // fmod=0: x - floor(x/y) * y
+                    let x = inp(inputs, 0);
+                    let y = inp(inputs, 1);
+                    let div = x.try_div(y)?;
+                    let floored = div.floor()?;
+                    let product = floored.try_mul(y)?;
+                    x.try_sub(&product)?
+                }
+            }
+            "Sum" => {
+                let valid: Vec<&Tensor> = inputs.iter().filter_map(Option::as_ref).collect();
+                let first = valid
+                    .first()
+                    .ok_or_else(|| Error::IrConstruction { details: "Sum requires at least one input".into() })?;
+                let mut acc = (*first).clone();
+                for t in &valid[1..] {
+                    acc = acc.try_add(t)?;
+                }
+                acc
+            }
+            "Mean" => {
+                let valid: Vec<&Tensor> = inputs.iter().filter_map(Option::as_ref).collect();
+                let count = valid.len();
+                let first = valid
+                    .first()
+                    .ok_or_else(|| Error::IrConstruction { details: "Mean requires at least one input".into() })?;
+                let mut acc = (*first).clone();
+                for t in &valid[1..] {
+                    acc = acc.try_add(t)?;
+                }
+                acc.try_div(&Tensor::from_slice([count as f32]))?
+            }
+
+            // === Bitwise ===
+            "BitShift" => {
+                let dir = get_attr_string(node, "direction", "");
+                if dir == "LEFT" {
+                    inp(inputs, 0).lshift(inp(inputs, 1))?
+                } else {
+                    inp(inputs, 0).rshift(inp(inputs, 1))?
+                }
+            }
+            "BitwiseAnd" => inp(inputs, 0).bitwise_and(inp(inputs, 1))?,
+            "BitwiseOr" => inp(inputs, 0).bitwise_or(inp(inputs, 1))?,
+            "BitwiseXor" => inp(inputs, 0).bitwise_xor(inp(inputs, 1))?,
+            "BitwiseNot" => inp(inputs, 0).bitwise_not()?,
 
             // === Math ===
             "Sqrt" => inp(inputs, 0).try_sqrt()?,
@@ -251,6 +271,30 @@ impl OpRegistry {
             "LogSoftmax" => {
                 let axis = get_attr_int(node, "axis", -1) as isize;
                 inp(inputs, 0).log_softmax(axis)?
+            }
+            "Gelu" => inp(inputs, 0).gelu()?,
+            "HardSigmoid" => {
+                let alpha = get_attr_float(node, "alpha", 0.2) as f64;
+                let beta = get_attr_float(node, "beta", 0.5) as f64;
+                inp(inputs, 0).hard_sigmoid(alpha, beta)?
+            }
+            "LeakyRelu" => {
+                let alpha = get_attr_float(node, "alpha", 0.01) as f64;
+                inp(inputs, 0).leaky_relu(alpha)?
+            }
+            "PRelu" => inp(inputs, 0).prelu(inp(inputs, 1))?,
+            "ThresholdedRelu" => {
+                let alpha = get_attr_float(node, "alpha", 1.0) as f64;
+                inp(inputs, 0).thresholded_relu(alpha)?
+            }
+            "Elu" => {
+                let alpha = get_attr_float(node, "alpha", 1.0) as f64;
+                inp(inputs, 0).elu(alpha)?
+            }
+            "Selu" => {
+                let alpha = get_attr_float(node, "alpha", 1.6732632) as f64;
+                let gamma = get_attr_float(node, "gamma", 1.0507010) as f64;
+                inp(inputs, 0).selu(alpha, gamma)?
             }
 
             // === Comparison ===
@@ -318,6 +362,26 @@ impl OpRegistry {
                 let (spec, kd) = reduce_attrs(node);
                 inp(inputs, 0).prod_with().axes(spec).keepdim(kd).call()?
             }
+            "ReduceSumSquare" => {
+                let (spec, kd) = reduce_attrs(node);
+                inp(inputs, 0).square()?.sum_with().axes(spec).keepdim(kd).call()?
+            }
+            "ReduceL1" => {
+                let (spec, kd) = reduce_attrs(node);
+                inp(inputs, 0).try_abs()?.sum_with().axes(spec).keepdim(kd).call()?
+            }
+            "ReduceL2" => {
+                let (spec, kd) = reduce_attrs(node);
+                inp(inputs, 0).square()?.sum_with().axes(spec).keepdim(kd).call()?.try_sqrt()?
+            }
+            "ReduceLogSum" => {
+                let (spec, kd) = reduce_attrs(node);
+                inp(inputs, 0).sum_with().axes(spec).keepdim(kd).call()?.try_log()?
+            }
+            "ReduceLogSumExp" => {
+                let (spec, kd) = reduce_attrs(node);
+                inp(inputs, 0).try_exp()?.sum_with().axes(spec).keepdim(kd).call()?.try_log()?
+            }
             "ArgMax" => {
                 let axis = get_attr_int(node, "axis", 0) as isize;
                 let keepdims = get_attr_int(node, "keepdims", 1) == 1;
@@ -333,6 +397,42 @@ impl OpRegistry {
             "MatMul" => inp(inputs, 0).matmul(inp(inputs, 1))?,
             "Gemm" => self.op_gemm(inputs, node)?,
             "BatchNormalization" => self.op_batch_norm(inputs, node)?,
+
+            // === Type ===
+            "CastLike" => inp(inputs, 0).cast(inp(inputs, 1).uop().dtype())?,
+
+            // === Shape (Phase 2) ===
+            "Expand" => self.op_expand(inputs)?,
+            "Pad" => self.op_pad(inputs, node)?,
+            "Slice" => self.op_slice(inputs)?,
+            "Split" => return self.op_split(inputs, node),
+            "Tile" => {
+                let repeats: Vec<usize> =
+                    tensor_to_i64_vec(inp(inputs, 1))?.iter().map(|&v| v as usize).collect();
+                inp(inputs, 0).repeat(&repeats)?
+            }
+            "Range" => {
+                let start = tensor_to_i64_vec(inp(inputs, 0))?[0];
+                let limit = tensor_to_i64_vec(inp(inputs, 1))?[0];
+                let delta = tensor_to_i64_vec(inp(inputs, 2))?[0];
+                Tensor::arange(start, Some(limit), Some(delta))?
+            }
+            "ConstantOfShape" => {
+                let shape: Vec<isize> =
+                    tensor_to_i64_vec(inp(inputs, 0))?.iter().map(|&v| v as isize).collect();
+                let value = get_attr_tensor(node, "value")
+                    .map(tensor_from_proto)
+                    .transpose()?
+                    .unwrap_or_else(|| Tensor::from_slice([0.0f32]));
+                value.try_reshape(&[1])?.try_expand(&shape)?
+            }
+            "Size" => Tensor::from_slice([inp(inputs, 0).numel()? as i64]),
+            "Dropout" => {
+                // Inference mode: return input unchanged + all-true mask
+                let x = inp(inputs, 0).clone();
+                let mask = Tensor::from_slice([true]);
+                return Ok(vec![x, mask]);
+            }
 
             // === Identity / Constant ===
             "Identity" => inp(inputs, 0).clone(),
@@ -350,7 +450,9 @@ impl OpRegistry {
             let shape: Vec<isize> = shape.iter().map(|&d| d as isize).collect();
             Ok(inp(inputs, 0).try_reshape(&shape)?)
         } else if inputs.len() > 1 && inputs[1].is_some() {
-            Err(Error::IrConstruction { details: "Reshape with shape tensor not yet implemented".to_string() })
+            let shape: Vec<isize> =
+                tensor_to_i64_vec(inp(inputs, 1))?.iter().map(|&v| v as isize).collect();
+            Ok(inp(inputs, 0).try_reshape(&shape)?)
         } else {
             Err(Error::IrConstruction { details: "Reshape requires shape attribute or input".to_string() })
         }
@@ -369,89 +471,48 @@ impl OpRegistry {
     fn op_squeeze(&self, inputs: &[Option<Tensor>], node: &NodeProto) -> Result<Tensor> {
         let axes = get_attr_ints(node, "axes");
         if axes.is_empty() {
-            Ok(inp(inputs, 0).try_squeeze(None)?)
-        } else if axes.len() == 1 {
-            Ok(inp(inputs, 0).try_squeeze(Some(axes[0] as isize))?)
-        } else {
-            let mut result = inp(inputs, 0).clone();
-            let mut sorted_axes: Vec<isize> = axes.iter().map(|&a| a as isize).collect();
-            sorted_axes.sort_by(|a, b| b.cmp(a));
-            for axis in sorted_axes {
-                result = result.try_squeeze(Some(axis))?;
-            }
-            Ok(result)
+            return Ok(inp(inputs, 0).try_squeeze(None)?);
         }
+        let mut sorted: Vec<isize> = axes.iter().map(|&a| a as isize).collect();
+        sorted.sort_by(|a, b| b.cmp(a)); // descending to preserve indices
+        sorted.iter().try_fold(inp(inputs, 0).clone(), |t, &ax| Ok(t.try_squeeze(Some(ax))?))
     }
 
     fn op_unsqueeze(&self, inputs: &[Option<Tensor>], node: &NodeProto) -> Result<Tensor> {
         let axes = get_attr_ints(node, "axes");
         if axes.is_empty() {
-            return Err(Error::IrConstruction { details: "Unsqueeze requires axes attribute".to_string() });
+            return Err(Error::IrConstruction { details: "Unsqueeze requires axes attribute".into() });
         }
-        let mut result = inp(inputs, 0).clone();
-        let mut sorted_axes: Vec<isize> = axes.iter().map(|&a| a as isize).collect();
-        sorted_axes.sort();
-        for axis in sorted_axes {
-            result = result.try_unsqueeze(axis)?;
-        }
-        Ok(result)
+        let mut sorted: Vec<isize> = axes.iter().map(|&a| a as isize).collect();
+        sorted.sort(); // ascending for unsqueeze
+        sorted.iter().try_fold(inp(inputs, 0).clone(), |t, &ax| Ok(t.try_unsqueeze(ax)?))
     }
 
     fn op_flatten(&self, inputs: &[Option<Tensor>], node: &NodeProto) -> Result<Tensor> {
         let axis = get_attr_int(node, "axis", 1) as usize;
-        let uop = inp(inputs, 0).uop();
-        let shape = uop
-            .shape()
-            .map_err(|e| Error::IrConstruction { details: format!("Flatten shape error: {e}") })?
-            .ok_or_else(|| Error::IrConstruction { details: "Flatten: no shape".to_string() })?;
-        let dims: Vec<usize> = shape
+        let shape = inp(inputs, 0).shape()?;
+        let pre: isize = shape[..axis]
             .iter()
-            .map(|s| {
-                s.as_const()
-                    .ok_or_else(|| Error::IrConstruction { details: "Flatten requires concrete shape".to_string() })
-            })
-            .collect::<Result<_>>()?;
-
-        if axis == 0 {
-            let total: isize = dims.iter().product::<usize>() as isize;
-            Ok(inp(inputs, 0).try_reshape(&[1, total])?)
-        } else {
-            let pre: isize = dims[..axis].iter().product::<usize>() as isize;
-            let post: isize = dims[axis..].iter().product::<usize>() as isize;
-            Ok(inp(inputs, 0).try_reshape(&[pre, post])?)
-        }
+            .try_fold(1isize, |acc, d| d.as_const().map(|v| acc * v as isize))
+            .ok_or_else(|| Error::IrConstruction { details: "Flatten requires concrete shape".into() })?;
+        Ok(inp(inputs, 0).try_reshape(&[pre, -1])?)
     }
 
     fn op_gemm(&self, inputs: &[Option<Tensor>], node: &NodeProto) -> Result<Tensor> {
         let alpha = get_attr_float(node, "alpha", 1.0);
         let beta = get_attr_float(node, "beta", 1.0);
-        let trans_a = get_attr_int(node, "transA", 0) == 1;
-        let trans_b = get_attr_int(node, "transB", 0) == 1;
-
-        let mut a = inp(inputs, 0).clone();
-        let mut b = inp(inputs, 1).clone();
-
-        if trans_a {
-            a = a.try_transpose(0, 1)?;
-        }
-        if trans_b {
-            b = b.try_transpose(0, 1)?;
-        }
-
+        let a = inp(inputs, 0);
+        let b = inp(inputs, 1);
+        let a = if get_attr_int(node, "transA", 0) == 1 { a.try_transpose(0, 1)? } else { a.clone() };
+        let b = if get_attr_int(node, "transB", 0) == 1 { b.try_transpose(0, 1)? } else { b.clone() };
         let mut result = a.matmul(&b)?;
-
         if alpha != 1.0 {
             result = result.try_mul(&Tensor::from_slice([alpha]))?;
         }
-
         if let Some(c) = inputs.get(2).and_then(|o| o.as_ref()) {
-            let mut c = c.clone();
-            if beta != 1.0 {
-                c = c.try_mul(&Tensor::from_slice([beta]))?;
-            }
+            let c = if beta != 1.0 { c.try_mul(&Tensor::from_slice([beta]))? } else { c.clone() };
             result = result.try_add(&c)?;
         }
-
         Ok(result)
     }
 
@@ -464,6 +525,128 @@ impl OpRegistry {
         let invstd = var_plus_eps.try_rsqrt()?;
 
         Ok(x.batchnorm().scale(scale).bias(bias).mean(mean).invstd(&invstd).call()?)
+    }
+
+    fn op_expand(&self, inputs: &[Option<Tensor>]) -> Result<Tensor> {
+        let data = inp(inputs, 0);
+        let target_shape: Vec<isize> =
+            tensor_to_i64_vec(inp(inputs, 1))?.iter().map(|&v| v as isize).collect();
+        let data_ndim = data.ndim()?;
+
+        // ONNX Expand uses numpy broadcasting: may add leading dimensions
+        let mut result = data.clone();
+        for _ in data_ndim..target_shape.len() {
+            result = result.try_unsqueeze(0)?;
+        }
+
+        // -1 or same-size means keep, otherwise broadcast
+        let cur_shape = result.shape()?;
+        let expand_spec: Vec<isize> = target_shape
+            .iter()
+            .zip(cur_shape.iter())
+            .map(|(&tgt, cur)| {
+                let cur_val = cur.as_const().unwrap_or(1) as isize;
+                if tgt == -1 || tgt == cur_val { -1 } else { tgt }
+            })
+            .collect();
+        Ok(result.try_expand(&expand_spec)?)
+    }
+
+    fn op_pad(&self, inputs: &[Option<Tensor>], node: &NodeProto) -> Result<Tensor> {
+        let pads = tensor_to_i64_vec(inp(inputs, 1))?;
+        let mode = get_attr_string(node, "mode", "constant");
+        if mode != "constant" {
+            return Err(Error::IrConstruction {
+                details: format!("Pad mode '{}' not supported, only 'constant'", mode),
+            });
+        }
+        // ONNX format: [x1_begin, x2_begin, ..., x1_end, x2_end, ...]
+        let ndim = pads.len() / 2;
+        let padding: Vec<(isize, isize)> =
+            (0..ndim).map(|i| (pads[i] as isize, pads[ndim + i] as isize)).collect();
+        Ok(inp(inputs, 0).try_pad(&padding)?)
+    }
+
+    fn op_slice(&self, inputs: &[Option<Tensor>]) -> Result<Tensor> {
+        let data = inp(inputs, 0);
+        let starts = tensor_to_i64_vec(inp(inputs, 1))?;
+        let ends = tensor_to_i64_vec(inp(inputs, 2))?;
+        let shape = data.shape()?;
+        let ndim = shape.len();
+
+        let axes: Vec<usize> = inputs
+            .get(3)
+            .and_then(|o| o.as_ref())
+            .map(|t| tensor_to_i64_vec(t))
+            .transpose()?
+            .map(|v| v.iter().map(|&a| if a < 0 { (ndim as i64 + a) as usize } else { a as usize }).collect())
+            .unwrap_or_else(|| (0..starts.len()).collect());
+
+        let steps: Vec<i64> = inputs
+            .get(4)
+            .and_then(|o| o.as_ref())
+            .map(|t| tensor_to_i64_vec(t))
+            .transpose()?
+            .unwrap_or_else(|| vec![1; starts.len()]);
+
+        for &s in &steps {
+            if s != 1 && s != -1 {
+                return Err(Error::IrConstruction {
+                    details: format!("Slice with step={s} not supported (only 1 and -1)"),
+                });
+            }
+        }
+
+        let mut ranges: Vec<(isize, isize)> =
+            (0..ndim).map(|d| (0isize, shape[d].as_const().unwrap() as isize)).collect();
+        let mut flip_axes: Vec<isize> = Vec::new();
+
+        for (i, &axis) in axes.iter().enumerate() {
+            let d = shape[axis].as_const().unwrap() as i64;
+            let mut s = starts[i].clamp(-d, d);
+            let mut e = ends[i].clamp(-d, d);
+            if s < 0 { s += d; }
+            if e < 0 { e += d; }
+
+            if steps[i] == -1 {
+                flip_axes.push(axis as isize);
+                ranges[axis] = ((d - e) as isize, (d - s) as isize);
+            } else {
+                ranges[axis] = (s as isize, e as isize);
+            }
+        }
+
+        let mut result = data.clone();
+        if !flip_axes.is_empty() {
+            result = result.flip(&flip_axes)?;
+        }
+        Ok(result.try_shrink(&ranges)?)
+    }
+
+    fn op_split(&self, inputs: &[Option<Tensor>], node: &NodeProto) -> Result<Vec<Tensor>> {
+        let axis = get_attr_int(node, "axis", 0) as isize;
+        let data = inp(inputs, 0);
+        let shape = data.shape()?;
+        let ndim = shape.len();
+        let norm_axis = if axis < 0 { (ndim as isize + axis) as usize } else { axis as usize };
+        let dim_size = shape[norm_axis].as_const().unwrap();
+
+        let split_sizes: Vec<usize> =
+            if let Some(split_tensor) = inputs.get(1).and_then(|o| o.as_ref()) {
+                tensor_to_i64_vec(split_tensor)?.iter().map(|&v| v as usize).collect()
+            } else {
+                let n = get_attr_int(node, "num_outputs", 0) as usize;
+                if n == 0 {
+                    return Err(Error::IrConstruction {
+                        details: "Split requires either split input or num_outputs attribute".into(),
+                    });
+                }
+                let mut sizes = vec![dim_size / n; n];
+                sizes[n - 1] += dim_size % n;
+                sizes
+            };
+
+        Ok(data.split(&split_sizes, axis)?)
     }
 
     fn op_constant(&self, node: &NodeProto) -> Result<Tensor> {

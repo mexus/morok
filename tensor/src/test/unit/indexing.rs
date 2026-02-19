@@ -1,0 +1,138 @@
+use crate::*;
+use morok_dtype::DType;
+
+fn get_shape(tensor: &Tensor) -> Vec<usize> {
+    tensor.uop().shape().unwrap().unwrap().iter().map(|s| s.as_const().unwrap()).collect()
+}
+
+// =========================================================================
+// Gather Tests
+// =========================================================================
+
+#[test]
+fn test_gather_1d_basic() {
+    // Gather from 1D tensor
+    let t = Tensor::from_slice([10.0f32, 20.0, 30.0, 40.0, 50.0]);
+    let idx = Tensor::from_slice([2i64, 0, 4]); // Gather elements 2, 0, 4
+
+    // Need to expand index to same rank as input (1D)
+    let result = t.gather(0, &idx).unwrap();
+
+    // Result shape should match index shape
+    assert_eq!(get_shape(&result), vec![3]);
+}
+
+#[test]
+fn test_gather_2d_dim0() {
+    // Input shape [3, 4], index shape [2, 4]
+    let t = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0])
+        .try_reshape(&[3, 4])
+        .unwrap();
+
+    // Index must have same non-gather dim sizes
+    let idx = Tensor::from_slice([0i64, 1, 2, 0, 1, 0, 1, 2]).try_reshape(&[2, 4]).unwrap();
+
+    let result = t.gather(0, &idx).unwrap();
+    assert_eq!(get_shape(&result), vec![2, 4]);
+}
+
+#[test]
+fn test_gather_2d_dim1() {
+    // Input shape [2, 5], index shape [2, 3]
+    let t = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0]).try_reshape(&[2, 5]).unwrap();
+
+    let idx = Tensor::from_slice([0i64, 2, 4, 1, 3, 0]).try_reshape(&[2, 3]).unwrap();
+
+    let result = t.gather(1, &idx).unwrap();
+    assert_eq!(get_shape(&result), vec![2, 3]);
+}
+
+#[test]
+fn test_gather_negative_axis() {
+    let t = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]).try_reshape(&[2, 3]).unwrap();
+
+    let idx = Tensor::from_slice([0i64, 2]).try_reshape(&[2, 1]).unwrap();
+
+    // -1 = last axis
+    let result = t.gather(-1, &idx).unwrap();
+    assert_eq!(get_shape(&result), vec![2, 1]);
+}
+
+#[test]
+fn test_gather_error_rank_mismatch() {
+    let t = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]).try_reshape(&[2, 3]).unwrap();
+
+    // Index has different rank (1D vs 2D)
+    let idx = Tensor::from_slice([0i64, 1]);
+
+    let result = t.gather(0, &idx);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_gather_error_dim_mismatch() {
+    // Input [2, 3], gather along dim=1
+    let t = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]).try_reshape(&[2, 3]).unwrap();
+
+    // Index [3, 2] - non-gather dim 0 has size 3 > input size 2
+    let idx = Tensor::from_slice([0i64, 1, 0, 1, 0, 1]).try_reshape(&[3, 2]).unwrap();
+
+    let result = t.gather(1, &idx);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_gather_dtype_preserved() {
+    let t = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0, 5.0]);
+    let idx = Tensor::from_slice([0i64, 2, 4]);
+
+    let result = t.gather(0, &idx).unwrap();
+
+    // Result should have same dtype as input
+    assert_eq!(result.uop().dtype(), DType::Float32);
+}
+
+// =========================================================================
+// Shrink Tests
+// =========================================================================
+
+#[test]
+fn test_shrink_1d() {
+    let t = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0, 5.0]);
+
+    let sliced = t.try_shrink(&[(1, 4)]).unwrap();
+    assert_eq!(get_shape(&sliced), vec![3]);
+}
+
+#[test]
+fn test_shrink_2d() {
+    let t = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]).try_reshape(&[2, 3]).unwrap();
+
+    let sliced = t.try_shrink(&[(0, 1), (1, 3)]).unwrap();
+    assert_eq!(get_shape(&sliced), vec![1, 2]);
+}
+
+#[test]
+fn test_shrink_negative_indices() {
+    let t = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0, 5.0]);
+
+    // -3 to -1 should give elements [3, 4]
+    let sliced = t.try_shrink(&[(-3, -1)]).unwrap();
+    assert_eq!(get_shape(&sliced), vec![2]);
+}
+
+#[test]
+fn test_shrink_full_dimension() {
+    let t = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]).try_reshape(&[2, 3]).unwrap();
+
+    // Keep full first dim, slice second
+    let sliced = t.try_shrink(&[(0, 2), (1, 3)]).unwrap();
+    assert_eq!(get_shape(&sliced), vec![2, 2]);
+}
+
+#[test]
+fn test_shrink_empty_is_identity() {
+    let t = Tensor::from_slice([1.0f32]);
+    let sliced = t.try_shrink(&[]).unwrap();
+    assert_eq!(get_shape(&sliced), vec![1]);
+}

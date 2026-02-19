@@ -224,6 +224,101 @@ impl Tensor {
         self.uop().try_reshape(&new_shape).map(|uop| self.with_same_buffer(uop)).context(UOpSnafu)
     }
 
+    /// Reverse elements along specified axes.
+    ///
+    /// Each axis in the list is flipped (reversed). Supports negative indexing.
+    ///
+    /// # Examples
+    /// ```ignore
+    /// let t = Tensor::from_slice(&[1.0f32, 2.0, 3.0, 4.0]).try_reshape(&[2, 2])?;
+    /// let flipped = t.flip(&[0])?;  // Flip along axis 0
+    /// ```
+    #[track_caller]
+    pub fn flip(&self, axes: &[isize]) -> Result<Tensor> {
+        let shape = self.shape()?;
+        let ndim = shape.len();
+        let flip_spec: Vec<bool> = (0..ndim)
+            .map(|d| axes.iter().any(|&a| Self::normalize_axis(a, ndim).map_or(false, |na| na == d)))
+            .collect();
+        self.uop().try_flip(flip_spec).map(Self::new).context(UOpSnafu)
+    }
+
+    /// Split tensor into chunks along a dimension.
+    ///
+    /// Returns a vector of tensors, each with the specified size along the split dimension.
+    ///
+    /// # Examples
+    /// ```ignore
+    /// let t = Tensor::from_slice(&[1.0f32, 2.0, 3.0, 4.0, 5.0]);
+    /// let parts = t.split(&[2, 3], 0)?;  // [2] and [3]
+    /// ```
+    #[track_caller]
+    pub fn split(&self, sizes: &[usize], dim: isize) -> Result<Vec<Tensor>> {
+        let shape = self.shape()?;
+        let ndim = shape.len();
+        let dim = Self::normalize_axis(dim, ndim)?;
+        let mut results = Vec::with_capacity(sizes.len());
+        let mut offset = 0usize;
+        for &size in sizes {
+            let ranges: Vec<(isize, isize)> = (0..ndim)
+                .map(|d| {
+                    if d == dim {
+                        (offset as isize, (offset + size) as isize)
+                    } else {
+                        (0, shape[d].as_const().unwrap() as isize)
+                    }
+                })
+                .collect();
+            results.push(self.try_shrink(&ranges)?);
+            offset += size;
+        }
+        Ok(results)
+    }
+
+    /// Repeat tensor along each dimension.
+    ///
+    /// `repeats[i]` is the number of times to repeat along dimension `i`.
+    ///
+    /// # Examples
+    /// ```ignore
+    /// let t = Tensor::from_slice(&[1.0f32, 2.0, 3.0]).try_reshape(&[1, 3])?;
+    /// let tiled = t.repeat(&[3, 2])?;  // Shape [3, 6]
+    /// ```
+    #[track_caller]
+    pub fn repeat(&self, repeats: &[usize]) -> Result<Tensor> {
+        let shape = self.shape()?;
+        let ndim = shape.len();
+        snafu::ensure!(
+            repeats.len() == ndim,
+            ShapeMismatchSnafu {
+                context: "repeat",
+                expected: format!("{} dimensions", ndim),
+                actual: format!("{} repeats", repeats.len())
+            }
+        );
+        let mut result = self.clone();
+        for (dim, &rep) in repeats.iter().enumerate() {
+            if rep == 1 {
+                continue;
+            }
+            let current_shape = result.shape()?;
+            let dim_size = current_shape[dim]
+                .as_const()
+                .ok_or_else(|| Error::SymbolicShapeUnsupported { operation: "repeat".to_string() })?
+                as isize;
+            // Unsqueeze at dim, expand rep times, then reshape to merge
+            result = result.try_unsqueeze(dim as isize)?;
+            let mut expand_shape: Vec<isize> =
+                current_shape.iter().map(|s| s.as_const().unwrap() as isize).collect();
+            expand_shape.insert(dim, rep as isize);
+            result = result.try_expand(&expand_shape)?;
+            expand_shape[dim] = rep as isize * dim_size;
+            expand_shape.remove(dim + 1);
+            result = result.try_reshape(&expand_shape)?;
+        }
+        Ok(result)
+    }
+
     /// Flatten tensor to 1D.
     ///
     /// Reshapes tensor to have a single dimension containing all elements.
@@ -451,26 +546,23 @@ impl Tensor {
     // Helper Methods
     // =========================================================================
 
-    /// Get the shape of this tensor.
-    pub(crate) fn shape(&self) -> Result<Shape> {
+    /// Get the concrete shape of this tensor.
+    pub fn shape(&self) -> Result<Shape> {
         self.uop().shape().context(UOpSnafu)?.cloned().ok_or(Error::ShapeUnknown)
     }
 
-    /// Get the number of dimensions (rank) of this tensor.
-    ///
-    /// This is equivalent to `len(tensor.shape)` in NumPy/PyTorch.
-    ///
-    /// # Examples
-    ///
-    /// ```ignore
-    /// let scalar = Tensor::from_slice([5.0f32]);  // Shape [1]
-    /// assert_eq!(scalar.ndim()?, 1);
-    ///
-    /// let matrix = Tensor::from_slice([1.0f32; 6]).try_reshape(&[2, 3])?;
-    /// assert_eq!(matrix.ndim()?, 2);
-    /// ```
-    pub(crate) fn ndim(&self) -> Result<usize> {
+    /// Get the number of dimensions (rank).
+    pub fn ndim(&self) -> Result<usize> {
         Ok(self.shape()?.len())
+    }
+
+    /// Total number of elements. Fails if any dimension is symbolic.
+    pub fn numel(&self) -> Result<usize> {
+        self.shape()?.iter().try_fold(1usize, |acc, d| {
+            d.as_const()
+                .map(|v| acc * v)
+                .ok_or(Error::SymbolicShapeUnsupported { operation: "numel".into() })
+        })
     }
 
     /// Get the size of a specific dimension.

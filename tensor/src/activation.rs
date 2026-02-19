@@ -216,6 +216,90 @@ impl Tensor {
         half.try_mul(&x_times)
     }
 
+    /// Hard Sigmoid: `clamp(alpha * x + beta, 0, 1)`.
+    ///
+    /// Piecewise linear approximation of sigmoid. Faster to compute.
+    ///
+    /// # Arguments
+    /// * `alpha` - Slope (default 0.2 in ONNX)
+    /// * `beta` - Offset (default 0.5 in ONNX)
+    pub fn hard_sigmoid(&self, alpha: f64, beta: f64) -> Result<Self> {
+        let alpha_t = self.broadcast_scalar(ConstValue::Float(alpha))?;
+        let beta_t = self.broadcast_scalar(ConstValue::Float(beta))?;
+        let zero = self.broadcast_scalar(ConstValue::Float(0.0))?;
+        let one = self.broadcast_scalar(ConstValue::Float(1.0))?;
+        let ax = alpha_t.try_mul(self)?;
+        let axb = ax.try_add(&beta_t)?;
+        // clamp(axb, 0, 1) = max(0, min(1, axb))
+        let clamped_low = axb.maximum(&zero)?;
+        clamped_low.minimum(&one)
+    }
+
+    /// Leaky ReLU: `x if x > 0, alpha * x otherwise`.
+    ///
+    /// # Arguments
+    /// * `alpha` - Negative slope (default 0.01 in ONNX)
+    pub fn leaky_relu(&self, alpha: f64) -> Result<Self> {
+        let zero = self.broadcast_scalar(ConstValue::Int(0))?;
+        let alpha_t = self.broadcast_scalar(ConstValue::Float(alpha))?;
+        let condition = self.try_gt(&zero)?;
+        let neg_branch = alpha_t.try_mul(self)?;
+        self.where_(&condition, &neg_branch)
+    }
+
+    /// PReLU: `x if x > 0, slope * x otherwise`.
+    ///
+    /// Like LeakyReLU but with a learned per-channel slope.
+    pub fn prelu(&self, slope: &Tensor) -> Result<Self> {
+        let zero = self.broadcast_scalar(ConstValue::Int(0))?;
+        let condition = self.try_gt(&zero)?;
+        let neg_branch = self.try_mul(slope)?;
+        self.where_(&condition, &neg_branch)
+    }
+
+    /// Thresholded ReLU: `x if x > alpha, 0 otherwise`.
+    ///
+    /// # Arguments
+    /// * `alpha` - Threshold (default 1.0 in ONNX)
+    pub fn thresholded_relu(&self, alpha: f64) -> Result<Self> {
+        let alpha_t = self.broadcast_scalar(ConstValue::Float(alpha))?;
+        let zero = self.broadcast_scalar(ConstValue::Int(0))?;
+        let condition = self.try_gt(&alpha_t)?;
+        self.where_(&condition, &zero)
+    }
+
+    /// ELU: `x if x > 0, alpha * (exp(x) - 1) otherwise`.
+    ///
+    /// # Arguments
+    /// * `alpha` - Scale for negative part (default 1.0 in ONNX)
+    pub fn elu(&self, alpha: f64) -> Result<Self> {
+        let zero = self.broadcast_scalar(ConstValue::Int(0))?;
+        let one = self.broadcast_scalar(ConstValue::Int(1))?;
+        let alpha_t = self.broadcast_scalar(ConstValue::Float(alpha))?;
+        let condition = self.try_gt(&zero)?;
+        let exp_minus_1 = self.try_exp()?.try_sub(&one)?;
+        let neg_branch = alpha_t.try_mul(&exp_minus_1)?;
+        self.where_(&condition, &neg_branch)
+    }
+
+    /// SELU: `gamma * (alpha * exp(x) - alpha) if x <= 0, gamma * x if x > 0`.
+    ///
+    /// Self-normalizing activation with fixed constants.
+    ///
+    /// # Arguments
+    /// * `alpha` - Default 1.6732632...
+    /// * `gamma` - Default 1.0507010...
+    pub fn selu(&self, alpha: f64, gamma: f64) -> Result<Self> {
+        let zero = self.broadcast_scalar(ConstValue::Int(0))?;
+        let alpha_t = self.broadcast_scalar(ConstValue::Float(alpha))?;
+        let gamma_t = self.broadcast_scalar(ConstValue::Float(gamma))?;
+        let condition = self.try_gt(&zero)?;
+        // neg: alpha * exp(x) - alpha
+        let neg_branch = alpha_t.try_mul(&self.try_exp()?)?.try_sub(&self.broadcast_scalar(ConstValue::Float(alpha))?)?;
+        let selected = self.where_(&condition, &neg_branch)?;
+        gamma_t.try_mul(&selected)
+    }
+
     /// Swish/SiLU activation: `x * sigmoid(x)`.
     ///
     /// Also known as SiLU (Sigmoid Linear Unit).
