@@ -200,6 +200,36 @@ impl<C> Default for SimplifiedPatternMatcher<C> {
     }
 }
 
+impl SimplifiedPatternMatcher<()> {
+    /// Lift a context-free matcher into any context type.
+    ///
+    /// Since `()` patterns ignore the context parameter, they can safely run
+    /// under any `D`. Each closure is re-wrapped to discard `&mut D` and pass
+    /// `&mut ()` to the original. This enables combining context-free matchers
+    /// with context-dependent ones via `+`:
+    ///
+    /// ```ignore
+    /// let mega = symbolic().with_context::<PcontigConfig>()
+    ///     + buffer_removal_with_pcontig(); // TypedPatternMatcher<PcontigConfig>
+    /// ```
+    pub fn with_context<D: 'static + Send + Sync>(self) -> SimplifiedPatternMatcher<D> {
+        let mut result = SimplifiedPatternMatcher::<D>::new();
+        for (key, closures) in self.indexed {
+            for closure in closures {
+                result
+                    .indexed
+                    .entry(key.clone())
+                    .or_default()
+                    .push(Box::new(move |uop: &Arc<UOp>, _ctx: &mut D| closure(uop, &mut ())));
+            }
+        }
+        for closure in self.wildcards {
+            result.wildcards.push(Box::new(move |uop: &Arc<UOp>, _ctx: &mut D| closure(uop, &mut ())));
+        }
+        result
+    }
+}
+
 // Implement Matcher trait for graph_rewrite compatibility
 impl<C> super::Matcher<C> for SimplifiedPatternMatcher<C> {
     fn rewrite(&self, uop: &Arc<UOp>, ctx: &mut C) -> RewriteResult {

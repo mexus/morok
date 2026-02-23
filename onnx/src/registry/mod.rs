@@ -57,13 +57,20 @@ fn create_tensor_from_raw(data: &[u8], dims: &[usize], dtype: DType) -> Result<T
         ScalarDType::Int32 => typed!(i32),
         ScalarDType::Int64 => typed!(i64),
         ScalarDType::Bool => {
-            // ONNX stores bools as int32
-            let values: Vec<bool> = bytemuck::cast_slice::<_, i32>(data).iter().map(|&v| v != 0).collect();
+            // ONNX raw_data stores bools as single bytes; int32_data stores as i32.
+            // Detect format by checking if data is aligned to i32 boundaries.
+            let values: Vec<bool> = if data.len() == dims.iter().product::<usize>() {
+                // 1-byte-per-element (raw_data or extract_tensor_data from int32)
+                data.iter().map(|&v| v != 0).collect()
+            } else {
+                // i32-per-element fallback
+                bytemuck::cast_slice::<_, i32>(data).iter().map(|&v| v != 0).collect()
+            };
             Tensor::from_slice(&values).try_reshape(&shape)
         }
-        _ => return Err(Error::IrConstruction {
-            details: format!("Unsupported dtype for tensor creation: {dtype:?}"),
-        }),
+        _ => {
+            return Err(Error::IrConstruction { details: format!("Unsupported dtype for tensor creation: {dtype:?}") });
+        }
     };
     tensor.map_err(Error::from)
 }
@@ -132,23 +139,60 @@ pub struct OpSetId {
     pub version: i64,
 }
 
-/// Operator registry for dispatching ONNX ops to Morok Tensor operations.
-pub struct OpRegistry {
-    /// Supported opset versions (for future opset version dispatch)
-    #[allow(dead_code)]
-    opsets: Vec<OpSetId>,
+/// Resolve opset version for a domain from the model's opset imports.
+/// Default domain "" is equivalent to "ai.onnx". Returns 1 if not found.
+pub fn onnx_opset_version(opsets: &[OpSetId], domain: &str) -> i64 {
+    let normalized = if domain == "ai.onnx" { "" } else { domain };
+    opsets
+        .iter()
+        .find(|op| {
+            let op_domain = if op.domain == "ai.onnx" { "" } else { op.domain.as_str() };
+            op_domain == normalized
+        })
+        .map(|op| op.version)
+        .unwrap_or(1)
 }
+
+/// Operator registry for dispatching ONNX ops to Morok Tensor operations.
+pub struct OpRegistry;
 
 fn inp(inputs: &[Option<Tensor>], idx: usize) -> &Tensor {
     inputs[idx].as_ref().expect("missing required ONNX input")
 }
 
-fn reduce_attrs(node: &NodeProto) -> (AxisSpec, bool) {
-    let axes = get_attr_ints(node, "axes");
+/// Extract reduce axes and keepdims, opset-aware.
+/// Opset >= 13: axes from input[1] tensor. Opset <= 12: axes from node attribute.
+fn reduce_attrs(node: &NodeProto, inputs: &[Option<Tensor>], opset: i64) -> Result<(AxisSpec, bool)> {
     let keepdims = get_attr_int(node, "keepdims", 1) == 1;
-    let spec =
-        if axes.is_empty() { AxisSpec::All } else { AxisSpec::Multiple(axes.iter().map(|&a| a as isize).collect()) };
-    (spec, keepdims)
+    let default_noop = if opset >= 18 { 1 } else { 0 };
+    let noop_with_empty_axes = get_attr_int(node, "noop_with_empty_axes", default_noop) == 1;
+
+    let axes: Vec<i64> = if opset >= 13 {
+        // Opset 13+: axes from input[1] tensor
+        inputs.get(1).and_then(|o| o.as_ref()).map(tensor_to_i64_vec).transpose()?.unwrap_or_default()
+    } else {
+        // Opset <= 12: axes from attribute
+        get_attr_ints(node, "axes")
+    };
+
+    let spec = if axes.is_empty() {
+        if noop_with_empty_axes {
+            return Ok((AxisSpec::Multiple(vec![]), keepdims));
+        }
+        AxisSpec::All
+    } else {
+        AxisSpec::Multiple(axes.iter().map(|&a| a as isize).collect())
+    };
+    Ok((spec, keepdims))
+}
+
+/// Extract a scalar f64 from a tensor (e.g. constant_value for Pad).
+fn tensor_to_f64_scalar(t: &Tensor) -> Result<f64> {
+    let arr = t
+        .cast(DType::Float64)?
+        .to_ndarray::<f64>()
+        .map_err(|e| Error::IrConstruction { details: format!("tensor_to_f64_scalar: {e}") })?;
+    arr.iter().next().copied().ok_or_else(|| Error::IrConstruction { details: "empty scalar tensor".into() })
 }
 
 /// Extract concrete i64 values from a tensor (shape/indices/pads inputs).
@@ -162,13 +206,14 @@ fn tensor_to_i64_vec(t: &Tensor) -> Result<Vec<i64>> {
 
 impl OpRegistry {
     pub fn new() -> Self {
-        Self { opsets: Vec::new() }
+        Self
     }
 
     /// Dispatch an ONNX operator (convenience for callers with non-optional inputs).
+    /// Uses a default opset version (latest). For opset-aware dispatch, use `dispatch_multi`.
     pub fn dispatch(&self, op_type: &str, domain: &str, inputs: &[Tensor], node: &NodeProto) -> Result<Tensor> {
         let inputs: Vec<Option<Tensor>> = inputs.iter().cloned().map(Some).collect();
-        let outputs = self.dispatch_multi(op_type, domain, &inputs, node)?;
+        let outputs = self.dispatch_multi(op_type, domain, &inputs, node, i64::MAX)?;
         outputs
             .into_iter()
             .next()
@@ -184,13 +229,19 @@ impl OpRegistry {
         domain: &str,
         inputs: &[Option<Tensor>],
         node: &NodeProto,
+        opset_version: i64,
     ) -> Result<Vec<Tensor>> {
         let r = match op_type {
             // === Arithmetic ===
             "Add" => inp(inputs, 0).try_add(inp(inputs, 1))?,
             "Sub" => inp(inputs, 0).try_sub(inp(inputs, 1))?,
             "Mul" => inp(inputs, 0).try_mul(inp(inputs, 1))?,
-            "Div" => inp(inputs, 0).try_div(inp(inputs, 1))?,
+            "Div" => {
+                let x = inp(inputs, 0);
+                let y = inp(inputs, 1);
+                let result = x.try_div(y)?;
+                if x.uop().dtype().is_int() { result.trunc()? } else { result }
+            }
             "Neg" => inp(inputs, 0).try_neg()?,
             "Abs" => inp(inputs, 0).try_abs()?,
             "Pow" => inp(inputs, 0).try_pow(inp(inputs, 1))?,
@@ -265,11 +316,13 @@ impl OpRegistry {
             "Sigmoid" => inp(inputs, 0).sigmoid()?,
             "Tanh" => inp(inputs, 0).tanh()?,
             "Softmax" => {
-                let axis = get_attr_int(node, "axis", -1) as isize;
+                let default_axis = if opset_version < 13 { 1 } else { -1 };
+                let axis = get_attr_int(node, "axis", default_axis) as isize;
                 inp(inputs, 0).softmax(axis)?
             }
             "LogSoftmax" => {
-                let axis = get_attr_int(node, "axis", -1) as isize;
+                let default_axis = if opset_version < 13 { 1 } else { -1 };
+                let axis = get_attr_int(node, "axis", default_axis) as isize;
                 inp(inputs, 0).log_softmax(axis)?
             }
             "Gelu" => inp(inputs, 0).gelu()?,
@@ -293,7 +346,7 @@ impl OpRegistry {
             }
             "Selu" => {
                 let alpha = get_attr_float(node, "alpha", 1.6732632) as f64;
-                let gamma = get_attr_float(node, "gamma", 1.0507010) as f64;
+                let gamma = get_attr_float(node, "gamma", 1.050_701) as f64;
                 inp(inputs, 0).selu(alpha, gamma)?
             }
 
@@ -325,8 +378,8 @@ impl OpRegistry {
             // === Shape ===
             "Reshape" => self.op_reshape(inputs, node)?,
             "Transpose" => self.op_transpose(inputs, node)?,
-            "Squeeze" => self.op_squeeze(inputs, node)?,
-            "Unsqueeze" => self.op_unsqueeze(inputs, node)?,
+            "Squeeze" => self.op_squeeze(inputs, node, opset_version)?,
+            "Unsqueeze" => self.op_unsqueeze(inputs, node, opset_version)?,
             "Flatten" => self.op_flatten(inputs, node)?,
             "Concat" => {
                 let axis = get_attr_int(node, "axis", 0) as isize;
@@ -343,44 +396,55 @@ impl OpRegistry {
 
             // === Reductions ===
             "ReduceSum" => {
-                let (spec, kd) = reduce_attrs(node);
+                let (spec, kd) = reduce_attrs(node, inputs, opset_version)?;
                 inp(inputs, 0).sum_with().axes(spec).keepdim(kd).call()?
             }
             "ReduceMean" => {
-                let (spec, kd) = reduce_attrs(node);
+                let (spec, kd) = reduce_attrs(node, inputs, opset_version)?;
                 inp(inputs, 0).mean_with().axes(spec).keepdim(kd).call()?
             }
             "ReduceMax" => {
-                let (spec, kd) = reduce_attrs(node);
+                let (spec, kd) = reduce_attrs(node, inputs, opset_version)?;
                 inp(inputs, 0).max_with().axes(spec).keepdim(kd).call()?
             }
             "ReduceMin" => {
-                let (spec, kd) = reduce_attrs(node);
+                let (spec, kd) = reduce_attrs(node, inputs, opset_version)?;
                 inp(inputs, 0).min_with().axes(spec).keepdim(kd).call()?
             }
             "ReduceProd" => {
-                let (spec, kd) = reduce_attrs(node);
+                let (spec, kd) = reduce_attrs(node, inputs, opset_version)?;
                 inp(inputs, 0).prod_with().axes(spec).keepdim(kd).call()?
             }
             "ReduceSumSquare" => {
-                let (spec, kd) = reduce_attrs(node);
+                let (spec, kd) = reduce_attrs(node, inputs, opset_version)?;
                 inp(inputs, 0).square()?.sum_with().axes(spec).keepdim(kd).call()?
             }
             "ReduceL1" => {
-                let (spec, kd) = reduce_attrs(node);
+                let (spec, kd) = reduce_attrs(node, inputs, opset_version)?;
                 inp(inputs, 0).try_abs()?.sum_with().axes(spec).keepdim(kd).call()?
             }
             "ReduceL2" => {
-                let (spec, kd) = reduce_attrs(node);
+                let (spec, kd) = reduce_attrs(node, inputs, opset_version)?;
                 inp(inputs, 0).square()?.sum_with().axes(spec).keepdim(kd).call()?.try_sqrt()?
             }
             "ReduceLogSum" => {
-                let (spec, kd) = reduce_attrs(node);
+                let (spec, kd) = reduce_attrs(node, inputs, opset_version)?;
                 inp(inputs, 0).sum_with().axes(spec).keepdim(kd).call()?.try_log()?
             }
             "ReduceLogSumExp" => {
-                let (spec, kd) = reduce_attrs(node);
-                inp(inputs, 0).try_exp()?.sum_with().axes(spec).keepdim(kd).call()?.try_log()?
+                let (spec, kd) = reduce_attrs(node, inputs, opset_version)?;
+                let x = inp(inputs, 0);
+                let max_val = x.max_with().axes(spec.clone()).keepdim(true).call()?;
+                let shifted = x.try_sub(&max_val.broadcast_to(&x.shape()?)?)?;
+                let sum_exp = shifted.try_exp()?.sum_with().axes(spec).keepdim(kd).call()?;
+                let log_val = sum_exp.try_log()?;
+                let max_reduced = if kd {
+                    max_val
+                } else {
+                    let target: Vec<isize> = sum_exp.shape()?.iter().map(|d| d.as_const().unwrap() as isize).collect();
+                    max_val.try_reshape(&target)?
+                };
+                max_reduced.try_add(&log_val)?
             }
             "ArgMax" => {
                 let axis = get_attr_int(node, "axis", 0) as isize;
@@ -407,8 +471,7 @@ impl OpRegistry {
             "Slice" => self.op_slice(inputs)?,
             "Split" => return self.op_split(inputs, node),
             "Tile" => {
-                let repeats: Vec<usize> =
-                    tensor_to_i64_vec(inp(inputs, 1))?.iter().map(|&v| v as usize).collect();
+                let repeats: Vec<usize> = tensor_to_i64_vec(inp(inputs, 1))?.iter().map(|&v| v as usize).collect();
                 inp(inputs, 0).repeat(&repeats)?
             }
             "Range" => {
@@ -418,8 +481,7 @@ impl OpRegistry {
                 Tensor::arange(start, Some(limit), Some(delta))?
             }
             "ConstantOfShape" => {
-                let shape: Vec<isize> =
-                    tensor_to_i64_vec(inp(inputs, 0))?.iter().map(|&v| v as isize).collect();
+                let shape: Vec<isize> = tensor_to_i64_vec(inp(inputs, 0))?.iter().map(|&v| v as isize).collect();
                 let value = get_attr_tensor(node, "value")
                     .map(tensor_from_proto)
                     .transpose()?
@@ -450,8 +512,7 @@ impl OpRegistry {
             let shape: Vec<isize> = shape.iter().map(|&d| d as isize).collect();
             Ok(inp(inputs, 0).try_reshape(&shape)?)
         } else if inputs.len() > 1 && inputs[1].is_some() {
-            let shape: Vec<isize> =
-                tensor_to_i64_vec(inp(inputs, 1))?.iter().map(|&v| v as isize).collect();
+            let shape: Vec<isize> = tensor_to_i64_vec(inp(inputs, 1))?.iter().map(|&v| v as isize).collect();
             Ok(inp(inputs, 0).try_reshape(&shape)?)
         } else {
             Err(Error::IrConstruction { details: "Reshape requires shape attribute or input".to_string() })
@@ -461,15 +522,23 @@ impl OpRegistry {
     fn op_transpose(&self, inputs: &[Option<Tensor>], node: &NodeProto) -> Result<Tensor> {
         let perm = get_attr_ints(node, "perm");
         if perm.is_empty() {
-            Ok(inp(inputs, 0).try_transpose(0, 1)?)
+            // ONNX spec: default is reverse of all dimensions
+            let ndim = inp(inputs, 0).ndim()?;
+            let reversed: Vec<isize> = (0..ndim).rev().map(|i| i as isize).collect();
+            Ok(inp(inputs, 0).try_permute(&reversed)?)
         } else {
             let perm: Vec<isize> = perm.iter().map(|&p| p as isize).collect();
             Ok(inp(inputs, 0).try_permute(&perm)?)
         }
     }
 
-    fn op_squeeze(&self, inputs: &[Option<Tensor>], node: &NodeProto) -> Result<Tensor> {
-        let axes = get_attr_ints(node, "axes");
+    fn op_squeeze(&self, inputs: &[Option<Tensor>], node: &NodeProto, opset: i64) -> Result<Tensor> {
+        let axes: Vec<i64> = if opset >= 13 {
+            // Opset 13+: axes from input[1] tensor
+            inputs.get(1).and_then(|o| o.as_ref()).map(tensor_to_i64_vec).transpose()?.unwrap_or_default()
+        } else {
+            get_attr_ints(node, "axes")
+        };
         if axes.is_empty() {
             return Ok(inp(inputs, 0).try_squeeze(None)?);
         }
@@ -478,11 +547,20 @@ impl OpRegistry {
         sorted.iter().try_fold(inp(inputs, 0).clone(), |t, &ax| Ok(t.try_squeeze(Some(ax))?))
     }
 
-    fn op_unsqueeze(&self, inputs: &[Option<Tensor>], node: &NodeProto) -> Result<Tensor> {
-        let axes = get_attr_ints(node, "axes");
-        if axes.is_empty() {
-            return Err(Error::IrConstruction { details: "Unsqueeze requires axes attribute".into() });
-        }
+    fn op_unsqueeze(&self, inputs: &[Option<Tensor>], node: &NodeProto, opset: i64) -> Result<Tensor> {
+        let axes: Vec<i64> =
+            if opset >= 13 {
+                // Opset 13+: axes from input[1] tensor
+                inputs.get(1).and_then(|o| o.as_ref()).map(tensor_to_i64_vec).transpose()?.ok_or_else(|| {
+                    Error::IrConstruction { details: "Unsqueeze (opset>=13) requires axes input".into() }
+                })?
+            } else {
+                let axes = get_attr_ints(node, "axes");
+                if axes.is_empty() {
+                    return Err(Error::IrConstruction { details: "Unsqueeze requires axes attribute".into() });
+                }
+                axes
+            };
         let mut sorted: Vec<isize> = axes.iter().map(|&a| a as isize).collect();
         sorted.sort(); // ascending for unsqueeze
         sorted.iter().try_fold(inp(inputs, 0).clone(), |t, &ax| Ok(t.try_unsqueeze(ax)?))
@@ -529,8 +607,7 @@ impl OpRegistry {
 
     fn op_expand(&self, inputs: &[Option<Tensor>]) -> Result<Tensor> {
         let data = inp(inputs, 0);
-        let target_shape: Vec<isize> =
-            tensor_to_i64_vec(inp(inputs, 1))?.iter().map(|&v| v as isize).collect();
+        let target_shape: Vec<isize> = tensor_to_i64_vec(inp(inputs, 1))?.iter().map(|&v| v as isize).collect();
         let data_ndim = data.ndim()?;
 
         // ONNX Expand uses numpy broadcasting: may add leading dimensions
@@ -560,11 +637,14 @@ impl OpRegistry {
                 details: format!("Pad mode '{}' not supported, only 'constant'", mode),
             });
         }
+        let pad_value: f64 = match inputs.get(2).and_then(|o| o.as_ref()) {
+            Some(cv) => tensor_to_f64_scalar(cv)?,
+            None => 0.0,
+        };
         // ONNX format: [x1_begin, x2_begin, ..., x1_end, x2_end, ...]
         let ndim = pads.len() / 2;
-        let padding: Vec<(isize, isize)> =
-            (0..ndim).map(|i| (pads[i] as isize, pads[ndim + i] as isize)).collect();
-        Ok(inp(inputs, 0).try_pad(&padding)?)
+        let padding: Vec<(isize, isize)> = (0..ndim).map(|i| (pads[i] as isize, pads[ndim + i] as isize)).collect();
+        Ok(inp(inputs, 0).try_pad_value(&padding, pad_value)?)
     }
 
     fn op_slice(&self, inputs: &[Option<Tensor>]) -> Result<Tensor> {
@@ -577,7 +657,7 @@ impl OpRegistry {
         let axes: Vec<usize> = inputs
             .get(3)
             .and_then(|o| o.as_ref())
-            .map(|t| tensor_to_i64_vec(t))
+            .map(tensor_to_i64_vec)
             .transpose()?
             .map(|v| v.iter().map(|&a| if a < 0 { (ndim as i64 + a) as usize } else { a as usize }).collect())
             .unwrap_or_else(|| (0..starts.len()).collect());
@@ -585,7 +665,7 @@ impl OpRegistry {
         let steps: Vec<i64> = inputs
             .get(4)
             .and_then(|o| o.as_ref())
-            .map(|t| tensor_to_i64_vec(t))
+            .map(tensor_to_i64_vec)
             .transpose()?
             .unwrap_or_else(|| vec![1; starts.len()]);
 
@@ -605,8 +685,12 @@ impl OpRegistry {
             let d = shape[axis].as_const().unwrap() as i64;
             let mut s = starts[i].clamp(-d, d);
             let mut e = ends[i].clamp(-d, d);
-            if s < 0 { s += d; }
-            if e < 0 { e += d; }
+            if s < 0 {
+                s += d;
+            }
+            if e < 0 {
+                e += d;
+            }
 
             if steps[i] == -1 {
                 flip_axes.push(axis as isize);
@@ -631,20 +715,19 @@ impl OpRegistry {
         let norm_axis = if axis < 0 { (ndim as isize + axis) as usize } else { axis as usize };
         let dim_size = shape[norm_axis].as_const().unwrap();
 
-        let split_sizes: Vec<usize> =
-            if let Some(split_tensor) = inputs.get(1).and_then(|o| o.as_ref()) {
-                tensor_to_i64_vec(split_tensor)?.iter().map(|&v| v as usize).collect()
-            } else {
-                let n = get_attr_int(node, "num_outputs", 0) as usize;
-                if n == 0 {
-                    return Err(Error::IrConstruction {
-                        details: "Split requires either split input or num_outputs attribute".into(),
-                    });
-                }
-                let mut sizes = vec![dim_size / n; n];
-                sizes[n - 1] += dim_size % n;
-                sizes
-            };
+        let split_sizes: Vec<usize> = if let Some(split_tensor) = inputs.get(1).and_then(|o| o.as_ref()) {
+            tensor_to_i64_vec(split_tensor)?.iter().map(|&v| v as usize).collect()
+        } else {
+            let n = get_attr_int(node, "num_outputs", 0) as usize;
+            if n == 0 {
+                return Err(Error::IrConstruction {
+                    details: "Split requires either split input or num_outputs attribute".into(),
+                });
+            }
+            let mut sizes = vec![dim_size / n; n];
+            sizes[n - 1] += dim_size % n;
+            sizes
+        };
 
         Ok(data.split(&split_sizes, axis)?)
     }
@@ -821,6 +904,7 @@ mod tests {
     // === Constant Operator Tests ===
 
     #[test]
+    #[tracing_test::traced_test]
     fn test_constant_value_float() {
         let registry = OpRegistry::new();
         let mut node = NodeProto::default();

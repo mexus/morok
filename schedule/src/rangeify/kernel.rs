@@ -228,23 +228,24 @@ pub fn split_store(_ctx: &mut Vec<Arc<UOp>>, x: &Arc<UOp>) -> Option<Arc<UOp>> {
     use super::patterns::{
         local_to_define_global_patterns, movement_op_patterns, pm_syntactic_sugar, rangeify_codegen_patterns,
     };
+    use super::transforms::pm_flatten_range;
     use crate::rewrite::graph_rewrite_bottom_up;
 
     trace!(uop_id = x.id, op = ?std::mem::discriminant(x.op()), "split_store: entering");
 
     // Guard 1: Skip if has non-OUTER ranges (like Tinygrad rangeify.py:482)
-    let has_non_outer = x
-        .in_scope_ranges()
-        .iter()
-        .any(|r| matches!(r.0.op(), Op::Range { axis_type, .. } if *axis_type != AxisType::Outer));
+    #[allow(clippy::mutable_key_type)] // UOp uses Arc<OnceLock> for caching, but keys hash by ID
+    let in_scope = x.in_scope_ranges();
+    let has_non_outer =
+        in_scope.iter().any(|r| matches!(r.0.op(), Op::Range { axis_type, .. } if *axis_type != AxisType::Outer));
     if has_non_outer {
         return None;
     }
 
-    // Guard 2: Skip END where LAST range is OUTER (like Tinygrad rangeify.py:485)
-    // Tinygrad: `if x.op is Ops.END and x.src[1].arg[-1] == AxisType.OUTER: return None`
+    // Guard 2: Skip END where FIRST range is OUTER (like Tinygrad rangeify.py:485)
+    // Tinygrad: `if x.op is Ops.END and x.src[1].arg[0] == AxisType.OUTER: return None`
     if let Op::End { ranges, .. } = x.op()
-        && let Some(r) = ranges.last()
+        && let Some(r) = ranges.first()
         && matches!(r.op(), Op::Range { axis_type: AxisType::Outer, .. })
     {
         return None;
@@ -270,10 +271,11 @@ pub fn split_store(_ctx: &mut Vec<Arc<UOp>>, x: &Arc<UOp>) -> Option<Arc<UOp>> {
         graph_rewrite_bottom_up(&matcher, x.clone(), &mut lctx)
     };
 
-    // 2. movement_op_patterns + pm_syntactic_sugar (pm_mops + pm_syntactic_sugar equivalent)
-    // Tinygrad: graph_rewrite(sink, pm_mops+pm_syntactic_sugar, name="early movement ops", bottom_up=True)
+    // 2. movement_op_patterns + pm_syntactic_sugar + pm_flatten_range (combined pass)
+    // Tinygrad: to_define_global + pm_flatten_range + rangeify_codegen
+    // pm_flatten_range normalizes nested END structures before codegen.
     let ret = {
-        let matcher = movement_op_patterns() + pm_syntactic_sugar();
+        let matcher = movement_op_patterns() + pm_syntactic_sugar() + pm_flatten_range();
         graph_rewrite_bottom_up(&matcher, ret, &mut ())
     };
 
@@ -325,12 +327,8 @@ fn fix_assign(root: &Arc<UOp>) -> Arc<UOp> {
         let buf_id = passthrough.buf_uop().id;
         kernel_assign.insert(buf_id, u.clone());
 
-        // Get kernel from deps (first dep that is a kernel, may be wrapped in End)
-        let Some(kernel) = deps.iter().find_map(|d| match d.op() {
-            Op::Kernel { .. } => Some(d.clone()),
-            Op::End { computation, .. } if matches!(computation.op(), Op::Kernel { .. }) => Some(computation.clone()),
-            _ => None,
-        }) else {
+        // Get kernel from deps
+        let Some(kernel) = deps.iter().find(|d| matches!(d.op(), Op::Kernel { .. })).cloned() else {
             continue;
         };
 
@@ -340,7 +338,7 @@ fn fix_assign(root: &Arc<UOp>) -> Arc<UOp> {
 
         for s in sources {
             // Check kernel sources for buffer dependencies
-            if !matches!(s.op(), Op::Buffer { .. } | Op::DefineGlobal(_) | Op::After { .. }) {
+            if !matches!(s.op(), Op::Buffer { .. }) {
                 continue;
             }
             let s_buf_id = s.buf_uop().id;
@@ -351,9 +349,21 @@ fn fix_assign(root: &Arc<UOp>) -> Arc<UOp> {
                 continue;
             };
 
+            // Same-kernel check (Tinygrad rangeify.py:576: a.src[1] is u.src[1])
+            // Skip if both AFTERs belong to the same kernel — avoids spurious WAR deps
+            // between outputs of the same multi-output kernel.
+            if let Op::After { deps: a_deps, .. } = a.op()
+                && a_deps.iter().any(|ad| deps.iter().any(|ud| Arc::ptr_eq(ad, ud)))
+            {
+                continue;
+            }
+
             // Cycle detection (like Tinygrad rangeify.py:577-578)
             if u.toposort().iter().any(|x| matches!(x.op(), Op::After { .. }) && x.buf_uop().id == s_buf_id) {
-                panic!("cycle detected in graph, kernel for buffer must either depend on AFTER or BUFFER");
+                panic!(
+                    "cycle detected in graph: kernel for buffer {} reads buffer {} which has AFTER in its tree",
+                    buf_id, s_buf_id
+                );
             }
 
             // Add dependency: a.replace(src=a.src+(u,))
@@ -382,18 +392,21 @@ fn fix_assign(root: &Arc<UOp>) -> Arc<UOp> {
 /// # Returns
 /// Returns `(result, KernelContext)` tuple for backward compatibility with 30+ callers.
 pub fn run_kernel_split_pipeline(root: Arc<UOp>) -> (Arc<UOp>, KernelContext) {
-    use super::transforms::pm_add_buffers_local_patterns;
+    use super::transforms::pm_add_buffers_patterns;
     use crate::rewrite::graph_rewrite_bottom_up;
 
-    let ctx = KernelContext::new(); // Keep for compatibility
+    let mut ctx = KernelContext::new();
 
     // Phase 1: bufferize -> store (like Tinygrad rangeify.py:565)
-    // Using pm_add_buffers_local_patterns (allow_locals=true) to create DEFINE_LOCAL
-    // for local address space BUFFERIZE ops. The raw stage (allow_locals=false)
-    // is used in the full optimizer pipeline after filtering.
+    // Use pm_add_buffers (global-only), NOT pm_add_buffers_local.
+    // Local BUFFERIZEs stay as-is here and are converted later during codegen.
+    // This matches Tinygrad where pm_add_buffers runs before split_kernels,
+    // and pm_add_buffers_local runs later in codegen/__init__.py.
+    // Shared KernelContext ensures unique buffer IDs across all BUFFERIZE conversions
+    // (like Tinygrad's ctx=itertools.count(lunique_start)).
     let after_buffers = {
-        let matcher = pm_add_buffers_local_patterns();
-        graph_rewrite_bottom_up(&matcher, root, &mut ())
+        let matcher = pm_add_buffers_patterns();
+        graph_rewrite_bottom_up(&matcher, root, &mut ctx)
     };
 
     trace!(tree = %after_buffers.tree_full(), "after pm_add_buffers");
@@ -416,60 +429,61 @@ pub fn run_kernel_split_pipeline(root: Arc<UOp>) -> (Arc<UOp>, KernelContext) {
 fn split_all_stores(root: &Arc<UOp>) -> Arc<UOp> {
     use morok_ir::UOpKey;
 
-    #[allow(clippy::mutable_key_type)]
-    let mut replacements: HashMap<UOpKey, Arc<UOp>> = HashMap::new();
     let mut ctx = Vec::new();
+    let mut current = root.clone();
 
-    // Find all AFTER nodes that contain STORE/END in their deps
-    for node in root.toposort() {
-        if let Op::After { passthrough, deps } = node.op() {
-            // Transform each dep that is STORE, END(STORE), or BARRIER(END(STORE))
-            let mut new_deps = SmallVec::new();
-            let mut any_changed = false;
+    // Process AFTER nodes from leaves to root (toposort order).
+    // Apply each replacement immediately so that outer AFTERs see updated inner AFTERs.
+    // This is necessary because split_store captures kernel sources from the current tree,
+    // and we need inner AFTERs to already be transformed before the outer END is processed.
+    loop {
+        let mut found_any = false;
 
-            for dep in deps {
-                let transformed_dep = transform_store_to_kernel(dep, &mut ctx);
-                if !Arc::ptr_eq(&transformed_dep, dep) {
-                    any_changed = true;
+        for node in current.toposort() {
+            if let Op::After { passthrough, deps } = node.op() {
+                let mut new_deps = SmallVec::new();
+                let mut any_changed = false;
+
+                for dep in deps {
+                    let transformed_dep = transform_store_to_kernel(dep, &mut ctx);
+                    if !Arc::ptr_eq(&transformed_dep, dep) {
+                        any_changed = true;
+                    }
+                    new_deps.push(transformed_dep);
                 }
-                new_deps.push(transformed_dep);
-            }
 
-            if any_changed {
-                let new_after = passthrough.after(new_deps);
-                replacements.insert(UOpKey(node.clone()), new_after);
+                if any_changed {
+                    let new_after = passthrough.after(new_deps);
+                    #[allow(clippy::mutable_key_type)]
+                    let mut single_replacement: HashMap<UOpKey, Arc<UOp>> = HashMap::new();
+                    single_replacement.insert(UOpKey(node.clone()), new_after);
+                    current = current.substitute(&single_replacement);
+                    found_any = true;
+                    break; // Restart iteration since tree changed
+                }
             }
+        }
+
+        if !found_any {
+            break;
         }
     }
 
-    if replacements.is_empty() { root.clone() } else { root.substitute(&replacements) }
+    current
 }
 
 /// Transform a single STORE/END/BARRIER node into a KERNEL.
 fn transform_store_to_kernel(node: &Arc<UOp>, ctx: &mut Vec<Arc<UOp>>) -> Arc<UOp> {
     match node.op() {
-        Op::Store { .. } => {
-            if let Some(kernel) = split_store(ctx, node) {
-                // Wrap kernel in END for proper structure
-                kernel.end(SmallVec::new())
-            } else {
-                node.clone()
-            }
-        }
-        Op::End { computation, ranges } => {
-            if matches!(computation.op(), Op::Store { .. }) {
-                if let Some(kernel) = split_store(ctx, node) {
-                    // Keep END wrapper with original ranges
-                    kernel.end(ranges.clone())
-                } else {
-                    node.clone()
-                }
+        Op::Store { .. } => split_store(ctx, node).unwrap_or_else(|| node.clone()),
+        Op::End { computation, .. } => {
+            if matches!(computation.op(), Op::Store { .. } | Op::End { .. }) {
+                split_store(ctx, node).unwrap_or_else(|| node.clone())
             } else {
                 node.clone()
             }
         }
         Op::Barrier { src, deps } => {
-            // Recursively transform the barrier source
             let transformed_src = transform_store_to_kernel(src, ctx);
             if Arc::ptr_eq(&transformed_src, src) { node.clone() } else { transformed_src.barrier(deps.clone()) }
         }

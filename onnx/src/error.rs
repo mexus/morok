@@ -30,13 +30,12 @@ pub enum Error {
     EmptyModel,
 
     #[snafu(display("Tensor operation error: {source}"))]
-    Tensor { source: morok_tensor::error::Error },
+    Tensor { source: Box<morok_tensor::error::Error> },
 }
 
-// Implement From for tensor errors
 impl From<morok_tensor::error::Error> for Error {
     fn from(source: morok_tensor::error::Error) -> Self {
-        Error::Tensor { source }
+        Error::Tensor { source: Box::new(source) }
     }
 }
 

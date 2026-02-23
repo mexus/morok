@@ -1511,6 +1511,8 @@ dependencies = [
  "snafu",
  "test-case",
  "tracing",
+ "tracing-subscriber",
+ "tracing-test",
 ]
 
 [[package]]

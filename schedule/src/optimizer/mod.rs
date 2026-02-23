@@ -71,9 +71,13 @@ use crate::gpudims::pm_add_gpudims;
 use crate::passes::pm_linearize_multi_index;
 use crate::rangeify::patterns::{
     pm_add_loads, pm_bool_devectorize, pm_comparison_negations, pm_div_to_shr, pm_fdiv_to_mul, pm_fma_decomposition,
-    pm_mod_to_and, pm_mul_to_shl, pm_neg_from_mul, pm_reduce_devectorize, rangeify_codegen_simple,
+    pm_load_collapse, pm_mod_to_and, pm_mul_to_shl, pm_neg_from_mul, pm_reduce_devectorize,
+    rangeify_codegen_with_kernel_ctx,
 };
 use crate::rangeify::pm_add_buffers_local_patterns;
+use crate::rangeify::transforms::{
+    SplitStoreContext, pm_flatten_range, pm_simplify_ranges, pm_split_ranges, pm_split_store,
+};
 use crate::rewrite::graph_rewrite;
 use crate::symbolic::patterns::{gep_pushing_patterns, symbolic, symbolic_simple};
 use std::sync::Arc;
@@ -128,7 +132,7 @@ pub fn optimize_kernel(ast: Arc<morok_ir::UOp>, renderer: &Renderer) -> Arc<moro
 ///
 /// Called by both heuristic and beam search paths for consistent behavior.
 /// For GPU pipelines, use `apply_post_optimization_with_renderer` to enable GPU dimension injection.
-#[tracing::instrument(skip_all, fields(ast.initial = %ast.tree()))]
+#[tracing::instrument(skip_all, fields(ast.initial = ast.tree()))]
 pub fn apply_post_optimization(ast: Arc<morok_ir::UOp>, devectorize_alu: bool) -> Arc<morok_ir::UOp> {
     apply_post_optimization_with_renderer(ast, devectorize_alu, None)
 }
@@ -144,7 +148,7 @@ pub fn apply_post_optimization(ast: Arc<morok_ir::UOp>, devectorize_alu: bool) -
 /// * `ast` - The kernel AST to optimize
 /// * `devectorize_alu` - If true, convert vector ALU ops to scalar + VECTORIZE
 /// * `renderer` - Optional renderer for GPU dimension injection
-#[tracing::instrument(skip_all, fields(ast.initial = %ast.tree()))]
+#[tracing::instrument(skip_all, fields(ast.initial = ast.tree()))]
 pub fn apply_post_optimization_with_renderer(
     ast: Arc<morok_ir::UOp>,
     devectorize_alu: bool,
@@ -156,7 +160,6 @@ pub fn apply_post_optimization_with_renderer(
     // Must run BEFORE pm_add_loads (which transforms INDEX dtype to Ptr).
     // Uses bottom-up traversal to ensure children are processed before parents.
     let linearized = graph_rewrite(&pm_linearize_multi_index(), ast, &mut ());
-    tracing::debug!(ast.optimized = linearized.tree(), "after pm_linearize_multi_index");
 
     // =========================================================================
     // Stage 8: Post-opt symbolic + WHERE movement (Tinygrad: sym + pm_move_where_on_load)
@@ -182,8 +185,16 @@ pub fn apply_post_optimization_with_renderer(
     // Converts BUFFERIZE(Local) → DEFINE_LOCAL + STORE + LOAD for GROUP_REDUCE.
     // Also strips leftover CONTIGUOUS and NOOP nodes.
     // Must run AFTER expander (which creates BUFFERIZE_LOCAL) and BEFORE pm_reduce.
-    let pm_local_buffers = pm_add_buffers_local_patterns() + rangeify_codegen_simple();
-    let with_local_buffers = graph_rewrite(&pm_local_buffers, expanded, &mut ());
+    //
+    // CRITICAL: Combine pm_add_buffers_local + rangeify_codegen in a SINGLE pass
+    // (like Tinygrad) to ensure CONTIGUOUS is stripped BEFORE bufferize_to_store
+    // sees it. Otherwise CONTIGUOUS(BUFFER) becomes the STORE value directly,
+    // which fails codegen because STORE expects a value, not a buffer pointer.
+    let with_local_buffers = {
+        let mut buf_ctx = crate::rangeify::KernelContext::new();
+        let combined_matcher = pm_add_buffers_local_patterns() + rangeify_codegen_with_kernel_ctx();
+        graph_rewrite(&combined_matcher, expanded, &mut buf_ctx)
+    };
     tracing::debug!(ast.optimized = with_local_buffers.tree(), "Stage 10: after add local buffers");
 
     // pm_reduce: Convert REDUCE → DEFINE_REG + accumulator pattern (Tinygrad devectorizer.py:310-316)
@@ -378,6 +389,58 @@ fn get_late_rewrite_patterns(renderer: Option<&Renderer>) -> crate::TypedPattern
     patterns
 }
 
+/// Apply per-kernel pre-optimization passes.
+///
+/// These stages run BEFORE heuristic/beam optimization, per-kernel
+/// (Tinygrad: inside `full_rewrite_to_sink()`, codegen/__init__.py:28-51).
+///
+/// Stages:
+/// 0. Movement ops + syntactic sugar (`pm_mops + pm_syntactic_sugar`, bottom-up)
+/// 1. Load collapse (`pm_load_collapse`)
+/// 2. Split ranges + flatten (`pm_split_ranges + pm_flatten_range`)
+/// 3. Symbolic + flatten (`sym + pm_flatten_range`)
+/// 4. Simplify ranges (`pm_simplify_ranges`)
+/// 5. Split store (`pm_split_store`, CPU only)
+#[tracing::instrument(skip_all, fields(ast.initial = ast.tree()))]
+pub fn apply_pre_optimization(ast: Arc<morok_ir::UOp>, renderer: &Renderer) -> Arc<morok_ir::UOp> {
+    use crate::rangeify::transforms::SplitRangesContext;
+
+    // Stage 0: Early movement ops (Tinygrad: pm_mops + pm_syntactic_sugar, bottom_up)
+    use crate::rangeify::patterns::{movement_op_patterns, pm_syntactic_sugar};
+    use crate::rewrite::graph_rewrite_bottom_up;
+    let early_mops = movement_op_patterns() + pm_syntactic_sugar();
+    let mut sink = graph_rewrite_bottom_up(&early_mops, ast, &mut ());
+    tracing::debug!(ast.pre = sink.tree(), "pre-opt: movement ops + syntactic sugar complete");
+
+    // Stage 1: Load collapse (Tinygrad: pm_load_collapse)
+    sink = graph_rewrite(&pm_load_collapse(), sink, &mut ());
+    tracing::debug!(ast.pre = sink.tree(), "pre-opt: load collapse complete");
+
+    // Stage 2: Split ranges + flatten (Tinygrad: pm_split_ranges + pm_flatten_range)
+    let mut split_ctx = SplitRangesContext::default();
+    sink = graph_rewrite(&pm_split_ranges(), sink, &mut split_ctx);
+    sink = graph_rewrite(&pm_flatten_range(), sink, &mut ());
+    tracing::debug!(ast.pre = sink.tree(), "pre-opt: split ranges complete");
+
+    // Stage 3: Symbolic + flatten (Tinygrad: sym + pm_flatten_range)
+    let symbolic_with_flatten = symbolic() + pm_flatten_range();
+    sink = graph_rewrite(&symbolic_with_flatten, sink, &mut ());
+    tracing::debug!(ast.pre = sink.tree(), "pre-opt: symbolic + flatten complete");
+
+    // Stage 4: Simplify ranges (Tinygrad: pm_simplify_ranges)
+    sink = graph_rewrite(&pm_simplify_ranges(), sink, &mut ());
+    tracing::debug!(ast.pre = sink.tree(), "pre-opt: simplify ranges complete");
+
+    // Stage 5: Split store (CPU only, Tinygrad: pm_split_store)
+    if renderer.device == "CPU" {
+        let mut split_store_ctx = SplitStoreContext::for_device(morok_device::DeviceSpec::Cpu);
+        sink = graph_rewrite(&pm_split_store(), sink, &mut split_store_ctx);
+        tracing::debug!(ast.pre = sink.tree(), "pre-opt: split store complete");
+    }
+
+    sink
+}
+
 /// Apply optimizations with explicit configuration.
 ///
 /// Use this when you need explicit control over the optimization settings.
@@ -390,14 +453,17 @@ pub fn optimize_kernel_with_config(
     renderer: &Renderer,
     config: &OptimizerConfig,
 ) -> Arc<morok_ir::UOp> {
+    // Pre-optimization: per-kernel stages (Tinygrad: full_rewrite_to_sink)
+    let pre_optimized = apply_pre_optimization(ast, renderer);
+
     let optimized = match config.strategy {
-        OptStrategy::None => ast, // No heuristic optimization, but post-optimization still needed
-        OptStrategy::Heuristic => optimize_heuristic(ast, renderer, &config.heuristics),
+        OptStrategy::None => pre_optimized, // No heuristic optimization, but post-optimization still needed
+        OptStrategy::Heuristic => optimize_heuristic(pre_optimized, renderer, &config.heuristics),
         OptStrategy::Beam { .. } => {
             // Beam search requires a compile_and_time function.
             // Use optimize_kernel_beam() for actual beam search.
             // Fall back to heuristics for the simple API.
-            optimize_heuristic(ast, renderer, &config.heuristics)
+            optimize_heuristic(pre_optimized, renderer, &config.heuristics)
         }
     };
 
@@ -467,8 +533,11 @@ where
     use crate::rewrite::graph_rewrite;
     use crate::symbolic::patterns::symbolic;
 
+    // Step 0: Per-kernel pre-optimization (Tinygrad: full_rewrite_to_sink)
+    let pre_optimized = apply_pre_optimization(ast, renderer);
+
     // Step 1: Symbolic simplification
-    let simplified = graph_rewrite(&symbolic(), ast, &mut ());
+    let simplified = graph_rewrite(&symbolic(), pre_optimized, &mut ());
 
     // Step 2: Create scheduler
     let mut scheduler = Scheduler::new(simplified, renderer.clone());
@@ -494,7 +563,8 @@ where
 ///
 /// A `Scheduler` with loops converted to globals (if applicable).
 pub fn prepare_scheduler(ast: Arc<morok_ir::UOp>, renderer: &Renderer) -> Scheduler {
-    let simplified = graph_rewrite(&symbolic(), ast, &mut ());
+    let pre_optimized = apply_pre_optimization(ast, renderer);
+    let simplified = graph_rewrite(&symbolic(), pre_optimized, &mut ());
     let mut scheduler = Scheduler::new(simplified, renderer.clone());
     let _ = scheduler.convert_loop_to_global(); // GPU: LOOP→GLOBAL
     // Note: Don't apply threading here - let beam search explore THREAD actions naturally.

@@ -49,7 +49,7 @@ use crate::{
 use morok_device::{Buffer, device::Device};
 use morok_dtype::DType;
 use morok_ir::pattern::is_any_const;
-use morok_ir::{AxisId, DeviceSpec, Op, SInt, UOp};
+use morok_ir::{DeviceSpec, Op, UOp};
 use morok_runtime::{
     ExecutionGraph, ExecutionNode, ExecutionPlan, ExecutionPlanBuilder, KernelBufferAccess, ParallelGroup,
     PreparedKernel,
@@ -254,32 +254,17 @@ impl Tensor {
     /// - Kernel compilation fails
     /// - Buffer allocation fails
     pub fn prepare_with(&self, config: &morok_schedule::OptimizerConfig) -> Result<ExecutionPlan> {
-        use morok_ir::AxisType;
-
         let uop = self.uop();
-
-        // Step 1: Create BUFFERIZE wrapping the computation
         let shape = uop.shape().context(UOpSnafu)?.context(ShapeUnknownSnafu)?;
-
-        let ranges: Vec<_> = shape
-            .iter()
-            .enumerate()
-            .map(|(i, dim)| {
-                let end = match dim {
-                    SInt::Const(n) => UOp::index_const(*n as i64),
-                    SInt::Symbolic(var) => var.clone(),
-                };
-                // Use Loop type (not Outer) so ranges are compatible with rangeify.
-                // Outer is for special cases like vmap batching, not normal computation.
-                UOp::range_axis(end, AxisId::Unrenumbered(i), AxisType::Loop)
-            })
-            .collect();
-
         let output_dtype = uop.dtype();
-        let bufferize = UOp::bufferize_global(uop.clone(), ranges);
 
-        // Step 2: Create SINK of the BUFFERIZE
-        let sink = UOp::sink(vec![bufferize]);
+        // Step 1: Mark computation for realization via CONTIGUOUS (Tinygrad approach).
+        // Ranges are NOT pre-created here — the rangeify pipeline assigns them
+        // via consumer-driven propagation in assign_ranges().
+        let contiguous = uop.contiguous();
+
+        // Step 2: Create SINK of the CONTIGUOUS
+        let sink = UOp::sink(vec![contiguous]);
 
         // Step 3: Run rangeify pipeline
         // Note: We track becomes_map but don't apply it globally.
@@ -1078,8 +1063,6 @@ mod tests {
         // Prepare the plan
         let plan = c.prepare().expect("prepare should succeed");
 
-        let count_before_cleanup = crate::tensor_registry::buffer_count();
-
         // Execute multiple times (simulating benchmark loop)
         let mut executor = morok_runtime::global_executor();
         for _ in 0..3 {
@@ -1094,13 +1077,14 @@ mod tests {
             .expect("copyout should succeed");
         assert_eq!(data, vec![5.0, 7.0, 9.0]);
 
-        // Now cleanup
+        // Now cleanup — count how many buffers were actually released
+        let count_before_cleanup = crate::tensor_registry::buffer_count();
         plan.release_intermediate_buffers(crate::tensor_registry::remove_buffer);
-
         let count_after_cleanup = crate::tensor_registry::buffer_count();
 
-        // After cleanup, we should have fewer or equal buffers
-        // (intermediate buffers removed)
+        // release_intermediate_buffers should remove at least one buffer (the output buffer)
+        // or at minimum not increase the count. We check the immediate delta to avoid
+        // interference from parallel tests.
         assert!(
             count_after_cleanup <= count_before_cleanup,
             "Cleanup should not increase buffer count: before={}, after={}",

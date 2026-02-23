@@ -20,13 +20,6 @@ impl Tensor {
         scalar.broadcast_to(&shape)
     }
 
-    /// Helper to broadcast this tensor to a target shape.
-    ///
-    /// Uses the broadcast_to method which supports symbolic shapes.
-    fn broadcast_to_shape(&self, target_shape: &morok_ir::shape::Shape) -> Result<Self> {
-        self.broadcast_to(target_shape)
-    }
-
     /// Rectified Linear Unit: `max(0, x)`.
     ///
     /// ReLU is one of the most common activation functions in deep learning.
@@ -56,14 +49,13 @@ impl Tensor {
     /// // y ≈ [0.119, 0.268, 0.5, 0.731, 0.880]
     /// ```
     pub fn sigmoid(&self) -> Result<Self> {
-        // sigmoid(x) = 1 / (1 + exp(-x))
-        // Equivalent to: (1 + exp(-x)).reciprocal()
-        let neg_x = self.try_neg()?;
-        let exp_neg_x = neg_x.try_exp()?;
-        let one = exp_neg_x.broadcast_scalar(ConstValue::Int(1))?;
-        let denominator = one.try_add(&exp_neg_x)?;
-
-        // Use reciprocal for 1 / denominator
+        // sigmoid(x) = 1 / (1 + exp(-x)) = 1 / (1 + 2^(-x/ln2))
+        // Using exp2 matches Tinygrad's implementation for better hardware mapping.
+        let scale = self.broadcast_scalar(ConstValue::Float(-1.0 / std::f64::consts::LN_2))?;
+        let scaled = self.try_mul(&scale)?;
+        let exp2_val = scaled.try_exp2()?;
+        let one = exp2_val.broadcast_scalar(ConstValue::Int(1))?;
+        let denominator = one.try_add(&exp2_val)?;
         let recip = Self::new(UOp::try_reciprocal(&denominator.uop()).context(UOpSnafu)?);
         Ok(recip)
     }
@@ -110,11 +102,11 @@ impl Tensor {
         // For 1D tensors (most common case), we can simplify
         // softmax(x) = exp(x - max(x)) / sum(exp(x - max(x)))
         let max_val = self.max(axis.clone())?; // Scalar
-        let max_broadcasted = max_val.broadcast_to_shape(&self.shape()?)?;
+        let max_broadcasted = max_val.broadcast_to(&self.shape()?)?;
         let shifted = self.try_sub(&max_broadcasted)?;
         let exp_shifted = shifted.try_exp()?;
         let sum_exp = exp_shifted.sum(axis)?; // Scalar
-        let sum_broadcasted = sum_exp.broadcast_to_shape(&self.shape()?)?;
+        let sum_broadcasted = sum_exp.broadcast_to(&self.shape()?)?;
 
         exp_shifted.try_div(&sum_broadcasted)
     }
@@ -138,8 +130,10 @@ impl Tensor {
         let axis = axis.into();
 
         // log_softmax(x) = x - logsumexp(x, axis)
+        // logsumexp returns reduced shape, so broadcast it back to match x
         let logsumexp = self.logsumexp(axis)?;
-        self.try_sub(&logsumexp)
+        let logsumexp_broadcast = logsumexp.broadcast_to(&self.shape()?)?;
+        self.try_sub(&logsumexp_broadcast)
     }
 
     /// Log-sum-exp: `log(sum(exp(x)))`.
@@ -159,15 +153,14 @@ impl Tensor {
 
         // logsumexp(x) = max(x) + log(sum(exp(x - max(x))))
         let max_val = self.max(axis.clone())?;
-        let max_broadcasted = max_val.broadcast_to_shape(&self.shape()?)?;
+        let max_broadcasted = max_val.broadcast_to(&self.shape()?)?;
         let shifted = self.try_sub(&max_broadcasted)?;
         let exp_shifted = shifted.try_exp()?;
         let sum_exp = exp_shifted.sum(axis)?;
         let log_sum = sum_exp.try_log()?;
 
-        // Result is scalar, broadcast back if needed
-        let result = max_val.try_add(&log_sum)?;
-        result.broadcast_to_shape(&self.shape()?)
+        // Result should have reduced shape (not broadcast back to input shape)
+        max_val.try_add(&log_sum)
     }
 
     /// GELU activation (Gaussian Error Linear Unit).
@@ -293,9 +286,10 @@ impl Tensor {
         let zero = self.broadcast_scalar(ConstValue::Int(0))?;
         let alpha_t = self.broadcast_scalar(ConstValue::Float(alpha))?;
         let gamma_t = self.broadcast_scalar(ConstValue::Float(gamma))?;
-        let condition = self.try_gt(&zero)?;
+        let condition = self.try_ge(&zero)?;
         // neg: alpha * exp(x) - alpha
-        let neg_branch = alpha_t.try_mul(&self.try_exp()?)?.try_sub(&self.broadcast_scalar(ConstValue::Float(alpha))?)?;
+        let neg_branch =
+            alpha_t.try_mul(&self.try_exp()?)?.try_sub(&self.broadcast_scalar(ConstValue::Float(alpha))?)?;
         let selected = self.where_(&condition, &neg_branch)?;
         gamma_t.try_mul(&selected)
     }

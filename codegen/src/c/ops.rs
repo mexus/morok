@@ -10,7 +10,7 @@ use std::sync::Arc;
 use morok_dtype::{DType, ScalarDType};
 use morok_ir::{AxisType, BinaryOp, Op, ReduceOp, TernaryOp, UnaryOp, prelude::*};
 
-use super::types::{c_cast, c_dtype, c_math_fn};
+use super::types::{c_cast, c_const, c_dtype, c_math_fn};
 
 /// Context for C code generation, tracking variable names and SSA inlining.
 pub struct CContext {
@@ -130,7 +130,7 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut CContext, kernel: &mut Vec<String>) 
             Some(())
         }
 
-        Op::Index { buffer, indices, gate } => {
+        Op::Index { buffer, indices, .. } => {
             let buf = ctx.get(buffer).to_string();
 
             if indices.is_empty() {
@@ -138,19 +138,10 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut CContext, kernel: &mut Vec<String>) 
                 ctx.register(uop.id, buf);
             } else {
                 let idx = ctx.get(&indices[0]).to_string();
-
-                if let Some(gate_uop) = gate {
-                    let gate_val = ctx.get(gate_uop).to_string();
-                    let elem_type = match uop.dtype() {
-                        DType::Ptr { ref base, .. } => c_dtype(base),
-                        ref other => c_dtype(other),
-                    };
-                    let expr = format!("({gate_val} ? {buf} + {idx} : ({elem_type}*)0)");
-                    ctx.emit_expr(uop, expr, "idx", kernel);
-                } else {
-                    let expr = format!("{buf} + {idx}");
-                    ctx.emit_expr(uop, expr, "idx", kernel);
-                }
+                // Gate is NOT rendered here — it's handled at LOAD/STORE level.
+                // Tinygrad: INDEX renders as (buf + idx), LOAD checks gate.
+                let expr = format!("{buf} + {idx}");
+                ctx.emit_expr(uop, expr, "idx", kernel);
             }
             Some(())
         }
@@ -166,13 +157,24 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut CContext, kernel: &mut Vec<String>) 
         Op::Load { index, .. } => {
             let idx = ctx.get(index).to_string();
             let load_dtype = uop.dtype();
-            // Buffer pointers are declared as scalar types (e.g., float*) in C,
-            // so vector loads need an explicit pointer cast (e.g., *((float4*)(ptr))).
-            let expr = if load_dtype.vcount() > 1 {
+            // Check if the INDEX source has a gate — render conditional load to avoid null deref.
+            // Tinygrad: LOAD with gated INDEX → (gate ? *(index) : alt_value)
+            let gate_expr = if let Op::Index { gate: Some(gate_uop), .. } = index.op() {
+                Some(ctx.get(gate_uop).to_string())
+            } else {
+                None
+            };
+            let deref_expr = if load_dtype.vcount() > 1 {
                 let cast_type = c_dtype(&load_dtype);
                 format!("*(({cast_type}*)({idx}))")
             } else {
                 format!("*({idx})")
+            };
+            let expr = if let Some(gate) = gate_expr {
+                let zero = c_const(&morok_ir::types::ConstValue::zero(load_dtype.base()), &load_dtype);
+                format!("({gate} ? {deref_expr} : {zero})")
+            } else {
+                deref_expr
             };
             ctx.emit_expr(uop, expr, "val", kernel);
             Some(())

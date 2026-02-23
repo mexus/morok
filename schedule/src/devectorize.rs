@@ -815,13 +815,15 @@ fn expand_vector_index(index: &Arc<UOp>) -> Option<Arc<UOp>> {
 
     let buf = if let Op::Vectorize { elements } = buffer.op() { elements.first()?.clone() } else { buffer.clone() };
 
-    // Generate scalar INDEX ops and simplify
+    // Generate scalar INDEX ops and simplify.
+    // Extract per-lane scalar gate from vector gate (Tinygrad: vec.gep(i) through WHERE-Invalid).
     let scalar_indices: Vec<_> = (0..count)
         .map(|i| {
+            let lane_gate = gate.as_ref().map(|g| if g.dtype().vcount() > 1 { g.gep(vec![i]) } else { g.clone() });
             UOp::index()
                 .buffer(buf.clone())
                 .indices(vec![vec.gep(vec![i])])
-                .maybe_gate(gate.clone())
+                .maybe_gate(lane_gate)
                 .ptr(true)
                 .call()
                 .expect("ICE: unable to create index")
@@ -831,13 +833,16 @@ fn expand_vector_index(index: &Arc<UOp>) -> Option<Arc<UOp>> {
     let midx = graph_rewrite(&(symbolic() + load_store_indexing_patterns()), UOp::sink(scalar_indices), &mut ());
     let Op::Sink { sources } = midx.op() else { return None };
 
-    // Extract (valid, root, offset) for each lane
-    let mut offsets_by_root: HashMap<(u64, u64), HashMap<i64, Vec<usize>>> = HashMap::new();
+    // Extract (valid, root, offset, gate) for each lane.
+    // Gate is included in the grouping key so lanes with different gates (e.g., valid vs invalid
+    // from padding) are grouped separately. This ensures PTRCAT groups have uniform gate values.
+    let mut offsets_by_root: HashMap<(u64, u64, u64), HashMap<i64, Vec<usize>>> = HashMap::new();
 
     for (lane, idx_op) in sources.iter().enumerate() {
-        let Op::Index { indices: simp_indices, .. } = idx_op.op() else { continue };
+        let Op::Index { indices: simp_indices, gate: lane_gate, .. } = idx_op.op() else { continue };
         let idx = simp_indices.first()?.get_idx();
         let valid = simp_indices.first()?.get_valid();
+        let gate_hash = lane_gate.as_ref().map_or(0u64, |g| g.content_hash());
 
         let (root, offset) = match idx.op() {
             // Invalid grouped separately (devectorizer.py:72-77)
@@ -859,7 +864,7 @@ fn expand_vector_index(index: &Arc<UOp>) -> Option<Arc<UOp>> {
             _ => (idx.clone(), 0),
         };
 
-        let key = (valid.content_hash(), root.content_hash());
+        let key = (valid.content_hash(), root.content_hash(), gate_hash);
         offsets_by_root.entry(key).or_default().entry(offset).or_default().push(lane);
     }
 

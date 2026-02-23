@@ -256,6 +256,8 @@ impl crate::Renderer for CRenderer {
 
         let code = code_lines.join("\n");
 
+        tracing::debug!(generated_c = code, "c codegen: final generated code");
+
         let mut result = RenderedKernel::new(code, kernel_name.to_string());
         result.buffer_args = buffer_args;
         result.var_names = var_names;

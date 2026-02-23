@@ -120,6 +120,8 @@ pub fn identity_and_zero_patterns() -> TypedPatternMatcher {
         Sub(x, @zero) ~> |x| x.clone(),
         Idiv(x, @one) ~> |x| x.clone(),
         Fdiv(x, @one) ~> |x| x.clone(),
+        // x % 1 → 0 (anything mod 1 is 0)
+        Mod(x, @one) => |x| x.dtype().scalar().map(|dt| UOp::const_(x.dtype(), ConstValue::zero(dt))),
 
         // ========== Zero propagation ==========
         // NOTE: For floats, x * 0 is NOT always 0 due to IEEE 754 special values:
@@ -138,13 +140,28 @@ pub fn identity_and_zero_patterns() -> TypedPatternMatcher {
 /// - CAST(WHERE(cond, x, Invalid)) → WHERE(cond, CAST(x), Invalid)
 /// - ALU(WHERE(cond, x, Invalid), y) → WHERE(cond, ALU(x, y), Invalid)
 /// - ALU(y, WHERE(cond, x, Invalid)) → WHERE(cond, ALU(y, x), Invalid)
-/// - ALU(Invalid, y) → Invalid
-/// - ALU(y, Invalid) → Invalid
+/// - ALU(Invalid, y) → Invalid  (only when y is Index dtype, left position only)
+///
+/// Note: Tinygrad only propagates bare Invalid from the LEFT position and requires
+/// the right operand to be Index dtype (symbolic.py:37). Right-position bare Invalid
+/// is NOT propagated to avoid contaminating non-index computations.
 ///
 /// MUST be first in `symbolic_simple()` — before `x*0→0` which would eat
 /// `MUL(0, WHERE(cond, x, Invalid))` → `0`, losing validity tracking.
 pub fn propagate_invalid() -> TypedPatternMatcher {
     patterns! {
+        // Merge nested WHERE-Invalid: WHERE(c1, WHERE(c2, x, Inv), Inv) → WHERE(AND(c1, c2), x, Inv)
+        // Multi-dimensional padding creates nested WHERE-Invalid after propagation through
+        // linearized index arithmetic (e.g., WHERE(valid_h, idx_h, Inv)*W + WHERE(valid_w, idx_w, Inv)
+        // → WHERE(valid_h, WHERE(valid_w, linear_idx, Inv), Inv)). Merging to a single level
+        // ensures pm_lower_index_dtype's INDEX pattern can consume it in one step.
+        Where(c1, Where(c2, x, inner_inv), outer_inv)
+            if matches!(inner_inv.op(), Op::Invalid) && matches!(outer_inv.op(), Op::Invalid)
+            => |c1, c2, x, inner_inv| {
+                let combined = c1.try_and_op(c2).ok()?;
+                UOp::try_where(combined, x.clone(), inner_inv.clone()).ok()
+            },
+
         // Push CAST through WHERE-with-Invalid
         // CAST(WHERE(cond, x, Invalid)) → WHERE(cond, CAST(x), Invalid)
         Cast { src: Where(cond, x, invalid), dtype }
@@ -176,15 +193,76 @@ pub fn propagate_invalid() -> TypedPatternMatcher {
                 },
         },
 
-        // ALU with bare Invalid → Invalid (left position)
-        for op in binary [Add, Mul, Sub, Mod, Max, Idiv, And, Or, Xor, Shl, Shr] {
-            op(invalid, _y) if matches!(invalid.op(), Op::Invalid) => |invalid| { let _ = op; Some(invalid.clone()) },
+        // Strip WHERE-Invalid from comparison inputs (Tinygrad symbolic.py:35)
+        // CMP(WHERE(cond, x, Invalid), y) → CMP(x, y)
+        // When comparing padded values, the Invalid region is already gated downstream,
+        // so we can safely compare just the valid part.
+        for op in binary [Lt, Le, Eq, Ne, Gt, Ge] {
+            r @ op(Where(_cond, x, invalid), y)
+                if matches!(invalid.op(), Op::Invalid)
+                => |r, x, y| {
+                    Some(UOp::new(Op::Binary(op, x.clone(), y.clone()), r.dtype()))
+                },
         },
 
-        // ALU with bare Invalid → Invalid (right position)
-        for op in binary [Add, Mul, Sub, Mod, Max, Idiv, And, Or, Xor, Shl, Shr] {
-            op(_y, invalid) if matches!(invalid.op(), Op::Invalid) => |invalid| { let _ = op; Some(invalid.clone()) },
+        // CMP(y, WHERE(cond, x, Invalid)) → CMP(y, x) (right operand variant)
+        for op in binary [Lt, Le, Eq, Ne, Gt, Ge] {
+            r @ op(y, Where(_cond, x, invalid))
+                if matches!(invalid.op(), Op::Invalid)
+                => |r, y, x| {
+                    Some(UOp::new(Op::Binary(op, y.clone(), x.clone()), r.dtype()))
+                },
         },
+
+        // ALU with bare Invalid → Invalid (left position only, right must be Index dtype)
+        // Tinygrad symbolic.py:37 — only matches Invalid on LEFT with Index-typed right operand.
+        // NOT matching right-position bare Invalid to avoid contaminating non-index computations.
+        for op in binary [Add, Mul, Sub, Mod, Max, Idiv, And, Or, Xor, Shl, Shr] {
+            op(invalid, y) if matches!(invalid.op(), Op::Invalid) && y.dtype() == DType::Index
+                => |invalid| { let _ = op; Some(invalid.clone()) },
+        },
+    }
+}
+
+/// Fold LOAD/STORE with fully-Invalid INDEX (Tinygrad symbolic.py:408-409).
+///
+/// When an INDEX has an Invalid marker as its index, the entire access is out-of-bounds:
+/// - LOAD(INDEX(buf, Invalid)) → const 0 (invalid load produces zero)
+/// - STORE(INDEX(buf, Invalid), value) → NOOP (invalid store does nothing)
+///
+/// Also handles CAST-wrapped variants:
+/// - LOAD(CAST(INDEX(buf, Invalid))) → const 0
+/// - STORE(CAST(INDEX(buf, Invalid)), value) → NOOP
+///
+/// This occurs when padding creates regions entirely outside the original tensor bounds,
+/// causing WHERE(valid, idx, Invalid) to simplify to just Invalid when valid is always false.
+pub fn fold_invalid_load_store() -> TypedPatternMatcher {
+    patterns! {
+        // LOAD(INDEX(buf, Invalid)) → const 0 (dtype-appropriate)
+        load @ Load { index: Index { indices, .. }, .. }
+            if indices.len() == 1 && matches!(indices[0].op(), Op::Invalid)
+            => |load| {
+                let zero = ConstValue::zero(load.dtype().scalar()?);
+                Some(load.const_like(zero))
+            },
+
+        // LOAD(CAST(INDEX(buf, Invalid))) → const 0 (dtype-appropriate)
+        load @ Load { index: Cast { src: Index { indices, .. }, .. }, .. }
+            if indices.len() == 1 && matches!(indices[0].op(), Op::Invalid)
+            => |load| {
+                let zero = ConstValue::zero(load.dtype().scalar()?);
+                Some(load.const_like(zero))
+            },
+
+        // STORE(INDEX(buf, Invalid), value) → NOOP
+        Store { index: Index { indices, .. }, .. }
+            if indices.len() == 1 && matches!(indices[0].op(), Op::Invalid)
+            => || Some(UOp::new(Op::Noop, DType::Void)),
+
+        // STORE(CAST(INDEX(buf, Invalid)), value) → NOOP
+        Store { index: Cast { src: Index { indices, .. }, .. }, .. }
+            if indices.len() == 1 && matches!(indices[0].op(), Op::Invalid)
+            => || Some(UOp::new(Op::Noop, DType::Void)),
     }
 }
 
@@ -201,6 +279,7 @@ pub fn propagate_invalid() -> TypedPatternMatcher {
 /// - x & 0 → 0, 0 & x → 0
 pub fn symbolic_simple() -> TypedPatternMatcher {
     propagate_invalid()
+        + fold_invalid_load_store()
         + constant_folding_dsl_patterns()
         + vconst_folding_patterns()
         + identity_and_zero_patterns()
@@ -746,19 +825,36 @@ pub fn advanced_division_dsl_patterns() -> TypedPatternMatcher {
         },
         // expr // divisor → expr.divides(divisor) (generic exact division)
         Idiv(expr, divisor @ @const) => |expr, divisor| expr.divides(divisor),
-        // (a + b) % c → simplify when one operand is multiple of c
+        // (a + b) % c → simplify when one operand is multiple of c, or reduce coefficient
         Mod(Add(a, b), c @const(c_val)) => |a, b, c, c_val| {
             let ConstValue::Int(modulus) = c_val else { return None };
-            (modulus > 0 && modulus <= 256).then(|| {
-                let (af, bf) = (a.const_factor(), b.const_factor());
-                if af % modulus == 0 {
-                    b.try_mod(c).ok()
-                } else if bf % modulus == 0 {
-                    a.try_mod(c).ok()
+            if modulus <= 0 || modulus > 256 { return None; }
+            let (af, bf) = (a.const_factor(), b.const_factor());
+            if af % modulus == 0 {
+                b.try_mod(c).ok()
+            } else if bf % modulus == 0 {
+                a.try_mod(c).ok()
+            } else {
+                // Reduce coefficient: (a*k + b) % m → (a*(k%m) + b) % m when k%m < k
+                // E.g., (r*8 + v) % 7 → (r + v) % 7 since 8 ≡ 1 (mod 7)
+                let new_af = af % modulus;
+                if new_af != af && new_af != 0 {
+                    let factor = UOp::index_const(af);
+                    let new_factor = UOp::index_const(new_af);
+                    let reduced_a = a.try_div(&factor).ok()?.try_mul(&new_factor).ok()?;
+                    reduced_a.try_add(b).ok()?.try_mod(c).ok()
                 } else {
-                    None
+                    let new_bf = bf % modulus;
+                    if new_bf != bf && new_bf != 0 {
+                        let factor = UOp::index_const(bf);
+                        let new_factor = UOp::index_const(new_bf);
+                        let reduced_b = b.try_div(&factor).ok()?.try_mul(&new_factor).ok()?;
+                        a.try_add(&reduced_b).ok()?.try_mod(c).ok()
+                    } else {
+                        None
+                    }
                 }
-            }).flatten()
+            }
         },
         // (a + b) // c → (a // c) + (b // c) when both divide evenly
         Idiv(Add(a, b), c @ @const) => |a, b, c| a.divides(c)?.try_add(&b.divides(c)?).ok(),
@@ -946,7 +1042,12 @@ pub fn dce_dsl_patterns() -> TypedPatternMatcher {
           ~> |x| x.not(),
 
         // WHERE(!cond, t, f) → WHERE(cond, f, t) - negated condition swap
-        Where(Not(cond), t, f) => |cond, t, f| UOp::try_where(Arc::clone(cond), Arc::clone(f), Arc::clone(t)).ok(),
+        // Guard: don't swap when f is Invalid — PAD creates WHERE(valid, idx, Invalid),
+        // and swapping would move Invalid to the true branch where downstream patterns can't match it.
+        // Tinygrad symbolic.py:201-202 has this same guard.
+        Where(Not(cond), t, f)
+            if !matches!(f.op(), Op::Invalid)
+            => |cond, t, f| UOp::try_where(Arc::clone(cond), Arc::clone(f), Arc::clone(t)).ok(),
 
         // WHERE(a, WHERE(b, c, d), d) → WHERE(a & b, c, d) - branch merging
         Where(a, Where(b, c, d), d2) if Arc::ptr_eq(d, d2) => |a, b, c, d| {

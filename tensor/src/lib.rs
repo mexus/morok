@@ -19,6 +19,7 @@ pub mod indexing;
 pub mod math;
 pub mod matmul;
 pub mod memory_planner;
+pub mod nn;
 pub mod realize;
 pub mod reduce;
 pub mod schedule;
@@ -28,6 +29,30 @@ pub mod traits;
 
 // Re-export for public API
 pub use tensor_registry::apply_map_to_tensors;
+
+/// Reduction operations supported by cumulative reduce (`_cumalu`).
+#[derive(Debug, Clone, Copy)]
+enum CumReduceOp {
+    Add,
+    #[allow(dead_code)]
+    Max,
+}
+
+impl CumReduceOp {
+    /// Identity element for this operation as f64, used as pad fill value.
+    fn identity_value(&self, dtype: DType) -> f64 {
+        match self {
+            CumReduceOp::Add => 0.0,
+            CumReduceOp::Max => {
+                if dtype.is_int() {
+                    i64::MIN as f64
+                } else {
+                    f64::NEG_INFINITY
+                }
+            }
+        }
+    }
+}
 
 /// Information about a rendered kernel.
 ///
@@ -127,24 +152,62 @@ impl Tensor {
         Vec::new()
     }
 
+    /// Create a tensor filled with a constant value, broadcast to the given shape.
+    pub fn full(shape: &[usize], value: impl Into<ConstValue>, dtype: DType) -> Result<Self> {
+        let scalar = Self::const_(value, dtype);
+        if shape.is_empty() {
+            return Ok(scalar);
+        }
+        let expand_shape: Vec<isize> = shape.iter().map(|&d| d as isize).collect();
+        scalar.try_reshape(&vec![1; shape.len()])?.try_expand(&expand_shape)
+    }
+
+    /// Cumulative reduce along an axis using a sliding-window approach.
+    ///
+    /// Decomposes prefix-sum/prefix-max/prefix-prod into existing ops:
+    /// pad → pool (sliding windows) → reduce. Fully lazy, O(1) graph nodes.
+    fn _cumalu(&self, axis: isize, reduce: CumReduceOp) -> Result<Self> {
+        let shape = self.shape()?;
+        let ndim = shape.len();
+        let axis_idx = Self::normalize_axis(axis, ndim)?;
+        let n = shape[axis_idx]
+            .as_const()
+            .ok_or_else(|| Error::SymbolicShapeUnsupported { operation: "_cumalu".to_string() })?;
+
+        if n <= 1 {
+            return Ok(self.clone());
+        }
+
+        // 1. Transpose target axis to last
+        let x = if axis_idx != ndim - 1 { self.try_transpose(axis_idx as isize, -1)? } else { self.clone() };
+
+        // 2. Pad left with (n-1) identity elements
+        let identity = reduce.identity_value(self.uop().dtype());
+        let mut padding = vec![(0isize, 0isize); ndim];
+        padding[ndim - 1] = ((n - 1) as isize, 0);
+        let x = x.try_pad_value(&padding, identity)?;
+
+        // 3. Pool with kernel=n, stride=1
+        let x = x.pool(&[n], &[1], &[1])?;
+
+        // 4. Reduce last dim
+        let x = match reduce {
+            CumReduceOp::Add => x.sum(-1isize)?,
+            CumReduceOp::Max => x.max(-1isize)?,
+        };
+
+        // 5. Transpose back
+        if axis_idx != ndim - 1 { x.try_transpose(axis_idx as isize, -1) } else { Ok(x) }
+    }
+
     /// Create 1D tensor with evenly spaced values.
     ///
     /// Generates values in the range `[start, stop)` with given step size.
     /// If `stop` is None, treats `start` as stop and starts from 0.
     ///
-    /// # Arguments
-    /// * `start` - Starting value (or stop value if `stop` is None)
-    /// * `stop` - Ending value (exclusive), defaults to None
-    /// * `step` - Step size, defaults to 1
-    ///
-    /// # Examples
-    /// ```ignore
-    /// let t = Tensor::arange(5, None, None)?;         // [0, 1, 2, 3, 4]
-    /// let t = Tensor::arange(2, Some(10), Some(2))?;  // [2, 4, 6, 8]
-    /// let t = Tensor::arange(10, Some(0), Some(-2))?; // [10, 8, 6, 4, 2]
-    /// ```
+    /// Uses lazy `full(step)._cumalu(0, Add) + (start - step)` which
+    /// `reduce_collapse` simplifies into `RANGE * step + offset`.
     pub fn arange(start: i64, stop: Option<i64>, step: Option<i64>) -> Result<Self> {
-        // Handle start/stop convention: arange(5) = arange(0, 5, 1)
         let (actual_start, actual_stop) = match stop {
             Some(s) => (start, s),
             None => (0, start),
@@ -152,7 +215,6 @@ impl Tensor {
 
         let actual_step = step.unwrap_or(1);
 
-        // Calculate number of elements
         if actual_step == 0 {
             return Err(Error::SymbolicShapeUnsupported { operation: "arange with step=0".to_string() });
         }
@@ -169,11 +231,15 @@ impl Tensor {
             ((actual_start - actual_stop - actual_step - 1) / (-actual_step)) as usize
         };
 
-        // Generate values
-        let values: Vec<i32> = (0..count).map(|i| (actual_start + i as i64 * actual_step) as i32).collect();
+        if count == 0 {
+            return Ok(Self::from_slice::<i32, _>(&[]));
+        }
 
-        // Create tensor from values
-        Ok(Self::from_slice(&values))
+        // Lazy: full(step)._cumalu(0, Add) + (start - step)
+        let step_tensor = Self::full(&[count], ConstValue::Int(actual_step), DType::Int32)?;
+        let cumsum = step_tensor._cumalu(0, CumReduceOp::Add)?;
+        let offset = Self::const_(ConstValue::Int(actual_start - actual_step), DType::Int32);
+        cumsum.try_add(&offset)
     }
 
     /// Create tensor from slice on CPU (default device).
@@ -421,6 +487,9 @@ impl Tensor {
     /// ```
     pub fn contiguous(&self) -> Self {
         let uop = self.uop();
+        if matches!(uop.op(), morok_ir::Op::Contiguous { .. }) {
+            return self.clone();
+        }
         let contiguous_uop = uop.contiguous();
         Self::new(contiguous_uop)
     }

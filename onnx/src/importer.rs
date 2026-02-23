@@ -12,7 +12,7 @@ use snafu::ResultExt;
 
 use crate::error::{EmptyModelSnafu, IoSnafu, MissingInputSnafu, ProtobufDecodeSnafu, Result};
 use crate::parser::onnx::{ModelProto, NodeProto, ValueInfoProto};
-use crate::registry::{OpRegistry, OpSetId, convert_onnx_dtype, tensor_from_proto};
+use crate::registry::{OpRegistry, OpSetId, convert_onnx_dtype, onnx_opset_version, tensor_from_proto};
 
 /// Dimension value - either static (known size) or dynamic (named, e.g., batch dim).
 #[derive(Debug, Clone, PartialEq)]
@@ -221,16 +221,16 @@ impl OnnxImporter {
             .map(|s| {
                 s.dim
                     .iter()
-                    .filter_map(|d| match &d.value {
+                    .map(|d| match &d.value {
                         Some(DimValueProto::DimValue(v)) => {
                             if *v > 0 {
-                                Some(DimValue::Static(*v as usize))
+                                DimValue::Static(*v as usize)
                             } else {
-                                Some(DimValue::Dynamic(String::new()))
+                                DimValue::Dynamic(String::new())
                             }
                         }
-                        Some(DimValueProto::DimParam(name)) => Some(DimValue::Dynamic(name.clone())),
-                        None => Some(DimValue::Dynamic(String::new())),
+                        Some(DimValueProto::DimParam(name)) => DimValue::Dynamic(name.clone()),
+                        None => DimValue::Dynamic(String::new()),
                     })
                     .collect()
             })
@@ -267,9 +267,18 @@ impl OnnxImporter {
             }
         }
 
+        // Resolve the default (ai.onnx) opset version
+        let opset_version = onnx_opset_version(&graph.opsets, "");
+
         // Process nodes in order (ONNX guarantees topological order)
         for node in &graph.nodes {
-            self.process_node(node, &mut values)?;
+            // Resolve opset for the node's domain (most nodes use default "")
+            let node_opset = if node.domain.is_empty() || node.domain == "ai.onnx" {
+                opset_version
+            } else {
+                onnx_opset_version(&graph.opsets, &node.domain)
+            };
+            self.process_node(node, &mut values, node_opset)?;
         }
 
         // Collect outputs by name
@@ -280,7 +289,7 @@ impl OnnxImporter {
     }
 
     /// Process a single ONNX node.
-    fn process_node(&self, node: &NodeProto, values: &mut HashMap<String, Tensor>) -> Result<()> {
+    fn process_node(&self, node: &NodeProto, values: &mut HashMap<String, Tensor>, opset_version: i64) -> Result<()> {
         let op_type = &node.op_type;
         let domain = &node.domain;
         let node_name = if node.name.is_empty() { "unnamed" } else { &node.name };
@@ -306,7 +315,7 @@ impl OnnxImporter {
         }
 
         // Dispatch to operator registry - may return multiple outputs
-        let outputs = self.registry.dispatch_multi(op_type, domain, &inputs, node)?;
+        let outputs = self.registry.dispatch_multi(op_type, domain, &inputs, node, opset_version)?;
 
         // Register outputs by name
         for (i, output_name) in node.output.iter().enumerate() {

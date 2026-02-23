@@ -66,7 +66,9 @@ impl Tensor {
             try_sqrt => try_sqrt,
             try_rsqrt => try_rsqrt,
             try_exp => try_exp,
+            try_exp2 => try_exp2,
             try_log => try_log,
+            try_log2 => try_log2,
         }
     }
 

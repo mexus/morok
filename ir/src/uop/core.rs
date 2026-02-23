@@ -120,6 +120,20 @@ impl UOp {
         self.dtype.clone()
     }
 
+    /// Check if this UOp has a concrete buffer identity in the graph.
+    ///
+    /// Returns true for BUFFER or RESHAPE/MULTI chains leading to BUFFER.
+    /// These are already contiguous by definition, so wrapping in CONTIGUOUS is a no-op.
+    ///
+    /// Based on Tinygrad's `UOp.has_buffer_identity()` (ops.py:616-619).
+    pub fn has_buffer_identity(&self) -> bool {
+        match &self.op {
+            Op::Reshape { src, .. } | Op::Multi { src, .. } => src.has_buffer_identity(),
+            Op::Buffer { .. } => true,
+            _ => false,
+        }
+    }
+
     /// Get pointer dtype components if this UOp has a Ptr dtype.
     ///
     /// Returns `(base, addrspace, size)` for Ptr types, None otherwise.

@@ -3,6 +3,7 @@
 //! These types are generated from `onnx.proto` at compile time.
 
 pub mod onnx {
+    #![allow(clippy::doc_overindented_list_items)]
     include!(concat!(env!("OUT_DIR"), "/onnx.rs"));
 }
 

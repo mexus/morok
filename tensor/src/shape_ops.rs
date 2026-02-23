@@ -237,10 +237,9 @@ impl Tensor {
     pub fn flip(&self, axes: &[isize]) -> Result<Tensor> {
         let shape = self.shape()?;
         let ndim = shape.len();
-        let flip_spec: Vec<bool> = (0..ndim)
-            .map(|d| axes.iter().any(|&a| Self::normalize_axis(a, ndim).map_or(false, |na| na == d)))
-            .collect();
-        self.uop().try_flip(flip_spec).map(Self::new).context(UOpSnafu)
+        let flip_spec: Vec<bool> =
+            (0..ndim).map(|d| axes.iter().any(|&a| Self::normalize_axis(a, ndim).is_ok_and(|na| na == d))).collect();
+        self.uop().try_flip(flip_spec).map(|uop| self.with_same_buffer(uop)).context(UOpSnafu)
     }
 
     /// Split tensor into chunks along a dimension.
@@ -308,8 +307,7 @@ impl Tensor {
                 as isize;
             // Unsqueeze at dim, expand rep times, then reshape to merge
             result = result.try_unsqueeze(dim as isize)?;
-            let mut expand_shape: Vec<isize> =
-                current_shape.iter().map(|s| s.as_const().unwrap() as isize).collect();
+            let mut expand_shape: Vec<isize> = current_shape.iter().map(|s| s.as_const().unwrap() as isize).collect();
             expand_shape.insert(dim, rep as isize);
             result = result.try_expand(&expand_shape)?;
             expand_shape[dim] = rep as isize * dim_size;
@@ -371,10 +369,34 @@ impl Tensor {
             }
         );
 
-        let padding_sint: Vec<(SInt, SInt)> =
-            padding.iter().map(|(begin, end)| (SInt::Const(*begin as usize), SInt::Const(*end as usize))).collect();
+        // Phase 1: shrink for negative padding (negative padding = cropping)
+        let needs_shrink = padding.iter().any(|(b, e)| *b < 0 || *e < 0);
+        let base = if needs_shrink {
+            let shrink_ranges: Vec<(isize, isize)> = padding
+                .iter()
+                .zip(shape.iter())
+                .map(|((b, e), s)| {
+                    let dim = s.as_const().expect("pad with negative values requires concrete shape") as isize;
+                    let begin = (-*b).max(0);
+                    let end = (dim + *e).min(dim);
+                    (begin, end)
+                })
+                .collect();
+            self.try_shrink(&shrink_ranges)?
+        } else {
+            self.clone()
+        };
 
-        self.uop().try_pad(&padding_sint).map(|uop| self.with_same_buffer(uop)).context(UOpSnafu)
+        // Phase 2: pad with positive-only values
+        let pos_padding: Vec<(isize, isize)> = padding.iter().map(|(b, e)| ((*b).max(0), (*e).max(0))).collect();
+        if pos_padding.iter().all(|(b, e)| *b == 0 && *e == 0) {
+            return Ok(base);
+        }
+
+        let padding_sint: Vec<(SInt, SInt)> =
+            pos_padding.iter().map(|(begin, end)| (SInt::Const(*begin as usize), SInt::Const(*end as usize))).collect();
+
+        base.uop().try_pad(&padding_sint).map(|uop| base.with_same_buffer(uop)).context(UOpSnafu)
     }
 
     /// Concatenate tensors along an axis.
@@ -559,9 +581,7 @@ impl Tensor {
     /// Total number of elements. Fails if any dimension is symbolic.
     pub fn numel(&self) -> Result<usize> {
         self.shape()?.iter().try_fold(1usize, |acc, d| {
-            d.as_const()
-                .map(|v| acc * v)
-                .ok_or(Error::SymbolicShapeUnsupported { operation: "numel".into() })
+            d.as_const().map(|v| acc * v).ok_or(Error::SymbolicShapeUnsupported { operation: "numel".into() })
         })
     }
 
