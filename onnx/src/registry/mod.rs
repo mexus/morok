@@ -241,6 +241,10 @@ fn inp(inputs: &[Option<Tensor>], idx: usize) -> &Tensor {
     inputs[idx].as_ref().expect("missing required ONNX input")
 }
 
+fn non_empty_i64(v: &[i64]) -> Option<&[i64]> {
+    if v.is_empty() { None } else { Some(v) }
+}
+
 /// Extract reduce axes and keepdims, opset-aware.
 /// Opset >= 13: axes from input[1] tensor. Opset <= 12: axes from node attribute.
 fn reduce_attrs(node: &NodeProto, inputs: &[Option<Tensor>], opset: i64) -> Result<(AxisSpec, bool)> {
@@ -639,6 +643,205 @@ impl OpRegistry {
             "MatMul" => inp(inputs, 0).matmul(inp(inputs, 1))?,
             "Gemm" => self.op_gemm(inputs, node)?,
             "BatchNormalization" => self.op_batch_norm(inputs, node)?,
+
+            // === Conv ===
+            "Conv" => {
+                let ks: Vec<usize> = get_attr_ints(node, "kernel_shape").iter().map(|&k| k as usize).collect();
+                let auto_pad = get_attr_string(node, "auto_pad", "NOTSET");
+                let pads = get_attr_ints(node, "pads");
+                let strides = get_attr_ints(node, "strides");
+                let dilations = get_attr_ints(node, "dilations");
+                inp(inputs, 0)
+                    .conv()
+                    .weight(inp(inputs, 1))
+                    .maybe_bias(inputs.get(2).and_then(|o| o.as_ref()))
+                    .auto_pad(&auto_pad)
+                    .group(get_attr_int(node, "group", 1) as usize)
+                    .maybe_kernel_shape((!ks.is_empty()).then_some(ks.as_slice()))
+                    .maybe_pads(non_empty_i64(&pads))
+                    .maybe_strides(non_empty_i64(&strides))
+                    .maybe_dilations(non_empty_i64(&dilations))
+                    .call()?
+            }
+            "ConvTranspose" => {
+                let ks: Vec<usize> = get_attr_ints(node, "kernel_shape").iter().map(|&k| k as usize).collect();
+                let op: Vec<usize> = get_attr_ints(node, "output_padding").iter().map(|&p| p as usize).collect();
+                let os = get_attr_ints(node, "output_shape");
+                let auto_pad = get_attr_string(node, "auto_pad", "NOTSET");
+                let pads = get_attr_ints(node, "pads");
+                let strides = get_attr_ints(node, "strides");
+                let dilations = get_attr_ints(node, "dilations");
+                inp(inputs, 0)
+                    .conv_transpose()
+                    .weight(inp(inputs, 1))
+                    .maybe_bias(inputs.get(2).and_then(|o| o.as_ref()))
+                    .auto_pad(&auto_pad)
+                    .group(get_attr_int(node, "group", 1) as usize)
+                    .maybe_kernel_shape((!ks.is_empty()).then_some(ks.as_slice()))
+                    .maybe_pads(non_empty_i64(&pads))
+                    .maybe_output_shape(non_empty_i64(&os))
+                    .maybe_output_padding((!op.is_empty()).then_some(op.as_slice()))
+                    .maybe_strides(non_empty_i64(&strides))
+                    .maybe_dilations(non_empty_i64(&dilations))
+                    .call()?
+            }
+
+            // === Pooling ===
+            "AveragePool" => {
+                let kernel: Vec<usize> = get_attr_ints(node, "kernel_shape").iter().map(|&k| k as usize).collect();
+                let auto_pad = get_attr_string(node, "auto_pad", "NOTSET");
+                let pads = get_attr_ints(node, "pads");
+                let strides = get_attr_ints(node, "strides");
+                let dilations = get_attr_ints(node, "dilations");
+                inp(inputs, 0)
+                    .avg_pool()
+                    .kernel_shape(&kernel)
+                    .auto_pad(&auto_pad)
+                    .ceil_mode(get_attr_int(node, "ceil_mode", 0) == 1)
+                    .count_include_pad(get_attr_int(node, "count_include_pad", 0) == 1)
+                    .maybe_pads(non_empty_i64(&pads))
+                    .maybe_strides(non_empty_i64(&strides))
+                    .maybe_dilations(non_empty_i64(&dilations))
+                    .call()?
+            }
+            "MaxPool" => {
+                let kernel: Vec<usize> = get_attr_ints(node, "kernel_shape").iter().map(|&k| k as usize).collect();
+                let auto_pad = get_attr_string(node, "auto_pad", "NOTSET");
+                let pads = get_attr_ints(node, "pads");
+                let strides = get_attr_ints(node, "strides");
+                let dilations = get_attr_ints(node, "dilations");
+                let (values, indices) = inp(inputs, 0)
+                    .max_pool()
+                    .kernel_shape(&kernel)
+                    .auto_pad(&auto_pad)
+                    .ceil_mode(get_attr_int(node, "ceil_mode", 0) == 1)
+                    .storage_order(get_attr_int(node, "storage_order", 0) as usize)
+                    .maybe_pads(non_empty_i64(&pads))
+                    .maybe_strides(non_empty_i64(&strides))
+                    .maybe_dilations(non_empty_i64(&dilations))
+                    .call()?;
+                return Ok(vec![values, indices]);
+            }
+            "GlobalAveragePool" => {
+                let x = inp(inputs, 0);
+                let axes: Vec<isize> = (2..x.ndim()? as isize).collect();
+                x.mean_with().axes(AxisSpec::Multiple(axes)).keepdim(true).call()?
+            }
+            "GlobalMaxPool" => {
+                let x = inp(inputs, 0);
+                let axes: Vec<isize> = (2..x.ndim()? as isize).collect();
+                x.max_with().axes(AxisSpec::Multiple(axes)).keepdim(true).call()?
+            }
+
+            // === Normalization ===
+            "LayerNormalization" => {
+                let x = inp(inputs, 0);
+                let scale = inp(inputs, 1);
+                let bias = inputs.get(2).and_then(|o| o.as_ref());
+                let axis = get_attr_int(node, "axis", -1) as isize;
+                let epsilon = get_attr_float(node, "epsilon", 1e-5) as f64;
+                let (mut output, mean, inv_std_dev) = x.layernorm_with_stats(axis, epsilon)?;
+                output = output.try_mul(scale)?;
+                if let Some(bias) = bias {
+                    output = output.try_add(bias)?;
+                }
+                return Ok(vec![output, mean, inv_std_dev]);
+            }
+            "GroupNormalization" => {
+                let x = inp(inputs, 0);
+                let scale = inp(inputs, 1);
+                let bias = inp(inputs, 2);
+                let num_groups = get_attr_int(node, "num_groups", 1) as usize;
+                let epsilon = get_attr_float(node, "epsilon", 1e-5) as f64;
+                x.group_norm(scale, bias, num_groups, epsilon)?
+            }
+            "InstanceNormalization" => {
+                let x = inp(inputs, 0);
+                let scale = inp(inputs, 1);
+                let bias = inp(inputs, 2);
+                let epsilon = get_attr_float(node, "epsilon", 1e-5) as f64;
+                let num_channels = x.shape()?[1].as_const().unwrap();
+                x.group_norm(scale, bias, num_channels, epsilon)?
+            }
+
+            // === Indexing (Phase 4) ===
+            "GatherElements" => {
+                let x = inp(inputs, 0);
+                let idx = inp(inputs, 1);
+                let axis = get_attr_int(node, "axis", 0) as isize;
+                let x_shape = x.shape()?;
+                let ndim = x_shape.len();
+                let norm_axis = if axis < 0 { (ndim as isize + axis) as usize } else { axis as usize };
+                let dim_size = x_shape[norm_axis].as_const().unwrap() as i64;
+                // Normalize negative indices
+                let zero = Tensor::const_(ConstValue::Int(0), idx.uop().dtype());
+                let dim_t = Tensor::const_(ConstValue::Int(dim_size), idx.uop().dtype());
+                let neg_mask = idx.try_lt(&zero)?;
+                let normalized_idx = idx.try_add(&dim_t)?.where_(&neg_mask, idx)?;
+                x.gather(axis, &normalized_idx)?
+            }
+            "Trilu" => {
+                let x = inp(inputs, 0);
+                let k = inputs
+                    .get(1)
+                    .and_then(|o| o.as_ref())
+                    .map(tensor_to_i64_vec)
+                    .transpose()?
+                    .map(|v| v[0])
+                    .unwrap_or(0);
+                let upper = get_attr_int(node, "upper", 1) == 1;
+                if upper { x.triu(k)? } else { x.tril(k)? }
+            }
+            "OneHot" => {
+                let indices = inp(inputs, 0);
+                let depth = tensor_to_i64_vec(inp(inputs, 1))?[0] as usize;
+                let values = inp(inputs, 2);
+                let axis = get_attr_int(node, "axis", -1) as isize;
+                // Normalize negative indices
+                let zero = Tensor::const_(ConstValue::Int(0), indices.uop().dtype());
+                let depth_t = Tensor::const_(ConstValue::Int(depth as i64), indices.uop().dtype());
+                let neg_mask = indices.try_lt(&zero)?;
+                let norm_idx = indices.try_add(&depth_t)?.where_(&neg_mask, indices)?;
+                let norm_idx = norm_idx.cast(DType::Int32)?;
+                // Unsqueeze at axis, then one-hot
+                let ndim = norm_idx.ndim()? + 1;
+                let norm_axis = if axis < 0 { (ndim as isize + axis) as usize } else { axis as usize };
+                let expanded = norm_idx.try_unsqueeze(norm_axis as isize)?;
+                let mask = expanded.one_hot_along_dim(depth, norm_axis as isize)?;
+                // Extract on_value and off_value via shrink
+                let on_val = values.try_shrink(&[(1, 2)])?;
+                let off_val = values.try_shrink(&[(0, 1)])?;
+                on_val.where_(&mask, &off_val)?
+            }
+            "CumSum" => {
+                let x = inp(inputs, 0);
+                let axis_raw = tensor_to_i64_vec(inp(inputs, 1))?[0];
+                let ndim = x.ndim()?;
+                let axis = if axis_raw < 0 { (ndim as i64 + axis_raw) as usize } else { axis_raw as usize };
+                let exclusive = get_attr_int(node, "exclusive", 0) == 1;
+                let reverse = get_attr_int(node, "reverse", 0) == 1;
+                let mut result = x.clone();
+                if reverse {
+                    result = result.flip(&[axis as isize])?;
+                }
+                if exclusive {
+                    // Shift by 1: pad beginning, shrink end
+                    let shape = result.shape()?;
+                    let dim_size = shape[axis].as_const().unwrap() as isize;
+                    let mut pad_spec: Vec<(isize, isize)> = vec![(0, 0); ndim];
+                    pad_spec[axis] = (1, 0);
+                    result = result.try_pad(&pad_spec)?;
+                    let mut shrink_spec: Vec<(isize, isize)> =
+                        result.shape()?.iter().map(|s| (0, s.as_const().unwrap() as isize)).collect();
+                    shrink_spec[axis] = (0, dim_size);
+                    result = result.try_shrink(&shrink_spec)?;
+                }
+                result = result.cumsum(axis as isize)?;
+                if reverse {
+                    result = result.flip(&[axis as isize])?;
+                }
+                result
+            }
 
             // === Type ===
             "CastLike" => inp(inputs, 0).cast(inp(inputs, 1).uop().dtype())?,
@@ -2100,5 +2303,389 @@ mod tests {
         assert_eq!(arr.as_slice().unwrap(), &[42.0f32, 99.0]);
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // === Batch 4: Critical operators ===
+
+    #[test]
+    fn test_global_average_pool() {
+        let registry = OpRegistry::new();
+        // (1, 2, 3, 3) → mean over spatial → (1, 2, 1, 1)
+        let x_data: Vec<f32> = (0..18).map(|v| v as f32).collect();
+        let x = Tensor::from_slice(&x_data).try_reshape(&[1, 2, 3, 3]).unwrap();
+        let inputs = vec![Some(x)];
+        let node = NodeProto::default();
+        let result = registry.dispatch_multi("GlobalAveragePool", "", &inputs, &node, i64::MAX).unwrap();
+        let s = result[0].shape().unwrap();
+        assert_eq!(s.iter().map(|d| d.as_const().unwrap()).collect::<Vec<_>>(), vec![1, 2, 1, 1]);
+        let arr = result[0].to_ndarray::<f32>().unwrap();
+        // Channel 0: mean(0..9) = 4.0
+        assert!((arr[[0, 0, 0, 0]] - 4.0).abs() < 1e-4);
+        // Channel 1: mean(9..18) = 13.0
+        assert!((arr[[0, 1, 0, 0]] - 13.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn test_global_max_pool() {
+        let registry = OpRegistry::new();
+        let x_data: Vec<f32> = (0..18).map(|v| v as f32).collect();
+        let x = Tensor::from_slice(&x_data).try_reshape(&[1, 2, 3, 3]).unwrap();
+        let inputs = vec![Some(x)];
+        let node = NodeProto::default();
+        let result = registry.dispatch_multi("GlobalMaxPool", "", &inputs, &node, i64::MAX).unwrap();
+        let s = result[0].shape().unwrap();
+        assert_eq!(s.iter().map(|d| d.as_const().unwrap()).collect::<Vec<_>>(), vec![1, 2, 1, 1]);
+        let arr = result[0].to_ndarray::<f32>().unwrap();
+        // Channel 0: max(0..9) = 8
+        assert!((arr[[0, 0, 0, 0]] - 8.0).abs() < 1e-4);
+        // Channel 1: max(9..18) = 17
+        assert!((arr[[0, 1, 0, 0]] - 17.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn test_gather_elements() {
+        let registry = OpRegistry::new();
+        // 3x3 input, gather along axis 1
+        let data = Tensor::from_slice(&[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0]).try_reshape(&[3, 3]).unwrap();
+        let indices = Tensor::from_slice(&[1i64, 2, 0, 2, 0, 0, 0, 1, 1]).try_reshape(&[3, 3]).unwrap();
+        let mut node = NodeProto::default();
+        let mut attr = AttributeProto::default();
+        attr.name = "axis".to_string();
+        attr.i = 1;
+        node.attribute.push(attr);
+        let inputs = vec![Some(data), Some(indices)];
+        let result = registry.dispatch_multi("GatherElements", "", &inputs, &node, i64::MAX).unwrap();
+        let arr = result[0].to_ndarray::<f32>().unwrap();
+        let vals: Vec<f32> = arr.iter().copied().collect();
+        assert_eq!(vals, vec![2.0, 3.0, 1.0, 6.0, 4.0, 4.0, 7.0, 8.0, 8.0]);
+    }
+
+    #[test]
+    fn test_gather_elements_negative_indices() {
+        let registry = OpRegistry::new();
+        let data = Tensor::from_slice(&[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]).try_reshape(&[2, 3]).unwrap();
+        // -1 should map to index 2 (last element)
+        let indices = Tensor::from_slice(&[-1i64, 0]).try_reshape(&[2, 1]).unwrap();
+        let mut node = NodeProto::default();
+        let mut attr = AttributeProto::default();
+        attr.name = "axis".to_string();
+        attr.i = 1;
+        node.attribute.push(attr);
+        let inputs = vec![Some(data), Some(indices)];
+        let result = registry.dispatch_multi("GatherElements", "", &inputs, &node, i64::MAX).unwrap();
+        let arr = result[0].to_ndarray::<f32>().unwrap();
+        let vals: Vec<f32> = arr.iter().copied().collect();
+        assert_eq!(vals, vec![3.0, 4.0]);
+    }
+
+    #[test]
+    fn test_trilu_upper() {
+        let registry = OpRegistry::new();
+        let x = Tensor::from_slice(&[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0]).try_reshape(&[3, 3]).unwrap();
+        let inputs = vec![Some(x)];
+        let mut node = NodeProto::default();
+        let mut attr = AttributeProto::default();
+        attr.name = "upper".to_string();
+        attr.i = 1;
+        node.attribute.push(attr);
+        let result = registry.dispatch_multi("Trilu", "", &inputs, &node, i64::MAX).unwrap();
+        let arr = result[0].to_ndarray::<f32>().unwrap();
+        let vals: Vec<f32> = arr.iter().copied().collect();
+        assert_eq!(vals, vec![1.0, 2.0, 3.0, 0.0, 5.0, 6.0, 0.0, 0.0, 9.0]);
+    }
+
+    #[test]
+    fn test_trilu_lower() {
+        let registry = OpRegistry::new();
+        let x = Tensor::from_slice(&[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0]).try_reshape(&[3, 3]).unwrap();
+        let inputs = vec![Some(x)];
+        let mut node = NodeProto::default();
+        let mut attr = AttributeProto::default();
+        attr.name = "upper".to_string();
+        attr.i = 0;
+        node.attribute.push(attr);
+        let result = registry.dispatch_multi("Trilu", "", &inputs, &node, i64::MAX).unwrap();
+        let arr = result[0].to_ndarray::<f32>().unwrap();
+        let vals: Vec<f32> = arr.iter().copied().collect();
+        assert_eq!(vals, vec![1.0, 0.0, 0.0, 4.0, 5.0, 0.0, 7.0, 8.0, 9.0]);
+    }
+
+    #[test]
+    fn test_trilu_with_k() {
+        let registry = OpRegistry::new();
+        let x = Tensor::from_slice(&[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0]).try_reshape(&[3, 3]).unwrap();
+        let k = Tensor::from_slice(&[1i64]);
+        let inputs = vec![Some(x), Some(k)];
+        let node = NodeProto::default(); // upper=1 by default
+        let result = registry.dispatch_multi("Trilu", "", &inputs, &node, i64::MAX).unwrap();
+        let arr = result[0].to_ndarray::<f32>().unwrap();
+        let vals: Vec<f32> = arr.iter().copied().collect();
+        // triu(k=1): exclude main diagonal
+        assert_eq!(vals, vec![0.0, 2.0, 3.0, 0.0, 0.0, 6.0, 0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn test_cumsum() {
+        let registry = OpRegistry::new();
+        let x = Tensor::from_slice(&[1.0f32, 2.0, 3.0, 4.0]);
+        let axis = Tensor::from_slice(&[0i64]);
+        let inputs = vec![Some(x), Some(axis)];
+        let node = NodeProto::default();
+        let result = registry.dispatch_multi("CumSum", "", &inputs, &node, i64::MAX).unwrap();
+        let arr = result[0].to_ndarray::<f32>().unwrap();
+        let vals: Vec<f32> = arr.iter().copied().collect();
+        assert_eq!(vals, vec![1.0, 3.0, 6.0, 10.0]);
+    }
+
+    #[test]
+    fn test_cumsum_exclusive_reverse() {
+        let registry = OpRegistry::new();
+        let x = Tensor::from_slice(&[1.0f32, 2.0, 3.0, 4.0]);
+        let axis = Tensor::from_slice(&[0i64]);
+        let inputs = vec![Some(x), Some(axis)];
+        let mut node = NodeProto::default();
+        let mut attr_exc = AttributeProto::default();
+        attr_exc.name = "exclusive".to_string();
+        attr_exc.i = 1;
+        node.attribute.push(attr_exc);
+        let mut attr_rev = AttributeProto::default();
+        attr_rev.name = "reverse".to_string();
+        attr_rev.i = 1;
+        node.attribute.push(attr_rev);
+        let result = registry.dispatch_multi("CumSum", "", &inputs, &node, i64::MAX).unwrap();
+        let arr = result[0].to_ndarray::<f32>().unwrap();
+        let vals: Vec<f32> = arr.iter().copied().collect();
+        // exclusive reverse cumsum of [1, 2, 3, 4]:
+        // reverse: [4, 3, 2, 1], exclusive shift: [0, 4, 3, 2], cumsum: [0, 4, 7, 9], reverse: [9, 7, 4, 0]
+        assert_eq!(vals, vec![9.0, 7.0, 4.0, 0.0]);
+    }
+
+    #[test]
+    fn test_one_hot() {
+        let registry = OpRegistry::new();
+        let indices = Tensor::from_slice(&[0i64, 1, 2]);
+        let depth = Tensor::from_slice(&[3i64]);
+        let values = Tensor::from_slice(&[0.0f32, 1.0]); // off=0, on=1
+        let inputs = vec![Some(indices), Some(depth), Some(values)];
+        let mut node = NodeProto::default();
+        let mut attr = AttributeProto::default();
+        attr.name = "axis".to_string();
+        attr.i = -1;
+        node.attribute.push(attr);
+        let result = registry.dispatch_multi("OneHot", "", &inputs, &node, i64::MAX).unwrap();
+        let arr = result[0].to_ndarray::<f32>().unwrap();
+        let vals: Vec<f32> = arr.iter().copied().collect();
+        // [1,0,0, 0,1,0, 0,0,1]
+        assert_eq!(vals, vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]);
+    }
+
+    #[test]
+    fn test_conv_basic() {
+        let registry = OpRegistry::new();
+        // 3x3 all-ones kernel on 4x4 input
+        let x_data: Vec<f32> = (0..16).map(|v| v as f32).collect();
+        let x = Tensor::from_slice(&x_data).try_reshape(&[1, 1, 4, 4]).unwrap();
+        let w = Tensor::from_slice(&[1.0f32; 9]).try_reshape(&[1, 1, 3, 3]).unwrap();
+        let inputs = vec![Some(x), Some(w)];
+        let mut node = NodeProto::default();
+        let mut attr = AttributeProto::default();
+        attr.name = "kernel_shape".to_string();
+        attr.ints = vec![3, 3];
+        node.attribute.push(attr);
+        let result = registry.dispatch_multi("Conv", "", &inputs, &node, i64::MAX).unwrap();
+        let arr = result[0].to_ndarray::<f32>().unwrap();
+        assert_eq!(arr.shape(), &[1, 1, 2, 2]);
+        assert!((arr[[0, 0, 0, 0]] - 45.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn test_conv_auto_pad_same_upper() {
+        let registry = OpRegistry::new();
+        let x = Tensor::from_slice(&[1.0f32; 9]).try_reshape(&[1, 1, 3, 3]).unwrap();
+        let w = Tensor::from_slice(&[1.0f32; 9]).try_reshape(&[1, 1, 3, 3]).unwrap();
+        let inputs = vec![Some(x), Some(w)];
+        let mut node = NodeProto::default();
+        let mut attr_k = AttributeProto::default();
+        attr_k.name = "kernel_shape".to_string();
+        attr_k.ints = vec![3, 3];
+        node.attribute.push(attr_k);
+        let mut attr_ap = AttributeProto::default();
+        attr_ap.name = "auto_pad".to_string();
+        attr_ap.s = b"SAME_UPPER".to_vec();
+        node.attribute.push(attr_ap);
+        let result = registry.dispatch_multi("Conv", "", &inputs, &node, i64::MAX).unwrap();
+        let s = result[0].shape().unwrap();
+        // SAME_UPPER with stride=1 should preserve spatial dims
+        assert_eq!(s.iter().map(|d| d.as_const().unwrap()).collect::<Vec<_>>(), vec![1, 1, 3, 3]);
+    }
+
+    #[test]
+    fn test_conv_transpose() {
+        let registry = OpRegistry::new();
+        // Simple 1x1 conv_transpose
+        let x = Tensor::from_slice(&[1.0f32, 2.0, 3.0, 4.0]).try_reshape(&[1, 1, 2, 2]).unwrap();
+        let w = Tensor::from_slice(&[2.0f32]).try_reshape(&[1, 1, 1, 1]).unwrap();
+        let inputs = vec![Some(x), Some(w)];
+        let mut node = NodeProto::default();
+        let mut attr = AttributeProto::default();
+        attr.name = "kernel_shape".to_string();
+        attr.ints = vec![1, 1];
+        node.attribute.push(attr);
+        let result = registry.dispatch_multi("ConvTranspose", "", &inputs, &node, i64::MAX).unwrap();
+        let arr = result[0].to_ndarray::<f32>().unwrap();
+        assert_eq!(arr.shape(), &[1, 1, 2, 2]);
+        assert!((arr[[0, 0, 0, 0]] - 2.0).abs() < 1e-4);
+        assert!((arr[[0, 0, 1, 1]] - 8.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn test_average_pool() {
+        let registry = OpRegistry::new();
+        let x_data: Vec<f32> = (0..16).map(|v| v as f32).collect();
+        let x = Tensor::from_slice(&x_data).try_reshape(&[1, 1, 4, 4]).unwrap();
+        let inputs = vec![Some(x)];
+        let mut node = NodeProto::default();
+        let mut attr_k = AttributeProto::default();
+        attr_k.name = "kernel_shape".to_string();
+        attr_k.ints = vec![2, 2];
+        node.attribute.push(attr_k);
+        let mut attr_s = AttributeProto::default();
+        attr_s.name = "strides".to_string();
+        attr_s.ints = vec![2, 2];
+        node.attribute.push(attr_s);
+        let result = registry.dispatch_multi("AveragePool", "", &inputs, &node, i64::MAX).unwrap();
+        let arr = result[0].to_ndarray::<f32>().unwrap();
+        assert_eq!(arr.shape(), &[1, 1, 2, 2]);
+        // Top-left: mean(0,1,4,5) = 2.5
+        assert!((arr[[0, 0, 0, 0]] - 2.5).abs() < 1e-4);
+    }
+
+    #[test]
+    fn test_average_pool_ceil() {
+        let registry = OpRegistry::new();
+        let x = Tensor::from_slice(&[0.0f32; 49]).try_reshape(&[1, 1, 7, 7]).unwrap();
+        let inputs = vec![Some(x)];
+        let mut node = NodeProto::default();
+        let mut attr_k = AttributeProto::default();
+        attr_k.name = "kernel_shape".to_string();
+        attr_k.ints = vec![2, 2];
+        node.attribute.push(attr_k);
+        let mut attr_s = AttributeProto::default();
+        attr_s.name = "strides".to_string();
+        attr_s.ints = vec![3, 3];
+        node.attribute.push(attr_s);
+        let mut attr_c = AttributeProto::default();
+        attr_c.name = "ceil_mode".to_string();
+        attr_c.i = 1;
+        node.attribute.push(attr_c);
+        let result = registry.dispatch_multi("AveragePool", "", &inputs, &node, i64::MAX).unwrap();
+        let s = result[0].shape().unwrap();
+        assert_eq!(s.iter().map(|d| d.as_const().unwrap()).collect::<Vec<_>>(), vec![1, 1, 3, 3]);
+    }
+
+    #[test]
+    fn test_max_pool() {
+        let registry = OpRegistry::new();
+        let x_data: Vec<f32> = (0..16).map(|v| v as f32).collect();
+        let x = Tensor::from_slice(&x_data).try_reshape(&[1, 1, 4, 4]).unwrap();
+        let inputs = vec![Some(x)];
+        let mut node = NodeProto::default();
+        let mut attr_k = AttributeProto::default();
+        attr_k.name = "kernel_shape".to_string();
+        attr_k.ints = vec![2, 2];
+        node.attribute.push(attr_k);
+        let mut attr_s = AttributeProto::default();
+        attr_s.name = "strides".to_string();
+        attr_s.ints = vec![2, 2];
+        node.attribute.push(attr_s);
+        let result = registry.dispatch_multi("MaxPool", "", &inputs, &node, i64::MAX).unwrap();
+        // Should return 2 outputs: values and indices
+        assert_eq!(result.len(), 2);
+        let vals = result[0].to_ndarray::<f32>().unwrap();
+        assert_eq!(vals.shape(), &[1, 1, 2, 2]);
+        // Top-left: max(0,1,4,5) = 5
+        assert!((vals[[0, 0, 0, 0]] - 5.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn test_max_pool_indices() {
+        let registry = OpRegistry::new();
+        let x_data: Vec<f32> = (0..16).map(|v| v as f32).collect();
+        let x = Tensor::from_slice(&x_data).try_reshape(&[1, 1, 4, 4]).unwrap();
+        let inputs = vec![Some(x)];
+        let mut node = NodeProto::default();
+        let mut attr_k = AttributeProto::default();
+        attr_k.name = "kernel_shape".to_string();
+        attr_k.ints = vec![2, 2];
+        node.attribute.push(attr_k);
+        let mut attr_s = AttributeProto::default();
+        attr_s.name = "strides".to_string();
+        attr_s.ints = vec![2, 2];
+        node.attribute.push(attr_s);
+        let result = registry.dispatch_multi("MaxPool", "", &inputs, &node, i64::MAX).unwrap();
+        assert_eq!(result.len(), 2);
+        let idx = result[1].to_ndarray::<i64>().unwrap();
+        assert_eq!(idx.shape(), &[1, 1, 2, 2]);
+        // For max(0..5)=5 at position (1,1) → flat index 5
+        assert_eq!(idx[[0, 0, 0, 0]], 5);
+    }
+
+    #[test]
+    fn test_layer_norm() {
+        let registry = OpRegistry::new();
+        let x = Tensor::from_slice(&[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]).try_reshape(&[2, 4]).unwrap();
+        let scale = Tensor::from_slice(&[1.0f32; 4]);
+        let bias = Tensor::from_slice(&[0.0f32; 4]);
+        let inputs = vec![Some(x), Some(scale), Some(bias)];
+        let mut node = NodeProto::default();
+        let mut attr = AttributeProto::default();
+        attr.name = "axis".to_string();
+        attr.i = -1;
+        node.attribute.push(attr);
+        let result = registry.dispatch_multi("LayerNormalization", "", &inputs, &node, i64::MAX).unwrap();
+        // Should return 3 outputs: output, mean, inv_std_dev
+        assert_eq!(result.len(), 3);
+        let arr = result[0].to_ndarray::<f32>().unwrap();
+        assert_eq!(arr.shape(), &[2, 4]);
+        // Each row should be normalized (mean ≈ 0)
+        for row in 0..2 {
+            let row_data: Vec<f32> = (0..4).map(|c| arr[[row, c]]).collect();
+            let mean: f32 = row_data.iter().sum::<f32>() / 4.0;
+            assert!(mean.abs() < 1e-4, "row {row} mean should be ~0, got {mean}");
+        }
+    }
+
+    #[test]
+    fn test_group_norm() {
+        let registry = OpRegistry::new();
+        // (1, 4, 2, 2) with 2 groups
+        let x_data: Vec<f32> = (0..16).map(|v| v as f32).collect();
+        let x = Tensor::from_slice(&x_data).try_reshape(&[1, 4, 2, 2]).unwrap();
+        let scale = Tensor::from_slice(&[1.0f32; 4]);
+        let bias = Tensor::from_slice(&[0.0f32; 4]);
+        let inputs = vec![Some(x), Some(scale), Some(bias)];
+        let mut node = NodeProto::default();
+        let mut attr = AttributeProto::default();
+        attr.name = "num_groups".to_string();
+        attr.i = 2;
+        node.attribute.push(attr);
+        let result = registry.dispatch_multi("GroupNormalization", "", &inputs, &node, i64::MAX).unwrap();
+        let arr = result[0].to_ndarray::<f32>().unwrap();
+        assert_eq!(arr.shape(), &[1, 4, 2, 2]);
+    }
+
+    #[test]
+    fn test_instance_norm() {
+        let registry = OpRegistry::new();
+        // (1, 2, 3, 3)
+        let x_data: Vec<f32> = (0..18).map(|v| v as f32).collect();
+        let x = Tensor::from_slice(&x_data).try_reshape(&[1, 2, 3, 3]).unwrap();
+        let scale = Tensor::from_slice(&[1.0f32; 2]);
+        let bias = Tensor::from_slice(&[0.0f32; 2]);
+        let inputs = vec![Some(x), Some(scale), Some(bias)];
+        let node = NodeProto::default();
+        let result = registry.dispatch_multi("InstanceNormalization", "", &inputs, &node, i64::MAX).unwrap();
+        let arr = result[0].to_ndarray::<f32>().unwrap();
+        assert_eq!(arr.shape(), &[1, 2, 3, 3]);
     }
 }

@@ -210,6 +210,11 @@ impl Tensor {
         if axis_idx != ndim - 1 { x.try_transpose(axis_idx as isize, -1) } else { Ok(x) }
     }
 
+    /// Cumulative sum along an axis.
+    pub fn cumsum(&self, axis: isize) -> Result<Self> {
+        self._cumalu(axis, CumReduceOp::Add)
+    }
+
     /// Create 1D tensor with evenly spaced values and explicit dtype.
     ///
     /// Generates values in the range `[start, stop)` with given step size.

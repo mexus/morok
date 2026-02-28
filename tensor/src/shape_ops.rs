@@ -688,6 +688,36 @@ impl Tensor {
         Ok(new_shape)
     }
 
+    /// Upper triangular mask: row + diagonal <= col.
+    fn tri(rows: i64, cols: i64, diagonal: i64) -> Result<Tensor> {
+        let row = Tensor::arange(0, Some(rows), None)?.try_unsqueeze(-1)?;
+        let col = Tensor::arange(0, Some(cols), None)?;
+        let diag = Tensor::const_(ConstValue::Int(diagonal), DType::Int32);
+        row.try_add(&diag)?.try_le(&col)
+    }
+
+    /// Keep upper triangle, zero below. Matches Tinygrad `Tensor.triu(diagonal)`.
+    pub fn triu(&self, diagonal: i64) -> Result<Tensor> {
+        let shape = self.shape()?;
+        let ndim = shape.len();
+        let r = shape[ndim - 2].as_const().unwrap() as i64;
+        let c = shape[ndim - 1].as_const().unwrap() as i64;
+        let mask = Self::tri(r, c, diagonal)?;
+        let zero = Tensor::new(self.uop().const_like(ConstValue::zero(self.uop().dtype().scalar().unwrap())));
+        self.where_(&mask, &zero)
+    }
+
+    /// Keep lower triangle, zero above. Matches Tinygrad `Tensor.tril(diagonal)`.
+    pub fn tril(&self, diagonal: i64) -> Result<Tensor> {
+        let shape = self.shape()?;
+        let ndim = shape.len();
+        let r = shape[ndim - 2].as_const().unwrap() as i64;
+        let c = shape[ndim - 1].as_const().unwrap() as i64;
+        let mask = Self::tri(r, c, diagonal + 1)?;
+        let zero = Tensor::new(self.uop().const_like(ConstValue::zero(self.uop().dtype().scalar().unwrap())));
+        zero.where_(&mask, self)
+    }
+
     /// Resolve expand shape with -1 meaning "keep current dimension".
     fn resolve_expand_shape(&self, shape_spec: &[isize]) -> Result<Shape> {
         let current_shape = self.shape()?;

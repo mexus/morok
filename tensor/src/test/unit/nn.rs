@@ -231,6 +231,67 @@ fn test_max_pool2d_pad() {
 }
 
 // =========================================================================
+// Ceil mode pooling tests
+// =========================================================================
+
+#[test]
+fn test_avg_pool2d_ceil_mode_shape() {
+    // (1,1,7,7) with k=2 s=3 ceil_mode=true → output should be 3x3 (ceil) vs 2x2 (floor)
+    let x = Tensor::from_slice(&[0.0f32; 49]).try_reshape(&[1, 1, 7, 7]).unwrap();
+    let result = x.avg_pool2d().kernel_size(&[2, 2]).stride(&[3, 3]).ceil_mode(true).call().unwrap();
+    let shape = result.shape().unwrap();
+    let dims: Vec<usize> = shape.iter().map(|s| s.as_const().unwrap()).collect();
+    assert_eq!(dims, vec![1, 1, 3, 3]);
+}
+
+#[test]
+fn test_max_pool2d_ceil_mode_shape() {
+    // (1,1,7,7) with k=2 s=3 ceil_mode=true → output should be 3x3
+    let x = Tensor::from_slice(&[0.0f32; 49]).try_reshape(&[1, 1, 7, 7]).unwrap();
+    let result = x.max_pool2d().kernel_size(&[2, 2]).stride(&[3, 3]).ceil_mode(true).call().unwrap();
+    let shape = result.shape().unwrap();
+    let dims: Vec<usize> = shape.iter().map(|s| s.as_const().unwrap()).collect();
+    assert_eq!(dims, vec![1, 1, 3, 3]);
+}
+
+#[test]
+fn test_max_pool2d_with_indices_basic() {
+    // 2x2 kernel on 4x4 with stride 2 → 2x2 output
+    let x_data: Vec<f32> =
+        vec![-1.0, 2.0, 3.0, -4.0, 5.0, -6.0, 7.0, 8.0, 9.0, 10.0, -11.0, 12.0, 13.0, -14.0, 15.0, 16.0];
+    let x = Tensor::from_slice(&x_data).try_reshape(&[1, 1, 4, 4]).unwrap();
+    let (values, indices) = x.max_pool2d_with_indices().kernel_size(&[2, 2]).stride(&[2, 2]).call().unwrap();
+    let vals = values.to_ndarray::<f32>().unwrap();
+    assert_eq!(vals.shape(), &[1, 1, 2, 2]);
+    // Top-left: max(-1, 2, 5, -6) = 5 at flat index 4
+    assert!((vals[[0, 0, 0, 0]] - 5.0).abs() < 1e-4);
+    // Top-right: max(3, -4, 7, 8) = 8 at flat index 7
+    assert!((vals[[0, 0, 0, 1]] - 8.0).abs() < 1e-4);
+
+    let idx = indices.to_ndarray::<i32>().unwrap();
+    assert_eq!(idx.shape(), &[1, 1, 2, 2]);
+    // Index of max=5 in flat 4x4: position (1,0) → index 4
+    assert_eq!(idx[[0, 0, 0, 0]], 4);
+    // Index of max=8 in flat 4x4: position (1,3) → index 7
+    assert_eq!(idx[[0, 0, 0, 1]], 7);
+}
+
+#[test]
+fn test_avg_pool2d_ceil_mode_large_stride() {
+    // Regression test for ceil_mode correction: input=3, kernel=2, stride=3
+    // Without correction, apply_ceil_mode over-pads by 1.
+    // Expected: ceildiv(3-2, 3)+1 = 2 output elements, but last window starts
+    // past real data, so correction reduces padding.
+    let x = Tensor::from_slice(&[1.0f32, 2.0, 3.0]).try_reshape(&[1, 1, 1, 3]).unwrap();
+    let result = x.avg_pool2d().kernel_size(&[1, 2]).stride(&[1, 3]).ceil_mode(true).call().unwrap();
+    let shape = result.shape().unwrap();
+    let dims: Vec<usize> = shape.iter().map(|s| s.as_const().unwrap()).collect();
+    // With stride=3, kernel=2, input=3: floor output=1 ([1,2]), ceil output=1
+    // (last window at offset 3 starts past data end, so correction removes it)
+    assert_eq!(dims[3], 1);
+}
+
+// =========================================================================
 // Normalization tests
 // =========================================================================
 

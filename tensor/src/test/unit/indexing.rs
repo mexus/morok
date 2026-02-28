@@ -6,6 +6,32 @@ fn get_shape(tensor: &Tensor) -> Vec<usize> {
 }
 
 // =========================================================================
+// One-Hot Tests
+// =========================================================================
+
+#[test]
+fn test_one_hot_along_dim_basic() {
+    // [0, 1, 2] with 3 classes → 3x3 identity-like mask
+    let idx = Tensor::from_slice(&[0i32, 1, 2]).try_unsqueeze(-1).unwrap();
+    let result = idx.one_hot_along_dim(3, -1).unwrap();
+    let shape = get_shape(&result);
+    assert_eq!(shape, vec![3, 3]);
+    let arr = result.to_ndarray::<bool>().unwrap();
+    // Row 0: [true, false, false]
+    assert!(arr[[0, 0]]);
+    assert!(!arr[[0, 1]]);
+    assert!(!arr[[0, 2]]);
+    // Row 1: [false, true, false]
+    assert!(!arr[[1, 0]]);
+    assert!(arr[[1, 1]]);
+    assert!(!arr[[1, 2]]);
+    // Row 2: [false, false, true]
+    assert!(!arr[[2, 0]]);
+    assert!(!arr[[2, 1]]);
+    assert!(arr[[2, 2]]);
+}
+
+// =========================================================================
 // Gather Tests
 // =========================================================================
 

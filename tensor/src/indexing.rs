@@ -42,4 +42,16 @@ impl Tensor {
 
         x.where_(&mask, &Self::new(x.uop().const_like(0)))?.sum_with().axes(-1).dtype(self.uop().dtype()).call()
     }
+
+    /// One-hot encoding: self == arange(num_classes) broadcast along dim.
+    /// Returns a boolean tensor with True at the class positions.
+    pub fn one_hot_along_dim(&self, num_classes: usize, dim: isize) -> Result<Tensor> {
+        let ndim = self.ndim()?;
+        let norm_dim = Self::normalize_axis(dim, ndim)?;
+        let offset = ndim - norm_dim - 1;
+        let arange = Tensor::arange(0, Some(num_classes as i64), None)?;
+        let mut ar_shape = vec![1isize; 1 + offset];
+        ar_shape[0] = num_classes as isize;
+        self.try_eq(&arange.try_reshape(&ar_shape)?)
+    }
 }
