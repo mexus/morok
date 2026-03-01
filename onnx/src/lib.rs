@@ -24,3 +24,6 @@ pub mod registry;
 
 pub use error::{Error, Result};
 pub use importer::{DimValue, InputSpec, OnnxGraph, OnnxImporter};
+
+#[cfg(test)]
+mod test;
