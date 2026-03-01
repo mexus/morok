@@ -128,6 +128,22 @@ impl Tensor {
         Self { entry, buffer: Some(buffer) }
     }
 
+    /// Ensure buffer is attached if the UOp has buffer identity.
+    ///
+    /// When `apply_map_to_tensors` substitutes a tensor's UOp with a realized
+    /// BUFFER+RESHAPE, the Tensor struct's `buffer` field isn't updated.
+    /// This method looks up the buffer from the registry and attaches it.
+    pub(crate) fn ensure_buffer(mut self) -> Self {
+        if self.buffer.is_none() {
+            let buffer_id = self.uop().base().id;
+            if let Some(buf_arc) = tensor_registry::get_buffer_arc(buffer_id) {
+                self.entry.set_buffer(Arc::clone(&buf_arc));
+                self.buffer = Some(buf_arc);
+            }
+        }
+        self
+    }
+
     /// Create a new tensor from a UOp, preserving buffer from self.
     ///
     /// Used by movement operations (reshape, permute, etc.) that create
