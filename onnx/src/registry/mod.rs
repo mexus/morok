@@ -139,6 +139,20 @@ impl OpRegistry {
             "Sin" => inp(inputs, 0).sin()?,
             "Cos" => inp(inputs, 0).cos()?,
             "Tan" => inp(inputs, 0).tan()?,
+            "Asin" => inp(inputs, 0).asin()?,
+            "Acos" => inp(inputs, 0).acos()?,
+            "Atan" => inp(inputs, 0).atan()?,
+            "Sinh" => inp(inputs, 0).sinh()?,
+            "Cosh" => inp(inputs, 0).cosh()?,
+            "Asinh" => inp(inputs, 0).asinh()?,
+            "Acosh" => inp(inputs, 0).acosh()?,
+            "Atanh" => inp(inputs, 0).atanh()?,
+            "IsNaN" => inp(inputs, 0).isnan()?,
+            "IsInf" => {
+                let detect_negative = get_attr_int(node, "detect_negative", 1) == 1;
+                let detect_positive = get_attr_int(node, "detect_positive", 1) == 1;
+                inp(inputs, 0).isinf(detect_positive, detect_negative)?
+            }
 
             // === Activation ===
             "Relu" => inp(inputs, 0).relu()?,
@@ -190,6 +204,17 @@ impl OpRegistry {
                 let gamma = get_attr_float(node, "gamma", 1.050_701) as f64;
                 inp(inputs, 0).selu(alpha, gamma)?
             }
+            "Softplus" => {
+                let beta = get_attr_float(node, "beta", 1.0) as f64;
+                inp(inputs, 0).softplus(beta)?
+            }
+            "Mish" => inp(inputs, 0).mish()?,
+            "HardSwish" => inp(inputs, 0).hardswish()?,
+            "Softsign" => inp(inputs, 0).softsign()?,
+            "Celu" => {
+                let alpha = get_attr_float(node, "alpha", 1.0) as f64;
+                inp(inputs, 0).celu(alpha)?
+            }
 
             // === Comparison ===
             "Equal" => inp(inputs, 0).try_eq(inp(inputs, 1))?,
@@ -198,6 +223,21 @@ impl OpRegistry {
             "Greater" => inp(inputs, 0).try_gt(inp(inputs, 1))?,
             "GreaterOrEqual" => inp(inputs, 0).try_ge(inp(inputs, 1))?,
             "Not" => inp(inputs, 0).logical_not()?,
+            "And" => {
+                let (x, y) = (inp(inputs, 0), inp(inputs, 1));
+                let cond = x.try_eq(y)?;
+                x.where_(&cond, &Tensor::from_const(false))?
+            }
+            "Or" => {
+                let (x, y) = (inp(inputs, 0), inp(inputs, 1));
+                let cond = x.try_eq(y)?;
+                x.where_(&cond, &Tensor::from_const(true))?
+            }
+            "Xor" => {
+                let x = inp(inputs, 0).cast(DType::Bool)?;
+                let y = inp(inputs, 1).cast(DType::Bool)?;
+                x.bitwise_xor(&y)?
+            }
 
             // === Conditional ===
             "Where" => inp(inputs, 1).where_(inp(inputs, 0), inp(inputs, 2))?,
@@ -479,6 +519,103 @@ impl OpRegistry {
                 let (values, indices) = inp(inputs, 0).topk(k, axis, largest)?;
                 return Ok(vec![values, indices.cast(DType::Int64)?]);
             }
+
+            // === Simple Ops ===
+            "Hardmax" => {
+                let axis = get_attr_int(node, "axis", -1) as isize;
+                inp(inputs, 0).hardmax(axis)?
+            }
+            "Binarizer" => {
+                let threshold = get_attr_float(node, "threshold", 0.0) as f64;
+                let x = inp(inputs, 0);
+                x.try_gt(&Tensor::const_(threshold, x.uop().dtype()))?.cast(DType::Float32)?
+            }
+            "Swish" => {
+                let alpha = get_attr_float(node, "alpha", 1.0) as f64;
+                let x = inp(inputs, 0);
+                let alpha_t = Tensor::const_(alpha, x.uop().dtype());
+                x.try_mul(&x.try_mul(&alpha_t)?.sigmoid()?)?
+            }
+            "BiasGelu" => {
+                let x = inp(inputs, 0);
+                let bias = inp(inputs, 1);
+                let xb = x.try_add(bias)?;
+                let approximate = get_attr_string(node, "approximate", "none");
+                if approximate == "tanh" {
+                    xb.gelu()?
+                } else {
+                    let dtype = xb.uop().dtype();
+                    let half = Tensor::const_(0.5f64, dtype.clone());
+                    let one = Tensor::const_(1.0f64, dtype.clone());
+                    let sqrt2 = Tensor::const_(std::f64::consts::SQRT_2, dtype);
+                    half.try_mul(&xb)?.try_mul(&one.try_add(&xb.try_div(&sqrt2)?.erf()?)?)?
+                }
+            }
+            "FastGelu" => {
+                let x = inp(inputs, 0);
+                let xb =
+                    if let Some(bias) = inputs.get(1).and_then(|o| o.as_ref()) { x.try_add(bias)? } else { x.clone() };
+                xb.gelu()?
+            }
+            "Shrink" => {
+                let bias = get_attr_float(node, "bias", 0.0) as f64;
+                let lambd = get_attr_float(node, "lambd", 0.5) as f64;
+                inp(inputs, 0).shrink(bias, lambd)?
+            }
+            "EyeLike" => {
+                let x = inp(inputs, 0);
+                let x_shape = x.shape()?;
+                let dtype = if let Some(dt) = get_attr(node, "dtype") {
+                    convert_onnx_dtype(dt.i as i32)?
+                } else {
+                    x.uop().dtype()
+                };
+                let k = get_attr_int(node, "k", 0);
+                let h = x_shape[0]
+                    .as_const()
+                    .ok_or_else(|| Error::IrConstruction { details: "EyeLike requires concrete shape".into() })?;
+                let w = x_shape[1]
+                    .as_const()
+                    .ok_or_else(|| Error::IrConstruction { details: "EyeLike requires concrete shape".into() })?;
+                let eye_size = h.min(w);
+                let mut eye = Tensor::eye(eye_size, eye_size)?.cast(dtype)?;
+                if h != w || k != 0 {
+                    let k = k as isize;
+                    let pad_top = if k < 0 { (-k) as isize } else { 0 };
+                    let pad_left = if k > 0 { k as isize } else { 0 };
+                    let pad_bottom = h as isize - eye_size as isize - pad_top;
+                    let pad_right = w as isize - eye_size as isize - pad_left;
+                    eye = eye.try_pad(&[(pad_top, pad_bottom), (pad_left, pad_right)])?;
+                }
+                eye
+            }
+            "OptionalHasElement" => {
+                let has = inputs.first().and_then(|o| o.as_ref()).is_some_and(|t| t.numel().unwrap_or(0) > 0);
+                Tensor::from_const(has)
+            }
+            "OptionalGetElement" => match inputs.first().and_then(|o| o.as_ref()) {
+                Some(t) => t.clone(),
+                None => Tensor::empty(DType::Float32),
+            },
+            "CenterCropPad" => {
+                let t = inp(inputs, 0);
+                let target_shape = tensor_to_i64_vec(inp(inputs, 1))?;
+                let target: Vec<usize> = target_shape.iter().map(|&v| v as usize).collect();
+                let axes: Option<Vec<usize>> = get_attr(node, "axes").map(|a| {
+                    a.ints
+                        .iter()
+                        .map(|&v| if v < 0 { (t.ndim().unwrap() as i64 + v) as usize } else { v as usize })
+                        .collect()
+                });
+                t.center_crop_pad(&target, axes.as_deref())?
+            }
+            "Compress" => {
+                let cond_vals = tensor_to_i64_vec(inp(inputs, 1))?;
+                let condition: Vec<bool> = cond_vals.iter().map(|&v| v != 0).collect();
+                let axis = get_attr(node, "axis").map(|a| a.i as isize);
+                inp(inputs, 0).compress(&condition, axis)?
+            }
+            "Upsample" => nn::op_resize(inputs, node)?,
 
             // === Identity / Constant ===
             "Identity" => inp(inputs, 0).clone(),

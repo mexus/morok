@@ -152,3 +152,79 @@ fn test_cast_fallback() {
     let result = registry.dispatch("Cast", "", &[x], &node);
     assert!(result.is_ok(), "Cast with invalid dtype should fallback, not crash");
 }
+
+#[test]
+fn test_and() {
+    let registry = OpRegistry::new();
+    let a = Tensor::from_slice([true, true, false, false]);
+    let b = Tensor::from_slice([true, false, true, false]);
+    let node = NodeProto::default();
+
+    let result = registry.dispatch("And", "", &[a, b], &node).unwrap().realize().unwrap();
+    let arr = result.to_ndarray::<bool>().unwrap();
+    let vals: Vec<bool> = arr.iter().copied().collect();
+    assert_eq!(vals, vec![true, false, false, false]);
+}
+
+#[test]
+fn test_or() {
+    let registry = OpRegistry::new();
+    let a = Tensor::from_slice([true, true, false, false]);
+    let b = Tensor::from_slice([true, false, true, false]);
+    let node = NodeProto::default();
+
+    let result = registry.dispatch("Or", "", &[a, b], &node).unwrap().realize().unwrap();
+    let arr = result.to_ndarray::<bool>().unwrap();
+    let vals: Vec<bool> = arr.iter().copied().collect();
+    assert_eq!(vals, vec![true, true, true, false]);
+}
+
+#[test]
+fn test_xor() {
+    let registry = OpRegistry::new();
+    let a = Tensor::from_slice([true, true, false, false]);
+    let b = Tensor::from_slice([true, false, true, false]);
+    let node = NodeProto::default();
+
+    let result = registry.dispatch("Xor", "", &[a, b], &node).unwrap().realize().unwrap();
+    let arr = result.to_ndarray::<bool>().unwrap();
+    let vals: Vec<bool> = arr.iter().copied().collect();
+    assert_eq!(vals, vec![false, true, true, false]);
+}
+
+#[test]
+fn test_isnan() {
+    let registry = OpRegistry::new();
+    let x = Tensor::from_slice([1.0f32, f32::NAN, 3.0]);
+    let node = NodeProto::default();
+
+    let result = registry.dispatch("IsNaN", "", &[x], &node).unwrap().realize().unwrap();
+    let arr = result.to_ndarray::<bool>().unwrap();
+    let vals: Vec<bool> = arr.iter().copied().collect();
+    assert_eq!(vals, vec![false, true, false]);
+}
+
+#[test]
+fn test_isinf() {
+    let registry = OpRegistry::new();
+    let x = Tensor::from_slice([1.0f32, f32::INFINITY, f32::NEG_INFINITY]);
+    let node = NodeProto::default();
+
+    let result = registry.dispatch("IsInf", "", &[x], &node).unwrap().realize().unwrap();
+    assert!(result.buffer().is_some());
+}
+
+#[test]
+fn test_shrink() {
+    let registry = OpRegistry::new();
+    let x = Tensor::from_slice([-2.0f32, -0.3, 0.0, 0.3, 2.0]);
+    let node = NodeProto::default();
+
+    let result = registry.dispatch("Shrink", "", &[x], &node).unwrap().realize().unwrap();
+    let arr = result.to_ndarray::<f32>().unwrap();
+    let vals: Vec<f32> = arr.iter().copied().collect();
+    let expected = vec![-2.0f32, 0.0, 0.0, 0.0, 2.0];
+    for (a, b) in vals.iter().zip(expected.iter()) {
+        assert!((a - b).abs() < 1e-4, "expected {b}, got {a}");
+    }
+}

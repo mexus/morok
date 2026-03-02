@@ -1128,3 +1128,40 @@ fn test_dropout_v7_inference() {
     let out = result[0].clone().realize().unwrap().to_ndarray::<f32>().unwrap();
     assert_eq!(out.as_slice().unwrap(), &[1.0, 2.0, 3.0]); // passthrough
 }
+
+// =========================================================================
+// Optional operator tests
+// =========================================================================
+
+#[test]
+fn test_optional_has_element_present() {
+    let registry = OpRegistry::new();
+    let x = Tensor::from_slice([1.0f32]);
+    let inputs = vec![Some(x)];
+    let node = NodeProto::default();
+    let result = registry.dispatch_multi("OptionalHasElement", "", &inputs, &node, i64::MAX).unwrap();
+    let arr = result[0].to_ndarray::<bool>().unwrap();
+    assert_eq!(arr[[]], true);
+}
+
+#[test]
+fn test_optional_has_element_absent() {
+    let registry = OpRegistry::new();
+    let inputs: Vec<Option<Tensor>> = vec![None];
+    let node = NodeProto::default();
+    let result = registry.dispatch_multi("OptionalHasElement", "", &inputs, &node, i64::MAX).unwrap();
+    let arr = result[0].to_ndarray::<bool>().unwrap();
+    assert_eq!(arr[[]], false);
+}
+
+#[test]
+fn test_optional_get_element() {
+    let registry = OpRegistry::new();
+    let x = Tensor::from_slice([1.0f32, 2.0, 3.0]);
+    let inputs = vec![Some(x)];
+    let node = NodeProto::default();
+    let result = registry.dispatch_multi("OptionalGetElement", "", &inputs, &node, i64::MAX).unwrap();
+    let arr = result[0].to_ndarray::<f32>().unwrap();
+    let vals: Vec<f32> = arr.iter().copied().collect();
+    assert_eq!(vals, vec![1.0, 2.0, 3.0]);
+}

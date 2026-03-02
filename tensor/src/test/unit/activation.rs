@@ -179,3 +179,66 @@ fn test_batchnorm_4d() {
     assert_eq!(shape[2].as_const(), Some(4));
     assert_eq!(shape[3].as_const(), Some(5));
 }
+
+// =========================================================================
+// Activation Value Tests
+// =========================================================================
+
+#[test]
+fn test_softplus_values() {
+    let x = Tensor::from_slice([0.0f32, 1.0, -1.0]);
+    let result = crate::test::helpers::realize_f32(x.softplus(1.0).unwrap());
+    crate::test::helpers::assert_close_f32(&result, &[0.6931, 1.3133, 0.3133], 1e-3);
+}
+
+#[test]
+fn test_softplus_beta() {
+    let x = Tensor::from_slice([0.0f32, 1.0]);
+    let result = crate::test::helpers::realize_f32(x.softplus(2.0).unwrap());
+    // softplus(0, beta=2) = log(1+exp(0))/2 = ln(2)/2 = 0.3466
+    // softplus(1, beta=2) = log(1+exp(2))/2 = ln(8.389)/2 = 1.0635
+    crate::test::helpers::assert_close_f32(&result, &[0.3466, 1.0635], 1e-3);
+}
+
+#[test]
+fn test_softplus_large_input() {
+    // softplus(100) ≈ 100.0 (should not overflow to inf)
+    let x = Tensor::from_slice([100.0f32, -100.0]);
+    let result = crate::test::helpers::realize_f32(x.softplus(1.0).unwrap());
+    crate::test::helpers::assert_close_f32(&result, &[100.0, 0.0], 1e-3);
+}
+
+#[test]
+fn test_mish_values() {
+    let x = Tensor::from_slice([0.0f32, 1.0, -1.0]);
+    let result = crate::test::helpers::realize_f32(x.mish().unwrap());
+    crate::test::helpers::assert_close_f32(&result, &[0.0, 0.8651, -0.3034], 1e-3);
+}
+
+#[test]
+fn test_relu6_values() {
+    let x = Tensor::from_slice([-1.0f32, 0.0, 3.0, 6.0, 9.0]);
+    let result = crate::test::helpers::realize_f32(x.relu6().unwrap());
+    crate::test::helpers::assert_close_f32(&result, &[0.0, 0.0, 3.0, 6.0, 6.0], 1e-4);
+}
+
+#[test]
+fn test_hardswish_values() {
+    let x = Tensor::from_slice([-4.0f32, -3.0, 0.0, 3.0, 4.0]);
+    let result = crate::test::helpers::realize_f32(x.hardswish().unwrap());
+    crate::test::helpers::assert_close_f32(&result, &[0.0, 0.0, 0.0, 3.0, 4.0], 1e-3);
+}
+
+#[test]
+fn test_softsign_values() {
+    let x = Tensor::from_slice([-2.0f32, 0.0, 2.0]);
+    let result = crate::test::helpers::realize_f32(x.softsign().unwrap());
+    crate::test::helpers::assert_close_f32(&result, &[-0.6667, 0.0, 0.6667], 1e-3);
+}
+
+#[test]
+fn test_celu_values() {
+    let x = Tensor::from_slice([-1.0f32, 0.0, 1.0]);
+    let result = crate::test::helpers::realize_f32(x.celu(1.0).unwrap());
+    crate::test::helpers::assert_close_f32(&result, &[-0.6321, 0.0, 1.0], 1e-3);
+}

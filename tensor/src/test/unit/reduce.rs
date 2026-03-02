@@ -826,3 +826,13 @@ fn test_indices_cast_bug() {
 
     assert_eq!(after_cast.as_slice().unwrap(), &[5, 4, 3, 2, 1]);
 }
+
+#[test]
+fn test_hardmax_basic() {
+    let x = Tensor::from_slice([1.0f32, 3.0, 2.0, 5.0, 4.0, 0.0]).try_reshape(&[2, 3]).unwrap();
+    let result = x.hardmax(-1).unwrap();
+    let arr = result.to_ndarray::<f32>().unwrap();
+    assert_eq!(arr.shape(), &[2, 3]);
+    let vals: Vec<f32> = arr.iter().copied().collect();
+    assert_eq!(vals, vec![0.0, 1.0, 0.0, 1.0, 0.0, 0.0]);
+}

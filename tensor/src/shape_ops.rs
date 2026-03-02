@@ -615,6 +615,36 @@ impl Tensor {
         self.uop().try_shrink(&ranges_sint).map(|uop| self.with_same_buffer(uop)).context(UOpSnafu)
     }
 
+    /// Center-crop or center-pad each specified axis to the target size.
+    ///
+    /// For axes where `target < current`, crops from the center.
+    /// For axes where `target > current`, pads symmetrically around the center.
+    /// Axes where `target == current` are unchanged.
+    ///
+    /// `axes` specifies which dimensions to apply (default: all).
+    pub fn center_crop_pad(&self, target_shape: &[usize], axes: Option<&[usize]>) -> Result<Tensor> {
+        let shape = self.shape()?;
+        let ndim = shape.len();
+        let default_axes: Vec<usize> = (0..ndim).collect();
+        let axes = axes.unwrap_or(&default_axes);
+
+        let mut shrink_arg: Vec<(isize, isize)> =
+            (0..ndim).map(|i| (0, shape[i].as_const().unwrap_or(1) as isize)).collect();
+        let mut pad_arg: Vec<(isize, isize)> = vec![(0, 0); ndim];
+
+        for (&s, &ax) in target_shape.iter().zip(axes.iter()) {
+            let s = s as isize;
+            let tx = shape[ax].as_const().unwrap_or(1) as isize;
+            if s < tx {
+                shrink_arg[ax] = (tx / 2 - (s + 1) / 2, tx / 2 + s / 2);
+            } else if s > tx {
+                pad_arg[ax] = ((s - tx) / 2, (s - tx + 1) / 2);
+            }
+        }
+
+        self.try_shrink(&shrink_arg)?.try_pad(&pad_arg)
+    }
+
     // =========================================================================
     // Helper Methods
     // =========================================================================

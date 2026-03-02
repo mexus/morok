@@ -424,6 +424,27 @@ impl Tensor {
         argmax_impl(self, axis.into(), keepdim)
     }
 
+    /// Hard maximum: one-hot encoding of the argmax along an axis.
+    ///
+    /// Returns a tensor of the same shape with 1.0 at the position of the
+    /// maximum value along `axis` and 0.0 elsewhere, cast to the input dtype.
+    #[track_caller]
+    pub fn hardmax(&self, axis: isize) -> Result<Self> {
+        let shape = self.shape()?;
+        let ndim = shape.len();
+        let norm_axis = Self::normalize_axis(axis, ndim)?;
+        let axis_size = shape[norm_axis].as_const().ok_or_else(|| crate::error::Error::SymbolicShapeUnsupported {
+            operation: format!("hardmax axis {norm_axis}"),
+        })?;
+        self.argmax_with()
+            .axis(Some(axis))
+            .keepdim(false)
+            .call()?
+            .try_unsqueeze(axis)?
+            .one_hot_along_dim(axis_size, axis)?
+            .cast(self.uop().dtype())
+    }
+
     /// Index of minimum value along axis.
     ///
     /// Returns int32 tensor with indices of minimum values.

@@ -182,3 +182,40 @@ fn test_constant_of_shape_empty() {
     assert_eq!(arr.len(), 0);
     assert_eq!(arr.shape(), &[0]);
 }
+
+#[test]
+fn test_eye_like() {
+    let registry = OpRegistry::new();
+    let x = Tensor::from_slice([0.0f32; 9]).try_reshape(&[3, 3]).unwrap();
+    let node = NodeProto::default();
+    let result = registry.dispatch("EyeLike", "", &[x], &node).unwrap();
+    let arr = result.to_ndarray::<f32>().unwrap();
+    assert_eq!(arr.shape(), &[3, 3]);
+    let vals: Vec<f32> = arr.iter().copied().collect();
+    assert_eq!(vals, vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]);
+}
+
+#[test]
+fn test_center_crop_pad_crop() {
+    let registry = OpRegistry::new();
+    let x = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]).try_reshape(&[2, 3]).unwrap();
+    let shape = Tensor::from_slice([2i64, 2]);
+    let inputs = vec![Some(x), Some(shape)];
+    let node = NodeProto::default();
+    let result = registry.dispatch_multi("CenterCropPad", "", &inputs, &node, i64::MAX).unwrap();
+    let s = result[0].shape().unwrap();
+    assert_eq!(s.iter().map(|d| d.as_const().unwrap()).collect::<Vec<_>>(), vec![2, 2]);
+}
+
+#[test]
+fn test_compress() {
+    let registry = OpRegistry::new();
+    let data = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0]);
+    let condition = Tensor::from_slice([0i64, 1, 1, 0]);
+    let inputs = vec![Some(data), Some(condition)];
+    let node = NodeProto::default();
+    let result = registry.dispatch_multi("Compress", "", &inputs, &node, i64::MAX).unwrap();
+    let arr = result[0].to_ndarray::<f32>().unwrap();
+    let vals: Vec<f32> = arr.iter().copied().collect();
+    assert_eq!(vals, vec![2.0, 3.0]);
+}

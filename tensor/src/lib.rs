@@ -592,5 +592,23 @@ impl Tensor {
     }
 }
 
+impl Tensor {
+    /// Helper to broadcast a scalar constant to match this tensor's shape.
+    pub(crate) fn broadcast_scalar(&self, value: ConstValue) -> Result<Self> {
+        let shape = self.shape()?;
+        let scalar = Self::new(UOp::const_(self.uop().dtype(), value));
+        scalar.broadcast_to(&shape)
+    }
+
+    /// Identity matrix of shape `[n, m]`.
+    ///
+    /// Uses `arange(n).unsqueeze(-1) == arange(m)` then casts to Float32.
+    pub fn eye(n: usize, m: usize) -> Result<Self> {
+        let rows = Self::arange(n as i64, None, None)?.try_unsqueeze(-1)?;
+        let cols = Self::arange(m as i64, None, None)?;
+        rows.try_eq(&cols)?.cast(DType::Float32)
+    }
+}
+
 #[cfg(test)]
 mod test;

@@ -211,6 +211,19 @@ impl Tensor {
         x.gather(0, &idxs)
     }
 
+    /// Select elements along an axis where `condition` is true.
+    ///
+    /// If `axis` is None, the input is flattened first and selection is along axis 0.
+    /// The condition is a 1D boolean/integer tensor; nonzero values select.
+    #[track_caller]
+    pub fn compress(&self, condition: &[bool], axis: Option<isize>) -> Result<Tensor> {
+        let x = if axis.is_none() { self.flatten()? } else { self.clone() };
+        let axis = axis.unwrap_or(0);
+        let indices: Vec<i64> = condition.iter().enumerate().filter(|(_, v)| **v).map(|(i, _)| i as i64).collect();
+        let idx = Tensor::from_slice(&indices);
+        x.gather(axis, &idx)
+    }
+
     // =========================================================================
     // Sort (Bitonic) (Tinygrad tensor.py:2730-2779)
     // =========================================================================

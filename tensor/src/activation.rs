@@ -11,15 +11,6 @@ use crate::{Result, Tensor, error::UOpSnafu, reduce::AxisSpec};
 
 #[bon]
 impl Tensor {
-    /// Helper to broadcast a scalar constant to match this tensor's shape.
-    ///
-    /// Uses the broadcast_to method which supports symbolic shapes.
-    fn broadcast_scalar(&self, value: ConstValue) -> Result<Self> {
-        let shape = self.shape()?;
-        let scalar = Self::new(UOp::const_(self.uop().dtype(), value));
-        scalar.broadcast_to(&shape)
-    }
-
     /// Rectified Linear Unit: `max(0, x)`.
     ///
     /// ReLU is one of the most common activation functions in deep learning.
@@ -313,6 +304,56 @@ impl Tensor {
     /// Alias for `swish` (matches PyTorch naming).
     pub fn silu(&self) -> Result<Self> {
         self.swish()
+    }
+
+    /// Softplus: `log(1 + exp(beta*x)) / beta`, numerically stable via logaddexp.
+    pub fn softplus(&self, beta: f64) -> Result<Self> {
+        let beta_t = self.broadcast_scalar(ConstValue::Float(beta))?;
+        let scaled = self.try_mul(&beta_t)?;
+        let zero = self.broadcast_scalar(ConstValue::Int(0))?;
+        let inv_beta = self.broadcast_scalar(ConstValue::Float(1.0 / beta))?;
+        // logaddexp(scaled, 0) = max(scaled, 0) + log(exp(scaled - max) + exp(0 - max))
+        let m = scaled.maximum(&zero)?;
+        let stable = scaled.try_sub(&m)?.try_exp()?.try_add(&zero.try_sub(&m)?.try_exp()?)?.try_log()?.try_add(&m)?;
+        stable.try_mul(&inv_beta)
+    }
+
+    /// Mish: `x * tanh(softplus(x))`.
+    pub fn mish(&self) -> Result<Self> {
+        self.try_mul(&self.softplus(1.0)?.tanh()?)
+    }
+
+    /// ReLU6: `relu(x) - relu(x-6)` = `clamp(x, 0, 6)`.
+    pub fn relu6(&self) -> Result<Self> {
+        let six = self.broadcast_scalar(ConstValue::Int(6))?;
+        let relu_x = self.relu()?;
+        let relu_x6 = self.try_sub(&six)?.relu()?;
+        relu_x.try_sub(&relu_x6)
+    }
+
+    /// HardSwish: `x * relu6(x+3) / 6`.
+    pub fn hardswish(&self) -> Result<Self> {
+        let three = self.broadcast_scalar(ConstValue::Int(3))?;
+        let six = self.broadcast_scalar(ConstValue::Int(6))?;
+        let r6 = self.try_add(&three)?.relu6()?;
+        self.try_mul(&r6)?.try_div(&six)
+    }
+
+    /// Softsign: `x / (1 + |x|)`.
+    pub fn softsign(&self) -> Result<Self> {
+        let one = self.broadcast_scalar(ConstValue::Int(1))?;
+        let denom = one.try_add(&self.try_abs()?)?;
+        self.try_div(&denom)
+    }
+
+    /// CELU: `max(0, x) + min(0, alpha*(exp(x/alpha)-1))`.
+    pub fn celu(&self, alpha: f64) -> Result<Self> {
+        let zero = self.broadcast_scalar(ConstValue::Int(0))?;
+        let one = self.broadcast_scalar(ConstValue::Int(1))?;
+        let alpha_t = self.broadcast_scalar(ConstValue::Float(alpha))?;
+        let pos = self.maximum(&zero)?;
+        let neg = alpha_t.try_mul(&self.try_div(&alpha_t)?.try_exp()?.try_sub(&one)?)?.minimum(&zero)?;
+        pos.try_add(&neg)
     }
 
     /// Batch Normalization.
