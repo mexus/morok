@@ -270,6 +270,20 @@ impl Tensor {
         Self::arange_inner(start, stop, step, dtype, true)
     }
 
+    /// Create 1D tensor with `steps` evenly spaced values from `start` to `end` (inclusive).
+    pub fn linspace(start: f64, end: f64, steps: usize, dtype: DType) -> Result<Self> {
+        if steps == 0 {
+            return Ok(Self::empty(dtype));
+        }
+        if steps == 1 {
+            return Self::full(&[1], start, dtype);
+        }
+        let t = Self::arange(steps as i64, None, None)?;
+        let scale = Self::const_((end - start) / (steps as f64 - 1.0), DType::Float64);
+        let offset = Self::const_(start, DType::Float64);
+        t.cast(DType::Float64)?.try_mul(&scale)?.try_add(&offset)?.cast(dtype)
+    }
+
     /// Shared implementation: `full(count, step) → cumsum → + (start - step)`.
     fn arange_inner(start: f64, stop: f64, step: f64, dtype: DType, is_float: bool) -> Result<Self> {
         let count = ((stop - start) / step).ceil() as i64;

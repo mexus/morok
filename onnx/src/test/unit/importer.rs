@@ -895,3 +895,236 @@ fn test_attention_domain_dispatch() {
         registry.dispatch_multi("Attention", "com.microsoft", &inputs_contrib, &node_contrib, i64::MAX).unwrap();
     assert_eq!(result_contrib.len(), 2); // Contrib returns [output, present]
 }
+
+// =========================================================================
+// DepthToSpace / SpaceToDepth tests
+// =========================================================================
+
+#[test]
+fn test_depth_to_space_dcr() {
+    let registry = OpRegistry::new();
+    // [1, 8, 1, 1] with blocksize=2 → [1, 2, 2, 2]
+    let x = Tensor::from_slice((0..8).map(|v| v as f32).collect::<Vec<_>>()).try_reshape(&[1, 8, 1, 1]).unwrap();
+    let mut node = NodeProto::default();
+    node.attribute.push(make_attr_int("blocksize", 2));
+    let result = registry.dispatch("DepthToSpace", "", &[x], &node).unwrap();
+    let shape: Vec<usize> = result.shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
+    assert_eq!(shape, vec![1, 2, 2, 2]);
+}
+
+#[test]
+fn test_depth_to_space_crd() {
+    let registry = OpRegistry::new();
+    let x = Tensor::from_slice((0..8).map(|v| v as f32).collect::<Vec<_>>()).try_reshape(&[1, 8, 1, 1]).unwrap();
+    let mut node = NodeProto::default();
+    node.attribute.push(make_attr_int("blocksize", 2));
+    node.attribute.push(make_attr_string("mode", "CRD"));
+    let result = registry.dispatch("DepthToSpace", "", &[x], &node).unwrap();
+    let shape: Vec<usize> = result.shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
+    assert_eq!(shape, vec![1, 2, 2, 2]);
+}
+
+#[test]
+fn test_space_to_depth() {
+    let registry = OpRegistry::new();
+    // [1, 1, 4, 4] with blocksize=2 → [1, 4, 2, 2]
+    let x = Tensor::from_slice((0..16).map(|v| v as f32).collect::<Vec<_>>()).try_reshape(&[1, 1, 4, 4]).unwrap();
+    let mut node = NodeProto::default();
+    node.attribute.push(make_attr_int("blocksize", 2));
+    let result = registry.dispatch("SpaceToDepth", "", &[x], &node).unwrap();
+    let shape: Vec<usize> = result.shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
+    assert_eq!(shape, vec![1, 4, 2, 2]);
+}
+
+// =========================================================================
+// LpNormalization tests
+// =========================================================================
+
+#[test]
+fn test_lp_norm_l1() {
+    let registry = OpRegistry::new();
+    let x = Tensor::from_slice([1.0f32, -2.0, 3.0]).try_reshape(&[1, 3]).unwrap();
+    let mut node = NodeProto::default();
+    node.attribute.push(make_attr_int("axis", 1));
+    node.attribute.push(make_attr_int("p", 1));
+    let result = registry.dispatch("LpNormalization", "", &[x], &node).unwrap();
+    let arr = result.realize().unwrap().to_ndarray::<f32>().unwrap();
+    // L1 norm = |1| + |-2| + |3| = 6
+    assert!((arr[[0, 0]] - 1.0 / 6.0).abs() < 1e-5);
+    assert!((arr[[0, 1]] - (-2.0 / 6.0)).abs() < 1e-5);
+    assert!((arr[[0, 2]] - 3.0 / 6.0).abs() < 1e-5);
+}
+
+#[test]
+fn test_lp_norm_l2() {
+    let registry = OpRegistry::new();
+    let x = Tensor::from_slice([3.0f32, 4.0]).try_reshape(&[1, 2]).unwrap();
+    let mut node = NodeProto::default();
+    node.attribute.push(make_attr_int("axis", 1));
+    node.attribute.push(make_attr_int("p", 2));
+    let result = registry.dispatch("LpNormalization", "", &[x], &node).unwrap();
+    let arr = result.realize().unwrap().to_ndarray::<f32>().unwrap();
+    // L2 norm = sqrt(9 + 16) = 5
+    assert!((arr[[0, 0]] - 0.6).abs() < 1e-5);
+    assert!((arr[[0, 1]] - 0.8).abs() < 1e-5);
+}
+
+// =========================================================================
+// MeanVarianceNormalization test
+// =========================================================================
+
+#[test]
+fn test_mean_variance_norm() {
+    let registry = OpRegistry::new();
+    // [1, 2, 1, 1] — default axes [0,2,3]
+    let x = Tensor::from_slice([3.0f32, 5.0]).try_reshape(&[1, 2, 1, 1]).unwrap();
+    let node = NodeProto::default(); // default axes=[0,2,3]
+    let result = registry.dispatch("MeanVarianceNormalization", "", &[x], &node).unwrap();
+    let shape: Vec<usize> = result.shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
+    assert_eq!(shape, vec![1, 2, 1, 1]);
+    // With axes [0,2,3] on a [1,2,1,1] tensor, each channel is independently normalized
+    // For single-element reduction: (x - mean) / std → 0/0 ≈ 0 (clamped by eps)
+    let arr = result.realize().unwrap().to_ndarray::<f32>().unwrap();
+    assert!(arr[[0, 0, 0, 0]].abs() < 1e-3);
+    assert!(arr[[0, 1, 0, 0]].abs() < 1e-3);
+}
+
+// =========================================================================
+// LRN test
+// =========================================================================
+
+#[test]
+fn test_lrn() {
+    let registry = OpRegistry::new();
+    // [1, 3, 1, 1] — size=3
+    let x = Tensor::from_slice([1.0f32, 2.0, 3.0]).try_reshape(&[1, 3, 1, 1]).unwrap();
+    let mut node = NodeProto::default();
+    node.attribute.push(make_attr_int("size", 3));
+    node.attribute.push(make_attr_float("alpha", 0.0001));
+    node.attribute.push(make_attr_float("beta", 0.75));
+    node.attribute.push(make_attr_float("bias", 1.0));
+    let result = registry.dispatch("LRN", "", &[x], &node).unwrap();
+    let shape: Vec<usize> = result.shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
+    assert_eq!(shape, vec![1, 3, 1, 1]);
+    // Just verify it runs and produces finite values
+    let arr = result.realize().unwrap().to_ndarray::<f32>().unwrap();
+    for val in arr.iter() {
+        assert!(val.is_finite(), "LRN produced non-finite value: {val}");
+    }
+}
+
+// =========================================================================
+// NegativeLogLikelihoodLoss / SoftmaxCrossEntropyLoss tests
+// =========================================================================
+
+#[test]
+fn test_nll_loss() {
+    let registry = OpRegistry::new();
+    let log_probs = Tensor::from_slice([
+        -0.5f32, -1.0, -2.0, // sample 0
+        -0.3, -1.5, -0.8, // sample 1
+    ])
+    .try_reshape(&[2, 3])
+    .unwrap();
+    let target = Tensor::from_slice([0i64, 2]);
+    let node = NodeProto::default(); // default: reduction="mean"
+    let inputs = vec![Some(log_probs), Some(target)];
+    let result = registry.dispatch_multi("NegativeLogLikelihoodLoss", "", &inputs, &node, i64::MAX).unwrap();
+    assert_eq!(result.len(), 1);
+    let arr = result[0].clone().realize().unwrap().to_ndarray::<f32>().unwrap();
+    let val = arr.into_raw_vec_and_offset().0[0];
+    assert!((val - 0.65).abs() < 1e-4, "NLL loss got {val}");
+}
+
+#[test]
+fn test_softmax_ce_loss() {
+    let registry = OpRegistry::new();
+    // Raw logits [2, 3]
+    let logits = Tensor::from_slice([1.0f32, 2.0, 3.0, 1.0, 2.0, 3.0]).try_reshape(&[2, 3]).unwrap();
+    let target = Tensor::from_slice([0i64, 2]);
+    let node = NodeProto::default();
+    let inputs = vec![Some(logits), Some(target)];
+    let result = registry.dispatch_multi("SoftmaxCrossEntropyLoss", "", &inputs, &node, i64::MAX).unwrap();
+    assert_eq!(result.len(), 2); // [loss, log_probs]
+    let loss = result[0].clone().realize().unwrap().to_ndarray::<f32>().unwrap();
+    let val = loss.into_raw_vec_and_offset().0[0];
+    assert!(val > 0.0, "CE loss should be positive, got {val}");
+    // log_probs shape should match logits
+    let lp_shape: Vec<usize> = result[1].shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
+    assert_eq!(lp_shape, vec![2, 3]);
+}
+
+// =========================================================================
+// AffineGrid tests
+// =========================================================================
+
+#[test]
+fn test_affine_grid() {
+    let registry = OpRegistry::new();
+    // Identity transform: theta = [[1,0,0],[0,1,0]] → [1, 2, 3]
+    let theta = Tensor::from_slice([1.0f32, 0.0, 0.0, 0.0, 1.0, 0.0]).try_reshape(&[1, 2, 3]).unwrap();
+    let size = Tensor::from_slice([1i64, 1, 2, 2]); // N=1, C=1, H=2, W=2
+    let mut node = NodeProto::default();
+    node.attribute.push(make_attr_int("align_corners", 0));
+    let inputs = vec![Some(theta), Some(size)];
+    let result = registry.dispatch_multi("AffineGrid", "", &inputs, &node, i64::MAX).unwrap();
+    let shape: Vec<usize> = result[0].shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
+    assert_eq!(shape, vec![1, 2, 2, 2]); // [N, H, W, 2]
+}
+
+#[test]
+fn test_affine_grid_aligned() {
+    let registry = OpRegistry::new();
+    let theta = Tensor::from_slice([1.0f32, 0.0, 0.0, 0.0, 1.0, 0.0]).try_reshape(&[1, 2, 3]).unwrap();
+    let size = Tensor::from_slice([1i64, 1, 3, 3]);
+    let mut node = NodeProto::default();
+    node.attribute.push(make_attr_int("align_corners", 1));
+    let inputs = vec![Some(theta), Some(size)];
+    let result = registry.dispatch_multi("AffineGrid", "", &inputs, &node, i64::MAX).unwrap();
+    let shape: Vec<usize> = result[0].shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
+    assert_eq!(shape, vec![1, 3, 3, 2]); // [N, H, W, 2]
+    // With align_corners=1, identity transform on 3x3 grid should have corners at (-1,-1) and (1,1)
+    let arr = result[0].clone().realize().unwrap().to_ndarray::<f32>().unwrap();
+    // Top-left corner: (x, y) = (-1, -1)  — note: reversed dim order in grid (W then H)
+    assert!((arr[[0, 0, 0, 0]] - (-1.0)).abs() < 1e-4, "x corner got {}", arr[[0, 0, 0, 0]]);
+    assert!((arr[[0, 0, 0, 1]] - (-1.0)).abs() < 1e-4, "y corner got {}", arr[[0, 0, 0, 1]]);
+}
+
+// =========================================================================
+// BatchNormalization training mode test
+// =========================================================================
+
+#[test]
+fn test_batch_norm_training() {
+    let registry = OpRegistry::new();
+    // [2, 2, 1, 1] — 2 samples, 2 channels
+    let x = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0]).try_reshape(&[2, 2, 1, 1]).unwrap();
+    let scale = Tensor::from_slice([1.0f32, 1.0]);
+    let bias = Tensor::from_slice([0.0f32, 0.0]);
+    let mean = Tensor::from_slice([0.0f32, 0.0]);
+    let var = Tensor::from_slice([1.0f32, 1.0]);
+    let mut node = NodeProto::default();
+    node.attribute.push(make_attr_int("training_mode", 1));
+    let inputs = vec![Some(x), Some(scale), Some(bias), Some(mean), Some(var)];
+    let result = registry.dispatch_multi("BatchNormalization", "", &inputs, &node, i64::MAX).unwrap();
+    assert_eq!(result.len(), 3); // [output, running_mean, running_var]
+    // Output should be normalized (mean≈0 per channel)
+    let out = result[0].clone().realize().unwrap().to_ndarray::<f32>().unwrap();
+    assert_eq!(out.shape(), &[2, 2, 1, 1]);
+}
+
+// =========================================================================
+// Dropout tests
+// =========================================================================
+
+#[test]
+fn test_dropout_v7_inference() {
+    let registry = OpRegistry::new();
+    let x = Tensor::from_slice([1.0f32, 2.0, 3.0]);
+    let node = NodeProto::default();
+    let inputs = vec![Some(x)];
+    let result = registry.dispatch_multi("Dropout", "", &inputs, &node, 13).unwrap();
+    assert_eq!(result.len(), 2); // [output, mask]
+    let out = result[0].clone().realize().unwrap().to_ndarray::<f32>().unwrap();
+    assert_eq!(out.as_slice().unwrap(), &[1.0, 2.0, 3.0]); // passthrough
+}

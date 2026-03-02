@@ -363,3 +363,121 @@ fn test_resize_nearest_downsample() {
     let result = t.resize().sizes(&[1, 1, 2, 2]).mode("nearest").call().unwrap().realize().unwrap();
     assert_eq!(get_shape(&result), vec![1, 1, 2, 2]);
 }
+
+// =========================================================================
+// Linspace tests
+// =========================================================================
+
+#[test]
+fn test_linspace_basic() {
+    let t = Tensor::linspace(-1.0, 1.0, 5, morok_dtype::DType::Float32).unwrap();
+    assert_eq!(get_shape(&t), vec![5]);
+    let result = t.realize().unwrap().to_ndarray::<f32>().unwrap();
+    let expected = [-1.0f32, -0.5, 0.0, 0.5, 1.0];
+    for (got, exp) in result.iter().zip(expected.iter()) {
+        assert!((got - exp).abs() < 1e-5, "got {got}, expected {exp}");
+    }
+}
+
+#[test]
+fn test_linspace_single() {
+    let t = Tensor::linspace(3.0, 7.0, 1, morok_dtype::DType::Float32).unwrap();
+    assert_eq!(get_shape(&t), vec![1], "steps=1 must produce 1-D shape [1]");
+    let result = t.realize().unwrap().to_ndarray::<f32>().unwrap();
+    let vals: Vec<f32> = result.iter().copied().collect();
+    assert_eq!(vals.len(), 1);
+    assert!((vals[0] - 3.0).abs() < 1e-5);
+}
+
+#[test]
+fn test_linspace_zero() {
+    let t = Tensor::linspace(0.0, 1.0, 0, morok_dtype::DType::Float32).unwrap();
+    assert_eq!(get_shape(&t), vec![0]);
+}
+
+// =========================================================================
+// NLL Loss tests
+// =========================================================================
+
+#[test]
+fn test_nll_loss_basic() {
+    // 2 samples, 3 classes — mean reduction
+    let log_probs = Tensor::from_slice([
+        -0.5f32, -1.0, -2.0, // sample 0
+        -0.3, -1.5, -0.8, // sample 1
+    ])
+    .try_reshape(&[2, 3])
+    .unwrap();
+    let target = Tensor::from_slice([0i64, 2]); // class 0 for sample 0, class 2 for sample 1
+    let loss = log_probs.nll_loss(&target, None, None, "mean").unwrap();
+    let result = loss.realize().unwrap().to_ndarray::<f32>().unwrap();
+    let val = result.into_raw_vec_and_offset().0[0];
+    // NLL = -log_probs[i, target[i]]: sample0=-(-0.5)=0.5, sample1=-(-0.8)=0.8
+    // mean = (0.5 + 0.8) / 2 = 0.65
+    assert!((val - 0.65).abs() < 1e-4, "got {val}");
+}
+
+#[test]
+fn test_nll_loss_none_reduction() {
+    let log_probs = Tensor::from_slice([
+        -0.5f32, -1.0, -2.0, // sample 0
+        -0.3, -1.5, -0.8, // sample 1
+    ])
+    .try_reshape(&[2, 3])
+    .unwrap();
+    let target = Tensor::from_slice([0i64, 2]);
+    let loss = log_probs.nll_loss(&target, None, None, "none").unwrap();
+    let vals: Vec<f32> = loss.realize().unwrap().to_ndarray::<f32>().unwrap().iter().copied().collect();
+    assert_eq!(vals.len(), 2);
+    assert!((vals[0] - 0.5).abs() < 1e-4);
+    assert!((vals[1] - 0.8).abs() < 1e-4);
+}
+
+#[test]
+fn test_nll_loss_weighted() {
+    let log_probs = Tensor::from_slice([
+        -0.5f32, -1.0, -2.0, // sample 0
+        -0.3, -1.5, -0.8, // sample 1
+    ])
+    .try_reshape(&[2, 3])
+    .unwrap();
+    let target = Tensor::from_slice([0i64, 2]);
+    let weight = Tensor::from_slice([2.0f32, 1.0, 3.0]); // class weights
+    let loss = log_probs.nll_loss(&target, Some(&weight), None, "mean").unwrap();
+    let result = loss.realize().unwrap().to_ndarray::<f32>().unwrap();
+    let val = result.into_raw_vec_and_offset().0[0];
+    // weighted: sample0=0.5*2.0=1.0, sample1=0.8*3.0=2.4
+    // mean = (1.0 + 2.4) / (2.0 + 3.0) = 3.4 / 5.0 = 0.68
+    assert!((val - 0.68).abs() < 1e-4, "got {val}");
+}
+
+#[test]
+fn test_nll_loss_ignore_index() {
+    let log_probs = Tensor::from_slice([
+        -0.5f32, -1.0, -2.0, // sample 0
+        -0.3, -1.5, -0.8, // sample 1
+    ])
+    .try_reshape(&[2, 3])
+    .unwrap();
+    let target = Tensor::from_slice([0i64, 2]);
+    // Ignore class 2 — sample 1 is masked out
+    let loss = log_probs.nll_loss(&target, None, Some(2), "mean").unwrap();
+    let result = loss.realize().unwrap().to_ndarray::<f32>().unwrap();
+    let val = result.into_raw_vec_and_offset().0[0];
+    // Only sample 0 contributes: 0.5 / 1.0 = 0.5
+    assert!((val - 0.5).abs() < 1e-4, "got {val}");
+}
+
+// =========================================================================
+// Dropout tests
+// =========================================================================
+
+#[test]
+fn test_dropout_inference() {
+    let x = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0]);
+    let (output, mask) = x.dropout(0.5, false).unwrap();
+    let out = output.realize().unwrap().to_ndarray::<f32>().unwrap();
+    assert_eq!(out.as_slice().unwrap(), &[1.0, 2.0, 3.0, 4.0]);
+    let m = mask.realize().unwrap().to_ndarray::<bool>().unwrap();
+    assert!(m.iter().all(|&v| v)); // all true
+}

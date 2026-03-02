@@ -708,6 +708,66 @@ impl Tensor {
         let bias = bias.try_reshape(&sb_shape)?;
         normed.try_mul(&scale)?.try_add(&bias)
     }
+
+    /// Negative log-likelihood loss.
+    ///
+    /// `self` is `[N, C, ...]` log-probs, `target` is `[N, ...]` class indices.
+    /// Matches Tinygrad's `nll_loss` (tensor.py:3391-3413).
+    pub fn nll_loss(
+        &self,
+        target: &Tensor,
+        weight: Option<&Tensor>,
+        ignore_index: Option<i64>,
+        reduction: &str,
+    ) -> Result<Tensor> {
+        // Gather log-probs at target class, negate
+        let nll = self.gather(1, &target.try_unsqueeze(1)?)?.try_squeeze(Some(1))?.try_neg()?;
+
+        // Per-sample weight: weight[target] or ones
+        let sample_weight = match weight {
+            Some(w) => {
+                let flat = target.try_reshape(&[-1])?;
+                let sel = w.gather(0, &flat)?;
+                let target_shape: Vec<isize> = target.shape()?.iter().map(|d| d.as_const().unwrap() as isize).collect();
+                sel.try_reshape(&target_shape)?
+            }
+            None => {
+                let shape: Vec<usize> = target.shape()?.iter().map(|d| d.as_const().unwrap()).collect();
+                Tensor::full(&shape, 1.0, self.uop().dtype())?
+            }
+        };
+
+        // Mask out ignore_index
+        let masked_weight = match ignore_index {
+            Some(idx) => {
+                let mask = target.try_ne(&Tensor::const_(idx as f64, target.uop().dtype()))?;
+                sample_weight.try_mul(&mask.cast(sample_weight.uop().dtype())?)?
+            }
+            None => sample_weight,
+        };
+
+        let weighted_loss = nll.try_mul(&masked_weight)?;
+        match reduction {
+            "mean" => weighted_loss.sum(AxisSpec::All)?.try_div(&masked_weight.sum(AxisSpec::All)?),
+            "sum" => weighted_loss.sum(AxisSpec::All),
+            _ => Ok(weighted_loss),
+        }
+    }
+
+    /// Dropout: zeros random elements during training, passes through in inference.
+    ///
+    /// Returns `(output, mask)` where mask is a boolean tensor (true = kept).
+    /// Training mode is deferred until RNG infrastructure is available.
+    pub fn dropout(&self, _p: f64, training: bool) -> Result<(Tensor, Tensor)> {
+        let shape: Vec<usize> = self.shape()?.iter().map(|d| d.as_const().unwrap()).collect();
+        if !training {
+            let mask = Tensor::full(&shape, true, DType::Bool)?;
+            return Ok((self.clone(), mask));
+        }
+        // Training mode deferred (needs RNG: rand_like / Threefry)
+        let mask = Tensor::full(&shape, true, DType::Bool)?;
+        Ok((self.clone(), mask))
+    }
 }
 
 // =========================================================================

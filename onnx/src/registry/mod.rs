@@ -305,12 +305,7 @@ impl OpRegistry {
                 }
             }
             "Size" => Tensor::from_slice([inp(inputs, 0).numel()? as i64]),
-            "Dropout" => {
-                let x = inp(inputs, 0).clone();
-                let shape: Vec<usize> = x.shape()?.iter().map(|d| d.as_const().unwrap_or(1)).collect();
-                let mask = Tensor::full(&shape, true, DType::Scalar(ScalarDType::Bool))?;
-                return Ok(vec![x, mask]);
-            }
+            "Dropout" => return nn::op_dropout(inputs, node, opset_version),
 
             // === Indexing ===
             "Gather" => {
@@ -436,7 +431,7 @@ impl OpRegistry {
             // === NN ===
             "MatMul" => inp(inputs, 0).matmul(inp(inputs, 1))?,
             "Gemm" => nn::op_gemm(inputs, node)?,
-            "BatchNormalization" => nn::op_batch_norm(inputs, node)?,
+            "BatchNormalization" => return nn::op_batch_norm(inputs, node),
             "Conv" => nn::op_conv(inputs, node)?,
             "ConvTranspose" => nn::op_conv_transpose(inputs, node)?,
             "AveragePool" => nn::op_avg_pool(inputs, node)?,
@@ -455,6 +450,14 @@ impl OpRegistry {
             "GroupNormalization" => nn::op_group_norm(inputs, node)?,
             "InstanceNormalization" => nn::op_instance_norm(inputs, node)?,
             "Resize" => nn::op_resize(inputs, node)?,
+            "DepthToSpace" => nn::op_depth_to_space(inputs, node)?,
+            "SpaceToDepth" => nn::op_space_to_depth(inputs, node)?,
+            "LpNormalization" => nn::op_lp_norm(inputs, node)?,
+            "MeanVarianceNormalization" => nn::op_mean_variance_norm(inputs, node)?,
+            "LRN" => nn::op_lrn(inputs, node)?,
+            "AffineGrid" => nn::op_affine_grid(inputs, node)?,
+            "NegativeLogLikelihoodLoss" => return nn::op_nll_loss(inputs, node),
+            "SoftmaxCrossEntropyLoss" => return nn::op_softmax_ce_loss(inputs, node),
             "RMSNormalization" => transformer::op_rms_norm(inputs, node)?,
             "Attention" => return transformer::op_attention_onnx(inputs, node),
 

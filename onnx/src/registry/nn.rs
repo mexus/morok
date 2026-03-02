@@ -1,4 +1,6 @@
+use morok_dtype::DType;
 use morok_tensor::Tensor;
+use morok_tensor::reduce::AxisSpec;
 
 use crate::error::Result;
 use crate::parser::onnx::NodeProto;
@@ -23,14 +25,55 @@ pub(crate) fn op_gemm(inputs: &[Option<Tensor>], node: &NodeProto) -> Result<Ten
     Ok(result)
 }
 
-pub(crate) fn op_batch_norm(inputs: &[Option<Tensor>], node: &NodeProto) -> Result<Tensor> {
-    let (x, scale, bias, mean, var) = (inp(inputs, 0), inp(inputs, 1), inp(inputs, 2), inp(inputs, 3), inp(inputs, 4));
+pub(crate) fn op_batch_norm(inputs: &[Option<Tensor>], node: &NodeProto) -> Result<Vec<Tensor>> {
+    let (x, scale, bias, running_mean, running_var) =
+        (inp(inputs, 0), inp(inputs, 1), inp(inputs, 2), inp(inputs, 3), inp(inputs, 4));
     let epsilon = get_attr_float(node, "epsilon", 1e-5);
+    let training_mode = get_attr_int(node, "training_mode", 0) == 1;
 
-    let var_plus_eps = var.try_add(&Tensor::from_slice([epsilon]))?;
-    let invstd = var_plus_eps.try_rsqrt()?;
+    if training_mode {
+        let momentum = get_attr_float(node, "momentum", 0.9) as f64;
+        let shape = x.shape()?;
+        let ndim = shape.len();
+        // Reduce over all dims except channel (dim 1)
+        let reduce_axes: Vec<isize> = (0..ndim).filter(|&i| i != 1).map(|i| i as isize).collect();
+        let axes = AxisSpec::Multiple(reduce_axes);
 
-    Ok(x.batchnorm().scale(scale).bias(bias).mean(mean).invstd(&invstd).call()?)
+        // Compute batch stats in f32
+        let x32 = if x.uop().dtype() != DType::Float32 { x.cast(DType::Float32)? } else { x.clone() };
+        let batch_mean = x32.mean_with().axes(axes.clone()).keepdim(false).call()?;
+        let centered = x32.try_sub(&batch_mean.try_reshape(&{
+            let mut s = vec![1isize; ndim];
+            s[1] = -1;
+            s
+        })?)?;
+        // Population variance (correction=0): mean(x²) not mean(x²)*N/(N-1)
+        let batch_var = centered.square()?.mean_with().axes(axes).keepdim(false).call()?;
+
+        // EMA update: running = batch * (1 - momentum) + running * momentum
+        let m = Tensor::const_(momentum, DType::Float64);
+        let one_minus_m = Tensor::const_(1.0 - momentum, DType::Float64);
+        let new_running_mean = batch_mean
+            .cast(DType::Float64)?
+            .try_mul(&one_minus_m)?
+            .try_add(&running_mean.cast(DType::Float64)?.try_mul(&m)?)?
+            .cast(running_mean.uop().dtype())?;
+        let new_running_var = batch_var
+            .cast(DType::Float64)?
+            .try_mul(&one_minus_m)?
+            .try_add(&running_var.cast(DType::Float64)?.try_mul(&m)?)?
+            .cast(running_var.uop().dtype())?;
+
+        // Normalize with batch stats, cast back to input dtype
+        let invstd = batch_var.try_add(&Tensor::from_slice([epsilon]))?.try_rsqrt()?;
+        let out = x.batchnorm().scale(scale).bias(bias).mean(&batch_mean).invstd(&invstd).call()?;
+        let out = out.cast(x.uop().dtype())?;
+        Ok(vec![out, new_running_mean, new_running_var])
+    } else {
+        let invstd = running_var.try_add(&Tensor::from_slice([epsilon]))?.try_rsqrt()?;
+        let out = x.batchnorm().scale(scale).bias(bias).mean(running_mean).invstd(&invstd).call()?;
+        Ok(vec![out])
+    }
 }
 
 pub(crate) fn op_conv(inputs: &[Option<Tensor>], node: &NodeProto) -> Result<Tensor> {
@@ -182,4 +225,238 @@ pub(crate) fn op_resize(inputs: &[Option<Tensor>], node: &NodeProto) -> Result<T
         .keep_aspect_ratio_policy(&policy)
         .maybe_axes(axes.as_deref())
         .call()?)
+}
+
+// =========================================================================
+// DepthToSpace / SpaceToDepth
+// =========================================================================
+
+pub(crate) fn op_depth_to_space(inputs: &[Option<Tensor>], node: &NodeProto) -> Result<Tensor> {
+    let x = inp(inputs, 0);
+    let bs = get_attr_int(node, "blocksize", 1) as usize;
+    let mode = get_attr_string(node, "mode", "DCR");
+    let shape = x.shape()?;
+    let (b, c, h, w) = (
+        shape[0].as_const().unwrap(),
+        shape[1].as_const().unwrap(),
+        shape[2].as_const().unwrap(),
+        shape[3].as_const().unwrap(),
+    );
+    let c_out = c / (bs * bs);
+    let result = if mode == "CRD" {
+        // CRD: reshape [B, C', bs, bs, H, W] → permute [0,1,4,2,5,3]
+        x.try_reshape(&[b as isize, c_out as isize, bs as isize, bs as isize, h as isize, w as isize])?
+            .try_permute(&[0, 1, 4, 2, 5, 3])?
+    } else {
+        // DCR: reshape [B, bs, bs, C', H, W] → permute [0,3,4,1,5,2]
+        x.try_reshape(&[b as isize, bs as isize, bs as isize, c_out as isize, h as isize, w as isize])?
+            .try_permute(&[0, 3, 4, 1, 5, 2])?
+    };
+    Ok(result.try_reshape(&[b as isize, c_out as isize, (h * bs) as isize, (w * bs) as isize])?)
+}
+
+pub(crate) fn op_space_to_depth(inputs: &[Option<Tensor>], node: &NodeProto) -> Result<Tensor> {
+    let x = inp(inputs, 0);
+    let bs = get_attr_int(node, "blocksize", 1) as usize;
+    let shape = x.shape()?;
+    let (b, c, h, w) = (
+        shape[0].as_const().unwrap(),
+        shape[1].as_const().unwrap(),
+        shape[2].as_const().unwrap(),
+        shape[3].as_const().unwrap(),
+    );
+    // reshape [B, C, H/bs, bs, W/bs, bs] → permute [0,3,5,1,2,4] → reshape [B, C*bs², H/bs, W/bs]
+    Ok(x.try_reshape(&[b as isize, c as isize, (h / bs) as isize, bs as isize, (w / bs) as isize, bs as isize])?
+        .try_permute(&[0, 3, 5, 1, 2, 4])?
+        .try_reshape(&[b as isize, (c * bs * bs) as isize, (h / bs) as isize, (w / bs) as isize])?)
+}
+
+// =========================================================================
+// LpNormalization
+// =========================================================================
+
+pub(crate) fn op_lp_norm(inputs: &[Option<Tensor>], node: &NodeProto) -> Result<Tensor> {
+    let x = inp(inputs, 0);
+    let axis = get_attr_int(node, "axis", -1) as isize;
+    let p = get_attr_int(node, "p", 2);
+    let norm = match p {
+        1 => x.try_abs()?.sum_with().axes(AxisSpec::Single(axis)).keepdim(true).call()?,
+        _ => x.square()?.sum_with().axes(AxisSpec::Single(axis)).keepdim(true).call()?.try_sqrt()?,
+    };
+    Ok(x.try_div(&norm)?)
+}
+
+// =========================================================================
+// MeanVarianceNormalization
+// =========================================================================
+
+pub(crate) fn op_mean_variance_norm(inputs: &[Option<Tensor>], node: &NodeProto) -> Result<Tensor> {
+    let x = inp(inputs, 0);
+    let axes_attr = get_attr_ints(node, "axes");
+    let axes: Vec<isize> =
+        if axes_attr.is_empty() { vec![0, 2, 3] } else { axes_attr.iter().map(|&a| a as isize).collect() };
+    let axes_spec = AxisSpec::Multiple(axes);
+    let mean = x.mean_with().axes(axes_spec.clone()).keepdim(true).call()?;
+    let centered = x.try_sub(&mean)?;
+    // Population std (correction=0): sqrt(mean((x-mean)²))
+    let pop_std = centered.square()?.mean_with().axes(axes_spec).keepdim(true).call()?.try_sqrt()?;
+    let eps = Tensor::const_(1e-9, DType::Float32);
+    Ok(centered.try_div(&pop_std.try_add(&eps)?)?)
+}
+
+// =========================================================================
+// LRN (Local Response Normalization)
+// =========================================================================
+
+pub(crate) fn op_lrn(inputs: &[Option<Tensor>], node: &NodeProto) -> Result<Tensor> {
+    let x = inp(inputs, 0);
+    let alpha = get_attr_float(node, "alpha", 0.0001) as f64;
+    let beta = get_attr_float(node, "beta", 0.75) as f64;
+    let bias = get_attr_float(node, "bias", 1.0) as f64;
+    let size = get_attr_int(node, "size", 1) as usize;
+    let shape = x.shape()?;
+    let (b, c, h, w) = (
+        shape[0].as_const().unwrap(),
+        shape[1].as_const().unwrap(),
+        shape[2].as_const().unwrap(),
+        shape[3].as_const().unwrap(),
+    );
+
+    // x² → reshape [B,1,C,H*W] → pad channel dim → avg_pool2d([size,1]) → reshape back
+    let x_sq = x.square()?;
+    let x_sq = x_sq.try_reshape(&[b as isize, 1, c as isize, (h * w) as isize])?;
+    let pad_before = ((size - 1) / 2) as isize;
+    let pad_after = (size / 2) as isize;
+    // Pad the channel dim (dim 2): [(0,0), (0,0), (before,after), (0,0)]
+    let x_sq = x_sq.try_pad(&[(0, 0), (0, 0), (pad_before, pad_after), (0, 0)])?;
+    let pooled = x_sq.avg_pool2d().kernel_size(&[size, 1]).stride(&[1, 1]).call()?;
+    let pooled = pooled.try_reshape(&[b as isize, c as isize, h as isize, w as isize])?;
+
+    // x / (bias + alpha * pooled)^beta
+    let dtype = x.uop().dtype();
+    let scale = pooled
+        .try_mul(&Tensor::const_(alpha, dtype.clone()))?
+        .try_add(&Tensor::const_(bias, dtype.clone()))?
+        .try_pow(&Tensor::const_(beta, dtype))?;
+    Ok(x.try_div(&scale)?)
+}
+
+// =========================================================================
+// NegativeLogLikelihoodLoss / SoftmaxCrossEntropyLoss
+// =========================================================================
+
+pub(crate) fn op_nll_loss(inputs: &[Option<Tensor>], node: &NodeProto) -> Result<Vec<Tensor>> {
+    let x = inp(inputs, 0);
+    let target = inp(inputs, 1);
+    let weight = inputs.get(2).and_then(|o| o.as_ref());
+    let reduction = get_attr_string(node, "reduction", "mean");
+    let ignore_index = get_attr(node, "ignore_index").map(|a| a.i);
+    let loss = x.nll_loss(target, weight, ignore_index, &reduction)?;
+    Ok(vec![loss])
+}
+
+pub(crate) fn op_softmax_ce_loss(inputs: &[Option<Tensor>], node: &NodeProto) -> Result<Vec<Tensor>> {
+    let x = inp(inputs, 0);
+    let target = inp(inputs, 1);
+    let weight = inputs.get(2).and_then(|o| o.as_ref());
+    let reduction = get_attr_string(node, "reduction", "mean");
+    let ignore_index = get_attr(node, "ignore_index").map(|a| a.i);
+    // log_softmax over class dim (axis 1) using keepdim reduce to avoid broadcast issues
+    let max_val = x.max_with().axes(1isize).keepdim(true).call()?;
+    let shifted = x.try_sub(&max_val)?;
+    let exp_shifted = shifted.try_exp()?;
+    let sum_exp = exp_shifted.sum_with().axes(1isize).keepdim(true).call()?;
+    let log_probs = shifted.try_sub(&sum_exp.try_log()?)?;
+    let loss = log_probs.nll_loss(target, weight, ignore_index, &reduction)?;
+    Ok(vec![loss, log_probs])
+}
+
+// =========================================================================
+// AffineGrid
+// =========================================================================
+
+pub(crate) fn op_affine_grid(inputs: &[Option<Tensor>], node: &NodeProto) -> Result<Tensor> {
+    let theta = inp(inputs, 0); // [N, ndim, ndim+1]
+    let size = tensor_to_i64_vec(inp(inputs, 1))?;
+    let align_corners = get_attr_int(node, "align_corners", 0) == 1;
+
+    let n = size[0] as usize;
+    let ndim = size.len() - 2; // spatial dims
+
+    // Generate per-dim grids
+    let spatial_dims: Vec<usize> = size[2..].iter().map(|&s| s as usize).collect();
+    let mut grids = Vec::with_capacity(ndim);
+    for &dim_size in &spatial_dims {
+        let g = if align_corners {
+            Tensor::linspace(-1.0, 1.0, dim_size, DType::Float32)?
+        } else {
+            // half_pixel: (-1, 1) range adjusted
+            let start = -1.0 + 1.0 / dim_size as f64;
+            let end = 1.0 - 1.0 / dim_size as f64;
+            Tensor::linspace(start, end, dim_size, DType::Float32)?
+        };
+        grids.push(g);
+    }
+
+    // Meshgrid
+    let grid_refs: Vec<&Tensor> = grids.iter().collect();
+    let mesh = Tensor::meshgrid(&grid_refs, "ij")?;
+
+    // Stack in reverse order + ones for homogeneous coordinates
+    let total_elements: usize = spatial_dims.iter().product();
+    let flat_shape = [total_elements as isize];
+    let mut components: Vec<Tensor> = Vec::with_capacity(ndim + 1);
+    for g in mesh.iter().rev() {
+        components.push(g.try_reshape(&flat_shape)?);
+    }
+    components.push(Tensor::full(&[total_elements], 1.0, DType::Float32)?);
+
+    // Stack to [ndim+1, prod(spatial)] and transpose to [prod(spatial), ndim+1]
+    let comp_refs: Vec<&Tensor> = components.iter().collect();
+    let base_grid = Tensor::cat(&comp_refs, 0)?
+        .try_reshape(&[(ndim + 1) as isize, total_elements as isize])?
+        .try_transpose(0, 1)?;
+
+    // Expand to [N, prod(spatial), ndim+1]
+    let base_grid =
+        base_grid.try_unsqueeze(0)?.try_expand(&[n as isize, total_elements as isize, (ndim + 1) as isize])?;
+
+    // theta: [N, ndim, ndim+1] → transpose to [N, ndim+1, ndim]
+    let theta_t = theta.try_transpose(1, 2)?;
+
+    // base_grid @ theta^T → [N, prod(spatial), ndim]
+    let output = base_grid.matmul(&theta_t)?;
+
+    // Reshape to [N, *spatial_dims, ndim]
+    let mut out_shape: Vec<isize> = vec![n as isize];
+    out_shape.extend(spatial_dims.iter().map(|&d| d as isize));
+    out_shape.push(ndim as isize);
+    Ok(output.try_reshape(&out_shape)?)
+}
+
+// =========================================================================
+// Dropout (version-dispatched)
+// =========================================================================
+
+pub(crate) fn op_dropout(inputs: &[Option<Tensor>], node: &NodeProto, opset_version: i64) -> Result<Vec<Tensor>> {
+    let x = inp(inputs, 0);
+
+    // Extract ratio (v7+: input[1], v6: attribute)
+    let ratio = if opset_version >= 7 {
+        inputs.get(1).and_then(|o| o.as_ref()).map(|t| tensor_to_f64_scalar(t).unwrap_or(0.5)).unwrap_or(0.5)
+    } else {
+        get_attr_float(node, "ratio", 0.5) as f64
+    };
+
+    // Determine training mode
+    let training = if opset_version < 7 {
+        // v6: is_test attribute (default 0 = training)
+        get_attr_int(node, "is_test", 0) != 1
+    } else {
+        // v7+: training_mode input (index 2, default false)
+        inputs.get(2).and_then(|o| o.as_ref()).map(|t| tensor_to_bool_scalar(t).unwrap_or(false)).unwrap_or(false)
+    };
+
+    let (output, mask) = x.dropout(ratio, training)?;
+    Ok(vec![output, mask])
 }
