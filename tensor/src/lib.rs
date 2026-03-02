@@ -27,6 +27,7 @@ pub mod schedule;
 pub mod shape_ops;
 pub mod tensor_registry;
 pub mod traits;
+pub mod transformer;
 
 // Re-export for public API
 pub use tensor_registry::apply_map_to_tensors;

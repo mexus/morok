@@ -10,6 +10,7 @@ mod constant;
 mod indexing;
 mod nn;
 mod shape;
+mod transformer;
 
 use morok_dtype::{DType, ScalarDType};
 use morok_ir::ConstValue;
@@ -49,6 +50,17 @@ impl OpRegistry {
         node: &NodeProto,
         opset_version: i64,
     ) -> Result<Vec<Tensor>> {
+        // Domain-specific ops (checked first)
+        if let Some(result) = match (domain, op_type) {
+            ("com.microsoft", "Attention") => Some(transformer::op_attention_contrib(inputs, node)),
+            ("com.microsoft", "SkipLayerNormalization") => Some(transformer::op_skip_layer_norm(inputs, node)),
+            ("com.microsoft", "EmbedLayerNormalization") => Some(transformer::op_embed_layer_norm(inputs, node)),
+            ("com.microsoft", "RotaryEmbedding") => Some(transformer::op_rotary_embedding(inputs, node)),
+            _ => None,
+        } {
+            return result;
+        }
+
         let r = match op_type {
             // === Arithmetic ===
             "Add" => inp(inputs, 0).try_add(inp(inputs, 1))?,
@@ -443,6 +455,8 @@ impl OpRegistry {
             "GroupNormalization" => nn::op_group_norm(inputs, node)?,
             "InstanceNormalization" => nn::op_instance_norm(inputs, node)?,
             "Resize" => nn::op_resize(inputs, node)?,
+            "RMSNormalization" => transformer::op_rms_norm(inputs, node)?,
+            "Attention" => return transformer::op_attention_onnx(inputs, node),
 
             // === NonZero ===
             "NonZero" => inp(inputs, 0).nonzero()?.try_transpose(0, 1)?.cast(DType::Int64)?,

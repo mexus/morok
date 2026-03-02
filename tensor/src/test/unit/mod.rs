@@ -15,4 +15,5 @@ pub mod reduce;
 pub mod shape_ops;
 pub mod shared_subgraph;
 pub mod sort;
+pub mod transformer;
 pub mod triangular;

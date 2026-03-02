@@ -662,6 +662,29 @@ impl Tensor {
         Ok((normalized, mean, inv_std))
     }
 
+    /// RMS normalization over axes [axis..ndim). Like layernorm without mean subtraction.
+    /// Computes in f32, multiplies original input by the normalization factor.
+    pub fn rms_norm(&self, axis: isize, eps: f64) -> Result<Tensor> {
+        let ndim = self.ndim()?;
+        let norm_axis = Tensor::normalize_axis(axis, ndim)?;
+        let axes: Vec<isize> = (norm_axis..ndim).map(|a| a as isize).collect();
+        let axes_spec = AxisSpec::Multiple(axes);
+
+        let original_dtype = self.uop().dtype();
+        let x32 = if original_dtype != DType::Float32 { self.cast(DType::Float32)? } else { self.clone() };
+
+        let norm = x32
+            .square()?
+            .mean_with()
+            .axes(axes_spec)
+            .keepdim(true)
+            .call()?
+            .try_add(&Tensor::new(UOp::const_(DType::Float32, ConstValue::Float(eps))))?
+            .try_rsqrt()?;
+
+        self.try_mul(&norm)
+    }
+
     /// Group normalization: reshape → layernorm → scale + bias.
     /// Matches Tinygrad's ONNX `GroupNormalization` pattern.
     pub fn group_norm(&self, scale: &Tensor, bias: &Tensor, num_groups: usize, eps: f64) -> Result<Tensor> {

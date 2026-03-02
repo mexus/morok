@@ -625,3 +625,273 @@ fn test_load_silero_vad_prepare() {
         println!("  {:4}x  {}", count, op);
     }
 }
+
+// =========================================================================
+// Transformer / LLM Operator tests
+// =========================================================================
+
+use crate::registry::OpRegistry;
+
+#[test]
+fn test_rms_norm() {
+    let registry = OpRegistry::new();
+    // X: [1, 4], scale: [4]
+    let x = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0]).try_reshape(&[1, 4]).unwrap();
+    let scale = Tensor::from_slice([1.0f32, 1.0, 1.0, 1.0]);
+    let mut node = NodeProto::default();
+    node.attribute.push(make_attr_int("axis", -1));
+    node.attribute.push(make_attr_float("epsilon", 1e-5));
+    let inputs = vec![Some(x), Some(scale)];
+    let result = registry.dispatch_multi("RMSNormalization", "", &inputs, &node, i64::MAX).unwrap();
+    let arr = result[0].to_ndarray::<f32>().unwrap();
+    assert_eq!(arr.shape(), &[1, 4]);
+    // With scale=[1,1,1,1], output = rms_norm(x)
+    let rms_inv = 1.0 / (7.5f32 + 1e-5).sqrt();
+    for i in 0..4 {
+        let expected = (i + 1) as f32 * rms_inv;
+        assert!((arr[[0, i]] - expected).abs() < 1e-4);
+    }
+}
+
+#[test]
+fn test_rms_norm_with_scale() {
+    let registry = OpRegistry::new();
+    let x = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0]).try_reshape(&[1, 4]).unwrap();
+    let scale = Tensor::from_slice([2.0f32, 0.5, 1.0, 3.0]);
+    let mut node = NodeProto::default();
+    node.attribute.push(make_attr_float("epsilon", 1e-5));
+    let inputs = vec![Some(x), Some(scale)];
+    let result = registry.dispatch_multi("RMSNormalization", "", &inputs, &node, i64::MAX).unwrap();
+    let arr = result[0].to_ndarray::<f32>().unwrap();
+    let rms_inv = 1.0 / (7.5f32 + 1e-5).sqrt();
+    let scales = [2.0, 0.5, 1.0, 3.0];
+    for i in 0..4 {
+        let expected = (i + 1) as f32 * rms_inv * scales[i];
+        assert!((arr[[0, i]] - expected).abs() < 1e-4);
+    }
+}
+
+#[test]
+fn test_skip_layer_norm() {
+    let registry = OpRegistry::new();
+    // x: [1, 3], skip: [1, 3], gamma: [3], beta: [3]
+    let x = Tensor::from_slice([1.0f32, 2.0, 3.0]).try_reshape(&[1, 3]).unwrap();
+    let skip = Tensor::from_slice([0.1f32, 0.2, 0.3]).try_reshape(&[1, 3]).unwrap();
+    let gamma = Tensor::from_slice([1.0f32, 1.0, 1.0]);
+    let beta = Tensor::from_slice([0.0f32, 0.0, 0.0]);
+    let mut node = NodeProto::default();
+    node.attribute.push(make_attr_float("epsilon", 1e-5));
+    let inputs = vec![Some(x), Some(skip), Some(gamma), Some(beta)];
+    let result = registry.dispatch_multi("SkipLayerNormalization", "com.microsoft", &inputs, &node, i64::MAX).unwrap();
+    assert_eq!(result.len(), 4);
+    let arr = result[0].to_ndarray::<f32>().unwrap();
+    assert_eq!(arr.shape(), &[1, 3]);
+    // x_sum = x + skip = [1.1, 2.2, 3.3], layernorm → mean ~0
+    let vals: Vec<f32> = arr.iter().copied().collect();
+    let mean: f32 = vals.iter().sum::<f32>() / 3.0;
+    assert!(mean.abs() < 1e-4, "layernorm mean should be ~0, got {mean}");
+    // 4th output is x_sum
+    let x_sum = result[3].to_ndarray::<f32>().unwrap();
+    assert!((x_sum[[0, 0]] - 1.1).abs() < 1e-4);
+}
+
+#[test]
+fn test_skip_layer_norm_no_optionals() {
+    let registry = OpRegistry::new();
+    let x = Tensor::from_slice([1.0f32, 2.0, 3.0]).try_reshape(&[1, 3]).unwrap();
+    let skip = Tensor::from_slice([4.0f32, 5.0, 6.0]).try_reshape(&[1, 3]).unwrap();
+    let gamma = Tensor::from_slice([1.0f32, 1.0, 1.0]);
+    let mut node = NodeProto::default();
+    node.attribute.push(make_attr_float("epsilon", 1e-5));
+    // No beta, no bias
+    let inputs = vec![Some(x), Some(skip), Some(gamma)];
+    let result = registry.dispatch_multi("SkipLayerNormalization", "com.microsoft", &inputs, &node, i64::MAX).unwrap();
+    assert_eq!(result.len(), 4);
+    let arr = result[0].to_ndarray::<f32>().unwrap();
+    assert_eq!(arr.shape(), &[1, 3]);
+}
+
+#[test]
+fn test_embed_layer_norm() {
+    let registry = OpRegistry::new();
+    // input_ids: [1, 3] (batch=1, seq=3)
+    let input_ids = Tensor::from_slice([0i32, 1, 2]).try_reshape(&[1, 3]).unwrap();
+    // word_embedding: [3, 4] (vocab=3, embed=4)
+    let word_emb_data: Vec<f32> = (0..12).map(|v| v as f32).collect();
+    let word_emb = Tensor::from_slice(&word_emb_data).try_reshape(&[3, 4]).unwrap();
+    // position_embedding: [3, 4] (max_pos=3, embed=4)
+    let pos_emb = Tensor::from_slice([0.1f32; 12]).try_reshape(&[3, 4]).unwrap();
+    // gamma: [4], beta: [4]
+    let gamma = Tensor::from_slice([1.0f32; 4]);
+    let beta = Tensor::from_slice([0.0f32; 4]);
+    let mut node = NodeProto::default();
+    node.attribute.push(make_attr_float("epsilon", 1e-5));
+    // inputs: input_ids, segment_ids(None), word_emb, pos_emb, seg_emb(None), gamma, beta
+    let inputs = vec![
+        Some(input_ids),
+        None, // segment_ids
+        Some(word_emb),
+        Some(pos_emb),
+        None, // segment_embedding
+        Some(gamma),
+        Some(beta),
+    ];
+    let result = registry.dispatch_multi("EmbedLayerNormalization", "com.microsoft", &inputs, &node, i64::MAX).unwrap();
+    assert_eq!(result.len(), 3);
+    let arr = result[0].to_ndarray::<f32>().unwrap();
+    assert_eq!(arr.shape(), &[1, 3, 4]);
+    // 3rd output is the raw embedding sum (before layernorm)
+    let sum_arr = result[2].to_ndarray::<f32>().unwrap();
+    assert_eq!(sum_arr.shape(), &[1, 3, 4]);
+}
+
+#[test]
+fn test_rotary_embedding_split() {
+    let registry = OpRegistry::new();
+    // x: [1, 1, 2, 4] (B=1, H=1, S=2, D=4)
+    let x_data: Vec<f32> = (1..=8).map(|v| v as f32).collect();
+    let x = Tensor::from_slice(&x_data).try_reshape(&[1, 1, 2, 4]).unwrap();
+    // cos_cache: [2, 2], sin_cache: [2, 2]
+    let cos_cache = Tensor::from_slice([1.0f32, 1.0, 1.0, 1.0]).try_reshape(&[2, 2]).unwrap();
+    let sin_cache = Tensor::from_slice([0.0f32, 0.0, 0.0, 0.0]).try_reshape(&[2, 2]).unwrap();
+    // position_ids: [1, 2]
+    let pos_ids = Tensor::from_slice([0i32, 1]).try_reshape(&[1, 2]).unwrap();
+
+    let mut node = NodeProto::default();
+    node.attribute.push(make_attr_int("interleaved", 0));
+    node.attribute.push(make_attr_int("num_heads", 1));
+
+    let inputs = vec![Some(x), Some(pos_ids), Some(cos_cache), Some(sin_cache)];
+    let result = registry.dispatch_multi("RotaryEmbedding", "com.microsoft", &inputs, &node, i64::MAX).unwrap();
+    assert_eq!(result.len(), 1);
+    let arr = result[0].to_ndarray::<f32>().unwrap();
+    assert_eq!(arr.shape(), &[1, 1, 2, 4]);
+    // With cos=1, sin=0 → identity rotation, output = input
+    let flat: Vec<f32> = arr.iter().copied().collect();
+    for (i, val) in flat.iter().enumerate() {
+        assert!((val - (i + 1) as f32).abs() < 1e-4, "rotary identity: got {val}, expected {}", i + 1);
+    }
+}
+
+#[test]
+fn test_attention_contrib_basic() {
+    let registry = OpRegistry::new();
+    // x: [1, 2, 4] (batch=1, seq=2, hidden=4)
+    let x = Tensor::from_slice([1.0f32; 8]).try_reshape(&[1, 2, 4]).unwrap();
+    // weights: [4, 12] (input_hidden=4, 3*hidden = 3*4 = 12)
+    // ONNX contrib Attention weight layout: [input_hidden, 3*hidden]
+    // qkv_hidden_sizes default: [4, 4, 4] (each third)
+    // num_heads=2, so head_dim=2 for each of Q, K, V
+    let mut w_data = vec![0.0f32; 48]; // 4 * 12
+    // Identity-like: for each input dim i, map to Q[i], K[i], V[i]
+    for i in 0..4 {
+        w_data[i * 12 + i] = 1.0; // Q block
+        w_data[i * 12 + 4 + i] = 1.0; // K block
+        w_data[i * 12 + 8 + i] = 1.0; // V block
+    }
+    let weights = Tensor::from_slice(&w_data).try_reshape(&[4, 12]).unwrap();
+    let bias = Tensor::from_slice([0.0f32; 12]);
+
+    let mut node = NodeProto::default();
+    node.attribute.push(make_attr_int("num_heads", 2));
+
+    let inputs = vec![Some(x), Some(weights), Some(bias)];
+    let result = registry.dispatch_multi("Attention", "com.microsoft", &inputs, &node, i64::MAX).unwrap();
+    assert!(result.len() >= 1);
+    let arr = result[0].to_ndarray::<f32>().unwrap();
+    assert_eq!(arr.shape(), &[1, 2, 4]);
+}
+
+#[test]
+fn test_attention_contrib_causal() {
+    let registry = OpRegistry::new();
+    // x: [1, 2, 4], weights: [4, 6] with num_heads=1, so Q,K,V each have hidden=2
+    let x = Tensor::from_slice([1.0f32, 0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0]).try_reshape(&[1, 2, 4]).unwrap();
+    // Weight: [4, 6] (input=4, 3*hidden=6 where hidden=2, num_heads=1, head_dim=2)
+    let mut w_data = vec![0.1f32; 24]; // 4 * 6
+    // Make Q,K,V project to something predictable
+    for i in 0..2 {
+        w_data[i * 6 + i] = 1.0; // Q
+        w_data[i * 6 + 2 + i] = 1.0; // K
+        w_data[i * 6 + 4 + i] = 1.0; // V
+    }
+    let weights = Tensor::from_slice(&w_data).try_reshape(&[4, 6]).unwrap();
+    let bias = Tensor::from_slice([0.0f32; 6]);
+
+    let mut node = NodeProto::default();
+    node.attribute.push(make_attr_int("num_heads", 1));
+    node.attribute.push(make_attr_int("unidirectional", 1));
+    node.attribute.push(make_attr_ints("qkv_hidden_sizes", &[2, 2, 2]));
+
+    let inputs = vec![Some(x), Some(weights), Some(bias)];
+    let result = registry.dispatch_multi("Attention", "com.microsoft", &inputs, &node, i64::MAX).unwrap();
+    let arr = result[0].to_ndarray::<f32>().unwrap();
+    assert_eq!(arr.shape(), &[1, 2, 2]);
+    // With unidirectional, position 0 can only attend to position 0
+}
+
+#[test]
+fn test_attention_onnx_basic() {
+    let registry = OpRegistry::new();
+    // Q, K, V: [1, 2, 2, 2] (batch=1, heads=2, seq=2, dim=2)
+    let q = Tensor::from_slice([1.0f32; 8]).try_reshape(&[1, 2, 2, 2]).unwrap();
+    let k = q.clone();
+    let v = Tensor::from_slice([1.0f32, 0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0]).try_reshape(&[1, 2, 2, 2]).unwrap();
+
+    let node = NodeProto::default();
+    let inputs = vec![Some(q), Some(k), Some(v)];
+    let result = registry.dispatch_multi("Attention", "", &inputs, &node, i64::MAX).unwrap();
+    assert_eq!(result.len(), 4);
+    let arr = result[0].to_ndarray::<f32>().unwrap();
+    assert_eq!(arr.shape(), &[1, 2, 2, 2]);
+}
+
+#[test]
+fn test_attention_onnx_causal() {
+    let registry = OpRegistry::new();
+    let q = Tensor::from_slice([1.0f32, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.5, 0.5, 0.5, 0.5])
+        .try_reshape(&[1, 1, 3, 4])
+        .unwrap();
+    let k = q.clone();
+    let v = Tensor::from_slice([1.0f32, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0])
+        .try_reshape(&[1, 1, 3, 4])
+        .unwrap();
+
+    let mut node = NodeProto::default();
+    node.attribute.push(make_attr_int("is_causal", 1));
+    let inputs = vec![Some(q), Some(k), Some(v)];
+    let result = registry.dispatch_multi("Attention", "", &inputs, &node, i64::MAX).unwrap();
+    let arr = result[0].to_ndarray::<f32>().unwrap();
+    assert_eq!(arr.shape(), &[1, 1, 3, 4]);
+    // Position 0 can only attend to position 0 -> output[0] = V[0] = [1, 0, 0, 0]
+    assert!((arr[[0, 0, 0, 0]] - 1.0).abs() < 1e-4);
+    assert!((arr[[0, 0, 0, 1]] - 0.0).abs() < 1e-4);
+}
+
+#[test]
+fn test_attention_domain_dispatch() {
+    // Same op name "Attention" dispatches to different implementations based on domain
+    let registry = OpRegistry::new();
+
+    // ONNX standard: takes pre-projected Q, K, V (4D)
+    let q = Tensor::from_slice([1.0f32; 4]).try_reshape(&[1, 1, 2, 2]).unwrap();
+    let k = q.clone();
+    let v = q.clone();
+    let node = NodeProto::default();
+    let inputs_onnx = vec![Some(q), Some(k), Some(v)];
+    let result_onnx = registry.dispatch_multi("Attention", "", &inputs_onnx, &node, i64::MAX).unwrap();
+    assert_eq!(result_onnx.len(), 4); // ONNX returns [output, present_key, present_value, qk]
+
+    // Microsoft contrib: takes x + weights (packed QKV projection)
+    // x: [1, 2, 2], weights: [2, 6] (input_hidden=2, 3*hidden=6), num_heads=1, head_dim=2
+    let x = Tensor::from_slice([1.0f32; 4]).try_reshape(&[1, 2, 2]).unwrap();
+    let w = Tensor::from_slice([0.1f32; 12]).try_reshape(&[2, 6]).unwrap();
+    let b = Tensor::from_slice([0.0f32; 6]);
+    let mut node_contrib = NodeProto::default();
+    node_contrib.attribute.push(make_attr_int("num_heads", 1));
+    node_contrib.attribute.push(make_attr_ints("qkv_hidden_sizes", &[2, 2, 2]));
+    let inputs_contrib = vec![Some(x), Some(w), Some(b)];
+    let result_contrib =
+        registry.dispatch_multi("Attention", "com.microsoft", &inputs_contrib, &node_contrib, i64::MAX).unwrap();
+    assert_eq!(result_contrib.len(), 2); // Contrib returns [output, present]
+}

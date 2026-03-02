@@ -165,6 +165,19 @@ impl crate::Renderer for CRenderer {
             ctx.register(buf.id, name);
         }
 
+        // Local memory allocations (stack arrays on CPU)
+        for node in &nodes {
+            if let Op::DefineLocal(id) = node.op() {
+                let (base, size) = match node.dtype() {
+                    DType::Ptr { base, size, .. } => (c_dtype(&base), size.unwrap_or(1)),
+                    other => (c_dtype(&other), 1),
+                };
+                let name = format!("local{id}");
+                code_lines.push(format!("  {base} {name}[{size}];"));
+                ctx.register(node.id, name);
+            }
+        }
+
         // Variable loads
         for (i, var) in variables.iter().enumerate() {
             if let Op::DefineVar { name, .. } = var.op() {
