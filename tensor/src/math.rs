@@ -233,7 +233,7 @@ impl Tensor {
         // inf - inf = NaN, finite - finite = 0, NaN - NaN = NaN
         // So (x-x).isnan() is true for both inf and NaN; exclude NaN.
         let is_inf = self.try_sub(self)?.isnan()?.try_sub(&self.isnan()?)?;
-        let zero = self.broadcast_scalar(ConstValue::Int(0))?;
+        let zero = self.zero()?;
         match (detect_positive, detect_negative) {
             (true, true) => Ok(is_inf),
             (true, false) => is_inf.try_mul(&self.try_gt(&zero)?),
@@ -271,7 +271,7 @@ impl Tensor {
     /// Inverse hyperbolic sine: `log(x + sqrt(x² + 1))`.
     #[track_caller]
     pub fn asinh(&self) -> Result<Tensor> {
-        let one = self.broadcast_scalar(ConstValue::Int(1))?;
+        let one = self.one()?;
         let inner = self.square()?.try_add(&one)?.try_sqrt()?;
         self.try_add(&inner)?.try_log()
     }
@@ -279,7 +279,7 @@ impl Tensor {
     /// Inverse hyperbolic cosine: `log(x + sqrt(x² - 1))`.
     #[track_caller]
     pub fn acosh(&self) -> Result<Tensor> {
-        let one = self.broadcast_scalar(ConstValue::Int(1))?;
+        let one = self.one()?;
         let inner = self.square()?.try_sub(&one)?.try_sqrt()?;
         self.try_add(&inner)?.try_log()
     }
@@ -287,7 +287,7 @@ impl Tensor {
     /// Inverse hyperbolic tangent: `0.5 * log((1+x)/(1-x))`.
     #[track_caller]
     pub fn atanh(&self) -> Result<Tensor> {
-        let one = self.broadcast_scalar(ConstValue::Int(1))?;
+        let one = self.one()?;
         let half = self.broadcast_scalar(ConstValue::Float(0.5))?;
         let num = one.try_add(self)?;
         let den = one.try_sub(self)?;
@@ -312,7 +312,7 @@ impl Tensor {
             1.5707963050,
         ];
         let abs_x = self.try_abs()?;
-        let one = self.broadcast_scalar(ConstValue::Int(1))?;
+        let one = self.one()?;
         let half_pi = self.broadcast_scalar(ConstValue::Float(std::f64::consts::FRAC_PI_2))?;
         let sqrt_part = one.try_sub(&abs_x)?.try_sqrt()?;
         let poly = poly_n(&abs_x, &coefficients)?;
@@ -330,7 +330,7 @@ impl Tensor {
     /// Arctangent: `asin(x / sqrt(1 + x²))`.
     #[track_caller]
     pub fn atan(&self) -> Result<Tensor> {
-        let one = self.broadcast_scalar(ConstValue::Int(1))?;
+        let one = self.one()?;
         let denom = one.try_add(&self.square()?)?.try_sqrt()?;
         self.try_div(&denom)?.asin()
     }

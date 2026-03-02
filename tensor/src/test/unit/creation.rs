@@ -39,7 +39,7 @@ fn test_from_raw_bytes_wrong_length() {
 
 #[test]
 fn test_eye_square() {
-    let eye = Tensor::eye(3, 3).unwrap();
+    let eye = Tensor::eye(3, 3, DType::Float32).unwrap();
     let arr = eye.to_ndarray::<f32>().unwrap();
     assert_eq!(arr.shape(), &[3, 3]);
     let vals: Vec<f32> = arr.iter().copied().collect();
@@ -48,7 +48,7 @@ fn test_eye_square() {
 
 #[test]
 fn test_eye_rectangular() {
-    let eye = Tensor::eye(2, 4).unwrap();
+    let eye = Tensor::eye(2, 4, DType::Float32).unwrap();
     let arr = eye.to_ndarray::<f32>().unwrap();
     assert_eq!(arr.shape(), &[2, 4]);
     let vals: Vec<f32> = arr.iter().copied().collect();
@@ -57,7 +57,7 @@ fn test_eye_rectangular() {
 
 #[test]
 fn test_eye_single() {
-    let eye = Tensor::eye(1, 1).unwrap();
+    let eye = Tensor::eye(1, 1, DType::Float32).unwrap();
     let arr = eye.to_ndarray::<f32>().unwrap();
     assert_eq!(arr.shape(), &[1, 1]);
     assert_eq!(arr[[0, 0]], 1.0);

@@ -8,7 +8,19 @@
 //! - Squeeze: Remove dimensions of size 1
 //! - Unsqueeze: Add dimensions of size 1
 
+use strum::{Display, EnumString};
+
 use super::*;
+
+/// Indexing convention for meshgrid.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, EnumString, Display)]
+pub enum MeshgridIndexing {
+    #[default]
+    #[strum(serialize = "ij")]
+    Ij,
+    #[strum(serialize = "xy")]
+    Xy,
+}
 
 impl Tensor {
     /// Reshape tensor to a new shape.
@@ -307,7 +319,7 @@ impl Tensor {
                 as isize;
             // Unsqueeze at dim, expand rep times, then reshape to merge
             result = result.try_unsqueeze(dim as isize)?;
-            let mut expand_shape: Vec<isize> = current_shape.iter().map(|s| s.as_const().unwrap() as isize).collect();
+            let mut expand_shape = morok_ir::shape::to_vec_isize(&current_shape).context(UOpSnafu)?;
             expand_shape.insert(dim, rep as isize);
             result = result.try_expand(&expand_shape)?;
             expand_shape[dim] = rep as isize * dim_size;
@@ -497,20 +509,20 @@ impl Tensor {
     pub fn unflatten(&self, dim: isize, sizes: &[isize]) -> Result<Tensor> {
         let shape = self.shape()?;
         let dim = Self::normalize_axis(dim, shape.len())?;
-        let mut new_shape: Vec<isize> = shape.iter().map(|s| s.as_const().unwrap() as isize).collect();
+        let mut new_shape = morok_ir::shape::to_vec_isize(&shape).context(UOpSnafu)?;
         new_shape.splice(dim..=dim, sizes.iter().copied());
         self.try_reshape(&new_shape)
     }
 
     /// Create coordinate grids from 1D tensors.
     ///
-    /// `indexing`: `"ij"` (matrix/default) or `"xy"` (Cartesian, swaps first two inputs).
+    /// `indexing`: `Ij` (matrix/default) or `Xy` (Cartesian, swaps first two inputs).
     #[track_caller]
-    pub fn meshgrid(tensors: &[&Tensor], indexing: &str) -> Result<Vec<Tensor>> {
+    pub fn meshgrid(tensors: &[&Tensor], indexing: MeshgridIndexing) -> Result<Vec<Tensor>> {
         let n = tensors.len();
         let sizes: Vec<usize> = tensors.iter().map(|t| t.numel().unwrap()).collect();
         // For "xy" indexing, swap the first two inputs
-        let swapped: Vec<usize> = if indexing == "xy" && n >= 2 {
+        let swapped: Vec<usize> = if indexing == MeshgridIndexing::Xy && n >= 2 {
             let mut s: Vec<usize> = (0..n).collect();
             s.swap(0, 1);
             s

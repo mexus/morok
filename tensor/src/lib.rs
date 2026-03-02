@@ -600,13 +600,23 @@ impl Tensor {
         scalar.broadcast_to(&shape)
     }
 
-    /// Identity matrix of shape `[n, m]`.
-    ///
-    /// Uses `arange(n).unsqueeze(-1) == arange(m)` then casts to Float32.
-    pub fn eye(n: usize, m: usize) -> Result<Self> {
+    /// Broadcast a dtype-aware zero to match this tensor's shape.
+    pub(crate) fn zero(&self) -> Result<Self> {
+        let sdtype = self.uop().dtype().scalar().expect("scalar dtype");
+        self.broadcast_scalar(ConstValue::zero(sdtype))
+    }
+
+    /// Broadcast a dtype-aware one to match this tensor's shape.
+    pub(crate) fn one(&self) -> Result<Self> {
+        let sdtype = self.uop().dtype().scalar().expect("scalar dtype");
+        self.broadcast_scalar(ConstValue::one(sdtype))
+    }
+
+    /// Identity matrix of shape `[n, m]` with the given dtype.
+    pub fn eye(n: usize, m: usize, dtype: DType) -> Result<Self> {
         let rows = Self::arange(n as i64, None, None)?.try_unsqueeze(-1)?;
         let cols = Self::arange(m as i64, None, None)?;
-        rows.try_eq(&cols)?.cast(DType::Float32)
+        rows.try_eq(&cols)?.cast(dtype)
     }
 }
 

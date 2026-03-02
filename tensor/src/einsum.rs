@@ -2,7 +2,10 @@
 
 use std::collections::HashMap;
 
+use snafu::ResultExt;
+
 use crate::Tensor;
+use crate::error::UOpSnafu;
 use crate::reduce::AxisSpec;
 
 type Result<T> = crate::Result<T>;
@@ -256,7 +259,7 @@ impl Tensor {
             let new_dim_size = dim_size.div_ceil(stride as usize);
 
             // Reshape dim into [new_dim_size, stride], take [:, 0]
-            let mut new_shape: Vec<isize> = cur_shape.iter().map(|d| d.as_const().unwrap() as isize).collect();
+            let mut new_shape = morok_ir::shape::to_vec_isize(&cur_shape).context(UOpSnafu)?;
 
             // Pad if needed so dim is evenly divisible by stride
             let padded_size = new_dim_size * stride as usize;

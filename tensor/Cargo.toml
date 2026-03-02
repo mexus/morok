@@ -20,6 +20,7 @@ ndarray.workspace = true
 papaya = "0.2.3"
 parking_lot = "0.12"
 tracing = "0.1"
+strum = { version = "0.28.0", features = ["derive"] }
 
 [features]
 default = []

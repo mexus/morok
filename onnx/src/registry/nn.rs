@@ -1,11 +1,22 @@
 use morok_dtype::DType;
 use morok_tensor::Tensor;
+use morok_tensor::nn::{AspectRatioPolicy, AutoPad, CoordinateTransformMode, NearestMode, Reduction, ResizeMode};
 use morok_tensor::reduce::AxisSpec;
+use morok_tensor::shape_ops::MeshgridIndexing;
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::parser::onnx::NodeProto;
 
 use super::*;
+
+/// Parse an ONNX string attribute into a typed enum.
+fn parse_enum<T: std::str::FromStr>(node: &NodeProto, attr: &str, default: &str) -> Result<T>
+where
+    T::Err: std::fmt::Display,
+{
+    let s = get_attr_string(node, attr, default);
+    s.parse::<T>().map_err(|e| Error::IrConstruction { details: format!("{attr}='{s}': {e}") })
+}
 
 pub(crate) fn op_gemm(inputs: &[Option<Tensor>], node: &NodeProto) -> Result<Tensor> {
     let alpha = get_attr_float(node, "alpha", 1.0);
@@ -78,7 +89,7 @@ pub(crate) fn op_batch_norm(inputs: &[Option<Tensor>], node: &NodeProto) -> Resu
 
 pub(crate) fn op_conv(inputs: &[Option<Tensor>], node: &NodeProto) -> Result<Tensor> {
     let ks: Vec<usize> = get_attr_ints(node, "kernel_shape").iter().map(|&k| k as usize).collect();
-    let auto_pad = get_attr_string(node, "auto_pad", "NOTSET");
+    let auto_pad: AutoPad = parse_enum(node, "auto_pad", "NOTSET")?;
     let pads = get_attr_ints(node, "pads");
     let strides = get_attr_ints(node, "strides");
     let dilations = get_attr_ints(node, "dilations");
@@ -86,7 +97,7 @@ pub(crate) fn op_conv(inputs: &[Option<Tensor>], node: &NodeProto) -> Result<Ten
         .conv()
         .weight(inp(inputs, 1))
         .maybe_bias(inputs.get(2).and_then(|o| o.as_ref()))
-        .auto_pad(&auto_pad)
+        .auto_pad(auto_pad)
         .group(get_attr_int(node, "group", 1) as usize)
         .maybe_kernel_shape((!ks.is_empty()).then_some(ks.as_slice()))
         .maybe_pads(non_empty_i64(&pads))
@@ -99,7 +110,7 @@ pub(crate) fn op_conv_transpose(inputs: &[Option<Tensor>], node: &NodeProto) -> 
     let ks: Vec<usize> = get_attr_ints(node, "kernel_shape").iter().map(|&k| k as usize).collect();
     let op: Vec<usize> = get_attr_ints(node, "output_padding").iter().map(|&p| p as usize).collect();
     let os = get_attr_ints(node, "output_shape");
-    let auto_pad = get_attr_string(node, "auto_pad", "NOTSET");
+    let auto_pad: AutoPad = parse_enum(node, "auto_pad", "NOTSET")?;
     let pads = get_attr_ints(node, "pads");
     let strides = get_attr_ints(node, "strides");
     let dilations = get_attr_ints(node, "dilations");
@@ -107,7 +118,7 @@ pub(crate) fn op_conv_transpose(inputs: &[Option<Tensor>], node: &NodeProto) -> 
         .conv_transpose()
         .weight(inp(inputs, 1))
         .maybe_bias(inputs.get(2).and_then(|o| o.as_ref()))
-        .auto_pad(&auto_pad)
+        .auto_pad(auto_pad)
         .group(get_attr_int(node, "group", 1) as usize)
         .maybe_kernel_shape((!ks.is_empty()).then_some(ks.as_slice()))
         .maybe_pads(non_empty_i64(&pads))
@@ -120,14 +131,14 @@ pub(crate) fn op_conv_transpose(inputs: &[Option<Tensor>], node: &NodeProto) -> 
 
 pub(crate) fn op_avg_pool(inputs: &[Option<Tensor>], node: &NodeProto) -> Result<Tensor> {
     let kernel: Vec<usize> = get_attr_ints(node, "kernel_shape").iter().map(|&k| k as usize).collect();
-    let auto_pad = get_attr_string(node, "auto_pad", "NOTSET");
+    let auto_pad: AutoPad = parse_enum(node, "auto_pad", "NOTSET")?;
     let pads = get_attr_ints(node, "pads");
     let strides = get_attr_ints(node, "strides");
     let dilations = get_attr_ints(node, "dilations");
     Ok(inp(inputs, 0)
         .avg_pool()
         .kernel_shape(&kernel)
-        .auto_pad(&auto_pad)
+        .auto_pad(auto_pad)
         .ceil_mode(get_attr_int(node, "ceil_mode", 0) == 1)
         .count_include_pad(get_attr_int(node, "count_include_pad", 0) == 1)
         .maybe_pads(non_empty_i64(&pads))
@@ -138,14 +149,14 @@ pub(crate) fn op_avg_pool(inputs: &[Option<Tensor>], node: &NodeProto) -> Result
 
 pub(crate) fn op_max_pool(inputs: &[Option<Tensor>], node: &NodeProto) -> Result<Vec<Tensor>> {
     let kernel: Vec<usize> = get_attr_ints(node, "kernel_shape").iter().map(|&k| k as usize).collect();
-    let auto_pad = get_attr_string(node, "auto_pad", "NOTSET");
+    let auto_pad: AutoPad = parse_enum(node, "auto_pad", "NOTSET")?;
     let pads = get_attr_ints(node, "pads");
     let strides = get_attr_ints(node, "strides");
     let dilations = get_attr_ints(node, "dilations");
     let (values, indices) = inp(inputs, 0)
         .max_pool()
         .kernel_shape(&kernel)
-        .auto_pad(&auto_pad)
+        .auto_pad(auto_pad)
         .ceil_mode(get_attr_int(node, "ceil_mode", 0) == 1)
         .storage_order(get_attr_int(node, "storage_order", 0) as usize)
         .maybe_pads(non_empty_i64(&pads))
@@ -188,6 +199,10 @@ pub(crate) fn op_instance_norm(inputs: &[Option<Tensor>], node: &NodeProto) -> R
 }
 
 pub(crate) fn op_resize(inputs: &[Option<Tensor>], node: &NodeProto) -> Result<Tensor> {
+    let antialias = get_attr_int(node, "antialias", 0);
+    if antialias != 0 {
+        return Err(Error::IrConstruction { details: "Resize: antialias != 0 is not supported".into() });
+    }
     let x = inp(inputs, 0);
     let scales: Option<Vec<f64>> = inputs
         .get(2)
@@ -201,12 +216,12 @@ pub(crate) fn op_resize(inputs: &[Option<Tensor>], node: &NodeProto) -> Result<T
         .filter(|t| t.numel().unwrap_or(0) > 0)
         .map(|t| tensor_to_i64_vec(t).map(|v| v.iter().map(|&x| x as usize).collect()))
         .transpose()?;
-    let mode = get_attr_string(node, "mode", "nearest");
-    let coord_mode = get_attr_string(node, "coordinate_transformation_mode", "half_pixel");
-    let nearest_mode = get_attr_string(node, "nearest_mode", "round_prefer_floor");
+    let mode: ResizeMode = parse_enum(node, "mode", "nearest")?;
+    let coord_mode: CoordinateTransformMode = parse_enum(node, "coordinate_transformation_mode", "half_pixel")?;
+    let nearest_mode: NearestMode = parse_enum(node, "nearest_mode", "round_prefer_floor")?;
     let cubic_coeff = get_attr_float(node, "cubic_coeff_a", -0.75) as f64;
     let exclude_outside = get_attr_int(node, "exclude_outside", 0) != 0;
-    let policy = get_attr_string(node, "keep_aspect_ratio_policy", "stretch");
+    let policy: AspectRatioPolicy = parse_enum(node, "keep_aspect_ratio_policy", "stretch")?;
     let axes_attr = get_attr_ints(node, "axes");
     let axes: Option<Vec<usize>> = if axes_attr.is_empty() {
         None
@@ -217,12 +232,12 @@ pub(crate) fn op_resize(inputs: &[Option<Tensor>], node: &NodeProto) -> Result<T
     Ok(x.resize()
         .maybe_scales(scales.as_deref())
         .maybe_sizes(sizes.as_deref())
-        .mode(&mode)
-        .coordinate_transformation_mode(&coord_mode)
-        .nearest_mode(&nearest_mode)
+        .mode(mode)
+        .coordinate_transformation_mode(coord_mode)
+        .nearest_mode(nearest_mode)
         .cubic_coeff_a(cubic_coeff)
         .exclude_outside(exclude_outside)
-        .keep_aspect_ratio_policy(&policy)
+        .keep_aspect_ratio_policy(policy)
         .maybe_axes(axes.as_deref())
         .call()?)
 }
@@ -300,7 +315,7 @@ pub(crate) fn op_mean_variance_norm(inputs: &[Option<Tensor>], node: &NodeProto)
     let centered = x.try_sub(&mean)?;
     // Population std (correction=0): sqrt(mean((x-mean)²))
     let pop_std = centered.square()?.mean_with().axes(axes_spec).keepdim(true).call()?.try_sqrt()?;
-    let eps = Tensor::const_(1e-9, DType::Float32);
+    let eps = Tensor::const_(1e-9, x.uop().dtype());
     Ok(centered.try_div(&pop_std.try_add(&eps)?)?)
 }
 
@@ -349,9 +364,9 @@ pub(crate) fn op_nll_loss(inputs: &[Option<Tensor>], node: &NodeProto) -> Result
     let x = inp(inputs, 0);
     let target = inp(inputs, 1);
     let weight = inputs.get(2).and_then(|o| o.as_ref());
-    let reduction = get_attr_string(node, "reduction", "mean");
+    let reduction: Reduction = parse_enum(node, "reduction", "mean")?;
     let ignore_index = get_attr(node, "ignore_index").map(|a| a.i);
-    let loss = x.nll_loss(target, weight, ignore_index, &reduction)?;
+    let loss = x.nll_loss(target, weight, ignore_index, reduction)?;
     Ok(vec![loss])
 }
 
@@ -359,7 +374,7 @@ pub(crate) fn op_softmax_ce_loss(inputs: &[Option<Tensor>], node: &NodeProto) ->
     let x = inp(inputs, 0);
     let target = inp(inputs, 1);
     let weight = inputs.get(2).and_then(|o| o.as_ref());
-    let reduction = get_attr_string(node, "reduction", "mean");
+    let reduction: Reduction = parse_enum(node, "reduction", "mean")?;
     let ignore_index = get_attr(node, "ignore_index").map(|a| a.i);
     // log_softmax over class dim (axis 1) using keepdim reduce to avoid broadcast issues
     let max_val = x.max_with().axes(1isize).keepdim(true).call()?;
@@ -367,7 +382,7 @@ pub(crate) fn op_softmax_ce_loss(inputs: &[Option<Tensor>], node: &NodeProto) ->
     let exp_shifted = shifted.try_exp()?;
     let sum_exp = exp_shifted.sum_with().axes(1isize).keepdim(true).call()?;
     let log_probs = shifted.try_sub(&sum_exp.try_log()?)?;
-    let loss = log_probs.nll_loss(target, weight, ignore_index, &reduction)?;
+    let loss = log_probs.nll_loss(target, weight, ignore_index, reduction)?;
     Ok(vec![loss, log_probs])
 }
 
@@ -400,7 +415,7 @@ pub(crate) fn op_affine_grid(inputs: &[Option<Tensor>], node: &NodeProto) -> Res
 
     // Meshgrid
     let grid_refs: Vec<&Tensor> = grids.iter().collect();
-    let mesh = Tensor::meshgrid(&grid_refs, "ij")?;
+    let mesh = Tensor::meshgrid(&grid_refs, MeshgridIndexing::Ij)?;
 
     // Stack in reverse order + ones for homogeneous coordinates
     let total_elements: usize = spatial_dims.iter().product();

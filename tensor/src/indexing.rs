@@ -1,7 +1,22 @@
 //! Indexing operations for Tensors.
 
+use strum::{Display, EnumString};
+
 use super::*;
 use crate::error::ShapeMismatchSnafu;
+
+/// Reduction mode for scatter operations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, EnumString, Display)]
+pub enum ScatterReduction {
+    #[strum(serialize = "sum")]
+    Sum,
+    #[strum(serialize = "prod")]
+    Prod,
+    #[strum(serialize = "amax")]
+    Amax,
+    #[strum(serialize = "amin")]
+    Amin,
+}
 
 impl Tensor {
     /// Gather values along an axis specified by `dim`, using `index` for element selection.
@@ -141,7 +156,7 @@ impl Tensor {
         dim: isize,
         index: &Tensor,
         src: &Tensor,
-        reduce: &str,
+        reduce: ScatterReduction,
         include_self: bool,
     ) -> Result<Tensor> {
         let (src_p, mask_p) = self._pre_scatter(dim, index, src)?;
@@ -155,33 +170,30 @@ impl Tensor {
         };
 
         match reduce {
-            "sum" => {
+            ScatterReduction::Sum => {
                 let zero = Tensor::const_(ConstValue::Int(0), dtype.clone());
                 let reduced = src_p.where_(&mask_p, &zero)?.sum_with().axes(-1isize).call()?;
                 reduced.try_add(&self_or(ConstValue::Int(0))?)
             }
-            "prod" => {
+            ScatterReduction::Prod => {
                 let one = Tensor::const_(ConstValue::Int(1), dtype.clone());
                 let reduced = src_p.where_(&mask_p, &one)?.prod_with().axes(-1isize).call()?;
                 reduced.try_mul(&self_or(ConstValue::Int(1))?)
             }
-            "amax" => {
+            ScatterReduction::Amax => {
                 let min_val =
                     if dtype.is_float() { ConstValue::Float(f64::NEG_INFINITY) } else { ConstValue::Int(i64::MIN) };
                 let fill = Tensor::const_(min_val, dtype.clone());
                 let reduced = src_p.where_(&mask_p, &fill)?.max(-1isize)?;
                 reduced.maximum(&self_or(min_val)?)
             }
-            "amin" => {
+            ScatterReduction::Amin => {
                 let max_val =
                     if dtype.is_float() { ConstValue::Float(f64::INFINITY) } else { ConstValue::Int(i64::MAX) };
                 let fill = Tensor::const_(max_val, dtype.clone());
                 let reduced = src_p.where_(&mask_p, &fill)?.min(-1isize)?;
                 reduced.minimum(&self_or(max_val)?)
             }
-            _ => Err(crate::error::Error::IrConstruction {
-                details: format!("scatter_reduce: unsupported reduce '{reduce}'"),
-            }),
         }
     }
 
@@ -207,7 +219,7 @@ impl Tensor {
         // Build gather indices: zeros.scatter(0, cumsum, 1).cumsum
         let zeros = Tensor::full(&[count], ConstValue::Int(0), morok_dtype::DType::Int32)?;
         let ones = Tensor::full(&[n], ConstValue::Int(1), morok_dtype::DType::Int32)?;
-        let idxs = zeros.scatter_reduce(0, &mask_cumsum, &ones, "sum", false)?.cumsum(0)?;
+        let idxs = zeros.scatter_reduce(0, &mask_cumsum, &ones, ScatterReduction::Sum, false)?.cumsum(0)?;
         x.gather(0, &idxs)
     }
 

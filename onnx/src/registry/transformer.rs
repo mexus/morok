@@ -43,8 +43,12 @@ pub(crate) fn op_attention_onnx(inputs: &[Option<Tensor>], node: &NodeProto) -> 
 
     // Reshape 3D → 4D [B, S, hidden] → [B, H, S, D]
     let (q, k, v) = if is_3d {
-        assert!(q_num_heads > 0, "q_num_heads required for 3D input");
-        assert!(kv_num_heads > 0, "kv_num_heads required for 3D input");
+        if q_num_heads == 0 {
+            return Err(Error::IrConstruction { details: "q_num_heads required for 3D input".into() });
+        }
+        if kv_num_heads == 0 {
+            return Err(Error::IrConstruction { details: "kv_num_heads required for 3D input".into() });
+        }
         let q_hidden = q_shape[2].as_const().unwrap();
         let q_head_dim = q_hidden / q_num_heads;
         let k_shape = k.shape()?;
@@ -272,7 +276,9 @@ pub(crate) fn op_rotary_embedding(inputs: &[Option<Tensor>], node: &NodeProto) -
         // [B, H, S, D] -> [B, S, H, D]
         x.try_permute(&[0, 2, 1, 3])?
     } else if x_ndim == 3 {
-        assert!(num_heads > 0, "num_heads must be provided for 3D input");
+        if num_heads == 0 {
+            return Err(Error::IrConstruction { details: "num_heads must be provided for 3D input".into() });
+        }
         let hidden = x_shape[2].as_const().unwrap();
         let head_dim = hidden / num_heads;
         x.unflatten(-1, &[num_heads as isize, head_dim as isize])?
@@ -353,7 +359,9 @@ pub(crate) fn op_attention_contrib(inputs: &[Option<Tensor>], node: &NodeProto) 
     let past = inputs.get(4).and_then(|o| o.as_ref());
 
     let num_heads = get_attr_int(node, "num_heads", 0) as usize;
-    assert!(num_heads > 0, "num_heads is required for Attention");
+    if num_heads == 0 {
+        return Err(Error::IrConstruction { details: "num_heads is required for Attention".into() });
+    }
     let mask_filter_value = get_attr_float(node, "mask_filter_value", -10000.0) as f64;
     let scale_attr = get_attr_float(node, "scale", 0.0);
     let unidirectional = get_attr_int(node, "unidirectional", 0) != 0;

@@ -267,6 +267,22 @@ pub fn to_vec_usize(shape: &Shape) -> Result<Vec<usize>> {
         .collect()
 }
 
+/// Convert shape to Vec<isize>, ensuring all dimensions are concrete.
+///
+/// # Errors
+///
+/// Returns error if any dimension contains a symbolic (non-const) value.
+pub fn to_vec_isize(shape: &Shape) -> Result<Vec<isize>> {
+    shape
+        .iter()
+        .map(|dim| {
+            dim.as_const()
+                .map(|v| v as isize)
+                .ok_or_else(|| Error::SymbolicShapeUnsupported { operation: "shape conversion".to_string() })
+        })
+        .collect()
+}
+
 // =========================================================================
 // Movement Op Argument Extraction (marg equivalent)
 // =========================================================================

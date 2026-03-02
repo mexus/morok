@@ -20,6 +20,32 @@ use morok_tensor::reduce::AxisSpec;
 use crate::error::{Error, Result, UnsupportedOpSnafu};
 use crate::parser::onnx::NodeProto;
 
+/// Exact GELU: `0.5 * x * (1 + erf(x / sqrt(2)))`.
+fn exact_gelu(x: &Tensor) -> Result<Tensor> {
+    let dtype = x.uop().dtype();
+    let half = Tensor::const_(0.5f64, dtype.clone());
+    let one = Tensor::const_(1.0f64, dtype.clone());
+    let sqrt2 = Tensor::const_(std::f64::consts::SQRT_2, dtype);
+    Ok(half.try_mul(x)?.try_mul(&one.try_add(&x.try_div(&sqrt2)?.erf()?)?)?)
+}
+
+/// Fold a variadic list of tensors with a binary operation.
+fn fold_variadic(
+    inputs: &[Option<Tensor>],
+    op_name: &str,
+    f: fn(&Tensor, &Tensor) -> std::result::Result<Tensor, morok_tensor::error::Error>,
+) -> Result<Tensor> {
+    let valid: Vec<&Tensor> = inputs.iter().filter_map(Option::as_ref).collect();
+    let first = valid
+        .first()
+        .ok_or_else(|| Error::IrConstruction { details: format!("{op_name} requires at least one input") })?;
+    let mut acc = (*first).clone();
+    for t in &valid[1..] {
+        acc = f(&acc, t)?;
+    }
+    Ok(acc)
+}
+
 /// Operator registry for dispatching ONNX ops to Morok Tensor operations.
 pub struct OpRegistry;
 
@@ -88,28 +114,10 @@ impl OpRegistry {
                     x.try_sub(&product)?
                 }
             }
-            "Sum" => {
-                let valid: Vec<&Tensor> = inputs.iter().filter_map(Option::as_ref).collect();
-                let first = valid
-                    .first()
-                    .ok_or_else(|| Error::IrConstruction { details: "Sum requires at least one input".into() })?;
-                let mut acc = (*first).clone();
-                for t in &valid[1..] {
-                    acc = acc.try_add(t)?;
-                }
-                acc
-            }
+            "Sum" => fold_variadic(inputs, "Sum", |a, b| a.try_add(b))?,
             "Mean" => {
-                let valid: Vec<&Tensor> = inputs.iter().filter_map(Option::as_ref).collect();
-                let count = valid.len();
-                let first = valid
-                    .first()
-                    .ok_or_else(|| Error::IrConstruction { details: "Mean requires at least one input".into() })?;
-                let mut acc = (*first).clone();
-                for t in &valid[1..] {
-                    acc = acc.try_add(t)?;
-                }
-                acc.try_div(&Tensor::from_slice([count as f32]))?
+                let count = inputs.iter().filter(|o| o.is_some()).count();
+                fold_variadic(inputs, "Mean", |a, b| a.try_add(b))?.try_div(&Tensor::from_slice([count as f32]))?
             }
 
             // === Bitwise ===
@@ -170,16 +178,7 @@ impl OpRegistry {
             }
             "Gelu" => {
                 let approximate = get_attr_string(node, "approximate", "none");
-                if approximate == "tanh" {
-                    inp(inputs, 0).gelu()?
-                } else {
-                    let x = inp(inputs, 0);
-                    let dtype = x.uop().dtype();
-                    let half = Tensor::const_(0.5f64, dtype.clone());
-                    let one = Tensor::const_(1.0f64, dtype.clone());
-                    let sqrt2 = Tensor::const_(std::f64::consts::SQRT_2, dtype);
-                    half.try_mul(x)?.try_mul(&one.try_add(&x.try_div(&sqrt2)?.erf()?)?)?
-                }
+                if approximate == "tanh" { inp(inputs, 0).gelu()? } else { exact_gelu(inp(inputs, 0))? }
             }
             "HardSigmoid" => {
                 let alpha = get_attr_float(node, "alpha", 0.2) as f64;
@@ -224,14 +223,16 @@ impl OpRegistry {
             "GreaterOrEqual" => inp(inputs, 0).try_ge(inp(inputs, 1))?,
             "Not" => inp(inputs, 0).logical_not()?,
             "And" => {
-                let (x, y) = (inp(inputs, 0), inp(inputs, 1));
-                let cond = x.try_eq(y)?;
-                x.where_(&cond, &Tensor::from_const(false))?
+                let a = inp(inputs, 0).cast(DType::Bool)?;
+                let b = inp(inputs, 1).cast(DType::Bool)?;
+                a.try_mul(&b)?
             }
             "Or" => {
-                let (x, y) = (inp(inputs, 0), inp(inputs, 1));
-                let cond = x.try_eq(y)?;
-                x.where_(&cond, &Tensor::from_const(true))?
+                let a = inp(inputs, 0).cast(DType::Bool)?;
+                let b = inp(inputs, 1).cast(DType::Bool)?;
+                // a | b = a + b - a*b
+                let ab = a.try_mul(&b)?;
+                a.try_add(&b)?.try_sub(&ab)?
             }
             "Xor" => {
                 let x = inp(inputs, 0).cast(DType::Bool)?;
@@ -241,28 +242,8 @@ impl OpRegistry {
 
             // === Conditional ===
             "Where" => inp(inputs, 1).where_(inp(inputs, 0), inp(inputs, 2))?,
-            "Max" => {
-                let valid: Vec<&Tensor> = inputs.iter().filter_map(Option::as_ref).collect();
-                let first = valid
-                    .first()
-                    .ok_or_else(|| Error::IrConstruction { details: "Max requires at least one input".into() })?;
-                let mut acc = (*first).clone();
-                for t in &valid[1..] {
-                    acc = acc.maximum(t)?;
-                }
-                acc
-            }
-            "Min" => {
-                let valid: Vec<&Tensor> = inputs.iter().filter_map(Option::as_ref).collect();
-                let first = valid
-                    .first()
-                    .ok_or_else(|| Error::IrConstruction { details: "Min requires at least one input".into() })?;
-                let mut acc = (*first).clone();
-                for t in &valid[1..] {
-                    acc = acc.minimum(t)?;
-                }
-                acc
-            }
+            "Max" => fold_variadic(inputs, "Max", |a, b| a.maximum(b))?,
+            "Min" => fold_variadic(inputs, "Min", |a, b| a.minimum(b))?,
             "Clip" => {
                 let min = inputs.get(1).and_then(|o| o.as_ref());
                 let max = inputs.get(2).and_then(|o| o.as_ref());
@@ -537,19 +518,9 @@ impl OpRegistry {
                 x.try_mul(&x.try_mul(&alpha_t)?.sigmoid()?)?
             }
             "BiasGelu" => {
-                let x = inp(inputs, 0);
-                let bias = inp(inputs, 1);
-                let xb = x.try_add(bias)?;
+                let xb = inp(inputs, 0).try_add(inp(inputs, 1))?;
                 let approximate = get_attr_string(node, "approximate", "none");
-                if approximate == "tanh" {
-                    xb.gelu()?
-                } else {
-                    let dtype = xb.uop().dtype();
-                    let half = Tensor::const_(0.5f64, dtype.clone());
-                    let one = Tensor::const_(1.0f64, dtype.clone());
-                    let sqrt2 = Tensor::const_(std::f64::consts::SQRT_2, dtype);
-                    half.try_mul(&xb)?.try_mul(&one.try_add(&xb.try_div(&sqrt2)?.erf()?)?)?
-                }
+                if approximate == "tanh" { xb.gelu()? } else { exact_gelu(&xb)? }
             }
             "FastGelu" => {
                 let x = inp(inputs, 0);
@@ -578,7 +549,7 @@ impl OpRegistry {
                     .as_const()
                     .ok_or_else(|| Error::IrConstruction { details: "EyeLike requires concrete shape".into() })?;
                 let eye_size = h.min(w);
-                let mut eye = Tensor::eye(eye_size, eye_size)?.cast(dtype)?;
+                let mut eye = Tensor::eye(eye_size, eye_size, dtype)?;
                 if h != w || k != 0 {
                     let k = k as isize;
                     let pad_top = if k < 0 { (-k) as isize } else { 0 };

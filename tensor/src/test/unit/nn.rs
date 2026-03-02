@@ -1,6 +1,7 @@
 //! Tests for neural network operations: pool, conv, normalization, resize.
 
 use crate::Tensor;
+use crate::nn::{Reduction, ResizeMode};
 
 fn get_shape(tensor: &Tensor) -> Vec<usize> {
     tensor.uop().shape().unwrap().unwrap().iter().map(|s| s.as_const().unwrap()).collect()
@@ -346,21 +347,21 @@ fn test_layernorm_2d() {
 #[test]
 fn test_resize_nearest_upsample() {
     let t = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0]).try_reshape(&[1, 1, 2, 2]).unwrap();
-    let result = t.resize().scales(&[1.0, 1.0, 2.0, 2.0]).mode("nearest").call().unwrap().realize().unwrap();
+    let result = t.resize().scales(&[1.0, 1.0, 2.0, 2.0]).mode(ResizeMode::Nearest).call().unwrap().realize().unwrap();
     assert_eq!(get_shape(&result), vec![1, 1, 4, 4]);
 }
 
 #[test]
 fn test_resize_linear_upsample() {
     let t = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0]).try_reshape(&[1, 1, 2, 2]).unwrap();
-    let result = t.resize().scales(&[1.0, 1.0, 2.0, 2.0]).mode("linear").call().unwrap().realize().unwrap();
+    let result = t.resize().scales(&[1.0, 1.0, 2.0, 2.0]).mode(ResizeMode::Linear).call().unwrap().realize().unwrap();
     assert_eq!(get_shape(&result), vec![1, 1, 4, 4]);
 }
 
 #[test]
 fn test_resize_nearest_downsample() {
     let t = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0]).try_reshape(&[1, 1, 3, 3]).unwrap();
-    let result = t.resize().sizes(&[1, 1, 2, 2]).mode("nearest").call().unwrap().realize().unwrap();
+    let result = t.resize().sizes(&[1, 1, 2, 2]).mode(ResizeMode::Nearest).call().unwrap().realize().unwrap();
     assert_eq!(get_shape(&result), vec![1, 1, 2, 2]);
 }
 
@@ -409,7 +410,7 @@ fn test_nll_loss_basic() {
     .try_reshape(&[2, 3])
     .unwrap();
     let target = Tensor::from_slice([0i64, 2]); // class 0 for sample 0, class 2 for sample 1
-    let loss = log_probs.nll_loss(&target, None, None, "mean").unwrap();
+    let loss = log_probs.nll_loss(&target, None, None, Reduction::Mean).unwrap();
     let result = loss.realize().unwrap().to_ndarray::<f32>().unwrap();
     let val = result.into_raw_vec_and_offset().0[0];
     // NLL = -log_probs[i, target[i]]: sample0=-(-0.5)=0.5, sample1=-(-0.8)=0.8
@@ -426,7 +427,7 @@ fn test_nll_loss_none_reduction() {
     .try_reshape(&[2, 3])
     .unwrap();
     let target = Tensor::from_slice([0i64, 2]);
-    let loss = log_probs.nll_loss(&target, None, None, "none").unwrap();
+    let loss = log_probs.nll_loss(&target, None, None, Reduction::None).unwrap();
     let vals: Vec<f32> = loss.realize().unwrap().to_ndarray::<f32>().unwrap().iter().copied().collect();
     assert_eq!(vals.len(), 2);
     assert!((vals[0] - 0.5).abs() < 1e-4);
@@ -443,7 +444,7 @@ fn test_nll_loss_weighted() {
     .unwrap();
     let target = Tensor::from_slice([0i64, 2]);
     let weight = Tensor::from_slice([2.0f32, 1.0, 3.0]); // class weights
-    let loss = log_probs.nll_loss(&target, Some(&weight), None, "mean").unwrap();
+    let loss = log_probs.nll_loss(&target, Some(&weight), None, Reduction::Mean).unwrap();
     let result = loss.realize().unwrap().to_ndarray::<f32>().unwrap();
     let val = result.into_raw_vec_and_offset().0[0];
     // weighted: sample0=0.5*2.0=1.0, sample1=0.8*3.0=2.4
@@ -461,7 +462,7 @@ fn test_nll_loss_ignore_index() {
     .unwrap();
     let target = Tensor::from_slice([0i64, 2]);
     // Ignore class 2 — sample 1 is masked out
-    let loss = log_probs.nll_loss(&target, None, Some(2), "mean").unwrap();
+    let loss = log_probs.nll_loss(&target, None, Some(2), Reduction::Mean).unwrap();
     let result = loss.realize().unwrap().to_ndarray::<f32>().unwrap();
     let val = result.into_raw_vec_and_offset().0[0];
     // Only sample 0 contributes: 0.5 / 1.0 = 0.5

@@ -185,7 +185,8 @@ fn test_scatter_reduce_sum() {
     let x = Tensor::from_slice([0.0f32, 0.0, 0.0]);
     let idx = Tensor::from_slice([0i32, 0, 1]);
     let src = Tensor::from_slice([1.0f32, 2.0, 3.0]);
-    let result = x.scatter_reduce(0, &idx, &src, "sum", true).unwrap().realize().unwrap();
+    let result =
+        x.scatter_reduce(0, &idx, &src, crate::indexing::ScatterReduction::Sum, true).unwrap().realize().unwrap();
     let vals = result.to_ndarray::<f32>().unwrap();
     // index 0: 0 + 1 + 2 = 3, index 1: 0 + 3 = 3, index 2: 0
     assert_eq!(vals[[0]], 3.0);

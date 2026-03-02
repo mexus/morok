@@ -39,4 +39,10 @@ impl From<morok_tensor::error::Error> for Error {
     }
 }
 
+impl From<morok_ir::error::Error> for Error {
+    fn from(source: morok_ir::error::Error) -> Self {
+        Error::IrConstruction { details: source.to_string() }
+    }
+}
+
 pub type Result<T> = std::result::Result<T, Error>;

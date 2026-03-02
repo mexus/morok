@@ -527,7 +527,7 @@ fn argmax_impl(tensor: &Tensor, axis: Option<isize>, keepdim: bool) -> Result<Te
         .ok_or_else(|| Error::SymbolicShapeUnsupported { operation: "argmax".to_string() })?;
 
     // Convert shape to isize vec once for reuse in expand operations
-    let shape_vec: Vec<isize> = shape.iter().map(|s| s.as_const().unwrap() as isize).collect();
+    let shape_vec = morok_ir::shape::to_vec_isize(&shape).context(UOpSnafu)?;
 
     // Step 1: Find maximum values along axis (with keepdim for broadcasting)
     let max_vals_keepdim = working_tensor.max_with().axes(working_axis).keepdim(true).call()?;
@@ -565,7 +565,7 @@ fn argmax_impl(tensor: &Tensor, axis: Option<isize>, keepdim: bool) -> Result<Te
     let max_idx_shape = max_idx.shape()?;
     let result = if !max_idx_shape.is_empty() {
         // Non-scalar result: broadcast n_tensor
-        let max_idx_shape_vec: Vec<isize> = max_idx_shape.iter().map(|s| s.as_const().unwrap() as isize).collect();
+        let max_idx_shape_vec = morok_ir::shape::to_vec_isize(&max_idx_shape).context(UOpSnafu)?;
         let ones_shape = vec![1isize; max_idx_shape.len()];
         let n_reshaped = n_tensor.try_reshape(&ones_shape)?;
         let n_broadcast = n_reshaped.try_expand(&max_idx_shape_vec)?;

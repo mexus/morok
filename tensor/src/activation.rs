@@ -7,7 +7,8 @@ use bon::bon;
 use morok_ir::{ConstValue, UOp};
 use snafu::ResultExt;
 
-use crate::{Result, Tensor, error::UOpSnafu, reduce::AxisSpec};
+use crate::reduce::AxisSpec;
+use crate::{Result, Tensor, error::UOpSnafu};
 
 #[bon]
 impl Tensor {
@@ -23,8 +24,7 @@ impl Tensor {
     /// // y = [0.0, 0.0, 0.0, 1.0, 2.0]
     /// ```
     pub fn relu(&self) -> Result<Self> {
-        // relu(x) = where(x > 0, x, 0)
-        let zero = self.broadcast_scalar(ConstValue::Int(0))?;
+        let zero = self.zero()?;
         let condition = self.try_gt(&zero)?;
         self.where_(&condition, &zero)
     }
@@ -45,7 +45,7 @@ impl Tensor {
         let scale = self.broadcast_scalar(ConstValue::Float(-1.0 / std::f64::consts::LN_2))?;
         let scaled = self.try_mul(&scale)?;
         let exp2_val = scaled.try_exp2()?;
-        let one = exp2_val.broadcast_scalar(ConstValue::Int(1))?;
+        let one = exp2_val.one()?;
         let denominator = one.try_add(&exp2_val)?;
         let recip = Self::new(UOp::try_reciprocal(&denominator.uop()).context(UOpSnafu)?);
         Ok(recip)
@@ -69,7 +69,7 @@ impl Tensor {
         let two_x = self.try_mul(&two)?;
         let sig = two_x.sigmoid()?;
         let two_sig = two.try_mul(&sig)?;
-        let one = sig.broadcast_scalar(ConstValue::Int(1))?;
+        let one = sig.one()?;
         two_sig.try_sub(&one)
     }
 
@@ -224,7 +224,7 @@ impl Tensor {
     /// # Arguments
     /// * `alpha` - Negative slope (default 0.01 in ONNX)
     pub fn leaky_relu(&self, alpha: f64) -> Result<Self> {
-        let zero = self.broadcast_scalar(ConstValue::Int(0))?;
+        let zero = self.zero()?;
         let alpha_t = self.broadcast_scalar(ConstValue::Float(alpha))?;
         let condition = self.try_gt(&zero)?;
         let neg_branch = alpha_t.try_mul(self)?;
@@ -235,7 +235,7 @@ impl Tensor {
     ///
     /// Like LeakyReLU but with a learned per-channel slope.
     pub fn prelu(&self, slope: &Tensor) -> Result<Self> {
-        let zero = self.broadcast_scalar(ConstValue::Int(0))?;
+        let zero = self.zero()?;
         let condition = self.try_gt(&zero)?;
         let neg_branch = self.try_mul(slope)?;
         self.where_(&condition, &neg_branch)
@@ -247,7 +247,7 @@ impl Tensor {
     /// * `alpha` - Threshold (default 1.0 in ONNX)
     pub fn thresholded_relu(&self, alpha: f64) -> Result<Self> {
         let alpha_t = self.broadcast_scalar(ConstValue::Float(alpha))?;
-        let zero = self.broadcast_scalar(ConstValue::Int(0))?;
+        let zero = self.zero()?;
         let condition = self.try_gt(&alpha_t)?;
         self.where_(&condition, &zero)
     }
@@ -257,8 +257,8 @@ impl Tensor {
     /// # Arguments
     /// * `alpha` - Scale for negative part (default 1.0 in ONNX)
     pub fn elu(&self, alpha: f64) -> Result<Self> {
-        let zero = self.broadcast_scalar(ConstValue::Int(0))?;
-        let one = self.broadcast_scalar(ConstValue::Int(1))?;
+        let zero = self.zero()?;
+        let one = self.one()?;
         let alpha_t = self.broadcast_scalar(ConstValue::Float(alpha))?;
         let condition = self.try_gt(&zero)?;
         let exp_minus_1 = self.try_exp()?.try_sub(&one)?;
@@ -274,7 +274,7 @@ impl Tensor {
     /// * `alpha` - Default 1.6732632...
     /// * `gamma` - Default 1.0507010...
     pub fn selu(&self, alpha: f64, gamma: f64) -> Result<Self> {
-        let zero = self.broadcast_scalar(ConstValue::Int(0))?;
+        let zero = self.zero()?;
         let alpha_t = self.broadcast_scalar(ConstValue::Float(alpha))?;
         let gamma_t = self.broadcast_scalar(ConstValue::Float(gamma))?;
         let condition = self.try_ge(&zero)?;
@@ -310,7 +310,7 @@ impl Tensor {
     pub fn softplus(&self, beta: f64) -> Result<Self> {
         let beta_t = self.broadcast_scalar(ConstValue::Float(beta))?;
         let scaled = self.try_mul(&beta_t)?;
-        let zero = self.broadcast_scalar(ConstValue::Int(0))?;
+        let zero = self.zero()?;
         let inv_beta = self.broadcast_scalar(ConstValue::Float(1.0 / beta))?;
         // logaddexp(scaled, 0) = max(scaled, 0) + log(exp(scaled - max) + exp(0 - max))
         let m = scaled.maximum(&zero)?;
@@ -341,15 +341,15 @@ impl Tensor {
 
     /// Softsign: `x / (1 + |x|)`.
     pub fn softsign(&self) -> Result<Self> {
-        let one = self.broadcast_scalar(ConstValue::Int(1))?;
+        let one = self.one()?;
         let denom = one.try_add(&self.try_abs()?)?;
         self.try_div(&denom)
     }
 
     /// CELU: `max(0, x) + min(0, alpha*(exp(x/alpha)-1))`.
     pub fn celu(&self, alpha: f64) -> Result<Self> {
-        let zero = self.broadcast_scalar(ConstValue::Int(0))?;
-        let one = self.broadcast_scalar(ConstValue::Int(1))?;
+        let zero = self.zero()?;
+        let one = self.one()?;
         let alpha_t = self.broadcast_scalar(ConstValue::Float(alpha))?;
         let pos = self.maximum(&zero)?;
         let neg = alpha_t.try_mul(&self.try_div(&alpha_t)?.try_exp()?.try_sub(&one)?)?.minimum(&zero)?;

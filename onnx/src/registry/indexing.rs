@@ -1,6 +1,7 @@
 use morok_dtype::DType;
 use morok_ir::ConstValue;
 use morok_tensor::Tensor;
+use morok_tensor::indexing::ScatterReduction;
 
 use crate::error::{Error, Result};
 use crate::parser::onnx::NodeProto;
@@ -95,10 +96,10 @@ pub(crate) fn op_scatter_elements(inputs: &[Option<Tensor>], node: &NodeProto) -
         "none" => x.scatter(axis, &norm_idx, updates)?,
         other => {
             let reduce = match other {
-                "add" => "sum",
-                "mul" => "prod",
-                "min" => "amin",
-                "max" => "amax",
+                "add" => ScatterReduction::Sum,
+                "mul" => ScatterReduction::Prod,
+                "min" => ScatterReduction::Amin,
+                "max" => ScatterReduction::Amax,
                 _ => {
                     return Err(Error::IrConstruction {
                         details: format!("ScatterElements: unsupported reduction '{other}'"),
@@ -116,7 +117,7 @@ pub(crate) fn op_scatter_nd(inputs: &[Option<Tensor>], node: &NodeProto) -> Resu
     let updates = inp(inputs, 2);
     let reduction = get_attr_string(node, "reduction", "none");
     let x_shape = x.shape()?;
-    let x_dims: Vec<usize> = x_shape.iter().map(|s| s.as_const().unwrap()).collect();
+    let x_dims = morok_ir::shape::to_vec_usize(&x_shape)?;
     let idx_shape = indices.shape()?;
     let last_idx_dim = idx_shape[idx_shape.len() - 1].as_const().unwrap();
     let strides: Vec<i64> =
@@ -144,12 +145,13 @@ pub(crate) fn op_scatter_nd(inputs: &[Option<Tensor>], node: &NodeProto) -> Resu
         upd_shape[..upd_shape.len() - (x_dims.len() - last_idx_dim)].iter().map(|s| s.as_const().unwrap()).product();
     let upd_flat = updates.try_reshape(&[upd_outer as isize, inner as isize])?;
     let flat_idx = flat_idx.try_reshape(&[upd_outer as isize, 1])?.try_expand(&[upd_outer as isize, inner as isize])?;
+    let flat_idx_i32 = flat_idx.cast(DType::Int32)?;
     x = match reduction.as_str() {
-        "none" => x_flat.scatter(0, &flat_idx.cast(DType::Int32)?, &upd_flat)?,
-        "add" => x_flat.scatter_reduce(0, &flat_idx.cast(DType::Int32)?, &upd_flat, "sum", true)?,
-        "mul" => x_flat.scatter_reduce(0, &flat_idx.cast(DType::Int32)?, &upd_flat, "prod", true)?,
-        "max" => x_flat.scatter_reduce(0, &flat_idx.cast(DType::Int32)?, &upd_flat, "amax", true)?,
-        "min" => x_flat.scatter_reduce(0, &flat_idx.cast(DType::Int32)?, &upd_flat, "amin", true)?,
+        "none" => x_flat.scatter(0, &flat_idx_i32, &upd_flat)?,
+        "add" => x_flat.scatter_reduce(0, &flat_idx_i32, &upd_flat, ScatterReduction::Sum, true)?,
+        "mul" => x_flat.scatter_reduce(0, &flat_idx_i32, &upd_flat, ScatterReduction::Prod, true)?,
+        "max" => x_flat.scatter_reduce(0, &flat_idx_i32, &upd_flat, ScatterReduction::Amax, true)?,
+        "min" => x_flat.scatter_reduce(0, &flat_idx_i32, &upd_flat, ScatterReduction::Amin, true)?,
         _ => {
             return Err(Error::IrConstruction { details: format!("ScatterND: unsupported reduction '{reduction}'") });
         }
@@ -163,9 +165,9 @@ pub(crate) fn op_gather_nd(inputs: &[Option<Tensor>], node: &NodeProto) -> Resul
     let indices = inp(inputs, 1);
     let batch_dims = get_attr_int(node, "batch_dims", 0) as usize;
     let x_shape = x.shape()?;
-    let x_dims: Vec<usize> = x_shape.iter().map(|s| s.as_const().unwrap()).collect();
+    let x_dims = morok_ir::shape::to_vec_usize(&x_shape)?;
     let idx_shape = indices.shape()?;
-    let idx_dims: Vec<usize> = idx_shape.iter().map(|s| s.as_const().unwrap()).collect();
+    let idx_dims = morok_ir::shape::to_vec_usize(&idx_shape)?;
     let last_idx_dim = *idx_dims.last().unwrap();
 
     if batch_dims == 0 {
@@ -216,7 +218,7 @@ pub(crate) fn op_gather_nd(inputs: &[Option<Tensor>], node: &NodeProto) -> Resul
 
         let mut flat_idx = Tensor::const_(ConstValue::Int(0), DType::Int64);
         let idx_flat_shape = idx_flat.shape()?;
-        let idx_flat_dims: Vec<usize> = idx_flat_shape.iter().map(|s| s.as_const().unwrap()).collect();
+        let idx_flat_dims = morok_ir::shape::to_vec_usize(&idx_flat_shape)?;
         for (k, stride) in strides.iter().enumerate() {
             let mut ranges: Vec<(isize, isize)> = idx_flat_dims.iter().map(|&s| (0, s as isize)).collect();
             ranges[idx_flat_dims.len() - 1] = (k as isize, k as isize + 1);
