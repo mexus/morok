@@ -1,4 +1,4 @@
-use morok_dtype::DType;
+use morok_dtype::{DType, ScalarDType};
 use morok_tensor::Tensor;
 use morok_tensor::nn::{AspectRatioPolicy, AutoPad, CoordinateTransformMode, NearestMode, Reduction, ResizeMode};
 use morok_tensor::reduce::AxisSpec;
@@ -8,6 +8,17 @@ use crate::error::{Error, Result};
 use crate::parser::onnx::NodeProto;
 
 use super::*;
+
+/// Smallest positive normal value for a float dtype.
+fn dtype_min_positive(dtype: DType) -> f64 {
+    match dtype.scalar().expect("scalar dtype") {
+        ScalarDType::Float16 => 6.103515625e-05,        // 2^-14
+        ScalarDType::BFloat16 => 1.175494350822288e-38, // 2^-126 (same exponent range as f32)
+        ScalarDType::Float32 => f32::MIN_POSITIVE as f64,
+        ScalarDType::Float64 => f64::MIN_POSITIVE,
+        _ => f32::MIN_POSITIVE as f64,
+    }
+}
 
 /// Parse an ONNX string attribute into a typed enum.
 fn parse_enum<T: std::str::FromStr>(node: &NodeProto, attr: &str, default: &str) -> Result<T>
@@ -298,7 +309,9 @@ pub(crate) fn op_lp_norm(inputs: &[Option<Tensor>], node: &NodeProto) -> Result<
         1 => x.try_abs()?.sum_with().axes(AxisSpec::Single(axis)).keepdim(true).call()?,
         _ => x.square()?.sum_with().axes(AxisSpec::Single(axis)).keepdim(true).call()?.try_sqrt()?,
     };
-    Ok(x.try_div(&norm)?)
+    // Avoid 0/0 → NaN: add smallest normal float so 0/ε = 0 (ONNX expects 0 when norm is 0)
+    let eps = dtype_min_positive(x.uop().dtype());
+    Ok(x.try_div(&norm.try_add(&Tensor::const_(eps, x.uop().dtype()))?)?)
 }
 
 // =========================================================================

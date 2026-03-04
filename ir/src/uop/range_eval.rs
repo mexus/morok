@@ -91,7 +91,9 @@ fn zero_to_end_minus_one(end: &Arc<UOp>, dtype: &DType) -> (ConstValue, ConstVal
 fn sources_range(sources: &[Arc<UOp>], dtype: &DType) -> (ConstValue, ConstValue) {
     use crate::uop::cached_property::CachedProperty;
     use crate::uop::properties::VminVmaxProperty;
-    if sources.is_empty() { return dtype_bounds(dtype); }
+    if sources.is_empty() {
+        return dtype_bounds(dtype);
+    }
     let (first_min, first_max) = VminVmaxProperty::get(&sources[0]);
     sources.iter().skip(1).fold((*first_min, *first_max), |(vmin, vmax), src| {
         let (s_min, s_max) = VminVmaxProperty::get(src);
@@ -101,10 +103,10 @@ fn sources_range(sources: &[Arc<UOp>], dtype: &DType) -> (ConstValue, ConstValue
 
 /// Union of ranges across ConstValue slice (VConst).
 fn sources_range_values(values: &[ConstValue], dtype: &DType) -> (ConstValue, ConstValue) {
-    if values.is_empty() { return dtype_bounds(dtype); }
-    values.iter().skip(1).fold((values[0], values[0]), |(vmin, vmax), &v| {
-        (min_value(vmin, v), max_value(vmax, v))
-    })
+    if values.is_empty() {
+        return dtype_bounds(dtype);
+    }
+    values.iter().skip(1).fold((values[0], values[0]), |(vmin, vmax), &v| (min_value(vmin, v), max_value(vmax, v)))
 }
 
 // ============================================================================
@@ -566,27 +568,9 @@ fn eval_four_corners(
 }
 
 /// Get the minimum and maximum values for a dtype.
-///
-/// Uses the base scalar type for bounds, matching Tinygrad's `dtype.scalar()` approach.
 fn dtype_bounds(dtype: &DType) -> (ConstValue, ConstValue) {
-    use morok_dtype::ScalarDType as S;
-
-    match dtype.base() {
-        S::Bool => (ConstValue::Bool(false), ConstValue::Bool(true)),
-        S::Int8 => (ConstValue::Int(i8::MIN as i64), ConstValue::Int(i8::MAX as i64)),
-        S::Int16 => (ConstValue::Int(i16::MIN as i64), ConstValue::Int(i16::MAX as i64)),
-        S::Int32 => (ConstValue::Int(i32::MIN as i64), ConstValue::Int(i32::MAX as i64)),
-        S::Int64 | S::Index => (ConstValue::Int(i64::MIN), ConstValue::Int(i64::MAX)),
-        S::UInt8 => (ConstValue::UInt(u8::MIN as u64), ConstValue::UInt(u8::MAX as u64)),
-        S::UInt16 => (ConstValue::UInt(u16::MIN as u64), ConstValue::UInt(u16::MAX as u64)),
-        S::UInt32 => (ConstValue::UInt(u32::MIN as u64), ConstValue::UInt(u32::MAX as u64)),
-        S::UInt64 => (ConstValue::UInt(u64::MIN), ConstValue::UInt(u64::MAX)),
-        S::FP8E4M3 | S::FP8E5M2 | S::Float16 => (ConstValue::Float(-65504.0), ConstValue::Float(65504.0)),
-        S::BFloat16 => (ConstValue::Float(-3.38953e38), ConstValue::Float(3.38953e38)),
-        S::Float32 => (ConstValue::Float(f32::MIN as f64), ConstValue::Float(f32::MAX as f64)),
-        S::Float64 => (ConstValue::Float(f64::MIN), ConstValue::Float(f64::MAX)),
-        S::Void => (ConstValue::Int(0), ConstValue::Int(0)),
-    }
+    let s = dtype.base();
+    (ConstValue::min(s), ConstValue::max(s))
 }
 
 /// Compare two ConstValues and return the minimum.

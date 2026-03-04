@@ -590,13 +590,13 @@ impl Tensor {
     }
 
     /// Broadcast a dtype-aware zero to match this tensor's shape.
-    pub(crate) fn zero(&self) -> Result<Self> {
+    pub fn zero(&self) -> Result<Self> {
         let sdtype = self.uop().dtype().scalar().expect("scalar dtype");
         self.broadcast_scalar(ConstValue::zero(sdtype))
     }
 
     /// Broadcast a dtype-aware one to match this tensor's shape.
-    pub(crate) fn one(&self) -> Result<Self> {
+    pub fn one(&self) -> Result<Self> {
         let sdtype = self.uop().dtype().scalar().expect("scalar dtype");
         self.broadcast_scalar(ConstValue::one(sdtype))
     }

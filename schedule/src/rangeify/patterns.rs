@@ -2002,12 +2002,7 @@ fn uop_min(a: &Arc<UOp>, b: &Arc<UOp>) -> Option<Arc<UOp>> {
 ///
 /// Substitutes range with `idx.cast(r.dtype).valid(in_bounds)` in the expression,
 /// producing `where(in_bounds, expr[r:=valid_idx], 0)`.
-fn gated_collapse_core(
-    idx: &Arc<UOp>,
-    range: &Arc<UOp>,
-    end: &Arc<UOp>,
-    expr: &Arc<UOp>,
-) -> Option<Arc<UOp>> {
+fn gated_collapse_core(idx: &Arc<UOp>, range: &Arc<UOp>, end: &Arc<UOp>, expr: &Arc<UOp>) -> Option<Arc<UOp>> {
     let idx_casted = idx.cast(range.dtype());
     let zero = UOp::index_const(0);
     let in_bounds = idx_casted.try_cmpge(&zero).ok()?.try_and_op(&idx_casted.try_cmplt(end).ok()?).ok()?;
@@ -2123,9 +2118,13 @@ fn try_reduce_collapse(
             }
             // EQ: where(idx == range_side, expr, 0) — Morok-specific
             Op::Binary(BinaryOp::Eq, lhs, rhs) if is_const_zero(false_val) => {
-                if no_range(lhs) { Some((lhs, rhs, true_val)) }
-                else if no_range(rhs) { Some((rhs, lhs, true_val)) }
-                else { None }
+                if no_range(lhs) {
+                    Some((lhs, rhs, true_val))
+                } else if no_range(rhs) {
+                    Some((rhs, lhs, true_val))
+                } else {
+                    None
+                }
             }
             _ => None,
         }?;
@@ -2296,7 +2295,9 @@ fn try_lift_arithmetic_from_lt(cond: &Arc<UOp>) -> Option<Arc<UOp>> {
 /// - Cast(x ± y) == c → same with c cast to inner dtype
 fn try_lift_arithmetic_from_eq(cond: &Arc<UOp>) -> Option<Arc<UOp>> {
     let Op::Binary(BinaryOp::Eq, lhs, rhs) = cond.op() else { return None };
-    if !no_range(rhs) { return None; }
+    if !no_range(rhs) {
+        return None;
+    }
 
     // Unwrap optional CAST, adjusting rhs to inner dtype
     let (inner_lhs, effective_rhs) = if let Op::Cast { src, .. } = lhs.op() {
@@ -2306,18 +2307,10 @@ fn try_lift_arithmetic_from_eq(cond: &Arc<UOp>) -> Option<Arc<UOp>> {
     };
 
     match inner_lhs.op() {
-        Op::Binary(BinaryOp::Add, x, y) if no_range(y) => {
-            x.try_cmpeq(&effective_rhs.try_sub(y).ok()?).ok()
-        }
-        Op::Binary(BinaryOp::Add, x, y) if no_range(x) => {
-            y.try_cmpeq(&effective_rhs.try_sub(x).ok()?).ok()
-        }
-        Op::Binary(BinaryOp::Sub, x, y) if no_range(y) => {
-            x.try_cmpeq(&effective_rhs.try_add(y).ok()?).ok()
-        }
-        Op::Binary(BinaryOp::Sub, x, y) if no_range(x) => {
-            y.try_cmpeq(&x.try_sub(&effective_rhs).ok()?).ok()
-        }
+        Op::Binary(BinaryOp::Add, x, y) if no_range(y) => x.try_cmpeq(&effective_rhs.try_sub(y).ok()?).ok(),
+        Op::Binary(BinaryOp::Add, x, y) if no_range(x) => y.try_cmpeq(&effective_rhs.try_sub(x).ok()?).ok(),
+        Op::Binary(BinaryOp::Sub, x, y) if no_range(y) => x.try_cmpeq(&effective_rhs.try_add(y).ok()?).ok(),
+        Op::Binary(BinaryOp::Sub, x, y) if no_range(x) => y.try_cmpeq(&x.try_sub(&effective_rhs).ok()?).ok(),
         _ => None,
     }
 }

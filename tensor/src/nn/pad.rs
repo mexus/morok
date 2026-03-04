@@ -138,8 +138,7 @@ fn pad_replicate(data: &Tensor, padding: &[(isize, isize)]) -> Result<Tensor> {
                 shape.iter().map(|s| (0, s.as_const().unwrap() as isize)).collect();
             shrink_ranges[d] = (0, 1);
             let edge = result.try_shrink(&shrink_ranges)?;
-            let mut expand_shape: Vec<isize> =
-                shape.iter().map(|s| s.as_const().unwrap() as isize).collect();
+            let mut expand_shape: Vec<isize> = shape.iter().map(|s| s.as_const().unwrap() as isize).collect();
             expand_shape[d] = pad_before;
             parts.push(edge.try_expand(&expand_shape)?);
         }
@@ -151,8 +150,7 @@ fn pad_replicate(data: &Tensor, padding: &[(isize, isize)]) -> Result<Tensor> {
                 shape.iter().map(|s| (0, s.as_const().unwrap() as isize)).collect();
             shrink_ranges[d] = (dim_size - 1, dim_size);
             let edge = result.try_shrink(&shrink_ranges)?;
-            let mut expand_shape: Vec<isize> =
-                shape.iter().map(|s| s.as_const().unwrap() as isize).collect();
+            let mut expand_shape: Vec<isize> = shape.iter().map(|s| s.as_const().unwrap() as isize).collect();
             expand_shape[d] = pad_after;
             parts.push(edge.try_expand(&expand_shape)?);
         }
@@ -208,10 +206,7 @@ fn pad_reflect(data: &Tensor, padding: &[(isize, isize)]) -> Result<Tensor> {
 fn pad_circular(data: &Tensor, padding: &[(isize, isize)]) -> Result<Tensor> {
     let shape = data.shape()?;
     let ndim = shape.len();
-    let repeats: Vec<usize> = padding
-        .iter()
-        .map(|&(pb, pa)| 1 + usize::from(pb > 0) + usize::from(pa > 0))
-        .collect();
+    let repeats: Vec<usize> = padding.iter().map(|&(pb, pa)| 1 + usize::from(pb > 0) + usize::from(pa > 0)).collect();
     let repeated = data.repeat(&repeats)?;
     let rep_shape = repeated.shape()?;
 

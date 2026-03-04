@@ -298,24 +298,12 @@ pub(crate) fn op_embed_layer_norm(inputs: &[Option<Tensor>], node: &NodeProto) -
 
 /// RotaryEmbedding (standard ONNX opset 23): inputs are (input, cos_cache, sin_cache, position_ids?)
 pub(crate) fn op_rotary_embedding(inputs: &[Option<Tensor>], node: &NodeProto) -> Result<Vec<Tensor>> {
-    rotary_embedding_impl(
-        inp(inputs, 0),
-        inp(inputs, 1),
-        inp(inputs, 2),
-        inputs.get(3).and_then(|o| o.as_ref()),
-        node,
-    )
+    rotary_embedding_impl(inp(inputs, 0), inp(inputs, 1), inp(inputs, 2), inputs.get(3).and_then(|o| o.as_ref()), node)
 }
 
 /// RotaryEmbedding (Microsoft contrib): inputs are (input, position_ids?, cos_cache, sin_cache)
 pub(crate) fn op_rotary_embedding_contrib(inputs: &[Option<Tensor>], node: &NodeProto) -> Result<Vec<Tensor>> {
-    rotary_embedding_impl(
-        inp(inputs, 0),
-        inp(inputs, 2),
-        inp(inputs, 3),
-        inputs.get(1).and_then(|o| o.as_ref()),
-        node,
-    )
+    rotary_embedding_impl(inp(inputs, 0), inp(inputs, 2), inp(inputs, 3), inputs.get(1).and_then(|o| o.as_ref()), node)
 }
 
 /// Shared RotaryEmbedding implementation.

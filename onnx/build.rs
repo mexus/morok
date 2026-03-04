@@ -126,6 +126,9 @@ fn should_skip(name: &str) -> bool {
         // If variants using sequence/optional types in subgraphs
         "test_if_seq",
         "test_if_opt",
+        // Identity variants using optional/sequence container types
+        "test_identity_opt",
+        "test_identity_sequence",
     ];
 
     const SKIP_CONTAINS: &[&str] =

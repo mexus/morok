@@ -595,7 +595,7 @@ fn unary_instr(op: UnaryOp, dtype: &DType) -> Option<&'static str> {
         UnaryOp::Floor => Some("floor"),
         UnaryOp::Ceil => Some("ceil"),
         UnaryOp::Trunc => Some("trunc"),
-        UnaryOp::Round => Some("round"),
+        UnaryOp::Round => Some("rint"),
         UnaryOp::Reciprocal => None,
         UnaryOp::Tan => None,
         UnaryOp::Sign => None,

@@ -533,7 +533,7 @@ fn render_unary(op: UnaryOp, s: &str, dtype: &DType) -> String {
         UnaryOp::Floor => format!("{}({s})", c_math_fn("floor", dtype)),
         UnaryOp::Ceil => format!("{}({s})", c_math_fn("ceil", dtype)),
         UnaryOp::Trunc => format!("{}({s})", c_math_fn("trunc", dtype)),
-        UnaryOp::Round => format!("{}({s})", c_math_fn("round", dtype)),
+        UnaryOp::Round => format!("{}({s})", c_math_fn("rint", dtype)),
         UnaryOp::Erf => format!("{}({s})", c_math_fn("erf", dtype)),
         UnaryOp::Sign => {
             if dtype.is_float() {

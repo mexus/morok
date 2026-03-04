@@ -5,7 +5,7 @@
 
 use bon::bon;
 use morok_dtype::{DType, ScalarDType};
-use morok_ir::{ReduceOp, UOp};
+use morok_ir::{ConstValue, ReduceOp, UOp};
 use snafu::ResultExt;
 
 use crate::{
@@ -604,6 +604,17 @@ fn all_impl(tensor: &Tensor, axes: AxisSpec, keepdim: bool) -> Result<Tensor> {
     any_negated.logical_not()
 }
 
+/// Identity element for a reduction over an empty set (matching Tinygrad's `identity_element`).
+fn reduction_identity(op: ReduceOp, dtype: &DType) -> ConstValue {
+    let s = dtype.scalar().expect("scalar dtype");
+    match op {
+        ReduceOp::Add => ConstValue::zero(s),
+        ReduceOp::Mul => ConstValue::one(s),
+        ReduceOp::Max => ConstValue::min(s),
+        ReduceOp::Min => ConstValue::max(s),
+    }
+}
+
 /// Internal reduction implementation.
 #[track_caller]
 fn reduce_internal(
@@ -634,6 +645,29 @@ fn reduce_internal(
         // Preserve input dtype
         original_dtype.clone()
     };
+
+    // Handle zero-sized dimensions: short-circuit to identity element to avoid
+    // DivisionByZero in indexing (matching Tinygrad rangeify.py:115-120).
+    let reducing_empty_axis = resolved_axes.iter().any(|&ax| shape[ax].as_const() == Some(0));
+    if reducing_empty_axis {
+        // Compute output shape: reduced axes become 1
+        let out_shape: Vec<usize> = shape
+            .iter()
+            .enumerate()
+            .map(|(i, d)| if resolved_axes.contains(&i) { 1 } else { d.as_const().unwrap_or(1) as usize })
+            .collect();
+
+        let identity = reduction_identity(op, &acc_dtype);
+        let result = Tensor::full(&out_shape, identity, acc_dtype)?;
+
+        let result = if !keepdim { result.remove_singleton_dims(&resolved_axes)? } else { result };
+
+        return if promote && dtype.is_none() && Tensor::should_cast_back_after_sum(&original_dtype) {
+            result.cast(original_dtype)
+        } else {
+            Ok(result)
+        };
+    }
 
     // Cast to accumulation dtype if needed
     let working_tensor = if acc_dtype != original_dtype { tensor.cast(acc_dtype.clone())? } else { tensor.clone() };

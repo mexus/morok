@@ -103,15 +103,25 @@ impl OpRegistry {
             "Pow" => inp(inputs, 0).try_pow(inp(inputs, 1))?,
             "Mod" => {
                 let fmod = get_attr_int(node, "fmod", 0);
+                let x = inp(inputs, 0);
+                let y = inp(inputs, 1);
                 if fmod == 1 {
-                    inp(inputs, 0).try_mod(inp(inputs, 1))?
+                    // fmod=1: C-style remainder (sign of dividend)
+                    x.try_mod(y)?
+                } else if x.uop().dtype().is_int() {
+                    // fmod=0 integers: Python-style modulo (sign of divisor)
+                    // Adjust C-style remainder: add y when remainder is nonzero and
+                    // has opposite sign from divisor (matching Tinygrad's x % y)
+                    let trunc_mod = x.try_mod(y)?;
+                    let zero = trunc_mod.zero()?;
+                    let mod_ne_zero = trunc_mod.try_ne(&zero)?;
+                    let signs_differ = trunc_mod.bitwise_xor(y)?.try_lt(&zero)?;
+                    let needs_adj = mod_ne_zero.bitwise_and(&signs_differ)?;
+                    trunc_mod.try_add(&y.where_(&needs_adj, &zero)?)?
                 } else {
-                    let x = inp(inputs, 0);
-                    let y = inp(inputs, 1);
+                    // fmod=0 floats: x - floor(x/y) * y
                     let div = x.try_div(y)?;
-                    let floored = div.floor()?;
-                    let product = floored.try_mul(y)?;
-                    x.try_sub(&product)?
+                    x.try_sub(&div.floor()?.try_mul(y)?)?
                 }
             }
             "Sum" => fold_variadic(inputs, "Sum", |a, b| a.try_add(b))?,
@@ -322,7 +332,8 @@ impl OpRegistry {
                     Tensor::empty(value.uop().dtype())
                 } else {
                     let shape: Vec<isize> = shape_i64.iter().map(|&v| v as isize).collect();
-                    value.try_reshape(&[1])?.try_expand(&shape)?
+                    let ones = vec![1isize; shape.len()];
+                    value.try_reshape(&ones)?.try_expand(&shape)?
                 }
             }
             "Size" => Tensor::from_const(inp(inputs, 0).numel()? as i64),
@@ -615,7 +626,12 @@ impl OpRegistry {
                 let axis = get_attr(node, "axis").map(|a| a.i as isize);
                 inp(inputs, 0).compress(&condition, axis)?
             }
-            "Upsample" => nn::op_resize(inputs, node)?,
+            "Upsample" => {
+                // Upsample (deprecated) has inputs [X, scales]; Resize has [X, roi, scales, sizes].
+                // Remap by inserting None for roi so op_resize reads scales from index 2.
+                let remapped = vec![inputs.get(0).cloned().flatten(), None, inputs.get(1).cloned().flatten()];
+                nn::op_resize(&remapped, node)?
+            }
 
             // === Identity / Constant ===
             "Identity" => inp(inputs, 0).clone(),
