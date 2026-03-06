@@ -27,6 +27,8 @@ impl Tensor {
         #[builder(default = false)] exclude_outside: bool,
         #[builder(default)] keep_aspect_ratio_policy: AspectRatioPolicy,
         axes: Option<&[usize]>,
+        roi: Option<&[f64]>,
+        #[builder(default = 0.0)] extrapolation_value: f64,
     ) -> Result<Tensor> {
         let ndim = self.ndim()?;
         let shape = self.shape()?;
@@ -97,19 +99,71 @@ impl Tensor {
             };
         }
 
+        // Extract per-spatial-dim ROI (start, end) pairs
+        let roi_pairs: Vec<(f64, f64)> = if let Some(roi) = roi {
+            let half = roi.len() / 2;
+            let starts = &roi[half - n_spatial..half];
+            let ends = &roi[roi.len() - n_spatial..];
+            starts.iter().zip(ends).map(|(&s, &e)| (s, e)).collect()
+        } else {
+            vec![(0.0, 1.0); n_spatial]
+        };
+
         // Build coordinate transforms for each spatial dim
         let dtype = x.uop().dtype();
         let indexes: Vec<Tensor> = input_shape
             .iter()
             .zip(&output_sizes)
             .zip(&final_scales)
-            .map(|((&inp_sz, &out_sz), &scale)| {
-                apply_coordinate_transform(inp_sz, out_sz, scale, coordinate_transformation_mode, &dtype)
+            .zip(&roi_pairs)
+            .map(|(((&inp_sz, &out_sz), &scale), &(roi_start, roi_end))| {
+                apply_coordinate_transform(
+                    inp_sz,
+                    out_sz,
+                    scale,
+                    coordinate_transformation_mode,
+                    &dtype,
+                    roi_start,
+                    roi_end,
+                )
             })
             .collect::<Result<_>>()?;
 
-        // Clip for nearest/linear modes
-        let indexes: Vec<Tensor> = if matches!(mode, ResizeMode::Nearest | ResizeMode::Linear) {
+        // Clip for nearest/linear modes (skip for tf_crop_and_resize — uses extrapolation instead)
+        let is_tf_crop = coordinate_transformation_mode == CoordinateTransformMode::TfCropAndResize;
+        let indexes: Vec<Tensor> = if !is_tf_crop && matches!(mode, ResizeMode::Nearest | ResizeMode::Linear) {
+            indexes
+                .into_iter()
+                .zip(&input_shape)
+                .map(|(idx, &sz)| {
+                    let zero = Tensor::const_(ConstValue::Float(0.0), dtype.clone());
+                    let max_val = Tensor::const_(ConstValue::Float((sz - 1) as f64), dtype.clone());
+                    idx.clamp().min(&zero).max(&max_val).call()
+                })
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            indexes
+        };
+
+        // For tf_crop_and_resize, build a validity mask from unclipped indexes
+        let validity_mask: Option<Vec<Tensor>> = if is_tf_crop {
+            Some(
+                indexes
+                    .iter()
+                    .zip(&input_shape)
+                    .map(|(idx, &sz)| {
+                        let zero = Tensor::const_(ConstValue::Float(0.0), dtype.clone());
+                        let max_val = Tensor::const_(ConstValue::Float((sz - 1) as f64), dtype.clone());
+                        idx.try_ge(&zero)?.bitwise_and(&idx.try_le(&max_val)?)
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+            )
+        } else {
+            None
+        };
+
+        // For tf_crop_and_resize, clip indexes before gather (to avoid OOB)
+        let indexes: Vec<Tensor> = if is_tf_crop {
             indexes
                 .into_iter()
                 .zip(&input_shape)
@@ -255,6 +309,29 @@ impl Tensor {
             }
         }
 
+        // Apply extrapolation for tf_crop_and_resize: out-of-bounds → extrapolation_value
+        if let Some(masks) = validity_mask {
+            let extrap = Tensor::const_(ConstValue::Float(extrapolation_value), dtype.clone());
+            let x_shape = x.shape()?;
+            let x_dims = morok_ir::shape::to_vec_usize(&x_shape).context(UOpSnafu)?;
+            let expand_shape: Vec<isize> = x_dims.iter().map(|&d| d as isize).collect();
+
+            // Each mask_i is 1D [out_sz_i]; reshape to [1,..,out_sz_i,..,1] and broadcast
+            let mut combined: Option<Tensor> = None;
+            for (i, mask) in masks.into_iter().enumerate() {
+                let mut shape = vec![1isize; ndim];
+                shape[ndim - n_spatial + i] = output_sizes[i] as isize;
+                let broad = mask.try_reshape(&shape)?.try_expand(&expand_shape)?;
+                combined = Some(match combined {
+                    Some(c) => c.bitwise_and(&broad)?,
+                    None => broad,
+                });
+            }
+            if let Some(valid) = combined {
+                x = x.where_(&valid, &extrap)?;
+            }
+        }
+
         // Permute back
         if perm.iter().enumerate().any(|(i, &p)| p != i as isize) { x.try_permute(&inv_perm_i) } else { Ok(x) }
     }
@@ -267,6 +344,8 @@ fn apply_coordinate_transform(
     scale: f64,
     mode: CoordinateTransformMode,
     dtype: &DType,
+    roi_start: f64,
+    roi_end: f64,
 ) -> Result<Tensor> {
     let index = Tensor::arange(0, Some(output_sz as i64), None)?.cast(dtype.clone())?;
     match mode {
@@ -297,6 +376,17 @@ fn apply_coordinate_transform(
             let half = Tensor::const_(0.5f64, dtype.clone());
             let off_t = Tensor::const_(offset, dtype.clone());
             off_t.try_add(&index.try_add(&half)?.try_div(&Tensor::const_(scale, dtype.clone()))?)?.try_sub(&half)
+        }
+        CoordinateTransformMode::TfCropAndResize => {
+            let len = (input_sz as f64) - 1.0;
+            if output_sz == 1 {
+                Ok(Tensor::const_((roi_end - roi_start) * len / 2.0 + roi_start * len, dtype.clone()))
+            } else {
+                // x_ori = x * (roi_end - roi_start) * (input_sz - 1) / (output_sz - 1) + roi_start * (input_sz - 1)
+                let stride = (roi_end - roi_start) * len / (output_sz as f64 - 1.0);
+                let offset = roi_start * len;
+                index.try_mul(&Tensor::const_(stride, dtype.clone()))?.try_add(&Tensor::const_(offset, dtype.clone()))
+            }
         }
     }
 }

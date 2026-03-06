@@ -80,6 +80,8 @@ pub enum CoordinateTransformMode {
     PytorchHalfPixel,
     #[strum(serialize = "half_pixel_symmetric")]
     HalfPixelSymmetric,
+    #[strum(serialize = "tf_crop_and_resize")]
+    TfCropAndResize,
 }
 
 /// Nearest-neighbor rounding mode for resize.

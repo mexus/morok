@@ -1401,25 +1401,13 @@ pub fn pm_add_loads() -> TypedPatternMatcher<()> {
         // Pattern 1: INDEX with non-Ptr dtype → LOAD(buffer, INDEX with Ptr dtype)
         // Guard prevents re-matching: after transformation, INDEX has Ptr dtype.
         // Also skip Image dtype - image access handled separately in codegen.
-        // Based on Tinygrad's pm_add_loads (devectorizer.py:320-323).
+        // Based on Tinygrad's pm_add_loads (devectorizer.py:320-323):
+        //   idx.replace(dtype=idx.src[0].dtype).load(dtype=idx.dtype.base)
+        // idx.dtype.base for non-PtrDType returns self — preserving vectorization.
         idx @ Index { buffer, indices } if !matches!(idx.dtype(), DType::Ptr { .. } | DType::Image { .. }) => |idx, buffer, indices| {
-            // Handle vectorized indices - if any index has vector dtype, LOAD produces vector
-            let vec_count = indices.iter().find_map(|i| match i.dtype() {
-                DType::Vector { count, .. } => Some(count),
-                _ => None,
-            });
-
-            let element_dtype = match buffer.dtype() {
-                DType::Ptr { base, .. } => (*base).clone(),
-                other => other.clone(),
-            };
-
-            // Compute result dtype based on vectorized indices
-            // If element_dtype is already vectorized, use it as-is to avoid double-vectorization
-            let result_dtype = match vec_count {
-                Some(count) if element_dtype.vcount() == 1 => element_dtype.vec(count),
-                _ => element_dtype,
-            };
+            // Use INDEX's own dtype as LOAD result type. The expander has already set
+            // the correct vectorization (e.g. Float32.vec(3) for UPCAST=3).
+            let result_dtype = idx.dtype().clone();
 
             // Create INDEX with Ptr dtype (buffer's dtype) - won't match pattern again.
             // This matches Tinygrad's idx.replace(dtype=idx.src[0].dtype) approach.
@@ -1453,6 +1441,56 @@ pub fn pm_add_loads() -> TypedPatternMatcher<()> {
 /// support, and Clang explicitly prohibits bool as vector element type.
 fn is_vectorized_bool(dtype: &DType) -> bool {
     dtype.base() == ScalarDType::Bool && dtype.vcount() > 1
+}
+
+/// Check if an INDEX has a vectorized bool gate.
+fn has_vectorized_bool_gate(index: &Arc<UOp>) -> bool {
+    match index.op() {
+        Op::Index { gate: Some(g), .. } => is_vectorized_bool(&g.dtype()),
+        Op::Cast { src, .. } => has_vectorized_bool_gate(src),
+        _ => false,
+    }
+}
+
+/// Devectorize a LOAD whose INDEX has a vectorized bool gate.
+///
+/// Splits LOAD(INDEX_GATED(buf_vN, idx, Bool_N)) into
+/// VECTORIZE(LOAD(INDEX_GATED(buf[0], idx, Bool[0])), ..., LOAD(INDEX_GATED(buf[N-1], idx, Bool[N-1])))
+fn devectorize_gated_load(load: &Arc<UOp>, index: &Arc<UOp>) -> Option<Arc<UOp>> {
+    let Op::Index { buffer, indices, gate: Some(gate) } = index.op() else { return None };
+    let vcount = gate.dtype().vcount();
+    if vcount <= 1 {
+        return None;
+    }
+
+    let scalar_load_dtype = load.dtype().scalar_dtype();
+    let alt = match load.op() {
+        Op::Load { alt, .. } => alt.clone(),
+        _ => None,
+    };
+
+    let elements: SmallVec<[Arc<UOp>; 4]> = (0..vcount)
+        .map(|i| {
+            let buf_i = if buffer.dtype().vcount() > 1 { buffer.gep(vec![i]) } else { buffer.clone() };
+            let gate_i = gate.gep(vec![i]);
+            let idx_i = UOp::index()
+                .buffer(buf_i.clone())
+                .indices(indices.clone())
+                .gate(gate_i)
+                .dtype(buf_i.dtype())
+                .call()
+                .unwrap();
+            match &alt {
+                Some(a) => {
+                    let alt_i = if a.dtype().vcount() > 1 { a.gep(vec![i]) } else { a.clone() };
+                    UOp::load().buffer(buf_i).index(idx_i).dtype(scalar_load_dtype.clone()).alt(alt_i).call()
+                }
+                None => UOp::load().buffer(buf_i).index(idx_i).dtype(scalar_load_dtype.clone()).call(),
+            }
+        })
+        .collect();
+
+    Some(UOp::vectorize(elements))
 }
 
 /// Unified devectorize for any binary op producing vectorized output.
@@ -1576,6 +1614,11 @@ pub fn pm_bool_devectorize() -> TypedPatternMatcher<()> {
 
         // BITCAST with vectorized bool (cstyle.py:64)
         bc @ BitCast { src: _, .. } if is_vectorized_bool(&bc.dtype()) => devectorize_generic(bc),
+
+        // LOAD from INDEX with vectorized bool gate: split into per-element LOADs.
+        // C ext_vector_type requires gate and value to have same element size,
+        // but bool (1 byte) != float (4 bytes), so we must scalarize.
+        load @ Load { index, .. } if has_vectorized_bool_gate(index) => devectorize_gated_load(load, index),
     }
 }
 

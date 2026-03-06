@@ -218,6 +218,12 @@ pub(crate) fn op_resize(inputs: &[Option<Tensor>], node: &NodeProto) -> Result<T
         return Err(Error::IrConstruction { details: "Resize: antialias != 0 is not supported".into() });
     }
     let x = inp(inputs, 0);
+    let roi: Option<Vec<f64>> = inputs
+        .get(1)
+        .and_then(|o| o.as_ref())
+        .filter(|t| t.numel().unwrap_or(0) > 0)
+        .map(tensor_to_f64_vec)
+        .transpose()?;
     let scales: Option<Vec<f64>> = inputs
         .get(2)
         .and_then(|o| o.as_ref())
@@ -235,6 +241,7 @@ pub(crate) fn op_resize(inputs: &[Option<Tensor>], node: &NodeProto) -> Result<T
     let nearest_mode: NearestMode = parse_enum(node, "nearest_mode", "round_prefer_floor")?;
     let cubic_coeff = get_attr_float(node, "cubic_coeff_a", -0.75) as f64;
     let exclude_outside = get_attr_int(node, "exclude_outside", 0) != 0;
+    let extrapolation_value = get_attr_float(node, "extrapolation_value", 0.0) as f64;
     let policy: AspectRatioPolicy = parse_enum(node, "keep_aspect_ratio_policy", "stretch")?;
     let axes_attr = get_attr_ints(node, "axes");
     let axes: Option<Vec<usize>> = if axes_attr.is_empty() {
@@ -251,8 +258,10 @@ pub(crate) fn op_resize(inputs: &[Option<Tensor>], node: &NodeProto) -> Result<T
         .nearest_mode(nearest_mode)
         .cubic_coeff_a(cubic_coeff)
         .exclude_outside(exclude_outside)
+        .extrapolation_value(extrapolation_value)
         .keep_aspect_ratio_policy(policy)
         .maybe_axes(axes.as_deref())
+        .maybe_roi(roi.as_deref())
         .call()?)
 }
 
