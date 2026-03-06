@@ -63,14 +63,7 @@ fn should_skip(name: &str) -> bool {
         // Quantization
         "test_quantize",
         "test_dequantize",
-        "test_qlinear",
         "test_dynamicquantize",
-        "test_convinteger",
-        // Training ops
-        "test_training_",
-        "test_adam_",
-        // Image decoding
-        "test_image_decoder_",
         // Deformable convolution
         "test_basic_deform_conv",
         "test_deform_conv",
@@ -86,8 +79,6 @@ fn should_skip(name: &str) -> bool {
         "test_dft",
         "test_stft",
         "test_melweight",
-        // Max unpooling
-        "test_maxunpool_",
         // Lp pooling
         "test_lppool_",
         // Matrix determinant
@@ -100,18 +91,10 @@ fn should_skip(name: &str) -> bool {
         "test_blackmanwindow",
         // Random (non-deterministic)
         "test_bernoulli",
-        // Cumulative product
-        "test_cumprod_",
         // Reverse sequence
         "test_reversesequence_",
-        // New opset 24 scatter
-        "test_tensorscatter",
         // Optional type ops
         "test_optional_",
-        // Affine grid generation
-        "test_affine_grid",
-        // Center crop pad
-        "test_center_crop_pad",
         // Exotic dtype casts
         "test_cast_e8m0_",
         "test_cast_no_saturate_",
@@ -130,8 +113,7 @@ fn should_skip(name: &str) -> bool {
         "test_identity_sequence",
     ];
 
-    const SKIP_CONTAINS: &[&str] =
-        &["_expanded", "FLOAT8", "INT4", "UINT4", "INT2", "UINT2", "FLOAT4E2M1", "FLOAT8E8M0", "COMPLEX"];
+    const SKIP_CONTAINS: &[&str] = &["FLOAT8", "INT4", "UINT4", "INT2", "UINT2", "FLOAT4E2M1", "FLOAT8E8M0", "COMPLEX"];
 
     SKIP_PREFIXES.iter().any(|p| name.starts_with(p))
         || SKIP_EXACT.contains(&name)

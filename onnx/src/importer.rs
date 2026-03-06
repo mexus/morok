@@ -395,7 +395,16 @@ impl OnnxImporter {
             .collect()
     }
 
-    /// Process an ONNX If node: execute both branches, select outputs.
+    /// Process an ONNX If node: resolve condition, then execute the taken branch.
+    ///
+    /// Strategy: resolve the condition as a concrete boolean (forces evaluation)
+    /// and only execute the taken branch. This avoids crashes when the not-taken
+    /// branch contains operations incompatible with the current input shapes
+    /// (e.g. Squeeze on a non-1 dimension in an expanded AffineGrid model).
+    ///
+    /// This works because the importer builds a fresh graph per invocation —
+    /// there is no graph caching across calls. If we ever add JIT/graph caching,
+    /// data-dependent conditions would need both branches via lazy `where_`.
     fn process_if_node(
         &self,
         node_index: usize,
@@ -416,42 +425,13 @@ impl OnnxImporter {
             .get(&(node_index, "else_branch".to_string()))
             .ok_or_else(|| crate::Error::IrConstruction { details: "If node missing else_branch attribute".into() })?;
 
-        // Execute both branches (lazy — builds tensor graphs without computing)
-        let then_outputs = self.execute_subgraph(then_branch, values, opset_version)?;
-        let else_outputs = self.execute_subgraph(else_branch, values, opset_version)?;
-
-        if then_outputs.len() != else_outputs.len() {
-            return Err(crate::Error::IrConstruction {
-                details: format!(
-                    "If: then_branch ({}) and else_branch ({}) must produce the same number of outputs",
-                    then_outputs.len(),
-                    else_outputs.len()
-                ),
-            });
-        }
-
-        // Select outputs: lazy where_ if shapes match, eager fallback otherwise
-        let selected: Vec<Tensor> = {
-            let shapes_match = then_outputs
-                .iter()
-                .zip(else_outputs.iter())
-                .all(|(t, e)| t.shape().ok() == e.shape().ok() && t.shape().is_ok());
-
-            if shapes_match {
-                then_outputs
-                    .iter()
-                    .zip(else_outputs.iter())
-                    .map(|(t, e)| t.where_(&condition, e).map_err(Into::into))
-                    .collect::<Result<_>>()?
-            } else {
-                let cond = tensor_to_bool_scalar(&condition)?;
-                if cond { then_outputs } else { else_outputs }
-            }
-        };
+        let cond = tensor_to_bool_scalar(&condition)?;
+        let branch = if cond { then_branch } else { else_branch };
+        let outputs = self.execute_subgraph(branch, values, opset_version)?;
 
         for (i, output_name) in node.output.iter().enumerate() {
             if !output_name.is_empty()
-                && let Some(tensor) = selected.get(i)
+                && let Some(tensor) = outputs.get(i)
             {
                 values.insert(output_name.clone(), tensor.clone());
             }

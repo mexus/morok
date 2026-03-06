@@ -61,11 +61,20 @@ pub(crate) fn non_empty_i64(v: &[i64]) -> Option<&[i64]> {
 
 /// Extract reduce axes and keepdims, opset-aware.
 /// Opset >= 13: axes from input[1] tensor. Opset <= 12: axes from node attribute.
-pub(crate) fn reduce_attrs(node: &NodeProto, inputs: &[Option<Tensor>], opset: i64) -> Result<(AxisSpec, bool)> {
+pub(crate) fn reduce_attrs(
+    node: &NodeProto,
+    inputs: &[Option<Tensor>],
+    opset: i64,
+    op_type: &str,
+) -> Result<(AxisSpec, bool)> {
     let keepdims = get_attr_int(node, "keepdims", 1) == 1;
     let noop_with_empty_axes = get_attr_int(node, "noop_with_empty_axes", 0) == 1;
 
-    let axes: Vec<i64> = if opset >= 13 {
+    // ReduceSum moved axes from attribute to input[1] at opset 13;
+    // all other reduce ops moved at opset 18.
+    let axes_from_input_version = if op_type == "ReduceSum" { 13 } else { 18 };
+
+    let axes: Vec<i64> = if opset >= axes_from_input_version {
         inputs.get(1).and_then(|o| o.as_ref()).map(tensor_to_i64_vec).transpose()?.unwrap_or_default()
     } else {
         get_attr_ints(node, "axes")

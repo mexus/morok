@@ -385,35 +385,35 @@ impl OpRegistry {
 
             // === Reductions ===
             "ReduceSum" => {
-                let (spec, kd) = reduce_attrs(node, inputs, opset_version)?;
+                let (spec, kd) = reduce_attrs(node, inputs, opset_version, op_type)?;
                 inp(inputs, 0).sum_with().axes(spec).keepdim(kd).call()?
             }
             "ReduceMean" => {
-                let (spec, kd) = reduce_attrs(node, inputs, opset_version)?;
+                let (spec, kd) = reduce_attrs(node, inputs, opset_version, op_type)?;
                 inp(inputs, 0).mean_with().axes(spec).keepdim(kd).call()?
             }
             "ReduceMax" => {
-                let (spec, kd) = reduce_attrs(node, inputs, opset_version)?;
+                let (spec, kd) = reduce_attrs(node, inputs, opset_version, op_type)?;
                 inp(inputs, 0).max_with().axes(spec).keepdim(kd).call()?
             }
             "ReduceMin" => {
-                let (spec, kd) = reduce_attrs(node, inputs, opset_version)?;
+                let (spec, kd) = reduce_attrs(node, inputs, opset_version, op_type)?;
                 inp(inputs, 0).min_with().axes(spec).keepdim(kd).call()?
             }
             "ReduceProd" => {
-                let (spec, kd) = reduce_attrs(node, inputs, opset_version)?;
+                let (spec, kd) = reduce_attrs(node, inputs, opset_version, op_type)?;
                 inp(inputs, 0).prod_with().axes(spec).keepdim(kd).call()?
             }
             "ReduceSumSquare" => {
-                let (spec, kd) = reduce_attrs(node, inputs, opset_version)?;
+                let (spec, kd) = reduce_attrs(node, inputs, opset_version, op_type)?;
                 inp(inputs, 0).square()?.sum_with().axes(spec).keepdim(kd).call()?
             }
             "ReduceL1" => {
-                let (spec, kd) = reduce_attrs(node, inputs, opset_version)?;
+                let (spec, kd) = reduce_attrs(node, inputs, opset_version, op_type)?;
                 inp(inputs, 0).try_abs()?.sum_with().axes(spec).keepdim(kd).call()?
             }
             "ReduceL2" => {
-                let (spec, kd) = reduce_attrs(node, inputs, opset_version)?;
+                let (spec, kd) = reduce_attrs(node, inputs, opset_version, op_type)?;
                 let x = inp(inputs, 0);
                 let orig_dtype = x.uop().dtype();
                 let needs_upcast =
@@ -423,11 +423,11 @@ impl OpRegistry {
                 if needs_upcast { result.cast(orig_dtype)? } else { result }
             }
             "ReduceLogSum" => {
-                let (spec, kd) = reduce_attrs(node, inputs, opset_version)?;
+                let (spec, kd) = reduce_attrs(node, inputs, opset_version, op_type)?;
                 inp(inputs, 0).sum_with().axes(spec).keepdim(kd).call()?.try_log()?
             }
             "ReduceLogSumExp" => {
-                let (spec, kd) = reduce_attrs(node, inputs, opset_version)?;
+                let (spec, kd) = reduce_attrs(node, inputs, opset_version, op_type)?;
                 inp(inputs, 0).try_exp()?.sum_with().axes(spec).keepdim(kd).call()?.try_log()?
             }
             "ArgMax" => {
