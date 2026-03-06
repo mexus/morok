@@ -835,13 +835,23 @@ fn expand_vector_index(index: &Arc<UOp>) -> Option<Arc<UOp>> {
     // Extract (valid, root, offset, gate) for each lane.
     // Gate is included in the grouping key so lanes with different gates (e.g., valid vs invalid
     // from padding) are grouped separately. This ensures PTRCAT groups have uniform gate values.
-    let mut offsets_by_root: HashMap<(u64, u64, u64), HashMap<i64, Vec<usize>>> = HashMap::new();
+    //
+    // Important: collect all lane data first to keep Arc<UOp> refs alive. Temporary UOps
+    // (e.g. const(true) from get_valid()) would get GC'd between loop iterations via the
+    // weak-ref hash consing cache, producing different ids for structurally identical nodes.
+    struct LaneData {
+        valid: Arc<UOp>,
+        root: Arc<UOp>,
+        offset: i64,
+        gate_id: u64,
+    }
+    let mut lane_data: Vec<(usize, LaneData)> = Vec::with_capacity(count);
 
     for (lane, idx_op) in sources.iter().enumerate() {
         let Op::Index { indices: simp_indices, gate: lane_gate, .. } = idx_op.op() else { continue };
         let idx = simp_indices.first()?.get_idx();
         let valid = simp_indices.first()?.get_valid();
-        let gate_hash = lane_gate.as_ref().map_or(0u64, |g| g.content_hash());
+        let gate_id = lane_gate.as_ref().map_or(u64::MAX, |g| g.id);
 
         let (root, offset) = match idx.op() {
             // Invalid grouped separately (devectorizer.py:72-77)
@@ -863,8 +873,14 @@ fn expand_vector_index(index: &Arc<UOp>) -> Option<Arc<UOp>> {
             _ => (idx.clone(), 0),
         };
 
-        let key = (valid.content_hash(), root.content_hash(), gate_hash);
-        offsets_by_root.entry(key).or_default().entry(offset).or_default().push(lane);
+        lane_data.push((lane, LaneData { valid, root, offset, gate_id }));
+    }
+
+    // Now build grouping map — all Arcs are alive so ids are stable
+    let mut offsets_by_root: HashMap<(u64, u64, u64), HashMap<i64, Vec<usize>>> = HashMap::new();
+    for (lane, data) in &lane_data {
+        let key = (data.valid.id, data.root.id, data.gate_id);
+        offsets_by_root.entry(key).or_default().entry(data.offset).or_default().push(*lane);
     }
 
     // Group consecutive offsets and build PTRCAT

@@ -32,6 +32,7 @@ fn generate_node_tests() {
         let ignored = should_skip(name);
         code.push_str(&format!(
             "#[test]\n{attr}fn {name}() {{\n    \
+               setup_tracing();
                run_onnx_node_test(concat!(env!(\"CARGO_MANIFEST_DIR\"), \
                \"/../submodules/onnx/onnx/backend/test/data/node/{name}\"));\n}}\n\n",
             attr = if ignored { "#[ignore]\n" } else { "" },

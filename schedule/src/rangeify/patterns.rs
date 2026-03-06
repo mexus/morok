@@ -2294,10 +2294,18 @@ fn try_lift_arithmetic_from_lt(cond: &Arc<UOp>) -> Option<Arc<UOp>> {
 /// - (x - y) == c → x == (c + y) or y == (x - c)
 /// - Cast(x ± y) == c → same with c cast to inner dtype
 fn try_lift_arithmetic_from_eq(cond: &Arc<UOp>) -> Option<Arc<UOp>> {
-    let Op::Binary(BinaryOp::Eq, lhs, rhs) = cond.op() else { return None };
-    if !no_range(rhs) {
+    let Op::Binary(BinaryOp::Eq, raw_lhs, raw_rhs) = cond.op() else { return None };
+
+    // Normalize: range-containing side on lhs, range-free on rhs.
+    // The pattern `Eq[_, c] if no_range(c)` matches commutatively, but
+    // cond.op() returns operands in storage order which may differ.
+    let (lhs, rhs) = if no_range(raw_rhs) {
+        (raw_lhs, raw_rhs)
+    } else if no_range(raw_lhs) {
+        (raw_rhs, raw_lhs)
+    } else {
         return None;
-    }
+    };
 
     // Unwrap optional CAST, adjusting rhs to inner dtype
     let (inner_lhs, effective_rhs) = if let Op::Cast { src, .. } = lhs.op() {
@@ -2400,10 +2408,9 @@ pub fn build_reduce_collapse_matcher() -> TypedPatternMatcher<()> {
 
 /// Extended pattern matcher for `reduce_load_collapse`.
 ///
-/// Combines the basic `reduce_collapse` patterns with NE lifting, EQ lifting,
-/// and index overflow undo patterns. These are only needed in the per-kernel
-/// `reduce_load_collapse` path, matching Tinygrad where NE lifting is only
-/// in `pm_reduce_load_collapse`.
+/// Combines the basic `reduce_collapse` patterns with NE lifting.
+/// NE lifting is only needed in the per-kernel `reduce_load_collapse` path,
+/// matching Tinygrad where NE lifting is only in `pm_reduce_load_collapse`.
 ///
 /// Does NOT include the REDUCE→reduce_load_collapse call to avoid infinite recursion.
 pub fn build_reduce_load_collapse_matcher() -> TypedPatternMatcher<()> {
@@ -2413,9 +2420,7 @@ pub fn build_reduce_load_collapse_matcher() -> TypedPatternMatcher<()> {
 /// NE lifting patterns for the extended `reduce_load_collapse` path.
 ///
 /// Matches Tinygrad's `pm_reduce_load_collapse` additions over `pm_reduce_collapse`:
-/// NE lifting is only needed here (not in the basic matcher).
-/// EQ lifting is in the basic matcher since Morok uses EQ directly
-/// (unlike Tinygrad which decomposes eq() as ne().not()).
+/// NE lifting is only needed here (not in the basic mega-pass matcher).
 ///
 /// Note: index overflow undo lives in `pm_load_collapse()` (the outer matcher),
 /// not here — inside reduce_collapse, external inputs are DEFINE_VARs with no loads,
@@ -2449,8 +2454,7 @@ fn ne_lifting_patterns() -> TypedPatternMatcher<()> {
 /// 5. Bound-from-below/above/two-sided/gated collapse on REDUCE(ADD)
 /// 6. DEFINE_VAR factoring: (dv & y).where(c,0).reduce(ADD)
 /// 7. MUL casted bool: x * gate:bool.cast() → gate.where(x, 0)
-/// 8. EQ lifting: Morok-specific — needed because Morok uses EQ directly from gather,
-///    unlike Tinygrad which decomposes eq() as ne().not() and only needs NE lifting.
+/// 8. EQ lifting: (x+y)==c → x==(c-y), Morok-specific for gather's EQ pattern
 fn reduce_collapse_inner_patterns() -> TypedPatternMatcher<()> {
     // Start with reduce_unparented (shared with pm_reduce_simplify)
     pm_reduce_unparented().with_context()
@@ -2484,9 +2488,12 @@ fn reduce_collapse_inner_patterns() -> TypedPatternMatcher<()> {
             UOp::try_where(gate.clone(), x.clone(), zero).ok()
         },
 
-        // EQ lifting — Morok-specific (Morok generates EQ directly from gather,
-        // unlike Tinygrad which decomposes eq() as ne().not()).
-        // Handles both direct and .or_casted() (CAST-wrapped) Add/Sub forms.
+        // EQ lifting: isolate range-containing operands from arithmetic in EQ conditions.
+        // Morok-specific — needed because Morok uses EQ directly from gather,
+        // unlike Tinygrad which decomposes eq() as ne().not() and only needs NE lifting.
+        // Must be in basic matcher since mega-pass buffer_folding inlines arange constants,
+        // enabling EQ lifting to work. Per-kernel pm_load_collapse runs before buffer_folding
+        // so it can't see through LOADs.
         cond @ Eq[_, c] if no_range(c) => |cond| try_lift_arithmetic_from_eq(cond),
     }
 }

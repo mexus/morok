@@ -10,7 +10,7 @@
 //! These patterns are separated from rangeify patterns because they apply
 //! universally to any UOp graph, not just during schedule transformation.
 
-use morok_dtype::DType;
+use morok_dtype::{DType, ScalarDType};
 use morok_ir::types::{BinaryOp, ConstValue, TernaryOp};
 use morok_ir::uop::cached_property::CachedProperty;
 use morok_ir::uop::comparison_analysis::ComparisonAnalyzer;
@@ -337,17 +337,17 @@ pub fn symbolic() -> TypedPatternMatcher {
 /// Commutative operand canonicalization for index-type operations.
 ///
 /// Ensures commutative binary ops have operands in canonical order (smaller
-/// `content_hash` on the left). Without this, mathematically equivalent
-/// expressions like `R1*8000 + R2*16` and `R2*16 + R1*8000` can have
-/// different hashes, breaking grouping in `expand_vector_index`.
+/// id on the left). Without this, mathematically equivalent expressions like
+/// `R1*8000 + R2*16` and `R2*16 + R1*8000` won't be deduplicated by hash
+/// consing, breaking grouping in `expand_vector_index`.
 ///
 /// Follows Tinygrad's approach (symbolic.py:178-182): only applies to
 /// index-type operations to avoid breaking vector math merging.
 fn commutative_canonicalization() -> TypedPatternMatcher {
     patterns! {
-        for op in binary [Add, Mul, Max, And, Or, Xor] {
+        for op in binary [Add, Mul, Max, Eq, Ne, And, Or, Xor] {
             r @ op(a, b)
-                if r.dtype() == DType::Index && b.content_hash() < a.content_hash()
+                if r.dtype() == DType::Index && b.id < a.id
                 => |r, a, b| Some(UOp::new(Op::Binary(op, b.clone(), a.clone()), r.dtype())),
         },
     }
@@ -1674,20 +1674,20 @@ pub fn gep_pushing_patterns() -> TypedPatternMatcher {
             }
         },
 
-        // 6. Push GEP through Binary: GEP(Binary(op, a, b), indices) → Binary(op, GEP(a), GEP(b))
-        // Follows Tinygrad's approach (symbolic.py:165-168): result dtype is alu.dtype.scalar().vec(gep_count)
-        // Guard: skip pointer types to avoid creating invalid pointer ALU ops
+        // 6. Push GEP through ALU ops (Binary, Unary, Ternary).
+        // Tinygrad (symbolic.py:167): only fires for dtype=dtypes.index.
+        // Without this guard, combining gep_pushing with no_vectorized_alu
+        // causes graph explosion on high-dimensional kernels.
         Gep { vector, indices }
             if !indices.is_empty()
             && matches!(vector.op(), Op::Binary(..))
+            && vector.dtype().base() == ScalarDType::Index
             && !matches!(vector.dtype(), DType::Ptr { .. })
             => |vector, indices| {
                 let Op::Binary(bin_op, a, b) = vector.op() else { return None };
                 let gep_a = a.gep(indices.clone());
                 let gep_b = b.gep(indices.clone());
-                // Guard: skip if result would be pointer type (edge case: vector of pointers)
                 if matches!(gep_a.dtype(), DType::Ptr { .. }) { return None; }
-                // Result dtype: derived from original op's dtype (works for comparisons and all other ops)
                 let gep_count = indices.len();
                 let scalar_base = vector.dtype().base();
                 let result_dtype = if gep_count > 1 {
@@ -1698,43 +1698,40 @@ pub fn gep_pushing_patterns() -> TypedPatternMatcher {
                 Some(UOp::new(Op::Binary(*bin_op, gep_a, gep_b), result_dtype))
             },
 
-        // 7. Push GEP through Unary: GEP(Unary(op, x), indices) → Unary(op, GEP(x))
-        // Guard: skip pointer types to avoid creating invalid pointer ALU ops
+        // 7. Push GEP through Unary for index types only (Tinygrad: dtype=dtypes.index guard)
         Gep { vector, indices }
             if !indices.is_empty()
             && matches!(vector.op(), Op::Unary(..))
+            && vector.dtype().base() == ScalarDType::Index
             && !matches!(vector.dtype(), DType::Ptr { .. })
             => |vector, indices| {
                 let Op::Unary(un_op, x) = vector.op() else { return None };
                 let gep_x = x.gep(indices.clone());
-                // Guard: skip if result would be pointer type (edge case: vector of pointers)
                 if matches!(gep_x.dtype(), DType::Ptr { .. }) { return None; }
                 Some(UOp::new(Op::Unary(*un_op, gep_x.clone()), gep_x.dtype()))
             },
 
-        // 7b. Push GEP through Ternary: GEP(Ternary(op, a, b, c), indices) → Ternary(op, GEP(a), GEP(b), GEP(c))
-        // Required for MulAcc (FMA) and WHERE to work with split_load (which creates CAT of 4-element loads)
-        // Guard: skip pointer types to avoid creating invalid pointer ALU ops
+        // 7b. Push GEP through Ternary for index types only (Tinygrad: dtype=dtypes.index guard)
         Gep { vector: Where(cond, t, f), indices }
-            if !indices.is_empty() && !matches!(cond.dtype(), DType::Ptr { .. })
+            if !indices.is_empty()
+            && t.dtype().base() == ScalarDType::Index
+            && !matches!(cond.dtype(), DType::Ptr { .. })
             => |cond, t, f, indices| {
                 let gep_cond = cond.gep(indices.clone());
                 let gep_t = t.gep(indices.clone());
                 let gep_f = f.gep(indices.clone());
-                // Guard: skip if result would be pointer type (edge case: vector of pointers)
                 if matches!(gep_t.dtype(), DType::Ptr { .. }) { return None; }
-                // WHERE dtype comes from true_val (same as false_val), not from condition
                 Some(UOp::new(Op::Ternary(TernaryOp::Where, gep_cond, gep_t.clone(), gep_f), gep_t.dtype()))
             },
         Gep { vector: MulAcc(a, b, c), indices }
-            if !indices.is_empty() && !matches!(a.dtype(), DType::Ptr { .. })
+            if !indices.is_empty()
+            && a.dtype().base() == ScalarDType::Index
+            && !matches!(a.dtype(), DType::Ptr { .. })
             => |a, b, c, indices| {
                 let gep_a = a.gep(indices.clone());
                 let gep_b = b.gep(indices.clone());
                 let gep_c = c.gep(indices.clone());
-                // Guard: skip if result would be pointer type (edge case: vector of pointers)
                 if matches!(gep_a.dtype(), DType::Ptr { .. }) { return None; }
-                // try_mulacc validates matching dtypes; returns None if mismatched
                 UOp::try_mulacc(gep_a, gep_b, gep_c).ok()
             },
 
