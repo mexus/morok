@@ -1,3 +1,4 @@
+#![allow(clippy::result_large_err)]
 //! ONNX operator registry - maps ONNX ops to Morok Tensor operations.
 
 pub mod proto;
@@ -641,7 +642,7 @@ impl OpRegistry {
             "Upsample" => {
                 // Upsample (deprecated) has inputs [X, scales]; Resize has [X, roi, scales, sizes].
                 // Remap by inserting None for roi so op_resize reads scales from index 2.
-                let remapped = vec![inputs.get(0).cloned().flatten(), None, inputs.get(1).cloned().flatten()];
+                let remapped = vec![inputs.first().cloned().flatten(), None, inputs.get(1).cloned().flatten()];
                 nn::op_resize(&remapped, node)?
             }
 

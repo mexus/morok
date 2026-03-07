@@ -52,7 +52,7 @@ fn test_registry_math_ops() {
     let node = NodeProto::default();
 
     for op in ["Exp", "Log", "Ceil", "Floor", "Round", "Sign", "Reciprocal", "Sin", "Cos", "Tan"] {
-        let result = registry.dispatch(op, "", &[x.clone()], &node);
+        let result = registry.dispatch(op, "", std::slice::from_ref(&x), &node);
         assert!(result.is_ok(), "Operator {op} failed: {:?}", result.err());
     }
 }
@@ -223,7 +223,7 @@ fn test_shrink() {
     let result = registry.dispatch("Shrink", "", &[x], &node).unwrap().realize().unwrap();
     let arr = result.to_ndarray::<f32>().unwrap();
     let vals: Vec<f32> = arr.iter().copied().collect();
-    let expected = vec![-2.0f32, 0.0, 0.0, 0.0, 2.0];
+    let expected = [-2.0f32, 0.0, 0.0, 0.0, 2.0];
     for (a, b) in vals.iter().zip(expected.iter()) {
         assert!((a - b).abs() < 1e-4, "expected {b}, got {a}");
     }

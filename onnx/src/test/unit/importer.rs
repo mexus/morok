@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-
 use crate::importer::{DimValue, InputSpec, OnnxImporter};
 use crate::parser::onnx::{GraphProto, ModelProto, NodeProto, TensorProto, ValueInfoProto, tensor_proto};
 use crate::test::helpers::*;
@@ -22,18 +20,6 @@ fn test_prepare_minimal_model() {
 }
 
 #[test]
-fn test_execute_minimal_model() {
-    let importer = OnnxImporter::new();
-    let model = make_minimal_model();
-    let graph = importer.prepare(model).unwrap();
-
-    let outputs = importer.execute(&graph, HashMap::new()).unwrap();
-
-    assert_eq!(outputs.len(), 1);
-    assert!(outputs.contains_key("output"));
-}
-
-#[test]
 fn test_import_model_minimal() {
     let mut importer = OnnxImporter::new();
     let model = make_minimal_model();
@@ -45,15 +31,10 @@ fn test_import_model_minimal() {
 
 #[test]
 fn test_multi_output_model() {
-    let importer = OnnxImporter::new();
+    let mut importer = OnnxImporter::new();
     let model = make_multi_output_model();
-    let graph = importer.prepare(model).unwrap();
+    let outputs = importer.import_model(model).unwrap();
 
-    assert_eq!(graph.outputs.len(), 2);
-    assert!(graph.outputs.contains(&"out1".to_string()));
-    assert!(graph.outputs.contains(&"out2".to_string()));
-
-    let outputs = importer.execute(&graph, HashMap::new()).unwrap();
     assert_eq!(outputs.len(), 2);
     assert!(outputs.contains_key("out1"));
     assert!(outputs.contains_key("out2"));
@@ -300,8 +281,9 @@ fn test_if_where_path() {
 }
 
 #[test]
-fn test_if_shape_mismatch_fallback() {
+fn test_if_shape_mismatch_errors() {
     // Build a model where then_branch outputs shape [3] and else_branch outputs shape [2]
+    // With where_()-based If, incompatible branches should error.
     let mut model = ModelProto::default();
     let mut graph = GraphProto::default();
     graph.name = "if_mismatch_test".to_string();
@@ -366,13 +348,10 @@ fn test_if_shape_mismatch_fallback() {
     model.graph = Some(graph);
 
     let mut importer = OnnxImporter::new();
-    let outputs = importer.import_model(model).unwrap();
-
-    let result = outputs.get("output").unwrap();
-    let arr = result.to_ndarray::<f32>().unwrap();
-    let vals: Vec<f32> = arr.iter().copied().collect();
-    // condition=true, shapes differ -> eager fallback selects then_branch
-    assert_eq!(vals, vec![1.0, 2.0, 3.0]);
+    let result = importer.import_model(model);
+    assert!(result.is_err(), "expected error for incompatible If branches");
+    let msg = result.err().unwrap().to_string();
+    assert!(msg.contains("incompatible branches"), "expected incompatible branches error, got: {msg}");
 }
 
 #[test]
@@ -591,6 +570,126 @@ fn test_if_nested() {
     assert_eq!(vals, vec![12.0, 22.0]);
 }
 
+// =========================================================================
+// Trace API tests
+// =========================================================================
+
+use crate::parser::onnx::type_proto::{self, Tensor as TensorTypeProto};
+
+fn make_typed_input(name: &str, dtype: i32, dims: &[i64]) -> ValueInfoProto {
+    use crate::parser::onnx::{TensorShapeProto, TypeProto, tensor_shape_proto};
+    let shape = TensorShapeProto {
+        dim: dims
+            .iter()
+            .map(|&d| tensor_shape_proto::Dimension {
+                denotation: String::new(),
+                value: if d > 0 { Some(tensor_shape_proto::dimension::Value::DimValue(d)) } else { None },
+            })
+            .collect(),
+    };
+    ValueInfoProto {
+        name: name.to_string(),
+        r#type: Some(TypeProto {
+            denotation: String::new(),
+            value: Some(type_proto::Value::TensorType(TensorTypeProto { elem_type: dtype, shape: Some(shape) })),
+        }),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn test_trace_static_shapes() {
+    // Model: input (float [2,3]) -> Identity -> output
+    let mut model = ModelProto::default();
+    let mut graph = GraphProto::default();
+    graph.name = "trace_test".to_string();
+
+    graph.input.push(make_typed_input("input", tensor_proto::DataType::Float as i32, &[2, 3]));
+
+    let mut output = ValueInfoProto::default();
+    output.name = "output".to_string();
+    graph.output.push(output);
+
+    let mut node = NodeProto::default();
+    node.op_type = "Identity".to_string();
+    node.input.push("input".to_string());
+    node.output.push("output".to_string());
+    graph.node.push(node);
+
+    model.graph = Some(graph);
+
+    let importer = OnnxImporter::new();
+    let onnx_graph = importer.prepare(model).unwrap();
+    let (inputs, outputs) = importer.trace(&onnx_graph).unwrap();
+
+    assert!(inputs.contains_key("input"));
+    assert!(outputs.contains_key("output"));
+
+    // Input shape should be [2, 3]
+    let input_shape: Vec<usize> = inputs["input"].shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
+    assert_eq!(input_shape, vec![2, 3]);
+}
+
+#[test]
+fn test_trace_with_dims() {
+    use crate::parser::onnx::{TensorShapeProto, TypeProto, tensor_shape_proto};
+
+    // Model: input (float [batch, 3]) -> Identity -> output
+    let mut model = ModelProto::default();
+    let mut graph = GraphProto::default();
+    graph.name = "trace_dim_test".to_string();
+
+    // Input with dynamic batch dim
+    let shape = TensorShapeProto {
+        dim: vec![
+            tensor_shape_proto::Dimension {
+                denotation: String::new(),
+                value: Some(tensor_shape_proto::dimension::Value::DimParam("batch".to_string())),
+            },
+            tensor_shape_proto::Dimension {
+                denotation: String::new(),
+                value: Some(tensor_shape_proto::dimension::Value::DimValue(3)),
+            },
+        ],
+    };
+    graph.input.push(ValueInfoProto {
+        name: "input".to_string(),
+        r#type: Some(TypeProto {
+            denotation: String::new(),
+            value: Some(type_proto::Value::TensorType(TensorTypeProto {
+                elem_type: tensor_proto::DataType::Float as i32,
+                shape: Some(shape),
+            })),
+        }),
+        ..Default::default()
+    });
+
+    let mut output = ValueInfoProto::default();
+    output.name = "output".to_string();
+    graph.output.push(output);
+
+    let mut node = NodeProto::default();
+    node.op_type = "Identity".to_string();
+    node.input.push("input".to_string());
+    node.output.push("output".to_string());
+    graph.node.push(node);
+
+    model.graph = Some(graph);
+
+    let importer = OnnxImporter::new();
+    let onnx_graph = importer.prepare(model).unwrap();
+
+    // Without binding, should error
+    let result = importer.trace(&onnx_graph);
+    assert!(result.is_err());
+
+    // With binding, should succeed
+    let (inputs, outputs) = importer.trace_with_dims(&onnx_graph, &[("batch", 4)]).unwrap();
+    let input_shape: Vec<usize> = inputs["input"].shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
+    assert_eq!(input_shape, vec![4, 3]);
+    assert!(outputs.contains_key("output"));
+}
+
 #[test]
 fn test_load_silero_vad_prepare() {
     use prost::Message;
@@ -797,7 +896,7 @@ fn test_attention_contrib_basic() {
 
     let inputs = vec![Some(x), Some(weights), Some(bias)];
     let result = registry.dispatch_multi("Attention", "com.microsoft", &inputs, &node, i64::MAX).unwrap();
-    assert!(result.len() >= 1);
+    assert!(!result.is_empty());
     let arr = result[0].to_ndarray::<f32>().unwrap();
     assert_eq!(arr.shape(), &[1, 2, 4]);
 }
@@ -1141,7 +1240,7 @@ fn test_optional_has_element_present() {
     let node = NodeProto::default();
     let result = registry.dispatch_multi("OptionalHasElement", "", &inputs, &node, i64::MAX).unwrap();
     let arr = result[0].to_ndarray::<bool>().unwrap();
-    assert_eq!(arr[[]], true);
+    assert!(arr[[]]);
 }
 
 #[test]
@@ -1151,7 +1250,7 @@ fn test_optional_has_element_absent() {
     let node = NodeProto::default();
     let result = registry.dispatch_multi("OptionalHasElement", "", &inputs, &node, i64::MAX).unwrap();
     let arr = result[0].to_ndarray::<bool>().unwrap();
-    assert_eq!(arr[[]], false);
+    assert!(!arr[[]]);
 }
 
 #[test]

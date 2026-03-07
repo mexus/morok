@@ -12,9 +12,7 @@ use snafu::ResultExt;
 
 use crate::error::{EmptyModelSnafu, IoSnafu, MissingInputSnafu, ProtobufDecodeSnafu, Result};
 use crate::parser::onnx::{GraphProto, ModelProto, NodeProto, ValueInfoProto};
-use crate::registry::{
-    OpRegistry, OpSetId, convert_onnx_dtype, onnx_opset_version, tensor_from_proto_ext, tensor_to_bool_scalar,
-};
+use crate::registry::{OpRegistry, OpSetId, convert_onnx_dtype, onnx_opset_version, tensor_from_proto_ext};
 
 /// Dimension value - either static (known size) or dynamic (named, e.g., batch dim).
 #[derive(Debug, Clone, PartialEq)]
@@ -107,7 +105,7 @@ impl OnnxGraph {
 ///
 /// Converts ONNX models to Morok Tensors using a two-phase approach:
 /// 1. `prepare()` - Extract graph structure without executing
-/// 2. `execute()` - Run graph with provided inputs
+/// 2. `trace()` / `trace_with_dims()` - Build lazy computation graph with allocated inputs
 pub struct OnnxImporter {
     /// Operator registry for dispatch
     registry: OpRegistry,
@@ -144,24 +142,10 @@ impl OnnxImporter {
 
     /// Import from parsed ModelProto (convenience for all-initializer models).
     ///
-    /// For models with runtime inputs, use `prepare()` + `execute()` instead.
+    /// For models with runtime inputs, use `prepare()` + `trace()` instead.
     pub fn import_model(&mut self, model: ModelProto) -> Result<HashMap<String, Tensor>> {
         let graph = self.prepare(model)?;
-
-        // If all inputs have initializers, we can execute directly
-        let has_runtime_inputs = graph.inputs.keys().any(|name| !graph.initializers.contains_key(name));
-
-        if has_runtime_inputs {
-            // Need user inputs - return empty map, user should use execute()
-            // Actually, for backward compat, let's try with empty inputs and see what happens
-            // This will error on missing inputs, which is expected
-            let inputs = HashMap::new();
-            self.execute_with_initializers(&graph, inputs)
-        } else {
-            // All inputs are initializers - can execute with empty runtime inputs
-            let inputs = HashMap::new();
-            self.execute_with_initializers(&graph, inputs)
-        }
+        self.execute_with_initializers(&graph, HashMap::new())
     }
 
     /// Phase 1: Extract graph structure from ONNX model.
@@ -268,11 +252,64 @@ impl OnnxImporter {
         Ok(Some(InputSpec::new(shape, dtype, false)))
     }
 
-    /// Phase 2: Execute the graph with provided inputs.
+    /// Trace graph — all input shapes must be static (from graph metadata).
     ///
-    /// Returns a HashMap mapping output names to their tensor values.
-    pub fn execute(&self, graph: &OnnxGraph, inputs: HashMap<String, Tensor>) -> Result<HashMap<String, Tensor>> {
-        self.execute_with_initializers(graph, inputs)
+    /// Allocates zero-filled input buffers. Weights come from graph initializers.
+    /// Returns (input_tensors, output_tensors). Caller `copyin()`s real data to
+    /// input buffers before executing.
+    pub fn trace(&self, graph: &OnnxGraph) -> Result<(HashMap<String, Tensor>, HashMap<String, Tensor>)> {
+        self.trace_with_dims(graph, &[])
+    }
+
+    /// Trace graph with concrete values for dynamic dimensions.
+    ///
+    /// Dynamic dims are locked to the provided values for the plan's lifetime.
+    /// Static dims are read from the graph. Error if any dynamic dim is unbound.
+    pub fn trace_with_dims(
+        &self,
+        graph: &OnnxGraph,
+        dim_bindings: &[(&str, usize)],
+    ) -> Result<(HashMap<String, Tensor>, HashMap<String, Tensor>)> {
+        let bindings: HashMap<&str, usize> = dim_bindings.iter().copied().collect();
+        let inputs = resolve_input_shapes(&graph.inputs, &bindings)?;
+        let input_map = inputs.clone();
+        let output_map = self.execute_with_initializers(graph, inputs)?;
+        Ok((input_map, output_map))
+    }
+
+    /// Trace graph with external weights.
+    pub fn trace_external(
+        &self,
+        graph: &OnnxGraph,
+        weights: HashMap<String, Tensor>,
+    ) -> Result<(HashMap<String, Tensor>, HashMap<String, Tensor>)> {
+        self.trace_external_with_dims(graph, weights, &[])
+    }
+
+    /// Trace with external weights + dynamic dim bindings.
+    ///
+    /// Inputs already present in `weights` are used as-is; remaining graph
+    /// inputs are auto-resolved from their specs + `dim_bindings`.
+    pub fn trace_external_with_dims(
+        &self,
+        graph: &OnnxGraph,
+        weights: HashMap<String, Tensor>,
+        dim_bindings: &[(&str, usize)],
+    ) -> Result<(HashMap<String, Tensor>, HashMap<String, Tensor>)> {
+        let bindings: HashMap<&str, usize> = dim_bindings.iter().copied().collect();
+        // Only auto-resolve inputs not already provided
+        let unresolved: HashMap<String, InputSpec> = graph
+            .inputs
+            .iter()
+            .filter(|(name, _)| !weights.contains_key(*name))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        let inputs = resolve_input_shapes(&unresolved, &bindings)?;
+        let input_map = inputs.clone();
+        let mut all_inputs = inputs;
+        all_inputs.extend(weights);
+        let output_map = self.execute_with_initializers(graph, all_inputs)?;
+        Ok((input_map, output_map))
     }
 
     /// Execute graph with initializers merged into values.
@@ -395,16 +432,15 @@ impl OnnxImporter {
             .collect()
     }
 
-    /// Process an ONNX If node: resolve condition, then execute the taken branch.
+    /// Process an ONNX If node: execute both branches and merge with `where_()`.
     ///
-    /// Strategy: resolve the condition as a concrete boolean (forces evaluation)
-    /// and only execute the taken branch. This avoids crashes when the not-taken
-    /// branch contains operations incompatible with the current input shapes
-    /// (e.g. Squeeze on a non-1 dimension in an expanded AffineGrid model).
+    /// Both branches are always executed so the resulting graph is data-dependent
+    /// on the condition rather than eagerly resolved. This enables the
+    /// trace-once / run-many pattern where the condition changes at runtime.
     ///
-    /// This works because the importer builds a fresh graph per invocation —
-    /// there is no graph caching across calls. If we ever add JIT/graph caching,
-    /// data-dependent conditions would need both branches via lazy `where_`.
+    /// If the branches produce incompatible shapes or dtypes, the node errors.
+    /// Models with legitimately incompatible branches (e.g., AffineGrid expanded)
+    /// are already skipped via `SKIP_CONTAINS: ["_expanded"]`.
     fn process_if_node(
         &self,
         node_index: usize,
@@ -425,16 +461,34 @@ impl OnnxImporter {
             .get(&(node_index, "else_branch".to_string()))
             .ok_or_else(|| crate::Error::IrConstruction { details: "If node missing else_branch attribute".into() })?;
 
-        let cond = tensor_to_bool_scalar(&condition)?;
-        let branch = if cond { then_branch } else { else_branch };
-        let outputs = self.execute_subgraph(branch, values, opset_version)?;
+        let then_outputs = self.execute_subgraph(then_branch, values, opset_version)?;
+        let else_outputs = self.execute_subgraph(else_branch, values, opset_version)?;
 
         for (i, output_name) in node.output.iter().enumerate() {
-            if !output_name.is_empty()
-                && let Some(tensor) = outputs.get(i)
-            {
-                values.insert(output_name.clone(), tensor.clone());
+            if output_name.is_empty() {
+                continue;
             }
+            let then_out = then_outputs.get(i).ok_or_else(|| crate::Error::IrConstruction {
+                details: format!("If node output {i}: then_branch missing output"),
+            })?;
+            let else_out = else_outputs.get(i).ok_or_else(|| crate::Error::IrConstruction {
+                details: format!("If node output {i}: else_branch missing output"),
+            })?;
+
+            if then_out.shape()? != else_out.shape()? || then_out.uop().dtype() != else_out.uop().dtype() {
+                return Err(crate::Error::IrConstruction {
+                    details: format!(
+                        "If node output {i}: incompatible branches: then={:?}/{:?}, else={:?}/{:?}",
+                        then_out.shape()?,
+                        then_out.uop().dtype(),
+                        else_out.shape()?,
+                        else_out.uop().dtype(),
+                    ),
+                });
+            }
+
+            let merged = then_out.where_(&condition, else_out)?;
+            values.insert(output_name.clone(), merged);
         }
 
         Ok(())
@@ -484,4 +538,34 @@ impl Default for OnnxImporter {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Resolve input shapes from graph specs + dim bindings into allocated tensors.
+///
+/// Creates zero-filled tensors with the correct shape and dtype for each input.
+/// Static dimensions are read directly; dynamic dimensions are looked up in `bindings`.
+fn resolve_input_shapes(
+    specs: &HashMap<String, InputSpec>,
+    bindings: &HashMap<&str, usize>,
+) -> Result<HashMap<String, Tensor>> {
+    specs
+        .iter()
+        .filter(|(_, spec)| !spec.optional)
+        .map(|(name, spec)| {
+            let shape: Vec<usize> = spec
+                .shape
+                .iter()
+                .map(|d| match d {
+                    DimValue::Static(s) => Ok(*s),
+                    DimValue::Dynamic(dim_name) => {
+                        bindings.get(dim_name.as_str()).copied().ok_or_else(|| crate::Error::IrConstruction {
+                            details: format!("unbound dynamic dim '{dim_name}' for input '{name}'"),
+                        })
+                    }
+                })
+                .collect::<Result<_>>()?;
+            let tensor = Tensor::full(&shape, 0u8, spec.dtype.clone())?;
+            Ok((name.clone(), tensor))
+        })
+        .collect()
 }

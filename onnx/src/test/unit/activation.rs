@@ -70,7 +70,7 @@ fn test_softplus() {
     let result = registry.dispatch("Softplus", "", &[x], &node).unwrap();
     let arr = result.to_ndarray::<f32>().unwrap();
     let vals: Vec<f32> = arr.iter().copied().collect();
-    let expected = [0.6931f32, 1.3133, 0.3133];
+    let expected = [std::f32::consts::LN_2, 1.3133, 0.3133];
     for (i, (v, e)) in vals.iter().zip(expected.iter()).enumerate() {
         assert!((v - e).abs() < 1e-3, "softplus[{i}]: got {v}, expected {e}");
     }

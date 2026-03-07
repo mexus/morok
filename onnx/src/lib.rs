@@ -7,10 +7,14 @@
 //! ```ignore
 //! use morok_onnx::{OnnxImporter, OnnxGraph};
 //!
-//! // Two-phase import for runtime inputs
+//! // Trace: build lazy graph with allocated input buffers
 //! let importer = OnnxImporter::new();
 //! let graph = importer.prepare(model)?;
-//! let outputs = importer.execute(&graph, inputs)?;
+//! let (inputs, outputs) = importer.trace(&graph)?;
+//!
+//! // Prepare execution plan, copyin data, execute repeatedly
+//! let plan = outputs["output"].prepare()?;
+//! plan.execute(&mut executor)?;
 //!
 //! // Or convenience method for all-initializer models
 //! let mut importer = OnnxImporter::new();

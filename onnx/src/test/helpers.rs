@@ -14,45 +14,27 @@ pub(crate) use morok_tensor::Tensor;
 use crate::importer::OnnxImporter;
 
 pub(crate) fn make_attr_int(name: &str, val: i64) -> AttributeProto {
-    let mut attr = AttributeProto::default();
-    attr.name = name.to_string();
-    attr.i = val;
-    attr
+    AttributeProto { name: name.to_string(), i: val, ..Default::default() }
 }
 
 pub(crate) fn make_attr_ints(name: &str, vals: &[i64]) -> AttributeProto {
-    let mut attr = AttributeProto::default();
-    attr.name = name.to_string();
-    attr.ints = vals.to_vec();
-    attr
+    AttributeProto { name: name.to_string(), ints: vals.to_vec(), ..Default::default() }
 }
 
 pub(crate) fn make_attr_float(name: &str, val: f32) -> AttributeProto {
-    let mut attr = AttributeProto::default();
-    attr.name = name.to_string();
-    attr.f = val;
-    attr
+    AttributeProto { name: name.to_string(), f: val, ..Default::default() }
 }
 
 pub(crate) fn make_attr_string(name: &str, val: &str) -> AttributeProto {
-    let mut attr = AttributeProto::default();
-    attr.name = name.to_string();
-    attr.s = val.as_bytes().to_vec();
-    attr
+    AttributeProto { name: name.to_string(), s: val.as_bytes().to_vec(), ..Default::default() }
 }
 
 pub(crate) fn make_attr_floats(name: &str, vals: &[f32]) -> AttributeProto {
-    let mut attr = AttributeProto::default();
-    attr.name = name.to_string();
-    attr.floats = vals.to_vec();
-    attr
+    AttributeProto { name: name.to_string(), floats: vals.to_vec(), ..Default::default() }
 }
 
 pub(crate) fn make_attr_tensor(name: &str, tensor: TensorProto) -> AttributeProto {
-    let mut attr = AttributeProto::default();
-    attr.name = name.to_string();
-    attr.t = Some(tensor);
-    attr
+    AttributeProto { name: name.to_string(), t: Some(tensor), ..Default::default() }
 }
 
 pub(crate) fn make_attr_graph(name: &str, graph: GraphProto) -> AttributeProto {
@@ -80,79 +62,78 @@ pub(crate) fn make_graph(
 }
 
 pub(crate) fn make_tensor_proto(raw_data: Vec<u8>, dims: Vec<i64>, dtype: i32) -> TensorProto {
-    let mut tensor = TensorProto::default();
-    tensor.data_type = dtype;
-    tensor.dims = dims;
-    tensor.raw_data = raw_data;
-    tensor
+    TensorProto { data_type: dtype, dims, raw_data, ..Default::default() }
+}
+
+fn make_initializer(name: &str, data_type: i32, dims: Vec<i64>, raw_data: Vec<u8>) -> (ValueInfoProto, TensorProto) {
+    let input = ValueInfoProto { name: name.to_string(), ..Default::default() };
+    let init = TensorProto { name: name.to_string(), data_type, dims, raw_data, ..Default::default() };
+    (input, init)
 }
 
 pub(crate) fn make_minimal_model() -> ModelProto {
-    let mut model = ModelProto::default();
-    let mut graph = GraphProto::default();
-    graph.name = "test_graph".to_string();
+    let (input, init) = make_initializer(
+        "input",
+        tensor_proto::DataType::Float as i32,
+        vec![3],
+        [1.0f32, 2.0, 3.0].iter().flat_map(|v| v.to_le_bytes()).collect(),
+    );
 
-    let mut input = ValueInfoProto::default();
-    input.name = "input".to_string();
-    graph.input.push(input);
+    let node = NodeProto {
+        op_type: "Identity".to_string(),
+        input: vec!["input".to_string()],
+        output: vec!["output".to_string()],
+        ..Default::default()
+    };
 
-    let mut init = TensorProto::default();
-    init.name = "input".to_string();
-    init.data_type = tensor_proto::DataType::Float as i32;
-    init.dims = vec![3];
-    init.raw_data = [1.0f32, 2.0, 3.0].iter().flat_map(|v| v.to_le_bytes()).collect();
-    graph.initializer.push(init);
-
-    let mut output = ValueInfoProto::default();
-    output.name = "output".to_string();
-    graph.output.push(output);
-
-    let mut node = NodeProto::default();
-    node.op_type = "Identity".to_string();
-    node.input.push("input".to_string());
-    node.output.push("output".to_string());
-    graph.node.push(node);
-
-    model.graph = Some(graph);
-    model
+    ModelProto {
+        graph: Some(GraphProto {
+            name: "test_graph".to_string(),
+            input: vec![input],
+            output: vec![ValueInfoProto { name: "output".to_string(), ..Default::default() }],
+            initializer: vec![init],
+            node: vec![node],
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
 }
 
 pub(crate) fn make_multi_output_model() -> ModelProto {
-    let mut model = ModelProto::default();
-    let mut graph = GraphProto::default();
-    graph.name = "multi_output_test".to_string();
+    let (input, init) = make_initializer(
+        "input",
+        tensor_proto::DataType::Float as i32,
+        vec![3],
+        [1.0f32, 2.0, 3.0].iter().flat_map(|v| v.to_le_bytes()).collect(),
+    );
 
-    let mut input = ValueInfoProto::default();
-    input.name = "input".to_string();
-    graph.input.push(input);
+    let node1 = NodeProto {
+        op_type: "Identity".to_string(),
+        input: vec!["input".to_string()],
+        output: vec!["out1".to_string()],
+        ..Default::default()
+    };
+    let node2 = NodeProto {
+        op_type: "Identity".to_string(),
+        input: vec!["input".to_string()],
+        output: vec!["out2".to_string()],
+        ..Default::default()
+    };
 
-    let mut init = TensorProto::default();
-    init.name = "input".to_string();
-    init.data_type = tensor_proto::DataType::Float as i32;
-    init.dims = vec![3];
-    init.raw_data = [1.0f32, 2.0, 3.0].iter().flat_map(|v| v.to_le_bytes()).collect();
-    graph.initializer.push(init);
-
-    for name in ["out1", "out2"] {
-        let mut output = ValueInfoProto::default();
-        output.name = name.to_string();
-        graph.output.push(output);
+    ModelProto {
+        graph: Some(GraphProto {
+            name: "multi_output_test".to_string(),
+            input: vec![input],
+            output: ["out1", "out2"]
+                .iter()
+                .map(|n| ValueInfoProto { name: n.to_string(), ..Default::default() })
+                .collect(),
+            initializer: vec![init],
+            node: vec![node1, node2],
+            ..Default::default()
+        }),
+        ..Default::default()
     }
-
-    let mut node1 = NodeProto::default();
-    node1.op_type = "Identity".to_string();
-    node1.input.push("input".to_string());
-    node1.output.push("out1".to_string());
-    graph.node.push(node1);
-
-    let mut node2 = NodeProto::default();
-    node2.op_type = "Identity".to_string();
-    node2.input.push("input".to_string());
-    node2.output.push("out2".to_string());
-    graph.node.push(node2);
-
-    model.graph = Some(graph);
-    model
 }
 
 // ---------------------------------------------------------------------------
@@ -286,9 +267,9 @@ pub(crate) fn run_onnx_node_test(test_dir: &str) {
             inputs.insert(name.clone(), tensor);
         }
 
-        // Execute
-        let outputs = importer
-            .execute(&graph, inputs)
+        // Execute via trace_external (inputs override auto-resolved placeholders)
+        let (_, outputs) = importer
+            .trace_external(&graph, inputs)
             .unwrap_or_else(|e| panic!("{test_name}/{set_name}: execution failed: {e}"));
 
         // Load expected outputs and compare
