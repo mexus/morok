@@ -2,7 +2,7 @@ use morok_dtype::{DType, ScalarDType};
 use morok_tensor::Tensor;
 use morok_tensor::nn::{
     AspectRatioPolicy, AutoPad, CoordinateTransformMode, GridSampleMode, GridSamplePaddingMode, NearestMode, Reduction,
-    ResizeMode,
+    ResizeMode, flat_pads_to_pairs,
 };
 use morok_tensor::reduce::AxisSpec;
 use morok_tensor::shape_ops::MeshgridIndexing;
@@ -239,6 +239,31 @@ pub(crate) fn op_max_pool(inputs: &[Option<Tensor>], node: &NodeProto) -> Result
         .maybe_dilations(non_empty_i64(&dilations))
         .call()?;
     Ok(vec![values, indices])
+}
+
+pub(crate) fn op_max_unpool(inputs: &[Option<Tensor>], node: &NodeProto) -> Result<Tensor> {
+    let x = inp(inputs, 0);
+    let indices = inp(inputs, 1);
+    let kernel: Vec<usize> = get_attr_ints(node, "kernel_shape").iter().map(|&k| k as usize).collect();
+    let strides = get_attr_ints(node, "strides");
+    let pads = get_attr_ints(node, "pads");
+    let n_spatial = kernel.len();
+    let stride_u: Vec<usize> =
+        if strides.is_empty() { kernel.clone() } else { strides.iter().map(|&s| s as usize).collect() };
+    let padding: Vec<(isize, isize)> =
+        if pads.is_empty() { vec![(0, 0); n_spatial] } else { flat_pads_to_pairs(&pads) };
+    let output_shape: Option<Vec<usize>> = inputs
+        .get(2)
+        .and_then(|o| o.as_ref())
+        .map(|t| tensor_to_i64_vec(t).map(|v| v.iter().map(|&x| x as usize).collect()))
+        .transpose()?;
+    Ok(x.max_unpool2d()
+        .indices(indices)
+        .kernel_size(&kernel)
+        .stride(&stride_u)
+        .padding(&padding)
+        .maybe_output_size(output_shape.as_deref())
+        .call()?)
 }
 
 pub(crate) fn op_layer_norm(inputs: &[Option<Tensor>], node: &NodeProto) -> Result<Vec<Tensor>> {

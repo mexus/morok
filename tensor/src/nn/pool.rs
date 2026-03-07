@@ -337,4 +337,78 @@ impl Tensor {
 
         Ok((values, indices))
     }
+
+    /// Inverse of max pooling: place pooled values back at their original positions.
+    ///
+    /// Indices are flat into the *inferred* output shape (from kernel/stride/pads).
+    /// When `output_size` exceeds the inferred shape, the result is zero-padded.
+    ///
+    /// Uses one-hot encoding of indices to scatter values: `one_hot(idx) * vals → sum`.
+    #[builder]
+    pub fn max_unpool2d(
+        &self,
+        indices: &Tensor,
+        kernel_size: &[usize],
+        stride: Option<&[usize]>,
+        padding: Option<&[(isize, isize)]>,
+        output_size: Option<&[usize]>,
+    ) -> Result<Tensor> {
+        let shape = self.shape()?;
+        let ndim = shape.len();
+        let n_spatial = kernel_size.len();
+        let n_batch = ndim - n_spatial;
+
+        let spatial_shape: Vec<usize> = (0..n_spatial).map(|j| shape[n_batch + j].as_const().unwrap()).collect();
+
+        // Inferred shape from inverse pooling formula: o = (i-1)*s - (pB+pA) + k
+        let stride = stride.unwrap_or(kernel_size);
+        let no_pad: Vec<(isize, isize)> = vec![(0, 0); n_spatial];
+        let padding = padding.unwrap_or(&no_pad);
+        let inferred_spatial: Vec<usize> = (0..n_spatial)
+            .map(|j| {
+                let (pa, pb) = padding[j];
+                (spatial_shape[j] - 1) * stride[j] - (pa as usize + pb as usize) + kernel_size[j]
+            })
+            .collect();
+
+        let inferred_numel: usize = inferred_spatial.iter().product();
+        let bs: usize = (0..n_batch).map(|j| shape[j].as_const().unwrap()).product();
+
+        // Flatten: (N, C, *spatial) → (N*C, 1, num_pooled)
+        let num_pooled: usize = spatial_shape.iter().product();
+        let vals_flat = self.try_reshape(&[bs as isize, 1, num_pooled as isize])?;
+        let idx_flat = indices.try_reshape(&[bs as isize, 1, num_pooled as isize])?;
+
+        // One-hot: compare indices against arange(inferred_numel)
+        let arange = Tensor::arange(inferred_numel as i64, None, None)?.cast(indices.uop().dtype())?.try_reshape(&[
+            1,
+            inferred_numel as isize,
+            1,
+        ])?;
+        let one_hot = idx_flat.try_eq(&arange)?;
+
+        // Place values at one-hot positions, zero elsewhere, then sum over pooled dim
+        let zero = Tensor::const_(0.0f64, self.uop().dtype());
+        let placed = vals_flat.where_(&one_hot, &zero)?;
+        let result = placed.sum(-1isize)?;
+
+        // Reshape to (N, C, *inferred_spatial)
+        let batch_dims: Vec<isize> = (0..n_batch).map(|j| shape[j].as_const().unwrap() as isize).collect();
+        let mut inferred_shape: Vec<isize> = batch_dims.clone();
+        inferred_shape.extend(inferred_spatial.iter().map(|&s| s as isize));
+        let result = result.try_reshape(&inferred_shape)?;
+
+        // If output_size is larger, zero-pad to match
+        if let Some(os) = output_size {
+            let out_spatial = &os[os.len() - n_spatial..];
+            if out_spatial != inferred_spatial.as_slice() {
+                let mut pad_spec: Vec<(isize, isize)> = vec![(0, 0); n_batch];
+                for j in 0..n_spatial {
+                    pad_spec.push((0, (out_spatial[j] - inferred_spatial[j]) as isize));
+                }
+                return result.try_pad(&pad_spec);
+            }
+        }
+        Ok(result)
+    }
 }

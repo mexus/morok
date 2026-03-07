@@ -512,6 +512,7 @@ impl OpRegistry {
             "ConvInteger" => nn::op_conv_integer(inputs, node)?,
             "AveragePool" => nn::op_avg_pool(inputs, node)?,
             "MaxPool" => return nn::op_max_pool(inputs, node),
+            "MaxUnpool" => nn::op_max_unpool(inputs, node)?,
             "GlobalAveragePool" => {
                 let x = inp(inputs, 0);
                 let axes: Vec<isize> = (2..x.ndim()? as isize).collect();
