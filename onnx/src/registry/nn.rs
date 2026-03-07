@@ -120,6 +120,67 @@ pub(crate) fn op_conv(inputs: &[Option<Tensor>], node: &NodeProto) -> Result<Ten
         .call()?)
 }
 
+pub(crate) fn op_qlinear_conv(inputs: &[Option<Tensor>], node: &NodeProto) -> Result<Tensor> {
+    let ks: Vec<usize> = get_attr_ints(node, "kernel_shape").iter().map(|&k| k as usize).collect();
+    let auto_pad: AutoPad = parse_enum(node, "auto_pad", "NOTSET")?;
+    let pads = get_attr_ints(node, "pads");
+    let strides = get_attr_ints(node, "strides");
+    let dilations = get_attr_ints(node, "dilations");
+    // QLinearConv inputs: x(0), x_scale(1), x_zp(2), w(3), w_scale(4), w_zp(5), y_scale(6), y_zp(7), B(8)?
+    Ok(inp(inputs, 0)
+        .qlinear_conv()
+        .x_scale(inp(inputs, 1))
+        .x_zero_point(inp(inputs, 2))
+        .weight(inp(inputs, 3))
+        .w_scale(inp(inputs, 4))
+        .w_zero_point(inp(inputs, 5))
+        .y_scale(inp(inputs, 6))
+        .y_zero_point(inp(inputs, 7))
+        .maybe_bias(inputs.get(8).and_then(|o| o.as_ref()))
+        .auto_pad(auto_pad)
+        .group(get_attr_int(node, "group", 1) as usize)
+        .maybe_kernel_shape((!ks.is_empty()).then_some(ks.as_slice()))
+        .maybe_pads(non_empty_i64(&pads))
+        .maybe_strides(non_empty_i64(&strides))
+        .maybe_dilations(non_empty_i64(&dilations))
+        .call()?)
+}
+
+pub(crate) fn op_qlinear_matmul(inputs: &[Option<Tensor>], _node: &NodeProto) -> Result<Tensor> {
+    // QLinearMatMul inputs: a(0), a_scale(1), a_zp(2), b(3), b_scale(4), b_zp(5), y_scale(6), y_zp(7)
+    Ok(inp(inputs, 0)
+        .qlinear_matmul()
+        .a_scale(inp(inputs, 1))
+        .a_zero_point(inp(inputs, 2))
+        .b(inp(inputs, 3))
+        .b_scale(inp(inputs, 4))
+        .b_zero_point(inp(inputs, 5))
+        .y_scale(inp(inputs, 6))
+        .y_zero_point(inp(inputs, 7))
+        .call()?)
+}
+
+pub(crate) fn op_conv_integer(inputs: &[Option<Tensor>], node: &NodeProto) -> Result<Tensor> {
+    let ks: Vec<usize> = get_attr_ints(node, "kernel_shape").iter().map(|&k| k as usize).collect();
+    let auto_pad: AutoPad = parse_enum(node, "auto_pad", "NOTSET")?;
+    let pads = get_attr_ints(node, "pads");
+    let strides = get_attr_ints(node, "strides");
+    let dilations = get_attr_ints(node, "dilations");
+    // ConvInteger inputs: x(0), w(1), x_zero_point(2)?, w_zero_point(3)?
+    Ok(inp(inputs, 0)
+        .conv_integer()
+        .weight(inp(inputs, 1))
+        .maybe_x_zero_point(inputs.get(2).and_then(|o| o.as_ref()))
+        .maybe_w_zero_point(inputs.get(3).and_then(|o| o.as_ref()))
+        .auto_pad(auto_pad)
+        .group(get_attr_int(node, "group", 1) as usize)
+        .maybe_kernel_shape((!ks.is_empty()).then_some(ks.as_slice()))
+        .maybe_pads(non_empty_i64(&pads))
+        .maybe_strides(non_empty_i64(&strides))
+        .maybe_dilations(non_empty_i64(&dilations))
+        .call()?)
+}
+
 pub(crate) fn op_conv_transpose(inputs: &[Option<Tensor>], node: &NodeProto) -> Result<Tensor> {
     let ks: Vec<usize> = get_attr_ints(node, "kernel_shape").iter().map(|&k| k as usize).collect();
     let op: Vec<usize> = get_attr_ints(node, "output_padding").iter().map(|&p| p as usize).collect();

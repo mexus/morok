@@ -506,6 +506,9 @@ impl OpRegistry {
             }
             "Conv" => nn::op_conv(inputs, node)?,
             "ConvTranspose" => nn::op_conv_transpose(inputs, node)?,
+            "QLinearConv" => nn::op_qlinear_conv(inputs, node)?,
+            "QLinearMatMul" => nn::op_qlinear_matmul(inputs, node)?,
+            "ConvInteger" => nn::op_conv_integer(inputs, node)?,
             "AveragePool" => nn::op_avg_pool(inputs, node)?,
             "MaxPool" => return nn::op_max_pool(inputs, node),
             "GlobalAveragePool" => {

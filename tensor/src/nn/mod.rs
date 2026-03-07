@@ -5,6 +5,7 @@ mod grid_sample;
 mod norm;
 pub mod pad;
 mod pool;
+mod quantize;
 mod resize;
 mod rnn;
 
