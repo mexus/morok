@@ -9,7 +9,7 @@ mod quantize;
 mod resize;
 mod rnn;
 
-pub use rnn::{LstmOutput, RnnOutput};
+pub use rnn::{GruOutput, LstmOutput, RnnOutput};
 
 pub use pad::{auto_pad_split, flat_pads_to_pairs, resolve_pool_pads};
 

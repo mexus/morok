@@ -1,8 +1,8 @@
 # ONNX Operator Parity
 
-**154 / 198** standard operators implemented (77%).
+**155 / 198** standard operators implemented (78%).
 
-Test results from the ONNX backend node test suite: **1317** pass, **31** fail, **330** skip (out of 1678 tests).
+Test results from the ONNX backend node test suite: **1322** pass, **31** fail, **325** skip (out of 1678 tests).
 
 The *expanded uses* column counts how many `_expanded` tests exercise each
 operator as a building block (indirect coverage beyond direct tests).
@@ -210,14 +210,14 @@ operator as a building block (indirect coverage beyond direct tests).
 | MeanVarianceNormalization | Y | 1 pass | 1 pass | - |
 | NegativeLogLikelihoodLoss | Y | 18 pass | 18 pass | 34 |
 | RMSNormalization | Y | 19 pass | 19 pass | - |
-| RNN | Y | 3 pass, 1 skip | - | - |
+| RNN | Y | 4 pass | - | - |
 | Resize | Y | 39 pass | - | - |
 | RotaryEmbedding | Y | 8 pass | 8 pass | - |
 | SoftmaxCrossEntropyLoss | Y | 34 pass | 34 pass | - |
 | Upsample | Y | 1 pass | - | - |
 | ConvInteger | Y | 2 pass | - | - |
 | DeformConv | - | 4 skip | - | - |
-| GRU | - | 4 skip | - | - |
+| GRU | Y | 4 pass | - | - |
 | GlobalLpPool | - | - | - | - |
 | LSTM | Y | 4 pass | - | - |
 | LpPool | - | 8 skip | - | - |

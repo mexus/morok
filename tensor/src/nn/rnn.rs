@@ -8,6 +8,14 @@ pub struct RnnOutput {
     pub y_h: Tensor,
 }
 
+/// Output of a GRU forward pass.
+pub struct GruOutput {
+    /// All hidden states: `[seq_length, num_directions, batch, hidden_size]`
+    pub y: Tensor,
+    /// Final hidden state: `[num_directions, batch, hidden_size]`
+    pub y_h: Tensor,
+}
+
 /// Output of an LSTM forward pass.
 pub struct LstmOutput {
     /// All hidden states: `[seq_length, num_directions, batch, hidden_size]`
@@ -23,11 +31,13 @@ impl Tensor {
     ///
     /// `H_t = tanh(X_t @ W^T + H_{t-1} @ R^T + Wb + Rb)`
     ///
-    /// - `x`: input sequence `[seq_length, batch_size, input_size]`
+    /// - `x`: input `[seq_length, batch_size, input_size]` (layout=0) or
+    ///         `[batch_size, seq_length, input_size]` (layout=1)
     /// - `w`: input weights `[num_directions, hidden_size, input_size]`
     /// - `r`: recurrence weights `[num_directions, hidden_size, hidden_size]`
     /// - `bias`: optional bias `[num_directions, 2 * hidden_size]` (Wb ++ Rb)
     /// - `initial_h`: optional initial hidden state `[num_directions, batch_size, hidden_size]`
+    /// - `layout`: 0 = seq-first (default), 1 = batch-first
     pub fn rnn(
         &self,
         w: &Tensor,
@@ -35,11 +45,13 @@ impl Tensor {
         bias: Option<&Tensor>,
         initial_h: Option<&Tensor>,
         hidden_size: usize,
+        layout: usize,
     ) -> Result<RnnOutput> {
-        let x = self;
+        let x = if layout != 0 { self.try_permute(&[1, 0, 2])? } else { self.clone() };
         let x_shape = x.shape()?;
         let seq_length = x_shape[0].as_const().expect("static seq_length");
         let batch_size = x_shape[1].as_const().expect("static batch_size");
+        let input_size = x_shape[2].as_const().expect("static input_size");
         let num_directions = w.shape()?[0].as_const().expect("static num_directions");
         let dtype = x.uop().dtype();
 
@@ -64,7 +76,6 @@ impl Tensor {
             Tensor::full(&[batch_size, hidden_size], 0.0f32, dtype)?
         };
 
-        let input_size = x_shape[2].as_const().expect("static input_size");
         let mut h_list = Vec::with_capacity(seq_length);
         for t in 0..seq_length {
             let x_t =
@@ -82,9 +93,157 @@ impl Tensor {
         let h_refs: Vec<&Tensor> = h_list.iter().collect();
         let y_seq = Tensor::stack(&h_refs, 0)?; // [seq, batch, hidden]
         let y = y_seq.try_unsqueeze(1)?; // [seq, 1, batch, hidden]
-        let y_h = h_t.try_unsqueeze(0)?; // [1, batch, hidden]
+
+        let y = if layout != 0 {
+            y.try_permute(&[2, 0, 1, 3])? // [batch, seq, 1, hidden]
+        } else {
+            y
+        };
+
+        let y_h = if layout != 0 {
+            h_t.try_unsqueeze(1)? // [batch, 1, hidden]
+        } else {
+            h_t.try_unsqueeze(0)? // [1, batch, hidden]
+        };
 
         Ok(RnnOutput { y, y_h })
+    }
+
+    /// GRU (Gated Recurrent Unit).
+    ///
+    /// Gate order: `[z, r, h]` (update, reset, hidden).
+    ///
+    /// Equations (default, `linear_before_reset=0`):
+    /// - `z = sigmoid(X @ W_z^T + H @ R_z^T + w_bz + r_bz)`
+    /// - `r = sigmoid(X @ W_r^T + H @ R_r^T + w_br + r_br)`
+    /// - `h = tanh(X @ W_h^T + (r * H) @ R_h^T + w_bh + r_bh)`
+    /// - `H_new = (1 - z) * h + z * H_prev`
+    ///
+    /// When `linear_before_reset=1`:
+    /// - `h = tanh(X @ W_h^T + r * (H @ R_h^T + r_bh) + w_bh)`
+    ///
+    /// - `x`: input `[seq_length, batch_size, input_size]` (layout=0) or
+    ///         `[batch_size, seq_length, input_size]` (layout=1)
+    /// - `w`: input weights `[num_directions, 3*hidden_size, input_size]`
+    /// - `r_weights`: recurrence weights `[num_directions, 3*hidden_size, hidden_size]`
+    /// - `bias`: optional `[num_directions, 6*hidden_size]` (Wb ++ Rb)
+    /// - `initial_h`: optional `[num_directions, batch_size, hidden_size]`
+    /// - `linear_before_reset`: 0 (default) or 1
+    /// - `layout`: 0 = seq-first (default), 1 = batch-first
+    pub fn gru(
+        &self,
+        w: &Tensor,
+        r_weights: &Tensor,
+        bias: Option<&Tensor>,
+        initial_h: Option<&Tensor>,
+        hidden_size: usize,
+        linear_before_reset: usize,
+        layout: usize,
+    ) -> Result<GruOutput> {
+        let x = if layout != 0 { self.try_permute(&[1, 0, 2])? } else { self.clone() };
+        let x_shape = x.shape()?;
+        let seq_length = x_shape[0].as_const().expect("static seq_length");
+        let batch_size = x_shape[1].as_const().expect("static batch_size");
+        let input_size = x_shape[2].as_const().expect("static input_size");
+        let num_directions = w.shape()?[0].as_const().expect("static num_directions");
+        let dtype = x.uop().dtype();
+
+        assert_eq!(num_directions, 1, "GRU: only forward direction supported");
+
+        let w0 = w.try_squeeze(Some(0))?; // [3*hidden, input]
+        let r0 = r_weights.try_squeeze(Some(0))?; // [3*hidden, hidden]
+
+        // Split W into [W_z, W_r, W_h] and R into [R_z, R_r, R_h]
+        let w_parts = w0.split(&[hidden_size; 3], 0)?;
+        let r_parts = r0.split(&[hidden_size; 3], 0)?;
+
+        // Combine z,r weights for joint computation: gates_w = [W_z; W_r]^T
+        let gates_w = Tensor::cat(&[&w_parts[0], &w_parts[1]], 0)?.try_permute(&[1, 0])?;
+        let gates_r = Tensor::cat(&[&r_parts[0], &r_parts[1]], 0)?.try_permute(&[1, 0])?;
+
+        // W_h and R_h kept separate (reset gate interacts differently)
+        let w_h_t = w_parts[2].try_permute(&[1, 0])?; // [input, hidden]
+        let r_h_t = r_parts[2].try_permute(&[1, 0])?; // [hidden, hidden]
+
+        // Bias: [6*hidden] → [w_bz, w_br, w_bh, r_bz, r_br, r_bh]
+        let (gates_b, w_bh, r_bh) = if let Some(b) = bias {
+            let b0 = b.try_squeeze(Some(0))?;
+            let parts = b0.split(&[hidden_size; 6], 0)?;
+            // gates_b = (w_bz + r_bz) ++ (w_br + r_br)
+            let gates_b = Tensor::cat(&[&parts[0].try_add(&parts[3])?, &parts[1].try_add(&parts[4])?], 0)?;
+            (Some(gates_b), Some(parts[2].clone()), Some(parts[5].clone()))
+        } else {
+            (None, None, None)
+        };
+
+        let mut h_t = if let Some(h0) = initial_h {
+            h0.try_squeeze(Some(0))?
+        } else {
+            Tensor::full(&[batch_size, hidden_size], 0.0f32, dtype)?
+        };
+
+        let mut h_list = Vec::with_capacity(seq_length);
+        for t in 0..seq_length {
+            let x_t =
+                x.try_shrink(&[(t as isize, t as isize + 1), (0, batch_size as isize), (0, input_size as isize)])?;
+            let x_t = x_t.try_squeeze(Some(0))?; // [batch, input]
+
+            // z, r gates: combined matmul
+            let mut gates = x_t.matmul(&gates_w)?.try_add(&h_t.matmul(&gates_r)?)?;
+            if let Some(ref gb) = gates_b {
+                gates = gates.try_add(gb)?;
+            }
+            let zr = gates.split(&[hidden_size; 2], -1)?;
+            let z = zr[0].sigmoid()?;
+            let r = zr[1].sigmoid()?;
+
+            // Hidden candidate
+            let h_candidate = if linear_before_reset != 0 {
+                // h = tanh(x @ W_h^T + r * (H @ R_h^T + r_bh) + w_bh)
+                let mut rh = h_t.matmul(&r_h_t)?;
+                if let Some(ref rb) = r_bh {
+                    rh = rh.try_add(rb)?;
+                }
+                let mut h = x_t.matmul(&w_h_t)?.try_add(&r.try_mul(&rh)?)?;
+                if let Some(ref wb) = w_bh {
+                    h = h.try_add(wb)?;
+                }
+                h.tanh()?
+            } else {
+                // h = tanh(x @ W_h^T + (r * H) @ R_h^T + w_bh + r_bh)
+                let mut h = x_t.matmul(&w_h_t)?.try_add(&r.try_mul(&h_t)?.matmul(&r_h_t)?)?;
+                if let Some(ref wb) = w_bh {
+                    h = h.try_add(wb)?;
+                }
+                if let Some(ref rb) = r_bh {
+                    h = h.try_add(rb)?;
+                }
+                h.tanh()?
+            };
+
+            // H = (1 - z) * h_candidate + z * H_prev
+            let one = Tensor::full(&[1], 1.0f32, z.uop().dtype())?;
+            h_t = one.try_sub(&z)?.try_mul(&h_candidate)?.try_add(&z.try_mul(&h_t)?)?;
+            h_list.push(h_t.clone());
+        }
+
+        let h_refs: Vec<&Tensor> = h_list.iter().collect();
+        let y_seq = Tensor::stack(&h_refs, 0)?; // [seq, batch, hidden]
+        let y = y_seq.try_unsqueeze(1)?; // [seq, 1, batch, hidden]
+
+        let y = if layout != 0 {
+            y.try_permute(&[2, 0, 1, 3])? // [batch, seq, 1, hidden]
+        } else {
+            y
+        };
+
+        let y_h = if layout != 0 {
+            h_t.try_unsqueeze(1)? // [batch, 1, hidden]
+        } else {
+            h_t.try_unsqueeze(0)? // [1, batch, hidden]
+        };
+
+        Ok(GruOutput { y, y_h })
     }
 
     /// LSTM (Long Short-Term Memory).
@@ -162,11 +321,8 @@ impl Tensor {
 
         let mut h_list = Vec::with_capacity(seq_length);
         for t in 0..seq_length {
-            let x_t = x.try_shrink(&[
-                (t as isize, t as isize + 1),
-                (0, batch_size as isize),
-                (0, input_size as isize),
-            ])?;
+            let x_t =
+                x.try_shrink(&[(t as isize, t as isize + 1), (0, batch_size as isize), (0, input_size as isize)])?;
             let x_t = x_t.try_squeeze(Some(0))?; // [batch, input]
 
             // gates = X_t @ W^T + H_{t-1} @ R^T + bias

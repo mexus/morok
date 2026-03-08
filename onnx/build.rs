@@ -56,9 +56,8 @@ fn should_skip(name: &str) -> bool {
         // Control flow iteration (we support If, not Loop/Scan)
         "test_loop",
         "test_scan",
-        // Recurrent ops (GRU unimplemented)
-        "test_gru_",
-        "test_simple_rnn_batchwise",
+        // Recurrent ops
+        // "test_simple_rnn_batchwise",
         // Quantization
         "test_quantize",
         "test_dequantize",

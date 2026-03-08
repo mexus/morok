@@ -502,12 +502,29 @@ impl OpRegistry {
             "BatchNormalization" => return nn::op_batch_norm(inputs, node),
             "RNN" => {
                 let hidden_size = get_attr_int(node, "hidden_size", 0) as usize;
+                let layout = get_attr_int(node, "layout", 0) as usize;
                 let out = inp(inputs, 0).rnn(
                     inp(inputs, 1),
                     inp(inputs, 2),
                     inputs.get(3).and_then(|o| o.as_ref()),
                     inputs.get(5).and_then(|o| o.as_ref()),
                     hidden_size,
+                    layout,
+                )?;
+                return Ok(vec![out.y, out.y_h]);
+            }
+            "GRU" => {
+                let hidden_size = get_attr_int(node, "hidden_size", 0) as usize;
+                let layout = get_attr_int(node, "layout", 0) as usize;
+                let linear_before_reset = get_attr_int(node, "linear_before_reset", 0) as usize;
+                let out = inp(inputs, 0).gru(
+                    inp(inputs, 1),
+                    inp(inputs, 2),
+                    inputs.get(3).and_then(|o| o.as_ref()), // B
+                    inputs.get(5).and_then(|o| o.as_ref()), // initial_h
+                    hidden_size,
+                    linear_before_reset,
+                    layout,
                 )?;
                 return Ok(vec![out.y, out.y_h]);
             }
@@ -517,10 +534,10 @@ impl OpRegistry {
                 let out = inp(inputs, 0).lstm(
                     inp(inputs, 1),
                     inp(inputs, 2),
-                    inputs.get(3).and_then(|o| o.as_ref()),  // B
-                    inputs.get(5).and_then(|o| o.as_ref()),  // initial_h
-                    inputs.get(6).and_then(|o| o.as_ref()),  // initial_c
-                    inputs.get(7).and_then(|o| o.as_ref()),  // P
+                    inputs.get(3).and_then(|o| o.as_ref()), // B
+                    inputs.get(5).and_then(|o| o.as_ref()), // initial_h
+                    inputs.get(6).and_then(|o| o.as_ref()), // initial_c
+                    inputs.get(7).and_then(|o| o.as_ref()), // P
                     hidden_size,
                     layout,
                 )?;
