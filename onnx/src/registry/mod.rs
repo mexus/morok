@@ -390,6 +390,11 @@ impl OpRegistry {
             "Scatter" | "ScatterElements" => indexing::op_scatter_elements(inputs, node)?,
             "ScatterND" => indexing::op_scatter_nd(inputs, node)?,
             "TensorScatter" => indexing::op_tensor_scatter(inputs, node)?,
+            "ReverseSequence" => {
+                let batch_axis = get_attr_int(node, "batch_axis", 1) as usize;
+                let time_axis = get_attr_int(node, "time_axis", 0) as usize;
+                inp(inputs, 0).reverse_sequence(inp(inputs, 1), time_axis, batch_axis)?
+            }
 
             // === Reductions ===
             "ReduceSum" => {

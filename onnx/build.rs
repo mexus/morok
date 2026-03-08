@@ -91,8 +91,6 @@ fn should_skip(name: &str) -> bool {
         "test_blackmanwindow",
         // Random (non-deterministic)
         "test_bernoulli",
-        // Reverse sequence
-        "test_reversesequence_",
         // Optional type ops
         "test_optional_",
         // Exotic dtype casts

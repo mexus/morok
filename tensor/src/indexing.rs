@@ -451,6 +451,54 @@ impl Tensor {
         let selected = indices.masked_select(&expanded_mask)?;
         selected.try_reshape(&[-1, ndim as isize])
     }
+
+    /// Reverse the first `sequence_lens[i]` elements along `time_axis` for each
+    /// batch element `i` along `batch_axis`, leaving the rest unchanged.
+    #[track_caller]
+    pub fn reverse_sequence(&self, sequence_lens: &Tensor, time_axis: usize, batch_axis: usize) -> Result<Self> {
+        let dims = morok_ir::shape::to_vec_usize(&self.shape()?).context(UOpSnafu)?;
+        let ndim = dims.len();
+        let time_len = dims[time_axis];
+
+        // Transpose so time_axis→0, batch_axis→1
+        let mut perm: Vec<usize> = (0..ndim).collect();
+        perm.swap(0, time_axis);
+        let batch_pos = if batch_axis == 0 {
+            time_axis
+        } else if batch_axis == time_axis {
+            0
+        } else {
+            batch_axis
+        };
+        perm.swap(1, batch_pos);
+        let perm_i: Vec<isize> = perm.iter().map(|&p| p as isize).collect();
+        let work = self.try_permute(&perm_i)?;
+        let work_dims = morok_ir::shape::to_vec_usize(&work.shape()?).context(UOpSnafu)?;
+
+        // t = arange(T) as [T, 1], seq_lens as [1, B]
+        let idx_dt = sequence_lens.uop().dtype();
+        let t = Tensor::arange(0, Some(time_len as i64), None)?.cast(idx_dt.clone())?.try_unsqueeze(1)?;
+        let sl = sequence_lens.try_unsqueeze(0)?;
+
+        // reversed_t = seq_lens - 1 - t; idx = where(t < seq_lens, reversed_t, t)
+        let one = Tensor::const_(ConstValue::Int(1), idx_dt);
+        let reversed_t = sl.try_sub(&one)?.try_sub(&t)?;
+        let mask = t.try_lt(&sl)?;
+        let idx = reversed_t.where_(&mask, &t)?;
+
+        // Expand indices to match work shape [T, B, ...] and gather along axis 0
+        let expand_shape: Vec<isize> = work_dims.iter().map(|&d| d as isize).collect();
+        let idx = idx.try_reshape(&expand_shape[..2].to_vec())?.try_expand(&expand_shape)?;
+        let result = work.gather(0, &idx)?;
+
+        // Inverse permutation to restore original axis order
+        let mut inv_perm = vec![0usize; ndim];
+        for (i, &p) in perm.iter().enumerate() {
+            inv_perm[p] = i;
+        }
+        let inv_perm_i: Vec<isize> = inv_perm.iter().map(|&p| p as isize).collect();
+        result.try_permute(&inv_perm_i)
+    }
 }
 
 /// Reduce repeated indices so the last value wins, then apply mask.
