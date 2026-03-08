@@ -85,8 +85,6 @@ fn should_skip(name: &str) -> bool {
         "test_dft",
         "test_stft",
         "test_melweight",
-        // Lp pooling
-        "test_lppool_",
         // Matrix determinant
         "test_det_",
         // Window functions

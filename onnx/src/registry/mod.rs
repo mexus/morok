@@ -549,12 +549,20 @@ impl OpRegistry {
             "QLinearMatMul" => nn::op_qlinear_matmul(inputs, node)?,
             "ConvInteger" => nn::op_conv_integer(inputs, node)?,
             "AveragePool" => nn::op_avg_pool(inputs, node)?,
+            "LpPool" => nn::op_lp_pool(inputs, node)?,
             "MaxPool" => return nn::op_max_pool(inputs, node),
             "MaxUnpool" => nn::op_max_unpool(inputs, node)?,
             "GlobalAveragePool" => {
                 let x = inp(inputs, 0);
                 let axes: Vec<isize> = (2..x.ndim()? as isize).collect();
                 x.mean_with().axes(AxisSpec::Multiple(axes)).keepdim(true).call()?
+            }
+            "GlobalLpPool" => {
+                let x = inp(inputs, 0);
+                let p = get_attr_int(node, "p", 2) as usize;
+                let shape = x.shape()?;
+                let kernel: Vec<usize> = shape[2..].iter().map(|s| s.as_const().unwrap()).collect();
+                x.lp_pool().kernel_shape(&kernel).p(p).call()?
             }
             "GlobalMaxPool" => {
                 let x = inp(inputs, 0);

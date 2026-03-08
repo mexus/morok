@@ -222,6 +222,24 @@ pub(crate) fn op_avg_pool(inputs: &[Option<Tensor>], node: &NodeProto) -> Result
         .call()?)
 }
 
+pub(crate) fn op_lp_pool(inputs: &[Option<Tensor>], node: &NodeProto) -> Result<Tensor> {
+    let kernel: Vec<usize> = get_attr_ints(node, "kernel_shape").iter().map(|&k| k as usize).collect();
+    let auto_pad: AutoPad = parse_enum(node, "auto_pad", "NOTSET")?;
+    let pads = get_attr_ints(node, "pads");
+    let strides = get_attr_ints(node, "strides");
+    let dilations = get_attr_ints(node, "dilations");
+    Ok(inp(inputs, 0)
+        .lp_pool()
+        .kernel_shape(&kernel)
+        .p(get_attr_int(node, "p", 2) as usize)
+        .auto_pad(auto_pad)
+        .ceil_mode(get_attr_int(node, "ceil_mode", 0) == 1)
+        .maybe_pads(non_empty_i64(&pads))
+        .maybe_strides(non_empty_i64(&strides))
+        .maybe_dilations(non_empty_i64(&dilations))
+        .call()?)
+}
+
 pub(crate) fn op_max_pool(inputs: &[Option<Tensor>], node: &NodeProto) -> Result<Vec<Tensor>> {
     let kernel: Vec<usize> = get_attr_ints(node, "kernel_shape").iter().map(|&k| k as usize).collect();
     let auto_pad: AutoPad = parse_enum(node, "auto_pad", "NOTSET")?;
