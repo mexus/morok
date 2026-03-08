@@ -52,7 +52,9 @@ fn test_tensor_from_proto_f32() {
     let tensor = make_tensor_proto(raw, vec![2, 3], 1); // FLOAT
 
     let result = tensor_from_proto(&tensor).unwrap();
-    assert!(result.buffer().is_some());
+    let arr = result.to_ndarray::<f32>().unwrap();
+    assert_eq!(arr.shape(), &[2, 3]);
+    assert_eq!(arr.as_slice().unwrap(), &[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]);
 }
 
 #[test]

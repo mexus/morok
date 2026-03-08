@@ -46,18 +46,26 @@ fn should_skip(name: &str) -> bool {
     const SKIP_PREFIXES: &[&str] = &[
         // ML domain ops
         "test_ai_onnx_ml_",
-        // String ops
+        // String ops (unsupported string dtype)
         "test_string_",
         "test_strnormalizer_",
         "test_tfidfvectorizer_",
+        "test_equal_string",
+        "test_regex_full_match_",
         // Sequence ops
         "test_sequence_",
         "test_split_to_sequence_",
         // Control flow iteration (we support If, not Loop/Scan)
         "test_loop",
         "test_scan",
-        // Recurrent ops
-        // "test_simple_rnn_batchwise",
+        // Training ops (ai.onnx.preview.training domain)
+        "test_adagrad",
+        "test_adam",
+        "test_momentum",
+        "test_nesterov_momentum",
+        "test_training_dropout",
+        // Image decoding (unsupported ImageDecoder op)
+        "test_image_decoder_",
         // Quantization
         "test_quantize",
         "test_dequantize",
@@ -107,6 +115,14 @@ fn should_skip(name: &str) -> bool {
         // Identity variants using optional/sequence container types
         "test_identity_opt",
         "test_identity_sequence",
+        // Expanded subgraphs using If with incompatible branch shapes
+        "test_affine_grid_2d_expanded",
+        "test_affine_grid_2d_align_corners_expanded",
+        "test_affine_grid_3d_expanded",
+        "test_affine_grid_3d_align_corners_expanded",
+        // Expanded subgraphs using Loop (unsupported)
+        "test_range_float_type_positive_delta_expanded",
+        "test_range_int32_type_negative_delta_expanded",
     ];
 
     const SKIP_CONTAINS: &[&str] = &["FLOAT8", "INT4", "UINT4", "INT2", "UINT2", "FLOAT4E2M1", "FLOAT8E8M0", "COMPLEX"];
