@@ -363,7 +363,6 @@ def run_tests() -> dict[str, str]:
             "morok-onnx",
             "test::node",
             "--",
-            "--include-ignored",
             "-Z",
             "unstable-options",
             "--format",

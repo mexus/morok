@@ -271,6 +271,11 @@ impl OpRegistry {
                 inp(inputs, 0).cast(dtype)?
             }
             "CastLike" => inp(inputs, 0).cast(inp(inputs, 1).uop().dtype())?,
+            "BitCast" => {
+                let to = get_attr_int(node, "to", 1);
+                let dtype = convert_onnx_dtype(to as i32)?;
+                inp(inputs, 0).bitcast(dtype)?
+            }
 
             // === Shape ===
             "Reshape" => shape::op_reshape(inputs, node)?,

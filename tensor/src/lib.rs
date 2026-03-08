@@ -497,6 +497,11 @@ impl Tensor {
         Ok(Self::new(casted))
     }
 
+    /// Bitcast tensor to a different dtype (reinterpret bits, same byte size required).
+    pub fn bitcast(&self, dtype: morok_dtype::DType) -> Result<Self> {
+        Ok(Self::new(self.uop().bitcast(dtype)))
+    }
+
     /// Extract data as ndarray::ArrayD<T> (for testing).
     ///
     /// This method is primarily intended for testing and validation.

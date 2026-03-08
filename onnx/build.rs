@@ -83,8 +83,6 @@ fn should_skip(name: &str) -> bool {
         "test_lppool_",
         // Matrix determinant
         "test_det_",
-        // Bitcast reinterpretation
-        "test_bitcast_",
         // Window functions
         "test_hannwindow",
         "test_hammingwindow",
