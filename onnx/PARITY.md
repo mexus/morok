@@ -1,8 +1,8 @@
 # ONNX Operator Parity
 
-**153 / 198** standard operators implemented (77%).
+**154 / 198** standard operators implemented (77%).
 
-Test results from the ONNX backend node test suite: **1313** pass, **31** fail, **334** skip (out of 1678 tests).
+Test results from the ONNX backend node test suite: **1317** pass, **31** fail, **330** skip (out of 1678 tests).
 
 The *expanded uses* column counts how many `_expanded` tests exercise each
 operator as a building block (indirect coverage beyond direct tests).
@@ -219,7 +219,7 @@ operator as a building block (indirect coverage beyond direct tests).
 | DeformConv | - | 4 skip | - | - |
 | GRU | - | 4 skip | - | - |
 | GlobalLpPool | - | - | - | - |
-| LSTM | - | 4 skip | - | - |
+| LSTM | Y | 4 pass | - | - |
 | LpPool | - | 8 skip | - | - |
 | MaxRoiPool | - | - | - | - |
 | MaxUnpool | Y | 2 pass | - | - |

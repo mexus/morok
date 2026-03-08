@@ -1055,8 +1055,19 @@ impl UOp {
                 Op::Barrier { src: src(0), deps: new_srcs[1..].iter().cloned().collect() }
             }
 
-            // Vector operations
-            Op::Vectorize { .. } => Op::Vectorize { elements: new_srcs.iter().cloned().collect() },
+            // Vector operations — recompute dtype from new elements when element
+            // dtype category changed (e.g. Scalar → Ptr during rewrite reconstruction).
+            // Preserving old dtype is wrong when DEFINE_LOCAL → AFTER(Ptr) changes
+            // element types from Scalar to Ptr, causing pm_add_loads infinite loops.
+            Op::Vectorize { .. } => {
+                let elements: SmallVec<[Arc<Self>; 4]> = new_srcs.iter().cloned().collect();
+                let elem_dtype = elements[0].dtype();
+                let new_dtype = match elem_dtype {
+                    DType::Scalar(_) | DType::Ptr { .. } => elem_dtype.vec(elements.len()),
+                    _ => self.dtype.clone(),
+                };
+                return Self::new(Op::Vectorize { elements }, new_dtype);
+            }
             Op::Gep { indices, .. } => {
                 assert_eq!(new_srcs.len(), 1);
                 Op::Gep { vector: src(0), indices: indices.clone() }

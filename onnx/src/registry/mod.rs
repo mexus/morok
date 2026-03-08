@@ -511,6 +511,21 @@ impl OpRegistry {
                 )?;
                 return Ok(vec![out.y, out.y_h]);
             }
+            "LSTM" => {
+                let hidden_size = get_attr_int(node, "hidden_size", 0) as usize;
+                let layout = get_attr_int(node, "layout", 0) as usize;
+                let out = inp(inputs, 0).lstm(
+                    inp(inputs, 1),
+                    inp(inputs, 2),
+                    inputs.get(3).and_then(|o| o.as_ref()),  // B
+                    inputs.get(5).and_then(|o| o.as_ref()),  // initial_h
+                    inputs.get(6).and_then(|o| o.as_ref()),  // initial_c
+                    inputs.get(7).and_then(|o| o.as_ref()),  // P
+                    hidden_size,
+                    layout,
+                )?;
+                return Ok(vec![out.y, out.y_h, out.y_c]);
+            }
             "Conv" => nn::op_conv(inputs, node)?,
             "ConvTranspose" => nn::op_conv_transpose(inputs, node)?,
             "QLinearConv" => nn::op_qlinear_conv(inputs, node)?,
