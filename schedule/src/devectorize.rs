@@ -97,6 +97,215 @@ pub fn bool_storage_patterns() -> TypedPatternMatcher {
     }
 }
 
+// ============================================================================
+// FP8 Float Decomposition (Tinygrad: pm_float_decomp, decompositions.py:504-522)
+// ============================================================================
+
+/// Context for FP8 float decomposition.
+/// `from` is the FP8 dtype being decomposed, `to` is the target float dtype.
+#[derive(Debug, Clone)]
+pub struct Fp8DecompCtx {
+    pub from: ScalarDType,
+    pub to: ScalarDType,
+}
+
+/// Round-to-nearest-even for integer bitwise rounding.
+/// Port of Tinygrad's `rne(v, s)` (decompositions.py:383).
+fn rne(v: &Arc<UOp>, s: u32) -> Arc<UOp> {
+    let one = v.const_like(1);
+    let shifted = v.shr(&v.const_like(s));
+    let half_bit = v.shr(&v.const_like(s - 1)).and_(&one);
+    let remainder_mask = v.const_like((1i64 << (s - 1)) - 1);
+    let has_remainder = v.and_(&remainder_mask).ne(&v.const_like(0)).cast(v.dtype());
+    let lsb = shifted.and_(&one);
+    let round_up = half_bit.and_(&has_remainder.or_(&lsb));
+    shifted.try_add(&round_up).expect("rne: add failed")
+}
+
+/// Bitwise float-to-float format conversion.
+/// Port of Tinygrad's `f2f(v, fr, to)` (decompositions.py:385-404).
+///
+/// `v` is a UInt value holding the raw bits of the source float.
+/// Returns a UOp holding raw bits of the target float, which must be bitcast to get the float value.
+fn f2f(v: &Arc<UOp>, fr: ScalarDType, to: ScalarDType) -> Arc<UOp> {
+    let (fe, fm) = fr.finfo();
+    let (te, tm) = to.finfo();
+    let fs = fr.bitsize();
+    let ts = to.bitsize();
+    let fb = fr.exponent_bias() as i64;
+    let tb = to.exponent_bias() as i64;
+    let fr_uint = DType::Scalar(fr.float_to_uint());
+    let to_uint = DType::Scalar(to.float_to_uint());
+
+    if fe <= te && fm < tm {
+        // Upcast path: e.g. FP8 → Float16
+        let sign_mask = v.const_like(1i64 << (fs - 1));
+        let sign = v.and_(&sign_mask).cast(to_uint.clone()).shl(&v.const_like(ts - fs).cast(to_uint.clone()));
+        let nosign_mask = v.const_like((1i64 << (fs - 1)) - 1);
+        let nosign = v.and_(&nosign_mask).cast(to_uint.clone());
+        let exp = nosign.shr(&nosign.const_like(fm));
+        let norm = nosign
+            .shl(&nosign.const_like(tm - fm))
+            .try_add(&nosign.const_like((tb - fb) << tm))
+            .expect("f2f: add failed");
+        let nan_val = nosign.shl(&nosign.const_like(tm - fm)).or_(&nosign.const_like(((1i64 << te) - 1) << tm));
+
+        // FP8E4M3 has a single NaN value (all exponent+mantissa bits set)
+        let is_nan = if fr == ScalarDType::FP8E4M3 {
+            nosign.eq(&nosign.const_like((1i64 << (fm + fe)) - 1))
+        } else {
+            exp.eq(&exp.const_like((1i64 << fe) - 1))
+        };
+
+        let zero = nosign.const_like(0);
+        let exp_is_zero = exp.eq(&zero);
+        let inner = UOp::try_where(is_nan, nan_val, norm).expect("f2f: where failed");
+        let result = UOp::try_where(exp_is_zero, zero, inner).expect("f2f: where failed");
+        sign.or_(&result).bitcast(DType::Scalar(to))
+    } else if fe >= te && fm > tm {
+        // Downcast path: e.g. Float16 → FP8
+        let clamped = f2f_clamp(&v.bitcast(DType::Scalar(fr)), to);
+        let v = clamped.bitcast(fr_uint);
+        let sign = v.shr(&v.const_like(fs - ts)).and_(&v.const_like(1i64 << (ts - 1)));
+        let nosign_mask = v.const_like((1i64 << (fs - 1)) - 1);
+        let nosign = v.and_(&nosign_mask);
+        let norm = rne(&nosign, fm - tm)
+            .try_sub(&nosign.const_like((fb - tb) << tm))
+            .expect("f2f: sub failed")
+            .cast(to_uint.clone());
+
+        let exp_field = nosign.shr(&nosign.const_like(fm)).and_(&nosign.const_like((1i64 << fe) - 1));
+        let underflow = exp_field.lt(&exp_field.const_like(1 + fb - tb));
+
+        let nan_mantissa = if to == ScalarDType::FP8E4M3 {
+            sign.const_like((1i64 << tm) - 1).cast(to_uint.clone())
+        } else {
+            nosign.shr(&nosign.const_like(fm - tm)).and_(&nosign.const_like((1i64 << tm) - 1)).cast(to_uint.clone())
+        };
+        let nan_exp = sign.const_like(((1i64 << te) - 1) << tm).cast(to_uint.clone());
+        let nan = sign.cast(to_uint.clone()).or_(&nan_mantissa).or_(&nan_exp);
+
+        let is_nan = exp_field.eq(&exp_field.const_like((1i64 << fe) - 1));
+        let zero = sign.const_like(0).cast(to_uint.clone());
+        let normal = sign.cast(to_uint.clone()).or_(&UOp::try_where(underflow, zero, norm).expect("f2f: where failed"));
+        UOp::try_where(is_nan, nan, normal).expect("f2f: where failed")
+    } else {
+        panic!("f2f: unsupported conversion {fr:?} -> {to:?}")
+    }
+}
+
+/// Clamp a float value to the representable range of a target FP8 dtype.
+/// Port of Tinygrad's `f2f_clamp` (decompositions.py:406-412).
+fn f2f_clamp(val: &Arc<UOp>, dt: ScalarDType) -> Arc<UOp> {
+    let (e, m) = dt.finfo();
+    let (max_exp, max_man): (i64, i64) =
+        if dt == ScalarDType::FP8E4M3 { ((1 << e) - 1, (1 << m) - 2) } else { ((1 << e) - 2, (1 << m) - 1) };
+    let mx_f64 =
+        f64::powi(2.0, (max_exp - dt.exponent_bias() as i64) as i32) * (1.0 + max_man as f64 / (1i64 << m) as f64);
+    let mx = val.const_like(mx_f64);
+    let neg_mx = val.const_like(-mx_f64);
+
+    // For FP8 types, clamp to ±max; for others, clamp to ±inf
+    let sat = if dt.is_fp8() { mx.clone() } else { val.const_like(f64::INFINITY) };
+    let neg_sat = if dt.is_fp8() { neg_mx.clone() } else { val.const_like(f64::NEG_INFINITY) };
+
+    // nan → nan, < -mx → -sat, > mx → sat, otherwise → val
+    let is_nan = val.ne(val);
+    let below = val.lt(&neg_mx);
+    let above = mx.lt(val);
+    let clamped_above = UOp::try_where(above, sat, val.clone()).expect("f2f_clamp: where failed");
+    let clamped = UOp::try_where(below, neg_sat, clamped_above).expect("f2f_clamp: where failed");
+    UOp::try_where(is_nan, val.clone(), clamped).expect("f2f_clamp: where failed")
+}
+
+/// FP8 STORE decomposition patterns (bpm — sees ORIGINAL children).
+///
+/// The STORE pattern must run in the bpm slot so it sees the ORIGINAL index dtype
+/// (still FP8) before Pattern 1 changes it to UInt8. This is the Morok equivalent
+/// of Tinygrad's `tag` mechanism in `pm_float_decomp`.
+pub fn pm_float_decomp_store() -> crate::TypedPatternMatcher<Fp8DecompCtx> {
+    crate::patterns! {
+        @context Fp8DecompCtx;
+
+        // STORE to FP8 buffer → f2f convert value→UInt8, store
+        // In bpm, index still has FP8 ptr (ORIGINAL children, before Pattern 1 runs).
+        Store { index, value, ranges }
+            if index.dtype().base() == ctx.from
+        => {
+            let target_float = DType::Scalar(ctx.to);
+            let target_uint = DType::Scalar(ctx.to.float_to_uint());
+            // Cast value to target float (handles FP8, Float32, etc. → Float16)
+            let float_val = value.cast(target_float);
+            // Bitwise float→FP8 conversion (includes clamping internally)
+            let result = f2f(&float_val.bitcast(target_uint), ctx.to, ctx.from);
+            // Change index ptr to UInt8
+            let uint8_ptr = index.dtype().with_ptr_base(DType::Scalar(ctx.from.float_to_uint()))?;
+            let new_index = index.with_dtype(uint8_ptr);
+            Some(new_index.store_with_ranges(result, ranges.clone()))
+        },
+    }
+}
+
+/// FP8 float decomposition patterns (pm — sees OPTIMIZED children).
+///
+/// Port of Tinygrad's `pm_float_decomp` (decompositions.py:504-522).
+/// Run via `graph_rewrite_with_bpm` together with `pm_float_decomp_store()`.
+pub fn pm_float_decomp() -> crate::TypedPatternMatcher<Fp8DecompCtx> {
+    crate::patterns! {
+        @context Fp8DecompCtx;
+
+        // Pattern 1: INDEX/DEFINE with FP8 ptr base → change ptr to UInt8
+        x if matches!(x.op(), Op::DefineGlobal(_) | Op::DefineLocal(_) | Op::Index { .. })
+            && x.dtype().base() == ctx.from
+        => {
+            let uint8_ptr = x.dtype().with_ptr_base(DType::Scalar(ctx.from.float_to_uint()))?;
+            Some(x.with_dtype(uint8_ptr))
+        },
+
+        // Pattern 2: LOAD with FP8 dtype → load as UInt8, f2f upcast to target float
+        load @ Load { buffer, index } if load.dtype().base() == ctx.from => {
+            let uint_dtype = DType::Scalar(ctx.from.float_to_uint());
+            let uint_load = UOp::load().buffer(buffer.clone()).index(index.clone())
+                .dtype(uint_dtype).call();
+            Some(f2f(&uint_load, ctx.from, ctx.to))
+        },
+
+        // Pattern 5: CAST to FP8 → full round-trip (Float16→FP8 bytes→Float16).
+        // Must do the complete conversion (not just clamp) because the kernel may fuse
+        // Cast(Float16→FP8) and Cast(FP8→Float32) without materializing the FP8 buffer.
+        x @ Cast { src: val, .. } if x.dtype().base() == ctx.from => {
+            let target = DType::Scalar(ctx.to);
+            let target_uint = DType::Scalar(ctx.to.float_to_uint());
+            let float_val = val.cast(target);
+            // Downcast: Float16 bits → FP8 bytes (includes clamping)
+            let fp8_bytes = f2f(&float_val.bitcast(target_uint.clone()), ctx.to, ctx.from);
+            // Upcast: FP8 bytes → Float16 (proper FP8-quantized value)
+            Some(f2f(&fp8_bytes, ctx.from, ctx.to))
+        },
+
+        // Pattern 6: Any op with FP8 output dtype → promote to target float, cast FP8 sources
+        x if !matches!(x.op(), Op::BitCast { .. })
+            && x.dtype().is_float()
+            && x.dtype().base() == ctx.from
+        => {
+            let target_dtype = DType::Scalar(ctx.to);
+            let new_dtype = if x.dtype().vcount() > 1 {
+                target_dtype.vec(x.dtype().vcount())
+            } else {
+                target_dtype.clone()
+            };
+            let new_sources: Vec<Arc<UOp>> = x.op().sources().iter().map(|s| {
+                if s.dtype().base() == ctx.from {
+                    s.cast(target_dtype.clone())
+                } else {
+                    s.clone()
+                }
+            }).collect();
+            Some(x.with_sources(new_sources).with_dtype(new_dtype))
+        },
+    }
+}
+
 /// Post-devectorize rendering patterns (devectorizer.py:258-275).
 /// Called during codegen, NOT part of pm_devectorize.
 pub fn pm_render() -> TypedPatternMatcher {

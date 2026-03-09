@@ -202,6 +202,10 @@ impl ScalarDType {
         matches!(self, Self::FP8E4M3 | Self::FP8E5M2 | Self::Float16 | Self::BFloat16 | Self::Float32 | Self::Float64)
     }
 
+    pub const fn is_fp8(&self) -> bool {
+        matches!(self, Self::FP8E4M3 | Self::FP8E5M2)
+    }
+
     pub const fn min_value(&self) -> f64 {
         match self {
             Self::Bool => 0.0,
@@ -261,6 +265,42 @@ impl ScalarDType {
             Self::Void => "void",
             Self::Index => "size_t",
         }
+    }
+
+    /// (exponent_bits, mantissa_bits) for float types.
+    /// Matches Tinygrad's `dtypes.finfo()`.
+    pub const fn finfo(&self) -> (u32, u32) {
+        match self {
+            Self::FP8E4M3 => (4, 3),
+            Self::FP8E5M2 => (5, 2),
+            Self::Float16 => (5, 10),
+            Self::BFloat16 => (8, 7),
+            Self::Float32 => (8, 23),
+            Self::Float64 => (11, 52),
+            _ => panic!("finfo: not a float type"),
+        }
+    }
+
+    /// Exponent bias: `(1 << (exp_bits - 1)) - 1`.
+    pub const fn exponent_bias(&self) -> i32 {
+        let (e, _) = self.finfo();
+        (1 << (e - 1)) - 1
+    }
+
+    /// Map float dtype to uint storage equivalent of the same bit width.
+    pub const fn float_to_uint(&self) -> ScalarDType {
+        match self {
+            Self::FP8E4M3 | Self::FP8E5M2 => Self::UInt8,
+            Self::Float16 | Self::BFloat16 => Self::UInt16,
+            Self::Float32 => Self::UInt32,
+            Self::Float64 => Self::UInt64,
+            _ => panic!("float_to_uint: not a float type"),
+        }
+    }
+
+    /// Bit size of this scalar type.
+    pub const fn bitsize(&self) -> u32 {
+        (self.bytes() * 8) as u32
     }
 
     /// Create a vector DType from this scalar type.
@@ -356,6 +396,17 @@ impl DType {
         if count > 1 { Self::Scalar(new_base).vec(count) } else { Self::Scalar(new_base) }
     }
 
+    /// For Ptr types: replace the base dtype while preserving addrspace, size, and vcount.
+    /// Returns None if not a Ptr.
+    pub fn with_ptr_base(&self, new_base: DType) -> Option<Self> {
+        match self {
+            Self::Ptr { addrspace, size, vcount, .. } => {
+                Some(Self::Ptr { base: Box::new(new_base), addrspace: *addrspace, size: *size, vcount: *vcount })
+            }
+            _ => None,
+        }
+    }
+
     /// Get the vector count (1 for scalars).
     pub fn count(&self) -> usize {
         match self {
@@ -407,8 +458,11 @@ impl DType {
     }
 
     pub fn is_float(&self) -> bool {
-        // Use base() to handle both Scalar and Vector types
         self.base().is_float()
+    }
+
+    pub fn is_fp8(&self) -> bool {
+        self.base().is_fp8()
     }
 
     pub fn min_value(&self) -> f64 {

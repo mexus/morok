@@ -66,7 +66,10 @@ pub use scheduler::Scheduler;
 pub use scheduler::clear_kernel_name_counts;
 pub use types::{AxisType, Opt, OptArg, OptOps};
 
-use crate::devectorize::{bool_storage_patterns, pm_reduce, pm_render, pm_wmma_accumulate};
+use crate::devectorize::{
+    Fp8DecompCtx, bool_storage_patterns, pm_float_decomp, pm_float_decomp_store, pm_reduce, pm_render,
+    pm_wmma_accumulate,
+};
 use crate::gpudims::pm_add_gpudims;
 use crate::passes::pm_linearize_multi_index;
 use crate::rangeify::patterns::{
@@ -301,8 +304,29 @@ pub fn apply_post_optimization_with_renderer(
         "Stage 18-19: after pm_decomp + pm_render"
     );
 
+    // FP8 float decomposition: promote FP8 computation to Float16 via bitwise conversion.
+    // Uses graph_rewrite_with_bpm: STORE pattern in bpm (sees ORIGINAL children to detect
+    // FP8 buffer ptrs), all other patterns in pm (sees OPTIMIZED children).
+    // Run once per FP8 type. Tinygrad: codegen/__init__.py:97-99
     let t_stage = std::time::Instant::now();
-    let bs = graph_rewrite(&bool_storage_patterns(), rendered, &mut ());
+    let fp8_pm = pm_float_decomp();
+    let fp8_bpm = pm_float_decomp_store();
+    let mut fp8_decomposed = rendered;
+    for (fr, to) in [
+        (morok_dtype::ScalarDType::FP8E5M2, morok_dtype::ScalarDType::Float16),
+        (morok_dtype::ScalarDType::FP8E4M3, morok_dtype::ScalarDType::Float16),
+    ] {
+        let mut ctx = Fp8DecompCtx { from: fr, to };
+        fp8_decomposed = morok_ir::rewrite::graph_rewrite_with_bpm(&fp8_pm, &fp8_bpm, fp8_decomposed, &mut ctx);
+    }
+    tracing::debug!(
+        ast.optimized = fp8_decomposed.tree(),
+        elapsed_ms = t_stage.elapsed().as_millis() as u64,
+        "after pm_float_decomp"
+    );
+
+    let t_stage = std::time::Instant::now();
+    let bs = graph_rewrite(&bool_storage_patterns(), fp8_decomposed, &mut ());
     tracing::debug!(
         ast.optimized = bs.tree(),
         elapsed_ms = t_stage.elapsed().as_millis() as u64,

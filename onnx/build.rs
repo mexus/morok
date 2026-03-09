@@ -94,6 +94,7 @@ fn should_skip(name: &str) -> bool {
         // Exotic dtype casts
         "test_cast_e8m0_",
         "test_cast_no_saturate_",
+        "test_castlike_no_saturate_",
     ];
 
     const SKIP_EXACT: &[&str] = &[
@@ -117,7 +118,7 @@ fn should_skip(name: &str) -> bool {
         "test_range_int32_type_negative_delta_expanded",
     ];
 
-    const SKIP_CONTAINS: &[&str] = &["FLOAT8", "INT4", "UINT4", "INT2", "UINT2", "FLOAT4E2M1", "FLOAT8E8M0", "COMPLEX"];
+    const SKIP_CONTAINS: &[&str] = &["INT4", "UINT4", "INT2", "UINT2", "FLOAT4E2M1", "FLOAT8E8M0", "COMPLEX", "FNUZ"];
 
     SKIP_PREFIXES.iter().any(|p| name.starts_with(p))
         || SKIP_EXACT.contains(&name)

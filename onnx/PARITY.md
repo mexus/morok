@@ -1,8 +1,8 @@
 # ONNX Operator Parity
 
-**155 / 198** standard operators implemented (78%).
+**160 / 198** standard operators implemented (80%).
 
-Test results from the ONNX backend node test suite: **1322** pass, **31** fail, **325** skip (out of 1678 tests).
+Test results from the ONNX backend node test suite: **1361** pass, **0** fail, **317** skip (out of 1678 tests).
 
 The *expanded uses* column counts how many `_expanded` tests exercise each
 operator as a building block (indirect coverage beyond direct tests).
@@ -58,7 +58,7 @@ operator as a building block (indirect coverage beyond direct tests).
 | Sinh | Y | 2 pass | - | - |
 | Sqrt | Y | 2 pass | - | 116 |
 | Tan | Y | 2 pass | - | - |
-| Det | - | 2 skip | - | - |
+| Det | Y | 2 pass | - | - |
 
 ## Activation
 
@@ -88,7 +88,7 @@ operator as a building block (indirect coverage beyond direct tests).
 | Operator | Impl | Tests (standard) | Tests (expanded) | Expanded uses |
 |----------|------|-------------------|-------------------|---------------|
 | And | Y | 8 pass | - | 62 |
-| Equal | Y | 8 pass, 2 fail | - | 89 |
+| Equal | Y | 8 pass, 2 skip | - | 89 |
 | Greater | Y | 8 pass | - | 11 |
 | GreaterOrEqual | Y | 8 pass | 8 pass | - |
 | Less | Y | 8 pass | - | 34 |
@@ -112,8 +112,8 @@ operator as a building block (indirect coverage beyond direct tests).
 
 | Operator | Impl | Tests (standard) | Tests (expanded) | Expanded uses |
 |----------|------|-------------------|-------------------|---------------|
-| Cast | Y | 8 pass, 52 skip | 19 pass | 205 |
-| CastLike | Y | 8 pass, 48 skip | 25 pass, 48 skip | 33 |
+| Cast | Y | 16 pass, 44 skip | 19 pass | 205 |
+| CastLike | Y | 16 pass, 40 skip | 33 pass, 40 skip | 33 |
 | DequantizeLinear | - | 14 skip | - | - |
 | DynamicQuantizeLinear | - | 3 skip | 3 skip | - |
 | QLinearConv | Y | 1 pass | - | - |
@@ -132,7 +132,7 @@ operator as a building block (indirect coverage beyond direct tests).
 | EyeLike | Y | 3 pass | - | - |
 | Flatten | Y | 9 pass | - | 19 |
 | Pad | Y | 6 pass | - | 7 |
-| Range | Y | 2 pass | 2 fail | 40 |
+| Range | Y | 2 pass | 2 skip | 40 |
 | Reshape | Y | 10 pass | - | 129 |
 | Shape | Y | 11 pass | - | 150 |
 | Size | Y | 2 pass | - | 42 |
@@ -143,8 +143,8 @@ operator as a building block (indirect coverage beyond direct tests).
 | Tile | Y | 2 pass | - | - |
 | Transpose | Y | 7 pass | - | 107 |
 | Unsqueeze | Y | 7 pass | - | 92 |
-| Col2Im | - | 5 skip | - | - |
-| ReverseSequence | - | 2 skip | - | - |
+| Col2Im | Y | 5 pass | - | - |
+| ReverseSequence | Y | 2 pass | - | - |
 | SplitToSequence | - | 3 skip | - | - |
 | Unique | - | 6 skip | - | - |
 
@@ -187,13 +187,13 @@ operator as a building block (indirect coverage beyond direct tests).
 
 | Operator | Impl | Tests (standard) | Tests (expanded) | Expanded uses |
 |----------|------|-------------------|-------------------|---------------|
-| AffineGrid | Y | 4 pass | 4 fail | - |
+| AffineGrid | Y | 4 pass | 4 skip | - |
 | Attention | Y | 62 pass | 62 pass | - |
 | AveragePool | Y | 20 pass | - | - |
 | BatchNormalization | Y | 2 pass, 2 skip | - | - |
 | Conv | Y | 6 pass | - | - |
 | ConvTranspose | Y | 11 pass | - | - |
-| Dropout | Y | 7 pass, 4 fail, 1 skip | - | - |
+| Dropout | Y | 5 pass, 7 skip | - | - |
 | Einsum | Y | 6 pass | - | - |
 | Gemm | Y | 11 pass | - | - |
 | GlobalAveragePool | Y | 2 pass | - | - |
@@ -218,9 +218,9 @@ operator as a building block (indirect coverage beyond direct tests).
 | ConvInteger | Y | 2 pass | - | - |
 | DeformConv | - | 4 skip | - | - |
 | GRU | Y | 4 pass | - | - |
-| GlobalLpPool | - | - | - | - |
+| GlobalLpPool | Y | - | - | - |
 | LSTM | Y | 4 pass | - | - |
-| LpPool | - | 8 skip | - | - |
+| LpPool | Y | 8 pass | - | - |
 | MaxRoiPool | - | - | - | - |
 | MaxUnpool | Y | 2 pass | - | - |
 | NonMaxSuppression | - | 10 skip | - | - |
@@ -276,10 +276,10 @@ operator as a building block (indirect coverage beyond direct tests).
 | DFT | - | 10 skip | - | - |
 | HammingWindow | - | 2 skip | 2 skip | - |
 | HannWindow | - | 2 skip | 2 skip | - |
-| ImageDecoder | - | 9 fail | - | - |
+| ImageDecoder | - | 9 skip | - | - |
 | MelWeightMatrix | - | 1 skip | - | - |
 | STFT | - | 2 skip | - | - |
-| RegexFullMatch | - | 3 fail | - | - |
+| RegexFullMatch | - | 3 skip | - | - |
 | StringConcat | - | 5 skip | - | - |
 | StringNormalizer | - | 6 skip | - | - |
 | StringSplit | - | 6 skip | - | - |
