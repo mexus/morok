@@ -9,6 +9,7 @@
 //! - Unsqueeze: Add dimensions of size 1
 
 use bon::bon;
+use snafu::ResultExt;
 use strum::{Display, EnumString};
 
 use super::*;

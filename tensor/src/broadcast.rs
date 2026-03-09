@@ -8,6 +8,8 @@
 //! This module provides the infrastructure for automatic broadcasting
 //! in binary operations, matching Tinygrad's architecture.
 
+use snafu::ResultExt;
+
 use super::*;
 use morok_ir::shape::{align_shapes_left, broadcast_shape};
 

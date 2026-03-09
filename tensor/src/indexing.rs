@@ -1,5 +1,6 @@
 //! Indexing operations for Tensors.
 
+use snafu::ResultExt;
 use strum::{Display, EnumString};
 
 use super::*;

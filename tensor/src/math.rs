@@ -6,6 +6,7 @@
 //! - Advanced math: erf (error function), reciprocal, square, sign
 
 use morok_ir::ConstValue;
+use snafu::ResultExt;
 
 use super::*;
 

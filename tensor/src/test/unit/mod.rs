@@ -5,6 +5,7 @@ pub mod broadcast;
 pub mod conditional;
 pub mod creation;
 pub mod cumsum;
+pub mod data;
 pub mod einsum;
 pub mod indexing;
 pub mod math;

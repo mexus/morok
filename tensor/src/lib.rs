@@ -1,8 +1,7 @@
 use bon::bon;
-use snafu::ResultExt;
 use std::sync::Arc;
 
-use morok_device::{Buffer, registry};
+use morok_device::Buffer;
 use morok_dtype::DType;
 use morok_dtype::ext::HasDType;
 use morok_ir::{ConstValue, DeviceSpec, SInt, UOp, shape::Shape};
@@ -15,6 +14,7 @@ pub mod arithmetic;
 pub mod bitwise;
 pub mod broadcast;
 pub mod conditional;
+pub mod data;
 pub mod einsum;
 pub mod indexing;
 pub mod math;
@@ -118,7 +118,6 @@ impl Clone for Tensor {
     }
 }
 
-#[bon]
 impl Tensor {
     /// Create tensor without buffer (for lazy computation graphs).
     fn new(uop: Arc<UOp>) -> Self {
@@ -297,106 +296,6 @@ impl Tensor {
         cumsum.try_add(&offset)?.cast(dtype)
     }
 
-    /// Create tensor from slice on CPU (default device).
-    ///
-    /// For explicit device specification, use `from_slice_with`.
-    ///
-    /// # Examples
-    /// ```ignore
-    /// let a = Tensor::from_slice(&[1.0f32, 2.0, 3.0]);
-    /// assert_eq!(a.device(), DeviceSpec::Cpu);
-    /// ```
-    pub fn from_slice<T: HasDType, C: AsRef<[T]>>(source: C) -> Self {
-        Self::from_slice_on(source, DeviceSpec::Cpu)
-    }
-
-    /// Create tensor from slice with explicit device specification using builder pattern.
-    ///
-    /// # Examples
-    /// ```ignore
-    /// // CPU tensor with builder
-    /// let a = Tensor::from_slice_with(&[1.0f32, 2.0, 3.0]).call();
-    ///
-    /// // Explicit device
-    /// let b = Tensor::from_slice_with(&[1.0f32, 2.0, 3.0])
-    ///     .device(DeviceSpec::Cuda { device_id: 0 })
-    ///     .call();
-    /// ```
-    #[builder]
-    pub fn from_slice_with<T: HasDType, C: AsRef<[T]>>(
-        source: C,
-        #[builder(default = DeviceSpec::Cpu)] device: DeviceSpec,
-    ) -> Self {
-        Self::from_slice_on(source, device)
-    }
-
-    /// Internal: Create tensor from slice on specified device.
-    fn from_slice_on<T: HasDType, C: AsRef<[T]>>(source: C, device: DeviceSpec) -> Self {
-        let source = source.as_ref();
-        let shape = Shape::from_iter([SInt::Const(source.len())]);
-        let dtype = T::DTYPE;
-
-        let buffer_uop = UOp::new_buffer(device.clone(), source.len(), dtype.clone());
-        let buffer_uop_id = buffer_uop.id;
-
-        // Get allocator for specified device
-        let allocator = match &device {
-            DeviceSpec::Cpu => registry::cpu().expect("CPU always should be accessible"),
-            // For non-CPU devices, try to get from registry or fall back to CPU for now
-            _ => registry::cpu().expect("CPU fallback for unsupported device"),
-        };
-
-        let mut buffer = Buffer::new(allocator, dtype.clone(), vec![source.len()], Default::default());
-        let bytes = unsafe { std::slice::from_raw_parts(source.as_ptr() as *const u8, source.len() * dtype.bytes()) };
-        buffer.copyin(bytes).expect("Buffer write always successful");
-
-        // Wrap buffer in Arc for RAII ownership
-        let buffer_arc = Arc::new(buffer);
-
-        let uop = buffer_uop.try_reshape(&shape).expect("this reshape is always successful");
-
-        // Register tensor with buffer (also adds to buffer index for schedule lookups)
-        let entry = tensor_registry::register_tensor_with_buffer(uop, buffer_arc.clone(), buffer_uop_id);
-        Self::with_buffer(entry, buffer_arc)
-    }
-
-    /// Create tensor from raw bytes with explicit dtype and shape.
-    ///
-    /// The bytes are interpreted as little-endian values of the given dtype.
-    /// Length must equal `product(shape) * dtype.bytes()`.
-    /// Used for types without a native Rust representation (Float16, BFloat16, FP8).
-    pub fn from_raw_bytes(data: &[u8], shape: &[usize], dtype: DType) -> Result<Self> {
-        let numel: usize = shape.iter().product();
-        let expected_bytes = numel * dtype.bytes();
-        if data.len() != expected_bytes {
-            return Err(error::Error::IrConstruction {
-                details: format!(
-                    "from_raw_bytes: data length {} != expected {} ({} elements * {} bytes)",
-                    data.len(),
-                    expected_bytes,
-                    numel,
-                    dtype.bytes()
-                ),
-            });
-        }
-
-        let flat_shape = Shape::from_iter([SInt::Const(numel)]);
-        let buffer_uop = UOp::new_buffer(DeviceSpec::Cpu, numel, dtype.clone());
-        let buffer_uop_id = buffer_uop.id;
-
-        let allocator = registry::cpu().expect("CPU always accessible");
-        let mut buffer = Buffer::new(allocator, dtype.clone(), vec![numel], Default::default());
-        buffer.copyin(data).expect("Buffer write always successful");
-
-        let buffer_arc = Arc::new(buffer);
-        let uop = buffer_uop.try_reshape(&flat_shape).expect("flat reshape always succeeds");
-
-        let entry = tensor_registry::register_tensor_with_buffer(uop, buffer_arc.clone(), buffer_uop_id);
-        let tensor = Self::with_buffer(entry, buffer_arc);
-        let isize_shape: Vec<isize> = shape.iter().map(|&d| d as isize).collect();
-        tensor.try_reshape(&isize_shape)
-    }
-
     // === Constant Constructors ===
 
     /// Create a scalar constant tensor.
@@ -436,18 +335,6 @@ impl Tensor {
     pub fn from_const<T: Into<ConstValue> + HasDType>(value: T) -> Self {
         let dtype = T::DTYPE;
         Self::const_(value, dtype)
-    }
-
-    /// Get a reference to the underlying buffer.
-    ///
-    /// Tensors own their buffers via RAII. Input tensors get their buffer
-    /// from `from_slice()`, realized tensors get theirs from `realize()`.
-    ///
-    /// Returns `None` for lazy tensors that haven't been realized yet.
-    /// Returns `Some(buffer)` for input tensors and realized tensors.
-    pub fn buffer(&self) -> Option<Buffer> {
-        // Tensor-owned buffer via RAII (no locks, no registry lookup)
-        self.buffer.as_ref().map(|arc_buf| (**arc_buf).clone())
     }
 
     /// Get device specification from underlying UOp graph.
@@ -500,67 +387,6 @@ impl Tensor {
     /// Bitcast tensor to a different dtype (reinterpret bits, same byte size required).
     pub fn bitcast(&self, dtype: morok_dtype::DType) -> Result<Self> {
         Ok(Self::new(self.uop().bitcast(dtype)))
-    }
-
-    /// Extract data as ndarray::ArrayD<T> (for testing).
-    ///
-    /// This method is primarily intended for testing and validation.
-    /// It extracts the computed tensor data into an ndarray with the proper shape.
-    ///
-    /// # Type Parameters
-    /// * `T` - The output type, must implement HasDType and match the tensor's dtype
-    ///
-    /// # Examples
-    /// ```ignore
-    /// let t = Tensor::from_slice(&[1.0f32, 2.0, 3.0]);
-    /// let result = t.realize()?.to_ndarray::<f32>()?;
-    /// assert_eq!(result.shape(), &[3]);
-    /// ```
-    ///
-    /// # Errors
-    /// Returns error if:
-    /// - Tensor has no buffer (unrealized)
-    /// - Type T doesn't match tensor's dtype
-    /// - Shape cannot be extracted
-    /// - Buffer read fails
-    pub fn to_ndarray<T: HasDType + Default + Clone>(&self) -> Result<ndarray::ArrayD<T>> {
-        use ndarray::{ArrayD, IxDyn};
-
-        // If no buffer, materialize the tensor.
-        // Get shape first to check for zero-size tensors
-        let uop = self.uop();
-        let shape = uop.shape().context(UOpSnafu)?.ok_or(Error::NoShape)?;
-        let dims: Vec<usize> = shape.iter().map(|dim| dim.as_const().unwrap_or(1)).collect();
-
-        // Zero-size tensor: return empty ndarray without realization (matches Tinygrad)
-        if dims.contains(&0) {
-            let arr = ArrayD::from_shape_vec(IxDyn(&dims), vec![]).context(NdarrayShapeSnafu)?;
-            return Ok(arr);
-        }
-
-        // Following Tinygrad's approach: `.numpy()` always calls `.contiguous().realize()`.
-        // Never use a cached buffer directly — movement ops (permute, shrink, pad, etc.)
-        // change the logical-to-physical mapping, so the underlying buffer may not match
-        // the tensor's logical shape.
-        let realized = self.clone().contiguous().realize()?;
-        let buffer = realized.buffer().ok_or(Error::NoBuffer)?;
-
-        // Validate dtype matches
-        if buffer.dtype() != T::DTYPE {
-            return TypeMismatchSnafu { expected: T::DTYPE, actual: buffer.dtype() }.fail();
-        }
-
-        // Extract data
-        let count = buffer.size() / T::DTYPE.bytes();
-        let mut data = vec![T::default(); count];
-        buffer
-            .copyout(unsafe { std::slice::from_raw_parts_mut(data.as_mut_ptr() as *mut u8, count * T::DTYPE.bytes()) })
-            .context(DeviceSnafu)?;
-
-        // Create ndarray with proper shape
-        let arr = ArrayD::from_shape_vec(IxDyn(&dims), data).context(NdarrayShapeSnafu)?;
-
-        Ok(arr)
     }
 
     /// Update the UOp for this tensor directly.

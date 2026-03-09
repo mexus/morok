@@ -3,6 +3,8 @@
 //! This module provides bitwise operations: AND, OR, XOR, left shift, right shift.
 //! All operations require integer or boolean dtypes.
 
+use snafu::ResultExt;
+
 use super::*;
 
 impl Tensor {
