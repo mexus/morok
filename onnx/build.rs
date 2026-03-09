@@ -83,8 +83,6 @@ fn should_skip(name: &str) -> bool {
         "test_dft",
         "test_stft",
         "test_melweight",
-        // Matrix determinant
-        "test_det_",
         // Window functions
         "test_hannwindow",
         "test_hammingwindow",

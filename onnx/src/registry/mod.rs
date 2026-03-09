@@ -166,6 +166,7 @@ impl OpRegistry {
             "Asinh" => inp(inputs, 0).asinh()?,
             "Acosh" => inp(inputs, 0).acosh()?,
             "Atanh" => inp(inputs, 0).atanh()?,
+            "Det" => inp(inputs, 0).det()?,
             "IsNaN" => inp(inputs, 0).isnan()?,
             "IsInf" => {
                 let detect_negative = get_attr_int(node, "detect_negative", 1) == 1;

@@ -387,11 +387,12 @@ impl Tensor {
         strides: Option<&[i64]>,
         dilations: Option<&[i64]>,
     ) -> Result<Tensor> {
-        let n = kernel_shape.len();
+        assert!(p >= 1, "LpPool requires p >= 1");
+        let n_spatial = kernel_shape.len();
         let strides_u: Vec<usize> =
-            strides.map(|s| s.iter().map(|&v| v as usize).collect()).unwrap_or_else(|| vec![1; n]);
+            strides.map(|s| s.iter().map(|&v| v as usize).collect()).unwrap_or_else(|| vec![1; n_spatial]);
         let dilations_u: Vec<usize> =
-            dilations.map(|d| d.iter().map(|&v| v as usize).collect()).unwrap_or_else(|| vec![1; n]);
+            dilations.map(|d| d.iter().map(|&v| v as usize).collect()).unwrap_or_else(|| vec![1; n_spatial]);
         let x_shape = self.shape()?;
         let input_spatial: Vec<usize> = x_shape[2..].iter().map(|s| s.as_const().unwrap()).collect();
         let empty_pads: Vec<i64> = vec![];
@@ -403,24 +404,34 @@ impl Tensor {
             &strides_u,
             auto_pad,
         );
-        // LpPool = (kernel_count * avg_pool(|x|^p))^(1/p)
+
         let p_f = p as f64;
         let dtype = self.uop().dtype();
         let p_tensor = Tensor::const_(p_f, dtype.clone());
         let inv_p = Tensor::const_(1.0 / p_f, dtype);
         let x_abs_p = self.try_abs()?.try_pow(&p_tensor)?;
-        let avg = x_abs_p
-            .avg_pool2d()
-            .kernel_size(kernel_shape)
-            .stride(&strides_u)
-            .dilation(&dilations_u)
-            .padding(&padding)
-            .ceil_mode(ceil_mode)
-            .count_include_pad(true)
-            .call()?;
-        let kernel_count: usize = kernel_shape.iter().product();
-        let scale = Tensor::const_(kernel_count as f64, avg.uop().dtype());
-        avg.try_mul(&scale)?.try_pow(&inv_p)
+
+        // Pad, pool (create windows), then sum over kernel axes.
+        // This computes sum(|x|^p) directly — correct for all padding/ceil modes
+        // because padded zeros contribute 0 to the sum.
+        let reg_pads = padding;
+        let ceil_pads = if ceil_mode {
+            pad::apply_ceil_mode(&reg_pads, &input_spatial, kernel_shape, &strides_u, &dilations_u)
+        } else {
+            reg_pads.clone()
+        };
+        let pads_to_use = if ceil_mode { &ceil_pads } else { &reg_pads };
+        let mut padded = x_abs_p;
+        if pads_to_use.iter().any(|&(b, e)| b != 0 || e != 0) {
+            let n_batch = x_shape.len() - n_spatial;
+            let mut full_pad: Vec<(isize, isize)> = vec![(0, 0); n_batch];
+            full_pad.extend_from_slice(pads_to_use);
+            padded = padded.try_pad(&full_pad)?;
+        }
+        let pooled = padded.pool(kernel_shape, &strides_u, &dilations_u)?;
+        let reduce_axes: Vec<isize> = (0..n_spatial).map(|j| -(1 + j as isize)).collect();
+        let sum_p = pooled.sum(crate::reduce::AxisSpec::Multiple(reduce_axes))?;
+        sum_p.try_pow(&inv_p)
     }
 
     /// Max pooling with ONNX-style parameters. Always returns `(values, indices)`. Wraps `max_pool2d_with_indices`.
