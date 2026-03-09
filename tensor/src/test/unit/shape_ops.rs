@@ -156,16 +156,14 @@ fn test_permute_space_to_depth() {
     let data: Vec<f32> = vec![
         0., 6., 1., 7., 2., 8., 12., 18., 13., 19., 14., 20., 3., 9., 4., 10., 5., 11., 15., 21., 16., 22., 17., 23.,
     ];
-    let x = Tensor::from_slice(data).try_reshape(&[1, 1, 4, 6]).unwrap();
+    let x = Tensor::from_ndarray(&ndarray::Array4::from_shape_vec((1, 1, 4, 6), data).unwrap());
 
     let step1 = x.try_reshape(&[1, 1, 2, 2, 3, 2]).unwrap();
     let step2 = step1.try_permute(&[0, 3, 5, 1, 2, 4]).unwrap();
     let result = step2.try_reshape(&[1, 4, 2, 3]).unwrap();
 
-    let arr = result.realize().unwrap().to_ndarray::<f32>().unwrap();
     let expected: Vec<f32> = (0..24).map(|i| i as f32).collect();
-    let actual: Vec<f32> = arr.iter().copied().collect();
-    assert_eq!(actual, expected, "SpaceToDepth reshape+permute+reshape failed");
+    assert_eq!(result.to_vec::<f32>().unwrap(), expected, "SpaceToDepth reshape+permute+reshape failed");
 }
 
 // =========================================================================
@@ -665,35 +663,26 @@ fn test_shape_tensor_1d() {
     assert_eq!(get_shape(&shape), vec![1]);
 
     // Verify shape tensor contains [3]
-    let realized = shape.realize().unwrap().to_ndarray::<i64>().unwrap();
-    assert_eq!(realized.shape(), &[1]);
-    assert_eq!(realized[0], 3);
+    assert_eq!(shape.to_vec::<i64>().unwrap(), [3]);
 }
 
 #[test]
 fn test_shape_tensor_2d() {
-    let t = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]).try_reshape(&[2, 3]).unwrap();
+    let t = Tensor::from_ndarray(&ndarray::array![[1.0f32, 2.0, 3.0], [4.0, 5.0, 6.0]]);
     let shape = t.shape_tensor().unwrap();
 
     assert_eq!(get_shape(&shape), vec![2]);
 
     // Verify shape tensor contains [2, 3]
-    let realized = shape.realize().unwrap().to_ndarray::<i64>().unwrap();
-    assert_eq!(realized.shape(), &[2]);
-    assert_eq!(realized[0], 2);
-    assert_eq!(realized[1], 3);
+    assert_eq!(shape.to_vec::<i64>().unwrap(), [2, 3]);
 }
 
 #[test]
 fn test_shape_tensor_3d() {
-    let t = Tensor::from_slice([1.0f32; 24]).try_reshape(&[2, 3, 4]).unwrap();
+    let t = Tensor::from_ndarray(&ndarray::Array3::<f32>::ones((2, 3, 4)));
     let shape = t.shape_tensor().unwrap();
 
-    let realized = shape.realize().unwrap().to_ndarray::<i64>().unwrap();
-    assert_eq!(realized.shape(), &[3]);
-    assert_eq!(realized[0], 2);
-    assert_eq!(realized[1], 3);
-    assert_eq!(realized[2], 4);
+    assert_eq!(shape.to_vec::<i64>().unwrap(), [2, 3, 4]);
 }
 
 #[test]

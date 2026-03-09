@@ -12,6 +12,7 @@
 use crate::Tensor;
 use crate::test::helpers::*;
 use morok_dtype::DType;
+use ndarray::Array2;
 use test_case::test_case;
 
 // =========================================================================
@@ -25,15 +26,14 @@ fn test_realized_matrix_matmul(n: usize) {
     test_setup();
 
     let data: Vec<f32> = (0..n * n).map(|i| i as f32 * 0.1).collect();
-    let matrix = Tensor::from_slice(&data).try_reshape(&[n as isize, n as isize]).unwrap();
+    let matrix = Tensor::from_ndarray(&Array2::from_shape_vec((n, n), data).unwrap());
 
-    let x = Tensor::from_slice(vec![1.0f32; n]).try_reshape(&[n as isize, 1]).unwrap();
+    let x = Tensor::from_ndarray(&Array2::from_shape_vec((n, 1), vec![1.0f32; n]).unwrap());
 
     let out = matrix.dot(&x).unwrap().try_reshape(&[n as isize]).unwrap();
 
     let result = out.realize().expect("realized matrix matmul");
-    let arr = result.to_ndarray::<f32>().unwrap();
-    assert_eq!(arr.len(), n);
+    assert_eq!(result.to_vec::<f32>().unwrap().len(), n);
 }
 
 /// Unary on buffer-rooted matrix, then matmul. Works because the
@@ -44,15 +44,14 @@ fn test_unary_on_buffer_rooted_matmul(n: usize) {
     test_setup();
 
     let data: Vec<f32> = (0..n * n).map(|i| i as f32 * 0.1).collect();
-    let matrix = Tensor::from_slice(&data).try_reshape(&[n as isize, n as isize]).unwrap().cos().unwrap();
+    let matrix = Tensor::from_ndarray(&Array2::from_shape_vec((n, n), data).unwrap()).cos().unwrap();
 
-    let x = Tensor::from_slice(vec![1.0f32; n]).try_reshape(&[n as isize, 1]).unwrap();
+    let x = Tensor::from_ndarray(&Array2::from_shape_vec((n, 1), vec![1.0f32; n]).unwrap());
 
     let out = matrix.dot(&x).unwrap().try_reshape(&[n as isize]).unwrap();
 
     let result = out.realize().expect("unary on buffer-rooted matmul");
-    let arr = result.to_ndarray::<f32>().unwrap();
-    assert_eq!(arr.len(), n);
+    assert_eq!(result.to_vec::<f32>().unwrap().len(), n);
 }
 
 /// Element-wise diamond (no matmul): cos(t) + sin(t). Always works.
@@ -60,15 +59,14 @@ fn test_unary_on_buffer_rooted_matmul(n: usize) {
 fn test_diamond_elementwise_no_matmul() {
     test_setup();
 
-    let t = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0]).try_reshape(&[2, 2]).unwrap();
+    let t = Tensor::from_ndarray(&Array2::from_shape_vec((2, 2), vec![1.0f32, 2.0, 3.0, 4.0]).unwrap());
 
     let out = t.cos().unwrap().try_add(&t.sin().unwrap()).unwrap();
 
     let result = out.realize().expect("diamond elementwise");
-    let arr = result.to_ndarray::<f32>().unwrap();
 
     let expected: Vec<f32> = [1.0f32, 2.0, 3.0, 4.0].iter().map(|x| x.cos() + x.sin()).collect();
-    assert_close_f32(&arr, &expected, 1e-5);
+    assert_close_f32(&result.to_vec::<f32>().unwrap(), &expected, 1e-5);
 }
 
 // =========================================================================
@@ -102,13 +100,12 @@ fn test_lazy_outer_product_matmul(n: usize) {
     let j = indices.try_reshape(&[1, n as isize]).unwrap();
     let matrix = k.try_mul(&j).unwrap();
 
-    let x = Tensor::from_slice(vec![1.0f32; n]).try_reshape(&[n as isize, 1]).unwrap();
+    let x = Tensor::from_ndarray(&Array2::from_shape_vec((n, 1), vec![1.0f32; n]).unwrap());
 
     let out = matrix.dot(&x).unwrap().try_reshape(&[n as isize]).unwrap();
 
     let result = out.realize().expect("lazy outer product matmul");
-    let arr = result.to_ndarray::<f32>().unwrap();
-    assert_eq!(arr.len(), n);
+    assert_eq!(result.to_vec::<f32>().unwrap().len(), n);
 }
 
 /// Lazy outer product → unary → matmul.
@@ -122,13 +119,12 @@ fn test_lazy_outer_product_unary_matmul(n: usize) {
     let j = indices.try_reshape(&[1, n as isize]).unwrap();
     let matrix = k.try_mul(&j).unwrap().cos().unwrap();
 
-    let x = Tensor::from_slice(vec![1.0f32; n]).try_reshape(&[n as isize, 1]).unwrap();
+    let x = Tensor::from_ndarray(&Array2::from_shape_vec((n, 1), vec![1.0f32; n]).unwrap());
 
     let out = matrix.dot(&x).unwrap().try_reshape(&[n as isize]).unwrap();
 
     let result = out.realize().expect("lazy outer product unary matmul");
-    let arr = result.to_ndarray::<f32>().unwrap();
-    assert_eq!(arr.len(), n);
+    assert_eq!(result.to_vec::<f32>().unwrap().len(), n);
 }
 
 /// Full DFT pattern: cos(angles) @ x + sin(angles) @ x.
@@ -146,11 +142,10 @@ fn test_dft_pattern(n: usize) {
     let cos_w = angles.cos().unwrap();
     let sin_w = angles.sin().unwrap();
 
-    let x = Tensor::from_slice(vec![1.0f32; n]).try_reshape(&[n as isize, 1]).unwrap();
+    let x = Tensor::from_ndarray(&Array2::from_shape_vec((n, 1), vec![1.0f32; n]).unwrap());
 
     let out = cos_w.dot(&x).unwrap().try_add(&sin_w.dot(&x).unwrap()).unwrap().try_reshape(&[n as isize]).unwrap();
 
     let result = out.realize().expect("DFT pattern");
-    let arr = result.to_ndarray::<f32>().unwrap();
-    assert_eq!(arr.len(), n);
+    assert_eq!(result.to_vec::<f32>().unwrap().len(), n);
 }
