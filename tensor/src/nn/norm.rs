@@ -1,15 +1,17 @@
 //! Normalization: layernorm, rms_norm, group_norm.
 
+use bon::bon;
 use morok_dtype::DType;
 use morok_ir::{ConstValue, UOp};
 use snafu::ResultExt;
 
 use crate::Tensor;
-use crate::error::UOpSnafu;
+use crate::error::{NdimMinimumSnafu, ParamRangeSnafu, UOpSnafu};
 use crate::reduce::AxisSpec;
 
 type Result<T> = crate::Result<T>;
 
+#[bon]
 impl Tensor {
     /// Layer normalization over axes [axis..ndim). Casts to f32 internally.
     pub fn layernorm(&self, axis: isize, eps: f64) -> Result<Tensor> {
@@ -63,12 +65,44 @@ impl Tensor {
         self.try_mul(&norm)
     }
 
+    /// Lp normalization along an axis.
+    pub fn lp_normalize(&self, axis: isize, p: i64) -> Result<Tensor> {
+        let norm = match p {
+            1 => self.try_abs()?.sum_with().axes(AxisSpec::Single(axis)).keepdim(true).call()?,
+            _ => self.square()?.sum_with().axes(AxisSpec::Single(axis)).keepdim(true).call()?.try_sqrt()?,
+        };
+        let eps = self.uop().dtype().base().min_positive();
+        self.try_div(&norm.try_add(&Tensor::const_(eps, self.uop().dtype()))?)
+    }
+
+    /// Mean Variance Normalization.
+    pub fn mean_variance_normalize(&self, axes: &[isize], eps: f64) -> Result<Tensor> {
+        let axes_spec = AxisSpec::Multiple(axes.to_vec());
+        let mean = self.mean_with().axes(axes_spec.clone()).keepdim(true).call()?;
+        let centered = self.try_sub(&mean)?;
+        let pop_std = centered.square()?.mean_with().axes(axes_spec).keepdim(true).call()?.try_sqrt()?;
+        let eps = Tensor::const_(eps, self.uop().dtype());
+        centered.try_div(&pop_std.try_add(&eps)?)
+    }
+
     /// Group normalization: reshape → layernorm → scale + bias.
     /// Matches Tinygrad's ONNX `GroupNormalization` pattern.
     /// Casts to f32 internally for numerical stability.
-    pub fn group_norm(&self, scale: &Tensor, bias: &Tensor, num_groups: usize, eps: f64) -> Result<Tensor> {
+    #[builder]
+    pub fn group_norm(
+        &self,
+        scale: &Tensor,
+        bias: &Tensor,
+        num_groups: usize,
+        #[builder(default = 1e-5)] eps: f64,
+    ) -> Result<Tensor> {
         let x_shape = self.shape()?;
         let ndim = x_shape.len();
+        snafu::ensure!(ndim >= 2, NdimMinimumSnafu { op: "group_norm", min: 2_usize, actual: ndim });
+        snafu::ensure!(
+            num_groups > 0,
+            ParamRangeSnafu { op: "group_norm", param: "num_groups", value: num_groups.to_string(), constraint: "> 0" }
+        );
         let batch = x_shape[0].as_const().unwrap();
 
         // Reshape to (batch, num_groups, -1), cast to f32 before layernorm

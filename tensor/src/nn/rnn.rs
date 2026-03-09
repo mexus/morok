@@ -1,3 +1,7 @@
+use bon::bon;
+
+use crate::error::{NdimExactSnafu, ParamRangeSnafu};
+
 use super::*;
 
 /// Output of an RNN forward pass.
@@ -26,6 +30,7 @@ pub struct LstmOutput {
     pub y_c: Tensor,
 }
 
+#[bon]
 impl Tensor {
     /// Simple RNN (Elman network).
     ///
@@ -38,15 +43,22 @@ impl Tensor {
     /// - `bias`: optional bias `[num_directions, 2 * hidden_size]` (Wb ++ Rb)
     /// - `initial_h`: optional initial hidden state `[num_directions, batch_size, hidden_size]`
     /// - `layout`: 0 = seq-first (default), 1 = batch-first
+    #[builder]
     pub fn rnn(
         &self,
         w: &Tensor,
         r: &Tensor,
+        hidden_size: usize,
         bias: Option<&Tensor>,
         initial_h: Option<&Tensor>,
-        hidden_size: usize,
-        layout: usize,
+        #[builder(default = 0)] layout: usize,
     ) -> Result<RnnOutput> {
+        let ndim = self.ndim()?;
+        snafu::ensure!(ndim == 3, NdimExactSnafu { op: "rnn", expected: 3_usize, actual: ndim });
+        snafu::ensure!(
+            hidden_size > 0,
+            ParamRangeSnafu { op: "rnn", param: "hidden_size", value: hidden_size.to_string(), constraint: "> 0" }
+        );
         let x = if layout != 0 { self.try_permute(&[1, 0, 2])? } else { self.clone() };
         let x_shape = x.shape()?;
         let seq_length = x_shape[0].as_const().expect("static seq_length");
@@ -55,7 +67,15 @@ impl Tensor {
         let num_directions = w.shape()?[0].as_const().expect("static num_directions");
         let dtype = x.uop().dtype();
 
-        assert_eq!(num_directions, 1, "RNN: only forward direction supported");
+        snafu::ensure!(
+            num_directions == 1,
+            ParamRangeSnafu {
+                op: "rnn",
+                param: "num_directions",
+                value: num_directions.to_string(),
+                constraint: "== 1"
+            }
+        );
 
         let w0 = w.try_squeeze(Some(0))?; // [hidden, input]
         let r0 = r.try_squeeze(Some(0))?; // [hidden, hidden]
@@ -130,16 +150,23 @@ impl Tensor {
     /// - `initial_h`: optional `[num_directions, batch_size, hidden_size]`
     /// - `linear_before_reset`: 0 (default) or 1
     /// - `layout`: 0 = seq-first (default), 1 = batch-first
+    #[builder]
     pub fn gru(
         &self,
         w: &Tensor,
         r_weights: &Tensor,
+        hidden_size: usize,
         bias: Option<&Tensor>,
         initial_h: Option<&Tensor>,
-        hidden_size: usize,
-        linear_before_reset: usize,
-        layout: usize,
+        #[builder(default = 0)] linear_before_reset: usize,
+        #[builder(default = 0)] layout: usize,
     ) -> Result<GruOutput> {
+        let ndim = self.ndim()?;
+        snafu::ensure!(ndim == 3, NdimExactSnafu { op: "gru", expected: 3_usize, actual: ndim });
+        snafu::ensure!(
+            hidden_size > 0,
+            ParamRangeSnafu { op: "gru", param: "hidden_size", value: hidden_size.to_string(), constraint: "> 0" }
+        );
         let x = if layout != 0 { self.try_permute(&[1, 0, 2])? } else { self.clone() };
         let x_shape = x.shape()?;
         let seq_length = x_shape[0].as_const().expect("static seq_length");
@@ -148,7 +175,15 @@ impl Tensor {
         let num_directions = w.shape()?[0].as_const().expect("static num_directions");
         let dtype = x.uop().dtype();
 
-        assert_eq!(num_directions, 1, "GRU: only forward direction supported");
+        snafu::ensure!(
+            num_directions == 1,
+            ParamRangeSnafu {
+                op: "gru",
+                param: "num_directions",
+                value: num_directions.to_string(),
+                constraint: "== 1"
+            }
+        );
 
         let w0 = w.try_squeeze(Some(0))?; // [3*hidden, input]
         let r0 = r_weights.try_squeeze(Some(0))?; // [3*hidden, hidden]
@@ -259,17 +294,24 @@ impl Tensor {
     /// - `initial_c`: optional `[num_directions, batch_size, hidden_size]`
     /// - `peepholes`: optional `[num_directions, 3*hidden_size]` (p_i, p_o, p_f)
     /// - `layout`: 0 = seq-first (default), 1 = batch-first
+    #[builder]
     pub fn lstm(
         &self,
         w: &Tensor,
         r: &Tensor,
+        hidden_size: usize,
         bias: Option<&Tensor>,
         initial_h: Option<&Tensor>,
         initial_c: Option<&Tensor>,
         peepholes: Option<&Tensor>,
-        hidden_size: usize,
-        layout: usize,
+        #[builder(default = 0)] layout: usize,
     ) -> Result<LstmOutput> {
+        let ndim = self.ndim()?;
+        snafu::ensure!(ndim == 3, NdimExactSnafu { op: "lstm", expected: 3_usize, actual: ndim });
+        snafu::ensure!(
+            hidden_size > 0,
+            ParamRangeSnafu { op: "lstm", param: "hidden_size", value: hidden_size.to_string(), constraint: "> 0" }
+        );
         let x = if layout != 0 {
             self.try_permute(&[1, 0, 2])? // batch-first → seq-first
         } else {
@@ -282,7 +324,15 @@ impl Tensor {
         let num_directions = w.shape()?[0].as_const().expect("static num_directions");
         let dtype = x.uop().dtype();
 
-        assert_eq!(num_directions, 1, "LSTM: only forward direction supported");
+        snafu::ensure!(
+            num_directions == 1,
+            ParamRangeSnafu {
+                op: "lstm",
+                param: "num_directions",
+                value: num_directions.to_string(),
+                constraint: "== 1"
+            }
+        );
 
         let w0 = w.try_squeeze(Some(0))?; // [4*hidden, input]
         let r0 = r.try_squeeze(Some(0))?; // [4*hidden, hidden]

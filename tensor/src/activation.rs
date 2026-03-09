@@ -202,6 +202,15 @@ impl Tensor {
         half.try_mul(&x_times)
     }
 
+    /// Exact GELU: `0.5 * x * (1 + erf(x / sqrt(2)))`.
+    pub fn gelu_exact(&self) -> Result<Self> {
+        let dtype = self.uop().dtype();
+        let half = Tensor::const_(0.5f64, dtype.clone());
+        let one = Tensor::const_(1.0f64, dtype.clone());
+        let sqrt2 = Tensor::const_(std::f64::consts::SQRT_2, dtype);
+        half.try_mul(self)?.try_mul(&one.try_add(&self.try_div(&sqrt2)?.erf()?)?)
+    }
+
     /// Hard Sigmoid: `clamp(alpha * x + beta, 0, 1)`.
     ///
     /// Piecewise linear approximation of sigmoid. Faster to compute.

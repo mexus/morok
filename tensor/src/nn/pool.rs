@@ -6,7 +6,7 @@ use morok_ir::{ConstValue, UOp};
 use snafu::ResultExt;
 
 use crate::Tensor;
-use crate::error::UOpSnafu;
+use crate::error::{DivisibilitySnafu, UOpSnafu};
 use crate::reduce::AxisSpec;
 
 use super::pad::apply_ceil_mode;
@@ -441,6 +441,16 @@ impl Tensor {
         let n = shape[0].as_const().unwrap();
         let c_times_bl: usize = shape[1].as_const().unwrap();
         let bl: usize = block_shape.iter().product();
+        snafu::ensure!(
+            c_times_bl.is_multiple_of(bl),
+            DivisibilitySnafu {
+                op: "col2im",
+                lhs_name: "C*block_size",
+                lhs: c_times_bl,
+                rhs_name: "block_size",
+                rhs: bl
+            }
+        );
         let c = c_times_bl / bl;
 
         // Padded image shape (reconstruct in padded space, shrink at end)
@@ -480,11 +490,11 @@ impl Tensor {
             // Extract slice for this kernel position: [N*C, *L_spatial]
             // Shrink block dims (dims 1..n_spatial) to singletons, keep L_spatial dims
             let mut shrink_ranges: Vec<(isize, isize)> = vec![(0, nc as isize)];
-            for j in 0..n_spatial {
-                shrink_ranges.push((kpos[j] as isize, kpos[j] as isize + 1));
+            for &k in kpos.iter().take(n_spatial) {
+                shrink_ranges.push((k as isize, k as isize + 1));
             }
-            for j in 0..n_spatial {
-                shrink_ranges.push((0, l_spatial[j] as isize));
+            for &l in l_spatial.iter().take(n_spatial) {
+                shrink_ranges.push((0, l as isize));
             }
             let slice = data.try_shrink(&shrink_ranges)?;
             // Squeeze block dims → [N*C, *L_spatial]

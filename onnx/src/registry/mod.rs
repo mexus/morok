@@ -21,15 +21,6 @@ use morok_tensor::reduce::AxisSpec;
 use crate::error::{Error, Result, UnsupportedOpSnafu};
 use crate::parser::onnx::NodeProto;
 
-/// Exact GELU: `0.5 * x * (1 + erf(x / sqrt(2)))`.
-fn exact_gelu(x: &Tensor) -> Result<Tensor> {
-    let dtype = x.uop().dtype();
-    let half = Tensor::const_(0.5f64, dtype.clone());
-    let one = Tensor::const_(1.0f64, dtype.clone());
-    let sqrt2 = Tensor::const_(std::f64::consts::SQRT_2, dtype);
-    Ok(half.try_mul(x)?.try_mul(&one.try_add(&x.try_div(&sqrt2)?.erf()?)?)?)
-}
-
 /// Fold a variadic list of tensors with a binary operation.
 fn fold_variadic(
     inputs: &[Option<Tensor>],
@@ -192,7 +183,7 @@ impl OpRegistry {
             }
             "Gelu" => {
                 let approximate = attrs.string("approximate", "none");
-                vec![if approximate == "tanh" { inp(inputs, 0).gelu()? } else { exact_gelu(inp(inputs, 0))? }]
+                vec![if approximate == "tanh" { inp(inputs, 0).gelu()? } else { inp(inputs, 0).gelu_exact()? }]
             }
             "HardSigmoid" => {
                 let alpha = attrs.float("alpha", 0.2) as f64;
@@ -366,10 +357,7 @@ impl OpRegistry {
                     details: format!("Gather requires concrete dimension on axis {norm_axis}"),
                 })? as i64;
                 // Normalize negative indices
-                let zero = Tensor::const_(ConstValue::Int(0), idx.uop().dtype());
-                let dim_t = Tensor::const_(ConstValue::Int(dim_size), idx.uop().dtype());
-                let neg_mask = idx.try_lt(&zero)?;
-                let idx = idx.try_add(&dim_t)?.where_(&neg_mask, idx)?;
+                let idx = idx.normalize_negative_indices(dim_size)?;
                 // Flatten indices → index_select → reshape to insert indices shape
                 let idx_shape = idx.shape()?;
                 let idx_shape_concrete: Vec<usize> = idx_shape.iter().map(|d| d.as_const().unwrap()).collect();
@@ -520,14 +508,15 @@ impl OpRegistry {
                 let _activations_beta = attrs.floats("activation_beta");
                 let _activations_list = attrs.ints("activations"); // consume but ignore
                 let _clip = attrs.float("clip", 0.0);
-                let out = inp(inputs, 0).rnn(
-                    inp(inputs, 1),
-                    inp(inputs, 2),
-                    inputs.get(3).and_then(|o| o.as_ref()),
-                    inputs.get(5).and_then(|o| o.as_ref()),
-                    hidden_size,
-                    layout,
-                )?;
+                let out = inp(inputs, 0)
+                    .rnn()
+                    .w(inp(inputs, 1))
+                    .r(inp(inputs, 2))
+                    .hidden_size(hidden_size)
+                    .maybe_bias(inputs.get(3).and_then(|o| o.as_ref()))
+                    .maybe_initial_h(inputs.get(5).and_then(|o| o.as_ref()))
+                    .layout(layout)
+                    .call()?;
                 vec![out.y, out.y_h]
             }
             "GRU" => {
@@ -539,15 +528,16 @@ impl OpRegistry {
                 let _activations_beta = attrs.floats("activation_beta");
                 let _activations_list = attrs.ints("activations");
                 let _clip = attrs.float("clip", 0.0);
-                let out = inp(inputs, 0).gru(
-                    inp(inputs, 1),
-                    inp(inputs, 2),
-                    inputs.get(3).and_then(|o| o.as_ref()), // B
-                    inputs.get(5).and_then(|o| o.as_ref()), // initial_h
-                    hidden_size,
-                    linear_before_reset,
-                    layout,
-                )?;
+                let out = inp(inputs, 0)
+                    .gru()
+                    .w(inp(inputs, 1))
+                    .r_weights(inp(inputs, 2))
+                    .hidden_size(hidden_size)
+                    .maybe_bias(inputs.get(3).and_then(|o| o.as_ref()))
+                    .maybe_initial_h(inputs.get(5).and_then(|o| o.as_ref()))
+                    .linear_before_reset(linear_before_reset)
+                    .layout(layout)
+                    .call()?;
                 vec![out.y, out.y_h]
             }
             "LSTM" => {
@@ -559,16 +549,17 @@ impl OpRegistry {
                 let _activations_list = attrs.ints("activations");
                 let _clip = attrs.float("clip", 0.0);
                 let _input_forget = attrs.int("input_forget", 0);
-                let out = inp(inputs, 0).lstm(
-                    inp(inputs, 1),
-                    inp(inputs, 2),
-                    inputs.get(3).and_then(|o| o.as_ref()), // B
-                    inputs.get(5).and_then(|o| o.as_ref()), // initial_h
-                    inputs.get(6).and_then(|o| o.as_ref()), // initial_c
-                    inputs.get(7).and_then(|o| o.as_ref()), // P
-                    hidden_size,
-                    layout,
-                )?;
+                let out = inp(inputs, 0)
+                    .lstm()
+                    .w(inp(inputs, 1))
+                    .r(inp(inputs, 2))
+                    .hidden_size(hidden_size)
+                    .maybe_bias(inputs.get(3).and_then(|o| o.as_ref()))
+                    .maybe_initial_h(inputs.get(5).and_then(|o| o.as_ref()))
+                    .maybe_initial_c(inputs.get(6).and_then(|o| o.as_ref()))
+                    .maybe_peepholes(inputs.get(7).and_then(|o| o.as_ref()))
+                    .layout(layout)
+                    .call()?;
                 vec![out.y, out.y_h, out.y_c]
             }
             "Conv" => vec![nn::op_conv(inputs, &mut attrs)?],
@@ -654,7 +645,7 @@ impl OpRegistry {
             "BiasGelu" => {
                 let xb = inp(inputs, 0).try_add(inp(inputs, 1))?;
                 let approximate = attrs.string("approximate", "none");
-                vec![if approximate == "tanh" { xb.gelu()? } else { exact_gelu(&xb)? }]
+                vec![if approximate == "tanh" { xb.gelu()? } else { xb.gelu_exact()? }]
             }
             "FastGelu" => {
                 let x = inp(inputs, 0);

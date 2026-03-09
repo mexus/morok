@@ -154,111 +154,15 @@ pub(crate) fn op_slice(inputs: &[Option<Tensor>]) -> Result<Tensor> {
     let data = inp(inputs, 0);
     let starts = tensor_to_i64_vec(inp(inputs, 1))?;
     let ends = tensor_to_i64_vec(inp(inputs, 2))?;
-    let shape = data.shape()?;
-    let ndim = shape.len();
-
-    let axes: Vec<usize> = inputs
-        .get(3)
-        .and_then(|o| o.as_ref())
-        .map(tensor_to_i64_vec)
-        .transpose()?
-        .map(|v| v.iter().map(|&a| if a < 0 { (ndim as i64 + a) as usize } else { a as usize }).collect())
-        .unwrap_or_else(|| (0..starts.len()).collect());
-
-    let steps: Vec<i64> = inputs
-        .get(4)
-        .and_then(|o| o.as_ref())
-        .map(tensor_to_i64_vec)
-        .transpose()?
-        .unwrap_or_else(|| vec![1; starts.len()]);
-
-    let mut ranges: Vec<(isize, isize)> = (0..ndim).map(|d| (0isize, shape[d].as_const().unwrap() as isize)).collect();
-    let mut flip_axes: Vec<isize> = Vec::new();
-
-    for (i, &axis) in axes.iter().enumerate() {
-        let d = shape[axis].as_const().unwrap() as i64;
-        let step = steps[i];
-        if step == 0 {
-            return Err(Error::IrConstruction { details: "Slice step cannot be 0".into() });
-        }
-
-        // Replicate Python's slice.indices(d): step-dependent clamping
-        let (lower, upper) = if step > 0 { (0i64, d) } else { (-1i64, d - 1) };
-        let mut s = starts[i].clamp(-d, d);
-        if s < 0 {
-            s += d;
-        }
-        let s = s.clamp(lower, upper);
-
-        let mut e = ends[i].clamp(-d - 1, d);
-        if e < 0 {
-            e += d;
-        }
-        let e = e.clamp(lower, upper);
-
-        if step * (e - s) < 0 {
-            ranges[axis] = (0, 0);
-        } else if step < 0 {
-            flip_axes.push(axis as isize);
-            ranges[axis] = ((e + 1) as isize, (s + 1) as isize);
-        } else {
-            ranges[axis] = (s as isize, e as isize);
-        }
-    }
-
-    let mut result = data.try_shrink(&ranges)?;
-    if !flip_axes.is_empty() {
-        result = result.flip(&flip_axes)?;
-    }
-
-    // Apply strides > 1 via pad→reshape→shrink→reshape pattern
-    for (i, &axis) in axes.iter().enumerate() {
-        let abs_step = steps[i].unsigned_abs() as usize;
-        if abs_step <= 1 {
-            continue;
-        }
-        let cur = result.shape()?;
-        let size = cur[axis].as_const().unwrap();
-        let padded = size.div_ceil(abs_step) * abs_step;
-        if padded > size {
-            let mut p = vec![(0isize, 0isize); cur.len()];
-            p[axis] = (0, (padded - size) as isize);
-            result = result.try_pad(&p)?;
-        }
-        let n = padded / abs_step;
-        let cs = result.shape()?;
-        let mut rs: Vec<isize> = Vec::new();
-        for (d, dim) in cs.iter().enumerate() {
-            if d == axis {
-                rs.push(n as isize);
-                rs.push(abs_step as isize);
-            } else {
-                rs.push(dim.as_const().unwrap() as isize);
-            }
-        }
-        result = result.try_reshape(&rs)?;
-        let ss = result.shape()?;
-        let sr: Vec<(isize, isize)> = ss
-            .iter()
-            .enumerate()
-            .map(|(d, dim)| if d == axis + 1 { (0, 1) } else { (0, dim.as_const().unwrap() as isize) })
-            .collect();
-        result = result.try_shrink(&sr)?;
-        let fs: Vec<isize> = result
-            .shape()?
-            .iter()
-            .enumerate()
-            .filter(|&(d, _)| d != axis + 1)
-            .map(|(_, dim)| dim.as_const().unwrap() as isize)
-            .collect();
-        result = result.try_reshape(&fs)?;
-    }
-
-    if !flip_axes.is_empty() || steps.iter().any(|&s| s.unsigned_abs() > 1) {
-        result = result.contiguous();
-    }
-
-    Ok(result)
+    let axes: Option<Vec<i64>> = inputs.get(3).and_then(|o| o.as_ref()).map(tensor_to_i64_vec).transpose()?;
+    let steps: Option<Vec<i64>> = inputs.get(4).and_then(|o| o.as_ref()).map(tensor_to_i64_vec).transpose()?;
+    Ok(data
+        .slice_with()
+        .starts(&starts)
+        .ends(&ends)
+        .maybe_axes(axes.as_deref())
+        .maybe_steps(steps.as_deref())
+        .call()?)
 }
 
 pub(crate) fn op_split(inputs: &[Option<Tensor>], attrs: &mut Attrs, opset_version: i64) -> Result<Vec<Tensor>> {

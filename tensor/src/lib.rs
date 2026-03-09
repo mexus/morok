@@ -622,5 +622,72 @@ impl Tensor {
     }
 }
 
+#[bon]
+impl Tensor {
+    /// Cumulative sum with exclusive and reverse options.
+    #[builder]
+    pub fn cumsum_with(
+        &self,
+        axis: isize,
+        #[builder(default = false)] exclusive: bool,
+        #[builder(default = false)] reverse: bool,
+    ) -> Result<Self> {
+        let shape = self.shape()?;
+        let ndim = shape.len();
+        let axis_idx = Self::normalize_axis(axis, ndim)?;
+        let mut result = self.clone();
+        if reverse {
+            result = result.flip(&[axis_idx as isize])?;
+        }
+        if exclusive {
+            let dim_size = shape[axis_idx].as_const().unwrap() as isize;
+            let mut pad_spec: Vec<(isize, isize)> = vec![(0, 0); ndim];
+            pad_spec[axis_idx] = (1, 0);
+            result = result.try_pad(&pad_spec)?;
+            let mut shrink_spec: Vec<(isize, isize)> =
+                result.shape()?.iter().map(|s| (0, s.as_const().unwrap() as isize)).collect();
+            shrink_spec[axis_idx] = (0, dim_size);
+            result = result.try_shrink(&shrink_spec)?;
+        }
+        result = result.cumsum(axis_idx as isize)?;
+        if reverse {
+            result = result.flip(&[axis_idx as isize])?;
+        }
+        Ok(result)
+    }
+
+    /// Cumulative product with exclusive and reverse options.
+    #[builder]
+    pub fn cumprod_with(
+        &self,
+        axis: isize,
+        #[builder(default = false)] exclusive: bool,
+        #[builder(default = false)] reverse: bool,
+    ) -> Result<Self> {
+        let shape = self.shape()?;
+        let ndim = shape.len();
+        let axis_idx = Self::normalize_axis(axis, ndim)?;
+        let mut result = self.clone();
+        if reverse {
+            result = result.flip(&[axis_idx as isize])?;
+        }
+        if exclusive {
+            let dim_size = shape[axis_idx].as_const().unwrap() as isize;
+            let mut pad_spec: Vec<(isize, isize)> = vec![(0, 0); ndim];
+            pad_spec[axis_idx] = (1, 0);
+            result = result.try_pad_value(&pad_spec, 1.0)?;
+            let mut shrink_spec: Vec<(isize, isize)> =
+                result.shape()?.iter().map(|s| (0, s.as_const().unwrap() as isize)).collect();
+            shrink_spec[axis_idx] = (0, dim_size);
+            result = result.try_shrink(&shrink_spec)?;
+        }
+        result = result.cumprod(axis_idx as isize)?;
+        if reverse {
+            result = result.flip(&[axis_idx as isize])?;
+        }
+        Ok(result)
+    }
+}
+
 #[cfg(test)]
 mod test;

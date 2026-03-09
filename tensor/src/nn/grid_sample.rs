@@ -1,29 +1,87 @@
 //! GridSample: spatial sampling via coordinate grids (ONNX GridSample operator).
 
+use bon::bon;
 use morok_dtype::DType;
 use morok_ir::ConstValue;
 use snafu::ResultExt;
 
 use crate::Tensor;
-use crate::error::UOpSnafu;
+use crate::error::{NdimMinimumSnafu, UOpSnafu};
+use crate::shape_ops::MeshgridIndexing;
 
 use super::{GridSampleMode, GridSamplePaddingMode};
 
 type Result<T> = crate::Result<T>;
 
+#[bon]
 impl Tensor {
+    /// Generate an affine sampling grid from transformation parameters.
+    #[builder]
+    pub fn affine_grid(
+        theta: &Tensor,
+        size: &[i64],
+        #[builder(default = false)] align_corners: bool,
+    ) -> Result<Tensor> {
+        snafu::ensure!(size.len() >= 3, NdimMinimumSnafu { op: "affine_grid", min: 3_usize, actual: size.len() });
+        let n = size[0] as usize;
+        let ndim = size.len() - 2; // spatial dims
+
+        let spatial_dims: Vec<usize> = size[2..].iter().map(|&s| s as usize).collect();
+        let mut grids = Vec::with_capacity(ndim);
+        for &dim_size in &spatial_dims {
+            let g = if align_corners {
+                Tensor::linspace(-1.0, 1.0, dim_size, DType::Float32)?
+            } else {
+                let start = -1.0 + 1.0 / dim_size as f64;
+                let end = 1.0 - 1.0 / dim_size as f64;
+                Tensor::linspace(start, end, dim_size, DType::Float32)?
+            };
+            grids.push(g);
+        }
+
+        let grid_refs: Vec<&Tensor> = grids.iter().collect();
+        let mesh = Tensor::meshgrid(&grid_refs, MeshgridIndexing::Ij)?;
+
+        let total_elements: usize = spatial_dims.iter().product();
+        let flat_shape = [total_elements as isize];
+        let mut components: Vec<Tensor> = Vec::with_capacity(ndim + 1);
+        for g in mesh.iter().rev() {
+            components.push(g.try_reshape(&flat_shape)?);
+        }
+        components.push(Tensor::full(&[total_elements], 1.0, DType::Float32)?);
+
+        let comp_refs: Vec<&Tensor> = components.iter().collect();
+        let base_grid = Tensor::cat(&comp_refs, 0)?
+            .try_reshape(&[(ndim + 1) as isize, total_elements as isize])?
+            .try_transpose(0, 1)?;
+
+        let base_grid =
+            base_grid.try_unsqueeze(0)?.try_expand(&[n as isize, total_elements as isize, (ndim + 1) as isize])?;
+
+        let theta_t = theta.try_transpose(1, 2)?;
+        let output = base_grid.matmul(&theta_t)?;
+
+        let mut out_shape: Vec<isize> = vec![n as isize];
+        out_shape.extend(spatial_dims.iter().map(|&d| d as isize));
+        out_shape.push(ndim as isize);
+        output.try_reshape(&out_shape)
+    }
+
     /// Sample input at positions specified by a coordinate grid.
     ///
     /// - `self`: Input tensor `[N, C, *spatial_dims]`
     /// - `grid`: Coordinate grid `[N, *output_spatial_dims, n_spatial]` with values in `[-1, 1]`
     /// - Returns: `[N, C, *output_spatial_dims]`
+    #[builder]
     pub fn grid_sample(
         &self,
         grid: &Tensor,
-        mode: GridSampleMode,
-        padding_mode: GridSamplePaddingMode,
-        align_corners: bool,
+        #[builder(default)] mode: GridSampleMode,
+        #[builder(default)] padding_mode: GridSamplePaddingMode,
+        #[builder(default = false)] align_corners: bool,
     ) -> Result<Tensor> {
+        let x_ndim = self.ndim()?;
+        snafu::ensure!(x_ndim >= 3, NdimMinimumSnafu { op: "grid_sample", min: 3_usize, actual: x_ndim });
         let x_shape = self.shape()?;
         let grid_shape = grid.shape()?;
         let x_dims = morok_ir::shape::to_vec_usize(&x_shape).context(UOpSnafu)?;
@@ -50,10 +108,10 @@ impl Tensor {
         // Extract, denormalize coordinates for each spatial dim.
         // Grid stores coords in reverse order: grid[...,0]=x→last spatial dim, etc.
         let mut coords: Vec<Tensor> = Vec::with_capacity(n_spatial);
-        for i in 0..n_spatial {
+        for (i, &dim_size) in spatial.iter().enumerate() {
             let grid_idx = n_spatial - 1 - i;
             let coord = slice_last_dim(&grid_flat, grid_idx, n, out_prod)?;
-            let denorm = gs_denormalize(&coord, spatial[i], align_corners, &dtype)?;
+            let denorm = gs_denormalize(&coord, dim_size, align_corners, &dtype)?;
             coords.push(denorm);
         }
 
@@ -203,6 +261,7 @@ fn gather_and_mask(
     Ok(gathered)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn interpolate_nearest(
     x_flat: &Tensor,
     coords: &[Tensor],
@@ -220,6 +279,7 @@ fn interpolate_nearest(
     gather_and_mask(x_flat, &flat_idx, valid_mask.as_ref(), n, c, out_prod, dtype)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn interpolate_linear(
     x_flat: &Tensor,
     coords: &[Tensor],
@@ -262,6 +322,7 @@ fn interpolate_linear(
     Ok(result)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn interpolate_cubic(
     x_flat: &Tensor,
     coords: &[Tensor],

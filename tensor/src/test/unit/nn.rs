@@ -410,7 +410,7 @@ fn test_nll_loss_basic() {
     .try_reshape(&[2, 3])
     .unwrap();
     let target = Tensor::from_slice([0i64, 2]); // class 0 for sample 0, class 2 for sample 1
-    let loss = log_probs.nll_loss(&target, None, None, Reduction::Mean).unwrap();
+    let loss = log_probs.nll_loss().target(&target).call().unwrap();
     let result = loss.realize().unwrap().to_ndarray::<f32>().unwrap();
     let val = result.into_raw_vec_and_offset().0[0];
     // NLL = -log_probs[i, target[i]]: sample0=-(-0.5)=0.5, sample1=-(-0.8)=0.8
@@ -427,7 +427,7 @@ fn test_nll_loss_none_reduction() {
     .try_reshape(&[2, 3])
     .unwrap();
     let target = Tensor::from_slice([0i64, 2]);
-    let loss = log_probs.nll_loss(&target, None, None, Reduction::None).unwrap();
+    let loss = log_probs.nll_loss().target(&target).reduction(Reduction::None).call().unwrap();
     let vals: Vec<f32> = loss.realize().unwrap().to_ndarray::<f32>().unwrap().iter().copied().collect();
     assert_eq!(vals.len(), 2);
     assert!((vals[0] - 0.5).abs() < 1e-4);
@@ -444,7 +444,7 @@ fn test_nll_loss_weighted() {
     .unwrap();
     let target = Tensor::from_slice([0i64, 2]);
     let weight = Tensor::from_slice([2.0f32, 1.0, 3.0]); // class weights
-    let loss = log_probs.nll_loss(&target, Some(&weight), None, Reduction::Mean).unwrap();
+    let loss = log_probs.nll_loss().target(&target).weight(&weight).call().unwrap();
     let result = loss.realize().unwrap().to_ndarray::<f32>().unwrap();
     let val = result.into_raw_vec_and_offset().0[0];
     // weighted: sample0=0.5*2.0=1.0, sample1=0.8*3.0=2.4
@@ -462,7 +462,7 @@ fn test_nll_loss_ignore_index() {
     .unwrap();
     let target = Tensor::from_slice([0i64, 2]);
     // Ignore class 2 — sample 1 is masked out
-    let loss = log_probs.nll_loss(&target, None, Some(2), Reduction::Mean).unwrap();
+    let loss = log_probs.nll_loss().target(&target).ignore_index(2).call().unwrap();
     let result = loss.realize().unwrap().to_ndarray::<f32>().unwrap();
     let val = result.into_raw_vec_and_offset().0[0];
     // Only sample 0 contributes: 0.5 / 1.0 = 0.5
@@ -476,9 +476,65 @@ fn test_nll_loss_ignore_index() {
 #[test]
 fn test_dropout_inference() {
     let x = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0]);
-    let (output, mask) = x.dropout(0.5, false).unwrap();
+    let (output, mask) = x.dropout().p(0.5).call().unwrap();
     let out = output.realize().unwrap().to_ndarray::<f32>().unwrap();
     assert_eq!(out.as_slice().unwrap(), &[1.0, 2.0, 3.0, 4.0]);
     let m = mask.realize().unwrap().to_ndarray::<bool>().unwrap();
     assert!(m.iter().all(|&v| v)); // all true
+}
+
+// =========================================================================
+// Input validation tests
+// =========================================================================
+
+fn expect_err_msg<T>(result: crate::Result<T>, substr: &str) {
+    let msg = result.err().expect("expected an error").to_string();
+    assert!(msg.contains(substr), "error should contain '{substr}', got: {msg}");
+}
+
+#[test]
+fn test_depth_to_space_rejects_3d() {
+    let x = Tensor::from_slice([0.0f32; 24]).try_reshape(&[2, 3, 4]).unwrap();
+    expect_err_msg(x.depth_to_space().blocksize(2).call(), "exactly 4D");
+}
+
+#[test]
+fn test_depth_to_space_rejects_indivisible_channels() {
+    // c=3, blocksize=2 → blocksize^2=4, 3 % 4 != 0
+    let x = Tensor::from_slice([0.0f32; 12]).try_reshape(&[1, 3, 2, 2]).unwrap();
+    expect_err_msg(x.depth_to_space().blocksize(2).call(), "divisible");
+}
+
+#[test]
+fn test_space_to_depth_rejects_indivisible_spatial() {
+    // h=3, w=3, blocksize=2 → 3 % 2 != 0
+    let x = Tensor::from_slice([0.0f32; 9]).try_reshape(&[1, 1, 3, 3]).unwrap();
+    expect_err_msg(x.space_to_depth(2), "divisible");
+}
+
+#[test]
+fn test_dropout_rejects_invalid_p() {
+    let x = Tensor::from_slice([1.0f32, 2.0, 3.0]);
+    expect_err_msg(x.dropout().p(1.5).call(), "p");
+    expect_err_msg(x.dropout().p(-0.1).call(), "p");
+}
+
+#[test]
+fn test_lp_pool_rejects_p_zero() {
+    let x = Tensor::from_slice([0.0f32; 16]).try_reshape(&[1, 1, 4, 4]).unwrap();
+    expect_err_msg(x.lp_pool().kernel_shape(&[2, 2]).p(0).call(), "p");
+}
+
+#[test]
+fn test_group_norm_rejects_1d() {
+    let x = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0]);
+    let scale = Tensor::from_slice([1.0f32]);
+    let bias = Tensor::from_slice([0.0f32]);
+    expect_err_msg(x.group_norm().scale(&scale).bias(&bias).num_groups(1).call(), "at least 2D");
+}
+
+#[test]
+fn test_lrn_rejects_3d() {
+    let x = Tensor::from_slice([0.0f32; 24]).try_reshape(&[2, 3, 4]).unwrap();
+    expect_err_msg(x.lrn().size(5).call(), "exactly 4D");
 }

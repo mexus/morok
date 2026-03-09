@@ -8,6 +8,7 @@
 //! - Squeeze: Remove dimensions of size 1
 //! - Unsqueeze: Add dimensions of size 1
 
+use bon::bon;
 use strum::{Display, EnumString};
 
 use super::*;
@@ -834,5 +835,121 @@ impl Tensor {
             .collect::<Result<_>>()?;
 
         Ok(new_shape)
+    }
+}
+
+#[bon]
+impl Tensor {
+    /// Slice tensor with Python-style indexing: negative indices, steps, and axis selection.
+    #[builder]
+    pub fn slice_with(
+        &self,
+        starts: &[i64],
+        ends: &[i64],
+        axes: Option<&[i64]>,
+        steps: Option<&[i64]>,
+    ) -> Result<Tensor> {
+        let shape = self.shape()?;
+        let ndim = shape.len();
+
+        let axes: Vec<usize> = axes
+            .map(|v| v.iter().map(|&a| if a < 0 { (ndim as i64 + a) as usize } else { a as usize }).collect())
+            .unwrap_or_else(|| (0..starts.len()).collect());
+
+        let default_steps;
+        let steps = match steps {
+            Some(s) => s,
+            None => {
+                default_steps = vec![1i64; starts.len()];
+                &default_steps
+            }
+        };
+
+        let mut ranges: Vec<(isize, isize)> =
+            (0..ndim).map(|d| (0isize, shape[d].as_const().unwrap() as isize)).collect();
+        let mut flip_axes: Vec<isize> = Vec::new();
+
+        for (i, &axis) in axes.iter().enumerate() {
+            let d = shape[axis].as_const().unwrap() as i64;
+            let step = steps[i];
+            if step == 0 {
+                return Err(crate::error::Error::IrConstruction { details: "Slice step cannot be 0".into() });
+            }
+
+            let (lower, upper) = if step > 0 { (0i64, d) } else { (-1i64, d - 1) };
+            let mut s = starts[i].clamp(-d, d);
+            if s < 0 {
+                s += d;
+            }
+            let s = s.clamp(lower, upper);
+
+            let mut e = ends[i].clamp(-d - 1, d);
+            if e < 0 {
+                e += d;
+            }
+            let e = e.clamp(lower, upper);
+
+            if step * (e - s) < 0 {
+                ranges[axis] = (0, 0);
+            } else if step < 0 {
+                flip_axes.push(axis as isize);
+                ranges[axis] = ((e + 1) as isize, (s + 1) as isize);
+            } else {
+                ranges[axis] = (s as isize, e as isize);
+            }
+        }
+
+        let mut result = self.try_shrink(&ranges)?;
+        if !flip_axes.is_empty() {
+            result = result.flip(&flip_axes)?;
+        }
+
+        for (i, &axis) in axes.iter().enumerate() {
+            let abs_step = steps[i].unsigned_abs() as usize;
+            if abs_step <= 1 {
+                continue;
+            }
+            let cur = result.shape()?;
+            let size = cur[axis].as_const().unwrap();
+            let padded = size.div_ceil(abs_step) * abs_step;
+            if padded > size {
+                let mut p = vec![(0isize, 0isize); cur.len()];
+                p[axis] = (0, (padded - size) as isize);
+                result = result.try_pad(&p)?;
+            }
+            let n = padded / abs_step;
+            let cs = result.shape()?;
+            let mut rs: Vec<isize> = Vec::new();
+            for (d, dim) in cs.iter().enumerate() {
+                if d == axis {
+                    rs.push(n as isize);
+                    rs.push(abs_step as isize);
+                } else {
+                    rs.push(dim.as_const().unwrap() as isize);
+                }
+            }
+            result = result.try_reshape(&rs)?;
+            let ss = result.shape()?;
+            let sr: Vec<(isize, isize)> = ss
+                .iter()
+                .enumerate()
+                .map(|(d, dim)| if d == axis + 1 { (0, 1) } else { (0, dim.as_const().unwrap() as isize) })
+                .collect();
+            result = result.try_shrink(&sr)?;
+            let fs: Vec<isize> = result
+                .shape()?
+                .iter()
+                .enumerate()
+                .filter(|&(d, _)| d != axis + 1)
+                .map(|(_, dim)| dim.as_const().unwrap() as isize)
+                .collect();
+            result = result.try_reshape(&fs)?;
+        }
+
+        if !flip_axes.is_empty() || steps.iter().any(|&s| s.unsigned_abs() > 1) {
+            result = result.contiguous();
+        }
+
+        Ok(result)
     }
 }

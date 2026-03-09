@@ -267,6 +267,16 @@ impl ScalarDType {
         }
     }
 
+    pub const fn min_positive(&self) -> f64 {
+        match self {
+            Self::Float16 => 6.103515625e-05,         // 2^-14
+            Self::BFloat16 => 1.175494350822288e-38,  // 2^-126 (same exponent range as f32)
+            Self::Float32 => 1.1754944e-38,           // f32::MIN_POSITIVE
+            Self::Float64 => 2.2250738585072014e-308, // f64::MIN_POSITIVE
+            _ => 1.1754944e-38,                       // default to f32 range
+        }
+    }
+
     /// (exponent_bits, mantissa_bits) for float types.
     /// Matches Tinygrad's `dtypes.finfo()`.
     pub const fn finfo(&self) -> (u32, u32) {

@@ -95,6 +95,14 @@ impl Tensor {
         self.try_eq(&arange.try_reshape(&ar_shape)?)
     }
 
+    /// Normalize negative indices: indices[i] = indices[i] < 0 ? indices[i] + dim_size : indices[i]
+    pub fn normalize_negative_indices(&self, dim_size: i64) -> Result<Tensor> {
+        let zero = Tensor::const_(ConstValue::Int(0), self.uop().dtype());
+        let dim_t = Tensor::const_(ConstValue::Int(dim_size), self.uop().dtype());
+        let neg_mask = self.try_lt(&zero)?;
+        self.try_add(&dim_t)?.where_(&neg_mask, self)
+    }
+
     // =========================================================================
     // Scatter Operations (Tinygrad tensor.py:2641-2728)
     // =========================================================================
@@ -488,7 +496,7 @@ impl Tensor {
 
         // Expand indices to match work shape [T, B, ...] and gather along axis 0
         let expand_shape: Vec<isize> = work_dims.iter().map(|&d| d as isize).collect();
-        let idx = idx.try_reshape(&expand_shape[..2].to_vec())?.try_expand(&expand_shape)?;
+        let idx = idx.try_reshape(&expand_shape[..2])?.try_expand(&expand_shape)?;
         let result = work.gather(0, &idx)?;
 
         // Inverse permutation to restore original axis order
@@ -498,6 +506,217 @@ impl Tensor {
         }
         let inv_perm_i: Vec<isize> = inv_perm.iter().map(|&p| p as isize).collect();
         result.try_permute(&inv_perm_i)
+    }
+
+    // =========================================================================
+    // N-dimensional Gather/Scatter (from ONNX GatherND/ScatterND/TensorScatter)
+    // =========================================================================
+
+    /// Gather values using N-dimensional indices.
+    pub fn gather_nd(&self, indices: &Tensor, batch_dims: usize) -> Result<Tensor> {
+        let x_shape = self.shape()?;
+        let x_dims = morok_ir::shape::to_vec_usize(&x_shape).context(UOpSnafu)?;
+        let idx_shape = indices.shape()?;
+        let idx_dims = morok_ir::shape::to_vec_usize(&idx_shape).context(UOpSnafu)?;
+        let last_idx_dim = *idx_dims.last().unwrap();
+
+        if batch_dims == 0 {
+            let strides: Vec<i64> =
+                (0..last_idx_dim).map(|k| x_dims[k + 1..last_idx_dim].iter().product::<usize>() as i64).collect();
+            let inner: usize = x_dims[last_idx_dim..].iter().product();
+            let outer = x_dims[..last_idx_dim].iter().product::<usize>();
+
+            let mut flat_idx = Tensor::const_(ConstValue::Int(0), DType::Int64);
+            for (k, stride) in strides.iter().enumerate() {
+                let mut ranges: Vec<(isize, isize)> = idx_dims.iter().map(|&s| (0, s as isize)).collect();
+                ranges[idx_dims.len() - 1] = (k as isize, k as isize + 1);
+                let idx_k = indices.try_shrink(&ranges)?.try_squeeze(Some(-1))?;
+                let stride_t = Tensor::const_(ConstValue::Int(*stride), DType::Int64);
+                flat_idx = flat_idx.try_add(&idx_k.cast(DType::Int64)?.try_mul(&stride_t)?)?;
+            }
+
+            let x_flat = self.try_reshape(&[outer as isize, inner as isize])?;
+            let gather_outer: Vec<isize> = idx_dims[..idx_dims.len() - 1].iter().map(|&d| d as isize).collect();
+            let num_gathers: usize = gather_outer.iter().map(|&d| d as usize).product();
+
+            let flat_idx_2d = flat_idx
+                .try_reshape(&[num_gathers as isize, 1])?
+                .try_expand(&[num_gathers as isize, inner as isize])?
+                .cast(DType::Int32)?;
+            let result = x_flat.gather(0, &flat_idx_2d)?;
+
+            let mut out_shape = gather_outer;
+            for &d in &x_dims[last_idx_dim..] {
+                out_shape.push(d as isize);
+            }
+            result.try_reshape(&out_shape)
+        } else {
+            let batch_size: usize = x_dims[..batch_dims].iter().product();
+            let inner_x: Vec<usize> = x_dims[batch_dims..].to_vec();
+            let inner_idx: Vec<usize> = idx_dims[batch_dims..].to_vec();
+
+            let x_flat = self.try_reshape(
+                &std::iter::once(batch_size as isize).chain(inner_x.iter().map(|&d| d as isize)).collect::<Vec<_>>(),
+            )?;
+            let idx_flat = indices.try_reshape(
+                &std::iter::once(batch_size as isize).chain(inner_idx.iter().map(|&d| d as isize)).collect::<Vec<_>>(),
+            )?;
+
+            let last_inner = *inner_idx.last().unwrap();
+            let strides: Vec<i64> =
+                (0..last_inner).map(|k| inner_x[k + 1..last_inner].iter().product::<usize>() as i64).collect();
+
+            let mut flat_idx = Tensor::const_(ConstValue::Int(0), DType::Int64);
+            let idx_flat_shape = idx_flat.shape()?;
+            let idx_flat_dims = morok_ir::shape::to_vec_usize(&idx_flat_shape).context(UOpSnafu)?;
+            for (k, stride) in strides.iter().enumerate() {
+                let mut ranges: Vec<(isize, isize)> = idx_flat_dims.iter().map(|&s| (0, s as isize)).collect();
+                ranges[idx_flat_dims.len() - 1] = (k as isize, k as isize + 1);
+                let idx_k = idx_flat.try_shrink(&ranges)?.try_squeeze(Some(-1))?;
+                let stride_t = Tensor::const_(ConstValue::Int(*stride), DType::Int64);
+                flat_idx = flat_idx.try_add(&idx_k.cast(DType::Int64)?.try_mul(&stride_t)?)?;
+            }
+
+            let batch_stride = inner_x[..last_inner].iter().product::<usize>();
+            let batch_offset_arr = Tensor::arange(0, Some(batch_size as i64), None)?
+                .try_mul(&Tensor::from_slice([batch_stride as i64]))?;
+            let gather_inner = idx_flat_dims[1..idx_flat_dims.len() - 1].iter().product::<usize>();
+            flat_idx = flat_idx.try_reshape(&[batch_size as isize, gather_inner as isize])?;
+            let batch_offset = batch_offset_arr
+                .try_reshape(&[batch_size as isize, 1])?
+                .try_expand(&[batch_size as isize, gather_inner as isize])?;
+            flat_idx = flat_idx.try_add(&batch_offset)?;
+
+            let remaining: usize = inner_x[last_inner..].iter().product();
+            let x_2d = x_flat.try_reshape(&[(batch_size * batch_stride) as isize, remaining as isize])?;
+            let fi = flat_idx
+                .try_reshape(&[(batch_size * gather_inner) as isize, 1])?
+                .try_expand(&[(batch_size * gather_inner) as isize, remaining as isize])?
+                .cast(DType::Int32)?;
+            let result = x_2d.gather(0, &fi)?;
+
+            let mut out_shape: Vec<isize> = x_dims[..batch_dims].iter().map(|&d| d as isize).collect();
+            out_shape.extend(inner_idx[..inner_idx.len() - 1].iter().map(|&d| d as isize));
+            out_shape.extend(inner_x[last_inner..].iter().map(|&d| d as isize));
+            result.try_reshape(&out_shape)
+        }
+    }
+
+    /// Scatter updates into a tensor using N-dimensional indices.
+    pub fn scatter_nd(&self, indices: &Tensor, updates: &Tensor, reduction: &str) -> Result<Tensor> {
+        let x_shape = self.shape()?;
+        let x_dims = morok_ir::shape::to_vec_usize(&x_shape).context(UOpSnafu)?;
+        let idx_shape = indices.shape()?;
+        let last_idx_dim = idx_shape[idx_shape.len() - 1].as_const().unwrap();
+        let strides: Vec<i64> =
+            (0..last_idx_dim).map(|k| x_dims[k + 1..last_idx_dim].iter().product::<usize>() as i64).collect();
+        let x_numel: usize = x_dims.iter().product();
+        let inner: usize = x_dims[last_idx_dim..].iter().product();
+        let outer = x_numel / inner;
+        let x_flat = self.try_reshape(&[outer as isize, inner as isize])?;
+        let idx_splits: Vec<Tensor> = (0..last_idx_dim)
+            .map(|k| {
+                let mut ranges: Vec<(isize, isize)> =
+                    idx_shape.iter().map(|s| (0, s.as_const().unwrap() as isize)).collect();
+                ranges[idx_shape.len() - 1] = (k as isize, k as isize + 1);
+                let slice = indices.try_shrink(&ranges)?;
+                slice.try_squeeze(Some(-1))
+            })
+            .collect::<Result<_>>()?;
+        let mut flat_idx = Tensor::const_(ConstValue::Int(0), DType::Int64);
+        for (k, idx_k) in idx_splits.iter().enumerate() {
+            let stride_t = Tensor::const_(ConstValue::Int(strides[k]), DType::Int64);
+            flat_idx = flat_idx.try_add(&idx_k.cast(DType::Int64)?.try_mul(&stride_t)?)?;
+        }
+        let upd_shape = updates.shape()?;
+        let upd_outer: usize = upd_shape[..upd_shape.len() - (x_dims.len() - last_idx_dim)]
+            .iter()
+            .map(|s| s.as_const().unwrap())
+            .product();
+        let upd_flat = updates.try_reshape(&[upd_outer as isize, inner as isize])?;
+        let flat_idx =
+            flat_idx.try_reshape(&[upd_outer as isize, 1])?.try_expand(&[upd_outer as isize, inner as isize])?;
+        let flat_idx_i32 = flat_idx.cast(DType::Int32)?;
+        let mut result = match reduction {
+            "none" => x_flat.scatter(0, &flat_idx_i32, &upd_flat)?,
+            "add" => x_flat.scatter_reduce(0, &flat_idx_i32, &upd_flat, ScatterReduction::Sum, true)?,
+            "mul" => x_flat.scatter_reduce(0, &flat_idx_i32, &upd_flat, ScatterReduction::Prod, true)?,
+            "max" => x_flat.scatter_reduce(0, &flat_idx_i32, &upd_flat, ScatterReduction::Amax, true)?,
+            "min" => x_flat.scatter_reduce(0, &flat_idx_i32, &upd_flat, ScatterReduction::Amin, true)?,
+            _ => {
+                return Err(crate::error::Error::IrConstruction {
+                    details: format!("ScatterND: unsupported reduction '{reduction}'"),
+                });
+            }
+        };
+        let out_shape: Vec<isize> = x_dims.iter().map(|&d| d as isize).collect();
+        result = result.try_reshape(&out_shape)?;
+        Ok(result)
+    }
+
+    /// Batch-aware tensor scatter with write index offsets.
+    pub fn tensor_scatter(
+        &self,
+        update: &Tensor,
+        write_indices: Option<&Tensor>,
+        mode: &str,
+        axis: isize,
+    ) -> Result<Tensor> {
+        let data_shape = self.shape()?;
+        let ndim = data_shape.len();
+        let axis = Self::normalize_axis(axis, ndim)?;
+        let data_dims = morok_ir::shape::to_vec_usize(&data_shape).context(UOpSnafu)?;
+        let update_dims = morok_ir::shape::to_vec_usize(&update.shape()?).context(UOpSnafu)?;
+
+        let batch_size = data_dims[0];
+        let max_seq = data_dims[axis];
+        let seq_len = update_dims[axis];
+
+        let b_total: usize = data_dims[..axis].iter().product();
+        let features: usize = data_dims[axis + 1..].iter().product();
+
+        let write_idx = if let Some(wi) = write_indices {
+            wi.cast(DType::Int32)?
+        } else {
+            Tensor::full(&[batch_size], ConstValue::Int(0), DType::Int32)?
+        };
+
+        let wi_flat = if axis > 1 {
+            let mut wi_reshape: Vec<isize> = vec![batch_size as isize];
+            wi_reshape.extend(std::iter::repeat_n(1, axis - 1));
+            let wi_expand: Vec<isize> = data_dims[..axis].iter().map(|&d| d as isize).collect();
+            write_idx.try_reshape(&wi_reshape)?.try_expand(&wi_expand)?.try_reshape(&[b_total as isize])?
+        } else {
+            write_idx
+        };
+
+        let data_flat = self.try_reshape(&[(b_total * max_seq) as isize, features as isize])?;
+        let updates_flat = update.try_reshape(&[(b_total * seq_len) as isize, features as isize])?;
+
+        let batch_offset = Tensor::arange(0, Some(b_total as i64), None)?
+            .cast(DType::Int32)?
+            .try_mul(&Tensor::const_(ConstValue::Int(max_seq as i64), DType::Int32))?
+            .try_reshape(&[b_total as isize, 1])?;
+
+        let wi_2d = wi_flat.try_reshape(&[b_total as isize, 1])?;
+        let seq_arange =
+            Tensor::arange(0, Some(seq_len as i64), None)?.cast(DType::Int32)?.try_reshape(&[1, seq_len as isize])?;
+        let mut row_idx = wi_2d.try_add(&seq_arange)?;
+
+        if mode == "circular" {
+            let max_seq_t = Tensor::const_(ConstValue::Int(max_seq as i64), DType::Int32);
+            row_idx = row_idx.try_mod(&max_seq_t)?;
+        }
+
+        let flat_idx = batch_offset
+            .try_add(&row_idx)?
+            .try_reshape(&[(b_total * seq_len) as isize, 1])?
+            .try_expand(&[(b_total * seq_len) as isize, features as isize])?;
+
+        let result = data_flat.scatter(0, &flat_idx, &updates_flat)?;
+
+        let out_shape: Vec<isize> = data_dims.iter().map(|&d| d as isize).collect();
+        result.try_reshape(&out_shape)
     }
 }
 

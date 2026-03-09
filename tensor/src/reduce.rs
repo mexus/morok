@@ -654,7 +654,7 @@ fn reduce_internal(
         let out_shape: Vec<usize> = shape
             .iter()
             .enumerate()
-            .map(|(i, d)| if resolved_axes.contains(&i) { 1 } else { d.as_const().unwrap_or(1) as usize })
+            .map(|(i, d)| if resolved_axes.contains(&i) { 1 } else { d.as_const().unwrap_or(1) })
             .collect();
 
         let identity = reduction_identity(op, &acc_dtype);

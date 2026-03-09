@@ -18,7 +18,7 @@ use morok_dtype::DType;
 use snafu::ResultExt;
 
 use crate::Tensor;
-use crate::error::UOpSnafu;
+use crate::error::{DivisibilitySnafu, NdimExactSnafu, NdimMinimumSnafu, ParamRangeSnafu, UOpSnafu};
 use crate::reduce::AxisSpec;
 
 type Result<T> = crate::Result<T>;
@@ -99,6 +99,18 @@ pub enum NearestMode {
     Ceil,
 }
 
+/// Depth-to-space rearrangement mode.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, EnumString, Display)]
+pub enum DepthToSpaceMode {
+    /// DCR: depth-column-row (default, ONNX standard).
+    #[default]
+    #[strum(serialize = "DCR")]
+    Dcr,
+    /// CRD: column-row-depth (PyTorch pixel_shuffle order).
+    #[strum(serialize = "CRD")]
+    Crd,
+}
+
 /// Padding fill mode.
 ///
 /// Determines how values outside the original tensor are filled when padding.
@@ -156,18 +168,26 @@ pub enum AspectRatioPolicy {
     NotSmaller,
 }
 
+// =========================================================================
+// Higher-level building blocks (ONNX-style wrappers)
+// =========================================================================
+
+#[bon]
 impl Tensor {
     /// Negative log-likelihood loss.
     ///
     /// `self` is `[N, C, ...]` log-probs, `target` is `[N, ...]` class indices.
     /// Matches Tinygrad's `nll_loss` (tensor.py:3391-3413).
+    #[builder]
     pub fn nll_loss(
         &self,
         target: &Tensor,
         weight: Option<&Tensor>,
         ignore_index: Option<i64>,
-        reduction: Reduction,
+        #[builder(default)] reduction: Reduction,
     ) -> Result<Tensor> {
+        let ndim = self.ndim()?;
+        snafu::ensure!(ndim >= 2, NdimMinimumSnafu { op: "nll_loss", min: 2_usize, actual: ndim });
         // Gather log-probs at target class, negate
         let nll = self.gather(1, &target.try_unsqueeze(1)?)?.try_squeeze(Some(1))?.try_neg()?;
 
@@ -206,7 +226,13 @@ impl Tensor {
     ///
     /// Returns `(output, mask)` where mask is a boolean tensor (true = kept).
     /// Training mode is deferred until RNG infrastructure is available.
-    pub fn dropout(&self, _p: f64, training: bool) -> Result<(Tensor, Tensor)> {
+    #[builder]
+    pub fn dropout(&self, p: f64, #[builder(default = false)] training: bool) -> Result<(Tensor, Tensor)> {
+        snafu::ensure!(
+            (0.0..=1.0).contains(&p),
+            ParamRangeSnafu { op: "dropout", param: "p", value: p.to_string(), constraint: "0.0 <= p <= 1.0" }
+        );
+        let _ = p;
         let shape = morok_ir::shape::to_vec_usize(&self.shape()?).context(UOpSnafu)?;
         if !training {
             let mask = Tensor::full(&shape, true, DType::Bool)?;
@@ -216,14 +242,6 @@ impl Tensor {
         let mask = Tensor::full(&shape, true, DType::Bool)?;
         Ok((self.clone(), mask))
     }
-}
-
-// =========================================================================
-// Higher-level building blocks (ONNX-style wrappers)
-// =========================================================================
-
-#[bon]
-impl Tensor {
     /// Convolution with ONNX-style parameters. Wraps `conv2d`.
     #[builder]
     pub fn conv(
@@ -387,7 +405,7 @@ impl Tensor {
         strides: Option<&[i64]>,
         dilations: Option<&[i64]>,
     ) -> Result<Tensor> {
-        assert!(p >= 1, "LpPool requires p >= 1");
+        snafu::ensure!(p >= 1, ParamRangeSnafu { op: "lp_pool", param: "p", value: p.to_string(), constraint: ">= 1" });
         let n_spatial = kernel_shape.len();
         let strides_u: Vec<usize> =
             strides.map(|s| s.iter().map(|&v| v as usize).collect()).unwrap_or_else(|| vec![1; n_spatial]);
@@ -434,6 +452,122 @@ impl Tensor {
         sum_p.try_pow(&inv_p)
     }
 
+    /// Rearrange depth data into spatial blocks (inverse of space_to_depth).
+    /// Equivalent to PyTorch's F.pixel_shuffle.
+    #[builder]
+    pub fn depth_to_space(&self, blocksize: usize, #[builder(default)] mode: DepthToSpaceMode) -> Result<Tensor> {
+        let ndim = self.ndim()?;
+        snafu::ensure!(ndim == 4, NdimExactSnafu { op: "depth_to_space", expected: 4_usize, actual: ndim });
+        snafu::ensure!(
+            blocksize > 0,
+            ParamRangeSnafu {
+                op: "depth_to_space",
+                param: "blocksize",
+                value: blocksize.to_string(),
+                constraint: "> 0"
+            }
+        );
+        let shape = self.shape()?;
+        let (b, c, h, w) = (
+            shape[0].as_const().unwrap(),
+            shape[1].as_const().unwrap(),
+            shape[2].as_const().unwrap(),
+            shape[3].as_const().unwrap(),
+        );
+        let bs_sq = blocksize * blocksize;
+        snafu::ensure!(
+            c.is_multiple_of(bs_sq),
+            DivisibilitySnafu {
+                op: "depth_to_space",
+                lhs_name: "channels",
+                lhs: c,
+                rhs_name: "blocksize^2",
+                rhs: bs_sq
+            }
+        );
+        let c_out = c / bs_sq;
+        let result = if mode == DepthToSpaceMode::Crd {
+            self.try_reshape(&[
+                b as isize,
+                c_out as isize,
+                blocksize as isize,
+                blocksize as isize,
+                h as isize,
+                w as isize,
+            ])?
+            .try_permute(&[0, 1, 4, 2, 5, 3])?
+        } else {
+            // DCR (default)
+            self.try_reshape(&[
+                b as isize,
+                blocksize as isize,
+                blocksize as isize,
+                c_out as isize,
+                h as isize,
+                w as isize,
+            ])?
+            .try_permute(&[0, 3, 4, 1, 5, 2])?
+        };
+        result.try_reshape(&[b as isize, c_out as isize, (h * blocksize) as isize, (w * blocksize) as isize])
+    }
+
+    /// Rearrange spatial data into depth (inverse of depth_to_space).
+    pub fn space_to_depth(&self, blocksize: usize) -> Result<Tensor> {
+        let ndim = self.ndim()?;
+        snafu::ensure!(ndim == 4, NdimExactSnafu { op: "space_to_depth", expected: 4_usize, actual: ndim });
+        snafu::ensure!(
+            blocksize > 0,
+            ParamRangeSnafu {
+                op: "space_to_depth",
+                param: "blocksize",
+                value: blocksize.to_string(),
+                constraint: "> 0"
+            }
+        );
+        let shape = self.shape()?;
+        let (b, c, h, w) = (
+            shape[0].as_const().unwrap(),
+            shape[1].as_const().unwrap(),
+            shape[2].as_const().unwrap(),
+            shape[3].as_const().unwrap(),
+        );
+        snafu::ensure!(
+            h.is_multiple_of(blocksize),
+            DivisibilitySnafu {
+                op: "space_to_depth",
+                lhs_name: "height",
+                lhs: h,
+                rhs_name: "blocksize",
+                rhs: blocksize
+            }
+        );
+        snafu::ensure!(
+            w.is_multiple_of(blocksize),
+            DivisibilitySnafu {
+                op: "space_to_depth",
+                lhs_name: "width",
+                lhs: w,
+                rhs_name: "blocksize",
+                rhs: blocksize
+            }
+        );
+        self.try_reshape(&[
+            b as isize,
+            c as isize,
+            (h / blocksize) as isize,
+            blocksize as isize,
+            (w / blocksize) as isize,
+            blocksize as isize,
+        ])?
+        .try_permute(&[0, 3, 5, 1, 2, 4])?
+        .try_reshape(&[
+            b as isize,
+            (c * blocksize * blocksize) as isize,
+            (h / blocksize) as isize,
+            (w / blocksize) as isize,
+        ])
+    }
+
     /// Max pooling with ONNX-style parameters. Always returns `(values, indices)`. Wraps `max_pool2d_with_indices`.
     #[builder]
     pub fn max_pool(
@@ -476,5 +610,42 @@ impl Tensor {
             indices.cast(DType::Int64)?
         };
         Ok((values, indices))
+    }
+
+    /// Local Response Normalization.
+    #[builder]
+    pub fn lrn(
+        &self,
+        size: usize,
+        #[builder(default = 0.0001)] alpha: f64,
+        #[builder(default = 0.75)] beta: f64,
+        #[builder(default = 1.0)] bias: f64,
+    ) -> Result<Tensor> {
+        let ndim = self.ndim()?;
+        snafu::ensure!(ndim == 4, NdimExactSnafu { op: "lrn", expected: 4_usize, actual: ndim });
+        snafu::ensure!(
+            size > 0,
+            ParamRangeSnafu { op: "lrn", param: "size", value: size.to_string(), constraint: "> 0" }
+        );
+        let shape = self.shape()?;
+        let (b, c, h, w) = (
+            shape[0].as_const().unwrap(),
+            shape[1].as_const().unwrap(),
+            shape[2].as_const().unwrap(),
+            shape[3].as_const().unwrap(),
+        );
+        let x_sq = self.square()?;
+        let x_sq = x_sq.try_reshape(&[b as isize, 1, c as isize, (h * w) as isize])?;
+        let pad_before = ((size - 1) / 2) as isize;
+        let pad_after = (size / 2) as isize;
+        let x_sq = x_sq.try_pad(&[(0, 0), (0, 0), (pad_before, pad_after), (0, 0)])?;
+        let pooled = x_sq.avg_pool2d().kernel_size(&[size, 1]).stride(&[1, 1]).call()?;
+        let pooled = pooled.try_reshape(&[b as isize, c as isize, h as isize, w as isize])?;
+        let dtype = self.uop().dtype();
+        let scale = pooled
+            .try_mul(&Tensor::const_(alpha, dtype.clone()))?
+            .try_add(&Tensor::const_(bias, dtype.clone()))?
+            .try_pow(&Tensor::const_(beta, dtype))?;
+        self.try_div(&scale)
     }
 }
