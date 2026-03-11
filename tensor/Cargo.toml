@@ -31,7 +31,7 @@ tracing-verbose = []
 [dev-dependencies]
 criterion = { version = "0.8", features = ["html_reports"] }
 test-case = "3.3.1"
-tracing-subscriber = { version = "0.3.22", features = ["env-filter", "json"] }
+morok-schedule = { path = "../schedule", features = ["testing"] }
 
 [[bench]]
 name = "optimization"

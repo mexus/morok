@@ -338,6 +338,8 @@ impl OnnxImporter {
 
         // Process nodes in order (ONNX guarantees topological order)
         for (node_index, node) in graph.nodes.iter().enumerate() {
+            let _span = tracing::debug_span!("onnx_node", idx = node_index, op = %node.op_type).entered();
+
             let node_opset = if node.domain.is_empty() || node.domain == "ai.onnx" {
                 opset_version
             } else {
@@ -348,6 +350,28 @@ impl OnnxImporter {
                 self.process_if_node(node_index, node, &mut values, node_opset, &graph.subgraphs)?;
             } else {
                 self.process_node(node, &mut values, node_opset)?;
+            }
+
+            // At trace level: realize each output and dump first values.
+            // Intrusive (breaks fusion) — use for numerical bisection only.
+            // RUST_LOG=morok_onnx::importer=trace to enable.
+            #[allow(clippy::result_large_err)]
+            if tracing::enabled!(tracing::Level::TRACE) {
+                for out_name in &node.output {
+                    if let Some(tensor) = values.get_mut(out_name) {
+                        match tensor.clone().realize().and_then(|t| {
+                            *tensor = t.clone();
+                            t.to_vec::<f32>()
+                        }) {
+                            Ok(data) => {
+                                let first5: Vec<f32> = data.iter().take(5).copied().collect();
+                                let shape = tensor.shape().unwrap_or_default();
+                                tracing::trace!(%out_name, ?shape, ?first5, "node output");
+                            }
+                            _ => tracing::trace!(%out_name, "node output (non-f32)"),
+                        }
+                    }
+                }
             }
         }
 

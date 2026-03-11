@@ -73,19 +73,8 @@ fn test_diamond_elementwise_no_matmul() {
 // FAILING: fully-lazy LHS (no buffer root)
 // =========================================================================
 
-use std::sync::Once;
-use tracing_subscriber::EnvFilter;
-
-static TRACING_INIT: Once = Once::new();
-
-pub fn setup_tracing() {
-    TRACING_INIT.call_once(|| {
-        tracing_subscriber::fmt()
-            .json()
-            .with_env_filter(EnvFilter::from_default_env())
-            .with_test_writer() // Ensures output is captured by `cargo test`
-            .init();
-    });
+fn setup_tracing() {
+    morok_schedule::testing::setup_test_tracing();
 }
 
 /// Simplest failing case: arange → outer product → matmul.

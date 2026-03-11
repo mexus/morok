@@ -58,8 +58,6 @@ RUST_LOG="morok_schedule::rangeify::transforms=debug,\
 morok_schedule::rangeify::indexing=debug,\
 morok_schedule::rangeify::kernel=debug,\
 morok_schedule::optimizer=debug,\
-morok_schedule::expand=debug,\
-morok_schedule::devectorize=debug,\
 morok_schedule::linearize=debug,\
 morok_codegen=debug"
 

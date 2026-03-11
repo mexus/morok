@@ -1,17 +1,7 @@
 #![allow(non_snake_case)]
 
-use std::sync::Once;
-use tracing_subscriber::EnvFilter;
-
-static TRACING_INIT: Once = Once::new();
-
-pub fn setup_tracing() {
-    TRACING_INIT.call_once(|| {
-        tracing_subscriber::fmt()
-            .with_env_filter(EnvFilter::from_default_env())
-            .with_test_writer() // Ensures output is captured by `cargo test`
-            .init();
-    });
+fn setup_tracing() {
+    morok_schedule::testing::setup_test_tracing();
 }
 
 use super::helpers::run_onnx_node_test;
