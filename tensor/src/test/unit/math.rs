@@ -1,3 +1,4 @@
+use crate::test::helpers::*;
 use crate::*;
 use morok_dtype::DType;
 
@@ -128,88 +129,70 @@ fn test_isnan() {
 }
 
 #[test]
-fn test_isnan_values() {
-    let t = Tensor::from_slice([1.0f32, f32::NAN, 3.0]);
-    let vals = t.isnan().unwrap().to_vec::<bool>().unwrap();
-    assert_eq!(vals, [false, true, false]);
-}
-
-#[test]
 fn test_isinf() {
     let t = Tensor::from_slice([1.0f32, f32::INFINITY, f32::NEG_INFINITY]);
     let result = t.isinf(true, true).unwrap();
     assert_eq!(result.uop().dtype(), DType::Bool);
 }
 
-#[test]
-fn test_isinf_positive_only() {
-    let t = Tensor::from_slice([1.0f32, f32::INFINITY, f32::NEG_INFINITY]);
-    let vals = t.isinf(true, false).unwrap().to_vec::<bool>().unwrap();
-    assert_eq!(vals, [false, true, false]);
-}
+crate::codegen_tests! {
+    fn test_isnan_values(config) {
+        let t = Tensor::from_slice([1.0f32, f32::NAN, 3.0]);
+        let vals = t.isnan().unwrap().realize_with(&config).unwrap().to_vec::<bool>().unwrap();
+        assert_eq!(vals, [false, true, false]);
+    }
 
-// Hyperbolic function tests
-#[test]
-fn test_sinh_values() {
-    use crate::test::helpers::*;
-    let t = Tensor::from_slice([0.0f32, 1.0]);
-    assert_close_f32(&t.sinh().unwrap().to_vec::<f32>().unwrap(), &[0.0, 1.1752], 1e-3);
-}
+    fn test_isinf_positive_only(config) {
+        let t = Tensor::from_slice([1.0f32, f32::INFINITY, f32::NEG_INFINITY]);
+        let vals = t.isinf(true, false).unwrap().realize_with(&config).unwrap().to_vec::<bool>().unwrap();
+        assert_eq!(vals, [false, true, false]);
+    }
 
-#[test]
-fn test_cosh_values() {
-    use crate::test::helpers::*;
-    let t = Tensor::from_slice([0.0f32, 1.0]);
-    assert_close_f32(&t.cosh().unwrap().to_vec::<f32>().unwrap(), &[1.0, 1.5431], 1e-3);
-}
+    // Hyperbolic function tests
+    fn test_sinh_values(config) {
+        let t = Tensor::from_slice([0.0f32, 1.0]);
+        assert_close_f32(&t.sinh().unwrap().realize_with(&config).unwrap().to_vec::<f32>().unwrap(), &[0.0, 1.1752], 1e-3);
+    }
 
-#[test]
-fn test_asinh_values() {
-    use crate::test::helpers::*;
-    let t = Tensor::from_slice([0.0f32, 1.0]);
-    assert_close_f32(&t.asinh().unwrap().to_vec::<f32>().unwrap(), &[0.0, 0.8814], 1e-3);
-}
+    fn test_cosh_values(config) {
+        let t = Tensor::from_slice([0.0f32, 1.0]);
+        assert_close_f32(&t.cosh().unwrap().realize_with(&config).unwrap().to_vec::<f32>().unwrap(), &[1.0, 1.5431], 1e-3);
+    }
 
-#[test]
-fn test_acosh_values() {
-    use crate::test::helpers::*;
-    let t = Tensor::from_slice([1.0f32, 2.0]);
-    assert_close_f32(&t.acosh().unwrap().to_vec::<f32>().unwrap(), &[0.0, 1.3170], 1e-3);
-}
+    fn test_asinh_values(config) {
+        let t = Tensor::from_slice([0.0f32, 1.0]);
+        assert_close_f32(&t.asinh().unwrap().realize_with(&config).unwrap().to_vec::<f32>().unwrap(), &[0.0, 0.8814], 1e-3);
+    }
 
-#[test]
-fn test_atanh_values() {
-    use crate::test::helpers::*;
-    let t = Tensor::from_slice([0.0f32, 0.5]);
-    assert_close_f32(&t.atanh().unwrap().to_vec::<f32>().unwrap(), &[0.0, 0.5493], 1e-3);
-}
+    fn test_acosh_values(config) {
+        let t = Tensor::from_slice([1.0f32, 2.0]);
+        assert_close_f32(&t.acosh().unwrap().realize_with(&config).unwrap().to_vec::<f32>().unwrap(), &[0.0, 1.3170], 1e-3);
+    }
 
-// Inverse trigonometric tests
-#[test]
-fn test_asin_values() {
-    use crate::test::helpers::*;
-    let t = Tensor::from_slice([0.0f32, 0.5, 1.0]);
-    assert_close_f32(&t.asin().unwrap().to_vec::<f32>().unwrap(), &[0.0, 0.5236, 1.5708], 1e-3);
-}
+    fn test_atanh_values(config) {
+        let t = Tensor::from_slice([0.0f32, 0.5]);
+        assert_close_f32(&t.atanh().unwrap().realize_with(&config).unwrap().to_vec::<f32>().unwrap(), &[0.0, 0.5493], 1e-3);
+    }
 
-#[test]
-fn test_acos_values() {
-    use crate::test::helpers::*;
-    let t = Tensor::from_slice([0.0f32, 0.5, 1.0]);
-    assert_close_f32(&t.acos().unwrap().to_vec::<f32>().unwrap(), &[1.5708, 1.0472, 0.0], 1e-3);
-}
+    // Inverse trigonometric tests
+    fn test_asin_values(config) {
+        let t = Tensor::from_slice([0.0f32, 0.5, 1.0]);
+        assert_close_f32(&t.asin().unwrap().realize_with(&config).unwrap().to_vec::<f32>().unwrap(), &[0.0, 0.5236, 1.5708], 1e-3);
+    }
 
-#[test]
-fn test_atan_values() {
-    use crate::test::helpers::*;
-    let t = Tensor::from_slice([0.0f32, 1.0]);
-    assert_close_f32(&t.atan().unwrap().to_vec::<f32>().unwrap(), &[0.0, 0.7854], 1e-3);
-}
+    fn test_acos_values(config) {
+        let t = Tensor::from_slice([0.0f32, 0.5, 1.0]);
+        assert_close_f32(&t.acos().unwrap().realize_with(&config).unwrap().to_vec::<f32>().unwrap(), &[1.5708, 1.0472, 0.0], 1e-3);
+    }
 
-// Shrink test
-#[test]
-fn test_shrink_values() {
-    use crate::test::helpers::*;
-    let t = Tensor::from_slice([-2.0f32, -0.3, 0.0, 0.3, 2.0]);
-    assert_close_f32(&t.shrink(0.0, 0.5).unwrap().to_vec::<f32>().unwrap(), &[-2.0, 0.0, 0.0, 0.0, 2.0], 1e-4);
+    fn test_atan_values(config) {
+        let t = Tensor::from_slice([0.0f32, 1.0]);
+        assert_close_f32(&t.atan().unwrap().realize_with(&config).unwrap().to_vec::<f32>().unwrap(), &[0.0, 0.7854], 1e-3);
+    }
+
+    // Shrink test
+    fn test_shrink_values(config) {
+        let t = Tensor::from_slice([-2.0f32, -0.3, 0.0, 0.3, 2.0]);
+        assert_close_f32(&t.shrink(0.0, 0.5).unwrap().realize_with(&config).unwrap().to_vec::<f32>().unwrap(), &[-2.0, 0.0, 0.0, 0.0, 2.0], 1e-4);
+    }
 }

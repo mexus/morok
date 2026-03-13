@@ -62,35 +62,69 @@ impl ReduceContext {
     /// Matches Tinygrad's `merge_reduce_ends` (devectorizer.py:333-336).
     pub fn merge_reduce_ends(&mut self, sources: &SmallVec<[Arc<UOp>; 4]>) -> Option<Arc<UOp>> {
         #[allow(clippy::mutable_key_type)]
-        let mut subs: HashMap<UOpKey, Arc<UOp>> = HashMap::new();
-        for ends in self.range_to_ends.values() {
-            if ends.len() <= 1 {
-                continue;
-            }
-            let computations: Vec<Arc<UOp>> = ends
-                .iter()
-                .map(|e| match e.op() {
-                    Op::End { computation, .. } => computation.clone(),
-                    _ => unreachable!(),
-                })
-                .collect();
-            let ranges = match ends[0].op() {
-                Op::End { ranges, .. } => ranges.clone(),
-                _ => unreachable!(),
-            };
-            let merged = UOp::group(computations).end(ranges);
-            for end in ends {
-                subs.insert(UOpKey(end.clone()), merged.clone());
-            }
-        }
+        let subs = build_end_merge_subs(&self.range_to_ends);
         self.range_to_ends.clear();
-
         if subs.is_empty() {
             return None;
         }
-        let sink = UOp::sink(sources.to_vec());
-        Some(sink.substitute(&subs))
+        Some(UOp::sink(sources.to_vec()).substitute(&subs))
     }
+}
+
+/// Core merge logic: given a map of range-key → END nodes, build substitutions.
+#[allow(clippy::mutable_key_type)]
+fn build_end_merge_subs(range_to_ends: &HashMap<SmallVec<[u64; 4]>, Vec<Arc<UOp>>>) -> HashMap<UOpKey, Arc<UOp>> {
+    let mut subs = HashMap::new();
+    for ends in range_to_ends.values() {
+        if ends.len() <= 1 {
+            continue;
+        }
+        let computations: Vec<Arc<UOp>> = ends
+            .iter()
+            .map(|e| match e.op() {
+                Op::End { computation, .. } => computation.clone(),
+                _ => unreachable!(),
+            })
+            .collect();
+        let ranges = match ends[0].op() {
+            Op::End { ranges, .. } => ranges.clone(),
+            _ => unreachable!(),
+        };
+        let merged = UOp::group(computations).end(ranges);
+        for end in ends {
+            subs.insert(UOpKey(end.clone()), merged.clone());
+        }
+    }
+    subs
+}
+
+/// Merge sibling END nodes that share the same reduce ranges (standalone pass).
+///
+/// Walks the SINK subgraph, discovers all END nodes, groups by range key,
+/// and merges groups of >1 into `GROUP(computations...).end(ranges)`.
+///
+/// This is the same merge as `ReduceContext::merge_reduce_ends` but doesn't
+/// require tracking during pm_reduce — it discovers ENDs from the graph directly.
+/// Needed because later passes (e.g. pm_decomp+pm_render) can create new sibling
+/// ENDs that weren't present when pm_reduce ran.
+pub fn merge_sibling_ends(sink: &Arc<UOp>) -> Arc<UOp> {
+    let Op::Sink { sources } = sink.op() else { return sink.clone() };
+
+    let mut range_to_ends: HashMap<SmallVec<[u64; 4]>, Vec<Arc<UOp>>> = HashMap::new();
+    for node in sink.toposort() {
+        if let Op::End { ranges, .. } = node.op() {
+            let mut key: SmallVec<[u64; 4]> = ranges.iter().map(|r| r.id).collect();
+            key.sort_unstable();
+            range_to_ends.entry(key).or_default().push(node.clone());
+        }
+    }
+
+    #[allow(clippy::mutable_key_type)]
+    let subs = build_end_merge_subs(&range_to_ends);
+    if subs.is_empty() {
+        return sink.clone();
+    }
+    UOp::sink(sources.to_vec()).substitute(&subs)
 }
 
 use crate::rewrite::graph_rewrite;

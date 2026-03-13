@@ -2,6 +2,20 @@ use ndarray::{Array1, Array3, array};
 
 use crate::Tensor;
 
+// =========================================================================
+// Codegen-required tests
+// =========================================================================
+
+crate::codegen_tests! {
+    fn test_to_vec_computed(config) {
+        let a = Tensor::from_slice(&[1.0f32, 2.0, 3.0]);
+        let b = Tensor::from_slice(&[10.0f32, 20.0, 30.0]);
+        let c = (&a + &b).realize_with(&config).unwrap();
+        let v = c.to_vec::<f32>().unwrap();
+        assert_eq!(v, vec![11.0, 22.0, 33.0]);
+    }
+}
+
 // === from_ndarray ===
 
 #[test]
@@ -74,15 +88,6 @@ fn test_to_vec_f32() {
     let t = Tensor::from_slice(&[1.0f32, 2.0, 3.0]);
     let v = t.to_vec::<f32>().unwrap();
     assert_eq!(v, vec![1.0, 2.0, 3.0]);
-}
-
-#[test]
-fn test_to_vec_computed() {
-    let a = Tensor::from_slice(&[1.0f32, 2.0, 3.0]);
-    let b = Tensor::from_slice(&[10.0f32, 20.0, 30.0]);
-    let c = (&a + &b).realize().unwrap();
-    let v = c.to_vec::<f32>().unwrap();
-    assert_eq!(v, vec![11.0, 22.0, 33.0]);
 }
 
 // === array_view ===

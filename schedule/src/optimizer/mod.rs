@@ -301,6 +301,18 @@ pub fn apply_post_optimization_with_renderer(
         "Stage 18-19: after pm_decomp + pm_render"
     );
 
+    // Merge sibling ENDs that share the same reduce ranges.
+    // pm_decomp+pm_render can create new sibling ENDs (e.g. by rewriting computations
+    // inside an END differently per vector lane). merge_reduce_ends ran earlier in
+    // pm_reduce but only caught ENDs that existed at that point.
+    let t_merge = std::time::Instant::now();
+    let rendered = crate::devectorize::merge_sibling_ends(&rendered);
+    tracing::debug!(
+        ast.optimized = rendered.tree(),
+        elapsed_ms = t_merge.elapsed().as_millis() as u64,
+        "after merge_sibling_ends"
+    );
+
     // FP8 float decomposition: promote FP8 computation to Float16 via bitwise conversion.
     // Uses graph_rewrite_with_bpm: STORE pattern in bpm (sees ORIGINAL children to detect
     // FP8 buffer ptrs), all other patterns in pm (sees OPTIMIZED children).

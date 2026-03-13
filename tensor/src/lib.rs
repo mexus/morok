@@ -14,6 +14,7 @@ pub mod arithmetic;
 pub mod bitwise;
 pub mod broadcast;
 pub mod conditional;
+pub mod config;
 pub mod data;
 pub mod einsum;
 pub mod indexing;
@@ -30,6 +31,8 @@ pub mod traits;
 pub mod transformer;
 
 // Re-export for public API
+pub use config::PrepareConfig;
+pub use morok_runtime::CpuBackend;
 pub use tensor_registry::apply_map_to_tensors;
 
 /// Reduction operations supported by cumulative reduce (`_cumalu`).

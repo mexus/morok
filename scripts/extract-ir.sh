@@ -76,6 +76,7 @@ echo "Running: RUST_LOG=... cargo ${CARGO_ARGS[*]}" >&2
 #   .fields["ast.optimized"] — post-optimization IR tree
 #   .fields["ast.initial"]   — kernel input tree (emitted once per kernel)
 #   .fields["generated_c"]   — generated C kernel code
+#   .fields["generated_code"] — generated kernel code (LLVM IR, etc.)
 #   .fields.elapsed_ms       — stage timing (ms)
 #   .target                  — module path
 
@@ -102,6 +103,7 @@ reduce .[] as $e (
   ($e.fields["ast.optimized"] // null) as $opt    |
   ($e.fields["ast.initial"]   // null) as $init   |
   ($e.fields["generated_c"]   // null) as $ccode  |
+  ($e.fields["generated_code"] // null) as $gcode  |
   ($e.fields.elapsed_ms       // null) as $ms     |
   ($e.fields.message          // "?")  as $msg    |
 
@@ -138,6 +140,9 @@ reduce .[] as $e (
   elif $ccode then
     .out += "--- C KERNEL CODE ---\n\($ccode)\n\n"
 
+  elif $gcode then
+    .out += "--- GENERATED CODE ---\n\($gcode)\n\n"
+
   elif $ms then
     .out += "\(hdr($msg; $ms))\n\n"
 
@@ -147,7 +152,7 @@ reduce .[] as $e (
 ' > "$OUTPUT"
 
 STAGES=$(rg -c '^--- ' "$OUTPUT" || true)
-KERNELS=$(rg -c 'C KERNEL CODE' "$OUTPUT" || echo 0)
+KERNELS=$(rg -c 'KERNEL CODE\|GENERATED CODE' "$OUTPUT" || echo 0)
 
 if [[ "${STAGES:-0}" -eq 0 ]]; then
     echo "No stages found. Is the test using .json() tracing?" >&2

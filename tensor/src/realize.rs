@@ -38,11 +38,10 @@ use morok_schedule::{
 use tracing::{debug, trace};
 
 use crate::{
-    Result, Tensor,
+    PrepareConfig, Result, Tensor,
     error::{
-        CompileKernelSnafu, CreateProgramSnafu, DependencyCyclesSnafu, DeviceFactorySnafu, DeviceSnafu,
-        EmptyScheduleSnafu, ExecutionSnafu, OptimizeSnafu, RangeifySnafu, RenderKernelSnafu, ShapeUnknownSnafu,
-        UOpSnafu,
+        CompileKernelSnafu, CreateProgramSnafu, DependencyCyclesSnafu, DeviceSnafu, EmptyScheduleSnafu, ExecutionSnafu,
+        OptimizeSnafu, RangeifySnafu, RenderKernelSnafu, ShapeUnknownSnafu, UOpSnafu,
     },
     schedule::{Schedule, ScheduleItem, expand_schedule},
 };
@@ -123,25 +122,26 @@ impl Tensor {
         Ok(result)
     }
 
-    /// Realize tensor with custom optimizer configuration.
+    /// Realize tensor with custom configuration.
     ///
-    /// Like [`realize()`](Self::realize) but allows specifying optimization strategy:
-    /// - Beam search width
-    /// - Devectorization settings
-    /// - Heuristics configuration
+    /// Like [`realize()`](Self::realize) but allows specifying optimization strategy
+    /// and codegen backend.
     ///
     /// # Example
     ///
     /// ```ignore
+    /// use morok_tensor::PrepareConfig;
     /// use morok_schedule::{OptStrategy, OptimizerConfig};
     ///
     /// let c = a.matmul(&b)?;
-    /// let config = OptimizerConfig::builder()
-    ///     .strategy(OptStrategy::Beam { width: 4 })
-    ///     .build();
+    /// let config = PrepareConfig::from(
+    ///     OptimizerConfig::builder()
+    ///         .strategy(OptStrategy::Beam { width: 4 })
+    ///         .build()
+    /// );
     /// let c = c.realize_with(&config)?;
     /// ```
-    pub fn realize_with(self, config: &morok_schedule::OptimizerConfig) -> Result<Self> {
+    pub fn realize_with(self, config: &PrepareConfig) -> Result<Self> {
         if self.uop().has_buffer_identity() {
             return Ok(self.ensure_buffer());
         }
@@ -249,43 +249,34 @@ impl Tensor {
     /// - Kernel compilation fails
     /// - Buffer allocation fails
     pub fn prepare(&self) -> Result<ExecutionPlan> {
-        self.prepare_with(&morok_schedule::OptimizerConfig::from_env())
+        self.prepare_with(&PrepareConfig::from_env())
     }
 
-    /// Prepare an execution plan with explicit optimizer configuration.
+    /// Prepare an execution plan with explicit configuration.
     ///
-    /// This method allows fine-grained control over kernel optimization settings,
-    /// including beam search width, heuristic parameters, and tensor core usage.
+    /// This method allows fine-grained control over kernel optimization settings
+    /// and codegen backend selection.
     ///
     /// # Example
     ///
     /// ```ignore
+    /// use morok_tensor::PrepareConfig;
     /// use morok_schedule::{OptimizerConfig, OptStrategy, BeamConfig};
     ///
     /// // Beam search with width 8 and 120s timeout
-    /// let config = OptimizerConfig::builder()
-    ///     .strategy(OptStrategy::Beam { width: 8 })
-    ///     .beam(BeamConfig::builder()
-    ///         .timeout_secs(120)
-    ///         .build())
-    ///     .build();
+    /// let config = PrepareConfig::from(
+    ///     OptimizerConfig::builder()
+    ///         .strategy(OptStrategy::Beam { width: 8 })
+    ///         .beam(BeamConfig::builder()
+    ///             .timeout_secs(120)
+    ///             .build())
+    ///         .build()
+    /// );
     ///
     /// let plan = tensor.prepare_with(&config)?;
     /// plan.execute(&mut executor)?;
     /// ```
-    ///
-    /// # Arguments
-    ///
-    /// * `config` - Optimizer configuration controlling optimization strategy
-    ///
-    /// # Errors
-    ///
-    /// Returns error if:
-    /// - Rangeify transformation fails
-    /// - No kernels found after scheduling
-    /// - Kernel compilation fails
-    /// - Buffer allocation fails
-    pub fn prepare_with(&self, config: &morok_schedule::OptimizerConfig) -> Result<ExecutionPlan> {
+    pub fn prepare_with(&self, config: &PrepareConfig) -> Result<ExecutionPlan> {
         let uop = self.uop();
         let shape = uop.shape().context(UOpSnafu)?.context(ShapeUnknownSnafu)?;
         let output_dtype = uop.dtype();
@@ -508,7 +499,7 @@ fn prepare_execution_plan(
     schedule: &Schedule,
     expected_output_dtype: DType,
     expected_output_size: usize,
-    config: &morok_schedule::OptimizerConfig,
+    config: &PrepareConfig,
 ) -> Result<ExecutionPlan> {
     // Expand the schedule to handle OUTER range iterations
     let expanded_schedule = expand_schedule(schedule.clone());
@@ -526,20 +517,22 @@ fn prepare_execution_plan(
         return DependencyCyclesSnafu.fail();
     }
 
-    // Get device from first buffer in first kernel (Tinygrad pattern: ctx[0].device)
+    // Get device via config's resolver (allows per-call backend selection).
     let alloc_registry = morok_device::registry::registry();
     let device = if let Some(first_item) = expanded_schedule.first() {
-        if let Some(first_buffer) = first_item.buffers.first() {
-            let device_spec = first_buffer.allocator().device_spec();
-            morok_runtime::DEVICE_FACTORIES.device(&device_spec, alloc_registry).context(DeviceFactorySnafu)?
-        } else {
-            morok_runtime::DEVICE_FACTORIES.device(&DeviceSpec::Cpu, alloc_registry).context(DeviceFactorySnafu)?
-        }
+        let device_spec = first_item.buffers.first().map(|b| b.allocator().device_spec()).unwrap_or(DeviceSpec::Cpu);
+        config.resolve_device(&device_spec, alloc_registry)?
     } else {
         return EmptyScheduleSnafu.fail();
     };
 
-    let device_str = device.device.canonicalize();
+    // Include compiler cache key in device string to prevent cross-backend cache collisions.
+    // Without this, "CPU" is shared between Clang and LLVM, so switching backends in the
+    // same process would return a kernel compiled by the wrong backend.
+    let device_str = match device.compiler.cache_key() {
+        Some(key) => format!("{}:{}", device.device.canonicalize(), key),
+        None => device.device.canonicalize(),
+    };
 
     // Build the ExecutionPlan using the builder
     let mut builder = ExecutionPlanBuilder::new(device.device.clone());
@@ -576,12 +569,12 @@ fn prepare_execution_plan(
         let optimizer_renderer = get_optimizer_renderer(&device);
 
         // Step 2: Optimize OUTSIDE cache (enables beam search)
-        let optimized_ast = if let morok_schedule::OptStrategy::Beam { .. } = config.strategy {
+        let optimized_ast = if let morok_schedule::OptStrategy::Beam { .. } = config.optimizer.strategy {
             // Beam search: compile-and-time multiple candidates
-            beam_search_optimize(item.ast.clone(), &optimizer_renderer, &device, &item.buffers, config)?
+            beam_search_optimize(item.ast.clone(), &optimizer_renderer, &device, &item.buffers, &config.optimizer)?
         } else {
             // Heuristic optimization (default)
-            morok_schedule::optimize_kernel_with_config(item.ast.clone(), &optimizer_renderer, config)
+            morok_schedule::optimize_kernel_with_config(item.ast.clone(), &optimizer_renderer, &config.optimizer)
         };
 
         // Step 3: Apply decomposition

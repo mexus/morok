@@ -41,17 +41,9 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec<Stri
             Some(())
         }
 
-        Op::Index { buffer, indices, gate } => {
+        Op::Index { buffer, indices, .. } => {
             let buf = ctx.get(buffer);
             let buf_type = ldt(&buffer.dtype());
-
-            tracing::debug!(
-                index_id = uop.id,
-                buffer_id = buffer.id,
-                uop_dtype = ?uop.dtype(),
-                buffer_dtype = ?buffer.dtype(),
-                "INDEX codegen"
-            );
 
             if indices.is_empty() {
                 kernel.push(format!("  {dst} = bitcast {buf_type} {buf} to {}", ldt(&uop.dtype())));
@@ -68,20 +60,12 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec<Stri
                     other => ldt(&other),
                 };
 
-                if gate.is_some() {
-                    let gate_val = ctx.get(gate.as_ref().unwrap());
-                    let null_ptr = format!("{dst}.null");
-                    let gep_ptr = format!("{dst}.gep");
-                    kernel.push(format!(
-                        "  {gep_ptr} = getelementptr inbounds {elem_type}, ptr {buf}, {final_idx_type} {final_idx}"
-                    ));
-                    kernel.push(format!("  {null_ptr} = inttoptr i64 0 to ptr"));
-                    kernel.push(format!("  {dst} = select i1 {gate_val}, ptr {gep_ptr}, ptr {null_ptr}"));
-                } else {
-                    kernel.push(format!(
-                        "  {dst} = getelementptr inbounds {elem_type}, ptr {buf}, {final_idx_type} {final_idx}"
-                    ));
-                }
+                // Gate is NOT handled here — matching Tinygrad's approach where INDEX
+                // always emits a plain GEP. The gate is handled at LOAD level (branch+phi)
+                // and at STORE level (IF/ENDIF via line_rewrite_cleanups).
+                kernel.push(format!(
+                    "  {dst} = getelementptr inbounds {elem_type}, ptr {buf}, {final_idx_type} {final_idx}"
+                ));
             }
             Some(())
         }
@@ -99,11 +83,48 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec<Stri
             Some(())
         }
 
-        Op::Load { index, .. } => {
+        Op::Load { index, alt, .. } => {
             let idx = ctx.get(index);
             let dtype = ldt(&uop.dtype());
-            // LLVM uses opaque pointers (ptr) for all pointer types since LLVM 14+
-            kernel.push(format!("  {dst} = load {dtype}, ptr {idx}"));
+
+            // Gated LOAD: emit branch+phi to avoid null deref.
+            // Matches Tinygrad's pattern (llvmir.py:123-129) which requires BOTH
+            // a gated INDEX and an alt value on the LOAD. If gate exists without
+            // alt, that's a pipeline bug (line_rewrite_cleanups should provide it).
+            // Unwrap one CAST layer to find the INDEX gate (matches Tinygrad's .or_casted("idx")).
+            // The pipeline CAN produce CAST(INDEX) — devectorize handles this shape explicitly.
+            let actual_index = match index.op() {
+                Op::Cast { src, .. } => src,
+                _ => index,
+            };
+            let gate_info = if let Op::Index { gate: Some(gate_uop), .. } = actual_index.op() {
+                let alt_uop = alt.as_ref().expect(
+                    "gated LOAD without alt value — pipeline bug: \
+                     line_rewrite_cleanups should ensure alt is present for gated loads",
+                );
+                Some((ctx.get(gate_uop).to_string(), ctx.get(alt_uop).to_string()))
+            } else {
+                None
+            };
+
+            if let Some((gate, alt_val)) = gate_info {
+                let label_base = &dst[1..]; // strip leading %
+                let entry_label = format!("{label_base}_entry");
+                let load_label = format!("{label_base}_load");
+                let exit_label = format!("{label_base}_exit");
+                let load_val = format!("{dst}_yes");
+
+                kernel.push(format!("  br label %{entry_label}"));
+                kernel.push(format!("{entry_label}:"));
+                kernel.push(format!("  br i1 {gate}, label %{load_label}, label %{exit_label}"));
+                kernel.push(format!("{load_label}:"));
+                kernel.push(format!("  {load_val} = load {dtype}, ptr {idx}"));
+                kernel.push(format!("  br label %{exit_label}"));
+                kernel.push(format!("{exit_label}:"));
+                kernel.push(format!("  {dst} = phi {dtype} [{load_val}, %{load_label}], [{alt_val}, %{entry_label}]"));
+            } else {
+                kernel.push(format!("  {dst} = load {dtype}, ptr {idx}"));
+            }
             Some(())
         }
 
@@ -458,6 +479,11 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec<Stri
 }
 
 fn binary_instr(op: BinaryOp, dtype: &DType) -> &'static str {
+    assert!(
+        !matches!(dtype.base(), morok_dtype::ScalarDType::Index),
+        "Index dtype reached LLVM codegen binary_instr({op:?}, {dtype:?}) — \
+         pm_lower_index_dtype should have lowered it to i32/i64"
+    );
     let is_float = dtype.is_float();
     let is_signed = dtype.is_signed();
 
