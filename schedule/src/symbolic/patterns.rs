@@ -589,37 +589,35 @@ fn fold_divmod_general(op: BinaryOp, x: &Arc<UOp>, y: &Arc<UOp>) -> Option<Arc<U
             if let Op::Const(cv) = g_uop.op()
                 && let ConstValue::Int(g) = cv.0
                 && g > 1
-                && let Some(new_x_base) = x_peeled.divide_exact(&g_uop) {
-                    let const_rem_div_g = (const_val.rem_euclid(c)) / g;
-                    let new_x = if const_rem_div_g != 0 {
-                        new_x_base.try_add(&x.const_like(const_rem_div_g)).ok()?
-                    } else {
-                        new_x_base
-                    };
+                && let Some(new_x_base) = x_peeled.divide_exact(&g_uop)
+            {
+                let const_rem_div_g = (const_val.rem_euclid(c)) / g;
+                let new_x = if const_rem_div_g != 0 {
+                    new_x_base.try_add(&x.const_like(const_rem_div_g)).ok()?
+                } else {
+                    new_x_base
+                };
 
-                    let (new_vmin, _) = VminVmaxProperty::get(&new_x);
-                    if let ConstValue::Int(nv) = new_vmin
-                        && *nv >= 0
-                    {
-                        let new_c_uop = x.const_like(c / g);
-                        if op == BinaryOp::Mod {
-                            let ret = new_x.try_mod(&new_c_uop).ok()?;
-                            let result = ret.try_mul(&x.const_like(g)).ok()?;
-                            let const_mod_g = const_val.rem_euclid(g);
-                            let r = if const_mod_g != 0 {
-                                result.try_add(&x.const_like(const_mod_g)).ok()?
-                            } else {
-                                result
-                            };
-                            return Some(r);
-                        } else {
-                            let ret = new_x.try_div(&new_c_uop).ok()?;
-                            let const_div_c = const_val / c;
-                            let r = if const_div_c != 0 { ret.try_add(&x.const_like(const_div_c)).ok()? } else { ret };
-                            return Some(r);
-                        }
+                let (new_vmin, _) = VminVmaxProperty::get(&new_x);
+                if let ConstValue::Int(nv) = new_vmin
+                    && *nv >= 0
+                {
+                    let new_c_uop = x.const_like(c / g);
+                    if op == BinaryOp::Mod {
+                        let ret = new_x.try_mod(&new_c_uop).ok()?;
+                        let result = ret.try_mul(&x.const_like(g)).ok()?;
+                        let const_mod_g = const_val.rem_euclid(g);
+                        let r =
+                            if const_mod_g != 0 { result.try_add(&x.const_like(const_mod_g)).ok()? } else { result };
+                        return Some(r);
+                    } else {
+                        let ret = new_x.try_div(&new_c_uop).ok()?;
+                        let const_div_c = const_val / c;
+                        let r = if const_div_c != 0 { ret.try_add(&x.const_like(const_div_c)).ok()? } else { ret };
+                        return Some(r);
                     }
                 }
+            }
         }
     }
 
@@ -639,16 +637,16 @@ fn fold_divmod_general(op: BinaryOp, x: &Arc<UOp>, y: &Arc<UOp>) -> Option<Arc<U
         let is_trivial = matches!(g_uop.op(), Op::Const(cv) if matches!(cv.0, ConstValue::Int(1)));
         if !is_trivial
             && let Some(x_div) = x.divide_exact(&g_uop)
-                && let Some(y_div) = y.divide_exact(&g_uop)
-            {
-                let r = if op == BinaryOp::Mod {
-                    let ret = x_div.try_mod(&y_div).ok()?;
-                    ret.try_mul(&g_uop).ok()?
-                } else {
-                    x_div.try_div(&y_div).ok()?
-                };
-                return Some(r);
-            }
+            && let Some(y_div) = y.divide_exact(&g_uop)
+        {
+            let r = if op == BinaryOp::Mod {
+                let ret = x_div.try_mod(&y_div).ok()?;
+                ret.try_mul(&g_uop).ok()?
+            } else {
+                x_div.try_div(&y_div).ok()?
+            };
+            return Some(r);
+        }
     }
 
     // 7. factor_remainder: (d*x+y)//d → x+y//d

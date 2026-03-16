@@ -208,9 +208,10 @@ impl Tensor {
         // Zero-size tensor: return empty vec without realization (matches to_ndarray)
         let uop = self.uop();
         if let Ok(Some(shape)) = uop.shape()
-            && shape.iter().any(|dim| dim.as_const() == Some(0)) {
-                return Ok(vec![]);
-            }
+            && shape.iter().any(|dim| dim.as_const() == Some(0))
+        {
+            return Ok(vec![]);
+        }
 
         let realized = self.clone().contiguous().realize()?;
         let buffer = realized.buffer().ok_or(Error::NoBuffer)?;

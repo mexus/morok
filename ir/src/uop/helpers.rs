@@ -35,13 +35,15 @@ impl UOp {
             // MUL: only immediate CONST child, matching Tinygrad exactly
             Op::Binary(BinaryOp::Mul, a, b) => {
                 if let Op::Const(cv) = &a.op
-                    && let ConstValue::Int(i) = cv.0 {
-                        return i;
-                    }
+                    && let ConstValue::Int(i) = cv.0
+                {
+                    return i;
+                }
                 if let Op::Const(cv) = &b.op
-                    && let ConstValue::Int(i) = cv.0 {
-                        return i;
-                    }
+                    && let ConstValue::Int(i) = cv.0
+                {
+                    return i;
+                }
                 1
             }
             Op::Binary(BinaryOp::Add, a, b) => gcd(a.const_factor().abs(), b.const_factor().abs()),
