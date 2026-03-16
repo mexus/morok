@@ -266,12 +266,15 @@ pub fn split_store(_ctx: &mut Vec<Arc<UOp>>, x: &Arc<UOp>) -> Option<Arc<UOp>> {
 
     // Combined single-pass rewrite (Tinygrad: to_define_global + pm_flatten_range + rangeify_codegen)
     let ret = {
-        let matcher = local_to_define_global_patterns()
-            + movement_op_patterns().with_context::<LocalAddBufferContext>()
-            + pm_syntactic_sugar().with_context::<LocalAddBufferContext>()
-            + pm_flatten_range().with_context::<LocalAddBufferContext>()
-            + rangeify_codegen_patterns();
-        graph_rewrite_bottom_up(&matcher, x.clone(), &mut lctx)
+        use std::sync::LazyLock;
+        static PM_RANGEIFY: LazyLock<crate::TypedPatternMatcher<LocalAddBufferContext>> = LazyLock::new(|| {
+            local_to_define_global_patterns()
+                + movement_op_patterns().with_context::<LocalAddBufferContext>()
+                + pm_syntactic_sugar().with_context::<LocalAddBufferContext>()
+                + pm_flatten_range().with_context::<LocalAddBufferContext>()
+                + rangeify_codegen_patterns()
+        });
+        graph_rewrite_bottom_up(&*PM_RANGEIFY, x.clone(), &mut lctx)
     };
 
     // Find COPY/BUFFER_VIEW or wrap in SINK (like Tinygrad rangeify.py:495-501)
@@ -496,8 +499,10 @@ fn detect_expanded_dimensions(source: &Arc<UOp>, input_shape: &[SInt]) -> Vec<bo
     use crate::rewrite::graph_rewrite_bottom_up;
 
     // Tinygrad: pm_mops + pm_syntactic_sugar (early movement ops, bottom_up=True)
-    let pm_mops = movement_op_patterns() + pm_syntactic_sugar();
-    let transformed = graph_rewrite_bottom_up(&pm_mops, substituted, &mut ());
+    use std::sync::LazyLock;
+    static PM_MOPS: LazyLock<crate::TypedPatternMatcher> =
+        LazyLock::new(|| movement_op_patterns() + pm_syntactic_sugar());
+    let transformed = graph_rewrite_bottom_up(&*PM_MOPS, substituted, &mut ());
 
     let surviving_range_ids = collect_range_ids(&transformed);
     let surviving_set: HashSet<usize> = surviving_range_ids.into_iter().collect();

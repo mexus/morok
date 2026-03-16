@@ -145,30 +145,36 @@ use crate::symbolic::patterns::symbolic;
 /// Note: `bool_storage_patterns()` called separately (backend-specific).
 /// Note: `pm_render()` should be applied AFTER this pass.
 pub fn devectorize(ast: &Arc<UOp>) -> Arc<UOp> {
+    use std::sync::LazyLock;
+
     // Phase 1: Devectorize ALU, WMMA, buffers, and expand vector indices
-    let pm_phase1 = symbolic() + devectorize_patterns() + expand_index_patterns();
-    let ast = graph_rewrite(&pm_phase1, ast.clone(), &mut ());
+    static PHASE1: LazyLock<TypedPatternMatcher> =
+        LazyLock::new(|| symbolic() + devectorize_patterns() + expand_index_patterns());
+    let ast = graph_rewrite(&*PHASE1, ast.clone(), &mut ());
 
     // Phase 2: Move GEP through LOAD/STORE AND distribute PTRCAT
     // These must be in the same pass because:
     // - move_gep_after_load creates LOAD(PTRCAT) from LOAD(GEP(PTRCAT))
     // - distribute_ptrcat_load needs to match the newly created LOAD(PTRCAT)
     // - The rewrite engine's fixed-point matching allows this in a single pass
-    let pm_phase2 = symbolic()
-        + gep_simplification_patterns()
-        + gep_movement_patterns()
-        + ptrcat_distribution_patterns()
-        + contiguous_gep_load_patterns();
-    let ast = graph_rewrite(&pm_phase2, ast, &mut ());
+    static PHASE2: LazyLock<TypedPatternMatcher> = LazyLock::new(|| {
+        symbolic()
+            + gep_simplification_patterns()
+            + gep_movement_patterns()
+            + ptrcat_distribution_patterns()
+            + contiguous_gep_load_patterns()
+    });
+    let ast = graph_rewrite(&*PHASE2, ast, &mut ());
 
     // Phase 3: Split loads/stores by device fold lengths, drop true gates
-    let pm_phase3 = symbolic() + correct_load_store_patterns() + load_store_indexing_patterns();
-    graph_rewrite(&pm_phase3, ast, &mut ())
+    static PHASE3: LazyLock<TypedPatternMatcher> =
+        LazyLock::new(|| symbolic() + correct_load_store_patterns() + load_store_indexing_patterns());
+    graph_rewrite(&*PHASE3, ast, &mut ())
 }
 
 /// Bool LOAD/STORE via uint8. LLVM i1 can have garbage in upper bits.
-pub fn bool_storage_patterns() -> TypedPatternMatcher {
-    crate::patterns! {
+pub fn bool_storage_patterns() -> &'static TypedPatternMatcher {
+    crate::cached_patterns! {
         // STORE bool: cast to uint8 before storing
         Store { index, value, ranges } if value.dtype().base().is_bool() => {
             let uint8_dtype = value.dtype().with_base(ScalarDType::UInt8);
@@ -395,8 +401,8 @@ pub fn pm_float_decomp() -> crate::TypedPatternMatcher<Fp8DecompCtx> {
 
 /// Post-devectorize rendering patterns (devectorizer.py:258-275).
 /// Called during codegen, NOT part of pm_devectorize.
-pub fn pm_render() -> TypedPatternMatcher {
-    crate::patterns! {
+pub fn pm_render() -> &'static TypedPatternMatcher {
+    crate::cached_patterns! {
         // Vector CONST → VECTORIZE of scalar CONST (devectorizer.py:260-261)
         c @ Const(_) if c.dtype().vcount() > 1 => |c| {
             let vcount = c.dtype().vcount();
@@ -587,8 +593,8 @@ fn devectorize_alu(alu: &Arc<UOp>) -> Option<Arc<UOp>> {
 /// Vector ALU → VECTORIZE of scalar ALU (devectorizer.py:219-223).
 /// LLVM SLP can re-vectorize when beneficial.
 #[allow(unused_variables)]
-pub fn no_vectorized_alu() -> TypedPatternMatcher {
-    crate::patterns! {
+pub fn no_vectorized_alu() -> &'static TypedPatternMatcher {
+    crate::cached_patterns! {
         // All binary ops
         for op in binary [*] {
             alu @ op(_, _) if alu.dtype().vcount() > 1 => devectorize_alu(alu),
@@ -612,13 +618,17 @@ pub fn no_vectorized_alu() -> TypedPatternMatcher {
 // ============================================================================
 
 /// Combined devectorize patterns: cast_after, ALU, WMMA, buffer/index devectorization.
-pub fn devectorize_patterns() -> TypedPatternMatcher {
-    cast_after_pattern() + no_vectorized_alu() + no_vectorized_wmma() + devectorize_buf_and_index_patterns()
+pub fn devectorize_patterns() -> &'static TypedPatternMatcher {
+    use std::sync::LazyLock;
+    static CACHED: LazyLock<TypedPatternMatcher> = LazyLock::new(|| {
+        cast_after_pattern() + no_vectorized_alu() + no_vectorized_wmma() + devectorize_buf_and_index_patterns()
+    });
+    &CACHED
 }
 
 /// WMMA devectorization (devectorizer.py:208-217).
-fn no_vectorized_wmma() -> TypedPatternMatcher {
-    crate::patterns! {
+fn no_vectorized_wmma() -> &'static TypedPatternMatcher {
+    crate::cached_patterns! {
         wmma @ Wmma { a, b, c, metadata } if wmma.dtype().vcount() > wmma_expected_size(metadata)
             => devectorize_wmma(wmma, a, b, c, metadata),
     }
@@ -673,8 +683,8 @@ fn devectorize_wmma(
 }
 
 /// AFTER(CAST(x), deps) → CAST(AFTER(x, deps)) - allows cast to be optimized independently.
-fn cast_after_pattern() -> TypedPatternMatcher {
-    crate::patterns! {
+fn cast_after_pattern() -> &'static TypedPatternMatcher {
+    crate::cached_patterns! {
         After { passthrough: Cast { src, dtype }, deps }
             => |src, dtype, deps| {
                 let new_after = src.after(deps.clone());
@@ -684,8 +694,8 @@ fn cast_after_pattern() -> TypedPatternMatcher {
 }
 
 /// LOCAL/REG buffer devectorization (devectorizer.py:241-248).
-fn devectorize_buf_and_index_patterns() -> TypedPatternMatcher {
-    crate::patterns! {
+fn devectorize_buf_and_index_patterns() -> &'static TypedPatternMatcher {
+    crate::cached_patterns! {
         // DEFINE_LOCAL/REG with vector pointer → scalar pointer + CAST
         def if matches!(def.op(), Op::DefineLocal(_) | Op::DefineReg { .. })
             && def.ptrdtype().is_some_and(|(base, _, _)| base.vcount() > 1)
@@ -745,7 +755,7 @@ fn no_vectorized_buf(buf: &Arc<UOp>) -> Option<Arc<UOp>> {
         return None;
     }
 
-    let scalar_base = base.scalar()?;
+    let scalar_base = base.base();
     let new_size = size.map(|s| s * vcount);
     let scalar_ptr_dtype =
         DType::Ptr { base: Box::new(DType::Scalar(scalar_base)), addrspace, size: new_size, vcount: 1 };
@@ -823,11 +833,15 @@ fn no_vectorized_index_precnt(
 // ============================================================================
 
 /// INDEX(buf, x, true) → INDEX(buf, x, None)
-pub fn load_store_indexing_patterns() -> TypedPatternMatcher {
-    crate::patterns! {
+pub fn load_store_indexing_patterns() -> &'static TypedPatternMatcher {
+    crate::cached_patterns! {
+        // INDEX(buf, idx, true) → INDEX(buf, idx, None) — remove trivially-true gate.
+        // Uses UOp::new directly to preserve the original dtype without builder inference,
+        // since the builder's dtype logic (ptr flag, element extraction) may not match
+        // the already-determined dtype on the matched INDEX node.
         index @ Index { buffer, indices, gate: Some(g) }
             if matches!(g.op(), Op::Const(cv) if matches!(cv.0, ConstValue::Bool(true)))
-            ~> UOp::index().buffer(buffer.clone()).indices(indices.clone()).dtype(index.dtype()).call().expect("ICE: unable to crate index")
+            ~> UOp::new(Op::Index { buffer: buffer.clone(), indices: indices.clone(), gate: None }, index.dtype())
     }
 }
 
@@ -836,8 +850,8 @@ pub fn load_store_indexing_patterns() -> TypedPatternMatcher {
 // ============================================================================
 
 /// Add LOAD to non-pointer INDEX, remove LOAD wrapper from STORE.
-pub fn pm_add_loads() -> TypedPatternMatcher {
-    crate::patterns! {
+pub fn pm_add_loads() -> &'static TypedPatternMatcher {
+    crate::cached_patterns! {
         // Add LOAD to non-ptr INDEX: INDEX(buf, idx) → LOAD(INDEX(buf, idx))
         // Skip if dtype is already Ptr (devectorizer.py:322-323)
         idx @ Index { buffer, .. } if !is_ptr_or_image_dtype(&idx.dtype()) => {
@@ -862,8 +876,8 @@ fn is_ptr_or_image_dtype(dtype: &DType) -> bool {
 
 /// Fuse Add into WMMA's accumulator: WMMA(a,b,c) + add → WMMA(a,b,c+add)
 /// Tensor cores have built-in accumulation, so this is more efficient.
-pub fn pm_wmma_accumulate() -> TypedPatternMatcher {
-    crate::patterns! {
+pub fn pm_wmma_accumulate() -> &'static TypedPatternMatcher {
+    crate::cached_patterns! {
         // WMMA + add → WMMA with fused accumulator (devectorizer.py:314-315)
         // Pattern: Add(WMMA(a, b, c), add) → WMMA(a, b, Add(c, add))
         Add(wmma @ Wmma { a, b, c, metadata }, add) => |wmma, a, b, c, metadata, add| {
@@ -901,8 +915,8 @@ pub fn pm_wmma_accumulate() -> TypedPatternMatcher {
 // 3. ptrcat_distribution: LOAD(PTRCAT) → CAT(LOADs)
 
 /// Phase 1: Expand vector INDEX into GEP(PTRCAT) groupings.
-fn expand_index_patterns() -> TypedPatternMatcher {
-    crate::patterns! {
+fn expand_index_patterns() -> &'static TypedPatternMatcher {
+    crate::cached_patterns! {
         index if is_vector_index(index) => expand_vector_index(index),
     }
 }
@@ -914,8 +928,8 @@ fn expand_index_patterns() -> TypedPatternMatcher {
 ///
 /// These must run in Phase 2 because `move_gep_on_store` creates identity GEPs
 /// that block `contiguous_gep_load_patterns` from matching.
-fn gep_simplification_patterns() -> TypedPatternMatcher {
-    crate::patterns! {
+fn gep_simplification_patterns() -> &'static TypedPatternMatcher {
+    crate::cached_patterns! {
         // Identity GEP: GEP(x, [0,1,...,n-1]) → x
         Gep { vector, indices } if is_identity_gep(vector, indices) => Some(vector.clone()),
 
@@ -932,8 +946,8 @@ fn gep_simplification_patterns() -> TypedPatternMatcher {
 }
 
 /// Phase 2: Move GEP through LOAD/STORE.
-fn gep_movement_patterns() -> TypedPatternMatcher {
-    crate::patterns! {
+fn gep_movement_patterns() -> &'static TypedPatternMatcher {
+    crate::cached_patterns! {
         // GEP after LOAD: LOAD(GEP(x)) → GEP(LOAD(x))
         load @ Load { buffer, index: Gep { vector, indices } }
             => move_gep_after_load(load, buffer, vector, indices),
@@ -945,8 +959,8 @@ fn gep_movement_patterns() -> TypedPatternMatcher {
 }
 
 /// Phase 3: Distribute PTRCAT through LOAD/STORE.
-fn ptrcat_distribution_patterns() -> TypedPatternMatcher {
-    crate::patterns! {
+fn ptrcat_distribution_patterns() -> &'static TypedPatternMatcher {
+    crate::cached_patterns! {
         // PTRCAT after LOAD: LOAD(PTRCAT(a,b)) → CAT(LOAD(a), LOAD(b))
         load @ Load { buffer, index: ptrcat @ PtrCat { sources }, alt: None }
             => distribute_ptrcat_load(load, buffer, ptrcat, sources),
@@ -964,8 +978,8 @@ fn ptrcat_distribution_patterns() -> TypedPatternMatcher {
 ///
 /// Uses scalar element dtype for the INDEX so the GEP strides by single elements,
 /// even when the buffer base type is a vector (e.g., DEFINE_REG_TYPED(1, vec256)).
-fn contiguous_gep_load_patterns() -> TypedPatternMatcher {
-    crate::patterns! {
+fn contiguous_gep_load_patterns() -> &'static TypedPatternMatcher {
+    crate::cached_patterns! {
         Gep { vector: load @ Load { buffer, index, alt: None }, indices }
             if indices.len() > 1
             && is_contiguous_indices(indices).is_some()
@@ -1012,8 +1026,11 @@ fn contiguous_gep_load_patterns() -> TypedPatternMatcher {
 
 /// Combined load/store folding patterns (for backward compatibility).
 /// Prefer using `devectorize()` which applies these in proper phase order.
-pub fn load_store_folding_patterns() -> TypedPatternMatcher {
-    expand_index_patterns() + gep_movement_patterns() + ptrcat_distribution_patterns()
+pub fn load_store_folding_patterns() -> &'static TypedPatternMatcher {
+    use std::sync::LazyLock;
+    static CACHED: LazyLock<TypedPatternMatcher> =
+        LazyLock::new(|| expand_index_patterns() + gep_movement_patterns() + ptrcat_distribution_patterns());
+    &CACHED
 }
 
 // ============================================================================
@@ -1021,8 +1038,8 @@ pub fn load_store_folding_patterns() -> TypedPatternMatcher {
 // ============================================================================
 
 /// LOAD/STORE(CAST(INDEX)) → split by device fold lengths + image fixup.
-pub fn correct_load_store_patterns() -> TypedPatternMatcher {
-    crate::patterns! {
+pub fn correct_load_store_patterns() -> &'static TypedPatternMatcher {
+    crate::cached_patterns! {
         // Split LOAD/STORE by device fold lengths
         ls @ Load { index: Cast { src: idx @ Index { buffer: _, .. }, .. }, .. }
             => split_load_store(ls, idx),
@@ -1126,7 +1143,9 @@ fn expand_vector_index(index: &Arc<UOp>) -> Option<Arc<UOp>> {
         })
         .collect();
 
-    let midx = graph_rewrite(&(symbolic() + load_store_indexing_patterns()), UOp::sink(scalar_indices), &mut ());
+    use std::sync::LazyLock;
+    static EXPAND_IDX_PM: LazyLock<TypedPatternMatcher> = LazyLock::new(|| symbolic() + load_store_indexing_patterns());
+    let midx = graph_rewrite(&*EXPAND_IDX_PM, UOp::sink(scalar_indices), &mut ());
     let Op::Sink { sources } = midx.op() else { return None };
 
     // Extract (valid, root, offset, gate) for each lane.
@@ -1185,7 +1204,6 @@ fn expand_vector_index(index: &Arc<UOp>) -> Option<Arc<UOp>> {
     let mut idxs: Vec<Option<usize>> = vec![None; count];
     let mut global_offset = 0;
 
-    // DIAG: Print grouping info for vec256 stores
     for offsets in offsets_by_root.values() {
         let groups = group_consecutive_offsets_from_map(offsets);
         for grp in groups {

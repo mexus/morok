@@ -78,14 +78,18 @@ echo "Running: RUST_LOG=... cargo ${CARGO_ARGS[*]}" >&2
 #   .fields["generated_c"]   — generated C kernel code
 #   .fields["generated_code"] — generated kernel code (LLVM IR, etc.)
 #   .fields.elapsed_ms       — stage timing (ms)
+#   .fields.node_count       — unique DAG node count at this stage
 #   .target                  — module path
 
 (RUST_LOG="$RUST_LOG" RUSTFLAGS="-C target-cpu=native" cargo "${CARGO_ARGS[@]}" 2>&1 || true) \
 | rg --line-buffered '^\{' \
 | jaq -rs --arg tfilter "$TARGET_FILTER" '
 
-def hdr(msg; ms):
-  if ms then "--- \(msg) [\(ms)ms] ---" else "--- \(msg) ---" end;
+def hdr(msg; ms; nc):
+  "--- \(msg)" +
+  (if nc then " [nodes=\(nc)]" else "" end) +
+  (if ms then " [\(ms)ms]" else "" end) +
+  " ---";
 
 def section(title):
   "============================================================\n  \(title)\n============================================================\n";
@@ -105,6 +109,7 @@ reduce .[] as $e (
   ($e.fields["generated_c"]   // null) as $ccode  |
   ($e.fields["generated_code"] // null) as $gcode  |
   ($e.fields.elapsed_ms       // null) as $ms     |
+  ($e.fields.node_count       // null) as $nc     |
   ($e.fields.message          // "?")  as $msg    |
 
   if $uop then
@@ -112,7 +117,7 @@ reduce .[] as $e (
        .phase = "rangeify" |
        .out += section("RANGEIFY PHASE (single pass, pre-kernel-split)")
      else . end) |
-    .out += "\(hdr($msg; $ms))\n\($uop)\n\n"
+    .out += "\(hdr($msg; $ms; $nc))\n\($uop)\n\n"
 
   elif $init then
     # "kernel initial" event — start new kernel section
@@ -120,13 +125,13 @@ reduce .[] as $e (
     .last_initial = $init |
     .phase = "initial" |
     .out += section("KERNEL \(.kernel)") |
-    .out += "--- INITIAL: kernel input ---\n\($init)\n\n"
+    .out += "\(hdr("INITIAL: kernel input"; null; $nc))\n\($init)\n\n"
 
   elif $pre then
     (if .phase != "pre-opt" then
        .phase = "pre-opt"
      else . end) |
-    .out += "\(hdr($msg; $ms))\n\($pre)\n\n"
+    .out += "\(hdr($msg; $ms; $nc))\n\($pre)\n\n"
 
   elif $opt then
     (if .phase != "post-opt" then
@@ -135,7 +140,7 @@ reduce .[] as $e (
         else . end) |
        .phase = "post-opt"
      else . end) |
-    .out += "\(hdr($msg; $ms))\n\($opt)\n\n"
+    .out += "\(hdr($msg; $ms; $nc))\n\($opt)\n\n"
 
   elif $ccode then
     .out += "--- C KERNEL CODE ---\n\($ccode)\n\n"
@@ -144,7 +149,7 @@ reduce .[] as $e (
     .out += "--- GENERATED CODE ---\n\($gcode)\n\n"
 
   elif $ms then
-    .out += "\(hdr($msg; $ms))\n\n"
+    .out += "\(hdr($msg; $ms; $nc))\n\n"
 
   else . end
 ) | .out

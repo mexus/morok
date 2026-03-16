@@ -1072,7 +1072,7 @@ impl Scheduler {
 
         // 2. Flatten ranges (using top-down graph_rewrite matching Tinygrad's default)
         let flattened_ast =
-            crate::rewrite::graph_rewrite(&crate::rangeify::pm_flatten_range(), self.ast.clone(), &mut ());
+            crate::rewrite::graph_rewrite(crate::rangeify::pm_flatten_range(), self.ast.clone(), &mut ());
 
         // 3. Attach metadata
         let info = KernelInfo { name, applied_opts: self.applied_opts.clone(), dont_use_locals: self.dont_use_locals };

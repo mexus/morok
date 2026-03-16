@@ -8,7 +8,7 @@ use crate::TypedPatternMatcher;
 use crate::symbolic::symbolic_simple;
 
 /// Get the symbolic_simple pattern matcher (reduces duplication).
-pub fn get_matcher() -> TypedPatternMatcher {
+pub fn get_matcher() -> &'static TypedPatternMatcher {
     symbolic_simple()
 }
 

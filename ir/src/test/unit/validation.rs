@@ -61,7 +61,8 @@ fn test_index_type_mismatch() {
 
     let buffer = UOp::new_buffer(DeviceSpec::Cpu, 100, DType::Float32);
 
-    let result = UOp::index().buffer(buffer).indices(vec![UOp::native_const(0i32)]).call();
+    // Float indices are invalid — only integer/index types are accepted
+    let result = UOp::index().buffer(buffer).indices(vec![UOp::native_const(0.0f32)]).call();
     assert!(matches!(result, Err(Error::IndexTypeMismatch { .. })));
 }
 

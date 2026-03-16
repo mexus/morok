@@ -69,5 +69,5 @@ pub use optimizer::{
 // Re-export UOp for macro usage
 pub use morok_ir::UOp;
 
-// Re-export the patterns! proc-macro
-pub use morok_macros::patterns;
+// Re-export the patterns! proc-macros
+pub use morok_macros::{cached_patterns, patterns};

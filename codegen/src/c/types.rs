@@ -181,8 +181,12 @@ pub fn collect_vector_typedefs(nodes: &[Arc<UOp>]) -> Vec<String> {
 }
 
 fn collect_vec_dtype(dtype: &DType, seen: &mut BTreeSet<(ScalarDType, usize)>) {
-    if let DType::Vector { scalar, count } = dtype {
-        seen.insert((*scalar, *count));
+    match dtype {
+        DType::Vector { scalar, count } => {
+            seen.insert((*scalar, *count));
+        }
+        DType::Ptr { base, .. } => collect_vec_dtype(base, seen),
+        _ => {}
     }
 }
 

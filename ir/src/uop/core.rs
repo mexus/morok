@@ -614,6 +614,26 @@ impl UOp {
         result
     }
 
+    /// Count unique nodes in the DAG rooted at this UOp.
+    ///
+    /// Much cheaper than `toposort().len()` — no result Vec, no ordering.
+    /// Uses pointer-based visited set for O(1) identity checks.
+    pub fn node_count(self: &Arc<Self>) -> usize {
+        let mut visited = HashSet::new();
+        let mut stack = vec![self.clone()];
+        while let Some(node) = stack.pop() {
+            if !visited.insert(Arc::as_ptr(&node)) {
+                continue;
+            }
+            node.op.map_child(|child| {
+                if !visited.contains(&Arc::as_ptr(child)) {
+                    stack.push(child.clone());
+                }
+            });
+        }
+        visited.len()
+    }
+
     /// Render this UOp and its sources as a compact ASCII tree.
     ///
     /// Shared nodes (appearing multiple times due to hash-consing) are shown

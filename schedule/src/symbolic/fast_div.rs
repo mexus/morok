@@ -22,55 +22,32 @@ use crate::patterns;
 /// Given max_val (maximum value the dividend can take) and divisor d,
 /// computes M and S such that: x/d = (x*M) >> S for all 0 <= x <= max_val.
 ///
-/// Algorithm from Hacker's Delight, "magicgu" function.
+/// Matches Tinygrad's `magicgu` (decompositions.py:272-280). Finds the smallest
+/// shift S, producing the smallest magic number — critical for fitting the
+/// intermediate multiply in narrow types (e.g. Int32).
 ///
 /// # Returns
-/// `(magic_multiplier, shift_amount)` or `None` if overflow would occur.
+/// `(magic_multiplier, shift_amount)` or `None` if no valid pair found.
 fn magic_unsigned(max_val: i64, divisor: i64) -> Option<(i64, u32)> {
     if divisor <= 0 || max_val <= 0 {
         return None;
     }
 
-    // nc = (max_val + 1) - (max_val + 1) % d - 1
-    // This is the largest value < (max_val + 1) that is divisible by d, minus 1
-    let nc = max_val - max_val % divisor;
+    let d = divisor as i128;
+    let nc = ((max_val as i128 + 1) / d * d - 1).max(0);
+    let nbits = 64 - (max_val.leading_zeros() as u32); // = bit_length
 
-    // Find smallest p such that 2^p > nc * (d - 2^p mod d)
-    // Start from p = 32 (for 32-bit arithmetic)
-    let mut p = 32u32;
-
-    // Limit search to prevent infinite loop
-    const MAX_P: u32 = 64;
-
-    while p < MAX_P {
-        // Check if 2^p > nc * (d - (2^p mod d))
-        // Using 128-bit to avoid overflow
-        let two_p = 1i128 << p;
-        let two_p_mod_d = (two_p % (divisor as i128)) as i64;
-        let rhs = (nc as i128) * ((divisor - two_p_mod_d) as i128);
-
-        if two_p > rhs {
-            break;
+    for s in 0..=(2 * nbits) {
+        let two_s: i128 = 1 << s;
+        if two_s > nc * (d - 1 - (two_s - 1) % d) {
+            let m = (two_s + d - 1 - (two_s - 1) % d) / d;
+            if m > i64::MAX as i128 {
+                return None;
+            }
+            return Some((m as i64, s));
         }
-        p += 1;
     }
-
-    if p >= MAX_P {
-        return None;
-    }
-
-    // m = (2^p + d - 1 - (2^p - 1) % d) / d
-    // Simplifies to: m = ceil(2^p / d)
-    // Using 128-bit arithmetic to avoid overflow
-    let two_p = 1i128 << p;
-    let m = (two_p + (divisor as i128) - 1 - (two_p - 1) % (divisor as i128)) / (divisor as i128);
-
-    // Check if m fits in i64
-    if m > i64::MAX as i128 {
-        return None;
-    }
-
-    Some((m as i64, p))
+    None
 }
 
 /// Check if a value is a power of two.
@@ -102,127 +79,109 @@ fn vmax_as_i64(uop: &Arc<UOp>) -> Option<i64> {
     }
 }
 
+/// Emit `(x * m) >> s`, with signed adjustment if needed.
+/// Matches Tinygrad decompositions.py:291.
+fn emit_fast_div(x: &Arc<UOp>, m: i64, s: u32, is_unsigned: bool, dtype: &morok_ir::DType) -> Option<Arc<UOp>> {
+    let m_const = UOp::const_(dtype.clone(), ConstValue::Int(m));
+    let s_const = UOp::const_(dtype.clone(), ConstValue::Int(s as i64));
+    let mul_result = x.mul(&m_const);
+    if is_unsigned {
+        Some(mul_result.shr(&s_const))
+    } else {
+        let base = mul_result.shr(&s_const);
+        let zero = UOp::const_(dtype.clone(), ConstValue::Int(0));
+        let one = UOp::const_(dtype.clone(), ConstValue::Int(1));
+        let is_negative = x.try_cmplt(&zero).ok()?;
+        let adjustment = UOp::try_where(is_negative, one, zero).ok()?;
+        Some(base.add(&adjustment))
+    }
+}
+
+/// Check if m*vmin and m*vmax fit within a dtype's representable range.
+fn fits_in_dtype(m: i64, vmin: i64, vmax: i64, dtype: &morok_ir::DType) -> bool {
+    use morok_ir::uop::range_eval::dtype_bounds;
+    let (dt_min, dt_max) = dtype_bounds(dtype);
+    let dt_min_i = match dt_min {
+        ConstValue::Int(v) => v,
+        _ => return false,
+    };
+    let dt_max_i = match dt_max {
+        ConstValue::Int(v) => v,
+        _ => return false,
+    };
+    match (m.checked_mul(vmin), m.checked_mul(vmax)) {
+        (Some(lo), Some(hi)) => lo >= dt_min_i && hi <= dt_max_i,
+        _ => false,
+    }
+}
+
 /// Pattern matcher for fast integer division.
 ///
 /// Transforms `x // d` where d is a non-power-of-2 constant into:
-/// - Unsigned case (x >= 0): `(x * M) >> S`
-/// - Signed case (x may be negative): `((x * M) >> S) + (x < 0 ? 1 : 0)`
+/// `(x * M) >> S` (unsigned) or `((x * M) >> S) + (x < 0)` (signed).
 ///
-/// The magic number M and shift S are computed such that the multiply-shift
-/// gives exact division results for all values in the range [vmin, vmax].
-///
-/// # Performance
-///
-/// Multiplications are typically 5-20x faster than divisions on modern CPUs
-/// and GPUs. This transformation is particularly beneficial for:
-/// - Index calculations in tensor operations
-/// - Modulo decomposition in range splitting
-/// - Array indexing with non-power-of-2 strides
+/// Matches Tinygrad's `fast_idiv` (decompositions.py:282-300):
+/// 1. Try same-dtype multiply if m*x fits
+/// 2. Factor out powers of two in d to reduce magnitude
+/// 3. Widen to Int64 if needed (for Int32 inputs)
 pub fn fast_division_patterns() -> TypedPatternMatcher {
     patterns! {
-        // x // d where d is constant non-power-of-2
         Idiv(x, _d @const(d_val)) if is_int_dtype(x) => |x, d_val| {
-            // Extract divisor value
             let d_int = match d_val {
                 ConstValue::Int(v) => v,
-                ConstValue::UInt(v) => match i64::try_from(v) {
-                    Ok(v) => v,
-                    Err(_) => return None,
-                },
+                ConstValue::UInt(v) => i64::try_from(v).ok()?,
                 _ => return None,
             };
-
-            // Guard: divisor must be positive
-            if d_int <= 0 {
+            if d_int <= 0 || is_power_of_two(d_int) {
                 return None;
             }
 
-            // Guard: skip power-of-2 (already handled by shift optimization)
-            if is_power_of_two(d_int) {
-                return None;
+            let dtype = x.dtype();
+            let vmin = vmin_as_i64(x)?;
+            let vmax = vmax_as_i64(x)?;
+            let is_unsigned = vmin >= 0;
+            let max_abs = vmax.max(vmin.saturating_abs());
+            let (m, s) = magic_unsigned(max_abs, d_int)?;
+
+            // 1. Try same-dtype if m*x fits (decompositions.py:290-291)
+            if fits_in_dtype(m, vmin, vmax, &dtype) {
+                return emit_fast_div(x, m, s, is_unsigned, &dtype);
             }
 
-            // Factor out largest power of two to reduce overflow risk (decompositions.py:292-293)
-            // For d = 6 = 2 * 3, we compute x // 6 = (x >> 1) // 3
-            let pow2_factor = d_int & (-d_int);  // Isolates lowest set bit (largest power of 2 dividing d)
+            // 2. Factor out powers of two in d (decompositions.py:293-294)
+            let pow2_factor = d_int & (-d_int);
             if pow2_factor > 1 {
-                let reduced_divisor = d_int / pow2_factor;
-                let shift_amount = (pow2_factor as u64).trailing_zeros() as i64;
-                // x // d == (x >> shift) // (d // pow2_factor)
-                let shift_const = UOp::index_const(shift_amount);
-                let shifted = x.shr(&shift_const);
-                // Recursive pattern match will handle the reduced divisor
-                // We return None to let the pattern reapply to the shifted value
-                // But since patterns don't auto-recurse, we need to compute directly
-                let reduced_vmin = vmin_as_i64(&shifted).unwrap_or(0);
-                let reduced_vmax = vmax_as_i64(&shifted).unwrap_or(vmax_as_i64(x)? >> shift_amount);
-
-                if reduced_divisor > 1 && !is_power_of_two(reduced_divisor) {
-                    let max_abs = reduced_vmax.max(reduced_vmin.abs());
-                    if let Some((m, s)) = magic_unsigned(max_abs, reduced_divisor)
-                        && m.checked_mul(reduced_vmin).is_some() && m.checked_mul(reduced_vmax).is_some() {
-                            let dtype = x.dtype();
-                            let m_const = UOp::const_(dtype.clone(), ConstValue::Int(m));
-                            let s_const = UOp::const_(dtype.clone(), ConstValue::Int(s as i64));
-
-                            if reduced_vmin >= 0 {
-                                let mul_result = shifted.mul(&m_const);
-                                return Some(mul_result.shr(&s_const));
-                            } else {
-                                let mul_result = shifted.mul(&m_const);
-                                let base = mul_result.shr(&s_const);
-                                let zero = UOp::const_(dtype.clone(), ConstValue::Int(0));
-                                let one = UOp::const_(dtype, ConstValue::Int(1));
-                                let is_negative = shifted.try_cmplt(&zero).ok()?;
-                                let adjustment = UOp::try_where(is_negative, one, zero).ok()?;
-                                return Some(base.add(&adjustment));
-                            }
+                let reduced_d = d_int / pow2_factor;
+                if reduced_d > 1 && !is_power_of_two(reduced_d) {
+                    let shift_bits = (pow2_factor as u64).trailing_zeros() as i64;
+                    let shift_const = UOp::const_(dtype.clone(), ConstValue::Int(shift_bits));
+                    let shifted = x.shr(&shift_const);
+                    let rv_min = vmin_as_i64(&shifted).unwrap_or(vmin >> shift_bits);
+                    let rv_max = vmax_as_i64(&shifted).unwrap_or(vmax >> shift_bits);
+                    let r_max_abs = rv_max.max(rv_min.saturating_abs());
+                    if let Some((rm, rs)) = magic_unsigned(r_max_abs, reduced_d) {
+                        if fits_in_dtype(rm, rv_min, rv_max, &dtype) {
+                            return emit_fast_div(&shifted, rm, rs, rv_min >= 0, &dtype);
                         }
-                } else if reduced_divisor == 1 {
-                    // d was a power of 2, just shift (shouldn't reach here due to guard above)
-                    return Some(shifted);
+                    }
+                } else if reduced_d == 1 {
+                    let shift_bits = (pow2_factor as u64).trailing_zeros() as i64;
+                    let shift_const = UOp::const_(dtype.clone(), ConstValue::Int(shift_bits));
+                    return Some(x.shr(&shift_const));
                 }
             }
 
-            // Get value bounds
-            let vmin = vmin_as_i64(x)?;
-            let vmax = vmax_as_i64(x)?;
-
-            // Compute the maximum absolute value for magic number calculation
-            let max_abs = vmax.max(vmin.abs());
-
-            // Compute magic number and shift
-            let (m, s) = magic_unsigned(max_abs, d_int)?;
-
-            // Check for potential overflow in the multiplication
-            // m * vmin and m * vmax must not overflow
-            if m.checked_mul(vmin).is_none() || m.checked_mul(vmax).is_none() {
-                return None;
+            // 3. Widen to Int64 if current dtype is narrower (decompositions.py:297-299)
+            if dtype.bytes() < 8 {
+                let wide = morok_ir::DType::Int64;
+                if fits_in_dtype(m, vmin, vmax, &wide) {
+                    let wide_x = x.cast(wide.clone());
+                    let result = emit_fast_div(&wide_x, m, s, is_unsigned, &wide)?;
+                    return Some(result.cast(dtype));
+                }
             }
 
-            // Create constants with same dtype as dividend
-            let dtype = x.dtype();
-            let m_const = UOp::const_(dtype.clone(), ConstValue::Int(m));
-            let s_const = UOp::const_(dtype.clone(), ConstValue::Int(s as i64));
-
-            if vmin >= 0 {
-                // Unsigned case: (x * m) >> s
-                let mul_result = x.mul(&m_const);
-                Some(mul_result.shr(&s_const))
-            } else {
-                // Signed case: ((x * m) >> s) + (x < 0 ? 1 : 0)
-                // This handles rounding towards zero for negative dividends
-                let mul_result = x.mul(&m_const);
-                let base = mul_result.shr(&s_const);
-
-                // Compute adjustment: (x < 0) ? 1 : 0
-                let zero = UOp::const_(dtype.clone(), ConstValue::Int(0));
-                let one = UOp::const_(dtype, ConstValue::Int(1));
-                let is_negative = x.try_cmplt(&zero).ok()?;
-                let adjustment = UOp::try_where(is_negative, one, zero).ok()?;
-
-                Some(base.add(&adjustment))
-            }
+            None
         },
     }
 }

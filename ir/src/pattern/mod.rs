@@ -48,3 +48,9 @@ pub trait Matcher<C> {
     /// Attempt to rewrite a UOp using registered patterns.
     fn rewrite(&self, uop: &Arc<UOp>, ctx: &mut C) -> RewriteResult;
 }
+
+impl<C, M: Matcher<C> + ?Sized> Matcher<C> for &M {
+    fn rewrite(&self, uop: &Arc<UOp>, ctx: &mut C) -> RewriteResult {
+        (**self).rewrite(uop, ctx)
+    }
+}

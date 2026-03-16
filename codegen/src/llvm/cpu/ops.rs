@@ -31,13 +31,15 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec<Stri
         | Op::Kernel { .. }
         | Op::Barrier { .. } => None,
 
-        Op::DefineReg { size, .. } => {
-            let base_dtype = match uop.dtype() {
-                DType::Ptr { base, .. } => base.as_ref().clone(),
-                other => other,
+        Op::DefineReg { .. } => {
+            // Read base type and size from dtype (matching Tinygrad's x.dtype.base/x.dtype.size).
+            // After devectorize's no_vectorized_buf, dtype is the canonical source of truth.
+            let (base_dtype, alloc_size) = match uop.dtype() {
+                DType::Ptr { base, size, .. } => (base.as_ref().clone(), size.unwrap_or(1)),
+                other => (other, 1),
             };
             let base = ldt(&base_dtype);
-            kernel.push(format!("  {dst} = alloca [{size} x {base}]"));
+            kernel.push(format!("  {dst} = alloca [{alloc_size} x {base}]"));
             Some(())
         }
 

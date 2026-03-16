@@ -274,8 +274,8 @@ fn build_vectorized_linear_index(indices: &[Arc<UOp>], strides: &[i64], vcount: 
 /// Tinygrad's `simplify.py`.
 ///
 /// If rejected, codegen backends handle multi-index INDEX natively.
-pub fn pm_linearize_multi_index() -> TypedPatternMatcher<()> {
-    crate::patterns! {
+pub fn pm_linearize_multi_index() -> &'static TypedPatternMatcher<()> {
+    crate::cached_patterns! {
         // Match INDEX with multiple indices
         idx @ Index { buffer, indices, gate } if indices.len() > 1 => |idx, buffer, indices, gate| {
             // Extract dimensions from index expressions.

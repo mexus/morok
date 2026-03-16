@@ -81,7 +81,7 @@ use crate::rangeify::pm_add_buffers_local_patterns;
 use crate::rangeify::transforms::{pm_flatten_range, pm_simplify_ranges, pm_split_ranges};
 use crate::rewrite::graph_rewrite;
 use crate::symbolic::patterns::{gep_pushing_patterns, symbolic, symbolic_simple};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 /// Apply optimizations to a kernel AST.
 ///
@@ -151,7 +151,7 @@ pub fn apply_post_optimization_with_renderer(
     ast: Arc<morok_ir::UOp>,
     renderer: Option<&Renderer>,
 ) -> Arc<morok_ir::UOp> {
-    tracing::debug!(ast.initial = ast.tree(), "kernel initial");
+    tracing::debug!(ast.initial = ast.tree(), node_count = ast.node_count(), "kernel initial");
 
     // Multi-index linearization: INDEX(buf, [i,j,k]) → INDEX(buf, [linear])
     // Moves row-major linearization from codegen to schedule, eliminating
@@ -159,7 +159,7 @@ pub fn apply_post_optimization_with_renderer(
     // Must run BEFORE pm_add_loads (which transforms INDEX dtype to Ptr).
     // Uses bottom-up traversal to ensure children are processed before parents.
     let t_stage = std::time::Instant::now();
-    let linearized = graph_rewrite(&pm_linearize_multi_index(), ast, &mut ());
+    let linearized = graph_rewrite(pm_linearize_multi_index(), ast, &mut ());
     tracing::debug!(elapsed_ms = t_stage.elapsed().as_millis() as u64, "linearize_multi_index complete");
 
     // =========================================================================
@@ -167,10 +167,10 @@ pub fn apply_post_optimization_with_renderer(
     // This MUST run BEFORE expander to optimize conditionals before expansion.
     // =========================================================================
     let t_stage = std::time::Instant::now();
-    let post_opt_symbolic = symbolic();
-    let with_symbolic = graph_rewrite(&post_opt_symbolic, linearized, &mut ());
+    let with_symbolic = graph_rewrite(symbolic(), linearized, &mut ());
     tracing::debug!(
         ast.optimized = with_symbolic.tree(),
+        node_count = with_symbolic.node_count(),
         elapsed_ms = t_stage.elapsed().as_millis() as u64,
         "Stage 8: after post-opt symbolic"
     );
@@ -186,6 +186,7 @@ pub fn apply_post_optimization_with_renderer(
     let expanded = crate::expand::pre_expand(&with_symbolic);
     tracing::debug!(
         ast.optimized = expanded.tree(),
+        node_count = expanded.node_count(),
         elapsed_ms = t_stage.elapsed().as_millis() as u64,
         "Stage 9: after pre_expand"
     );
@@ -204,21 +205,25 @@ pub fn apply_post_optimization_with_renderer(
     let t_stage = std::time::Instant::now();
     let with_local_buffers = {
         let mut buf_ctx = crate::rangeify::KernelContext::new();
-        let combined_matcher = pm_add_buffers_local_patterns() + rangeify_codegen_with_kernel_ctx();
-        graph_rewrite(&combined_matcher, expanded, &mut buf_ctx)
+        static PM_LOCAL_BUF: LazyLock<crate::TypedPatternMatcher<crate::rangeify::KernelContext>> =
+            LazyLock::new(|| pm_add_buffers_local_patterns() + rangeify_codegen_with_kernel_ctx());
+        graph_rewrite(&*PM_LOCAL_BUF, expanded, &mut buf_ctx)
     };
     tracing::debug!(
         ast.optimized = with_local_buffers.tree(),
+        node_count = with_local_buffers.node_count(),
         elapsed_ms = t_stage.elapsed().as_millis() as u64,
         "Stage 10: after add local buffers"
     );
 
     let t_stage = std::time::Instant::now();
-    let pm_reduce_combined = pm_reduce() + pm_wmma_accumulate().with_context() + gep_pushing_patterns().with_context();
+    static PM_REDUCE_COMBINED: LazyLock<crate::TypedPatternMatcher<crate::devectorize::ReduceContext>> =
+        LazyLock::new(|| pm_reduce() + pm_wmma_accumulate().with_context() + gep_pushing_patterns().with_context());
     let mut reduce_ctx = crate::devectorize::ReduceContext::default();
-    let reduced = graph_rewrite(&pm_reduce_combined, with_local_buffers, &mut reduce_ctx);
+    let reduced = graph_rewrite(&*PM_REDUCE_COMBINED, with_local_buffers, &mut reduce_ctx);
     tracing::debug!(
         ast.optimized = reduced.tree(),
+        node_count = reduced.node_count(),
         elapsed_ms = t_stage.elapsed().as_millis() as u64,
         "after pm_reduce"
     );
@@ -231,13 +236,18 @@ pub fn apply_post_optimization_with_renderer(
     };
     tracing::debug!(
         ast.optimized = with_gpudims.tree(),
+        node_count = with_gpudims.node_count(),
         elapsed_ms = t_stage.elapsed().as_millis() as u64,
         "after pm_add_gpudims"
     );
 
     let t_stage = std::time::Instant::now();
-    let with_loads = graph_rewrite(&pm_add_loads(), with_gpudims, &mut ());
-    tracing::debug!(elapsed_ms = t_stage.elapsed().as_millis() as u64, "after pm_add_loads");
+    let with_loads = graph_rewrite(pm_add_loads(), with_gpudims, &mut ());
+    tracing::debug!(
+        node_count = with_loads.node_count(),
+        elapsed_ms = t_stage.elapsed().as_millis() as u64,
+        "after pm_add_loads"
+    );
 
     // ALU devectorization happens inside devectorize() Phase 1, alongside expand_index
     // and full symbolic (including gep_pushing). This matches Tinygrad's structure where
@@ -248,43 +258,50 @@ pub fn apply_post_optimization_with_renderer(
     let devectorized_mem = crate::devectorize::devectorize(&with_loads);
     tracing::debug!(
         ast.optimized = devectorized_mem.tree(),
+        node_count = devectorized_mem.node_count(),
         elapsed_ms = t_stage.elapsed().as_millis() as u64,
         "after devectorize"
     );
 
     let t_stage = std::time::Instant::now();
-    let devectorized = graph_rewrite(&pm_bool_devectorize(), devectorized_mem, &mut ());
+    let devectorized = graph_rewrite(pm_bool_devectorize(), devectorized_mem, &mut ());
     tracing::debug!(
         ast.optimized = devectorized.tree(),
+        node_count = devectorized.node_count(),
         elapsed_ms = t_stage.elapsed().as_millis() as u64,
         "after pm_bool_devectorize"
     );
 
     let t_stage = std::time::Instant::now();
-    let reduce_devec = graph_rewrite(&pm_reduce_devectorize(), devectorized, &mut ());
+    let reduce_devec = graph_rewrite(pm_reduce_devectorize(), devectorized, &mut ());
     tracing::debug!(
         ast.optimized = reduce_devec.tree(),
+        node_count = reduce_devec.node_count(),
         elapsed_ms = t_stage.elapsed().as_millis() as u64,
         "after pm_reduce_devectorize"
     );
 
     // Tinygrad: pm_lower_index_dtype + load_store_indexing + gep_pushing (step 15)
     let t_stage = std::time::Instant::now();
-    let pm_lower_combined = crate::symbolic::pm_lower_index_dtype()
-        + crate::devectorize::load_store_indexing_patterns()
-        + gep_pushing_patterns();
-    let with_lowered_idx = graph_rewrite(&pm_lower_combined, reduce_devec, &mut ());
+    static PM_LOWER_COMBINED: LazyLock<crate::TypedPatternMatcher> = LazyLock::new(|| {
+        crate::symbolic::pm_lower_index_dtype()
+            + crate::devectorize::load_store_indexing_patterns()
+            + gep_pushing_patterns()
+    });
+    let with_lowered_idx = graph_rewrite(&*PM_LOWER_COMBINED, reduce_devec, &mut ());
     tracing::debug!(
         ast.optimized = with_lowered_idx.tree(),
+        node_count = with_lowered_idx.node_count(),
         elapsed_ms = t_stage.elapsed().as_millis() as u64,
         "after pm_lower_index_dtype"
     );
 
     // Tinygrad: symbolic (step 16) — includes gep_pushing
     let t_stage = std::time::Instant::now();
-    let with_lowered_idx = graph_rewrite(&symbolic(), with_lowered_idx, &mut ());
+    let with_lowered_idx = graph_rewrite(symbolic(), with_lowered_idx, &mut ());
     tracing::debug!(
         ast.optimized = with_lowered_idx.tree(),
+        node_count = with_lowered_idx.node_count(),
         elapsed_ms = t_stage.elapsed().as_millis() as u64,
         "after post-index symbolic"
     );
@@ -293,10 +310,12 @@ pub fn apply_post_optimization_with_renderer(
     // Stage 18-19: Decompositions + Render (Tinygrad: pm_decomp + pm_render in one pass)
     // =========================================================================
     let t_stage = std::time::Instant::now();
-    let pm_final = symbolic_simple() + get_late_rewrite_patterns(renderer) + pm_render();
-    let rendered = graph_rewrite(&pm_final, with_lowered_idx, &mut ());
+    static PM_FINAL: LazyLock<crate::TypedPatternMatcher> =
+        LazyLock::new(|| symbolic_simple() + get_late_rewrite_patterns() + pm_render());
+    let rendered = graph_rewrite(&*PM_FINAL, with_lowered_idx, &mut ());
     tracing::debug!(
         ast.optimized = rendered.tree(),
+        node_count = rendered.node_count(),
         elapsed_ms = t_stage.elapsed().as_millis() as u64,
         "Stage 18-19: after pm_decomp + pm_render"
     );
@@ -309,6 +328,7 @@ pub fn apply_post_optimization_with_renderer(
     let rendered = crate::devectorize::merge_sibling_ends(&rendered);
     tracing::debug!(
         ast.optimized = rendered.tree(),
+        node_count = rendered.node_count(),
         elapsed_ms = t_merge.elapsed().as_millis() as u64,
         "after merge_sibling_ends"
     );
@@ -330,73 +350,47 @@ pub fn apply_post_optimization_with_renderer(
     }
     tracing::debug!(
         ast.optimized = fp8_decomposed.tree(),
+        node_count = fp8_decomposed.node_count(),
         elapsed_ms = t_stage.elapsed().as_millis() as u64,
         "after pm_float_decomp"
     );
 
     let t_stage = std::time::Instant::now();
-    let bs = graph_rewrite(&bool_storage_patterns(), fp8_decomposed, &mut ());
+    let bs = graph_rewrite(bool_storage_patterns(), fp8_decomposed, &mut ());
     tracing::debug!(
         ast.optimized = bs.tree(),
+        node_count = bs.node_count(),
         elapsed_ms = t_stage.elapsed().as_millis() as u64,
         "after bool_storage_pattern"
     );
     bs
 }
 
-/// Get late rewrite patterns based on renderer capabilities.
+/// Late rewrite patterns for algebraic decompositions.
 ///
-/// Based on Tinygrad's `get_late_rewrite_patterns` (decompositions.py:320-367).
+/// Based on Tinygrad's `get_late_rewrite_patterns` (decompositions.py:438-480).
 ///
 /// Returns patterns for:
 /// - MULACC (FMA): `a*b+c → MulAcc(a,b,c)` for float types
 /// - MOD → AND: `x % 2^n → x & (2^n-1)` for power-of-two modulus
 /// - MUL → SHL: `x * 2^n → x << n` for power-of-two multiplier
 /// - NEG from MUL: `x * -1 → NEG(x)`
-/// - MAX decomposition: `MAX(a,b) → (a<b).where(b,a)` if backend lacks native MAX
-/// - SQRT decomposition: `SQRT(x) → POW(x, 0.5)` if backend lacks native SQRT
-///
-/// # Arguments
-///
-/// * `renderer` - Optional renderer to check supported ops. If None, applies all patterns
-///   except conditional decompositions (MAX, SQRT).
-fn get_late_rewrite_patterns(renderer: Option<&Renderer>) -> crate::TypedPatternMatcher {
-    // Start with FMA decomposition - most backends benefit from explicit FMA ops
-    // (LLVM generates fma intrinsics, GPUs have native FMA support)
-    let mut patterns = pm_fma_decomposition();
-
-    // Always apply pure optimizations that generate cheaper instructions:
-    // - MOD → AND for power-of-2 (bitwise cheaper than modulo)
-    // - MUL → SHL for power-of-2 (shift cheaper than multiply)
-    // - DIV → SHR for power-of-2 (shift cheaper than divide) - Tinygrad: decompositions.py:340-344
-    // - FDIV → MUL for float constant divisor (multiply cheaper than divide) - Tinygrad: decompositions.py:364-366
-    // - NEG from MUL (negation cheaper than multiply by -1)
-    // - Comparison negations: !(x<c) → (c-1)<x, etc. - Tinygrad: decompositions.py:354-361
-    // - Fast division: x//d → (x*M)>>S for non-power-of-2 constants - Tinygrad: decompositions.py fast_idiv
-    patterns = patterns
-        + pm_mod_to_and()
-        + pm_mul_to_shl()
-        + pm_div_to_shr()
-        + pm_fdiv_to_mul()
-        + pm_neg_from_mul()
-        + pm_comparison_negations()
-        + crate::symbolic::fast_division_patterns();
-
-    // Conditional decompositions based on backend capabilities.
-    // These only apply if the backend lacks native support for the operation.
-    // For now, we assume all backends support MAX and SQRT natively (LLVM, CUDA, Metal all do).
-    // When we add backends that lack support, we can check renderer capabilities.
-    //
-    // Future: Add renderer.supports_max() / renderer.supports_sqrt() checks:
-    // if !renderer.map_or(true, |r| r.supports_max()) {
-    //     patterns = patterns + pm_max_decomposition();
-    // }
-    // if !renderer.map_or(true, |r| r.supports_sqrt()) {
-    //     patterns = patterns + pm_sqrt_decomposition();
-    // }
-    let _ = renderer; // Will be used for capability checks when needed
-
-    patterns
+/// - Fast integer division (magic number multiplication)
+fn get_late_rewrite_patterns() -> &'static crate::TypedPatternMatcher {
+    // All current backends support MAX and SQRT natively (LLVM, CUDA, Metal).
+    // When we add backends that lack support, this should take a capability set
+    // (like Tinygrad's `ops: tuple[Ops, ...]`) and conditionally include patterns.
+    static CACHED: LazyLock<crate::TypedPatternMatcher> = LazyLock::new(|| {
+        pm_fma_decomposition()
+            + pm_mod_to_and()
+            + pm_mul_to_shl()
+            + pm_div_to_shr()
+            + pm_fdiv_to_mul()
+            + pm_neg_from_mul()
+            + pm_comparison_negations()
+            + crate::symbolic::fast_division_patterns()
+    });
+    &CACHED
 }
 
 /// Apply per-kernel pre-optimization passes.
@@ -414,25 +408,28 @@ fn get_late_rewrite_patterns(renderer: Option<&Renderer>) -> crate::TypedPattern
 /// Called by both heuristic and beam search paths.
 #[tracing::instrument(skip_all)]
 pub fn apply_pre_optimization(ast: Arc<morok_ir::UOp>) -> Arc<morok_ir::UOp> {
-    tracing::debug!(ast.initial = ast.tree(), "kernel initial");
+    tracing::debug!(ast.initial = ast.tree(), node_count = ast.node_count(), "kernel initial");
 
     use crate::rangeify::transforms::SplitRangesContext;
 
     let t_stage = std::time::Instant::now();
     use crate::rangeify::patterns::{movement_op_patterns, pm_syntactic_sugar};
     use crate::rewrite::graph_rewrite_bottom_up;
-    let early_mops = movement_op_patterns() + pm_syntactic_sugar();
-    let mut sink = graph_rewrite_bottom_up(&early_mops, ast, &mut ());
+    static PM_EARLY_MOPS: LazyLock<crate::TypedPatternMatcher> =
+        LazyLock::new(|| movement_op_patterns() + pm_syntactic_sugar());
+    let mut sink = graph_rewrite_bottom_up(&*PM_EARLY_MOPS, ast, &mut ());
     tracing::debug!(
         ast.pre = sink.tree(),
+        node_count = sink.node_count(),
         elapsed_ms = t_stage.elapsed().as_millis() as u64,
         "pre-opt: movement ops + syntactic sugar complete"
     );
 
     let t_stage = std::time::Instant::now();
-    sink = graph_rewrite(&pm_load_collapse(), sink, &mut ());
+    sink = graph_rewrite(pm_load_collapse(), sink, &mut ());
     tracing::debug!(
         ast.pre = sink.tree(),
+        node_count = sink.node_count(),
         elapsed_ms = t_stage.elapsed().as_millis() as u64,
         "pre-opt: load collapse complete"
     );
@@ -440,27 +437,31 @@ pub fn apply_pre_optimization(ast: Arc<morok_ir::UOp>) -> Arc<morok_ir::UOp> {
     let t_stage = std::time::Instant::now();
     let mut split_ctx = SplitRangesContext::default();
     sink = graph_rewrite(&pm_split_ranges(), sink, &mut split_ctx);
-    sink = graph_rewrite(&pm_flatten_range(), sink, &mut ());
+    sink = graph_rewrite(pm_flatten_range(), sink, &mut ());
     tracing::debug!(
         ast.pre = sink.tree(),
+        node_count = sink.node_count(),
         elapsed_ms = t_stage.elapsed().as_millis() as u64,
         "pre-opt: split ranges complete"
     );
 
     let t_stage = std::time::Instant::now();
-    let symbolic_with_flatten = symbolic() + pm_flatten_range();
-    sink = graph_rewrite(&symbolic_with_flatten, sink, &mut ());
+    static PM_SYM_FLATTEN: LazyLock<crate::TypedPatternMatcher> = LazyLock::new(|| symbolic() + pm_flatten_range());
+    sink = graph_rewrite(&*PM_SYM_FLATTEN, sink, &mut ());
     tracing::debug!(
         ast.pre = sink.tree(),
+        node_count = sink.node_count(),
         elapsed_ms = t_stage.elapsed().as_millis() as u64,
         "pre-opt: symbolic + flatten complete"
     );
 
     let t_stage = std::time::Instant::now();
-    let simplify_with_flatten = pm_flatten_range() + pm_simplify_ranges();
-    sink = graph_rewrite(&simplify_with_flatten, sink, &mut ());
+    static PM_SIMPLIFY_FLATTEN: LazyLock<crate::TypedPatternMatcher> =
+        LazyLock::new(|| pm_flatten_range() + pm_simplify_ranges());
+    sink = graph_rewrite(&*PM_SIMPLIFY_FLATTEN, sink, &mut ());
     tracing::debug!(
         ast.pre = sink.tree(),
+        node_count = sink.node_count(),
         elapsed_ms = t_stage.elapsed().as_millis() as u64,
         "pre-opt: simplify ranges complete"
     );

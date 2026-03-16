@@ -90,6 +90,7 @@ pub fn rangeify_with_map(
     all_becomes.extend(result.becomes_map);
     tracing::debug!(
         uop.tree = sink.tree(),
+        node_count = sink.node_count(),
         elapsed_ms = t_stage.elapsed().as_millis() as u64,
         "early rewrites + replace contiguous complete"
     );
@@ -102,6 +103,7 @@ pub fn rangeify_with_map(
     sink = rangeified;
     tracing::debug!(
         uop.tree = sink.tree(),
+        node_count = sink.node_count(),
         elapsed_ms = t_stage.elapsed().as_millis() as u64,
         "Stage 0: range assignment complete"
     );
@@ -115,6 +117,7 @@ pub fn rangeify_with_map(
     all_becomes.extend(result.becomes_map);
     tracing::debug!(
         uop.tree = sink.tree(),
+        node_count = sink.node_count(),
         elapsed_ms = t_stage.elapsed().as_millis() as u64,
         "split reduceops complete"
     );
@@ -130,6 +133,7 @@ pub fn rangeify_with_map(
     all_becomes.extend(result.becomes_map);
     tracing::debug!(
         uop.tree = sink.tree(),
+        node_count = sink.node_count(),
         elapsed_ms = t_stage.elapsed().as_millis() as u64,
         "Stage 1: rangeify + movement ops complete"
     );
@@ -145,13 +149,17 @@ pub fn rangeify_with_map(
     {
         use super::kernel::PcontigConfig;
         let t_stage = std::time::Instant::now();
-        let mega_pass = crate::symbolic::symbolic().with_context::<PcontigConfig>()
-            + super::patterns::pm_reduce_simplify().with_context()
-            + super::patterns::buffer_folding().with_context()
-            + super::patterns::dead_axis_removal().with_context()
-            + super::patterns::movement_op_patterns().with_context()
-            + super::patterns::early_rewrites().with_context()
-            + super::patterns::buffer_removal_with_pcontig();
+        use std::sync::LazyLock;
+        static MEGA_PASS: LazyLock<crate::TypedPatternMatcher<PcontigConfig>> = LazyLock::new(|| {
+            crate::symbolic::symbolic().with_context::<PcontigConfig>()
+                + super::patterns::pm_reduce_simplify().with_context()
+                + super::patterns::buffer_folding().with_context()
+                + super::patterns::dead_axis_removal().with_context()
+                + super::patterns::movement_op_patterns().with_context()
+                + super::patterns::early_rewrites().with_context()
+                + super::patterns::buffer_removal_with_pcontig()
+        });
+        let mega_pass = &*MEGA_PASS;
         tracing::debug!(
             total_patterns = mega_pass.len(),
             wildcard_count = mega_pass.wildcard_count(),
@@ -159,9 +167,9 @@ pub fn rangeify_with_map(
             "mega-pass pattern stats"
         );
         let mut pcontig = pcontig_config.cloned().unwrap_or_default();
-        sink = apply_buffer_removal_protecting_sink(&sink, &mega_pass, &mut pcontig);
+        sink = apply_buffer_removal_protecting_sink(&sink, mega_pass, &mut pcontig);
         tracing::debug!(
-            node_count = sink.toposort().len(),
+            node_count = sink.node_count(),
             elapsed_ms = t_stage.elapsed().as_millis() as u64,
             "mega-pass complete"
         );
@@ -200,8 +208,8 @@ pub fn rangeify_with_map(
 ///
 /// Based on Tinygrad's pm_flatten_range (simplify.py:14-17).
 /// Extracts all RANGE operations from nested END/REDUCE/STORE structures.
-pub fn pm_flatten_range() -> crate::TypedPatternMatcher {
-    crate::patterns! {
+pub fn pm_flatten_range() -> &'static crate::TypedPatternMatcher {
+    crate::cached_patterns! {
         r @ End { computation: _, ranges } if !ranges.is_empty() => |r| flatten_range_impl(r),
         r @ Reduce { src: _, ranges, reduce_op: _ } if !ranges.is_empty() => |r| flatten_range_impl(r),
         r @ Store { index: _, value: _, ranges } if !ranges.is_empty() => |r| flatten_range_impl(r),
@@ -1211,8 +1219,7 @@ fn reduce_collapse_with(src: &Arc<UOp>, ranges: &[Arc<UOp>], pm: &crate::TypedPa
 ///
 /// Tinygrad: `reduce_collapse(red, u)` (uses default `pm=pm_reduce_collapse`).
 pub fn reduce_collapse(src: &Arc<UOp>, ranges: &[Arc<UOp>]) -> Option<Arc<UOp>> {
-    let pm = super::patterns::build_reduce_collapse_matcher();
-    reduce_collapse_with(src, ranges, &pm)
+    reduce_collapse_with(src, ranges, super::patterns::build_reduce_collapse_matcher())
 }
 
 /// Collapse REDUCE using extended `pm_reduce_load_collapse` patterns.
@@ -1221,8 +1228,7 @@ pub fn reduce_collapse(src: &Arc<UOp>, ranges: &[Arc<UOp>]) -> Option<Arc<UOp>> 
 /// `pm=pm_reduce_load_collapse` which includes `.or_casted()` variants,
 /// NE lifting, and the full `pm_load_collapse` non-REDUCE patterns.
 pub fn reduce_load_collapse(src: &Arc<UOp>, ranges: &[Arc<UOp>]) -> Option<Arc<UOp>> {
-    let pm = super::patterns::build_reduce_load_collapse_matcher();
-    reduce_collapse_with(src, ranges, &pm)
+    reduce_collapse_with(src, ranges, super::patterns::build_reduce_load_collapse_matcher())
 }
 
 pub(crate) fn cast_to_dtype(value: &Arc<UOp>, target_dtype: &morok_dtype::DType) -> Option<Arc<UOp>> {
@@ -1373,8 +1379,7 @@ pub fn simplify_merge_adjacent(u: &Arc<UOp>) -> Option<Arc<UOp>> {
 
         // Apply substitution and simplify (Tinygrad simplify.py:30-31)
         let rewritten = u.substitute(&subs);
-        let matcher = crate::symbolic::symbolic_simple();
-        let simplified = crate::rewrite::graph_rewrite(&matcher, rewritten, &mut ());
+        let simplified = crate::rewrite::graph_rewrite(crate::symbolic::symbolic_simple(), rewritten, &mut ());
 
         // Count divmod operations (Tinygrad simplify.py:34-36)
         use crate::passes::linearize_index::count_divmod;
@@ -1393,8 +1398,8 @@ pub fn simplify_merge_adjacent(u: &Arc<UOp>) -> Option<Arc<UOp>> {
 /// Pattern matcher for range simplification.
 ///
 /// Tries to merge adjacent ranges to reduce divmod operations.
-pub fn pm_simplify_ranges() -> crate::TypedPatternMatcher {
-    crate::patterns! {
+pub fn pm_simplify_ranges() -> &'static crate::TypedPatternMatcher {
+    crate::cached_patterns! {
         // Match END ops with ranges
         u @ End { computation: _, ranges } if !ranges.is_empty() => |u| simplify_merge_adjacent(u),
         // Match REDUCE ops with ranges

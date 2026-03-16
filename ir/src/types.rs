@@ -79,7 +79,7 @@ fn cast_bool(v: bool, to: ScalarDType) -> Option<ConstValue> {
     use ScalarDType::*;
     Some(match to {
         Bool => ConstValue::Bool(v),
-        Int8 | Int16 | Int32 | Int64 => ConstValue::Int(v as i64),
+        Int8 | Int16 | Int32 | Int64 | Index => ConstValue::Int(v as i64),
         UInt8 | UInt16 | UInt32 | UInt64 => ConstValue::UInt(v as u64),
         Float16 | BFloat16 | Float32 | Float64 => ConstValue::Float(v as u8 as f64),
         _ => return None,
@@ -94,7 +94,7 @@ fn cast_int(v: i64, to: ScalarDType) -> Option<ConstValue> {
         Int8 => ConstValue::Int(cast_via!(v, i8, i64)),
         Int16 => ConstValue::Int(cast_via!(v, i16, i64)),
         Int32 => ConstValue::Int(cast_via!(v, i32, i64)),
-        Int64 => ConstValue::Int(v),
+        Int64 | Index => ConstValue::Int(v),
         UInt8 => ConstValue::UInt(cast_via!(v, u8, u64)),
         UInt16 => ConstValue::UInt(cast_via!(v, u16, u64)),
         UInt32 => ConstValue::UInt(cast_via!(v, u32, u64)),
@@ -112,7 +112,7 @@ fn cast_uint(v: u64, to: ScalarDType) -> Option<ConstValue> {
         Int8 => ConstValue::Int(cast_via!(v, i8, i64)),
         Int16 => ConstValue::Int(cast_via!(v, i16, i64)),
         Int32 => ConstValue::Int(cast_via!(v, i32, i64)),
-        Int64 => ConstValue::Int(v as i64),
+        Int64 | Index => ConstValue::Int(v as i64),
         UInt8 => ConstValue::UInt(cast_via!(v, u8, u64)),
         UInt16 => ConstValue::UInt(cast_via!(v, u16, u64)),
         UInt32 => ConstValue::UInt(cast_via!(v, u32, u64)),
@@ -130,7 +130,7 @@ fn cast_float(v: f64, to: ScalarDType) -> Option<ConstValue> {
         Int8 => ConstValue::Int(cast_via!(v, i8, i64)),
         Int16 => ConstValue::Int(cast_via!(v, i16, i64)),
         Int32 => ConstValue::Int(cast_via!(v, i32, i64)),
-        Int64 => ConstValue::Int(v as i64),
+        Int64 | Index => ConstValue::Int(v as i64),
         // Float-to-unsigned: route through i64 first (matches Tinygrad behavior)
         UInt8 => ConstValue::UInt(cast_via!(v as i64, u8, u64)),
         UInt16 => ConstValue::UInt(cast_via!(v as i64, u16, u64)),

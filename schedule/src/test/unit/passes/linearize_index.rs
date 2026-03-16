@@ -39,8 +39,7 @@ fn test_linearize_pattern_2d() {
     assert_eq!(multi_index.op().sources().len(), 3); // buffer, i, j
 
     // Apply linearization pattern
-    let pattern = pm_linearize_multi_index();
-    let result = crate::rewrite::graph_rewrite(&pattern, multi_index.clone(), &mut ());
+    let result = crate::rewrite::graph_rewrite(pm_linearize_multi_index(), multi_index.clone(), &mut ());
 
     // Result should be INDEX(buffer, [linear])
     if let Op::Index { indices, .. } = result.op() {
@@ -60,8 +59,7 @@ fn test_linearize_pattern_3d() {
 
     let multi_index = UOp::index().buffer(buffer.clone()).indices(vec![i, j, k]).call().unwrap();
 
-    let pattern = pm_linearize_multi_index();
-    let result = crate::rewrite::graph_rewrite(&pattern, multi_index.clone(), &mut ());
+    let result = crate::rewrite::graph_rewrite(pm_linearize_multi_index(), multi_index.clone(), &mut ());
 
     if let Op::Index { indices, .. } = result.op() {
         assert_eq!(indices.len(), 1, "3D index should be linearized to 1D");
@@ -78,8 +76,7 @@ fn test_single_index_unchanged() {
 
     let single_index = UOp::index().buffer(buffer.clone()).indices(vec![i.clone()]).call().unwrap();
 
-    let pattern = pm_linearize_multi_index();
-    let result = crate::rewrite::graph_rewrite(&pattern, single_index.clone(), &mut ());
+    let result = crate::rewrite::graph_rewrite(pm_linearize_multi_index(), single_index.clone(), &mut ());
 
     // Single-index should be unchanged
     assert!(Arc::ptr_eq(&result, &single_index), "Single index should not be transformed");
@@ -96,8 +93,7 @@ fn test_linearize_pattern_4d() {
 
     let multi_index = UOp::index().buffer(buffer.clone()).indices(vec![i, j, k, l]).call().unwrap();
 
-    let pattern = pm_linearize_multi_index();
-    let result = crate::rewrite::graph_rewrite(&pattern, multi_index.clone(), &mut ());
+    let result = crate::rewrite::graph_rewrite(pm_linearize_multi_index(), multi_index.clone(), &mut ());
 
     if let Op::Index { indices, .. } = result.op() {
         assert_eq!(indices.len(), 1, "4D index should be linearized to 1D");
@@ -118,8 +114,7 @@ fn test_unbounded_buffer_still_linearizes() {
 
     let multi_index = UOp::index().buffer(buffer.clone()).indices(vec![i, j]).call().unwrap();
 
-    let pattern = pm_linearize_multi_index();
-    let result = crate::rewrite::graph_rewrite(&pattern, multi_index.clone(), &mut ());
+    let result = crate::rewrite::graph_rewrite(pm_linearize_multi_index(), multi_index.clone(), &mut ());
 
     // Should be linearized - dimensions come from indices
     if let Op::Index { indices, .. } = result.op() {

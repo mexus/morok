@@ -49,7 +49,7 @@ impl crate::Renderer for CRenderer {
         let kernel_name = name.unwrap_or("kernel");
 
         // Apply pm_bool_devectorize as safety fallback
-        let uop = graph_rewrite_bottom_up(&pm_bool_devectorize(), uop.clone(), &mut ());
+        let uop = graph_rewrite_bottom_up(pm_bool_devectorize(), uop.clone(), &mut ());
 
         tracing::debug!(ast_after_pm_bool_devectorize = %uop.tree(), "c codegen: after pm_bool_devectorize");
 

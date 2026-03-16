@@ -796,8 +796,8 @@ pub fn split_reduceop_patterns() -> TypedPatternMatcher<SplitReduceOpConfig> {
 ///
 /// Factored out so it can be shared between `pm_reduce_simplify` and the inner
 /// `reduce_collapse` pattern matchers without duplication.
-fn pm_reduce_unparented() -> TypedPatternMatcher {
-    crate::patterns! {
+fn pm_reduce_unparented() -> &'static TypedPatternMatcher {
+    crate::cached_patterns! {
         reduce @ Reduce { src, ranges, reduce_op: Add | Mul | Max | Min } => |reduce, src, ranges, reduce_op| {
             #[allow(clippy::mutable_key_type)]
             let src_ranges = src.in_scope_ranges();
@@ -844,12 +844,15 @@ fn pm_reduce_unparented() -> TypedPatternMatcher {
 ///
 /// No duplication of distributive or bound patterns — those live inside
 /// `reduce_collapse_inner_patterns()` and run via `reduce_collapse`.
-pub fn pm_reduce_simplify() -> TypedPatternMatcher {
-    pm_reduce_unparented()
-        + crate::patterns! {
-            Reduce { src, ranges, reduce_op } if *reduce_op == ReduceOp::Add
-                => |src, ranges| super::transforms::reduce_collapse(src, ranges),
-        }
+pub fn pm_reduce_simplify() -> &'static TypedPatternMatcher {
+    static CACHED: std::sync::LazyLock<TypedPatternMatcher> = std::sync::LazyLock::new(|| {
+        pm_reduce_unparented()
+            + crate::patterns! {
+                Reduce { src, ranges, reduce_op } if *reduce_op == ReduceOp::Add
+                    => |src, ranges| super::transforms::reduce_collapse(src, ranges),
+            }
+    });
+    &CACHED
 }
 
 // ============================================================================
@@ -888,8 +891,8 @@ pub fn movement_op_patterns() -> TypedPatternMatcher {
 /// This only applies when:
 /// - Inner INDEX has PtrDType (is a pointer)
 /// - Outer INDEX doesn't have PtrDType (is an element access)
-pub fn pm_syntactic_sugar() -> TypedPatternMatcher {
-    crate::patterns! {
+pub fn pm_syntactic_sugar() -> &'static TypedPatternMatcher {
+    crate::cached_patterns! {
         // INDEX on ptr INDEX concats them
         outer @ Index { buffer: inner @ Index { buffer: base_buffer, indices: inner_indices, gate: inner_gate }, indices: outer_indices, gate: outer_gate }
             if matches!(inner.dtype(), DType::Ptr { .. }) && !matches!(outer.dtype(), DType::Ptr { .. })
@@ -1370,8 +1373,8 @@ fn force_bufferize(src: &Arc<UOp>) -> Arc<UOp> {
 /// Bottom-up rewriting propagates the transformation to all consumers automatically:
 /// 1. INDEX → LOAD(buffer, INDEX) - wrap every INDEX with LOAD
 /// 2. STORE cleanup - remove LOAD from index position (STORE needs raw INDEX)
-pub fn pm_add_loads() -> TypedPatternMatcher<()> {
-    crate::patterns! {
+pub fn pm_add_loads() -> &'static TypedPatternMatcher<()> {
+    crate::cached_patterns! {
         // Pattern 1: INDEX with non-Ptr dtype → LOAD(buffer, INDEX with Ptr dtype)
         // Guard prevents re-matching: after transformation, INDEX has Ptr dtype.
         // Also skip Image dtype - image access handled separately in codegen.
@@ -1504,8 +1507,8 @@ fn devectorize_generic(uop: &Arc<UOp>) -> Option<Arc<UOp>> {
 /// - WHERE with vectorized condition → scalar WHERE + VECTORIZE
 /// - INDEX with vectorized bool dtype → scalar INDEX + VECTORIZE
 /// - CAST to/from vectorized bool → scalar CAST + VECTORIZE
-pub fn pm_bool_devectorize() -> TypedPatternMatcher<()> {
-    crate::patterns! {
+pub fn pm_bool_devectorize() -> &'static TypedPatternMatcher<()> {
+    crate::cached_patterns! {
         // Any binary op that produces vectorized bool output
         // Covers: And, Or, Xor, Max on bool vectors AND Lt, Le, Eq, Ne, Gt, Ge comparisons
         for op in binary [*] {
@@ -1757,8 +1760,8 @@ fn is_bool_reduce(reduce: &Arc<UOp>, src: &Arc<UOp>) -> bool {
 ///    Example: REDUCE(<16 x f32> → <4 x f32>) → chain(gep[0,4,8,12], gep[1,5,9,13], ...)
 ///
 /// Based on Tinygrad's pm_reduce (devectorizer.py:283-316).
-pub fn pm_reduce_devectorize() -> TypedPatternMatcher<()> {
-    crate::patterns! {
+pub fn pm_reduce_devectorize() -> &'static TypedPatternMatcher<()> {
+    crate::cached_patterns! {
         reduce @ Reduce { src } if needs_reduce_devectorize(reduce) => |reduce, src| {
             // Branch to appropriate transform based on case
             if is_k_vectorized(reduce, src) {
@@ -1913,8 +1916,8 @@ fn tree_reduce(elements: &[Arc<UOp>], reduce_op: ReduceOp, dtype: &DType) -> Arc
 ///
 /// Applied late (post-optimization) so earlier passes can still work with Add(Mul) structure.
 /// Only matches float types where FMA provides benefit (maps to llvm.fma intrinsic).
-pub fn pm_fma_decomposition() -> TypedPatternMatcher<()> {
-    crate::patterns! {
+pub fn pm_fma_decomposition() -> &'static TypedPatternMatcher<()> {
+    crate::cached_patterns! {
         // (a*b)+c or c+(a*b) → MulAcc(a,b,c) using commutative matching
         // Dtype equality guard is an early-out; try_mulacc also validates matching dtypes.
         Add[Mul(a, b), c] if a.dtype().is_float() && a.dtype() == b.dtype() && a.dtype() == c.dtype() => |a, b, c| {
@@ -2325,8 +2328,8 @@ fn try_lift_arithmetic_from_ge(cond: &Arc<UOp>) -> Option<Arc<UOp>> {
 /// 6. MUL casted bool: `x * gate:bool.cast()` → `gate.where(x, 0)`
 /// 7. NE lifting: `(x + y) != c` → `x != (c - y)`
 /// 8. Index overflow protection: `(x:index + y) < c` → `x < (c - y)` when x has loads
-pub fn pm_load_collapse() -> TypedPatternMatcher<()> {
-    crate::patterns! {
+pub fn pm_load_collapse() -> &'static TypedPatternMatcher<()> {
+    crate::cached_patterns! {
         // Match REDUCE(ADD) with a single range → full reduce_load_collapse algorithm.
         //
         // Tinygrad: pm_load_collapse matches only single-range REDUCE(ADD)
@@ -2364,8 +2367,10 @@ pub fn pm_load_collapse() -> TypedPatternMatcher<()> {
 ///
 /// Combines reduce-specific algebraic patterns with full symbolic simplification.
 /// Does NOT include a recursive `reduce_collapse` call (would infinite-loop).
-pub fn build_reduce_collapse_matcher() -> TypedPatternMatcher<()> {
-    reduce_collapse_inner_patterns() + crate::symbolic::symbolic_simple()
+pub fn build_reduce_collapse_matcher() -> &'static TypedPatternMatcher<()> {
+    static CACHED: std::sync::LazyLock<TypedPatternMatcher<()>> =
+        std::sync::LazyLock::new(|| reduce_collapse_inner_patterns() + crate::symbolic::symbolic_simple());
+    &CACHED
 }
 
 /// Extended pattern matcher for `reduce_load_collapse`.
@@ -2375,8 +2380,10 @@ pub fn build_reduce_collapse_matcher() -> TypedPatternMatcher<()> {
 /// matching Tinygrad where NE lifting is only in `pm_reduce_load_collapse`.
 ///
 /// Does NOT include the REDUCE→reduce_load_collapse call to avoid infinite recursion.
-pub fn build_reduce_load_collapse_matcher() -> TypedPatternMatcher<()> {
-    build_reduce_collapse_matcher() + ne_lifting_patterns()
+pub fn build_reduce_load_collapse_matcher() -> &'static TypedPatternMatcher<()> {
+    static CACHED: std::sync::LazyLock<TypedPatternMatcher<()>> =
+        std::sync::LazyLock::new(|| build_reduce_collapse_matcher() + ne_lifting_patterns());
+    &CACHED
 }
 
 /// NE lifting patterns for the extended `reduce_load_collapse` path.
@@ -2472,9 +2479,9 @@ fn reduce_collapse_inner_patterns() -> TypedPatternMatcher<()> {
 /// This is a common optimization that converts expensive modulo operations
 /// into cheap bitwise AND when the divisor is a power of two.
 /// Only applies to integer types.
-pub fn pm_mod_to_and() -> TypedPatternMatcher<()> {
+pub fn pm_mod_to_and() -> &'static TypedPatternMatcher<()> {
     use morok_ir::types::ConstValue;
-    crate::patterns! {
+    crate::cached_patterns! {
         // x % c where c is power of two → x & (c - 1)
         Mod(x, _c @const(c_val)) => |x, c_val| {
             // Only apply to integer types
@@ -2498,9 +2505,9 @@ pub fn pm_mod_to_and() -> TypedPatternMatcher<()> {
 ///
 /// Converts multiplication by power-of-two into left shift.
 /// Only applies to integer types.
-pub fn pm_mul_to_shl() -> TypedPatternMatcher<()> {
+pub fn pm_mul_to_shl() -> &'static TypedPatternMatcher<()> {
     use morok_ir::types::ConstValue;
-    crate::patterns! {
+    crate::cached_patterns! {
         // x * c where c is power of two → x << log2(c)
         // Note: Only applies to integer types, but we check inside the closure
         Mul[x, _c @const(c_val)] => |x, c_val| {
@@ -2522,8 +2529,8 @@ pub fn pm_mul_to_shl() -> TypedPatternMatcher<()> {
 /// Negate from multiply: x * -1 → NEG(x)
 ///
 /// Converts multiplication by -1 into negation operation.
-pub fn pm_neg_from_mul() -> TypedPatternMatcher<()> {
-    crate::patterns! {
+pub fn pm_neg_from_mul() -> &'static TypedPatternMatcher<()> {
+    crate::cached_patterns! {
         // x * -1 → NEG(x)
         Mul[x, _c @const(c_val)] if c_val.is_neg_one() => |x| {
             Some(x.neg())
@@ -2540,12 +2547,12 @@ pub fn pm_neg_from_mul() -> TypedPatternMatcher<()> {
 ///   (handles rounding towards zero for negative dividends)
 ///
 /// Shifts are typically 2-5x faster than divisions on modern CPUs and GPUs.
-pub fn pm_div_to_shr() -> TypedPatternMatcher<()> {
+pub fn pm_div_to_shr() -> &'static TypedPatternMatcher<()> {
     use morok_ir::types::ConstValue;
     use morok_ir::uop::cached_property::CachedProperty;
     use morok_ir::uop::properties::VminVmaxProperty;
 
-    crate::patterns! {
+    crate::cached_patterns! {
         // x // c where c is power of two → x >> log2(c)
         Idiv(x, _c @const(c_val)) => |x, c_val| {
             // Only apply to integer types
@@ -2593,8 +2600,8 @@ pub fn pm_div_to_shr() -> TypedPatternMatcher<()> {
 ///
 /// For backends that don't have native MAX support, decompose into
 /// comparison and conditional select.
-pub fn pm_max_decomposition() -> TypedPatternMatcher<()> {
-    crate::patterns! {
+pub fn pm_max_decomposition() -> &'static TypedPatternMatcher<()> {
+    crate::cached_patterns! {
         // MAX(a, b) → (a < b).where(b, a)
         Max(a, b) => |a, b| {
             let cond = a.try_cmplt(b).ok()?;
@@ -2607,8 +2614,8 @@ pub fn pm_max_decomposition() -> TypedPatternMatcher<()> {
 ///
 /// For backends that don't have native SQRT support, decompose into
 /// power operation with exponent 0.5.
-pub fn pm_sqrt_decomposition() -> TypedPatternMatcher<()> {
-    crate::patterns! {
+pub fn pm_sqrt_decomposition() -> &'static TypedPatternMatcher<()> {
+    crate::cached_patterns! {
         // SQRT(x) → POW(x, 0.5)
         Sqrt(x) if x.dtype().is_float() => |x| {
             let half = UOp::const_(x.dtype(), morok_ir::types::ConstValue::Float(0.5));
@@ -2625,9 +2632,9 @@ pub fn pm_sqrt_decomposition() -> TypedPatternMatcher<()> {
 ///
 /// Multiplication is typically 2-3x faster than division on modern CPUs and GPUs.
 /// Guards against divide by zero (leaves as FDIV to preserve IEEE 754 semantics).
-pub fn pm_fdiv_to_mul() -> TypedPatternMatcher<()> {
+pub fn pm_fdiv_to_mul() -> &'static TypedPatternMatcher<()> {
     use morok_ir::types::ConstValue;
-    crate::patterns! {
+    crate::cached_patterns! {
         // x / c → x * (1/c) for float constants
         Fdiv(x, _c @const(c_val)) => |x, c_val| {
             // Only apply to float types
@@ -2659,10 +2666,10 @@ pub fn pm_fdiv_to_mul() -> TypedPatternMatcher<()> {
 /// - !(x < c) → (c-1) < x  (for integers)
 /// - !(c < x) → x < (c+1)  (for integers)
 /// - (c1 < x) & (x < c2) → x == (c1+1)  (when c2 == c1+2, range compression)
-pub fn pm_comparison_negations() -> TypedPatternMatcher<()> {
+pub fn pm_comparison_negations() -> &'static TypedPatternMatcher<()> {
     use morok_ir::types::ConstValue;
 
-    crate::patterns! {
+    crate::cached_patterns! {
         // !(x < c) → (c-1) < x for integers
         // When x >= c, that's equivalent to (c-1) < x
         Not(Lt(x, _c @const(c_val))) if x.dtype().is_int() => |x, c_val| {

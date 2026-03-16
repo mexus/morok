@@ -694,7 +694,7 @@ pub fn apply_movement_op(op: &Op, in_shape: &[SInt], rngs: &[Arc<UOp>]) -> Vec<A
                     // Simplify validity expression so downstream patterns match cleanly
                     // (like Tinygrad: graph_rewrite(validity, symbolic+pm_simplify_valid))
                     let valid =
-                        crate::rewrite::graph_rewrite(&crate::symbolic::patterns::symbolic_simple(), valid, &mut ());
+                        crate::rewrite::graph_rewrite(crate::symbolic::patterns::symbolic_simple(), valid, &mut ());
                     let adjusted_rng = rng.try_sub(&begin_uop).unwrap();
                     UOp::try_where(valid, adjusted_rng, UOp::invalid_marker()).unwrap()
                 })
@@ -846,7 +846,7 @@ pub fn apply_movement_op(op: &Op, in_shape: &[SInt], rngs: &[Arc<UOp>]) -> Vec<A
             use morok_ir::rewrite::graph_rewrite;
 
             let sink = UOp::sink(axes_out);
-            let simplified_sink = graph_rewrite(&symbolic_simple(), sink, &mut ());
+            let simplified_sink = graph_rewrite(symbolic_simple(), sink, &mut ());
 
             // Extract simplified sources
             match simplified_sink.op() {

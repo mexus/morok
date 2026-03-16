@@ -205,3 +205,29 @@ pub fn patterns(input: TokenStream) -> TokenStream {
         Err(e) => e.to_compile_error().into(),
     }
 }
+
+/// Like `patterns!` but wraps the matcher in `LazyLock` for zero-cost reuse.
+///
+/// Returns `&'static SimplifiedPatternMatcher<C>` instead of an owned matcher.
+/// The matcher is constructed only once on first call and cached globally.
+///
+/// Use this for stateless `pm_*()` functions that are called repeatedly
+/// (e.g., once per kernel). Avoids re-constructing closures and hashmaps
+/// on every call.
+///
+/// # Example
+///
+/// ```ignore
+/// pub fn pm_render() -> &'static TypedPatternMatcher {
+///     cached_patterns! { ... }
+/// }
+/// ```
+#[proc_macro]
+pub fn cached_patterns(input: TokenStream) -> TokenStream {
+    let pattern_list = parse_macro_input!(input as patterns::PatternList);
+
+    match patterns::generate_cached_pattern_matcher(&pattern_list) {
+        Ok(tokens) => tokens.into(),
+        Err(e) => e.to_compile_error().into(),
+    }
+}

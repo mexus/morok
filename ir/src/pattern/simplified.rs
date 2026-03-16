@@ -40,7 +40,9 @@ use super::RewriteResult;
 /// Closure type for pattern matching + rewriting.
 ///
 /// Takes a UOp and mutable context, returns a RewriteResult.
-pub type PatternClosure<C> = Box<dyn Fn(&Arc<UOp>, &mut C) -> RewriteResult + Send + Sync>;
+/// Uses `Arc` instead of `Box` to enable `Clone` on `SimplifiedPatternMatcher`,
+/// which is needed for caching combined matchers via `LazyLock`.
+pub type PatternClosure<C> = Arc<dyn Fn(&Arc<UOp>, &mut C) -> RewriteResult + Send + Sync>;
 
 /// High-performance pattern matcher with O(1) OpKey-based dispatch.
 ///
@@ -112,19 +114,15 @@ impl<C> SimplifiedPatternMatcher<C> {
     {
         if keys.is_empty() {
             // No keys = wildcard pattern
-            self.wildcards.push(Box::new(closure));
+            self.wildcards.push(Arc::new(closure));
         } else if keys.len() == 1 {
             // Single key - store directly
-            self.indexed.entry(keys[0].clone()).or_default().push(Box::new(closure));
+            self.indexed.entry(keys[0].clone()).or_default().push(Arc::new(closure));
         } else {
-            // Multiple keys - need to share the closure via Arc
-            let shared = Arc::new(closure);
+            // Multiple keys - share the closure via Arc clone
+            let shared: PatternClosure<C> = Arc::new(closure);
             for key in keys {
-                let shared_clone = Arc::clone(&shared);
-                self.indexed
-                    .entry(key.clone())
-                    .or_default()
-                    .push(Box::new(move |uop: &Arc<UOp>, ctx: &mut C| shared_clone(uop, ctx)));
+                self.indexed.entry(key.clone()).or_default().push(Arc::clone(&shared));
             }
         }
     }
@@ -136,7 +134,7 @@ impl<C> SimplifiedPatternMatcher<C> {
     where
         F: Fn(&Arc<UOp>, &mut C) -> RewriteResult + Send + Sync + 'static,
     {
-        self.wildcards.push(Box::new(closure));
+        self.wildcards.push(Arc::new(closure));
     }
 
     /// Number of registered patterns.
@@ -204,6 +202,12 @@ impl<C> SimplifiedPatternMatcher<C> {
     }
 }
 
+impl<C> Clone for SimplifiedPatternMatcher<C> {
+    fn clone(&self) -> Self {
+        Self { indexed: self.indexed.clone(), wildcards: self.wildcards.clone() }
+    }
+}
+
 impl<C> Default for SimplifiedPatternMatcher<C> {
     fn default() -> Self {
         Self::new()
@@ -222,19 +226,21 @@ impl SimplifiedPatternMatcher<()> {
     /// let mega = symbolic().with_context::<PcontigConfig>()
     ///     + buffer_removal_with_pcontig(); // TypedPatternMatcher<PcontigConfig>
     /// ```
-    pub fn with_context<D: 'static + Send + Sync>(self) -> SimplifiedPatternMatcher<D> {
+    pub fn with_context<D: 'static + Send + Sync>(&self) -> SimplifiedPatternMatcher<D> {
         let mut result = SimplifiedPatternMatcher::<D>::new();
-        for (key, closures) in self.indexed {
+        for (key, closures) in &self.indexed {
             for closure in closures {
+                let closure = Arc::clone(closure);
                 result
                     .indexed
                     .entry(key.clone())
                     .or_default()
-                    .push(Box::new(move |uop: &Arc<UOp>, _ctx: &mut D| closure(uop, &mut ())));
+                    .push(Arc::new(move |uop: &Arc<UOp>, _ctx: &mut D| closure(uop, &mut ())));
             }
         }
-        for closure in self.wildcards {
-            result.wildcards.push(Box::new(move |uop: &Arc<UOp>, _ctx: &mut D| closure(uop, &mut ())));
+        for closure in &self.wildcards {
+            let closure = Arc::clone(closure);
+            result.wildcards.push(Arc::new(move |uop: &Arc<UOp>, _ctx: &mut D| closure(uop, &mut ())));
         }
         result
     }
@@ -261,6 +267,32 @@ impl<C> std::ops::Add for SimplifiedPatternMatcher<C> {
         // Merge wildcards
         self.wildcards.extend(rhs.wildcards);
         self
+    }
+}
+
+// Implement Add for references — clones both sides then combines.
+// Enables `pm_a() + pm_b()` when both return `&'static TypedPatternMatcher`.
+impl<C> std::ops::Add for &SimplifiedPatternMatcher<C> {
+    type Output = SimplifiedPatternMatcher<C>;
+
+    fn add(self, rhs: Self) -> Self::Output {
+        self.clone() + rhs.clone()
+    }
+}
+
+impl<C> std::ops::Add<&SimplifiedPatternMatcher<C>> for SimplifiedPatternMatcher<C> {
+    type Output = SimplifiedPatternMatcher<C>;
+
+    fn add(self, rhs: &SimplifiedPatternMatcher<C>) -> Self::Output {
+        self + rhs.clone()
+    }
+}
+
+impl<C> std::ops::Add<SimplifiedPatternMatcher<C>> for &SimplifiedPatternMatcher<C> {
+    type Output = SimplifiedPatternMatcher<C>;
+
+    fn add(self, rhs: SimplifiedPatternMatcher<C>) -> Self::Output {
+        self.clone() + rhs
     }
 }
 

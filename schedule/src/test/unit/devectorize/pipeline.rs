@@ -86,7 +86,7 @@ fn test_devectorize_matmul_pattern() {
     let after_devectorize = devectorize(&load);
 
     // Step 2: Run pm_render
-    let result = graph_rewrite(&pm_render(), after_devectorize, &mut ());
+    let result = graph_rewrite(pm_render(), after_devectorize, &mut ());
 
     // Should produce vec8 result through devectorization
     assert_eq!(result.dtype().vcount(), 8, "Total vcount should be 8");

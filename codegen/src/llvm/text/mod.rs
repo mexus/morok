@@ -108,7 +108,7 @@ impl Renderer for LlvmTextRenderer {
 
         // NOTE: pm_render() is now called in schedule/optimizer Stage 19.
         // Keeping pm_bool_devectorize as safety fallback for direct codegen paths.
-        let uop = graph_rewrite_bottom_up(&pm_bool_devectorize(), uop.clone(), &mut ());
+        let uop = graph_rewrite_bottom_up(pm_bool_devectorize(), uop.clone(), &mut ());
 
         tracing::debug!(ast_after_pm_bool_devectorize = %uop.tree(), "codegen: after pm_bool_devectorize");
 

@@ -568,7 +568,7 @@ fn eval_four_corners(
 }
 
 /// Get the minimum and maximum values for a dtype.
-fn dtype_bounds(dtype: &DType) -> (ConstValue, ConstValue) {
+pub fn dtype_bounds(dtype: &DType) -> (ConstValue, ConstValue) {
     let s = dtype.base();
     (ConstValue::min(s), ConstValue::max(s))
 }

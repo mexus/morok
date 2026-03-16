@@ -118,14 +118,17 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut CContext, kernel: &mut Vec<String>) 
         | Op::Kernel { .. }
         | Op::Barrier { .. } => None,
 
-        Op::DefineReg { size, .. } => {
-            let base_dtype = match uop.dtype() {
-                DType::Ptr { base, .. } => base.as_ref().clone(),
-                other => other,
+        Op::DefineReg { .. } => {
+            // Read base type and size from dtype (matching Tinygrad's x.dtype.base/x.dtype.size).
+            // After devectorize's no_vectorized_buf, the dtype is the canonical source of truth:
+            // e.g. Ptr(base=Float32, size=35) instead of the Op's original size field.
+            let (base_dtype, alloc_size) = match uop.dtype() {
+                DType::Ptr { base, size, .. } => (base.as_ref().clone(), size.unwrap_or(1)),
+                other => (other, 1),
             };
             let name = ctx.next_name("reg");
             let indent = ctx.indent();
-            kernel.push(format!("{indent}{} {name}[{size}];", c_dtype(&base_dtype)));
+            kernel.push(format!("{indent}{} {name}[{alloc_size}];", c_dtype(&base_dtype)));
             ctx.register(uop.id, name);
             Some(())
         }
@@ -143,8 +146,6 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut CContext, kernel: &mut Vec<String>) 
                 } else {
                     ctx.get(&indices[0]).to_string()
                 };
-                // Gate is NOT rendered here — it's handled at LOAD/STORE level.
-                // Tinygrad: INDEX renders as (buf + idx), LOAD checks gate.
                 let expr = format!("{buf} + {idx}");
                 ctx.emit_expr(uop, expr, "idx", kernel);
             }
