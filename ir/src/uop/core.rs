@@ -338,11 +338,6 @@ impl UOp {
         &VminVmaxProperty::get(self).1
     }
 
-    /// Compute a stable content-based hash for this UOp.
-    ///
-    /// Unlike the runtime `id` field which changes between program runs,
-    /// this hash is computed from the UOp's structural content:
-    /// - Operation type (discriminant)
     /// Extract device specification from this UOp graph.
     ///
     /// Traverses the graph to find Op::Device nodes following Tinygrad's

@@ -30,12 +30,12 @@ use morok_tensor::Tensor;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create tensors from slices
-    let a = Tensor::from_slice(&[1.0f32, 2.0, 3.0, 4.0]);
-    let b = Tensor::from_slice(&[10.0f32, 20.0, 30.0, 40.0]);
+    let a = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0]);
+    let b = Tensor::from_slice([10.0f32, 20.0, 30.0, 40.0]);
 
     // Lazy operations (no execution yet)
     let sum = &a + &b;
-    let scaled = &sum * &Tensor::from_slice(&[0.1f32]);
+    let scaled = &sum * &Tensor::from_slice([0.1f32]);
 
     // Execute and get results
     let result = scaled.realize()?;
@@ -49,7 +49,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 **What's happening:**
 
-1. `Tensor::from_slice()` creates a tensor from a Rust slice. The `f32` suffix tells Rust the element type.
+1. `Tensor::from_slice()` creates a 1D tensor from array data. The `f32` suffix tells Rust the element type.
 
 2. `&a + &b` doesn't compute anything yet. It returns a new `Tensor` that *represents* the addition. The `&` borrows the tensors so we can reuse them.
 
@@ -70,28 +70,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 Neural networks constantly reshape data. Let's master the basics.
 
 ```rust
+use ndarray::array;
+
 fn shape_example() -> Result<(), Box<dyn std::error::Error>> {
     // Create a 1D tensor with 6 elements
-    let data = Tensor::from_slice(&[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]);
-    println!("Original shape: {:?}", data.shape());  // [6]
+    let data = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]);
+    println!("Original shape: {:?}", data.shape()?);  // [6]
 
-    // Reshape to a 2x3 matrix
-    let matrix = data.try_reshape(&[2, 3])?;
+    // Reshape to a 2x3 matrix (or create directly with from_ndarray)
+    let matrix = Tensor::from_ndarray(&array![[1.0f32, 2.0, 3.0], [4.0, 5.0, 6.0]]);
     println!("Matrix shape: {:?}", matrix.shape());  // [2, 3]
     // [[1, 2, 3],
     //  [4, 5, 6]]
 
     // Transpose to 3x2
     let transposed = matrix.try_transpose(0, 1)?;
-    println!("Transposed shape: {:?}", transposed.shape());  // [3, 2]
+    println!("Transposed shape: {:?}", transposed.shape()?);  // [3, 2]
     // [[1, 4],
     //  [2, 5],
     //  [3, 6]]
 
     // Broadcasting: add a row vector to every row
     // [3, 2] + [1, 2] → [3, 2]
-    let bias = Tensor::from_slice(&[100.0f32, 200.0])
-        .try_reshape(&[1, 2])?;
+    let bias = Tensor::from_ndarray(&array![[100.0f32, 200.0]]);
     let biased = &transposed + &bias;
 
     let result = biased.realize()?;
@@ -132,21 +133,23 @@ fn shape_example() -> Result<(), Box<dyn std::error::Error>> {
 Matrix multiplication is the workhorse of neural networks. Every layer uses it.
 
 ```rust
+use ndarray::array;
+
 fn matmul_example() -> Result<(), Box<dyn std::error::Error>> {
     // Input: 4 samples, 3 features each → shape [4, 3]
-    let input = Tensor::from_slice(&[
-        1.0f32, 2.0, 3.0,   // sample 0
-        4.0, 5.0, 6.0,      // sample 1
-        7.0, 8.0, 9.0,      // sample 2
-        10.0, 11.0, 12.0,   // sample 3
-    ]).try_reshape(&[4, 3])?;
+    let input = Tensor::from_ndarray(&array![
+        [1.0f32, 2.0, 3.0],    // sample 0
+        [4.0, 5.0, 6.0],       // sample 1
+        [7.0, 8.0, 9.0],       // sample 2
+        [10.0, 11.0, 12.0],    // sample 3
+    ]);
 
     // Weights: 3 inputs → 2 outputs → shape [3, 2]
-    let weights = Tensor::from_slice(&[
-        0.1f32, 0.2,  // feature 0 → outputs
-        0.3, 0.4,     // feature 1 → outputs
-        0.5, 0.6,     // feature 2 → outputs
-    ]).try_reshape(&[3, 2])?;
+    let weights = Tensor::from_ndarray(&array![
+        [0.1f32, 0.2],  // feature 0 → outputs
+        [0.3, 0.4],     // feature 1 → outputs
+        [0.5, 0.6],     // feature 2 → outputs
+    ]);
 
     // Matrix multiply: [4, 3] @ [3, 2] → [4, 2]
     let output = input.dot(&weights)?;
@@ -178,43 +181,14 @@ The inner dimensions must match (the `K`). Think of it as: "for each row of left
 A linear layer computes `y = x @ W.T + b`. Let's build one from scratch.
 
 ```rust
-use morok_tensor::{Tensor, Error};
-
-struct Linear {
-    weight: Tensor,  // shape: [out_features, in_features]
-    bias: Tensor,    // shape: [out_features]
-}
-
-impl Linear {
-    fn new(in_features: usize, out_features: usize) -> Self {
-        // Simple initialization (real code would use proper random init)
-        let weight_data: Vec<f32> = (0..in_features * out_features)
-            .map(|i| (i as f32 * 0.1).sin() * 0.1)
-            .collect();
-        let bias_data = vec![0.0f32; out_features];
-
-        Self {
-            weight: Tensor::from_slice(&weight_data)
-                .try_reshape(&[out_features as isize, in_features as isize])
-                .expect("reshape failed"),
-            bias: Tensor::from_slice(&bias_data),
-        }
-    }
-
-    fn forward(&self, x: &Tensor) -> Result<Tensor, Error> {
-        // y = x @ W.T + b
-        let weight_t = self.weight.try_transpose(0, 1)?;
-        let out = x.dot(&weight_t)?;
-        Ok(&out + &self.bias)
-    }
-}
+use morok_tensor::{Tensor, nn::{Linear, Layer}};
 
 fn linear_example() -> Result<(), Box<dyn std::error::Error>> {
     // Create a layer: 4 inputs → 2 outputs
-    let layer = Linear::new(4, 2);
+    let layer = Linear::with_dims(4, 2, morok_dtype::DType::Float32);
 
     // Single sample with 4 features
-    let input = Tensor::from_slice(&[1.0f32, 2.0, 3.0, 4.0]);
+    let input = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0]);
 
     // Forward pass
     let output = layer.forward(&input)?;
@@ -242,49 +216,22 @@ This convention makes it easy to read the weight matrix: row `i` contains all we
 Let's build a complete neural network that could classify handwritten digits.
 
 ```rust
-/// Two-layer neural network for MNIST
-/// Architecture: 784 (28×28 pixels) → 128 (hidden) → 10 (digits)
-struct MnistNet {
-    fc1: Linear,
-    fc2: Linear,
-}
-
-impl MnistNet {
-    fn new() -> Self {
-        Self {
-            fc1: Linear::new(784, 128),
-            fc2: Linear::new(128, 10),
-        }
-    }
-
-    fn forward(&self, x: &Tensor) -> Result<Tensor, Error> {
-        // Layer 1: linear + ReLU activation
-        let x = self.fc1.forward(x)?;
-        let x = x.relu()?;
-
-        // Layer 2: linear (no activation — raw logits)
-        self.fc2.forward(&x)
-    }
-
-    fn predict(&self, x: &Tensor) -> Result<Tensor, Error> {
-        let logits = self.forward(x)?;
-        // Convert logits to probabilities
-        logits.softmax(-1)
-    }
-}
+use morok_tensor::{Tensor, nn::{Linear, Relu, Layer}};
 
 fn mnist_example() -> Result<(), Box<dyn std::error::Error>> {
-    let model = MnistNet::new();
+    // Architecture: 784 (28×28 pixels) → 128 (hidden) → 10 (digits)
+    let fc1 = Linear::with_dims(784, 128, morok_dtype::DType::Float32);
+    let fc2 = Linear::with_dims(128, 10, morok_dtype::DType::Float32);
 
     // Simulate a 28×28 grayscale image (flattened to 784)
     let fake_image: Vec<f32> = (0..784)
         .map(|i| (i as f32) / 784.0)
         .collect();
-    let input = Tensor::from_slice(&fake_image)
+    let input = Tensor::from_slice(fake_image)
         .try_reshape(&[1, 784])?;  // batch size 1
 
-    // Forward pass
-    let logits = model.forward(&input)?;
+    // Forward pass: linear → ReLU → linear
+    let logits = input.sequential(&[&fc1, &Relu, &fc2])?;
     let probs = logits.softmax(-1)?;
 
     // Get results
@@ -302,13 +249,15 @@ fn mnist_example() -> Result<(), Box<dyn std::error::Error>> {
 
 **Key concepts:**
 
-1. **ReLU activation:** `x.relu()` returns `max(0, x)`. It introduces non-linearity—without it, stacking linear layers would just be one big linear layer.
+1. **`sequential()`** chains layers together: each layer's output feeds into the next. No manual wiring needed.
 
-2. **Logits vs probabilities:** The raw output of the last layer (logits) can be any real number. `softmax()` converts them to probabilities that sum to 1.
+2. **ReLU activation:** `Relu` is a zero-size layer that applies `max(0, x)`. It introduces non-linearity—without it, stacking linear layers would just be one big linear layer.
 
-3. **argmax:** Returns the index of the maximum value—the predicted class.
+3. **Logits vs probabilities:** The raw output of the last layer (logits) can be any real number. `softmax()` converts them to probabilities that sum to 1.
 
-4. **Batch dimension:** We use shape `[1, 784]` for a single image. For 32 images, use `[32, 784]`. The model handles batches automatically.
+4. **argmax:** Returns the index of the maximum value—the predicted class.
+
+5. **Batch dimension:** We use shape `[1, 784]` for a single image. For 32 images, use `[32, 784]`. The model handles batches automatically.
 
 ---
 
@@ -318,8 +267,8 @@ Want to see what Morok generates? Here's how to inspect the IR and generated cod
 
 ```rust
 fn inspect_compilation() -> Result<(), Box<dyn std::error::Error>> {
-    let a = Tensor::from_slice(&[1.0f32, 2.0, 3.0]);
-    let b = Tensor::from_slice(&[4.0f32, 5.0, 6.0]);
+    let a = Tensor::from_slice([1.0f32, 2.0, 3.0]);
+    let b = Tensor::from_slice([4.0f32, 5.0, 6.0]);
     let c = &a + &b;
 
     // Print the computation graph (before compilation)
@@ -330,6 +279,8 @@ fn inspect_compilation() -> Result<(), Box<dyn std::error::Error>> {
     let result = c.realize()?;
 
     // Inspect generated kernels
+    // Note: kernel tracking via kernels() is a placeholder — use prepare() for
+    // full kernel inspection (see matmul IR test).
     println!("\n=== Generated Kernels ===");
     for (i, kernel) in result.kernels().iter().enumerate() {
         println!("Kernel {}: {}", i, kernel.name);
@@ -360,11 +311,13 @@ You've learned the core patterns for using Morok:
 
 | Task | Code |
 |------|------|
-| Create tensor | `Tensor::from_slice(&[1.0f32, 2.0])` |
+| Create tensor | `Tensor::from_slice([1.0f32, 2.0])` |
 | Arithmetic | `&a + &b`, `&a * &b`, `-&a` |
 | Reshape | `t.try_reshape(&[2, 3])?` |
 | Transpose | `t.try_transpose(0, 1)?` |
 | Matrix multiply | `a.dot(&b)?` |
+| Linear layer | `Linear::with_dims(in, out, dtype)` |
+| Chain layers | `x.sequential(&[&fc1, &Relu, &fc2])?` |
 | Activation | `t.relu()?`, `t.softmax(-1)?` |
 | Execute | `t.realize()?` |
 | Extract data | `result.to_ndarray::<f32>()?` |

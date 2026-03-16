@@ -1,3 +1,5 @@
+#![allow(clippy::approx_constant)]
+
 use crate::test::helpers::*;
 use crate::*;
 use morok_dtype::DType;

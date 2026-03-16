@@ -25,8 +25,8 @@ Morok is a Rust-based ML compiler inspired by [Tinygrad](https://github.com/tiny
 use morok_tensor::Tensor;
 
 // Build lazy computation graph
-let a = Tensor::from_slice(&[1.0, 2.0, 3.0], &[3])?;
-let b = Tensor::from_slice(&[4.0, 5.0, 6.0], &[3])?;
+let a = Tensor::from_slice([1.0f32, 2.0, 3.0]);
+let b = Tensor::from_slice([4.0f32, 5.0, 6.0]);
 let c = (a + b).sum();
 
 // Compile and execute

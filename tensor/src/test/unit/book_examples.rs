@@ -1,6 +1,7 @@
 use crate::nn::Layer;
 use crate::test::helpers::{assert_close_f32, test_setup};
 use crate::*;
+use ndarray::array;
 
 // =========================================================================
 // Example 1: Hello Tensor
@@ -10,11 +11,11 @@ crate::codegen_tests! {
     fn test_example_1_hello_tensor(config) {
         test_setup();
 
-        let a = Tensor::from_slice(&[1.0f32, 2.0, 3.0, 4.0]);
-        let b = Tensor::from_slice(&[10.0f32, 20.0, 30.0, 40.0]);
+        let a = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0]);
+        let b = Tensor::from_slice([10.0f32, 20.0, 30.0, 40.0]);
 
         let sum = &a + &b;
-        let scaled = sum * Tensor::from_slice(&[0.1f32]);
+        let scaled = sum * Tensor::from_slice([0.1f32]);
 
         let result = scaled.realize_with(&config).unwrap();
         let data = result.to_vec::<f32>().unwrap();
@@ -32,7 +33,7 @@ crate::codegen_tests! {
     fn test_example_2_shape_reshape(_config) {
         test_setup();
 
-        let data = Tensor::from_slice(&[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let data = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]);
         assert_eq!(data.shape().unwrap().len(), 1);
         assert_eq!(data.shape().unwrap()[0].as_const(), Some(6));
 
@@ -43,9 +44,7 @@ crate::codegen_tests! {
     fn test_example_2_shape_transpose(config) {
         test_setup();
 
-        let data = Tensor::from_slice(&[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0])
-            .try_reshape(&[2, 3])
-            .unwrap();
+        let data = Tensor::from_ndarray(&array![[1.0f32, 2.0, 3.0], [4.0, 5.0, 6.0]]);
         let transposed = data.try_transpose(0, 1).unwrap();
 
         assert_eq!(transposed.shape().unwrap()[0].as_const(), Some(3));
@@ -61,10 +60,8 @@ crate::codegen_tests! {
         test_setup();
 
         // [3, 2] + [1, 2] → [3, 2]
-        let transposed = Tensor::from_slice(&[1.0f32, 4.0, 2.0, 5.0, 3.0, 6.0])
-            .try_reshape(&[3, 2])
-            .unwrap();
-        let bias = Tensor::from_slice(&[100.0f32, 200.0]).try_reshape(&[1, 2]).unwrap();
+        let transposed = Tensor::from_ndarray(&array![[1.0f32, 4.0], [2.0, 5.0], [3.0, 6.0]]);
+        let bias = Tensor::from_ndarray(&array![[100.0f32, 200.0]]);
         let biased = &transposed + &bias;
 
         let result = biased.realize_with(&config).unwrap();
@@ -84,18 +81,18 @@ crate::codegen_tests! {
         test_setup();
 
         // Input: [4, 3], Weights: [3, 2] → Output: [4, 2]
-        let input = Tensor::from_slice(&[
-            1.0f32, 2.0, 3.0,
-            4.0, 5.0, 6.0,
-            7.0, 8.0, 9.0,
-            10.0, 11.0, 12.0,
-        ]).try_reshape(&[4, 3]).unwrap();
+        let input = Tensor::from_ndarray(&array![
+            [1.0f32, 2.0, 3.0],
+            [4.0, 5.0, 6.0],
+            [7.0, 8.0, 9.0],
+            [10.0, 11.0, 12.0],
+        ]);
 
-        let weights = Tensor::from_slice(&[
-            0.1f32, 0.2,
-            0.3, 0.4,
-            0.5, 0.6,
-        ]).try_reshape(&[3, 2]).unwrap();
+        let weights = Tensor::from_ndarray(&array![
+            [0.1f32, 0.2],
+            [0.3, 0.4],
+            [0.5, 0.6],
+        ]);
 
         let output = input.dot(&weights).unwrap();
 
@@ -127,14 +124,15 @@ crate::codegen_tests! {
     fn test_example_4_linear_layer(config) {
         test_setup();
 
-        // Deterministic weights for verifiable output
-        // Weight: [2, 4] = [[0.0, 0.1, 0.2, 0.3], [0.4, 0.5, 0.6, 0.7]]
-        let weight_data: Vec<f32> = vec![0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7];
-        let weight = Tensor::from_slice(&weight_data).try_reshape(&[2, 4]).unwrap();
-        let bias = Tensor::from_slice(&[0.0f32, 0.0]);
+        // Weight: [2, 4], Bias: [2]
+        let weight = Tensor::from_ndarray(&array![
+            [0.0f32, 0.1, 0.2, 0.3],
+            [0.4, 0.5, 0.6, 0.7],
+        ]);
+        let bias = Tensor::from_slice([0.0f32, 0.0]);
 
         // Input: [1, 4]
-        let input = Tensor::from_slice(&[1.0f32, 2.0, 3.0, 4.0]).try_reshape(&[1, 4]).unwrap();
+        let input = Tensor::from_ndarray(&array![[1.0f32, 2.0, 3.0, 4.0]]);
 
         // y = input @ weight.T + bias
         let weight_t = weight.try_transpose(0, 1).unwrap();
@@ -166,16 +164,16 @@ crate::codegen_tests! {
         // Use small dimensions for fast test: 4 → 3 → 2
         // fc1: [3, 4] weights + [3] bias
         let w1_data: Vec<f32> = (0..12).map(|i| (i as f32) * 0.1 - 0.5).collect();
-        let w1 = Tensor::from_slice(&w1_data).try_reshape(&[3, 4]).unwrap();
-        let b1 = Tensor::from_slice(&[0.0f32; 3]);
+        let w1 = Tensor::from_ndarray(&ndarray::Array2::from_shape_vec((3, 4), w1_data).unwrap());
+        let b1 = Tensor::from_slice([0.0f32; 3]);
 
         // fc2: [2, 3] weights + [2] bias
         let w2_data: Vec<f32> = (0..6).map(|i| (i as f32) * 0.1 - 0.3).collect();
-        let w2 = Tensor::from_slice(&w2_data).try_reshape(&[2, 3]).unwrap();
-        let b2 = Tensor::from_slice(&[0.0f32; 2]);
+        let w2 = Tensor::from_ndarray(&ndarray::Array2::from_shape_vec((2, 3), w2_data).unwrap());
+        let b2 = Tensor::from_slice([0.0f32; 2]);
 
         // Input: [1, 4]
-        let input = Tensor::from_slice(&[0.5f32, -0.3, 0.8, 0.1]).try_reshape(&[1, 4]).unwrap();
+        let input = Tensor::from_ndarray(&array![[0.5f32, -0.3, 0.8, 0.1]]);
 
         // Layer 1: linear + relu
         let h = input.dot(&w1.try_transpose(0, 1).unwrap()).unwrap();
@@ -212,7 +210,7 @@ crate::codegen_tests! {
         test_setup();
 
         // Simple test: [1, 4] with clear argmax
-        let input = Tensor::from_slice(&[0.1f32, 0.9, 0.3, 0.5]).try_reshape(&[1, 4]).unwrap();
+        let input = Tensor::from_ndarray(&array![[0.1f32, 0.9, 0.3, 0.5]]);
         let prediction = input.argmax(Some(-1)).unwrap();
 
         let result = prediction.realize_with(&config).unwrap();
@@ -235,12 +233,14 @@ crate::codegen_tests! {
         test_setup();
 
         // Use library Linear with known weights: [2, 4]
-        let weight = Tensor::from_slice(&[0.0f32, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7])
-            .try_reshape(&[2, 4]).unwrap();
-        let bias = Tensor::from_slice(&[0.0f32, 0.0]);
+        let weight = Tensor::from_ndarray(&array![
+            [0.0f32, 0.1, 0.2, 0.3],
+            [0.4, 0.5, 0.6, 0.7],
+        ]);
+        let bias = Tensor::from_slice([0.0f32, 0.0]);
         let layer = nn::Linear::new(weight, bias);
 
-        let input = Tensor::from_slice(&[1.0f32, 2.0, 3.0, 4.0]);
+        let input = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0]);
 
         let output = layer.forward(&input).unwrap();
         let shape = output.shape().unwrap();
@@ -264,19 +264,17 @@ crate::codegen_tests! {
         test_setup();
 
         // Small 4 -> 3 -> 2 network via sequential
-        let w1 = Tensor::from_slice(
-            &(0..12i32).map(|i| (i as f32) * 0.1 - 0.5).collect::<Vec<_>>()
-        ).try_reshape(&[3, 4]).unwrap();
-        let b1 = Tensor::from_slice(&[0.0f32; 3]);
+        let w1_data: Vec<f32> = (0..12).map(|i| (i as f32) * 0.1 - 0.5).collect();
+        let w1 = Tensor::from_ndarray(&ndarray::Array2::from_shape_vec((3, 4), w1_data).unwrap());
+        let b1 = Tensor::from_slice([0.0f32; 3]);
         let fc1 = nn::Linear::new(w1, b1);
 
-        let w2 = Tensor::from_slice(
-            &(0..6i32).map(|i| (i as f32) * 0.1 - 0.3).collect::<Vec<_>>()
-        ).try_reshape(&[2, 3]).unwrap();
-        let b2 = Tensor::from_slice(&[0.0f32; 2]);
+        let w2_data: Vec<f32> = (0..6).map(|i| (i as f32) * 0.1 - 0.3).collect();
+        let w2 = Tensor::from_ndarray(&ndarray::Array2::from_shape_vec((2, 3), w2_data).unwrap());
+        let b2 = Tensor::from_slice([0.0f32; 2]);
         let fc2 = nn::Linear::new(w2, b2);
 
-        let input = Tensor::from_slice(&[0.5f32, -0.3, 0.8, 0.1]);
+        let input = Tensor::from_slice([0.5f32, -0.3, 0.8, 0.1]);
 
         let logits = input.sequential(&[&fc1, &nn::Relu, &fc2]).unwrap();
 
@@ -303,8 +301,8 @@ crate::codegen_tests! {
 
 #[test]
 fn test_example_6_ir_graph() {
-    let a = Tensor::from_slice(&[1.0f32, 2.0, 3.0]);
-    let b = Tensor::from_slice(&[4.0f32, 5.0, 6.0]);
+    let a = Tensor::from_slice([1.0f32, 2.0, 3.0]);
+    let b = Tensor::from_slice([4.0f32, 5.0, 6.0]);
     let c = &a + &b;
 
     // Verify we can print the IR tree without crashing

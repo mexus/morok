@@ -30,12 +30,12 @@ use morok_tensor::Tensor;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create tensors from slices
-    let a = Tensor::from_slice(&[1.0f32, 2.0, 3.0, 4.0]);
-    let b = Tensor::from_slice(&[10.0f32, 20.0, 30.0, 40.0]);
+    let a = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0]);
+    let b = Tensor::from_slice([10.0f32, 20.0, 30.0, 40.0]);
 
     // Lazy operations (no execution yet)
     let sum = &a + &b;
-    let scaled = &sum * &Tensor::from_slice(&[0.1f32]);
+    let scaled = &sum * &Tensor::from_slice([0.1f32]);
 
     // Execute and get results
     let result = scaled.realize()?;
@@ -72,7 +72,7 @@ Neural networks constantly reshape data. Let's master the basics.
 ```rust
 fn shape_example() -> Result<(), Box<dyn std::error::Error>> {
     // Create a 1D tensor with 6 elements
-    let data = Tensor::from_slice(&[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]);
+    let data = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]);
     println!("Original shape: {:?}", data.shape());  // [6]
 
     // Reshape to a 2x3 matrix
@@ -90,7 +90,7 @@ fn shape_example() -> Result<(), Box<dyn std::error::Error>> {
 
     // Broadcasting: add a row vector to every row
     // [3, 2] + [1, 2] → [3, 2]
-    let bias = Tensor::from_slice(&[100.0f32, 200.0])
+    let bias = Tensor::from_slice([100.0f32, 200.0])
         .try_reshape(&[1, 2])?;
     let biased = &transposed + &bias;
 
@@ -133,20 +133,22 @@ Matrix multiplication is the workhorse of neural networks. Every layer uses it.
 
 ```rust
 fn matmul_example() -> Result<(), Box<dyn std::error::Error>> {
+    use ndarray::array;
+
     // Input: 4 samples, 3 features each → shape [4, 3]
-    let input = Tensor::from_slice(&[
-        1.0f32, 2.0, 3.0,   // sample 0
-        4.0, 5.0, 6.0,      // sample 1
-        7.0, 8.0, 9.0,      // sample 2
-        10.0, 11.0, 12.0,   // sample 3
-    ]).try_reshape(&[4, 3])?;
+    let input = Tensor::from_ndarray(&array![
+        [1.0f32, 2.0, 3.0],    // sample 0
+        [4.0, 5.0, 6.0],       // sample 1
+        [7.0, 8.0, 9.0],       // sample 2
+        [10.0, 11.0, 12.0],    // sample 3
+    ]);
 
     // Weights: 3 inputs → 2 outputs → shape [3, 2]
-    let weights = Tensor::from_slice(&[
-        0.1f32, 0.2,  // feature 0 → outputs
-        0.3, 0.4,     // feature 1 → outputs
-        0.5, 0.6,     // feature 2 → outputs
-    ]).try_reshape(&[3, 2])?;
+    let weights = Tensor::from_ndarray(&array![
+        [0.1f32, 0.2],  // feature 0 → outputs
+        [0.3, 0.4],     // feature 1 → outputs
+        [0.5, 0.6],     // feature 2 → outputs
+    ]);
 
     // Matrix multiply: [4, 3] @ [3, 2] → [4, 2]
     let output = input.dot(&weights)?;
@@ -194,10 +196,10 @@ impl Linear {
         let bias_data = vec![0.0f32; out_features];
 
         Self {
-            weight: Tensor::from_slice(&weight_data)
+            weight: Tensor::from_slice(weight_data)
                 .try_reshape(&[out_features as isize, in_features as isize])
                 .expect("reshape failed"),
-            bias: Tensor::from_slice(&bias_data),
+            bias: Tensor::from_slice(bias_data),
         }
     }
 
@@ -214,7 +216,7 @@ fn linear_example() -> Result<(), Box<dyn std::error::Error>> {
     let layer = Linear::new(4, 2);
 
     // Single sample with 4 features
-    let input = Tensor::from_slice(&[1.0f32, 2.0, 3.0, 4.0]);
+    let input = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0]);
 
     // Forward pass
     let output = layer.forward(&input)?;
@@ -280,7 +282,7 @@ fn mnist_example() -> Result<(), Box<dyn std::error::Error>> {
     let fake_image: Vec<f32> = (0..784)
         .map(|i| (i as f32) / 784.0)
         .collect();
-    let input = Tensor::from_slice(&fake_image)
+    let input = Tensor::from_slice(fake_image)
         .try_reshape(&[1, 784])?;  // batch size 1
 
     // Forward pass
@@ -318,8 +320,8 @@ Want to see what Morok generates? Here's how to inspect the IR and generated cod
 
 ```rust
 fn inspect_compilation() -> Result<(), Box<dyn std::error::Error>> {
-    let a = Tensor::from_slice(&[1.0f32, 2.0, 3.0]);
-    let b = Tensor::from_slice(&[4.0f32, 5.0, 6.0]);
+    let a = Tensor::from_slice([1.0f32, 2.0, 3.0]);
+    let b = Tensor::from_slice([4.0f32, 5.0, 6.0]);
     let c = &a + &b;
 
     // Print the computation graph (before compilation)
@@ -360,7 +362,7 @@ You've learned the core patterns for using Morok:
 
 | Task | Code |
 |------|------|
-| Create tensor | `Tensor::from_slice(&[1.0f32, 2.0])` |
+| Create tensor | `Tensor::from_slice([1.0f32, 2.0])` |
 | Arithmetic | `&a + &b`, `&a * &b`, `-&a` |
 | Reshape | `t.try_reshape(&[2, 3])?` |
 | Transpose | `t.try_transpose(0, 1)?` |

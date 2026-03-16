@@ -66,7 +66,7 @@ The `entry` holds a `TensorEntry` containing the UOp graph—the computation thi
 **1. Input tensors** — buffer allocated immediately:
 
 ```rust
-let a = Tensor::from_slice(&[1.0, 2.0, 3.0], &[3])?;
+let a = Tensor::from_slice([1.0f32, 2.0, 3.0]);
 // `a.buffer` = Some(Arc<Buffer>) with actual data
 ```
 
@@ -412,8 +412,8 @@ Let's trace `C = A @ B` through the entire pipeline. Assume 4×4 matrices.
 ### Stage 1: Lazy Graph Construction
 
 ```rust
-let a = Tensor::from_slice(&a_data, &[4, 4])?;  // Input buffer allocated
-let b = Tensor::from_slice(&b_data, &[4, 4])?;  // Input buffer allocated
+let a = Tensor::from_slice(a_data).try_reshape(&[4, 4])?;  // Input buffer allocated
+let b = Tensor::from_slice(b_data).try_reshape(&[4, 4])?;  // Input buffer allocated
 let c = a.matmul(&b)?;                           // Graph built, no computation
 ```
 
