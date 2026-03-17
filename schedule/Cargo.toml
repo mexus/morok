@@ -4,12 +4,16 @@ name = "morok-schedule"
 version.workspace = true
 authors.workspace = true
 edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Optimization passes and pattern engine for the Morok ML compiler"
+readme = "README.md"
 
 [dependencies]
-morok-ir = { path = "../ir" }
-morok-dtype = { path = "../dtype" }
-morok-device = { path = "../device" }
-morok-macros = { path = "../macros" }
+morok-ir = { path = "../ir", version = "=0.1.0-alpha.0" }
+morok-dtype = { path = "../dtype", version = "=0.1.0-alpha.0" }
+morok-device = { path = "../device", version = "=0.1.0-alpha.0" }
+morok-macros = { path = "../macros", version = "=0.1.0-alpha.0" }
 smallvec = { version = "1.15", features = ["union"] }
 rayon = "1.11"
 once_cell = "1.21"
@@ -42,5 +46,5 @@ webgpu = ["morok-device/webgpu"]
 
 [dev-dependencies]
 proptest = "1.9.0"
-morok-ir = { path = "../ir", features = ["proptest"] }
+morok-ir = { path = "../ir", version = "=0.1.0-alpha.0", features = ["proptest"] }
 test-case = "3.3.1"

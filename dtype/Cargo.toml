@@ -4,6 +4,10 @@ name = "morok-dtype"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Type system for the Morok ML compiler"
+readme = "README.md"
 
 [dependencies]
 proptest = { version = "1.9", optional = true }
