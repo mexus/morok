@@ -4,10 +4,14 @@ name = "morok-device"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Device abstraction layer for the Morok ML compiler"
+readme = "README.md"
 
 [dependencies]
-morok-dtype = { path = "../dtype" }
-morok-ir = { path = "../ir" }
+morok-dtype = { path = "../dtype", version = "=0.1.0-alpha.0" }
+morok-ir = { path = "../ir", version = "=0.1.0-alpha.0" }
 
 ndarray.workspace = true
 enum_delegate.workspace = true

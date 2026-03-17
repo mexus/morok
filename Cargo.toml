@@ -20,6 +20,8 @@ name = "morok"
 authors = ["Patsakula Nikita <nikita.patsakula@gmail.com>"]
 edition = "2024"
 version = "0.1.0-alpha.0"
+license = "MIT"
+repository = "https://github.com/npatsakula/morok"
 
 [workspace.dependencies]
 ndarray = "0.17"
