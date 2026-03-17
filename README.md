@@ -1,6 +1,6 @@
 # Morok
 
-> ⚠️ **Pre-alpha software.** APIs are unstable and may change without notice. Not recommended for production use. 🚧💀
+> **Alpha software.** Core functionality is tested, but APIs are unstable and may change without notice.
 
 A Rust-based ML compiler inspired by [Tinygrad](https://github.com/tinygrad/tinygrad). Lazy tensor evaluation with UOp-based IR, pattern-driven optimization, and multi-backend code generation.
 
@@ -10,75 +10,46 @@ A Rust-based ML compiler inspired by [Tinygrad](https://github.com/tinygrad/tiny
 |---------|-------------|
 | **Declarative Optimization** | `patterns!` DSL for graph rewrites with Z3-verified correctness |
 | **Lazy Evaluation** | Tensors build computation graphs, compiled only at `realize()` |
-| **CUDA Support** | Unified memory, D2D copy, LRU buffer caching |
 | **Provenance Tracking** | `#[track_caller]` traces every UOp to source location |
 | **80+ IR Operations** | Arithmetic, memory, control flow, WMMA tensor cores |
 | **20+ Optimizations** | Constant folding, tensor cores, vectorization, loop unrolling |
 
-## Architecture
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│                        morok-tensor                         │
-│              High-level API: Tensor, lazy ops               │
-└─────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────┐
-│                         morok-ir                            │
-│         UOp graph, 80+ ops, symbolic integers, WMMA         │
-└─────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────┐
-│              morok-schedule + morok-schedule-macros         │
-│    patterns! DSL, RANGEIFY, kernel splitting, Z3 proofs     │
-└─────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────┐
-│                       morok-codegen                         │
-│                    LLVM IR generation                       │
-└─────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────┐
-│            morok-runtime + morok-device                     │
-│     JIT execution, CPU/CUDA buffers, unified memory         │
-└─────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────┐
-│                       morok-dtype                           │
-│       Scalars, vectors, pointers, address spaces            │
-└─────────────────────────────────────────────────────────────┘
-```
+For architecture details, see the [documentation site](https://npatsakula.github.io/morok/).
 
 ## Workspace
 
-| Crate | Description | Highlights |
-|-------|-------------|------------|
-| [dtype](dtype/) | Type system | 14 scalar types, vectors, pointers, images |
-| [device](device/) | Buffer management | Lazy alloc, zero-copy views, CUDA unified/D2D |
-| [ir](ir/) | Core IR | 80+ ops, provenance tracking, WMMA |
-| [schedule](schedule/) | Optimization engine | 20+ passes, RANGEIFY, Z3 verification |
-| [schedule-macros](schedule-macros/) | Pattern DSL | `patterns!` macro with 45 op types |
-| [codegen](codegen/) | Code generation | LLVM IR backend |
-| [runtime](runtime/) | Kernel execution | JIT compilation |
-| [tensor](tensor/) | High-level API | Lazy tensors, arithmetic, reductions |
+| Crate | Description |
+|-------|-------------|
+| [dtype](dtype/) | Type system: scalars, vectors, pointers, images |
+| [macros](macros/) | Procedural macros (`patterns!` DSL) |
+| [ir](ir/) | UOp graph IR: 80+ ops, symbolic integers, provenance |
+| [device](device/) | Buffer management: lazy alloc, zero-copy views, LRU caching |
+| [schedule](schedule/) | Optimization engine: 20+ passes, RANGEIFY, Z3 verification |
+| [codegen](codegen/) | Code generation: Clang (default), LLVM JIT, MLIR |
+| [runtime](runtime/) | JIT compilation and kernel execution |
+| [tensor](tensor/) | High-level lazy tensor API |
+| [onnx](onnx/) | ONNX model importer |
 
 ## Quick Example
 
 ```rust
 use morok_tensor::Tensor;
+use ndarray::array;
 
-// Build lazy computation graph
-let a = Tensor::from_slice(&[1.0f32, 2.0, 3.0]);
-let b = Tensor::from_slice(&[4.0f32, 5.0, 6.0]);
-let c = (&a + &b)?.sum(morok_tensor::AxisSpec::All)?;
+// Zero-copy from ndarray (C-contiguous fast path)
+let a = Tensor::from_ndarray(&array![[1.0f32, 2.0], [3.0, 4.0]]);
+let b = Tensor::from_ndarray(&array![[5.0f32, 6.0], [7.0, 8.0]]);
 
-// Compile and execute
-let result = c.realize()?;
+// Lazy — nothing executes yet
+let c = (&a + &b)?;
+
+// Compile, execute, extract as ndarray
+let result = c.to_ndarray::<f32>()?;
+assert_eq!(result, array![[6.0, 8.0], [10.0, 12.0]].into_dyn());
+
+// Or extract as flat Vec
+let flat = c.to_vec::<f32>()?;
+assert_eq!(flat, vec![6.0, 8.0, 10.0, 12.0]);
 ```
 
 ## Pattern DSL Example
@@ -117,16 +88,17 @@ nix fmt # Format source files
 
 #### Bare metal
 
-| Dependency | Version | Description |
-|------------|---------|-------------|
-| Rust toolchain | 1.75+ | Required for building and testing |
-| LLVM | >21.x | CPU code generation backend |
-| NVCC | >13.x | CUDA code generation backend (optional) |
-| MESA NAK | >=25.x | CUDA code generation backend (optional) |
-| Z3 | >=4.15 | SMT solver for optimization verification (optional) |
-| zlib | >=1.3 | Compression library |
-| libffi | >=3.4 | Foreign function interface library |
-| libxml | >=2.13 | XML parsing library |
+| Dependency | Version | Required | Description |
+|------------|---------|----------|-------------|
+| Rust | 1.85+ | yes | Edition 2024 |
+| LLVM | 21.x | yes | CPU code generation backend |
+| Clang | - | yes | C compiler for LLVM builds |
+| pkgconf | - | yes | Build configuration tool |
+| protobuf | - | yes | ONNX proto compilation |
+| zlib | >=1.3 | yes | Compression library |
+| libffi | >=3.4 | yes | Foreign function interface |
+| libxml2 | >=2.13 | yes | XML parsing |
+| Z3 | >=4.15 | no | SMT solver for optimization verification |
 
 ## Test
 

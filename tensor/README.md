@@ -9,8 +9,37 @@ use morok_tensor::Tensor;
 
 let a = Tensor::from_slice(&[1.0f32, 2.0, 3.0]);
 let b = Tensor::from_slice(&[4.0f32, 5.0, 6.0]);
-let c = a.try_add(&b)?;
-let result = c.realize()?;
+let c = (&a + &b)?;
+
+// Extract as Vec
+let result = c.to_vec::<f32>()?;
+assert_eq!(result, vec![5.0, 7.0, 9.0]);
+```
+
+## ndarray Interop
+
+```rust
+use morok_tensor::Tensor;
+use ndarray::array;
+
+// Zero-copy from ndarray (fast path for C-contiguous arrays)
+let input = array![[1.0f32, 2.0], [3.0, 4.0]];
+let t = Tensor::from_ndarray(&input);
+
+// Compute and extract back as ndarray
+let result = (t * 2.0)?.to_ndarray::<f32>()?;
+assert_eq!(result, array![[2.0, 4.0], [6.0, 8.0]].into_dyn());
+```
+
+### Zero-Copy View
+
+For realized tensors on CPU, `array_view` returns a borrowed ndarray view
+without copying data:
+
+```rust
+let t = Tensor::from_slice(&[1.0f32, 2.0, 3.0]).realize()?;
+let view = t.array_view::<f32>()?;  // no copy, lifetime tied to tensor
+assert_eq!(view.len(), 3);
 ```
 
 ## Prepare/Execute Infrastructure
@@ -32,19 +61,6 @@ let plan = result.prepare()?;
 let mut executor = global_executor();
 for _ in 0..1000 {
     plan.execute(&mut executor)?;
-}
-```
-
-## Zero-Copy Buffer Access
-
-Access underlying device buffer without copying data:
-
-```rust
-let tensor = Tensor::from_slice(&[1.0f32, 2.0, 3.0]).realize()?;
-
-// Direct buffer access (no copy)
-if let Some(buffer) = tensor.buffer() {
-    // Use buffer directly
 }
 ```
 

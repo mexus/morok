@@ -34,7 +34,7 @@ dst.copy_from(&src)?;
 - CPU allocator
 - CUDA allocator (feature `cuda`)
 
-**CUDA Optimizations:**
+**CUDA Buffer Management** (feature `cuda`; CUDA code generation is not yet available — CPU backends only):
 | Feature | Implementation | Notes |
 |---------|---------------|-------|
 | Unified memory | `cudaMallocManaged` | `cpu_accessible: true` |
