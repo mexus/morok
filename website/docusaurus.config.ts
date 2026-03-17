@@ -1,109 +1,109 @@
-import {themes as prismThemes} from 'prism-react-renderer';
-import type {Config} from '@docusaurus/types';
-import type * as Preset from '@docusaurus/preset-classic';
+import { themes as prismThemes } from "prism-react-renderer";
+import type { Config } from "@docusaurus/types";
+import type * as Preset from "@docusaurus/preset-classic";
 
 const config: Config = {
-  title: 'Morok',
-  tagline: 'Rust-based ML compiler with UOp IR',
-  favicon: 'img/favicon.ico',
+  title: "Morok",
+  tagline: "Rust-based ML compiler with UOp IR",
+  favicon: "img/favicon.ico",
 
   future: {
     v4: true,
   },
 
-  url: 'https://docs.morok.tech',
-  baseUrl: '/',
+  url: "https://docs.morok.tech",
+  baseUrl: "/",
 
-  organizationName: 'patsak',
-  projectName: 'morok',
+  organizationName: "Patsakula Nikita",
+  projectName: "morok",
 
-  onBrokenLinks: 'throw',
+  onBrokenLinks: "throw",
 
   i18n: {
-    defaultLocale: 'en',
-    locales: ['en', 'zh-Hans', 'ru', 'hi'],
+    defaultLocale: "en",
+    locales: ["en", "zh-Hans", "ru", "hi"],
     localeConfigs: {
       en: {
-        label: 'English',
+        label: "English",
       },
-      'zh-Hans': {
-        htmlLang: 'zh-CN',
-        label: '简体中文',
+      "zh-Hans": {
+        htmlLang: "zh-CN",
+        label: "简体中文",
       },
       ru: {
-        htmlLang: 'ru',
-        label: 'Русский',
+        htmlLang: "ru",
+        label: "Русский",
       },
       hi: {
-        htmlLang: 'hi',
-        label: 'हिन्दी',
+        htmlLang: "hi",
+        label: "हिन्दी",
       },
     },
   },
 
   presets: [
     [
-      'classic',
+      "classic",
       {
         docs: {
-          sidebarPath: './sidebars.ts',
-          editUrl: 'https://github.com/patsak/morok/edit/main/website/',
+          sidebarPath: "./sidebars.ts",
+          editUrl: "https://github.com/patsak/morok/edit/main/website/",
         },
         blog: false,
         theme: {
-          customCss: './src/css/custom.css',
+          customCss: "./src/css/custom.css",
         },
       } satisfies Preset.Options,
     ],
   ],
 
   themeConfig: {
-    image: 'img/docusaurus-social-card.jpg',
+    image: "img/docusaurus-social-card.jpg",
     colorMode: {
       respectPrefersColorScheme: true,
     },
     navbar: {
-      title: 'Morok',
+      title: "Morok",
       logo: {
-        alt: 'Morok Logo',
-        src: 'img/logo.svg',
+        alt: "Morok Logo",
+        src: "img/logo.svg",
       },
       items: [
         {
-          type: 'docSidebar',
-          sidebarId: 'defaultSidebar',
-          position: 'left',
-          label: 'Docs',
+          type: "docSidebar",
+          sidebarId: "defaultSidebar",
+          position: "left",
+          label: "Docs",
         },
         {
-          type: 'localeDropdown',
-          position: 'right',
+          type: "localeDropdown",
+          position: "right",
         },
         {
-          href: 'https://github.com/patsak/morok',
-          label: 'GitHub',
-          position: 'right',
+          href: "https://github.com/patsak/morok",
+          label: "GitHub",
+          position: "right",
         },
       ],
     },
     footer: {
-      style: 'dark',
+      style: "dark",
       links: [
         {
-          title: 'Docs',
+          title: "Docs",
           items: [
             {
-              label: 'Introduction',
-              to: '/docs/introduction',
+              label: "Introduction",
+              to: "/docs/introduction",
             },
           ],
         },
         {
-          title: 'Community',
+          title: "Community",
           items: [
             {
-              label: 'GitHub',
-              href: 'https://github.com/patsak/morok',
+              label: "GitHub",
+              href: "https://github.com/npatsakula/morok",
             },
           ],
         },
@@ -113,7 +113,7 @@ const config: Config = {
     prism: {
       theme: prismThemes.github,
       darkTheme: prismThemes.dracula,
-      additionalLanguages: ['rust'],
+      additionalLanguages: ["rust"],
     },
   } satisfies Preset.ThemeConfig,
 };
