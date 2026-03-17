@@ -338,41 +338,6 @@ fn test_trace_with_dims() {
     assert!(outputs.contains_key("output"));
 }
 
-#[test]
-fn test_load_silero_vad_prepare() {
-    use prost::Message;
-    use std::fs::File;
-    use std::io::BufReader;
-
-    let file = File::open("audio.onnx").expect("audio.onnx not found");
-    let mut reader = BufReader::new(file);
-    let mut bytes = Vec::new();
-    std::io::Read::read_to_end(&mut reader, &mut bytes).unwrap();
-
-    let model = ModelProto::decode(&bytes[..]).expect("Failed to decode ONNX");
-
-    let importer = OnnxImporter::new();
-    let graph = importer.prepare(model).expect("Failed to prepare graph");
-
-    println!("Inputs: {:?}", graph.input_names());
-    println!("Outputs: {:?}", graph.output_names());
-    println!("Num initializers: {}", graph.initializers.len());
-    println!("Num nodes: {}", graph.nodes.len());
-
-    let mut op_counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
-    for node in &graph.nodes {
-        *op_counts.entry(node.op_type.as_str()).or_insert(0) += 1;
-    }
-
-    let mut ops: Vec<_> = op_counts.into_iter().collect();
-    ops.sort_by(|a, b| b.1.cmp(&a.1));
-
-    println!("\nOperators (sorted by frequency):");
-    for (op, count) in ops {
-        println!("  {:4}x  {}", count, op);
-    }
-}
-
 // =========================================================================
 // Shape-only operator tests
 // =========================================================================

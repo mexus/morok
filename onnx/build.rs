@@ -1,7 +1,9 @@
 use std::path::Path;
 
 fn main() {
-    prost_build::compile_protos(&["proto/onnx.proto"], &["proto/"]).unwrap();
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
+    let proto_dir = Path::new(&manifest_dir).join("proto");
+    prost_build::compile_protos(&[proto_dir.join("onnx.proto")], &[&proto_dir]).unwrap();
     generate_node_tests();
     generate_light_tests();
 }
@@ -33,19 +35,37 @@ mod {fn_name} {{
     ));
 }
 
-fn generate_node_tests() {
+/// Resolve the ONNX backend test data root.
+/// Prefers `ONNX_TEST_DATA` env var (set by Nix), falls back to the git submodule.
+fn onnx_test_data_dir() -> Option<std::path::PathBuf> {
+    println!("cargo:rerun-if-env-changed=ONNX_TEST_DATA");
+    if let Ok(dir) = std::env::var("ONNX_TEST_DATA") {
+        let p = Path::new(&dir).to_path_buf();
+        if p.exists() {
+            return Some(p);
+        }
+    }
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
-    let node_dir = Path::new(&manifest_dir).join("../submodules/onnx/onnx/backend/test/data/node");
+    let p = Path::new(&manifest_dir).join("../submodules/onnx/onnx/backend/test/data");
+    if p.exists() { Some(p) } else { None }
+}
 
+fn generate_node_tests() {
     println!("cargo:rerun-if-changed=build.rs");
 
     let out_dir = std::env::var("OUT_DIR").unwrap();
     let out_path = Path::new(&out_dir).join("onnx_node_tests.rs");
 
+    let Some(test_data) = onnx_test_data_dir() else {
+        std::fs::write(&out_path, "// ONNX test data not found\n").unwrap();
+        return;
+    };
+    let node_dir = test_data.join("node");
     if !node_dir.exists() {
-        std::fs::write(&out_path, "// ONNX submodule not found\n").unwrap();
+        std::fs::write(&out_path, "// ONNX node test data not found\n").unwrap();
         return;
     }
+    let node_dir_str = node_dir.display();
 
     let mut test_names: Vec<String> = std::fs::read_dir(&node_dir)
         .unwrap()
@@ -58,10 +78,7 @@ fn generate_node_tests() {
     let mut code = String::new();
     for name in &test_names {
         let ignored = should_skip(name);
-        let helper_call = format!(
-            "run_onnx_node_test(concat!(env!(\"CARGO_MANIFEST_DIR\"), \
-             \"/../submodules/onnx/onnx/backend/test/data/node/{name}\"), &config);"
-        );
+        let helper_call = format!("run_onnx_node_test(\"{node_dir_str}/{name}\", &config);");
         write_backend_test(&mut code, name, ignored, &helper_call);
     }
 
@@ -69,16 +86,19 @@ fn generate_node_tests() {
 }
 
 fn generate_light_tests() {
-    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
-    let light_dir = Path::new(&manifest_dir).join("../submodules/onnx/onnx/backend/test/data/light");
-
     let out_dir = std::env::var("OUT_DIR").unwrap();
     let out_path = Path::new(&out_dir).join("onnx_light_tests.rs");
 
+    let Some(test_data) = onnx_test_data_dir() else {
+        std::fs::write(&out_path, "// ONNX test data not found\n").unwrap();
+        return;
+    };
+    let light_dir = test_data.join("light");
     if !light_dir.exists() {
-        std::fs::write(&out_path, "// ONNX light models not found\n").unwrap();
+        std::fs::write(&out_path, "// ONNX light test data not found\n").unwrap();
         return;
     }
+    let light_dir_str = light_dir.display();
 
     let mut models: Vec<String> = std::fs::read_dir(&light_dir)
         .unwrap()
@@ -97,10 +117,8 @@ fn generate_light_tests() {
         let ignored = SKIP_LIGHT.contains(&name.as_str());
         let helper_call = format!(
             "run_onnx_light_test(\
-             concat!(env!(\"CARGO_MANIFEST_DIR\"), \
-             \"/../submodules/onnx/onnx/backend/test/data/light/{name}.onnx\"), \
-             concat!(env!(\"CARGO_MANIFEST_DIR\"), \
-             \"/../submodules/onnx/onnx/backend/test/data/light/{name}_output_0.pb\"), &config);"
+             \"{light_dir_str}/{name}.onnx\", \
+             \"{light_dir_str}/{name}_output_0.pb\", &config);"
         );
         write_backend_test(&mut code, name, ignored, &helper_call);
     }
