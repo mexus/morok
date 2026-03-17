@@ -28,12 +28,12 @@ jobs:
             exit 1
           fi
 
-      - name: Dry-run publish all crates
+      - name: Verify all crates package correctly
         run: |
           for crate in morok-dtype morok-macros morok-ir morok-device morok-schedule \
                        morok-codegen morok-runtime morok-tensor morok-onnx; do
             echo "=== $crate ==="
-            nix develop --command cargo publish -p "$crate" --dry-run
+            nix develop --command cargo package -p "$crate"
           done
 
   publish:
