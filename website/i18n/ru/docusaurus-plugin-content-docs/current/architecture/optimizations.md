@@ -1,12 +1,12 @@
 ---
-sidebar_label: Optimization System
+sidebar_label: Система оптимизаций
 ---
 
-# Pattern-Based Optimization
+# Оптимизации на основе паттернов
 
-Open any production ML compiler and you'll find dozens of optimization passes: constant folding, dead code elimination, operator fusion, loop tiling, vectorization, memory layout optimization. Each pass has its own data structures, its own traversal logic, its own bugs.
+Откройте любой продакшн ML-компилятор — и найдёте десятки оптимизационных проходов: свёртка констант, удаление мёртвого кода, фьюзинг операторов, тайлинг циклов, векторизация, оптимизация раскладки памяти. У каждого прохода свои структуры данных, своя логика обхода, свои баги.
 
-Morok takes a different approach: **one mechanism for everything**.
+Morok использует другой подход: **один механизм для всего**.
 
 ```text
 Traditional Compiler:              Morok:
@@ -23,15 +23,15 @@ Traditional Compiler:              Morok:
                                        One mechanism
 ```
 
-Every optimization in Morok is expressed as a **pattern**: "when you see this structure, replace it with that structure." The same `graph_rewrite()` function applies constant folding, converts movement ops to loops, optimizes memory access patterns, and lowers to hardware primitives.
+Каждая оптимизация в Morok выражается как **паттерн**: «когда видишь эту структуру, замени её вот этой». Одна и та же функция `graph_rewrite()` применяет свёртку констант, преобразует movement-операции в циклы, оптимизирует паттерны доступа к памяти и снижает до аппаратных примитивов.
 
-This chapter explains how pattern-based optimization works and why it's powerful.
+Эта глава объясняет, как работают оптимизации на основе паттернов и почему они мощные.
 
 ---
 
-## The `patterns!` DSL
+## DSL `patterns!`
 
-Morok provides a domain-specific language for writing optimization patterns. Here's what it looks like:
+Morok предоставляет предметно-ориентированный язык для написания оптимизационных паттернов. Вот как он выглядит:
 
 ```rust
 patterns! {
@@ -50,24 +50,24 @@ patterns! {
 }
 ```
 
-The macro compiles these patterns into efficient Rust code. Let's break down the syntax:
+Макрос компилирует эти паттерны в эффективный Rust-код. Разберём синтаксис:
 
-| Syntax | Meaning | Example |
-|--------|---------|---------|
-| `(x, y)` | **Ordered.** Match in exact order. | `Sub(x, @zero) ~> x` |
-| `[x, y]` | **Commutative.** Try both orderings. | `Add[x, @zero] ~> x` |
-| `@zero` | **Zero constant.** Matches 0 or 0.0. | `Mul[_, z @ @zero] ~> z` |
-| `@one` | **One constant.** Matches 1 or 1.0. | `Mul[x, @one] ~> x` |
-| `@const(val)` | **Extract constant.** Binds the value. | `Add(@const(a), @const(b))` |
-| `x, x` | **Same operand.** Auto-generates ptr_eq check. | `Idiv(x, x) ~> UOp::one(...)` |
-| `~>` | **Infallible.** Always succeeds, returns `Arc<UOp>`. | `Add[x, @zero] ~> x` |
-| `=>` | **Fallible.** May fail, returns `Option<Arc<UOp>>`. | `=> eval(...).map(...)` |
-| `for op in binary [...]` | **Template.** Generate patterns for multiple ops. | See below |
-| `@context Type` | **Stateful.** Access mutable context in patterns. | See below |
+| Синтаксис | Значение | Пример |
+|-----------|----------|--------|
+| `(x, y)` | **Упорядочено.** Сопоставляется в точном порядке. | `Sub(x, @zero) ~> x` |
+| `[x, y]` | **Коммутативно.** Пробуются оба порядка. | `Add[x, @zero] ~> x` |
+| `@zero` | **Нулевая константа.** Совпадает с 0 или 0.0. | `Mul[_, z @ @zero] ~> z` |
+| `@one` | **Единичная константа.** Совпадает с 1 или 1.0. | `Mul[x, @one] ~> x` |
+| `@const(val)` | **Извлечение константы.** Связывает значение. | `Add(@const(a), @const(b))` |
+| `x, x` | **Один и тот же операнд.** Автогенерируется проверка ptr_eq. | `Idiv(x, x) ~> UOp::one(...)` |
+| `~>` | **Безусловный.** Всегда успешен, возвращает `Arc<UOp>`. | `Add[x, @zero] ~> x` |
+| `=>` | **Условный.** Может не сработать, возвращает `Option<Arc<UOp>>`. | `=> eval(...).map(...)` |
+| `for op in binary [...]` | **Шаблон.** Генерация паттернов для нескольких операций. | См. ниже |
+| `@context Type` | **С состоянием.** Доступ к мутабельному контексту в паттернах. | См. ниже |
 
-### Template Expansion
+### Раскрытие шаблонов
 
-Instead of writing the same pattern for every binary operation, use a for-loop:
+Вместо написания одного и того же паттерна для каждой бинарной операции используйте for-цикл:
 
 ```rust
 patterns! {
@@ -79,11 +79,11 @@ patterns! {
 }
 ```
 
-This expands to six separate patterns at compile time—one for each operation.
+Это раскрывается в шесть отдельных паттернов во время компиляции — по одному для каждой операции.
 
-### Stateful Patterns
+### Паттерны с состоянием
 
-Some optimizations need context (e.g., which kernel we're in, what ranges are active). Declare a context type:
+Некоторым оптимизациям нужен контекст (например, в каком ядре мы находимся, какие диапазоны активны). Объявите тип контекста:
 
 ```rust
 patterns! {
@@ -96,17 +96,17 @@ patterns! {
 }
 ```
 
-The context is passed as the last argument to pattern closures.
+Контекст передаётся последним аргументом в замыкания паттернов.
 
 ---
 
-## How Pattern Matching Works
+## Как работает сопоставление паттернов
 
-The `patterns!` macro generates a `SimplifiedPatternMatcher` that dispatches patterns in **O(1)** time.
+Макрос `patterns!` генерирует `SimplifiedPatternMatcher`, который диспатчит паттерны за **O(1)**.
 
-### The OpKey Index
+### Индекс OpKey
 
-Every UOp has an operation type (Add, Mul, Load, etc.). The `#[derive(PatternEnum)]` macro generates an `OpKey` enum that maps operations to hashable keys:
+У каждого UOp есть тип операции (Add, Mul, Load и т.д.). Макрос `#[derive(PatternEnum)]` генерирует enum `OpKey`, отображающий операции в хэшируемые ключи:
 
 ```rust
 pub enum OpKey {
@@ -120,7 +120,7 @@ pub enum OpKey {
 }
 ```
 
-### The Matcher Structure
+### Структура Matcher
 
 ```rust
 pub struct SimplifiedPatternMatcher<C = ()> {
@@ -129,18 +129,18 @@ pub struct SimplifiedPatternMatcher<C = ()> {
 }
 ```
 
-When matching a UOp:
+При сопоставлении UOp:
 
-1. **Extract OpKey** from the UOp's operation
-2. **Lookup** in the HashMap—O(1)
-3. **Try each closure** until one matches
-4. **Fall back** to wildcards if no indexed pattern matches
+1. **Извлекаем OpKey** из операции UOp
+2. **Ищем** в HashMap — O(1)
+3. **Пробуем каждое замыкание**, пока одно не сработает
+4. **Откатываемся** на wildcards, если ни один индексированный паттерн не совпал
 
-This is 5-10x faster than scanning all patterns linearly.
+Это в 5–10 раз быстрее линейного перебора всех паттернов.
 
-### Commutative Handling
+### Обработка коммутативности
 
-For patterns like `Add[x, @zero]`, the macro generates code that tries both orderings:
+Для паттернов вроде `Add[x, @zero]` макрос генерирует код, пробующий оба порядка:
 
 ```rust
 // Try (x, @zero)
@@ -153,9 +153,9 @@ if let Some(result) = try_match_ordered(&children[1], &children[0]) {
 }
 ```
 
-### Duplicate Detection
+### Обнаружение дубликатов
 
-When you write `Idiv(x, x)`, the pattern should only match if both operands are the *same* UOp (pointer equality, not structural equality). The macro automatically generates this check:
+Когда вы пишете `Idiv(x, x)`, паттерн должен сработать только если оба операнда — *один и тот же* UOp (равенство указателей, а не структурное). Макрос автоматически генерирует эту проверку:
 
 ```rust
 // Generated code for Idiv(x, x)
@@ -167,25 +167,27 @@ if !Arc::ptr_eq(x, x_dup) {
 // ... rest of pattern
 ```
 
-This leverages hash consing—identical subexpressions share the same pointer.
+Это использует hash consing — идентичные подвыражения разделяют один указатель.
 
 ---
 
-## The Rewrite Engine: Two-Stage Algorithm
+## Движок перезаписи: двухстадийный алгоритм
 
-Pattern matching alone isn't enough. Consider this expression:
+> **Примечание:** Это упрощённое описание. Реальный движок использует трёхстадийный стековый алгоритм с path compression для эффективности.
+
+Одного сопоставления паттернов недостаточно. Рассмотрим выражение:
 
 ```text
 WHERE(Lt(3, 5), t, f)
 ```
 
-To simplify it, we need two steps:
-1. `Lt(3, 5)` → `true` (constant folding)
-2. `WHERE(true, t, f)` → `t` (dead code elimination)
+Чтобы его упростить, нужны два шага:
+1. `Lt(3, 5)` → `true` (свёртка констант)
+2. `WHERE(true, t, f)` → `t` (удаление мёртвого кода)
 
-But the `WHERE` pattern won't match until its child is simplified. The rewrite engine solves this with a **two-stage algorithm**.
+Но паттерн `WHERE` не сработает, пока его дочерний узел не упрощён. Движок перезаписи решает это **двухстадийным алгоритмом**.
 
-### Stage 0: Pattern Application
+### Стадия 0: Применение паттернов
 
 ```rust
 fn rewrite_stage0(&mut self, uop: &Arc<UOp>) -> RewriteResult {
@@ -196,11 +198,11 @@ fn rewrite_stage0(&mut self, uop: &Arc<UOp>) -> RewriteResult {
 }
 ```
 
-If no pattern matches, return `Gate`—a signal to process children first.
+Если ни один паттерн не совпал, возвращаем `Gate` — сигнал сначала обработать дочерние узлы.
 
-### Stage 1: Source Reconstruction
+### Стадия 1: Реконструкция
 
-After children are rewritten, rebuild the node with new children and try patterns again:
+После перезаписи дочерних узлов перестраиваем узел с новыми потомками и снова пробуем паттерны:
 
 ```rust
 fn rewrite_stage1(&mut self, uop: &Arc<UOp>, new_children: Vec<Arc<UOp>>) {
@@ -215,7 +217,7 @@ fn rewrite_stage1(&mut self, uop: &Arc<UOp>, new_children: Vec<Arc<UOp>>) {
 }
 ```
 
-### The Magic: Cascading Optimizations
+### Магия: каскадные оптимизации
 
 ```text
 Stage 0: WHERE(Lt(3, 5), t, f)     → Gate (no match, process children)
@@ -224,22 +226,22 @@ Stage 0: WHERE(Lt(3, 5), t, f)     → Gate (no match, process children)
 Stage 1: WHERE(true, t, f)         → t (dead code elimination matches!)
 ```
 
-The reconstruction stage re-applies patterns, enabling multi-step optimizations in a single traversal.
+Стадия реконструкции повторно применяет паттерны, что позволяет многошаговым оптимизациям сработать за один обход.
 
-### Safety Limits
+### Ограничения безопасности
 
-To prevent infinite loops, the engine has limits:
-- **1000 iterations** per node maximum
-- **100,000 iterations** total maximum
-- Panics with diagnostic info if limits exceeded
+Для предотвращения бесконечных циклов в движке есть лимиты:
+- **1000 итераций** максимум на узел
+- **500 000 итераций** максимум в сумме
+- Panic с диагностикой при превышении лимитов
 
-In practice, well-formed patterns converge quickly.
+На практике корректные паттерны сходятся быстро.
 
 ---
 
-## The Full Optimization Pipeline
+## Полный пайплайн оптимизаций
 
-Pattern matching is one part of a larger pipeline. When you call `tensor.realize()`, here's what happens:
+Сопоставление паттернов — часть более крупного пайплайна. При вызове `tensor.realize()` происходит следующее:
 
 ```text
 Tensor.realize()
@@ -289,21 +291,21 @@ Tensor.realize()
 └─────────────────────────────────────────────────────────┘
 ```
 
-Each box uses pattern-based rewriting. The difference is which patterns are applied:
+Каждый блок использует перезапись на основе паттернов. Разница — в том, какие паттерны применяются:
 
-- **Rangeify**: Movement op → BUFFERIZE + INDEX patterns
-- **Symbolic**: Algebraic simplification patterns
-- **Post-opt**: Memory access optimization patterns
+- **Rangeify**: Movement-операции → паттерны BUFFERIZE + INDEX
+- **Символьные**: Паттерны алгебраического упрощения
+- **Пост-оптимизация**: Паттерны оптимизации доступа к памяти
 
 ---
 
-## Kernel Optimization: Heuristics vs Beam Search
+## Оптимизация ядер: эвристики vs beam search
 
-After symbolic simplification, each kernel needs *scheduling decisions*: how to tile loops, where to parallelize, whether to use tensor cores. Morok offers two strategies.
+После символьного упрощения каждому ядру нужны *решения по планированию*: как тайлить циклы, где параллелизовать, использовать ли tensor cores. Morok предлагает две стратегии.
 
-### Heuristics (Default)
+### Эвристики (по умолчанию)
 
-The heuristic optimizer applies optimizations in a fixed order:
+Эвристический оптимизатор применяет оптимизации в фиксированном порядке:
 
 ```rust
 pub fn hand_coded_optimizations(scheduler: &mut Scheduler) {
@@ -327,19 +329,20 @@ pub fn hand_coded_optimizations(scheduler: &mut Scheduler) {
 }
 ```
 
-**Pros**: Fast (~50ms per kernel), predictable, no hardware measurement needed.
+**Плюсы**: Быстро (~50ms на ядро), предсказуемо, не требует аппаратных замеров.
 
-**Cons**: May miss optimization opportunities, fixed heuristics don't adapt to workload.
+**Минусы**: Может упустить возможности оптимизации, фиксированные эвристики не адаптируются к нагрузке.
 
-### Beam Search (Optional)
+### Beam search (опционально)
 
-For production workloads, beam search finds better schedules:
+Для продакшн-нагрузок beam search находит лучшие расписания:
 
 ```rust
 pub fn beam_search(scheduler: Scheduler, config: BeamConfig) -> Scheduler {
     let mut beam = vec![scheduler];
+    let deadline = Instant::now() + config.time_limit;
 
-    for iteration in 0..config.max_iterations {
+    while Instant::now() < deadline {
         let mut candidates = vec![];
 
         for state in &beam {
@@ -368,19 +371,20 @@ pub fn beam_search(scheduler: Scheduler, config: BeamConfig) -> Scheduler {
 }
 ```
 
-The action space includes ~500 predefined actions:
-- `UPCAST(axis, amount)` — vectorize output dimension
-- `UNROLL(axis, amount)` — unroll reduction loop
-- `LOCAL(axis, amount)` — use GPU shared memory
-- `GROUP(axis, amount)` — two-stage reduction
-- `THREAD(axis, amount)` — CPU parallelization
-- `SWAP(axis1, axis2)` — reorder global dimensions
+Пространство действий включает ~162 базовых действия (зависит от доступного параллелизма):
+- `UPCAST(axis, amount)` — векторизация размерности выхода
+- `UNROLL(axis, amount)` — развёртка цикла редукции
+- `LOCAL(axis, amount)` — использование GPU shared memory
+- `GROUP(axis, amount)` — двухстадийная редукция
+- `GROUPTOP(axis, amount)` — grouped reduction для tensor cores
+- `THREAD(axis, amount)` — CPU-параллелизация
+- `SWAP(axis1, axis2)` — перестановка глобальных размерностей
 
-**Pros**: Finds near-optimal schedules, adapts to hardware.
+**Плюсы**: Находит близкие к оптимальным расписания, адаптируется к железу.
 
-**Cons**: Minutes per kernel (but results are cached by AST hash).
+**Минусы**: Минуты на ядро (но результаты кэшируются по хэшу AST).
 
-### Configuration
+### Конфигурация
 
 ```bash
 # Disable optimization (debugging)
@@ -390,10 +394,10 @@ MOROK_NOOPT=1 cargo run
 MOROK_BEAM=8 cargo run
 ```
 
-Or programmatically:
+Или программно:
 
 ```rust
-let config = OptimizerConfig::builder()
+let config = PrepareConfig::builder()
     .strategy(OptStrategy::Beam { width: 8 })
     .build();
 
@@ -402,42 +406,42 @@ tensor.realize_with(config)?;
 
 ---
 
-## Comparison: How Other Compilers Optimize
+## Сравнение: как оптимизируют другие компиляторы
 
-Different ML compilers take different approaches to optimization:
+Разные ML-компиляторы используют разные подходы к оптимизации:
 
-| Aspect | XLA | TVM/Ansor | Triton | **Morok** |
+| Аспект | XLA | TVM/Ansor | Triton | **Morok** |
 |--------|-----|-----------|--------|-----------|
-| **Philosophy** | Fixed heuristics | Search-based | Programmer-guided | Pattern-based |
-| **Fusion** | Conservative rules | Tile-and-fuse | Block-level | Graph rewriting |
-| **Auto-tuning** | None | Evolutionary + cost model | Grid search | Beam search |
-| **Tuning cost** | 0 | Hours | Minutes | Minutes (cached) |
-| **Flexibility** | Low | High | Medium | High |
-| **Transparency** | Low (C++ passes) | Medium (Python) | Medium (DSL) | High (patterns!) |
+| **Философия** | Фиксированные эвристики | Поиск | Управление программистом | На основе паттернов |
+| **Фьюзинг** | Консервативные правила | Tile-and-fuse | Block-level | Перезапись графа |
+| **Автотюнинг** | Нет | Эволюционный + cost model | Grid search | Beam search |
+| **Стоимость тюнинга** | 0 | Часы | Минуты | Минуты (кэшируется) |
+| **Гибкость** | Низкая | Высокая | Средняя | Высокая |
+| **Прозрачность** | Низкая (C++-проходы) | Средняя (Python) | Средняя (DSL) | Высокая (patterns!) |
 
-### XLA — Production Conservative
+### XLA — продакшн-консерватизм
 
-XLA uses fixed heuristics for fusion decisions. Safe and predictable, but leaves performance on the table. The fusion rules are hard-coded in C++—extending them requires deep compiler knowledge.
+XLA использует фиксированные эвристики для решений по фьюзингу. Безопасно и предсказуемо, но оставляет производительность на столе. Правила фьюзинга захардкожены в C++ — для их расширения нужно глубокое знание компилятора.
 
-### TVM/Ansor — Maximum Auto-Tuning
+### TVM/Ansor — максимальный автотюнинг
 
-TVM separates *what* to compute from *how* to compute it. Ansor uses evolutionary search with a learned cost model to explore the schedule space. Can achieve best-in-class performance, but tuning takes hours per model.
+TVM разделяет *что* вычислять и *как* вычислять. Ansor использует эволюционный поиск с обучаемой cost model для исследования пространства расписаний. Может достигать лучшей в классе производительности, но тюнинг занимает часы на модель.
 
-### Triton — Programmer-Guided
+### Triton — управление программистом
 
-Triton exposes a Python-like DSL where you write blocked algorithms explicitly. The compiler handles register allocation and memory management. Good balance of control and automation, but requires GPU programming expertise.
+Triton предоставляет Python-подобный DSL, где вы явно пишете блочные алгоритмы. Компилятор занимается аллокацией регистров и управлением памятью. Хороший баланс контроля и автоматизации, но требует экспертизы в GPU-программировании.
 
-### Morok — Pattern Composition
+### Morok — композиция паттернов
 
-Morok's insight: express optimizations as composable patterns. Each pattern is local and verifiable. Complex optimizations emerge from composition. Beam search adds auto-tuning when needed, with results cached for reuse.
+Идея Morok: выражать оптимизации как компонуемые паттерны. Каждый паттерн локален и верифицируем. Сложные оптимизации возникают из композиции. Beam search добавляет автотюнинг при необходимости, с кэшированием результатов для повторного использования.
 
 ---
 
-## Why This Matters: Practical Benefits
+## Почему это важно: практическая польза
 
-Pattern-based optimization has concrete advantages for developers:
+Оптимизации на основе паттернов дают конкретные преимущества для разработчиков:
 
-**Debugging is direct.** Patterns are readable code. Add a `println!` to any pattern to trace when it fires:
+**Отладка прямая.** Паттерны — это читаемый код. Добавьте `println!` в любой паттерн, чтобы отследить, когда он срабатывает:
 
 ```rust
 patterns! {
@@ -448,7 +452,7 @@ patterns! {
 }
 ```
 
-**Extensibility is easy.** Adding a custom optimization is two lines:
+**Расширяемость простая.** Добавление своей оптимизации — пара строк:
 
 ```rust
 patterns! {
@@ -457,22 +461,22 @@ patterns! {
 }
 ```
 
-No need to understand compiler internals, write visitors, or modify pass managers.
+Не нужно разбираться во внутренностях компилятора, писать визиторы или модифицировать pass manager.
 
-**Correctness is local.** Each pattern is a small theorem: "if this structure appears, replacing it with that structure preserves semantics." Verify each pattern independently. Composition of correct patterns yields correct programs.
+**Корректность локальна.** Каждый паттерн — маленькая теорема: «если появляется эта структура, замена на ту структуру сохраняет семантику». Каждый паттерн верифицируется независимо. Композиция корректных паттернов даёт корректные программы.
 
-**Performance is tunable.** O(1) pattern dispatch is fast by default. Enable beam search for production workloads. Cache results by AST hash—tune once, benefit forever.
+**Производительность настраиваема.** O(1) диспатч паттернов быстр по умолчанию. Включите beam search для продакшн-нагрузок. Кэшируйте результаты по хэшу AST — тюним один раз, пользуемся всегда.
 
 ---
 
-## The Deeper Insight
+## Глубинная идея
 
-Pattern matching trades generality for composability.
+Сопоставление паттернов обменивает общность на компонуемость.
 
-A general-purpose optimization pass can do anything—but that's exactly the problem. It's hard to verify, hard to extend, hard to compose with other passes. Ordering matters. Interactions are subtle.
+Универсальный оптимизационный проход может делать что угодно — и в этом проблема. Его трудно верифицировать, трудно расширять, трудно компоновать с другими проходами. Порядок важен. Взаимодействия тонки.
 
-A pattern is constrained: it matches a specific structure and produces a specific replacement. But constraints enable composition. Run patterns in any order—the result converges to the same fixed point. Add new patterns without breaking existing ones. Delete patterns without cascading failures.
+Паттерн ограничен: он сопоставляет конкретную структуру и порождает конкретную замену. Но ограничения дают компонуемость. Запускайте паттерны в любом порядке — результат сходится к одной и той же фиксированной точке. Добавляйте новые паттерны, не ломая существующие. Удаляйте паттерны без каскадных сбоев.
 
-Each pattern is a theorem about semantic equivalence. The rewrite engine is a theorem prover, finding derivations from input to optimized output. Correctness follows from the correctness of individual steps.
+Каждый паттерн — теорема о семантической эквивалентности. Движок перезаписи — доказыватель теорем, находящий вывод от входа к оптимизированному выходу. Корректность следует из корректности отдельных шагов.
 
-This is the Unix philosophy applied to compilers: small, focused tools that compose. Pattern-based optimization won't solve every problem—but for the problems it solves, it solves them elegantly.
+Это философия Unix, применённая к компиляторам: маленькие, сфокусированные инструменты, которые компонуются. Оптимизации на основе паттернов не решат все задачи — но те, что решают, решают элегантно.

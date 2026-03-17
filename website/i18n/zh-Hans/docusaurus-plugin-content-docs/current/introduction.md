@@ -1,25 +1,25 @@
 ---
-sidebar_label: Introduction
+sidebar_label: 简介
 ---
 
 # Morok
 
-> ⚠️ **Pre-alpha software.** APIs are unstable and may change without notice. Not recommended for production use. 🚧💀
+> ⚠️ **Pre-alpha 阶段软件。** API 尚不稳定，可能随时更改。不建议用于生产环境。 🚧💀
 
-Morok is a Rust-based ML compiler inspired by [Tinygrad](https://github.com/tinygrad/tinygrad). It features lazy tensor evaluation with UOp-based IR, pattern-driven optimization, and multi-backend code generation.
+Morok 是一个基于 Rust 的 ML 编译器，灵感来自 [Tinygrad](https://github.com/tinygrad/tinygrad)。它具有基于 UOp 的 IR 惰性张量求值、模式驱动优化和多后端代码生成。
 
-## Highlights
+## 亮点
 
-| Feature | Description |
+| 特性 | 描述 |
 |---------|-------------|
-| **Declarative Optimization** | `patterns!` DSL for graph rewrites with Z3-verified correctness |
-| **Lazy Evaluation** | Tensors build computation graphs, compiled only at `realize()` |
-| **CUDA Support** | Unified memory, D2D copy, LRU buffer caching |
-| **Provenance Tracking** | `#[track_caller]` traces every UOp to source location |
-| **80+ IR Operations** | Arithmetic, memory, control flow, WMMA tensor cores |
-| **20+ Optimizations** | Constant folding, tensor cores, vectorization, loop unrolling |
+| **声明式优化** | `patterns!` DSL 实现图重写，通过 Z3 验证正确性 |
+| **惰性求值** | Tensor 构建计算图，仅在 `realize()` 时编译执行 |
+| **CUDA 支持** | 统一内存、D2D 拷贝、LRU 缓冲区缓存 |
+| **溯源追踪** | `#[track_caller]` 将每个 UOp 追溯到源码位置 |
+| **80+ IR 操作** | 算术、内存、控制流、WMMA tensor core |
+| **20+ 优化** | 常量折叠、tensor core、向量化、循环展开 |
 
-## Quick Example
+## 快速示例
 
 ```rust
 use morok_tensor::Tensor;
@@ -27,12 +27,12 @@ use morok_tensor::Tensor;
 // Build lazy computation graph
 let a = Tensor::from_slice([1.0f32, 2.0, 3.0]);
 let b = Tensor::from_slice([4.0f32, 5.0, 6.0]);
-let c = (a + b).sum();
+let c = (&a + &b).sum();
 
 // Compile and execute
 let result = c.realize()?;
 ```
 
-## License
+## 许可证
 
 MIT

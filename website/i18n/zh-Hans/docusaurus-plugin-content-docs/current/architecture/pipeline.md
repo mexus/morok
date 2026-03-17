@@ -1,14 +1,14 @@
 ---
-sidebar_label: Execution Pipeline
+sidebar_label: 执行流水线
 ---
 
-# From Tensor to Machine Code
+# 从 Tensor 到机器码
 
-In most ML frameworks, computation happens immediately. Write `a + b` in PyTorch and it runs *now*—the GPU crunches numbers before you can even inspect the result. This eager execution is simple to understand, but it leaves optimization opportunities on the table. How can a compiler optimize a computation it hasn't seen yet?
+大多数 ML 框架中，计算是立即发生的。在 PyTorch 里写 `a + b`，它*马上*就执行了——GPU 在你能查看结果之前就已经算完了。这种即时求值方式容易理解，但会错过很多优化机会。编译器怎么优化一个还没看到的完整计算呢？
 
-Morok takes the opposite approach: **lazy evaluation**. When you write `a.try_add(&b)?`, nothing computes. Morok builds a graph describing *what* to compute, not *when*. The magic happens when you call `realize()`—that single method triggers the entire compilation pipeline, from high-level tensor operations down to JIT-compiled machine code.
+Morok 走的是相反的路线：**惰性求值**。当你写 `a.try_add(&b)?` 时，什么都不会被计算。Morok 构建的是一个描述*做什么*的图，而不是*何时做*。关键在于调用 `realize()`——这个方法触发整个编译流水线，从高层张量操作一路到 JIT 编译的机器码。
 
-This chapter traces that journey.
+本章追踪这一过程。
 
 ```text
 tensor.realize()
@@ -44,13 +44,13 @@ tensor.realize()
 └─────────────────────────────────────────────────────────┘
 ```
 
-Each box is a distinct phase. Let's walk through them.
+每个框都是一个独立的阶段。逐一讲解。
 
 ---
 
-## Lazy Evaluation: Building the Graph
+## 惰性求值：构建计算图
 
-A `Tensor` in Morok is surprisingly lightweight:
+Morok 中的 `Tensor` 非常轻量：
 
 ```rust
 pub struct Tensor {
@@ -59,51 +59,51 @@ pub struct Tensor {
 }
 ```
 
-The `entry` holds a `TensorEntry` containing the UOp graph—the computation this tensor represents. The `buffer` is optional: lazy tensors don't have one, only realized tensors do.
+`entry` 持有包含 UOp 图的 `TensorEntry`——即这个张量所代表的计算。`buffer` 是可选的：惰性张量没有 buffer，只有 realize 后的张量才有。
 
-### Three Ways to Create Tensors
+### 三种创建张量的方式
 
-**1. Input tensors** — buffer allocated immediately:
+**1. 输入张量** — 立即分配 buffer：
 
 ```rust
 let a = Tensor::from_slice([1.0f32, 2.0, 3.0]);
 // `a.buffer` = Some(Arc<Buffer>) with actual data
 ```
 
-When you create a tensor from data, Morok allocates device memory and copies your bytes. The UOp graph contains a `BUFFER` node pointing to this allocation.
+从数据创建张量时，Morok 分配设备内存并拷贝字节。UOp 图中包含一个指向此分配的 `BUFFER` 节点。
 
-**2. Lazy operations** — no buffer, only graph:
+**2. 惰性操作** — 没有 buffer，只有图：
 
 ```rust
 let b = a.try_add(&a)?;   // b.buffer = None
 let c = b.try_mul(&a)?;   // c.buffer = None
 ```
 
-Arithmetic operations don't compute anything. They build a UOp graph: `Binary(Add, a.uop, a.uop)`. The tensor exists purely as a description of future work.
+算术操作不执行任何计算。它们构建 UOp 图：`Binary(Add, a.uop, a.uop)`。张量纯粹作为未来工作的描述而存在。
 
-**3. Movement operations** — shares the original buffer:
+**3. 变换操作** — 共享原始 buffer：
 
 ```rust
 let d = a.try_reshape(&[1, 3])?;  // d.buffer = same as a.buffer
 ```
 
-Reshape, permute, and similar operations create new *views* of existing data. The buffer is shared; only the UOp graph changes to describe the new indexing.
+Reshape、permute 等操作创建的是现有数据的新*视图*。buffer 是共享的；只有 UOp 图会改变以描述新的索引方式。
 
-### The Global Registry
+### 全局注册表
 
-Morok maintains three global maps (lock-free, thread-safe):
+Morok 维护着三个全局映射（无锁，线程安全）：
 
-| Map | Key → Value | Purpose |
+| 映射 | 键 → 值 | 用途 |
 |-----|-------------|---------|
-| `TENSORS` | tensor_id → `Weak<TensorEntry>` | Track all tensors for graph substitution |
-| `BUFFERS` | uop_id → `Arc<Buffer>` | Find buffers during scheduling |
-| `UOP_TO_TENSOR` | uop_id → tensor_id | Secondary index for lookups |
+| `TENSORS` | tensor_id → `Weak<TensorEntry>` | 跟踪所有张量，用于图替换 |
+| `BUFFERS` | uop_id → `Arc<Buffer>` | 在调度阶段查找 buffer |
+| `UOP_TO_TENSOR` | uop_id → tensor_id | 用于查找的二级索引 |
 
-This registry enables a critical feature: **global graph substitution**. When an optimization transforms a UOp, all tensors referencing that UOp automatically see the updated version. No stale references, no manual updates.
+这个注册表支撑了一个关键特性：**全局图替换**。当优化变换了某个 UOp 时，所有引用该 UOp 的张量都会自动看到更新后的版本。不会有过时的引用，也不需要手动更新。
 
-### Hash Consing in Action
+### Hash Consing 实战
 
-Because UOps use hash consing (content-based deduplication), identical computations share memory:
+由于 UOp 使用 hash consing（基于内容的去重），相同的计算共享内存：
 
 ```rust
 let x = a.try_add(&b)?;
@@ -111,42 +111,42 @@ let y = a.try_add(&b)?;
 // x.uop() and y.uop() point to the SAME Arc<UOp>
 ```
 
-This matters for caching: when we compile kernels, we cache by UOp ID. Hash consing means identical computations automatically hit the cache, even if constructed separately.
+这对缓存很重要：编译 kernel 时按 UOp ID 缓存。Hash consing 意味着相同的计算会自动命中缓存，即使是分别构造的。
 
 ---
 
-## Rangeify: Making Loops Explicit
+## Rangeify：让循环显式化
 
-When you write `tensor.reshape([2, 3]).expand([4, 2, 3]).sum(axis=0)`, those movement operations (reshape, expand) are high-level descriptions. To generate actual loops, we need explicit iteration structure.
+当你写 `tensor.reshape([2, 3]).expand([4, 2, 3]).sum(axis=0)` 时，那些变换操作（reshape、expand）是高层描述。要生成实际的循环，我们需要显式的迭代结构。
 
-**Rangeify** transforms movement operations into `RANGE` loops and `INDEX` arithmetic. The entry point is `rangeify()` in `schedule/src/rangeify/transforms.rs`.
+**Rangeify** 将变换操作转换为 `RANGE` 循环和 `INDEX` 算术运算。入口点是 `schedule/src/rangeify/transforms.rs` 中的 `rangeify()`。
 
-### The 8-Pass Pipeline
+### 八步流水线
 
-Rangeify isn't a single transformation—it's eight coordinated passes:
+Rangeify 不是单一变换——而是八个协调的 pass：
 
-| Pass | Purpose |
+| Pass | 用途 |
 |------|---------|
-| **1. Range Assignment** | Create RANGE UOps for each tensor dimension |
-| **2. Early Rewrites** | Remove DETACH, clean up trivial RESHAPE |
-| **3. Split Large Reductions** | Two-stage reduce for huge arrays (ratio > 32768) |
-| **4. Core Rangeify** | ReduceAxis → REDUCE, bufferization, movement removal |
-| **5. Buffer Folding** | Constant propagation through buffer expressions |
-| **6. Dead Axis Removal** | Filter ranges that don't affect the output |
-| **7. Cost-Based Buffer Removal** | Inline buffers when profitable (PContig optimization) |
-| **8. Reduction Simplification** | Lift range-independent code out of reductions |
+| **1. 范围分配** | 为每个张量维度创建 RANGE UOp |
+| **2. 前置重写** | 移除 DETACH，清理无意义的 RESHAPE |
+| **3. 大 reduce 拆分** | 对超大数组的两阶段 reduce（比率 > 32768） |
+| **4. 核心 Rangeify** | ReduceAxis → REDUCE，buffer 化，变换操作移除 |
+| **5. Buffer 折叠** | 通过 buffer 表达式进行常量传播 |
+| **6. 死轴移除** | 过滤不影响输出的范围 |
+| **7. 基于代价的 Buffer 移除** | 在有利时内联 buffer（PContig 优化） |
+| **8. Reduce 简化** | 将与范围无关的代码提升到 reduce 外部 |
 
-Each pass uses pattern-based rewriting (see the [Pattern-Based Optimization](./optimizations) chapter). Patterns fire until no more match, then the next pass begins.
+每个 pass 都使用基于模式的重写（参见[基于模式的优化](./optimizations)章节）。模式持续触发直到没有更多匹配，然后开始下一个 pass。
 
-### Before and After
+### 变换前后对比
 
-Consider this tensor expression:
+考虑这个张量表达式：
 
 ```text
 Before: BUFFER.reshape([2, 3]).expand([4, 2, 3]).sum(axis=0)
 ```
 
-After rangeify, movement ops become explicit index computations:
+经过 rangeify，变换操作变成显式的索引计算：
 
 ```text
 After:
@@ -158,83 +158,83 @@ STORE
     └── RANGE(0..4, Reduce)
 ```
 
-The `EXPAND` became a `RANGE(0..4)` that doesn't affect the buffer index—broadcasting. The `RESHAPE` became different index arithmetic. The `SUM` became `REDUCE(Add)` with the first range marked as `Reduce` type.
+`EXPAND` 变成了一个不影响 buffer 索引的 `RANGE(0..4)`——即广播。`RESHAPE` 变成了不同的索引算术。`SUM` 变成了 `REDUCE(Add)`，其中第一个范围标记为 `Reduce` 类型。
 
-### Movement → Index Arithmetic
+### 变换 → 索引算术
 
-Each movement operation has a specific transformation:
+每种变换操作有其特定的转换方式：
 
-| Operation | Transformation |
+| 操作 | 转换方式 |
 |-----------|----------------|
-| **RESHAPE** | Flatten/unflatten index expressions |
-| **PERMUTE** | Reorder dimensions in INDEX |
-| **EXPAND** | Index becomes 0 (or range doesn't affect index) |
+| **RESHAPE** | 展平/反展平索引表达式 |
+| **PERMUTE** | 重新排列 INDEX 中的维度 |
+| **EXPAND** | 索引变为 0（或范围不影响索引） |
 | **PAD** | WHERE(in_bounds, LOAD, pad_value) |
-| **SHRINK** | Offset adjustment in INDEX |
+| **SHRINK** | INDEX 中的偏移调整 |
 | **FLIP** | `size - 1 - index` |
 
-After rangeify, there are no more movement ops—just arithmetic operations on indices.
+经过 rangeify 后，不再有变换操作——只有对索引的算术运算。
 
 ---
 
-## Kernel Splitting: Finding the Boundaries
+## Kernel 拆分：寻找边界
 
-A computation graph might have multiple outputs, or intermediate values that need materialization. **Kernel splitting** identifies these boundaries and creates separate kernels.
+一个计算图可能有多个输出，或者需要物化的中间值。**Kernel 拆分**识别这些边界并创建独立的 kernel。
 
-The entry point is `run_kernel_split_pipeline()` in `schedule/src/rangeify/kernel.rs`.
+入口点是 `schedule/src/rangeify/kernel.rs` 中的 `run_kernel_split_pipeline()`。
 
-### Two-Phase Transformation
+### 两阶段变换
 
-**Phase 1: BUFFERIZE → STORE**
+**阶段 1：BUFFERIZE → STORE**
 
-`BUFFERIZE` nodes mark where values should materialize. Phase 1 converts them to explicit `STORE` operations:
+`BUFFERIZE` 节点标记值应该物化的位置。阶段 1 将它们转换为显式的 `STORE` 操作：
 
 ```text
 Before: BUFFERIZE(computation, ranges)
 After:  END(STORE(buffer, INDEX(...), computation), ranges)
 ```
 
-The `END` wrapper captures which ranges scope this store. Buffers are allocated and assigned IDs during this phase.
+`END` 包装器捕获哪些范围限定了这个 store 的作用域。buffer 在此阶段被分配并赋予 ID。
 
-**Phase 2: STORE → KERNEL**
+**阶段 2：STORE → KERNEL**
 
-Each `STORE` becomes its own kernel:
+每个 `STORE` 变成独立的 kernel：
 
 ```text
 Before: END(STORE(...), ranges)
 After:  KERNEL(SINK(STORE(...)), ranges, buffer_list)
 ```
 
-The `KERNEL` node wraps everything: the computation (as a `SINK`), the iteration ranges, and the list of buffers this kernel reads and writes.
+`KERNEL` 节点封装了所有内容：计算（作为 `SINK`）、迭代范围，以及该 kernel 读写的 buffer 列表。
 
-### Tracking Dependencies
+### 依赖追踪
 
-When one kernel's output feeds another kernel's input, we need dependency tracking:
+当一个 kernel 的输出作为另一个 kernel 的输入时，我们需要依赖追踪：
 
-1. `fix_assign()` maps each buffer_id to the kernel that writes it
-2. When kernel B reads a buffer written by kernel A, B depends on A
-3. `resolve_kernel_dependencies()` builds the dependency graph
+1. `fix_assign()` 将每个 buffer_id 映射到写入它的 kernel
+2. 当 kernel B 读取由 kernel A 写入的 buffer 时，B 依赖于 A
+3. `resolve_kernel_dependencies()` 构建依赖图
 
-Dependencies appear as `AFTER` nodes in the IR, ensuring kernels execute in valid order.
+依赖关系以 `AFTER` 节点出现在 IR 中，确保 kernel 按有效顺序执行。
 
-### Buffer Renumbering
+### Buffer 重编号
 
-Each kernel sees buffers in a specific order (outputs first, then inputs). `renumber_define_globals()` remaps buffer IDs to match this ordering:
+每个 kernel 按特定顺序看到 buffer（输出优先，然后是输入）。`renumber_define_globals()` 重新映射 buffer ID 以匹配此顺序：
 
 ```text
 Original: buffer_3, buffer_1, buffer_7
 Kernel view: buffer_0 (output), buffer_1, buffer_2 (inputs)
 ```
 
-This simplifies code generation—buffer `N` is always argument `N`.
+这简化了代码生成——buffer `N` 始终是参数 `N`。
 
 ---
 
-## Schedule Creation: Preparing for Execution
+## 调度创建：准备执行
 
-Once kernels are split, we need to **schedule** them: determine execution order, allocate buffers, and prepare for compilation.
+kernel 拆分完成后，需要**调度**它们：确定执行顺序、分配 buffer，并准备编译。
 
-`create_schedule()` in `tensor/src/schedule.rs` produces a `Vec<ScheduleItem>`:
+`tensor/src/schedule.rs` 中的 `create_schedule()` 生成 `Vec<ScheduleItem>`：
 
 ```rust
 pub struct ScheduleItem {
@@ -246,15 +246,15 @@ pub struct ScheduleItem {
 }
 ```
 
-### Buffer Allocation Strategy
+### Buffer 分配策略
 
-- **Input buffers**: Already allocated (from `Tensor::from_slice`)
-- **Intermediate buffers**: Allocated during scheduling (for kernel outputs that feed other kernels)
-- **Output buffer**: Allocated and registered with the final tensor
+- **输入 buffer**：已经分配好（来自 `Tensor::from_slice`）
+- **中间 buffer**：在调度阶段分配（用于 kernel 之间传递的输出）
+- **输出 buffer**：分配后注册到最终张量
 
-### Parallel Group Analysis
+### 并行组分析
 
-Not all kernels need sequential execution. Independent kernels can run in parallel:
+并非所有 kernel 都需要顺序执行。无依赖的 kernel 可以并行运行：
 
 ```text
 Kernel A (writes buf0)
@@ -262,25 +262,25 @@ Kernel B (writes buf1)  ─── no dependency ─── can run in parallel
 Kernel C (reads buf0, buf1)  ─── depends on A and B
 ```
 
-The scheduler uses **Kahn's algorithm** to find parallel groups:
+调度器使用 **Kahn 算法** 寻找并行组：
 
-1. Build the kernel dependency DAG
-2. Find all kernels with no incoming edges → Group 1
-3. Remove Group 1, repeat → Group 2, etc.
+1. 构建 kernel 依赖 DAG
+2. 找出所有没有入边的 kernel → 第 1 组
+3. 移除第 1 组，重复 → 第 2 组，以此类推
 
-Each group's kernels execute in parallel, then the next group starts.
+每组 kernel 并行执行，然后开始下一组。
 
 ---
 
-## Code Generation: From UOp to LLVM IR
+## 代码生成：从 UOp 到 LLVM IR
 
-With kernels scheduled, we generate actual code. Morok currently supports the LLVM backend:
+kernel 调度完成后，开始生成实际代码。Morok 目前支持 LLVM 后端：
 
-| Backend | Compile Speed | Output Quality | Use Case |
+| 后端 | 编译速度 | 输出质量 | 使用场景 |
 |---------|---------------|----------------|----------|
-| **LLVM** | Slower | Highly optimized | Production |
+| **LLVM** | 较慢 | 高度优化 | 生产环境 |
 
-The `Renderer` trait abstracts code generation:
+`Renderer` trait 抽象了代码生成：
 
 ```rust
 pub trait Renderer {
@@ -288,9 +288,9 @@ pub trait Renderer {
 }
 ```
 
-### LLVM CPU Renderer
+### LLVM CPU 渲染器
 
-The LLVM renderer (`codegen/src/llvm/cpu/`) traverses the UOp graph and emits LLVM IR:
+LLVM 渲染器（`codegen/src/llvm/cpu/`）遍历 UOp 图并生成 LLVM IR：
 
 ```llvm
 define void @kernel_0(ptr %args, ptr %vars) {
@@ -312,34 +312,34 @@ exit:
 }
 ```
 
-The generated kernel takes two arguments:
-- `args`: Array of buffer pointers
-- `vars`: Array of symbolic variable values (for dynamic shapes)
+生成的 kernel 接受两个参数：
+- `args`：buffer 指针数组
+- `vars`：符号变量值数组（用于动态形状）
 
-### Post-Optimization Passes
+### 后优化 Pass
 
-Before code generation, 13+ pattern-based passes clean up the IR:
+在代码生成之前，13+ 个基于模式的 pass 清理 IR：
 
-| Pass | Purpose |
+| Pass | 用途 |
 |------|---------|
-| `pm_add_loads` | Wrap INDEX operations in LOAD |
-| `pre_expand` | Convert UNROLL/UPCAST ranges to explicit operations |
-| `devectorize` | Group contiguous memory accesses |
-| `pm_reduce_devectorize` | Handle vector reductions (K-vec, bool, horizontal) |
-| `pm_fma_decomposition` | Convert `a*b+c` to fused multiply-add |
-| `bool_storage_patterns` | Convert bool ↔ uint8 for memory operations |
+| `pm_add_loads` | 将 INDEX 操作包装为 LOAD |
+| `pre_expand` | 将 UNROLL/UPCAST 范围转换为显式操作 |
+| `devectorize` | 组合连续内存访问 |
+| `pm_reduce_devectorize` | 处理向量 reduce（K-vec、bool、水平） |
+| `pm_fma_decomposition` | 将 `a*b+c` 转换为融合乘加 |
+| `bool_storage_patterns` | 在内存操作中转换 bool ↔ uint8 |
 
-These passes transform the optimized AST into a form suitable for code generation. The result is clean, vectorized code with proper memory access patterns.
+这些 pass 将优化后的 AST 转换为适合代码生成的形式。结果是干净的、向量化的代码，具有正确的内存访问模式。
 
 ---
 
-## Execution: Running the Kernels
+## 执行：运行 Kernel
 
-Code generation produces LLVM IR strings. Execution involves JIT compilation and kernel launch.
+代码生成产生 LLVM IR 字符串。执行阶段涉及 JIT 编译和 kernel 启动。
 
-### The ExecutionPlan
+### ExecutionPlan
 
-`prepare_execution_plan()` builds an `ExecutionPlan`:
+`prepare_execution_plan()` 构建 `ExecutionPlan`：
 
 ```rust
 pub struct ExecutionPlan {
@@ -350,17 +350,17 @@ pub struct ExecutionPlan {
 }
 ```
 
-The plan is **reusable**: compile once, execute many times with different data.
+这个计划是**可复用的**：编译一次，可以用不同的数据多次执行。
 
-### JIT Compilation
+### JIT 编译
 
-The LLVM runtime (`runtime/src/llvm.rs`) compiles IR to machine code:
+LLVM 运行时（`runtime/src/llvm.rs`）将 IR 编译为机器码：
 
-1. **Parse** the LLVM IR string into a module
-2. **Verify** the module is well-formed
-3. **Optimize** with LLVM's O3 pass pipeline
-4. **JIT compile** to native machine code
-5. **Cache** by (AST ID, device) for reuse
+1. **解析** LLVM IR 字符串为 module
+2. **验证** module 格式正确
+3. **优化**，使用 LLVM 的 O3 pass pipeline
+4. **JIT 编译**为原生机器码
+5. **缓存**，按 (AST ID, device) 复用
 
 ```rust
 // Simplified JIT flow
@@ -371,9 +371,9 @@ let function = execution_engine.get_function::<KernelFn>(&name)?;
 // Cache: (ast_id, device) → function
 ```
 
-### Parallel Execution
+### 并行执行
 
-With kernels compiled, execution follows the parallel groups:
+kernel 编译完成后，按并行组执行：
 
 ```rust
 for group in &plan.parallel_groups {
@@ -391,25 +391,25 @@ for group in &plan.parallel_groups {
 }
 ```
 
-Independent kernels run in parallel using Rayon's work-stealing scheduler.
+无依赖的 kernel 通过 Rayon 的工作窃取调度器并行运行。
 
-### Kernel Caching
+### Kernel 缓存
 
-Hash consing makes kernel caching highly effective:
+Hash consing 使 kernel 缓存非常高效：
 
-- **Key**: `(UOp ID, device string)`
-- **Storage**: Lock-free HashMap (papaya crate)
-- **Hit rate**: High, because identical computations share UOp IDs
+- **键**：`(UOp ID, device string)`
+- **存储**：无锁 HashMap（papaya crate）
+- **命中率**：高，因为相同的计算共享 UOp ID
 
-When you compute the same expression twice, the second call hits the cache—no recompilation.
+当你计算同一个表达式两次时，第二次会命中缓存——无需重新编译。
 
 ---
 
-## Worked Example: Matrix Multiply
+## 完整示例：矩阵乘法
 
-Let's trace `C = A @ B` through the entire pipeline. Assume 4×4 matrices.
+追踪 `C = A @ B` 通过整个流水线。假设 4×4 矩阵。
 
-### Stage 1: Lazy Graph Construction
+### 阶段 1：惰性图构建
 
 ```rust
 let a = Tensor::from_slice(a_data).try_reshape(&[4, 4])?;  // Input buffer allocated
@@ -417,7 +417,7 @@ let b = Tensor::from_slice(b_data).try_reshape(&[4, 4])?;  // Input buffer alloc
 let c = a.matmul(&b)?;                           // Graph built, no computation
 ```
 
-At this point, `c` is a lazy tensor with this UOp graph:
+此时，`c` 是一个惰性张量，具有如下 UOp 图：
 
 ```text
 REDUCE_AXIS(Add, axis=2)
@@ -426,9 +426,9 @@ REDUCE_AXIS(Add, axis=2)
     └── EXPAND(B, [4, 4, 4])    — B: [4, 4] → [1, 4, 4] → [4, 4, 4]
 ```
 
-### Stage 2: Rangeify
+### 阶段 2：Rangeify
 
-Movement ops become explicit loops:
+变换操作变成显式循环：
 
 ```text
 STORE
@@ -443,11 +443,11 @@ STORE
     └── RANGE(k, Reduce)
 ```
 
-The `i` and `j` ranges are output dimensions. The `k` range is the reduction (contracted) dimension.
+`i` 和 `j` 范围是输出维度。`k` 范围是规约（收缩）维度。
 
-### Stage 3: Kernel Splitting
+### 阶段 3：Kernel 拆分
 
-Single STORE → single KERNEL:
+单个 STORE → 单个 KERNEL：
 
 ```text
 KERNEL
@@ -456,23 +456,23 @@ KERNEL
 └── buffers: [C (output), A (input), B (input)]
 ```
 
-### Stage 4: Schedule
+### 阶段 4：调度
 
-One `ScheduleItem` with:
-- `kernel`: The KERNEL UOp
-- `ast`: The inner SINK/STORE
-- `buffers`: [C, A, B]
-- `dependencies`: [] (no prior kernels)
+一个 `ScheduleItem`，包含：
+- `kernel`：KERNEL UOp
+- `ast`：内部的 SINK/STORE
+- `buffers`：[C, A, B]
+- `dependencies`：[]（没有前置 kernel）
 
-### Stage 5: Optimization
+### 阶段 5：优化
 
-Heuristic optimizer applies:
-- Vectorization: UPCAST j dimension by 4
-- Loop ordering: Ensure good cache behavior
+启发式优化器应用：
+- 向量化：将 j 维度 UPCAST 4 倍
+- 循环顺序：确保良好的缓存行为
 
-### Stage 6: Code Generation
+### 阶段 6：代码生成
 
-Generated LLVM IR (simplified):
+生成的 LLVM IR（简化版）：
 
 ```llvm
 define void @matmul(ptr %args, ptr %vars) {
@@ -507,46 +507,46 @@ loop_k.end:
 }
 ```
 
-### Stage 7: Execution
+### 阶段 7：执行
 
-1. JIT compile the LLVM IR
-2. Execute: `kernel([C_ptr, A_ptr, B_ptr], [])`
-3. Result is in C buffer
+1. JIT 编译 LLVM IR
+2. 执行：`kernel([C_ptr, A_ptr, B_ptr], [])`
+3. 结果存入 C buffer
 
-Total: one function call, result ready.
+总计：一次函数调用，结果就绪。
 
 ---
 
-## Comparison: How Other Frameworks Execute
+## 对比：其他框架如何执行
 
-| Aspect | PyTorch | JAX | TVM | **Morok** |
+| 方面 | PyTorch | JAX | TVM | **Morok** |
 |--------|---------|-----|-----|-----------|
-| **Evaluation** | Eager (immediate) | Traced (jit decorator) | Lazy (te.compute) | Lazy (realize) |
-| **Graph capture** | torch.compile | jax.jit trace | Explicit schedule | Implicit via ops |
-| **Compilation** | TorchInductor | XLA backend | Auto-scheduler | Pattern + beam |
-| **Caching** | Per-graph hash | Per-trace | Per-schedule | Per-AST (hash consing) |
-| **Parallelism** | DataParallel/DDP | pmap/pjit | Parallel schedule | Parallel groups |
+| **求值方式** | 即时（立即） | 追踪（jit 装饰器） | 惰性（te.compute） | 惰性（realize） |
+| **图捕获** | torch.compile | jax.jit trace | 显式 schedule | 通过操作隐式 |
+| **编译** | TorchInductor | XLA 后端 | Auto-scheduler | 模式 + beam |
+| **缓存** | 按图哈希 | 按 trace | 按 schedule | 按 AST（hash consing） |
+| **并行** | DataParallel/DDP | pmap/pjit | Parallel schedule | 并行组 |
 
-**PyTorch**: Eager by default, torch.compile for optimization. TorchInductor generates Triton or C++ code.
+**PyTorch**：默认即时求值，torch.compile 用于优化。TorchInductor 生成 Triton 或 C++ 代码。
 
-**JAX**: Functional transformations (jit, grad, vmap) trace computations. XLA compiles to optimized kernels.
+**JAX**：函数式变换（jit、grad、vmap）追踪计算。XLA 编译为优化 kernel。
 
-**TVM**: Explicit separation of computation and schedule. Auto-scheduler searches for good schedules.
+**TVM**：将计算和调度显式分离。Auto-scheduler 搜索好的调度方案。
 
-**Morok**: Fully lazy—nothing executes until `realize()`. Hash consing provides automatic caching. Pattern-based optimization with optional beam search for production quality.
+**Morok**：完全惰性——在 `realize()` 之前什么都不执行。Hash consing 提供自动缓存。基于模式的优化，可选 beam 搜索以获得生产级质量。
 
 ---
 
-## The Deeper Insight
+## 更深层的洞察
 
-The pipeline embodies several design principles:
+流水线体现了几个设计原则：
 
-**Lazy evaluation enables global optimization.** By deferring computation, we see the entire graph before generating code. No local decision limits global optimization.
+**惰性求值实现全局优化。** 通过延迟计算，我们在生成代码前看到完整的图。局部决策不会限制全局优化。
 
-**Explicit loops enable hardware-specific scheduling.** Movement ops are convenient abstractions, but GPUs need loops. Rangeify bridges the gap.
+**显式循环实现硬件特定的调度。** 变换操作是方便的抽象，但 GPU 需要循环。Rangeify 在两者之间架起了桥梁。
 
-**Hash consing makes caching automatic.** Identical computations share pointers, so cache keys are trivial. No complex graph hashing needed.
+**Hash consing 使缓存自动化。** 相同的计算共享指针，所以缓存键很简单。不需要复杂的图哈希。
 
-**Separation of concerns keeps each stage simple.** Rangeify doesn't know about LLVM. Code generation doesn't know about tensor semantics. Each stage does one thing well.
+**关注点分离使每个阶段保持简单。** Rangeify 不知道 LLVM 的存在。代码生成不知道张量语义。每个阶段只做好一件事。
 
-The result: a compilation pipeline that's both powerful and maintainable. From `tensor.realize()` to machine code, every step is visible, debuggable, and extensible.
+结果是：一个既强大又可维护的编译流水线。从 `tensor.realize()` 到机器码，每一步都是可见的、可调试的、可扩展的。

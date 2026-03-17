@@ -1,12 +1,12 @@
 ---
-sidebar_label: Optimization System
+sidebar_label: ऑप्टिमाइज़ेशन सिस्टम
 ---
 
-# Pattern-Based Optimization
+# पैटर्न-आधारित ऑप्टिमाइज़ेशन
 
-Open any production ML compiler and you'll find dozens of optimization passes: constant folding, dead code elimination, operator fusion, loop tiling, vectorization, memory layout optimization. Each pass has its own data structures, its own traversal logic, its own bugs.
+कोई भी प्रोडक्शन ML कम्पाइलर खोलिए और आपको दर्जनों ऑप्टिमाइज़ेशन पासेज़ मिलेंगे: constant folding, dead code elimination, operator fusion, loop tiling, vectorization, memory layout optimization। हर पास के अपने डेटा स्ट्रक्चर, अपना traversal लॉजिक, अपने बग्स।
 
-Morok takes a different approach: **one mechanism for everything**.
+Morok एक अलग तरीका अपनाता है: **हर चीज़ के लिए एक मैकेनिज़्म**।
 
 ```text
 Traditional Compiler:              Morok:
@@ -23,15 +23,15 @@ Traditional Compiler:              Morok:
                                        One mechanism
 ```
 
-Every optimization in Morok is expressed as a **pattern**: "when you see this structure, replace it with that structure." The same `graph_rewrite()` function applies constant folding, converts movement ops to loops, optimizes memory access patterns, and lowers to hardware primitives.
+Morok में हर ऑप्टिमाइज़ेशन एक **पैटर्न** के रूप में एक्सप्रेस होता है: "जब यह स्ट्रक्चर दिखे, उसे इस स्ट्रक्चर से बदल दो।" वही `graph_rewrite()` फ़ंक्शन constant folding अप्लाई करता है, movement ops को लूप्स में बदलता है, मेमोरी एक्सेस पैटर्न ऑप्टिमाइज़ करता है, और हार्डवेयर प्रिमिटिव्स में लोअर करता है।
 
-This chapter explains how pattern-based optimization works and why it's powerful.
+यह चैप्टर बताता है कि पैटर्न-आधारित ऑप्टिमाइज़ेशन कैसे काम करता है और यह पावरफ़ुल क्यों है।
 
 ---
 
-## The `patterns!` DSL
+## `patterns!` DSL
 
-Morok provides a domain-specific language for writing optimization patterns. Here's what it looks like:
+Morok ऑप्टिमाइज़ेशन पैटर्न लिखने के लिए एक domain-specific language प्रदान करता है। यह कुछ ऐसा दिखता है:
 
 ```rust
 patterns! {
@@ -50,24 +50,24 @@ patterns! {
 }
 ```
 
-The macro compiles these patterns into efficient Rust code. Let's break down the syntax:
+मैक्रो इन पैटर्न को एफ़िशिएंट Rust कोड में कम्पाइल करता है। चलिए सिंटैक्स तोड़कर देखते हैं:
 
-| Syntax | Meaning | Example |
-|--------|---------|---------|
-| `(x, y)` | **Ordered.** Match in exact order. | `Sub(x, @zero) ~> x` |
-| `[x, y]` | **Commutative.** Try both orderings. | `Add[x, @zero] ~> x` |
-| `@zero` | **Zero constant.** Matches 0 or 0.0. | `Mul[_, z @ @zero] ~> z` |
-| `@one` | **One constant.** Matches 1 or 1.0. | `Mul[x, @one] ~> x` |
-| `@const(val)` | **Extract constant.** Binds the value. | `Add(@const(a), @const(b))` |
-| `x, x` | **Same operand.** Auto-generates ptr_eq check. | `Idiv(x, x) ~> UOp::one(...)` |
-| `~>` | **Infallible.** Always succeeds, returns `Arc<UOp>`. | `Add[x, @zero] ~> x` |
-| `=>` | **Fallible.** May fail, returns `Option<Arc<UOp>>`. | `=> eval(...).map(...)` |
-| `for op in binary [...]` | **Template.** Generate patterns for multiple ops. | See below |
-| `@context Type` | **Stateful.** Access mutable context in patterns. | See below |
+| सिंटैक्स | मतलब | उदाहरण |
+|----------|------|--------|
+| `(x, y)` | **Ordered।** एक्ज़ैक्ट ऑर्डर में मैच। | `Sub(x, @zero) ~> x` |
+| `[x, y]` | **Commutative।** दोनों orderings ट्राई करे। | `Add[x, @zero] ~> x` |
+| `@zero` | **ज़ीरो कॉन्स्टेंट।** 0 या 0.0 मैच करे। | `Mul[_, z @ @zero] ~> z` |
+| `@one` | **वन कॉन्स्टेंट।** 1 या 1.0 मैच करे। | `Mul[x, @one] ~> x` |
+| `@const(val)` | **कॉन्स्टेंट एक्सट्रैक्ट।** वैल्यू बाइंड करे। | `Add(@const(a), @const(b))` |
+| `x, x` | **Same operand।** ptr_eq चेक ऑटो-जनरेट। | `Idiv(x, x) ~> UOp::one(...)` |
+| `~>` | **Infallible।** हमेशा सफ़ल, `Arc<UOp>` रिटर्न। | `Add[x, @zero] ~> x` |
+| `=>` | **Fallible।** फ़ेल हो सकता है, `Option<Arc<UOp>>` रिटर्न। | `=> eval(...).map(...)` |
+| `for op in binary [...]` | **Template।** मल्टीपल ops के लिए पैटर्न जनरेट। | नीचे देखें |
+| `@context Type` | **Stateful।** पैटर्न में mutable context एक्सेस। | नीचे देखें |
 
-### Template Expansion
+### Template एक्सपैंशन
 
-Instead of writing the same pattern for every binary operation, use a for-loop:
+हर binary ऑपरेशन के लिए एक ही पैटर्न लिखने की बजाय, for-loop इस्तेमाल करें:
 
 ```rust
 patterns! {
@@ -79,11 +79,11 @@ patterns! {
 }
 ```
 
-This expands to six separate patterns at compile time—one for each operation.
+यह कम्पाइल टाइम पर छह अलग-अलग पैटर्न में एक्सपैंड होता है — हर ऑपरेशन के लिए एक।
 
-### Stateful Patterns
+### Stateful पैटर्न
 
-Some optimizations need context (e.g., which kernel we're in, what ranges are active). Declare a context type:
+कुछ ऑप्टिमाइज़ेशन को context चाहिए (जैसे, हम किस कर्नेल में हैं, कौन सी ranges एक्टिव हैं)। एक context type डिक्लेयर करें:
 
 ```rust
 patterns! {
@@ -96,17 +96,17 @@ patterns! {
 }
 ```
 
-The context is passed as the last argument to pattern closures.
+Context पैटर्न closures को लास्ट आर्ग्युमेंट के रूप में पास होता है।
 
 ---
 
-## How Pattern Matching Works
+## पैटर्न मैचिंग कैसे काम करता है
 
-The `patterns!` macro generates a `SimplifiedPatternMatcher` that dispatches patterns in **O(1)** time.
+`patterns!` मैक्रो एक `SimplifiedPatternMatcher` जनरेट करता है जो **O(1)** टाइम में पैटर्न डिस्पैच करता है।
 
-### The OpKey Index
+### OpKey इंडेक्स
 
-Every UOp has an operation type (Add, Mul, Load, etc.). The `#[derive(PatternEnum)]` macro generates an `OpKey` enum that maps operations to hashable keys:
+हर UOp का एक ऑपरेशन टाइप होता है (Add, Mul, Load, वगैरह)। `#[derive(PatternEnum)]` मैक्रो एक `OpKey` enum जनरेट करता है जो ऑपरेशन को hashable keys में मैप करता है:
 
 ```rust
 pub enum OpKey {
@@ -120,7 +120,7 @@ pub enum OpKey {
 }
 ```
 
-### The Matcher Structure
+### Matcher स्ट्रक्चर
 
 ```rust
 pub struct SimplifiedPatternMatcher<C = ()> {
@@ -129,18 +129,18 @@ pub struct SimplifiedPatternMatcher<C = ()> {
 }
 ```
 
-When matching a UOp:
+UOp मैच करते समय:
 
-1. **Extract OpKey** from the UOp's operation
-2. **Lookup** in the HashMap—O(1)
-3. **Try each closure** until one matches
-4. **Fall back** to wildcards if no indexed pattern matches
+1. UOp के ऑपरेशन से **OpKey एक्सट्रैक्ट** करें
+2. HashMap में **लुकअप** करें — O(1)
+3. हर closure **ट्राई** करें जब तक कोई मैच न हो
+4. कोई indexed पैटर्न मैच न हो तो **wildcards पर फ़ॉलबैक**
 
-This is 5-10x faster than scanning all patterns linearly.
+यह सभी पैटर्न को linearly स्कैन करने से 5-10x तेज़ है।
 
-### Commutative Handling
+### Commutative हैंडलिंग
 
-For patterns like `Add[x, @zero]`, the macro generates code that tries both orderings:
+`Add[x, @zero]` जैसे पैटर्न के लिए, मैक्रो ऐसा कोड जनरेट करता है जो दोनों orderings ट्राई करे:
 
 ```rust
 // Try (x, @zero)
@@ -153,9 +153,9 @@ if let Some(result) = try_match_ordered(&children[1], &children[0]) {
 }
 ```
 
-### Duplicate Detection
+### डुप्लिकेट डिटेक्शन
 
-When you write `Idiv(x, x)`, the pattern should only match if both operands are the *same* UOp (pointer equality, not structural equality). The macro automatically generates this check:
+जब आप `Idiv(x, x)` लिखते हैं, पैटर्न सिर्फ़ तभी मैच होना चाहिए जब दोनों operands *एक ही* UOp हों (pointer equality, structural equality नहीं)। मैक्रो ऑटोमैटिकली यह चेक जनरेट करता है:
 
 ```rust
 // Generated code for Idiv(x, x)
@@ -167,25 +167,27 @@ if !Arc::ptr_eq(x, x_dup) {
 // ... rest of pattern
 ```
 
-This leverages hash consing—identical subexpressions share the same pointer.
+यह hash consing का फ़ायदा उठाता है — आइडेंटिकल subexpressions एक ही पॉइंटर शेयर करते हैं।
 
 ---
 
-## The Rewrite Engine: Two-Stage Algorithm
+## रीराइट इंजन: टू-स्टेज एल्गोरिदम
 
-Pattern matching alone isn't enough. Consider this expression:
+> **नोट:** यह सिम्प्लिफ़ाइड प्रेज़ेंटेशन है। असल इंजन एफ़िशिएंसी के लिए path compression के साथ 3-स्टेज stack-based एल्गोरिदम इस्तेमाल करता है।
+
+सिर्फ़ पैटर्न मैचिंग काफ़ी नहीं है। यह एक्सप्रेशन देखें:
 
 ```text
 WHERE(Lt(3, 5), t, f)
 ```
 
-To simplify it, we need two steps:
+इसे सिम्प्लिफ़ाई करने के लिए, दो स्टेप चाहिए:
 1. `Lt(3, 5)` → `true` (constant folding)
 2. `WHERE(true, t, f)` → `t` (dead code elimination)
 
-But the `WHERE` pattern won't match until its child is simplified. The rewrite engine solves this with a **two-stage algorithm**.
+लेकिन `WHERE` पैटर्न तब तक मैच नहीं करेगा जब तक उसका child सिम्प्लिफ़ाई न हो। रीराइट इंजन इसे **टू-स्टेज एल्गोरिदम** से सॉल्व करता है।
 
-### Stage 0: Pattern Application
+### स्टेज 0: पैटर्न अप्लिकेशन
 
 ```rust
 fn rewrite_stage0(&mut self, uop: &Arc<UOp>) -> RewriteResult {
@@ -196,11 +198,11 @@ fn rewrite_stage0(&mut self, uop: &Arc<UOp>) -> RewriteResult {
 }
 ```
 
-If no pattern matches, return `Gate`—a signal to process children first.
+कोई पैटर्न मैच न हो तो `Gate` रिटर्न करें — children को पहले प्रोसेस करने का सिग्नल।
 
-### Stage 1: Source Reconstruction
+### स्टेज 1: सोर्स रीकंस्ट्रक्शन
 
-After children are rewritten, rebuild the node with new children and try patterns again:
+Children रीराइट होने के बाद, नए children के साथ नोड रीबिल्ड करें और पैटर्न फिर ट्राई करें:
 
 ```rust
 fn rewrite_stage1(&mut self, uop: &Arc<UOp>, new_children: Vec<Arc<UOp>>) {
@@ -215,7 +217,7 @@ fn rewrite_stage1(&mut self, uop: &Arc<UOp>, new_children: Vec<Arc<UOp>>) {
 }
 ```
 
-### The Magic: Cascading Optimizations
+### जादू: कैस्केडिंग ऑप्टिमाइज़ेशन
 
 ```text
 Stage 0: WHERE(Lt(3, 5), t, f)     → Gate (no match, process children)
@@ -224,22 +226,22 @@ Stage 0: WHERE(Lt(3, 5), t, f)     → Gate (no match, process children)
 Stage 1: WHERE(true, t, f)         → t (dead code elimination matches!)
 ```
 
-The reconstruction stage re-applies patterns, enabling multi-step optimizations in a single traversal.
+रीकंस्ट्रक्शन स्टेज पैटर्न री-अप्लाई करता है, जो सिंगल traversal में मल्टी-स्टेप ऑप्टिमाइज़ेशन सक्षम करता है।
 
-### Safety Limits
+### सेफ़्टी लिमिट्स
 
-To prevent infinite loops, the engine has limits:
-- **1000 iterations** per node maximum
-- **100,000 iterations** total maximum
-- Panics with diagnostic info if limits exceeded
+इन्फ़िनिट लूप रोकने के लिए, इंजन में लिमिट्स हैं:
+- प्रति नोड मैक्सिमम **1000 iterations**
+- कुल मैक्सिमम **500,000 iterations**
+- लिमिट पार होने पर डायग्नोस्टिक इन्फ़ो के साथ panic
 
-In practice, well-formed patterns converge quickly.
+प्रैक्टिस में, ठीक से बने पैटर्न जल्दी converge करते हैं।
 
 ---
 
-## The Full Optimization Pipeline
+## पूरी ऑप्टिमाइज़ेशन पाइपलाइन
 
-Pattern matching is one part of a larger pipeline. When you call `tensor.realize()`, here's what happens:
+पैटर्न मैचिंग एक बड़ी पाइपलाइन का एक हिस्सा है। जब आप `tensor.realize()` कॉल करते हैं, यह होता है:
 
 ```text
 Tensor.realize()
@@ -289,21 +291,21 @@ Tensor.realize()
 └─────────────────────────────────────────────────────────┘
 ```
 
-Each box uses pattern-based rewriting. The difference is which patterns are applied:
+हर बॉक्स पैटर्न-आधारित रीराइटिंग इस्तेमाल करता है। फ़र्क सिर्फ़ इतना है कि कौन से पैटर्न अप्लाई होते हैं:
 
-- **Rangeify**: Movement op → BUFFERIZE + INDEX patterns
-- **Symbolic**: Algebraic simplification patterns
-- **Post-opt**: Memory access optimization patterns
+- **Rangeify**: Movement op → BUFFERIZE + INDEX पैटर्न
+- **Symbolic**: एल्जेब्रिक सिम्प्लिफ़िकेशन पैटर्न
+- **Post-opt**: मेमोरी एक्सेस ऑप्टिमाइज़ेशन पैटर्न
 
 ---
 
-## Kernel Optimization: Heuristics vs Beam Search
+## कर्नेल ऑप्टिमाइज़ेशन: Heuristics बनाम Beam Search
 
-After symbolic simplification, each kernel needs *scheduling decisions*: how to tile loops, where to parallelize, whether to use tensor cores. Morok offers two strategies.
+Symbolic सिम्प्लिफ़िकेशन के बाद, हर कर्नेल को *scheduling decisions* चाहिए: लूप कैसे tile करें, कहाँ पैरेललाइज़ करें, tensor cores इस्तेमाल करें या नहीं। Morok दो स्ट्रैटेजी ऑफ़र करता है।
 
-### Heuristics (Default)
+### Heuristics (डिफ़ॉल्ट)
 
-The heuristic optimizer applies optimizations in a fixed order:
+Heuristic ऑप्टिमाइज़र एक फ़िक्स्ड ऑर्डर में ऑप्टिमाइज़ेशन अप्लाई करता है:
 
 ```rust
 pub fn hand_coded_optimizations(scheduler: &mut Scheduler) {
@@ -327,19 +329,20 @@ pub fn hand_coded_optimizations(scheduler: &mut Scheduler) {
 }
 ```
 
-**Pros**: Fast (~50ms per kernel), predictable, no hardware measurement needed.
+**फ़ायदे**: तेज़ (~50ms प्रति कर्नेल), predictable, हार्डवेयर measurement नहीं चाहिए।
 
-**Cons**: May miss optimization opportunities, fixed heuristics don't adapt to workload.
+**नुकसान**: ऑप्टिमाइज़ेशन के मौके छूट सकते हैं, फ़िक्स्ड heuristics वर्कलोड के हिसाब से adapt नहीं करते।
 
-### Beam Search (Optional)
+### Beam Search (ऑप्शनल)
 
-For production workloads, beam search finds better schedules:
+प्रोडक्शन वर्कलोड के लिए, beam search बेहतर schedules ढूँढता है:
 
 ```rust
 pub fn beam_search(scheduler: Scheduler, config: BeamConfig) -> Scheduler {
     let mut beam = vec![scheduler];
+    let deadline = Instant::now() + config.time_limit;
 
-    for iteration in 0..config.max_iterations {
+    while Instant::now() < deadline {
         let mut candidates = vec![];
 
         for state in &beam {
@@ -368,19 +371,20 @@ pub fn beam_search(scheduler: Scheduler, config: BeamConfig) -> Scheduler {
 }
 ```
 
-The action space includes ~500 predefined actions:
-- `UPCAST(axis, amount)` — vectorize output dimension
-- `UNROLL(axis, amount)` — unroll reduction loop
-- `LOCAL(axis, amount)` — use GPU shared memory
-- `GROUP(axis, amount)` — two-stage reduction
-- `THREAD(axis, amount)` — CPU parallelization
-- `SWAP(axis1, axis2)` — reorder global dimensions
+एक्शन स्पेस में ~162 बेस एक्शन शामिल हैं (उपलब्ध parallelism के अनुसार अलग-अलग):
+- `UPCAST(axis, amount)` — आउटपुट डायमेंशन vectorize करें
+- `UNROLL(axis, amount)` — रिडक्शन लूप अनरोल करें
+- `LOCAL(axis, amount)` — GPU shared memory इस्तेमाल करें
+- `GROUP(axis, amount)` — टू-स्टेज रिडक्शन
+- `GROUPTOP(axis, amount)` — tensor cores के लिए grouped reduction
+- `THREAD(axis, amount)` — CPU पैरेललाइज़ेशन
+- `SWAP(axis1, axis2)` — global dimensions रीऑर्डर करें
 
-**Pros**: Finds near-optimal schedules, adapts to hardware.
+**फ़ायदे**: नियर-ऑप्टिमल schedules ढूँढता है, हार्डवेयर के हिसाब से adapt करता है।
 
-**Cons**: Minutes per kernel (but results are cached by AST hash).
+**नुकसान**: प्रति कर्नेल मिनटों में (लेकिन रिज़ल्ट AST hash से कैश होते हैं)।
 
-### Configuration
+### कॉन्फ़िगरेशन
 
 ```bash
 # Disable optimization (debugging)
@@ -390,10 +394,10 @@ MOROK_NOOPT=1 cargo run
 MOROK_BEAM=8 cargo run
 ```
 
-Or programmatically:
+या प्रोग्रामैटिकली:
 
 ```rust
-let config = OptimizerConfig::builder()
+let config = PrepareConfig::builder()
     .strategy(OptStrategy::Beam { width: 8 })
     .build();
 
@@ -402,42 +406,42 @@ tensor.realize_with(config)?;
 
 ---
 
-## Comparison: How Other Compilers Optimize
+## तुलना: दूसरे कम्पाइलर कैसे ऑप्टिमाइज़ करते हैं
 
-Different ML compilers take different approaches to optimization:
+अलग-अलग ML कम्पाइलर ऑप्टिमाइज़ेशन के लिए अलग-अलग तरीके अपनाते हैं:
 
-| Aspect | XLA | TVM/Ansor | Triton | **Morok** |
-|--------|-----|-----------|--------|-----------|
-| **Philosophy** | Fixed heuristics | Search-based | Programmer-guided | Pattern-based |
-| **Fusion** | Conservative rules | Tile-and-fuse | Block-level | Graph rewriting |
-| **Auto-tuning** | None | Evolutionary + cost model | Grid search | Beam search |
-| **Tuning cost** | 0 | Hours | Minutes | Minutes (cached) |
-| **Flexibility** | Low | High | Medium | High |
-| **Transparency** | Low (C++ passes) | Medium (Python) | Medium (DSL) | High (patterns!) |
+| पहलू | XLA | TVM/Ansor | Triton | **Morok** |
+|-------|-----|-----------|--------|-----------|
+| **फ़िलॉसफ़ी** | फ़िक्स्ड heuristics | सर्च-आधारित | प्रोग्रामर-गाइडेड | पैटर्न-आधारित |
+| **Fusion** | कंज़र्वेटिव नियम | Tile-and-fuse | Block-level | ग्राफ़ रीराइटिंग |
+| **Auto-tuning** | कोई नहीं | Evolutionary + cost model | Grid search | Beam search |
+| **ट्यूनिंग कॉस्ट** | 0 | घंटों | मिनटों | मिनटों (कैश्ड) |
+| **फ़्लेक्सिबिलिटी** | कम | ज़्यादा | मध्यम | ज़्यादा |
+| **ट्रांसपैरेंसी** | कम (C++ पासेज़) | मध्यम (Python) | मध्यम (DSL) | ज़्यादा (patterns!) |
 
-### XLA — Production Conservative
+### XLA — प्रोडक्शन कंज़र्वेटिव
 
-XLA uses fixed heuristics for fusion decisions. Safe and predictable, but leaves performance on the table. The fusion rules are hard-coded in C++—extending them requires deep compiler knowledge.
+XLA fusion decisions के लिए फ़िक्स्ड heuristics इस्तेमाल करता है। सेफ़ और predictable, लेकिन परफ़ॉर्मेंस टेबल पर छूट जाती है। Fusion rules C++ में hard-coded हैं — उन्हें extend करने के लिए डीप कम्पाइलर नॉलेज चाहिए।
 
-### TVM/Ansor — Maximum Auto-Tuning
+### TVM/Ansor — मैक्सिमम Auto-Tuning
 
-TVM separates *what* to compute from *how* to compute it. Ansor uses evolutionary search with a learned cost model to explore the schedule space. Can achieve best-in-class performance, but tuning takes hours per model.
+TVM *क्या* कम्प्यूट करना है और *कैसे* कम्प्यूट करना है को अलग करता है। Ansor schedule space explore करने के लिए learned cost model के साथ evolutionary search इस्तेमाल करता है। बेस्ट-इन-क्लास परफ़ॉर्मेंस दे सकता है, लेकिन ट्यूनिंग में प्रति मॉडल घंटे लगते हैं।
 
-### Triton — Programmer-Guided
+### Triton — प्रोग्रामर-गाइडेड
 
-Triton exposes a Python-like DSL where you write blocked algorithms explicitly. The compiler handles register allocation and memory management. Good balance of control and automation, but requires GPU programming expertise.
+Triton एक Python-जैसा DSL एक्सपोज़ करता है जहाँ आप blocked algorithms एक्सप्लिसिटली लिखते हैं। कम्पाइलर register allocation और memory management हैंडल करता है। कंट्रोल और ऑटोमेशन का अच्छा बैलेंस, लेकिन GPU प्रोग्रामिंग एक्सपर्टीज़ चाहिए।
 
-### Morok — Pattern Composition
+### Morok — पैटर्न कम्पोज़िशन
 
-Morok's insight: express optimizations as composable patterns. Each pattern is local and verifiable. Complex optimizations emerge from composition. Beam search adds auto-tuning when needed, with results cached for reuse.
+Morok की इनसाइट: ऑप्टिमाइज़ेशन को composable पैटर्न के रूप में एक्सप्रेस करें। हर पैटर्न लोकल और verifiable है। कॉम्प्लेक्स ऑप्टिमाइज़ेशन composition से निकलते हैं। Beam search ज़रूरत पड़ने पर auto-tuning जोड़ता है, रिज़ल्ट रीयूज़ के लिए कैश होते हैं।
 
 ---
 
-## Why This Matters: Practical Benefits
+## यह क्यों ज़रूरी है: प्रैक्टिकल फ़ायदे
 
-Pattern-based optimization has concrete advantages for developers:
+पैटर्न-आधारित ऑप्टिमाइज़ेशन के डेवलपर्स के लिए ठोस फ़ायदे हैं:
 
-**Debugging is direct.** Patterns are readable code. Add a `println!` to any pattern to trace when it fires:
+**डीबगिंग डायरेक्ट है।** पैटर्न पढ़ने योग्य कोड हैं। किसी भी पैटर्न में `println!` जोड़ें ताकि पता चले कब फ़ायर होता है:
 
 ```rust
 patterns! {
@@ -448,7 +452,7 @@ patterns! {
 }
 ```
 
-**Extensibility is easy.** Adding a custom optimization is two lines:
+**एक्सटेंसिबिलिटी आसान है।** कस्टम ऑप्टिमाइज़ेशन जोड़ना दो लाइन है:
 
 ```rust
 patterns! {
@@ -457,22 +461,22 @@ patterns! {
 }
 ```
 
-No need to understand compiler internals, write visitors, or modify pass managers.
+कम्पाइलर इंटरनल्स समझने, visitors लिखने, या pass managers मॉडिफ़ाई करने की ज़रूरत नहीं।
 
-**Correctness is local.** Each pattern is a small theorem: "if this structure appears, replacing it with that structure preserves semantics." Verify each pattern independently. Composition of correct patterns yields correct programs.
+**करेक्टनेस लोकल है।** हर पैटर्न एक छोटा theorem है: "अगर यह स्ट्रक्चर दिखे, उसे इससे बदलने से सिमैंटिक्स preserve होते हैं।" हर पैटर्न को इंडिपेंडेंटली वेरिफ़ाई करें। करेक्ट पैटर्न का composition करेक्ट प्रोग्राम देता है।
 
-**Performance is tunable.** O(1) pattern dispatch is fast by default. Enable beam search for production workloads. Cache results by AST hash—tune once, benefit forever.
+**परफ़ॉर्मेंस ट्यूनेबल है।** O(1) पैटर्न dispatch डिफ़ॉल्ट से तेज़ है। प्रोडक्शन वर्कलोड के लिए beam search इनेबल करें। AST hash से रिज़ल्ट कैश करें — एक बार ट्यून करें, हमेशा फ़ायदा।
 
 ---
 
-## The Deeper Insight
+## गहरी समझ
 
-Pattern matching trades generality for composability.
+पैटर्न मैचिंग generality को composability से ट्रेड करता है।
 
-A general-purpose optimization pass can do anything—but that's exactly the problem. It's hard to verify, hard to extend, hard to compose with other passes. Ordering matters. Interactions are subtle.
+एक general-purpose ऑप्टिमाइज़ेशन पास कुछ भी कर सकता है — लेकिन यही प्रॉब्लम है। इसे वेरिफ़ाई करना मुश्किल, extend करना मुश्किल, दूसरे passes के साथ compose करना मुश्किल। ऑर्डरिंग मैटर करती है। इंटरैक्शन सटल हैं।
 
-A pattern is constrained: it matches a specific structure and produces a specific replacement. But constraints enable composition. Run patterns in any order—the result converges to the same fixed point. Add new patterns without breaking existing ones. Delete patterns without cascading failures.
+पैटर्न constrained है: यह एक स्पेसिफ़िक स्ट्रक्चर मैच करता है और स्पेसिफ़िक replacement प्रोड्यूस करता है। लेकिन constraints composition सक्षम करते हैं। पैटर्न किसी भी ऑर्डर में चलाएँ — रिज़ल्ट एक ही fixed point पर converge करता है। नए पैटर्न जोड़ें मौजूदा को तोड़े बिना। पैटर्न हटाएँ बिना cascading failures के।
 
-Each pattern is a theorem about semantic equivalence. The rewrite engine is a theorem prover, finding derivations from input to optimized output. Correctness follows from the correctness of individual steps.
+हर पैटर्न semantic equivalence का एक theorem है। रीराइट इंजन एक theorem prover है, जो इनपुट से ऑप्टिमाइज़्ड आउटपुट तक derivations ढूँढता है। करेक्टनेस individual steps की करेक्टनेस से आती है।
 
-This is the Unix philosophy applied to compilers: small, focused tools that compose. Pattern-based optimization won't solve every problem—but for the problems it solves, it solves them elegantly.
+यह Unix philosophy है जो कम्पाइलरों पर लागू है: छोटे, focused टूल जो compose करें। पैटर्न-आधारित ऑप्टिमाइज़ेशन हर प्रॉब्लम सॉल्व नहीं करेगा — लेकिन जो प्रॉब्लम सॉल्व करता है, उन्हें एलिगेंटली सॉल्व करता है।

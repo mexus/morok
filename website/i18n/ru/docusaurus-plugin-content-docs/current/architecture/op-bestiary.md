@@ -1,61 +1,63 @@
 ---
-sidebar_label: Op Bestiary
+sidebar_label: Бестиарий операций
 ---
 
-# Op Bestiary: A Field Guide to UOp Operations
+# Бестиарий операций: справочник по UOp
 
-When debugging Morok IR dumps, you'll encounter operations that aren't obvious from their names. This chapter documents non-trivial operations with signatures, field explanations, and examples.
+При отладке IR-дампов Morok вы встретите операции, назначение которых не очевидно из названия. Эта глава документирует нетривиальные операции с сигнатурами, описанием полей и примерами.
 
-**What's covered:** Operations that require explanation—loop control, reductions, memory operations, kernel structure, vectorization, tensor cores.
+**Что покрыто:** Операции, требующие пояснений — управление циклами, редукции, работа с памятью, структура ядер, векторизация, тензорные ядра.
 
-**What's NOT covered:** Trivial ALU operations (`Add`, `Mul`, `Sqrt`, etc.) that work exactly as you'd expect.
+**Что НЕ покрыто:** Тривиальные ALU-операции (`Add`, `Mul`, `Sqrt` и т.д.), которые работают ровно так, как вы ожидаете.
 
 ---
 
-## Loop Control: RANGE and END
+## Управление циклами: RANGE и END
 
-### RANGE — Loop Scope Opener
+### RANGE — открытие скоупа цикла
 
 ```rust
 Range {
     end: Arc<UOp>,           // loop bound (exclusive)
     axis_id: AxisId,         // identifier for deduplication
     axis_type: AxisType,     // scheduling behavior
+    deps: SmallVec<[Arc<UOp>; 2]>,  // range dependencies
 }
 ```
 
-**Fields:**
+**Поля:**
 
-| Field | Type | Purpose |
-|-------|------|---------|
-| `end` | `Arc<UOp>` | Upper bound (exclusive), typically a `CONST` |
-| `axis_id` | `AxisId` | `Unrenumbered(n)` before kernel splitting, `Renumbered(n)` after |
-| `axis_type` | `AxisType` | Determines how the loop is scheduled (see below) |
+| Поле | Тип | Назначение |
+|------|-----|------------|
+| `end` | `Arc<UOp>` | Верхняя граница (исключительно), обычно `CONST` |
+| `axis_id` | `AxisId` | `Unrenumbered(n)` до разделения ядер, `Renumbered(n)` после |
+| `axis_type` | `AxisType` | Определяет способ планирования цикла (см. ниже) |
+| `deps` | `SmallVec<[Arc<UOp>; 2]>` | Другие RANGE, от которых зависит этот |
 
-**AxisType Hierarchy:**
+**Иерархия AxisType:**
 
-| Type | Priority | GPU Mapping | Purpose |
-|------|----------|-------------|---------|
-| `Outer` | -2 | — | Kernel boundary marker |
-| `Loop` | -1 | `for` loop | Sequential iteration |
-| `Global` | 0 | `blockIdx` | Grid parallelism |
-| `Thread` | 0 | thread pool | CPU parallelism |
-| `Warp` | 1 | warp/wavefront | Sub-group parallelism |
-| `Local` | 2 | `threadIdx` | Workgroup parallelism |
-| `GroupReduce` | 2 | shared memory | Two-stage reduction |
-| `Upcast` | 3 | SIMD | Vectorization |
-| `Reduce` | 4 | accumulator | Reduction dimension |
-| `Unroll` | 5 | unrolled | Loop unrolling |
+| Тип | Приоритет | GPU-маппинг | Назначение |
+|-----|-----------|-------------|------------|
+| `Outer` | -2 | — | Маркер границы ядра |
+| `Loop` | -1 | цикл `for` | Последовательная итерация |
+| `Global` | 0 | `blockIdx` | Параллелизм по гриду |
+| `Thread` | 0 | пул потоков | CPU-параллелизм |
+| `Warp` | 1 | warp/wavefront | Субгрупповой параллелизм |
+| `Local` | 2 | `threadIdx` | Параллелизм внутри воркгруппы |
+| `GroupReduce` | 2 | shared memory | Двухэтапная редукция |
+| `Upcast` | 3 | SIMD | Векторизация |
+| `Reduce` | 4 | аккумулятор | Ось редукции |
+| `Unroll` | 5 | развёрнутый | Развёртка цикла |
 
-Priority determines loop nesting order—lower values are outer loops.
+Приоритет определяет порядок вложенности — меньшие значения соответствуют внешним циклам.
 
-**Example:**
+**Пример:**
 ```text
 RANGE(end=128, axis_id=R0, type=Global)
 └── CONST(128) : Index
 ```
 
-### END — Loop Scope Closer
+### END — закрытие скоупа цикла
 
 ```rust
 End {
@@ -64,9 +66,9 @@ End {
 }
 ```
 
-END closes one or more RANGE scopes and removes them from the active set. Multiple ranges can be closed simultaneously.
+END закрывает один или несколько скоупов RANGE и убирает их из активного набора. Можно закрыть несколько RANGE одновременно.
 
-**Example:**
+**Пример:**
 ```text
 END
 ├── STORE(...)           — computation
@@ -76,11 +78,11 @@ END
 
 ---
 
-## Reduction: REDUCE vs REDUCE_AXIS
+## Редукция: REDUCE vs REDUCE_AXIS
 
-Two operations with similar names serve different purposes.
+Две операции с похожими названиями, но с разным назначением.
 
-### REDUCE_AXIS — Tensor Dimension Reduction (High-Level)
+### REDUCE_AXIS — редукция по измерению тензора (высокоуровневая)
 
 ```rust
 ReduceAxis {
@@ -90,17 +92,17 @@ ReduceAxis {
 }
 ```
 
-Used **before** rangeify. Operates on tensor dimensions like NumPy's `.sum(axis=0)`.
+Используется **до** rangeify. Работает по измерениям тензора, как `.sum(axis=0)` в NumPy.
 
-**Example:**
+**Пример:**
 ```text
 REDUCE_AXIS(Add, axes=[1])
 └── BUFFER[10, 20] : Float32
 ```
 
-This reduces a `[10, 20]` tensor to `[10]` by summing along axis 1.
+Редуцирует тензор `[10, 20]` до `[10]`, суммируя по оси 1.
 
-### REDUCE — Range Iteration Reduction (Low-Level)
+### REDUCE — редукция по итерациям RANGE (низкоуровневая)
 
 ```rust
 Reduce {
@@ -110,20 +112,20 @@ Reduce {
 }
 ```
 
-Used **after** rangeify. Accumulates values across RANGE iterations and closes the specified ranges.
+Используется **после** rangeify. Аккумулирует значения по итерациям RANGE и закрывает указанные RANGE.
 
-**ReduceOp Variants:**
+**Варианты ReduceOp:**
 
-| Op | Identity | Operation | Tinygrad |
-|----|----------|-----------|----------|
+| Op | Нейтральный элемент | Операция | Tinygrad |
+|----|---------------------|----------|----------|
 | `Add` | 0 | `acc + value` | ✓ |
 | `Mul` | 1 | `acc * value` | ✓ |
 | `Max` | -∞ | `max(acc, value)` | ✓ |
-| `Min` | +∞ | `min(acc, value)` | Morok-only |
+| `Min` | +∞ | `min(acc, value)` | Только Morok |
 
-> **Compatibility:** Tinygrad's spec restricts REDUCE_AXIS to `{Add, Mul, Max}`. Morok extends this with `Min`.
+> **Совместимость:** Спецификация Tinygrad ограничивает REDUCE_AXIS до `{Add, Mul, Max}`. Morok расширяет это добавлением `Min`.
 
-**Example:**
+**Пример:**
 ```text
 REDUCE(Add)
 ├── MUL                      — value to accumulate
@@ -133,7 +135,7 @@ REDUCE(Add)
     └── CONST(64)
 ```
 
-### ALLREDUCE — Cross-Device Reduction
+### ALLREDUCE — редукция между устройствами
 
 ```rust
 AllReduce {
@@ -143,13 +145,13 @@ AllReduce {
 }
 ```
 
-Performs distributed reduction across multiple devices. Used for multi-GPU training.
+Выполняет распределённую редукцию между несколькими устройствами. Используется для мульти-GPU обучения.
 
 ---
 
-## Buffer Operations
+## Операции с буферами
 
-### BUFFER — Buffer Declaration
+### BUFFER — объявление буфера
 
 ```rust
 Buffer {
@@ -159,9 +161,9 @@ Buffer {
 }
 ```
 
-Declares a buffer for tensor storage. The `unique` field ensures distinct buffers even with identical size/device.
+Объявляет буфер для хранения данных тензора. Поле `unique` гарантирует различимость буферов даже при одинаковых размере и устройстве.
 
-### BUFFERIZE — Materialization Marker
+### BUFFERIZE — маркер материализации
 
 ```rust
 Bufferize {
@@ -171,16 +173,16 @@ Bufferize {
 }
 ```
 
-Marks where computation should materialize to memory. Triggers kernel splitting.
+Отмечает место, где вычисление должно материализоваться в память. Триггерит разделение на ядра.
 
 **BufferizeOpts:**
 
-| Field | Type | Purpose |
-|-------|------|---------|
-| `device` | `Option<DeviceSpec>` | Target device, `None` for local |
-| `addrspace` | `AddrSpace` | `Global` (device) or `Local` (shared) |
+| Поле | Тип | Назначение |
+|------|-----|------------|
+| `device` | `Option<DeviceSpec>` | Целевое устройство, `None` для локального |
+| `addrspace` | `AddrSpace` | `Global` (устройство) или `Local` (shared) |
 
-**Example:**
+**Пример:**
 ```text
 BUFFERIZE(opts={addrspace=Global})
 ├── REDUCE(Add, ...)         — computation
@@ -188,7 +190,7 @@ BUFFERIZE(opts={addrspace=Global})
 └── RANGE(R1, Global)        — output dim 1
 ```
 
-### INDEX — Multi-Dimensional Buffer Access
+### INDEX — многомерный доступ к буферу
 
 ```rust
 Index {
@@ -198,9 +200,9 @@ Index {
 }
 ```
 
-Computes memory address from multi-dimensional indices. Returns element dtype (not pointer).
+Вычисляет адрес в памяти из многомерных индексов. Возвращает DType элемента (не указатель).
 
-**Example:**
+**Пример:**
 ```text
 INDEX : Float32
 ├── DEFINE_GLOBAL(0)
@@ -209,7 +211,7 @@ INDEX : Float32
 └── MUL(...)                 — index for dim 2
 ```
 
-### POINTER_INDEX — Low-Level Pointer Arithmetic
+### POINTER_INDEX — низкоуровневая арифметика указателей
 
 ```rust
 PointerIndex {
@@ -218,22 +220,23 @@ PointerIndex {
 }
 ```
 
-Direct pointer arithmetic. Used after linearization when indices are flattened.
+Прямая арифметика указателей. Используется после линеаризации, когда индексы уже свёрнуты в линейные.
 
-> **Compatibility:** Tinygrad uses `INDEX` with a `ptr=True` flag instead of a separate operation.
+> **Совместимость:** Tinygrad использует `INDEX` с флагом `ptr=True` вместо отдельной операции.
 
-### LOAD — Memory Read
+### LOAD — чтение из памяти
 
 ```rust
 Load {
     buffer: Arc<UOp>,        // buffer or pointer
     index: Arc<UOp>,         // INDEX op
+    alt: Option<Arc<UOp>>,   // alternative value for gated loads
 }
 ```
 
-Read value from buffer at index. For gated loads, use an INDEX with a gate (INDEX has an optional `gate` field).
+Читает значение из буфера по индексу. Для gated loads поле `alt` задаёт значение при ложном условии INDEX-а (позволяет полностью избежать обращения к памяти).
 
-**Example:**
+**Пример:**
 ```text
 LOAD : Float32
 ├── DEFINE_GLOBAL(1)
@@ -243,28 +246,26 @@ LOAD : Float32
     └── RANGE(R2)
 ```
 
-### STORE — Memory Write
+### STORE — запись в память
 
 ```rust
 Store {
-    buffer: Arc<UOp>,                   // output buffer
-    index: Arc<UOp>,                    // INDEX op
+    index: Arc<UOp>,                    // INDEX op (buffer accessed via index.src[0])
     value: Arc<UOp>,                    // value to write
     ranges: SmallVec<[Arc<UOp>; 4]>,    // ranges being closed
 }
 ```
 
-Write value to buffer. STORE closes the specified ranges, which represent output iteration dimensions. The ranges field is used for output upcasting: when a `Range(Upcast)` is included, it becomes `UNROLL` during expansion, then contracted via `CONTRACT`.
+Записывает значение в буфер. Буфер доступен через INDEX-узел (через `index.src[0]`), а не через отдельное поле. STORE закрывает указанные RANGE, которые представляют выходные измерения итерации. Поле ranges используется для output upcasting: когда включён `Range(Upcast)`, он становится `UNROLL` при расширении, а затем сжимается через `CONTRACT`.
 
-For gated stores, use an INDEX with a gate (INDEX has an optional `gate` field).
+Для условной записи используйте INDEX с gate (у INDEX есть опциональное поле `gate`).
 
-> **Compatibility:** Morok's STORE has an explicit `index` field (sources: buffer=0, index=1, value=2, ranges=3+). Tinygrad's STORE combines buffer and value differently (range_start=2).
+> **Совместимость:** У STORE в Morok нет отдельного поля `buffer` — источники: index=0, value=1, ranges=2+ (range_start=2). Устройство Tinygrad аналогично.
 
-**Example:**
+**Пример:**
 ```text
 STORE
-├── DEFINE_GLOBAL(0)         — output buffer
-├── INDEX[R0, R1]            — write address
+├── INDEX[R0, R1]            — write address (buffer via index.src[0])
 ├── REDUCE(Add, ...)         — value
 ├── RANGE(R0, Global)        — output dim 0 (closed)
 └── RANGE(R1, Global)        — output dim 1 (closed)
@@ -272,9 +273,9 @@ STORE
 
 ---
 
-## Kernel Structure
+## Структура ядра
 
-### KERNEL — Kernel Wrapper
+### KERNEL — обёртка ядра
 
 ```rust
 Kernel {
@@ -283,9 +284,9 @@ Kernel {
 }
 ```
 
-Wraps a complete kernel for code generation. Sources are kernel arguments (`DefineGlobal`, `DefineLocal`, `DefineVar`).
+Оборачивает готовое ядро для кодогенерации. Источники — аргументы ядра (`DefineGlobal`, `DefineLocal`, `DefineVar`).
 
-**Example:**
+**Пример:**
 ```text
 KERNEL
 ├── DEFINE_GLOBAL(0)         — output buffer arg
@@ -295,7 +296,7 @@ KERNEL
     └── STORE(...)
 ```
 
-### SINK — Multiple Root Collector
+### SINK — коллектор нескольких корней
 
 ```rust
 Sink {
@@ -303,9 +304,9 @@ Sink {
 }
 ```
 
-Collects multiple outputs into a single root. Every kernel's `ast` is typically a SINK containing STORE operations.
+Собирает несколько выходов в один корень. `ast` каждого ядра — как правило, SINK, содержащий операции STORE.
 
-**Example:**
+**Пример:**
 ```text
 SINK
 ├── STORE(output_0, ...)
@@ -313,7 +314,7 @@ SINK
 └── STORE(output_2, ...)
 ```
 
-### AFTER — Dependency Marker
+### AFTER — маркер зависимости
 
 ```rust
 After {
@@ -322,9 +323,9 @@ After {
 }
 ```
 
-Expresses execution dependencies between kernels without data dependency. The `passthrough` value is returned unchanged, but only after all `deps` complete.
+Выражает зависимости выполнения между ядрами без data dependency. Значение `passthrough` возвращается без изменений, но только после завершения всех `deps`.
 
-**Example:**
+**Пример:**
 ```text
 SINK
 ├── AFTER
@@ -333,7 +334,7 @@ SINK
 └── KERNEL(...)              — can use buffer after AFTER
 ```
 
-### BARRIER — Synchronization Fence
+### BARRIER — барьер синхронизации
 
 ```rust
 Barrier {
@@ -342,13 +343,13 @@ Barrier {
 }
 ```
 
-GPU workgroup synchronization. Ensures all threads in a workgroup reach the barrier before continuing.
+Синхронизация GPU-воркгруппы. Гарантирует, что все потоки в воркгруппе достигли барьера, прежде чем продолжить.
 
 ---
 
-## Vector Operations
+## Векторные операции
 
-### VECTORIZE — Create Vector from Scalars
+### VECTORIZE — создание вектора из скаляров
 
 ```rust
 Vectorize {
@@ -356,9 +357,9 @@ Vectorize {
 }
 ```
 
-Combines N scalar values into a vector of size N. All elements must have the same base dtype.
+Комбинирует N скалярных значений в вектор размера N. Все элементы должны иметь одинаковый базовый DType.
 
-**Example:**
+**Пример:**
 ```text
 VECTORIZE : <4 x Float32>
 ├── CONST(1.0)
@@ -367,7 +368,7 @@ VECTORIZE : <4 x Float32>
 └── CONST(4.0)
 ```
 
-### GEP — Get Element Pointer (Vector Extract)
+### GEP — Get Element Pointer (извлечение из вектора)
 
 ```rust
 Gep {
@@ -376,18 +377,18 @@ Gep {
 }
 ```
 
-Extracts elements from a vector:
-- Single index → scalar
-- Multiple indices → smaller vector
+Извлекает элементы из вектора:
+- Один индекс — скаляр
+- Несколько индексов — вектор меньшего размера
 
-**Example:**
+**Пример:**
 ```text
 GEP([0, 2]) : <2 x Float32>
 └── VECTORIZE : <4 x Float32>
     └── ...
 ```
 
-### VConst — Vector Constant
+### VConst — векторная константа
 
 ```rust
 VConst {
@@ -395,9 +396,9 @@ VConst {
 }
 ```
 
-Vector of compile-time constants. More efficient than `VECTORIZE` of `CONST` nodes.
+Вектор констант, известных на этапе компиляции. Эффективнее, чем `VECTORIZE` из `CONST`-узлов.
 
-### CAT — Concatenate Vectors
+### CAT — конкатенация векторов
 
 ```rust
 Cat {
@@ -405,16 +406,16 @@ Cat {
 }
 ```
 
-Concatenates vectors into a larger vector. Output `vcount` = sum of input `vcount`s.
+Конкатенирует векторы в вектор большего размера. `vcount` на выходе = сумма `vcount` входов.
 
-**Example:**
+**Пример:**
 ```text
 CAT : <8 x Float32>
 ├── VECTORIZE : <4 x Float32>
 └── VECTORIZE : <4 x Float32>
 ```
 
-### PtrCat — Concatenate Pointers
+### PtrCat — конкатенация указателей
 
 ```rust
 PtrCat {
@@ -422,13 +423,13 @@ PtrCat {
 }
 ```
 
-Groups memory accesses for vectorized load/store. Used by the devectorizer pass.
+Группирует обращения к памяти для векторизованного load/store. Используется проходом devectorizer.
 
 ---
 
-## Expansion: UNROLL and CONTRACT
+## Расширение: UNROLL и CONTRACT
 
-### UNROLL — Expand Computation Across Iterations
+### UNROLL — расширение вычисления по итерациям
 
 ```rust
 Unroll {
@@ -437,11 +438,11 @@ Unroll {
 }
 ```
 
-Creates multiple versions of computation for different iteration values. Used for loop unrolling optimization.
+Создаёт несколько версий вычисления для разных значений итерации. Используется для оптимизации развёртки циклов.
 
-**Example:** `UNROLL(unroll_axes=[(0, 4)])` expands computation 4 times with different index values.
+**Пример:** `UNROLL(unroll_axes=[(0, 4)])` расширяет вычисление 4 раза с разными значениями индекса.
 
-### CONTRACT — Collapse Unrolled Values to Vector
+### CONTRACT — свёртка развёрнутых значений в вектор
 
 ```rust
 Contract {
@@ -450,20 +451,20 @@ Contract {
 }
 ```
 
-The inverse of UNROLL—collects expanded scalar values into a vector. Output vector size = product of factors.
+Обратная операция к UNROLL — собирает расширенные скалярные значения в вектор. Размер выходного вектора = произведение множителей.
 
-**Example:**
+**Пример:**
 ```text
 CONTRACT(upcast_ranges=[(0, 4)]) : <4 x Float32>
 └── UNROLL(unroll_axes=[(0, 4)])
     └── LOAD(...)
 ```
 
-This pattern vectorizes a load: expand 4 iterations, then pack results into a 4-element vector.
+Этот паттерн векторизует загрузку: расширить 4 итерации, затем упаковать результаты в 4-элементный вектор.
 
 ---
 
-## Tensor Cores: WMMA
+## Тензорные ядра: WMMA
 
 ### WMMA — Warp Matrix Multiply-Accumulate
 
@@ -476,22 +477,23 @@ Wmma {
 }
 ```
 
-Hardware tensor core operation: `D = A × B + C`. Requires specific matrix shapes and data layouts.
+Аппаратная операция тензорного ядра: `D = A * B + C`. Требует конкретных форм матриц и раскладок данных.
 
-**WmmaMetadata Fields:**
+**Поля WmmaMetadata:**
 
-| Field | Type | Purpose |
-|-------|------|---------|
-| `name` | `String` | Instruction name (e.g., `"__hmma..."`) |
-| `dims` | `(N, M, K)` | Matrix dimensions (e.g., `(16, 16, 16)`) |
-| `dtype_in` | `DType` | Input matrix precision (e.g., `Float16`) |
-| `dtype_out` | `DType` | Output precision (e.g., `Float32`) |
-| `device` | `String` | Target device string |
-| `threads` | `usize` | Threads per warp (typically 32) |
-| `upcast_axes` | `Vec<(usize, usize)>` | Vectorization for output |
-| `reduce_axes` | `Vec<(usize, usize)>` | Contraction axes |
+| Поле | Тип | Назначение |
+|------|-----|------------|
+| `name` | `String` | Имя инструкции (например, `"__hmma..."`) |
+| `dims` | `(N, M, K)` | Размерности матриц (например, `(16, 16, 16)`) |
+| `dtype_in` | `DType` | Точность входных матриц (например, `Float16`) |
+| `dtype_out` | `DType` | Точность выхода (например, `Float32`) |
+| `device` | `String` | Строка целевого устройства |
+| `threads` | `usize` | Потоков на warp (обычно 32) |
+| `upcast_axes` | `WmmaUpcastAxes` | Векторизация для каждого операнда (поля: `a`, `b`, `c`) |
+| `reduce_axes` | `Vec<(usize, usize)>` | Оси свёртки |
+| `tile_grid` | `(usize, usize)` | Грид для мульти-FMA батчинга (по умолчанию (1,1)) |
 
-**Example:**
+**Пример:**
 ```text
 WMMA(dims=(16, 16, 16), dtype_in=Float16, dtype_out=Float32)
 ├── A fragment : <8 x Float16>
@@ -501,9 +503,9 @@ WMMA(dims=(16, 16, 16), dtype_in=Float16, dtype_out=Float32)
 
 ---
 
-## Control Flow
+## Управление потоком выполнения
 
-### IF / ENDIF — Conditional Execution
+### IF / ENDIF — условное выполнение
 
 ```rust
 If {
@@ -516,9 +518,9 @@ EndIf {
 }
 ```
 
-Execute body only when condition is true. Used for boundary checks and sparse operations.
+Выполнить тело, только если условие истинно. Используется для проверок границ и разреженных операций.
 
-**Example:**
+**Пример:**
 ```text
 IF
 ├── LT(idx, bound)           — condition (src[0])
@@ -531,25 +533,25 @@ ENDIF
 
 ---
 
-## Definition Operations
+## Операции определения
 
-### DEFINE_GLOBAL — Device Memory Argument
+### DEFINE_GLOBAL — аргумент в памяти устройства
 
 ```rust
 DefineGlobal(usize)          // argument index
 ```
 
-Kernel argument for device (global) memory. Index refers to position in kernel argument list.
+Аргумент ядра для глобальной (device) памяти. Индекс указывает на позицию в списке аргументов ядра.
 
-### DEFINE_LOCAL — Shared Memory Allocation
+### DEFINE_LOCAL — аллокация shared-памяти
 
 ```rust
 DefineLocal(usize)           // local memory index
 ```
 
-GPU shared memory (LDS) allocation. Visible within a workgroup.
+Аллокация GPU shared memory (LDS). Видна внутри воркгруппы.
 
-### DEFINE_VAR — Symbolic Runtime Variable
+### DEFINE_VAR — символическая рантайм-переменная
 
 ```rust
 DefineVar {
@@ -559,24 +561,25 @@ DefineVar {
 }
 ```
 
-Runtime variable with known bounds. Used for dynamic shapes where bounds are known.
+Рантайм-переменная с известными границами. Используется для динамических форм, когда границы известны.
 
-**Example:**
+**Пример:**
 ```text
 DEFINE_VAR(name="batch_size", min=1, max=128) : Index
 ```
 
-### DEFINE_REG — Register Allocation
+### DEFINE_REG — аллокация регистра
 
 ```rust
 DefineReg {
     size: usize,             // register size
+    id: usize,               // unique accumulator ID
 }
 ```
 
-Allocates a register for intermediate storage. Used in code generation.
+Аллоцирует регистр для промежуточного хранения. Поле `id` различает регистры одного DType — без него два reduce с одинаковым DType разделили бы один DEFINE_REG через hash consing. Используется в кодогенерации.
 
-### BIND — Variable Binding
+### BIND — привязка переменной
 
 ```rust
 Bind {
@@ -585,13 +588,13 @@ Bind {
 }
 ```
 
-Binds a symbolic variable to a concrete value at runtime.
+Привязывает символическую переменную к конкретному значению в рантайме.
 
 ---
 
-## Special Operations
+## Специальные операции
 
-### SPECIAL — Hardware-Provided Values
+### SPECIAL — аппаратные значения
 
 ```rust
 Special {
@@ -600,46 +603,46 @@ Special {
 }
 ```
 
-Accesses hardware-provided values (thread/block indices). Not a loop—the hardware provides the value directly.
+Доступ к значениям, предоставляемым аппаратурой (индексы потоков/блоков). Это не цикл — значение даётся напрямую оборудованием.
 
-**Example:**
+**Пример:**
 ```text
 SPECIAL(name="blockIdx.x", end=128) : Index
 └── CONST(128)
 ```
 
-### UNIQUE — Identity Marker
+### UNIQUE — маркер идентичности
 
 ```rust
 Unique(usize)                // unique identifier
 ```
 
-Creates a unique identity for buffer disambiguation. Two buffers with different UNIQUE values are distinct even if otherwise identical.
+Создаёт уникальную идентичность для различения буферов. Два буфера с разными UNIQUE-значениями различимы, даже если в остальном идентичны.
 
-### DEVICE — Device Specification
+### DEVICE — спецификация устройства
 
 ```rust
 Device(DeviceSpec)           // device specification
 ```
 
-Specifies target device for computation.
+Указывает целевое устройство для вычисления.
 
 ---
 
-## Movement Operations
+## Операции перемещения (Movement)
 
-High-level tensor shape transformations. These are converted to explicit INDEX operations during rangeify.
+Высокоуровневые трансформации формы тензора. Преобразуются в явные INDEX-операции во время rangeify.
 
-| Operation | Signature | Purpose |
-|-----------|-----------|---------|
-| `Reshape` | `{ src, new_shape }` | Change shape, same elements |
-| `Permute` | `{ src, axes: Vec<usize> }` | Transpose/reorder axes |
-| `Expand` | `{ src, new_shape }` | Broadcast to larger shape |
-| `Pad` | `{ src, begin_pads, end_pads }` | Add padding |
-| `Shrink` | `{ src, begins, ends }` | Extract sub-region |
-| `Flip` | `{ src, axes: Vec<bool> }` | Reverse along axes |
+| Операция | Сигнатура | Назначение |
+|----------|-----------|------------|
+| `Reshape` | `{ src, new_shape }` | Изменить форму, те же элементы |
+| `Permute` | `{ src, axes: Vec<usize> }` | Транспонирование / перестановка осей |
+| `Expand` | `{ src, new_shape }` | Бродкаст до большей формы |
+| `Pad` | `{ src, begin_pads, end_pads }` | Добавить паддинг |
+| `Shrink` | `{ src, begins, ends }` | Извлечь подобласть |
+| `Flip` | `{ src, axes: Vec<bool> }` | Развернуть по осям |
 
-**Example:** RESHAPE
+**Пример:** RESHAPE
 ```text
 RESHAPE(new_shape=[6, 4]) : Shape[6, 4]
 ├── BUFFER[2, 3, 4] : Float32
@@ -648,44 +651,65 @@ RESHAPE(new_shape=[6, 4]) : Shape[6, 4]
 
 ---
 
-## Quick Reference
+## Дополнительные операции
 
-### By Category
+Следующие операции существуют в enum `Op`, но являются внутренними или редко встречаются при отладке:
 
-| Category | Operations |
+| Операция | Назначение |
 |----------|------------|
-| **Loop Control** | `RANGE`, `END` |
-| **Reduction** | `REDUCE_AXIS`, `REDUCE`, `ALLREDUCE` |
-| **Memory** | `BUFFER`, `BUFFERIZE`, `INDEX`, `POINTER_INDEX`, `LOAD`, `STORE` |
-| **Kernel** | `KERNEL`, `SINK`, `AFTER`, `BARRIER` |
-| **Vector** | `VECTORIZE`, `GEP`, `VCONST`, `CAT`, `PTRCAT` |
-| **Expansion** | `UNROLL`, `CONTRACT` |
-| **Hardware** | `WMMA`, `SPECIAL` |
-| **Control** | `IF`, `ENDIF` |
-| **Definition** | `DEFINE_GLOBAL`, `DEFINE_LOCAL`, `DEFINE_VAR`, `DEFINE_REG`, `BIND`, `UNIQUE`, `DEVICE` |
-| **Movement** | `RESHAPE`, `PERMUTE`, `EXPAND`, `PAD`, `SHRINK`, `FLIP` |
+| `Copy` | Явное копирование значения |
+| `BufferView` | View в существующий буфер со смещением/страйдом |
+| `MStack` | Аллокация стека в памяти |
+| `MSelect` | Выбор в памяти (условный доступ) |
+| `Multi` | Операция с множественными выходами |
+| `Assign` | Присваивание переменной |
+| `Group` | Группировка операций для планирования |
+| `Detach` | Отсоединение от графа (запрет оптимизации через узел) |
+| `Contiguous` | Хинт, что данные непрерывны |
+| `ContiguousBackward` | Обратный проход для хинта contiguous |
+| `Precast` | Предварительное приведение типа |
+| `Custom` / `CustomI` | Расширяемость пользовательскими операциями |
+
+---
+
+## Краткий справочник
+
+### По категориям
+
+| Категория | Операции |
+|-----------|----------|
+| **Управление циклами** | `RANGE`, `END` |
+| **Редукция** | `REDUCE_AXIS`, `REDUCE`, `ALLREDUCE` |
+| **Память** | `BUFFER`, `BUFFERIZE`, `INDEX`, `POINTER_INDEX`, `LOAD`, `STORE` |
+| **Ядро** | `KERNEL`, `SINK`, `AFTER`, `BARRIER` |
+| **Векторные** | `VECTORIZE`, `GEP`, `VCONST`, `CAT`, `PTRCAT` |
+| **Расширение** | `UNROLL`, `CONTRACT` |
+| **Аппаратные** | `WMMA`, `SPECIAL` |
+| **Управление** | `IF`, `ENDIF` |
+| **Определение** | `DEFINE_GLOBAL`, `DEFINE_LOCAL`, `DEFINE_VAR`, `DEFINE_REG`, `BIND`, `UNIQUE`, `DEVICE` |
+| **Перемещение** | `RESHAPE`, `PERMUTE`, `EXPAND`, `PAD`, `SHRINK`, `FLIP` |
 | **ALU** | `Unary(...)`, `Binary(...)`, `Ternary(...)`, `Cast`, `BitCast` |
 
-### Range-Ending Operations
+### Операции, закрывающие RANGE
 
-Operations that close RANGE scopes (remove ranges from active set):
+Операции, которые закрывают скоупы RANGE (убирают RANGE из активного набора):
 
-| Operation | Range Start Index |
-|-----------|-------------------|
+| Операция | Начальный индекс RANGE |
+|----------|------------------------|
 | `BUFFERIZE` | 1 (compute=0, ranges=1+) |
 | `REDUCE` | 1 (src=0, ranges=1+) |
-| `STORE` | 3 (buffer=0, index=1, value=2, ranges=3+) |
+| `STORE` | 2 (index=0, value=1, ranges=2+) |
 | `WMMA` | 3 (a=0, b=1, c=2) |
 | `END` | 1 (computation=0, ranges=1+) |
 
-### Expandable Operations
+### Расширяемые операции
 
-Operations that propagate UNROLL through the computation graph:
+Операции, через которые UNROLL пропагируется по графу вычислений:
 
 - ALU: `Unary`, `Binary`, `Ternary`
-- Type: `Cast`, `BitCast`
-- Vector: `Gep`, `Vectorize`
-- Memory: `Load`, `Store`, `Index`, `PointerIndex`
-- Control: `Reduce`, `End`, `After`
-- Buffer: `Bufferize`
-- Hardware: `Wmma`
+- Типы: `Cast`, `BitCast`
+- Векторные: `Gep`, `Vectorize`
+- Память: `Load`, `Store`, `Index`, `PointerIndex`
+- Управление: `Reduce`, `End`, `After`
+- Буферы: `Bufferize`
+- Аппаратные: `Wmma`

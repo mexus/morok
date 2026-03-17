@@ -1,31 +1,31 @@
 ---
-sidebar_label: ONNX Inference
+sidebar_label: ONNX 推理
 ---
 
-# ONNX Model Inference
+# ONNX 模型推理
 
-Morok's ONNX importer is the recommended way to run model inference. It loads standard `.onnx` files, decomposes operators into Morok's lazy tensor operations, and compiles them through the full optimization pipeline — no C++ runtime required.
+Morok 的 ONNX 导入器是运行模型推理的推荐方式。它加载标准的 `.onnx` 文件，将算子分解为 Morok 的惰性张量操作，并通过完整的优化流水线编译执行——无需 C++ 运行时。
 
-**Current status:**
+**当前状态：**
 
-| Capability | Status |
-|------------|--------|
-| Forward inference | Supported |
-| 162 / 200 ONNX operators | [Parity details](https://github.com/patsak/morok/blob/main/onnx/PARITY.md) |
-| CNN architectures (ResNet, DenseNet, VGG, ...) | 9 models validated |
-| Microsoft extensions (Attention, RotaryEmbedding) | Supported |
-| Dynamic batch size | Planned for next release |
-| Training / backward pass | Not supported |
+| 能力 | 状态 |
+|------|------|
+| 前向推理 | 已支持 |
+| 162 / 200 个 ONNX 算子 | [算子对齐详情](https://github.com/patsak/morok/blob/main/onnx/PARITY.md) |
+| CNN 架构（ResNet、DenseNet、VGG 等） | 已验证 9 个模型 |
+| Microsoft 扩展（Attention、RotaryEmbedding） | 已支持 |
+| 动态批大小 | 计划在下一版本中支持 |
+| 训练 / 反向传播 | 不支持 |
 
-**How does Morok compare to other Rust ML frameworks?**
+**与其他框架的比较**
 
-Among pure-Rust frameworks, Morok offers the broadest ONNX operator coverage — 162 operators with 1361 passing conformance tests across dual backends (Clang + LLVM). `candle` and `burn` each support fewer operators and lack conformance test suites of comparable scope. That said, if you need maximum compatibility with production ONNX models, use `ort` — a Rust wrapper around the C++ ONNX Runtime — which covers the full ONNX spec.
+在纯 Rust 框架中，Morok 的 ONNX 算子覆盖面最广——162 个算子，双后端（Clang + LLVM）上通过 1361 项一致性测试。`candle` 和 `burn` 支持的算子更少，也没有同等规模的测试套件。如果需要与生产环境 ONNX 模型的最大兼容性，用 `ort`——C++ ONNX Runtime 的 Rust 封装，覆盖完整的 ONNX 规范。
 
 ---
 
-## Quick Start
+## 快速开始
 
-Add `morok-onnx` and `morok-tensor` to your `Cargo.toml`:
+在你的 `Cargo.toml` 中添加 `morok-onnx` 和 `morok-tensor`：
 
 ```toml
 [dependencies]
@@ -33,9 +33,9 @@ morok-onnx = { git = "https://github.com/patsak/morok" }
 morok-tensor = { git = "https://github.com/patsak/morok" }
 ```
 
-### Simple: All-Initializer Models
+### 简单用法：全初始化器模型
 
-For models where all inputs are baked into the file (no runtime inputs):
+对于所有输入都内嵌在文件中（无运行时输入）的模型：
 
 ```rust
 use morok_onnx::OnnxImporter;
@@ -53,9 +53,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-### Two-Phase: Models with Runtime Inputs
+### 两阶段用法：带运行时输入的模型
 
-Most models need runtime data (images, tokens, audio). The two-phase API separates graph preparation from execution:
+大多数模型需要运行时数据（图像、token、音频）。两阶段 API 将图构建与执行分离：
 
 ```rust
 use morok_onnx::OnnxImporter;
@@ -80,19 +80,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-The `prepare()` / `trace()` split exists because graph structure is static — you parse it once and can trace multiple times with different dimension bindings or input data.
+`prepare()` / `trace()` 的分离设计是因为图结构是静态的——你只需解析一次，就可以使用不同的维度绑定或输入数据多次 trace。
 
 ---
 
-## Architecture
+## 架构
 
-### Two-Phase Design
+### 两阶段设计
 
-The importer processes ONNX models in two distinct phases:
+导入器分两个阶段处理 ONNX 模型：
 
-**Phase 1 — `prepare()`:** Extracts graph topology without executing anything. Parses the protobuf, separates initializers (weights) from runtime inputs, records opset versions, and pre-parses control flow subgraphs. Returns an `OnnxGraph` — a lightweight structure you can inspect before committing to execution.
+**阶段一 — `prepare()`：** 提取图拓扑结构，不执行任何计算。解析 protobuf，将初始化器（权重）与运行时输入分离，记录 opset 版本，并预解析控制流子图。返回 `OnnxGraph`——一个轻量级结构，可以在执行前检查。
 
-**Phase 2 — `trace()`:** Walks the graph in topological order, dispatching each ONNX node to its Tensor implementation. This builds Morok's lazy computation DAG — no actual math happens yet. The result is a set of `Tensor` handles that, when `realize()`'d, compile and execute through the full pipeline.
+**阶段二 — `trace()`：** 按拓扑顺序遍历图，将每个 ONNX 节点分派给对应的 Tensor 实现。这将构建 Morok 的惰性计算 DAG——此时不会进行实际计算。结果是一组 `Tensor` 句柄，当调用 `realize()` 时，才会编译并通过完整流水线执行。
 
 ```text
 model.onnx → prepare() → OnnxGraph → trace() → lazy Tensors → realize() → results
@@ -103,16 +103,16 @@ model.onnx → prepare() → OnnxGraph → trace() → lazy Tensors → realize(
           Inspect inputs/outputs    Pass to optimizer/codegen
 ```
 
-This separation enables several patterns:
-- **Inspect before executing:** Check input shapes and dtypes before allocating anything
-- **Multiple traces:** Re-trace with different dynamic dimension bindings
-- **External weights:** Load weights separately (useful for models with external data files)
+这样做有几个好处：
+- **执行前检查：** 在分配任何资源之前检查输入形状和 DType
+- **多次 trace：** 使用不同的动态维度绑定重新 trace
+- **外部权重：** 单独加载权重（适用于带有外部数据文件的模型）
 
-### Operator Decomposition
+### 算子分解
 
-Every ONNX operator is decomposed into Morok Tensor operations. The complexity varies:
+每个 ONNX 算子都会分解为 Morok Tensor 操作，复杂程度不一：
 
-**Direct mappings** — about 60 operators map 1:1 to a tensor method:
+**直接映射** — 约 60 个算子与 tensor 方法一一对应：
 
 ```rust
 // In the registry:
@@ -122,7 +122,7 @@ Every ONNX operator is decomposed into Morok Tensor operations. The complexity v
 "Equal" => x.try_eq(y)?
 ```
 
-**Builder patterns** — complex operators with many optional parameters use fluent APIs:
+**Builder 模式** — 带有多个可选参数的复杂算子使用流式 API：
 
 ```rust
 // Conv with optional bias, padding, dilation, groups
@@ -135,7 +135,7 @@ x.conv()
     .call()?
 ```
 
-**Multi-step decompositions** — operators like BatchNormalization, Attention, and Mod require intermediate computations. For example, Python-style integer `Mod` decomposes into truncation mod + sign adjustment:
+**多步分解** — BatchNormalization、Attention 和 Mod 等算子需要中间计算。例如，Python 风格的整数 `Mod` 被分解为截断取模 + 符号调整：
 
 ```rust
 let trunc_mod = x.try_mod(y)?;
@@ -144,21 +144,21 @@ let needs_adj = mod_ne_zero.bitwise_and(&signs_differ)?;
 trunc_mod.try_add(&y.where_(&needs_adj, &zero)?)?
 ```
 
-### Attribute Validation
+### 属性验证
 
-The `Attrs` helper uses pop-based extraction — each call to `attrs.int("axis", -1)` or `attrs.float("epsilon", 1e-5)` removes the attribute from the map. After the operator finishes, `attrs.done()` asserts the map is empty. Any leftover attributes trigger an error, catching incomplete operator implementations at trace time rather than producing silent wrong results.
+`Attrs` 辅助工具使用弹出式提取——每次调用 `attrs.int("axis", -1)` 或 `attrs.float("epsilon", 1e-5)` 都会从映射中移除该属性。算子处理完成后，`attrs.done()` 断言映射为空。任何剩余属性都会触发错误，在 trace 时捕获不完整的算子实现，而不是产生静默的错误结果。
 
-### Opset Versioning
+### Opset 版本管理
 
-ONNX models declare opset imports per domain. The importer tracks these and passes the version to each operator handler. Operators switch behavior based on version — for example, `Softmax`'s default axis changed from `1` (opset < 13) to `-1` (opset >= 13), and `ReduceSum` moved its axes from an attribute to an input tensor at opset 13.
+ONNX 模型按域声明 opset 导入。导入器跟踪这些信息并将版本传递给每个算子处理器。算子根据版本切换行为——例如，`Softmax` 的默认轴从 `1`（opset < 13）变为 `-1`（opset >= 13），而 `ReduceSum` 在 opset 13 时将其轴从属性移至输入张量。
 
 ---
 
-## Working with Models
+## 使用模型
 
-### Dynamic Dimensions
+### 动态维度
 
-ONNX inputs can have symbolic dimensions like `"batch_size"` or `"sequence_length"`. Bind them at trace time:
+ONNX 输入可以有符号维度，如 `"batch_size"` 或 `"sequence_length"`。在 trace 时绑定它们：
 
 ```rust
 let graph = importer.prepare(model)?;
@@ -170,7 +170,7 @@ let (inputs, outputs) = importer.trace_with_dims(
 )?;
 ```
 
-Unbound dynamic dimensions cause a clear error at trace time. You can inspect which dimensions are dynamic via `InputSpec::shape`:
+未绑定的动态维度会在 trace 时产生明确的错误。你可以通过 `InputSpec::shape` 检查哪些维度是动态的：
 
 ```rust
 for (name, spec) in &graph.inputs {
@@ -183,9 +183,9 @@ for (name, spec) in &graph.inputs {
 }
 ```
 
-### External Weights
+### 外部权重
 
-Some ONNX models store weights in separate files. Use `trace_external()` to provide them:
+一些 ONNX 模型将权重存储在单独的文件中。使用 `trace_external()` 来提供它们：
 
 ```rust
 let (inputs, outputs) = importer.trace_external(
@@ -194,79 +194,79 @@ let (inputs, outputs) = importer.trace_external(
 )?;
 ```
 
-### Microsoft Extensions
+### Microsoft 扩展
 
-The importer supports several `com.microsoft` contrib operators commonly found in transformer models exported from ONNX Runtime:
+导入器支持多个 `com.microsoft` 贡献算子，这些算子常见于从 ONNX Runtime 导出的 transformer 模型中：
 
-| Extension | What it does |
-|-----------|-------------|
-| `Attention` | Packed QKV projection with masking, past KV cache |
-| `RotaryEmbedding` | Rotary positional embeddings (interleaved/non-interleaved) |
-| `SkipLayerNormalization` | Fused residual + LayerNorm + scale |
-| `EmbedLayerNormalization` | Token + position + segment embeddings → LayerNorm |
+| 扩展 | 功能说明 |
+|------|---------|
+| `Attention` | 打包的 QKV 投影，支持掩码和历史 KV cache |
+| `RotaryEmbedding` | 旋转位置编码（交错/非交错） |
+| `SkipLayerNormalization` | 融合的残差 + LayerNorm + 缩放 |
+| `EmbedLayerNormalization` | Token + 位置 + 段落嵌入 → LayerNorm |
 
-Standard ONNX transformer operators (`Attention` from the ai.onnx domain) are also supported with grouped query attention (GQA), causal masking, past KV caching, and softcap.
+标准 ONNX transformer 算子（ai.onnx 域的 `Attention`）同样支持，包括分组查询注意力（GQA）、因果掩码、历史 KV cache 和 softcap。
 
 ---
 
-## Control Flow and Limitations
+## 控制流与局限性
 
-### Semantic If: Both Branches Always Execute
+### 语义 If：两个分支始终执行
 
-ONNX's `If` operator has data-dependent control flow — the condition determines which branch runs. Morok's lazy evaluation model is fundamentally incompatible with this: since nothing executes at trace time, the condition value is unknown.
+ONNX 的 `If` 算子具有数据依赖的控制流——条件决定执行哪个分支。Morok 的惰性求值模型与此从根本上不兼容：由于 trace 时不执行任何计算，条件值是未知的。
 
-**Morok's solution:** Trace *both* branches, then merge results with `Tensor::where_()`:
+**Morok 的解决方案：** 同时 trace *两个*分支，然后使用 `Tensor::where_()` 合并结果：
 
 ```text
 ONNX:    if condition { then_branch } else { else_branch }
 Morok:   then_result.where_(&condition, &else_result)
 ```
 
-This enables **trace-once, run-many** — the compiled graph handles any condition value at runtime. But it has a hard constraint: **both branches must produce identical output shapes and dtypes.** Models with shape-polymorphic branches (where the then-branch produces `[3, 4]` and the else-branch produces `[5, 6]`) cannot be traced.
+这实现了**一次 trace，多次运行**——编译后的图在运行时可以处理任何条件值。但它有一个硬性约束：**两个分支必须产生相同的输出形状和 DType。** 形状多态的模型（即 then 分支产生 `[3, 4]` 而 else 分支产生 `[5, 6]`）无法 trace。
 
-In practice, most ONNX models with `If` nodes satisfy this constraint because they use conditional logic for value selection, not shape-changing control flow.
+在实践中，大多数带有 `If` 节点的 ONNX 模型都满足此约束，因为它们使用条件逻辑进行值选择，而非改变形状的控制流。
 
-### No Loop or Scan
+### 不支持 Loop 和 Scan
 
-Iterative control flow (`Loop`, `Scan`) is not implemented. These operators require repeated tracing or unrolling, which conflicts with the single-trace architecture. Models using recurrent patterns typically work via unrolled operators (LSTM, GRU, RNN are implemented as native ops).
+迭代控制流（`Loop`、`Scan`）尚未实现。这些算子需要重复 trace 或展开，这与单次 trace 架构冲突。使用循环模式的模型通常通过展开的算子工作（LSTM、GRU、RNN 已作为原生算子实现）。
 
-### No Batching (Yet)
+### 不支持批处理（暂时）
 
-Dynamic batching — running inference on multiple inputs simultaneously — is planned for the next release. Currently, batch dimensions must be bound to a fixed value at trace time via `trace_with_dims()`.
+动态批处理——同时对多个输入运行推理——计划在下一版本中支持。目前，批维度必须通过 `trace_with_dims()` 在 trace 时绑定到固定值。
 
-### No Training
+### 不支持训练
 
-The importer is inference-only. There is no backward pass, gradient computation, or optimizer support.
+导入器仅支持推理。没有反向传播、梯度计算或优化器支持。
 
-### Missing Operator Categories
+### 缺失的算子类别
 
-| Category | Examples | Why |
-|----------|----------|-----|
-| Quantization | DequantizeLinear, QuantizeLinear | Requires quantized dtype support in IR |
-| Sequence ops | SequenceConstruct, SequenceAt | Non-tensor types not in Morok's type system |
-| Random | RandomNormal, RandomUniform | Stateful RNG not yet implemented |
-| Signal processing | DFT, STFT, MelWeightMatrix | Low priority; niche use cases |
-| Text | StringNormalizer, TfIdfVectorizer | String types not supported |
+| 类别 | 示例 | 原因 |
+|------|------|------|
+| 量化 | DequantizeLinear、QuantizeLinear | 需要 IR 中的量化 DType 支持 |
+| 序列操作 | SequenceConstruct、SequenceAt | 非张量类型不在 Morok 的类型系统中 |
+| 随机数 | RandomNormal、RandomUniform | 有状态 RNG 尚未实现 |
+| 信号处理 | DFT、STFT、MelWeightMatrix | 低优先级；小众用例 |
+| 文本 | StringNormalizer、TfIdfVectorizer | 不支持字符串类型 |
 
-For models using these operators, consider `ort` (ONNX Runtime wrapper) which covers the full spec.
+用到这些算子的模型，可以用 `ort`（ONNX Runtime 封装），它覆盖完整规范。
 
 ---
 
-## Debugging
+## 调试
 
-### Per-Node Output Tracing
+### 逐节点输出追踪
 
-Set the trace log level to dump intermediate outputs:
+设置 trace 日志级别以输出中间结果：
 
 ```bash
 RUST_LOG=morok_onnx::importer=trace cargo run
 ```
 
-This realizes each node's output individually and prints the first 5 values — useful for numerical bisection when a model produces wrong results. Note that this breaks kernel fusion (each node runs separately), so it's purely a debugging tool.
+这会逐个 realize 每个节点的输出并打印前 5 个值——模型输出有误时可以用来做数值二分。注意这会破坏内核融合（每个节点单独运行），纯粹是调试用途。
 
-### Inspecting the Graph
+### 检查图结构
 
-Use the `OnnxGraph` structure to understand what a model needs before tracing:
+trace 之前，用 `OnnxGraph` 看看模型需要什么：
 
 ```rust
 let graph = importer.prepare(model)?;
@@ -283,17 +283,17 @@ println!("Initializers: {}", graph.initializers.len());
 
 ---
 
-## Summary
+## 总结
 
-| Aspect | Detail |
-|--------|--------|
-| **Entry point** | `OnnxImporter::new()` |
-| **Simple import** | `importer.import_path("model.onnx")?` |
-| **Two-phase** | `prepare()` → `trace()` / `trace_with_dims()` |
-| **Operators** | 162 / 200 ([full parity table](https://github.com/patsak/morok/blob/main/onnx/PARITY.md)) |
-| **Validated models** | ResNet50, DenseNet121, VGG19, Inception, AlexNet, ShuffleNet, SqueezeNet, ZFNet |
-| **Backends** | Clang + LLVM (identical results) |
-| **Extensions** | com.microsoft Attention, RotaryEmbedding, SkipLayerNorm, EmbedLayerNorm |
-| **Limitations** | No training, no batching (yet), no Loop/Scan, shape-polymorphic If |
+| 方面 | 详情 |
+|------|------|
+| **入口点** | `OnnxImporter::new()` |
+| **简单导入** | `importer.import_path("model.onnx")?` |
+| **两阶段** | `prepare()` → `trace()` / `trace_with_dims()` |
+| **算子** | 162 / 200（[完整对齐表](https://github.com/patsak/morok/blob/main/onnx/PARITY.md)） |
+| **已验证模型** | ResNet50、DenseNet121、VGG19、Inception、AlexNet、ShuffleNet、SqueezeNet、ZFNet |
+| **后端** | Clang + LLVM（结果一致） |
+| **扩展** | com.microsoft Attention、RotaryEmbedding、SkipLayerNorm、EmbedLayerNorm |
+| **局限性** | 不支持训练、不支持批处理（暂时）、不支持 Loop/Scan、形状多态的 If |
 
-**Next:** [Hands-On Examples](./examples) for tensor basics, or [Execution Pipeline](./architecture/pipeline) for how compilation works under the hood.
+**下一步：** [实践示例](./examples)——张量基础，或 [执行流水线](./architecture/pipeline)——了解编译是怎么跑的。

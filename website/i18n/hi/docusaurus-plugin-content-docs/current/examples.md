@@ -1,29 +1,29 @@
 ---
-sidebar_label: Hands-On Examples
+sidebar_label: प्रैक्टिकल उदाहरण
 ---
 
-# Hands-On: From Tensors to Models
+# प्रैक्टिकल: Tensor से मॉडल तक
 
-This chapter teaches Morok through progressive examples. You'll start with basic tensor operations and build up to a working neural network classifier.
+यह चैप्टर प्रोग्रेसिव उदाहरणों के ज़रिए Morok सिखाता है। आप बेसिक tensor ऑपरेशनों से शुरू करेंगे और एक काम करने वाले न्यूरल नेटवर्क क्लासिफ़ायर तक पहुँचेंगे।
 
-**What you'll learn:**
-- Creating and manipulating tensors
-- Shape operations (reshape, transpose, broadcast)
-- Matrix multiplication
-- Building reusable layers
-- Composing a complete model
+**आप क्या सीखेंगे:**
+- Tensor बनाना और मैनिपुलेट करना
+- Shape ऑपरेशन (reshape, transpose, broadcast)
+- मैट्रिक्स मल्टिप्लिकेशन
+- रीयूज़ेबल लेयर बनाना
+- एक पूरा मॉडल कम्पोज़ करना
 
-**Prerequisites:**
-- Basic Rust knowledge
-- Add `morok_tensor` to your `Cargo.toml`
+**पूर्व-आवश्यकताएँ:**
+- बेसिक Rust ज्ञान
+- अपनी `Cargo.toml` में `morok_tensor` जोड़ें
 
-**Key pattern:** Morok uses *lazy evaluation*. Operations build a computation graph without executing. Call `realize()` to compile and run everything at once.
+**मुख्य पैटर्न:** Morok *lazy evaluation* इस्तेमाल करता है। ऑपरेशन एक कम्प्यूटेशन ग्राफ़ बनाते हैं बिना एक्ज़ीक्यूट किए। `realize()` कॉल करें तो सब कुछ एक साथ कम्पाइल और रन होता है।
 
 ---
 
-## Example 1: Hello Tensor
+## उदाहरण 1: Hello Tensor
 
-Let's create tensors, perform operations, and get results.
+चलिए tensor बनाते हैं, ऑपरेशन करते हैं, और रिज़ल्ट लेते हैं।
 
 ```rust
 use morok_tensor::Tensor;
@@ -47,51 +47,52 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-**What's happening:**
+**क्या हो रहा है:**
 
-1. `Tensor::from_slice()` creates a tensor from a Rust slice. The `f32` suffix tells Rust the element type.
+1. `Tensor::from_slice()` array डेटा से 1D tensor बनाता है। `f32` सफ़िक्स Rust को एलिमेंट टाइप बताता है।
 
-2. `&a + &b` doesn't compute anything yet. It returns a new `Tensor` that *represents* the addition. The `&` borrows the tensors so we can reuse them.
+2. `&a + &b` अभी कुछ कम्प्यूट नहीं करता। यह एक नया `Tensor` रिटर्न करता है जो एडिशन को *रिप्रेज़ेंट* करता है। `&` tensor को बॉरो करता है ताकि हम उन्हें फिर से इस्तेमाल कर सकें।
 
-3. `realize()` is where the magic happens. Morok:
-   - Analyzes the computation graph
-   - Fuses operations where possible
-   - Generates optimized code
-   - Executes on the target device
+3. `realize()` वो जगह है जहाँ जादू होता है। Morok:
+   - कम्प्यूटेशन ग्राफ़ एनालाइज़ करता है
+   - जहाँ मुमकिन हो ऑपरेशन फ़्यूज़ करता है
+   - ऑप्टिमाइज़्ड कोड जनरेट करता है
+   - टारगेट डिवाइस पर एक्ज़ीक्यूट करता है
 
-4. `to_ndarray()` extracts the result as an `ndarray::ArrayD` for inspection.
+4. `to_ndarray()` रिज़ल्ट को `ndarray::ArrayD` के रूप में निकालता है ताकि आप देख सकें।
 
-**Try this:** Remove the `realize()` call. The code still runs, but `data` would be empty—nothing was computed.
+**यह करके देखें:** `realize()` कॉल हटा दें। कोड तब भी चलेगा, लेकिन `data` खाली होगा — कुछ भी कम्प्यूट नहीं हुआ।
 
 ---
 
-## Example 2: Shape Gymnastics
+## उदाहरण 2: Shape ट्रिक्स
 
-Neural networks constantly reshape data. Let's master the basics.
+न्यूरल नेटवर्क लगातार डेटा को reshape करते हैं। चलिए बेसिक्स सीखते हैं।
 
 ```rust
+use ndarray::array;
+
 fn shape_example() -> Result<(), Box<dyn std::error::Error>> {
     // Create a 1D tensor with 6 elements
     let data = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]);
-    println!("Original shape: {:?}", data.shape());  // [6]
+    println!("Original shape: {:?}", data.shape()?);  // [6]
 
-    // Reshape to a 2x3 matrix
-    let matrix = data.try_reshape(&[2, 3])?;
+    // Reshape to a 2x3 matrix (or create directly with from_ndarray)
+    let matrix = Tensor::from_ndarray(&array![[1.0f32, 2.0, 3.0], [4.0, 5.0, 6.0]]);
     println!("Matrix shape: {:?}", matrix.shape());  // [2, 3]
     // [[1, 2, 3],
     //  [4, 5, 6]]
 
     // Transpose to 3x2
     let transposed = matrix.try_transpose(0, 1)?;
-    println!("Transposed shape: {:?}", transposed.shape());  // [3, 2]
+    println!("Transposed shape: {:?}", transposed.shape()?);  // [3, 2]
     // [[1, 4],
     //  [2, 5],
     //  [3, 6]]
 
     // Broadcasting: add a row vector to every row
     // [3, 2] + [1, 2] → [3, 2]
-    let bias = Tensor::from_slice([100.0f32, 200.0])
-        .try_reshape(&[1, 2])?;
+    let bias = Tensor::from_ndarray(&array![[100.0f32, 200.0]]);
     let biased = &transposed + &bias;
 
     let result = biased.realize()?;
@@ -104,20 +105,20 @@ fn shape_example() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-**Key operations:**
+**मुख्य ऑपरेशन:**
 
-| Operation | What it does |
-|-----------|--------------|
-| `try_reshape(&[2, 3])` | Change shape (same total elements) |
-| `try_reshape(&[-1, 3])` | Infer dimension from total size |
-| `try_transpose(0, 1)` | Swap dimensions 0 and 1 |
-| `try_squeeze(dim)` | Remove dimension of size 1 |
-| `try_unsqueeze(dim)` | Add dimension of size 1 |
+| ऑपरेशन | क्या करता है |
+|---------|-------------|
+| `try_reshape(&[2, 3])` | Shape बदलें (कुल एलिमेंट समान रहें) |
+| `try_reshape(&[-1, 3])` | कुल साइज़ से डायमेंशन इन्फ़र करें |
+| `try_transpose(0, 1)` | डायमेंशन 0 और 1 को स्वैप करें |
+| `try_squeeze(dim)` | साइज़ 1 का डायमेंशन हटाएँ |
+| `try_unsqueeze(dim)` | साइज़ 1 का डायमेंशन जोड़ें |
 
-**Broadcasting rules** (same as NumPy/PyTorch):
-- Shapes align from the right
-- Each dimension must match or be 1
-- Dimensions of size 1 are "stretched" to match
+**Broadcasting नियम** (NumPy/PyTorch जैसे ही):
+- Shape दाईं ओर से अलाइन होती हैं
+- हर डायमेंशन मैच होना चाहिए या 1 होना चाहिए
+- साइज़ 1 वाले डायमेंशन मैच करने के लिए "स्ट्रेच" होते हैं
 
 ```text
 [3, 2] + [1, 2] → [3, 2]  ✓ (1 broadcasts to 3)
@@ -127,14 +128,14 @@ fn shape_example() -> Result<(), Box<dyn std::error::Error>> {
 
 ---
 
-## Example 3: Matrix Multiply
+## उदाहरण 3: मैट्रिक्स मल्टिप्लाई
 
-Matrix multiplication is the workhorse of neural networks. Every layer uses it.
+मैट्रिक्स मल्टिप्लिकेशन न्यूरल नेटवर्क का वर्कहॉर्स है। हर लेयर इसे इस्तेमाल करती है।
 
 ```rust
-fn matmul_example() -> Result<(), Box<dyn std::error::Error>> {
-    use ndarray::array;
+use ndarray::array;
 
+fn matmul_example() -> Result<(), Box<dyn std::error::Error>> {
     // Input: 4 samples, 3 features each → shape [4, 3]
     let input = Tensor::from_ndarray(&array![
         [1.0f32, 2.0, 3.0],    // sample 0
@@ -162,7 +163,7 @@ fn matmul_example() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-**Shape rules for `dot()`:**
+**`dot()` के Shape नियम:**
 
 | Left | Right | Result |
 |------|-------|--------|
@@ -171,49 +172,20 @@ fn matmul_example() -> Result<(), Box<dyn std::error::Error>> {
 | `[M, K]` | `[K]` | `[M]` (matrix-vector) |
 | `[B, M, K]` | `[B, K, N]` | `[B, M, N]` (batched) |
 
-The inner dimensions must match (the `K`). Think of it as: "for each row of left, dot product with each column of right."
+इनर डायमेंशन मैच होना चाहिए (`K`)। इसे ऐसे सोचें: "left की हर रो का right के हर कॉलम के साथ dot product।"
 
 ---
 
-## Example 4: Building a Linear Layer
+## उदाहरण 4: Linear लेयर बनाना
 
-A linear layer computes `y = x @ W.T + b`. Let's build one from scratch.
+एक linear लेयर `y = x @ W.T + b` कम्प्यूट करती है। Morok में `nn::Linear` बिल्ट-इन है।
 
 ```rust
-use morok_tensor::{Tensor, Error};
-
-struct Linear {
-    weight: Tensor,  // shape: [out_features, in_features]
-    bias: Tensor,    // shape: [out_features]
-}
-
-impl Linear {
-    fn new(in_features: usize, out_features: usize) -> Self {
-        // Simple initialization (real code would use proper random init)
-        let weight_data: Vec<f32> = (0..in_features * out_features)
-            .map(|i| (i as f32 * 0.1).sin() * 0.1)
-            .collect();
-        let bias_data = vec![0.0f32; out_features];
-
-        Self {
-            weight: Tensor::from_slice(weight_data)
-                .try_reshape(&[out_features as isize, in_features as isize])
-                .expect("reshape failed"),
-            bias: Tensor::from_slice(bias_data),
-        }
-    }
-
-    fn forward(&self, x: &Tensor) -> Result<Tensor, Error> {
-        // y = x @ W.T + b
-        let weight_t = self.weight.try_transpose(0, 1)?;
-        let out = x.dot(&weight_t)?;
-        Ok(&out + &self.bias)
-    }
-}
+use morok_tensor::{Tensor, nn::{Linear, Layer}};
 
 fn linear_example() -> Result<(), Box<dyn std::error::Error>> {
     // Create a layer: 4 inputs → 2 outputs
-    let layer = Linear::new(4, 2);
+    let layer = Linear::with_dims(4, 2, morok_dtype::DType::Float32);
 
     // Single sample with 4 features
     let input = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0]);
@@ -228,55 +200,28 @@ fn linear_example() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-**Why transpose the weights?**
+**Weights को transpose क्यों करते हैं?**
 
-PyTorch convention stores weights as `[out_features, in_features]`. For a layer mapping 4 → 2:
+PyTorch कन्वेंशन weights को `[out_features, in_features]` के रूप में स्टोर करता है। 4 → 2 मैपिंग वाली लेयर के लिए:
 - Weight shape: `[2, 4]`
-- Input shape: `[4]` or `[batch, 4]`
-- We need: `input @ weight.T` = `[batch, 4] @ [4, 2]` = `[batch, 2]`
+- Input shape: `[4]` या `[batch, 4]`
+- हमें चाहिए: `input @ weight.T` = `[batch, 4] @ [4, 2]` = `[batch, 2]`
 
-This convention makes it easy to read the weight matrix: row `i` contains all weights feeding into output `i`.
+यह कन्वेंशन weight मैट्रिक्स को पढ़ना आसान बनाता है: रो `i` में वो सभी weights होते हैं जो आउटपुट `i` में फ़ीड होते हैं।
 
 ---
 
-## Example 5: MNIST Classifier
+## उदाहरण 5: MNIST क्लासिफ़ायर
 
-Let's build a complete neural network that could classify handwritten digits.
+चलिए `sequential()` से लेयर चेन करके एक पूरा न्यूरल नेटवर्क बनाते हैं।
 
 ```rust
-/// Two-layer neural network for MNIST
-/// Architecture: 784 (28×28 pixels) → 128 (hidden) → 10 (digits)
-struct MnistNet {
-    fc1: Linear,
-    fc2: Linear,
-}
-
-impl MnistNet {
-    fn new() -> Self {
-        Self {
-            fc1: Linear::new(784, 128),
-            fc2: Linear::new(128, 10),
-        }
-    }
-
-    fn forward(&self, x: &Tensor) -> Result<Tensor, Error> {
-        // Layer 1: linear + ReLU activation
-        let x = self.fc1.forward(x)?;
-        let x = x.relu()?;
-
-        // Layer 2: linear (no activation — raw logits)
-        self.fc2.forward(&x)
-    }
-
-    fn predict(&self, x: &Tensor) -> Result<Tensor, Error> {
-        let logits = self.forward(x)?;
-        // Convert logits to probabilities
-        logits.softmax(-1)
-    }
-}
+use morok_tensor::{Tensor, nn::{Linear, Relu, Layer}};
 
 fn mnist_example() -> Result<(), Box<dyn std::error::Error>> {
-    let model = MnistNet::new();
+    // Architecture: 784 (28×28 pixels) → 128 (hidden) → 10 (digits)
+    let fc1 = Linear::with_dims(784, 128, morok_dtype::DType::Float32);
+    let fc2 = Linear::with_dims(128, 10, morok_dtype::DType::Float32);
 
     // Simulate a 28×28 grayscale image (flattened to 784)
     let fake_image: Vec<f32> = (0..784)
@@ -285,8 +230,8 @@ fn mnist_example() -> Result<(), Box<dyn std::error::Error>> {
     let input = Tensor::from_slice(fake_image)
         .try_reshape(&[1, 784])?;  // batch size 1
 
-    // Forward pass
-    let logits = model.forward(&input)?;
+    // Forward pass: linear → ReLU → linear
+    let logits = input.sequential(&[&fc1, &Relu, &fc2])?;
     let probs = logits.softmax(-1)?;
 
     // Get results
@@ -302,21 +247,23 @@ fn mnist_example() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-**Key concepts:**
+**मुख्य कॉन्सेप्ट:**
 
-1. **ReLU activation:** `x.relu()` returns `max(0, x)`. It introduces non-linearity—without it, stacking linear layers would just be one big linear layer.
+1. **`sequential()`** लेयर्स को चेन करता है: हर लेयर का आउटपुट अगली लेयर का इनपुट बनता है। मैन्युअल वायरिंग की ज़रूरत नहीं।
 
-2. **Logits vs probabilities:** The raw output of the last layer (logits) can be any real number. `softmax()` converts them to probabilities that sum to 1.
+2. **ReLU एक्टिवेशन:** `Relu` एक ज़ीरो-साइज़ लेयर है जो `max(0, x)` अप्लाई करती है। यह नॉन-लीनियरिटी लाती है — इसके बिना, linear लेयर स्टैक करना बस एक बड़ी linear लेयर होगी।
 
-3. **argmax:** Returns the index of the maximum value—the predicted class.
+3. **Logits बनाम probabilities:** लास्ट लेयर का रॉ आउटपुट (logits) कोई भी रियल नंबर हो सकता है। `softmax()` उन्हें probabilities में बदलता है जिनका योग 1 होता है।
 
-4. **Batch dimension:** We use shape `[1, 784]` for a single image. For 32 images, use `[32, 784]`. The model handles batches automatically.
+4. **argmax:** मैक्सिमम वैल्यू का इंडेक्स रिटर्न करता है — यानी प्रेडिक्टेड क्लास।
+
+5. **Batch डायमेंशन:** हम सिंगल इमेज के लिए shape `[1, 784]` इस्तेमाल करते हैं। 32 इमेज के लिए `[32, 784]` इस्तेमाल करें। मॉडल बैच ऑटोमैटिकली हैंडल करता है।
 
 ---
 
-## Example 6: Under the Hood
+## उदाहरण 6: अंदर की बात
 
-Want to see what Morok generates? Here's how to inspect the IR and generated code.
+जानना चाहते हैं कि Morok क्या जनरेट करता है? IR और जनरेटेड कोड कैसे देखें, यह रहा।
 
 ```rust
 fn inspect_compilation() -> Result<(), Box<dyn std::error::Error>> {
@@ -332,6 +279,8 @@ fn inspect_compilation() -> Result<(), Box<dyn std::error::Error>> {
     let result = c.realize()?;
 
     // Inspect generated kernels
+    // Note: kernel tracking via kernels() is a placeholder — use prepare() for
+    // full kernel inspection (see matmul IR test).
     println!("\n=== Generated Kernels ===");
     for (i, kernel) in result.kernels().iter().enumerate() {
         println!("Kernel {}: {}", i, kernel.name);
@@ -343,42 +292,44 @@ fn inspect_compilation() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-**What you'll see:**
+**आपको क्या दिखेगा:**
 
-1. **IR Graph:** The UOp tree shows operations like `BUFFER`, `LOAD`, `ADD`, `STORE`. This is Morok's intermediate representation before optimization.
+1. **IR Graph:** UOp tree `BUFFER`, `LOAD`, `ADD`, `STORE` जैसे ऑपरेशन दिखाता है। यह ऑप्टिमाइज़ेशन से पहले Morok का इंटरमीडिएट रिप्रेज़ेंटेशन है।
 
-2. **Generated Code:** The actual LLVM IR or GPU code that runs. Notice how Morok fuses the loads and add into a single kernel—no intermediate buffers needed.
+2. **जनरेटेड कोड:** वास्तविक LLVM IR या GPU कोड जो रन होता है। ध्यान दें कि Morok loads और add को एक सिंगल कर्नेल में फ़्यूज़ करता है — कोई इंटरमीडिएट बफ़र नहीं चाहिए।
 
-**Debugging tip:** If something seems slow or wrong, print the IR tree. Look for:
-- Unexpected operations (redundant reshapes, extra copies)
-- Missing fusion (separate kernels where one would do)
-- Shape mismatches (often the root cause of errors)
+**डीबगिंग टिप:** अगर कुछ स्लो या गलत लगे, तो IR tree प्रिंट करें। देखें:
+- अनएक्सपेक्टेड ऑपरेशन (रिडंडेंट reshapes, एक्स्ट्रा कॉपीज़)
+- मिसिंग फ़्यूज़न (जहाँ एक कर्नेल काफ़ी हो वहाँ अलग-अलग कर्नेल)
+- Shape मिसमैच (अक्सर एरर की असली वजह)
 
 ---
 
-## Summary
+## सारांश
 
-You've learned the core patterns for using Morok:
+आपने Morok इस्तेमाल करने के कोर पैटर्न सीख लिए:
 
-| Task | Code |
-|------|------|
-| Create tensor | `Tensor::from_slice([1.0f32, 2.0])` |
-| Arithmetic | `&a + &b`, `&a * &b`, `-&a` |
+| टास्क | कोड |
+|-------|------|
+| Tensor बनाएँ | `Tensor::from_slice([1.0f32, 2.0])` |
+| अरिथमेटिक | `&a + &b`, `&a * &b`, `-&a` |
 | Reshape | `t.try_reshape(&[2, 3])?` |
 | Transpose | `t.try_transpose(0, 1)?` |
-| Matrix multiply | `a.dot(&b)?` |
-| Activation | `t.relu()?`, `t.softmax(-1)?` |
-| Execute | `t.realize()?` |
-| Extract data | `result.to_ndarray::<f32>()?` |
+| मैट्रिक्स मल्टिप्लाई | `a.dot(&b)?` |
+| Linear लेयर | `Linear::with_dims(in, out, dtype)` |
+| लेयर चेन करें | `x.sequential(&[&fc1, &Relu, &fc2])?` |
+| एक्टिवेशन | `t.relu()?`, `t.softmax(-1)?` |
+| एक्ज़ीक्यूट करें | `t.realize()?` |
+| डेटा निकालें | `result.to_ndarray::<f32>()?` |
 
-**The lazy evaluation pattern:**
+**Lazy evaluation पैटर्न:**
 
-1. Build your computation graph with operations
-2. Call `realize()` once at the end
-3. Morok optimizes and executes everything together
+1. ऑपरेशन से अपना कम्प्यूटेशन ग्राफ़ बनाएँ
+2. अंत में एक बार `realize()` कॉल करें
+3. Morok सब कुछ ऑप्टिमाइज़ और एक साथ एक्ज़ीक्यूट करता है
 
-**Next steps:**
+**आगे:**
 
-- [Op Bestiary](./architecture/op-bestiary) — Reference for IR operations
-- [Execution Pipeline](./architecture/pipeline) — How compilation works
-- [Optimization System](./architecture/optimizations) — Pattern-based rewrites
+- [Op Bestiary](./architecture/op-bestiary) — IR ऑपरेशन रेफ़रेंस
+- [एक्ज़ीक्यूशन पाइपलाइन](./architecture/pipeline) — कम्पाइलेशन कैसे काम करता है
+- [ऑप्टिमाइज़ेशन सिस्टम](./architecture/optimizations) — पैटर्न-आधारित रीराइट्स

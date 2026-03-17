@@ -1,12 +1,12 @@
 ---
-sidebar_label: Optimization System
+sidebar_label: 优化系统
 ---
 
-# Pattern-Based Optimization
+# 基于模式的优化
 
-Open any production ML compiler and you'll find dozens of optimization passes: constant folding, dead code elimination, operator fusion, loop tiling, vectorization, memory layout optimization. Each pass has its own data structures, its own traversal logic, its own bugs.
+打开任何一个生产级 ML 编译器，你会发现几十个优化 pass：常量折叠、死代码消除、算子融合、循环分块、向量化、内存布局优化。每个 pass 都有自己的数据结构、遍历逻辑和 bug。
 
-Morok takes a different approach: **one mechanism for everything**.
+Morok 采用了不同的方案：**一种机制搞定一切**。
 
 ```text
 Traditional Compiler:              Morok:
@@ -23,15 +23,15 @@ Traditional Compiler:              Morok:
                                        One mechanism
 ```
 
-Every optimization in Morok is expressed as a **pattern**: "when you see this structure, replace it with that structure." The same `graph_rewrite()` function applies constant folding, converts movement ops to loops, optimizes memory access patterns, and lowers to hardware primitives.
+Morok 中的每一项优化都表达为一个**模式**："当你看到这种结构，就替换为那种结构。"同一个 `graph_rewrite()` 函数负责常量折叠、将变换操作转换为循环、优化内存访问模式，以及降级到硬件原语。
 
-This chapter explains how pattern-based optimization works and why it's powerful.
+本章解释基于模式的优化如何工作以及为什么它很强大。
 
 ---
 
-## The `patterns!` DSL
+## `patterns!` DSL
 
-Morok provides a domain-specific language for writing optimization patterns. Here's what it looks like:
+Morok 提供了一种领域特定语言来编写优化模式。它长这样：
 
 ```rust
 patterns! {
@@ -50,24 +50,24 @@ patterns! {
 }
 ```
 
-The macro compiles these patterns into efficient Rust code. Let's break down the syntax:
+宏将这些模式编译为高效的 Rust 代码。语法详解：
 
-| Syntax | Meaning | Example |
+| 语法 | 含义 | 示例 |
 |--------|---------|---------|
-| `(x, y)` | **Ordered.** Match in exact order. | `Sub(x, @zero) ~> x` |
-| `[x, y]` | **Commutative.** Try both orderings. | `Add[x, @zero] ~> x` |
-| `@zero` | **Zero constant.** Matches 0 or 0.0. | `Mul[_, z @ @zero] ~> z` |
-| `@one` | **One constant.** Matches 1 or 1.0. | `Mul[x, @one] ~> x` |
-| `@const(val)` | **Extract constant.** Binds the value. | `Add(@const(a), @const(b))` |
-| `x, x` | **Same operand.** Auto-generates ptr_eq check. | `Idiv(x, x) ~> UOp::one(...)` |
-| `~>` | **Infallible.** Always succeeds, returns `Arc<UOp>`. | `Add[x, @zero] ~> x` |
-| `=>` | **Fallible.** May fail, returns `Option<Arc<UOp>>`. | `=> eval(...).map(...)` |
-| `for op in binary [...]` | **Template.** Generate patterns for multiple ops. | See below |
-| `@context Type` | **Stateful.** Access mutable context in patterns. | See below |
+| `(x, y)` | **有序。** 按精确顺序匹配。 | `Sub(x, @zero) ~> x` |
+| `[x, y]` | **交换律。** 尝试两种顺序。 | `Add[x, @zero] ~> x` |
+| `@zero` | **零常量。** 匹配 0 或 0.0。 | `Mul[_, z @ @zero] ~> z` |
+| `@one` | **一常量。** 匹配 1 或 1.0。 | `Mul[x, @one] ~> x` |
+| `@const(val)` | **提取常量。** 绑定值。 | `Add(@const(a), @const(b))` |
+| `x, x` | **同一操作数。** 自动生成 ptr_eq 检查。 | `Idiv(x, x) ~> UOp::one(...)` |
+| `~>` | **不会失败。** 总是成功，返回 `Arc<UOp>`。 | `Add[x, @zero] ~> x` |
+| `=>` | **可能失败。** 返回 `Option<Arc<UOp>>`。 | `=> eval(...).map(...)` |
+| `for op in binary [...]` | **模板。** 为多个操作生成模式。 | 见下文 |
+| `@context Type` | **有状态。** 在模式中访问可变上下文。 | 见下文 |
 
-### Template Expansion
+### 模板展开
 
-Instead of writing the same pattern for every binary operation, use a for-loop:
+不必为每个二元操作写同样的模式，用 for 循环：
 
 ```rust
 patterns! {
@@ -79,11 +79,11 @@ patterns! {
 }
 ```
 
-This expands to six separate patterns at compile time—one for each operation.
+这在编译期展开为六个独立的模式——每个操作一个。
 
-### Stateful Patterns
+### 有状态模式
 
-Some optimizations need context (e.g., which kernel we're in, what ranges are active). Declare a context type:
+某些优化需要上下文（比如当前在哪个 kernel、哪些范围是活跃的）。声明一个上下文类型：
 
 ```rust
 patterns! {
@@ -96,17 +96,17 @@ patterns! {
 }
 ```
 
-The context is passed as the last argument to pattern closures.
+上下文作为最后一个参数传递给模式闭包。
 
 ---
 
-## How Pattern Matching Works
+## 模式匹配的工作原理
 
-The `patterns!` macro generates a `SimplifiedPatternMatcher` that dispatches patterns in **O(1)** time.
+`patterns!` 宏生成一个 `SimplifiedPatternMatcher`，可以在 **O(1)** 时间内分派模式。
 
-### The OpKey Index
+### OpKey 索引
 
-Every UOp has an operation type (Add, Mul, Load, etc.). The `#[derive(PatternEnum)]` macro generates an `OpKey` enum that maps operations to hashable keys:
+每个 UOp 都有一个操作类型（Add、Mul、Load 等）。`#[derive(PatternEnum)]` 宏生成一个 `OpKey` enum，将操作映射为可哈希的键：
 
 ```rust
 pub enum OpKey {
@@ -120,7 +120,7 @@ pub enum OpKey {
 }
 ```
 
-### The Matcher Structure
+### Matcher 结构
 
 ```rust
 pub struct SimplifiedPatternMatcher<C = ()> {
@@ -129,18 +129,18 @@ pub struct SimplifiedPatternMatcher<C = ()> {
 }
 ```
 
-When matching a UOp:
+匹配一个 UOp 时：
 
-1. **Extract OpKey** from the UOp's operation
-2. **Lookup** in the HashMap—O(1)
-3. **Try each closure** until one matches
-4. **Fall back** to wildcards if no indexed pattern matches
+1. 从 UOp 的操作中**提取 OpKey**
+2. 在 HashMap 中**查找**——O(1)
+3. **逐一尝试闭包**直到有一个匹配
+4. 如果没有索引模式匹配，**回退**到通配符
 
-This is 5-10x faster than scanning all patterns linearly.
+这比线性扫描所有模式快 5-10 倍。
 
-### Commutative Handling
+### 交换律处理
 
-For patterns like `Add[x, @zero]`, the macro generates code that tries both orderings:
+对于 `Add[x, @zero]` 这样的模式，宏生成尝试两种顺序的代码：
 
 ```rust
 // Try (x, @zero)
@@ -153,9 +153,9 @@ if let Some(result) = try_match_ordered(&children[1], &children[0]) {
 }
 ```
 
-### Duplicate Detection
+### 重复检测
 
-When you write `Idiv(x, x)`, the pattern should only match if both operands are the *same* UOp (pointer equality, not structural equality). The macro automatically generates this check:
+当你写 `Idiv(x, x)` 时，模式应该只在两个操作数是*同一个* UOp（指针相等，不是结构相等）时匹配。宏自动生成这个检查：
 
 ```rust
 // Generated code for Idiv(x, x)
@@ -167,25 +167,25 @@ if !Arc::ptr_eq(x, x_dup) {
 // ... rest of pattern
 ```
 
-This leverages hash consing—identical subexpressions share the same pointer.
+这利用了 hash consing——相同的子表达式共享同一个指针。
 
 ---
 
-## The Rewrite Engine: Two-Stage Algorithm
+## 重写引擎：两阶段算法
 
-Pattern matching alone isn't enough. Consider this expression:
+仅有模式匹配还不够。考虑这个表达式：
 
 ```text
 WHERE(Lt(3, 5), t, f)
 ```
 
-To simplify it, we need two steps:
-1. `Lt(3, 5)` → `true` (constant folding)
-2. `WHERE(true, t, f)` → `t` (dead code elimination)
+要化简它，需要两步：
+1. `Lt(3, 5)` → `true`（常量折叠）
+2. `WHERE(true, t, f)` → `t`（死代码消除）
 
-But the `WHERE` pattern won't match until its child is simplified. The rewrite engine solves this with a **two-stage algorithm**.
+但 `WHERE` 模式在子节点被化简之前不会匹配。重写引擎通过**两阶段算法**解决这个问题。
 
-### Stage 0: Pattern Application
+### 阶段 0：模式应用
 
 ```rust
 fn rewrite_stage0(&mut self, uop: &Arc<UOp>) -> RewriteResult {
@@ -196,11 +196,11 @@ fn rewrite_stage0(&mut self, uop: &Arc<UOp>) -> RewriteResult {
 }
 ```
 
-If no pattern matches, return `Gate`—a signal to process children first.
+如果没有模式匹配，返回 `Gate`——表示先处理子节点的信号。
 
-### Stage 1: Source Reconstruction
+### 阶段 1：源重建
 
-After children are rewritten, rebuild the node with new children and try patterns again:
+子节点被重写后，用新的子节点重建节点，再次尝试模式：
 
 ```rust
 fn rewrite_stage1(&mut self, uop: &Arc<UOp>, new_children: Vec<Arc<UOp>>) {
@@ -215,7 +215,7 @@ fn rewrite_stage1(&mut self, uop: &Arc<UOp>, new_children: Vec<Arc<UOp>>) {
 }
 ```
 
-### The Magic: Cascading Optimizations
+### 关键：级联优化
 
 ```text
 Stage 0: WHERE(Lt(3, 5), t, f)     → Gate (no match, process children)
@@ -224,22 +224,22 @@ Stage 0: WHERE(Lt(3, 5), t, f)     → Gate (no match, process children)
 Stage 1: WHERE(true, t, f)         → t (dead code elimination matches!)
 ```
 
-The reconstruction stage re-applies patterns, enabling multi-step optimizations in a single traversal.
+重建阶段重新应用模式，使多步优化在一次遍历中完成。
 
-### Safety Limits
+### 安全限制
 
-To prevent infinite loops, the engine has limits:
-- **1000 iterations** per node maximum
-- **100,000 iterations** total maximum
-- Panics with diagnostic info if limits exceeded
+为防止无限循环，引擎有限制：
+- 每个节点最多 **1000 次迭代**
+- 总计最多 **100,000 次迭代**
+- 超限时 panic 并输出诊断信息
 
-In practice, well-formed patterns converge quickly.
+在实践中，良好的模式能快速收敛。
 
 ---
 
-## The Full Optimization Pipeline
+## 完整优化流水线
 
-Pattern matching is one part of a larger pipeline. When you call `tensor.realize()`, here's what happens:
+模式匹配是更大流水线的一部分。当你调用 `tensor.realize()` 时，以下是发生的过程：
 
 ```text
 Tensor.realize()
@@ -289,21 +289,21 @@ Tensor.realize()
 └─────────────────────────────────────────────────────────┘
 ```
 
-Each box uses pattern-based rewriting. The difference is which patterns are applied:
+每个框都使用基于模式的重写。不同之处在于应用哪些模式：
 
-- **Rangeify**: Movement op → BUFFERIZE + INDEX patterns
-- **Symbolic**: Algebraic simplification patterns
-- **Post-opt**: Memory access optimization patterns
+- **Rangeify**：变换操作 → BUFFERIZE + INDEX 模式
+- **符号化简**：代数化简模式
+- **后优化**：内存访问优化模式
 
 ---
 
-## Kernel Optimization: Heuristics vs Beam Search
+## Kernel 优化：启发式 vs Beam 搜索
 
-After symbolic simplification, each kernel needs *scheduling decisions*: how to tile loops, where to parallelize, whether to use tensor cores. Morok offers two strategies.
+符号化简之后，每个 kernel 需要*调度决策*：如何分块循环、在哪里并行化、是否使用 tensor core。Morok 提供两种策略。
 
-### Heuristics (Default)
+### 启发式（默认）
 
-The heuristic optimizer applies optimizations in a fixed order:
+启发式优化器按固定顺序应用优化：
 
 ```rust
 pub fn hand_coded_optimizations(scheduler: &mut Scheduler) {
@@ -327,13 +327,13 @@ pub fn hand_coded_optimizations(scheduler: &mut Scheduler) {
 }
 ```
 
-**Pros**: Fast (~50ms per kernel), predictable, no hardware measurement needed.
+**优点**：快（每个 kernel 约 50ms）、可预测、无需硬件测量。
 
-**Cons**: May miss optimization opportunities, fixed heuristics don't adapt to workload.
+**缺点**：可能错过优化机会，固定启发式不能适应不同工作负载。
 
-### Beam Search (Optional)
+### Beam 搜索（可选）
 
-For production workloads, beam search finds better schedules:
+对于生产工作负载，beam 搜索能找到更好的调度方案：
 
 ```rust
 pub fn beam_search(scheduler: Scheduler, config: BeamConfig) -> Scheduler {
@@ -368,19 +368,19 @@ pub fn beam_search(scheduler: Scheduler, config: BeamConfig) -> Scheduler {
 }
 ```
 
-The action space includes ~500 predefined actions:
-- `UPCAST(axis, amount)` — vectorize output dimension
-- `UNROLL(axis, amount)` — unroll reduction loop
-- `LOCAL(axis, amount)` — use GPU shared memory
-- `GROUP(axis, amount)` — two-stage reduction
-- `THREAD(axis, amount)` — CPU parallelization
-- `SWAP(axis1, axis2)` — reorder global dimensions
+动作空间包含约 500 个预定义动作：
+- `UPCAST(axis, amount)` — 向量化输出维度
+- `UNROLL(axis, amount)` — 展开规约循环
+- `LOCAL(axis, amount)` — 使用 GPU 共享内存
+- `GROUP(axis, amount)` — 两阶段规约
+- `THREAD(axis, amount)` — CPU 并行化
+- `SWAP(axis1, axis2)` — 重排全局维度
 
-**Pros**: Finds near-optimal schedules, adapts to hardware.
+**优点**：找到接近最优的调度方案，能适应硬件。
 
-**Cons**: Minutes per kernel (but results are cached by AST hash).
+**缺点**：每个 kernel 需要几分钟（但结果按 AST 哈希缓存）。
 
-### Configuration
+### 配置
 
 ```bash
 # Disable optimization (debugging)
@@ -390,7 +390,7 @@ MOROK_NOOPT=1 cargo run
 MOROK_BEAM=8 cargo run
 ```
 
-Or programmatically:
+或通过代码配置：
 
 ```rust
 let config = OptimizerConfig::builder()
@@ -402,42 +402,42 @@ tensor.realize_with(config)?;
 
 ---
 
-## Comparison: How Other Compilers Optimize
+## 对比：其他编译器如何优化
 
-Different ML compilers take different approaches to optimization:
+不同的 ML 编译器采用不同的优化方式：
 
-| Aspect | XLA | TVM/Ansor | Triton | **Morok** |
+| 方面 | XLA | TVM/Ansor | Triton | **Morok** |
 |--------|-----|-----------|--------|-----------|
-| **Philosophy** | Fixed heuristics | Search-based | Programmer-guided | Pattern-based |
-| **Fusion** | Conservative rules | Tile-and-fuse | Block-level | Graph rewriting |
-| **Auto-tuning** | None | Evolutionary + cost model | Grid search | Beam search |
-| **Tuning cost** | 0 | Hours | Minutes | Minutes (cached) |
-| **Flexibility** | Low | High | Medium | High |
-| **Transparency** | Low (C++ passes) | Medium (Python) | Medium (DSL) | High (patterns!) |
+| **理念** | 固定启发式 | 基于搜索 | 程序员引导 | 基于模式 |
+| **融合** | 保守规则 | Tile-and-fuse | 块级别 | 图重写 |
+| **自动调优** | 无 | 进化算法 + 代价模型 | 网格搜索 | Beam 搜索 |
+| **调优成本** | 0 | 数小时 | 数分钟 | 数分钟（有缓存） |
+| **灵活性** | 低 | 高 | 中 | 高 |
+| **透明度** | 低（C++ pass） | 中（Python） | 中（DSL） | 高（patterns!） |
 
-### XLA — Production Conservative
+### XLA — 生产级保守
 
-XLA uses fixed heuristics for fusion decisions. Safe and predictable, but leaves performance on the table. The fusion rules are hard-coded in C++—extending them requires deep compiler knowledge.
+XLA 使用固定启发式做融合决策。安全可预测，但会损失一些性能。融合规则硬编码在 C++ 中——扩展它们需要深入的编译器知识。
 
-### TVM/Ansor — Maximum Auto-Tuning
+### TVM/Ansor — 极致自动调优
 
-TVM separates *what* to compute from *how* to compute it. Ansor uses evolutionary search with a learned cost model to explore the schedule space. Can achieve best-in-class performance, but tuning takes hours per model.
+TVM 将*计算什么*和*如何计算*分离。Ansor 使用进化搜索配合学习的代价模型来探索调度空间。可以达到业界最佳性能，但每个模型调优需要数小时。
 
-### Triton — Programmer-Guided
+### Triton — 程序员引导
 
-Triton exposes a Python-like DSL where you write blocked algorithms explicitly. The compiler handles register allocation and memory management. Good balance of control and automation, but requires GPU programming expertise.
+Triton 提供一个类 Python 的 DSL，让你显式编写分块算法。编译器处理寄存器分配和内存管理。在控制和自动化之间取得了良好平衡，但需要 GPU 编程专业知识。
 
-### Morok — Pattern Composition
+### Morok — 模式组合
 
-Morok's insight: express optimizations as composable patterns. Each pattern is local and verifiable. Complex optimizations emerge from composition. Beam search adds auto-tuning when needed, with results cached for reuse.
+Morok 的洞察：将优化表达为可组合的模式。每个模式是局部的、可验证的。复杂优化通过组合涌现。Beam 搜索在需要时提供自动调优，结果缓存可复用。
 
 ---
 
-## Why This Matters: Practical Benefits
+## 为什么这很重要：实际好处
 
-Pattern-based optimization has concrete advantages for developers:
+基于模式的优化对开发者有具体的优势：
 
-**Debugging is direct.** Patterns are readable code. Add a `println!` to any pattern to trace when it fires:
+**调试是直接的。** 模式是可读的代码。在任何模式中加一个 `println!` 来追踪何时触发：
 
 ```rust
 patterns! {
@@ -448,7 +448,7 @@ patterns! {
 }
 ```
 
-**Extensibility is easy.** Adding a custom optimization is two lines:
+**扩展很容易。** 添加自定义优化只需两行：
 
 ```rust
 patterns! {
@@ -457,22 +457,22 @@ patterns! {
 }
 ```
 
-No need to understand compiler internals, write visitors, or modify pass managers.
+不需要理解编译器内部实现、编写 visitor 或修改 pass 管理器。
 
-**Correctness is local.** Each pattern is a small theorem: "if this structure appears, replacing it with that structure preserves semantics." Verify each pattern independently. Composition of correct patterns yields correct programs.
+**正确性是局部的。** 每个模式都是一个小定理："如果出现这种结构，用那种结构替换可以保持语义。"可以独立验证每个模式。正确模式的组合产生正确的程序。
 
-**Performance is tunable.** O(1) pattern dispatch is fast by default. Enable beam search for production workloads. Cache results by AST hash—tune once, benefit forever.
+**性能可调。** O(1) 模式分派默认就很快。对生产工作负载启用 beam 搜索。按 AST 哈希缓存结果——调优一次，永久受益。
 
 ---
 
-## The Deeper Insight
+## 更深层的洞察
 
-Pattern matching trades generality for composability.
+模式匹配用通用性换取了可组合性。
 
-A general-purpose optimization pass can do anything—but that's exactly the problem. It's hard to verify, hard to extend, hard to compose with other passes. Ordering matters. Interactions are subtle.
+通用优化 pass 可以做任何事——但这恰恰是问题所在。它难以验证、难以扩展、难以与其他 pass 组合。顺序很重要。交互很微妙。
 
-A pattern is constrained: it matches a specific structure and produces a specific replacement. But constraints enable composition. Run patterns in any order—the result converges to the same fixed point. Add new patterns without breaking existing ones. Delete patterns without cascading failures.
+模式是受约束的：它匹配特定结构，产生特定替换。但约束使组合成为可能。以任何顺序运行模式——结果收敛到同一个不动点。添加新模式不会破坏现有的。删除模式不会产生级联故障。
 
-Each pattern is a theorem about semantic equivalence. The rewrite engine is a theorem prover, finding derivations from input to optimized output. Correctness follows from the correctness of individual steps.
+每个模式都是关于语义等价的定理。重写引擎是定理证明器，从输入到优化输出寻找推导路径。正确性来自每一步的正确性。
 
-This is the Unix philosophy applied to compilers: small, focused tools that compose. Pattern-based optimization won't solve every problem—but for the problems it solves, it solves them elegantly.
+这是 Unix 哲学在编译器中的应用：小的、专注的工具进行组合。基于模式的优化不能解决所有问题——但对于它能解决的问题，它解决得很优雅。

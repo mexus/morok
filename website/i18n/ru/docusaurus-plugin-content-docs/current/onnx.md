@@ -1,31 +1,31 @@
 ---
-sidebar_label: ONNX Inference
+sidebar_label: ONNX-инференс
 ---
 
-# ONNX Model Inference
+# Инференс ONNX-моделей
 
-Morok's ONNX importer is the recommended way to run model inference. It loads standard `.onnx` files, decomposes operators into Morok's lazy tensor operations, and compiles them through the full optimization pipeline — no C++ runtime required.
+ONNX-импортёр Morok — рекомендуемый способ инференса моделей. Он загружает стандартные `.onnx`-файлы, раскладывает операторы на ленивые тензорные операции Morok и компилирует их через полный пайплайн оптимизаций — без C++ рантайма.
 
-**Current status:**
+**Текущий статус:**
 
-| Capability | Status |
-|------------|--------|
-| Forward inference | Supported |
-| 162 / 200 ONNX operators | [Parity details](https://github.com/patsak/morok/blob/main/onnx/PARITY.md) |
-| CNN architectures (ResNet, DenseNet, VGG, ...) | 9 models validated |
-| Microsoft extensions (Attention, RotaryEmbedding) | Supported |
-| Dynamic batch size | Planned for next release |
-| Training / backward pass | Not supported |
+| Возможность | Статус |
+|-------------|--------|
+| Прямой инференс | Поддерживается |
+| 162 / 200 операторов ONNX | [Таблица паритета](https://github.com/patsak/morok/blob/main/onnx/PARITY.md) |
+| CNN-архитектуры (ResNet, DenseNet, VGG, ...) | Проверено 9 моделей |
+| Расширения Microsoft (Attention, RotaryEmbedding) | Поддерживается |
+| Динамический размер батча | Планируется в следующем релизе |
+| Обучение / обратный проход | Не поддерживается |
 
-**How does Morok compare to other Rust ML frameworks?**
+**Сравнение с другими фреймворками**
 
-Among pure-Rust frameworks, Morok offers the broadest ONNX operator coverage — 162 operators with 1361 passing conformance tests across dual backends (Clang + LLVM). `candle` and `burn` each support fewer operators and lack conformance test suites of comparable scope. That said, if you need maximum compatibility with production ONNX models, use `ort` — a Rust wrapper around the C++ ONNX Runtime — which covers the full ONNX spec.
+Среди чистых Rust-фреймворков у Morok самое широкое покрытие операторов ONNX — 162 оператора, 1361 пройденный conformance-тест на двух бэкендах (Clang + LLVM). У `candle` и `burn` операторов меньше, а тестовых наборов сопоставимого масштаба нет. Если же нужна максимальная совместимость с продакшн-моделями ONNX — используйте `ort`, Rust-обёртку вокруг C++ ONNX Runtime, которая покрывает полную спецификацию.
 
 ---
 
-## Quick Start
+## Быстрый старт
 
-Add `morok-onnx` and `morok-tensor` to your `Cargo.toml`:
+Добавьте `morok-onnx` и `morok-tensor` в `Cargo.toml`:
 
 ```toml
 [dependencies]
@@ -33,9 +33,9 @@ morok-onnx = { git = "https://github.com/patsak/morok" }
 morok-tensor = { git = "https://github.com/patsak/morok" }
 ```
 
-### Simple: All-Initializer Models
+### Простой вариант: модели со встроенными весами
 
-For models where all inputs are baked into the file (no runtime inputs):
+Для моделей, у которых все входы уже вшиты в файл (без рантайм-входов):
 
 ```rust
 use morok_onnx::OnnxImporter;
@@ -53,9 +53,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-### Two-Phase: Models with Runtime Inputs
+### Двухфазный вариант: модели с рантайм-входами
 
-Most models need runtime data (images, tokens, audio). The two-phase API separates graph preparation from execution:
+Большинству моделей нужны данные на этапе выполнения (изображения, токены, аудио). Двухфазный API разделяет подготовку графа и выполнение:
 
 ```rust
 use morok_onnx::OnnxImporter;
@@ -80,19 +80,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-The `prepare()` / `trace()` split exists because graph structure is static — you parse it once and can trace multiple times with different dimension bindings or input data.
+`prepare()` и `trace()` разделены, потому что структура графа статична — парсим один раз, а `trace()` можно вызывать многократно с разными привязками размерностей или входными данными.
 
 ---
 
-## Architecture
+## Архитектура
 
-### Two-Phase Design
+### Двухфазный дизайн
 
-The importer processes ONNX models in two distinct phases:
+Импортёр обрабатывает ONNX-модели в два этапа:
 
-**Phase 1 — `prepare()`:** Extracts graph topology without executing anything. Parses the protobuf, separates initializers (weights) from runtime inputs, records opset versions, and pre-parses control flow subgraphs. Returns an `OnnxGraph` — a lightweight structure you can inspect before committing to execution.
+**Фаза 1 — `prepare()`:** Извлекает топологию графа, ничего не выполняя. Парсит protobuf, отделяет инициализаторы (веса) от рантайм-входов, запоминает версии opset, предварительно парсит подграфы control flow. Возвращает `OnnxGraph` — лёгкую структуру, которую можно изучить до запуска вычислений.
 
-**Phase 2 — `trace()`:** Walks the graph in topological order, dispatching each ONNX node to its Tensor implementation. This builds Morok's lazy computation DAG — no actual math happens yet. The result is a set of `Tensor` handles that, when `realize()`'d, compile and execute through the full pipeline.
+**Фаза 2 — `trace()`:** Обходит граф в топологическом порядке, диспатчит каждый ONNX-узел в соответствующую реализацию Tensor. На этом этапе строится ленивый граф вычислений (DAG) — никаких реальных вычислений ещё нет. Результат — набор хэндлов `Tensor`, которые при вызове `realize()` компилируются и выполняются через полный пайплайн.
 
 ```text
 model.onnx → prepare() → OnnxGraph → trace() → lazy Tensors → realize() → results
@@ -103,16 +103,16 @@ model.onnx → prepare() → OnnxGraph → trace() → lazy Tensors → realize(
           Inspect inputs/outputs    Pass to optimizer/codegen
 ```
 
-This separation enables several patterns:
-- **Inspect before executing:** Check input shapes and dtypes before allocating anything
-- **Multiple traces:** Re-trace with different dynamic dimension bindings
-- **External weights:** Load weights separately (useful for models with external data files)
+Такое разделение даёт несколько возможностей:
+- **Проверка перед запуском:** Посмотреть формы и типы данных входов до аллокаций
+- **Множественные трассировки:** Повторный `trace()` с другими привязками динамических размерностей
+- **Внешние веса:** Загрузка весов отдельно (полезно для моделей с внешними файлами данных)
 
-### Operator Decomposition
+### Декомпозиция операторов
 
-Every ONNX operator is decomposed into Morok Tensor operations. The complexity varies:
+Каждый оператор ONNX раскладывается на операции Morok Tensor. Степень сложности разная:
 
-**Direct mappings** — about 60 operators map 1:1 to a tensor method:
+**Прямые отображения** — около 60 операторов напрямую соответствуют одному методу тензора:
 
 ```rust
 // In the registry:
@@ -122,7 +122,7 @@ Every ONNX operator is decomposed into Morok Tensor operations. The complexity v
 "Equal" => x.try_eq(y)?
 ```
 
-**Builder patterns** — complex operators with many optional parameters use fluent APIs:
+**Паттерны-билдеры** — сложные операторы с множеством необязательных параметров используют fluent API:
 
 ```rust
 // Conv with optional bias, padding, dilation, groups
@@ -135,7 +135,7 @@ x.conv()
     .call()?
 ```
 
-**Multi-step decompositions** — operators like BatchNormalization, Attention, and Mod require intermediate computations. For example, Python-style integer `Mod` decomposes into truncation mod + sign adjustment:
+**Многошаговые декомпозиции** — операторы вроде BatchNormalization, Attention и Mod требуют промежуточных вычислений. Например, целочисленный `Mod` в стиле Python раскладывается на truncation mod + поправку знака:
 
 ```rust
 let trunc_mod = x.try_mod(y)?;
@@ -144,21 +144,21 @@ let needs_adj = mod_ne_zero.bitwise_and(&signs_differ)?;
 trunc_mod.try_add(&y.where_(&needs_adj, &zero)?)?
 ```
 
-### Attribute Validation
+### Валидация атрибутов
 
-The `Attrs` helper uses pop-based extraction — each call to `attrs.int("axis", -1)` or `attrs.float("epsilon", 1e-5)` removes the attribute from the map. After the operator finishes, `attrs.done()` asserts the map is empty. Any leftover attributes trigger an error, catching incomplete operator implementations at trace time rather than producing silent wrong results.
+Хелпер `Attrs` работает по принципу pop — каждый вызов `attrs.int("axis", -1)` или `attrs.float("epsilon", 1e-5)` забирает атрибут из словаря. После обработки оператора `attrs.done()` проверяет, что словарь пуст. Оставшиеся атрибуты вызывают ошибку — так неполные реализации операторов ловятся на этапе трассировки, а не приводят к молчаливо неверным результатам.
 
-### Opset Versioning
+### Версионирование opset
 
-ONNX models declare opset imports per domain. The importer tracks these and passes the version to each operator handler. Operators switch behavior based on version — for example, `Softmax`'s default axis changed from `1` (opset < 13) to `-1` (opset >= 13), and `ReduceSum` moved its axes from an attribute to an input tensor at opset 13.
+ONNX-модели объявляют импорты opset для каждого домена. Импортёр отслеживает их и передаёт версию каждому обработчику. Операторы переключают поведение в зависимости от версии — например, ось по умолчанию у Softmax сменилась с `1` (opset < 13) на `-1` (opset >= 13), а `ReduceSum` перенёс оси из атрибута во входной тензор в opset 13.
 
 ---
 
-## Working with Models
+## Работа с моделями
 
-### Dynamic Dimensions
+### Динамические размерности
 
-ONNX inputs can have symbolic dimensions like `"batch_size"` or `"sequence_length"`. Bind them at trace time:
+Входы ONNX могут содержать символические размерности вроде `"batch_size"` или `"sequence_length"`. Привяжите их на этапе трассировки:
 
 ```rust
 let graph = importer.prepare(model)?;
@@ -170,7 +170,7 @@ let (inputs, outputs) = importer.trace_with_dims(
 )?;
 ```
 
-Unbound dynamic dimensions cause a clear error at trace time. You can inspect which dimensions are dynamic via `InputSpec::shape`:
+Непривязанные динамические размерности дают понятную ошибку на этапе трассировки. Какие размерности динамические, можно узнать через `InputSpec::shape`:
 
 ```rust
 for (name, spec) in &graph.inputs {
@@ -183,9 +183,9 @@ for (name, spec) in &graph.inputs {
 }
 ```
 
-### External Weights
+### Внешние веса
 
-Some ONNX models store weights in separate files. Use `trace_external()` to provide them:
+Некоторые ONNX-модели хранят веса в отдельных файлах. Чтобы передать их, используйте `trace_external()`:
 
 ```rust
 let (inputs, outputs) = importer.trace_external(
@@ -194,79 +194,79 @@ let (inputs, outputs) = importer.trace_external(
 )?;
 ```
 
-### Microsoft Extensions
+### Расширения Microsoft
 
-The importer supports several `com.microsoft` contrib operators commonly found in transformer models exported from ONNX Runtime:
+Импортёр поддерживает несколько contrib-операторов `com.microsoft`, которые часто встречаются в трансформерных моделях, экспортированных из ONNX Runtime:
 
-| Extension | What it does |
-|-----------|-------------|
-| `Attention` | Packed QKV projection with masking, past KV cache |
-| `RotaryEmbedding` | Rotary positional embeddings (interleaved/non-interleaved) |
-| `SkipLayerNormalization` | Fused residual + LayerNorm + scale |
-| `EmbedLayerNormalization` | Token + position + segment embeddings → LayerNorm |
+| Расширение | Назначение |
+|------------|-----------|
+| `Attention` | Упакованная QKV-проекция с маскированием, past KV cache |
+| `RotaryEmbedding` | Ротационные позиционные эмбеддинги (interleaved/non-interleaved) |
+| `SkipLayerNormalization` | Fused residual + LayerNorm + масштабирование |
+| `EmbedLayerNormalization` | Эмбеддинги токенов + позиций + сегментов → LayerNorm |
 
-Standard ONNX transformer operators (`Attention` from the ai.onnx domain) are also supported with grouped query attention (GQA), causal masking, past KV caching, and softcap.
+Стандартные трансформерные операторы ONNX (`Attention` из домена ai.onnx) тоже поддерживаются — с grouped query attention (GQA), каузальным маскированием, past KV cache и softcap.
 
 ---
 
-## Control Flow and Limitations
+## Control flow и ограничения
 
-### Semantic If: Both Branches Always Execute
+### Семантика If: обе ветки всегда выполняются
 
-ONNX's `If` operator has data-dependent control flow — the condition determines which branch runs. Morok's lazy evaluation model is fundamentally incompatible with this: since nothing executes at trace time, the condition value is unknown.
+Оператор `If` в ONNX — это data-dependent control flow: условие определяет, какая ветка выполняется. Ленивые вычисления Morok принципиально несовместимы с этим: на этапе трассировки ничего не выполняется, и значение условия неизвестно.
 
-**Morok's solution:** Trace *both* branches, then merge results with `Tensor::where_()`:
+**Решение Morok:** Трассировать *обе* ветки, а потом объединить результаты через `Tensor::where_()`:
 
 ```text
 ONNX:    if condition { then_branch } else { else_branch }
 Morok:   then_result.where_(&condition, &else_result)
 ```
 
-This enables **trace-once, run-many** — the compiled graph handles any condition value at runtime. But it has a hard constraint: **both branches must produce identical output shapes and dtypes.** Models with shape-polymorphic branches (where the then-branch produces `[3, 4]` and the else-branch produces `[5, 6]`) cannot be traced.
+Это даёт подход **«трассируй один раз — запускай многократно»** — скомпилированный граф обрабатывает любое значение условия в рантайме. Но есть жёсткое ограничение: **обе ветки должны возвращать одинаковые формы и типы данных.** Модели с shape-полиморфными ветками (then-ветка возвращает `[3, 4]`, а else-ветка — `[5, 6]`) трассировать нельзя.
 
-In practice, most ONNX models with `If` nodes satisfy this constraint because they use conditional logic for value selection, not shape-changing control flow.
+На практике большинство ONNX-моделей с узлами `If` укладываются в это ограничение — условная логика в них выбирает значения, а не меняет форму данных.
 
-### No Loop or Scan
+### Нет Loop и Scan
 
-Iterative control flow (`Loop`, `Scan`) is not implemented. These operators require repeated tracing or unrolling, which conflicts with the single-trace architecture. Models using recurrent patterns typically work via unrolled operators (LSTM, GRU, RNN are implemented as native ops).
+Итеративный control flow (`Loop`, `Scan`) не реализован. Эти операторы требуют многократной трассировки или развёртки, что не ложится на архитектуру однократной трассировки. Модели с рекуррентными паттернами обычно работают через развёрнутые операторы (LSTM, GRU, RNN реализованы как нативные ops).
 
-### No Batching (Yet)
+### Нет батчинга (пока)
 
-Dynamic batching — running inference on multiple inputs simultaneously — is planned for the next release. Currently, batch dimensions must be bound to a fixed value at trace time via `trace_with_dims()`.
+Динамический батчинг — одновременный инференс на нескольких входах — планируется в следующем релизе. Пока что размерности батча нужно привязывать к фиксированному значению на этапе трассировки через `trace_with_dims()`.
 
-### No Training
+### Нет обучения
 
-The importer is inference-only. There is no backward pass, gradient computation, or optimizer support.
+Импортёр только для инференса. Обратного прохода, вычисления градиентов и оптимизаторов нет.
 
-### Missing Operator Categories
+### Нереализованные категории операторов
 
-| Category | Examples | Why |
-|----------|----------|-----|
-| Quantization | DequantizeLinear, QuantizeLinear | Requires quantized dtype support in IR |
-| Sequence ops | SequenceConstruct, SequenceAt | Non-tensor types not in Morok's type system |
-| Random | RandomNormal, RandomUniform | Stateful RNG not yet implemented |
-| Signal processing | DFT, STFT, MelWeightMatrix | Low priority; niche use cases |
-| Text | StringNormalizer, TfIdfVectorizer | String types not supported |
+| Категория | Примеры | Причина |
+|-----------|---------|---------|
+| Квантизация | DequantizeLinear, QuantizeLinear | Нужна поддержка квантизованных типов в IR |
+| Операции с последовательностями | SequenceConstruct, SequenceAt | Нетензорные типы не входят в систему типов Morok |
+| Случайные числа | RandomNormal, RandomUniform | Stateful RNG пока не реализован |
+| Обработка сигналов | DFT, STFT, MelWeightMatrix | Низкий приоритет; узкоспециализированные задачи |
+| Текст | StringNormalizer, TfIdfVectorizer | Строковые типы не поддерживаются |
 
-For models using these operators, consider `ort` (ONNX Runtime wrapper) which covers the full spec.
+Для моделей с такими операторами используйте `ort` (обёртку над ONNX Runtime) — она покрывает полную спецификацию.
 
 ---
 
-## Debugging
+## Отладка
 
-### Per-Node Output Tracing
+### Поузловая трассировка выходов
 
-Set the trace log level to dump intermediate outputs:
+Установите уровень логирования trace, чтобы выводить промежуточные результаты:
 
 ```bash
 RUST_LOG=morok_onnx::importer=trace cargo run
 ```
 
-This realizes each node's output individually and prints the first 5 values — useful for numerical bisection when a model produces wrong results. Note that this breaks kernel fusion (each node runs separately), so it's purely a debugging tool.
+Это вызывает `realize()` для выхода каждого узла отдельно и печатает первые 5 значений — помогает при числовой бисекции, когда модель выдаёт неверные результаты. Учтите, что это ломает фьюзинг ядер (каждый узел выполняется отдельно), так что это чисто отладочный инструмент.
 
-### Inspecting the Graph
+### Исследование графа
 
-Use the `OnnxGraph` structure to understand what a model needs before tracing:
+Чтобы понять, что нужно модели, до трассировки используйте `OnnxGraph`:
 
 ```rust
 let graph = importer.prepare(model)?;
@@ -283,17 +283,17 @@ println!("Initializers: {}", graph.initializers.len());
 
 ---
 
-## Summary
+## Итого
 
-| Aspect | Detail |
+| Аспект | Детали |
 |--------|--------|
-| **Entry point** | `OnnxImporter::new()` |
-| **Simple import** | `importer.import_path("model.onnx")?` |
-| **Two-phase** | `prepare()` → `trace()` / `trace_with_dims()` |
-| **Operators** | 162 / 200 ([full parity table](https://github.com/patsak/morok/blob/main/onnx/PARITY.md)) |
-| **Validated models** | ResNet50, DenseNet121, VGG19, Inception, AlexNet, ShuffleNet, SqueezeNet, ZFNet |
-| **Backends** | Clang + LLVM (identical results) |
-| **Extensions** | com.microsoft Attention, RotaryEmbedding, SkipLayerNorm, EmbedLayerNorm |
-| **Limitations** | No training, no batching (yet), no Loop/Scan, shape-polymorphic If |
+| **Точка входа** | `OnnxImporter::new()` |
+| **Простой импорт** | `importer.import_path("model.onnx")?` |
+| **Двухфазный режим** | `prepare()` → `trace()` / `trace_with_dims()` |
+| **Операторы** | 162 / 200 ([полная таблица паритета](https://github.com/patsak/morok/blob/main/onnx/PARITY.md)) |
+| **Проверенные модели** | ResNet50, DenseNet121, VGG19, Inception, AlexNet, ShuffleNet, SqueezeNet, ZFNet |
+| **Бэкенды** | Clang + LLVM (идентичные результаты) |
+| **Расширения** | com.microsoft Attention, RotaryEmbedding, SkipLayerNorm, EmbedLayerNorm |
+| **Ограничения** | Нет обучения, нет батчинга (пока), нет Loop/Scan, shape-полиморфный If |
 
-**Next:** [Hands-On Examples](./examples) for tensor basics, or [Execution Pipeline](./architecture/pipeline) for how compilation works under the hood.
+**Далее:** [Практические примеры](./examples) — основы работы с тензорами, или [Пайплайн выполнения](./architecture/pipeline) — чтобы разобраться, как устроена компиляция.

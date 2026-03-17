@@ -1,29 +1,29 @@
 ---
-sidebar_label: Hands-On Examples
+sidebar_label: Практические примеры
 ---
 
-# Hands-On: From Tensors to Models
+# Практика: от тензоров до моделей
 
-This chapter teaches Morok through progressive examples. You'll start with basic tensor operations and build up to a working neural network classifier.
+Эта глава обучает Morok через последовательные примеры. Начнём с базовых тензорных операций и дойдём до рабочего нейросетевого классификатора.
 
-**What you'll learn:**
-- Creating and manipulating tensors
-- Shape operations (reshape, transpose, broadcast)
-- Matrix multiplication
-- Building reusable layers
-- Composing a complete model
+**Чему вы научитесь:**
+- Создание и манипуляции с тензорами
+- Операции с формами (reshape, transpose, broadcast)
+- Матричное умножение
+- Построение переиспользуемых слоёв
+- Сборка полноценной модели
 
-**Prerequisites:**
-- Basic Rust knowledge
-- Add `morok_tensor` to your `Cargo.toml`
+**Предварительные требования:**
+- Базовое знание Rust
+- Добавить `morok_tensor` в `Cargo.toml`
 
-**Key pattern:** Morok uses *lazy evaluation*. Operations build a computation graph without executing. Call `realize()` to compile and run everything at once.
+**Ключевой паттерн:** Morok использует *ленивые вычисления*. Операции строят граф вычислений без выполнения. Вызов `realize()` компилирует и запускает всё разом.
 
 ---
 
-## Example 1: Hello Tensor
+## Пример 1: Hello Tensor
 
-Let's create tensors, perform operations, and get results.
+Создадим тензоры, выполним операции и получим результаты.
 
 ```rust
 use morok_tensor::Tensor;
@@ -47,27 +47,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-**What's happening:**
+**Что здесь происходит:**
 
-1. `Tensor::from_slice()` creates a 1D tensor from array data. The `f32` suffix tells Rust the element type.
+1. `Tensor::from_slice()` создаёт одномерный тензор из массива. Суффикс `f32` указывает Rust тип элемента.
 
-2. `&a + &b` doesn't compute anything yet. It returns a new `Tensor` that *represents* the addition. The `&` borrows the tensors so we can reuse them.
+2. `&a + &b` ничего не вычисляет. Возвращается новый `Tensor`, который *описывает* сложение. `&` заимствует тензоры, чтобы их можно было использовать повторно.
 
-3. `realize()` is where the magic happens. Morok:
-   - Analyzes the computation graph
-   - Fuses operations where possible
-   - Generates optimized code
-   - Executes on the target device
+3. `realize()` — здесь происходит магия. Morok:
+   - Анализирует граф вычислений
+   - Фьюзит операции, где это возможно
+   - Генерирует оптимизированный код
+   - Выполняет на целевом устройстве
 
-4. `to_ndarray()` extracts the result as an `ndarray::ArrayD` for inspection.
+4. `to_ndarray()` извлекает результат в виде `ndarray::ArrayD` для просмотра.
 
-**Try this:** Remove the `realize()` call. The code still runs, but `data` would be empty—nothing was computed.
+**Попробуйте:** Уберите вызов `realize()`. Код всё ещё запустится, но `data` будет пустым — ничего не было вычислено.
 
 ---
 
-## Example 2: Shape Gymnastics
+## Пример 2: Гимнастика с формами
 
-Neural networks constantly reshape data. Let's master the basics.
+Нейросети постоянно меняют форму данных. Освоим базовые операции.
 
 ```rust
 use ndarray::array;
@@ -105,20 +105,20 @@ fn shape_example() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-**Key operations:**
+**Ключевые операции:**
 
-| Operation | What it does |
-|-----------|--------------|
-| `try_reshape(&[2, 3])` | Change shape (same total elements) |
-| `try_reshape(&[-1, 3])` | Infer dimension from total size |
-| `try_transpose(0, 1)` | Swap dimensions 0 and 1 |
-| `try_squeeze(dim)` | Remove dimension of size 1 |
-| `try_unsqueeze(dim)` | Add dimension of size 1 |
+| Операция | Что делает |
+|----------|------------|
+| `try_reshape(&[2, 3])` | Изменить форму (то же количество элементов) |
+| `try_reshape(&[-1, 3])` | Вывести размерность из общего числа элементов |
+| `try_transpose(0, 1)` | Поменять местами размерности 0 и 1 |
+| `try_squeeze(dim)` | Убрать размерность длины 1 |
+| `try_unsqueeze(dim)` | Добавить размерность длины 1 |
 
-**Broadcasting rules** (same as NumPy/PyTorch):
-- Shapes align from the right
-- Each dimension must match or be 1
-- Dimensions of size 1 are "stretched" to match
+**Правила broadcasting** (такие же, как в NumPy/PyTorch):
+- Формы выравниваются справа
+- Каждая размерность должна совпадать или быть равна 1
+- Размерности равные 1 «растягиваются» до нужного значения
 
 ```text
 [3, 2] + [1, 2] → [3, 2]  ✓ (1 broadcasts to 3)
@@ -128,9 +128,9 @@ fn shape_example() -> Result<(), Box<dyn std::error::Error>> {
 
 ---
 
-## Example 3: Matrix Multiply
+## Пример 3: Матричное умножение
 
-Matrix multiplication is the workhorse of neural networks. Every layer uses it.
+Матричное умножение — рабочая лошадка нейросетей. Каждый слой его использует.
 
 ```rust
 use ndarray::array;
@@ -163,22 +163,22 @@ fn matmul_example() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-**Shape rules for `dot()`:**
+**Правила форм для `dot()`:**
 
-| Left | Right | Result |
-|------|-------|--------|
+| Левый | Правый | Результат |
+|-------|--------|-----------|
 | `[M, K]` | `[K, N]` | `[M, N]` |
-| `[K]` | `[K, N]` | `[N]` (vector-matrix) |
-| `[M, K]` | `[K]` | `[M]` (matrix-vector) |
-| `[B, M, K]` | `[B, K, N]` | `[B, M, N]` (batched) |
+| `[K]` | `[K, N]` | `[N]` (вектор-матрица) |
+| `[M, K]` | `[K]` | `[M]` (матрица-вектор) |
+| `[B, M, K]` | `[B, K, N]` | `[B, M, N]` (батч) |
 
-The inner dimensions must match (the `K`). Think of it as: "for each row of left, dot product with each column of right."
+Внутренние размерности должны совпадать (`K`). Суть: «для каждой строки левого — скалярное произведение с каждым столбцом правого».
 
 ---
 
-## Example 4: Building a Linear Layer
+## Пример 4: Линейный слой
 
-A linear layer computes `y = x @ W.T + b`. Let's build one from scratch.
+Линейный слой вычисляет `y = x @ W.T + b`. Morok предоставляет `nn::Linear` из коробки.
 
 ```rust
 use morok_tensor::{Tensor, nn::{Linear, Layer}};
@@ -200,20 +200,20 @@ fn linear_example() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-**Why transpose the weights?**
+**Зачем транспонировать веса?**
 
-PyTorch convention stores weights as `[out_features, in_features]`. For a layer mapping 4 → 2:
-- Weight shape: `[2, 4]`
-- Input shape: `[4]` or `[batch, 4]`
-- We need: `input @ weight.T` = `[batch, 4] @ [4, 2]` = `[batch, 2]`
+В PyTorch принято хранить веса как `[out_features, in_features]`. Для слоя 4 → 2:
+- Форма весов: `[2, 4]`
+- Форма входа: `[4]` или `[batch, 4]`
+- Нужно: `input @ weight.T` = `[batch, 4] @ [4, 2]` = `[batch, 2]`
 
-This convention makes it easy to read the weight matrix: row `i` contains all weights feeding into output `i`.
+Такое соглашение удобно для чтения матрицы весов: строка `i` содержит все веса, ведущие в выход `i`.
 
 ---
 
-## Example 5: MNIST Classifier
+## Пример 5: Классификатор MNIST
 
-Let's build a complete neural network that could classify handwritten digits.
+Построим полноценную нейросеть, используя `sequential()` для цепочки слоёв.
 
 ```rust
 use morok_tensor::{Tensor, nn::{Linear, Relu, Layer}};
@@ -247,23 +247,23 @@ fn mnist_example() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-**Key concepts:**
+**Ключевые концепции:**
 
-1. **`sequential()`** chains layers together: each layer's output feeds into the next. No manual wiring needed.
+1. **`sequential()`** соединяет слои в цепочку: выход каждого слоя подаётся на вход следующему. Ручная прокладка не нужна.
 
-2. **ReLU activation:** `Relu` is a zero-size layer that applies `max(0, x)`. It introduces non-linearity—without it, stacking linear layers would just be one big linear layer.
+2. **Активация ReLU:** `Relu` — zero-size слой, который применяет `max(0, x)`. Вносит нелинейность — без неё стек линейных слоёв оставался бы одним большим линейным слоем.
 
-3. **Logits vs probabilities:** The raw output of the last layer (logits) can be any real number. `softmax()` converts them to probabilities that sum to 1.
+3. **Logits и вероятности:** Сырой выход последнего слоя (logits) может быть любым вещественным числом. `softmax()` превращает их в вероятности с суммой 1.
 
-4. **argmax:** Returns the index of the maximum value—the predicted class.
+4. **argmax:** Возвращает индекс максимального значения — предсказанный класс.
 
-5. **Batch dimension:** We use shape `[1, 784]` for a single image. For 32 images, use `[32, 784]`. The model handles batches automatically.
+5. **Размерность батча:** Форма `[1, 784]` для одного изображения. Для 32 изображений — `[32, 784]`. Модель обрабатывает батчи автоматически.
 
 ---
 
-## Example 6: Under the Hood
+## Пример 6: Под капотом
 
-Want to see what Morok generates? Here's how to inspect the IR and generated code.
+Хотите увидеть, что генерирует Morok? Вот как заглянуть в IR и сгенерированный код.
 
 ```rust
 fn inspect_compilation() -> Result<(), Box<dyn std::error::Error>> {
@@ -292,44 +292,44 @@ fn inspect_compilation() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-**What you'll see:**
+**Что вы увидите:**
 
-1. **IR Graph:** The UOp tree shows operations like `BUFFER`, `LOAD`, `ADD`, `STORE`. This is Morok's intermediate representation before optimization.
+1. **IR-граф:** UOp-дерево показывает операции вроде `BUFFER`, `LOAD`, `ADD`, `STORE`. Это промежуточное представление Morok до оптимизаций.
 
-2. **Generated Code:** The actual LLVM IR or GPU code that runs. Notice how Morok fuses the loads and add into a single kernel—no intermediate buffers needed.
+2. **Сгенерированный код:** Реальный LLVM IR или GPU-код, который выполняется. Обратите внимание, как Morok фьюзит загрузки и сложение в одно ядро — промежуточные буферы не нужны.
 
-**Debugging tip:** If something seems slow or wrong, print the IR tree. Look for:
-- Unexpected operations (redundant reshapes, extra copies)
-- Missing fusion (separate kernels where one would do)
-- Shape mismatches (often the root cause of errors)
+**Совет по отладке:** Если что-то кажется медленным или неправильным, напечатайте IR-дерево. Ищите:
+- Неожиданные операции (лишние reshape, дополнительные копии)
+- Отсутствие фьюзинга (отдельные ядра там, где хватило бы одного)
+- Несовпадения форм (часто коренная причина ошибок)
 
 ---
 
-## Summary
+## Итого
 
-You've learned the core patterns for using Morok:
+Вы освоили основные паттерны работы с Morok:
 
-| Task | Code |
-|------|------|
-| Create tensor | `Tensor::from_slice([1.0f32, 2.0])` |
-| Arithmetic | `&a + &b`, `&a * &b`, `-&a` |
-| Reshape | `t.try_reshape(&[2, 3])?` |
-| Transpose | `t.try_transpose(0, 1)?` |
-| Matrix multiply | `a.dot(&b)?` |
-| Linear layer | `Linear::with_dims(in, out, dtype)` |
-| Chain layers | `x.sequential(&[&fc1, &Relu, &fc2])?` |
-| Activation | `t.relu()?`, `t.softmax(-1)?` |
-| Execute | `t.realize()?` |
-| Extract data | `result.to_ndarray::<f32>()?` |
+| Задача | Код |
+|--------|-----|
+| Создать тензор | `Tensor::from_slice([1.0f32, 2.0])` |
+| Арифметика | `&a + &b`, `&a * &b`, `-&a` |
+| Изменить форму | `t.try_reshape(&[2, 3])?` |
+| Транспонирование | `t.try_transpose(0, 1)?` |
+| Матричное умножение | `a.dot(&b)?` |
+| Линейный слой | `Linear::with_dims(in, out, dtype)` |
+| Цепочка слоёв | `x.sequential(&[&fc1, &Relu, &fc2])?` |
+| Активация | `t.relu()?`, `t.softmax(-1)?` |
+| Выполнить | `t.realize()?` |
+| Извлечь данные | `result.to_ndarray::<f32>()?` |
 
-**The lazy evaluation pattern:**
+**Паттерн ленивых вычислений:**
 
-1. Build your computation graph with operations
-2. Call `realize()` once at the end
-3. Morok optimizes and executes everything together
+1. Постройте граф вычислений с помощью операций
+2. Вызовите `realize()` один раз в конце
+3. Morok оптимизирует и выполняет всё вместе
 
-**Next steps:**
+**Дальше:**
 
-- [Op Bestiary](./architecture/op-bestiary) — Reference for IR operations
-- [Execution Pipeline](./architecture/pipeline) — How compilation works
-- [Optimization System](./architecture/optimizations) — Pattern-based rewrites
+- [Op Bestiary](./architecture/op-bestiary) — справочник по IR-операциям
+- [Пайплайн выполнения](./architecture/pipeline) — как устроена компиляция
+- [Система оптимизаций](./architecture/optimizations) — перезапись на основе паттернов

@@ -1,25 +1,25 @@
 ---
-sidebar_label: Introduction
+sidebar_label: Введение
 ---
 
 # Morok
 
-> ⚠️ **Pre-alpha software.** APIs are unstable and may change without notice. Not recommended for production use. 🚧💀
+> **Пре-альфа.** API нестабильный и может измениться без предупреждения. Не рекомендуется для продакшна.
 
-Morok is a Rust-based ML compiler inspired by [Tinygrad](https://github.com/tinygrad/tinygrad). It features lazy tensor evaluation with UOp-based IR, pattern-driven optimization, and multi-backend code generation.
+Morok — ML-компилятор на Rust, вдохновлённый [Tinygrad](https://github.com/tinygrad/tinygrad). Ленивые тензорные вычисления на основе UOp IR, паттерн-ориентированные оптимизации и кодогенерация под несколько бэкендов.
 
-## Highlights
+## Основные возможности
 
-| Feature | Description |
-|---------|-------------|
-| **Declarative Optimization** | `patterns!` DSL for graph rewrites with Z3-verified correctness |
-| **Lazy Evaluation** | Tensors build computation graphs, compiled only at `realize()` |
-| **CUDA Support** | Unified memory, D2D copy, LRU buffer caching |
-| **Provenance Tracking** | `#[track_caller]` traces every UOp to source location |
-| **80+ IR Operations** | Arithmetic, memory, control flow, WMMA tensor cores |
-| **20+ Optimizations** | Constant folding, tensor cores, vectorization, loop unrolling |
+| Возможность | Описание |
+|-------------|----------|
+| **Декларативные оптимизации** | DSL `patterns!` для перезаписи графов с Z3-верифицированной корректностью |
+| **Ленивые вычисления** | Тензоры строят граф вычислений, компиляция происходит только при `realize()` |
+| **Поддержка CUDA** | Unified memory, D2D copy, LRU-кэширование буферов |
+| **Трассировка происхождения** | `#[track_caller]` привязывает каждый UOp к месту в исходном коде |
+| **80+ IR-операций** | Арифметика, память, control flow, WMMA tensor cores |
+| **20+ оптимизаций** | Свёртка констант, tensor cores, векторизация, развёртка циклов |
 
-## Quick Example
+## Быстрый пример
 
 ```rust
 use morok_tensor::Tensor;
@@ -33,6 +33,6 @@ let c = (&a + &b).sum();
 let result = c.realize()?;
 ```
 
-## License
+## Лицензия
 
 MIT

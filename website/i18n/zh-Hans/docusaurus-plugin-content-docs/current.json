@@ -4,15 +4,15 @@
     "description": "The label for version current"
   },
   "sidebar.defaultSidebar.category.Getting Started": {
-    "message": "Getting Started",
+    "message": "快速上手",
     "description": "The label for category 'Getting Started' in sidebar 'defaultSidebar'"
   },
   "sidebar.defaultSidebar.category.Architecture": {
-    "message": "Architecture",
+    "message": "架构",
     "description": "The label for category 'Architecture' in sidebar 'defaultSidebar'"
   },
   "sidebar.defaultSidebar.doc.Introduction": {
-    "message": "Introduction",
+    "message": "简介",
     "description": "The label for the doc item 'Introduction' in sidebar 'defaultSidebar', linking to the doc introduction"
   }
 }

@@ -1,61 +1,63 @@
 ---
-sidebar_label: Op Bestiary
+sidebar_label: 操作图鉴
 ---
 
-# Op Bestiary: A Field Guide to UOp Operations
+# 操作图鉴：UOp 操作速查手册
 
-When debugging Morok IR dumps, you'll encounter operations that aren't obvious from their names. This chapter documents non-trivial operations with signatures, field explanations, and examples.
+调试 Morok IR 输出时，你会遇到一些从名字上看不太直观的操作。本章记录了那些需要解释的操作，包括签名、字段说明和示例。
 
-**What's covered:** Operations that require explanation—loop control, reductions, memory operations, kernel structure, vectorization, tensor cores.
+**涵盖内容：** 需要解释的操作——循环控制、规约、内存操作、内核结构、向量化、张量核心。
 
-**What's NOT covered:** Trivial ALU operations (`Add`, `Mul`, `Sqrt`, etc.) that work exactly as you'd expect.
+**不涵盖：** 简单的 ALU 操作（`Add`、`Mul`、`Sqrt` 等），它们的行为完全符合直觉。
 
 ---
 
-## Loop Control: RANGE and END
+## 循环控制：RANGE 和 END
 
-### RANGE — Loop Scope Opener
+### RANGE — 循环作用域开启
 
 ```rust
 Range {
     end: Arc<UOp>,           // loop bound (exclusive)
     axis_id: AxisId,         // identifier for deduplication
     axis_type: AxisType,     // scheduling behavior
+    deps: SmallVec<[Arc<UOp>; 2]>,  // range dependencies
 }
 ```
 
-**Fields:**
+**字段：**
 
-| Field | Type | Purpose |
-|-------|------|---------|
-| `end` | `Arc<UOp>` | Upper bound (exclusive), typically a `CONST` |
-| `axis_id` | `AxisId` | `Unrenumbered(n)` before kernel splitting, `Renumbered(n)` after |
-| `axis_type` | `AxisType` | Determines how the loop is scheduled (see below) |
+| 字段 | 类型 | 用途 |
+|------|------|------|
+| `end` | `Arc<UOp>` | 上界（不包含），通常是一个 `CONST` |
+| `axis_id` | `AxisId` | 内核分割前为 `Unrenumbered(n)`，之后为 `Renumbered(n)` |
+| `axis_type` | `AxisType` | 决定循环的调度方式（见下表） |
+| `deps` | `SmallVec<[Arc<UOp>; 2]>` | 该 range 依赖的其他 range |
 
-**AxisType Hierarchy:**
+**AxisType 层级：**
 
-| Type | Priority | GPU Mapping | Purpose |
-|------|----------|-------------|---------|
-| `Outer` | -2 | — | Kernel boundary marker |
-| `Loop` | -1 | `for` loop | Sequential iteration |
-| `Global` | 0 | `blockIdx` | Grid parallelism |
-| `Thread` | 0 | thread pool | CPU parallelism |
-| `Warp` | 1 | warp/wavefront | Sub-group parallelism |
-| `Local` | 2 | `threadIdx` | Workgroup parallelism |
-| `GroupReduce` | 2 | shared memory | Two-stage reduction |
-| `Upcast` | 3 | SIMD | Vectorization |
-| `Reduce` | 4 | accumulator | Reduction dimension |
-| `Unroll` | 5 | unrolled | Loop unrolling |
+| 类型 | 优先级 | GPU 映射 | 用途 |
+|------|--------|----------|------|
+| `Outer` | -2 | — | 内核边界标记 |
+| `Loop` | -1 | `for` 循环 | 顺序迭代 |
+| `Global` | 0 | `blockIdx` | 网格并行 |
+| `Thread` | 0 | 线程池 | CPU 并行 |
+| `Warp` | 1 | warp/wavefront | 子组并行 |
+| `Local` | 2 | `threadIdx` | 工作组并行 |
+| `GroupReduce` | 2 | 共享内存 | 两阶段规约 |
+| `Upcast` | 3 | SIMD | 向量化 |
+| `Reduce` | 4 | 累加器 | 规约维度 |
+| `Unroll` | 5 | 展开 | 循环展开 |
 
-Priority determines loop nesting order—lower values are outer loops.
+优先级决定循环嵌套顺序——值越小越在外层。
 
-**Example:**
+**示例：**
 ```text
 RANGE(end=128, axis_id=R0, type=Global)
 └── CONST(128) : Index
 ```
 
-### END — Loop Scope Closer
+### END — 循环作用域关闭
 
 ```rust
 End {
@@ -64,9 +66,9 @@ End {
 }
 ```
 
-END closes one or more RANGE scopes and removes them from the active set. Multiple ranges can be closed simultaneously.
+END 关闭一个或多个 RANGE 作用域，并将其从活跃集合中移除。可以同时关闭多个 range。
 
-**Example:**
+**示例：**
 ```text
 END
 ├── STORE(...)           — computation
@@ -76,11 +78,11 @@ END
 
 ---
 
-## Reduction: REDUCE vs REDUCE_AXIS
+## 规约：REDUCE 与 REDUCE_AXIS
 
-Two operations with similar names serve different purposes.
+两个名字相似的操作，用途不同。
 
-### REDUCE_AXIS — Tensor Dimension Reduction (High-Level)
+### REDUCE_AXIS — 张量维度规约（高层）
 
 ```rust
 ReduceAxis {
@@ -90,17 +92,17 @@ ReduceAxis {
 }
 ```
 
-Used **before** rangeify. Operates on tensor dimensions like NumPy's `.sum(axis=0)`.
+用于 rangeify **之前**。对张量维度进行操作，类似于 NumPy 的 `.sum(axis=0)`。
 
-**Example:**
+**示例：**
 ```text
 REDUCE_AXIS(Add, axes=[1])
 └── BUFFER[10, 20] : Float32
 ```
 
-This reduces a `[10, 20]` tensor to `[10]` by summing along axis 1.
+将一个 `[10, 20]` 的张量沿 axis 1 求和，规约为 `[10]`。
 
-### REDUCE — Range Iteration Reduction (Low-Level)
+### REDUCE — Range 迭代规约（底层）
 
 ```rust
 Reduce {
@@ -110,20 +112,20 @@ Reduce {
 }
 ```
 
-Used **after** rangeify. Accumulates values across RANGE iterations and closes the specified ranges.
+用于 rangeify **之后**。在 RANGE 迭代中累加值，并关闭指定的 range。
 
-**ReduceOp Variants:**
+**ReduceOp 变体：**
 
-| Op | Identity | Operation | Tinygrad |
-|----|----------|-----------|----------|
+| 操作 | 单位元 | 运算 | Tinygrad |
+|------|--------|------|----------|
 | `Add` | 0 | `acc + value` | ✓ |
 | `Mul` | 1 | `acc * value` | ✓ |
 | `Max` | -∞ | `max(acc, value)` | ✓ |
-| `Min` | +∞ | `min(acc, value)` | Morok-only |
+| `Min` | +∞ | `min(acc, value)` | 仅 Morok |
 
-> **Compatibility:** Tinygrad's spec restricts REDUCE_AXIS to `{Add, Mul, Max}`. Morok extends this with `Min`.
+> **兼容性：** Tinygrad 的规范将 REDUCE_AXIS 限制为 `{Add, Mul, Max}`。Morok 额外支持 `Min`。
 
-**Example:**
+**示例：**
 ```text
 REDUCE(Add)
 ├── MUL                      — value to accumulate
@@ -133,7 +135,7 @@ REDUCE(Add)
     └── CONST(64)
 ```
 
-### ALLREDUCE — Cross-Device Reduction
+### ALLREDUCE — 跨设备规约
 
 ```rust
 AllReduce {
@@ -143,13 +145,13 @@ AllReduce {
 }
 ```
 
-Performs distributed reduction across multiple devices. Used for multi-GPU training.
+在多个设备之间执行分布式规约，用于多 GPU 训练。
 
 ---
 
-## Buffer Operations
+## Buffer 操作
 
-### BUFFER — Buffer Declaration
+### BUFFER — Buffer 声明
 
 ```rust
 Buffer {
@@ -159,9 +161,9 @@ Buffer {
 }
 ```
 
-Declares a buffer for tensor storage. The `unique` field ensures distinct buffers even with identical size/device.
+声明一个用于张量存储的 buffer。`unique` 字段确保即使 size/device 相同，不同 buffer 也能区分。
 
-### BUFFERIZE — Materialization Marker
+### BUFFERIZE — 物化标记
 
 ```rust
 Bufferize {
@@ -171,16 +173,16 @@ Bufferize {
 }
 ```
 
-Marks where computation should materialize to memory. Triggers kernel splitting.
+标记计算结果应物化到内存的位置，触发内核分割。
 
-**BufferizeOpts:**
+**BufferizeOpts：**
 
-| Field | Type | Purpose |
-|-------|------|---------|
-| `device` | `Option<DeviceSpec>` | Target device, `None` for local |
-| `addrspace` | `AddrSpace` | `Global` (device) or `Local` (shared) |
+| 字段 | 类型 | 用途 |
+|------|------|------|
+| `device` | `Option<DeviceSpec>` | 目标设备，`None` 表示本地 |
+| `addrspace` | `AddrSpace` | `Global`（设备）或 `Local`（共享） |
 
-**Example:**
+**示例：**
 ```text
 BUFFERIZE(opts={addrspace=Global})
 ├── REDUCE(Add, ...)         — computation
@@ -188,7 +190,7 @@ BUFFERIZE(opts={addrspace=Global})
 └── RANGE(R1, Global)        — output dim 1
 ```
 
-### INDEX — Multi-Dimensional Buffer Access
+### INDEX — 多维 Buffer 访问
 
 ```rust
 Index {
@@ -198,9 +200,9 @@ Index {
 }
 ```
 
-Computes memory address from multi-dimensional indices. Returns element dtype (not pointer).
+从多维索引计算内存地址。返回元素 dtype（不是指针）。
 
-**Example:**
+**示例：**
 ```text
 INDEX : Float32
 ├── DEFINE_GLOBAL(0)
@@ -209,7 +211,7 @@ INDEX : Float32
 └── MUL(...)                 — index for dim 2
 ```
 
-### POINTER_INDEX — Low-Level Pointer Arithmetic
+### POINTER_INDEX — 底层指针算术
 
 ```rust
 PointerIndex {
@@ -218,22 +220,23 @@ PointerIndex {
 }
 ```
 
-Direct pointer arithmetic. Used after linearization when indices are flattened.
+直接指针算术。在线性化后、索引被展平时使用。
 
-> **Compatibility:** Tinygrad uses `INDEX` with a `ptr=True` flag instead of a separate operation.
+> **兼容性：** Tinygrad 使用 `INDEX` 加 `ptr=True` 标志，而不是独立的操作。
 
-### LOAD — Memory Read
+### LOAD — 内存读取
 
 ```rust
 Load {
     buffer: Arc<UOp>,        // buffer or pointer
     index: Arc<UOp>,         // INDEX op
+    alt: Option<Arc<UOp>>,   // alternative value for gated loads
 }
 ```
 
-Read value from buffer at index. For gated loads, use an INDEX with a gate (INDEX has an optional `gate` field).
+从 buffer 的指定索引处读取值。对于门控加载，`alt` 字段提供当 INDEX 的 `gate` 为 false 时的替代值（完全跳过内存访问）。
 
-**Example:**
+**示例：**
 ```text
 LOAD : Float32
 ├── DEFINE_GLOBAL(1)
@@ -243,28 +246,26 @@ LOAD : Float32
     └── RANGE(R2)
 ```
 
-### STORE — Memory Write
+### STORE — 内存写入
 
 ```rust
 Store {
-    buffer: Arc<UOp>,                   // output buffer
-    index: Arc<UOp>,                    // INDEX op
+    index: Arc<UOp>,                    // INDEX op (buffer accessed via index.src[0])
     value: Arc<UOp>,                    // value to write
     ranges: SmallVec<[Arc<UOp>; 4]>,    // ranges being closed
 }
 ```
 
-Write value to buffer. STORE closes the specified ranges, which represent output iteration dimensions. The ranges field is used for output upcasting: when a `Range(Upcast)` is included, it becomes `UNROLL` during expansion, then contracted via `CONTRACT`.
+向 buffer 写入值。Buffer 通过 INDEX 节点（`index.src[0]`）访问，而不是单独的字段。STORE 关闭指定的 range，这些 range 代表输出迭代维度。ranges 字段用于输出 upcast：当包含 `Range(Upcast)` 时，展开阶段会将其变为 `UNROLL`，再通过 `CONTRACT` 收缩。
 
-For gated stores, use an INDEX with a gate (INDEX has an optional `gate` field).
+对于门控写入，使用带 gate 的 INDEX（INDEX 有一个可选的 `gate` 字段）。
 
-> **Compatibility:** Morok's STORE has an explicit `index` field (sources: buffer=0, index=1, value=2, ranges=3+). Tinygrad's STORE combines buffer and value differently (range_start=2).
+> **兼容性：** Morok 的 STORE 没有单独的 `buffer` 字段——源为：index=0, value=1, ranges=2+（range_start=2）。Tinygrad 的布局类似。
 
-**Example:**
+**示例：**
 ```text
 STORE
-├── DEFINE_GLOBAL(0)         — output buffer
-├── INDEX[R0, R1]            — write address
+├── INDEX[R0, R1]            — write address (buffer via index.src[0])
 ├── REDUCE(Add, ...)         — value
 ├── RANGE(R0, Global)        — output dim 0 (closed)
 └── RANGE(R1, Global)        — output dim 1 (closed)
@@ -272,9 +273,9 @@ STORE
 
 ---
 
-## Kernel Structure
+## 内核结构
 
-### KERNEL — Kernel Wrapper
+### KERNEL — 内核包装器
 
 ```rust
 Kernel {
@@ -283,9 +284,9 @@ Kernel {
 }
 ```
 
-Wraps a complete kernel for code generation. Sources are kernel arguments (`DefineGlobal`, `DefineLocal`, `DefineVar`).
+封装一个完整的内核用于代码生成。sources 是内核参数（`DefineGlobal`、`DefineLocal`、`DefineVar`）。
 
-**Example:**
+**示例：**
 ```text
 KERNEL
 ├── DEFINE_GLOBAL(0)         — output buffer arg
@@ -295,7 +296,7 @@ KERNEL
     └── STORE(...)
 ```
 
-### SINK — Multiple Root Collector
+### SINK — 多根收集器
 
 ```rust
 Sink {
@@ -303,9 +304,9 @@ Sink {
 }
 ```
 
-Collects multiple outputs into a single root. Every kernel's `ast` is typically a SINK containing STORE operations.
+将多个输出收集到一个根节点。每个内核的 `ast` 通常是一个包含 STORE 操作的 SINK。
 
-**Example:**
+**示例：**
 ```text
 SINK
 ├── STORE(output_0, ...)
@@ -313,7 +314,7 @@ SINK
 └── STORE(output_2, ...)
 ```
 
-### AFTER — Dependency Marker
+### AFTER — 依赖标记
 
 ```rust
 After {
@@ -322,9 +323,9 @@ After {
 }
 ```
 
-Expresses execution dependencies between kernels without data dependency. The `passthrough` value is returned unchanged, but only after all `deps` complete.
+表达内核之间的执行依赖，不涉及数据依赖。`passthrough` 值原样返回，但必须在所有 `deps` 完成后才执行。
 
-**Example:**
+**示例：**
 ```text
 SINK
 ├── AFTER
@@ -333,7 +334,7 @@ SINK
 └── KERNEL(...)              — can use buffer after AFTER
 ```
 
-### BARRIER — Synchronization Fence
+### BARRIER — 同步栅栏
 
 ```rust
 Barrier {
@@ -342,13 +343,13 @@ Barrier {
 }
 ```
 
-GPU workgroup synchronization. Ensures all threads in a workgroup reach the barrier before continuing.
+GPU 工作组同步。确保工作组中的所有线程到达栅栏后才继续执行。
 
 ---
 
-## Vector Operations
+## 向量操作
 
-### VECTORIZE — Create Vector from Scalars
+### VECTORIZE — 从标量创建向量
 
 ```rust
 Vectorize {
@@ -356,9 +357,9 @@ Vectorize {
 }
 ```
 
-Combines N scalar values into a vector of size N. All elements must have the same base dtype.
+将 N 个标量值组合成一个大小为 N 的向量。所有元素必须具有相同的基础 dtype。
 
-**Example:**
+**示例：**
 ```text
 VECTORIZE : <4 x Float32>
 ├── CONST(1.0)
@@ -367,7 +368,7 @@ VECTORIZE : <4 x Float32>
 └── CONST(4.0)
 ```
 
-### GEP — Get Element Pointer (Vector Extract)
+### GEP — Get Element Pointer（向量元素提取）
 
 ```rust
 Gep {
@@ -376,18 +377,18 @@ Gep {
 }
 ```
 
-Extracts elements from a vector:
-- Single index → scalar
-- Multiple indices → smaller vector
+从向量中提取元素：
+- 单个索引 → 标量
+- 多个索引 → 更小的向量
 
-**Example:**
+**示例：**
 ```text
 GEP([0, 2]) : <2 x Float32>
 └── VECTORIZE : <4 x Float32>
     └── ...
 ```
 
-### VConst — Vector Constant
+### VConst — 向量常量
 
 ```rust
 VConst {
@@ -395,9 +396,9 @@ VConst {
 }
 ```
 
-Vector of compile-time constants. More efficient than `VECTORIZE` of `CONST` nodes.
+编译期常量向量。比用 `CONST` 节点构建 `VECTORIZE` 更高效。
 
-### CAT — Concatenate Vectors
+### CAT — 向量拼接
 
 ```rust
 Cat {
@@ -405,16 +406,16 @@ Cat {
 }
 ```
 
-Concatenates vectors into a larger vector. Output `vcount` = sum of input `vcount`s.
+将多个向量拼接成更大的向量。输出的 `vcount` = 各输入 `vcount` 之和。
 
-**Example:**
+**示例：**
 ```text
 CAT : <8 x Float32>
 ├── VECTORIZE : <4 x Float32>
 └── VECTORIZE : <4 x Float32>
 ```
 
-### PtrCat — Concatenate Pointers
+### PtrCat — 指针拼接
 
 ```rust
 PtrCat {
@@ -422,13 +423,13 @@ PtrCat {
 }
 ```
 
-Groups memory accesses for vectorized load/store. Used by the devectorizer pass.
+将内存访问分组以实现向量化 load/store。由 devectorizer pass 使用。
 
 ---
 
-## Expansion: UNROLL and CONTRACT
+## 展开：UNROLL 和 CONTRACT
 
-### UNROLL — Expand Computation Across Iterations
+### UNROLL — 跨迭代展开计算
 
 ```rust
 Unroll {
@@ -437,11 +438,11 @@ Unroll {
 }
 ```
 
-Creates multiple versions of computation for different iteration values. Used for loop unrolling optimization.
+为不同的迭代值创建计算的多个副本，用于循环展开优化。
 
-**Example:** `UNROLL(unroll_axes=[(0, 4)])` expands computation 4 times with different index values.
+**示例：** `UNROLL(unroll_axes=[(0, 4)])` 将计算展开 4 次，使用不同的索引值。
 
-### CONTRACT — Collapse Unrolled Values to Vector
+### CONTRACT — 将展开的值收缩为向量
 
 ```rust
 Contract {
@@ -450,22 +451,22 @@ Contract {
 }
 ```
 
-The inverse of UNROLL—collects expanded scalar values into a vector. Output vector size = product of factors.
+UNROLL 的逆操作——将展开的标量值收集成一个向量。输出向量大小 = 各 factor 之积。
 
-**Example:**
+**示例：**
 ```text
 CONTRACT(upcast_ranges=[(0, 4)]) : <4 x Float32>
 └── UNROLL(unroll_axes=[(0, 4)])
     └── LOAD(...)
 ```
 
-This pattern vectorizes a load: expand 4 iterations, then pack results into a 4-element vector.
+这个模式实现了 load 的向量化：展开 4 次迭代，然后将结果打包成 4 元素向量。
 
 ---
 
-## Tensor Cores: WMMA
+## 张量核心：WMMA
 
-### WMMA — Warp Matrix Multiply-Accumulate
+### WMMA — Warp 矩阵乘累加
 
 ```rust
 Wmma {
@@ -476,22 +477,23 @@ Wmma {
 }
 ```
 
-Hardware tensor core operation: `D = A × B + C`. Requires specific matrix shapes and data layouts.
+硬件张量核心操作：`D = A × B + C`。需要特定的矩阵形状和数据布局。
 
-**WmmaMetadata Fields:**
+**WmmaMetadata 字段：**
 
-| Field | Type | Purpose |
-|-------|------|---------|
-| `name` | `String` | Instruction name (e.g., `"__hmma..."`) |
-| `dims` | `(N, M, K)` | Matrix dimensions (e.g., `(16, 16, 16)`) |
-| `dtype_in` | `DType` | Input matrix precision (e.g., `Float16`) |
-| `dtype_out` | `DType` | Output precision (e.g., `Float32`) |
-| `device` | `String` | Target device string |
-| `threads` | `usize` | Threads per warp (typically 32) |
-| `upcast_axes` | `Vec<(usize, usize)>` | Vectorization for output |
-| `reduce_axes` | `Vec<(usize, usize)>` | Contraction axes |
+| 字段 | 类型 | 用途 |
+|------|------|------|
+| `name` | `String` | 指令名称（如 `"__hmma..."`） |
+| `dims` | `(N, M, K)` | 矩阵维度（如 `(16, 16, 16)`） |
+| `dtype_in` | `DType` | 输入矩阵精度（如 `Float16`） |
+| `dtype_out` | `DType` | 输出精度（如 `Float32`） |
+| `device` | `String` | 目标设备字符串 |
+| `threads` | `usize` | 每个 warp 的线程数（通常 32） |
+| `upcast_axes` | `WmmaUpcastAxes` | 各操作数的向量化信息（字段：`a`、`b`、`c`） |
+| `reduce_axes` | `Vec<(usize, usize)>` | 收缩轴 |
+| `tile_grid` | `(usize, usize)` | 多 FMA 批处理网格（默认 (1,1)） |
 
-**Example:**
+**示例：**
 ```text
 WMMA(dims=(16, 16, 16), dtype_in=Float16, dtype_out=Float32)
 ├── A fragment : <8 x Float16>
@@ -501,9 +503,9 @@ WMMA(dims=(16, 16, 16), dtype_in=Float16, dtype_out=Float32)
 
 ---
 
-## Control Flow
+## 控制流
 
-### IF / ENDIF — Conditional Execution
+### IF / ENDIF — 条件执行
 
 ```rust
 If {
@@ -516,9 +518,9 @@ EndIf {
 }
 ```
 
-Execute body only when condition is true. Used for boundary checks and sparse operations.
+仅在条件为真时执行 body。用于边界检查和稀疏操作。
 
-**Example:**
+**示例：**
 ```text
 IF
 ├── LT(idx, bound)           — condition (src[0])
@@ -531,25 +533,25 @@ ENDIF
 
 ---
 
-## Definition Operations
+## 定义操作
 
-### DEFINE_GLOBAL — Device Memory Argument
+### DEFINE_GLOBAL — 设备内存参数
 
 ```rust
 DefineGlobal(usize)          // argument index
 ```
 
-Kernel argument for device (global) memory. Index refers to position in kernel argument list.
+设备（全局）内存的内核参数。index 指的是内核参数列表中的位置。
 
-### DEFINE_LOCAL — Shared Memory Allocation
+### DEFINE_LOCAL — 共享内存分配
 
 ```rust
 DefineLocal(usize)           // local memory index
 ```
 
-GPU shared memory (LDS) allocation. Visible within a workgroup.
+GPU 共享内存（LDS）分配。在工作组内可见。
 
-### DEFINE_VAR — Symbolic Runtime Variable
+### DEFINE_VAR — 符号运行时变量
 
 ```rust
 DefineVar {
@@ -559,24 +561,25 @@ DefineVar {
 }
 ```
 
-Runtime variable with known bounds. Used for dynamic shapes where bounds are known.
+带已知范围的运行时变量。用于已知边界的动态 shape。
 
-**Example:**
+**示例：**
 ```text
 DEFINE_VAR(name="batch_size", min=1, max=128) : Index
 ```
 
-### DEFINE_REG — Register Allocation
+### DEFINE_REG — 寄存器分配
 
 ```rust
 DefineReg {
     size: usize,             // register size
+    id: usize,               // unique accumulator ID
 }
 ```
 
-Allocates a register for intermediate storage. Used in code generation.
+分配一个寄存器用于中间存储。`id` 字段用于区分相同 dtype 的寄存器——没有它的话，两个相同 dtype 的 reduce 会因为 hash consing 共享同一个 DEFINE_REG。用于代码生成。
 
-### BIND — Variable Binding
+### BIND — 变量绑定
 
 ```rust
 Bind {
@@ -585,13 +588,13 @@ Bind {
 }
 ```
 
-Binds a symbolic variable to a concrete value at runtime.
+在运行时将符号变量绑定到具体值。
 
 ---
 
-## Special Operations
+## 特殊操作
 
-### SPECIAL — Hardware-Provided Values
+### SPECIAL — 硬件提供的值
 
 ```rust
 Special {
@@ -600,46 +603,46 @@ Special {
 }
 ```
 
-Accesses hardware-provided values (thread/block indices). Not a loop—the hardware provides the value directly.
+访问硬件提供的值（线程/块索引）。不是循环——硬件直接提供该值。
 
-**Example:**
+**示例：**
 ```text
 SPECIAL(name="blockIdx.x", end=128) : Index
 └── CONST(128)
 ```
 
-### UNIQUE — Identity Marker
+### UNIQUE — 标识标记
 
 ```rust
 Unique(usize)                // unique identifier
 ```
 
-Creates a unique identity for buffer disambiguation. Two buffers with different UNIQUE values are distinct even if otherwise identical.
+为 buffer 消歧创建唯一标识。具有不同 UNIQUE 值的两个 buffer 即使其他属性完全相同也是不同的。
 
-### DEVICE — Device Specification
+### DEVICE — 设备规格
 
 ```rust
 Device(DeviceSpec)           // device specification
 ```
 
-Specifies target device for computation.
+指定计算的目标设备。
 
 ---
 
-## Movement Operations
+## 移动操作
 
-High-level tensor shape transformations. These are converted to explicit INDEX operations during rangeify.
+高层张量 shape 变换。在 rangeify 阶段会被转换为显式的 INDEX 操作。
 
-| Operation | Signature | Purpose |
-|-----------|-----------|---------|
-| `Reshape` | `{ src, new_shape }` | Change shape, same elements |
-| `Permute` | `{ src, axes: Vec<usize> }` | Transpose/reorder axes |
-| `Expand` | `{ src, new_shape }` | Broadcast to larger shape |
-| `Pad` | `{ src, begin_pads, end_pads }` | Add padding |
-| `Shrink` | `{ src, begins, ends }` | Extract sub-region |
-| `Flip` | `{ src, axes: Vec<bool> }` | Reverse along axes |
+| 操作 | 签名 | 用途 |
+|------|------|------|
+| `Reshape` | `{ src, new_shape }` | 改变 shape，元素不变 |
+| `Permute` | `{ src, axes: Vec<usize> }` | 转置/重排轴 |
+| `Expand` | `{ src, new_shape }` | 广播到更大的 shape |
+| `Pad` | `{ src, begin_pads, end_pads }` | 添加填充 |
+| `Shrink` | `{ src, begins, ends }` | 提取子区域 |
+| `Flip` | `{ src, axes: Vec<bool> }` | 沿轴翻转 |
 
-**Example:** RESHAPE
+**示例：** RESHAPE
 ```text
 RESHAPE(new_shape=[6, 4]) : Shape[6, 4]
 ├── BUFFER[2, 3, 4] : Float32
@@ -648,44 +651,65 @@ RESHAPE(new_shape=[6, 4]) : Shape[6, 4]
 
 ---
 
-## Quick Reference
+## 其他操作
 
-### By Category
+以下操作存在于 `Op` 枚举中，但它们要么是内部实现，要么在调试中很少遇到：
 
-| Category | Operations |
-|----------|------------|
-| **Loop Control** | `RANGE`, `END` |
-| **Reduction** | `REDUCE_AXIS`, `REDUCE`, `ALLREDUCE` |
-| **Memory** | `BUFFER`, `BUFFERIZE`, `INDEX`, `POINTER_INDEX`, `LOAD`, `STORE` |
-| **Kernel** | `KERNEL`, `SINK`, `AFTER`, `BARRIER` |
-| **Vector** | `VECTORIZE`, `GEP`, `VCONST`, `CAT`, `PTRCAT` |
-| **Expansion** | `UNROLL`, `CONTRACT` |
-| **Hardware** | `WMMA`, `SPECIAL` |
-| **Control** | `IF`, `ENDIF` |
-| **Definition** | `DEFINE_GLOBAL`, `DEFINE_LOCAL`, `DEFINE_VAR`, `DEFINE_REG`, `BIND`, `UNIQUE`, `DEVICE` |
-| **Movement** | `RESHAPE`, `PERMUTE`, `EXPAND`, `PAD`, `SHRINK`, `FLIP` |
+| 操作 | 用途 |
+|------|------|
+| `Copy` | 显式复制值 |
+| `BufferView` | 带 offset/stride 的 buffer 视图 |
+| `MStack` | 内存栈分配 |
+| `MSelect` | 内存选择（条件内存访问） |
+| `Multi` | 多输出操作 |
+| `Assign` | 变量赋值 |
+| `Group` | 用于调度的操作分组 |
+| `Detach` | 从图中分离（阻止优化穿透） |
+| `Contiguous` | 标记数据连续的提示 |
+| `ContiguousBackward` | contiguous 提示的反向传播 |
+| `Precast` | 类型转换的预转型 |
+| `Custom` / `CustomI` | 自定义操作扩展 |
+
+---
+
+## 速查表
+
+### 按类别
+
+| 类别 | 操作 |
+|------|------|
+| **循环控制** | `RANGE`, `END` |
+| **规约** | `REDUCE_AXIS`, `REDUCE`, `ALLREDUCE` |
+| **内存** | `BUFFER`, `BUFFERIZE`, `INDEX`, `POINTER_INDEX`, `LOAD`, `STORE` |
+| **内核** | `KERNEL`, `SINK`, `AFTER`, `BARRIER` |
+| **向量** | `VECTORIZE`, `GEP`, `VCONST`, `CAT`, `PTRCAT` |
+| **展开** | `UNROLL`, `CONTRACT` |
+| **硬件** | `WMMA`, `SPECIAL` |
+| **控制** | `IF`, `ENDIF` |
+| **定义** | `DEFINE_GLOBAL`, `DEFINE_LOCAL`, `DEFINE_VAR`, `DEFINE_REG`, `BIND`, `UNIQUE`, `DEVICE` |
+| **移动** | `RESHAPE`, `PERMUTE`, `EXPAND`, `PAD`, `SHRINK`, `FLIP` |
 | **ALU** | `Unary(...)`, `Binary(...)`, `Ternary(...)`, `Cast`, `BitCast` |
 
-### Range-Ending Operations
+### Range 终止操作
 
-Operations that close RANGE scopes (remove ranges from active set):
+关闭 RANGE 作用域（从活跃集合中移除 range）的操作：
 
-| Operation | Range Start Index |
-|-----------|-------------------|
+| 操作 | Range 起始索引 |
+|------|----------------|
 | `BUFFERIZE` | 1 (compute=0, ranges=1+) |
 | `REDUCE` | 1 (src=0, ranges=1+) |
-| `STORE` | 3 (buffer=0, index=1, value=2, ranges=3+) |
+| `STORE` | 2 (index=0, value=1, ranges=2+) |
 | `WMMA` | 3 (a=0, b=1, c=2) |
 | `END` | 1 (computation=0, ranges=1+) |
 
-### Expandable Operations
+### 可展开操作
 
-Operations that propagate UNROLL through the computation graph:
+通过计算图传播 UNROLL 的操作：
 
-- ALU: `Unary`, `Binary`, `Ternary`
-- Type: `Cast`, `BitCast`
-- Vector: `Gep`, `Vectorize`
-- Memory: `Load`, `Store`, `Index`, `PointerIndex`
-- Control: `Reduce`, `End`, `After`
-- Buffer: `Bufferize`
-- Hardware: `Wmma`
+- ALU：`Unary`、`Binary`、`Ternary`
+- 类型：`Cast`、`BitCast`
+- 向量：`Gep`、`Vectorize`
+- 内存：`Load`、`Store`、`Index`、`PointerIndex`
+- 控制：`Reduce`、`End`、`After`
+- Buffer：`Bufferize`
+- 硬件：`Wmma`

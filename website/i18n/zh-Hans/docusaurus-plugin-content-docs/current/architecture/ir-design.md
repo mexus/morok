@@ -1,14 +1,14 @@
 ---
-sidebar_label: IR Design Philosophy
+sidebar_label: IR 设计哲学
 ---
 
-# One IR to Rule Them All
+# 一个 IR 统治一切
 
-You're debugging a slow model. The profiler says "kernel X takes 200ms" but you have no idea what kernel X actually *does*. You trace through PyTorch's dispatcher, then ATen, then TorchInductor, then Triton IR, and finally land in LLVM IR. Five different representations, five different mental models, five different debugging tools.
+你正在调试一个慢模型。Profiler 说"kernel X 花了 200ms"，但你完全不知道 kernel X 到底*做了什么*。你翻遍 PyTorch 的 dispatcher，然后是 ATen，然后是 TorchInductor，然后是 Triton IR，最后到达 LLVM IR。五种不同的表示，五种不同的心智模型，五种不同的调试工具。
 
-This is the reality of modern ML compilation. TensorFlow's XLA has a similar story: Python → Graph → XLA HLO → MLIR → LLVM IR. Each layer was added to solve a real problem, but the accumulated complexity is staggering.
+这就是现代 ML 编译的现实。TensorFlow 的 XLA 也类似：Python → Graph → XLA HLO → MLIR → LLVM IR。每一层都是为了解决真实问题而添加的，但累积的复杂度令人咋舌。
 
-Morok takes a different approach, borrowed from [Tinygrad](https://github.com/tinygrad/tinygrad): **one IR from tensors to machine code**.
+Morok 采用了不同的方案，借鉴自 [Tinygrad](https://github.com/tinygrad/tinygrad)：**从张量到机器码，只用一个 IR**。
 
 ```text
 ┌──────────────────┐   ┌─────────────────┐   ┌───────────────┐
@@ -25,15 +25,15 @@ Morok takes a different approach, borrowed from [Tinygrad](https://github.com/ti
 └──────────────────┘   └─────────────────┘   └───────────────┘
 ```
 
-The simplest architecture often wins. This chapter explains how one carefully designed IR can replace an entire compiler stack.
+最简单的架构往往胜出。本章解释一个精心设计的 IR 如何替代整个编译器栈。
 
 ---
 
-## UOp: The Universal Node
+## UOp：通用节点
 
-A **UOp** (micro-operation) is a node in a computation graph. But unlike nodes in other IRs, a UOp can represent operations at *any* abstraction level—from high-level tensor reshapes down to individual CPU instructions.
+**UOp**（微操作）是计算图中的节点。但与其他 IR 中的节点不同，UOp 能表示*任何*抽象层级的操作——从高层张量 reshape 到底层 CPU 指令。
 
-Here's the key insight: instead of having separate IRs for "tensor operations" and "loop structures" and "memory accesses", we put them all in one enum:
+核心洞察是：与其为"张量操作"、"循环结构"和"内存访问"维护各自独立的 IR，不如把它们放进同一个 enum：
 
 ```rust
 pub enum Op {
@@ -56,18 +56,18 @@ pub enum Op {
 }
 ```
 
-The enum has ~80 variants organized by abstraction level:
+这个 enum 包含约 80 个变体，按抽象层级组织：
 
-| Category | Examples | What It Represents |
+| 类别 | 示例 | 表示什么 |
 |----------|----------|-------------------|
-| **Movement** | `RESHAPE`, `PERMUTE`, `EXPAND`, `PAD` | Tensor shape transformations |
-| **Reduction** | `REDUCE_AXIS`, `REDUCE` | Mathematical aggregations |
-| **Control** | `RANGE`, `END`, `IF`, `BARRIER` | Loop and branch structure |
-| **Memory** | `LOAD`, `STORE`, `INDEX`, `BUFFER` | Hardware memory access |
-| **ALU** | `ADD`, `MUL`, `SQRT`, `EXP`, `WHERE` | CPU/GPU instructions |
-| **Advanced** | `WMMA`, `CONTRACT`, `UNROLL` | Tensor cores, vectorization |
+| **变换** | `RESHAPE`, `PERMUTE`, `EXPAND`, `PAD` | 张量形状变换 |
+| **规约** | `REDUCE_AXIS`, `REDUCE` | 数学聚合运算 |
+| **控制** | `RANGE`, `END`, `IF`, `BARRIER` | 循环和分支结构 |
+| **内存** | `LOAD`, `STORE`, `INDEX`, `BUFFER` | 硬件内存访问 |
+| **ALU** | `ADD`, `MUL`, `SQRT`, `EXP`, `WHERE` | CPU/GPU 指令 |
+| **高级** | `WMMA`, `CONTRACT`, `UNROLL` | Tensor core、向量化 |
 
-When you print a UOp graph, you see its tree structure:
+打印 UOp 图时，你会看到它的树形结构：
 
 ```text
 [42] STORE : Void
@@ -83,13 +83,13 @@ When you print a UOp graph, you see its tree structure:
     └── [30] → (same RANGE as above)
 ```
 
-Notice the arrows pointing to "same as above"? That's not just pretty-printing—it's a fundamental property called **hash consing**.
+注意到指向"same as above"的箭头了吗？这不仅仅是打印格式——它是一个叫做 **hash consing** 的基本属性。
 
 ---
 
-## Hash Consing: Structural Sharing
+## Hash Consing：结构共享
 
-When you create the same expression twice in Morok, you get the *same pointer*. Not equal values—the same memory address.
+在 Morok 中创建同一个表达式两次，你会得到*同一个指针*。不是值相等——而是同一个内存地址。
 
 ```rust
 let a = UOp::binary(Add, x.clone(), y.clone());
@@ -98,7 +98,7 @@ let b = UOp::binary(Add, x.clone(), y.clone());
 assert!(Arc::ptr_eq(&a, &b));  // Same pointer!
 ```
 
-This works through a global cache. When constructing a UOp, we first check if an identical one exists:
+这通过全局缓存实现。构造 UOp 时先检查是否已有相同的：
 
 ```rust
 pub fn new(op: Op, dtype: DType) -> Arc<Self> {
@@ -116,31 +116,31 @@ pub fn new(op: Op, dtype: DType) -> Arc<Self> {
 }
 ```
 
-Why does this matter for ML engineers?
+这对 ML 工程师意味着什么？
 
-- **Pointer equality is semantic equality.** To check if two subexpressions are identical, just compare pointers: `Arc::ptr_eq(&a, &b)`. No tree traversal needed.
+- **指针相等即语义相等。** 检查两个子表达式是否相同，只需比较指针：`Arc::ptr_eq(&a, &b)`。无需遍历整棵树。
 
-- **Pattern matching is O(1).** When the optimizer asks "have I seen this pattern before?", pointer comparison gives an instant answer.
+- **模式匹配是 O(1) 的。** 当优化器问"之前见过这个模式吗？"时，指针比较立刻给出答案。
 
-- **Memory efficiency.** Common subexpressions (think: shared computations in attention, gradient graphs) are stored once, not duplicated.
+- **内存高效。** 公共子表达式（例如 attention 和梯度图中的共享计算）只存储一次，不会被复制。
 
-- **Thread safety.** The same computation from different threads produces the same object—no synchronization bugs.
+- **线程安全。** 不同线程中的相同计算会产生同一个对象——没有同步 bug。
 
-The tree printout shows this: when you see `[10] → (same as above)`, that's not a copy—it's the *same node* referenced from multiple places.
+树形打印展示了这一点：当你看到 `[10] → (same as above)` 时，那不是拷贝——而是从多处引用的*同一个节点*。
 
 ---
 
-## Explicit Loops: The `RANGE` Operation
+## 显式循环：`RANGE` 操作
 
-Most ML IRs hide loops inside operations. In ONNX, a reduction looks like:
+大多数 ML IR 将循环隐藏在操作内部。在 ONNX 中，一个规约看起来是这样：
 
 ```python
 ReduceSum(data, axes=[1], keepdims=0)
 ```
 
-Where's the loop? It's implicit—somewhere inside the runtime's implementation of `ReduceSum`. You can't see it, can't modify it, can't reason about it.
+循环在哪里？它是隐式的——藏在运行时 `ReduceSum` 实现的某处。你看不到它，改不了它，也无法推理它。
 
-Morok makes loops *explicit* using `RANGE` operations. The same reduction becomes:
+Morok 用 `RANGE` 操作使循环*显式化*。同样的规约变成：
 
 ```text
 [REDUCE(Add)]
@@ -154,34 +154,34 @@ Morok makes loops *explicit* using `RANGE` operations. The same reduction become
 └── [RANGE(axis=1, Reduce)]           # same RANGE via hash consing
 ```
 
-Each `RANGE` has an **AxisType** that tells the code generator how to compile it:
+每个 `RANGE` 都有一个 **AxisType**，告诉代码生成器如何编译它：
 
-| AxisType | CPU | CUDA | Meaning |
+| AxisType | CPU | CUDA | 含义 |
 |----------|-----|------|---------|
-| **Global** | Thread pool | `blockIdx` | Outer parallel dimension |
-| **Local** | (N/A) | `threadIdx` | Workgroup parallelism |
-| **Loop** | `for` loop | `for` loop | Sequential iteration |
-| **Reduce** | Accumulator | Warp reduce | Reduction dimension |
-| **Upcast** | SIMD vector | Register tile | Vectorization |
-| **Unroll** | Unrolled | Unrolled | Loop unrolling |
+| **Global** | 线程池 | `blockIdx` | 外层并行维度 |
+| **Local** | (N/A) | `threadIdx` | 工作组并行 |
+| **Loop** | `for` 循环 | `for` 循环 | 顺序迭代 |
+| **Reduce** | 累加器 | Warp reduce | 规约维度 |
+| **Upcast** | SIMD 向量 | 寄存器 tile | 向量化 |
+| **Unroll** | 展开 | 展开 | 循环展开 |
 
-The AxisType hierarchy (Global → Local → Loop → Reduce → Upcast → Unroll) maps directly to GPU programming models. A `RANGE` with `AxisType::Global` becomes `blockIdx.x` in CUDA. A `RANGE` with `AxisType::Local` becomes `threadIdx.x`.
+AxisType 层次结构（Global → Local → Loop → Reduce → Upcast → Unroll）直接映射到 GPU 编程模型。`AxisType::Global` 的 `RANGE` 在 CUDA 中变成 `blockIdx.x`。`AxisType::Local` 的 `RANGE` 变成 `threadIdx.x`。
 
-Why explicit loops matter:
+为什么显式循环重要：
 
-- **Optimization is visible.** You can *see* which loops will be parallelized, which will be unrolled, which will use SIMD.
+- **优化是可见的。** 你能*看到*哪些循环会被并行化、哪些会被展开、哪些会使用 SIMD。
 
-- **Scheduling is graph rewriting.** Changing loop order, tiling, or unrolling is just a pattern transformation—no special "scheduling pass".
+- **调度就是图重写。** 改变循环顺序、分块或展开只是模式变换——不需要专门的"调度 pass"。
 
-- **Same IR at every stage.** The `RANGE` that represents "iterate over batch dimension" at the tensor level is the *same* `RANGE` that becomes `for (int i = 0; i < N; i++)` in generated code.
+- **每个阶段都是同一个 IR。** 在张量层面代表"遍历 batch 维度"的 `RANGE`，就是在生成代码中变成 `for (int i = 0; i < N; i++)` 的*同一个* `RANGE`。
 
 ---
 
-## Graph Rewriting: One Transformation Mechanism
+## 图重写：统一的变换机制
 
-Traditional compilers have dozens of specialized passes: constant folding, dead code elimination, loop unrolling, operator fusion. Each pass has custom logic, custom data structures, custom bugs.
+传统编译器有几十个专用 pass：常量折叠、死代码消除、循环展开、算子融合。每个 pass 都有自己的逻辑、数据结构和 bug。
 
-Morok uses one mechanism: **pattern-based graph rewriting**.
+Morok 只用一种机制：**基于模式的图重写**。
 
 ```rust
 patterns! {
@@ -200,16 +200,16 @@ patterns! {
 }
 ```
 
-The DSL is expressive:
+这个 DSL 表达力强：
 
-- **`[x, y]` — commutative.** Try both orderings (for `ADD`, `MUL`, etc.)
-- **`(x, y)` — ordered.** Match exactly this order.
-- **`@zero`, `@one`, `@true` — semantic constants.** Works for any dtype.
-- **`@const(val)` — extract value.** For compile-time computation.
-- **`x, x` — same operand.** Detects pointer equality.
-- **`~>` vs `=>`** — infallible vs fallible rewrite.
+- **`[x, y]` — 交换律。** 尝试两种顺序（用于 `ADD`、`MUL` 等）
+- **`(x, y)` — 有序。** 严格匹配这个顺序。
+- **`@zero`, `@one`, `@true` — 语义常量。** 对任何 DType 有效。
+- **`@const(val)` — 提取值。** 用于编译期计算。
+- **`x, x` — 同一操作数。** 检测指针相等。
+- **`~>` vs `=>`** — 不会失败 vs 可能失败的重写。
 
-The rewrite engine applies patterns bottom-up until no more matches:
+重写引擎自底向上应用模式直到没有更多匹配：
 
 ```text
 Original:       Add(Mul(x, 1), 0)
@@ -217,24 +217,24 @@ After Mul:      Add(x, 0)         # Mul(x, 1) → x
 After Add:      x                 # Add(x, 0) → x
 ```
 
-This single mechanism handles:
+这一种机制处理了：
 
-- **Algebraic simplification** — constant folding, identity removal
-- **Rangeify transformation** — movement ops → explicit loops
-- **Kernel optimization** — vectorization, unrolling, tensor cores
-- **Code generation** — lowering to hardware primitives
+- **代数化简** — 常量折叠、恒等消除
+- **Rangeify 变换** — 变换操作 → 显式循环
+- **Kernel 优化** — 向量化、展开、tensor core
+- **代码生成** — 降级到硬件原语
 
-Same patterns, same engine, different pattern sets for each stage.
+同样的模式，同样的引擎，不同阶段用不同的模式集。
 
 ---
 
-## Worked Example: Matmul Journey
+## 完整示例：矩阵乘法之旅
 
-Let's trace `C = A @ B` (a 4×4 matrix multiply) through the entire pipeline.
+追踪 `C = A @ B`（4×4 矩阵乘法）通过整个流水线。
 
-### Stage 1: Tensor Construction
+### 阶段 1：张量构建
 
-When you write `A.matmul(&B)`, Morok builds a high-level UOp graph:
+当你写 `A.matmul(&B)` 时，Morok 构建一个高层 UOp 图：
 
 ```text
 [REDUCE_AXIS(Add, axes=[2])]
@@ -246,11 +246,11 @@ When you write `A.matmul(&B)`, Morok builds a high-level UOp graph:
 │           └── [BUFFER(B)]
 ```
 
-This is pure math: "expand A and B to align dimensions, multiply elementwise, sum along the contracted axis."
+这是纯数学表达："扩展 A 和 B 以对齐维度，逐元素相乘，沿收缩轴求和。"
 
-### Stage 2: Rangeify
+### 阶段 2：Rangeify
 
-The rangeify pass converts movement ops (`EXPAND`, `PERMUTE`) into explicit index computations with `RANGE` loops:
+Rangeify pass 将变换操作（`EXPAND`、`PERMUTE`）转换为带有 `RANGE` 循环的显式索引计算：
 
 ```text
 [STORE]
@@ -275,15 +275,15 @@ The rangeify pass converts movement ops (`EXPAND`, `PERMUTE`) into explicit inde
         └── [CONST(4)]
 ```
 
-Now we see the loop structure: `i` and `j` are `Global` (parallelized), `k` is `Reduce` (accumulated).
+现在可以看到循环结构：`i` 和 `j` 是 `Global`（并行化），`k` 是 `Reduce`（累加）。
 
-### Stage 3: Symbolic Simplification
+### 阶段 3：符号化简
 
-Pattern rewrites clean up redundant operations, fold constants, and simplify index arithmetic.
+模式重写清理冗余操作，折叠常量，简化索引算术。
 
-### Stage 4: Code Generation
+### 阶段 4：代码生成
 
-The final IR translates directly to loops:
+最终 IR 直接转换为循环：
 
 ```c
 // GPU kernel (conceptual)
@@ -298,46 +298,46 @@ __global__ void matmul(float* C, float* A, float* B) {
 }
 ```
 
-The key observation: **structure is visible at every stage**. There's no magic fusion pass that turns three nested loops into something unrecognizable. The `RANGE` structure you see in Stage 2 is exactly what becomes loops in Stage 4.
+关键观察：**每个阶段的结构都是可见的**。没有神秘的融合 pass 把三个嵌套循环变成面目全非的东西。你在阶段 2 看到的 `RANGE` 结构，就是阶段 4 中变成循环的那些。
 
 ---
 
-## Comparison: How Other IRs Differ
+## 对比：其他 IR 的差异
 
-Different IRs make different tradeoffs. Here's how they stack up:
+不同的 IR 做了不同的取舍。以下是对比：
 
-| Aspect | ONNX | XLA HLO | Triton | **Morok** |
+| 方面 | ONNX | XLA HLO | Triton | **Morok** |
 |--------|------|---------|--------|-----------|
-| **Purpose** | Model interchange | Backend optimization | GPU kernel DSL | Full compilation |
-| **Operators** | ~200 high-level | ~100–150 high-level | Tile operations | ~80 multi-level |
-| **Loop model** | Implicit | Implicit | Tile-based | **Explicit `RANGE`** |
-| **Memory** | Pure values | Pure values → buffers | Explicit pointers | **Explicit `LOAD`/`STORE`** |
-| **Optimization** | None | Specialized passes | MLIR patterns | **Unified rewriting** |
-| **Targets** | Runtime engines | CPU/GPU/TPU | GPU only | CPU/GPU |
+| **定位** | 模型交换格式 | 后端优化 | GPU kernel DSL | 完整编译 |
+| **算子** | ~200 高层 | ~100–150 高层 | Tile 操作 | ~80 多层级 |
+| **循环模型** | 隐式 | 隐式 | 基于 Tile | **显式 `RANGE`** |
+| **内存** | 纯值 | 纯值 → buffer | 显式指针 | **显式 `LOAD`/`STORE`** |
+| **优化** | 无 | 专用 pass | MLIR 模式 | **统一重写** |
+| **目标** | 运行时引擎 | CPU/GPU/TPU | 仅 GPU | CPU/GPU |
 
-**ONNX** maximizes portability. Operations like `Conv` and `MatMul` hide all implementation details. Great for model exchange, but you can't optimize what you can't see.
+**ONNX** 最大化可移植性。`Conv` 和 `MatMul` 等操作隐藏了所有实现细节。很适合模型交换，但看不到的东西没法优化。
 
-**XLA HLO** is functional and pure—no side effects, immutable tensors. This enables algebraic optimization but requires a separate "buffer assignment" phase before code generation. The transition from HLO to LMHLO (buffer-based) is a fundamental boundary.
+**XLA HLO** 是函数式的、纯的——没有副作用，张量不可变。这使代数优化成为可能，但在代码生成前需要单独的"buffer 分配"阶段。从 HLO 到 LMHLO（基于 buffer）的转换是一个根本性的边界。
 
-**Triton** exposes more than ONNX but less than Morok. You write "tile-level" code—operations on blocks of data—and the compiler handles thread-level details. Explicit memory (`tl.load`, `tl.store`) but implicit parallelization within tiles.
+**Triton** 暴露的比 ONNX 多但比 Morok 少。你写"tile 级别"的代码——对数据块的操作——编译器处理线程级细节。内存是显式的（`tl.load`、`tl.store`），但 tile 内的并行化是隐式的。
 
-**Morok** exposes everything: loops are explicit (`RANGE`), memory is explicit (`LOAD`/`STORE`), parallelization is explicit (`AxisType`). This means more to learn, but nothing is hidden.
+**Morok** 暴露一切：循环是显式的（`RANGE`），内存是显式的（`LOAD`/`STORE`），并行化是显式的（`AxisType`）。这意味着需要学更多，但没有东西被隐藏。
 
 ---
 
-## Why This Matters: Practical Benefits
+## 为什么这很重要：实际好处
 
-Morok's transparent IR has practical benefits for ML engineers:
+Morok 透明的 IR 对 ML 工程师有实际好处：
 
-**Debugging is direct.** Print the graph at any stage:
+**调试是直接的。** 在任何阶段打印图：
 
 ```rust
 println!("{}", tensor.uop().tree());
 ```
 
-You'll see exactly what operations exist, how they connect, and where the computation happens. No "kernel X" mysteries.
+你会看到确切存在哪些操作、它们如何连接、计算在哪里发生。没有"kernel X"的谜团。
 
-**Performance tuning is informed.** See which loops are parallelized:
+**性能调优有据可循。** 查看哪些循环被并行化了：
 
 ```text
 [RANGE(batch, Global)]    # parallelized across GPU blocks
@@ -345,11 +345,11 @@ You'll see exactly what operations exist, how they connect, and where the comput
 [RANGE(pixel, Loop)]      # sequential — might be slow!
 ```
 
-If something should be parallel but isn't, you can see it.
+如果某些东西应该并行但没有，你能看到。
 
-**The mental model is simple.** There's one IR, one transformation mechanism, one set of operations. You don't need to learn XLA HLO *and* MLIR *and* Triton *and* LLVM. Just UOps.
+**心智模型很简单。** 只有一个 IR、一种变换机制、一组操作。你不需要同时学习 XLA HLO *和* MLIR *和* Triton *和* LLVM。只需要 UOp。
 
-**Optimization is composable.** Want a custom rewrite? Add a pattern:
+**优化是可组合的。** 想添加自定义重写？加一个模式：
 
 ```rust
 patterns! {
@@ -358,16 +358,16 @@ patterns! {
 }
 ```
 
-It works with the same engine as constant folding, fusion, and everything else.
+它和常量折叠、融合以及其他所有优化使用同一个引擎。
 
 ---
 
-## The Deeper Insight
+## 更深层的洞察
 
-Morok/Tinygrad proves that compiler complexity is often *accidental*, not essential. The multi-layer IR stacks in TensorFlow and PyTorch accumulated organically—each layer solved a real problem, but the combined system is harder to understand than any individual part.
+Morok/Tinygrad 证明了编译器的复杂度通常是*偶然的*，而非本质的。TensorFlow 和 PyTorch 中的多层 IR 栈是有机积累的——每一层都解决了实际问题，但组合起来的系统比任何单个部分都更难理解。
 
-One well-designed IR, one transformation mechanism, and principled composition can replace thousands of lines of specialized passes. It's the Unix philosophy applied to compilers: do one thing well, and compose.
+一个设计精良的 IR、一种变换机制和有原则的组合，可以替代数千行专用 pass。这是 Unix 哲学在编译器中的应用：做好一件事，然后组合。
 
-The cost is explicitness—you see loops, memory accesses, and parallelization hints that other IRs hide. But visibility is a feature, not a bug. When your model is slow, you want to see *why*, not hope the compiler figures it out.
+代价是显式性——你会看到其他 IR 隐藏的循环、内存访问和并行化提示。但可见性是特性，不是缺陷。当你的模型运行缓慢时，你想*看到*原因，而不是寄希望于编译器自己搞定。
 
-That's the bet Morok makes: transparent complexity beats hidden complexity.
+这就是 Morok 的赌注：透明的复杂度胜过隐藏的复杂度。

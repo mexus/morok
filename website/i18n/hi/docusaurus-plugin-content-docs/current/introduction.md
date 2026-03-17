@@ -1,25 +1,25 @@
 ---
-sidebar_label: Introduction
+sidebar_label: परिचय
 ---
 
 # Morok
 
-> ⚠️ **Pre-alpha software.** APIs are unstable and may change without notice. Not recommended for production use. 🚧💀
+> **प्री-अल्फ़ा सॉफ़्टवेयर।** APIs अस्थिर हैं और बिना नोटिस के बदल सकते हैं। प्रोडक्शन उपयोग के लिए अनुशंसित नहीं है।
 
-Morok is a Rust-based ML compiler inspired by [Tinygrad](https://github.com/tinygrad/tinygrad). It features lazy tensor evaluation with UOp-based IR, pattern-driven optimization, and multi-backend code generation.
+Morok एक Rust-आधारित ML कम्पाइलर है जो [Tinygrad](https://github.com/tinygrad/tinygrad) से प्रेरित है। इसमें UOp-आधारित IR के साथ lazy tensor इवैल्यूएशन, पैटर्न-ड्रिवन ऑप्टिमाइज़ेशन, और मल्टी-बैकएंड कोड जनरेशन शामिल है।
 
-## Highlights
+## मुख्य विशेषताएँ
 
-| Feature | Description |
-|---------|-------------|
-| **Declarative Optimization** | `patterns!` DSL for graph rewrites with Z3-verified correctness |
-| **Lazy Evaluation** | Tensors build computation graphs, compiled only at `realize()` |
-| **CUDA Support** | Unified memory, D2D copy, LRU buffer caching |
-| **Provenance Tracking** | `#[track_caller]` traces every UOp to source location |
-| **80+ IR Operations** | Arithmetic, memory, control flow, WMMA tensor cores |
-| **20+ Optimizations** | Constant folding, tensor cores, vectorization, loop unrolling |
+| विशेषता | विवरण |
+|---------|-------|
+| **डिक्लेरेटिव ऑप्टिमाइज़ेशन** | Z3-सत्यापित शुद्धता के साथ ग्राफ़ रीराइट्स के लिए `patterns!` DSL |
+| **Lazy इवैल्यूएशन** | Tensor कम्प्यूटेशन ग्राफ़ बनाते हैं, कम्पाइल केवल `realize()` पर होता है |
+| **CUDA सपोर्ट** | यूनिफ़ाइड मेमोरी, D2D कॉपी, LRU बफ़र कैशिंग |
+| **प्रोवेनेंस ट्रैकिंग** | `#[track_caller]` हर UOp को सोर्स लोकेशन तक ट्रेस करता है |
+| **80+ IR ऑपरेशन** | अरिथमेटिक, मेमोरी, कंट्रोल फ़्लो, WMMA tensor cores |
+| **20+ ऑप्टिमाइज़ेशन** | कॉन्स्टेंट फ़ोल्डिंग, tensor cores, वेक्टराइज़ेशन, लूप अनरोलिंग |
 
-## Quick Example
+## त्वरित उदाहरण
 
 ```rust
 use morok_tensor::Tensor;
@@ -27,12 +27,12 @@ use morok_tensor::Tensor;
 // Build lazy computation graph
 let a = Tensor::from_slice([1.0f32, 2.0, 3.0]);
 let b = Tensor::from_slice([4.0f32, 5.0, 6.0]);
-let c = (a + b).sum();
+let c = (&a + &b).sum();
 
 // Compile and execute
 let result = c.realize()?;
 ```
 
-## License
+## लाइसेंस
 
 MIT
