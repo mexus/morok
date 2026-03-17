@@ -10,19 +10,21 @@ use morok_codegen::{Renderer, render};
 let code = render(&kernel_graph, backend)?;
 ```
 
-## Features
+## Backends
 
-**Supported:**
+| Backend | Output | Feature | Default |
+|---------|--------|---------|---------|
+| **Clang** | C source → `clang -shared -O2` → `.so` | always | yes |
+| **LLVM JIT** | LLVM IR text → Inkwell ExecutionEngine | always | no |
+| **MLIR** | MLIR (arith/scf/llvm dialects) → MLIR ExecutionEngine | `mlir` | no |
 
-- LLVM IR generation for CPU
-- Renderer trait for backend abstraction
+Select at runtime via `MOROK_CPU_BACKEND` env var (`clang`, `llvm`, `mlir`).
 
 **Planned:**
 
 - PTX renderer (CUDA)
 - Metal renderer
 - WebGPU (WGSL) renderer
-- C-style renderer
 
 ## Testing
 
