@@ -55,7 +55,7 @@
 //! ```
 
 use crate::{UOp, UOpKey};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use crate::pattern::{Matcher, RewriteResult};
@@ -238,7 +238,7 @@ where
     /// - If bpm is present, apply patterns in fixed-point (sees ORIGINAL children)
     /// - Push children for processing
     /// - Schedule Stage 1 (ApplyPatterns) for after children are done
-    fn handle_push_children(&mut self, stack: &mut Vec<StackEntry>, original: Arc<UOp>, working: Arc<UOp>) {
+    fn handle_push_children(&mut self, stack: &mut VecDeque<StackEntry>, original: Arc<UOp>, working: Arc<UOp>) {
         let mut node = working;
 
         // Apply bpm patterns if present (sees ORIGINAL children)
@@ -271,7 +271,7 @@ where
         }
 
         // Schedule Stage 1 (ApplyPatterns) for after children are processed
-        stack.push(StackEntry::apply_patterns(original, node.clone()));
+        stack.push_back(StackEntry::apply_patterns(original, node.clone()));
 
         // Push children for processing (always, matching Tinygrad's unified_rewrite)
         let sources = node.op().sources();
@@ -279,7 +279,7 @@ where
             let child_key = UOpKey(child.clone());
             if !self.pending.contains(&child_key) && !self.results.contains(child) {
                 self.pending.insert(child_key);
-                stack.push(StackEntry::push_children(child.clone()));
+                stack.push_back(StackEntry::push_children(child.clone()));
             }
         }
     }
@@ -293,7 +293,7 @@ where
     /// - If patterns produce new node, process it through Stage 0
     fn handle_apply_patterns(
         &mut self,
-        stack: &mut Vec<StackEntry>,
+        stack: &mut VecDeque<StackEntry>,
         original: Arc<UOp>,
         working: Arc<UOp>,
         retry_count: u32,
@@ -310,9 +310,9 @@ where
                 // Pattern produced new node - process it
                 let key = UOpKey(final_node.clone());
                 if !self.results.contains(&final_node) && !self.pending.contains(&key) {
-                    stack.push(StackEntry::link(original, final_node.clone()));
+                    stack.push_back(StackEntry::link(original, final_node.clone()));
                     self.pending.insert(key);
-                    stack.push(StackEntry::push_children(final_node));
+                    stack.push_back(StackEntry::push_children(final_node));
                 } else {
                     // Already processed - link to its result
                     let result = self.results.get(&final_node);
@@ -344,7 +344,7 @@ where
             if retry_count >= MAX_RETRIES {
                 panic!("ApplyPatterns stuck waiting for sources after {} retries: {:?}", MAX_RETRIES, working.tree());
             }
-            stack.insert(0, StackEntry::apply_patterns_retry(original, working, retry_count + 1));
+            stack.push_front(StackEntry::apply_patterns_retry(original, working, retry_count + 1));
             return;
         }
 
@@ -372,9 +372,9 @@ where
             let key = UOpKey(final_node.clone());
             if !self.results.contains(&final_node) && !self.pending.contains(&key) {
                 // Schedule: Link after processing the new node
-                stack.push(StackEntry::link(original, final_node.clone()));
+                stack.push_back(StackEntry::link(original, final_node.clone()));
                 self.pending.insert(key);
-                stack.push(StackEntry::push_children(final_node));
+                stack.push_back(StackEntry::push_children(final_node));
                 return;
             }
             // New node already processed - link to its result
@@ -388,9 +388,9 @@ where
             let recon_key = UOpKey(node.clone());
             if !self.results.contains(&node) && !self.pending.contains(&recon_key) {
                 // Reconstructed node not seen - process it
-                stack.push(StackEntry::link(original, node.clone()));
+                stack.push_back(StackEntry::link(original, node.clone()));
                 self.pending.insert(recon_key);
-                stack.push(StackEntry::push_children(node));
+                stack.push_back(StackEntry::push_children(node));
                 return;
             }
             // Already processed - link to its result
@@ -424,6 +424,9 @@ where
                     current = new_node;
                 }
                 RewriteResult::Gate(_) | RewriteResult::NoMatch => {
+                    if i > 5 {
+                        tracing::warn!(iterations = i, op = current.op().as_ref(), "high fixpoint iterations");
+                    }
                     break;
                 }
             }
@@ -471,13 +474,16 @@ where
         }
 
         self.pending.insert(root_key.clone());
-        let mut stack: Vec<StackEntry> = vec![StackEntry::new(root.clone())];
+        let mut stack: VecDeque<StackEntry> = VecDeque::from([StackEntry::new(root.clone())]);
 
-        // Limit total iterations to catch infinite loops
-        const MAX_TOTAL_ITERATIONS: usize = 100_000;
+        // Limit total iterations to catch infinite loops.
+        // 500K accommodates large kernels with wide VECTORIZE (e.g., 135-element Index
+        // expressions from conv_transpose pool ops) while still catching true infinite loops.
+        // Tinygrad has no hard limit; this is a safety net.
+        const MAX_TOTAL_ITERATIONS: usize = 500_000;
         let mut iterations = 0;
 
-        while let Some(StackEntry { original, stage, working, retry_count }) = stack.pop() {
+        while let Some(StackEntry { original, stage, working, retry_count }) = stack.pop_back() {
             iterations += 1;
             if iterations > MAX_TOTAL_ITERATIONS {
                 panic!(
@@ -500,6 +506,12 @@ where
                 Stage::Link => self.handle_link(original, working),
             }
         }
+
+        tracing::debug!(
+            total_stack_iterations = iterations,
+            results_cached = self.results.results.len(),
+            "rewrite complete"
+        );
 
         self.results.get_direct(&root_key).unwrap_or(root)
     }
@@ -567,6 +579,16 @@ pub struct GraphRewriteOutput {
     pub root: Arc<UOp>,
     /// Map from original nodes to their replacements
     pub becomes_map: HashMap<UOpKey, Arc<UOp>>,
+}
+
+/// Apply graph rewriting to multiple roots sharing a single engine.
+///
+/// All roots are rewritten using the same `RewriteEngine`, so subgraphs shared
+/// between roots are only processed once. This is critical for SINK sources that
+/// share large subgraphs (e.g., bitonic sort network).
+pub fn graph_rewrite_roots<M: Matcher<C>, C>(matcher: &M, roots: &[Arc<UOp>], ctx: &mut C) -> Vec<Arc<UOp>> {
+    let mut engine = RewriteEngine::new(Some(matcher), None::<&NoMatcher>, ctx);
+    roots.iter().map(|root| engine.rewrite(root.clone())).collect()
 }
 
 /// Apply graph rewriting and return both the result and the transformation map.

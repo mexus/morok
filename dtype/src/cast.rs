@@ -112,7 +112,14 @@ impl DType {
             .iter()
             .min()?; // min by discriminant (= priority: lower = more specific)
 
-        // Return scalar type (Ptr values will be auto-loaded in codegen)
-        Some(DType::Scalar(scalar_result))
+        // Morok extension: preserve vector count if all inputs have the same vcount > 1.
+        // Tinygrad's least_upper_dtype always returns scalar; we extend it to preserve
+        // vector width when all operands agree, avoiding unnecessary devectorize/revectorize.
+        let vcount = dtypes[0].vcount();
+        if vcount > 1 && dtypes.iter().all(|d| d.vcount() == vcount) {
+            Some(DType::Vector { scalar: scalar_result, count: vcount })
+        } else {
+            Some(DType::Scalar(scalar_result))
+        }
     }
 }

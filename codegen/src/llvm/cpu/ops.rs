@@ -10,6 +10,28 @@ use morok_ir::{AxisType, BinaryOp, Op, ReduceOp, TernaryOp, UnaryOp, prelude::*}
 
 use crate::llvm::common::{RenderContext, lcast, ldt};
 
+/// Extract a scalar `ptr` from a vectorized `<N x ptr>` via `extractelement ... i32 0`.
+///
+/// When the devectorize pipeline doesn't fully eliminate vectorized DEFINE_GLOBAL pointers
+/// (see `no_vectorized_buf` / `no_vectorized_index` which only target DEFINE_LOCAL/DEFINE_REG),
+/// the GEP result can be `<N x ptr>`. All elements are identical (broadcast of the same buffer
+/// pointer), so extracting element 0 yields the correct scalar ptr for LLVM load/store.
+fn maybe_extract_scalar_ptr(
+    dst: &str,
+    idx: &str,
+    idx_type: &str,
+    dtype: &DType,
+    kernel: &mut Vec<String>,
+) -> (String, String) {
+    if matches!(dtype, DType::Ptr { vcount, .. } if *vcount > 1) {
+        let extract = format!("{dst}.ptr");
+        kernel.push(format!("  {extract} = extractelement {idx_type} {idx}, i32 0"));
+        (extract, "ptr".to_string())
+    } else {
+        (idx.to_string(), idx_type.to_string())
+    }
+}
+
 /// Render a UOp to LLVM IR string.
 ///
 /// Returns None for meta-ops that don't produce instructions.
@@ -20,7 +42,6 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec<Stri
         Op::Const(_)
         | Op::VConst { .. }
         | Op::DefineGlobal(_)
-        | Op::DefineLocal(_)
         | Op::DefineVar { .. }
         | Op::Noop
         | Op::Sink { .. }
@@ -31,49 +52,46 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec<Stri
         | Op::Kernel { .. }
         | Op::Barrier { .. } => None,
 
-        Op::DefineReg { size, .. } => {
-            let base_dtype = match uop.dtype() {
-                DType::Ptr { base, .. } => base.as_ref().clone(),
-                other => other,
+        Op::DefineLocal(_) | Op::DefineReg { .. } => {
+            // Emit alloca for local/register memory.
+            // Read base type and size from dtype (matching Tinygrad's x.dtype.base/x.dtype.size).
+            // After devectorize's no_vectorized_buf, dtype is the canonical source of truth.
+            let (base_dtype, alloc_size) = match uop.dtype() {
+                DType::Ptr { base, size, .. } => (base.as_ref().clone(), size.unwrap_or(1)),
+                other => (other, 1),
             };
             let base = ldt(&base_dtype);
-            kernel.push(format!("  {dst} = alloca [{size} x {base}]"));
+            // Tinygrad: DEFINE_LOCAL gets align 16 (for SSE vector loads), DEFINE_REG gets default.
+            let align = if matches!(uop.op(), Op::DefineLocal(_)) { ", align 16" } else { "" };
+            kernel.push(format!("  {dst} = alloca [{alloc_size} x {base}]{align}"));
             Some(())
         }
 
-        Op::Index { buffer, indices, gate } => {
+        Op::Index { buffer, indices, .. } => {
             let buf = ctx.get(buffer);
             let buf_type = ldt(&buffer.dtype());
-
-            tracing::debug!(
-                index_id = uop.id,
-                buffer_id = buffer.id,
-                uop_dtype = ?uop.dtype(),
-                buffer_dtype = ?buffer.dtype(),
-                "INDEX codegen"
-            );
 
             if indices.is_empty() {
                 kernel.push(format!("  {dst} = bitcast {buf_type} {buf} to {}", ldt(&uop.dtype())));
             } else {
-                let idx = ctx.get(&indices[0]);
+                // Multi-index: linearize at render time using row-major strides
+                let (final_idx, final_idx_type) = if indices.len() > 1 {
+                    render_linearize_multi_index(&dst, indices, ctx, kernel)
+                } else {
+                    (ctx.get(&indices[0]).to_string(), ldt(&indices[0].dtype()))
+                };
+
                 let elem_type = match uop.dtype() {
                     morok_dtype::DType::Ptr { ref base, .. } => ldt(base),
                     other => ldt(&other),
                 };
-                let idx_type = ldt(&indices[0].dtype());
 
-                if gate.is_some() {
-                    let gate_val = ctx.get(gate.as_ref().unwrap());
-                    let null_ptr = format!("{dst}.null");
-                    let gep_ptr = format!("{dst}.gep");
-                    kernel
-                        .push(format!("  {gep_ptr} = getelementptr inbounds {elem_type}, ptr {buf}, {idx_type} {idx}"));
-                    kernel.push(format!("  {null_ptr} = inttoptr i64 0 to ptr"));
-                    kernel.push(format!("  {dst} = select i1 {gate_val}, ptr {gep_ptr}, ptr {null_ptr}"));
-                } else {
-                    kernel.push(format!("  {dst} = getelementptr inbounds {elem_type}, ptr {buf}, {idx_type} {idx}"));
-                }
+                // Gate is NOT handled here — matching Tinygrad's approach where INDEX
+                // always emits a plain GEP. The gate is handled at LOAD level (branch+phi)
+                // and at STORE level (IF/ENDIF via line_rewrite_cleanups).
+                kernel.push(format!(
+                    "  {dst} = getelementptr inbounds {elem_type}, {buf_type} {buf}, {final_idx_type} {final_idx}"
+                ));
             }
             Some(())
         }
@@ -91,11 +109,51 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec<Stri
             Some(())
         }
 
-        Op::Load { index, .. } => {
+        Op::Load { index, alt, .. } => {
             let idx = ctx.get(index);
             let dtype = ldt(&uop.dtype());
-            // LLVM uses opaque pointers (ptr) for all pointer types since LLVM 14+
-            kernel.push(format!("  {dst} = load {dtype}, ptr {idx}"));
+            let idx_type = ldt(&index.dtype());
+
+            let (idx, idx_type) = maybe_extract_scalar_ptr(&dst, idx, &idx_type, &index.dtype(), kernel);
+
+            // Gated LOAD: emit branch+phi to avoid null deref.
+            // Matches Tinygrad's pattern (llvmir.py:123-129) which requires BOTH
+            // a gated INDEX and an alt value on the LOAD. If gate exists without
+            // alt, that's a pipeline bug (line_rewrite_cleanups should provide it).
+            // Unwrap one CAST layer to find the INDEX gate (matches Tinygrad's .or_casted("idx")).
+            // The pipeline CAN produce CAST(INDEX) — devectorize handles this shape explicitly.
+            let actual_index = match index.op() {
+                Op::Cast { src, .. } => src,
+                _ => index,
+            };
+            let gate_info = if let Op::Index { gate: Some(gate_uop), .. } = actual_index.op() {
+                let alt_uop = alt.as_ref().expect(
+                    "gated LOAD without alt value — pipeline bug: \
+                     line_rewrite_cleanups should ensure alt is present for gated loads",
+                );
+                Some((ctx.get(gate_uop).to_string(), ctx.get(alt_uop).to_string()))
+            } else {
+                None
+            };
+
+            if let Some((gate, alt_val)) = gate_info {
+                let label_base = &dst[1..]; // strip leading %
+                let entry_label = format!("{label_base}_entry");
+                let load_label = format!("{label_base}_load");
+                let exit_label = format!("{label_base}_exit");
+                let load_val = format!("{dst}_yes");
+
+                kernel.push(format!("  br label %{entry_label}"));
+                kernel.push(format!("{entry_label}:"));
+                kernel.push(format!("  br i1 {gate}, label %{load_label}, label %{exit_label}"));
+                kernel.push(format!("{load_label}:"));
+                kernel.push(format!("  {load_val} = load {dtype}, {idx_type} {idx}"));
+                kernel.push(format!("  br label %{exit_label}"));
+                kernel.push(format!("{exit_label}:"));
+                kernel.push(format!("  {dst} = phi {dtype} [{load_val}, %{load_label}], [{alt_val}, %{entry_label}]"));
+            } else {
+                kernel.push(format!("  {dst} = load {dtype}, {idx_type} {idx}"));
+            }
             Some(())
         }
 
@@ -103,8 +161,11 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec<Stri
             let idx = ctx.get(index);
             let val = ctx.get(value);
             let val_type = ldt(&value.dtype());
-            // LLVM uses opaque pointers (ptr) for all pointer types since LLVM 14+
-            kernel.push(format!("  store {val_type} {val}, ptr {idx}"));
+            let idx_type = ldt(&index.dtype());
+
+            let (idx, idx_type) = maybe_extract_scalar_ptr(&dst, idx, &idx_type, &index.dtype(), kernel);
+
+            kernel.push(format!("  store {val_type} {val}, {idx_type} {idx}"));
             Some(())
         }
 
@@ -156,6 +217,11 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec<Stri
                 UnaryOp::Not => {
                     let all_ones = if src.dtype().is_bool() { "1".to_string() } else { "-1".to_string() };
                     kernel.push(format!("  {dst} = xor {stype} {s}, {all_ones}"));
+                }
+                UnaryOp::Floor | UnaryOp::Ceil | UnaryOp::Trunc | UnaryOp::Round if !src.dtype().is_float() => {
+                    // Rounding is identity for integer types (defense-in-depth;
+                    // symbolic_simple folds these away upstream).
+                    kernel.push(format!("  {dst} = bitcast {stype} {s} to {stype}"));
                 }
                 UnaryOp::Sqrt
                 | UnaryOp::Exp
@@ -450,6 +516,11 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec<Stri
 }
 
 fn binary_instr(op: BinaryOp, dtype: &DType) -> &'static str {
+    assert!(
+        !matches!(dtype.base(), morok_dtype::ScalarDType::Index),
+        "Index dtype reached LLVM codegen binary_instr({op:?}, {dtype:?}) — \
+         pm_lower_index_dtype should have lowered it to i32/i64"
+    );
     let is_float = dtype.is_float();
     let is_signed = dtype.is_signed();
 
@@ -587,7 +658,7 @@ fn unary_instr(op: UnaryOp, dtype: &DType) -> Option<&'static str> {
         UnaryOp::Floor => Some("floor"),
         UnaryOp::Ceil => Some("ceil"),
         UnaryOp::Trunc => Some("trunc"),
-        UnaryOp::Round => Some("round"),
+        UnaryOp::Round => Some("rint"),
         UnaryOp::Reciprocal => None,
         UnaryOp::Tan => None,
         UnaryOp::Sign => None,
@@ -843,6 +914,56 @@ fn render_ptrcat(dst: &str, sources: &[Arc<UOp>], ctx: &RenderContext, kernel: &
         kernel.push(format!("  {next} = insertelement {vec_type} {prev}, {ptr_type} {val}, i32 {i}"));
         prev = next;
     }
+}
+
+/// Linearize multiple index expressions into a single linear offset at render time.
+///
+/// Emits LLVM IR `mul` + `add` chain for `idx0*stride0 + idx1*stride1 + ...`.
+/// Returns the final SSA name and its LLVM type string.
+fn render_linearize_multi_index(
+    dst: &str,
+    indices: &[Arc<UOp>],
+    ctx: &RenderContext,
+    kernel: &mut Vec<String>,
+) -> (String, String) {
+    use morok_schedule::passes::linearize_index::{compute_row_major_strides, extract_index_dimension};
+
+    // Extract dimensions from index UOps
+    let dims: Vec<i64> = indices
+        .iter()
+        .map(|idx| extract_index_dimension(idx).expect("multi-index dimension must be resolvable at codegen"))
+        .collect();
+    let strides = compute_row_major_strides(&dims);
+    let idx_type = ldt(&indices[0].dtype());
+
+    let mut current = String::new();
+    for (i, (idx_uop, &stride)) in indices.iter().zip(strides.iter()).enumerate() {
+        if stride == 0 {
+            continue;
+        }
+        let idx_val = ctx.get(idx_uop);
+        let term = if stride == 1 {
+            idx_val.to_string()
+        } else {
+            let mul_name = format!("{dst}.lin_mul{i}");
+            kernel.push(format!("  {mul_name} = mul {idx_type} {idx_val}, {stride}"));
+            mul_name
+        };
+
+        if current.is_empty() {
+            current = term;
+        } else {
+            let add_name = format!("{dst}.lin_add{i}");
+            kernel.push(format!("  {add_name} = add {idx_type} {current}, {term}"));
+            current = add_name;
+        }
+    }
+
+    if current.is_empty() {
+        current = "0".to_string();
+    }
+
+    (current, idx_type)
 }
 
 /// Get identity element for reduce operation.

@@ -68,8 +68,8 @@ pub use linearize::linearize;
 /// Note: The `ranges` field may contain non-RANGE ops (like CONST or Add expressions)
 /// after optimization passes. We extract actual RANGE ops first, matching Tinygrad's
 /// `.ranges` property behavior.
-pub fn pm_split_ends() -> TypedPatternMatcher {
-    crate::patterns! {
+pub fn pm_split_ends() -> &'static TypedPatternMatcher {
+    crate::cached_patterns! {
         // Match ALL END ops - split_end handles extraction and filtering
         End { computation, ranges } => |computation, ranges| {
             split_end(computation, ranges)
@@ -173,7 +173,7 @@ fn pm_add_control_flow() -> TypedPatternMatcher<CFGContext> {
 /// linearize(sink)
 /// ```
 pub fn linearize_with_cfg(sink: Arc<UOp>) -> Vec<Arc<UOp>> {
-    let sink = graph_rewrite(&pm_split_ends(), sink, &mut ());
+    let sink = graph_rewrite(pm_split_ends(), sink, &mut ());
     let mut cfg = CFGContext::new(&sink);
     let sink = graph_rewrite_bottom_up(&pm_add_control_flow(), sink, &mut cfg);
     linearize(sink)

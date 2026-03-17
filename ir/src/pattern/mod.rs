@@ -30,7 +30,7 @@ pub enum RewriteResult {
 // Pattern Exports
 // =============================================================================
 
-pub use helpers::{const_matches, is_neg_one, is_nonzero, is_one, is_zero, try_const};
+pub use helpers::{const_matches, is_any_const, is_neg_one, is_nonzero, is_one, is_zero, try_const};
 pub use simplified::{PatternClosure, SimplifiedPatternMatcher};
 
 /// Type alias for backwards compatibility.
@@ -47,4 +47,10 @@ pub type TypedPatternMatcher<C = ()> = SimplifiedPatternMatcher<C>;
 pub trait Matcher<C> {
     /// Attempt to rewrite a UOp using registered patterns.
     fn rewrite(&self, uop: &Arc<UOp>, ctx: &mut C) -> RewriteResult;
+}
+
+impl<C, M: Matcher<C> + ?Sized> Matcher<C> for &M {
+    fn rewrite(&self, uop: &Arc<UOp>, ctx: &mut C) -> RewriteResult {
+        (**self).rewrite(uop, ctx)
+    }
 }

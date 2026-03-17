@@ -108,7 +108,7 @@ impl Renderer for LlvmTextRenderer {
 
         // NOTE: pm_render() is now called in schedule/optimizer Stage 19.
         // Keeping pm_bool_devectorize as safety fallback for direct codegen paths.
-        let uop = graph_rewrite_bottom_up(&pm_bool_devectorize(), uop.clone(), &mut ());
+        let uop = graph_rewrite_bottom_up(pm_bool_devectorize(), uop.clone(), &mut ());
 
         tracing::debug!(ast_after_pm_bool_devectorize = %uop.tree(), "codegen: after pm_bool_devectorize");
 
@@ -295,6 +295,8 @@ attributes #0 = {{ alwaysinline nounwind "no-builtins" "no-trapping-math"="true"
             intrinsics = generate_intrinsic_declarations(&kernel),
             body = kernel.join("\n")
         );
+
+        tracing::debug!(generated_code = ir, "llvm codegen: final generated code");
 
         let mut result = RenderedKernel::new(ir, kernel_name.to_string());
         result.buffer_args = buffer_args;

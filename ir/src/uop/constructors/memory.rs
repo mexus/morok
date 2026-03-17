@@ -64,10 +64,18 @@ impl UOp {
         ptr: Option<bool>,
     ) -> Result<Arc<Self>> {
         let indices = indices.into();
-        // Validate that all indices have Index dtype
+        // Validate that all indices have integer/index base dtype.
+        // Allows both scalar (Index, Int64, Int32) and vector (Index.vec(N), Int64.vec(N))
+        // for devectorized register/local buffer indexing.
         for idx in &indices {
-            let idx_dtype = idx.dtype();
-            ensure!([DType::Index, DType::Int64].contains(&idx_dtype), IndexTypeMismatchSnafu { actual: idx_dtype });
+            let base = idx.dtype().base();
+            ensure!(
+                matches!(
+                    base,
+                    morok_dtype::ScalarDType::Index | morok_dtype::ScalarDType::Int64 | morok_dtype::ScalarDType::Int32
+                ),
+                IndexTypeMismatchSnafu { actual: idx.dtype() }
+            );
         }
 
         // Determine result dtype based on (dtype, ptr) parameters

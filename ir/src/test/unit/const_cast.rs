@@ -125,11 +125,11 @@ fn test_unsupported_void_cast() {
 }
 
 #[test]
-fn test_unsupported_index_cast() {
+fn test_index_cast_from_int() {
     let value = ConstValue::Int(42);
     let index_dtype = DType::Scalar(ScalarDType::Index);
-    // Index can be cast TO from integers, but we don't support it in ConstValue
-    assert_eq!(value.cast(&index_dtype), None);
+    // Index is semantically an integer type, cast from Int succeeds
+    assert_eq!(value.cast(&index_dtype), Some(ConstValue::Int(42)));
 }
 
 #[test]

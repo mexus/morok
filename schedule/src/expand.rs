@@ -185,8 +185,7 @@ pub fn pre_expand(ast: &Arc<UOp>) -> Arc<UOp> {
 
     // Phase 1: Convert Range(Unroll/Upcast) to UNROLL ops
     // Uses default graph_rewrite (patterns see optimized children)
-    let phase1 = phase1_range_to_unroll();
-    let ast = graph_rewrite(&phase1, ast.clone(), &mut ());
+    let ast = graph_rewrite(phase1_range_to_unroll(), ast.clone(), &mut ());
 
     // Phase 2: Expander + symbolic (Tinygrad: sym + pm_pre_expander + pm_group_for_reduce + expander)
     //
@@ -199,8 +198,10 @@ pub fn pre_expand(ast: &Arc<UOp>) -> Arc<UOp> {
     // CRITICAL: Uses graph_rewrite (not bottom_up) so do_expand sees OPTIMIZED children.
     // This ensures nested expressions like Add(Add(UNROLL, UNROLL), UNROLL) are
     // correctly expanded - inner Add becomes UNROLL before outer Add is processed.
-    let phase2 = symbolic_simple() + pm_pre_expander() + pm_group_for_reduce() + expander();
-    graph_rewrite(&phase2, ast, &mut ())
+    use std::sync::LazyLock;
+    static PHASE2: LazyLock<TypedPatternMatcher> =
+        LazyLock::new(|| symbolic_simple() + pm_pre_expander() + pm_group_for_reduce() + expander());
+    graph_rewrite(&*PHASE2, ast, &mut ())
 }
 
 /// Phase 1: Convert Range(Unroll/Upcast) → UNROLL ops with constant vectors.
@@ -212,8 +213,8 @@ pub fn pre_expand(ast: &Arc<UOp>) -> Arc<UOp> {
 ///  if r.arg[1] in {AxisType.UNROLL, AxisType.UPCAST} else None)
 /// ```
 ///
-fn phase1_range_to_unroll() -> TypedPatternMatcher {
-    crate::patterns! {
+fn phase1_range_to_unroll() -> &'static TypedPatternMatcher {
+    crate::cached_patterns! {
         // Convert Range(Unroll) to UNROLL op with constant vector
         // NOTE: Range(Upcast) is NOT converted here - it's preserved for fix_reduce_unroll
         // to detect and set Vector dtype for K-vectorization. It gets converted in Phase 2.
@@ -238,8 +239,8 @@ fn phase1_range_to_unroll() -> TypedPatternMatcher {
 /// 1. Converting Upcast/Unroll ranges to UNROLL ops with const vectors
 /// 2. Partitioning REDUCE ranges so only Range ops remain (UNROLL → CONTRACT)
 /// 3. Partitioning STORE ranges similarly
-pub fn pm_pre_expander() -> TypedPatternMatcher {
-    crate::patterns! {
+pub fn pm_pre_expander() -> &'static TypedPatternMatcher {
+    crate::cached_patterns! {
         // =====================================================================
         // Range conversion (pm_pre_expander pattern 1)
         // =====================================================================
@@ -280,8 +281,8 @@ pub fn pm_pre_expander() -> TypedPatternMatcher {
 ///
 /// These patterns propagate UNROLL through the computation graph,
 /// vectorizing operations and collapsing via CONTRACT when needed.
-pub fn expander() -> TypedPatternMatcher {
-    crate::patterns! {
+pub fn expander() -> &'static TypedPatternMatcher {
+    crate::cached_patterns! {
         // =====================================================================
         // Push broadcast through AFTER/END (Tinygrad expander.py:84-85)
         // =====================================================================
@@ -906,8 +907,8 @@ fn fix_group_for_reduce(reduce: &Arc<UOp>) -> Option<Arc<UOp>> {
 /// Based on Tinygrad's pm_group_for_reduce (expander.py:153-156).
 ///
 /// This should be applied AFTER pm_pre_expander but BEFORE the main expander.
-pub fn pm_group_for_reduce() -> TypedPatternMatcher {
-    crate::patterns! {
+pub fn pm_group_for_reduce() -> &'static TypedPatternMatcher {
+    crate::cached_patterns! {
         // Match REDUCE ops and transform GROUP_REDUCE ranges
         reduce @ Reduce(_, ..) => |reduce| fix_group_for_reduce(reduce),
     }

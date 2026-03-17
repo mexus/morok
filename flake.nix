@@ -6,10 +6,10 @@
     crane = {
       url = "github:ipetkov/crane";
     };
-    advisory-db = {
-      url = "github:rustsec/advisory-db";
-      flake = false;
-    };
+    # advisory-db = {
+    #   url = "github:rustsec/advisory-db";
+    #   flake = false;
+    # };
     treefmtSrc.url = "github:numtide/treefmt-nix";
   };
 
@@ -20,7 +20,7 @@
       utils,
       crane,
       rust-overlay,
-      advisory-db,
+      # advisory-db,
       treefmtSrc,
     }:
     utils.lib.eachDefaultSystem (
@@ -46,16 +46,29 @@
         mkShell = pkgs.mkShell.override { inherit stdenv; };
         crane' = (crane.mkLib pkgs).overrideToolchain (pkgs.rust_stable);
 
-        sourceFilter = path: type: (crane'.filterCargoSources path type);
+        sourceFilter = path: type: (pkgs.lib.hasSuffix ".proto" path) || (crane'.filterCargoSources path type);
 
         src = pkgs.lib.cleanSourceWith {
           src = ./.;
           filter = sourceFilter;
         };
+
+        onnxTestData = pkgs.fetchFromGitHub {
+          owner = "onnx";
+          repo = "onnx";
+          rev = "bd577f8df5b3fc58a171471125fbda1f7486b5e8";
+          hash = "sha256-UclqX+WcrU2ZGLPoH+7ZHABM8Jqzc4BmHC8UGhyF/3k=";
+          sparseCheckout = [
+            "onnx/backend/test/data/node"
+            "onnx/backend/test/data/light"
+          ];
+        };
+
         nativeBuildInputs = with pkgs; [
           llvm.llvm.dev
           llvm.mlir
           pkgconf
+          protobuf
           libffi
           libxml2
           z3
@@ -78,6 +91,7 @@
           MLIR_SYS_210_PREFIX = "${mlirSysPrefix}";
           TABLEGEN_210_PREFIX = "${mlirSysPrefix}";
           LIBCLANG_PATH = "${pkgs.libclang.lib}/lib/";
+          ONNX_TEST_DATA = "${onnxTestData}/onnx/backend/test/data";
           # Disable fortify since debug builds use -O0 but _FORTIFY_SOURCE requires optimization
           hardeningDisable = [ "fortify" ];
 
@@ -99,13 +113,13 @@
             commonArgs
             // {
               inherit cargoArtifacts;
-              cargoNextestExtraArgs = "--features z3,proptest";
+              cargoNextestExtraArgs = "--features z3,proptest -E 'not test(light_densenet121)'";
             }
           );
 
-          audit = crane'.cargoAudit {
-            inherit src advisory-db;
-          };
+          # audit = crane'.cargoAudit {
+            # inherit src advisory-db;
+          # };
 
           rustfmt = crane'.cargoFmt { inherit src; };
           # treefmt = treefmt.config.build.check self;

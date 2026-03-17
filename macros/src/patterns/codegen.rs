@@ -1786,6 +1786,25 @@ pub fn generate_simplified_pattern_matcher(patterns: &PatternList) -> Result<Tok
     }
 }
 
+/// Generate a `&'static SimplifiedPatternMatcher` cached in a `LazyLock`.
+///
+/// Wraps the output of `generate_simplified_pattern_matcher` in a `std::sync::LazyLock`
+/// static, so the matcher is constructed only once (on first use) and reused thereafter.
+pub fn generate_cached_pattern_matcher(patterns: &PatternList) -> Result<TokenStream2> {
+    let inner = generate_simplified_pattern_matcher(patterns)?;
+    let ctx_type = patterns.context_type.as_ref().map(|t| quote! { #t }).unwrap_or_else(|| quote! { () });
+
+    Ok(quote! {
+        {
+            use std::sync::LazyLock;
+            static __CACHED: LazyLock<
+                morok_ir::pattern::SimplifiedPatternMatcher<#ctx_type>
+            > = LazyLock::new(|| #inner);
+            &*__CACHED
+        }
+    })
+}
+
 /// Expand a for-block for simplified matcher.
 fn expand_simplified_for_block(for_block: &ForBlock, has_context: bool) -> Result<Vec<TokenStream2>> {
     let var_name = &for_block.var;

@@ -9,5 +9,5 @@ pub mod parser;
 #[cfg(test)]
 mod test;
 
-pub use codegen::generate_simplified_pattern_matcher;
+pub use codegen::{generate_cached_pattern_matcher, generate_simplified_pattern_matcher};
 pub use parser::PatternList;

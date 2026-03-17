@@ -2,7 +2,7 @@
 //!
 //! These methods support symbolic pattern matching, based on Tinygrad's ops.py.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::op::Op;
@@ -12,55 +12,41 @@ use crate::uop::UOp;
 impl UOp {
     /// Returns the largest known integer that divides this UOp.
     ///
-    /// Based on Tinygrad's `const_factor()` (ops.py lines 695-702).
-    ///
-    /// # Examples
-    ///
-    /// ```ignore
-    /// let x = UOp::const_(DType::Int32, ConstValue::Int(6));
-    /// assert_eq!(x.const_factor(), 6);
-    ///
-    /// let mul = UOp::new(Op::Binary(BinaryOp::Mul, x, y), DType::Int32);
-    /// // Returns 6 if x.const_factor() == 6
-    /// ```
+    /// Based on Tinygrad's `const_factor()` (ops.py:693-700).
+    /// For MUL, only checks immediate CONST children (not recursive).
     pub fn const_factor(&self) -> i64 {
         match &self.op {
-            // Constants have their own value as factor
             Op::Const(cv) => match &cv.0 {
                 ConstValue::Int(i) => *i,
                 ConstValue::UInt(u) => *u as i64,
                 _ => 1,
             },
-
-            // Multiplication: product of const factors
-            // If multiplying by a constant, the whole expression has that factor
+            // VCONST: GCD of all elements (Tinygrad ops.py:697)
+            Op::VConst { values } => values
+                .iter()
+                .filter_map(|v| match v {
+                    ConstValue::Int(i) => Some(*i),
+                    ConstValue::UInt(u) => Some(*u as i64),
+                    _ => None,
+                })
+                .map(|v| v.abs())
+                .reduce(gcd)
+                .unwrap_or(1),
+            // MUL: only immediate CONST child, matching Tinygrad exactly
             Op::Binary(BinaryOp::Mul, a, b) => {
-                let fa = a.const_factor();
-                let fb = b.const_factor();
-                fa * fb
+                if let Op::Const(cv) = &a.op
+                    && let ConstValue::Int(i) = cv.0
+                {
+                    return i;
+                }
+                if let Op::Const(cv) = &b.op
+                    && let ConstValue::Int(i) = cv.0
+                {
+                    return i;
+                }
+                1
             }
-
-            // Division: dividend factor divided by divisor factor
-            Op::Binary(BinaryOp::Idiv, a, b) => {
-                let fa = a.const_factor();
-                let fb = b.const_factor();
-                if fb != 0 && fa % fb == 0 { fa / fb } else { 1 }
-            }
-
-            // Modulo: GCD of both operands
-            Op::Binary(BinaryOp::Mod, a, b) => {
-                let fa = a.const_factor();
-                let fb = b.const_factor();
-                gcd(fa.abs(), fb.abs())
-            }
-
-            // Addition: GCD of all addends
-            Op::Binary(BinaryOp::Add, a, b) => {
-                let fa = a.const_factor();
-                let fb = b.const_factor();
-                gcd(fa.abs(), fb.abs())
-            }
-
+            Op::Binary(BinaryOp::Add, a, b) => gcd(a.const_factor().abs(), b.const_factor().abs()),
             _ => 1,
         }
     }
@@ -68,51 +54,157 @@ impl UOp {
     /// Returns `self / v` if `v` divides `self` exactly, otherwise None.
     ///
     /// Based on Tinygrad's `divides()` (ops.py lines 703-711).
-    ///
-    /// # Examples
-    ///
-    /// ```ignore
-    /// // (6*x).divides(3) = Some(2*x)
-    /// // (5*x).divides(3) = None
-    /// ```
+    /// Delegates to [`divides_int`] for constant divisors.
     pub fn divides(self: &Arc<Self>, v: &Arc<Self>) -> Option<Arc<Self>> {
-        // If v is a constant, check if const_factor is divisible
         if let Op::Const(cv) = v.op()
             && let ConstValue::Int(divisor) = cv.0
         {
-            let factor = self.const_factor();
-            if divisor != 0 && factor % divisor == 0 {
-                // If self is constant, return const result
-                if let Op::Const(self_cv) = self.op()
-                    && let ConstValue::Int(dividend) = self_cv.0
-                {
-                    return Some(Self::const_(self.dtype(), ConstValue::Int(dividend / divisor)));
-                }
+            return self.divides_int(divisor);
+        }
+        None
+    }
 
-                // If self is multiplication by constant
-                if let Op::Binary(BinaryOp::Mul, a, b) = self.op() {
-                    // Check right operand for constant
-                    if let Op::Const(const_cv) = b.op()
-                        && let ConstValue::Int(mult) = const_cv.0
-                        && mult % divisor == 0
-                    {
-                        let new_const = Self::const_(b.dtype(), ConstValue::Int(mult / divisor));
-                        return Some(a.try_mul(&new_const).expect("divides: mul should succeed with same dtype"));
-                    }
-
-                    // Check left operand for constant (multiplication is commutative)
-                    if let Op::Const(const_cv) = a.op()
-                        && let ConstValue::Int(mult) = const_cv.0
-                        && mult % divisor == 0
-                    {
-                        let new_const = Self::const_(a.dtype(), ConstValue::Int(mult / divisor));
-                        return Some(new_const.try_mul(b).expect("divides: mul should succeed with same dtype"));
-                    }
+    /// Returns `self / v` if integer `v` divides all terms exactly, otherwise None.
+    ///
+    /// Based on Tinygrad's `divides(v: int)` (ops.py:701-709).
+    /// Recursively handles Const, Add, and Mul operations.
+    pub fn divides_int(self: &Arc<Self>, v: i64) -> Option<Arc<Self>> {
+        if v == 1 {
+            return Some(Arc::clone(self));
+        }
+        if v == 0 {
+            return None;
+        }
+        match self.op() {
+            Op::Const(cv) => {
+                let ConstValue::Int(val) = cv.0 else { return None };
+                if val % v == 0 { Some(Self::const_(self.dtype(), ConstValue::Int(val / v))) } else { None }
+            }
+            // VCONST: divide each element if all are divisible (Tinygrad ops.py:704)
+            Op::VConst { values } => {
+                let divided: Option<Vec<ConstValue>> = values
+                    .iter()
+                    .map(|val| match val {
+                        ConstValue::Int(i) if i % v == 0 => Some(ConstValue::Int(i / v)),
+                        _ => None,
+                    })
+                    .collect();
+                divided.map(UOp::vconst)
+            }
+            Op::Binary(BinaryOp::Add, a, b) => {
+                let d0 = a.divides_int(v)?;
+                let d1 = b.divides_int(v)?;
+                d0.try_add(&d1).ok()
+            }
+            Op::Binary(BinaryOp::Mul, a, b) => {
+                if let Some(d0) = a.divides_int(v) {
+                    return d0.try_mul(b).ok();
                 }
+                if let Some(d1) = b.divides_int(v) {
+                    return a.try_mul(&d1).ok();
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+
+    /// Returns `self / v` if exact division by UOp `v` is possible.
+    ///
+    /// Based on Tinygrad's `divide_exact(v: UOp)` (ops.py:717-726).
+    /// Handles identity, constant divisors, Add recursion, and Mul factoring.
+    pub fn divide_exact(self: &Arc<Self>, v: &Arc<Self>) -> Option<Arc<Self>> {
+        if Arc::ptr_eq(self, v) {
+            return Some(self.const_like(1i64));
+        }
+        if let Op::Const(cv) = v.op()
+            && let ConstValue::Int(d) = cv.0
+        {
+            return self.divides_int(d);
+        }
+        if let Op::Binary(BinaryOp::Add, a, b) = self.op() {
+            let d0 = a.divide_exact(v)?;
+            let d1 = b.divide_exact(v)?;
+            return d0.try_add(&d1).ok();
+        }
+        if let Op::Binary(BinaryOp::Mul, a, b) = self.op() {
+            if let Some(d) = a.divide_exact(v) {
+                return d.try_mul(b).ok();
+            }
+            if let Some(d) = b.divide_exact(v) {
+                return a.try_mul(&d).ok();
+            }
+        }
+        None
+    }
+
+    /// Computes the symbolic GCD of multiple UOps, returning a UOp.
+    ///
+    /// Based on Tinygrad's `UOp.gcd()` (ops.py:713-716).
+    /// Finds both numeric GCD of const_factors AND common symbolic MUL factors.
+    ///
+    /// For inputs `6*a*b` and `4*a*c`, returns `2*a` (numeric GCD=2, common factor=a).
+    pub fn symbolic_gcd(uops: &[Arc<Self>]) -> Arc<Self> {
+        assert!(!uops.is_empty(), "symbolic_gcd requires at least one uop");
+
+        // Step 1: decompose each uop into (term, factor) where term = uop / factor
+        let decomp: Vec<(Arc<Self>, i64)> = uops
+            .iter()
+            .map(|u| {
+                let f = u.const_factor();
+                let term = if f == 1 || f == 0 {
+                    Arc::clone(u)
+                } else {
+                    u.divides_int(f).unwrap_or_else(|| u.const_like(1i64))
+                };
+                (term, f)
+            })
+            .collect();
+
+        // Step 2: split each term into MUL factors, build Counter (ptr → count)
+        let counters: Vec<HashMap<*const Self, (Arc<Self>, usize)>> = decomp
+            .iter()
+            .map(|(term, _)| {
+                let mut counter: HashMap<*const Self, (Arc<Self>, usize)> = HashMap::new();
+                for factor in term.split_uop(BinaryOp::Mul) {
+                    let ptr = Arc::as_ptr(&factor);
+                    counter.entry(ptr).and_modify(|(_, c)| *c += 1).or_insert((factor, 1));
+                }
+                counter
+            })
+            .collect();
+
+        // Step 3: intersect counters (keep factors present in ALL terms with min count)
+        let mut common = counters[0].clone();
+        for other in &counters[1..] {
+            common.retain(|ptr, (_, count)| {
+                if let Some((_, other_count)) = other.get(ptr) {
+                    *count = (*count).min(*other_count);
+                    true
+                } else {
+                    false
+                }
+            });
+        }
+
+        // Step 4: numeric GCD of all const_factors
+        let numeric = decomp.iter().map(|(_, f)| f.abs()).reduce(gcd).unwrap_or(1);
+
+        // Step 5: multiply common symbolic factors with numeric GCD
+        let mut result = uops[0].const_like(numeric);
+        for (factor, count) in common.values() {
+            // Skip CONST(1) factors from divides_int normalization
+            if let Op::Const(cv) = factor.op()
+                && matches!(cv.0, ConstValue::Int(1))
+            {
+                continue;
+            }
+            for _ in 0..*count {
+                result = result.try_mul(factor).expect("symbolic_gcd: mul failed");
             }
         }
 
-        None
+        result
     }
 
     /// Separates a constant term from a binary expression.
@@ -356,20 +448,20 @@ impl UOp {
 
     /// Check if a UOp represents an invalid index marker.
     ///
-    /// Currently uses a sentinel value convention (i64::MIN for Index type).
-    /// This will be replaced with proper ConstValue::Invalid in Phase 5.
+    /// Matches both scalar `Op::Invalid` and vectorized `VECTORIZE(Invalid, ..., Invalid)`
+    /// where ALL elements are Invalid. The vectorized form appears after expansion
+    /// broadcasts scalar Invalid across lanes.
     ///
-    /// # Examples
-    ///
-    /// ```ignore
-    /// let invalid = UOp::invalid_marker();
-    /// assert!(UOp::is_invalid_marker(&invalid));
-    ///
-    /// let valid_idx = UOp::index_const(5);
-    /// assert!(!UOp::is_invalid_marker(&valid_idx));
-    /// ```
-    fn is_invalid_marker(uop: &Arc<Self>) -> bool {
-        matches!(uop.op(), Op::Invalid)
+    /// Uses `all()` semantics (entire vector must be Invalid). This differs from
+    /// `has_invalid()` in symbolic patterns which uses `any()` for guard semantics.
+    pub fn is_invalid_marker(uop: &Arc<Self>) -> bool {
+        match uop.op() {
+            Op::Invalid => true,
+            Op::Vectorize { elements } => {
+                !elements.is_empty() && elements.iter().all(|e| matches!(e.op(), Op::Invalid))
+            }
+            _ => false,
+        }
     }
 
     /// Create an invalid index marker.
@@ -448,7 +540,9 @@ impl UOp {
 }
 
 /// Computes the greatest common divisor using Euclid's algorithm.
-fn gcd(mut a: i64, mut b: i64) -> i64 {
+/// Always returns a non-negative value.
+pub fn gcd(a: i64, b: i64) -> i64 {
+    let (mut a, mut b) = (a.abs(), b.abs());
     while b != 0 {
         let temp = b;
         b = a % b;
@@ -587,6 +681,88 @@ mod tests {
         assert_eq!(gcd(12, 8), 4);
         assert_eq!(gcd(17, 19), 1);
         assert_eq!(gcd(100, 50), 50);
+        assert_eq!(gcd(-12, 8), 4);
+        assert_eq!(gcd(12, -8), 4);
+        assert_eq!(gcd(-12, -8), 4);
+    }
+
+    #[test]
+    fn test_symbolic_gcd_numeric_only() {
+        // GCD of 6*x and 4*y → numeric GCD is 2
+        let x = UOp::var("x", DType::Index, 0, 10);
+        let y = UOp::var("y", DType::Index, 0, 10);
+        let six = UOp::const_(DType::Index, ConstValue::Int(6));
+        let four = UOp::const_(DType::Index, ConstValue::Int(4));
+        let a = x.try_mul(&six).unwrap(); // 6*x
+        let b = y.try_mul(&four).unwrap(); // 4*y
+        let g = UOp::symbolic_gcd(&[a, b]);
+        if let Op::Const(cv) = g.op() {
+            assert_eq!(cv.0, ConstValue::Int(2));
+        } else {
+            panic!("Expected constant GCD, got: {}", g.tree());
+        }
+    }
+
+    #[test]
+    fn test_symbolic_gcd_with_common_factor() {
+        // GCD of 6*x and 4*x → 2*x (common symbolic factor x, numeric GCD 2)
+        let x = UOp::var("x", DType::Index, 0, 10);
+        let six = UOp::const_(DType::Index, ConstValue::Int(6));
+        let four = UOp::const_(DType::Index, ConstValue::Int(4));
+        let a = x.try_mul(&six).unwrap(); // 6*x (= x*6 internally)
+        let b = x.try_mul(&four).unwrap(); // 4*x (= x*4 internally)
+        let g = UOp::symbolic_gcd(&[a, b]);
+        // Should be 2*x — a MUL node
+        assert!(matches!(g.op(), Op::Binary(BinaryOp::Mul, _, _)), "Expected MUL, got: {}", g.tree());
+    }
+
+    #[test]
+    fn test_const_factor_mul_only_immediate() {
+        // (x * 6) * (y * 4) — const_factor should be 1 (no immediate CONST child)
+        let x = UOp::var("x", DType::Index, 0, 10);
+        let y = UOp::var("y", DType::Index, 0, 10);
+        let six = UOp::const_(DType::Index, ConstValue::Int(6));
+        let four = UOp::const_(DType::Index, ConstValue::Int(4));
+        let a = x.try_mul(&six).unwrap(); // x*6
+        let b = y.try_mul(&four).unwrap(); // y*4
+        let ab = a.try_mul(&b).unwrap(); // (x*6) * (y*4)
+        // Tinygrad: neither immediate child is CONST → returns 1
+        assert_eq!(ab.const_factor(), 1);
+    }
+
+    #[test]
+    fn test_const_factor_vconst() {
+        let vc = UOp::vconst(vec![ConstValue::Int(6), ConstValue::Int(12), ConstValue::Int(18), ConstValue::Int(24)]);
+        assert_eq!(vc.const_factor(), 6); // GCD(6, 12, 18, 24) = 6
+    }
+
+    #[test]
+    fn test_const_factor_vconst_no_common() {
+        let vc = UOp::vconst(vec![ConstValue::Int(7), ConstValue::Int(11)]);
+        assert_eq!(vc.const_factor(), 1); // GCD(7, 11) = 1
+    }
+
+    #[test]
+    fn test_divides_int_vconst() {
+        let vc = UOp::vconst(vec![ConstValue::Int(6), ConstValue::Int(12)]);
+        let result = vc.divides_int(3);
+        assert!(result.is_some());
+        if let Some(r) = result {
+            if let Op::VConst { values } = r.op() {
+                assert_eq!(values, &[ConstValue::Int(2), ConstValue::Int(4)]);
+            } else {
+                panic!("Expected VConst result");
+            }
+        }
+    }
+
+    #[test]
+    fn test_divides_int_vconst_not_divisible() {
+        let vc = UOp::vconst(vec![
+            ConstValue::Int(6),
+            ConstValue::Int(7), // 7 not divisible by 3
+        ]);
+        assert!(vc.divides_int(3).is_none());
     }
 
     #[test]
