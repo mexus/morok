@@ -10,7 +10,7 @@ const sidebars: SidebarsConfig = {
     {
       type: 'category',
       label: 'Getting Started',
-      items: ['examples'],
+      items: ['examples', 'onnx'],
     },
     {
       type: 'category',
