@@ -53,6 +53,19 @@ jobs:
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
+          publish_crate() {
+            local crate="$1"
+            local output
+            if output=$(nix develop --command cargo publish -p "$crate" --no-verify 2>&1); then
+              echo "$crate: published"
+            elif echo "$output" | grep -q "already exists"; then
+              echo "$crate: already published, skipping"
+            else
+              echo "$output" >&2
+              return 1
+            fi
+          }
+
           wait_for_crate() {
             local crate="$1"
             local version="$2"
@@ -74,38 +87,38 @@ jobs:
           VERSION="${GITHUB_REF#refs/tags/v}"
 
           # L0: no internal deps
-          nix develop --command cargo publish -p morok-dtype --no-verify &
-          nix develop --command cargo publish -p morok-macros --no-verify &
+          publish_crate morok-dtype &
+          publish_crate morok-macros &
           wait
           wait_for_crate morok-dtype "$VERSION"
           wait_for_crate morok-macros "$VERSION"
 
           # L1
-          nix develop --command cargo publish -p morok-ir --no-verify
+          publish_crate morok-ir
           wait_for_crate morok-ir "$VERSION"
 
           # L2
-          nix develop --command cargo publish -p morok-device --no-verify
+          publish_crate morok-device
           wait_for_crate morok-device "$VERSION"
 
           # L3
-          nix develop --command cargo publish -p morok-schedule --no-verify
+          publish_crate morok-schedule
           wait_for_crate morok-schedule "$VERSION"
 
           # L4
-          nix develop --command cargo publish -p morok-codegen --no-verify
+          publish_crate morok-codegen
           wait_for_crate morok-codegen "$VERSION"
 
           # L5
-          nix develop --command cargo publish -p morok-runtime --no-verify
+          publish_crate morok-runtime
           wait_for_crate morok-runtime "$VERSION"
 
           # L6
-          nix develop --command cargo publish -p morok-tensor --no-verify
+          publish_crate morok-tensor
           wait_for_crate morok-tensor "$VERSION"
 
           # L7
-          nix develop --command cargo publish -p morok-onnx --no-verify
+          publish_crate morok-onnx
           echo "All crates published successfully!"
 
   release:
