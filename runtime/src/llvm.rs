@@ -1,233 +1,142 @@
-//! LLVM JIT compilation and execution.
-
-use std::mem::ManuallyDrop;
+//! LLVM JIT compilation via external clang + ELF loader.
+//!
+//! Compiles LLVM IR text via `clang -x ir -c -O2` stdin→stdout and loads the
+//! resulting object via the shared JIT ELF loader. No linked LLVM required.
 
 use crate::Result;
-use inkwell::OptimizationLevel;
-use inkwell::context::Context;
-use inkwell::execution_engine::ExecutionEngine;
-use inkwell::module::Module;
-use inkwell::passes::PassBuilderOptions;
-use inkwell::targets::{CodeModel, InitializationConfig, RelocMode, Target, TargetMachine};
-use tracing::{debug, instrument, trace};
+use crate::dispatch::KernelCif;
+use tracing::debug;
 
-/// LLVM JIT-compiled kernel with proper context ownership.
-///
-/// Uses Box<Context> for stable addressing and ManuallyDrop for correct drop order.
-/// The Context is heap-allocated and never moves, so references remain valid.
+/// LLVM JIT-compiled kernel using external clang + mmap ELF loader.
 pub struct LlvmKernel {
-    /// Owned context (heap-allocated, stable address).
-    /// Not directly accessed, but must be kept alive for module/engine.
-    #[allow(dead_code)]
-    context: Box<Context>,
-
-    /// Module referencing the context (dropped before context).
-    /// SAFETY: 'static lifetime is a lie, but safe because:
-    /// 1. Context is boxed (stable address)
-    /// 2. Module is dropped before Context in Drop impl
-    module: ManuallyDrop<Module<'static>>,
-
-    /// Execution engine referencing the module (dropped first).
-    /// SAFETY: Same rationale as module.
-    execution_engine: ManuallyDrop<ExecutionEngine<'static>>,
-
-    /// Entry point function name.
+    _mmap: memmap2::MmapMut,
+    fn_ptr: *const (),
     entry_point: String,
-
-    /// Kernel name for debugging.
     name: String,
-
-    /// Variable names in order (for populating vars array at runtime).
-    /// Includes thread_id at the end if threading is enabled.
     var_names: Vec<String>,
-
-    /// Raw function pointer for thread-safe parallel execution.
-    /// SAFETY: This is a raw pointer to JIT-compiled code that remains valid
-    /// as long as the execution_engine is alive.
-    fn_ptr: *const u8,
+    cif: KernelCif,
 }
 
+// SAFETY: Function pointer points to read-only compiled code in mmap'd memory.
+// Multiple threads can call it concurrently.
+unsafe impl Send for LlvmKernel {}
+unsafe impl Sync for LlvmKernel {}
+
 impl LlvmKernel {
-    /// Compile LLVM IR to executable code.
-    ///
-    /// This parses the LLVM IR, verifies it, runs optimization passes,
-    /// and JIT compiles using LLVM's MCJIT or ORC engine.
-    ///
-    /// # Arguments
-    /// * `ir` - LLVM IR source code
-    /// * `entry_point` - Name of the kernel entry point function
-    /// * `name` - Kernel name for debugging/caching
-    /// * `var_names` - Variable names in order for populating vars array at runtime
-    #[instrument(skip_all, fields(kernel.entry_point, kernel.name))]
+    /// Compile LLVM IR text to executable code via external clang.
     pub fn compile_ir(
         ir: &str,
         entry_point: impl Into<String>,
         name: impl Into<String>,
         var_names: Vec<String>,
+        buf_count: usize,
     ) -> Result<Self> {
         let entry_point = entry_point.into();
         let name = name.into();
 
-        // Record span fields after conversion
-        tracing::Span::current().record("kernel.entry_point", &entry_point);
-        tracing::Span::current().record("kernel.name", &name);
+        debug!(kernel.name = %name, ir.length = ir.len(), "Compiling LLVM IR via external clang");
 
-        // Create boxed context (stable heap address)
-        let context = Box::new(Context::create());
+        let obj = compile_ir_to_object(ir)?;
+        let (fn_ptr, mmap) = crate::jit_loader::jit_load(&obj, &entry_point)?;
+        let cif = KernelCif::new(buf_count + var_names.len());
 
-        // SAFETY: We extend lifetime to 'static, but maintain safety by:
-        // 1. Context is boxed - stable address, won't move
-        // 2. We manually control drop order in Drop impl
-        // 3. Module/Engine never outlive the context
-        let context_ref: &'static Context = unsafe { &*(context.as_ref() as *const Context) };
+        debug!(kernel.name = %name, "LLVM kernel compiled and loaded");
 
-        // Dump raw IR before parsing for debugging
-        trace!(
-            kernel.name = %name,
-            ir.length = ir.len(),
-            "Raw LLVM IR before parsing:\n{}", ir
-        );
-
-        // Parse LLVM IR into a module
-        let mem_buffer = inkwell::memory_buffer::MemoryBuffer::create_from_memory_range_copy(ir.as_bytes(), &name);
-        let module = context_ref
-            .create_module_from_ir(mem_buffer)
-            .map_err(|e| crate::Error::JitCompilation { reason: format!("Failed to parse LLVM IR: {}", e) })?;
-
-        // Verify the module
-        if let Err(err) = module.verify() {
-            return Err(crate::Error::JitCompilation { reason: format!("Module verification failed: {}", err) });
-        }
-
-        // Dump LLVM IR at trace level (before optimization)
-        trace!(
-            kernel.name = %name,
-            llvm.ir = %module.print_to_string().to_string(),
-            "LLVM IR before optimization"
-        );
-
-        // Initialize native target for optimization passes
-        Target::initialize_native(&InitializationConfig::default()).map_err(|e| crate::Error::JitCompilation {
-            reason: format!("Failed to initialize native target: {}", e),
-        })?;
-
-        // Create target machine for native CPU with aggressive optimization
-        let triple = TargetMachine::get_default_triple();
-        let target = Target::from_triple(&triple)
-            .map_err(|e| crate::Error::JitCompilation { reason: format!("Failed to get target: {}", e) })?;
-        let target_machine = target
-            .create_target_machine(
-                &triple,
-                TargetMachine::get_host_cpu_name().to_str().unwrap_or("generic"),
-                TargetMachine::get_host_cpu_features().to_str().unwrap_or(""),
-                OptimizationLevel::Aggressive,
-                RelocMode::PIC,
-                CodeModel::Default,
-            )
-            .ok_or_else(|| crate::Error::JitCompilation { reason: "Failed to create target machine".to_string() })?;
-
-        // Configure pass options with explicit vectorization (like Tinygrad)
-        let pass_options = PassBuilderOptions::create();
-        pass_options.set_loop_vectorization(true);
-        pass_options.set_loop_slp_vectorization(true);
-        pass_options.set_loop_unrolling(true);
-
-        // Run optimization passes using the new PassBuilder API
-        module.run_passes("default<O3>", &target_machine, pass_options).map_err(|e| crate::Error::JitCompilation {
-            reason: format!("Failed to run optimization passes: {}", e),
-        })?;
-
-        // Dump optimized IR at debug level
-        debug!(
-            kernel.name = %name,
-            llvm.ir = %module.print_to_string().to_string(),
-            "LLVM IR after optimization"
-        );
-
-        // Create execution engine with Aggressive - the JIT engine may need to do its own codegen
-        let execution_engine = module.create_jit_execution_engine(OptimizationLevel::Aggressive).map_err(|e| {
-            crate::Error::JitCompilation { reason: format!("Failed to create execution engine: {}", e) }
-        })?;
-
-        // Cache function pointer for thread-safe parallel execution
-        let fn_ptr = execution_engine
-            .get_function_address(&entry_point)
-            .map_err(|e| crate::Error::FunctionNotFound { name: format!("{}: {}", entry_point, e) })?
-            as *const u8;
-
-        Ok(Self {
-            context,
-            module: ManuallyDrop::new(module),
-            execution_engine: ManuallyDrop::new(execution_engine),
-            entry_point,
-            name,
-            var_names,
-            fn_ptr,
-        })
+        Ok(Self { _mmap: mmap, fn_ptr, entry_point, name, var_names, cif })
     }
 
     /// Compile a RenderedKernel from the codegen crate.
     pub fn compile(kernel: &morok_codegen::RenderedKernel) -> Result<Self> {
-        Self::compile_ir(&kernel.code, &kernel.name, &kernel.name, kernel.var_names.clone())
+        Self::compile_ir(&kernel.code, &kernel.name, &kernel.name, kernel.var_names.clone(), kernel.buffer_args.len())
     }
 
-    /// Get the variable names in order (thread-safe).
-    ///
-    /// Variable names are passed from codegen and cached for populating the vars array.
-    /// Includes thread_id at the end if threading is enabled.
     pub fn var_names(&self) -> &[String] {
         &self.var_names
     }
 
-    /// Get the raw function pointer (thread-safe).
-    ///
-    /// The function pointer points to JIT-compiled machine code and is safe to call
-    /// from multiple threads concurrently (the compiled code is read-only).
-    pub fn fn_ptr(&self) -> *const u8 {
+    pub fn fn_ptr(&self) -> *const () {
         self.fn_ptr
     }
 
-    /// Get the kernel name (for debugging/profiling).
     pub fn name(&self) -> &str {
         &self.name
     }
 
-    /// Execute the kernel with positional variable values.
+    /// Execute the kernel with buffer pointers and variable values.
     ///
     /// # Safety
     ///
-    /// Caller must ensure:
-    /// - Buffer pointers are valid and properly aligned
-    /// - `vals` has the correct length matching `var_names`
+    /// Caller must ensure buffer pointers are valid/aligned and `vals` length
+    /// matches `var_names`.
     pub unsafe fn execute_with_vals(&self, buffers: &[*mut u8], vals: &[i64]) -> Result<()> {
-        tracing::debug!(
+        debug!(
             kernel.entry_point = %self.entry_point,
             kernel.num_buffers = buffers.len(),
             kernel.num_vals = vals.len(),
             "Executing LLVM kernel"
         );
 
-        // Kernel signature: void kernel(ptr %args, ptr %vars)
-        type KernelFn = unsafe extern "C" fn(*const *mut u8, *const i64);
-        unsafe {
-            let f: KernelFn = std::mem::transmute(self.fn_ptr);
-            f(buffers.as_ptr(), vals.as_ptr());
-        }
+        unsafe { self.cif.dispatch(self.fn_ptr, buffers, vals, None) };
 
         Ok(())
     }
+
+    pub(crate) fn cif(&self) -> &KernelCif {
+        &self.cif
+    }
 }
 
-impl Drop for LlvmKernel {
-    fn drop(&mut self) {
-        // SAFETY: Drop in reverse dependency order
-        // ExecutionEngine -> Module -> Context
-        unsafe {
-            ManuallyDrop::drop(&mut self.execution_engine);
-            ManuallyDrop::drop(&mut self.module);
-            // context drops naturally via Box::drop
-        }
+/// Compile LLVM IR text to a relocatable object via `clang -x ir`.
+fn compile_ir_to_object(ir: &str) -> Result<Vec<u8>> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let mut child = Command::new("clang")
+        .args([
+            "-x",
+            "ir",
+            "-c",
+            "-O2",
+            "-march=native",
+            "-fPIC",
+            "-fno-math-errno",
+            "-fno-stack-protector",
+            "-funroll-loops",
+            "-fvectorize",
+            "-fslp-vectorize",
+            "-",
+            "-o",
+            "-",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| crate::Error::JitCompilation {
+            reason: format!("Failed to spawn clang: {e}. Is clang installed?"),
+        })?;
+
+    child
+        .stdin
+        .take()
+        .expect("stdin was piped")
+        .write_all(ir.as_bytes())
+        .map_err(|e| crate::Error::JitCompilation { reason: format!("Failed to write IR to clang stdin: {e}") })?;
+
+    let output = child
+        .wait_with_output()
+        .map_err(|e| crate::Error::JitCompilation { reason: format!("Failed to wait for clang: {e}") })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(crate::Error::JitCompilation { reason: format!("clang IR compilation failed:\n{stderr}") });
     }
+
+    if output.stdout.is_empty() {
+        return Err(crate::Error::JitCompilation { reason: "clang produced empty output from IR".to_string() });
+    }
+
+    Ok(output.stdout)
 }
 
 #[cfg(test)]
@@ -236,14 +145,13 @@ mod tests {
 
     #[test]
     fn test_llvm_kernel_no_args() {
-        // New signature: kernel(ptr %args, ptr %vars)
         let ir = r#"
-            define void @test_kernel(ptr %args, ptr %vars) {
+            define void @test_kernel() {
                 ret void
             }
         "#;
 
-        let kernel = LlvmKernel::compile_ir(ir, "test_kernel", "test_kernel", vec![]).unwrap();
+        let kernel = LlvmKernel::compile_ir(ir, "test_kernel", "test_kernel", vec![], 0).unwrap();
         assert_eq!(kernel.name(), "test_kernel");
 
         unsafe {
@@ -253,15 +161,13 @@ mod tests {
 
     #[test]
     fn test_llvm_kernel_with_args() {
-        // New signature: kernel(ptr %args, ptr %vars)
-        // This test just checks that buffers are passed correctly
         let ir = r#"
-            define void @add_kernel(ptr %args, ptr %vars) {
+            define void @add_kernel(ptr noalias %data0, ptr noalias %data1) {
                 ret void
             }
         "#;
 
-        let kernel = LlvmKernel::compile_ir(ir, "add_kernel", "add_kernel", vec![]).unwrap();
+        let kernel = LlvmKernel::compile_ir(ir, "add_kernel", "add_kernel", vec![], 2).unwrap();
 
         let mut data1 = vec![0u8; 16];
         let mut data2 = vec![0u8; 16];
@@ -274,15 +180,13 @@ mod tests {
 
     #[test]
     fn test_kernel_drop_order() {
-        // This test verifies that Drop doesn't crash
-        // (proper drop order prevents use-after-free)
         let ir = r#"
-            define void @test(ptr %args, ptr %vars) {
+            define void @test() {
                 ret void
             }
         "#;
 
-        let kernel = LlvmKernel::compile_ir(ir, "test", "test", vec![]).unwrap();
+        let kernel = LlvmKernel::compile_ir(ir, "test", "test", vec![], 0).unwrap();
         drop(kernel); // Should not crash
     }
 }

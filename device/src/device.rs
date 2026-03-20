@@ -94,11 +94,14 @@ pub struct CompiledSpec {
 
     /// Local work size for dispatch (GPU backends)
     pub local_size: Option<[usize; 3]>,
+
+    /// Number of buffer arguments (for CIF construction at compile time).
+    pub buf_count: usize,
 }
 
 impl CompiledSpec {
     /// Create a new CompiledSpec for JIT backends (source-based).
-    pub fn from_source(name: String, src: String, ast: Arc<UOp>) -> Self {
+    pub fn from_source(name: String, src: String, ast: Arc<UOp>, buf_count: usize) -> Self {
         Self {
             name,
             src: Some(src),
@@ -107,12 +110,13 @@ impl CompiledSpec {
             var_names: Vec::new(),
             global_size: None,
             local_size: None,
+            buf_count,
         }
     }
 
     /// Create a new CompiledSpec for AOT backends (bytecode-based).
     pub fn from_bytes(name: String, bytes: Vec<u8>, ast: Arc<UOp>) -> Self {
-        Self { name, src: None, bytes, ast, var_names: Vec::new(), global_size: None, local_size: None }
+        Self { name, src: None, bytes, ast, var_names: Vec::new(), global_size: None, local_size: None, buf_count: 0 }
     }
 
     /// Create a new CompiledSpec with work sizes for JIT backends.
@@ -122,8 +126,9 @@ impl CompiledSpec {
         ast: Arc<UOp>,
         global_size: Option<[usize; 3]>,
         local_size: Option<[usize; 3]>,
+        buf_count: usize,
     ) -> Self {
-        Self { name, src: Some(src), bytes: Vec::new(), ast, var_names: Vec::new(), global_size, local_size }
+        Self { name, src: Some(src), bytes: Vec::new(), ast, var_names: Vec::new(), global_size, local_size, buf_count }
     }
 }
 
@@ -188,6 +193,8 @@ pub trait Renderer: Send + Sync {
     /// # Arguments
     ///
     /// * `ast` - The kernel AST (UOp graph rooted at KERNEL op)
+    /// * `name` - Optional kernel name for debugging (e.g., "r_g16l16R32u4").
+    ///   Falls back to "kernel" if None.
     ///
     /// # Returns
     ///
@@ -196,7 +203,7 @@ pub trait Renderer: Send + Sync {
     /// - Entry point name
     /// - Variable list
     /// - Work sizes (for GPU backends)
-    fn render(&self, ast: &Arc<UOp>) -> Result<ProgramSpec>;
+    fn render(&self, ast: &Arc<UOp>, name: Option<&str>) -> Result<ProgramSpec>;
 
     /// Get the device spec for this renderer.
     ///
@@ -244,7 +251,7 @@ pub type CompilerPair = (Arc<dyn Renderer>, Arc<dyn Compiler>);
 ///
 /// ```ignore
 /// let cpu_device = create_cpu_device()?;
-/// let spec = cpu_device.renderer.render(&kernel_ast)?;
+/// let spec = cpu_device.renderer.render(&kernel_ast, Some("E_L3"))?;
 /// let compiled = cpu_device.compiler.compile(&spec)?;
 /// let program = (cpu_device.runtime)(&compiled)?;
 /// unsafe { program.execute(&buffers, &vals, None, None)?; }
@@ -358,6 +365,9 @@ pub struct ProgramSpec {
     /// Input buffer indices (read by LOAD ops, excluding outputs).
     /// Matches Tinygrad's `ins` field.
     pub ins: Vec<usize>,
+
+    /// Number of buffer arguments (for CIF construction at compile time).
+    pub buf_count: usize,
 }
 
 impl ProgramSpec {
@@ -375,6 +385,7 @@ impl ProgramSpec {
             globals: Vec::new(),
             outs: Vec::new(),
             ins: Vec::new(),
+            buf_count: 0,
         }
     }
 

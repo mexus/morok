@@ -5,12 +5,11 @@
 //!
 //! # Kernel Signature
 //!
-//! The generated kernel uses CPU signature:
+//! Generates a single function with direct typed parameters and `noalias align 32`
+//! buffer annotations:
 //! ```llvm
-//! void @kernel(ptr %args, ptr %vars)
+//! define void @kernel(ptr noalias align 32 %buf0, ..., i32 %N) #0 { ... }
 //! ```
-//! - `args`: pointer to array of buffer pointers
-//! - `vars`: pointer to array of i64 values (variables + optional thread_id)
 
 use std::sync::Arc;
 
@@ -86,8 +85,8 @@ fn native_data_layout() -> &'static str {
 
 /// Text-based LLVM IR renderer.
 ///
-/// Generates LLVM IR as strings, suitable for compilation via inkwell's IR parser.
-/// Produces kernel signature: `void @kernel(ptr %args, ptr %vars)`
+/// Generates LLVM IR as strings, suitable for compilation via external clang.
+/// Produces a single function with direct typed parameters.
 pub struct LlvmTextRenderer;
 
 impl LlvmTextRenderer {
@@ -175,60 +174,38 @@ impl Renderer for LlvmTextRenderer {
             var_names.push("thread_id".to_string());
         }
 
-        kernel.push("  ; Load buffer pointers from args array".to_string());
+        // -- Build function parameters --
+        let mut inner_params: Vec<String> = Vec::new();
+
+        // Buffer pointer parameters
         for (i, buf) in buffers.iter().enumerate() {
-            let ptr_name = format!("%buf{i}_ptr");
-            let buf_name = format!("%buf{i}");
-            kernel.push(format!("  {ptr_name} = getelementptr ptr, ptr %args, i64 {i}"));
-            kernel.push(format!("  {buf_name} = load ptr, ptr {ptr_name}"));
-            ctx.register(buf.id, buf_name);
+            inner_params.push(format!("ptr noalias align 32 %buf{i}"));
+            ctx.register(buf.id, format!("%buf{i}"));
         }
 
-        kernel.push("  ; Load variable values from vars array".to_string());
-        for (i, var) in variables.iter().enumerate() {
-            let var_ptr_name = format!("%var{i}_ptr");
+        // Variable parameters
+        for var in &variables {
             let var_base_name =
-                if let Op::DefineVar { name, .. } = var.op() { name.clone() } else { format!("var{i}") };
-            kernel.push(format!("  {var_ptr_name} = getelementptr i64, ptr %vars, i64 {i}"));
-            kernel.push(format!("  %{var_base_name}_i64 = load i64, ptr {var_ptr_name}"));
-
-            // Cast variable to its expected dtype (i32 or i64 after Index lowering)
+                if let Op::DefineVar { name, .. } = var.op() { name.clone() } else { "var".to_string() };
             let var_dtype = var.dtype();
             let var_dtype_str = ldt(&var_dtype);
-            let var_val_name = if var_dtype_str == "i64" {
-                format!("%{var_base_name}_i64")
-            } else {
-                // Trunc from i64 to i32 (or other narrower type)
-                kernel.push(format!("  %{var_base_name} = trunc i64 %{var_base_name}_i64 to {var_dtype_str}"));
-                format!("%{var_base_name}")
-            };
-            ctx.register(var.id, var_val_name);
+            inner_params.push(format!("{var_dtype_str} %{var_base_name}"));
+            ctx.register(var.id, format!("%{var_base_name}"));
         }
 
+        // Thread ID parameter
         if let Some((thread_range, _)) = &thread_info {
-            let thread_idx = variables.len();
-            kernel.push(format!("  %thread_id_ptr = getelementptr i64, ptr %vars, i64 {thread_idx}"));
-            kernel.push("  %thread_id_i64 = load i64, ptr %thread_id_ptr".to_string());
-
-            // Cast thread_id to the thread_range's dtype (i32 after Index lowering)
             let range_dtype = thread_range.dtype();
             let range_dtype_str = ldt(&range_dtype);
-            let thread_id_name = if range_dtype_str == "i64" {
-                "%thread_id_i64".to_string()
-            } else {
-                // Trunc from i64 to i32 (or other narrower type)
-                kernel.push(format!("  %thread_id = trunc i64 %thread_id_i64 to {range_dtype_str}"));
-                "%thread_id".to_string()
-            };
+            inner_params.push(format!("{range_dtype_str} %thread_id"));
 
             if let Op::Range { axis_id, .. } = thread_range.op() {
-                ctx.register(thread_range.id, thread_id_name.clone());
-                ctx.register_range(axis_id.value(), thread_id_name);
+                ctx.register(thread_range.id, "%thread_id".to_string());
+                ctx.register_range(axis_id.value(), "%thread_id".to_string());
             }
         }
 
-        kernel.push("".to_string());
-
+        // -- Build function body --
         kernel.push("  ; Reduction accumulators".to_string());
         for node in &nodes {
             if let Op::Reduce { reduce_op, .. } = node.op() {
@@ -283,17 +260,18 @@ target triple = "{target_triple}"
 
 {intrinsics}
 
-define void @{kernel_name}(ptr %args, ptr %vars) #0 {{
+define void @{kernel_name}({inner_params}) #0 {{
 entry:
-{body}
+{inner_body}
 }}
 
-attributes #0 = {{ alwaysinline nounwind "no-builtins" "no-trapping-math"="true" }}
+attributes #0 = {{ nounwind "no-builtins" "no-trapping-math"="true" }}
 "#,
             data_layout = native_data_layout(),
             target_triple = native_target_triple(),
             intrinsics = generate_intrinsic_declarations(&kernel),
-            body = kernel.join("\n")
+            inner_params = inner_params.join(", "),
+            inner_body = kernel.join("\n"),
         );
 
         tracing::debug!(generated_code = ir, "llvm codegen: final generated code");
@@ -432,8 +410,10 @@ mod tests {
         let result = render(&sink, Some("test_add")).unwrap();
         println!("{}", result.code);
 
-        assert!(result.code.contains("define void @test_add(ptr %args, ptr %vars)"));
-        assert!(result.code.contains("getelementptr ptr, ptr %args"));
+        assert!(result.code.contains("define void @test_add("));
+        assert!(result.code.contains("noalias align 32"));
+        assert!(!result.code.contains("_inner"));
+        assert!(!result.code.contains("ptr %args"));
         assert!(result.code.contains("fadd"));
         assert!(result.code.contains("load"));
         assert!(result.code.contains("store"));

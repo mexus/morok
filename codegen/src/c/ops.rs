@@ -231,7 +231,7 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut CContext, kernel: &mut Vec<String>) 
             let bv = ctx.get(b).to_string();
             let cv = ctx.get(c).to_string();
             let expr = if a.dtype().is_float() {
-                format!("{}({av}, {bv}, {cv})", c_math_fn("fma", &a.dtype()))
+                format!("{}({av}, {bv}, {cv})", c_math_fn("__builtin_fma", &a.dtype()))
             } else {
                 format!("(({av} * {bv}) + {cv})")
             };
@@ -461,14 +461,14 @@ fn render_binary(op: BinaryOp, l: &str, r: &str, dtype: &DType) -> String {
         BinaryOp::Idiv => format!("({l} / {r})"),
         BinaryOp::Mod => {
             if dtype.is_float() {
-                format!("{}({l}, {r})", c_math_fn("fmod", dtype))
+                format!("{}({l}, {r})", c_math_fn("__builtin_fmod", dtype))
             } else {
                 format!("({l} % {r})")
             }
         }
         BinaryOp::Max => {
             if dtype.is_float() {
-                format!("{}({l}, {r})", c_math_fn("fmax", dtype))
+                format!("{}({l}, {r})", c_math_fn("__builtin_fmax", dtype))
             } else {
                 format!("({l} > {r} ? {l} : {r})")
             }
@@ -486,10 +486,10 @@ fn render_binary(op: BinaryOp, l: &str, r: &str, dtype: &DType) -> String {
         BinaryOp::Shr => format!("({l} >> {r})"),
         BinaryOp::Pow => {
             if dtype.is_float() {
-                format!("{}({l}, {r})", c_math_fn("pow", dtype))
+                format!("{}({l}, {r})", c_math_fn("__builtin_pow", dtype))
             } else {
                 // Integer pow via cast to double
-                format!("(({})pow((double){l}, (double){r}))", c_dtype(&DType::Scalar(dtype.base())))
+                format!("(({})__builtin_pow((double){l}, (double){r}))", c_dtype(&DType::Scalar(dtype.base())))
             }
         }
         BinaryOp::Threefry => format!("({l} ^ {r})"),
@@ -511,32 +511,32 @@ fn render_unary(op: UnaryOp, s: &str, dtype: &DType) -> String {
         }
         UnaryOp::Abs => {
             if dtype.is_float() {
-                format!("{}({s})", c_math_fn("fabs", dtype))
+                format!("{}({s})", c_math_fn("__builtin_fabs", dtype))
             } else {
                 format!("({s} < 0 ? -{s} : {s})")
             }
         }
-        UnaryOp::Sqrt => format!("{}({s})", c_math_fn("sqrt", dtype)),
+        UnaryOp::Sqrt => format!("{}({s})", c_math_fn("__builtin_sqrt", dtype)),
         UnaryOp::Rsqrt => {
             let one = if matches!(dtype.base(), ScalarDType::Float64) { "1.0" } else { "1.0f" };
-            format!("({one} / {}({s}))", c_math_fn("sqrt", dtype))
+            format!("({one} / {}({s}))", c_math_fn("__builtin_sqrt", dtype))
         }
         UnaryOp::Reciprocal => {
             let one = if matches!(dtype.base(), ScalarDType::Float64) { "1.0" } else { "1.0f" };
             format!("({one} / {s})")
         }
-        UnaryOp::Exp => format!("{}({s})", c_math_fn("exp", dtype)),
-        UnaryOp::Exp2 => format!("{}({s})", c_math_fn("exp2", dtype)),
-        UnaryOp::Log => format!("{}({s})", c_math_fn("log", dtype)),
-        UnaryOp::Log2 => format!("{}({s})", c_math_fn("log2", dtype)),
-        UnaryOp::Sin => format!("{}({s})", c_math_fn("sin", dtype)),
-        UnaryOp::Cos => format!("{}({s})", c_math_fn("cos", dtype)),
-        UnaryOp::Tan => format!("{}({s})", c_math_fn("tan", dtype)),
-        UnaryOp::Floor => format!("{}({s})", c_math_fn("floor", dtype)),
-        UnaryOp::Ceil => format!("{}({s})", c_math_fn("ceil", dtype)),
-        UnaryOp::Trunc => format!("{}({s})", c_math_fn("trunc", dtype)),
-        UnaryOp::Round => format!("{}({s})", c_math_fn("rint", dtype)),
-        UnaryOp::Erf => format!("{}({s})", c_math_fn("erf", dtype)),
+        UnaryOp::Exp => format!("{}({s})", c_math_fn("__builtin_exp", dtype)),
+        UnaryOp::Exp2 => format!("{}({s})", c_math_fn("__builtin_exp2", dtype)),
+        UnaryOp::Log => format!("{}({s})", c_math_fn("__builtin_log", dtype)),
+        UnaryOp::Log2 => format!("{}({s})", c_math_fn("__builtin_log2", dtype)),
+        UnaryOp::Sin => format!("{}({s})", c_math_fn("__builtin_sin", dtype)),
+        UnaryOp::Cos => format!("{}({s})", c_math_fn("__builtin_cos", dtype)),
+        UnaryOp::Tan => format!("{}({s})", c_math_fn("__builtin_tan", dtype)),
+        UnaryOp::Floor => format!("{}({s})", c_math_fn("__builtin_floor", dtype)),
+        UnaryOp::Ceil => format!("{}({s})", c_math_fn("__builtin_ceil", dtype)),
+        UnaryOp::Trunc => format!("{}({s})", c_math_fn("__builtin_trunc", dtype)),
+        UnaryOp::Round => format!("{}({s})", c_math_fn("__builtin_rint", dtype)),
+        UnaryOp::Erf => format!("{}({s})", c_math_fn("__builtin_erf", dtype)),
         UnaryOp::Sign => {
             if dtype.is_float() {
                 let zero = if matches!(dtype.base(), ScalarDType::Float64) { "0.0" } else { "0.0f" };
@@ -556,14 +556,14 @@ fn render_reduce_accumulate(op: ReduceOp, acc: &str, val: &str, dtype: &DType) -
         ReduceOp::Mul => format!("{acc} *= {val};"),
         ReduceOp::Max => {
             if dtype.is_float() {
-                format!("{acc} = {}({acc}, {val});", c_math_fn("fmax", dtype))
+                format!("{acc} = {}({acc}, {val});", c_math_fn("__builtin_fmax", dtype))
             } else {
                 format!("{acc} = ({acc} > {val} ? {acc} : {val});")
             }
         }
         ReduceOp::Min => {
             if dtype.is_float() {
-                format!("{acc} = {}({acc}, {val});", c_math_fn("fmin", dtype))
+                format!("{acc} = {}({acc}, {val});", c_math_fn("__builtin_fmin", dtype))
             } else {
                 format!("{acc} = ({acc} < {val} ? {acc} : {val});")
             }

@@ -17,9 +17,11 @@ pub mod benchmark;
 pub mod clang;
 pub mod device_registry;
 pub mod devices;
+pub(crate) mod dispatch;
 pub mod error;
 pub mod execution_plan;
 pub mod executor;
+pub mod jit_loader;
 pub mod kernel_cache;
 pub mod llvm;
 #[cfg(feature = "mlir")]

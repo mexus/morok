@@ -15,7 +15,7 @@ morok-dtype = { path = "../dtype", version = "=0.1.0-alpha.0" }
 prost = "0.14"
 snafu = "0.9"
 tracing = "0.1"
-smallvec = "1.15"
+smallvec = { workspace = true }
 bytemuck = "1.25"
 
 [build-dependencies]

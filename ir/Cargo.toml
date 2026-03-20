@@ -12,7 +12,7 @@ readme = "README.md"
 [dependencies]
 morok-dtype = { path = "../dtype", version = "=0.1.0-alpha.0", features = ["serde"] }
 morok-macros = { path = "../macros", version = "=0.1.0-alpha.0" }
-smallvec = { version = "1.15.1", features = ["serde"] }
+smallvec = { workspace = true, features = ["serde"] }
 snafu = "0.8.9"
 itertools = "0.14.0"
 proptest-derive = { version = "0.7", optional = true }

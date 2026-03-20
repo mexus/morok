@@ -18,6 +18,7 @@ use morok_ir::UOp;
 
 use crate::LlvmKernel;
 use crate::clang::ClangKernel;
+use crate::dispatch::KernelCif;
 
 /// CPU backend selection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -64,7 +65,8 @@ impl CpuBackend {
 /// 1. Input buffers: Read-only access (no data race)
 /// 2. Output buffers: Disjoint write regions per thread
 unsafe fn execute_parallel(
-    fn_ptr: usize,
+    cif: &KernelCif,
+    fn_ptr: *const (),
     buffers: &[*mut u8],
     vals: &[i64],
     var_names: &[String],
@@ -73,25 +75,45 @@ unsafe fn execute_parallel(
     use rayon::prelude::*;
 
     let thread_id_idx = var_names.iter().position(|n| n == "thread_id");
-    let buffer_usizes: Vec<usize> = buffers.iter().map(|&ptr| ptr as usize).collect();
+    let fn_ptr_usize = fn_ptr as usize;
 
-    type KernelFn = unsafe extern "C" fn(*const *mut u8, *const i64);
+    // Convert raw pointers to usize for Send-safe cross-thread sharing.
+    // Safety: buffer pointers are read-only and point to disjoint write
+    // regions per thread (guaranteed by shift_to transformation).
+    let buf_ptr = buffers.as_ptr() as usize;
+    let buf_len = buffers.len();
 
     (0..thread_count).into_par_iter().for_each(|thread_id| {
-        let mut thread_vals = vals.to_vec();
-        if let Some(idx) = thread_id_idx {
-            thread_vals[idx] = thread_id as i64;
-        }
-
-        let bufs_ptr = buffer_usizes.as_ptr() as *const *mut u8;
-
+        let bufs = unsafe { std::slice::from_raw_parts(buf_ptr as *const *mut u8, buf_len) };
+        let patch = thread_id_idx.map(|idx| (idx, thread_id));
         unsafe {
-            let f: KernelFn = std::mem::transmute(fn_ptr);
-            f(bufs_ptr, thread_vals.as_ptr());
+            cif.dispatch(fn_ptr_usize as *const (), bufs, vals, patch);
         }
     });
 
     Ok(())
+}
+
+// =============================================================================
+// Shared kernel execution
+// =============================================================================
+
+/// Execute a kernel: parallel if global_size > 1, otherwise single-threaded.
+unsafe fn execute_kernel(
+    cif: &KernelCif,
+    fn_ptr: *const (),
+    buffers: &[*mut u8],
+    vals: &[i64],
+    var_names: &[String],
+    global_size: Option<[usize; 3]>,
+) -> Result<()> {
+    let thread_count = global_size.map(|[tc, _, _]| tc).filter(|&tc| tc > 1);
+    if let Some(count) = thread_count {
+        unsafe { execute_parallel(cif, fn_ptr, buffers, vals, var_names, count) }
+    } else {
+        unsafe { cif.dispatch(fn_ptr, buffers, vals, None) };
+        Ok(())
+    }
 }
 
 // =============================================================================
@@ -111,13 +133,8 @@ impl Program for ClangProgram {
         global_size: Option<[usize; 3]>,
         _local_size: Option<[usize; 3]>,
     ) -> Result<()> {
-        let thread_count = global_size.map(|[tc, _, _]| tc).filter(|&tc| tc > 1);
-
-        if let Some(count) = thread_count {
-            unsafe { execute_parallel(self.kernel.fn_ptr() as usize, buffers, vals, self.kernel.var_names(), count) }
-        } else {
-            unsafe { self.kernel.execute_with_vals(buffers, vals) }
-                .map_err(|e| morok_device::Error::Runtime { message: format!("Clang kernel execution failed: {}", e) })
+        unsafe {
+            execute_kernel(self.kernel.cif(), self.kernel.fn_ptr(), buffers, vals, self.kernel.var_names(), global_size)
         }
     }
 
@@ -132,8 +149,8 @@ struct ClangRendererWrapper {
 }
 
 impl Renderer for ClangRendererWrapper {
-    fn render(&self, ast: &Arc<UOp>) -> Result<ProgramSpec> {
-        let rendered = morok_codegen::c::render(ast, Some("kernel"))
+    fn render(&self, ast: &Arc<UOp>, name: Option<&str>) -> Result<ProgramSpec> {
+        let rendered = morok_codegen::c::render(ast, name.or(Some("kernel")))
             .map_err(|e| morok_device::Error::Runtime { message: format!("C rendering failed: {}", e) })?;
 
         let mut spec = ProgramSpec::new(rendered.name.clone(), rendered.code.clone(), self.device.clone(), ast.clone());
@@ -145,6 +162,7 @@ impl Renderer for ClangRendererWrapper {
         }
 
         spec.set_var_names(rendered.var_names.clone());
+        spec.buf_count = rendered.buffer_args.len();
 
         Ok(spec)
     }
@@ -159,8 +177,12 @@ struct ClangCompiler;
 
 impl Compiler for ClangCompiler {
     fn compile(&self, spec: &ProgramSpec) -> Result<morok_device::device::CompiledSpec> {
-        let mut compiled =
-            morok_device::device::CompiledSpec::from_source(spec.name.clone(), spec.src.clone(), spec.ast.clone());
+        let mut compiled = morok_device::device::CompiledSpec::from_source(
+            spec.name.clone(),
+            spec.src.clone(),
+            spec.ast.clone(),
+            spec.buf_count,
+        );
         compiled.var_names = spec.var_names.clone();
         compiled.global_size = spec.global_size;
         compiled.local_size = spec.local_size;
@@ -178,7 +200,7 @@ fn create_clang_program(spec: &morok_device::device::CompiledSpec) -> Result<Box
         message: "Clang backend requires source code in CompiledSpec".to_string(),
     })?;
 
-    let kernel = ClangKernel::compile(src, &spec.name, spec.var_names.clone())
+    let kernel = ClangKernel::compile(src, &spec.name, spec.var_names.clone(), spec.buf_count)
         .map_err(|e| morok_device::Error::Runtime { message: format!("Clang compilation failed: {}", e) })?;
 
     Ok(Box::new(ClangProgram { kernel }))
@@ -201,13 +223,8 @@ impl Program for LlvmProgram {
         global_size: Option<[usize; 3]>,
         _local_size: Option<[usize; 3]>,
     ) -> Result<()> {
-        let thread_count = global_size.map(|[tc, _, _]| tc).filter(|&tc| tc > 1);
-
-        if let Some(count) = thread_count {
-            unsafe { execute_parallel(self.kernel.fn_ptr() as usize, buffers, vals, self.kernel.var_names(), count) }
-        } else {
-            unsafe { self.kernel.execute_with_vals(buffers, vals) }
-                .map_err(|e| morok_device::Error::Runtime { message: format!("LLVM kernel execution failed: {}", e) })
+        unsafe {
+            execute_kernel(self.kernel.cif(), self.kernel.fn_ptr(), buffers, vals, self.kernel.var_names(), global_size)
         }
     }
 
@@ -221,8 +238,12 @@ struct LlvmCompiler;
 
 impl Compiler for LlvmCompiler {
     fn compile(&self, spec: &morok_device::device::ProgramSpec) -> Result<morok_device::device::CompiledSpec> {
-        let mut compiled =
-            morok_device::device::CompiledSpec::from_source(spec.name.clone(), spec.src.clone(), spec.ast.clone());
+        let mut compiled = morok_device::device::CompiledSpec::from_source(
+            spec.name.clone(),
+            spec.src.clone(),
+            spec.ast.clone(),
+            spec.buf_count,
+        );
         compiled.var_names = spec.var_names.clone();
         compiled.global_size = spec.global_size;
         compiled.local_size = spec.local_size;
@@ -240,8 +261,8 @@ struct LlvmRendererWrapper {
 }
 
 impl Renderer for LlvmRendererWrapper {
-    fn render(&self, ast: &Arc<UOp>) -> Result<ProgramSpec> {
-        let rendered = morok_codegen::llvm::text::render(ast, Some("kernel"))
+    fn render(&self, ast: &Arc<UOp>, name: Option<&str>) -> Result<ProgramSpec> {
+        let rendered = morok_codegen::llvm::text::render(ast, name.or(Some("kernel")))
             .map_err(|e| morok_device::Error::Runtime { message: format!("LLVM rendering failed: {}", e) })?;
 
         let mut spec = ProgramSpec::new(rendered.name.clone(), rendered.code.clone(), self.device.clone(), ast.clone());
@@ -253,6 +274,7 @@ impl Renderer for LlvmRendererWrapper {
         }
 
         spec.set_var_names(rendered.var_names.clone());
+        spec.buf_count = rendered.buffer_args.len();
 
         Ok(spec)
     }
@@ -268,7 +290,7 @@ fn create_llvm_program(spec: &morok_device::device::CompiledSpec) -> Result<Box<
         message: "LLVM JIT requires source code in CompiledSpec".to_string(),
     })?;
 
-    let kernel = crate::LlvmKernel::compile_ir(src, &spec.name, &spec.name, spec.var_names.clone())
+    let kernel = crate::LlvmKernel::compile_ir(src, &spec.name, &spec.name, spec.var_names.clone(), spec.buf_count)
         .map_err(|e| morok_device::Error::Runtime { message: format!("LLVM JIT compilation failed: {}", e) })?;
 
     Ok(Box::new(LlvmProgram { kernel }))
@@ -298,9 +320,23 @@ mod mlir_backend {
             let thread_count = global_size.map(|[tc, _, _]| tc).filter(|&tc| tc > 1);
 
             if let Some(count) = thread_count {
-                unsafe {
-                    execute_parallel(self.kernel.fn_ptr() as usize, buffers, vals, self.kernel.var_names(), count)
-                }
+                // MLIR uses wrapper fn(ptr, ptr) ABI — parallel execution
+                // calls execute_with_vals per thread with patched thread_id.
+                use rayon::prelude::*;
+                let thread_id_idx = self.kernel.var_names().iter().position(|n| n == "thread_id");
+                let buf_ptr = buffers.as_ptr() as usize;
+                let buf_len = buffers.len();
+                let vals = vals.to_vec();
+                (0..count).into_par_iter().try_for_each(|tid| {
+                    let bufs = unsafe { std::slice::from_raw_parts(buf_ptr as *const *mut u8, buf_len) };
+                    let mut thread_vals = vals.clone();
+                    if let Some(idx) = thread_id_idx {
+                        thread_vals[idx] = tid as i64;
+                    }
+                    unsafe { self.kernel.execute_with_vals(bufs, &thread_vals) }.map_err(|e| {
+                        morok_device::Error::Runtime { message: format!("MLIR kernel execution failed: {}", e) }
+                    })
+                })
             } else {
                 unsafe { self.kernel.execute_with_vals(buffers, vals) }.map_err(|e| morok_device::Error::Runtime {
                     message: format!("MLIR kernel execution failed: {}", e),
@@ -319,8 +355,8 @@ mod mlir_backend {
     }
 
     impl Renderer for MlirRendererWrapper {
-        fn render(&self, ast: &Arc<UOp>) -> Result<ProgramSpec> {
-            let rendered = morok_codegen::mlir::render(ast, Some("kernel"))
+        fn render(&self, ast: &Arc<UOp>, name: Option<&str>) -> Result<ProgramSpec> {
+            let rendered = morok_codegen::mlir::render(ast, name.or(Some("kernel")))
                 .map_err(|e| morok_device::Error::Runtime { message: format!("MLIR rendering failed: {}", e) })?;
 
             let mut spec =
@@ -352,8 +388,12 @@ mod mlir_backend {
 
     impl Compiler for MlirCompiler {
         fn compile(&self, spec: &morok_device::device::ProgramSpec) -> Result<morok_device::device::CompiledSpec> {
-            let mut compiled =
-                morok_device::device::CompiledSpec::from_source(spec.name.clone(), spec.src.clone(), spec.ast.clone());
+            let mut compiled = morok_device::device::CompiledSpec::from_source(
+                spec.name.clone(),
+                spec.src.clone(),
+                spec.ast.clone(),
+                spec.buf_count,
+            );
             compiled.var_names = spec.var_names.clone();
             compiled.global_size = spec.global_size;
             compiled.local_size = spec.local_size;
