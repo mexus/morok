@@ -5,12 +5,11 @@
 //!
 //! # Kernel Signature
 //!
+//! Emits a single function with typed `restrict` pointer params and const variable params:
+//!
 //! ```c
-//! void kernel(void** args, long long* vars);
+//! void kernel(float* restrict data0, const int N) { /* body */ }
 //! ```
-//! - `args[i]` = buffer pointer (order from `DefineGlobal` index)
-//! - `vars[i]` = i64 variable value (order from `var_names`)
-//! - Thread ID as last var when `global_size[0] > 1`
 
 mod amx;
 pub mod ops;
@@ -120,7 +119,6 @@ impl crate::Renderer for CRenderer {
         let mut code_lines: Vec<String> = Vec::new();
 
         // Includes
-        code_lines.push("#include <math.h>".to_string());
         code_lines.push("#include <stdbool.h>".to_string());
         code_lines.push("".to_string());
 
@@ -142,10 +140,10 @@ impl crate::Renderer for CRenderer {
             code_lines.push("".to_string());
         }
 
-        // Function signature
-        code_lines.push(format!("void {kernel_name}(void** args, long long* vars) {{"));
+        // Build typed function params
+        let mut params: Vec<String> = Vec::new();
 
-        // Buffer pointer casts
+        // Buffer parameters
         for (i, buf) in buffers.iter().enumerate() {
             let buf_dtype = buf.dtype();
             let elem_type = match &buf_dtype {
@@ -153,9 +151,30 @@ impl crate::Renderer for CRenderer {
                 _ => c_dtype(&buf_dtype),
             };
             let name = format!("data{i}");
-            code_lines.push(format!("  {elem_type}* {name} = ({elem_type}*)args[{i}];"));
+            params.push(format!("{elem_type}* restrict {name}"));
             ctx.register(buf.id, name);
         }
+
+        // Variable parameters
+        for var in &variables {
+            if let Op::DefineVar { name, .. } = var.op() {
+                let var_dtype = &var.dtype();
+                let c_type = c_dtype(var_dtype);
+                params.push(format!("const {c_type} {name}"));
+                ctx.register(var.id, name.clone());
+            }
+        }
+
+        // Thread ID parameter
+        if let Some((thread_range, _)) = &thread_info {
+            let range_dtype = &thread_range.dtype();
+            let c_type = c_dtype(range_dtype);
+            params.push(format!("const {c_type} thread_id"));
+            ctx.register(thread_range.id, "thread_id".to_string());
+        }
+
+        // Function signature
+        code_lines.push(format!("void {kernel_name}({}) {{", params.join(", ")));
 
         // Local memory allocations (stack arrays on CPU)
         for node in &nodes {
@@ -167,37 +186,6 @@ impl crate::Renderer for CRenderer {
                 let name = format!("local{id}");
                 code_lines.push(format!("  {base} {name}[{size}];"));
                 ctx.register(node.id, name);
-            }
-        }
-
-        // Variable loads
-        for (i, var) in variables.iter().enumerate() {
-            if let Op::DefineVar { name, .. } = var.op() {
-                let var_dtype = &var.dtype();
-                let c_type = c_dtype(var_dtype);
-                if c_type == "long long" {
-                    code_lines.push(format!("  long long {name} = vars[{i}];"));
-                } else {
-                    code_lines.push(format!("  {c_type} {name} = ({c_type})vars[{i}];"));
-                }
-                ctx.register(var.id, name.clone());
-            }
-        }
-
-        // Thread ID
-        if let Some((thread_range, _)) = &thread_info {
-            let thread_idx = variables.len();
-            let range_dtype = &thread_range.dtype();
-            let c_type = c_dtype(range_dtype);
-            if c_type == "long long" {
-                code_lines.push(format!("  long long thread_id = vars[{thread_idx}];"));
-            } else {
-                code_lines.push(format!("  {c_type} thread_id = ({c_type})vars[{thread_idx}];"));
-            }
-
-            if let Op::Range { axis_id, .. } = thread_range.op() {
-                ctx.register(thread_range.id, "thread_id".to_string());
-                let _ = axis_id; // Thread range is registered above
             }
         }
 
@@ -280,8 +268,8 @@ impl crate::Renderer for CRenderer {
     }
 
     fn decompositor(&self) -> Option<TypedPatternMatcher<()>> {
-        // C has math.h with sqrt, exp, sin, etc. — no decomposition needed
-        // for standard transcendentals. Threefry is handled by XOR in render.
+        // C uses __builtin_ math functions (sqrt, exp, sin, etc.) — no decomposition needed.
+        // Threefry is handled by XOR in render.
         None
     }
 }
