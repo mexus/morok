@@ -23,66 +23,6 @@ use crate::llvm::common::{RenderContext, ldt};
 use crate::llvm::cpu::{reduce_identity, render_uop};
 use crate::{BufferArg, RenderedKernel, Renderer, Result};
 
-/// Returns the LLVM target triple for the current platform.
-fn native_target_triple() -> &'static str {
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    {
-        "arm64-apple-macosx"
-    }
-    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
-    {
-        "x86_64-apple-macosx"
-    }
-    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-    {
-        "x86_64-unknown-linux-gnu"
-    }
-    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
-    {
-        "aarch64-unknown-linux-gnu"
-    }
-    #[cfg(not(any(
-        all(target_os = "macos", target_arch = "aarch64"),
-        all(target_os = "macos", target_arch = "x86_64"),
-        all(target_os = "linux", target_arch = "x86_64"),
-        all(target_os = "linux", target_arch = "aarch64"),
-    )))]
-    {
-        // Fallback: let LLVM use host default
-        ""
-    }
-}
-
-/// Returns the LLVM data layout for the current platform.
-fn native_data_layout() -> &'static str {
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    {
-        "e-m:o-i64:64-i128:128-n32:64-S128"
-    }
-    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
-    {
-        "e-m:o-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-n8:16:32:64-S128"
-    }
-    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-    {
-        "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-n8:16:32:64-S128"
-    }
-    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
-    {
-        "e-m:e-i8:8:32-i16:16:32-i64:64-i128:128-n32:64-S128"
-    }
-    #[cfg(not(any(
-        all(target_os = "macos", target_arch = "aarch64"),
-        all(target_os = "macos", target_arch = "x86_64"),
-        all(target_os = "linux", target_arch = "x86_64"),
-        all(target_os = "linux", target_arch = "aarch64"),
-    )))]
-    {
-        // Fallback: use a generic layout
-        "e-m:e-i64:64-n32:64-S128"
-    }
-}
-
 /// Text-based LLVM IR renderer.
 ///
 /// Generates LLVM IR as strings, suitable for compilation via external clang.
@@ -255,8 +195,6 @@ impl Renderer for LlvmTextRenderer {
         let ir = format!(
             r#"; ModuleID = '{kernel_name}'
 source_filename = "{kernel_name}"
-target datalayout = "{data_layout}"
-target triple = "{target_triple}"
 
 {intrinsics}
 
@@ -267,8 +205,6 @@ entry:
 
 attributes #0 = {{ nounwind "no-builtins" "no-trapping-math"="true" }}
 "#,
-            data_layout = native_data_layout(),
-            target_triple = native_target_triple(),
             intrinsics = generate_intrinsic_declarations(&kernel),
             inner_params = inner_params.join(", "),
             inner_body = kernel.join("\n"),

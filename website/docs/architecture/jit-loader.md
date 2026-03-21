@@ -64,7 +64,7 @@ The loader implements a minimal ELF relocator for each architecture. It handles 
 
 **x86_64** — PC-relative (`R_X86_64_PC32`, `PLT32`, `GOTPCRELX`, `REX_GOTPCRELX`), absolute 32/64-bit (`R_X86_64_32`, `32S`, `64`).
 
-**aarch64** — 26-bit branches (`CALL26`, `JUMP26`), page-relative ADRP (`ADR_PREL_PG_HI21`), 12-bit page offsets with access-size shifts (`ADD_ABS_LO12_NC`, `LDST8/16/32/64/128_ABS_LO12_NC`).
+**aarch64** — 26-bit branches (`CALL26`, `JUMP26`) with automatic veneer generation when the target exceeds ±128 MiB, page-relative ADRP (`ADR_PREL_PG_HI21`), 12-bit page offsets with access-size shifts (`ADD_ABS_LO12_NC`, `LDST8/16/32/64/128_ABS_LO12_NC`).
 
 **riscv64** — Call pairs (`CALL`, `CALL_PLT`), PC-relative split addressing with state tracking (`PCREL_HI20` + `PCREL_LO12_I/S`), absolute (`HI20`, `LO12_I/S`), branches (`BRANCH`, `JAL`), data (`32`, `64`). Linker relaxation hints (`RELAX`) are skipped.
 
@@ -87,7 +87,8 @@ The loader compiles with a bare-metal target to produce clean, self-contained EL
 | `-fno-stack-protector` | yes | yes | No stack canary overhead |
 | `-nostdlib` | yes | no | No standard library |
 | `-fno-ident` | yes | no | Suppress `.comment` section |
-| `--target=<arch>-none-unknown-elf` | yes | no | Bare-metal target |
+| `--target=<arch>-none-unknown-elf` | yes | yes | Bare-metal ELF target |
+| `-ffixed-x18` | aarch64 macOS/Win | aarch64 macOS/Win | Reserve platform register |
 | `-funroll-loops` | no | yes | Aggressive loop unrolling |
 | `-fvectorize` | no | yes | Loop vectorization |
 | `-fslp-vectorize` | no | yes | SLP (straight-line) vectorization |
@@ -97,6 +98,24 @@ The C backend uses `__builtin_*` functions (e.g. `__builtin_sqrtf`, `__builtin_f
 ## External Symbol Resolution
 
 If clang emits a call to an external function (rare — most math is handled by builtins), the loader resolves it via `dlsym(RTLD_DEFAULT, name)` at load time. This covers cases like `memcpy` or platform-specific libm symbols that clang might emit instead of inlining.
+
+### Branch Veneers (aarch64)
+
+On aarch64, `CALL26`/`JUMP26` relocations encode a PC-relative offset in 26 bits, giving a range of ±128 MiB. On macOS with ASLR, the anonymous mmap region is typically ~2 GB away from system libraries like libm — far beyond this range.
+
+When the loader detects an out-of-range `CALL26`/`JUMP26`, it emits a **veneer** (branch trampoline) in a reserved area at the end of the mmap:
+
+```text
+LDR X16, [PC, #8]   // load 64-bit target address
+BR  X16              // indirect branch
+.quad <address>      // full 64-bit address
+```
+
+Veneers are pre-scanned (counted before mmap allocation) and deduplicated — if multiple call sites reference the same external symbol, they share a single veneer.
+
+### Platform Register (aarch64)
+
+On macOS and Windows ARM, register `x18` is reserved as the platform register. Since we compile with `--target=aarch64-none-unknown-elf` (bare-metal), the compiler would normally treat `x18` as a free GPR. The `-ffixed-x18` flag prevents this, avoiding crashes when JIT code runs in a macOS/Windows process.
 
 ## Instruction Cache Coherence
 
