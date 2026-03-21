@@ -1,6 +1,6 @@
 use crate::*;
 use morok_dtype::DType;
-use morok_schedule::{BeamConfig, OptStrategy, OptimizerConfig};
+use morok_schedule::{BeamConfig, OptStrategy, OptimizerConfig, testing::setup_test_tracing};
 use ndarray::{Array2, array};
 
 fn prep_config(optimizer: OptimizerConfig) -> PrepareConfig {
@@ -658,6 +658,7 @@ use test_case::test_case;
 #[test_case(512, 2.0; "512x512")]
 #[test_case(1024, 3.0; "1024x1024")]
 fn test_matmul_validated_square(size: usize, tol: f32) {
+    setup_test_tracing();
     run_validated_square_matmul(size, tol);
 }
 

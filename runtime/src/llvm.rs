@@ -87,27 +87,35 @@ impl LlvmKernel {
 }
 
 /// Compile LLVM IR text to a relocatable object via `clang -x ir`.
+///
+/// Uses `--target=<arch>-none-unknown-elf` to produce a relocatable ELF object
+/// (same as the C path in jit_loader), so the JIT ELF loader can handle
+/// relocations consistently.
 fn compile_ir_to_object(ir: &str) -> Result<Vec<u8>> {
     use std::io::Write;
     use std::process::{Command, Stdio};
 
+    let target = crate::jit_loader::elf_target_triple();
+
+    let mut args = vec![
+        "-x",
+        "ir",
+        "-c",
+        "-O2",
+        "-march=native",
+        "-fPIC",
+        "-fno-math-errno",
+        "-fno-stack-protector",
+        "-funroll-loops",
+        "-fvectorize",
+        "-fslp-vectorize",
+    ];
+    args.push(&target);
+    args.extend_from_slice(crate::jit_loader::platform_clang_flags());
+    args.extend_from_slice(&["-", "-o", "-"]);
+
     let mut child = Command::new("clang")
-        .args([
-            "-x",
-            "ir",
-            "-c",
-            "-O2",
-            "-march=native",
-            "-fPIC",
-            "-fno-math-errno",
-            "-fno-stack-protector",
-            "-funroll-loops",
-            "-fvectorize",
-            "-fslp-vectorize",
-            "-",
-            "-o",
-            "-",
-        ])
+        .args(&args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

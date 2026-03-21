@@ -10,7 +10,7 @@ use morok_ir::{ConstValue, UOp};
 pub fn c_scalar(s: ScalarDType) -> &'static str {
     match s {
         ScalarDType::Bool => "_Bool",
-        ScalarDType::Int8 => "char",
+        ScalarDType::Int8 => "signed char",
         ScalarDType::UInt8 => "unsigned char",
         ScalarDType::Int16 => "short",
         ScalarDType::UInt16 => "unsigned short",
@@ -31,7 +31,7 @@ pub fn c_scalar(s: ScalarDType) -> &'static str {
 fn c_vector_base(s: ScalarDType) -> &'static str {
     match s {
         ScalarDType::Bool => "bool",
-        ScalarDType::Int8 => "char",
+        ScalarDType::Int8 => "schar",
         ScalarDType::UInt8 | ScalarDType::FP8E4M3 | ScalarDType::FP8E5M2 => "uchar",
         ScalarDType::Int16 => "short",
         ScalarDType::UInt16 => "ushort",

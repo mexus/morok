@@ -66,6 +66,32 @@ impl JitKernel {
 
 // ── Compilation ─────────────────────────────────────────────────────────────
 
+/// Returns the `--target=<arch>-none-unknown-elf` flag for the host architecture.
+/// Shared between the C and LLVM IR compilation paths.
+pub(crate) fn elf_target_triple() -> String {
+    let arch = std::env::consts::ARCH;
+    if arch == "powerpc64" && cfg!(target_endian = "little") {
+        "--target=powerpc64le-none-unknown-elf".to_string()
+    } else {
+        format!("--target={arch}-none-unknown-elf")
+    }
+}
+
+/// Extra clang flags required for correct JIT code on the host platform.
+/// Shared between the C and LLVM IR compilation paths.
+pub(crate) fn platform_clang_flags() -> &'static [&'static str] {
+    // macOS/Windows reserve x18 as the platform register. Bare-metal ELF
+    // targets treat it as a free GPR, so we must tell clang to avoid it.
+    #[cfg(all(target_arch = "aarch64", any(target_os = "macos", target_os = "windows")))]
+    {
+        &["-ffixed-x18"]
+    }
+    #[cfg(not(all(target_arch = "aarch64", any(target_os = "macos", target_os = "windows"))))]
+    {
+        &[]
+    }
+}
+
 /// Pipe C source to clang via stdin, receive relocatable object from stdout.
 fn compile_to_object(src: &str) -> crate::Result<Vec<u8>> {
     use std::io::Write;
@@ -83,31 +109,27 @@ fn compile_to_object(src: &str) -> crate::Result<Vec<u8>> {
         }
     };
 
-    // PPC64LE needs explicit "powerpc64le" in the target triple.
-    let target = if arch == "powerpc64" && cfg!(target_endian = "little") {
-        "--target=powerpc64le-none-unknown-elf".to_string()
-    } else {
-        format!("--target={arch}-none-unknown-elf")
-    };
+    let target = elf_target_triple();
+
+    let mut args = vec![
+        "-c",
+        "-x",
+        "c",
+        "-O2",
+        march,
+        "-fPIC",
+        "-ffreestanding",
+        "-fno-math-errno",
+        "-fno-stack-protector",
+        "-nostdlib",
+        "-fno-ident",
+    ];
+    args.push(&target);
+    args.extend_from_slice(platform_clang_flags());
+    args.extend_from_slice(&["-", "-o", "-"]);
 
     let mut child = Command::new("clang")
-        .args([
-            "-c",
-            "-x",
-            "c",
-            "-O2",
-            march,
-            "-fPIC",
-            "-ffreestanding",
-            "-fno-math-errno",
-            "-fno-stack-protector",
-            "-nostdlib",
-            "-fno-ident",
-            &target,
-            "-",
-            "-o",
-            "-",
-        ])
+        .args(&args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -169,6 +191,18 @@ pub(crate) fn jit_load(obj: &[u8], name: &str) -> crate::Result<(*const (), memm
         return Err(crate::Error::JitCompilation { reason: "No loadable sections in ELF".to_string() });
     }
 
+    // Aarch64: reserve space for branch veneers (trampolines) after loadable
+    // sections. CALL26/JUMP26 only reach ±128 MiB; external symbols (libm etc.)
+    // are typically much farther on macOS/ARM.
+    let veneer_base = if arch == Architecture::Aarch64 {
+        let n = count_aarch64_external_calls(&elf, &section_offsets);
+        let base = (total_size + 3) & !3; // align to 4 bytes (instruction size)
+        total_size = base + n * VENEER_SIZE;
+        base
+    } else {
+        total_size
+    };
+
     // Allocate and populate mmap.
     let mut mmap = memmap2::MmapMut::map_anon(total_size)
         .map_err(|e| crate::Error::JitCompilation { reason: format!("mmap failed: {e}") })?;
@@ -193,7 +227,7 @@ pub(crate) fn jit_load(obj: &[u8], name: &str) -> crate::Result<(*const (), memm
     }
 
     // Apply relocations.
-    let mut state = RelocState::default();
+    let mut state = RelocState { veneers: VeneerPool::new(veneer_base), ..Default::default() };
 
     // PPC64 ELFv2: find TOC base for TOC-relative relocations.
     if arch == Architecture::PowerPc64 {
@@ -279,7 +313,7 @@ pub(crate) fn jit_load(obj: &[u8], name: &str) -> crate::Result<(*const (), memm
     // Flush instruction cache on architectures with non-coherent I/D caches.
     #[cfg(not(target_arch = "x86_64"))]
     unsafe {
-        extern "C" {
+        unsafe extern "C" {
             fn __clear_cache(start: *mut libc::c_void, end: *mut libc::c_void);
         }
         __clear_cache(mmap.as_ptr() as *mut _, mmap.as_ptr().add(mmap.len()) as *mut _);
@@ -298,6 +332,56 @@ struct RelocState {
     pcrel_hi: HashMap<u64, i64>,
     /// PPC64 ELFv2: TOC base address (.TOC. symbol), needed for TOC16 relocations.
     toc_base: Option<u64>,
+    /// Aarch64: veneer (branch trampoline) pool for CALL26/JUMP26 that exceed ±128 MiB.
+    veneers: VeneerPool,
+}
+
+/// Pool of branch veneers (trampolines) for aarch64 CALL26/JUMP26 range overflow.
+///
+/// When the target of a direct branch is more than ±128 MiB away, we emit a
+/// small trampoline that loads the full 64-bit address and does an indirect
+/// branch:
+///
+/// ```text
+///   LDR X16, [PC, #8]   // load 64-bit address from next 8 bytes
+///   BR  X16              // indirect branch
+///   .quad <target>       // 64-bit absolute address
+/// ```
+#[derive(Default)]
+struct VeneerPool {
+    /// Next available offset for a new veneer.
+    next: usize,
+    /// Reuse map: target address → veneer mmap offset (avoid duplicate veneers).
+    map: HashMap<u64, usize>,
+}
+
+const VENEER_SIZE: usize = 16; // LDR X16 + BR X16 + .quad addr
+const CALL26_MAX: i64 = (1 << 27) - 4; // ±128 MiB (signed 28-bit range, 4-byte aligned)
+
+impl VeneerPool {
+    fn new(base: usize) -> Self {
+        Self { next: base, map: HashMap::new() }
+    }
+
+    /// Get or create a veneer for `target_addr`, returning its mmap offset.
+    fn get_or_create(&mut self, mmap: &mut [u8], target_addr: u64) -> usize {
+        if let Some(&off) = self.map.get(&target_addr) {
+            return off;
+        }
+        let off = self.next;
+        self.next += VENEER_SIZE;
+        debug_assert!(self.next <= mmap.len(), "veneer pool overflow");
+
+        // LDR X16, [PC, #8]  →  0x58000050
+        mmap[off..off + 4].copy_from_slice(&0x5800_0050u32.to_le_bytes());
+        // BR X16              →  0xD61F0200
+        mmap[off + 4..off + 8].copy_from_slice(&0xD61F_0200u32.to_le_bytes());
+        // .quad target_addr
+        mmap[off + 8..off + 16].copy_from_slice(&target_addr.to_le_bytes());
+
+        self.map.insert(target_addr, off);
+        off
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -313,7 +397,7 @@ fn apply_relocation(
 ) -> crate::Result<()> {
     match arch {
         Architecture::X86_64 => reloc_x86_64(mmap, off, patch, target, addend, r_type),
-        Architecture::Aarch64 => reloc_aarch64(mmap, off, patch, target, addend, r_type),
+        Architecture::Aarch64 => reloc_aarch64(mmap, off, patch, target, addend, r_type, state),
         Architecture::Riscv64 => reloc_riscv64(mmap, off, patch, target, addend, r_type, state),
         Architecture::LoongArch64 => reloc_loongarch64(mmap, off, patch, target, addend, r_type),
         Architecture::PowerPc64 => reloc_ppc64(mmap, off, patch, target, addend, r_type, state),
@@ -353,12 +437,30 @@ fn reloc_x86_64(mmap: &mut [u8], off: usize, patch: u64, target: u64, addend: i6
 
 // ── aarch64 relocations ────────────────────────────────────────────────────
 
-fn reloc_aarch64(mmap: &mut [u8], off: usize, patch: u64, target: u64, addend: i64, r_type: u32) -> crate::Result<()> {
+fn reloc_aarch64(
+    mmap: &mut [u8],
+    off: usize,
+    patch: u64,
+    target: u64,
+    addend: i64,
+    r_type: u32,
+    state: &mut RelocState,
+) -> crate::Result<()> {
     use object::elf::*;
     match r_type {
         // 26-bit PC-relative branch: (S+A-P)>>2, encoded in [25:0]
+        // Range: ±128 MiB. Use a veneer when the target is out of range.
         R_AARCH64_CALL26 | R_AARCH64_JUMP26 => {
-            let imm26 = ((target as i64 + addend - patch as i64) >> 2) as u32 & 0x03FF_FFFF;
+            let dest = (target as i64).wrapping_add(addend);
+            let offset = dest.wrapping_sub(patch as i64);
+            let final_offset = if !(-CALL26_MAX..=CALL26_MAX).contains(&offset) {
+                let mmap_base = patch - off as u64;
+                let veneer_off = state.veneers.get_or_create(mmap, dest as u64);
+                mmap_base as i64 + veneer_off as i64 - patch as i64
+            } else {
+                offset
+            };
+            let imm26 = (final_offset >> 2) as u32 & 0x03FF_FFFF;
             patch_insn(mmap, off, 0xFC00_0000, imm26);
         }
         // ADRP page-relative: ((S+A) & ~0xFFF) - (P & ~0xFFF), split into immlo[30:29] immhi[23:5]
@@ -645,6 +747,34 @@ fn find_symbol_offset(
         }
     }
     Err(crate::Error::FunctionNotFound { name: name.to_string() })
+}
+
+/// Count unique external symbols referenced by CALL26/JUMP26 in an aarch64 ELF.
+/// Used to pre-allocate veneer space before mmap.
+fn count_aarch64_external_calls(elf: &object::File, section_offsets: &HashMap<object::SectionIndex, usize>) -> usize {
+    use std::collections::HashSet;
+    let mut external = HashSet::new();
+    for section in elf.sections() {
+        if !matches!(section.kind(), SectionKind::Text | SectionKind::Data | SectionKind::ReadOnlyData) {
+            continue;
+        }
+        for (_, reloc) in section.relocations() {
+            let r_type = match reloc.flags() {
+                RelocationFlags::Elf { r_type } => r_type,
+                _ => continue,
+            };
+            if r_type != object::elf::R_AARCH64_CALL26 && r_type != object::elf::R_AARCH64_JUMP26 {
+                continue;
+            }
+            if let object::RelocationTarget::Symbol(sym_idx) = reloc.target()
+                && let Ok(sym) = elf.symbol_by_index(sym_idx)
+                && sym.section_index().and_then(|si| section_offsets.get(&si)).is_none()
+            {
+                external.insert(sym_idx);
+            }
+        }
+    }
+    external.len()
 }
 
 /// Resolve an external symbol (e.g. `sqrtf`, `expf`) via dlsym at runtime.
