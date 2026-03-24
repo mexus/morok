@@ -41,6 +41,10 @@ const config: Config = {
     },
   },
 
+  plugins: [
+    './plugins/readme-intro.mjs',
+  ],
+
   presets: [
     [
       "classic",

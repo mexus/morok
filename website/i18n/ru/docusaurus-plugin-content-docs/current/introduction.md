@@ -4,9 +4,9 @@ sidebar_label: Введение
 
 # Morok
 
-> **Пре-альфа.** API нестабильный и может измениться без предупреждения. Не рекомендуется для продакшна.
+> **Альфа-версия.** Основная функциональность протестирована, но API нестабильны и могут измениться без предупреждения.
 
-Morok — ML-компилятор на Rust, вдохновлённый [Tinygrad](https://github.com/tinygrad/tinygrad). Ленивые тензорные вычисления на основе UOp IR, паттерн-ориентированные оптимизации и кодогенерация под несколько бэкендов.
+ML-компилятор на Rust, вдохновлённый [Tinygrad](https://github.com/tinygrad/tinygrad). Ленивые тензорные вычисления на основе UOp IR, паттерн-ориентированные оптимизации и кодогенерация под несколько бэкендов.
 
 ## Основные возможности
 
@@ -14,25 +14,100 @@ Morok — ML-компилятор на Rust, вдохновлённый [Tinygra
 |-------------|----------|
 | **Декларативные оптимизации** | DSL `patterns!` для перезаписи графов с Z3-верифицированной корректностью |
 | **Ленивые вычисления** | Тензоры строят граф вычислений, компиляция происходит только при `realize()` |
-| **Поддержка CUDA** | Unified memory, D2D copy, LRU-кэширование буферов |
 | **Трассировка происхождения** | `#[track_caller]` привязывает каждый UOp к месту в исходном коде |
 | **80+ IR-операций** | Арифметика, память, control flow, WMMA tensor cores |
 | **20+ оптимизаций** | Свёртка констант, tensor cores, векторизация, развёртка циклов |
+
+Подробнее об архитектуре — на [сайте документации](https://npatsakula.github.io/morok/).
+
+## Структура проекта
+
+| Крейт | Описание |
+|-------|----------|
+| [dtype](https://github.com/npatsakula/morok/tree/main/dtype/) | Система типов: скаляры, векторы, указатели, изображения |
+| [macros](https://github.com/npatsakula/morok/tree/main/macros/) | Процедурные макросы (DSL `patterns!`) |
+| [ir](https://github.com/npatsakula/morok/tree/main/ir/) | UOp-граф IR: 80+ операций, символьные целые, трассировка происхождения |
+| [device](https://github.com/npatsakula/morok/tree/main/device/) | Управление буферами: ленивое выделение, zero-copy view, LRU-кэширование |
+| [schedule](https://github.com/npatsakula/morok/tree/main/schedule/) | Движок оптимизаций: 20+ проходов, RANGEIFY, Z3-верификация |
+| [codegen](https://github.com/npatsakula/morok/tree/main/codegen/) | Кодогенерация: Clang (по умолчанию), LLVM JIT, MLIR |
+| [runtime](https://github.com/npatsakula/morok/tree/main/runtime/) | JIT-компиляция и выполнение ядер |
+| [tensor](https://github.com/npatsakula/morok/tree/main/tensor/) | Высокоуровневый API ленивых тензоров |
+| [onnx](https://github.com/npatsakula/morok/tree/main/onnx/) | Импортер ONNX-моделей |
 
 ## Быстрый пример
 
 ```rust
 use morok_tensor::Tensor;
+use ndarray::array;
 
-// Build lazy computation graph
-let a = Tensor::from_slice([1.0f32, 2.0, 3.0]);
-let b = Tensor::from_slice([4.0f32, 5.0, 6.0]);
-let c = (&a + &b).sum();
+// Zero-copy from ndarray (C-contiguous fast path)
+let a = Tensor::from_ndarray(&array![[1.0f32, 2.0], [3.0, 4.0]]);
+let b = Tensor::from_ndarray(&array![[5.0f32, 6.0], [7.0, 8.0]]);
 
-// Compile and execute
-let result = c.realize()?;
+// Lazy — nothing executes yet
+let c = &a + &b;
+
+// Compile, execute, extract as ndarray
+let result = c.to_ndarray::<f32>()?;
+assert_eq!(result, array![[6.0, 8.0], [10.0, 12.0]].into_dyn());
+
+// Or extract as flat Vec
+let flat = c.to_vec::<f32>()?;
+assert_eq!(flat, vec![6.0, 8.0, 10.0, 12.0]);
 ```
 
-## Лицензия
+## Пример DSL паттернов
 
-MIT
+```rust
+use morok_schedule::patterns;
+
+let optimizer = patterns! {
+    // Identity folding (commutative)
+    Add[x, @zero] ~> x,
+    Mul[x, @one] ~> x,
+
+    // Constant folding
+    for op in binary [Add, Mul, Sub] {
+        op(a @const(av), _b @const(bv))
+          => |a, av, bv| eval_binary_op(op, av, bv).map(|r| UOp::const_(a.dtype(), r)),
+    },
+};
+```
+
+## Разработка
+
+### Настройка окружения
+
+#### Nix
+
+Проект содержит предварительно настроенное Nix-окружение для разработки
+со всеми зависимостями и компиляторами. Та же инфраструктура
+используется для CI/CD, поэтому это предпочтительный способ разработки и тестирования.
+
+```bash
+nix develop # Open development shell
+nix flake check # Run CI tests
+nix fmt # Format source files
+```
+
+#### Установка вручную
+
+| Зависимость | Версия | Обязательна | Описание |
+|-------------|--------|-------------|----------|
+| Rust | 1.85+ | да | Edition 2024 |
+| LLVM | 21.x | да | Backend кодогенерации для CPU |
+| Clang | - | да | C-компилятор для сборки LLVM |
+| pkgconf | - | да | Инструмент конфигурации сборки |
+| protobuf | - | да | Компиляция ONNX proto |
+| zlib | >=1.3 | да | Библиотека сжатия |
+| libffi | >=3.4 | да | Foreign function interface |
+| libxml2 | >=2.13 | да | Парсинг XML |
+| Z3 | >=4.15 | нет | SMT-решатель для верификации оптимизаций |
+
+## Тестирование
+
+```bash
+cargo test
+cargo test --features z3,proptest  # With Z3 verification and PB generated tests
+cargo test --features cuda   # With CUDA tests
+```

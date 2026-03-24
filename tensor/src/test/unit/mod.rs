@@ -12,6 +12,7 @@ pub mod indexing;
 pub mod math;
 pub mod matmul;
 pub mod nn;
+pub mod readme_examples;
 pub mod realize_binary;
 pub mod reduce;
 pub mod shape_ops;

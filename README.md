@@ -41,7 +41,7 @@ let a = Tensor::from_ndarray(&array![[1.0f32, 2.0], [3.0, 4.0]]);
 let b = Tensor::from_ndarray(&array![[5.0f32, 6.0], [7.0, 8.0]]);
 
 // Lazy — nothing executes yet
-let c = (&a + &b)?;
+let c = &a + &b;
 
 // Compile, execute, extract as ndarray
 let result = c.to_ndarray::<f32>()?;
@@ -64,8 +64,8 @@ let optimizer = patterns! {
 
     // Constant folding
     for op in binary [Add, Mul, Sub] {
-        op(a @const(av), b @const(bv))
-          => eval_binary_op(op, av, bv).map(|r| UOp::const_(a.dtype(), r)),
+        op(a @const(av), _b @const(bv))
+          => |a, av, bv| eval_binary_op(op, av, bv).map(|r| UOp::const_(a.dtype(), r)),
     },
 };
 ```
