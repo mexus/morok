@@ -136,7 +136,7 @@ Rangeify 不是单一变换——而是八个协调的 pass：
 | **7. 基于代价的 Buffer 移除** | 在有利时内联 buffer（PContig 优化） |
 | **8. Reduce 简化** | 将与范围无关的代码提升到 reduce 外部 |
 
-每个 pass 都使用基于模式的重写（参见[基于模式的优化](./optimizations)章节）。模式持续触发直到没有更多匹配，然后开始下一个 pass。
+每个 pass 都使用基于模式的重写（参见[模式引擎](./optimizations/pattern-system)章节）。模式持续触发直到没有更多匹配，然后开始下一个 pass。
 
 ### 变换前后对比
 
