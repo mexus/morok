@@ -332,4 +332,4 @@ fn inspect_compilation() -> Result<(), Box<dyn std::error::Error>> {
 
 - [Op Bestiary](./architecture/op-bestiary) — справочник по IR-операциям
 - [Пайплайн выполнения](./architecture/pipeline) — как устроена компиляция
-- [Система оптимизаций](./architecture/optimizations) — перезапись на основе паттернов
+- [Движок паттернов](./architecture/optimizations/pattern-system) — перезапись на основе паттернов

@@ -29,6 +29,33 @@ impl Matcher<()> for SubstituteMatcher<'_> {
     }
 }
 
+/// Matcher for `UOp::substitute_gated` — substitution with range-scope gating.
+///
+/// Equivalent to Tinygrad's `_substitute` + `pm_gate_substitute`:
+/// - If a node is in the substitution map, replace it.
+/// - If a node's ranges don't overlap with substitution keys, gate (skip subtree).
+struct SubstituteGatedMatcher<'a> {
+    map: &'a HashMap<UOpKey, Arc<UOp>>,
+    range_keys: &'a HashSet<UOpKey>,
+}
+
+impl Matcher<()> for SubstituteGatedMatcher<'_> {
+    fn rewrite(&self, uop: &Arc<UOp>, _ctx: &mut ()) -> RewriteResult {
+        // Direct substitution lookup
+        if let Some(replacement) = self.map.get(&UOpKey(uop.clone()))
+            && !Arc::ptr_eq(uop, replacement)
+        {
+            return RewriteResult::Rewritten(replacement.clone());
+        }
+        // Gate: skip subtrees whose ranges don't overlap with substitution keys
+        // Tinygrad (rangeify.py:187): `if not any(r in b.ranges for r in ctx.keys()): raise BottomUpGate()`
+        if !uop.in_scope_ranges().iter().any(|r| self.range_keys.contains(r)) {
+            return RewriteResult::Gate(uop.clone());
+        }
+        RewriteResult::NoMatch
+    }
+}
+
 /// Wrapper for Arc<UOp> that implements Hash and Eq based on stable ID.
 ///
 /// This allows using Arc<UOp> as HashMap keys without implementing
@@ -95,6 +122,18 @@ pub struct UOp {
     /// Computed lazily via range propagation through the computation graph.
     /// Returns (vmin, vmax) as ConstValue types.
     pub(crate) vmin_vmax_cache: std::sync::OnceLock<(ConstValue, ConstValue)>,
+    /// Sound vmin/vmax: `None` for ops where range analysis is unsound (LOAD, Pow, etc.).
+    /// Used by patterns that must not act on unsound bounds (e.g., vmin_vmax_collapse).
+    #[debug(skip)]
+    pub(crate) sound_vmin_vmax_cache: std::sync::OnceLock<Option<(ConstValue, ConstValue)>>,
+    /// Whether this node or any of its sources is an INDEX op.
+    /// Cached O(1) lookup used by `simplify_valid` to skip And chains inside INDEX trees.
+    #[debug(skip)]
+    pub(crate) has_index_in_sources_cache: std::sync::OnceLock<bool>,
+    /// Cached backward slice: IDs of all nodes reachable from this UOp (including self).
+    /// O(1) membership test via `backward_slice_ids().contains(&target.id)`.
+    #[debug(skip)]
+    pub(crate) backward_slice_cache: std::sync::OnceLock<HashSet<u64>>,
     /// Optional metadata attached to this UOp.
     ///
     /// Metadata is NOT part of hash consing - attaching metadata creates a new UOp
@@ -629,6 +668,25 @@ impl UOp {
         visited.len()
     }
 
+    /// O(1) cached check: does this node or any of its sources contain an INDEX op?
+    ///
+    /// Computed lazily and cached. Each node checks itself and its direct sources'
+    /// cached values, so the total cost across the graph is O(N).
+    pub fn has_index_in_sources(self: &Arc<Self>) -> bool {
+        *self.has_index_in_sources_cache.get_or_init(|| {
+            if matches!(self.op, Op::Index { .. }) {
+                return true;
+            }
+            let mut result = false;
+            self.op.map_child(|child| {
+                if child.has_index_in_sources() {
+                    result = true;
+                }
+            });
+            result
+        })
+    }
+
     /// Render this UOp and its sources as a compact ASCII tree.
     ///
     /// Shared nodes (appearing multiple times due to hash-consing) are shown
@@ -704,58 +762,6 @@ impl UOp {
         use crate::uop::cached_property::CachedProperty;
         use crate::uop::properties::InScopeRangesProperty;
         InScopeRangesProperty::get(self)
-    }
-
-    /// Internal helper to compute in-scope ranges via toposort.
-    ///
-    /// Uses toposort to ensure we process nodes in dependency order,
-    /// computing each node's scope from its sources' scopes.
-    #[allow(clippy::mutable_key_type)]
-    pub(crate) fn compute_in_scope_ranges(self: &Arc<Self>) -> HashSet<UOpKey> {
-        use crate::Op;
-
-        // Map from UOp ID to its computed in-scope ranges
-        let mut scope_map: HashMap<u64, HashSet<UOpKey>> = HashMap::new();
-
-        // Process in topological order (sources before consumers)
-        for node in self.toposort() {
-            let mut in_scope: HashSet<UOpKey> = HashSet::new();
-
-            // Step 1: Merge ranges from all sources
-            node.op.map_child(|src| {
-                if let Some(src_ranges) = scope_map.get(&src.id) {
-                    in_scope.extend(src_ranges.iter().cloned());
-                }
-            });
-
-            // Step 2: Remove ended ranges
-            for ended in node.op.ended_ranges() {
-                match ended.op() {
-                    Op::Range { .. } => {
-                        // Remove the specific RANGE
-                        in_scope.remove(&UOpKey(ended.clone()));
-                    }
-                    _ => {
-                        // Remove all ranges that were in the ended op's scope
-                        if let Some(ended_scope) = scope_map.get(&ended.id) {
-                            for r in ended_scope.iter() {
-                                in_scope.remove(r);
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Step 3: If this is a RANGE, add it to scope
-            if matches!(node.op, Op::Range { .. }) {
-                in_scope.insert(UOpKey(node.clone()));
-            }
-
-            scope_map.insert(node.id, in_scope);
-        }
-
-        // Return the scope for this node
-        scope_map.remove(&self.id).unwrap_or_default()
     }
 
     /// Check if all in-scope ranges at this UOp have the given AxisType.
@@ -878,6 +884,21 @@ impl UOp {
             return self.clone();
         }
         let matcher = SubstituteMatcher(map);
+        crate::rewrite::graph_rewrite_bottom_up(&matcher, self.clone(), &mut ())
+    }
+
+    /// Replace UOps with range-gated substitution (Tinygrad: `extra_pm=pm_gate_substitute`).
+    ///
+    /// Like `substitute`, but skips subtrees whose `in_scope_ranges()` don't contain
+    /// any of the substitution keys. This prevents substituting ranges in subexpressions
+    /// that don't reference them, matching Tinygrad's `gate_substitute` behavior.
+    #[allow(clippy::mutable_key_type)]
+    pub fn substitute_gated(self: &Arc<Self>, map: &HashMap<UOpKey, Arc<Self>>) -> Arc<Self> {
+        if map.is_empty() {
+            return self.clone();
+        }
+        let range_keys: HashSet<UOpKey> = map.keys().cloned().collect();
+        let matcher = SubstituteGatedMatcher { map, range_keys: &range_keys };
         crate::rewrite::graph_rewrite_bottom_up(&matcher, self.clone(), &mut ())
     }
 
@@ -1219,6 +1240,9 @@ impl Clone for UOp {
             ranges_cache: std::sync::OnceLock::new(),
             in_scope_ranges_cache: std::sync::OnceLock::new(),
             vmin_vmax_cache: std::sync::OnceLock::new(),
+            sound_vmin_vmax_cache: std::sync::OnceLock::new(),
+            has_index_in_sources_cache: std::sync::OnceLock::new(),
+            backward_slice_cache: std::sync::OnceLock::new(),
             metadata: self.metadata.clone(),
         }
     }

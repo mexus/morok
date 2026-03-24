@@ -332,4 +332,4 @@ fn inspect_compilation() -> Result<(), Box<dyn std::error::Error>> {
 
 - [Op Bestiary](./architecture/op-bestiary) — IR ऑपरेशन रेफ़रेंस
 - [एक्ज़ीक्यूशन पाइपलाइन](./architecture/pipeline) — कम्पाइलेशन कैसे काम करता है
-- [ऑप्टिमाइज़ेशन सिस्टम](./architecture/optimizations) — पैटर्न-आधारित रीराइट्स
+- [पैटर्न इंजन](./architecture/optimizations/pattern-system) — पैटर्न-आधारित रीराइट्स

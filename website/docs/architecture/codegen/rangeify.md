@@ -203,7 +203,9 @@ The compiler only merges if it saves operations. Merging might require division/
 
 **Function**: `run_kernel_split_pipeline()` in `schedule/src/rangeify/kernel.rs`
 
-This stage also handles buffer numbering (via `LocalAddBufferContext.dg` counter) and dependency tracking (via `fix_assign()`).
+Before splitting, a `pm_flatten_range` pre-pass runs on the **full graph once** (bottom-up). This merges nested ranges across all kernels in a single traversal, avoiding redundant per-kernel work on overlapping subgraphs. The pre-pass is a key compilation speed optimization — without it, each kernel's `split_store` would re-traverse shared subgraphs independently.
+
+After the pre-pass, `split_all_stores` splits at STORE boundaries, then `fix_assign` handles buffer numbering (via `LocalAddBufferContext.dg` counter) and dependency tracking.
 
 ---
 

@@ -381,4 +381,4 @@ fn inspect_compilation() -> Result<(), Box<dyn std::error::Error>> {
 
 - [Op 手册](./architecture/op-bestiary) — IR 操作参考
 - [执行流水线](./architecture/pipeline) — 编译过程详解
-- [优化系统](./architecture/optimizations) — 基于模式的重写
+- [模式引擎](./architecture/optimizations/pattern-system) — 基于模式的重写

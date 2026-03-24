@@ -203,7 +203,9 @@ RANGE(0..32)
 
 **函数**：`schedule/src/rangeify/kernel.rs` 中的 `run_kernel_split_pipeline()`
 
-这个阶段还处理 buffer 编号（通过 `LocalAddBufferContext.dg` 计数器）和依赖跟踪（通过 `fix_assign()`）。
+在分割之前，先在**整个图上执行一次** `pm_flatten_range` 预处理（bottom-up）。这会在一次遍历中合并所有内核的嵌套 range，避免在重叠子图上的重复工作。这个预处理是编译速度的关键优化——没有它，每个内核的 `split_store` 都会独立重新遍历共享子图。
+
+预处理之后，`split_all_stores` 在 STORE 边界进行分割，`fix_assign` 处理 buffer 编号（通过 `LocalAddBufferContext.dg` 计数器）和依赖跟踪。
 
 ---
 
