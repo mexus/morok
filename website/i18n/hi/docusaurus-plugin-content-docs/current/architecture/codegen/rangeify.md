@@ -203,7 +203,9 @@ RANGE(0..32)
 
 **फ़ंक्शन**: `run_kernel_split_pipeline()` in `schedule/src/rangeify/kernel.rs`
 
-यह स्टेज बफ़र नंबरिंग (`LocalAddBufferContext.dg` काउंटर से) और डिपेंडेंसी ट्रैकिंग (`fix_assign()` से) भी हैंडल करता है।
+Splitting से पहले, `pm_flatten_range` pre-pass **पूरे ग्राफ़ पर एक बार** चलता है (bottom-up)। यह सभी kernels के nested ranges को एक ही traversal में merge करता है, overlapping subgraphs पर redundant काम से बचता है। यह pre-pass compilation speed की एक key optimization है — इसके बिना, हर kernel का `split_store` shared subgraphs को independently re-traverse करता।
+
+Pre-pass के बाद, `split_all_stores` STORE boundaries पर split करता है, और `fix_assign` buffer numbering (`LocalAddBufferContext.dg` counter से) और dependency tracking handle करता है।
 
 ---
 
