@@ -4,10 +4,13 @@ use std::sync::{Arc, OnceLock};
 use morok_dtype::DType;
 use smallvec::{SmallVec, smallvec};
 
+use morok_dtype::ext::HasDType;
+use snafu::ResultExt;
+
 use crate::allocator::{Allocator, BufferOptions, RawBuffer};
-#[cfg(feature = "cuda")]
-use crate::error::NotCpuAccessibleSnafu;
-use crate::error::{InvalidViewSnafu, Result, SizeMismatchSnafu};
+use crate::error::{
+    InvalidViewSnafu, NdarrayShapeSnafu, NotCpuAccessibleSnafu, Result, SizeMismatchSnafu, TypeMismatchSnafu,
+};
 
 /// Global counter for unique buffer IDs.
 ///
@@ -223,6 +226,84 @@ impl Buffer {
             #[cfg(feature = "cuda")]
             _ => NotCpuAccessibleSnafu.fail(),
         }
+    }
+
+    /// Typed immutable view over CPU-accessible buffer memory.
+    ///
+    /// Returns an ndarray view shaped according to the buffer's concrete dimensions.
+    /// Only works for CPU-accessible buffers — fails for device-only CUDA memory.
+    ///
+    /// # Errors
+    /// - `TypeMismatch` if `T::DTYPE` doesn't match buffer dtype
+    /// - `NotCpuAccessible` for non-CPU-accessible buffers
+    /// - `NotAllocated` if buffer hasn't been allocated
+    pub fn as_array<T: HasDType>(&self) -> Result<ndarray::ArrayViewD<'_, T>> {
+        self.ensure_allocated()?;
+        if self.dtype != T::DTYPE {
+            return TypeMismatchSnafu { expected: T::DTYPE, actual: self.dtype.clone() }.fail();
+        }
+        let raw = self.data.raw();
+        match raw {
+            RawBuffer::Cpu { data, .. } => {
+                let bytes = unsafe { &(&(*data.get()))[self.offset..self.offset + self.size] };
+                let count = bytes.len() / T::DTYPE.bytes();
+                let typed = unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const T, count) };
+                ndarray::ArrayViewD::from_shape(ndarray::IxDyn(&self.shape), typed).context(NdarrayShapeSnafu)
+            }
+            #[cfg(feature = "cuda")]
+            _ => NotCpuAccessibleSnafu.fail(),
+        }
+    }
+
+    /// Typed mutable view over CPU-accessible buffer memory.
+    ///
+    /// Same as [`as_array`] but allows writes. Caller must ensure no kernels
+    /// are executing concurrently (safety is the caller's responsibility).
+    ///
+    /// # Errors
+    /// Same as [`as_array`].
+    #[allow(clippy::mut_from_ref)]
+    pub fn as_array_mut<T: HasDType>(&self) -> Result<ndarray::ArrayViewMutD<'_, T>> {
+        self.ensure_allocated()?;
+        if self.dtype != T::DTYPE {
+            return TypeMismatchSnafu { expected: T::DTYPE, actual: self.dtype.clone() }.fail();
+        }
+        let raw = self.data.raw();
+        match raw {
+            RawBuffer::Cpu { data, cpu_accessible } if *cpu_accessible => {
+                let bytes = unsafe { &mut (&mut *data.get())[self.offset..self.offset + self.size] };
+                let count = bytes.len() / T::DTYPE.bytes();
+                let typed = unsafe { std::slice::from_raw_parts_mut(bytes.as_mut_ptr() as *mut T, count) };
+                ndarray::ArrayViewMutD::from_shape(ndarray::IxDyn(&self.shape), typed).context(NdarrayShapeSnafu)
+            }
+            _ => NotCpuAccessibleSnafu.fail(),
+        }
+    }
+
+    /// Zero-copy typed slice view (CPU-accessible only).
+    pub fn as_slice<T: HasDType>(&self) -> Result<&[T]> {
+        self.ensure_allocated()?;
+        if self.dtype != T::DTYPE {
+            return TypeMismatchSnafu { expected: T::DTYPE, actual: self.dtype.clone() }.fail();
+        }
+        let raw = self.data.raw();
+        match raw {
+            RawBuffer::Cpu { data, cpu_accessible } if *cpu_accessible => {
+                let bytes = unsafe { &(&(*data.get()))[self.offset..self.offset + self.size] };
+                let count = bytes.len() / T::DTYPE.bytes();
+                Ok(unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const T, count) })
+            }
+            _ => NotCpuAccessibleSnafu.fail(),
+        }
+    }
+
+    /// Read a single scalar value from the buffer (CPU-accessible only).
+    ///
+    /// Panics if the buffer contains more than one element.
+    pub fn item<T: HasDType + Copy>(&self) -> Result<T> {
+        let slice = self.as_slice::<T>()?;
+        assert_eq!(slice.len(), 1, "item() requires exactly 1 element, got {}", slice.len());
+        Ok(slice[0])
     }
 
     /// Get the allocator used by this buffer.

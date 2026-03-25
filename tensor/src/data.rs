@@ -63,7 +63,7 @@ impl Tensor {
             _ => registry::cpu().expect("CPU fallback for unsupported device"),
         };
 
-        let mut buffer = Buffer::new(allocator, dtype.clone(), vec![numel], Default::default());
+        let mut buffer = Buffer::new(allocator, dtype.clone(), shape.to_vec(), Default::default());
         buffer.copyin(bytes).expect("Buffer write always successful");
 
         let buffer_arc = Arc::new(buffer);
@@ -235,11 +235,10 @@ impl Tensor {
         Ok(data)
     }
 
-    /// Get a zero-copy typed view into the realized buffer.
+    /// Typed immutable view into the buffer, shaped by the tensor's logical shape.
     ///
-    /// CPU-only. The tensor must have a buffer (from `from_slice`, `from_ndarray`,
-    /// or `realize()`). For tensors with movement ops (permute, etc.),
-    /// call `.contiguous().realize()` first.
+    /// Uses the tensor's concrete shape for multidimensional indexing.
+    /// Falls back to the buffer's flat shape for symbolic tensors.
     ///
     /// # Examples
     /// ```
@@ -251,23 +250,18 @@ impl Tensor {
     /// ```
     pub fn array_view<T: HasDType>(&self) -> Result<ndarray::ArrayViewD<'_, T>> {
         let buffer_arc = self.buffer.as_ref().or_else(|| self.entry.buffer()).ok_or(Error::NoBuffer)?;
-
-        if buffer_arc.dtype() != T::DTYPE {
-            return TypeMismatchSnafu { expected: T::DTYPE, actual: buffer_arc.dtype() }.fail();
+        let flat = buffer_arc.as_array::<T>().context(DeviceSnafu)?;
+        // Reshape to tensor's logical shape if concrete
+        if let Ok(shape) = self.shape() {
+            let dims: Vec<usize> = shape.iter().filter_map(|d| d.as_const()).collect();
+            if dims.len() == shape.len() {
+                return flat.into_shape_with_order(ndarray::IxDyn(&dims)).context(NdarrayShapeSnafu);
+            }
         }
-
-        let bytes = buffer_arc.as_host_bytes().context(DeviceSnafu)?;
-        let count = bytes.len() / T::DTYPE.bytes();
-        let data = unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const T, count) };
-        let shape = self.shape()?;
-        let dims: Vec<usize> = shape.iter().map(|d| d.as_const().unwrap_or(1)).collect();
-        ndarray::ArrayViewD::from_shape(ndarray::IxDyn(&dims), data).context(NdarrayShapeSnafu)
+        Ok(flat)
     }
 
-    /// Get a mutable zero-copy typed view into the buffer.
-    ///
-    /// Allows direct writes into the tensor's backing memory.
-    /// Same requirements as `array_view` — CPU-only, buffer must exist.
+    /// Typed mutable view into the buffer, shaped by the tensor's logical shape.
     ///
     /// # Examples
     /// ```
@@ -279,16 +273,13 @@ impl Tensor {
     /// ```
     pub fn array_view_mut<T: HasDType>(&self) -> Result<ndarray::ArrayViewMutD<'_, T>> {
         let buffer_arc = self.buffer.as_ref().or_else(|| self.entry.buffer()).ok_or(Error::NoBuffer)?;
-
-        if buffer_arc.dtype() != T::DTYPE {
-            return TypeMismatchSnafu { expected: T::DTYPE, actual: buffer_arc.dtype() }.fail();
+        let flat = buffer_arc.as_array_mut::<T>().context(DeviceSnafu)?;
+        if let Ok(shape) = self.shape() {
+            let dims: Vec<usize> = shape.iter().filter_map(|d| d.as_const()).collect();
+            if dims.len() == shape.len() {
+                return flat.into_shape_with_order(ndarray::IxDyn(&dims)).context(NdarrayShapeSnafu);
+            }
         }
-
-        let bytes = buffer_arc.as_host_bytes_mut().context(DeviceSnafu)?;
-        let count = bytes.len() / T::DTYPE.bytes();
-        let data = unsafe { std::slice::from_raw_parts_mut(bytes.as_mut_ptr() as *mut T, count) };
-        let shape = self.shape()?;
-        let dims: Vec<usize> = shape.iter().map(|d| d.as_const().unwrap_or(1)).collect();
-        ndarray::ArrayViewMutD::from_shape(ndarray::IxDyn(&dims), data).context(NdarrayShapeSnafu)
+        Ok(flat)
     }
 }

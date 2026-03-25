@@ -151,16 +151,22 @@ impl RawBuffer {
 }
 
 /// Options for buffer allocation.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 #[cfg_attr(feature = "proptest", derive(proptest_derive::Arbitrary))]
 pub struct BufferOptions {
     /// Whether to zero-initialize the buffer.
     pub zero_init: bool,
-    /// Hint that this buffer will be accessed from CPU (for unified memory).
+    /// Whether this buffer is CPU-accessible.
     ///
-    /// NOTE: CUDA unified memory is not yet implemented. Setting this to `true`
-    /// with CudaAllocator will panic in debug builds.
+    /// CPU allocator: always true (host memory is always accessible).
+    /// CUDA allocator: false = device-only (cuMemAlloc), true = unified (cuMemAllocManaged).
     pub cpu_accessible: bool,
+}
+
+impl Default for BufferOptions {
+    fn default() -> Self {
+        Self { zero_init: false, cpu_accessible: true }
+    }
 }
 
 pub trait Allocator: Send + Sync + std::fmt::Debug {

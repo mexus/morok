@@ -211,7 +211,7 @@ impl Tensor {
     /// without reallocation. Matches Tinygrad's
     /// `prod([x.vmax if isinstance(x, UOp) else x for x in shape])`.
     pub fn empty_dynamic(shape: &[SInt], dtype: DType) -> Self {
-        let numel: usize = shape.iter().map(|s| sint_vmax(s)).product();
+        let numel: usize = shape.iter().map(sint_vmax).product();
         let buffer_uop = UOp::new_buffer(DeviceSpec::Cpu, numel, dtype);
         let ir_shape = Shape::from_iter(shape.iter().cloned());
         let uop = buffer_uop.try_reshape(&ir_shape).expect("shape valid for reshape");

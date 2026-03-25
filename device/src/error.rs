@@ -28,6 +28,14 @@ pub enum Error {
     #[snafu(display("buffer is not CPU-accessible (device buffers require copyout)"))]
     NotCpuAccessible,
 
+    /// Element type mismatch.
+    #[snafu(display("type mismatch: buffer has {actual:?}, requested {expected:?}"))]
+    TypeMismatch { expected: morok_dtype::DType, actual: morok_dtype::DType },
+
+    /// Failed to create ndarray view from buffer shape.
+    #[snafu(display("ndarray shape error: {source}"))]
+    NdarrayShape { source: ndarray::ShapeError },
+
     /// Invalid buffer view parameters.
     #[snafu(display("invalid view: offset {offset} + size {size} exceeds buffer size {buffer_size}"))]
     InvalidView { offset: usize, size: usize, buffer_size: usize },

@@ -401,22 +401,18 @@ crate::codegen_tests! {
             (3, vec![10.0, 20.0, 30.0], 60.0),
             (2, vec![100.0, 200.0], 300.0),
         ] {
-            // Write new input data into the buffer (same memory the plan reads).
+            // Write new input data (same buffer the plan reads).
             // Buffer is max-sized (16 elements); kernel reads only first N.
-            // SAFETY: no concurrent kernel execution during writes (sequential test).
             let buf = input.buffer().unwrap();
-            let host = buf.as_host_bytes_mut().unwrap();
-            for (i, &val) in data.iter().enumerate() {
-                host[i * 4..(i + 1) * 4].copy_from_slice(&val.to_le_bytes());
-            }
+            buf.as_array_mut::<f32>().unwrap().as_slice_mut().unwrap()[..data.len()]
+                .copy_from_slice(data);
 
             // Execute with new N — same compiled kernels, different variable
             let bound = batch.bind(n).unwrap();
             plan.execute_with_vars(&mut executor, &[bound.as_var_val()]).unwrap();
 
             // Read scalar output
-            let out = plan.output_buffer_at(0).as_host_bytes().unwrap();
-            let result = f32::from_le_bytes(out[..4].try_into().unwrap());
+            let result = plan.output_buffer_at(0).item::<f32>().unwrap();
             assert_close_f32(&[result], &[expected], 1e-5);
         }
     }
