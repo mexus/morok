@@ -161,6 +161,7 @@ pub fn has_pending_assigns() -> bool {
 /// After side-realizing one pending assign, its becomes_map must propagate
 /// into other pending assigns that may reference stale graphs.
 /// Matches Tinygrad tensor.py:285-287.
+#[allow(clippy::mutable_key_type)]
 pub fn substitute_pending_assigns(becomes_map: &HashMap<UOpKey, Arc<UOp>>) {
     if becomes_map.is_empty() {
         return;
