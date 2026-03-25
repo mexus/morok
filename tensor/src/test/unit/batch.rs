@@ -89,23 +89,14 @@ crate::codegen_tests! {
 
     fn test_prepare_batch_execute(config) {
         test_setup();
-        let a = &Tensor::from_slice([1.0f32, 2.0]) + &Tensor::from_slice([3.0f32, 4.0]);
-        let b = &Tensor::from_slice([10.0f32, 20.0]) * &Tensor::from_slice([2.0f32, 3.0]);
-        let plan = Tensor::prepare_batch_with(&[&a, &b], &config).unwrap();
+        let mut a = &Tensor::from_slice([1.0f32, 2.0]) + &Tensor::from_slice([3.0f32, 4.0]);
+        let mut b = &Tensor::from_slice([10.0f32, 20.0]) * &Tensor::from_slice([2.0f32, 3.0]);
+        let plan = Tensor::prepare_batch_with([&mut a, &mut b], &config).unwrap();
         let mut executor = morok_runtime::global_executor();
         plan.execute(&mut executor).unwrap();
         assert_eq!(plan.num_outputs(), 2);
-        let buf0 = plan.output_buffer_at(0);
-        let mut out0 = vec![0u8; buf0.size()];
-        buf0.copyout(&mut out0).unwrap();
-        let out0: Vec<f32> = out0.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect();
-        assert_close_f32(&out0, &[4.0, 6.0], 1e-6);
-
-        let buf1 = plan.output_buffer_at(1);
-        let mut out1 = vec![0u8; buf1.size()];
-        buf1.copyout(&mut out1).unwrap();
-        let out1: Vec<f32> = out1.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect();
-        assert_close_f32(&out1, &[20.0, 60.0], 1e-6);
+        assert_close_f32(&a.as_vec::<f32>().unwrap(), &[4.0, 6.0], 1e-6);
+        assert_close_f32(&b.as_vec::<f32>().unwrap(), &[20.0, 60.0], 1e-6);
     }
 }
 

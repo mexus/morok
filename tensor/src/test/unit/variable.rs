@@ -388,21 +388,18 @@ crate::codegen_tests! {
         let mut input_copy = input.clone();
         input_copy.realize_with(&config).unwrap();
 
-        // 2. Build computation graph on the input (which now has a buffer)
-        let sum_result = input.sum(()).unwrap();
-
-        // 3. Prepare plan once (compiles kernels)
-        let mut plan = Tensor::prepare_batch_with(&[&sum_result], &config).unwrap();
+        // 2. Build computation graph and prepare plan (wires output tensor to plan buffer)
+        let mut sum_result = input.sum(()).unwrap();
+        let mut plan = Tensor::prepare_batch_with([&mut sum_result], &config).unwrap();
         let mut executor = morok_runtime::global_executor();
 
-        // 4. Execute loop with varying N and data
+        // 3. Execute loop with varying N and data
         for &(n, ref data, expected) in &[
             (4i64, vec![1.0f32, 2.0, 3.0, 4.0], 10.0f32),
             (3, vec![10.0, 20.0, 30.0], 60.0),
             (2, vec![100.0, 200.0], 300.0),
         ] {
-            // Write new input data (same buffer the plan reads).
-            // Buffer is max-sized (16 elements); kernel reads only first N.
+            // Write new input data (same buffer the plan reads)
             let buf = input.buffer().unwrap();
             buf.as_array_mut::<f32>().unwrap().as_slice_mut().unwrap()[..data.len()]
                 .copy_from_slice(data);
@@ -412,7 +409,7 @@ crate::codegen_tests! {
             plan.execute_with_vars(&mut executor, &[bound.as_var_val()]).unwrap();
 
             // Read scalar output
-            let result = plan.output_buffer_at(0).item::<f32>().unwrap();
+            let result = sum_result.buffer().unwrap().item::<f32>().unwrap();
             assert_close_f32(&[result], &[expected], 1e-5);
         }
     }

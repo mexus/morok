@@ -278,9 +278,10 @@ impl OnnxImporter {
         for spec in inputs.values() {
             for dim in &spec.shape {
                 if let DimValue::Dynamic(name) = dim
-                    && !name.is_empty() {
-                        variables.entry(name.clone()).or_insert_with(|| Variable::new(name, 1, self.default_max_dim));
-                    }
+                    && !name.is_empty()
+                {
+                    variables.entry(name.clone()).or_insert_with(|| Variable::new(name, 1, self.default_max_dim));
+                }
             }
         }
 

@@ -439,7 +439,7 @@ fn test_print_matmul_ir() {
     // Create 4x4 matmul to see generated IR
     let a = Tensor::from_ndarray(&Array2::from_shape_vec((4, 4), (0..16).map(|i| i as f32).collect()).unwrap());
     let b = Tensor::from_ndarray(&Array2::from_shape_vec((4, 4), (0..16).map(|i| i as f32).collect()).unwrap());
-    let c = a.matmul(&b).unwrap();
+    let mut c = a.matmul(&b).unwrap();
 
     let plan = c.prepare().expect("prepare should succeed");
 
@@ -461,7 +461,7 @@ fn test_print_matmul_512x512_ir() {
     let b = Tensor::from_ndarray(
         &Array2::from_shape_vec((SIZE, SIZE), (0..SIZE * SIZE).map(|i| (i as f32) * 0.01).collect()).unwrap(),
     );
-    let c = a.matmul(&b).unwrap();
+    let mut c = a.matmul(&b).unwrap();
 
     // Use Heuristic strategy (Beam has a pre-existing bug with horizontal reduction)
     let config = prep_config(OptimizerConfig::builder().strategy(OptStrategy::Heuristic).build());
@@ -485,7 +485,7 @@ fn test_beam_search_matmul() {
     let b = Tensor::from_ndarray(
         &Array2::from_shape_vec((size, size), (0..size * size).map(|i| (i as f32) * 0.01).collect()).unwrap(),
     );
-    let c = a.matmul(&b).unwrap();
+    let mut c = a.matmul(&b).unwrap();
 
     // Use width=2 for reasonable test time. Disable disk cache to avoid stale results
     // from previous runs affecting correctness (beam cache is keyed by AST hash, but
@@ -623,7 +623,7 @@ fn test_print_matmul_64x64_ir() {
     const SIZE: usize = 64;
     let a = Tensor::from_ndarray(&Array2::<f32>::ones((SIZE, SIZE)));
     let b = Tensor::from_ndarray(&Array2::<f32>::ones((SIZE, SIZE)));
-    let c = a.matmul(&b).unwrap();
+    let mut c = a.matmul(&b).unwrap();
 
     let config = env_config();
     let plan = c.prepare_with(&config).expect("prepare should succeed");
