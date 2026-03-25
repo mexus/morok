@@ -117,7 +117,7 @@ impl Tensor {
     {
         let shape: Vec<usize> = array.shape().to_vec();
         if array.is_empty() {
-            let t = Self::empty(T::DTYPE);
+            let t = Self::empty_zero(T::DTYPE);
             if shape.len() <= 1 {
                 return t;
             }
@@ -143,40 +143,44 @@ impl Tensor {
     /// Returns `None` for lazy tensors that haven't been realized yet.
     /// Returns `Some(buffer)` for input tensors and realized tensors.
     pub fn buffer(&self) -> Option<Buffer> {
-        self.buffer.as_ref().map(|arc_buf| (**arc_buf).clone())
+        // Check local field first, then entry, then global registry by base UOp ID.
+        if let Some(buf) = self.buffer.as_ref().or_else(|| self.entry.buffer()) {
+            return Some((**buf).clone());
+        }
+        crate::tensor_registry::get_buffer_arc(self.uop().base().id).map(|arc| (*arc).clone())
     }
 
-    /// Extract data as `ndarray::ArrayD<T>`.
+    /// Read realized tensor data as an ndarray.
     ///
-    /// Calls `.contiguous().realize()` internally to ensure correct layout,
-    /// then copies data out of the buffer.
+    /// The tensor must have a buffer (from `from_slice`, `realize()`, etc.).
+    /// Returns error if the tensor has not been realized.
     ///
     /// # Examples
     /// ```
     /// # use morok_tensor::Tensor;
     /// let t = Tensor::from_slice(&[1.0f32, 2.0, 3.0]);
-    /// let result = t.to_ndarray::<f32>().unwrap();
+    /// let result = t.as_ndarray::<f32>().unwrap();
     /// assert_eq!(result.shape(), &[3]);
     /// ```
-    pub fn to_ndarray<T: HasDType + Default + Clone>(&self) -> Result<ndarray::ArrayD<T>> {
+    pub fn as_ndarray<T: HasDType + Default + Clone>(&self) -> Result<ndarray::ArrayD<T>> {
         use ndarray::{ArrayD, IxDyn};
 
         let uop = self.uop();
         let shape = uop.shape().context(UOpSnafu)?.ok_or(Error::NoShape)?;
-        let dims: Vec<usize> = shape.iter().map(|dim| dim.as_const().unwrap_or(1)).collect();
 
-        // Zero-size tensor: return empty ndarray without realization (matches Tinygrad)
+        // Refuse symbolic shapes — matches Tinygrad: assert all_int(self.shape)
+        if shape.iter().any(|dim| dim.as_const().is_none()) {
+            return SymbolicShapeSnafu.fail();
+        }
+
+        let dims: Vec<usize> = shape.iter().map(|dim| dim.as_const().unwrap()).collect();
+
         if dims.contains(&0) {
             let arr = ArrayD::from_shape_vec(IxDyn(&dims), vec![]).context(NdarrayShapeSnafu)?;
             return Ok(arr);
         }
 
-        // Following Tinygrad's approach: `.numpy()` always calls `.contiguous().realize()`.
-        // Never use a cached buffer directly — movement ops (permute, shrink, pad, etc.)
-        // change the logical-to-physical mapping, so the underlying buffer may not match
-        // the tensor's logical shape.
-        let realized = self.clone().contiguous().realize()?;
-        let buffer = realized.buffer().ok_or(Error::NoBuffer)?;
+        let buffer = self.buffer().ok_or(Error::NoBuffer)?;
 
         if buffer.dtype() != T::DTYPE {
             return TypeMismatchSnafu { expected: T::DTYPE, actual: buffer.dtype() }.fail();
@@ -192,29 +196,31 @@ impl Tensor {
         Ok(arr)
     }
 
-    /// Extract data as a flat `Vec<T>`.
+    /// Read realized tensor data as a flat `Vec<T>`.
     ///
-    /// Calls `.contiguous().realize()` internally to ensure correct layout,
-    /// then copies data out of the buffer.
+    /// The tensor must have a buffer (from `from_slice`, `realize()`, etc.).
+    /// Returns error if the tensor has not been realized.
     ///
     /// # Examples
     /// ```
     /// # use morok_tensor::Tensor;
     /// let t = Tensor::from_slice(&[1.0f32, 2.0, 3.0]);
-    /// let v = t.to_vec::<f32>().unwrap();
+    /// let v = t.as_vec::<f32>().unwrap();
     /// assert_eq!(v, vec![1.0, 2.0, 3.0]);
     /// ```
-    pub fn to_vec<T: HasDType + Default + Clone>(&self) -> Result<Vec<T>> {
-        // Zero-size tensor: return empty vec without realization (matches to_ndarray)
+    pub fn as_vec<T: HasDType + Default + Clone>(&self) -> Result<Vec<T>> {
         let uop = self.uop();
-        if let Ok(Some(shape)) = uop.shape()
-            && shape.iter().any(|dim| dim.as_const() == Some(0))
-        {
-            return Ok(vec![]);
+        if let Ok(Some(shape)) = uop.shape() {
+            // Refuse symbolic shapes — matches Tinygrad: assert all_int(self.shape)
+            if shape.iter().any(|dim| dim.as_const().is_none()) {
+                return SymbolicShapeSnafu.fail();
+            }
+            if shape.iter().any(|dim| dim.as_const() == Some(0)) {
+                return Ok(vec![]);
+            }
         }
 
-        let realized = self.clone().contiguous().realize()?;
-        let buffer = realized.buffer().ok_or(Error::NoBuffer)?;
+        let buffer = self.buffer().ok_or(Error::NoBuffer)?;
 
         if buffer.dtype() != T::DTYPE {
             return TypeMismatchSnafu { expected: T::DTYPE, actual: buffer.dtype() }.fail();
@@ -244,7 +250,7 @@ impl Tensor {
     /// assert_eq!(view[[0, 1]], 2.0);
     /// ```
     pub fn array_view<T: HasDType>(&self) -> Result<ndarray::ArrayViewD<'_, T>> {
-        let buffer_arc = self.buffer.as_ref().ok_or(Error::NoBuffer)?;
+        let buffer_arc = self.buffer.as_ref().or_else(|| self.entry.buffer()).ok_or(Error::NoBuffer)?;
 
         if buffer_arc.dtype() != T::DTYPE {
             return TypeMismatchSnafu { expected: T::DTYPE, actual: buffer_arc.dtype() }.fail();
@@ -272,7 +278,7 @@ impl Tensor {
     /// assert_eq!(t.array_view::<f32>().unwrap()[[1, 2]], 42.0);
     /// ```
     pub fn array_view_mut<T: HasDType>(&self) -> Result<ndarray::ArrayViewMutD<'_, T>> {
-        let buffer_arc = self.buffer.as_ref().ok_or(Error::NoBuffer)?;
+        let buffer_arc = self.buffer.as_ref().or_else(|| self.entry.buffer()).ok_or(Error::NoBuffer)?;
 
         if buffer_arc.dtype() != T::DTYPE {
             return TypeMismatchSnafu { expected: T::DTYPE, actual: buffer_arc.dtype() }.fail();

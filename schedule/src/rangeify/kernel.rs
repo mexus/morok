@@ -80,7 +80,10 @@ pub struct KernelContext {
     pub global_counter: usize,
     pub local_counter: usize,
     pub buffer_map: HashMap<UOpKey, Arc<UOp>>,
-    pub vars: HashSet<UOpKey>,
+    /// Bound variables: maps variable name → (DEFINE_VAR UOp, optional bound value).
+    /// Populated when BIND(DEFINE_VAR, CONST) is stripped during kernel splitting.
+    /// The UOp is kept for kernel sources; the i64 is the concrete bound value (None for OUTER ranges).
+    pub vars: HashMap<String, (Arc<UOp>, Option<i64>)>,
     pub range_counter: usize,
     /// Mapping from DefineGlobal UOp ID to original BUFFER UOp ID.
     /// Used by to_define_global_patterns for buffer tracking.
@@ -93,7 +96,7 @@ impl KernelContext {
             global_counter: 0,
             local_counter: 0,
             buffer_map: HashMap::new(),
-            vars: HashSet::new(),
+            vars: HashMap::new(),
             range_counter: 0,
             define_to_buffer_id: HashMap::new(),
         }
@@ -129,12 +132,11 @@ impl KernelContext {
         self.buffer_map.insert(UOpKey(original), replacement);
     }
 
-    pub fn add_var(&mut self, var: Arc<UOp>) {
-        self.vars.insert(UOpKey(var));
-    }
-
-    pub fn has_var(&self, var: &Arc<UOp>) -> bool {
-        self.vars.contains(&UOpKey(var.clone()))
+    /// Track a bound variable with its DEFINE_VAR UOp and concrete value.
+    pub fn add_var(&mut self, var: Arc<UOp>, value: Option<i64>) {
+        if let Op::DefineVar { name, .. } = var.op() {
+            self.vars.insert(name.clone(), (var, value));
+        }
     }
 }
 
@@ -163,8 +165,8 @@ pub struct LocalAddBufferContext {
     pub dg: usize,
     /// Buffer → AFTER mapping (IndexMap maintains insertion order)
     pub map: IndexMap<UOpKey, Arc<UOp>>,
-    /// Bound variables
-    pub vars: HashMap<UOpKey, ()>,
+    /// Bound variables: name → (DEFINE_VAR UOp, optional bound value).
+    pub vars: HashMap<String, (Arc<UOp>, Option<i64>)>,
     /// Range renumber counter
     pub range: usize,
     /// Optimization hints extracted from CONTIGUOUS.opts (Tinygrad: ctx.opts)
@@ -190,9 +192,11 @@ impl LocalAddBufferContext {
         id
     }
 
-    /// Track a variable (like unbind_kernel in Tinygrad).
-    pub fn add_var(&mut self, var: Arc<UOp>) {
-        self.vars.insert(UOpKey(var), ());
+    /// Track a bound variable with its DEFINE_VAR UOp and concrete value.
+    pub fn add_var(&mut self, var: Arc<UOp>, value: Option<i64>) {
+        if let Op::DefineVar { name, .. } = var.op() {
+            self.vars.insert(name.clone(), (var, value));
+        }
     }
 
     /// Map a buffer to its AFTER wrapper.
@@ -289,9 +293,9 @@ pub fn split_store(_ctx: &mut Vec<Arc<UOp>>, x: &Arc<UOp>) -> Option<Arc<UOp>> {
     };
 
     // Build KERNEL from context (like Tinygrad rangeify.py:504)
-    // Sources: lctx.map.values() (buffer → AFTER mappings) + lctx.vars.keys() (bound variables)
+    // Sources: lctx.map.values() (buffer → AFTER mappings) + DEFINE_VAR UOps from vars
     let sources: SmallVec<[Arc<UOp>; 4]> =
-        lctx.map.values().cloned().chain(lctx.vars.keys().map(|k| k.0.clone())).collect();
+        lctx.map.values().cloned().chain(lctx.vars.values().map(|(uop, _)| uop.clone())).collect();
 
     let kernel = UOp::kernel(sources.clone(), ast.clone());
     debug!(

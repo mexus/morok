@@ -166,6 +166,15 @@ pub enum Error {
 
     #[snafu(display("Failed to create ndarray: {source}"))]
     NdarrayShape { source: ndarray::ShapeError },
+
+    // =========================================================================
+    // Variable Errors
+    // =========================================================================
+    #[snafu(display("Variable '{name}' value {val} out of range [{min}, {max}]"))]
+    VariableOutOfRange { name: String, val: i64, min: i64, max: i64 },
+
+    #[snafu(display("Cannot read data from tensor with symbolic shape — reduce or slice to concrete shape first"))]
+    SymbolicShape,
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

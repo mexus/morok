@@ -4,7 +4,27 @@ use std::sync::Arc;
 use morok_device::Buffer;
 use morok_dtype::DType;
 use morok_dtype::ext::HasDType;
-use morok_ir::{ConstValue, DeviceSpec, SInt, UOp, shape::Shape};
+use morok_ir::{ConstValue, DeviceSpec, Op, SInt, UOp, shape::Shape};
+use snafu::ResultExt;
+
+/// Extract max value from an SInt for buffer allocation.
+///
+/// Concrete dims return their value. Symbolic dims (DefineVar, Bind)
+/// return `max_val` from the underlying Variable, enabling rebinding
+/// without reallocation. Matches Tinygrad's `x.vmax`.
+fn sint_vmax(s: &SInt) -> usize {
+    match s {
+        SInt::Const(v) => *v,
+        SInt::Symbolic(uop) => match uop.op() {
+            Op::DefineVar { max_val, .. } => *max_val as usize,
+            Op::Bind { var, .. } => match var.op() {
+                Op::DefineVar { max_val, .. } => *max_val as usize,
+                _ => 1,
+            },
+            _ => 1,
+        },
+    }
+}
 
 pub mod error;
 use error::*;
@@ -29,11 +49,13 @@ pub mod shape_ops;
 pub mod tensor_registry;
 pub mod traits;
 pub mod transformer;
+pub mod variable;
 
 // Re-export for public API
 pub use config::PrepareConfig;
 pub use morok_runtime::CpuBackend;
 pub use tensor_registry::apply_map_to_tensors;
+pub use variable::{BoundVariable, Variable};
 
 /// Reduction operations supported by cumulative reduce (`_cumalu`).
 #[derive(Debug, Clone, Copy)]
@@ -104,8 +126,8 @@ pub struct KernelInfo {
 /// # use morok_tensor::Tensor;
 /// let a = Tensor::from_slice(&[1.0f32, 2.0, 3.0]);
 /// let b = Tensor::from_slice(&[4.0f32, 5.0, 6.0]);
-/// let c = &a + &b;  // Lazy - only builds UOp graph
-/// let realized = c.realize().unwrap();  // Executes the computation
+/// let mut c = &a + &b;  // Lazy - only builds UOp graph
+/// c.realize().unwrap();  // Executes the computation
 /// ```
 pub struct Tensor {
     /// Registry entry holding the computation graph (supports global substitution)
@@ -146,15 +168,11 @@ impl Tensor {
     /// When `apply_map_to_tensors` substitutes a tensor's UOp with a realized
     /// BUFFER+RESHAPE, the Tensor struct's `buffer` field isn't updated.
     /// This method looks up the buffer from the registry and attaches it.
-    pub(crate) fn ensure_buffer(mut self) -> Self {
-        if self.buffer.is_none() {
-            let buffer_id = self.uop().base().id;
-            if let Some(buf_arc) = tensor_registry::get_buffer_arc(buffer_id) {
-                self.entry.set_buffer(Arc::clone(&buf_arc));
-                self.buffer = Some(buf_arc);
-            }
+    pub(crate) fn ensure_buffer(&self) {
+        let buffer_id = self.uop().base().id;
+        if let Some(buf_arc) = tensor_registry::get_buffer_arc(buffer_id) {
+            self.entry.set_buffer(buf_arc);
         }
-        self
     }
 
     /// Get the current UOp for this tensor.
@@ -173,14 +191,36 @@ impl Tensor {
         Vec::new()
     }
 
-    /// Create an empty (0-element) tensor with the given dtype and shape `[0]`.
+    /// Create an uninitialized buffer-backed tensor with the given shape and dtype.
     ///
-    /// Matches Tinygrad's `Tensor([], dtype=dtype)`. No buffer is allocated.
-    pub fn empty(dtype: DType) -> Self {
-        let buffer_uop = UOp::new_buffer(DeviceSpec::Cpu, 0, dtype);
-        let shape = Shape::from_iter([SInt::Const(0)]);
-        let uop = buffer_uop.try_reshape(&shape).expect("empty reshape to [0]");
+    /// No device memory is allocated — only the BUFFER UOp is created.
+    /// Use `assign()` to bind real data before `realize()`.
+    /// Matches Tinygrad's `Tensor.empty(*shape)`.
+    pub fn empty(shape: &[usize], dtype: DType) -> Self {
+        let numel: usize = shape.iter().product();
+        let buffer_uop = UOp::new_buffer(DeviceSpec::Cpu, numel, dtype);
+        let ir_shape = Shape::from_iter(shape.iter().map(|&d| SInt::Const(d)));
+        let uop = buffer_uop.try_reshape(&ir_shape).expect("shape matches element count");
         Self::new(uop)
+    }
+
+    /// Create an uninitialized buffer-backed tensor with symbolic (dynamic) dimensions.
+    ///
+    /// Buffer is sized to `prod(vmax)` — each symbolic dim uses its Variable's
+    /// max_val for allocation. This enables rebinding to any value in [min, max]
+    /// without reallocation. Matches Tinygrad's
+    /// `prod([x.vmax if isinstance(x, UOp) else x for x in shape])`.
+    pub fn empty_dynamic(shape: &[SInt], dtype: DType) -> Self {
+        let numel: usize = shape.iter().map(|s| sint_vmax(s)).product();
+        let buffer_uop = UOp::new_buffer(DeviceSpec::Cpu, numel, dtype);
+        let ir_shape = Shape::from_iter(shape.iter().cloned());
+        let uop = buffer_uop.try_reshape(&ir_shape).expect("shape valid for reshape");
+        Self::new(uop)
+    }
+
+    /// Create an empty 0-element tensor with the given dtype and shape `[0]`.
+    pub fn empty_zero(dtype: DType) -> Self {
+        Self::empty(&[0], dtype)
     }
 
     /// Create a tensor filled with a constant value, broadcast to the given shape.
@@ -191,6 +231,44 @@ impl Tensor {
         }
         let expand_shape: Vec<isize> = shape.iter().map(|&d| d as isize).collect();
         scalar.try_reshape(&vec![1; shape.len()])?.try_expand(&expand_shape)
+    }
+
+    /// Create a tensor filled with a constant value, using symbolic (dynamic) dimensions.
+    ///
+    /// Dimensions can be concrete (`SInt::Const`) or symbolic (`SInt::Symbolic`
+    /// from [`Variable::bind()`](crate::Variable::bind)).
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use morok_tensor::{Tensor, Variable};
+    /// use morok_dtype::DType;
+    ///
+    /// let batch = Variable::new("batch", 1, 32);
+    /// let x = Tensor::full_dynamic(&[batch.bind(16)?.into(), 784.into()], 0.0, DType::Float32)?;
+    /// ```
+    pub fn full_dynamic(shape: &[SInt], value: impl Into<ConstValue>, dtype: DType) -> Result<Self> {
+        let const_uop = UOp::const_(dtype.clone(), value.into());
+        if shape.is_empty() {
+            return Ok(Self::new(const_uop));
+        }
+        // Reshape scalar to [1, 1, ...] then expand to target shape.
+        // Expand handles both concrete and symbolic (SInt::Symbolic) dims.
+        let ones: Shape = vec![SInt::Const(1); shape.len()].into();
+        let target: Shape = shape.to_vec().into();
+        let reshaped = const_uop.try_reshape(&ones).context(error::UOpSnafu)?;
+        let expanded = reshaped.try_expand(&target).context(error::UOpSnafu)?;
+        Ok(Self::new(expanded))
+    }
+
+    /// Create a zero-filled tensor with symbolic (dynamic) dimensions.
+    pub fn zeros_dynamic(shape: &[SInt], dtype: DType) -> Result<Self> {
+        Self::full_dynamic(shape, ConstValue::zero(dtype.base()), dtype)
+    }
+
+    /// Create a one-filled tensor with symbolic (dynamic) dimensions.
+    pub fn ones_dynamic(shape: &[SInt], dtype: DType) -> Result<Self> {
+        Self::full_dynamic(shape, ConstValue::one(dtype.base()), dtype)
     }
 
     /// Cumulative reduce along an axis using a sliding-window approach.
@@ -282,7 +360,7 @@ impl Tensor {
     /// Create 1D tensor with `steps` evenly spaced values from `start` to `end` (inclusive).
     pub fn linspace(start: f64, end: f64, steps: usize, dtype: DType) -> Result<Self> {
         if steps == 0 {
-            return Ok(Self::empty(dtype));
+            return Ok(Self::empty_zero(dtype));
         }
         if steps == 1 {
             return Self::full(&[1], start, dtype);
@@ -297,7 +375,7 @@ impl Tensor {
     fn arange_inner(start: f64, stop: f64, step: f64, dtype: DType, is_float: bool) -> Result<Self> {
         let count = ((stop - start) / step).ceil() as i64;
         if count <= 0 {
-            return Ok(Self::empty(dtype));
+            return Ok(Self::empty_zero(dtype));
         }
         let count = count as usize;
         let val = |v: f64| if is_float { ConstValue::Float(v) } else { ConstValue::Int(v as i64) };
@@ -371,8 +449,8 @@ impl Tensor {
     /// # Examples
     /// ```ignore
     /// let cpu_tensor = Tensor::from_slice(&[1.0f32, 2.0, 3.0]);
-    /// let gpu_tensor = cpu_tensor.to(DeviceSpec::Cuda { device_id: 0 });
-    /// let realized = gpu_tensor.realize()?;  // Actually transfers data
+    /// let mut gpu_tensor = cpu_tensor.to(DeviceSpec::Cuda { device_id: 0 });
+    /// gpu_tensor.realize()?;  // Actually transfers data
     /// ```
     pub fn to(&self, device: DeviceSpec) -> Self {
         if self.device() == device {
@@ -400,6 +478,28 @@ impl Tensor {
         Ok(Self::new(self.uop().bitcast(dtype)))
     }
 
+    /// Assign a value tensor to this tensor in-place.
+    ///
+    /// Creates an ASSIGN UOp linking this tensor's BUFFER to the value.
+    /// The assignment is resolved lazily during `realize()`.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let placeholder = Tensor::empty(&[2, 3], DType::Float32);
+    /// let real_data = Tensor::from_slice(&[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0])
+    ///     .try_reshape(&[2, 3]).unwrap();
+    /// placeholder.assign(&real_data);
+    /// ```
+    pub fn assign(&self, value: &Tensor) {
+        let target_uop = self.uop();
+        let assign_uop = UOp::assign(target_uop.clone(), value.uop());
+        // Track for side-realization during realize() (Tinygrad: _pending_assigns).
+        let buffer_id = target_uop.base().id;
+        tensor_registry::add_pending_assign(buffer_id, assign_uop.clone());
+        self.set_uop(assign_uop);
+    }
+
     /// Update the UOp for this tensor directly.
     ///
     /// This is used internally after realization to update the tensor's UOp
@@ -417,9 +517,9 @@ impl Tensor {
     /// # Examples
     /// ```ignore
     /// // Force a constant to be materialized
-    /// let c = Tensor::const_(5.0f32, DType::Float32);
-    /// let realized = c.contiguous().realize()?;
-    /// assert!(realized.buffer().is_some());
+    /// let mut c = Tensor::const_(5.0f32, DType::Float32).contiguous();
+    /// c.realize()?;
+    /// assert!(c.buffer().is_some());
     /// ```
     pub fn contiguous(&self) -> Self {
         let uop = self.uop();

@@ -18,19 +18,19 @@ fn test_importer_creation() {
 fn test_prepare_minimal_model() {
     let importer = OnnxImporter::new();
     let model = make_minimal_model();
-    let graph = importer.prepare(model).unwrap();
+    let result = importer.import_model(model, &[]).unwrap();
 
-    assert!(graph.inputs.is_empty());
-    assert_eq!(graph.outputs.len(), 1);
-    assert_eq!(graph.outputs[0], "output");
-    assert!(graph.initializers.contains_key("input"));
+    // Minimal model: all inputs are initializers, so no user inputs
+    assert!(result.inputs.is_empty());
+    assert_eq!(result.outputs.len(), 1);
+    assert!(result.outputs.contains_key("output"));
 }
 
 #[test]
 fn test_import_model_minimal() {
-    let mut importer = OnnxImporter::new();
+    let importer = OnnxImporter::new();
     let model = make_minimal_model();
-    let outputs = importer.import_model(model).unwrap();
+    let outputs = importer.import_model(model, &[]).unwrap().outputs;
 
     assert_eq!(outputs.len(), 1);
     assert!(outputs.contains_key("output"));
@@ -38,9 +38,9 @@ fn test_import_model_minimal() {
 
 #[test]
 fn test_multi_output_model() {
-    let mut importer = OnnxImporter::new();
+    let importer = OnnxImporter::new();
     let model = make_multi_output_model();
-    let outputs = importer.import_model(model).unwrap();
+    let outputs = importer.import_model(model, &[]).unwrap().outputs;
 
     assert_eq!(outputs.len(), 2);
     assert!(outputs.contains_key("out1"));
@@ -51,13 +51,13 @@ fn test_multi_output_model() {
 fn test_import_empty_model() {
     let importer = OnnxImporter::new();
     let model = ModelProto::default();
-    let result = importer.prepare(model);
+    let result = importer.import_model(model, &[]);
     assert!(result.is_err());
 }
 
 #[test]
 fn test_import_with_add() {
-    let mut importer = OnnxImporter::new();
+    let importer = OnnxImporter::new();
 
     let mut model = ModelProto::default();
     let mut graph = GraphProto::default();
@@ -89,14 +89,14 @@ fn test_import_with_add() {
 
     model.graph = Some(graph);
 
-    let outputs = importer.import_model(model).unwrap();
+    let outputs = importer.import_model(model, &[]).unwrap().outputs;
     assert_eq!(outputs.len(), 1);
     assert!(outputs.contains_key("output"));
 }
 
 #[test]
 fn test_import_with_matmul() {
-    let mut importer = OnnxImporter::new();
+    let importer = OnnxImporter::new();
 
     let mut model = ModelProto::default();
     let mut graph = GraphProto::default();
@@ -128,7 +128,7 @@ fn test_import_with_matmul() {
 
     model.graph = Some(graph);
 
-    let outputs = importer.import_model(model).unwrap();
+    let outputs = importer.import_model(model, &[]).unwrap().outputs;
     assert_eq!(outputs.len(), 1);
     assert!(outputs.contains_key("output"));
 }
@@ -219,8 +219,8 @@ fn test_if_shape_mismatch_errors() {
 
     model.graph = Some(graph);
 
-    let mut importer = OnnxImporter::new();
-    let result = importer.import_model(model);
+    let importer = OnnxImporter::new();
+    let result = importer.import_model(model, &[]);
     assert!(result.is_err(), "expected error for incompatible If branches");
     let msg = result.err().unwrap().to_string();
     assert!(msg.contains("incompatible branches"), "expected incompatible branches error, got: {msg}");
@@ -272,18 +272,18 @@ fn test_trace_static_shapes() {
     model.graph = Some(graph);
 
     let importer = OnnxImporter::new();
-    let onnx_graph = importer.prepare(model).unwrap();
-    let (inputs, outputs) = importer.trace(&onnx_graph).unwrap();
+    let result = importer.import_model(model, &[]).unwrap();
 
-    assert!(inputs.contains_key("input"));
-    assert!(outputs.contains_key("output"));
+    assert!(result.inputs.contains_key("input"));
+    assert!(result.outputs.contains_key("output"));
 
-    let input_shape: Vec<usize> = inputs["input"].shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
+    let input_shape: Vec<usize> =
+        result.inputs["input"].shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
     assert_eq!(input_shape, vec![2, 3]);
 }
 
 #[test]
-fn test_trace_with_dims() {
+fn test_import_with_dynamic_dims() {
     use crate::parser::onnx::{TensorShapeProto, TypeProto, tensor_shape_proto};
 
     let mut model = ModelProto::default();
@@ -327,15 +327,319 @@ fn test_trace_with_dims() {
     model.graph = Some(graph);
 
     let importer = OnnxImporter::new();
-    let onnx_graph = importer.prepare(model).unwrap();
+    let result = importer.import_model(model, &[("batch", 4)]).unwrap();
+    assert!(result.outputs.contains_key("output"));
+    assert!(result.variables.contains_key("batch"));
+}
 
-    let result = importer.trace(&onnx_graph);
-    assert!(result.is_err());
+// =========================================================================
+// Variable auto-extraction tests
+// =========================================================================
 
-    let (inputs, outputs) = importer.trace_with_dims(&onnx_graph, &[("batch", 4)]).unwrap();
-    let input_shape: Vec<usize> = inputs["input"].shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
-    assert_eq!(input_shape, vec![4, 3]);
-    assert!(outputs.contains_key("output"));
+#[test]
+fn test_prepare_extracts_variables() {
+    use crate::parser::onnx::{TensorShapeProto, TypeProto, tensor_shape_proto};
+
+    let mut model = ModelProto::default();
+    let mut graph = GraphProto::default();
+    graph.name = "var_test".to_string();
+
+    // Input with dim_param "batch" and static dim 3
+    let shape = TensorShapeProto {
+        dim: vec![
+            tensor_shape_proto::Dimension {
+                denotation: String::new(),
+                value: Some(tensor_shape_proto::dimension::Value::DimParam("batch".to_string())),
+            },
+            tensor_shape_proto::Dimension {
+                denotation: String::new(),
+                value: Some(tensor_shape_proto::dimension::Value::DimValue(3)),
+            },
+        ],
+    };
+    graph.input.push(ValueInfoProto {
+        name: "x".to_string(),
+        r#type: Some(TypeProto {
+            denotation: String::new(),
+            value: Some(type_proto::Value::TensorType(TensorTypeProto {
+                elem_type: tensor_proto::DataType::Float as i32,
+                shape: Some(shape),
+            })),
+        }),
+        ..Default::default()
+    });
+
+    let mut output = ValueInfoProto::default();
+    output.name = "y".to_string();
+    graph.output.push(output);
+
+    model.graph = Some(graph);
+
+    let importer = OnnxImporter::new();
+    let result = importer.import_model(model, &[]).unwrap();
+
+    // Variables should be auto-extracted
+    assert!(!result.variables.is_empty());
+    assert!(result.variables.contains_key("batch"));
+
+    let var = result.variables.get("batch").unwrap();
+    assert_eq!(var.name(), "batch");
+    assert_eq!(var.bounds(), (1, i16::MAX as i64));
+}
+
+#[test]
+fn test_prepare_no_variables_for_static_model() {
+    let mut model = ModelProto::default();
+    let mut graph = GraphProto::default();
+    graph.name = "static_test".to_string();
+
+    graph.input.push(make_typed_input("x", tensor_proto::DataType::Float as i32, &[2, 3]));
+
+    let mut output = ValueInfoProto::default();
+    output.name = "y".to_string();
+    graph.output.push(output);
+
+    model.graph = Some(graph);
+
+    let importer = OnnxImporter::new();
+    let result = importer.import_model(model, &[]).unwrap();
+
+    assert!(result.variables.is_empty());
+}
+
+#[test]
+fn test_prepare_multiple_dynamic_dims() {
+    use crate::parser::onnx::{TensorShapeProto, TypeProto, tensor_shape_proto};
+
+    let mut model = ModelProto::default();
+    let mut graph = GraphProto::default();
+    graph.name = "multi_var_test".to_string();
+
+    // Input with two different dim_params
+    let shape = TensorShapeProto {
+        dim: vec![
+            tensor_shape_proto::Dimension {
+                denotation: String::new(),
+                value: Some(tensor_shape_proto::dimension::Value::DimParam("batch".to_string())),
+            },
+            tensor_shape_proto::Dimension {
+                denotation: String::new(),
+                value: Some(tensor_shape_proto::dimension::Value::DimParam("seq_len".to_string())),
+            },
+            tensor_shape_proto::Dimension {
+                denotation: String::new(),
+                value: Some(tensor_shape_proto::dimension::Value::DimValue(768)),
+            },
+        ],
+    };
+    graph.input.push(ValueInfoProto {
+        name: "x".to_string(),
+        r#type: Some(TypeProto {
+            denotation: String::new(),
+            value: Some(type_proto::Value::TensorType(TensorTypeProto {
+                elem_type: tensor_proto::DataType::Float as i32,
+                shape: Some(shape),
+            })),
+        }),
+        ..Default::default()
+    });
+
+    let mut output = ValueInfoProto::default();
+    output.name = "y".to_string();
+    graph.output.push(output);
+
+    model.graph = Some(graph);
+
+    let importer = OnnxImporter::new();
+    let result = importer.import_model(model, &[]).unwrap();
+
+    let mut dims: Vec<&str> = result.variables.keys().map(|s| s.as_str()).collect();
+    dims.sort();
+    assert_eq!(dims, vec!["batch", "seq_len"]);
+}
+
+#[test]
+fn test_default_max_dim_configurable() {
+    use crate::parser::onnx::{TensorShapeProto, TypeProto, tensor_shape_proto};
+
+    let mut model = ModelProto::default();
+    let mut graph = GraphProto::default();
+    graph.name = "config_test".to_string();
+
+    let shape = TensorShapeProto {
+        dim: vec![tensor_shape_proto::Dimension {
+            denotation: String::new(),
+            value: Some(tensor_shape_proto::dimension::Value::DimParam("batch".to_string())),
+        }],
+    };
+    graph.input.push(ValueInfoProto {
+        name: "x".to_string(),
+        r#type: Some(TypeProto {
+            denotation: String::new(),
+            value: Some(type_proto::Value::TensorType(TensorTypeProto {
+                elem_type: tensor_proto::DataType::Float as i32,
+                shape: Some(shape),
+            })),
+        }),
+        ..Default::default()
+    });
+
+    let mut output = ValueInfoProto::default();
+    output.name = "y".to_string();
+    graph.output.push(output);
+
+    model.graph = Some(graph);
+
+    let mut importer = OnnxImporter::new();
+    importer.default_max_dim = 256;
+    let result = importer.import_model(model, &[]).unwrap();
+
+    let var = result.variables.get("batch").unwrap();
+    assert_eq!(var.bounds(), (1, 256));
+}
+
+#[test]
+fn test_shared_dim_param_across_inputs() {
+    use crate::parser::onnx::{TensorShapeProto, TypeProto, tensor_shape_proto};
+
+    let mut model = ModelProto::default();
+    let mut graph = GraphProto::default();
+    graph.name = "shared_dim_test".to_string();
+
+    // Two inputs sharing the same "batch" dim_param
+    for name in ["x", "y"] {
+        let shape = TensorShapeProto {
+            dim: vec![
+                tensor_shape_proto::Dimension {
+                    denotation: String::new(),
+                    value: Some(tensor_shape_proto::dimension::Value::DimParam("batch".to_string())),
+                },
+                tensor_shape_proto::Dimension {
+                    denotation: String::new(),
+                    value: Some(tensor_shape_proto::dimension::Value::DimValue(4)),
+                },
+            ],
+        };
+        graph.input.push(ValueInfoProto {
+            name: name.to_string(),
+            r#type: Some(TypeProto {
+                denotation: String::new(),
+                value: Some(type_proto::Value::TensorType(TensorTypeProto {
+                    elem_type: tensor_proto::DataType::Float as i32,
+                    shape: Some(shape),
+                })),
+            }),
+            ..Default::default()
+        });
+    }
+
+    let mut output = ValueInfoProto::default();
+    output.name = "out".to_string();
+    graph.output.push(output);
+
+    model.graph = Some(graph);
+
+    let importer = OnnxImporter::new();
+    let result = importer.import_model(model, &[]).unwrap();
+
+    // Should only have ONE "batch" variable, not duplicated
+    assert_eq!(result.variables.len(), 1);
+    assert!(result.variables.contains_key("batch"));
+}
+
+// =========================================================================
+// OnnxModel (single import() call) tests
+// =========================================================================
+
+#[test]
+fn test_import_model_static() {
+    let mut model = ModelProto::default();
+    let mut graph = GraphProto::default();
+    graph.name = "import_test".to_string();
+
+    graph.input.push(make_typed_input("x", tensor_proto::DataType::Float as i32, &[2, 3]));
+
+    let mut output = ValueInfoProto::default();
+    output.name = "y".to_string();
+    graph.output.push(output);
+
+    let mut node = NodeProto::default();
+    node.op_type = "Identity".to_string();
+    node.input.push("x".to_string());
+    node.output.push("y".to_string());
+    graph.node.push(node);
+
+    model.graph = Some(graph);
+
+    let importer = OnnxImporter::new();
+    let onnx_model = importer.import_model(model, &[]).unwrap();
+
+    // Inputs and outputs are normal Tensors
+    assert!(onnx_model.inputs.contains_key("x"));
+    assert!(onnx_model.outputs.contains_key("y"));
+
+    // Static model has no variables
+    assert!(onnx_model.variables.is_empty());
+
+    // Input has correct shape
+    let shape: Vec<usize> = onnx_model.inputs["x"].shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
+    assert_eq!(shape, vec![2, 3]);
+}
+
+#[test]
+fn test_import_model_with_dynamic_dims() {
+    use crate::parser::onnx::{TensorShapeProto, TypeProto, tensor_shape_proto};
+
+    let mut model = ModelProto::default();
+    let mut graph = GraphProto::default();
+    graph.name = "dynamic_import_test".to_string();
+
+    let shape = TensorShapeProto {
+        dim: vec![
+            tensor_shape_proto::Dimension {
+                denotation: String::new(),
+                value: Some(tensor_shape_proto::dimension::Value::DimParam("batch".to_string())),
+            },
+            tensor_shape_proto::Dimension {
+                denotation: String::new(),
+                value: Some(tensor_shape_proto::dimension::Value::DimValue(3)),
+            },
+        ],
+    };
+    graph.input.push(ValueInfoProto {
+        name: "x".to_string(),
+        r#type: Some(TypeProto {
+            denotation: String::new(),
+            value: Some(type_proto::Value::TensorType(TensorTypeProto {
+                elem_type: tensor_proto::DataType::Float as i32,
+                shape: Some(shape),
+            })),
+        }),
+        ..Default::default()
+    });
+
+    let mut output = ValueInfoProto::default();
+    output.name = "y".to_string();
+    graph.output.push(output);
+
+    let mut node = NodeProto::default();
+    node.op_type = "Identity".to_string();
+    node.input.push("x".to_string());
+    node.output.push("y".to_string());
+    graph.node.push(node);
+
+    model.graph = Some(graph);
+
+    let importer = OnnxImporter::new();
+    let onnx_model = importer.import_model(model, &[("batch", 4)]).unwrap();
+
+    // Variables extracted
+    assert!(onnx_model.variables.contains_key("batch"));
+    assert_eq!(onnx_model.variables["batch"].bounds(), (1, i16::MAX as i64));
+
+    // Inputs and outputs present
+    assert!(onnx_model.inputs.contains_key("x"));
+    assert!(onnx_model.outputs.contains_key("y"));
 }
 
 // =========================================================================
@@ -624,32 +928,38 @@ fn make_if_model(cond_value: bool, x_values: &[f32]) -> ModelProto {
 
 morok_tensor::codegen_tests! {
     fn test_if_true_condition(config) {
-        let mut importer = OnnxImporter::new();
+        let importer = OnnxImporter::new();
         let model = make_if_model(true, &[1.0, 2.0, 3.0]);
-        let outputs = importer.import_model(model).unwrap();
+        let outputs = importer.import_model(model, &[]).unwrap().outputs;
 
         let result = outputs.get("output").unwrap();
-        let vals = result.clone().realize_with(&config).unwrap().to_vec::<f32>().unwrap();
+        let mut r = result.clone();
+        r.realize_with(&config).unwrap();
+        let vals = r.as_vec::<f32>().unwrap();
         assert_eq!(vals, vec![11.0, 12.0, 13.0]); // x + 10
     }
 
     fn test_if_false_condition(config) {
-        let mut importer = OnnxImporter::new();
+        let importer = OnnxImporter::new();
         let model = make_if_model(false, &[1.0, 2.0, 3.0]);
-        let outputs = importer.import_model(model).unwrap();
+        let outputs = importer.import_model(model, &[]).unwrap().outputs;
 
         let result = outputs.get("output").unwrap();
-        let vals = result.clone().realize_with(&config).unwrap().to_vec::<f32>().unwrap();
+        let mut r = result.clone();
+        r.realize_with(&config).unwrap();
+        let vals = r.as_vec::<f32>().unwrap();
         assert_eq!(vals, vec![21.0, 22.0, 23.0]); // x + 20
     }
 
     fn test_if_where_path(config) {
-        let mut importer = OnnxImporter::new();
+        let importer = OnnxImporter::new();
         let model = make_if_model(true, &[5.0, 6.0]);
-        let outputs = importer.import_model(model).unwrap();
+        let outputs = importer.import_model(model, &[]).unwrap().outputs;
 
         let result = outputs.get("output").unwrap();
-        let vals = result.clone().realize_with(&config).unwrap().to_vec::<f32>().unwrap();
+        let mut r = result.clone();
+        r.realize_with(&config).unwrap();
+        let vals = r.as_vec::<f32>().unwrap();
         assert_eq!(vals, vec![15.0, 16.0]);
     }
 
@@ -717,11 +1027,13 @@ morok_tensor::codegen_tests! {
 
         model.graph = Some(graph);
 
-        let mut importer = OnnxImporter::new();
-        let outputs = importer.import_model(model).unwrap();
+        let importer = OnnxImporter::new();
+        let outputs = importer.import_model(model, &[]).unwrap().outputs;
 
         let result = outputs.get("output").unwrap();
-        let vals = result.clone().realize_with(&config).unwrap().to_vec::<f32>().unwrap();
+        let mut r = result.clone();
+        r.realize_with(&config).unwrap();
+        let vals = r.as_vec::<f32>().unwrap();
         assert_eq!(vals, vec![100.0, 200.0, 300.0]);
     }
 
@@ -839,11 +1151,13 @@ morok_tensor::codegen_tests! {
 
         model.graph = Some(graph);
 
-        let mut importer = OnnxImporter::new();
-        let outputs = importer.import_model(model).unwrap();
+        let importer = OnnxImporter::new();
+        let outputs = importer.import_model(model, &[]).unwrap().outputs;
 
         let result = outputs.get("output").unwrap();
-        let vals = result.clone().realize_with(&config).unwrap().to_vec::<f32>().unwrap();
+        let mut r = result.clone();
+        r.realize_with(&config).unwrap();
+        let vals = r.as_vec::<f32>().unwrap();
         // outer_cond=true -> outer then_branch executes
         // inner_cond=false -> inner else_branch executes (x + 2)
         // x = [10, 20], so result = [12, 22]
@@ -859,7 +1173,8 @@ morok_tensor::codegen_tests! {
         node.attribute.push(make_attr_float("epsilon", 1e-5));
         let inputs = vec![Some(x), Some(scale)];
         let result = registry.dispatch_multi("RMSNormalization", "", &inputs, &node, i64::MAX).unwrap();
-        let r = result[0].clone().contiguous().realize_with(&config).unwrap();
+        let mut r = result[0].clone().contiguous();
+        r.realize_with(&config).unwrap();
         let dims: Vec<usize> = r.shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
         assert_eq!(dims, [1, 4]);
         let view = r.array_view::<f32>().unwrap();
@@ -878,7 +1193,8 @@ morok_tensor::codegen_tests! {
         node.attribute.push(make_attr_float("epsilon", 1e-5));
         let inputs = vec![Some(x), Some(scale)];
         let result = registry.dispatch_multi("RMSNormalization", "", &inputs, &node, i64::MAX).unwrap();
-        let r = result[0].clone().contiguous().realize_with(&config).unwrap();
+        let mut r = result[0].clone().contiguous();
+        r.realize_with(&config).unwrap();
         let view = r.array_view::<f32>().unwrap();
         let rms_inv = 1.0 / (7.5f32 + 1e-5).sqrt();
         let scales = [2.0, 0.5, 1.0, 3.0];
@@ -901,10 +1217,13 @@ morok_tensor::codegen_tests! {
         assert_eq!(result.len(), 4);
         let dims: Vec<usize> = result[0].shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
         assert_eq!(dims, [1, 3]);
-        let vals = result[0].clone().realize_with(&config).unwrap().to_vec::<f32>().unwrap();
+        let mut r0 = result[0].clone();
+        r0.realize_with(&config).unwrap();
+        let vals = r0.as_vec::<f32>().unwrap();
         let mean: f32 = vals.iter().sum::<f32>() / 3.0;
         assert!(mean.abs() < 1e-4, "layernorm mean should be ~0, got {mean}");
-        let r3 = result[3].clone().contiguous().realize_with(&config).unwrap();
+        let mut r3 = result[3].clone().contiguous();
+        r3.realize_with(&config).unwrap();
         let x_sum = r3.array_view::<f32>().unwrap();
         assert!((x_sum[[0, 0]] - 1.1).abs() < 1e-4);
     }
@@ -926,7 +1245,9 @@ morok_tensor::codegen_tests! {
         assert_eq!(result.len(), 1);
         let dims: Vec<usize> = result[0].shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
         assert_eq!(dims, [1, 1, 2, 4]);
-        let flat = result[0].clone().realize_with(&config).unwrap().to_vec::<f32>().unwrap();
+        let mut r = result[0].clone();
+        r.realize_with(&config).unwrap();
+        let flat = r.as_vec::<f32>().unwrap();
         for (i, val) in flat.iter().enumerate() {
             assert!((val - (i + 1) as f32).abs() < 1e-4, "rotary identity: got {val}, expected {}", i + 1);
         }
@@ -942,7 +1263,8 @@ morok_tensor::codegen_tests! {
         node.attribute.push(make_attr_int("is_causal", 1));
         let inputs = vec![Some(q), Some(k), Some(v)];
         let result = registry.dispatch_multi("Attention", "", &inputs, &node, i64::MAX).unwrap();
-        let r = result[0].clone().contiguous().realize_with(&config).unwrap();
+        let mut r = result[0].clone().contiguous();
+        r.realize_with(&config).unwrap();
         let dims: Vec<usize> = r.shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
         assert_eq!(dims, [1, 1, 3, 4]);
         let view = r.array_view::<f32>().unwrap();
@@ -957,7 +1279,8 @@ morok_tensor::codegen_tests! {
         node.attribute.push(make_attr_int("axis", 1));
         node.attribute.push(make_attr_int("p", 1));
         let result = registry.dispatch("LpNormalization", "", &[x], &node).unwrap();
-        let r = result.contiguous().realize_with(&config).unwrap();
+        let mut r = result.contiguous();
+        r.realize_with(&config).unwrap();
         let view = r.array_view::<f32>().unwrap();
         assert!((view[[0, 0]] - 1.0 / 6.0).abs() < 1e-5);
         assert!((view[[0, 1]] - (-2.0 / 6.0)).abs() < 1e-5);
@@ -971,7 +1294,8 @@ morok_tensor::codegen_tests! {
         node.attribute.push(make_attr_int("axis", 1));
         node.attribute.push(make_attr_int("p", 2));
         let result = registry.dispatch("LpNormalization", "", &[x], &node).unwrap();
-        let r = result.contiguous().realize_with(&config).unwrap();
+        let mut r = result.contiguous();
+        r.realize_with(&config).unwrap();
         let view = r.array_view::<f32>().unwrap();
         assert!((view[[0, 0]] - 0.6).abs() < 1e-5);
         assert!((view[[0, 1]] - 0.8).abs() < 1e-5);
@@ -984,7 +1308,8 @@ morok_tensor::codegen_tests! {
         let result = registry.dispatch("MeanVarianceNormalization", "", &[x], &node).unwrap();
         let shape: Vec<usize> = result.shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
         assert_eq!(shape, vec![1, 2, 1, 1]);
-        let r = result.contiguous().realize_with(&config).unwrap();
+        let mut r = result.contiguous();
+        r.realize_with(&config).unwrap();
         let view = r.array_view::<f32>().unwrap();
         assert!(view[[0, 0, 0, 0]].abs() < 1e-3);
         assert!(view[[0, 1, 0, 0]].abs() < 1e-3);
@@ -998,10 +1323,11 @@ morok_tensor::codegen_tests! {
         node.attribute.push(make_attr_float("alpha", 0.0001));
         node.attribute.push(make_attr_float("beta", 0.75));
         node.attribute.push(make_attr_float("bias", 1.0));
-        let result = registry.dispatch("LRN", "", &[x], &node).unwrap();
+        let mut result = registry.dispatch("LRN", "", &[x], &node).unwrap();
         let shape: Vec<usize> = result.shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
         assert_eq!(shape, vec![1, 3, 1, 1]);
-        let vals = result.realize_with(&config).unwrap().to_vec::<f32>().unwrap();
+        result.realize_with(&config).unwrap();
+        let vals = result.as_vec::<f32>().unwrap();
         for val in &vals {
             assert!(val.is_finite(), "LRN produced non-finite value: {val}");
         }
@@ -1018,7 +1344,9 @@ morok_tensor::codegen_tests! {
         let inputs = vec![Some(log_probs), Some(target)];
         let result = registry.dispatch_multi("NegativeLogLikelihoodLoss", "", &inputs, &node, i64::MAX).unwrap();
         assert_eq!(result.len(), 1);
-        let val = result[0].clone().realize_with(&config).unwrap().to_vec::<f32>().unwrap()[0];
+        let mut r = result[0].clone();
+        r.realize_with(&config).unwrap();
+        let val = r.as_vec::<f32>().unwrap()[0];
         assert!((val - 0.65).abs() < 1e-4, "NLL loss got {val}");
     }
 
@@ -1030,7 +1358,9 @@ morok_tensor::codegen_tests! {
         let inputs = vec![Some(logits), Some(target)];
         let result = registry.dispatch_multi("SoftmaxCrossEntropyLoss", "", &inputs, &node, i64::MAX).unwrap();
         assert_eq!(result.len(), 2);
-        let val = result[0].clone().realize_with(&config).unwrap().to_vec::<f32>().unwrap()[0];
+        let mut r = result[0].clone();
+        r.realize_with(&config).unwrap();
+        let val = r.as_vec::<f32>().unwrap()[0];
         assert!(val > 0.0, "CE loss should be positive, got {val}");
         let lp_shape: Vec<usize> = result[1].shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
         assert_eq!(lp_shape, vec![2, 3]);
@@ -1046,7 +1376,8 @@ morok_tensor::codegen_tests! {
         let result = registry.dispatch_multi("AffineGrid", "", &inputs, &node, i64::MAX).unwrap();
         let shape: Vec<usize> = result[0].shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
         assert_eq!(shape, vec![1, 3, 3, 2]);
-        let r = result[0].clone().contiguous().realize_with(&config).unwrap();
+        let mut r = result[0].clone().contiguous();
+        r.realize_with(&config).unwrap();
         let view = r.array_view::<f32>().unwrap();
         assert!((view[[0, 0, 0, 0]] - (-1.0)).abs() < 1e-4, "x corner got {}", view[[0, 0, 0, 0]]);
         assert!((view[[0, 0, 0, 1]] - (-1.0)).abs() < 1e-4, "y corner got {}", view[[0, 0, 0, 1]]);
@@ -1059,7 +1390,9 @@ morok_tensor::codegen_tests! {
         let inputs = vec![Some(x)];
         let result = registry.dispatch_multi("Dropout", "", &inputs, &node, 13).unwrap();
         assert_eq!(result.len(), 2);
-        assert_eq!(result[0].clone().realize_with(&config).unwrap().to_vec::<f32>().unwrap(), [1.0, 2.0, 3.0]);
+        let mut r = result[0].clone();
+        r.realize_with(&config).unwrap();
+        assert_eq!(r.as_vec::<f32>().unwrap(), [1.0, 2.0, 3.0]);
     }
 
     fn test_optional_has_element_present(config) {
@@ -1068,7 +1401,9 @@ morok_tensor::codegen_tests! {
         let inputs = vec![Some(x)];
         let node = NodeProto::default();
         let result = registry.dispatch_multi("OptionalHasElement", "", &inputs, &node, i64::MAX).unwrap();
-        assert!(result[0].clone().realize_with(&config).unwrap().to_vec::<bool>().unwrap()[0]);
+        let mut r = result[0].clone();
+        r.realize_with(&config).unwrap();
+        assert!(r.as_vec::<bool>().unwrap()[0]);
     }
 
     fn test_optional_has_element_absent(config) {
@@ -1076,7 +1411,9 @@ morok_tensor::codegen_tests! {
         let inputs: Vec<Option<Tensor>> = vec![None];
         let node = NodeProto::default();
         let result = registry.dispatch_multi("OptionalHasElement", "", &inputs, &node, i64::MAX).unwrap();
-        assert!(!result[0].clone().realize_with(&config).unwrap().to_vec::<bool>().unwrap()[0]);
+        let mut r = result[0].clone();
+        r.realize_with(&config).unwrap();
+        assert!(!r.as_vec::<bool>().unwrap()[0]);
     }
 
     fn test_optional_get_element(config) {
@@ -1085,7 +1422,9 @@ morok_tensor::codegen_tests! {
         let inputs = vec![Some(x)];
         let node = NodeProto::default();
         let result = registry.dispatch_multi("OptionalGetElement", "", &inputs, &node, i64::MAX).unwrap();
-        let vals = result[0].clone().realize_with(&config).unwrap().to_vec::<f32>().unwrap();
+        let mut r = result[0].clone();
+        r.realize_with(&config).unwrap();
+        let vals = r.as_vec::<f32>().unwrap();
         assert_eq!(vals, vec![1.0, 2.0, 3.0]);
     }
 }

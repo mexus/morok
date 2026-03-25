@@ -12,7 +12,9 @@ morok_tensor::codegen_tests! {
         let node = NodeProto::default();
 
         let result = registry.dispatch_multi("Slice", "", &inputs, &node, i64::MAX).unwrap();
-        let vals = result[0].clone().realize_with(&config).unwrap().to_vec::<f32>().unwrap();
+        let mut r = result[0].clone();
+        r.realize_with(&config).unwrap();
+        let vals = r.as_vec::<f32>().unwrap();
         assert_eq!(vals, vec![0.0, 2.0, 4.0, 6.0, 8.0]);
     }
 
@@ -27,7 +29,9 @@ morok_tensor::codegen_tests! {
         let node = NodeProto::default();
 
         let result = registry.dispatch_multi("Slice", "", &inputs, &node, i64::MAX).unwrap();
-        let vals = result[0].clone().realize_with(&config).unwrap().to_vec::<f32>().unwrap();
+        let mut r = result[0].clone();
+        r.realize_with(&config).unwrap();
+        let vals = r.as_vec::<f32>().unwrap();
         assert_eq!(vals, vec![0.0, 3.0, 6.0, 9.0]);
     }
 
@@ -42,7 +46,9 @@ morok_tensor::codegen_tests! {
         let node = NodeProto::default();
 
         let result = registry.dispatch_multi("Slice", "", &inputs, &node, i64::MAX).unwrap();
-        let vals = result[0].clone().realize_with(&config).unwrap().to_vec::<f32>().unwrap();
+        let mut r = result[0].clone();
+        r.realize_with(&config).unwrap();
+        let vals = r.as_vec::<f32>().unwrap();
         assert_eq!(vals, vec![5.0, 3.0, 1.0]);
     }
 
@@ -57,7 +63,9 @@ morok_tensor::codegen_tests! {
         let node = NodeProto::default();
 
         let result = registry.dispatch_multi("Slice", "", &inputs, &node, i64::MAX).unwrap();
-        let vals = result[0].clone().realize_with(&config).unwrap().to_vec::<f32>().unwrap();
+        let mut r = result[0].clone();
+        r.realize_with(&config).unwrap();
+        let vals = r.as_vec::<f32>().unwrap();
         assert_eq!(vals, vec![5.0, 4.0, 3.0, 2.0, 1.0, 0.0]);
     }
 
@@ -72,7 +80,9 @@ morok_tensor::codegen_tests! {
         let node = NodeProto::default();
 
         let result = registry.dispatch_multi("Slice", "", &inputs, &node, i64::MAX).unwrap();
-        let vals = result[0].clone().realize_with(&config).unwrap().to_vec::<f32>().unwrap();
+        let mut r = result[0].clone();
+        r.realize_with(&config).unwrap();
+        let vals = r.as_vec::<f32>().unwrap();
         assert_eq!(vals, vec![5.0, 4.0, 3.0, 2.0, 1.0]);
     }
 }

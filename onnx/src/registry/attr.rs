@@ -137,32 +137,37 @@ pub(crate) fn reduce_attrs(
 
 /// Extract a scalar bool from a tensor (for If condition fallback).
 pub(crate) fn tensor_to_bool_scalar(t: &Tensor) -> Result<bool> {
-    let vals = t
-        .cast(DType::Bool)?
-        .to_vec::<bool>()
+    let mut casted =
+        t.cast(DType::Bool).map_err(|e| Error::IrConstruction { details: format!("tensor_to_bool_scalar: {e}") })?;
+    casted.realize().map_err(|e| Error::IrConstruction { details: format!("tensor_to_bool_scalar: {e}") })?;
+    let vals = casted
+        .as_vec::<bool>()
         .map_err(|e| Error::IrConstruction { details: format!("tensor_to_bool_scalar: {e}") })?;
     vals.into_iter().next().ok_or_else(|| Error::IrConstruction { details: "empty bool tensor".into() })
 }
 
 /// Extract a scalar f64 from a tensor (e.g. constant_value for Pad).
 pub(crate) fn tensor_to_f64_scalar(t: &Tensor) -> Result<f64> {
-    let vals = t
-        .cast(DType::Float64)?
-        .to_vec::<f64>()
-        .map_err(|e| Error::IrConstruction { details: format!("tensor_to_f64_scalar: {e}") })?;
+    let mut casted =
+        t.cast(DType::Float64).map_err(|e| Error::IrConstruction { details: format!("tensor_to_f64_scalar: {e}") })?;
+    casted.realize().map_err(|e| Error::IrConstruction { details: format!("tensor_to_f64_scalar: {e}") })?;
+    let vals =
+        casted.as_vec::<f64>().map_err(|e| Error::IrConstruction { details: format!("tensor_to_f64_scalar: {e}") })?;
     vals.into_iter().next().ok_or_else(|| Error::IrConstruction { details: "empty scalar tensor".into() })
 }
 
 /// Extract concrete i64 values from a tensor (shape/indices/pads inputs).
 pub(crate) fn tensor_to_i64_vec(t: &Tensor) -> Result<Vec<i64>> {
-    t.cast(DType::Int64)?
-        .to_vec::<i64>()
-        .map_err(|e| Error::IrConstruction { details: format!("tensor_to_i64_vec: {e}") })
+    let mut casted =
+        t.cast(DType::Int64).map_err(|e| Error::IrConstruction { details: format!("tensor_to_i64_vec: {e}") })?;
+    casted.realize().map_err(|e| Error::IrConstruction { details: format!("tensor_to_i64_vec: {e}") })?;
+    casted.as_vec::<i64>().map_err(|e| Error::IrConstruction { details: format!("tensor_to_i64_vec: {e}") })
 }
 
 /// Extract concrete f64 values from a tensor.
 pub(crate) fn tensor_to_f64_vec(t: &Tensor) -> Result<Vec<f64>> {
-    t.cast(DType::Float64)?
-        .to_vec::<f64>()
-        .map_err(|e| Error::IrConstruction { details: format!("tensor_to_f64_vec: {e}") })
+    let mut casted =
+        t.cast(DType::Float64).map_err(|e| Error::IrConstruction { details: format!("tensor_to_f64_vec: {e}") })?;
+    casted.realize().map_err(|e| Error::IrConstruction { details: format!("tensor_to_f64_vec: {e}") })?;
+    casted.as_vec::<f64>().map_err(|e| Error::IrConstruction { details: format!("tensor_to_f64_vec: {e}") })
 }

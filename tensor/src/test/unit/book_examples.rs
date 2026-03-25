@@ -17,8 +17,9 @@ crate::codegen_tests! {
         let sum = &a + &b;
         let scaled = sum * Tensor::from_slice([0.1f32]);
 
-        let result = scaled.realize_with(&config).unwrap();
-        let data = result.to_vec::<f32>().unwrap();
+        let mut result = scaled;
+        result.realize_with(&config).unwrap();
+        let data = result.as_vec::<f32>().unwrap();
 
         // [1+10, 2+20, 3+30, 4+40] * 0.1 = [1.1, 2.2, 3.3, 4.4]
         assert_close_f32(&data, &[1.1, 2.2, 3.3, 4.4], 1e-6);
@@ -51,8 +52,9 @@ crate::codegen_tests! {
         assert_eq!(transposed.shape().unwrap()[1].as_const(), Some(2));
 
         // Verify transposition is correct: [[1,2,3],[4,5,6]] -> [[1,4],[2,5],[3,6]]
-        let result = transposed.realize_with(&config).unwrap();
-        let vals = result.to_vec::<f32>().unwrap();
+        let mut result = transposed;
+        result.realize_with(&config).unwrap();
+        let vals = result.as_vec::<f32>().unwrap();
         assert_close_f32(&vals, &[1.0, 4.0, 2.0, 5.0, 3.0, 6.0], 1e-6);
     }
 
@@ -64,8 +66,9 @@ crate::codegen_tests! {
         let bias = Tensor::from_ndarray(&array![[100.0f32, 200.0]]);
         let biased = &transposed + &bias;
 
-        let result = biased.realize_with(&config).unwrap();
-        let vals = result.to_vec::<f32>().unwrap();
+        let mut result = biased;
+        result.realize_with(&config).unwrap();
+        let vals = result.as_vec::<f32>().unwrap();
 
         // [[1+100, 4+200], [2+100, 5+200], [3+100, 6+200]]
         assert_close_f32(&vals, &[101.0, 204.0, 102.0, 205.0, 103.0, 206.0], 1e-6);
@@ -101,8 +104,9 @@ crate::codegen_tests! {
         assert_eq!(shape[0].as_const(), Some(4));
         assert_eq!(shape[1].as_const(), Some(2));
 
-        let result = output.realize_with(&config).unwrap();
-        let vals = result.to_vec::<f32>().unwrap();
+        let mut result = output;
+        result.realize_with(&config).unwrap();
+        let vals = result.as_vec::<f32>().unwrap();
 
         // Row 0: [1,2,3] @ [0.1,0.3,0.5] = 0.1+0.6+1.5=2.2, [1,2,3] @ [0.2,0.4,0.6] = 0.2+0.8+1.8=2.8
         // Row 1: [4,5,6] @ [0.1,0.3,0.5] = 0.4+1.5+3.0=4.9, [4,5,6] @ [0.2,0.4,0.6] = 0.8+2.0+3.6=6.4
@@ -144,8 +148,9 @@ crate::codegen_tests! {
         assert_eq!(shape[0].as_const(), Some(1));
         assert_eq!(shape[1].as_const(), Some(2));
 
-        let result = result_tensor.realize_with(&config).unwrap();
-        let vals = result.to_vec::<f32>().unwrap();
+        let mut result = result_tensor;
+        result.realize_with(&config).unwrap();
+        let vals = result.as_vec::<f32>().unwrap();
 
         // [1,2,3,4] @ [0.0,0.4; 0.1,0.5; 0.2,0.6; 0.3,0.7] = [0*1+0.1*2+0.2*3+0.3*4, 0.4*1+0.5*2+0.6*3+0.7*4]
         // = [0+0.2+0.6+1.2, 0.4+1.0+1.8+2.8] = [2.0, 6.0]
@@ -192,8 +197,9 @@ crate::codegen_tests! {
         // Softmax
         let probs = logits.softmax(-1).unwrap();
 
-        let result = probs.realize_with(&config).unwrap();
-        let vals = result.to_vec::<f32>().unwrap();
+        let mut result = probs;
+        result.realize_with(&config).unwrap();
+        let vals = result.as_vec::<f32>().unwrap();
 
         // Probabilities should sum to 1.0
         let sum: f32 = vals.iter().sum();
@@ -211,10 +217,10 @@ crate::codegen_tests! {
 
         // Simple test: [1, 4] with clear argmax
         let input = Tensor::from_ndarray(&array![[0.1f32, 0.9, 0.3, 0.5]]);
-        let prediction = input.argmax(Some(-1)).unwrap();
+        let mut result = input.argmax(Some(-1)).unwrap();
 
-        let result = prediction.realize_with(&config).unwrap();
-        let vals = result.to_vec::<i32>().unwrap();
+        result.realize_with(&config).unwrap();
+        let vals = result.as_vec::<i32>().unwrap();
 
         assert_eq!(vals, &[1], "Argmax should be 1 (0.9 is largest)");
     }
@@ -247,8 +253,9 @@ crate::codegen_tests! {
         assert_eq!(shape.len(), 1);
         assert_eq!(shape[0].as_const(), Some(2));
 
-        let result = output.realize_with(&config).unwrap();
-        let vals = result.to_vec::<f32>().unwrap();
+        let mut result = output;
+        result.realize_with(&config).unwrap();
+        let vals = result.as_vec::<f32>().unwrap();
 
         // Same computation as test_example_4_linear_layer
         assert_close_f32(&vals, &[2.0, 6.0], 1e-4);
@@ -286,8 +293,9 @@ crate::codegen_tests! {
         // Softmax
         let probs = logits.softmax(-1).unwrap();
 
-        let result = probs.realize_with(&config).unwrap();
-        let vals = result.to_vec::<f32>().unwrap();
+        let mut result = probs;
+        result.realize_with(&config).unwrap();
+        let vals = result.as_vec::<f32>().unwrap();
 
         let sum: f32 = vals.iter().sum();
         assert!((sum - 1.0).abs() < 1e-4, "Probabilities should sum to 1.0, got {}", sum);

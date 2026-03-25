@@ -48,7 +48,9 @@ fn test_unbind_kernel() {
     // Should return just the variable
     let op = result.expect("Expected Some result");
     assert!(matches!(op.op(), Op::DefineVar { .. }));
-    assert!(ctx.has_var(&var));
+    assert!(ctx.vars.contains_key("x"));
+    let (_, bound_val) = ctx.vars.get("x").unwrap();
+    assert_eq!(*bound_val, Some(5));
 }
 
 #[test]

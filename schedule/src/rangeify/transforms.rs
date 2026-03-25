@@ -973,19 +973,22 @@ pub fn bufferize_to_store(bufferize_op: &Arc<UOp>, ctx: &mut KernelContext, allo
         // concrete dimensions. This is the proper place to linearize because
         // later passes (pm_linearize_multi_index) only see the 1D buffer shape.
         if sorted_ranges.len() > 1 {
-            // Extract sizes from each RANGE
-            let dims: Vec<i64> = sorted_ranges.iter().filter_map(range_size_as_i64).collect();
+            // Extract sizes from each RANGE using vmax (always concrete).
+            // Matches Tinygrad's BUFFERIZE.shape = tuple([int(r.vmax+1) for r in ranges]).
+            // Symbolic range ends (e.g. BIND(N,4)) have concrete vmax from DefineVar bounds.
+            let dims: Vec<i64> = sorted_ranges
+                .iter()
+                .map(|r| match r.op() {
+                    Op::Range { end, .. } => match end.vmax() {
+                        ConstValue::Int(v) => *v,
+                        ConstValue::UInt(v) => *v as i64,
+                        other => panic!("bufferize_to_store: range vmax is not integer: {:?}", other),
+                    },
+                    _ => 1,
+                })
+                .collect();
 
-            if dims.len() != sorted_ranges.len() {
-                panic!(
-                    "ICE: symbolic ranges in bufferize_to_store \
-                     (resolved {}/{} dims). Symbolic buffer sizes are not supported.",
-                    dims.len(),
-                    sorted_ranges.len()
-                );
-            }
-
-            // All ranges have concrete sizes - linearize
+            // Compute strides from vmax dims — always concrete
             let strides = compute_row_major_strides(&dims);
             let indices: Vec<Arc<UOp>> = sorted_ranges.iter().cloned().collect();
             trace!(

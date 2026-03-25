@@ -327,7 +327,7 @@ impl OpRegistry {
                     .transpose()?
                     .unwrap_or_else(|| Tensor::from_slice([0.0f32]));
                 vec![if shape_i64.contains(&0) {
-                    Tensor::empty(value.uop().dtype())
+                    Tensor::empty_zero(value.uop().dtype())
                 } else {
                     let shape: Vec<isize> = shape_i64.iter().map(|&v| v as isize).collect();
                     let ones = vec![1isize; shape.len()];
@@ -681,7 +681,7 @@ impl OpRegistry {
             }
             "OptionalGetElement" => match inputs.first().and_then(|o| o.as_ref()) {
                 Some(t) => vec![t.clone()],
-                None => vec![Tensor::empty(DType::Float32)],
+                None => vec![Tensor::empty_zero(DType::Float32)],
             },
             "CenterCropPad" => {
                 let t = inp(inputs, 0);

@@ -6,7 +6,8 @@ use std::io::{BufReader, Read};
 use std::path::Path;
 
 use morok_dtype::DType;
-use morok_tensor::Tensor;
+use morok_ir::SInt;
+use morok_tensor::{Tensor, Variable};
 use prost::Message;
 use snafu::ResultExt;
 
@@ -82,6 +83,11 @@ pub struct OnnxGraph {
     pub opsets: Vec<OpSetId>,
     /// Pre-parsed subgraph attributes: (node_index, attr_name) -> SubGraph
     pub(crate) subgraphs: HashMap<(usize, String), SubGraph>,
+    /// Variables auto-extracted from dynamic dimensions (`dim_param`).
+    ///
+    /// Key: dim_param name (e.g., "batch"), Value: Variable with bounds `[1, default_max_dim]`.
+    /// Populated during `prepare()` by scanning input specs for `DimValue::Dynamic` entries.
+    pub variables: HashMap<String, Variable>,
 }
 
 impl OnnxGraph {
@@ -99,59 +105,123 @@ impl OnnxGraph {
     pub fn is_input_optional(&self, name: &str) -> bool {
         self.inputs.get(name).map(|s| s.optional).unwrap_or(false)
     }
+
+    /// Get all dynamic dimension names found in the graph.
+    pub fn dynamic_dims(&self) -> Vec<&str> {
+        self.variables.keys().map(|s| s.as_str()).collect()
+    }
+
+    /// Check if the graph has any dynamic dimensions.
+    pub fn has_dynamic_dims(&self) -> bool {
+        !self.variables.is_empty()
+    }
+}
+
+/// Imported ONNX model — normal Morok types, ready to use.
+///
+/// Contains the lazy computation graph as input/output Tensors and any
+/// dynamic dimension Variables extracted from the ONNX graph.
+///
+/// # Example
+///
+/// ```ignore
+/// let model = OnnxImporter::new().import("model.onnx", &[("batch", 4)])?;
+///
+/// // Inputs are zero-filled tensors matching the model's input shapes
+/// let input_data: Vec<f32> = load_my_data();
+/// model.inputs["x"].copyin(&input_data);
+///
+/// // Outputs are lazy — realize to execute
+/// let result = model.outputs["prob"].realize()?;
+/// ```
+pub struct OnnxModel {
+    /// Model inputs: name → zero-filled Tensor with correct shape/dtype.
+    pub inputs: HashMap<String, Tensor>,
+    /// Model outputs: name → lazy Tensor (realize to execute).
+    pub outputs: HashMap<String, Tensor>,
+    /// Dynamic dimension variables extracted from `dim_param` annotations.
+    /// Empty for static models. Bind to new values for re-execution.
+    pub variables: HashMap<String, Variable>,
 }
 
 /// ONNX model importer.
 ///
-/// Converts ONNX models to Morok Tensors using a two-phase approach:
-/// 1. `prepare()` - Extract graph structure without executing
-/// 2. `trace()` / `trace_with_dims()` - Build lazy computation graph with allocated inputs
+/// Converts ONNX models to Morok Tensors via a single `import()` call that
+/// returns an [`OnnxModel`] with inputs, outputs, and auto-extracted variables.
 pub struct OnnxImporter {
-    /// Operator registry for dispatch
     registry: OpRegistry,
-    /// Directory containing the model file (for external data loading)
     model_dir: Option<std::path::PathBuf>,
+    /// Default max bound for auto-extracted dynamic dimension Variables.
+    ///
+    /// When `prepare()` encounters `dim_param` names in ONNX input shapes,
+    /// it creates `Variable::new(name, 1, default_max_dim)`. Default: 32767.
+    pub default_max_dim: i64,
 }
 
 impl OnnxImporter {
     /// Create a new ONNX importer.
     pub fn new() -> Self {
-        Self { registry: OpRegistry::new(), model_dir: None }
+        Self { registry: OpRegistry::new(), model_dir: None, default_max_dim: i16::MAX as i64 }
     }
 
-    /// Import ONNX model from file path (convenience method for all-initializer models).
-    pub fn import_path<P: AsRef<Path>>(&mut self, path: P) -> Result<HashMap<String, Tensor>> {
+    /// Import an ONNX model from a file path.
+    ///
+    /// Dynamic dimensions are bound via `dim_bindings`; unmentioned dynamic
+    /// dims use their max value for buffer allocation.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let model = OnnxImporter::new().import("model.onnx", &[("batch", 4)])?;
+    /// let result = model.outputs["output"].realize()?;
+    /// ```
+    pub fn import(&mut self, path: impl AsRef<Path>, dim_bindings: &[(&str, i64)]) -> Result<OnnxModel> {
         self.model_dir = path.as_ref().parent().map(|p| p.to_path_buf());
         let file = File::open(path.as_ref()).context(IoSnafu)?;
         let mut reader = BufReader::new(file);
-        self.import_reader(&mut reader)
-    }
-
-    /// Import ONNX model from a reader.
-    pub fn import_reader<R: Read>(&mut self, reader: &mut R) -> Result<HashMap<String, Tensor>> {
         let mut bytes = Vec::new();
         reader.read_to_end(&mut bytes).context(IoSnafu)?;
-        self.import_bytes(&bytes)
+        let model = ModelProto::decode(bytes.as_slice()).context(ProtobufDecodeSnafu)?;
+        self.import_model(model, dim_bindings)
     }
 
-    /// Import from bytes.
-    pub fn import_bytes(&mut self, bytes: &[u8]) -> Result<HashMap<String, Tensor>> {
-        let model = ModelProto::decode(bytes).context(ProtobufDecodeSnafu)?;
-        self.import_model(model)
-    }
-
-    /// Import from parsed ModelProto (convenience for all-initializer models).
-    ///
-    /// For models with runtime inputs, use `prepare()` + `trace()` instead.
-    pub fn import_model(&mut self, model: ModelProto) -> Result<HashMap<String, Tensor>> {
+    /// Import from a parsed `ModelProto`.
+    pub fn import_model(&self, model: ModelProto, dim_bindings: &[(&str, i64)]) -> Result<OnnxModel> {
         let graph = self.prepare(model)?;
-        self.execute_with_initializers(&graph, HashMap::new())
+        let bindings: HashMap<String, i64> = dim_bindings.iter().map(|&(k, v)| (k.to_string(), v)).collect();
+        let inputs = resolve_symbolic_shapes(&graph.inputs, &graph.variables, &bindings)?;
+        let outputs = self.trace_graph(&graph, inputs.clone())?;
+        Ok(OnnxModel { inputs, outputs, variables: graph.variables })
     }
 
-    /// Phase 1: Extract graph structure from ONNX model.
+    /// Import with pre-built input tensors that override auto-resolved empty ones.
     ///
-    /// Returns an `OnnxGraph` that can be executed multiple times with different inputs.
-    pub fn prepare(&self, model: ModelProto) -> Result<OnnxGraph> {
+    /// Used for node conformance tests where inputs carry concrete data
+    /// that ops need at trace time (shape parameters, indices, etc.).
+    pub fn import_model_with_inputs(
+        &self,
+        model: ModelProto,
+        inputs: HashMap<String, Tensor>,
+        dim_bindings: &[(&str, i64)],
+    ) -> Result<OnnxModel> {
+        let graph = self.prepare(model)?;
+        let bindings: HashMap<String, i64> = dim_bindings.iter().map(|&(k, v)| (k.to_string(), v)).collect();
+        let unresolved: HashMap<String, InputSpec> = graph
+            .inputs
+            .iter()
+            .filter(|(name, _)| !inputs.contains_key(*name))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        let resolved = resolve_symbolic_shapes(&unresolved, &graph.variables, &bindings)?;
+        let mut all_inputs = resolved;
+        all_inputs.extend(inputs);
+        let input_map = all_inputs.clone();
+        let outputs = self.trace_graph(&graph, all_inputs)?;
+        Ok(OnnxModel { inputs: input_map, outputs, variables: graph.variables })
+    }
+
+    /// Extract graph structure from ONNX model (internal — used by `import_model`).
+    pub(crate) fn prepare(&self, model: ModelProto) -> Result<OnnxGraph> {
         let proto_graph = model.graph.ok_or_else(|| EmptyModelSnafu.build())?;
 
         // Collect opsets
@@ -203,7 +273,19 @@ impl OnnxImporter {
             }
         }
 
-        Ok(OnnxGraph { inputs, outputs, initializers, nodes, opsets, subgraphs })
+        // Auto-extract Variables from dynamic dimensions (dim_param names)
+        let mut variables: HashMap<String, Variable> = HashMap::new();
+        for spec in inputs.values() {
+            for dim in &spec.shape {
+                if let DimValue::Dynamic(name) = dim {
+                    if !name.is_empty() {
+                        variables.entry(name.clone()).or_insert_with(|| Variable::new(name, 1, self.default_max_dim));
+                    }
+                }
+            }
+        }
+
+        Ok(OnnxGraph { inputs, outputs, initializers, nodes, opsets, subgraphs, variables })
     }
 
     /// Extract InputSpec from ValueInfoProto.
@@ -252,72 +334,8 @@ impl OnnxImporter {
         Ok(Some(InputSpec::new(shape, dtype, false)))
     }
 
-    /// Trace graph — all input shapes must be static (from graph metadata).
-    ///
-    /// Allocates zero-filled input buffers. Weights come from graph initializers.
-    /// Returns (input_tensors, output_tensors). Caller `copyin()`s real data to
-    /// input buffers before executing.
-    pub fn trace(&self, graph: &OnnxGraph) -> Result<(HashMap<String, Tensor>, HashMap<String, Tensor>)> {
-        self.trace_with_dims(graph, &[])
-    }
-
-    /// Trace graph with concrete values for dynamic dimensions.
-    ///
-    /// Dynamic dims are locked to the provided values for the plan's lifetime.
-    /// Static dims are read from the graph. Error if any dynamic dim is unbound.
-    pub fn trace_with_dims(
-        &self,
-        graph: &OnnxGraph,
-        dim_bindings: &[(&str, usize)],
-    ) -> Result<(HashMap<String, Tensor>, HashMap<String, Tensor>)> {
-        let bindings: HashMap<&str, usize> = dim_bindings.iter().copied().collect();
-        let inputs = resolve_input_shapes(&graph.inputs, &bindings)?;
-        let input_map = inputs.clone();
-        let output_map = self.execute_with_initializers(graph, inputs)?;
-        Ok((input_map, output_map))
-    }
-
-    /// Trace graph with external weights.
-    pub fn trace_external(
-        &self,
-        graph: &OnnxGraph,
-        weights: HashMap<String, Tensor>,
-    ) -> Result<(HashMap<String, Tensor>, HashMap<String, Tensor>)> {
-        self.trace_external_with_dims(graph, weights, &[])
-    }
-
-    /// Trace with external weights + dynamic dim bindings.
-    ///
-    /// Inputs already present in `weights` are used as-is; remaining graph
-    /// inputs are auto-resolved from their specs + `dim_bindings`.
-    pub fn trace_external_with_dims(
-        &self,
-        graph: &OnnxGraph,
-        weights: HashMap<String, Tensor>,
-        dim_bindings: &[(&str, usize)],
-    ) -> Result<(HashMap<String, Tensor>, HashMap<String, Tensor>)> {
-        let bindings: HashMap<&str, usize> = dim_bindings.iter().copied().collect();
-        // Only auto-resolve inputs not already provided
-        let unresolved: HashMap<String, InputSpec> = graph
-            .inputs
-            .iter()
-            .filter(|(name, _)| !weights.contains_key(*name))
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
-        let inputs = resolve_input_shapes(&unresolved, &bindings)?;
-        let input_map = inputs.clone();
-        let mut all_inputs = inputs;
-        all_inputs.extend(weights);
-        let output_map = self.execute_with_initializers(graph, all_inputs)?;
-        Ok((input_map, output_map))
-    }
-
-    /// Execute graph with initializers merged into values.
-    fn execute_with_initializers(
-        &self,
-        graph: &OnnxGraph,
-        inputs: HashMap<String, Tensor>,
-    ) -> Result<HashMap<String, Tensor>> {
+    /// Build the lazy UOp graph by walking ONNX nodes with initializers + inputs.
+    fn trace_graph(&self, graph: &OnnxGraph, inputs: HashMap<String, Tensor>) -> Result<HashMap<String, Tensor>> {
         // Merge initializers into values
         let mut values: HashMap<String, Tensor> = graph.initializers.clone();
 
@@ -359,10 +377,7 @@ impl OnnxImporter {
             if tracing::enabled!(tracing::Level::TRACE) {
                 for out_name in &node.output {
                     if let Some(tensor) = values.get_mut(out_name) {
-                        match tensor.clone().realize().and_then(|t| {
-                            *tensor = t.clone();
-                            t.to_vec::<f32>()
-                        }) {
+                        match tensor.realize().and_then(|()| tensor.as_vec::<f32>()) {
                             Ok(data) => {
                                 let first5: Vec<f32> = data.iter().take(5).copied().collect();
                                 let shape = tensor.shape().unwrap_or_default();
@@ -435,7 +450,7 @@ impl OnnxImporter {
         }
 
         // Execute subgraph nodes (subgraphs inherit the parent's opset).
-        // Control-flow ops (If) are intercepted here, matching execute_with_initializers.
+        // Control-flow ops (If) are intercepted here, matching trace_graph.
         for (node_index, node) in subgraph.nodes.iter().enumerate() {
             if node.op_type == "If" {
                 self.process_if_node(node_index, node, &mut values, opset_version, &subgraph.subgraphs)?;
@@ -564,31 +579,48 @@ impl Default for OnnxImporter {
     }
 }
 
-/// Resolve input shapes from graph specs + dim bindings into allocated tensors.
+/// Resolve input shapes using Variables for dynamic dimensions.
 ///
-/// Creates zero-filled tensors with the correct shape and dtype for each input.
-/// Static dimensions are read directly; dynamic dimensions are looked up in `bindings`.
-fn resolve_input_shapes(
+/// Static dims become `SInt::Const`. Dynamic dims are resolved via the
+/// auto-extracted `variables` map: bound variables use their concrete value,
+/// unbound variables use the `Variable` directly (allocates to max).
+fn resolve_symbolic_shapes(
     specs: &HashMap<String, InputSpec>,
-    bindings: &HashMap<&str, usize>,
+    variables: &HashMap<String, Variable>,
+    bindings: &HashMap<String, i64>,
 ) -> Result<HashMap<String, Tensor>> {
     specs
         .iter()
         .filter(|(_, spec)| !spec.optional)
         .map(|(name, spec)| {
-            let shape: Vec<usize> = spec
+            let shape: Vec<SInt> = spec
                 .shape
                 .iter()
                 .map(|d| match d {
-                    DimValue::Static(s) => Ok(*s),
+                    DimValue::Static(s) => Ok(SInt::from(*s)),
+                    DimValue::Dynamic(dim_name) if dim_name.is_empty() => {
+                        // Unnamed dynamic dim — treat as 1 (common for unknown batch)
+                        Ok(SInt::from(1usize))
+                    }
                     DimValue::Dynamic(dim_name) => {
-                        bindings.get(dim_name.as_str()).copied().ok_or_else(|| crate::Error::IrConstruction {
-                            details: format!("unbound dynamic dim '{dim_name}' for input '{name}'"),
-                        })
+                        let var = variables.get(dim_name).ok_or_else(|| crate::Error::IrConstruction {
+                            details: format!("no Variable for dynamic dim '{dim_name}' in input '{name}'"),
+                        })?;
+                        if let Some(&val) = bindings.get(dim_name) {
+                            Ok(var
+                                .bind(val)
+                                .map_err(|e| crate::Error::IrConstruction {
+                                    details: format!("failed to bind '{dim_name}' = {val}: {e}"),
+                                })?
+                                .as_sint())
+                        } else {
+                            // Unbound: use variable directly (allocates to max)
+                            Ok(var.as_sint())
+                        }
                     }
                 })
                 .collect::<Result<_>>()?;
-            let tensor = Tensor::full(&shape, 0u8, spec.dtype.clone())?;
+            let tensor = Tensor::empty_dynamic(&shape, spec.dtype.clone());
             Ok((name.clone(), tensor))
         })
         .collect()

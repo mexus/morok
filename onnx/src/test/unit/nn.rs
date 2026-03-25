@@ -8,8 +8,8 @@ morok_tensor::codegen_tests! {
         let b = Tensor::from_ndarray(&array![[5.0f32, 6.0], [7.0, 8.0]]);
         let node = NodeProto::default();
 
-        let result = registry.dispatch("MatMul", "", &[a, b], &node);
-        let result = result.unwrap().realize_with(&config).unwrap();
+        let mut result = registry.dispatch("MatMul", "", &[a, b], &node).unwrap();
+        result.realize_with(&config).unwrap();
         assert!(result.buffer().is_some());
     }
 
@@ -22,7 +22,8 @@ morok_tensor::codegen_tests! {
         node.attribute.push(make_attr_ints("kernel_shape", &[3, 3]));
 
         let result = registry.dispatch_multi("Conv", "", &inputs, &node, i64::MAX).unwrap();
-        let result0 = result[0].contiguous().realize_with(&config).unwrap();
+        let mut result0 = result[0].contiguous();
+        result0.realize_with(&config).unwrap();
         let dims: Vec<usize> = result0.shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
         assert_eq!(dims, [1, 1, 2, 2]);
         let view = result0.array_view::<f32>().unwrap();
@@ -38,7 +39,8 @@ morok_tensor::codegen_tests! {
         node.attribute.push(make_attr_ints("kernel_shape", &[1, 1]));
 
         let result = registry.dispatch_multi("ConvTranspose", "", &inputs, &node, i64::MAX).unwrap();
-        let result0 = result[0].contiguous().realize_with(&config).unwrap();
+        let mut result0 = result[0].contiguous();
+        result0.realize_with(&config).unwrap();
         let dims: Vec<usize> = result0.shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
         assert_eq!(dims, [1, 1, 2, 2]);
         let view = result0.array_view::<f32>().unwrap();
@@ -55,7 +57,8 @@ morok_tensor::codegen_tests! {
         node.attribute.push(make_attr_ints("strides", &[2, 2]));
 
         let result = registry.dispatch_multi("AveragePool", "", &inputs, &node, i64::MAX).unwrap();
-        let result0 = result[0].contiguous().realize_with(&config).unwrap();
+        let mut result0 = result[0].contiguous();
+        result0.realize_with(&config).unwrap();
         let dims: Vec<usize> = result0.shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
         assert_eq!(dims, [1, 1, 2, 2]);
         let view = result0.array_view::<f32>().unwrap();
@@ -72,7 +75,8 @@ morok_tensor::codegen_tests! {
 
         let result = registry.dispatch_multi("MaxPool", "", &inputs, &node, i64::MAX).unwrap();
         assert_eq!(result.len(), 2);
-        let result0 = result[0].contiguous().realize_with(&config).unwrap();
+        let mut result0 = result[0].contiguous();
+        result0.realize_with(&config).unwrap();
         let dims: Vec<usize> = result0.shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
         assert_eq!(dims, [1, 1, 2, 2]);
         let view = result0.array_view::<f32>().unwrap();
@@ -89,7 +93,8 @@ morok_tensor::codegen_tests! {
 
         let result = registry.dispatch_multi("MaxPool", "", &inputs, &node, i64::MAX).unwrap();
         assert_eq!(result.len(), 2);
-        let result1 = result[1].contiguous().realize_with(&config).unwrap();
+        let mut result1 = result[1].contiguous();
+        result1.realize_with(&config).unwrap();
         let dims: Vec<usize> = result1.shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
         assert_eq!(dims, [1, 1, 2, 2]);
         let view = result1.array_view::<i64>().unwrap();
@@ -103,7 +108,8 @@ morok_tensor::codegen_tests! {
         let node = NodeProto::default();
 
         let result = registry.dispatch_multi("GlobalAveragePool", "", &inputs, &node, i64::MAX).unwrap();
-        let result0 = result[0].contiguous().realize_with(&config).unwrap();
+        let mut result0 = result[0].contiguous();
+        result0.realize_with(&config).unwrap();
         let dims: Vec<usize> = result0.shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
         assert_eq!(dims, [1, 2, 1, 1]);
         let view = result0.array_view::<f32>().unwrap();
@@ -118,7 +124,8 @@ morok_tensor::codegen_tests! {
         let node = NodeProto::default();
 
         let result = registry.dispatch_multi("GlobalMaxPool", "", &inputs, &node, i64::MAX).unwrap();
-        let result0 = result[0].contiguous().realize_with(&config).unwrap();
+        let mut result0 = result[0].contiguous();
+        result0.realize_with(&config).unwrap();
         let dims: Vec<usize> = result0.shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
         assert_eq!(dims, [1, 2, 1, 1]);
         let view = result0.array_view::<f32>().unwrap();
@@ -137,7 +144,8 @@ morok_tensor::codegen_tests! {
 
         let result = registry.dispatch_multi("LayerNormalization", "", &inputs, &node, i64::MAX).unwrap();
         assert_eq!(result.len(), 3);
-        let result0 = result[0].contiguous().realize_with(&config).unwrap();
+        let mut result0 = result[0].contiguous();
+        result0.realize_with(&config).unwrap();
         let dims: Vec<usize> = result0.shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
         assert_eq!(dims, [2, 4]);
         let view = result0.array_view::<f32>().unwrap();

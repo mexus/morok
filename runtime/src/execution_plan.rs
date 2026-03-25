@@ -132,8 +132,8 @@ pub struct ExecutionPlan {
     /// Mapping: AST id → buffer index (for kernel buffer binding).
     ast_to_buffer: HashMap<u64, usize>,
 
-    /// Index of output buffer in `buffers`.
-    output_buffer_idx: usize,
+    /// Indices of output buffers in `buffers` (matches SINK source order).
+    output_buffer_indices: Vec<usize>,
 
     /// Primary device for this plan.
     device: DeviceSpec,
@@ -147,9 +147,24 @@ pub struct ExecutionPlan {
 // ============================================================================
 
 impl ExecutionPlan {
-    /// Get the output buffer after execution.
+    /// Get the first (or only) output buffer after execution.
     pub fn output_buffer(&self) -> &Buffer {
-        &self.buffers[self.output_buffer_idx]
+        &self.buffers[self.output_buffer_indices[0]]
+    }
+
+    /// Get output buffer by position (matches SINK source order for batch).
+    pub fn output_buffer_at(&self, position: usize) -> &Buffer {
+        &self.buffers[self.output_buffer_indices[position]]
+    }
+
+    /// Get all output buffers.
+    pub fn output_buffers(&self) -> Vec<&Buffer> {
+        self.output_buffer_indices.iter().map(|&i| &self.buffers[i]).collect()
+    }
+
+    /// Number of outputs in this plan.
+    pub fn num_outputs(&self) -> usize {
+        self.output_buffer_indices.len()
     }
 
     /// Get a buffer by AST id (for reading intermediate results).
@@ -225,9 +240,42 @@ impl ExecutionPlan {
         Ok(())
     }
 
-    /// Get the output buffer index.
+    /// Re-execute the plan with different variable bindings.
+    ///
+    /// The kernel code is NOT recompiled; only the `vals` passed to each kernel
+    /// are updated. Buffers must be allocated to max variable values (which is
+    /// the default when using `Variable::bind()`).
+    ///
+    /// Use with `BoundVariable::bind()` for typed, bounds-checked rebinding:
+    /// ```ignore
+    /// let batch = model.variables["batch"].bind(new_size)?;
+    /// plan.execute_with_vars(&mut executor, &[(&batch)])?;
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// Panics if a variable name required by a kernel is not in `var_vals`.
+    pub fn execute_with_vars(&mut self, executor: &mut UnifiedExecutor, var_vals: &[(&str, i64)]) -> Result<()> {
+        for kernel in &mut self.kernels {
+            kernel.vals = kernel
+                .kernel
+                .var_names
+                .iter()
+                .map(|name| {
+                    var_vals
+                        .iter()
+                        .find(|(n, _)| *n == name.as_str())
+                        .map(|(_, v)| *v)
+                        .unwrap_or_else(|| panic!("Variable '{name}' not in var_vals"))
+                })
+                .collect();
+        }
+        self.execute(executor)
+    }
+
+    /// Get the first output buffer index.
     pub fn output_buffer_idx(&self) -> usize {
-        self.output_buffer_idx
+        self.output_buffer_indices[0]
     }
 
     /// Get the AST ID to buffer index mapping.
@@ -288,18 +336,19 @@ impl ExecutionPlan {
     where
         F: Fn(u64),
     {
-        let output_buf_id = self.buffers.get(self.output_buffer_idx).map(|b| b.id().0);
+        let output_buf_ids: std::collections::HashSet<u64> = if skip_output {
+            self.output_buffer_indices.iter().filter_map(|&idx| self.buffers.get(idx).map(|b| b.id().0)).collect()
+        } else {
+            std::collections::HashSet::new()
+        };
 
         for (&ast_id, &buf_idx) in &self.ast_to_buffer {
-            // Skip the output buffer if requested
-            if skip_output && Some(self.buffers[buf_idx].id().0) == output_buf_id {
+            if skip_output && output_buf_ids.contains(&self.buffers[buf_idx].id().0) {
                 continue;
             }
-            // Remove buffer from global registry
             remove_fn(ast_id);
         }
 
-        // Also clean up alias IDs (alternate keys for the same buffers)
         for &alias_id in &self.alias_ids {
             remove_fn(alias_id);
         }
@@ -343,7 +392,7 @@ pub struct ExecutionPlanBuilder {
     parallel_groups: Vec<ParallelGroup>,
     buffers: Vec<Buffer>,
     ast_to_buffer: HashMap<u64, usize>,
-    output_buffer_idx: usize,
+    output_buffer_indices: Vec<usize>,
     device: DeviceSpec,
     /// Additional UOp IDs registered as aliases in buffer_registry.
     /// These need to be cleaned up but don't have their own buffer index.
@@ -358,7 +407,7 @@ impl ExecutionPlanBuilder {
             parallel_groups: Vec::new(),
             buffers: Vec::new(),
             ast_to_buffer: HashMap::new(),
-            output_buffer_idx: 0,
+            output_buffer_indices: Vec::new(),
             device,
             alias_ids: Vec::new(),
         }
@@ -383,9 +432,14 @@ impl ExecutionPlanBuilder {
         idx
     }
 
-    /// Set the output buffer index.
+    /// Set single output buffer index (backwards compat).
     pub fn set_output_buffer(&mut self, idx: usize) {
-        self.output_buffer_idx = idx;
+        self.output_buffer_indices = vec![idx];
+    }
+
+    /// Set multiple output buffer indices (batch scheduling).
+    pub fn set_output_buffers(&mut self, indices: Vec<usize>) {
+        self.output_buffer_indices = indices;
     }
 
     /// Add a prepared kernel.
@@ -418,12 +472,17 @@ impl ExecutionPlanBuilder {
             kernel.buffer_ids = kernel.buffer_indices.iter().map(|&idx| self.buffers[idx].id()).collect();
         }
 
+        // Fallback: if no output was set, default to index 0
+        if self.output_buffer_indices.is_empty() && !self.buffers.is_empty() {
+            self.output_buffer_indices = vec![0];
+        }
+
         ExecutionPlan {
             kernels: self.kernels,
             parallel_groups: self.parallel_groups,
             buffers: self.buffers,
             ast_to_buffer: self.ast_to_buffer,
-            output_buffer_idx: self.output_buffer_idx,
+            output_buffer_indices: self.output_buffer_indices,
             device: self.device,
             alias_ids: self.alias_ids,
         }

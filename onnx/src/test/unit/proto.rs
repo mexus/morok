@@ -79,7 +79,7 @@ fn test_tensor_from_proto_f32() {
     let result = tensor_from_proto(&tensor).unwrap();
     let dims: Vec<usize> = result.shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
     assert_eq!(dims, vec![2, 3]);
-    assert_eq!(result.to_vec::<f32>().unwrap(), [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]);
+    assert_eq!(result.as_vec::<f32>().unwrap(), [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]);
 }
 
 #[test]
@@ -87,14 +87,14 @@ fn test_create_tensor_int8() {
     let values: Vec<i8> = vec![-128, 0, 127];
     let data: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
     let t = create_tensor_from_raw(&data, &[3], DType::Int8).unwrap();
-    assert_eq!(t.to_vec::<i8>().unwrap(), [-128i8, 0, 127]);
+    assert_eq!(t.as_vec::<i8>().unwrap(), [-128i8, 0, 127]);
 }
 
 #[test]
 fn test_create_tensor_uint8() {
     let values: Vec<u8> = vec![0, 128, 255];
     let t = create_tensor_from_raw(&values, &[3], DType::UInt8).unwrap();
-    assert_eq!(t.to_vec::<u8>().unwrap(), [0u8, 128, 255]);
+    assert_eq!(t.as_vec::<u8>().unwrap(), [0u8, 128, 255]);
 }
 
 #[test]
@@ -102,7 +102,7 @@ fn test_create_tensor_int16() {
     let values: Vec<i16> = vec![-32768, 0, 32767];
     let data: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
     let t = create_tensor_from_raw(&data, &[3], DType::Int16).unwrap();
-    assert_eq!(t.to_vec::<i16>().unwrap(), [-32768i16, 0, 32767]);
+    assert_eq!(t.as_vec::<i16>().unwrap(), [-32768i16, 0, 32767]);
 }
 
 #[test]
@@ -110,7 +110,7 @@ fn test_create_tensor_uint16() {
     let values: Vec<u16> = vec![0, 32768, 65535];
     let data: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
     let t = create_tensor_from_raw(&data, &[3], DType::UInt16).unwrap();
-    assert_eq!(t.to_vec::<u16>().unwrap(), [0u16, 32768, 65535]);
+    assert_eq!(t.as_vec::<u16>().unwrap(), [0u16, 32768, 65535]);
 }
 
 #[test]
@@ -118,7 +118,7 @@ fn test_create_tensor_uint32() {
     let values: Vec<u32> = vec![0, 1_000_000, u32::MAX];
     let data: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
     let t = create_tensor_from_raw(&data, &[3], DType::UInt32).unwrap();
-    assert_eq!(t.to_vec::<u32>().unwrap(), [0u32, 1_000_000, u32::MAX]);
+    assert_eq!(t.as_vec::<u32>().unwrap(), [0u32, 1_000_000, u32::MAX]);
 }
 
 #[test]
@@ -126,7 +126,7 @@ fn test_create_tensor_uint64() {
     let values: Vec<u64> = vec![0, 1_000_000_000, u64::MAX];
     let data: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
     let t = create_tensor_from_raw(&data, &[3], DType::UInt64).unwrap();
-    assert_eq!(t.to_vec::<u64>().unwrap(), [0u64, 1_000_000_000, u64::MAX]);
+    assert_eq!(t.as_vec::<u64>().unwrap(), [0u64, 1_000_000_000, u64::MAX]);
 }
 
 #[test]
@@ -135,8 +135,9 @@ fn test_create_tensor_float16() {
     let f16_bits: Vec<u16> = vec![0x3C00, 0x4000, 0x3800];
     let data: Vec<u8> = f16_bits.iter().flat_map(|v| v.to_le_bytes()).collect();
     let t = create_tensor_from_raw(&data, &[3], DType::Float16).unwrap();
-    let t_f32 = t.cast(DType::Float32).unwrap();
-    let vals = t_f32.to_vec::<f32>().unwrap();
+    let mut t_f32 = t.cast(DType::Float32).unwrap();
+    t_f32.realize().unwrap();
+    let vals = t_f32.as_vec::<f32>().unwrap();
     assert!((vals[0] - 1.0).abs() < 1e-3);
     assert!((vals[1] - 2.0).abs() < 1e-3);
     assert!((vals[2] - 0.5).abs() < 1e-3);
@@ -148,8 +149,9 @@ fn test_create_tensor_bfloat16() {
     let bf16_bits: Vec<u16> = vec![0x3F80, 0x4000, 0x3F00];
     let data: Vec<u8> = bf16_bits.iter().flat_map(|v| v.to_le_bytes()).collect();
     let t = create_tensor_from_raw(&data, &[3], DType::BFloat16).unwrap();
-    let t_f32 = t.cast(DType::Float32).unwrap();
-    let vals = t_f32.to_vec::<f32>().unwrap();
+    let mut t_f32 = t.cast(DType::Float32).unwrap();
+    t_f32.realize().unwrap();
+    let vals = t_f32.as_vec::<f32>().unwrap();
     assert!((vals[0] - 1.0).abs() < 1e-2);
     assert!((vals[1] - 2.0).abs() < 1e-2);
     assert!((vals[2] - 0.5).abs() < 1e-2);
@@ -215,7 +217,7 @@ fn test_external_data_loading() {
     ];
 
     let result = tensor_from_proto_ext(&tensor, Some(&dir)).unwrap();
-    assert_eq!(result.to_vec::<f32>().unwrap(), [1.0f32, 2.0, 3.0]);
+    assert_eq!(result.as_vec::<f32>().unwrap(), [1.0f32, 2.0, 3.0]);
 
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -246,7 +248,7 @@ fn test_external_data_with_offset() {
     ];
 
     let result = tensor_from_proto_ext(&tensor, Some(&dir)).unwrap();
-    assert_eq!(result.to_vec::<f32>().unwrap(), [42.0f32, 99.0]);
+    assert_eq!(result.as_vec::<f32>().unwrap(), [42.0f32, 99.0]);
 
     std::fs::remove_dir_all(&dir).ok();
 }

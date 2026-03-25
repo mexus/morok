@@ -1204,9 +1204,13 @@ pub fn to_define_global_patterns() -> TypedPatternMatcher<KernelContext> {
             ctx.map_buffer(buf.clone(), replacement.clone());
             Some(replacement)
         },
-        // Remove BIND: extract var and track it
-        Bind { var, value: _ } => |var, ctx| {
-            ctx.add_var(var.clone());
+        // Remove BIND: extract var and track it with its bound value
+        Bind { var, value } => |var, value, ctx| {
+            let bound_val = match value.op() {
+                Op::Const(cv) => cv.0.try_int(),
+                _ => None,
+            };
+            ctx.add_var(var.clone(), bound_val);
             Some(var.clone())
         },
         // Handle AFTER: extract buffer and track dependency
@@ -1259,9 +1263,13 @@ pub fn local_to_define_global_patterns() -> TypedPatternMatcher<LocalAddBufferCo
             }
             Some(replacement)
         },
-        // Remove BIND: extract var and track it (like Tinygrad's unbind_kernel)
-        Bind { var, value: _ } => |var, ctx| {
-            ctx.add_var(var.clone());
+        // Remove BIND: extract var and track it with bound value (like Tinygrad's unbind_kernel)
+        Bind { var, value } => |var, value, ctx| {
+            let bound_val = match value.op() {
+                Op::Const(cv) => cv.0.try_int(),
+                _ => None,
+            };
+            ctx.add_var(var.clone(), bound_val);
             Some(var.clone())
         },
         // Handle AFTER: extract buffer and track dependency (like Tinygrad's handle_after, rangeify.py:395-402)

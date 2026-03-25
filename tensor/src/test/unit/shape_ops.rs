@@ -21,10 +21,11 @@ crate::codegen_tests! {
 
         let step1 = x.try_reshape(&[1, 1, 2, 2, 3, 2]).unwrap();
         let step2 = step1.try_permute(&[0, 3, 5, 1, 2, 4]).unwrap();
-        let result = step2.try_reshape(&[1, 4, 2, 3]).unwrap();
+        let mut result = step2.try_reshape(&[1, 4, 2, 3]).unwrap();
 
         let expected: Vec<f32> = (0..24).map(|i| i as f32).collect();
-        assert_eq!(result.realize_with(&config).unwrap().to_vec::<f32>().unwrap(), expected, "SpaceToDepth reshape+permute+reshape failed");
+        result.realize_with(&config).unwrap();
+        assert_eq!(result.as_vec::<f32>().unwrap(), expected, "SpaceToDepth reshape+permute+reshape failed");
     }
 
     // =========================================================================
@@ -35,8 +36,10 @@ crate::codegen_tests! {
         crate::test::helpers::test_setup();
         let f32_dt = crate::DType::Scalar(morok_dtype::ScalarDType::Float32);
         // Two realized channel-dim buffers
-        let a = Tensor::full(&[1, 4, 3, 3], 1.0f32, f32_dt.clone()).unwrap().realize_with(&config).unwrap();
-        let b = Tensor::full(&[1, 2, 3, 3], 2.0f32, f32_dt.clone()).unwrap().realize_with(&config).unwrap();
+        let mut a = Tensor::full(&[1, 4, 3, 3], 1.0f32, f32_dt.clone()).unwrap();
+        a.realize_with(&config).unwrap();
+        let mut b = Tensor::full(&[1, 2, 3, 3], 2.0f32, f32_dt.clone()).unwrap();
+        b.realize_with(&config).unwrap();
 
         // Concat along channel dim (lazy)
         let cat = Tensor::cat(&[&a, &b], 1).unwrap();
@@ -47,7 +50,9 @@ crate::codegen_tests! {
         // Reduce over spatial dims (like GlobalAveragePool)
         let pooled = relu.mean(vec![2isize, 3]).unwrap();
 
-        let result = pooled.realize_with(&config).unwrap().to_vec::<f32>().unwrap();
+        let mut pooled = pooled;
+        pooled.realize_with(&config).unwrap();
+        let result = pooled.as_vec::<f32>().unwrap();
 
         // a channels are 1.0+0.5=1.5 (relu=1.5), b channels are 2.0+0.5=2.5 (relu=2.5)
         // Mean over 3x3 spatial = same values (all spatial elements identical)
@@ -64,16 +69,19 @@ crate::codegen_tests! {
     fn test_cat_fused_with_reduce_large(config) {
         crate::test::helpers::test_setup();
         let f32_dt = crate::DType::Scalar(morok_dtype::ScalarDType::Float32);
-        let a = Tensor::full(&[1, 32, 7, 7], 1.0f32, f32_dt.clone()).unwrap().realize_with(&config).unwrap();
-        let b = Tensor::full(&[1, 8, 7, 7], 3.0f32, f32_dt.clone()).unwrap().realize_with(&config).unwrap();
+        let mut a = Tensor::full(&[1, 32, 7, 7], 1.0f32, f32_dt.clone()).unwrap();
+        a.realize_with(&config).unwrap();
+        let mut b = Tensor::full(&[1, 8, 7, 7], 3.0f32, f32_dt.clone()).unwrap();
+        b.realize_with(&config).unwrap();
 
         let cat = Tensor::cat(&[&a, &b], 1).unwrap();
         let one = Tensor::full(&[1, 40, 1, 1], 1.0f32, f32_dt).unwrap();
         let added = cat.try_add(&one).unwrap();
         let relu = added.relu().unwrap();
-        let pooled = relu.mean(vec![2isize, 3]).unwrap();
+        let mut pooled = relu.mean(vec![2isize, 3]).unwrap();
 
-        let result = pooled.realize_with(&config).unwrap().to_vec::<f32>().unwrap();
+        pooled.realize_with(&config).unwrap();
+        let result = pooled.as_vec::<f32>().unwrap();
         assert_eq!(result.len(), 40);
         for (i, &val) in result.iter().enumerate() {
             let expected = if i < 32 { 2.0f32 } else { 4.0 };
@@ -721,7 +729,7 @@ fn test_shape_tensor_1d() {
     assert_eq!(get_shape(&shape), vec![1]);
 
     // Verify shape tensor contains [3]
-    assert_eq!(shape.to_vec::<i64>().unwrap(), [3]);
+    assert_eq!(shape.as_vec::<i64>().unwrap(), [3]);
 }
 
 #[test]
@@ -732,7 +740,7 @@ fn test_shape_tensor_2d() {
     assert_eq!(get_shape(&shape), vec![2]);
 
     // Verify shape tensor contains [2, 3]
-    assert_eq!(shape.to_vec::<i64>().unwrap(), [2, 3]);
+    assert_eq!(shape.as_vec::<i64>().unwrap(), [2, 3]);
 }
 
 #[test]
@@ -740,7 +748,7 @@ fn test_shape_tensor_3d() {
     let t = Tensor::from_ndarray(&ndarray::Array3::<f32>::ones((2, 3, 4)));
     let shape = t.shape_tensor().unwrap();
 
-    assert_eq!(shape.to_vec::<i64>().unwrap(), [2, 3, 4]);
+    assert_eq!(shape.as_vec::<i64>().unwrap(), [2, 3, 4]);
 }
 
 #[test]

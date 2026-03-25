@@ -112,8 +112,8 @@ morok_tensor::codegen_tests! {
         let mut node = NodeProto::default();
         node.attribute.push(make_attr_ints("perm", &[1, 0]));
 
-        let result = registry.dispatch("Transpose", "", &[x], &node);
-        let result = result.unwrap().realize_with(&config).unwrap();
+        let mut result = registry.dispatch("Transpose", "", &[x], &node).unwrap();
+        result.realize_with(&config).unwrap();
         assert!(result.buffer().is_some());
     }
 
@@ -122,9 +122,9 @@ morok_tensor::codegen_tests! {
         let x = Tensor::from_ndarray(&array![[1.0f32, 2.0, 3.0], [4.0, 5.0, 6.0]]);
         let node = NodeProto::default(); // axis defaults to 1
 
-        let result = registry.dispatch("Flatten", "", &[x], &node).unwrap();
-        let realized = result.realize_with(&config).unwrap();
-        assert!(realized.buffer().is_some());
+        let mut result = registry.dispatch("Flatten", "", &[x], &node).unwrap();
+        result.realize_with(&config).unwrap();
+        assert!(result.buffer().is_some());
     }
 
     fn test_shape_start_end(config) {
@@ -135,8 +135,9 @@ morok_tensor::codegen_tests! {
         node.attribute.push(make_attr_int("start", 1));
         node.attribute.push(make_attr_int("end", 3));
 
-        let result = registry.dispatch("Shape", "", &[x], &node).unwrap();
-        let vals = result.realize_with(&config).unwrap().to_vec::<i64>().unwrap();
+        let mut result = registry.dispatch("Shape", "", &[x], &node).unwrap();
+        result.realize_with(&config).unwrap();
+        let vals = result.as_vec::<i64>().unwrap();
         assert_eq!(vals, vec![3, 4]);
     }
 
@@ -146,8 +147,9 @@ morok_tensor::codegen_tests! {
         let mut node = NodeProto::default();
         node.attribute.push(make_attr_int("start", -1));
 
-        let result = registry.dispatch("Shape", "", &[x], &node).unwrap();
-        let vals = result.realize_with(&config).unwrap().to_vec::<i64>().unwrap();
+        let mut result = registry.dispatch("Shape", "", &[x], &node).unwrap();
+        result.realize_with(&config).unwrap();
+        let vals = result.as_vec::<i64>().unwrap();
         assert_eq!(vals, vec![4]);
     }
 
@@ -160,7 +162,9 @@ morok_tensor::codegen_tests! {
         node.attribute.push(make_attr_int("end", 1));
 
         let result = registry.dispatch_multi("Shape", "", &inputs, &node, i64::MAX).unwrap();
-        let vals = result[0].clone().realize_with(&config).unwrap().to_vec::<i64>().unwrap();
+        let mut r = result[0].clone();
+        r.realize_with(&config).unwrap();
+        let vals = r.as_vec::<i64>().unwrap();
         assert!(vals.is_empty());
     }
 
@@ -176,7 +180,9 @@ morok_tensor::codegen_tests! {
         assert_eq!(mask_shape.len(), 2);
         assert_eq!(mask_shape[0].as_const().unwrap(), 2);
         assert_eq!(mask_shape[1].as_const().unwrap(), 3);
-        assert!(result[1].clone().realize_with(&config).unwrap().to_vec::<bool>().unwrap().iter().all(|&v| v));
+        let mut r = result[1].clone();
+        r.realize_with(&config).unwrap();
+        assert!(r.as_vec::<bool>().unwrap().iter().all(|&v| v));
     }
 
     fn test_constant_of_shape_empty(config) {
@@ -184,21 +190,23 @@ morok_tensor::codegen_tests! {
         let shape = Tensor::from_slice([0i64]);
         let node = NodeProto::default();
 
-        let result = registry.dispatch("ConstantOfShape", "", &[shape], &node).unwrap();
+        let mut result = registry.dispatch("ConstantOfShape", "", &[shape], &node).unwrap();
         let s = result.shape().unwrap();
         assert_eq!(s.len(), 1);
         assert_eq!(s[0].as_const().unwrap(), 0);
-        assert_eq!(result.realize_with(&config).unwrap().to_vec::<f32>().unwrap().len(), 0);
+        result.realize_with(&config).unwrap();
+        assert_eq!(result.as_vec::<f32>().unwrap().len(), 0);
     }
 
     fn test_eye_like(config) {
         let registry = OpRegistry::new();
         let x = Tensor::from_ndarray(&Array2::<f32>::zeros((3, 3)));
         let node = NodeProto::default();
-        let result = registry.dispatch("EyeLike", "", &[x], &node).unwrap();
+        let mut result = registry.dispatch("EyeLike", "", &[x], &node).unwrap();
         let s = result.shape().unwrap();
         assert_eq!(s.iter().map(|d| d.as_const().unwrap()).collect::<Vec<_>>(), vec![3, 3]);
-        assert_eq!(result.realize_with(&config).unwrap().to_vec::<f32>().unwrap(), vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]);
+        result.realize_with(&config).unwrap();
+        assert_eq!(result.as_vec::<f32>().unwrap(), vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]);
     }
 
     fn test_compress(config) {
@@ -208,6 +216,8 @@ morok_tensor::codegen_tests! {
         let inputs = vec![Some(data), Some(condition)];
         let node = NodeProto::default();
         let result = registry.dispatch_multi("Compress", "", &inputs, &node, i64::MAX).unwrap();
-        assert_eq!(result[0].clone().realize_with(&config).unwrap().to_vec::<f32>().unwrap(), vec![2.0, 3.0]);
+        let mut r = result[0].clone();
+        r.realize_with(&config).unwrap();
+        assert_eq!(r.as_vec::<f32>().unwrap(), vec![2.0, 3.0]);
     }
 }

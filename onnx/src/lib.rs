@@ -5,20 +5,18 @@
 //! # Example
 //!
 //! ```ignore
-//! use morok_onnx::{OnnxImporter, OnnxGraph};
+//! use morok_onnx::OnnxImporter;
 //!
-//! // Trace: build lazy graph with allocated input buffers
-//! let importer = OnnxImporter::new();
-//! let graph = importer.prepare(model)?;
-//! let (inputs, outputs) = importer.trace(&graph)?;
+//! // Import model — returns inputs, outputs, and variables as normal Morok types
+//! let model = OnnxImporter::new().import("model.onnx", &[("batch", 4)])?;
 //!
-//! // Prepare execution plan, copyin data, execute repeatedly
-//! let plan = outputs["output"].prepare()?;
-//! plan.execute(&mut executor)?;
+//! // Outputs are lazy Tensors — realize to execute
+//! let result = model.outputs["output"].realize()?;
 //!
-//! // Or convenience method for all-initializer models
-//! let mut importer = OnnxImporter::new();
-//! let outputs = importer.import_path("model.onnx")?;
+//! // Dynamic dimensions are auto-extracted as Variables
+//! for (name, var) in &model.variables {
+//!     println!("{name}: bounds {:?}", var.bounds());
+//! }
 //! ```
 
 pub mod error;
@@ -27,7 +25,7 @@ pub mod parser;
 pub mod registry;
 
 pub use error::{Error, Result};
-pub use importer::{DimValue, InputSpec, OnnxGraph, OnnxImporter};
+pub use importer::{OnnxImporter, OnnxModel};
 
 #[cfg(test)]
 mod test;

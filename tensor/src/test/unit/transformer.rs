@@ -11,8 +11,8 @@ crate::codegen_tests! {
     fn test_rms_norm_basic(config) {
         // rms_norm(x) = x * rsqrt(mean(x^2) + eps)
         let x = Tensor::from_ndarray(&array![[1.0f32, 2.0, 3.0, 4.0]]);
-        let result = x.rms_norm(-1, 1e-5).unwrap();
-        let result = result.realize_with(&config).unwrap();
+        let mut result = x.rms_norm(-1, 1e-5).unwrap();
+        result.realize_with(&config).unwrap();
         let view = result.array_view::<f32>().unwrap();
         assert_eq!(view.shape(), &[1, 4]);
 
@@ -27,8 +27,8 @@ crate::codegen_tests! {
     fn test_rms_norm_axis(config) {
         // (2, 3), normalize over last axis
         let x = Tensor::from_ndarray(&array![[1.0f32, 2.0, 3.0], [4.0, 5.0, 6.0]]);
-        let result = x.rms_norm(-1, 1e-5).unwrap();
-        let result = result.realize_with(&config).unwrap();
+        let mut result = x.rms_norm(-1, 1e-5).unwrap();
+        result.realize_with(&config).unwrap();
         let view = result.array_view::<f32>().unwrap();
         assert_eq!(view.shape(), &[2, 3]);
 
@@ -52,8 +52,8 @@ crate::codegen_tests! {
         let weight = Tensor::from_ndarray(&Array2::from_shape_vec((3, 4), weight_data).unwrap());
         // Indices: [2, 0] -> should return rows 2 and 0
         let indices = Tensor::from_slice([2i32, 0]);
-        let result = weight.embedding(&indices).unwrap();
-        let result = result.realize_with(&config).unwrap();
+        let mut result = weight.embedding(&indices).unwrap();
+        result.realize_with(&config).unwrap();
         let view = result.array_view::<f32>().unwrap();
         assert_eq!(view.shape(), &[2, 4]);
         // Row 0 = weight[2] = [8, 9, 10, 11]
@@ -69,8 +69,8 @@ crate::codegen_tests! {
         let weight = Tensor::from_ndarray(&array![[0.0f32, 1.0], [2.0, 3.0], [4.0, 5.0], [6.0, 7.0]]);
         // Indices: [2, 3] (batch=2, seq=3)
         let indices = Tensor::from_ndarray(&array![[0i32, 1, 2], [3, 2, 1]]);
-        let result = weight.embedding(&indices).unwrap();
-        let result = result.realize_with(&config).unwrap();
+        let mut result = weight.embedding(&indices).unwrap();
+        result.realize_with(&config).unwrap();
         let view = result.array_view::<f32>().unwrap();
         assert_eq!(view.shape(), &[2, 3, 2]);
         // [0,0] = weight[0] = [0, 1]
@@ -93,8 +93,8 @@ crate::codegen_tests! {
         let k = q.clone();
         let v = Tensor::from_ndarray(&array![[[[1.0f32, 2.0], [3.0, 4.0]]]]);
 
-        let result = q.scaled_dot_product_attention().key(&k).value(&v).call().unwrap();
-        let result = result.realize_with(&config).unwrap();
+        let mut result = q.scaled_dot_product_attention().key(&k).value(&v).call().unwrap();
+        result.realize_with(&config).unwrap();
         let view = result.array_view::<f32>().unwrap();
         assert_eq!(view.shape(), &[1, 1, 2, 2]);
         // With identity-like Q=K, attention should weight both rows
@@ -106,8 +106,8 @@ crate::codegen_tests! {
         let k = q.clone();
         let v = Tensor::from_ndarray(&array![[[[1.0f32, 0.0], [0.0, 1.0], [0.0, 0.0]]]]);
 
-        let result = q.scaled_dot_product_attention().key(&k).value(&v).is_causal(true).call().unwrap();
-        let result = result.realize_with(&config).unwrap();
+        let mut result = q.scaled_dot_product_attention().key(&k).value(&v).is_causal(true).call().unwrap();
+        result.realize_with(&config).unwrap();
         let view = result.array_view::<f32>().unwrap();
         assert_eq!(view.shape(), &[1, 1, 3, 2]);
         // Position 0 can only attend to position 0 -> output[0] = V[0] = [1, 0]
@@ -122,10 +122,10 @@ crate::codegen_tests! {
         let v = Tensor::from_ndarray(&array![[[[1.0f32, 0.0], [0.0, 1.0]]]]);
 
         // With softcap, large scores get capped via tanh
-        let result = q.scaled_dot_product_attention().key(&k).value(&v).softcap(1.0).call().unwrap();
-        let result = result.realize_with(&config).unwrap();
+        let mut result = q.scaled_dot_product_attention().key(&k).value(&v).softcap(1.0).call().unwrap();
+        result.realize_with(&config).unwrap();
         // Should still produce valid output (no NaN/Inf)
-        for val in result.to_vec::<f32>().unwrap() {
+        for val in result.as_vec::<f32>().unwrap() {
             assert!(val.is_finite(), "softcap produced non-finite value: {val}");
         }
     }
@@ -141,8 +141,8 @@ crate::codegen_tests! {
         let cos = Tensor::from_ndarray(&array![[[1.0f32, 0.0]]]);
         let sin = Tensor::from_ndarray(&array![[[0.0f32, 0.0]]]);
 
-        let result = x.apply_rotary_emb(&cos, &sin, false).unwrap();
-        let result = result.realize_with(&config).unwrap();
+        let mut result = x.apply_rotary_emb(&cos, &sin, false).unwrap();
+        result.realize_with(&config).unwrap();
         let view = result.array_view::<f32>().unwrap();
         assert_eq!(view.shape(), &[1, 1, 4]);
         // With cos=[1,0], sin=[0,0]:
@@ -166,8 +166,8 @@ crate::codegen_tests! {
         let cos = Tensor::from_ndarray(&array![[[1.0f32, 1.0]]]);
         let sin = Tensor::from_ndarray(&array![[[0.0f32, 0.0]]]);
 
-        let result = x.apply_rotary_emb(&cos, &sin, true).unwrap();
-        let result = result.realize_with(&config).unwrap();
+        let mut result = x.apply_rotary_emb(&cos, &sin, true).unwrap();
+        result.realize_with(&config).unwrap();
         let view = result.array_view::<f32>().unwrap();
         assert_eq!(view.shape(), &[1, 1, 4]);
         // Interleaved: x1 = [1, 3] (even), x2 = [2, 4] (odd)
@@ -186,8 +186,8 @@ crate::codegen_tests! {
         let cos = Tensor::from_ndarray(&array![[[0.0f32, 0.0]]]);
         let sin = Tensor::from_ndarray(&array![[[1.0f32, 1.0]]]);
 
-        let result = x.apply_rotary_emb(&cos, &sin, false).unwrap();
-        let result = result.realize_with(&config).unwrap();
+        let mut result = x.apply_rotary_emb(&cos, &sin, false).unwrap();
+        result.realize_with(&config).unwrap();
         let view = result.array_view::<f32>().unwrap();
         // x1 = [1, 0], x2 = [0, 1]
         // real = x1*cos - x2*sin = [0-0, 0-1] = [0, -1]

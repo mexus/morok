@@ -96,8 +96,9 @@ impl From<OptimizerConfig> for PrepareConfig {
 /// ```ignore
 /// codegen_tests! {
 ///     fn test_add(config) {
-///         let a = Tensor::from_slice([1.0f32, 2.0, 3.0]);
-///         let result: Vec<f32> = a.realize_with(&config).unwrap().to_vec().unwrap();
+///         let mut a = Tensor::from_slice([1.0f32, 2.0, 3.0]);
+///         a.realize_with(&config).unwrap();
+///         let result: Vec<f32> = a.as_vec().unwrap();
 ///     }
 /// }
 /// // Generates: test_add::clang, test_add::llvm
@@ -108,7 +109,8 @@ impl From<OptimizerConfig> for PrepareConfig {
 /// codegen_tests! {
 ///     #[test_case(128, 0.5; "128x128")]
 ///     fn test_matmul(config, size: usize, tol: f32) {
-///         let result = run_matmul(size).realize_with(&config).unwrap();
+///         let mut result = run_matmul(size);
+///         result.realize_with(&config).unwrap();
 ///         assert_close(&result, tol);
 ///     }
 /// }

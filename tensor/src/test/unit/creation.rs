@@ -11,7 +11,9 @@ crate::codegen_tests! {
         assert_eq!(shape.len(), 2);
         assert_eq!(shape[0].as_const().unwrap(), 2);
         assert_eq!(shape[1].as_const().unwrap(), 3);
-        assert_eq!(t.realize_with(&config).unwrap().to_vec::<f32>().unwrap(), [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let mut t = t;
+        t.realize_with(&config).unwrap();
+        assert_eq!(t.as_vec::<f32>().unwrap(), [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]);
     }
 
     fn test_from_raw_bytes_f16(config) {
@@ -20,8 +22,9 @@ crate::codegen_tests! {
         let t = Tensor::from_raw_bytes(&bytes, &[2], DType::Float16).unwrap();
         assert_eq!(t.uop().dtype(), DType::Float16);
 
-        let t_f32 = t.cast(DType::Float32).unwrap();
-        let vals = t_f32.realize_with(&config).unwrap().to_vec::<f32>().unwrap();
+        let mut t_f32 = t.cast(DType::Float32).unwrap();
+        t_f32.realize_with(&config).unwrap();
+        let vals = t_f32.as_vec::<f32>().unwrap();
         assert!((vals[0] - 1.0).abs() < 1e-3);
         assert!((vals[1] - 2.0).abs() < 1e-3);
     }
@@ -32,8 +35,10 @@ crate::codegen_tests! {
         assert_eq!(shape.len(), 2);
         assert_eq!(shape[0].as_const().unwrap(), 3);
         assert_eq!(shape[1].as_const().unwrap(), 3);
+        let mut eye = eye;
+        eye.realize_with(&config).unwrap();
         assert_eq!(
-            eye.realize_with(&config).unwrap().to_vec::<f32>().unwrap(),
+            eye.as_vec::<f32>().unwrap(),
             [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
         );
     }
@@ -44,14 +49,17 @@ crate::codegen_tests! {
         assert_eq!(shape.len(), 2);
         assert_eq!(shape[0].as_const().unwrap(), 2);
         assert_eq!(shape[1].as_const().unwrap(), 4);
+        let mut eye = eye;
+        eye.realize_with(&config).unwrap();
         assert_eq!(
-            eye.realize_with(&config).unwrap().to_vec::<f32>().unwrap(),
+            eye.as_vec::<f32>().unwrap(),
             [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0]
         );
     }
 
     fn test_eye_single(config) {
-        let eye = Tensor::eye(1, 1, DType::Float32).unwrap().realize_with(&config).unwrap();
+        let mut eye = Tensor::eye(1, 1, DType::Float32).unwrap();
+        eye.realize_with(&config).unwrap();
         let view = eye.array_view::<f32>().unwrap();
         assert_eq!(view[[0, 0]], 1.0);
     }

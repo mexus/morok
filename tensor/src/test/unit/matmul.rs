@@ -32,11 +32,12 @@ fn run_validated_square_matmul(size: usize, tol: f32) {
     let b = Tensor::from_ndarray(&b_nd);
 
     let config = env_config();
-    let c = a.matmul(&b).unwrap().realize_with(&config).unwrap();
+    let mut c = a.matmul(&b).unwrap();
+    c.realize_with(&config).unwrap();
 
     let expected = a_nd.dot(&b_nd);
 
-    assert_matmul_close(&c.to_vec::<f32>().unwrap(), &expected, tol);
+    assert_matmul_close(&c.as_vec::<f32>().unwrap(), &expected, tol);
 }
 
 /// Helper to run validated non-square matmul test.
@@ -50,7 +51,8 @@ fn run_validated_matmul(m: usize, k: usize, n: usize, tol: f32) {
     let b = Tensor::from_ndarray(&b_nd);
 
     let config = env_config();
-    let c = a.matmul(&b).unwrap().realize_with(&config).unwrap();
+    let mut c = a.matmul(&b).unwrap();
+    c.realize_with(&config).unwrap();
 
     let c_shape = c.shape().unwrap();
     assert_eq!(c_shape[0].as_const().unwrap(), m, "Output shape mismatch");
@@ -58,7 +60,7 @@ fn run_validated_matmul(m: usize, k: usize, n: usize, tol: f32) {
 
     let expected = a_nd.dot(&b_nd);
 
-    assert_matmul_close(&c.to_vec::<f32>().unwrap(), &expected, tol);
+    assert_matmul_close(&c.as_vec::<f32>().unwrap(), &expected, tol);
 }
 
 // =========================================================================
@@ -74,13 +76,14 @@ crate::codegen_tests! {
         // Compute with morok
         let a = Tensor::from_ndarray(&a_nd);
         let b = Tensor::from_ndarray(&b_nd);
-        let c = a.matmul(&b).unwrap().realize_with(&config).unwrap();
+        let mut c = a.matmul(&b).unwrap();
+    c.realize_with(&config).unwrap();
 
         // Compute reference with ndarray
         let expected = a_nd.dot(&b_nd);
 
         // Expected: [[1*5+2*7, 1*6+2*8], [3*5+4*7, 3*6+4*8]] = [[19, 22], [43, 50]]
-        assert_matmul_close(&c.to_vec::<f32>().unwrap(), &expected, 1e-5);
+        assert_matmul_close(&c.as_vec::<f32>().unwrap(), &expected, 1e-5);
     }
 
     fn test_matmul_validated_3x3(config) {
@@ -92,11 +95,12 @@ crate::codegen_tests! {
         let b_nd = Array2::from_shape_vec((3, 3), b_data).unwrap();
         let a = Tensor::from_ndarray(&a_nd);
         let b = Tensor::from_ndarray(&b_nd);
-        let c = a.matmul(&b).unwrap().realize_with(&config).unwrap();
+        let mut c = a.matmul(&b).unwrap();
+    c.realize_with(&config).unwrap();
 
         let expected = a_nd.dot(&b_nd);
 
-        assert_matmul_close(&c.to_vec::<f32>().unwrap(), &expected, 1e-4);
+        assert_matmul_close(&c.as_vec::<f32>().unwrap(), &expected, 1e-4);
     }
 
     fn test_matmul_validated_2x3_3x4(config) {
@@ -108,11 +112,12 @@ crate::codegen_tests! {
         let b_nd = Array2::from_shape_vec((3, 4), b_data).unwrap();
         let a = Tensor::from_ndarray(&a_nd);
         let b = Tensor::from_ndarray(&b_nd);
-        let c = a.matmul(&b).unwrap().realize_with(&config).unwrap();
+        let mut c = a.matmul(&b).unwrap();
+    c.realize_with(&config).unwrap();
 
         let expected = a_nd.dot(&b_nd);
 
-        assert_matmul_close(&c.to_vec::<f32>().unwrap(), &expected, 1e-4);
+        assert_matmul_close(&c.as_vec::<f32>().unwrap(), &expected, 1e-4);
     }
 
     fn test_matmul_validated_tall_wide(config) {
@@ -124,11 +129,12 @@ crate::codegen_tests! {
         let b_nd = Array2::from_shape_vec((2, 5), b_data).unwrap();
         let a = Tensor::from_ndarray(&a_nd);
         let b = Tensor::from_ndarray(&b_nd);
-        let c = a.matmul(&b).unwrap().realize_with(&config).unwrap();
+        let mut c = a.matmul(&b).unwrap();
+    c.realize_with(&config).unwrap();
 
         let expected = a_nd.dot(&b_nd);
 
-        assert_matmul_close(&c.to_vec::<f32>().unwrap(), &expected, 1e-5);
+        assert_matmul_close(&c.as_vec::<f32>().unwrap(), &expected, 1e-5);
     }
 
     fn test_matmul_validated_16x16(config) {
@@ -141,11 +147,12 @@ crate::codegen_tests! {
         let b_nd = Array2::from_shape_vec((SIZE, SIZE), b_data).unwrap();
         let a = Tensor::from_ndarray(&a_nd);
         let b = Tensor::from_ndarray(&b_nd);
-        let c = a.matmul(&b).unwrap().realize_with(&config).unwrap();
+        let mut c = a.matmul(&b).unwrap();
+    c.realize_with(&config).unwrap();
 
         let expected = a_nd.dot(&b_nd);
 
-        assert_matmul_close(&c.to_vec::<f32>().unwrap(), &expected, 1e-3);
+        assert_matmul_close(&c.as_vec::<f32>().unwrap(), &expected, 1e-3);
     }
 
     fn test_matmul_validated_32x32(config) {
@@ -158,11 +165,12 @@ crate::codegen_tests! {
         let b_nd = Array2::from_shape_vec((SIZE, SIZE), b_data).unwrap();
         let a = Tensor::from_ndarray(&a_nd);
         let b = Tensor::from_ndarray(&b_nd);
-        let c = a.matmul(&b).unwrap().realize_with(&config).unwrap();
+        let mut c = a.matmul(&b).unwrap();
+    c.realize_with(&config).unwrap();
 
         let expected = a_nd.dot(&b_nd);
 
-        assert_matmul_close(&c.to_vec::<f32>().unwrap(), &expected, 1e-2);
+        assert_matmul_close(&c.as_vec::<f32>().unwrap(), &expected, 1e-2);
     }
 
     fn test_dot_product_validated(config) {
@@ -172,13 +180,14 @@ crate::codegen_tests! {
 
         let a = Tensor::from_slice(a_data);
         let b = Tensor::from_slice(b_data);
-        let c = a.dot(&b).unwrap().realize_with(&config).unwrap();
+        let mut c = a.dot(&b).unwrap();
+        c.realize_with(&config).unwrap();
 
         // Expected: 1*2 + 2*3 + 3*4 + 4*5 + 5*6 = 2 + 6 + 12 + 20 + 30 = 70
         let expected: f32 = a_data.iter().zip(b_data.iter()).map(|(a, b)| a * b).sum();
 
         assert_eq!(c.shape().unwrap().len(), 0, "Dot product should be scalar");
-        let result = c.to_vec::<f32>().unwrap();
+        let result = c.as_vec::<f32>().unwrap();
         assert!((result[0] - expected).abs() < 1e-5, "Expected {}, got {}", expected, result[0]);
     }
 
@@ -190,14 +199,15 @@ crate::codegen_tests! {
         let v = Tensor::from_slice(v_data);
         let m_nd = Array2::from_shape_vec((4, 3), m_data).unwrap();
         let m = Tensor::from_ndarray(&m_nd);
-        let c = v.dot(&m).unwrap().realize_with(&config).unwrap();
+        let mut c = v.dot(&m).unwrap();
+        c.realize_with(&config).unwrap();
 
         // ndarray: need to treat vector as [1, 4] @ [4, 3] -> [1, 3], then squeeze
         let v_nd = ndarray::Array1::from_vec(v_data.to_vec());
         let expected = v_nd.dot(&m_nd);
 
         assert_eq!(c.shape().unwrap()[0].as_const().unwrap(), 3);
-        let morok_result = c.to_vec::<f32>().unwrap();
+        let morok_result = c.as_vec::<f32>().unwrap();
         for (i, (a, e)) in morok_result.iter().zip(expected.iter()).enumerate() {
             assert!((a - e).abs() < 1e-5, "Mismatch at index {}: {} != {}", i, a, e);
         }
@@ -211,13 +221,14 @@ crate::codegen_tests! {
         let m_nd = Array2::from_shape_vec((3, 4), m_data).unwrap();
         let m = Tensor::from_ndarray(&m_nd);
         let v = Tensor::from_slice(v_data);
-        let c = m.dot(&v).unwrap().realize_with(&config).unwrap();
+        let mut c = m.dot(&v).unwrap();
+        c.realize_with(&config).unwrap();
 
         let v_nd = ndarray::Array1::from_vec(v_data.to_vec());
         let expected = m_nd.dot(&v_nd);
 
         assert_eq!(c.shape().unwrap()[0].as_const().unwrap(), 3);
-        let morok_result = c.to_vec::<f32>().unwrap();
+        let morok_result = c.as_vec::<f32>().unwrap();
         for (i, (a, e)) in morok_result.iter().zip(expected.iter()).enumerate() {
             assert!((a - e).abs() < 1e-5, "Mismatch at index {}: {} != {}", i, a, e);
         }
@@ -232,8 +243,9 @@ crate::codegen_tests! {
         let i_nd = Array2::from_shape_vec((4, 4), identity_data).unwrap();
         let a = Tensor::from_ndarray(&a_nd);
         let i = Tensor::from_ndarray(&i_nd);
-        let c = a.matmul(&i).unwrap().realize_with(&config).unwrap();
-        let morok_result = c.to_vec::<f32>().unwrap();
+        let mut c = a.matmul(&i).unwrap();
+        c.realize_with(&config).unwrap();
+        let morok_result = c.as_vec::<f32>().unwrap();
 
         // Result should equal original A
         for (i, (actual, expected)) in morok_result.iter().zip(a_data.iter()).enumerate() {
@@ -249,11 +261,12 @@ crate::codegen_tests! {
         let a = Tensor::from_ndarray(&a_nd);
         let b = Tensor::from_ndarray(&b_nd).try_transpose(0, 1).unwrap();
         let b = b.try_transpose(0, 1).unwrap(); // Back to [3, 2] but contiguous
-        let c = a.matmul(&b).unwrap().realize_with(&config).unwrap();
+        let mut c = a.matmul(&b).unwrap();
+    c.realize_with(&config).unwrap();
 
         let expected = a_nd.dot(&b_nd);
 
-        assert_matmul_close(&c.to_vec::<f32>().unwrap(), &expected, 1e-5);
+        assert_matmul_close(&c.as_vec::<f32>().unwrap(), &expected, 1e-5);
     }
 }
 
@@ -558,7 +571,7 @@ fn test_vectorize_normalize_minimal() {
     // Test 64x64 matmul with vectorization enabled
     let a = Tensor::from_ndarray(&Array2::<f32>::ones((64, 64)));
     let b = Tensor::from_ndarray(&Array2::<f32>::ones((64, 64)));
-    let c = a.matmul(&b).unwrap();
+    let mut c = a.matmul(&b).unwrap();
 
     // Explicit config to avoid test pollution from shared global state
     let config = prep_config(OptimizerConfig::builder().strategy(OptStrategy::Heuristic).build());
@@ -574,13 +587,13 @@ fn test_matmul_512x512_vectorized() {
     const SIZE: usize = 512;
     let a = Tensor::from_ndarray(&Array2::<f32>::ones((SIZE, SIZE)));
     let b = Tensor::from_ndarray(&Array2::<f32>::ones((SIZE, SIZE)));
-    let c = a.matmul(&b).unwrap();
+    let mut c = a.matmul(&b).unwrap();
 
     // Use from_env() to respect MOROK_OUTPUT_UPCAST and other env vars
     // Note: Beam search has a pre-existing bug with horizontal reduction, using Heuristic
     let config = env_config();
-    let c = c.realize_with(&config).unwrap();
-    let result = c.to_vec::<f32>().unwrap();
+    c.realize_with(&config).unwrap();
+    let result = c.as_vec::<f32>().unwrap();
 
     // Each element should be 512 (sum of 512 ones)
     assert_eq!(result.len(), SIZE * SIZE);
@@ -593,11 +606,11 @@ fn test_matmul_64x64_vectorized() {
     const SIZE: usize = 64;
     let a = Tensor::from_ndarray(&Array2::<f32>::ones((SIZE, SIZE)));
     let b = Tensor::from_ndarray(&Array2::<f32>::ones((SIZE, SIZE)));
-    let c = a.matmul(&b).unwrap();
+    let mut c = a.matmul(&b).unwrap();
 
     let config = env_config();
-    let c = c.realize_with(&config).unwrap();
-    let result = c.to_vec::<f32>().unwrap();
+    c.realize_with(&config).unwrap();
+    let result = c.as_vec::<f32>().unwrap();
 
     // Each element should be 64 (sum of 64 ones)
     assert_eq!(result.len(), SIZE * SIZE);
@@ -639,12 +652,13 @@ fn test_matmul_validated_64x64() {
     let b = Tensor::from_ndarray(&b_nd);
 
     let config = env_config();
-    let c = a.matmul(&b).unwrap().realize_with(&config).unwrap();
+    let mut c = a.matmul(&b).unwrap();
+    c.realize_with(&config).unwrap();
 
     let expected = a_nd.dot(&b_nd);
 
     // Larger tolerance for accumulated floating point error
-    assert_matmul_close(&c.to_vec::<f32>().unwrap(), &expected, 1e-1);
+    assert_matmul_close(&c.as_vec::<f32>().unwrap(), &expected, 1e-1);
 }
 
 // ========== Large Dimension Validated Tests ==========

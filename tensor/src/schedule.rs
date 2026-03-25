@@ -99,6 +99,26 @@ pub struct ScheduleItem {
 /// Full execution schedule (list of kernels in dependency order).
 pub type Schedule = Vec<ScheduleItem>;
 
+/// Result of schedule creation, including output buffer identification.
+pub struct ScheduleResult {
+    /// The schedule items in dependency order.
+    pub items: Schedule,
+    /// UOp IDs of output buffers, in SINK source order.
+    /// Extracted directly from the SINK's sources via `buf_uop()`.
+    /// For single-tensor realize, contains one ID.
+    pub output_uop_ids: Vec<u64>,
+}
+
+/// Buffers collected for a single kernel.
+struct KernelBuffers {
+    /// Device buffers in codegen order.
+    buffers: Vec<Buffer>,
+    /// UOp IDs for each buffer.
+    uop_ids: Vec<u64>,
+    /// Additional alias IDs for cleanup.
+    alias_ids: Vec<u64>,
+}
+
 /// Sort kernels by dependencies (producers before consumers).
 ///
 /// Uses Kahn's algorithm for topological sort based on buffer dependencies
@@ -226,7 +246,8 @@ pub fn create_schedule(
     transformed: Arc<UOp>,
     kernel_ctx: KernelContext,
     input_buffers: &InputBuffers,
-) -> Result<Schedule> {
+    var_vals: &HashMap<String, i64>,
+) -> Result<ScheduleResult> {
     // Step 1: Find all KERNEL operations
     let mut kernels = Vec::new();
     for node in transformed.toposort() {
@@ -294,7 +315,7 @@ pub fn create_schedule(
 
         // Collect and allocate all buffers for this kernel
         // Buffers are allocated ONCE here, then reused across all iterations
-        let (buffers, buffer_uop_ids, alias_registered_ids) = collect_kernel_buffers(
+        let kb = collect_kernel_buffers(
             sources,
             &kernel_uop,
             &define_to_buffer,
@@ -303,8 +324,10 @@ pub fn create_schedule(
             &mut allocated_buffers,
         )?;
 
-        // Collect bound ranges from kernel AST (BIND nodes with DEFINE_VAR)
-        let bound_ranges = collect_bound_ranges(inner_ast)?;
+        // Collect bound ranges from kernel AST (DEFINE_VAR nodes needing expansion).
+        // Skip DefineVars that have bound values in var_vals — those are user Variables,
+        // not OUTER ranges needing schedule expansion.
+        let bound_ranges = collect_bound_ranges(inner_ast, var_vals)?;
 
         // Build source_buffers mapping for this kernel
         let mut source_buffers = HashMap::new();
@@ -323,21 +346,49 @@ pub fn create_schedule(
 
         debug!(kernel.id = kernel_uop.id, num_sources = sources.len(), "Kernel created");
 
+        // Populate fixedvars with only the user Variables referenced by this kernel's AST.
+        let fixedvars: HashMap<String, i64> = if var_vals.is_empty() {
+            HashMap::new()
+        } else {
+            let nodes = inner_ast.toposort();
+            let ast_var_names: HashSet<&str> = nodes
+                .iter()
+                .filter_map(|n| match n.op() {
+                    Op::DefineVar { name, .. } => Some(name.as_str()),
+                    _ => None,
+                })
+                .collect();
+            var_vals
+                .iter()
+                .filter(|(name, _)| ast_var_names.contains(name.as_str()))
+                .map(|(k, v)| (k.clone(), *v))
+                .collect()
+        };
+
         // Use inner_ast (the kernel's internal AST) for codegen, kernel_uop for buffer allocation
         schedule.push(ScheduleItem {
             kernel: kernel_uop.clone(),
             ast: inner_ast.clone(),
-            buffers,
-            buffer_uop_ids,
-            fixedvars: HashMap::new(),
+            buffers: kb.buffers,
+            buffer_uop_ids: kb.uop_ids,
+            fixedvars,
             bound_ranges,
             source_buffers,
             dependencies,
-            alias_registered_ids,
+            alias_registered_ids: kb.alias_ids,
         });
     }
 
-    Ok(schedule)
+    // Identify output buffers directly from SINK source order.
+    // Each SINK source is AFTER(BUFFER, KERNEL) — buf_uop() extracts the BUFFER.
+    // This handles diamond patterns correctly: a buffer can be both an output
+    // AND consumed by another kernel without being filtered out.
+    let output_uop_ids: Vec<u64> = match transformed.op() {
+        Op::Sink { sources } => sources.iter().map(|src| src.buf_uop().id).collect(),
+        _ => vec![transformed.buf_uop().id],
+    };
+
+    Ok(ScheduleResult { items: schedule, output_uop_ids })
 }
 
 /// Extract device from the first input buffer in kernel sources.
@@ -439,7 +490,7 @@ fn collect_kernel_buffers(
     define_to_buffer_id: &HashMap<u64, u64>,
     input_buffers: &InputBuffers,
     allocated_buffers: &mut HashMap<u64, Buffer>,
-) -> Result<(Vec<Buffer>, Vec<u64>, Vec<u64>)> {
+) -> Result<KernelBuffers> {
     // Get AST for buffer size computation
     let ast = match kernel.op() {
         Op::Kernel { ast, .. } => ast,
@@ -459,7 +510,7 @@ fn collect_kernel_buffers(
 
     let mut buffers = Vec::new();
     let mut uop_ids = Vec::new();
-    let alias_ids = Vec::new(); // No longer populated after removing renumbering logic
+    let alias_ids = Vec::new();
 
     for src in sources {
         match src.op() {
@@ -557,7 +608,6 @@ fn collect_kernel_buffers(
 
                     // Track in allocated_buffers (no registry needed)
                     allocated_buffers.insert(src.id, buffer.clone());
-
                     buffers.push(buffer);
                     uop_ids.push(src.id);
                 }
@@ -607,7 +657,6 @@ fn collect_kernel_buffers(
 
                     // Track in allocated_buffers
                     allocated_buffers.insert(src.id, buffer.clone());
-
                     buffers.push(buffer);
                     uop_ids.push(src.id);
                 }
@@ -623,7 +672,7 @@ fn collect_kernel_buffers(
         }
     }
 
-    Ok((buffers, uop_ids, alias_ids))
+    Ok(KernelBuffers { buffers, uop_ids, alias_ids })
 }
 
 /// Collect bound ranges from kernel AST.
@@ -640,25 +689,27 @@ fn collect_kernel_buffers(
 /// # Returns
 ///
 /// A vector of BoundRange structs, one for each DefineVar found.
-fn collect_bound_ranges(ast: &Arc<UOp>) -> Result<Vec<BoundRange>> {
+fn collect_bound_ranges(ast: &Arc<UOp>, var_vals: &HashMap<String, i64>) -> Result<Vec<BoundRange>> {
     let nodes = ast.toposort();
     let mut bound_ranges = Vec::new();
 
-    // Collect all DefineVar nodes - they need schedule expansion
-    // (Loop ranges no longer create DefineVars - they become inline loops)
+    // Collect DefineVar nodes that need schedule expansion (OUTER ranges).
+    // Skip DefineVars that have a bound value in var_vals — those are user Variables
+    // whose value goes directly to fixedvars, not range expansion.
     for node in &nodes {
         if let Op::DefineVar { name, max_val, .. } = node.op() {
-            // Create a synthetic RANGE UOp for this variable
-            // Range goes from 0 to max_val+1 (exclusive upper bound)
+            // If this variable has a concrete bound value, it's a user Variable.
+            // Its value is already in fixedvars — no schedule expansion needed.
+            if var_vals.contains_key(name) {
+                continue;
+            }
+
+            // OUTER range variable — expand from 0 to max_val
             let range_end = UOp::const_(
                 morok_ir::DType::Scalar(morok_dtype::ScalarDType::Index),
                 morok_ir::ConstValue::Int(*max_val + 1),
             );
-            let range_uop = UOp::range_axis(
-                range_end,
-                morok_ir::AxisId::Renumbered(0), // Dummy axis ID
-                morok_ir::AxisType::Outer,
-            );
+            let range_uop = UOp::range_axis(range_end, morok_ir::AxisId::Renumbered(0), morok_ir::AxisType::Outer);
 
             bound_ranges.push(BoundRange { var_name: name.clone(), range_uop });
         }
