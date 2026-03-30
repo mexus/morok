@@ -310,7 +310,8 @@ pub(crate) fn merge_consumer_ranges(
         let ranges_same = all_ranges_same(&indices);
 
         // Tinygrad: `if all_all_same or (PCONTIG and all_same(local_rngs)):` → merge
-        // With PCONTIG=0: only merge when all_all_same is True
+        // With PCONTIG=0: only merge when all_all_same is True.
+        // TODO: ranges_same should be gated on PCONTIG > 0 for full alignment.
         if all_all_same || ranges_same {
             debug!(dim_idx, ranges_same, all_all_same, "merge_consumer_ranges: merging dimension");
             let merged_idx = Arc::clone(&indices[0]);

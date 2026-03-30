@@ -246,7 +246,7 @@ pub(crate) fn op_skip_layer_norm(inputs: &[Option<Tensor>], attrs: &mut Attrs) -
     if let Some(b) = beta {
         out = out.try_add(b)?;
     }
-    let dummy = Tensor::from_slice([0.0f32]);
+    let dummy = Tensor::const_(0.0f64, DType::Float32);
     Ok(vec![out, dummy.clone(), dummy, x_sum])
 }
 
@@ -282,7 +282,7 @@ pub(crate) fn op_embed_layer_norm(inputs: &[Option<Tensor>], attrs: &mut Attrs) 
     }
 
     let out = sum.layernorm(-1, epsilon)?.try_mul(gamma)?.try_add(beta)?;
-    let dummy = Tensor::from_slice([0.0f32]);
+    let dummy = Tensor::const_(0.0f64, DType::Float32);
     Ok(vec![out, dummy, sum])
 }
 
@@ -528,7 +528,8 @@ pub(crate) fn op_attention_contrib(inputs: &[Option<Tensor>], attrs: &mut Attrs)
     // Reshape [B, H, S, D] -> [B, S, H*D]
     let output = output.try_permute(&[0, 2, 1, 3])?.try_reshape([batch, seq_len as isize, -1])?;
 
-    let present = if has_past || past.is_some() { Tensor::stack(&[&k, &v], 0)? } else { Tensor::from_slice([0.0f32]) };
+    let present =
+        if has_past || past.is_some() { Tensor::stack(&[&k, &v], 0)? } else { Tensor::const_(0.0f64, DType::Float32) };
 
     Ok(vec![output, present])
 }

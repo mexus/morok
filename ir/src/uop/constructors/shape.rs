@@ -79,6 +79,17 @@ impl UOp {
 
         // Validate product equality if source shape is known
         if let Some(src_shape) = self.shape()? {
+            // Identity reshape: skip if shapes already match.
+            // Exclude BUFFER and CONST: the rangeify pipeline requires RESHAPE(BUFFER) to
+            // generate INDEX operations for ASSIGN targets. Bare BUFFER can't be indexed.
+            // Tinygrad avoids this because their BUFFER carries shape natively and their
+            // rangeify handles bare BUFFER → INDEX directly.
+            if src_shape.as_slice() == new_shape.as_slice()
+                && !matches!(self.op(), crate::Op::Buffer { .. } | crate::Op::Const(_))
+            {
+                return Ok(self.clone());
+            }
+
             let src_product = crate::sint_prod(src_shape);
             let dst_product = crate::sint_prod(new_shape);
 
@@ -120,6 +131,11 @@ impl UOp {
                 }
                 // Symbolic dimensions assumed compatible
             }
+
+            // Identity expand: skip if shapes already match
+            if src_shape.as_slice() == new_shape.as_slice() {
+                return Ok(self.clone());
+            }
         }
 
         let shape_uop = shape_to_uop(new_shape);
@@ -135,6 +151,11 @@ impl UOp {
         // Validate permutation if source shape is known
         if let Some(src_shape) = self.shape()? {
             Self::validate_permutation(&axes, src_shape.len())?;
+
+            // Identity permute: skip if axes is [0, 1, 2, ..., n-1]
+            if axes.iter().enumerate().all(|(i, &a)| a == i) {
+                return Ok(self.clone());
+            }
         }
 
         let dtype = self.dtype();
@@ -160,6 +181,11 @@ impl UOp {
         for (begin, end) in padding {
             ensure!(begin.is_const(), SymbolicPaddingUnsupportedSnafu);
             ensure!(end.is_const(), SymbolicPaddingUnsupportedSnafu);
+        }
+
+        // All-zero padding: no-op
+        if padding.iter().all(|(b, e)| b.as_const() == Some(0) && e.as_const() == Some(0)) {
+            return Ok(self.clone());
         }
 
         if let Some(src_shape) = self.shape()? {
@@ -202,6 +228,11 @@ impl UOp {
                     );
                 }
             }
+
+            // Identity shrink: skip if all ranges span the full dimension
+            if ranges.iter().zip(src_shape.iter()).all(|((b, e), d)| b.as_const() == Some(0) && *e == *d) {
+                return Ok(self.clone());
+            }
         }
 
         let (begins, ends) = ranges_to_uops(ranges);
@@ -214,6 +245,11 @@ impl UOp {
     /// Validates:
     /// - Flip specification length matches shape dimensions
     pub fn try_flip(self: &Arc<Self>, axes: Vec<bool>) -> Result<Arc<Self>> {
+        // All-false flip: no-op
+        if !axes.iter().any(|&a| a) {
+            return Ok(self.clone());
+        }
+
         if let Some(src_shape) = self.shape()? {
             Self::validate_flip_axes(&axes, src_shape.len())?;
         }

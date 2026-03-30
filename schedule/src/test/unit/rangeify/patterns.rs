@@ -203,23 +203,25 @@ fn test_dead_axis_removal_single_dead_axis() {
 
     let result = matcher.rewrite(&bufferize, &mut ());
 
-    // Should restructure to EXPAND(RESHAPE(BUFFERIZE_no_ranges)) - Tinygrad behavior
+    // Should restructure to [EXPAND(]RESHAPE(BUFFERIZE_no_ranges)[)] - Tinygrad behavior
     // The BUFFERIZE is KEPT (not removed) so it can be converted to STORE later.
+    // Note: identity EXPAND is eliminated at construction time, so EXPAND may not be present.
     match result {
         RewriteResult::Rewritten(rewritten) => {
-            // Should be EXPAND(RESHAPE(BUFFERIZE_no_ranges))
-            if let Op::Expand { src: reshape_op, .. } = rewritten.op() {
-                if let Op::Reshape { src: bufferize_op, .. } = reshape_op.op() {
-                    assert!(
-                        matches!(bufferize_op.op(), Op::Bufferize { ranges, .. } if ranges.is_empty()),
-                        "Inner should be BUFFERIZE with no ranges, got: {}",
-                        rewritten.tree()
-                    );
-                } else {
-                    panic!("Expected RESHAPE inside EXPAND, got: {}", rewritten.tree());
-                }
+            // Accept EXPAND(RESHAPE(BUFFERIZE)) or RESHAPE(BUFFERIZE) (when expand is identity)
+            let reshape_op = match rewritten.op() {
+                Op::Expand { src, .. } => src,
+                Op::Reshape { .. } => &rewritten,
+                _ => panic!("Expected EXPAND or RESHAPE, got: {}", rewritten.tree()),
+            };
+            if let Op::Reshape { src: bufferize_op, .. } = reshape_op.op() {
+                assert!(
+                    matches!(bufferize_op.op(), Op::Bufferize { ranges, .. } if ranges.is_empty()),
+                    "Inner should be BUFFERIZE with no ranges, got: {}",
+                    rewritten.tree()
+                );
             } else {
-                panic!("Expected EXPAND(RESHAPE(BUFFERIZE_no_ranges)), got: {}", rewritten.tree());
+                panic!("Expected RESHAPE inside result, got: {}", rewritten.tree());
             }
         }
         _ => {

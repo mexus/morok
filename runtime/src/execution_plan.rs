@@ -252,23 +252,21 @@ impl ExecutionPlan {
     /// plan.execute_with_vars(&mut executor, &[(&batch)])?;
     /// ```
     ///
-    /// # Panics
-    ///
-    /// Panics if a variable name required by a kernel is not in `var_vals`.
+    /// Variables not present in `var_vals` keep their existing values from
+    /// `prepare()` (or the previous `execute_with_vars` call). This allows
+    /// internal variables like `thread_id` (injected by CPU codegen for
+    /// parallel dispatch) to remain untouched by user code.
     pub fn execute_with_vars(&mut self, executor: &mut UnifiedExecutor, var_vals: &[(&str, i64)]) -> Result<()> {
         for kernel in &mut self.kernels {
-            kernel.vals = kernel
-                .kernel
-                .var_names
-                .iter()
-                .map(|name| {
-                    var_vals
-                        .iter()
-                        .find(|(n, _)| *n == name.as_str())
-                        .map(|(_, v)| *v)
-                        .unwrap_or_else(|| panic!("Variable '{name}' not in var_vals"))
-                })
-                .collect();
+            for (idx, name) in kernel.kernel.var_names.iter().enumerate() {
+                if let Some((_, v)) = var_vals.iter().find(|(n, _)| *n == name.as_str()) {
+                    kernel.vals[idx] = *v;
+                } else if name != "thread_id" {
+                    // User variable not provided — keep existing value but warn
+                    tracing::warn!(variable = %name, "execute_with_vars: variable not in var_vals, using existing value");
+                }
+                // thread_id: internal codegen variable, patched per-thread at dispatch time
+            }
         }
         self.execute(executor)
     }

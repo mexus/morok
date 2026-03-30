@@ -1556,6 +1556,7 @@ name = "morok-onnx"
 version = "0.1.0-alpha.1"
 dependencies = [
  "bytemuck",
+ "half",
  "morok-dtype",
  "morok-ir",
  "morok-runtime",

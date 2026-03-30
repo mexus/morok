@@ -12,7 +12,7 @@ use morok_tensor::{PrepareConfig, Tensor};
 /// Create a test matrix of given size with sequential values.
 fn create_matrix(rows: usize, cols: usize) -> Tensor {
     let data: Vec<f32> = (0..rows * cols).map(|i| i as f32 * 0.01).collect();
-    Tensor::from_slice(&data).try_reshape(&[rows as isize, cols as isize]).expect("reshape should succeed")
+    Tensor::from_slice(&data).try_reshape([rows as isize, cols as isize]).expect("reshape should succeed")
 }
 
 /// Calculate FLOPs for matrix multiplication.

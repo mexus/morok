@@ -183,9 +183,15 @@ pub fn propagate_invalid() -> &'static TypedPatternMatcher {
     crate::cached_patterns! {
         // Canonicalize: WHERE(cond, INVALID, x) → WHERE(NOT(cond), x, INVALID)
         // INVALID must be in the false branch for downstream patterns to match.
-        Where(cond, inv, x) if matches!(inv.op(), Op::Invalid) ~> {
+        //
+        // This form arises indirectly: when an inner WHERE(valid, rng, INVALID) collapses
+        // to bare INVALID (condition proven always-false by range analysis), the graph rewrite
+        // engine rebuilds the parent WHERE via with_sources, placing bare INVALID in the true branch.
+        // Tinygrad avoids this because their pattern ordering resolves it during reconstruction;
+        // Morok needs explicit canonicalization.
+        Where(cond, inv, x) if matches!(inv.op(), Op::Invalid) => {
             let invalid = if inv.dtype() == x.dtype() { inv.clone() } else { UOp::new(Op::Invalid, x.dtype()) };
-            UOp::try_where(cond.not(), x.clone(), invalid).expect("failes to create WHERE")
+            UOp::try_where(cond.not(), x.clone(), invalid).ok()
         },
 
         // Merge nested WHERE-Invalid: WHERE(c1, WHERE(c2, x, Inv), Inv) → WHERE(AND(c1, c2), x, Inv)

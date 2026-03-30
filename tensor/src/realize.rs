@@ -541,6 +541,7 @@ impl Tensor {
         let rangeify_result = morok_schedule::rangeify_with_map(sink, None).context(RangeifySnafu)?;
         let (kernelized, kernel_ctx) = morok_schedule::run_kernel_split_pipeline(rangeify_result.sink);
         let schedule_result = crate::schedule::create_schedule(kernelized, kernel_ctx, &all_input_buffers, &var_vals)?;
+
         let plan = prepare_execution_plan(&schedule_result, config)?;
 
         // Wire each output tensor to its plan buffer.
@@ -917,6 +918,10 @@ fn prepare_execution_plan(
     // Step 2: Compile all kernels and create PreparedKernel structures
     let mut prepared_kernels: Vec<PreparedKernel> = Vec::new();
 
+    // Pre-compile: optimize + compile each UNIQUE ast once, cache by pre-optimization ast id.
+    // Expanded schedule items sharing the same ast get the same compiled kernel.
+    let mut compiled_cache: HashMap<u64, Arc<morok_runtime::kernel_cache::CachedKernel>> = HashMap::new();
+
     for item in &expanded_schedule {
         // Skip COPY operations for now (handle separately in execution)
         if matches!(item.ast.op(), Op::Copy { .. }) {
@@ -924,57 +929,62 @@ fn prepare_execution_plan(
             continue;
         }
 
-        // Step 1: Get device-aware optimizer renderer
-        let optimizer_renderer = get_optimizer_renderer(&device);
+        // Cache by pre-optimization AST id — expanded items sharing the same AST
+        // (from OUTER range expansion) compile once, not N times.
+        let pre_opt_id = item.ast.id;
 
-        // Step 2: Optimize OUTSIDE cache (enables beam search)
-        let optimized_ast = if let morok_schedule::OptStrategy::Beam { .. } = config.optimizer.strategy {
-            // Beam search: compile-and-time multiple candidates
-            beam_search_optimize(item.ast.clone(), &optimizer_renderer, &device, &item.buffers, &config.optimizer)?
+        let cached = if let Some(cached) = compiled_cache.get(&pre_opt_id) {
+            cached.clone()
         } else {
-            // Heuristic optimization (default)
-            morok_schedule::optimize_kernel_with_config(item.ast.clone(), &optimizer_renderer, &config.optimizer)
+            // Step 1: Get device-aware optimizer renderer
+            let optimizer_renderer = get_optimizer_renderer(&device);
+
+            // Step 2: Optimize OUTSIDE cache (enables beam search)
+            let optimized_ast = if let morok_schedule::OptStrategy::Beam { .. } = config.optimizer.strategy {
+                // Beam search: compile-and-time multiple candidates
+                beam_search_optimize(item.ast.clone(), &optimizer_renderer, &device, &item.buffers, &config.optimizer)?
+            } else {
+                // Heuristic optimization (default)
+                morok_schedule::optimize_kernel_with_config(item.ast.clone(), &optimizer_renderer, &config.optimizer)
+            };
+
+            // Extract kernel name from metadata (attached by Scheduler, preserved through post-opt)
+            let kernel_name =
+                optimized_ast.metadata::<morok_schedule::optimizer::KernelInfo>().map(|info| info.function_name());
+
+            // Step 3: Apply decomposition
+            let ast_decomposed = match device.renderer.decompositor() {
+                Some(matcher) => {
+                    tracing::debug!("Applying backend decomposition patterns");
+                    let decomposed = morok_ir::decompositions::decompose_with(&optimized_ast, &matcher);
+                    tracing::debug!("Decomposition complete");
+                    decomposed
+                }
+                None => {
+                    tracing::debug!("No decomposition needed (renderer provides no decompositor)");
+                    optimized_ast
+                }
+            };
+
+            // Step 4: Compile (also cached by post-opt AST id for cross-run dedup)
+            let result = morok_runtime::kernel_cache::get_or_compile_kernel(ast_decomposed.id, &device_str, || {
+                let spec =
+                    device.renderer.render(&ast_decomposed, kernel_name.as_deref()).context(RenderKernelSnafu)?;
+                let compiled = device.compiler.compile(&spec).context(CompileKernelSnafu)?;
+                let program = (device.runtime)(&compiled).context(CreateProgramSnafu)?;
+                Ok(morok_runtime::kernel_cache::CachedKernel {
+                    program,
+                    device: device_str.clone(),
+                    code: spec.src.clone(),
+                    entry_point: spec.name.clone(),
+                    var_names: spec.var_names.clone(),
+                    global_size: spec.global_size,
+                    local_size: spec.local_size,
+                })
+            })?;
+            compiled_cache.insert(pre_opt_id, result.clone());
+            result
         };
-
-        // Extract kernel name from metadata (attached by Scheduler, preserved through post-opt)
-        let kernel_name =
-            optimized_ast.metadata::<morok_schedule::optimizer::KernelInfo>().map(|info| info.function_name());
-
-        // Step 3: Apply decomposition
-        let ast_decomposed = match device.renderer.decompositor() {
-            Some(matcher) => {
-                tracing::debug!("Applying backend decomposition patterns");
-                let decomposed = morok_ir::decompositions::decompose_with(&optimized_ast, &matcher);
-                tracing::debug!("Decomposition complete");
-                decomposed
-            }
-            None => {
-                tracing::debug!("No decomposition needed (renderer provides no decompositor)");
-                optimized_ast
-            }
-        };
-
-        // Step 4: Cache by OPTIMIZED ast id (different optimizations → different cache entries)
-        let cached = morok_runtime::kernel_cache::get_or_compile_kernel(ast_decomposed.id, &device_str, || {
-            // Render
-            let spec = device.renderer.render(&ast_decomposed, kernel_name.as_deref()).context(RenderKernelSnafu)?;
-
-            // Compile
-            let compiled = device.compiler.compile(&spec).context(CompileKernelSnafu)?;
-
-            // Create program
-            let program = (device.runtime)(&compiled).context(CreateProgramSnafu)?;
-
-            Ok(morok_runtime::kernel_cache::CachedKernel {
-                program,
-                device: device_str.clone(),
-                code: spec.src.clone(),
-                entry_point: spec.name.clone(),
-                var_names: spec.var_names.clone(),
-                global_size: spec.global_size,
-                local_size: spec.local_size,
-            })
-        })?;
 
         // Build buffer indices for this kernel using item.buffer_uop_ids (already in correct order)
         let buffer_indices: Vec<usize> =

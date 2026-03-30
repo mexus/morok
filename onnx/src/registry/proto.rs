@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use morok_dtype::{DType, ScalarDType};
+use morok_ir::ConstValue;
 use morok_tensor::Tensor;
 
 use crate::error::{Error, Result, UnsupportedDTypeSnafu};
@@ -120,7 +121,61 @@ pub(crate) fn create_tensor_from_raw(data: &[u8], dims: &[usize], dtype: DType) 
         let shape: Vec<isize> = dims.iter().map(|&d| d as isize).collect();
         return Tensor::from_slice(&values).try_reshape(&shape).map_err(Error::from);
     }
+
     Tensor::from_raw_bytes(data, dims, dtype).map_err(Error::from)
+}
+
+/// Extract a scalar [`ConstValue`] from raw bytes for const-folding.
+/// Used for 0-dimensional (scalar) ONNX initializers during model import.
+pub(crate) fn extract_scalar_const(data: &[u8], dtype: &DType) -> Result<ConstValue> {
+    match dtype.base() {
+        ScalarDType::Float32 => {
+            let v = f32::from_le_bytes(data[..4].try_into().unwrap());
+            Ok(ConstValue::Float(v as f64))
+        }
+        ScalarDType::Float64 => {
+            let v = f64::from_le_bytes(data[..8].try_into().unwrap());
+            Ok(ConstValue::Float(v))
+        }
+        ScalarDType::Float16 => {
+            let bits = u16::from_le_bytes(data[..2].try_into().unwrap());
+            Ok(ConstValue::Float(f64::from(half::f16::from_bits(bits))))
+        }
+        ScalarDType::BFloat16 => {
+            let bits = u16::from_le_bytes(data[..2].try_into().unwrap());
+            Ok(ConstValue::Float(f64::from(half::bf16::from_bits(bits))))
+        }
+        ScalarDType::Int8 => Ok(ConstValue::Int(data[0] as i8 as i64)),
+        ScalarDType::Int16 => {
+            let v = i16::from_le_bytes(data[..2].try_into().unwrap());
+            Ok(ConstValue::Int(v as i64))
+        }
+        ScalarDType::Int32 => {
+            let v = i32::from_le_bytes(data[..4].try_into().unwrap());
+            Ok(ConstValue::Int(v as i64))
+        }
+        ScalarDType::Int64 => {
+            let v = i64::from_le_bytes(data[..8].try_into().unwrap());
+            Ok(ConstValue::Int(v))
+        }
+        ScalarDType::UInt8 => Ok(ConstValue::UInt(data[0] as u64)),
+        ScalarDType::UInt16 => {
+            let v = u16::from_le_bytes(data[..2].try_into().unwrap());
+            Ok(ConstValue::UInt(v as u64))
+        }
+        ScalarDType::UInt32 => {
+            let v = u32::from_le_bytes(data[..4].try_into().unwrap());
+            Ok(ConstValue::UInt(v as u64))
+        }
+        ScalarDType::UInt64 => {
+            let v = u64::from_le_bytes(data[..8].try_into().unwrap());
+            Ok(ConstValue::UInt(v))
+        }
+        ScalarDType::Bool => Ok(ConstValue::Bool(data[0] != 0)),
+        other => {
+            Err(Error::IrConstruction { details: format!("scalar const-folding not supported for dtype {other:?}") })
+        }
+    }
 }
 
 /// Extract raw data bytes from TensorProto.

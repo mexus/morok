@@ -5,19 +5,20 @@ use crate::rewrite::graph_rewrite_bottom_up;
 use morok_dtype::DType;
 use morok_ir::{ConstValue, Op, UOp};
 
-/// Helper to check if result is EXPAND(RESHAPE(BUFFERIZE_no_ranges, ...), ...)
+/// Helper to check if result contains RESHAPE(BUFFERIZE_no_ranges), optionally wrapped in EXPAND.
+/// Identity expand is eliminated at construction time, so EXPAND may not be present.
 fn is_expand_reshape_bufferize(result: &Arc<UOp>) -> bool {
-    // Result should be EXPAND
-    let Op::Expand { src: reshape_op, .. } = result.op() else {
-        return false;
+    // Try EXPAND(RESHAPE(BUFFERIZE)) first
+    let reshape_op = match result.op() {
+        Op::Expand { src, .. } => src,
+        Op::Reshape { .. } => result,
+        _ => return false,
     };
 
-    // Inner should be RESHAPE
     let Op::Reshape { src: bufferize_op, .. } = reshape_op.op() else {
         return false;
     };
 
-    // Innermost should be BUFFERIZE with empty ranges
     let Op::Bufferize { ranges, .. } = bufferize_op.op() else {
         return false;
     };
@@ -25,10 +26,12 @@ fn is_expand_reshape_bufferize(result: &Arc<UOp>) -> bool {
     ranges.is_empty()
 }
 
-/// Helper to get the innermost BUFFERIZE from EXPAND(RESHAPE(BUFFERIZE))
+/// Helper to get the innermost BUFFERIZE from [EXPAND(]RESHAPE(BUFFERIZE)[)]
 fn get_inner_bufferize(result: &Arc<UOp>) -> Option<&Arc<UOp>> {
-    let Op::Expand { src: reshape_op, .. } = result.op() else {
-        return None;
+    let reshape_op = match result.op() {
+        Op::Expand { src, .. } => src,
+        Op::Reshape { .. } => result,
+        _ => return None,
     };
     let Op::Reshape { src: bufferize_op, .. } = reshape_op.op() else {
         return None;

@@ -342,7 +342,13 @@ impl DType {
             Self::Ptr { vcount: 1, base, addrspace, size } => {
                 Self::Ptr { base: base.clone(), addrspace: *addrspace, size: *size, vcount: count }
             }
-            Self::Ptr { vcount, .. } => panic!("Cannot vectorize an already vectorized pointer (vcount={vcount})"),
+            // Already vectorized to target count — idempotent (transient state during
+            // graph rewrite when VECTORIZE(CAST(buf)) is reconstructed before the
+            // INDEX(VECTORIZE(CAST(...))) pattern consumes it).
+            Self::Ptr { vcount, .. } if *vcount == count => self.clone(),
+            Self::Ptr { vcount, .. } => {
+                panic!("Cannot vectorize an already vectorized pointer (vcount={vcount}) to different count ({count})")
+            }
             _ => self.clone(),
         }
     }

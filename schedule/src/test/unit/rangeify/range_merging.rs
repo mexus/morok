@@ -283,13 +283,15 @@ fn test_merge_consumer_ranges_2d_partial_overlap() {
     // Merge ranges
     let merged = merge_consumer_ranges(&reshaped, &consumer_rngs, &mut ctx).unwrap();
 
-    // Should return 2 ranges
+    // Partial merge: dim 0 has identical ranges (pointer-equal r0), dim 1 differs.
+    // Current behavior (ranges_same merging): dim 0 is preserved, dim 1 gets new range.
+    // TODO: With PCONTIG=0 alignment, all dims should be realized when any differs.
     assert_eq!(merged.len(), 2, "Should have 2 merged ranges");
 
-    // First range should be unchanged (identical)
+    // First range should be unchanged (identical across consumers)
     assert!(Arc::ptr_eq(&merged[0], &r0), "Identical first dimension should be unchanged");
 
-    // Second range should be NEW (different)
+    // Second range should be NEW (different across consumers)
     assert!(!Arc::ptr_eq(&merged[1], &r1_a), "Different second dimension should create new range");
 
     // Should mark only dimension 1 for realization

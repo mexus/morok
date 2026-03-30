@@ -965,14 +965,7 @@ pub fn bufferize_to_store(bufferize_op: &Arc<UOp>, ctx: &mut KernelContext, allo
         // For local address space (only when allow_locals=true), create DEFINE_LOCAL directly (like Tinygrad)
         let local_ptr_dtype = base_dtype.clone().ptr(Some(size), opts.addrspace);
         let local_id = ctx.next_local();
-        let local_buf = UOp::define_local(local_id, local_ptr_dtype);
-
-        // Broadcast to vector count if needed (Tinygrad: rangeify.py:343)
-        // Tinygrad uses x.src[1].dtype.count (the idx's vcount). In Morok, we use
-        // compute.dtype().vcount() which should match since the stored value's
-        // vectorization determines the indexing granularity.
-        let vcount = compute.dtype().vcount();
-        if vcount > 1 { local_buf.broadcast(vcount) } else { local_buf }
+        UOp::define_local(local_id, local_ptr_dtype)
     };
 
     // Use ptr=true to keep Ptr dtype for STORE targets (Tinygrad-aligned).
@@ -987,11 +980,16 @@ pub fn bufferize_to_store(bufferize_op: &Arc<UOp>, ctx: &mut KernelContext, allo
     // Sort active ranges by axis_id for correct row-major linearization (Tinygrad: rangeify.py:303)
     let sorted_ranges = sort_ranges_by_axis_id(&active_ranges);
 
+    // Broadcast buffer for STORE-side INDEX only (Tinygrad: buf.broadcast(count).index(idx))
+    // The AFTER return uses the unbroadcast buffer so consumers can broadcast it properly.
+    let vcount = compute.dtype().vcount();
+    let store_buffer = if vcount > 1 { buffer.broadcast(vcount) } else { buffer.clone() };
+
     let store_target = if !sorted_ranges.is_empty() {
         // After flatten_bufferize, ranges[0] may be the already-linearized flat index.
         // Use it directly. For non-flattened single-range, the RANGE is used directly.
         // Matches Tinygrad: buf.index(idx, dtype=sdtype)
-        debug_assert!(
+        assert!(
             ranges.len() <= 1 || ranges.iter().all(|r| matches!(r.op(), Op::Const(_))),
             "bufferize_to_store: unexpected multi-range in general path after flatten_bufferize"
         );
@@ -1003,7 +1001,7 @@ pub fn bufferize_to_store(bufferize_op: &Arc<UOp>, ctx: &mut KernelContext, allo
             sorted_ranges[0].clone()
         };
         UOp::index()
-            .buffer(buffer.clone())
+            .buffer(store_buffer)
             .indices(vec![idx])
             .dtype(sdtype.clone())
             .call()
@@ -1011,7 +1009,7 @@ pub fn bufferize_to_store(bufferize_op: &Arc<UOp>, ctx: &mut KernelContext, allo
     } else {
         // Scalar store: create INDEX with buffer + index 0 and explicit sdtype
         UOp::index()
-            .buffer(buffer.clone())
+            .buffer(store_buffer)
             .indices(vec![UOp::index_const(0)])
             .dtype(sdtype.clone())
             .call()

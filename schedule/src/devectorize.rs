@@ -699,6 +699,11 @@ fn cast_after_pattern() -> &'static TypedPatternMatcher {
 }
 
 /// LOCAL/REG buffer devectorization (devectorizer.py:241-248).
+///
+/// Extended beyond Tinygrad: handles vector indices (not just scalar) by expanding
+/// each index lane separately. Tinygrad asserts `idx.dtype.count == 1` which would
+/// crash on local buffers with vector indices from UPCAST — Morok's optimizer can
+/// produce such kernels (e.g., u3u3 upcast on matmul with local buffers).
 fn devectorize_buf_and_index_patterns() -> &'static TypedPatternMatcher {
     crate::cached_patterns! {
         // DEFINE_LOCAL/REG with vector pointer → scalar pointer + CAST
@@ -706,14 +711,15 @@ fn devectorize_buf_and_index_patterns() -> &'static TypedPatternMatcher {
             && def.ptrdtype().is_some_and(|(base, _, _)| base.vcount() > 1)
             => no_vectorized_buf(def),
 
-        // INDEX(CAST(DEFINE_LOCAL/REG), scalar_idx) → scaled vector index
+        // INDEX(CAST(DEFINE_LOCAL/REG), idx) → scaled vector index
+        // Handles both scalar and vector idx (Tinygrad only handles scalar).
         Index { buffer: Cast { src: buf, dtype: cast_dtype }, indices, gate }
-            if is_scalar_index(indices) && is_vectorized_local_reg_cast(buf, cast_dtype)
+            if is_vectorized_local_reg_cast(buf, cast_dtype)
             => no_vectorized_index(buf, indices, gate, cast_dtype),
 
-        // INDEX(BROADCAST(CAST(...)), scalar_idx)
+        // INDEX(BROADCAST(CAST(...)), idx)
         Index { buffer: Vectorize { elements }, indices, gate }
-            if is_scalar_index(indices) && is_vectorized_broadcast_cast(elements)
+            if is_vectorized_broadcast_cast(elements)
             => {
                 let first = elements.first()?;
                 let Op::Cast { src: buf, dtype: DType::Ptr { base, .. } } = first.op() else { return None };
@@ -721,19 +727,15 @@ fn devectorize_buf_and_index_patterns() -> &'static TypedPatternMatcher {
                 no_vectorized_index_precnt(buf, idx, gate, base.vcount(), &vec![0; elements.len()])
             },
 
-        // INDEX(GEP(CAST(...)), scalar_idx)
+        // INDEX(GEP(CAST(...)), idx)
         Index { buffer: Gep { vector: Cast { src: buf, dtype: cast_dtype }, indices: gep_indices }, indices, gate }
-            if is_scalar_index(indices) && is_vectorized_local_reg_cast(buf, cast_dtype)
+            if is_vectorized_local_reg_cast(buf, cast_dtype)
             => {
                 let DType::Ptr { base, .. } = cast_dtype else { return None };
                 let idx = indices.first()?;
                 no_vectorized_index_precnt(buf, idx, gate, base.vcount(), gep_indices)
             },
     }
-}
-
-fn is_scalar_index(indices: &SmallVec<[Arc<UOp>; 4]>) -> bool {
-    indices.first().is_some_and(|idx| idx.dtype().vcount() == 1)
 }
 
 fn is_vectorized_local_reg_cast(buf: &Arc<UOp>, cast_dtype: &DType) -> bool {
@@ -769,7 +771,11 @@ fn no_vectorized_buf(buf: &Arc<UOp>) -> Option<Arc<UOp>> {
     Some(scalar_def.cast(buf.dtype()))
 }
 
-/// INDEX(CAST(buf), scalar_idx) → INDEX(VECTORIZE([buf,...]), scaled_vec_idx) (devectorizer.py:228-231)
+/// INDEX(CAST(buf), idx) → INDEX(VECTORIZE([buf,...]), scaled_vec_idx) (devectorizer.py:228-231)
+///
+/// Handles both scalar idx (original Tinygrad path) and vector idx (Morok extension).
+/// For vector idx with vcount=V and pointer vcount=cnt, produces total = V*cnt lanes:
+///   for each lane i in idx: idx[i]*cnt + [0, 1, ..., cnt-1]
 fn no_vectorized_index(
     buf: &Arc<UOp>,
     indices: &SmallVec<[Arc<UOp>; 4]>,
@@ -783,17 +789,53 @@ fn no_vectorized_index(
         return None;
     }
 
-    let buf_broadcast = buf.broadcast(cnt);
-    let idx_broadcast = idx.broadcast(cnt);
-    let offset_vec = create_index_vector(0..cnt as i64);
-    let cnt_broadcast = idx.const_like(cnt as i64).broadcast(cnt);
-    let final_idx = idx_broadcast.mul(&cnt_broadcast).add(&offset_vec);
+    let idx_vcount = idx.dtype().vcount();
+    let total = cnt * idx_vcount;
+    let buf_broadcast = buf.broadcast(total);
+
+    let final_idx = if idx_vcount == 1 {
+        // Scalar path (original Tinygrad logic)
+        let idx_broadcast = idx.broadcast(cnt);
+        let cnt_broadcast = idx.const_like(cnt as i64).broadcast(cnt);
+        idx_broadcast.mul(&cnt_broadcast).add(&create_index_vector(0..cnt as i64))
+    } else {
+        // Vector path: expand each lane by cnt elements
+        // idx = [a, b, c], cnt = 3 → [a*3+0, a*3+1, a*3+2, b*3+0, b*3+1, b*3+2, c*3+0, c*3+1, c*3+2]
+        let cnt_const = UOp::index_const(cnt as i64);
+        let elements: SmallVec<[Arc<UOp>; 4]> = (0..idx_vcount)
+            .flat_map(|i| {
+                let lane = idx.gep(vec![i]);
+                let scaled = lane.mul(&cnt_const);
+                (0..cnt).map(move |j| scaled.add(&UOp::index_const(j as i64)))
+            })
+            .collect();
+        UOp::vectorize(elements)
+    };
+
+    // Expand gate to match total lanes if it's vectorized
+    let expanded_gate = if idx_vcount > 1 {
+        gate.as_ref().map(|g| {
+            if g.dtype().vcount() > 1 {
+                let elements: SmallVec<[Arc<UOp>; 4]> = (0..idx_vcount)
+                    .flat_map(|i| {
+                        let lane = g.gep(vec![i]);
+                        std::iter::repeat_n(lane, cnt)
+                    })
+                    .collect();
+                UOp::vectorize(elements)
+            } else {
+                g.broadcast(total)
+            }
+        })
+    } else {
+        gate.clone()
+    };
 
     Some(
         UOp::index()
             .buffer(buf_broadcast)
             .indices(vec![final_idx])
-            .maybe_gate(gate.clone())
+            .maybe_gate(expanded_gate)
             .ptr(true)
             .call()
             .expect("ICE unable to create index"),
@@ -806,6 +848,9 @@ fn create_index_vector(values: impl IntoIterator<Item = i64>) -> Arc<UOp> {
 }
 
 /// INDEX with precnt multiplier (broadcast or gep case) (devectorizer.py:233-239)
+///
+/// Handles both scalar and vector idx. For vector idx, each lane is expanded
+/// independently with the same precnt/cnt scaling.
 fn no_vectorized_index_precnt(
     buf: &Arc<UOp>,
     idx: &Arc<UOp>,
@@ -814,23 +859,70 @@ fn no_vectorized_index_precnt(
     input_gep: &[usize],
 ) -> Option<Arc<UOp>> {
     let precnt = input_gep.len();
-    let total = cnt * precnt;
-    let gep_arg: Vec<usize> = (0..cnt).flat_map(|_| 0..precnt).collect();
-    let sum_arg = (0..cnt).flat_map(|i| input_gep.iter().map(move |&y| (i + y) as i64));
+    let idx_vcount = idx.dtype().vcount();
 
-    let buf_broadcast = buf.broadcast(total);
-    let final_idx =
-        idx.gep(gep_arg).mul(&idx.const_like(cnt as i64).broadcast(total)).add(&create_index_vector(sum_arg));
+    if idx_vcount == 1 {
+        // Scalar path (original Tinygrad logic)
+        let total = cnt * precnt;
+        let gep_arg: Vec<usize> = (0..cnt).flat_map(|_| 0..precnt).collect();
+        let sum_arg = (0..cnt).flat_map(|i| input_gep.iter().map(move |&y| (i + y) as i64));
 
-    Some(
-        UOp::index()
-            .buffer(buf_broadcast.clone())
-            .indices(vec![final_idx])
-            .maybe_gate(gate.clone())
-            .ptr(true)
-            .call()
-            .expect("ICE: unable to create index"),
-    )
+        let buf_broadcast = buf.broadcast(total);
+        let final_idx =
+            idx.gep(gep_arg).mul(&idx.const_like(cnt as i64).broadcast(total)).add(&create_index_vector(sum_arg));
+
+        Some(
+            UOp::index()
+                .buffer(buf_broadcast)
+                .indices(vec![final_idx])
+                .maybe_gate(gate.clone())
+                .ptr(true)
+                .call()
+                .expect("ICE: unable to create index"),
+        )
+    } else {
+        // Vector path: expand each lane with the same precnt/cnt scaling
+        let per_lane = cnt * precnt;
+        let total = per_lane * idx_vcount;
+
+        let buf_broadcast = buf.broadcast(total);
+        let cnt_const = UOp::index_const(cnt as i64);
+        let elements: SmallVec<[Arc<UOp>; 4]> = (0..idx_vcount)
+            .flat_map(|i| {
+                let lane = idx.gep(vec![i]);
+                let scaled = lane.mul(&cnt_const);
+                (0..cnt).flat_map(move |c| {
+                    let s = scaled.clone();
+                    input_gep.iter().map(move |&y| s.add(&UOp::index_const((c + y) as i64)))
+                })
+            })
+            .collect();
+        let final_idx = UOp::vectorize(elements);
+
+        let expanded_gate = gate.as_ref().map(|g| {
+            if g.dtype().vcount() > 1 {
+                let elements: SmallVec<[Arc<UOp>; 4]> = (0..idx_vcount)
+                    .flat_map(|i| {
+                        let lane = g.gep(vec![i]);
+                        std::iter::repeat_n(lane, per_lane)
+                    })
+                    .collect();
+                UOp::vectorize(elements)
+            } else {
+                g.broadcast(total)
+            }
+        });
+
+        Some(
+            UOp::index()
+                .buffer(buf_broadcast)
+                .indices(vec![final_idx])
+                .maybe_gate(expanded_gate)
+                .ptr(true)
+                .call()
+                .expect("ICE: unable to create index"),
+        )
+    }
 }
 
 // ============================================================================

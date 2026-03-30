@@ -106,6 +106,7 @@ pub struct UOp {
     pub(crate) dtype: DType,
     /// Cached shape - computed lazily on first access.
     /// OnceLock provides thread-safe lazy initialization.
+    #[debug(skip)]
     pub(crate) shape_cache: std::sync::OnceLock<crate::Result<Option<shape::Shape>>>,
     /// Cached list of RANGE operations in this UOp's graph.
     /// Computed lazily via toposort to collect all RANGE ops.
@@ -121,6 +122,7 @@ pub struct UOp {
     /// Cached vmin/vmax range analysis values.
     /// Computed lazily via range propagation through the computation graph.
     /// Returns (vmin, vmax) as ConstValue types.
+    #[debug(skip)]
     pub(crate) vmin_vmax_cache: std::sync::OnceLock<(ConstValue, ConstValue)>,
     /// Sound vmin/vmax: `None` for ops where range analysis is unsound (LOAD, Pow, etc.).
     /// Used by patterns that must not act on unsound bounds (e.g., vmin_vmax_collapse).

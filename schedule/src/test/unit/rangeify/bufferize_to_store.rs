@@ -137,6 +137,7 @@ fn test_bufferize_to_store_local_with_barrier() {
 }
 
 #[test]
+#[should_panic(expected = "unexpected multi-range")]
 fn test_bufferize_to_store_multiple_ranges() {
     let mut ctx = KernelContext::new();
 

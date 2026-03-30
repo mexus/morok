@@ -1,6 +1,6 @@
 //! ONNX model importer - converts ONNX protobuf to Morok Tensors.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufReader, Read};
 use std::path::Path;
@@ -235,6 +235,9 @@ impl OnnxImporter {
         for init in &proto_graph.initializer {
             if !init.name.is_empty() {
                 let tensor = tensor_from_proto_ext(init, self.model_dir.as_deref())?;
+                // Scalar const-folding: shape () initializers become CONST UOps (inlineable,
+                // no buffer needed). Matches Tinygrad onnx.py:254-256.
+                let tensor = const_fold_scalar(tensor);
                 initializers.insert(init.name.clone(), tensor);
             }
         }
@@ -351,6 +354,19 @@ impl OnnxImporter {
             }
         }
 
+        // Track names of constant tensors (initializers + Constant node outputs).
+        // Used for Gather fast path: when indices are known constants, use shrink+cat
+        // instead of full index_select (which creates arange + one-hot + reduce kernels).
+        // Matches Tinygrad's `self.const_names` (onnx.py:394).
+        let mut const_names: HashSet<String> = graph.initializers.keys().cloned().collect();
+        for node in &graph.nodes {
+            if node.op_type == "Constant" {
+                for out in &node.output {
+                    const_names.insert(out.clone());
+                }
+            }
+        }
+
         // Resolve the default (ai.onnx) opset version
         let opset_version = onnx_opset_version(&graph.opsets, "");
 
@@ -364,10 +380,35 @@ impl OnnxImporter {
                 onnx_opset_version(&graph.opsets, &node.domain)
             };
 
+            // Gather fast path: when indices are from initializers/Constant nodes,
+            // use shrink+cat instead of index_select. Creates zero kernels vs 2-5
+            // kernels per Gather. Port of Tinygrad onnx.py:468-471,1148-1158.
+            if node.op_type == "Gather"
+                && node.input.len() > 1
+                && const_names.contains(&node.input[1])
+                && let Some(result) = self.try_gather_fast_path(node, &values)?
+            {
+                for (i, output_name) in node.output.iter().enumerate() {
+                    if i == 0 && !output_name.is_empty() {
+                        values.insert(output_name.clone(), result.clone());
+                    }
+                }
+                continue;
+            }
+
             if node.op_type == "If" {
                 self.process_if_node(node_index, node, &mut values, node_opset, &graph.subgraphs)?;
             } else {
                 self.process_node(node, &mut values, node_opset)?;
+            }
+
+            // Shape op outputs are always const (shape of concrete tensor is deterministic)
+            if node.op_type == "Shape" {
+                for out in &node.output {
+                    if !out.is_empty() {
+                        const_names.insert(out.clone());
+                    }
+                }
             }
 
             // At trace level: realize each output and dump first values.
@@ -533,6 +574,38 @@ impl OnnxImporter {
         Ok(())
     }
 
+    /// Gather fast path: when indices are from initializers/Constant nodes, use
+    /// shrink+cat instead of index_select (arange + one-hot + reduce).
+    /// Port of Tinygrad onnx.py:468-471,1148-1158.
+    fn try_gather_fast_path(&self, node: &NodeProto, values: &HashMap<String, Tensor>) -> Result<Option<Tensor>> {
+        use crate::registry::attr::{Attrs, tensor_to_i64_vec};
+
+        let data = match values.get(&node.input[0]) {
+            Some(t) => t.clone(),
+            None => return Ok(None),
+        };
+        let idx_tensor = match values.get(&node.input[1]) {
+            Some(t) => t,
+            None => return Ok(None),
+        };
+
+        let mut attrs = Attrs::new(node);
+        let axis = attrs.int("axis", 0) as isize;
+
+        let indices = match tensor_to_i64_vec(idx_tensor) {
+            Ok(v) => v,
+            Err(_) => return Ok(None), // fall back to normal path
+        };
+        let idx_shape: Vec<usize> = match idx_tensor.shape().ok().and_then(|s| s.iter().map(|d| d.as_const()).collect())
+        {
+            Some(v) => v,
+            None => return Ok(None), // symbolic index shape, fall back to normal path
+        };
+
+        let result = crate::registry::gather_const_fast_path(&data, &indices, &idx_shape, axis)?;
+        Ok(Some(result))
+    }
+
     /// Process a single ONNX node.
     fn process_node(&self, node: &NodeProto, values: &mut HashMap<String, Tensor>, opset_version: i64) -> Result<()> {
         let op_type = &node.op_type;
@@ -579,6 +652,37 @@ impl Default for OnnxImporter {
     }
 }
 
+/// Const-fold a scalar tensor (shape `()`) into a CONST UOp.
+///
+/// When a tensor has exactly 1 element and a buffer, extract the scalar value
+/// and return `Tensor::const_()` instead. This makes the value inlineable into
+/// compute kernels without a separate buffer load.
+/// Matches Tinygrad onnx.py:254-256: `data = Tensor(data.item(), dtype=to_dtype)`.
+fn const_fold_scalar(tensor: Tensor) -> Tensor {
+    // Only fold true scalars with empty shape
+    let shape = match tensor.shape() {
+        Ok(s) => s,
+        Err(_) => return tensor,
+    };
+    if !shape.is_empty() {
+        return tensor;
+    }
+    let buf = match tensor.buffer() {
+        Some(b) => b,
+        None => return tensor,
+    };
+    let dtype = tensor.uop().dtype();
+    let bytes_needed = dtype.bytes();
+    let mut raw = vec![0u8; bytes_needed];
+    if buf.copyout(&mut raw).is_err() {
+        return tensor;
+    }
+    match crate::registry::proto::extract_scalar_const(&raw, &dtype) {
+        Ok(cv) => Tensor::const_(cv, dtype),
+        Err(_) => tensor,
+    }
+}
+
 /// Resolve input shapes using Variables for dynamic dimensions.
 ///
 /// Static dims become `SInt::Const`. Dynamic dims are resolved via the
@@ -607,12 +711,11 @@ fn resolve_symbolic_shapes(
                             details: format!("no Variable for dynamic dim '{dim_name}' in input '{name}'"),
                         })?;
                         if let Some(&val) = bindings.get(dim_name) {
-                            Ok(var
-                                .bind(val)
-                                .map_err(|e| crate::Error::IrConstruction {
-                                    details: format!("failed to bind '{dim_name}' = {val}: {e}"),
-                                })?
-                                .as_sint())
+                            // Concrete binding: use fixed value (no symbolic Variable)
+                            let _ = var.bind(val).map_err(|e| crate::Error::IrConstruction {
+                                details: format!("binding '{dim_name}' = {val} out of range: {e}"),
+                            })?; // validate bounds
+                            Ok(SInt::from(val as usize))
                         } else {
                             // Unbound: use variable directly (allocates to max)
                             Ok(var.as_sint())

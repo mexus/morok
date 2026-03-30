@@ -48,10 +48,26 @@ pub fn is_vconst(uop: &Arc<UOp>) -> bool {
     matches!(uop.op(), Op::VConst { .. })
 }
 
-/// Check if a UOp is any constant (Const or VConst).
+/// Check if a UOp is a pure constant tree (no buffer references).
+///
+/// Returns true for bare CONST/VCONST, and also for unary transformations
+/// of constants (e.g., CAST(CONST), BITCAST(CONST), RESHAPE(CONST),
+/// EXPAND(CONST)). These trees have no buffer backing and need
+/// `.contiguous()` wrapping before realization.
 #[inline]
 pub fn is_any_const(uop: &Arc<UOp>) -> bool {
-    matches!(uop.op(), Op::Const(_) | Op::VConst { .. })
+    match uop.op() {
+        Op::Const(_) | Op::VConst { .. } => true,
+        Op::Cast { src, .. }
+        | Op::BitCast { src, .. }
+        | Op::Reshape { src, .. }
+        | Op::Expand { src, .. }
+        | Op::Shrink { src, .. }
+        | Op::Pad { src, .. }
+        | Op::Permute { src, .. }
+        | Op::Flip { src, .. } => is_any_const(src),
+        _ => false,
+    }
 }
 
 /// Extract VConst values if present.
