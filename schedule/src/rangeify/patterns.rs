@@ -2710,6 +2710,87 @@ pub fn pm_neg_from_mul() -> &'static TypedPatternMatcher<()> {
     }
 }
 
+/// Threefry2x32 PRNG decomposition (Tinygrad decompositions.py:302-316).
+///
+/// No real hardware supports THREEFRY natively. Decomposes to uint32 arithmetic:
+/// split 64-bit x/key into halves, apply 5 rounds of add-rotate-xor mixing,
+/// recombine to uint64.
+pub fn pm_threefry_decomp() -> &'static TypedPatternMatcher<()> {
+    crate::cached_patterns! {
+        Threefry(x, key) if x.dtype() == DType::UInt64 => |x, key| {
+            Some(threefry2x32(x, key))
+        },
+    }
+}
+
+/// Threefry2x32 mixing algorithm (Random123 library).
+fn threefry2x32(x: &Arc<UOp>, key: &Arc<UOp>) -> Arc<UOp> {
+    let u32_dt = DType::Scalar(morok_dtype::ScalarDType::UInt32);
+    let u64_dt = DType::Scalar(morok_dtype::ScalarDType::UInt64);
+    let mask32 = UOp::const_(u64_dt.clone(), ConstValue::UInt(0xFFFFFFFF));
+    let pow32 = UOp::const_(u64_dt.clone(), ConstValue::UInt(1u64 << 32));
+
+    // Split x and key from uint64 to two uint32
+    let x0 = x.and_(&mask32).cast(u32_dt.clone());
+    let x1 = x.idiv(&pow32).and_(&mask32).cast(u32_dt.clone());
+    let key0 = key.and_(&mask32).cast(u32_dt.clone());
+    let key1 = key.idiv(&pow32).and_(&mask32).cast(u32_dt.clone());
+
+    // Key schedule: ks = [key1, key0 ^ key1 ^ 0x1BD11BDA, key0]
+    let skein_const = UOp::const_(u32_dt.clone(), ConstValue::UInt(0x1BD11BDA));
+    let ks = [key1.clone(), key0.xor(&key1).xor(&skein_const), key0.clone()];
+
+    let rotations: [[u32; 4]; 2] = [[13, 15, 26, 6], [17, 29, 16, 24]];
+
+    // Initialize: xr = [x0 + ks[2], x1 + ks[0]]
+    let mut xr0 = x0.add(&ks[2]);
+    let mut xr1 = x1.add(&ks[0]);
+
+    // 5 rounds of mixing
+    for i in 0..5u32 {
+        for &r in &rotations[i as usize % 2] {
+            let new_x0 = xr0.add(&xr1);
+            // Rotation: (xr1 * 2^r) + (xr1 // 2^(32-r))  (barrel rotate via mul+div)
+            let rot_left = xr1.mul(&UOp::const_(u32_dt.clone(), ConstValue::UInt(1u64 << r)));
+            let rot_right = xr1.idiv(&UOp::const_(u32_dt.clone(), ConstValue::UInt(1u64 << (32 - r))));
+            let rotated = rot_left.add(&rot_right);
+            xr1 = new_x0.xor(&rotated);
+            xr0 = new_x0;
+        }
+        // Key injection
+        xr0 = xr0.add(&ks[i as usize % 3]);
+        let round_const = UOp::const_(u32_dt.clone(), ConstValue::UInt((i + 1) as u64));
+        xr1 = xr1.add(&ks[(i as usize + 1) % 3]).add(&round_const);
+    }
+
+    // Recombine: xr1.cast(u64) * 2^32 | xr0.cast(u64)
+    xr1.cast(u64_dt.clone()).mul(&pow32).or_(&xr0.cast(u64_dt))
+}
+
+/// DeMorgan's law: NOT(x) & NOT(y) → NOT(x | y) (Tinygrad decompositions.py:446-447).
+///
+/// Reduces one NOT instruction by factoring out negation.
+pub fn pm_demorgan() -> &'static TypedPatternMatcher<()> {
+    crate::cached_patterns! {
+        And[Not(x), Not(y)] if x.dtype().is_bool() ~> x.or_(y).not(),
+    }
+}
+
+/// SHL+ADD → MULACC fusion (Tinygrad decompositions.py:475).
+///
+/// After `pm_mul_to_shl` converts `x * 2^n → x << n`, expressions like
+/// `(x << n) + c` can fuse to MULACC(x, 2^n, c) for backends with FMA.
+pub fn pm_shl_add_to_mulacc() -> &'static TypedPatternMatcher<()> {
+    crate::cached_patterns! {
+        Add[Shl(x, _n @const(nv)), c] => |x, nv, c| {
+            let ConstValue::Int(v) = nv else { return None };
+            if !(0..64).contains(&v) { return None; }
+            let multiplier = UOp::const_(x.dtype(), ConstValue::Int(1i64 << v));
+            UOp::try_mulacc(x.clone(), multiplier, c.clone()).ok()
+        },
+    }
+}
+
 /// Divide → Shift optimization for power-of-two divisor.
 ///
 /// Tinygrad: decompositions.py:340-344

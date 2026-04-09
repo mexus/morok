@@ -1052,6 +1052,23 @@ pub fn advanced_division_dsl_patterns() -> &'static TypedPatternMatcher {
         // y * (x + c) → y*x + y*c for index dtype (Tinygrad symbolic.py:199)
         // Only distributes when x is Index dtype to avoid float inf*0=nan issues.
         Mul[y @const(_yv), Add[x, c @const(_cv)]] if x.dtype() == DType::Index ~> y.mul(x).add(&y.mul(c)),
+        // (a//c1 + c2) // c3 → (a + c1*c2) // (c1*c3) (Tinygrad divandmod.py:97-98)
+        // Moved from symbolic_simple to symbolic tier to avoid infinite loop with fast_division_patterns
+        // in Stage 18-19 (fast div creates wider expr → nested div re-fires → ever-growing constants).
+        // Guards: c1>0, c3>0, and (a>=0 && c2>=0) or (a<=0 && c2<=0) (same-sign requirement)
+        Idiv(Add[Idiv(a, c1 @const(c1_val)), _c2 @const(c2_val)], _c3 @const(c3_val)) => {
+            let c1_int = c1_val.try_int().expect("failed to extract int");
+            let c2_int = c2_val.try_int().expect("failed to extract int");
+            let c3_int = c3_val.try_int().expect("failed to extract int");
+            if c1_int <= 0 || c3_int <= 0 { return None; }
+            let a_vmin = a.vmin().try_int().expect("failed to extract int from vmin");
+            let a_vmax = a.vmax().try_int().expect("failed to extract int from vmax");
+            if !((a_vmin >= 0 && c2_int >= 0) || (a_vmax <= 0 && c2_int <= 0)) { return None; }
+            let c1_times_c2 = eval_mul_typed(c1_val, c2_val, c1.dtype().base()).expect("failed to evaluate cprod");
+            let c1_times_c3 = eval_mul_typed(c1_val, c3_val, c1.dtype().base()).expect("failed to evaluate cprod");
+            Some(a.add(&UOp::const_(c1.dtype(), c1_times_c2))
+             .idiv(&UOp::const_(c1.dtype(), c1_times_c3)))
+        },
     }
 }
 
@@ -2417,24 +2434,6 @@ pub fn div_mod_recombine_dsl_patterns() -> &'static TypedPatternMatcher {
         // y + (x % n) + (x // n) * n → y + x
         // Note: x appears twice, n appears 3 times → auto ptr_eq for all
         Add[Add[y, Mod(x, n)], Mul[Idiv(x, n), n]] ~> y.add(x),
-
-        // (a//c1 + c2) // c3 → (a + c1*c2) // (c1*c3) (nested division simplification)
-        // e.g., (a//2 + 1) // 2 → (a + 2) // 4
-        // Guards: c1>0, c3>0, and (a>=0 && c2>=0) or (a<=0 && c2<=0) (same-sign requirement)
-        Idiv(Add[Idiv(a, c1 @const(c1_val)), _c2 @const(c2_val)], _c3 @const(c3_val)) => {
-            let c1_int = c1_val.try_int().expect("failed to extract int");
-            let c2_int = c2_val.try_int().expect("failed to extract int");
-            let c3_int = c3_val.try_int().expect("failed to extract int");
-            if c1_int <= 0 || c3_int <= 0 { return None; }
-            let a_vmin = a.vmin().try_int().expect("failed to extract int from vmin");
-            let a_vmax = a.vmax().try_int().expect("failed to extract int from vmax");
-            if !((a_vmin >= 0 && c2_int >= 0) || (a_vmax <= 0 && c2_int <= 0)) { return None; }
-            let c1_times_c2 = eval_mul_typed(c1_val, c2_val, c1.dtype().base()).expect("failed to evaluate cprod");
-            let c1_times_c3 = eval_mul_typed(c1_val, c3_val, c1.dtype().base()).expect("failed to evaluate cprod");
-            // (a + c1*c2) // (c1*c3)
-            Some(a.add(&UOp::const_(c1.dtype(), c1_times_c2))
-             .idiv(&UOp::const_(c1.dtype(), c1_times_c3)))
-        },
     }
 }
 

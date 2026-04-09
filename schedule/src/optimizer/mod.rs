@@ -73,8 +73,9 @@ use crate::devectorize::{
 use crate::gpudims::pm_add_gpudims;
 use crate::passes::pm_linearize_multi_index;
 use crate::rangeify::patterns::{
-    pm_add_loads, pm_comparison_negations, pm_div_to_shr, pm_erf_decomposition, pm_fdiv_to_mul, pm_fma_decomposition,
-    pm_load_collapse, pm_mod_to_and, pm_mul_to_shl, pm_neg_from_mul, rangeify_codegen_with_kernel_ctx,
+    pm_add_loads, pm_comparison_negations, pm_demorgan, pm_div_to_shr, pm_erf_decomposition, pm_fdiv_to_mul,
+    pm_fma_decomposition, pm_load_collapse, pm_mod_to_and, pm_mul_to_shl, pm_neg_from_mul, pm_shl_add_to_mulacc,
+    pm_threefry_decomp, rangeify_codegen_with_kernel_ctx,
 };
 use crate::rangeify::pm_add_buffers_local_patterns;
 use crate::rangeify::transforms::{pm_flatten_range, pm_simplify_ranges, pm_split_ranges};
@@ -419,6 +420,9 @@ fn get_late_rewrite_patterns() -> &'static crate::TypedPatternMatcher {
             + pm_div_to_shr()
             + pm_fdiv_to_mul()
             + pm_neg_from_mul()
+            + pm_demorgan()
+            + pm_shl_add_to_mulacc()
+            + pm_threefry_decomp()
             + pm_comparison_negations()
             + crate::symbolic::fast_division_patterns()
             + pm_mod_to_idiv()
