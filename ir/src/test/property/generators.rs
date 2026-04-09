@@ -226,7 +226,7 @@ pub fn arb_arithmetic_tree(dtype: DType, depth: usize) -> impl Strategy<Value = 
                     _ => unreachable!("arb_arithmetic_binary_op only generates Add, Mul, Sub, Max"),
                 }
             }),
-            // Unary operation (only Neg for arithmetic)
+            // Negation: produces MUL(x, -1) matching Tinygrad's approach
             inner.clone().prop_map(move |src| src.neg()),
         ]
     })

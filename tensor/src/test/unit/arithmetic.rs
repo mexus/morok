@@ -306,14 +306,15 @@ fn test_provenance_tracking() {
 
 #[test]
 fn test_neg_basic() {
+    // neg() now produces MUL(x, -1) matching Tinygrad's approach
     let a = Tensor::from_slice([1.0f32, -2.0, 3.0]);
     let b = -&a;
 
-    if let Op::Unary(op, _) = b.uop().op() {
-        assert_eq!(format!("{:?}", op), "Neg");
-    } else {
-        panic!("Expected Unary Neg operation");
-    }
+    assert!(
+        matches!(b.uop().op(), Op::Binary(morok_ir::BinaryOp::Mul, _, _)),
+        "Expected MUL operation, got {:?}",
+        b.uop().op()
+    );
 }
 
 #[test]

@@ -37,8 +37,9 @@ pub fn constant_folding_dsl_patterns() -> &'static TypedPatternMatcher {
     use morok_ir::uop::eval::{eval_binary_op_typed, eval_ternary_op_typed, eval_unary_op_typed};
 
     crate::cached_patterns! {
-        // Unary constant folding - 7 operations in one declaration
-        for op in unary [Neg, Sqrt, Exp2, Log2, Sin, Reciprocal, Trunc] {
+        // Unary constant folding - 6 operations in one declaration
+        // Neg is not here: neg() produces MUL(x, -1), folded by binary constant folding.
+        for op in unary [Sqrt, Exp2, Log2, Sin, Reciprocal, Trunc] {
             op(c @const(c_val))
               => eval_unary_op_typed(op, c_val, c.dtype().base()).map(|r| UOp::const_(c.dtype(), r)),
         },
@@ -106,7 +107,7 @@ pub fn vconst_folding_patterns() -> &'static TypedPatternMatcher {
         },
 
         // Unary VConst folding
-        for op in unary [Neg, Sqrt, Exp2, Log2, Sin, Reciprocal, Trunc] {
+        for op in unary [Sqrt, Exp2, Log2, Sin, Reciprocal, Trunc] {
             op(a @vconst(vals))
               => {
                   let dt = a.dtype().scalar_dtype();
@@ -371,7 +372,6 @@ pub fn symbolic_simple() -> &'static TypedPatternMatcher {
             + cast_dsl_patterns()
             + div_mod_recombine_dsl_patterns()
             + power_dsl_patterns()
-            + negation_dsl_patterns()
             + boolean_dsl_simple_patterns()
             + dce_dsl_simple_patterns()
             + dead_loop_patterns()
@@ -1202,7 +1202,7 @@ pub fn vmin_vmax_collapse_patterns() -> &'static TypedPatternMatcher {
         for op in binary [Add, Mul, Sub, Mod, Max, Pow, Idiv, Fdiv, And, Or, Xor, Shl, Shr, Lt, Le, Eq, Ne, Gt, Ge] {
             r @ op(_, _) if is_collapsible(r) => { let _ = op; try_collapse(r) },
         },
-        for op in unary [Neg, Sqrt, Exp2, Log2, Sin, Reciprocal, Trunc, Not, Floor, Ceil, Round] {
+        for op in unary [Sqrt, Exp2, Log2, Sin, Reciprocal, Trunc, Not, Floor, Ceil, Round] {
             r @ op(_) if is_collapsible(r) => { let _ = op; try_collapse(r) },
         },
         for op in ternary [Where, MulAcc] {
@@ -1576,8 +1576,11 @@ pub fn comparison_dsl_patterns() -> &'static TypedPatternMatcher {
             x.try_cmplt(&UOp::const_(c0.dtype(), diff)).expect("failed to create cmplt")
         },
 
-        // -x < -y → y < x (negation flip for Lt)
-        Lt(Neg(x), Neg(y)) ~> y.try_cmplt(x).expect("failed to create cmplt"),
+        // MUL(x,-1) < MUL(y,-1) → y < x (negation flip for Lt)
+        // neg() produces MUL(x, -1), so we match that form.
+        Lt(Mul[x, _c1 @const(c1v)], Mul[y, _c2 @const(c2v)])
+            if c1v.is_neg_one() && c2v.is_neg_one()
+            ~> y.try_cmplt(x).expect("failed to create cmplt"),
 
         // Phase 6: (x // d) < c → x < (c * d) when d > 0
         // This lifts division out of comparisons, enabling further simplification.
@@ -1891,16 +1894,6 @@ fn simplify_pow_const_base(c: &Arc<UOp>, cv: ConstValue, x: &Arc<UOp>) -> Option
         return UOp::try_exp2(&product).ok();
     }
     None
-}
-
-/// Negation patterns.
-///
-/// - -(-x) → x (double negation for arithmetic)
-pub fn negation_dsl_patterns() -> &'static TypedPatternMatcher {
-    crate::cached_patterns! {
-        // Double arithmetic negation: -(-x) → x
-        Neg(Neg(x)) ~> |x| x.clone(),
-    }
 }
 
 /// ALU(VECTORIZE, VECTORIZE) → VECTORIZE(scalar_ALU) reordering (Tinygrad sym line 390-391).

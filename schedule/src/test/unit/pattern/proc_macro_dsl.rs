@@ -635,7 +635,7 @@ fn test_for_loop_unary_expansion() {
     // Test that for-loop syntax generates patterns for multiple unary ops
     #[allow(unused_variables)]
     let matcher = patterns! {
-        for op in unary [Neg, Sqrt] {
+        for op in unary [Sqrt, Exp2] {
             op(c) ~> {
                 // Just return the operand for testing
                 Arc::clone(c)
@@ -643,29 +643,27 @@ fn test_for_loop_unary_expansion() {
         }
     };
 
-    // Create Neg(x)
     let x = UOp::native_const(42.0f32);
-    let neg_x = x.neg();
-
-    match matcher.rewrite(&neg_x, &mut ()) {
-        RewriteResult::Rewritten(r) => assert!(Arc::ptr_eq(&r, &x)),
-        _ => panic!("Neg pattern from for-loop should match"),
-    }
 
     // Create Sqrt(x)
     let sqrt_x = x.try_sqrt().unwrap();
-
     match matcher.rewrite(&sqrt_x, &mut ()) {
         RewriteResult::Rewritten(r) => assert!(Arc::ptr_eq(&r, &x)),
         _ => panic!("Sqrt pattern from for-loop should match"),
     }
 
-    // Create Exp2(x) - should NOT match (not in the loop)
+    // Create Exp2(x)
     let exp2_x = x.try_exp2().unwrap();
-
     match matcher.rewrite(&exp2_x, &mut ()) {
+        RewriteResult::Rewritten(r) => assert!(Arc::ptr_eq(&r, &x)),
+        _ => panic!("Exp2 pattern from for-loop should match"),
+    }
+
+    // Create Sin(x) - should NOT match (not in the loop)
+    let sin_x = x.try_sin().unwrap();
+    match matcher.rewrite(&sin_x, &mut ()) {
         RewriteResult::NoMatch => {} // Expected
-        _ => panic!("Exp2 should NOT match (not in for-loop list)"),
+        _ => panic!("Sin should NOT match (not in for-loop list)"),
     }
 }
 
@@ -755,13 +753,13 @@ fn test_for_loop_with_op_var_access() {
 
     // Test that the operation variable `op` is accessible in the closure
     let matcher = patterns! {
-        for op in unary [Neg, Sqrt] {
+        for op in unary [Sqrt, Exp2] {
             op(x) ~> {
                 // Use the op variable to verify it's accessible
                 // Create a different unary op with the same operand
                 match op {
-                    UnaryOp::Neg => x.try_sqrt().unwrap(),
-                    UnaryOp::Sqrt => x.neg(),
+                    UnaryOp::Sqrt => x.try_exp2().unwrap(),
+                    UnaryOp::Exp2 => x.try_sqrt().unwrap(),
                     _ => Arc::clone(x),
                 }
             }
@@ -770,22 +768,22 @@ fn test_for_loop_with_op_var_access() {
 
     let x = UOp::native_const(42.0f32);
 
-    // Neg(x) should rewrite to Sqrt(x) (swapped)
-    let neg_x = x.neg();
-    match matcher.rewrite(&neg_x, &mut ()) {
-        RewriteResult::Rewritten(r) => {
-            assert!(matches!(r.op(), Op::Unary(UnaryOp::Sqrt, _)), "Neg should rewrite to Sqrt");
-        }
-        _ => panic!("Neg pattern should match"),
-    }
-
-    // Sqrt(x) should rewrite to Neg(x) (swapped)
+    // Sqrt(x) should rewrite to Exp2(x) (swapped)
     let sqrt_x = x.try_sqrt().unwrap();
     match matcher.rewrite(&sqrt_x, &mut ()) {
         RewriteResult::Rewritten(r) => {
-            assert!(matches!(r.op(), Op::Unary(UnaryOp::Neg, _)), "Sqrt should rewrite to Neg");
+            assert!(matches!(r.op(), Op::Unary(UnaryOp::Exp2, _)), "Sqrt should rewrite to Exp2");
         }
         _ => panic!("Sqrt pattern should match"),
+    }
+
+    // Exp2(x) should rewrite to Sqrt(x) (swapped)
+    let exp2_x = x.try_exp2().unwrap();
+    match matcher.rewrite(&exp2_x, &mut ()) {
+        RewriteResult::Rewritten(r) => {
+            assert!(matches!(r.op(), Op::Unary(UnaryOp::Sqrt, _)), "Exp2 should rewrite to Sqrt");
+        }
+        _ => panic!("Exp2 pattern should match"),
     }
 }
 
@@ -798,7 +796,7 @@ fn test_for_loop_mixed_with_regular_patterns() {
         Add(x, @zero) ~> x,
 
         // For-loop in the middle
-        for op in unary [Neg, Sqrt] {
+        for op in unary [Sqrt, Exp2] {
             op(x) ~> Arc::clone(x)
         },
 
@@ -817,11 +815,11 @@ fn test_for_loop_mixed_with_regular_patterns() {
         _ => panic!("Add(x, 0) should match"),
     }
 
-    // Test Neg(x) => x
-    let neg_x = x.neg();
-    match matcher.rewrite(&neg_x, &mut ()) {
+    // Test Sqrt(x) => x
+    let sqrt_x = x.try_sqrt().unwrap();
+    match matcher.rewrite(&sqrt_x, &mut ()) {
         RewriteResult::Rewritten(r) => assert!(Arc::ptr_eq(&r, &x)),
-        _ => panic!("Neg(x) from for-loop should match"),
+        _ => panic!("Sqrt(x) from for-loop should match"),
     }
 
     // Test Mul(x, 1) => x
@@ -837,7 +835,7 @@ fn test_for_loop_with_guard() {
     // Test for-loop patterns with guards
     #[allow(unused_variables)]
     let matcher = patterns! {
-        for op in unary [Neg, Sqrt] {
+        for op in unary [Sqrt, Exp2] {
             // Only match if operand is a constant
             op(c) if matches!(c.op(), Op::Const(_)) ~> Arc::clone(c)
         }
@@ -845,11 +843,11 @@ fn test_for_loop_with_guard() {
 
     let c = UOp::native_const(42.0f32);
 
-    // Neg(const) - should match
-    let neg_c = c.neg();
-    match matcher.rewrite(&neg_c, &mut ()) {
+    // Sqrt(const) - should match
+    let sqrt_c = c.try_sqrt().unwrap();
+    match matcher.rewrite(&sqrt_c, &mut ()) {
         RewriteResult::Rewritten(r) => assert!(Arc::ptr_eq(&r, &c)),
-        _ => panic!("Neg(const) should match with guard"),
+        _ => panic!("Sqrt(const) should match with guard"),
     }
 
     // Create a non-constant operand (binary)
@@ -857,11 +855,11 @@ fn test_for_loop_with_guard() {
     let y = UOp::native_const(2.0f32);
     let add_xy = binary(BinaryOp::Add, x, y);
 
-    // Neg(add) - should NOT match (operand is not a constant)
-    let neg_add = add_xy.neg();
-    match matcher.rewrite(&neg_add, &mut ()) {
+    // Sqrt(add) - should NOT match (operand is not a constant)
+    let sqrt_add = add_xy.try_sqrt().unwrap();
+    match matcher.rewrite(&sqrt_add, &mut ()) {
         RewriteResult::NoMatch => {} // Expected
-        _ => panic!("Neg(non-const) should NOT match with const guard"),
+        _ => panic!("Sqrt(non-const) should NOT match with const guard"),
     }
 }
 
@@ -870,25 +868,25 @@ fn test_for_loop_with_binding() {
     // Test for-loop patterns with bindings
     #[allow(unused_variables)]
     let matcher = patterns! {
-        for op in unary [Neg, Sqrt] {
+        for op in unary [Sqrt, Exp2] {
             op(inner @ @const) ~> inner
         }
     };
 
     let c = UOp::native_const(42.0f32);
 
-    // Neg(const) - should match and return the inner constant
-    let neg_c = c.neg();
-    match matcher.rewrite(&neg_c, &mut ()) {
-        RewriteResult::Rewritten(r) => assert!(Arc::ptr_eq(&r, &c)),
-        _ => panic!("Neg(inner @ @const) should match and return inner"),
-    }
-
-    // Sqrt(const) - should also match
+    // Sqrt(const) - should match and return the inner constant
     let sqrt_c = c.try_sqrt().unwrap();
     match matcher.rewrite(&sqrt_c, &mut ()) {
         RewriteResult::Rewritten(r) => assert!(Arc::ptr_eq(&r, &c)),
         _ => panic!("Sqrt(inner @ @const) should match and return inner"),
+    }
+
+    // Exp2(const) - should also match
+    let exp2_c = c.try_exp2().unwrap();
+    match matcher.rewrite(&exp2_c, &mut ()) {
+        RewriteResult::Rewritten(r) => assert!(Arc::ptr_eq(&r, &c)),
+        _ => panic!("Exp2(inner @ @const) should match and return inner"),
     }
 }
 
@@ -926,18 +924,18 @@ fn test_const_with_value_extraction_fallible() {
     // Test ConstValue extraction with fallible pattern
     let matcher = patterns! {
         // Use cv in fallible expression with ?
-        Neg(_c@const(cv)) => cv.cast(&DType::Float32).map(|casted| UOp::const_(DType::Float32, casted))
+        Sqrt(_c@const(cv)) => cv.cast(&DType::Float32).map(|casted| UOp::const_(DType::Float32, casted))
     };
 
-    let c = UOp::native_const(42i32);
-    let neg_c = c.neg();
+    let c = UOp::native_const(42.0f32);
+    let sqrt_c = c.try_sqrt().unwrap();
 
-    match matcher.rewrite(&neg_c, &mut ()) {
+    match matcher.rewrite(&sqrt_c, &mut ()) {
         RewriteResult::Rewritten(r) => {
             // Should create a Float32 constant with casted value
             assert_eq!(r.dtype(), DType::Float32);
         }
-        _ => panic!("Neg(c@const(cv)) should match and cast the value"),
+        _ => panic!("Sqrt(c@const(cv)) should match and cast the value"),
     }
 }
 
@@ -1759,6 +1757,7 @@ fn test_for_loop_binary_wildcard() {
 #[test]
 fn test_for_loop_unary_wildcard() {
     // Test that `unary [*]` expands to ALL unary ops
+    // Note: neg() produces MUL(x,-1) now, so use raw Unary(Neg) to test the DSL wildcard.
     #[allow(unused_variables)]
     let matcher = patterns! {
         for op in unary [*] {
@@ -1768,8 +1767,8 @@ fn test_for_loop_unary_wildcard() {
 
     let c = UOp::native_const(42.0f32);
 
-    // Test Neg(const)
-    let neg_c = c.neg();
+    // Test Neg(const) — construct raw Unary(Neg) since .neg() produces MUL
+    let neg_c = UOp::new(Op::Unary(morok_ir::UnaryOp::Neg, c.clone()), c.dtype());
     match matcher.rewrite(&neg_c, &mut ()) {
         RewriteResult::Rewritten(r) => assert!(Arc::ptr_eq(&r, &c)),
         _ => panic!("Neg(const) from unary [*] should match"),

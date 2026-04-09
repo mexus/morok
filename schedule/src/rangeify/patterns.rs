@@ -2694,15 +2694,19 @@ pub fn pm_mul_to_shl() -> &'static TypedPatternMatcher<()> {
     }
 }
 
-/// Negate from multiply: x * -1 → NEG(x)
-///
-/// Converts multiplication by -1 into negation operation.
+/// Negation decompositions (Tinygrad decompositions.py:458-460):
+/// - x * -1 → NEG(x)
+/// - x + NEG(y) → SUB(x, y)
 pub fn pm_neg_from_mul() -> &'static TypedPatternMatcher<()> {
     crate::cached_patterns! {
         // x * -1 → NEG(x)
+        // Uses raw UOp::new to avoid infinite loop since .neg() now produces MUL(x, -1).
         Mul[x, _c @const(c_val)] if c_val.is_neg_one() => |x| {
-            Some(x.neg())
+            let dtype = x.dtype();
+            Some(UOp::new(Op::Unary(UnaryOp::Neg, x.clone()), dtype))
         },
+        // x + NEG(y) → SUB(x, y) (Tinygrad decompositions.py:460)
+        Add[x, Neg(y)] ~> x.sub(y),
     }
 }
 

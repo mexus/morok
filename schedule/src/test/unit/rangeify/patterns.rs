@@ -532,14 +532,15 @@ fn test_movement_op_removal_non_movement_op() {
     let matcher = patterns::apply_rangeify_patterns();
     let mut ctx = IndexingContext::new();
 
-    // Create a non-movement op (NEG)
+    // Create a non-movement op (SQRT)
+    // neg() now produces MUL (binary), use sqrt (unary) instead.
     let src = UOp::define_global(0, DType::Float32);
-    let neg = src.neg();
+    let sqrt = src.try_sqrt().unwrap();
 
     // Non-movement ops without ranges should not match the movement removal pattern
     // (they may match other patterns like bufferize, but without ranges assigned,
     // apply_bufferize_transform returns None)
-    let result = matcher.rewrite(&neg, &mut ctx);
+    let result = matcher.rewrite(&sqrt, &mut ctx);
     assert!(matches!(result, RewriteResult::NoMatch), "Should not match non-movement ops without ranges");
 }
 

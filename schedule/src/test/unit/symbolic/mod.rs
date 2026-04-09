@@ -155,20 +155,20 @@ fn test_self_division() {
 
 #[test]
 fn test_division_by_neg_one() {
-    // Test: x // -1 -> -x
+    // Test: x // -1 -> -x (which is MUL(x, -1) since neg() produces MUL)
+    use crate::rewrite::graph_rewrite;
     let matcher = symbolic_simple();
     let x = UOp::var("x", DType::Int32, 0, i64::MAX);
     let neg_one = UOp::native_const(-1i32);
     let div = x.try_div(&neg_one).unwrap();
 
-    let result = matcher.rewrite(&div, &mut ());
-    assert!(matches!(result, RewriteResult::Rewritten(_)));
-    if let RewriteResult::Rewritten(rewritten) = result {
-        if let Op::Unary(morok_ir::UnaryOp::Neg, negated) = rewritten.op() {
-            assert!(std::sync::Arc::ptr_eq(negated, &x));
-        } else {
-            panic!("Expected Unary(Neg, x), got {:?}", rewritten.op());
-        }
+    let result = graph_rewrite(&matcher, div, &mut ());
+    // x // -1 → neg(x) → MUL(x, -1)
+    if let Op::Binary(morok_ir::BinaryOp::Mul, inner, c) = result.op() {
+        assert!(std::sync::Arc::ptr_eq(inner, &x));
+        assert!(matches!(c.op(), Op::Const(cv) if cv.0.is_neg_one()));
+    } else {
+        panic!("Expected MUL(x, -1), got {:?}", result.op());
     }
 }
 
@@ -1242,31 +1242,62 @@ fn test_xor_self_cancellation() {
 #[test]
 fn test_double_neg_elimination() {
     // -(-x) → x
-    let matcher = symbolic_simple();
+    // neg() produces MUL(x, -1), so -(-x) = MUL(MUL(x, -1), -1).
+    // Folds via two-stage ALU (in symbolic tier 2): MUL(MUL(x, c1), c2) → MUL(x, c1*c2) = MUL(x, 1) → x.
+    use crate::rewrite::graph_rewrite;
+    let matcher = symbolic();
     let x = UOp::var("x", DType::Int32, 0, i64::MAX);
     let neg_x = x.neg();
     let neg_neg_x = neg_x.neg();
 
-    let result = matcher.rewrite(&neg_neg_x, &mut ());
-    assert!(matches!(result, RewriteResult::Rewritten(_)));
-    if let RewriteResult::Rewritten(rewritten) = result {
-        assert!(Arc::ptr_eq(&rewritten, &x));
-    }
+    let result = graph_rewrite(&matcher, neg_neg_x, &mut ());
+    assert!(Arc::ptr_eq(&result, &x), "double neg should simplify back to x, got: {}", result.tree());
 }
 
 #[test]
 fn test_double_neg_float() {
     // -(-x) → x (for floats)
-    let matcher = symbolic_simple();
+    use crate::rewrite::graph_rewrite;
+    let matcher = symbolic();
     let x = UOp::var("x", DType::Float32, 0, i64::MAX);
     let neg_x = x.neg();
     let neg_neg_x = neg_x.neg();
 
-    let result = matcher.rewrite(&neg_neg_x, &mut ());
-    assert!(matches!(result, RewriteResult::Rewritten(_)));
-    if let RewriteResult::Rewritten(rewritten) = result {
-        assert!(Arc::ptr_eq(&rewritten, &x));
-    }
+    let result = graph_rewrite(&matcher, neg_neg_x, &mut ());
+    assert!(Arc::ptr_eq(&result, &x), "double neg should simplify back to x, got: {}", result.tree());
+}
+
+// ====== Test: propagate_invalid through neg (MUL) ======
+
+#[test]
+fn test_propagate_invalid_through_neg() {
+    // Core regression test for the Neg→MUL(-1) change.
+    // neg(WHERE(cond, x, Invalid)) = MUL(WHERE(cond, x, Invalid), -1)
+    // propagate_invalid pushes Binary through WHERE-Invalid:
+    // → WHERE(cond, MUL(x, -1), Invalid)
+    use crate::rewrite::graph_rewrite;
+    use crate::symbolic::patterns::propagate_invalid;
+    let matcher = propagate_invalid();
+
+    let cond = UOp::var("c", DType::Bool, 0, 1);
+    let x = UOp::var("x", DType::Index, 0, 100);
+    let invalid = UOp::new(Op::Invalid, DType::Index);
+    let gated = UOp::try_where(cond.clone(), x.clone(), invalid.clone()).unwrap();
+    let negated = gated.neg(); // MUL(WHERE(cond, x, Invalid), -1)
+
+    let result = graph_rewrite(&matcher, negated, &mut ());
+
+    // Should be WHERE(cond, MUL(x, -1), Invalid)
+    let Op::Ternary(morok_ir::TernaryOp::Where, c, inner, inv) = result.op() else {
+        panic!("Expected WHERE, got: {}", result.tree());
+    };
+    assert!(Arc::ptr_eq(c, &cond), "condition should be preserved");
+    assert!(matches!(inv.op(), Op::Invalid), "false branch should be Invalid");
+    assert!(
+        matches!(inner.op(), Op::Binary(morok_ir::BinaryOp::Mul, _, _)),
+        "true branch should be MUL(x, -1), got: {}",
+        inner.tree()
+    );
 }
 
 // ====== Tests for MINMAX patterns (minmax_dsl_patterns) ======

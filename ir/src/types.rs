@@ -176,7 +176,7 @@ impl ConstValue {
     pub const fn neg_one(dtype: ScalarDType) -> Option<Self> {
         use ScalarDType::*;
         Some(match dtype {
-            Int8 | Int16 | Int32 | Int64 => Self::Int(-1),
+            Int8 | Int16 | Int32 | Int64 | Index => Self::Int(-1),
             FP8E4M3 | FP8E5M2 | Float16 | BFloat16 | Float32 | Float64 => Self::Float(-1.0),
             _ => return None,
         })

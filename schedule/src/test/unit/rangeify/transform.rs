@@ -37,7 +37,7 @@ fn test_transform_buffer_source() {
 fn test_transform_realizable_source() {
     // Create a source that needs realization
     let x = UOp::define_global(1, DType::Float32);
-    let consumer = x.neg();
+    let consumer = x.try_sqrt().unwrap();
 
     // Create ranges
     let range = UOp::new(
