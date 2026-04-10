@@ -4,6 +4,8 @@ pub mod ext;
 #[cfg(any(test, feature = "proptest"))]
 pub mod test;
 
+use std::path::PathBuf;
+
 /// Device specification parsed from a device string.
 ///
 /// This enum represents different compute devices that can execute kernels.
@@ -20,6 +22,9 @@ pub enum DeviceSpec {
     Metal { device_id: usize },
     /// WebGPU device (browser or native WebGPU)
     WebGpu,
+    /// File-backed device (memory-mapped, read-only). Matches Tinygrad's DISK device.
+    /// Cannot execute kernels — data is transferred to compute devices via COPY.
+    Disk { path: PathBuf },
 }
 
 impl DeviceSpec {
@@ -37,9 +42,10 @@ impl DeviceSpec {
     pub fn canonicalize(&self) -> String {
         match self {
             DeviceSpec::Cpu => "CPU".to_string(),
-            DeviceSpec::Cuda { device_id } => format!("CUDA:{}", device_id),
-            DeviceSpec::Metal { device_id } => format!("Metal:{}", device_id),
+            DeviceSpec::Cuda { device_id } => format!("CUDA:{device_id}"),
+            DeviceSpec::Metal { device_id } => format!("Metal:{device_id}"),
             DeviceSpec::WebGpu => "WebGPU".to_string(),
+            DeviceSpec::Disk { path } => format!("DISK:{}", path.display()),
         }
     }
 
@@ -51,16 +57,17 @@ impl DeviceSpec {
     /// - Metal: 31 buffers (Apple Silicon hardware limit)
     /// - WebGPU: 8 buffers (WebGPU specification limit)
     /// - CPU/CUDA: None (no practical limit)
+    /// - Disk: None (file-backed, no kernel execution)
     pub fn max_buffers(&self) -> Option<usize> {
         match self {
-            DeviceSpec::Cpu => None,
+            DeviceSpec::Cpu | DeviceSpec::Disk { .. } => None,
             DeviceSpec::Cuda { .. } => Some(128),
             DeviceSpec::Metal { .. } => Some(31),
             DeviceSpec::WebGpu => Some(8),
         }
     }
 
-    /// Get the base device type string (strips device ID).
+    /// Get the base device type string (strips device ID / path).
     ///
     /// Used for device factory lookup and cache key construction.
     /// Unlike `canonicalize()`, this returns a static string without device ID.
@@ -80,7 +87,13 @@ impl DeviceSpec {
             DeviceSpec::Cuda { .. } => "CUDA",
             DeviceSpec::Metal { .. } => "METAL",
             DeviceSpec::WebGpu => "WEBGPU",
+            DeviceSpec::Disk { .. } => "DISK",
         }
+    }
+
+    /// Check if this is a DISK (file-backed) device.
+    pub fn is_disk(&self) -> bool {
+        matches!(self, DeviceSpec::Disk { .. })
     }
 }
 

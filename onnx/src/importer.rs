@@ -176,19 +176,36 @@ impl OnnxImporter {
     /// let result = model.outputs["output"].realize()?;
     /// ```
     pub fn import(&mut self, path: impl AsRef<Path>, dim_bindings: &[(&str, i64)]) -> Result<OnnxModel> {
-        self.model_dir = path.as_ref().parent().map(|p| p.to_path_buf());
-        let file = File::open(path.as_ref()).context(IoSnafu)?;
+        let path = path.as_ref();
+        self.model_dir = path.parent().map(|p| p.to_path_buf());
+        let file = File::open(path).context(IoSnafu)?;
         let mut reader = BufReader::new(file);
         let mut bytes = Vec::new();
         reader.read_to_end(&mut bytes).context(IoSnafu)?;
-        let model = ModelProto::decode(bytes.as_slice()).context(ProtobufDecodeSnafu)?;
-        self.import_model(model, dim_bindings)
+        // Decode from Bytes (not &[u8]) so raw_data fields are zero-copy sub-slices.
+        // This enables computing byte offsets for DISK-backed weight loading.
+        let file_bytes = prost::bytes::Bytes::from(bytes);
+        let base_ptr = file_bytes.as_ptr();
+        let model = ModelProto::decode(file_bytes).context(ProtobufDecodeSnafu)?;
+        self.import_model_with_disk(model, dim_bindings, Some(path), base_ptr)
     }
 
-    /// Import from a parsed `ModelProto`.
+    /// Import from a parsed `ModelProto` (no DISK-backed loading).
     pub fn import_model(&self, model: ModelProto, dim_bindings: &[(&str, i64)]) -> Result<OnnxModel> {
+        self.import_model_with_disk(model, dim_bindings, None, std::ptr::null())
+    }
+
+    /// Import from a parsed `ModelProto` with optional DISK-backed weight loading.
+    /// When `model_path` is Some, raw_data initializers become lazy DISK views.
+    fn import_model_with_disk(
+        &self,
+        model: ModelProto,
+        dim_bindings: &[(&str, i64)],
+        model_path: Option<&Path>,
+        base_ptr: *const u8,
+    ) -> Result<OnnxModel> {
         let bindings: HashMap<String, i64> = dim_bindings.iter().map(|&(k, v)| (k.to_string(), v)).collect();
-        let graph = self.prepare(model)?;
+        let graph = self.prepare_with_disk(model, model_path, base_ptr)?;
         let inputs = resolve_symbolic_shapes(&graph.inputs, &graph.variables, &bindings)?;
         let outputs = self.trace_graph(&graph, inputs.clone())?;
         Ok(OnnxModel { inputs, outputs, variables: graph.variables })
@@ -222,6 +239,15 @@ impl OnnxImporter {
 
     /// Extract graph structure from ONNX model (internal — used by `import_model`).
     pub(crate) fn prepare(&self, model: ModelProto) -> Result<OnnxGraph> {
+        self.prepare_with_disk(model, None, std::ptr::null())
+    }
+
+    fn prepare_with_disk(
+        &self,
+        model: ModelProto,
+        model_path: Option<&Path>,
+        base_ptr: *const u8,
+    ) -> Result<OnnxGraph> {
         let proto_graph = model.graph.ok_or_else(|| EmptyModelSnafu.build())?;
 
         // Collect opsets
@@ -229,20 +255,15 @@ impl OnnxImporter {
             model.opset_import.iter().map(|op| OpSetId { domain: op.domain.clone(), version: op.version }).collect();
 
         // Build initializer map (weights/constants).
-        // Group float raw_data initializers by dtype, pack each group into a shared buffer,
-        // and create lazy SHRINK → RESHAPE views per weight. This reduces scheduling
-        // boundaries from ~N to 1 per dtype, enabling kernel fusion.
-        // Matches Tinygrad's approach: raw_data → lazy tensor, typed fields → eager.
+        // When model_path is available: create a DISK-backed tensor from the file, then each
+        // raw_data initializer becomes a lazy SHRINK → BITCAST → RESHAPE → COPY(CPU) chain.
+        // All weights share ONE DISK buffer (matching Tinygrad's approach).
+        // When model_path is None: fall back to eager loading via tensor_from_proto_ext.
         let mut initializers: HashMap<String, Tensor> = HashMap::new();
         let initializer_names: Vec<String> = proto_graph.initializer.iter().map(|i| i.name.clone()).collect();
 
-        struct InitInfo {
-            name: String,
-            dims: Vec<usize>,
-            offset: usize,
-            numel: usize,
-        }
-        let mut packed_by_dtype: HashMap<DType, (Vec<u8>, Vec<InitInfo>)> = HashMap::new();
+        // Create DISK tensor if we have a file path
+        let disk_tensor = model_path.map(|p| Tensor::from_path(p).expect("DISK tensor creation"));
 
         for init in &proto_graph.initializer {
             if init.name.is_empty() {
@@ -253,42 +274,46 @@ impl OnnxImporter {
                 initializers.insert(init.name.clone(), const_fold_scalar(tensor));
                 continue;
             }
+
+            // DISK path: raw_data is a Bytes sub-slice of the file buffer.
+            // Compute byte offset via pointer arithmetic, create lazy view chain.
             let dtype = convert_onnx_dtype(init.data_type)?;
-            if !init.raw_data.is_empty() && dtype.is_float() {
+            let can_use_disk =
+                disk_tensor.is_some() && !init.raw_data.is_empty() && !base_ptr.is_null() && dtype.is_float(); // INT64 shape tensors go eager (no cross-size bitcast in codegen yet)
+
+            if can_use_disk {
                 let dims: Vec<usize> = init.dims.iter().map(|&d| d as usize).collect();
                 let numel: usize = dims.iter().product();
+
                 // Scalars: eager path for const-folding (const_fold_scalar needs buffer)
                 if numel <= 1 {
                     let tensor = tensor_from_proto_ext(init, self.model_dir.as_deref())?;
                     initializers.insert(init.name.clone(), const_fold_scalar(tensor));
                     continue;
                 }
-                let entry = packed_by_dtype.entry(dtype.clone()).or_insert_with(|| (Vec::new(), Vec::new()));
-                let elem_offset = entry.0.len() / dtype.bytes();
-                entry.0.extend_from_slice(&init.raw_data);
-                entry.1.push(InitInfo { name: init.name.clone(), dims, offset: elem_offset, numel });
+
+                let byte_offset = init.raw_data.as_ptr() as usize - base_ptr as usize;
+                let byte_len = init.raw_data.len();
+                let disk_uop = disk_tensor.as_ref().unwrap().uop();
+
+                // SHRINK(uint8 byte range) → BITCAST(target dtype) → RESHAPE(dims) → COPY(CPU)
+                // Matches Tinygrad: data.bitcast(true_dtype).reshape(shape).to(Device.DEFAULT)
+                let view = disk_uop
+                    .try_shrink(&[(SInt::from(byte_offset), SInt::from(byte_offset + byte_len))])
+                    .map_err(|e| crate::error::Error::IrConstruction {
+                        details: format!("DISK shrink '{}': {e}", init.name),
+                    })?;
+                let bitcasted = view.bitcast(dtype);
+                let ir_dims: smallvec::SmallVec<[SInt; 4]> = dims.iter().map(|&d| SInt::from(d)).collect();
+                let reshaped = bitcasted.try_reshape(&ir_dims).map_err(|e| crate::error::Error::IrConstruction {
+                    details: format!("DISK reshape '{}': {e}", init.name),
+                })?;
+                let copied = reshaped.copy_to_device(morok_dtype::DeviceSpec::Cpu);
+                let tensor = Tensor::from_lazy(copied);
+                initializers.insert(init.name.clone(), tensor);
             } else {
                 let tensor = tensor_from_proto_ext(init, self.model_dir.as_deref())?;
                 initializers.insert(init.name.clone(), const_fold_scalar(tensor));
-            }
-        }
-
-        // Create shared buffers per dtype and lazy SHRINK views per weight
-        for (dtype, (packed_data, infos)) in &packed_by_dtype {
-            let total_elems = packed_data.len() / dtype.bytes();
-            let shared_buf = Tensor::from_raw_bytes(packed_data, &[total_elems], dtype.clone())
-                .expect("packed initializer buffer creation");
-
-            for info in infos {
-                // SHRINK in element units (same dtype, no bitcast) → RESHAPE to final dims
-                let view = shared_buf
-                    .uop()
-                    .try_shrink(&[(SInt::from(info.offset), SInt::from(info.offset + info.numel))])
-                    .expect("shrink to weight element range");
-                let ir_dims: smallvec::SmallVec<[SInt; 4]> = info.dims.iter().map(|&d| SInt::from(d)).collect();
-                let reshaped = view.try_reshape(&ir_dims).expect("reshape weight to final dims");
-                let tensor = Tensor::from_lazy(reshaped);
-                initializers.insert(info.name.clone(), tensor);
             }
         }
 

@@ -198,6 +198,7 @@ impl Buffer {
                 let bytes = unsafe { &(&(*data.get()))[self.offset..self.offset + self.size] };
                 Ok(bytes)
             }
+            RawBuffer::Mmap { data, .. } => Ok(&data[self.offset..self.offset + self.size]),
             #[cfg(feature = "cuda")]
             _ => NotCpuAccessibleSnafu.fail(),
         }
@@ -223,6 +224,8 @@ impl Buffer {
                 let bytes = unsafe { &mut (&mut *data.get())[self.offset..self.offset + self.size] };
                 Ok(bytes)
             }
+            // Mmap is read-only — no mutable access
+            RawBuffer::Mmap { .. } => NotCpuAccessibleSnafu.fail(),
             #[cfg(feature = "cuda")]
             _ => NotCpuAccessibleSnafu.fail(),
         }
@@ -246,6 +249,12 @@ impl Buffer {
         match raw {
             RawBuffer::Cpu { data, .. } => {
                 let bytes = unsafe { &(&(*data.get()))[self.offset..self.offset + self.size] };
+                let count = bytes.len() / T::DTYPE.bytes();
+                let typed = unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const T, count) };
+                ndarray::ArrayViewD::from_shape(ndarray::IxDyn(&self.shape), typed).context(NdarrayShapeSnafu)
+            }
+            RawBuffer::Mmap { data, .. } => {
+                let bytes = &data[self.offset..self.offset + self.size];
                 let count = bytes.len() / T::DTYPE.bytes();
                 let typed = unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const T, count) };
                 ndarray::ArrayViewD::from_shape(ndarray::IxDyn(&self.shape), typed).context(NdarrayShapeSnafu)
@@ -338,6 +347,7 @@ impl Buffer {
                 slice.copy_from_slice(src);
                 Ok(())
             }
+            RawBuffer::Mmap { .. } => panic!("DISK device is read-only: copyin not supported"),
             #[cfg(feature = "cuda")]
             RawBuffer::CudaDevice { data, device } => {
                 // SAFETY: Scheduler guarantees exclusive access
@@ -371,6 +381,10 @@ impl Buffer {
                 // SAFETY: Scheduler guarantees no concurrent writes during buffer operations
                 let data_ref = unsafe { &*data.get() };
                 dst.copy_from_slice(&data_ref[self.offset..self.offset + self.size]);
+                Ok(())
+            }
+            RawBuffer::Mmap { data, .. } => {
+                dst.copy_from_slice(&data[self.offset..self.offset + self.size]);
                 Ok(())
             }
             #[cfg(feature = "cuda")]
@@ -417,6 +431,16 @@ impl Buffer {
                 dst_slice.copy_from_slice(src_slice);
                 Ok(())
             }
+            // Mmap -> CPU
+            (RawBuffer::Cpu { data: dst_data, .. }, RawBuffer::Mmap { data: src_data, .. }) => {
+                let dst_mut = unsafe { &mut *dst_data.get() };
+                let dst_slice = &mut dst_mut[self.offset..self.offset + self.size];
+                let src_slice = &src_data[src.offset..src.offset + src.size];
+                dst_slice.copy_from_slice(src_slice);
+                Ok(())
+            }
+            // Mmap as destination is not supported (read-only)
+            (RawBuffer::Mmap { .. }, _) => panic!("DISK device is read-only: copy_from not supported"),
             // CudaDevice -> CudaDevice
             #[cfg(feature = "cuda")]
             (
@@ -535,6 +559,10 @@ impl Buffer {
                 // This is already an unsafe function - caller guarantees exclusive access.
                 unsafe { (&mut *data.get()).as_mut_ptr().add(self.offset) }
             }
+            RawBuffer::Mmap { data, .. } => {
+                // Read-only mmap: writing through this pointer is UB.
+                unsafe { data.as_ptr().add(self.offset) as *mut u8 }
+            }
             #[cfg(feature = "cuda")]
             RawBuffer::CudaDevice { .. } | RawBuffer::CudaUnified { .. } => {
                 // TODO: CUDA device memory support for kernels
@@ -557,6 +585,7 @@ impl Buffer {
                 // SAFETY: Only reading the pointer address for test comparison
                 unsafe { (*data.get()).as_ptr() as usize }
             }
+            RawBuffer::Mmap { data, .. } => data.as_ptr() as usize,
             #[cfg(feature = "cuda")]
             RawBuffer::CudaDevice { data, .. } => {
                 // For CUDA device memory, we use the CudaSlice's internal pointer

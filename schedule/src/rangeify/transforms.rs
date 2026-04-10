@@ -563,7 +563,9 @@ pub(crate) fn transform_single_source(
             removable = removable,
             "BUFFERIZE decision"
         );
-        let opts = BufferizeOpts { device: None, addrspace, removable };
+        // Propagate source device to BUFFERIZE opts (Tinygrad indexing.py:69: device=s.device)
+        let device = src.device_spec();
+        let opts = BufferizeOpts { device, addrspace, removable };
 
         let bufferized = UOp::bufferize(Arc::clone(src), closed_ranges.clone(), opts);
 
@@ -1510,6 +1512,90 @@ pub fn find_bufs(store: &Arc<UOp>) -> HashMap<UOpKey, OpAccessType> {
 // PM_ADD_BUFFERS PATTERNS
 // ============================================================================
 
+/// Convert DISK BUFFERIZE(BITCAST|CONTIGUOUS) → BUFFER_VIEW (Tinygrad rangeify.py:285-304).
+/// For DISK devices, instead of creating a compute kernel, creates a zero-copy typed view
+/// with byte offset into the memory-mapped file.
+fn late_buffer_view(compute: &Arc<UOp>, bufferize: &Arc<UOp>) -> Option<Arc<UOp>> {
+    use morok_ir::uop::cached_property::CachedProperty;
+    use morok_ir::uop::properties::VminVmaxProperty;
+
+    let Op::Bufferize { opts, ranges, .. } = bufferize.op() else { return None };
+
+    // Only for DISK device
+    if !matches!(&opts.device, Some(d) if d.is_disk()) {
+        return None;
+    }
+
+    // Compute size from ranges (product of range ends)
+    let size: usize = ranges
+        .iter()
+        .map(|r| {
+            if let Op::Range { end, .. } = r.op()
+                && let (_, morok_ir::ConstValue::Int(v)) = VminVmaxProperty::get(end)
+            {
+                return *v as usize;
+            }
+            if let Op::Const(_) = r.op() {
+                return 1; // const 0 index contributes dim of 1
+            }
+            1
+        })
+        .product();
+
+    // Walk up from compute to find the INDEX node (Tinygrad rangeify.py:291-295)
+    // In Tinygrad, `t` is the BITCAST/CONTIGUOUS itself. We need to look INTO its children
+    // for an INDEX, not walk UP past it. The BITCAST's source (after rangeify) should be
+    // an INDEX or contain one.
+    let mut x = compute.clone();
+    loop {
+        // Check if any SOURCE of x is an INDEX
+        if x.op().sources().iter().any(|s| matches!(s.op(), Op::Index { .. })) {
+            break;
+        }
+        // For BITCAST/CONTIGUOUS (the starting node), look into their source
+        if matches!(x.op(), Op::BitCast { .. } | Op::Contiguous { .. }) {
+            x = x.op().sources().first()?.clone();
+            continue;
+        }
+        // Don't cross other elementwise ops
+        if matches!(x.op(), Op::Unary(..) | Op::Binary(..) | Op::Ternary(..) | Op::Cast { .. }) {
+            return None;
+        }
+        x = x.op().sources().first()?.clone();
+    }
+    let index = x.op().sources().iter().find(|s| matches!(s.op(), Op::Index { .. }))?.clone();
+
+    // Compute byte offset (Tinygrad rangeify.py:297-298)
+    let offset: usize = if let Op::Index { indices, .. } = index.op() {
+        if indices.is_empty() {
+            // Scalar: offset from first index's constant arg (Tinygrad: x.src[1].arg)
+            0
+        } else {
+            // Shaped: sum of index vmin values
+            let mut total: i64 = 0;
+            for idx in indices.iter() {
+                let (vmin, _) = VminVmaxProperty::get(idx);
+                if let morok_ir::ConstValue::Int(v) = vmin {
+                    total += v;
+                }
+            }
+            total.max(0) as usize
+        }
+    } else {
+        0
+    };
+
+    // Get base buffer (the DISK BUFFER UOp)
+    let base = index.base();
+
+    // Create BUFFER_VIEW with compute's dtype
+    let buffer_view = UOp::new(Op::BufferView { buffer: base, size, offset }, compute.dtype());
+
+    // Replace BUFFERIZE's first source with the BUFFER_VIEW, keep the range source
+    let new_sources: Vec<Arc<UOp>> = std::iter::once(buffer_view).chain(ranges.iter().cloned()).collect();
+    Some(UOp::bufferize(new_sources[0].clone(), new_sources[1..].to_vec(), opts.clone()))
+}
+
 /// Create pattern matcher for adding buffers (BUFFERIZE → STORE conversion).
 ///
 /// Based on Tinygrad's pm_add_buffers (rangeify.py:358-367) with `allow_locals=False`.
@@ -1539,6 +1625,10 @@ pub fn pm_add_buffers_patterns() -> crate::TypedPatternMatcher<super::kernel::Ke
                 let src = &mop.op().sources()[0];
                 Some(src.end(ranges.clone()))
             },
+        // to_bufferview: DISK BUFFERIZE(BITCAST|CONTIGUOUS) → BUFFER_VIEW (Tinygrad rangeify.py:302-304)
+        buf @ Bufferize { compute }
+            if matches!(compute.op(), Op::BitCast { .. } | Op::Contiguous { .. })
+            => |buf, compute, _ctx| late_buffer_view(compute, buf),
         // BUFFERIZE → STORE conversion (allow_locals=false: treat local as global)
         buf @ Bufferize { compute: _ } => |buf, ctx| {
             bufferize_to_store(buf, ctx, false)
@@ -1572,6 +1662,10 @@ pub fn pm_add_buffers_local_patterns() -> crate::TypedPatternMatcher<super::kern
                 let src = &mop.op().sources()[0];
                 Some(src.end(ranges.clone()))
             },
+        // to_bufferview: DISK BUFFERIZE(BITCAST|CONTIGUOUS) → BUFFER_VIEW (Tinygrad rangeify.py:302-304)
+        buf @ Bufferize { compute }
+            if matches!(compute.op(), Op::BitCast { .. } | Op::Contiguous { .. })
+            => |buf, compute, _ctx| late_buffer_view(compute, buf),
         // BUFFERIZE → STORE conversion (allow_locals=true: create DEFINE_LOCAL for local addrspace)
         buf @ Bufferize { compute: _ } => |buf, ctx| {
             bufferize_to_store(buf, ctx, true)

@@ -181,7 +181,7 @@ pub(crate) fn extract_scalar_const(data: &[u8], dtype: &DType) -> Result<ConstVa
 /// Extract raw data bytes from TensorProto.
 pub fn extract_tensor_data(tensor: &TensorProto) -> Result<Vec<u8>> {
     if !tensor.raw_data.is_empty() {
-        return Ok(tensor.raw_data.clone());
+        return Ok(tensor.raw_data.to_vec());
     }
 
     let dtype = convert_onnx_dtype(tensor.data_type)?;

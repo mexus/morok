@@ -170,7 +170,7 @@ fn test_if_shape_mismatch_errors() {
     cond_init.name = "condition".to_string();
     cond_init.data_type = tensor_proto::DataType::Bool as i32;
     cond_init.dims = vec![];
-    cond_init.raw_data = vec![1u8];
+    cond_init.raw_data = prost::bytes::Bytes::from(vec![1u8]);
     graph.initializer.push(cond_init);
 
     let then_const = {
@@ -852,7 +852,7 @@ fn make_if_model(cond_value: bool, x_values: &[f32]) -> ModelProto {
     cond_init.name = "condition".to_string();
     cond_init.data_type = tensor_proto::DataType::Bool as i32;
     cond_init.dims = vec![];
-    cond_init.raw_data = vec![cond_value as u8];
+    cond_init.raw_data = prost::bytes::Bytes::from(vec![cond_value as u8]);
     graph.initializer.push(cond_init);
 
     let mut x_input = ValueInfoProto::default();
@@ -975,7 +975,7 @@ morok_tensor::codegen_tests! {
         cond_init.name = "condition".to_string();
         cond_init.data_type = tensor_proto::DataType::Bool as i32;
         cond_init.dims = vec![];
-        cond_init.raw_data = vec![1u8];
+        cond_init.raw_data = prost::bytes::Bytes::from(vec![1u8]);
         graph.initializer.push(cond_init);
 
         let mut pv_input = ValueInfoProto::default();
@@ -1050,7 +1050,7 @@ morok_tensor::codegen_tests! {
             init.name = name.to_string();
             init.data_type = tensor_proto::DataType::Bool as i32;
             init.dims = vec![];
-            init.raw_data = vec![val as u8];
+            init.raw_data = prost::bytes::Bytes::from(vec![val as u8]);
             graph.initializer.push(init);
         }
 

@@ -25,6 +25,11 @@ pub trait DeviceSpecExt {
 
 impl DeviceSpecExt for DeviceSpec {
     fn parse(s: &str) -> Result<Self> {
+        // DISK: preserve path case (don't uppercase)
+        if s.len() >= 5 && s[..5].eq_ignore_ascii_case("DISK:") {
+            return Ok(DeviceSpec::Disk { path: std::path::PathBuf::from(&s[5..]) });
+        }
+
         let s = s.to_uppercase();
         let parts: Vec<&str> = s.split(':').collect();
 
@@ -112,6 +117,11 @@ impl DeviceRegistry {
     }
 
     fn create_allocator(&self, spec: &DeviceSpec) -> Result<Arc<dyn Allocator>> {
+        // DISK: no LRU caching (Tinygrad: DiskAllocator extends Allocator, not LRUAllocator)
+        if let DeviceSpec::Disk { path } = spec {
+            return Ok(Arc::new(crate::allocator::DiskAllocator::new(path.clone())));
+        }
+
         let base: Box<dyn Allocator> = match spec {
             DeviceSpec::Cpu => Box::new(CpuAllocator),
             #[cfg(feature = "cuda")]
@@ -120,6 +130,7 @@ impl DeviceRegistry {
             DeviceSpec::Cuda { .. } => unimplemented!("Cuda allocator - to be implemented"),
             DeviceSpec::Metal { .. } => unimplemented!("Metal allocator - to be implemented"),
             DeviceSpec::WebGpu => unimplemented!("WebGPU allocator - to be implemented"),
+            DeviceSpec::Disk { .. } => unreachable!(),
         };
 
         // Wrap with LRU cache (already thread-safe via Mutex)

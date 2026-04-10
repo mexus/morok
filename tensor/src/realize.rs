@@ -982,9 +982,35 @@ fn prepare_execution_plan(
     let opt_guard = opt_cache.guard();
 
     for item in &expanded_schedule {
-        // Skip COPY operations for now (handle separately in execution)
+        // COPY operations: buffer-to-buffer transfer (DISK→CPU, CPU→CUDA, etc.)
+        // No kernel compilation needed — just register the buffer copy for execution.
         if matches!(item.ast.op(), Op::Copy { .. }) {
-            // TODO: Handle COPY operations in ExecutionPlan
+            if item.buffers.len() >= 2 {
+                let mut dst = item.buffers[0].clone();
+                let src = &item.buffers[1];
+                if let Err(e) = dst.copy_from(src) {
+                    tracing::error!("COPY buffer transfer failed: {e}");
+                }
+            }
+            continue;
+        }
+
+        // BUFFER_VIEW: zero-copy sub-buffer view (DISK weight views).
+        // Creates a view into the base buffer at the specified byte offset.
+        // Tinygrad schedule.py:201-204: buffers[buf_uops[0]] = base.view(size, dtype, offset)
+        if let Op::BufferView { size, offset, .. } = item.ast.op() {
+            if item.buffers.len() >= 2 && item.buffer_uop_ids.len() >= 2 {
+                let base = &item.buffers[1];
+                let byte_offset = offset * base.dtype().bytes();
+                let byte_size = size * item.ast.dtype().bytes();
+                let view = base.view(byte_offset, byte_size).expect("BUFFER_VIEW: invalid view into base buffer");
+                // Register the view under the output buffer's UOp ID so downstream
+                // COPY/kernel items find it as their source buffer.
+                let output_uop_id = item.buffer_uop_ids[0];
+                if let Some(&idx) = uop_id_to_idx.get(&output_uop_id) {
+                    builder.replace_buffer(idx, view);
+                }
+            }
             continue;
         }
 

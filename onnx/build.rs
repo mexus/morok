@@ -3,7 +3,11 @@ use std::path::Path;
 fn main() {
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
     let proto_dir = Path::new(&manifest_dir).join("proto");
-    prost_build::compile_protos(&[proto_dir.join("onnx.proto")], &[&proto_dir]).unwrap();
+    let mut config = prost_build::Config::new();
+    // Decode raw_data as bytes::Bytes (zero-copy sub-slice of the input buffer).
+    // This enables computing byte offsets into the original file for DISK-backed weight loading.
+    config.bytes([".onnx.TensorProto.raw_data"]);
+    config.compile_protos(&[proto_dir.join("onnx.proto")], &[&proto_dir]).unwrap();
     generate_node_tests();
     generate_light_tests();
 }

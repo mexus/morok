@@ -1491,6 +1491,7 @@ version = "0.1.0-alpha.1"
 dependencies = [
  "cudarc",
  "enum_delegate",
+ "memmap2",
  "morok-dtype",
  "morok-ir",
  "ndarray",

@@ -158,6 +158,22 @@ impl Tensor {
         Self::new(uop)
     }
 
+    /// Create a file-backed tensor using the DISK device (Tinygrad: `Tensor(pathlib.Path)`).
+    /// The file is memory-mapped lazily — no data is read until the tensor is realized.
+    /// The resulting tensor has dtype `uint8` and shape `(file_size,)`.
+    pub fn from_path(path: &std::path::Path) -> Result<Self> {
+        let file_size = std::fs::metadata(path)
+            .map_err(|e| Error::IrConstruction { details: format!("DISK: {}: {e}", path.display()) })?
+            .len() as usize;
+        let canonical = path
+            .canonicalize()
+            .map_err(|e| Error::IrConstruction { details: format!("DISK: {}: {e}", path.display()) })?;
+        let device = morok_dtype::DeviceSpec::Disk { path: canonical };
+        let buffer_uop =
+            UOp::new_buffer(device, file_size, morok_dtype::DType::Scalar(morok_dtype::ScalarDType::UInt8));
+        Ok(Self::new(buffer_uop))
+    }
+
     /// Create tensor with existing buffer (for input tensors and realize results).
     pub(crate) fn with_buffer(entry: Arc<tensor_registry::TensorEntry>, buffer: Arc<Buffer>) -> Self {
         Self { entry, buffer: Some(buffer) }

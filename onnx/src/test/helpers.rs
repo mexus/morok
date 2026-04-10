@@ -62,12 +62,12 @@ pub(crate) fn make_graph(
 }
 
 pub(crate) fn make_tensor_proto(raw_data: Vec<u8>, dims: Vec<i64>, dtype: i32) -> TensorProto {
-    TensorProto { data_type: dtype, dims, raw_data, ..Default::default() }
+    TensorProto { data_type: dtype, dims, raw_data: raw_data.into(), ..Default::default() }
 }
 
 fn make_initializer(name: &str, data_type: i32, dims: Vec<i64>, raw_data: Vec<u8>) -> (ValueInfoProto, TensorProto) {
     let input = ValueInfoProto { name: name.to_string(), ..Default::default() };
-    let init = TensorProto { name: name.to_string(), data_type, dims, raw_data, ..Default::default() };
+    let init = TensorProto { name: name.to_string(), data_type, dims, raw_data: raw_data.into(), ..Default::default() };
     (input, init)
 }
 
@@ -144,14 +144,10 @@ pub(crate) fn run_onnx_light_test(model_path: &str, output_pb_path: &str, config
     let model_path = Path::new(model_path);
     let test_name = model_path.file_stem().unwrap().to_string_lossy();
 
-    // 1. Load and decode model
-    let model_bytes = std::fs::read(model_path).unwrap_or_else(|e| panic!("{test_name}: failed to read model: {e}"));
-    let model = ModelProto::decode(model_bytes.as_slice())
-        .unwrap_or_else(|e| panic!("{test_name}: failed to decode model: {e}"));
-
-    // 2. Import model (inputs are Tensor::empty — no data yet)
-    let importer = OnnxImporter::new();
-    let result = importer.import_model(model, &[]).unwrap_or_else(|e| panic!("{test_name}: import failed: {e}"));
+    // 1+2. Import model via file path — enables DISK-backed weight loading
+    // (Bytes zero-copy decoding + DISK tensor for lazy weight views)
+    let mut importer = OnnxImporter::new();
+    let result = importer.import(model_path, &[]).unwrap_or_else(|e| panic!("{test_name}: import failed: {e}"));
 
     // 3. Assign deterministic inputs: arange(n)/n (matches ONNX backend test runner)
     for (name, input_tensor) in &result.inputs {

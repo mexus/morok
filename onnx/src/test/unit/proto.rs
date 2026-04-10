@@ -22,7 +22,7 @@ fn test_convert_onnx_dtype_unsupported() {
 #[test]
 fn test_extract_tensor_data_raw() {
     let mut tensor = TensorProto::default();
-    tensor.raw_data = vec![1, 2, 3, 4];
+    tensor.raw_data = vec![1u8, 2, 3, 4].into();
     let data = extract_tensor_data(&tensor).unwrap();
     assert_eq!(data, vec![1, 2, 3, 4]);
 }

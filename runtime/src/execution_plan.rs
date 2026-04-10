@@ -430,6 +430,11 @@ impl ExecutionPlanBuilder {
         idx
     }
 
+    /// Replace a buffer at the given index (for BUFFER_VIEW sub-buffer views).
+    pub fn replace_buffer(&mut self, idx: usize, buffer: Buffer) {
+        self.buffers[idx] = buffer;
+    }
+
     /// Set single output buffer index (backwards compat).
     pub fn set_output_buffer(&mut self, idx: usize) {
         self.output_buffer_indices = vec![idx];
