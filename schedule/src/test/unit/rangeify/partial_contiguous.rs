@@ -23,11 +23,14 @@ use crate::rewrite::graph_rewrite;
 // Helper Functions
 // ============================================================================
 
-/// Create a test BUFFER with given size and dtype.
+/// Create a test PARAM with given size and dtype.
+///
+/// Uses Op::Param to match the real pipeline where normalize_buffers_to_params
+/// converts Buffer → Param before buffer removal runs. This ensures buffer
+/// counting tests reflect actual behavior (Param is counted, Buffer is not).
 fn create_test_buffer(size: usize, dtype: DType, id: usize) -> Arc<UOp> {
-    let unique = UOp::buffer_id(Some(id));
     let device = UOp::device(morok_device::DeviceSpec::Cpu);
-    UOp::new(Op::Buffer { unique, device, size }, dtype)
+    UOp::new(Op::Param { slot: id, size, device }, dtype.ptr(Some(size), AddrSpace::Global))
 }
 
 /// Create a test INDEX(BUFFERIZE(...), ...) pattern.

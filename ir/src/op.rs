@@ -82,6 +82,7 @@ pub enum Op {
     Param {
         slot: usize,
         size: usize,
+        device: Arc<UOp>,
     },
     Buffer {
         unique: Arc<UOp>,
@@ -319,10 +320,12 @@ impl Op {
             | Self::Invalid
             | Self::DefineGlobal(_)
             | Self::DefineLocal(_)
-            | Self::Param { .. }
             | Self::VConst { .. }
             | Self::DefineVar { .. }
             | Self::DefineReg { .. } => SmallVec::new(),
+
+            // Param has device child (like Buffer) — Tinygrad Ops.PARAM has DEVICE src
+            Self::Param { device, .. } => SmallVec::from_slice(&[device]),
 
             // Graph organization operations
             Self::Sink { sources } | Self::Group { sources } => sources.iter().collect(),

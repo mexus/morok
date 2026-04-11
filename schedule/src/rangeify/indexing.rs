@@ -225,20 +225,28 @@ fn pm_generate_realize_map() -> &'static crate::TypedPatternMatcher<IndexingCont
 }
 
 /// Check if a UOp is always contiguous (doesn't need realization).
+///
+/// Aligned with Tinygrad's ALWAYS_CONTIGUOUS (indexing.py:10-12).
+/// When the source of a BUFFERIZE is in this set, the BUFFERIZE gets `removable: false`,
+/// preventing it from being inlined by buffer removal.
 pub(crate) fn is_always_contiguous(uop: &Arc<UOp>) -> bool {
     matches!(
         uop.op(),
         Op::Contiguous { .. }
+            | Op::Assign { .. }
             | Op::Copy { .. }
             | Op::Buffer { .. }
-            | Op::Param { .. }
             | Op::BufferView { .. }
             | Op::Const(_)
+            | Op::Bind { .. }
             | Op::Device(_)
             | Op::MSelect { .. }
             | Op::MStack { .. }
-            | Op::DefineGlobal(_)
+            | Op::Param { .. }
             | Op::DefineLocal(_)
+            | Op::DefineReg { .. }
+            | Op::Load { .. }
+            | Op::Kernel { .. }
     )
 }
 

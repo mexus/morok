@@ -411,7 +411,8 @@ pub fn buffer_folding() -> TypedPatternMatcher {
         Index { buffer: c @ Const(_), .. } ~> |c| c.clone(),
         Copy { src: c @ Const(_), .. } ~> |c| c.clone(),
         Index { buffer: Bufferize { compute, ranges, .. }, indices, gate: None }
-            if ranges_equal(ranges, indices) => |compute| {
+            if ranges_equal(ranges, indices) && !matches!(compute.op(), Op::BufferView { .. })
+            => |compute| {
                 Some(compute.clone())
             },
     }
@@ -640,12 +641,17 @@ fn apply_pcontig_removal_inner(
         }
 
         match uop.op() {
+            // Tinygrad (rangeify.py:208-209): BUFFERIZE(Global) and MSTACK count + stop traversal
             Op::Bufferize { opts, .. } if opts.addrspace == AddrSpace::Global => {
                 buffers.push(Arc::clone(uop));
                 return false; // Stop traversing into GLOBAL bufferize
             }
-            // Count PARAM (normalized input buffer) like Tinygrad counts Ops.PARAM
-            Op::Buffer { .. } | Op::Param { .. } | Op::MStack { .. } | Op::MSelect { .. } => {
+            Op::MStack { .. } => {
+                buffers.push(Arc::clone(uop));
+                return false; // Stop traversing into MSTACK (Tinygrad returns False)
+            }
+            // Tinygrad (rangeify.py:211): PARAM counts but continues traversal
+            Op::Param { .. } => {
                 buffers.push(Arc::clone(uop));
             }
             Op::Index { .. } => indexes.push(Arc::clone(uop)),
@@ -691,10 +697,9 @@ fn apply_pcontig_removal_inner(
             false
         } else {
             let sink = UOp::sink(reduce_sources);
-            // Tinygrad (rangeify.py:230): checks for PARAM or BUFFERIZE in reduce body.
-            // Must include Op::Param because normalize_buffers_to_params converts
-            // Buffer → Param before buffer removal runs.
-            sink.any_in_subtree(|n| matches!(n.op(), Op::Buffer { .. } | Op::Param { .. } | Op::Bufferize { .. }))
+            // Tinygrad (rangeify.py:228): checks for PARAM or BUFFERIZE in reduce body.
+            // Buffer is normalized to Param before buffer removal runs.
+            sink.any_in_subtree(|n| matches!(n.op(), Op::Param { .. } | Op::Bufferize { .. }))
         }
     };
 
@@ -769,8 +774,9 @@ fn apply_pcontig_removal_inner(
                 let elem_size = buf.dtype().base().bytes();
                 product.checked_mul(elem_size)
             }
-            Op::Buffer { size, .. } => Some(*size),
-            Op::MStack { .. } | Op::MSelect { .. } => Some(1),
+            // After fix A1, accessed_buffers only contains Bufferize(Global), MStack, Param
+            Op::Param { size, .. } => Some(*size),
+            Op::MStack { .. } => Some(1),
             _ => None,
         })
         .sum();

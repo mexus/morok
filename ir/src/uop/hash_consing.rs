@@ -212,7 +212,7 @@ impl UOpKey {
             Op::Unroll { unroll_axes, .. } => OpData::UnrollAxes(unroll_axes.clone()),
             Op::Custom { code, .. } | Op::CustomI { code, .. } => OpData::CustomCode(code.clone()),
             Op::Contiguous { opts, .. } => OpData::ContiguousOpts(opts.to_vec()),
-            Op::Param { slot, size } => OpData::ParamData(*slot, *size),
+            Op::Param { slot, size, .. } => OpData::ParamData(*slot, *size),
             _ => OpData::None,
             // Op::Noop => todo!(),
             // Op::Invalid => todo!(),

@@ -4,6 +4,7 @@ mod constant;
 #[allow(clippy::field_reassign_with_default)]
 mod importer;
 mod indexing;
+mod kernel_count;
 mod nn;
 #[allow(clippy::field_reassign_with_default)]
 mod proto;

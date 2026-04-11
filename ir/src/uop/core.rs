@@ -404,7 +404,7 @@ impl UOp {
     pub fn device_spec(&self) -> Option<morok_dtype::DeviceSpec> {
         match self.op() {
             Op::Device(spec) => Some(spec.clone()),
-            Op::Buffer { device, .. } => {
+            Op::Buffer { device, .. } | Op::Param { device, .. } => {
                 if let Op::Device(spec) = device.op() {
                     Some(spec.clone())
                 } else {
@@ -945,7 +945,6 @@ impl UOp {
             | Op::Invalid
             | Op::DefineGlobal(_)
             | Op::DefineLocal(_)
-            | Op::Param { .. }
             | Op::VConst { .. }
             | Op::DefineVar { .. }
             | Op::DefineReg { .. } => {
@@ -995,6 +994,10 @@ impl UOp {
             Op::Buffer { size, .. } => {
                 assert_eq!(new_srcs.len(), 2);
                 Op::Buffer { unique: src(0), device: src(1), size: *size }
+            }
+            Op::Param { slot, size, .. } => {
+                assert_eq!(new_srcs.len(), 1);
+                Op::Param { slot: *slot, size: *size, device: src(0) }
             }
             Op::BufferView { size, offset, .. } => {
                 assert_eq!(new_srcs.len(), 1);

@@ -161,6 +161,30 @@ pub fn rangeify_with_map(
     // Stages 2a-6 (load_collapse, split_ranges, symbolic+flatten, simplify_ranges,
     // split_store) now run per-kernel in optimizer::apply_pre_optimization().
 
+    // SINK cleanup: filter sources to valid output types (Tinygrad rangeify.py:585-589).
+    // The mega-pass may simplify some SINK sources (e.g., BUFFERIZE(CONST) → CONST).
+    // Only keep sources whose base op is a valid output type.
+    if let Op::Sink { sources } = sink.op() {
+        let filtered: Vec<Arc<UOp>> = sources
+            .iter()
+            .filter(|s| {
+                matches!(
+                    s.base().op(),
+                    Op::Bufferize { .. } | Op::MStack { .. } | Op::Const(_) | Op::Param { .. } | Op::After { .. }
+                )
+            })
+            .cloned()
+            .collect();
+        if filtered.len() != sources.len() && !filtered.is_empty() {
+            tracing::debug!(
+                original = sources.len(),
+                filtered = filtered.len(),
+                "SINK cleanup: removed non-output sources after mega-pass"
+            );
+            sink = UOp::sink(filtered);
+        }
+    }
+
     // Buffer limit enforcement
     if let Some(device) = super::patterns::extract_device_from_graph(&sink)
         && let Some(limit) = device.max_buffers()

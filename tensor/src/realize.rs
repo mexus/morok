@@ -445,6 +445,22 @@ impl Tensor {
         let contiguouses: Vec<Arc<UOp>> = old_uops.iter().map(|u| u.contiguous()).collect();
         let sink = UOp::sink(contiguouses);
 
+        // Pre-schedule normalization: BUFFER→PARAM (Tinygrad pm_pre_sched_cache).
+        // Must run before rangeify so buffer counting sees Param nodes (not Buffer).
+        let (sink, param_buffers) = normalize_buffers_to_params(&sink);
+
+        // Rebuild input_buffers keyed by PARAM UOp ids (the normalized graph
+        // no longer has BUFFER nodes — they've been replaced with PARAMs).
+        let mut param_input_buffers = crate::schedule::InputBuffers::new();
+        for node in sink.toposort() {
+            if let Op::Param { slot, .. } = node.op() {
+                let (orig_buffer_id, _) = &param_buffers[*slot];
+                if let Some(buf) = all_input_buffers.get(orig_buffer_id) {
+                    param_input_buffers.insert(node.id, buf.clone());
+                }
+            }
+        }
+
         // Extract bound variable values from all pending tensor UOps
         let mut var_vals = HashMap::new();
         for uop in &old_uops {
@@ -454,7 +470,8 @@ impl Tensor {
         // Pipeline: rangeify → kernel_split → schedule → plan → execute
         let rangeify_result = morok_schedule::rangeify_with_map(sink, None).context(RangeifySnafu)?;
         let (kernelized, kernel_ctx) = morok_schedule::run_kernel_split_pipeline(rangeify_result.sink);
-        let schedule_result = crate::schedule::create_schedule(kernelized, &kernel_ctx, &all_input_buffers, &var_vals)?;
+        let schedule_result =
+            crate::schedule::create_schedule(kernelized, &kernel_ctx, &param_input_buffers, &var_vals)?;
 
         let t_prep = std::time::Instant::now();
         let plan = prepare_execution_plan(&schedule_result, config)?;
@@ -719,13 +736,15 @@ fn normalize_buffers_patterns() -> &'static morok_schedule::TypedPatternMatcher<
     static CACHED: LazyLock<morok_schedule::TypedPatternMatcher<NormalizeBuffersCtx>> = LazyLock::new(|| {
         morok_schedule::patterns! {
             @context NormalizeBuffersCtx;
-            buf @ Buffer { size, unique: _, .. } => {
+            // Tinygrad (schedule.py:106): UOp.param(slot, dtype, shape, device)
+            // Preserves device from Buffer so device_spec() works on Param.
+            buf @ Buffer { size, unique: _, device } => {
                 let slot = *ctx.buffer_map.entry(buf.id).or_insert_with(|| {
                     let s = ctx.param_buffers.len();
                     ctx.param_buffers.push((buf.id, buf.clone()));
                     s
                 });
-                Some(UOp::param(slot, *size, buf.dtype()))
+                Some(UOp::param(slot, *size, buf.dtype(), device.clone()))
             },
         }
     });
