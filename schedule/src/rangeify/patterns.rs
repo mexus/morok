@@ -1391,7 +1391,26 @@ pub fn local_to_param_patterns() -> TypedPatternMatcher<LocalAddBufferContext> {
         Range { end } if matches!(end.op(), Op::Const(v) if v.0.is_zero()) => |_r, _ctx| {
             Some(UOp::index_const(0))
         },
-        // Renumber RANGE axis_id (like Tinygrad's renumber_range)
+        // OUTER range → bound variable (Tinygrad rangeify.py:440-442)
+        // Tinygrad: UOp.variable("range_"+range_str(r), r.vmin, r.vmax).bind(r.replace(tag=None))
+        r @ Range { end: _, axis_id, axis_type }
+            if matches!(axis_id, AxisId::Unrenumbered(_)) && *axis_type == AxisType::Outer
+        => |r, _axis_id, _axis_type, ctx| {
+            // Tinygrad: r.vmin=0, r.vmax=(end-1).vmax
+            let vmin = r.vmin().try_int().unwrap_or(0);
+            let vmax = r.vmax().try_int().unwrap_or(0);
+            let range_id = ctx.next_range();
+            let var_name = format!("range_{range_id}");
+            let define_var = UOp::var(var_name, morok_dtype::DType::Index, vmin, vmax);
+            // Bind to the original range with cleared tag (Tinygrad: r.replace(tag=None))
+            // In Morok, clearing the tag = renumbering the axis_id
+            let Op::Range { end, axis_type, .. } = r.op() else { return None };
+            let range_cleared = UOp::range_axis(end.clone(), AxisId::Renumbered(range_id), *axis_type);
+            let bound = define_var.bind(range_cleared);
+            ctx.add_var(define_var, None);
+            Some(bound)
+        },
+        // Renumber non-OUTER RANGE axis_id (Tinygrad rangeify.py:443-445)
         Range { end, axis_id, axis_type } if matches!(axis_id, AxisId::Unrenumbered(_)) => |_r, end, axis_type, ctx| {
             Some(UOp::range_axis(end.clone(), AxisId::Renumbered(ctx.next_range()), *axis_type))
         },

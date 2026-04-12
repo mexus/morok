@@ -373,8 +373,13 @@ fn assign_ranges(
         }
 
         // Skip Index-typed UOps: shape parameters (begins/ends, dim sizes) are not data.
-        // Matches Tinygrad rangeify.py line 177: `if x.dtype.scalar() == dtypes.index: continue`
+        // Matches Tinygrad indexing.py:177
         if x.dtype().scalar() == Some(morok_dtype::ScalarDType::Index) {
+            continue;
+        }
+
+        // Skip MSTACK/MSELECT: Tinygrad indexing.py:194-196
+        if matches!(x.op(), Op::MStack { .. } | Op::MSelect { .. }) {
             continue;
         }
 
@@ -426,27 +431,7 @@ fn assign_ranges(
             } else {
                 continue;
             }
-        } else if let Op::ReduceAxis { .. } = x.op() {
-            // Use the ReduceAxis's OUTPUT shape, not input shape.
-            // For keepdim=true, output shape is [1], not [] - we must use actual output shape.
-            // Tinygrad inherits output ranges from consumers or creates based on output shape.
-            debug!(
-                node_id = x.id,
-                num_consumer_rngs = consumer_rngs.len(),
-                has_ending = !ending_ranges.get(&UOpKey(x.clone())).is_none_or(|e| e.is_empty()),
-                "ReduceAxis range assignment path"
-            );
-            if consumer_rngs.is_empty() {
-                if let Some(out_shape) = x.shape()? {
-                    out_shape.iter().map(|s| ctx.new_range(s, AxisType::Loop)).collect()
-                } else {
-                    continue;
-                }
-            } else if consumer_rngs.len() == 1 {
-                consumer_rngs[0].clone()
-            } else {
-                merge_consumer_ranges(x, &consumer_rngs, ctx)?
-            }
+        // Tinygrad: ReduceAxis uses the same consumer_rngs branching as all other ops
         } else if consumer_rngs.is_empty() {
             continue;
         } else if consumer_rngs.len() == 1 {
@@ -510,7 +495,7 @@ fn assign_ranges(
                         .enumerate()
                         .map(|(i, r)| {
                             if realize_axes.contains(&i) {
-                                ctx.new_range_uncollapsed(&shape[i], AxisType::Loop)
+                                ctx.new_range(&shape[i], AxisType::Loop)
                             } else {
                                 Arc::clone(r)
                             }
@@ -1184,7 +1169,7 @@ fn collect_ranges_from_uop(uop: &Arc<UOp>) -> Vec<Arc<UOp>> {
     ranges
 }
 
-/// Check if UOp is an elementwise operation.
+/// Check if UOp is an elementwise operation (matches Tinygrad's GroupOp.Elementwise).
 fn is_elementwise_op(uop: &Arc<UOp>) -> bool {
-    matches!(uop.op(), Op::Binary(..) | Op::Unary(..) | Op::Ternary(..) | Op::Cast { .. } | Op::Noop)
+    matches!(uop.op(), Op::Binary(..) | Op::Unary(..) | Op::Ternary(..) | Op::Cast { .. } | Op::BitCast { .. })
 }

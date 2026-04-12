@@ -121,8 +121,8 @@ enum OpData {
     SpecialName(String),
 
     // Buffer operations
-    BufferData(usize, usize),               // (unique_id, size) - each buffer is unique
-    ParamData(usize, usize, Option<usize>), // (slot, size, unique_id) - codegen PARAMs anti-dedup via unique_id
+    BufferData(usize, usize), // (unique_id, size) - each buffer is unique
+    ParamData(usize, usize),  // (slot, size) — dedup by structure, matching Tinygrad's UOp cache
     BufferView(usize, usize),
     Bufferize(BufferizeOpts),
 
@@ -210,13 +210,7 @@ impl UOpKey {
             Op::Unroll { unroll_axes, .. } => OpData::UnrollAxes(unroll_axes.clone()),
             Op::Custom { code, .. } | Op::CustomI { code, .. } => OpData::CustomCode(code.clone()),
             Op::Contiguous { opts, .. } => OpData::ContiguousOpts(opts.to_vec()),
-            Op::Param { slot, size, device } => {
-                // Per-kernel codegen PARAMs (device: None) use anti-dedup to prevent
-                // cross-kernel sharing.
-                // Pre-kernel PARAMs (device: Some) dedup normally by (slot, size).
-                let unique = if device.is_none() { Some(next_unique_id()) } else { None };
-                OpData::ParamData(*slot, *size, unique)
-            }
+            Op::Param { slot, size, .. } => OpData::ParamData(*slot, *size),
             _ => OpData::None,
             // Op::Noop => todo!(),
             // Op::Invalid => todo!(),

@@ -363,44 +363,28 @@ pub fn apply_masked_upcasts(scheduler: &mut Scheduler) -> bool {
     applied
 }
 
-/// Grouped reduction for large reduce dimensions (> threshold).
+/// Grouped reduction for small output dimensions (Tinygrad heuristic.py:83-89).
+///
+/// When the product of upcastable output dimensions is small (<= 2048),
+/// apply GROUPTOP on output axes to enable local reduction.
 pub fn try_grouped_reduction(scheduler: &mut Scheduler, config: &HeuristicsConfig) -> bool {
-    if !scheduler.renderer().has_local || config.disable_locals {
-        return false;
-    }
-    let reduce_axes = scheduler.axes_of(&[AxisType::Reduce]);
-    if reduce_axes.is_empty() {
+    if !scheduler.renderer().has_local || config.disable_locals || !scheduler.renderer().has_shared {
         return false;
     }
 
-    let rngs = scheduler.rngs();
-    let mut largest_axis = None;
-    let mut largest_size = 0;
-    let threshold = config.grouped_threshold as i64;
+    // Tinygrad: prod(k.output_shape[i] for i in k.upcastable_dims) <= 2048
+    let upcastable = scheduler.upcastable_dims();
+    let full_shape = scheduler.full_shape();
+    let group_for_reduces: i64 = upcastable.iter().map(|&i| full_shape.get(i).copied().unwrap_or(1)).product();
 
-    for &axis_idx in &reduce_axes {
-        if axis_idx >= rngs.len() {
-            continue;
-        }
-        let rng = &rngs[axis_idx];
-        if let Op::Range { end, .. } = rng.op()
-            && let Op::Const(cv) = end.op()
-            && let morok_ir::ConstValue::Int(size) = cv.0
-            && size > largest_size
-        {
-            largest_size = size;
-            largest_axis = Some(axis_idx);
-        }
-    }
-
-    if largest_size <= threshold {
+    if group_for_reduces > 2048 {
         return false;
     }
-    if let Some(axis_idx) = largest_axis
-        && let Some(logical) = reduce_axes.iter().position(|&a| a == axis_idx)
-    {
-        let group_size = (config.grouped_threshold).min(largest_size as usize);
-        if apply_opt(scheduler, &Opt::group(logical, group_size), true).is_ok() {
+
+    // Tinygrad: for axis, sz in itertools.product((0, 1, 2), (16,)):
+    //   try: k.apply_opt(Opt(OptOps.GROUPTOP, axis, sz)); break
+    for axis in 0..3 {
+        if apply_opt(scheduler, &Opt::grouptop(axis, 16), true).is_ok() {
             return true;
         }
     }
