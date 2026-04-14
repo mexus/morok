@@ -1125,12 +1125,14 @@ pub(crate) fn transform_movement_through_index(
     indices: &SmallVec<[Arc<UOp>; 4]>,
     gate: &Option<Arc<UOp>>,
 ) -> Option<Arc<UOp>> {
-    use super::indexing::apply_movement_op;
+    use super::indexing::{SimplifyCache, apply_movement_op};
 
     let src = &mop.op().sources()[0];
     let src_shape = src.shape().ok()??;
 
-    let transformed = apply_movement_op(mop.op(), src_shape, indices.as_slice());
+    // Temporary cache — this call site is outside the scoped assign_ranges cache
+    let mut cache = SimplifyCache::default();
+    let transformed = apply_movement_op(mop.op(), src_shape, indices.as_slice(), &mut cache);
 
     match gate {
         Some(g) => UOp::index().buffer(src.clone()).indices(transformed).gate(g.clone()).call(),

@@ -1,4 +1,4 @@
-//! Valid clause simplification (Tinygrad symbolic.py:262-384).
+//! Valid clause simplification.
 //!
 //! Simplifies AND-chains of validity clauses and narrows WHERE-Invalid gates
 //! using bound information from the condition.
@@ -56,7 +56,7 @@ fn parse_valid(v: &Arc<UOp>) -> Option<(Arc<UOp>, bool, i64)> {
     None
 }
 
-/// Check if a UOp is irreducible (Tinygrad: GroupOp.Irreducible = {CONST, DEFINE_VAR, SPECIAL, RANGE}).
+/// Check if a UOp is irreducible (upstream: GroupOp.Irreducible = {CONST, DEFINE_VAR, SPECIAL, RANGE}).
 fn is_irreducible(op: &Op) -> bool {
     matches!(op, Op::Const(..) | Op::DefineVar { .. } | Op::Special { .. } | Op::Range { .. })
 }
@@ -93,12 +93,12 @@ fn join_and(clauses: &[Arc<UOp>]) -> Arc<UOp> {
     clauses.iter().cloned().reduce(|a, b| a.and_(&b)).unwrap()
 }
 
-/// Simplify redundant AND clauses (Tinygrad symbolic.py:320-328).
+/// Simplify redundant AND clauses.
 ///
 /// Splits the AND into clauses, deduplicates, and for each clause tries to
 /// simplify it given the already-accepted clauses as known-true constraints.
 pub fn simplify_valid(valid: &Arc<UOp>) -> Option<Arc<UOp>> {
-    // Skip if the AND chain references INDEX nodes
+    // skip if AND chain references INDEX nodes
     if valid.has_index_in_sources() {
         return None;
     }
@@ -110,17 +110,14 @@ pub fn simplify_valid(valid: &Arc<UOp>) -> Option<Arc<UOp>> {
         return None;
     }
 
-    // Sort by priority: clauses whose parsed expr appears in other clauses' backward slices
-    // should come first, so they're more likely to simplify later clauses.
-    // This matches Tinygrad's _valid_priority.
-    // Pre-compute backward slices once per clause (Tinygrad caches these as a property).
-    let original_clauses = clauses.clone();
-    let backward_slices: Vec<&HashSet<u64>> = original_clauses.iter().map(|c| c.backward_slice_ids()).collect();
+    // Sort by priority
+    let clauses_snapshot = clauses.clone();
+    let backward_slices: Vec<&HashSet<u64>> = clauses_snapshot.iter().map(|c| c.backward_slice_ids()).collect();
     clauses.sort_by_key(|v| {
         let Some((expr, _, _)) = parse_valid(v) else { return 0i32 };
         let expr_id = expr.id;
         let mut priority = 0i32;
-        for (i, other) in original_clauses.iter().enumerate() {
+        for (i, other) in clauses_snapshot.iter().enumerate() {
             if other.id == v.id {
                 continue;
             }
@@ -131,7 +128,10 @@ pub fn simplify_valid(valid: &Arc<UOp>) -> Option<Arc<UOp>> {
         priority
     });
 
-    // Deduplicate by id
+    // Save sorted list BEFORE dedup for final comparison (if ret != valids else None`)
+    let sorted_valids = clauses.clone();
+
+    // for stmt in dedup(valids)` — iterate deduplicated
     let mut seen = std::collections::HashSet::new();
     clauses.retain(|c| seen.insert(c.id));
 
@@ -147,15 +147,16 @@ pub fn simplify_valid(valid: &Arc<UOp>) -> Option<Arc<UOp>> {
         ret.push(simplified);
     }
 
-    // Only return if something changed
-    if ret.len() == clauses.len() && ret.iter().zip(clauses.iter()).all(|(a, b)| a.id == b.id) {
+    // Compare ret against ORIGINAL sorted list (pre-dedup)
+    // return UOp.prod(*ret) if ret != valids else None
+    if ret.len() == sorted_valids.len() && ret.iter().zip(sorted_valids.iter()).all(|(a, b)| a.id == b.id) {
         return None;
     }
 
     Some(join_and(&ret))
 }
 
-/// Simplify a UOp given that `valid` is known to be true (Tinygrad symbolic.py:277-314).
+/// Simplify a UOp given that `valid` is known to be true.
 ///
 /// Parses validity clauses into bounds, creates substitute variables with
 /// tighter ranges, and rewrites the uop.
@@ -192,7 +193,7 @@ fn uop_given_valid(valid: &Arc<UOp>, uop: &Arc<UOp>, try_simplex: bool) -> Arc<U
     }
 
     // Build candidate list: (original_expr, fake_var_with_tighter_bounds)
-    // Tinygrad symbolic.py:288-292
+    //
     let mut all_candidates: Vec<(Arc<UOp>, Arc<UOp>)> = Vec::new();
     let mut uop = uop.clone();
 
@@ -212,7 +213,7 @@ fn uop_given_valid(valid: &Arc<UOp>, uop: &Arc<UOp>, try_simplex: bool) -> Arc<U
         let fake_var = if expr.dtype() != fake_var.dtype() { fake_var.cast(expr.dtype()) } else { fake_var };
         all_candidates.push((expr.clone(), fake_var));
 
-        // Per-candidate simplex logic (Tinygrad symbolic.py:294-309)
+        // Per-candidate simplex logic
         if try_simplex {
             let mut candidate_sets: Vec<Vec<(Arc<UOp>, Arc<UOp>)>> = vec![vec![all_candidates.last().unwrap().clone()]];
 
@@ -272,7 +273,7 @@ fn uop_given_valid(valid: &Arc<UOp>, uop: &Arc<UOp>, try_simplex: bool) -> Arc<U
                 if simplified.windows(2).all(|w| w[0].id == w[1].id) {
                     uop = simplified[0].clone();
                 }
-                // TODO: VECTORIZE partial simplification (Tinygrad lines 307-309) — add when needed
+                // TODO: VECTORIZE partial simplification (upstream) — add when needed
             }
         }
     }
@@ -281,7 +282,7 @@ fn uop_given_valid(valid: &Arc<UOp>, uop: &Arc<UOp>, try_simplex: bool) -> Arc<U
         return uop;
     }
 
-    // Combined all-candidates substitution (Tinygrad symbolic.py:311-313)
+    // Combined all-candidates substitution
     #[allow(clippy::mutable_key_type)]
     let sub_map: HashMap<UOpKey, Arc<UOp>> =
         all_candidates.iter().map(|(x, f)| (UOpKey(x.clone()), f.clone())).collect();
@@ -302,7 +303,7 @@ fn uop_given_valid(valid: &Arc<UOp>, uop: &Arc<UOp>, try_simplex: bool) -> Arc<U
 }
 
 /// Simplify WHERE(cond, x, Invalid) using cond as bounds context
-/// (Tinygrad symbolic.py:366-369).
+///.
 ///
 /// Rewrites `x` using tighter bounds derived from the condition `cond`.
 pub fn gated_given_valid(cond: &Arc<UOp>, x: &Arc<UOp>, invalid: &Arc<UOp>) -> Option<Arc<UOp>> {
@@ -329,7 +330,7 @@ pub fn pm_simplify_valid() -> &'static TypedPatternMatcher {
 /// Drop AND clauses from WHERE conditions when the clause's ranges
 /// don't overlap with the gated expression's ranges.
 ///
-/// Tinygrad: `pm_drop_and_clauses` (symbolic.py:343-346).
+/// pm_drop_and_clauses`.
 ///
 /// For `WHERE(AND(c1, c2, ..., cn), expr, INVALID)`:
 /// - Keep clause ci if any of ci's RANGE ops also appear in expr's RANGE ops
@@ -380,7 +381,7 @@ fn drop_and_clauses(cond: &Arc<UOp>, x: &Arc<UOp>, invalid: &Arc<UOp>) -> Option
 
 /// Pattern matcher that drops irrelevant AND clauses from WHERE-Invalid gates.
 ///
-/// Tinygrad: `pm_drop_and_clauses` (symbolic.py:346).
+/// pm_drop_and_clauses`.
 pub fn pm_drop_and_clauses() -> &'static TypedPatternMatcher {
     crate::cached_patterns! {
         Where(cond, x, inv) if matches!(inv.op(), Op::Invalid)

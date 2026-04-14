@@ -48,7 +48,7 @@ pub use transforms::{
 };
 
 // Utilities (re-exported from indexing)
-pub use indexing::{apply_movement_op, is_dead_axis, ranges_equal};
+pub use indexing::{SimplifyCache, apply_movement_op, is_dead_axis, ranges_equal};
 pub use patterns::{extract_device_from_graph, is_elementwise};
 
 // Testing exports

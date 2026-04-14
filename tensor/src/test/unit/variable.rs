@@ -391,7 +391,6 @@ crate::codegen_tests! {
         // 2. Build computation graph and prepare plan (wires output tensor to plan buffer)
         let mut sum_result = input.sum(()).unwrap();
         let mut plan = Tensor::prepare_batch_with([&mut sum_result], &config).unwrap();
-        let mut executor = morok_runtime::global_executor();
 
         // 3. Execute loop with varying N and data
         for &(n, ref data, expected) in &[
@@ -406,7 +405,7 @@ crate::codegen_tests! {
 
             // Execute with new N — same compiled kernels, different variable
             let bound = batch.bind(n).unwrap();
-            plan.execute_with_vars(&mut executor, &[bound.as_var_val()]).unwrap();
+            plan.execute_with_vars(&[bound.as_var_val()]).unwrap();
 
             // Read scalar output
             let result = sum_result.buffer().unwrap().item::<f32>().unwrap();

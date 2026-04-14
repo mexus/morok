@@ -67,7 +67,7 @@ pub fn constant_folding_dsl_patterns() -> &'static TypedPatternMatcher {
 /// - Binary operations mixing Const and VConst (with broadcast)
 /// - Unary operations on VConst
 ///
-/// Based on Tinygrad's exec_alu for VCONST handling.
+/// Based on exec_alu for VCONST handling.
 pub fn vconst_folding_patterns() -> &'static TypedPatternMatcher {
     crate::cached_patterns! {
         // Binary VConst folding: VConst op VConst → VConst
@@ -117,7 +117,7 @@ pub fn vconst_folding_patterns() -> &'static TypedPatternMatcher {
     }
 }
 
-/// VECTORIZE(CONST, CONST, ...) → VCONST (Tinygrad symbolic.py:258-259).
+/// VECTORIZE(CONST, CONST, ...) → VCONST.
 ///
 /// Collapses a VECTORIZE of all-constant elements into a single VCONST node.
 pub fn vectorize_to_vconst_patterns() -> &'static TypedPatternMatcher {
@@ -174,9 +174,9 @@ pub fn identity_and_zero_patterns() -> &'static TypedPatternMatcher {
         },
 
         // ========== Zero propagation ==========
-        // x * 0 → 0 (Tinygrad symbolic.py:91-95)
+        // x * 0 → 0
         // For float consts that are NaN/Inf: fold to NaN (IEEE 754: nan*0=nan, inf*0=nan).
-        // NOTE: can be wrong for loaded NaN (same caveat as Tinygrad).
+        // NOTE: can be wrong for loaded NaN (same caveat as upstream).
         Mul[x, _zero @ @zero] => {
             if let Op::Const(ConstValueHash(ConstValue::Float(f))) = x.op()
                 && (f.is_nan() || f.is_infinite()) {
@@ -188,7 +188,7 @@ pub fn identity_and_zero_patterns() -> &'static TypedPatternMatcher {
     }
 }
 
-/// Invalid propagation patterns (Tinygrad symbolic.py:29-38).
+/// Invalid propagation patterns.
 ///
 /// Push arithmetic through WHERE-encoded gates to preserve validity tracking:
 /// - CAST(WHERE(cond, x, Invalid)) → WHERE(cond, CAST(x), Invalid)
@@ -196,8 +196,8 @@ pub fn identity_and_zero_patterns() -> &'static TypedPatternMatcher {
 /// - ALU(y, WHERE(cond, x, Invalid)) → WHERE(cond, ALU(y, x), Invalid)
 /// - ALU(Invalid, y) → Invalid  (only when y is Index dtype, left position only)
 ///
-/// Note: Tinygrad only propagates bare Invalid from the LEFT position and requires
-/// the right operand to be Index dtype (symbolic.py:37). Right-position bare Invalid
+/// Note: Upstream only propagates bare Invalid from the LEFT position and requires
+/// the right operand to be Index dtype (upstream symbolic_simple). Right-position bare Invalid
 /// is NOT propagated to avoid contaminating non-index computations.
 ///
 /// MUST be first in `symbolic_simple()` — before `x*0→0` which would eat
@@ -210,7 +210,7 @@ pub fn propagate_invalid() -> &'static TypedPatternMatcher {
         // This form arises indirectly: when an inner WHERE(valid, rng, INVALID) collapses
         // to bare INVALID (condition proven always-false by range analysis), the graph rewrite
         // engine rebuilds the parent WHERE via with_sources, placing bare INVALID in the true branch.
-        // Tinygrad avoids this because their pattern ordering resolves it during reconstruction;
+        // Upstream avoids this because their pattern ordering resolves it during reconstruction;
         // Morok needs explicit canonicalization.
         Where(cond, inv, x) if matches!(inv.op(), Op::Invalid) => {
             let invalid = if inv.dtype() == x.dtype() { inv.clone() } else { UOp::new(Op::Invalid, x.dtype()) };
@@ -224,25 +224,14 @@ pub fn propagate_invalid() -> &'static TypedPatternMatcher {
             UOp::try_where(flipped, x.clone(), invalid).ok()
         },
 
-        // Merge nested WHERE-Invalid: WHERE(c1, WHERE(c2, x, Inv), Inv) → WHERE(AND(c1, c2), x, Inv)
-        // Multi-dimensional padding creates nested WHERE-Invalid after propagation through
-        // linearized index arithmetic (e.g., WHERE(valid_h, idx_h, Inv)*W + WHERE(valid_w, idx_w, Inv)
-        // → WHERE(valid_h, WHERE(valid_w, linear_idx, Inv), Inv)). Merging to a single level
-        // ensures pm_lower_index_dtype's INDEX pattern can consume it in one step.
-        Where(c1, Where(c2, x, inner_inv), outer_inv) if matches!(inner_inv.op(), Op::Invalid) && matches!(outer_inv.op(), Op::Invalid) ~> {
+        // Merge nested WHERE: a.where(b.where(c, d), d) → (a & b).where(c, d)
+        // .
+        Where(c1, Where(c2, x, d), d) ~> {
             let combined = c1.and_(c2);
-            UOp::try_where(combined, x.clone(), inner_inv.clone()).expect("failed to create WHERE")
+            UOp::try_where(combined, x.clone(), d.clone()).expect("failed to create WHERE")
         },
 
-        // Safety net: Eliminate WHERE-Invalid from data path.
-        // If absorb_invalid_into_index_gate didn't catch it (e.g. multi-index INDEX),
-        // WHERE(c1, WHERE(c2, x, Inv), y) → WHERE(AND(c1,c2), x, y) remains correct.
-        Where(c1, Where(c2, x, inner_inv), y) if matches!(inner_inv.op(), Op::Invalid) ~> {
-            let combined = c1.and_(c2);
-            UOp::try_where(combined, x.clone(), y.clone()).expect("failed to create WHERE")
-        },
-
-        // Drop WHERE-Invalid through CAST (Tinygrad symbolic.py:31)
+        // Drop WHERE-Invalid through CAST
         // CAST(WHERE(cond, x, Invalid)) → CAST(x)
         // INVALID only lives in Index dtype for INDEX addresses. After CAST to a
         // different type, the protection is irrelevant — the outer value-level WHERE
@@ -271,7 +260,7 @@ pub fn propagate_invalid() -> &'static TypedPatternMatcher {
                 },
         },
 
-        // Strip WHERE-Invalid from comparison inputs (Tinygrad symbolic.py:35)
+        // Strip WHERE-Invalid from comparison inputs
         // CMP(WHERE(cond, x, Invalid), y) → CMP(x, y)
         // When comparing padded values, the Invalid region is already gated downstream,
         // so we can safely compare just the valid part.
@@ -288,14 +277,14 @@ pub fn propagate_invalid() -> &'static TypedPatternMatcher {
                 ~> UOp::new(Op::Binary(op, y.clone(), x.clone()), r.dtype()),
         },
 
-        // ALU with bare Invalid → Invalid (Tinygrad symbolic.py:37)
-        // Tinygrad: `invalid_pat.alu(op, UPat(dtype=dtypes.index))` with auto-commutation.
+        // ALU with bare Invalid → Invalid
+        // upstream: only from left position with auto-commutation.
         // Left position (all ops):
         for op in binary [Add, Mul, Sub, Mod, Max, Idiv, Fdiv, Pow, And, Or, Xor, Shl, Shr] {
             op(invalid, y) if matches!(invalid.op(), Op::Invalid) && y.dtype() == DType::Index
                 ~> { let _ = op; invalid.clone() },
         },
-        // Right position (commutative ops only — Tinygrad auto-commutation):
+        // Right position (commutative ops only — upstream auto-commutation):
         for op in binary [Add, Mul, Max, And, Or, Xor] {
             op(y, invalid) if matches!(invalid.op(), Op::Invalid) && y.dtype() == DType::Index
                 ~> { let _ = op; invalid.clone() },
@@ -303,7 +292,7 @@ pub fn propagate_invalid() -> &'static TypedPatternMatcher {
     }
 }
 
-/// Fold LOAD/STORE with fully-Invalid INDEX (Tinygrad symbolic.py:408-409).
+/// Fold LOAD/STORE with fully-Invalid INDEX.
 ///
 /// When an INDEX has an Invalid marker as its index, the entire access is out-of-bounds:
 /// - LOAD(INDEX(buf, Invalid)) → const 0 (invalid load produces zero)
@@ -359,11 +348,11 @@ pub fn fold_invalid_load_store() -> &'static TypedPatternMatcher {
 pub fn symbolic_simple() -> &'static TypedPatternMatcher {
     static CACHED: std::sync::LazyLock<TypedPatternMatcher> = std::sync::LazyLock::new(|| {
         // Tier 1: Basic algebraic identities, constant folding, propagate_invalid.
-        // Matches Tinygrad's `symbolic_simple` (symbolic.py:40-118).
+        // Matches upstream `symbolic_simple` (upstream symbolic_simple).
         // Used at lightweight stages: decompositions, pm_simplify_valid helpers.
         propagate_invalid()
             + constant_folding_dsl_patterns()
-            + vconst_folding_patterns()         // Tinygrad folds CONST+VCONST together in symbolic_simple
+            + vconst_folding_patterns()         // Upstream folds CONST+VCONST together in symbolic_simple
             + bool_arithmetic_patterns()
             + identity_and_zero_patterns()
             + self_folding_dsl_patterns()
@@ -381,10 +370,10 @@ pub fn symbolic_simple() -> &'static TypedPatternMatcher {
 
 /// Full symbolic simplification matcher (tier 2).
 ///
-/// Matches Tinygrad's `symbolic` (symbolic.py:185-260):
+/// Matches upstream `symbolic` (upstream symbolic_simple):
 /// symbolic_simple + commutative + inline PM + div_and_mod_symbolic + gep_pushing.
 ///
-/// Pattern order matches Tinygrad: commutative → boolean algebra → WHERE swap →
+/// Pattern order matches commutative → boolean algebra → WHERE swap →
 /// WHERE ALU combine → term combining → vmin/vmax → max fold → ALU folding →
 /// comparison/lt → range mod/div → advanced division → cast/long → AFTER →
 /// VECTORIZE → gep_pushing.
@@ -393,9 +382,9 @@ pub fn symbolic_simple() -> &'static TypedPatternMatcher {
 pub fn symbolic() -> &'static TypedPatternMatcher {
     static CACHED: std::sync::LazyLock<TypedPatternMatcher> = std::sync::LazyLock::new(|| {
         symbolic_simple()
-            // Tinygrad: commutative (separate PM, line 179)
+            // commutative (separate PM, line 179)
             + commutative_canonicalization()
-            // Tinygrad inline PM (lines 186-259), ordered to match:
+            // Ordered to match upstream:
             + boolean_dsl_patterns()           // I1: x|!x (line 188)
             + term_combining_dsl_patterns()    // I2-I8: combine terms (lines 190-196)
             + dce_dsl_patterns()               // I12: WHERE(!cond) swap (lines 201-202)
@@ -418,7 +407,7 @@ pub fn symbolic() -> &'static TypedPatternMatcher {
 
 /// Maximum symbolic matcher (tier 3).
 ///
-/// Matches Tinygrad's `sym` (symbolic.py:388-431):
+/// Matches `sym` (upstream symbolic_simple):
 /// symbolic + pm_simplify_valid + store/load fold + cast-through-WHERE +
 /// ALU/VECTORIZE reorder + x!=0 fold + reciprocal distribution +
 /// opinionated combine terms + reduce hoist.
@@ -431,7 +420,7 @@ pub fn sym() -> &'static TypedPatternMatcher {
             + alu_vectorize_reorder_patterns()
             + ne_zero_fold_patterns()
             + cast_where_dsl_patterns()
-            + fold_invalid_load_store()           // Tinygrad sym lines 408-409
+            + fold_invalid_load_store()
             + store_load_folding_patterns()
             + reciprocal_patterns()
             + reduce_sym_patterns()
@@ -447,7 +436,7 @@ pub fn sym() -> &'static TypedPatternMatcher {
 /// `R1*8000 + R2*16` and `R2*16 + R1*8000` won't be deduplicated by hash
 /// consing, breaking grouping in `expand_vector_index`.
 ///
-/// Follows Tinygrad's approach (symbolic.py:178-182): only applies to
+/// Follows upstream symbolic_simple: only applies to
 /// index-type operations to avoid breaking vector math merging.
 fn commutative_canonicalization() -> &'static TypedPatternMatcher {
     crate::cached_patterns! {
@@ -474,7 +463,7 @@ pub fn self_folding_dsl_patterns() -> &'static TypedPatternMatcher {
         Idiv(x, _c @const(c_val)) if c_val.is_neg_one() ~> x.neg(),
         // (x % y) % y → x % y
         Mod(Mod(x, y), y) ~> x.mod_(y),
-        // Idempotent: x op x → x (Tinygrad GroupOp.Idempotent = {AND, OR, MAX})
+        // Idempotent: x op x → x (GroupOp.Idempotent = {AND, OR, MAX})
         And(x, x) ~> x.clone(),
         Max(x, x) ~> x.clone(),
         // x | x → x
@@ -485,16 +474,16 @@ pub fn self_folding_dsl_patterns() -> &'static TypedPatternMatcher {
 /// Zero folding patterns.
 ///
 /// Patterns that fold to zero or false:
-/// - x < x → False (Tinygrad symbolic.py:69, no dtype guard)
+/// - x < x → False (, no dtype guard)
 /// - x % x → 0
-/// - x != x → False (Tinygrad symbolic.py:72-73, ints+bool+index only)
+/// - x != x → False (, ints+bool+index only)
 pub fn zero_folding_dsl_patterns() -> &'static TypedPatternMatcher {
     crate::cached_patterns! {
         // x % x → 0
         Mod(x, x) => x.dtype().scalar().map(|dt| UOp::const_(x.dtype(), ConstValue::zero(dt))),
-        // x < x → False (Tinygrad L69: no dtype guard, returns bool.vec(count))
+        // x < x → False (no dtype guard, returns bool.vec(count))
         Lt(x, x) => Some(UOp::const_(DType::Bool.vec(x.dtype().vcount()), ConstValue::Bool(false))),
-        // x != x → False (Tinygrad L72-73: ints+bool+index, returns bool.vec(count))
+        // x != x → False (ints+bool+index, returns bool.vec(count))
         Ne(x, x) if x.dtype().is_int() || x.dtype().is_bool() =>
             Some(UOp::const_(DType::Bool.vec(x.dtype().vcount()), ConstValue::Bool(false))),
     }
@@ -514,7 +503,7 @@ pub fn range_based_mod_div_patterns() -> &'static TypedPatternMatcher {
         // Range(end) // end → 0 (all values in [0, end) divide by end to 0)
         Idiv(Range { end, .. }, end)  ~> UOp::index_const(0),
 
-        // Negative operand canonicalization (Tinygrad divandmod.py:99-100, 110-111).
+        // Negative operand canonicalization (upstream divandmod, 110-111).
         // Canonicalize div/mod with negative operands into positive-operand form
         // so downstream simplification patterns (which assume positive) can fire.
         //
@@ -603,7 +592,7 @@ pub fn range_based_mod_div_patterns() -> &'static TypedPatternMatcher {
         },
 
         // x / n → k when all values of x are in the same bucket [k*n, (k+1)*n)
-        // This is the "cancel divmod" rule from Tinygrad's fold_divmod_general.
+        // This is the "cancel divmod" rule from upstream fold_divmod_general.
         // Examples:
         //   Range(3) / 3 → 0 (since Range(3) is 0,1,2 and all /3 = 0)
         //   (64 + Range(8)) / 64 → 1 (since 64..71 all /64 = 1)
@@ -735,7 +724,7 @@ pub fn range_based_mod_div_patterns() -> &'static TypedPatternMatcher {
         // Phase 1: (x + c) // d → (x + (c % d)) // d + (c // d)
         // When c >= d, split the offset into quotient and remainder parts.
         // This canonicalizes large offsets, allowing further simplification.
-        // Based on Tinygrad's divandmod.py:101-104
+        // Based on upstream divandmod
         Idiv(Add[x, _c @const(c_val)], d @const(d_val)) => {
             let c_int = c_val.try_int()?;
             let d_int = d_val.try_int()?;
@@ -763,7 +752,7 @@ pub fn range_based_mod_div_patterns() -> &'static TypedPatternMatcher {
             Some(div_result.add(&quotient_const))
         },
 
-        // Phase 1b: (x + c) // d for negative x (Tinygrad divandmod.py:103-104)
+        // Phase 1b: (x + c) // d for negative x
         // When x <= 0 but (x + c) >= 0, split using adjusted formula:
         // (x + c) // d → -(-(c%d + x - (d-1)) // d) + c//d
         Idiv(Add[x, _c @const(c_val)], d @const(d_val)) => {
@@ -793,7 +782,7 @@ pub fn range_based_mod_div_patterns() -> &'static TypedPatternMatcher {
         },
 
         // Unified divmod simplification (catch-all for IDIV/MOD on Index dtype).
-        // Based on Tinygrad's fold_divmod_general (divandmod.py:8-93).
+        // Based on upstream fold_divmod_general (divandmod.py:8-93).
         // Tries rules in priority order: cancel_divmod → remove_nested_mod →
         // fold_binary_numerator → fold_divmod_congruence → gcd_with_remainder →
         // divide_by_gcd → factor_remainder.
@@ -940,7 +929,7 @@ pub fn cast_dsl_patterns() -> &'static TypedPatternMatcher {
     }
 }
 
-/// Range-based double-cast collapse (Tinygrad symbolic.py:246-247).
+/// Range-based double-cast collapse.
 ///
 /// x:ints.cast(ints, a).cast(b) → x.cast(b) when a.min <= x.vmin and x.vmax <= a.max.
 /// Uses vmin/vmax analysis — belongs in symbolic tier, not symbolic_simple.
@@ -1012,7 +1001,7 @@ pub fn term_combining_dsl_patterns() -> &'static TypedPatternMatcher {
             let x2 = 2.into_uop(x.dtype()).mul(x);
             y.add(&x2)
         },
-        // (x/x2)/x3 → x/(x2*x3) — flatten nested float division (Tinygrad symbolic.py:197)
+        // (x/x2)/x3 → x/(x2*x3) — flatten nested float division
         // Guard: x2 must not be same UOp as x3 (prevents loop with x/x→1)
         Fdiv(Fdiv(x, x2), x3)
             if !Arc::ptr_eq(x2, x3)
@@ -1049,10 +1038,10 @@ pub fn advanced_division_dsl_patterns() -> &'static TypedPatternMatcher {
         Idiv(Add(a, b), c @ @const) => Some(a.divides(c)?.add(&b.divides(c)?)),
         // (a - b) // c → (a // c) - (b // c) when both divide evenly
         Idiv(Sub(a, b), c @ @const) => Some(a.divides(c)?.sub(&b.divides(c)?)),
-        // y * (x + c) → y*x + y*c for index dtype (Tinygrad symbolic.py:199)
+        // y * (x + c) → y*x + y*c for index dtype
         // Only distributes when x is Index dtype to avoid float inf*0=nan issues.
         Mul[y @const(_yv), Add[x, c @const(_cv)]] if x.dtype() == DType::Index ~> y.mul(x).add(&y.mul(c)),
-        // (a//c1 + c2) // c3 → (a + c1*c2) // (c1*c3) (Tinygrad divandmod.py:97-98)
+        // (a//c1 + c2) // c3 → (a + c1*c2) // (c1*c3)
         // Moved from symbolic_simple to symbolic tier to avoid infinite loop with fast_division_patterns
         // in Stage 18-19 (fast div creates wider expr → nested div re-fires → ever-growing constants).
         // Guards: c1>0, c3>0, and (a>=0 && c2>=0) or (a<=0 && c2<=0) (same-sign requirement)
@@ -1075,7 +1064,7 @@ pub fn advanced_division_dsl_patterns() -> &'static TypedPatternMatcher {
 /// Two-stage ALU folding patterns.
 ///
 /// For all associative ops: (x op c1) op c2 → x op (c1 op c2)
-/// Tinygrad symbolic.py:217-218: GroupOp.Associative = {Add, Mul, And, Or, Xor, Max}
+/// : GroupOp.Associative = {Add, Mul, And, Or, Xor, Max}
 pub fn alu_folding_dsl_patterns() -> &'static TypedPatternMatcher {
     crate::cached_patterns! {
         // (x + c1) + c2 → x + (c1 + c2) - commutative outer Add
@@ -1083,16 +1072,16 @@ pub fn alu_folding_dsl_patterns() -> &'static TypedPatternMatcher {
             let csum = eval_add_typed(c1_val, c2_val, c1.dtype().base()).expect("failed to add constants");
             x.add(&UOp::const_(c1.dtype(), csum))
         },
-        // Constant pushing: (x + c) + y → (x + y) + c (Tinygrad symbolic.py:232)
+        // Constant pushing: (x + c) + y → (x + y) + c
         Add[Add[x, c @const(_c_val)], y] if !matches!(y.op(), Op::Const(_)) ~> x.add(y).add(c),
         // (x * c1) * c2 → x * (c1 * c2) - commutative outer Mul
         Mul[Mul[x, c1 @const(c1_val)], _c2 @const(c2_val)] ~> {
             let cmul = eval_mul_typed(c1_val, c2_val, c1.dtype().base()).expect("failed to multiply constants");
             x.mul(&UOp::const_(c1.dtype(), cmul))
         },
-        // Constant pushing: (x * c) * y → (x * y) * c (Tinygrad symbolic.py:233)
+        // Constant pushing: (x * c) * y → (x * y) * c
         Mul[Mul[x, c @const(_c_val)], y] if !matches!(y.op(), Op::Const(_)) ~> x.mul(y).mul(c),
-        // Two-stage folding for remaining associative ops (Tinygrad symbolic.py:217-218)
+        // Two-stage folding for remaining associative ops
         // (x & c1) & c2 → x & (c1 & c2)
         And[And[x, c1 @const(c1_val)], _c2 @const(c2_val)]
             => eval_binary_op(BinaryOp::And, c1_val, c2_val).map(|r| x.and_(&UOp::const_(c1.dtype(), r))),
@@ -1166,7 +1155,7 @@ pub fn dead_loop_patterns() -> &'static TypedPatternMatcher {
     }
 
     /// Check if a Range is trivial (vmin == vmax), meaning only one value.
-    /// This matches Tinygrad's simplification: Range(Const) → Const when vmin == vmax.
+    /// This matches upstream simplification: Range(Const) → Const when vmin == vmax.
     fn is_trivial_range(uop: &Arc<UOp>) -> bool {
         let (vmin, vmax) = VminVmaxProperty::get(uop);
         vmin == vmax
@@ -1183,7 +1172,7 @@ pub fn dead_loop_patterns() -> &'static TypedPatternMatcher {
         r @ Range(_) if is_empty_range(r) ~> UOp::index_const(0),
 
         // RANGE(Const) with vmin == vmax (trivial, e.g., end=1) → Const(vmin)
-        // Matches Tinygrad symbolic.py:211
+        // Matches
         r @ Range { end: Const(_) } if is_trivial_range(r) ~> trivial_range_value(r),
 
         // END with dead ranges → filter or unwrap
@@ -1213,7 +1202,7 @@ pub fn vmin_vmax_collapse_patterns() -> &'static TypedPatternMatcher {
     }
 
     crate::cached_patterns! {
-        // ALU/DefineVar/Special with sound vmin == vmax → const (Tinygrad symbolic.py:210)
+        // ALU/DefineVar/Special with sound vmin == vmax → const
         // Uses SoundVminVmaxProperty: returns None for ops with unsound range analysis
         // (LOAD, Pow, Fdiv, etc.), preventing incorrect collapse.
         for op in binary [Add, Mul, Sub, Mod, Max, Pow, Idiv, Fdiv, And, Or, Xor, Shl, Shr, Lt, Le, Eq, Ne, Gt, Ge] {
@@ -1278,7 +1267,7 @@ pub fn dce_dsl_simple_patterns() -> &'static TypedPatternMatcher {
 
 /// DCE patterns for `symbolic` tier — negated condition swap.
 ///
-/// WHERE(!cond, t, f) → WHERE(cond, f, t) belongs in `symbolic` (Tinygrad symbolic.py:201-202).
+/// WHERE(!cond, t, f) → WHERE(cond, f, t) belongs in `symbolic`.
 /// Separated from simple patterns because it introduces branch swaps that interact
 /// with propagate_invalid at higher complexity.
 pub fn dce_dsl_patterns() -> &'static TypedPatternMatcher {
@@ -1287,26 +1276,26 @@ pub fn dce_dsl_patterns() -> &'static TypedPatternMatcher {
         // Guard: don't swap when f contains Invalid — PAD creates WHERE(valid, idx, Invalid),
         // and swapping would move Invalid to the true branch where downstream patterns can't match it.
         // Handles both scalar Invalid and vectorized VECTORIZE(Invalid, ...) from expansion.
-        // Tinygrad symbolic.py:201-202 has this same guard.
+        //  has this same guard.
         Where(Not(cond), t, f)
             if !has_invalid(f)
             => UOp::try_where(Arc::clone(cond), Arc::clone(f), Arc::clone(t)).ok(),
     }
 }
 
-/// AFTER simplification patterns (Tinygrad symbolic.py:256).
+/// AFTER simplification patterns.
 ///
 /// - AFTER(x, []) → x (empty deps, just passthrough)
 pub fn after_simplification_patterns() -> &'static TypedPatternMatcher {
     crate::cached_patterns! {
-        // AFTER recursive dep flattening (Tinygrad symbolic.py:253-254):
+        // AFTER recursive dep flattening:
         // For each dep, if it's not a side-effecting op, replace it with its sources.
         // This inlines AFTER dep chains so only true side-effect boundaries remain.
         After { passthrough, deps } if !deps.is_empty() => {
             let mut new_deps = smallvec::SmallVec::<[Arc<UOp>; 4]>::new();
             let mut changed = false;
             for dep in deps {
-                // Tinygrad symbolic.py:254: {RANGE, STORE, KERNEL, BARRIER, END, UNROLL}
+                // : {RANGE, STORE, KERNEL, BARRIER, END, UNROLL}
                 if matches!(dep.op(), Op::Range { .. } | Op::Store { .. } | Op::End { .. } | Op::Kernel { .. } | Op::Barrier { .. } | Op::Unroll { .. }) {
                     new_deps.push(Arc::clone(dep));
                 } else {
@@ -1332,7 +1321,7 @@ pub fn after_simplification_patterns() -> &'static TypedPatternMatcher {
     }
 }
 
-/// Move WHERE condition to LOAD gate patterns (Tinygrad symbolic.py:360).
+/// Move WHERE condition to LOAD gate patterns.
 ///
 /// Transforms `WHERE(cond, LOAD(INDEX(buf, idx)), 0)` to `LOAD(INDEX(buf, idx, gate=cond), alt=0)`
 /// when the condition can be safely moved into the INDEX's gate field.
@@ -1345,7 +1334,7 @@ pub fn after_simplification_patterns() -> &'static TypedPatternMatcher {
 /// **Critical**: This pattern runs at Stage 8 (Post-Opt Symbolic), BEFORE LOADs are added
 /// at Stage 13. Therefore, it matches INDEX directly, not LOAD(INDEX).
 ///
-/// Matches Tinygrad's `pm_move_where_on_load` pattern:
+/// Matches `pm_move_where_on_load` pattern:
 /// ```python
 /// (UPat.var("c1").where(UPat.var("buf").index(UPat.var("x")), 0), where_on_load),
 /// ```
@@ -1386,10 +1375,10 @@ fn has_invalid(uop: &Arc<UOp>) -> bool {
 
 /// Transform WHERE(cond, INDEX(buf, idx), 0) by embedding moveable clauses as WHERE-Invalid in indices[0].
 ///
-/// This is the Stage 8 version that works directly with INDEX, matching Tinygrad's approach.
+/// This is the Stage 8 version that works directly with INDEX, matching upstream approach.
 /// LOADs are added later at Stage 13.
 ///
-/// Supports **partial clause movement** (Tinygrad: where_on_load in symbolic.py):
+/// Supports **partial clause movement** (upstream: where_on_load):
 /// - Splits condition into AND clauses
 /// - Moves only clauses where ALL ranges are within index scope AND no load dependencies
 /// - Keeps remaining clauses in outer WHERE
@@ -1421,7 +1410,7 @@ fn where_on_load_index_transform(
         c1_clauses.iter().filter(|c| c2_clauses.iter().any(|c2| c.id == c2.id)).map(|c| c.id).collect();
 
     // Step 4: Collect RANGE and INDEX ids reachable from indices (index scope)
-    // Tinygrad: idx_index = {u for u in idx.backward_slice_with_self if u.op is Ops.INDEX}
+    // All INDEX ops in the idx backward slice
     let mut index_ranges = std::collections::HashSet::new();
     let mut idx_indices = std::collections::HashSet::new();
     for idx in indices {
@@ -1450,7 +1439,7 @@ fn where_on_load_index_transform(
 
     // Step 5: Partition clauses into moveable vs remaining
     // Single DFS per clause: check range scope + index deps simultaneously
-    // Tinygrad: can_move checks c.ranges <= idx.ranges AND all INDEX ops are in idx_index
+    // can_move: clause ranges ⊆ idx ranges AND all INDEX ops are in idx_index
     let (moved_clauses, remaining_clauses): (Vec<_>, Vec<_>) = c1_clauses.iter().cloned().partition(|clause| {
         if duplicate_ids.contains(&clause.id) {
             return true; // Treat as "moved" (but won't add to validity)
@@ -1601,7 +1590,7 @@ pub fn comparison_dsl_patterns() -> &'static TypedPatternMatcher {
 
         // Phase 6: (x // d) < c → x < (c * d) when d > 0
         // This lifts division out of comparisons, enabling further simplification.
-        // Based on Tinygrad's symbolic.py:229-230
+        // Based on upstream
         Lt(Idiv(x, _d @const(d_val)), _c @const(c_val)) => {
             let d_int = d_val.try_int()?;
             let c_int = c_val.try_int()?;
@@ -1630,7 +1619,7 @@ pub fn comparison_dsl_patterns() -> &'static TypedPatternMatcher {
                 return Some(x.try_cmplt(&UOp::index_const(ceil_div)).expect("failed to create cmplt"));
             }
             // Negative c0: c0*x < c1 → (-x) < -(floor(-c1/-c0))
-            // Tinygrad symbolic.py:226-227
+            //
             if c0 < 0 && c0 != -1 && c1 <= 0 {
                 let neg_c0 = -c0;
                 let neg_c1 = -c1;
@@ -1640,7 +1629,7 @@ pub fn comparison_dsl_patterns() -> &'static TypedPatternMatcher {
             None
           },
 
-        // Lt(x, c) with GCD-based folding for Index dtype (Tinygrad symbolic.py:122-126, 236)
+        // Lt(x, c) with GCD-based folding for Index dtype (, 236)
         Lt(x, _c @const(cv)) if x.dtype() == DType::Index => {
             let c_int = cv.try_int()?;
             if c_int <= 0 { return None; }
@@ -1649,7 +1638,7 @@ pub fn comparison_dsl_patterns() -> &'static TypedPatternMatcher {
     }
 }
 
-/// GCD-based Lt folding (Tinygrad symbolic.py:122-126, 236).
+/// GCD-based Lt folding (, 236).
 ///
 /// Split x into add terms, partition into unit-factor (|const_factor| <= 1)
 /// and non-unit terms. Compute d = gcd(non-unit factors, c). If d > 1 and
@@ -1662,7 +1651,7 @@ fn lt_folding(x: &Arc<UOp>, c_int: i64) -> Option<Arc<UOp>> {
     }
 
     // Partition terms by const_factor: exactly 1 → unit, otherwise → non-unit
-    // Matches Tinygrad: partition(x.split_uop(Ops.ADD), lambda u: u.const_factor() == 1)
+    // Split addends by const_factor == 1
     let mut unit_terms = Vec::new();
     let mut non_unit_factors = Vec::new();
     for t in &terms {
@@ -1678,7 +1667,7 @@ fn lt_folding(x: &Arc<UOp>, c_int: i64) -> Option<Arc<UOp>> {
         return None;
     }
 
-    // Compute GCD of non-unit factors AND c (Tinygrad: d = gcd(*factors, c))
+    // Compute GCD of non-unit factors AND c (d = gcd(*factors, c)
     let mut d = c_int.unsigned_abs() as i64;
     for &f in &non_unit_factors {
         d = gcd(d, f);
@@ -1696,7 +1685,7 @@ fn lt_folding(x: &Arc<UOp>, c_int: i64) -> Option<Arc<UOp>> {
         return None;
     }
 
-    // Build the non-unit sum divided by d (Tinygrad: UOp.sum(*np).divides(d))
+    // Build the non-unit sum divided by d (Build non-unit sum divided by d
     let non_unit_terms: Vec<Arc<UOp>> = terms.iter().filter(|t| t.const_factor() != 1).cloned().collect();
     let non_unit_sum = super::divmod::uop_sum(&non_unit_terms, x);
     let q = non_unit_sum.divides_int(d)?;
@@ -1729,7 +1718,7 @@ fn gcd(a: i64, b: i64) -> i64 {
 ///
 /// Basic boolean patterns for `symbolic_simple` tier.
 ///
-/// Matches Tinygrad symbolic_simple lines 61-62, 64, 71:
+/// Matches upstream symbolic_simple:
 /// NOT(NOT(x))→x, XOR(x,x)→0, bool const AND/OR identity.
 pub fn boolean_dsl_simple_patterns() -> &'static TypedPatternMatcher {
     crate::cached_patterns! {
@@ -1738,7 +1727,7 @@ pub fn boolean_dsl_simple_patterns() -> &'static TypedPatternMatcher {
         // x ^ x → 0
         Xor(x, x) => x.dtype().scalar().map(|dt| UOp::const_(x.dtype(), ConstValue::zero(dt))),
 
-        // Bool const identity (Tinygrad symbolic_simple lines 61-62):
+        // Bool const identity (upstream symbolic_simple):
         // bool & c → x if c else 0; bool | c → c if c else x
         // true | x → true (commutative)
         Or[t @const(t_val), _] if t_val == ConstValue::Bool(true) ~> t.clone(),
@@ -1754,7 +1743,7 @@ pub fn boolean_dsl_simple_patterns() -> &'static TypedPatternMatcher {
 /// Full boolean patterns for `symbolic` tier.
 ///
 /// Tautology, contradiction, De Morgan — these belong in `symbolic`
-/// (Tinygrad symbolic.py:188, decompositions.py).
+/// (, decompositions.py).
 pub fn boolean_dsl_patterns() -> &'static TypedPatternMatcher {
     crate::cached_patterns! {
         // x | !x → true (tautology) - commutative
@@ -1763,7 +1752,7 @@ pub fn boolean_dsl_patterns() -> &'static TypedPatternMatcher {
         // x & !x → false (contradiction) - commutative
         And[x, Not(x)] if x.dtype() == DType::Bool ~> UOp::const_(DType::Bool, ConstValue::Bool(false)),
 
-        // De Morgan's laws (Tinygrad: decompositions.py)
+        // De Morgan's laws (upstream decompositions)
         // (!x) & (!y) → !(x | y)
         And[Not(x), Not(y)] ~> x.or_(y).not(),
 
@@ -1774,7 +1763,7 @@ pub fn boolean_dsl_patterns() -> &'static TypedPatternMatcher {
 
 /// Min/max elimination via bounds analysis.
 ///
-/// Based on Tinygrad symbolic.py:213:
+/// Based on :
 ///   `max(x, y) → x if x.vmin >= y.vmax else y if x.vmax <= y.vmin`
 pub fn minmax_dsl_patterns() -> &'static TypedPatternMatcher {
     crate::cached_patterns! {
@@ -1831,21 +1820,21 @@ fn cv_lt(a: &ConstValue, b: &ConstValue) -> bool {
     }
 }
 
-/// Power patterns (Tinygrad symbolic.py:12-17, 103-105).
+/// Power patterns (, 103-105).
 ///
 /// Handles: x^0→1, x^1→x, negative/half-integer/integer exponents, const-base.
 pub fn power_dsl_patterns() -> &'static TypedPatternMatcher {
     crate::cached_patterns! {
-        // x ** c (scalar const exponent) — Tinygrad simplify_pow (L12-17)
+        // x ** c (scalar const exponent) — upstream simplify_pow
         Pow(x, c @const(cv)) => simplify_pow(x, c, cv),
-        // c ** x (scalar const base) — Tinygrad L105
+        // c ** x (scalar const base) — upstream
         Pow(c @const(cv), x) => simplify_pow_const_base(c, cv, x),
     }
 }
 
-/// Tinygrad `simplify_pow` (symbolic.py:12-17).
+/// upstream `simplify_pow` (upstream symbolic_simple).
 fn simplify_pow(x: &Arc<UOp>, c: &Arc<UOp>, cv: ConstValue) -> Option<Arc<UOp>> {
-    // Only scalar consts (Tinygrad: cvar vec=False)
+    // Only scalar consts (cvar vec=False)
     if x.dtype().vcount() > 1 {
         return None;
     }
@@ -1889,7 +1878,7 @@ fn simplify_pow(x: &Arc<UOp>, c: &Arc<UOp>, cv: ConstValue) -> Option<Arc<UOp>> 
     None
 }
 
-/// Tinygrad const-base power (symbolic.py:105).
+/// Const-base power (upstream symbolic_simple).
 fn simplify_pow_const_base(c: &Arc<UOp>, cv: ConstValue, x: &Arc<UOp>) -> Option<Arc<UOp>> {
     // Only scalar consts
     if c.dtype().vcount() > 1 {
@@ -1913,7 +1902,7 @@ fn simplify_pow_const_base(c: &Arc<UOp>, cv: ConstValue, x: &Arc<UOp>) -> Option
     None
 }
 
-/// ALU(VECTORIZE, VECTORIZE) → VECTORIZE(scalar_ALU) reordering (Tinygrad sym line 390-391).
+/// ALU(VECTORIZE, VECTORIZE) → VECTORIZE(scalar_ALU) reordering (upstream sym).
 ///
 /// When both operands of an ALU are VECTORIZE of identical-src (broadcast),
 /// collapse to VECTORIZE of scalar operation replicated N times.
@@ -1937,9 +1926,9 @@ fn alu_vectorize_reorder_patterns() -> &'static TypedPatternMatcher {
     }
 }
 
-/// x != 0 → (bool)x self-folding (Tinygrad sym line 394).
+/// x != 0 → (bool)x self-folding (upstream sym).
 ///
-/// Non-zero comparison folds to cast-to-bool. No dtype guard — matches Tinygrad exactly.
+/// Non-zero comparison folds to cast-to-bool. No dtype guard — matches upstream exactly.
 fn ne_zero_fold_patterns() -> &'static TypedPatternMatcher {
     crate::cached_patterns! {
         Ne(x, _zero @const(zv)) if zv.is_zero() => {
@@ -1949,7 +1938,7 @@ fn ne_zero_fold_patterns() -> &'static TypedPatternMatcher {
     }
 }
 
-/// Reciprocal distribution patterns (Tinygrad sym lines 410-415).
+/// Reciprocal distribution patterns (upstream sym).
 ///
 /// Algebraic transformations for reciprocal expressions:
 /// - 1/(x*x) → (1/x) * (1/x)
@@ -2001,7 +1990,7 @@ fn reciprocal_patterns() -> &'static TypedPatternMatcher {
     }
 }
 
-/// Reduce patterns for sym tier (Tinygrad sym lines 417-419).
+/// Reduce patterns for sym tier (upstream sym).
 ///
 /// - (x*c).reduce(ADD) → reduce(x, ADD) * c  (move const multiply after reduce)
 /// - MUL(...).reduce(r) → reduce_mul_chain(r) (factor multiplicative terms out)
@@ -2010,7 +1999,7 @@ fn reduce_sym_patterns() -> &'static TypedPatternMatcher {
 
     crate::cached_patterns! {
         // Pull scalar const OUT of reduce: REDUCE(x * c, ADD) → REDUCE(x, ADD) * c
-        // Tinygrad symbolic.py:417: (x*c).reduce(ADD) → reduce(x)*c
+        // : (x*c).reduce(ADD) → reduce(x)*c
         // `vec=False` means scalar const — `@const` already matches Op::Const only.
         Reduce { src: Mul[x, c @const(_cv)], ranges, reduce_op }
             if *reduce_op == ReduceOp::Add
@@ -2027,8 +2016,8 @@ fn reduce_sym_patterns() -> &'static TypedPatternMatcher {
             },
 
         // reduce_mul_chain: factor range-independent multipliers outside REDUCE
-        // Tinygrad symbolic.py:419 + reduce_mul_chain (line 332-341)
-        // Guard: r.dtype != r.src[0].dtype → return None (Tinygrad line 334)
+        //  + reduce_mul_chain (line 332-341)
+        // Guard: r.dtype != r.src[0].dtype → return None (upstream)
         // This prevents firing on horizontal reduces (body has wider dtype than output).
         reduce @ Reduce { src, ranges, reduce_op }
             if matches!(reduce_op, ReduceOp::Add | ReduceOp::Max)
@@ -2040,7 +2029,7 @@ fn reduce_sym_patterns() -> &'static TypedPatternMatcher {
     }
 }
 
-/// Factor range-independent multipliers outside REDUCE (Tinygrad symbolic.py:332-341).
+/// Factor range-independent multipliers outside REDUCE.
 ///
 /// For REDUCE(MUL(a, b, ...), ranges), if some factors don't depend on any reduce range,
 /// pull them outside: REDUCE(remaining, ranges) * outside_factors.
@@ -2091,32 +2080,32 @@ fn reduce_mul_chain_sym(
     reduced.try_mul(&outside_prod).ok()
 }
 
-/// Tinygrad REMOVE_FROM_SINK_LIKE = {Ops.UNROLL, Ops.NOOP, Ops.VECTORIZE, Ops.SINK}
+/// REMOVE_FROM_SINK_LIKE = {Ops.UNROLL, Ops.NOOP, Ops.VECTORIZE, Ops.SINK}
 fn is_remove_from_sink_like(u: &Arc<UOp>) -> bool {
     matches!(u.op(), Op::Unroll { .. } | Op::Noop | Op::Vectorize { .. } | Op::Sink { .. })
 }
 
 /// Phase 3 symbolic patterns (full symbolic() only, not symbolic_simple()).
 ///
-/// General negation distribution (Tinygrad symbolic.py:428):
+/// General negation distribution:
 /// - (-1) * (x + y) → x.neg() + y.neg()
-/// - (x + y) * c → x*c + y*c for index dtype (Tinygrad symbolic.py:430)
+/// - (x + y) * c → x*c + y*c for index dtype
 pub fn sym_phase3_patterns() -> &'static TypedPatternMatcher {
     crate::cached_patterns! {
         // General negation distribution: (-1) * (x + y) → neg(x) + neg(y)
         Mul[_neg @const(nv), Add(x, y)] if nv.is_neg_one() ~> x.neg().add(&y.neg()),
 
-        // (x + y) * c → x*c + y*c for index dtype only (Tinygrad sym line 430)
+        // (x + y) * c → x*c + y*c for index dtype only (upstream sym)
         // Float has inf*0=nan issue, so only safe for integers/index.
         Mul[Add(x, y), c @const(_cv)] if x.dtype() == DType::Index ~> x.mul(c).add(&y.mul(c)),
 
-        // GROUP(x) → x: single-element GROUP is identity (Tinygrad sym line 421)
+        // GROUP(x) → x: single-element GROUP is identity (upstream sym)
         Group { sources } if sources.len() == 1 ~> sources[0].clone(),
 
-        // SINK/GROUP flatten: unwrap NOOP/UNROLL/VECTORIZE/SINK children (Tinygrad sym lines 422-424)
-        // Tinygrad REMOVE_FROM_SINK_LIKE = {UNROLL, NOOP, VECTORIZE, SINK}
+        // SINK/GROUP flatten: unwrap NOOP/UNROLL/VECTORIZE/SINK children (upstream sym)
+        // REMOVE_FROM_SINK_LIKE = {UNROLL, NOOP, VECTORIZE, SINK}
         // Note: GROUP is NOT in this set — it survives to renderers which skip it.
-        // Tinygrad REMOVE_FROM_SINK_LIKE = {Ops.UNROLL, Ops.NOOP, Ops.VECTORIZE, Ops.SINK}
+        // REMOVE_FROM_SINK_LIKE = {Ops.UNROLL, Ops.NOOP, Ops.VECTORIZE, Ops.SINK}
         // For matching children, replace with x.src (all children). NOOP has no children → removed.
         Sink { sources } if sources.iter().any(is_remove_from_sink_like) => {
             let new_srcs: Vec<Arc<UOp>> = sources.iter().flat_map(|s| {
@@ -2134,12 +2123,12 @@ pub fn sym_phase3_patterns() -> &'static TypedPatternMatcher {
             Some(UOp::group(new_srcs))
         },
 
-        // END(NOOP) → NOOP (Tinygrad sym line 426)
+        // END(NOOP) → NOOP (upstream sym)
         End { computation, .. } if matches!(computation.op(), Op::Noop) ~> UOp::new(Op::Noop, DType::Void),
     }
 }
 
-/// Store/load folding patterns (Tinygrad sym lines 402-409).
+/// Store/load folding patterns (upstream sym).
 ///
 /// - STORE(idx, LOAD(idx)) → NOOP (storing what was just loaded is a no-op)
 /// - STORE(idx, WHERE(gate, alt, LOAD(idx))) → STORE(INDEX(buf, WHERE(gate, orig_idx, Invalid)), alt)
@@ -2150,7 +2139,7 @@ pub fn store_load_folding_patterns() -> &'static TypedPatternMatcher {
         Store { index, value: Load { index, .. } } ~> UOp::new(Op::Noop, DType::Void),
 
         // STORE(INDEX, WHERE(gate, alt, LOAD(INDEX))) → STORE(INDEX(buf, WHERE(gate, idx, Invalid)), alt)
-        // Tinygrad sym line 404-406: converts selective overwrite into gated store.
+        // upstream sym: converts selective overwrite into gated store.
         // When we store WHERE(gate, alt_value, load_from_same_index), the store only
         // matters where gate is true. Convert to a gated INDEX with alt as the value.
         Store { index: idx @ Index { buffer: buf, indices, gate: None }, value: Where(gate, alt, Load { index: idx2, .. }), ranges }
@@ -2187,7 +2176,7 @@ pub fn store_load_folding_patterns() -> &'static TypedPatternMatcher {
 /// - ALU(WHERE(c, a, b), WHERE(c, d, e)) → WHERE(c, ALU(a, d), ALU(b, e))
 pub fn where_alu_combining_patterns() -> &'static TypedPatternMatcher {
     crate::cached_patterns! {
-        // Tinygrad: only combine when both true branches or both false branches are const
+        // Only combine when both true branches or both false branches are const
         // Variant 1: both true branches are const
         for op in binary [Add, Mul, Sub, Max, And, Or, Xor] {
             r @ op(Where(c, a @const(_a), b), Where(c, d @const(_d), e)) ~> {
@@ -2206,7 +2195,7 @@ pub fn where_alu_combining_patterns() -> &'static TypedPatternMatcher {
         },
 
         // Variant 3: Associative Add — (y + WHERE(c,t,f)) + WHERE(c,tt,ff) → y + WHERE(c,t+tt,f+ff)
-        // Tinygrad symbolic.py:207-208: handles WHERE-gates at different nesting levels in Add chains.
+        // : handles WHERE-gates at different nesting levels in Add chains.
         // Both true branches const:
         Add(Add(y, Where(c, t @const(_t), f)), Where(c, tt @const(_tt), ff)) ~> {
             let true_sum = t.add(tt);
@@ -2227,12 +2216,12 @@ pub fn where_alu_combining_patterns() -> &'static TypedPatternMatcher {
 /// GEP pushing patterns for devectorize pass.
 ///
 /// Push GEP through ALU operations to simplify vector index extraction.
-/// Based on Tinygrad's gep_pushing (symbolic.py:154-177). Exact alignment.
+/// Based on upstream gep_pushing.
 pub fn gep_pushing_patterns() -> &'static TypedPatternMatcher {
     crate::cached_patterns! {
         // 0. GEP on void: GEP(x, _) where x is void → x
         // Removes GEP on GROUP, STORE, and other void-typed nodes.
-        // Matches Tinygrad: (UPat(Ops.GEP, src=(UPat(dtype=dtypes.void),)), lambda x: x)
+        // Matches upstream: GEP on void-dtype → identity.
         Gep { vector, .. } if vector.dtype() == DType::Void ~> Arc::clone(vector),
 
         // 1. GEP composition: GEP(GEP(x, inner), outer) → GEP(x, inner[outer])
@@ -2243,7 +2232,7 @@ pub fn gep_pushing_patterns() -> &'static TypedPatternMatcher {
         },
 
         // 2. GEP through VECTORIZE: extract element(s)
-        // Tinygrad symbolic.py:158-159: handles both single-element extraction and multi-element
+        // : handles both single-element extraction and multi-element
         Gep { vector: Vectorize { elements, .. }, indices } if indices.len() == 1 => elements.get(indices[0]).cloned(),
         Gep { vector: Vectorize { elements, .. }, indices } if indices.len() > 1 => {
             let selected: SmallVec<[Arc<UOp>; 4]> = indices.iter().filter_map(|&i| elements.get(i).cloned()).collect();
@@ -2251,11 +2240,11 @@ pub fn gep_pushing_patterns() -> &'static TypedPatternMatcher {
         },
 
         // 3. GEP on scalar CONST: GEP(const:scalar, _) → const_like(const.arg)
-        // Tinygrad symbolic.py:160
+        //
         Gep { vector: c @const(_cv), .. } if c.dtype().vcount() == 1 ~> Arc::clone(c),
 
         // 4. GEP through VConst: extract element(s)
-        // Tinygrad symbolic.py:161
+        //
         Gep { vector: v @ VConst { values }, indices } => {
             let scalar_dtype = v.dtype().scalar_dtype();
             if indices.len() == 1 {
@@ -2267,14 +2256,14 @@ pub fn gep_pushing_patterns() -> &'static TypedPatternMatcher {
         },
 
         // 5. GEP in order is removed: GEP(x, [0,1,...,n-1]) → x
-        // Tinygrad symbolic.py:165
+        //
         Gep { vector, indices }
             if !matches!(vector.dtype(), DType::Ptr { .. })
             && indices.iter().enumerate().all(|(i, &idx)| i == idx) && indices.len() == vector.dtype().vcount()
             ~> Arc::clone(vector),
 
         // 6. Push GEP through ALU/CAST/BITCAST for index dtype
-        // Tinygrad symbolic.py:167-169: ONE unified pattern for ALL GroupOp.ALU + CAST + BITCAST
+        // : ONE unified pattern for ALL GroupOp.ALU + CAST + BITCAST
         // Guard: GEP dtype=dtypes.index, !PtrDType on both GEP and ALU
         gep @ Gep { vector, indices }
             if !indices.is_empty()
@@ -2305,7 +2294,7 @@ pub fn gep_pushing_patterns() -> &'static TypedPatternMatcher {
                 Some(new_op)
             },
 
-        // 7. CAT → VECTORIZE with GEPs (Tinygrad symbolic.py:171-172)
+        // 7. CAT → VECTORIZE with GEPs
         Cat { sources } if !matches!(sources.first().map(|s| s.dtype()), Some(DType::Ptr { .. })) => {
             let elements: SmallVec<[Arc<UOp>; 4]> = sources.iter()
                 .flat_map(|s| (0..s.dtype().vcount()).map(move |i| s.gep(vec![i])))
@@ -2314,7 +2303,7 @@ pub fn gep_pushing_patterns() -> &'static TypedPatternMatcher {
             Some(UOp::vectorize(elements))
         },
 
-        // 8. VECTORIZE on same GEP (Tinygrad symbolic.py:174)
+        // 8. VECTORIZE on same GEP
         Vectorize { elements }
             if elements.len() > 1 && matches!(elements[0].op(), Op::Gep { .. })
             => {
@@ -2330,8 +2319,8 @@ pub fn gep_pushing_patterns() -> &'static TypedPatternMatcher {
                 Some(first_src.gep(combined))
             },
 
-        // 9. GEP through WMMA (Tinygrad symbolic.py:176)
-        // Based on Tinygrad's gep_through_wmma (symbolic.py:140-151).
+        // 9. GEP through WMMA
+        // Based on upstream gep_through_wmma.
         //
         // GEP(WMMA(a, b, c), indices) → WMMA(GEP(a, ...), GEP(b, ...), GEP(c, ...))
         //
@@ -2469,7 +2458,7 @@ pub fn long_to_int_narrowing_patterns() -> &'static TypedPatternMatcher {
         },
 
         // (index + c).cast(sints) → index.cast(sints) + c.cast(sints)
-        // Distribute signed-int cast over addition with constant (Tinygrad symbolic.py:251).
+        // Distribute signed-int cast over addition with constant.
         // Enables further simplification of cast-of-index expressions.
         Cast { src: Add(x, c @const(_cv)), dtype: cast_dt }
             if x.dtype() == DType::Index && cast_dt.scalar().is_some_and(|s| s.is_signed() && s.is_int())

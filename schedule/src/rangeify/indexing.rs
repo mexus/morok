@@ -62,7 +62,7 @@ impl IndexingContext {
 
     /// Create a new RANGE from an existing UOp end value.
     /// Used when converting REDUCE ranges to LOOP ranges during bufferization.
-    /// (Tinygrad rangeify.py:286 - when bufferizing, REDUCE ranges become LOOP)
+    ///( when bufferizing, REDUCE ranges become LOOP)
     pub fn new_range_from_uop(&mut self, end: &Arc<UOp>, axis_type: AxisType) -> Arc<UOp> {
         let axis_id = AxisId::Unrenumbered(self.range_idx);
         self.range_idx += 1;
@@ -119,14 +119,43 @@ impl IndexingContext {
 // Core Algorithm
 // ============================================================================
 
+/// Cache for memoizing expensive `graph_rewrite` calls during rangeify.
+///
+/// Matches upstream `@functools.cache` on `_apply_reshape` and `apply_movement_op`.
+/// Keyed by input UOp's `content_hash` (structural, O(1) — pre-computed at creation).
+/// Hash-consing ensures same expression = same Arc = same `id` = cache hit.
+///
+/// Scoped to a single `run_rangeify` call — automatically freed when the function returns.
+/// Uses `UOp.id` (identity) as key — collision-free because all UOps are held alive
+/// within a single run, and hash consing guarantees same structure = same Arc = same id.
+#[derive(Default)]
+pub struct SimplifyCache {
+    cache: HashMap<u64, Arc<UOp>>,
+}
+
+impl SimplifyCache {
+    /// Look up or compute a graph_rewrite simplification.
+    /// `input` is the UOp to simplify; `f` computes the result if not cached.
+    #[inline]
+    fn get_or_simplify(&mut self, input: &Arc<UOp>, f: impl FnOnce() -> Arc<UOp>) -> Arc<UOp> {
+        if let Some(cached) = self.cache.get(&input.id) {
+            return cached.clone();
+        }
+        let result = f();
+        self.cache.insert(input.id, result.clone());
+        result
+    }
+}
+
 /// Run range assignment on a UOp graph. Returns (transformed_sink, context).
 #[allow(clippy::mutable_key_type)]
 #[instrument(skip(sink), fields(sink_id = sink.id))]
 pub fn run_rangeify(sink: Arc<UOp>) -> morok_ir::Result<(Arc<UOp>, IndexingContext)> {
     let mut ctx = IndexingContext::new();
+    let mut simplify_cache = SimplifyCache::default();
 
-    // Step 1: Generate realize map via pattern matcher (Tinygrad: pm_generate_realize_map)
-    // Tinygrad (indexing.py:163): bottom_up=True — patterns see ORIGINAL children
+    // Step 1: Generate realize map via pattern matcher (pm_generate_realize_map)
+    // bottom_up=True — patterns see ORIGINAL children
     crate::rewrite::graph_rewrite_bottom_up(pm_generate_realize_map(), sink.clone(), &mut ctx);
 
     // Step 2: Get toposort (root-to-leaves) and consumer map
@@ -136,18 +165,18 @@ pub fn run_rangeify(sink: Arc<UOp>) -> morok_ir::Result<(Arc<UOp>, IndexingConte
     let forward_topo: Vec<_> = sink.toposort().into_iter().rev().collect();
 
     // Step 3: Assign ranges via forward traversal
-    assign_ranges(&forward_topo, &consumer_map, &mut ctx)?;
+    assign_ranges(&forward_topo, &consumer_map, &mut ctx, &mut simplify_cache)?;
 
-    // Step 4: Apply rangeify patterns (Tinygrad: pm_apply_rangeify, indexing.py:275)
+    // Step 4: Apply rangeify patterns (pm_apply_rangeify)
     // Converts ReduceAxis→REDUCE, PAD→WHERE, creates BUFFERIZE+INDEX, removes movement ops.
-    // Must run bottom_up so patterns see ORIGINAL children (Tinygrad: bottom_up=True).
+    // Must run bottom_up so patterns see ORIGINAL children (bottom_up=True).
     let rangeify_matcher = super::patterns::apply_rangeify_patterns();
     let transformed_sink = crate::rewrite::graph_rewrite_bottom_up(&rangeify_matcher, sink, &mut ctx);
 
     Ok((transformed_sink, ctx))
 }
 
-/// Pattern matcher for generating the realize map (Tinygrad: `pm_generate_realize_map`).
+/// Pattern matcher for generating the realize map (`pm_generate_realize_map`).
 ///
 /// Marks which UOps need to be materialized to buffers:
 /// - SINK sources (if not always-contiguous)
@@ -160,7 +189,7 @@ fn pm_generate_realize_map() -> &'static crate::TypedPatternMatcher<IndexingCont
         @context IndexingContext;
 
         // SINK sources → realize non-contiguous sources
-        // Tinygrad indexing.py:22
+
         x @ Sink { sources: _ } => |x, ctx| {
             for src in x.op().sources() {
                 if !is_always_contiguous(&src) {
@@ -170,12 +199,11 @@ fn pm_generate_realize_map() -> &'static crate::TypedPatternMatcher<IndexingCont
             None
         },
 
-        // Always realize these ops
-        // Tinygrad indexing.py:24: COPY, BUFFER_VIEW, CONTIGUOUS, STORE, ASSIGN, ENCDEC
+        // Always realize these ops: COPY, BUFFER_VIEW, CONTIGUOUS, STORE, ASSIGN
         x @ Store { index: _, value: _ } => |x, ctx| { ctx.mark_realize_all(x).ok(); None },
         x @ BufferView { buffer: _ } => |x, ctx| { ctx.mark_realize_all(x).ok(); None },
 
-        // Tinygrad indexing.py:26: always realize REDUCE on outer ranges
+        // Always realize REDUCE on outer ranges
         x @ Reduce { src: _, ranges, reduce_op: _ } => |x, ctx| {
             if ranges.iter().any(|r| matches!(r.op(), Op::Range { axis_type, .. } if *axis_type == AxisType::Outer)) {
                 ctx.mark_realize_all(x).ok();
@@ -185,7 +213,7 @@ fn pm_generate_realize_map() -> &'static crate::TypedPatternMatcher<IndexingCont
 
         x @ Copy { src: _ } => |x, ctx| {
             ctx.mark_realize_all(x).ok();
-            // Also realize sources (Tinygrad indexing.py:28)
+            // Also realize sources
             for src in x.op().sources() {
                 if !is_always_contiguous(&src) {
                     ctx.mark_realize_all(&src).ok();
@@ -204,7 +232,7 @@ fn pm_generate_realize_map() -> &'static crate::TypedPatternMatcher<IndexingCont
             None
         },
 
-        // MStack/MSelect → realize sources (Tinygrad indexing.py:28)
+        // MStack/MSelect → realize sources
         x @ MStack { buffers: _ } => |x, ctx| {
             for src in x.op().sources() {
                 if !is_always_contiguous(&src) {
@@ -226,7 +254,7 @@ fn pm_generate_realize_map() -> &'static crate::TypedPatternMatcher<IndexingCont
 
 /// Check if a UOp is always contiguous (doesn't need realization).
 ///
-/// Aligned with Tinygrad's ALWAYS_CONTIGUOUS (indexing.py:10-12).
+/// Aligned with ALWAYS_CONTIGUOUS.
 /// When the source of a BUFFERIZE is in this set, the BUFFERIZE gets `removable: false`,
 /// preventing it from being inlined by buffer removal.
 pub(crate) fn is_always_contiguous(uop: &Arc<UOp>) -> bool {
@@ -285,7 +313,7 @@ pub(crate) fn merge_consumer_ranges(
     let mut out_rngs = Vec::new();
     let mut realize_axes = Vec::new();
 
-    // Tinygrad indexing.py:212: compute all_all_same FIRST — if ANY dimension
+    // Compute all_all_same FIRST — if ANY dimension
     // has incompatible ranges across consumers, ALL dimensions get realized.
     // With PCONTIG=0 (default): condition per-dim = `all_all_same || (PCONTIG && all_same(dim))`.
     // When all_all_same=False and PCONTIG=0, this is always False → all dims realized.
@@ -311,14 +339,14 @@ pub(crate) fn merge_consumer_ranges(
         if dim_ranges.iter().skip(1).all(|r| Arc::ptr_eq(&dim_ranges[0], r)) && all_all_same {
             out_rngs.push(Arc::clone(&dim_ranges[0]));
             continue;
-            // all_all_same=False but this dim is same → still realize (Tinygrad behavior with PCONTIG=0)
+            // all_all_same=False but this dim is same → still realize (PCONTIG=0 behavior)
         }
 
         let indices: Vec<_> = dim_ranges.iter().map(|r| r.get_idx()).collect();
         let valids: Vec<_> = dim_ranges.iter().map(|r| r.get_valid()).collect();
         let ranges_same = all_ranges_same(&indices);
 
-        // Tinygrad: `if all_all_same or (PCONTIG and all_same(local_rngs)):` → merge
+        // if all_all_same or (PCONTIG and all_same): merge
         // With PCONTIG=0 (default): only merge when all_all_same is True.
         if all_all_same {
             debug!(dim_idx, ranges_same, all_all_same, "merge_consumer_ranges: merging dimension");
@@ -330,14 +358,13 @@ pub(crate) fn merge_consumer_ranges(
             };
 
             // Build WHERE(valid, idx, Invalid) and simplify immediately.
-            // Tinygrad indexing.py:220: graph_rewrite(minimum_valid.where(x, Invalid), symbolic)
             // Without this simplification, unsimplified WHERE/Not chains accumulate
             // and cause oscillation in downstream symbolic passes.
             let merged_range = if is_const_true(&merged_valid) {
                 merged_idx
             } else {
                 let raw = UOp::try_where(merged_valid, merged_idx, UOp::invalid_marker())?;
-                // Tinygrad indexing.py:220 uses full `symbolic` here (not symbolic_simple)
+                // Uses full `symbolic` here (not symbolic_simple)
                 crate::rewrite::graph_rewrite(crate::symbolic::patterns::symbolic(), raw, &mut ())
             };
             out_rngs.push(merged_range);
@@ -363,8 +390,9 @@ fn assign_ranges(
     reverse_topo: &[Arc<UOp>],
     consumer_map: &HashMap<UOpKey, Vec<Arc<UOp>>>,
     ctx: &mut IndexingContext,
+    simplify_cache: &mut SimplifyCache,
 ) -> morok_ir::Result<()> {
-    // Local variable for ending_ranges - only used within this function (like Tinygrad)
+    // Local variable for ending_ranges - only used within this function
     let mut ending_ranges: HashMap<UOpKey, Vec<Arc<UOp>>> = HashMap::new();
 
     for x in reverse_topo {
@@ -373,12 +401,12 @@ fn assign_ranges(
         }
 
         // Skip Index-typed UOps: shape parameters (begins/ends, dim sizes) are not data.
-        // Matches Tinygrad indexing.py:177
+        // Matches upstream
         if x.dtype().scalar() == Some(morok_dtype::ScalarDType::Index) {
             continue;
         }
 
-        // Skip MSTACK/MSELECT: Tinygrad indexing.py:194-196
+        // Skip MSTACK/MSELECT:
         if matches!(x.op(), Op::MStack { .. } | Op::MSelect { .. }) {
             continue;
         }
@@ -396,7 +424,7 @@ fn assign_ranges(
             "Consumer info"
         );
 
-        // Inherit ending_ranges from consumers (like Tinygrad line 173)
+        // Inherit ending_ranges from consumers
         // ending_ranges propagate from consumers → producers (backward in data flow)
         let mut inherited_ending: Vec<Arc<UOp>> = Vec::new();
         for consumer in &consumers {
@@ -413,7 +441,7 @@ fn assign_ranges(
         ending_ranges.insert(UOpKey(x.clone()), inherited_ending);
 
         let mut out_rngs = if ctx.should_realize(x) {
-            // Realized op: create fresh ranges for all dimensions (Tinygrad indexing.py:186-193).
+            // Realized op: create fresh ranges for all dimensions.
             // CONTIGUOUS, COPY, ASSIGN, and ops marked by ending_ranges all land here.
             if let Some(shape) = x.shape()? {
                 debug!(
@@ -425,13 +453,13 @@ fn assign_ranges(
                 let rngs: Vec<_> = shape.iter().map(|s| ctx.new_range(s, AxisType::Loop)).collect();
                 let axes: Vec<usize> = (0..shape.len()).collect();
                 ctx.realize_map.insert(UOpKey(x.clone()), Some(axes));
-                // Clear ending_ranges when realized (like Tinygrad line 188)
+                // Clear ending_ranges when realized
                 ending_ranges.insert(UOpKey(x.clone()), Vec::new());
                 rngs
             } else {
                 continue;
             }
-        // Tinygrad: ReduceAxis uses the same consumer_rngs branching as all other ops
+        // ReduceAxis uses the same consumer_rngs branching as all other ops
         } else if consumer_rngs.is_empty() {
             continue;
         } else if consumer_rngs.len() == 1 {
@@ -443,7 +471,7 @@ fn assign_ranges(
         debug!(should_realize = ctx.should_realize(x), out_rngs_len = out_rngs.len(), "output ranges computed");
 
         // Check ending_ranges FIRST (before in_rngs computation)
-        // Tinygrad lines 224-234: ending_ranges realization happens BEFORE input ranges
+        // ending_ranges realization happens BEFORE input ranges
         // This is critical: in_rngs must be computed from the FINAL out_rngs after realization
         let ending = ending_ranges.get(&UOpKey(x.clone())).cloned().unwrap_or_default();
         if !ending.is_empty() {
@@ -453,7 +481,7 @@ fn assign_ranges(
                 "Ending ranges detected (pre-in_rngs check)"
             );
         }
-        // Use ending ranges directly without filtering (matches Tinygrad behavior).
+        // Use ending ranges directly without filtering (matches upstream behavior).
         let filtered_ending = ending.clone();
 
         if !filtered_ending.is_empty() && (matches!(x.op(), Op::ReduceAxis { .. }) || is_elementwise_op(x)) {
@@ -461,7 +489,7 @@ fn assign_ranges(
                 // Start with existing realize_axes (from merge_consumer_ranges)
                 let mut realize_axes: Vec<usize> = ctx.get_realize_axes(x).cloned().unwrap_or_default();
 
-                // Tinygrad line 229: `if not (PCONTIG > 1) or any(any(rr.arg > e.arg ...) ...)`
+                // `if not (PCONTIG > 1) or any(any(rr.arg > e.arg ...) ...)`
                 // With PCONTIG=0 (default), `not (0 > 1)` = True, so ALL axes are unconditionally
                 // realized when ending_ranges are present. This is critical for layernorm-style
                 // patterns where `centered = x - mean` is shared between output and variance paths.
@@ -516,7 +544,7 @@ fn assign_ranges(
             | Op::Shrink { src, .. }
             | Op::Flip { src, .. } => {
                 if let Some(in_shape) = src.shape()? {
-                    apply_movement_op(x.op(), in_shape, &out_rngs)
+                    apply_movement_op(x.op(), in_shape, &out_rngs, simplify_cache)
                 } else {
                     out_rngs.clone()
                 }
@@ -590,7 +618,7 @@ fn assign_ranges(
 
         debug!(in_rngs_len = in_rngs.len(), "input ranges computed");
 
-        // EXPAND marks ranges as ending when broadcasting to static dimensions (Tinygrad lines 249-252)
+        // EXPAND marks ranges as ending when broadcasting to static dimensions
         // "if the EXPAND is used to inject a range, we don't mark it as ending_ranges. otherwise we do."
         if let Op::Expand { new_shape, .. } = x.op() {
             // Check if new_shape is all static (no RANGE ops being injected in the shape)
@@ -612,7 +640,7 @@ fn assign_ranges(
             if shape_is_static {
                 // Ranges that changed (in_rngs != out_rngs) are "ending"
                 // These are the output ranges that were collapsed to const 0 in in_rngs
-                // Tinygrad's `.ranges.keys()` returns ALL range types without filtering.
+                // upstream `.ranges.keys()` returns ALL range types without filtering.
                 let mut changed_ranges: Vec<Arc<UOp>> = Vec::new();
                 for (inp, out) in in_rngs.iter().zip(out_rngs.iter()) {
                     if !Arc::ptr_eq(inp, out) {
@@ -644,10 +672,15 @@ fn assign_ranges(
 // ============================================================================
 
 /// Transform ranges through a movement op (SHRINK, PERMUTE, FLIP, EXPAND, PAD, RESHAPE).
-pub fn apply_movement_op(op: &Op, in_shape: &[SInt], rngs: &[Arc<UOp>]) -> Vec<Arc<UOp>> {
+pub fn apply_movement_op(
+    op: &Op,
+    in_shape: &[SInt],
+    rngs: &[Arc<UOp>],
+    simplify_cache: &mut SimplifyCache,
+) -> Vec<Arc<UOp>> {
     match op {
         Op::Shrink { begins, .. } => {
-            // Matches Tinygrad indexing.py:140:
+            // Matches upstream:
             // case Ops.SHRINK: rngs = tuple(a if ss == 0 else a+ss for a,(ss,_) in zip(rngs, arg))
             let begin_uops = extract_shape_uops(begins);
             rngs.iter()
@@ -742,13 +775,15 @@ pub fn apply_movement_op(op: &Op, in_shape: &[SInt], rngs: &[Arc<UOp>]) -> Vec<A
                     let valid_low = rng.try_cmplt(begin).unwrap().not();
                     let valid_high = rng.try_cmplt(&shape_plus_begin).unwrap();
                     let valid = valid_low.try_and_op(&valid_high).unwrap();
-                    // Tinygrad: graph_rewrite(validity, symbolic+pm_simplify_valid)
+                    // graph_rewrite(validity, symbolic+pm_simplify_valid)
                     static PAD_SIMPLIFY: std::sync::LazyLock<crate::TypedPatternMatcher> =
                         std::sync::LazyLock::new(|| {
                             crate::symbolic::patterns::symbolic()
                                 + crate::symbolic::valid_simplification::pm_simplify_valid()
                         });
-                    let valid = crate::rewrite::graph_rewrite(&*PAD_SIMPLIFY, valid, &mut ());
+                    let valid = simplify_cache.get_or_simplify(&valid, || {
+                        crate::rewrite::graph_rewrite(&*PAD_SIMPLIFY, valid.clone(), &mut ())
+                    });
                     let adjusted_rng = rng.try_sub(begin).unwrap();
                     UOp::try_where(valid, adjusted_rng, UOp::invalid_marker()).unwrap()
                 })
@@ -776,9 +811,9 @@ pub fn apply_movement_op(op: &Op, in_shape: &[SInt], rngs: &[Arc<UOp>]) -> Vec<A
                 }
             }
 
-            // PLACEHOLDER canonicalization + reshape (Tinygrad indexing.py:150-153)
+            // PLACEHOLDER canonicalization + reshape
             with_placeholder_canonicalization(rngs, |canonical| {
-                apply_reshape_core(in_shape, &new_shape_vals, canonical)
+                apply_reshape_core(in_shape, &new_shape_vals, canonical, simplify_cache)
             })
         }
 
@@ -789,9 +824,14 @@ pub fn apply_movement_op(op: &Op, in_shape: &[SInt], rngs: &[Arc<UOp>]) -> Vec<A
 /// Core RESHAPE: flatten `rngs` by `out_shape` strides, decompose into `in_shape` via Mod/Idiv,
 /// then run full symbolic simplification.
 ///
-/// Matches Tinygrad's `_apply_reshape` (indexing.py:122-134).
+/// Matches upstream `_apply_reshape`.
 /// Callers should PLACEHOLDER-canonicalize `rngs` before calling this.
-fn apply_reshape_core(in_shape: &[SInt], out_shape: &[SInt], rngs: &[Arc<UOp>]) -> Vec<Arc<UOp>> {
+fn apply_reshape_core(
+    in_shape: &[SInt],
+    out_shape: &[SInt],
+    rngs: &[Arc<UOp>],
+    simplify_cache: &mut SimplifyCache,
+) -> Vec<Arc<UOp>> {
     use morok_ir::rewrite::graph_rewrite;
 
     // Pad with CONST(0) on the left when rngs.len() < out_shape.len()
@@ -828,14 +868,14 @@ fn apply_reshape_core(in_shape: &[SInt], out_shape: &[SInt], rngs: &[Arc<UOp>]) 
     }
     axes_out.reverse();
 
-    // Simplify (Tinygrad: "this simplify is doing a lot of heavy lifting")
+    // Simplify ("This simplify is doing a lot of heavy lifting")
     static RESHAPE_SIMPLIFY: std::sync::LazyLock<crate::TypedPatternMatcher> = std::sync::LazyLock::new(|| {
         crate::symbolic::patterns::symbolic()
             + crate::symbolic::valid_simplification::pm_simplify_valid()
             + crate::symbolic::valid_simplification::pm_drop_and_clauses()
     });
     let sink = UOp::sink(axes_out);
-    let simplified = graph_rewrite(&*RESHAPE_SIMPLIFY, sink, &mut ());
+    let simplified = simplify_cache.get_or_simplify(&sink, || graph_rewrite(&*RESHAPE_SIMPLIFY, sink.clone(), &mut ()));
     match simplified.op() {
         Op::Sink { sources } => sources.iter().cloned().collect(),
         _ => vec![simplified],
@@ -847,11 +887,12 @@ fn apply_reshape_core(in_shape: &[SInt], out_shape: &[SInt], rngs: &[Arc<UOp>]) 
 /// Public wrapper around `apply_reshape_core` with PLACEHOLDER canonicalization.
 /// Used by `flatten_bufferize` to convert multi-dim ranges to 1D.
 pub fn apply_reshape_ranges(in_shape: &[SInt], out_shape: &[SInt], rngs: &[Arc<UOp>]) -> Vec<Arc<UOp>> {
-    with_placeholder_canonicalization(rngs, |canonical| apply_reshape_core(in_shape, out_shape, canonical))
+    let mut cache = SimplifyCache::default();
+    with_placeholder_canonicalization(rngs, |canonical| apply_reshape_core(in_shape, out_shape, canonical, &mut cache))
 }
 
 /// Canonicalize RANGE UOps to PLACEHOLDER before calling `f`, then restore.
-/// Matches Tinygrad indexing.py:150-153.
+/// Matches upstream.
 fn with_placeholder_canonicalization(rngs: &[Arc<UOp>], f: impl FnOnce(&[Arc<UOp>]) -> Vec<Arc<UOp>>) -> Vec<Arc<UOp>> {
     let sink = UOp::sink(rngs.to_vec());
     let ranges_in_expr: Vec<Arc<UOp>> = sink.ranges().clone();
@@ -906,7 +947,7 @@ fn is_const_zero(uop: &Arc<UOp>) -> bool {
 
 /// Extract shape UOps from a vectorize/const (symbolic-aware).
 /// Returns individual element UOps — may be CONST or symbolic expressions.
-/// Matches Tinygrad's `marg` which extracts via `sgep`.
+/// Matches upstream `marg` which extracts via `sgep`.
 fn extract_shape_uops(uop: &Arc<UOp>) -> Vec<Arc<UOp>> {
     match uop.op() {
         Op::Vectorize { elements } => elements.to_vec(),
@@ -968,7 +1009,7 @@ pub fn ranges_equal(ranges1: &[Arc<UOp>], ranges2: &[Arc<UOp>]) -> bool {
 /// Two ranges are compatible if:
 /// Check if two range index expressions are compatible (can share the same range).
 ///
-/// Aligned with Tinygrad's `all_same()` which uses `==` on hash-consed UOps.
+/// Aligned with upstream `all_same()`.
 /// Two ranges are compatible only if they are identical (pointer-equal or
 /// structurally equal including axis_id). Different REDUCE ranges from
 /// different reduction scopes must NOT be considered compatible.
@@ -1169,7 +1210,7 @@ fn collect_ranges_from_uop(uop: &Arc<UOp>) -> Vec<Arc<UOp>> {
     ranges
 }
 
-/// Check if UOp is an elementwise operation (matches Tinygrad's GroupOp.Elementwise).
+/// Check if UOp is an elementwise operation (matches upstream GroupOp.Elementwise).
 fn is_elementwise_op(uop: &Arc<UOp>) -> bool {
     matches!(uop.op(), Op::Binary(..) | Op::Unary(..) | Op::Ternary(..) | Op::Cast { .. } | Op::BitCast { .. })
 }

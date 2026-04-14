@@ -551,6 +551,7 @@ pub fn optimize_kernel_with_config(
     // apply_post_optimization contains correctness transforms (pm_add_loads wraps INDEX
     // with LOAD for arithmetic ops) and must run even when optimizations are disabled.
     // Pass the renderer to enable GPU dimension injection for GPU backends.
+
     apply_post_optimization_with_renderer(optimized, Some(renderer))
 }
 

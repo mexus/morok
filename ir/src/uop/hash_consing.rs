@@ -64,7 +64,7 @@ pub(crate) fn next_uop_id() -> u64 {
 struct UOpKey {
     op_discriminant: std::mem::Discriminant<Op>,
     dtype: DType,
-    src_ids: SmallVec<[u64; 4]>,
+    src_hashes: SmallVec<[u64; 4]>,
     op_data: OpData,
     tag: Option<SmallVec<[usize; 2]>>,
     /// Pre-computed hash — avoids re-hashing on every HashMap operation.
@@ -85,7 +85,7 @@ impl PartialEq for UOpKey {
         self.cached_hash == other.cached_hash
             && self.op_discriminant == other.op_discriminant
             && self.dtype == other.dtype
-            && self.src_ids == other.src_ids
+            && self.src_hashes == other.src_hashes
             && self.op_data == other.op_data
             && self.tag == other.tag
     }
@@ -160,17 +160,23 @@ enum OpData {
     None,
 }
 
-/// Get child UOp stable IDs for hash consing.
+/// Get child UOp structural hashes for hash consing.
 ///
-/// Returns SmallVec of IDs, optimized for common case of ≤4 children (inline storage).
-fn src_ids(op: &Op) -> SmallVec<[u64; 4]> {
-    op.children().into_iter().map(|child| child.id).collect()
+/// Uses `content_hash` (structural) instead of `id` (identity) so that
+/// structurally identical children produce the same key — even if they're
+/// different `Arc` pointers. This makes hash consing truly structural,
+/// matching Tinygrad's behavior where `id()` works because hash consing
+/// guarantees same structure = same object.
+///
+/// Returns SmallVec of hashes, optimized for common case of ≤4 children (inline storage).
+fn src_hashes(op: &Op) -> SmallVec<[u64; 4]> {
+    op.children().into_iter().map(|child| child.content_hash).collect()
 }
 
 impl UOpKey {
     fn new(op: &Op, dtype: DType, tag: &Option<SmallVec<[usize; 2]>>) -> Self {
         let op_discriminant = discriminant(op);
-        let src_ids = src_ids(op);
+        let src_hashes = src_hashes(op);
 
         let op_data = match op {
             Op::Const(c) => OpData::Const(*c),
@@ -250,7 +256,7 @@ impl UOpKey {
             let mut h = Xxh64::new(0);
             op_discriminant.hash(&mut h);
             dtype.hash(&mut h);
-            for id in &src_ids {
+            for id in &src_hashes {
                 h.write_u64(*id);
             }
             op_data.hash(&mut h);
@@ -258,7 +264,7 @@ impl UOpKey {
             h.finish()
         };
 
-        Self { op_discriminant, dtype, src_ids, op_data, tag: tag.clone(), cached_hash }
+        Self { op_discriminant, dtype, src_hashes, op_data, tag: tag.clone(), cached_hash }
     }
 }
 

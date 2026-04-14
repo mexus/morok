@@ -25,7 +25,6 @@ fn bench_matmul(c: &mut Criterion) {
     // tracing_subscriber::fmt::init();
 
     let mut group = c.benchmark_group("matmul_optimization");
-    let mut executor = morok_runtime::global_executor();
 
     // Typed optimizer configurations (no environment variables needed)
     let heuristic_config: PrepareConfig = OptimizerConfig::builder()
@@ -61,7 +60,7 @@ fn bench_matmul(c: &mut Criterion) {
             }
 
             group.bench_with_input(BenchmarkId::new("heuristic", size), &size, |bencher, _| {
-                bencher.iter(|| plan_h.execute(&mut executor).expect("execute should succeed"));
+                bencher.iter(|| plan_h.execute().expect("execute should succeed"));
             });
 
             // BEAM: Prepare OUTSIDE timing (beam search + compilation happens here)
@@ -76,7 +75,7 @@ fn bench_matmul(c: &mut Criterion) {
             }
 
             group.bench_with_input(BenchmarkId::new(format!("beam_w{BEAM_WIDTH}"), size), &size, |bencher, _| {
-                bencher.iter(|| plan_b.execute(&mut executor).expect("execute should succeed"));
+                bencher.iter(|| plan_b.execute().expect("execute should succeed"));
             });
         }
     }

@@ -49,8 +49,7 @@ use morok_device::{Buffer, device::Device};
 use morok_ir::pattern::is_any_const;
 use morok_ir::{DeviceSpec, Op, UOp, UOpKey};
 use morok_runtime::{
-    ExecutionGraph, ExecutionNode, ExecutionPlan, ExecutionPlanBuilder, KernelBufferAccess, ParallelGroup,
-    PreparedKernel,
+    ExecutionGraph, ExecutionNode, ExecutionPlan, ExecutionPlanBuilder, KernelBufferAccess, PreparedKernel,
 };
 use snafu::{OptionExt, ResultExt};
 use std::sync::Arc;
@@ -104,8 +103,7 @@ impl Tensor {
         let plan = self.prepare()?;
         let prep_ms = t_prep.elapsed().as_millis();
         let t_exec = std::time::Instant::now();
-        let mut executor = morok_runtime::global_executor();
-        plan.execute(&mut executor).context(ExecutionSnafu)?;
+        plan.execute().context(ExecutionSnafu)?;
         let exec_ms = t_exec.elapsed().as_millis();
         debug!(prep_ms, exec_ms, "realize complete");
 
@@ -170,8 +168,7 @@ impl Tensor {
         let plan = self.prepare_with(config)?;
         let prep_ms = t_prep.elapsed().as_millis();
         let t_exec = std::time::Instant::now();
-        let mut executor = morok_runtime::global_executor();
-        plan.execute(&mut executor).context(ExecutionSnafu)?;
+        plan.execute().context(ExecutionSnafu)?;
         let exec_ms = t_exec.elapsed().as_millis();
         debug!(prep_ms, exec_ms, "realize_with complete");
 
@@ -257,8 +254,7 @@ impl Tensor {
     /// let plan = c.prepare()?;
     ///
     /// // Fast execution (can be called many times)
-    /// let mut executor = morok_runtime::global_executor();
-    /// plan.execute(&mut executor)?;
+    /// plan.execute()?;
     ///
     /// // Get results
     /// let output = plan.output_buffer();
@@ -472,8 +468,7 @@ impl Tensor {
         let plan = prepare_execution_plan(&schedule_result, config)?;
         let prep_ms = t_prep.elapsed().as_millis();
         let t_exec = std::time::Instant::now();
-        let mut executor = morok_runtime::global_executor();
-        plan.execute(&mut executor).context(ExecutionSnafu)?;
+        plan.execute().context(ExecutionSnafu)?;
         let exec_ms = t_exec.elapsed().as_millis();
         debug!(prep_ms, exec_ms, num_outputs = pending_indices.len(), "realize_batch complete");
 
@@ -678,8 +673,7 @@ fn realize_pending_recursive(buf_id: u64, config: &PrepareConfig) -> Result<()> 
         }
 
         let plan = prepare_execution_plan(&schedule_result, config)?;
-        let mut executor = morok_runtime::global_executor();
-        plan.execute(&mut executor).context(ExecutionSnafu)?;
+        plan.execute().context(ExecutionSnafu)?;
 
         // Register the target buffer so collect_input_buffers can find it.
         let output_buf = plan.output_buffer().clone();
@@ -737,29 +731,29 @@ pub(crate) struct NormalizeBuffersCtx {
     pub param_buffers: Vec<(u64, Arc<UOp>)>,
 }
 
-fn normalize_buffers_patterns() -> &'static morok_schedule::TypedPatternMatcher<NormalizeBuffersCtx> {
-    use std::sync::LazyLock;
-    static CACHED: LazyLock<morok_schedule::TypedPatternMatcher<NormalizeBuffersCtx>> = LazyLock::new(|| {
-        morok_schedule::patterns! {
-            @context NormalizeBuffersCtx;
-            // Tinygrad (schedule.py:106): UOp.param(slot, dtype, shape, device)
-            // Preserves device from Buffer so device_spec() works on Param.
-            buf @ Buffer { size, unique: _, device } => {
-                let slot = *ctx.buffer_map.entry(buf.id).or_insert_with(|| {
-                    let s = ctx.param_buffers.len();
-                    ctx.param_buffers.push((buf.id, buf.clone()));
-                    s
-                });
-                Some(UOp::param(slot, *size, buf.dtype(), Some(device.clone())))
-            },
-        }
-    });
-    &CACHED
-}
-
 pub(crate) fn normalize_buffers_to_params(sink: &Arc<UOp>) -> (Arc<UOp>, Vec<(u64, Arc<UOp>)>) {
     let mut ctx = NormalizeBuffersCtx { buffer_map: HashMap::new(), param_buffers: Vec::new() };
-    let normalized = morok_schedule::rewrite::graph_rewrite(normalize_buffers_patterns(), sink.clone(), &mut ctx);
+
+    // Replace BUFFER → PARAM via graph_rewrite (matching upstream pm_pre_sched_cache).
+    use morok_ir::op::pattern_derived::OpKey;
+    use morok_ir::pattern::{RewriteResult, SimplifiedPatternMatcher};
+    use morok_ir::rewrite::graph_rewrite;
+
+    let mut matcher = SimplifiedPatternMatcher::<NormalizeBuffersCtx>::new();
+    matcher.add(&[OpKey::Buffer], |node, ctx| {
+        let Op::Buffer { size, device, .. } = node.op() else {
+            return RewriteResult::NoMatch;
+        };
+        let slot = *ctx.buffer_map.entry(node.id).or_insert_with(|| {
+            let s = ctx.param_buffers.len();
+            ctx.param_buffers.push((node.id, node.clone()));
+            s
+        });
+        let param = UOp::param(slot, *size, node.dtype(), Some(device.clone()));
+        RewriteResult::Rewritten(param)
+    });
+
+    let normalized = graph_rewrite(&matcher, sink.clone(), &mut ctx);
     (normalized, ctx.param_buffers)
 }
 
@@ -920,10 +914,8 @@ fn prepare_execution_plan(
     // Build execution graph for parallel group analysis
     let mut execution_graph = build_execution_graph(&expanded_schedule);
 
-    // Compute parallel groups
-    let _parallel_groups_raw = execution_graph.compute_parallel_groups();
-
     // Verify the graph is valid (no cycles)
+    execution_graph.compute_parallel_groups();
     if !execution_graph.is_valid() {
         return DependencyCyclesSnafu.fail();
     }
@@ -972,7 +964,7 @@ fn prepare_execution_plan(
     let opt_cache = OPT_CACHE.get_or_init(papaya::HashMap::new);
     let opt_guard = opt_cache.guard();
 
-    for item in &expanded_schedule {
+    for item in expanded_schedule.iter() {
         // COPY operations: buffer-to-buffer transfer (DISK→CPU, CPU→CUDA, etc.)
         // No kernel compilation needed — just register the buffer copy for execution.
         if matches!(item.ast.op(), Op::Copy { .. }) {
@@ -1077,26 +1069,9 @@ fn prepare_execution_plan(
     }
 
     // Add kernels to builder and track their indices
-    let num_prepared_kernels = prepared_kernels.len();
     for kernel in prepared_kernels {
         builder.add_kernel(kernel);
     }
-
-    // Step 3: Create parallel groups
-    // Each kernel goes into its own group for sequential execution.
-    //
-    // NOTE: While expanded iterations with different fixedvars ARE independent
-    // (they write to different positions in the same buffer), the UnifiedExecutor's
-    // validate_parallel_independence() cannot distinguish this - it sees writes to
-    // the same buffer ID as a conflict. Until we enhance the executor to understand
-    // position-based independence, we execute sequentially.
-    //
-    // Future optimization: Group truly independent kernels (different AST IDs
-    // writing to different buffers) for parallel execution.
-    let parallel_groups: Vec<ParallelGroup> =
-        (0..num_prepared_kernels).map(|idx| ParallelGroup { kernel_indices: vec![idx] }).collect();
-
-    builder.set_parallel_groups(parallel_groups);
 
     // Deterministic output identification via ScheduleResult.output_uop_ids
     let output_buffer_indices: Vec<usize> =
@@ -1105,7 +1080,8 @@ fn prepare_execution_plan(
         builder.set_output_buffers(output_buffer_indices);
     }
 
-    Ok(builder.build())
+    let plan = builder.build();
+    Ok(plan)
 }
 
 /// Resolve the device string for cache keying (includes compiler cache key).
@@ -1363,7 +1339,6 @@ mod tests {
         // Verify plan has kernels and buffers
         assert!(plan.kernels().next().is_some(), "Plan should have at least one kernel");
         assert!(!plan.buffers().is_empty(), "Plan should have buffers");
-        assert!(!plan.parallel_groups().is_empty(), "Plan should have parallel groups");
     }
 
     #[test]
@@ -1379,8 +1354,7 @@ mod tests {
         let plan = c.prepare().expect("prepare should succeed");
 
         // Execute
-        let mut executor = morok_runtime::global_executor();
-        let result = plan.execute(&mut executor);
+        let result = plan.execute();
         assert!(result.is_ok(), "execute() should succeed: {:?}", result.err());
 
         // Verify output buffer has correct data
@@ -1405,10 +1379,8 @@ mod tests {
         let plan = c.prepare().expect("prepare should succeed");
 
         // Execute twice to verify reusability
-        let mut executor = morok_runtime::global_executor();
-
         for _ in 0..2 {
-            let result = plan.execute(&mut executor);
+            let result = plan.execute();
             assert!(result.is_ok(), "execute() should succeed: {:?}", result.err());
         }
 
@@ -1458,9 +1430,8 @@ mod tests {
         let plan = c.prepare().expect("prepare should succeed");
 
         // Execute multiple times (simulating benchmark loop)
-        let mut executor = morok_runtime::global_executor();
         for _ in 0..3 {
-            plan.execute(&mut executor).expect("execute should succeed");
+            plan.execute().expect("execute should succeed");
         }
 
         // Verify output
@@ -1499,8 +1470,6 @@ mod tests {
 
         const ITERATIONS: usize = 10;
 
-        let mut executor = morok_runtime::global_executor();
-
         // Create input tensors
         let a = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0]);
         let b = Tensor::from_slice([5.0f32, 6.0, 7.0, 8.0]);
@@ -1513,7 +1482,7 @@ mod tests {
 
         // Execute MANY times
         for _ in 0..ITERATIONS {
-            plan.execute(&mut executor).expect("execute should succeed");
+            plan.execute().expect("execute should succeed");
             counts.push(crate::tensor_registry::buffer_count());
         }
 

@@ -92,8 +92,7 @@ crate::codegen_tests! {
         let mut a = &Tensor::from_slice([1.0f32, 2.0]) + &Tensor::from_slice([3.0f32, 4.0]);
         let mut b = &Tensor::from_slice([10.0f32, 20.0]) * &Tensor::from_slice([2.0f32, 3.0]);
         let plan = Tensor::prepare_batch_with([&mut a, &mut b], &config).unwrap();
-        let mut executor = morok_runtime::global_executor();
-        plan.execute(&mut executor).unwrap();
+        plan.execute().unwrap();
         assert_eq!(plan.num_outputs(), 2);
         assert_close_f32(&a.as_vec::<f32>().unwrap(), &[4.0, 6.0], 1e-6);
         assert_close_f32(&b.as_vec::<f32>().unwrap(), &[20.0, 60.0], 1e-6);

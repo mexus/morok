@@ -74,7 +74,7 @@ impl SplitReduceOpConfig {
 ///
 /// Simplified from original 8 fields to 6 fields, removing Morok-specific
 /// `kernel_deps` and `buffer_id_mapping` that are no longer needed after
-/// aligning with Tinygrad's fix_assign approach.
+/// aligning with fix_assign approach.
 #[derive(Clone)]
 pub struct KernelContext {
     pub global_counter: usize,
@@ -142,7 +142,7 @@ impl Default for KernelContext {
 
 /// Per-kernel context for tracking state during kernel splitting.
 ///
-/// Based on Tinygrad's `LocalAddBufferContext` (rangeify.py:376-383).
+/// Based on `LocalAddBufferContext`.
 /// This is used within `split_store` for each individual kernel being created.
 ///
 /// IMPORTANT: Uses IndexMap for `map` to maintain insertion order.
@@ -151,7 +151,7 @@ impl Default for KernelContext {
 /// buffer indexing during execution.
 #[derive(Default)]
 pub struct LocalAddBufferContext {
-    /// PARAM slot counter (Tinygrad: `dg`)
+    /// PARAM slot counter (`dg`)
     pub param_slot: usize,
     /// Buffer → AFTER mapping (IndexMap maintains insertion order)
     pub map: IndexMap<UOpKey, Arc<UOp>>,
@@ -159,7 +159,7 @@ pub struct LocalAddBufferContext {
     pub vars: HashMap<String, (Arc<UOp>, Option<i64>)>,
     /// Range renumber counter
     pub range: usize,
-    /// Optimization hints extracted from CONTIGUOUS.opts (Tinygrad: ctx.opts)
+    /// Optimization hints extracted from CONTIGUOUS.opts (ctx.opts)
     pub opts: Vec<morok_ir::ContiguousHint>,
 }
 
@@ -168,7 +168,7 @@ impl LocalAddBufferContext {
         Self::default()
     }
 
-    /// Get next PARAM slot index (Tinygrad: `ctx.dg`).
+    /// Get next PARAM slot index (`ctx.dg`).
     pub fn next_param_slot(&mut self) -> usize {
         let id = self.param_slot;
         self.param_slot += 1;
@@ -204,10 +204,20 @@ impl LocalAddBufferContext {
 // SPLIT KERNEL
 // ============================================================================
 
+/// Marker metadata for kernel AST SINKs.
+///
+/// Matches `KernelInfo` arg on SINK nodes:
+///   `ret = ret.sink(arg=KernelInfo(...))`
+///
+/// The gate (`pm_gate_kernel_sink`) checks for this marker to skip
+/// already-formed kernel ASTs during bottom-up traversal.
+#[derive(Debug, Clone)]
+pub struct KernelAstMarker;
+
 /// Extract the stored value from a STORE/END(STORE) structure.
 ///
 /// Used to check if the stored value is COPY/BUFFER_VIEW without traversing
-/// the entire subgraph (matching Tinygrad rangeify.py:526-529).
+/// the entire subgraph.
 fn extract_stored_value(ret: &Arc<UOp>) -> &Arc<UOp> {
     match ret.op() {
         Op::Store { value, .. } => value,
@@ -221,7 +231,7 @@ fn extract_stored_value(ret: &Arc<UOp>) -> &Arc<UOp> {
 
 /// Split STORE and END operations into individual kernels.
 ///
-/// Based on Tinygrad's split_store (rangeify.py:480-507).
+/// Based on split_store.
 /// Simplified from 280 lines to ~80 lines using LocalAddBufferContext.
 pub fn split_store(_ctx: &mut Vec<Arc<UOp>>, x: &Arc<UOp>) -> Option<Arc<UOp>> {
     use super::patterns::{local_to_param_patterns, rangeify_codegen_patterns};
@@ -229,7 +239,7 @@ pub fn split_store(_ctx: &mut Vec<Arc<UOp>>, x: &Arc<UOp>) -> Option<Arc<UOp>> {
 
     trace!(uop_id = x.id, op = ?std::mem::discriminant(x.op()), "split_store: entering");
 
-    // Guard 1: Skip if has non-OUTER ranges (like Tinygrad rangeify.py:482)
+    // Guard 1: Skip if has non-OUTER ranges
     #[allow(clippy::mutable_key_type)] // UOp uses Arc<OnceLock> for caching, but keys hash by ID
     let in_scope = x.in_scope_ranges();
     let has_non_outer =
@@ -238,8 +248,8 @@ pub fn split_store(_ctx: &mut Vec<Arc<UOp>>, x: &Arc<UOp>) -> Option<Arc<UOp>> {
         return None;
     }
 
-    // Guard 2: Skip END where FIRST range is OUTER (like Tinygrad rangeify.py:485)
-    // Tinygrad: `if x.op is Ops.END and x.src[1].arg[0] == AxisType.OUTER: return None`
+    // Guard 2: Skip END where FIRST range is OUTER
+    // `if x.op is Ops.END and x.src[1].arg[0] == AxisType.OUTER: return None`
     if let Op::End { ranges, .. } = x.op()
         && let Some(r) = ranges.first()
         && matches!(r.op(), Op::Range { axis_type: AxisType::Outer, .. })
@@ -273,16 +283,18 @@ pub fn split_store(_ctx: &mut Vec<Arc<UOp>>, x: &Arc<UOp>) -> Option<Arc<UOp>> {
         graph_rewrite_bottom_up(&*PM_CTX_DEP, x.clone(), &mut lctx)
     };
 
-    // Check for COPY/BUFFER_VIEW directly on the stored value (like Tinygrad rangeify.py:526-530).
+    // Check for COPY/BUFFER_VIEW directly on the stored value.
     // No graph traversal needed — just walk the STORE/END structure.
     let stored = extract_stored_value(&ret);
     let ast = if matches!(stored.op(), Op::Copy { .. } | Op::BufferView { .. }) {
         stored.clone()
     } else {
-        UOp::sink(vec![ret])
+        // Mark AST SINK with KernelAstMarker — matches `ret.sink(arg=KernelInfo(...))`
+        // The gate (`pm_gate_kernel_sink`) checks for this marker to skip the kernel AST subtree.
+        UOp::sink(vec![ret]).with_metadata(KernelAstMarker)
     };
 
-    // Build KERNEL from context (like Tinygrad rangeify.py:504)
+    // Build KERNEL from context
     // Sources: lctx.map.values() (buffer → AFTER mappings) + DEFINE_VAR UOps from vars
     let sources: SmallVec<[Arc<UOp>; 4]> =
         lctx.map.values().cloned().chain(lctx.vars.values().map(|(uop, _)| uop.clone())).collect();
@@ -299,9 +311,9 @@ pub fn split_store(_ctx: &mut Vec<Arc<UOp>>, x: &Arc<UOp>) -> Option<Arc<UOp>> {
     Some(kernel)
 }
 
-/// Fix inter-kernel dependencies (like Tinygrad's fix_assign).
+/// Fix inter-kernel dependencies (like fix_assign).
 ///
-/// Based on Tinygrad rangeify.py:568-580.
+/// Based on upstream.
 /// When kernel B reads from a buffer that kernel A writes to, this function
 /// ensures kernel B's AFTER node depends on kernel A's AFTER node.
 ///
@@ -343,7 +355,7 @@ fn fix_assign(root: &Arc<UOp>) -> Arc<UOp> {
                 continue;
             };
 
-            // Same-kernel check (Tinygrad rangeify.py:576: a.src[1] is u.src[1])
+            // Same-kernel check (a.src[1] is u.src[1])
             // Skip if both AFTERs belong to the same kernel — avoids spurious WAR deps
             // between outputs of the same multi-output kernel.
             if let Op::After { deps: a_deps, .. } = a.op()
@@ -352,7 +364,7 @@ fn fix_assign(root: &Arc<UOp>) -> Arc<UOp> {
                 continue;
             }
 
-            // Cycle detection (like Tinygrad rangeify.py:577-578)
+            // Cycle detection
             if u.any_in_subtree(|x| matches!(x.op(), Op::After { .. }) && x.buf_uop().id == s_buf_id) {
                 panic!(
                     "cycle detected in graph: kernel for buffer {} reads buffer {} which has AFTER in its tree",
@@ -380,7 +392,7 @@ fn fix_assign(root: &Arc<UOp>) -> Arc<UOp> {
 
 /// Run the kernel splitting pipeline.
 ///
-/// Based on Tinygrad's get_rangeify_map (rangeify.py:565-580).
+/// Based on get_rangeify_map.
 /// Simplified from ~200 lines to ~40 lines.
 ///
 /// # Returns
@@ -391,9 +403,21 @@ pub fn run_kernel_split_pipeline(root: Arc<UOp>) -> (Arc<UOp>, KernelContext) {
 
     let mut ctx = KernelContext::new();
 
+    // PASS 1: bufferize → store (pm_gate_kernel_sink + pm_add_buffers + pm_add_range_tags, bottom_up=True)
     let t_stage = std::time::Instant::now();
     let after_buffers = {
-        let matcher = pm_add_buffers_patterns();
+        use morok_ir::op::pattern_derived::OpKey;
+        use morok_ir::pattern::RewriteResult;
+        let mut matcher = pm_add_buffers_patterns();
+        // Gate on SINK with KernelAstMarker to skip already-formed kernel ASTs
+        // (pm_gate_kernel_sink gates on SINK with KernelInfo arg)
+        matcher.add(&[OpKey::Sink], |node, _ctx| {
+            if node.metadata::<KernelAstMarker>().is_some() {
+                RewriteResult::Gate(node.clone())
+            } else {
+                RewriteResult::NoMatch
+            }
+        });
         graph_rewrite_bottom_up(&matcher, root, &mut ctx)
     };
     tracing::debug!(elapsed_ms = t_stage.elapsed().as_millis() as u64, "kernel split: pm_add_buffers complete");
@@ -402,7 +426,7 @@ pub fn run_kernel_split_pipeline(root: Arc<UOp>) -> (Arc<UOp>, KernelContext) {
 
     // Pre-run pm_flatten_range on the FULL graph ONCE before kernel splitting.
     //
-    // Tinygrad's split_store includes pm_flatten_range but NOT pm_mops/pm_syntactic_sugar
+    // split_store includes pm_flatten_range but NOT pm_mops/pm_syntactic_sugar
     // (those were already applied in earlier pipeline stages). Running flatten_range once
     // on the full graph avoids redundant per-kernel traversals on overlapping subgraphs.
     let t_stage = std::time::Instant::now();
@@ -425,37 +449,37 @@ pub fn run_kernel_split_pipeline(root: Arc<UOp>) -> (Arc<UOp>, KernelContext) {
 
 /// Split all STORE/END operations into KERNELs.
 ///
-/// Uses a single graph_rewrite pass with bpm (gate) + pm (split) matching Tinygrad's:
+/// Matches upstream:
 ///   `graph_rewrite(tsink, pm_gate_kernel_sink + split_kernels, bottom_up=True)`
 ///
-/// - bpm (Stage 0): gates on KERNEL nodes to prevent descending into already-split subtrees
-/// - pm (Stage 1): transforms STORE/END → KERNEL after children are already optimized
-///
-/// Bottom-up processing ensures inner STORE/END become KERNELs before outer ones see them.
+/// All patterns run in bpm (Stage 0, see ORIGINAL children):
+/// - Gate on KERNEL nodes to prevent descending into already-split subtrees
+/// - STORE/END → KERNEL via split_store
 fn split_all_stores(root: &Arc<UOp>) -> Arc<UOp> {
     use morok_ir::op::pattern_derived::OpKey;
-    use morok_ir::pattern::{RewriteResult, SimplifiedPatternMatcher};
-    use morok_ir::rewrite::graph_rewrite_with_bpm;
+    use morok_ir::pattern::RewriteResult;
+    use morok_ir::rewrite::graph_rewrite_bottom_up;
 
-    // bpm: gate on KERNEL nodes (stop descent into already-processed subtrees)
-    // NOTE: patterns! macro doesn't support Gate returns, so this stays manual
-    let bpm = {
-        let mut m = SimplifiedPatternMatcher::<Vec<Arc<UOp>>>::new();
-        m.add(&[OpKey::Kernel], |node, _ctx| RewriteResult::Gate(node.clone()));
-        m
-    };
-
-    // pm: transform STORE/END → KERNEL (sees optimized children)
-    let pm = crate::patterns! {
+    // Combined gate + split in bpm (pm_gate_kernel_sink + split_kernels, bottom_up=True)
+    let mut matcher = crate::patterns! {
         @context Vec<Arc<UOp>>;
         node @ Store { index: _, value: _ } => |node, ctx| split_store(ctx, node),
         node @ End { computation, .. }
             if matches!(computation.op(), Op::Store { .. } | Op::End { .. })
             => |node, ctx| split_store(ctx, node),
     };
+    // Gate on SINK with KernelAstMarker to skip already-formed kernel ASTs
+    // (pm_gate_kernel_sink gates on SINK with KernelInfo arg)
+    matcher.add(&[OpKey::Sink], |node, _ctx| {
+        if node.metadata::<KernelAstMarker>().is_some() {
+            RewriteResult::Gate(node.clone())
+        } else {
+            RewriteResult::NoMatch
+        }
+    });
 
     let mut ctx = Vec::new();
-    graph_rewrite_with_bpm(&pm, &bpm, root.clone(), &mut ctx)
+    graph_rewrite_bottom_up(&matcher, root.clone(), &mut ctx)
 }
 
 // ============================================================================
@@ -512,7 +536,7 @@ fn detect_expanded_dimensions(source: &Arc<UOp>, input_shape: &[SInt]) -> Vec<bo
     use super::patterns::{movement_op_patterns, pm_syntactic_sugar};
     use crate::rewrite::graph_rewrite_bottom_up;
 
-    // Tinygrad: pm_mops + pm_syntactic_sugar (early movement ops, bottom_up=True)
+    // pm_mops + pm_syntactic_sugar (early movement ops, bottom_up=True)
     use std::sync::LazyLock;
     static PM_MOPS: LazyLock<crate::TypedPatternMatcher> =
         LazyLock::new(|| movement_op_patterns() + pm_syntactic_sugar());

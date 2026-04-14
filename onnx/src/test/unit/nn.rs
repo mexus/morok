@@ -221,6 +221,7 @@ fn test_instance_norm() {
 /// Loads v3_e2e_rnnt_encoder.onnx and counts kernels at rangeify level
 /// for comparison with Tinygrad (465 kernels, 17 unique types).
 #[test]
+#[ignore = "it's heavy regression test"]
 fn test_rnnt_encoder_kernel_count() {
     setup_test_tracing();
     let model_path =
