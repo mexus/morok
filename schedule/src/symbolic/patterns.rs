@@ -2382,11 +2382,17 @@ pub fn gep_pushing_patterns() -> &'static TypedPatternMatcher {
 /// Div/Mod recombination patterns.
 ///
 /// Uses automatic ptr_eq checks via duplicate variable names in patterns.
-/// - x%n + (x//n)*n → x (div-mod identity)
-/// - ((x//a) % c) + (x // b) * c → x // a when a*c == b
-/// - (x % c1) * c2 + (x // c1) * c3 → x * c2 when c1*c2 == c3
-/// - y + (x % n) + (x // n) * n → y + x
-/// - (a//c1 + c2) // c3 → (a + c1*c2) // (c1*c3) (nested division)
+///
+/// Flat (2-operand) variants:
+/// - x%n + (x//n)*n → x
+/// - ((x//a) % c) + (x // b) * c → x // a  when a*c == b
+/// - (x % c1) * c2 + (x // c1) * c3 → x * c2  when c1*c2 == c3
+///
+/// Nested-Add (3-operand) variants for expressions with an extra addend:
+/// - y + (x//n)*n + x%n → y + x
+/// - y + x%n + (x//n)*n → y + x
+/// - y + (x // c1) * c3 + (x % c1) * c2 → y + x * c2  when c1*c2 == c3
+/// - y + (x % c1) * c2 + (x // c1) * c3 → y + x * c2  when c1*c2 == c3
 pub fn div_mod_recombine_dsl_patterns() -> &'static TypedPatternMatcher {
     crate::cached_patterns! {
         // x%n + (x//n)*n → x (div-mod identity)
@@ -2420,9 +2426,27 @@ pub fn div_mod_recombine_dsl_patterns() -> &'static TypedPatternMatcher {
             None
         },
 
-        // y + (x % n) + (x // n) * n → y + x
-        // Note: x appears twice, n appears 3 times → auto ptr_eq for all
+        // y + (x//n)*n + x%n → y + x
+        Add[Add[y, Mul[Idiv(x, n), n]], Mod(x, n)] ~> y.add(x),
+
+        // y + x%n + (x//n)*n → y + x
         Add[Add[y, Mod(x, n)], Mul[Idiv(x, n), n]] ~> y.add(x),
+
+        // y + (x // c1) * c3 + (x % c1) * c2 → y + x * c2  when c1*c2 == c3
+        Add[Add[y, Mul[Idiv(x, c1 @const(c1_val)), _c3 @const(c3_val)]], Mul[Mod(x, c1), c2 @const(c2_val)]] => {
+            let c1_int = c1_val.try_int()?;
+            let c2_int = c2_val.try_int()?;
+            let c3_int = c3_val.try_int()?;
+            (c1_int * c2_int == c3_int).then(|| y.add(&x.mul(c2)))
+        },
+
+        // y + (x % c1) * c2 + (x // c1) * c3 → y + x * c2  when c1*c2 == c3
+        Add[Add[y, Mul[Mod(x, c1 @const(c1_val)), c2 @const(c2_val)]], Mul[Idiv(x, c1), _c3 @const(c3_val)]] => {
+            let c1_int = c1_val.try_int()?;
+            let c2_int = c2_val.try_int()?;
+            let c3_int = c3_val.try_int()?;
+            (c1_int * c2_int == c3_int).then(|| y.add(&x.mul(c2)))
+        },
     }
 }
 
