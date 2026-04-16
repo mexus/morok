@@ -86,6 +86,18 @@ pub fn pm_lower_index_dtype() -> TypedPatternMatcher {
         // PHASE 2: Process wrapped values
         // ================================================================
 
+        // Unary(x.cast(Index)) → Unary(x.cast(dt), dt).cast(Index)
+        // Handles Neg and other unary ops on Index-wrapped values.
+        node if matches!(node.op(), Op::Unary(_, _)) && node.dtype() == DType::Index => |node| {
+            let Op::Unary(op, x) = node.op() else { return None };
+            let Op::Cast { src, dtype } = x.op() else { return None };
+            if *dtype != DType::Index { return None; }
+
+            let dt = least_upper_dtype(&select_dtype(node), &src.dtype());
+            let result = UOp::new(Op::Unary(*op, src.cast(dt.clone())), dt);
+            Some(result.cast(DType::Index))
+        },
+
         // Binary(x.cast(Index), y.cast(Index)) → alu(op, x.cast(dt), y.cast(dt)).cast(u.dtype)
         // Tinygrad: x.cast(dt:=least_upper_dtype(select_dtype(u), x.dtype, y.dtype)).alu(u.op, y.cast(dt)).cast(u.dtype)
         // No dtype guard on result — comparisons (Lt, Ge, etc.) produce Bool, not Index,
@@ -188,52 +200,53 @@ pub fn pm_lower_index_dtype() -> TypedPatternMatcher {
         // PHASE 3: Cleanup - strip wrappers at terminal nodes
         // ================================================================
 
-        // INDEX(buf, idx.cast(Index)) → INDEX(buf, idx) preserving INDEX dtype
-        // Tinygrad: buf.index(idx, ptr=True) - preserves buffer's Ptr dtype
-        // Note: we use node.dtype() instead of buffer.dtype() to preserve any
-        // explicit dtype set by earlier passes (e.g. contiguous_gep_load_patterns
-        // sets Ptr{base: scalar} for vector buffer reads).
-        node @ Index { buffer, indices, gate: None } if indices.len() == 1 => |node, buffer, indices| {
-            let idx = &indices[0];
-            let Op::Cast { src, dtype } = idx.op() else { return None };
-            if *dtype != DType::Index || !src.dtype().is_int() { return None; }
-
-            Some(UOp::new(Op::Index { buffer: buffer.clone(), indices: smallvec::smallvec![src.clone()], gate: None }, node.dtype()))
+        // INDEX(buf, ...idx.cast(Index)...) → INDEX(buf, ...idx...) — strip Cast(Index) from all per-dim indices
+        // Tinygrad: ops.py:1308-1310 — buf.index(idx, ptr=True)
+        // Generalized for multi-index INDEX (Tinygrad keeps multi-index through the pipeline).
+        node @ Index { buffer, indices, gate } => |node, buffer, indices, gate| {
+            let mut changed = false;
+            let new_indices: smallvec::SmallVec<[std::sync::Arc<UOp>; 4]> = indices.iter().map(|idx| {
+                if let Op::Cast { src, dtype } = idx.op()
+                    && *dtype == DType::Index && src.dtype().is_int() {
+                        changed = true;
+                        return src.clone();
+                    }
+                idx.clone()
+            }).collect();
+            if !changed { return None; }
+            Some(UOp::new(Op::Index { buffer: buffer.clone(), indices: new_indices, gate: gate.clone() }, node.dtype()))
         },
 
-        // INDEX(buf, idx.cast(Index), valid) → INDEX(buf, idx, valid) preserving INDEX dtype
-        node @ Index { buffer, indices, gate: Some(valid) } if indices.len() == 1 => |node, buffer, indices, valid| {
-            let idx = &indices[0];
-            let Op::Cast { src, dtype } = idx.op() else { return None };
-            if *dtype != DType::Index || !src.dtype().is_int() { return None; }
-
-            Some(UOp::new(Op::Index { buffer: buffer.clone(), indices: smallvec::smallvec![src.clone()], gate: Some(valid.clone()) }, node.dtype()))
-        },
-
-        // INDEX(buf, WHERE(cond, idx, Invalid)) → INDEX(buf, idx, gate=cond) preserving INDEX dtype
-        node @ Index { buffer, indices, gate: None } if indices.len() == 1 => |node, buffer, indices| {
-            let idx_uop = &indices[0];
-            let Op::Ternary(morok_ir::TernaryOp::Where, cond, idx, false_val) = idx_uop.op() else {
-                return None;
+        // INDEX(buf, ...WHERE(cond, idx, Invalid)...) → INDEX(buf, ...idx..., gate=AND(conds...))
+        // Tinygrad: ops.py:1306 — extract WHERE-Invalid from index, merge conds into gate
+        // Generalized for multi-index: extracts validity from ALL per-dimension indices.
+        node @ Index { buffer, indices, gate } => |node, buffer, indices, gate| {
+            let mut new_indices: smallvec::SmallVec<[std::sync::Arc<UOp>; 4]> = smallvec::SmallVec::new();
+            let mut conds: Vec<std::sync::Arc<UOp>> = Vec::new();
+            let mut changed = false;
+            for idx in indices.iter() {
+                if let Op::Ternary(morok_ir::TernaryOp::Where, cond, true_val, false_val) = idx.op()
+                    && UOp::is_invalid_marker(false_val) {
+                        new_indices.push(true_val.clone());
+                        conds.push(cond.clone());
+                        changed = true;
+                        continue;
+                    }
+                new_indices.push(idx.clone());
+            }
+            if !changed { return None; }
+            let extracted = conds.into_iter().reduce(|a, b| a.try_and_op(&b).expect("ICE: AND gate merge"));
+            let new_gate = match (gate, extracted) {
+                (Some(existing), Some(ext)) => Some(existing.try_and_op(&ext).expect("ICE: AND gate merge")),
+                (Some(existing), None) => Some(existing.clone()),
+                (None, ext) => ext,
             };
-            if !UOp::is_invalid_marker(false_val) { return None; }
-
-            Some(UOp::new(Op::Index { buffer: buffer.clone(), indices: smallvec::smallvec![idx.clone()], gate: Some(cond.clone()) }, node.dtype()))
+            Some(UOp::new(Op::Index { buffer: buffer.clone(), indices: new_indices, gate: new_gate }, node.dtype()))
         },
 
-        // INDEX(buf, WHERE(cond, idx, Invalid), gate=existing) → INDEX(buf, idx, gate=AND(existing, cond))
-        // Safety net for multi-dimensional padding where nested WHERE-Invalid merge didn't
-        // fire before index lowering. Combines existing gate with new validity condition.
-        node @ Index { buffer, indices, gate: Some(existing_gate) } if indices.len() == 1 => |node, buffer, indices, existing_gate| {
-            let idx_uop = &indices[0];
-            let Op::Ternary(morok_ir::TernaryOp::Where, cond, idx, false_val) = idx_uop.op() else {
-                return None;
-            };
-            if !UOp::is_invalid_marker(false_val) { return None; }
-
-            let combined_gate = existing_gate.try_and_op(cond).ok()?;
-            Some(UOp::new(Op::Index { buffer: buffer.clone(), indices: smallvec::smallvec![idx.clone()], gate: Some(combined_gate) }, node.dtype()))
-        },
+        // SINK/END - strip .cast(Index) from sources
+        // Tinygrad (ops.py:1311) also includes NOOP here, but Morok's Op::Noop has no sources,
+        // so stripping .cast(Index) from NOOP sources is a no-op.
 
         // SINK - strip .cast(Index) from sources
         Sink { sources } => |sources| {

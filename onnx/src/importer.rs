@@ -1,12 +1,13 @@
 //! ONNX model importer - converts ONNX protobuf to Morok Tensors.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufReader, Read};
 use std::path::Path;
 
 use morok_dtype::DType;
-use morok_tensor::Tensor;
+use morok_ir::SInt;
+use morok_tensor::{Tensor, Variable};
 use prost::Message;
 use snafu::ResultExt;
 
@@ -82,6 +83,11 @@ pub struct OnnxGraph {
     pub opsets: Vec<OpSetId>,
     /// Pre-parsed subgraph attributes: (node_index, attr_name) -> SubGraph
     pub(crate) subgraphs: HashMap<(usize, String), SubGraph>,
+    /// Variables auto-extracted from dynamic dimensions (`dim_param`).
+    ///
+    /// Key: dim_param name (e.g., "batch"), Value: Variable with bounds `[1, default_max_dim]`.
+    /// Populated during `prepare()` by scanning input specs for `DimValue::Dynamic` entries.
+    pub variables: HashMap<String, Variable>,
 }
 
 impl OnnxGraph {
@@ -99,73 +105,216 @@ impl OnnxGraph {
     pub fn is_input_optional(&self, name: &str) -> bool {
         self.inputs.get(name).map(|s| s.optional).unwrap_or(false)
     }
+
+    /// Get all dynamic dimension names found in the graph.
+    pub fn dynamic_dims(&self) -> Vec<&str> {
+        self.variables.keys().map(|s| s.as_str()).collect()
+    }
+
+    /// Check if the graph has any dynamic dimensions.
+    pub fn has_dynamic_dims(&self) -> bool {
+        !self.variables.is_empty()
+    }
+}
+
+/// Imported ONNX model — normal Morok types, ready to use.
+///
+/// Contains the lazy computation graph as input/output Tensors and any
+/// dynamic dimension Variables extracted from the ONNX graph.
+///
+/// # Example
+///
+/// ```ignore
+/// let model = OnnxImporter::new().import("model.onnx", &[("batch", 4)])?;
+///
+/// // Inputs are zero-filled tensors matching the model's input shapes
+/// let input_data: Vec<f32> = load_my_data();
+/// model.inputs["x"].copyin(&input_data);
+///
+/// // Outputs are lazy — realize to execute
+/// let result = model.outputs["prob"].realize()?;
+/// ```
+pub struct OnnxModel {
+    /// Model inputs: name → zero-filled Tensor with correct shape/dtype.
+    pub inputs: HashMap<String, Tensor>,
+    /// Model outputs: name → lazy Tensor (realize to execute).
+    pub outputs: HashMap<String, Tensor>,
+    /// Dynamic dimension variables extracted from `dim_param` annotations.
+    /// Empty for static models. Bind to new values for re-execution.
+    pub variables: HashMap<String, Variable>,
 }
 
 /// ONNX model importer.
 ///
-/// Converts ONNX models to Morok Tensors using a two-phase approach:
-/// 1. `prepare()` - Extract graph structure without executing
-/// 2. `trace()` / `trace_with_dims()` - Build lazy computation graph with allocated inputs
+/// Converts ONNX models to Morok Tensors via a single `import()` call that
+/// returns an [`OnnxModel`] with inputs, outputs, and auto-extracted variables.
 pub struct OnnxImporter {
-    /// Operator registry for dispatch
     registry: OpRegistry,
-    /// Directory containing the model file (for external data loading)
     model_dir: Option<std::path::PathBuf>,
+    /// Default max bound for auto-extracted dynamic dimension Variables.
+    ///
+    /// When `prepare()` encounters `dim_param` names in ONNX input shapes,
+    /// it creates `Variable::new(name, 1, default_max_dim)`. Default: 32767.
+    pub default_max_dim: i64,
 }
 
 impl OnnxImporter {
     /// Create a new ONNX importer.
     pub fn new() -> Self {
-        Self { registry: OpRegistry::new(), model_dir: None }
+        Self { registry: OpRegistry::new(), model_dir: None, default_max_dim: i16::MAX as i64 }
     }
 
-    /// Import ONNX model from file path (convenience method for all-initializer models).
-    pub fn import_path<P: AsRef<Path>>(&mut self, path: P) -> Result<HashMap<String, Tensor>> {
-        self.model_dir = path.as_ref().parent().map(|p| p.to_path_buf());
-        let file = File::open(path.as_ref()).context(IoSnafu)?;
+    /// Import an ONNX model from a file path.
+    ///
+    /// Dynamic dimensions are bound via `dim_bindings`; unmentioned dynamic
+    /// dims use their max value for buffer allocation.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let model = OnnxImporter::new().import("model.onnx", &[("batch", 4)])?;
+    /// let result = model.outputs["output"].realize()?;
+    /// ```
+    pub fn import(&mut self, path: impl AsRef<Path>, dim_bindings: &[(&str, i64)]) -> Result<OnnxModel> {
+        let path = path.as_ref();
+        self.model_dir = path.parent().map(|p| p.to_path_buf());
+        let file = File::open(path).context(IoSnafu)?;
         let mut reader = BufReader::new(file);
-        self.import_reader(&mut reader)
-    }
-
-    /// Import ONNX model from a reader.
-    pub fn import_reader<R: Read>(&mut self, reader: &mut R) -> Result<HashMap<String, Tensor>> {
         let mut bytes = Vec::new();
         reader.read_to_end(&mut bytes).context(IoSnafu)?;
-        self.import_bytes(&bytes)
+        // Decode from Bytes (not &[u8]) so raw_data fields are zero-copy sub-slices.
+        // This enables computing byte offsets for DISK-backed weight loading.
+        let file_bytes = prost::bytes::Bytes::from(bytes);
+        let base_ptr = file_bytes.as_ptr();
+        let model = ModelProto::decode(file_bytes).context(ProtobufDecodeSnafu)?;
+        self.import_model_with_disk(model, dim_bindings, Some(path), base_ptr)
     }
 
-    /// Import from bytes.
-    pub fn import_bytes(&mut self, bytes: &[u8]) -> Result<HashMap<String, Tensor>> {
-        let model = ModelProto::decode(bytes).context(ProtobufDecodeSnafu)?;
-        self.import_model(model)
+    /// Import from a parsed `ModelProto` (no DISK-backed loading).
+    pub fn import_model(&self, model: ModelProto, dim_bindings: &[(&str, i64)]) -> Result<OnnxModel> {
+        self.import_model_with_disk(model, dim_bindings, None, std::ptr::null())
     }
 
-    /// Import from parsed ModelProto (convenience for all-initializer models).
+    /// Import from a parsed `ModelProto` with optional DISK-backed weight loading.
+    /// When `model_path` is Some, raw_data initializers become lazy DISK views.
+    fn import_model_with_disk(
+        &self,
+        model: ModelProto,
+        dim_bindings: &[(&str, i64)],
+        model_path: Option<&Path>,
+        base_ptr: *const u8,
+    ) -> Result<OnnxModel> {
+        let bindings: HashMap<String, i64> = dim_bindings.iter().map(|&(k, v)| (k.to_string(), v)).collect();
+        let graph = self.prepare_with_disk(model, model_path, base_ptr)?;
+        let inputs = resolve_symbolic_shapes(&graph.inputs, &graph.variables, &bindings)?;
+        let outputs = self.trace_graph(&graph, inputs.clone())?;
+        Ok(OnnxModel { inputs, outputs, variables: graph.variables })
+    }
+
+    /// Import with pre-built input tensors that override auto-resolved empty ones.
     ///
-    /// For models with runtime inputs, use `prepare()` + `trace()` instead.
-    pub fn import_model(&mut self, model: ModelProto) -> Result<HashMap<String, Tensor>> {
+    /// Used for node conformance tests where inputs carry concrete data
+    /// that ops need at trace time (shape parameters, indices, etc.).
+    pub fn import_model_with_inputs(
+        &self,
+        model: ModelProto,
+        inputs: HashMap<String, Tensor>,
+        dim_bindings: &[(&str, i64)],
+    ) -> Result<OnnxModel> {
+        let bindings: HashMap<String, i64> = dim_bindings.iter().map(|&(k, v)| (k.to_string(), v)).collect();
         let graph = self.prepare(model)?;
-        self.execute_with_initializers(&graph, HashMap::new())
+        let unresolved: HashMap<String, InputSpec> = graph
+            .inputs
+            .iter()
+            .filter(|(name, _)| !inputs.contains_key(*name))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        let resolved = resolve_symbolic_shapes(&unresolved, &graph.variables, &bindings)?;
+        let mut all_inputs = resolved;
+        all_inputs.extend(inputs);
+        let input_map = all_inputs.clone();
+        let outputs = self.trace_graph(&graph, all_inputs)?;
+        Ok(OnnxModel { inputs: input_map, outputs, variables: graph.variables })
     }
 
-    /// Phase 1: Extract graph structure from ONNX model.
-    ///
-    /// Returns an `OnnxGraph` that can be executed multiple times with different inputs.
-    pub fn prepare(&self, model: ModelProto) -> Result<OnnxGraph> {
+    /// Extract graph structure from ONNX model (internal — used by `import_model`).
+    pub(crate) fn prepare(&self, model: ModelProto) -> Result<OnnxGraph> {
+        self.prepare_with_disk(model, None, std::ptr::null())
+    }
+
+    fn prepare_with_disk(
+        &self,
+        model: ModelProto,
+        model_path: Option<&Path>,
+        base_ptr: *const u8,
+    ) -> Result<OnnxGraph> {
         let proto_graph = model.graph.ok_or_else(|| EmptyModelSnafu.build())?;
 
         // Collect opsets
         let opsets: Vec<OpSetId> =
             model.opset_import.iter().map(|op| OpSetId { domain: op.domain.clone(), version: op.version }).collect();
 
-        // Build initializer map (weights/constants)
+        // Build initializer map (weights/constants).
+        // When model_path is available: create a DISK-backed tensor from the file, then each
+        // raw_data initializer becomes a lazy SHRINK → BITCAST → RESHAPE → COPY(CPU) chain.
+        // All weights share ONE DISK buffer (matching Tinygrad's approach).
+        // When model_path is None: fall back to eager loading via tensor_from_proto_ext.
         let mut initializers: HashMap<String, Tensor> = HashMap::new();
-        let initializer_names: Vec<String> = proto_graph.initializer.iter().map(|i| i.name.clone()).collect();
+        let initializer_names: std::collections::HashSet<String> =
+            proto_graph.initializer.iter().map(|i| i.name.clone()).collect();
+
+        // Create DISK tensor if we have a file path
+        let disk_tensor = model_path.map(|p| Tensor::from_path(p).expect("DISK tensor creation"));
 
         for init in &proto_graph.initializer {
-            if !init.name.is_empty() {
+            if init.name.is_empty() {
+                continue;
+            }
+            if init.data_location == 1 {
                 let tensor = tensor_from_proto_ext(init, self.model_dir.as_deref())?;
+                initializers.insert(init.name.clone(), const_fold_scalar(tensor));
+                continue;
+            }
+
+            // DISK path: raw_data is a Bytes sub-slice of the file buffer.
+            // Compute byte offset via pointer arithmetic, create lazy view chain.
+            let dtype = convert_onnx_dtype(init.data_type)?;
+            let can_use_disk =
+                disk_tensor.is_some() && !init.raw_data.is_empty() && !base_ptr.is_null() && dtype.is_float(); // INT64 shape tensors go eager (no cross-size bitcast in codegen yet)
+
+            if can_use_disk {
+                let dims: Vec<usize> = init.dims.iter().map(|&d| d as usize).collect();
+                let numel: usize = dims.iter().product();
+
+                // Scalars: eager path for const-folding (const_fold_scalar needs buffer)
+                if numel <= 1 {
+                    let tensor = tensor_from_proto_ext(init, self.model_dir.as_deref())?;
+                    initializers.insert(init.name.clone(), const_fold_scalar(tensor));
+                    continue;
+                }
+
+                let byte_offset = init.raw_data.as_ptr() as usize - base_ptr as usize;
+                let byte_len = init.raw_data.len();
+                let disk_uop = disk_tensor.as_ref().unwrap().uop();
+
+                // SHRINK(uint8 byte range) → BITCAST(target dtype) → RESHAPE(dims) → COPY(CPU)
+                // Matches Tinygrad: data.bitcast(true_dtype).reshape(shape).to(Device.DEFAULT)
+                let view = disk_uop
+                    .try_shrink(&[(SInt::from(byte_offset), SInt::from(byte_offset + byte_len))])
+                    .map_err(|e| crate::error::Error::IrConstruction {
+                        details: format!("DISK shrink '{}': {e}", init.name),
+                    })?;
+                let bitcasted = view.bitcast(dtype);
+                let ir_dims: smallvec::SmallVec<[SInt; 4]> = dims.iter().map(|&d| SInt::from(d)).collect();
+                let reshaped = bitcasted.try_reshape(&ir_dims).map_err(|e| crate::error::Error::IrConstruction {
+                    details: format!("DISK reshape '{}': {e}", init.name),
+                })?;
+                let copied = reshaped.copy_to_device(morok_dtype::DeviceSpec::Cpu);
+                let tensor = Tensor::from_lazy(copied);
                 initializers.insert(init.name.clone(), tensor);
+            } else {
+                let tensor = tensor_from_proto_ext(init, self.model_dir.as_deref())?;
+                initializers.insert(init.name.clone(), const_fold_scalar(tensor));
             }
         }
 
@@ -203,7 +352,19 @@ impl OnnxImporter {
             }
         }
 
-        Ok(OnnxGraph { inputs, outputs, initializers, nodes, opsets, subgraphs })
+        // Auto-extract Variables from dynamic dimensions (dim_param names)
+        let mut variables: HashMap<String, Variable> = HashMap::new();
+        for spec in inputs.values() {
+            for dim in &spec.shape {
+                if let DimValue::Dynamic(name) = dim
+                    && !name.is_empty()
+                {
+                    variables.entry(name.clone()).or_insert_with(|| Variable::new(name, 1, self.default_max_dim));
+                }
+            }
+        }
+
+        Ok(OnnxGraph { inputs, outputs, initializers, nodes, opsets, subgraphs, variables })
     }
 
     /// Extract InputSpec from ValueInfoProto.
@@ -252,72 +413,8 @@ impl OnnxImporter {
         Ok(Some(InputSpec::new(shape, dtype, false)))
     }
 
-    /// Trace graph — all input shapes must be static (from graph metadata).
-    ///
-    /// Allocates zero-filled input buffers. Weights come from graph initializers.
-    /// Returns (input_tensors, output_tensors). Caller `copyin()`s real data to
-    /// input buffers before executing.
-    pub fn trace(&self, graph: &OnnxGraph) -> Result<(HashMap<String, Tensor>, HashMap<String, Tensor>)> {
-        self.trace_with_dims(graph, &[])
-    }
-
-    /// Trace graph with concrete values for dynamic dimensions.
-    ///
-    /// Dynamic dims are locked to the provided values for the plan's lifetime.
-    /// Static dims are read from the graph. Error if any dynamic dim is unbound.
-    pub fn trace_with_dims(
-        &self,
-        graph: &OnnxGraph,
-        dim_bindings: &[(&str, usize)],
-    ) -> Result<(HashMap<String, Tensor>, HashMap<String, Tensor>)> {
-        let bindings: HashMap<&str, usize> = dim_bindings.iter().copied().collect();
-        let inputs = resolve_input_shapes(&graph.inputs, &bindings)?;
-        let input_map = inputs.clone();
-        let output_map = self.execute_with_initializers(graph, inputs)?;
-        Ok((input_map, output_map))
-    }
-
-    /// Trace graph with external weights.
-    pub fn trace_external(
-        &self,
-        graph: &OnnxGraph,
-        weights: HashMap<String, Tensor>,
-    ) -> Result<(HashMap<String, Tensor>, HashMap<String, Tensor>)> {
-        self.trace_external_with_dims(graph, weights, &[])
-    }
-
-    /// Trace with external weights + dynamic dim bindings.
-    ///
-    /// Inputs already present in `weights` are used as-is; remaining graph
-    /// inputs are auto-resolved from their specs + `dim_bindings`.
-    pub fn trace_external_with_dims(
-        &self,
-        graph: &OnnxGraph,
-        weights: HashMap<String, Tensor>,
-        dim_bindings: &[(&str, usize)],
-    ) -> Result<(HashMap<String, Tensor>, HashMap<String, Tensor>)> {
-        let bindings: HashMap<&str, usize> = dim_bindings.iter().copied().collect();
-        // Only auto-resolve inputs not already provided
-        let unresolved: HashMap<String, InputSpec> = graph
-            .inputs
-            .iter()
-            .filter(|(name, _)| !weights.contains_key(*name))
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
-        let inputs = resolve_input_shapes(&unresolved, &bindings)?;
-        let input_map = inputs.clone();
-        let mut all_inputs = inputs;
-        all_inputs.extend(weights);
-        let output_map = self.execute_with_initializers(graph, all_inputs)?;
-        Ok((input_map, output_map))
-    }
-
-    /// Execute graph with initializers merged into values.
-    fn execute_with_initializers(
-        &self,
-        graph: &OnnxGraph,
-        inputs: HashMap<String, Tensor>,
-    ) -> Result<HashMap<String, Tensor>> {
+    /// Build the lazy UOp graph by walking ONNX nodes with initializers + inputs.
+    fn trace_graph(&self, graph: &OnnxGraph, inputs: HashMap<String, Tensor>) -> Result<HashMap<String, Tensor>> {
         // Merge initializers into values
         let mut values: HashMap<String, Tensor> = graph.initializers.clone();
 
@@ -330,6 +427,19 @@ impl OnnxImporter {
         for (name, spec) in &graph.inputs {
             if !values.contains_key(name) && !spec.optional {
                 return MissingInputSnafu { node: "graph_input".to_string(), input: name.clone() }.fail();
+            }
+        }
+
+        // Track names of constant tensors (initializers + Constant node outputs).
+        // Used for Gather fast path: when indices are known constants, use shrink+cat
+        // instead of full index_select (which creates arange + one-hot + reduce kernels).
+        // Matches Tinygrad's `self.const_names` (onnx.py:394).
+        let mut const_names: HashSet<String> = graph.initializers.keys().cloned().collect();
+        for node in &graph.nodes {
+            if node.op_type == "Constant" {
+                for out in &node.output {
+                    const_names.insert(out.clone());
+                }
             }
         }
 
@@ -346,10 +456,35 @@ impl OnnxImporter {
                 onnx_opset_version(&graph.opsets, &node.domain)
             };
 
+            // Gather fast path: when indices are from initializers/Constant nodes,
+            // use shrink+cat instead of index_select. Creates zero kernels vs 2-5
+            // kernels per Gather. Port of Tinygrad onnx.py:468-471,1148-1158.
+            if node.op_type == "Gather"
+                && node.input.len() > 1
+                && const_names.contains(&node.input[1])
+                && let Some(result) = self.try_gather_fast_path(node, &values)?
+            {
+                for (i, output_name) in node.output.iter().enumerate() {
+                    if i == 0 && !output_name.is_empty() {
+                        values.insert(output_name.clone(), result.clone());
+                    }
+                }
+                continue;
+            }
+
             if node.op_type == "If" {
                 self.process_if_node(node_index, node, &mut values, node_opset, &graph.subgraphs)?;
             } else {
                 self.process_node(node, &mut values, node_opset)?;
+            }
+
+            // Shape op outputs are always const (shape of concrete tensor is deterministic)
+            if node.op_type == "Shape" {
+                for out in &node.output {
+                    if !out.is_empty() {
+                        const_names.insert(out.clone());
+                    }
+                }
             }
 
             // At trace level: realize each output and dump first values.
@@ -359,10 +494,7 @@ impl OnnxImporter {
             if tracing::enabled!(tracing::Level::TRACE) {
                 for out_name in &node.output {
                     if let Some(tensor) = values.get_mut(out_name) {
-                        match tensor.clone().realize().and_then(|t| {
-                            *tensor = t.clone();
-                            t.to_vec::<f32>()
-                        }) {
+                        match tensor.realize().and_then(|()| tensor.as_vec::<f32>()) {
                             Ok(data) => {
                                 let first5: Vec<f32> = data.iter().take(5).copied().collect();
                                 let shape = tensor.shape().unwrap_or_default();
@@ -435,7 +567,7 @@ impl OnnxImporter {
         }
 
         // Execute subgraph nodes (subgraphs inherit the parent's opset).
-        // Control-flow ops (If) are intercepted here, matching execute_with_initializers.
+        // Control-flow ops (If) are intercepted here, matching trace_graph.
         for (node_index, node) in subgraph.nodes.iter().enumerate() {
             if node.op_type == "If" {
                 self.process_if_node(node_index, node, &mut values, opset_version, &subgraph.subgraphs)?;
@@ -518,6 +650,38 @@ impl OnnxImporter {
         Ok(())
     }
 
+    /// Gather fast path: when indices are from initializers/Constant nodes, use
+    /// shrink+cat instead of index_select (arange + one-hot + reduce).
+    /// Port of Tinygrad onnx.py:468-471,1148-1158.
+    fn try_gather_fast_path(&self, node: &NodeProto, values: &HashMap<String, Tensor>) -> Result<Option<Tensor>> {
+        use crate::registry::attr::{Attrs, tensor_to_i64_vec};
+
+        let data = match values.get(&node.input[0]) {
+            Some(t) => t.clone(),
+            None => return Ok(None),
+        };
+        let idx_tensor = match values.get(&node.input[1]) {
+            Some(t) => t,
+            None => return Ok(None),
+        };
+
+        let mut attrs = Attrs::new(node);
+        let axis = attrs.int("axis", 0) as isize;
+
+        let indices = match tensor_to_i64_vec(idx_tensor) {
+            Ok(v) => v,
+            Err(_) => return Ok(None), // fall back to normal path
+        };
+        let idx_shape: Vec<usize> = match idx_tensor.shape().ok().and_then(|s| s.iter().map(|d| d.as_const()).collect())
+        {
+            Some(v) => v,
+            None => return Ok(None), // symbolic index shape, fall back to normal path
+        };
+
+        let result = crate::registry::gather_const_fast_path(&data, &indices, &idx_shape, axis)?;
+        Ok(Some(result))
+    }
+
     /// Process a single ONNX node.
     fn process_node(&self, node: &NodeProto, values: &mut HashMap<String, Tensor>, opset_version: i64) -> Result<()> {
         let op_type = &node.op_type;
@@ -564,31 +728,78 @@ impl Default for OnnxImporter {
     }
 }
 
-/// Resolve input shapes from graph specs + dim bindings into allocated tensors.
+/// Const-fold a scalar tensor (shape `()`) into a CONST UOp.
 ///
-/// Creates zero-filled tensors with the correct shape and dtype for each input.
-/// Static dimensions are read directly; dynamic dimensions are looked up in `bindings`.
-fn resolve_input_shapes(
+/// When a tensor has exactly 1 element and a buffer, extract the scalar value
+/// and return `Tensor::const_()` instead. This makes the value inlineable into
+/// compute kernels without a separate buffer load.
+/// Matches Tinygrad onnx.py:254-256: `data = Tensor(data.item(), dtype=to_dtype)`.
+fn const_fold_scalar(tensor: Tensor) -> Tensor {
+    // Only fold true scalars with empty shape
+    let shape = match tensor.shape() {
+        Ok(s) => s,
+        Err(_) => return tensor,
+    };
+    if !shape.is_empty() {
+        return tensor;
+    }
+    let buf = match tensor.buffer() {
+        Some(b) => b,
+        None => return tensor,
+    };
+    let dtype = tensor.uop().dtype();
+    let bytes_needed = dtype.bytes();
+    let mut raw = vec![0u8; bytes_needed];
+    if buf.copyout(&mut raw).is_err() {
+        return tensor;
+    }
+    match crate::registry::proto::extract_scalar_const(&raw, &dtype) {
+        Ok(cv) => Tensor::const_(cv, dtype),
+        Err(_) => tensor,
+    }
+}
+
+/// Resolve input shapes using Variables for dynamic dimensions.
+///
+/// Static dims become `SInt::Const`. Dynamic dims are resolved via the
+/// auto-extracted `variables` map: bound variables use their concrete value,
+/// unbound variables use the `Variable` directly (allocates to max).
+fn resolve_symbolic_shapes(
     specs: &HashMap<String, InputSpec>,
-    bindings: &HashMap<&str, usize>,
+    variables: &HashMap<String, Variable>,
+    bindings: &HashMap<String, i64>,
 ) -> Result<HashMap<String, Tensor>> {
     specs
         .iter()
         .filter(|(_, spec)| !spec.optional)
         .map(|(name, spec)| {
-            let shape: Vec<usize> = spec
+            let shape: Vec<SInt> = spec
                 .shape
                 .iter()
                 .map(|d| match d {
-                    DimValue::Static(s) => Ok(*s),
+                    DimValue::Static(s) => Ok(SInt::from(*s)),
+                    DimValue::Dynamic(dim_name) if dim_name.is_empty() => {
+                        // Unnamed dynamic dim — treat as 1 (common for unknown batch)
+                        Ok(SInt::from(1usize))
+                    }
                     DimValue::Dynamic(dim_name) => {
-                        bindings.get(dim_name.as_str()).copied().ok_or_else(|| crate::Error::IrConstruction {
-                            details: format!("unbound dynamic dim '{dim_name}' for input '{name}'"),
-                        })
+                        let var = variables.get(dim_name).ok_or_else(|| crate::Error::IrConstruction {
+                            details: format!("no Variable for dynamic dim '{dim_name}' in input '{name}'"),
+                        })?;
+                        if let Some(&val) = bindings.get(dim_name) {
+                            // Concrete binding: use fixed value (no symbolic Variable)
+                            let _ = var.bind(val).map_err(|e| crate::Error::IrConstruction {
+                                details: format!("binding '{dim_name}' = {val} out of range: {e}"),
+                            })?; // validate bounds
+                            Ok(SInt::from(val as usize))
+                        } else {
+                            // Unbound: use variable directly (allocates to max)
+                            Ok(var.as_sint())
+                        }
                     }
                 })
                 .collect::<Result<_>>()?;
-            let tensor = Tensor::full(&shape, 0u8, spec.dtype.clone())?;
+            let tensor = Tensor::empty_dynamic(&shape, spec.dtype.clone());
             Ok((name.clone(), tensor))
         })
         .collect()

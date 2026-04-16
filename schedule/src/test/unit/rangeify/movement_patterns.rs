@@ -232,8 +232,9 @@ fn test_non_movement_op_no_match() {
 
     let buffer = create_buffer(100);
 
-    // Create a non-movement op (NEG) - using unary op to avoid shape issues
-    let negated = buffer.neg();
+    // Create a non-movement op (SQRT) - using unary op to avoid shape issues
+    // neg() now produces MUL(x, -1) which is binary, use sqrt instead.
+    let negated = buffer.try_sqrt().unwrap();
 
     // Create INDEX
     let r0 = create_range(100, 0);
@@ -244,15 +245,15 @@ fn test_non_movement_op_no_match() {
     let result = graph_rewrite(&pm, indexed, &mut ());
 
     // Should NOT transform (no movement op)
-    // The result should still have the NEG operation somewhere in the tree
+    // The result should still have the SQRT operation somewhere in the tree
     assert!(matches!(result.op(), Op::Index { .. }));
 
-    // The buffer should still be the NEG node
+    // The buffer should still be the SQRT node
     let Op::Index { buffer: res_buf, .. } = result.op() else {
         panic!("Expected INDEX");
     };
 
-    assert!(matches!(res_buf.op(), Op::Unary(..)), "Buffer should still be the NEG");
+    assert!(matches!(res_buf.op(), Op::Unary(..)), "Buffer should still be the SQRT");
 }
 
 // ===== Nested Movement Ops Test =====

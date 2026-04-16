@@ -363,7 +363,7 @@ pub fn shape_to_uop(shape: &Shape) -> Arc<UOp> {
     // Empty shape = scalar: use VConst with empty values
     // extract_shape_from_uop will decode this back to empty Shape
     if shape.is_empty() {
-        return UOp::vconst(vec![]);
+        return UOp::vconst(vec![], DType::Index);
     }
 
     let elements: SmallVec<[Arc<UOp>; 4]> = shape.iter().map(|dim| dim.to_uop(DType::Index)).collect();
@@ -417,24 +417,18 @@ pub fn infer_shape_from_op(uop: &UOp) -> crate::Result<Option<Shape>> {
 
         Op::Unique(_) | Op::Device(_) | Op::Noop | Op::Invalid => None,
 
-        // Define operations have shape from dtype.size (pointer types)
-        // Following Tinygrad: shape comes from PtrDType.size, not from the id parameter
-        Op::DefineGlobal(_id) | Op::DefineLocal(_id) => {
+        // DefineLocal: shape from PtrDType.size
+        Op::DefineLocal(_id) => {
             use morok_dtype::DType;
             match uop.dtype() {
                 DType::Ptr { size: Some(s), .. } => Some(smallvec![SInt::from(s)]),
                 DType::Ptr { size: None, .. } => {
-                    // Unlimited size - represented as -1 following Tinygrad
                     let neg_one = UOp::index_const(-1);
                     Some(smallvec![SInt::from(neg_one)])
                 }
                 dtype => {
-                    // DefineGlobal/Local must have Ptr dtype (following Tinygrad spec)
-                    return crate::error::DefineGlobalRequiresPtrDTypeSnafu {
-                        op: "DefineGlobal/DefineLocal",
-                        dtype: dtype.clone(),
-                    }
-                    .fail();
+                    return crate::error::BufferDefRequiresPtrDTypeSnafu { op: "DefineLocal", dtype: dtype.clone() }
+                        .fail();
                 }
             }
         }
@@ -485,9 +479,33 @@ pub fn infer_shape_from_op(uop: &UOp) -> crate::Result<Option<Shape>> {
         }
 
         // =====================================================================
-        // Type operations - preserve shape
+        // Type operations
         // =====================================================================
-        Op::Cast { src, .. } | Op::BitCast { src, .. } => src.shape()?.cloned(),
+        Op::Cast { src, .. } => src.shape()?.cloned(),
+        // BitCast: byte-reinterpretation. Same itemsize → same shape.
+        // Different itemsize → adjust last dimension (Tinygrad tensor.py:3549-3568).
+        // BitCast: byte-reinterpretation (Tinygrad ops.py:240-245).
+        // Same itemsize → same shape. Different itemsize → adjust last dimension.
+        Op::BitCast { src, dtype } => {
+            let src_shape = src.shape()?;
+            match src_shape {
+                Some(shape) if !shape.is_empty() => {
+                    let src_bytes = src.dtype().bytes();
+                    let dst_bytes = dtype.bytes();
+                    if src_bytes == dst_bytes {
+                        Some(shape.clone())
+                    } else {
+                        // Adjust last dimension: (last * src_bytes) / dst_bytes
+                        let mut new_shape = shape.clone();
+                        let last = new_shape.last().unwrap().clone();
+                        let new_last = (last * SInt::Const(src_bytes)) / SInt::Const(dst_bytes);
+                        *new_shape.last_mut().unwrap() = new_last;
+                        Some(new_shape)
+                    }
+                }
+                other => other.cloned(),
+            }
+        }
 
         // =====================================================================
         // Vector operations (kernel-level, no tensor shape)
@@ -524,21 +542,11 @@ pub fn infer_shape_from_op(uop: &UOp) -> crate::Result<Option<Shape>> {
             }
 
             // New shape = src_shape + begin_pads + end_pads for each dimension
-            // All padding values must be concrete (checked during construction)
             Some(
                 src_shape
                     .iter()
                     .zip(ranges.iter())
-                    .map(|(dim, (begin, end))| {
-                        // dim + begin + end
-                        if let (Some(d), Some(b), Some(e)) = (dim.as_const(), begin.as_const(), end.as_const()) {
-                            Ok(SInt::from(d + b + e))
-                        } else {
-                            // Symbolic padding should have been rejected at construction time
-                            // This case should not be reachable if try_pad validates properly
-                            crate::error::SymbolicPaddingUnsupportedSnafu.fail()
-                        }
-                    })
+                    .map(|(dim, (begin, end))| Ok(dim + begin + end))
                     .collect::<crate::Result<Shape>>()?,
             )
         }
@@ -552,23 +560,17 @@ pub fn infer_shape_from_op(uop: &UOp) -> crate::Result<Option<Shape>> {
             }
 
             // New shape = end - begin for each dimension
-            // All shrink values must be concrete (checked during construction)
             Some(
                 ranges
                     .iter()
-                    .map(|(begin, end)| {
-                        // end - begin
-                        if let (Some(b), Some(e)) = (begin.as_const(), end.as_const()) {
-                            Ok(if e >= b {
-                                SInt::from(e - b)
-                            } else {
-                                SInt::from(0) // Invalid shrink
-                            })
-                        } else {
-                            // Symbolic shrinking should have been rejected at construction time
-                            // This case should not be reachable if try_shrink validates properly
-                            crate::error::SymbolicShrinkingUnsupportedSnafu.fail()
+                    .zip(src_shape.iter())
+                    .map(|((begin, end), dim)| {
+                        // Identity range (0, dim_size) → preserve dim (supports symbolic batch)
+                        if begin.as_const() == Some(0) && end == dim {
+                            return Ok(dim.clone());
                         }
+                        // end - begin (works for both concrete and symbolic)
+                        Ok(end - begin)
                     })
                     .collect::<crate::Result<Shape>>()?,
             )
@@ -616,6 +618,7 @@ pub fn infer_shape_from_op(uop: &UOp) -> crate::Result<Option<Shape>> {
         // =====================================================================
         // Buffer operations have shape (size,)
         Op::Buffer { size, .. } => Some(smallvec![SInt::from(*size)]),
+        Op::Param { size, .. } => Some(smallvec![SInt::from(*size)]),
         Op::BufferView { size, .. } => Some(smallvec![SInt::from(*size)]),
 
         // Passthrough operations

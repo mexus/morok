@@ -24,10 +24,11 @@ crate::codegen_tests! {
 
         let x = Tensor::from_ndarray(&Array2::from_shape_vec((n, 1), vec![1.0f32; n]).unwrap());
 
-        let out = matrix.dot(&x).unwrap().try_reshape(&[n as isize]).unwrap();
+        let out = matrix.dot(&x).unwrap().try_reshape([n as isize]).unwrap();
 
-        let result = out.realize_with(&config).expect("realized matrix matmul");
-        assert_eq!(result.to_vec::<f32>().unwrap().len(), n);
+        let mut out = out;
+        out.realize_with(&config).expect("realized matrix matmul");
+        assert_eq!(out.as_vec::<f32>().unwrap().len(), n);
     }
 
     #[test_case(2 ; "N=2")]
@@ -40,10 +41,11 @@ crate::codegen_tests! {
 
         let x = Tensor::from_ndarray(&Array2::from_shape_vec((n, 1), vec![1.0f32; n]).unwrap());
 
-        let out = matrix.dot(&x).unwrap().try_reshape(&[n as isize]).unwrap();
+        let out = matrix.dot(&x).unwrap().try_reshape([n as isize]).unwrap();
 
-        let result = out.realize_with(&config).expect("unary on buffer-rooted matmul");
-        assert_eq!(result.to_vec::<f32>().unwrap().len(), n);
+        let mut out = out;
+        out.realize_with(&config).expect("unary on buffer-rooted matmul");
+        assert_eq!(out.as_vec::<f32>().unwrap().len(), n);
     }
 
     fn test_diamond_elementwise_no_matmul(config) {
@@ -53,10 +55,11 @@ crate::codegen_tests! {
 
         let out = t.cos().unwrap().try_add(&t.sin().unwrap()).unwrap();
 
-        let result = out.realize_with(&config).expect("diamond elementwise");
+        let mut out = out;
+        out.realize_with(&config).expect("diamond elementwise");
 
         let expected: Vec<f32> = [1.0f32, 2.0, 3.0, 4.0].iter().map(|x| x.cos() + x.sin()).collect();
-        assert_close_f32(&result.to_vec::<f32>().unwrap(), &expected, 1e-5);
+        assert_close_f32(&out.as_vec::<f32>().unwrap(), &expected, 1e-5);
     }
 
     #[test_case(2 ; "N=2")]
@@ -65,16 +68,17 @@ crate::codegen_tests! {
         test_setup();
 
         let indices = Tensor::arange(n as i64, None, None).unwrap().cast(DType::Float32).unwrap();
-        let k = indices.try_reshape(&[n as isize, 1]).unwrap();
-        let j = indices.try_reshape(&[1, n as isize]).unwrap();
+        let k = indices.try_reshape([n as isize, 1]).unwrap();
+        let j = indices.try_reshape([1, n as isize]).unwrap();
         let matrix = k.try_mul(&j).unwrap();
 
         let x = Tensor::from_ndarray(&Array2::from_shape_vec((n, 1), vec![1.0f32; n]).unwrap());
 
-        let out = matrix.dot(&x).unwrap().try_reshape(&[n as isize]).unwrap();
+        let out = matrix.dot(&x).unwrap().try_reshape([n as isize]).unwrap();
 
-        let result = out.realize_with(&config).expect("lazy outer product matmul");
-        assert_eq!(result.to_vec::<f32>().unwrap().len(), n);
+        let mut out = out;
+        out.realize_with(&config).expect("lazy outer product matmul");
+        assert_eq!(out.as_vec::<f32>().unwrap().len(), n);
     }
 
     #[test_case(2 ; "N=2")]
@@ -83,16 +87,17 @@ crate::codegen_tests! {
         test_setup();
 
         let indices = Tensor::arange(n as i64, None, None).unwrap().cast(DType::Float32).unwrap();
-        let k = indices.try_reshape(&[n as isize, 1]).unwrap();
-        let j = indices.try_reshape(&[1, n as isize]).unwrap();
+        let k = indices.try_reshape([n as isize, 1]).unwrap();
+        let j = indices.try_reshape([1, n as isize]).unwrap();
         let matrix = k.try_mul(&j).unwrap().cos().unwrap();
 
         let x = Tensor::from_ndarray(&Array2::from_shape_vec((n, 1), vec![1.0f32; n]).unwrap());
 
-        let out = matrix.dot(&x).unwrap().try_reshape(&[n as isize]).unwrap();
+        let out = matrix.dot(&x).unwrap().try_reshape([n as isize]).unwrap();
 
-        let result = out.realize_with(&config).expect("lazy outer product unary matmul");
-        assert_eq!(result.to_vec::<f32>().unwrap().len(), n);
+        let mut out = out;
+        out.realize_with(&config).expect("lazy outer product unary matmul");
+        assert_eq!(out.as_vec::<f32>().unwrap().len(), n);
     }
 
     #[test_case(2 ; "N=2")]
@@ -101,8 +106,8 @@ crate::codegen_tests! {
         test_setup();
 
         let indices = Tensor::arange(n as i64, None, None).unwrap().cast(DType::Float32).unwrap();
-        let k = indices.try_reshape(&[n as isize, 1]).unwrap();
-        let j = indices.try_reshape(&[1, n as isize]).unwrap();
+        let k = indices.try_reshape([n as isize, 1]).unwrap();
+        let j = indices.try_reshape([1, n as isize]).unwrap();
         let angles = k.try_mul(&j).unwrap().try_mul(&Tensor::from_slice([-0.5f32])).unwrap();
 
         let cos_w = angles.cos().unwrap();
@@ -110,9 +115,10 @@ crate::codegen_tests! {
 
         let x = Tensor::from_ndarray(&Array2::from_shape_vec((n, 1), vec![1.0f32; n]).unwrap());
 
-        let out = cos_w.dot(&x).unwrap().try_add(&sin_w.dot(&x).unwrap()).unwrap().try_reshape(&[n as isize]).unwrap();
+        let out = cos_w.dot(&x).unwrap().try_add(&sin_w.dot(&x).unwrap()).unwrap().try_reshape([n as isize]).unwrap();
 
-        let result = out.realize_with(&config).expect("DFT pattern");
-        assert_eq!(result.to_vec::<f32>().unwrap().len(), n);
+        let mut out = out;
+        out.realize_with(&config).expect("DFT pattern");
+        assert_eq!(out.as_vec::<f32>().unwrap().len(), n);
     }
 }

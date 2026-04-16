@@ -15,14 +15,14 @@ mod amx;
 pub mod ops;
 pub mod types;
 
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use morok_ir::pattern::TypedPatternMatcher;
-use morok_ir::rewrite::graph_rewrite_bottom_up;
 use morok_ir::{AxisType, Op, prelude::*};
 use morok_schedule::linearize::{line_rewrite_cleanups, linearize_with_cfg};
-use morok_schedule::rangeify::patterns::pm_bool_devectorize;
 
+use crate::common::is_output_buffer;
 use crate::{BufferArg, RenderedKernel, Result};
 
 use self::ops::{CContext, count_references, render_uop};
@@ -47,13 +47,7 @@ impl crate::Renderer for CRenderer {
     fn render(&self, uop: &Arc<UOp>, name: Option<&str>) -> Result<RenderedKernel> {
         let kernel_name = name.unwrap_or("kernel");
 
-        // Apply pm_bool_devectorize as safety fallback
-        let uop = graph_rewrite_bottom_up(pm_bool_devectorize(), uop.clone(), &mut ());
-
-        tracing::debug!(ast_after_pm_bool_devectorize = %uop.tree(), "c codegen: after pm_bool_devectorize");
-
-        // Linearize the UOp DAG
-        let nodes = linearize_with_cfg(uop);
+        let nodes = linearize_with_cfg(uop.clone());
 
         // Apply line rewrite cleanups (gated stores → if/store/endif)
         let nodes = line_rewrite_cleanups(nodes);
@@ -68,13 +62,13 @@ impl crate::Renderer for CRenderer {
 
         for node in &nodes {
             match node.op() {
-                Op::DefineGlobal(_) => buffers.push(node.clone()),
+                Op::Param { device: None, .. } => buffers.push(node.clone()),
                 Op::DefineVar { .. } => variables.push(node.clone()),
                 _ => {}
             }
         }
 
-        buffers.sort_by_key(|b| if let Op::DefineGlobal(id) = b.op() { *id } else { usize::MAX });
+        buffers.sort_by_key(|b| if let Op::Param { slot, device: None, .. } = b.op() { *slot } else { usize::MAX });
 
         // Detect threading
         let thread_info: Option<(Arc<UOp>, usize)> = nodes.iter().find_map(|n| {
@@ -94,9 +88,9 @@ impl crate::Renderer for CRenderer {
         // Build buffer args metadata
         let mut buffer_args: Vec<BufferArg> = Vec::new();
         for (i, buf) in buffers.iter().enumerate() {
-            if let Op::DefineGlobal(id) = buf.op() {
+            if let Op::Param { slot, device: None, .. } = buf.op() {
                 let is_output = is_output_buffer(buf, &nodes);
-                buffer_args.push(BufferArg { index: *id, name: format!("data{i}"), dtype: buf.dtype(), is_output });
+                buffer_args.push(BufferArg { index: *slot, name: format!("data{i}"), dtype: buf.dtype(), is_output });
             }
         }
 
@@ -113,7 +107,8 @@ impl crate::Renderer for CRenderer {
 
         // Count references for SSA inlining decisions
         let ref_counts = count_references(&nodes);
-        let mut ctx = CContext::new(ref_counts);
+        let scope_escaping = find_scope_escaping_vars(&nodes, &ref_counts);
+        let mut ctx = CContext::new(ref_counts, scope_escaping);
 
         // === Build C source ===
         let mut code_lines: Vec<String> = Vec::new();
@@ -233,8 +228,15 @@ impl crate::Renderer for CRenderer {
         }
 
         // Render all instructions
+        // Skip NOOP and GROUP — they are structural no-ops (Tinygrad cstyle.py:175)
         let mut kernel_body: Vec<String> = Vec::new();
         for node in &nodes {
+            if matches!(node.op(), Op::Noop | Op::Group { .. }) {
+                // Register with empty string so downstream UNROLL/CONTRACT can alias them.
+                // Matches LLVM backend behavior — these are structural no-ops.
+                ctx.register(node.id, String::new());
+                continue;
+            }
             if let Op::Range { axis_type, .. } = node.op()
                 && matches!(axis_type, AxisType::Thread)
             {
@@ -243,6 +245,10 @@ impl crate::Renderer for CRenderer {
             render_uop(node, &mut ctx, &mut kernel_body);
         }
 
+        // Emit hoisted declarations for scope-escaping variables (before kernel body)
+        if !ctx.hoisted_declarations.is_empty() {
+            code_lines.append(&mut ctx.hoisted_declarations);
+        }
         code_lines.extend(kernel_body);
         code_lines.push("}".to_string());
         code_lines.push("".to_string());
@@ -274,22 +280,57 @@ impl crate::Renderer for CRenderer {
     }
 }
 
-fn is_output_buffer(def_global: &Arc<UOp>, nodes: &[Arc<UOp>]) -> bool {
-    let buffer_id = def_global.id;
+/// Find variables that escape their declaration scope.
+///
+/// Walks the linearized instruction list tracking scope depth. A variable "escapes"
+/// if it's defined at a deeper scope than where it's used. Returns the set of UOp IDs
+/// that need function-scope declarations to avoid "use of undeclared identifier" errors.
+///
+/// This handles the case where pm_decomp creates sibling ENDs that share sub-DAG nodes.
+/// The linearizer places the shared node inside one loop, but another consumer is outside.
+fn find_scope_escaping_vars(nodes: &[Arc<UOp>], ref_counts: &HashMap<u64, usize>) -> HashSet<u64> {
+    let mut depth = 0usize;
+    let mut def_depth: HashMap<u64, usize> = HashMap::new();
+    let mut min_use_depth: HashMap<u64, usize> = HashMap::new();
 
     for node in nodes {
-        if let Some(buffer) = node.store_buffer() {
-            if buffer.id == buffer_id {
-                return true;
+        // Track scope depth changes
+        match node.op() {
+            Op::Range { .. } | Op::If { .. } => {
+                // Definition of this node is at current depth (before entering)
+                if ref_counts.get(&node.id).copied().unwrap_or(0) > 1 {
+                    def_depth.entry(node.id).or_insert(depth);
+                }
+                // Record usages of sources at current depth
+                for src in node.op().sources() {
+                    min_use_depth.entry(src.id).and_modify(|d| *d = (*d).min(depth)).or_insert(depth);
+                }
+                depth += 1;
+                continue;
             }
-            if let Op::Index { buffer: idx_buf, .. } = buffer.op()
-                && idx_buf.id == buffer_id
-            {
-                return true;
+            Op::End { .. } | Op::EndIf { .. } => {
+                depth = depth.saturating_sub(1);
             }
+            _ => {}
+        }
+
+        // Record definition depth for multi-use values
+        if ref_counts.get(&node.id).copied().unwrap_or(0) > 1 {
+            def_depth.entry(node.id).or_insert(depth);
+        }
+
+        // Record minimum usage depth for all source operands
+        for src in node.op().sources() {
+            min_use_depth.entry(src.id).and_modify(|d| *d = (*d).min(depth)).or_insert(depth);
         }
     }
-    false
+
+    // Variables where any use is at a shallower depth than definition
+    def_depth
+        .into_iter()
+        .filter(|(id, def_d)| min_use_depth.get(id).copied().unwrap_or(*def_d) < *def_d)
+        .map(|(id, _)| id)
+        .collect()
 }
 
 /// Public render function for the C backend.

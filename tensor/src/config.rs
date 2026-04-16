@@ -90,14 +90,15 @@ impl From<OptimizerConfig> for PrepareConfig {
 
 /// Generate one test per codegen backend (Clang, LLVM) from a single test body.
 ///
-/// Supports two forms:
+/// Supports three forms:
 ///
 /// **Simple test** (config only, no extra params):
 /// ```ignore
 /// codegen_tests! {
 ///     fn test_add(config) {
-///         let a = Tensor::from_slice([1.0f32, 2.0, 3.0]);
-///         let result: Vec<f32> = a.realize_with(&config).unwrap().to_vec().unwrap();
+///         let mut a = Tensor::from_slice([1.0f32, 2.0, 3.0]);
+///         a.realize_with(&config).unwrap();
+///         let result: Vec<f32> = a.as_vec().unwrap();
 ///     }
 /// }
 /// // Generates: test_add::clang, test_add::llvm
@@ -108,11 +109,25 @@ impl From<OptimizerConfig> for PrepareConfig {
 /// codegen_tests! {
 ///     #[test_case(128, 0.5; "128x128")]
 ///     fn test_matmul(config, size: usize, tol: f32) {
-///         let result = run_matmul(size).realize_with(&config).unwrap();
+///         let mut result = run_matmul(size);
+///         result.realize_with(&config).unwrap();
 ///         assert_close(&result, tol);
 ///     }
 /// }
 /// // Generates: test_matmul::clang::test_matmul, test_matmul::llvm::test_matmul
+/// ```
+///
+/// **Proptest** (property-based, params use `in` syntax):
+/// ```ignore
+/// codegen_tests! {
+///     #[proptest_config(ProptestConfig::with_cases(50))]
+///     fn test_sort_random(config, data in proptest::collection::vec(-100.0f32..100.0, 1..=16)) {
+///         let mut t = Tensor::from_slice(&data);
+///         let (sorted, _) = t.sort(-1, false).unwrap();
+///         // ...
+///     }
+/// }
+/// // Generates: test_sort_random::clang, test_sort_random::llvm
 /// ```
 #[macro_export]
 macro_rules! codegen_tests {
@@ -142,6 +157,54 @@ macro_rules! codegen_tests {
             }
         }
         $crate::codegen_tests!($($rest)*);
+    };
+
+    // Proptest with config: #[proptest_config(...)] fn name(config, param in strategy) { body }
+    (#[proptest_config($($pc:tt)*)] $(#[$meta:meta])* fn $name:ident($config:ident, $($param:ident in $strategy:expr),+ $(,)?) $body:block $($rest:tt)*) => {
+        $crate::codegen_tests!(@proptest $name, $config, [$($param in $strategy),+], $body,
+            ::proptest::test_runner::TestRunner::new($($pc)*), [$(#[$meta])*]);
+        $crate::codegen_tests!($($rest)*);
+    };
+
+    // Proptest with default config: fn name(config, param in strategy) { body }
+    ($(#[$meta:meta])* fn $name:ident($config:ident, $($param:ident in $strategy:expr),+ $(,)?) $body:block $($rest:tt)*) => {
+        $crate::codegen_tests!(@proptest $name, $config, [$($param in $strategy),+], $body,
+            ::proptest::test_runner::TestRunner::default(), [$(#[$meta])*]);
+        $crate::codegen_tests!($($rest)*);
+    };
+
+    // Internal: proptest code generation (uses TestRunner API directly)
+    (@proptest $name:ident, $config:ident, [$($param:ident in $strategy:expr),+], $body:block, $runner:expr, [$(#[$meta:meta])*]) => {
+        mod $name {
+            #[allow(unused_imports)]
+            use super::*;
+
+            #[test]
+            #[allow(unused_parens)]
+            $(#[$meta])*
+            fn clang() {
+                ::morok_schedule::testing::setup_test_tracing();
+                let mut runner = $runner;
+                runner.run(&($($strategy),+), |($($param),+)| {
+                    let $config = $crate::PrepareConfig::for_cpu_backend($crate::CpuBackend::Clang);
+                    $body
+                    Ok(())
+                }).unwrap();
+            }
+
+            #[test]
+            #[allow(unused_parens)]
+            $(#[$meta])*
+            fn llvm() {
+                ::morok_schedule::testing::setup_test_tracing();
+                let mut runner = $runner;
+                runner.run(&($($strategy),+), |($($param),+)| {
+                    let $config = $crate::PrepareConfig::for_cpu_backend($crate::CpuBackend::Llvm);
+                    $body
+                    Ok(())
+                }).unwrap();
+            }
+        }
     };
 
     // Parameterized test (extra typed params — test_case attrs expected, no #[test])

@@ -195,10 +195,42 @@ impl UOp {
     }
 
     /// Negation: -x.
+    ///
+    /// Produces `MUL(x, -1)` instead of `Unary(Neg, x)`, matching Tinygrad's approach.
+    /// `Unary(Neg)` is reintroduced late in codegen decompositions (`pm_neg_from_mul`)
+    /// AFTER `pm_lower_index_dtype` has resolved all Invalid nodes. This ensures
+    /// `propagate_invalid` (which only handles Binary ops) can push WHERE+Invalid
+    /// through negation.
+    ///
+    /// If `self` has a shape, broadcasts -1 to match (RESHAPE+EXPAND), matching
+    /// Tinygrad's Tensor-level `_broadcasted()`. If shapeless (schedule/symbolic
+    /// context), uses a scalar const directly.
     #[track_caller]
     pub fn neg(self: &Arc<Self>) -> Arc<Self> {
+        // Tinygrad: logical_not for bool, MUL(-1) for everything else
+        if self.dtype.is_bool() {
+            return self.not();
+        }
+        use crate::types::ConstValue;
         let dtype = self.dtype.clone();
-        Self::new(Op::Unary(UnaryOp::Neg, self.clone()), dtype)
+        // Use Int(-1) or Float(-1.0) and let const_() handle dtype cast (wraps for unsigned).
+        // Matches Tinygrad where Python's -1 is cast via dtypes.as_const(-1, dtype).
+        let neg_one = if dtype.is_float() { ConstValue::Float(-1.0) } else { ConstValue::Int(-1) };
+        let mut neg_one_uop = Self::const_(dtype.clone(), neg_one);
+
+        // Broadcast scalar -1 to match self's shape if present.
+        // Matches Tinygrad's _broadcasted: reshape to (1,)*ndim then expand to shape.
+        if let Ok(Some(shape)) = self.shape()
+            && !shape.is_empty()
+        {
+            use crate::sint::SInt;
+            use smallvec::SmallVec;
+            let ones: SmallVec<[SInt; 4]> = shape.iter().map(|_| SInt::from(1)).collect();
+            neg_one_uop = neg_one_uop.try_reshape(&ones).expect("neg: reshape failed");
+            neg_one_uop = neg_one_uop.try_expand(shape).expect("neg: expand failed");
+        }
+
+        self.mul(&neg_one_uop)
     }
 
     /// Absolute value: |x|.

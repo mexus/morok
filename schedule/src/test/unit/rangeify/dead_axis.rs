@@ -5,19 +5,20 @@ use crate::rewrite::graph_rewrite_bottom_up;
 use morok_dtype::DType;
 use morok_ir::{ConstValue, Op, UOp};
 
-/// Helper to check if result is EXPAND(RESHAPE(BUFFERIZE_no_ranges, ...), ...)
+/// Helper to check if result contains RESHAPE(BUFFERIZE_no_ranges), optionally wrapped in EXPAND.
+/// Identity expand is eliminated at construction time, so EXPAND may not be present.
 fn is_expand_reshape_bufferize(result: &Arc<UOp>) -> bool {
-    // Result should be EXPAND
-    let Op::Expand { src: reshape_op, .. } = result.op() else {
-        return false;
+    // Try EXPAND(RESHAPE(BUFFERIZE)) first
+    let reshape_op = match result.op() {
+        Op::Expand { src, .. } => src,
+        Op::Reshape { .. } => result,
+        _ => return false,
     };
 
-    // Inner should be RESHAPE
     let Op::Reshape { src: bufferize_op, .. } = reshape_op.op() else {
         return false;
     };
 
-    // Innermost should be BUFFERIZE with empty ranges
     let Op::Bufferize { ranges, .. } = bufferize_op.op() else {
         return false;
     };
@@ -25,10 +26,12 @@ fn is_expand_reshape_bufferize(result: &Arc<UOp>) -> bool {
     ranges.is_empty()
 }
 
-/// Helper to get the innermost BUFFERIZE from EXPAND(RESHAPE(BUFFERIZE))
+/// Helper to get the innermost BUFFERIZE from [EXPAND(]RESHAPE(BUFFERIZE)[)]
 fn get_inner_bufferize(result: &Arc<UOp>) -> Option<&Arc<UOp>> {
-    let Op::Expand { src: reshape_op, .. } = result.op() else {
-        return None;
+    let reshape_op = match result.op() {
+        Op::Expand { src, .. } => src,
+        Op::Reshape { .. } => result,
+        _ => return None,
     };
     let Op::Reshape { src: bufferize_op, .. } = reshape_op.op() else {
         return None;
@@ -40,7 +43,7 @@ fn get_inner_bufferize(result: &Arc<UOp>) -> Option<&Arc<UOp>> {
 fn test_bufferize_with_size_1_range() {
     // BUFFERIZE(x, [RANGE(1)]) should be restructured to EXPAND(RESHAPE(BUFFERIZE(x, [])))
     // This matches Tinygrad's behavior where BUFFERIZE is kept for later STORE creation.
-    let x = UOp::define_global(1, DType::Float32);
+    let x = UOp::param(1, 1, DType::Float32, None);
     let dead_range = UOp::range_const(1, 0); // Size 1 = dead axis
 
     let bufferized = UOp::bufferize_global(x.clone(), vec![dead_range]);
@@ -67,7 +70,7 @@ fn test_bufferize_with_size_1_range() {
 #[test]
 fn test_bufferize_all_dead_axes() {
     // BUFFERIZE(x, [RANGE(1), RANGE(1), RANGE(1)]) → EXPAND(RESHAPE(BUFFERIZE(x, [])))
-    let x = UOp::define_global(1, DType::Float32);
+    let x = UOp::param(1, 1, DType::Float32, None);
     let dead_ranges = vec![UOp::range_const(1, 0), UOp::range_const(1, 1), UOp::range_const(1, 2)];
 
     let bufferized = UOp::bufferize_global(x.clone(), dead_ranges);
@@ -88,7 +91,7 @@ fn test_bufferize_mixed_live_dead_simple_compute() {
     // When compute is DEFINE_GLOBAL (has no ranges), ALL ranges are considered dead
     // because compute doesn't depend on any of them. This matches Tinygrad's behavior.
     // BUFFERIZE(DEFINE_GLOBAL, [RANGE(10), RANGE(1), RANGE(20)]) → EXPAND(RESHAPE(BUFFERIZE_no_ranges))
-    let x = UOp::define_global(1, DType::Float32);
+    let x = UOp::param(1, 1, DType::Float32, None);
     let range1 = UOp::range_const(10, 0);
     let dead_range = UOp::range_const(1, 1);
     let range2 = UOp::range_const(20, 2);
@@ -110,7 +113,7 @@ fn test_bufferize_mixed_live_dead_simple_compute() {
 fn test_bufferize_no_dead_axes_simple_compute() {
     // With DEFINE_GLOBAL compute (no ranges), ALL BUFFERIZE ranges are dead
     // because compute doesn't depend on them. This matches Tinygrad's behavior.
-    let x = UOp::define_global(1, DType::Float32);
+    let x = UOp::param(1, 1, DType::Float32, None);
     let ranges = vec![UOp::range_const(10, 0), UOp::range_const(20, 1)];
 
     let bufferized = UOp::bufferize_global(x.clone(), ranges);
@@ -137,7 +140,7 @@ fn test_index_after_dead_axis_removal() {
     // movement_op_patterns pushes INDEX through EXPAND and RESHAPE layers.
     use crate::rangeify::patterns::{buffer_folding, movement_op_patterns};
 
-    let x = UOp::define_global(1, DType::Float32);
+    let x = UOp::param(1, 1, DType::Float32, None);
     let live_range = UOp::range_const(10, 0);
     let dead_range = UOp::range_const(1, 1);
 
@@ -163,7 +166,7 @@ fn test_index_after_dead_axis_removal() {
 #[test]
 fn test_bufferize_dead_axis_with_constants() {
     // Dead axes with CONST ranges should be removed, result wrapped in EXPAND(RESHAPE(...))
-    let x = UOp::define_global(1, DType::Float32);
+    let x = UOp::param(1, 1, DType::Float32, None);
 
     // Create range with constant end = 1
     let dead_range_const = UOp::range_const(1, 0);
@@ -184,7 +187,7 @@ fn test_bufferize_dead_axis_with_constants() {
 #[test]
 fn test_multiple_dead_axis_removal_passes() {
     // Test that multiple passes of dead axis removal work correctly
-    let x = UOp::define_global(1, DType::Float32);
+    let x = UOp::param(1, 1, DType::Float32, None);
     let live_range = UOp::range_const(10, 0);
     let dead_range1 = UOp::range_const(1, 1);
     let dead_range2 = UOp::range_const(1, 2);
@@ -210,7 +213,7 @@ fn test_multiple_dead_axis_removal_passes() {
 #[test]
 fn test_dead_axis_uint_constant() {
     // Test with UInt constant value of 1
-    let x = UOp::define_global(1, DType::Float32);
+    let x = UOp::param(1, 1, DType::Float32, None);
 
     let const_end = UOp::const_(DType::Index, ConstValue::UInt(1));
     let dead_range = UOp::range(const_end, 0);

@@ -11,7 +11,7 @@ pub(crate) use crate::registry::*;
 pub(crate) use morok_dtype::{DType, ScalarDType};
 pub(crate) use morok_tensor::{PrepareConfig, Tensor};
 
-use crate::importer::{DimValue, OnnxImporter};
+use crate::importer::OnnxImporter;
 
 pub(crate) fn make_attr_int(name: &str, val: i64) -> AttributeProto {
     AttributeProto { name: name.to_string(), i: val, ..Default::default() }
@@ -62,12 +62,12 @@ pub(crate) fn make_graph(
 }
 
 pub(crate) fn make_tensor_proto(raw_data: Vec<u8>, dims: Vec<i64>, dtype: i32) -> TensorProto {
-    TensorProto { data_type: dtype, dims, raw_data, ..Default::default() }
+    TensorProto { data_type: dtype, dims, raw_data: raw_data.into(), ..Default::default() }
 }
 
 fn make_initializer(name: &str, data_type: i32, dims: Vec<i64>, raw_data: Vec<u8>) -> (ValueInfoProto, TensorProto) {
     let input = ValueInfoProto { name: name.to_string(), ..Default::default() };
-    let init = TensorProto { name: name.to_string(), data_type, dims, raw_data, ..Default::default() };
+    let init = TensorProto { name: name.to_string(), data_type, dims, raw_data: raw_data.into(), ..Default::default() };
     (input, init)
 }
 
@@ -144,39 +144,37 @@ pub(crate) fn run_onnx_light_test(model_path: &str, output_pb_path: &str, config
     let model_path = Path::new(model_path);
     let test_name = model_path.file_stem().unwrap().to_string_lossy();
 
-    // 1. Load and decode model
-    let model_bytes = std::fs::read(model_path).unwrap_or_else(|e| panic!("{test_name}: failed to read model: {e}"));
-    let model = ModelProto::decode(model_bytes.as_slice())
-        .unwrap_or_else(|e| panic!("{test_name}: failed to decode model: {e}"));
+    // 1+2. Import model via file path — enables DISK-backed weight loading
+    // (Bytes zero-copy decoding + DISK tensor for lazy weight views)
+    let mut importer = OnnxImporter::new();
+    let result = importer.import(model_path, &[]).unwrap_or_else(|e| panic!("{test_name}: import failed: {e}"));
 
-    // 2. Prepare graph
-    let importer = OnnxImporter::new();
-    let graph = importer.prepare(model).unwrap_or_else(|e| panic!("{test_name}: prepare failed: {e}"));
-
-    // 3. Generate deterministic inputs: arange(n)/n (matches ONNX backend test runner)
-    let mut inputs = HashMap::new();
-    for (name, spec) in &graph.inputs {
-        let shape: Vec<usize> = spec
-            .shape
+    // 3. Assign deterministic inputs: arange(n)/n (matches ONNX backend test runner)
+    for (name, input_tensor) in &result.inputs {
+        let shape: Vec<usize> = input_tensor
+            .shape()
+            .unwrap_or_else(|e| panic!("{test_name}: input '{name}' shape: {e}"))
             .iter()
-            .map(|d| match d {
-                DimValue::Static(s) => *s,
-                DimValue::Dynamic(name) => panic!("{test_name}: unexpected dynamic dim '{name}'"),
-            })
+            .map(|d| d.as_const().unwrap_or_else(|| panic!("{test_name}: dynamic dim in '{name}'")))
             .collect();
         let n: usize = shape.iter().product();
         let data: Vec<f32> = (0..n).map(|i| i as f32 / n as f32).collect();
         let bytes: &[u8] = bytemuck::cast_slice(&data);
-        let tensor = Tensor::from_raw_bytes(bytes, &shape, DType::Scalar(ScalarDType::Float32))
+        let real_tensor = Tensor::from_raw_bytes(bytes, &shape, DType::Scalar(ScalarDType::Float32))
             .unwrap_or_else(|e| panic!("{test_name}: input '{name}': {e}"));
-        inputs.insert(name.clone(), tensor);
+        input_tensor.assign(&real_tensor);
     }
 
-    // 4. Trace with generated inputs
-    let (_, outputs) =
-        importer.trace_external(&graph, inputs).unwrap_or_else(|e| panic!("{test_name}: trace failed: {e}"));
+    // 5. Batch-realize ALL outputs (matches Tinygrad: all outputs in one SINK)
+    let mut outputs: Vec<(String, Tensor)> = result.outputs.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+    {
+        let mut refs: Vec<&mut Tensor> = outputs.iter_mut().map(|(_, t)| t).collect();
+        Tensor::realize_batch_with(refs.iter_mut().map(|t| &mut **t), config)
+            .unwrap_or_else(|e| panic!("{test_name}: realize failed: {e}"));
+    }
 
-    // 5. Load expected output and compare
+    // 6. Load expected output and compare
+    let output_name = result.outputs.keys().next().unwrap_or_else(|| panic!("{test_name}: no outputs")).clone();
     let pb_bytes =
         std::fs::read(output_pb_path).unwrap_or_else(|e| panic!("{test_name}: failed to read expected output: {e}"));
     let tensor_proto = TensorProto::decode(pb_bytes.as_slice())
@@ -184,10 +182,13 @@ pub(crate) fn run_onnx_light_test(model_path: &str, output_pb_path: &str, config
     let expected = tensor_from_proto_ext(&tensor_proto, None)
         .unwrap_or_else(|e| panic!("{test_name}: expected output conversion: {e}"));
 
-    let actual =
-        outputs.get(&graph.outputs[0]).unwrap_or_else(|| panic!("{test_name}: missing output '{}'", graph.outputs[0]));
-    let actual = actual.clone().realize_with(config).unwrap_or_else(|e| panic!("{test_name}: realize failed: {e}"));
-    assert_tensors_close(&actual, &expected, &test_name, config);
+    let mut actual = outputs
+        .iter_mut()
+        .find(|(k, _)| *k == output_name)
+        .unwrap_or_else(|| panic!("{test_name}: missing output '{output_name}'"))
+        .1
+        .clone();
+    assert_tensors_close(&mut actual, &expected, &test_name, config);
 }
 
 // ---------------------------------------------------------------------------
@@ -199,8 +200,8 @@ macro_rules! assert_float_close {
         let a_shape = $actual.shape().unwrap();
         let e_shape = $expected.shape().unwrap();
         assert_eq!(a_shape, e_shape, "Shape mismatch on output '{}'", $name);
-        let a = $actual.to_vec::<$ty>().unwrap();
-        let e = $expected.to_vec::<$ty>().unwrap();
+        let a = $actual.as_vec::<$ty>().unwrap();
+        let e = $expected.as_vec::<$ty>().unwrap();
         for (idx, (av, ev)) in a.iter().zip(e.iter()).enumerate() {
             let av = *av as f64;
             let ev = *ev as f64;
@@ -231,26 +232,23 @@ macro_rules! assert_int_exact {
         let a_shape = $actual.shape().unwrap();
         let e_shape = $expected.shape().unwrap();
         assert_eq!(a_shape, e_shape, "Shape mismatch on output '{}'", $name);
-        let a = $actual.to_vec::<$ty>().unwrap();
-        let e = $expected.to_vec::<$ty>().unwrap();
+        let a = $actual.as_vec::<$ty>().unwrap();
+        let e = $expected.as_vec::<$ty>().unwrap();
         assert_eq!(a, e, "Value mismatch on output '{}'", $name);
     }};
 }
 
-fn assert_tensors_close(actual: &Tensor, expected: &Tensor, label: &str, config: &PrepareConfig) {
+fn assert_tensors_close(actual: &mut Tensor, expected: &Tensor, label: &str, config: &PrepareConfig) {
     let expected_dtype = expected.uop().dtype();
 
     // Cast actual to match expected dtype if they differ
-    let actual_cast;
-    let actual = if actual.uop().dtype() != expected_dtype {
-        actual_cast = actual
-            .cast(expected_dtype.clone())
-            .unwrap_or_else(|e| {
-                panic!("Output '{label}': dtype cast failed ({:?} -> {expected_dtype:?}): {e}", actual.uop().dtype())
-            })
-            .realize_with(config)
-            .unwrap_or_else(|e| panic!("Output '{label}': realize after cast failed: {e}"));
-        &actual_cast
+    let mut actual_cast;
+    let actual: &mut Tensor = if actual.uop().dtype() != expected_dtype {
+        actual_cast = actual.cast(expected_dtype.clone()).unwrap_or_else(|e| {
+            panic!("Output '{label}': dtype cast failed ({:?} -> {expected_dtype:?}): {e}", actual.uop().dtype())
+        });
+        actual_cast.realize_with(config).unwrap_or_else(|e| panic!("Output '{label}': realize after cast failed: {e}"));
+        &mut actual_cast
     } else {
         actual
     };
@@ -260,8 +258,10 @@ fn assert_tensors_close(actual: &Tensor, expected: &Tensor, label: &str, config:
         ScalarDType::Float64 => assert_float_close!(actual, expected, label, 1e-3, 1e-7, f64),
         ScalarDType::Float16 | ScalarDType::BFloat16 | ScalarDType::FP8E4M3 | ScalarDType::FP8E5M2 => {
             let f32_dtype = DType::Scalar(ScalarDType::Float32);
-            let a = actual.cast(f32_dtype.clone()).unwrap().realize_with(config).unwrap();
-            let e = expected.cast(f32_dtype).unwrap().realize_with(config).unwrap();
+            let mut a = actual.cast(f32_dtype.clone()).unwrap();
+            a.realize_with(config).unwrap();
+            let mut e = expected.cast(f32_dtype).unwrap();
+            e.realize_with(config).unwrap();
             assert_float_close!(&a, &e, label, 1e-2, 1e-3, f32);
         }
         ScalarDType::Int8 => assert_int_exact!(actual, expected, label, i8),
@@ -305,15 +305,13 @@ pub(crate) fn run_onnx_node_test(test_dir: &str, config: &PrepareConfig) {
     let input_names: Vec<String> = proto_graph.input.iter().map(|i| i.name.clone()).collect();
     let output_names: Vec<String> = proto_graph.output.iter().map(|o| o.name.clone()).collect();
 
-    // 3. Prepare graph
     let importer = OnnxImporter::new();
-    let graph = importer.prepare(model).unwrap_or_else(|e| panic!("{test_name}: prepare failed: {e}"));
 
-    // 4. Run each test data set
+    // 3. Run each test data set
     for set_dir in sorted_dirs(test_dir, "test_data_set_") {
         let set_name = set_dir.file_name().unwrap().to_string_lossy();
 
-        // Load inputs
+        // Load test inputs
         let mut inputs = HashMap::new();
         for (i, name) in input_names.iter().enumerate() {
             let pb_path = set_dir.join(format!("input_{i}.pb"));
@@ -329,10 +327,10 @@ pub(crate) fn run_onnx_node_test(test_dir: &str, config: &PrepareConfig) {
             inputs.insert(name.clone(), tensor);
         }
 
-        // Execute via trace_external (inputs override auto-resolved placeholders)
-        let (_, outputs) = importer
-            .trace_external(&graph, inputs)
-            .unwrap_or_else(|e| panic!("{test_name}/{set_name}: execution failed: {e}"));
+        // Import with concrete inputs (some ops read values at trace time)
+        let result = importer
+            .import_model_with_inputs(model.clone(), inputs, &[])
+            .unwrap_or_else(|e| panic!("{test_name}/{set_name}: import failed: {e}"));
 
         // Load expected outputs and compare
         for (i, name) in output_names.iter().enumerate() {
@@ -346,12 +344,11 @@ pub(crate) fn run_onnx_node_test(test_dir: &str, config: &PrepareConfig) {
                 .unwrap_or_else(|e| panic!("{test_name}/{set_name}: failed to decode output_{i}.pb: {e}"));
             let expected = tensor_from_proto_ext(&tensor_proto, None)
                 .unwrap_or_else(|e| panic!("{test_name}/{set_name}: expected output '{name}': {e}"));
-            let actual = outputs.get(name).unwrap_or_else(|| panic!("{test_name}/{set_name}: missing output '{name}'"));
-            let actual = actual
-                .clone()
-                .realize_with(config)
-                .unwrap_or_else(|e| panic!("{test_name}/{set_name}: realize failed: {e}"));
-            assert_tensors_close(&actual, &expected, &format!("{test_name}/{set_name}:{name}"), config);
+            let actual =
+                result.outputs.get(name).unwrap_or_else(|| panic!("{test_name}/{set_name}: missing output '{name}'"));
+            let mut actual = actual.clone();
+            actual.realize_with(config).unwrap_or_else(|e| panic!("{test_name}/{set_name}: realize failed: {e}"));
+            assert_tensors_close(&mut actual, &expected, &format!("{test_name}/{set_name}:{name}"), config);
         }
     }
 }

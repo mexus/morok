@@ -173,6 +173,15 @@ impl ConstValue {
         }
     }
 
+    pub const fn neg_one(dtype: ScalarDType) -> Option<Self> {
+        use ScalarDType::*;
+        Some(match dtype {
+            Int8 | Int16 | Int32 | Int64 | Index => Self::Int(-1),
+            FP8E4M3 | FP8E5M2 | Float16 | BFloat16 | Float32 | Float64 => Self::Float(-1.0),
+            _ => return None,
+        })
+    }
+
     /// Minimum representable value for a scalar dtype (matches Tinygrad's `dtypes.min`).
     pub const fn min(dtype: ScalarDType) -> Self {
         use ScalarDType::*;
@@ -390,6 +399,9 @@ pub enum AxisType {
     Unroll,
     /// Thread dimension.
     Thread,
+    /// Temporary canonicalized range for RESHAPE caching (Tinygrad: AxisType.PLACEHOLDER).
+    /// Substituted in before `_apply_reshape` and substituted back after.
+    Placeholder,
 }
 
 impl AxisType {
@@ -426,6 +438,7 @@ impl AxisType {
             Self::Upcast => 3,
             Self::Reduce => 4,
             Self::Unroll => 5,
+            Self::Placeholder => -3,
         }
     }
 
@@ -456,6 +469,7 @@ impl AxisType {
             Self::Upcast => 'u',
             Self::Reduce => 'R',
             Self::Unroll => 'r',
+            Self::Placeholder => 'P',
         }
     }
 

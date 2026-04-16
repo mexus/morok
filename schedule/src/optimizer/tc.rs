@@ -9,6 +9,7 @@ use std::sync::Arc;
 use morok_ir::{AxisId, AxisType, BinaryOp, ConstValue, Op, ReduceOp, UOp, UOpKey, WmmaMetadata, WmmaUpcastAxes};
 use smallvec::{SmallVec, smallvec};
 
+use crate::argsort;
 use crate::optimizer::{
     Renderer, Scheduler,
     error::*,
@@ -237,15 +238,6 @@ pub fn permutes_for_shape(tc: &TensorCore, shape: &[SwizzleAxis]) -> (Vec<usize>
 /// Get the number of reduce axes for the tensor core (log2 of K dimension).
 pub fn get_reduce_axes_count(tc: &TensorCore) -> usize {
     (tc.dims.2 as f64).log2().floor() as usize
-}
-
-/// Compute inverse permutation.
-fn argsort(perm: &[usize]) -> Vec<usize> {
-    let mut inv = vec![0; perm.len()];
-    for (i, &p) in perm.iter().enumerate() {
-        inv[p] = i;
-    }
-    inv
 }
 
 // ============================================================================

@@ -12,7 +12,7 @@ use morok_tensor::{PrepareConfig, Tensor};
 /// Create a test matrix of given size with sequential values.
 fn create_matrix(rows: usize, cols: usize) -> Tensor {
     let data: Vec<f32> = (0..rows * cols).map(|i| i as f32 * 0.01).collect();
-    Tensor::from_slice(&data).try_reshape(&[rows as isize, cols as isize]).expect("reshape should succeed")
+    Tensor::from_slice(&data).try_reshape([rows as isize, cols as isize]).expect("reshape should succeed")
 }
 
 /// Calculate FLOPs for matrix multiplication.
@@ -25,7 +25,6 @@ fn bench_matmul(c: &mut Criterion) {
     // tracing_subscriber::fmt::init();
 
     let mut group = c.benchmark_group("matmul_optimization");
-    let mut executor = morok_runtime::global_executor();
 
     // Typed optimizer configurations (no environment variables needed)
     let heuristic_config: PrepareConfig = OptimizerConfig::builder()
@@ -47,7 +46,7 @@ fn bench_matmul(c: &mut Criterion) {
             let b = create_matrix(size, size);
 
             // HEURISTIC: Prepare OUTSIDE timing (compilation happens here)
-            let result_h = a.matmul(&b).expect("matmul should succeed");
+            let mut result_h = a.matmul(&b).expect("matmul should succeed");
             let plan_h = result_h.prepare_with(&heuristic_config).expect("prepare should succeed");
 
             // DEBUG: Print kernel info for heuristic
@@ -61,11 +60,11 @@ fn bench_matmul(c: &mut Criterion) {
             }
 
             group.bench_with_input(BenchmarkId::new("heuristic", size), &size, |bencher, _| {
-                bencher.iter(|| plan_h.execute(&mut executor).expect("execute should succeed"));
+                bencher.iter(|| plan_h.execute().expect("execute should succeed"));
             });
 
             // BEAM: Prepare OUTSIDE timing (beam search + compilation happens here)
-            let result_b = a.matmul(&b).expect("matmul should succeed");
+            let mut result_b = a.matmul(&b).expect("matmul should succeed");
             let plan_b = result_b.prepare_with(&beam_config).expect("prepare should succeed");
 
             // DEBUG: Print kernel info for beam
@@ -76,7 +75,7 @@ fn bench_matmul(c: &mut Criterion) {
             }
 
             group.bench_with_input(BenchmarkId::new(format!("beam_w{BEAM_WIDTH}"), size), &size, |bencher, _| {
-                bencher.iter(|| plan_b.execute(&mut executor).expect("execute should succeed"));
+                bencher.iter(|| plan_b.execute().expect("execute should succeed"));
             });
         }
     }

@@ -89,7 +89,7 @@ impl UOp {
                         _ => None,
                     })
                     .collect();
-                divided.map(UOp::vconst)
+                divided.map(|v| UOp::vconst(v, self.dtype().scalar_dtype()))
             }
             Op::Binary(BinaryOp::Add, a, b) => {
                 let d0 = a.divides_int(v)?;
@@ -439,8 +439,12 @@ impl UOp {
                 // WHERE(valid, idx, INVALID) → return valid
                 cond.clone()
             }
+            Op::Invalid => {
+                // Bare Invalid is NOT valid (Tinygrad: self.arg is not Invalid → False)
+                Self::const_(DType::Bool, ConstValue::Bool(false))
+            }
             _ => {
-                // Always valid - return constant true
+                // Non-Invalid, non-WHERE: always valid
                 Self::const_(DType::Bool, ConstValue::Bool(true))
             }
         }
@@ -732,19 +736,22 @@ mod tests {
 
     #[test]
     fn test_const_factor_vconst() {
-        let vc = UOp::vconst(vec![ConstValue::Int(6), ConstValue::Int(12), ConstValue::Int(18), ConstValue::Int(24)]);
+        let vc = UOp::vconst(
+            vec![ConstValue::Int(6), ConstValue::Int(12), ConstValue::Int(18), ConstValue::Int(24)],
+            DType::Int64,
+        );
         assert_eq!(vc.const_factor(), 6); // GCD(6, 12, 18, 24) = 6
     }
 
     #[test]
     fn test_const_factor_vconst_no_common() {
-        let vc = UOp::vconst(vec![ConstValue::Int(7), ConstValue::Int(11)]);
+        let vc = UOp::vconst(vec![ConstValue::Int(7), ConstValue::Int(11)], DType::Int64);
         assert_eq!(vc.const_factor(), 1); // GCD(7, 11) = 1
     }
 
     #[test]
     fn test_divides_int_vconst() {
-        let vc = UOp::vconst(vec![ConstValue::Int(6), ConstValue::Int(12)]);
+        let vc = UOp::vconst(vec![ConstValue::Int(6), ConstValue::Int(12)], DType::Int64);
         let result = vc.divides_int(3);
         assert!(result.is_some());
         if let Some(r) = result {
@@ -758,10 +765,13 @@ mod tests {
 
     #[test]
     fn test_divides_int_vconst_not_divisible() {
-        let vc = UOp::vconst(vec![
-            ConstValue::Int(6),
-            ConstValue::Int(7), // 7 not divisible by 3
-        ]);
+        let vc = UOp::vconst(
+            vec![
+                ConstValue::Int(6),
+                ConstValue::Int(7), // 7 not divisible by 3
+            ],
+            DType::Int64,
+        );
         assert!(vc.divides_int(3).is_none());
     }
 

@@ -1,5 +1,6 @@
 pub mod activation;
 pub mod arithmetic;
+pub mod batch;
 pub mod bitwise;
 pub mod book_examples;
 pub mod broadcast;
@@ -20,3 +21,8 @@ pub mod shared_subgraph;
 pub mod sort;
 pub mod transformer;
 pub mod triangular;
+pub mod variable;
+
+pub mod fusion;
+pub mod scatter_debug;
+pub mod schedule_cache;

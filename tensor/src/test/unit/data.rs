@@ -10,8 +10,9 @@ crate::codegen_tests! {
     fn test_to_vec_computed(config) {
         let a = Tensor::from_slice([1.0f32, 2.0, 3.0]);
         let b = Tensor::from_slice([10.0f32, 20.0, 30.0]);
-        let c = (&a + &b).realize_with(&config).unwrap();
-        let v = c.to_vec::<f32>().unwrap();
+        let mut c = &a + &b;
+        c.realize_with(&config).unwrap();
+        let v = c.as_vec::<f32>().unwrap();
         assert_eq!(v, vec![11.0, 22.0, 33.0]);
     }
 }
@@ -49,7 +50,7 @@ fn test_from_ndarray_3d() {
 fn test_from_ndarray_0d() {
     let arr = ndarray::arr0(42.0f32);
     let t = Tensor::from_ndarray(&arr);
-    let v = t.to_vec::<f32>().unwrap();
+    let v = t.as_vec::<f32>().unwrap();
     assert_eq!(v, vec![42.0]);
 }
 
@@ -57,7 +58,7 @@ fn test_from_ndarray_0d() {
 fn test_from_ndarray_empty() {
     let arr = Array1::<f32>::zeros(0);
     let t = Tensor::from_ndarray(&arr);
-    let result = t.to_ndarray::<f32>().unwrap();
+    let result = t.as_ndarray::<f32>().unwrap();
     assert_eq!(result.shape(), &[0]);
     assert_eq!(result.len(), 0);
 }
@@ -86,7 +87,7 @@ fn test_from_ndarray_fortran() {
 #[test]
 fn test_to_vec_f32() {
     let t = Tensor::from_slice([1.0f32, 2.0, 3.0]);
-    let v = t.to_vec::<f32>().unwrap();
+    let v = t.as_vec::<f32>().unwrap();
     assert_eq!(v, vec![1.0, 2.0, 3.0]);
 }
 

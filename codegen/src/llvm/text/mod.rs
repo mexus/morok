@@ -14,11 +14,10 @@
 use std::sync::Arc;
 
 use morok_ir::pattern::TypedPatternMatcher;
-use morok_ir::rewrite::graph_rewrite_bottom_up;
 use morok_ir::{AxisType, Op, prelude::*};
 use morok_schedule::linearize::{line_rewrite_cleanups, linearize_with_cfg};
-use morok_schedule::rangeify::patterns::pm_bool_devectorize;
 
+use crate::common::is_output_buffer;
 use crate::llvm::common::{RenderContext, ldt};
 use crate::llvm::cpu::{reduce_identity, render_uop};
 use crate::{BufferArg, RenderedKernel, Renderer, Result};
@@ -45,13 +44,7 @@ impl Renderer for LlvmTextRenderer {
     fn render(&self, uop: &Arc<UOp>, name: Option<&str>) -> Result<RenderedKernel> {
         let kernel_name = name.unwrap_or("kernel");
 
-        // NOTE: pm_render() is now called in schedule/optimizer Stage 19.
-        // Keeping pm_bool_devectorize as safety fallback for direct codegen paths.
-        let uop = graph_rewrite_bottom_up(pm_bool_devectorize(), uop.clone(), &mut ());
-
-        tracing::debug!(ast_after_pm_bool_devectorize = %uop.tree(), "codegen: after pm_bool_devectorize");
-
-        let nodes = linearize_with_cfg(uop);
+        let nodes = linearize_with_cfg(uop.clone());
 
         // Stage 22: Apply line rewrite cleanups to handle gated INDEX operations.
         // Converts gated STOREs to IF/STORE/ENDIF sequences.
@@ -72,7 +65,7 @@ impl Renderer for LlvmTextRenderer {
 
         for node in &nodes {
             match node.op() {
-                Op::DefineGlobal(_) => {
+                Op::Param { device: None, .. } => {
                     buffers.push(node.clone());
                 }
                 Op::DefineVar { .. } => {
@@ -82,7 +75,7 @@ impl Renderer for LlvmTextRenderer {
             }
         }
 
-        buffers.sort_by_key(|b| if let Op::DefineGlobal(id) = b.op() { *id } else { usize::MAX });
+        buffers.sort_by_key(|b| if let Op::Param { slot, device: None, .. } = b.op() { *slot } else { usize::MAX });
 
         let thread_info: Option<(Arc<UOp>, usize)> = nodes.iter().find_map(|n| {
             if let Op::Range { axis_type, end, .. } = n.op()
@@ -99,9 +92,9 @@ impl Renderer for LlvmTextRenderer {
         let thread_count = thread_info.as_ref().map(|(_, c)| *c).unwrap_or(1);
 
         for (i, buf) in buffers.iter().enumerate() {
-            if let Op::DefineGlobal(id) = buf.op() {
+            if let Op::Param { slot, device: None, .. } = buf.op() {
                 let is_output = is_output_buffer(buf, &nodes);
-                buffer_args.push(BufferArg { index: *id, name: format!("data{i}"), dtype: buf.dtype(), is_output });
+                buffer_args.push(BufferArg { index: *slot, name: format!("data{i}"), dtype: buf.dtype(), is_output });
             }
         }
 
@@ -182,6 +175,10 @@ impl Renderer for LlvmTextRenderer {
         }
 
         for node in &nodes {
+            if matches!(node.op(), Op::Noop | Op::Group { .. }) {
+                ctx.register(node.id, String::new());
+                continue;
+            }
             if let Op::Range { axis_type, .. } = node.op()
                 && matches!(axis_type, AxisType::Thread)
             {
@@ -231,24 +228,6 @@ attributes #0 = {{ nounwind "no-builtins" "no-trapping-math"="true" }}
     fn decompositor(&self) -> Option<TypedPatternMatcher<()>> {
         None
     }
-}
-
-fn is_output_buffer(def_global: &Arc<UOp>, nodes: &[Arc<UOp>]) -> bool {
-    let buffer_id = def_global.id;
-
-    for node in nodes {
-        if let Some(buffer) = node.store_buffer() {
-            if buffer.id == buffer_id {
-                return true;
-            }
-            if let Op::Index { buffer: idx_buf, .. } = buffer.op()
-                && idx_buf.id == buffer_id
-            {
-                return true;
-            }
-        }
-    }
-    false
 }
 
 fn mangle_type(llvm_type: &str) -> String {
@@ -326,9 +305,9 @@ mod tests {
 
     #[test]
     fn test_simple_add() {
-        let a = UOp::define_global(0, DType::Float32.ptr(Some(1), AddrSpace::Global));
-        let b = UOp::define_global(1, DType::Float32.ptr(Some(1), AddrSpace::Global));
-        let out = UOp::define_global(2, DType::Float32.ptr(Some(1), AddrSpace::Global));
+        let a = UOp::param(0, 1, DType::Float32.ptr(Some(1), AddrSpace::Global), None);
+        let b = UOp::param(1, 1, DType::Float32.ptr(Some(1), AddrSpace::Global), None);
+        let out = UOp::param(2, 1, DType::Float32.ptr(Some(1), AddrSpace::Global), None);
 
         let idx = UOp::index_const(0);
         let a_idx = UOp::index().buffer(a.clone()).indices(vec![idx.clone()]).call().unwrap();

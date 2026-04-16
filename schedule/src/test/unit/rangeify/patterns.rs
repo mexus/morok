@@ -203,23 +203,25 @@ fn test_dead_axis_removal_single_dead_axis() {
 
     let result = matcher.rewrite(&bufferize, &mut ());
 
-    // Should restructure to EXPAND(RESHAPE(BUFFERIZE_no_ranges)) - Tinygrad behavior
+    // Should restructure to [EXPAND(]RESHAPE(BUFFERIZE_no_ranges)[)] - Tinygrad behavior
     // The BUFFERIZE is KEPT (not removed) so it can be converted to STORE later.
+    // Note: identity EXPAND is eliminated at construction time, so EXPAND may not be present.
     match result {
         RewriteResult::Rewritten(rewritten) => {
-            // Should be EXPAND(RESHAPE(BUFFERIZE_no_ranges))
-            if let Op::Expand { src: reshape_op, .. } = rewritten.op() {
-                if let Op::Reshape { src: bufferize_op, .. } = reshape_op.op() {
-                    assert!(
-                        matches!(bufferize_op.op(), Op::Bufferize { ranges, .. } if ranges.is_empty()),
-                        "Inner should be BUFFERIZE with no ranges, got: {}",
-                        rewritten.tree()
-                    );
-                } else {
-                    panic!("Expected RESHAPE inside EXPAND, got: {}", rewritten.tree());
-                }
+            // Accept EXPAND(RESHAPE(BUFFERIZE)) or RESHAPE(BUFFERIZE) (when expand is identity)
+            let reshape_op = match rewritten.op() {
+                Op::Expand { src, .. } => src,
+                Op::Reshape { .. } => &rewritten,
+                _ => panic!("Expected EXPAND or RESHAPE, got: {}", rewritten.tree()),
+            };
+            if let Op::Reshape { src: bufferize_op, .. } = reshape_op.op() {
+                assert!(
+                    matches!(bufferize_op.op(), Op::Bufferize { ranges, .. } if ranges.is_empty()),
+                    "Inner should be BUFFERIZE with no ranges, got: {}",
+                    rewritten.tree()
+                );
             } else {
-                panic!("Expected EXPAND(RESHAPE(BUFFERIZE_no_ranges)), got: {}", rewritten.tree());
+                panic!("Expected RESHAPE inside result, got: {}", rewritten.tree());
             }
         }
         _ => {
@@ -421,7 +423,7 @@ fn test_movement_op_removal_no_match_without_ranges() {
     let mut ctx = IndexingContext::new();
 
     // Create a PERMUTE operation (a movement op)
-    let src = UOp::define_global(0, DType::Float32);
+    let src = UOp::native_const(1.0f32);
     let permute = UOp::new(Op::Permute { src: src.clone(), axes: vec![1, 0] }, DType::Float32);
 
     // Without ranges assigned, should NOT remove
@@ -436,7 +438,7 @@ fn test_movement_op_removal_removes_with_ranges() {
     let mut ctx = IndexingContext::new();
 
     // Create a PERMUTE operation
-    let src = UOp::define_global(0, DType::Float32);
+    let src = UOp::native_const(1.0f32);
     let permute = UOp::new(Op::Permute { src: src.clone(), axes: vec![1, 0] }, DType::Float32);
 
     // Assign ranges to the movement op (simulating transformation has been applied)
@@ -467,7 +469,7 @@ fn test_movement_op_removal_reshape() {
     let mut ctx = IndexingContext::new();
 
     // Create a RESHAPE operation
-    let src = UOp::define_global(0, DType::Float32);
+    let src = UOp::native_const(1.0f32);
     let new_shape = UOp::vectorize(smallvec::smallvec![UOp::index_const(4), UOp::index_const(8)]);
     let reshape = UOp::new(Op::Reshape { src: src.clone(), new_shape }, DType::Float32);
 
@@ -499,7 +501,7 @@ fn test_movement_op_removal_expand() {
     let mut ctx = IndexingContext::new();
 
     // Create an EXPAND operation
-    let src = UOp::define_global(0, DType::Float32);
+    let src = UOp::native_const(1.0f32);
     let new_shape = UOp::vectorize(smallvec::smallvec![UOp::index_const(4), UOp::index_const(8)]);
     let expand = UOp::new(Op::Expand { src: src.clone(), new_shape }, DType::Float32);
 
@@ -530,14 +532,15 @@ fn test_movement_op_removal_non_movement_op() {
     let matcher = patterns::apply_rangeify_patterns();
     let mut ctx = IndexingContext::new();
 
-    // Create a non-movement op (NEG)
-    let src = UOp::define_global(0, DType::Float32);
-    let neg = src.neg();
+    // Create a non-movement op (SQRT)
+    // neg() now produces MUL (binary), use sqrt (unary) instead.
+    let src = UOp::native_const(1.0f32);
+    let sqrt = src.try_sqrt().unwrap();
 
     // Non-movement ops without ranges should not match the movement removal pattern
     // (they may match other patterns like bufferize, but without ranges assigned,
     // apply_bufferize_transform returns None)
-    let result = matcher.rewrite(&neg, &mut ctx);
+    let result = matcher.rewrite(&sqrt, &mut ctx);
     assert!(matches!(result, RewriteResult::NoMatch), "Should not match non-movement ops without ranges");
 }
 

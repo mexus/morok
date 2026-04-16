@@ -26,6 +26,7 @@ pub mod kernel_cache;
 pub mod llvm;
 #[cfg(feature = "mlir")]
 pub mod mlir;
+pub mod profiler;
 
 #[cfg(test)]
 pub mod test;
@@ -35,9 +36,10 @@ pub use device_registry::DEVICE_FACTORIES;
 pub use devices::cpu::{CpuBackend, create_cpu_device, create_cpu_device_with_backend};
 pub use devices::cpu_queue::CpuQueue;
 pub use error::*;
-pub use execution_plan::{ExecutionPlan, ExecutionPlanBuilder, ParallelGroup, PreparedKernel};
+pub use execution_plan::{ExecutionPlan, ExecutionPlanBuilder, PreparedKernel};
 pub use executor::{
     DeviceContext, ExecutionGraph, ExecutionNode, KernelBufferAccess, SyncStrategy, UnifiedExecutor, global_executor,
 };
 pub use kernel_cache::*;
 pub use llvm::*;
+pub use profiler::KernelProfile;

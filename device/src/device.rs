@@ -169,15 +169,11 @@ pub trait Compiler: Send + Sync {
     /// ```
     fn compile(&self, spec: &ProgramSpec) -> Result<CompiledSpec>;
 
-    /// Optional cache key for this compiler configuration.
+    /// Cache key identifying this compiler backend.
     ///
     /// Used to differentiate compiled artifacts when the same device type
-    /// can have multiple compiler configurations (e.g., different optimization levels).
-    ///
-    /// Returns None if all instances of this compiler produce identical output.
-    fn cache_key(&self) -> Option<&str> {
-        None
-    }
+    /// can have multiple compiler backends (e.g., clang vs llvm-jit).
+    fn cache_key(&self) -> &'static str;
 }
 
 /// A renderer that transforms UOp graphs into source code.
@@ -324,7 +320,7 @@ impl Device {
 /// # Tinygrad Alignment
 ///
 /// Buffer metadata (`globals`, `outs`, `ins`) matches Tinygrad's Program class:
-/// - `globals`: Buffer indices from DefineGlobal ops
+/// - `globals`: Buffer indices from PARAM ops
 /// - `outs`: Output buffer indices (written by STORE ops)
 /// - `ins`: Input buffer indices (read by LOAD ops)
 #[derive(Debug, Clone)]
@@ -354,7 +350,7 @@ pub struct ProgramSpec {
     /// Includes thread_id at the end if threading is enabled.
     pub var_names: Vec<String>,
 
-    /// Global buffer indices (from DefineGlobal argument values).
+    /// Global buffer indices (from PARAM slot values).
     /// Matches Tinygrad's `globals` field.
     pub globals: Vec<usize>,
 

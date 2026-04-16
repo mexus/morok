@@ -5,10 +5,14 @@
 //! - load_store_indexing: INDEX(buf, x, true) → INDEX(buf, x, None)
 //! - devectorize_buf_and_index: LOCAL/REG buffer vectorization
 
+use std::sync::Arc;
+
 use morok_dtype::{AddrSpace, DType};
 use morok_ir::types::ConstValue;
 use morok_ir::{Op, UOp};
-use smallvec::smallvec;
+use smallvec::{SmallVec, smallvec};
+
+use crate::devectorize::devectorize;
 
 use super::helpers::*;
 
@@ -377,4 +381,113 @@ fn test_is_increasing_mul_negative() {
     let c = UOp::const_(DType::Int32, ConstValue::Int(-1));
     let prod = x.try_mul(&c).unwrap();
     assert!(!prod.is_increasing(), "x * negative CONST should not be increasing");
+}
+
+// =============================================================================
+// Vector INDEX on Local Buffer Tests (scatter store fix)
+// =============================================================================
+
+/// Test: INDEX(CAST(DEF_LOCAL), vec3_idx) gets decomposed by devectorize.
+///
+/// Reproduces the scatter store bug: UPCAST creates vec3 indices on a local buffer
+/// with vec3 pointer type. Without the fix, neither `expand_index` (requires
+/// VECTORIZE buffer) nor `no_vectorized_index` (required scalar idx) would match,
+/// leaving a vector STORE that C/LLVM codegen cannot emit.
+#[test]
+fn test_devectorize_local_buffer_vector_index() {
+    // DEF_LOCAL with vec3 pointer: Ptr<vec3<f32>>
+    let vec3_ptr_dtype = DType::Float32.vec(3).ptr(Some(9), AddrSpace::Local);
+    let _def_local = UOp::define_local(0, vec3_ptr_dtype.clone());
+
+    // Simulate no_vectorized_buf having fired: DEF_LOCAL(Ptr<f32>).cast(Ptr<vec3<f32>>)
+    let scalar_ptr_dtype = DType::Float32.ptr(Some(9), AddrSpace::Local);
+    let scalar_def = UOp::define_local(1, scalar_ptr_dtype);
+    let cast_def = scalar_def.cast(vec3_ptr_dtype);
+
+    // Create vector index with 3 lanes (simulating UPCAST expansion)
+    let idx0 = UOp::index_const(0);
+    let idx1 = UOp::index_const(1);
+    let idx2 = UOp::index_const(2);
+    let vec3_idx = UOp::vectorize(smallvec![idx0, idx1, idx2]);
+
+    // INDEX(CAST(DEF_LOCAL), vec3_idx) — this is the problematic pattern
+    let index = UOp::new(
+        Op::Index { buffer: cast_def, indices: smallvec![vec3_idx], gate: None },
+        DType::Float32.vec(9).ptr(Some(9), AddrSpace::Local),
+    );
+
+    // Create vec9 value and STORE
+    let value_elements: SmallVec<[Arc<UOp>; 4]> =
+        (0..9).map(|i| UOp::const_(DType::Float32, ConstValue::Float(i as f64))).collect();
+    let vec9_value = UOp::vectorize(value_elements);
+    let store = index.store(vec9_value);
+
+    // Wrap in SINK for the rewrite engine
+    let sink = UOp::sink(vec![store]);
+
+    // Apply full devectorize pipeline
+    let result = devectorize(&sink);
+
+    // After devectorize, all STOREs should have scalar indices (no vector INDEX on local buf)
+    let has_vector_local_index = result.toposort().iter().any(|node: &Arc<UOp>| {
+        if let Op::Index { buffer, indices, .. } = node.op() {
+            let has_vec_idx = indices.first().is_some_and(|i| i.dtype().vcount() > 1);
+            let is_local_cast = matches!(buffer.op(), Op::Cast { src, .. }
+                if matches!(src.op(), Op::DefineLocal(_)));
+            has_vec_idx && is_local_cast
+        } else {
+            false
+        }
+    });
+    assert!(!has_vector_local_index, "After devectorize, no INDEX(CAST(DEF_LOCAL), vec_idx) should remain");
+
+    // Should have produced multiple STOREs (PTRCAT groups consecutive offsets,
+    // so count may be less than 9 due to grouping)
+    let store_count = count_stores(&result);
+    assert!(store_count >= 3, "Expected at least 3 stores (grouped), got {store_count}");
+}
+
+/// Test: Same as above but with vec9 index (simulating u3u3 UPCAST = 3×3 = 9 lanes).
+#[test]
+fn test_devectorize_local_buffer_vec9_index() {
+    // DEF_LOCAL with vec9 pointer: Ptr<vec9<f32>>
+    // (This is the actual pattern from the u3u3 kernel)
+    let vec9_ptr_dtype = DType::Float32.vec(9).ptr(Some(81), AddrSpace::Local);
+    let scalar_ptr_dtype = DType::Float32.ptr(Some(81), AddrSpace::Local);
+    let scalar_def = UOp::define_local(2, scalar_ptr_dtype);
+    let cast_def = scalar_def.cast(vec9_ptr_dtype);
+
+    // Create vector index with 9 lanes
+    let vec9_idx = UOp::vectorize((0..9i64).map(UOp::index_const).collect::<SmallVec<[Arc<UOp>; 4]>>());
+
+    // INDEX(CAST(DEF_LOCAL), vec9_idx)
+    let index = UOp::new(
+        Op::Index { buffer: cast_def, indices: smallvec![vec9_idx], gate: None },
+        DType::Float32.vec(81).ptr(Some(81), AddrSpace::Local),
+    );
+
+    // vec81 value (9 index lanes × 9 pointer vcount)
+    let value_elements: SmallVec<[Arc<UOp>; 4]> =
+        (0..81).map(|i| UOp::const_(DType::Float32, ConstValue::Float(i as f64))).collect();
+    let vec81_value = UOp::vectorize(value_elements);
+    let store = index.store(vec81_value);
+
+    let sink = UOp::sink(vec![store]);
+    let result = devectorize(&sink);
+
+    let has_vector_local_index = result.toposort().iter().any(|node: &Arc<UOp>| {
+        if let Op::Index { buffer, indices, .. } = node.op() {
+            let has_vec_idx = indices.first().is_some_and(|i| i.dtype().vcount() > 1);
+            let is_local_cast = matches!(buffer.op(), Op::Cast { src, .. }
+                if matches!(src.op(), Op::DefineLocal(_)));
+            has_vec_idx && is_local_cast
+        } else {
+            false
+        }
+    });
+    assert!(!has_vector_local_index, "After devectorize, no INDEX(CAST(DEF_LOCAL), vec_idx) should remain");
+
+    // PTRCAT groups consecutive offsets, so store count is less than 81
+    let store_count = count_stores(&result);
+    assert!(store_count >= 9, "Expected at least 9 stores (grouped), got {store_count}");
 }

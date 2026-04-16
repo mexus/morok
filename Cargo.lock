@@ -1491,6 +1491,7 @@ version = "0.1.0-alpha.1"
 dependencies = [
  "cudarc",
  "enum_delegate",
+ "memmap2",
  "morok-dtype",
  "morok-ir",
  "ndarray",
@@ -1556,6 +1557,7 @@ name = "morok-onnx"
 version = "0.1.0-alpha.1"
 dependencies = [
  "bytemuck",
+ "half",
  "morok-dtype",
  "morok-ir",
  "morok-runtime",
@@ -1639,6 +1641,7 @@ dependencies = [
  "once_cell",
  "papaya",
  "parking_lot 0.12.5",
+ "proptest",
  "smallvec",
  "snafu 0.8.9",
  "strum 0.28.0",

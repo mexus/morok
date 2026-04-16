@@ -14,7 +14,7 @@ mod shape;
 mod transformer;
 
 use morok_dtype::{DType, ScalarDType};
-use morok_ir::ConstValue;
+use morok_ir::{ConstValue, SInt};
 use morok_tensor::Tensor;
 use morok_tensor::reduce::AxisSpec;
 
@@ -116,7 +116,10 @@ impl OpRegistry {
             "Sum" => vec![fold_variadic(inputs, "Sum", |a, b| a.try_add(b))?],
             "Mean" => {
                 let count = inputs.iter().filter(|o| o.is_some()).count();
-                vec![fold_variadic(inputs, "Mean", |a, b| a.try_add(b))?.try_div(&Tensor::from_slice([count as f32]))?]
+                vec![
+                    fold_variadic(inputs, "Mean", |a, b| a.try_add(b))?
+                        .try_div(&Tensor::const_(count as f64, DType::Float32))?,
+                ]
             }
 
             // === Bitwise ===
@@ -280,28 +283,29 @@ impl OpRegistry {
                 vec![Tensor::cat(&tensors, axis)?]
             }
             "Shape" => {
+                let full_shape = inp(inputs, 0).shape()?;
+                let ndim = full_shape.len() as isize;
                 let start = attrs.int("start", 0) as isize;
                 let end = attrs.int("end", i64::MAX) as isize;
-                let shape = inp(inputs, 0).shape()?;
-                let ndim = shape.len() as isize;
                 let s = if start < 0 { (ndim + start).max(0) } else { start.min(ndim) } as usize;
-                let e = (if end < 0 { (ndim + end).max(0) } else { end.min(ndim) } as usize).max(s);
-                let dims: Vec<i64> = shape[s..e]
-                    .iter()
-                    .map(|d| {
-                        d.as_const()
-                            .map(|v| v as i64)
-                            .ok_or_else(|| Error::IrConstruction { details: "Shape requires concrete dims".into() })
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-                vec![Tensor::from_slice(&dims)]
+                let e = if end < 0 { (ndim + end).max(0) } else { end.min(ndim) } as usize;
+                let e = e.max(s);
+                if full_shape[s..e].iter().all(|d| d.is_const()) {
+                    let dims: Vec<i64> = full_shape[s..e].iter().map(|d| d.as_const().unwrap() as i64).collect();
+                    vec![Tensor::from_slice(&dims)]
+                } else {
+                    // Symbolic dims: fall back to shape_tensor + shrink
+                    let shape_t = inp(inputs, 0).shape_tensor()?;
+                    vec![shape_t.try_shrink([(s as isize, e as isize)])?]
+                }
             }
             "Expand" => vec![shape::op_expand(inputs)?],
             "Pad" => vec![shape::op_pad(inputs, &mut attrs)?],
             "Slice" => vec![shape::op_slice(inputs)?],
             "Split" => shape::op_split(inputs, &mut attrs, opset_version)?,
             "Tile" => {
-                let repeats: Vec<usize> = tensor_to_i64_vec(inp(inputs, 1))?.iter().map(|&v| v as usize).collect();
+                let repeats: Vec<SInt> =
+                    tensor_to_i64_vec(inp(inputs, 1))?.iter().map(|&v| SInt::from(v as usize)).collect();
                 vec![inp(inputs, 0).repeat(&repeats)?]
             }
             "Range" => {
@@ -325,9 +329,9 @@ impl OpRegistry {
                     .tensor("value")
                     .map(tensor_from_proto)
                     .transpose()?
-                    .unwrap_or_else(|| Tensor::from_slice([0.0f32]));
+                    .unwrap_or_else(|| Tensor::const_(0.0f64, DType::Float32));
                 vec![if shape_i64.contains(&0) {
-                    Tensor::empty(value.uop().dtype())
+                    Tensor::empty_zero(value.uop().dtype())
                 } else {
                     let shape: Vec<isize> = shape_i64.iter().map(|&v| v as isize).collect();
                     let ones = vec![1isize; shape.len()];
@@ -681,7 +685,7 @@ impl OpRegistry {
             }
             "OptionalGetElement" => match inputs.first().and_then(|o| o.as_ref()) {
                 Some(t) => vec![t.clone()],
-                None => vec![Tensor::empty(DType::Float32)],
+                None => vec![Tensor::empty_zero(DType::Float32)],
             },
             "CenterCropPad" => {
                 let t = inp(inputs, 0);
@@ -724,4 +728,86 @@ impl Default for OpRegistry {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Gather fast path for constant indices: uses shrink+cat instead of index_select.
+///
+/// When Gather indices are known constants (from initializers/Constant nodes), this
+/// produces zero compute kernels — only lazy shape operations (shrink, cat, reshape).
+/// The normal path creates arange + one-hot + where + reduce(sum) = 2-5 kernels per Gather.
+///
+/// Port of Tinygrad onnx.py:1148-1158.
+pub(crate) fn gather_const_fast_path(
+    data: &Tensor,
+    indices: &[i64],
+    idx_shape: &[usize],
+    axis: isize,
+) -> crate::Result<Tensor> {
+    let data_shape = data.shape().map_err(|e| crate::Error::IrConstruction { details: e.to_string() })?;
+    let ndim = data_shape.len();
+
+    // All data dimensions must be concrete (symbolic batch dims not supported in fast path)
+    let concrete_shape: Vec<usize> =
+        data_shape.iter().map(|d| d.as_const()).collect::<Option<Vec<_>>>().ok_or_else(|| {
+            crate::Error::IrConstruction { details: "Gather fast path requires all-concrete data shape".into() }
+        })?;
+
+    let norm_axis = if axis < 0 { (ndim as isize + axis) as usize } else { axis as usize };
+    let dim_size = concrete_shape[norm_axis] as i64;
+
+    // Normalize negative indices with bounds check
+    let index_consts: Vec<usize> = indices
+        .iter()
+        .map(|&i| {
+            let normalized = if i < 0 { dim_size + i } else { i };
+            if normalized < 0 || normalized >= dim_size {
+                return Err(crate::Error::IrConstruction {
+                    details: format!("Gather index {i} out of bounds for axis {norm_axis} with size {dim_size}"),
+                });
+            }
+            Ok(normalized as usize)
+        })
+        .collect::<crate::Result<Vec<_>>>()?;
+
+    if index_consts.is_empty() {
+        // Empty indices: produce empty tensor with correct output shape
+        let mut out_dims: Vec<usize> = Vec::new();
+        out_dims.extend_from_slice(&concrete_shape[..norm_axis]);
+        out_dims.extend_from_slice(idx_shape);
+        out_dims.extend_from_slice(&concrete_shape[norm_axis + 1..]);
+        return Tensor::full(&out_dims, 0.0f32, data.uop().dtype())
+            .map_err(|e| crate::Error::IrConstruction { details: e.to_string() });
+    }
+
+    // Shrink: extract each index as a slice along the gather axis
+    let shrunk: Vec<Tensor> = index_consts
+        .iter()
+        .map(|&i| {
+            let ranges: Vec<(isize, isize)> = (0..ndim)
+                .map(|j| if j == norm_axis { (i as isize, i as isize + 1) } else { (0, concrete_shape[j] as isize) })
+                .collect();
+            data.try_shrink(&ranges).map_err(|e| crate::Error::IrConstruction { details: e.to_string() })
+        })
+        .collect::<crate::Result<Vec<_>>>()?;
+
+    // Cat along axis (if more than one slice)
+    let catted = if shrunk.len() == 1 {
+        shrunk.into_iter().next().unwrap()
+    } else {
+        let refs: Vec<&Tensor> = shrunk.iter().collect();
+        Tensor::cat(&refs, norm_axis as isize).map_err(|e| crate::Error::IrConstruction { details: e.to_string() })?
+    };
+
+    // Reshape to output shape: data[:axis] + idx_shape + data[axis+1:]
+    let mut out_dims: Vec<isize> = Vec::new();
+    for &d in &concrete_shape[..norm_axis] {
+        out_dims.push(d as isize);
+    }
+    for &d in idx_shape {
+        out_dims.push(d as isize);
+    }
+    for &d in &concrete_shape[norm_axis + 1..] {
+        out_dims.push(d as isize);
+    }
+    catted.try_reshape(&out_dims).map_err(|e| crate::Error::IrConstruction { details: e.to_string() })
 }

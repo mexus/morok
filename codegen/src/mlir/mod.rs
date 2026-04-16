@@ -24,14 +24,13 @@ use melior::pass::PassManager;
 use melior::utility::{register_all_dialects, register_all_llvm_translations};
 use morok_dtype::DType;
 use morok_ir::pattern::TypedPatternMatcher;
-use morok_ir::rewrite::graph_rewrite_bottom_up;
 use morok_ir::{AxisType, ConstValue, Op, ReduceOp, WmmaMetadata, prelude::*};
 use morok_schedule::linearize::{line_rewrite_cleanups, linearize_with_cfg};
-use morok_schedule::rangeify::patterns::pm_bool_devectorize;
 
 use self::ctx::{RenderContext, ScfIfInfo, ScfLoopInfo};
 use self::ops::*;
 use self::types::{mlir_ptr_type, mlir_type};
+use crate::common::is_output_buffer;
 use crate::{BufferArg, RenderedKernel, Renderer, Result};
 
 /// MLIR-based renderer using Melior bindings.
@@ -166,11 +165,7 @@ impl Renderer for MlirRenderer {
     fn render(&self, uop: &Arc<UOp>, name: Option<&str>) -> Result<RenderedKernel> {
         let kernel_name = name.unwrap_or("kernel");
 
-        let uop = graph_rewrite_bottom_up(&pm_bool_devectorize(), uop.clone(), &mut ());
-
-        tracing::debug!(ast_after_pm_bool_devectorize = %uop.tree(), "mlir codegen: after pm_bool_devectorize");
-
-        let nodes = linearize_with_cfg(uop);
+        let nodes = linearize_with_cfg(uop.clone());
         let nodes = line_rewrite_cleanups(nodes);
 
         for (i, node) in nodes.iter().enumerate() {
@@ -183,12 +178,12 @@ impl Renderer for MlirRenderer {
 
         for node in &nodes {
             match node.op() {
-                Op::DefineGlobal(_) => buffers.push(node.clone()),
+                Op::Param { device: None, .. } => buffers.push(node.clone()),
                 Op::DefineVar { .. } => variables.push(node.clone()),
                 _ => {}
             }
         }
-        buffers.sort_by_key(|b| if let Op::DefineGlobal(id) = b.op() { *id } else { usize::MAX });
+        buffers.sort_by_key(|b| if let Op::Param { slot, device: None, .. } = b.op() { *slot } else { usize::MAX });
 
         let thread_info: Option<(Arc<UOp>, usize)> = nodes.iter().find_map(|n| {
             if let Op::Range { axis_type, end, .. } = n.op()
@@ -210,9 +205,9 @@ impl Renderer for MlirRenderer {
         let mut var_names: Vec<String> = Vec::new();
 
         for (i, buf) in buffers.iter().enumerate() {
-            if let Op::DefineGlobal(id) = buf.op() {
+            if let Op::Param { slot, device: None, .. } = buf.op() {
                 let is_output = is_output_buffer(buf, &nodes);
-                buffer_args.push(BufferArg { index: *id, name: format!("data{i}"), dtype: buf.dtype(), is_output });
+                buffer_args.push(BufferArg { index: *slot, name: format!("data{i}"), dtype: buf.dtype(), is_output });
             }
         }
         for var in &variables {
@@ -403,7 +398,7 @@ fn render_node<'c, 'a: 'c>(
     match node.op() {
         // Skip meta-ops and already-handled ops
         Op::Const(_)
-        | Op::DefineGlobal(_)
+        | Op::Param { device: None, .. }
         | Op::DefineLocal(_)
         | Op::DefineVar { .. }
         | Op::Noop
@@ -1021,23 +1016,6 @@ fn to_index<'c>(
     loc: Location<'c>,
 ) -> melior::ir::Value<'c, 'c> {
     block.append_operation(arith::index_cast(val, index_type, loc)).result(0).unwrap().into()
-}
-
-fn is_output_buffer(def_global: &Arc<UOp>, nodes: &[Arc<UOp>]) -> bool {
-    let buffer_id = def_global.id;
-    for node in nodes {
-        if let Some(buffer) = node.store_buffer() {
-            if buffer.id == buffer_id {
-                return true;
-            }
-            if let Op::Index { buffer: idx_buf, .. } = buffer.op()
-                && idx_buf.id == buffer_id
-            {
-                return true;
-            }
-        }
-    }
-    false
 }
 
 /// Public render function for the MLIR backend.

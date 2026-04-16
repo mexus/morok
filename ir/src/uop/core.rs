@@ -8,6 +8,7 @@ use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use bon::bon;
+use smallvec::SmallVec;
 
 use crate::op::Op;
 use crate::pattern::{Matcher, RewriteResult};
@@ -106,6 +107,7 @@ pub struct UOp {
     pub(crate) dtype: DType,
     /// Cached shape - computed lazily on first access.
     /// OnceLock provides thread-safe lazy initialization.
+    #[debug(skip)]
     pub(crate) shape_cache: std::sync::OnceLock<crate::Result<Option<shape::Shape>>>,
     /// Cached list of RANGE operations in this UOp's graph.
     /// Computed lazily via toposort to collect all RANGE ops.
@@ -121,6 +123,7 @@ pub struct UOp {
     /// Cached vmin/vmax range analysis values.
     /// Computed lazily via range propagation through the computation graph.
     /// Returns (vmin, vmax) as ConstValue types.
+    #[debug(skip)]
     pub(crate) vmin_vmax_cache: std::sync::OnceLock<(ConstValue, ConstValue)>,
     /// Sound vmin/vmax: `None` for ops where range analysis is unsound (LOAD, Pow, etc.).
     /// Used by patterns that must not act on unsound bounds (e.g., vmin_vmax_collapse).
@@ -134,6 +137,23 @@ pub struct UOp {
     /// O(1) membership test via `backward_slice_ids().contains(&target.id)`.
     #[debug(skip)]
     pub(crate) backward_slice_cache: std::sync::OnceLock<HashSet<u64>>,
+    /// Structural content hash — deterministic regardless of allocation order.
+    /// Computed at creation time: hash(op_discriminant, dtype, op_data, children_content_hashes).
+    /// O(1) per node since children are already created with their content_hash set.
+    /// Used for schedule-level caching where UOp IDs are not stable across runs.
+    pub content_hash: u64,
+    /// Tag for tracking tensor identity through the rangeify pipeline.
+    ///
+    /// Matches Tinygrad's `UOp.tag` (ops.py:128). Tags are tuples of integer indices
+    /// that track which original tensor UOps map to which final kernel outputs.
+    /// Tags participate in hash consing — different tag = different UOp.
+    ///
+    /// Values:
+    /// - `None` — untagged (default)
+    /// - `Some([])` — empty tag (e.g., RANGE ops)
+    /// - `Some([i])` — single index (assigned by add_tags)
+    /// - `Some([i, j, ...])` — merged indices (from buffer folding)
+    pub tag: Option<SmallVec<[usize; 2]>>,
     /// Optional metadata attached to this UOp.
     ///
     /// Metadata is NOT part of hash consing - attaching metadata creates a new UOp
@@ -168,6 +188,25 @@ impl UOp {
     /// Get the data type.
     pub fn dtype(&self) -> DType {
         self.dtype.clone()
+    }
+
+    /// Get the tag.
+    pub fn tag(&self) -> &Option<SmallVec<[usize; 2]>> {
+        &self.tag
+    }
+
+    /// Create a new UOp with the given tag (Tinygrad: `rtag()`).
+    /// Returns self unchanged if tag is already equal.
+    pub fn rtag(self: &Arc<Self>, tag: Option<SmallVec<[usize; 2]>>) -> Arc<Self> {
+        if self.tag == tag {
+            return self.clone();
+        }
+        Self::new_tagged(self.op.clone(), self.dtype.clone(), tag)
+    }
+
+    /// Create a new UOp with the given tag set.
+    pub fn with_tag(self: &Arc<Self>, tag: SmallVec<[usize; 2]>) -> Arc<Self> {
+        self.rtag(Some(tag))
     }
 
     /// Check if this UOp has a concrete buffer identity in the graph.
@@ -404,6 +443,14 @@ impl UOp {
                     None
                 }
             }
+            Op::Param { device: Some(device), .. } => {
+                if let Op::Device(spec) = device.op() {
+                    Some(spec.clone())
+                } else {
+                    None
+                }
+            }
+            Op::Param { device: None, .. } => None,
             Op::Copy { device, .. } => {
                 if let Op::Device(spec) = device.op() {
                     Some(spec.clone())
@@ -696,7 +743,7 @@ impl UOp {
     ///
     /// ```text
     /// [42] STORE : Void
-    /// ├── [10] DEFINE_GLOBAL(0) : Ptr<Float32> shape=[4]
+    /// ├── [10] PARAM(0) : Ptr<Float32> shape=[4]
     /// ├── [35] INDEX : Ptr<Float32> shape=[4]
     /// │   ├── [10] → (see above)
     /// │   └── [30] RANGE(0, Reduce) : Index
@@ -936,7 +983,6 @@ impl UOp {
             | Op::Device(_)
             | Op::Noop
             | Op::Invalid
-            | Op::DefineGlobal(_)
             | Op::DefineLocal(_)
             | Op::VConst { .. }
             | Op::DefineVar { .. }
@@ -987,6 +1033,15 @@ impl UOp {
             Op::Buffer { size, .. } => {
                 assert_eq!(new_srcs.len(), 2);
                 Op::Buffer { unique: src(0), device: src(1), size: *size }
+            }
+            Op::Param { slot, size, device } => {
+                if device.is_some() {
+                    assert_eq!(new_srcs.len(), 1);
+                    Op::Param { slot: *slot, size: *size, device: Some(src(0)) }
+                } else {
+                    assert_eq!(new_srcs.len(), 0);
+                    return self.clone();
+                }
             }
             Op::BufferView { size, offset, .. } => {
                 assert_eq!(new_srcs.len(), 1);
@@ -1193,9 +1248,8 @@ impl UOp {
             Op::Group { .. } => Op::Group { sources: new_srcs.iter().cloned().collect() },
         };
 
-        // Preserve original dtype like Tinygrad - dtype is explicitly set at creation
-        // If you need a different dtype, create a new UOp explicitly
-        Self::new(new_op, self.dtype.clone())
+        // Preserve original dtype and tag (Tinygrad ops.py:1256: preserves tag through source reconstruction)
+        Self::new_tagged(new_op, self.dtype.clone(), self.tag.clone())
     }
 }
 
@@ -1236,6 +1290,8 @@ impl Clone for UOp {
             id: self.id,
             op: self.op.clone(),
             dtype: self.dtype.clone(),
+            content_hash: self.content_hash,
+            tag: self.tag.clone(),
             shape_cache: std::sync::OnceLock::new(),
             ranges_cache: std::sync::OnceLock::new(),
             in_scope_ranges_cache: std::sync::OnceLock::new(),

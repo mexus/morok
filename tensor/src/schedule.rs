@@ -5,7 +5,7 @@
 //! the computation graph into KERNEL operations, we need to:
 //!
 //! 1. Extract kernel operations from the transformed graph
-//! 2. Allocate buffers for intermediate results (DEFINE_GLOBAL/DEFINE_LOCAL)
+//! 2. Allocate buffers for intermediate results (PARAM/DEFINE_LOCAL)
 //! 3. Execute kernels in dependency order
 //!
 //! The scheduling process converts from lazy tensor operations to
@@ -19,7 +19,6 @@ use morok_device::device::Device;
 use morok_device::registry;
 use morok_dtype::{DType, DeviceSpec};
 use morok_ir::{ConstValueHash, Op, UOp};
-use morok_schedule::rangeify::KernelContext;
 use tracing::{debug, trace};
 
 use crate::error::*;
@@ -80,11 +79,6 @@ pub struct ScheduleItem {
     /// After expansion, this will be empty and fixedvars will be populated.
     pub bound_ranges: Vec<BoundRange>,
 
-    /// Mapping from DEFINE_GLOBAL UOp ID to original BUFFER UOp (for input buffers).
-    /// This allows reusing existing buffers instead of allocating new ones.
-    /// Key: DEFINE_GLOBAL UOp ID, Value: original BUFFER UOp for looking up in buffer index.
-    pub source_buffers: HashMap<u64, Arc<UOp>>,
-
     /// KERNEL UOp IDs that must complete before this kernel can execute.
     /// Empty for kernels without dependencies (first in chain or independent).
     /// Dependencies are implicit in kernel ordering after topological sort.
@@ -98,6 +92,26 @@ pub struct ScheduleItem {
 
 /// Full execution schedule (list of kernels in dependency order).
 pub type Schedule = Vec<ScheduleItem>;
+
+/// Result of schedule creation, including output buffer identification.
+pub struct ScheduleResult {
+    /// The schedule items in dependency order.
+    pub items: Schedule,
+    /// UOp IDs of output buffers, in SINK source order.
+    /// Extracted directly from the SINK's sources via `buf_uop()`.
+    /// For single-tensor realize, contains one ID.
+    pub output_uop_ids: Vec<u64>,
+}
+
+/// Buffers collected for a single kernel.
+struct KernelBuffers {
+    /// Device buffers in codegen order.
+    buffers: Vec<Buffer>,
+    /// UOp IDs for each buffer.
+    uop_ids: Vec<u64>,
+    /// Additional alias IDs for cleanup.
+    alias_ids: Vec<u64>,
+}
 
 /// Sort kernels by dependencies (producers before consumers).
 ///
@@ -145,7 +159,7 @@ fn sort_kernels_by_dependencies(kernels: &[Arc<UOp>], root: &Arc<UOp>) -> Vec<Ar
             for src in sources {
                 // Get the buffer ID this source refers to
                 let buf_id = match src.op() {
-                    Op::Buffer { .. } | Op::DefineGlobal(_) => src.buf_uop().id,
+                    Op::Buffer { .. } | Op::Param { .. } => src.buf_uop().id,
                     Op::After { passthrough, .. } => passthrough.buf_uop().id,
                     _ => continue,
                 };
@@ -209,7 +223,6 @@ fn sort_kernels_by_dependencies(kernels: &[Arc<UOp>], root: &Arc<UOp>) -> Vec<Ar
 /// # Arguments
 ///
 /// * `transformed` - The UOp graph after rangeify + kernel splitting
-/// * `kernel_ctx` - The KernelContext from kernel splitting, containing buffer_map
 /// * `input_buffers` - Pre-collected input buffers (for RAII migration).
 ///   If a buffer is found here, it's used directly instead of registry lookup.
 ///
@@ -224,9 +237,9 @@ fn sort_kernels_by_dependencies(kernels: &[Arc<UOp>], root: &Arc<UOp>) -> Vec<Ar
 /// - Buffer not found in registry for a kernel source
 pub fn create_schedule(
     transformed: Arc<UOp>,
-    kernel_ctx: KernelContext,
     input_buffers: &InputBuffers,
-) -> Result<Schedule> {
+    var_vals: &HashMap<String, i64>,
+) -> Result<ScheduleResult> {
     // Step 1: Find all KERNEL operations
     let mut kernels = Vec::new();
     for node in transformed.toposort() {
@@ -247,35 +260,6 @@ pub fn create_schedule(
     // Track allocated intermediate buffers locally (no global registry needed)
     let mut allocated_buffers: HashMap<u64, Buffer> = HashMap::new();
 
-    // Step 2: Build reverse mapping from DEFINE_GLOBAL → original BUFFER/BUFFERIZE
-    // This allows us to reuse existing input buffers instead of allocating new ones.
-    // For outputs (BUFFERIZE), we don't have a pre-existing buffer, so we skip those.
-    let mut define_to_buffer: HashMap<u64, Arc<UOp>> = HashMap::new();
-    for (key, value) in &kernel_ctx.buffer_map {
-        // Unwrap AFTER if present (for output buffers)
-        let actual_value = match value.op() {
-            Op::After { passthrough, .. } => passthrough.clone(),
-            _ => value.clone(),
-        };
-
-        // If actual_value is DEFINE_GLOBAL, map it back to the original key
-        // BUT only if the key is a BUFFER (input), not BUFFERIZE (output)
-        if let Op::DefineGlobal(_) = actual_value.op()
-            && matches!(key.0.op(), Op::Buffer { .. })
-        {
-            // Input buffer - map DEFINE_GLOBAL → BUFFER for reuse
-            define_to_buffer.insert(actual_value.id, key.0.clone());
-        }
-        // For BUFFERIZE (output), we don't add to define_to_buffer
-        // This causes collect_kernel_buffers to allocate a new buffer
-    }
-
-    trace!(
-        define_to_buffer_entries = define_to_buffer.len(),
-        define_to_buffer_id_entries = kernel_ctx.define_to_buffer_id.len(),
-        "Buffer mappings"
-    );
-
     // Step 2: For each kernel, collect buffers from sources
     let mut schedule = Vec::new();
 
@@ -286,35 +270,13 @@ pub fn create_schedule(
         };
 
         // Step 3: Map sources to actual Buffers and extract bound ranges
-        // Sources can be:
-        // - DEFINE_GLOBAL(id) - intermediate buffer to allocate
-        // - DEFINE_LOCAL(id) - local/shared memory to allocate
-        // - BUFFER - input buffer from registry
-        // - DEFINE_VAR - variable binding for OUTER ranges
+        // Sources are Buffer/Param/After nodes.
+        let kb = collect_kernel_buffers(sources, &kernel_uop, input_buffers, &mut allocated_buffers)?;
 
-        // Collect and allocate all buffers for this kernel
-        // Buffers are allocated ONCE here, then reused across all iterations
-        let (buffers, buffer_uop_ids, alias_registered_ids) = collect_kernel_buffers(
-            sources,
-            &kernel_uop,
-            &define_to_buffer,
-            &kernel_ctx.define_to_buffer_id,
-            input_buffers,
-            &mut allocated_buffers,
-        )?;
-
-        // Collect bound ranges from kernel AST (BIND nodes with DEFINE_VAR)
-        let bound_ranges = collect_bound_ranges(inner_ast)?;
-
-        // Build source_buffers mapping for this kernel
-        let mut source_buffers = HashMap::new();
-        for src in sources {
-            if let Op::DefineGlobal(_) = src.op()
-                && let Some(original_buffer) = define_to_buffer.get(&src.id)
-            {
-                source_buffers.insert(src.id, original_buffer.clone());
-            }
-        }
+        // Collect bound ranges from kernel AST (DEFINE_VAR nodes needing expansion).
+        // Skip DefineVars that have bound values in var_vals — those are user Variables,
+        // not OUTER ranges needing schedule expansion.
+        let bound_ranges = collect_bound_ranges(inner_ast, var_vals)?;
 
         // Dependencies are now implicit in kernel ordering (sorted by sort_kernels_by_dependencies).
         // For explicit dependency tracking, we could extract from sources, but since
@@ -323,21 +285,48 @@ pub fn create_schedule(
 
         debug!(kernel.id = kernel_uop.id, num_sources = sources.len(), "Kernel created");
 
+        // Populate fixedvars with only the user Variables referenced by this kernel's AST.
+        let fixedvars: HashMap<String, i64> = if var_vals.is_empty() {
+            HashMap::new()
+        } else {
+            let nodes = inner_ast.toposort();
+            let ast_var_names: HashSet<&str> = nodes
+                .iter()
+                .filter_map(|n| match n.op() {
+                    Op::DefineVar { name, .. } => Some(name.as_str()),
+                    _ => None,
+                })
+                .collect();
+            var_vals
+                .iter()
+                .filter(|(name, _)| ast_var_names.contains(name.as_str()))
+                .map(|(k, v)| (k.clone(), *v))
+                .collect()
+        };
+
         // Use inner_ast (the kernel's internal AST) for codegen, kernel_uop for buffer allocation
         schedule.push(ScheduleItem {
             kernel: kernel_uop.clone(),
             ast: inner_ast.clone(),
-            buffers,
-            buffer_uop_ids,
-            fixedvars: HashMap::new(),
+            buffers: kb.buffers,
+            buffer_uop_ids: kb.uop_ids,
+            fixedvars,
             bound_ranges,
-            source_buffers,
             dependencies,
-            alias_registered_ids,
+            alias_registered_ids: kb.alias_ids,
         });
     }
 
-    Ok(schedule)
+    // Identify output buffers directly from SINK source order.
+    // Each SINK source is AFTER(BUFFER, KERNEL) — buf_uop() extracts the BUFFER.
+    // This handles diamond patterns correctly: a buffer can be both an output
+    // AND consumed by another kernel without being filtered out.
+    let output_uop_ids: Vec<u64> = match transformed.op() {
+        Op::Sink { sources } => sources.iter().map(|src| src.buf_uop().id).collect(),
+        _ => vec![transformed.buf_uop().id],
+    };
+
+    Ok(ScheduleResult { items: schedule, output_uop_ids })
 }
 
 /// Extract device from the first input buffer in kernel sources.
@@ -348,8 +337,6 @@ pub fn create_schedule(
 /// Falls back to CPU if no input buffers are found.
 fn find_first_input_buffer_device(
     sources: &[Arc<UOp>],
-    define_to_buffer: &HashMap<u64, Arc<UOp>>,
-    define_to_buffer_id: &HashMap<u64, u64>,
     input_buffers: &InputBuffers,
     allocated_buffers: &HashMap<u64, Buffer>,
 ) -> Result<Arc<Device>> {
@@ -357,44 +344,14 @@ fn find_first_input_buffer_device(
 
     for src in sources {
         match src.op() {
-            // Direct input buffer
-            Op::Buffer { .. } => {
-                // Try allocated_buffers, then input_buffers (no registry needed)
+            // Direct input buffer (BUFFER or PARAM)
+            Op::Buffer { .. } | Op::Param { .. } => {
                 let buffer = allocated_buffers.get(&src.id).cloned().or_else(|| input_buffers.get(&src.id).cloned());
                 if let Some(buffer) = buffer {
                     let device_spec = buffer.allocator().device_spec();
                     return morok_runtime::DEVICE_FACTORIES
                         .device(&device_spec, alloc_registry)
                         .context(DeviceFactorySnafu);
-                }
-            }
-            // DEFINE_GLOBAL that maps to an input buffer
-            Op::DefineGlobal(_) => {
-                // Try direct lookup via define_to_buffer
-                if let Some(original_buffer) = define_to_buffer.get(&src.id) {
-                    let buffer = allocated_buffers
-                        .get(&original_buffer.id)
-                        .cloned()
-                        .or_else(|| input_buffers.get(&original_buffer.id).cloned());
-                    if let Some(buffer) = buffer {
-                        let device_spec = buffer.allocator().device_spec();
-                        return morok_runtime::DEVICE_FACTORIES
-                            .device(&device_spec, alloc_registry)
-                            .context(DeviceFactorySnafu);
-                    }
-                }
-                // Try via define_to_buffer_id mapping
-                if let Some(&original_buffer_id) = define_to_buffer_id.get(&src.id) {
-                    let buffer = allocated_buffers
-                        .get(&original_buffer_id)
-                        .cloned()
-                        .or_else(|| input_buffers.get(&original_buffer_id).cloned());
-                    if let Some(buffer) = buffer {
-                        let device_spec = buffer.allocator().device_spec();
-                        return morok_runtime::DEVICE_FACTORIES
-                            .device(&device_spec, alloc_registry)
-                            .context(DeviceFactorySnafu);
-                    }
                 }
             }
             // AFTER node - get device from the passthrough buffer
@@ -420,10 +377,10 @@ fn find_first_input_buffer_device(
 ///
 /// This walks the kernel sources and identifies:
 /// - Input buffers (Op::Buffer) - get from input_buffers
-/// - Intermediate buffers (Op::DefineGlobal, Op::DefineLocal) - allocate and track
+/// - Intermediate buffers (Op::Param) - allocate and track
 /// - Shared buffers (Op::After) - look up from allocated_buffers (producer kernel)
 ///
-/// For input buffers (DEFINE_GLOBAL that maps to an original BUFFER),
+/// For input buffers (PARAM that maps to an original BUFFER),
 /// we reuse the existing buffer from input_buffers instead of allocating.
 ///
 /// For shared buffers (AFTER nodes), we look up the buffer using buf_uop()
@@ -431,15 +388,12 @@ fn find_first_input_buffer_device(
 ///
 /// Output/intermediate buffers are allocated on the same device as the first input buffer
 /// (following Tinygrad's pattern). Newly allocated buffers are tracked in `allocated_buffers`.
-#[allow(clippy::too_many_arguments)]
 fn collect_kernel_buffers(
     sources: &[Arc<UOp>],
     kernel: &Arc<UOp>,
-    define_to_buffer: &HashMap<u64, Arc<UOp>>,
-    define_to_buffer_id: &HashMap<u64, u64>,
     input_buffers: &InputBuffers,
     allocated_buffers: &mut HashMap<u64, Buffer>,
-) -> Result<(Vec<Buffer>, Vec<u64>, Vec<u64>)> {
+) -> Result<KernelBuffers> {
     // Get AST for buffer size computation
     let ast = match kernel.op() {
         Op::Kernel { ast, .. } => ast,
@@ -449,17 +403,11 @@ fn collect_kernel_buffers(
     };
 
     // Get target device from first input buffer (Tinygrad pattern: ctx[0].device)
-    let target_device = find_first_input_buffer_device(
-        sources,
-        define_to_buffer,
-        define_to_buffer_id,
-        input_buffers,
-        allocated_buffers,
-    )?;
+    let target_device = find_first_input_buffer_device(sources, input_buffers, allocated_buffers)?;
 
     let mut buffers = Vec::new();
     let mut uop_ids = Vec::new();
-    let alias_ids = Vec::new(); // No longer populated after removing renumbering logic
+    let alias_ids = Vec::new();
 
     for src in sources {
         match src.op() {
@@ -488,80 +436,7 @@ fn collect_kernel_buffers(
                     return Err(Error::BufferNotFound { uop_id: buf_id });
                 }
             }
-            Op::DefineGlobal(_id) => {
-                // Check if this DEFINE_GLOBAL maps to an original BUFFER (input buffer)
-                let lookup_result = define_to_buffer.get(&src.id);
-
-                if let Some(original_buffer) = lookup_result {
-                    trace!(src.id = src.id, original_buffer.id = original_buffer.id, "input buffer (reusing existing)");
-                    // This is an input buffer - get from input_buffers
-                    if let Some(buffer) = input_buffers.get(&original_buffer.id).cloned() {
-                        // Also track under the DEFINE_GLOBAL's ID for later lookups
-                        allocated_buffers.insert(src.id, buffer.clone());
-                        buffers.push(buffer);
-                        uop_ids.push(src.id);
-                    } else {
-                        return Err(Error::BufferNotFound { uop_id: original_buffer.id });
-                    }
-                } else {
-                    // Try define_to_buffer_id mapping (tracks all DefineGlobal → BUFFER id)
-                    let buffer_id_via_mapping = define_to_buffer_id.get(&src.id);
-
-                    if let Some(&original_buffer_id) = buffer_id_via_mapping
-                        && let Some(buffer) = input_buffers.get(&original_buffer_id).cloned()
-                    {
-                        trace!(
-                            src.id = src.id,
-                            original_buffer_id,
-                            buffer.id = ?buffer.id(),
-                            "Input buffer via define_to_buffer_id"
-                        );
-                        // Also track under the DEFINE_GLOBAL's ID for later lookups
-                        allocated_buffers.insert(src.id, buffer.clone());
-                        buffers.push(buffer);
-                        uop_ids.push(src.id);
-                        continue;
-                    }
-
-                    // Check if buffer already exists in allocated_buffers (shared from another kernel)
-                    if let Some(existing) = allocated_buffers.get(&src.id).cloned() {
-                        trace!(
-                            src.id = src.id,
-                            buffer.id = ?existing.id(),
-                            "Shared buffer from allocated_buffers"
-                        );
-                        buffers.push(existing);
-                        uop_ids.push(src.id);
-                        continue;
-                    }
-
-                    trace!(src.id = src.id, "creating output/intermediate buffer");
-                    // This is an output/intermediate buffer - allocate on the same device as input
-                    let ptr_dtype = src.dtype();
-                    let size = compute_buffer_size(ast, src)?;
-
-                    // Extract the base scalar dtype from the Ptr type
-                    let scalar_dtype = match ptr_dtype {
-                        morok_dtype::DType::Ptr { base, .. } => *base,
-                        other => {
-                            return ExpectedPtrDtypeSnafu { context: "DEFINE_GLOBAL", actual: other.clone() }.fail();
-                        }
-                    };
-
-                    let buffer = Buffer::new(
-                        target_device.allocator.clone(),
-                        scalar_dtype.clone(),
-                        vec![size],
-                        Default::default(),
-                    );
-
-                    // Track in allocated_buffers (no registry needed)
-                    allocated_buffers.insert(src.id, buffer.clone());
-
-                    buffers.push(buffer);
-                    uop_ids.push(src.id);
-                }
-            }
+            // Kernel sources are always Buffer/Param/After.
             Op::DefineLocal(_id) => {
                 // Allocate local/shared memory buffer on same device as inputs
                 let ptr_dtype = src.dtype();
@@ -584,8 +459,8 @@ fn collect_kernel_buffers(
                 buffers.push(buffer);
                 uop_ids.push(src.id);
             }
-            Op::Buffer { size, .. } => {
-                // BUFFER can be either input (from input_buffers) or output (needs allocation)
+            Op::Buffer { size, .. } | Op::Param { size, .. } => {
+                // BUFFER/PARAM can be either input (from input_buffers) or output (needs allocation)
                 // Try input_buffers first, then allocated_buffers, then allocate new
                 if let Some(buffer) = input_buffers.get(&src.id).cloned() {
                     buffers.push(buffer);
@@ -595,7 +470,7 @@ fn collect_kernel_buffers(
                     uop_ids.push(src.id);
                 } else {
                     // Output buffer - allocate new buffer
-                    trace!(src.id = src.id, size, "Allocating output BUFFER");
+                    trace!(src.id = src.id, size, "Allocating output BUFFER/PARAM");
                     let scalar_dtype = src.dtype();
 
                     let buffer = Buffer::new(
@@ -607,7 +482,6 @@ fn collect_kernel_buffers(
 
                     // Track in allocated_buffers
                     allocated_buffers.insert(src.id, buffer.clone());
-
                     buffers.push(buffer);
                     uop_ids.push(src.id);
                 }
@@ -623,7 +497,7 @@ fn collect_kernel_buffers(
         }
     }
 
-    Ok((buffers, uop_ids, alias_ids))
+    Ok(KernelBuffers { buffers, uop_ids, alias_ids })
 }
 
 /// Collect bound ranges from kernel AST.
@@ -640,25 +514,27 @@ fn collect_kernel_buffers(
 /// # Returns
 ///
 /// A vector of BoundRange structs, one for each DefineVar found.
-fn collect_bound_ranges(ast: &Arc<UOp>) -> Result<Vec<BoundRange>> {
+fn collect_bound_ranges(ast: &Arc<UOp>, var_vals: &HashMap<String, i64>) -> Result<Vec<BoundRange>> {
     let nodes = ast.toposort();
     let mut bound_ranges = Vec::new();
 
-    // Collect all DefineVar nodes - they need schedule expansion
-    // (Loop ranges no longer create DefineVars - they become inline loops)
+    // Collect DefineVar nodes that need schedule expansion (OUTER ranges).
+    // Skip DefineVars that have a bound value in var_vals — those are user Variables
+    // whose value goes directly to fixedvars, not range expansion.
     for node in &nodes {
         if let Op::DefineVar { name, max_val, .. } = node.op() {
-            // Create a synthetic RANGE UOp for this variable
-            // Range goes from 0 to max_val+1 (exclusive upper bound)
+            // If this variable has a concrete bound value, it's a user Variable.
+            // Its value is already in fixedvars — no schedule expansion needed.
+            if var_vals.contains_key(name) {
+                continue;
+            }
+
+            // OUTER range variable — expand from 0 to max_val
             let range_end = UOp::const_(
                 morok_ir::DType::Scalar(morok_dtype::ScalarDType::Index),
                 morok_ir::ConstValue::Int(*max_val + 1),
             );
-            let range_uop = UOp::range_axis(
-                range_end,
-                morok_ir::AxisId::Renumbered(0), // Dummy axis ID
-                morok_ir::AxisType::Outer,
-            );
+            let range_uop = UOp::range_axis(range_end, morok_ir::AxisId::Renumbered(0), morok_ir::AxisType::Outer);
 
             bound_ranges.push(BoundRange { var_name: name.clone(), range_uop });
         }
@@ -730,7 +606,6 @@ pub fn expand_schedule(schedule: Schedule) -> Schedule {
                     buffer_uop_ids: item.buffer_uop_ids.clone(),
                     fixedvars,
                     bound_ranges: vec![], // Expanded items have no bound ranges
-                    source_buffers: item.source_buffers.clone(),
                     dependencies: item.dependencies.clone(),
                     alias_registered_ids: item.alias_registered_ids.clone(),
                 });
@@ -840,7 +715,6 @@ mod tests {
             buffer_uop_ids: vec![],
             fixedvars: HashMap::new(),
             bound_ranges: vec![],
-            source_buffers: HashMap::new(),
             dependencies: vec![],
             alias_registered_ids: vec![],
         };

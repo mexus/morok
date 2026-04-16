@@ -1,21 +1,10 @@
-//! Devectorize pass for contiguous memory access optimization.
+//! Devectorize pass — single-pass combined matcher matching Tinygrad's `pm_devectorize`.
 //!
-//! Transforms vectorized INDEX into grouped consecutive accesses (PTRCAT) after expansion.
+//! Composition: `sym + devectorize + load_store_folding + correct_load_store + load_store_indexing`
 //!
-//! # Multi-Pass Architecture
-//!
-//! The devectorize pass uses a multi-pass architecture to ensure pattern dependencies
-//! are respected by the bottom-up rewrite engine:
-//!
-//! - **Phase 1**: Devectorize ALU/WMMA/buffers + expand vector INDEX → GEP(PTRCAT)
-//! - **Phase 2**: Move GEP through LOAD/STORE → creates LOAD(PTRCAT) from LOAD(GEP(PTRCAT))
-//! - **Phase 3**: Distribute PTRCAT through LOAD/STORE → LOAD(PTRCAT) → CAT(LOADs)
-//! - **Phase 4**: Split loads/stores by device fold lengths + drop true gates
-//!
-//! This separation is necessary because the bottom-up rewrite engine processes children
-//! first, then does fixed-point matching on the result. When `move_gep_after_load`
-//! transforms `LOAD(GEP(PTRCAT))` to `GEP(LOAD(PTRCAT))`, the inner `LOAD(PTRCAT)` needs
-//! to be matched by `distribute_ptrcat_load` in a subsequent pass.
+//! All patterns run in one `graph_rewrite` call with fixed-point convergence.
+//! PtrCat is an intermediate created by `fold_expanded_index` and eliminated by
+//! `distribute_ptrcat_load/store` within the same pass. It must never reach codegen.
 //!
 //! # pm_render (called AFTER devectorize)
 //!
@@ -26,6 +15,7 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::sync::LazyLock;
 
 use itertools::Itertools;
 use morok_dtype::{AddrSpace, DType, ScalarDType};
@@ -128,7 +118,7 @@ pub fn merge_sibling_ends(sink: &Arc<UOp>) -> Arc<UOp> {
 }
 
 use crate::rewrite::graph_rewrite;
-use crate::symbolic::patterns::{gep_pushing_patterns, symbolic, symbolic_simple};
+use crate::symbolic::patterns::sym;
 
 // ============================================================================
 // Main Entry Point
@@ -136,35 +126,16 @@ use crate::symbolic::patterns::{gep_pushing_patterns, symbolic, symbolic_simple}
 
 /// Run devectorize pass. Call AFTER `pre_expand`, BEFORE codegen.
 ///
-/// Uses multi-pass architecture to ensure pattern dependencies are respected:
-/// - Phase 1: Devectorize ALU/WMMA/buffers + expand vector INDEX → GEP(PTRCAT)
-/// - Phase 2: Move GEP through LOAD/STORE (creates LOAD(PTRCAT) from LOAD(GEP(PTRCAT)))
-/// - Phase 3: Distribute PTRCAT through LOAD/STORE (LOAD(PTRCAT) → CAT(LOADs))
-/// - Phase 4: Split loads/stores by device fold lengths + drop true gates
+/// Single-pass combined matcher (Tinygrad `pm_devectorize`):
+/// sym + devectorize + load_store_folding + correct_load_store + load_store_indexing
 ///
 /// Note: `bool_storage_patterns()` called separately (backend-specific).
 /// Note: `pm_render()` should be applied AFTER this pass.
 pub fn devectorize(ast: &Arc<UOp>) -> Arc<UOp> {
-    use std::sync::LazyLock;
-
-    // Single combined pass: devectorize + GEP movement + load/store fixup.
-    // Tinygrad uses one pass (sym + devectorize + load_store_folding + ...).
-    // The rewrite engine's fixed-point iteration handles pattern ordering.
-    //
-    // Uses symbolic_simple() instead of symbolic() for performance:
-    // symbolic() adds vmin_vmax_collapse, pm_simplify_valid, etc. which are
-    // expensive on large devectorized trees (10K+ nodes) but rarely productive.
-    // The full symbolic() already ran in post-opt; devectorize only needs basic
-    // algebraic simplification + gep_pushing for the newly expanded scalar ops.
     static COMBINED: LazyLock<TypedPatternMatcher> = LazyLock::new(|| {
-        symbolic_simple()
-            + gep_pushing_patterns()
+        sym()
             + devectorize_patterns()
-            + expand_index_patterns()
-            + gep_simplification_patterns()
-            + gep_movement_patterns()
-            + ptrcat_distribution_patterns()
-            + contiguous_gep_load_patterns()
+            + load_store_folding_patterns()
             + correct_load_store_patterns()
             + load_store_indexing_patterns()
     });
@@ -353,7 +324,7 @@ pub fn pm_float_decomp() -> crate::TypedPatternMatcher<Fp8DecompCtx> {
         @context Fp8DecompCtx;
 
         // Pattern 1: INDEX/DEFINE with FP8 ptr base → change ptr to UInt8
-        x if matches!(x.op(), Op::DefineGlobal(_) | Op::DefineLocal(_) | Op::Index { .. })
+        x if matches!(x.op(), Op::Param { device: None, .. } | Op::DefineLocal(_) | Op::Index { .. })
             && x.dtype().base() == ctx.from
         => {
             let uint8_ptr = x.dtype().with_ptr_base(DType::Scalar(ctx.from.float_to_uint()))?;
@@ -477,12 +448,15 @@ pub fn pm_render() -> &'static TypedPatternMatcher {
             Some(UOp::load().buffer(load.load_buffer()?).index(index.clone()).alt(alt_value).dtype(load.dtype()).call())
         },
 
-        // WHERE(c, LOAD(INDEX(buf, idx, c)), alt) → LOAD with alt value (devectorizer.py:271-272)
-        // The load's gate matches the WHERE condition
-        Where(cond, load @ Load { index, alt: None, .. }, alt)
+        // WHERE(c, LOAD(INDEX(buf, idx, c)), alt) → LOAD with alt value (devectorizer.py:289-291)
+        // The load's gate matches the WHERE condition.
+        // Matches Tinygrad's allow_any_len=True (no alt: None guard).
+        // NOTE: if alt is CAST and alt.src.dtype == load.dtype, use alt.src to avoid
+        // roundtrip cast (e.g. uint->float->uint).
+        Where(cond, load @ Load { index, .. }, alt)
             if index_has_gate_matching(index, cond)
             => |cond, load, index, alt| {
-                let casted_alt = alt.cast(load.dtype());
+                let casted_alt = cast_alt_avoiding_roundtrip(alt, &load.dtype());
                 let new_load = UOp::load()
                     .buffer(load.load_buffer()?)
                     .index(index.clone())
@@ -492,12 +466,13 @@ pub fn pm_render() -> &'static TypedPatternMatcher {
                 Some(new_load.cast(alt.dtype()))
             },
 
-        // WHERE(c, alt, LOAD(INDEX(buf, idx, !c))) → LOAD with alt value (devectorizer.py:273-274)
-        // Same pattern but with inverted condition in WHERE
-        Where(cond, alt, load @ Load { index, alt: None, .. })
+        // WHERE(c, alt, LOAD(INDEX(buf, idx, !c))) → LOAD with alt value (devectorizer.py:292-294)
+        // Same pattern but with inverted condition in WHERE.
+        // is_negation_of handles NOT(cond) and pm_comparison_negations simplified forms.
+        Where(cond, alt, load @ Load { index, .. })
             if index_has_inverted_gate_matching(index, cond)
             => |cond, alt, load, index| {
-                let casted_alt = alt.cast(load.dtype());
+                let casted_alt = cast_alt_avoiding_roundtrip(alt, &load.dtype());
                 let new_load = UOp::load()
                     .buffer(load.load_buffer()?)
                     .index(index.clone())
@@ -507,6 +482,18 @@ pub fn pm_render() -> &'static TypedPatternMatcher {
                 Some(new_load.cast(alt.dtype()))
             },
     }
+}
+
+/// Cast alt value to load dtype, avoiding roundtrip casts (devectorizer.py:290).
+/// If alt is CAST(inner) and inner.dtype == load_dtype, use inner directly
+/// to avoid e.g. uint→float→uint.
+fn cast_alt_avoiding_roundtrip(alt: &Arc<UOp>, load_dtype: &DType) -> Arc<UOp> {
+    if let Op::Cast { src: inner, .. } = alt.op()
+        && inner.dtype() == *load_dtype
+    {
+        return inner.clone();
+    }
+    alt.cast(load_dtype.clone())
 }
 
 /// Check if GEP is identity: GEP(x, [0,1,...,n-1]) where n == x.vcount
@@ -534,14 +521,60 @@ fn index_has_gate_matching(index: &Arc<UOp>, cond: &Arc<UOp>) -> bool {
 }
 
 /// Check if index has an inverted gate that matches the given condition.
-/// Matches INDEX(..., NOT(cond)) where cond is the WHERE condition.
+///
+/// Matches INDEX gate that is semantically NOT(cond). Handles three forms:
+/// 1. `NOT(cond)` — structural NOT, pointer-equal inner
+/// 2. `Lt(c-1, x)` when cond = `Lt(x, c)` — result of pm_comparison_negations on NOT(Lt(x,c))
+/// 3. `Lt(x, c+1)` when cond = `Lt(c, x)` — result of pm_comparison_negations on NOT(Lt(c,x))
+///
+/// Form 2/3 arise because dce_dsl_patterns swaps WHERE(NOT(Lt), t, f) → WHERE(Lt, f, t),
+/// then pm_comparison_negations converts the NOT(Lt) on the INDEX gate to a reversed Lt.
 fn index_has_inverted_gate_matching(index: &Arc<UOp>, cond: &Arc<UOp>) -> bool {
     match index.op() {
-        Op::Index { gate: Some(g), .. } => {
-            // Check if gate is NOT(cond)
-            if let Op::Unary(UnaryOp::Not, inner) = g.op() { Arc::ptr_eq(inner, cond) } else { false }
-        }
+        Op::Index { gate: Some(g), .. } => is_negation_of(g, cond),
         Op::Cast { src, .. } => index_has_inverted_gate_matching(src, cond),
+        _ => false,
+    }
+}
+
+/// Check if `gate` is semantically NOT(cond).
+fn is_negation_of(gate: &Arc<UOp>, cond: &Arc<UOp>) -> bool {
+    // Form 1: NOT(cond) — structural
+    if let Op::Unary(UnaryOp::Not, inner) = gate.op()
+        && Arc::ptr_eq(inner, cond)
+    {
+        return true;
+    }
+
+    // Form 2: gate = Lt(c-1, x), cond = Lt(x, c) — from pm_comparison_negations on NOT(Lt(x,c))
+    // Form 3: gate = Lt(x, c+1), cond = Lt(c, x) — from pm_comparison_negations on NOT(Lt(c,x))
+    if let Op::Binary(BinaryOp::Lt, gate_lhs, gate_rhs) = gate.op()
+        && let Op::Binary(BinaryOp::Lt, cond_lhs, cond_rhs) = cond.op()
+    {
+        // Form 2: gate_rhs == cond_lhs (same x), gate_lhs == c-1 where cond_rhs == c
+        if Arc::ptr_eq(gate_rhs, cond_lhs)
+            && let (Op::Const(gate_cv), Op::Const(cond_cv)) = (gate_lhs.op(), cond_rhs.op())
+            && is_const_minus_one(&cond_cv.0, &gate_cv.0)
+        {
+            return true;
+        }
+        // Form 3: gate_lhs == cond_rhs (same x), gate_rhs == c+1 where cond_lhs == c
+        if Arc::ptr_eq(gate_lhs, cond_rhs)
+            && let (Op::Const(cond_cv), Op::Const(gate_cv)) = (cond_lhs.op(), gate_rhs.op())
+            && is_const_minus_one(&cond_cv.0, &gate_cv.0)
+        {
+            return true;
+        }
+    }
+
+    false
+}
+
+/// Check if `a - 1 == b` (i.e., b = a - 1).
+fn is_const_minus_one(a: &ConstValue, b: &ConstValue) -> bool {
+    match (a, b) {
+        (ConstValue::Int(av), ConstValue::Int(bv)) => av.checked_sub(1) == Some(*bv),
+        (ConstValue::UInt(av), ConstValue::UInt(bv)) => av.checked_sub(1) == Some(*bv),
         _ => false,
     }
 }
@@ -699,6 +732,11 @@ fn cast_after_pattern() -> &'static TypedPatternMatcher {
 }
 
 /// LOCAL/REG buffer devectorization (devectorizer.py:241-248).
+///
+/// Extended beyond Tinygrad: handles vector indices (not just scalar) by expanding
+/// each index lane separately. Tinygrad asserts `idx.dtype.count == 1` which would
+/// crash on local buffers with vector indices from UPCAST — Morok's optimizer can
+/// produce such kernels (e.g., u3u3 upcast on matmul with local buffers).
 fn devectorize_buf_and_index_patterns() -> &'static TypedPatternMatcher {
     crate::cached_patterns! {
         // DEFINE_LOCAL/REG with vector pointer → scalar pointer + CAST
@@ -706,14 +744,15 @@ fn devectorize_buf_and_index_patterns() -> &'static TypedPatternMatcher {
             && def.ptrdtype().is_some_and(|(base, _, _)| base.vcount() > 1)
             => no_vectorized_buf(def),
 
-        // INDEX(CAST(DEFINE_LOCAL/REG), scalar_idx) → scaled vector index
+        // INDEX(CAST(DEFINE_LOCAL/REG), idx) → scaled vector index
+        // Handles both scalar and vector idx (Tinygrad only handles scalar).
         Index { buffer: Cast { src: buf, dtype: cast_dtype }, indices, gate }
-            if is_scalar_index(indices) && is_vectorized_local_reg_cast(buf, cast_dtype)
+            if is_vectorized_local_reg_cast(buf, cast_dtype)
             => no_vectorized_index(buf, indices, gate, cast_dtype),
 
-        // INDEX(BROADCAST(CAST(...)), scalar_idx)
+        // INDEX(BROADCAST(CAST(...)), idx)
         Index { buffer: Vectorize { elements }, indices, gate }
-            if is_scalar_index(indices) && is_vectorized_broadcast_cast(elements)
+            if is_vectorized_broadcast_cast(elements)
             => {
                 let first = elements.first()?;
                 let Op::Cast { src: buf, dtype: DType::Ptr { base, .. } } = first.op() else { return None };
@@ -721,19 +760,15 @@ fn devectorize_buf_and_index_patterns() -> &'static TypedPatternMatcher {
                 no_vectorized_index_precnt(buf, idx, gate, base.vcount(), &vec![0; elements.len()])
             },
 
-        // INDEX(GEP(CAST(...)), scalar_idx)
+        // INDEX(GEP(CAST(...)), idx)
         Index { buffer: Gep { vector: Cast { src: buf, dtype: cast_dtype }, indices: gep_indices }, indices, gate }
-            if is_scalar_index(indices) && is_vectorized_local_reg_cast(buf, cast_dtype)
+            if is_vectorized_local_reg_cast(buf, cast_dtype)
             => {
                 let DType::Ptr { base, .. } = cast_dtype else { return None };
                 let idx = indices.first()?;
                 no_vectorized_index_precnt(buf, idx, gate, base.vcount(), gep_indices)
             },
     }
-}
-
-fn is_scalar_index(indices: &SmallVec<[Arc<UOp>; 4]>) -> bool {
-    indices.first().is_some_and(|idx| idx.dtype().vcount() == 1)
 }
 
 fn is_vectorized_local_reg_cast(buf: &Arc<UOp>, cast_dtype: &DType) -> bool {
@@ -769,7 +804,11 @@ fn no_vectorized_buf(buf: &Arc<UOp>) -> Option<Arc<UOp>> {
     Some(scalar_def.cast(buf.dtype()))
 }
 
-/// INDEX(CAST(buf), scalar_idx) → INDEX(VECTORIZE([buf,...]), scaled_vec_idx) (devectorizer.py:228-231)
+/// INDEX(CAST(buf), idx) → INDEX(VECTORIZE([buf,...]), scaled_vec_idx) (devectorizer.py:228-231)
+///
+/// Handles both scalar idx (original Tinygrad path) and vector idx (Morok extension).
+/// For vector idx with vcount=V and pointer vcount=cnt, produces total = V*cnt lanes:
+///   for each lane i in idx: idx[i]*cnt + [0, 1, ..., cnt-1]
 fn no_vectorized_index(
     buf: &Arc<UOp>,
     indices: &SmallVec<[Arc<UOp>; 4]>,
@@ -783,17 +822,53 @@ fn no_vectorized_index(
         return None;
     }
 
-    let buf_broadcast = buf.broadcast(cnt);
-    let idx_broadcast = idx.broadcast(cnt);
-    let offset_vec = create_index_vector(0..cnt as i64);
-    let cnt_broadcast = idx.const_like(cnt as i64).broadcast(cnt);
-    let final_idx = idx_broadcast.mul(&cnt_broadcast).add(&offset_vec);
+    let idx_vcount = idx.dtype().vcount();
+    let total = cnt * idx_vcount;
+    let buf_broadcast = buf.broadcast(total);
+
+    let final_idx = if idx_vcount == 1 {
+        // Scalar path (original Tinygrad logic)
+        let idx_broadcast = idx.broadcast(cnt);
+        let cnt_broadcast = idx.const_like(cnt as i64).broadcast(cnt);
+        idx_broadcast.mul(&cnt_broadcast).add(&create_index_vector(0..cnt as i64))
+    } else {
+        // Vector path: expand each lane by cnt elements
+        // idx = [a, b, c], cnt = 3 → [a*3+0, a*3+1, a*3+2, b*3+0, b*3+1, b*3+2, c*3+0, c*3+1, c*3+2]
+        let elements: SmallVec<[Arc<UOp>; 4]> = (0..idx_vcount)
+            .flat_map(|i| {
+                let lane = idx.gep(vec![i]);
+                let cnt_const = UOp::const_(lane.dtype(), ConstValue::Int(cnt as i64));
+                let scaled = lane.mul(&cnt_const);
+                (0..cnt).map(move |j| scaled.add(&UOp::const_(scaled.dtype(), ConstValue::Int(j as i64))))
+            })
+            .collect();
+        UOp::vectorize(elements)
+    };
+
+    // Expand gate to match total lanes if it's vectorized
+    let expanded_gate = if idx_vcount > 1 {
+        gate.as_ref().map(|g| {
+            if g.dtype().vcount() > 1 {
+                let elements: SmallVec<[Arc<UOp>; 4]> = (0..idx_vcount)
+                    .flat_map(|i| {
+                        let lane = g.gep(vec![i]);
+                        std::iter::repeat_n(lane, cnt)
+                    })
+                    .collect();
+                UOp::vectorize(elements)
+            } else {
+                g.broadcast(total)
+            }
+        })
+    } else {
+        gate.clone()
+    };
 
     Some(
         UOp::index()
             .buffer(buf_broadcast)
             .indices(vec![final_idx])
-            .maybe_gate(gate.clone())
+            .maybe_gate(expanded_gate)
             .ptr(true)
             .call()
             .expect("ICE unable to create index"),
@@ -806,6 +881,9 @@ fn create_index_vector(values: impl IntoIterator<Item = i64>) -> Arc<UOp> {
 }
 
 /// INDEX with precnt multiplier (broadcast or gep case) (devectorizer.py:233-239)
+///
+/// Handles both scalar and vector idx. For vector idx, each lane is expanded
+/// independently with the same precnt/cnt scaling.
 fn no_vectorized_index_precnt(
     buf: &Arc<UOp>,
     idx: &Arc<UOp>,
@@ -814,23 +892,70 @@ fn no_vectorized_index_precnt(
     input_gep: &[usize],
 ) -> Option<Arc<UOp>> {
     let precnt = input_gep.len();
-    let total = cnt * precnt;
-    let gep_arg: Vec<usize> = (0..cnt).flat_map(|_| 0..precnt).collect();
-    let sum_arg = (0..cnt).flat_map(|i| input_gep.iter().map(move |&y| (i + y) as i64));
+    let idx_vcount = idx.dtype().vcount();
 
-    let buf_broadcast = buf.broadcast(total);
-    let final_idx =
-        idx.gep(gep_arg).mul(&idx.const_like(cnt as i64).broadcast(total)).add(&create_index_vector(sum_arg));
+    if idx_vcount == 1 {
+        // Scalar path (original Tinygrad logic)
+        let total = cnt * precnt;
+        let gep_arg: Vec<usize> = (0..cnt).flat_map(|_| 0..precnt).collect();
+        let sum_arg = (0..cnt).flat_map(|i| input_gep.iter().map(move |&y| (i + y) as i64));
 
-    Some(
-        UOp::index()
-            .buffer(buf_broadcast.clone())
-            .indices(vec![final_idx])
-            .maybe_gate(gate.clone())
-            .ptr(true)
-            .call()
-            .expect("ICE: unable to create index"),
-    )
+        let buf_broadcast = buf.broadcast(total);
+        let final_idx =
+            idx.gep(gep_arg).mul(&idx.const_like(cnt as i64).broadcast(total)).add(&create_index_vector(sum_arg));
+
+        Some(
+            UOp::index()
+                .buffer(buf_broadcast)
+                .indices(vec![final_idx])
+                .maybe_gate(gate.clone())
+                .ptr(true)
+                .call()
+                .expect("ICE: unable to create index"),
+        )
+    } else {
+        // Vector path: expand each lane with the same precnt/cnt scaling
+        let per_lane = cnt * precnt;
+        let total = per_lane * idx_vcount;
+
+        let buf_broadcast = buf.broadcast(total);
+        let elements: SmallVec<[Arc<UOp>; 4]> = (0..idx_vcount)
+            .flat_map(|i| {
+                let lane = idx.gep(vec![i]);
+                let cnt_const = UOp::const_(lane.dtype(), ConstValue::Int(cnt as i64));
+                let scaled = lane.mul(&cnt_const);
+                (0..cnt).flat_map(move |c| {
+                    let s = scaled.clone();
+                    input_gep.iter().map(move |&y| s.add(&UOp::const_(s.dtype(), ConstValue::Int((c + y) as i64))))
+                })
+            })
+            .collect();
+        let final_idx = UOp::vectorize(elements);
+
+        let expanded_gate = gate.as_ref().map(|g| {
+            if g.dtype().vcount() > 1 {
+                let elements: SmallVec<[Arc<UOp>; 4]> = (0..idx_vcount)
+                    .flat_map(|i| {
+                        let lane = g.gep(vec![i]);
+                        std::iter::repeat_n(lane, per_lane)
+                    })
+                    .collect();
+                UOp::vectorize(elements)
+            } else {
+                g.broadcast(total)
+            }
+        });
+
+        Some(
+            UOp::index()
+                .buffer(buf_broadcast)
+                .indices(vec![final_idx])
+                .maybe_gate(expanded_gate)
+                .ptr(true)
+                .call()
+                .expect("ICE: unable to create index"),
+        )
+    }
 }
 
 // ============================================================================
@@ -838,6 +963,14 @@ fn no_vectorized_index_precnt(
 // ============================================================================
 
 /// INDEX(buf, x, true) → INDEX(buf, x, None)
+///
+/// Tinygrad (devectorizer.py:48-55) has 2 additional IMAGE-specific patterns:
+///
+/// 1. `simplify_valid_load(buf, x, cond)` for `INDEX(buf, WHERE(cond, x, Invalid))`
+/// 2. `simplify_valid_load(buf, x, c)` for `INDEX(buf, x:long, c:bool)` (post-lowering)
+///
+/// These use `uop_given_valid`/`parse_valid` and are tied to ImageDType.
+/// TODO: Add when implementing IMAGE backend support.
 pub fn load_store_indexing_patterns() -> &'static TypedPatternMatcher {
     crate::cached_patterns! {
         // INDEX(buf, idx, true) → INDEX(buf, idx, None) — remove trivially-true gate.
@@ -908,134 +1041,33 @@ pub fn pm_wmma_accumulate() -> &'static TypedPatternMatcher {
 // ============================================================================
 // Load Store Folding Patterns (devectorizer.py:114-126)
 // ============================================================================
-//
-// Multi-pass architecture: The patterns are split into phases because the
-// bottom-up rewrite engine processes children before parents and does fixed-point
-// matching on the result. When patterns create nested structures (e.g., GEP(LOAD(PTRCAT))),
-// inner patterns may not match if they're in the same pass.
-//
-// Phase order:
-// 1. expand_index: vector INDEX → GEP(PTRCAT)
-// 2. gep_movement: LOAD(GEP(PTRCAT)) → GEP(LOAD(PTRCAT))
-// 3. ptrcat_distribution: LOAD(PTRCAT) → CAT(LOADs)
-
-/// Phase 1: Expand vector INDEX into GEP(PTRCAT) groupings.
-fn expand_index_patterns() -> &'static TypedPatternMatcher {
+/// Tinygrad load_store_folding (devectorizer.py:119-132).
+/// 6 patterns in one matcher, exactly matching Tinygrad's order.
+pub fn load_store_folding_patterns() -> &'static TypedPatternMatcher {
     crate::cached_patterns! {
-        index if is_vector_index(index) => expand_vector_index(index),
-    }
-}
+        // 1. expand_index: INDEX(VECTORIZE(buf), vec) → VECTORIZE(INDEX(buf, gep(0)), ...)
+        index if is_vector_index(index) => expand_index_to_vectorize(index),
 
-/// GEP simplification: identity elimination and GEP-of-GEP folding.
-///
-/// Identity GEP `GEP(x, [0,1,...,n-1])` where n == x.vcount is a no-op.
-/// GEP-of-GEP `GEP(GEP(x, outer), inner)` composes into `GEP(x, [outer[i] for i in inner])`.
-///
-/// These must run in Phase 2 because `move_gep_on_store` creates identity GEPs
-/// that block `contiguous_gep_load_patterns` from matching.
-fn gep_simplification_patterns() -> &'static TypedPatternMatcher {
-    crate::cached_patterns! {
-        // Identity GEP: GEP(x, [0,1,...,n-1]) → x
-        Gep { vector, indices } if is_identity_gep(vector, indices) => Some(vector.clone()),
+        // 2. fold_expanded_index: VECTORIZE(INDEX, INDEX, ...) → GEP(PTRCAT(...), indices)
+        midx @ Vectorize { elements } if elements.iter().all(|e| matches!(e.op(), Op::Index { .. }))
+            => fold_expanded_index(midx),
 
-        // GEP(GEP(x, outer), inner) → GEP(x, composed)
-        Gep { vector: Gep { vector: inner_vec, indices: outer_indices }, indices: inner_indices }
-            => |inner_vec, outer_indices, inner_indices| {
-                let composed: Vec<usize> = inner_indices.iter()
-                    .filter_map(|&i| outer_indices.get(i).copied())
-                    .collect();
-                if composed.len() != inner_indices.len() { return None; }
-                Some(inner_vec.gep(composed))
-            },
-    }
-}
-
-/// Phase 2: Move GEP through LOAD/STORE.
-fn gep_movement_patterns() -> &'static TypedPatternMatcher {
-    crate::cached_patterns! {
-        // GEP after LOAD: LOAD(GEP(x)) → GEP(LOAD(x))
+        // 3. GEP after LOAD: LOAD(buf, GEP(x)) → GEP(LOAD(buf, x))
         load @ Load { buffer, index: Gep { vector, indices } }
             => move_gep_after_load(load, buffer, vector, indices),
 
-        // GEP on STORE: STORE(GEP(x), data) → STORE(x, GEP⁻¹(data))
+        // 4. GEP on STORE: STORE(GEP(x), data) → STORE(x, GEP⁻¹(data))
         Store { index: Gep { vector, indices }, value, ranges }
             => move_gep_on_store(vector, indices, value, ranges),
-    }
-}
 
-/// Phase 3: Distribute PTRCAT through LOAD/STORE.
-fn ptrcat_distribution_patterns() -> &'static TypedPatternMatcher {
-    crate::cached_patterns! {
-        // PTRCAT after LOAD: LOAD(PTRCAT(a,b)) → CAT(LOAD(a), LOAD(b))
-        load @ Load { buffer, index: ptrcat @ PtrCat { sources }, alt: None }
+        // 5. PTRCAT after LOAD: LOAD(buf, PTRCAT) → CAT(LOAD(buf_i, ptr_i), ...)
+        load @ Load { buffer, index: ptrcat @ PtrCat { sources } }
             => distribute_ptrcat_load(load, buffer, ptrcat, sources),
 
-        // PTRCAT after STORE
+        // 6. PTRCAT after STORE: STORE(PTRCAT, data) → GROUP(STORE(ptr_i, gep(data, i)), ...)
         Store { index: PtrCat { sources }, value, ranges }
             => distribute_ptrcat_store(sources, value, ranges),
     }
-}
-
-/// Contiguous GEP on LOAD → direct sub-vector LOAD.
-///
-/// Transforms `GEP(LOAD(INDEX(buf)), [start..start+N])` into
-/// `LOAD(INDEX(buf, offset+start), dtype=vec<N>)`, avoiding scalar decomposition.
-///
-/// Uses scalar element dtype for the INDEX so the GEP strides by single elements,
-/// even when the buffer base type is a vector (e.g., DEFINE_REG_TYPED(1, vec256)).
-fn contiguous_gep_load_patterns() -> &'static TypedPatternMatcher {
-    crate::cached_patterns! {
-        Gep { vector: load @ Load { buffer, index, alt: None }, indices }
-            if indices.len() > 1
-            && is_contiguous_indices(indices).is_some()
-            && matches!(index.op(), Op::Index { .. })
-            => |load, buffer, index, indices| {
-                let start = indices[0];
-                let count = indices.len();
-                let Op::Index { buffer: buf, indices: orig_indices, gate } = index.op() else {
-                    return None;
-                };
-                let scalar_dtype = load.dtype().scalar_dtype();
-                let new_first = if start == 0 {
-                    orig_indices[0].clone()
-                } else {
-                    let offset = orig_indices[0].const_like(start as i64);
-                    orig_indices[0].add(&offset)
-                };
-                let new_indices: SmallVec<[Arc<UOp>; 4]> = std::iter::once(new_first)
-                    .chain(orig_indices[1..].iter().cloned())
-                    .collect();
-                // Use Ptr dtype with scalar base so:
-                // 1. pm_add_loads skips this INDEX (is_ptr_or_image_dtype → true)
-                // 2. MLIR codegen extracts scalar base for GEP element type (correct stride)
-                let idx_dtype = match buf.dtype() {
-                    DType::Ptr { addrspace, size, .. } => DType::Ptr {
-                        base: Box::new(scalar_dtype.clone()),
-                        addrspace,
-                        size,
-                        vcount: 1,
-                    },
-                    _ => scalar_dtype.clone(),
-                };
-                let new_index = UOp::index()
-                    .buffer(buf.clone())
-                    .indices(new_indices)
-                    .maybe_gate(gate.clone())
-                    .dtype(idx_dtype)
-                    .call()
-                    .ok()?;
-                Some(UOp::load().buffer(buffer.clone()).index(new_index).dtype(scalar_dtype.vec(count)).call())
-            },
-    }
-}
-
-/// Combined load/store folding patterns (for backward compatibility).
-/// Prefer using `devectorize()` which applies these in proper phase order.
-pub fn load_store_folding_patterns() -> &'static TypedPatternMatcher {
-    use std::sync::LazyLock;
-    static CACHED: LazyLock<TypedPatternMatcher> =
-        LazyLock::new(|| expand_index_patterns() + gep_movement_patterns() + ptrcat_distribution_patterns());
-    &CACHED
 }
 
 // ============================================================================
@@ -1063,13 +1095,7 @@ pub fn correct_load_store_patterns() -> &'static TypedPatternMatcher {
 // ============================================================================
 
 fn is_define_or_after(uop: &Arc<UOp>) -> bool {
-    matches!(uop.unwrap_after().op(), Op::DefineLocal(_) | Op::DefineReg { .. } | Op::DefineGlobal(_))
-}
-
-/// Check if GEP indices are contiguous `[start, start+1, ..., start+N-1]`.
-fn is_contiguous_indices(indices: &[usize]) -> Option<usize> {
-    let &start = indices.first()?;
-    indices.iter().enumerate().all(|(i, &idx)| idx == start + i).then_some(start)
+    matches!(uop.unwrap_after().op(), Op::DefineLocal(_) | Op::DefineReg { .. } | Op::Param { device: None, .. })
 }
 
 /// Matches INDEX(VECTORIZE(Defines.or_after()), vec_idx) only.
@@ -1127,14 +1153,17 @@ fn move_gep_on_store(
 // ============================================================================
 
 /// Vector INDEX → grouped PTRCAT. Generates scalar indices, simplifies, groups by root+offset.
-fn expand_vector_index(index: &Arc<UOp>) -> Option<Arc<UOp>> {
+/// Phase 1a: Expand vector INDEX into VECTORIZE of scalar INDEXes.
+/// Matches Tinygrad's `expand_index` (devectorizer.py:59-62).
+/// NO inner rewrite — the outer fixed-point (sym) simplifies GEP expressions.
+fn expand_index_to_vectorize(index: &Arc<UOp>) -> Option<Arc<UOp>> {
     let Op::Index { buffer, indices, gate } = index.op() else { return None };
+    assert!(indices.len() <= 1, "ICE: expand_index_to_vectorize called with multi-index INDEX (len={})", indices.len());
     let vec = indices.first()?;
     let count = vec.dtype().vcount();
 
     let buf = if let Op::Vectorize { elements } = buffer.op() { elements.first()?.clone() } else { buffer.clone() };
 
-    // Generate scalar INDEX ops and simplify.
     let scalar_indices: Vec<_> = (0..count)
         .map(|i| {
             let lane_gate = gate.as_ref().map(|g| if g.dtype().vcount() > 1 { g.gep(vec![i]) } else { g.clone() });
@@ -1148,18 +1177,31 @@ fn expand_vector_index(index: &Arc<UOp>) -> Option<Arc<UOp>> {
         })
         .collect();
 
-    use std::sync::LazyLock;
-    static EXPAND_IDX_PM: LazyLock<TypedPatternMatcher> = LazyLock::new(|| symbolic() + load_store_indexing_patterns());
-    let midx = graph_rewrite(&*EXPAND_IDX_PM, UOp::sink(scalar_indices), &mut ());
-    let Op::Sink { sources } = midx.op() else { return None };
+    Some(UOp::vectorize(scalar_indices.into()))
+}
+
+/// Phase 1b: Fold VECTORIZE of scalar INDEXes into PTRCAT groupings.
+/// Matches Tinygrad's `fold_expanded_index` (devectorizer.py:64-100).
+/// By this point, the outer sym fixed-point has simplified GEP expressions
+/// into concrete root+offset form so grouping can identify consecutive accesses.
+fn fold_expanded_index(midx: &Arc<UOp>) -> Option<Arc<UOp>> {
+    let Op::Vectorize { elements: sources } = midx.op() else { return None };
+    let count = sources.len();
+    if count == 0 {
+        return None;
+    }
+
+    // Verify all elements are INDEX and share the same buffer
+    let first_buf = match sources[0].op() {
+        Op::Index { buffer, .. } => buffer,
+        _ => return None,
+    };
+    if !sources.iter().all(|s| matches!(s.op(), Op::Index { buffer, .. } if Arc::ptr_eq(buffer, first_buf))) {
+        return None;
+    }
+    let buf = first_buf;
 
     // Extract (valid, root, offset, gate) for each lane.
-    // Gate is included in the grouping key so lanes with different gates (e.g., valid vs invalid
-    // from padding) are grouped separately. This ensures PTRCAT groups have uniform gate values.
-    //
-    // Important: collect all lane data first to keep Arc<UOp> refs alive. Temporary UOps
-    // (e.g. const(true) from get_valid()) would get GC'd between loop iterations via the
-    // weak-ref hash consing cache, producing different ids for structurally identical nodes.
     struct LaneData {
         valid: Arc<UOp>,
         root: Arc<UOp>,
@@ -1175,7 +1217,6 @@ fn expand_vector_index(index: &Arc<UOp>) -> Option<Arc<UOp>> {
         let gate_id = lane_gate.as_ref().map_or(u64::MAX, |g| g.id);
 
         let (root, offset) = match idx.op() {
-            // Invalid grouped separately (devectorizer.py:72-77)
             Op::Invalid => (UOp::invalid_marker(), 0),
             Op::Binary(BinaryOp::Add, l, r) if matches!(r.op(), Op::Const(cv) if matches!(cv.0, ConstValue::Int(_))) => {
                 let Op::Const(cv) = r.op() else { unreachable!() };
@@ -1197,7 +1238,7 @@ fn expand_vector_index(index: &Arc<UOp>) -> Option<Arc<UOp>> {
         lane_data.push((lane, LaneData { valid, root, offset, gate_id }));
     }
 
-    // Now build grouping map — all Arcs are alive so ids are stable
+    // Build grouping map
     let mut offsets_by_root: HashMap<(u64, u64, u64), HashMap<i64, Vec<usize>>> = HashMap::new();
     for (lane, data) in &lane_data {
         let key = (data.valid.id, data.root.id, data.gate_id);
@@ -1213,7 +1254,7 @@ fn expand_vector_index(index: &Arc<UOp>) -> Option<Arc<UOp>> {
         let groups = group_consecutive_offsets_from_map(offsets);
         for grp in groups {
             let lidx = sources[offsets[&grp[0]][0]].clone();
-            let ptr = if grp.len() > 1 { lidx.cast(make_vec_ptr_dtype(&buf, grp.len())) } else { lidx };
+            let ptr = if grp.len() > 1 { lidx.cast(make_vec_ptr_dtype(buf, grp.len())) } else { lidx };
             for (i, &offset) in grp.iter().enumerate() {
                 for &lane in &offsets[&offset] {
                     idxs[lane] = Some(global_offset + i);
@@ -1228,7 +1269,6 @@ fn expand_vector_index(index: &Arc<UOp>) -> Option<Arc<UOp>> {
         return None;
     }
 
-    // Create PTRCAT with vec(global_offset) of scalar pointers
     let DType::Ptr { base, addrspace, size, .. } = buf.dtype().clone() else { return None };
     let scalar_ptr = DType::Ptr { base: Box::new(DType::Scalar(base.scalar()?)), addrspace, size, vcount: 1 };
     let ptrcat_dtype = scalar_ptr.vec(global_offset);
@@ -1273,29 +1313,45 @@ fn make_vec_ptr_dtype(buffer: &Arc<UOp>, vec_len: usize) -> DType {
 // ============================================================================
 
 /// LOAD(PTRCAT) → CAT(LOADs). CAT dtype = ptrcat.dtype.base.vec(ptrcat.dtype.vcount)
+/// LOAD(buf, PTRCAT(idx0,idx1,...)) → CAT(LOAD(buf_i, idx_i), ...)
+///
+/// Matches Tinygrad devectorizer.py:128-129:
+///   ld.replace(dtype=x.dtype.base, src=(x,)+ld.src[1:]) for x in cat.src
+///
+/// Each PtrCat source is a scalar INDEX(buf, offset). The distributed scalar
+/// LOAD uses that INDEX directly, with the scalar buffer from GEP(buffer, i).
 fn distribute_ptrcat_load(
-    _load: &Arc<UOp>,
+    load: &Arc<UOp>,
     buffer: &Arc<UOp>,
     ptrcat: &Arc<UOp>,
     sources: &[Arc<UOp>],
 ) -> Option<Arc<UOp>> {
     let loads: Vec<Arc<UOp>> = sources
         .iter()
-        .map(|ptr| {
-            // Tinygrad: ld.replace(dtype=x.dtype.base, ...) - preserves vec type
-            // If ptr is ptr<vec4<float>>, load dtype should be vec4<float>, NOT scalar float
+        .enumerate()
+        .map(|(i, ptr)| {
             let load_dtype = match ptr.dtype() {
                 DType::Ptr { base, .. } => base.as_ref().clone(),
                 other => other.clone(),
             };
-            UOp::load().buffer(buffer.clone()).index(ptr.clone()).dtype(load_dtype).call()
+            // Extract scalar buffer for this lane.
+            // Tinygrad: ld.replace(src=(x,)+ld.src[1:]) — PtrCat source IS the full
+            // INDEX(buf, idx), so the scalar load doesn't need the outer buffer at all.
+            // Each PtrCat source already contains its own buffer reference.
+            // For VECTORIZE(buf, buf, ...) just use the scalar element.
+            let scalar_buf = match buffer.op() {
+                Op::Vectorize { elements, .. } => elements.get(i).cloned().unwrap_or_else(|| buffer.clone()),
+                _ => buffer.clone(),
+            };
+            let alt = match load.op() {
+                Op::Load { alt, .. } => alt.clone(),
+                _ => None,
+            };
+            UOp::load().buffer(scalar_buf).index(ptr.clone()).maybe_alt(alt).dtype(load_dtype).call()
         })
         .collect();
 
-    let ptrcat_vcount = ptrcat.dtype().vcount();
-    let base_scalar = ptrcat.dtype().base();
-    let cat_dtype = DType::Scalar(base_scalar).vec(ptrcat_vcount);
-
+    let cat_dtype = DType::Scalar(ptrcat.dtype().base()).vec(ptrcat.dtype().vcount());
     Some(UOp::cat().sources(loads).dtype(cat_dtype).call())
 }
 
@@ -1356,7 +1412,9 @@ fn split_load_store(ls: &Arc<UOp>, idx: &Arc<UOp>) -> Option<Arc<UOp>> {
 
     // Fold lengths (devectorizer.py:138-152)
     let buf_dtype = buf.dtype();
-    let is_amx = std::env::var("MOROK_AMX").is_ok_and(|v| v == "1");
+    static IS_AMX: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var("MOROK_AMX").is_ok_and(|v| v == "1"));
+    let is_amx = *IS_AMX;
 
     // AMX TC accumulators are stored in DEFINE_REG (AddrSpace::Reg) but need vector stores.
     // For STORE: check if VALUE comes from an AMX TC accumulator (DEFINE_REG with AddrSpace::Reg).
@@ -1411,7 +1469,10 @@ fn split_load_store(ls: &Arc<UOp>, idx: &Arc<UOp>) -> Option<Arc<UOp>> {
     } else if is_amx {
         vec![16, 8, 4, 2, 1] // AMX: wider folds matching 64-byte row stride
     } else {
-        vec![4, 2, 1] // ctx.supports_float4
+        // Tinygrad uses ctx.supports_float4 from Renderer context (devectorizer.py:155-157).
+        // Hardcoded [4,2,1] matches the default supports_float4 path.
+        // TODO: Pass Renderer context through when adding backends with different fold lengths.
+        vec![4, 2, 1]
     };
 
     // Filter by divisibility (devectorizer.py:155-156)

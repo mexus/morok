@@ -45,7 +45,7 @@ fn test_buffer_mapping() {
     let mut ctx = KernelContext::new();
 
     let original = UOp::native_const(1.0f32);
-    let replacement = UOp::define_global(0, DType::Float32);
+    let replacement = UOp::param(0, 1, DType::Float32, None);
 
     assert!(!ctx.has_buffer(&original));
 
@@ -57,14 +57,15 @@ fn test_buffer_mapping() {
 
 #[test]
 fn test_var_tracking() {
-    use morok_dtype::DType;
-
     let mut ctx = KernelContext::new();
-    let var = UOp::define_global(1, DType::Index);
+    let var = UOp::define_var("test_var".to_string(), 0, 10);
 
-    assert!(!ctx.has_var(&var));
+    assert!(!ctx.vars.contains_key("test_var"));
 
-    ctx.add_var(var.clone());
+    ctx.add_var(var.clone(), Some(5));
 
-    assert!(ctx.has_var(&var));
+    assert!(ctx.vars.contains_key("test_var"));
+    let (stored_uop, stored_val) = ctx.vars.get("test_var").unwrap();
+    assert_eq!(stored_uop.id, var.id);
+    assert_eq!(*stored_val, Some(5));
 }

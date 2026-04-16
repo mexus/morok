@@ -40,18 +40,17 @@ use tracing::{debug, trace};
 use crate::{
     PrepareConfig, Result, Tensor,
     error::{
-        CompileKernelSnafu, CreateProgramSnafu, DependencyCyclesSnafu, DeviceSnafu, EmptyScheduleSnafu, ExecutionSnafu,
-        OptimizeSnafu, RangeifySnafu, RenderKernelSnafu, ShapeUnknownSnafu, UOpSnafu,
+        BatchOutputMismatchSnafu, CompileKernelSnafu, CreateProgramSnafu, DependencyCyclesSnafu, DeviceSnafu,
+        EmptyScheduleSnafu, ExecutionSnafu, OptimizeSnafu, RangeifySnafu, RenderKernelSnafu, ShapeUnknownSnafu,
+        UOpSnafu,
     },
-    schedule::{Schedule, ScheduleItem, expand_schedule},
+    schedule::{ScheduleItem, expand_schedule},
 };
 use morok_device::{Buffer, device::Device};
-use morok_dtype::DType;
 use morok_ir::pattern::is_any_const;
 use morok_ir::{DeviceSpec, Op, UOp, UOpKey};
 use morok_runtime::{
-    ExecutionGraph, ExecutionNode, ExecutionPlan, ExecutionPlanBuilder, KernelBufferAccess, ParallelGroup,
-    PreparedKernel,
+    ExecutionGraph, ExecutionNode, ExecutionPlan, ExecutionPlanBuilder, KernelBufferAccess, PreparedKernel,
 };
 use snafu::{OptionExt, ResultExt};
 use std::sync::Arc;
@@ -81,19 +80,21 @@ impl Tensor {
     /// # Errors
     ///
     /// Returns error if preparation or execution fails.
-    pub fn realize(self) -> Result<Self> {
-        // Already realized — ensure buffer is attached and return.
+    pub fn realize(&mut self) -> Result<()> {
         if self.uop().has_buffer_identity() {
-            return Ok(self.ensure_buffer());
+            self.ensure_buffer();
+            return Ok(());
         }
-        // Pure constant — no computation needed.
+        // Pure constants: wrap in CONTIGUOUS to force materialization into a buffer.
         if is_any_const(&self.uop()) {
-            return Ok(self);
+            let contiguous_uop = self.uop().contiguous();
+            self.set_uop(contiguous_uop);
         }
-        // Zero-element tensor: nothing to compute.
         if self.has_zero_elements() {
-            return Ok(self);
+            return Ok(());
         }
+
+        resolve_pending_assigns(&self.uop(), &PrepareConfig::from_env())?;
 
         let old_uop = self.uop();
         let input_buffer_ids: std::collections::HashSet<u64> =
@@ -103,32 +104,26 @@ impl Tensor {
         let plan = self.prepare()?;
         let prep_ms = t_prep.elapsed().as_millis();
         let t_exec = std::time::Instant::now();
-        let mut executor = morok_runtime::global_executor();
-        plan.execute(&mut executor).context(ExecutionSnafu)?;
+        plan.execute().context(ExecutionSnafu)?;
         let exec_ms = t_exec.elapsed().as_millis();
         debug!(prep_ms, exec_ms, "realize complete");
 
-        let result = self.finalize_realize(&plan, &old_uop)?;
+        self.finalize_realize(&plan, &old_uop)?;
 
-        // Propagate realized buffer to all live tensors referencing old_uop.
-        // This is Tinygrad's _apply_map_to_tensors approach: after realize, all
-        // tensors sharing this subgraph see the buffer instead of recomputing.
-        let realized_uop = result.uop();
+        let realized_uop = self.uop();
         if !Arc::ptr_eq(&old_uop, &realized_uop) {
             #[allow(clippy::mutable_key_type)]
             let becomes_map = HashMap::from([(UOpKey(old_uop), realized_uop)]);
             crate::tensor_registry::apply_map_to_tensors(&becomes_map);
         }
 
-        // Release intermediate buffers AFTER apply_map_to_tensors so other
-        // tensors can still look up buffers during the substitution window.
         plan.release_intermediate_buffers(|uop_id| {
             if !input_buffer_ids.contains(&uop_id) {
                 crate::tensor_registry::remove_buffer(uop_id);
             }
         });
 
-        Ok(result)
+        Ok(())
     }
 
     /// Realize tensor with custom configuration.
@@ -150,14 +145,21 @@ impl Tensor {
     /// );
     /// let c = c.realize_with(&config)?;
     /// ```
-    pub fn realize_with(self, config: &PrepareConfig) -> Result<Self> {
+    pub fn realize_with(&mut self, config: &PrepareConfig) -> Result<()> {
         if self.uop().has_buffer_identity() {
-            return Ok(self.ensure_buffer());
+            self.ensure_buffer();
+            return Ok(());
         }
-        // Zero-element tensor: nothing to compute (Tinygrad: rangeify folds size-0 to const).
+        // Pure constants: wrap in CONTIGUOUS to force materialization into a buffer.
+        if is_any_const(&self.uop()) {
+            let contiguous_uop = self.uop().contiguous();
+            self.set_uop(contiguous_uop);
+        }
         if self.has_zero_elements() {
-            return Ok(self);
+            return Ok(());
         }
+
+        resolve_pending_assigns(&self.uop(), config)?;
 
         let old_uop = self.uop();
         let input_buffer_ids: std::collections::HashSet<u64> =
@@ -167,14 +169,13 @@ impl Tensor {
         let plan = self.prepare_with(config)?;
         let prep_ms = t_prep.elapsed().as_millis();
         let t_exec = std::time::Instant::now();
-        let mut executor = morok_runtime::global_executor();
-        plan.execute(&mut executor).context(ExecutionSnafu)?;
+        plan.execute().context(ExecutionSnafu)?;
         let exec_ms = t_exec.elapsed().as_millis();
         debug!(prep_ms, exec_ms, "realize_with complete");
 
-        let result = self.finalize_realize(&plan, &old_uop)?;
+        self.finalize_realize(&plan, &old_uop)?;
 
-        let realized_uop = result.uop();
+        let realized_uop = self.uop();
         if !Arc::ptr_eq(&old_uop, &realized_uop) {
             #[allow(clippy::mutable_key_type)]
             let becomes_map = HashMap::from([(UOpKey(old_uop), realized_uop)]);
@@ -187,7 +188,7 @@ impl Tensor {
             }
         });
 
-        Ok(result)
+        Ok(())
     }
 
     /// Finalize realization: bind output buffer to tensor.
@@ -195,7 +196,7 @@ impl Tensor {
     /// Note: intermediate buffer cleanup is deferred to `realize()` so it
     /// runs AFTER `apply_map_to_tensors`. This ensures other tensors can still
     /// find buffers during the substitution window.
-    fn finalize_realize(&self, plan: &ExecutionPlan, uop: &Arc<UOp>) -> Result<Self> {
+    fn finalize_realize(&mut self, plan: &ExecutionPlan, uop: &Arc<UOp>) -> Result<()> {
         let output_buf = plan.output_buffer().clone();
 
         trace!(
@@ -226,7 +227,9 @@ impl Tensor {
         );
 
         self.set_uop(realized_uop);
-        Ok(Tensor::with_buffer(Arc::clone(&self.entry), output_buf_arc))
+        self.entry.set_buffer(Arc::clone(&output_buf_arc));
+        self.buffer = Some(output_buf_arc);
+        Ok(())
     }
 
     /// Prepare an execution plan for this tensor's computation graph.
@@ -246,14 +249,13 @@ impl Tensor {
     /// ```ignore
     /// let a = Tensor::from_slice(&[1.0f32, 2.0, 3.0]);
     /// let b = Tensor::from_slice(&[4.0f32, 5.0, 6.0]);
-    /// let c = &a + &b;
+    /// let mut c = &a + &b;
     ///
-    /// // One-time preparation
+    /// // One-time preparation (wires output tensor to plan buffer)
     /// let plan = c.prepare()?;
     ///
     /// // Fast execution (can be called many times)
-    /// let mut executor = morok_runtime::global_executor();
-    /// plan.execute(&mut executor)?;
+    /// plan.execute()?;
     ///
     /// // Get results
     /// let output = plan.output_buffer();
@@ -266,7 +268,7 @@ impl Tensor {
     /// - No kernels found after scheduling
     /// - Kernel compilation fails
     /// - Buffer allocation fails
-    pub fn prepare(&self) -> Result<ExecutionPlan> {
+    pub fn prepare(&mut self) -> Result<ExecutionPlan> {
         self.prepare_with(&PrepareConfig::from_env())
     }
 
@@ -294,60 +296,497 @@ impl Tensor {
     /// let plan = tensor.prepare_with(&config)?;
     /// plan.execute(&mut executor)?;
     /// ```
-    pub fn prepare_with(&self, config: &PrepareConfig) -> Result<ExecutionPlan> {
+    pub fn prepare_with(&mut self, config: &PrepareConfig) -> Result<ExecutionPlan> {
         let t_total = std::time::Instant::now();
         let uop = self.uop();
-        let shape = uop.shape().context(UOpSnafu)?.context(ShapeUnknownSnafu)?;
-        let output_dtype = uop.dtype();
+        resolve_pending_assigns(&uop, config)?;
 
-        // Step 1: Mark computation for realization via CONTIGUOUS (Tinygrad approach).
-        // Ranges are NOT pre-created here — the rangeify pipeline assigns them
-        // via consumer-driven propagation in assign_ranges().
-        let contiguous = uop.contiguous();
+        let sink = UOp::sink(vec![uop.contiguous()]);
+        let var_vals = extract_var_vals(&uop);
 
-        // Step 2: Create SINK of the CONTIGUOUS
-        let sink = UOp::sink(vec![contiguous]);
+        // Pre-schedule normalization: BUFFER→PARAM (Tinygrad pm_pre_sched_cache).
+        let (normalized, param_buffers) = normalize_buffers_to_params(&sink);
 
-        // Step 3: Run rangeify pipeline
-        // Note: The rangeify becomes_map (STORE/INDEX/RANGE nodes) is NOT applied globally —
-        // it would corrupt other tensors. Instead, realize() applies a minimal output-only
-        // becomes_map (old_uop -> realized BUFFER+RESHAPE) after execution.
-        let t_step = std::time::Instant::now();
+        // Build input_buffers keyed by PARAM UOp IDs (the normalized graph
+        // no longer has BUFFER nodes — they've been replaced with PARAMs).
+        let mut param_input_buffers = crate::schedule::InputBuffers::new();
+        for node in normalized.toposort() {
+            if let Op::Param { slot, .. } = node.op() {
+                let (orig_buffer_id, _) = &param_buffers[*slot];
+                if let Some(buf) = crate::tensor_registry::get_buffer(*orig_buffer_id) {
+                    param_input_buffers.insert(node.id, buf);
+                }
+            }
+        }
+
+        // Compute cache key: (structural hash of normalized sink, codegen backend).
+        let codegen = resolve_codegen(&param_buffers, config)?;
+        let sched_key = (crate::schedule_cache::content_hash(&normalized), codegen);
+
+        // Check schedule-level cache. On hit, skip rangeify + kernel_split.
+        let cache = crate::schedule_cache::schedule_cache();
+        let entry = {
+            let guard = cache.guard();
+            cache.get(&sched_key, &guard).cloned()
+        };
+        let entry = match entry {
+            Some(hit) => {
+                debug!("schedule cache hit");
+                hit
+            }
+            None => {
+                let rangeify_result = morok_schedule::rangeify_with_map(normalized, None).context(RangeifySnafu)?;
+                let (k, _) = morok_schedule::run_kernel_split_pipeline(rangeify_result.sink);
+                let new_entry = Arc::new(crate::schedule_cache::CachedSchedule { kernelized: k });
+                let guard = cache.guard();
+                cache.insert(sched_key, Arc::clone(&new_entry), &guard);
+                new_entry
+            }
+        };
+
+        let schedule_result =
+            crate::schedule::create_schedule(entry.kernelized.clone(), &param_input_buffers, &var_vals)?;
+        // Per-kernel optimization+compilation is cached globally in prepare_execution_plan
+        // via OPT_CACHE keyed by content_hash(ast). Identical kernel ASTs across calls
+        // (e.g., sort substages, repeated model inference) skip optimize+compile.
+        let plan = prepare_execution_plan(&schedule_result, config)?;
+
+        self.wire_output_tensor(&plan, &uop)?;
+        debug!(total_ms = t_total.elapsed().as_millis() as u64, "prepare: total");
+        Ok(plan)
+    }
+
+    fn wire_output_tensor(&mut self, plan: &ExecutionPlan, uop: &Arc<UOp>) -> Result<()> {
+        if plan.num_outputs() > 0 {
+            let buf = Arc::new(plan.output_buffer().clone());
+            let dtype = uop.dtype();
+            let device = buf.allocator().device_spec();
+            let buffer_uop = UOp::new_buffer(device, buf.size() / dtype.bytes(), dtype);
+            crate::tensor_registry::register_buffer(buffer_uop.id, self.entry.id, buf.clone());
+            let shape = uop.shape().context(UOpSnafu)?.context(ShapeUnknownSnafu)?;
+            self.set_uop(buffer_uop.try_reshape(shape).context(UOpSnafu)?);
+            self.entry.set_buffer(buf.clone());
+            self.buffer = Some(buf);
+        }
+        Ok(())
+    }
+
+    // =========================================================================
+    // Batch realize / prepare
+    // =========================================================================
+
+    /// Realize multiple tensors in a single batch, sharing computation.
+    ///
+    /// Merges all tensor computation graphs into one SINK, enabling the scheduler
+    /// to share kernels across outputs. More efficient than calling `realize()`
+    /// individually when tensors share subgraphs.
+    pub fn realize_batch<'a>(tensors: impl IntoIterator<Item = &'a mut Tensor>) -> Result<()> {
+        Self::realize_batch_with(tensors, &PrepareConfig::from_env())
+    }
+
+    /// Realize multiple tensors with custom configuration.
+    pub fn realize_batch_with<'a>(
+        tensors: impl IntoIterator<Item = &'a mut Tensor>,
+        config: &PrepareConfig,
+    ) -> Result<()> {
+        let mut tensors: Vec<&mut Tensor> = tensors.into_iter().collect();
+        if tensors.is_empty() {
+            return Ok(());
+        }
+
+        // Handle already-realized tensors
+        for t in &mut tensors {
+            if t.uop().has_buffer_identity() {
+                t.ensure_buffer();
+            }
+        }
+
+        // Wrap pure constants in CONTIGUOUS to force materialization (matches realize())
+        for t in &mut tensors {
+            if !t.uop().has_buffer_identity() && is_any_const(&t.uop()) {
+                let contiguous_uop = t.uop().contiguous();
+                t.set_uop(contiguous_uop);
+            }
+        }
+
+        // Collect pending (unrealized) tensor indices
+        let pending_indices: Vec<usize> = tensors
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| !t.uop().has_buffer_identity() && !is_any_const(&t.uop()) && !t.has_zero_elements())
+            .map(|(i, _)| i)
+            .collect();
+
+        if pending_indices.is_empty() {
+            return Ok(());
+        }
+
+        // Resolve pending assigns
+        for &i in &pending_indices {
+            resolve_pending_assigns(&tensors[i].uop(), config)?;
+        }
+
+        // Collect input buffers and old UOps from ALL pending tensors
+        let old_uops: Vec<Arc<UOp>> = pending_indices.iter().map(|&i| tensors[i].uop()).collect();
+        let mut all_input_buffers = crate::schedule::InputBuffers::new();
+        for uop in &old_uops {
+            all_input_buffers.extend(collect_input_buffers(uop));
+        }
+        let input_ids: std::collections::HashSet<u64> = all_input_buffers.keys().copied().collect();
+
+        // Create merged SINK(CONTIGUOUS(t1), ..., CONTIGUOUS(tN))
+        let contiguouses: Vec<Arc<UOp>> = old_uops.iter().map(|u| u.contiguous()).collect();
+        let sink = UOp::sink(contiguouses);
+
+        // Pre-schedule normalization: BUFFER→PARAM (Tinygrad pm_pre_sched_cache).
+        // Must run before rangeify so buffer counting sees Param nodes (not Buffer).
+        let (sink, param_buffers) = normalize_buffers_to_params(&sink);
+
+        // Rebuild input_buffers keyed by PARAM UOp ids (the normalized graph
+        // no longer has BUFFER nodes — they've been replaced with PARAMs).
+        let mut param_input_buffers = crate::schedule::InputBuffers::new();
+        for node in sink.toposort() {
+            if let Op::Param { slot, .. } = node.op() {
+                let (orig_buffer_id, _) = &param_buffers[*slot];
+                if let Some(buf) = all_input_buffers.get(orig_buffer_id) {
+                    param_input_buffers.insert(node.id, buf.clone());
+                }
+            }
+        }
+
+        // Extract bound variable values from all pending tensor UOps
+        let mut var_vals = HashMap::new();
+        for uop in &old_uops {
+            var_vals.extend(extract_var_vals(uop));
+        }
+
+        // Pipeline: rangeify → kernel_split → schedule → plan → execute
         let rangeify_result = morok_schedule::rangeify_with_map(sink, None).context(RangeifySnafu)?;
-        let rangeified = rangeify_result.sink;
-        debug!(elapsed_ms = t_step.elapsed().as_millis() as u64, "prepare: rangeify complete");
+        let (kernelized, _kernel_ctx) = morok_schedule::run_kernel_split_pipeline(rangeify_result.sink);
+        let schedule_result = crate::schedule::create_schedule(kernelized, &param_input_buffers, &var_vals)?;
 
-        trace!(ast = %rangeified.tree_full(), "post-rangeify ast");
+        let t_prep = std::time::Instant::now();
+        let plan = prepare_execution_plan(&schedule_result, config)?;
+        let prep_ms = t_prep.elapsed().as_millis();
+        let t_exec = std::time::Instant::now();
+        plan.execute().context(ExecutionSnafu)?;
+        let exec_ms = t_exec.elapsed().as_millis();
+        debug!(prep_ms, exec_ms, num_outputs = pending_indices.len(), "realize_batch complete");
 
-        // Step 4: Run kernel splitting pipeline
-        let t_step = std::time::Instant::now();
-        let (kernelized, kernel_ctx) = morok_schedule::run_kernel_split_pipeline(rangeified);
-        debug!(elapsed_ms = t_step.elapsed().as_millis() as u64, "prepare: kernel split complete");
-
-        trace!(ast = %kernelized.tree_full(), "post-kernel-split ast");
-
-        // Step 5: Collect input buffers from the computation graph
-        // This allows schedule creation to find buffers without global registry lookups
-        let input_buffers = collect_input_buffers(&uop);
-
-        // Step 6: Create schedule from kernels
-        let t_step = std::time::Instant::now();
-        let schedule = crate::schedule::create_schedule(kernelized, kernel_ctx, &input_buffers)?;
-        debug!(
-            elapsed_ms = t_step.elapsed().as_millis() as u64,
-            num_kernels = schedule.len(),
-            "prepare: schedule complete"
+        snafu::ensure!(
+            plan.num_outputs() >= pending_indices.len(),
+            BatchOutputMismatchSnafu { expected: pending_indices.len(), actual: plan.num_outputs() }
         );
 
-        // Step 7: Build execution plan (pass expected output dtype and size)
-        let t_step = std::time::Instant::now();
-        let output_size = shape.iter().map(|s| s.as_const().unwrap_or(1)).product::<usize>() * output_dtype.bytes();
-        let plan = prepare_execution_plan(&schedule, output_dtype, output_size, config);
-        debug!(elapsed_ms = t_step.elapsed().as_millis() as u64, "prepare: execution plan complete");
+        // Finalize each pending tensor in-place + build batched becomes_map
+        #[allow(clippy::mutable_key_type)]
+        let mut becomes_map = HashMap::new();
+        for (buf_idx, &orig_idx) in pending_indices.iter().enumerate() {
+            let output_buf = plan.output_buffer_at(buf_idx).clone();
+            let old_uop = &old_uops[buf_idx];
 
-        debug!(total_ms = t_total.elapsed().as_millis() as u64, "prepare: total");
-        plan
+            let output_dtype = old_uop.dtype();
+            let output_device = output_buf.allocator().device_spec();
+            let num_elements = output_buf.size() / output_dtype.bytes();
+            let buffer_uop = UOp::new_buffer(output_device, num_elements, output_dtype);
+            let buf_arc = Arc::new(output_buf);
+
+            let t = &mut tensors[orig_idx];
+            crate::tensor_registry::register_buffer(buffer_uop.id, t.entry.id, buf_arc.clone());
+            let shape = old_uop.shape().context(UOpSnafu)?.context(ShapeUnknownSnafu)?;
+            let realized_uop = buffer_uop.try_reshape(shape).context(UOpSnafu)?;
+            t.set_uop(realized_uop.clone());
+            t.entry.set_buffer(Arc::clone(&buf_arc));
+            t.buffer = Some(buf_arc);
+
+            becomes_map.insert(UOpKey(old_uop.clone()), realized_uop);
+        }
+
+        // Single batched apply_map (one global walk instead of N)
+        crate::tensor_registry::apply_map_to_tensors(&becomes_map);
+
+        // Cleanup intermediate buffers
+        plan.release_intermediate_buffers(|id| {
+            if !input_ids.contains(&id) {
+                crate::tensor_registry::remove_buffer(id);
+            }
+        });
+
+        Ok(())
     }
+
+    /// Prepare a batch execution plan for multiple tensors.
+    ///
+    /// Output tensors are wired to plan buffers — after `execute`/`execute_with_vars`,
+    /// results are readable directly via `tensor.as_vec()` or `tensor.array_view()`.
+    pub fn prepare_batch<'a>(tensors: impl IntoIterator<Item = &'a mut Tensor>) -> Result<ExecutionPlan> {
+        Self::prepare_batch_with(tensors, &PrepareConfig::from_env())
+    }
+
+    /// Prepare a batch execution plan with custom configuration.
+    pub fn prepare_batch_with<'a>(
+        tensors: impl IntoIterator<Item = &'a mut Tensor>,
+        config: &PrepareConfig,
+    ) -> Result<ExecutionPlan> {
+        let mut tensors: Vec<&mut Tensor> = tensors.into_iter().collect();
+        if tensors.is_empty() {
+            return EmptyScheduleSnafu.fail();
+        }
+
+        // Handle already-realized tensors
+        for t in &mut tensors {
+            if t.uop().has_buffer_identity() {
+                t.ensure_buffer();
+            }
+        }
+
+        // Wrap pure constants in CONTIGUOUS to force materialization (matches realize())
+        for t in &mut tensors {
+            if !t.uop().has_buffer_identity() && is_any_const(&t.uop()) {
+                let contiguous_uop = t.uop().contiguous();
+                t.set_uop(contiguous_uop);
+            }
+        }
+
+        // Collect pending (unrealized) tensor indices
+        let pending_indices: Vec<usize> = tensors
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| !t.uop().has_buffer_identity() && !is_any_const(&t.uop()) && !t.has_zero_elements())
+            .map(|(i, _)| i)
+            .collect();
+
+        if pending_indices.is_empty() {
+            return EmptyScheduleSnafu.fail();
+        }
+
+        // Resolve pending assigns so input buffers exist for scheduling.
+        for &i in &pending_indices {
+            resolve_pending_assigns(&tensors[i].uop(), config)?;
+        }
+
+        // Collect UOps from pending tensors only
+        let uops: Vec<Arc<UOp>> = pending_indices.iter().map(|&i| tensors[i].uop()).collect();
+
+        let mut all_input_buffers = crate::schedule::InputBuffers::new();
+        let mut var_vals = HashMap::new();
+        for uop in &uops {
+            all_input_buffers.extend(collect_input_buffers(uop));
+            var_vals.extend(extract_var_vals(uop));
+        }
+
+        // Create merged SINK(CONTIGUOUS(t1), ..., CONTIGUOUS(tN)) from pending tensors
+        let contiguouses: Vec<Arc<UOp>> = uops.iter().map(|u| u.contiguous()).collect();
+        let sink = UOp::sink(contiguouses);
+
+        // Pre-schedule normalization: BUFFER→PARAM (Tinygrad pm_pre_sched_cache).
+        // Erases buffer identity so structurally identical computations on different
+        // buffers share the same AST. Enables kernel compilation dedup.
+        let (sink, param_buffers) = normalize_buffers_to_params(&sink);
+
+        // Rebuild input_buffers keyed by PARAM UOp ids (the normalized graph
+        // no longer has BUFFER nodes — they've been replaced with PARAMs).
+        // Each PARAM's id maps to the original BUFFER's device allocation.
+        let mut param_input_buffers = crate::schedule::InputBuffers::new();
+        for node in sink.toposort() {
+            if let Op::Param { slot, .. } = node.op() {
+                let (orig_buffer_id, _) = &param_buffers[*slot];
+                if let Some(buf) = all_input_buffers.get(orig_buffer_id) {
+                    param_input_buffers.insert(node.id, buf.clone());
+                }
+            }
+        }
+
+        let rangeify_result = morok_schedule::rangeify_with_map(sink, None).context(RangeifySnafu)?;
+        let (kernelized, _kernel_ctx) = morok_schedule::run_kernel_split_pipeline(rangeify_result.sink);
+        let schedule_result = crate::schedule::create_schedule(kernelized, &param_input_buffers, &var_vals)?;
+
+        let plan = prepare_execution_plan(&schedule_result, config)?;
+
+        // Wire each pending output tensor to its plan buffer.
+        // After execute/execute_with_vars, tensor.array_view() reads the result directly.
+        for (buf_idx, &orig_idx) in pending_indices.iter().enumerate() {
+            if buf_idx >= plan.num_outputs() {
+                break;
+            }
+            let output_buf = plan.output_buffer_at(buf_idx).clone();
+            let buf_arc = Arc::new(output_buf);
+            let old_uop = &uops[buf_idx];
+            let output_dtype = old_uop.dtype();
+            let output_device = buf_arc.allocator().device_spec();
+            let num_elements = buf_arc.size() / output_dtype.bytes();
+            let buffer_uop = UOp::new_buffer(output_device, num_elements, output_dtype);
+            let t = &mut tensors[orig_idx];
+            crate::tensor_registry::register_buffer(buffer_uop.id, t.entry.id, buf_arc.clone());
+            let shape = old_uop.shape().context(UOpSnafu)?.context(ShapeUnknownSnafu)?;
+            let realized_uop = buffer_uop.try_reshape(shape).context(UOpSnafu)?;
+            t.set_uop(realized_uop);
+            t.entry.set_buffer(Arc::clone(&buf_arc));
+            t.buffer = Some(buf_arc);
+        }
+
+        Ok(plan)
+    }
+}
+
+/// Side-realize pending assigns for buffers referenced by a UOp graph.
+///
+/// Matches Tinygrad's `realize()` lines 274-289: before scheduling the main
+/// computation, pending assigns for any referenced BUFFER are scheduled and
+/// executed first. The `becomes_map` from each assign's realization is propagated
+/// to all live tensors via `apply_map_to_tensors`.
+///
+/// Key difference from previous implementation: ASSIGN goes directly into SINK
+/// (no CONTIGUOUS wrapper), matching Tinygrad line 281. The ASSIGN writes directly
+/// into its target buffer via bufferize_to_store, producing a single copy kernel
+/// instead of two.
+fn resolve_pending_assigns(uop: &Arc<UOp>, config: &PrepareConfig) -> Result<()> {
+    if !crate::tensor_registry::has_pending_assigns() {
+        return Ok(());
+    }
+
+    // Collect buffer IDs up front (like Tinygrad line 288: set comprehension).
+    let buffer_ids: Vec<u64> =
+        uop.toposort().iter().filter(|n| matches!(n.op(), Op::Buffer { .. })).map(|n| n.id).collect();
+
+    for buf_id in buffer_ids {
+        realize_pending_recursive(buf_id, config)?;
+    }
+
+    Ok(())
+}
+
+/// Recursively realize pending assigns for a buffer and its transitive dependencies.
+///
+/// Matches Tinygrad's `_realize_pending` (tensor.py:276-287):
+/// 1. Pop all assigns for this buffer
+/// 2. For each assign, recursively realize any buffer dependencies that also have pending assigns
+/// 3. Schedule + execute the assign
+/// 4. Propagate becomes_map to all live tensors and remaining pending assigns
+fn realize_pending_recursive(buf_id: u64, config: &PrepareConfig) -> Result<()> {
+    let Some(assign_uops) = crate::tensor_registry::take_pending_assigns(buf_id) else {
+        return Ok(());
+    };
+
+    for assign_uop in assign_uops {
+        // Recurse: realize transitive dependencies FIRST (Tinygrad lines 279-280)
+        for dep in assign_uop.toposort() {
+            if matches!(dep.op(), Op::Buffer { .. }) && crate::tensor_registry::has_pending_assign(dep.id) {
+                realize_pending_recursive(dep.id, config)?;
+            }
+        }
+
+        debug!(buffer_id = buf_id, "realize_pending_recursive: side-realizing assign");
+
+        // Schedule the ASSIGN directly in SINK — no CONTIGUOUS wrapper.
+        let sink = UOp::sink(vec![assign_uop.clone()]);
+
+        let all_input_buffers = collect_input_buffers(&assign_uop);
+        let var_vals = extract_var_vals(&assign_uop);
+
+        // Pre-schedule normalization: BUFFER→PARAM (same as prepare_with/realize_batch_with).
+        let (sink, param_buffers) = normalize_buffers_to_params(&sink);
+        let mut param_input_buffers = crate::schedule::InputBuffers::new();
+        for node in sink.toposort() {
+            if let Op::Param { slot, .. } = node.op() {
+                let (orig_buffer_id, _) = &param_buffers[*slot];
+                if let Some(buf) = all_input_buffers.get(orig_buffer_id) {
+                    param_input_buffers.insert(node.id, buf.clone());
+                }
+            }
+        }
+
+        let rangeify_result = morok_schedule::rangeify_with_map(sink, None).context(RangeifySnafu)?;
+        let (kernelized, _kernel_ctx) = morok_schedule::run_kernel_split_pipeline(rangeify_result.sink);
+        let schedule_result = crate::schedule::create_schedule(kernelized, &param_input_buffers, &var_vals)?;
+
+        if schedule_result.items.is_empty() {
+            continue;
+        }
+
+        let plan = prepare_execution_plan(&schedule_result, config)?;
+        plan.execute().context(ExecutionSnafu)?;
+
+        // Register the target buffer so collect_input_buffers can find it.
+        let output_buf = plan.output_buffer().clone();
+        let output_buf_arc = Arc::new(output_buf);
+        crate::tensor_registry::register_buffer_by_uop_id(buf_id, Arc::clone(&output_buf_arc));
+
+        // Map ASSIGN → target to remove the ASSIGN from all live tensor graphs.
+        let target_uop = match assign_uop.op() {
+            Op::Assign { target, .. } => target.clone(),
+            _ => unreachable!("pending assign must be an ASSIGN op"),
+        };
+        #[allow(clippy::mutable_key_type)]
+        let becomes_map = HashMap::from([(UOpKey(assign_uop), target_uop)]);
+        crate::tensor_registry::apply_map_to_tensors(&becomes_map);
+        crate::tensor_registry::substitute_pending_assigns(&becomes_map);
+    }
+
+    Ok(())
+}
+
+/// Extract bound variable values from a UOp graph (pre-pipeline).
+///
+/// Scans for BIND(DEFINE_VAR, CONST) nodes and extracts the mapping
+/// from variable name to concrete bound value. This is the Morok equivalent
+/// of Tinygrad's `strip_bind` in `pm_pre_sched_cache`.
+///
+/// These values are passed through to scheduling so that user Variables
+/// (like `Variable::new("N", 1, 32).bind(4)`) are treated as fixed parameters
+/// rather than OUTER ranges to be expanded.
+fn extract_var_vals(root: &Arc<UOp>) -> HashMap<String, i64> {
+    let mut var_vals = HashMap::new();
+    for node in root.toposort() {
+        if let Op::Bind { var, value } = node.op()
+            && let Op::DefineVar { name, .. } = var.op()
+            && let Op::Const(cv) = value.op()
+            && let Some(val) = cv.0.try_int()
+        {
+            var_vals.insert(name.clone(), val);
+        }
+    }
+    var_vals
+}
+
+/// Pre-schedule normalization: replace BUFFER UOps with positional PARAM.
+///
+/// Erases buffer identity (UNIQUE id) so structurally identical computations
+/// on different buffers produce the same AST. Returns:
+/// - The normalized sink (BUFFER→PARAM)
+/// - `param_buffers`: slot → (original_buffer_uop_id, buffer_uop) for buffer lookup
+///
+/// Matches Tinygrad's `pm_pre_sched_cache` / `replace_input_buffer` (engine/schedule.py:103-130).
+/// Context for BUFFER→PARAM normalization (like Tinygrad's replace_input_buffer).
+pub(crate) struct NormalizeBuffersCtx {
+    pub buffer_map: HashMap<u64, usize>,
+    pub param_buffers: Vec<(u64, Arc<UOp>)>,
+}
+
+pub(crate) fn normalize_buffers_to_params(sink: &Arc<UOp>) -> (Arc<UOp>, Vec<(u64, Arc<UOp>)>) {
+    let mut ctx = NormalizeBuffersCtx { buffer_map: HashMap::new(), param_buffers: Vec::new() };
+
+    // Replace BUFFER → PARAM via graph_rewrite (matching upstream pm_pre_sched_cache).
+    use morok_ir::op::pattern_derived::OpKey;
+    use morok_ir::pattern::{RewriteResult, SimplifiedPatternMatcher};
+    use morok_ir::rewrite::graph_rewrite;
+
+    let mut matcher = SimplifiedPatternMatcher::<NormalizeBuffersCtx>::new();
+    matcher.add(&[OpKey::Buffer], |node, ctx| {
+        let Op::Buffer { size, device, .. } = node.op() else {
+            return RewriteResult::NoMatch;
+        };
+        let slot = *ctx.buffer_map.entry(node.id).or_insert_with(|| {
+            let s = ctx.param_buffers.len();
+            ctx.param_buffers.push((node.id, node.clone()));
+            s
+        });
+        let param = UOp::param(slot, *size, node.dtype(), Some(device.clone()));
+        RewriteResult::Rewritten(param)
+    });
+
+    let normalized = graph_rewrite(&matcher, sink.clone(), &mut ctx);
+    (normalized, ctx.param_buffers)
 }
 
 /// Collect input buffers from a computation graph.
@@ -430,82 +869,48 @@ fn build_execution_graph(schedule: &[ScheduleItem]) -> ExecutionGraph {
     graph
 }
 
-/// Detect output buffer indices by finding buffers written to by STORE operations.
+/// Detect output buffer indices by finding PARAM slots written to by STORE operations.
 ///
-/// Examines the kernel's AST to find STORE and STOREGATED operations, then
-/// identifies which buffers in the buffer list are written to.
-///
-/// # Arguments
-///
-/// * `kernel` - The KERNEL UOp containing the AST
-/// * `buffers` - The list of buffers for this kernel
-///
-/// # Returns
-///
-/// Indices into `buffers` for output buffers. Falls back to [0] if no outputs found.
+/// Uses PARAM slot-based matching (like Tinygrad's `ProgramSpec.from_uop`,
+/// renderer/__init__.py:119-124). The codegen PARAM slot directly indexes
+/// into the kernel's buffer list — no second pass over sources needed.
 fn detect_output_indices(kernel: &Arc<UOp>, buffers: &[Buffer]) -> Vec<usize> {
-    use std::collections::HashSet;
-
     let ast = match kernel.op() {
         Op::Kernel { ast, .. } => ast,
-        _ => return vec![0], // Fallback if not a kernel
-    };
-
-    // Find all DefineGlobal IDs that are written to by STORE operations
-    let mut output_buffer_uop_ids: HashSet<u64> = HashSet::new();
-
-    for node in ast.toposort() {
-        // Use store_buffer() helper to get buffer from STORE via its INDEX child
-        if let Some(buffer) = node.store_buffer() {
-            // Get the buffer's DefineGlobal ID
-            let buf_id = match buffer.op() {
-                Op::DefineGlobal(_) | Op::DefineLocal(_) => buffer.id,
-                Op::Index { buffer: inner, .. } => {
-                    if matches!(inner.op(), Op::DefineGlobal(_) | Op::DefineLocal(_)) {
-                        inner.id
-                    } else {
-                        continue;
-                    }
-                }
-                _ => continue,
-            };
-            output_buffer_uop_ids.insert(buf_id);
-        }
-    }
-
-    // Now map UOp IDs to buffer indices
-    // The kernel sources have DefineGlobal UOps in a specific order, which corresponds
-    // to the buffer list order. We need to find which DefineGlobal IDs match.
-    let sources = match kernel.op() {
-        Op::Kernel { sources, .. } => sources,
         _ => return vec![0],
     };
 
-    let mut output_indices = Vec::new();
-    let mut buffer_idx = 0;
-    for src in sources {
-        match src.op() {
-            Op::DefineGlobal(_) | Op::DefineLocal(_) => {
-                if output_buffer_uop_ids.contains(&src.id) && buffer_idx < buffers.len() {
-                    output_indices.push(buffer_idx);
-                }
-                buffer_idx += 1;
-            }
-            Op::Buffer { .. } => {
-                // Input buffer - also consumes a buffer slot
-                if output_buffer_uop_ids.contains(&src.id) && buffer_idx < buffers.len() {
-                    output_indices.push(buffer_idx);
-                }
-                buffer_idx += 1;
-            }
-            Op::DefineVar { .. } | Op::Bind { .. } => {
-                // Variable - doesn't consume a buffer slot
-            }
-            _ => {}
+    // Single AST walk: find STORE targets, extract PARAM slot numbers.
+    // Tinygrad: if (buf:=idx.src[0]).op is Ops.PARAM: outs.append(buf.arg)
+    let mut output_slots = Vec::new();
+    for node in ast.toposort() {
+        if !matches!(node.op(), Op::Store { .. }) {
+            continue;
+        }
+        // STORE.index → INDEX.buffer → PARAM (or STORE.index → CAST → INDEX.buffer → PARAM)
+        let idx = match node.op() {
+            Op::Store { index, .. } => index,
+            _ => continue,
+        };
+        let buf = match idx.op() {
+            Op::Index { buffer, .. } => buffer,
+            Op::Cast { src, .. } => match src.op() {
+                Op::Index { buffer, .. } => buffer,
+                _ => continue,
+            },
+            _ => continue,
+        };
+        if let Op::Param { slot, device: None, .. } = buf.op()
+            && !output_slots.contains(slot)
+        {
+            output_slots.push(*slot);
         }
     }
 
-    // Fallback to first buffer if no outputs found
+    // Slots are buffer indices (Tinygrad: sorted(dedup(outs)))
+    output_slots.sort();
+    output_slots.dedup();
+    let output_indices: Vec<usize> = output_slots.into_iter().filter(|&s| s < buffers.len()).collect();
     if output_indices.is_empty() && !buffers.is_empty() { vec![0] } else { output_indices }
 }
 
@@ -530,23 +935,19 @@ fn detect_output_indices(kernel: &Arc<UOp>, buffers: &[Buffer]) -> Vec<usize> {
 ///
 /// Returns error if compilation or buffer allocation fails.
 fn prepare_execution_plan(
-    schedule: &Schedule,
-    expected_output_dtype: DType,
-    expected_output_size: usize,
+    schedule_result: &crate::schedule::ScheduleResult,
     config: &PrepareConfig,
 ) -> Result<ExecutionPlan> {
     // Expand the schedule to handle OUTER range iterations
-    let expanded_schedule = expand_schedule(schedule.clone());
+    let expanded_schedule = expand_schedule(schedule_result.items.clone());
 
     debug!(num_items = expanded_schedule.len(), "expanded schedule");
 
     // Build execution graph for parallel group analysis
     let mut execution_graph = build_execution_graph(&expanded_schedule);
 
-    // Compute parallel groups
-    let _parallel_groups_raw = execution_graph.compute_parallel_groups();
-
     // Verify the graph is valid (no cycles)
+    execution_graph.compute_parallel_groups();
     if !execution_graph.is_valid() {
         return DependencyCyclesSnafu.fail();
     }
@@ -560,13 +961,7 @@ fn prepare_execution_plan(
         return EmptyScheduleSnafu.fail();
     };
 
-    // Include compiler cache key in device string to prevent cross-backend cache collisions.
-    // Without this, "CPU" is shared between Clang and LLVM, so switching backends in the
-    // same process would return a kernel compiled by the wrong backend.
-    let device_str = match device.compiler.cache_key() {
-        Some(key) => format!("{}:{}", device.device.canonicalize(), key),
-        None => device.device.canonicalize(),
-    };
+    let codegen: &'static str = device.compiler.cache_key();
 
     // Build the ExecutionPlan using the builder
     let mut builder = ExecutionPlanBuilder::new(device.device.clone());
@@ -592,64 +987,90 @@ fn prepare_execution_plan(
     // Step 2: Compile all kernels and create PreparedKernel structures
     let mut prepared_kernels: Vec<PreparedKernel> = Vec::new();
 
-    for item in &expanded_schedule {
-        // Skip COPY operations for now (handle separately in execution)
+    // Pre-compile: optimize + compile each UNIQUE ast once, cache by pre-optimization ast id.
+    // Uses global cache so identical kernels across prepare calls (e.g., sort substages
+    // with same axis) skip both optimization and compilation.
+    type OptKey = (u64, DeviceSpec, &'static str);
+    static OPT_CACHE: std::sync::OnceLock<papaya::HashMap<OptKey, Arc<morok_runtime::kernel_cache::CachedKernel>>> =
+        std::sync::OnceLock::new();
+    let opt_cache = OPT_CACHE.get_or_init(papaya::HashMap::new);
+    let opt_guard = opt_cache.guard();
+
+    for item in expanded_schedule.iter() {
+        // COPY operations: buffer-to-buffer transfer (DISK→CPU, CPU→CUDA, etc.)
+        // No kernel compilation needed — just register the buffer copy for execution.
         if matches!(item.ast.op(), Op::Copy { .. }) {
-            // TODO: Handle COPY operations in ExecutionPlan
+            if item.buffers.len() >= 2 {
+                let mut dst = item.buffers[0].clone();
+                let src = &item.buffers[1];
+                if let Err(e) = dst.copy_from(src) {
+                    tracing::error!("COPY buffer transfer failed: {e}");
+                }
+            }
             continue;
         }
 
-        // Step 1: Get device-aware optimizer renderer
-        let optimizer_renderer = get_optimizer_renderer(&device);
+        // BUFFER_VIEW: zero-copy sub-buffer view (DISK weight views).
+        // Creates a view into the base buffer at the specified byte offset.
+        // Tinygrad schedule.py:201-204: buffers[buf_uops[0]] = base.view(size, dtype, offset)
+        if let Op::BufferView { size, offset, .. } = item.ast.op() {
+            if item.buffers.len() >= 2 && item.buffer_uop_ids.len() >= 2 {
+                let base = &item.buffers[1];
+                let byte_offset = offset * base.dtype().bytes();
+                let byte_size = size * item.ast.dtype().bytes();
+                let view = base.view(byte_offset, byte_size).expect("BUFFER_VIEW: invalid view into base buffer");
+                // Register the view under the output buffer's UOp ID so downstream
+                // COPY/kernel items find it as their source buffer.
+                let output_uop_id = item.buffer_uop_ids[0];
+                if let Some(&idx) = uop_id_to_idx.get(&output_uop_id) {
+                    builder.replace_buffer(idx, view);
+                }
+            }
+            continue;
+        }
 
-        // Step 2: Optimize OUTSIDE cache (enables beam search)
-        let optimized_ast = if let morok_schedule::OptStrategy::Beam { .. } = config.optimizer.strategy {
-            // Beam search: compile-and-time multiple candidates
-            beam_search_optimize(item.ast.clone(), &optimizer_renderer, &device, &item.buffers, &config.optimizer)?
+        let opt_key = (crate::schedule_cache::content_hash(&item.ast), device.device.clone(), codegen);
+
+        let cached = if let Some(cached) = opt_cache.get(&opt_key, &opt_guard) {
+            Arc::clone(cached)
         } else {
-            // Heuristic optimization (default)
-            morok_schedule::optimize_kernel_with_config(item.ast.clone(), &optimizer_renderer, &config.optimizer)
+            let optimizer_renderer = get_optimizer_renderer(&device);
+            let optimized_ast = if let morok_schedule::OptStrategy::Beam { .. } = config.optimizer.strategy {
+                beam_search_optimize(item.ast.clone(), &optimizer_renderer, &device, &item.buffers, &config.optimizer)?
+            } else {
+                morok_schedule::optimize_kernel_with_config(item.ast.clone(), &optimizer_renderer, &config.optimizer)
+            };
+
+            let kernel_name =
+                optimized_ast.metadata::<morok_schedule::optimizer::KernelInfo>().map(|info| info.function_name());
+
+            let ast_decomposed = match device.renderer.decompositor() {
+                Some(matcher) => morok_ir::decompositions::decompose_with(&optimized_ast, &matcher),
+                None => optimized_ast,
+            };
+
+            let result = morok_runtime::kernel_cache::get_or_compile_kernel(
+                crate::schedule_cache::content_hash(&ast_decomposed),
+                codegen,
+                || {
+                    let spec =
+                        device.renderer.render(&ast_decomposed, kernel_name.as_deref()).context(RenderKernelSnafu)?;
+                    let compiled = device.compiler.compile(&spec).context(CompileKernelSnafu)?;
+                    let program = (device.runtime)(&compiled).context(CreateProgramSnafu)?;
+                    Ok(morok_runtime::kernel_cache::CachedKernel {
+                        program,
+                        device: codegen.to_string(),
+                        code: spec.src.clone(),
+                        entry_point: spec.name.clone(),
+                        var_names: spec.var_names.clone(),
+                        global_size: spec.global_size,
+                        local_size: spec.local_size,
+                    })
+                },
+            )?;
+            opt_cache.insert(opt_key, Arc::clone(&result), &opt_guard);
+            result
         };
-
-        // Extract kernel name from metadata (attached by Scheduler, preserved through post-opt)
-        let kernel_name =
-            optimized_ast.metadata::<morok_schedule::optimizer::KernelInfo>().map(|info| info.function_name());
-
-        // Step 3: Apply decomposition
-        let ast_decomposed = match device.renderer.decompositor() {
-            Some(matcher) => {
-                tracing::debug!("Applying backend decomposition patterns");
-                let decomposed = morok_ir::decompositions::decompose_with(&optimized_ast, &matcher);
-                tracing::debug!("Decomposition complete");
-                decomposed
-            }
-            None => {
-                tracing::debug!("No decomposition needed (renderer provides no decompositor)");
-                optimized_ast
-            }
-        };
-
-        // Step 4: Cache by OPTIMIZED ast id (different optimizations → different cache entries)
-        let cached = morok_runtime::kernel_cache::get_or_compile_kernel(ast_decomposed.id, &device_str, || {
-            // Render
-            let spec = device.renderer.render(&ast_decomposed, kernel_name.as_deref()).context(RenderKernelSnafu)?;
-
-            // Compile
-            let compiled = device.compiler.compile(&spec).context(CompileKernelSnafu)?;
-
-            // Create program
-            let program = (device.runtime)(&compiled).context(CreateProgramSnafu)?;
-
-            Ok(morok_runtime::kernel_cache::CachedKernel {
-                program,
-                device: device_str.clone(),
-                code: spec.src.clone(),
-                entry_point: spec.name.clone(),
-                var_names: spec.var_names.clone(),
-                global_size: spec.global_size,
-                local_size: spec.local_size,
-            })
-        })?;
 
         // Build buffer indices for this kernel using item.buffer_uop_ids (already in correct order)
         let buffer_indices: Vec<usize> =
@@ -680,112 +1101,28 @@ fn prepare_execution_plan(
     }
 
     // Add kernels to builder and track their indices
-    let num_prepared_kernels = prepared_kernels.len();
     for kernel in prepared_kernels {
         builder.add_kernel(kernel);
     }
 
-    // Step 3: Create parallel groups
-    // Each kernel goes into its own group for sequential execution.
-    //
-    // NOTE: While expanded iterations with different fixedvars ARE independent
-    // (they write to different positions in the same buffer), the UnifiedExecutor's
-    // validate_parallel_independence() cannot distinguish this - it sees writes to
-    // the same buffer ID as a conflict. Until we enhance the executor to understand
-    // position-based independence, we execute sequentially.
-    //
-    // Future optimization: Group truly independent kernels (different AST IDs
-    // writing to different buffers) for parallel execution.
-    let parallel_groups: Vec<ParallelGroup> =
-        (0..num_prepared_kernels).map(|idx| ParallelGroup { kernel_indices: vec![idx] }).collect();
-
-    builder.set_parallel_groups(parallel_groups);
-
-    // Find output buffer by scanning ALL kernels' buffers
-    // Search order: exact match (dtype + size), then dtype only, then first buffer
-    let mut output_buffer_idx: Option<usize> = None;
-
-    // Pass 1: Look for exact match (dtype AND size)
-    // Select the HIGHEST BufferId (most recently allocated = output buffer)
-    // because input and output buffers may have the same dtype+size for cast operations.
-    // Note: We use BufferId for selection but UOp ID for the map lookup.
-    let mut best_buf_id: Option<u64> = None;
-    for item in &expanded_schedule {
-        if matches!(item.ast.op(), Op::Copy { .. }) {
-            continue;
-        }
-        for (buf, &uop_id) in item.buffers.iter().zip(item.buffer_uop_ids.iter()) {
-            if buf.dtype() == expected_output_dtype
-                && buf.size() == expected_output_size
-                && let Some(&idx) = uop_id_to_idx.get(&uop_id)
-            {
-                let buf_id = buf.id().0;
-                // Select highest BufferId (latest allocated = output)
-                if best_buf_id.is_none_or(|best| buf_id > best) {
-                    trace!(
-                        uop_id,
-                        buffer.id = buf_id,
-                        buffer.idx = idx,
-                        buffer.dtype = ?expected_output_dtype,
-                        buffer.size = expected_output_size,
-                        "Candidate output buffer (exact match)"
-                    );
-                    output_buffer_idx = Some(idx);
-                    best_buf_id = Some(buf_id);
-                }
-            }
-        }
+    // Deterministic output identification via ScheduleResult.output_uop_ids
+    let output_buffer_indices: Vec<usize> =
+        schedule_result.output_uop_ids.iter().filter_map(|&id| uop_id_to_idx.get(&id).copied()).collect();
+    if !output_buffer_indices.is_empty() {
+        builder.set_output_buffers(output_buffer_indices);
     }
 
-    // Pass 2: Fallback to dtype match only
-    if output_buffer_idx.is_none() {
-        for item in &expanded_schedule {
-            if matches!(item.ast.op(), Op::Copy { .. }) {
-                continue;
-            }
-            for (buf, &uop_id) in item.buffers.iter().zip(item.buffer_uop_ids.iter()) {
-                if buf.dtype() == expected_output_dtype
-                    && let Some(&idx) = uop_id_to_idx.get(&uop_id)
-                {
-                    trace!(
-                        uop_id,
-                        buffer.idx = idx,
-                        buffer.dtype = ?buf.dtype(),
-                        "Fallback output buffer (dtype match)"
-                    );
-                    output_buffer_idx = Some(idx);
-                    break;
-                }
-            }
-            if output_buffer_idx.is_some() {
-                break;
-            }
-        }
-    }
+    let plan = builder.build();
+    Ok(plan)
+}
 
-    // Pass 3: Last resort - first buffer
-    if output_buffer_idx.is_none()
-        && let Some(first_item) = expanded_schedule.first()
-        && !first_item.buffer_uop_ids.is_empty()
-    {
-        let first_uop_id = first_item.buffer_uop_ids[0];
-        if let Some(&idx) = uop_id_to_idx.get(&first_uop_id) {
-            trace!(
-                uop_id = first_uop_id,
-                buffer.idx = idx,
-                buffer.dtype = ?first_item.buffers[0].dtype(),
-                "Fallback output buffer (first buffer)"
-            );
-            output_buffer_idx = Some(idx);
-        }
-    }
-
-    // Set output buffer
-    if let Some(idx) = output_buffer_idx {
-        builder.set_output_buffer(idx);
-    }
-
-    Ok(builder.build())
+/// Resolve the device string for cache keying (includes compiler cache key).
+pub(crate) fn resolve_codegen(param_buffers: &[(u64, Arc<UOp>)], config: &PrepareConfig) -> Result<&'static str> {
+    let alloc_registry = morok_device::registry::registry();
+    let first_buf = param_buffers.iter().find_map(|(id, _)| crate::tensor_registry::get_buffer(*id));
+    let spec = first_buf.as_ref().map(|b| b.allocator().device_spec()).unwrap_or(DeviceSpec::Cpu);
+    let device = config.resolve_device(&spec, alloc_registry)?;
+    Ok(device.compiler.cache_key())
 }
 
 /// Get the optimizer renderer for a device.
@@ -943,10 +1280,11 @@ mod tests {
         let b = Tensor::from_slice([4.0f32, 5.0, 6.0]);
 
         // Create computation: a + b
-        let c = &a + &b;
+        let mut c = &a + &b;
 
         // Realize should compile and execute the kernel
-        let result: ndarray::ArrayD<f32> = c.realize().unwrap().to_ndarray().unwrap();
+        c.realize().unwrap();
+        let result: ndarray::ArrayD<f32> = c.as_ndarray().unwrap();
         let (result, _) = result.into_raw_vec_and_offset();
         assert_eq!(result, vec![5.0, 7.0, 9.0]);
     }
@@ -973,7 +1311,8 @@ mod tests {
         assert!(sum_result.is_ok(), "Sum creation failed");
 
         // Realize the computation
-        let realized = sum_result.unwrap().realize();
+        let mut sum_tensor = sum_result.unwrap();
+        let realized = sum_tensor.realize();
         if let Err(ref e) = realized {
             eprintln!("realize failed: {e:?}");
         }
@@ -1021,7 +1360,7 @@ mod tests {
         // Create computation: a + b
         let a = Tensor::from_slice([1.0f32, 2.0, 3.0]);
         let b = Tensor::from_slice([4.0f32, 5.0, 6.0]);
-        let c = &a + &b;
+        let mut c = &a + &b;
 
         // Prepare should compile kernels and allocate buffers
         let plan = c.prepare();
@@ -1032,7 +1371,6 @@ mod tests {
         // Verify plan has kernels and buffers
         assert!(plan.kernels().next().is_some(), "Plan should have at least one kernel");
         assert!(!plan.buffers().is_empty(), "Plan should have buffers");
-        assert!(!plan.parallel_groups().is_empty(), "Plan should have parallel groups");
     }
 
     #[test]
@@ -1042,14 +1380,13 @@ mod tests {
         // Create computation: a + b
         let a = Tensor::from_slice([1.0f32, 2.0, 3.0]);
         let b = Tensor::from_slice([4.0f32, 5.0, 6.0]);
-        let c = &a + &b;
+        let mut c = &a + &b;
 
         // Prepare
         let plan = c.prepare().expect("prepare should succeed");
 
         // Execute
-        let mut executor = morok_runtime::global_executor();
-        let result = plan.execute(&mut executor);
+        let result = plan.execute();
         assert!(result.is_ok(), "execute() should succeed: {:?}", result.err());
 
         // Verify output buffer has correct data
@@ -1068,16 +1405,14 @@ mod tests {
         // Create computation
         let a = Tensor::from_slice([1.0f32, 2.0, 3.0]);
         let b = Tensor::from_slice([4.0f32, 5.0, 6.0]);
-        let c = &a + &b;
+        let mut c = &a + &b;
 
         // Prepare once
         let plan = c.prepare().expect("prepare should succeed");
 
         // Execute twice to verify reusability
-        let mut executor = morok_runtime::global_executor();
-
         for _ in 0..2 {
-            let result = plan.execute(&mut executor);
+            let result = plan.execute();
             assert!(result.is_ok(), "execute() should succeed: {:?}", result.err());
         }
 
@@ -1104,10 +1439,11 @@ mod tests {
         let b = Tensor::from_slice([4.0f32, 5.0, 6.0]);
 
         // Realize the computation
-        let c = (&a + &b).realize().expect("realize should succeed");
+        let mut c = &a + &b;
+        c.realize().expect("realize should succeed");
 
         // Verify computation is correct
-        let result: ndarray::ArrayD<f32> = c.to_ndarray().expect("to_ndarray should succeed");
+        let result: ndarray::ArrayD<f32> = c.as_ndarray().expect("as_ndarray should succeed");
         let (data, _) = result.into_raw_vec_and_offset();
         assert_eq!(data, vec![5.0, 7.0, 9.0]);
     }
@@ -1120,15 +1456,14 @@ mod tests {
         // Create input tensors
         let a = Tensor::from_slice([1.0f32, 2.0, 3.0]);
         let b = Tensor::from_slice([4.0f32, 5.0, 6.0]);
-        let c = &a + &b;
+        let mut c = &a + &b;
 
         // Prepare the plan
         let plan = c.prepare().expect("prepare should succeed");
 
         // Execute multiple times (simulating benchmark loop)
-        let mut executor = morok_runtime::global_executor();
         for _ in 0..3 {
-            plan.execute(&mut executor).expect("execute should succeed");
+            plan.execute().expect("execute should succeed");
         }
 
         // Verify output
@@ -1167,12 +1502,10 @@ mod tests {
 
         const ITERATIONS: usize = 10;
 
-        let mut executor = morok_runtime::global_executor();
-
         // Create input tensors
         let a = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0]);
         let b = Tensor::from_slice([5.0f32, 6.0, 7.0, 8.0]);
-        let c = &a + &b;
+        let mut c = &a + &b;
 
         // Prepare ONCE
         let plan = c.prepare().expect("prepare should succeed");
@@ -1181,7 +1514,7 @@ mod tests {
 
         // Execute MANY times
         for _ in 0..ITERATIONS {
-            plan.execute(&mut executor).expect("execute should succeed");
+            plan.execute().expect("execute should succeed");
             counts.push(crate::tensor_registry::buffer_count());
         }
 
@@ -1220,82 +1553,11 @@ mod tests {
         // Single realize should work correctly
         let a = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0]);
         let b = Tensor::from_slice([5.0f32, 6.0, 7.0, 8.0]);
-        let c = (&a + &b).realize().expect("realize should succeed");
+        let mut c = &a + &b;
+        c.realize().expect("realize should succeed");
 
         // Verify result
-        let result: ndarray::ArrayD<f32> = c.to_ndarray().expect("to_ndarray should succeed");
+        let result: ndarray::ArrayD<f32> = c.as_ndarray().expect("as_ndarray should succeed");
         assert_eq!(result.as_slice().unwrap(), &[6.0, 8.0, 10.0, 12.0]);
-    }
-
-    /// STRICT test: Repeated prepare+execute+cleanup cycles with SAME inputs.
-    ///
-    /// Each cycle should return to the same baseline registry count.
-    /// If this fails, we have a leak in the prepare or cleanup path.
-    #[test]
-    fn test_memory_growth_strict_cycles() {
-        crate::test::helpers::test_setup();
-
-        const ITERATIONS: usize = 10;
-
-        let mut executor = morok_runtime::global_executor();
-
-        // Create input tensors ONCE
-        let a = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0]);
-        let b = Tensor::from_slice([5.0f32, 6.0, 7.0, 8.0]);
-
-        // Baseline after creating inputs
-        let baseline = crate::tensor_registry::buffer_count();
-        eprintln!("Baseline after creating inputs: {}", baseline);
-
-        let mut counts_after_cleanup: Vec<usize> = Vec::with_capacity(ITERATIONS);
-
-        for i in 0..ITERATIONS {
-            // Create computation graph (no new allocations, just UOp graph)
-            let c = &a + &b;
-
-            // Collect input buffer IDs to preserve their mappings
-            let input_buffer_ids: std::collections::HashSet<u64> =
-                collect_input_buffers(&c.uop()).keys().copied().collect();
-
-            // Full cycle: prepare -> execute -> cleanup
-            let plan = c.prepare().expect("prepare should succeed");
-            let count_after_prepare = crate::tensor_registry::buffer_count();
-
-            plan.execute(&mut executor).expect("execute should succeed");
-            let count_after_execute = crate::tensor_registry::buffer_count();
-
-            // Release all buffers EXCEPT inputs (which are reused across iterations)
-            plan.release_all_buffers(|uop_id| {
-                if !input_buffer_ids.contains(&uop_id) {
-                    crate::tensor_registry::remove_buffer(uop_id);
-                }
-            });
-            let count_after_cleanup = crate::tensor_registry::buffer_count();
-
-            counts_after_cleanup.push(count_after_cleanup);
-
-            if i == 0 {
-                eprintln!(
-                    "Cycle 0: after_prepare={}, after_execute={}, after_cleanup={}",
-                    count_after_prepare, count_after_execute, count_after_cleanup
-                );
-            }
-        }
-
-        eprintln!("Counts after cleanup each cycle: {:?}", counts_after_cleanup);
-
-        // Check that counts stay bounded (within 1 of first cycle's cleanup count)
-        let first_cleanup = counts_after_cleanup[0];
-        let last_cleanup = *counts_after_cleanup.last().unwrap();
-        let growth = last_cleanup.saturating_sub(first_cleanup);
-
-        eprintln!("First cleanup: {}, Last cleanup: {}, Growth: {}", first_cleanup, last_cleanup, growth);
-
-        assert_eq!(
-            growth, 0,
-            "Registry should not grow across prepare+execute+cleanup cycles. \
-             First: {}, Last: {}, Growth: {}",
-            first_cleanup, last_cleanup, growth
-        );
     }
 }

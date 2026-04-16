@@ -38,7 +38,6 @@ pub enum Op {
     Noop,
     #[pattern(skip)]
     Invalid,
-    DefineGlobal(usize),
     DefineLocal(usize),
 
     // Graph organization operations (2 variants)
@@ -74,7 +73,16 @@ pub enum Op {
         name: String,
     },
 
-    // Buffer operations (high-level, 7 variants)
+    // Buffer operations (high-level, 8 variants)
+    /// Normalized buffer parameter — positional reference to an input/output buffer.
+    /// Created by pre-schedule normalization (BUFFER→PARAM) to erase buffer identity,
+    /// enabling structural deduplication of identical computations on different buffers.
+    /// Matches Tinygrad's Ops.PARAM (engine/schedule.py:125).
+    Param {
+        slot: usize,
+        size: usize,
+        device: Option<Arc<UOp>>,
+    },
     Buffer {
         unique: Arc<UOp>,
         device: Arc<UOp>,
@@ -309,11 +317,14 @@ impl Op {
             | Self::Device(_)
             | Self::Noop
             | Self::Invalid
-            | Self::DefineGlobal(_)
             | Self::DefineLocal(_)
             | Self::VConst { .. }
             | Self::DefineVar { .. }
             | Self::DefineReg { .. } => SmallVec::new(),
+
+            // Param has optional device child — pre-kernel PARAMs have device, codegen PARAMs don't
+            Self::Param { device: Some(d), .. } => SmallVec::from_slice(&[d]),
+            Self::Param { device: None, .. } => SmallVec::new(),
 
             // Graph organization operations
             Self::Sink { sources } | Self::Group { sources } => sources.iter().collect(),

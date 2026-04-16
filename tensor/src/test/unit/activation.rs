@@ -98,7 +98,7 @@ fn test_silu_alias() {
 #[test]
 fn test_batchnorm_basic() {
     // Create input tensor [2, 3]
-    let x = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]).try_reshape(&[2, 3]).unwrap();
+    let x = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]).try_reshape([2, 3]).unwrap();
 
     // Create parameters (each has shape [3] for axis=1)
     let scale = Tensor::from_slice([1.0f32, 1.0, 1.0]);
@@ -123,7 +123,7 @@ fn test_batchnorm_basic() {
 
 #[test]
 fn test_batchnorm_no_scale_bias() {
-    let x = Tensor::from_slice([1.0f32, 2.0, 3.0]).try_reshape(&[3, 1]).unwrap();
+    let x = Tensor::from_slice([1.0f32, 2.0, 3.0]).try_reshape([3, 1]).unwrap();
 
     // Without scale/bias (None)
     let mean = Tensor::from_slice([2.0f32]);
@@ -138,7 +138,7 @@ fn test_batchnorm_no_scale_bias() {
 fn test_batchnorm_different_axis() {
     // Input shape [2, 3, 4] - normalize over axis 0
     // For axis=0, mean/scale/bias need shape [2] (size of dim 0)
-    let x = Tensor::from_slice([1.0f32; 24]).try_reshape(&[2, 3, 4]).unwrap();
+    let x = Tensor::from_slice([1.0f32; 24]).try_reshape([2, 3, 4]).unwrap();
 
     let scale = Tensor::from_slice([1.0f32, 1.0]);
     let bias = Tensor::from_slice([0.0f32, 0.0]);
@@ -164,7 +164,7 @@ fn test_batchnorm_different_axis() {
 #[test]
 fn test_batchnorm_4d() {
     // Input shape [2, 3, 4, 5] - typical CNN shape
-    let x = Tensor::from_slice([1.0f32; 120]).try_reshape(&[2, 3, 4, 5]).unwrap();
+    let x = Tensor::from_slice([1.0f32; 120]).try_reshape([2, 3, 4, 5]).unwrap();
 
     // BatchNorm2d normalizes over channels (axis=1)
     let scale = Tensor::from_slice([1.0f32, 1.0, 1.0]);
@@ -189,8 +189,10 @@ fn test_batchnorm_4d() {
 crate::codegen_tests! {
     fn test_softplus_values(config) {
         let x = Tensor::from_slice([0.0f32, 1.0, -1.0]);
+        let mut r = x.softplus(1.0).unwrap();
+        r.realize_with(&config).unwrap();
         crate::test::helpers::assert_close_f32(
-            &x.softplus(1.0).unwrap().realize_with(&config).unwrap().to_vec::<f32>().unwrap(),
+            &r.as_vec::<f32>().unwrap(),
             &[0.6931, 1.3133, 0.3133],
             1e-3,
         );
@@ -200,24 +202,32 @@ crate::codegen_tests! {
         let x = Tensor::from_slice([0.0f32, 1.0]);
         // softplus(0, beta=2) = log(1+exp(0))/2 = ln(2)/2 = 0.3466
         // softplus(1, beta=2) = log(1+exp(2))/2 = ln(8.389)/2 = 1.0635
-        crate::test::helpers::assert_close_f32(&x.softplus(2.0).unwrap().realize_with(&config).unwrap().to_vec::<f32>().unwrap(), &[0.3466, 1.0635], 1e-3);
+        let mut r = x.softplus(2.0).unwrap();
+        r.realize_with(&config).unwrap();
+        crate::test::helpers::assert_close_f32(&r.as_vec::<f32>().unwrap(), &[0.3466, 1.0635], 1e-3);
     }
 
     fn test_softplus_large_input(config) {
         // softplus(100) ≈ 100.0 (should not overflow to inf)
         let x = Tensor::from_slice([100.0f32, -100.0]);
-        crate::test::helpers::assert_close_f32(&x.softplus(1.0).unwrap().realize_with(&config).unwrap().to_vec::<f32>().unwrap(), &[100.0, 0.0], 1e-3);
+        let mut r = x.softplus(1.0).unwrap();
+        r.realize_with(&config).unwrap();
+        crate::test::helpers::assert_close_f32(&r.as_vec::<f32>().unwrap(), &[100.0, 0.0], 1e-3);
     }
 
     fn test_mish_values(config) {
         let x = Tensor::from_slice([0.0f32, 1.0, -1.0]);
-        crate::test::helpers::assert_close_f32(&x.mish().unwrap().realize_with(&config).unwrap().to_vec::<f32>().unwrap(), &[0.0, 0.8651, -0.3034], 1e-3);
+        let mut r = x.mish().unwrap();
+        r.realize_with(&config).unwrap();
+        crate::test::helpers::assert_close_f32(&r.as_vec::<f32>().unwrap(), &[0.0, 0.8651, -0.3034], 1e-3);
     }
 
     fn test_relu6_values(config) {
         let x = Tensor::from_slice([-1.0f32, 0.0, 3.0, 6.0, 9.0]);
+        let mut r = x.relu6().unwrap();
+        r.realize_with(&config).unwrap();
         crate::test::helpers::assert_close_f32(
-            &x.relu6().unwrap().realize_with(&config).unwrap().to_vec::<f32>().unwrap(),
+            &r.as_vec::<f32>().unwrap(),
             &[0.0, 0.0, 3.0, 6.0, 6.0],
             1e-4,
         );
@@ -225,8 +235,10 @@ crate::codegen_tests! {
 
     fn test_hardswish_values(config) {
         let x = Tensor::from_slice([-4.0f32, -3.0, 0.0, 3.0, 4.0]);
+        let mut r = x.hardswish().unwrap();
+        r.realize_with(&config).unwrap();
         crate::test::helpers::assert_close_f32(
-            &x.hardswish().unwrap().realize_with(&config).unwrap().to_vec::<f32>().unwrap(),
+            &r.as_vec::<f32>().unwrap(),
             &[0.0, 0.0, 0.0, 3.0, 4.0],
             1e-3,
         );
@@ -234,8 +246,10 @@ crate::codegen_tests! {
 
     fn test_softsign_values(config) {
         let x = Tensor::from_slice([-2.0f32, 0.0, 2.0]);
+        let mut r = x.softsign().unwrap();
+        r.realize_with(&config).unwrap();
         crate::test::helpers::assert_close_f32(
-            &x.softsign().unwrap().realize_with(&config).unwrap().to_vec::<f32>().unwrap(),
+            &r.as_vec::<f32>().unwrap(),
             &[-0.6667, 0.0, 0.6667],
             1e-3,
         );
@@ -243,6 +257,8 @@ crate::codegen_tests! {
 
     fn test_celu_values(config) {
         let x = Tensor::from_slice([-1.0f32, 0.0, 1.0]);
-        crate::test::helpers::assert_close_f32(&x.celu(1.0).unwrap().realize_with(&config).unwrap().to_vec::<f32>().unwrap(), &[-0.6321, 0.0, 1.0], 1e-3);
+        let mut r = x.celu(1.0).unwrap();
+        r.realize_with(&config).unwrap();
+        crate::test::helpers::assert_close_f32(&r.as_vec::<f32>().unwrap(), &[-0.6321, 0.0, 1.0], 1e-3);
     }
 }

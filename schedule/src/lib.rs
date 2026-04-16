@@ -55,8 +55,8 @@ pub use devectorize::devectorize;
 // Re-export gpudims pass
 pub use gpudims::pm_add_gpudims;
 
-// Re-export backend-agnostic passes
-pub use passes::pm_linearize_multi_index;
+// Re-export backend-agnostic passes (pm_linearize_multi_index removed: Tinygrad keeps multi-index INDEX)
+pub use passes::{build_linear_index, compute_row_major_strides, count_divmod, extract_index_dimension};
 
 // Re-export optimizer entry points
 pub use optimizer::{
@@ -71,3 +71,12 @@ pub use morok_ir::UOp;
 
 // Re-export the patterns! proc-macros
 pub use morok_macros::{cached_patterns, patterns};
+
+/// Compute inverse permutation (argsort).
+pub(crate) fn argsort(perm: &[usize]) -> Vec<usize> {
+    let mut inv = vec![0; perm.len()];
+    for (i, &p) in perm.iter().enumerate() {
+        inv[p] = i;
+    }
+    inv
+}

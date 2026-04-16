@@ -64,8 +64,9 @@ pub(crate) fn next_uop_id() -> u64 {
 struct UOpKey {
     op_discriminant: std::mem::Discriminant<Op>,
     dtype: DType,
-    src_ids: SmallVec<[u64; 4]>,
+    src_hashes: SmallVec<[u64; 4]>,
     op_data: OpData,
+    tag: Option<SmallVec<[usize; 2]>>,
     /// Pre-computed hash — avoids re-hashing on every HashMap operation.
     cached_hash: u64,
 }
@@ -84,8 +85,9 @@ impl PartialEq for UOpKey {
         self.cached_hash == other.cached_hash
             && self.op_discriminant == other.op_discriminant
             && self.dtype == other.dtype
-            && self.src_ids == other.src_ids
+            && self.src_hashes == other.src_hashes
             && self.op_data == other.op_data
+            && self.tag == other.tag
     }
 }
 
@@ -102,11 +104,8 @@ enum OpData {
     Const(ConstValueHash),
     Unique(usize),
     Device(DeviceSpec),
-    // DefineGlobal and DefineLocal include unique IDs to prevent hash consing
-    // across different kernels/realizations. Each kernel's DEFINE_GLOBAL(0)
-    // must be a distinct UOp, even though they have the same slot number.
-    DefineGlobal(usize, usize), // (slot, unique_id)
-    DefineLocal(usize, usize),  // (slot, unique_id)
+    // DefineLocal includes unique ID to prevent hash consing across kernels.
+    DefineLocal(usize, usize), // (slot, unique_id)
 
     // Grouped operations
     Unary(UnaryOp),
@@ -123,6 +122,7 @@ enum OpData {
 
     // Buffer operations
     BufferData(usize, usize), // (unique_id, size) - each buffer is unique
+    ParamData(usize, usize),  // (slot, size) — dedup by structure, matching Tinygrad's UOp cache
     BufferView(usize, usize),
     Bufferize(BufferizeOpts),
 
@@ -160,41 +160,36 @@ enum OpData {
     None,
 }
 
-/// Get child UOp stable IDs for hash consing.
+/// Get child UOp structural hashes for hash consing.
 ///
-/// Returns SmallVec of IDs, optimized for common case of ≤4 children (inline storage).
-fn src_ids(op: &Op) -> SmallVec<[u64; 4]> {
-    op.children().into_iter().map(|child| child.id).collect()
+/// Uses `content_hash` (structural) instead of `id` (identity) so that
+/// structurally identical children produce the same key — even if they're
+/// different `Arc` pointers. This makes hash consing truly structural,
+/// matching Tinygrad's behavior where `id()` works because hash consing
+/// guarantees same structure = same object.
+///
+/// Returns SmallVec of hashes, optimized for common case of ≤4 children (inline storage).
+fn src_hashes(op: &Op) -> SmallVec<[u64; 4]> {
+    op.children().into_iter().map(|child| child.content_hash).collect()
 }
 
 impl UOpKey {
-    fn new(op: &Op, dtype: DType) -> Self {
+    fn new(op: &Op, dtype: DType, tag: &Option<SmallVec<[usize; 2]>>) -> Self {
         let op_discriminant = discriminant(op);
-        let src_ids = src_ids(op);
+        let src_hashes = src_hashes(op);
 
         let op_data = match op {
-            // Nullary operations
             Op::Const(c) => OpData::Const(*c),
             Op::Unique(id) => OpData::Unique(*id),
             Op::Device(d) => OpData::Device(d.clone()),
-            // DEFINE_GLOBAL/LOCAL need unique IDs to prevent hash consing across kernels
-            Op::DefineGlobal(slot) => OpData::DefineGlobal(*slot, next_unique_id()),
             Op::DefineLocal(slot) => OpData::DefineLocal(*slot, next_unique_id()),
-
-            // Grouped operations
             Op::Unary(unary_op, _) => OpData::Unary(*unary_op),
             Op::Binary(binary_op, _, _) => OpData::Binary(*binary_op),
             Op::Ternary(ternary_op, _, _, _) => OpData::Ternary(*ternary_op),
-
-            // Type operations
             Op::Cast { dtype, .. } => OpData::CastDType(dtype.clone()),
             Op::BitCast { dtype, .. } => OpData::BitCastDType(dtype.clone()),
-
-            // Special operations
             Op::MSelect { device_index, .. } => OpData::MSelectIdx(*device_index),
             Op::Special { name, .. } => OpData::SpecialName(name.clone()),
-
-            // Buffer operations - include unique ID to prevent collision
             Op::Buffer { unique, size, .. } => {
                 if let Op::Unique(id) = unique.op() {
                     OpData::BufferData(*id, *size)
@@ -205,39 +200,45 @@ impl UOpKey {
             }
             Op::BufferView { size, offset, .. } => OpData::BufferView(*size, *offset),
             Op::Bufferize { opts, .. } => OpData::Bufferize(opts.clone()),
-
-            // Movement/Reshape operations
             Op::Permute { axes, .. } => OpData::PermuteAxes(axes.clone()),
             Op::Flip { axes, .. } => OpData::FlipAxes(axes.clone()),
             Op::Multi { axis, .. } => OpData::MultiAxis(*axis),
-
-            // Reduction operations
             Op::ReduceAxis { reduce_op, axes, .. } => OpData::ReduceAxisData(*reduce_op, axes.clone()),
             Op::Reduce { reduce_op, .. } => OpData::ReduceOp(*reduce_op),
             Op::AllReduce { reduce_op, .. } => OpData::AllReduceOp(*reduce_op),
-
-            // Control flow operations
             Op::Range { axis_id, axis_type, .. } => OpData::RangeData(*axis_id, *axis_type),
-
-            // Vector operations
             Op::Gep { indices, .. } => OpData::GepIndices(indices.clone()),
             Op::VConst { values } => OpData::VConstValues(values.iter().map(|v| ConstValueHash(*v)).collect()),
-
-            // Symbolic/Define operations
             Op::DefineVar { name, min_val, max_val } => OpData::DefineVarData(name.clone(), *min_val, *max_val),
             Op::DefineReg { size, id } => OpData::DefineRegData(*size, *id),
-
-            // Advanced operations
             Op::Wmma { metadata, .. } => OpData::WmmaData(metadata.clone().into()),
             Op::Contract { upcast_ranges, .. } => OpData::ContractRanges(upcast_ranges.clone()),
             Op::Unroll { unroll_axes, .. } => OpData::UnrollAxes(unroll_axes.clone()),
             Op::Custom { code, .. } | Op::CustomI { code, .. } => OpData::CustomCode(code.clone()),
-
-            // Movement operations with extra data
             Op::Contiguous { opts, .. } => OpData::ContiguousOpts(opts.to_vec()),
-
-            // All other operations have no semantic data beyond children and discriminant
-            _ => OpData::None,
+            Op::Param { slot, size, .. } => OpData::ParamData(*slot, *size),
+            // All remaining ops encode semantic data entirely through children
+            // (captured by src_hashes) — no extra OpData needed.
+            Op::Noop | Op::Invalid => OpData::None,
+            // Multi-child ops: children ARE the data
+            Op::Sink { .. }
+            | Op::Group { .. }
+            | Op::Vectorize { .. }
+            | Op::Cat { .. }
+            | Op::PtrCat { .. }
+            | Op::MStack { .. }
+            | Op::Barrier { .. } => OpData::None,
+            // Movement ops: shape/bounds are Arc<UOp> children
+            Op::Reshape { .. } | Op::Expand { .. } | Op::Pad { .. } | Op::Shrink { .. } => OpData::None,
+            // Memory/control: all fields are Arc<UOp> children
+            Op::Index { .. } | Op::PointerIndex { .. } | Op::Copy { .. } | Op::Load { .. } | Op::Store { .. } => {
+                OpData::None
+            }
+            Op::If { .. } | Op::EndIf { .. } | Op::End { .. } | Op::After { .. } => OpData::None,
+            // Single-source ops with no extra data
+            Op::Detach { .. } | Op::ContiguousBackward { .. } | Op::Precast { .. } => OpData::None,
+            // Binding/kernel: children encode all semantics
+            Op::Bind { .. } | Op::Kernel { .. } | Op::Assign { .. } => OpData::None,
         };
 
         // Pre-compute hash using xxhash (fast, non-cryptographic).
@@ -248,14 +249,15 @@ impl UOpKey {
             let mut h = Xxh64::new(0);
             op_discriminant.hash(&mut h);
             dtype.hash(&mut h);
-            for id in &src_ids {
+            for id in &src_hashes {
                 h.write_u64(*id);
             }
             op_data.hash(&mut h);
+            tag.hash(&mut h);
             h.finish()
         };
 
-        Self { op_discriminant, dtype, src_ids, op_data, cached_hash }
+        Self { op_discriminant, dtype, src_hashes, op_data, tag: tag.clone(), cached_hash }
     }
 }
 
@@ -341,33 +343,51 @@ impl UOp {
     ///
     /// The cache stores weak references. UOps are automatically cleaned up when
     /// no strong references remain (Tinygrad-aligned behavior).
+    #[inline]
     #[track_caller]
     pub fn new(op: Op, dtype: DType) -> Arc<Self> {
+        Self::new_tagged(op, dtype, None)
+    }
+
+    /// Create a UOp with an explicit tag (Tinygrad: `UOp(op, dtype, src, arg, tag)`).
+    /// Tag participates in hash consing — same structure + different tag = different UOp.
+    #[track_caller]
+    pub fn new_tagged(op: Op, dtype: DType, tag: Option<SmallVec<[usize; 2]>>) -> Arc<Self> {
         use papaya::{Compute, Operation};
 
-        // Capture caller location BEFORE entering any closures
         let caller_location = std::panic::Location::caller();
-        let key = UOpKey::new(&op, dtype.clone());
+        let key = UOpKey::new(&op, dtype.clone(), &tag);
         let guard = uops().guard();
 
         // Fast path: check if valid entry exists
         if let Some(weak) = uops().get(&key, &guard)
             && let Some(arc) = weak.upgrade()
         {
-            // Valid entry found - record provenance and return
             use crate::provenance::PROVENANCE_TRACKER;
             PROVENANCE_TRACKER.with(|tracker| {
                 tracker.borrow_mut().capture(arc.id, caller_location);
             });
             return arc;
         }
-        // Dead weak ref - will be replaced below
 
-        // Create new UOp (will be used if we win the race)
+        let content_hash = {
+            use xxhash_rust::xxh64::Xxh64;
+            let mut h = Xxh64::new(0);
+            std::mem::discriminant(&op).hash(&mut h);
+            dtype.hash(&mut h);
+            for child in op.children() {
+                h.write_u64(child.content_hash);
+            }
+            key.op_data.hash(&mut h);
+            h.finish()
+        };
+
         let new_arc = Arc::new(Self {
             id: next_uop_id(),
             op,
             dtype,
+            content_hash,
+            tag,
             shape_cache: std::sync::OnceLock::new(),
             ranges_cache: std::sync::OnceLock::new(),
             in_scope_ranges_cache: std::sync::OnceLock::new(),
@@ -379,36 +399,27 @@ impl UOp {
         });
         let new_weak = Arc::downgrade(&new_arc);
 
-        // Atomic insert: insert our weak ref, but if someone else has a valid one, use theirs
-        // Note: papaya's Insert replaces existing entries, which handles dead weak refs
         let result = uops().compute(
             key,
             |entry| match entry {
                 Some((_, existing_weak)) => {
                     if let Some(existing_arc) = existing_weak.upgrade() {
-                        // Valid entry exists - abort with it (reuse existing)
                         Operation::Abort(existing_arc)
                     } else {
-                        // Dead entry - replace with ours
                         Operation::Insert(new_weak.clone())
                     }
                 }
-                None => {
-                    // No entry - insert ours
-                    Operation::Insert(new_weak.clone())
-                }
+                None => Operation::Insert(new_weak.clone()),
             },
             &guard,
         );
 
-        // Determine which Arc to return based on compute result
         let final_arc = match result {
             Compute::Inserted(_, _) | Compute::Updated { .. } => new_arc,
             Compute::Aborted(existing_arc) => existing_arc,
-            _ => new_arc, // Fallback for Unchanged/Removed (shouldn't happen)
+            _ => new_arc,
         };
 
-        // Record provenance
         use crate::provenance::PROVENANCE_TRACKER;
         PROVENANCE_TRACKER.with(|tracker| {
             tracker.borrow_mut().capture(final_arc.id, caller_location);
@@ -463,6 +474,8 @@ impl UOp {
             id: next_uop_id(),
             op: self.op.clone(),
             dtype: self.dtype.clone(),
+            content_hash: self.content_hash, // same structure, same content hash
+            tag: self.tag.clone(),
             shape_cache: std::sync::OnceLock::new(),
             ranges_cache: std::sync::OnceLock::new(),
             in_scope_ranges_cache: std::sync::OnceLock::new(),

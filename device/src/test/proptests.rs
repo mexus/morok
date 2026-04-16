@@ -133,13 +133,13 @@ proptest! {
         }
 
         // Verify exactly one buffer was cached
-        prop_assert_eq!(alloc.cache_count(spec.size(), false), 1, "Expected exactly 1 buffer cached after dropping buffer+view");
+        prop_assert_eq!(alloc.cache_count(spec.size(), true), 1, "Expected exactly 1 buffer cached after dropping buffer+view");
 
         // Allocate again with same size - should reuse the single cached RawBuffer
         let _buffer2 = spec.alloc(alloc.clone())?;
 
         // Cache should now be empty (buffer was reused)
-        prop_assert_eq!(alloc.cache_count(spec.size(), false), 0, "Expected cache to be empty after reusing buffer");
+        prop_assert_eq!(alloc.cache_count(spec.size(), true), 0, "Expected cache to be empty after reusing buffer");
     }
 
     /// Property: zero_init works correctly with cache reuse.

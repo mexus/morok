@@ -89,6 +89,11 @@ pub enum RawBuffer {
         data: UnsafeCell<AlignedBuffer>,
         cpu_accessible: bool,
     },
+    /// Memory-mapped file region (read-only). Used by DISK device.
+    Mmap {
+        data: memmap2::Mmap,
+        size: usize,
+    },
     #[cfg(feature = "cuda")]
     CudaDevice {
         data: UnsafeCell<CudaSlice<u8>>,
@@ -113,6 +118,7 @@ impl std::fmt::Debug for RawBuffer {
             RawBuffer::Cpu { cpu_accessible, .. } => {
                 f.debug_struct("Cpu").field("cpu_accessible", cpu_accessible).finish_non_exhaustive()
             }
+            RawBuffer::Mmap { size, .. } => f.debug_struct("Mmap").field("size", size).finish_non_exhaustive(),
             #[cfg(feature = "cuda")]
             RawBuffer::CudaDevice { device, .. } => {
                 f.debug_struct("CudaDevice").field("device", device).finish_non_exhaustive()
@@ -131,6 +137,7 @@ impl RawBuffer {
         // SAFETY: Reading .len() doesn't alias with content access and is immutable after allocation
         match self {
             RawBuffer::Cpu { data, .. } => unsafe { (&*data.get()).len() },
+            RawBuffer::Mmap { size, .. } => *size,
             #[cfg(feature = "cuda")]
             RawBuffer::CudaDevice { data, .. } => unsafe { (&*data.get()).len() },
             #[cfg(feature = "cuda")]
@@ -142,6 +149,7 @@ impl RawBuffer {
     pub fn cpu_accessible(&self) -> bool {
         match self {
             RawBuffer::Cpu { cpu_accessible, .. } => *cpu_accessible,
+            RawBuffer::Mmap { .. } => true,
             #[cfg(feature = "cuda")]
             RawBuffer::CudaDevice { .. } => false,
             #[cfg(feature = "cuda")]
@@ -151,16 +159,22 @@ impl RawBuffer {
 }
 
 /// Options for buffer allocation.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 #[cfg_attr(feature = "proptest", derive(proptest_derive::Arbitrary))]
 pub struct BufferOptions {
     /// Whether to zero-initialize the buffer.
     pub zero_init: bool,
-    /// Hint that this buffer will be accessed from CPU (for unified memory).
+    /// Whether this buffer is CPU-accessible.
     ///
-    /// NOTE: CUDA unified memory is not yet implemented. Setting this to `true`
-    /// with CudaAllocator will panic in debug builds.
+    /// CPU allocator: always true (host memory is always accessible).
+    /// CUDA allocator: false = device-only (cuMemAlloc), true = unified (cuMemAllocManaged).
     pub cpu_accessible: bool,
+}
+
+impl Default for BufferOptions {
+    fn default() -> Self {
+        Self { zero_init: false, cpu_accessible: true }
+    }
 }
 
 pub trait Allocator: Send + Sync + std::fmt::Debug {
@@ -191,6 +205,50 @@ impl Allocator for CpuAllocator {
 
     fn device_spec(&self) -> morok_dtype::DeviceSpec {
         morok_dtype::DeviceSpec::Cpu
+    }
+}
+
+/// DISK allocator using memory-mapped files (Tinygrad: ops_disk.py).
+/// Read-only — cannot execute kernels. Data is transferred via COPY.
+#[derive(Debug, Clone)]
+pub struct DiskAllocator {
+    path: std::path::PathBuf,
+}
+
+impl DiskAllocator {
+    pub fn new(path: std::path::PathBuf) -> Self {
+        Self { path }
+    }
+}
+
+impl Allocator for DiskAllocator {
+    fn alloc(&self, size: usize, _options: &BufferOptions) -> Result<RawBuffer> {
+        let file = std::fs::File::open(&self.path).map_err(|e| crate::Error::CopyFailed {
+            reason: format!("DISK: failed to open {}: {e}", self.path.display()),
+        })?;
+        let file_size = file
+            .metadata()
+            .map_err(|e| crate::Error::CopyFailed {
+                reason: format!("DISK: failed to read metadata for {}: {e}", self.path.display()),
+            })?
+            .len() as usize;
+        if size > file_size {
+            return Err(crate::Error::CopyFailed {
+                reason: format!("DISK: requested {size} bytes but {} is only {file_size} bytes", self.path.display()),
+            });
+        }
+        let mmap = unsafe { memmap2::Mmap::map(&file) }.map_err(|e| crate::Error::CopyFailed {
+            reason: format!("DISK: mmap failed for {}: {e}", self.path.display()),
+        })?;
+        Ok(RawBuffer::Mmap { data: mmap, size })
+    }
+
+    fn name(&self) -> &str {
+        "DISK"
+    }
+
+    fn device_spec(&self) -> morok_dtype::DeviceSpec {
+        morok_dtype::DeviceSpec::Disk { path: self.path.clone() }
     }
 }
 
@@ -333,6 +391,7 @@ impl Allocator for LruAllocator {
                     RawBuffer::Cpu { data, .. } => {
                         unsafe { (*data.get()).fill(0) };
                     }
+                    RawBuffer::Mmap { .. } => panic!("DISK device is read-only: cannot zero-init mmap buffer"),
                     #[cfg(feature = "cuda")]
                     RawBuffer::CudaDevice { data, device } => {
                         let cuda_data = unsafe { &mut *data.get() };

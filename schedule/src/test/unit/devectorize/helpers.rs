@@ -82,37 +82,6 @@ pub fn apply_cast_after(uop: &Arc<UOp>) -> Arc<UOp> {
 }
 
 // =============================================================================
-// Legacy Phase Names (Backward Compatibility)
-// =============================================================================
-
-/// Legacy name for load_store_folding patterns (Phase 1).
-///
-/// Includes expand_index patterns.
-pub fn apply_phase1(uop: &Arc<UOp>) -> Arc<UOp> {
-    apply_load_store_folding(uop)
-}
-
-/// Legacy name for load_store_folding + correct_load_store + pm_render patterns (Phase 2).
-///
-/// Includes: GEP movement, PTRCAT distribution, split patterns, and GEP/CAT normalization.
-pub fn apply_phase2(uop: &Arc<UOp>) -> Arc<UOp> {
-    let patterns = load_store_folding_patterns() + correct_load_store_patterns() + pm_render();
-    graph_rewrite(&patterns, uop.clone(), &mut ())
-}
-
-/// Legacy name for bool_storage patterns (Phase 3).
-pub fn apply_phase3(uop: &Arc<UOp>) -> Arc<UOp> {
-    apply_bool_storage(uop)
-}
-
-/// Legacy name for pm_render patterns.
-///
-/// (Was gep_ptrcat_patterns)
-pub fn apply_gep_ptrcat_patterns(uop: &Arc<UOp>) -> Arc<UOp> {
-    apply_pm_render(uop)
-}
-
-// =============================================================================
 // Buffer Builders
 // =============================================================================
 
@@ -170,14 +139,18 @@ pub fn create_vector_index_iota(buffer: Arc<UOp>, count: usize) -> Arc<UOp> {
     UOp::new(Op::Index { buffer: buf_vec, indices: smallvec::smallvec![vec_idx], gate: None }, DType::Scalar(idx_dtype))
 }
 
-/// Convert a BUFFER to DEFINE_GLOBAL for testing.
+/// Convert a BUFFER to codegen PARAM for testing.
 ///
-/// In real code, this conversion happens during lowering. For tests,
-/// we create DEFINE_GLOBAL directly to match the expected input structure.
+/// In real code, this conversion happens during kernel splitting.
+/// For tests, we create codegen PARAM (device: None) directly.
 fn buffer_to_define(buffer: &Arc<UOp>) -> Arc<UOp> {
     static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    UOp::define_global(id, buffer.dtype())
+    let size = match buffer.dtype() {
+        DType::Ptr { size: Some(s), .. } => s,
+        _ => 1024,
+    };
+    UOp::param(id, size, buffer.dtype(), None)
 }
 
 /// Create a vector INDEX with offset: [offset, offset+1, offset+2, ..., offset+count-1].

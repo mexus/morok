@@ -321,12 +321,16 @@ pub fn apply_unroll(scheduler: &mut Scheduler) -> bool {
 // ============================================================================
 
 /// Upcast small masked dimensions (size <= 7).
+///
+/// Matches Tinygrad heuristic.py:97-105: collect all masked-upcastable axes first,
+/// then apply in REVERSE order. Reverse iteration is critical — upcast of a higher-indexed
+/// axis doesn't shift lower-indexed axes in the rngs list, preserving index validity.
 pub fn apply_masked_upcasts(scheduler: &mut Scheduler) -> bool {
-    let mut applied = false;
     let upcastable = scheduler.upcastable_dims();
 
-    // Tinygrad caps total masked upcast product at 7*7=49.
+    // Phase 1: Collect candidates (Tinygrad heuristic.py:97-104)
     let mut product: i64 = 1;
+    let mut to_upcast: Vec<(usize, usize)> = Vec::new();
 
     for axis_idx in upcastable {
         if !is_masked(scheduler, axis_idx) {
@@ -343,53 +347,44 @@ pub fn apply_masked_upcasts(scheduler: &mut Scheduler) -> bool {
             && size > 1
             && size <= 7
             && product * size <= 49
-            && apply_opt(scheduler, &Opt::upcast(axis_idx, size as usize), true).is_ok()
         {
+            to_upcast.push((axis_idx, size as usize));
             product *= size;
+        }
+    }
+
+    // Phase 2: Apply in reverse order (Tinygrad: to_upcast[::-1])
+    let mut applied = false;
+    for (axis_idx, size) in to_upcast.into_iter().rev() {
+        if apply_opt(scheduler, &Opt::upcast(axis_idx, size), true).is_ok() {
             applied = true;
         }
     }
     applied
 }
 
-/// Grouped reduction for large reduce dimensions (> threshold).
+/// Grouped reduction for small output dimensions (Tinygrad heuristic.py:83-89).
+///
+/// When the product of upcastable output dimensions is small (<= 2048),
+/// apply GROUPTOP on output axes to enable local reduction.
 pub fn try_grouped_reduction(scheduler: &mut Scheduler, config: &HeuristicsConfig) -> bool {
-    if !scheduler.renderer().has_local || config.disable_locals {
-        return false;
-    }
-    let reduce_axes = scheduler.axes_of(&[AxisType::Reduce]);
-    if reduce_axes.is_empty() {
+    if !scheduler.renderer().has_local || config.disable_locals || !scheduler.renderer().has_shared {
         return false;
     }
 
-    let rngs = scheduler.rngs();
-    let mut largest_axis = None;
-    let mut largest_size = 0;
-    let threshold = config.grouped_threshold as i64;
+    // Tinygrad: prod(k.output_shape[i] for i in k.upcastable_dims) <= 2048
+    let upcastable = scheduler.upcastable_dims();
+    let full_shape = scheduler.full_shape();
+    let group_for_reduces: i64 = upcastable.iter().map(|&i| full_shape.get(i).copied().unwrap_or(1)).product();
 
-    for &axis_idx in &reduce_axes {
-        if axis_idx >= rngs.len() {
-            continue;
-        }
-        let rng = &rngs[axis_idx];
-        if let Op::Range { end, .. } = rng.op()
-            && let Op::Const(cv) = end.op()
-            && let morok_ir::ConstValue::Int(size) = cv.0
-            && size > largest_size
-        {
-            largest_size = size;
-            largest_axis = Some(axis_idx);
-        }
-    }
-
-    if largest_size <= threshold {
+    if group_for_reduces > 2048 {
         return false;
     }
-    if let Some(axis_idx) = largest_axis
-        && let Some(logical) = reduce_axes.iter().position(|&a| a == axis_idx)
-    {
-        let group_size = (config.grouped_threshold).min(largest_size as usize);
-        if apply_opt(scheduler, &Opt::group(logical, group_size), true).is_ok() {
+
+    // Tinygrad: for axis, sz in itertools.product((0, 1, 2), (16,)):
+    //   try: k.apply_opt(Opt(OptOps.GROUPTOP, axis, sz)); break
+    for axis in 0..3 {
+        if apply_opt(scheduler, &Opt::grouptop(axis, 16), true).is_ok() {
             return true;
         }
     }
@@ -670,37 +665,80 @@ pub fn apply_heuristic_upcasts(scheduler: &mut Scheduler) -> bool {
     applied
 }
 
-/// GPU workgroup configuration (2D for 2D+ kernels, 1D fallback).
+/// Stride-ranked LOCAL workgroup configuration (Tinygrad heuristic.py:156-175).
+///
+/// Prioritizes expand axes (stride-0 in some buffer = broadcast) for LOCAL,
+/// then higher axis indices. Tries sizes [32, 16, 8, 4, 3, 2] for axis 0
+/// and [16, 8, 4, 3, 2] for others, with cumulative LOCAL size ≤ 128.
 pub fn apply_local_dims(scheduler: &mut Scheduler, config: &HeuristicsConfig) -> bool {
     if !scheduler.renderer().has_local || config.disable_locals {
         return false;
     }
-    let global_axes = scheduler.axes_of(&[AxisType::Global]);
-    if global_axes.is_empty() {
-        return false;
+
+    // Rank axes: (has_expand_pattern, axis_index)
+    // Tinygrad: prioritize expand axes (stride-0 in some buffer), then higher indices
+    let eligible_axes = scheduler.axes_of(&[AxisType::Global, AxisType::Loop]);
+    let full_shape = scheduler.full_shape();
+
+    let mut local_axis_ranking: Vec<(bool, usize)> = Vec::new();
+    for &axis in &eligible_axes {
+        let rngs = scheduler.rngs();
+        if axis >= rngs.len() {
+            continue;
+        }
+        // Only CONST-end ranges (no symbolic dims)
+        if let Op::Range { end, .. } = rngs[axis].op() {
+            if !matches!(end.op(), Op::Const(..)) {
+                continue;
+            }
+        } else {
+            continue;
+        }
+        let is_expand = has_broadcast_pattern(scheduler, axis);
+        local_axis_ranking.push((is_expand, axis));
     }
 
-    let local_max = scheduler.renderer().local_max.unwrap_or(1024);
-    let output_shape = scheduler.output_shape();
+    // Sort descending by (is_expand, axis) — expand axes first, higher index first
+    local_axis_ranking.sort_by(|a, b| b.cmp(a));
 
-    // 2D layout for 2D+ kernels
-    if output_shape.len() >= 2 && global_axes.len() >= 2 && local_max >= 256 {
-        let axis0 = global_axes[0];
-        let axis1 = global_axes[1];
-        if apply_opt(scheduler, &Opt::local(axis0, 16), true).is_ok() {
-            let _ = apply_opt(scheduler, &Opt::local(axis1, 16), true);
-            return true;
+    // Collect LOCAL candidates with cumulative size constraint
+    let mut to_local: Vec<(usize, usize)> = Vec::new();
+    for &(_, axis) in &local_axis_ranking {
+        let cumulative_local: usize = to_local.iter().map(|(_, sz)| *sz).product::<usize>().max(1);
+        let axis_size = full_shape[axis];
+        if axis_size <= 0 {
+            continue;
+        }
+
+        // Tinygrad: axis 0 gets [32, 16, 8, 4, 3, 2], others get [16, 8, 4, 3, 2]
+        let candidates: &[usize] = if axis == 0 { &[32, 16, 8, 4, 3, 2] } else { &[16, 8, 4, 3, 2] };
+
+        let local_sz =
+            candidates.iter().copied().find(|&x| (axis_size as usize).is_multiple_of(x) && cumulative_local * x <= 128);
+
+        if let Some(sz) = local_sz {
+            to_local.push((axis, sz));
         }
     }
 
-    // 1D fallback
-    if !global_axes.is_empty() {
-        let local_size = local_max.min(256);
-        if apply_opt(scheduler, &Opt::local(global_axes[0], local_size), true).is_ok() {
-            return true;
+    // Apply at most 3 LOCALs, sorted by axis (ascending)
+    // Track deleted shapes: if local_sz == full_shape[axis], axis merges and shifts indices
+    let mut to_apply: Vec<(usize, usize)> = to_local.into_iter().take(3).collect();
+    to_apply.sort();
+
+    let mut applied = false;
+    let mut deleted_shape = 0usize;
+    for (axis, local_sz) in to_apply {
+        let adjusted_axis = axis - deleted_shape;
+        let will_delete = local_sz == full_shape[axis] as usize;
+        if apply_opt(scheduler, &Opt::local(adjusted_axis, local_sz), true).is_ok() {
+            applied = true;
+            if will_delete {
+                deleted_shape += 1;
+            }
         }
     }
-    false
+    applied
 }
 
 /// Tensor core optimization for matmul patterns.

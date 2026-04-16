@@ -10,7 +10,8 @@ morok_tensor::codegen_tests! {
         };
 
         let result = registry.dispatch("Constant", "", &[], &node).unwrap();
-        let realized = result.contiguous().realize_with(&config).unwrap();
+        let mut realized = result.contiguous();
+        realized.realize_with(&config).unwrap();
         assert!(realized.buffer().is_some());
     }
 
@@ -22,9 +23,9 @@ morok_tensor::codegen_tests! {
             ..Default::default()
         };
 
-        let result = registry.dispatch("Constant", "", &[], &node).unwrap();
-        let realized = result.realize_with(&config).unwrap();
-        assert!(realized.buffer().is_some());
+        let mut result = registry.dispatch("Constant", "", &[], &node).unwrap();
+        result.realize_with(&config).unwrap();
+        assert!(result.buffer().is_some());
     }
 
     fn test_constant_value_int(config) {
@@ -36,7 +37,8 @@ morok_tensor::codegen_tests! {
         };
 
         let result = registry.dispatch("Constant", "", &[], &node).unwrap();
-        let realized = result.contiguous().realize_with(&config).unwrap();
+        let mut realized = result.contiguous();
+        realized.realize_with(&config).unwrap();
         assert!(realized.buffer().is_some());
     }
 
@@ -48,9 +50,9 @@ morok_tensor::codegen_tests! {
             ..Default::default()
         };
 
-        let result = registry.dispatch("Constant", "", &[], &node).unwrap();
-        let realized = result.realize_with(&config).unwrap();
-        assert!(realized.buffer().is_some());
+        let mut result = registry.dispatch("Constant", "", &[], &node).unwrap();
+        result.realize_with(&config).unwrap();
+        assert!(result.buffer().is_some());
     }
 
     fn test_constant_value_tensor(config) {
@@ -64,8 +66,8 @@ morok_tensor::codegen_tests! {
             ..Default::default()
         };
 
-        let result = registry.dispatch("Constant", "", &[], &node).unwrap();
-        let realized = result.realize_with(&config).unwrap();
-        assert!(realized.buffer().is_some());
+        let mut result = registry.dispatch("Constant", "", &[], &node).unwrap();
+        result.realize_with(&config).unwrap();
+        assert!(result.buffer().is_some());
     }
 }

@@ -1,3 +1,4 @@
+use crate::test::helpers::RealizeTestExt;
 use crate::*;
 use morok_dtype::DType;
 use ndarray::array;
@@ -17,7 +18,8 @@ crate::codegen_tests! {
         let result = idx.one_hot_along_dim(3, -1).unwrap();
         let shape = get_shape(&result);
         assert_eq!(shape, vec![3, 3]);
-        let realized = result.contiguous().realize_with(&config).unwrap();
+        let mut realized = result.contiguous();
+        realized.realize_with(&config).unwrap();
         let view = realized.array_view::<bool>().unwrap();
         // Row 0: [true, false, false]
         assert!(view[[0, 0]]);
@@ -42,7 +44,8 @@ crate::codegen_tests! {
         let x = Tensor::from_slice([0.0f32, 0.0, 0.0, 0.0, 0.0]);
         let idx = Tensor::from_slice([1i32, 3, 0]);
         let src = Tensor::from_slice([10.0f32, 20.0, 30.0]);
-        let result = x.scatter(0, &idx, &src).unwrap().contiguous().realize_with(&config).unwrap();
+        let mut result = x.scatter(0, &idx, &src).unwrap().contiguous();
+        result.realize_with(&config).unwrap();
         let view = result.array_view::<f32>().unwrap();
         assert_eq!(view[[0]], 30.0); // index 0 got 30
         assert_eq!(view[[1]], 10.0); // index 1 got 10
@@ -53,12 +56,11 @@ crate::codegen_tests! {
         let x = Tensor::from_slice([0.0f32, 0.0, 0.0]);
         let idx = Tensor::from_slice([0i32, 0, 1]);
         let src = Tensor::from_slice([1.0f32, 2.0, 3.0]);
-        let result = x
+        let mut result = x
             .scatter_reduce(0, &idx, &src, crate::indexing::ScatterReduction::Sum, true)
             .unwrap()
-            .contiguous()
-            .realize_with(&config)
-            .unwrap();
+            .contiguous();
+        result.realize_with(&config).unwrap();
         let view = result.array_view::<f32>().unwrap();
         // index 0: 0 + 1 + 2 = 3, index 1: 0 + 3 = 3, index 2: 0
         assert_eq!(view[[0]], 3.0);
@@ -70,7 +72,8 @@ crate::codegen_tests! {
         let x = Tensor::from_ndarray(&ndarray::Array2::<f32>::zeros((3, 2)));
         let idx = Tensor::from_ndarray(&array![[0i32, 1]]);
         let src = Tensor::from_ndarray(&array![[10.0f32, 20.0]]);
-        let result = x.scatter(0, &idx, &src).unwrap().contiguous().realize_with(&config).unwrap();
+        let mut result = x.scatter(0, &idx, &src).unwrap().contiguous();
+        result.realize_with(&config).unwrap();
         assert_eq!(get_shape(&result), vec![3, 2]);
         let view = result.array_view::<f32>().unwrap();
         assert_eq!(view[[0, 0]], 10.0);
@@ -85,8 +88,10 @@ crate::codegen_tests! {
         // 4 elements = n_stages=2 (power of 2) — larger sizes are very slow in debug builds
         let t = Tensor::from_slice([1.0f32, 4.0, 2.0, 3.0]);
         let (values, indices) = t.topk(2, -1, true).unwrap();
-        let values = values.contiguous().realize_with(&config).unwrap();
-        let indices = indices.realize_with(&config).unwrap();
+        let mut values = values.contiguous();
+        values.realize_with(&config).unwrap();
+        let mut indices = indices;
+        indices.realize_with(&config).unwrap();
         assert_eq!(get_shape(&values), vec![2]);
         assert_eq!(get_shape(&indices), vec![2]);
         let view = values.array_view::<f32>().unwrap();
@@ -97,7 +102,8 @@ crate::codegen_tests! {
     fn test_topk_smallest(config) {
         let t = Tensor::from_slice([1.0f32, 4.0, 2.0, 3.0]);
         let (values, _) = t.topk(2, -1, false).unwrap();
-        let values = values.contiguous().realize_with(&config).unwrap();
+        let mut values = values.contiguous();
+        values.realize_with(&config).unwrap();
         let view = values.array_view::<f32>().unwrap();
         assert_eq!(view[[0]], 1.0);
         assert_eq!(view[[1]], 2.0);
@@ -110,9 +116,10 @@ crate::codegen_tests! {
     fn test_masked_select_basic(config) {
         let t = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0, 5.0]);
         let mask = Tensor::from_slice([true, false, true, false, true]);
-        let result = t.masked_select(&mask).unwrap().realize_with(&config).unwrap();
+        let mut result = t.masked_select(&mask).unwrap();
+        result.realize_with(&config).unwrap();
         assert_eq!(get_shape(&result), vec![3]);
-        assert_eq!(result.to_vec::<f32>().unwrap(), [1.0, 3.0, 5.0]);
+        assert_eq!(result.as_vec::<f32>().unwrap(), [1.0, 3.0, 5.0]);
     }
 
     // =========================================================================
@@ -121,7 +128,8 @@ crate::codegen_tests! {
 
     fn test_nonzero_1d(config) {
         let t = Tensor::from_slice([1i32, 0, 2, 0, 3]);
-        let result = t.nonzero().unwrap().contiguous().realize_with(&config).unwrap();
+        let mut result = t.nonzero().unwrap().contiguous();
+        result.realize_with(&config).unwrap();
         assert_eq!(get_shape(&result), vec![3, 1]);
         let view = result.array_view::<i32>().unwrap();
         assert_eq!(view[[0, 0]], 0); // index of 1
@@ -132,27 +140,27 @@ crate::codegen_tests! {
     fn test_nonzero_2d_debug_coords(config) {
         // Test the coordinate building for nonzero on [2, 2]
         // coord0: arange(2) → [0, 1], reshape [2, 1], expand [2, 2], flatten → [0, 0, 1, 1]
-        let coord0 = Tensor::arange(0, Some(2), None)
+        let mut coord0 = Tensor::arange(0, Some(2), None)
             .unwrap()
-            .try_reshape(&[2, 1])
+            .try_reshape([2, 1])
             .unwrap()
-            .try_expand(&[2, 2])
+            .try_expand([2, 2])
             .unwrap()
             .flatten()
             .unwrap();
-        let c0 = coord0.realize_with(&config).unwrap().to_vec::<i32>().unwrap();
+        let c0 = coord0.realize_with_and(&config).as_vec::<i32>().unwrap();
         eprintln!("coord0 len: {}, vals: {:?}", c0.len(), c0);
 
         // coord1: arange(2) → [0, 1], reshape [1, 2], expand [2, 2], flatten → [0, 1, 0, 1]
-        let coord1 = Tensor::arange(0, Some(2), None)
+        let mut coord1 = Tensor::arange(0, Some(2), None)
             .unwrap()
-            .try_reshape(&[1, 2])
+            .try_reshape([1, 2])
             .unwrap()
-            .try_expand(&[2, 2])
+            .try_expand([2, 2])
             .unwrap()
             .flatten()
             .unwrap();
-        let c1 = coord1.realize_with(&config).unwrap().to_vec::<i32>().unwrap();
+        let c1 = coord1.realize_with_and(&config).as_vec::<i32>().unwrap();
         eprintln!("coord1 len: {}, vals: {:?}", c1.len(), c1);
 
         assert_eq!(c0, [0, 0, 1, 1]);
@@ -163,27 +171,28 @@ crate::codegen_tests! {
         // Test stack with lazy coordinate tensors
         let coord0 = Tensor::arange(0, Some(2), None)
             .unwrap()
-            .try_reshape(&[2, 1])
+            .try_reshape([2, 1])
             .unwrap()
-            .try_expand(&[2, 2])
+            .try_expand([2, 2])
             .unwrap()
             .flatten()
             .unwrap(); // [0, 0, 1, 1]
 
         let coord1 = Tensor::arange(0, Some(2), None)
             .unwrap()
-            .try_reshape(&[1, 2])
+            .try_reshape([1, 2])
             .unwrap()
-            .try_expand(&[2, 2])
+            .try_expand([2, 2])
             .unwrap()
             .flatten()
             .unwrap(); // [0, 1, 0, 1]
 
         let stacked = Tensor::stack(&[&coord0, &coord1], -1).unwrap();
         eprintln!("stacked uop tree:\n{}", stacked.uop().tree());
-        let stacked_realized = stacked.realize_with(&config).unwrap();
-        let stacked_vec = stacked_realized.to_vec::<i32>().unwrap();
-        let stacked_shape = get_shape(&stacked_realized);
+        let mut stacked = stacked;
+        stacked.realize_with(&config).unwrap();
+        let stacked_vec = stacked.as_vec::<i32>().unwrap();
+        let stacked_shape = get_shape(&stacked);
         eprintln!("stacked shape: {:?}", stacked_shape);
         eprintln!("stacked values: {:?}", stacked_vec);
         assert_eq!(stacked_shape, [4, 2]);
@@ -194,7 +203,8 @@ crate::codegen_tests! {
     fn test_nonzero_2d(config) {
         // [[1, 0], [1, 1]] — nonzero at (0,0), (1,0), (1,1)
         let t = Tensor::from_ndarray(&array![[1i32, 0], [1, 1]]);
-        let result = t.nonzero().unwrap().contiguous().realize_with(&config).unwrap();
+        let mut result = t.nonzero().unwrap().contiguous();
+        result.realize_with(&config).unwrap();
         assert_eq!(get_shape(&result), vec![3, 2]);
         let view = result.array_view::<i32>().unwrap();
         eprintln!("nonzero shape: {:?}", view.shape());
@@ -301,7 +311,7 @@ fn test_gather_dtype_preserved() {
 fn test_shrink_1d() {
     let t = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0, 5.0]);
 
-    let sliced = t.try_shrink(&[(1, 4)]).unwrap();
+    let sliced = t.try_shrink([(1, 4)]).unwrap();
     assert_eq!(get_shape(&sliced), vec![3]);
 }
 
@@ -309,7 +319,7 @@ fn test_shrink_1d() {
 fn test_shrink_2d() {
     let t = Tensor::from_ndarray(&array![[1.0f32, 2.0, 3.0], [4.0, 5.0, 6.0]]);
 
-    let sliced = t.try_shrink(&[(0, 1), (1, 3)]).unwrap();
+    let sliced = t.try_shrink([(0, 1), (1, 3)]).unwrap();
     assert_eq!(get_shape(&sliced), vec![1, 2]);
 }
 
@@ -318,7 +328,7 @@ fn test_shrink_negative_indices() {
     let t = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0, 5.0]);
 
     // -3 to -1 should give elements [3, 4]
-    let sliced = t.try_shrink(&[(-3, -1)]).unwrap();
+    let sliced = t.try_shrink([(-3, -1)]).unwrap();
     assert_eq!(get_shape(&sliced), vec![2]);
 }
 
@@ -327,13 +337,13 @@ fn test_shrink_full_dimension() {
     let t = Tensor::from_ndarray(&array![[1.0f32, 2.0, 3.0], [4.0, 5.0, 6.0]]);
 
     // Keep full first dim, slice second
-    let sliced = t.try_shrink(&[(0, 2), (1, 3)]).unwrap();
+    let sliced = t.try_shrink([(0, 2), (1, 3)]).unwrap();
     assert_eq!(get_shape(&sliced), vec![2, 2]);
 }
 
 #[test]
 fn test_shrink_empty_is_identity() {
     let t = Tensor::from_slice([1.0f32]);
-    let sliced = t.try_shrink(&[]).unwrap();
+    let sliced = t.try_shrink(&[] as &[(isize, isize)]).unwrap();
     assert_eq!(get_shape(&sliced), vec![1]);
 }
