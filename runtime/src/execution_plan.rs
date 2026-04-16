@@ -226,14 +226,23 @@ impl ExecutionPlan {
     /// are updated. Buffers must be allocated to max variable values (which is
     /// the default when using `Variable::bind()`).
     ///
+    /// # Safety contract
+    ///
+    /// Variable values **must** fall within `[min_val, max_val]` bounds defined
+    /// at `Variable::new()` time. Exceeding `max_val` causes out-of-bounds buffer
+    /// access (buffers are allocated to `max_val`). Use `Variable::bind()` to
+    /// validate bounds before calling this method.
+    ///
     /// Variables not present in `var_vals` keep their existing values from
     /// `prepare()` (or the previous `execute_with_vars` call). Internal
     /// variables like `thread_id` are left untouched.
     pub fn execute_with_vars(&mut self, var_vals: &[(&str, i64)]) -> Result<()> {
+        // Build a map for O(1) lookup (avoids O(V*K) linear scan per kernel)
+        let vals_map: HashMap<&str, i64> = var_vals.iter().copied().collect();
         for kernel in &mut self.kernels {
             for (idx, name) in kernel.kernel.var_names.iter().enumerate() {
-                if let Some((_, v)) = var_vals.iter().find(|(n, _)| *n == name.as_str()) {
-                    kernel.vals[idx] = *v;
+                if let Some(&v) = vals_map.get(name.as_str()) {
+                    kernel.vals[idx] = v;
                 }
             }
         }

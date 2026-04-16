@@ -40,8 +40,9 @@ use tracing::{debug, trace};
 use crate::{
     PrepareConfig, Result, Tensor,
     error::{
-        CompileKernelSnafu, CreateProgramSnafu, DependencyCyclesSnafu, DeviceSnafu, EmptyScheduleSnafu, ExecutionSnafu,
-        OptimizeSnafu, RangeifySnafu, RenderKernelSnafu, ShapeUnknownSnafu, UOpSnafu,
+        BatchOutputMismatchSnafu, CompileKernelSnafu, CreateProgramSnafu, DependencyCyclesSnafu, DeviceSnafu,
+        EmptyScheduleSnafu, ExecutionSnafu, OptimizeSnafu, RangeifySnafu, RenderKernelSnafu, ShapeUnknownSnafu,
+        UOpSnafu,
     },
     schedule::{ScheduleItem, expand_schedule},
 };
@@ -472,12 +473,9 @@ impl Tensor {
         let exec_ms = t_exec.elapsed().as_millis();
         debug!(prep_ms, exec_ms, num_outputs = pending_indices.len(), "realize_batch complete");
 
-        assert_eq!(
-            plan.num_outputs(),
-            pending_indices.len(),
-            "Expected {} outputs from plan, got {}",
-            pending_indices.len(),
-            plan.num_outputs()
+        snafu::ensure!(
+            plan.num_outputs() >= pending_indices.len(),
+            BatchOutputMismatchSnafu { expected: pending_indices.len(), actual: plan.num_outputs() }
         );
 
         // Finalize each pending tensor in-place + build batched becomes_map
@@ -531,12 +529,44 @@ impl Tensor {
         config: &PrepareConfig,
     ) -> Result<ExecutionPlan> {
         let mut tensors: Vec<&mut Tensor> = tensors.into_iter().collect();
-        let uops: Vec<Arc<UOp>> = tensors.iter().map(|t| t.uop()).collect();
+        if tensors.is_empty() {
+            return EmptyScheduleSnafu.fail();
+        }
+
+        // Handle already-realized tensors
+        for t in &mut tensors {
+            if t.uop().has_buffer_identity() {
+                t.ensure_buffer();
+            }
+        }
+
+        // Wrap pure constants in CONTIGUOUS to force materialization (matches realize())
+        for t in &mut tensors {
+            if !t.uop().has_buffer_identity() && is_any_const(&t.uop()) {
+                let contiguous_uop = t.uop().contiguous();
+                t.set_uop(contiguous_uop);
+            }
+        }
+
+        // Collect pending (unrealized) tensor indices
+        let pending_indices: Vec<usize> = tensors
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| !t.uop().has_buffer_identity() && !is_any_const(&t.uop()) && !t.has_zero_elements())
+            .map(|(i, _)| i)
+            .collect();
+
+        if pending_indices.is_empty() {
+            return EmptyScheduleSnafu.fail();
+        }
 
         // Resolve pending assigns so input buffers exist for scheduling.
-        for uop in &uops {
-            resolve_pending_assigns(uop, config)?;
+        for &i in &pending_indices {
+            resolve_pending_assigns(&tensors[i].uop(), config)?;
         }
+
+        // Collect UOps from pending tensors only
+        let uops: Vec<Arc<UOp>> = pending_indices.iter().map(|&i| tensors[i].uop()).collect();
 
         let mut all_input_buffers = crate::schedule::InputBuffers::new();
         let mut var_vals = HashMap::new();
@@ -545,6 +575,7 @@ impl Tensor {
             var_vals.extend(extract_var_vals(uop));
         }
 
+        // Create merged SINK(CONTIGUOUS(t1), ..., CONTIGUOUS(tN)) from pending tensors
         let contiguouses: Vec<Arc<UOp>> = uops.iter().map(|u| u.contiguous()).collect();
         let sink = UOp::sink(contiguouses);
 
@@ -560,8 +591,8 @@ impl Tensor {
         for node in sink.toposort() {
             if let Op::Param { slot, .. } = node.op() {
                 let (orig_buffer_id, _) = &param_buffers[*slot];
-                if let Some(buf) = crate::tensor_registry::get_buffer(*orig_buffer_id) {
-                    param_input_buffers.insert(node.id, buf);
+                if let Some(buf) = all_input_buffers.get(orig_buffer_id) {
+                    param_input_buffers.insert(node.id, buf.clone());
                 }
             }
         }
@@ -572,19 +603,20 @@ impl Tensor {
 
         let plan = prepare_execution_plan(&schedule_result, config)?;
 
-        // Wire each output tensor to its plan buffer.
+        // Wire each pending output tensor to its plan buffer.
         // After execute/execute_with_vars, tensor.array_view() reads the result directly.
-        for (i, t) in tensors.iter_mut().enumerate() {
-            if i >= plan.num_outputs() {
+        for (buf_idx, &orig_idx) in pending_indices.iter().enumerate() {
+            if buf_idx >= plan.num_outputs() {
                 break;
             }
-            let output_buf = plan.output_buffer_at(i).clone();
+            let output_buf = plan.output_buffer_at(buf_idx).clone();
             let buf_arc = Arc::new(output_buf);
-            let old_uop = &uops[i];
+            let old_uop = &uops[buf_idx];
             let output_dtype = old_uop.dtype();
             let output_device = buf_arc.allocator().device_spec();
             let num_elements = buf_arc.size() / output_dtype.bytes();
             let buffer_uop = UOp::new_buffer(output_device, num_elements, output_dtype);
+            let t = &mut tensors[orig_idx];
             crate::tensor_registry::register_buffer(buffer_uop.id, t.entry.id, buf_arc.clone());
             let shape = old_uop.shape().context(UOpSnafu)?.context(ShapeUnknownSnafu)?;
             let realized_uop = buffer_uop.try_reshape(shape).context(UOpSnafu)?;

@@ -14,6 +14,8 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use crate::argsort;
+
 use morok_device::DeviceSpec;
 use morok_dtype::{AddrSpace, DType, ScalarDType};
 use morok_ir::{AxisId, AxisType, BinaryOp, BufferizeOpts, ConstValue, Op, ReduceOp, UOp, UOpKey, UnaryOp};
@@ -231,15 +233,6 @@ fn found_contiguous(ctx: &mut ReplaceContiguousCtx, contig: &Arc<UOp>, src: &Arc
     // Map the base to the adjusted contiguous
     ctx.insert(UOpKey(base.clone()), adjusted_contig);
     None // Don't transform the CONTIGUOUS node itself; ALU pattern does the replacement
-}
-
-/// Compute inverse permutation (argsort).
-fn argsort(perm: &[usize]) -> Vec<usize> {
-    let mut inv = vec![0; perm.len()];
-    for (i, &p) in perm.iter().enumerate() {
-        inv[p] = i;
-    }
-    inv
 }
 
 // ============================================================================

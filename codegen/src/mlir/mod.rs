@@ -30,6 +30,7 @@ use morok_schedule::linearize::{line_rewrite_cleanups, linearize_with_cfg};
 use self::ctx::{RenderContext, ScfIfInfo, ScfLoopInfo};
 use self::ops::*;
 use self::types::{mlir_ptr_type, mlir_type};
+use crate::common::is_output_buffer;
 use crate::{BufferArg, RenderedKernel, Renderer, Result};
 
 /// MLIR-based renderer using Melior bindings.
@@ -1015,23 +1016,6 @@ fn to_index<'c>(
     loc: Location<'c>,
 ) -> melior::ir::Value<'c, 'c> {
     block.append_operation(arith::index_cast(val, index_type, loc)).result(0).unwrap().into()
-}
-
-fn is_output_buffer(def_global: &Arc<UOp>, nodes: &[Arc<UOp>]) -> bool {
-    let buffer_id = def_global.id;
-    for node in nodes {
-        if let Some(buffer) = node.store_buffer() {
-            if buffer.id == buffer_id {
-                return true;
-            }
-            if let Op::Index { buffer: idx_buf, .. } = buffer.op()
-                && idx_buf.id == buffer_id
-            {
-                return true;
-            }
-        }
-    }
-    false
 }
 
 /// Public render function for the MLIR backend.

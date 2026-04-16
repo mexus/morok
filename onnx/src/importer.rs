@@ -260,7 +260,8 @@ impl OnnxImporter {
         // All weights share ONE DISK buffer (matching Tinygrad's approach).
         // When model_path is None: fall back to eager loading via tensor_from_proto_ext.
         let mut initializers: HashMap<String, Tensor> = HashMap::new();
-        let initializer_names: Vec<String> = proto_graph.initializer.iter().map(|i| i.name.clone()).collect();
+        let initializer_names: std::collections::HashSet<String> =
+            proto_graph.initializer.iter().map(|i| i.name.clone()).collect();
 
         // Create DISK tensor if we have a file path
         let disk_tensor = model_path.map(|p| Tensor::from_path(p).expect("DISK tensor creation"));

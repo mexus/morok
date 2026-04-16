@@ -217,35 +217,28 @@ impl UOpKey {
             Op::Custom { code, .. } | Op::CustomI { code, .. } => OpData::CustomCode(code.clone()),
             Op::Contiguous { opts, .. } => OpData::ContiguousOpts(opts.to_vec()),
             Op::Param { slot, size, .. } => OpData::ParamData(*slot, *size),
-            _ => OpData::None,
-            // Op::Noop => todo!(),
-            // Op::Invalid => todo!(),
-            // Op::Sink { sources } => todo!(),
-            // Op::Group { sources } => todo!(),
-            // Op::Index { buffer, indices, gate } => todo!(),
-            // Op::PointerIndex { ptr, offset } => todo!(),
-            // Op::Copy { src, device } => todo!(),
-            // Op::MStack { buffers } => todo!(),
-            // Op::Reshape { src, new_shape } => todo!(),
-            // Op::Expand { src, new_shape } => todo!(),
-            // Op::Pad { src, begin_pads, end_pads } => todo!(),
-            // Op::Shrink { src, begins, ends } => todo!(),
-            // Op::If { condition, body } => todo!(),
-            // Op::EndIf { if_op } => todo!(),
-            // Op::End { computation, ranges } => todo!(),
-            // Op::Barrier { src, deps } => todo!(),
-            // Op::Vectorize { elements } => todo!(),
-            // Op::Cat { sources } => todo!(),
-            // Op::PtrCat { sources } => todo!(),
-            // Op::Bind { var, value } => todo!(),
-            // Op::Kernel { sources, ast } => todo!(),
-            // Op::Assign { target, value, movement_ops } => todo!(),
-            // Op::Detach { src } => todo!(),
-            // Op::ContiguousBackward { src } => todo!(),
-            // Op::After { passthrough, deps } => todo!(),
-            // Op::Precast { src } => todo!(),
-            // Op::Load { buffer, index, alt } => todo!(),
-            // Op::Store { index, value, ranges } => todo!(),
+            // All remaining ops encode semantic data entirely through children
+            // (captured by src_hashes) — no extra OpData needed.
+            Op::Noop | Op::Invalid => OpData::None,
+            // Multi-child ops: children ARE the data
+            Op::Sink { .. }
+            | Op::Group { .. }
+            | Op::Vectorize { .. }
+            | Op::Cat { .. }
+            | Op::PtrCat { .. }
+            | Op::MStack { .. }
+            | Op::Barrier { .. } => OpData::None,
+            // Movement ops: shape/bounds are Arc<UOp> children
+            Op::Reshape { .. } | Op::Expand { .. } | Op::Pad { .. } | Op::Shrink { .. } => OpData::None,
+            // Memory/control: all fields are Arc<UOp> children
+            Op::Index { .. } | Op::PointerIndex { .. } | Op::Copy { .. } | Op::Load { .. } | Op::Store { .. } => {
+                OpData::None
+            }
+            Op::If { .. } | Op::EndIf { .. } | Op::End { .. } | Op::After { .. } => OpData::None,
+            // Single-source ops with no extra data
+            Op::Detach { .. } | Op::ContiguousBackward { .. } | Op::Precast { .. } => OpData::None,
+            // Binding/kernel: children encode all semantics
+            Op::Bind { .. } | Op::Kernel { .. } | Op::Assign { .. } => OpData::None,
         };
 
         // Pre-compute hash using xxhash (fast, non-cryptographic).

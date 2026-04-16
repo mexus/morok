@@ -225,7 +225,9 @@ pub fn apply_post_optimization_with_renderer(
         elapsed_ms = t_stage.elapsed().as_millis() as u64,
         "Stage 10: after add local buffers"
     );
-    check_unroll_group("after_add_local_buffers", &with_local_buffers);
+    if cfg!(debug_assertions) {
+        check_unroll_group("after_add_local_buffers", &with_local_buffers);
+    }
 
     let t_stage = std::time::Instant::now();
     static PM_REDUCE_COMBINED: LazyLock<crate::TypedPatternMatcher<crate::devectorize::ReduceContext>> =
@@ -238,7 +240,9 @@ pub fn apply_post_optimization_with_renderer(
         elapsed_ms = t_stage.elapsed().as_millis() as u64,
         "after pm_reduce"
     );
-    check_unroll_group("after_pm_reduce", &reduced);
+    if cfg!(debug_assertions) {
+        check_unroll_group("after_pm_reduce", &reduced);
+    }
 
     let t_stage = std::time::Instant::now();
     let with_gpudims = if let Some(ren) = renderer {
@@ -252,7 +256,9 @@ pub fn apply_post_optimization_with_renderer(
         elapsed_ms = t_stage.elapsed().as_millis() as u64,
         "after pm_add_gpudims"
     );
-    check_unroll_group("after_pm_add_gpudims", &with_gpudims);
+    if cfg!(debug_assertions) {
+        check_unroll_group("after_pm_add_gpudims", &with_gpudims);
+    }
 
     let t_stage = std::time::Instant::now();
     let with_loads = graph_rewrite(pm_add_loads(), with_gpudims, &mut ());
@@ -262,24 +268,26 @@ pub fn apply_post_optimization_with_renderer(
         elapsed_ms = t_stage.elapsed().as_millis() as u64,
         "after pm_add_loads"
     );
-    check_unroll_group("after_pm_add_loads", &with_loads);
-    // Also check for any UNROLL or CONTRACT
-    for node in with_loads.toposort() {
-        if let morok_ir::Op::Unroll { src, unroll_axes, .. } = node.op() {
-            tracing::error!(
-                id = node.id,
-                src_op = src.op().as_ref(),
-                axes = ?unroll_axes,
-                "BEFORE devectorize: found UNROLL!"
-            );
-        }
-        if let morok_ir::Op::Contract { src, upcast_ranges, .. } = node.op() {
-            tracing::error!(
-                id = node.id,
-                src_op = src.op().as_ref(),
-                axes = ?upcast_ranges,
-                "BEFORE devectorize: found CONTRACT!"
-            );
+    if cfg!(debug_assertions) {
+        check_unroll_group("after_pm_add_loads", &with_loads);
+        // Also check for any UNROLL or CONTRACT
+        for node in with_loads.toposort() {
+            if let morok_ir::Op::Unroll { src, unroll_axes, .. } = node.op() {
+                tracing::error!(
+                    id = node.id,
+                    src_op = src.op().as_ref(),
+                    axes = ?unroll_axes,
+                    "BEFORE devectorize: found UNROLL!"
+                );
+            }
+            if let morok_ir::Op::Contract { src, upcast_ranges, .. } = node.op() {
+                tracing::error!(
+                    id = node.id,
+                    src_op = src.op().as_ref(),
+                    axes = ?upcast_ranges,
+                    "BEFORE devectorize: found CONTRACT!"
+                );
+            }
         }
     }
 

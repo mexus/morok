@@ -71,3 +71,12 @@ pub use morok_ir::UOp;
 
 // Re-export the patterns! proc-macros
 pub use morok_macros::{cached_patterns, patterns};
+
+/// Compute inverse permutation (argsort).
+pub(crate) fn argsort(perm: &[usize]) -> Vec<usize> {
+    let mut inv = vec![0; perm.len()];
+    for (i, &p) in perm.iter().enumerate() {
+        inv[p] = i;
+    }
+    inv
+}

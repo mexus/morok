@@ -15,6 +15,7 @@ pub(crate) fn op_rms_norm(inputs: &[Option<Tensor>], attrs: &mut Attrs) -> Resul
     let scale = inp(inputs, 1);
     let axis = attrs.int("axis", -1) as isize;
     let epsilon = attrs.float("epsilon", 1e-5) as f64;
+    let _stash_type = attrs.int("stash_type", 1); // consumed to avoid UnhandledAttributes
     Ok(x.rms_norm(axis, epsilon)?.try_mul(scale)?)
 }
 

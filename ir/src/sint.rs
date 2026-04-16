@@ -100,11 +100,6 @@ impl SInt {
         matches!(self, SInt::Symbolic(_))
     }
 
-    /// Check if this dimension is concrete (not symbolic and not infer).
-    pub fn is_concrete(&self) -> bool {
-        matches!(self, SInt::Const(_))
-    }
-
     /// Get concrete value if this is a constant, None otherwise.
     pub fn as_const(&self) -> Option<usize> {
         match self {

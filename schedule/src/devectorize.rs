@@ -1412,7 +1412,9 @@ fn split_load_store(ls: &Arc<UOp>, idx: &Arc<UOp>) -> Option<Arc<UOp>> {
 
     // Fold lengths (devectorizer.py:138-152)
     let buf_dtype = buf.dtype();
-    let is_amx = std::env::var("MOROK_AMX").is_ok_and(|v| v == "1");
+    static IS_AMX: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var("MOROK_AMX").is_ok_and(|v| v == "1"));
+    let is_amx = *IS_AMX;
 
     // AMX TC accumulators are stored in DEFINE_REG (AddrSpace::Reg) but need vector stores.
     // For STORE: check if VALUE comes from an AMX TC accumulator (DEFINE_REG with AddrSpace::Reg).

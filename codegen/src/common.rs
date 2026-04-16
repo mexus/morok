@@ -4,6 +4,25 @@ use std::sync::Arc;
 
 use morok_ir::{Op, UOp};
 
+/// Check whether a buffer (PARAM/DefineGlobal) is used as a STORE target in the graph.
+pub fn is_output_buffer(def_global: &Arc<UOp>, nodes: &[Arc<UOp>]) -> bool {
+    let buffer_id = def_global.id;
+
+    for node in nodes {
+        if let Some(buffer) = node.store_buffer() {
+            if buffer.id == buffer_id {
+                return true;
+            }
+            if let Op::Index { buffer: idx_buf, .. } = buffer.op()
+                && idx_buf.id == buffer_id
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Collect buffer and variable parameters from a UOp graph.
 ///
 /// Collects:

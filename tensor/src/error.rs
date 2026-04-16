@@ -119,6 +119,9 @@ pub enum Error {
     #[snafu(display("Empty schedule"))]
     EmptySchedule,
 
+    #[snafu(display("Batch output count mismatch: expected {expected}, got {actual}"))]
+    BatchOutputMismatch { expected: usize, actual: usize },
+
     #[snafu(display("Expected KERNEL operation"))]
     ExpectedKernelOp,
 

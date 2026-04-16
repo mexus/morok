@@ -10,6 +10,8 @@ use morok_dtype::DType;
 use morok_ir::{AxisId, AxisType, BinaryOp, ConstValue, Op, SInt, UOp, UOpKey};
 use tracing::{debug, info_span, instrument, trace, warn};
 
+use crate::argsort;
+
 // ============================================================================
 // Context
 // ============================================================================
@@ -40,6 +42,12 @@ impl IndexingContext {
     /// renumbering. The `renumber_range` pattern will later convert them to
     /// `AxisId::Renumbered` with sequential IDs starting from 0 for each kernel.
     pub fn new_range(&mut self, size: &SInt, axistype: AxisType) -> Arc<UOp> {
+        // If size is already a RANGE UOp, return it unchanged (Tinygrad indexing.py:46)
+        if let SInt::Symbolic(u) = size
+            && matches!(u.op(), Op::Range { .. })
+        {
+            return Arc::clone(u);
+        }
         // Check if size is constant 1
         if let SInt::Const(1) = size {
             return UOp::index_const(0);
@@ -987,15 +995,6 @@ fn extract_shape_from_uop(uop: &Arc<UOp>) -> Vec<SInt> {
     }
 }
 
-/// Compute inverse permutation (argsort).
-fn argsort(perm: &[usize]) -> Vec<usize> {
-    let mut inv = vec![0; perm.len()];
-    for (i, &p) in perm.iter().enumerate() {
-        inv[p] = i;
-    }
-    inv
-}
-
 // ============================================================================
 // Range Utilities (from helpers.rs)
 // ============================================================================
@@ -1154,33 +1153,6 @@ pub fn get_binary_op(uop: &Arc<UOp>) -> Option<BinaryOp> {
         Op::Binary(op, _, _) => Some(*op),
         _ => None,
     }
-}
-
-/// Check if op should always run (CONTIGUOUS, COPY, ASSIGN, NOOP).
-pub fn is_always_run_op(op: &Op) -> bool {
-    matches!(op, Op::Contiguous { .. } | Op::Copy { .. } | Op::Assign { .. } | Op::Noop)
-}
-
-/// Check if op is cheap to inline (CONST, Unary, Binary, Ternary, Cast, Gep, Vectorize).
-pub fn is_cheap_to_inline(op: &Op) -> bool {
-    matches!(
-        op,
-        Op::Const(_)
-            | Op::Unique(_)
-            | Op::Device(_)
-            | Op::Noop
-            | Op::DefineVar { .. }
-            | Op::DefineReg { .. }
-            | Op::VConst { .. }
-            // Note: Op::Unary excluded - needs buffering for reduce sources
-            | Op::Binary(..)
-            | Op::Ternary(..)
-            | Op::Cast { .. }
-            | Op::BitCast { .. }
-            | Op::Gep { .. }
-            | Op::Vectorize { .. }
-            | Op::PointerIndex { .. }
-    )
 }
 
 /// Check if a BUFFERIZE operation is for local memory.

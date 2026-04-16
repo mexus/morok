@@ -17,6 +17,7 @@ use morok_ir::pattern::TypedPatternMatcher;
 use morok_ir::{AxisType, Op, prelude::*};
 use morok_schedule::linearize::{line_rewrite_cleanups, linearize_with_cfg};
 
+use crate::common::is_output_buffer;
 use crate::llvm::common::{RenderContext, ldt};
 use crate::llvm::cpu::{reduce_identity, render_uop};
 use crate::{BufferArg, RenderedKernel, Renderer, Result};
@@ -227,24 +228,6 @@ attributes #0 = {{ nounwind "no-builtins" "no-trapping-math"="true" }}
     fn decompositor(&self) -> Option<TypedPatternMatcher<()>> {
         None
     }
-}
-
-fn is_output_buffer(def_global: &Arc<UOp>, nodes: &[Arc<UOp>]) -> bool {
-    let buffer_id = def_global.id;
-
-    for node in nodes {
-        if let Some(buffer) = node.store_buffer() {
-            if buffer.id == buffer_id {
-                return true;
-            }
-            if let Op::Index { buffer: idx_buf, .. } = buffer.op()
-                && idx_buf.id == buffer_id
-            {
-                return true;
-            }
-        }
-    }
-    false
 }
 
 fn mangle_type(llvm_type: &str) -> String {

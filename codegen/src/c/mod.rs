@@ -22,6 +22,7 @@ use morok_ir::pattern::TypedPatternMatcher;
 use morok_ir::{AxisType, Op, prelude::*};
 use morok_schedule::linearize::{line_rewrite_cleanups, linearize_with_cfg};
 
+use crate::common::is_output_buffer;
 use crate::{BufferArg, RenderedKernel, Result};
 
 use self::ops::{CContext, count_references, render_uop};
@@ -330,24 +331,6 @@ fn find_scope_escaping_vars(nodes: &[Arc<UOp>], ref_counts: &HashMap<u64, usize>
         .filter(|(id, def_d)| min_use_depth.get(id).copied().unwrap_or(*def_d) < *def_d)
         .map(|(id, _)| id)
         .collect()
-}
-
-fn is_output_buffer(def_global: &Arc<UOp>, nodes: &[Arc<UOp>]) -> bool {
-    let buffer_id = def_global.id;
-
-    for node in nodes {
-        if let Some(buffer) = node.store_buffer() {
-            if buffer.id == buffer_id {
-                return true;
-            }
-            if let Op::Index { buffer: idx_buf, .. } = buffer.op()
-                && idx_buf.id == buffer_id
-            {
-                return true;
-            }
-        }
-    }
-    false
 }
 
 /// Public render function for the C backend.
