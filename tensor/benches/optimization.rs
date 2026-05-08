@@ -14,7 +14,6 @@ use morok_schedule::{HeuristicsConfig, OptStrategy, OptimizerConfig};
 use morok_tensor::{PrepareConfig, Tensor};
 use ndarray::{Array, Dim};
 use std::env;
-use strum::Display;
 
 /// Create a test matrix of given size with sequential values.
 fn create_matrix(rows: usize, cols: usize) -> Tensor {
@@ -34,35 +33,18 @@ fn matmul_flops(m: usize, k: usize, n: usize) -> u64 {
     2 * (m as u64) * (k as u64) * (n as u64)
 }
 
-#[derive(Display)]
-enum Config {
-    #[strum(to_string = "HEURISTIC")]
-    Heuristic,
-    #[strum(to_string = "BEAM")]
-    Beam,
-}
-
-fn print_tree(config: Config, size: usize, plan: &morok_runtime::ExecutionPlan, result: &Tensor) {
+fn print_tree(config: &str, size: usize, plan: &morok_runtime::ExecutionPlan, result: &Tensor) {
     if env::var(KEY).is_ok() {
         // DEBUG: Print kernel info
-        eprintln!("\n=== {config} (size={size}) ===");
+        eprintln!("\n=== {config:?} (size={size}) ===");
         eprintln!("Kernel count: {}", plan.kernels().count());
 
-        match config {
-            Config::Heuristic => {
+        eprintln!("UOp tree:\n{}", result.uop().tree());
+        for (i, kernel) in plan.prepared_kernels().iter().enumerate() {
+            if env::var(KEY).is_ok() {
                 eprintln!("UOp tree:\n{}", result.uop().tree());
-                for (i, kernel) in plan.prepared_kernels().iter().enumerate() {
-                    if env::var(KEY).is_ok() {
-                        eprintln!("UOp tree:\n{}", result.uop().tree());
-                        eprintln!("  Kernel {}: {}", i, kernel.kernel.entry_point);
-                        eprintln!("{}", kernel.kernel.code);
-                    }
-                }
-            }
-            Config::Beam => {
-                for (i, kernel) in plan.kernels().enumerate() {
-                    eprintln!("  Kernel {}: {}", i, kernel.entry_point);
-                }
+                eprintln!("  Kernel {}: {}", i, kernel.kernel.entry_point);
+                eprintln!("{}", kernel.kernel.code);
             }
         }
     }
@@ -83,8 +65,7 @@ fn bench_matmul(c: &mut Criterion) {
     let beam_config: PrepareConfig =
         OptimizerConfig::builder().strategy(OptStrategy::Beam { width: BEAM_WIDTH }).build().into();
 
-    {
-        let size = 512;
+    for size in [512] {
         let flops = matmul_flops(size, size, size);
         group.throughput(Throughput::Elements(flops));
 
@@ -97,7 +78,7 @@ fn bench_matmul(c: &mut Criterion) {
             let mut result_h = a.matmul(&b).expect("matmul should succeed");
             let plan_h = result_h.prepare_with(&heuristic_config).expect("prepare should succeed");
 
-            print_tree(Config::Heuristic, size, &plan_h, &result_h);
+            print_tree("HEURISTIC", size, &plan_h, &result_h);
 
             group.bench_with_input(BenchmarkId::new("heuristic", size), &plan_h, |bencher, plan_h| {
                 bencher.iter(|| plan_h.execute().expect("execute should succeed"));
@@ -107,7 +88,7 @@ fn bench_matmul(c: &mut Criterion) {
             let mut result_b = a.matmul(&b).expect("matmul should succeed");
             let plan_b = result_b.prepare_with(&beam_config).expect("prepare should succeed");
 
-            print_tree(Config::Beam, size, &plan_b, &result_b);
+            print_tree("BEAM", size, &plan_b, &result_b);
 
             group.bench_with_input(
                 BenchmarkId::new(format!("beam_w{BEAM_WIDTH}"), size),
