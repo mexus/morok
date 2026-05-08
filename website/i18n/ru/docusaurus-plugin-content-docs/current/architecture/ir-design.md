@@ -159,18 +159,17 @@ Morok делает циклы *явными* через операции `RANGE`
 
 | AxisType | CPU | CUDA | Смысл |
 |----------|-----|------|-------|
-| **Outer** | — | — | Маркер границы ядра |
+| **Loop** | `for`-цикл | `for`-цикл | Последовательная итерация; default после rangeify |
 | **Global** | Thread pool | `blockIdx` | Внешняя параллельная размерность |
 | **Thread** | Thread pool | — | CPU-параллелизм |
-| **Local** | (N/A) | `threadIdx` | Параллелизм рабочей группы |
 | **Warp** | (N/A) | warp/wavefront | Субгрупповой параллелизм |
+| **Local** | (N/A) | `threadIdx` | Параллелизм рабочей группы |
 | **GroupReduce** | (N/A) | Shared memory | Двухстадийная редукция |
-| **Loop** | `for`-цикл | `for`-цикл | Последовательная итерация |
-| **Reduce** | Аккумулятор | Warp reduce | Размерность редукции |
 | **Upcast** | SIMD-вектор | Register tile | Векторизация |
+| **Reduce** | Аккумулятор | Warp reduce | Размерность редукции |
 | **Unroll** | Развёрнутый | Развёрнутый | Развёртка цикла |
 
-Иерархия AxisType (Outer → Global/Thread → Local/Warp/GroupReduce → Loop → Reduce → Upcast → Unroll) отображается на аппаратные модели выполнения. `RANGE` с `AxisType::Global` становится `blockIdx.x` в CUDA. `RANGE` с `AxisType::Local` становится `threadIdx.x`.
+Иерархия AxisType (Loop → Global/Thread → Warp → Local/GroupReduce → Upcast → Reduce → Unroll) отображается на аппаратные модели выполнения — у внешних циклов меньший приоритет. `RANGE` с `AxisType::Global` становится `blockIdx.x` в CUDA. `RANGE` с `AxisType::Local` становится `threadIdx.x`.
 
 Почему явные циклы важны:
 

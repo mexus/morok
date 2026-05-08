@@ -159,18 +159,17 @@ Morok `RANGE` ऑपरेशन से लूप्स को *explicit* बन
 
 | AxisType | CPU | CUDA | मतलब |
 |----------|-----|------|------|
-| **Outer** | — | — | कर्नेल बाउंड्री मार्कर |
+| **Loop** | `for` loop | `for` loop | सीक्वेंशियल इटरेशन; rangeify का डिफ़ॉल्ट |
 | **Global** | Thread pool | `blockIdx` | आउटर पैरेलल डायमेंशन |
 | **Thread** | Thread pool | — | CPU पैरेलिज़्म |
-| **Local** | (N/A) | `threadIdx` | वर्कग्रुप पैरेलिज़्म |
 | **Warp** | (N/A) | warp/wavefront | सब-ग्रुप पैरेलिज़्म |
+| **Local** | (N/A) | `threadIdx` | वर्कग्रुप पैरेलिज़्म |
 | **GroupReduce** | (N/A) | Shared memory | टू-स्टेज रिडक्शन |
-| **Loop** | `for` loop | `for` loop | सीक्वेंशियल इटरेशन |
-| **Reduce** | Accumulator | Warp reduce | रिडक्शन डायमेंशन |
 | **Upcast** | SIMD vector | Register tile | वेक्टराइज़ेशन |
+| **Reduce** | Accumulator | Warp reduce | रिडक्शन डायमेंशन |
 | **Unroll** | Unrolled | Unrolled | लूप अनरोलिंग |
 
-AxisType हाइरार्की (Outer → Global/Thread → Local/Warp/GroupReduce → Loop → Reduce → Upcast → Unroll) हार्डवेयर एक्ज़ीक्यूशन मॉडल से मैप करती है। `AxisType::Global` वाला `RANGE` CUDA में `blockIdx.x` बनता है। `AxisType::Local` वाला `RANGE` `threadIdx.x` बनता है।
+AxisType हाइरार्की (Loop → Global/Thread → Warp → Local/GroupReduce → Upcast → Reduce → Unroll) हार्डवेयर एक्ज़ीक्यूशन मॉडल से मैप करती है — आउटर लूप्स की प्रायोरिटी कम होती है। `AxisType::Global` वाला `RANGE` CUDA में `blockIdx.x` बनता है। `AxisType::Local` वाला `RANGE` `threadIdx.x` बनता है।
 
 एक्सप्लिसिट लूप्स क्यों ज़रूरी हैं:
 

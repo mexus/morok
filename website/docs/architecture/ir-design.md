@@ -159,18 +159,17 @@ Each `RANGE` has an **AxisType** that tells the code generator how to compile it
 
 | AxisType | CPU | CUDA | Meaning |
 |----------|-----|------|---------|
-| **Outer** | — | — | Kernel boundary marker |
+| **Loop** | `for` loop | `for` loop | Sequential iteration; rangeify default |
 | **Global** | Thread pool | `blockIdx` | Outer parallel dimension |
 | **Thread** | Thread pool | — | CPU parallelism |
-| **Local** | (N/A) | `threadIdx` | Workgroup parallelism |
 | **Warp** | (N/A) | warp/wavefront | Sub-group parallelism |
+| **Local** | (N/A) | `threadIdx` | Workgroup parallelism |
 | **GroupReduce** | (N/A) | Shared memory | Two-stage reduction |
-| **Loop** | `for` loop | `for` loop | Sequential iteration |
-| **Reduce** | Accumulator | Warp reduce | Reduction dimension |
 | **Upcast** | SIMD vector | Register tile | Vectorization |
+| **Reduce** | Accumulator | Warp reduce | Reduction dimension |
 | **Unroll** | Unrolled | Unrolled | Loop unrolling |
 
-The AxisType hierarchy (Outer → Global/Thread → Local/Warp/GroupReduce → Loop → Reduce → Upcast → Unroll) maps to hardware execution models. A `RANGE` with `AxisType::Global` becomes `blockIdx.x` in CUDA. A `RANGE` with `AxisType::Local` becomes `threadIdx.x`.
+The AxisType hierarchy (Loop → Global/Thread → Warp → Local/GroupReduce → Upcast → Reduce → Unroll) maps to hardware execution models — outer loops have lower priority. A `RANGE` with `AxisType::Global` becomes `blockIdx.x` in CUDA. A `RANGE` with `AxisType::Local` becomes `threadIdx.x`.
 
 Why explicit loops matter:
 

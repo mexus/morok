@@ -158,14 +158,17 @@ Morok 用 `RANGE` 操作使循环*显式化*。同样的规约变成：
 
 | AxisType | CPU | CUDA | 含义 |
 |----------|-----|------|---------|
+| **Loop** | `for` 循环 | `for` 循环 | 顺序迭代；rangeify 默认 |
 | **Global** | 线程池 | `blockIdx` | 外层并行维度 |
+| **Thread** | 线程池 | — | CPU 并行 |
+| **Warp** | (N/A) | warp/wavefront | 子组并行 |
 | **Local** | (N/A) | `threadIdx` | 工作组并行 |
-| **Loop** | `for` 循环 | `for` 循环 | 顺序迭代 |
-| **Reduce** | 累加器 | Warp reduce | 规约维度 |
+| **GroupReduce** | (N/A) | 共享内存 | 两阶段规约 |
 | **Upcast** | SIMD 向量 | 寄存器 tile | 向量化 |
+| **Reduce** | 累加器 | Warp reduce | 规约维度 |
 | **Unroll** | 展开 | 展开 | 循环展开 |
 
-AxisType 层次结构（Global → Local → Loop → Reduce → Upcast → Unroll）直接映射到 GPU 编程模型。`AxisType::Global` 的 `RANGE` 在 CUDA 中变成 `blockIdx.x`。`AxisType::Local` 的 `RANGE` 变成 `threadIdx.x`。
+AxisType 层次结构（Loop → Global/Thread → Warp → Local/GroupReduce → Upcast → Reduce → Unroll）映射到硬件执行模型——外层循环的优先级数值更小。`AxisType::Global` 的 `RANGE` 在 CUDA 中变成 `blockIdx.x`。`AxisType::Local` 的 `RANGE` 变成 `threadIdx.x`。
 
 为什么显式循环重要：
 

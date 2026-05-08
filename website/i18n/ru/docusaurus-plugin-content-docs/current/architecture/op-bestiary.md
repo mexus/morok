@@ -38,8 +38,8 @@ Range {
 
 | Тип | Приоритет | GPU-маппинг | Назначение |
 |-----|-----------|-------------|------------|
-| `Outer` | -2 | — | Маркер границы ядра |
-| `Loop` | -1 | цикл `for` | Последовательная итерация |
+| `Placeholder` | -3 | — | Временный канонический range, используемый при кэшировании RESHAPE |
+| `Loop` | -1 | цикл `for` | Range по умолчанию после rangeify; обёртки уровня schedule структурно соединены парой `END(Call)` |
 | `Global` | 0 | `blockIdx` | Параллелизм по гриду |
 | `Thread` | 0 | пул потоков | CPU-параллелизм |
 | `Warp` | 1 | warp/wavefront | Субгрупповой параллелизм |
@@ -49,7 +49,7 @@ Range {
 | `Reduce` | 4 | аккумулятор | Ось редукции |
 | `Unroll` | 5 | развёрнутый | Развёртка цикла |
 
-Приоритет определяет порядок вложенности — меньшие значения соответствуют внешним циклам.
+Приоритет определяет порядок вложенности — меньшие значения соответствуют внешним циклам. Границы ядер выражаются структурно через `Call`/`Function`, без выделенного типа оси.
 
 **Пример:**
 ```text
@@ -181,6 +181,7 @@ Bufferize {
 |------|-----|------------|
 | `device` | `Option<DeviceSpec>` | Целевое устройство, `None` для локального |
 | `addrspace` | `AddrSpace` | `Global` (устройство) или `Local` (shared) |
+| `removable` | `bool` | При `false` `buffer_removal` не имеет права инлайнить эту BUFFERIZE — используется на границах realize с несколькими потребителями, чтобы буфер сохранялся между итерациями фикспоинта мега-прохода |
 
 **Пример:**
 ```text
@@ -273,38 +274,113 @@ STORE
 
 ---
 
-## Структура ядра
+## Структура ядра и вызываемый IR
 
-### KERNEL — обёртка ядра
+Работа уровня schedule выражается через вызываемый IR, повторяющий модель
+`CALL`/`FUNCTION`/`PROGRAM` из tinygrad: `Function` определяет тело
+(обычно `Sink` со store-операциями), параметризованное аргументами,
+`Call` вызывает его с конкретными аргументами, а `Program` проводит тело
+через строгий конвейер компиляции `SINK → LINEAR → SOURCE → BINARY`.
+
+### CALL — вызов тела функции
 
 ```rust
-Kernel {
-    sources: SmallVec<[Arc<UOp>; 4]>,   // arguments
-    ast: Arc<UOp>,                       // computation (usually SINK)
+Call {
+    body: Arc<UOp>,                     // FUNCTION (или его тело)
+    args: SmallVec<[Arc<UOp>; 4]>,      // конкретные значения аргументов
+    info: CallInfo,                     // метаданные (name, grad_tag, ...)
 }
 ```
 
-Оборачивает готовое ядро для кодогенерации. Источники — аргументы ядра (`Param`, `DefineLocal`, `DefineVar`). Замечание: `Param` заменил `DefineGlobal` в PR batching_support для дедупликации ядер путём стирания идентичности буферов.
+Вызывает тело callable с аргументами. Закрывает диапазоны: любые `Range`
+из `args` (range_start_index = 1; `body=0`, `args=1+`).
 
-**Пример:**
-```text
-KERNEL
-├── PARAM(slot=0, size=1024) — output buffer arg
-├── PARAM(slot=1, size=1024) — input A arg
-├── PARAM(slot=2, size=1024) — input B arg
-└── SINK                     — computation
-    └── STORE(...)
+`CallInfo` несёт безопасные для ключей кэша аннотации:
+
+| Поле | Тип | Назначение |
+|------|-----|------------|
+| `name` | `Option<String>` | Человекочитаемое имя callable |
+| `grad_tag` | `Option<String>` | Зарезервировано для идентичности градиентного коллбека |
+| `metadata` | `Vec<String>` | Стабильные хешируемые аннотации |
+| `precompile` / `precompile_backward` | `bool` | Подсказки для предкомпиляции |
+
+### FUNCTION — переиспользуемое тело
+
+```rust
+Function {
+    body: Arc<UOp>,                     // вычисление
+    args: SmallVec<[Arc<UOp>; 4]>,      // формальные параметры
+    info: CallInfo,
+}
 ```
+
+Переиспользуемый callable. Его dtype всегда `Void`; тела, возвращающие
+несколько значений, оборачиваются в `Tuple`, чтобы граница функции
+оставалась Void. По форме закрытия диапазонов идентичен `Call`.
+
+### TUPLE / GET_TUPLE — мульти-возврат
+
+```rust
+Tuple { src: SmallVec<[Arc<UOp>; 4]> }
+GetTuple { src: Arc<UOp>, index: usize }
+```
+
+`Tuple` упаковывает разнородные значения; его dtype всегда `Void`.
+`GetTuple` извлекает элемент `index` из `Tuple` (или из `Function`, чьё
+тело — `Tuple`); dtype соответствует внутреннему элементу. Используется,
+чтобы провести несколько выходов через Void-границу функции.
+
+### PROGRAM — контейнер компиляционного конвейера
+
+```rust
+Program {
+    sink: Arc<UOp>,                     // корневой SINK
+    device: Arc<UOp>,                   // DEVICE
+    linear: Option<Arc<UOp>>,           // LINEAR (после линеаризации)
+    source: Option<Arc<UOp>>,           // SOURCE (после рендера)
+    binary: Option<Arc<UOp>>,           // PROGRAM_BINARY (после компиляции)
+}
+```
+
+Проводит ядро через стадии `SINK → LINEAR → SOURCE → PROGRAM_BINARY`,
+которые жёстко выстроены в `codegen/src/program_pipeline.rs`
+(`do_linearize`/`do_render`/`do_compile`/`get_program`). Каждая стадия
+заполняет следующее поле. Рендерeры C/LLVM/MLIR ожидают вход `Op::Linear`
+и сообщают `Error::InvalidGraph` через `pending_error` контекста, не падая
+с panic; многоиндексные `INDEX` должны быть приведены к одноиндексным
+через `pm_linearize_multi_index` до рендера.
+
+### LINEAR — линеаризованный поток операций
+
+```rust
+Linear { ops: SmallVec<[Arc<UOp>; 8]> }
+```
+
+Плоская последовательность операций, полученная при линеаризации.
+Потребители итерируются по `ops` напрямую, без обхода графа.
+
+### SOURCE / PROGRAM_BINARY — артефакты компиляции
+
+```rust
+Source { code: String }              // отрендеренный исходник (C / LLVM-IR / MLIR)
+ProgramBinary { bytes: Vec<u8> }     // скомпилированный артефакт
+```
+
+Терминальные стадии конвейера. Оба — листья (без потомков).
 
 ### SINK — коллектор нескольких корней
 
 ```rust
 Sink {
     sources: SmallVec<[Arc<UOp>; 4]>,
+    info: Option<KernelInfo>,           // структурный маркер для AST ядер
 }
 ```
 
-Собирает несколько выходов в один корень. `ast` каждого ядра — как правило, SINK, содержащий операции STORE.
+Собирает несколько выходов в один корень. Тело `Function` — как правило,
+`Sink` из store-операций. Поле `info` — хеш-консолидированный структурный
+маркер, отличающий SINK уровня kernel-AST от обычного SINK с теми же
+источниками без опоры на боковой канал type-erased метаданных.
 
 **Пример:**
 ```text
@@ -487,7 +563,7 @@ Wmma {
 | `dims` | `(N, M, K)` | Размерности матриц (например, `(16, 16, 16)`) |
 | `dtype_in` | `DType` | Точность входных матриц (например, `Float16`) |
 | `dtype_out` | `DType` | Точность выхода (например, `Float32`) |
-| `device` | `String` | Строка целевого устройства |
+| `device` | `RendererDevice` | Рендерер / TC-бэкенд, породивший эту WMMA |
 | `threads` | `usize` | Потоков на warp (обычно 32) |
 | `upcast_axes` | `WmmaUpcastAxes` | Векторизация для каждого операнда (поля: `a`, `b`, `c`) |
 | `reduce_axes` | `Vec<(usize, usize)>` | Оси свёртки |
@@ -614,13 +690,19 @@ SPECIAL(name="blockIdx.x", end=128) : Index
 └── CONST(128)
 ```
 
-### UNIQUE — маркер идентичности
+### UNIQUE / LUNIQUE — маркеры идентичности
 
 ```rust
-Unique(usize)                // unique identifier
+Unique(usize)                // глобальный счётчик идентичности
+LUnique(usize)               // счётчик идентичности локальной области
 ```
 
-Создаёт уникальную идентичность для различения буферов. Два буфера с разными UNIQUE-значениями различимы, даже если в остальном идентичны.
+Создаёт уникальную идентичность для различения буферов. Два буфера с
+разными `Unique`-значениями различимы, даже если в остальном идентичны.
+`LUnique` обеспечивает такое же различение в пределах локальной области
+(например, внутри тела `Function`), не пересекаясь с глобальным
+счётчиком, — благодаря этому тела callable можно хеш-консолидировать
+независимо от точек вызова.
 
 ### DEVICE — спецификация устройства
 
@@ -661,17 +743,17 @@ RESHAPE(new_shape=[6, 4]) : Shape[6, 4]
 | Операция | Назначение |
 |----------|------------|
 | `Copy` | Явное копирование значения |
-| `BufferView` | View в существующий буфер со смещением/страйдом |
+| `BufferView` | `{ buffer, size, offset }` — срез существующего буфера со смещением |
 | `MStack` | Аллокация стека в памяти |
 | `MSelect` | Выбор в памяти (условный доступ) |
 | `Multi` | Операция с множественными выходами |
-| `Assign` | Присваивание переменной |
 | `Group` | Группировка операций для планирования |
 | `Detach` | Отсоединение от графа (запрет оптимизации через узел) |
 | `Contiguous` | Хинт, что данные непрерывны |
 | `ContiguousBackward` | Обратный проход для хинта contiguous |
 | `Precast` | Предварительное приведение типа |
-| `Custom` / `CustomI` | Расширяемость пользовательскими операциями |
+| `Custom` / `CustomI` | Инлайновое расширение пользовательскими операциями (`Custom` поддерживает только C) |
+| `CustomFunction` | Хук пользовательской функции уровня runtime (виды: `EncDec`, `Graph`) |
 
 ---
 
@@ -683,13 +765,13 @@ RESHAPE(new_shape=[6, 4]) : Shape[6, 4]
 |-----------|----------|
 | **Управление циклами** | `RANGE`, `END` |
 | **Редукция** | `REDUCE_AXIS`, `REDUCE`, `ALLREDUCE` |
-| **Память** | `BUFFER`, `BUFFERIZE`, `INDEX`, `POINTER_INDEX`, `LOAD`, `STORE` |
-| **Ядро** | `KERNEL`, `SINK`, `AFTER`, `BARRIER` |
+| **Память** | `BUFFER`, `BUFFER_VIEW`, `BUFFERIZE`, `INDEX`, `POINTER_INDEX`, `LOAD`, `STORE` |
+| **Ядро и callable** | `SINK`, `CALL`, `FUNCTION`, `TUPLE`, `GET_TUPLE`, `PROGRAM`, `LINEAR`, `SOURCE`, `PROGRAM_BINARY`, `AFTER`, `BARRIER` |
 | **Векторные** | `VECTORIZE`, `GEP`, `VCONST`, `CAT`, `PTRCAT` |
 | **Расширение** | `UNROLL`, `CONTRACT` |
 | **Аппаратные** | `WMMA`, `SPECIAL` |
 | **Управление** | `IF`, `ENDIF` |
-| **Определение** | `PARAM`, `DEFINE_LOCAL`, `DEFINE_VAR`, `DEFINE_REG`, `BIND`, `UNIQUE`, `DEVICE` |
+| **Определение** | `PARAM`, `DEFINE_LOCAL`, `DEFINE_VAR`, `DEFINE_REG`, `BIND`, `UNIQUE`, `LUNIQUE`, `DEVICE` |
 | **Перемещение** | `RESHAPE`, `PERMUTE`, `EXPAND`, `PAD`, `SHRINK`, `FLIP` |
 | **ALU** | `Unary(...)`, `Binary(...)`, `Ternary(...)`, `Cast`, `BitCast` |
 
@@ -704,6 +786,7 @@ RESHAPE(new_shape=[6, 4]) : Shape[6, 4]
 | `STORE` | 2 (index=0, value=1, ranges=2+) |
 | `WMMA` | 3 (a=0, b=1, c=2) |
 | `END` | 1 (computation=0, ranges=1+) |
+| `CALL` / `FUNCTION` | 1 (body=0, args=1+) |
 
 ### Расширяемые операции
 
