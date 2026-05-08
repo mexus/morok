@@ -5,7 +5,7 @@
 //!
 //! Run with: `cargo bench -p morok-tensor`
 //!
-//! If you want to see tree, set env variable TREE.
+//! If you want to see the UOp tree, set the TREE environment variable.
 
 const KEY: &str = "TREE";
 
