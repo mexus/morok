@@ -1562,6 +1562,24 @@ fn get_optimizer_renderer(device: &Device) -> morok_schedule::OptimizerRenderer 
 /// Beam search explores multiple optimization paths and selects the fastest
 /// by compiling and timing each candidate. Slower than heuristics but can
 /// find better optimizations. Beam and heuristic are mutually exclusive.
+/// Count the top-K most frequent Op variants in a flat uop list. Used by the
+/// `BEAM_LOG_SURPASS_MAX` diagnostic to identify which Op type is
+/// bloating the linearized count for a dropped BEAM candidate.
+pub(crate) fn count_top_ops(ops: &[Arc<UOp>], top_k: usize) -> Vec<(String, usize)> {
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for u in ops {
+        *counts.entry(u.op().as_ref().to_string()).or_insert(0) += 1;
+    }
+    let mut v: Vec<(String, usize)> = counts.into_iter().collect();
+    v.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+    v.truncate(top_k);
+    v
+}
+
+pub(crate) fn fmt_op_counts(counts: &[(String, usize)]) -> String {
+    counts.iter().map(|(o, n)| format!("{o}={n}")).collect::<Vec<_>>().join(", ")
+}
+
 fn beam_search_optimize(
     ast: Arc<UOp>,
     renderer: &morok_schedule::OptimizerRenderer,
@@ -1597,13 +1615,20 @@ fn beam_search_optimize(
     // ranking against fast candidates that happen to run first.
     morok_runtime::warmup_thread_pool();
 
-    // Per-candidate compile timeout. Rust can't safely interrupt clang via
-    // POSIX signals, so we run each candidate's compile+time on a detached
-    // worker thread and abandon the worker on timeout. Side effect: a hung
-    // clang invocation leaks one OS thread per timeout, reaped at process
-    // exit.
-    let beam_timeout =
-        Duration::from_secs(std::env::var("MOROK_BEAM_TIMEOUT_SEC").ok().and_then(|s| s.parse().ok()).unwrap_or(10));
+    // Per-candidate **compile-only** timeout (default 10s). Rust can't
+    // safely deliver SIGALRM to a worker, so we use a two-stage detached
+    // worker thread: the worker signals `CompileDone` once
+    // codegen/compile/runtime-link finish, after which execution runs
+    // unbounded (only `early_stop` aborts a slow run). Side effect: a hung
+    // clang invocation orphans one OS thread per timeout, reaped at
+    // process exit.
+    let compile_timeout =
+        Duration::from_secs(std::env::var("BEAM_TIMEOUT_SEC").ok().and_then(|s| s.parse().ok()).unwrap_or(10));
+
+    // When `BEAM_LOG_SURPASS_MAX` is set, every dropped candidate prints
+    // one line with the failure reason, applied-opt chain, and (for "too
+    // many uops") the top Op-variant counts in the linearized program.
+    let log_surpass = std::env::var("BEAM_LOG_SURPASS_MAX").is_ok();
 
     // Per-BEAM-call cache for `apply_post_optimization_with_renderer`. Many
     // candidates expand from the same parent state and share the underlying
@@ -1639,11 +1664,22 @@ fn beam_search_optimize(
         let bench_config_c = bench_config.clone();
         let max_uops_c = max_uops;
         let post_opt_cache_c = Arc::clone(&post_opt_cache);
+        let log_surpass_c = log_surpass;
+        // Snapshot the applied-opts chain so the diagnostic line in the worker
+        // thread can identify which BEAM branch triggered the drop without
+        // having to send the full Scheduler back across the channel.
+        let opts_snapshot: Vec<morok_schedule::optimizer::Opt> = s_owned.applied_opts.clone();
 
-        let (tx, rx) = mpsc::sync_channel::<Option<morok_schedule::CandidateMetrics>>(1);
-        // Detached: drop the JoinHandle so `recv_timeout` can return without
-        // blocking on the worker. If clang hangs, the thread orphans and is
-        // collected at process exit.
+        // Two-stage signal: CompileDone fires when codegen/compile/runtime-link
+        // finish; Final carries the benchmark result (or None on failure/panic).
+        // Capacity 2 so the worker never blocks on send. Detached: drop the
+        // JoinHandle so the parent can abandon the worker on compile timeout.
+        enum WorkerMsg {
+            CompileDone,
+            Final(Option<morok_schedule::CandidateMetrics>),
+        }
+        let (tx, rx) = mpsc::sync_channel::<WorkerMsg>(2);
+        let tx_compile = tx.clone();
         let _ = std::thread::spawn(move || {
             let result = catch_unwind(AssertUnwindSafe(|| {
                 let raw_ast = s_owned.get_optimized_ast(None);
@@ -1671,13 +1707,6 @@ fn beam_search_optimize(
                 let kernel_name =
                     optimized.metadata::<morok_schedule::optimizer::KernelInfo>().map(|info| info.function_name());
 
-                // Post-optimization UOp count filter. validate_limits checks
-                // pre-optimization AST size, but devectorization can massively expand
-                // the graph (e.g., 256-wide UPCAST -> 4096 GEP indices).
-                if optimized.toposort().len() > max_uops_c {
-                    return None;
-                }
-
                 // Pre-codegen metrics: structural hash for `seen_libs`, ALU node
                 // count for `least_compute_ops`. Computed before compile so even
                 // failed compiles still consume a slot fairly.
@@ -1689,17 +1718,69 @@ fn beam_search_optimize(
                     Some(m) => morok_ir::decompositions::decompose_with(&optimized, &m),
                     None => optimized,
                 };
-                let program = morok_codegen::program_pipeline::program_from_sink(decomposed, dev_device_c.clone());
+                let mut program = morok_codegen::program_pipeline::program_from_sink(decomposed, dev_device_c.clone());
+
+                // Linearize *now* so we can count flat uops. Counting the
+                // post-optimization AST `toposort()` (the earlier behavior)
+                // under-counts because morok's high-level Reduce/Index/Cast
+                // nodes get fanned out into many flat uops by the codegen
+                // pipeline. Counting post-linearize gives the number to
+                // compare against `BEAM_UOPS_MAX`.
+                program = match morok_codegen::program_pipeline::do_linearize(&program) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        if log_surpass_c {
+                            eprintln!("[BEAM drop] linearize_err: {e:?} opts={opts_snapshot:?}");
+                        }
+                        return None;
+                    }
+                };
+                let (linear_uops_count, top_op_counts) = if let morok_ir::Op::Program { linear: Some(linear), .. } =
+                    program.op()
+                    && let morok_ir::Op::Linear { ops } = linear.op()
+                {
+                    (ops.len(), if log_surpass_c { count_top_ops(ops, 8) } else { Vec::new() })
+                } else {
+                    (0, Vec::new())
+                };
+                if linear_uops_count > max_uops_c {
+                    if log_surpass_c {
+                        eprintln!(
+                            "[BEAM drop] too_many_uops: linear={linear_uops_count} max={max_uops_c} opts={opts_snapshot:?} top_ops=[{}]",
+                            fmt_op_counts(&top_op_counts)
+                        );
+                    }
+                    return None;
+                }
 
                 // Render and compile through PROGRAM stages (NOT timed).
-                let (spec, compiled) = compile_with_program_pipeline_components(
+                let (spec, compiled) = match compile_with_program_pipeline_components(
                     program,
                     dev_renderer_c.as_ref(),
                     dev_compiler_c.as_ref(),
                     kernel_name.as_deref(),
-                )
-                .ok()?;
-                let program = (dev_runtime_c)(&compiled).ok()?;
+                ) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        if log_surpass_c {
+                            eprintln!("[BEAM drop] compile_err: {e:?} opts={opts_snapshot:?}");
+                        }
+                        return None;
+                    }
+                };
+                let program = match (dev_runtime_c)(&compiled) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        if log_surpass_c {
+                            eprintln!("[BEAM drop] runtime_err: {e:?} opts={opts_snapshot:?}");
+                        }
+                        return None;
+                    }
+                };
+
+                // Compile phase done — release parent from the `BEAM_TIMEOUT_SEC`
+                // bound. Anything below is execution-only (bounded by `early_stop`).
+                let _ = tx_compile.send(WorkerMsg::CompileDone);
 
                 // Extract buffer pointers inside the worker (avoids Sync issue
                 // and keeps raw pointers thread-local).
@@ -1770,16 +1851,43 @@ fn beam_search_optimize(
                 let scaled_nanos = (result.min.as_nanos() as f64 * factor).min(u64::MAX as f64);
                 let timing = Duration::from_nanos(scaled_nanos as u64);
                 Some(morok_schedule::CandidateMetrics { timing, ir_hash, compute_ops })
-            }))
-            .ok()
-            .flatten();
-            // Receiver may have already given up on timeout — ignore send errors.
-            let _ = tx.send(result);
+            }));
+            let final_result = match result {
+                Ok(opt) => opt,
+                Err(_) => {
+                    if log_surpass_c {
+                        eprintln!("[BEAM drop] panic_in_worker opts={opts_snapshot:?}");
+                    }
+                    None
+                }
+            };
+            // Receiver may have already given up on compile timeout — ignore send errors.
+            let _ = tx.send(WorkerMsg::Final(final_result));
         });
 
-        // None on timeout, panic, or worker disconnect — BEAM treats all the
-        // same: candidate dropped, search continues.
-        rx.recv_timeout(beam_timeout).ok().flatten()
+        // Stage 1: wait for compile to finish, bounded by `BEAM_TIMEOUT_SEC`.
+        // Three outcomes:
+        // - `CompileDone`: compile succeeded, fall through to unbounded execution wait.
+        // - `Final(_)`: compile failed/aborted before reaching the signal (early return
+        //   on linearize_err / too_many_uops / compile_err / runtime_err, or panic).
+        // - timeout: clang hung past the budget; abandon the worker (orphaned thread).
+        match rx.recv_timeout(compile_timeout) {
+            Ok(WorkerMsg::CompileDone) => {
+                // Stage 2: execution. Unbounded — `bench_config.early_stop`
+                // aborts a slow run from inside `benchmark_kernel`.
+                match rx.recv() {
+                    Ok(WorkerMsg::Final(metrics)) => metrics,
+                    _ => None,
+                }
+            }
+            Ok(WorkerMsg::Final(metrics)) => metrics,
+            Err(_) => {
+                if log_surpass {
+                    eprintln!("[BEAM drop] compile_timeout opts={:?}", s.applied_opts);
+                }
+                None
+            }
+        }
     };
 
     // Suppress panic output during beam search. Speculative candidates may panic

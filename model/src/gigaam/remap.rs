@@ -124,7 +124,60 @@ fn remap_key(key: &str, config: &GigaAmConfig) -> Option<String> {
         return Some(format!("head.{}", &parts[3..].join(".")));
     }
 
+    // RNN-T predictor: head.decoder.embed.weight, head.decoder.lstm.{w,b}_{ih,hh}_l{N}.
+    if parts[..2] == ["head", "decoder"] && parts.len() >= 3 {
+        if parts[2] == "embed" && parts.len() == 4 && parts[3] == "weight" {
+            return Some("head.predictor.embed".to_string());
+        }
+        if parts[2] == "lstm" && parts.len() == 4 {
+            return remap_rnnt_lstm_param(parts[3]);
+        }
+        return None;
+    }
+
+    // RNN-T joint: head.joint.{enc,pred}.{weight,bias},
+    // head.joint.joint_net.1.{weight,bias} (joint_net.0 = ReLU, no params).
+    if parts[..2] == ["head", "joint"] && parts.len() >= 4 {
+        let sub = parts[2];
+        let last = parts.last().unwrap();
+        if (sub == "enc" || sub == "pred") && parts.len() == 4 {
+            let suffix = match *last {
+                "weight" => "w",
+                "bias" => "b",
+                _ => return None,
+            };
+            return Some(format!("head.joint.{sub}_{suffix}"));
+        }
+        if sub == "joint_net" && parts.len() == 5 && parts[3] == "1" {
+            let suffix = match *last {
+                "weight" => "out_w",
+                "bias" => "out_b",
+                _ => return None,
+            };
+            return Some(format!("head.joint.{suffix}"));
+        }
+        return None;
+    }
+
     None
+}
+
+/// Decode a PyTorch LSTM parameter token like `weight_ih_l0` or `bias_hh_l2`
+/// into morok's `head.predictor.lstm.{layer}.{w_ih,w_hh,b_ih,b_hh}` shape.
+fn remap_rnnt_lstm_param(token: &str) -> Option<String> {
+    // Strip `_l{N}` suffix.
+    let (base, layer) = token.rsplit_once("_l")?;
+    if !layer.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let mapped = match base {
+        "weight_ih" => "w_ih",
+        "weight_hh" => "w_hh",
+        "bias_ih" => "b_ih",
+        "bias_hh" => "b_hh",
+        _ => return None,
+    };
+    Some(format!("head.predictor.lstm.{layer}.{mapped}"))
 }
 
 fn remap_bn_key(layer: &str, param: &str, config: &GigaAmConfig) -> Option<String> {

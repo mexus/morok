@@ -26,6 +26,7 @@ fn test_config() -> GigaAmConfig {
         max_mel_frames: 512,
         max_encoder_frames: 128,
         decoder: CtcDecoder::Greedy(GreedyDecoder::new(Vec::new())),
+        transducer: None,
     }
 }
 
@@ -43,12 +44,12 @@ fn test_output_length_matches_forward() {
     let model = GigaAm::with_random_weights(test_config());
 
     let x = Tensor::full(&[1, 100, 64], 0.0f32, DType::Float32).unwrap();
-    let out = model.subsampling.forward(&x).unwrap();
+    let out = model.encoder.subsampling.forward(&x).unwrap();
     let actual_t = out.shape().unwrap()[1].as_const().unwrap();
     assert_eq!(model.subsampling_output_length(100), actual_t);
 
     let x2 = Tensor::full(&[1, 50, 64], 0.0f32, DType::Float32).unwrap();
-    let out2 = model.subsampling.forward(&x2).unwrap();
+    let out2 = model.encoder.subsampling.forward(&x2).unwrap();
     let actual_t2 = out2.shape().unwrap()[1].as_const().unwrap();
     assert_eq!(model.subsampling_output_length(50), actual_t2);
 }
@@ -126,8 +127,8 @@ fn test_rope_cache_uses_encoder_bound() {
     let model = model_with_random_weights();
     let cfg = test_config();
 
-    assert_eq!(model.cos_cache.shape().unwrap()[0].as_const().unwrap(), cfg.max_encoder_frames);
-    assert_eq!(model.sin_cache.shape().unwrap()[0].as_const().unwrap(), cfg.max_encoder_frames);
+    assert_eq!(model.encoder.cos_cache.shape().unwrap()[0].as_const().unwrap(), cfg.max_encoder_frames);
+    assert_eq!(model.encoder.sin_cache.shape().unwrap()[0].as_const().unwrap(), cfg.max_encoder_frames);
     assert_ne!(cfg.max_encoder_frames, cfg.max_mel_frames);
 }
 

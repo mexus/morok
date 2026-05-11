@@ -40,13 +40,11 @@ pub fn hand_coded_optimizations(scheduler: &mut Scheduler, config: &HeuristicsCo
 
     debug!("hand_coded_optimizations: starting");
 
-    // 1. Tensor cores (skip other opts if applied). On AMX the heuristic
-    // explicitly avoids TC: the post-TC schedule cannot be distributed
-    // efficiently (per-WMMA marshalling of 256-element accumulators) and
-    // UNROLL inside an AMX-TC reduce loop breaks codegen. The general path
-    // (matvec → group → upcast → unroll → threading) runs instead; BEAM
-    // discovers the higher-perf sequence via its broader action grid.
-    if !scheduler.renderer().is_amx() && try_tensor_cores(scheduler, config) {
+    // 1. Tensor cores (skip other opts if applied). Try TC first; return on
+    // success on non-AMX (with post-TC UPCAST/LOCAL extras), or fall through
+    // on AMX to the regular UPCAST → THREAD → LOCAL chain. The "skip post-TC
+    // on AMX" branch is implemented inside `try_tensor_cores`.
+    if try_tensor_cores(scheduler, config) {
         debug!("hand_coded_optimizations: tensor cores applied, skipping remaining opts");
         return;
     }
@@ -1011,37 +1009,46 @@ pub fn try_tensor_cores(scheduler: &mut Scheduler, config: &HeuristicsConfig) ->
         );
         trial.applied_opts.push(opt);
 
-        // Post-TC opts: UPCAST M/N then LOCAL N. AMX never reaches this
-        // branch — the outer `!is_amx()` gate at the `try_tensor_cores`
-        // call site routes AMX through the general hand-coded path instead.
-        let mut tc_rngs = [axes[0].clone(), axes[1].clone()];
-
-        // UPCAST M (dim=1) then N (dim=0) with factors [5,4,3,2]
-        for tc_dim in [1usize, 0] {
-            for &sz in &[5usize, 4, 3, 2] {
-                if matches!(tc_rngs[tc_dim].op(), Op::Range { end, .. } if end.divides(sz as i64).is_some()) {
-                    if let Some(rng_idx) = trial.rngs().iter().position(|r| Arc::ptr_eq(r, &tc_rngs[tc_dim]))
-                        && let Ok((replaced, _)) =
-                            trial.shift_to(tc_rngs[tc_dim].clone(), sz, AxisType::Upcast, false, None)
-                    {
-                        trial.applied_opts.push(Opt::upcast(rng_idx, sz));
-                        tc_rngs[tc_dim] = replaced;
-                    }
-                    break;
-                }
-            }
+        // On AMX, discard the TC'd `trial` and fall through to the regular
+        // UPCAST → THREAD → LOCAL chain on the untouched scheduler.
+        // Previously morok committed the TC'd trial back into the scheduler
+        // on AMX, producing kernels with TC + 8 internal `U(0)/U(1)` upcasts
+        // and bloated LLVM IR.
+        if trial.renderer().is_amx() {
+            return false;
         }
 
-        // LOCAL N (dim=0) with factors [4,2]
-        if trial.renderer().has_local {
-            for &sz in &[4usize, 2] {
-                if matches!(tc_rngs[0].op(), Op::Range { end, .. } if end.divides(sz as i64).is_some()) {
-                    if let Some(rng_idx) = trial.rngs().iter().position(|r| Arc::ptr_eq(r, &tc_rngs[0]))
-                        && trial.shift_to(tc_rngs[0].clone(), sz, AxisType::Local, false, None).is_ok()
-                    {
-                        trial.applied_opts.push(Opt::local(rng_idx, sz));
+        // Non-AMX post-TC extras: UPCAST M/N then LOCAL N.
+        {
+            let mut tc_rngs = [axes[0].clone(), axes[1].clone()];
+
+            // UPCAST M (dim=1) then N (dim=0) with factors [5,4,3,2]
+            for tc_dim in [1usize, 0] {
+                for &sz in &[5usize, 4, 3, 2] {
+                    if matches!(tc_rngs[tc_dim].op(), Op::Range { end, .. } if end.divides(sz as i64).is_some()) {
+                        if let Some(rng_idx) = trial.rngs().iter().position(|r| Arc::ptr_eq(r, &tc_rngs[tc_dim]))
+                            && let Ok((replaced, _)) =
+                                trial.shift_to(tc_rngs[tc_dim].clone(), sz, AxisType::Upcast, false, None)
+                        {
+                            trial.applied_opts.push(Opt::upcast(rng_idx, sz));
+                            tc_rngs[tc_dim] = replaced;
+                        }
+                        break;
                     }
-                    break;
+                }
+            }
+
+            // LOCAL N (dim=0) with factors [4,2]
+            if trial.renderer().has_local {
+                for &sz in &[4usize, 2] {
+                    if matches!(tc_rngs[0].op(), Op::Range { end, .. } if end.divides(sz as i64).is_some()) {
+                        if let Some(rng_idx) = trial.rngs().iter().position(|r| Arc::ptr_eq(r, &tc_rngs[0]))
+                            && trial.shift_to(tc_rngs[0].clone(), sz, AxisType::Local, false, None).is_ok()
+                        {
+                            trial.applied_opts.push(Opt::local(rng_idx, sz));
+                        }
+                        break;
+                    }
                 }
             }
         }

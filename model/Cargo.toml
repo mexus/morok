@@ -18,6 +18,7 @@ morok-macros = { version = "0.1.0-alpha.2", path = "../macros" }
 morok-runtime = { version = "0.1.0-alpha.2", path = "../runtime" }
 morok-tensor = { version = "0.1.0-alpha.2", path = "../tensor", package = "morok-tensor" }
 ndarray.workspace = true
+prost = "0.14.3"
 realfft = "3.5.0"
 safetensors = "0.7.0"
 serde_json = "1.0.149"

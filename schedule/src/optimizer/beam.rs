@@ -19,7 +19,7 @@
 //! the IGNORE_BEAM_CACHE environment variable.
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use once_cell::sync::Lazy;
 
@@ -29,15 +29,17 @@ use super::Scheduler;
 use super::config::BeamConfig;
 use super::error::*;
 use super::opts::apply_opt;
-use super::types::Opt;
+use super::types::{Opt, OptArg, OptOps};
 
 /// Minimum measurable improvement before BEAM stops iterating.
 ///
-/// Default 10 ns — below typical measurement noise. Override via
-/// `MOROK_BEAM_MIN_PROGRESS` (nanoseconds; set to `0` to disable).
+/// Default 10 ns. With kernels timing in hundreds of µs this floor
+/// effectively never fires; it exists to stop beam when improvements
+/// drop into measurement noise. Override via `BEAM_MIN_PROGRESS`
+/// (nanoseconds; `0` to disable).
 fn beam_min_progress() -> Duration {
     static CACHED: Lazy<Duration> = Lazy::new(|| {
-        let nanos: u64 = std::env::var("MOROK_BEAM_MIN_PROGRESS").ok().and_then(|s| s.parse().ok()).unwrap_or(10);
+        let nanos: u64 = std::env::var("BEAM_MIN_PROGRESS").ok().and_then(|s| s.parse().ok()).unwrap_or(10);
         Duration::from_nanos(nanos)
     });
     *CACHED
@@ -141,37 +143,188 @@ pub static BEAM_ACTIONS: Lazy<Vec<Opt>> = Lazy::new(|| {
 // ACTION GENERATION & FILTERING
 // ============================================================================
 
-/// Generate all valid next-states from the current scheduler.
-///
-/// Applies each action from `BEAM_ACTIONS` and filters to those that:
-/// 1. Apply successfully (divisibility, bounds, etc.)
-/// 2. Pass limit checks (upcast size, local size, UOp count)
-fn generate_actions(scheduler: &Scheduler, config: &BeamConfig) -> Vec<Scheduler> {
+/// `(op, axis)` pairs that have an `arg=0` (full-axis) variant in
+/// [`BEAM_ACTIONS`]. Used by [`passes_prefilter`] to dedup the explicit
+/// `arg=axis_size` variants whenever the `arg=0` variant covers the same case.
+static FULL_AXIS_VARIANTS: Lazy<std::collections::HashSet<(OptOps, usize)>> = Lazy::new(|| {
     BEAM_ACTIONS
         .iter()
-        .filter_map(|action| {
-            // Clone scheduler and try to apply action
-            let mut candidate = scheduler.clone();
-            match apply_opt(&mut candidate, action, true) {
-                Ok(()) if validate_limits(&candidate, config) => Some(candidate),
+        .filter_map(|opt| {
+            let axis = opt.axis?;
+            match opt.arg {
+                OptArg::Int(0) => Some((opt.op, axis)),
                 _ => None,
             }
         })
         .collect()
+});
+
+/// Pre-apply filter with two early-rejects:
+///
+/// 1. The action's logical axis can't be resolved (would always fail in
+///    `apply_opt`). Skips the candidate clone+apply roundtrip.
+/// 2. The action's `arg` already equals the axis's full size AND an `arg=0`
+///    variant exists in `BEAM_ACTIONS` for the same `(op, axis)`. The two
+///    actions produce the same kernel post-codegen, so we drop the explicit
+///    one to halve dedup work.
+fn passes_prefilter(scheduler: &Scheduler, action: &Opt) -> bool {
+    // TC and NOLOCALS skip the filter — they have no logical axis.
+    if action.op == OptOps::TC || action.axis.is_none() {
+        return true;
+    }
+    // Resolve the logical axis to a real axis. Failure → action would fail
+    // at apply time; skip now.
+    let real_axis = match scheduler.real_axis(action.op, action.axis) {
+        Ok(a) if a >= 0 => a as usize,
+        _ => return false,
+    };
+    if real_axis >= scheduler.shape_len() {
+        return false;
+    }
+    // Dedup: skip if `arg == full_shape[real_axis]` and an `arg=0` variant
+    // covers the same case. Only `OptArg::Int` carries a comparable arg.
+    if let OptArg::Int(arg) = action.arg
+        && arg > 0
+        && let Some(&size) = scheduler.full_shape().get(real_axis)
+        && size as usize == arg
+        && let Some(axis) = action.axis
+        && FULL_AXIS_VARIANTS.contains(&(action.op, axis))
+    {
+        return false;
+    }
+    true
+}
+
+/// `BEAM_DEBUG=1` toggles eprintln! tracing of action survival across
+/// the prefilter/apply/limit/time stages. Cheap when disabled (one env-cached
+/// bool check per call); useful for diagnosing why an action class never wins.
+fn beam_debug_enabled() -> bool {
+    static CACHED: Lazy<bool> = Lazy::new(|| std::env::var("BEAM_DEBUG").is_ok());
+    *CACHED
+}
+
+/// Per-stage candidate counts, broken out by [`OptOps`] kind. Aggregated by
+/// [`generate_actions`] when [`beam_debug_enabled`] is on.
+#[derive(Default, Debug)]
+struct ActionStageCounts {
+    attempted: std::collections::HashMap<OptOps, usize>,
+    prefilter_dropped: std::collections::HashMap<OptOps, usize>,
+    apply_dropped: std::collections::HashMap<OptOps, usize>,
+    limit_dropped: std::collections::HashMap<OptOps, usize>,
+    survived: std::collections::HashMap<OptOps, usize>,
+}
+
+/// Generate all valid next-states from the current scheduler.
+///
+/// Applies each action from `BEAM_ACTIONS` and filters to those that:
+/// 1. Pass the cheap [`passes_prefilter`] gate (axis resolves, no arg-eq-size dup)
+/// 2. Apply successfully (divisibility, bounds, etc.)
+/// 3. Pass limit checks (upcast size, local size, UOp count)
+fn generate_actions(scheduler: &Scheduler, config: &BeamConfig) -> Vec<Scheduler> {
+    let debug = beam_debug_enabled();
+    let mut counts = ActionStageCounts::default();
+    let mut out = Vec::with_capacity(BEAM_ACTIONS.len());
+
+    for action in BEAM_ACTIONS.iter() {
+        if debug {
+            *counts.attempted.entry(action.op).or_insert(0) += 1;
+        }
+        if !passes_prefilter(scheduler, action) {
+            if debug {
+                *counts.prefilter_dropped.entry(action.op).or_insert(0) += 1;
+            }
+            continue;
+        }
+        let mut candidate = scheduler.clone();
+        match apply_opt(&mut candidate, action, true) {
+            Ok(()) => {
+                if !validate_limits(&candidate, config) {
+                    if debug {
+                        *counts.limit_dropped.entry(action.op).or_insert(0) += 1;
+                    }
+                    continue;
+                }
+                if debug {
+                    *counts.survived.entry(action.op).or_insert(0) += 1;
+                }
+                out.push(candidate);
+            }
+            Err(_) => {
+                if debug {
+                    *counts.apply_dropped.entry(action.op).or_insert(0) += 1;
+                }
+            }
+        }
+    }
+
+    if debug {
+        let ops_in_order = [
+            OptOps::TC,
+            OptOps::UPCAST,
+            OptOps::UNROLL,
+            OptOps::LOCAL,
+            OptOps::GROUP,
+            OptOps::GROUPTOP,
+            OptOps::THREAD,
+            OptOps::SWAP,
+            OptOps::PADTO,
+            OptOps::NOLOCALS,
+        ];
+        eprintln!("[beam] generate_actions: {} survivors", out.len());
+        // Print every action class, not only the ones with non-zero
+        // `attempted`. A class with `attempted=0` means the BEAM_ACTIONS
+        // static doesn't even contain that variant — useful for catching
+        // missing actions vs. catastrophically high apply/limit drops.
+        for op in ops_in_order {
+            let a = counts.attempted.get(&op).copied().unwrap_or(0);
+            let pf = counts.prefilter_dropped.get(&op).copied().unwrap_or(0);
+            let ap = counts.apply_dropped.get(&op).copied().unwrap_or(0);
+            let lim = counts.limit_dropped.get(&op).copied().unwrap_or(0);
+            let s = counts.survived.get(&op).copied().unwrap_or(0);
+            eprintln!("  {op:?}: attempted={a:3} prefilter={pf:3} apply_err={ap:3} limit={lim:3} survived={s:3}");
+        }
+    }
+
+    out
 }
 
 /// Validate that a scheduler state is within configured limits.
+///
+/// Per-candidate filter: reject if `(up_axes_prod / tc_up) > max_upcast`
+/// or `local_axes_prod > max_local`, where `tc_up = prod(tc.dims) /
+/// tc.threads` if a TC is active else 1.
+///
+/// The `tc_up` divisor accounts for the TC tile's contribution to the
+/// total UPCAST/UNROLL product — without it, applying TC immediately
+/// saturates `max_upcast` (e.g. APPLE_AMX `prod((16,16,1))/1 = 256`),
+/// blocking any post-TC UPCAST composition.
 fn validate_limits(scheduler: &Scheduler, config: &BeamConfig) -> bool {
-    // Calculate upcast size (product of UPCAST/UNROLL dimensions)
     let upcast_sz = product_of_axes(scheduler, &[AxisType::Upcast, AxisType::Unroll]);
-
-    // Calculate local size (product of LOCAL/WARP/GROUP_REDUCE dimensions)
     let local_sz = product_of_axes(scheduler, &[AxisType::Local, AxisType::Warp, AxisType::GroupReduce]);
+    let tc_up = active_tc_upcast(scheduler);
 
-    // Check UOp count
-    let uop_count = scheduler.ast().toposort().len();
+    upcast_sz / tc_up <= config.max_upcast && local_sz <= config.max_local
+}
 
-    upcast_sz <= config.max_upcast && local_sz <= config.max_local && uop_count <= config.max_uops
+/// Return `prod(tc.dims) / tc.threads` for the active TC, or 1 if none.
+///
+/// Uses `scheduler.selected_tc_index` (recorded by `apply_axis_choice_impl`)
+/// rather than guessing from the renderer's TC list. For multi-TC renderers
+/// (e.g. SM89 with f16+bf16+tf32 variants) this is the only correct
+/// accounting.
+fn active_tc_upcast(scheduler: &Scheduler) -> usize {
+    let Some(idx) = scheduler.selected_tc_index else {
+        return 1;
+    };
+    scheduler
+        .ren
+        .tensor_cores
+        .get(idx)
+        .map(|tc| {
+            let prod = tc.dims.0 * tc.dims.1 * tc.dims.2;
+            prod / tc.threads.max(1)
+        })
+        .unwrap_or(1)
 }
 
 /// Calculate product of dimension sizes for given axis types.
@@ -328,7 +481,6 @@ pub fn beam_search<F>(scheduler: Scheduler, config: &BeamConfig, compile_and_tim
 where
     F: Fn(&Scheduler, Option<Duration>) -> Option<CandidateMetrics> + Sync,
 {
-    let start = Instant::now();
     let mut iterations = 0;
     let mut candidates_evaluated = 0;
 
@@ -337,7 +489,17 @@ where
     // invocation (also charged on cache replay through `OPT_CACHE`).
     let mut beam: Vec<(Scheduler, Duration)> = vec![(scheduler.clone(), Duration::MAX)];
 
-    while start.elapsed() < config.timeout {
+    // `seen_libs` and `least_compute_ops` persist across the entire beam
+    // search. Identity-keyed dedup carries across iterations, so a kernel
+    // produced at iter N and re-produced (via a different opt order) at
+    // iter N+1 only gets compiled+timed once.
+    let mut seen_libs: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    let mut least_compute_ops: u64 = u64::MAX;
+
+    // No total search budget; terminates on empty candidate set, empty timed
+    // list, `min_progress` floor, or sub-noise gain. Per-candidate compile
+    // budgets live separately in `compile_and_time`'s thread+timeout wrapper.
+    loop {
         iterations += 1;
 
         // 1. EXPAND: Generate all valid next states from current beam (sequential)
@@ -347,12 +509,6 @@ where
         if candidates.is_empty() {
             break;
         }
-
-        // Per-iteration state — both reset at the top of every iteration.
-        // `seen_libs` dedups kernels that lower to the same post-codegen IR;
-        // `least_compute_ops` anchors the 1000× compute-bloat filter.
-        let mut seen_libs: std::collections::HashSet<u64> = std::collections::HashSet::with_capacity(candidates.len());
-        let mut least_compute_ops: u64 = u64::MAX;
 
         // Reject any candidate whose first run already exceeds 3× the current beam best.
         let beam_best = beam.first().map(|(_, t)| *t);
@@ -378,6 +534,37 @@ where
 
         if timed.is_empty() {
             break;
+        }
+
+        if beam_debug_enabled() {
+            // Bucket survivors by the *last* applied opt (the one this iteration
+            // just stacked on). Useful for spotting "TC compiled but lost on
+            // timing vs UPCAST" vs "TC never survived to timing at all".
+            let mut by_op: std::collections::HashMap<OptOps, (usize, Duration)> = std::collections::HashMap::new();
+            for (s, t) in &timed {
+                if let Some(opt) = s.applied_opts.last() {
+                    let entry = by_op.entry(opt.op).or_insert((0, Duration::MAX));
+                    entry.0 += 1;
+                    if *t < entry.1 {
+                        entry.1 = *t;
+                    }
+                }
+            }
+            eprintln!("[beam iter {iterations}] timed survivors by last-op (count, best):");
+            let ops_in_order = [
+                OptOps::TC,
+                OptOps::UPCAST,
+                OptOps::UNROLL,
+                OptOps::LOCAL,
+                OptOps::GROUP,
+                OptOps::GROUPTOP,
+                OptOps::THREAD,
+            ];
+            for op in ops_in_order {
+                if let Some((cnt, best)) = by_op.get(&op) {
+                    eprintln!("  {op:?}: count={cnt:3} best={best:?}");
+                }
+            }
         }
 
         // 3. SORT: Sort by timing (best first)

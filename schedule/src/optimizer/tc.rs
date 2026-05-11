@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use morok_ir::{AxisId, AxisType, BinaryOp, ConstValue, Op, ReduceOp, UOp, UOpKey, WmmaMetadata, WmmaUpcastAxes};
-use smallvec::{SmallVec, smallvec};
+use smallvec::SmallVec;
 
 use crate::argsort;
 use crate::optimizer::{
@@ -256,116 +256,6 @@ pub fn get_reduce_axes_count(tc: &TensorCore) -> usize {
 }
 
 // ============================================================================
-// A-TILE PACKING
-// ============================================================================
-
-/// Pre-pack a TC operand into a contiguous scratch buffer.
-///
-/// When operand A has strided memory access (e.g., row-major A in AMX matmul),
-/// each K iteration requires `tile_size` separate cache line accesses. This function
-/// creates a copy loop that packs the tile into contiguous memory, so the reduction
-/// loop reads one cache line per K iteration instead of `tile_size`.
-///
-/// The copy loop uses fresh RANGE nodes (distinct axis_ids) so it becomes a separate
-/// loop from the downstream reduction. An AFTER dependency ensures correct ordering.
-fn pack_tc_operand(
-    src: &Arc<UOp>,
-    reduce_range: &Arc<UOp>,
-    contract_ranges: &[&Arc<UOp>],
-    next_axis_id: &mut usize,
-) -> Result<Arc<UOp>, OptError> {
-    // 1. Compute buffer dimensions
-    let k_size = get_range_size(reduce_range).expect("ICE: reduce range must have const size") as usize;
-    let contract_sizes: Vec<usize> = contract_ranges
-        .iter()
-        .map(|r| get_range_size(r).expect("ICE: contract range must have const size") as usize)
-        .collect();
-    let tile_size: usize = contract_sizes.iter().product();
-    let buf_total = k_size * tile_size;
-    let element_dtype = src.dtype().scalar_dtype();
-
-    // 2. Create scratch buffer (register-allocated)
-    let buf = UOp::define_reg_typed(buf_total, element_dtype);
-
-    // 3. Create fresh RANGE nodes for the copy loop (2 loops: K × tile_size)
-    let k_end = match reduce_range.op() {
-        Op::Range { end, .. } => end.clone(),
-        _ => unreachable!(),
-    };
-    let k_clone = UOp::range_axis(k_end, AxisId::Renumbered(*next_axis_id), AxisType::Loop);
-    *next_axis_id += 1;
-
-    // Single flat range for the entire tile (replaces N nested binary ranges)
-    let m_flat = UOp::range_axis(UOp::index_const(tile_size as i64), AxisId::Renumbered(*next_axis_id), AxisType::Loop);
-    *next_axis_id += 1;
-
-    // 4. Substitute original ranges → decomposed sub-indices of m_flat in src expression
-    //
-    // The contract_ranges are N binary (size-2) Upcast ranges from shift_to splits.
-    // The src expression references them individually. We decompose m_flat back into
-    // sub-indices: sub_idx[i] = (m_flat / contract_strides[i]) % contract_sizes[i]
-    let contract_dims: Vec<i64> = contract_sizes.iter().map(|&s| s as i64).collect();
-    let contract_strides = crate::passes::linearize_index::compute_row_major_strides(&contract_dims);
-
-    #[allow(clippy::mutable_key_type)]
-    let subst: HashMap<UOpKey, Arc<UOp>> = {
-        let mut map = HashMap::with_capacity(1 + contract_ranges.len());
-        map.insert(UOpKey(reduce_range.clone()), k_clone.clone());
-        for (i, orig) in contract_ranges.iter().enumerate() {
-            let sub_idx = if contract_strides[i] == 1 {
-                m_flat
-                    .try_mod(&UOp::index_const(contract_sizes[i] as i64))
-                    .map_err(|_| ValidationFailedSnafu { op: "TC pack", reason: "sub-index mod failed" }.build())?
-            } else {
-                let divided = m_flat
-                    .try_div(&UOp::index_const(contract_strides[i]))
-                    .map_err(|_| ValidationFailedSnafu { op: "TC pack", reason: "sub-index div failed" }.build())?;
-                divided
-                    .try_mod(&UOp::index_const(contract_sizes[i] as i64))
-                    .map_err(|_| ValidationFailedSnafu { op: "TC pack", reason: "sub-index mod failed" }.build())?
-            };
-            map.insert(UOpKey((*orig).clone()), sub_idx);
-        }
-        map
-    };
-    let src_cloned = src.substitute(&subst);
-
-    // 5. Store: buf[k_clone * tile_size + m_flat] = src_cloned
-    let tile_size_const = UOp::index_const(tile_size as i64);
-    let store_idx = k_clone
-        .try_mul(&tile_size_const)
-        .and_then(|k_offset| k_offset.try_add(&m_flat))
-        .map_err(|_| ValidationFailedSnafu { op: "TC pack", reason: "store index creation failed" }.build())?;
-
-    let store_ptr = UOp::index()
-        .buffer(buf.clone())
-        .indices(vec![store_idx])
-        .ptr(true)
-        .call()
-        .map_err(|_| ValidationFailedSnafu { op: "TC pack", reason: "store index creation failed" }.build())?;
-    let store = store_ptr.store(src_cloned);
-
-    let end = store.end(smallvec![k_clone, m_flat]);
-    let buf_ready = buf.after(smallvec![end]);
-
-    // 6. Read: LOAD(INDEX(buf_ready, [k * tile_size + m_linear])) using ORIGINAL ranges
-    let read_dims: Vec<i64> = std::iter::once(k_size as i64).chain(contract_sizes.iter().map(|&s| s as i64)).collect();
-    let read_strides = crate::passes::linearize_index::compute_row_major_strides(&read_dims);
-    let read_indices: Vec<Arc<UOp>> =
-        std::iter::once(reduce_range.clone()).chain(contract_ranges.iter().map(|r| (*r).clone())).collect();
-    let read_idx = crate::passes::linearize_index::build_linear_index(&read_indices, &read_strides);
-
-    let read_ptr = UOp::index()
-        .buffer(buf_ready.clone())
-        .indices(vec![read_idx])
-        .ptr(true)
-        .call()
-        .map_err(|_| ValidationFailedSnafu { op: "TC pack", reason: "read index creation failed" }.build())?;
-
-    Ok(UOp::load().buffer(buf_ready).index(read_ptr).call())
-}
-
-// ============================================================================
 // APPLICATION
 // ============================================================================
 
@@ -380,6 +270,11 @@ fn apply_axis_choice_impl(
     let tc_selection = select_tensor_core(pattern, &scheduler.ren, tc_select, axis_choice)?
         .ok_or_else(|| ValidationFailedSnafu { op: "TC", reason: "no compatible tensor core found" }.build())?;
 
+    // Record which TC was actually picked; beam's `validate_limits` reads
+    // this to compute the correct `tc_up` divisor when the renderer offers
+    // multiple TC variants.
+    scheduler.selected_tc_index = Some(tc_selection.tc_index);
+
     // Clone the TensorCore to avoid borrow conflicts when applying PADTO
     let tc = scheduler.ren.tensor_cores[tc_selection.tc_index].clone();
     let (n_range, m_range, k_range) = &tc_selection.axes;
@@ -389,10 +284,6 @@ fn apply_axis_choice_impl(
     // Padding check and application (tc_opt >= 2)
     // When tc_opt >= 2, we use PADTO to align non-divisible dimensions
     // instead of rejecting them outright.
-    // Track whether any axis was padded — if so, B operand needs packing
-    // because PADTO gates break devectorization of the B source expression.
-    let mut padded = false;
-
     if tc_opt >= 2 {
         // Collect padding operations needed (can't mutate axes while iterating)
         let tc_dims = [tc.dims.0, tc.dims.1, tc.dims.2];
@@ -409,8 +300,6 @@ fn apply_axis_choice_impl(
                 padding_ops.push((i, axis_idx, tc_dim));
             }
         }
-
-        padded = !padding_ops.is_empty();
 
         // Apply padding operations sequentially
         for (axes_idx, scheduler_idx, tc_dim) in padding_ops {
@@ -583,26 +472,6 @@ fn apply_axis_choice_impl(
         let a_axes = base_upcast_axes[..n_a].to_vec();
         let b_axes = base_upcast_axes[..n_b].to_vec();
         let c_axes = base_upcast_axes[..n_c].to_vec();
-
-        // Pack operand A if configured (AMX: contiguous scratch buffer for strided access)
-        let mut next_axis_id = scheduler.maxarg() + 200;
-        let src_a = if tc.pack_a {
-            let contract_range_refs: Vec<&Arc<UOp>> = base_upcast_ne[..n_a].to_vec();
-            pack_tc_operand(&src_a, &axes[2], &contract_range_refs, &mut next_axis_id)?
-        } else {
-            src_a
-        };
-
-        // Pack operand B when PADTO was applied — PADTO gates break devectorization
-        // by creating per-element validity masks that prevent merging into contiguous
-        // vector loads. Packing B into a scratch buffer resolves this: the copy loop
-        // handles gated reads at the scalar level, and WMMA reads from contiguous memory.
-        let src_b = if padded {
-            let contract_range_refs: Vec<&Arc<UOp>> = base_upcast_ne[..n_b].to_vec();
-            pack_tc_operand(&src_b, &axes[2], &contract_range_refs, &mut next_axis_id)?
-        } else {
-            src_b
-        };
 
         // Step 5: Construct WMMA
         // Compute TC reduce axis IDs early (needed for metadata)

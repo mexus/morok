@@ -129,16 +129,73 @@ impl Renderer for LlvmTextRenderer {
                 ctx.register(node.id, acc_name);
             }
         }
+
+        // WMMA scratch buffers — one alloca + ptrtoint per (A, B, C) operand.
+        // Allocas placed in the entry block so LLVM's mem2reg can promote them
+        // to vector registers across loop iterations. Without this, the WMMA
+        // accumulator is materialized to memory every K iteration.
+        let wmma_count = nodes.iter().filter(|n| matches!(n.op(), Op::Wmma { .. })).count();
+        if wmma_count > 0 {
+            kernel.push("  ; WMMA AMX scratch buffers".to_string());
+            for node in &nodes {
+                if let Op::Wmma { a, b, c, .. } = node.op() {
+                    for (i, src) in [a, b, c].iter().enumerate() {
+                        let dtype = ldt(&src.dtype());
+                        let base = format!("%wmma_{}_amx{}", node.id, i);
+                        let ptr_name = format!("%wmma_{}_ptr_amx{}", node.id, i);
+                        let align = src.dtype().bytes();
+                        kernel.push(format!("  {base} = alloca {dtype}, align {align}"));
+                        kernel.push(format!("  {ptr_name} = ptrtoint ptr {base} to i64"));
+                    }
+                }
+            }
+        }
         kernel.push("".to_string());
 
         for node in &nodes {
             match node.op() {
                 Op::Const(cv) => {
-                    let val = crate::llvm::common::lconst(&cv.0, &node.dtype());
-                    ctx.register(node.id, val);
+                    if node.dtype().vcount() > 1 {
+                        // Vector-typed CONST → splat via insertelement +
+                        // shufflevector.
+                        //
+                        // Invariant after this pre-pass: any UOp with a vector
+                        // dtype either has a true vector value (load, ALU
+                        // result, vectorize) or — for vector CONSTs — gets a
+                        // named splat value emitted in the entry block.
+                        let scalar_dtype = node.dtype().scalar_dtype();
+                        let scalar_lit = crate::llvm::common::lconst(&cv.0, &scalar_dtype);
+                        let scalar_ty = ldt(&scalar_dtype);
+                        let count = node.dtype().vcount();
+                        let dst = ctx.name(node);
+                        kernel.push(format!(
+                            "  {dst}_splat0 = insertelement <1 x {scalar_ty}> poison, {scalar_ty} {scalar_lit}, i32 0"
+                        ));
+                        kernel.push(format!(
+                            "  {dst} = shufflevector <1 x {scalar_ty}> {dst}_splat0, \
+                             <1 x {scalar_ty}> poison, <{count} x i32> zeroinitializer"
+                        ));
+                    } else {
+                        let val = crate::llvm::common::lconst(&cv.0, &node.dtype());
+                        ctx.register(node.id, val);
+                    }
                 }
-                Op::VConst { .. } => {
-                    ctx.name(node);
+                Op::VConst { values } => {
+                    // Per-lane vector CONST → VECTORIZE chain of scalar
+                    // CONSTs, emitted as a sequence of insertelements.
+                    let scalar_dtype = node.dtype().scalar_dtype();
+                    let scalar_ty = ldt(&scalar_dtype);
+                    let vec_ty = ldt(&node.dtype());
+                    let dst = ctx.name(node);
+                    let mut prev = "poison".to_string();
+                    for (i, cv) in values.iter().enumerate() {
+                        let scalar_lit = crate::llvm::common::lconst(cv, &scalar_dtype);
+                        let next = if i + 1 == values.len() { dst.clone() } else { format!("{dst}_e{i}") };
+                        kernel.push(format!(
+                            "  {next} = insertelement {vec_ty} {prev}, {scalar_ty} {scalar_lit}, i32 {i}"
+                        ));
+                        prev = next;
+                    }
                 }
                 _ => {}
             }

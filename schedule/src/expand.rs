@@ -162,82 +162,21 @@ pub fn swizzle_args(cargs: &[(usize, usize)], eargs: &[(usize, usize)], exclude_
 
 /// Run pre-expansion pass on kernel AST.
 ///
-/// Call this AFTER optimization but BEFORE codegen.
-///
-/// # Tinygrad Pipeline Alignment (Stage 9)
-///
-/// Tinygrad: `sym + pm_pre_expander + pm_group_for_reduce + expander`
-///
-/// Our phases:
-/// 1. Convert Range(Unroll/Upcast) → UNROLL ops with constant vectors
-/// 2. Apply expansion patterns with symbolic simplification
-///
-/// # Traversal Direction
-///
-/// Uses bottom-up traversal. Note that Tinygrad's `bottom_up=False` is actually
-/// a hybrid that processes children first, then applies patterns - it's NOT
-/// purely top-down. Morok's bottom-up matches this behavior better because:
-/// - Range(Upcast) → UNROLL conversion must complete before fix_reduce_unroll
-/// - Pattern dependencies require children to be transformed first
+/// Composition: `sym + pm_pre_expander + pm_group_for_reduce + expander`.
 pub fn pre_expand(ast: &Arc<UOp>) -> Arc<UOp> {
     use crate::rewrite::graph_rewrite;
     use crate::symbolic::patterns::sym;
-
-    // Phase 1: Convert Range(Unroll/Upcast) to UNROLL ops
-    // Uses default graph_rewrite (patterns see optimized children)
-    let ast = graph_rewrite(phase1_range_to_unroll(), ast.clone(), &mut ());
-
-    // Phase 2: Expander + symbolic (Tinygrad: sym + pm_pre_expander + pm_group_for_reduce + expander)
-    //
-    // Pattern order matches Tinygrad exactly:
-    // 1. sym() - full symbolic (Tinygrad uses sym tier here)
-    // 2. pm_pre_expander() - Range→UNROLL, fix_reduce_unroll, fix_store_unroll
-    // 3. pm_group_for_reduce() - GROUP_REDUCE → shared memory pattern
-    // 4. expander() - do_expand, do_contract, BARRIER handling
-    //
-    // CRITICAL: Uses graph_rewrite (not bottom_up) so do_expand sees OPTIMIZED children.
-    // This ensures nested expressions like Add(Add(UNROLL, UNROLL), UNROLL) are
-    // correctly expanded - inner Add becomes UNROLL before outer Add is processed.
     use std::sync::LazyLock;
-    static PHASE2: LazyLock<TypedPatternMatcher> =
+    static COMBINED: LazyLock<TypedPatternMatcher> =
         LazyLock::new(|| sym().clone() + pm_pre_expander() + pm_group_for_reduce() + expander());
 
-    graph_rewrite(&*PHASE2, ast, &mut ())
-}
-
-/// Phase 1: Convert Range(Unroll/Upcast) → UNROLL ops with constant vectors.
-///
-/// Tinygrad pattern (expander.py:143-147, Python syntax):
-/// ```text
-/// (UPat(Ops.RANGE, name="r"),
-///  lambda r: UOp(Ops.UNROLL, r.dtype, (UOp.const(r.dtype.vec(s), tuple(range(s))),), ((r.arg[0],s),))
-///  if r.arg[1] in {AxisType.UNROLL, AxisType.UPCAST} else None)
-/// ```
-///
-fn phase1_range_to_unroll() -> &'static TypedPatternMatcher {
-    crate::cached_patterns! {
-        // Convert Range(Unroll) to UNROLL op with constant vector
-        // NOTE: Range(Upcast) is NOT converted here - it's preserved for fix_reduce_unroll
-        // to detect and set Vector dtype for K-vectorization. It gets converted in Phase 2.
-        range @ Range { end: _end @const(cv), axis_id, axis_type }
-            if matches!(axis_type, AxisType::Unroll) => |range| {
-            let size = const_to_usize(&cv)?;
-            let values: Vec<ConstValue> = (0..size as i64).map(ConstValue::Int).collect();
-            let vconst = UOp::vconst(values, range.dtype().scalar_dtype());
-            Some(vconst.unroll_with_dtype(vec![(axis_id.value(), size)], range.dtype()))
-        },
-    }
+    graph_rewrite(&*COMBINED, ast.clone(), &mut ())
 }
 
 /// Pre-expander patterns that run BEFORE pm_group_for_reduce.
 ///
-/// Based on Tinygrad's pm_pre_expander (expander.py:143-151):
-/// - Range(Upcast/Unroll) → UNROLL conversion
-/// - fix_reduce_unroll: partition REDUCE ranges, wrap UNROLL in CONTRACT
-/// - fix_store_unroll: partition STORE ranges, wrap in CONTRACT
-///
-/// These patterns prepare REDUCE/STORE for the main expander by:
-/// 1. Converting Upcast/Unroll ranges to UNROLL ops with const vectors
+/// Prepares REDUCE/STORE for the main expander by:
+/// 1. Converting `Range(Upcast/Unroll)` to UNROLL ops with const vectors
 /// 2. Partitioning REDUCE ranges so only Range ops remain (UNROLL → CONTRACT)
 /// 3. Partitioning STORE ranges similarly
 pub fn pm_pre_expander() -> &'static TypedPatternMatcher {
@@ -298,9 +237,14 @@ pub fn expander() -> &'static TypedPatternMatcher {
         },
 
         // Push END inside broadcast: END(VECTORIZE([x;n]), ranges) → VECTORIZE([END(x, ranges);n])
-        End { computation, ranges, .. } if broadcast_info(computation).is_some() => |end| {
+        // Tag preservation: the matched END may carry TAG_MERGEABLE (set by
+        // reduce_to_acc); the reconstructed inner ENDs must inherit it so
+        // downstream `merge_sibling_ends` can still find them.
+        end @ End { computation, ranges, .. } if broadcast_info(computation).is_some() => |end| {
             let (src, count) = broadcast_info(computation)?;
-            let elements: SmallVec<[Arc<UOp>; 4]> = std::iter::repeat_n(src.end(ranges.clone()), count).collect();
+            let tag = end.tag().clone();
+            let elements: SmallVec<[Arc<UOp>; 4]> =
+                std::iter::repeat_n(src.end(ranges.clone()).rtag(tag), count).collect();
             Some(UOp::vectorize(elements))
         },
 
@@ -576,9 +520,10 @@ fn do_expand(uop: &Arc<UOp>) -> Option<Arc<UOp>> {
         let stride = src_count / expand_sz;
         let new_indices: Vec<usize> =
             indices.iter().flat_map(|&idx| (0..expand_sz).map(move |e| idx + e * stride)).collect();
-        // Fall through to normal path with modified arg
+        // Wrap result in UNROLL with original scalar dtype.
+        // Using gep_result.dtype() (vector after multi-index gep) bloats codegen.
         let gep_result = src.gep(new_indices);
-        return Some(gep_result.unroll(expand_args));
+        return Some(gep_result.unroll_with_dtype(expand_args, base_dtype));
     }
 
     // Create the expanded operation using replace() infrastructure

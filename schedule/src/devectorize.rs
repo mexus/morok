@@ -719,6 +719,12 @@ fn is_const_minus_one(a: &ConstValue, b: &ConstValue) -> bool {
 /// Generic ALU devectorization: Vector ALU → VECTORIZE of scalar ALU.
 ///
 /// Per-lane: `vec_alu(op, srcs) → VECTORIZE(alu(op, [s.gep(i) for s in srcs]) for i in vcount)`.
+/// Walk `uop`'s subtree and return true if any descendant is an AMX-tagged
+/// [`Op::Wmma`]. Used to guard scalarization of AMX-accumulator ALU chains.
+fn alu_src_contains_amx_wmma(uop: &Arc<UOp>) -> bool {
+    uop.any_in_subtree(|u| matches!(u.op(), Op::Wmma { metadata, .. } if metadata.device.is_apple_amx()))
+}
+
 fn devectorize_alu(alu: &Arc<UOp>) -> Option<Arc<UOp>> {
     let vcount = alu.dtype().vcount();
     if vcount <= 1 {
@@ -730,6 +736,15 @@ fn devectorize_alu(alu: &Arc<UOp>) -> Option<Arc<UOp>> {
     if let Op::Ternary(TernaryOp::Where, _, _, f) = alu.op()
         && UOp::is_invalid_marker(f)
     {
+        return None;
+    }
+
+    // Skip ALUs that touch an AMX-WMMA accumulator. Scalarizing here would
+    // turn the single `<N x float>` accumulator Add into N scalar ops and
+    // prevent `pm_wmma_accumulate` from fusing `Add(WMMA, x)` into the
+    // WMMA's `c` operand. We only refuse for AMX — other devices' WMMA
+    // paths (CUDA/Metal/AMD) expect lane-broken accumulators.
+    if alu.op().sources().iter().any(alu_src_contains_amx_wmma) {
         return None;
     }
 
@@ -932,9 +947,22 @@ fn no_vectorized_buf(buf: &Arc<UOp>) -> Option<Arc<UOp>> {
 
 /// INDEX(CAST(buf), idx) → INDEX(VECTORIZE([buf,...]), scaled_vec_idx).
 ///
-/// Handles both scalar and vector idx. For vector idx with vcount=V and pointer
-/// vcount=cnt, produces total = V*cnt lanes:
-///   for each lane i in idx: idx[i]*cnt + [0, 1, ..., cnt-1]
+/// Scope: CAST-wrapped buffer path only — driven by the patterns at
+/// `Index { buffer: Cast { ... } }` and
+/// `Index { buffer: Gep { vector: Cast { ... } } }`, which is the
+/// register / DEFINE_LOCAL widening path. The UPCAST/UNROLL hot path goes
+/// through `expand_index_to_vectorize` + `fold_expanded_index` and never
+/// reaches here.
+///
+/// Handles both scalar and vector idx. For vector idx with vcount=V and
+/// pointer vcount=cnt, produces total = V*cnt lanes in idx-major order:
+///   lane k = idx[k / cnt] * cnt + (k % cnt)
+///
+/// The vector path emits a single multi-index GEP + two VCONSTs + one
+/// vector Mul + one vector Add (5 nodes regardless of total). Idx-major
+/// order matches the CAST-buf consumer expectations (lanes grouped by
+/// idx position); flipping to offset-major would require flipping the
+/// consumer-side gather too.
 fn no_vectorized_index(
     buf: &Arc<UOp>,
     indices: &SmallVec<[Arc<UOp>; 4]>,
@@ -951,6 +979,7 @@ fn no_vectorized_index(
     let idx_vcount = idx.dtype().vcount();
     let total = cnt * idx_vcount;
     let buf_broadcast = buf.broadcast(total);
+    let scalar_dtype = idx.dtype().scalar_dtype();
 
     let final_idx = if idx_vcount == 1 {
         // Scalar path.
@@ -958,30 +987,22 @@ fn no_vectorized_index(
         let cnt_broadcast = idx.const_like(cnt as i64).broadcast(cnt);
         idx_broadcast.mul(&cnt_broadcast).add(&create_index_vector(0..cnt as i64))
     } else {
-        // Vector path: expand each lane by cnt elements
-        // idx = [a, b, c], cnt = 3 → [a*3+0, a*3+1, a*3+2, b*3+0, b*3+1, b*3+2, c*3+0, c*3+1, c*3+2]
-        let elements: SmallVec<[Arc<UOp>; 4]> = (0..idx_vcount)
-            .flat_map(|i| {
-                let lane = idx.gep(vec![i]);
-                let cnt_const = UOp::const_(lane.dtype(), ConstValue::Int(cnt as i64));
-                let scaled = lane.mul(&cnt_const);
-                (0..cnt).map(move |j| scaled.add(&UOp::const_(scaled.dtype(), ConstValue::Int(j as i64))))
-            })
-            .collect();
-        UOp::vectorize(elements)
+        // Vector path: idx-major lane order.
+        //   gep_indices = [0,0,..,0, 1,1,..,1, ..., (V-1),..,(V-1)]   (each idx pos × cnt)
+        //   offsets     = [0..cnt-1, 0..cnt-1, ..., 0..cnt-1]          (V copies)
+        let gep_indices: Vec<usize> = (0..idx_vcount).flat_map(|i| std::iter::repeat_n(i, cnt)).collect();
+        let cnt_vconst = UOp::vconst(vec![ConstValue::Int(cnt as i64); total], scalar_dtype.clone());
+        let offsets_vconst =
+            UOp::vconst((0..idx_vcount).flat_map(|_| (0..cnt as i64).map(ConstValue::Int)).collect(), scalar_dtype);
+        idx.gep(gep_indices).mul(&cnt_vconst).add(&offsets_vconst)
     };
 
-    // Expand gate to match total lanes if it's vectorized
+    // Gate expansion mirrors final_idx lane order (idx-major).
     let expanded_gate = if idx_vcount > 1 {
         gate.as_ref().map(|g| {
             if g.dtype().vcount() > 1 {
-                let elements: SmallVec<[Arc<UOp>; 4]> = (0..idx_vcount)
-                    .flat_map(|i| {
-                        let lane = g.gep(vec![i]);
-                        std::iter::repeat_n(lane, cnt)
-                    })
-                    .collect();
-                UOp::vectorize(elements)
+                let gate_gep: Vec<usize> = (0..idx_vcount).flat_map(|i| std::iter::repeat_n(i, cnt)).collect();
+                g.gep(gate_gep)
             } else {
                 g.broadcast(total)
             }
@@ -1008,8 +1029,16 @@ fn create_index_vector(values: impl IntoIterator<Item = i64>) -> Arc<UOp> {
 
 /// INDEX with precnt multiplier (broadcast or gep case).
 ///
-/// Handles both scalar and vector idx. For vector idx, each lane is expanded
-/// independently with the same precnt/cnt scaling.
+/// Handles both scalar and vector idx in idx-major lane order:
+///   per_lane = cnt * precnt
+///   lane k = idx[k / per_lane] * cnt + (c + input_gep[y])
+///   where (c, y) = ((k % per_lane) / precnt, (k % per_lane) % precnt)
+///
+/// Both branches emit single-vector ops (one multi-index GEP for vec-idx,
+/// one broadcast for scalar-idx) + two VCONSTs + one vector Mul + one
+/// vector Add. The previous scalar path called `idx.gep(...)` on a scalar
+/// idx — invalid since `gep` requires `vcount > 1`; this rewrite repairs
+/// it by broadcasting first (lane-major order preserved).
 fn no_vectorized_index_precnt(
     buf: &Arc<UOp>,
     idx: &Arc<UOp>,
@@ -1019,69 +1048,47 @@ fn no_vectorized_index_precnt(
 ) -> Option<Arc<UOp>> {
     let precnt = input_gep.len();
     let idx_vcount = idx.dtype().vcount();
+    let scalar_dtype = idx.dtype().scalar_dtype();
+    let per_lane = cnt * precnt;
+    let total = per_lane * idx_vcount;
 
-    if idx_vcount == 1 {
-        // Scalar path.
-        let total = cnt * precnt;
-        let gep_arg: Vec<usize> = (0..cnt).flat_map(|_| 0..precnt).collect();
-        let sum_arg = (0..cnt).flat_map(|i| input_gep.iter().map(move |&y| (i + y) as i64));
+    let buf_broadcast = buf.broadcast(total);
 
-        let buf_broadcast = buf.broadcast(total);
-        let final_idx =
-            idx.gep(gep_arg).mul(&idx.const_like(cnt as i64).broadcast(total)).add(&create_index_vector(sum_arg));
+    // Offsets: for each idx lane: for each c in 0..cnt: for each y in input_gep: (c + y).
+    let offsets: Vec<ConstValue> = (0..idx_vcount)
+        .flat_map(|_| (0..cnt).flat_map(|c| input_gep.iter().map(move |&y| ConstValue::Int((c + y) as i64))))
+        .collect();
+    let cnt_vconst = UOp::vconst(vec![ConstValue::Int(cnt as i64); total], scalar_dtype.clone());
+    let offsets_vconst = UOp::vconst(offsets, scalar_dtype);
 
-        Some(
-            UOp::index()
-                .buffer(buf_broadcast)
-                .indices(vec![final_idx])
-                .maybe_gate(gate.clone())
-                .ptr(true)
-                .call()
-                .expect("ICE: unable to create index"),
-        )
+    let final_idx = if idx_vcount == 1 {
+        // Scalar idx: broadcast to total lanes, then vector mul + vector add.
+        idx.broadcast(total).mul(&cnt_vconst).add(&offsets_vconst)
     } else {
-        // Vector path: expand each lane with the same precnt/cnt scaling
-        let per_lane = cnt * precnt;
-        let total = per_lane * idx_vcount;
+        // Vector idx: idx-major. Each idx lane repeats per_lane times.
+        let gep_indices: Vec<usize> = (0..idx_vcount).flat_map(|i| std::iter::repeat_n(i, per_lane)).collect();
+        idx.gep(gep_indices).mul(&cnt_vconst).add(&offsets_vconst)
+    };
 
-        let buf_broadcast = buf.broadcast(total);
-        let elements: SmallVec<[Arc<UOp>; 4]> = (0..idx_vcount)
-            .flat_map(|i| {
-                let lane = idx.gep(vec![i]);
-                let cnt_const = UOp::const_(lane.dtype(), ConstValue::Int(cnt as i64));
-                let scaled = lane.mul(&cnt_const);
-                (0..cnt).flat_map(move |c| {
-                    let s = scaled.clone();
-                    input_gep.iter().map(move |&y| s.add(&UOp::const_(s.dtype(), ConstValue::Int((c + y) as i64))))
-                })
-            })
-            .collect();
-        let final_idx = UOp::vectorize(elements);
+    let expanded_gate = gate.as_ref().map(|g| {
+        if g.dtype().vcount() > 1 {
+            // One multi-index GEP picks each gate lane per_lane times (idx-major).
+            let gate_gep: Vec<usize> = (0..idx_vcount).flat_map(|i| std::iter::repeat_n(i, per_lane)).collect();
+            g.gep(gate_gep)
+        } else {
+            g.broadcast(total)
+        }
+    });
 
-        let expanded_gate = gate.as_ref().map(|g| {
-            if g.dtype().vcount() > 1 {
-                let elements: SmallVec<[Arc<UOp>; 4]> = (0..idx_vcount)
-                    .flat_map(|i| {
-                        let lane = g.gep(vec![i]);
-                        std::iter::repeat_n(lane, per_lane)
-                    })
-                    .collect();
-                UOp::vectorize(elements)
-            } else {
-                g.broadcast(total)
-            }
-        });
-
-        Some(
-            UOp::index()
-                .buffer(buf_broadcast)
-                .indices(vec![final_idx])
-                .maybe_gate(expanded_gate)
-                .ptr(true)
-                .call()
-                .expect("ICE: unable to create index"),
-        )
-    }
+    Some(
+        UOp::index()
+            .buffer(buf_broadcast)
+            .indices(vec![final_idx])
+            .maybe_gate(expanded_gate)
+            .ptr(true)
+            .call()
+            .expect("ICE: unable to create index"),
+    )
 }
 
 // ============================================================================
@@ -1527,72 +1534,37 @@ fn split_load_store(ctx: &Renderer, ls: &Arc<UOp>, idx: &Arc<UOp>) -> Option<Arc
     }
 
     let buf_dtype = buf.dtype();
-
-    fn is_reg_tile_ptr(dtype: &DType, sz: usize) -> bool {
-        sz >= 16
-            && dtype.base().is_float()
-            && matches!(dtype, DType::Ptr { addrspace: AddrSpace::Reg, .. } | DType::Vector { .. })
-    }
-
-    fn find_underlying_load(uop: &Arc<UOp>) -> Option<Arc<UOp>> {
-        match uop.op() {
-            Op::Gep { vector, .. } => find_underlying_load(vector),
-            Op::Load { .. } => Some(uop.clone()),
-            _ => None,
-        }
-    }
-
-    // Detect a STORE/LOAD that targets an actual AMX TC accumulator: (a) the
-    // buffer is a float Reg pointer of TC tile width AND (b) a WMMA op tagged
-    // with `RendererDevice::AppleAmx` appears in the value chain. The device
-    // tag is what guarantees this is the AMX accumulator pattern and not a
-    // Metal/CUDA WMMA that happens to use a register-mapped accumulator.
-    //
-    // Without (b), heuristic kernels with `MOROK_AMX=1` but no TC application
-    // hit the wider-fold path and materialise a `float16` load/store of the
-    // regular FMA accumulator each reduce iteration; clang then can't keep it
-    // in NEON registers, costing ~2× perf.
-    fn has_amx_wmma(uop: &Arc<UOp>) -> bool {
-        uop.any_in_subtree(|u| matches!(u.op(), Op::Wmma { metadata, .. } if metadata.device.is_apple_amx()))
-    }
-
-    let is_amx_tc_acc = match ls.op() {
-        Op::Store { value, .. } => {
-            let reg_ptr_match = if let Some(load) = find_underlying_load(value)
-                && let Op::Load { index, .. } = load.op()
-                && let Op::Index { buffer, .. } = index.op()
-            {
-                is_reg_tile_ptr(&buffer.dtype(), sz)
-            } else {
-                false
-            };
-            reg_ptr_match && has_amx_wmma(value)
-        }
-        Op::Load { index, .. } => is_reg_tile_ptr(&buf_dtype, sz) && has_amx_wmma(index),
-        _ => false,
+    let buf_addrspace = match &buf_dtype {
+        DType::Ptr { addrspace, .. } => Some(*addrspace),
+        _ => None,
     };
 
-    // Don't fold for non-float types or Image, but allow AMX TC accumulators
-    // (which use in-memory accumulation).
-    let no_fold = (!buf_dtype.base().is_float() && !matches!(buf_dtype, DType::Image { .. }))
-        || (matches!(buf_dtype, DType::Ptr { addrspace: AddrSpace::Reg, .. }) && !is_amx_tc_acc);
-
-    let mut lengths = if no_fold {
-        vec![1]
+    // Chunk-length selection for load/store splitting:
+    // - non-float-non-image: scalar fold (lengths stays empty).
+    // - REG addrspace (AMX TC accumulators): scalar fold — folding 4-wide
+    //   here corrupts the WMMA C-operand load; SROA reconstitutes the
+    //   vector PHI from scalar loads.
+    // - Image: lengths = [4].
+    // - supports_float4: [8,4,2] for fp16+ALLOW_HALF8, [16,8,4,2] for AMX,
+    //   else [4,2].
+    // - Trailing 1 is always appended as the scalar fallback.
+    let mut lengths: Vec<usize> = Vec::new();
+    if !buf_dtype.base().is_float() && !matches!(buf_dtype, DType::Image { .. }) {
+        // non-float-non-image: scalar fold (lengths stays empty).
+    } else if buf_addrspace == Some(AddrSpace::Reg) {
+        // REG addrspace: scalar fold (lengths stays empty).
     } else if matches!(buf_dtype, DType::Image { .. }) {
-        vec![4, 1]
-    } else if is_amx_tc_acc {
-        vec![16, 8, 4, 2, 1] // AMX TC accumulator: 16-wide for WMMA
+        lengths.push(4);
     } else if ctx.supports_float4 {
-        vec![4, 2, 1]
-    } else {
-        // Renderer doesn't support float4 (e.g. WebGPU/WGSL): scalar only.
-        vec![1]
-    };
+        if ctx.is_amx() {
+            lengths.extend_from_slice(&[16, 8, 4, 2]);
+        } else {
+            lengths.extend_from_slice(&[4, 2]);
+        }
+    }
+    lengths.push(1);
 
-    // Filter by divisibility. AMX TC accumulator offsets are tile-aligned
-    // (typically `acc.index(0)`), so 0-offset trivially divides any fold
-    // width.
+    // Filter by divisibility against the index offset.
     if let Some(offset) = indices.first() {
         lengths.retain(|&len| offset_divides_evenly(offset, len));
     }

@@ -27,6 +27,7 @@ fn make_config(conv_norm: ConvNormType) -> GigaAmConfig {
         max_mel_frames: 20000,
         max_encoder_frames: 5000,
         decoder: CtcDecoder::Greedy(GreedyDecoder::new(Vec::new())),
+        transducer: None,
     }
 }
 
@@ -132,4 +133,48 @@ fn test_remap_head() {
     let out = remap_pytorch(sd, &config).unwrap();
     assert!(out.contains_key("head.weight"));
     assert!(out.contains_key("head.bias"));
+}
+
+#[test]
+fn test_remap_rnnt_predictor() {
+    let config = make_config(ConvNormType::LayerNorm);
+    let mut sd = StateDict::new();
+    sd.insert("head.decoder.embed.weight".into(), fake_tensor());
+    sd.insert("head.decoder.lstm.weight_ih_l0".into(), fake_tensor());
+    sd.insert("head.decoder.lstm.weight_hh_l0".into(), fake_tensor());
+    sd.insert("head.decoder.lstm.bias_ih_l0".into(), fake_tensor());
+    sd.insert("head.decoder.lstm.bias_hh_l0".into(), fake_tensor());
+    sd.insert("head.decoder.lstm.weight_ih_l1".into(), fake_tensor());
+    sd.insert("head.decoder.lstm.weight_hh_l1".into(), fake_tensor());
+    sd.insert("head.decoder.lstm.bias_ih_l1".into(), fake_tensor());
+    sd.insert("head.decoder.lstm.bias_hh_l1".into(), fake_tensor());
+
+    let out = remap_pytorch(sd, &config).unwrap();
+    assert!(out.contains_key("head.predictor.embed"));
+    assert!(out.contains_key("head.predictor.lstm.0.w_ih"));
+    assert!(out.contains_key("head.predictor.lstm.0.w_hh"));
+    assert!(out.contains_key("head.predictor.lstm.0.b_ih"));
+    assert!(out.contains_key("head.predictor.lstm.0.b_hh"));
+    assert!(out.contains_key("head.predictor.lstm.1.w_ih"));
+    assert!(out.contains_key("head.predictor.lstm.1.b_hh"));
+}
+
+#[test]
+fn test_remap_rnnt_joint() {
+    let config = make_config(ConvNormType::LayerNorm);
+    let mut sd = StateDict::new();
+    sd.insert("head.joint.enc.weight".into(), fake_tensor());
+    sd.insert("head.joint.enc.bias".into(), fake_tensor());
+    sd.insert("head.joint.pred.weight".into(), fake_tensor());
+    sd.insert("head.joint.pred.bias".into(), fake_tensor());
+    sd.insert("head.joint.joint_net.1.weight".into(), fake_tensor());
+    sd.insert("head.joint.joint_net.1.bias".into(), fake_tensor());
+
+    let out = remap_pytorch(sd, &config).unwrap();
+    assert!(out.contains_key("head.joint.enc_w"));
+    assert!(out.contains_key("head.joint.enc_b"));
+    assert!(out.contains_key("head.joint.pred_w"));
+    assert!(out.contains_key("head.joint.pred_b"));
+    assert!(out.contains_key("head.joint.out_w"));
+    assert!(out.contains_key("head.joint.out_b"));
 }

@@ -36,6 +36,23 @@ impl LlvmKernel {
 
         debug!(kernel.name = %name, ir.length = ir.len(), "Compiling LLVM IR via external clang");
 
+        if let Ok(dir) = std::env::var("MOROK_DUMP_LLVM_IR") {
+            let path = std::path::Path::new(&dir).join(format!("{name}.ll"));
+            let _ = std::fs::create_dir_all(&dir);
+            let _ = std::fs::write(&path, ir);
+        }
+
+        if let Ok(dir) = std::env::var("MOROK_DUMP_POST_O2_IR") {
+            // Run the same `-O2 -funroll-loops -fvectorize -fslp-vectorize`
+            // pipeline as the JIT compile but emit textual LLVM IR instead
+            // of an object file. Writes `<dir>/<name>.post.ll`.
+            let _ = std::fs::create_dir_all(&dir);
+            if let Some(post_ir) = compile_ir_to_post_o2_text(ir) {
+                let path = std::path::Path::new(&dir).join(format!("{name}.post.ll"));
+                let _ = std::fs::write(&path, post_ir);
+            }
+        }
+
         let obj = compile_ir_to_object(ir)?;
         let (fn_ptr, mmap) = crate::jit_loader::jit_load(&obj, &entry_point)?;
         let cif = KernelCif::new(buf_count + var_names.len());
@@ -145,6 +162,43 @@ fn compile_ir_to_object(ir: &str) -> Result<Vec<u8>> {
     }
 
     Ok(output.stdout)
+}
+
+/// Run the same `-O2` LLVM pass pipeline as the JIT compile but emit
+/// textual LLVM IR. Returns `None` on compile failure (silent — this
+/// is a diagnostic-only path, never load-bearing).
+fn compile_ir_to_post_o2_text(ir: &str) -> Option<String> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let mut args = vec![
+        "-x",
+        "ir",
+        "-S",
+        "-emit-llvm",
+        "-O2",
+        "-march=native",
+        "-fno-math-errno",
+        "-funroll-loops",
+        "-fvectorize",
+        "-fslp-vectorize",
+    ];
+    args.extend_from_slice(crate::jit_loader::platform_clang_flags());
+    args.extend_from_slice(&["-", "-o", "-"]);
+
+    let mut child = Command::new("clang")
+        .args(&args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .ok()?;
+    child.stdin.take()?.write_all(ir.as_bytes()).ok()?;
+    let output = child.wait_with_output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8(output.stdout).ok()
 }
 
 #[cfg(test)]

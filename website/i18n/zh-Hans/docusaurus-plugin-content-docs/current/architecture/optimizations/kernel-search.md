@@ -118,7 +118,7 @@ fn beam_search(scheduler: Scheduler, config: BeamConfig) -> Scheduler {
 MOROK_NOOPT=1 cargo run
 
 # Enable beam search with width 8
-MOROK_BEAM=8 cargo run
+BEAM=8 cargo run
 ```
 
 或通过代码配置：

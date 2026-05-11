@@ -254,10 +254,12 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec<Stri
                 UnaryOp::Rsqrt => {
                     let sqrt_dst = format!("{dst}.sqrt");
                     render_intrinsic(&sqrt_dst, "sqrt", &[(&stype, s)], &stype, kernel);
-                    kernel.push(format!("  {dst} = fdiv nsz arcp contract afn {stype} 1.0, {sqrt_dst}"));
+                    let one = splat_or_literal("1.0", &src.dtype(), kernel, &dst);
+                    kernel.push(format!("  {dst} = fdiv nsz arcp contract afn {stype} {one}, {sqrt_dst}"));
                 }
                 UnaryOp::Reciprocal => {
-                    kernel.push(format!("  {dst} = fdiv nsz arcp contract afn {stype} 1.0, {s}"));
+                    let one = splat_or_literal("1.0", &src.dtype(), kernel, &dst);
+                    kernel.push(format!("  {dst} = fdiv nsz arcp contract afn {stype} {one}, {s}"));
                 }
                 UnaryOp::Tan => {
                     let sin_dst = format!("{dst}.sin");
@@ -272,8 +274,9 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec<Stri
                         let lt_zero = format!("{dst}.lt");
                         let gt_ext = format!("{dst}.gt_ext");
                         let lt_ext = format!("{dst}.lt_ext");
-                        kernel.push(format!("  {gt_zero} = fcmp nsz arcp contract afn ogt {stype} {s}, 0.0"));
-                        kernel.push(format!("  {lt_zero} = fcmp nsz arcp contract afn olt {stype} {s}, 0.0"));
+                        let zero = splat_or_literal("0.0", &src.dtype(), kernel, &dst);
+                        kernel.push(format!("  {gt_zero} = fcmp nsz arcp contract afn ogt {stype} {s}, {zero}"));
+                        kernel.push(format!("  {lt_zero} = fcmp nsz arcp contract afn olt {stype} {s}, {zero}"));
                         kernel.push(format!("  {gt_ext} = uitofp i1 {gt_zero} to {stype}"));
                         kernel.push(format!("  {lt_ext} = uitofp i1 {lt_zero} to {stype}"));
                         kernel.push(format!("  {dst} = fsub nsz arcp contract afn {stype} {gt_ext}, {lt_ext}"));
@@ -282,15 +285,17 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec<Stri
                         let lt_zero = format!("{dst}.lt");
                         let gt_ext = format!("{dst}.gt_ext");
                         let lt_ext = format!("{dst}.lt_ext");
-                        kernel.push(format!("  {gt_zero} = icmp sgt {stype} {s}, 0"));
-                        kernel.push(format!("  {lt_zero} = icmp slt {stype} {s}, 0"));
+                        let zero = splat_or_literal("0", &src.dtype(), kernel, &dst);
+                        kernel.push(format!("  {gt_zero} = icmp sgt {stype} {s}, {zero}"));
+                        kernel.push(format!("  {lt_zero} = icmp slt {stype} {s}, {zero}"));
                         kernel.push(format!("  {gt_ext} = zext i1 {gt_zero} to {stype}"));
                         kernel.push(format!("  {lt_ext} = zext i1 {lt_zero} to {stype}"));
                         kernel.push(format!("  {dst} = sub {stype} {gt_ext}, {lt_ext}"));
                     } else {
                         // Unsigned: sign(x) = (x != 0) ? 1 : 0.
                         let ne_zero = format!("{dst}.ne");
-                        kernel.push(format!("  {ne_zero} = icmp ne {stype} {s}, 0"));
+                        let zero = splat_or_literal("0", &src.dtype(), kernel, &dst);
+                        kernel.push(format!("  {ne_zero} = icmp ne {stype} {s}, {zero}"));
                         kernel.push(format!("  {dst} = zext i1 {ne_zero} to {stype}"));
                     }
                 }
@@ -486,6 +491,83 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec<Stri
             None
         }
 
+        Op::Wmma { a, b, c, metadata } => {
+            // Apple AMX matmul.
+            //
+            // Stack slots `wmma_<id>_amx{0,1,2}` were pre-allocated in the
+            // function entry block (see `llvm/text/mod.rs`); LLVM's mem2reg
+            // pass promotes them to registers across loop iterations, which
+            // is the whole reason for using LLVM here over the C backend.
+            //
+            // Per call: store the 3 src vectors into their allocas, then
+            // `ldz×16 + ldx + ldy + fma + stz×16` via AMX inline asm. The C
+            // operand is a flat 256-elem accumulator; A and B are 16-elem
+            // input vectors. The AMX(op, gpr) macro encodes the row index
+            // and byte offset into the gpr for ldz/stz.
+            let a_val = ctx.get(a);
+            let b_val = ctx.get(b);
+            let c_val = ctx.get(c);
+            let a_dtype = ldt(&a.dtype());
+            let b_dtype = ldt(&b.dtype());
+            let c_dtype = ldt(&c.dtype());
+            let a_align = a.dtype().bytes();
+            let b_align = b.dtype().bytes();
+            let c_align = c.dtype().bytes();
+
+            let id = uop.id;
+            let amx0 = format!("%wmma_{id}_amx0");
+            let amx1 = format!("%wmma_{id}_amx1");
+            let amx2 = format!("%wmma_{id}_amx2");
+            let ptr0 = format!("%wmma_{id}_ptr_amx0");
+            let ptr1 = format!("%wmma_{id}_ptr_amx1");
+            let ptr2 = format!("%wmma_{id}_ptr_amx2");
+
+            // 1. Store A, B, C into their pre-allocated stack slots.
+            kernel.push(format!("  store {a_dtype} {a_val}, ptr {amx0}, align {a_align}"));
+            kernel.push(format!("  store {b_dtype} {b_val}, ptr {amx1}, align {b_align}"));
+            kernel.push(format!("  store {c_dtype} {c_val}, ptr {amx2}, align {c_align}"));
+
+            // 2. AMX_SET(0): enable the AMX coprocessor on this thread.
+            // Without this, every subsequent AMX instruction traps with
+            // SIGILL because the coprocessor is in disabled state.
+            // Encoding: `nop;nop;nop;.word (0x201000 + (17 << 5) + 0)`
+            // = `0x201220`.
+            kernel.push(amx_set_inline_asm(0));
+
+            // 3. ldz × N rows of the C accumulator into Z registers.
+            // AMX `ldz` op = 4. Each row is 64 bytes; row index is encoded in bits 56-59 (i*4<<56),
+            // byte offset is bits 0-9 (i*64). The bytes_per_elem in the encoding is fixed at
+            // 4 because AMX TC is fp32-only.
+            let n_rows = metadata.dims.0; // typically 16 for fp32
+            for i in 0..n_rows {
+                let off = ((i as u64 * 4) << 56) | (i as u64 * 64);
+                let ld_name = format!("%wmma_{id}_ld{i}");
+                kernel.push(format!("  {ld_name} = add i64 {ptr2}, {off}"));
+                kernel.push(amx_inline_asm(4, &ld_name));
+            }
+
+            // 4. ldx (A → X), ldy (B → Y), fma32.
+            kernel.push(amx_inline_asm(0, &ptr1));
+            kernel.push(amx_inline_asm(1, &ptr0));
+            kernel.push(amx_inline_asm_imm(12, 0));
+
+            // 5. stz × N rows of Z back into the C accumulator's stack slot.
+            for i in 0..n_rows {
+                let off = ((i as u64 * 4) << 56) | (i as u64 * 64);
+                let st_name = format!("%wmma_{id}_st{i}");
+                kernel.push(format!("  {st_name} = add i64 {ptr2}, {off}"));
+                kernel.push(amx_inline_asm(5, &st_name));
+            }
+
+            // 6. AMX_SET(1): disable the AMX coprocessor. Pairs with the
+            // enable above.
+            kernel.push(amx_set_inline_asm(1));
+
+            // 7. Load the WMMA result back from the C accumulator stack slot.
+            kernel.push(format!("  {dst} = load {c_dtype}, ptr {amx2}, align {c_align}"));
+            Some(())
+        }
+
         Op::After { passthrough, .. } => {
             #[cfg(debug_assertions)]
             if matches!(passthrough.op(), Op::Range { .. }) {
@@ -517,9 +599,8 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec<Stri
             Some(())
         }
 
-        // CUSTOM / CUSTOMI are intentionally absent: tinygrad's `llvmir.py`
-        // doesn't handle CUSTOM either, and the LLVM text renderer rejects
-        // these ops at the entry point with a typed error before they reach
+        // CUSTOM / CUSTOMI are intentionally absent: the LLVM text renderer
+        // rejects them at the entry point with a typed error before reaching
         // here (see `llvm/text/mod.rs`).
         op if op.is_movement() => {
             panic!(
@@ -536,6 +617,66 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec<Stri
             None
         }
     }
+}
+
+/// Materialize a scalar literal as a value usable in a `dtype`-typed
+/// instruction. For scalar `dtype` returns the literal as-is; for vector
+/// `dtype` emits a splat (insertelement + shufflevector) into `kernel`
+/// and returns the resulting SSA name.
+fn splat_or_literal(scalar_lit: &str, dtype: &DType, kernel: &mut Vec<String>, name_hint: &str) -> String {
+    if dtype.vcount() <= 1 {
+        return scalar_lit.to_string();
+    }
+    let scalar_ty = ldt(&dtype.scalar_dtype());
+    let n = dtype.vcount();
+    let splat_z = format!("{name_hint}.splat0");
+    let splat_v = format!("{name_hint}.splat");
+    kernel.push(format!("  {splat_z} = insertelement <1 x {scalar_ty}> poison, {scalar_ty} {scalar_lit}, i32 0"));
+    kernel.push(format!(
+        "  {splat_v} = shufflevector <1 x {scalar_ty}> {splat_z}, \
+         <1 x {scalar_ty}> poison, <{n} x i32> zeroinitializer"
+    ));
+    splat_v
+}
+
+/// Emit an `AMX_SET` instruction that toggles the AMX coprocessor's
+/// per-thread state. `imm5 = 0` enables AMX (must run before any other
+/// AMX instruction); `imm5 = 1` disables it (must run when leaving the
+/// AMX block to release the corruption surface).
+///
+/// Encoding: three NOP cycles to drain the pipeline, then a fixed 32-bit
+/// word at `0x201000 + (17 << 5) + imm5`. `17` is the AMX_SET op slot.
+/// Same encoding as the `AMX_SET` macro in morok's C backend
+/// (`codegen/src/c/amx.rs:39`).
+fn amx_set_inline_asm(imm5: u32) -> String {
+    let opcode = 0x201000u32 + (17 << 5) + imm5;
+    format!(
+        "  tail call void asm sideeffect \"nop\\0Anop\\0Anop\\0A.word ({opcode})\", \
+         \"~{{memory}}\"()"
+    )
+}
+
+/// Emit an Apple AMX inline asm instruction that takes a 64-bit register
+/// operand.
+///
+/// The `.word` directive emits the AMX-encoded instruction; the encoding
+/// `0x201000+(op<<5)+gpr-...` selects the AMX op and which AArch64 GPR
+/// carries the operand. `sideeffect` is required so LLVM doesn't DCE the
+/// AMX state-mutating instruction.
+fn amx_inline_asm(op: u32, gpr_name: &str) -> String {
+    format!(
+        "  tail call void asm sideeffect \".word (0x201000+($0<<5)+0$1-((0$1>>4)*6))\", \
+         \"i,r,~{{memory}}\"(i32 {op}, i64 {gpr_name})"
+    )
+}
+
+/// Emit an AMX inline asm instruction with an immediate operand instead of a
+/// register (used for `fma32` where the operand encoding is `0`).
+fn amx_inline_asm_imm(op: u32, imm: u64) -> String {
+    format!(
+        "  tail call void asm sideeffect \".word (0x201000+($0<<5)+0$1-((0$1>>4)*6))\", \
+         \"i,r,~{{memory}}\"(i32 {op}, i64 {imm})"
+    )
 }
 
 fn binary_instr(op: BinaryOp, dtype: &DType) -> &'static str {

@@ -105,6 +105,9 @@ impl UOp {
         if count == 1 {
             return self.clone();
         }
+        if let Op::Const(cvh) = self.op() {
+            return Self::vconst(vec![cvh.0; count], self.dtype().scalar_dtype());
+        }
         let elements: SmallVec<[Arc<Self>; 4]> = (0..count).map(|_| self.clone()).collect();
         Self::vectorize(elements)
     }

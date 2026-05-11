@@ -422,10 +422,6 @@ pub struct TensorCore {
         (SmallVec<[SwizzleAxis; 8]>, SmallVec<[SwizzleAxis; 8]>, SmallVec<[SwizzleAxis; 8]>),
     ),
 
-    /// Pre-pack operand A into contiguous scratch buffer before the reduction loop.
-    /// Beneficial when the A operand has non-unit stride access (e.g., AMX row-major matmul).
-    pub pack_a: bool,
-
     /// Tile grid for multi-FMA batching (tile_y_count, tile_x_count).
     ///
     /// When > (1, 1), the codegen emits load-pair instructions and multiple FMAs
@@ -449,7 +445,6 @@ pub struct TcConfig {
     opts: &'static [TcOpt],
     swizzle_a: (&'static [SwizzleAxis], &'static [SwizzleAxis], &'static [SwizzleAxis]),
     swizzle_b: (&'static [SwizzleAxis], &'static [SwizzleAxis], &'static [SwizzleAxis]),
-    pack_a: bool,
     tile_grid: (usize, usize),
 }
 
@@ -475,7 +470,6 @@ impl TcConfig {
                     self.swizzle_b.2.iter().copied().collect(),
                 ),
             ),
-            pack_a: self.pack_a,
             tile_grid: self.tile_grid,
         }
     }
@@ -493,7 +487,6 @@ pub const CUDA_81616: TcConfig = TcConfig {
     opts: &[U(0), L(0), L(0), L(1), L(1), L(1), U(1)],
     swizzle_a: (&[R(1), R(2), SL(2), SL(3), SL(4)], &[SU(1), R(3)], &[SL(0), SL(1), SU(0), R(0)]),
     swizzle_b: (&[R(1), R(2), SU(0), SL(0), SL(1)], &[R(0), R(3)], &[SL(2), SL(3), SL(4), SU(1)]),
-    pack_a: false,
     tile_grid: (1, 1),
 };
 
@@ -504,7 +497,6 @@ pub const CUDA_81632: TcConfig = TcConfig {
     opts: &[U(0), L(0), L(0), L(1), L(1), L(1), U(1)],
     swizzle_a: (&[R(2), R(3), SL(2), SL(3), SL(4)], &[SU(1), R(4)], &[SL(0), SL(1), SU(0), R(0), R(1)]),
     swizzle_b: (&[R(2), R(3), SU(0), SL(0), SL(1)], &[R(1), R(4)], &[SL(2), SL(3), SL(4), SU(1), R(0)]),
-    pack_a: false,
     tile_grid: (1, 1),
 };
 
@@ -515,7 +507,6 @@ pub const CUDA_8168: TcConfig = TcConfig {
     opts: &[U(0), L(0), L(0), L(1), L(1), L(1), U(1)],
     swizzle_a: (&[R(1), R(2), SL(2), SL(3), SL(4)], &[R(0), SU(1)], &[SL(0), SL(1), SU(0)]),
     swizzle_b: (&[R(1), R(2), SU(0), SL(0), SL(1)], &[SU(1), R(0)], &[SL(2), SL(3), SL(4)]),
-    pack_a: false,
     tile_grid: (1, 1),
 };
 
@@ -526,7 +517,6 @@ pub const CUDA_8168_TF32: TcConfig = TcConfig {
     opts: &[U(0), L(0), L(0), L(1), L(1), L(1), U(1)],
     swizzle_a: (&[R(0), R(1), SL(2), SL(3), SL(4)], &[SU(1), R(2)], &[SL(0), SL(1), SU(0)]),
     swizzle_b: (&[R(0), R(1), SU(0), SL(0), SL(1)], &[SU(1), R(2)], &[SL(2), SL(3), SL(4)]),
-    pack_a: false,
     tile_grid: (1, 1),
 };
 
@@ -538,7 +528,6 @@ pub const AMD_RDNA3: TcConfig = TcConfig {
     opts: &[L(0), L(0), L(0), L(0), L(1), U(1), U(1), U(1)],
     swizzle_a: (&[SL(4), SU(0), SU(1), SU(2), SL(0)], &[R(1), R(2), R(3)], &[SL(1), SL(2), SL(3), R(0)]),
     swizzle_b: (&[SL(0), SL(1), SL(2), SL(3), SL(4)], &[R(1), R(2), R(3)], &[SU(0), SU(1), SU(2), R(0)]),
-    pack_a: false,
     tile_grid: (1, 1),
 };
 
@@ -549,7 +538,6 @@ pub const AMD_RDNA4: TcConfig = TcConfig {
     opts: &[L(0), L(0), L(0), L(0), U(1), U(1), U(1), L(1)],
     swizzle_a: (&[SU(0), SU(1), SU(2), SL(4), R(2)], &[R(0), R(1), R(3)], &[SL(0), SL(1), SL(2), SL(3)]),
     swizzle_b: (&[SL(0), SL(1), SL(2), SL(3), R(2)], &[R(0), R(1), R(3)], &[SL(4), SU(0), SU(1), SU(2)]),
-    pack_a: false,
     tile_grid: (1, 1),
 };
 
@@ -560,7 +548,6 @@ pub const AMD_CDNA_161616: TcConfig = TcConfig {
     opts: &[L(0), L(0), L(0), L(0), U(1), U(1), L(1), L(1)],
     swizzle_a: (&[SU(0), SU(1), SL(4), SL(5), R(2), R(3)], &[R(0), R(1)], &[SL(0), SL(1), SL(2), SL(3)]),
     swizzle_b: (&[SL(0), SL(1), SL(2), SL(3), R(2), R(3)], &[R(0), R(1)], &[SL(4), SL(5), SU(0), SU(1)]),
-    pack_a: false,
     tile_grid: (1, 1),
 };
 
@@ -571,7 +558,6 @@ pub const AMD_CDNA_161632: TcConfig = TcConfig {
     opts: &[L(0), L(0), L(0), L(0), U(1), U(1), L(1), L(1)],
     swizzle_a: (&[SU(0), SU(1), SL(4), SL(5), R(3), R(4)], &[R(0), R(1)], &[SL(0), SL(1), SL(2), SL(3), R(2)]),
     swizzle_b: (&[SL(0), SL(1), SL(2), SL(3), R(3), R(4)], &[R(0), R(1)], &[SL(4), SL(5), SU(0), SU(1), R(2)]),
-    pack_a: false,
     tile_grid: (1, 1),
 };
 
@@ -583,7 +569,6 @@ pub const METAL_888: TcConfig = TcConfig {
     opts: &[U(0), L(0), L(1), L(1), L(0), L(1)],
     swizzle_a: (&[R(1), SL(1), SL(2), R(2), SL(4)], &[R(0)], &[SU(0), SL(0), SL(3)]),
     swizzle_b: (&[SL(0), R(0), R(1), SL(3), R(2)], &[SU(0)], &[SL(1), SL(2), SL(4)]),
-    pack_a: false,
     tile_grid: (1, 1),
 };
 
@@ -597,7 +582,6 @@ pub const APPLE_AMX: TcConfig = TcConfig {
     opts: &[U(0), U(0), U(0), U(0), U(1), U(1), U(1), U(1)],
     swizzle_a: (&[], &[SU(0), SU(1), SU(2), SU(3), SU(4), SU(5), SU(6), SU(7)], &[]),
     swizzle_b: (&[], &[SU(4), SU(5), SU(6), SU(7), SU(0), SU(1), SU(2), SU(3)], &[]),
-    pack_a: true,
     tile_grid: (1, 1),
 };
 
@@ -608,7 +592,6 @@ pub const APPLE_AMX_F16_F32: TcConfig = TcConfig {
     opts: &[U(0), U(0), U(0), U(0), U(0), U(1), U(1), U(1), U(1), U(1)],
     swizzle_a: (&[], &[SU(0), SU(1), SU(2), SU(3), SU(4), SU(5), SU(6), SU(7), SU(8), SU(9)], &[]),
     swizzle_b: (&[], &[SU(5), SU(6), SU(7), SU(8), SU(9), SU(0), SU(1), SU(2), SU(3), SU(4)], &[]),
-    pack_a: true,
     tile_grid: (1, 1),
 };
 
@@ -619,7 +602,6 @@ pub const APPLE_AMX_F16: TcConfig = TcConfig {
     opts: &[U(0), U(0), U(0), U(0), U(0), U(1), U(1), U(1), U(1), U(1)],
     swizzle_a: (&[], &[SU(0), SU(1), SU(2), SU(3), SU(4), SU(5), SU(6), SU(7), SU(8), SU(9)], &[]),
     swizzle_b: (&[], &[SU(5), SU(6), SU(7), SU(8), SU(9), SU(0), SU(1), SU(2), SU(3), SU(4)], &[]),
-    pack_a: true,
     tile_grid: (1, 1),
 };
 
@@ -630,7 +612,6 @@ pub const APPLE_AMX_F64: TcConfig = TcConfig {
     opts: &[U(0), U(0), U(0), U(1), U(1), U(1)],
     swizzle_a: (&[], &[SU(0), SU(1), SU(2), SU(3), SU(4), SU(5)], &[]),
     swizzle_b: (&[], &[SU(3), SU(4), SU(5), SU(0), SU(1), SU(2)], &[]),
-    pack_a: true,
     tile_grid: (1, 1),
 };
 
@@ -642,7 +623,6 @@ pub const APPLE_AMX_I16: TcConfig = TcConfig {
     opts: &[U(0), U(0), U(0), U(0), U(0), U(1), U(1), U(1), U(1), U(1)],
     swizzle_a: (&[], &[SU(0), SU(1), SU(2), SU(3), SU(4), SU(5), SU(6), SU(7), SU(8), SU(9)], &[]),
     swizzle_b: (&[], &[SU(5), SU(6), SU(7), SU(8), SU(9), SU(0), SU(1), SU(2), SU(3), SU(4)], &[]),
-    pack_a: true,
     tile_grid: (1, 1),
 };
 
@@ -654,7 +634,6 @@ pub const INTEL_XE_8816: TcConfig = TcConfig {
     opts: &[L(0), L(0), L(0), U(1), U(1), U(1)],
     swizzle_a: (&[R(1), R(2), R(3)], &[SU(0), SU(1), SU(2)], &[SL(0), SL(1), SL(2), R(0)]),
     swizzle_b: (&[SL(0), SL(1), SL(2)], &[R(1), R(2), R(3)], &[SU(0), SU(1), SU(2), R(0)]),
-    pack_a: false,
     tile_grid: (1, 1),
 };
 

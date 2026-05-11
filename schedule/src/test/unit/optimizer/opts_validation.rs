@@ -9,7 +9,7 @@
 
 use crate::optimizer::{Opt, Renderer, Scheduler, apply_opt};
 use crate::test::helpers::*;
-use morok_ir::{AxisType, ReduceOp};
+use morok_ir::{AxisId, AxisType, DType, ReduceOp, UOp};
 
 /// Port of Tinygrad test_kernel_opts.py::test_upcasts (lines 37-47)
 ///
@@ -508,4 +508,48 @@ fn test_double_reduce() {
         assert_axis_count(&sched, AxisType::GroupReduce, 2);
         assert_axis_count(&sched, AxisType::Upcast, 2);
     }
+}
+
+/// `Opt::upcast(_, 0)` (arg=0 = "use full axis size") must reach `shift_to`
+/// for symbolic-end Ranges instead of being pre-rejected with the old
+/// "requires constant axis size" error.
+///
+/// `resolve_full_axis` resolves `vmax+1` via `VminVmaxProperty` on any
+/// Range. Downstream `shift_to` still enforces static divisibility, so
+/// non-divisor-friendly symbolic Ranges fail with `SymbolicDivisionError` —
+/// the correct guard at the correct layer, not a silent drop at the resolver.
+#[test]
+fn test_full_upcast_no_longer_pre_rejects_symbolic_end() {
+    let const_val = UOp::native_const(1.0f32);
+    let symbolic_end = UOp::var("b", DType::Int32, 1, 4);
+    let range = UOp::range_axis(symbolic_end, AxisId::Renumbered(0), AxisType::Global);
+    let pattern = UOp::sink(vec![const_val, range]);
+
+    let mut sched = Scheduler::new(pattern, Renderer::cpu());
+
+    let result = apply_opt(&mut sched, &Opt::upcast(0, 0), true);
+    let err = result.expect_err("symbolic non-divisor Range should fail at shift_to, not resolve");
+    let err_str = format!("{err:?}");
+    // Old behavior: ValidationFailedSnafu "requires constant axis size".
+    // Post-Fix-A: SymbolicDivisionError from shift_to (resolver succeeded;
+    // the divisibility check downstream is the correct rejection).
+    assert!(err_str.contains("SymbolicDivisionError"), "Expected SymbolicDivisionError from shift_to, got: {err_str}");
+    assert!(
+        !err_str.contains("requires constant axis size"),
+        "resolve_full_axis must no longer pre-reject symbolic Ranges: {err_str}"
+    );
+}
+
+/// `Opt::upcast(_, 0)` on a const-end Range resolves identically to the
+/// prior strict path (`vmax+1 == const_end`).
+#[test]
+fn test_full_upcast_const_end_unchanged() {
+    let pattern = create_elementwise_pattern(&[8]);
+    let mut sched = Scheduler::new(pattern, Renderer::cpu());
+
+    let result = apply_opt(&mut sched, &Opt::upcast(0, 0), true);
+    assert!(result.is_ok(), "arg=0 UPCAST on const Range should succeed: {:?}", result.err());
+
+    assert_axis_count(&sched, AxisType::Upcast, 1);
+    assert_axis_count(&sched, AxisType::Global, 0);
 }

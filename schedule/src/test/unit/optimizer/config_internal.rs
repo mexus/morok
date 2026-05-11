@@ -23,17 +23,15 @@ fn test_opt_strategy_is_beam() {
 fn test_beam_config_default() {
     let config = BeamConfig::default();
     assert_eq!(config.beam_width, 4);
-    assert_eq!(config.timeout, Duration::from_secs(60));
     assert_eq!(config.max_upcast, 256);
     assert_eq!(config.max_local, 1024);
 }
 
 #[test]
 fn test_beam_config_builder() {
-    let config = BeamConfig::builder().beam_width(8).timeout_secs(120).max_upcast(512).build();
+    let config = BeamConfig::builder().beam_width(8).max_upcast(512).build();
 
     assert_eq!(config.beam_width, 8);
-    assert_eq!(config.timeout, Duration::from_secs(120));
     assert_eq!(config.max_upcast, 512);
     assert_eq!(config.max_local, 1024); // default
 }
@@ -77,11 +75,11 @@ fn test_optimizer_config_default() {
 fn test_optimizer_config_builder() {
     let config = OptimizerConfig::builder()
         .strategy(OptStrategy::Beam { width: 8 })
-        .beam(BeamConfig::builder().timeout_secs(120).build())
+        .beam(BeamConfig::builder().max_upcast(512).build())
         .build();
 
     assert_eq!(config.strategy, OptStrategy::Beam { width: 8 });
-    assert_eq!(config.beam.timeout, Duration::from_secs(120));
+    assert_eq!(config.beam.max_upcast, 512);
 }
 
 #[test]

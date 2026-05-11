@@ -6,6 +6,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use morok_ir::uop::cached_property::CachedProperty;
+use morok_ir::uop::properties::VminVmaxProperty;
 use morok_ir::{AxisType, ConstValue, Op, UOp, UOpKey};
 use smallvec::SmallVec;
 
@@ -26,10 +28,14 @@ pub fn apply_opt(scheduler: &mut Scheduler, opt: &Opt, append_opt: bool) -> Resu
             let _axes = tc::apply_with_axis_choice(scheduler, tc_select, tc_opt, use_tensor_cores, opt.axis)?;
         }
         OptOps::UPCAST => {
-            apply_upcast(scheduler, rng.ok_or_else(|| MissingAxisParameterSnafu.build())?, opt.arg.int()?)?;
+            let r = rng.ok_or_else(|| MissingAxisParameterSnafu.build())?;
+            let amount = resolve_full_axis(&r, opt.arg.int()?, "UPCAST")?;
+            apply_upcast(scheduler, r, amount)?;
         }
         OptOps::LOCAL => {
-            apply_local(scheduler, rng.ok_or_else(|| MissingAxisParameterSnafu.build())?, opt.arg.int()?)?;
+            let r = rng.ok_or_else(|| MissingAxisParameterSnafu.build())?;
+            let amount = resolve_full_axis(&r, opt.arg.int()?, "LOCAL")?;
+            apply_local(scheduler, r, amount)?;
         }
         OptOps::UNROLL => {
             apply_unroll(scheduler, opt.axis.ok_or_else(|| MissingAxisParameterSnafu.build())?, opt.arg.int()?)?;
@@ -41,13 +47,19 @@ pub fn apply_opt(scheduler: &mut Scheduler, opt: &Opt, append_opt: bool) -> Resu
             apply_swap(scheduler, opt.axis.ok_or_else(|| MissingAxisParameterSnafu.build())?, opt.arg.swap()?)?;
         }
         OptOps::GROUP => {
-            apply_group(scheduler, rng.ok_or_else(|| MissingAxisParameterSnafu.build())?, opt.arg.int()?, false)?;
+            let r = rng.ok_or_else(|| MissingAxisParameterSnafu.build())?;
+            let amount = resolve_full_axis(&r, opt.arg.int()?, "GROUP")?;
+            apply_group(scheduler, r, amount, false)?;
         }
         OptOps::GROUPTOP => {
-            apply_group(scheduler, rng.ok_or_else(|| MissingAxisParameterSnafu.build())?, opt.arg.int()?, true)?;
+            let r = rng.ok_or_else(|| MissingAxisParameterSnafu.build())?;
+            let amount = resolve_full_axis(&r, opt.arg.int()?, "GROUPTOP")?;
+            apply_group(scheduler, r, amount, true)?;
         }
         OptOps::THREAD => {
-            apply_thread(scheduler, rng.ok_or_else(|| MissingAxisParameterSnafu.build())?, opt.arg.int()?)?;
+            let r = rng.ok_or_else(|| MissingAxisParameterSnafu.build())?;
+            let amount = resolve_full_axis(&r, opt.arg.int()?, "THREAD")?;
+            apply_thread(scheduler, r, amount)?;
         }
         OptOps::PADTO => {
             apply_padto(scheduler, rng.ok_or_else(|| MissingAxisParameterSnafu.build())?, opt.arg.int()?)?;
@@ -58,6 +70,29 @@ pub fn apply_opt(scheduler: &mut Scheduler, opt: &Opt, append_opt: bool) -> Resu
         scheduler.applied_opts.push(opt.clone());
     }
     Ok(())
+}
+
+/// Resolve `amount=0` to the full size of `rng`'s axis via `vmax+1`.
+///
+/// `arg=0` means "use the full axis size"; resolved through `VminVmaxProperty`
+/// so both constant- and symbolic-end Ranges work. Beam search emits this
+/// for `Opt::{upcast,local,group,thread}(_, 0)` variants.
+fn resolve_full_axis(rng: &Arc<UOp>, amount: usize, op_name: &'static str) -> Result<usize, OptError> {
+    if amount != 0 {
+        return Ok(amount);
+    }
+    if !matches!(rng.op(), Op::Range { .. }) {
+        return ExpectedRangeOperationSnafu.fail();
+    }
+    let (_, vmax) = VminVmaxProperty::get(rng);
+    let vmax_i64 = match vmax {
+        ConstValue::Int(v) => v,
+        _ => return ValidationFailedSnafu { op: op_name, reason: "axis vmax has non-Int ConstValue" }.fail(),
+    };
+    vmax_i64
+        .checked_add(1)
+        .and_then(|v| usize::try_from(v).ok())
+        .ok_or_else(|| ValidationFailedSnafu { op: op_name, reason: "axis vmax+1 out of range" }.build())
 }
 
 // ============================================================================
@@ -193,26 +228,15 @@ fn find_reduce_using_range(scheduler: &Scheduler, rng: &Arc<UOp>) -> Result<Arc<
 // ============================================================================
 
 /// Split reduction into smaller range + UNROLL for compile-time expansion.
-/// When `amount == 0`, the entire axis is unrolled (full unroll).
+/// When `amount == 0`, the entire axis is unrolled (full unroll). Resolution
+/// is shared with UPCAST/LOCAL/GROUP/GROUPTOP/THREAD via [`resolve_full_axis`].
 fn apply_unroll(scheduler: &mut Scheduler, axis: usize, amount: usize) -> Result<(), OptError> {
     let unrollable = scheduler.unrollable_dims();
     let real_axis =
         *unrollable.get(axis).ok_or_else(|| AxisOutOfBoundsSnafu { axis, max: unrollable.len() }.build())?;
     let rng = scheduler.rngs()[real_axis].clone();
 
-    // Resolve amount=0 to full axis size (full unroll).
-    let amount = if amount == 0 {
-        if let Op::Range { end, .. } = rng.op()
-            && let Op::Const(cv) = end.op()
-            && let morok_ir::ConstValue::Int(sz) = cv.0
-        {
-            sz as usize
-        } else {
-            return ValidationFailedSnafu { op: "UNROLL", reason: "full unroll requires constant axis size" }.fail();
-        }
-    } else {
-        amount
-    };
+    let amount = resolve_full_axis(&rng, amount, "UNROLL")?;
 
     const MAX_UNROLL: usize = 32;
     if amount > MAX_UNROLL {
@@ -504,12 +528,13 @@ fn apply_thread(scheduler: &mut Scheduler, rng: Arc<UOp>, amount: usize) -> Resu
         return UnsupportedFeatureSnafu { feature: "CPU threads" }.fail();
     }
 
-    // Check if already threaded - make THREAD opt idempotent
-    // This allows replaying cached opts even when prepare_scheduler pre-applies threading
+    // Reject if already threaded. The previous silent `Ok(())` made beam
+    // expansions of a THREADed parent generate duplicate schedulers, which
+    // then got dedup'd — truncating the beam fan-out and preventing
+    // multi-step composition.
     let thread_axes = scheduler.axes_of(&[AxisType::Thread]);
     if !thread_axes.is_empty() {
-        tracing::debug!("THREAD opt skipped: scheduler already has Thread axis");
-        return Ok(());
+        return ValidationFailedSnafu { op: "THREAD", reason: "already threaded" }.fail();
     }
 
     // Validate thread count within limits

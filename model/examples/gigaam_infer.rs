@@ -33,6 +33,17 @@ struct KernelAstSummary {
     has_wmma: bool,
 }
 
+#[derive(Clone)]
+struct KernelDump {
+    kernel_id: u64,
+    ast_full: String,
+    code: String,
+    global_size: String,
+    local_size: String,
+    code_len: usize,
+    applied_opts: String,
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
     let t_total = Instant::now();
@@ -52,6 +63,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Err(_) => false,
     };
+    // For the top-N hottest kernels, dump the full UOp tree + rendered source
+    // so we can read the applied opt chain off a kernel that BEAM left bare.
+    let profile_dump_top: usize = env::var("MOROK_PROFILE_DUMP_TOP")
+        .ok()
+        .and_then(|v| {
+            let v = v.trim();
+            if v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes") || v.eq_ignore_ascii_case("on") {
+                Some(3)
+            } else {
+                v.parse::<usize>().ok()
+            }
+        })
+        .unwrap_or(0);
     let debug_logits = match env::var("MOROK_DEBUG_LOGITS") {
         Ok(v) => {
             let v = v.trim().to_ascii_lowercase();
@@ -235,11 +259,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         HashMap::new()
     };
+    // entry_point → (full UOp tree as text, rendered source code, applied-opts encoded
+    // in the entry name). Only populated when dump-top is requested so we don't pay
+    // the toposort+tree formatting cost in the default profile path.
+    let kernel_dump_map: HashMap<String, KernelDump> = if profile_dump_top > 0 {
+        let mut map: HashMap<String, KernelDump> = HashMap::new();
+        for pk in jit.prepared_kernels()? {
+            map.entry(pk.kernel.entry_point.clone()).or_insert_with(|| build_kernel_dump(pk));
+        }
+        map
+    } else {
+        HashMap::new()
+    };
     if profile_kernels {
         println!("Kernel profiling enabled via MOROK_PROFILE=1");
     }
     if profile_ast {
         println!("Kernel AST summaries enabled via MOROK_PROFILE_AST=1");
+    }
+    if profile_dump_top > 0 {
+        println!("Top-{} kernel dumps enabled via MOROK_PROFILE_DUMP_TOP", profile_dump_top);
     }
     let t_loop = Instant::now();
     let mut dt_pack = Duration::ZERO;
@@ -452,6 +491,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if kernel_total.is_zero() { 0.0 } else { elapsed.as_secs_f64() / kernel_total.as_secs_f64() * 100.0 };
             println!("  {:>7.2}% {:>9} calls {:>5} gsz={}", pct, fmt_duration(elapsed), calls, gs);
         }
+        // Capture the top-N (entry, elapsed) before `rows` is consumed below so the
+        // detailed-dump section after the table can replay the same ordering.
+        let dump_targets: Vec<(String, Duration)> = if profile_dump_top > 0 {
+            rows.iter().take(profile_dump_top).map(|(e, a)| (e.clone(), a.elapsed)).collect()
+        } else {
+            Vec::new()
+        };
+
         println!("top kernels:");
         for (entry, agg) in rows.into_iter().take(15) {
             let elapsed = agg.elapsed;
@@ -482,6 +529,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 );
                 for line in summary.ast_head.lines() {
                     println!("         {}", line);
+                }
+            }
+        }
+
+        if profile_dump_top > 0 {
+            println!("\n--- Top-{} kernel dumps (full UOp tree + rendered source) ---", profile_dump_top);
+            for (rank, (entry, elapsed)) in dump_targets.iter().enumerate() {
+                println!(
+                    "\n[#{}] {entry}\n     elapsed={} gsz={} lsz={} code={}B",
+                    rank + 1,
+                    fmt_duration(*elapsed),
+                    kernel_dump_map.get(entry).map(|d| d.global_size.as_str()).unwrap_or("?"),
+                    kernel_dump_map.get(entry).map(|d| d.local_size.as_str()).unwrap_or("?"),
+                    kernel_dump_map.get(entry).map(|d| d.code_len).unwrap_or(0),
+                );
+                let Some(dump) = kernel_dump_map.get(entry) else {
+                    println!("     (no dump captured — kernel not present in prepared_kernels())");
+                    continue;
+                };
+                println!("     ast_id={}", dump.kernel_id);
+                println!("     applied_opts: {}", dump.applied_opts);
+                println!("     --- UOp tree ---");
+                for line in dump.ast_full.lines() {
+                    println!("       {line}");
+                }
+                println!("     --- rendered source ({} bytes) ---", dump.code_len);
+                for line in dump.code.lines() {
+                    println!("       {line}");
                 }
             }
         }
@@ -624,6 +699,66 @@ fn summarize_kernel_ast(pk: &morok_runtime::PreparedKernel) -> KernelAstSummary 
 
     let ast_head = trim_tree_head(&ast.tree(), 14);
     KernelAstSummary { kernel_id: pk.id, top_ops, ast_head, has_wmma }
+}
+
+fn build_kernel_dump(pk: &morok_runtime::PreparedKernel) -> KernelDump {
+    let ast = match pk.ast.op() {
+        Op::Call { body, .. } => body.clone(),
+        _ => pk.ast.clone(),
+    };
+    KernelDump {
+        kernel_id: pk.id,
+        ast_full: ast.tree(),
+        code: pk.kernel.code.clone(),
+        global_size: format_launch_size(&pk.kernel.global_size),
+        local_size: format_launch_local_size(pk.kernel.local_size.as_ref()),
+        code_len: pk.kernel.code.len(),
+        applied_opts: parse_applied_opts_from_name(&pk.kernel.entry_point),
+    }
+}
+
+/// Decode the opt chain encoded in kernel name suffixes. The optimizer
+/// renderer suffixes axes with single-letter type prefixes followed by the size:
+/// `t` THREAD, `u` UPCAST, `r` UNROLL, `l` LOCAL, `g` GROUP, `G` GROUP_REDUCE,
+/// `R` reduce, `L` Loop, `W` WARP. We surface only the opt-introduced axes
+/// so a bare matmul (`r_L3FL3FL3072R768`) reports "(no opts)" while an opted
+/// kernel (`r_L3FL3FL4t12u4u4R768r4`) reports "THREAD(12), UPCAST(4), UPCAST(4), UNROLL(4)".
+fn parse_applied_opts_from_name(entry: &str) -> String {
+    // Strip leading kind prefix ("r_", "E_", ...) up to and including the underscore.
+    let body = entry.find('_').map(|i| &entry[i + 1..]).unwrap_or(entry);
+    let bytes = body.as_bytes();
+    let mut opts: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i] as char;
+        let kind = match c {
+            't' => Some("THREAD"),
+            'u' => Some("UPCAST"),
+            'r' => Some("UNROLL"),
+            'l' => Some("LOCAL"),
+            'g' => Some("GROUP"),
+            'G' => Some("GROUP_REDUCE"),
+            'W' => Some("WARP"),
+            // L (Loop), R (Reduce) and constants are baseline axes, not opts.
+            _ => None,
+        };
+        i += 1;
+        // Consume the axis size token (alphanumeric — may include hex like 3F or n suffix).
+        let start = i;
+        while i < bytes.len() && bytes[i].is_ascii_alphanumeric() {
+            // A new opt-kind char (one of t/u/r/l/g/G/W) terminates the size token.
+            let nb = bytes[i] as char;
+            if matches!(nb, 't' | 'u' | 'r' | 'l' | 'g' | 'G' | 'W' | 'L' | 'R') {
+                break;
+            }
+            i += 1;
+        }
+        if let Some(k) = kind {
+            let size = &body[start..i];
+            opts.push(format!("{k}({size})"));
+        }
+    }
+    if opts.is_empty() { "(no opts)".to_string() } else { opts.join(", ") }
 }
 
 fn trim_tree_head(tree: &str, max_lines: usize) -> String {

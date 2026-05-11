@@ -172,3 +172,54 @@ fn test_reduce_empty_ranges_bug() {
         );
     }
 }
+
+/// `pre_expand` is a single combined rewrite (`sym + pm_pre_expander +
+/// pm_group_for_reduce + expander`) — no Phase 1 pre-pass.
+///
+/// Behavioral assertion: a REDUCE containing both an UNROLL source and a
+/// `Range(Reduce)` resolves in one `pre_expand` call. The result must NOT
+/// be the same REDUCE with mixed Range+UNROLL ranges, must NOT have empty
+/// ranges (see `test_reduce_empty_ranges_bug`), and remaining ranges must
+/// be pure `Op::Range`, not `Op::Unroll`.
+#[test]
+fn test_pre_expand_single_pass_handles_unroll_and_reduce_together() {
+    // UNROLL source with axis id 1.
+    let values =
+        UOp::vconst(vec![ConstValue::Int(0), ConstValue::Int(1), ConstValue::Int(2), ConstValue::Int(3)], DType::Int64);
+    let unroll = values.unroll(vec![(1, 4)]);
+
+    // Range(Reduce) with axis id 0.
+    let reduce_end = UOp::const_(DType::Index, ConstValue::Int(8));
+    let reduce_range = UOp::range_axis(reduce_end, morok_ir::AxisId::Renumbered(0), AxisType::Reduce);
+
+    let src = UOp::const_(DType::Float32, ConstValue::Float(0.0));
+    let reduce = src.reduce(smallvec::smallvec![reduce_range, unroll], ReduceOp::Add);
+
+    let result = pre_expand(&reduce);
+
+    // Walk the result and confirm no node is a REDUCE that still contains
+    // an UNROLL in its `ranges`. After a single combined rewrite the UNROLL
+    // must have been absorbed (typically into a CONTRACT wrapper).
+    fn no_unroll_in_reduce_ranges(uop: &std::sync::Arc<UOp>, depth: usize) {
+        if depth > 32 {
+            return; // guard against pathological depth
+        }
+        if let Op::Reduce { ranges, .. } = uop.op() {
+            assert!(
+                !ranges.is_empty(),
+                "REDUCE with empty ranges after pre_expand (guarded by test_reduce_empty_ranges_bug)"
+            );
+            for r in ranges {
+                assert!(
+                    !matches!(r.op(), Op::Unroll { .. }),
+                    "REDUCE.ranges must not contain Unroll after single-pass pre_expand; got {:?}",
+                    r.op()
+                );
+            }
+        }
+        for child in uop.op().sources() {
+            no_unroll_in_reduce_ranges(&child, depth + 1);
+        }
+    }
+    no_unroll_in_reduce_ranges(&result, 0);
+}

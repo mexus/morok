@@ -5,7 +5,6 @@ use super::*;
 fn test_beam_config_default() {
     let config = BeamConfig::default();
     assert_eq!(config.beam_width, 4);
-    assert_eq!(config.timeout, Duration::from_secs(60));
     assert_eq!(config.max_upcast, 256);
     assert_eq!(config.max_local, 1024);
 }
@@ -54,7 +53,7 @@ fn test_beam_search_with_mock_scoring() {
     let renderer = Renderer::cpu();
     let scheduler = Scheduler::new(sink, renderer);
 
-    let config = BeamConfig { beam_width: 2, timeout: Duration::from_millis(100), ..Default::default() };
+    let config = BeamConfig { beam_width: 2, ..Default::default() };
 
     // Mock scoring: return constant timing + a hash that varies by scheduler
     // pointer so dedup doesn't collapse every candidate to one entry.

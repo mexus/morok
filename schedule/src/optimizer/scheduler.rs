@@ -89,6 +89,13 @@ pub struct Scheduler {
     /// Used for debugging, kernel naming, and potential undo functionality.
     pub applied_opts: Vec<Opt>,
 
+    /// Index of the actively-selected TensorCore in `ren.tensor_cores`,
+    /// set by `apply_with_axis_choice` when an `OptOps::TC` is applied.
+    /// Used by beam's `validate_limits` to compute the correct `tc_up`
+    /// divisor when the renderer offers multiple TC variants (e.g. f32,
+    /// f16, bf16). `None` until a TC is applied.
+    pub selected_tc_index: Option<usize>,
+
     // Cached properties (computed lazily, cleared by set_ast/clear_caches)
     /// Cached list of all RANGE operations, sorted by (axis_type.priority(), axis_id).
     rngs_cache: OnceCell<Vec<Arc<UOp>>>,
@@ -119,6 +126,7 @@ impl Scheduler {
             ren,
             dont_use_locals: false,
             applied_opts: Vec::new(),
+            selected_tc_index: None,
             rngs_cache: OnceCell::new(),
             maxarg_cache: OnceCell::new(),
             toposort_cache: OnceCell::new(),
@@ -1016,6 +1024,7 @@ impl Clone for Scheduler {
             ren: self.ren.clone(),
             dont_use_locals: self.dont_use_locals,
             applied_opts: self.applied_opts.clone(),
+            selected_tc_index: self.selected_tc_index,
             // Clear caches in clone - they'll be recomputed on demand
             rngs_cache: OnceCell::new(),
             maxarg_cache: OnceCell::new(),

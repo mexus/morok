@@ -264,3 +264,31 @@ fn test_expand_compound_expression() {
     // Expected: [1*2, 2*2, 3*2, 4*2] = [2, 4, 6, 8]
     assert_result_values(&result, &[2, 4, 6, 8]);
 }
+
+// =============================================================================
+// Broadcast on Const short-circuits to VConst.
+// =============================================================================
+
+/// `UOp::broadcast(const, N)` emits a single `VConst` (one uop), not a
+/// `Vectorize` of N cloned scalar `Const`s (N+1 uops).
+#[test]
+fn test_broadcast_const_emits_single_vconst() {
+    let scalar = UOp::const_(DType::Float32, ConstValue::Float(2.5));
+    let broadcast = scalar.broadcast(8);
+
+    assert!(
+        matches!(broadcast.op(), morok_ir::Op::VConst { .. }),
+        "broadcast(Const, 8) should produce Op::VConst, got {:?}",
+        broadcast.op()
+    );
+    assert_eq!(broadcast.dtype().vcount(), 8);
+}
+
+/// `broadcast(N=1)` short-circuits to the same Arc (no wrapper).
+#[test]
+fn test_broadcast_count_one_is_passthrough() {
+    let scalar = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+    let same = scalar.broadcast(1);
+
+    assert!(std::sync::Arc::ptr_eq(&scalar, &same), "broadcast(_, 1) should clone the Arc, not wrap");
+}

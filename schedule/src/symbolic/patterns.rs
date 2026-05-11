@@ -1142,29 +1142,14 @@ pub fn alu_folding_dsl_patterns() -> &'static TypedPatternMatcher {
 
 /// Dead loop elimination patterns.
 ///
-/// - RANGE with vmax ≤ 0 → Const(0)
-/// - END with dead ranges → remove dead ranges
-/// - REDUCE with all empty ranges → identity element
+/// - RANGE with vmax < 0 → Const(0)  (dead loop)
+/// - RANGE(Const) with vmin == vmax → Const(vmin)  (single-value range)
+///
+/// END/REDUCE empty-ranges folds intentionally absent — they conflated
+/// trivial Range(end=1) folds with dead-range markers; `reduce_to_acc`
+/// already handles dead/empty ranges correctly.
 pub fn dead_loop_patterns() -> &'static TypedPatternMatcher {
-    use crate::symbolic::dce::reduce_identity;
-
-    /// Filter dead ranges from END, or unwrap if all dead.
-    fn filter_dead_ranges(end_op: &Arc<UOp>) -> Arc<UOp> {
-        let Op::End { computation, ranges } = end_op.op() else { unreachable!("filter_dead_ranges called on non-End") };
-
-        let live_ranges: SmallVec<[Arc<UOp>; 4]> = ranges.iter().filter(|r| !is_empty_range(r)).cloned().collect();
-
-        if live_ranges.is_empty() {
-            // All ranges dead - return computation directly
-            Arc::clone(computation)
-        } else {
-            // Some ranges dead - create new END with only live ranges
-            computation.end(live_ranges)
-        }
-    }
-
     /// Check if a Range is trivial (vmin == vmax), meaning only one value.
-    /// This matches upstream simplification: Range(Const) → Const when vmin == vmax.
     fn is_trivial_range(uop: &Arc<UOp>) -> bool {
         let (vmin, vmax) = VminVmaxProperty::get(uop);
         vmin == vmax
@@ -1180,16 +1165,8 @@ pub fn dead_loop_patterns() -> &'static TypedPatternMatcher {
         // RANGE with vmax < 0 (empty/dead) → Const(0)
         r @ Range(_) if is_empty_range(r) ~> UOp::index_const(0),
 
-        // RANGE(Const) with vmin == vmax (trivial, e.g., end=1) → Const(vmin)
-        // Matches
+        // RANGE(Const) with vmin == vmax (trivial) → Const(vmin)
         r @ Range { end: Const(_) } if is_trivial_range(r) ~> trivial_range_value(r),
-
-        // END with dead ranges → filter or unwrap
-        end_op @ End { ranges, .. } if ranges.iter().any(is_empty_range) ~> filter_dead_ranges(end_op),
-
-        // REDUCE with all empty ranges → identity element
-        rop @ Reduce { ranges, reduce_op: op, .. } if !ranges.is_empty() && ranges.iter().all(is_empty_range)
-          ~> reduce_identity(*op, rop.dtype()),
     }
 }
 

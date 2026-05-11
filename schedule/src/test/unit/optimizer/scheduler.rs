@@ -1491,6 +1491,39 @@ fn test_thread_basic() {
 }
 
 #[test]
+fn test_thread_rejects_second_application() {
+    // Once a Thread axis exists, any further THREAD opt must be rejected so
+    // beam expansion of an already-threaded scheduler doesn't generate
+    // duplicate (parent == child) candidates that get silently dedup'd.
+    let end_64 = UOp::index_const(64);
+    let r_loop = UOp::range_axis(end_64, AxisId::Renumbered(0), AxisType::Loop);
+    let compute = UOp::native_const(1.0f32);
+    let sink = UOp::sink(vec![compute, r_loop]);
+
+    let ren = Renderer::cpu();
+    let mut scheduler = Scheduler::new(sink, ren);
+
+    // Pick a thread count this machine actually supports.
+    let max_threads = std::thread::available_parallelism().map(|p| p.get()).unwrap_or(4);
+    let thread_count = [32usize, 16, 8, 4, 2].into_iter().find(|&t| t <= max_threads && 64 % t == 0).unwrap_or(1);
+    if thread_count == 1 {
+        return; // Single-thread environment: meaningless.
+    }
+    // First THREAD succeeds.
+    apply_opt(&mut scheduler, &Opt::thread(0, thread_count), true).expect("first THREAD should succeed");
+    let thread_axes = scheduler.axes_of(&[AxisType::Thread]);
+    assert!(!thread_axes.is_empty(), "first THREAD should create a Thread axis");
+
+    // Second THREAD must be rejected with ValidationFailed("already threaded").
+    let result = apply_opt(&mut scheduler, &Opt::thread(0, 2), true);
+    let Err(err) = result else {
+        panic!("second THREAD must fail; got Ok");
+    };
+    let msg = format!("{err:?}");
+    assert!(msg.contains("already threaded"), "second THREAD must report 'already threaded'; got: {msg}");
+}
+
+#[test]
 fn test_thread_rejects_non_globalizable_axis() {
     // Two independent stores with disjoint LOOP ranges.
     // No LOOP range appears in all outputs, so THREAD must be rejected.

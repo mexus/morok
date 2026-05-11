@@ -3,8 +3,6 @@
 //! Provides typed configuration for kernel optimization with bon builders.
 //! Supports both explicit configuration and environment variable fallbacks.
 
-use std::time::Duration;
-
 use bon::bon;
 
 // ============================================================================
@@ -34,13 +32,13 @@ impl OptStrategy {
     /// # Environment Variables
     ///
     /// * `MOROK_NOOPT=1` - Disable all optimizations
-    /// * `MOROK_BEAM=N` - Use beam search with width N
+    /// * `BEAM=N` - Use beam search with width N
     pub fn from_env() -> Self {
         if std::env::var("MOROK_NOOPT").is_ok() {
             return Self::None;
         }
 
-        if let Ok(beam_str) = std::env::var("MOROK_BEAM")
+        if let Ok(beam_str) = std::env::var("BEAM")
             && let Ok(width) = beam_str.parse::<usize>()
             && width > 0
         {
@@ -141,12 +139,15 @@ impl TcSelect {
 // ============================================================================
 
 /// Configuration for beam search auto-tuning.
+///
+/// No total search timeout — the loop terminates only on the `min_progress`
+/// floor or an empty candidate set. `BEAM_TIMEOUT_SEC` is a per-candidate
+/// compile alarm enforced in `compile_and_time`'s thread+timeout machinery,
+/// not a global search budget.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct BeamConfig {
     /// Beam width - number of candidates to keep at each step.
     pub beam_width: usize,
-    /// Maximum search time.
-    pub timeout: Duration,
     /// Maximum upcast size (product of UPCAST/UNROLL dimensions).
     pub max_upcast: usize,
     /// Maximum local size (product of LOCAL/WARP/GROUP_REDUCE dimensions).
@@ -161,71 +162,51 @@ pub struct BeamConfig {
 
 impl Default for BeamConfig {
     fn default() -> Self {
-        Self {
-            beam_width: 4,
-            timeout: Duration::from_secs(60),
-            max_upcast: 256,
-            max_local: 1024,
-            max_uops: 3000,
-            num_runs: 3,
-            disable_cache: false,
-        }
+        Self { beam_width: 4, max_upcast: 256, max_local: 1024, max_uops: 3000, num_runs: 3, disable_cache: false }
     }
 }
 
 #[bon]
 impl BeamConfig {
     /// Create a beam configuration with builder pattern.
+    ///
+    /// Defaults consult the same env vars as `from_env()` so callers
+    /// like benches can be overridden via `BEAM_*` without changing
+    /// builder call sites.
     #[builder]
     pub fn builder(
-        #[builder(default = 4)] beam_width: usize,
-        #[builder(default = 60)] timeout_secs: u64,
-        #[builder(default = 256)] max_upcast: usize,
-        #[builder(default = 1024)] max_local: usize,
-        #[builder(default = 3000)] max_uops: usize,
-        #[builder(default = 3)] num_runs: usize,
-        #[builder(default = false)] disable_cache: bool,
+        #[builder(default = std::env::var("BEAM").ok().and_then(|s| s.parse().ok()).unwrap_or(4))] beam_width: usize,
+        #[builder(default = std::env::var("BEAM_UPCAST_MAX").ok().and_then(|s| s.parse().ok()).unwrap_or(256))]
+        max_upcast: usize,
+        #[builder(default = std::env::var("BEAM_LOCAL_MAX").ok().and_then(|s| s.parse().ok()).unwrap_or(1024))]
+        max_local: usize,
+        #[builder(default = std::env::var("BEAM_UOPS_MAX").ok().and_then(|s| s.parse().ok()).unwrap_or(3000))]
+        max_uops: usize,
+        #[builder(default = std::env::var("BEAM_RUNS").ok().and_then(|s| s.parse().ok()).unwrap_or(3))] num_runs: usize,
+        #[builder(default = std::env::var("IGNORE_BEAM_CACHE").is_ok())] disable_cache: bool,
     ) -> Self {
-        Self {
-            beam_width,
-            timeout: Duration::from_secs(timeout_secs),
-            max_upcast,
-            max_local,
-            max_uops,
-            num_runs,
-            disable_cache,
-        }
+        Self { beam_width, max_upcast, max_local, max_uops, num_runs, disable_cache }
     }
 
     /// Create configuration from environment variables.
     ///
     /// # Environment Variables
     ///
-    /// * `MOROK_BEAM` - Beam width (default: 4)
-    /// * `MOROK_BEAM_TIMEOUT` - Max search time in seconds (default: 60)
+    /// * `BEAM` - Beam width (default: 4)
     /// * `BEAM_UPCAST_MAX` - Max upcast size (default: 256)
     /// * `BEAM_LOCAL_MAX` - Max local memory elements (default: 1024)
     /// * `BEAM_UOPS_MAX` - Max UOps before rejecting (default: 3000)
     /// * `BEAM_RUNS` - Benchmark runs per kernel (default: 3)
     /// * `IGNORE_BEAM_CACHE` - Bypass disk cache if set
     pub fn from_env() -> Self {
-        let beam_width = std::env::var("MOROK_BEAM").ok().and_then(|s| s.parse().ok()).unwrap_or(4);
-        let timeout_secs = std::env::var("MOROK_BEAM_TIMEOUT").ok().and_then(|s| s.parse().ok()).unwrap_or(60);
+        let beam_width = std::env::var("BEAM").ok().and_then(|s| s.parse().ok()).unwrap_or(4);
         let max_upcast = std::env::var("BEAM_UPCAST_MAX").ok().and_then(|s| s.parse().ok()).unwrap_or(256);
         let max_local = std::env::var("BEAM_LOCAL_MAX").ok().and_then(|s| s.parse().ok()).unwrap_or(1024);
         let max_uops = std::env::var("BEAM_UOPS_MAX").ok().and_then(|s| s.parse().ok()).unwrap_or(3000);
         let num_runs = std::env::var("BEAM_RUNS").ok().and_then(|s| s.parse().ok()).unwrap_or(3);
         let disable_cache = std::env::var("IGNORE_BEAM_CACHE").is_ok();
 
-        Self {
-            beam_width,
-            timeout: Duration::from_secs(timeout_secs),
-            max_upcast,
-            max_local,
-            max_uops,
-            num_runs,
-            disable_cache,
-        }
+        Self { beam_width, max_upcast, max_local, max_uops, num_runs, disable_cache }
     }
 
     /// Get beam width from strategy if applicable.
@@ -282,7 +263,6 @@ pub struct HeuristicsConfig {
     /// Enable K-axis vectorization for matmul.
     /// When enabled, UPCAST is applied to the reduce (K) axis creating vector accumulators.
     /// Disabled by default: K-vectorization complicates output tiling and horizontal reduce.
-    /// Tinygrad doesn't use K-vectorization - they rely on output tiling (register blocking).
     /// Default: false.
     pub k_vectorize: bool,
 
@@ -422,11 +402,16 @@ pub struct OptimizerConfig {
 #[bon]
 impl OptimizerConfig {
     /// Create an optimizer configuration with builder pattern.
+    ///
+    /// `beam` and `heuristics` defaults consult env vars (matching
+    /// `*::from_env()`) so callers like benches and end-to-end examples
+    /// pick up `IGNORE_BEAM_CACHE`, `BEAM_TIMEOUT_SEC`, `BEAM_UOPS_MAX`,
+    /// etc. without explicit field setting.
     #[builder]
     pub fn builder(
         #[builder(default)] strategy: OptStrategy,
-        #[builder(default)] beam: BeamConfig,
-        #[builder(default)] heuristics: HeuristicsConfig,
+        #[builder(default = BeamConfig::from_env())] beam: BeamConfig,
+        #[builder(default = HeuristicsConfig::from_env())] heuristics: HeuristicsConfig,
     ) -> Self {
         Self { strategy, beam, heuristics }
     }
@@ -438,7 +423,7 @@ impl OptimizerConfig {
     /// # Environment Variables
     ///
     /// * `MOROK_NOOPT=1` - Disable all optimizations
-    /// * `MOROK_BEAM=N` - Use beam search with width N
+    /// * `BEAM=N` - Use beam search with width N
     pub fn from_env() -> Self {
         let strategy = OptStrategy::from_env();
         let beam = BeamConfig::from_env().with_strategy_width(&strategy);

@@ -107,7 +107,7 @@ use std::sync::{Arc, LazyLock};
 /// # Environment Variables
 ///
 /// * `MOROK_NOOPT=1` - Disable all optimizations (for debugging)
-/// * `MOROK_BEAM=N` - Use beam search with width N (future)
+/// * `BEAM=N` - Use beam search with width N (future)
 pub fn optimize_kernel(ast: Arc<morok_ir::UOp>, renderer: &Renderer) -> Arc<morok_ir::UOp> {
     optimize_kernel_with_config(ast, renderer, &OptimizerConfig::from_env())
 }
@@ -155,6 +155,27 @@ pub fn apply_post_optimization_with_renderer(
 
     tracing::debug!(ast.initial = ast.tree(), node_count = ast.node_count(), "kernel initial");
 
+    // Env-gated per-stage diagnostic. Set MOROK_PER_STAGE_UOPS=1 to print
+    // node_count to stderr after each post-opt stage. Used to pinpoint
+    // which pass blows up on a bloated input. Set MOROK_DUMP_STAGE=<prefix>
+    // to also dump the full UOp tree at any stage whose label starts with
+    // that prefix (e.g. MOROK_DUMP_STAGE=13 dumps stage 13-pm_add_loads).
+    let dump_per_stage = std::env::var("MOROK_PER_STAGE_UOPS").is_ok();
+    let dump_stage_prefix = std::env::var("MOROK_DUMP_STAGE").ok();
+    let print_stage = |label: &str, node: &Arc<morok_ir::UOp>| {
+        if dump_per_stage {
+            eprintln!("[per-stage] {} : node_count={}", label, node.node_count());
+        }
+        if let Some(ref prefix) = dump_stage_prefix
+            && label.starts_with(prefix.as_str())
+        {
+            eprintln!("[dump-stage] {} :", label);
+            eprintln!("{}", node.tree());
+            eprintln!("[dump-stage] {} : end", label);
+        }
+    };
+    print_stage("00-initial", &ast);
+
     // Multi-index INDEX is normalized to single-index during devectorize
     // via pm_linearize_multi_index. Backends consume only linearized INDEX.
 
@@ -173,6 +194,7 @@ pub fn apply_post_optimization_with_renderer(
         elapsed_ms = t_stage.elapsed().as_millis() as u64,
         "Stage 8: after post-opt symbolic"
     );
+    print_stage("08-post_opt_sym", &with_symbolic);
 
     // =========================================================================
     // Stage 9: Expander
@@ -189,6 +211,7 @@ pub fn apply_post_optimization_with_renderer(
         elapsed_ms = t_stage.elapsed().as_millis() as u64,
         "Stage 9: after pre_expand"
     );
+    print_stage("09-pre_expand", &expanded);
 
     // =========================================================================
     // Stage 10: Add local buffers
@@ -225,6 +248,7 @@ pub fn apply_post_optimization_with_renderer(
         elapsed_ms = t_stage.elapsed().as_millis() as u64,
         "Stage 10: after add local buffers"
     );
+    print_stage("10-local_buffers", &with_local_buffers);
     if cfg!(debug_assertions) {
         check_unroll_group("after_add_local_buffers", &with_local_buffers);
     }
@@ -240,6 +264,7 @@ pub fn apply_post_optimization_with_renderer(
         elapsed_ms = t_stage.elapsed().as_millis() as u64,
         "after pm_reduce"
     );
+    print_stage("11-pm_reduce", &reduced);
     if cfg!(debug_assertions) {
         check_unroll_group("after_pm_reduce", &reduced);
     }
@@ -260,6 +285,7 @@ pub fn apply_post_optimization_with_renderer(
         elapsed_ms = t_stage.elapsed().as_millis() as u64,
         "after pm_add_gpudims"
     );
+    print_stage("12-pm_add_gpudims", &with_gpudims);
     if cfg!(debug_assertions) {
         check_unroll_group("after_pm_add_gpudims", &with_gpudims);
     }
@@ -272,6 +298,7 @@ pub fn apply_post_optimization_with_renderer(
         elapsed_ms = t_stage.elapsed().as_millis() as u64,
         "after pm_add_loads"
     );
+    print_stage("13-pm_add_loads", &with_loads);
     if cfg!(debug_assertions) {
         check_unroll_group("after_pm_add_loads", &with_loads);
         // Also check for any UNROLL or CONTRACT
@@ -312,6 +339,7 @@ pub fn apply_post_optimization_with_renderer(
         elapsed_ms = t_stage.elapsed().as_millis() as u64,
         "after devectorize"
     );
+    print_stage("14-devectorize", &devectorized);
     check_unroll_group("after_devectorize", &devectorized);
 
     // Stage 15: pm_lower_index_dtype + load_store_indexing + gep_pushing
@@ -328,6 +356,7 @@ pub fn apply_post_optimization_with_renderer(
         elapsed_ms = t_stage.elapsed().as_millis() as u64,
         "after pm_lower_index_dtype"
     );
+    print_stage("15-pm_lower_index_dtype", &with_lowered_idx);
     check_unroll_group("after_pm_lower_index_dtype", &with_lowered_idx);
 
     // Stage 16: full symbolic (includes gep_pushing, div_and_mod, etc.)
@@ -340,34 +369,37 @@ pub fn apply_post_optimization_with_renderer(
         elapsed_ms = t_stage.elapsed().as_millis() as u64,
         "after post-index symbolic"
     );
+    print_stage("16-post_index_sym", &with_lowered_idx);
+
+    // Merge sibling ENDs that share the same reduce ranges, BEFORE pm_split_ends
+    // runs inside PM_FINAL. split_end (linearize/mod.rs) does not preserve the
+    // TAG_MERGEABLE tag set by reduce_to_acc, so merging must happen first.
+    let t_merge = std::time::Instant::now();
+    let with_lowered_idx = crate::devectorize::merge_sibling_ends(&with_lowered_idx);
+    tracing::debug!(
+        ast.optimized = with_lowered_idx.tree(),
+        node_count = with_lowered_idx.node_count(),
+        elapsed_ms = t_merge.elapsed().as_millis() as u64,
+        "after merge_sibling_ends"
+    );
+    print_stage("17-merge_sibling_ends", &with_lowered_idx);
 
     // =========================================================================
-    // Stage 18-19: Decompositions + Render (single combined pass)
+    // Stage 18-19: Decompositions + Render + split ENDs (single combined pass)
     // =========================================================================
     let t_stage = std::time::Instant::now();
-    static PM_FINAL: LazyLock<crate::TypedPatternMatcher> =
-        LazyLock::new(|| symbolic_simple() + get_late_rewrite_patterns() + pm_render());
+    static PM_FINAL: LazyLock<crate::TypedPatternMatcher> = LazyLock::new(|| {
+        symbolic_simple() + get_late_rewrite_patterns() + pm_render() + crate::linearize::pm_split_ends()
+    });
     let rendered = graph_rewrite(&*PM_FINAL, with_lowered_idx, &mut ());
     tracing::debug!(
         ast.optimized = rendered.tree(),
         node_count = rendered.node_count(),
         elapsed_ms = t_stage.elapsed().as_millis() as u64,
-        "Stage 18-19: after pm_decomp + pm_render"
+        "Stage 18-19: after pm_decomp + pm_render + pm_split_ends"
     );
+    print_stage("18-pm_decomp_render", &rendered);
     assert_gated_loads_have_alt("after_pm_decomp_pm_render", &rendered);
-
-    // Merge sibling ENDs that share the same reduce ranges.
-    // pm_decomp+pm_render can create new sibling ENDs (e.g. by rewriting computations
-    // inside an END differently per vector lane). merge_reduce_ends ran earlier in
-    // pm_reduce but only caught ENDs that existed at that point.
-    let t_merge = std::time::Instant::now();
-    let rendered = crate::devectorize::merge_sibling_ends(&rendered);
-    tracing::debug!(
-        ast.optimized = rendered.tree(),
-        node_count = rendered.node_count(),
-        elapsed_ms = t_merge.elapsed().as_millis() as u64,
-        "after merge_sibling_ends"
-    );
 
     // FP8 float decomposition: promote FP8 computation to Float16 via bitwise conversion.
     // Uses graph_rewrite_with_bpm: STORE pattern in bpm (sees ORIGINAL children to detect
@@ -390,6 +422,7 @@ pub fn apply_post_optimization_with_renderer(
         elapsed_ms = t_stage.elapsed().as_millis() as u64,
         "after pm_float_decomp"
     );
+    print_stage("19-pm_float_decomp", &fp8_decomposed);
     assert_gated_loads_have_alt("after_pm_float_decomp", &fp8_decomposed);
 
     let t_stage = std::time::Instant::now();
@@ -400,6 +433,7 @@ pub fn apply_post_optimization_with_renderer(
         elapsed_ms = t_stage.elapsed().as_millis() as u64,
         "after bool_storage_pattern"
     );
+    print_stage("20-bool_storage", &bs);
     assert_gated_loads_have_alt("after_bool_storage_pattern", &bs);
 
     // Re-attach metadata (e.g., KernelInfo) that was lost during graph rewrites

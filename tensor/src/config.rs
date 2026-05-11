@@ -80,10 +80,14 @@ impl PrepareConfig {
         Self { optimizer: OptimizerConfig::from_env(), resolver: Arc::new(EnvResolver), disable_schedule_cache: false }
     }
 
-    /// Convenience constructor: specific CPU backend with default optimizer.
+    /// Convenience constructor: specific CPU backend with optimizer settings
+    /// resolved from env (`BEAM`, `MOROK_NOOPT`, `IGNORE_BEAM_CACHE`,
+    /// `BEAM_*`, `MOROK_*`). Used by the `codegen_tests!` macro so a single
+    /// `BEAM=4 cargo test` flips every codegen-test target to BEAM
+    /// without changing test bodies.
     pub fn for_cpu_backend(backend: CpuBackend) -> Self {
         Self {
-            optimizer: OptimizerConfig::default(),
+            optimizer: OptimizerConfig::from_env(),
             resolver: Arc::new(CpuBackendResolver(backend)),
             disable_schedule_cache: false,
         }
