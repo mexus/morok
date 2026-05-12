@@ -251,3 +251,75 @@ fn test_encode_batch_respects_dynamic_seq_len() {
         "expected at least one kernel to keep dynamic seq var 't'"
     );
 }
+
+fn assert_runtime_bounds_err(err: crate::jit::JitError) {
+    match err {
+        crate::jit::JitError::Runtime { source: morok_runtime::Error::Execution { reason } } => {
+            assert!(reason.contains("outside bounds"), "unexpected runtime error: {reason}");
+        }
+        other => panic!("expected runtime bounds error, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_with_b_bound_shrinks_upper_bound() {
+    let model = model_with_random_weights();
+    let cfg = test_config();
+    // Default b range is [1, max_batch_size=8]. Shrink to [1, 2].
+    let mut jit = GigaAmBatchedJit::new(model).with_b_bound(2);
+    let mut mel = Tensor::full(&[2, cfg.n_mels, 64], 0.0f32, DType::Float32).unwrap();
+    mel.realize().unwrap();
+    let lengths = Tensor::from_slice([64i32, 64]);
+
+    jit.prepare(&mel, &lengths).unwrap();
+    jit.execute_with_vars(&[("b", 2), ("t", 64)]).unwrap();
+    // b=3 is now outside the shrunken bound even though config allowed up to 8.
+    assert_runtime_bounds_err(jit.execute_with_vars(&[("b", 3), ("t", 64)]).unwrap_err());
+}
+
+#[test]
+fn test_with_t_fixed_specializes_kernels() {
+    let model = model_with_random_weights();
+    let cfg = test_config();
+    let pinned_t = 64usize;
+    let mut jit = GigaAmBatchedJit::new(model).with_t_fixed(pinned_t);
+    let mut mel = Tensor::full(&[1, cfg.n_mels, pinned_t], 0.0f32, DType::Float32).unwrap();
+    mel.realize().unwrap();
+    let lengths = Tensor::from_slice([pinned_t as i32]);
+
+    jit.prepare(&mel, &lengths).unwrap();
+    // With `t` pinned at JIT time, the symbolic axis is folded to a const by the
+    // trivial-range simplifier, so no compiled kernel should retain `t` as a
+    // runtime variable. `b` is still dynamic and should still appear.
+    let kernels = jit.prepared_kernels().unwrap();
+    let any_kernel_keeps_t = kernels.iter().any(|k| k.kernel.var_names.iter().any(|n| n == "t"));
+    assert!(!any_kernel_keeps_t, "with_t_fixed should fold `t` out of kernel var lists");
+    let any_kernel_keeps_b = kernels.iter().any(|k| k.kernel.var_names.iter().any(|n| n == "b"));
+    assert!(any_kernel_keeps_b, "`b` is still dynamic and should remain in some kernel's var list");
+
+    // Execute with the pinned value succeeds; passing `t` is permitted but
+    // discarded since no kernel reads it.
+    jit.execute_with_vars(&[("b", 1), ("t", pinned_t as i64)]).unwrap();
+}
+
+#[test]
+fn test_with_b_min_bound_raises_lower_bound() {
+    let model = model_with_random_weights();
+    let cfg = test_config();
+    // Default b range is [1, 8]. Raise lower bound to 2.
+    let mut jit = GigaAmBatchedJit::new(model).with_b_min_bound(2);
+    let mut mel = Tensor::full(&[2, cfg.n_mels, 64], 0.0f32, DType::Float32).unwrap();
+    mel.realize().unwrap();
+    let lengths = Tensor::from_slice([64i32, 64]);
+
+    jit.prepare(&mel, &lengths).unwrap();
+    jit.execute_with_vars(&[("b", 2), ("t", 64)]).unwrap();
+    assert_runtime_bounds_err(jit.execute_with_vars(&[("b", 1), ("t", 64)]).unwrap_err());
+}
+
+#[test]
+#[should_panic(expected = "with_b_bound(0) creates empty range")]
+fn test_with_b_bound_panics_on_empty_range() {
+    let model = model_with_random_weights();
+    let _jit = GigaAmBatchedJit::new(model).with_b_bound(0);
+}

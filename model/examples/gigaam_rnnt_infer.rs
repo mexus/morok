@@ -34,15 +34,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("Loading audio: {wav_path}");
     let t_audio = Instant::now();
-    let waveform = load_wav(&wav_path)?;
+    let (waveform, wav_sample_rate) = load_wav(&wav_path)?;
     let dt_audio = t_audio.elapsed();
-    let duration_s = waveform.len() as f32 / 16000.0;
-    println!("Samples: {} ({:.1}s)", waveform.len(), duration_s);
+    let duration_s = waveform.len() as f32 / wav_sample_rate as f32;
+    println!("Samples: {} ({:.1}s @ {} Hz)", waveform.len(), duration_s, wav_sample_rate);
 
     println!("\nLoading GigaAM RNN-T from {repo} ({revision})...");
     let t_model = Instant::now();
     let model = GigaAmRnnt::from_hub_with_revision(&repo, &revision)?;
     let model = Arc::new(model);
+    if wav_sample_rate as usize != model.config.sample_rate {
+        return Err(format!(
+            "WAV is {} Hz, model expects {} Hz (resample first)",
+            wav_sample_rate, model.config.sample_rate
+        )
+        .into());
+    }
     let dt_model = t_model.elapsed();
 
     let sample_rate = model.config.sample_rate;
@@ -85,7 +92,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut view = full_mel.array_view_mut::<f32>()?;
         mel.forward_into(&waveform, &mut view);
     }
-    full_mel.realize().unwrap();
     let full_mel_data = full_mel.as_vec::<f32>()?;
     let dt_mel = t_mel.elapsed();
 
@@ -142,18 +148,39 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ─── Encoder JIT ─────────────────────────────────────────────────────
     let num_chunks = chunks_meta.len();
-    let max_batch = model.config.max_batch_size.min(num_chunks);
-    println!("Chunking into {} VAD chunks; JIT batch bound {}", num_chunks, max_batch);
 
-    let mut mel_batch = Tensor::full(&[max_batch, n_mels, max_t_mel], 0.0f32, DType::Float32)?;
+    // Shrink JIT bounds to the actual VAD chunk extent (see `gigaam_infer.rs`
+    // for the full reasoning). `max_mel_frames`/`max_batch_size` from the
+    // model config are encoder budgets, not per-audio bounds — sizing the JIT
+    // to them allocates `[B, n_heads, T_max, T_max]` scores buffers that
+    // dwarf the actual chunk shape (`T_actual ≪ T_max`).
+    let actual_max_chunk_mel = chunks_meta.iter().map(|(_, len, _)| *len).max().unwrap_or(0);
+    let jit_t_mel = (actual_max_chunk_mel + 2 * subsampling_factor)
+        .next_multiple_of(subsampling_factor)
+        .min(max_t_mel)
+        .max(subsampling_factor);
+
+    let target_scores_mib: usize = env::var("MOROK_MAX_SCORES_MIB").ok().and_then(|s| s.parse().ok()).unwrap_or(256);
+    let target_scores_bytes = target_scores_mib * 1024 * 1024;
+    let t_sub_max = (jit_t_mel / subsampling_factor).max(1);
+    let scores_dtype_bytes = model.input_dtype().bytes();
+    let bytes_per_batch = model.config.n_heads * t_sub_max * t_sub_max * scores_dtype_bytes;
+    let max_batch_by_memory = (target_scores_bytes / bytes_per_batch.max(1)).max(1);
+    let max_batch = max_batch_by_memory.min(model.config.max_batch_size).min(num_chunks);
+    println!(
+        "Chunking into {} VAD chunks (longest {} mel frames); JIT bounds [B={}, T_mel={}] (budget={} MiB/scores)",
+        num_chunks, actual_max_chunk_mel, max_batch, jit_t_mel, target_scores_mib
+    );
+
+    let mut mel_batch = Tensor::full(&[max_batch, n_mels, jit_t_mel], 0.0f32, DType::Float32)?;
     mel_batch.realize().unwrap();
     let lengths = Tensor::from_slice(vec![0i32; max_batch]);
 
     let t_prepare = Instant::now();
-    let mut encoder_jit = GigaAmRnntEncoderJit::new(Arc::clone(&model));
+    let mut encoder_jit = GigaAmRnntEncoderJit::new(Arc::clone(&model)).with_b_bound(max_batch).with_t_bound(jit_t_mel);
     let prepare_config = PrepareConfig::from_env();
     println!("AMX renderer      {}", if amx_enabled { "enabled (MOROK_AMX=1)" } else { "disabled" });
-    println!("Preparing encoder JIT plan... [{max_batch}, {n_mels}, {max_t_mel}]");
+    println!("Preparing encoder JIT plan... [{max_batch}, {n_mels}, {jit_t_mel}]");
     encoder_jit.prepare_with_config(&mel_batch, &lengths, &prepare_config)?;
     let dt_prepare_enc = t_prepare.elapsed();
 
@@ -191,7 +218,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 *chunk_len = valid;
                 for mel_bin in 0..n_mels {
                     let src = mel_bin * total_mel_frames + mel_start;
-                    let dst = ((bi * n_mels) + mel_bin) * max_t_mel;
+                    let dst = ((bi * n_mels) + mel_bin) * jit_t_mel;
                     slice[dst..dst + valid].copy_from_slice(&full_mel_data[src..src + valid]);
                 }
             }
@@ -289,7 +316,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn load_wav(path: &str) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
+fn load_wav(path: &str) -> Result<(Vec<f32>, u32), Box<dyn std::error::Error>> {
     let mut reader = hound::WavReader::open(path)?;
     let spec = reader.spec();
     let samples: Vec<f32> = match spec.sample_format {
@@ -298,7 +325,7 @@ fn load_wav(path: &str) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
             reader.samples::<i16>().map(|s| s.map(|v| v as f32 / 32768.0)).collect::<Result<_, _>>()?
         }
     };
-    Ok(samples)
+    Ok((samples, spec.sample_rate))
 }
 
 fn subs_output_length(kernel_size: usize, mel_frames: usize) -> usize {

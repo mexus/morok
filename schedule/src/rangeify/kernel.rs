@@ -28,7 +28,30 @@ pub use morok_ir::KernelInfo;
 /// Configuration for partial contiguous optimization.
 #[derive(Debug, Clone)]
 pub struct PcontigConfig {
-    /// 0=disabled, 1=basic, 2=enabled (default), 3+=aggressive
+    /// 0=disabled, 1=basic, 2=enabled (default), 3+=aggressive.
+    ///
+    /// Level 3 activates the partial-contig branch in
+    /// `apply_pcontig_removal_inner` that materializes reduce-bodied
+    /// producers as per-tile `AddrSpace::Local` buffers — the
+    /// FlashAttention shape for SDPA-like reduce → softmax → reduce
+    /// chains. **Not safe to enable globally today.** The branch needs a
+    /// discriminator that fires for true multi-consumer fan-out (SDPA's
+    /// scores → max + sum + @V) but skips single-consumer reduce chains
+    /// (DenseNet BN+ReLU → Conv). The natural signal is "consumer
+    /// Index count per Bufferize," but pcontig's own rewrite rules
+    /// (notably flatten-nested-Bufferize and the gated-INDEX path)
+    /// create new Bufferize UOps mid-pass whose consumer counts aren't
+    /// visible to any pre-pass snapshot. The Bufferize this branch
+    /// most wants to fuse — the SDPA scores tensor — is one of those
+    /// dynamic Bufferizes.
+    ///
+    /// Bumping the default to 3 without the discriminator over-inlines
+    /// DenseNet-style chains and stalls codegen (`NoKernelsFound` on
+    /// symbolic SDPA, runaway compile on ONNX). Resolution paths:
+    /// (a) thread the SINK through the pattern matcher so the branch
+    /// can rebuild consumer counts on demand; (b) maintain parent-links
+    /// as a side table kept consistent through rewrites; (c) tag SDPA
+    /// shape upstream with a structural recognizer. None is small.
     pub level: u8,
     /// Max buffers before keeping BUFFERIZE (default: 3)
     pub max_buffers_threshold: usize,

@@ -270,7 +270,12 @@ pub struct Encoder {
 }
 
 impl Encoder {
-    fn input_dtype(&self) -> DType {
+    /// dtype the encoder operates in. Read off the first subsampling
+    /// conv weight (the model's compute dtype is determined by the
+    /// weights it was loaded with). Falls back to f32 when the weight
+    /// isn't itself a float type — should never happen in practice but
+    /// avoids producing an integer dtype here.
+    pub fn input_dtype(&self) -> DType {
         let dtype = self.subsampling.conv1_weight.uop().dtype();
         if dtype.is_float() { dtype } else { DType::Float32 }
     }
@@ -492,6 +497,11 @@ impl GigaAm {
         mel_len: &BoundVariable,
     ) -> Result<Tensor> {
         self.encoder.forward_batch(mel, lengths, batch, mel_len)
+    }
+
+    /// dtype the encoder + heads operate in (read from the loaded weights).
+    pub fn input_dtype(&self) -> DType {
+        self.encoder.input_dtype()
     }
 }
 

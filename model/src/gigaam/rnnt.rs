@@ -492,6 +492,11 @@ impl GigaAmRnnt {
         let head = RnntHead::empty(config.d_model, pred_hidden, pred_rnn_layers, joint_hidden, num_classes);
         Self { config, encoder, head, vocabulary, max_symbols_per_step, sentencepiece }
     }
+
+    /// dtype the encoder + heads operate in (read from the loaded weights).
+    pub fn input_dtype(&self) -> DType {
+        self.encoder.input_dtype()
+    }
 }
 
 // ─── LSTM cell ────────────────────────────────────────────────────────────

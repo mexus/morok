@@ -147,6 +147,80 @@ pub(crate) fn generate(jit: JitWrapper) -> Result<TokenStream> {
             },
         );
 
+    // For each declared `vars { name: (min, max), ... }` entry, emit three
+    // builders:
+    //   * `with_<name>_bound(max)`     — override only the upper bound
+    //   * `with_<name>_min_bound(min)` — override only the lower bound
+    //   * `with_<name>_fixed(value)`   — pin both bounds to one value, making
+    //     the variable a JIT-time constant (specializable kernels, single
+    //     valid value at execute time)
+    //
+    // All three panic if the resulting `[min, max]` is empty so misuse fails
+    // loud at construction instead of at bind/execute time. Variable names
+    // are checked at compile time via the generated method names. Must be
+    // chained before `prepare` — the JIT plan captures the bounds when the
+    // build closure runs.
+    let with_var_bound_methods = var_names.iter().zip(var_field_names.iter()).flat_map(|(var_name, field_name)| {
+        let max_setter = format_ident!("with_{}_bound", var_name);
+        let min_setter = format_ident!("with_{}_min_bound", var_name);
+        let fixed_setter = format_ident!("with_{}_fixed", var_name);
+        let max_doc = format!(
+            "Override the upper bound for the `{var_name}` symbolic variable. \
+             Must be called before `prepare`/`prepare_with_config`. Panics if \
+             `max < min`."
+        );
+        let min_doc = format!(
+            "Override the lower bound for the `{var_name}` symbolic variable. \
+             Must be called before `prepare`/`prepare_with_config`. Panics if \
+             `min > max`."
+        );
+        let fixed_doc = format!(
+            "Pin `{var_name}` to a single value, making it a JIT-time \
+             constant. Sets both bounds to `value` so only `value` is \
+             accepted at execute time. Must be called before \
+             `prepare`/`prepare_with_config`. Panics on `value == 0`."
+        );
+        let name_str = format!("{var_name}");
+        std::iter::empty()
+            .chain(std::iter::once(quote! {
+                #[doc = #max_doc]
+                pub fn #max_setter(mut self, max: usize) -> Self {
+                    let (min, _) = self.#field_name.bounds();
+                    let max_i64 = max as i64;
+                    assert!(
+                        max_i64 >= min,
+                        "{}: with_{}_bound({max}) creates empty range (min={min})",
+                        #name_str, #name_str,
+                    );
+                    self.#field_name = morok_tensor::Variable::new(stringify!(#var_name), min, max_i64);
+                    self
+                }
+            }))
+            .chain(std::iter::once(quote! {
+                #[doc = #min_doc]
+                pub fn #min_setter(mut self, min: usize) -> Self {
+                    let (_, max) = self.#field_name.bounds();
+                    let min_i64 = min as i64;
+                    assert!(
+                        min_i64 <= max,
+                        "{}: with_{}_min_bound({min}) exceeds upper bound max={max}",
+                        #name_str, #name_str,
+                    );
+                    self.#field_name = morok_tensor::Variable::new(stringify!(#var_name), min_i64, max);
+                    self
+                }
+            }))
+            .chain(std::iter::once(quote! {
+                #[doc = #fixed_doc]
+                pub fn #fixed_setter(mut self, value: usize) -> Self {
+                    assert!(value > 0, "{}: with_{}_fixed(0) is not allowed", #name_str, #name_str);
+                    let v = value as i64;
+                    self.#field_name = morok_tensor::Variable::new(stringify!(#var_name), v, v);
+                    self
+                }
+            }))
+    });
+
     let prepare_var_bindings = var_names.iter().zip(var_field_names.iter()).map(|(var_name, field_name)| {
         quote! {
             let #var_name = self.#field_name
@@ -277,6 +351,8 @@ pub(crate) fn generate(jit: JitWrapper) -> Result<TokenStream> {
                     #( #var_field_names, )*
                 }
             }
+
+            #(#with_var_bound_methods)*
 
             pub fn prepare(&mut self, #(#prepare_params),*) -> morok_model::jit::Result<()> {
                 let config = morok_tensor::PrepareConfig::from_env();
