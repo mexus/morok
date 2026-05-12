@@ -36,16 +36,14 @@ fn matmul_flops(m: usize, k: usize, n: usize) -> u64 {
 fn print_tree(config: &str, size: usize, plan: &morok_runtime::ExecutionPlan, result: &Tensor) {
     if env::var(KEY).is_ok() {
         // DEBUG: Print kernel info
-        eprintln!("\n=== {config:?} (size={size}) ===");
+        eprintln!("\n=== {config} (size={size}) ===");
         eprintln!("Kernel count: {}", plan.kernels().count());
-
         eprintln!("UOp tree:\n{}", result.uop().tree());
+
         for (i, kernel) in plan.prepared_kernels().iter().enumerate() {
-            if env::var(KEY).is_ok() {
-                eprintln!("UOp tree:\n{}", result.uop().tree());
-                eprintln!("  Kernel {}: {}", i, kernel.kernel.entry_point);
-                eprintln!("{}", kernel.kernel.code);
-            }
+            eprintln!("UOp tree:\n{}", kernel.ast.tree());
+            eprintln!("  Kernel {}: {}", i, kernel.kernel.entry_point);
+            eprintln!("{}", kernel.kernel.code);
         }
     }
 }
@@ -65,7 +63,7 @@ fn bench_matmul(c: &mut Criterion) {
     let beam_config: PrepareConfig =
         OptimizerConfig::builder().strategy(OptStrategy::Beam { width: BEAM_WIDTH }).build().into();
 
-    for size in [512] {
+    for size in [256, 512, 1024] {
         let flops = matmul_flops(size, size, size);
         group.throughput(Throughput::Elements(flops));
 
