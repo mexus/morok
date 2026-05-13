@@ -13,6 +13,11 @@
 //!                                    "vpermilp/GigaAM-v3")
 //!   MOROK_RNNT_REVISION=<branch>     Repo revision (default "rnnt")
 //!   MOROK_AMX=1                      Enable AMX renderer (Apple Silicon).
+//!   MOROK_TIMESTAMPS=1               Emit per-word `[start - end] word`
+//!                                    lines (seconds) instead of one
+//!                                    `[start_sec] text` line per VAD chunk.
+//!                                    Mirrors upstream GigaAM's
+//!                                    `transcribe(..., word_timestamps=True)`.
 
 use std::env;
 use std::sync::Arc;
@@ -29,6 +34,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let wav_path = env::args().nth(1).ok_or("usage: gigaam_rnnt_infer <audio.wav>")?;
     let amx_enabled = env::var("MOROK_AMX").as_deref() == Ok("1");
+    let want_timestamps = env::var("MOROK_TIMESTAMPS").as_deref() == Ok("1");
     let repo = env::var("MOROK_RNNT_REPO").unwrap_or_else(|_| "vpermilp/GigaAM-v3".to_string());
     let revision = env::var("MOROK_RNNT_REVISION").unwrap_or_else(|_| "e2e_rnnt".to_string());
 
@@ -262,12 +268,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // SP pieces retain `▁` (U+2581) on word-initial tokens; after
             // concatenation, replace them with spaces for natural Russian
             // text. Char-wise checkpoints (no SP) skip the replace.
+            let &(_, _, start_sec) = &chunks_meta[chunk_batch_start + bi];
             let t_dec = Instant::now();
-            let raw = decoder.decode(&frames, actual_sub, actual_sub, d_model, &mut step_backend)?;
+            let (raw, words) = if want_timestamps {
+                let (raw, emissions) =
+                    decoder.decode_with_timestamps(&frames, actual_sub, actual_sub, d_model, &mut step_backend)?;
+                // Per-chunk frame_shift mirrors upstream's
+                // `audio_length_samples / SAMPLE_RATE / encoder_seq_len`
+                // (gigaam/timestamps_utils.py:8): chunk_duration_secs / actual_sub.
+                let chunk_duration = (*mel_len as f32) * hop_length as f32 / sample_rate as f32;
+                let frame_shift = chunk_duration / (actual_sub as f32).max(1.0);
+                (raw, Some(decoder.frames_to_words(&emissions, frame_shift)))
+            } else {
+                (decoder.decode(&frames, actual_sub, actual_sub, d_model, &mut step_backend)?, None)
+            };
             dt_decode += t_dec.elapsed();
             let text = if model.sentencepiece { raw.replace('\u{2581}', " ").trim().to_string() } else { raw };
-            let &(_, _, start_sec) = &chunks_meta[chunk_batch_start + bi];
-            if !text.is_empty() {
+            if let Some(words) = words {
+                for w in &words {
+                    println!("  [{:>6.2} - {:>6.2}] {}", start_sec + w.start, start_sec + w.end, w.text);
+                }
+            } else if !text.is_empty() {
                 println!("  [{:>6.1}s] {}", start_sec, text);
             }
             chunk_texts.push(text);

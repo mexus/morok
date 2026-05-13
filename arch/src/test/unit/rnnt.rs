@@ -2,7 +2,7 @@ use std::convert::Infallible;
 
 use proptest::prelude::*;
 
-use crate::rnnt::{JointStep, RnntDecoder, RnntOpts};
+use crate::rnnt::{JointStep, RnntDecoder, RnntOpts, TokenEmission, Word};
 
 // ─── Mock backend ─────────────────────────────────────────────────────────
 
@@ -237,9 +237,10 @@ fn test_rnnt_with_timestamps() {
     let mut mock = MockJointStep::new(script);
 
     let enc = linspace_encoder(3);
-    let (text, frames) = decoder.decode_with_timestamps(&enc, 3, 3, 1, &mut mock).unwrap();
+    let (text, emissions) = decoder.decode_with_timestamps(&enc, 3, 3, 1, &mut mock).unwrap();
     assert_eq!(text, "abc");
-    assert_eq!(frames, vec![0, 2, 2]);
+    let pairs: Vec<(usize, usize)> = emissions.iter().map(|e| (e.token_id, e.frame)).collect();
+    assert_eq!(pairs, vec![(0, 0), (1, 2), (2, 2)]);
 }
 
 #[test]
@@ -290,6 +291,51 @@ fn test_rnnt_opts_serde_default_roundtrip() {
 
     let opts: RnntOpts = serde_json::from_str(r#"{"max_symbols_per_step": 5}"#).unwrap();
     assert_eq!(opts.max_symbols_per_step, 5);
+}
+
+// ─── frames_to_words ──────────────────────────────────────────────────────
+
+fn em(token_id: usize, frame: usize) -> TokenEmission {
+    TokenEmission { token_id, frame }
+}
+
+fn assert_words(got: &[Word], expected: &[(&str, f32, f32)]) {
+    assert_eq!(got.len(), expected.len(), "word count mismatch: got {got:?}, expected {expected:?}");
+    for (g, (text, start, end)) in got.iter().zip(expected.iter()) {
+        assert_eq!(&g.text, text);
+        assert!((g.start - start).abs() < 1e-5, "start: got {}, expected {}", g.start, start);
+        assert!((g.end - end).abs() < 1e-5, "end: got {}, expected {}", g.end, end);
+    }
+}
+
+#[test]
+fn test_frames_to_words_sentencepiece_boundaries() {
+    let decoder = decoder_with(vec!["\u{2581}hello".into(), "\u{2581}world".into(), "!".into()], 10);
+    let emissions = vec![em(0, 0), em(1, 10), em(2, 12)];
+    let words = decoder.frames_to_words(&emissions, 0.04);
+    assert_words(&words, &[("hello", 0.0, 0.04), ("world!", 0.40, 0.52)]);
+}
+
+#[test]
+fn test_frames_to_words_multi_piece_word() {
+    let decoder = decoder_with(vec!["\u{2581}при".into(), "ве".into(), "т".into()], 10);
+    let emissions = vec![em(0, 5), em(1, 6), em(2, 7)];
+    let words = decoder.frames_to_words(&emissions, 0.04);
+    assert_words(&words, &[("привет", 0.20, 0.32)]);
+}
+
+#[test]
+fn test_frames_to_words_empty_emissions() {
+    let decoder = decoder_with(vec!["\u{2581}x".into()], 10);
+    assert!(decoder.frames_to_words(&[], 0.04).is_empty());
+}
+
+#[test]
+fn test_frames_to_words_literal_space_separator() {
+    let decoder = decoder_with(vec!["hello".into(), " ".into(), "world".into()], 10);
+    let emissions = vec![em(0, 0), em(1, 2), em(2, 3)];
+    let words = decoder.frames_to_words(&emissions, 0.1);
+    assert_words(&words, &[("hello", 0.0, 0.1), ("world", 0.3, 0.4)]);
 }
 
 // ─── Property tests ───────────────────────────────────────────────────────
@@ -359,12 +405,12 @@ proptest! {
         }
         let mut mock = MockJointStep::new(script);
         let enc = linspace_encoder(n_frames);
-        let (_, frames) = decoder.decode_with_timestamps(&enc, n_frames, n_frames, 1, &mut mock).unwrap();
-        for w in frames.windows(2) {
-            prop_assert!(w[0] <= w[1]);
+        let (_, emissions) = decoder.decode_with_timestamps(&enc, n_frames, n_frames, 1, &mut mock).unwrap();
+        for w in emissions.windows(2) {
+            prop_assert!(w[0].frame <= w[1].frame);
         }
-        for &f in &frames {
-            prop_assert!(f < n_frames);
+        for e in &emissions {
+            prop_assert!(e.frame < n_frames);
         }
     }
 }

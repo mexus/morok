@@ -69,6 +69,45 @@ impl Default for RnntOpts {
     }
 }
 
+// ─── Token emissions / words ──────────────────────────────────────────────
+
+/// One non-blank token emitted by the greedy decoder. `frame` is the
+/// encoder-frame index (`t` in the outer search loop) at which the joint
+/// network selected this token.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TokenEmission {
+    pub token_id: usize,
+    pub frame: usize,
+}
+
+/// A grouped word and its `[start, end)` time span in seconds. Produced by
+/// [`frames_to_words`]. Mirrors upstream GigaAM's `Word` dataclass in
+/// `gigaam/types.py`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Word {
+    pub text: String,
+    pub start: f32,
+    pub end: f32,
+}
+
+struct PendingWord {
+    text: String,
+    first_frame: usize,
+    last_frame: usize,
+}
+
+fn flush_pending(pending: &mut Option<PendingWord>, frame_shift: f32, words: &mut Vec<Word>) {
+    let Some(p) = pending.take() else { return };
+    let trimmed = p.text.trim();
+    if !trimmed.is_empty() {
+        words.push(Word {
+            text: trimmed.to_string(),
+            start: p.first_frame as f32 * frame_shift,
+            end: (p.last_frame + 1) as f32 * frame_shift,
+        });
+    }
+}
+
 // ─── JointStep trait ──────────────────────────────────────────────────────
 
 /// Bridge between the search loop and the predictor/joint backend.
@@ -145,6 +184,51 @@ impl RnntDecoder {
         self.vocabulary.len() + 1
     }
 
+    /// Group token emissions from [`decode_with_timestamps`](Self::decode_with_timestamps)
+    /// into words and assign each a `[start, end)` time span in seconds.
+    /// A new word begins on:
+    ///
+    /// - a piece prefixed with `▁` (U+2581, SentencePiece word marker), or
+    /// - a piece equal to a single ASCII space (char-based vocabularies).
+    ///
+    /// Other pieces concatenate onto the current word. `start = first_frame *
+    /// frame_shift`; `end = (last_frame + 1) * frame_shift`. Whitespace-only
+    /// candidates are dropped.
+    ///
+    /// Port of `gigaam/timestamps_utils.py:frames_to_words`.
+    pub fn frames_to_words(&self, emissions: &[TokenEmission], frame_shift: f32) -> Vec<Word> {
+        const SP_MARK: char = '\u{2581}';
+
+        let mut words: Vec<Word> = Vec::new();
+        let mut pending: Option<PendingWord> = None;
+
+        for e in emissions {
+            let piece = match self.vocabulary.get(e.token_id) {
+                Some(p) => p.as_str(),
+                None => continue,
+            };
+            if let Some(stripped) = piece.strip_prefix(SP_MARK) {
+                flush_pending(&mut pending, frame_shift, &mut words);
+                pending = Some(PendingWord { text: stripped.to_string(), first_frame: e.frame, last_frame: e.frame });
+            } else if piece == " " {
+                flush_pending(&mut pending, frame_shift, &mut words);
+            } else {
+                match &mut pending {
+                    Some(p) => {
+                        p.text.push_str(piece);
+                        p.last_frame = e.frame;
+                    }
+                    None => {
+                        pending =
+                            Some(PendingWord { text: piece.to_string(), first_frame: e.frame, last_frame: e.frame });
+                    }
+                }
+            }
+        }
+        flush_pending(&mut pending, frame_shift, &mut words);
+        words
+    }
+
     /// Greedy decode. `encoder_frames` is row-major `[stride_frames, enc_hidden]`.
     /// Empty vocabulary or `valid_frames == 0` yield an empty string.
     pub fn decode<S: JointStep>(
@@ -155,13 +239,15 @@ impl RnntDecoder {
         enc_hidden: usize,
         step: &mut S,
     ) -> Result<String, RnntDecodeError<S::Error>> {
-        let (text, _frames) =
+        let (text, _emissions) =
             self.decode_inner(encoder_frames, stride_frames, valid_frames, enc_hidden, step, false)?;
         Ok(text)
     }
 
-    /// Greedy decode + per-emission frame indices. `frames[i]` is the encoder
-    /// frame at which the `i`-th token was emitted.
+    /// Greedy decode + per-emission `(token_id, frame)` pairs. `emissions[i]`
+    /// records which token was emitted and at which encoder frame, in
+    /// decoder output order. Pair with [`frames_to_words`] to recover
+    /// word-level timestamps from a SentencePiece vocabulary.
     pub fn decode_with_timestamps<S: JointStep>(
         &self,
         encoder_frames: &[f32],
@@ -169,7 +255,7 @@ impl RnntDecoder {
         valid_frames: usize,
         enc_hidden: usize,
         step: &mut S,
-    ) -> Result<(String, Vec<usize>), RnntDecodeError<S::Error>> {
+    ) -> Result<(String, Vec<TokenEmission>), RnntDecodeError<S::Error>> {
         self.decode_inner(encoder_frames, stride_frames, valid_frames, enc_hidden, step, true)
     }
 
@@ -180,8 +266,8 @@ impl RnntDecoder {
         valid_frames: usize,
         enc_hidden: usize,
         step: &mut S,
-        keep_frames: bool,
-    ) -> Result<(String, Vec<usize>), RnntDecodeError<S::Error>> {
+        keep_emissions: bool,
+    ) -> Result<(String, Vec<TokenEmission>), RnntDecodeError<S::Error>> {
         if self.vocabulary.is_empty() || valid_frames == 0 {
             return Ok((String::new(), Vec::new()));
         }
@@ -192,7 +278,7 @@ impl RnntDecoder {
         step.reset();
 
         let mut text = String::new();
-        let mut frames = if keep_frames { Vec::with_capacity(n_frames) } else { Vec::new() };
+        let mut emissions = if keep_emissions { Vec::with_capacity(n_frames) } else { Vec::new() };
         let mut logits = vec![0.0f32; total_vocab];
         let mut prev_token: Option<usize> = None;
 
@@ -211,15 +297,15 @@ impl RnntDecoder {
                 // backend's committed predictor state to the post-step
                 // state we just produced.
                 text.push_str(&self.vocabulary[k]);
-                if keep_frames {
-                    frames.push(t);
+                if keep_emissions {
+                    emissions.push(TokenEmission { token_id: k, frame: t });
                 }
                 prev_token = Some(k);
                 step.commit();
             }
         }
 
-        Ok((text, frames))
+        Ok((text, emissions))
     }
 }
 
