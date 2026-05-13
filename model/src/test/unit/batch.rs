@@ -60,11 +60,7 @@ fn test_batched_jit_prepare_and_execute() {
     let mut jit = GigaAmBatchedJit::new(model);
 
     let (b, t, n_mels) = (2, 10, test_config().n_mels);
-    let mut mel = Tensor::full(&[b, n_mels, t], 0.5f32, DType::Float32).unwrap();
-    mel.realize().unwrap();
-    let lengths = Tensor::from_slice([10i32, 8]);
-
-    jit.prepare(&mel, &lengths).unwrap();
+    jit.prepare(crate::jit::InputSpec::f32(&[b, n_mels, t]), crate::jit::InputSpec::i32(&[b])).unwrap();
     jit.execute_with_vars(&[("b", b as i64), ("t", t as i64)]).unwrap();
 
     let output = jit.output().unwrap();
@@ -77,11 +73,11 @@ fn test_batched_jit_prepare_large_shape() {
     let mut jit = GigaAmBatchedJit::new(model);
 
     let cfg = test_config();
-    let mut mel = Tensor::full(&[cfg.max_batch_size, cfg.n_mels, cfg.max_mel_frames], 0.0f32, DType::Float32).unwrap();
-    mel.realize().unwrap();
-    let lengths = Tensor::from_slice(vec![cfg.max_mel_frames as i32; cfg.max_batch_size]);
-
-    jit.prepare(&mel, &lengths).unwrap();
+    jit.prepare(
+        crate::jit::InputSpec::f32(&[cfg.max_batch_size, cfg.n_mels, cfg.max_mel_frames]),
+        crate::jit::InputSpec::i32(&[cfg.max_batch_size]),
+    )
+    .unwrap();
     jit.execute_with_vars(&[("b", cfg.max_batch_size as i64), ("t", cfg.max_mel_frames as i64)]).unwrap();
 
     let output = jit.output().unwrap();
@@ -95,11 +91,8 @@ fn test_batched_jit_t_bound_is_mel_frames() {
     assert!(cfg.max_mel_frames > cfg.max_encoder_frames);
 
     let mut jit = GigaAmBatchedJit::new(model);
-    let mut mel = Tensor::full(&[1, cfg.n_mels, cfg.max_mel_frames], 0.0f32, DType::Float32).unwrap();
-    mel.realize().unwrap();
-    let lengths = Tensor::from_slice([cfg.max_mel_frames as i32]);
-
-    jit.prepare(&mel, &lengths).unwrap();
+    jit.prepare(crate::jit::InputSpec::f32(&[1, cfg.n_mels, cfg.max_mel_frames]), crate::jit::InputSpec::i32(&[1]))
+        .unwrap();
     jit.execute_with_vars(&[("b", 1), ("t", cfg.max_mel_frames as i64)]).unwrap();
 }
 
@@ -108,11 +101,8 @@ fn test_batched_jit_rejects_t_above_max_mel_frames() {
     let model = model_with_random_weights();
     let cfg = test_config();
     let mut jit = GigaAmBatchedJit::new(model);
-    let mut mel = Tensor::full(&[1, cfg.n_mels, cfg.max_mel_frames], 0.0f32, DType::Float32).unwrap();
-    mel.realize().unwrap();
-    let lengths = Tensor::from_slice([cfg.max_mel_frames as i32]);
-
-    jit.prepare(&mel, &lengths).unwrap();
+    jit.prepare(crate::jit::InputSpec::f32(&[1, cfg.n_mels, cfg.max_mel_frames]), crate::jit::InputSpec::i32(&[1]))
+        .unwrap();
     let err = jit.execute_with_vars(&[("b", 1), ("t", cfg.max_mel_frames as i64 + 1)]).unwrap_err();
     match err {
         crate::jit::JitError::Runtime { source: morok_runtime::Error::Execution { reason } } => {
@@ -238,11 +228,11 @@ fn test_encode_batch_respects_dynamic_seq_len() {
     let t_dynamic = 64usize;
 
     let mut jit = GigaAmBatchedJit::new(model);
-    let mut mel = Tensor::full(&[cfg.max_batch_size, cfg.n_mels, cfg.max_mel_frames], 0.0f32, DType::Float32).unwrap();
-    mel.realize().unwrap();
-    let lengths = Tensor::from_slice(vec![cfg.max_mel_frames as i32; cfg.max_batch_size]);
-
-    jit.prepare(&mel, &lengths).unwrap();
+    jit.prepare(
+        crate::jit::InputSpec::f32(&[cfg.max_batch_size, cfg.n_mels, cfg.max_mel_frames]),
+        crate::jit::InputSpec::i32(&[cfg.max_batch_size]),
+    )
+    .unwrap();
     let profiles = jit.execute_with_vars_profiled(&[("b", 1), ("t", t_dynamic as i64)]).unwrap();
 
     assert!(!profiles.is_empty(), "expected kernels for profiled dynamic execute");
@@ -267,11 +257,7 @@ fn test_with_b_bound_shrinks_upper_bound() {
     let cfg = test_config();
     // Default b range is [1, max_batch_size=8]. Shrink to [1, 2].
     let mut jit = GigaAmBatchedJit::new(model).with_b_bound(2);
-    let mut mel = Tensor::full(&[2, cfg.n_mels, 64], 0.0f32, DType::Float32).unwrap();
-    mel.realize().unwrap();
-    let lengths = Tensor::from_slice([64i32, 64]);
-
-    jit.prepare(&mel, &lengths).unwrap();
+    jit.prepare(crate::jit::InputSpec::f32(&[2, cfg.n_mels, 64]), crate::jit::InputSpec::i32(&[2])).unwrap();
     jit.execute_with_vars(&[("b", 2), ("t", 64)]).unwrap();
     // b=3 is now outside the shrunken bound even though config allowed up to 8.
     assert_runtime_bounds_err(jit.execute_with_vars(&[("b", 3), ("t", 64)]).unwrap_err());
@@ -283,11 +269,7 @@ fn test_with_t_fixed_specializes_kernels() {
     let cfg = test_config();
     let pinned_t = 64usize;
     let mut jit = GigaAmBatchedJit::new(model).with_t_fixed(pinned_t);
-    let mut mel = Tensor::full(&[1, cfg.n_mels, pinned_t], 0.0f32, DType::Float32).unwrap();
-    mel.realize().unwrap();
-    let lengths = Tensor::from_slice([pinned_t as i32]);
-
-    jit.prepare(&mel, &lengths).unwrap();
+    jit.prepare(crate::jit::InputSpec::f32(&[1, cfg.n_mels, pinned_t]), crate::jit::InputSpec::i32(&[1])).unwrap();
     // With `t` pinned at JIT time, the symbolic axis is folded to a const by the
     // trivial-range simplifier, so no compiled kernel should retain `t` as a
     // runtime variable. `b` is still dynamic and should still appear.
@@ -308,11 +290,7 @@ fn test_with_b_min_bound_raises_lower_bound() {
     let cfg = test_config();
     // Default b range is [1, 8]. Raise lower bound to 2.
     let mut jit = GigaAmBatchedJit::new(model).with_b_min_bound(2);
-    let mut mel = Tensor::full(&[2, cfg.n_mels, 64], 0.0f32, DType::Float32).unwrap();
-    mel.realize().unwrap();
-    let lengths = Tensor::from_slice([64i32, 64]);
-
-    jit.prepare(&mel, &lengths).unwrap();
+    jit.prepare(crate::jit::InputSpec::f32(&[2, cfg.n_mels, 64]), crate::jit::InputSpec::i32(&[2])).unwrap();
     jit.execute_with_vars(&[("b", 2), ("t", 64)]).unwrap();
     assert_runtime_bounds_err(jit.execute_with_vars(&[("b", 1), ("t", 64)]).unwrap_err());
 }

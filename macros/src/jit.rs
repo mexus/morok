@@ -17,7 +17,6 @@ pub(crate) struct JitWrapper {
 
 struct Input {
     name: Ident,
-    ty: Type,
 }
 
 struct VarDecl {
@@ -75,9 +74,14 @@ impl Parse for JitWrapper {
                     }
                 }
             } else {
-                body.parse::<Token![:]>()?;
-                let input_ty: Type = body.parse()?;
-                inputs.push(Input { name: first, ty: input_ty });
+                // Accept (and discard) an optional `: Tensor` for DSL clarity;
+                // the macro now allocates placeholder buffers from `InputSpec`
+                // so the declared type is informational.
+                if body.peek(Token![:]) {
+                    body.parse::<Token![:]>()?;
+                    let _: Type = body.parse()?;
+                }
+                inputs.push(Input { name: first });
                 if body.peek(Comma) {
                     body.parse::<Comma>()?;
                 }
@@ -98,7 +102,6 @@ pub(crate) fn generate(jit: JitWrapper) -> Result<TokenStream> {
     let state_name = format_ident!("{}State", name);
 
     let input_names: Vec<&Ident> = jit.inputs.iter().map(|i| &i.name).collect();
-    let input_types: Vec<&Type> = jit.inputs.iter().map(|i| &i.ty).collect();
     let var_names: Vec<&Ident> = jit.vars.iter().map(|v| &v.name).collect();
     let var_min_exprs: Vec<&Expr> = jit.vars.iter().map(|v| &v.min).collect();
     let var_max_exprs: Vec<&Expr> = jit.vars.iter().map(|v| &v.max).collect();
@@ -132,7 +135,7 @@ pub(crate) fn generate(jit: JitWrapper) -> Result<TokenStream> {
     let build_arg_sources: Vec<TokenStream> = build_args.iter().map(|arg| quote! { #arg }).collect();
 
     let prepare_params: Vec<TokenStream> =
-        input_names.iter().zip(input_types.iter()).map(|(n, t)| quote! { #n: &#t }).collect();
+        input_names.iter().map(|n| quote! { #n: morok_model::jit::InputSpec }).collect();
 
     let var_inits =
         var_names.iter().zip(var_field_names.iter()).zip(var_min_exprs.iter().zip(var_max_exprs.iter())).map(
@@ -239,7 +242,8 @@ pub(crate) fn generate(jit: JitWrapper) -> Result<TokenStream> {
 
     let input_realizations = input_names.iter().zip(input_realized_locals.iter()).map(|(input_name, local)| {
         quote! {
-            let mut #local = #input_name.clone();
+            let mut #local = morok_tensor::Tensor::zeros(&#input_name.shape, #input_name.dtype.clone())
+                .map_err(|e| morok_model::jit::JitError::Tensor { source: Box::new(e) })?;
             #local
                 .realize_with(config)
                 .map_err(|e| morok_model::jit::JitError::Tensor { source: Box::new(e) })?;

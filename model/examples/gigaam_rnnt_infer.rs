@@ -98,8 +98,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ─── VAD chunking ────────────────────────────────────────────────────
     println!("\nLoading Silero VAD...");
     let t_vad_prepare = Instant::now();
-    let vad_model = morok_model::vad::SileroVad::from_hub()?;
-    let mut vad = morok_model::vad::VadInference::new(vad_model)?;
+    let vad_model = morok_model::silero_vad::SileroVad::from_hub()?;
+    let mut vad = morok_model::silero_vad::VadInference::new(vad_model)?;
     let dt_vad_prepare = t_vad_prepare.elapsed();
 
     let t_vad = Instant::now();
@@ -110,7 +110,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let default_opts = morok_arch::vad::ChunkerOpts::default();
     let chunker_opts = morok_arch::vad::ChunkerOpts {
         sample_rate: sample_rate as u32,
-        samples_per_prob: morok_model::vad::NUM_SAMPLES,
+        samples_per_prob: morok_model::silero_vad::NUM_SAMPLES,
         max_duration: default_opts.max_duration.min(encoder_capacity_secs),
         strict_limit_duration: default_opts.strict_limit_duration.min(encoder_capacity_secs),
         align_to: hop_length * subsampling_factor,
@@ -172,16 +172,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         num_chunks, actual_max_chunk_mel, max_batch, jit_t_mel, target_scores_mib
     );
 
-    let mut mel_batch = Tensor::full(&[max_batch, n_mels, jit_t_mel], 0.0f32, DType::Float32)?;
-    mel_batch.realize().unwrap();
-    let lengths = Tensor::from_slice(vec![0i32; max_batch]);
-
     let t_prepare = Instant::now();
     let mut encoder_jit = GigaAmRnntEncoderJit::new(Arc::clone(&model)).with_b_bound(max_batch).with_t_bound(jit_t_mel);
     let prepare_config = PrepareConfig::from_env();
     println!("AMX renderer      {}", if amx_enabled { "enabled (MOROK_AMX=1)" } else { "disabled" });
     println!("Preparing encoder JIT plan... [{max_batch}, {n_mels}, {jit_t_mel}]");
-    encoder_jit.prepare_with_config(&mel_batch, &lengths, &prepare_config)?;
+    encoder_jit.prepare_with_config(
+        morok_model::jit::InputSpec::f32(&[max_batch, n_mels, jit_t_mel]),
+        morok_model::jit::InputSpec::i32(&[max_batch]),
+        &prepare_config,
+    )?;
     let dt_prepare_enc = t_prepare.elapsed();
 
     // ─── Predictor + joint backend ───────────────────────────────────────
@@ -303,8 +303,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("    joint exec    {:>9}", fmt_duration(s.t_joint_exec));
     println!("    joint read    {:>9}", fmt_duration(s.t_joint_read));
     println!("    step total    {:>9}", fmt_duration(s_total));
-    if s.n_steps > 0 {
-        let avg_ns = (s_total.as_nanos() as u64) / s.n_steps;
+    if let Some(avg_ns) = (s_total.as_nanos() as u64).checked_div(s.n_steps) {
         println!("    avg/step      {:>9}", fmt_duration(std::time::Duration::from_nanos(avg_ns)));
     }
     println!("total             {:>9}", fmt_duration(t_total.elapsed()));

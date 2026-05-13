@@ -114,8 +114,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ─── VAD chunking ──────────────────────────────────────────────────────
     let t_vad = Instant::now();
     println!("\nLoading Silero VAD...");
-    let vad_model = morok_model::vad::SileroVad::from_hub()?;
-    let mut vad = morok_model::vad::VadInference::new(vad_model)?;
+    let vad_model = morok_model::silero_vad::SileroVad::from_hub()?;
+    let mut vad = morok_model::silero_vad::VadInference::new(vad_model)?;
     let probs = vad.probs(&waveform)?;
     // Each chunk's mel-frame count must fit max_t_mel. The chunker rounds
     // chunk boundaries to align_to-sample multiples; the start/end snap
@@ -127,7 +127,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let default_opts = morok_arch::vad::ChunkerOpts::default();
     let chunker_opts = morok_arch::vad::ChunkerOpts {
         sample_rate: model.config.sample_rate as u32,
-        samples_per_prob: morok_model::vad::NUM_SAMPLES,
+        samples_per_prob: morok_model::silero_vad::NUM_SAMPLES,
         max_duration: default_opts.max_duration.min(encoder_capacity_secs),
         strict_limit_duration: default_opts.strict_limit_duration.min(encoder_capacity_secs),
         align_to: hop_length * subsampling_factor,
@@ -186,14 +186,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ─── JIT prepare ───────────────────────────────────────────────────────
     let t_prepare = Instant::now();
-    let mut mel_batch = Tensor::full(&[max_batch, n_mels, jit_t_mel], 0.0f32, DType::Float32)?;
-    mel_batch.realize().unwrap();
-    let lengths = Tensor::from_slice(vec![0i32; max_batch]);
     let mut jit = GigaAmBatchedJit::new(model).with_b_bound(max_batch).with_t_bound(jit_t_mel);
     println!("Preparing batched JIT plan... [{max_batch}, {n_mels}, {jit_t_mel}]");
     println!("AMX renderer {}", if amx_enabled { "enabled" } else { "disabled" });
     let prepare_config = PrepareConfig::from_env();
-    jit.prepare_with_config(&mel_batch, &lengths, &prepare_config)?;
+    jit.prepare_with_config(
+        morok_model::jit::InputSpec::f32(&[max_batch, n_mels, jit_t_mel]),
+        morok_model::jit::InputSpec::i32(&[max_batch]),
+        &prepare_config,
+    )?;
     let dt_prepare = t_prepare.elapsed();
     println!("Plan captured.");
 

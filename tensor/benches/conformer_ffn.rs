@@ -84,16 +84,8 @@ fn make_configs() -> Vec<(&'static str, PrepareConfig)> {
         .into();
     out.push(("heuristic", heuristic));
 
-    for &w in &[4] {
-        let cfg: PrepareConfig = OptimizerConfig::builder().strategy(OptStrategy::Beam { width: w }).build().into();
-        let label: &'static str = match w {
-            1 => "beam_w1",
-            2 => "beam_w2",
-            4 => "beam_w4",
-            _ => unreachable!(),
-        };
-        out.push((label, cfg));
-    }
+    let beam: PrepareConfig = OptimizerConfig::builder().strategy(OptStrategy::Beam { width: 4 }).build().into();
+    out.push(("beam_w4", beam));
     out
 }
 

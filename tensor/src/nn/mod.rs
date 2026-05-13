@@ -1,8 +1,10 @@
 //! Neural network operations: convolution, pooling, normalization.
 
 mod conv;
+mod conv1d;
 mod grid_sample;
 mod linear;
+mod lstm_cell;
 mod norm;
 pub mod pad;
 mod pool;
@@ -10,7 +12,9 @@ mod quantize;
 mod resize;
 mod rnn;
 
+pub use conv1d::Conv1d;
 pub use linear::Linear;
+pub use lstm_cell::LSTMCell;
 pub use rnn::{GruOutput, LstmOutput, RnnOutput};
 
 /// A neural network layer.

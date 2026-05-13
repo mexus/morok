@@ -3,8 +3,9 @@
 //!
 //! Layout mirrors the reference Python `RNNTDecoder` / `RNNTJoint` / `RNNTHead`
 //! in `submodules/GigaAM/gigaam/decoder.py`. The predictor is a multi-layer
-//! hand-coded LSTM (matching `model/src/vad/mod.rs`'s Silero pattern), and the
-//! joint is a two-Linear sum + ReLU + Linear + log-softmax projection.
+//! LSTM stack of [`morok_tensor::nn::LSTMCell`]s (PyTorch `[i, f, g, o]` gate
+//! order, matching the Silero VAD predictor); the joint is a two-Linear sum
+//! + ReLU + Linear + log-softmax projection.
 //!
 //! `RnntPredictor::forward_concat` packs `(g, h_out, c_out)` into a single
 //! output tensor (Silero-style multi-output trick) so it fits the
@@ -15,6 +16,7 @@ use std::path::Path;
 
 use morok_dtype::DType;
 use morok_tensor::Tensor;
+use morok_tensor::nn::LSTMCell;
 use snafu::ResultExt;
 
 use crate::audio::{MelConfig, MelSpectrogram};
@@ -25,45 +27,6 @@ use super::{Encoder, GigaAmConfig, Result, build_encoder_from_sd, build_rope_cac
 
 // ─── Predictor ────────────────────────────────────────────────────────────
 
-/// One layer of the multi-layer LSTM stack inside [`RnntPredictor`].
-///
-/// Gate packing follows PyTorch's `nn.LSTM`: `[i, f, g, o]`. The hand-coded
-/// LSTM cell at the bottom of this file applies the gates in that order, so a
-/// straight checkpoint load (no remap of gate dimensions) gives bit-for-bit
-/// equivalence to the reference.
-pub struct RnntPredictorLstmLayer {
-    /// `[4 * pred_hidden, input_size]`. For layer 0, `input_size = pred_hidden`
-    /// (embed output); for higher layers, `input_size = pred_hidden`
-    /// (preceding layer's output).
-    pub w_ih: Tensor,
-    /// `[4 * pred_hidden, pred_hidden]`.
-    pub w_hh: Tensor,
-    /// `[4 * pred_hidden]`.
-    pub b_ih: Tensor,
-    /// `[4 * pred_hidden]`.
-    pub b_hh: Tensor,
-}
-
-impl RnntPredictorLstmLayer {
-    pub fn empty(pred_hidden: usize) -> Self {
-        let h4 = 4 * pred_hidden;
-        Self {
-            w_ih: Tensor::full(&[h4, pred_hidden], 0.0, DType::Float32).unwrap(),
-            w_hh: Tensor::full(&[h4, pred_hidden], 0.0, DType::Float32).unwrap(),
-            b_ih: Tensor::full(&[h4], 0.0, DType::Float32).unwrap(),
-            b_hh: Tensor::full(&[h4], 0.0, DType::Float32).unwrap(),
-        }
-    }
-
-    fn load(&mut self, sd: &StateDict, prefix: &str) -> std::result::Result<(), state::Error> {
-        self.w_ih = get_tensor(sd, &prefixed(prefix, "w_ih"))?;
-        self.w_hh = get_tensor(sd, &prefixed(prefix, "w_hh"))?;
-        self.b_ih = get_tensor(sd, &prefixed(prefix, "b_ih"))?;
-        self.b_hh = get_tensor(sd, &prefixed(prefix, "b_hh"))?;
-        Ok(())
-    }
-}
-
 /// RNN-T predictor: token embedding + multi-layer LSTM. Stateful per-utterance:
 /// the search loop carries `(h, c)` across calls and resets to zeros at the
 /// start of a new utterance.
@@ -73,10 +36,14 @@ impl RnntPredictorLstmLayer {
 /// `nn.Embedding(padding_idx=blank_id)` keeps the blank row at zero through
 /// training, so this is equivalent to "embedding of zero vector". We assert
 /// the row is in fact zero at load time.
+///
+/// The LSTM stack reuses [`LSTMCell`] from `morok_tensor::nn`, which applies
+/// PyTorch's `[i, f, g, o]` gate order — matching the reference exactly so
+/// checkpoints load without gate-axis remapping.
 pub struct RnntPredictor {
     /// `[num_classes, pred_hidden]`. Row `blank_id` must be zeros.
     pub embed: Tensor,
-    pub layers: Vec<RnntPredictorLstmLayer>,
+    pub layers: Vec<LSTMCell>,
     pub pred_hidden: usize,
     pub num_classes: usize,
     pub blank_id: usize,
@@ -85,9 +52,19 @@ pub struct RnntPredictor {
 impl RnntPredictor {
     pub fn empty(pred_hidden: usize, num_layers: usize, num_classes: usize) -> Self {
         let blank_id = num_classes - 1;
+        let h4 = 4 * pred_hidden;
         Self {
-            embed: Tensor::full(&[num_classes, pred_hidden], 0.0, DType::Float32).unwrap(),
-            layers: (0..num_layers).map(|_| RnntPredictorLstmLayer::empty(pred_hidden)).collect(),
+            embed: Tensor::zeros(&[num_classes, pred_hidden], DType::Float32).unwrap(),
+            layers: (0..num_layers)
+                .map(|_| {
+                    LSTMCell::new(
+                        Tensor::zeros(&[h4, pred_hidden], DType::Float32).unwrap(),
+                        Tensor::zeros(&[h4, pred_hidden], DType::Float32).unwrap(),
+                        Tensor::zeros(&[h4], DType::Float32).unwrap(),
+                        Tensor::zeros(&[h4], DType::Float32).unwrap(),
+                    )
+                })
+                .collect(),
             pred_hidden,
             num_classes,
             blank_id,
@@ -111,7 +88,7 @@ impl RnntPredictor {
 
         let mut new_hs: Vec<Tensor> = Vec::with_capacity(self.layers.len());
         let mut new_cs: Vec<Tensor> = Vec::with_capacity(self.layers.len());
-        for (i, layer) in self.layers.iter().enumerate() {
+        for (i, cell) in self.layers.iter().enumerate() {
             let i_i = i as isize;
             // Slice layer i's h, c → [1, 1, P], squeeze leading axis → [1, P].
             let h_i = h_in
@@ -124,8 +101,7 @@ impl RnntPredictor {
                 .context(TensorSnafu)?
                 .try_squeeze(Some(0))
                 .context(TensorSnafu)?; // [1, P]
-            let (new_h, new_c) =
-                lstm_cell(&layer_in, &h_i, &c_i, &layer.w_ih, &layer.w_hh, &layer.b_ih, &layer.b_hh, self.pred_hidden)?;
+            let (new_h, new_c) = cell.step(&layer_in, &h_i, &c_i).context(TensorSnafu)?;
             new_hs.push(new_h.clone());
             new_cs.push(new_c.clone());
             layer_in = new_h; // next layer's input
@@ -165,15 +141,11 @@ impl RnntPredictor {
     fn prepare_for_inference(&mut self) -> Result<()> {
         self.embed = self.embed.cast(DType::Float32).context(TensorSnafu)?;
         self.embed.realize().context(TensorSnafu)?;
-        for layer in &mut self.layers {
-            layer.w_ih = layer.w_ih.cast(DType::Float32).context(TensorSnafu)?;
-            layer.w_hh = layer.w_hh.cast(DType::Float32).context(TensorSnafu)?;
-            layer.b_ih = layer.b_ih.cast(DType::Float32).context(TensorSnafu)?;
-            layer.b_hh = layer.b_hh.cast(DType::Float32).context(TensorSnafu)?;
-            layer.w_ih.realize().context(TensorSnafu)?;
-            layer.w_hh.realize().context(TensorSnafu)?;
-            layer.b_ih.realize().context(TensorSnafu)?;
-            layer.b_hh.realize().context(TensorSnafu)?;
+        for cell in &mut self.layers {
+            for t in [&mut cell.weight_ih, &mut cell.weight_hh, &mut cell.bias_ih, &mut cell.bias_hh] {
+                *t = t.cast(DType::Float32).context(TensorSnafu)?;
+                t.realize().context(TensorSnafu)?;
+            }
         }
         let mut view = self.embed.array_view_mut::<f32>().context(TensorSnafu)?;
         let p = self.pred_hidden;
@@ -188,20 +160,24 @@ impl HasStateDict for RnntPredictor {
     fn state_dict(&self, prefix: &str) -> StateDict {
         let mut sd = StateDict::new();
         sd.insert(prefixed(prefix, "embed"), self.embed.clone());
-        for (i, layer) in self.layers.iter().enumerate() {
+        for (i, cell) in self.layers.iter().enumerate() {
             let p = prefixed(prefix, &format!("lstm.{i}"));
-            sd.insert(prefixed(&p, "w_ih"), layer.w_ih.clone());
-            sd.insert(prefixed(&p, "w_hh"), layer.w_hh.clone());
-            sd.insert(prefixed(&p, "b_ih"), layer.b_ih.clone());
-            sd.insert(prefixed(&p, "b_hh"), layer.b_hh.clone());
+            sd.insert(prefixed(&p, "w_ih"), cell.weight_ih.clone());
+            sd.insert(prefixed(&p, "w_hh"), cell.weight_hh.clone());
+            sd.insert(prefixed(&p, "b_ih"), cell.bias_ih.clone());
+            sd.insert(prefixed(&p, "b_hh"), cell.bias_hh.clone());
         }
         sd
     }
 
     fn load_state_dict(&mut self, sd: &StateDict, prefix: &str) -> std::result::Result<(), state::Error> {
         self.embed = get_tensor(sd, &prefixed(prefix, "embed"))?;
-        for (i, layer) in self.layers.iter_mut().enumerate() {
-            layer.load(sd, &prefixed(prefix, &format!("lstm.{i}")))?;
+        for (i, cell) in self.layers.iter_mut().enumerate() {
+            let p = prefixed(prefix, &format!("lstm.{i}"));
+            cell.weight_ih = get_tensor(sd, &prefixed(&p, "w_ih"))?;
+            cell.weight_hh = get_tensor(sd, &prefixed(&p, "w_hh"))?;
+            cell.bias_ih = get_tensor(sd, &prefixed(&p, "b_ih"))?;
+            cell.bias_hh = get_tensor(sd, &prefixed(&p, "b_hh"))?;
         }
         Ok(())
     }
@@ -226,12 +202,12 @@ pub struct RnntJoint {
 impl RnntJoint {
     pub fn empty(enc_hidden: usize, pred_hidden: usize, joint_hidden: usize, num_classes: usize) -> Self {
         Self {
-            enc_w: Tensor::full(&[joint_hidden, enc_hidden], 0.0, DType::Float32).unwrap(),
-            enc_b: Tensor::full(&[joint_hidden], 0.0, DType::Float32).unwrap(),
-            pred_w: Tensor::full(&[joint_hidden, pred_hidden], 0.0, DType::Float32).unwrap(),
-            pred_b: Tensor::full(&[joint_hidden], 0.0, DType::Float32).unwrap(),
-            out_w: Tensor::full(&[num_classes, joint_hidden], 0.0, DType::Float32).unwrap(),
-            out_b: Tensor::full(&[num_classes], 0.0, DType::Float32).unwrap(),
+            enc_w: Tensor::zeros(&[joint_hidden, enc_hidden], DType::Float32).unwrap(),
+            enc_b: Tensor::zeros(&[joint_hidden], DType::Float32).unwrap(),
+            pred_w: Tensor::zeros(&[joint_hidden, pred_hidden], DType::Float32).unwrap(),
+            pred_b: Tensor::zeros(&[joint_hidden], DType::Float32).unwrap(),
+            out_w: Tensor::zeros(&[num_classes, joint_hidden], DType::Float32).unwrap(),
+            out_b: Tensor::zeros(&[num_classes], DType::Float32).unwrap(),
         }
     }
 
@@ -499,45 +475,6 @@ impl GigaAmRnnt {
     }
 }
 
-// ─── LSTM cell ────────────────────────────────────────────────────────────
-
-/// Hand-coded LSTM cell. Inputs:
-/// - `x`: `[B, input_size]`
-/// - `h`, `c`: `[B, hidden_size]`
-/// - `w_ih`: `[4 * hidden_size, input_size]`
-/// - `w_hh`: `[4 * hidden_size, hidden_size]`
-/// - `b_ih`, `b_hh`: `[4 * hidden_size]`
-///
-/// Gate order is PyTorch's `[i, f, g, o]`. Matches the Silero VAD cell at
-/// `model/src/vad/mod.rs:156` and the reference `nn.LSTM` packing exactly,
-/// so PyTorch checkpoints load without gate-axis remapping.
-#[allow(clippy::too_many_arguments)]
-fn lstm_cell(
-    x: &Tensor,
-    h: &Tensor,
-    c: &Tensor,
-    w_ih: &Tensor,
-    w_hh: &Tensor,
-    b_ih: &Tensor,
-    b_hh: &Tensor,
-    hidden: usize,
-) -> Result<(Tensor, Tensor)> {
-    let gates_x = x.linear().weight(w_ih).bias(b_ih).call().context(TensorSnafu)?;
-    let gates_h = h.linear().weight(w_hh).bias(b_hh).call().context(TensorSnafu)?;
-    let gates = gates_x.try_add(&gates_h).context(TensorSnafu)?;
-
-    let parts = gates.split(&[hidden, hidden, hidden, hidden], 1).context(TensorSnafu)?;
-    let i = parts[0].sigmoid().context(TensorSnafu)?;
-    let f = parts[1].sigmoid().context(TensorSnafu)?;
-    let g = parts[2].tanh().context(TensorSnafu)?;
-    let o = parts[3].sigmoid().context(TensorSnafu)?;
-
-    let new_c =
-        f.try_mul(c).context(TensorSnafu)?.try_add(&i.try_mul(&g).context(TensorSnafu)?).context(TensorSnafu)?;
-    let new_h = o.try_mul(&new_c.tanh().context(TensorSnafu)?).context(TensorSnafu)?;
-    Ok((new_h, new_c))
-}
-
 // ─── SentencePiece tokenizer loader ───────────────────────────────────────
 
 /// Minimal subset of the SentencePiece `ModelProto` schema needed to read
@@ -606,26 +543,48 @@ use super::{RnntJointStepJit, RnntPredictorStepJit};
 /// per-frame inner loop. JIT plans (the heavy ones — predictor + joint) are
 /// prepared once at construction and reused; the only per-step overhead is
 /// the buffer-pack / execute / read-out cycle.
+impl crate::jit::RecurrentJit for RnntPredictorStepJit {
+    fn pack_state(&mut self, s: &crate::jit::LstmState) -> crate::jit::Result<()> {
+        {
+            let buf = self.h_in_mut()?;
+            let mut view = buf.as_array_mut::<f32>().context(crate::jit::DeviceSnafu)?;
+            view.as_slice_mut().expect("contiguous h_in").copy_from_slice(&s.h);
+        }
+        {
+            let buf = self.c_in_mut()?;
+            let mut view = buf.as_array_mut::<f32>().context(crate::jit::DeviceSnafu)?;
+            view.as_slice_mut().expect("contiguous c_in").copy_from_slice(&s.c);
+        }
+        Ok(())
+    }
+
+    fn execute_step(&mut self) -> crate::jit::Result<()> {
+        self.execute()
+    }
+
+    fn output_buffer(&self) -> crate::jit::Result<&morok_device::Buffer> {
+        self.output()
+    }
+}
+
 pub struct RnntStepBackend {
-    predictor_jit: RnntPredictorStepJit,
+    /// Predictor JIT + active (post-step) LSTM state, flat layout `[L * P]`
+    /// row-major. Active state is overwritten by every step; the search loop
+    /// reads it via [`commit`](JointStep::commit) on non-blank emission.
+    predictor: crate::jit::JitRecurrent<RnntPredictorStepJit>,
     joint_jit: RnntJointStepJit,
 
-    /// Latest committed LSTM hidden state, flat layout `[L * P]` row-major
-    /// (layer-major). Reset to zeros at the start of each utterance.
-    committed_h: Vec<f32>,
-    committed_c: Vec<f32>,
-    /// Post-step LSTM state stash. The search loop calls `commit` to promote
-    /// these into `committed_*` on a non-blank emission.
-    tentative_h: Vec<f32>,
-    tentative_c: Vec<f32>,
+    /// Last accepted LSTM state. Copied into the predictor's active state
+    /// before every [`step`](JointStep::step) so the JIT sees the committed
+    /// prefix; [`commit`](JointStep::commit) copies the post-step active state
+    /// back here.
+    committed: crate::jit::LstmState,
     /// Last predictor `g` output (`[P]`). Stashed here so we can drop the
     /// predictor's output borrow before mutably accessing the joint JIT's
     /// input buffer.
     g_tentative: Vec<f32>,
 
     blank_id: usize,
-    pred_hidden: usize,
-    pred_rnn_layers: usize,
     enc_hidden: usize,
     total_vocab: usize,
 
@@ -672,46 +631,25 @@ impl RnntStepBackend {
         let enc_hidden = model.config.d_model;
         let lp = pred_rnn_layers * pred_hidden;
 
-        // Placeholder inputs for `prepare()`. Shape and dtype must match the
-        // tensors we'll feed each step. JIT captures their buffer ids and
-        // reuses them as in-place input slots.
-        let mut prev_token = Tensor::full(&[1, 1], blank_id as i64, DType::Int64)
-            .map_err(|e| crate::jit::JitError::Tensor { source: Box::new(e) })?;
-        prev_token.realize().map_err(|e| crate::jit::JitError::Tensor { source: Box::new(e) })?;
-
-        let mut h_in = Tensor::full(&[pred_rnn_layers, 1, pred_hidden], 0.0f32, DType::Float32)
-            .map_err(|e| crate::jit::JitError::Tensor { source: Box::new(e) })?;
-        h_in.realize().map_err(|e| crate::jit::JitError::Tensor { source: Box::new(e) })?;
-
-        let mut c_in = Tensor::full(&[pred_rnn_layers, 1, pred_hidden], 0.0f32, DType::Float32)
-            .map_err(|e| crate::jit::JitError::Tensor { source: Box::new(e) })?;
-        c_in.realize().map_err(|e| crate::jit::JitError::Tensor { source: Box::new(e) })?;
-
-        let mut enc_t = Tensor::full(&[1, 1, enc_hidden], 0.0f32, DType::Float32)
-            .map_err(|e| crate::jit::JitError::Tensor { source: Box::new(e) })?;
-        enc_t.realize().map_err(|e| crate::jit::JitError::Tensor { source: Box::new(e) })?;
-
-        let mut g = Tensor::full(&[1, 1, pred_hidden], 0.0f32, DType::Float32)
-            .map_err(|e| crate::jit::JitError::Tensor { source: Box::new(e) })?;
-        g.realize().map_err(|e| crate::jit::JitError::Tensor { source: Box::new(e) })?;
-
+        // JIT-input shapes. The macro allocates zero-initialized placeholder
+        // buffers internally; per-step values are written via `<input>_mut()`.
+        use crate::jit::InputSpec;
         let mut predictor_jit = RnntPredictorStepJit::new(Arc::clone(&model));
-        predictor_jit.prepare(&prev_token, &h_in, &c_in)?;
+        predictor_jit.prepare(
+            InputSpec::i64(&[1, 1]),
+            InputSpec::f32(&[pred_rnn_layers, 1, pred_hidden]),
+            InputSpec::f32(&[pred_rnn_layers, 1, pred_hidden]),
+        )?;
 
         let mut joint_jit = RnntJointStepJit::new(Arc::clone(&model));
-        joint_jit.prepare(&enc_t, &g)?;
+        joint_jit.prepare(InputSpec::f32(&[1, 1, enc_hidden]), InputSpec::f32(&[1, 1, pred_hidden]))?;
 
         Ok(Self {
-            predictor_jit,
+            predictor: crate::jit::JitRecurrent::new(predictor_jit, crate::jit::LstmState::zeros(lp), pred_hidden)?,
             joint_jit,
-            committed_h: vec![0.0f32; lp],
-            committed_c: vec![0.0f32; lp],
-            tentative_h: vec![0.0f32; lp],
-            tentative_c: vec![0.0f32; lp],
+            committed: crate::jit::LstmState::zeros(lp),
             g_tentative: vec![0.0f32; pred_hidden],
             blank_id,
-            pred_hidden,
-            pred_rnn_layers,
             enc_hidden,
             total_vocab,
             stats: StepStats::default(),
@@ -739,97 +677,73 @@ impl JointStep for RnntStepBackend {
         debug_assert_eq!(encoder_frame.len(), self.enc_hidden);
         debug_assert_eq!(logits_out.len(), self.total_vocab);
 
+        let tok_value = prev_token.unwrap_or(self.blank_id) as i64;
+
+        // ── Predictor phase ──────────────────────────────────────────────
+        // Copy committed state → predictor's active state, run one JIT step,
+        // copy the resulting `g` head into our own buffer (so the JIT output
+        // borrow ends before we mutate the joint JIT).
+        let t_state_copy = std::time::Instant::now();
+        self.predictor.state_mut().h.copy_from_slice(&self.committed.h);
+        self.predictor.state_mut().c.copy_from_slice(&self.committed.c);
+        let state_copy = t_state_copy.elapsed();
+
+        let g = self.predictor.step(|jit| {
+            let buf = jit.prev_token_mut()?;
+            let mut view = buf.as_array_mut::<i64>().context(crate::jit::DeviceSnafu)?;
+            view.as_slice_mut().expect("contiguous prev_token")[0] = tok_value;
+            Ok(())
+        })?;
+        let t_g_copy = std::time::Instant::now();
+        self.g_tentative.copy_from_slice(g);
+        let g_copy = t_g_copy.elapsed();
+        let pred_timing = self.predictor.last_timing.clone();
+
+        // ── Joint phase ──────────────────────────────────────────────────
         let t0 = std::time::Instant::now();
-        // 1. Pack prev_token (or blank_id) into the predictor's prev_token input.
-        {
-            let buf = self.predictor_jit.prev_token_mut()?;
-            let mut view =
-                buf.as_array_mut::<i64>().map_err(|e| crate::jit::JitError::Build { source: Box::new(e) })?;
-            let slice = view.as_slice_mut().expect("contiguous prev_token");
-            slice[0] = prev_token.unwrap_or(self.blank_id) as i64;
-        }
-        // 2. Pack committed h, c into predictor inputs.
-        {
-            let buf = self.predictor_jit.h_in_mut()?;
-            let mut view =
-                buf.as_array_mut::<f32>().map_err(|e| crate::jit::JitError::Build { source: Box::new(e) })?;
-            view.as_slice_mut().expect("contiguous h_in").copy_from_slice(&self.committed_h);
-        }
-        {
-            let buf = self.predictor_jit.c_in_mut()?;
-            let mut view =
-                buf.as_array_mut::<f32>().map_err(|e| crate::jit::JitError::Build { source: Box::new(e) })?;
-            view.as_slice_mut().expect("contiguous c_in").copy_from_slice(&self.committed_c);
-        }
-        let t1 = std::time::Instant::now();
-        // 3. Execute predictor.
-        self.predictor_jit.execute()?;
-        let t2 = std::time::Instant::now();
-
-        // 4. Read predictor output and split into g | h_out | c_out. Copy
-        //    everything into self-owned buffers so the predictor's output
-        //    borrow ends before we touch the joint JIT.
-        {
-            let out = self.predictor_jit.output()?;
-            let arr = out.as_array::<f32>().map_err(|e| crate::jit::JitError::Build { source: Box::new(e) })?;
-            let flat = arr.as_slice().expect("contiguous predictor output");
-            let p = self.pred_hidden;
-            let lp = self.pred_rnn_layers * self.pred_hidden;
-            debug_assert_eq!(flat.len(), p + 2 * lp);
-            self.g_tentative.copy_from_slice(&flat[..p]);
-            self.tentative_h.copy_from_slice(&flat[p..p + lp]);
-            self.tentative_c.copy_from_slice(&flat[p + lp..p + 2 * lp]);
-        }
-        let t3 = std::time::Instant::now();
-
-        // 5. Pack enc_t and g into joint inputs.
         {
             let buf = self.joint_jit.enc_t_mut()?;
-            let mut view =
-                buf.as_array_mut::<f32>().map_err(|e| crate::jit::JitError::Build { source: Box::new(e) })?;
+            let mut view = buf.as_array_mut::<f32>().context(crate::jit::DeviceSnafu)?;
             view.as_slice_mut().expect("contiguous enc_t").copy_from_slice(encoder_frame);
         }
         {
             let buf = self.joint_jit.g_mut()?;
-            let mut view =
-                buf.as_array_mut::<f32>().map_err(|e| crate::jit::JitError::Build { source: Box::new(e) })?;
+            let mut view = buf.as_array_mut::<f32>().context(crate::jit::DeviceSnafu)?;
             view.as_slice_mut().expect("contiguous g").copy_from_slice(&self.g_tentative);
         }
-        let t4 = std::time::Instant::now();
-        // 6. Execute joint.
+        let t1 = std::time::Instant::now();
         self.joint_jit.execute()?;
-        let t5 = std::time::Instant::now();
-
-        // 7. Copy log-probs into the caller's slice.
+        let t2 = std::time::Instant::now();
         {
             let out = self.joint_jit.output()?;
-            let arr = out.as_array::<f32>().map_err(|e| crate::jit::JitError::Build { source: Box::new(e) })?;
+            let arr = out.as_array::<f32>().context(crate::jit::DeviceSnafu)?;
             let flat = arr.as_slice().expect("contiguous joint output");
             // `flat.len() == 1 * 1 * total_vocab` for the [1, 1, V+1] joint output.
             logits_out.copy_from_slice(&flat[..self.total_vocab]);
         }
-        let t6 = std::time::Instant::now();
+        let t3 = std::time::Instant::now();
 
         self.stats.n_steps += 1;
-        self.stats.t_pred_pack += t1 - t0;
-        self.stats.t_pred_exec += t2 - t1;
-        self.stats.t_pred_read += t3 - t2;
-        self.stats.t_joint_pack += t4 - t3;
-        self.stats.t_joint_exec += t5 - t4;
-        self.stats.t_joint_read += t6 - t5;
+        self.stats.t_pred_pack += pred_timing.pack + state_copy;
+        self.stats.t_pred_exec += pred_timing.exec;
+        self.stats.t_pred_read += pred_timing.read + g_copy;
+        self.stats.t_joint_pack += t1 - t0;
+        self.stats.t_joint_exec += t2 - t1;
+        self.stats.t_joint_read += t3 - t2;
         Ok(())
     }
 
     fn commit(&mut self) {
         self.stats.n_commits += 1;
-        std::mem::swap(&mut self.committed_h, &mut self.tentative_h);
-        std::mem::swap(&mut self.committed_c, &mut self.tentative_c);
+        let state = self.predictor.state_mut();
+        self.committed.h.copy_from_slice(&state.h);
+        self.committed.c.copy_from_slice(&state.c);
     }
 
     fn reset(&mut self) {
         self.stats.n_resets += 1;
-        self.committed_h.fill(0.0);
-        self.committed_c.fill(0.0);
+        self.committed.reset();
+        self.predictor.reset();
     }
 }
 

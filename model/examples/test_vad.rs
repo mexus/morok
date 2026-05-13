@@ -1,4 +1,4 @@
-use morok_model::vad::{SileroVad, VadInference};
+use morok_model::silero_vad::{SileroVad, VadInference};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Loading Silero VAD...");

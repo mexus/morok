@@ -272,6 +272,16 @@ impl Tensor {
         scalar.try_reshape(vec![1; shape.len()])?.try_expand(&expand_shape)
     }
 
+    /// Create a zero-filled tensor with the given concrete shape.
+    pub fn zeros(shape: &[usize], dtype: DType) -> Result<Self> {
+        Self::full(shape, ConstValue::zero(dtype.base()), dtype)
+    }
+
+    /// Create a one-filled tensor with the given concrete shape.
+    pub fn ones(shape: &[usize], dtype: DType) -> Result<Self> {
+        Self::full(shape, ConstValue::one(dtype.base()), dtype)
+    }
+
     /// Create a tensor filled with a constant value, using symbolic (dynamic) dimensions.
     ///
     /// Dimensions can be concrete (`SInt::Const`) or symbolic (`SInt::Symbolic`
