@@ -1888,6 +1888,7 @@ dependencies = [
  "prost",
  "realfft",
  "safetensors",
+ "serde",
  "serde_json",
  "snafu 0.9.0",
  "tempfile",

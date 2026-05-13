@@ -1,19 +1,21 @@
 use morok_dtype::DType;
 use morok_ir::SInt;
-use morok_tensor::Tensor;
+use morok_tensor::{BoundVariable, Tensor};
 use snafu::ResultExt;
 
+use crate::audio::{MelConfig, MelSpectrogram};
 use crate::state::{HasStateDict, StateDict, get_tensor, prefixed};
 
-use super::error::TensorSnafu;
+use super::error::{StateSnafu, TensorSnafu};
+use super::rope::build_rope_cache;
 use super::{ConvNormType, GigaAmConfig, SubsamplingMode};
 
 fn zeros(shape: &[usize]) -> Tensor {
-    Tensor::full(shape, 0.0, DType::Float32).unwrap()
+    Tensor::zeros(shape, DType::Float32).unwrap()
 }
 
 fn ones(shape: &[usize]) -> Tensor {
-    Tensor::full(shape, 1.0, DType::Float32).unwrap()
+    Tensor::ones(shape, DType::Float32).unwrap()
 }
 
 type Result<T> = super::Result<T>;
@@ -628,4 +630,220 @@ impl HasStateDict for ConformerLayer {
         self.final_norm.load_state_dict(sd, &prefixed(prefix, "final_norm"))?;
         Ok(())
     }
+}
+
+// ---------------------------------------------------------------------------
+// Encoder — audio preprocessor + Conformer backbone
+// ---------------------------------------------------------------------------
+
+/// Audio preprocessor + Conformer encoder. Shared by `GigaAm` (CTC) and
+/// `GigaAmRnnt` (transducer); they layer different heads on top of the same
+/// encoder. Encoder-only path: `forward` for single-batch, `forward_batch`
+/// for batched JIT execution.
+pub struct Encoder {
+    pub mel: MelSpectrogram,
+    pub subsampling: StridingSubsampling,
+    pub layers: Vec<ConformerLayer>,
+    pub cos_cache: Tensor,
+    pub sin_cache: Tensor,
+    pub d_model: usize,
+    pub n_heads: usize,
+    pub max_encoder_frames: usize,
+}
+
+impl Encoder {
+    pub fn with_random_weights(config: &GigaAmConfig) -> Self {
+        let mel = MelSpectrogram::new(&MelConfig {
+            sample_rate: config.sample_rate,
+            n_fft: config.n_fft,
+            hop_length: config.hop_length,
+            win_length: config.win_length,
+            n_mels: config.n_mels,
+            center: config.mel_center,
+        });
+        let (cos_cache, sin_cache) = build_rope_cache(config);
+        let subsampling = StridingSubsampling::empty(config);
+        let layers = (0..config.n_layers).map(|_| ConformerLayer::empty(config)).collect();
+        Self {
+            mel,
+            subsampling,
+            layers,
+            cos_cache,
+            sin_cache,
+            d_model: config.d_model,
+            n_heads: config.n_heads,
+            max_encoder_frames: config.max_encoder_frames,
+        }
+    }
+
+    /// dtype the encoder operates in. Read off the first subsampling
+    /// conv weight (the model's compute dtype is determined by the
+    /// weights it was loaded with). Falls back to f32 when the weight
+    /// isn't itself a float type — should never happen in practice but
+    /// avoids producing an integer dtype here.
+    pub fn input_dtype(&self) -> DType {
+        let dtype = self.subsampling.conv1_weight.uop().dtype();
+        if dtype.is_float() { dtype } else { DType::Float32 }
+    }
+
+    /// Encoder pass on a single mel batch with no padding mask.
+    /// Input: tensor `[B, n_mels, T]`. Output: lazy tensor `[B, d_model, T/4]`.
+    pub fn forward(&self, mel: &Tensor) -> Result<Tensor> {
+        let x = mel.try_transpose(-1, -2).context(TensorSnafu)?;
+        let x = x.cast(self.input_dtype()).context(TensorSnafu)?;
+        let x = self.subsampling.forward(&x)?;
+
+        let shape = x.shape().context(TensorSnafu)?;
+        let seq_len = shape[1].clone();
+
+        let d_half = self.d_model / self.n_heads / 2;
+
+        let cos = self
+            .cos_cache
+            .try_shrink([
+                (SInt::Const(0), seq_len.clone()),
+                (SInt::Const(0), SInt::Const(1)),
+                (SInt::Const(0), SInt::Const(1)),
+                (SInt::Const(0), SInt::Const(d_half)),
+            ])
+            .context(TensorSnafu)?;
+        let sin = self
+            .sin_cache
+            .try_shrink([
+                (SInt::Const(0), seq_len.clone()),
+                (SInt::Const(0), SInt::Const(1)),
+                (SInt::Const(0), SInt::Const(1)),
+                (SInt::Const(0), SInt::Const(d_half)),
+            ])
+            .context(TensorSnafu)?;
+
+        let mut x = x;
+        for layer in &self.layers {
+            x = layer.forward(&x, &cos, &sin, None, None)?;
+        }
+
+        x.try_transpose(-1, -2).context(TensorSnafu)
+    }
+
+    /// Batched encoder path with dynamic batch and mel-frame length.
+    /// Input: `mel` `[B, n_mels, T_mel]`, `lengths` `[B]` valid lengths in mel frames.
+    /// Output: `[B, d_model, T_sub]`.
+    pub fn forward_batch(
+        &self,
+        mel: &Tensor,
+        lengths: &Tensor,
+        batch: &BoundVariable,
+        mel_len: &BoundVariable,
+    ) -> Result<Tensor> {
+        let b = batch.as_sint();
+        let t_mel = mel_len.as_sint();
+
+        let lengths = lengths.try_shrink([Some((SInt::Const(0), b.clone()))]).context(TensorSnafu)?;
+        let lengths = lengths.cast(DType::Index).context(TensorSnafu)?;
+
+        let two_t = Tensor::const_(2i64, DType::Index);
+        let one_t = Tensor::const_(1i64, DType::Index);
+
+        let mut lengths_sub = lengths;
+        for _ in 0..2 {
+            lengths_sub = lengths_sub.try_add(&one_t).context(TensorSnafu)?.try_div(&two_t).context(TensorSnafu)?;
+        }
+
+        let mel = mel
+            .try_shrink([Some((SInt::Const(0), b.clone())), None, Some((SInt::Const(0), t_mel))])
+            .context(TensorSnafu)?;
+        let x = mel.try_transpose(-1, -2).context(TensorSnafu)?;
+        let x = x.cast(self.input_dtype()).context(TensorSnafu)?;
+        let x = self.subsampling.forward(&x)?;
+
+        let shape = x.shape().context(TensorSnafu)?;
+        let t_sub = shape[1].clone();
+
+        let range = Tensor::arange(self.max_encoder_frames as i64, None, None).context(TensorSnafu)?;
+        let range = range.cast(DType::Index).context(TensorSnafu)?;
+        let range = range.try_shrink([(SInt::Const(0), t_sub.clone())]).context(TensorSnafu)?;
+        let range = range.try_reshape([SInt::Const(1), t_sub.clone()]).context(TensorSnafu)?;
+        let lens = lengths_sub;
+        let lens = lens.try_reshape([b.clone(), SInt::Const(1)]).context(TensorSnafu)?;
+        let pad_valid = range.try_lt(&lens).context(TensorSnafu)?;
+
+        let pv1 = pad_valid.try_unsqueeze(1).context(TensorSnafu)?;
+        let pv2 = pad_valid.try_unsqueeze(2).context(TensorSnafu)?;
+        let att_mask = Some(
+            pv1.bitwise_and(&pv2)
+                .context(TensorSnafu)?
+                .logical_not()
+                .context(TensorSnafu)?
+                .try_unsqueeze(1)
+                .context(TensorSnafu)?,
+        );
+        let pad_mask = pad_valid.logical_not().context(TensorSnafu)?;
+
+        let d_half = self.d_model / self.n_heads / 2;
+        let cos = self
+            .cos_cache
+            .try_shrink([
+                (SInt::Const(0), t_sub.clone()),
+                (SInt::Const(0), SInt::Const(1)),
+                (SInt::Const(0), SInt::Const(1)),
+                (SInt::Const(0), SInt::Const(d_half)),
+            ])
+            .context(TensorSnafu)?;
+        let sin = self
+            .sin_cache
+            .try_shrink([
+                (SInt::Const(0), t_sub.clone()),
+                (SInt::Const(0), SInt::Const(1)),
+                (SInt::Const(0), SInt::Const(1)),
+                (SInt::Const(0), SInt::Const(d_half)),
+            ])
+            .context(TensorSnafu)?;
+
+        let mut x = x;
+        for layer in &self.layers {
+            x = layer.forward(&x, &cos, &sin, att_mask.as_ref(), Some(&pad_mask))?;
+        }
+
+        x.try_transpose(-1, -2).context(TensorSnafu)
+    }
+
+    pub fn subsampling_output_length(&self, mel_frames: usize) -> usize {
+        self.subsampling.output_length(mel_frames)
+    }
+}
+
+/// Construct an `Encoder` from an already-remapped state dict + config.
+/// Shared by `GigaAm::from_state_dict` (in `ctc/model.rs`) and
+/// `GigaAmRnnt::from_state_dict` (in `rnnt/model.rs`).
+pub(crate) fn build_encoder_from_sd(sd: &StateDict, config: &GigaAmConfig) -> Result<Encoder> {
+    let mel = MelSpectrogram::new(&MelConfig {
+        sample_rate: config.sample_rate,
+        n_fft: config.n_fft,
+        hop_length: config.hop_length,
+        win_length: config.win_length,
+        n_mels: config.n_mels,
+        center: config.mel_center,
+    });
+    let (cos_cache, sin_cache) = build_rope_cache(config);
+
+    let mut subsampling = StridingSubsampling::empty(config);
+    subsampling.load_state_dict(sd, "subsampling").context(StateSnafu)?;
+
+    let mut layers = Vec::with_capacity(config.n_layers);
+    for i in 0..config.n_layers {
+        let mut layer = ConformerLayer::empty(config);
+        layer.load_state_dict(sd, &format!("layers.{i}")).context(StateSnafu)?;
+        layers.push(layer);
+    }
+
+    Ok(Encoder {
+        mel,
+        subsampling,
+        layers,
+        cos_cache,
+        sin_cache,
+        d_model: config.d_model,
+        n_heads: config.n_heads,
+        max_encoder_frames: config.max_encoder_frames,
+    })
 }

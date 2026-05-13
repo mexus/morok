@@ -1,18 +1,17 @@
+//! CTC projection head: `Conv1d(d_model, vocab_size, k=1)` + transpose +
+//! `LogSoftmax`. Produces the `[B, T, vocab_size]` log-probabilities consumed
+//! by `morok_arch::ctc` decoders — the head itself is just the final
+//! projection layer, not the decoder.
+
 use morok_dtype::DType;
 use morok_tensor::Tensor;
 use snafu::ResultExt;
 
 use crate::state::{HasStateDict, StateDict, get_tensor, prefixed};
 
-use super::GigaAmConfig;
-use super::error::TensorSnafu;
+use crate::gigaam::error::TensorSnafu;
+use crate::gigaam::{GigaAmConfig, Result};
 
-type Result<T> = super::Result<T>;
-
-/// CTC projection head: `Conv1d(d_model, vocab_size, k=1)` + transpose +
-/// `LogSoftmax`. Produces the `[B, T, vocab_size]` log-probabilities consumed
-/// by `morok_arch::ctc` decoders — the head itself is just the final
-/// projection layer, not the decoder.
 pub struct CTCHead {
     pub weight: Tensor, // [vocab_size, d_model, 1]
     pub bias: Tensor,   // [vocab_size]
@@ -21,8 +20,8 @@ pub struct CTCHead {
 impl CTCHead {
     pub fn empty(config: &GigaAmConfig) -> Self {
         Self {
-            weight: Tensor::full(&[config.vocab_size, config.d_model, 1], 0.0, DType::Float32).unwrap(),
-            bias: Tensor::full(&[config.vocab_size], 0.0, DType::Float32).unwrap(),
+            weight: Tensor::zeros(&[config.vocab_size, config.d_model, 1], DType::Float32).unwrap(),
+            bias: Tensor::zeros(&[config.vocab_size], DType::Float32).unwrap(),
         }
     }
 
