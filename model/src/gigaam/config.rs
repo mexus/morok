@@ -20,16 +20,19 @@ use snafu::ResultExt;
 
 use super::error::{ConfigIoSnafu, ConfigSnafu, Error, Result};
 
+#[derive(Clone)]
 pub enum SubsamplingMode {
     Conv1d,
     Conv2d,
 }
 
+#[derive(Clone)]
 pub enum ConvNormType {
     LayerNorm,
     BatchNorm,
 }
 
+#[derive(Clone)]
 pub struct GigaAmConfig {
     pub max_batch_size: usize,
     pub n_mels: usize,

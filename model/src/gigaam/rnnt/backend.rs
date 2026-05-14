@@ -7,7 +7,6 @@
 //! prepared once at construction and reused; the only per-step overhead is
 //! the buffer-pack / execute / read-out cycle.
 
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use morok_arch::rnnt::JointStep;
@@ -96,10 +95,11 @@ impl StepStats {
 }
 
 impl RnntStepBackend {
-    /// Build the backend from a shared model. Constructs predictor + joint
-    /// JIT plans (one of each) and zero state buffers. The model must carry
-    /// an RN-T head; CTC models are rejected.
-    pub fn from_model(model: Arc<GigaAm>) -> crate::jit::Result<Self> {
+    /// Build the backend from a model. `GigaAm` is cheap to clone (weights
+    /// are `Tensor` handles backed by shared `Arc<Buffer>`s) so the predictor
+    /// and joint JITs each take their own clone. The model must carry an
+    /// RN-T head; CTC models are rejected.
+    pub fn from_model(model: GigaAm) -> crate::jit::Result<Self> {
         let (rnnt_head, _) = model.head.as_rnnt().ok_or_else(|| JitError::Build {
             source: Box::new(crate::gigaam::Error::DecoderConfig {
                 message: "RnntStepBackend requires an RN-T head; this model has a CTC head".into(),
@@ -112,14 +112,14 @@ impl RnntStepBackend {
         let enc_hidden = model.config.d_model;
         let lp = pred_rnn_layers * pred_hidden;
 
-        let mut predictor_jit = RnntPredictorStepJit::new(Arc::clone(&model));
+        let mut predictor_jit = RnntPredictorStepJit::new(model.clone());
         predictor_jit.prepare(
             InputSpec::i64(&[1, 1]),
             InputSpec::f32(&[pred_rnn_layers, 1, pred_hidden]),
             InputSpec::f32(&[pred_rnn_layers, 1, pred_hidden]),
         )?;
 
-        let mut joint_jit = RnntJointStepJit::new(Arc::clone(&model));
+        let mut joint_jit = RnntJointStepJit::new(model);
         joint_jit.prepare(InputSpec::f32(&[1, 1, enc_hidden]), InputSpec::f32(&[1, 1, pred_hidden]))?;
 
         Ok(Self {

@@ -2,20 +2,19 @@
 //! joint each compiled as their own plan. The encoder JIT lives in the
 //! shared [`crate::gigaam::jit`] now.
 //!
-//! All step JITs take an `Arc<GigaAm>` and validate that the head is
+//! All step JITs take a [`GigaAm`] (cheap to clone — weights are shared
+//! via the underlying `Tensor` handle Arcs) and validate that the head is
 //! the RN-T variant in their build closure (returning a typed `Err` via
 //! `JitError::Build` if it isn't).
 
 extern crate self as morok_model;
-
-use std::sync::Arc;
 
 use morok_macros::jit_wrapper;
 
 use crate::gigaam::model::GigaAm;
 
 jit_wrapper! {
-    RnntPredictorStepJit(Arc<GigaAm>) {
+    RnntPredictorStepJit(GigaAm) {
         prev_token: Tensor,
         h_in: Tensor,
         c_in: Tensor,
@@ -30,7 +29,7 @@ jit_wrapper! {
 }
 
 jit_wrapper! {
-    RnntJointStepJit(Arc<GigaAm>) {
+    RnntJointStepJit(GigaAm) {
         enc_t: Tensor,
         g: Tensor,
 

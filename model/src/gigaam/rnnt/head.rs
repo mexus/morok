@@ -5,6 +5,7 @@ use crate::state::{self, HasStateDict, StateDict, prefixed};
 use super::joint::RnntJoint;
 use super::predictor::RnntPredictor;
 
+#[derive(Clone)]
 pub struct RnntHead {
     pub predictor: RnntPredictor,
     pub joint: RnntJoint,

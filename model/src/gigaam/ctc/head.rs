@@ -12,6 +12,7 @@ use crate::state::{HasStateDict, StateDict, get_tensor, prefixed};
 use crate::gigaam::error::TensorSnafu;
 use crate::gigaam::{GigaAmConfig, Result};
 
+#[derive(Clone)]
 pub struct CTCHead {
     pub weight: Tensor, // [vocab_size, d_model, 1]
     pub bias: Tensor,   // [vocab_size]

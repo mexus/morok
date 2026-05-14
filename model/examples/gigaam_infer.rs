@@ -19,7 +19,6 @@
 //! revision).
 
 use std::env;
-use std::sync::Arc;
 use std::time::Instant;
 
 use morok_model::gigaam::{GigaAm, TranscribeOpts, Transcriber};
@@ -36,8 +35,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Samples: {} ({:.1}s @ {} Hz)", waveform.len(), duration_s, sample_rate);
 
     println!("\nLoading GigaAM ({revision})...");
-    let model = Arc::new(GigaAm::from_hub_with_revision("vpermilp/GigaAM-v3", &revision)?);
-    let mut transcriber = Transcriber::new(Arc::clone(&model), opts.clone())?;
+    let model = GigaAm::from_hub_with_revision("vpermilp/GigaAM-v3", &revision)?;
+    let mut transcriber = Transcriber::new(model, opts.clone())?;
 
     println!("Transcribing...");
     let t_transcribe = Instant::now();

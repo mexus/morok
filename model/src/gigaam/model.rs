@@ -22,13 +22,14 @@ use crate::state::{self, HasStateDict, StateDict};
 
 use crate::gigaam::ctc::CTCHead;
 use crate::gigaam::encoder::{Encoder, build_encoder_from_sd};
-use crate::gigaam::error::{Error, HubSnafu, StateSnafu, TensorSnafu};
+use crate::gigaam::error::{Error, HubSnafu, StateSnafu};
 use crate::gigaam::rnnt::{RnntHead, load_sentencepiece_vocab};
 use crate::gigaam::{GigaAmConfig, Result, remap};
 
 /// Unified GigaAM model. The `head` enum carries either a CTC projection or
 /// an RN-T predictor+joint pair; pattern-match (or use [`Head::as_ctc`] /
 /// [`Head::as_rnnt`]) to drive the head-specific inference path.
+#[derive(Clone)]
 pub struct GigaAm {
     pub config: GigaAmConfig,
     pub encoder: Encoder,
@@ -39,6 +40,7 @@ pub struct GigaAm {
 /// `morok_arch::ctc` decoders. `Rnnt` holds the predictor+joint pair plus
 /// the runtime metadata (vocab, max-symbols-per-step, SP flag) used by the
 /// arch's `JointStep`-driven decoder.
+#[derive(Clone)]
 pub enum Head {
     Ctc(CTCHead),
     Rnnt { head: RnntHead, runtime: RnntRuntime },
@@ -46,6 +48,7 @@ pub enum Head {
 
 /// RN-T-only runtime metadata. Lives inside [`Head::Rnnt`] so the CTC path
 /// stays free of fields it would never use.
+#[derive(Clone)]
 pub struct RnntRuntime {
     /// Token strings indexed by predictor class. Length is `num_classes - 1`
     /// (the last class is the blank, not a vocabulary entry).
@@ -237,17 +240,5 @@ impl GigaAm {
 
     pub fn subsampling_output_length(&self, mel_frames: usize) -> usize {
         self.encoder.subsampling_output_length(mel_frames)
-    }
-
-    /// Full CTC pipeline: waveform → mel → encoder → head log-probs. Panics
-    /// if the model has an RN-T head; the RN-T path runs through the search
-    /// loop, not a single forward call.
-    pub fn forward_ctc(&self, waveform: &[f32], mel_tensor: &mut Tensor) -> Result<Tensor> {
-        {
-            let mut view = mel_tensor.array_view_mut::<f32>().context(TensorSnafu)?;
-            self.encoder.mel.forward_into(waveform, &mut view);
-        }
-        let encoded = self.encode(mel_tensor)?;
-        self.head.ctc().forward(&encoded)
     }
 }

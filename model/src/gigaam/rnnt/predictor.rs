@@ -23,6 +23,7 @@ use crate::gigaam::error::TensorSnafu;
 /// The LSTM stack reuses [`LSTMCell`] from `morok_tensor::nn`, which applies
 /// PyTorch's `[i, f, g, o]` gate order — matching the reference exactly so
 /// checkpoints load without gate-axis remapping.
+#[derive(Clone)]
 pub struct RnntPredictor {
     /// `[num_classes, pred_hidden]`. Row `blank_id` must be zeros.
     pub embed: Tensor,

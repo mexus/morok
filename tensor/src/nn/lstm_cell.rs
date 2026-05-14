@@ -11,6 +11,7 @@ type Result<T> = crate::Result<T>;
 /// `nn.LSTM`'s packing, so PyTorch checkpoints load without remapping.
 ///
 /// Not a [`Layer`](crate::nn::Layer) — cells take `(x, h, c)`, not a single tensor.
+#[derive(Clone)]
 pub struct LSTMCell {
     pub weight_ih: Tensor,
     pub weight_hh: Tensor,

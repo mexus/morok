@@ -15,6 +15,7 @@ use crate::gigaam::error::TensorSnafu;
 /// All Linear weights stored PyTorch-style `[out_features, in_features]` so
 /// they plug straight into the `linear()` builder (which transposes
 /// internally).
+#[derive(Clone)]
 pub struct RnntJoint {
     pub enc_w: Tensor,
     pub enc_b: Tensor,

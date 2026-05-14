@@ -17,7 +17,6 @@
 //!   MOROK_MAX_SCORES_MIB=N      SDPA scores buffer budget (default 256).
 
 use std::env;
-use std::sync::Arc;
 use std::time::Instant;
 
 use morok_model::gigaam::{GigaAm, TranscribeOpts, Transcriber};
@@ -36,14 +35,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Samples: {} ({:.1}s @ {} Hz)", waveform.len(), duration_s, sample_rate);
 
     println!("\nLoading GigaAM RNN-T from {repo} ({revision})...");
-    let model = Arc::new(GigaAm::from_hub_with_revision(&repo, &revision)?);
+    let model = GigaAm::from_hub_with_revision(&repo, &revision)?;
     if model.head.as_rnnt().is_none() {
         return Err(format!(
             "{repo}@{revision} has a CTC head, not RN-T. Set MOROK_RNNT_REVISION to an RN-T revision."
         )
         .into());
     }
-    let mut transcriber = Transcriber::new(Arc::clone(&model), opts.clone())?;
+    let mut transcriber = Transcriber::new(model, opts.clone())?;
 
     println!("Transcribing...");
     let t_transcribe = Instant::now();

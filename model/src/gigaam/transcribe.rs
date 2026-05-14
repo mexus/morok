@@ -13,8 +13,6 @@
 //! that RN-T needs (`[d_model, T_sub] → [T_sub, d_model]`), and the CTC
 //! `frames_to_words` grouping all live inside [`HeadDecoder`].
 
-use std::sync::Arc;
-
 use bon::bon;
 use morok_arch::ctc::CtcDecoder;
 use morok_arch::rnnt::{RnntDecoder, RnntOpts};
@@ -330,7 +328,7 @@ pub enum TranscribeError {
 /// cached `(max_batch, jit_t_mel)` plan if the new audio fits underneath;
 /// otherwise they tear down the JITs and re-prepare with the larger bounds.
 pub struct Transcriber {
-    model: Arc<GigaAm>,
+    model: GigaAm,
     opts: TranscribeOpts,
     mel: MelSpectrogram,
     vad: VadInference,
@@ -351,7 +349,11 @@ impl Transcriber {
     /// (CTC-only) head JIT are constructed lazily on the first
     /// [`transcribe`](Self::transcribe) call, since their bounds depend on
     /// the audio.
-    pub fn new(model: Arc<GigaAm>, opts: TranscribeOpts) -> Result<Self, TranscribeError> {
+    ///
+    /// `model` is consumed; the internal JITs each take their own
+    /// `model.clone()` (cheap — weights are shared via the underlying
+    /// `Tensor` handle Arcs).
+    pub fn new(model: GigaAm, opts: TranscribeOpts) -> Result<Self, TranscribeError> {
         let mel = MelSpectrogram::new(&MelConfig {
             sample_rate: model.config.sample_rate,
             n_fft: model.config.n_fft,
@@ -378,7 +380,7 @@ impl Transcriber {
                 HeadDecoder::Ctc { decoder }
             }
             Head::Rnnt { runtime, .. } => {
-                let backend = Box::new(RnntStepBackend::from_model(Arc::clone(&model)).context(JitSnafu)?);
+                let backend = Box::new(RnntStepBackend::from_model(model.clone()).context(JitSnafu)?);
                 let decoder = RnntDecoder::new(
                     runtime.vocabulary.clone(),
                     RnntOpts { max_symbols_per_step: runtime.max_symbols_per_step },
@@ -613,8 +615,7 @@ impl Transcriber {
         };
         let jit_t_sub = subs_output_length(subs_kernel_size, jit_t_mel);
 
-        let mut encoder_jit =
-            GigaAmEncoderJit::new(Arc::clone(&self.model)).with_b_bound(max_batch).with_t_bound(jit_t_mel);
+        let mut encoder_jit = GigaAmEncoderJit::new(self.model.clone()).with_b_bound(max_batch).with_t_bound(jit_t_mel);
         encoder_jit
             .prepare_with_config(
                 InputSpec::f32(&[max_batch, n_mels, jit_t_mel]),
@@ -625,8 +626,7 @@ impl Transcriber {
         self.encoder_jit = Some(encoder_jit);
 
         if matches!(self.head_decoder, HeadDecoder::Ctc { .. }) {
-            let mut head_jit =
-                CtcHeadJit::new(Arc::clone(&self.model)).with_b_bound(max_batch).with_t_sub_bound(jit_t_sub);
+            let mut head_jit = CtcHeadJit::new(self.model.clone()).with_b_bound(max_batch).with_t_sub_bound(jit_t_sub);
             head_jit
                 .prepare_with_config(InputSpec::f32(&[max_batch, d_model, jit_t_sub]), &self.prepare_config)
                 .context(JitSnafu)?;

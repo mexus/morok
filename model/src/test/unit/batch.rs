@@ -1,5 +1,3 @@
-use std::sync::Arc;
-
 use morok_arch::ctc::{CtcDecoder, GreedyDecoder};
 use morok_dtype::DType;
 use morok_tensor::{Tensor, Variable};
@@ -59,7 +57,7 @@ fn test_output_length_matches_forward() {
 #[test]
 fn test_batched_jit_prepare_and_execute() {
     let model = model_with_random_weights();
-    let mut jit = GigaAmEncoderJit::new(Arc::new(model));
+    let mut jit = GigaAmEncoderJit::new(model);
 
     let (b, t, n_mels) = (2, 10, test_config().n_mels);
     jit.prepare(crate::jit::InputSpec::f32(&[b, n_mels, t]), crate::jit::InputSpec::i32(&[b])).unwrap();
@@ -72,7 +70,7 @@ fn test_batched_jit_prepare_and_execute() {
 #[test]
 fn test_batched_jit_prepare_large_shape() {
     let model = model_with_random_weights();
-    let mut jit = GigaAmEncoderJit::new(Arc::new(model));
+    let mut jit = GigaAmEncoderJit::new(model);
 
     let cfg = test_config();
     jit.prepare(
@@ -92,7 +90,7 @@ fn test_batched_jit_t_bound_is_mel_frames() {
     let cfg = test_config();
     assert!(cfg.max_mel_frames > cfg.max_encoder_frames);
 
-    let mut jit = GigaAmEncoderJit::new(Arc::new(model));
+    let mut jit = GigaAmEncoderJit::new(model);
     jit.prepare(crate::jit::InputSpec::f32(&[1, cfg.n_mels, cfg.max_mel_frames]), crate::jit::InputSpec::i32(&[1]))
         .unwrap();
     jit.execute_with_vars(&[("b", 1), ("t", cfg.max_mel_frames as i64)]).unwrap();
@@ -102,7 +100,7 @@ fn test_batched_jit_t_bound_is_mel_frames() {
 fn test_batched_jit_rejects_t_above_max_mel_frames() {
     let model = model_with_random_weights();
     let cfg = test_config();
-    let mut jit = GigaAmEncoderJit::new(Arc::new(model));
+    let mut jit = GigaAmEncoderJit::new(model);
     jit.prepare(crate::jit::InputSpec::f32(&[1, cfg.n_mels, cfg.max_mel_frames]), crate::jit::InputSpec::i32(&[1]))
         .unwrap();
     let err = jit.execute_with_vars(&[("b", 1), ("t", cfg.max_mel_frames as i64 + 1)]).unwrap_err();
@@ -229,7 +227,7 @@ fn test_encode_batch_respects_dynamic_seq_len() {
     let cfg = test_config();
     let t_dynamic = 64usize;
 
-    let mut jit = GigaAmEncoderJit::new(Arc::new(model));
+    let mut jit = GigaAmEncoderJit::new(model);
     jit.prepare(
         crate::jit::InputSpec::f32(&[cfg.max_batch_size, cfg.n_mels, cfg.max_mel_frames]),
         crate::jit::InputSpec::i32(&[cfg.max_batch_size]),
@@ -258,7 +256,7 @@ fn test_with_b_bound_shrinks_upper_bound() {
     let model = model_with_random_weights();
     let cfg = test_config();
     // Default b range is [1, max_batch_size=8]. Shrink to [1, 2].
-    let mut jit = GigaAmEncoderJit::new(Arc::new(model)).with_b_bound(2);
+    let mut jit = GigaAmEncoderJit::new(model).with_b_bound(2);
     jit.prepare(crate::jit::InputSpec::f32(&[2, cfg.n_mels, 64]), crate::jit::InputSpec::i32(&[2])).unwrap();
     jit.execute_with_vars(&[("b", 2), ("t", 64)]).unwrap();
     // b=3 is now outside the shrunken bound even though config allowed up to 8.
@@ -270,7 +268,7 @@ fn test_with_t_fixed_specializes_kernels() {
     let model = model_with_random_weights();
     let cfg = test_config();
     let pinned_t = 64usize;
-    let mut jit = GigaAmEncoderJit::new(Arc::new(model)).with_t_fixed(pinned_t);
+    let mut jit = GigaAmEncoderJit::new(model).with_t_fixed(pinned_t);
     jit.prepare(crate::jit::InputSpec::f32(&[1, cfg.n_mels, pinned_t]), crate::jit::InputSpec::i32(&[1])).unwrap();
     // With `t` pinned at JIT time, the symbolic axis is folded to a const by the
     // trivial-range simplifier, so no compiled kernel should retain `t` as a
@@ -291,7 +289,7 @@ fn test_with_b_min_bound_raises_lower_bound() {
     let model = model_with_random_weights();
     let cfg = test_config();
     // Default b range is [1, 8]. Raise lower bound to 2.
-    let mut jit = GigaAmEncoderJit::new(Arc::new(model)).with_b_min_bound(2);
+    let mut jit = GigaAmEncoderJit::new(model).with_b_min_bound(2);
     jit.prepare(crate::jit::InputSpec::f32(&[2, cfg.n_mels, 64]), crate::jit::InputSpec::i32(&[2])).unwrap();
     jit.execute_with_vars(&[("b", 2), ("t", 64)]).unwrap();
     assert_runtime_bounds_err(jit.execute_with_vars(&[("b", 1), ("t", 64)]).unwrap_err());
@@ -301,5 +299,5 @@ fn test_with_b_min_bound_raises_lower_bound() {
 #[should_panic(expected = "with_b_bound(0) creates empty range")]
 fn test_with_b_bound_panics_on_empty_range() {
     let model = model_with_random_weights();
-    let _jit = GigaAmEncoderJit::new(Arc::new(model)).with_b_bound(0);
+    let _jit = GigaAmEncoderJit::new(model).with_b_bound(0);
 }

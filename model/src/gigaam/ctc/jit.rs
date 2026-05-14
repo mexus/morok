@@ -8,8 +8,6 @@
 
 extern crate self as morok_model;
 
-use std::sync::Arc;
-
 use morok_ir::SInt;
 use morok_macros::jit_wrapper;
 use snafu::ResultExt;
@@ -18,7 +16,7 @@ use crate::gigaam::error::TensorSnafu;
 use crate::gigaam::model::GigaAm;
 
 jit_wrapper! {
-    CtcHeadJit(Arc<GigaAm>) {
+    CtcHeadJit(GigaAm) {
         encoded: Tensor,
 
         vars {

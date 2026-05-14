@@ -3,7 +3,6 @@ use morok_ir::SInt;
 use morok_tensor::{BoundVariable, Tensor};
 use snafu::ResultExt;
 
-use crate::audio::{MelConfig, MelSpectrogram};
 use crate::state::{HasStateDict, StateDict, get_tensor, prefixed};
 
 use super::error::{StateSnafu, TensorSnafu};
@@ -25,6 +24,7 @@ type Result<T> = super::Result<T>;
 // ---------------------------------------------------------------------------
 
 /// Affine layer normalization: `layernorm(x) * weight + bias`.
+#[derive(Clone)]
 pub struct LayerNormWeights {
     pub weight: Tensor,
     pub bias: Tensor,
@@ -64,6 +64,7 @@ impl HasStateDict for LayerNormWeights {
 /// Conformer FFN: LayerNorm -> Linear(d->4d) -> SiLU -> Linear(4d->d).
 ///
 /// Does NOT apply residual or 0.5 scaling — caller handles that.
+#[derive(Clone)]
 pub struct FeedForward {
     pub norm: LayerNormWeights,
     pub linear1_weight: Tensor,
@@ -117,6 +118,7 @@ impl HasStateDict for FeedForward {
 // ---------------------------------------------------------------------------
 
 /// Multi-head self-attention with rotary position embeddings.
+#[derive(Clone)]
 pub struct MultiHeadSelfAttention {
     pub norm: LayerNormWeights,
     pub q_proj: Tensor,
@@ -256,6 +258,7 @@ impl HasStateDict for MultiHeadSelfAttention {
 // ConvModule
 // ---------------------------------------------------------------------------
 
+#[derive(Clone)]
 pub enum ConvNorm {
     LayerNorm(LayerNormWeights),
     BatchNorm { scale: Tensor, bias: Tensor, mean: Tensor, invstd: Tensor },
@@ -263,6 +266,7 @@ pub enum ConvNorm {
 
 /// Conformer convolution module:
 /// LayerNorm -> Conv1d(d,2d,k=1) -> GLU -> DepthwiseConv1d -> Norm -> SiLU -> Conv1d(d,d,k=1)
+#[derive(Clone)]
 pub struct ConvModule {
     pub norm: LayerNormWeights,
     pub pw1_weight: Tensor,
@@ -405,6 +409,7 @@ impl HasStateDict for ConvModule {
 /// - **conv2d**: `Conv2d(1→d, 3x3, stride=2)` x2 + `Linear(d * n_mels/4, d)`.
 ///
 /// Input: `[B, T, n_mels]` -> Output: `[B, T/4, d_model]`.
+#[derive(Clone)]
 pub struct StridingSubsampling {
     pub conv1_weight: Tensor,
     pub conv1_bias: Tensor,
@@ -565,6 +570,7 @@ impl HasStateDict for StridingSubsampling {
 
 /// One Conformer layer (Macaron-style):
 /// FFN1(x0.5) + MHSA + Conv + FFN2(x0.5) + LayerNorm
+#[derive(Clone)]
 pub struct ConformerLayer {
     pub ffn1: FeedForward,
     pub mhsa: MultiHeadSelfAttention,
@@ -640,8 +646,8 @@ impl HasStateDict for ConformerLayer {
 /// [`crate::gigaam::GigaAm`] (`Head::Ctc` and `Head::Rnnt` layer different
 /// heads on top of the same encoder). Encoder-only path: `forward` for
 /// single-batch, `forward_batch` for batched JIT execution.
+#[derive(Clone)]
 pub struct Encoder {
-    pub mel: MelSpectrogram,
     pub subsampling: StridingSubsampling,
     pub layers: Vec<ConformerLayer>,
     pub cos_cache: Tensor,
@@ -653,19 +659,10 @@ pub struct Encoder {
 
 impl Encoder {
     pub fn with_random_weights(config: &GigaAmConfig) -> Self {
-        let mel = MelSpectrogram::new(&MelConfig {
-            sample_rate: config.sample_rate,
-            n_fft: config.n_fft,
-            hop_length: config.hop_length,
-            win_length: config.win_length,
-            n_mels: config.n_mels,
-            center: config.mel_center,
-        });
         let (cos_cache, sin_cache) = build_rope_cache(config);
         let subsampling = StridingSubsampling::empty(config);
         let layers = (0..config.n_layers).map(|_| ConformerLayer::empty(config)).collect();
         Self {
-            mel,
             subsampling,
             layers,
             cos_cache,
@@ -815,14 +812,6 @@ impl Encoder {
 /// Construct an `Encoder` from an already-remapped state dict + config.
 /// Called from the unified [`crate::gigaam::GigaAm::from_state_dict`] loader.
 pub(crate) fn build_encoder_from_sd(sd: &StateDict, config: &GigaAmConfig) -> Result<Encoder> {
-    let mel = MelSpectrogram::new(&MelConfig {
-        sample_rate: config.sample_rate,
-        n_fft: config.n_fft,
-        hop_length: config.hop_length,
-        win_length: config.win_length,
-        n_mels: config.n_mels,
-        center: config.mel_center,
-    });
     let (cos_cache, sin_cache) = build_rope_cache(config);
 
     let mut subsampling = StridingSubsampling::empty(config);
@@ -836,7 +825,6 @@ pub(crate) fn build_encoder_from_sd(sd: &StateDict, config: &GigaAmConfig) -> Re
     }
 
     Ok(Encoder {
-        mel,
         subsampling,
         layers,
         cos_cache,
