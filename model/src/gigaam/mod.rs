@@ -28,6 +28,7 @@ mod model;
 pub(crate) mod remap;
 mod rnnt;
 mod rope;
+mod transcribe;
 
 pub use config::*;
 pub use ctc::*;
@@ -37,3 +38,4 @@ pub use jit::*;
 pub use model::*;
 pub use rnnt::*;
 pub use rope::*;
+pub use transcribe::*;

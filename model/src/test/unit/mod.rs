@@ -6,3 +6,4 @@ mod jit_recurrent;
 mod mel;
 mod remap;
 mod state;
+mod transcribe;
