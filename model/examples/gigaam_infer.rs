@@ -21,12 +21,13 @@
 //!                            stay under `2 × N MiB`. Default 256.
 
 use std::env;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use morok_arch::ctc::CtcDecoder;
 use morok_dtype::DType;
 use morok_model::audio::MelSpectrogram;
-use morok_model::gigaam::{GigaAm, GigaAmBatchedJit, SubsamplingMode};
+use morok_model::gigaam::{CtcHeadJit, GigaAm, GigaAmEncoderJit, SubsamplingMode};
 use morok_tensor::{PrepareConfig, Tensor};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -186,17 +187,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ─── JIT prepare ───────────────────────────────────────────────────────
     let t_prepare = Instant::now();
-    let mut jit = GigaAmBatchedJit::new(model).with_b_bound(max_batch).with_t_bound(jit_t_mel);
-    println!("Preparing batched JIT plan... [{max_batch}, {n_mels}, {jit_t_mel}]");
+    let model = Arc::new(model);
+    let d_model = model.config.d_model;
+    let jit_t_sub = subs_output_length(subs_kernel_size, jit_t_mel);
+    let mut encoder_jit = GigaAmEncoderJit::new(Arc::clone(&model)).with_b_bound(max_batch).with_t_bound(jit_t_mel);
+    let mut head_jit = CtcHeadJit::new(Arc::clone(&model)).with_b_bound(max_batch).with_t_sub_bound(jit_t_sub);
+    println!("Preparing encoder JIT plan... [{max_batch}, {n_mels}, {jit_t_mel}]");
     println!("AMX renderer {}", if amx_enabled { "enabled" } else { "disabled" });
     let prepare_config = PrepareConfig::from_env();
-    jit.prepare_with_config(
+    encoder_jit.prepare_with_config(
         morok_model::jit::InputSpec::f32(&[max_batch, n_mels, jit_t_mel]),
         morok_model::jit::InputSpec::i32(&[max_batch]),
         &prepare_config,
     )?;
+    println!("Preparing CTC head JIT plan... [{max_batch}, {d_model}, {jit_t_sub}]");
+    head_jit
+        .prepare_with_config(morok_model::jit::InputSpec::f32(&[max_batch, d_model, jit_t_sub]), &prepare_config)?;
     let dt_prepare = t_prepare.elapsed();
-    println!("Plan captured.");
+    println!("Plans captured.");
 
     // ─── Inference loop ────────────────────────────────────────────────────
     let t_loop = Instant::now();
@@ -205,9 +213,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let b = (num_chunks - chunk_batch_start).min(max_batch);
         let mut chunk_lengths = vec![0usize; b];
 
-        // Pack mel slices + valid lengths into the JIT-owned input buffers.
+        // Pack mel slices + valid lengths into the encoder's input buffers.
         {
-            let mut view = jit.mel_mut()?.as_array_mut::<f32>()?;
+            let mut view = encoder_jit.mel_mut()?.as_array_mut::<f32>()?;
             let slice = view.as_slice_mut().expect("contiguous");
             slice.fill(0.0);
             for (bi, chunk_len) in chunk_lengths.iter_mut().enumerate() {
@@ -221,7 +229,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         {
-            let mut view = jit.lengths_mut()?.as_array_mut::<i32>()?;
+            let mut view = encoder_jit.lengths_mut()?.as_array_mut::<i32>()?;
             let slice = view.as_slice_mut().expect("contiguous");
             slice.fill(0);
             for (i, len) in chunk_lengths.iter().enumerate() {
@@ -229,13 +237,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        // Execute with the actual batch shape (b, t) for this iteration.
+        // Execute encoder with the actual batch shape (b, t) for this iteration.
         let t_exec = chunk_lengths.iter().copied().max().unwrap_or(1).max(1);
         let t_exec_sub = subs_output_length(subs_kernel_size, t_exec);
-        jit.execute_with_vars(&[("b", b as i64), ("t", t_exec as i64)])?;
+        encoder_jit.execute_with_vars(&[("b", b as i64), ("t", t_exec as i64)])?;
+
+        // Forward the encoder output into the head's input buffer. The encoder
+        // output buffer is flat 1D (kernel-packed at the dynamic stride
+        // `[b, d_model, t_exec_sub]`); the head input keeps the static 3D
+        // shape `[max_batch, d_model, jit_t_sub]` from `prepare()`. Reshape
+        // the source view to 3D and let ndarray cross-stride the assign into
+        // the destination's matching sub-slice.
+        {
+            let n = b * d_model * t_exec_sub;
+            let src_flat = encoder_jit.output()?.as_array::<f32>()?;
+            let src_3d = src_flat
+                .slice(ndarray::s![0..n])
+                .into_shape_with_order((b, d_model, t_exec_sub))
+                .expect("encoder output reshape");
+            let dst_flat = head_jit.encoded_mut()?.as_array_mut::<f32>()?;
+            let mut dst_3d =
+                dst_flat.into_shape_with_order((max_batch, d_model, jit_t_sub)).expect("head input reshape");
+            dst_3d.slice_mut(ndarray::s![0..b, 0..d_model, 0..t_exec_sub]).assign(&src_3d);
+        }
+        head_jit.execute_with_vars(&[("b", b as i64), ("t_sub", t_exec_sub as i64)])?;
 
         // Decode per batch item.
-        let logits_array = jit.output()?.as_array::<f32>().expect("failed to read output logits");
+        let logits_array = head_jit.output()?.as_array::<f32>().expect("failed to read output logits");
         let logits_slice = logits_array.as_slice().expect("contiguous output logits");
         let item_stride = t_exec_sub * total_vocab;
         for (bi, mel_len) in chunk_lengths.iter().enumerate() {

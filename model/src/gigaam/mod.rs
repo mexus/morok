@@ -1,8 +1,16 @@
-//! GigaAM ASR model wrappers.
+//! GigaAM ASR model.
 //!
-//! Two head variants share the same Conformer encoder:
-//! - [`ctc`] — `GigaAm` + `CTCHead`, decoded via `morok_arch::ctc`.
-//! - [`rnnt`] — `GigaAmRnnt` + `RnntHead`, decoded via `morok_arch::rnnt`.
+//! One [`GigaAm`] struct wraps a shared Conformer encoder and a [`Head`] enum
+//! that carries either a CTC projection (`Head::Ctc`) or an RN-T predictor +
+//! joint pair (`Head::Rnnt`). The head variant is auto-detected from
+//! `config.transducer.is_some()` at load time, so users construct the model
+//! once and the head flows through the type system.
+//!
+//! Submodules:
+//! - [`model`] — unified `GigaAm` + `Head` enum + `RnntRuntime` + all loaders.
+//! - [`jit`] — shared `GigaAmEncoderJit` (encoder-only, fp32 output).
+//! - [`ctc`] — `CTCHead` + `CtcHeadJit` (head-only; chains after the encoder JIT).
+//! - [`rnnt`] — `RnntHead`, predictor / joint step JITs, `RnntStepBackend`.
 //!
 //! Shared infrastructure:
 //! - [`config`] — `GigaAmConfig` JSON parsing.
@@ -15,6 +23,8 @@ mod config;
 mod ctc;
 mod encoder;
 mod error;
+mod jit;
+mod model;
 pub(crate) mod remap;
 mod rnnt;
 mod rope;
@@ -23,5 +33,7 @@ pub use config::*;
 pub use ctc::*;
 pub use encoder::*;
 pub use error::{Error, Result};
+pub use jit::*;
+pub use model::*;
 pub use rnnt::*;
 pub use rope::*;

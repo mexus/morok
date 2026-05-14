@@ -39,7 +39,7 @@ struct SpPiece {
 /// Special tokens (UNKNOWN=2, CONTROL=3, BYTE=6, UNUSED=5) are mapped to the
 /// empty string so they elide from the transcript on the (rare) chance the
 /// model emits one.
-pub(super) fn load_sentencepiece_vocab(path: &Path) -> Result<Vec<String>> {
+pub(crate) fn load_sentencepiece_vocab(path: &Path) -> Result<Vec<String>> {
     use prost::Message;
     let bytes = std::fs::read(path).context(ConfigIoSnafu)?;
     let proto = SpModelProto::decode(&*bytes).map_err(|e| Error::DecoderConfig {

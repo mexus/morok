@@ -25,7 +25,7 @@ use std::time::Instant;
 
 use morok_dtype::DType;
 use morok_model::audio::MelSpectrogram;
-use morok_model::gigaam::{GigaAmRnnt, GigaAmRnntEncoderJit, RnntStepBackend, SubsamplingMode};
+use morok_model::gigaam::{GigaAm, GigaAmEncoderJit, RnntStepBackend, SubsamplingMode};
 use morok_tensor::{PrepareConfig, Tensor};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -47,8 +47,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("\nLoading GigaAM RNN-T from {repo} ({revision})...");
     let t_model = Instant::now();
-    let model = GigaAmRnnt::from_hub_with_revision(&repo, &revision)?;
+    let model = GigaAm::from_hub_with_revision(&repo, &revision)?;
     let model = Arc::new(model);
+    let (_rnnt_head, rt) = model.head.as_rnnt().ok_or_else(|| {
+        format!("expected RN-T head from {repo}@{revision}; got CTC. Set MOROK_RNNT_REVISION to an RN-T revision.")
+    })?;
     if wav_sample_rate as usize != model.config.sample_rate {
         return Err(format!(
             "WAV is {} Hz, model expects {} Hz (resample first)",
@@ -72,9 +75,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "Loaded: {} layers, d_model={}, vocab_size={} (+blank), max_symbols/step={}, sentencepiece={}",
         model.config.n_layers,
         d_model,
-        model.vocabulary.len(),
-        model.max_symbols_per_step,
-        model.sentencepiece,
+        rt.vocabulary.len(),
+        rt.max_symbols_per_step,
+        rt.sentencepiece,
     );
 
     // ─── Mel features ────────────────────────────────────────────────────
@@ -179,7 +182,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let t_prepare = Instant::now();
-    let mut encoder_jit = GigaAmRnntEncoderJit::new(Arc::clone(&model)).with_b_bound(max_batch).with_t_bound(jit_t_mel);
+    let mut encoder_jit = GigaAmEncoderJit::new(Arc::clone(&model)).with_b_bound(max_batch).with_t_bound(jit_t_mel);
     let prepare_config = PrepareConfig::from_env();
     println!("AMX renderer      {}", if amx_enabled { "enabled (MOROK_AMX=1)" } else { "disabled" });
     println!("Preparing encoder JIT plan... [{max_batch}, {n_mels}, {jit_t_mel}]");
@@ -197,8 +200,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dt_prepare_step = t_step.elapsed();
 
     let decoder = morok_arch::rnnt::RnntDecoder::new(
-        model.vocabulary.clone(),
-        morok_arch::rnnt::RnntOpts { max_symbols_per_step: model.max_symbols_per_step },
+        rt.vocabulary.clone(),
+        morok_arch::rnnt::RnntOpts { max_symbols_per_step: rt.max_symbols_per_step },
     );
 
     // ─── Per-chunk loop ─────────────────────────────────────────────────
@@ -283,7 +286,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 (decoder.decode(&frames, actual_sub, actual_sub, d_model, &mut step_backend)?, None)
             };
             dt_decode += t_dec.elapsed();
-            let text = if model.sentencepiece { raw.replace('\u{2581}', " ").trim().to_string() } else { raw };
+            let text = if rt.sentencepiece { raw.replace('\u{2581}', " ").trim().to_string() } else { raw };
             if let Some(words) = words {
                 for w in &words {
                     println!("  [{:>6.2} - {:>6.2}] {}", start_sec + w.start, start_sec + w.end, w.text);

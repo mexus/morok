@@ -16,7 +16,7 @@ use snafu::ResultExt;
 use crate::jit::{DeviceSnafu, InputSpec, JitError, JitRecurrent, LstmState, RecurrentJit};
 
 use super::jit::{RnntJointStepJit, RnntPredictorStepJit};
-use super::model::GigaAmRnnt;
+use crate::gigaam::model::GigaAm;
 
 impl RecurrentJit for RnntPredictorStepJit {
     fn pack_state(&mut self, s: &LstmState) -> crate::jit::Result<()> {
@@ -97,11 +97,17 @@ impl StepStats {
 
 impl RnntStepBackend {
     /// Build the backend from a shared model. Constructs predictor + joint
-    /// JIT plans (one of each) and zero state buffers.
-    pub fn from_model(model: Arc<GigaAmRnnt>) -> crate::jit::Result<Self> {
-        let pred_hidden = model.head.pred_hidden;
-        let pred_rnn_layers = model.head.pred_rnn_layers;
-        let total_vocab = model.head.num_classes;
+    /// JIT plans (one of each) and zero state buffers. The model must carry
+    /// an RN-T head; CTC models are rejected.
+    pub fn from_model(model: Arc<GigaAm>) -> crate::jit::Result<Self> {
+        let (rnnt_head, _) = model.head.as_rnnt().ok_or_else(|| JitError::Build {
+            source: Box::new(crate::gigaam::Error::DecoderConfig {
+                message: "RnntStepBackend requires an RN-T head; this model has a CTC head".into(),
+            }),
+        })?;
+        let pred_hidden = rnnt_head.pred_hidden;
+        let pred_rnn_layers = rnnt_head.pred_rnn_layers;
+        let total_vocab = rnnt_head.num_classes;
         let blank_id = total_vocab - 1;
         let enc_hidden = model.config.d_model;
         let lp = pred_rnn_layers * pred_hidden;

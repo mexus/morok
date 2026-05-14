@@ -113,7 +113,7 @@ impl RnntPredictor {
     /// `embed.weight[blank_id]` at zero — fine-tuning updated it. We patch
     /// it here so morok matches the Python decoder regardless of how the
     /// checkpoint was trained.
-    pub(super) fn prepare_for_inference(&mut self) -> Result<()> {
+    pub(crate) fn prepare_for_inference(&mut self) -> Result<()> {
         self.embed = self.embed.cast(DType::Float32).context(TensorSnafu)?;
         self.embed.realize().context(TensorSnafu)?;
         for cell in &mut self.layers {

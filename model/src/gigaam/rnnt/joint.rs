@@ -38,7 +38,7 @@ impl RnntJoint {
 
     /// Cast all weights to f32 for inference. The joint is small; matches
     /// the predictor's f32 path so cross-network types align.
-    pub(super) fn cast_to_f32(&mut self) -> Result<()> {
+    pub(crate) fn cast_to_f32(&mut self) -> Result<()> {
         for t in
             [&mut self.enc_w, &mut self.enc_b, &mut self.pred_w, &mut self.pred_b, &mut self.out_w, &mut self.out_b]
         {

@@ -10,22 +10,26 @@
 //! - [`predictor`] — `RnntPredictor` (token embed + multi-layer LSTM).
 //! - [`joint`] — `RnntJoint` (sum projection + ReLU + linear).
 //! - [`head`] — `RnntHead = predictor + joint`.
-//! - [`model`] — `GigaAmRnnt`: encoder + head + vocab + loaders.
 //! - [`tokenizer`] — SentencePiece protobuf loader (private).
-//! - [`jit`] — `GigaAmRnntEncoderJit`, `RnntPredictorStepJit`, `RnntJointStepJit`.
+//! - [`jit`] — `RnntPredictorStepJit`, `RnntJointStepJit` (the encoder JIT
+//!   is shared and lives in [`crate::gigaam::jit`]).
 //! - [`backend`] — `RnntStepBackend` (impl `morok_arch::rnnt::JointStep`).
+//!
+//! The model wrapper itself lives in [`crate::gigaam::model`]; the RN-T
+//! runtime metadata (vocabulary, max-symbols-per-step, SP flag) is carried
+//! inside the `Head::Rnnt` variant.
 
 mod backend;
 mod head;
 mod jit;
 mod joint;
-mod model;
 mod predictor;
 mod tokenizer;
+
+pub(crate) use tokenizer::load_sentencepiece_vocab;
 
 pub use backend::*;
 pub use head::*;
 pub use jit::*;
 pub use joint::*;
-pub use model::*;
 pub use predictor::*;

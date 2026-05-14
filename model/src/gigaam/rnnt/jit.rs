@@ -1,60 +1,44 @@
-//! `jit_wrapper!`-generated JITs for the RNN-T head.
+//! `jit_wrapper!`-generated per-step JITs for the RN-T head: predictor and
+//! joint each compiled as their own plan. The encoder JIT lives in the
+//! shared [`crate::gigaam::jit`] now.
 //!
-//! The encoder JIT is encoder-only (no head); the head's predictor + joint
-//! run as their own per-step JITs since their input shape depends on
-//! `prev_token` and the LSTM state, which evolve through the search loop.
-//!
-//! All three JITs take an `Arc<GigaAmRnnt>` so the example can build them
-//! from a single underlying model — Tensor weights are Arc-backed and shared
-//! across clones, so the duplication is structural only.
+//! All step JITs take an `Arc<GigaAm>` and validate that the head is
+//! the RN-T variant in their build closure (returning a typed `Err` via
+//! `JitError::Build` if it isn't).
 
 extern crate self as morok_model;
 
+use std::sync::Arc;
+
 use morok_macros::jit_wrapper;
-use snafu::ResultExt;
 
-use super::model::GigaAmRnnt;
-use crate::gigaam::error::TensorSnafu;
+use crate::gigaam::model::GigaAm;
 
 jit_wrapper! {
-    GigaAmRnntEncoderJit(std::sync::Arc<GigaAmRnnt>) {
-        mel: Tensor,
-        lengths: Tensor,
-
-        vars {
-            b: (1, model.config.max_batch_size),
-            t: (1, model.config.max_mel_frames),
-        }
-
-        build(mel, lengths, b, t) {
-            let out = model.encoder.forward_batch(mel, lengths, &b, &t)?;
-            // Encoder may run in fp16 (depending on weight dtype); promote
-            // to fp32 at the JIT boundary so the joint step + the host-side
-            // copyout are uniform.
-            out.cast(morok_dtype::DType::Float32).context(TensorSnafu)
-        }
-    }
-}
-
-jit_wrapper! {
-    RnntPredictorStepJit(std::sync::Arc<GigaAmRnnt>) {
+    RnntPredictorStepJit(Arc<GigaAm>) {
         prev_token: Tensor,
         h_in: Tensor,
         c_in: Tensor,
 
         build(prev_token, h_in, c_in) {
-            model.head.predictor.forward_concat(prev_token, h_in, c_in)
+            let (rnnt_head, _) = model.head.as_rnnt().ok_or_else(|| crate::gigaam::Error::DecoderConfig {
+                message: "RnntPredictorStepJit requires an RN-T head; this model has a CTC head".into()
+            })?;
+            rnnt_head.predictor.forward_concat(prev_token, h_in, c_in)
         }
     }
 }
 
 jit_wrapper! {
-    RnntJointStepJit(std::sync::Arc<GigaAmRnnt>) {
+    RnntJointStepJit(Arc<GigaAm>) {
         enc_t: Tensor,
         g: Tensor,
 
         build(enc_t, g) {
-            model.head.joint.forward(enc_t, g)
+            let (rnnt_head, _) = model.head.as_rnnt().ok_or_else(|| crate::gigaam::Error::DecoderConfig {
+                message: "RnntJointStepJit requires an RN-T head; this model has a CTC head".into()
+            })?;
+            rnnt_head.joint.forward(enc_t, g)
         }
     }
 }

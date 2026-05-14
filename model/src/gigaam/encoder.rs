@@ -636,10 +636,10 @@ impl HasStateDict for ConformerLayer {
 // Encoder — audio preprocessor + Conformer backbone
 // ---------------------------------------------------------------------------
 
-/// Audio preprocessor + Conformer encoder. Shared by `GigaAm` (CTC) and
-/// `GigaAmRnnt` (transducer); they layer different heads on top of the same
-/// encoder. Encoder-only path: `forward` for single-batch, `forward_batch`
-/// for batched JIT execution.
+/// Audio preprocessor + Conformer encoder. Shared by both heads of
+/// [`crate::gigaam::GigaAm`] (`Head::Ctc` and `Head::Rnnt` layer different
+/// heads on top of the same encoder). Encoder-only path: `forward` for
+/// single-batch, `forward_batch` for batched JIT execution.
 pub struct Encoder {
     pub mel: MelSpectrogram,
     pub subsampling: StridingSubsampling,
@@ -813,8 +813,7 @@ impl Encoder {
 }
 
 /// Construct an `Encoder` from an already-remapped state dict + config.
-/// Shared by `GigaAm::from_state_dict` (in `ctc/model.rs`) and
-/// `GigaAmRnnt::from_state_dict` (in `rnnt/model.rs`).
+/// Called from the unified [`crate::gigaam::GigaAm::from_state_dict`] loader.
 pub(crate) fn build_encoder_from_sd(sd: &StateDict, config: &GigaAmConfig) -> Result<Encoder> {
     let mel = MelSpectrogram::new(&MelConfig {
         sample_rate: config.sample_rate,
