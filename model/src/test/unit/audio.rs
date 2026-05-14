@@ -1,4 +1,4 @@
-use crate::audio::reflect_pad;
+use crate::audio::mel::reflect_pad;
 
 #[test]
 fn test_reflect_pad_matches_pytorch_for_pad_lt_len() {

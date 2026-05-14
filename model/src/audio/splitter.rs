@@ -1,0 +1,131 @@
+//! Chunking abstraction for long-form audio inference.
+//!
+//! `Splitter` is the pluggable boundary between a raw waveform and the
+//! encoder-bounded chunks an ASR inference loop consumes. The trait + the
+//! built-in [`FixedLengthSplitter`] live here (audio-level preprocessing,
+//! same module family as the mel front-end); VAD-driven implementations
+//! ship next to their VAD model — see
+//! [`SileroVadSplitter`](crate::silero_vad::SileroVadSplitter).
+//!
+//! [`Transcriber`](crate::gigaam::Transcriber) is generic over the splitter;
+//! `S::Error` flows through `TranscribeError<E>` the same way
+//! `RnntDecodeError<JitError>` carries the step-backend error.
+//!
+//! Users with pre-segmented audio (pyannote, manual cuts) can skip the
+//! splitter entirely via
+//! [`Transcriber::transcribe_chunks`](crate::gigaam::Transcriber::transcribe_chunks).
+
+pub use morok_arch::vad::AudioChunk;
+
+/// Encoder-derived bounds passed to [`Splitter::split`].
+///
+/// Carries the model-config primitives (not derived seconds counts) so
+/// splitters can reason in whichever unit fits them. Helpers
+/// [`max_samples`](Self::max_samples), [`align_to_samples`](Self::align_to_samples),
+/// and [`encoder_capacity_secs`](Self::encoder_capacity_secs) cover the common
+/// derivations.
+///
+/// The `2 * subsampling_factor` headroom that
+/// [`encoder_capacity_secs`](Self::encoder_capacity_secs) subtracts mirrors the
+/// JIT prepare loop's `subs_output_length` margin — a chunk filling
+/// `max_samples()` is guaranteed to fit through the subsampling stack without
+/// padding overflow.
+#[derive(Clone, Copy, Debug)]
+pub struct EncoderBounds {
+    pub sample_rate: u32,
+    pub hop_length: usize,
+    pub subsampling_factor: usize,
+    pub max_mel_frames: usize,
+}
+
+impl EncoderBounds {
+    /// Sample-domain stride alignment: `hop_length * subsampling_factor`.
+    /// Splitters that produce frame-aligned chunks should snap boundaries to
+    /// this multiple.
+    pub fn align_to_samples(&self) -> usize {
+        self.hop_length * self.subsampling_factor
+    }
+
+    /// Maximum chunk length (in samples) the encoder can ingest. Equals
+    /// `(max_mel_frames - 2 * subsampling_factor) * hop_length` — the headroom
+    /// subtraction matches the JIT prepare path.
+    pub fn max_samples(&self) -> usize {
+        self.max_mel_frames.saturating_sub(2 * self.subsampling_factor) * self.hop_length
+    }
+
+    /// Convenience for splitters that reason in wall-clock seconds.
+    pub fn encoder_capacity_secs(&self) -> f32 {
+        self.max_samples() as f32 / self.sample_rate as f32
+    }
+}
+
+/// Chunking strategy: turn a waveform into encoder-bounded `AudioChunk`s.
+///
+/// `split` is called once per
+/// [`Transcriber::transcribe`](crate::gigaam::Transcriber::transcribe) call.
+/// Implementations may keep mutable state across calls (the Silero VAD JIT
+/// carries LSTM state internally), hence `&mut self`. Chunks must satisfy
+/// `end_sample <= waveform.len()` and `end_sample - start_sample <=
+/// bounds.max_samples()`; alignment is a soft preference (floor-division on
+/// `hop_length` tolerates misaligned boundaries).
+pub trait Splitter {
+    type Error: std::error::Error + Send + Sync + 'static;
+
+    fn split(&mut self, waveform: &[f32], bounds: &EncoderBounds) -> Result<Vec<AudioChunk>, Self::Error>;
+}
+
+/// No-VAD splitter: walks the waveform in `bounds.max_samples()`-sized
+/// strides, aligning non-final chunks to `bounds.align_to_samples()`.
+///
+/// Zero model load. Suitable when the caller already segmented the input,
+/// for short utterances that fit a single chunk, or for tests. Boundary
+/// context degrades transcription quality at chunk seams — for production
+/// long-form ASR prefer
+/// [`SileroVadSplitter`](crate::silero_vad::SileroVadSplitter).
+///
+/// `align_to_samples` dividing `max_samples` is not guaranteed; the final
+/// aligned chunk is the floor of `len_remaining / align_to_samples` times
+/// `align_to_samples` (so its mel length stays an integer multiple of
+/// `subsampling_factor`). The very last chunk keeps its unaligned tail —
+/// the JIT pads it.
+#[derive(Clone, Debug, Default)]
+pub struct FixedLengthSplitter {
+    // Field-form (not a unit struct) so v2 can add `overlap_samples` without
+    // a breaking API change.
+}
+
+impl FixedLengthSplitter {
+    pub fn new() -> Self {
+        Self {}
+    }
+}
+
+impl Splitter for FixedLengthSplitter {
+    type Error = std::convert::Infallible;
+
+    fn split(&mut self, waveform: &[f32], bounds: &EncoderBounds) -> Result<Vec<AudioChunk>, Self::Error> {
+        if waveform.is_empty() {
+            return Ok(Vec::new());
+        }
+        let align = bounds.align_to_samples().max(1);
+        // Saturating max_samples so a misconfigured bounds (zero, overflow)
+        // never stalls the loop. Floor at `align` so the loop always advances.
+        let max = bounds.max_samples().max(align);
+
+        let mut chunks = Vec::new();
+        let mut start = 0usize;
+        while start < waveform.len() {
+            let nominal_end = start.saturating_add(max).min(waveform.len());
+            let aligned_end = if nominal_end == waveform.len() {
+                nominal_end
+            } else {
+                let span = nominal_end - start;
+                let aligned_span = (span / align) * align;
+                start + aligned_span.max(align)
+            };
+            chunks.push(AudioChunk { start_sample: start, end_sample: aligned_end });
+            start = aligned_end;
+        }
+        Ok(chunks)
+    }
+}

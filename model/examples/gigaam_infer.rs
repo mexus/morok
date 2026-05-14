@@ -1,9 +1,13 @@
 //! GigaAM CTC inference demo.
 //!
-//! Loads a WAV, hands it to a [`Transcriber`] over a CTC-head [`GigaAm`], and
-//! prints the transcript. The pipeline (mel features, Silero VAD, batched
-//! encoder JIT, head decode) lives inside `Transcriber`; this example is just
-//! a thin CLI on top.
+//! Loads a WAV, hands it to a [`Transcriber`] over a CTC-head [`GigaAm`] with
+//! an explicit [`SileroVadSplitter`], and prints the transcript. The pipeline
+//! (mel features, splitter-driven chunking, batched encoder JIT, head decode)
+//! lives inside `Transcriber`; this example is just a thin CLI on top.
+//!
+//! Substitute `FixedLengthSplitter::new()` for the VAD splitter to skip the
+//! Silero hub download — useful for tests, short utterances, or pipelines
+//! that already segmented the input.
 //!
 //! Usage:
 //!   cargo run -p morok-model --release --example gigaam_infer -- audio.wav
@@ -14,6 +18,7 @@
 //!   MOROK_TIMESTAMPS=1          Emit per-word `[start - end] word` lines.
 //!   MOROK_GIGAAM_REVISION=name  HF Hub revision (default `ctc`).
 //!   MOROK_MAX_SCORES_MIB=N      SDPA scores buffer budget (default 256).
+//!   MOROK_VAD_THRESHOLD=f       Silero VAD threshold (default 0.5).
 //!
 //! See `gigaam_rnnt_infer.rs` for the RN-T variant (same pattern, RN-T-default
 //! revision).
@@ -22,6 +27,7 @@ use std::env;
 use std::time::Instant;
 
 use morok_model::gigaam::{GigaAm, TranscribeOpts, Transcriber};
+use morok_model::silero_vad::SileroVadSplitter;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let t_total = Instant::now();
@@ -36,7 +42,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("\nLoading GigaAM ({revision})...");
     let model = GigaAm::from_hub_with_revision("vpermilp/GigaAM-v3", &revision)?;
-    let mut transcriber = Transcriber::new(model, opts.clone())?;
+    let splitter = SileroVadSplitter::from_hub()?;
+    let mut transcriber = Transcriber::new(model, splitter, opts.clone())?;
 
     println!("Transcribing...");
     let t_transcribe = Instant::now();

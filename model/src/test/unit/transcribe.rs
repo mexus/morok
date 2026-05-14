@@ -79,14 +79,8 @@ fn ctc_frames_to_words_frame_shift_scales_linearly() {
 
 #[test]
 fn transcribe_opts_builder_overrides_all_fields() {
-    let opts = TranscribeOpts::builder()
-        .word_timestamps(true)
-        .beam_decode(true)
-        .max_scores_mib(512)
-        .vad_threshold(0.7)
-        .build();
+    let opts = TranscribeOpts::builder().word_timestamps(true).beam_decode(true).max_scores_mib(512).build();
     assert!(opts.word_timestamps);
     assert!(opts.beam_decode);
     assert_eq!(opts.max_scores_mib, 512);
-    assert!((opts.vad_threshold - 0.7).abs() < 1e-6);
 }

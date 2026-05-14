@@ -13,6 +13,10 @@
 
 extern crate self as morok_model;
 
+mod splitter;
+
+pub use splitter::{SileroVadSplitter, SileroVadSplitterError};
+
 use std::path::Path;
 
 use morok_macros::jit_wrapper;

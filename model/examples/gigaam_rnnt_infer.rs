@@ -1,10 +1,10 @@
 //! GigaAM RNN-T (transducer) inference demo.
 //!
 //! Same pipeline shape as `gigaam_infer.rs` — loads WAV, runs a
-//! [`Transcriber`] — but defaults to an RN-T revision (`e2e_rnnt`) so the
-//! `Head::Rnnt` path drives the predictor + joint JITs through the per-step
-//! `JointStep` backend. SentencePiece `▁ → space` post-processing happens
-//! inside the transcriber.
+//! [`Transcriber`] with an explicit [`SileroVadSplitter`] — but defaults to
+//! an RN-T revision (`e2e_rnnt`) so the `Head::Rnnt` path drives the
+//! predictor + joint JITs through the per-step `JointStep` backend.
+//! SentencePiece `▁ → space` post-processing happens inside the transcriber.
 //!
 //! Usage:
 //!   cargo run -p morok-model --release --example gigaam_rnnt_infer -- audio.wav
@@ -15,11 +15,13 @@
 //!   MOROK_RNNT_REPO=<repo>      HF Hub repo (default `vpermilp/GigaAM-v3`).
 //!   MOROK_RNNT_REVISION=<rev>   HF Hub revision (default `e2e_rnnt`).
 //!   MOROK_MAX_SCORES_MIB=N      SDPA scores buffer budget (default 256).
+//!   MOROK_VAD_THRESHOLD=f       Silero VAD threshold (default 0.5).
 
 use std::env;
 use std::time::Instant;
 
 use morok_model::gigaam::{GigaAm, TranscribeOpts, Transcriber};
+use morok_model::silero_vad::SileroVadSplitter;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
@@ -42,7 +44,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .into());
     }
-    let mut transcriber = Transcriber::new(model, opts.clone())?;
+    let splitter = SileroVadSplitter::from_hub()?;
+    let mut transcriber = Transcriber::new(model, splitter, opts.clone())?;
 
     println!("Transcribing...");
     let t_transcribe = Instant::now();

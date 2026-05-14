@@ -22,14 +22,13 @@ use snafu::{ResultExt, Snafu};
 
 pub use morok_arch::rnnt::Word;
 
-use crate::audio::{MelConfig, MelSpectrogram};
+use crate::audio::{AudioChunk, EncoderBounds, MelConfig, MelSpectrogram, Splitter};
 use crate::gigaam::SubsamplingMode;
 use crate::gigaam::ctc::CtcHeadJit;
 use crate::gigaam::jit::GigaAmEncoderJit;
 use crate::gigaam::model::{GigaAm, Head};
 use crate::gigaam::rnnt::RnntStepBackend;
 use crate::jit::InputSpec;
-use crate::silero_vad::{NUM_SAMPLES, SileroVad, VadInference};
 
 /// User-facing knobs for [`Transcriber::transcribe`].
 ///
@@ -46,7 +45,9 @@ use crate::silero_vad::{NUM_SAMPLES, SileroVad, VadInference};
 /// | `word_timestamps` | `MOROK_TIMESTAMPS=1`   | `false`  |
 /// | `beam_decode`     | `MOROK_BEAM_DECODE=1`  | `false`  |
 /// | `max_scores_mib`  | `MOROK_MAX_SCORES_MIB` | `256`    |
-/// | `vad_threshold`   | `MOROK_VAD_THRESHOLD`  | `0.5`    |
+///
+/// VAD-specific knobs (`threshold`, `min_duration`, …) live on
+/// [`SileroVadSplitter`](super::SileroVadSplitter), not here.
 #[derive(Clone, Debug)]
 pub struct TranscribeOpts {
     /// Emit per-word `Word { text, start, end }` entries on
@@ -59,9 +60,6 @@ pub struct TranscribeOpts {
     /// so two simultaneously live `[B, H, T_sub², dtype]` scores tensors
     /// stay under `2 × max_scores_mib` MiB.
     pub max_scores_mib: usize,
-    /// Speech-vs-silence threshold passed through to the chunker
-    /// (`ChunkerOpts::threshold`).
-    pub vad_threshold: f32,
 }
 
 impl Default for TranscribeOpts {
@@ -83,10 +81,8 @@ impl TranscribeOpts {
         #[builder(default = std::env::var("MOROK_BEAM_DECODE").as_deref() == Ok("1"))] beam_decode: bool,
         #[builder(default = std::env::var("MOROK_MAX_SCORES_MIB").ok().and_then(|s| s.parse().ok()).unwrap_or(256))]
         max_scores_mib: usize,
-        #[builder(default = std::env::var("MOROK_VAD_THRESHOLD").ok().and_then(|s| s.parse().ok()).unwrap_or(0.5))]
-        vad_threshold: f32,
     ) -> Self {
-        Self { word_timestamps, beam_decode, max_scores_mib, vad_threshold }
+        Self { word_timestamps, beam_decode, max_scores_mib }
     }
 
     /// Build from `MOROK_*` env vars with the same fallbacks as the
@@ -183,12 +179,12 @@ impl HeadDecoder {
     /// - [`HeadDecoder::Rnnt`]: `[layout.d_model, layout.t_exec_sub]` encoder
     ///   output row-major (one item-slab from the encoder JIT's output). The
     ///   transpose to frame-major `[actual_sub, d_model]` happens inside.
-    pub fn decode_chunk(
+    pub fn decode_chunk<E: std::error::Error + 'static>(
         &mut self,
         source: &[f32],
         layout: ChunkLayout,
         want_words: bool,
-    ) -> Result<ChunkDecoded, TranscribeError> {
+    ) -> Result<ChunkDecoded, TranscribeError<E>> {
         let ChunkLayout { d_model, t_exec_sub, actual_sub, chunk_duration_sec } = layout;
         let frame_shift = chunk_duration_sec / (actual_sub.max(1) as f32);
 
@@ -273,15 +269,22 @@ pub(crate) fn ctc_frames_to_words(text: &str, frames: &[usize], frame_shift: f32
     words
 }
 
-fn rnnt_decode_err(e: morok_arch::rnnt::RnntDecodeError<crate::jit::JitError>) -> TranscribeError {
+fn rnnt_decode_err<E: std::error::Error + 'static>(
+    e: morok_arch::rnnt::RnntDecodeError<crate::jit::JitError>,
+) -> TranscribeError<E> {
     TranscribeError::RnntDecode { source: Box::new(e) }
 }
 
 // ─── Errors ───────────────────────────────────────────────────────────────
 
+/// Generic over the splitter error type so per-impl errors stay
+/// pattern-matchable rather than being type-erased into `Box<dyn Error>`.
+/// Mirrors the `morok_arch::rnnt::RnntDecodeError<JitError>` shape.
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub(crate)))]
-pub enum TranscribeError {
+pub enum TranscribeError<E: std::error::Error + 'static> {
+    #[snafu(display("splitter: {source}"))]
+    Splitter { source: E },
     #[snafu(display("{source}"))]
     Jit {
         #[snafu(source(from(crate::jit::JitError, Box::new)))]
@@ -297,13 +300,6 @@ pub enum TranscribeError {
         source: Box<crate::gigaam::error::Error>,
     },
     #[snafu(display("{source}"))]
-    SileroVad {
-        #[snafu(source(from(crate::silero_vad::Error, Box::new)))]
-        source: Box<crate::silero_vad::Error>,
-    },
-    #[snafu(display("{source}"))]
-    Vad { source: morok_arch::vad::Error },
-    #[snafu(display("{source}"))]
     Tensor {
         #[snafu(source(from(morok_tensor::error::Error, Box::new)))]
         source: Box<morok_tensor::error::Error>,
@@ -315,23 +311,31 @@ pub enum TranscribeError {
     },
     #[snafu(display("WAV is {wav_sr} Hz, model expects {model_sr} Hz (resample first)"))]
     SampleRateMismatch { wav_sr: u32, model_sr: u32 },
+    #[snafu(display("chunk {idx} length {samples} samples exceeds encoder capacity {max_samples} samples"))]
+    ChunkExceedsCapacity { idx: usize, samples: usize, max_samples: usize },
+    #[snafu(display("chunk {idx} end {end_sample} exceeds waveform length {waveform_len}"))]
+    ChunkOutOfRange { idx: usize, end_sample: usize, waveform_len: usize },
 }
 
 // ─── Transcriber ──────────────────────────────────────────────────────────
 
-/// High-level transcription wrapper. Owns the encoder JIT, the per-head
-/// decoder (+ CTC head JIT for CTC models), the mel front-end, and the VAD.
+/// High-level transcription wrapper, generic over the chunking strategy.
 ///
+/// Owns the encoder JIT, the per-head decoder (+ CTC head JIT for CTC
+/// models), the mel front-end, and the caller-supplied [`Splitter`].
 /// Construction is cheap — JITs are unprepared. The first
-/// [`Transcriber::transcribe`] call sizes the encoder + CTC head JITs to the
-/// audio's actual VAD chunks and prepares them. Subsequent calls re-use the
-/// cached `(max_batch, jit_t_mel)` plan if the new audio fits underneath;
-/// otherwise they tear down the JITs and re-prepare with the larger bounds.
-pub struct Transcriber {
+/// [`Transcriber::transcribe`] call sizes the encoder + CTC head JITs to
+/// the actual chunks the splitter produces and prepares them; subsequent
+/// calls re-use the cached `(max_batch, jit_t_mel)` plan if the new audio
+/// fits underneath.
+///
+/// Use [`transcribe_chunks`](Self::transcribe_chunks) directly to bypass
+/// the splitter for pre-segmented audio (pyannote, manual cuts).
+pub struct Transcriber<S: Splitter> {
     model: GigaAm,
     opts: TranscribeOpts,
+    splitter: S,
     mel: MelSpectrogram,
-    vad: VadInference,
     encoder_jit: Option<GigaAmEncoderJit>,
     /// Present iff the model has a CTC head.
     ctc_head_jit: Option<CtcHeadJit>,
@@ -343,17 +347,17 @@ pub struct Transcriber {
     prepare_config: PrepareConfig,
 }
 
-impl Transcriber {
-    /// Build the transcriber. Constructs the mel front-end, the Silero VAD,
-    /// and the per-head decoder + step-backend JITs. The encoder JIT and the
-    /// (CTC-only) head JIT are constructed lazily on the first
+impl<S: Splitter> Transcriber<S> {
+    /// Build the transcriber. Constructs the mel front-end and the per-head
+    /// decoder + step-backend JITs. The encoder JIT and the (CTC-only) head
+    /// JIT are constructed lazily on the first
     /// [`transcribe`](Self::transcribe) call, since their bounds depend on
     /// the audio.
     ///
     /// `model` is consumed; the internal JITs each take their own
     /// `model.clone()` (cheap — weights are shared via the underlying
     /// `Tensor` handle Arcs).
-    pub fn new(model: GigaAm, opts: TranscribeOpts) -> Result<Self, TranscribeError> {
+    pub fn new(model: GigaAm, splitter: S, opts: TranscribeOpts) -> Result<Self, TranscribeError<S::Error>> {
         let mel = MelSpectrogram::new(&MelConfig {
             sample_rate: model.config.sample_rate,
             n_fft: model.config.n_fft,
@@ -362,7 +366,6 @@ impl Transcriber {
             n_mels: model.config.n_mels,
             center: model.config.mel_center,
         });
-        let vad = VadInference::new(SileroVad::from_hub().context(SileroVadSnafu)?).context(JitSnafu)?;
 
         let head_decoder = match &model.head {
             Head::Ctc(_) => {
@@ -392,8 +395,8 @@ impl Transcriber {
         Ok(Self {
             model,
             opts,
+            splitter,
             mel,
-            vad,
             encoder_jit: None,
             ctc_head_jit: None,
             head_decoder,
@@ -402,22 +405,68 @@ impl Transcriber {
         })
     }
 
-    /// Transcribe a waveform end-to-end: mel → VAD → batched encoder →
-    /// per-chunk head decode. `waveform` is fp32 PCM in `[-1, 1]`; the model
-    /// expects `model.config.sample_rate` (returns
-    /// [`TranscribeError::SampleRateMismatch`] otherwise).
-    pub fn transcribe(&mut self, waveform: &[f32], sample_rate: u32) -> Result<TranscribeResult, TranscribeError> {
+    /// Encoder-derived bounds for this model. Validates the input sample rate.
+    /// Useful for callers that want to invoke the splitter directly.
+    pub fn encoder_bounds(&self, sample_rate: u32) -> Result<EncoderBounds, TranscribeError<S::Error>> {
         if sample_rate as usize != self.model.config.sample_rate {
             return Err(TranscribeError::SampleRateMismatch {
                 wav_sr: sample_rate,
                 model_sr: self.model.config.sample_rate as u32,
             });
         }
+        Ok(EncoderBounds {
+            sample_rate,
+            hop_length: self.model.config.hop_length,
+            subsampling_factor: self.model.config.subsampling_factor,
+            max_mel_frames: self.model.config.max_mel_frames,
+        })
+    }
+
+    /// Transcribe a waveform end-to-end: bounds → splitter → mel → batched
+    /// encoder → per-chunk head decode. `waveform` is fp32 PCM in `[-1, 1]`;
+    /// the model expects `model.config.sample_rate` (returns
+    /// [`TranscribeError::SampleRateMismatch`] otherwise).
+    pub fn transcribe(
+        &mut self,
+        waveform: &[f32],
+        sample_rate: u32,
+    ) -> Result<TranscribeResult, TranscribeError<S::Error>> {
+        let bounds = self.encoder_bounds(sample_rate)?;
+        let chunks = self.splitter.split(waveform, &bounds).context(SplitterSnafu)?;
+        self.transcribe_chunks(waveform, sample_rate, &chunks)
+    }
+
+    /// Escape hatch: caller-supplied chunks. Validates each chunk against
+    /// encoder capacity (`ChunkExceedsCapacity`) and the waveform's bounds
+    /// (`ChunkOutOfRange`) rather than silently truncating. Misaligned
+    /// boundaries are accepted — the mel/JIT pipeline pads the trailing
+    /// fractional frame.
+    pub fn transcribe_chunks(
+        &mut self,
+        waveform: &[f32],
+        sample_rate: u32,
+        chunks: &[AudioChunk],
+    ) -> Result<TranscribeResult, TranscribeError<S::Error>> {
+        let bounds = self.encoder_bounds(sample_rate)?;
+        let max_samples = bounds.max_samples();
+        for (idx, chunk) in chunks.iter().enumerate() {
+            if chunk.end_sample > waveform.len() {
+                return Err(TranscribeError::ChunkOutOfRange {
+                    idx,
+                    end_sample: chunk.end_sample,
+                    waveform_len: waveform.len(),
+                });
+            }
+            let samples = chunk.end_sample.saturating_sub(chunk.start_sample);
+            if samples > max_samples {
+                return Err(TranscribeError::ChunkExceedsCapacity { idx, samples, max_samples });
+            }
+        }
 
         // ─── Mel features (whole audio, sliced per-chunk later) ─────────
         let n_mels = self.mel.n_mels();
         let total_mel_frames = self.mel.num_frames(waveform.len());
-        if total_mel_frames == 0 {
+        if total_mel_frames == 0 || chunks.is_empty() {
             return Ok(TranscribeResult { text: String::new(), chunks: Vec::new() });
         }
         let mut full_mel = Tensor::full(&[1, n_mels, total_mel_frames], 0.0f32, DType::Float32).context(TensorSnafu)?;
@@ -428,29 +477,13 @@ impl Transcriber {
         }
         let full_mel_data = full_mel.as_vec::<f32>().context(TensorSnafu)?;
 
-        // ─── VAD chunking ───────────────────────────────────────────────
         let sample_rate_hz = self.model.config.sample_rate;
         let hop_length = self.model.config.hop_length;
         let subsampling_factor = self.model.config.subsampling_factor;
         let max_t_mel = self.model.config.max_mel_frames;
-        let probs = self.vad.probs(waveform).context(JitSnafu)?;
-        let mel_headroom = 2 * subsampling_factor;
-        let encoder_capacity_secs =
-            (max_t_mel.saturating_sub(mel_headroom) as f32 * hop_length as f32) / sample_rate_hz as f32;
-        let default_opts = morok_arch::vad::ChunkerOpts::default();
-        let chunker_opts = morok_arch::vad::ChunkerOpts {
-            sample_rate: sample_rate_hz as u32,
-            samples_per_prob: NUM_SAMPLES,
-            threshold: self.opts.vad_threshold,
-            max_duration: default_opts.max_duration.min(encoder_capacity_secs),
-            strict_limit_duration: default_opts.strict_limit_duration.min(encoder_capacity_secs),
-            align_to: hop_length * subsampling_factor,
-            ..default_opts
-        };
-        let vad_chunks = morok_arch::vad::chunks_from_probs(&probs, &chunker_opts).context(VadSnafu)?;
 
         // (mel_start, mel_len, start_sec, end_sec) per chunk.
-        let chunks_meta: Vec<(usize, usize, f32, f32)> = vad_chunks
+        let chunks_meta: Vec<(usize, usize, f32, f32)> = chunks
             .iter()
             .filter_map(|c| {
                 let mel_start = c.start_sample / hop_length;
@@ -571,7 +604,7 @@ impl Transcriber {
                         let item_stride = t_exec_sub * total_vocab;
                         let base = bi * item_stride;
                         let item_slice = flat[base..base + item_stride].to_vec();
-                        self.head_decoder.decode_chunk(&item_slice, layout, self.opts.word_timestamps)?
+                        self.head_decoder.decode_chunk::<S::Error>(&item_slice, layout, self.opts.word_timestamps)?
                     }
                     HeadDecoder::Rnnt { .. } => {
                         let enc = encoder_jit.output().context(JitSnafu)?.as_array::<f32>().context(DeviceSnafu)?;
@@ -579,7 +612,7 @@ impl Transcriber {
                         let item_stride = d_model * t_exec_sub;
                         let base = bi * item_stride;
                         let item_slice = flat[base..base + item_stride].to_vec();
-                        self.head_decoder.decode_chunk(&item_slice, layout, self.opts.word_timestamps)?
+                        self.head_decoder.decode_chunk::<S::Error>(&item_slice, layout, self.opts.word_timestamps)?
                     }
                 };
 
@@ -602,7 +635,7 @@ impl Transcriber {
         }
     }
 
-    fn prepare_jits_if_needed(&mut self, max_batch: usize, jit_t_mel: usize) -> Result<(), TranscribeError> {
+    fn prepare_jits_if_needed(&mut self, max_batch: usize, jit_t_mel: usize) -> Result<(), TranscribeError<S::Error>> {
         if !self.would_reprepare(max_batch, jit_t_mel) {
             return Ok(());
         }
