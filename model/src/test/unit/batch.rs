@@ -46,12 +46,12 @@ fn test_output_length_matches_forward() {
     let x = Tensor::full(&[1, 100, 64], 0.0f32, DType::Float32).unwrap();
     let out = model.encoder.subsampling.forward(&x).unwrap();
     let actual_t = out.shape().unwrap()[1].as_const().unwrap();
-    assert_eq!(model.subsampling_output_length(100), actual_t);
+    assert_eq!(model.encoder.subsampling_output_length(100), actual_t);
 
     let x2 = Tensor::full(&[1, 50, 64], 0.0f32, DType::Float32).unwrap();
     let out2 = model.encoder.subsampling.forward(&x2).unwrap();
     let actual_t2 = out2.shape().unwrap()[1].as_const().unwrap();
-    assert_eq!(model.subsampling_output_length(50), actual_t2);
+    assert_eq!(model.encoder.subsampling_output_length(50), actual_t2);
 }
 
 #[test]
@@ -127,7 +127,7 @@ fn test_encode_batch_near_max_mel_stays_within_encoder_bound() {
     let model = model_with_random_weights();
     let cfg = test_config();
     let t = cfg.max_mel_frames;
-    let t_sub = model.subsampling_output_length(t);
+    let t_sub = model.encoder.subsampling_output_length(t);
     assert!(t_sub <= cfg.max_encoder_frames);
 
     let x = Tensor::full(&[1, cfg.n_mels, t], 0.1f32, DType::Float32).unwrap();
@@ -137,7 +137,7 @@ fn test_encode_batch_near_max_mel_stays_within_encoder_bound() {
     let b1 = b_var.bind(1).unwrap();
     let t_bound = t_var.bind(t as i64).unwrap();
 
-    let mut out = model.encode_batch(&x, &lengths, &b1, &t_bound).unwrap();
+    let mut out = model.encoder.forward_batch(&x, &lengths, &b1, &t_bound).unwrap();
     out.realize().unwrap();
     assert!(out.buffer().unwrap().size() > 0);
 }
@@ -148,7 +148,7 @@ fn test_single_vs_batch_consistency() {
     let d = test_config().d_model;
     let n_mels = test_config().n_mels;
     let t = 10;
-    let t_sub = model.subsampling_output_length(t);
+    let t_sub = model.encoder.subsampling_output_length(t);
 
     let x1 = Tensor::full(&[1, n_mels, t], 0.5f32, DType::Float32).unwrap();
     let x2 = Tensor::full(&[1, n_mels, t], 0.3f32, DType::Float32).unwrap();
@@ -159,11 +159,11 @@ fn test_single_vs_batch_consistency() {
     let b1 = b_var.bind(1).unwrap();
     let t1 = t_var.bind(t as i64).unwrap();
 
-    let mut out1 = model.encode_batch(&x1, &lengths_single, &b1, &t1).unwrap();
+    let mut out1 = model.encoder.forward_batch(&x1, &lengths_single, &b1, &t1).unwrap();
     out1.realize().unwrap();
     let data1 = read_prefix_f32(&out1, d * t_sub);
 
-    let mut out2 = model.encode_batch(&x2, &lengths_single, &b1, &t1).unwrap();
+    let mut out2 = model.encoder.forward_batch(&x2, &lengths_single, &b1, &t1).unwrap();
     out2.realize().unwrap();
     let data2 = read_prefix_f32(&out2, d * t_sub);
 
@@ -183,7 +183,7 @@ fn test_single_vs_batch_consistency() {
     let batch_lengths = Tensor::from_slice([t as i32, t as i32]);
 
     let b2 = b_var.bind(2).unwrap();
-    let mut batch_out = model.encode_batch(&batch_tensor, &batch_lengths, &b2, &t1).unwrap();
+    let mut batch_out = model.encoder.forward_batch(&batch_tensor, &batch_lengths, &b2, &t1).unwrap();
     batch_out.realize().unwrap();
     let batch_data = read_prefix_f32(&batch_out, 2 * d * t_sub);
 
@@ -211,7 +211,7 @@ fn test_encode_batch_full_lengths_finite() {
     let b2 = b_var.bind(2).unwrap();
     let t_bound = t_var.bind(t as i64).unwrap();
 
-    let mut out = model.encode_batch(&x, &lengths, &b2, &t_bound).unwrap();
+    let mut out = model.encoder.forward_batch(&x, &lengths, &b2, &t_bound).unwrap();
     out.realize().unwrap();
 
     let buf = out.buffer().unwrap();

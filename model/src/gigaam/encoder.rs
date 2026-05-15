@@ -1,13 +1,39 @@
 use morok_dtype::DType;
 use morok_ir::SInt;
 use morok_tensor::{BoundVariable, Tensor};
+use ndarray::Array4;
 use snafu::ResultExt;
 
 use crate::state::{HasStateDict, StateDict, get_tensor, prefixed};
+use crate::{load_state_field, state_field};
 
 use super::error::{StateSnafu, TensorSnafu};
-use super::rope::build_rope_cache;
 use super::{ConvNormType, GigaAmConfig, SubsamplingMode};
+
+/// Precompute RoPE cos/sin cache tensors. Returns `(cos, sin)` each of shape
+/// `[max_encoder_frames, 1, 1, d_k/2]` where `d_k = d_model / n_heads`. GigaAM
+/// uses non-interleaved RoPE (first_half/second_half split), matching
+/// `apply_rotary_emb(..., interleaved=false)`.
+fn build_rope_cache(config: &GigaAmConfig) -> (Tensor, Tensor) {
+    let d_k = config.d_model / config.n_heads;
+    let half_d = d_k / 2;
+    let max_len = config.max_encoder_frames;
+
+    let inv_freq: Vec<f32> = (0..half_d).map(|i| 1.0 / 10000.0f32.powf(2.0 * i as f32 / d_k as f32)).collect();
+
+    let mut cos_arr = Array4::<f32>::zeros((max_len, 1, 1, half_d));
+    let mut sin_arr = Array4::<f32>::zeros((max_len, 1, 1, half_d));
+
+    for pos in 0..max_len {
+        for i in 0..half_d {
+            let angle = pos as f32 * inv_freq[i];
+            cos_arr[[pos, 0, 0, i]] = angle.cos();
+            sin_arr[[pos, 0, 0, i]] = angle.sin();
+        }
+    }
+
+    (Tensor::from_ndarray(&cos_arr), Tensor::from_ndarray(&sin_arr))
+}
 
 fn zeros(shape: &[usize]) -> Tensor {
     Tensor::zeros(shape, DType::Float32).unwrap()
@@ -45,14 +71,12 @@ impl LayerNormWeights {
 impl HasStateDict for LayerNormWeights {
     fn state_dict(&self, prefix: &str) -> StateDict {
         let mut sd = StateDict::new();
-        sd.insert(prefixed(prefix, "weight"), self.weight.clone());
-        sd.insert(prefixed(prefix, "bias"), self.bias.clone());
+        state_field!(sd, prefix, self, [weight, bias]);
         sd
     }
 
     fn load_state_dict(&mut self, sd: &StateDict, prefix: &str) -> std::result::Result<(), crate::state::Error> {
-        self.weight = get_tensor(sd, &prefixed(prefix, "weight"))?;
-        self.bias = get_tensor(sd, &prefixed(prefix, "bias"))?;
+        load_state_field!(self, sd, prefix, [weight, bias]);
         Ok(())
     }
 }
@@ -161,20 +185,18 @@ impl MultiHeadSelfAttention {
 
         let y = self.norm.apply(x)?;
 
-        // Reshape to [T, B, H, d_k] for RoPE (matches PyTorch ordering)
+        // RoPE expects [T, B, H, d_k] (PyTorch ordering). Rotate once, then
+        // materialise back as [B, T, d_model] so the Q/K projections share
+        // a single rotated buffer.
         let y_heads = y
             .try_transpose(0, 1)
             .context(TensorSnafu)?
             .try_reshape([t.clone(), b.clone(), SInt::Const(h), SInt::Const(d_k)])
             .context(TensorSnafu)?;
-
-        // Apply RoPE once and materialize at the [B, T, d_model] layout the projections
-        // consume, so reshape+transpose isn't recomputed per matmul kernel and Q/K share
-        // a single rotated buffer.
         let rope_dtype = y_heads.uop().dtype();
         let cos = cos.cast(rope_dtype.clone()).context(TensorSnafu)?;
         let sin = sin.cast(rope_dtype).context(TensorSnafu)?;
-        let rot_btd = y_heads
+        let qk_input = y_heads
             .apply_rotary_emb(&cos, &sin, false)
             .context(TensorSnafu)?
             .try_reshape([t.clone(), b.clone(), SInt::Const(d_model)])
@@ -182,74 +204,45 @@ impl MultiHeadSelfAttention {
             .try_transpose(0, 1)
             .context(TensorSnafu)?
             .contiguous();
-        let q_input = rot_btd.clone();
-        let k_input = rot_btd;
 
-        // Project through Q, K, V linear layers
-        let q = q_input.linear().weight(&self.q_proj).bias(&self.q_bias).call().context(TensorSnafu)?;
-        let k = k_input.linear().weight(&self.k_proj).bias(&self.k_bias).call().context(TensorSnafu)?;
+        let q = qk_input.linear().weight(&self.q_proj).bias(&self.q_bias).call().context(TensorSnafu)?;
+        let k = qk_input.linear().weight(&self.k_proj).bias(&self.k_bias).call().context(TensorSnafu)?;
         let v = y.linear().weight(&self.v_proj).bias(&self.v_bias).call().context(TensorSnafu)?;
 
-        // Reshape to [B, H, T, d_k]
-        let q = q
-            .try_reshape([b.clone(), t.clone(), SInt::Const(h), SInt::Const(d_k)])
-            .context(TensorSnafu)?
-            .try_transpose(1, 2)
-            .context(TensorSnafu)?;
-        let k = k
-            .try_reshape([b.clone(), t.clone(), SInt::Const(h), SInt::Const(d_k)])
-            .context(TensorSnafu)?
-            .try_transpose(1, 2)
-            .context(TensorSnafu)?;
-        let v = v
-            .try_reshape([b.clone(), t.clone(), SInt::Const(h), SInt::Const(d_k)])
-            .context(TensorSnafu)?
-            .try_transpose(1, 2)
-            .context(TensorSnafu)?;
+        let q = split_heads(&q, b.clone(), t.clone(), h, d_k)?;
+        let k = split_heads(&k, b.clone(), t.clone(), h, d_k)?;
+        let v = split_heads(&v, b.clone(), t.clone(), h, d_k)?;
 
-        // Scaled dot-product attention
         let attn =
             q.scaled_dot_product_attention().key(&k).value(&v).maybe_attn_mask(mask).call().context(TensorSnafu)?;
-
-        // [B, H, T, d_k] -> [B, T, H, d_k] -> [B, T, d_model]
-        let out = attn
-            .try_transpose(1, 2)
-            .context(TensorSnafu)?
-            .try_reshape([b, t, SInt::Const(d_model)])
-            .context(TensorSnafu)?;
-
+        let out = merge_heads(&attn, b, t, d_model)?;
         out.linear().weight(&self.out_proj).bias(&self.out_bias).call().context(TensorSnafu)
     }
+}
+
+/// `[B, T, H*d_k] → [B, T, H, d_k] → [B, H, T, d_k]`.
+fn split_heads(x: &Tensor, b: SInt, t: SInt, h: usize, d_k: usize) -> Result<Tensor> {
+    x.try_reshape([b, t, SInt::Const(h), SInt::Const(d_k)])
+        .context(TensorSnafu)?
+        .try_transpose(1, 2)
+        .context(TensorSnafu)
+}
+
+/// `[B, H, T, d_k] → [B, T, H, d_k] → [B, T, d_model]`.
+fn merge_heads(x: &Tensor, b: SInt, t: SInt, d_model: usize) -> Result<Tensor> {
+    x.try_transpose(1, 2).context(TensorSnafu)?.try_reshape([b, t, SInt::Const(d_model)]).context(TensorSnafu)
 }
 
 impl HasStateDict for MultiHeadSelfAttention {
     fn state_dict(&self, prefix: &str) -> StateDict {
         let mut sd = self.norm.state_dict(&prefixed(prefix, "norm"));
-        for (name, t) in [
-            ("q_proj", &self.q_proj),
-            ("q_bias", &self.q_bias),
-            ("k_proj", &self.k_proj),
-            ("k_bias", &self.k_bias),
-            ("v_proj", &self.v_proj),
-            ("v_bias", &self.v_bias),
-            ("out_proj", &self.out_proj),
-            ("out_bias", &self.out_bias),
-        ] {
-            sd.insert(prefixed(prefix, name), t.clone());
-        }
+        state_field!(sd, prefix, self, [q_proj, q_bias, k_proj, k_bias, v_proj, v_bias, out_proj, out_bias]);
         sd
     }
 
     fn load_state_dict(&mut self, sd: &StateDict, prefix: &str) -> std::result::Result<(), crate::state::Error> {
         self.norm.load_state_dict(sd, &prefixed(prefix, "norm"))?;
-        self.q_proj = get_tensor(sd, &prefixed(prefix, "q_proj"))?;
-        self.q_bias = get_tensor(sd, &prefixed(prefix, "q_bias"))?;
-        self.k_proj = get_tensor(sd, &prefixed(prefix, "k_proj"))?;
-        self.k_bias = get_tensor(sd, &prefixed(prefix, "k_bias"))?;
-        self.v_proj = get_tensor(sd, &prefixed(prefix, "v_proj"))?;
-        self.v_bias = get_tensor(sd, &prefixed(prefix, "v_bias"))?;
-        self.out_proj = get_tensor(sd, &prefixed(prefix, "out_proj"))?;
-        self.out_bias = get_tensor(sd, &prefixed(prefix, "out_bias"))?;
+        load_state_field!(self, sd, prefix, [q_proj, q_bias, k_proj, k_bias, v_proj, v_bias, out_proj, out_bias]);
         Ok(())
     }
 }
@@ -356,16 +349,7 @@ impl ConvModule {
 impl HasStateDict for ConvModule {
     fn state_dict(&self, prefix: &str) -> StateDict {
         let mut sd = self.norm.state_dict(&prefixed(prefix, "norm"));
-        for (name, t) in [
-            ("pw1_weight", &self.pw1_weight),
-            ("pw1_bias", &self.pw1_bias),
-            ("dw_weight", &self.dw_weight),
-            ("dw_bias", &self.dw_bias),
-            ("pw2_weight", &self.pw2_weight),
-            ("pw2_bias", &self.pw2_bias),
-        ] {
-            sd.insert(prefixed(prefix, name), t.clone());
-        }
+        state_field!(sd, prefix, self, [pw1_weight, pw1_bias, dw_weight, dw_bias, pw2_weight, pw2_bias]);
         match &self.conv_norm {
             ConvNorm::LayerNorm(ln) => sd.extend(ln.state_dict(&prefixed(prefix, "conv_norm"))),
             ConvNorm::BatchNorm { scale, bias, mean, invstd } => {
@@ -379,12 +363,7 @@ impl HasStateDict for ConvModule {
 
     fn load_state_dict(&mut self, sd: &StateDict, prefix: &str) -> std::result::Result<(), crate::state::Error> {
         self.norm.load_state_dict(sd, &prefixed(prefix, "norm"))?;
-        self.pw1_weight = get_tensor(sd, &prefixed(prefix, "pw1_weight"))?;
-        self.pw1_bias = get_tensor(sd, &prefixed(prefix, "pw1_bias"))?;
-        self.dw_weight = get_tensor(sd, &prefixed(prefix, "dw_weight"))?;
-        self.dw_bias = get_tensor(sd, &prefixed(prefix, "dw_bias"))?;
-        self.pw2_weight = get_tensor(sd, &prefixed(prefix, "pw2_weight"))?;
-        self.pw2_bias = get_tensor(sd, &prefixed(prefix, "pw2_bias"))?;
+        load_state_field!(self, sd, prefix, [pw1_weight, pw1_bias, dw_weight, dw_bias, pw2_weight, pw2_bias]);
         match &mut self.conv_norm {
             ConvNorm::LayerNorm(ln) => ln.load_state_dict(sd, &prefixed(prefix, "conv_norm"))?,
             ConvNorm::BatchNorm { scale, bias, mean, invstd } => {
@@ -536,14 +515,7 @@ impl StridingSubsampling {
 impl HasStateDict for StridingSubsampling {
     fn state_dict(&self, prefix: &str) -> StateDict {
         let mut sd = StateDict::new();
-        for (name, t) in [
-            ("conv1_weight", &self.conv1_weight),
-            ("conv1_bias", &self.conv1_bias),
-            ("conv2_weight", &self.conv2_weight),
-            ("conv2_bias", &self.conv2_bias),
-        ] {
-            sd.insert(prefixed(prefix, name), t.clone());
-        }
+        state_field!(sd, prefix, self, [conv1_weight, conv1_bias, conv2_weight, conv2_bias]);
         if let (Some(lw), Some(lb)) = (&self.linear_weight, &self.linear_bias) {
             sd.insert(prefixed(prefix, "linear_weight"), lw.clone());
             sd.insert(prefixed(prefix, "linear_bias"), lb.clone());
@@ -552,10 +524,7 @@ impl HasStateDict for StridingSubsampling {
     }
 
     fn load_state_dict(&mut self, sd: &StateDict, prefix: &str) -> std::result::Result<(), crate::state::Error> {
-        self.conv1_weight = get_tensor(sd, &prefixed(prefix, "conv1_weight"))?;
-        self.conv1_bias = get_tensor(sd, &prefixed(prefix, "conv1_bias"))?;
-        self.conv2_weight = get_tensor(sd, &prefixed(prefix, "conv2_weight"))?;
-        self.conv2_bias = get_tensor(sd, &prefixed(prefix, "conv2_bias"))?;
+        load_state_field!(self, sd, prefix, [conv1_weight, conv1_bias, conv2_weight, conv2_bias]);
         if matches!(self.mode, SubsamplingMode::Conv2d) {
             self.linear_weight = Some(get_tensor(sd, &prefixed(prefix, "linear_weight"))?);
             self.linear_bias = Some(get_tensor(sd, &prefixed(prefix, "linear_bias"))?);
@@ -683,6 +652,21 @@ impl Encoder {
         if dtype.is_float() { dtype } else { DType::Float32 }
     }
 
+    /// Shrink the precomputed RoPE cache to `[t, 1, 1, d_k/2]` so both
+    /// single-batch and batched encoder forwards consume the same shape.
+    fn slice_rope(&self, t: SInt) -> Result<(Tensor, Tensor)> {
+        let d_half = self.d_model / self.n_heads / 2;
+        let shrink = [
+            (SInt::Const(0), t),
+            (SInt::Const(0), SInt::Const(1)),
+            (SInt::Const(0), SInt::Const(1)),
+            (SInt::Const(0), SInt::Const(d_half)),
+        ];
+        let cos = self.cos_cache.try_shrink(shrink.clone()).context(TensorSnafu)?;
+        let sin = self.sin_cache.try_shrink(shrink).context(TensorSnafu)?;
+        Ok((cos, sin))
+    }
+
     /// Encoder pass on a single mel batch with no padding mask.
     /// Input: tensor `[B, n_mels, T]`. Output: lazy tensor `[B, d_model, T/4]`.
     pub fn forward(&self, mel: &Tensor) -> Result<Tensor> {
@@ -692,27 +676,7 @@ impl Encoder {
 
         let shape = x.shape().context(TensorSnafu)?;
         let seq_len = shape[1].clone();
-
-        let d_half = self.d_model / self.n_heads / 2;
-
-        let cos = self
-            .cos_cache
-            .try_shrink([
-                (SInt::Const(0), seq_len.clone()),
-                (SInt::Const(0), SInt::Const(1)),
-                (SInt::Const(0), SInt::Const(1)),
-                (SInt::Const(0), SInt::Const(d_half)),
-            ])
-            .context(TensorSnafu)?;
-        let sin = self
-            .sin_cache
-            .try_shrink([
-                (SInt::Const(0), seq_len.clone()),
-                (SInt::Const(0), SInt::Const(1)),
-                (SInt::Const(0), SInt::Const(1)),
-                (SInt::Const(0), SInt::Const(d_half)),
-            ])
-            .context(TensorSnafu)?;
+        let (cos, sin) = self.slice_rope(seq_len)?;
 
         let mut x = x;
         for layer in &self.layers {
@@ -776,25 +740,7 @@ impl Encoder {
         );
         let pad_mask = pad_valid.logical_not().context(TensorSnafu)?;
 
-        let d_half = self.d_model / self.n_heads / 2;
-        let cos = self
-            .cos_cache
-            .try_shrink([
-                (SInt::Const(0), t_sub.clone()),
-                (SInt::Const(0), SInt::Const(1)),
-                (SInt::Const(0), SInt::Const(1)),
-                (SInt::Const(0), SInt::Const(d_half)),
-            ])
-            .context(TensorSnafu)?;
-        let sin = self
-            .sin_cache
-            .try_shrink([
-                (SInt::Const(0), t_sub.clone()),
-                (SInt::Const(0), SInt::Const(1)),
-                (SInt::Const(0), SInt::Const(1)),
-                (SInt::Const(0), SInt::Const(d_half)),
-            ])
-            .context(TensorSnafu)?;
+        let (cos, sin) = self.slice_rope(t_sub)?;
 
         let mut x = x;
         for layer in &self.layers {
@@ -807,30 +753,30 @@ impl Encoder {
     pub fn subsampling_output_length(&self, mel_frames: usize) -> usize {
         self.subsampling.output_length(mel_frames)
     }
-}
 
-/// Construct an `Encoder` from an already-remapped state dict + config.
-/// Called from the unified [`crate::gigaam::GigaAm::from_state_dict`] loader.
-pub(crate) fn build_encoder_from_sd(sd: &StateDict, config: &GigaAmConfig) -> Result<Encoder> {
-    let (cos_cache, sin_cache) = build_rope_cache(config);
+    /// Construct an `Encoder` from an already-remapped state dict + config.
+    /// Called from the unified [`crate::gigaam::GigaAm::from_state_dict`] loader.
+    pub(crate) fn from_state_dict(sd: &StateDict, config: &GigaAmConfig) -> Result<Self> {
+        let (cos_cache, sin_cache) = build_rope_cache(config);
 
-    let mut subsampling = StridingSubsampling::empty(config);
-    subsampling.load_state_dict(sd, "subsampling").context(StateSnafu)?;
+        let mut subsampling = StridingSubsampling::empty(config);
+        subsampling.load_state_dict(sd, "subsampling").context(StateSnafu)?;
 
-    let mut layers = Vec::with_capacity(config.n_layers);
-    for i in 0..config.n_layers {
-        let mut layer = ConformerLayer::empty(config);
-        layer.load_state_dict(sd, &format!("layers.{i}")).context(StateSnafu)?;
-        layers.push(layer);
+        let mut layers = Vec::with_capacity(config.n_layers);
+        for i in 0..config.n_layers {
+            let mut layer = ConformerLayer::empty(config);
+            layer.load_state_dict(sd, &format!("layers.{i}")).context(StateSnafu)?;
+            layers.push(layer);
+        }
+
+        Ok(Self {
+            subsampling,
+            layers,
+            cos_cache,
+            sin_cache,
+            d_model: config.d_model,
+            n_heads: config.n_heads,
+            max_encoder_frames: config.max_encoder_frames,
+        })
     }
-
-    Ok(Encoder {
-        subsampling,
-        layers,
-        cos_cache,
-        sin_cache,
-        d_model: config.d_model,
-        n_heads: config.n_heads,
-        max_encoder_frames: config.max_encoder_frames,
-    })
 }

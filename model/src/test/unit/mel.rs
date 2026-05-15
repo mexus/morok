@@ -1,17 +1,28 @@
-use morok_dtype::DType;
-use morok_tensor::Tensor;
-
 use crate::audio::{MelConfig, MelSpectrogram};
 
-fn run_mel(config: &MelConfig, waveform: &[f32]) -> Tensor {
+struct MelOutput {
+    data: ndarray::Array3<f32>,
+}
+
+impl MelOutput {
+    fn shape(&self) -> (usize, usize, usize) {
+        let s = self.data.shape();
+        (s[0], s[1], s[2])
+    }
+
+    fn as_slice(&self) -> &[f32] {
+        self.data.as_slice().expect("contiguous mel buffer")
+    }
+}
+
+fn run_mel(config: &MelConfig, waveform: &[f32]) -> MelOutput {
     let mel = MelSpectrogram::new(config);
     let n_mels = mel.n_mels();
     let n_frames = mel.num_frames(waveform.len());
-    let mut t = Tensor::full(&[1, n_mels, n_frames], 0.0f32, DType::Float32).unwrap();
-    t.realize().unwrap();
-    let mut view = t.array_view_mut::<f32>().unwrap();
+    let mut data = ndarray::Array3::<f32>::zeros((1, n_mels, n_frames));
+    let mut view = data.view_mut().into_dyn();
     mel.forward_into(waveform, &mut view);
-    t
+    MelOutput { data }
 }
 
 #[test]
@@ -23,10 +34,7 @@ fn test_mel_spectrogram_shape_center_true() {
         (0..16000).map(|i| (i as f32 * 440.0 * 2.0 * std::f32::consts::PI / 16000.0).sin()).collect();
     let output = run_mel(&config, &waveform);
 
-    let shape = output.shape().unwrap();
-    assert_eq!(shape[0].as_const().unwrap(), 1);
-    assert_eq!(shape[1].as_const().unwrap(), 64);
-    assert_eq!(shape[2].as_const().unwrap(), 101);
+    assert_eq!(output.shape(), (1, 64, 101));
 }
 
 #[test]
@@ -38,10 +46,7 @@ fn test_mel_spectrogram_shape_center_false() {
         (0..16000).map(|i| (i as f32 * 440.0 * 2.0 * std::f32::consts::PI / 16000.0).sin()).collect();
     let output = run_mel(&config, &waveform);
 
-    let shape = output.shape().unwrap();
-    assert_eq!(shape[0].as_const().unwrap(), 1);
-    assert_eq!(shape[1].as_const().unwrap(), 64);
-    assert_eq!(shape[2].as_const().unwrap(), 99);
+    assert_eq!(output.shape(), (1, 64, 99));
 }
 
 #[test]
@@ -52,8 +57,7 @@ fn test_mel_spectrogram_values_finite() {
     let waveform: Vec<f32> = vec![0.0; 1600];
     let output = run_mel(&config, &waveform);
 
-    let vals = output.as_vec::<f32>().unwrap();
-    for v in &vals {
+    for v in output.as_slice() {
         assert!(v.is_finite(), "mel output contains non-finite value: {v}");
     }
 }
@@ -67,10 +71,8 @@ fn test_mel_spectrogram_sine_wave() {
         (0..16000).map(|i| (i as f32 * 440.0 * 2.0 * std::f32::consts::PI / 16000.0).sin()).collect();
     let output = run_mel(&config, &waveform);
 
-    let vals = output.as_vec::<f32>().unwrap();
-    let shape = output.shape().unwrap();
-    let n_mels = shape[1].as_const().unwrap();
-    let n_frames = shape[2].as_const().unwrap();
+    let vals = output.as_slice();
+    let (_, n_mels, n_frames) = output.shape();
 
     let mut avg_energy: Vec<f32> = vec![0.0; n_mels];
     for mel_idx in 0..n_mels {

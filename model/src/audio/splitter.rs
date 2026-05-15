@@ -72,6 +72,14 @@ pub trait Splitter {
     type Error: std::error::Error + Send + Sync + 'static;
 
     fn split(&mut self, waveform: &[f32], bounds: &EncoderBounds) -> Result<Vec<AudioChunk>, Self::Error>;
+
+    /// Upper bound (in samples) on the longest chunk this splitter could
+    /// emit. Consumed by the transcriber to size JIT buffers — a tighter
+    /// advertised bound trades peak memory for tighter chunk handling.
+    /// Default: full encoder capacity.
+    fn max_chunk_samples(&self, bounds: &EncoderBounds) -> usize {
+        bounds.max_samples()
+    }
 }
 
 /// No-VAD splitter: walks the waveform in `bounds.max_samples()`-sized

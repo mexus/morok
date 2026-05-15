@@ -57,67 +57,7 @@ fn remap_key(key: &str, config: &GigaAmConfig) -> Option<String> {
     if parts[..2] == ["encoder", "layers"] && parts.len() >= 4 {
         let i = parts[2];
         let rest = &parts[3..];
-
-        if rest[0] == "norm_feed_forward1" {
-            return Some(format!("layers.{i}.ffn1.norm.{}", &rest[1..].join(".")));
-        }
-        if rest[0] == "feed_forward1" && rest.len() == 3 {
-            let sub = rest[1];
-            let param = rest[2];
-            return Some(format!("layers.{i}.ffn1.{sub}.{param}"));
-        }
-
-        if rest[0] == "norm_self_att" {
-            return Some(format!("layers.{i}.mhsa.norm.{}", &rest[1..].join(".")));
-        }
-        if rest[0] == "self_attn" && rest.len() == 3 {
-            let linear = rest[1];
-            let param = rest[2];
-            let base = match linear {
-                "linear_q" => "q",
-                "linear_k" => "k",
-                "linear_v" => "v",
-                "linear_out" => "out",
-                "linear_pos" => return None,
-                _ => return None,
-            };
-            let suffix = match param {
-                "weight" => "proj",
-                "bias" => "bias",
-                _ => return None,
-            };
-            return Some(format!("layers.{i}.mhsa.{base}_{suffix}"));
-        }
-
-        if rest[0] == "norm_conv" {
-            return Some(format!("layers.{i}.conv.norm.{}", &rest[1..].join(".")));
-        }
-        if rest[0] == "conv" && rest.len() == 3 {
-            let sub = rest[1];
-            let param = rest[2];
-            match sub {
-                "pointwise_conv1" => return Some(format!("layers.{i}.conv.pw1_{param}")),
-                "depthwise_conv" => return Some(format!("layers.{i}.conv.dw_{param}")),
-                "pointwise_conv2" => return Some(format!("layers.{i}.conv.pw2_{param}")),
-                "batch_norm" => return remap_bn_key(i, param, config),
-                _ => return None,
-            }
-        }
-
-        if rest[0] == "norm_feed_forward2" {
-            return Some(format!("layers.{i}.ffn2.norm.{}", &rest[1..].join(".")));
-        }
-        if rest[0] == "feed_forward2" && rest.len() == 3 {
-            let sub = rest[1];
-            let param = rest[2];
-            return Some(format!("layers.{i}.ffn2.{sub}.{param}"));
-        }
-
-        if rest[0] == "norm_out" {
-            return Some(format!("layers.{i}.final_norm.{}", &rest[1..].join(".")));
-        }
-
-        return None;
+        return remap_encoder_layer(i, rest, config);
     }
 
     if parts[..2] == ["head", "decoder_layers"] && parts.len() >= 4 {
@@ -157,6 +97,55 @@ fn remap_key(key: &str, config: &GigaAmConfig) -> Option<String> {
             return Some(format!("head.joint.{suffix}"));
         }
         return None;
+    }
+
+    None
+}
+
+/// Encoder-layer key remapping. The 7 "passthrough" sub-modules (4 norms + 2
+/// feed-forwards + final_norm) all share the same rename shape: replace the
+/// `rest[0]` prefix with the morok target prefix and keep the remaining
+/// path segments verbatim. `self_attn` and `conv` need bespoke logic.
+fn remap_encoder_layer(i: &str, rest: &[&str], config: &GigaAmConfig) -> Option<String> {
+    // (rest[0] prefix → morok target prefix)
+    const PASSTHROUGH: &[(&str, &str)] = &[
+        ("norm_feed_forward1", "ffn1.norm"),
+        ("feed_forward1", "ffn1"),
+        ("norm_self_att", "mhsa.norm"),
+        ("norm_conv", "conv.norm"),
+        ("norm_feed_forward2", "ffn2.norm"),
+        ("feed_forward2", "ffn2"),
+        ("norm_out", "final_norm"),
+    ];
+    if let Some(&(_, target)) = PASSTHROUGH.iter().find(|(src, _)| *src == rest[0]) {
+        return Some(format!("layers.{i}.{target}.{}", rest[1..].join(".")));
+    }
+
+    if rest[0] == "self_attn" && rest.len() == 3 {
+        let base = match rest[1] {
+            "linear_q" => "q",
+            "linear_k" => "k",
+            "linear_v" => "v",
+            "linear_out" => "out",
+            _ => return None,
+        };
+        let suffix = match rest[2] {
+            "weight" => "proj",
+            "bias" => "bias",
+            _ => return None,
+        };
+        return Some(format!("layers.{i}.mhsa.{base}_{suffix}"));
+    }
+
+    if rest[0] == "conv" && rest.len() == 3 {
+        let param = rest[2];
+        return match rest[1] {
+            "pointwise_conv1" => Some(format!("layers.{i}.conv.pw1_{param}")),
+            "depthwise_conv" => Some(format!("layers.{i}.conv.dw_{param}")),
+            "pointwise_conv2" => Some(format!("layers.{i}.conv.pw2_{param}")),
+            "batch_norm" => remap_bn_key(i, param, config),
+            _ => None,
+        };
     }
 
     None

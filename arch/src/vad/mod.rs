@@ -75,6 +75,12 @@ pub struct ChunkerOpts {
     /// which is fine when smoothing tightness and trough-search width happen
     /// to want the same scale; set explicitly to decouple them.
     pub trough_search_probs: Option<usize>,
+    /// Secondary threshold (typically lower than `threshold`) for
+    /// `split_long_runs`. When `Some(t)`, search the full legal split
+    /// range for the frame closest to the geometric target with prob
+    /// `< t`; fall back to the narrow argmin around the target when no
+    /// frame qualifies. `None` always uses narrow argmin.
+    pub trough_threshold: Option<f32>,
     /// Symmetric pad in samples added to each chunk's start/end (clamped at
     /// 0 and the implicit waveform end). Gives the encoder context at chunk
     /// boundaries.
@@ -101,6 +107,7 @@ impl Default for ChunkerOpts {
             min_silence_probs: 4,
             merge_gap_probs: 8,
             trough_search_probs: None,
+            trough_threshold: None,
             pad_samples: 0,
             align_to: 1,
         }
@@ -142,6 +149,21 @@ pub enum Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// Upper bound (in samples) on any chunk [`chunks_from_probs`] can emit:
+/// `strict_limit + 2·trough_radius` (split_long_runs slack) `+ 2·pad +
+/// align_to` (post-process slack at waveform edges + alignment ceil).
+/// Single source of truth for downstream callers that need to size
+/// buffers or assert the contract.
+pub fn strict_chunk_sample_bound(
+    strict_limit_probs: usize,
+    trough_radius: usize,
+    samples_per_prob: usize,
+    pad_samples: usize,
+    align_to: usize,
+) -> usize {
+    (strict_limit_probs + 2 * trough_radius) * samples_per_prob + 2 * pad_samples + align_to
+}
+
 // ─── Public entry point ───────────────────────────────────────────────────
 
 /// Pack VAD speech probabilities into bounded-length chunks.
@@ -163,8 +185,23 @@ pub fn chunks_from_probs(probs: &[f32], opts: &ChunkerOpts) -> Result<Vec<AudioC
     let max_probs = (opts.max_duration * probs_per_sec).ceil() as usize;
 
     let trough_radius = opts.trough_search_probs.unwrap_or(opts.min_silence_probs);
-    let segments = threshold_segments(probs, opts);
-    let segments = split_long_runs(segments, probs, trough_radius, strict_limit_probs);
+    let trough_threshold = opts.trough_threshold;
+
+    // Halve the silence-sensitivity knobs and retry if `threshold_segments`
+    // produced any segment exceeding `strict_limit_probs` — gives `split_long_runs`
+    // less work / more silence to cut at. Floor at 2 because a single
+    // sub-threshold prob is reliably a VAD micro-dip mid-word, not silence.
+    let mut adapted = opts.clone();
+    let segments = loop {
+        let segs = threshold_segments(probs, &adapted);
+        let any_over = segs.iter().any(|&(s, e)| e - s > strict_limit_probs);
+        if !any_over || adapted.min_silence_probs <= 2 {
+            break segs;
+        }
+        adapted.min_silence_probs = (adapted.min_silence_probs / 2).max(2);
+        adapted.merge_gap_probs = (adapted.merge_gap_probs / 2).max(1);
+    };
+    let segments = split_long_runs(segments, probs, trough_radius, trough_threshold, strict_limit_probs);
     let chunks = pack_segments(&segments, min_probs, max_probs, strict_limit_probs);
 
     Ok(post_process(&chunks, probs.len(), opts))
@@ -203,6 +240,7 @@ fn split_long_runs(
     segments: Vec<(usize, usize)>,
     probs: &[f32],
     search_radius: usize,
+    trough_threshold: Option<f32>,
     strict_limit_probs: usize,
 ) -> Vec<(usize, usize)> {
     if strict_limit_probs == 0 {
@@ -224,11 +262,31 @@ fn split_long_runs(
             // Constrain the argmin window so this split is at least
             // min_piece away from cur and from `end - pieces_left * min_piece`
             // (i.e. each remaining piece can still hit min_piece).
-            let lo = target.saturating_sub(search_radius).max(cur + min_piece);
+            let lo_narrow = target.saturating_sub(search_radius).max(cur + min_piece);
             let hi_floor = end.saturating_sub(pieces_left * min_piece);
-            let hi = (target + search_radius).min(hi_floor.saturating_sub(1));
-            let split = if hi >= lo {
-                lo + argmin(&probs[lo..=hi])
+            let hi_narrow = (target + search_radius).min(hi_floor.saturating_sub(1));
+
+            // With `trough_threshold`: prefer a real silence frame anywhere
+            // in the legal range (closest to target for balance) over the
+            // narrow-radius argmin which may land inside speech.
+            let trough_split = trough_threshold.and_then(|t| {
+                let lo_wide = cur + min_piece;
+                let hi_wide = hi_floor.saturating_sub(1);
+                if hi_wide < lo_wide {
+                    return None;
+                }
+                let slice = &probs[lo_wide..=hi_wide];
+                slice
+                    .iter()
+                    .enumerate()
+                    .filter(|&(_, &p)| p < t)
+                    .min_by_key(|(i, _)| (lo_wide + i).abs_diff(target))
+                    .map(|(i, _)| lo_wide + i)
+            });
+            let split = if let Some(s) = trough_split {
+                s
+            } else if hi_narrow >= lo_narrow {
+                lo_narrow + argmin(&probs[lo_narrow..=hi_narrow])
             } else {
                 // Constraints incompatible (radius wider than the available
                 // slack). Fall back to the geometric target, clamped so the
@@ -292,20 +350,38 @@ fn pack_segments(
     chunks
 }
 
-/// Convert prob-index ranges to sample ranges, apply padding + alignment,
-/// and merge any overlaps introduced by padding.
+/// Convert prob-index ranges to sample ranges. Padding is adaptive: each
+/// side is capped at half the silence gap to the neighbour, so chunks
+/// never overlap their neighbours' speech. Alignment-induced overlap
+/// (floor-start / ceil-end rounding) is clipped to preserve splits.
 fn post_process(chunks: &[(usize, usize)], probs_len: usize, opts: &ChunkerOpts) -> Vec<AudioChunk> {
     let max_sample = probs_len * opts.samples_per_prob;
     let pad = opts.pad_samples;
     let align = opts.align_to;
 
     let mut out: Vec<AudioChunk> = Vec::with_capacity(chunks.len());
-    for &(s, e) in chunks {
+    for (i, &(s, e)) in chunks.iter().enumerate() {
         let raw_start = s * opts.samples_per_prob;
         let raw_end = e * opts.samples_per_prob;
-        let padded_start = raw_start.saturating_sub(pad);
-        let padded_end = (raw_end + pad).min(max_sample);
-        // Floor start, ceil end (preserves coverage).
+
+        // Cap each side's padding at half the silence gap to the neighbour
+        // (or the full margin at the waveform edges). Floor division: total
+        // pad consumed by adjacent chunks ≤ gap, so they never overlap.
+        let pad_left = if i == 0 {
+            pad.min(raw_start)
+        } else {
+            let prev_raw_end = chunks[i - 1].1 * opts.samples_per_prob;
+            pad.min(raw_start.saturating_sub(prev_raw_end) / 2)
+        };
+        let pad_right = if i + 1 == chunks.len() {
+            pad.min(max_sample.saturating_sub(raw_end))
+        } else {
+            let next_raw_start = chunks[i + 1].0 * opts.samples_per_prob;
+            pad.min(next_raw_start.saturating_sub(raw_end) / 2)
+        };
+
+        let padded_start = raw_start - pad_left;
+        let padded_end = (raw_end + pad_right).min(max_sample);
         let aligned_start = (padded_start / align) * align;
         let mut aligned_end = padded_end.div_ceil(align) * align;
         if aligned_end > max_sample {
@@ -314,15 +390,16 @@ fn post_process(chunks: &[(usize, usize)], probs_len: usize, opts: &ChunkerOpts)
         if aligned_end <= aligned_start {
             continue;
         }
-        // Merge only on *strict* overlap (start < last.end). Two chunks
-        // that just touch at a shared sample (start == last.end) come from
-        // pack_segments deliberately splitting at a silence — preserve
-        // that decision. Padding only triggers a merge when chunks
-        // actually grow into one another.
         if let Some(last) = out.last_mut()
             && aligned_start < last.end_sample
         {
-            last.end_sample = last.end_sample.max(aligned_end);
+            // Alignment-only overlap (asymmetric floor/ceil rounding put us
+            // inside the previous chunk). Clip our start up to preserve the
+            // split. Drop if it collapses to empty.
+            let bumped_start = last.end_sample;
+            if aligned_end > bumped_start {
+                out.push(AudioChunk { start_sample: bumped_start, end_sample: aligned_end });
+            }
             continue;
         }
         out.push(AudioChunk { start_sample: aligned_start, end_sample: aligned_end });

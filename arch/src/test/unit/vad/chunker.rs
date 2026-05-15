@@ -17,6 +17,7 @@ fn fast_opts() -> ChunkerOpts {
         min_silence_probs: 2,
         merge_gap_probs: 0,
         trough_search_probs: None,
+        trough_threshold: None,
         pad_samples: 0,
         align_to: 1,
     }
@@ -159,6 +160,7 @@ fn test_chunker_align_to_640() {
         min_silence_probs: 2,
         merge_gap_probs: 0,
         trough_search_probs: None,
+        trough_threshold: None,
         pad_samples: 0,
         align_to: 640,
     };
@@ -260,14 +262,16 @@ proptest! {
             min_silence_probs: min_silence,
             merge_gap_probs: merge_gap,
             trough_search_probs: None,
+        trough_threshold: None,
             pad_samples,
             align_to,
         };
         let chunks = chunks_from_probs(&probs, &opts).unwrap();
         let max_sample = probs.len() * samples_per_prob;
 
-        // Sorted + non-overlapping (touching allowed: pack_segments may
-        // cut at silence boundaries that produce shared sample indices).
+        // Sorted + non-overlapping (touching allowed). Adaptive padding
+        // caps each chunk's pad at half the silence gap to the neighbour,
+        // so padding can never bump adjacent chunks into one another.
         for w in chunks.windows(2) {
             prop_assert!(
                 w[0].end_sample <= w[1].start_sample,
@@ -322,6 +326,7 @@ proptest! {
             min_silence_probs: min_silence,
             merge_gap_probs: merge_gap,
             trough_search_probs: None,
+        trough_threshold: None,
             pad_samples: 0,
             align_to: 1,
         };
@@ -330,7 +335,13 @@ proptest! {
         let strict_limit_probs = (strict_dur * probs_per_sec).ceil() as usize;
         // With `trough_search_probs: None` the radius defaults to min_silence.
         let radius = min_silence;
-        let bound_samples = (strict_limit_probs + 2 * radius) * samples_per_prob;
+        let bound_samples = crate::vad::strict_chunk_sample_bound(
+            strict_limit_probs,
+            radius,
+            samples_per_prob,
+            opts.pad_samples,
+            opts.align_to,
+        );
         for c in &chunks {
             let len = c.end_sample - c.start_sample;
             prop_assert!(
@@ -362,6 +373,7 @@ proptest! {
             min_silence_probs: 1,
             merge_gap_probs: 0,
             trough_search_probs: None,
+        trough_threshold: None,
             pad_samples: 0,
             align_to: 1,
         };
@@ -418,6 +430,7 @@ fn test_chunker_split_long_runs_respects_min_piece_floor() {
         min_silence_probs: 100, // suppress smoothing-driven termination
         merge_gap_probs: 0,
         trough_search_probs: Some(10),
+        trough_threshold: None,
         pad_samples: 0,
         align_to: 1,
     };
@@ -447,6 +460,7 @@ fn test_chunker_decoupled_trough_search_radius() {
         min_silence_probs: 2,
         merge_gap_probs: 0,
         trough_search_probs: Some(8),
+        trough_threshold: None,
         pad_samples: 0,
         align_to: 1,
     };

@@ -70,3 +70,31 @@ pub fn get_tensor(sd: &StateDict, key: &str) -> Result<Tensor> {
 pub fn prefixed(prefix: &str, name: &str) -> String {
     if prefix.is_empty() { name.to_string() } else { format!("{prefix}.{name}") }
 }
+
+/// Insert each named field of `$self` into the state dict under
+/// `<prefix>.<field>`. Field idents are used verbatim as keys.
+#[macro_export]
+macro_rules! state_field {
+    ($sd:expr, $prefix:expr, $self:ident, [$($field:ident),+ $(,)?]) => {
+        $(
+            $sd.insert(
+                $crate::state::prefixed($prefix, stringify!($field)),
+                $self.$field.clone(),
+            );
+        )+
+    };
+}
+
+/// Load each named field of `$self` from the state dict under
+/// `<prefix>.<field>`. Mirrors [`state_field!`].
+#[macro_export]
+macro_rules! load_state_field {
+    ($self:ident, $sd:expr, $prefix:expr, [$($field:ident),+ $(,)?]) => {
+        $(
+            $self.$field = $crate::state::get_tensor(
+                $sd,
+                &$crate::state::prefixed($prefix, stringify!($field)),
+            )?;
+        )+
+    };
+}

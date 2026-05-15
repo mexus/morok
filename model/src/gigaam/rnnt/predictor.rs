@@ -104,30 +104,21 @@ impl RnntPredictor {
         Tensor::cat(&[&g, &new_h_flat, &new_c_flat], 2).context(TensorSnafu)
     }
 
-    /// Cast predictor weights to fp32 (predictor is small; the encoder may
-    /// keep its native fp16/bf16 path) and force the blank-id embedding
-    /// row to zero, in place. Together these implement the Python
+    /// Zero the blank-id embedding row in place — matches Python's
     /// `predict(None, None, batch_size)` empty-prefix path without a
-    /// separate fresh-step JIT.
-    ///
-    /// Some checkpoints (notably `v3_e2e_rnnt`) do NOT keep
-    /// `embed.weight[blank_id]` at zero — fine-tuning updated it. We patch
-    /// it here so morok matches the Python decoder regardless of how the
-    /// checkpoint was trained.
+    /// separate fresh-step JIT. Load-bearing for checkpoints like
+    /// `v3_e2e_rnnt` whose fine-tuned blank row is non-zero.
     pub(crate) fn prepare_for_inference(&mut self) -> Result<()> {
-        self.embed = self.embed.cast(DType::Float32).context(TensorSnafu)?;
+        let mut mask_data = vec![1.0_f32; self.num_classes];
+        mask_data[self.blank_id] = 0.0;
+        let embed_dtype = self.embed.uop().dtype();
+        let mask = Tensor::from_slice(&mask_data)
+            .try_reshape([self.num_classes, 1])
+            .context(TensorSnafu)?
+            .cast(embed_dtype)
+            .context(TensorSnafu)?;
+        self.embed = self.embed.try_mul(&mask).context(TensorSnafu)?;
         self.embed.realize().context(TensorSnafu)?;
-        for cell in &mut self.layers {
-            for t in [&mut cell.weight_ih, &mut cell.weight_hh, &mut cell.bias_ih, &mut cell.bias_hh] {
-                *t = t.cast(DType::Float32).context(TensorSnafu)?;
-                t.realize().context(TensorSnafu)?;
-            }
-        }
-        let mut view = self.embed.array_view_mut::<f32>().context(TensorSnafu)?;
-        let p = self.pred_hidden;
-        let row_start = self.blank_id * p;
-        let slice = view.as_slice_mut().expect("contiguous embed");
-        slice[row_start..row_start + p].fill(0.0);
         Ok(())
     }
 }

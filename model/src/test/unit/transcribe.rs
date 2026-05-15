@@ -10,7 +10,7 @@
 use morok_arch::rnnt::Word;
 
 use crate::gigaam::TranscribeOpts;
-use crate::gigaam::ctc_frames_to_words;
+use crate::gigaam::transcribe::ctc_frames_to_words;
 
 #[test]
 fn ctc_frames_to_words_empty() {

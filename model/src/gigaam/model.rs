@@ -14,17 +14,16 @@
 
 use std::path::Path;
 
-use morok_dtype::DType;
-use morok_tensor::{BoundVariable, Tensor};
 use snafu::ResultExt;
 
 use crate::state::{self, HasStateDict, StateDict};
 
 use crate::gigaam::ctc::CTCHead;
-use crate::gigaam::encoder::{Encoder, build_encoder_from_sd};
+use crate::gigaam::encoder::Encoder;
 use crate::gigaam::error::{Error, HubSnafu, StateSnafu};
-use crate::gigaam::rnnt::{RnntHead, load_sentencepiece_vocab};
+use crate::gigaam::rnnt::RnntHead;
 use crate::gigaam::{GigaAmConfig, Result, remap};
+use crate::sentencepiece;
 
 /// Unified GigaAM model. The `head` enum carries either a CTC projection or
 /// an RN-T predictor+joint pair; pattern-match (or use [`Head::as_ctc`] /
@@ -61,14 +60,6 @@ pub struct RnntRuntime {
 }
 
 impl Head {
-    pub fn is_ctc(&self) -> bool {
-        matches!(self, Head::Ctc(_))
-    }
-
-    pub fn is_rnnt(&self) -> bool {
-        matches!(self, Head::Rnnt { .. })
-    }
-
     pub fn as_ctc(&self) -> Option<&CTCHead> {
         if let Head::Ctc(h) = self { Some(h) } else { None }
     }
@@ -77,14 +68,20 @@ impl Head {
         if let Head::Rnnt { head, runtime } = self { Some((head, runtime)) } else { None }
     }
 
-    /// Infallible accessor. Panics with a clear message if the head is RN-T.
-    pub fn ctc(&self) -> &CTCHead {
-        self.as_ctc().expect("head variant is RN-T, expected CTC")
+    /// Try-accessor for the CTC variant, returning a typed `DecoderConfig`
+    /// error when the head is RN-T. Used by the head-side JIT wrappers so
+    /// "wrong head type" surfaces as a normal `Error` instead of a panic.
+    pub(crate) fn expect_ctc(&self, ctx: &str) -> Result<&CTCHead> {
+        self.as_ctc().ok_or_else(|| Error::DecoderConfig {
+            message: format!("{ctx} requires a CTC head; this model has an RN-T head"),
+        })
     }
 
-    /// Infallible accessor. Panics with a clear message if the head is CTC.
-    pub fn rnnt(&self) -> (&RnntHead, &RnntRuntime) {
-        self.as_rnnt().expect("head variant is CTC, expected RN-T")
+    /// Try-accessor for the RN-T variant. Mirrors [`Head::expect_ctc`].
+    pub(crate) fn expect_rnnt(&self, ctx: &str) -> Result<(&RnntHead, &RnntRuntime)> {
+        self.as_rnnt().ok_or_else(|| Error::DecoderConfig {
+            message: format!("{ctx} requires an RN-T head; this model has a CTC head"),
+        })
     }
 }
 
@@ -126,7 +123,10 @@ impl GigaAm {
     /// model. `tokenizer` is ignored for CTC configs.
     pub fn from_safetensors(weights: &Path, tokenizer: Option<&Path>, config: GigaAmConfig) -> Result<Self> {
         let sd = state::load_safetensors(weights).context(StateSnafu)?;
-        let vocab_override = tokenizer.map(load_sentencepiece_vocab).transpose()?;
+        let vocab_override = tokenizer
+            .map(sentencepiece::load_vocab)
+            .transpose()
+            .map_err(|e| Error::DecoderConfig { message: e.to_string() })?;
         Self::from_state_dict(&sd, config, vocab_override)
     }
 
@@ -146,7 +146,7 @@ impl GigaAm {
         let sd_owned = if is_pytorch { remap::remap_pytorch(sd.clone(), &config)? } else { sd.clone() };
         let sd = &sd_owned;
 
-        let encoder = build_encoder_from_sd(sd, &config)?;
+        let encoder = Encoder::from_state_dict(sd, &config)?;
 
         let head = match &config.transducer {
             None => {
@@ -175,7 +175,6 @@ impl GigaAm {
                 );
                 h.load_state_dict(sd, "head").context(StateSnafu)?;
                 h.predictor.prepare_for_inference()?;
-                h.joint.cast_to_f32()?;
                 Head::Rnnt {
                     head: h,
                     runtime: RnntRuntime {
@@ -212,33 +211,5 @@ impl GigaAm {
             },
         };
         Self { config, encoder, head }
-    }
-
-    /// dtype the encoder operates in (read from the loaded weights).
-    pub fn input_dtype(&self) -> DType {
-        self.encoder.input_dtype()
-    }
-
-    /// Encoder-only single-batch forward: mel `[1, n_mels, T]` → encoded
-    /// `[1, d_model, T_sub]`.
-    pub fn encode(&self, mel: &Tensor) -> Result<Tensor> {
-        self.encoder.forward(mel)
-    }
-
-    /// Batched encoder forward with dynamic batch and mel-frame length.
-    /// Input: `mel` `[B, n_mels, T_mel]`, `lengths` `[B]`. Output:
-    /// `[B, d_model, T_sub]`.
-    pub fn encode_batch(
-        &self,
-        mel: &Tensor,
-        lengths: &Tensor,
-        batch: &BoundVariable,
-        mel_len: &BoundVariable,
-    ) -> Result<Tensor> {
-        self.encoder.forward_batch(mel, lengths, batch, mel_len)
-    }
-
-    pub fn subsampling_output_length(&self, mel_frames: usize) -> usize {
-        self.encoder.subsampling_output_length(mel_frames)
     }
 }

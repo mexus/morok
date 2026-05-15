@@ -46,7 +46,14 @@ impl SileroVadSplitter {
         #[builder(default = 4)] min_silence_probs: usize,
         #[builder(default = 8)] merge_gap_probs: usize,
         trough_search_probs: Option<usize>,
-        #[builder(default = 0)] pad_samples: usize,
+        /// Pad budget (samples) per chunk side. Default `1600` (= 100 ms at
+        /// 16 kHz). The actual pad applied is capped at half the silence
+        /// gap to the neighbouring chunk — so chunks never overlap into
+        /// each other's speech (no transcript duplication), but at seams
+        /// with enough surrounding silence the encoder sees up to this
+        /// many extra samples of context on each side.
+        #[builder(default = 1600)]
+        pad_samples: usize,
     ) -> Self {
         Self {
             vad,
@@ -91,10 +98,31 @@ impl Splitter for SileroVadSplitter {
             min_silence_probs: self.min_silence_probs,
             merge_gap_probs: self.merge_gap_probs,
             trough_search_probs: self.trough_search_probs,
+            trough_threshold: Some(self.threshold * 0.5),
             pad_samples: self.pad_samples,
             align_to: bounds.align_to_samples().max(1),
         };
         morok_arch::vad::chunks_from_probs(&probs, &chunker_opts).context(ChunkSnafu)
+    }
+
+    /// Upper bound on chunk length the chunker can emit under this
+    /// splitter's config. Translating to samples lets `Transcriber::new`
+    /// size JIT buffers to this chunker's actual emission rather than the
+    /// encoder's full capacity. Shared bound math lives in
+    /// [`morok_arch::vad::strict_chunk_sample_bound`].
+    fn max_chunk_samples(&self, bounds: &EncoderBounds) -> usize {
+        let cap = bounds.encoder_capacity_secs();
+        let secs = self.strict_limit_duration.min(cap);
+        let probs_per_sec = bounds.sample_rate as f32 / NUM_SAMPLES as f32;
+        let strict_limit_probs = (secs * probs_per_sec).ceil() as usize;
+        let radius = self.trough_search_probs.unwrap_or(self.min_silence_probs);
+        morok_arch::vad::strict_chunk_sample_bound(
+            strict_limit_probs,
+            radius,
+            NUM_SAMPLES,
+            self.pad_samples,
+            bounds.align_to_samples(),
+        )
     }
 }
 

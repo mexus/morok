@@ -20,13 +20,15 @@ use snafu::ResultExt;
 
 use super::error::{ConfigIoSnafu, ConfigSnafu, Error, Result};
 
-#[derive(Clone)]
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SubsamplingMode {
     Conv1d,
     Conv2d,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ConvNormType {
     LayerNorm,
     BatchNorm,
@@ -83,19 +85,15 @@ pub struct TransducerConfig {
 impl GigaAmConfig {
     pub fn from_json(path: &Path) -> Result<Self> {
         let data = std::fs::read_to_string(path).context(ConfigIoSnafu)?;
-        let raw: RawConfig = serde_json::from_str(&data).context(ConfigSnafu)?;
-        Self::from_raw(raw.cfg.model.cfg)
+        let root: serde_json::Value = serde_json::from_str(&data).context(ConfigSnafu)?;
+        let leaf = root.pointer("/cfg/model/cfg").ok_or_else(|| Error::DecoderConfig {
+            message: "config.json missing required path /cfg/model/cfg".into(),
+        })?;
+        let raw: RawModelCfg = serde_json::from_value(leaf.clone()).context(ConfigSnafu)?;
+        Self::from_raw(raw)
     }
 
     fn from_raw(raw: RawModelCfg) -> Result<Self> {
-        let subsampling_mode = match raw.encoder.subsampling.as_str() {
-            "conv1d" => SubsamplingMode::Conv1d,
-            _ => SubsamplingMode::Conv2d,
-        };
-        let conv_norm_type = match raw.encoder.conv_norm_type.as_str() {
-            "layer_norm" => ConvNormType::LayerNorm,
-            _ => ConvNormType::BatchNorm,
-        };
         // `max_mel_frames` is the pre-subsampling sequence-length bound. Configs that
         // only specify `pos_emb_max_len` (the post-subsampling encoder bound) need it
         // multiplied by `subsampling_factor` so audio approaching the encoder cap
@@ -127,9 +125,9 @@ impl GigaAmConfig {
             d_ff: raw.encoder.d_model * raw.encoder.ff_expansion_factor,
             conv_kernel: raw.encoder.conv_kernel_size,
             subsampling_factor: raw.encoder.subsampling_factor,
-            subsampling_mode,
+            subsampling_mode: raw.encoder.subsampling,
             subs_kernel_size: raw.encoder.subs_kernel_size,
-            conv_norm_type,
+            conv_norm_type: raw.encoder.conv_norm_type,
             vocab_size,
             sample_rate: raw.preprocessor.sample_rate,
             n_fft: raw.preprocessor.n_fft,
@@ -145,21 +143,10 @@ impl GigaAmConfig {
 }
 
 // ─── Serde mirror structs (private) ───────────────────────────────────────
-
-#[derive(Deserialize)]
-struct RawConfig {
-    cfg: RawCfgL1,
-}
-
-#[derive(Deserialize)]
-struct RawCfgL1 {
-    model: RawCfgL2,
-}
-
-#[derive(Deserialize)]
-struct RawCfgL2 {
-    cfg: RawModelCfg,
-}
+//
+// On-disk shape is `cfg.model.cfg.{preprocessor,encoder,head,decoding}`; the
+// outer wrappers are navigated via `serde_json::Value::pointer` in `from_json`
+// rather than mirrored here so this file stays focused on the leaf shape.
 
 #[derive(Deserialize)]
 struct RawModelCfg {
@@ -191,10 +178,10 @@ struct RawEncoder {
     subsampling_factor: usize,
     #[serde(default = "default_subs_kernel_size")]
     subs_kernel_size: usize,
-    #[serde(default = "default_subsampling")]
-    subsampling: String,
+    #[serde(default = "default_subsampling_mode")]
+    subsampling: SubsamplingMode,
     #[serde(default = "default_conv_norm_type")]
-    conv_norm_type: String,
+    conv_norm_type: ConvNormType,
     #[serde(default = "default_pos_emb_max_len")]
     pos_emb_max_len: usize,
     #[serde(default)]
@@ -236,11 +223,11 @@ fn default_true() -> bool {
 fn default_subs_kernel_size() -> usize {
     3
 }
-fn default_subsampling() -> String {
-    "conv2d".to_string()
+fn default_subsampling_mode() -> SubsamplingMode {
+    SubsamplingMode::Conv2d
 }
-fn default_conv_norm_type() -> String {
-    "batch_norm".to_string()
+fn default_conv_norm_type() -> ConvNormType {
+    ConvNormType::BatchNorm
 }
 fn default_pos_emb_max_len() -> usize {
     5000

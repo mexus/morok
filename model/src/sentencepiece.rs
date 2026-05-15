@@ -1,22 +1,14 @@
-//! SentencePiece tokenizer loader. Reads a `.model` (protobuf) file and
-//! extracts the per-id pieces. Pieces retain their `▁` (U+2581) prefix on
-//! word-initial tokens; the call site concatenates and replaces `▁` with a
+//! SentencePiece `.model` (protobuf) loader. Pieces retain their `▁`
+//! (U+2581) prefix on word-initial tokens; consumers replace `▁` with a
 //! space for natural detokenization.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use snafu::ResultExt;
+use snafu::{ResultExt, Snafu};
 
-use crate::gigaam::Result;
-use crate::gigaam::error::{ConfigIoSnafu, Error};
-
-/// Minimal subset of the SentencePiece `ModelProto` schema needed to read out
-/// the `pieces` array. We don't need the trainer/normalizer specs, the score
-/// field, or any other top-level fields — prost silently skips unknown tags
-/// during decode, so this partial schema suffices.
-///
-/// Source of truth for tags: `submodules/GigaAM/.../sentencepiece_model.proto`
-/// (or upstream `google/sentencepiece` repo `src/sentencepiece_model.proto`).
+/// Partial decode of `ModelProto` — only the `pieces` array. prost skips
+/// unknown tags. Tag source of truth: upstream `google/sentencepiece`
+/// repo's `src/sentencepiece_model.proto`.
 #[derive(prost::Message)]
 struct SpModelProto {
     #[prost(message, repeated, tag = "1")]
@@ -34,17 +26,26 @@ struct SpPiece {
     r#type: Option<i32>,
 }
 
+#[derive(Debug, Snafu)]
+#[snafu(visibility(pub))]
+pub enum Error {
+    #[snafu(display("reading SentencePiece model from {}: {source}", path.display()))]
+    Io { path: PathBuf, source: std::io::Error },
+    #[snafu(display("parsing SentencePiece model at {}: {source}", path.display()))]
+    Decode { path: PathBuf, source: prost::DecodeError },
+}
+
+pub type Result<T> = std::result::Result<T, Error>;
+
 /// Read a SentencePiece `.model` file and return per-id raw pieces.
 ///
 /// Special tokens (UNKNOWN=2, CONTROL=3, BYTE=6, UNUSED=5) are mapped to the
 /// empty string so they elide from the transcript on the (rare) chance the
 /// model emits one.
-pub(crate) fn load_sentencepiece_vocab(path: &Path) -> Result<Vec<String>> {
+pub fn load_vocab(path: &Path) -> Result<Vec<String>> {
     use prost::Message;
-    let bytes = std::fs::read(path).context(ConfigIoSnafu)?;
-    let proto = SpModelProto::decode(&*bytes).map_err(|e| Error::DecoderConfig {
-        message: format!("failed to parse SentencePiece model at {}: {e}", path.display()),
-    })?;
+    let bytes = std::fs::read(path).context(IoSnafu { path: path.to_path_buf() })?;
+    let proto = SpModelProto::decode(&*bytes).context(DecodeSnafu { path: path.to_path_buf() })?;
     let mut pieces = Vec::with_capacity(proto.pieces.len());
     for p in proto.pieces {
         let kind = p.r#type.unwrap_or(1);

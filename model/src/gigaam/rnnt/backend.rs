@@ -83,28 +83,14 @@ pub struct StepStats {
     pub t_joint_read: Duration,
 }
 
-impl StepStats {
-    pub fn total(&self) -> Duration {
-        self.t_pred_pack
-            + self.t_pred_exec
-            + self.t_pred_read
-            + self.t_joint_pack
-            + self.t_joint_exec
-            + self.t_joint_read
-    }
-}
-
 impl RnntStepBackend {
     /// Build the backend from a model. `GigaAm` is cheap to clone (weights
     /// are `Tensor` handles backed by shared `Arc<Buffer>`s) so the predictor
     /// and joint JITs each take their own clone. The model must carry an
     /// RN-T head; CTC models are rejected.
     pub fn from_model(model: GigaAm) -> crate::jit::Result<Self> {
-        let (rnnt_head, _) = model.head.as_rnnt().ok_or_else(|| JitError::Build {
-            source: Box::new(crate::gigaam::Error::DecoderConfig {
-                message: "RnntStepBackend requires an RN-T head; this model has a CTC head".into(),
-            }),
-        })?;
+        let (rnnt_head, _) =
+            model.head.expect_rnnt("RnntStepBackend").map_err(|e| JitError::Build { source: Box::new(e) })?;
         let pred_hidden = rnnt_head.pred_hidden;
         let pred_rnn_layers = rnnt_head.pred_rnn_layers;
         let total_vocab = rnnt_head.num_classes;
@@ -132,14 +118,6 @@ impl RnntStepBackend {
             total_vocab,
             stats: StepStats::default(),
         })
-    }
-
-    pub fn total_vocab(&self) -> usize {
-        self.total_vocab
-    }
-
-    pub fn reset_stats(&mut self) {
-        self.stats = StepStats::default();
     }
 }
 

@@ -20,9 +20,7 @@ jit_wrapper! {
         c_in: Tensor,
 
         build(prev_token, h_in, c_in) {
-            let (rnnt_head, _) = model.head.as_rnnt().ok_or_else(|| crate::gigaam::Error::DecoderConfig {
-                message: "RnntPredictorStepJit requires an RN-T head; this model has a CTC head".into()
-            })?;
+            let (rnnt_head, _) = model.head.expect_rnnt("RnntPredictorStepJit")?;
             rnnt_head.predictor.forward_concat(prev_token, h_in, c_in)
         }
     }
@@ -34,9 +32,7 @@ jit_wrapper! {
         g: Tensor,
 
         build(enc_t, g) {
-            let (rnnt_head, _) = model.head.as_rnnt().ok_or_else(|| crate::gigaam::Error::DecoderConfig {
-                message: "RnntJointStepJit requires an RN-T head; this model has a CTC head".into()
-            })?;
+            let (rnnt_head, _) = model.head.expect_rnnt("RnntJointStepJit")?;
             rnnt_head.joint.forward(enc_t, g)
         }
     }

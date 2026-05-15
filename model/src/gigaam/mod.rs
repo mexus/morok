@@ -14,8 +14,7 @@
 //!
 //! Shared infrastructure:
 //! - [`config`] — `GigaAmConfig` JSON parsing.
-//! - [`encoder`] — `Encoder` + Conformer building blocks.
-//! - [`rope`] — RoPE cache.
+//! - [`encoder`] — `Encoder` + Conformer building blocks (also owns the RoPE cache).
 //! - [`remap`] — PyTorch state-dict key remapping.
 //! - [`error`] — `Error` / `Result`.
 
@@ -27,15 +26,10 @@ mod jit;
 mod model;
 pub(crate) mod remap;
 mod rnnt;
-mod rope;
-mod transcribe;
+pub(crate) mod transcribe;
 
-pub use config::*;
-pub use ctc::*;
-pub use encoder::*;
+pub use config::{ConvNormType, GigaAmConfig, SubsamplingMode, TransducerConfig};
 pub use error::{Error, Result};
-pub use jit::*;
-pub use model::*;
-pub use rnnt::*;
-pub use rope::*;
-pub use transcribe::*;
+pub use jit::GigaAmEncoderJit;
+pub use model::{GigaAm, Head, RnntRuntime};
+pub use transcribe::{ChunkResult, TranscribeError, TranscribeOpts, TranscribeResult, Transcriber, Word};

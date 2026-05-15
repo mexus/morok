@@ -21,13 +21,11 @@ jit_wrapper! {
 
         vars {
             b: (1, model.config.max_batch_size),
-            t_sub: (1, model.subsampling_output_length(model.config.max_mel_frames)),
+            t_sub: (1, model.encoder.subsampling_output_length(model.config.max_mel_frames)),
         }
 
         build(encoded, b, t_sub) {
-            let head = model.head.as_ctc().ok_or_else(|| crate::gigaam::Error::DecoderConfig {
-                message: "CtcHeadJit requires a CTC head; this model has an RN-T head".into()
-            })?;
+            let head = model.head.expect_ctc("CtcHeadJit")?;
             // encoded: [max_batch, d_model, max_t_sub] -> [b, d_model, t_sub].
             let encoded = encoded.try_shrink([
                 Some((SInt::Const(0), b.as_sint())),
