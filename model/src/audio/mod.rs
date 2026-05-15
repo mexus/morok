@@ -10,4 +10,4 @@ pub(crate) mod mel;
 mod splitter;
 
 pub use mel::{MelConfig, MelSpectrogram};
-pub use splitter::{AudioChunk, EncoderBounds, FixedLengthSplitter, Splitter};
+pub use splitter::{AudioChunk, EncoderBounds, FixedLengthSplitter, Splitter, trim_chunks_to_waveform};

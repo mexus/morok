@@ -173,6 +173,38 @@ fn test_chunker_align_to_640() {
 }
 
 #[test]
+fn test_chunker_end_sample_can_exceed_waveform_len() {
+    // `chunks_from_probs` sees only `probs`, not the raw `waveform`. When the
+    // waveform's actual length isn't a multiple of `samples_per_prob`, the
+    // last prob's window straddles the waveform end and the emitted chunk's
+    // `end_sample` reflects the full window — overshooting the waveform by
+    // up to `samples_per_prob - 1` samples. This is the contract documented
+    // at `AudioChunk::end_sample`: callers owning the waveform must clamp at
+    // slice time. Pinned here so the documented overshoot is exercised by a
+    // test, not just a comment.
+    let probs = vec![1.0_f32; 4]; // 4 windows × 512 = 2048 samples of coverage
+    let waveform_len = 1800; // real waveform ended mid-window
+    let opts = ChunkerOpts {
+        sample_rate: 16_000,
+        samples_per_prob: 512,
+        threshold: 0.5,
+        min_duration: 0.0,
+        max_duration: 1.0,
+        strict_limit_duration: 1.0,
+        min_speech_probs: 1,
+        min_silence_probs: 1,
+        merge_gap_probs: 1,
+        trough_search_probs: None,
+        trough_threshold: None,
+        pad_samples: 0,
+        align_to: 640, // GigaAM: hop_length * subsampling_factor
+    };
+    let chunks = chunks_from_probs(&probs, &opts).unwrap();
+    assert_eq!(chunks, vec![AudioChunk { start_sample: 0, end_sample: 2048 }]);
+    assert!(chunks[0].end_sample > waveform_len);
+}
+
+#[test]
 fn test_chunker_validates_min_exceeds_max() {
     let opts = ChunkerOpts { min_duration: 30.0, max_duration: 22.0, ..ChunkerOpts::default() };
     match chunks_from_probs(&[], &opts) {
