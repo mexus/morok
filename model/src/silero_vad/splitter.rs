@@ -9,7 +9,7 @@
 use bon::bon;
 use snafu::{ResultExt, Snafu};
 
-use crate::audio::{AudioChunk, EncoderBounds, Splitter};
+use crate::audio::{AudioChunk, EncoderBounds, Splitter, trim_chunks_to_waveform};
 use crate::silero_vad::{NUM_SAMPLES, SileroVad, VadInference};
 
 /// VAD-driven splitter. Construction: [`from_hub`](Self::from_hub) loads the
@@ -102,7 +102,12 @@ impl Splitter for SileroVadSplitter {
             pad_samples: self.pad_samples,
             align_to: bounds.align_to_samples().max(1),
         };
-        morok_arch::vad::chunks_from_probs(&probs, &chunker_opts).context(ChunkSnafu)
+        let mut chunks = morok_arch::vad::chunks_from_probs(&probs, &chunker_opts).context(ChunkSnafu)?;
+        // `align_to` rounds chunk ends up to a stride multiple, which can push
+        // the trailing chunk past `waveform.len()`. The `Splitter` contract
+        // forbids that, so clamp the tail before returning.
+        trim_chunks_to_waveform(&mut chunks, waveform.len());
+        Ok(chunks)
     }
 
     /// Upper bound on chunk length the chunker can emit under this

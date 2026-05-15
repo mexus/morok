@@ -68,6 +68,12 @@ impl EncoderBounds {
 /// `end_sample <= waveform.len()` and `end_sample - start_sample <=
 /// bounds.max_samples()`; alignment is a soft preference (floor-division on
 /// `hop_length` tolerates misaligned boundaries).
+///
+/// Splitters that align chunk ends to encoder strides
+/// ([`align_to_samples`](EncoderBounds::align_to_samples)) can round the
+/// trailing chunk past `waveform.len()`. The contract still requires
+/// in-range chunks — use [`trim_chunks_to_waveform`] to clean up the tail
+/// before returning.
 pub trait Splitter {
     type Error: std::error::Error + Send + Sync + 'static;
 
@@ -79,6 +85,25 @@ pub trait Splitter {
     /// Default: full encoder capacity.
     fn max_chunk_samples(&self, bounds: &EncoderBounds) -> usize {
         bounds.max_samples()
+    }
+}
+
+/// Trim `chunks` so every entry stays within `0..waveform_len`: drop chunks
+/// starting at or past `waveform_len`, then clamp the trailing chunk's
+/// `end_sample` down to `waveform_len`. Intended for [`Splitter`]
+/// implementations whose stride alignment can push the last chunk past the
+/// waveform end (see the trait docs).
+///
+/// Assumes `chunks` is in increasing `start_sample` order — the
+/// `Splitter::split` contract — so a single pass from the back is enough.
+pub fn trim_chunks_to_waveform(chunks: &mut Vec<AudioChunk>, waveform_len: usize) {
+    while let Some(mut last) = chunks.pop() {
+        if last.start_sample >= waveform_len {
+            continue;
+        }
+        last.end_sample = last.end_sample.min(waveform_len);
+        chunks.push(last);
+        break;
     }
 }
 
