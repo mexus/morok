@@ -18,6 +18,7 @@ const sidebars: SidebarsConfig = {
       items: [
         'architecture/pipeline',
         'architecture/jit-loader',
+        'architecture/jit-graphs',
         {
           type: 'category',
           label: 'Codegen Pipeline',
