@@ -34,6 +34,7 @@ Morok एक Rust-आधारित ML कम्पाइलर है जो [
 | [tensor](https://github.com/npatsakula/morok/tree/main/tensor/) | हाई-लेवल lazy tensor API |
 | [onnx](https://github.com/npatsakula/morok/tree/main/onnx/) | ONNX मॉडल इम्पोर्टर |
 | [arch](https://github.com/npatsakula/morok/tree/main/arch/) | इन्फ़रेंस प्रिमिटिव्स |
+| [model](https://github.com/npatsakula/morok/tree/main/model/) | प्री-ट्रेन्ड मॉडल्स |
 
 ## त्वरित उदाहरण
 
