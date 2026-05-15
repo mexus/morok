@@ -71,6 +71,7 @@
 
         nativeBuildInputs = with pkgs; [
           pkgconf
+          openssl.dev
           protobuf
           libffi
           libxml2
