@@ -30,6 +30,7 @@ For architecture details, see the [documentation site](https://npatsakula.github
 | [tensor](tensor/) | High-level lazy tensor API |
 | [onnx](onnx/) | ONNX model importer |
 | [arch](arch/) | Inference primitives |
+| [model](model/) | Pretrained models |
 
 ## Quick Example
 
