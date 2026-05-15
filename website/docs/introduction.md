@@ -34,6 +34,7 @@ For architecture details, see the [documentation site](https://npatsakula.github
 | [tensor](https://github.com/npatsakula/morok/tree/main/tensor/) | High-level lazy tensor API |
 | [onnx](https://github.com/npatsakula/morok/tree/main/onnx/) | ONNX model importer |
 | [arch](https://github.com/npatsakula/morok/tree/main/arch/) | Inference primitives |
+| [model](https://github.com/npatsakula/morok/tree/main/model/) | Pretrained models |
 
 ## Quick Example
 
