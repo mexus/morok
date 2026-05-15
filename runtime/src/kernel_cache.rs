@@ -18,6 +18,7 @@
 use std::sync::{Arc, OnceLock};
 
 use morok_device::device::Program;
+use morok_ir::UOp;
 use papaya::HashMap;
 
 /// Cached kernel that can be reused across tensors.
@@ -36,18 +37,25 @@ pub struct CachedKernel {
     /// Variable names in order for converting HashMap to positional vals.
     /// Matches the order expected by the compiled program.
     pub var_names: Vec<String>,
-    /// Global work size for dispatch (GPU backends, CPU threading).
-    /// For CPU threading: [thread_count, 1, 1]
-    pub global_size: Option<[usize; 3]>,
-    /// Local work size for dispatch (GPU backends).
-    pub local_size: Option<[usize; 3]>,
+    /// Global buffer slots in kernel argument order.
+    /// Matches Tinygrad's ProgramSpec.globals semantics.
+    pub globals: Vec<usize>,
+    /// Output buffer slots written by STORE operations.
+    /// Matches Tinygrad's ProgramSpec.outs semantics.
+    pub outs: Vec<usize>,
+    /// Input buffer slots read by LOAD operations.
+    /// Matches Tinygrad's ProgramSpec.ins semantics.
+    pub ins: Vec<usize>,
+    /// Whether host-level scheduling may overlap this program with other kernels.
+    ///
+    /// Thread-safety is required by the `Program` trait. This flag is about
+    /// backend/kernel semantics, not Rust synchronization safety.
+    pub host_parallel_safe: bool,
+    /// Symbolic global work size evaluated with runtime vars before dispatch.
+    pub global_size: [Arc<UOp>; 3],
+    /// Symbolic local work size. None means direct global-id execution.
+    pub local_size: Option<[Arc<UOp>; 3]>,
 }
-
-// SAFETY: CachedKernel is Send + Sync because:
-// - Box<dyn Program> is Send + Sync (Program trait requires Send + Sync)
-// - String is Send + Sync
-unsafe impl Send for CachedKernel {}
-unsafe impl Sync for CachedKernel {}
 
 /// Cache key: (AST ID, device string).
 ///
@@ -128,7 +136,7 @@ pub fn clear_all() {
 
 /// Remove kernels whose AST IDs are no longer in the live UOp set.
 ///
-/// Call this after `gc_unused_uops()` to clean up compiled kernels for
+/// Call this after `gc_dead_refs()` to clean up compiled kernels for
 /// discarded UOps. This prevents kernel cache memory accumulation during
 /// beam search and other optimization passes.
 ///
@@ -139,7 +147,7 @@ pub fn clear_all() {
 /// # Example
 ///
 /// ```ignore
-/// morok_ir::uop::gc_unused_uops();
+/// morok_ir::uop::gc_dead_refs();
 /// let live_ids = morok_ir::uop::live_uop_ids();
 /// morok_runtime::kernel_cache::gc_unused_kernels(&live_ids);
 /// ```

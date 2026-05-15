@@ -11,8 +11,9 @@
 use std::f32::consts::PI;
 use std::sync::Arc;
 
+use morok_device::DeviceSpec;
 use morok_dtype::DType;
-use morok_ir::{AxisId, AxisType, BufferizeOpts, ConstValue, Op, UOp};
+use morok_ir::{AxisId, AxisType, BufferizeOpts, ConstValue, Op, ReduceOp, UOp};
 
 use crate::pattern::RewriteResult;
 use crate::rangeify::IndexingContext;
@@ -345,7 +346,7 @@ fn test_buffer_removal_always_run_ops_kept() {
     let matcher = patterns::buffer_removal();
 
     // Test: BUFFERIZE(CONTIGUOUS) should be KEPT (Tinygrad: ALWAYS_RUN_OPS keep their buffers).
-    // CONTIGUOUS/COPY/ASSIGN must produce actual buffers - they are materialization points.
+    // CONTIGUOUS/COPY must produce actual buffers - they are materialization points.
     let src = UOp::const_(DType::Float32, ConstValue::Float(1.0));
     let contiguous = src.contiguous();
 
@@ -542,6 +543,43 @@ fn test_movement_op_removal_non_movement_op() {
     // apply_bufferize_transform returns None)
     let result = matcher.rewrite(&sqrt, &mut ctx);
     assert!(matches!(result, RewriteResult::NoMatch), "Should not match non-movement ops without ranges");
+}
+
+#[test]
+fn test_pad_fallback_recovers_without_suppression() {
+    let matcher = patterns::apply_rangeify_patterns();
+    let mut ctx = IndexingContext::new();
+
+    for _ in 0..300 {
+        let _ = ctx.record_pad_fallback();
+    }
+
+    let src = UOp::new_buffer(DeviceSpec::Cpu, 4, DType::Float32);
+    let r = UOp::range_axis(UOp::index_const(4), AxisId::Renumbered(0), AxisType::Loop);
+    ctx.set_ranges(&src, vec![r.clone()], vec![r]);
+
+    let begin_pads = UOp::vectorize(vec![UOp::index_const(1)].into());
+    let end_pads = UOp::vectorize(vec![UOp::index_const(1)].into());
+    let pad = UOp::new(Op::Pad { src, begin_pads, end_pads }, DType::Float32);
+
+    let result = matcher.rewrite(&pad, &mut ctx);
+    assert!(matches!(result, RewriteResult::Rewritten(_)), "PAD fallback should remain enabled");
+}
+
+#[test]
+fn test_reduceaxis_fallback_recovers_without_suppression() {
+    let matcher = patterns::apply_rangeify_patterns();
+    let mut ctx = IndexingContext::new();
+
+    for _ in 0..300 {
+        let _ = ctx.record_reduceaxis_fallback();
+    }
+
+    let src = UOp::new_buffer(DeviceSpec::Cpu, 4, DType::Float32);
+    let reduce = src.try_reduce_axis(ReduceOp::Add, vec![0]).unwrap();
+
+    let result = matcher.rewrite(&reduce, &mut ctx);
+    assert!(matches!(result, RewriteResult::Rewritten(_)), "ReduceAxis fallback should remain enabled");
 }
 
 // ===== Integration Tests =====

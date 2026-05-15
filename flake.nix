@@ -50,6 +50,7 @@
           path: type:
           (crane'.filterCargoSources path type)
           || (pkgs.lib.hasSuffix ".proto" path)
+          || (pkgs.lib.hasSuffix "config.json" path)
           || (pkgs.lib.hasSuffix ".onnx" path);
 
         src = pkgs.lib.cleanSourceWith {
@@ -70,6 +71,7 @@
 
         nativeBuildInputs = with pkgs; [
           pkgconf
+          openssl.dev
           protobuf
           libffi
           libxml2

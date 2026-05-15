@@ -133,6 +133,15 @@ fn test_scheduler_upcast_size() {
 }
 
 #[test]
+fn test_scheduler_upcasted_treats_unroll_as_upcasted() {
+    let r_unroll = UOp::range_axis(UOp::index_const(4), AxisId::Renumbered(0), AxisType::Unroll);
+    let sink = UOp::sink(vec![UOp::native_const(1.0f32), r_unroll]);
+
+    let scheduler = Scheduler::new(sink, Renderer::cpu());
+    assert!(scheduler.upcasted(), "UNROLL axis should satisfy upcasted parity semantics");
+}
+
+#[test]
 fn test_scheduler_group_for_reduces() {
     // Create kernel with GROUP_REDUCE axes
     let end_16 = UOp::index_const(16);
@@ -505,6 +514,52 @@ fn test_shift_to_division_error() {
     if let Err(e) = result {
         assert!(matches!(e, OptError::DivisionError { .. }));
     }
+}
+
+#[test]
+fn test_shift_to_symbolic_exact_division() {
+    // Range end is symbolic but exactly divisible by 2: V * 2.
+    let v = UOp::define_var("V".to_string(), 1, 64);
+    let two = UOp::index_const(2);
+    let end = v.try_mul(&two).expect("index mul should succeed");
+    let r_global = UOp::range_axis(end, AxisId::Renumbered(0), AxisType::Global);
+
+    let compute = UOp::native_const(1.0f32);
+    let sink = UOp::sink(vec![compute, r_global.clone()]);
+
+    let ren = Renderer::cpu();
+    let mut scheduler = Scheduler::new(sink, ren);
+
+    let result = scheduler.shift_to(r_global, 2, AxisType::Upcast, false, None);
+    assert!(result.is_ok(), "symbolic split should succeed for V*2 / 2");
+
+    let (replaced_rng, _new_rng) = result.unwrap();
+    if let Op::Range { end, .. } = replaced_rng.op() {
+        assert!(end.backward_slice_ids().contains(&v.id), "reduced symbolic end should still depend on V");
+    } else {
+        panic!("Expected range after symbolic split");
+    }
+
+    assert_eq!(scheduler.shape_len(), 2);
+}
+
+#[test]
+fn test_shift_to_symbolic_non_divisible_error() {
+    // Range end is symbolic and not provably divisible by 2: V * 3.
+    let v = UOp::define_var("V".to_string(), 1, 64);
+    let three = UOp::index_const(3);
+    let end = v.try_mul(&three).expect("index mul should succeed");
+    let r_global = UOp::range_axis(end, AxisId::Renumbered(0), AxisType::Global);
+
+    let compute = UOp::native_const(1.0f32);
+    let sink = UOp::sink(vec![compute, r_global.clone()]);
+
+    let ren = Renderer::cpu();
+    let mut scheduler = Scheduler::new(sink, ren);
+
+    let result = scheduler.shift_to(r_global, 2, AxisType::Upcast, false, None);
+    assert!(result.is_err());
+    assert!(matches!(result.unwrap_err(), OptError::SymbolicDivisionError { .. }));
 }
 
 #[test]
@@ -1414,8 +1469,13 @@ fn test_thread_basic() {
     let ren = Renderer::cpu();
     let mut scheduler = Scheduler::new(sink, ren);
 
-    // Apply THREAD optimization - use available parallelism to work on machines with few cores
-    let thread_count = std::thread::available_parallelism().map(|p| p.get()).unwrap_or(4);
+    // Apply THREAD optimization with a divisor of 64 that fits this machine.
+    let max_threads = std::thread::available_parallelism().map(|p| p.get()).unwrap_or(4);
+    let thread_count = [32usize, 16, 8, 4, 2].into_iter().find(|&t| t <= max_threads && 64 % t == 0).unwrap_or(1);
+    if thread_count == 1 {
+        // Single-thread environment: THREAD split is not meaningful.
+        return;
+    }
     let opt = Opt::thread(0, thread_count);
     let result = apply_opt(&mut scheduler, &opt, true);
     assert!(result.is_ok(), "THREAD opt should succeed: {:?}", result);
@@ -1431,11 +1491,66 @@ fn test_thread_basic() {
 }
 
 #[test]
+fn test_thread_rejects_second_application() {
+    // Once a Thread axis exists, any further THREAD opt must be rejected so
+    // beam expansion of an already-threaded scheduler doesn't generate
+    // duplicate (parent == child) candidates that get silently dedup'd.
+    let end_64 = UOp::index_const(64);
+    let r_loop = UOp::range_axis(end_64, AxisId::Renumbered(0), AxisType::Loop);
+    let compute = UOp::native_const(1.0f32);
+    let sink = UOp::sink(vec![compute, r_loop]);
+
+    let ren = Renderer::cpu();
+    let mut scheduler = Scheduler::new(sink, ren);
+
+    // Pick a thread count this machine actually supports.
+    let max_threads = std::thread::available_parallelism().map(|p| p.get()).unwrap_or(4);
+    let thread_count = [32usize, 16, 8, 4, 2].into_iter().find(|&t| t <= max_threads && 64 % t == 0).unwrap_or(1);
+    if thread_count == 1 {
+        return; // Single-thread environment: meaningless.
+    }
+    // First THREAD succeeds.
+    apply_opt(&mut scheduler, &Opt::thread(0, thread_count), true).expect("first THREAD should succeed");
+    let thread_axes = scheduler.axes_of(&[AxisType::Thread]);
+    assert!(!thread_axes.is_empty(), "first THREAD should create a Thread axis");
+
+    // Second THREAD must be rejected with ValidationFailed("already threaded").
+    let result = apply_opt(&mut scheduler, &Opt::thread(0, 2), true);
+    let Err(err) = result else {
+        panic!("second THREAD must fail; got Ok");
+    };
+    let msg = format!("{err:?}");
+    assert!(msg.contains("already threaded"), "second THREAD must report 'already threaded'; got: {msg}");
+}
+
+#[test]
+fn test_thread_rejects_non_globalizable_axis() {
+    // Two independent stores with disjoint LOOP ranges.
+    // No LOOP range appears in all outputs, so THREAD must be rejected.
+    let loop_a = UOp::range_axis(UOp::index_const(64), AxisId::Renumbered(0), AxisType::Loop);
+    let loop_b = UOp::range_axis(UOp::index_const(64), AxisId::Renumbered(1), AxisType::Loop);
+
+    let idx = UOp::index_const(0);
+    let store_a = idx.store(loop_a.clone());
+    let store_b = idx.store(loop_b.clone());
+    let sink = UOp::sink(vec![store_a, store_b]);
+
+    let ren = Renderer::cpu();
+    let mut scheduler = Scheduler::new(sink, ren);
+
+    let result = apply_opt(&mut scheduler, &Opt::thread(0, 2), true);
+    assert!(result.is_err(), "THREAD should fail for non-globalizable axis");
+
+    let thread_axes = scheduler.axes_of(&[AxisType::Thread]);
+    assert!(thread_axes.is_empty(), "No Thread axis should be created on failure");
+}
+
+#[test]
 fn test_apply_threading_heuristic_loop() {
     use crate::optimizer::heuristics::apply_threading;
 
     // Create a kernel with Loop axis
-    // NOTE: Tinygrad requires at least 128K (131072) ops per thread
+    // NOTE: requires at least 128K (131072) ops per thread.
     // For 2 threads: need at least 2 * 131072 = 262144 elements
     // Use 2 threads with 262144 elements (exactly the minimum)
     let end = UOp::index_const(262144);
@@ -1456,26 +1571,32 @@ fn test_apply_threading_heuristic_loop() {
     assert!(!thread_axes.is_empty(), "Should have Thread axis after apply_threading");
 }
 
-#[test]
-fn test_apply_threading_heuristic_outer_not_threaded() {
-    use crate::optimizer::heuristics::apply_threading;
+// (`test_apply_threading_heuristic_outer_not_threaded` was deleted along with
+// the AxisType::Outer enum variant — after the OUTER→LOOP migration,
+// Outer no longer exists and this test path is unreachable.)
 
-    // NOTE: Tinygrad only threads LOOP axes, not Outer axes
-    // This test verifies that Outer axes are NOT threaded
-    let end_512 = UOp::index_const(524288); // 512K elements
-    let r_outer = UOp::range_axis(end_512, AxisId::Renumbered(0), AxisType::Outer);
+#[test]
+fn test_apply_threading_heuristic_symbolic_work_and_divisibility() {
+    use crate::optimizer::heuristics::apply_threading;
+    use morok_dtype::DType;
+    use morok_ir::BinaryOp;
+
+    // Non-const loop extent with known vmax and const factor.
+    // end = V * 4 where V in [1, 131072] => vmax=524288, divisible by 4.
+    let v = UOp::define_var("V".to_string(), 1, 131072);
+    let four = UOp::index_const(4);
+    let end = UOp::new(Op::Binary(BinaryOp::Mul, v, four), DType::Index);
+    let r_loop = UOp::range_axis(end, AxisId::Renumbered(0), AxisType::Loop);
 
     let compute = UOp::native_const(1.0f32);
-    let sink = UOp::sink(vec![compute, r_outer]);
+    let sink = UOp::sink(vec![compute, r_loop]);
 
     let ren = Renderer::cpu();
     let mut scheduler = Scheduler::new(sink, ren);
 
-    // Apply threading heuristic - should NOT work on Outer axes
-    let applied = apply_threading(&mut scheduler, 2);
-    assert!(!applied, "apply_threading should NOT succeed on Outer axis (only Loop axes are threaded)");
+    let applied = apply_threading(&mut scheduler, 4);
+    assert!(applied, "threading should apply for symbolic extent with sufficient vmax work");
 
-    // Verify NO Thread axis was created
     let thread_axes = scheduler.axes_of(&[AxisType::Thread]);
-    assert!(thread_axes.is_empty(), "Should NOT have Thread axis for Outer");
+    assert!(!thread_axes.is_empty(), "Should have Thread axis after apply_threading");
 }

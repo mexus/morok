@@ -20,7 +20,9 @@
 pub mod alu_devectorization;
 pub mod bool_storage;
 pub mod edge_cases;
+pub mod end_merge_nesting;
 pub mod expand_index;
+pub mod fp8_decomp;
 pub mod gep_movement;
 pub mod gep_patterns;
 pub mod helpers;

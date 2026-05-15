@@ -80,13 +80,14 @@ pub(crate) fn elf_target_triple() -> String {
 /// Extra clang flags required for correct JIT code on the host platform.
 /// Shared between the C and LLVM IR compilation paths.
 pub(crate) fn platform_clang_flags() -> &'static [&'static str] {
-    // macOS/Windows reserve x18 as the platform register. Bare-metal ELF
-    // targets treat it as a free GPR, so we must tell clang to avoid it.
-    #[cfg(all(target_arch = "aarch64", any(target_os = "macos", target_os = "windows")))]
+    // Reserve x18 only on macOS ARM, where the kernel clobbers it on context
+    // switch. Linux ARM treats x18 as a free GPR; Windows ARM is not a target
+    // morok currently supports.
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
     {
         &["-ffixed-x18"]
     }
-    #[cfg(not(all(target_arch = "aarch64", any(target_os = "macos", target_os = "windows"))))]
+    #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
     {
         &[]
     }
@@ -99,14 +100,14 @@ fn compile_to_object(src: &str) -> crate::Result<Vec<u8>> {
 
     let arch = std::env::consts::ARCH;
 
-    // Architecture-specific tuning flags.
+    // Architecture-specific tuning. On ARM, `-march=native` only sets the
+    // base ISA family (e.g. `armv8-a`); CPU-specific tuning (Apple-Silicon
+    // pipelines, NEON dual-issue scheduling, FP cost model) requires
+    // `-mcpu=native`.
     let march = match arch {
-        "x86_64" | "aarch64" | "loongarch64" => "-march=native",
-        "riscv64" => "-march=rv64gc",
-        "powerpc64" => "-mcpu=native",
-        other => {
-            return Err(crate::Error::JitCompilation { reason: format!("Unsupported architecture: {other}") });
-        }
+        "x86_64" | "loongarch64" => "-march=native",
+        "riscv64" => "-march=rv64g",
+        _ => "-mcpu=native",
     };
 
     let target = elf_target_triple();
@@ -789,84 +790,5 @@ fn resolve_symbol(name: &str) -> crate::Result<u64> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_jit_loader_noop() {
-        let src = "void test_kernel(void) { }\n";
-        let kernel = JitKernel::compile(src, "test_kernel", vec![], 0).unwrap();
-        assert_eq!(kernel.name(), "test_kernel");
-        unsafe {
-            kernel.execute_with_vals(&[], &[]).unwrap();
-        }
-    }
-
-    #[test]
-    fn test_jit_loader_add() {
-        let src = r#"
-void add_kernel(float* restrict a, float* restrict b, float* restrict out) {
-    out[0] = a[0] + b[0];
-}
-"#;
-        let kernel = JitKernel::compile(src, "add_kernel", vec![], 3).unwrap();
-
-        let mut a = [1.0f32];
-        let mut b = [2.0f32];
-        let mut out = [0.0f32];
-
-        let buffers = vec![a.as_mut_ptr() as *mut u8, b.as_mut_ptr() as *mut u8, out.as_mut_ptr() as *mut u8];
-
-        unsafe {
-            kernel.execute_with_vals(&buffers, &[]).unwrap();
-        }
-
-        assert_eq!(out[0], 3.0);
-    }
-
-    #[test]
-    fn test_jit_loader_math() {
-        let src = r#"
-void math_kernel(float* restrict in_buf, float* restrict out) {
-    out[0] = __builtin_sqrtf(in_buf[0]);
-}
-"#;
-        let kernel = JitKernel::compile(src, "math_kernel", vec![], 2).unwrap();
-
-        let mut input = [9.0f32];
-        let mut out = [0.0f32];
-
-        let buffers = vec![input.as_mut_ptr() as *mut u8, out.as_mut_ptr() as *mut u8];
-
-        unsafe {
-            kernel.execute_with_vals(&buffers, &[]).unwrap();
-        }
-
-        assert!((out[0] - 3.0).abs() < 1e-6);
-    }
-
-    #[test]
-    fn test_jit_loader_with_vars() {
-        let src = r#"
-void var_kernel(float* restrict out, const int N) {
-    for (int i = 0; i < N; i++) {
-        out[i] = (float)i;
-    }
-}
-"#;
-        let kernel = JitKernel::compile(src, "var_kernel", vec!["N".to_string()], 1).unwrap();
-
-        let mut out = [0.0f32; 8];
-        let buffers = vec![out.as_mut_ptr() as *mut u8];
-
-        unsafe {
-            kernel.execute_with_vals(&buffers, &[5]).unwrap();
-        }
-
-        assert_eq!(out[0], 0.0);
-        assert_eq!(out[1], 1.0);
-        assert_eq!(out[2], 2.0);
-        assert_eq!(out[3], 3.0);
-        assert_eq!(out[4], 4.0);
-    }
-}
+#[path = "test/unit/jit_loader.rs"]
+mod tests;

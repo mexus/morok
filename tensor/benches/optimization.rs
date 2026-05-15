@@ -49,16 +49,17 @@ fn print_tree(config: &str, size: usize, plan: &morok_runtime::ExecutionPlan, re
 }
 
 fn bench_matmul(c: &mut Criterion) {
-    // tracing_subscriber::fmt::init();
-
     let mut group = c.benchmark_group("matmul_optimization");
 
-    // Typed optimizer configurations (no environment variables needed)
+    // Typed optimizer configurations (no environment variables needed).
+    // Don't override thread_count — the default is `available_parallelism()`,
+    // matching the `renderer.global_max[0]` behavior on CPU.
     let heuristic_config: PrepareConfig = OptimizerConfig::builder()
         .strategy(OptStrategy::Heuristic)
-        .heuristics(HeuristicsConfig::builder().thread_count(4).build())
+        .heuristics(HeuristicsConfig::builder().build())
         .build()
         .into();
+
     const BEAM_WIDTH: usize = 4;
     let beam_config: PrepareConfig =
         OptimizerConfig::builder().strategy(OptStrategy::Beam { width: BEAM_WIDTH }).build().into();

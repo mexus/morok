@@ -3,7 +3,7 @@
 use ndarray::{Array4, array};
 
 use crate::Tensor;
-use crate::nn::{Reduction, ResizeMode};
+use crate::nn::{Conv1d, LSTMCell, Layer, Reduction, ResizeMode};
 use crate::test::helpers::RealizeTestExt;
 
 fn get_shape(tensor: &Tensor) -> Vec<usize> {
@@ -509,6 +509,85 @@ crate::codegen_tests! {
         mask.realize_with(&config).unwrap();
         assert!(mask.as_vec::<bool>().unwrap().iter().all(|&v| v));
     }
+
+    fn test_conv1d_module_matches_explicit_conv2d(config) {
+        // Conv1d::forward must reproduce x.conv2d() with the stored stride/padding.
+        let x_data: Vec<f32> = (0..8).map(|v| v as f32 * 0.1).collect();
+        let x = Tensor::from_slice(&x_data).try_reshape([1isize, 2, 4]).unwrap();
+        let w_data: Vec<f32> = (0..18).map(|v| (v as f32 * 0.05).sin()).collect();
+        let w = Tensor::from_slice(&w_data).try_reshape([3isize, 2, 3]).unwrap();
+        let b = Tensor::from_slice([0.1f32, 0.2, 0.3]);
+
+        let conv = Conv1d::new(w.clone(), Some(b.clone())).with_stride(2).with_padding((1, 1));
+        let mut got = conv.forward(&x).unwrap().contiguous();
+        got.realize_with(&config).unwrap();
+
+        let mut expected =
+            x.conv2d().weight(&w).bias(&b).stride(&[2]).padding(&[(1, 1)]).call().unwrap().contiguous();
+        expected.realize_with(&config).unwrap();
+
+        assert_eq!(got.as_vec::<f32>().unwrap(), expected.as_vec::<f32>().unwrap());
+    }
+
+    fn test_conv1d_no_bias(config) {
+        // Conv1d::new(_, None) must omit bias in the conv2d call.
+        let x = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0]).try_reshape([1isize, 1, 4]).unwrap();
+        let w = Tensor::from_slice([0.5f32, 0.25]).try_reshape([1isize, 1, 2]).unwrap();
+
+        let conv = Conv1d::new(w.clone(), None);
+        let mut got = conv.forward(&x).unwrap().contiguous();
+        got.realize_with(&config).unwrap();
+
+        let mut expected = x.conv2d().weight(&w).call().unwrap().contiguous();
+        expected.realize_with(&config).unwrap();
+
+        assert_eq!(got.as_vec::<f32>().unwrap(), expected.as_vec::<f32>().unwrap());
+    }
+
+    fn test_lstm_cell_step_matches_explicit(config) {
+        // LSTMCell::step must use PyTorch's [i, f, g, o] gate order.
+        let input = 3usize;
+        let hidden = 2usize;
+        let four_hidden = 4 * hidden;
+
+        let w_ih_data: Vec<f32> = (0..four_hidden * input).map(|i| (i as f32 * 0.1).sin()).collect();
+        let w_ih = Tensor::from_slice(&w_ih_data).try_reshape([four_hidden as isize, input as isize]).unwrap();
+        let w_hh_data: Vec<f32> = (0..four_hidden * hidden).map(|i| (i as f32 * 0.07).cos()).collect();
+        let w_hh = Tensor::from_slice(&w_hh_data).try_reshape([four_hidden as isize, hidden as isize]).unwrap();
+        let b_ih = Tensor::from_slice([0.01f32, 0.02, 0.03, 0.04, 0.05, 0.06, 0.07, 0.08]);
+        let b_hh = Tensor::from_slice([-0.01f32, -0.02, -0.03, -0.04, -0.05, -0.06, -0.07, -0.08]);
+
+        let x = Tensor::from_slice([0.5f32, -0.25, 0.125]).try_reshape([1isize, input as isize]).unwrap();
+        let h0 = Tensor::from_slice([0.1f32, -0.2]).try_reshape([1isize, hidden as isize]).unwrap();
+        let c0 = Tensor::from_slice([0.3f32, 0.4]).try_reshape([1isize, hidden as isize]).unwrap();
+
+        let cell = LSTMCell::new(w_ih.clone(), w_hh.clone(), b_ih.clone(), b_hh.clone());
+        assert_eq!(cell.hidden_size(), hidden);
+        let (new_h, new_c) = cell.step(&x, &h0, &c0).unwrap();
+        let mut new_h = new_h.contiguous();
+        let mut new_c = new_c.contiguous();
+        new_h.realize_with(&config).unwrap();
+        new_c.realize_with(&config).unwrap();
+
+        // Reference: inline body with [i, f, g, o] gate order.
+        let gates_x = x.linear().weight(&w_ih).bias(&b_ih).call().unwrap();
+        let gates_h = h0.linear().weight(&w_hh).bias(&b_hh).call().unwrap();
+        let gates = gates_x.try_add(&gates_h).unwrap();
+        let parts = gates.split(&[hidden, hidden, hidden, hidden], 1).unwrap();
+        let i = parts[0].sigmoid().unwrap();
+        let f = parts[1].sigmoid().unwrap();
+        let g = parts[2].tanh().unwrap();
+        let o = parts[3].sigmoid().unwrap();
+        let exp_c = f.try_mul(&c0).unwrap().try_add(&i.try_mul(&g).unwrap()).unwrap();
+        let exp_h = o.try_mul(&exp_c.tanh().unwrap()).unwrap();
+        let mut exp_h = exp_h.contiguous();
+        let mut exp_c = exp_c.contiguous();
+        exp_h.realize_with(&config).unwrap();
+        exp_c.realize_with(&config).unwrap();
+
+        assert_eq!(new_h.as_vec::<f32>().unwrap(), exp_h.as_vec::<f32>().unwrap());
+        assert_eq!(new_c.as_vec::<f32>().unwrap(), exp_c.as_vec::<f32>().unwrap());
+    }
 }
 
 /// DenseNet 2-layer kernel structure regression test.
@@ -554,12 +633,13 @@ fn test_densenet_two_layer_kernel_count() {
     let uop = result.uop();
     let sink = morok_ir::UOp::sink(vec![uop.clone()]);
     // Normalize Buffer→Param before rangeify (matches real pipeline)
-    let (sink, _param_buffers) = crate::realize::normalize_buffers_to_params(&sink);
-    let (rangeified, _ctx) = morok_schedule::rangeify::rangeify(sink, None).unwrap();
-    let (kernels_root, _kctx) = morok_schedule::rangeify::run_kernel_split_pipeline(rangeified);
+    let normalization = crate::realize::normalize_for_schedule_cache(&sink).expect("normalize schedule cache");
+    let (rangeified, _ctx) = morok_schedule::rangeify::rangeify(normalization.normalized, None).unwrap();
+    let (kernels_root, _kctx) = morok_schedule::rangeify::try_get_kernel_graph(rangeified)
+        .expect("kernel split pipeline should succeed for dense layer kernel count");
 
     let kernels: Vec<_> =
-        kernels_root.toposort().into_iter().filter(|n| matches!(n.op(), morok_ir::Op::Kernel { .. })).collect();
+        kernels_root.toposort().into_iter().filter(|n| matches!(n.op(), morok_ir::Op::Call { .. })).collect();
 
     // 6 kernels matching Tinygrad: BN+ReLU, Conv1x1+BN+ReLU, Conv3x3+Cat (×2 layers)
     assert_eq!(kernels.len(), 6, "Expected 6 kernels for 2 dense layers, got {}", kernels.len());

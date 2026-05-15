@@ -13,12 +13,10 @@ use smallvec::SmallVec;
 use crate::op::Op;
 use crate::pattern::{Matcher, RewriteResult};
 use crate::shape;
-use crate::types::{AxisType, ConstValue};
+use crate::types::ConstValue;
 use morok_dtype::DType;
 
 /// Matcher for `UOp::substitute` — looks up each node in a substitution map.
-///
-/// Equivalent to Tinygrad's `_substitute = PatternMatcher([(UPat(tuple(Ops)), lambda ctx,x: ctx.get(x))])`.
 struct SubstituteMatcher<'a>(&'a HashMap<UOpKey, Arc<UOp>>);
 
 impl Matcher<()> for SubstituteMatcher<'_> {
@@ -32,7 +30,6 @@ impl Matcher<()> for SubstituteMatcher<'_> {
 
 /// Matcher for `UOp::substitute_gated` — substitution with range-scope gating.
 ///
-/// Equivalent to Tinygrad's `_substitute` + `pm_gate_substitute`:
 /// - If a node is in the substitution map, replace it.
 /// - If a node's ranges don't overlap with substitution keys, gate (skip subtree).
 struct SubstituteGatedMatcher<'a> {
@@ -48,8 +45,7 @@ impl Matcher<()> for SubstituteGatedMatcher<'_> {
         {
             return RewriteResult::Rewritten(replacement.clone());
         }
-        // Gate: skip subtrees whose ranges don't overlap with substitution keys
-        // Tinygrad (rangeify.py:187): `if not any(r in b.ranges for r in ctx.keys()): raise BottomUpGate()`
+        // Gate: skip subtrees whose ranges don't overlap with substitution keys.
         if !uop.in_scope_ranges().iter().any(|r| self.range_keys.contains(r)) {
             return RewriteResult::Gate(uop.clone());
         }
@@ -57,9 +53,34 @@ impl Matcher<()> for SubstituteGatedMatcher<'_> {
     }
 }
 
-/// Wrapper for Arc<UOp> that implements Hash and Eq based on stable ID.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TraversalMode {
+    Full,
+    PreserveCalls,
+}
+
+fn traversal_sources(node: &Arc<UOp>, mode: TraversalMode) -> SmallVec<[Arc<UOp>; 4]> {
+    if mode == TraversalMode::Full {
+        return node.op().sources();
+    }
+
+    match node.op() {
+        Op::Call { args, .. } | Op::Function { args, .. } => args.clone(),
+        // Program holds compiled artifacts (linear/source/binary) wrapped as
+        // UOps; traversing through them during rewrite passes is expensive
+        // and unnecessary — only the device producer is traversed.
+        Op::Program { device, .. } => {
+            let mut children = SmallVec::new();
+            children.push(device.clone());
+            children
+        }
+        _ => node.op().sources(),
+    }
+}
+
+/// Wrapper for `Arc<UOp>` that implements Hash and Eq based on stable ID.
 ///
-/// This allows using Arc<UOp> as HashMap keys without implementing
+/// This allows using `Arc<UOp>` as HashMap keys without implementing
 /// Hash/Eq on UOp itself (which would be problematic due to OnceCell fields).
 ///
 /// Note: While UOp contains OnceCell fields, Hash/Eq are based solely on the
@@ -97,7 +118,7 @@ impl Hash for UOpKey {
 /// Shape inference is lazy and cached - computed on first access via `shape()` method.
 ///
 /// Note: Debug uses derive_more with `#[debug(skip)]` on cache fields to prevent
-/// stack overflow from recursive Arc<UOp> references in caches.
+/// stack overflow from recursive `Arc<UOp>` references in caches.
 #[derive(derive_more::Debug)]
 pub struct UOp {
     /// Unique stable ID for this UOp instance.
@@ -116,7 +137,6 @@ pub struct UOp {
     /// Cached set of RANGE operations that are in scope at this UOp.
     /// Unlike ranges_cache which contains ALL ranges in the graph,
     /// this contains only the ranges that are currently "active" (not yet ended).
-    /// Computed lazily based on Tinygrad's ranges property.
     /// Uses UOpKey wrapper to enable Hash/Eq based on UOp ID.
     #[debug(skip)]
     pub(crate) in_scope_ranges_cache: std::sync::OnceLock<HashSet<UOpKey>>,
@@ -144,9 +164,9 @@ pub struct UOp {
     pub content_hash: u64,
     /// Tag for tracking tensor identity through the rangeify pipeline.
     ///
-    /// Matches Tinygrad's `UOp.tag` (ops.py:128). Tags are tuples of integer indices
-    /// that track which original tensor UOps map to which final kernel outputs.
-    /// Tags participate in hash consing — different tag = different UOp.
+    /// Tags are sequences of integer indices that track which original tensor
+    /// UOps map to which final kernel outputs. They participate in hash consing
+    /// — different tag = different UOp.
     ///
     /// Values:
     /// - `None` — untagged (default)
@@ -160,8 +180,8 @@ pub struct UOp {
     /// instance with a different ID. This is used for kernel info (name, opts) after
     /// optimization is complete.
     ///
-    /// Uses Arc<dyn Any> to allow attaching any metadata type without circular
-    /// dependencies (e.g., schedule::KernelInfo).
+    /// Uses `Arc<dyn Any>` to allow attaching any metadata type without
+    /// circular dependencies (e.g., schedule::KernelInfo).
     #[debug(skip)]
     pub(crate) metadata: Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>,
 }
@@ -169,7 +189,7 @@ pub struct UOp {
 /// Hash implementation for UOp based on content (dtype + op).
 ///
 /// This enables content-based hashing for cross-run caching. The hash traverses
-/// the DAG structure since Op contains Arc<UOp> children that also get hashed.
+/// the DAG structure since Op contains `Arc<UOp>` children that also get hashed.
 /// Cache fields are intentionally skipped - they don't affect semantic identity.
 impl Hash for UOp {
     fn hash<H: Hasher>(&self, state: &mut H) {
@@ -195,8 +215,7 @@ impl UOp {
         &self.tag
     }
 
-    /// Create a new UOp with the given tag (Tinygrad: `rtag()`).
-    /// Returns self unchanged if tag is already equal.
+    /// Create a new UOp with the given tag. Returns self unchanged if tag is already equal.
     pub fn rtag(self: &Arc<Self>, tag: Option<SmallVec<[usize; 2]>>) -> Arc<Self> {
         if self.tag == tag {
             return self.clone();
@@ -211,14 +230,16 @@ impl UOp {
 
     /// Check if this UOp has a concrete buffer identity in the graph.
     ///
-    /// Returns true for BUFFER or RESHAPE/MULTI chains leading to BUFFER.
+    /// Returns true for buffer-like identities or RESHAPE/MULTI chains leading to them.
     /// These are already contiguous by definition, so wrapping in CONTIGUOUS is a no-op.
-    ///
-    /// Based on Tinygrad's `UOp.has_buffer_identity()` (ops.py:616-619).
     pub fn has_buffer_identity(&self) -> bool {
         match &self.op {
-            Op::Reshape { src, .. } => src.has_buffer_identity(),
-            Op::Buffer { .. } => true,
+            Op::Reshape { src, .. } | Op::Multi { src, .. } => src.has_buffer_identity(),
+            Op::Buffer { .. } | Op::BufferView { .. } | Op::Param { .. } => true,
+            Op::GetTuple { src, index } => match src.op() {
+                Op::Tuple { src: elements } => elements.get(*index).is_some_and(|t| t.has_buffer_identity()),
+                _ => false,
+            },
             _ => false,
         }
     }
@@ -249,7 +270,6 @@ impl UOp {
     /// Create a copy of this UOp with a different dtype.
     ///
     /// If the dtype is unchanged, returns self (clone of Arc).
-    /// This is the Rust equivalent of Tinygrad's `buf.replace(dtype=x)`.
     ///
     /// # Examples
     ///
@@ -270,7 +290,6 @@ impl UOp {
 
     /// Walk through AFTER nodes to get the passthrough value.
     ///
-    /// This is the Rust equivalent of Tinygrad's `.or_after()` pattern.
     /// Recursively unwraps AFTER nodes to find the underlying value.
     ///
     /// # Examples
@@ -289,7 +308,6 @@ impl UOp {
 
     /// Walk through CAST nodes to get the inner value.
     ///
-    /// This is the Rust equivalent of Tinygrad's `.or_casted()` pattern.
     /// Recursively unwraps CAST nodes to find the underlying value.
     ///
     /// # Examples
@@ -337,7 +355,6 @@ impl UOp {
     /// Store a value at this INDEX node.
     ///
     /// Convenience method for `self.store(value)`.
-    /// Matches Tinygrad's `idx.store(val)` pattern.
     ///
     /// # Panics
     ///
@@ -418,8 +435,7 @@ impl UOp {
 
     /// Extract device specification from this UOp graph.
     ///
-    /// Traverses the graph to find Op::Device nodes following Tinygrad's
-    /// `_device` recursive property (ops.py:585-599):
+    /// Traverses the graph to find Op::Device nodes:
     /// - DEVICE: returns the DeviceSpec directly
     /// - BUFFER: returns device from the device child
     /// - COPY: returns device from the device child (target device)
@@ -476,8 +492,6 @@ impl UOp {
     /// change the underlying data. This method recursively walks through these
     /// operations to find the actual buffer or computation that owns the data.
     ///
-    /// Based on Tinygrad's `base` property (ops.py:524-527).
-    ///
     /// # Examples
     ///
     /// ```rust
@@ -508,8 +522,7 @@ impl UOp {
 
     /// Get the underlying buffer UOp, walking through AFTER/MSELECT/MSTACK chains.
     ///
-    /// Based on Tinygrad's `buf_uop` property (ops.py:601-606).
-    /// This recursively unwraps AFTER chains to find the actual buffer.
+    /// Recursively unwraps AFTER chains to find the actual buffer.
     ///
     /// # Examples
     ///
@@ -529,6 +542,7 @@ impl UOp {
             Op::MSelect { buffer, .. } => buffer.buf_uop(),
             Op::MStack { buffers } if !buffers.is_empty() => buffers[0].buf_uop(),
             Op::After { passthrough, .. } => passthrough.buf_uop(),
+            Op::Call { body, .. } | Op::Function { body, .. } => body.buf_uop(),
             _ => {
                 // For other ops, check if base is AFTER
                 let base = self.base();
@@ -634,6 +648,84 @@ impl UOp {
                     for child in children.into_iter().rev() {
                         stack.push((child, false));
                     }
+                }
+            }
+        }
+
+        result
+    }
+
+    /// Topological sort with optional CALL/FUNCTION/PROGRAM boundary traversal.
+    ///
+    /// When `include_call_bodies` is false, traversal does not descend into
+    /// CALL/FUNCTION bodies or PROGRAM internals. Call/function arguments and
+    /// program device are
+    /// still traversed.
+    pub fn toposort_call_aware(self: &Arc<Self>, include_call_bodies: bool) -> Vec<Arc<Self>> {
+        let mode = if include_call_bodies { TraversalMode::Full } else { TraversalMode::PreserveCalls };
+
+        let mut visited = HashSet::new();
+        let mut result = Vec::new();
+        let mut stack = vec![(self.clone(), false)];
+
+        while let Some((node, processed)) = stack.pop() {
+            let ptr = Arc::as_ptr(&node);
+
+            if visited.contains(&ptr) {
+                continue;
+            }
+
+            if processed {
+                visited.insert(ptr);
+                result.push(node);
+            } else {
+                stack.push((node.clone(), true));
+                let mut children = Vec::new();
+                for child in traversal_sources(&node, mode) {
+                    if !visited.contains(&Arc::as_ptr(&child)) {
+                        children.push(child);
+                    }
+                }
+                for child in children.into_iter().rev() {
+                    stack.push((child, false));
+                }
+            }
+        }
+
+        result
+    }
+
+    /// Filtered topological sort with optional CALL/FUNCTION/PROGRAM boundary traversal.
+    pub fn toposort_filtered_call_aware<F>(self: &Arc<Self>, gate: F, include_call_bodies: bool) -> Vec<Arc<Self>>
+    where
+        F: Fn(&Arc<UOp>) -> bool,
+    {
+        let mode = if include_call_bodies { TraversalMode::Full } else { TraversalMode::PreserveCalls };
+
+        let mut visited = HashSet::new();
+        let mut result = Vec::new();
+        let mut stack = vec![(self.clone(), false)];
+
+        while let Some((node, processed)) = stack.pop() {
+            let ptr = Arc::as_ptr(&node);
+
+            if visited.contains(&ptr) {
+                continue;
+            }
+
+            if processed {
+                visited.insert(ptr);
+                result.push(node);
+            } else if gate(&node) {
+                stack.push((node.clone(), true));
+                let mut children = Vec::new();
+                for child in traversal_sources(&node, mode) {
+                    if !visited.contains(&Arc::as_ptr(&child)) {
+                        children.push(child);
+                    }
+                }
+                for child in children.into_iter().rev() {
+                    stack.push((child, false));
                 }
             }
         }
@@ -780,9 +872,6 @@ impl UOp {
     /// 2. Removing ranges that are ended by this operation
     /// 3. Adding self if this is a RANGE operation
     ///
-    /// Based on Tinygrad's `ranges` property (ops.py:318-320) and
-    /// `_ranges` recursive property (ops.py:302-315).
-    ///
     /// # Returns
     ///
     /// A HashSet of RANGE UOps that are in scope at this point in the graph.
@@ -811,75 +900,29 @@ impl UOp {
         InScopeRangesProperty::get(self)
     }
 
-    /// Check if all in-scope ranges at this UOp have the given AxisType.
-    ///
-    /// Returns true if the in-scope ranges set is empty or all ranges
-    /// match the specified axis type.
-    ///
-    /// # Use Cases
-    ///
-    /// - `all_in_scope_ranges_are(AxisType::Outer)` - Used in split_store
-    ///   to determine if we're at a kernel boundary
-    ///
-    /// # Examples
-    ///
-    /// ```ignore
-    /// use morok_ir::{UOp, AxisType};
-    ///
-    /// // At kernel boundary: only OUTER ranges in scope
-    /// assert!(uop.all_in_scope_ranges_are(AxisType::Outer));
-    ///
-    /// // Inside kernel: has non-OUTER ranges
-    /// assert!(!uop.all_in_scope_ranges_are(AxisType::Outer));
-    /// ```
-    #[allow(clippy::mutable_key_type)]
-    pub fn all_in_scope_ranges_are(self: &Arc<Self>, axis_type: AxisType) -> bool {
-        use crate::Op;
-
-        let ranges = self.in_scope_ranges();
-
-        // Empty scope means we're at the top level (treat as all OUTER)
-        if ranges.is_empty() {
-            return true;
-        }
-
-        ranges.iter().all(|r| match r.0.op() {
-            Op::Range { axis_type: at, .. } => *at == axis_type,
-            _ => false, // Should never happen
-        })
-    }
-
-    /// Check if any in-scope range is NOT of the given AxisType.
-    ///
-    /// Inverse of `all_in_scope_ranges_are`. Useful for Tinygrad-style
-    /// filtering: "skip if any range is not OUTER".
-    ///
-    /// # Examples
-    ///
-    /// ```ignore
-    /// use morok_ir::{UOp, AxisType};
-    ///
-    /// // Has non-OUTER ranges: should skip in split_store
-    /// if uop.has_non_outer_ranges() {
-    ///     return None;  // Don't split here
-    /// }
-    /// ```
-    pub fn has_non_outer_ranges(self: &Arc<Self>) -> bool {
-        !self.all_in_scope_ranges_are(AxisType::Outer)
-    }
-
     /// Build a consumer map for this UOp's computation graph.
     ///
     /// Returns a HashMap where each UOp maps to the list of UOps that consume it.
     /// Useful for reverse traversal and dependency analysis.
     #[allow(clippy::mutable_key_type)]
     pub fn get_consumer_map(self: &Arc<Self>) -> HashMap<UOpKey, Vec<Arc<Self>>> {
-        let mut consumer_map: HashMap<UOpKey, Vec<Arc<Self>>> = HashMap::new();
+        self.get_consumer_map_call_aware(true)
+    }
 
-        for node in self.toposort() {
-            node.op.map_child(|child| {
+    /// Build a consumer map with optional CALL/FUNCTION/PROGRAM boundary traversal.
+    ///
+    /// When `include_call_bodies` is false, traversal does not descend into
+    /// CALL/FUNCTION bodies or PROGRAM internals. Call/function arguments and
+    /// program device are still traversed.
+    #[allow(clippy::mutable_key_type)]
+    pub fn get_consumer_map_call_aware(self: &Arc<Self>, include_call_bodies: bool) -> HashMap<UOpKey, Vec<Arc<Self>>> {
+        let mut consumer_map: HashMap<UOpKey, Vec<Arc<Self>>> = HashMap::new();
+        let mode = if include_call_bodies { TraversalMode::Full } else { TraversalMode::PreserveCalls };
+
+        for node in self.toposort_call_aware(include_call_bodies) {
+            for child in traversal_sources(&node, mode) {
                 consumer_map.entry(UOpKey(child.clone())).or_default().push(node.clone());
-            });
+            }
         }
 
         consumer_map
@@ -923,8 +966,9 @@ impl UOp {
     /// Replace UOps in the computation graph according to a substitution map.
     ///
     /// Delegates to `graph_rewrite_bottom_up` with a wildcard pattern that looks up
-    /// each node in the map — exactly like Tinygrad's `substitute`. The rewrite engine
-    /// provides O(n) memoization via its result cache.
+    /// each node in the map. The rewrite engine provides O(n) memoization via its
+    /// result cache and an explicit work-stack (no Rust recursion, so deep graphs
+    /// do not exhaust the thread stack).
     #[allow(clippy::mutable_key_type)]
     pub fn substitute(self: &Arc<Self>, map: &HashMap<UOpKey, Arc<Self>>) -> Arc<Self> {
         if map.is_empty() {
@@ -934,11 +978,41 @@ impl UOp {
         crate::rewrite::graph_rewrite_bottom_up(&matcher, self.clone(), &mut ())
     }
 
-    /// Replace UOps with range-gated substitution (Tinygrad: `extra_pm=pm_gate_substitute`).
+    /// Replace UOps using walk semantics — single-pass, no re-traversal into
+    /// rewritten subtrees.
+    ///
+    /// Use when a replacement may contain the original key (e.g.
+    /// `Buffer → After(Buffer, [Store(...)])` for view-assign). The default
+    /// [`Self::substitute`] would re-traverse replacements and loop or wrap
+    /// the key multiple times.
+    #[allow(clippy::mutable_key_type)]
+    pub fn substitute_walk(self: &Arc<Self>, map: &HashMap<UOpKey, Arc<Self>>) -> Arc<Self> {
+        if map.is_empty() {
+            return self.clone();
+        }
+        let matcher = SubstituteMatcher(map);
+        crate::rewrite::graph_rewrite_walk(&matcher, self.clone(), &mut ())
+    }
+
+    /// Replace UOps while preserving CALL/FUNCTION/PROGRAM body boundaries.
+    ///
+    /// Direct substitutions still apply to CALL/FUNCTION/PROGRAM nodes themselves.
+    /// Traversal skips CALL/FUNCTION bodies and PROGRAM internals by default,
+    /// while still rewriting CALL/FUNCTION arguments and PROGRAM device.
+    #[allow(clippy::mutable_key_type)]
+    pub fn substitute_preserve_calls(self: &Arc<Self>, map: &HashMap<UOpKey, Arc<Self>>) -> Arc<Self> {
+        if map.is_empty() {
+            return self.clone();
+        }
+        let matcher = SubstituteMatcher(map);
+        crate::rewrite::graph_rewrite_bottom_up_preserve_calls(&matcher, self.clone(), &mut ())
+    }
+
+    /// Replace UOps with range-gated substitution.
     ///
     /// Like `substitute`, but skips subtrees whose `in_scope_ranges()` don't contain
-    /// any of the substitution keys. This prevents substituting ranges in subexpressions
-    /// that don't reference them, matching Tinygrad's `gate_substitute` behavior.
+    /// any of the substitution keys. Prevents substituting ranges in subexpressions
+    /// that don't reference them.
     #[allow(clippy::mutable_key_type)]
     pub fn substitute_gated(self: &Arc<Self>, map: &HashMap<UOpKey, Arc<Self>>) -> Arc<Self> {
         if map.is_empty() {
@@ -947,6 +1021,17 @@ impl UOp {
         let range_keys: HashSet<UOpKey> = map.keys().cloned().collect();
         let matcher = SubstituteGatedMatcher { map, range_keys: &range_keys };
         crate::rewrite::graph_rewrite_bottom_up(&matcher, self.clone(), &mut ())
+    }
+
+    /// Range-gated substitute that also preserves CALL/FUNCTION/PROGRAM boundaries.
+    #[allow(clippy::mutable_key_type)]
+    pub fn substitute_gated_preserve_calls(self: &Arc<Self>, map: &HashMap<UOpKey, Arc<Self>>) -> Arc<Self> {
+        if map.is_empty() {
+            return self.clone();
+        }
+        let range_keys: HashSet<UOpKey> = map.keys().cloned().collect();
+        let matcher = SubstituteGatedMatcher { map, range_keys: &range_keys };
+        crate::rewrite::graph_rewrite_bottom_up_preserve_calls(&matcher, self.clone(), &mut ())
     }
 
     /// Reconstruct this UOp with new sources.
@@ -980,13 +1065,16 @@ impl UOp {
             // Nullary operations - no sources
             Op::Const(_)
             | Op::Unique(_)
+            | Op::LUnique(_)
             | Op::Device(_)
             | Op::Noop
             | Op::Invalid
             | Op::DefineLocal(_)
             | Op::VConst { .. }
             | Op::DefineVar { .. }
-            | Op::DefineReg { .. } => {
+            | Op::DefineReg { .. }
+            | Op::Source { .. }
+            | Op::ProgramBinary { .. } => {
                 assert_eq!(new_srcs.len(), 0, "Nullary op should have no sources");
                 return self.clone(); // No sources to replace
             }
@@ -1185,20 +1273,52 @@ impl UOp {
                 assert_eq!(new_srcs.len(), 1);
                 Op::Unroll { src: src(0), unroll_axes: unroll_axes.clone() }
             }
-            Op::Kernel { .. } => {
-                assert!(!new_srcs.is_empty());
-                Op::Kernel {
-                    sources: new_srcs[..new_srcs.len() - 1].iter().cloned().collect(),
-                    ast: src(new_srcs.len() - 1),
-                }
+            Op::Call { info, .. } => {
+                assert!(!new_srcs.is_empty(), "Call requires at least body source");
+                Op::Call { body: src(0), args: new_srcs[1..].iter().cloned().collect(), info: info.clone() }
             }
-            Op::Assign { .. } => {
-                assert!(new_srcs.len() >= 2 && new_srcs.len() <= 3, "Assign requires 2-3 sources");
-                Op::Assign {
-                    target: src(0),
-                    value: src(1),
-                    movement_ops: if new_srcs.len() > 2 { Some(src(2)) } else { None },
-                }
+            Op::Function { info, .. } => {
+                assert!(!new_srcs.is_empty(), "Function requires at least body source");
+                Op::Function { body: src(0), args: new_srcs[1..].iter().cloned().collect(), info: info.clone() }
+            }
+            Op::Program { linear, source, binary, .. } => {
+                assert!(new_srcs.len() >= 2, "Program requires sink and device sources");
+                let mut idx = 0usize;
+                let sink = src(idx);
+                idx += 1;
+                let device = src(idx);
+                idx += 1;
+
+                let linear_new = if linear.is_some() {
+                    let value = src(idx);
+                    idx += 1;
+                    Some(value)
+                } else {
+                    None
+                };
+                let source_new = if source.is_some() {
+                    let value = src(idx);
+                    idx += 1;
+                    Some(value)
+                } else {
+                    None
+                };
+                let binary_new = if binary.is_some() {
+                    let value = src(idx);
+                    idx += 1;
+                    Some(value)
+                } else {
+                    None
+                };
+
+                assert_eq!(idx, new_srcs.len(), "Program source count mismatch");
+                Op::Program { sink, device, linear: linear_new, source: source_new, binary: binary_new }
+            }
+            Op::Linear { .. } => Op::Linear { ops: new_srcs.iter().cloned().collect() },
+            Op::Tuple { .. } => Op::Tuple { src: new_srcs.iter().cloned().collect() },
+            Op::GetTuple { index, .. } => {
+                assert_eq!(new_srcs.len(), 1);
+                Op::GetTuple { src: src(0), index: *index }
             }
             Op::Detach { .. } => {
                 assert_eq!(new_srcs.len(), 1);
@@ -1215,10 +1335,10 @@ impl UOp {
             Op::After { .. } => {
                 assert!(!new_srcs.is_empty());
                 let passthrough = src(0);
-                // Validate: AFTER passthrough must not be control flow (Tinygrad semantics)
+                // AFTER passthrough must not be control flow.
                 debug_assert!(
                     !matches!(passthrough.op(), Op::Range { .. } | Op::End { .. }),
-                    "reconstruct_sources: AFTER passthrough is {:?} (id={}), violates Tinygrad semantics",
+                    "reconstruct_sources: AFTER passthrough is {:?} (id={}), expected non-control-flow",
                     passthrough.op(),
                     passthrough.id
                 );
@@ -1229,6 +1349,9 @@ impl UOp {
                 Op::Precast { src: src(0) }
             }
             Op::Custom { code, .. } => Op::Custom { deps: new_srcs.iter().cloned().collect(), code: code.clone() },
+            Op::CustomFunction { kind, .. } => {
+                Op::CustomFunction { kind: kind.clone(), attrs: new_srcs.iter().cloned().collect() }
+            }
             Op::CustomI { code, .. } => Op::CustomI { deps: new_srcs.iter().cloned().collect(), code: code.clone() },
 
             // Memory operations
@@ -1244,11 +1367,11 @@ impl UOp {
             }
 
             // Graph organization
-            Op::Sink { .. } => Op::Sink { sources: new_srcs.iter().cloned().collect() },
+            Op::Sink { info, .. } => Op::Sink { sources: new_srcs.iter().cloned().collect(), info: info.clone() },
             Op::Group { .. } => Op::Group { sources: new_srcs.iter().cloned().collect() },
         };
 
-        // Preserve original dtype and tag (Tinygrad ops.py:1256: preserves tag through source reconstruction)
+        // Preserve original dtype and tag through source reconstruction.
         Self::new_tagged(new_op, self.dtype.clone(), self.tag.clone())
     }
 }

@@ -81,7 +81,17 @@ pub fn pm_split_ends() -> &'static TypedPatternMatcher {
 ///
 /// Extracts actual RANGE ops from the ranges field (which may contain arbitrary
 /// expressions after optimization), then creates nested single-range ENDs.
-fn split_end(computation: &Arc<UOp>, ranges: &SmallVec<[Arc<UOp>; 4]>) -> Option<Arc<UOp>> {
+///
+/// Tag preservation: the input END's tag (set by `reduce_to_acc` —
+/// `TAG_MERGEABLE`) is restored on the outermost nested END so
+/// downstream `merge_sibling_ends` can still find the result. Without
+/// this, `UOp::end(...)` constructs a fresh END with no tag and the
+/// merge pass becomes a no-op.
+pub(crate) fn split_end_with_tag(
+    computation: &Arc<UOp>,
+    ranges: &SmallVec<[Arc<UOp>; 4]>,
+    tag: Option<smallvec::SmallVec<[usize; 2]>>,
+) -> Option<Arc<UOp>> {
     // Extract RANGE ops using the cached `.ranges()` property.
     // Matches Tinygrad's `UOp.sink(*e.src[1:]).ranges`.
     let sink = UOp::sink(ranges.iter().cloned().collect());
@@ -94,12 +104,12 @@ fn split_end(computation: &Arc<UOp>, ranges: &SmallVec<[Arc<UOp>; 4]>) -> Option
 
     // Single RANGE - create simple single-range END
     if actual_ranges.len() == 1 {
-        let new_end = computation.end(SmallVec::from_elem(actual_ranges[0].clone(), 1));
         // Only return Some if this is different from the original
         if ranges.len() == 1 && ranges[0].id == actual_ranges[0].id {
             return None; // No change needed
         }
-        return Some(new_end);
+        let new_end = computation.end(SmallVec::from_elem(actual_ranges[0].clone(), 1));
+        return Some(new_end.rtag(tag));
     }
 
     // Step 2: Sort RANGEs by (axis_id, axis_type) descending (innermost first).
@@ -121,12 +131,23 @@ fn split_end(computation: &Arc<UOp>, ranges: &SmallVec<[Arc<UOp>; 4]>) -> Option
     // Step 3: Wrap computation in nested single-range ENDs.
     // The first range in sorted_ranges is innermost, so it wraps computation first.
     // Result: END(END(comp, inner), outer) — linearizer emits inner END first.
+    // The outermost END carries the original tag (TAG_MERGEABLE) so the merge
+    // pass can find it; inner ENDs are untagged (they bind to a single range
+    // and are not merge candidates).
     let mut result = computation.clone();
-    for range in sorted_ranges {
+    let last_idx = sorted_ranges.len() - 1;
+    for (i, range) in sorted_ranges.into_iter().enumerate() {
         result = result.end(SmallVec::from_elem(range, 1));
+        if i == last_idx {
+            result = result.rtag(tag.clone());
+        }
     }
 
     Some(result)
+}
+
+fn split_end(computation: &Arc<UOp>, ranges: &SmallVec<[Arc<UOp>; 4]>) -> Option<Arc<UOp>> {
+    split_end_with_tag(computation, ranges, None)
 }
 
 /// Pattern matcher for adding control flow dependencies to RANGE operations.

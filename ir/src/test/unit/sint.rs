@@ -11,6 +11,28 @@ fn test_sint_const() {
 }
 
 #[test]
+fn test_sint_vmax_returns_concrete_for_positive_symbolic() {
+    let var = UOp::define_var("n".to_string(), 1, 8);
+    let s = SInt::from(var);
+    assert!(s.is_symbolic());
+    assert_eq!(s.vmax(), Some(8));
+}
+
+#[test]
+fn test_sint_vmax_returns_zero_for_zero_bound() {
+    // A symbolic var bound at exactly 0 must return Some(0), not the previous
+    // Some(1) fallback that masked degenerate ranges as positive bounds.
+    let var = UOp::define_var("z".to_string(), 0, 0);
+    let s = SInt::from(var);
+    if s.is_symbolic() {
+        assert_eq!(s.vmax(), Some(0));
+    } else {
+        // If SInt::from collapsed it to Const(0), that path also yields Some(0).
+        assert_eq!(s.vmax(), Some(0));
+    }
+}
+
+#[test]
 fn test_sint_symbolic() {
     let uop = UOp::index_const(10);
     let s = SInt::from(uop);
@@ -95,6 +117,20 @@ fn test_sint_ceildiv_concrete() {
 fn test_sint_smax_concrete() {
     assert_eq!(SInt::from(3).smax(&SInt::from(7)).as_const(), Some(7));
     assert_eq!(SInt::from(7).smax(&SInt::from(3)).as_const(), Some(7));
+}
+
+#[test]
+fn test_sint_smax_absorbs_nested_max() {
+    let n_uop = UOp::new(Op::DefineVar { name: "N".to_string(), min_val: 1, max_val: 100 }, DType::Index);
+    let n = SInt::from(n_uop);
+    let n_plus_1 = &n + 1usize;
+
+    let max_ab = n.smax(&n_plus_1);
+    let absorbed_left = max_ab.smax(&n);
+    let absorbed_right = n.smax(&max_ab);
+
+    assert_eq!(absorbed_left, max_ab);
+    assert_eq!(absorbed_right, max_ab);
 }
 
 #[test]

@@ -1,10 +1,12 @@
 use bon::bon;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use morok_device::Buffer;
 use morok_dtype::DType;
 use morok_dtype::ext::HasDType;
-use morok_ir::{ConstValue, DeviceSpec, Op, SInt, UOp, shape::Shape};
+use morok_ir::{CallInfo, ConstValue, ConstValueHash, DeviceSpec, Op, SInt, UOp, UOpKey, shape::Shape};
+use smallvec::smallvec;
 use snafu::ResultExt;
 
 /// Extract max value from an SInt for buffer allocation.
@@ -25,6 +27,18 @@ fn sint_vmax(s: &SInt) -> usize {
         },
         SInt::Infer => panic!("cannot compute vmax of SInt::Infer"),
     }
+}
+
+fn find_assign_identity(target: &Arc<UOp>, base: &Arc<UOp>) -> Arc<UOp> {
+    let mut identity = target.clone();
+    while !identity.has_buffer_identity() && identity.id != base.id {
+        let sources = identity.op().sources();
+        let Some(next) = sources.first() else {
+            break;
+        };
+        identity = next.clone();
+    }
+    identity
 }
 
 pub mod error;
@@ -145,6 +159,7 @@ impl Clone for Tensor {
     }
 }
 
+#[bon]
 impl Tensor {
     /// Create tensor without buffer (for lazy computation graphs).
     fn new(uop: Arc<UOp>) -> Self {
@@ -257,6 +272,16 @@ impl Tensor {
         scalar.try_reshape(vec![1; shape.len()])?.try_expand(&expand_shape)
     }
 
+    /// Create a zero-filled tensor with the given concrete shape.
+    pub fn zeros(shape: &[usize], dtype: DType) -> Result<Self> {
+        Self::full(shape, ConstValue::zero(dtype.base()), dtype)
+    }
+
+    /// Create a one-filled tensor with the given concrete shape.
+    pub fn ones(shape: &[usize], dtype: DType) -> Result<Self> {
+        Self::full(shape, ConstValue::one(dtype.base()), dtype)
+    }
+
     /// Create a tensor filled with a constant value, using symbolic (dynamic) dimensions.
     ///
     /// Dimensions can be concrete (`SInt::Const`) or symbolic (`SInt::Symbolic`
@@ -346,39 +371,73 @@ impl Tensor {
 
     /// Create 1D tensor with evenly spaced values and explicit dtype.
     ///
-    /// Generates values in the range `[start, stop)` with given step size.
-    /// If `stop` is None, treats `start` as stop and starts from 0.
-    ///
-    /// Uses lazy `full(step)._cumalu(0, Add) + (start - step)` which
-    /// `reduce_collapse` simplifies into `RANGE * step + offset`.
-    /// Create 1D tensor with evenly spaced values (integer parameters).
-    ///
     /// Matches Tinygrad's `Tensor.arange()`: `full(step) → cumsum → + (start - step)`.
-    pub fn arange_with_dtype(start: i64, stop: Option<i64>, step: Option<i64>, dtype: DType) -> Result<Self> {
+    /// Accepts concrete `i64` or symbolic `Arc<UOp>` for start/stop/step.
+    /// If `stop` is None, treats `start` as stop and starts from 0.
+    #[builder]
+    pub fn arange_with_dtype(
+        start: Arc<UOp>,
+        stop: Option<Arc<UOp>>,
+        dtype: DType,
+        #[builder(default = UOp::const_(dtype.clone(), ConstValue::one(dtype.base())))] step: Arc<UOp>,
+    ) -> Result<Self> {
         let (start, stop) = match stop {
             Some(s) => (start, s),
-            None => (0, start),
+            None => (UOp::const_(dtype.clone(), ConstValue::zero(dtype.base())), start),
         };
-        let step = step.unwrap_or(1);
-        if step == 0 {
-            return Err(Error::SymbolicShapeUnsupported { operation: "arange with step=0".to_string() });
-        }
-        Self::arange_inner(start as f64, stop as f64, step as f64, dtype, false)
+
+        let step_tensor = if let Op::Const(ConstValueHash(ConstValue::Int(start))) = start.op()
+            && let Op::Const(ConstValueHash(ConstValue::Int(stop))) = stop.op()
+            && let Op::Const(ConstValueHash(s @ ConstValue::Int(step))) = step.op()
+        {
+            let diff = stop - start;
+            let ceildiv = ((diff as f64) / (*step as f64)).ceil() as i64;
+            if ceildiv <= 0 {
+                return Ok(Self::empty_zero(dtype));
+            }
+
+            Self::full(&[ceildiv as usize], *s, dtype.clone())?
+        } else {
+            let diff = stop.sub(&start);
+            let one = UOp::const_(dtype.clone(), ConstValue::one(dtype.base()));
+            let ceildiv = diff.add(&step.sub(&one)).idiv(&step);
+            let output_len_sint = SInt::from(ceildiv.clone());
+            let ones: Shape = vec![SInt::Const(1)].into();
+            let target: Shape = vec![output_len_sint].into();
+            let reshaped = step.try_reshape(&ones).unwrap();
+            Self::new(reshaped.try_expand(&target).unwrap())
+        };
+
+        let cumsum = step_tensor._cumalu(0, CumReduceOp::Add)?;
+        let offset = Self::new(start.sub(&step));
+        cumsum.try_add(&offset)?.cast(dtype)
     }
 
     /// Create 1D tensor with evenly spaced Int32 values.
     pub fn arange(start: i64, stop: Option<i64>, step: Option<i64>) -> Result<Self> {
-        Self::arange_with_dtype(start, stop, step, DType::Int32)
+        let dtype = DType::Int32;
+        Self::arange_with_dtype()
+            .start(UOp::const_(dtype.clone(), ConstValue::Int(start)))
+            .maybe_stop(stop.map(|s| UOp::const_(dtype.clone(), ConstValue::Int(s))))
+            .maybe_step(step.map(|s| UOp::const_(dtype.clone(), ConstValue::Int(s))))
+            .dtype(dtype)
+            .call()
     }
 
     /// Create 1D tensor with evenly spaced values (float parameters).
-    ///
-    /// Handles float start/stop/step natively, matching Tinygrad's `Tensor.arange()`.
     pub fn arange_f64(start: f64, stop: f64, step: f64, dtype: DType) -> Result<Self> {
         if step == 0.0 {
             return Err(Error::SymbolicShapeUnsupported { operation: "arange with step=0".to_string() });
         }
-        Self::arange_inner(start, stop, step, dtype, true)
+        let count = ((stop - start) / step).ceil() as i64;
+        if count <= 0 {
+            return Ok(Self::empty_zero(dtype));
+        }
+        let count = count as usize;
+        let step_tensor = Self::full(&[count], ConstValue::Float(step), dtype.clone())?;
+        let cumsum = step_tensor._cumalu(0, CumReduceOp::Add)?;
+        let offset = Self::const_(ConstValue::Float(start - step), dtype.clone());
+        cumsum.try_add(&offset)?.cast(dtype)
     }
 
     /// Create 1D tensor with `steps` evenly spaced values from `start` to `end` (inclusive).
@@ -391,22 +450,8 @@ impl Tensor {
         }
         let t = Self::arange(steps as i64, None, None)?;
         let scale = Self::const_((end - start) / (steps as f64 - 1.0), DType::Float64);
-        let offset = Self::const_(start, DType::Float64);
+        let offset = Tensor::const_(start, DType::Float64);
         t.cast(DType::Float64)?.try_mul(&scale)?.try_add(&offset)?.cast(dtype)
-    }
-
-    /// Shared implementation: `full(count, step) → cumsum → + (start - step)`.
-    fn arange_inner(start: f64, stop: f64, step: f64, dtype: DType, is_float: bool) -> Result<Self> {
-        let count = ((stop - start) / step).ceil() as i64;
-        if count <= 0 {
-            return Ok(Self::empty_zero(dtype));
-        }
-        let count = count as usize;
-        let val = |v: f64| if is_float { ConstValue::Float(v) } else { ConstValue::Int(v as i64) };
-        let step_tensor = Self::full(&[count], val(step), dtype.clone())?;
-        let cumsum = step_tensor._cumalu(0, CumReduceOp::Add)?;
-        let offset = Self::const_(val(start - step), dtype.clone());
-        cumsum.try_add(&offset)?.cast(dtype)
     }
 
     // === Constant Constructors ===
@@ -497,6 +542,31 @@ impl Tensor {
         Ok(Self::new(casted))
     }
 
+    /// Build and apply a custom UOp kernel over this tensor and additional inputs.
+    ///
+    /// The closure receives PARAM placeholders (as UOps) corresponding to
+    /// `[self, others...]` and must return the kernel body UOp (typically a SINK).
+    /// Returns tensors wrapped with AFTER(CALL) dependencies in argument order.
+    pub fn custom_kernel<F>(&self, others: &[&Tensor], fxn: F) -> Result<Vec<Tensor>>
+    where
+        F: FnOnce(Vec<Arc<UOp>>) -> Arc<UOp>,
+    {
+        self.custom_kernel_with(others, CallInfo::default(), fxn)
+    }
+
+    /// `custom_kernel` with explicit CALL metadata.
+    pub fn custom_kernel_with<F>(&self, others: &[&Tensor], info: CallInfo, fxn: F) -> Result<Vec<Tensor>>
+    where
+        F: FnOnce(Vec<Arc<UOp>>) -> Arc<UOp>,
+    {
+        let mut srcs: Vec<Arc<UOp>> = Vec::with_capacity(1 + others.len());
+        srcs.push(self.uop());
+        srcs.extend(others.iter().map(|t| t.uop()));
+
+        let outputs = UOp::custom_kernel(srcs, fxn, info).context(UOpSnafu)?;
+        Ok(outputs.into_iter().map(Self::from_lazy).collect())
+    }
+
     /// Bitcast tensor to a different dtype (reinterpret bits, same byte size required).
     pub fn bitcast(&self, dtype: morok_dtype::DType) -> Result<Self> {
         Ok(Self::new(self.uop().bitcast(dtype)))
@@ -504,8 +574,7 @@ impl Tensor {
 
     /// Assign a value tensor to this tensor in-place.
     ///
-    /// Creates an ASSIGN UOp linking this tensor's BUFFER to the value.
-    /// The assignment is resolved lazily during `realize()`.
+    /// Embeds the write as `AFTER(target, STORE(target, value))`.
     ///
     /// # Example
     ///
@@ -515,13 +584,57 @@ impl Tensor {
     ///     .try_reshape(&[2, 3]).unwrap();
     /// placeholder.assign(&real_data);
     /// ```
-    pub fn assign(&self, value: &Tensor) {
+    pub fn try_assign(&self, value: &Tensor) -> Result<()> {
         let target_uop = self.uop();
-        let assign_uop = UOp::assign(target_uop.clone(), value.uop());
-        // Track for side-realization during realize() (Tinygrad: _pending_assigns).
-        let buffer_id = target_uop.base().id;
-        tensor_registry::add_pending_assign(buffer_id, assign_uop.clone());
-        self.set_uop(assign_uop);
+        if self.device().is_disk() {
+            return Err(Error::IrConstruction {
+                details: "assign to DISK tensors is not supported by Morok runtime".to_string(),
+            });
+        }
+
+        let target_shape = self.shape()?;
+        let value_shape = value.shape()?;
+        let value = if target_shape != value_shape { value.broadcast_to(&target_shape)? } else { value.clone() };
+        if self.device() != value.device() {
+            return Err(Error::IrConstruction {
+                details: format!("assign device mismatch {:?} != {:?}", self.device(), value.device()),
+            });
+        }
+
+        let target_dtype = target_uop.dtype();
+        let value_dtype = value.uop().dtype();
+        if target_dtype != value_dtype {
+            return Err(Error::TypeMismatch { expected: target_dtype, actual: value_dtype });
+        }
+
+        let value_uop = value.uop();
+        if Arc::ptr_eq(&target_uop, &value_uop) {
+            return Ok(());
+        }
+
+        let assign_effect = target_uop.after(smallvec![target_uop.store(value_uop)]);
+        let base = target_uop.base();
+        if matches!(base.op(), Op::Buffer { .. } | Op::After { .. })
+            && target_uop.id != base.id
+            && !target_uop.has_buffer_identity()
+        {
+            let identity = find_assign_identity(&target_uop, &base);
+            let assigned_identity = identity.after(smallvec![assign_effect]);
+            #[allow(clippy::mutable_key_type)]
+            let mut becomes_map = HashMap::new();
+            becomes_map.insert(UOpKey(identity), assigned_identity);
+            // Walk semantics required: replacement contains the original key
+            // (`After(Buffer, [...])` wraps `Buffer`). A re-traversing rewrite
+            // would loop or wrap the buffer multiple times.
+            tensor_registry::apply_map_to_tensors_walk(&becomes_map);
+        } else {
+            self.set_uop(assign_effect);
+        }
+        Ok(())
+    }
+
+    pub fn assign(&self, value: &Tensor) {
+        self.try_assign(value).expect("tensor assign failed");
     }
 
     /// Update the UOp for this tensor directly.

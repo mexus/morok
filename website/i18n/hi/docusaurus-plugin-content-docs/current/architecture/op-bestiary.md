@@ -38,8 +38,8 @@ Range {
 
 | टाइप | प्रायोरिटी | GPU मैपिंग | उद्देश्य |
 |------|-----------|------------|----------|
-| `Outer` | -2 | — | कर्नेल बाउंड्री मार्कर |
-| `Loop` | -1 | `for` लूप | सीक्वेंशियल इटरेशन |
+| `Placeholder` | -3 | — | RESHAPE कैशिंग के दौरान इस्तेमाल होने वाला अस्थायी कैनोनिकल range |
+| `Loop` | -1 | `for` लूप | rangeify का डिफ़ॉल्ट range; schedule-स्तर के रैपर `END(Call)` पेयर के ज़रिए स्ट्रक्चरली पहचाने जाते हैं |
 | `Global` | 0 | `blockIdx` | ग्रिड पैरेललिज़्म |
 | `Thread` | 0 | thread pool | CPU पैरेललिज़्म |
 | `Warp` | 1 | warp/wavefront | सब-ग्रुप पैरेललिज़्म |
@@ -49,7 +49,7 @@ Range {
 | `Reduce` | 4 | accumulator | रिडक्शन डायमेंशन |
 | `Unroll` | 5 | unrolled | लूप अनरोलिंग |
 
-प्रायोरिटी लूप नेस्टिंग ऑर्डर तय करती है — कम वैल्यू वाले आउटर लूप होते हैं।
+प्रायोरिटी लूप नेस्टिंग ऑर्डर तय करती है — कम वैल्यू वाले आउटर लूप होते हैं। कर्नेल बाउंड्री `Call`/`Function` के ज़रिए स्ट्रक्चरली व्यक्त होती है, इसके लिए कोई अलग ऐक्सिस टाइप नहीं है।
 
 **उदाहरण:**
 ```text
@@ -181,6 +181,7 @@ Bufferize {
 |--------|------|----------|
 | `device` | `Option<DeviceSpec>` | टारगेट डिवाइस, लोकल के लिए `None` |
 | `addrspace` | `AddrSpace` | `Global` (डिवाइस) या `Local` (shared) |
+| `removable` | `bool` | `false` होने पर `buffer_removal` को इस BUFFERIZE को इनलाइन करने की अनुमति नहीं — मल्टी-कंज़्यूमर realize बाउंड्री पर इस्तेमाल होता है ताकि बफ़र मेगा-pass फ़िक्सपॉइंट इटरेशन के बीच टिका रहे |
 
 **उदाहरण:**
 ```text
@@ -273,38 +274,115 @@ STORE
 
 ---
 
-## कर्नेल स्ट्रक्चर
+## कर्नेल स्ट्रक्चर और कॉलेबल IR
 
-### KERNEL — कर्नेल रैपर
+Schedule-स्तर का काम एक कॉलेबल IR के ज़रिए व्यक्त होता है जो tinygrad
+के `CALL`/`FUNCTION`/`PROGRAM` मॉडल के अनुरूप है: `Function` एक बॉडी
+(आमतौर पर stores का `Sink`) को परिभाषित करता है जिसे आर्ग्युमेंट से
+पैरामीट्राइज़ किया जाता है, `Call` कंक्रीट आर्ग्युमेंट के साथ इसे invoke
+करता है, और `Program` बॉडी को सख़्त `SINK → LINEAR → SOURCE → BINARY`
+स्टेजिंग के ज़रिए कंपाइलेशन तक पहुँचाता है।
+
+### CALL — फ़ंक्शन बॉडी invoke करना
 
 ```rust
-Kernel {
-    sources: SmallVec<[Arc<UOp>; 4]>,   // arguments
-    ast: Arc<UOp>,                       // computation (usually SINK)
+Call {
+    body: Arc<UOp>,                     // FUNCTION (या उसकी बॉडी)
+    args: SmallVec<[Arc<UOp>; 4]>,      // कंक्रीट आर्ग्युमेंट वैल्यूज़
+    info: CallInfo,                     // मेटाडेटा (name, grad_tag, …)
 }
 ```
 
-कोड जनरेशन के लिए एक पूरे कर्नेल को रैप करता है। Sources कर्नेल आर्ग्युमेंट होते हैं (`Param`, `DefineLocal`, `DefineVar`)। नोट: `Param` ने batching_support PR में `DefineGlobal` को रिप्लेस किया ताकि बफ़र आइडेंटिटी हटाकर कर्नेल डीडुप्लिकेशन सक्षम हो सके।
+आर्ग्युमेंट के साथ कॉलेबल बॉडी invoke करता है। Range-ending: `args` में
+मौजूद किसी भी `Range` को क्लोज़ करता है (range_start_index = 1; `body=0`,
+`args=1+`)।
 
-**उदाहरण:**
-```text
-KERNEL
-├── PARAM(slot=0, size=1024) — आउटपुट बफ़र arg
-├── PARAM(slot=1, size=1024) — इनपुट A arg
-├── PARAM(slot=2, size=1024) — इनपुट B arg
-└── SINK                     — computation
-    └── STORE(...)
+`CallInfo` कैश-कुंजी के लिए सुरक्षित ऐनोटेशन कैरी करता है:
+
+| फ़ील्ड | टाइप | उद्देश्य |
+|--------|------|----------|
+| `name` | `Option<String>` | इंसान के पढ़ने योग्य कॉलेबल नाम |
+| `grad_tag` | `Option<String>` | फ़्यूचर ग्रेडिएंट-कॉलबैक आइडेंटिटी के लिए रिज़र्व |
+| `metadata` | `Vec<String>` | स्थिर हैशेबल ऐनोटेशन |
+| `precompile` / `precompile_backward` | `bool` | प्री-कंपाइल हिंट |
+
+### FUNCTION — री-यूज़ेबल बॉडी
+
+```rust
+Function {
+    body: Arc<UOp>,                     // कंप्यूटेशन
+    args: SmallVec<[Arc<UOp>; 4]>,      // फ़ॉर्मल पैरामीटर
+    info: CallInfo,
+}
 ```
+
+री-यूज़ेबल कॉलेबल। इसका dtype हमेशा `Void` होता है; जो बॉडी कई वैल्यू
+रिटर्न करती है उसे `Tuple` में रैप किया जाता है ताकि फ़ंक्शन बाउंड्री
+Void बनी रहे। Range-ending आकार `Call` जैसा ही है।
+
+### TUPLE / GET_TUPLE — मल्टी-वैल्यू रिटर्न
+
+```rust
+Tuple { src: SmallVec<[Arc<UOp>; 4]> }
+GetTuple { src: Arc<UOp>, index: usize }
+```
+
+`Tuple` विषम वैल्यूज़ को पैक करता है; इसका dtype हमेशा `Void` होता है।
+`GetTuple` एक `Tuple` (या जिस `Function` की बॉडी `Tuple` है) से
+`index` एलिमेंट निकालता है; इसका dtype अंदरूनी एलिमेंट से मेल खाता है।
+Void फ़ंक्शन बाउंड्री से कई आउटपुट गुज़ारने के लिए इस्तेमाल होता है।
+
+### PROGRAM — कंपाइल-पाइपलाइन कंटेनर
+
+```rust
+Program {
+    sink: Arc<UOp>,                     // रूट SINK
+    device: Arc<UOp>,                   // DEVICE
+    linear: Option<Arc<UOp>>,           // LINEAR (linearize के बाद)
+    source: Option<Arc<UOp>>,           // SOURCE (render के बाद)
+    binary: Option<Arc<UOp>>,           // PROGRAM_BINARY (compile के बाद)
+}
+```
+
+`codegen/src/program_pipeline.rs` के ज़रिए लागू होने वाले `SINK → LINEAR
+→ SOURCE → PROGRAM_BINARY` स्टेजिंग (`do_linearize`/`do_render`/
+`do_compile`/`get_program`) से कर्नेल को गुज़ारता है। हर स्टेज अगला
+फ़ील्ड भरती है। C/LLVM/MLIR रेंडरर `Op::Linear` इनपुट की उम्मीद रखते हैं
+और panic के बजाय per-context `pending_error` के ज़रिए
+`Error::InvalidGraph` रिपोर्ट करते हैं; render से पहले मल्टी-इंडेक्स
+`INDEX` को `pm_linearize_multi_index` से लो-कर लेना चाहिए।
+
+### LINEAR — लीनियराइज़्ड ऑप स्ट्रीम
+
+```rust
+Linear { ops: SmallVec<[Arc<UOp>; 8]> }
+```
+
+लीनियराइज़ेशन से उत्पन्न ऑप्स का फ़्लैट क्रम। उपभोक्ता ग्राफ़ को फिर से
+ट्रैवर्स किए बिना सीधे `ops` पर इटरेट कर सकते हैं।
+
+### SOURCE / PROGRAM_BINARY — कंपाइलेशन आर्टिफ़ैक्ट्स
+
+```rust
+Source { code: String }              // रेंडर्ड सोर्स (C / LLVM-IR / MLIR)
+ProgramBinary { bytes: Vec<u8> }     // कंपाइल्ड आर्टिफ़ैक्ट
+```
+
+प्रोग्राम पाइपलाइन की टर्मिनल स्टेजेज़। दोनों लीफ़ हैं (कोई चाइल्ड नहीं)।
 
 ### SINK — मल्टीपल रूट कलेक्टर
 
 ```rust
 Sink {
     sources: SmallVec<[Arc<UOp>; 4]>,
+    info: Option<KernelInfo>,           // कर्नेल AST के लिए स्ट्रक्चरल मार्कर
 }
 ```
 
-कई आउटपुट को एक सिंगल रूट में कलेक्ट करता है। हर कर्नेल का `ast` आमतौर पर एक SINK होता है जिसमें STORE ऑपरेशन होते हैं।
+कई आउटपुट को एक सिंगल रूट में कलेक्ट करता है। `Function` की बॉडी आमतौर
+पर stores का `Sink` होती है। `info` फ़ील्ड एक हैश-कॉन्स्ड स्ट्रक्चरल
+मार्कर है जो टाइप-इरेज़्ड साइड-चैनल मेटाडेटा पर निर्भर हुए बिना कर्नेल-
+AST SINK को बाकी समान-source SINK से अलग करता है।
 
 **उदाहरण:**
 ```text
@@ -487,7 +565,7 @@ Wmma {
 | `dims` | `(N, M, K)` | मैट्रिक्स डायमेंशन (जैसे, `(16, 16, 16)`) |
 | `dtype_in` | `DType` | इनपुट मैट्रिक्स प्रिसिज़न (जैसे, `Float16`) |
 | `dtype_out` | `DType` | आउटपुट प्रिसिज़न (जैसे, `Float32`) |
-| `device` | `String` | टारगेट डिवाइस स्ट्रिंग |
+| `device` | `RendererDevice` | इस WMMA को उत्पन्न करने वाला रेंडरर / TC बैकएंड |
 | `threads` | `usize` | प्रति warp threads (आमतौर पर 32) |
 | `upcast_axes` | `WmmaUpcastAxes` | प्रति-ऑपरेंड वेक्टराइज़ेशन (फ़ील्ड्स: `a`, `b`, `c`) |
 | `reduce_axes` | `Vec<(usize, usize)>` | कॉन्ट्रैक्शन axes |
@@ -614,13 +692,18 @@ SPECIAL(name="blockIdx.x", end=128) : Index
 └── CONST(128)
 ```
 
-### UNIQUE — आइडेंटिटी मार्कर
+### UNIQUE / LUNIQUE — आइडेंटिटी मार्कर
 
 ```rust
-Unique(usize)                // unique identifier
+Unique(usize)                // ग्लोबल आइडेंटिटी काउंटर
+LUnique(usize)               // लोकल-स्कोप आइडेंटिटी काउंटर
 ```
 
-बफ़र disambiguation के लिए यूनीक आइडेंटिटी बनाता है। अलग UNIQUE वैल्यू वाले दो बफ़र अलग माने जाते हैं, भले ही बाकी सब समान हो।
+बफ़र disambiguation के लिए यूनीक आइडेंटिटी बनाता है। अलग `Unique` वैल्यू
+वाले दो बफ़र अलग माने जाते हैं, भले ही बाकी सब समान हो। `LUnique` लोकल
+स्कोप (जैसे `Function` बॉडी) के अंदर वही disambiguation देता है, बिना
+ग्लोबल काउंटर से टकराए — इससे कॉलेबल बॉडीज़ को कॉल साइट से स्वतंत्र
+रूप से हैश-कॉन्स किया जा सकता है।
 
 ### DEVICE — डिवाइस स्पेसिफ़िकेशन
 
@@ -661,17 +744,17 @@ RESHAPE(new_shape=[6, 4]) : Shape[6, 4]
 | ऑपरेशन | उद्देश्य |
 |---------|----------|
 | `Copy` | एक वैल्यू की एक्सप्लिसिट कॉपी |
-| `BufferView` | offset/stride के साथ मौजूदा बफ़र में व्यू |
+| `BufferView` | `{ buffer, size, offset }` — मौजूदा बफ़र का किसी offset पर स्लाइस |
 | `MStack` | मेमोरी स्टैक एलोकेशन |
 | `MSelect` | मेमोरी सिलेक्ट (कंडीशनल मेमोरी एक्सेस) |
 | `Multi` | मल्टी-आउटपुट ऑपरेशन |
-| `Assign` | वेरिएबल असाइनमेंट |
 | `Group` | शेड्यूलिंग के लिए ऑपरेशन ग्रुप करें |
 | `Detach` | ग्राफ़ से डिटैच (ऑप्टिमाइज़ेशन रोकें) |
 | `Contiguous` | कॉन्टिग्यूअस डेटा का हिंट |
 | `ContiguousBackward` | कॉन्टिग्यूअस हिंट का बैकवर्ड पास |
 | `Precast` | टाइप कन्वर्शन के लिए प्री-कास्ट |
-| `Custom` / `CustomI` | कस्टम ऑपरेशन एक्सटेंसिबिलिटी |
+| `Custom` / `CustomI` | इनलाइन कस्टम ऑपरेशन एक्सटेंसिबिलिटी (`Custom` केवल C बैकएंड पर) |
+| `CustomFunction` | रनटाइम कस्टम-फ़ंक्शन हुक (kinds: `EncDec`, `Graph`) |
 
 ---
 
@@ -683,13 +766,13 @@ RESHAPE(new_shape=[6, 4]) : Shape[6, 4]
 |---------|--------|
 | **लूप कंट्रोल** | `RANGE`, `END` |
 | **रिडक्शन** | `REDUCE_AXIS`, `REDUCE`, `ALLREDUCE` |
-| **मेमोरी** | `BUFFER`, `BUFFERIZE`, `INDEX`, `POINTER_INDEX`, `LOAD`, `STORE` |
-| **कर्नेल** | `KERNEL`, `SINK`, `AFTER`, `BARRIER` |
+| **मेमोरी** | `BUFFER`, `BUFFER_VIEW`, `BUFFERIZE`, `INDEX`, `POINTER_INDEX`, `LOAD`, `STORE` |
+| **कर्नेल और कॉलेबल** | `SINK`, `CALL`, `FUNCTION`, `TUPLE`, `GET_TUPLE`, `PROGRAM`, `LINEAR`, `SOURCE`, `PROGRAM_BINARY`, `AFTER`, `BARRIER` |
 | **वेक्टर** | `VECTORIZE`, `GEP`, `VCONST`, `CAT`, `PTRCAT` |
 | **Expansion** | `UNROLL`, `CONTRACT` |
 | **हार्डवेयर** | `WMMA`, `SPECIAL` |
 | **कंट्रोल** | `IF`, `ENDIF` |
-| **डेफ़िनिशन** | `PARAM`, `DEFINE_LOCAL`, `DEFINE_VAR`, `DEFINE_REG`, `BIND`, `UNIQUE`, `DEVICE` |
+| **डेफ़िनिशन** | `PARAM`, `DEFINE_LOCAL`, `DEFINE_VAR`, `DEFINE_REG`, `BIND`, `UNIQUE`, `LUNIQUE`, `DEVICE` |
 | **मूवमेंट** | `RESHAPE`, `PERMUTE`, `EXPAND`, `PAD`, `SHRINK`, `FLIP` |
 | **ALU** | `Unary(...)`, `Binary(...)`, `Ternary(...)`, `Cast`, `BitCast` |
 
@@ -704,6 +787,7 @@ RESHAPE(new_shape=[6, 4]) : Shape[6, 4]
 | `STORE` | 2 (index=0, value=1, ranges=2+) |
 | `WMMA` | 3 (a=0, b=1, c=2) |
 | `END` | 1 (computation=0, ranges=1+) |
+| `CALL` / `FUNCTION` | 1 (body=0, args=1+) |
 
 ### Expandable ऑपरेशन
 

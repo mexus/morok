@@ -49,22 +49,23 @@ mod dlopen_impl {
                 .map_err(|e| crate::Error::JitCompilation { reason: format!("Failed to write source file: {e}") })?;
             drop(src_file);
 
-            let output = std::process::Command::new("clang")
-                .args([
-                    "-shared",
-                    "-O2",
-                    "-march=native",
-                    "-fPIC",
-                    "-fno-math-errno",
-                    "-lm",
-                    "-o",
-                    so_path.to_str().unwrap(),
-                    src_path.to_str().unwrap(),
-                ])
-                .output()
-                .map_err(|e| crate::Error::JitCompilation {
-                    reason: format!("Failed to run clang: {e}. Is clang installed?"),
-                })?;
+            // On ARM, `-mcpu=native` enables CPU-specific tuning. `-march=native`
+            // only sets the base ISA family on ARM.
+            let march = match std::env::consts::ARCH {
+                "x86_64" | "loongarch64" => "-march=native",
+                "riscv64" => "-march=rv64g",
+                _ => "-mcpu=native",
+            };
+            let mut args = vec!["-shared", "-O2", march, "-fPIC", "-fno-math-errno", "-fno-ident", "-lm"];
+            // Reserve x18 only on macOS ARM, where the kernel clobbers it on
+            // context switch. Linux ARM treats x18 as a free GPR; Windows ARM
+            // is not a target morok currently supports.
+            #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+            args.push("-ffixed-x18");
+            args.extend_from_slice(&["-o", so_path.to_str().unwrap(), src_path.to_str().unwrap()]);
+            let output = std::process::Command::new("clang").args(&args).output().map_err(|e| {
+                crate::Error::JitCompilation { reason: format!("Failed to run clang: {e}. Is clang installed?") }
+            })?;
 
             if !output.status.success() {
                 let stderr = String::from_utf8_lossy(&output.stderr);
@@ -119,38 +120,5 @@ mod dlopen_impl {
 pub use dlopen_impl::ClangKernel;
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_clang_kernel_noop() {
-        let src = "void test_kernel(void) { }\n";
-        let kernel = ClangKernel::compile(src, "test_kernel", vec![], 0).unwrap();
-        assert_eq!(kernel.name(), "test_kernel");
-        unsafe {
-            kernel.execute_with_vals(&[], &[]).unwrap();
-        }
-    }
-
-    #[test]
-    fn test_clang_kernel_add() {
-        let src = r#"
-void add_kernel(float* restrict a, float* restrict b, float* restrict out) {
-    out[0] = a[0] + b[0];
-}
-"#;
-        let kernel = ClangKernel::compile(src, "add_kernel", vec![], 3).unwrap();
-
-        let mut a = [1.0f32];
-        let mut b = [2.0f32];
-        let mut out = [0.0f32];
-
-        let buffers = vec![a.as_mut_ptr() as *mut u8, b.as_mut_ptr() as *mut u8, out.as_mut_ptr() as *mut u8];
-
-        unsafe {
-            kernel.execute_with_vals(&buffers, &[]).unwrap();
-        }
-
-        assert_eq!(out[0], 3.0);
-    }
-}
+#[path = "test/unit/clang.rs"]
+mod tests;

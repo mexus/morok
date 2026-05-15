@@ -147,7 +147,7 @@ When the rangeify pass creates a `BUFFERIZE` node (marking "this needs a buffer"
 ### Decision Tree
 
 ```text
-Is this an always-run op (CONTIGUOUS, COPY, ASSIGN)?
+Is this an always-run op (CONTIGUOUS, COPY)?
   └─ YES → Keep buffer (always materialized)
 
 Does inlining exceed the buffer limit?

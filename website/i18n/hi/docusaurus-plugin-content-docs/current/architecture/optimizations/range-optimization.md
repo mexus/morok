@@ -147,7 +147,7 @@ Tinygrad: `simplify.py:82-142`। Morok: `pm_reduce_simplify()` + `reduce_collap
 ### Decision Tree
 
 ```text
-Is this an always-run op (CONTIGUOUS, COPY, ASSIGN)?
+Is this an always-run op (CONTIGUOUS, COPY)?
   └─ YES → Keep buffer (always materialized)
 
 Does inlining exceed the buffer limit?

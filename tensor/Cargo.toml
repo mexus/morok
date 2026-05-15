@@ -43,3 +43,7 @@ proptest = "1.11.0"
 [[bench]]
 name = "optimization"
 harness = false
+
+[[bench]]
+name = "conformer_ffn"
+harness = false

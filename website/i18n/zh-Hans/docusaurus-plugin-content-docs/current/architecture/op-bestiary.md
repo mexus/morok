@@ -38,8 +38,8 @@ Range {
 
 | 类型 | 优先级 | GPU 映射 | 用途 |
 |------|--------|----------|------|
-| `Outer` | -2 | — | 内核边界标记 |
-| `Loop` | -1 | `for` 循环 | 顺序迭代 |
+| `Placeholder` | -3 | — | RESHAPE 缓存期间使用的临时规范化 range |
+| `Loop` | -1 | `for` 循环 | rangeify 产生的默认 range；schedule 层的封装通过 `END(Call)` 配对在结构上区分 |
 | `Global` | 0 | `blockIdx` | 网格并行 |
 | `Thread` | 0 | 线程池 | CPU 并行 |
 | `Warp` | 1 | warp/wavefront | 子组并行 |
@@ -49,7 +49,7 @@ Range {
 | `Reduce` | 4 | 累加器 | 规约维度 |
 | `Unroll` | 5 | 展开 | 循环展开 |
 
-优先级决定循环嵌套顺序——值越小越在外层。
+优先级决定循环嵌套顺序——值越小越在外层。内核边界由 `Call`/`Function` 在结构上表达，没有专门的轴类型。
 
 **示例：**
 ```text
@@ -181,6 +181,7 @@ Bufferize {
 |------|------|------|
 | `device` | `Option<DeviceSpec>` | 目标设备，`None` 表示本地 |
 | `addrspace` | `AddrSpace` | `Global`（设备）或 `Local`（共享） |
+| `removable` | `bool` | 为 `false` 时禁止 `buffer_removal` 内联此 BUFFERIZE——多消费者 realize 边界使用此设置，使得 buffer 在大型 pass 的不动点迭代中保持不变 |
 
 **示例：**
 ```text
@@ -273,38 +274,106 @@ STORE
 
 ---
 
-## 内核结构
+## 内核结构与可调用 IR
 
-### KERNEL — 内核包装器
+schedule 层的工作通过可调用 IR 表达，对应 tinygrad 的 `CALL`/`FUNCTION`/
+`PROGRAM` 模型：`Function` 定义一个由参数化的体（通常是包含 store 的
+`Sink`），`Call` 用具体参数调用它，`Program` 则按 `SINK → LINEAR →
+SOURCE → BINARY` 的严格阶段把体送进编译流水线。
+
+### CALL — 调用函数体
 
 ```rust
-Kernel {
-    sources: SmallVec<[Arc<UOp>; 4]>,   // arguments
-    ast: Arc<UOp>,                       // computation (usually SINK)
+Call {
+    body: Arc<UOp>,                     // FUNCTION（或其体）
+    args: SmallVec<[Arc<UOp>; 4]>,      // 具体的参数值
+    info: CallInfo,                     // 元数据（name、grad_tag……）
 }
 ```
 
-封装一个完整的内核用于代码生成。sources 是内核参数（`Param`、`DefineLocal`、`DefineVar`）。注意：在 batching_support PR 中，`Param` 替代了 `DefineGlobal`，通过擦除 buffer 身份来实现内核去重。
+用参数调用一个 callable 体。Range 关闭：关闭 `args` 中出现的任何 `Range`
+（range_start_index = 1；`body=0`，`args=1+`）。
 
-**示例：**
-```text
-KERNEL
-├── PARAM(slot=0, size=1024) — output buffer arg
-├── PARAM(slot=1, size=1024) — input A arg
-├── PARAM(slot=2, size=1024) — input B arg
-└── SINK                     — computation
-    └── STORE(...)
+`CallInfo` 携带可作为缓存键的注解：
+
+| 字段 | 类型 | 用途 |
+|------|------|------|
+| `name` | `Option<String>` | 可读的 callable 名称 |
+| `grad_tag` | `Option<String>` | 为梯度回调的身份保留 |
+| `metadata` | `Vec<String>` | 稳定的可哈希注解 |
+| `precompile` / `precompile_backward` | `bool` | 预编译提示 |
+
+### FUNCTION — 可重用的体
+
+```rust
+Function {
+    body: Arc<UOp>,                     // 计算
+    args: SmallVec<[Arc<UOp>; 4]>,      // 形参
+    info: CallInfo,
+}
 ```
+
+可重用的 callable。其 dtype 始终为 `Void`；返回多个值的体会被包进
+`Tuple`，使函数边界保持 Void。Range 关闭形态与 `Call` 相同。
+
+### TUPLE / GET_TUPLE — 多值返回
+
+```rust
+Tuple { src: SmallVec<[Arc<UOp>; 4]> }
+GetTuple { src: Arc<UOp>, index: usize }
+```
+
+`Tuple` 打包异构值；其 dtype 始终为 `Void`。`GetTuple` 从 `Tuple`（或体
+为 `Tuple` 的 `Function`）中提取索引为 `index` 的元素；其 dtype 与内部
+元素一致。用于让多个输出穿过 Void 的函数边界。
+
+### PROGRAM — 编译流水线容器
+
+```rust
+Program {
+    sink: Arc<UOp>,                     // 根 SINK
+    device: Arc<UOp>,                   // DEVICE
+    linear: Option<Arc<UOp>>,           // LINEAR（线性化后）
+    source: Option<Arc<UOp>>,           // SOURCE（渲染后）
+    binary: Option<Arc<UOp>>,           // PROGRAM_BINARY（编译后）
+}
+```
+
+把内核送过 `codegen/src/program_pipeline.rs` 强制的 `SINK → LINEAR →
+SOURCE → PROGRAM_BINARY` 阶段（`do_linearize`/`do_render`/`do_compile`/
+`get_program`），每一阶段填入下一字段。C/LLVM/MLIR 渲染器期望 `Op::Linear`
+作为输入，并通过上下文的 `pending_error` 报告 `Error::InvalidGraph`，不
+再用 panic；多索引 `INDEX` 必须先经 `pm_linearize_multi_index` 降级。
+
+### LINEAR — 线性化的操作流
+
+```rust
+Linear { ops: SmallVec<[Arc<UOp>; 8]> }
+```
+
+由线性化产生的扁平操作序列。消费者可以直接迭代 `ops`，无需重新遍历图。
+
+### SOURCE / PROGRAM_BINARY — 编译产物
+
+```rust
+Source { code: String }              // 渲染后的源码（C / LLVM-IR / MLIR）
+ProgramBinary { bytes: Vec<u8> }     // 编译产物
+```
+
+流水线的终结阶段。两者都是叶子（无子节点）。
 
 ### SINK — 多根收集器
 
 ```rust
 Sink {
     sources: SmallVec<[Arc<UOp>; 4]>,
+    info: Option<KernelInfo>,           // 内核 AST 的结构性标记
 }
 ```
 
-将多个输出收集到一个根节点。每个内核的 `ast` 通常是一个包含 STORE 操作的 SINK。
+将多个输出收集到一个根节点。`Function` 的体通常是由 store 组成的 `Sink`。
+`info` 字段是经过哈希 consing 的结构性标记，用来区分内核 AST 的 SINK
+和具有相同源的普通 SINK，无需依赖类型擦除的旁路元数据通道。
 
 **示例：**
 ```text
@@ -487,7 +556,7 @@ Wmma {
 | `dims` | `(N, M, K)` | 矩阵维度（如 `(16, 16, 16)`） |
 | `dtype_in` | `DType` | 输入矩阵精度（如 `Float16`） |
 | `dtype_out` | `DType` | 输出精度（如 `Float32`） |
-| `device` | `String` | 目标设备字符串 |
+| `device` | `RendererDevice` | 产生此 WMMA 的渲染器 / TC 后端 |
 | `threads` | `usize` | 每个 warp 的线程数（通常 32） |
 | `upcast_axes` | `WmmaUpcastAxes` | 各操作数的向量化信息（字段：`a`、`b`、`c`） |
 | `reduce_axes` | `Vec<(usize, usize)>` | 收缩轴 |
@@ -614,13 +683,17 @@ SPECIAL(name="blockIdx.x", end=128) : Index
 └── CONST(128)
 ```
 
-### UNIQUE — 标识标记
+### UNIQUE / LUNIQUE — 标识标记
 
 ```rust
-Unique(usize)                // unique identifier
+Unique(usize)                // 全局身份计数器
+LUnique(usize)               // 局部作用域身份计数器
 ```
 
-为 buffer 消歧创建唯一标识。具有不同 UNIQUE 值的两个 buffer 即使其他属性完全相同也是不同的。
+为 buffer 消歧创建唯一标识。具有不同 `Unique` 值的两个 buffer 即使其他
+属性完全相同也是不同的。`LUnique` 在局部作用域（例如 `Function` 体内）
+提供同样的消歧能力，且不与全局计数器冲突——这样 callable 体可以独立于
+调用点进行哈希 consing。
 
 ### DEVICE — 设备规格
 
@@ -661,17 +734,17 @@ RESHAPE(new_shape=[6, 4]) : Shape[6, 4]
 | 操作 | 用途 |
 |------|------|
 | `Copy` | 显式复制值 |
-| `BufferView` | 带 offset/stride 的 buffer 视图 |
+| `BufferView` | `{ buffer, size, offset }` —— 现有 buffer 在某偏移处的切片 |
 | `MStack` | 内存栈分配 |
 | `MSelect` | 内存选择（条件内存访问） |
 | `Multi` | 多输出操作 |
-| `Assign` | 变量赋值 |
 | `Group` | 用于调度的操作分组 |
 | `Detach` | 从图中分离（阻止优化穿透） |
 | `Contiguous` | 标记数据连续的提示 |
 | `ContiguousBackward` | contiguous 提示的反向传播 |
 | `Precast` | 类型转换的预转型 |
-| `Custom` / `CustomI` | 自定义操作扩展 |
+| `Custom` / `CustomI` | 内联自定义操作扩展（`Custom` 仅 C 后端支持） |
+| `CustomFunction` | 运行时自定义函数钩子（种类：`EncDec`、`Graph`） |
 
 ---
 
@@ -683,13 +756,13 @@ RESHAPE(new_shape=[6, 4]) : Shape[6, 4]
 |------|------|
 | **循环控制** | `RANGE`, `END` |
 | **规约** | `REDUCE_AXIS`, `REDUCE`, `ALLREDUCE` |
-| **内存** | `BUFFER`, `BUFFERIZE`, `INDEX`, `POINTER_INDEX`, `LOAD`, `STORE` |
-| **内核** | `KERNEL`, `SINK`, `AFTER`, `BARRIER` |
+| **内存** | `BUFFER`, `BUFFER_VIEW`, `BUFFERIZE`, `INDEX`, `POINTER_INDEX`, `LOAD`, `STORE` |
+| **内核与可调用** | `SINK`, `CALL`, `FUNCTION`, `TUPLE`, `GET_TUPLE`, `PROGRAM`, `LINEAR`, `SOURCE`, `PROGRAM_BINARY`, `AFTER`, `BARRIER` |
 | **向量** | `VECTORIZE`, `GEP`, `VCONST`, `CAT`, `PTRCAT` |
 | **展开** | `UNROLL`, `CONTRACT` |
 | **硬件** | `WMMA`, `SPECIAL` |
 | **控制** | `IF`, `ENDIF` |
-| **定义** | `PARAM`, `DEFINE_LOCAL`, `DEFINE_VAR`, `DEFINE_REG`, `BIND`, `UNIQUE`, `DEVICE` |
+| **定义** | `PARAM`, `DEFINE_LOCAL`, `DEFINE_VAR`, `DEFINE_REG`, `BIND`, `UNIQUE`, `LUNIQUE`, `DEVICE` |
 | **移动** | `RESHAPE`, `PERMUTE`, `EXPAND`, `PAD`, `SHRINK`, `FLIP` |
 | **ALU** | `Unary(...)`, `Binary(...)`, `Ternary(...)`, `Cast`, `BitCast` |
 
@@ -704,6 +777,7 @@ RESHAPE(new_shape=[6, 4]) : Shape[6, 4]
 | `STORE` | 2 (index=0, value=1, ranges=2+) |
 | `WMMA` | 3 (a=0, b=1, c=2) |
 | `END` | 1 (computation=0, ranges=1+) |
+| `CALL` / `FUNCTION` | 1 (body=0, args=1+) |
 
 ### 可展开操作
 

@@ -305,6 +305,53 @@ fn create_matmul_pattern_for_padding(m: i64, n: i64, k: i64) -> Arc<morok_ir::UO
     UOp::sink(vec![reduce, m_range, n_range])
 }
 
+/// Helper to create float16 matmul with float32 accumulation.
+///
+/// Creates: C[m,n] = sum_k cast_f32(A[m,k] * B[k,n])
+/// This allows testing TC candidate retry where multiple TC entries share
+/// float16 input / float32 output but differ in K dimension.
+fn create_matmul_pattern_f16_accum_f32(m: i64, n: i64, k: i64) -> Arc<morok_ir::UOp> {
+    let m_range = UOp::range_axis(UOp::index_const(m), AxisId::Renumbered(0), AxisType::Global);
+    let n_range = UOp::range_axis(UOp::index_const(n), AxisId::Renumbered(1), AxisType::Global);
+    let k_range = UOp::range_axis(UOp::index_const(k), AxisId::Renumbered(2), AxisType::Reduce);
+
+    let m_half = m_range.clone().cast(DType::Float16);
+    let k_half = k_range.clone().cast(DType::Float16);
+    let n_half = n_range.clone().cast(DType::Float16);
+
+    let a_val = m_half.try_add(&k_half).unwrap();
+    let b_val = k_half.try_add(&n_half).unwrap();
+
+    let mul = a_val.try_mul(&b_val).unwrap();
+    let reduce = mul.cast(DType::Float32).reduce(vec![k_range].into(), ReduceOp::Add);
+
+    UOp::sink(vec![reduce, m_range, n_range])
+}
+
+/// Creates a matmul-like graph with two candidate N axes.
+///
+/// Axis ordering by axis_id is intentionally chosen so axis choice 0 maps to
+/// `n_bad` (non-divisible), while axis choice 1 maps to `n_good` (divisible).
+fn create_matmul_pattern_with_two_n_axes(n_bad: i64, n_good: i64) -> Arc<morok_ir::UOp> {
+    let m_range = UOp::range_axis(UOp::index_const(16), AxisId::Renumbered(0), AxisType::Global);
+    let n_good_range = UOp::range_axis(UOp::index_const(n_good), AxisId::Renumbered(1), AxisType::Global);
+    let k_range = UOp::range_axis(UOp::index_const(16), AxisId::Renumbered(2), AxisType::Reduce);
+    let n_bad_range = UOp::range_axis(UOp::index_const(n_bad), AxisId::Renumbered(3), AxisType::Global);
+
+    let m_float = m_range.clone().cast(DType::Float32);
+    let k_float = k_range.clone().cast(DType::Float32);
+    let n_good_float = n_good_range.clone().cast(DType::Float32);
+    let n_bad_float = n_bad_range.clone().cast(DType::Float32);
+
+    let a_val = m_float.try_add(&k_float).unwrap();
+    let b_val = k_float.try_add(&n_bad_float).unwrap().try_add(&n_good_float).unwrap();
+
+    let mul = a_val.try_mul(&b_val).unwrap();
+    let reduce = mul.reduce(vec![k_range].into(), ReduceOp::Add);
+
+    UOp::sink(vec![reduce, m_range, n_good_range, n_bad_range])
+}
+
 #[test]
 fn test_tc_no_padding_divisible_dims() {
     // 16x16x16 matmul - perfectly divisible by TC dimensions
@@ -433,6 +480,61 @@ fn test_tc_opt_validation() {
 
     let err_msg = format!("{:?}", result.unwrap_err());
     assert!(err_msg.contains("tc_opt must be"), "Should fail validation: {}", err_msg);
+}
+
+#[test]
+fn test_tc_axis_choice_axis0_fail_axis1_pass() {
+    let sink = create_matmul_pattern_with_two_n_axes(15, 16);
+
+    // Explicit axis 0 should fail (non-divisible N=15).
+    let mut scheduler_fail = Scheduler::new(sink.clone(), Renderer::apple_amx());
+    let fail = apply_with_axis_choice(&mut scheduler_fail, -1, 1, 1, Some(0));
+    assert!(fail.is_err(), "axis choice 0 should fail");
+
+    // Explicit axis 1 should pass (divisible N=16).
+    let mut scheduler_pass = Scheduler::new(sink.clone(), Renderer::apple_amx());
+    let pass = apply_with_axis_choice(&mut scheduler_pass, -1, 1, 1, Some(1));
+    assert!(pass.is_ok(), "axis choice 1 should succeed: {:?}", pass.err());
+
+    // Auto axis-choice should retry and find the passing axis.
+    let mut scheduler_auto = Scheduler::new(sink, Renderer::apple_amx());
+    let auto = apply_with_axis_choice(&mut scheduler_auto, -1, 1, 1, None);
+    assert!(auto.is_ok(), "auto axis-choice should recover by trying later axis");
+}
+
+#[test]
+fn test_tc_select_auto_retries_later_tc_candidate() {
+    // K=8 makes the first FP16->FP32 SM80 TC (K=16) invalid, while
+    // a later FP16->FP32 TC (K=8) should still apply.
+    let sink = create_matmul_pattern_f16_accum_f32(16, 8, 8);
+    let renderer = Renderer::cuda_sm80(false);
+
+    let tc_fail_idx = renderer
+        .tensor_cores
+        .iter()
+        .position(|tc| tc.dtype_in == DType::Float16 && tc.dtype_out == DType::Float32 && tc.dims.2 == 16)
+        .expect("expected SM80 FP16->FP32 K=16 tensor core");
+    let tc_pass_idx = renderer
+        .tensor_cores
+        .iter()
+        .enumerate()
+        .find_map(|(idx, tc)| {
+            (idx > tc_fail_idx && tc.dtype_in == DType::Float16 && tc.dtype_out == DType::Float32 && tc.dims.2 == 8)
+                .then_some(idx)
+        })
+        .expect("expected later SM80 FP16->FP32 K=8 tensor core");
+
+    let mut scheduler_fail = Scheduler::new(sink.clone(), renderer.clone());
+    let fail = apply_with_axis_choice(&mut scheduler_fail, tc_fail_idx as i32, 1, 1, Some(0));
+    assert!(fail.is_err(), "first TC candidate should fail for K=8");
+
+    let mut scheduler_pass = Scheduler::new(sink.clone(), renderer.clone());
+    let pass = apply_with_axis_choice(&mut scheduler_pass, tc_pass_idx as i32, 1, 1, Some(0));
+    assert!(pass.is_ok(), "later TC candidate should succeed: {:?}", pass.err());
+
+    let mut scheduler_auto = Scheduler::new(sink, renderer);
+    let auto = apply_with_axis_choice(&mut scheduler_auto, -1, 1, 1, Some(0));
+    assert!(auto.is_ok(), "auto tc_select should retry later TC candidates: {:?}", auto.err());
 }
 
 // =============================================================================

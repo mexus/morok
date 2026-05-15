@@ -38,8 +38,8 @@ Range {
 
 | Type | Priority | GPU Mapping | Purpose |
 |------|----------|-------------|---------|
-| `Outer` | -2 | — | Kernel boundary marker |
-| `Loop` | -1 | `for` loop | Sequential iteration |
+| `Placeholder` | -3 | — | Transient canonical range used during RESHAPE caching |
+| `Loop` | -1 | `for` loop | Default range produced by rangeify; schedule-level wrappers paired with `END(Call)` |
 | `Global` | 0 | `blockIdx` | Grid parallelism |
 | `Thread` | 0 | thread pool | CPU parallelism |
 | `Warp` | 1 | warp/wavefront | Sub-group parallelism |
@@ -49,7 +49,9 @@ Range {
 | `Reduce` | 4 | accumulator | Reduction dimension |
 | `Unroll` | 5 | unrolled | Loop unrolling |
 
-Priority determines loop nesting order—lower values are outer loops.
+Priority determines loop nesting order — lower values are outer loops.
+Kernel-boundary framing is structural via `Call`/`Function`, not a dedicated
+axis type.
 
 **Example:**
 ```text
@@ -181,6 +183,7 @@ Marks where computation should materialize to memory. Triggers kernel splitting.
 |-------|------|---------|
 | `device` | `Option<DeviceSpec>` | Target device, `None` for local |
 | `addrspace` | `AddrSpace` | `Global` (device) or `Local` (shared) |
+| `removable` | `bool` | When `false`, `buffer_removal` is forbidden from inlining this BUFFERIZE — used at multi-consumer realize boundaries to keep the buffer fixed across mega-pass fixpoint iterations |
 
 **Example:**
 ```text
@@ -273,38 +276,113 @@ STORE
 
 ---
 
-## Kernel Structure
+## Kernel Structure & Callable IR
 
-### KERNEL — Kernel Wrapper
+Schedule-level work is expressed as a callable IR mirroring tinygrad's
+`CALL`/`FUNCTION`/`PROGRAM` model: a `Function` defines a body (typically a
+`Sink` of stores) parametrized by arguments, a `Call` invokes it with concrete
+arguments, and a `Program` carries the body through the strict
+`SINK → LINEAR → SOURCE → BINARY` compilation staging.
+
+### CALL — Invoke a Function Body
 
 ```rust
-Kernel {
-    sources: SmallVec<[Arc<UOp>; 4]>,   // arguments
-    ast: Arc<UOp>,                       // computation (usually SINK)
+Call {
+    body: Arc<UOp>,                     // FUNCTION (or its body)
+    args: SmallVec<[Arc<UOp>; 4]>,      // concrete argument values
+    info: CallInfo,                     // metadata (name, grad_tag, ...)
 }
 ```
 
-Wraps a complete kernel for code generation. Sources are kernel arguments (`Param`, `DefineLocal`, `DefineVar`). Note: `Param` replaced `DefineGlobal` in the batching_support PR to enable kernel deduplication by erasing buffer identity.
+Invokes a callable body with arguments. Range-ending: closes any `Range`
+operations in `args` (range_start_index = 1; `body=0`, `args=1+`).
 
-**Example:**
-```text
-KERNEL
-├── PARAM(slot=0, size=1024) — output buffer arg
-├── PARAM(slot=1, size=1024) — input A arg
-├── PARAM(slot=2, size=1024) — input B arg
-└── SINK                     — computation
-    └── STORE(...)
+`CallInfo` carries cache-key-safe annotations:
+
+| Field | Type | Purpose |
+|-------|------|---------|
+| `name` | `Option<String>` | Human-readable callable name |
+| `grad_tag` | `Option<String>` | Reserved for gradient-callback identity |
+| `metadata` | `Vec<String>` | Stable, hashable annotations |
+| `precompile` / `precompile_backward` | `bool` | Eager-compile hints |
+
+### FUNCTION — Reusable Body
+
+```rust
+Function {
+    body: Arc<UOp>,                     // computation
+    args: SmallVec<[Arc<UOp>; 4]>,      // formal parameters
+    info: CallInfo,
+}
 ```
+
+A reusable callable. Its dtype is always `Void`; bodies that return multiple
+values are wrapped in a `Tuple` so the function boundary stays Void. Same
+range-ending shape as `Call`.
+
+### TUPLE / GET_TUPLE — Multi-Value Returns
+
+```rust
+Tuple { src: SmallVec<[Arc<UOp>; 4]> }
+GetTuple { src: Arc<UOp>, index: usize }
+```
+
+`Tuple` packs heterogeneous values; its dtype is always `Void`. `GetTuple`
+extracts element `index` from a `Tuple` (or from a `Function` whose body is a
+`Tuple`); its dtype matches the inner element. Used to thread multiple
+outputs through the otherwise-Void function boundary.
+
+### PROGRAM — Compile-Pipeline Container
+
+```rust
+Program {
+    sink: Arc<UOp>,                     // root SINK
+    device: Arc<UOp>,                   // DEVICE
+    linear: Option<Arc<UOp>>,           // LINEAR (after linearize)
+    source: Option<Arc<UOp>>,           // SOURCE (after render)
+    binary: Option<Arc<UOp>>,           // PROGRAM_BINARY (after compile)
+}
+```
+
+Carries a kernel through the `SINK → LINEAR → SOURCE → PROGRAM_BINARY`
+staging enforced by `codegen/src/program_pipeline.rs`
+(`do_linearize`/`do_render`/`do_compile`/`get_program`). Each stage fills in
+the next field. The C/LLVM/MLIR renderers expect `Op::Linear` input and
+surface `Error::InvalidGraph` via per-context `pending_error` rather than
+panicking; multi-index `INDEX`s must be lowered with `pm_linearize_multi_index`
+before render.
+
+### LINEAR — Linearized Op Stream
+
+```rust
+Linear { ops: SmallVec<[Arc<UOp>; 8]> }
+```
+
+Flat sequence of ops produced by linearization. Consumers iterate `ops`
+directly without re-walking the graph.
+
+### SOURCE / PROGRAM_BINARY — Compilation Artifacts
+
+```rust
+Source { code: String }              // rendered source (C / LLVM-IR / MLIR)
+ProgramBinary { bytes: Vec<u8> }     // compiled artifact
+```
+
+Terminal stages of the program pipeline. Both are leaves (no children).
 
 ### SINK — Multiple Root Collector
 
 ```rust
 Sink {
     sources: SmallVec<[Arc<UOp>; 4]>,
+    info: Option<KernelInfo>,           // structural marker for kernel ASTs
 }
 ```
 
-Collects multiple outputs into a single root. Every kernel's `ast` is typically a SINK containing STORE operations.
+Collects multiple outputs into a single root. A `Function`'s body is
+typically a `Sink` of stores. The `info` field is a hash-consed structural
+marker that distinguishes kernel-AST SINKs from otherwise-identical bare
+SINKs without relying on type-erased side-channel metadata.
 
 **Example:**
 ```text
@@ -487,7 +565,7 @@ Hardware tensor core operation: `D = A × B + C`. Requires specific matrix shape
 | `dims` | `(N, M, K)` | Matrix dimensions (e.g., `(16, 16, 16)`) |
 | `dtype_in` | `DType` | Input matrix precision (e.g., `Float16`) |
 | `dtype_out` | `DType` | Output precision (e.g., `Float32`) |
-| `device` | `String` | Target device string |
+| `device` | `RendererDevice` | Renderer / TC backend that produced this WMMA |
 | `threads` | `usize` | Threads per warp (typically 32) |
 | `upcast_axes` | `WmmaUpcastAxes` | Per-operand vectorization (fields: `a`, `b`, `c`) |
 | `reduce_axes` | `Vec<(usize, usize)>` | Contraction axes |
@@ -614,13 +692,18 @@ SPECIAL(name="blockIdx.x", end=128) : Index
 └── CONST(128)
 ```
 
-### UNIQUE — Identity Marker
+### UNIQUE / LUNIQUE — Identity Markers
 
 ```rust
-Unique(usize)                // unique identifier
+Unique(usize)                // global identity counter
+LUnique(usize)               // local-scope identity counter
 ```
 
-Creates a unique identity for buffer disambiguation. Two buffers with different UNIQUE values are distinct even if otherwise identical.
+Creates a unique identity for buffer disambiguation. Two buffers with
+different `Unique` values are distinct even if otherwise identical. `LUnique`
+provides the same disambiguation within a local scope (e.g. inside a
+`Function` body) without colliding with the global counter, so callable
+bodies can be hash-consed independently of where they're called from.
 
 ### DEVICE — Device Specification
 
@@ -661,17 +744,17 @@ The following operations exist in the `Op` enum but are either internal or rarel
 | Operation | Purpose |
 |-----------|---------|
 | `Copy` | Explicit copy of a value |
-| `BufferView` | View into an existing buffer with offset/stride |
+| `BufferView` | `{ buffer, size, offset }` — slice of an existing buffer at an offset |
 | `MStack` | Memory stack allocation |
 | `MSelect` | Memory select (conditional memory access) |
 | `Multi` | Multi-output operation |
-| `Assign` | Variable assignment |
 | `Group` | Group operations for scheduling |
 | `Detach` | Detach from graph (prevent optimization through) |
 | `Contiguous` | Hint that data is contiguous |
 | `ContiguousBackward` | Backward pass for contiguous hint |
 | `Precast` | Pre-cast for type conversion |
-| `Custom` / `CustomI` | Custom operation extensibility |
+| `Custom` / `CustomI` | Inline custom operation extensibility (C only for `Custom`) |
+| `CustomFunction` | Runtime custom-function hook (kinds: `EncDec`, `Graph`) |
 
 ---
 
@@ -683,13 +766,13 @@ The following operations exist in the `Op` enum but are either internal or rarel
 |----------|------------|
 | **Loop Control** | `RANGE`, `END` |
 | **Reduction** | `REDUCE_AXIS`, `REDUCE`, `ALLREDUCE` |
-| **Memory** | `BUFFER`, `BUFFERIZE`, `INDEX`, `POINTER_INDEX`, `LOAD`, `STORE` |
-| **Kernel** | `KERNEL`, `SINK`, `AFTER`, `BARRIER` |
+| **Memory** | `BUFFER`, `BUFFER_VIEW`, `BUFFERIZE`, `INDEX`, `POINTER_INDEX`, `LOAD`, `STORE` |
+| **Kernel & Callable** | `SINK`, `CALL`, `FUNCTION`, `TUPLE`, `GET_TUPLE`, `PROGRAM`, `LINEAR`, `SOURCE`, `PROGRAM_BINARY`, `AFTER`, `BARRIER` |
 | **Vector** | `VECTORIZE`, `GEP`, `VCONST`, `CAT`, `PTRCAT` |
 | **Expansion** | `UNROLL`, `CONTRACT` |
 | **Hardware** | `WMMA`, `SPECIAL` |
 | **Control** | `IF`, `ENDIF` |
-| **Definition** | `PARAM`, `DEFINE_LOCAL`, `DEFINE_VAR`, `DEFINE_REG`, `BIND`, `UNIQUE`, `DEVICE` |
+| **Definition** | `PARAM`, `DEFINE_LOCAL`, `DEFINE_VAR`, `DEFINE_REG`, `BIND`, `UNIQUE`, `LUNIQUE`, `DEVICE` |
 | **Movement** | `RESHAPE`, `PERMUTE`, `EXPAND`, `PAD`, `SHRINK`, `FLIP` |
 | **ALU** | `Unary(...)`, `Binary(...)`, `Ternary(...)`, `Cast`, `BitCast` |
 
@@ -704,6 +787,7 @@ Operations that close RANGE scopes (remove ranges from active set):
 | `STORE` | 2 (index=0, value=1, ranges=2+) |
 | `WMMA` | 3 (a=0, b=1, c=2) |
 | `END` | 1 (computation=0, ranges=1+) |
+| `CALL` / `FUNCTION` | 1 (body=0, args=1+) |
 
 ### Expandable Operations
 

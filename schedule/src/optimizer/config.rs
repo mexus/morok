@@ -3,8 +3,6 @@
 //! Provides typed configuration for kernel optimization with bon builders.
 //! Supports both explicit configuration and environment variable fallbacks.
 
-use std::time::Duration;
-
 use bon::bon;
 
 // ============================================================================
@@ -12,7 +10,7 @@ use bon::bon;
 // ============================================================================
 
 /// Optimization strategy for kernel tuning.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub enum OptStrategy {
     /// No optimization (for debugging/regression testing).
     None,
@@ -34,13 +32,13 @@ impl OptStrategy {
     /// # Environment Variables
     ///
     /// * `MOROK_NOOPT=1` - Disable all optimizations
-    /// * `MOROK_BEAM=N` - Use beam search with width N
+    /// * `BEAM=N` - Use beam search with width N
     pub fn from_env() -> Self {
         if std::env::var("MOROK_NOOPT").is_ok() {
             return Self::None;
         }
 
-        if let Ok(beam_str) = std::env::var("MOROK_BEAM")
+        if let Ok(beam_str) = std::env::var("BEAM")
             && let Ok(width) = beam_str.parse::<usize>()
             && width > 0
         {
@@ -66,7 +64,7 @@ impl OptStrategy {
 // ============================================================================
 
 /// Tensor core usage level.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub enum TcUsage {
     /// Disabled (USE_TC=0).
     Disabled,
@@ -91,7 +89,7 @@ impl TcUsage {
 }
 
 /// Tensor core optimization level.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub enum TcOpt {
     /// Strict matching (TC_OPT=0).
     Strict,
@@ -116,7 +114,7 @@ impl TcOpt {
 }
 
 /// Tensor core selection mode.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub enum TcSelect {
     /// Auto-select best tensor core (TC_SELECT=-1, default).
     #[default]
@@ -141,12 +139,15 @@ impl TcSelect {
 // ============================================================================
 
 /// Configuration for beam search auto-tuning.
-#[derive(Debug, Clone)]
+///
+/// No total search timeout — the loop terminates only on the `min_progress`
+/// floor or an empty candidate set. `BEAM_TIMEOUT_SEC` is a per-candidate
+/// compile alarm enforced in `compile_and_time`'s thread+timeout machinery,
+/// not a global search budget.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct BeamConfig {
     /// Beam width - number of candidates to keep at each step.
     pub beam_width: usize,
-    /// Maximum search time.
-    pub timeout: Duration,
     /// Maximum upcast size (product of UPCAST/UNROLL dimensions).
     pub max_upcast: usize,
     /// Maximum local size (product of LOCAL/WARP/GROUP_REDUCE dimensions).
@@ -161,71 +162,51 @@ pub struct BeamConfig {
 
 impl Default for BeamConfig {
     fn default() -> Self {
-        Self {
-            beam_width: 4,
-            timeout: Duration::from_secs(60),
-            max_upcast: 256,
-            max_local: 1024,
-            max_uops: 3000,
-            num_runs: 3,
-            disable_cache: false,
-        }
+        Self { beam_width: 4, max_upcast: 256, max_local: 1024, max_uops: 3000, num_runs: 3, disable_cache: false }
     }
 }
 
 #[bon]
 impl BeamConfig {
     /// Create a beam configuration with builder pattern.
+    ///
+    /// Defaults consult the same env vars as `from_env()` so callers
+    /// like benches can be overridden via `BEAM_*` without changing
+    /// builder call sites.
     #[builder]
     pub fn builder(
-        #[builder(default = 4)] beam_width: usize,
-        #[builder(default = 60)] timeout_secs: u64,
-        #[builder(default = 256)] max_upcast: usize,
-        #[builder(default = 1024)] max_local: usize,
-        #[builder(default = 3000)] max_uops: usize,
-        #[builder(default = 3)] num_runs: usize,
-        #[builder(default = false)] disable_cache: bool,
+        #[builder(default = std::env::var("BEAM").ok().and_then(|s| s.parse().ok()).unwrap_or(4))] beam_width: usize,
+        #[builder(default = std::env::var("BEAM_UPCAST_MAX").ok().and_then(|s| s.parse().ok()).unwrap_or(256))]
+        max_upcast: usize,
+        #[builder(default = std::env::var("BEAM_LOCAL_MAX").ok().and_then(|s| s.parse().ok()).unwrap_or(1024))]
+        max_local: usize,
+        #[builder(default = std::env::var("BEAM_UOPS_MAX").ok().and_then(|s| s.parse().ok()).unwrap_or(3000))]
+        max_uops: usize,
+        #[builder(default = std::env::var("BEAM_RUNS").ok().and_then(|s| s.parse().ok()).unwrap_or(3))] num_runs: usize,
+        #[builder(default = std::env::var("IGNORE_BEAM_CACHE").is_ok())] disable_cache: bool,
     ) -> Self {
-        Self {
-            beam_width,
-            timeout: Duration::from_secs(timeout_secs),
-            max_upcast,
-            max_local,
-            max_uops,
-            num_runs,
-            disable_cache,
-        }
+        Self { beam_width, max_upcast, max_local, max_uops, num_runs, disable_cache }
     }
 
     /// Create configuration from environment variables.
     ///
     /// # Environment Variables
     ///
-    /// * `MOROK_BEAM` - Beam width (default: 4)
-    /// * `MOROK_BEAM_TIMEOUT` - Max search time in seconds (default: 60)
+    /// * `BEAM` - Beam width (default: 4)
     /// * `BEAM_UPCAST_MAX` - Max upcast size (default: 256)
     /// * `BEAM_LOCAL_MAX` - Max local memory elements (default: 1024)
     /// * `BEAM_UOPS_MAX` - Max UOps before rejecting (default: 3000)
     /// * `BEAM_RUNS` - Benchmark runs per kernel (default: 3)
     /// * `IGNORE_BEAM_CACHE` - Bypass disk cache if set
     pub fn from_env() -> Self {
-        let beam_width = std::env::var("MOROK_BEAM").ok().and_then(|s| s.parse().ok()).unwrap_or(4);
-        let timeout_secs = std::env::var("MOROK_BEAM_TIMEOUT").ok().and_then(|s| s.parse().ok()).unwrap_or(60);
+        let beam_width = std::env::var("BEAM").ok().and_then(|s| s.parse().ok()).unwrap_or(4);
         let max_upcast = std::env::var("BEAM_UPCAST_MAX").ok().and_then(|s| s.parse().ok()).unwrap_or(256);
         let max_local = std::env::var("BEAM_LOCAL_MAX").ok().and_then(|s| s.parse().ok()).unwrap_or(1024);
         let max_uops = std::env::var("BEAM_UOPS_MAX").ok().and_then(|s| s.parse().ok()).unwrap_or(3000);
         let num_runs = std::env::var("BEAM_RUNS").ok().and_then(|s| s.parse().ok()).unwrap_or(3);
         let disable_cache = std::env::var("IGNORE_BEAM_CACHE").is_ok();
 
-        Self {
-            beam_width,
-            timeout: Duration::from_secs(timeout_secs),
-            max_upcast,
-            max_local,
-            max_uops,
-            num_runs,
-            disable_cache,
-        }
+        Self { beam_width, max_upcast, max_local, max_uops, num_runs, disable_cache }
     }
 
     /// Get beam width from strategy if applicable.
@@ -242,7 +223,7 @@ impl BeamConfig {
 // ============================================================================
 
 /// Configuration for heuristic-based optimization.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct HeuristicsConfig {
     // Tensor cores
     /// Tensor core usage level.
@@ -257,6 +238,10 @@ pub struct HeuristicsConfig {
     pub matvec_enabled: bool,
     /// Matrix-vector block size (rows per workgroup).
     pub matvec_blocksize: usize,
+    /// Matrix-vector reduction split (threads per reduction row).
+    pub threads_per_row: usize,
+    /// Matrix-vector output lane split (rows computed per thread).
+    pub rows_per_thread: usize,
 
     // Reduction thresholds
     /// Threshold for applying grouped reduction.
@@ -278,7 +263,6 @@ pub struct HeuristicsConfig {
     /// Enable K-axis vectorization for matmul.
     /// When enabled, UPCAST is applied to the reduce (K) axis creating vector accumulators.
     /// Disabled by default: K-vectorization complicates output tiling and horizontal reduce.
-    /// Tinygrad doesn't use K-vectorization - they rely on output tiling (register blocking).
     /// Default: false.
     pub k_vectorize: bool,
 
@@ -304,16 +288,37 @@ impl HeuristicsConfig {
     /// # Environment Variables
     ///
     /// * `MOROK_THREADS` - Maximum thread count (default: available_parallelism)
+    /// * `MOROK_MV` - Enable/disable matvec fast-path (`0` disables)
+    /// * `MOROK_MV_BLOCKSIZE` / `MV_BLOCKSIZE` - Matvec local block size
+    /// * `MOROK_MV_THREADS_PER_ROW` / `MV_THREADS_PER_ROW` - Matvec reduce split
+    /// * `MOROK_MV_ROWS_PER_THREAD` / `MV_ROWS_PER_THREAD` - Matvec output split
     /// * `MOROK_K_VECTORIZE` - Enable K-axis vectorization (default: disabled)
     /// * `MOROK_NO_OUTPUT_UPCAST` - Disable output dimension upcasting (default: enabled)
     pub fn from_env() -> Self {
+        let parse_usize = |keys: &[&str], default: usize| {
+            keys.iter().find_map(|k| std::env::var(k).ok().and_then(|v| v.parse::<usize>().ok())).unwrap_or(default)
+        };
+
         let thread_count =
             std::env::var("MOROK_THREADS").ok().and_then(|s| s.parse().ok()).unwrap_or_else(default_thread_count);
+        let matvec_enabled = std::env::var("MOROK_MV").map(|v| v != "0").unwrap_or(true);
+        let matvec_blocksize = parse_usize(&["MOROK_MV_BLOCKSIZE", "MV_BLOCKSIZE"], 4);
+        let threads_per_row = parse_usize(&["MOROK_MV_THREADS_PER_ROW", "MV_THREADS_PER_ROW"], 8);
+        let rows_per_thread = parse_usize(&["MOROK_MV_ROWS_PER_THREAD", "MV_ROWS_PER_THREAD"], 4);
         let k_vectorize = std::env::var("MOROK_K_VECTORIZE").is_ok();
         // Default enabled, use MOROK_NO_OUTPUT_UPCAST to disable
         let output_upcast = std::env::var("MOROK_NO_OUTPUT_UPCAST").is_err();
 
-        Self { thread_count, k_vectorize, output_upcast, ..Default::default() }
+        Self {
+            matvec_enabled,
+            matvec_blocksize,
+            threads_per_row,
+            rows_per_thread,
+            thread_count,
+            k_vectorize,
+            output_upcast,
+            ..Default::default()
+        }
     }
 }
 
@@ -325,6 +330,8 @@ impl Default for HeuristicsConfig {
             tc_select: TcSelect::Auto,
             matvec_enabled: true,
             matvec_blocksize: 4,
+            threads_per_row: 8,
+            rows_per_thread: 4,
             grouped_threshold: 256,
             unroll_threshold: 32,
             disable_locals: false,
@@ -346,6 +353,8 @@ impl HeuristicsConfig {
         #[builder(default)] tc_select: TcSelect,
         #[builder(default = true)] matvec_enabled: bool,
         #[builder(default = 4)] matvec_blocksize: usize,
+        #[builder(default = 8)] threads_per_row: usize,
+        #[builder(default = 4)] rows_per_thread: usize,
         #[builder(default = 256)] grouped_threshold: usize,
         #[builder(default = 32)] unroll_threshold: usize,
         #[builder(default = false)] disable_locals: bool,
@@ -360,6 +369,8 @@ impl HeuristicsConfig {
             tc_select,
             matvec_enabled,
             matvec_blocksize,
+            threads_per_row,
+            rows_per_thread,
             grouped_threshold,
             unroll_threshold,
             disable_locals,
@@ -378,7 +389,7 @@ impl HeuristicsConfig {
 /// Top-level optimizer configuration.
 ///
 /// Combines strategy selection, beam search settings, and heuristic parameters.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub struct OptimizerConfig {
     /// Optimization strategy (None, Heuristic, or Beam).
     pub strategy: OptStrategy,
@@ -391,11 +402,16 @@ pub struct OptimizerConfig {
 #[bon]
 impl OptimizerConfig {
     /// Create an optimizer configuration with builder pattern.
+    ///
+    /// `beam` and `heuristics` defaults consult env vars (matching
+    /// `*::from_env()`) so callers like benches and end-to-end examples
+    /// pick up `IGNORE_BEAM_CACHE`, `BEAM_TIMEOUT_SEC`, `BEAM_UOPS_MAX`,
+    /// etc. without explicit field setting.
     #[builder]
     pub fn builder(
         #[builder(default)] strategy: OptStrategy,
-        #[builder(default)] beam: BeamConfig,
-        #[builder(default)] heuristics: HeuristicsConfig,
+        #[builder(default = BeamConfig::from_env())] beam: BeamConfig,
+        #[builder(default = HeuristicsConfig::from_env())] heuristics: HeuristicsConfig,
     ) -> Self {
         Self { strategy, beam, heuristics }
     }
@@ -407,7 +423,7 @@ impl OptimizerConfig {
     /// # Environment Variables
     ///
     /// * `MOROK_NOOPT=1` - Disable all optimizations
-    /// * `MOROK_BEAM=N` - Use beam search with width N
+    /// * `BEAM=N` - Use beam search with width N
     pub fn from_env() -> Self {
         let strategy = OptStrategy::from_env();
         let beam = BeamConfig::from_env().with_strategy_width(&strategy);
@@ -422,104 +438,5 @@ impl OptimizerConfig {
 // ============================================================================
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_opt_strategy_default_is_heuristic() {
-        assert_eq!(OptStrategy::default(), OptStrategy::Heuristic);
-    }
-
-    #[test]
-    fn test_opt_strategy_is_none() {
-        assert!(OptStrategy::None.is_none());
-        assert!(!OptStrategy::Heuristic.is_none());
-        assert!(!OptStrategy::Beam { width: 4 }.is_none());
-    }
-
-    #[test]
-    fn test_opt_strategy_is_beam() {
-        assert!(!OptStrategy::None.is_beam());
-        assert!(!OptStrategy::Heuristic.is_beam());
-        assert!(OptStrategy::Beam { width: 4 }.is_beam());
-    }
-
-    #[test]
-    fn test_beam_config_default() {
-        let config = BeamConfig::default();
-        assert_eq!(config.beam_width, 4);
-        assert_eq!(config.timeout, Duration::from_secs(60));
-        assert_eq!(config.max_upcast, 256);
-        assert_eq!(config.max_local, 1024);
-    }
-
-    #[test]
-    fn test_beam_config_builder() {
-        let config = BeamConfig::builder().beam_width(8).timeout_secs(120).max_upcast(512).build();
-
-        assert_eq!(config.beam_width, 8);
-        assert_eq!(config.timeout, Duration::from_secs(120));
-        assert_eq!(config.max_upcast, 512);
-        assert_eq!(config.max_local, 1024); // default
-    }
-
-    #[test]
-    fn test_heuristics_config_default() {
-        let config = HeuristicsConfig::default();
-        assert_eq!(config.tc_enabled, TcUsage::Enabled);
-        assert_eq!(config.tc_opt, TcOpt::Padded);
-        assert!(config.matvec_enabled);
-        assert_eq!(config.grouped_threshold, 256);
-    }
-
-    #[test]
-    fn test_heuristics_config_builder() {
-        let config = HeuristicsConfig::builder()
-            .tc_enabled(TcUsage::Disabled)
-            .matvec_enabled(false)
-            .grouped_threshold(128)
-            .build();
-
-        assert_eq!(config.tc_enabled, TcUsage::Disabled);
-        assert!(!config.matvec_enabled);
-        assert_eq!(config.grouped_threshold, 128);
-    }
-
-    #[test]
-    fn test_optimizer_config_default() {
-        let config = OptimizerConfig::default();
-        assert_eq!(config.strategy, OptStrategy::Heuristic);
-        assert_eq!(config.beam.beam_width, 4);
-    }
-
-    #[test]
-    fn test_optimizer_config_builder() {
-        let config = OptimizerConfig::builder()
-            .strategy(OptStrategy::Beam { width: 8 })
-            .beam(BeamConfig::builder().timeout_secs(120).build())
-            .build();
-
-        assert_eq!(config.strategy, OptStrategy::Beam { width: 8 });
-        assert_eq!(config.beam.timeout, Duration::from_secs(120));
-    }
-
-    #[test]
-    fn test_tc_usage_as_usize() {
-        assert_eq!(TcUsage::Disabled.as_usize(), 0);
-        assert_eq!(TcUsage::Enabled.as_usize(), 1);
-        assert_eq!(TcUsage::ShapeOnly.as_usize(), 2);
-    }
-
-    #[test]
-    fn test_tc_opt_as_usize() {
-        assert_eq!(TcOpt::Strict.as_usize(), 0);
-        assert_eq!(TcOpt::Relaxed.as_usize(), 1);
-        assert_eq!(TcOpt::Padded.as_usize(), 2);
-    }
-
-    #[test]
-    fn test_tc_select_as_i32() {
-        assert_eq!(TcSelect::Auto.as_i32(), -1);
-        assert_eq!(TcSelect::Index(5).as_i32(), 5);
-    }
-}
+#[path = "../test/unit/optimizer/config_internal.rs"]
+mod tests;

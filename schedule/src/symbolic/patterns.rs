@@ -964,42 +964,45 @@ fn range_based_cast_patterns() -> &'static TypedPatternMatcher {
 pub fn term_combining_dsl_patterns() -> &'static TypedPatternMatcher {
     crate::cached_patterns! {
         // x + x → 2*x
-        Add(x, x) ~> 2.into_uop(x.dtype()).mul(x),
+        Add(x, x) => x.try_mul(&x.const_like(2i64)).ok(),
         // (x * c1) + (x * c2) → x * (c1 + c2)  (Mul[] is commutative, covers c*x too)
         Add(Mul[x, c1 @const(c1_val)], Mul[x, _c2 @const(c2_val)])
-            ~> x.mul(&eval_add_typed(c1_val, c2_val, c1.dtype().base())
-                .expect("failed to add constants")
-                .into_uop(c1.dtype())),
+            => {
+                let coeff = eval_add_typed(c1_val, c2_val, c1.dtype().base())
+                    .expect("failed to add constants")
+                    .into_uop(c1.dtype());
+                x.try_mul(&coeff).ok()
+            },
         // x + x*c → x*(c+1) — commutative outer Add
-        Add[x, Mul[x, c @const(c_val)]] ~> {
+        Add[x, Mul[x, c @const(c_val)]] => {
             let one = ConstValue::one(c.dtype().base());
             let new_c = eval_add_typed(c_val, one, c.dtype().base()).expect("failed to add constants");
-            x.mul(&UOp::const_(c.dtype(), new_c))
+            x.try_mul(&UOp::const_(c.dtype(), new_c)).ok()
         },
         // (y + x*c0) + x*c1 → y + x*(c0+c1) — commutative outer Add
-        Add[Add[y, Mul[x, c0 @const(c0_val)]], Mul[x, _c1 @const(c1_val)]] ~> {
+        Add[Add[y, Mul[x, c0 @const(c0_val)]], Mul[x, _c1 @const(c1_val)]] => {
             let new_c = eval_add_typed(c0_val, c1_val, c0.dtype().base()).expect("failed to add constants");
-            let xc = x.mul(&UOp::const_(c0.dtype(), new_c));
-            y.add(&xc)
+            let xc = x.try_mul(&UOp::const_(c0.dtype(), new_c)).ok()?;
+            y.try_add(&xc).ok()
         },
         // (y + x) + x*c → y + x*(c+1) — commutative outer Add
-        Add[Add[y, x], Mul[x, c @const(c_val)]] ~> {
+        Add[Add[y, x], Mul[x, c @const(c_val)]] => {
             let one = ConstValue::one(c.dtype().base());
             let new_c = eval_add_typed(c_val, one, c.dtype().base()).expect("failed to add constants");
-            let xc = x.mul(&UOp::const_(c.dtype(), new_c));
-            y.add(&xc)
+            let xc = x.try_mul(&UOp::const_(c.dtype(), new_c)).ok()?;
+            y.try_add(&xc).ok()
         },
         // (y + x*c) + x → y + x*(c+1) — commutative outer Add
-        Add[Add[y, Mul[x, c @const(c_val)]], x] ~> {
+        Add[Add[y, Mul[x, c @const(c_val)]], x] => {
             let one = ConstValue::one(c.dtype().base());
             let new_c = eval_add_typed(c_val, one, c.dtype().base()).expect("failed to add constants");
-            let xc = x.mul(&UOp::const_(c.dtype(), new_c));
-            y.add(&xc)
+            let xc = x.try_mul(&UOp::const_(c.dtype(), new_c)).ok()?;
+            y.try_add(&xc).ok()
         },
         // (y + x) + x → y + x*2 — commutative outer Add
-        Add[Add[y, x], x] ~> {
-            let x2 = 2.into_uop(x.dtype()).mul(x);
-            y.add(&x2)
+        Add[Add[y, x], x] => {
+            let x2 = x.try_mul(&x.const_like(2i64)).ok()?;
+            y.try_add(&x2).ok()
         },
         // (x/x2)/x3 → x/(x2*x3) — flatten nested float division
         // Guard: x2 must not be same UOp as x3 (prevents loop with x/x→1)
@@ -1029,15 +1032,21 @@ pub fn advanced_division_dsl_patterns() -> &'static TypedPatternMatcher {
             a.idiv(&UOp::const_(b.dtype(), mul))
         },
         // expr // divisor → expr.divides(divisor) (generic exact division)
-        Idiv(expr, divisor @ @const) => expr.divides(divisor),
+        Idiv(expr, _divisor @const(d_val)) => d_val.try_int().and_then(|d| expr.divides(d)),
         // Decomposes x into sum(factor_i * term_i) + const, computes centered remainders,
         // and folds if the remainder range fits in one bucket (rem.vmin//c == rem.vmax//c).
         Mod(x, c @const(c_val)) => crate::symbolic::divmod::fold_divmod_congruence(x, c, c_val, true),
         Idiv(x, c @const(c_val)) => crate::symbolic::divmod::fold_divmod_congruence(x, c, c_val, false),
         // (a + b) // c → (a // c) + (b // c) when both divide evenly
-        Idiv(Add(a, b), c @ @const) => Some(a.divides(c)?.add(&b.divides(c)?)),
+        Idiv(Add(a, b), _c @const(c_val)) => {
+            let d = c_val.try_int()?;
+            Some(a.divides(d)?.add(&b.divides(d)?))
+        },
         // (a - b) // c → (a // c) - (b // c) when both divide evenly
-        Idiv(Sub(a, b), c @ @const) => Some(a.divides(c)?.sub(&b.divides(c)?)),
+        Idiv(Sub(a, b), _c @const(c_val)) => {
+            let d = c_val.try_int()?;
+            Some(a.divides(d)?.sub(&b.divides(d)?))
+        },
         // y * (x + c) → y*x + y*c for index dtype
         // Only distributes when x is Index dtype to avoid float inf*0=nan issues.
         Mul[y @const(_yv), Add[x, c @const(_cv)]] if x.dtype() == DType::Index ~> y.mul(x).add(&y.mul(c)),
@@ -1133,29 +1142,14 @@ pub fn alu_folding_dsl_patterns() -> &'static TypedPatternMatcher {
 
 /// Dead loop elimination patterns.
 ///
-/// - RANGE with vmax ≤ 0 → Const(0)
-/// - END with dead ranges → remove dead ranges
-/// - REDUCE with all empty ranges → identity element
+/// - RANGE with vmax < 0 → Const(0)  (dead loop)
+/// - RANGE(Const) with vmin == vmax → Const(vmin)  (single-value range)
+///
+/// END/REDUCE empty-ranges folds intentionally absent — they conflated
+/// trivial Range(end=1) folds with dead-range markers; `reduce_to_acc`
+/// already handles dead/empty ranges correctly.
 pub fn dead_loop_patterns() -> &'static TypedPatternMatcher {
-    use crate::symbolic::dce::reduce_identity;
-
-    /// Filter dead ranges from END, or unwrap if all dead.
-    fn filter_dead_ranges(end_op: &Arc<UOp>) -> Arc<UOp> {
-        let Op::End { computation, ranges } = end_op.op() else { unreachable!("filter_dead_ranges called on non-End") };
-
-        let live_ranges: SmallVec<[Arc<UOp>; 4]> = ranges.iter().filter(|r| !is_empty_range(r)).cloned().collect();
-
-        if live_ranges.is_empty() {
-            // All ranges dead - return computation directly
-            Arc::clone(computation)
-        } else {
-            // Some ranges dead - create new END with only live ranges
-            computation.end(live_ranges)
-        }
-    }
-
     /// Check if a Range is trivial (vmin == vmax), meaning only one value.
-    /// This matches upstream simplification: Range(Const) → Const when vmin == vmax.
     fn is_trivial_range(uop: &Arc<UOp>) -> bool {
         let (vmin, vmax) = VminVmaxProperty::get(uop);
         vmin == vmax
@@ -1171,16 +1165,8 @@ pub fn dead_loop_patterns() -> &'static TypedPatternMatcher {
         // RANGE with vmax < 0 (empty/dead) → Const(0)
         r @ Range(_) if is_empty_range(r) ~> UOp::index_const(0),
 
-        // RANGE(Const) with vmin == vmax (trivial, e.g., end=1) → Const(vmin)
-        // Matches
+        // RANGE(Const) with vmin == vmax (trivial) → Const(vmin)
         r @ Range { end: Const(_) } if is_trivial_range(r) ~> trivial_range_value(r),
-
-        // END with dead ranges → filter or unwrap
-        end_op @ End { ranges, .. } if ranges.iter().any(is_empty_range) ~> filter_dead_ranges(end_op),
-
-        // REDUCE with all empty ranges → identity element
-        rop @ Reduce { ranges, reduce_op: op, .. } if !ranges.is_empty() && ranges.iter().all(is_empty_range)
-          ~> reduce_identity(*op, rop.dtype()),
     }
 }
 
@@ -1295,8 +1281,16 @@ pub fn after_simplification_patterns() -> &'static TypedPatternMatcher {
             let mut new_deps = smallvec::SmallVec::<[Arc<UOp>; 4]>::new();
             let mut changed = false;
             for dep in deps {
-                // : {RANGE, STORE, KERNEL, BARRIER, END, UNROLL}
-                if matches!(dep.op(), Op::Range { .. } | Op::Store { .. } | Op::End { .. } | Op::Kernel { .. } | Op::Barrier { .. } | Op::Unroll { .. }) {
+                // : {RANGE, STORE, CALL, BARRIER, END, UNROLL}
+                if matches!(
+                    dep.op(),
+                    Op::Range { .. }
+                        | Op::Store { .. }
+                        | Op::End { .. }
+                        | Op::Call { .. }
+                        | Op::Barrier { .. }
+                        | Op::Unroll { .. }
+                ) {
                     new_deps.push(Arc::clone(dep));
                 } else {
                     // Inline: replace non-side-effecting dep with its children
@@ -1339,7 +1333,7 @@ pub fn after_simplification_patterns() -> &'static TypedPatternMatcher {
 /// (UPat.var("c1").where(UPat.var("buf").index(UPat.var("x")), 0), where_on_load),
 /// ```
 ///
-/// Moved clauses are embedded as WHERE(cond, idx, Invalid) in indices[0] instead of
+/// Moved clauses are embedded as `WHERE(cond, idx, Invalid)` in `indices[0]` instead of
 /// the gate field. This prevents gate vectorization during expansion — pm_lower_index_dtype
 /// extracts the scalar gate after devectorize.
 ///
@@ -1688,7 +1682,7 @@ fn lt_folding(x: &Arc<UOp>, c_int: i64) -> Option<Arc<UOp>> {
     // Build the non-unit sum divided by d (Build non-unit sum divided by d
     let non_unit_terms: Vec<Arc<UOp>> = terms.iter().filter(|t| t.const_factor() != 1).cloned().collect();
     let non_unit_sum = super::divmod::uop_sum(&non_unit_terms, x);
-    let q = non_unit_sum.divides_int(d)?;
+    let q = non_unit_sum.divides(d)?;
 
     // Since d | c, use exact division (no ceiling needed)
     q.try_cmplt(&UOp::index_const(c_int / d)).ok()

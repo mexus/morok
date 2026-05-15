@@ -5,6 +5,7 @@
 //! and provides tensor core configurations for hardware-accelerated matrix multiplication.
 
 use morok_dtype::DType;
+use morok_ir::RendererDevice;
 use smallvec::SmallVec;
 
 /// Tensor core optimization operation.
@@ -78,8 +79,8 @@ impl std::fmt::Display for SwizzleAxis {
 /// Used by the optimizer to determine valid transformations and enforce device limits.
 #[derive(Debug, Clone)]
 pub struct Renderer {
-    /// Backend device identifier (e.g., "CUDA", "Metal", "CPU").
-    pub device: String,
+    /// Backend device identifier.
+    pub device: RendererDevice,
 
     /// Whether the backend supports local/shared memory (GPU workgroups).
     pub has_local: bool,
@@ -126,6 +127,11 @@ pub struct Renderer {
     /// Hardware-accelerated matrix multiplication units with specific size constraints.
     /// Empty if tensor cores not available.
     pub tensor_cores: Vec<TensorCore>,
+
+    /// Whether the backend supports vector (float4-style) load/store.
+    /// When false, the devectorize pass falls back to scalar fold widths and
+    /// skips wide load/store generation.
+    pub supports_float4: bool,
 }
 
 impl Renderer {
@@ -133,7 +139,7 @@ impl Renderer {
     pub fn cpu() -> Self {
         let cores = std::thread::available_parallelism().map(|p| p.get()).unwrap_or(8);
         Self {
-            device: "CPU".to_string(),
+            device: RendererDevice::Cpu,
             has_local: false,
             has_shared: false,
             has_threads: true,
@@ -143,6 +149,7 @@ impl Renderer {
             upcast_max: 16, // AVX512 can do 16-wide float
             buffer_max: None,
             tensor_cores: vec![],
+            supports_float4: true,
         }
     }
 
@@ -156,7 +163,7 @@ impl Renderer {
     /// Create a CUDA GPU renderer for SM75 (Turing - RTX 20xx, T4).
     pub fn cuda_sm75() -> Self {
         Self {
-            device: "CUDA_SM75".to_string(),
+            device: RendererDevice::CudaSm75,
             has_local: true,
             has_shared: true,
             has_threads: false,
@@ -166,13 +173,14 @@ impl Renderer {
             upcast_max: 8,
             buffer_max: None,
             tensor_cores: TensorCore::sm75_tensor_cores(),
+            supports_float4: true,
         }
     }
 
     /// Create a CUDA GPU renderer for SM80 (Ampere - A100, RTX 30xx).
     pub fn cuda_sm80(allow_tf32: bool) -> Self {
         Self {
-            device: "CUDA_SM80".to_string(),
+            device: RendererDevice::CudaSm80,
             has_local: true,
             has_shared: true,
             has_threads: false,
@@ -182,13 +190,14 @@ impl Renderer {
             upcast_max: 8,
             buffer_max: None,
             tensor_cores: TensorCore::sm80_tensor_cores(allow_tf32),
+            supports_float4: true,
         }
     }
 
     /// Create a CUDA GPU renderer for SM89 (Hopper - H100).
     pub fn cuda_sm89(allow_tf32: bool) -> Self {
         Self {
-            device: "CUDA_SM89".to_string(),
+            device: RendererDevice::CudaSm89,
             has_local: true,
             has_shared: true,
             has_threads: false,
@@ -198,13 +207,14 @@ impl Renderer {
             upcast_max: 8,
             buffer_max: None,
             tensor_cores: TensorCore::sm89_tensor_cores(allow_tf32),
+            supports_float4: true,
         }
     }
 
     /// Create a Metal GPU renderer configuration (Apple M1/M2/M3).
     pub fn metal() -> Self {
         Self {
-            device: "Metal".to_string(),
+            device: RendererDevice::Metal,
             has_local: true,
             has_shared: true,
             has_threads: false,
@@ -214,13 +224,14 @@ impl Renderer {
             upcast_max: 4,        // float4 for Metal
             buffer_max: Some(31), // Metal has 31 buffer argument limit
             tensor_cores: TensorCore::metal_tensor_cores(),
+            supports_float4: true,
         }
     }
 
     /// Create an Apple AMX renderer configuration (M1/M2/M3 matrix coprocessor).
     pub fn apple_amx() -> Self {
         Self {
-            device: "AppleAMX".to_string(),
+            device: RendererDevice::AppleAmx,
             has_local: false, // AMX doesn't use traditional local memory
             has_shared: false,
             has_threads: true, // CPU-style threading
@@ -230,18 +241,19 @@ impl Renderer {
             upcast_max: 16,
             buffer_max: None,
             tensor_cores: TensorCore::amx_tensor_cores(),
+            supports_float4: true,
         }
     }
 
     /// Whether this renderer is for Apple AMX (CPU matrix coprocessor).
     pub fn is_amx(&self) -> bool {
-        self.device == "AppleAMX"
+        self.device.is_apple_amx()
     }
 
     /// Create an AMD RDNA3 GPU renderer (RX 7000 series).
     pub fn amd_rdna3() -> Self {
         Self {
-            device: "AMD_RDNA3".to_string(),
+            device: RendererDevice::AmdRdna3,
             has_local: true,
             has_shared: true,
             has_threads: false,
@@ -251,13 +263,14 @@ impl Renderer {
             upcast_max: 8,
             buffer_max: None,
             tensor_cores: TensorCore::rdna3_tensor_cores(),
+            supports_float4: true,
         }
     }
 
     /// Create an AMD RDNA4 GPU renderer.
     pub fn amd_rdna4() -> Self {
         Self {
-            device: "AMD_RDNA4".to_string(),
+            device: RendererDevice::AmdRdna4,
             has_local: true,
             has_shared: true,
             has_threads: false,
@@ -267,13 +280,14 @@ impl Renderer {
             upcast_max: 8,
             buffer_max: None,
             tensor_cores: TensorCore::rdna4_tensor_cores(),
+            supports_float4: true,
         }
     }
 
     /// Create an AMD CDNA3 GPU renderer (MI300 series).
     pub fn amd_cdna3() -> Self {
         Self {
-            device: "AMD_CDNA3".to_string(),
+            device: RendererDevice::AmdCdna3,
             has_local: true,
             has_shared: true,
             has_threads: false,
@@ -283,13 +297,14 @@ impl Renderer {
             upcast_max: 8,
             buffer_max: None,
             tensor_cores: TensorCore::cdna3_tensor_cores(),
+            supports_float4: true,
         }
     }
 
     /// Create an AMD CDNA4 GPU renderer.
     pub fn amd_cdna4() -> Self {
         Self {
-            device: "AMD_CDNA4".to_string(),
+            device: RendererDevice::AmdCdna4,
             has_local: true,
             has_shared: true,
             has_threads: false,
@@ -299,13 +314,14 @@ impl Renderer {
             upcast_max: 8,
             buffer_max: None,
             tensor_cores: TensorCore::cdna4_tensor_cores(),
+            supports_float4: true,
         }
     }
 
     /// Create an Intel Xe GPU renderer.
     pub fn intel_xe() -> Self {
         Self {
-            device: "IntelXe".to_string(),
+            device: RendererDevice::IntelXe,
             has_local: true,
             has_shared: true,
             has_threads: false,
@@ -315,13 +331,14 @@ impl Renderer {
             upcast_max: 8,
             buffer_max: None,
             tensor_cores: TensorCore::intel_tensor_cores(),
+            supports_float4: true,
         }
     }
 
     /// Create a WebGPU renderer configuration.
     pub fn webgpu() -> Self {
         Self {
-            device: "WebGPU".to_string(),
+            device: RendererDevice::WebGpu,
             has_local: true,
             has_shared: true,
             has_threads: false,
@@ -331,6 +348,7 @@ impl Renderer {
             upcast_max: 4,
             buffer_max: Some(8), // WebGPU has 8 buffer limit in some implementations
             tensor_cores: vec![],
+            supports_float4: false,
         }
     }
 }
@@ -404,10 +422,6 @@ pub struct TensorCore {
         (SmallVec<[SwizzleAxis; 8]>, SmallVec<[SwizzleAxis; 8]>, SmallVec<[SwizzleAxis; 8]>),
     ),
 
-    /// Pre-pack operand A into contiguous scratch buffer before the reduction loop.
-    /// Beneficial when the A operand has non-unit stride access (e.g., AMX row-major matmul).
-    pub pack_a: bool,
-
     /// Tile grid for multi-FMA batching (tile_y_count, tile_x_count).
     ///
     /// When > (1, 1), the codegen emits load-pair instructions and multiple FMAs
@@ -431,7 +445,6 @@ pub struct TcConfig {
     opts: &'static [TcOpt],
     swizzle_a: (&'static [SwizzleAxis], &'static [SwizzleAxis], &'static [SwizzleAxis]),
     swizzle_b: (&'static [SwizzleAxis], &'static [SwizzleAxis], &'static [SwizzleAxis]),
-    pack_a: bool,
     tile_grid: (usize, usize),
 }
 
@@ -457,7 +470,6 @@ impl TcConfig {
                     self.swizzle_b.2.iter().copied().collect(),
                 ),
             ),
-            pack_a: self.pack_a,
             tile_grid: self.tile_grid,
         }
     }
@@ -475,7 +487,6 @@ pub const CUDA_81616: TcConfig = TcConfig {
     opts: &[U(0), L(0), L(0), L(1), L(1), L(1), U(1)],
     swizzle_a: (&[R(1), R(2), SL(2), SL(3), SL(4)], &[SU(1), R(3)], &[SL(0), SL(1), SU(0), R(0)]),
     swizzle_b: (&[R(1), R(2), SU(0), SL(0), SL(1)], &[R(0), R(3)], &[SL(2), SL(3), SL(4), SU(1)]),
-    pack_a: false,
     tile_grid: (1, 1),
 };
 
@@ -486,7 +497,6 @@ pub const CUDA_81632: TcConfig = TcConfig {
     opts: &[U(0), L(0), L(0), L(1), L(1), L(1), U(1)],
     swizzle_a: (&[R(2), R(3), SL(2), SL(3), SL(4)], &[SU(1), R(4)], &[SL(0), SL(1), SU(0), R(0), R(1)]),
     swizzle_b: (&[R(2), R(3), SU(0), SL(0), SL(1)], &[R(1), R(4)], &[SL(2), SL(3), SL(4), SU(1), R(0)]),
-    pack_a: false,
     tile_grid: (1, 1),
 };
 
@@ -497,7 +507,6 @@ pub const CUDA_8168: TcConfig = TcConfig {
     opts: &[U(0), L(0), L(0), L(1), L(1), L(1), U(1)],
     swizzle_a: (&[R(1), R(2), SL(2), SL(3), SL(4)], &[R(0), SU(1)], &[SL(0), SL(1), SU(0)]),
     swizzle_b: (&[R(1), R(2), SU(0), SL(0), SL(1)], &[SU(1), R(0)], &[SL(2), SL(3), SL(4)]),
-    pack_a: false,
     tile_grid: (1, 1),
 };
 
@@ -508,7 +517,6 @@ pub const CUDA_8168_TF32: TcConfig = TcConfig {
     opts: &[U(0), L(0), L(0), L(1), L(1), L(1), U(1)],
     swizzle_a: (&[R(0), R(1), SL(2), SL(3), SL(4)], &[SU(1), R(2)], &[SL(0), SL(1), SU(0)]),
     swizzle_b: (&[R(0), R(1), SU(0), SL(0), SL(1)], &[SU(1), R(2)], &[SL(2), SL(3), SL(4)]),
-    pack_a: false,
     tile_grid: (1, 1),
 };
 
@@ -520,7 +528,6 @@ pub const AMD_RDNA3: TcConfig = TcConfig {
     opts: &[L(0), L(0), L(0), L(0), L(1), U(1), U(1), U(1)],
     swizzle_a: (&[SL(4), SU(0), SU(1), SU(2), SL(0)], &[R(1), R(2), R(3)], &[SL(1), SL(2), SL(3), R(0)]),
     swizzle_b: (&[SL(0), SL(1), SL(2), SL(3), SL(4)], &[R(1), R(2), R(3)], &[SU(0), SU(1), SU(2), R(0)]),
-    pack_a: false,
     tile_grid: (1, 1),
 };
 
@@ -531,7 +538,6 @@ pub const AMD_RDNA4: TcConfig = TcConfig {
     opts: &[L(0), L(0), L(0), L(0), U(1), U(1), U(1), L(1)],
     swizzle_a: (&[SU(0), SU(1), SU(2), SL(4), R(2)], &[R(0), R(1), R(3)], &[SL(0), SL(1), SL(2), SL(3)]),
     swizzle_b: (&[SL(0), SL(1), SL(2), SL(3), R(2)], &[R(0), R(1), R(3)], &[SL(4), SU(0), SU(1), SU(2)]),
-    pack_a: false,
     tile_grid: (1, 1),
 };
 
@@ -542,7 +548,6 @@ pub const AMD_CDNA_161616: TcConfig = TcConfig {
     opts: &[L(0), L(0), L(0), L(0), U(1), U(1), L(1), L(1)],
     swizzle_a: (&[SU(0), SU(1), SL(4), SL(5), R(2), R(3)], &[R(0), R(1)], &[SL(0), SL(1), SL(2), SL(3)]),
     swizzle_b: (&[SL(0), SL(1), SL(2), SL(3), R(2), R(3)], &[R(0), R(1)], &[SL(4), SL(5), SU(0), SU(1)]),
-    pack_a: false,
     tile_grid: (1, 1),
 };
 
@@ -553,7 +558,6 @@ pub const AMD_CDNA_161632: TcConfig = TcConfig {
     opts: &[L(0), L(0), L(0), L(0), U(1), U(1), L(1), L(1)],
     swizzle_a: (&[SU(0), SU(1), SL(4), SL(5), R(3), R(4)], &[R(0), R(1)], &[SL(0), SL(1), SL(2), SL(3), R(2)]),
     swizzle_b: (&[SL(0), SL(1), SL(2), SL(3), R(3), R(4)], &[R(0), R(1)], &[SL(4), SL(5), SU(0), SU(1), R(2)]),
-    pack_a: false,
     tile_grid: (1, 1),
 };
 
@@ -565,7 +569,6 @@ pub const METAL_888: TcConfig = TcConfig {
     opts: &[U(0), L(0), L(1), L(1), L(0), L(1)],
     swizzle_a: (&[R(1), SL(1), SL(2), R(2), SL(4)], &[R(0)], &[SU(0), SL(0), SL(3)]),
     swizzle_b: (&[SL(0), R(0), R(1), SL(3), R(2)], &[SU(0)], &[SL(1), SL(2), SL(4)]),
-    pack_a: false,
     tile_grid: (1, 1),
 };
 
@@ -579,7 +582,6 @@ pub const APPLE_AMX: TcConfig = TcConfig {
     opts: &[U(0), U(0), U(0), U(0), U(1), U(1), U(1), U(1)],
     swizzle_a: (&[], &[SU(0), SU(1), SU(2), SU(3), SU(4), SU(5), SU(6), SU(7)], &[]),
     swizzle_b: (&[], &[SU(4), SU(5), SU(6), SU(7), SU(0), SU(1), SU(2), SU(3)], &[]),
-    pack_a: true,
     tile_grid: (1, 1),
 };
 
@@ -590,7 +592,6 @@ pub const APPLE_AMX_F16_F32: TcConfig = TcConfig {
     opts: &[U(0), U(0), U(0), U(0), U(0), U(1), U(1), U(1), U(1), U(1)],
     swizzle_a: (&[], &[SU(0), SU(1), SU(2), SU(3), SU(4), SU(5), SU(6), SU(7), SU(8), SU(9)], &[]),
     swizzle_b: (&[], &[SU(5), SU(6), SU(7), SU(8), SU(9), SU(0), SU(1), SU(2), SU(3), SU(4)], &[]),
-    pack_a: true,
     tile_grid: (1, 1),
 };
 
@@ -601,7 +602,6 @@ pub const APPLE_AMX_F16: TcConfig = TcConfig {
     opts: &[U(0), U(0), U(0), U(0), U(0), U(1), U(1), U(1), U(1), U(1)],
     swizzle_a: (&[], &[SU(0), SU(1), SU(2), SU(3), SU(4), SU(5), SU(6), SU(7), SU(8), SU(9)], &[]),
     swizzle_b: (&[], &[SU(5), SU(6), SU(7), SU(8), SU(9), SU(0), SU(1), SU(2), SU(3), SU(4)], &[]),
-    pack_a: true,
     tile_grid: (1, 1),
 };
 
@@ -612,7 +612,6 @@ pub const APPLE_AMX_F64: TcConfig = TcConfig {
     opts: &[U(0), U(0), U(0), U(1), U(1), U(1)],
     swizzle_a: (&[], &[SU(0), SU(1), SU(2), SU(3), SU(4), SU(5)], &[]),
     swizzle_b: (&[], &[SU(3), SU(4), SU(5), SU(0), SU(1), SU(2)], &[]),
-    pack_a: true,
     tile_grid: (1, 1),
 };
 
@@ -624,7 +623,6 @@ pub const APPLE_AMX_I16: TcConfig = TcConfig {
     opts: &[U(0), U(0), U(0), U(0), U(0), U(1), U(1), U(1), U(1), U(1)],
     swizzle_a: (&[], &[SU(0), SU(1), SU(2), SU(3), SU(4), SU(5), SU(6), SU(7), SU(8), SU(9)], &[]),
     swizzle_b: (&[], &[SU(5), SU(6), SU(7), SU(8), SU(9), SU(0), SU(1), SU(2), SU(3), SU(4)], &[]),
-    pack_a: true,
     tile_grid: (1, 1),
 };
 
@@ -636,7 +634,6 @@ pub const INTEL_XE_8816: TcConfig = TcConfig {
     opts: &[L(0), L(0), L(0), U(1), U(1), U(1)],
     swizzle_a: (&[R(1), R(2), R(3)], &[SU(0), SU(1), SU(2)], &[SL(0), SL(1), SL(2), R(0)]),
     swizzle_b: (&[SL(0), SL(1), SL(2)], &[R(1), R(2), R(3)], &[SU(0), SU(1), SU(2), R(0)]),
-    pack_a: false,
     tile_grid: (1, 1),
 };
 
@@ -761,36 +758,5 @@ impl TensorCore {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_renderer_cpu() {
-        let r = Renderer::cpu();
-        assert_eq!(r.device, "CPU");
-        assert!(!r.has_local);
-        assert!(r.has_threads);
-        assert_eq!(r.tensor_cores.len(), 0);
-    }
-
-    #[test]
-    fn test_renderer_cuda() {
-        let r = Renderer::cuda();
-        assert_eq!(r.device, "CUDA_SM80"); // Default is SM80/Ampere
-        assert!(r.has_local);
-        assert!(r.has_shared);
-        assert!(!r.has_threads);
-        assert!(r.shared_max > 0);
-        assert!(!r.tensor_cores.is_empty());
-    }
-
-    #[test]
-    fn test_tensor_core_cuda() {
-        let tc = CUDA_81616.build(DType::Float16, DType::Float32);
-        assert_eq!(tc.dims, (8, 16, 16));
-        assert_eq!(tc.threads, 32);
-        assert_eq!(tc.dtype_in, DType::Float16);
-        assert_eq!(tc.dtype_out, DType::Float32);
-        assert!(!tc.opts.is_empty());
-    }
-}
+#[path = "../test/unit/optimizer/renderer_internal.rs"]
+mod tests;

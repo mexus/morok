@@ -7,6 +7,7 @@
 use proc_macro::TokenStream;
 use syn::{DeriveInput, parse_macro_input};
 
+mod jit;
 mod pattern_enum;
 mod patterns;
 
@@ -84,7 +85,8 @@ pub fn derive_pattern_enum(input: TokenStream) -> TokenStream {
 
 /// Proc-macro for declarative pattern rewrite rules.
 ///
-/// Generates a [`SimplifiedPatternMatcher`] from a list of pattern rewrite rules.
+/// Generates a `SimplifiedPatternMatcher` (in `morok_ir::pattern`) from a list
+/// of pattern rewrite rules.
 /// Patterns are compiled to efficient Rust code with O(1) dispatch via `OpKey`.
 ///
 /// # Syntax Overview
@@ -189,13 +191,12 @@ pub fn derive_pattern_enum(input: TokenStream) -> TokenStream {
 ///
 /// # Generated Code
 ///
-/// This macro generates a `SimplifiedPatternMatcher` with:
+/// This macro generates a `SimplifiedPatternMatcher` (defined in
+/// `morok_ir::pattern`) with:
 /// - Compile-time validation of all operation names
 /// - O(1) dispatch via OpKey hashmap
 /// - Inline pattern matching (no runtime pattern interpretation)
 /// - Automatic `Arc::ptr_eq` checks for duplicate variables
-///
-/// [`SimplifiedPatternMatcher`]: morok_ir::pattern::SimplifiedPatternMatcher
 #[proc_macro]
 pub fn patterns(input: TokenStream) -> TokenStream {
     let pattern_list = parse_macro_input!(input as patterns::PatternList);
@@ -227,6 +228,43 @@ pub fn cached_patterns(input: TokenStream) -> TokenStream {
     let pattern_list = parse_macro_input!(input as patterns::PatternList);
 
     match patterns::generate_cached_pattern_matcher(&pattern_list) {
+        Ok(tokens) => tokens.into(),
+        Err(e) => e.to_compile_error().into(),
+    }
+}
+
+/// Proc-macro for generating a JIT wrapper for a model.
+///
+/// Generates a struct with typed input/output buffer accessors and
+/// prepare/execute methods for zero-overhead repeated inference.
+///
+/// # Syntax
+///
+/// ```ignore
+/// jit_wrapper! {
+///     MyModelJit(MyModel) {
+///         input1: Tensor,
+///         input2: Tensor,
+///
+///         build(input1, input2) {
+///             // Graph-building code using `self.model`
+///             self.model.forward(&input1, &input2)
+///         }
+///     }
+/// }
+/// ```
+///
+/// # Generated API
+///
+/// - `new(model)` — create wrapper
+/// - `prepare(&input1, &input2)` — build graph + compile (one-time)
+/// - `input1_mut()` / `input2_mut()` — typed mutable buffer accessors
+/// - `output()` — output buffer accessor
+/// - `execute()` / `execute_with_vars()` — replay with zero allocation
+#[proc_macro]
+pub fn jit_wrapper(input: TokenStream) -> TokenStream {
+    let jit = parse_macro_input!(input as jit::JitWrapper);
+    match jit::generate(jit) {
         Ok(tokens) => tokens.into(),
         Err(e) => e.to_compile_error().into(),
     }

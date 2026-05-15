@@ -15,7 +15,27 @@
 use std::fmt;
 use std::sync::Arc;
 
-use crate::UOp;
+use crate::{BinaryOp, Op, UOp};
+
+fn const_to_i128(v: &crate::ConstValue) -> Option<i128> {
+    match v {
+        crate::ConstValue::Int(x) => Some(*x as i128),
+        crate::ConstValue::UInt(x) => Some(*x as i128),
+        _ => None,
+    }
+}
+
+fn symbolic_contains_max_term(expr: &Arc<UOp>, needle: &Arc<UOp>) -> bool {
+    if expr.id == needle.id {
+        return true;
+    }
+    match expr.op() {
+        Op::Binary(BinaryOp::Max, lhs, rhs) => {
+            symbolic_contains_max_term(lhs, needle) || symbolic_contains_max_term(rhs, needle)
+        }
+        _ => false,
+    }
+}
 
 /// Symbolic Integer - either a concrete value or a symbolic UOp expression.
 ///
@@ -108,6 +128,25 @@ impl SInt {
         }
     }
 
+    /// Maximum bound (Tinygrad's `x.vmax`).
+    ///
+    /// For `Const` returns the value. For `Symbolic` returns the symbolic
+    /// expression's `vmax` if it resolves to a non-negative integer, and
+    /// `None` otherwise so callers can fall back to the worst case rather
+    /// than silently treating distinct degenerate ranges as equal. For
+    /// `Infer` returns `None`.
+    pub fn vmax(&self) -> Option<usize> {
+        match self {
+            SInt::Const(v) => Some(*v),
+            SInt::Symbolic(uop) => match uop.vmax() {
+                crate::ConstValue::Int(v) if *v >= 0 => Some(*v as usize),
+                crate::ConstValue::UInt(v) => Some(*v as usize),
+                _ => None,
+            },
+            SInt::Infer => None,
+        }
+    }
+
     /// Get symbolic UOp if this is symbolic, None otherwise.
     pub fn as_symbolic(&self) -> Option<&Arc<UOp>> {
         match self {
@@ -167,8 +206,31 @@ impl SInt {
             }
             (SInt::Const(a), SInt::Const(b)) => SInt::Const(*a.max(b)),
             _ => {
+                if self == rhs {
+                    return self.clone();
+                }
+
                 let a = self.to_uop(morok_dtype::DType::Index);
                 let b = rhs.to_uop(morok_dtype::DType::Index);
+
+                if symbolic_contains_max_term(&a, &b) {
+                    return self.clone();
+                }
+                if symbolic_contains_max_term(&b, &a) {
+                    return rhs.clone();
+                }
+
+                if let (Some(a_min), Some(a_max), Some(b_min), Some(b_max)) =
+                    (const_to_i128(a.vmin()), const_to_i128(a.vmax()), const_to_i128(b.vmin()), const_to_i128(b.vmax()))
+                {
+                    if a_min >= b_max {
+                        return self.clone();
+                    }
+                    if b_min >= a_max {
+                        return rhs.clone();
+                    }
+                }
+
                 SInt::Symbolic(a.try_max(&b).unwrap())
             }
         }
@@ -267,6 +329,8 @@ impl std::ops::Sub for &SInt {
                 assert!(a >= b, "SInt subtraction underflow: {a} - {b} would be negative");
                 SInt::Const(a - b)
             }
+            (_, SInt::Const(0)) => self.clone(),
+            _ if self == rhs => SInt::Const(0),
             _ => {
                 let a = self.to_uop(morok_dtype::DType::Index);
                 let b = rhs.to_uop(morok_dtype::DType::Index);

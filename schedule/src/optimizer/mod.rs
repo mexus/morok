@@ -1,7 +1,6 @@
 //! Kernel optimization layer for morok-schedule.
 //!
-//! This module implements hardware-aware kernel optimization based on Tinygrad's approach.
-//! It provides a `Scheduler` that applies optimization primitives (OptOps) to transform
+//! Provides a `Scheduler` that applies optimization primitives (OptOps) to transform
 //! kernel execution for better performance on specific backends.
 //!
 //! # Architecture
@@ -54,7 +53,10 @@ pub mod tc;
 pub mod types;
 
 // Re-exports
-pub use beam::{BeamResult, beam_search, beam_search_cached, beam_search_with_timeout, clear_cache, replay_opts};
+pub use beam::{
+    BeamResult, CandidateMetrics, beam_search, beam_search_cached, clear_cache, compute_ops_estimate,
+    hash_post_codegen_ir, replay_opts,
+};
 pub use config::{BeamConfig, HeuristicsConfig, OptStrategy, OptimizerConfig, TcOpt as TcOptLevel, TcSelect, TcUsage};
 pub use error::OptError;
 pub use heuristics::hand_coded_optimizations;
@@ -71,8 +73,6 @@ use crate::devectorize::{
     pm_wmma_accumulate,
 };
 use crate::gpudims::pm_add_gpudims;
-// pm_linearize_multi_index removed: Tinygrad keeps multi-index INDEX through the pipeline.
-// Codegen backends compute flat addresses at render time.
 use crate::rangeify::patterns::{
     pm_add_loads, pm_comparison_negations, pm_demorgan, pm_div_to_shr, pm_erf_decomposition, pm_fdiv_to_mul,
     pm_fma_decomposition, pm_load_collapse, pm_mod_to_and, pm_mul_to_shl, pm_neg_from_mul, pm_shl_add_to_mulacc,
@@ -97,7 +97,7 @@ use std::sync::{Arc, LazyLock};
 ///
 /// # Arguments
 ///
-/// * `ast` - The kernel AST (inner AST from KERNEL op)
+/// * `ast` - The kernel AST (CALL body AST)
 /// * `renderer` - Backend capabilities descriptor
 ///
 /// # Returns
@@ -107,7 +107,7 @@ use std::sync::{Arc, LazyLock};
 /// # Environment Variables
 ///
 /// * `MOROK_NOOPT=1` - Disable all optimizations (for debugging)
-/// * `MOROK_BEAM=N` - Use beam search with width N (future)
+/// * `BEAM=N` - Use beam search with width N (future)
 pub fn optimize_kernel(ast: Arc<morok_ir::UOp>, renderer: &Renderer) -> Arc<morok_ir::UOp> {
     optimize_kernel_with_config(ast, renderer, &OptimizerConfig::from_env())
 }
@@ -121,8 +121,8 @@ pub fn optimize_kernel(ast: Arc<morok_ir::UOp>, renderer: &Renderer) -> Arc<moro
 /// - devectorize: Combined pass (sym + devec + load_store_folding + correct_load_store + indexing)
 /// - bool_storage_patterns: Convert bool LOAD/STORE to uint8
 ///
-/// NOTE: We do NOT apply FMA decomposition (a*b+c → MulAcc). Following Tinygrad's
-/// approach, we let LLVM's optimizer fuse MUL+ADD into FMA when beneficial.
+/// NOTE: We do NOT apply FMA decomposition (a*b+c → MulAcc) — let LLVM's
+/// optimizer fuse MUL+ADD into FMA when beneficial.
 ///
 /// # Arguments
 ///
@@ -155,15 +155,36 @@ pub fn apply_post_optimization_with_renderer(
 
     tracing::debug!(ast.initial = ast.tree(), node_count = ast.node_count(), "kernel initial");
 
-    // Tinygrad keeps multi-index INDEX through the pipeline — no linearization here.
-    // Codegen backends compute flat addresses at render time via render_linearize_multi_index.
+    // Env-gated per-stage diagnostic. Set MOROK_PER_STAGE_UOPS=1 to print
+    // node_count to stderr after each post-opt stage. Used to pinpoint
+    // which pass blows up on a bloated input. Set MOROK_DUMP_STAGE=<prefix>
+    // to also dump the full UOp tree at any stage whose label starts with
+    // that prefix (e.g. MOROK_DUMP_STAGE=13 dumps stage 13-pm_add_loads).
+    let dump_per_stage = std::env::var("MOROK_PER_STAGE_UOPS").is_ok();
+    let dump_stage_prefix = std::env::var("MOROK_DUMP_STAGE").ok();
+    let print_stage = |label: &str, node: &Arc<morok_ir::UOp>| {
+        if dump_per_stage {
+            eprintln!("[per-stage] {} : node_count={}", label, node.node_count());
+        }
+        if let Some(ref prefix) = dump_stage_prefix
+            && label.starts_with(prefix.as_str())
+        {
+            eprintln!("[dump-stage] {} :", label);
+            eprintln!("{}", node.tree());
+            eprintln!("[dump-stage] {} : end", label);
+        }
+    };
+    print_stage("00-initial", &ast);
+
+    // Multi-index INDEX is normalized to single-index during devectorize
+    // via pm_linearize_multi_index. Backends consume only linearized INDEX.
 
     // =========================================================================
-    // Stage 8: Post-opt symbolic + WHERE movement (Tinygrad: sym + pm_move_where_on_load)
+    // Stage 8: Post-opt symbolic + WHERE movement
     // This MUST run BEFORE expander to optimize conditionals before expansion.
+    // pm_move_where_on_load is scoped here, not applied globally.
     // =========================================================================
     let t_stage = std::time::Instant::now();
-    // Tinygrad: sym + pm_move_where_on_load (pm_move_where_on_load only at this stage, not global)
     static POST_OPT_SYM: LazyLock<crate::TypedPatternMatcher> =
         LazyLock::new(|| sym().clone() + crate::symbolic::patterns::pm_move_where_on_load());
     let with_symbolic = graph_rewrite(&*POST_OPT_SYM, ast, &mut ());
@@ -173,14 +194,15 @@ pub fn apply_post_optimization_with_renderer(
         elapsed_ms = t_stage.elapsed().as_millis() as u64,
         "Stage 8: after post-opt symbolic"
     );
+    print_stage("08-post_opt_sym", &with_symbolic);
 
     // =========================================================================
-    // Stage 9: Expander (Tinygrad: sym + pm_pre_expander + pm_group_for_reduce + expander)
+    // Stage 9: Expander
     // =========================================================================
-    // UNROLL expansion: Expand UNROLL ops to vectorized operations (Tinygrad expander.py)
-    // CRITICAL: Must run BEFORE pm_reduce so that REDUCE sees its actual vectorized dtype.
-    // In Tinygrad, expander runs first, then pm_reduce sees the expanded REDUCE with vec2 dtype.
-    // This allows reduce_to_acc to create accumulators with the correct vector dtype.
+    // UNROLL expansion: expand UNROLL ops to vectorized operations.
+    // CRITICAL: Must run BEFORE pm_reduce so REDUCE sees its actual vectorized
+    // dtype, allowing reduce_to_acc to create accumulators with the correct
+    // vector dtype.
     let t_stage = std::time::Instant::now();
     let expanded = crate::expand::pre_expand(&with_symbolic);
     tracing::debug!(
@@ -189,18 +211,19 @@ pub fn apply_post_optimization_with_renderer(
         elapsed_ms = t_stage.elapsed().as_millis() as u64,
         "Stage 9: after pre_expand"
     );
+    print_stage("09-pre_expand", &expanded);
 
     // =========================================================================
-    // Stage 10: Add local buffers (Tinygrad: pm_add_buffers_local + rangeify_codegen)
+    // Stage 10: Add local buffers
     // =========================================================================
     // Converts BUFFERIZE(Local) → DEFINE_LOCAL + STORE + LOAD for GROUP_REDUCE.
     // Also strips leftover CONTIGUOUS and NOOP nodes.
     // Must run AFTER expander (which creates BUFFERIZE_LOCAL) and BEFORE pm_reduce.
     //
     // CRITICAL: Combine pm_add_buffers_local + rangeify_codegen in a SINGLE pass
-    // (like Tinygrad) to ensure CONTIGUOUS is stripped BEFORE bufferize_to_store
-    // sees it. Otherwise CONTIGUOUS(BUFFER) becomes the STORE value directly,
-    // which fails codegen because STORE expects a value, not a buffer pointer.
+    // to strip CONTIGUOUS BEFORE bufferize_to_store sees it. Otherwise
+    // CONTIGUOUS(BUFFER) becomes the STORE value directly, and codegen rejects
+    // it (STORE expects a value, not a buffer pointer).
     // Helper closure: check for UNROLL(GROUP) in graph
     let check_unroll_group = |label: &str, root: &Arc<morok_ir::UOp>| {
         for node in root.toposort() {
@@ -214,8 +237,8 @@ pub fn apply_post_optimization_with_renderer(
 
     let t_stage = std::time::Instant::now();
     let with_local_buffers = {
-        let mut buf_ctx = crate::rangeify::KernelContext::new();
-        static PM_LOCAL_BUF: LazyLock<crate::TypedPatternMatcher<crate::rangeify::KernelContext>> =
+        let mut buf_ctx = crate::rangeify::RangeifyBufferContext::new();
+        static PM_LOCAL_BUF: LazyLock<crate::TypedPatternMatcher<crate::rangeify::RangeifyBufferContext>> =
             LazyLock::new(|| pm_add_buffers_local_patterns() + rangeify_codegen_with_kernel_ctx());
         graph_rewrite(&*PM_LOCAL_BUF, expanded, &mut buf_ctx)
     };
@@ -225,6 +248,7 @@ pub fn apply_post_optimization_with_renderer(
         elapsed_ms = t_stage.elapsed().as_millis() as u64,
         "Stage 10: after add local buffers"
     );
+    print_stage("10-local_buffers", &with_local_buffers);
     if cfg!(debug_assertions) {
         check_unroll_group("after_add_local_buffers", &with_local_buffers);
     }
@@ -240,13 +264,18 @@ pub fn apply_post_optimization_with_renderer(
         elapsed_ms = t_stage.elapsed().as_millis() as u64,
         "after pm_reduce"
     );
+    print_stage("11-pm_reduce", &reduced);
     if cfg!(debug_assertions) {
         check_unroll_group("after_pm_reduce", &reduced);
     }
 
     let t_stage = std::time::Instant::now();
     let with_gpudims = if let Some(ren) = renderer {
-        if ren.has_local { graph_rewrite(&pm_add_gpudims(), reduced, &mut ren.clone()) } else { reduced }
+        if ren.has_local || ren.has_threads {
+            graph_rewrite(&pm_add_gpudims(), reduced, &mut ren.clone())
+        } else {
+            reduced
+        }
     } else {
         reduced
     };
@@ -256,6 +285,7 @@ pub fn apply_post_optimization_with_renderer(
         elapsed_ms = t_stage.elapsed().as_millis() as u64,
         "after pm_add_gpudims"
     );
+    print_stage("12-pm_add_gpudims", &with_gpudims);
     if cfg!(debug_assertions) {
         check_unroll_group("after_pm_add_gpudims", &with_gpudims);
     }
@@ -268,6 +298,7 @@ pub fn apply_post_optimization_with_renderer(
         elapsed_ms = t_stage.elapsed().as_millis() as u64,
         "after pm_add_loads"
     );
+    print_stage("13-pm_add_loads", &with_loads);
     if cfg!(debug_assertions) {
         check_unroll_group("after_pm_add_loads", &with_loads);
         // Also check for any UNROLL or CONTRACT
@@ -291,25 +322,27 @@ pub fn apply_post_optimization_with_renderer(
         }
     }
 
-    // ALU devectorization happens inside devectorize() Phase 1, alongside expand_index
-    // and full symbolic (including gep_pushing). This matches Tinygrad's structure where
-    // no_vectorized_alu runs in the same pass as load_store_folding (step 14).
-    // Previously, an isolated pass here combined no_vectorized_alu + gep_pushing without
-    // load/store folding, causing graph explosion on wide VECTORIZE nodes (VECTORIZE(135)).
-    // Tinygrad Stage 14: devectorize — single combined pass handles ALL devectorization
-    // including bool ALU (via no_vectorized_alu). No separate pm_bool_devectorize or
-    // pm_reduce_devectorize passes — matching Tinygrad's pipeline exactly.
+    // ALU devectorization happens inside devectorize() Phase 1, alongside
+    // expand_index and full symbolic (including gep_pushing) — single combined
+    // pass handles ALL devectorization including bool ALU (via
+    // no_vectorized_alu). An earlier isolated pass that combined
+    // no_vectorized_alu + gep_pushing without load/store folding caused graph
+    // explosion on wide VECTORIZE nodes (VECTORIZE(135)).
     let t_stage = std::time::Instant::now();
-    let devectorized = crate::devectorize::devectorize(&with_loads);
+    // Default renderer to CPU when caller didn't supply one — `supports_float4=true`
+    // matches the conservative default behaviour.
+    let renderer_ctx = renderer.cloned().unwrap_or_else(Renderer::cpu);
+    let devectorized = crate::devectorize::devectorize(&with_loads, &renderer_ctx);
     tracing::debug!(
         ast.optimized = devectorized.tree(),
         node_count = devectorized.node_count(),
         elapsed_ms = t_stage.elapsed().as_millis() as u64,
         "after devectorize"
     );
+    print_stage("14-devectorize", &devectorized);
     check_unroll_group("after_devectorize", &devectorized);
 
-    // Tinygrad Stage 15: pm_lower_index_dtype + load_store_indexing + gep_pushing
+    // Stage 15: pm_lower_index_dtype + load_store_indexing + gep_pushing
     let t_stage = std::time::Instant::now();
     static PM_LOWER_COMBINED: LazyLock<crate::TypedPatternMatcher> = LazyLock::new(|| {
         crate::symbolic::pm_lower_index_dtype()
@@ -323,9 +356,10 @@ pub fn apply_post_optimization_with_renderer(
         elapsed_ms = t_stage.elapsed().as_millis() as u64,
         "after pm_lower_index_dtype"
     );
+    print_stage("15-pm_lower_index_dtype", &with_lowered_idx);
     check_unroll_group("after_pm_lower_index_dtype", &with_lowered_idx);
 
-    // Tinygrad: symbolic (step 16) — full symbolic (includes gep_pushing, div_and_mod, etc.)
+    // Stage 16: full symbolic (includes gep_pushing, div_and_mod, etc.)
     let t_stage = std::time::Instant::now();
     static POST_INDEX_SYM: LazyLock<crate::TypedPatternMatcher> = LazyLock::new(|| symbolic().clone());
     let with_lowered_idx = graph_rewrite(&*POST_INDEX_SYM, with_lowered_idx, &mut ());
@@ -335,38 +369,42 @@ pub fn apply_post_optimization_with_renderer(
         elapsed_ms = t_stage.elapsed().as_millis() as u64,
         "after post-index symbolic"
     );
+    print_stage("16-post_index_sym", &with_lowered_idx);
+
+    // Merge sibling ENDs that share the same reduce ranges, BEFORE pm_split_ends
+    // runs inside PM_FINAL. split_end (linearize/mod.rs) does not preserve the
+    // TAG_MERGEABLE tag set by reduce_to_acc, so merging must happen first.
+    let t_merge = std::time::Instant::now();
+    let with_lowered_idx = crate::devectorize::merge_sibling_ends(&with_lowered_idx);
+    tracing::debug!(
+        ast.optimized = with_lowered_idx.tree(),
+        node_count = with_lowered_idx.node_count(),
+        elapsed_ms = t_merge.elapsed().as_millis() as u64,
+        "after merge_sibling_ends"
+    );
+    print_stage("17-merge_sibling_ends", &with_lowered_idx);
 
     // =========================================================================
-    // Stage 18-19: Decompositions + Render (Tinygrad: pm_decomp + pm_render in one pass)
+    // Stage 18-19: Decompositions + Render + split ENDs (single combined pass)
     // =========================================================================
     let t_stage = std::time::Instant::now();
-    static PM_FINAL: LazyLock<crate::TypedPatternMatcher> =
-        LazyLock::new(|| symbolic_simple() + get_late_rewrite_patterns() + pm_render());
+    static PM_FINAL: LazyLock<crate::TypedPatternMatcher> = LazyLock::new(|| {
+        symbolic_simple() + get_late_rewrite_patterns() + pm_render() + crate::linearize::pm_split_ends()
+    });
     let rendered = graph_rewrite(&*PM_FINAL, with_lowered_idx, &mut ());
     tracing::debug!(
         ast.optimized = rendered.tree(),
         node_count = rendered.node_count(),
         elapsed_ms = t_stage.elapsed().as_millis() as u64,
-        "Stage 18-19: after pm_decomp + pm_render"
+        "Stage 18-19: after pm_decomp + pm_render + pm_split_ends"
     );
-
-    // Merge sibling ENDs that share the same reduce ranges.
-    // pm_decomp+pm_render can create new sibling ENDs (e.g. by rewriting computations
-    // inside an END differently per vector lane). merge_reduce_ends ran earlier in
-    // pm_reduce but only caught ENDs that existed at that point.
-    let t_merge = std::time::Instant::now();
-    let rendered = crate::devectorize::merge_sibling_ends(&rendered);
-    tracing::debug!(
-        ast.optimized = rendered.tree(),
-        node_count = rendered.node_count(),
-        elapsed_ms = t_merge.elapsed().as_millis() as u64,
-        "after merge_sibling_ends"
-    );
+    print_stage("18-pm_decomp_render", &rendered);
+    assert_gated_loads_have_alt("after_pm_decomp_pm_render", &rendered);
 
     // FP8 float decomposition: promote FP8 computation to Float16 via bitwise conversion.
     // Uses graph_rewrite_with_bpm: STORE pattern in bpm (sees ORIGINAL children to detect
     // FP8 buffer ptrs), all other patterns in pm (sees OPTIMIZED children).
-    // Run once per FP8 type. Tinygrad: codegen/__init__.py:97-99
+    // Run once per FP8 type.
     let t_stage = std::time::Instant::now();
     let fp8_pm = pm_float_decomp();
     let fp8_bpm = pm_float_decomp_store();
@@ -384,6 +422,8 @@ pub fn apply_post_optimization_with_renderer(
         elapsed_ms = t_stage.elapsed().as_millis() as u64,
         "after pm_float_decomp"
     );
+    print_stage("19-pm_float_decomp", &fp8_decomposed);
+    assert_gated_loads_have_alt("after_pm_float_decomp", &fp8_decomposed);
 
     let t_stage = std::time::Instant::now();
     let bs = graph_rewrite(bool_storage_patterns(), fp8_decomposed, &mut ());
@@ -393,6 +433,8 @@ pub fn apply_post_optimization_with_renderer(
         elapsed_ms = t_stage.elapsed().as_millis() as u64,
         "after bool_storage_pattern"
     );
+    print_stage("20-bool_storage", &bs);
+    assert_gated_loads_have_alt("after_bool_storage_pattern", &bs);
 
     // Re-attach metadata (e.g., KernelInfo) that was lost during graph rewrites
     match saved_metadata {
@@ -401,9 +443,26 @@ pub fn apply_post_optimization_with_renderer(
     }
 }
 
+fn assert_gated_loads_have_alt(stage: &str, root: &Arc<morok_ir::UOp>) {
+    for node in root.toposort() {
+        let morok_ir::Op::Load { index, alt, .. } = node.op() else {
+            continue;
+        };
+        if index_has_gate(index) && alt.is_none() {
+            panic!("pipeline invariant violation ({stage}): gated LOAD {} has no alt value", node.id);
+        }
+    }
+}
+
+fn index_has_gate(index: &Arc<morok_ir::UOp>) -> bool {
+    match index.op() {
+        morok_ir::Op::Index { gate: Some(_), .. } => true,
+        morok_ir::Op::Cast { src, .. } => index_has_gate(src),
+        _ => false,
+    }
+}
+
 /// Late rewrite patterns for algebraic decompositions.
-///
-/// Based on Tinygrad's `get_late_rewrite_patterns` (decompositions.py:438-480).
 ///
 /// Returns patterns for:
 /// - MULACC (FMA): `a*b+c → MulAcc(a,b,c)` for float types
@@ -413,8 +472,8 @@ pub fn apply_post_optimization_with_renderer(
 /// - Fast integer division (magic number multiplication)
 fn get_late_rewrite_patterns() -> &'static crate::TypedPatternMatcher {
     // All current backends support MAX and SQRT natively (LLVM, CUDA, Metal).
-    // When we add backends that lack support, this should take a capability set
-    // (like Tinygrad's `ops: tuple[Ops, ...]`) and conditionally include patterns.
+    // When backends lacking support are added, this should take a capability
+    // set and conditionally include patterns.
     static CACHED: LazyLock<crate::TypedPatternMatcher> = LazyLock::new(|| {
         pm_fma_decomposition()
             + pm_erf_decomposition()
@@ -433,7 +492,7 @@ fn get_late_rewrite_patterns() -> &'static crate::TypedPatternMatcher {
     &CACHED
 }
 
-/// MOD → IDIV decomposition (Tinygrad decompositions.py:457).
+/// MOD → IDIV decomposition.
 ///
 /// `x % d → x - d*(x//d)` for non-power-of-2 constant divisors.
 /// Runs AFTER fast_division_patterns so the resulting IDIV gets decomposed
@@ -455,8 +514,7 @@ fn pm_mod_to_idiv() -> &'static crate::TypedPatternMatcher {
 
 /// Apply per-kernel pre-optimization passes.
 ///
-/// These stages run BEFORE heuristic/beam optimization, per-kernel
-/// (Tinygrad: inside `full_rewrite_to_sink()`, codegen/__init__.py:28-51).
+/// These stages run BEFORE heuristic/beam optimization, per-kernel.
 ///
 /// Stages:
 /// 0. Movement ops + syntactic sugar (`pm_mops + pm_syntactic_sugar`, bottom-up)
@@ -506,7 +564,7 @@ pub fn apply_pre_optimization(ast: Arc<morok_ir::UOp>) -> Arc<morok_ir::UOp> {
     );
 
     let t_stage = std::time::Instant::now();
-    // Tinygrad: sym + pm_flatten_range (pre-opt uses full sym tier)
+    // Pre-opt uses the full sym tier alongside pm_flatten_range.
     static PM_SYM_FLATTEN: LazyLock<crate::TypedPatternMatcher> = LazyLock::new(|| sym().clone() + pm_flatten_range());
     sink = graph_rewrite(&*PM_SYM_FLATTEN, sink, &mut ());
     tracing::debug!(
@@ -542,7 +600,7 @@ pub fn optimize_kernel_with_config(
     renderer: &Renderer,
     config: &OptimizerConfig,
 ) -> Arc<morok_ir::UOp> {
-    // Pre-optimization: per-kernel stages (Tinygrad: full_rewrite_to_sink)
+    // Pre-optimization: per-kernel stages.
     let pre_optimized = apply_pre_optimization(ast);
 
     let optimized = match config.strategy {
@@ -618,9 +676,9 @@ pub fn optimize_kernel_beam<F>(
     compile_and_time: F,
 ) -> Result<BeamResult, error::OptError>
 where
-    F: Fn(&Scheduler) -> Option<std::time::Duration> + Sync,
+    F: Fn(&Scheduler, Option<std::time::Duration>) -> Option<beam::CandidateMetrics> + Sync,
 {
-    // Step 0: Per-kernel pre-optimization (Tinygrad: full_rewrite_to_sink)
+    // Step 0: Per-kernel pre-optimization.
     let pre_optimized = apply_pre_optimization(ast);
 
     // Step 1: Create scheduler (AST already simplified by apply_pre_optimization Stage 3)
@@ -650,8 +708,8 @@ pub fn prepare_scheduler(ast: Arc<morok_ir::UOp>, renderer: &Renderer) -> Schedu
     let pre_optimized = apply_pre_optimization(ast);
     let mut scheduler = Scheduler::new(pre_optimized, renderer.clone());
     let _ = scheduler.convert_loop_to_global(); // GPU: LOOP→GLOBAL
-    // Note: Don't apply threading here - let beam search explore THREAD actions naturally.
-    // Heuristics apply threading via hand_coded_optimizations() with config.thread_count.
+    // Rangeify produces LOOP-typed axes by default; threading is left to the
+    // optimizer.
     scheduler
 }
 
@@ -662,7 +720,6 @@ fn optimize_heuristic(ast: Arc<morok_ir::UOp>, renderer: &Renderer, config: &Heu
 
     // Step 3: Convert axes for parallelization/vectorization
     let _ = scheduler.convert_loop_to_global(); // GPU: LOOP→GLOBAL
-    let _ = scheduler.convert_outer_to_loop(); // CPU: OUTER→LOOP (enables UPCAST)
 
     // Step 4: Apply hand-coded heuristics with config
     heuristics::hand_coded_optimizations(&mut scheduler, config);

@@ -6,6 +6,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use morok_ir::uop::cached_property::CachedProperty;
+use morok_ir::uop::properties::VminVmaxProperty;
 use morok_ir::{AxisType, ConstValue, Op, UOp, UOpKey};
 use smallvec::SmallVec;
 
@@ -23,14 +25,17 @@ pub fn apply_opt(scheduler: &mut Scheduler, opt: &Opt, append_opt: bool) -> Resu
     match opt.op {
         OptOps::TC => {
             let (tc_select, tc_opt, use_tensor_cores) = opt.arg.tc()?;
-            // TODO: propagate TC axes for post-TC upcasts on non-AMX devices
-            let _axes = tc::apply(scheduler, tc_select, tc_opt, use_tensor_cores)?;
+            let _axes = tc::apply_with_axis_choice(scheduler, tc_select, tc_opt, use_tensor_cores, opt.axis)?;
         }
         OptOps::UPCAST => {
-            apply_upcast(scheduler, rng.ok_or_else(|| MissingAxisParameterSnafu.build())?, opt.arg.int()?)?;
+            let r = rng.ok_or_else(|| MissingAxisParameterSnafu.build())?;
+            let amount = resolve_full_axis(&r, opt.arg.int()?, "UPCAST")?;
+            apply_upcast(scheduler, r, amount)?;
         }
         OptOps::LOCAL => {
-            apply_local(scheduler, rng.ok_or_else(|| MissingAxisParameterSnafu.build())?, opt.arg.int()?)?;
+            let r = rng.ok_or_else(|| MissingAxisParameterSnafu.build())?;
+            let amount = resolve_full_axis(&r, opt.arg.int()?, "LOCAL")?;
+            apply_local(scheduler, r, amount)?;
         }
         OptOps::UNROLL => {
             apply_unroll(scheduler, opt.axis.ok_or_else(|| MissingAxisParameterSnafu.build())?, opt.arg.int()?)?;
@@ -42,13 +47,19 @@ pub fn apply_opt(scheduler: &mut Scheduler, opt: &Opt, append_opt: bool) -> Resu
             apply_swap(scheduler, opt.axis.ok_or_else(|| MissingAxisParameterSnafu.build())?, opt.arg.swap()?)?;
         }
         OptOps::GROUP => {
-            apply_group(scheduler, rng.ok_or_else(|| MissingAxisParameterSnafu.build())?, opt.arg.int()?, false)?;
+            let r = rng.ok_or_else(|| MissingAxisParameterSnafu.build())?;
+            let amount = resolve_full_axis(&r, opt.arg.int()?, "GROUP")?;
+            apply_group(scheduler, r, amount, false)?;
         }
         OptOps::GROUPTOP => {
-            apply_group(scheduler, rng.ok_or_else(|| MissingAxisParameterSnafu.build())?, opt.arg.int()?, true)?;
+            let r = rng.ok_or_else(|| MissingAxisParameterSnafu.build())?;
+            let amount = resolve_full_axis(&r, opt.arg.int()?, "GROUPTOP")?;
+            apply_group(scheduler, r, amount, true)?;
         }
         OptOps::THREAD => {
-            apply_thread(scheduler, rng.ok_or_else(|| MissingAxisParameterSnafu.build())?, opt.arg.int()?)?;
+            let r = rng.ok_or_else(|| MissingAxisParameterSnafu.build())?;
+            let amount = resolve_full_axis(&r, opt.arg.int()?, "THREAD")?;
+            apply_thread(scheduler, r, amount)?;
         }
         OptOps::PADTO => {
             apply_padto(scheduler, rng.ok_or_else(|| MissingAxisParameterSnafu.build())?, opt.arg.int()?)?;
@@ -61,13 +72,36 @@ pub fn apply_opt(scheduler: &mut Scheduler, opt: &Opt, append_opt: bool) -> Resu
     Ok(())
 }
 
+/// Resolve `amount=0` to the full size of `rng`'s axis via `vmax+1`.
+///
+/// `arg=0` means "use the full axis size"; resolved through `VminVmaxProperty`
+/// so both constant- and symbolic-end Ranges work. Beam search emits this
+/// for `Opt::{upcast,local,group,thread}(_, 0)` variants.
+fn resolve_full_axis(rng: &Arc<UOp>, amount: usize, op_name: &'static str) -> Result<usize, OptError> {
+    if amount != 0 {
+        return Ok(amount);
+    }
+    if !matches!(rng.op(), Op::Range { .. }) {
+        return ExpectedRangeOperationSnafu.fail();
+    }
+    let (_, vmax) = VminVmaxProperty::get(rng);
+    let vmax_i64 = match vmax {
+        ConstValue::Int(v) => v,
+        _ => return ValidationFailedSnafu { op: op_name, reason: "axis vmax has non-Int ConstValue" }.fail(),
+    };
+    vmax_i64
+        .checked_add(1)
+        .and_then(|v| usize::try_from(v).ok())
+        .ok_or_else(|| ValidationFailedSnafu { op: op_name, reason: "axis vmax+1 out of range" }.build())
+}
+
 // ============================================================================
 // UPCAST - Vectorization (SIMD)
 // ============================================================================
 
 /// Split dimension into smaller range + UPCAST for vector operations.
 ///
-/// UPCAST is for output dimension vectorization (OUTER/GLOBAL/LOCAL/LOOP).
+/// UPCAST is for output dimension vectorization (GLOBAL/LOCAL/LOOP).
 /// For reduce axis unrolling, use UNROLL instead.
 fn apply_upcast(scheduler: &mut Scheduler, rng: Arc<UOp>, amount: usize) -> Result<(), OptError> {
     let axis_type = match rng.op() {
@@ -75,11 +109,10 @@ fn apply_upcast(scheduler: &mut Scheduler, rng: Arc<UOp>, amount: usize) -> Resu
         _ => return ExpectedRangeOperationSnafu.fail(),
     };
 
-    // UPCAST is for output dimension vectorization (parallel lanes compute different outputs)
-    // Allowed: OUTER (reduce kernel outputs), GLOBAL/LOCAL/LOOP (elementwise outputs)
-    // REDUCE/GROUP_REDUCE should use UNROLL instead (unrolled iterations, scalar accumulators)
-    if !matches!(axis_type, AxisType::Outer | AxisType::Global | AxisType::Local | AxisType::Loop) {
-        return ValidationFailedSnafu { op: "UPCAST", reason: "can only upcast Outer/Global/Local/Loop axes" }.fail();
+    // UPCAST applies to GLOBAL/LOCAL/LOOP axes only — REDUCE/GROUP_REDUCE
+    // should use UNROLL.
+    if !matches!(axis_type, AxisType::Global | AxisType::Local | AxisType::Loop) {
+        return ValidationFailedSnafu { op: "UPCAST", reason: "can only upcast Global/Local/Loop axes" }.fail();
     }
 
     if amount > scheduler.ren.upcast_max {
@@ -195,26 +228,15 @@ fn find_reduce_using_range(scheduler: &Scheduler, rng: &Arc<UOp>) -> Result<Arc<
 // ============================================================================
 
 /// Split reduction into smaller range + UNROLL for compile-time expansion.
-/// When `amount == 0`, the entire axis is unrolled (full unroll), matching Tinygrad's convention.
+/// When `amount == 0`, the entire axis is unrolled (full unroll). Resolution
+/// is shared with UPCAST/LOCAL/GROUP/GROUPTOP/THREAD via [`resolve_full_axis`].
 fn apply_unroll(scheduler: &mut Scheduler, axis: usize, amount: usize) -> Result<(), OptError> {
     let unrollable = scheduler.unrollable_dims();
     let real_axis =
         *unrollable.get(axis).ok_or_else(|| AxisOutOfBoundsSnafu { axis, max: unrollable.len() }.build())?;
     let rng = scheduler.rngs()[real_axis].clone();
 
-    // Resolve amount=0 to full axis size (full unroll, matching Tinygrad's convention)
-    let amount = if amount == 0 {
-        if let Op::Range { end, .. } = rng.op()
-            && let Op::Const(cv) = end.op()
-            && let morok_ir::ConstValue::Int(sz) = cv.0
-        {
-            sz as usize
-        } else {
-            return ValidationFailedSnafu { op: "UNROLL", reason: "full unroll requires constant axis size" }.fail();
-        }
-    } else {
-        amount
-    };
+    let amount = resolve_full_axis(&rng, amount, "UNROLL")?;
 
     const MAX_UNROLL: usize = 32;
     if amount > MAX_UNROLL {
@@ -304,7 +326,6 @@ fn apply_nolocals(scheduler: &mut Scheduler) -> Result<(), OptError> {
 /// Pad dimension to alignment for tensor core compatibility.
 ///
 /// PADTO rounds up a loop dimension to enable tensor core alignment.
-/// Based on Tinygrad's PADTO (kernel.py).
 ///
 /// # Constraints
 ///
@@ -348,10 +369,8 @@ fn apply_padto(scheduler: &mut Scheduler, rng: Arc<UOp>, alignment: usize) -> Re
         return Ok(());
     }
 
-    // Constraint 4: don't add more than 4x work
-    // Tinygrad: check(rng.vmax+1 > new_sz//4, "pad adds more than quadruple the work")
-    // Strict inequality: exactly 4x is also rejected.
-    if old_sz * 4 <= new_sz {
+    // Constraint 4: don't add more than 4x work. Exactly 4x is admitted.
+    if old_sz * 4 < new_sz {
         return ValidationFailedSnafu { op: "PADTO", reason: "padding would add more than 4x work" }.fail();
     }
 
@@ -405,8 +424,8 @@ fn apply_padto(scheduler: &mut Scheduler, rng: Arc<UOp>, alignment: usize) -> Re
             let new_indices: SmallVec<[Arc<UOp>; 4]> = indices.iter().map(|idx| idx.substitute(&range_subst)).collect();
 
             // Encode validity gate using WHERE(cond, idx, Invalid) in the index source
-            // instead of the INDEX gate field. This prevents the expander from vectorizing
-            // the gate independently (Tinygrad's approach: symbolic.py invalid_gate encoding).
+            // instead of the INDEX gate field. This prevents the expander from
+            // vectorizing the gate independently.
             let new_index = if let Some(first_idx) = new_indices.first() {
                 // Extract any existing WHERE-encoded validity from the index
                 let existing_valid = first_idx.get_valid();
@@ -467,7 +486,7 @@ fn buf_uses_range(buf_op: &Arc<UOp>, rng: &Arc<UOp>) -> bool {
 
 /// Check for unsafe operations before reduce that prevent PADTO.
 ///
-/// Tinygrad's UnsafePad group - cannot pad reduce axes if these appear before reduction:
+/// Cannot pad reduce axes if these appear before reduction:
 /// - RECIPROCAL, LOG2, EXP2, IDIV, POW (non-linear ops where padding zeros changes result)
 /// - Comparisons (LT, etc.) that could mask valid data
 fn has_unsafe_ops_before_reduce(reduce_op: &Arc<UOp>) -> bool {
@@ -495,13 +514,13 @@ fn has_unsafe_ops_before_reduce(reduce_op: &Arc<UOp>) -> bool {
 ///
 /// THREAD works like GPU's GLOBAL but for CPU: instead of GPU thread blocks,
 /// we use OS threads (via rayon). The work partition is baked into index
-/// expressions at optimization time - runtime just provides thread_id.
+/// expressions at optimization time - runtime just provides core_id.
 ///
 /// # Safety
 ///
 /// Buffer safety is guaranteed by shift_to() transformation:
-/// - Each thread_id maps to disjoint output indices
-/// - Index formula: `output[thread_id * chunk_size + local_idx]`
+/// - Each core_id maps to disjoint output indices
+/// - Index formula: `output[core_id * chunk_size + local_idx]`
 /// - Same buffer pointers can be safely passed to all threads
 fn apply_thread(scheduler: &mut Scheduler, rng: Arc<UOp>, amount: usize) -> Result<(), OptError> {
     // Validate renderer supports threads
@@ -509,12 +528,13 @@ fn apply_thread(scheduler: &mut Scheduler, rng: Arc<UOp>, amount: usize) -> Resu
         return UnsupportedFeatureSnafu { feature: "CPU threads" }.fail();
     }
 
-    // Check if already threaded - make THREAD opt idempotent
-    // This allows replaying cached opts even when prepare_scheduler pre-applies threading
+    // Reject if already threaded. The previous silent `Ok(())` made beam
+    // expansions of a THREADed parent generate duplicate schedulers, which
+    // then got dedup'd — truncating the beam fan-out and preventing
+    // multi-step composition.
     let thread_axes = scheduler.axes_of(&[AxisType::Thread]);
     if !thread_axes.is_empty() {
-        tracing::debug!("THREAD opt skipped: scheduler already has Thread axis");
-        return Ok(());
+        return ValidationFailedSnafu { op: "THREAD", reason: "already threaded" }.fail();
     }
 
     // Validate thread count within limits
@@ -531,13 +551,18 @@ fn apply_thread(scheduler: &mut Scheduler, rng: Arc<UOp>, amount: usize) -> Resu
         _ => return ExpectedRangeOperationSnafu.fail(),
     };
 
-    // Outer, Global, Loop can be threaded
-    // Note: Reduce kernels keep Outer axes (convert_outer_to_loop skips them)
-    if !matches!(axis_type, AxisType::Outer | AxisType::Global | AxisType::Loop) {
-        return ValidationFailedSnafu { op: "THREAD", reason: "can only thread Outer/Global/Loop axes" }.fail();
+    // THREAD only applies to globalizable ranges (LOOP). GLOBAL kept for the
+    // GPU dispatch model.
+    if !matches!(axis_type, AxisType::Global | AxisType::Loop) {
+        return ValidationFailedSnafu { op: "THREAD", reason: "can only thread Global/Loop axes" }.fail();
     }
 
-    // Apply shift_to with top=true (outer-most position, like Tinygrad's core_id)
+    // Only ranges globalizable across all outputs can be threaded safely.
+    if !scheduler.globalizable_rngs().iter().any(|candidate| Arc::ptr_eq(candidate, &rng)) {
+        return ValidationFailedSnafu { op: "THREAD", reason: "can't apply range to this dim" }.fail();
+    }
+
+    // Outer-most position (top=true) so the thread dim becomes core_id.
     let _ = scheduler.shift_to(rng, amount, AxisType::Thread, true, None)?;
     Ok(())
 }

@@ -18,39 +18,49 @@
 //! (ast_hash, beam_width, device_name). Caching can be disabled via
 //! the IGNORE_BEAM_CACHE environment variable.
 
-use std::time::{Duration, Instant};
+use std::sync::Arc;
+use std::time::Duration;
 
 use once_cell::sync::Lazy;
 
-use morok_ir::{AxisType, ConstValue, Op};
+use morok_ir::{AxisType, ConstValue, Op, UOp};
 
 use super::Scheduler;
 use super::config::BeamConfig;
 use super::error::*;
 use super::opts::apply_opt;
-use super::types::Opt;
+use super::types::{Opt, OptArg, OptOps};
+
+/// Minimum measurable improvement before BEAM stops iterating.
+///
+/// Default 10 ns. With kernels timing in hundreds of µs this floor
+/// effectively never fires; it exists to stop beam when improvements
+/// drop into measurement noise. Override via `BEAM_MIN_PROGRESS`
+/// (nanoseconds; `0` to disable).
+fn beam_min_progress() -> Duration {
+    static CACHED: Lazy<Duration> = Lazy::new(|| {
+        let nanos: u64 = std::env::var("BEAM_MIN_PROGRESS").ok().and_then(|s| s.parse().ok()).unwrap_or(10);
+        Duration::from_nanos(nanos)
+    });
+    *CACHED
+}
 
 // ============================================================================
 // ACTION SPACE
 // ============================================================================
 
-/// Generate thread counts that are likely to divide common tensor sizes.
+/// Thread-count amounts considered by beam search.
 ///
-/// Instead of fixed power-of-2, includes all values up to max_threads that
-/// divide common sizes (64, 128, 256, 512, 1024). This ensures beam search
-/// can find optimal thread counts for various tensor dimensions.
+/// Static set `[2,3,4,5,8,12,16,24,32,64]` filtered by `max_threads`. We don't
+/// pre-filter by divisor patterns — `apply_thread` enforces divisibility against
+/// the chosen axis at apply time, and the true divisibility depends on
+/// post-action shape.
 fn thread_action_amounts(max_threads: usize) -> Vec<usize> {
-    const COMMON_SIZES: [usize; 5] = [64, 128, 256, 512, 1024];
-
-    let mut amounts: Vec<usize> = (2..=max_threads).filter(|&t| COMMON_SIZES.iter().any(|&sz| sz % t == 0)).collect();
-    amounts.sort_unstable();
-    amounts.dedup();
-    amounts
+    const AMOUNTS: [usize; 10] = [2, 3, 4, 5, 8, 12, 16, 24, 32, 64];
+    AMOUNTS.iter().copied().filter(|&t| t <= max_threads).collect()
 }
 
 /// Pre-computed action space for beam search (~500 actions).
-///
-/// Based on tinygrad's beam search action generation.
 pub static BEAM_ACTIONS: Lazy<Vec<Opt>> = Lazy::new(|| {
     let mut actions = Vec::with_capacity(600);
 
@@ -75,6 +85,9 @@ pub static BEAM_ACTIONS: Lazy<Vec<Opt>> = Lazy::new(|| {
             actions.push(Opt::local(axis, amt));
         }
     }
+    // Hand-tuned LOCAL extras outside the grid.
+    actions.push(Opt::local(0, 32));
+    actions.push(Opt::local(6, 2));
 
     // GROUPTOP: axes 0-2, amounts [13, 16, 28, 29, 32, 49, 64, 256]
     for axis in 0..3 {
@@ -90,12 +103,15 @@ pub static BEAM_ACTIONS: Lazy<Vec<Opt>> = Lazy::new(|| {
         }
     }
 
-    // TC: tensor cores
-    // Auto-select
-    actions.push(Opt::tc(None, -1, 0, 1));
-    // Specific TCs
-    for axis in 0..9 {
-        actions.push(Opt::tc(None, axis, 2, 1));
+    // TC: tensor cores. 1 default-axis action + 9 axis variants = 10 actions.
+    // Survivors after post-compile dedup are unchanged compared to a wider
+    // brute-force enumeration because `seen_libs` collapses duplicate kernels.
+    const TC_AXIS_CHOICES: usize = 9;
+    const TC_OPT_DEFAULT: usize = 0;
+    const TC_OPT_AXIS: usize = 2;
+    actions.push(Opt::tc(Some(0), -1, TC_OPT_DEFAULT, 1));
+    for axis_choice in 0..TC_AXIS_CHOICES {
+        actions.push(Opt::tc(Some(axis_choice), -1, TC_OPT_AXIS, 1));
     }
 
     // SWAP: axis pairs
@@ -115,8 +131,10 @@ pub static BEAM_ACTIONS: Lazy<Vec<Opt>> = Lazy::new(|| {
         }
     }
 
-    // NOLOCALS
-    actions.push(Opt::nolocals());
+    // NOLOCALS — only when explicitly enabled via `MOROK_NOLOCALS`.
+    if std::env::var("MOROK_NOLOCALS").is_ok() {
+        actions.push(Opt::nolocals());
+    }
 
     actions
 });
@@ -125,37 +143,188 @@ pub static BEAM_ACTIONS: Lazy<Vec<Opt>> = Lazy::new(|| {
 // ACTION GENERATION & FILTERING
 // ============================================================================
 
-/// Generate all valid next-states from the current scheduler.
-///
-/// Applies each action from `BEAM_ACTIONS` and filters to those that:
-/// 1. Apply successfully (divisibility, bounds, etc.)
-/// 2. Pass limit checks (upcast size, local size, UOp count)
-fn generate_actions(scheduler: &Scheduler, config: &BeamConfig) -> Vec<Scheduler> {
+/// `(op, axis)` pairs that have an `arg=0` (full-axis) variant in
+/// [`BEAM_ACTIONS`]. Used by [`passes_prefilter`] to dedup the explicit
+/// `arg=axis_size` variants whenever the `arg=0` variant covers the same case.
+static FULL_AXIS_VARIANTS: Lazy<std::collections::HashSet<(OptOps, usize)>> = Lazy::new(|| {
     BEAM_ACTIONS
         .iter()
-        .filter_map(|action| {
-            // Clone scheduler and try to apply action
-            let mut candidate = scheduler.clone();
-            match apply_opt(&mut candidate, action, true) {
-                Ok(()) if validate_limits(&candidate, config) => Some(candidate),
+        .filter_map(|opt| {
+            let axis = opt.axis?;
+            match opt.arg {
+                OptArg::Int(0) => Some((opt.op, axis)),
                 _ => None,
             }
         })
         .collect()
+});
+
+/// Pre-apply filter with two early-rejects:
+///
+/// 1. The action's logical axis can't be resolved (would always fail in
+///    `apply_opt`). Skips the candidate clone+apply roundtrip.
+/// 2. The action's `arg` already equals the axis's full size AND an `arg=0`
+///    variant exists in `BEAM_ACTIONS` for the same `(op, axis)`. The two
+///    actions produce the same kernel post-codegen, so we drop the explicit
+///    one to halve dedup work.
+fn passes_prefilter(scheduler: &Scheduler, action: &Opt) -> bool {
+    // TC and NOLOCALS skip the filter — they have no logical axis.
+    if action.op == OptOps::TC || action.axis.is_none() {
+        return true;
+    }
+    // Resolve the logical axis to a real axis. Failure → action would fail
+    // at apply time; skip now.
+    let real_axis = match scheduler.real_axis(action.op, action.axis) {
+        Ok(a) if a >= 0 => a as usize,
+        _ => return false,
+    };
+    if real_axis >= scheduler.shape_len() {
+        return false;
+    }
+    // Dedup: skip if `arg == full_shape[real_axis]` and an `arg=0` variant
+    // covers the same case. Only `OptArg::Int` carries a comparable arg.
+    if let OptArg::Int(arg) = action.arg
+        && arg > 0
+        && let Some(&size) = scheduler.full_shape().get(real_axis)
+        && size as usize == arg
+        && let Some(axis) = action.axis
+        && FULL_AXIS_VARIANTS.contains(&(action.op, axis))
+    {
+        return false;
+    }
+    true
+}
+
+/// `BEAM_DEBUG=1` toggles eprintln! tracing of action survival across
+/// the prefilter/apply/limit/time stages. Cheap when disabled (one env-cached
+/// bool check per call); useful for diagnosing why an action class never wins.
+fn beam_debug_enabled() -> bool {
+    static CACHED: Lazy<bool> = Lazy::new(|| std::env::var("BEAM_DEBUG").is_ok());
+    *CACHED
+}
+
+/// Per-stage candidate counts, broken out by [`OptOps`] kind. Aggregated by
+/// [`generate_actions`] when [`beam_debug_enabled`] is on.
+#[derive(Default, Debug)]
+struct ActionStageCounts {
+    attempted: std::collections::HashMap<OptOps, usize>,
+    prefilter_dropped: std::collections::HashMap<OptOps, usize>,
+    apply_dropped: std::collections::HashMap<OptOps, usize>,
+    limit_dropped: std::collections::HashMap<OptOps, usize>,
+    survived: std::collections::HashMap<OptOps, usize>,
+}
+
+/// Generate all valid next-states from the current scheduler.
+///
+/// Applies each action from `BEAM_ACTIONS` and filters to those that:
+/// 1. Pass the cheap [`passes_prefilter`] gate (axis resolves, no arg-eq-size dup)
+/// 2. Apply successfully (divisibility, bounds, etc.)
+/// 3. Pass limit checks (upcast size, local size, UOp count)
+fn generate_actions(scheduler: &Scheduler, config: &BeamConfig) -> Vec<Scheduler> {
+    let debug = beam_debug_enabled();
+    let mut counts = ActionStageCounts::default();
+    let mut out = Vec::with_capacity(BEAM_ACTIONS.len());
+
+    for action in BEAM_ACTIONS.iter() {
+        if debug {
+            *counts.attempted.entry(action.op).or_insert(0) += 1;
+        }
+        if !passes_prefilter(scheduler, action) {
+            if debug {
+                *counts.prefilter_dropped.entry(action.op).or_insert(0) += 1;
+            }
+            continue;
+        }
+        let mut candidate = scheduler.clone();
+        match apply_opt(&mut candidate, action, true) {
+            Ok(()) => {
+                if !validate_limits(&candidate, config) {
+                    if debug {
+                        *counts.limit_dropped.entry(action.op).or_insert(0) += 1;
+                    }
+                    continue;
+                }
+                if debug {
+                    *counts.survived.entry(action.op).or_insert(0) += 1;
+                }
+                out.push(candidate);
+            }
+            Err(_) => {
+                if debug {
+                    *counts.apply_dropped.entry(action.op).or_insert(0) += 1;
+                }
+            }
+        }
+    }
+
+    if debug {
+        let ops_in_order = [
+            OptOps::TC,
+            OptOps::UPCAST,
+            OptOps::UNROLL,
+            OptOps::LOCAL,
+            OptOps::GROUP,
+            OptOps::GROUPTOP,
+            OptOps::THREAD,
+            OptOps::SWAP,
+            OptOps::PADTO,
+            OptOps::NOLOCALS,
+        ];
+        eprintln!("[beam] generate_actions: {} survivors", out.len());
+        // Print every action class, not only the ones with non-zero
+        // `attempted`. A class with `attempted=0` means the BEAM_ACTIONS
+        // static doesn't even contain that variant — useful for catching
+        // missing actions vs. catastrophically high apply/limit drops.
+        for op in ops_in_order {
+            let a = counts.attempted.get(&op).copied().unwrap_or(0);
+            let pf = counts.prefilter_dropped.get(&op).copied().unwrap_or(0);
+            let ap = counts.apply_dropped.get(&op).copied().unwrap_or(0);
+            let lim = counts.limit_dropped.get(&op).copied().unwrap_or(0);
+            let s = counts.survived.get(&op).copied().unwrap_or(0);
+            eprintln!("  {op:?}: attempted={a:3} prefilter={pf:3} apply_err={ap:3} limit={lim:3} survived={s:3}");
+        }
+    }
+
+    out
 }
 
 /// Validate that a scheduler state is within configured limits.
+///
+/// Per-candidate filter: reject if `(up_axes_prod / tc_up) > max_upcast`
+/// or `local_axes_prod > max_local`, where `tc_up = prod(tc.dims) /
+/// tc.threads` if a TC is active else 1.
+///
+/// The `tc_up` divisor accounts for the TC tile's contribution to the
+/// total UPCAST/UNROLL product — without it, applying TC immediately
+/// saturates `max_upcast` (e.g. APPLE_AMX `prod((16,16,1))/1 = 256`),
+/// blocking any post-TC UPCAST composition.
 fn validate_limits(scheduler: &Scheduler, config: &BeamConfig) -> bool {
-    // Calculate upcast size (product of UPCAST/UNROLL dimensions)
     let upcast_sz = product_of_axes(scheduler, &[AxisType::Upcast, AxisType::Unroll]);
-
-    // Calculate local size (product of LOCAL/WARP/GROUP_REDUCE dimensions)
     let local_sz = product_of_axes(scheduler, &[AxisType::Local, AxisType::Warp, AxisType::GroupReduce]);
+    let tc_up = active_tc_upcast(scheduler);
 
-    // Check UOp count
-    let uop_count = scheduler.ast().toposort().len();
+    upcast_sz / tc_up <= config.max_upcast && local_sz <= config.max_local
+}
 
-    upcast_sz <= config.max_upcast && local_sz <= config.max_local && uop_count <= config.max_uops
+/// Return `prod(tc.dims) / tc.threads` for the active TC, or 1 if none.
+///
+/// Uses `scheduler.selected_tc_index` (recorded by `apply_axis_choice_impl`)
+/// rather than guessing from the renderer's TC list. For multi-TC renderers
+/// (e.g. SM89 with f16+bf16+tf32 variants) this is the only correct
+/// accounting.
+fn active_tc_upcast(scheduler: &Scheduler) -> usize {
+    let Some(idx) = scheduler.selected_tc_index else {
+        return 1;
+    };
+    scheduler
+        .ren
+        .tensor_cores
+        .get(idx)
+        .map(|tc| {
+            let prod = tc.dims.0 * tc.dims.1 * tc.dims.2;
+            prod / tc.threads.max(1)
+        })
+        .unwrap_or(1)
 }
 
 /// Calculate product of dimension sizes for given axis types.
@@ -194,6 +363,94 @@ pub struct BeamResult {
     pub candidates_evaluated: usize,
 }
 
+/// Metrics returned by the `compile_and_time` closure for each candidate.
+///
+/// Timing drives ranking; the IR hash drives `seen_libs` dedup; the compute-op
+/// count drives the `least_compute_ops*1000` filter.
+#[derive(Debug, Clone, Copy)]
+pub struct CandidateMetrics {
+    /// Best execution timing across the run loop (`min(tms)`).
+    pub timing: Duration,
+    /// Hash of the post-codegen IR — kernels that lower to the same IR are
+    /// guaranteed to compile to the same object, so we skip duplicates.
+    pub ir_hash: u64,
+    /// Cheap upper bound on the kernel's compute work; used by the
+    /// `least_compute_ops*1000` filter to discard degenerate candidates.
+    pub compute_ops: u64,
+}
+
+/// Hash a UOp tree to a `u64` for `seen_libs` dedup.
+///
+/// Uses the pre-computed `content_hash` field on `UOp` (see
+/// `ir/src/uop/hash_consing.rs`), which is the same structural hash the
+/// hash-consing cache and `schedule_cache` rely on. O(1) — read the cached
+/// field instead of re-walking the graph.
+pub fn hash_post_codegen_ir(uop: &Arc<UOp>) -> u64 {
+    uop.content_hash
+}
+
+/// Symbolic estimate of compute ops in a kernel.
+///
+/// Each ALU/Ternary/Reduce/WMMA node contributes `prod(enclosing-RANGE sizes)`
+/// flops. Symbolic RANGE ends resolve to the midpoint of their `vmin`/`vmax`
+/// bounds (matching the `(vmax+vmin)/2` choice in the BEAM timing path), so
+/// dynamic-shape kernels participate in the `least_compute_ops*1000` bloat
+/// filter.
+pub fn compute_ops_estimate(uop: &Arc<UOp>) -> u64 {
+    let topo = uop.toposort();
+
+    // Pre-compute the size contribution of every loop-bound node — RANGE for
+    // ordinary loops, SPECIAL for hardware-provided indices.
+    let mut range_size: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
+    for node in &topo {
+        let end = match node.op() {
+            Op::Range { end, .. } => Some(end),
+            Op::Special { end, .. } => Some(end),
+            _ => None,
+        };
+        if let Some(end) = end {
+            range_size.insert(node.id, range_size_estimate(end));
+        }
+    }
+
+    // Each ALU/Reduce/WMMA accumulates `prod(in-scope range sizes)`. Backward
+    // slice membership tells us which RANGEs the node sits inside, mirroring
+    // tinygrad's `mult_stack` discipline structurally.
+    let mut flops: u64 = 0;
+    for node in &topo {
+        let is_alu =
+            matches!(node.op(), Op::Binary(..) | Op::Unary(..) | Op::Ternary(..) | Op::Reduce { .. } | Op::Wmma { .. });
+        if !is_alu {
+            continue;
+        }
+        let bws = node.backward_slice_ids();
+        let mut weight: u64 = 1;
+        for (rid, sz) in &range_size {
+            if bws.contains(rid) {
+                weight = weight.saturating_mul(*sz);
+            }
+        }
+        flops = flops.saturating_add(weight);
+    }
+    flops
+}
+
+/// Estimate a RANGE end's iteration count.
+///
+/// Concrete `Const(Int)` ends use the value directly; everything else falls
+/// back to the midpoint of the `end` UOp's symbolic `vmin`/`vmax` bounds, so
+/// dynamic-shape ranges still contribute a representative number of flops.
+fn range_size_estimate(end: &Arc<UOp>) -> u64 {
+    if let Op::Const(cv) = end.op()
+        && let Some(v) = cv.0.try_int()
+    {
+        return (v.max(1)) as u64;
+    }
+    let vmin = end.vmin().try_int().unwrap_or(1);
+    let vmax = end.vmax().try_int().unwrap_or(vmin);
+    (((vmin + vmax) / 2).max(1)) as u64
+}
+
 /// Run beam search optimization.
 ///
 /// # Arguments
@@ -210,11 +467,11 @@ pub struct BeamResult {
 ///
 /// ```ignore
 /// let config = BeamConfig::default();
-/// let compile_and_time = |s: &Scheduler| {
+/// let compile_and_time = |s: &Scheduler, early_stop: Option<Duration>| {
 ///     let ast = s.get_optimized_ast(None);
 ///     let kernel = compile_kernel(&ast)?;
-///     let timing = benchmark_kernel(&kernel)?;
-///     Some(timing)
+///     let bench = benchmark_kernel(&kernel, ..., early_stop)?;
+///     Some(CandidateMetrics { timing: bench.min, ir_hash: ..., compute_ops: ... })
 /// };
 ///
 /// let result = beam_search(scheduler, &config, compile_and_time)?;
@@ -222,17 +479,27 @@ pub struct BeamResult {
 /// ```
 pub fn beam_search<F>(scheduler: Scheduler, config: &BeamConfig, compile_and_time: F) -> Result<BeamResult, OptError>
 where
-    F: Fn(&Scheduler) -> Option<Duration> + Sync,
+    F: Fn(&Scheduler, Option<Duration>) -> Option<CandidateMetrics> + Sync,
 {
-    let start = Instant::now();
     let mut iterations = 0;
     let mut candidates_evaluated = 0;
 
-    // Initialize beam with starting state
-    let initial_timing = compile_and_time(&scheduler).unwrap_or(Duration::MAX);
-    let mut beam: Vec<(Scheduler, Duration)> = vec![(scheduler.clone(), initial_timing)];
+    // Initialize beam with `Duration::MAX` so the first iteration has no
+    // incumbent to beat. Avoids one wasted compile+time per `beam_search`
+    // invocation (also charged on cache replay through `OPT_CACHE`).
+    let mut beam: Vec<(Scheduler, Duration)> = vec![(scheduler.clone(), Duration::MAX)];
 
-    while start.elapsed() < config.timeout {
+    // `seen_libs` and `least_compute_ops` persist across the entire beam
+    // search. Identity-keyed dedup carries across iterations, so a kernel
+    // produced at iter N and re-produced (via a different opt order) at
+    // iter N+1 only gets compiled+timed once.
+    let mut seen_libs: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    let mut least_compute_ops: u64 = u64::MAX;
+
+    // No total search budget; terminates on empty candidate set, empty timed
+    // list, `min_progress` floor, or sub-noise gain. Per-candidate compile
+    // budgets live separately in `compile_and_time`'s thread+timeout wrapper.
+    loop {
         iterations += 1;
 
         // 1. EXPAND: Generate all valid next states from current beam (sequential)
@@ -243,120 +510,88 @@ where
             break;
         }
 
+        // Reject any candidate whose first run already exceeds 3× the current beam best.
+        let beam_best = beam.first().map(|(_, t)| *t);
+        let early_stop = beam_best.and_then(|t| t.checked_mul(3));
+
         // 2. COMPILE & TIME: Evaluate performance
-        // The compile_and_time function should handle parallelism internally if needed
-        let timed: Vec<(Scheduler, Duration)> = candidates
-            .into_iter()
-            .filter_map(|s| {
-                let timing = compile_and_time(&s)?;
-                Some((s, timing))
-            })
-            .collect();
+        let mut timed: Vec<(Scheduler, Duration)> = Vec::new();
+        for s in candidates {
+            let Some(metrics) = compile_and_time(&s, early_stop) else { continue };
+
+            if !seen_libs.insert(metrics.ir_hash) {
+                continue;
+            }
+            least_compute_ops = least_compute_ops.min(metrics.compute_ops);
+            if least_compute_ops.saturating_mul(1000) < metrics.compute_ops {
+                continue;
+            }
+
+            timed.push((s, metrics.timing));
+        }
 
         candidates_evaluated += timed.len();
 
         if timed.is_empty() {
             break;
+        }
+
+        if beam_debug_enabled() {
+            // Bucket survivors by the *last* applied opt (the one this iteration
+            // just stacked on). Useful for spotting "TC compiled but lost on
+            // timing vs UPCAST" vs "TC never survived to timing at all".
+            let mut by_op: std::collections::HashMap<OptOps, (usize, Duration)> = std::collections::HashMap::new();
+            for (s, t) in &timed {
+                if let Some(opt) = s.applied_opts.last() {
+                    let entry = by_op.entry(opt.op).or_insert((0, Duration::MAX));
+                    entry.0 += 1;
+                    if *t < entry.1 {
+                        entry.1 = *t;
+                    }
+                }
+            }
+            eprintln!("[beam iter {iterations}] timed survivors by last-op (count, best):");
+            let ops_in_order = [
+                OptOps::TC,
+                OptOps::UPCAST,
+                OptOps::UNROLL,
+                OptOps::LOCAL,
+                OptOps::GROUP,
+                OptOps::GROUPTOP,
+                OptOps::THREAD,
+            ];
+            for op in ops_in_order {
+                if let Some((cnt, best)) = by_op.get(&op) {
+                    eprintln!("  {op:?}: count={cnt:3} best={best:?}");
+                }
+            }
         }
 
         // 3. SORT: Sort by timing (best first)
         let mut sorted = timed;
         sorted.sort_by_key(|(_, t)| *t);
 
-        // 4. CHECK TERMINATION: No improvement
+        // 4. CHECK TERMINATION — exit when the new best is already below
+        //    the progress floor (fast-enough kernel) OR when the gain over
+        //    the incumbent is sub-noise. Sub-noise gains don't justify a
+        //    next compile round.
         let best_new = sorted[0].1;
         let best_old = beam.first().map(|(_, t)| *t).unwrap_or(Duration::MAX);
+        let min_progress = beam_min_progress();
+        let absolute_floor = best_new < min_progress;
+        let no_real_gain = best_old.saturating_sub(best_new) < min_progress;
 
-        if best_new >= best_old {
-            // No improvement - stop
+        if absolute_floor || no_real_gain {
+            // When exiting AND we did improve, pin the beam to the single
+            // new winner so callers see it.
+            if best_new < best_old {
+                beam = sorted.into_iter().take(1).collect();
+            }
             break;
         }
 
         // 5. PRUNE: Keep top K by timing
         beam = sorted.into_iter().take(config.beam_width).collect();
-
-        // Memory management: With weak references in the UOp cache (Tinygrad-aligned),
-        // discarded candidates are automatically cleaned up when their Arcs are dropped.
-        // No manual GC calls needed.
-    }
-
-    // Return best result
-    let (best_scheduler, best_timing) = beam.into_iter().next().unwrap_or((scheduler, Duration::MAX));
-
-    Ok(BeamResult { scheduler: best_scheduler, timing: best_timing, iterations, candidates_evaluated })
-}
-
-/// Run beam search with timeout check per iteration.
-///
-/// Similar to `beam_search` but includes additional timeout checks
-/// to avoid long-running searches and early cutoff for slow candidates.
-pub fn beam_search_with_timeout<F>(
-    scheduler: Scheduler,
-    config: &BeamConfig,
-    compile_and_time: F,
-) -> Result<BeamResult, OptError>
-where
-    F: Fn(&Scheduler) -> Option<Duration> + Sync,
-{
-    let start = Instant::now();
-    let mut iterations = 0;
-    let mut candidates_evaluated = 0;
-
-    let initial_timing = compile_and_time(&scheduler).unwrap_or(Duration::MAX);
-    let mut beam: Vec<(Scheduler, Duration)> = vec![(scheduler.clone(), initial_timing)];
-
-    // Early termination threshold (3x the best time so far)
-    let mut cutoff = initial_timing.saturating_mul(3);
-
-    while start.elapsed() < config.timeout {
-        iterations += 1;
-
-        // Check timeout before expansion
-        if start.elapsed() > config.timeout {
-            break;
-        }
-
-        let candidates: Vec<Scheduler> = beam.iter().flat_map(|(s, _)| generate_actions(s, config)).collect();
-
-        if candidates.is_empty() {
-            break;
-        }
-
-        // Time with cutoff for early termination
-        let timed: Vec<(Scheduler, Duration)> = candidates
-            .into_iter()
-            .filter_map(|s| {
-                let timing = compile_and_time(&s)?;
-                // Skip if clearly worse than cutoff
-                if timing > cutoff {
-                    return None;
-                }
-                Some((s, timing))
-            })
-            .collect();
-
-        candidates_evaluated += timed.len();
-
-        if timed.is_empty() {
-            break;
-        }
-
-        let mut sorted = timed;
-        sorted.sort_by_key(|(_, t)| *t);
-
-        let best_new = sorted[0].1;
-        let best_old = beam.first().map(|(_, t)| *t).unwrap_or(Duration::MAX);
-
-        if best_new >= best_old {
-            break;
-        }
-
-        // Update cutoff based on new best
-        cutoff = best_new.saturating_mul(3);
-
-        beam = sorted.into_iter().take(config.beam_width).collect();
-
-        // Memory management: With weak refs, discarded candidates are auto-cleaned.
     }
 
     let (best_scheduler, best_timing) = beam.into_iter().next().unwrap_or((scheduler, Duration::MAX));
@@ -398,14 +633,24 @@ static CACHE_DB: Lazy<Option<sled::Db>> = Lazy::new(|| {
 });
 
 /// Cache key for beam search results.
+///
+/// Includes the limit configuration (max_upcast, max_local, max_uops) so that
+/// changing caps invalidates cached entries: replaying opts produced under a
+/// looser cap could reintroduce a kernel that no longer satisfies the new cap.
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 struct CacheKey {
     /// Hash of the AST structure.
     ast_hash: u64,
     /// Beam width used for search.
     beam_width: usize,
-    /// Device name (e.g., "cpu", "cuda").
-    device: String,
+    /// Renderer/TC backend.
+    device: morok_ir::RendererDevice,
+    /// Upcast/unroll product cap at search time.
+    max_upcast: usize,
+    /// Local/warp/group_reduce product cap at search time.
+    max_local: usize,
+    /// UOp count cap at search time.
+    max_uops: usize,
 }
 
 impl CacheKey {
@@ -419,15 +664,26 @@ impl CacheKey {
         scheduler.ast().hash(&mut hasher);
         let ast_hash = hasher.finish();
 
-        Self { ast_hash, beam_width: config.beam_width, device: scheduler.ren.device.clone() }
+        Self {
+            ast_hash,
+            beam_width: config.beam_width,
+            device: scheduler.ren.device,
+            max_upcast: config.max_upcast,
+            max_local: config.max_local,
+            max_uops: config.max_uops,
+        }
     }
 
     /// Convert to bytes for database key.
     fn to_bytes(&self) -> Vec<u8> {
-        let mut bytes = Vec::with_capacity(24);
+        let device_str = self.device.canonical();
+        let mut bytes = Vec::with_capacity(48 + device_str.len());
         bytes.extend_from_slice(&self.ast_hash.to_le_bytes());
         bytes.extend_from_slice(&self.beam_width.to_le_bytes());
-        bytes.extend_from_slice(self.device.as_bytes());
+        bytes.extend_from_slice(&self.max_upcast.to_le_bytes());
+        bytes.extend_from_slice(&self.max_local.to_le_bytes());
+        bytes.extend_from_slice(&self.max_uops.to_le_bytes());
+        bytes.extend_from_slice(device_str.as_bytes());
         bytes
     }
 }
@@ -488,7 +744,7 @@ pub fn beam_search_cached<F>(
     compile_and_time: F,
 ) -> Result<BeamResult, OptError>
 where
-    F: Fn(&Scheduler) -> Option<Duration> + Sync,
+    F: Fn(&Scheduler, Option<Duration>) -> Option<CandidateMetrics> + Sync,
 {
     let key = CacheKey::from_scheduler(&scheduler, config);
 
@@ -497,12 +753,17 @@ where
         && let Some(cached_opts) = cache_get(&key)
     {
         // Replay cached optimizations. If replay fails (stale entry from code changes),
-        // invalidate and fall through to fresh search.
+        // or the replayed scheduler exceeds the current limits (looser cap at search
+        // time, tighter cap now), invalidate and fall through to fresh search.
         tracing::info!(opts_count = cached_opts.len(), "Beam cache HIT - replaying opts");
         match replay_opts(scheduler.clone(), &cached_opts) {
-            Ok(replayed) => {
-                let timing = compile_and_time(&replayed).unwrap_or(Duration::MAX);
+            Ok(replayed) if validate_limits(&replayed, config) => {
+                let timing = compile_and_time(&replayed, None).map(|m| m.timing).unwrap_or(Duration::MAX);
                 return Ok(BeamResult { scheduler: replayed, timing, iterations: 0, candidates_evaluated: 0 });
+            }
+            Ok(_) => {
+                tracing::warn!("Beam cache replayed scheduler violates limits - invalidating");
+                cache_invalidate(&key);
             }
             Err(e) => {
                 tracing::warn!(?e, "Beam cache replay failed (stale entry?) - invalidating");
@@ -533,252 +794,5 @@ pub fn clear_cache() {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::super::types::OptOps;
-    use super::*;
-
-    #[test]
-    fn test_beam_config_default() {
-        let config = BeamConfig::default();
-        assert_eq!(config.beam_width, 4);
-        assert_eq!(config.timeout, Duration::from_secs(60));
-        assert_eq!(config.max_upcast, 256);
-        assert_eq!(config.max_local, 1024);
-    }
-
-    #[test]
-    fn test_beam_actions_not_empty() {
-        assert!(!BEAM_ACTIONS.is_empty());
-        // Should have a reasonable number of actions
-        // UPCAST: 8 axes * 6 amounts = 48
-        // UNROLL: 5 axes * 3 amounts = 15
-        // LOCAL: 6 axes * 7 amounts = 42
-        // GROUPTOP: 3 axes * 8 amounts = 24
-        // GROUP: 3 axes * 4 amounts = 12
-        // TC: 1 + 9 = 10
-        // SWAP: 10 pairs
-        // NOLOCALS: 1
-        // Total: ~162 actions
-        assert!(BEAM_ACTIONS.len() > 100, "Expected >100 actions, got {}", BEAM_ACTIONS.len());
-        assert!(BEAM_ACTIONS.len() < 500, "Expected <500 actions, got {}", BEAM_ACTIONS.len());
-    }
-
-    #[test]
-    fn test_beam_actions_contains_expected_types() {
-        let has_upcast = BEAM_ACTIONS.iter().any(|a| a.op == OptOps::UPCAST);
-        let has_local = BEAM_ACTIONS.iter().any(|a| a.op == OptOps::LOCAL);
-        let has_unroll = BEAM_ACTIONS.iter().any(|a| a.op == OptOps::UNROLL);
-        let has_tc = BEAM_ACTIONS.iter().any(|a| a.op == OptOps::TC);
-        let has_swap = BEAM_ACTIONS.iter().any(|a| a.op == OptOps::SWAP);
-        let has_nolocals = BEAM_ACTIONS.iter().any(|a| a.op == OptOps::NOLOCALS);
-
-        assert!(has_upcast);
-        assert!(has_local);
-        assert!(has_unroll);
-        assert!(has_tc);
-        assert!(has_swap);
-        assert!(has_nolocals);
-    }
-
-    #[test]
-    fn test_beam_search_with_mock_scoring() {
-        use super::super::renderer::Renderer;
-        use morok_ir::UOp;
-
-        // Create a simple scheduler
-        let val = UOp::native_const(1.0f32);
-        let sink = UOp::sink(vec![val]);
-        let renderer = Renderer::cpu();
-        let scheduler = Scheduler::new(sink, renderer);
-
-        let config = BeamConfig { beam_width: 2, timeout: Duration::from_millis(100), ..Default::default() };
-
-        // Mock scoring: just return a constant time
-        let mock_score = |_s: &Scheduler| Some(Duration::from_micros(100));
-
-        let result = beam_search(scheduler, &config, mock_score);
-        assert!(result.is_ok());
-
-        let result = result.unwrap();
-        assert!(result.iterations > 0 || result.candidates_evaluated == 0);
-    }
-
-    #[test]
-    fn test_validate_limits() {
-        use super::super::renderer::Renderer;
-        use morok_ir::UOp;
-
-        let val = UOp::native_const(1.0f32);
-        let sink = UOp::sink(vec![val]);
-        let renderer = Renderer::cpu();
-        let scheduler = Scheduler::new(sink, renderer);
-
-        let config = BeamConfig::default();
-
-        // Simple scheduler should pass limits
-        assert!(validate_limits(&scheduler, &config));
-
-        // With very restrictive limits
-        let strict_config = BeamConfig { max_upcast: 1, max_local: 1, max_uops: 1, ..Default::default() };
-
-        // May or may not pass depending on UOp count
-        let _result = validate_limits(&scheduler, &strict_config);
-    }
-
-    #[test]
-    fn test_replay_opts_empty() {
-        use super::super::renderer::Renderer;
-        use morok_ir::UOp;
-
-        let val = UOp::native_const(1.0f32);
-        let sink = UOp::sink(vec![val]);
-        let renderer = Renderer::cpu();
-        let scheduler = Scheduler::new(sink, renderer);
-
-        // Empty replay should succeed
-        let result = replay_opts(scheduler, &[]);
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn test_serialize_deserialize_opts_empty() {
-        let opts: Vec<Opt> = vec![];
-        let serialized = serialize_opts(&opts);
-        let deserialized = deserialize_opts(&serialized);
-
-        assert!(deserialized.is_some());
-        assert!(deserialized.unwrap().is_empty());
-    }
-
-    #[test]
-    fn test_serialize_deserialize_opts_upcast() {
-        let opts = vec![Opt::upcast(0, 4), Opt::upcast(1, 8)];
-        let serialized = serialize_opts(&opts);
-        let deserialized = deserialize_opts(&serialized);
-
-        assert!(deserialized.is_some());
-        let result = deserialized.unwrap();
-        assert_eq!(result.len(), 2);
-        assert_eq!(result[0].op, OptOps::UPCAST);
-        assert_eq!(result[0].axis, Some(0));
-        assert_eq!(result[1].op, OptOps::UPCAST);
-        assert_eq!(result[1].axis, Some(1));
-    }
-
-    #[test]
-    fn test_serialize_deserialize_opts_tc() {
-        use super::super::types::OptArg;
-
-        let opts = vec![Opt::tc(None, -1, 2, 1)];
-        let serialized = serialize_opts(&opts);
-        let deserialized = deserialize_opts(&serialized);
-
-        assert!(deserialized.is_some());
-        let result = deserialized.unwrap();
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].op, OptOps::TC);
-        assert_eq!(result[0].axis, None);
-        if let OptArg::TensorCore { tc_select, opt_level, use_tc } = &result[0].arg {
-            assert_eq!(*tc_select, -1);
-            assert_eq!(*opt_level, 2);
-            assert_eq!(*use_tc, 1);
-        } else {
-            panic!("Expected TensorCore arg");
-        }
-    }
-
-    #[test]
-    fn test_serialize_deserialize_opts_swap() {
-        use super::super::types::OptArg;
-
-        let opts = vec![Opt::swap(0, 2)];
-        let serialized = serialize_opts(&opts);
-        let deserialized = deserialize_opts(&serialized);
-
-        assert!(deserialized.is_some());
-        let result = deserialized.unwrap();
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].op, OptOps::SWAP);
-        assert_eq!(result[0].axis, Some(0));
-        if let OptArg::Swap { other_axis } = &result[0].arg {
-            assert_eq!(*other_axis, 2);
-        } else {
-            panic!("Expected Swap arg");
-        }
-    }
-
-    #[test]
-    fn test_serialize_deserialize_opts_mixed() {
-        let opts = vec![Opt::upcast(0, 4), Opt::local(1, 16), Opt::unroll(0, 8), Opt::nolocals()];
-        let serialized = serialize_opts(&opts);
-        let deserialized = deserialize_opts(&serialized);
-
-        assert!(deserialized.is_some());
-        let result = deserialized.unwrap();
-        assert_eq!(result.len(), 4);
-        assert_eq!(result[0].op, OptOps::UPCAST);
-        assert_eq!(result[1].op, OptOps::LOCAL);
-        assert_eq!(result[2].op, OptOps::UNROLL);
-        assert_eq!(result[3].op, OptOps::NOLOCALS);
-    }
-
-    #[test]
-    fn test_beam_actions_contains_thread() {
-        let has_thread = BEAM_ACTIONS.iter().any(|a| a.op == OptOps::THREAD);
-        assert!(has_thread, "BEAM_ACTIONS should contain THREAD actions");
-
-        // Count thread actions
-        let thread_count = BEAM_ACTIONS.iter().filter(|a| a.op == OptOps::THREAD).count();
-        assert!(thread_count >= 6, "Expected at least 6 THREAD actions (3 axes × 2+ amounts), got {}", thread_count);
-    }
-
-    #[test]
-    fn test_thread_action_applied_to_outer_axis() {
-        use super::super::renderer::Renderer;
-        use morok_ir::{AxisId, AxisType, UOp};
-
-        // Create a kernel with Outer axis (like matmul reduce kernels)
-        let end_512 = UOp::index_const(512);
-        let r_outer = UOp::range_axis(end_512, AxisId::Renumbered(0), AxisType::Outer);
-        let compute = UOp::native_const(1.0f32);
-        let sink = UOp::sink(vec![compute, r_outer]);
-
-        let renderer = Renderer::cpu();
-        let scheduler = Scheduler::new(sink, renderer);
-
-        // Verify renderer supports threading
-        assert!(scheduler.renderer().has_threads, "CPU renderer should have has_threads=true");
-
-        // Try to apply THREAD opt - use available parallelism to work on machines with few cores
-        let thread_count = std::thread::available_parallelism().map(|p| p.get()).unwrap_or(4);
-        let mut test_scheduler = scheduler.clone();
-        let result = apply_opt(&mut test_scheduler, &Opt::thread(0, thread_count), true);
-        assert!(result.is_ok(), "THREAD(0, {}) should succeed on Outer axis: {:?}", thread_count, result);
-
-        // Verify Thread axis was created
-        let thread_axes = test_scheduler.axes_of(&[AxisType::Thread]);
-        assert!(!thread_axes.is_empty(), "Should have Thread axis after THREAD opt");
-    }
-
-    #[test]
-    fn test_generate_actions_includes_thread_for_cpu() {
-        use super::super::renderer::Renderer;
-        use morok_ir::{AxisId, AxisType, UOp};
-
-        // Create a kernel with Outer axis
-        let end_512 = UOp::index_const(512);
-        let r_outer = UOp::range_axis(end_512, AxisId::Renumbered(0), AxisType::Outer);
-        let compute = UOp::native_const(1.0f32);
-        let sink = UOp::sink(vec![compute, r_outer]);
-
-        let renderer = Renderer::cpu();
-        let scheduler = Scheduler::new(sink, renderer);
-
-        let config = BeamConfig::default();
-        let candidates = generate_actions(&scheduler, &config);
-
-        // Check if any candidate has a Thread axis
-        let has_threaded = candidates.iter().any(|s| !s.axes_of(&[AxisType::Thread]).is_empty());
-        assert!(has_threaded, "generate_actions should produce candidates with Thread axes for CPU");
-    }
-}
+#[path = "../test/unit/optimizer/beam_internal.rs"]
+mod tests;
