@@ -59,6 +59,11 @@ impl Tensor {
             try_le => try_cmple,
             try_gt => try_cmpgt,
             try_ge => try_cmpge,
+            try_bitor => try_or_op,
+            try_bitand => try_and_op,
+            try_bitxor => try_xor_op,
+            try_shl => try_shl_op,
+            try_shr => try_shr_op,
         }
         unary_infallible {
             try_neg => neg,
