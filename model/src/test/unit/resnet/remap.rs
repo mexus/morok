@@ -1,6 +1,6 @@
 use morok_tensor::Tensor;
 
-use crate::resnet::remap::fold_batchnorm;
+use crate::blocks::remap::fold_batchnorm;
 use crate::state::StateDict;
 
 fn tensor_f32(values: &[f32]) -> Tensor {

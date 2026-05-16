@@ -1,3 +1,5 @@
+use crate::blocks::BlockKind;
+
 /// Canonical ResNet depths. The depth selects both the block type and the
 /// per-stage block count schedule used by the original paper.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -7,24 +9,6 @@ pub enum ResNetDepth {
     R50,
     R101,
     R152,
-}
-
-/// Which residual block class is used in a given stage.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub enum BlockKind {
-    /// Two 3×3 convs per block, no channel expansion.
-    Basic,
-    /// 1×1 → 3×3 → 1×1 bottleneck, 4× channel expansion.
-    Bottleneck,
-}
-
-impl BlockKind {
-    pub fn expansion(self) -> usize {
-        match self {
-            BlockKind::Basic => 1,
-            BlockKind::Bottleneck => 4,
-        }
-    }
 }
 
 impl ResNetDepth {

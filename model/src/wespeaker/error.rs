@@ -13,18 +13,24 @@ pub enum Error {
         #[snafu(source(from(crate::state::Error, Box::new)))]
         source: Box<crate::state::Error>,
     },
+    #[snafu(display("{source}"))]
+    Blocks {
+        #[snafu(source(from(crate::blocks::Error, Box::new)))]
+        source: Box<crate::blocks::Error>,
+    },
     #[snafu(display("hub error: {source}"))]
     Hub { source: hf_hub::api::sync::ApiError },
-    #[snafu(display("invalid resnet config: {message}"))]
-    Config { message: String },
+    #[snafu(display("{source}"))]
+    Pickle {
+        #[snafu(source(from(super::pickle::Error, Box::new)))]
+        source: Box<super::pickle::Error>,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
 
 impl From<crate::blocks::Error> for Error {
     fn from(e: crate::blocks::Error) -> Self {
-        match e {
-            crate::blocks::Error::Tensor { source } => Error::Tensor { source },
-        }
+        Error::Blocks { source: Box::new(e) }
     }
 }
