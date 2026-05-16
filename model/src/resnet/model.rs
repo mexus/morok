@@ -22,12 +22,11 @@ use morok_ir::SInt;
 use morok_tensor::{BoundVariable, Tensor};
 use snafu::ResultExt;
 
+use crate::blocks::{BatchNormWeights, Conv2dWeights, ResidualStage, remap};
 use crate::state::{self, HasStateDict, StateDict, get_tensor};
 
 use super::config::{OutputMode, ResNetConfig, ResNetDepth};
 use super::error::{HubSnafu, Result, StateSnafu, TensorSnafu};
-use super::layers::{BatchNormWeights, Conv2dWeights, ResidualStage};
-use super::remap;
 
 /// Image classification / feature backbone. Construct via one of the loaders
 /// ([`ResNet::from_hub`], [`ResNet::from_safetensors`], or

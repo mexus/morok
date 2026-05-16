@@ -9,3 +9,4 @@ mod resnet;
 mod splitter;
 mod state;
 mod transcribe;
+mod wespeaker;

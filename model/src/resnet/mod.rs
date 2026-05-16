@@ -36,11 +36,10 @@
 mod config;
 mod error;
 mod jit;
-mod layers;
 mod model;
-pub(crate) mod remap;
 
-pub use config::{BlockKind, OutputMode, ResNetConfig, ResNetDepth};
+pub use crate::blocks::BlockKind;
+pub use config::{OutputMode, ResNetConfig, ResNetDepth};
 pub use error::{Error, Result};
 pub use jit::ResNetJit;
 pub use model::ResNet;
