@@ -37,6 +37,14 @@ impl Tensor {
             }
         );
 
+        // TODO(symbolic-batch): both `to_vec_usize` calls require every dim of
+        // both `self` and `index` to be concrete. The arithmetic that uses
+        // them — the size-comparison loop and the `shrink` bounds — only
+        // needs the dims along which we shrink, not the symbolic prefix
+        // (typically a JIT batch bound to a `BoundVariable`). The symbolic
+        // dim could be passed through as `SInt`, and the comparison could be
+        // restricted to dims that are concrete on both sides. As-is, gather
+        // is unusable on tensors whose shape contains any symbolic dim.
         let self_dims = morok_ir::shape::to_vec_usize(&self_shape).context(UOpSnafu)?;
         let index_dims = morok_ir::shape::to_vec_usize(&index_shape).context(UOpSnafu)?;
 
@@ -68,6 +76,10 @@ impl Tensor {
         let self_shape = self.shape()?;
         let ndim = self_shape.len();
         let dim = Self::normalize_axis(dim, ndim)?;
+        // TODO(symbolic-batch): `self_dims` is consumed only to build
+        // `expand_shape` below (line 90). Forcing every dim through `usize`
+        // makes this unusable when the input has a symbolic dim (e.g. a JIT
+        // batch). The same SInt-aware `try_expand` shape would suffice.
         let self_dims = morok_ir::shape::to_vec_usize(&self_shape).context(UOpSnafu)?;
 
         // Reshape 1D index [K] → [1, ..., K, ..., 1] matching input ndim
