@@ -57,6 +57,7 @@ pub mod math;
 pub mod matmul;
 pub mod memory_planner;
 pub mod nn;
+pub mod rand;
 pub mod realize;
 pub mod reduce;
 pub mod schedule;
@@ -567,11 +568,141 @@ impl Tensor {
         Ok(outputs.into_iter().map(Self::from_lazy).collect())
     }
 
-    /// Bitcast tensor to a different dtype (reinterpret bits, same byte size required).
+    /// Bitcast tensor to a different dtype, reinterpreting bits.
+    ///
+    /// For equal-itemsize dtypes (e.g. `f32 ↔ i32`) this is the pure
+    /// IR-level reinterpretation. For different-itemsize dtypes (e.g.
+    /// `u32 → u16` or `u32 → u64`) the last axis is split or combined via
+    /// shifts + reshape, matching Tinygrad's `tensor.py::bitcast`. The total
+    /// byte count is preserved; the last axis grows (`src_size > dst_size`)
+    /// or shrinks (`src_size < dst_size`) by `rate = max(...)/min(...)`.
+    ///
+    /// Requires:
+    /// - source and destination are both scalar (vector dtypes unsupported);
+    /// - `(shape[-1] * src_size)` divides evenly by `dst_size`;
+    /// - the last shape dim is concrete (not symbolic).
     pub fn bitcast(&self, dtype: morok_dtype::DType) -> Result<Self> {
-        Ok(Self::new(self.uop().bitcast(dtype)))
-    }
+        let src_dt = self.uop().dtype();
+        let src_scalar = src_dt.scalar().ok_or_else(|| Error::SymbolicShapeUnsupported {
+            operation: "bitcast: non-scalar source dtype".to_string(),
+        })?;
+        let dst_scalar = dtype.scalar().ok_or_else(|| Error::SymbolicShapeUnsupported {
+            operation: "bitcast: non-scalar destination dtype".to_string(),
+        })?;
+        let src_size = src_scalar.bytes();
+        let dst_size = dst_scalar.bytes();
 
+        if src_size == dst_size {
+            return Ok(Self::new(self.uop().bitcast(dtype)));
+        }
+
+        let shape = self.shape()?;
+        let last_dim = shape.last().and_then(|s| s.as_const()).ok_or_else(|| Error::SymbolicShapeUnsupported {
+            operation: "bitcast with size change on symbolic last dim".to_string(),
+        })?;
+        if last_dim * src_size % dst_size != 0 {
+            return Err(Error::ReshapeSizeMismatch {
+                operation: format!(
+                    "bitcast {src_scalar:?}({src_size}B) → {dst_scalar:?}({dst_size}B): \
+                     last dim {last_dim} × {src_size} not divisible by {dst_size}"
+                ),
+            });
+        }
+
+        let src_uint = DType::Scalar(uint_for_bytes(src_size));
+        let dst_uint = DType::Scalar(uint_for_bytes(dst_size));
+
+        // Reinterpret as the source-sized uint first (always equal-size, falls
+        // into the identity path above).
+        let tmp = if src_dt == src_uint { self.clone() } else { Self::new(self.uop().bitcast(src_uint.clone())) };
+
+        let result = if dst_size > src_size {
+            // Combine `rate` source words into one dst word: shift each by
+            // `8*i*src_size`, OR them, squeeze the trailing axis.
+            let rate = dst_size / src_size;
+            let mut new_shape: Vec<isize> = morok_ir::shape::to_vec_isize(&shape).context(UOpSnafu)?;
+            let last_idx = new_shape.len() - 1;
+            new_shape[last_idx] = (last_dim / rate) as isize;
+            new_shape.push(rate as isize);
+            let reshaped = tmp.try_reshape(&new_shape)?;
+
+            let mut acc: Option<Tensor> = None;
+            for i in 0..rate {
+                // Slice the trailing axis to `(i, i+1)` (preserves rank).
+                let mut shrink_ranges: Vec<Option<(isize, isize)>> =
+                    std::iter::repeat_n(None, new_shape.len() - 1).collect();
+                shrink_ranges.push(Some((i as isize, (i + 1) as isize)));
+                let slice = reshaped.try_shrink(shrink_ranges)?;
+                let widened = slice.cast(dst_uint.clone())?;
+                let shift_amount = 8 * i * src_size;
+                let term = if shift_amount == 0 {
+                    widened
+                } else {
+                    let shift_t = Tensor::full(
+                        &morok_ir::shape::to_vec_usize(&widened.shape()?).context(UOpSnafu)?,
+                        ConstValue::UInt(shift_amount as u64),
+                        dst_uint.clone(),
+                    )?;
+                    widened.try_shl(&shift_t)?
+                };
+                acc = Some(match acc {
+                    None => term,
+                    Some(a) => a.try_bitor(&term)?,
+                });
+            }
+            let summed = acc.expect("rate >= 1");
+            // Squeeze the trailing axis (now size 1).
+            summed.try_squeeze(Some(-1))?
+        } else {
+            // Split each source word into `rate` dst words via right shifts,
+            // stack along a new trailing axis, then flatten the last two.
+            let rate = src_size / dst_size;
+            let mut shifted: Vec<Tensor> = Vec::with_capacity(rate);
+            for i in 0..rate {
+                let shift_amount = 8 * i * dst_size;
+                let s = if shift_amount == 0 {
+                    tmp.clone()
+                } else {
+                    let shift_t = Tensor::full(
+                        &morok_ir::shape::to_vec_usize(&tmp.shape()?).context(UOpSnafu)?,
+                        ConstValue::UInt(shift_amount as u64),
+                        src_uint.clone(),
+                    )?;
+                    tmp.try_shr(&shift_t)?
+                };
+                shifted.push(s);
+            }
+            let refs: Vec<&Tensor> = shifted.iter().collect();
+            let stacked = Tensor::stack(&refs, -1)?;
+            // Collapse trailing two axes (... × last × rate) → (... × last*rate).
+            let stacked_shape = stacked.shape()?;
+            let nd = stacked_shape.len();
+            let mut new_shape: Vec<isize> = morok_ir::shape::to_vec_isize(&stacked_shape).context(UOpSnafu)?;
+            let trailing = new_shape[nd - 2] * new_shape[nd - 1];
+            new_shape.truncate(nd - 2);
+            new_shape.push(trailing);
+            let flat = stacked.try_reshape(&new_shape)?;
+            flat.cast(dst_uint.clone())?
+        };
+
+        // Final reinterpretation at equal size (e.g. u16 → f16).
+        if result.uop().dtype() == dtype { Ok(result) } else { Ok(Self::new(result.uop().bitcast(dtype))) }
+    }
+}
+
+fn uint_for_bytes(n: usize) -> morok_dtype::ScalarDType {
+    use morok_dtype::ScalarDType;
+    match n {
+        1 => ScalarDType::UInt8,
+        2 => ScalarDType::UInt16,
+        4 => ScalarDType::UInt32,
+        8 => ScalarDType::UInt64,
+        _ => panic!("uint_for_bytes: unsupported byte size {n}"),
+    }
+}
+
+#[allow(dead_code)]
+impl Tensor {
     /// Assign a value tensor to this tensor in-place.
     ///
     /// Embeds the write as `AFTER(target, STORE(target, value))`.
