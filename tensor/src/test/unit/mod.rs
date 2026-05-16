@@ -1,6 +1,7 @@
 pub mod activation;
 pub mod arithmetic;
 pub mod batch;
+pub mod bitcast;
 pub mod bitwise;
 pub mod book_examples;
 pub mod broadcast;
@@ -14,6 +15,7 @@ pub mod indexing;
 pub mod math;
 pub mod matmul;
 pub mod nn;
+pub mod rand;
 pub mod readme_examples;
 pub mod realize_binary;
 pub mod reduce;
