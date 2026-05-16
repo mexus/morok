@@ -5,6 +5,7 @@ mod jit;
 mod jit_recurrent;
 mod mel;
 mod remap;
+mod resnet;
 mod splitter;
 mod state;
 mod transcribe;
