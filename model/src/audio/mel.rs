@@ -36,10 +36,7 @@ impl MelSpectrogram {
         let mut planner = RealFftPlanner::<f32>::new();
         let r2c = planner.plan_fft_forward(n_fft);
 
-        let mut window = vec![0.0f32; n_fft];
-        for (i, w) in window.iter_mut().enumerate().take(config.win_length) {
-            *w = 0.5 * (1.0 - (2.0 * PI * i as f32 / (config.win_length as f32 - 1.0)).cos());
-        }
+        let window = hann_window(config.n_fft, config.win_length);
 
         let mel_fb = build_mel_filterbank(config.n_mels, n_fft, config.sample_rate as f32);
 
@@ -112,6 +109,17 @@ impl MelSpectrogram {
             }
         }
     }
+}
+
+/// Periodic Hann window, matching `torch.hann_window(periodic=True)`, which is
+/// torchaudio's default in `MelSpectrogram`. `realfft` handles only the FFT;
+/// it does not provide STFT window builders.
+pub(crate) fn hann_window(n_fft: usize, win_length: usize) -> Vec<f32> {
+    let mut window = vec![0.0f32; n_fft];
+    for (i, w) in window.iter_mut().enumerate().take(win_length) {
+        *w = 0.5 * (1.0 - (2.0 * PI * i as f32 / win_length as f32).cos());
+    }
+    window
 }
 
 /// Build HTK mel filterbank matrix of shape `[n_mels, n_fft/2+1]`.

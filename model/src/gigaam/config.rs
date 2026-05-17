@@ -94,6 +94,9 @@ impl GigaAmConfig {
     }
 
     fn from_raw(raw: RawModelCfg) -> Result<Self> {
+        validate_preprocessor(&raw.preprocessor)?;
+        validate_encoder(&raw.encoder)?;
+
         // `max_mel_frames` is the pre-subsampling sequence-length bound. Configs that
         // only specify `pos_emb_max_len` (the post-subsampling encoder bound) need it
         // multiplied by `subsampling_factor` so audio approaching the encoder cap
@@ -104,6 +107,18 @@ impl GigaAmConfig {
             .max_mel_frames
             .or(raw.encoder.max_seq_len)
             .unwrap_or(max_encoder_frames * raw.encoder.subsampling_factor);
+        let subs_kernel = match &raw.encoder.subsampling {
+            SubsamplingMode::Conv1d => raw.encoder.subs_kernel_size,
+            SubsamplingMode::Conv2d => 3,
+        };
+        let max_sub_frames = subsampled_len(subs_kernel, max_mel_frames);
+        if max_sub_frames > max_encoder_frames {
+            return Err(Error::DecoderConfig {
+                message: format!(
+                    "max_mel_frames ({max_mel_frames}) subsamples to {max_sub_frames} encoder frames, exceeding pos_emb_max_len ({max_encoder_frames})"
+                ),
+            });
+        }
         // CTC configs put `num_classes` directly on `head`; RNN-T configs nest
         // it under `head.decoder.num_classes` / `head.joint.num_classes`.
         let vocab_size = raw
@@ -166,6 +181,10 @@ struct RawPreprocessor {
     win_length: usize,
     #[serde(default = "default_true")]
     center: bool,
+    #[serde(default)]
+    mel_scale: Option<String>,
+    #[serde(default)]
+    mel_norm: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -176,6 +195,8 @@ struct RawEncoder {
     n_layers: usize,
     conv_kernel_size: usize,
     subsampling_factor: usize,
+    #[serde(default = "default_self_attention_model")]
+    self_attention_model: String,
     #[serde(default = "default_subs_kernel_size")]
     subs_kernel_size: usize,
     #[serde(default = "default_subsampling_mode")]
@@ -232,8 +253,68 @@ fn default_conv_norm_type() -> ConvNormType {
 fn default_pos_emb_max_len() -> usize {
     5000
 }
+fn default_self_attention_model() -> String {
+    "rotary".into()
+}
 fn default_max_batch_size() -> usize {
     32
+}
+
+fn validate_preprocessor(pre: &RawPreprocessor) -> Result<()> {
+    if let Some(scale) = pre.mel_scale.as_deref()
+        && scale != "htk"
+    {
+        return Err(Error::DecoderConfig {
+            message: format!(
+                "unsupported mel_scale {scale:?}; Morok GigaAM currently matches torchaudio's HTK mel frontend"
+            ),
+        });
+    }
+    if let Some(norm) = pre.mel_norm.as_deref() {
+        return Err(Error::DecoderConfig {
+            message: format!(
+                "unsupported mel_norm {norm:?}; Morok GigaAM currently supports only null/no mel normalization"
+            ),
+        });
+    }
+    if pre.n_fft != pre.win_length {
+        return Err(Error::DecoderConfig {
+            message: format!(
+                "unsupported mel frontend n_fft ({}) != win_length ({}); current GigaAM parity path requires equal FFT/window lengths",
+                pre.n_fft, pre.win_length
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn validate_encoder(encoder: &RawEncoder) -> Result<()> {
+    if encoder.self_attention_model != "rotary" {
+        return Err(Error::DecoderConfig {
+            message: format!(
+                "unsupported self_attention_model {:?}; Morok GigaAM currently implements rotary attention only",
+                encoder.self_attention_model
+            ),
+        });
+    }
+    if encoder.subsampling_factor != 4 {
+        return Err(Error::DecoderConfig {
+            message: format!(
+                "unsupported subsampling_factor {}; Morok GigaAM currently implements exactly two stride-2 subsampling layers",
+                encoder.subsampling_factor
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn subsampled_len(kernel_size: usize, mel_frames: usize) -> usize {
+    let pad = (kernel_size - 1) / 2;
+    let mut len = mel_frames;
+    for _ in 0..2 {
+        len = len.saturating_add(2 * pad).saturating_sub(kernel_size) / 2 + 1;
+    }
+    len
 }
 
 // ─── Decoder + transducer dispatch ────────────────────────────────────────
