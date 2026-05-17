@@ -8,21 +8,21 @@ fn build_classifier_jit(max_batch: usize, num_classes: usize) -> ResNetJit {
     ResNetJit::new(model)
 }
 
+/// Realize-based JIT smoke gated behind `--ignored`. The default suite covers
+/// the JIT mechanics through the toy `jit_recurrent` tests and the GigaAM
+/// batch suite (which actually exercises variable rebinding); this is here
+/// for hands-on ResNet work.
 #[test]
+#[ignore = "heavy: full ResNet-18 graph compile through the CPU backend"]
 fn prepare_and_execute_at_max_batch() {
     let max_batch = 2;
     let mut jit = build_classifier_jit(max_batch, 5);
     jit.prepare(InputSpec::f32(&[max_batch, 3, 32, 32])).unwrap();
     jit.execute_with_vars(&[("b", max_batch as i64)]).unwrap();
     let out = jit.output().unwrap();
-    // [B, num_classes] = [2, 5] = 10 f32 elements
     assert_eq!(out.size(), 2 * 5 * std::mem::size_of::<f32>());
 }
 
-/// Confirms one prepared plan can serve multiple bound values of `b`. Gated
-/// behind `--ignored` because each `execute_with_vars` triggers a kernel
-/// dispatch through the full ResNet-18 graph; the smoke tests above already
-/// validate the single-shot path.
 #[test]
 #[ignore = "heavy: three executes of the full ResNet-18 graph"]
 fn rebind_batch_without_reprepare() {
@@ -38,6 +38,7 @@ fn rebind_batch_without_reprepare() {
 }
 
 #[test]
+#[ignore = "heavy: full ResNet-18 graph compile through the CPU backend"]
 fn features_mode_returns_spatial_map() {
     let max_batch = 1;
     let config = ResNetConfig::new(ResNetDepth::R18, OutputMode::Features).with_max_batch_size(max_batch);
@@ -46,6 +47,5 @@ fn features_mode_returns_spatial_map() {
     jit.prepare(InputSpec::f32(&[max_batch, 3, 32, 32])).unwrap();
     jit.execute_with_vars(&[("b", 1)]).unwrap();
     let out = jit.output().unwrap();
-    // [1, 512, 1, 1] = 512 f32 elements
     assert_eq!(out.size(), 512 * std::mem::size_of::<f32>());
 }

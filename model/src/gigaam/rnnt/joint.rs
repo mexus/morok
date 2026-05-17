@@ -5,6 +5,7 @@ use morok_dtype::DType;
 use morok_tensor::Tensor;
 use snafu::ResultExt;
 
+use crate::init::fan_in_uniform;
 use crate::state::{self, HasStateDict, StateDict};
 use crate::{load_state_field, state_field};
 
@@ -29,12 +30,12 @@ pub struct RnntJoint {
 impl RnntJoint {
     pub fn empty(enc_hidden: usize, pred_hidden: usize, joint_hidden: usize, num_classes: usize) -> Self {
         Self {
-            enc_w: Tensor::zeros(&[joint_hidden, enc_hidden], DType::Float32).unwrap(),
-            enc_b: Tensor::zeros(&[joint_hidden], DType::Float32).unwrap(),
-            pred_w: Tensor::zeros(&[joint_hidden, pred_hidden], DType::Float32).unwrap(),
-            pred_b: Tensor::zeros(&[joint_hidden], DType::Float32).unwrap(),
-            out_w: Tensor::zeros(&[num_classes, joint_hidden], DType::Float32).unwrap(),
-            out_b: Tensor::zeros(&[num_classes], DType::Float32).unwrap(),
+            enc_w: fan_in_uniform(&[joint_hidden, enc_hidden], enc_hidden, DType::Float32),
+            enc_b: fan_in_uniform(&[joint_hidden], enc_hidden, DType::Float32),
+            pred_w: fan_in_uniform(&[joint_hidden, pred_hidden], pred_hidden, DType::Float32),
+            pred_b: fan_in_uniform(&[joint_hidden], pred_hidden, DType::Float32),
+            out_w: fan_in_uniform(&[num_classes, joint_hidden], joint_hidden, DType::Float32),
+            out_b: fan_in_uniform(&[num_classes], joint_hidden, DType::Float32),
         }
     }
 

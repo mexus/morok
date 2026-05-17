@@ -2,13 +2,10 @@ use morok_dtype::DType;
 use morok_tensor::Tensor;
 use snafu::ResultExt;
 
+use crate::init::fan_in_uniform;
 use crate::state::{self, HasStateDict, StateDict, get_tensor, prefixed};
 
 use super::error::{Result, TensorSnafu};
-
-fn zeros(shape: &[usize]) -> Tensor {
-    Tensor::zeros(shape, DType::Float32).expect("zeros for block placeholder must succeed")
-}
 
 /// Bias-less 2D convolution wrapper. `weight` has layout
 /// `[out_ch, in_ch / groups, kH, kW]` (same as PyTorch / timm).
@@ -22,7 +19,9 @@ pub struct Conv2dWeights {
 
 impl Conv2dWeights {
     pub fn empty(out_ch: usize, in_ch: usize, kernel: usize, stride: usize, padding: usize) -> Self {
-        Self { weight: zeros(&[out_ch, in_ch, kernel, kernel]), stride, padding, groups: 1 }
+        let fan_in = in_ch * kernel * kernel;
+        let weight = fan_in_uniform(&[out_ch, in_ch, kernel, kernel], fan_in, DType::Float32);
+        Self { weight, stride, padding, groups: 1 }
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {

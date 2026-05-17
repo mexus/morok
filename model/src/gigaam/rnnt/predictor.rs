@@ -7,6 +7,7 @@ use morok_tensor::Tensor;
 use morok_tensor::nn::LSTMCell;
 use snafu::ResultExt;
 
+use crate::init::fan_in_uniform;
 use crate::state::{self, HasStateDict, StateDict, get_tensor, prefixed};
 
 use crate::gigaam::Result;
@@ -38,14 +39,14 @@ impl RnntPredictor {
         let blank_id = num_classes - 1;
         let h4 = 4 * pred_hidden;
         Self {
-            embed: Tensor::zeros(&[num_classes, pred_hidden], DType::Float32).unwrap(),
+            embed: fan_in_uniform(&[num_classes, pred_hidden], num_classes, DType::Float32),
             layers: (0..num_layers)
                 .map(|_| {
                     LSTMCell::new(
-                        Tensor::zeros(&[h4, pred_hidden], DType::Float32).unwrap(),
-                        Tensor::zeros(&[h4, pred_hidden], DType::Float32).unwrap(),
-                        Tensor::zeros(&[h4], DType::Float32).unwrap(),
-                        Tensor::zeros(&[h4], DType::Float32).unwrap(),
+                        fan_in_uniform(&[h4, pred_hidden], pred_hidden, DType::Float32),
+                        fan_in_uniform(&[h4, pred_hidden], pred_hidden, DType::Float32),
+                        fan_in_uniform(&[h4], pred_hidden, DType::Float32),
+                        fan_in_uniform(&[h4], pred_hidden, DType::Float32),
                     )
                 })
                 .collect(),

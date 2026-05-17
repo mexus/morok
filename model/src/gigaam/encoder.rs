@@ -4,6 +4,7 @@ use morok_tensor::{BoundVariable, Tensor};
 use ndarray::Array4;
 use snafu::ResultExt;
 
+use crate::init::{fan_in_uniform, ones, zeros};
 use crate::state::{HasStateDict, StateDict, get_tensor, prefixed};
 use crate::{load_state_field, state_field};
 
@@ -35,14 +36,6 @@ fn build_rope_cache(config: &GigaAmConfig) -> (Tensor, Tensor) {
     (Tensor::from_ndarray(&cos_arr), Tensor::from_ndarray(&sin_arr))
 }
 
-fn zeros(shape: &[usize]) -> Tensor {
-    Tensor::zeros(shape, DType::Float32).unwrap()
-}
-
-fn ones(shape: &[usize]) -> Tensor {
-    Tensor::ones(shape, DType::Float32).unwrap()
-}
-
 type Result<T> = super::Result<T>;
 
 // ---------------------------------------------------------------------------
@@ -59,7 +52,7 @@ pub struct LayerNormWeights {
 
 impl LayerNormWeights {
     pub fn empty(size: usize) -> Self {
-        Self { weight: ones(&[size]), bias: zeros(&[size]), eps: 1e-5 }
+        Self { weight: ones(&[size], DType::Float32), bias: zeros(&[size], DType::Float32), eps: 1e-5 }
     }
 
     pub fn apply(&self, x: &Tensor) -> Result<Tensor> {
@@ -102,10 +95,10 @@ impl FeedForward {
         let (d, d_ff) = (config.d_model, config.d_ff);
         Self {
             norm: LayerNormWeights::empty(d),
-            linear1_weight: zeros(&[d_ff, d]),
-            linear1_bias: zeros(&[d_ff]),
-            linear2_weight: zeros(&[d, d_ff]),
-            linear2_bias: zeros(&[d]),
+            linear1_weight: fan_in_uniform(&[d_ff, d], d, DType::Float32),
+            linear1_bias: fan_in_uniform(&[d_ff], d, DType::Float32),
+            linear2_weight: fan_in_uniform(&[d, d_ff], d_ff, DType::Float32),
+            linear2_bias: fan_in_uniform(&[d], d_ff, DType::Float32),
         }
     }
 
@@ -162,14 +155,14 @@ impl MultiHeadSelfAttention {
         let d = config.d_model;
         Self {
             norm: LayerNormWeights::empty(d),
-            q_proj: zeros(&[d, d]),
-            q_bias: zeros(&[d]),
-            k_proj: zeros(&[d, d]),
-            k_bias: zeros(&[d]),
-            v_proj: zeros(&[d, d]),
-            v_bias: zeros(&[d]),
-            out_proj: zeros(&[d, d]),
-            out_bias: zeros(&[d]),
+            q_proj: fan_in_uniform(&[d, d], d, DType::Float32),
+            q_bias: fan_in_uniform(&[d], d, DType::Float32),
+            k_proj: fan_in_uniform(&[d, d], d, DType::Float32),
+            k_bias: fan_in_uniform(&[d], d, DType::Float32),
+            v_proj: fan_in_uniform(&[d, d], d, DType::Float32),
+            v_bias: fan_in_uniform(&[d], d, DType::Float32),
+            out_proj: fan_in_uniform(&[d, d], d, DType::Float32),
+            out_bias: fan_in_uniform(&[d], d, DType::Float32),
             n_heads: config.n_heads,
             d_model: d,
         }
@@ -278,19 +271,22 @@ impl ConvModule {
         let (d, k) = (config.d_model, config.conv_kernel);
         let conv_norm = match &config.conv_norm_type {
             ConvNormType::LayerNorm => ConvNorm::LayerNorm(LayerNormWeights::empty(d)),
-            ConvNormType::BatchNorm => {
-                ConvNorm::BatchNorm { scale: ones(&[d]), bias: zeros(&[d]), mean: zeros(&[d]), invstd: ones(&[d]) }
-            }
+            ConvNormType::BatchNorm => ConvNorm::BatchNorm {
+                scale: ones(&[d], DType::Float32),
+                bias: zeros(&[d], DType::Float32),
+                mean: zeros(&[d], DType::Float32),
+                invstd: ones(&[d], DType::Float32),
+            },
         };
         Self {
             norm: LayerNormWeights::empty(d),
-            pw1_weight: zeros(&[2 * d, d, 1]),
-            pw1_bias: zeros(&[2 * d]),
-            dw_weight: zeros(&[d, 1, k]),
-            dw_bias: zeros(&[d]),
+            pw1_weight: fan_in_uniform(&[2 * d, d, 1], d, DType::Float32),
+            pw1_bias: fan_in_uniform(&[2 * d], d, DType::Float32),
+            dw_weight: fan_in_uniform(&[d, 1, k], k, DType::Float32),
+            dw_bias: fan_in_uniform(&[d], k, DType::Float32),
             conv_norm,
-            pw2_weight: zeros(&[d, d, 1]),
-            pw2_bias: zeros(&[d]),
+            pw2_weight: fan_in_uniform(&[d, d, 1], d, DType::Float32),
+            pw2_bias: fan_in_uniform(&[d], d, DType::Float32),
             d_model: d,
             conv_kernel: k,
         }
@@ -407,30 +403,39 @@ impl StridingSubsampling {
         let d = config.d_model;
         let k = config.subs_kernel_size;
         match &config.subsampling_mode {
-            SubsamplingMode::Conv1d => Self {
-                conv1_weight: zeros(&[d, config.n_mels, k]),
-                conv1_bias: zeros(&[d]),
-                conv2_weight: zeros(&[d, d, k]),
-                conv2_bias: zeros(&[d]),
-                linear_weight: None,
-                linear_bias: None,
-                n_mels: config.n_mels,
-                d_model: d,
-                mode: SubsamplingMode::Conv1d,
-                kernel_size: k,
-            },
-            SubsamplingMode::Conv2d => Self {
-                conv1_weight: zeros(&[d, 1, 3, 3]),
-                conv1_bias: zeros(&[d]),
-                conv2_weight: zeros(&[d, d, 3, 3]),
-                conv2_bias: zeros(&[d]),
-                linear_weight: Some(zeros(&[d, d * (config.n_mels / 4)])),
-                linear_bias: Some(zeros(&[d])),
-                n_mels: config.n_mels,
-                d_model: d,
-                mode: SubsamplingMode::Conv2d,
-                kernel_size: 3,
-            },
+            SubsamplingMode::Conv1d => {
+                let fan_in1 = config.n_mels * k;
+                let fan_in2 = d * k;
+                Self {
+                    conv1_weight: fan_in_uniform(&[d, config.n_mels, k], fan_in1, DType::Float32),
+                    conv1_bias: fan_in_uniform(&[d], fan_in1, DType::Float32),
+                    conv2_weight: fan_in_uniform(&[d, d, k], fan_in2, DType::Float32),
+                    conv2_bias: fan_in_uniform(&[d], fan_in2, DType::Float32),
+                    linear_weight: None,
+                    linear_bias: None,
+                    n_mels: config.n_mels,
+                    d_model: d,
+                    mode: SubsamplingMode::Conv1d,
+                    kernel_size: k,
+                }
+            }
+            SubsamplingMode::Conv2d => {
+                let fan_in1 = 9;
+                let fan_in2 = 9 * d;
+                let linear_in = d * (config.n_mels / 4);
+                Self {
+                    conv1_weight: fan_in_uniform(&[d, 1, 3, 3], fan_in1, DType::Float32),
+                    conv1_bias: fan_in_uniform(&[d], fan_in1, DType::Float32),
+                    conv2_weight: fan_in_uniform(&[d, d, 3, 3], fan_in2, DType::Float32),
+                    conv2_bias: fan_in_uniform(&[d], fan_in2, DType::Float32),
+                    linear_weight: Some(fan_in_uniform(&[d, linear_in], linear_in, DType::Float32)),
+                    linear_bias: Some(fan_in_uniform(&[d], linear_in, DType::Float32)),
+                    n_mels: config.n_mels,
+                    d_model: d,
+                    mode: SubsamplingMode::Conv2d,
+                    kernel_size: 3,
+                }
+            }
         }
     }
 

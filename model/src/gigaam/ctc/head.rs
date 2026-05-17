@@ -7,6 +7,7 @@ use morok_dtype::DType;
 use morok_tensor::Tensor;
 use snafu::ResultExt;
 
+use crate::init::fan_in_uniform;
 use crate::state::{HasStateDict, StateDict};
 use crate::{load_state_field, state_field};
 
@@ -21,9 +22,10 @@ pub struct CTCHead {
 
 impl CTCHead {
     pub fn empty(config: &GigaAmConfig) -> Self {
+        let fan_in = config.d_model;
         Self {
-            weight: Tensor::zeros(&[config.vocab_size, config.d_model, 1], DType::Float32).unwrap(),
-            bias: Tensor::zeros(&[config.vocab_size], DType::Float32).unwrap(),
+            weight: fan_in_uniform(&[config.vocab_size, config.d_model, 1], fan_in, DType::Float32),
+            bias: fan_in_uniform(&[config.vocab_size], fan_in, DType::Float32),
         }
     }
 

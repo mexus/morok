@@ -23,6 +23,7 @@ use morok_tensor::{BoundVariable, Tensor};
 use snafu::ResultExt;
 
 use crate::blocks::{BatchNormWeights, Conv2dWeights, ResidualStage, remap};
+use crate::init::fan_in_uniform;
 use crate::state::{self, HasStateDict, StateDict, get_tensor};
 
 use super::config::{OutputMode, ResNetConfig, ResNetDepth};
@@ -69,7 +70,11 @@ impl ResNet {
 
         let head = match &config.output {
             OutputMode::Classification { num_classes } => {
-                Some(HeadWeights { weight: zeros(&[*num_classes, 512 * expansion]), bias: zeros(&[*num_classes]) })
+                let fan_in = 512 * expansion;
+                Some(HeadWeights {
+                    weight: fan_in_uniform(&[*num_classes, fan_in], fan_in, DType::Float32),
+                    bias: fan_in_uniform(&[*num_classes], fan_in, DType::Float32),
+                })
             }
             OutputMode::Features => None,
         };
@@ -182,6 +187,32 @@ impl ResNet {
     }
 }
 
-fn zeros(shape: &[usize]) -> Tensor {
-    Tensor::zeros(shape, DType::Float32).expect("zeros for resnet placeholder must succeed")
+impl HasStateDict for ResNet {
+    fn state_dict(&self, prefix: &str) -> StateDict {
+        let mut sd = self.stem_conv.state_dict(&state::prefixed(prefix, "conv1"));
+        sd.extend(self.stem_bn.state_dict(&state::prefixed(prefix, "bn1")));
+        sd.extend(self.stage1.state_dict(&state::prefixed(prefix, "layer1")));
+        sd.extend(self.stage2.state_dict(&state::prefixed(prefix, "layer2")));
+        sd.extend(self.stage3.state_dict(&state::prefixed(prefix, "layer3")));
+        sd.extend(self.stage4.state_dict(&state::prefixed(prefix, "layer4")));
+        if let Some(head) = &self.head {
+            sd.insert(state::prefixed(prefix, "fc.weight"), head.weight.clone());
+            sd.insert(state::prefixed(prefix, "fc.bias"), head.bias.clone());
+        }
+        sd
+    }
+
+    fn load_state_dict(&mut self, sd: &StateDict, prefix: &str) -> std::result::Result<(), state::Error> {
+        self.stem_conv.load_state_dict(sd, &state::prefixed(prefix, "conv1"))?;
+        self.stem_bn.load_state_dict(sd, &state::prefixed(prefix, "bn1"))?;
+        self.stage1.load_state_dict(sd, &state::prefixed(prefix, "layer1"))?;
+        self.stage2.load_state_dict(sd, &state::prefixed(prefix, "layer2"))?;
+        self.stage3.load_state_dict(sd, &state::prefixed(prefix, "layer3"))?;
+        self.stage4.load_state_dict(sd, &state::prefixed(prefix, "layer4"))?;
+        if let Some(head) = self.head.as_mut() {
+            head.weight = get_tensor(sd, &state::prefixed(prefix, "fc.weight"))?;
+            head.bias = get_tensor(sd, &state::prefixed(prefix, "fc.bias"))?;
+        }
+        Ok(())
+    }
 }

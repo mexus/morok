@@ -2,17 +2,10 @@ use morok_dtype::DType;
 use morok_tensor::Tensor;
 use snafu::ResultExt;
 
+use crate::init::{ones, zeros};
 use crate::state::{self, HasStateDict, StateDict, get_tensor, prefixed};
 
 use super::error::{Result, TensorSnafu};
-
-fn zeros(shape: &[usize]) -> Tensor {
-    Tensor::zeros(shape, DType::Float32).expect("zeros for block placeholder must succeed")
-}
-
-fn ones(shape: &[usize]) -> Tensor {
-    Tensor::ones(shape, DType::Float32).expect("ones for block placeholder must succeed")
-}
 
 /// BN with the running variance pre-folded into `invstd`. State-dict round-trip
 /// uses the canonical timm/PyTorch keys `weight` (→ `scale`), `bias`,
@@ -27,7 +20,12 @@ pub struct BatchNormWeights {
 
 impl BatchNormWeights {
     pub fn empty(channels: usize) -> Self {
-        Self { scale: ones(&[channels]), bias: zeros(&[channels]), mean: zeros(&[channels]), invstd: ones(&[channels]) }
+        Self {
+            scale: ones(&[channels], DType::Float32),
+            bias: zeros(&[channels], DType::Float32),
+            mean: zeros(&[channels], DType::Float32),
+            invstd: ones(&[channels], DType::Float32),
+        }
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {

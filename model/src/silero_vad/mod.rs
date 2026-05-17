@@ -19,11 +19,13 @@ pub use splitter::{SileroVadSplitter, SileroVadSplitterError};
 
 use std::path::Path;
 
+use morok_dtype::DType;
 use morok_macros::jit_wrapper;
 use morok_tensor::Tensor;
 use morok_tensor::nn::{Conv1d, LSTMCell, Layer, PadMode};
 use snafu::{ResultExt, Snafu};
 
+use crate::init::fan_in_uniform;
 use crate::state;
 
 #[derive(Debug, Snafu)]
@@ -49,10 +51,10 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// callers can build [`morok_arch::vad::ChunkerOpts`] with the right
 /// `samples_per_prob`.
 pub const NUM_SAMPLES: usize = 512;
-const CONTEXT_SIZE: usize = 64;
+pub(crate) const CONTEXT_SIZE: usize = 64;
 const STFT_PAD: usize = 64;
 const CUTOFF: usize = 128 + 1;
-const HIDDEN: usize = 128;
+pub(crate) const HIDDEN: usize = 128;
 const CHUNK_LEN: usize = CONTEXT_SIZE + NUM_SAMPLES;
 
 pub struct SileroVad {
@@ -94,6 +96,35 @@ impl SileroVad {
             ),
             final_conv: Conv1d::new(get(&sd, "final_conv.weight")?, Some(get(&sd, "final_conv.bias")?)),
         })
+    }
+
+    /// Build with random weights matching the Silero V5 16 kHz layout. Strides
+    /// and paddings mirror [`Self::from_safetensors`]; the lazy
+    /// `fan_in_uniform` graphs keep the forward path from collapsing under
+    /// const-folding so the JIT pipeline can be exercised without a checkpoint.
+    pub fn with_random_weights() -> Self {
+        let dt = DType::Float32;
+        let mk_conv = |shape: [usize; 3], has_bias: bool, configure: fn(Conv1d) -> Conv1d| -> Conv1d {
+            let fan_in = shape[1] * shape[2];
+            let weight = fan_in_uniform(&shape, fan_in, dt.clone());
+            let bias = has_bias.then(|| fan_in_uniform(&[shape[0]], fan_in, dt.clone()));
+            configure(Conv1d::new(weight, bias))
+        };
+
+        Self {
+            stft_conv: mk_conv([258, 1, 256], false, |c| c.with_stride(128)),
+            conv1: mk_conv([128, 129, 3], true, |c| c.with_padding((1, 1))),
+            conv2: mk_conv([64, 128, 3], true, |c| c.with_stride(2).with_padding((1, 1))),
+            conv3: mk_conv([64, 64, 3], true, |c| c.with_stride(2).with_padding((1, 1))),
+            conv4: mk_conv([128, 64, 3], true, |c| c.with_padding((1, 1))),
+            lstm: LSTMCell::new(
+                fan_in_uniform(&[4 * HIDDEN, HIDDEN], HIDDEN, dt.clone()),
+                fan_in_uniform(&[4 * HIDDEN, HIDDEN], HIDDEN, dt.clone()),
+                fan_in_uniform(&[4 * HIDDEN], HIDDEN, dt.clone()),
+                fan_in_uniform(&[4 * HIDDEN], HIDDEN, dt.clone()),
+            ),
+            final_conv: mk_conv([1, 128, 1], true, |c| c),
+        }
     }
 
     pub fn forward_chunk(&self, chunk: &Tensor, state_h: &Tensor, state_c: &Tensor) -> Result<Tensor> {
