@@ -39,7 +39,7 @@ fn remap_key(key: &str, config: &GigaAmConfig) -> Option<String> {
     let key = key.strip_prefix("model.").unwrap_or(key);
     let parts: Vec<&str> = key.split('.').collect();
 
-    if parts[..3] == ["encoder", "pre_encode", "conv"] && parts.len() == 5 {
+    if parts.len() == 5 && parts[..3] == ["encoder", "pre_encode", "conv"] {
         let idx = parts[3];
         let param = parts[4];
         let conv_map = match idx {
@@ -50,22 +50,22 @@ fn remap_key(key: &str, config: &GigaAmConfig) -> Option<String> {
         return Some(format!("subsampling.{conv_map}_{param}"));
     }
 
-    if parts[..3] == ["encoder", "pre_encode", "out"] && parts.len() == 4 {
+    if parts.len() == 4 && parts[..3] == ["encoder", "pre_encode", "out"] {
         return Some(format!("subsampling.linear_{}", parts[3]));
     }
 
-    if parts[..2] == ["encoder", "layers"] && parts.len() >= 4 {
+    if parts.len() >= 4 && parts[..2] == ["encoder", "layers"] {
         let i = parts[2];
         let rest = &parts[3..];
         return remap_encoder_layer(i, rest, config);
     }
 
-    if parts[..2] == ["head", "decoder_layers"] && parts.len() >= 4 {
+    if parts.len() >= 4 && parts[..2] == ["head", "decoder_layers"] {
         return Some(format!("head.{}", &parts[3..].join(".")));
     }
 
     // RNN-T predictor: head.decoder.embed.weight, head.decoder.lstm.{w,b}_{ih,hh}_l{N}.
-    if parts[..2] == ["head", "decoder"] && parts.len() >= 3 {
+    if parts.len() >= 3 && parts[..2] == ["head", "decoder"] {
         if parts[2] == "embed" && parts.len() == 4 && parts[3] == "weight" {
             return Some("head.predictor.embed".to_string());
         }
@@ -77,7 +77,7 @@ fn remap_key(key: &str, config: &GigaAmConfig) -> Option<String> {
 
     // RNN-T joint: head.joint.{enc,pred}.{weight,bias},
     // head.joint.joint_net.1.{weight,bias} (joint_net.0 = ReLU, no params).
-    if parts[..2] == ["head", "joint"] && parts.len() >= 4 {
+    if parts.len() >= 4 && parts[..2] == ["head", "joint"] {
         let sub = parts[2];
         let last = parts.last().unwrap();
         if (sub == "enc" || sub == "pred") && parts.len() == 4 {

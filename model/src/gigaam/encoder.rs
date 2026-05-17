@@ -12,15 +12,15 @@ use super::error::{StateSnafu, TensorSnafu};
 use super::{ConvNormType, GigaAmConfig, SubsamplingMode};
 
 /// Precompute RoPE cos/sin cache tensors. Returns `(cos, sin)` each of shape
-/// `[max_encoder_frames, 1, 1, d_k/2]` where `d_k = d_model / n_heads`. GigaAM
-/// uses non-interleaved RoPE (first_half/second_half split), matching
-/// `apply_rotary_emb(..., interleaved=false)`.
+/// `[max_encoder_frames, 1, 1, d_k/2]` where `d_k = d_model / n_heads`. Upstream
+/// GigaAM passes `pos_emb_max_len` as both cache length and RoPE base.
 fn build_rope_cache(config: &GigaAmConfig) -> (Tensor, Tensor) {
     let d_k = config.d_model / config.n_heads;
     let half_d = d_k / 2;
     let max_len = config.max_encoder_frames;
+    let base = config.max_encoder_frames as f32;
 
-    let inv_freq: Vec<f32> = (0..half_d).map(|i| 1.0 / 10000.0f32.powf(2.0 * i as f32 / d_k as f32)).collect();
+    let inv_freq: Vec<f32> = (0..half_d).map(|i| 1.0 / base.powf(2.0 * i as f32 / d_k as f32)).collect();
 
     let mut cos_arr = Array4::<f32>::zeros((max_len, 1, 1, half_d));
     let mut sin_arr = Array4::<f32>::zeros((max_len, 1, 1, half_d));

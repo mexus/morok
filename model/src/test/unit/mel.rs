@@ -1,3 +1,4 @@
+use crate::audio::mel::hann_window;
 use crate::audio::{MelConfig, MelSpectrogram};
 
 struct MelOutput {
@@ -88,4 +89,14 @@ fn test_mel_spectrogram_sine_wave() {
         lower_avg > upper_avg,
         "Expected lower mel bins to have more energy for 440Hz sine: lower={lower_avg:.2}, upper={upper_avg:.2}"
     );
+}
+
+#[test]
+fn test_hann_window_matches_torch_periodic_default() {
+    let window = hann_window(8, 8);
+    let expected = [0.0, 0.14644662, 0.5, 0.8535534, 1.0, 0.8535533, 0.5, 0.1464465];
+
+    for (got, want) in window.iter().zip(expected) {
+        assert!((got - want).abs() < 1e-6, "got {got}, want {want}");
+    }
 }

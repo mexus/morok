@@ -406,23 +406,12 @@ impl<S: Splitter> Transcriber<S> {
             }
         }
 
-        // Plain `ndarray::Array3` (not a Tensor) — `forward_into` is pure
-        // host code, and a per-call `Tensor::full(...).realize()` would
-        // JIT-recompile per `total_mel_frames` value.
         let n_mels = self.mel.n_mels();
-        let total_mel_frames = self.mel.num_frames(waveform.len());
-        if total_mel_frames == 0 || chunks.is_empty() {
+        if chunks.is_empty() {
             return Ok(TranscribeResult { text: String::new(), chunks: Vec::new() });
         }
-        let mut full_mel = ndarray::Array3::<f32>::zeros((1, n_mels, total_mel_frames));
-        {
-            let mut view = full_mel.view_mut().into_dyn();
-            self.mel.forward_into(waveform, &mut view);
-        }
-        let full_mel_data = full_mel.as_slice().expect("contiguous mel buffer");
 
         let sample_rate_hz = self.model.config.sample_rate;
-        let hop_length = self.model.config.hop_length;
         let d_model = self.model.config.d_model;
         let subs_kernel_size = match self.model.config.subsampling_mode {
             SubsamplingMode::Conv1d => self.model.config.subs_kernel_size,
@@ -433,18 +422,17 @@ impl<S: Splitter> Transcriber<S> {
         let max_batch = self.max_batch;
         let want_words = self.opts.word_timestamps;
 
-        // (mel_start, mel_len, start_sec, end_sec) per chunk.
-        let chunks_meta: Vec<(usize, usize, f32, f32)> = chunks
+        // (start_sample, end_sample, mel_len, start_sec, end_sec) per chunk.
+        let chunks_meta: Vec<(usize, usize, usize, f32, f32)> = chunks
             .iter()
             .filter_map(|c| {
-                let mel_start = c.start_sample / hop_length;
-                let mel_end = (c.end_sample / hop_length).min(total_mel_frames);
-                if mel_end <= mel_start {
+                let mel_len = self.mel.num_frames(c.end_sample.saturating_sub(c.start_sample));
+                if mel_len == 0 {
                     return None;
                 }
                 let start_sec = c.start_sample as f32 / sample_rate_hz as f32;
                 let end_sec = c.end_sample as f32 / sample_rate_hz as f32;
-                Some((mel_start, mel_end - mel_start, start_sec, end_sec))
+                Some((c.start_sample, c.end_sample, mel_len, start_sec, end_sec))
             })
             .collect();
         if chunks_meta.is_empty() {
@@ -457,6 +445,18 @@ impl<S: Splitter> Transcriber<S> {
             let b = (num_chunks - chunk_batch_start).min(max_batch);
             let mut chunk_lengths = vec![0usize; b];
 
+            let batch_mels: Vec<Vec<f32>> = (0..b)
+                .map(|bi| {
+                    let &(start_sample, end_sample, valid, _, _) = &chunks_meta[chunk_batch_start + bi];
+                    let mut chunk_mel = ndarray::Array3::<f32>::zeros((1, n_mels, valid));
+                    {
+                        let mut view = chunk_mel.view_mut().into_dyn();
+                        self.mel.forward_into(&waveform[start_sample..end_sample], &mut view);
+                    }
+                    chunk_mel.as_slice().expect("contiguous chunk mel").to_vec()
+                })
+                .collect();
+
             // Pack mel into encoder JIT input buffer.
             {
                 let buf = self.encoder_jit.mel_mut().context(JitSnafu)?;
@@ -464,12 +464,13 @@ impl<S: Splitter> Transcriber<S> {
                 let slice = view.as_slice_mut().expect("contiguous mel buffer");
                 slice.fill(0.0);
                 for (bi, chunk_len) in chunk_lengths.iter_mut().enumerate() {
-                    let &(mel_start, valid, _, _) = &chunks_meta[chunk_batch_start + bi];
+                    let &(_, _, valid, _, _) = &chunks_meta[chunk_batch_start + bi];
                     *chunk_len = valid;
+                    let chunk_mel = &batch_mels[bi];
                     for mel_bin in 0..n_mels {
-                        let src = mel_bin * total_mel_frames + mel_start;
+                        let src = mel_bin * valid;
                         let dst = ((bi * n_mels) + mel_bin) * max_t_mel;
-                        slice[dst..dst + valid].copy_from_slice(&full_mel_data[src..src + valid]);
+                        slice[dst..dst + valid].copy_from_slice(&chunk_mel[src..src + valid]);
                     }
                 }
             }
@@ -519,22 +520,25 @@ impl<S: Splitter> Transcriber<S> {
                     let flat = logits.as_slice().expect("contiguous head logits");
                     for (bi, mel_len) in chunk_lengths.iter().enumerate() {
                         let actual_sub = subs_output_length(subs_kernel_size, *mel_len);
-                        let &(_, valid_mel, start_sec, end_sec) = &chunks_meta[chunk_batch_start + bi];
-                        let chunk_duration_sec = (valid_mel as f32) * hop_length as f32 / sample_rate_hz as f32;
+                        let &(start_sample, end_sample, _, start_sec, end_sec) = &chunks_meta[chunk_batch_start + bi];
+                        let chunk_duration_sec = (end_sample - start_sample) as f32 / sample_rate_hz as f32;
                         let frame_shift = chunk_duration_sec / (actual_sub.max(1) as f32);
 
                         let item_slice = &flat[bi * item_stride..bi * item_stride + item_stride];
 
-                        let (text, words) = if want_words {
+                        let (text, frames) = if want_words {
                             let (text, frames) = decoder
                                 .decode_with_timestamps(item_slice, t_exec_sub, actual_sub)
                                 .context(CtcDecodeSnafu)?;
-                            let words = ctc_frames_to_words(&text, &frames, frame_shift);
-                            (text, Some(words))
+                            (text, Some(frames))
                         } else {
                             let text = decoder.decode(item_slice, t_exec_sub, actual_sub).context(CtcDecodeSnafu)?;
                             (text, None)
                         };
+                        let words = want_words.then(|| {
+                            let frames = frames.as_deref().unwrap_or(&[]);
+                            ctc_frames_to_words(&text, frames, frame_shift)
+                        });
                         chunk_results.push(ChunkResult { start_sec, end_sec, text, words });
                     }
                 }
@@ -545,8 +549,8 @@ impl<S: Splitter> Transcriber<S> {
                     let flat = enc.as_slice().expect("contiguous encoder output");
                     for (bi, mel_len) in chunk_lengths.iter().enumerate() {
                         let actual_sub = subs_output_length(subs_kernel_size, *mel_len);
-                        let &(_, valid_mel, start_sec, end_sec) = &chunks_meta[chunk_batch_start + bi];
-                        let chunk_duration_sec = (valid_mel as f32) * hop_length as f32 / sample_rate_hz as f32;
+                        let &(start_sample, end_sample, _, start_sec, end_sec) = &chunks_meta[chunk_batch_start + bi];
+                        let chunk_duration_sec = (end_sample - start_sample) as f32 / sample_rate_hz as f32;
                         let frame_shift = chunk_duration_sec / (actual_sub.max(1) as f32);
 
                         let item_slice = &flat[bi * item_stride..bi * item_stride + item_stride];
@@ -555,18 +559,18 @@ impl<S: Splitter> Transcriber<S> {
                         let frames = transpose_dt_to_td(item_slice, d_model, t_exec_sub, actual_sub);
 
                         let backend: &mut RnntStepBackend = backend;
-                        let (raw, emissions, want_emissions) = if want_words {
+                        let (raw, emissions) = if want_words {
                             let (s, e) = decoder
                                 .decode_with_timestamps(&frames, actual_sub, actual_sub, d_model, backend)
                                 .map_err(rnnt_decode_err)?;
-                            (s, e, true)
+                            (s, e)
                         } else {
                             let s = decoder
                                 .decode(&frames, actual_sub, actual_sub, d_model, backend)
                                 .map_err(rnnt_decode_err)?;
-                            (s, Vec::new(), false)
+                            (s, Vec::new())
                         };
-                        let words = want_emissions.then(|| decoder.frames_to_words(&emissions, frame_shift));
+                        let words = want_words.then(|| decoder.frames_to_words(&emissions, frame_shift));
                         // SP pieces carry `▁` (U+2581) as word-initial markers;
                         // after concatenation we restore them as spaces.
                         let text = if *sentencepiece { raw.replace('\u{2581}', " ").trim().to_string() } else { raw };

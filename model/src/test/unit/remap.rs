@@ -178,3 +178,16 @@ fn test_remap_rnnt_joint() {
     assert!(out.contains_key("head.joint.out_w"));
     assert!(out.contains_key("head.joint.out_b"));
 }
+
+#[test]
+fn test_remap_ignores_short_keys_without_panicking() {
+    let config = make_config(ConvNormType::LayerNorm);
+    let mut sd = StateDict::new();
+    sd.insert("encoder".into(), fake_tensor());
+    sd.insert("head".into(), fake_tensor());
+    sd.insert("head.decoder".into(), fake_tensor());
+    sd.insert("model.encoder".into(), fake_tensor());
+
+    let out = remap_pytorch(sd, &config).unwrap();
+    assert!(out.is_empty());
+}
