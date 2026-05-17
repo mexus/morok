@@ -84,6 +84,15 @@ impl Tensor {
     ) -> Result<Tensor> {
         let ndim = self.ndim()?;
         let shape = self.shape()?;
+        // TODO(symbolic-batch): this validates *every* dim is concrete even
+        // though only the `axes` dims are read below (line 107) and only the
+        // non-axes dims are used to build expand shapes (lines 257, 274). For
+        // a symbolic batch with concrete spatial dims (e.g. a JIT input shrunk
+        // to a bound `b`), this fails unnecessarily. Narrow this to the axes
+        // dims, and have the expand-shape construction below carry SInt rather
+        // than going through `usize`. The result is the only thing using
+        // `_shape_dims` is its discard binding — drop it once the rest of the
+        // function stops needing fully-concrete shapes.
         let _shape_dims = morok_ir::shape::to_vec_usize(&shape).context(UOpSnafu)?;
 
         let axes: Vec<usize> = axes.map(|a| a.to_vec()).unwrap_or_else(|| (0..ndim).collect());
@@ -102,6 +111,10 @@ impl Tensor {
 
         // Input spatial dimensions (last len(axes) dims of permuted x)
         let x_shape = x.shape()?;
+        // TODO(symbolic-batch): same issue as above — only `input_shape` (the
+        // trailing spatial dims) is actually used; the non-axes prefix is
+        // copied into `expand_shape` later and never compared to a `usize`,
+        // so it could stay as `SInt` and admit symbolic dims.
         let x_dims = morok_ir::shape::to_vec_usize(&x_shape).context(UOpSnafu)?;
         let n_spatial = axes.len();
         let input_shape: Vec<usize> = x_dims[ndim - n_spatial..].to_vec();
@@ -247,6 +260,13 @@ impl Tensor {
             for (i, idx) in int_indexes.iter().enumerate() {
                 let dim = (ndim - n_spatial + i) as isize;
                 let cur_shape = x.shape()?;
+                // TODO(symbolic-batch): `cur_dims` is built only to feed
+                // `expand_shape` below, which forces a `usize → isize` cast on
+                // every dim. For a symbolic prefix this loses information and
+                // aborts here. `try_expand` would need to accept `SInt` (it
+                // already does internally) so we can pass the symbolic dims
+                // through; then we'd substitute `out_sz` at the axis position
+                // and keep the rest of the shape as-is.
                 let cur_dims = morok_ir::shape::to_vec_usize(&cur_shape).context(UOpSnafu)?;
                 let out_sz = output_sizes[i];
 

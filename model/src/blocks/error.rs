@@ -1,0 +1,13 @@
+use snafu::Snafu;
+
+#[derive(Debug, Snafu)]
+#[snafu(visibility(pub))]
+pub enum Error {
+    #[snafu(display("{source}"))]
+    Tensor {
+        #[snafu(source(from(morok_tensor::error::Error, Box::new)))]
+        source: Box<morok_tensor::error::Error>,
+    },
+}
+
+pub type Result<T> = std::result::Result<T, Error>;

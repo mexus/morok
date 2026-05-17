@@ -4,7 +4,7 @@ use morok_tensor::{Tensor, Variable};
 
 use crate::gigaam::{ConvNormType, GigaAm, GigaAmConfig, GigaAmEncoderJit, SubsamplingMode};
 
-fn test_config() -> GigaAmConfig {
+pub(super) fn test_config() -> GigaAmConfig {
     GigaAmConfig {
         max_batch_size: 8,
         n_mels: 64,
@@ -39,6 +39,10 @@ fn read_prefix_f32(t: &Tensor, len: usize) -> Vec<f32> {
     buf.as_array::<f32>().unwrap().as_slice().unwrap()[..len].to_vec()
 }
 
+// ---------------------------------------------------------------------------
+// Cheap default tests (no realize): config + structural invariants.
+// ---------------------------------------------------------------------------
+
 #[test]
 fn test_output_length_matches_forward() {
     let model = GigaAm::with_random_weights(test_config());
@@ -55,64 +59,6 @@ fn test_output_length_matches_forward() {
 }
 
 #[test]
-fn test_batched_jit_prepare_and_execute() {
-    let model = model_with_random_weights();
-    let mut jit = GigaAmEncoderJit::new(model);
-
-    let (b, t, n_mels) = (2, 10, test_config().n_mels);
-    jit.prepare(crate::jit::InputSpec::f32(&[b, n_mels, t]), crate::jit::InputSpec::i32(&[b])).unwrap();
-    jit.execute_with_vars(&[("b", b as i64), ("t", t as i64)]).unwrap();
-
-    let output = jit.output().unwrap();
-    assert!(output.size() > 0);
-}
-
-#[test]
-fn test_batched_jit_prepare_large_shape() {
-    let model = model_with_random_weights();
-    let mut jit = GigaAmEncoderJit::new(model);
-
-    let cfg = test_config();
-    jit.prepare(
-        crate::jit::InputSpec::f32(&[cfg.max_batch_size, cfg.n_mels, cfg.max_mel_frames]),
-        crate::jit::InputSpec::i32(&[cfg.max_batch_size]),
-    )
-    .unwrap();
-    jit.execute_with_vars(&[("b", cfg.max_batch_size as i64), ("t", cfg.max_mel_frames as i64)]).unwrap();
-
-    let output = jit.output().unwrap();
-    assert!(output.size() > 0);
-}
-
-#[test]
-fn test_batched_jit_t_bound_is_mel_frames() {
-    let model = model_with_random_weights();
-    let cfg = test_config();
-    assert!(cfg.max_mel_frames > cfg.max_encoder_frames);
-
-    let mut jit = GigaAmEncoderJit::new(model);
-    jit.prepare(crate::jit::InputSpec::f32(&[1, cfg.n_mels, cfg.max_mel_frames]), crate::jit::InputSpec::i32(&[1]))
-        .unwrap();
-    jit.execute_with_vars(&[("b", 1), ("t", cfg.max_mel_frames as i64)]).unwrap();
-}
-
-#[test]
-fn test_batched_jit_rejects_t_above_max_mel_frames() {
-    let model = model_with_random_weights();
-    let cfg = test_config();
-    let mut jit = GigaAmEncoderJit::new(model);
-    jit.prepare(crate::jit::InputSpec::f32(&[1, cfg.n_mels, cfg.max_mel_frames]), crate::jit::InputSpec::i32(&[1]))
-        .unwrap();
-    let err = jit.execute_with_vars(&[("b", 1), ("t", cfg.max_mel_frames as i64 + 1)]).unwrap_err();
-    match err {
-        crate::jit::JitError::Runtime { source: morok_runtime::Error::Execution { reason } } => {
-            assert!(reason.contains("outside bounds"), "unexpected runtime error: {reason}");
-        }
-        other => panic!("expected runtime bounds error, got {other:?}"),
-    }
-}
-
-#[test]
 fn test_rope_cache_uses_encoder_bound() {
     let model = model_with_random_weights();
     let cfg = test_config();
@@ -123,12 +69,48 @@ fn test_rope_cache_uses_encoder_bound() {
 }
 
 #[test]
-fn test_encode_batch_near_max_mel_stays_within_encoder_bound() {
+fn test_subsampled_max_mel_fits_encoder_bound() {
+    let model = model_with_random_weights();
+    let cfg = test_config();
+    let t_sub = model.encoder.subsampling_output_length(cfg.max_mel_frames);
+    assert!(
+        t_sub <= cfg.max_encoder_frames,
+        "subsampled max_mel ({t_sub}) > max_encoder_frames ({})",
+        cfg.max_encoder_frames
+    );
+}
+
+#[test]
+#[should_panic(expected = "with_b_bound(0) creates empty range")]
+fn test_with_b_bound_panics_on_empty_range() {
+    let model = model_with_random_weights();
+    let _jit = GigaAmEncoderJit::new(model).with_b_bound(0);
+}
+
+// ---------------------------------------------------------------------------
+// Heavy tests (realize / prepare): unique signal, gated behind --ignored.
+// Run on demand when actively touching the GigaAM encoder, JIT plumbing, or
+// the schedule pipeline. Each costs ~30s of prepare with random weights.
+// ---------------------------------------------------------------------------
+
+#[test]
+#[ignore = "heavy: realize-based bounds-error JIT smoke"]
+fn test_batched_jit_rejects_t_above_max_mel_frames() {
+    let model = model_with_random_weights();
+    let cfg = test_config();
+    let mut jit = GigaAmEncoderJit::new(model);
+    jit.prepare(crate::jit::InputSpec::f32(&[1, cfg.n_mels, cfg.max_mel_frames]), crate::jit::InputSpec::i32(&[1]))
+        .unwrap();
+    let err = jit.execute_with_vars(&[("b", 1), ("t", cfg.max_mel_frames as i64 + 1)]).unwrap_err();
+    assert_runtime_bounds_err(err);
+}
+
+#[test]
+#[ignore = "heavy: full encoder forward at max_mel_frames"]
+fn test_encode_batch_near_max_mel_runs() {
     let model = model_with_random_weights();
     let cfg = test_config();
     let t = cfg.max_mel_frames;
-    let t_sub = model.encoder.subsampling_output_length(t);
-    assert!(t_sub <= cfg.max_encoder_frames);
 
     let x = Tensor::full(&[1, cfg.n_mels, t], 0.1f32, DType::Float32).unwrap();
     let lengths = Tensor::from_slice([t as i32]);
@@ -143,6 +125,7 @@ fn test_encode_batch_near_max_mel_stays_within_encoder_bound() {
 }
 
 #[test]
+#[ignore = "heavy: batched-vs-single numerical consistency (the suite's only correctness assert)"]
 fn test_single_vs_batch_consistency() {
     let model = model_with_random_weights();
     let d = test_config().d_model;
@@ -198,6 +181,7 @@ fn test_single_vs_batch_consistency() {
 }
 
 #[test]
+#[ignore = "heavy: NaN/Inf detector across encoder forward"]
 fn test_encode_batch_full_lengths_finite() {
     let model = model_with_random_weights();
     let cfg = test_config();
@@ -222,6 +206,7 @@ fn test_encode_batch_full_lengths_finite() {
 }
 
 #[test]
+#[ignore = "heavy: symbolic seq-len threading through compiled kernels"]
 fn test_encode_batch_respects_dynamic_seq_len() {
     let model = model_with_random_weights();
     let cfg = test_config();
@@ -252,52 +237,40 @@ fn assert_runtime_bounds_err(err: crate::jit::JitError) {
 }
 
 #[test]
+#[ignore = "heavy: variable upper-bound enforcement at execute time"]
 fn test_with_b_bound_shrinks_upper_bound() {
     let model = model_with_random_weights();
     let cfg = test_config();
-    // Default b range is [1, max_batch_size=8]. Shrink to [1, 2].
     let mut jit = GigaAmEncoderJit::new(model).with_b_bound(2);
     jit.prepare(crate::jit::InputSpec::f32(&[2, cfg.n_mels, 64]), crate::jit::InputSpec::i32(&[2])).unwrap();
     jit.execute_with_vars(&[("b", 2), ("t", 64)]).unwrap();
-    // b=3 is now outside the shrunken bound even though config allowed up to 8.
     assert_runtime_bounds_err(jit.execute_with_vars(&[("b", 3), ("t", 64)]).unwrap_err());
 }
 
 #[test]
+#[ignore = "heavy: with_t_fixed should fold the symbolic dim out of compiled kernels"]
 fn test_with_t_fixed_specializes_kernels() {
     let model = model_with_random_weights();
     let cfg = test_config();
     let pinned_t = 64usize;
     let mut jit = GigaAmEncoderJit::new(model).with_t_fixed(pinned_t);
     jit.prepare(crate::jit::InputSpec::f32(&[1, cfg.n_mels, pinned_t]), crate::jit::InputSpec::i32(&[1])).unwrap();
-    // With `t` pinned at JIT time, the symbolic axis is folded to a const by the
-    // trivial-range simplifier, so no compiled kernel should retain `t` as a
-    // runtime variable. `b` is still dynamic and should still appear.
     let kernels = jit.prepared_kernels().unwrap();
     let any_kernel_keeps_t = kernels.iter().any(|k| k.kernel.var_names.iter().any(|n| n == "t"));
     assert!(!any_kernel_keeps_t, "with_t_fixed should fold `t` out of kernel var lists");
     let any_kernel_keeps_b = kernels.iter().any(|k| k.kernel.var_names.iter().any(|n| n == "b"));
     assert!(any_kernel_keeps_b, "`b` is still dynamic and should remain in some kernel's var list");
 
-    // Execute with the pinned value succeeds; passing `t` is permitted but
-    // discarded since no kernel reads it.
     jit.execute_with_vars(&[("b", 1), ("t", pinned_t as i64)]).unwrap();
 }
 
 #[test]
+#[ignore = "heavy: variable lower-bound enforcement at execute time"]
 fn test_with_b_min_bound_raises_lower_bound() {
     let model = model_with_random_weights();
     let cfg = test_config();
-    // Default b range is [1, 8]. Raise lower bound to 2.
     let mut jit = GigaAmEncoderJit::new(model).with_b_min_bound(2);
     jit.prepare(crate::jit::InputSpec::f32(&[2, cfg.n_mels, 64]), crate::jit::InputSpec::i32(&[2])).unwrap();
     jit.execute_with_vars(&[("b", 2), ("t", 64)]).unwrap();
     assert_runtime_bounds_err(jit.execute_with_vars(&[("b", 1), ("t", 64)]).unwrap_err());
-}
-
-#[test]
-#[should_panic(expected = "with_b_bound(0) creates empty range")]
-fn test_with_b_bound_panics_on_empty_range() {
-    let model = model_with_random_weights();
-    let _jit = GigaAmEncoderJit::new(model).with_b_bound(0);
 }

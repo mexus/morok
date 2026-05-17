@@ -3,7 +3,7 @@ codegen/src/test/
 device/src/test/
 dtype/src/test/
 ir/src/test/
-models/src/test/
+model/src/test/
 onnx/src/test/
 runtime/src/test/
 schedule/src/test/
