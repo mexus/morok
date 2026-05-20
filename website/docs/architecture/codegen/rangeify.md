@@ -27,14 +27,14 @@ sidebar_label: Phase 1 — Rangeify
 | Movement on INDEX | Apply movement to index expressions | `INDEX(PERMUTE(arr), [i, j]) → INDEX(arr, [j, i])` | `movement_op_patterns()` |
 | Movement through AFTER | Move RESHAPE through timing wrapper (Tinygrad-specific) | `AFTER(RESHAPE(x, arg), [dep1, dep2]) → RESHAPE(AFTER(x, [dep2]), arg)` | Tinygrad only |
 | Movement through END | Unwrap movement from END wrapper (Tinygrad-specific) | `END(RESHAPE(x), ranges) → END(x, ranges)` | Tinygrad only |
-| Nested INDEX simplification | Remove redundant nested INDEX (Morok) | `INDEX(INDEX(ptr, [i]), [i]) → INDEX(ptr, [i])` | `movement_op_patterns()` |
+| Nested INDEX simplification | Remove redundant nested INDEX (Svod) | `INDEX(INDEX(ptr, [i]), [i]) → INDEX(ptr, [i])` | `movement_op_patterns()` |
 | Nested INDEX concat | Flatten nested INDEX for PtrDType | `INDEX(INDEX(ptr, i), j) → INDEX(ptr, i, j)` | `pm_syntactic_sugar` |
 
 **Why bottom-up?** Child nodes must be clean before parents can match. Movement ops nest deeply; cleaning from bottom prevents missed patterns.
 
-**Note**: Tinygrad and Morok have different approaches here. Tinygrad moves movement ops through wrappers (AFTER, END) because it re-applies movement ops during bufferization. Morok removes movement ops entirely by transforming indices during bufferization, so AFTER/END patterns are not needed.
+**Note**: Tinygrad and Svod have different approaches here. Tinygrad moves movement ops through wrappers (AFTER, END) because it re-applies movement ops during bufferization. Svod removes movement ops entirely by transforming indices during bufferization, so AFTER/END patterns are not needed.
 
-**Morok**: `movement_op_patterns()` in `rangeify/patterns.rs`
+**Svod**: `movement_op_patterns()` in `rangeify/patterns.rs`
 
 ---
 
@@ -68,7 +68,7 @@ The mechanism works by:
 
 **Note**: WHERE movement through INDEX (`pm_move_where_on_load`) is a separate optimization that places conditionals before loads to skip memory accesses, but it doesn't eliminate REDUCE operations.
 
-**Morok**: `pm_load_collapse()` in `rangeify/patterns.rs`
+**Svod**: `pm_load_collapse()` in `rangeify/patterns.rs`
 
 ---
 
@@ -104,7 +104,7 @@ This enables:
 
 **Note**: The split only applies when `end % mod == 0` (divisibility check).
 
-**Morok**: `pm_split_ranges()` + `pm_flatten_range()` in `rangeify/transforms.rs`
+**Svod**: `pm_split_ranges()` + `pm_flatten_range()` in `rangeify/transforms.rs`
 
 ---
 
@@ -152,7 +152,7 @@ NOT(NOT(x)) → x
 - Where folding (combine WHERE with same conditions)
 - Reduce mul chain (move multiplications outside reduce)
 
-**Morok**: `symbolic()` in `symbolic/patterns.rs`
+**Svod**: `symbolic()` in `symbolic/patterns.rs`
 
 ---
 
@@ -185,7 +185,7 @@ Merge criteria:
 
 The compiler only merges if it saves operations. Merging might require division/modulo to recalculate indices. If that costs more than it saves, merge is skipped.
 
-**Morok**: `simplify_merge_adjacent()` in `rangeify/transforms.rs`
+**Svod**: `simplify_merge_adjacent()` in `rangeify/transforms.rs`
 
 ---
 
@@ -257,4 +257,4 @@ Optimization Search:
 
 **Note**: NOLOCALS is a constraint that sets `dont_use_locals = True`, preventing further LOCAL actions and affecting shared memory usage decisions.
 
-**Morok**: `optimizer/mod.rs`, `optimizer/opts.rs`
+**Svod**: `optimizer/mod.rs`, `optimizer/opts.rs`

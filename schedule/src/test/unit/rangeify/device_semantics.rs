@@ -9,8 +9,8 @@
 
 use std::sync::Arc;
 
-use morok_dtype::{AddrSpace, DType, DeviceSpec};
-use morok_ir::{Op, UOp};
+use svod_dtype::{AddrSpace, DType, DeviceSpec};
+use svod_ir::{Op, UOp};
 
 use crate::rangeify::patterns::extract_device_from_graph;
 

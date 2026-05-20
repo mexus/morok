@@ -1,6 +1,6 @@
 use crate::test::helpers::*;
 
-morok_tensor::codegen_tests! {
+svod_tensor::codegen_tests! {
     fn test_slice_step_2(config) {
         let registry = OpRegistry::new();
         let data = Tensor::from_slice([0.0f32, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0]);

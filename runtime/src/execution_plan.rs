@@ -30,12 +30,12 @@ use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 
-use morok_device::device::ProgramSpec;
-use morok_device::{Buffer, BufferId};
-use morok_dtype::DeviceSpec;
-use morok_ir::{CustomFunctionKind, Op, UOp};
 use rayon::prelude::*;
 use smallvec::SmallVec;
+use svod_device::device::ProgramSpec;
+use svod_device::{Buffer, BufferId};
+use svod_dtype::DeviceSpec;
+use svod_ir::{CustomFunctionKind, Op, UOp};
 
 use crate::error::Result;
 use crate::kernel_cache::CachedKernel;

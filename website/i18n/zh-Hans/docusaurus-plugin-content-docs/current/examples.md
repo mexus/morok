@@ -4,7 +4,7 @@ sidebar_label: 实践示例
 
 # 实践：从 Tensor 到模型
 
-本章通过渐进式示例教你使用 Morok。你将从基本的张量操作开始，逐步构建出一个完整的神经网络分类器。
+本章通过渐进式示例教你使用 Svod。你将从基本的张量操作开始，逐步构建出一个完整的神经网络分类器。
 
 **你将学到：**
 - 创建和操作张量
@@ -15,9 +15,9 @@ sidebar_label: 实践示例
 
 **前置条件：**
 - 基本的 Rust 知识
-- 在 `Cargo.toml` 中添加 `morok_tensor`
+- 在 `Cargo.toml` 中添加 `svod_tensor`
 
-**核心模式：** Morok 使用*惰性求值*。操作只构建计算图，不会立即执行。调用 `realize()` 时才会一次性编译和运行所有操作。
+**核心模式：** Svod 使用*惰性求值*。操作只构建计算图，不会立即执行。调用 `realize()` 时才会一次性编译和运行所有操作。
 
 ---
 
@@ -26,7 +26,7 @@ sidebar_label: 实践示例
 创建张量、执行操作并获取结果。
 
 ```rust
-use morok_tensor::Tensor;
+use svod_tensor::Tensor;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create tensors from slices
@@ -53,7 +53,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 2. `&a + &b` 不会执行任何计算，它返回一个*表示*加法操作的新 `Tensor`。`&` 借用张量以便后续复用。
 
-3. `realize()` 是关键所在。Morok 会：
+3. `realize()` 是关键所在。Svod 会：
    - 分析计算图
    - 尽可能融合操作
    - 生成优化后的代码
@@ -177,14 +177,14 @@ fn matmul_example() -> Result<(), Box<dyn std::error::Error>> {
 
 ## 示例 4：构建线性层
 
-线性层计算 `y = x @ W.T + b`。Morok 提供了开箱即用的 `nn::Linear`。
+线性层计算 `y = x @ W.T + b`。Svod 提供了开箱即用的 `nn::Linear`。
 
 ```rust
-use morok_tensor::{Tensor, nn::{Linear, Layer}};
+use svod_tensor::{Tensor, nn::{Linear, Layer}};
 
 fn linear_example() -> Result<(), Box<dyn std::error::Error>> {
     // Create a layer: 4 inputs → 2 outputs
-    let layer = Linear::with_dims(4, 2, morok_dtype::DType::Float32);
+    let layer = Linear::with_dims(4, 2, svod_dtype::DType::Float32);
 
     // Single sample with 4 features
     let input = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0]);
@@ -215,12 +215,12 @@ PyTorch 惯例将权重存储为 `[out_features, in_features]`。对于一个 4 
 使用 `sequential()` 链接层，构建一个完整的神经网络。
 
 ```rust
-use morok_tensor::{Tensor, nn::{Linear, Relu, Layer}};
+use svod_tensor::{Tensor, nn::{Linear, Relu, Layer}};
 
 fn mnist_example() -> Result<(), Box<dyn std::error::Error>> {
     // Architecture: 784 (28×28 pixels) → 128 (hidden) → 10 (digits)
-    let fc1 = Linear::with_dims(784, 128, morok_dtype::DType::Float32);
-    let fc2 = Linear::with_dims(128, 10, morok_dtype::DType::Float32);
+    let fc1 = Linear::with_dims(784, 128, svod_dtype::DType::Float32);
+    let fc2 = Linear::with_dims(128, 10, svod_dtype::DType::Float32);
 
     // Simulate a 28×28 grayscale image (flattened to 784)
     let fake_image: Vec<f32> = (0..784)
@@ -262,7 +262,7 @@ fn mnist_example() -> Result<(), Box<dyn std::error::Error>> {
 
 ## 示例 6：深入内部
 
-想看看 Morok 生成了什么？以下是如何查看 IR 和生成的代码。
+想看看 Svod 生成了什么？以下是如何查看 IR 和生成的代码。
 
 ```rust
 fn inspect_compilation() -> Result<(), Box<dyn std::error::Error>> {
@@ -287,9 +287,9 @@ fn inspect_compilation() -> Result<(), Box<dyn std::error::Error>> {
 
 **你会看到：**
 
-1. **IR 图：** UOp 树展示了 `BUFFER`、`LOAD`、`ADD`、`STORE` 等操作。这是 Morok 在优化之前的中间表示。
+1. **IR 图：** UOp 树展示了 `BUFFER`、`LOAD`、`ADD`、`STORE` 等操作。这是 Svod 在优化之前的中间表示。
 
-2. **生成的代码：** 实际运行的 LLVM IR 或 GPU 代码。注意 Morok 是如何将 load 和 add 融合到一个 kernel 中的——无需中间缓冲区。
+2. **生成的代码：** 实际运行的 LLVM IR 或 GPU 代码。注意 Svod 是如何将 load 和 add 融合到一个 kernel 中的——无需中间缓冲区。
 
 **调试技巧：** 如果某些操作看起来慢或不对，打印 IR 树。注意检查：
 - 意外的操作（冗余的 reshape、多余的拷贝）
@@ -300,7 +300,7 @@ fn inspect_compilation() -> Result<(), Box<dyn std::error::Error>> {
 
 ## 总结
 
-你已经学会了使用 Morok 的核心模式：
+你已经学会了使用 Svod 的核心模式：
 
 | 任务 | 代码 |
 |------|------|
@@ -320,7 +320,7 @@ fn inspect_compilation() -> Result<(), Box<dyn std::error::Error>> {
 
 1. 用各种操作构建计算图
 2. 最后调用一次 `realize()`
-3. Morok 统一优化并执行所有操作
+3. Svod 统一优化并执行所有操作
 
 **下一步：**
 

@@ -5,8 +5,8 @@ use snafu::Snafu;
 pub enum Error {
     #[snafu(display("{source}"))]
     Tensor {
-        #[snafu(source(from(morok_tensor::error::Error, Box::new)))]
-        source: Box<morok_tensor::error::Error>,
+        #[snafu(source(from(svod_tensor::error::Error, Box::new)))]
+        source: Box<svod_tensor::error::Error>,
     },
 }
 

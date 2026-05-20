@@ -1,4 +1,4 @@
-# Morok
+# Svod
 
 > **Alpha software.** Core functionality is tested, but APIs are unstable and may change without notice.
 
@@ -14,7 +14,7 @@ A Rust-based ML compiler inspired by [Tinygrad](https://github.com/tinygrad/tiny
 | **80+ IR Operations** | Arithmetic, memory, control flow, WMMA tensor cores |
 | **20+ Optimizations** | Constant folding, tensor cores, vectorization, loop unrolling |
 
-For architecture details, see the [documentation site](https://npatsakula.github.io/morok/).
+For architecture details, see the [documentation site](https://npatsakula.github.io/svod/).
 
 ## Workspace
 
@@ -35,7 +35,7 @@ For architecture details, see the [documentation site](https://npatsakula.github
 ## Quick Example
 
 ```rust
-use morok_tensor::Tensor;
+use svod_tensor::Tensor;
 use ndarray::array;
 
 // Zero-copy from ndarray (C-contiguous fast path)
@@ -57,7 +57,7 @@ assert_eq!(flat, vec![6.0, 8.0, 10.0, 12.0]);
 ## Pattern DSL Example
 
 ```rust
-use morok_schedule::patterns;
+use svod_schedule::patterns;
 
 let optimizer = patterns! {
     // Identity folding (commutative)

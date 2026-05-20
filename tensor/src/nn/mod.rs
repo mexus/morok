@@ -34,9 +34,9 @@ impl Layer for Relu {
 pub use pad::{auto_pad_split, flat_pads_to_pairs, resolve_pool_pads};
 
 use bon::bon;
-use morok_dtype::DType;
-use morok_ir::SInt;
 use snafu::ResultExt;
+use svod_dtype::DType;
+use svod_ir::SInt;
 
 use crate::Tensor;
 use crate::error::{DivisibilitySnafu, NdimExactSnafu, NdimMinimumSnafu, ParamRangeSnafu, UOpSnafu};
@@ -206,7 +206,7 @@ impl Tensor {
     /// # Examples
     ///
     /// ```
-    /// # use morok_tensor::Tensor;
+    /// # use svod_tensor::Tensor;
     /// # use ndarray::array;
     /// let logprobs = Tensor::from_ndarray(&array![[-0.5f32, -1.0, -2.0]]);
     /// let target = Tensor::from_slice([0i64]);
@@ -220,8 +220,8 @@ impl Tensor {
     /// With sum reduction:
     ///
     /// ```
-    /// # use morok_tensor::Tensor;
-    /// # use morok_tensor::nn::Reduction;
+    /// # use svod_tensor::Tensor;
+    /// # use svod_tensor::nn::Reduction;
     /// # use ndarray::array;
     /// let logprobs = Tensor::from_ndarray(&array![[-0.5f32, -1.0], [-2.0, -0.3]]);
     /// let target = Tensor::from_slice([0i64, 1]);
@@ -249,11 +249,11 @@ impl Tensor {
             Some(w) => {
                 let flat = target.try_reshape([-1])?;
                 let sel = w.gather(0, &flat)?;
-                let target_shape = morok_ir::shape::to_vec_isize(&target.shape()?).context(UOpSnafu)?;
+                let target_shape = svod_ir::shape::to_vec_isize(&target.shape()?).context(UOpSnafu)?;
                 sel.try_reshape(&target_shape)?
             }
             None => {
-                let shape = morok_ir::shape::to_vec_usize(&target.shape()?).context(UOpSnafu)?;
+                let shape = svod_ir::shape::to_vec_usize(&target.shape()?).context(UOpSnafu)?;
                 Tensor::full(&shape, 1.0, self.uop().dtype())?
             }
         };
@@ -287,7 +287,7 @@ impl Tensor {
     /// # Examples
     ///
     /// ```
-    /// # use morok_tensor::Tensor;
+    /// # use svod_tensor::Tensor;
     /// # use ndarray::array;
     /// let x = Tensor::from_ndarray(&array![1.0f32, 2.0, 3.0]);
     /// let (mut out, mut mask) = x.dropout().p(0.5).call().unwrap();
@@ -304,7 +304,7 @@ impl Tensor {
             ParamRangeSnafu { op: "dropout", param: "p", value: p.to_string(), constraint: "0.0 <= p <= 1.0" }
         );
         let _ = p;
-        let shape = morok_ir::shape::to_vec_usize(&self.shape()?).context(UOpSnafu)?;
+        let shape = svod_ir::shape::to_vec_usize(&self.shape()?).context(UOpSnafu)?;
         if !training {
             let mask = Tensor::full(&shape, true, DType::Bool)?;
             return Ok((self.clone(), mask));
@@ -324,7 +324,7 @@ impl Tensor {
     /// Basic convolution with no padding:
     ///
     /// ```
-    /// # use morok_tensor::Tensor;
+    /// # use svod_tensor::Tensor;
     /// # use ndarray::Array4;
     /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 5, 5), 1.0f32));
     /// let w = Tensor::from_ndarray(&Array4::from_elem((1, 1, 3, 3), 1.0f32));
@@ -339,7 +339,7 @@ impl Tensor {
     /// With explicit padding and strides:
     ///
     /// ```
-    /// # use morok_tensor::Tensor;
+    /// # use svod_tensor::Tensor;
     /// # use ndarray::Array4;
     /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 5, 5), 1.0f32));
     /// let w = Tensor::from_ndarray(&Array4::from_elem((1, 1, 3, 3), 1.0f32));
@@ -395,7 +395,7 @@ impl Tensor {
     /// Basic transposed convolution (upsampling):
     ///
     /// ```
-    /// # use morok_tensor::Tensor;
+    /// # use svod_tensor::Tensor;
     /// # use ndarray::Array4;
     /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 2, 2), 1.0f32));
     /// let w = Tensor::from_ndarray(&Array4::from_elem((1, 1, 3, 3), 1.0f32));
@@ -409,7 +409,7 @@ impl Tensor {
     /// With stride (larger upsampling factor):
     ///
     /// ```
-    /// # use morok_tensor::Tensor;
+    /// # use svod_tensor::Tensor;
     /// # use ndarray::Array4;
     /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 2, 2), 1.0f32));
     /// let w = Tensor::from_ndarray(&Array4::from_elem((1, 1, 3, 3), 1.0f32));
@@ -512,7 +512,7 @@ impl Tensor {
     /// # Examples
     ///
     /// ```
-    /// # use morok_tensor::Tensor;
+    /// # use svod_tensor::Tensor;
     /// # use ndarray::Array4;
     /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 4, 4), 1.0f32));
     /// let mut y = x.avg_pool().kernel_shape(&[2, 2]).call().unwrap();
@@ -526,7 +526,7 @@ impl Tensor {
     /// With strides:
     ///
     /// ```
-    /// # use morok_tensor::Tensor;
+    /// # use svod_tensor::Tensor;
     /// # use ndarray::Array4;
     /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 4, 4), 1.0f32));
     /// let mut y = x.avg_pool().kernel_shape(&[2, 2]).strides(&[2, 2]).call().unwrap();
@@ -580,7 +580,7 @@ impl Tensor {
     /// # Examples
     ///
     /// ```
-    /// # use morok_tensor::Tensor;
+    /// # use svod_tensor::Tensor;
     /// # use ndarray::Array4;
     /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 4, 4), 1.0f32));
     /// let mut y = x.lp_pool().kernel_shape(&[2, 2]).call().unwrap();
@@ -656,7 +656,7 @@ impl Tensor {
     /// # Examples
     ///
     /// ```
-    /// # use morok_tensor::Tensor;
+    /// # use svod_tensor::Tensor;
     /// # use ndarray::Array4;
     /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 4, 1, 1), 1.0f32));
     /// let mut y = x.depth_to_space().blocksize(2).call().unwrap();
@@ -669,8 +669,8 @@ impl Tensor {
     /// Using CRD mode (PyTorch pixel_shuffle order):
     ///
     /// ```
-    /// # use morok_tensor::Tensor;
-    /// # use morok_tensor::nn::DepthToSpaceMode;
+    /// # use svod_tensor::Tensor;
+    /// # use svod_tensor::nn::DepthToSpaceMode;
     /// # use ndarray::Array4;
     /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 4, 1, 1), 1.0f32));
     /// let mut y = x.depth_to_space().blocksize(2).mode(DepthToSpaceMode::Crd).call().unwrap();
@@ -742,7 +742,7 @@ impl Tensor {
     /// # Examples
     ///
     /// ```
-    /// # use morok_tensor::Tensor;
+    /// # use svod_tensor::Tensor;
     /// # use ndarray::Array4;
     /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 4, 4), 1.0f32));
     /// let mut y = x.space_to_depth(2).unwrap();
@@ -816,7 +816,7 @@ impl Tensor {
     /// # Examples
     ///
     /// ```
-    /// # use morok_tensor::Tensor;
+    /// # use svod_tensor::Tensor;
     /// # use ndarray::Array4;
     /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 4, 4), 1.0f32));
     /// let (vals, indices) = x.max_pool().kernel_shape(&[2, 2]).call().unwrap();
@@ -827,7 +827,7 @@ impl Tensor {
     /// With strides:
     ///
     /// ```
-    /// # use morok_tensor::Tensor;
+    /// # use svod_tensor::Tensor;
     /// # use ndarray::Array4;
     /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 4, 4), 1.0f32));
     /// let (vals, _) = x.max_pool().kernel_shape(&[2, 2]).strides(&[2, 2]).call().unwrap();
@@ -888,7 +888,7 @@ impl Tensor {
     /// # Examples
     ///
     /// ```
-    /// # use morok_tensor::Tensor;
+    /// # use svod_tensor::Tensor;
     /// # use ndarray::Array4;
     /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 3, 2, 2), 1.0f32));
     /// let y = x.lrn().size(3).call().unwrap();
@@ -899,7 +899,7 @@ impl Tensor {
     /// Custom alpha, beta, and bias:
     ///
     /// ```
-    /// # use morok_tensor::Tensor;
+    /// # use svod_tensor::Tensor;
     /// # use ndarray::Array4;
     /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 3, 2, 2), 1.0f32));
     /// let y = x.lrn().size(3).alpha(0.001).beta(0.5).bias(2.0).call().unwrap();

@@ -4,7 +4,7 @@ sidebar_label: Algebraic Simplification
 
 # Algebraic Simplification Patterns
 
-Morok's symbolic simplifier rewrites UOp computation graphs using 140+ algebraic patterns defined in `schedule/src/symbolic/patterns.rs`. These patterns fire at multiple points in the pipeline:
+Svod's symbolic simplifier rewrites UOp computation graphs using 140+ algebraic patterns defined in `schedule/src/symbolic/patterns.rs`. These patterns fire at multiple points in the pipeline:
 
 | Where | Matcher | Context |
 |-------|---------|---------|
@@ -242,7 +242,7 @@ Constant pushing is essential for index extraction. It ensures constants bubble 
 |---------|--------|-------|
 | `SUB(a, SUB(b, x))` | `ADD(x, SUB(a, b))` | Exposes inner variable |
 
-Morok keeps `SUB` as a first-class IR op (unlike Tinygrad which canonicalizes `a-b` to `ADD(a, NEG(b))`). This pattern ensures nested `SUB`s don't block further simplification.
+Svod keeps `SUB` as a first-class IR op (unlike Tinygrad which canonicalizes `a-b` to `ADD(a, NEG(b))`). This pattern ensures nested `SUB`s don't block further simplification.
 
 ---
 
@@ -309,7 +309,7 @@ The division lifting for `LT(x//d, c)` handles both positive and non-positive `c
 | `MAX(x, y)` | `x` | When `x.vmin >= y.vmax` (bounds prove dominance) |
 | `MAX(x, y)` | `y` | When `y.vmin >= x.vmax` |
 
-Uses `VminVmaxProperty` for range analysis. No separate `MIN` patterns -- Morok lowers `MIN(a,b)` to `NEG(MAX(NEG(a), NEG(b)))` before these patterns fire.
+Uses `VminVmaxProperty` for range analysis. No separate `MIN` patterns -- Svod lowers `MIN(a,b)` to `NEG(MAX(NEG(a), NEG(b)))` before these patterns fire.
 
 ---
 
@@ -344,7 +344,7 @@ Tinygrad has the same guard: `symbolic.py:201-202`.
 
 ## 13. Invalid Propagation
 
-Invalid is Morok's sentinel for out-of-bounds tensor regions created by padding operations. These patterns must run **before** identity patterns like `x*0=0`, otherwise validity markers are destroyed.
+Invalid is Svod's sentinel for out-of-bounds tensor regions created by padding operations. These patterns must run **before** identity patterns like `x*0=0`, otherwise validity markers are destroyed.
 
 ### Pattern Priority Example
 

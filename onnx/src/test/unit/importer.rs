@@ -137,7 +137,7 @@ fn test_import_with_matmul() {
 fn test_input_spec_static_shape() {
     let spec = InputSpec::new(
         vec![DimValue::Static(2), DimValue::Static(3)],
-        DType::Scalar(morok_dtype::ScalarDType::Float32),
+        DType::Scalar(svod_dtype::ScalarDType::Float32),
         false,
     );
 
@@ -149,7 +149,7 @@ fn test_input_spec_static_shape() {
 fn test_input_spec_dynamic_shape() {
     let spec = InputSpec::new(
         vec![DimValue::Dynamic("batch".to_string()), DimValue::Static(3)],
-        DType::Scalar(morok_dtype::ScalarDType::Float32),
+        DType::Scalar(svod_dtype::ScalarDType::Float32),
         false,
     );
 
@@ -926,7 +926,7 @@ fn make_if_model(cond_value: bool, x_values: &[f32]) -> ModelProto {
 // Codegen-required tests (realize/to_vec)
 // =========================================================================
 
-morok_tensor::codegen_tests! {
+svod_tensor::codegen_tests! {
     fn test_if_true_condition(config) {
         let importer = OnnxImporter::new();
         let model = make_if_model(true, &[1.0, 2.0, 3.0]);
@@ -1433,7 +1433,7 @@ morok_tensor::codegen_tests! {
 // Doc example tests — mirrors code blocks from onnx.md and onnx/README.md
 // =========================================================================
 
-morok_tensor::codegen_tests! {
+svod_tensor::codegen_tests! {
     /// onnx.md "Simple: All-Initializer Models" — destructure + realize_batch
     fn test_doc_all_initializer_realize_batch(config) {
         use crate::importer::OnnxModel;

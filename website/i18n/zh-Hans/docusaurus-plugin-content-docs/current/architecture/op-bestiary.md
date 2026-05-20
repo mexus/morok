@@ -4,7 +4,7 @@ sidebar_label: 操作图鉴
 
 # 操作图鉴：UOp 操作速查手册
 
-调试 Morok IR 输出时，你会遇到一些从名字上看不太直观的操作。本章记录了那些需要解释的操作，包括签名、字段说明和示例。
+调试 Svod IR 输出时，你会遇到一些从名字上看不太直观的操作。本章记录了那些需要解释的操作，包括签名、字段说明和示例。
 
 **涵盖内容：** 需要解释的操作——循环控制、规约、内存操作、内核结构、向量化、张量核心。
 
@@ -121,9 +121,9 @@ Reduce {
 | `Add` | 0 | `acc + value` | ✓ |
 | `Mul` | 1 | `acc * value` | ✓ |
 | `Max` | -∞ | `max(acc, value)` | ✓ |
-| `Min` | +∞ | `min(acc, value)` | 仅 Morok |
+| `Min` | +∞ | `min(acc, value)` | 仅 Svod |
 
-> **兼容性：** Tinygrad 的规范将 REDUCE_AXIS 限制为 `{Add, Mul, Max}`。Morok 额外支持 `Min`。
+> **兼容性：** Tinygrad 的规范将 REDUCE_AXIS 限制为 `{Add, Mul, Max}`。Svod 额外支持 `Min`。
 
 **示例：**
 ```text
@@ -261,7 +261,7 @@ Store {
 
 对于门控写入，使用带 gate 的 INDEX（INDEX 有一个可选的 `gate` 字段）。
 
-> **兼容性：** Morok 的 STORE 没有单独的 `buffer` 字段——源为：index=0, value=1, ranges=2+（range_start=2）。Tinygrad 的布局类似。
+> **兼容性：** Svod 的 STORE 没有单独的 `buffer` 字段——源为：index=0, value=1, ranges=2+（range_start=2）。Tinygrad 的布局类似。
 
 **示例：**
 ```text

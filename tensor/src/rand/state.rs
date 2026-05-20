@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use papaya::HashMap as PapayaMap;
 
-use morok_dtype::DeviceSpec;
+use svod_dtype::DeviceSpec;
 
 use crate::Tensor;
 
@@ -99,7 +99,7 @@ fn current_seed_lo() -> u32 {
 
 fn build_fresh_state(device_index: usize, seed_epoch: u64) -> DeviceRngState {
     let seed_hi = SEED_HI_BY_DEVICE_IDX.get(device_index).copied().unwrap_or_else(|| {
-        panic!("morok_tensor::rand: device index {device_index} exceeds hardcoded SHA256 table (16 entries)")
+        panic!("svod_tensor::rand: device index {device_index} exceeds hardcoded SHA256 table (16 entries)")
     });
     let seed_lo = current_seed_lo();
     DeviceRngState { seed: Tensor::from_slice([seed_hi, seed_lo]), counter: AtomicU64::new(0), seed_epoch }

@@ -5,10 +5,10 @@
 //!
 //! Based on Tinygrad's PTX/NIR bool->uint8 patterns.
 
-use morok_dtype::{DType, ScalarDType};
-use morok_ir::types::ConstValue;
-use morok_ir::{Op, UOp};
 use smallvec::smallvec;
+use svod_dtype::{DType, ScalarDType};
+use svod_ir::types::ConstValue;
+use svod_ir::{Op, UOp};
 
 use super::helpers::*;
 

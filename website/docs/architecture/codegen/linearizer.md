@@ -48,7 +48,7 @@ After:   ADD(GEP(arr_a, idx), GEP(arr_b, idx))
 
 Most backends (CPU, GPU) don't need this. Only specialized hardware uses it.
 
-**Note**: Morok does not currently implement this stage. The `Renderer` trait has `render()`, `backend_name()`, and `decompositor()` methods, but no `pre_matcher` support yet. This is a future enhancement for DSP and other specialized backends.
+**Note**: Svod does not currently implement this stage. The `Renderer` trait has `render()`, `backend_name()`, and `decompositor()` methods, but no `pre_matcher` support yet. This is a future enhancement for DSP and other specialized backends.
 
 ---
 
@@ -82,7 +82,7 @@ Note: `pm_render()` and `pm_split_ends()` are not part of this combined pass—t
 
 Transcendental function approximations (SIN, EXP, LOG, etc.) are implemented via the `decompositor()` pathway (see `ir/src/decompositions/transcendentals.rs`).
 
-**Morok**: `optimizer/mod.rs`
+**Svod**: `optimizer/mod.rs`
 
 ---
 
@@ -127,7 +127,7 @@ END(END(op, range_a), range_b)
 
 **extra_matcher**: Each backend can add its own final patterns. This allows hardware-specific optimizations without changing the generic pipeline.
 
-**Morok**: `devectorize.rs`, `linearize/mod.rs`, `optimizer/mod.rs`
+**Svod**: `devectorize.rs`, `linearize/mod.rs`, `optimizer/mod.rs`
 
 ---
 
@@ -164,7 +164,7 @@ RANGE_B waits for RANGE_A to complete
 
 Bottom-up traversal ensures dependencies flow correctly from leaves to roots.
 
-**Morok**: `schedule/src/linearize/mod.rs`
+**Svod**: `schedule/src/linearize/mod.rs`
 
 ---
 
@@ -188,7 +188,7 @@ Bottom-up traversal ensures dependencies flow correctly from leaves to roots.
 | DEFINE_VAR | -19 | Variables must be defined first |
 | DEFINE_LOCAL | -18 | Allocations first |
 | DEFINE_REG | -17 | Registers first |
-| CONST | -10 | Constants early for reuse (Morok extension; Tinygrad defaults to 0) |
+| CONST | -10 | Constants early for reuse (Svod extension; Tinygrad defaults to 0) |
 | LOAD | -1 | Loads before use |
 | END | -5 | Closes ranges |
 | STORE | +1 | Stores after computation |
@@ -208,7 +208,7 @@ run_count = prod(int(r.vmax) + 1 for r in u.ranges)
 ```
 This computes how many times an operation executes based on its enclosing ranges.
 
-**Morok**: `schedule/src/linearize/mod.rs`
+**Svod**: `schedule/src/linearize/mod.rs`
 
 ---
 
@@ -236,4 +236,4 @@ STORE(INDEX(ptr, idx, valid=cond), value)
 
 At this point, the instruction list is ready for code generation.
 
-**Morok**: `schedule/src/linearize/mod.rs` (predicated stores path)
+**Svod**: `schedule/src/linearize/mod.rs` (predicated stores path)

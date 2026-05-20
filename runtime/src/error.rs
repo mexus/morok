@@ -11,7 +11,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 pub enum Error {
     /// Codegen error occurred.
     #[snafu(display("Codegen error: {source}"))]
-    Codegen { source: morok_codegen::Error },
+    Codegen { source: svod_codegen::Error },
 
     /// JIT compilation failed.
     #[snafu(display("JIT compilation failed: {reason}"))]
@@ -45,13 +45,13 @@ pub enum Error {
     #[snafu(display("Unsupported runtime feature {kind}: {reason}"))]
     Unsupported { kind: String, reason: String },
 
-    /// Device error (from morok_device crate).
+    /// Device error (from svod_device crate).
     #[snafu(display("Device error: {source}"))]
-    Device { source: morok_device::Error },
+    Device { source: svod_device::Error },
 }
 
-impl From<morok_device::Error> for Error {
-    fn from(source: morok_device::Error) -> Self {
+impl From<svod_device::Error> for Error {
+    fn from(source: svod_device::Error) -> Self {
         Error::Device { source }
     }
 }

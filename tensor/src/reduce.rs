@@ -4,9 +4,9 @@
 //! with ergonomic APIs that match PyTorch/NumPy conventions.
 
 use bon::bon;
-use morok_dtype::{DType, ScalarDType};
-use morok_ir::{ConstValue, ReduceOp, SInt, UOp};
 use snafu::ResultExt;
+use svod_dtype::{DType, ScalarDType};
+use svod_ir::{ConstValue, ReduceOp, SInt, UOp};
 
 use crate::{
     Error, Result, Tensor,
@@ -526,7 +526,7 @@ fn argmax_impl(tensor: &Tensor, axis: Option<isize>, keepdim: bool) -> Result<Te
         .ok_or_else(|| Error::SymbolicShapeUnsupported { operation: "argmax".to_string() })?;
 
     // Convert shape to isize vec once for reuse in expand operations
-    let shape_vec = morok_ir::shape::to_vec_isize(&shape).context(UOpSnafu)?;
+    let shape_vec = svod_ir::shape::to_vec_isize(&shape).context(UOpSnafu)?;
 
     // Step 1: Find maximum values along axis (with keepdim for broadcasting)
     let max_vals_keepdim = working_tensor.max_with().axes(working_axis).keepdim(true).call()?;
@@ -564,7 +564,7 @@ fn argmax_impl(tensor: &Tensor, axis: Option<isize>, keepdim: bool) -> Result<Te
     let max_idx_shape = max_idx.shape()?;
     let result = if !max_idx_shape.is_empty() {
         // Non-scalar result: broadcast n_tensor
-        let max_idx_shape_vec = morok_ir::shape::to_vec_isize(&max_idx_shape).context(UOpSnafu)?;
+        let max_idx_shape_vec = svod_ir::shape::to_vec_isize(&max_idx_shape).context(UOpSnafu)?;
         let ones_shape = vec![1isize; max_idx_shape.len()];
         let n_reshaped = n_tensor.try_reshape(&ones_shape)?;
         let n_broadcast = n_reshaped.try_expand(&max_idx_shape_vec)?;
@@ -714,7 +714,7 @@ fn mean_impl(tensor: &Tensor, axes: impl Into<AxisSpec>, keepdim: bool) -> Resul
     let sum = reduce_internal(tensor, ReduceOp::Add, axes, keepdim, Some(output_dtype.clone()), false)?;
 
     // Divide by count
-    let count_tensor = Tensor::new(UOp::const_(output_dtype.clone(), morok_ir::ConstValue::Float(count as f64)));
+    let count_tensor = Tensor::new(UOp::const_(output_dtype.clone(), svod_ir::ConstValue::Float(count as f64)));
     Ok(&sum / &count_tensor)
 }
 
@@ -773,7 +773,7 @@ fn var_mean_impl(tensor: &Tensor, axes: AxisSpec, keepdim: bool) -> Result<(Tens
 
     // Divide by N-1 for unbiased estimate (Bessel's correction)
     let denom = if count > 1 { count - 1 } else { count };
-    let denom_tensor = Tensor::new(UOp::const_(output_dtype, morok_ir::ConstValue::Float(denom as f64)));
+    let denom_tensor = Tensor::new(UOp::const_(output_dtype, svod_ir::ConstValue::Float(denom as f64)));
     let variance = &sum_sq_dev / &denom_tensor;
 
     Ok((variance, mean))

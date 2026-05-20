@@ -17,9 +17,9 @@
 
 use std::sync::{Arc, OnceLock};
 
-use morok_device::device::Program;
-use morok_ir::UOp;
 use papaya::HashMap;
+use svod_device::device::Program;
+use svod_ir::UOp;
 
 /// Cached kernel that can be reused across tensors.
 ///
@@ -147,9 +147,9 @@ pub fn clear_all() {
 /// # Example
 ///
 /// ```ignore
-/// morok_ir::uop::gc_dead_refs();
-/// let live_ids = morok_ir::uop::live_uop_ids();
-/// morok_runtime::kernel_cache::gc_unused_kernels(&live_ids);
+/// svod_ir::uop::gc_dead_refs();
+/// let live_ids = svod_ir::uop::live_uop_ids();
+/// svod_runtime::kernel_cache::gc_unused_kernels(&live_ids);
 /// ```
 pub fn gc_unused_kernels(live_ids: &std::collections::HashSet<u64>) {
     let map = kernels();

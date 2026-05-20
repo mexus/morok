@@ -1,5 +1,5 @@
-use morok_arch::ctc::{CtcDecoder, GreedyDecoder};
-use morok_tensor::Tensor;
+use svod_arch::ctc::{CtcDecoder, GreedyDecoder};
+use svod_tensor::Tensor;
 
 use crate::gigaam::remap::remap_pytorch;
 use crate::gigaam::{ConvNormType, GigaAmConfig, SubsamplingMode};

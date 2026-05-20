@@ -12,8 +12,8 @@
 
 use std::sync::Arc;
 
-use morok_dtype::DType;
 use snafu::ensure;
+use svod_dtype::DType;
 
 use crate::error::{InvalidDTypeForUnaryOpSnafu, WhereConditionNotBoolSnafu};
 use crate::op::Op;

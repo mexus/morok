@@ -34,9 +34,9 @@ Validity को INDEX में मूव करने से बेहतर lo
 
 **नोट**: यह pattern तभी मैच होता है जब alternative वैल्यू `0` हो। ट्रांसफ़ॉर्मेशन में कॉम्प्लेक्स clause एनालिसिस होता है: duplicate डिटेक्शन, range डिपेंडेंसी चेक, और data-dependent load वेरिफ़िकेशन।
 
-**नोट**: Morok इम्प्लीमेंटेशन `valid=` के बजाय `gate=` इस्तेमाल करता है (Index struct में `gate` फ़ील्ड है)। कॉन्सेप्ट एक ही है।
+**नोट**: Svod इम्प्लीमेंटेशन `valid=` के बजाय `gate=` इस्तेमाल करता है (Index struct में `gate` फ़ील्ड है)। कॉन्सेप्ट एक ही है।
 
-**Morok**: `pm_move_where_on_load()` in `symbolic/patterns.rs`
+**Svod**: `pm_move_where_on_load()` in `symbolic/patterns.rs`
 
 ---
 
@@ -54,7 +54,7 @@ Validity को INDEX में मूव करने से बेहतर lo
 
 **Pattern**: `symbolic_simple() + pm_pre_expander + pm_group_for_reduce + expander`
 
-नोट: Morok इस स्टेज पर `symbolic_simple()` इस्तेमाल करता है (`sym` नहीं) क्योंकि `symbolic()` Stage 4 पर पहले ही चल चुका है। Tinygrad `sym` इस्तेमाल करता है जिसमें अतिरिक्त patterns शामिल हैं।
+नोट: Svod इस स्टेज पर `symbolic_simple()` इस्तेमाल करता है (`sym` नहीं) क्योंकि `symbolic()` Stage 4 पर पहले ही चल चुका है। Tinygrad `sym` इस्तेमाल करता है जिसमें अतिरिक्त patterns शामिल हैं।
 
 > **ज़रूरी: Pattern Precedence**
 
@@ -143,7 +143,7 @@ REDUCE(src, [range(GROUP_REDUCE)])
 
 यह shared memory से एफ़िशिएंट tensor core accumulation सक्षम करता है।
 
-**Morok**: `expand.rs`
+**Svod**: `expand.rs`
 
 ---
 
@@ -171,4 +171,4 @@ REDUCE(src, [range(GROUP_REDUCE)])
 | CONTIGUOUS wrapper हटाएँ | Codegen से पहले ऑप्टिमाइज़ेशन hints हटाएँ |
 | NOOP हटाना | No-op ऑपरेशन साफ़ करें |
 
-**Morok**: `rangeify/patterns.rs`, `rangeify/transforms.rs`, `optimizer/mod.rs`
+**Svod**: `rangeify/patterns.rs`, `rangeify/transforms.rs`, `optimizer/mod.rs`

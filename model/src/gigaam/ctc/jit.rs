@@ -1,16 +1,16 @@
 //! `CtcHeadJit`: the small CTC projection (Conv1d k=1 + log-softmax) compiled
 //! as its own JIT plan. Runs after the shared `GigaAmEncoderJit` on its
 //! `[B, d_model, T_sub]` output and emits `[B, T_sub, vocab_size]` log-probs
-//! consumed by `morok_arch::ctc` decoders.
+//! consumed by `svod_arch::ctc` decoders.
 //!
-//! The `jit_wrapper!` macro expands to `morok_model::jit::*` paths, so this
-//! file needs the `extern crate self as morok_model;` binding in scope.
+//! The `jit_wrapper!` macro expands to `svod_model::jit::*` paths, so this
+//! file needs the `extern crate self as svod_model;` binding in scope.
 
-extern crate self as morok_model;
+extern crate self as svod_model;
 
-use morok_ir::SInt;
-use morok_macros::jit_wrapper;
 use snafu::ResultExt;
+use svod_ir::SInt;
+use svod_macros::jit_wrapper;
 
 use crate::gigaam::error::TensorSnafu;
 use crate::gigaam::model::GigaAm;

@@ -1,5 +1,5 @@
-use morok_dtype::DType;
-use morok_ir::{ConstValue, SInt};
+use svod_dtype::DType;
+use svod_ir::{ConstValue, SInt};
 
 use crate::Tensor;
 use crate::test::helpers::*;

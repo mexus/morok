@@ -2,8 +2,8 @@
 //!
 //! Based on Tinygrad's decompositions.py:321-367.
 
-use morok_ir::types::ConstValue;
-use morok_ir::{BinaryOp, Op, UOp, UnaryOp};
+use svod_ir::types::ConstValue;
+use svod_ir::{BinaryOp, Op, UOp, UnaryOp};
 
 use crate::rangeify::patterns::{
     pm_comparison_negations, pm_div_to_shr, pm_fdiv_to_mul, pm_mod_to_and, pm_mul_to_shl, pm_neg_from_mul,

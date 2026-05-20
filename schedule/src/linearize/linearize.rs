@@ -6,10 +6,10 @@
 use std::collections::{BinaryHeap, HashMap};
 use std::sync::Arc;
 
-use morok_ir::UOp;
-use morok_ir::op::Op;
-use morok_ir::types::ConstValue;
-use morok_ir::uop::core::UOpKey;
+use svod_ir::UOp;
+use svod_ir::op::Op;
+use svod_ir::types::ConstValue;
+use svod_ir::uop::core::UOpKey;
 
 /// Priority values for different operation types.
 ///
@@ -75,7 +75,7 @@ struct OrderKey {
 /// # Example
 ///
 /// ```ignore
-/// use morok_schedule::linearize::linearize;
+/// use svod_schedule::linearize::linearize;
 ///
 /// let kernel_ast = /* ... */;
 /// let instructions = linearize(kernel_ast);
@@ -230,8 +230,8 @@ pub fn linearize(sink: Arc<UOp>) -> Vec<Arc<UOp>> {
 /// This matches Tinygrad's linearizer where `run_count = prod([int(r.vmax)+1 for r in u.ranges])`
 /// and `u.ranges` returns only ranges that haven't been ended yet at that point.
 fn compute_run_count(uop: &Arc<UOp>) -> u64 {
-    use morok_ir::uop::cached_property::CachedProperty;
-    use morok_ir::uop::properties::InScopeRangesProperty;
+    use svod_ir::uop::cached_property::CachedProperty;
+    use svod_ir::uop::properties::InScopeRangesProperty;
 
     #[allow(clippy::mutable_key_type)]
     let in_scope = InScopeRangesProperty::get(uop);
@@ -255,7 +255,7 @@ fn compute_run_count(uop: &Arc<UOp>) -> u64 {
 /// Get priority and optional argument value for a UOp.
 ///
 /// Note: Tinygrad uses `u.arg` for DEFINE_VAR ordering (the name tuple).
-/// Morok uses `id` for tie-breaking since `arg_value` is numeric.
+/// Svod uses `id` for tie-breaking since `arg_value` is numeric.
 /// This gives deterministic ordering but not alphabetical by name.
 fn get_priority(uop: &Arc<UOp>) -> (i32, Option<i64>) {
     match uop.op() {

@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use crate::rangeify::patterns::buffer_removal;
 use crate::rewrite::graph_rewrite;
-use morok_dtype::{AddrSpace as DTypeAddrSpace, DType};
-use morok_ir::{AddrSpace, AxisId, AxisType, BufferizeOpts, Op, UOp};
+use svod_dtype::{AddrSpace as DTypeAddrSpace, DType};
+use svod_ir::{AddrSpace, AxisId, AxisType, BufferizeOpts, Op, UOp};
 
 // Helper functions
 fn create_const(val: i64) -> Arc<UOp> {
@@ -84,7 +84,7 @@ fn test_keep_bufferize_expensive() {
     let range = create_range(100, 0);
 
     let reduce = UOp::new(
-        Op::Reduce { src: x, ranges: vec![range.clone()].into(), reduce_op: morok_ir::ReduceOp::Add },
+        Op::Reduce { src: x, ranges: vec![range.clone()].into(), reduce_op: svod_ir::ReduceOp::Add },
         DType::Float32,
     );
 
@@ -121,7 +121,7 @@ fn test_keep_bufferize_contiguous() {
 fn test_keep_bufferize_copy() {
     // BUFFERIZE(COPY(x, device), ranges) should be KEPT (always-run op needs its buffer)
     let x = UOp::var("x", DType::Float32, 0, 100);
-    let device = UOp::device(morok_device::DeviceSpec::Cpu);
+    let device = UOp::device(svod_device::DeviceSpec::Cpu);
     let copy = x.copy(device);
 
     let range = create_range(10, 0);

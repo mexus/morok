@@ -57,7 +57,7 @@ jit_wrapper! {
 | `vars { name: (min, max), ... }` | 带编译期边界的符号化形状变量 | 可选 |
 | `build(args...) { ... }` | 从输入和变量构造输出张量的闭包；`model` 在作用域内 | 是 |
 
-`build` 的每个参数必须命名为一个输入或一个已声明的变量（宏会在展开时拒绝匹配不上的名字）。在块内部，每个输入是 `&Tensor`（宏会在 `prepare()` 运行时分配一个零初始化的占位符），每个变量是一个已绑定到其上界的 `morok_tensor::Variable`，而 `model` 是对包装器所拥有的模型值的共享引用。闭包返回 `Result<Tensor, E>`，其中 `E: std::error::Error + Send + Sync + 'static`；失败会以 `JitError::Build` 形式呈现。
+`build` 的每个参数必须命名为一个输入或一个已声明的变量（宏会在展开时拒绝匹配不上的名字）。在块内部，每个输入是 `&Tensor`（宏会在 `prepare()` 运行时分配一个零初始化的占位符），每个变量是一个已绑定到其上界的 `svod_tensor::Variable`，而 `model` 是对包装器所拥有的模型值的共享引用。闭包返回 `Result<Tensor, E>`，其中 `E: std::error::Error + Send + Sync + 'static`；失败会以 `JitError::Build` 形式呈现。
 
 ---
 
@@ -187,7 +187,7 @@ jit_wrapper! {
 
         build(mel, lengths, b, t) {
             let out = model.encoder.forward_batch(mel, lengths, &b, &t)?;
-            out.cast(morok_dtype::DType::Float32).context(TensorSnafu)
+            out.cast(svod_dtype::DType::Float32).context(TensorSnafu)
         }
     }
 }

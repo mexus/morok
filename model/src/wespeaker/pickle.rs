@@ -14,11 +14,11 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
-use morok_dtype::DType;
-use morok_tensor::Tensor;
 use repugnant_pickle::ops::PickleOp;
 use repugnant_pickle::{SequenceType, Value, evaluate, parse_ops};
 use snafu::{ResultExt, Snafu};
+use svod_dtype::DType;
+use svod_tensor::Tensor;
 use zip::ZipArchive;
 use zip::result::ZipError;
 
@@ -43,8 +43,8 @@ pub enum Error {
     CompressedStorage,
     #[snafu(display("{source}"))]
     Tensor {
-        #[snafu(source(from(morok_tensor::error::Error, Box::new)))]
-        source: Box<morok_tensor::error::Error>,
+        #[snafu(source(from(svod_tensor::error::Error, Box::new)))]
+        source: Box<svod_tensor::error::Error>,
     },
 }
 

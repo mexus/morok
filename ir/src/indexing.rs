@@ -20,7 +20,7 @@ use crate::uop::UOp;
 ///
 /// # Example
 /// ```ignore
-/// use morok_ir::{s, IndexSpec, UOp};
+/// use svod_ir::{s, IndexSpec, UOp};
 ///
 /// // Using macro syntax
 /// let specs = vec![

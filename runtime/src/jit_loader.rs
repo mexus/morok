@@ -82,7 +82,7 @@ pub(crate) fn elf_target_triple() -> String {
 pub(crate) fn platform_clang_flags() -> &'static [&'static str] {
     // Reserve x18 only on macOS ARM, where the kernel clobbers it on context
     // switch. Linux ARM treats x18 as a free GPR; Windows ARM is not a target
-    // morok currently supports.
+    // svod currently supports.
     #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
     {
         &["-ffixed-x18"]

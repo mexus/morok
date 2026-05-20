@@ -5,8 +5,8 @@
 //! applied to both the `weights.sum` denominator and the variance denominator
 //! `v1 - v2 / v1 + eps`.
 
-use morok_dtype::DType;
-use morok_tensor::Tensor;
+use svod_dtype::DType;
+use svod_tensor::Tensor;
 
 use crate::wespeaker::WeSpeakerResNet34;
 
@@ -20,7 +20,7 @@ fn forward_zero_weights_shape() {
     let feats = Tensor::zeros(&[1, 1598, 80], DType::Float32).unwrap();
     let weights = Tensor::ones(&[1, 799], DType::Float32).unwrap();
 
-    let var = morok_tensor::Variable::new("b", 1, 1);
+    let var = svod_tensor::Variable::new("b", 1, 1);
     let b = var.bind(1).unwrap();
 
     let out = model.forward(&feats, &weights, &b).unwrap();
@@ -45,7 +45,7 @@ fn forward_zero_weights_realize() {
     let feats = Tensor::zeros(&[1, 1598, 80], DType::Float32).unwrap();
     let weights = Tensor::ones(&[1, 799], DType::Float32).unwrap();
 
-    let var = morok_tensor::Variable::new("b", 1, 1);
+    let var = svod_tensor::Variable::new("b", 1, 1);
     let b = var.bind(1).unwrap();
 
     let mut out = model.forward(&feats, &weights, &b).unwrap();

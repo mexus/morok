@@ -1,10 +1,10 @@
-use morok_dtype::DType;
-use morok_tensor::Tensor;
-use morok_tensor::nn::{
+use svod_dtype::DType;
+use svod_tensor::Tensor;
+use svod_tensor::nn::{
     AspectRatioPolicy, AutoPad, CoordinateTransformMode, DepthToSpaceMode, GridSampleMode, GridSamplePaddingMode,
     NearestMode, Reduction, ResizeMode, flat_pads_to_pairs,
 };
-use morok_tensor::reduce::AxisSpec;
+use svod_tensor::reduce::AxisSpec;
 
 use crate::error::Result;
 

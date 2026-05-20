@@ -9,7 +9,7 @@
 
 use std::sync::Arc;
 
-use morok_ir::{AxisId, AxisType, DType, Op, SInt, UOp};
+use svod_ir::{AxisId, AxisType, DType, Op, SInt, UOp};
 
 use crate::rangeify::IndexingContext;
 
@@ -177,7 +177,7 @@ fn test_multi_dimensional_ranges() {
     assert!(matches!(r2.op(), Op::Range { axis_id: AxisId::Unrenumbered(2), .. }));
 
     // Verify sizes (ConstValueHash is a tuple struct wrapping ConstValue)
-    use morok_ir::ConstValue;
+    use svod_ir::ConstValue;
     if let Op::Range { end, .. } = r0.op() {
         assert!(matches!(end.op(), Op::Const(c) if matches!(c.0, ConstValue::Int(32))));
     }
@@ -207,7 +207,7 @@ fn test_large_size_range() {
     // Very large size
     let range = ctx.new_range(&SInt::Const(1 << 30), AxisType::Loop);
 
-    use morok_ir::ConstValue;
+    use svod_ir::ConstValue;
     if let Op::Range { end, .. } = range.op() {
         assert!(matches!(end.op(), Op::Const(c) if matches!(c.0, ConstValue::Int(v) if v == 1 << 30)));
     }

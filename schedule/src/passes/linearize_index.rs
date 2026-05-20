@@ -27,8 +27,8 @@
 
 use std::sync::Arc;
 
-use morok_ir::{BinaryOp, ConstValue, DType, Op, UOp};
 use smallvec::SmallVec;
+use svod_ir::{BinaryOp, ConstValue, DType, Op, UOp};
 use tracing::trace;
 
 use crate::TypedPatternMatcher;
@@ -37,9 +37,9 @@ use crate::TypedPatternMatcher;
 ///
 /// The helper itself is ported from Tinygrad `simplify.py` `count_divmod`,
 /// where it gates END/REDUCE range merging in `simplify_merge_adjacent`.
-/// Morok reuses the same complexity proxy to decide whether multi-index
+/// Svod reuses the same complexity proxy to decide whether multi-index
 /// INDEX flattening introduces redundant `%` / `//` chains; that
-/// flattening pass is Morok-specific (tinygrad backends consume multi-
+/// flattening pass is Svod-specific (tinygrad backends consume multi-
 /// index INDEX directly), so the borrowed metric is the only Tinygrad
 /// link here.
 pub fn count_divmod(uop: &Arc<UOp>) -> usize {
@@ -60,7 +60,7 @@ pub fn extract_index_dimension(idx_uop: &Arc<UOp>) -> Option<i64> {
     // Case 0: WHERE(cond, idx, Invalid) from PAD
     // The RANGE inside is the OUTPUT range, which is larger than the buffer dimension.
     // Extract the actual input dimension from the validity condition.
-    if let Op::Ternary(morok_ir::TernaryOp::Where, cond, true_val, false_val) = idx_uop.op()
+    if let Op::Ternary(svod_ir::TernaryOp::Where, cond, true_val, false_val) = idx_uop.op()
         && matches!(false_val.op(), Op::Invalid)
     {
         return extract_dim_from_validity(cond, true_val);
@@ -160,7 +160,7 @@ fn as_index_expr(expr: Arc<UOp>) -> Arc<UOp> {
 
 fn extract_index_dimension_expr(idx_uop: &Arc<UOp>) -> Option<Arc<UOp>> {
     // Case 0: WHERE(cond, idx, Invalid) from PAD
-    if let Op::Ternary(morok_ir::TernaryOp::Where, cond, true_val, false_val) = idx_uop.op()
+    if let Op::Ternary(svod_ir::TernaryOp::Where, cond, true_val, false_val) = idx_uop.op()
         && matches!(false_val.op(), Op::Invalid)
     {
         return extract_dim_from_validity(cond, true_val).map(UOp::index_const);

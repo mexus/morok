@@ -3,7 +3,7 @@
 //! Tests that verify the number of kernels created by the pipeline,
 //! ensuring fusion decisions are correct without needing actual tensor data.
 
-use morok_ir::{Op, UOp};
+use svod_ir::{Op, UOp};
 
 use crate::rangeify::{RangeifyBufferContext, try_get_kernel_graph};
 use crate::test::unit::rangeify::helpers::{count_kernels, count_stores};

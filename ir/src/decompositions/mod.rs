@@ -30,7 +30,7 @@ use std::sync::Arc;
 use crate::pattern::TypedPatternMatcher;
 use crate::rewrite::graph_rewrite_bottom_up;
 use crate::uop::UOp;
-use morok_macros::patterns;
+use svod_macros::patterns;
 
 use transcendentals::{xcos, xerf, xexp, xexp2, xlog, xlog2, xpow, xrsqrt, xsin, xsqrt, xtan};
 

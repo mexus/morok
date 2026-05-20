@@ -89,7 +89,7 @@ fn test_avg_pool2d_ceil_mode_large_stride() {
 
 #[test]
 fn test_linspace_zero() {
-    let t = Tensor::linspace(0.0, 1.0, 0, morok_dtype::DType::Float32).unwrap();
+    let t = Tensor::linspace(0.0, 1.0, 0, svod_dtype::DType::Float32).unwrap();
     assert_eq!(get_shape(&t), vec![0]);
 }
 
@@ -428,7 +428,7 @@ crate::codegen_tests! {
     }
 
     fn test_linspace_basic(config) {
-        let mut t = Tensor::linspace(-1.0, 1.0, 5, morok_dtype::DType::Float32).unwrap();
+        let mut t = Tensor::linspace(-1.0, 1.0, 5, svod_dtype::DType::Float32).unwrap();
         assert_eq!(get_shape(&t), vec![5]);
         t.realize_with(&config).unwrap();
         let result = t.as_vec::<f32>().unwrap();
@@ -439,7 +439,7 @@ crate::codegen_tests! {
     }
 
     fn test_linspace_single(config) {
-        let mut t = Tensor::linspace(3.0, 7.0, 1, morok_dtype::DType::Float32).unwrap();
+        let mut t = Tensor::linspace(3.0, 7.0, 1, svod_dtype::DType::Float32).unwrap();
         assert_eq!(get_shape(&t), vec![1], "steps=1 must produce 1-D shape [1]");
         t.realize_with(&config).unwrap();
         let vals = t.as_vec::<f32>().unwrap();
@@ -602,7 +602,7 @@ fn test_densenet_two_layer_kernel_count() {
         let gamma = Tensor::from_slice(vec![1.0f32; ch]);
         let beta = Tensor::from_slice(vec![0.0f32; ch]);
         let invstd =
-            (&var + Tensor::const_(1e-5f64, morok_dtype::DType::Float32)).try_sqrt().unwrap().reciprocal().unwrap();
+            (&var + Tensor::const_(1e-5f64, svod_dtype::DType::Float32)).try_sqrt().unwrap().reciprocal().unwrap();
         (mean, invstd, gamma, beta)
     };
 
@@ -631,15 +631,15 @@ fn test_densenet_two_layer_kernel_count() {
     let result = Tensor::cat(&[&cat1, &conv3x3_2], 1).unwrap();
 
     let uop = result.uop();
-    let sink = morok_ir::UOp::sink(vec![uop.clone()]);
+    let sink = svod_ir::UOp::sink(vec![uop.clone()]);
     // Normalize Buffer→Param before rangeify (matches real pipeline)
     let normalization = crate::realize::normalize_for_schedule_cache(&sink).expect("normalize schedule cache");
-    let (rangeified, _ctx) = morok_schedule::rangeify::rangeify(normalization.normalized, None).unwrap();
-    let (kernels_root, _kctx) = morok_schedule::rangeify::try_get_kernel_graph(rangeified)
+    let (rangeified, _ctx) = svod_schedule::rangeify::rangeify(normalization.normalized, None).unwrap();
+    let (kernels_root, _kctx) = svod_schedule::rangeify::try_get_kernel_graph(rangeified)
         .expect("kernel split pipeline should succeed for dense layer kernel count");
 
     let kernels: Vec<_> =
-        kernels_root.toposort().into_iter().filter(|n| matches!(n.op(), morok_ir::Op::Call { .. })).collect();
+        kernels_root.toposort().into_iter().filter(|n| matches!(n.op(), svod_ir::Op::Call { .. })).collect();
 
     // 6 kernels matching Tinygrad: BN+ReLU, Conv1x1+BN+ReLU, Conv3x3+Cat (×2 layers)
     assert_eq!(kernels.len(), 6, "Expected 6 kernels for 2 dense layers, got {}", kernels.len());

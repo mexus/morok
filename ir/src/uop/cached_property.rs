@@ -28,7 +28,7 @@
 //! # Example
 //!
 //! ```ignore
-//! use morok_ir::cached_property;
+//! use svod_ir::cached_property;
 //!
 //! // Define a new cached property
 //! cached_property! {
@@ -192,8 +192,8 @@ pub trait CachedProperty: Sized + 'static {
 /// # Example
 ///
 /// ```ignore
-/// use morok_ir::cached_property;
-/// use morok_ir::shape::Shape;
+/// use svod_ir::cached_property;
+/// use svod_ir::shape::Shape;
 ///
 /// cached_property! {
 ///     ShapeProperty: Option<Shape> {

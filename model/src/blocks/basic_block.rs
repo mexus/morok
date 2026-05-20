@@ -1,5 +1,5 @@
-use morok_tensor::Tensor;
 use snafu::ResultExt;
+use svod_tensor::Tensor;
 
 use crate::state::{self, HasStateDict, StateDict, prefixed};
 

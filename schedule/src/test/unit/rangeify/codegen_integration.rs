@@ -7,9 +7,9 @@
 
 use std::sync::Arc;
 
-use morok_device::DeviceSpec;
-use morok_dtype::DType;
-use morok_ir::{AxisId, AxisType, Op, UOp};
+use svod_device::DeviceSpec;
+use svod_dtype::DType;
+use svod_ir::{AxisId, AxisType, Op, UOp};
 
 use crate::rangeify::kernel::{LocalAddBufferContext, split_store};
 use crate::rangeify::patterns::rangeify_codegen_patterns;
@@ -28,7 +28,7 @@ fn apply_codegen_patterns(uop: &Arc<UOp>) -> Option<Arc<UOp>> {
     let matcher = rangeify_codegen_patterns();
     let mut ctx = LocalAddBufferContext::new();
     match matcher.rewrite(uop, &mut ctx) {
-        morok_ir::pattern::RewriteResult::Rewritten(result) => Some(result),
+        svod_ir::pattern::RewriteResult::Rewritten(result) => Some(result),
         _ => None,
     }
 }

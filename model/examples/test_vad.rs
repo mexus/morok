@@ -1,4 +1,4 @@
-use morok_model::silero_vad::{SileroVad, VadInference};
+use svod_model::silero_vad::{SileroVad, VadInference};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Loading Silero VAD...");
@@ -7,7 +7,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut inf = VadInference::new(vad)?;
     println!("Engine ready.");
 
-    let mut reader = hound::WavReader::open("/home/mrpink/projects/morok/audio_1.wav")?;
+    let mut reader = hound::WavReader::open("/home/mrpink/projects/svod/audio_1.wav")?;
     let waveform: Vec<f32> = reader.samples::<i16>().map(|s| s.unwrap() as f32 / 32768.0).collect();
     println!("Audio: {} samples ({:.1}s)", waveform.len(), waveform.len() as f32 / 16000.0);
 

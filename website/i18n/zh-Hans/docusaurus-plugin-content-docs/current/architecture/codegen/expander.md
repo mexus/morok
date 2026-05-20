@@ -34,9 +34,9 @@ LOAD(INDEX(ptr, idx, valid=valid), alt)
 
 **注意**：该模式仅在替代值为 `0` 时匹配。变换涉及复杂的子句分析：重复检测、range 依赖检查和数据依赖 load 验证。
 
-**注意**：Morok 实现使用 `gate=` 而不是 `valid=`（Index 结构体有一个 `gate` 字段）。概念完全相同。
+**注意**：Svod 实现使用 `gate=` 而不是 `valid=`（Index 结构体有一个 `gate` 字段）。概念完全相同。
 
-**Morok**：`symbolic/patterns.rs` 中的 `pm_move_where_on_load()`
+**Svod**：`symbolic/patterns.rs` 中的 `pm_move_where_on_load()`
 
 ---
 
@@ -54,7 +54,7 @@ LOAD(INDEX(ptr, idx, valid=valid), alt)
 
 **模式**：`symbolic_simple() + pm_pre_expander + pm_group_for_reduce + expander`
 
-注意：Morok 在此阶段使用 `symbolic_simple()`（不是 `sym`），因为 `symbolic()` 已在 Stage 4 运行过。Tinygrad 使用 `sym`，包含额外的模式。
+注意：Svod 在此阶段使用 `symbolic_simple()`（不是 `sym`），因为 `symbolic()` 已在 Stage 4 运行过。Tinygrad 使用 `sym`，包含额外的模式。
 
 ⚠️ **重要：模式优先级**
 
@@ -143,7 +143,7 @@ REDUCE(src, [range(GROUP_REDUCE)])
 
 这实现了通过共享内存进行高效的张量核心累加。
 
-**Morok**：`expand.rs`
+**Svod**：`expand.rs`
 
 ---
 
@@ -171,4 +171,4 @@ REDUCE(src, [range(GROUP_REDUCE)])
 | 移除 CONTIGUOUS 包装器 | 在代码生成前移除优化提示 |
 | 移除 NOOP | 清理无操作 |
 
-**Morok**：`rangeify/patterns.rs`、`rangeify/transforms.rs`、`optimizer/mod.rs`
+**Svod**：`rangeify/patterns.rs`、`rangeify/transforms.rs`、`optimizer/mod.rs`

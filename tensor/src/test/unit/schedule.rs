@@ -1,15 +1,15 @@
 use std::collections::{HashMap, HashSet};
 
-use morok_device::Buffer;
-use morok_ir::{AxisId, AxisType, CallInfo, DType, DeviceSpec, Op, UOp};
 use smallvec::SmallVec;
+use svod_device::Buffer;
+use svod_ir::{AxisId, AxisType, CallInfo, DType, DeviceSpec, Op, UOp};
 
 use crate::schedule::{
     InputBuffers, KernelInvocation, PreSchedule, PreScheduleItem, ScheduleItem, create_schedule, instantiate_schedule,
 };
 
 fn cpu_buffer(numel: usize) -> Buffer {
-    let alloc = morok_device::registry::cpu().expect("cpu allocator");
+    let alloc = svod_device::registry::cpu().expect("cpu allocator");
     Buffer::new(alloc, DType::Float32, vec![numel], Default::default())
 }
 
@@ -207,7 +207,7 @@ fn test_create_schedule_preserves_call_arg_order() {
 #[test]
 fn test_create_schedule_unrolls_call_bound_ranges() {
     let buffer_uop = UOp::new_buffer(DeviceSpec::Cpu, 4, DType::Float32);
-    let outer_range = UOp::range_axis(UOp::index_const(3), morok_ir::AxisId::Renumbered(0), morok_ir::AxisType::Loop);
+    let outer_range = UOp::range_axis(UOp::index_const(3), svod_ir::AxisId::Renumbered(0), svod_ir::AxisType::Loop);
     let bind = UOp::define_var("outer_i".to_string(), 0, 2).bind(outer_range.clone());
     let body = UOp::sink(vec![UOp::native_const(1.0f32)]);
     let call = body.call(SmallVec::from_vec(vec![buffer_uop.clone(), bind]), CallInfo::default());
@@ -429,7 +429,7 @@ fn test_create_schedule_preserves_ordering_only_dep_for_void_custom_call() {
         UOp::sink(vec![UOp::native_const(1.0f32)]).call(SmallVec::from_vec(vec![input.clone()]), CallInfo::default());
     let producer_after = producer_passthrough.after(SmallVec::from_vec(vec![producer.clone()]));
 
-    let custom = UOp::custom_function(morok_ir::CustomFunctionKind::EncDec, SmallVec::new())
+    let custom = UOp::custom_function(svod_ir::CustomFunctionKind::EncDec, SmallVec::new())
         .call(SmallVec::new(), CallInfo::default());
 
     let ordering_after = ordering_passthrough.after(SmallVec::from_vec(vec![custom.clone(), producer_after]));

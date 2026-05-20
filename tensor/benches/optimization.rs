@@ -3,17 +3,17 @@
 //! Measures EXECUTION time only (not compilation/optimization time).
 //! Reports throughput in GFLOPS.
 //!
-//! Run with: `cargo bench -p morok-tensor`
+//! Run with: `cargo bench -p svod-tensor`
 //!
 //! If you want to see the UOp tree, set the TREE environment variable.
 
 const KEY: &str = "TREE";
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use morok_schedule::{HeuristicsConfig, OptStrategy, OptimizerConfig};
-use morok_tensor::{PrepareConfig, Tensor};
 use ndarray::{Array, Dim};
 use std::env;
+use svod_schedule::{HeuristicsConfig, OptStrategy, OptimizerConfig};
+use svod_tensor::{PrepareConfig, Tensor};
 
 /// Create a test matrix of given size with sequential values.
 fn create_matrix(rows: usize, cols: usize) -> Tensor {
@@ -33,7 +33,7 @@ fn matmul_flops(m: usize, k: usize, n: usize) -> u64 {
     2 * (m as u64) * (k as u64) * (n as u64)
 }
 
-fn print_tree(config: &str, size: usize, plan: &morok_runtime::ExecutionPlan, result: &Tensor) {
+fn print_tree(config: &str, size: usize, plan: &svod_runtime::ExecutionPlan, result: &Tensor) {
     if env::var(KEY).is_ok() {
         // DEBUG: Print kernel info
         eprintln!("\n=== {config} (size={size}) ===");

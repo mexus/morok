@@ -9,9 +9,9 @@
 use std::sync::Arc;
 
 use bon::bon;
-use morok_dtype::DType;
 use smallvec::{SmallVec, smallvec};
 use snafu::ensure;
+use svod_dtype::DType;
 
 use crate::Result;
 use crate::error::{

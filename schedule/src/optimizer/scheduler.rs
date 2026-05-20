@@ -9,7 +9,7 @@ use std::fmt;
 use std::sync::Arc;
 use std::sync::{Mutex, OnceLock};
 
-use morok_ir::{AxisId, AxisType, Op, UOp, UOpKey};
+use svod_ir::{AxisId, AxisType, Op, UOp, UOpKey};
 
 use super::error::*;
 use super::renderer::Renderer;
@@ -198,7 +198,7 @@ impl Scheduler {
                 if let Op::Range { .. } = node.op() {
                     // Include only ranges with vmax > 0 (size > 1)
                     // vmax = size - 1, so vmax > 0 means size > 1
-                    use morok_ir::ConstValue;
+                    use svod_ir::ConstValue;
                     match node.vmax() {
                         ConstValue::Int(v) => *v > 0,
                         ConstValue::UInt(v) => *v > 0,
@@ -286,7 +286,7 @@ impl Scheduler {
             .filter_map(|rng| {
                 if let Op::Range { end, .. } = rng.op()
                     && let Op::Const(cv) = end.op()
-                    && let morok_ir::ConstValue::Int(sz) = cv.0
+                    && let svod_ir::ConstValue::Int(sz) = cv.0
                 {
                     return Some(sz);
                 }
@@ -306,7 +306,7 @@ impl Scheduler {
             .map(|rng| {
                 if let Op::Range { end, .. } = rng.op()
                     && let Op::Const(cv) = end.op()
-                    && let morok_ir::ConstValue::Int(sz) = cv.0
+                    && let svod_ir::ConstValue::Int(sz) = cv.0
                 {
                     sz
                 } else {
@@ -356,7 +356,7 @@ impl Scheduler {
             .filter_map(|rng| {
                 if let Op::Range { end, .. } = rng.op()
                     && let Op::Const(cv) = end.op()
-                    && let morok_ir::ConstValue::Int(sz) = cv.0
+                    && let svod_ir::ConstValue::Int(sz) = cv.0
                 {
                     return Some(sz as usize);
                 }
@@ -453,7 +453,7 @@ impl Scheduler {
 
                     // Check size > 1
                     if let Op::Const(cv) = end.op()
-                        && let morok_ir::ConstValue::Int(sz) = cv.0
+                        && let svod_ir::ConstValue::Int(sz) = cv.0
                         && sz > 1
                     {
                         return Some(i);
@@ -488,7 +488,7 @@ impl Scheduler {
 
                     // Check size > 1
                     if let Op::Const(cv) = end.op()
-                        && let morok_ir::ConstValue::Int(sz) = cv.0
+                        && let svod_ir::ConstValue::Int(sz) = cv.0
                         && sz > 1
                     {
                         return Some(i);
@@ -595,7 +595,7 @@ impl Scheduler {
                 if let Op::Range { axis_type, end, .. } = rng.op() {
                     // Get size
                     if let Op::Const(cv) = end.op()
-                        && let morok_ir::ConstValue::Int(sz) = cv.0
+                        && let svod_ir::ConstValue::Int(sz) = cv.0
                     {
                         return Some(format!("{}{}", axis_type.letter(), sz));
                     }
@@ -622,7 +622,7 @@ impl Scheduler {
             .filter_map(|rng| {
                 if let Op::Range { axis_type, end, .. } = rng.op() {
                     if let Op::Const(cv) = end.op()
-                        && let morok_ir::ConstValue::Int(sz) = cv.0
+                        && let svod_ir::ConstValue::Int(sz) = cv.0
                     {
                         return Some(format!("{}{}", axis_type.letter(), sz));
                     }
@@ -707,8 +707,8 @@ impl Scheduler {
         top: bool,
         input_new_rng: Option<Arc<UOp>>,
     ) -> Result<(Arc<UOp>, Arc<UOp>), OptError> {
-        use morok_ir::{ConstValue, UOpKey};
         use std::collections::HashMap;
+        use svod_ir::{ConstValue, UOpKey};
 
         // 1. Validate divisibility and compute symbolic quotient end. When the
         // axis size is symbolic (e.g. `T*4`), the quotient is a UOp (e.g. `T`)
@@ -730,7 +730,7 @@ impl Scheduler {
 
         // 2. Create new range
         let new_rng = input_new_rng.unwrap_or_else(|| {
-            let end = UOp::const_(morok_dtype::DType::Index, ConstValue::Int(amount as i64));
+            let end = UOp::const_(svod_dtype::DType::Index, ConstValue::Int(amount as i64));
             UOp::range_axis(end, AxisId::Renumbered(self.maxarg() + 1), new_type)
         });
 
@@ -753,7 +753,7 @@ impl Scheduler {
         } else {
             // Bottom order: old varies faster
             // Example: [0,1,2,3, 4,5,6,7, 8,9,10,11, ...]
-            let amount_uop = UOp::const_(morok_dtype::DType::Index, ConstValue::Int(amount as i64));
+            let amount_uop = UOp::const_(svod_dtype::DType::Index, ConstValue::Int(amount as i64));
             replaced_rng
                 .try_mul(&amount_uop)
                 .expect("Multiplication should not fail for index types")
@@ -771,7 +771,7 @@ impl Scheduler {
 
         // Record high-level transformation
         if old_ast_id != self.ast.id {
-            use morok_ir::provenance::{PROVENANCE_TRACKER, PassName};
+            use svod_ir::provenance::{PROVENANCE_TRACKER, PassName};
             PROVENANCE_TRACKER.with(|tracker| {
                 tracker.borrow_mut().record_transform(self.ast.id, old_ast_id, PassName::ShiftTo);
             });
@@ -902,7 +902,7 @@ impl Scheduler {
 
         // Record high-level transformation
         if old_ast_id != self.ast.id {
-            use morok_ir::provenance::{PROVENANCE_TRACKER, PassName};
+            use svod_ir::provenance::{PROVENANCE_TRACKER, PassName};
             PROVENANCE_TRACKER.with(|tracker| {
                 tracker.borrow_mut().record_transform(self.ast.id, old_ast_id, PassName::ConvertLoopToGlobal);
             });
@@ -951,7 +951,7 @@ impl Scheduler {
                     if let Op::Range { end, axis_type, .. } = rng.op() {
                         // Get size if constant
                         let size = if let Op::Const(cv) = end.op()
-                            && let morok_ir::ConstValue::Int(sz) = cv.0
+                            && let svod_ir::ConstValue::Int(sz) = cv.0
                         {
                             sz.to_string()
                         } else {

@@ -6,11 +6,11 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use morok_dtype::DType;
-use morok_ir::types::{BinaryOp, ConstValue};
-use morok_ir::uop::cached_property::CachedProperty;
-use morok_ir::uop::properties::VminVmaxProperty;
-use morok_ir::{Op, UOp, UOpKey};
+use svod_dtype::DType;
+use svod_ir::types::{BinaryOp, ConstValue};
+use svod_ir::uop::cached_property::CachedProperty;
+use svod_ir::uop::properties::VminVmaxProperty;
+use svod_ir::{Op, UOp, UOpKey};
 
 use crate::TypedPatternMatcher;
 
@@ -33,7 +33,7 @@ fn parse_valid(v: &Arc<UOp>) -> Option<(Arc<UOp>, bool, i64)> {
     }
 
     // Pattern: NOT(X < c) -> X >= c
-    if let Op::Unary(morok_ir::types::UnaryOp::Not, inner) = v.op()
+    if let Op::Unary(svod_ir::types::UnaryOp::Not, inner) = v.op()
         && let Op::Binary(BinaryOp::Lt, x, c) = inner.op()
         && x.dtype().is_int()
     {
@@ -164,7 +164,7 @@ pub fn simplify_valid(valid: &Arc<UOp>) -> Option<Arc<UOp>> {
 /// When `try_simplex` is true (called from `simplify_valid`), also tries per-addend
 /// simplex decomposition for constraints like `X0 + X1 + ... >= 1`.
 fn uop_given_valid(valid: &Arc<UOp>, uop: &Arc<UOp>, try_simplex: bool) -> Arc<UOp> {
-    use morok_ir::rewrite::graph_rewrite;
+    use svod_ir::rewrite::graph_rewrite;
 
     // Parse valid into {expr: [lower_bound, upper_bound]}
     type BoundsEntry = (Arc<UOp>, Option<i64>, Option<i64>);
@@ -339,7 +339,7 @@ pub fn pm_simplify_valid() -> &'static TypedPatternMatcher {
 /// This is safe because dropped conditions are guarded at a higher level
 /// (e.g., VALUE-level WHERE in Concat branching).
 fn drop_and_clauses(cond: &Arc<UOp>, x: &Arc<UOp>, invalid: &Arc<UOp>) -> Option<Arc<UOp>> {
-    use morok_ir::types::BinaryOp;
+    use svod_ir::types::BinaryOp;
 
     let clauses = cond.split_uop(BinaryOp::And);
     if clauses.len() <= 1 {

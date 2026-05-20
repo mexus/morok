@@ -2,10 +2,10 @@
 //! the search loop carries `(h, c)` across calls and resets to zeros at the
 //! start of a new utterance.
 
-use morok_dtype::DType;
-use morok_tensor::Tensor;
-use morok_tensor::nn::LSTMCell;
 use snafu::ResultExt;
+use svod_dtype::DType;
+use svod_tensor::Tensor;
+use svod_tensor::nn::LSTMCell;
 
 use crate::init::fan_in_uniform;
 use crate::state::{self, HasStateDict, StateDict, get_tensor, prefixed};
@@ -21,7 +21,7 @@ use crate::gigaam::error::TensorSnafu;
 /// training, so this is equivalent to "embedding of zero vector". We assert
 /// the row is in fact zero at load time.
 ///
-/// The LSTM stack reuses [`LSTMCell`] from `morok_tensor::nn`, which applies
+/// The LSTM stack reuses [`LSTMCell`] from `svod_tensor::nn`, which applies
 /// PyTorch's `[i, f, g, o]` gate order — matching the reference exactly so
 /// checkpoints load without gate-axis remapping.
 #[derive(Clone)]

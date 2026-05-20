@@ -17,10 +17,10 @@
 
 use std::path::Path;
 
-use morok_dtype::DType;
-use morok_ir::SInt;
-use morok_tensor::{BoundVariable, Tensor};
 use snafu::ResultExt;
+use svod_dtype::DType;
+use svod_ir::SInt;
+use svod_tensor::{BoundVariable, Tensor};
 
 use crate::blocks::{BatchNormWeights, Conv2dWeights, ResidualStage, remap};
 use crate::init::fan_in_uniform;

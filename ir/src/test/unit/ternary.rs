@@ -2,7 +2,7 @@
 //!
 //! Tests ternary operations: Where (conditional selection) and MulAcc (fused multiply-add).
 
-use morok_dtype::DType;
+use svod_dtype::DType;
 
 use crate::UOp;
 

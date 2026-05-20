@@ -6,8 +6,8 @@
 use std::hash::{Hash, Hasher};
 use std::mem::discriminant;
 
-use morok_dtype::DeviceSpec;
-use morok_dtype::{DType, ScalarDType};
+use svod_dtype::DeviceSpec;
+use svod_dtype::{DType, ScalarDType};
 
 /// Constant value that can be stored in a UOp.
 ///
@@ -344,7 +344,7 @@ impl ConstValue {
 }
 
 // Re-export AddrSpace from dtype to avoid duplication
-pub use morok_dtype::AddrSpace;
+pub use svod_dtype::AddrSpace;
 
 /// Options for BUFFERIZE operation.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

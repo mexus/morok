@@ -1,6 +1,6 @@
-use morok_dtype::DType;
-use morok_tensor::Tensor;
 use snafu::ResultExt;
+use svod_dtype::DType;
+use svod_tensor::Tensor;
 
 use crate::init::{ones, zeros};
 use crate::state::{self, HasStateDict, StateDict, get_tensor, prefixed};

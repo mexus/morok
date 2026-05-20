@@ -1,6 +1,6 @@
-use morok_dtype::{DType, DeviceSpec};
-use morok_ir::{CallInfo, ConstValue, Op, SInt, UOp, shape::Shape};
 use smallvec::smallvec;
+use svod_dtype::{DType, DeviceSpec};
+use svod_ir::{CallInfo, ConstValue, Op, SInt, UOp, shape::Shape};
 
 use crate::{CpuBackend, PrepareConfig, Tensor, test::helpers::*};
 

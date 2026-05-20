@@ -5,8 +5,8 @@
 
 use std::path::Path;
 
-use morok_dtype::{DType, ScalarDType};
-use morok_tensor::{CpuBackend, PrepareConfig, Tensor};
+use svod_dtype::{DType, ScalarDType};
+use svod_tensor::{CpuBackend, PrepareConfig, Tensor};
 
 use crate::importer::OnnxImporter;
 

@@ -1,5 +1,5 @@
-use morok_dtype::DType;
-use morok_tensor::Tensor;
+use svod_dtype::DType;
+use svod_tensor::Tensor;
 
 use crate::error::Result;
 

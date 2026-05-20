@@ -4,7 +4,7 @@ sidebar_label: प्रैक्टिकल उदाहरण
 
 # प्रैक्टिकल: Tensor से मॉडल तक
 
-यह चैप्टर प्रोग्रेसिव उदाहरणों के ज़रिए Morok सिखाता है। आप बेसिक tensor ऑपरेशनों से शुरू करेंगे और एक काम करने वाले न्यूरल नेटवर्क क्लासिफ़ायर तक पहुँचेंगे।
+यह चैप्टर प्रोग्रेसिव उदाहरणों के ज़रिए Svod सिखाता है। आप बेसिक tensor ऑपरेशनों से शुरू करेंगे और एक काम करने वाले न्यूरल नेटवर्क क्लासिफ़ायर तक पहुँचेंगे।
 
 **आप क्या सीखेंगे:**
 - Tensor बनाना और मैनिपुलेट करना
@@ -15,9 +15,9 @@ sidebar_label: प्रैक्टिकल उदाहरण
 
 **पूर्व-आवश्यकताएँ:**
 - बेसिक Rust ज्ञान
-- अपनी `Cargo.toml` में `morok_tensor` जोड़ें
+- अपनी `Cargo.toml` में `svod_tensor` जोड़ें
 
-**मुख्य पैटर्न:** Morok *lazy evaluation* इस्तेमाल करता है। ऑपरेशन एक कम्प्यूटेशन ग्राफ़ बनाते हैं बिना एक्ज़ीक्यूट किए। `realize()` कॉल करें तो सब कुछ एक साथ कम्पाइल और रन होता है।
+**मुख्य पैटर्न:** Svod *lazy evaluation* इस्तेमाल करता है। ऑपरेशन एक कम्प्यूटेशन ग्राफ़ बनाते हैं बिना एक्ज़ीक्यूट किए। `realize()` कॉल करें तो सब कुछ एक साथ कम्पाइल और रन होता है।
 
 ---
 
@@ -26,7 +26,7 @@ sidebar_label: प्रैक्टिकल उदाहरण
 चलिए tensor बनाते हैं, ऑपरेशन करते हैं, और रिज़ल्ट लेते हैं।
 
 ```rust
-use morok_tensor::Tensor;
+use svod_tensor::Tensor;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create tensors from slices
@@ -53,7 +53,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 2. `&a + &b` अभी कुछ कम्प्यूट नहीं करता। यह एक नया `Tensor` रिटर्न करता है जो एडिशन को *रिप्रेज़ेंट* करता है। `&` tensor को बॉरो करता है ताकि हम उन्हें फिर से इस्तेमाल कर सकें।
 
-3. `realize()` वो जगह है जहाँ जादू होता है। Morok:
+3. `realize()` वो जगह है जहाँ जादू होता है। Svod:
    - कम्प्यूटेशन ग्राफ़ एनालाइज़ करता है
    - जहाँ मुमकिन हो ऑपरेशन फ़्यूज़ करता है
    - ऑप्टिमाइज़्ड कोड जनरेट करता है
@@ -178,14 +178,14 @@ fn matmul_example() -> Result<(), Box<dyn std::error::Error>> {
 
 ## उदाहरण 4: Linear लेयर बनाना
 
-एक linear लेयर `y = x @ W.T + b` कम्प्यूट करती है। Morok में `nn::Linear` बिल्ट-इन है।
+एक linear लेयर `y = x @ W.T + b` कम्प्यूट करती है। Svod में `nn::Linear` बिल्ट-इन है।
 
 ```rust
-use morok_tensor::{Tensor, nn::{Linear, Layer}};
+use svod_tensor::{Tensor, nn::{Linear, Layer}};
 
 fn linear_example() -> Result<(), Box<dyn std::error::Error>> {
     // Create a layer: 4 inputs → 2 outputs
-    let layer = Linear::with_dims(4, 2, morok_dtype::DType::Float32);
+    let layer = Linear::with_dims(4, 2, svod_dtype::DType::Float32);
 
     // Single sample with 4 features
     let input = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0]);
@@ -216,12 +216,12 @@ PyTorch कन्वेंशन weights को `[out_features, in_features]` �
 चलिए `sequential()` से लेयर चेन करके एक पूरा न्यूरल नेटवर्क बनाते हैं।
 
 ```rust
-use morok_tensor::{Tensor, nn::{Linear, Relu, Layer}};
+use svod_tensor::{Tensor, nn::{Linear, Relu, Layer}};
 
 fn mnist_example() -> Result<(), Box<dyn std::error::Error>> {
     // Architecture: 784 (28×28 pixels) → 128 (hidden) → 10 (digits)
-    let fc1 = Linear::with_dims(784, 128, morok_dtype::DType::Float32);
-    let fc2 = Linear::with_dims(128, 10, morok_dtype::DType::Float32);
+    let fc1 = Linear::with_dims(784, 128, svod_dtype::DType::Float32);
+    let fc2 = Linear::with_dims(128, 10, svod_dtype::DType::Float32);
 
     // Simulate a 28×28 grayscale image (flattened to 784)
     let fake_image: Vec<f32> = (0..784)
@@ -263,7 +263,7 @@ fn mnist_example() -> Result<(), Box<dyn std::error::Error>> {
 
 ## उदाहरण 6: अंदर की बात
 
-जानना चाहते हैं कि Morok क्या जनरेट करता है? IR और जनरेटेड कोड कैसे देखें, यह रहा।
+जानना चाहते हैं कि Svod क्या जनरेट करता है? IR और जनरेटेड कोड कैसे देखें, यह रहा।
 
 ```rust
 fn inspect_compilation() -> Result<(), Box<dyn std::error::Error>> {
@@ -288,9 +288,9 @@ fn inspect_compilation() -> Result<(), Box<dyn std::error::Error>> {
 
 **आपको क्या दिखेगा:**
 
-1. **IR Graph:** UOp tree `BUFFER`, `LOAD`, `ADD`, `STORE` जैसे ऑपरेशन दिखाता है। यह ऑप्टिमाइज़ेशन से पहले Morok का इंटरमीडिएट रिप्रेज़ेंटेशन है।
+1. **IR Graph:** UOp tree `BUFFER`, `LOAD`, `ADD`, `STORE` जैसे ऑपरेशन दिखाता है। यह ऑप्टिमाइज़ेशन से पहले Svod का इंटरमीडिएट रिप्रेज़ेंटेशन है।
 
-2. **जनरेटेड कोड:** वास्तविक LLVM IR या GPU कोड जो रन होता है। ध्यान दें कि Morok loads और add को एक सिंगल कर्नेल में फ़्यूज़ करता है — कोई इंटरमीडिएट बफ़र नहीं चाहिए।
+2. **जनरेटेड कोड:** वास्तविक LLVM IR या GPU कोड जो रन होता है। ध्यान दें कि Svod loads और add को एक सिंगल कर्नेल में फ़्यूज़ करता है — कोई इंटरमीडिएट बफ़र नहीं चाहिए।
 
 **डीबगिंग टिप:** अगर कुछ स्लो या गलत लगे, तो IR tree प्रिंट करें। देखें:
 - अनएक्सपेक्टेड ऑपरेशन (रिडंडेंट reshapes, एक्स्ट्रा कॉपीज़)
@@ -301,7 +301,7 @@ fn inspect_compilation() -> Result<(), Box<dyn std::error::Error>> {
 
 ## सारांश
 
-आपने Morok इस्तेमाल करने के कोर पैटर्न सीख लिए:
+आपने Svod इस्तेमाल करने के कोर पैटर्न सीख लिए:
 
 | टास्क | कोड |
 |-------|------|
@@ -321,7 +321,7 @@ fn inspect_compilation() -> Result<(), Box<dyn std::error::Error>> {
 
 1. ऑपरेशन से अपना कम्प्यूटेशन ग्राफ़ बनाएँ
 2. अंत में एक बार `realize()` कॉल करें
-3. Morok सब कुछ ऑप्टिमाइज़ और एक साथ एक्ज़ीक्यूट करता है
+3. Svod सब कुछ ऑप्टिमाइज़ और एक साथ एक्ज़ीक्यूट करता है
 
 **आगे:**
 

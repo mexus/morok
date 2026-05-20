@@ -58,7 +58,7 @@ WMMA(a, b, c) + add → WMMA(a, b, c + add)
 ```
 यह pattern NVIDIA tensor cores पर एफ़िशिएंट FMA-स्टाइल accumulation सक्षम करता है।
 
-**Morok**: `devectorize.rs`
+**Svod**: `devectorize.rs`
 
 ---
 
@@ -109,7 +109,7 @@ STORE(INDEX(...), value) → STORE(INDEX(..., gate=(lidx1 == 0)), value)
 ```
 यह सुनिश्चित करता है कि stores तभी एक्ज़ीक्यूट हों जब unused local indices 0 हों।
 
-**Morok**: `gpudims.rs`
+**Svod**: `gpudims.rs`
 
 ---
 
@@ -139,7 +139,7 @@ Stores से रिडंडेंट loads भी हटाता है (writ
 
 नोट: सभी INDEX ऑपरेशन LOAD में रैप नहीं होते। Pointer types (पहले से addresses हैं) और image textures (स्पेशल हार्डवेयर) अलग एक्सेस मेथड इस्तेमाल करते हैं।
 
-**Morok**: `devectorize.rs`
+**Svod**: `devectorize.rs`
 
 ---
 
@@ -185,7 +185,7 @@ PTRCAT consecutive pointer accesses ग्रुप करता है:
 - `1`: पूरा devectorization (डिफ़ॉल्ट)
 - `≥2`: `devectorize` और `correct_load_store` दोनों स्किप करें
 
-नोट: Morok हमेशा devectorizer चलाता है और यह env var एक्सपोज़ नहीं करता।
+नोट: Svod हमेशा devectorizer चलाता है और यह env var एक्सपोज़ नहीं करता।
 
 **Pattern**: `devectorize + load_store_folding + correct_load_store + load_store_indexing`
 
@@ -199,7 +199,7 @@ ADD(vec4_a, vec4_b) → [ADD(a[0], b[0]), ADD(a[1], b[1]), ...]
 
 **Image fixup**: Image tensor buffers की स्पेशल हैंडलिंग।
 
-**Morok**: `devectorize.rs`
+**Svod**: `devectorize.rs`
 
 ---
 
@@ -252,13 +252,13 @@ Index type lowering 3-phase cascade अप्रोच इस्तेमाल 
 dtype = i32 if bounds fit in [-2^31, 2^31-1] else i64
 ```
 
-**Morok**: `symbolic/index_lowering.rs`
+**Svod**: `symbolic/index_lowering.rs`
 
 ---
 
 ## अतिरिक्त Devectorizer पास
 
-Morok Stage 14 और 15 के बीच कई अतिरिक्त पास चलाता है जिनका Tinygrad में सीधा इक्विवैलेंट नहीं है:
+Svod Stage 14 और 15 के बीच कई अतिरिक्त पास चलाता है जिनका Tinygrad में सीधा इक्विवैलेंट नहीं है:
 
 | पास | उद्देश्य |
 |-----|----------|

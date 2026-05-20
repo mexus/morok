@@ -31,11 +31,11 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use morok_device::device::Device;
-use morok_device::registry::DeviceRegistry;
-use morok_device::{Allocator, Buffer, BufferId, CpuTimelineSignal, TimelineSignal};
-use morok_dtype::DeviceSpec;
 use snafu::ResultExt;
+use svod_device::device::Device;
+use svod_device::registry::DeviceRegistry;
+use svod_device::{Allocator, Buffer, BufferId, CpuTimelineSignal, TimelineSignal};
+use svod_dtype::DeviceSpec;
 
 use crate::error::Result;
 
@@ -480,7 +480,7 @@ impl UnifiedExecutor {
 /// For most use cases, a single global executor is sufficient.
 /// Thread-safety is handled by timeline signals and dependency tracking.
 static EXECUTOR: once_cell::sync::Lazy<parking_lot::Mutex<UnifiedExecutor>> =
-    once_cell::sync::Lazy::new(|| parking_lot::Mutex::new(UnifiedExecutor::new(morok_device::registry::registry())));
+    once_cell::sync::Lazy::new(|| parking_lot::Mutex::new(UnifiedExecutor::new(svod_device::registry::registry())));
 
 /// Get access to the global executor.
 pub fn global_executor() -> parking_lot::MutexGuard<'static, UnifiedExecutor> {

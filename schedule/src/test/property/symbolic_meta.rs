@@ -7,15 +7,15 @@ use std::sync::Arc;
 
 use proptest::prelude::*;
 
-use morok_dtype::DType;
-use morok_ir::UOp;
+use svod_dtype::DType;
+use svod_ir::UOp;
 
 use crate::rewrite::graph_rewrite;
 use crate::symbolic::symbolic_simple;
 
 // Import generators and utilities from ir crate
-use morok_ir::test::property::generators::*;
-use morok_ir::test::property::shrinking::{uop_depth, uop_op_count};
+use svod_ir::test::property::generators::*;
+use svod_ir::test::property::shrinking::{uop_depth, uop_op_count};
 
 // ============================================================================
 // Idempotence Properties
@@ -172,7 +172,7 @@ proptest! {
 
         // Build expression with optimized subexpressions
         let expr_opt_subs = UOp::new(
-            morok_ir::Op::Binary(op, opt_a, opt_b),
+            svod_ir::Op::Binary(op, opt_a, opt_b),
             DType::Int32,
         );
 
@@ -184,7 +184,7 @@ proptest! {
 
         // Build expression with un-optimized subexpressions and optimize
         let expr_unopt = UOp::new(
-            morok_ir::Op::Binary(op, a, b),
+            svod_ir::Op::Binary(op, a, b),
             DType::Int32,
         );
         let direct_opt = graph_rewrite(&matcher, expr_unopt, &mut ());
@@ -203,7 +203,7 @@ proptest! {
 
 /// Verify that all constants in the graph have matching dtypes.
 fn verify_constant_dtypes(uop: &Arc<UOp>) -> Result<(), TestCaseError> {
-    use morok_ir::Op;
+    use svod_ir::Op;
 
     match uop.op() {
         Op::Const(cv) => {

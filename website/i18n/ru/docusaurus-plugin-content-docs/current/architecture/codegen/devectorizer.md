@@ -58,7 +58,7 @@ WMMA(a, b, c) + add → WMMA(a, b, c + add)
 ```
 Этот паттерн обеспечивает эффективную FMA-аккумуляцию на тензорных ядрах NVIDIA.
 
-**Morok**: `devectorize.rs`
+**Svod**: `devectorize.rs`
 
 ---
 
@@ -109,7 +109,7 @@ STORE(INDEX(...), value) → STORE(INDEX(..., gate=(lidx1 == 0)), value)
 ```
 Это гарантирует, что STORE выполняется только при нулевых неиспользуемых локальных индексах.
 
-**Morok**: `gpudims.rs`
+**Svod**: `gpudims.rs`
 
 ---
 
@@ -139,7 +139,7 @@ LOAD(INDEX(ptr, i))
 
 Примечание: Не все INDEX-операции оборачиваются в LOAD. Указательные типы (уже адреса) и текстуры изображений (специальное железо) используют другие методы доступа.
 
-**Morok**: `devectorize.rs`
+**Svod**: `devectorize.rs`
 
 ---
 
@@ -185,7 +185,7 @@ PTRCAT группирует последовательные обращения 
 - `1`: Полная девекторизация (по умолчанию)
 - `>=2`: Пропустить и `devectorize`, и `correct_load_store`
 
-Примечание: Morok всегда запускает devectorizer и не предоставляет эту переменную окружения.
+Примечание: Svod всегда запускает devectorizer и не предоставляет эту переменную окружения.
 
 **Паттерн**: `devectorize + load_store_folding + correct_load_store + load_store_indexing`
 
@@ -199,7 +199,7 @@ ADD(vec4_a, vec4_b) → [ADD(a[0], b[0]), ADD(a[1], b[1]), ...]
 
 **Фиксация Image**: Специальная обработка для image-тензорных буферов.
 
-**Morok**: `devectorize.rs`
+**Svod**: `devectorize.rs`
 
 ---
 
@@ -252,13 +252,13 @@ idx: i32  // or i64, based on bounds
 dtype = i32 if bounds fit in [-2^31, 2^31-1] else i64
 ```
 
-**Morok**: `symbolic/index_lowering.rs`
+**Svod**: `symbolic/index_lowering.rs`
 
 ---
 
 ## Дополнительные проходы Devectorizer
 
-Morok выполняет несколько дополнительных проходов между стадиями 14 и 15, не имеющих прямых аналогов в Tinygrad:
+Svod выполняет несколько дополнительных проходов между стадиями 14 и 15, не имеющих прямых аналогов в Tinygrad:
 
 | Проход | Назначение |
 |--------|------------|

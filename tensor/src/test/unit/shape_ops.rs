@@ -1,5 +1,5 @@
 use crate::*;
-use morok_ir::Op;
+use svod_ir::Op;
 
 // Helper to get concrete shape as Vec<usize>
 fn get_shape(tensor: &Tensor) -> Vec<usize> {
@@ -34,7 +34,7 @@ crate::codegen_tests! {
 
     fn test_cat_fused_with_reduce(config) {
         crate::test::helpers::test_setup();
-        let f32_dt = crate::DType::Scalar(morok_dtype::ScalarDType::Float32);
+        let f32_dt = crate::DType::Scalar(svod_dtype::ScalarDType::Float32);
         // Two realized channel-dim buffers
         let mut a = Tensor::full(&[1, 4, 3, 3], 1.0f32, f32_dt.clone()).unwrap();
         a.realize_with(&config).unwrap();
@@ -68,7 +68,7 @@ crate::codegen_tests! {
 
     fn test_cat_fused_with_reduce_large(config) {
         crate::test::helpers::test_setup();
-        let f32_dt = crate::DType::Scalar(morok_dtype::ScalarDType::Float32);
+        let f32_dt = crate::DType::Scalar(svod_dtype::ScalarDType::Float32);
         let mut a = Tensor::full(&[1, 32, 7, 7], 1.0f32, f32_dt.clone()).unwrap();
         a.realize_with(&config).unwrap();
         let mut b = Tensor::full(&[1, 8, 7, 7], 3.0f32, f32_dt.clone()).unwrap();
@@ -487,8 +487,8 @@ fn test_dtype_preservation() {
     let reshaped_f32 = t_f32.try_reshape([3, 1]).unwrap();
     let reshaped_i32 = t_i32.try_reshape([3, 1]).unwrap();
 
-    assert_eq!(reshaped_f32.uop().dtype(), morok_dtype::DType::Float32);
-    assert_eq!(reshaped_i32.uop().dtype(), morok_dtype::DType::Int32);
+    assert_eq!(reshaped_f32.uop().dtype(), svod_dtype::DType::Float32);
+    assert_eq!(reshaped_i32.uop().dtype(), svod_dtype::DType::Int32);
 }
 
 // =========================================================================
@@ -497,15 +497,15 @@ fn test_dtype_preservation() {
 
 #[test]
 fn test_symbolic_shape_support() {
-    use morok_ir::{ConstValue, DType};
+    use svod_ir::{ConstValue, DType};
 
     // Create a tensor with a symbolic dimension using DefineVar
     let batch_var = UOp::define_var("batch".to_string(), 0, 128);
-    let batch_dim = morok_ir::SInt::Symbolic(batch_var);
+    let batch_dim = svod_ir::SInt::Symbolic(batch_var);
 
     // Create shape: [batch, 3, 4] where batch is symbolic
-    let symbolic_shape: morok_ir::shape::Shape =
-        vec![batch_dim.clone(), morok_ir::SInt::from(3), morok_ir::SInt::from(4)].into();
+    let symbolic_shape: svod_ir::shape::Shape =
+        vec![batch_dim.clone(), svod_ir::SInt::from(3), svod_ir::SInt::from(4)].into();
 
     // Create a tensor with this symbolic shape using a const value
     let const_val = UOp::const_(DType::Float32, ConstValue::Float(1.0));
@@ -526,7 +526,7 @@ fn test_symbolic_shape_support() {
     assert_eq!(tensor.ndim().unwrap(), 3);
 
     // Test 3: Reshape preserving symbolic dimension
-    let new_shape: morok_ir::shape::Shape = vec![batch_dim.clone(), morok_ir::SInt::from(12)].into();
+    let new_shape: svod_ir::shape::Shape = vec![batch_dim.clone(), svod_ir::SInt::from(12)].into();
     let reshaped = tensor.uop().try_reshape(&new_shape).map(Tensor::new).unwrap();
     assert_eq!(reshaped.ndim().unwrap(), 2);
 
@@ -540,14 +540,14 @@ fn test_symbolic_shape_support() {
 
 #[test]
 fn test_symbolic_shape_broadcast() {
-    use morok_ir::{ConstValue, DType};
+    use svod_ir::{ConstValue, DType};
 
     // Create symbolic batch dimension
     let batch_var = UOp::define_var("N".to_string(), 0, 1024);
-    let batch_dim = morok_ir::SInt::Symbolic(batch_var);
+    let batch_dim = svod_ir::SInt::Symbolic(batch_var);
 
     // Create tensor with shape [N, 4]
-    let symbolic_shape: morok_ir::shape::Shape = vec![batch_dim.clone(), morok_ir::SInt::from(4)].into();
+    let symbolic_shape: svod_ir::shape::Shape = vec![batch_dim.clone(), svod_ir::SInt::from(4)].into();
 
     let const_val = UOp::const_(DType::Float32, ConstValue::Float(1.0));
     let tensor_symbolic = const_val.try_reshape(&symbolic_shape).unwrap();
@@ -568,14 +568,14 @@ fn test_symbolic_shape_broadcast() {
 
 #[test]
 fn test_symbolic_shape_binary_ops() {
-    use morok_ir::{ConstValue, DType};
+    use svod_ir::{ConstValue, DType};
 
     // Create symbolic dimensions
     let dim_var = UOp::define_var("D".to_string(), 0, 512);
-    let dim_sym = morok_ir::SInt::Symbolic(dim_var);
+    let dim_sym = svod_ir::SInt::Symbolic(dim_var);
 
     // Create two tensors with symbolic shape [D]
-    let shape: morok_ir::shape::Shape = vec![dim_sym.clone()].into();
+    let shape: svod_ir::shape::Shape = vec![dim_sym.clone()].into();
 
     let const1 = UOp::const_(DType::Float32, ConstValue::Float(2.0));
     let tensor1_uop = const1.try_reshape(&shape).unwrap();
@@ -757,5 +757,5 @@ fn test_shape_tensor_dtype() {
     let shape = t.shape_tensor().unwrap();
 
     // Shape tensor should be int64
-    assert_eq!(shape.uop().dtype(), morok_dtype::DType::Int64);
+    assert_eq!(shape.uop().dtype(), svod_dtype::DType::Int64);
 }

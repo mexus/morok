@@ -7,10 +7,10 @@
 
 use std::sync::Arc;
 
-use morok_dtype::{AddrSpace, DType};
-use morok_ir::types::ConstValue;
-use morok_ir::{Op, UOp};
 use smallvec::{SmallVec, smallvec};
+use svod_dtype::{AddrSpace, DType};
+use svod_ir::types::ConstValue;
+use svod_ir::{Op, UOp};
 
 use crate::devectorize::devectorize;
 
@@ -342,7 +342,7 @@ fn test_ungate_load_unchanged() {
 /// Test: is_increasing on range variable
 #[test]
 fn test_is_increasing_range() {
-    use morok_ir::types::{AxisId, AxisType};
+    use svod_ir::types::{AxisId, AxisType};
     let range = UOp::range_axis(UOp::index_const(16), AxisId::Unrenumbered(0), AxisType::Loop);
     assert!(range.is_increasing(), "RANGE should be increasing");
 }
@@ -357,7 +357,7 @@ fn test_is_increasing_constant() {
 /// Test: is_increasing on add
 #[test]
 fn test_is_increasing_add_expr() {
-    use morok_ir::types::{AxisId, AxisType};
+    use svod_ir::types::{AxisId, AxisType};
     let range = UOp::range_axis(UOp::index_const(16), AxisId::Unrenumbered(0), AxisType::Loop);
     let c = UOp::const_(DType::Index, ConstValue::Int(5));
     let sum = range.try_add(&c).unwrap();
@@ -367,7 +367,7 @@ fn test_is_increasing_add_expr() {
 /// Test: is_increasing on mul by positive const
 #[test]
 fn test_is_increasing_mul_positive() {
-    use morok_ir::types::{AxisId, AxisType};
+    use svod_ir::types::{AxisId, AxisType};
     let range = UOp::range_axis(UOp::index_const(16), AxisId::Unrenumbered(0), AxisType::Loop);
     let c = UOp::const_(DType::Index, ConstValue::Int(4));
     let prod = range.try_mul(&c).unwrap();

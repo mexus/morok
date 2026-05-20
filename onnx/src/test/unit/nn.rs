@@ -1,8 +1,8 @@
 use crate::test::helpers::*;
-use morok_schedule::testing::setup_test_tracing;
 use ndarray::{Array4, array};
+use svod_schedule::testing::setup_test_tracing;
 
-morok_tensor::codegen_tests! {
+svod_tensor::codegen_tests! {
     fn test_registry_matmul(config) {
         let registry = OpRegistry::new();
         let a = Tensor::from_ndarray(&array![[1.0f32, 2.0], [3.0, 4.0]]);
@@ -239,27 +239,27 @@ fn test_rnnt_encoder_kernel_count() {
 
     // Rangeify + kernel split (no compilation — fast)
     let contiguouses = vec![encoded.uop().contiguous(), encoded_len.uop().contiguous()];
-    let sink = morok_ir::UOp::sink(contiguouses);
+    let sink = svod_ir::UOp::sink(contiguouses);
 
-    let (rangeified, _ctx) = morok_schedule::rangeify::rangeify(sink, None).unwrap();
-    let (kernels_root, _kctx) = morok_schedule::rangeify::try_get_kernel_graph(rangeified)
+    let (rangeified, _ctx) = svod_schedule::rangeify::rangeify(sink, None).unwrap();
+    let (kernels_root, _kctx) = svod_schedule::rangeify::try_get_kernel_graph(rangeified)
         .expect("kernel split pipeline should succeed for RNNT kernel count");
 
     let kernels: Vec<_> =
-        kernels_root.toposort().into_iter().filter(|n| matches!(n.op(), morok_ir::Op::Call { .. })).collect();
+        kernels_root.toposort().into_iter().filter(|n| matches!(n.op(), svod_ir::Op::Call { .. })).collect();
 
-    eprintln!("Morok rangeify kernels: {}", kernels.len());
+    eprintln!("Svod rangeify kernels: {}", kernels.len());
 
     // Count by structure: (node_count, reduce_count) → frequency
     // Extract the call body AST (SINK inside CALL), not the full dependency graph
     let mut type_counts: std::collections::HashMap<(usize, usize), usize> = std::collections::HashMap::new();
     for k in &kernels {
         let ast = match k.op() {
-            morok_ir::Op::Call { body, .. } => body,
+            svod_ir::Op::Call { body, .. } => body,
             _ => continue,
         };
         let nodes = ast.toposort();
-        let nr = nodes.iter().filter(|n| matches!(n.op(), morok_ir::Op::Reduce { .. })).count();
+        let nr = nodes.iter().filter(|n| matches!(n.op(), svod_ir::Op::Reduce { .. })).count();
         *type_counts.entry((nodes.len(), nr)).or_insert(0) += 1;
     }
 

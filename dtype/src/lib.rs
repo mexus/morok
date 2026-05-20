@@ -33,7 +33,7 @@ impl DeviceSpec {
     /// # Examples
     ///
     /// ```
-    /// use morok_dtype::DeviceSpec;
+    /// use svod_dtype::DeviceSpec;
     ///
     /// assert_eq!(DeviceSpec::Cpu.canonicalize(), "CPU");
     /// assert_eq!(DeviceSpec::Cuda { device_id: 0 }.canonicalize(), "CUDA:0");
@@ -75,7 +75,7 @@ impl DeviceSpec {
     /// # Examples
     ///
     /// ```
-    /// use morok_dtype::DeviceSpec;
+    /// use svod_dtype::DeviceSpec;
     ///
     /// assert_eq!(DeviceSpec::Cpu.base_type(), "CPU");
     /// assert_eq!(DeviceSpec::Cuda { device_id: 0 }.base_type(), "CUDA");
@@ -409,7 +409,7 @@ impl DType {
     /// # Examples
     ///
     /// ```
-    /// use morok_dtype::DType;
+    /// use svod_dtype::DType;
     ///
     /// let vec_dtype = DType::Float32.vec(4);
     /// assert_eq!(vec_dtype.scalar_dtype(), DType::Float32);

@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use morok_ir::UOp;
+use svod_ir::UOp;
 
 use crate::rangeify::RangeifyBufferContext;
 
@@ -40,7 +40,7 @@ fn test_next_range() {
 
 #[test]
 fn test_buffer_mapping() {
-    use morok_dtype::DType;
+    use svod_dtype::DType;
 
     let mut ctx = RangeifyBufferContext::new();
 

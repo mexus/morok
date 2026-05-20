@@ -22,9 +22,9 @@ use melior::ir::r#type::IntegerType;
 use melior::ir::{Block, Location, Module, Region, Type};
 use melior::pass::PassManager;
 use melior::utility::{register_all_dialects, register_all_llvm_translations};
-use morok_dtype::DType;
-use morok_ir::pattern::TypedPatternMatcher;
-use morok_ir::{AxisType, Op, ReduceOp, WmmaMetadata, prelude::*};
+use svod_dtype::DType;
+use svod_ir::pattern::TypedPatternMatcher;
+use svod_ir::{AxisType, Op, ReduceOp, WmmaMetadata, prelude::*};
 
 use self::ctx::{RenderContext, ScfIfInfo, ScfLoopInfo};
 use self::ops::*;
@@ -343,7 +343,7 @@ impl Renderer for MlirRenderer {
     fn decompositor(&self) -> Option<TypedPatternMatcher<()>> {
         // MLIR LLVM dialect doesn't support vector<N x ptr> types
         // Eliminate bare PTRCAT (dead code not consumed by LOAD/STORE)
-        use morok_ir::decompositions::ptrcat_decomposition_patterns;
+        use svod_ir::decompositions::ptrcat_decomposition_patterns;
 
         Some(ptrcat_decomposition_patterns())
     }

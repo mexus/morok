@@ -4,7 +4,7 @@
 
 use std::f64::consts::PI;
 
-use morok_dtype::DType;
+use svod_dtype::DType;
 
 use crate::{ReduceOp, UOp};
 

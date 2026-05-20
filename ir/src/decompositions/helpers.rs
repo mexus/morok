@@ -11,7 +11,7 @@
 
 use std::sync::Arc;
 
-use morok_dtype::{DType, ScalarDType};
+use svod_dtype::{DType, ScalarDType};
 
 use crate::types::ConstValue;
 use crate::uop::UOp;

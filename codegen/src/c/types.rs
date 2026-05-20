@@ -3,8 +3,8 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use morok_dtype::{DType, ScalarDType};
-use morok_ir::{ConstValue, UOp};
+use svod_dtype::{DType, ScalarDType};
+use svod_ir::{ConstValue, UOp};
 
 /// Convert a DType to its C scalar type string.
 pub fn c_scalar(s: ScalarDType) -> &'static str {
@@ -203,8 +203,8 @@ pub fn c_math_fn(name: &str, dtype: &DType) -> String {
 }
 
 /// Get the identity element for a reduce operation as a C literal.
-pub fn c_reduce_identity(op: morok_ir::ReduceOp, dtype: &DType) -> String {
-    use morok_ir::ReduceOp;
+pub fn c_reduce_identity(op: svod_ir::ReduceOp, dtype: &DType) -> String {
+    use svod_ir::ReduceOp;
     let is_f64 = matches!(dtype.base(), ScalarDType::Float64);
     match op {
         ReduceOp::Add => {

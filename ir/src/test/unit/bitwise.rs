@@ -4,7 +4,7 @@
 
 use std::f32::consts::PI;
 
-use morok_dtype::DType;
+use svod_dtype::DType;
 
 use crate::{ConstValue, UOp, error::Error}; // ConstValue kept for i8, i16, u8
 

@@ -9,7 +9,7 @@
 
 use std::sync::Arc;
 
-use morok_ir::{UOp, UOpKey};
+use svod_ir::{UOp, UOpKey};
 
 // ===== Hash Consing Tests =====
 

@@ -2,7 +2,7 @@
 //!
 //! Decoders own their vocabulary and configuration; callers pass only per-run
 //! data (`log_probs`, `valid_frames`). This crate operates on plain `&[f32]`
-//! log-prob slices — there is no coupling to `morok-tensor`, `morok-device`,
+//! log-prob slices — there is no coupling to `svod-tensor`, `svod-device`,
 //! or any specific model crate.
 //!
 //! Two decoders are provided:

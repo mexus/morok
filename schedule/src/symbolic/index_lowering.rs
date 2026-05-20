@@ -19,11 +19,11 @@
 
 use std::sync::Arc;
 
-use morok_dtype::{DType, ScalarDType};
-use morok_ir::types::ConstValue;
-use morok_ir::uop::cached_property::CachedProperty;
-use morok_ir::uop::properties::VminVmaxProperty;
-use morok_ir::{Op, UOp};
+use svod_dtype::{DType, ScalarDType};
+use svod_ir::types::ConstValue;
+use svod_ir::uop::cached_property::CachedProperty;
+use svod_ir::uop::properties::VminVmaxProperty;
+use svod_ir::{Op, UOp};
 
 use crate::TypedPatternMatcher;
 
@@ -225,7 +225,7 @@ pub fn pm_lower_index_dtype() -> TypedPatternMatcher {
             let mut conds: Vec<std::sync::Arc<UOp>> = Vec::new();
             let mut changed = false;
             for idx in indices.iter() {
-                if let Op::Ternary(morok_ir::TernaryOp::Where, cond, true_val, false_val) = idx.op()
+                if let Op::Ternary(svod_ir::TernaryOp::Where, cond, true_val, false_val) = idx.op()
                     && UOp::is_invalid_marker(false_val) {
                         new_indices.push(true_val.clone());
                         conds.push(cond.clone());
@@ -245,7 +245,7 @@ pub fn pm_lower_index_dtype() -> TypedPatternMatcher {
         },
 
         // SINK/END - strip .cast(Index) from sources
-        // Tinygrad (ops.py:1311) also includes NOOP here, but Morok's Op::Noop has no sources,
+        // Tinygrad (ops.py:1311) also includes NOOP here, but Svod's Op::Noop has no sources,
         // so stripping .cast(Index) from NOOP sources is a no-op.
 
         // SINK - strip .cast(Index) from sources

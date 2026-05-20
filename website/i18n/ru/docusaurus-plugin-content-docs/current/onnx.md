@@ -4,14 +4,14 @@ sidebar_label: ONNX-инференс
 
 # Инференс ONNX-моделей
 
-ONNX-импортёр Morok — рекомендуемый способ инференса моделей. Он загружает стандартные `.onnx`-файлы, раскладывает операторы на ленивые тензорные операции Morok и компилирует их через полный пайплайн оптимизаций — без C++ рантайма.
+ONNX-импортёр Svod — рекомендуемый способ инференса моделей. Он загружает стандартные `.onnx`-файлы, раскладывает операторы на ленивые тензорные операции Svod и компилирует их через полный пайплайн оптимизаций — без C++ рантайма.
 
 **Текущий статус:**
 
 | Возможность | Статус |
 |-------------|--------|
 | Прямой инференс | Поддерживается |
-| 162 / 200 операторов ONNX | [Таблица паритета](https://github.com/npatsakula/morok/blob/main/onnx/PARITY.md) |
+| 162 / 200 операторов ONNX | [Таблица паритета](https://github.com/npatsakula/svod/blob/main/onnx/PARITY.md) |
 | CNN-архитектуры (ResNet, DenseNet, VGG, ...) | Проверено 9 моделей |
 | Расширения Microsoft (Attention, RotaryEmbedding) | Поддерживается |
 | Динамический размер батча | Поддерживается (Variable API) |
@@ -19,18 +19,18 @@ ONNX-импортёр Morok — рекомендуемый способ инфе
 
 **Сравнение с другими фреймворками**
 
-Среди чистых Rust-фреймворков у Morok самое широкое покрытие операторов ONNX — 162 оператора, 1361 пройденный conformance-тест на двух бэкендах (Clang + LLVM). У `candle` и `burn` операторов меньше, а тестовых наборов сопоставимого масштаба нет. Если же нужна максимальная совместимость с продакшн-моделями ONNX — используйте `ort`, Rust-обёртку вокруг C++ ONNX Runtime, которая покрывает полную спецификацию.
+Среди чистых Rust-фреймворков у Svod самое широкое покрытие операторов ONNX — 162 оператора, 1361 пройденный conformance-тест на двух бэкендах (Clang + LLVM). У `candle` и `burn` операторов меньше, а тестовых наборов сопоставимого масштаба нет. Если же нужна максимальная совместимость с продакшн-моделями ONNX — используйте `ort`, Rust-обёртку вокруг C++ ONNX Runtime, которая покрывает полную спецификацию.
 
 ---
 
 ## Быстрый старт
 
-Добавьте `morok-onnx` и `morok-tensor` в `Cargo.toml`:
+Добавьте `svod-onnx` и `svod-tensor` в `Cargo.toml`:
 
 ```toml
 [dependencies]
-morok-onnx = { git = "https://github.com/npatsakula/morok" }
-morok-tensor = { git = "https://github.com/npatsakula/morok" }
+svod-onnx = { git = "https://github.com/npatsakula/svod" }
+svod-tensor = { git = "https://github.com/npatsakula/svod" }
 ```
 
 ### Простой вариант: модели со встроенными весами
@@ -38,8 +38,8 @@ morok-tensor = { git = "https://github.com/npatsakula/morok" }
 Для моделей, у которых все входы уже вшиты в файл (без рантайм-входов):
 
 ```rust
-use morok_onnx::{OnnxImporter, OnnxModel};
-use morok_tensor::Tensor;
+use svod_onnx::{OnnxImporter, OnnxModel};
+use svod_tensor::Tensor;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut importer = OnnxImporter::new();
@@ -61,8 +61,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 Большинству моделей нужны данные на этапе выполнения (изображения, токены, аудио). Деструктурируйте `OnnxModel` и используйте `remove()`, чтобы взять владение входными тензорами:
 
 ```rust
-use morok_onnx::{OnnxImporter, OnnxModel};
-use morok_tensor::Tensor;
+use svod_onnx::{OnnxImporter, OnnxModel};
+use svod_tensor::Tensor;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut importer = OnnxImporter::new();
@@ -98,7 +98,7 @@ model.onnx → import(path, dims) → OnnxModel { inputs, outputs, variables } �
 
 ### Декомпозиция операторов
 
-Каждый оператор ONNX раскладывается на операции Morok Tensor. Степень сложности разная:
+Каждый оператор ONNX раскладывается на операции Svod Tensor. Степень сложности разная:
 
 **Прямые отображения** — около 60 операторов напрямую соответствуют одному методу тензора:
 
@@ -204,13 +204,13 @@ let model = importer.import_model_with_inputs(
 
 ### Семантика If: обе ветки всегда выполняются
 
-Оператор `If` в ONNX — это data-dependent control flow: условие определяет, какая ветка выполняется. Ленивые вычисления Morok принципиально несовместимы с этим: на этапе трассировки ничего не выполняется, и значение условия неизвестно.
+Оператор `If` в ONNX — это data-dependent control flow: условие определяет, какая ветка выполняется. Ленивые вычисления Svod принципиально несовместимы с этим: на этапе трассировки ничего не выполняется, и значение условия неизвестно.
 
-**Решение Morok:** Трассировать *обе* ветки, а потом объединить результаты через `Tensor::where_()`:
+**Решение Svod:** Трассировать *обе* ветки, а потом объединить результаты через `Tensor::where_()`:
 
 ```text
 ONNX:    if condition { then_branch } else { else_branch }
-Morok:   then_result.where_(&condition, &else_result)
+Svod:   then_result.where_(&condition, &else_result)
 ```
 
 Это даёт подход **«трассируй один раз — запускай многократно»** — скомпилированный граф обрабатывает любое значение условия в рантайме. Но есть жёсткое ограничение: **обе ветки должны возвращать одинаковые формы и типы данных.** Модели с shape-полиморфными ветками (then-ветка возвращает `[3, 4]`, а else-ветка — `[5, 6]`) трассировать нельзя.
@@ -268,7 +268,7 @@ plan.execute_with_vars(&[bound.as_var_val()])?;
 | Категория | Примеры | Причина |
 |-----------|---------|---------|
 | Квантизация | DequantizeLinear, QuantizeLinear | Нужна поддержка квантизованных типов в IR |
-| Операции с последовательностями | SequenceConstruct, SequenceAt | Нетензорные типы не входят в систему типов Morok |
+| Операции с последовательностями | SequenceConstruct, SequenceAt | Нетензорные типы не входят в систему типов Svod |
 | Случайные числа | RandomNormal, RandomUniform | Stateful RNG пока не реализован |
 | Обработка сигналов | DFT, STFT, MelWeightMatrix | Низкий приоритет; узкоспециализированные задачи |
 | Текст | StringNormalizer, TfIdfVectorizer | Строковые типы не поддерживаются |
@@ -284,7 +284,7 @@ plan.execute_with_vars(&[bound.as_var_val()])?;
 Установите уровень логирования trace, чтобы выводить промежуточные результаты:
 
 ```bash
-RUST_LOG=morok_onnx::importer=trace cargo run
+RUST_LOG=svod_onnx::importer=trace cargo run
 ```
 
 Это вызывает `realize()` для выхода каждого узла отдельно и печатает первые 5 значений — помогает при числовой бисекции, когда модель выдаёт неверные результаты. Учтите, что это ломает фьюзинг ядер (каждый узел выполняется отдельно), так что это чисто отладочный инструмент.
@@ -314,7 +314,7 @@ println!("Variables: {:?}", model.variables.keys().collect::<Vec<_>>());
 | **Точка входа** | `OnnxImporter::new()` |
 | **Простой импорт** | `importer.import("model.onnx", &[])?` |
 | **Динамические размерности** | `importer.import(path, &[("batch", 4)])?` |
-| **Операторы** | 162 / 200 ([полная таблица паритета](https://github.com/npatsakula/morok/blob/main/onnx/PARITY.md)) |
+| **Операторы** | 162 / 200 ([полная таблица паритета](https://github.com/npatsakula/svod/blob/main/onnx/PARITY.md)) |
 | **Проверенные модели** | ResNet50, DenseNet121, VGG19, Inception, AlexNet, ShuffleNet, SqueezeNet, ZFNet |
 | **Бэкенды** | Clang + LLVM (идентичные результаты) |
 | **Расширения** | com.microsoft Attention, RotaryEmbedding, SkipLayerNorm, EmbedLayerNorm |

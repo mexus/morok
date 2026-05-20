@@ -5,8 +5,8 @@
 
 use std::sync::Arc;
 
-use morok_dtype::DType;
-use morok_ir::{BinaryOp, Op, ReduceOp, TernaryOp, UnaryOp, prelude::*};
+use svod_dtype::DType;
+use svod_ir::{BinaryOp, Op, ReduceOp, TernaryOp, UnaryOp, prelude::*};
 
 use crate::llvm::common::{RenderContext, lcast, ldt};
 
@@ -86,7 +86,7 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec<Stri
                 };
 
                 let elem_type = match uop.dtype() {
-                    morok_dtype::DType::Ptr { ref base, .. } => ldt(base),
+                    svod_dtype::DType::Ptr { ref base, .. } => ldt(base),
                     other => ldt(&other),
                 };
 
@@ -345,7 +345,7 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec<Stri
         Op::Cast { src, dtype } => {
             let s = ctx.get(src);
 
-            // INDEX always produces ptr in LLVM (via GEP), regardless of Morok dtype.
+            // INDEX always produces ptr in LLVM (via GEP), regardless of Svod dtype.
             // When source is INDEX, treat source LLVM type as ptr for cast selection.
             let is_index_src = matches!(src.op(), Op::Index { .. });
             let src_llvm_type = if is_index_src { "ptr".to_string() } else { ldt(&src.dtype()) };
@@ -646,7 +646,7 @@ fn splat_or_literal(scalar_lit: &str, dtype: &DType, kernel: &mut Vec<String>, n
 ///
 /// Encoding: three NOP cycles to drain the pipeline, then a fixed 32-bit
 /// word at `0x201000 + (17 << 5) + imm5`. `17` is the AMX_SET op slot.
-/// Same encoding as the `AMX_SET` macro in morok's C backend
+/// Same encoding as the `AMX_SET` macro in svod's C backend
 /// (`codegen/src/c/amx.rs:39`).
 fn amx_set_inline_asm(imm5: u32) -> String {
     let opcode = 0x201000u32 + (17 << 5) + imm5;
@@ -681,7 +681,7 @@ fn amx_inline_asm_imm(op: u32, imm: u64) -> String {
 
 fn binary_instr(op: BinaryOp, dtype: &DType) -> &'static str {
     assert!(
-        !matches!(dtype.base(), morok_dtype::ScalarDType::Index),
+        !matches!(dtype.base(), svod_dtype::ScalarDType::Index),
         "Index dtype reached LLVM codegen binary_instr({op:?}, {dtype:?}) — \
          pm_lower_index_dtype should have lowered it to i32/i64"
     );

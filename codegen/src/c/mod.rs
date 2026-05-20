@@ -18,8 +18,8 @@ pub mod types;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use morok_ir::pattern::TypedPatternMatcher;
-use morok_ir::{Op, prelude::*};
+use svod_ir::pattern::TypedPatternMatcher;
+use svod_ir::{Op, prelude::*};
 
 use crate::common::{is_output_buffer, validate_custom_template_strict};
 use crate::{BufferArg, Error, RenderedKernel, Result};

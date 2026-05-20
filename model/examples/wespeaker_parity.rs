@@ -2,7 +2,7 @@
 //!
 //! Loads a reference NPZ produced by the upstream Python pipeline (e.g.
 //! pyannote / DiariZen) and the pyannote `pytorch_model.bin` checkpoint, runs
-//! the morok JIT forward, and prints how far the morok output is from the
+//! the svod JIT forward, and prints how far the svod output is from the
 //! reference embeddings.
 //!
 //! ## NPZ contract
@@ -19,11 +19,11 @@
 //! ## Usage
 //!
 //! ```text
-//! cargo run -p morok-model --release --example wespeaker_parity -- \
+//! cargo run -p svod-model --release --example wespeaker_parity -- \
 //!     --bin /path/to/pytorch_model.bin --data /path/to/reference.npz
 //!
 //! # or pull the bin from HF Hub:
-//! cargo run -p morok-model --release --example wespeaker_parity -- \
+//! cargo run -p svod-model --release --example wespeaker_parity -- \
 //!     --hub --data /path/to/reference.npz
 //! ```
 
@@ -34,8 +34,8 @@ use clap::Parser;
 use ndarray::{Array2, Array3};
 use ndarray_npy::NpzReader;
 
-use morok_model::jit::InputSpec;
-use morok_model::wespeaker::{WeSpeakerConfig, WeSpeakerResNet34, WeSpeakerResNet34Jit};
+use svod_model::jit::InputSpec;
+use svod_model::wespeaker::{WeSpeakerConfig, WeSpeakerResNet34, WeSpeakerResNet34Jit};
 
 const DEFAULT_HUB_ID: &str = "pyannote/wespeaker-voxceleb-resnet34-LM";
 

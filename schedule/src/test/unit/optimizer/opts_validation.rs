@@ -4,12 +4,12 @@
 //! Each test is documented with its original Tinygrad source for reference.
 //!
 //! Note: These tests focus on structural correctness (axis types, shapes, counts)
-//! since morok doesn't yet have execution/runtime infrastructure for numerical
+//! since svod doesn't yet have execution/runtime infrastructure for numerical
 //! validation.
 
 use crate::optimizer::{Opt, Renderer, Scheduler, apply_opt};
 use crate::test::helpers::*;
-use morok_ir::{AxisId, AxisType, DType, ReduceOp, UOp};
+use svod_ir::{AxisId, AxisType, DType, ReduceOp, UOp};
 
 /// Port of Tinygrad test_kernel_opts.py::test_upcasts (lines 37-47)
 ///

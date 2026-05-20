@@ -6,7 +6,7 @@ use std::f64::consts::PI;
 
 use smallvec::smallvec;
 
-use morok_dtype::DType;
+use svod_dtype::DType;
 
 use crate::{SInt, UOp, error::Error, shape::Shape};
 

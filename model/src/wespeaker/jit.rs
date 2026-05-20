@@ -11,9 +11,9 @@
 //!   `[1, max_batch_size]` by the macro-generated setters.
 //! - Output is `[B, 256]` speaker embeddings.
 
-extern crate self as morok_model;
+extern crate self as svod_model;
 
-use morok_macros::jit_wrapper;
+use svod_macros::jit_wrapper;
 
 use super::model::WeSpeakerResNet34;
 

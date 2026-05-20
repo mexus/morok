@@ -7,8 +7,8 @@ pub mod tc;
 mod pipeline_composition {
     use crate::linearize::pm_split_ends;
     use crate::rewrite::graph_rewrite;
-    use morok_ir::{AxisId, AxisType, ConstValue, DType, Op, UOp};
     use smallvec::smallvec;
+    use svod_ir::{AxisId, AxisType, ConstValue, DType, Op, UOp};
 
     /// `pm_split_ends` (composed into `PM_FINAL` at
     /// `optimizer/mod.rs:391-393`) splits a multi-range END into nested

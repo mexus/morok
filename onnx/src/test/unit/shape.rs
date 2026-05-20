@@ -105,7 +105,7 @@ fn test_center_crop_pad_crop() {
 // Codegen-required tests (realize/to_vec)
 // =========================================================================
 
-morok_tensor::codegen_tests! {
+svod_tensor::codegen_tests! {
     fn test_registry_transpose(config) {
         let registry = OpRegistry::new();
         let x = Tensor::from_ndarray(&array![[1.0f32, 2.0, 3.0], [4.0, 5.0, 6.0]]);

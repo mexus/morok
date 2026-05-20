@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use morok_ir::{AxisId, AxisType, ConstValue, Op, ReduceOp, UOp};
+use svod_ir::{AxisId, AxisType, ConstValue, Op, ReduceOp, UOp};
 
 use crate::optimizer::error::OptError;
 use crate::optimizer::{OptOps, Renderer, Scheduler};
@@ -1074,7 +1074,7 @@ fn test_swap_basic() {
     let get_size = |rng: &Arc<UOp>| -> i64 {
         if let Op::Range { end, .. } = rng.op()
             && let Op::Const(cv) = end.op()
-            && let morok_ir::ConstValue::Int(sz) = cv.0
+            && let svod_ir::ConstValue::Int(sz) = cv.0
         {
             return sz;
         }
@@ -1578,8 +1578,8 @@ fn test_apply_threading_heuristic_loop() {
 #[test]
 fn test_apply_threading_heuristic_symbolic_work_and_divisibility() {
     use crate::optimizer::heuristics::apply_threading;
-    use morok_dtype::DType;
-    use morok_ir::BinaryOp;
+    use svod_dtype::DType;
+    use svod_ir::BinaryOp;
 
     // Non-const loop extent with known vmax and const factor.
     // end = V * 4 where V in [1, 131072] => vmax=524288, divisible by 4.

@@ -1,11 +1,11 @@
-# morok-tensor
+# svod-tensor
 
 High-level tensor API with lazy evaluation.
 
 ## Basic Example
 
 ```rust
-use morok_tensor::Tensor;
+use svod_tensor::Tensor;
 use ndarray::array;
 
 let a = Tensor::from_ndarray(&array![1.0f32, 2.0, 3.0]);
@@ -20,7 +20,7 @@ assert_eq!(view.as_slice().unwrap(), &[5.0, 7.0, 9.0]);
 ## ndarray Interop
 
 ```rust
-use morok_tensor::Tensor;
+use svod_tensor::Tensor;
 use ndarray::array;
 
 // Zero-copy from ndarray (fast path for C-contiguous arrays)
@@ -49,7 +49,7 @@ assert_eq!(view.len(), 3);
 For repeated kernel executions (e.g., benchmarks, inference loops), separate preparation from execution:
 
 ```rust
-use morok_tensor::Tensor;
+use svod_tensor::Tensor;
 
 let a = Tensor::from_slice(&data_a);
 let b = Tensor::from_slice(&data_b);
@@ -138,5 +138,5 @@ plan.execute_with_vars(&[bound.as_var_val()])?;
 ## Testing
 
 ```bash
-cargo test -p morok-tensor
+cargo test -p svod-tensor
 ```

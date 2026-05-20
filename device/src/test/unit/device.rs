@@ -1,6 +1,6 @@
 use crate::{DeviceSpec, registry::DeviceSpecExt};
-use morok_dtype::DType;
-use morok_ir::{Op, UOp};
+use svod_dtype::DType;
+use svod_ir::{Op, UOp};
 
 #[test]
 fn test_device_spec_parse() {

@@ -4,14 +4,14 @@ sidebar_label: ONNX 推理
 
 # ONNX 模型推理
 
-Morok 的 ONNX 导入器是运行模型推理的推荐方式。它加载标准的 `.onnx` 文件，将算子分解为 Morok 的惰性张量操作，并通过完整的优化流水线编译执行——无需 C++ 运行时。
+Svod 的 ONNX 导入器是运行模型推理的推荐方式。它加载标准的 `.onnx` 文件，将算子分解为 Svod 的惰性张量操作，并通过完整的优化流水线编译执行——无需 C++ 运行时。
 
 **当前状态：**
 
 | 能力 | 状态 |
 |------|------|
 | 前向推理 | 已支持 |
-| 162 / 200 个 ONNX 算子 | [算子对齐详情](https://github.com/npatsakula/morok/blob/main/onnx/PARITY.md) |
+| 162 / 200 个 ONNX 算子 | [算子对齐详情](https://github.com/npatsakula/svod/blob/main/onnx/PARITY.md) |
 | CNN 架构（ResNet、DenseNet、VGG 等） | 已验证 9 个模型 |
 | Microsoft 扩展（Attention、RotaryEmbedding） | 已支持 |
 | 动态批大小 | 已支持（Variable API） |
@@ -19,18 +19,18 @@ Morok 的 ONNX 导入器是运行模型推理的推荐方式。它加载标准�
 
 **与其他框架的比较**
 
-在纯 Rust 框架中，Morok 的 ONNX 算子覆盖面最广——162 个算子，双后端（Clang + LLVM）上通过 1361 项一致性测试。`candle` 和 `burn` 支持的算子更少，也没有同等规模的测试套件。如果需要与生产环境 ONNX 模型的最大兼容性，用 `ort`——C++ ONNX Runtime 的 Rust 封装，覆盖完整的 ONNX 规范。
+在纯 Rust 框架中，Svod 的 ONNX 算子覆盖面最广——162 个算子，双后端（Clang + LLVM）上通过 1361 项一致性测试。`candle` 和 `burn` 支持的算子更少，也没有同等规模的测试套件。如果需要与生产环境 ONNX 模型的最大兼容性，用 `ort`——C++ ONNX Runtime 的 Rust 封装，覆盖完整的 ONNX 规范。
 
 ---
 
 ## 快速开始
 
-在你的 `Cargo.toml` 中添加 `morok-onnx` 和 `morok-tensor`：
+在你的 `Cargo.toml` 中添加 `svod-onnx` 和 `svod-tensor`：
 
 ```toml
 [dependencies]
-morok-onnx = { git = "https://github.com/npatsakula/morok" }
-morok-tensor = { git = "https://github.com/npatsakula/morok" }
+svod-onnx = { git = "https://github.com/npatsakula/svod" }
+svod-tensor = { git = "https://github.com/npatsakula/svod" }
 ```
 
 ### 简单用法：全初始化器模型
@@ -38,8 +38,8 @@ morok-tensor = { git = "https://github.com/npatsakula/morok" }
 对于所有输入都内嵌在文件中（无运行时输入）的模型：
 
 ```rust
-use morok_onnx::{OnnxImporter, OnnxModel};
-use morok_tensor::Tensor;
+use svod_onnx::{OnnxImporter, OnnxModel};
+use svod_tensor::Tensor;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut importer = OnnxImporter::new();
@@ -61,8 +61,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 大多数模型需要运行时数据（图像、token、音频）。解构 `OnnxModel` 并使用 `remove()` 获取输入张量的所有权：
 
 ```rust
-use morok_onnx::{OnnxImporter, OnnxModel};
-use morok_tensor::Tensor;
+use svod_onnx::{OnnxImporter, OnnxModel};
+use svod_tensor::Tensor;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut importer = OnnxImporter::new();
@@ -98,7 +98,7 @@ model.onnx → import(path, dims) → OnnxModel { inputs, outputs, variables } �
 
 ### 算子分解
 
-每个 ONNX 算子都会分解为 Morok Tensor 操作，复杂程度不一：
+每个 ONNX 算子都会分解为 Svod Tensor 操作，复杂程度不一：
 
 **直接映射** — 约 60 个算子与 tensor 方法一一对应：
 
@@ -204,13 +204,13 @@ let model = importer.import_model_with_inputs(
 
 ### 语义 If：两个分支始终执行
 
-ONNX 的 `If` 算子具有数据依赖的控制流——条件决定执行哪个分支。Morok 的惰性求值模型与此从根本上不兼容：由于 trace 时不执行任何计算，条件值是未知的。
+ONNX 的 `If` 算子具有数据依赖的控制流——条件决定执行哪个分支。Svod 的惰性求值模型与此从根本上不兼容：由于 trace 时不执行任何计算，条件值是未知的。
 
-**Morok 的解决方案：** 同时 trace *两个*分支，然后使用 `Tensor::where_()` 合并结果：
+**Svod 的解决方案：** 同时 trace *两个*分支，然后使用 `Tensor::where_()` 合并结果：
 
 ```text
 ONNX:    if condition { then_branch } else { else_branch }
-Morok:   then_result.where_(&condition, &else_result)
+Svod:   then_result.where_(&condition, &else_result)
 ```
 
 这实现了**一次 trace，多次运行**——编译后的图在运行时可以处理任何条件值。但它有一个硬性约束：**两个分支必须产生相同的输出形状和 DType。** 形状多态的模型（即 then 分支产生 `[3, 4]` 而 else 分支产生 `[5, 6]`）无法 trace。
@@ -267,7 +267,7 @@ plan.execute_with_vars(&[bound.as_var_val()])?;
 | 类别 | 示例 | 原因 |
 |------|------|------|
 | 量化 | DequantizeLinear、QuantizeLinear | 需要 IR 中的量化 DType 支持 |
-| 序列操作 | SequenceConstruct、SequenceAt | 非张量类型不在 Morok 的类型系统中 |
+| 序列操作 | SequenceConstruct、SequenceAt | 非张量类型不在 Svod 的类型系统中 |
 | 随机数 | RandomNormal、RandomUniform | 有状态 RNG 尚未实现 |
 | 信号处理 | DFT、STFT、MelWeightMatrix | 低优先级；小众用例 |
 | 文本 | StringNormalizer、TfIdfVectorizer | 不支持字符串类型 |
@@ -283,7 +283,7 @@ plan.execute_with_vars(&[bound.as_var_val()])?;
 设置 trace 日志级别以输出中间结果：
 
 ```bash
-RUST_LOG=morok_onnx::importer=trace cargo run
+RUST_LOG=svod_onnx::importer=trace cargo run
 ```
 
 这会逐个 realize 每个节点的输出并打印前 5 个值——模型输出有误时可以用来做数值二分。注意这会破坏内核融合（每个节点单独运行），纯粹是调试用途。
@@ -313,7 +313,7 @@ println!("Variables: {:?}", model.variables.keys().collect::<Vec<_>>());
 | **入口点** | `OnnxImporter::new()` |
 | **简单导入** | `importer.import("model.onnx", &[])?` |
 | **动态维度** | `importer.import(path, &[("batch", 4)])?` |
-| **算子** | 162 / 200（[完整对齐表](https://github.com/npatsakula/morok/blob/main/onnx/PARITY.md)） |
+| **算子** | 162 / 200（[完整对齐表](https://github.com/npatsakula/svod/blob/main/onnx/PARITY.md)） |
 | **已验证模型** | ResNet50、DenseNet121、VGG19、Inception、AlexNet、ShuffleNet、SqueezeNet、ZFNet |
 | **后端** | Clang + LLVM（结果一致） |
 | **扩展** | com.microsoft Attention、RotaryEmbedding、SkipLayerNorm、EmbedLayerNorm |

@@ -15,7 +15,7 @@
 //! splitter entirely via
 //! [`Transcriber::transcribe_chunks`](crate::gigaam::Transcriber::transcribe_chunks).
 
-pub use morok_arch::vad::AudioChunk;
+pub use svod_arch::vad::AudioChunk;
 
 /// Encoder-derived bounds passed to [`Splitter::split`].
 ///

@@ -72,7 +72,7 @@ jit_wrapper! {
 The `build` arguments must each name either an input or a declared var (the
 macro rejects names that don't match at expansion time). Inside the block,
 each input is a `&Tensor` (the macro allocates a zero-initialized placeholder
-when `prepare()` runs), each var is a `morok_tensor::Variable` already bound
+when `prepare()` runs), each var is a `svod_tensor::Variable` already bound
 to its upper bound, and `model` is a shared reference to the wrapper's owned
 model value. The closure returns `Result<Tensor, E>` for any
 `E: std::error::Error + Send + Sync + 'static`; failures surface as
@@ -236,7 +236,7 @@ jit_wrapper! {
 
         build(mel, lengths, b, t) {
             let out = model.encoder.forward_batch(mel, lengths, &b, &t)?;
-            out.cast(morok_dtype::DType::Float32).context(TensorSnafu)
+            out.cast(svod_dtype::DType::Float32).context(TensorSnafu)
         }
     }
 }

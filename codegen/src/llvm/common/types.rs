@@ -1,10 +1,10 @@
 //! LLVM type and constant string generation.
 //!
-//! Provides functions for converting Morok types to LLVM IR text.
+//! Provides functions for converting Svod types to LLVM IR text.
 //! Shared between CPU and GPU backends.
 
-use morok_dtype::{AddrSpace, DType, ScalarDType};
-use morok_ir::ConstValue;
+use svod_dtype::{AddrSpace, DType, ScalarDType};
+use svod_ir::ConstValue;
 
 /// Convert a DType to LLVM type string.
 ///

@@ -13,10 +13,10 @@
   },
   "link.item.label.GitHub": {
     "message": "GitHub",
-    "description": "The label of footer link with label=GitHub linking to https://github.com/npatsakula/morok"
+    "description": "The label of footer link with label=GitHub linking to https://github.com/npatsakula/svod"
   },
   "copyright": {
-    "message": "Copyright © 2026 Morok. Built with Docusaurus.",
+    "message": "Copyright © 2026 Svod. Built with Docusaurus.",
     "description": "The footer copyright"
   }
 }

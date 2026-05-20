@@ -11,8 +11,8 @@
 //! ## Usage
 //!
 //! ```text
-//! cargo run -p morok-model --release --example resnet_classify
-//! cargo run -p morok-model --release --example resnet_classify -- --image /tmp/cat.bin --hub
+//! cargo run -p svod-model --release --example resnet_classify
+//! cargo run -p svod-model --release --example resnet_classify -- --image /tmp/cat.bin --hub
 //! ```
 //!
 //! ## Performance note
@@ -26,9 +26,9 @@ use std::time::Instant;
 
 use clap::{Parser, ValueEnum};
 
-use morok_dtype::DType;
-use morok_model::jit::InputSpec;
-use morok_model::resnet::{OutputMode, ResNet, ResNetConfig, ResNetDepth, ResNetJit};
+use svod_dtype::DType;
+use svod_model::jit::InputSpec;
+use svod_model::resnet::{OutputMode, ResNet, ResNetConfig, ResNetDepth, ResNetJit};
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
 enum DepthArg {

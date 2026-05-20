@@ -1,11 +1,11 @@
-# morok-codegen
+# svod-codegen
 
 Backend code generation from optimized UOp graphs.
 
 ## Example
 
 ```rust
-use morok_codegen::{Renderer, render};
+use svod_codegen::{Renderer, render};
 
 let code = render(&kernel_graph, backend)?;
 ```
@@ -18,7 +18,7 @@ let code = render(&kernel_graph, backend)?;
 | **LLVM JIT** | LLVM IR text → `clang -x ir` → JIT ELF loader | always | no |
 | **MLIR** | MLIR (arith/scf/llvm dialects) → MLIR ExecutionEngine | `mlir` | no |
 
-Select at runtime via `MOROK_CPU_BACKEND` env var (`clang`, `llvm`, `mlir`).
+Select at runtime via `SVOD_CPU_BACKEND` env var (`clang`, `llvm`, `mlir`).
 
 **Planned:**
 
@@ -29,5 +29,5 @@ Select at runtime via `MOROK_CPU_BACKEND` env var (`clang`, `llvm`, `mlir`).
 ## Testing
 
 ```bash
-cargo test -p morok-codegen
+cargo test -p svod-codegen
 ```

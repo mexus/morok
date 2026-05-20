@@ -7,8 +7,8 @@
 
 use std::{f32::consts::PI, sync::Arc};
 
-use morok_dtype::DType;
-use morok_ir::{AxisId, AxisType, BinaryOp, Op, ReduceOp, UOp, pattern::RewriteResult};
+use svod_dtype::DType;
+use svod_ir::{AxisId, AxisType, BinaryOp, Op, ReduceOp, UOp, pattern::RewriteResult};
 
 use crate::rangeify::transforms::reduce_collapse as reduce_collapse_inner;
 
@@ -486,7 +486,7 @@ fn test_reduce_mul_chain_max_negative_factor_stays() {
             // The -1 should NOT be factored outside a MAX reduce
             if let Op::Const(c) = factor.op() {
                 assert!(
-                    c.0 != morok_ir::ConstValue::Int(-1),
+                    c.0 != svod_ir::ConstValue::Int(-1),
                     "Negative factor should not be factored out of MAX reduce"
                 );
             }

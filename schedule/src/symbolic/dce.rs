@@ -1,7 +1,7 @@
 //! Dead Code Elimination (DCE) helpers for symbolic optimization.
 
-use morok_ir::{Op, UOp};
 use std::sync::Arc;
+use svod_ir::{Op, UOp};
 
 /// Check if a range is provably empty (no iterations).
 ///
@@ -16,10 +16,10 @@ use std::sync::Arc;
 /// Also recognizes `Const(0)` with Index dtype as a dead range marker.
 /// This happens after the rewrite engine transforms dead RANGE → Const(0).
 pub fn is_empty_range(uop: &Arc<UOp>) -> bool {
-    use morok_dtype::DType;
-    use morok_ir::types::ConstValue;
-    use morok_ir::uop::cached_property::CachedProperty;
-    use morok_ir::uop::properties::VminVmaxProperty;
+    use svod_dtype::DType;
+    use svod_ir::types::ConstValue;
+    use svod_ir::uop::cached_property::CachedProperty;
+    use svod_ir::uop::properties::VminVmaxProperty;
 
     match uop.op() {
         Op::Range { .. } => {
@@ -53,9 +53,9 @@ pub fn is_empty_range(uop: &Arc<UOp>) -> bool {
 ///
 /// Follows Tinygrad's approach (dtype.py:134-141): floats use ±inf,
 /// integers use type bounds, bools use false/true.
-pub fn reduce_identity(op: morok_ir::types::ReduceOp, dtype: morok_dtype::DType) -> Arc<UOp> {
-    use morok_ir::types::ConstValue::{Float, Int};
-    use morok_ir::types::ReduceOp;
+pub fn reduce_identity(op: svod_ir::types::ReduceOp, dtype: svod_dtype::DType) -> Arc<UOp> {
+    use svod_ir::types::ConstValue::{Float, Int};
+    use svod_ir::types::ReduceOp;
 
     let val = match op {
         ReduceOp::Add => {
@@ -79,9 +79,9 @@ pub fn reduce_identity(op: morok_ir::types::ReduceOp, dtype: morok_dtype::DType)
 }
 
 /// Return the minimum value for a dtype (Tinygrad: dtypes.min).
-fn dtype_min(dtype: &morok_dtype::DType) -> morok_ir::types::ConstValue {
-    use morok_dtype::ScalarDType;
-    use morok_ir::types::ConstValue::{Bool, Float, Int, UInt};
+fn dtype_min(dtype: &svod_dtype::DType) -> svod_ir::types::ConstValue {
+    use svod_dtype::ScalarDType;
+    use svod_ir::types::ConstValue::{Bool, Float, Int, UInt};
 
     if dtype.is_float() {
         return Float(f64::NEG_INFINITY);
@@ -104,9 +104,9 @@ fn dtype_min(dtype: &morok_dtype::DType) -> morok_ir::types::ConstValue {
 }
 
 /// Return the maximum value for a dtype (Tinygrad: dtypes.max).
-fn dtype_max(dtype: &morok_dtype::DType) -> morok_ir::types::ConstValue {
-    use morok_dtype::ScalarDType;
-    use morok_ir::types::ConstValue::{Bool, Float, Int, UInt};
+fn dtype_max(dtype: &svod_dtype::DType) -> svod_ir::types::ConstValue {
+    use svod_dtype::ScalarDType;
+    use svod_ir::types::ConstValue::{Bool, Float, Int, UInt};
 
     if dtype.is_float() {
         return Float(f64::INFINITY);

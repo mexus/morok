@@ -4,7 +4,7 @@ use std::sync::Arc;
 use once_cell::sync::Lazy;
 use parking_lot::RwLock;
 
-pub use morok_dtype::DeviceSpec;
+pub use svod_dtype::DeviceSpec;
 
 use crate::allocator::{Allocator, CpuAllocator, LruAllocator};
 use crate::error::{InvalidDeviceSnafu, Result};

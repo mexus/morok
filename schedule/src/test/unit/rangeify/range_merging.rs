@@ -7,8 +7,8 @@
 
 use std::sync::Arc;
 
-use morok_dtype::DType;
-use morok_ir::{AxisType, ConstValue, Op, SInt, TernaryOp, UOp};
+use svod_dtype::DType;
+use svod_ir::{AxisType, ConstValue, Op, SInt, TernaryOp, UOp};
 
 use crate::rangeify::indexing::IndexingContext;
 
@@ -163,7 +163,7 @@ fn test_or_merging_of_validity_masks() {
 
     // Verify it's a binary OR operation
     if let Op::Binary(op, _, _) = merged.op() {
-        assert!(matches!(op, morok_ir::BinaryOp::Or));
+        assert!(matches!(op, svod_ir::BinaryOp::Or));
     } else {
         panic!("Expected OR operation");
     }
@@ -191,7 +191,7 @@ fn test_single_range() {
 /// Helper to create a BUFFER with shape (size,)
 fn create_buffer_with_size(size: usize) -> Arc<UOp> {
     // Op::Buffer has shape (size,) - see shape.rs line 591
-    UOp::new_buffer(morok_dtype::DeviceSpec::Cpu, size, DType::Float32)
+    UOp::new_buffer(svod_dtype::DeviceSpec::Cpu, size, DType::Float32)
 }
 
 /// Helper to create a 2D shaped UOp via RESHAPE
@@ -227,7 +227,7 @@ fn test_merge_consumer_ranges_identical_1d() {
 
     // Should NOT mark for realization
     assert!(
-        !ctx.realize_map.contains_key(&morok_ir::UOpKey(buffer.clone())),
+        !ctx.realize_map.contains_key(&svod_ir::UOpKey(buffer.clone())),
         "Identical ranges should NOT require realization"
     );
 }
@@ -259,7 +259,7 @@ fn test_merge_consumer_ranges_different_1d() {
     assert!(!Arc::ptr_eq(&merged[0], &r0_b), "Different ranges should create new range");
 
     // Should mark for realization (because ranges differ)
-    let realize_info = ctx.realize_map.get(&morok_ir::UOpKey(buffer.clone()));
+    let realize_info = ctx.realize_map.get(&svod_ir::UOpKey(buffer.clone()));
     assert!(realize_info.is_some(), "Different ranges should require realization");
 }
 
@@ -293,7 +293,7 @@ fn test_merge_consumer_ranges_2d_partial_overlap() {
     assert!(!Arc::ptr_eq(&merged[1], &r1_a), "Different second dimension should create new range");
 
     // Should mark BOTH dimensions for realization
-    let realize_info = ctx.realize_map.get(&morok_ir::UOpKey(reshaped.clone()));
+    let realize_info = ctx.realize_map.get(&svod_ir::UOpKey(reshaped.clone()));
     assert!(realize_info.is_some(), "Should mark for realization");
     if let Some(Some(axes)) = realize_info {
         assert_eq!(axes, &[0, 1], "Both dimensions should need realization");
@@ -339,7 +339,7 @@ fn test_merge_consumer_ranges_with_validity() {
 
         // Merged validity should be OR of both conditions
         if let Op::Binary(op, _, _) = merged_valid.op() {
-            assert!(matches!(op, morok_ir::BinaryOp::Or), "Validity should be OR'd");
+            assert!(matches!(op, svod_ir::BinaryOp::Or), "Validity should be OR'd");
         } else {
             panic!("Expected OR operation in merged validity, got {:?}", merged_valid.op());
         }
@@ -367,6 +367,6 @@ fn test_merge_consumer_ranges_empty() {
     assert_eq!(merged.len(), 1, "Should create 1 range for 1-dim buffer");
 
     // Should mark for realization (no consumer ranges means new ranges needed)
-    let realize_info = ctx.realize_map.get(&morok_ir::UOpKey(buffer.clone()));
+    let realize_info = ctx.realize_map.get(&svod_ir::UOpKey(buffer.clone()));
     assert!(realize_info.is_some(), "Should mark for realization");
 }

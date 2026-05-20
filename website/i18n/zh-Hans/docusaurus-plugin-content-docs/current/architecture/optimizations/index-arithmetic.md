@@ -16,7 +16,7 @@ sidebar_label: 索引算术
 - **阶段 15**（通过 `pm_lower_index_dtype` 进行索引 dtype 降级）
 - **阶段 16**（索引后符号化简）
 
-Morok 源码：`schedule/src/symbolic/patterns.rs`、`schedule/src/symbolic/index_lowering.rs`
+Svod 源码：`schedule/src/symbolic/patterns.rs`、`schedule/src/symbolic/index_lowering.rs`
 
 Tinygrad 源码：`tinygrad/uop/divandmod.py`、`tinygrad/uop/symbolic.py`
 
@@ -185,7 +185,7 @@ Index dtype 上 `Idiv` 和 `Mod` 的兜底算法。按优先级顺序实现 Tiny
 
 **示例**：`(6*a + 4*b) // 12` -> `((6*a + 4*b) // 2) // 6` -> `(3*a + 2*b) // 6` -> `(3*a + 2*b) // 6`（然后规则 7 完成）。
 
-Tinygrad：`divandmod.py:62-67`。Morok：`fold_divmod_general` 中的 `nest_div_by_smallest_factor`。
+Tinygrad：`divandmod.py:62-67`。Svod：`fold_divmod_general` 中的 `nest_div_by_smallest_factor`。
 
 :::caution
 规则 5-8 要求分子非负（`x_min >= 0`）。负操作数的地板除法有不同的取整语义（Python/Tinygrad 中向负无穷取整，硬件中向零取整）。实现对负范围返回 `None`，交由后续 pass 处理。
@@ -216,7 +216,7 @@ Tinygrad：`divandmod.py:62-67`。Morok：`fold_divmod_general` 中的 `nest_div
 
 ## 5. 索引 dtype 降级（三阶段级联）
 
-Tinygrad：`ops.py:1291-1313`。Morok：`schedule/src/symbolic/index_lowering.rs`。
+Tinygrad：`ops.py:1291-1313`。Svod：`schedule/src/symbolic/index_lowering.rs`。
 
 抽象 `Index` 类型不携带宽度——它表示"此索引需要的任何整数宽度"。降级 pass 根据值边界将 `Index` 转换为具体的 `i32` 或 `i64`。
 

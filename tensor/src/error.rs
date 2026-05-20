@@ -1,5 +1,5 @@
-use morok_ir::shape::Shape;
 use snafu::Snafu;
+use svod_ir::shape::Shape;
 
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub))]
@@ -8,7 +8,7 @@ pub enum Error {
     // IR Layer Errors
     // =========================================================================
     #[snafu(display("IR operation error: {source}"))]
-    UOp { source: morok_ir::Error },
+    UOp { source: svod_ir::Error },
 
     // =========================================================================
     // Shape Errors
@@ -96,19 +96,19 @@ pub enum Error {
     // Codegen Errors (from device traits that wrap codegen)
     // =========================================================================
     #[snafu(display("Failed to render kernel: {source}"))]
-    RenderKernel { source: morok_device::Error },
+    RenderKernel { source: svod_device::Error },
 
     #[snafu(display("Failed to compile kernel: {source}"))]
-    CompileKernel { source: morok_device::Error },
+    CompileKernel { source: svod_device::Error },
 
     // =========================================================================
     // Schedule/Pipeline Errors
     // =========================================================================
     #[snafu(display("Rangeify failed: {source}"))]
-    Rangeify { source: morok_ir::Error },
+    Rangeify { source: svod_ir::Error },
 
     #[snafu(display("Optimization error: {source}"))]
-    Optimize { source: morok_schedule::OptError },
+    Optimize { source: svod_schedule::OptError },
 
     #[snafu(display("No kernels found after scheduling pipeline"))]
     NoKernelsFound,
@@ -129,25 +129,25 @@ pub enum Error {
     // Runtime Errors
     // =========================================================================
     #[snafu(display("Execution failed: {source}"))]
-    Execution { source: morok_runtime::Error },
+    Execution { source: svod_runtime::Error },
 
     #[snafu(display("Failed to create program: {source}"))]
-    CreateProgram { source: morok_device::Error },
+    CreateProgram { source: svod_device::Error },
 
     #[snafu(display("Failed to get device: {source}"))]
-    DeviceFactory { source: morok_runtime::Error },
+    DeviceFactory { source: svod_runtime::Error },
 
     #[snafu(display("Buffer for UOp {} not found in registry", uop_id))]
     BufferNotFound { uop_id: u64 },
 
     #[snafu(display("Device error: {source}"))]
-    Device { source: morok_device::Error },
+    Device { source: svod_device::Error },
 
     // =========================================================================
     // Type Errors
     // =========================================================================
     #[snafu(display("Expected Ptr dtype for {context}, got {actual:?}"))]
-    ExpectedPtrDtype { context: &'static str, actual: morok_dtype::DType },
+    ExpectedPtrDtype { context: &'static str, actual: svod_dtype::DType },
 
     #[snafu(display("Buffer Ptr dtype has no size"))]
     BufferPtrNoSize,
@@ -165,10 +165,10 @@ pub enum Error {
     IrConstruction { details: String },
 
     #[snafu(display("Type mismatch: expected {expected:?}, got {actual:?}"))]
-    TypeMismatch { expected: morok_dtype::DType, actual: morok_dtype::DType },
+    TypeMismatch { expected: svod_dtype::DType, actual: svod_dtype::DType },
 
     #[snafu(display("{op} requires floating-point dtype for {arg}, got {dtype:?}"))]
-    FloatDTypeRequired { op: &'static str, arg: &'static str, dtype: morok_dtype::DType },
+    FloatDTypeRequired { op: &'static str, arg: &'static str, dtype: svod_dtype::DType },
 
     #[snafu(display("Failed to create ndarray: {source}"))]
     NdarrayShape { source: ndarray::ShapeError },

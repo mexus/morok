@@ -8,9 +8,9 @@
 //! `v1 - v2/v1 + 1e-8` denominator and `1e-8` epsilon on `v1` — matches
 //! `pyannote.audio.models.blocks.pooling.StatsPool._pool`.
 
-use morok_ir::SInt;
-use morok_tensor::Tensor;
 use snafu::ResultExt;
+use svod_ir::SInt;
+use svod_tensor::Tensor;
 
 use super::error::{Result, TensorSnafu};
 
@@ -26,13 +26,13 @@ pub fn tstp_forward(features: &Tensor, weights: &Tensor) -> Result<Tensor> {
     let shape = features.shape().context(TensorSnafu)?;
     if shape.len() != 4 {
         return Err(super::error::Error::Tensor {
-            source: Box::new(morok_tensor::error::Error::IrConstruction {
+            source: Box::new(svod_tensor::error::Error::IrConstruction {
                 details: format!("TSTP expects 4D features, got {}D", shape.len()),
             }),
         });
     }
     let t_back = shape[3].as_const().ok_or_else(|| super::error::Error::Tensor {
-        source: Box::new(morok_tensor::error::Error::IrConstruction {
+        source: Box::new(svod_tensor::error::Error::IrConstruction {
             details: "TSTP requires concrete T (backbone time dim) — symbolic not supported".into(),
         }),
     })?;
@@ -43,7 +43,7 @@ pub fn tstp_forward(features: &Tensor, weights: &Tensor) -> Result<Tensor> {
     // tensor::resize() here because it requires every shape dim to be concrete
     // and our batch dim is symbolic.
     let t_w = weights.shape().context(TensorSnafu)?[1].as_const().ok_or_else(|| super::error::Error::Tensor {
-        source: Box::new(morok_tensor::error::Error::IrConstruction {
+        source: Box::new(svod_tensor::error::Error::IrConstruction {
             details: "TSTP requires concrete T_w (weight time dim)".into(),
         }),
     })?;
@@ -86,12 +86,12 @@ pub fn tstp_forward(features: &Tensor, weights: &Tensor) -> Result<Tensor> {
     // mean / std are [B, C, H, 1] → flatten dims 1..4 (i.e., 1,2,3 → C*H*1 = C*H).
     let b = shape[0].clone();
     let c = shape[1].as_const().ok_or_else(|| super::error::Error::Tensor {
-        source: Box::new(morok_tensor::error::Error::IrConstruction {
+        source: Box::new(svod_tensor::error::Error::IrConstruction {
             details: "TSTP requires concrete C (channel dim)".into(),
         }),
     })?;
     let h = shape[2].as_const().ok_or_else(|| super::error::Error::Tensor {
-        source: Box::new(morok_tensor::error::Error::IrConstruction {
+        source: Box::new(svod_tensor::error::Error::IrConstruction {
             details: "TSTP requires concrete H (freq dim)".into(),
         }),
     })?;

@@ -16,10 +16,10 @@ use std::sync::Arc;
 
 use crate::argsort;
 
-use morok_device::DeviceSpec;
-use morok_dtype::{AddrSpace, DType, ScalarDType};
-use morok_ir::{AxisId, AxisType, BinaryOp, BufferizeOpts, ConstValue, Op, ReduceOp, UOp, UOpKey, UnaryOp};
 use smallvec::SmallVec;
+use svod_device::DeviceSpec;
+use svod_dtype::{AddrSpace, DType, ScalarDType};
+use svod_ir::{AxisId, AxisType, BinaryOp, BufferizeOpts, ConstValue, Op, ReduceOp, UOp, UOpKey, UnaryOp};
 use tracing::trace;
 
 use crate::TypedPatternMatcher;
@@ -427,7 +427,7 @@ pub fn buffer_folding() -> TypedPatternMatcher {
                 if !ranges.is_empty()
                     && let (Ok(Some(buf_shape)), Ok(Some(_))) = (buf.shape(), result.shape()) {
                         let shrink_ranges: Vec<_> = buf_shape.iter()
-                            .map(|s| (morok_ir::SInt::Const(0), s.clone()))
+                            .map(|s| (svod_ir::SInt::Const(0), s.clone()))
                             .collect();
                         if let Ok(shrunk) = result.try_shrink(&shrink_ranges) {
                             return Some(shrunk);
@@ -464,8 +464,8 @@ fn cleanup_dead_axes_bufferize(
     ranges: &SmallVec<[Arc<UOp>; 4]>,
     opts: &BufferizeOpts,
 ) -> Option<Arc<UOp>> {
-    use morok_ir::SInt;
-    use morok_ir::shape::Shape;
+    use svod_ir::SInt;
+    use svod_ir::shape::Shape;
 
     // Don't optimize ALWAYS_RUN_OPS (CONTIGUOUS, COPY, NOOP) or AFTER. AFTER
     // is a buffer-identity wrapper: ranges define consumer access, not the
@@ -567,9 +567,9 @@ pub fn buffer_removal_with_pcontig() -> TypedPatternMatcher<PcontigConfig> {
             indices: idx_ranges,
             gate: None
         } if idx_ranges.len() == 1
-          && matches!(idx_ranges[0].op(), Op::Ternary(morok_ir::TernaryOp::Where, _, _, f) if matches!(f.op(), Op::Invalid))
+          && matches!(idx_ranges[0].op(), Op::Ternary(svod_ir::TernaryOp::Where, _, _, f) if matches!(f.op(), Op::Invalid))
         => |buffer, src, buf_ranges, idx_ranges, ctx| {
-            let Op::Ternary(morok_ir::TernaryOp::Where, cond, clean_idx, _) = idx_ranges[0].op() else {
+            let Op::Ternary(svod_ir::TernaryOp::Where, cond, clean_idx, _) = idx_ranges[0].op() else {
                 unreachable!()
             };
             let clean_indices: SmallVec<[Arc<UOp>; 4]> = smallvec::smallvec![clean_idx.clone()];
@@ -627,8 +627,8 @@ fn apply_pcontig_removal_inner(
     idx_ranges: &SmallVec<[Arc<UOp>; 4]>,
     config: &mut PcontigConfig,
 ) -> Option<Arc<UOp>> {
-    use morok_ir::{AddrSpace, AxisType, BufferizeOpts, ConstValue};
     use std::collections::{HashMap, HashSet};
+    use svod_ir::{AddrSpace, AxisType, BufferizeOpts, ConstValue};
 
     if config.level == 0 || is_always_run_op(src.op()) {
         return None;
@@ -1205,7 +1205,7 @@ pub fn rangeify_codegen_patterns() -> TypedPatternMatcher<LocalAddBufferContext>
     crate::patterns! {
         @context LocalAddBufferContext;
         // NOOP → zero constant (scalar or vector)
-        noop @ Noop() if noop.dtype().base() != morok_dtype::ScalarDType::Void => |noop, _ctx| {
+        noop @ Noop() if noop.dtype().base() != svod_dtype::ScalarDType::Void => |noop, _ctx| {
             Some(dtype_zero(noop.dtype()))
         },
         // CONTIGUOUS: extract hints and return source.
@@ -1226,7 +1226,7 @@ pub fn rangeify_codegen_patterns() -> TypedPatternMatcher<LocalAddBufferContext>
 pub fn rangeify_codegen_simple() -> TypedPatternMatcher {
     crate::patterns! {
         // NOOP → zero constant (scalar or vector)
-        noop @ Noop() if noop.dtype().base() != morok_dtype::ScalarDType::Void => |noop| {
+        noop @ Noop() if noop.dtype().base() != svod_dtype::ScalarDType::Void => |noop| {
             Some(dtype_zero(noop.dtype()))
         },
         // CONTIGUOUS → source (strip wrapper, no opts to extract at this stage)
@@ -1244,7 +1244,7 @@ pub fn rangeify_codegen_with_kernel_ctx() -> TypedPatternMatcher<super::kernel::
     crate::patterns! {
         @context super::kernel::RangeifyBufferContext;
         // NOOP → zero constant (scalar or vector)
-        noop @ Noop() if noop.dtype().base() != morok_dtype::ScalarDType::Void => |noop, _ctx| {
+        noop @ Noop() if noop.dtype().base() != svod_dtype::ScalarDType::Void => |noop, _ctx| {
             Some(dtype_zero(noop.dtype()))
         },
         // CONTIGUOUS → source (strip wrapper, no opts to extract at this stage)
@@ -2204,7 +2204,7 @@ fn try_reduce_collapse(
     };
 
     // Pattern: WHERE(cond, true_val, false_val)
-    let Op::Ternary(morok_ir::TernaryOp::Where, cond, true_val, false_val) = src.op() else {
+    let Op::Ternary(svod_ir::TernaryOp::Where, cond, true_val, false_val) = src.op() else {
         return None;
     };
 
@@ -2267,7 +2267,7 @@ fn try_reduce_collapse(
     }
 
     // Pattern 3: where(idx != r, 0, expr) — NE gated collapse
-    // Pattern 3b: where(idx == r, expr, 0) — EQ gated collapse (Morok-specific)
+    // Pattern 3b: where(idx == r, expr, 0) — EQ gated collapse (Svod-specific)
     //
     // Both collapse to: where(in_bounds, expr[r:=idx.valid(v)], 0)
     // NE: idx != r with zero in true_val, expression in false_val
@@ -2279,7 +2279,7 @@ fn try_reduce_collapse(
             Op::Binary(BinaryOp::Ne, idx, ne_range) if is_const_zero(true_val) && no_range(idx) => {
                 Some((idx, ne_range, false_val))
             }
-            // EQ: where(idx == range_side, expr, 0) — Morok-specific
+            // EQ: where(idx == range_side, expr, 0) — Svod-specific
             Op::Binary(BinaryOp::Eq, lhs, rhs) if is_const_zero(false_val) => {
                 if no_range(lhs) {
                     Some((lhs, rhs, true_val))
@@ -2366,7 +2366,7 @@ fn extract_lt_upper_bound(cond: &Arc<UOp>, range: &Arc<UOp>) -> Option<Arc<UOp>>
 /// Pattern: (DEFINE_VAR & y).where(c, 0).reduce(ADD) → y.where(c, 0).reduce(ADD) * DEFINE_VAR.cast(c.dtype)
 fn try_define_var_factor(src: &Arc<UOp>, ranges: &SmallVec<[Arc<UOp>; 4]>) -> Option<Arc<UOp>> {
     // Pattern: WHERE((DEFINE_VAR & y), c, 0)
-    let Op::Ternary(morok_ir::TernaryOp::Where, cond, true_val, false_val) = src.op() else {
+    let Op::Ternary(svod_ir::TernaryOp::Where, cond, true_val, false_val) = src.op() else {
         return None;
     };
     if !is_const_zero(false_val) {
@@ -2450,7 +2450,7 @@ fn try_lift_arithmetic_from_lt(cond: &Arc<UOp>) -> Option<Arc<UOp>> {
     None
 }
 
-/// Arithmetic lifting for EQ comparisons (Morok-specific).
+/// Arithmetic lifting for EQ comparisons (Svod-specific).
 ///
 /// Isolates range-containing operands from arithmetic in EQ conditions:
 /// - (x + y) == c → x == (c - y) or y == (c - x)
@@ -2616,7 +2616,7 @@ fn ne_lifting_patterns() -> TypedPatternMatcher<()> {
 /// 5. Bound-from-below/above/two-sided/gated collapse on REDUCE(ADD)
 /// 6. DEFINE_VAR factoring: (dv & y).where(c,0).reduce(ADD)
 /// 7. MUL casted bool: x * gate:bool.cast() → gate.where(x, 0)
-/// 8. EQ lifting: (x+y)==c → x==(c-y), Morok-specific for gather's EQ pattern
+/// 8. EQ lifting: (x+y)==c → x==(c-y), Svod-specific for gather's EQ pattern
 fn reduce_collapse_inner_patterns() -> TypedPatternMatcher<()> {
     // Start with reduce_unparented (shared with pm_reduce_simplify)
     pm_reduce_unparented().with_context()
@@ -2671,7 +2671,7 @@ fn reduce_collapse_inner_patterns() -> TypedPatternMatcher<()> {
 /// into cheap bitwise AND when the divisor is a power of two.
 /// Only applies to integer types.
 pub fn pm_mod_to_and() -> &'static TypedPatternMatcher<()> {
-    use morok_ir::types::ConstValue;
+    use svod_ir::types::ConstValue;
     crate::cached_patterns! {
         // x % c where c is power of two → x & (c - 1)
         Mod(x, _c @const(c_val)) => |x, c_val| {
@@ -2697,7 +2697,7 @@ pub fn pm_mod_to_and() -> &'static TypedPatternMatcher<()> {
 /// Converts multiplication by power-of-two into left shift.
 /// Only applies to integer types.
 pub fn pm_mul_to_shl() -> &'static TypedPatternMatcher<()> {
-    use morok_ir::types::ConstValue;
+    use svod_ir::types::ConstValue;
     crate::cached_patterns! {
         // x * c where c is power of two → x << log2(c)
         // Note: Only applies to integer types, but we check inside the closure
@@ -2748,8 +2748,8 @@ pub fn pm_threefry_decomp() -> &'static TypedPatternMatcher<()> {
 
 /// Threefry2x32 mixing algorithm (Random123 library).
 fn threefry2x32(x: &Arc<UOp>, key: &Arc<UOp>) -> Arc<UOp> {
-    let u32_dt = DType::Scalar(morok_dtype::ScalarDType::UInt32);
-    let u64_dt = DType::Scalar(morok_dtype::ScalarDType::UInt64);
+    let u32_dt = DType::Scalar(svod_dtype::ScalarDType::UInt32);
+    let u64_dt = DType::Scalar(svod_dtype::ScalarDType::UInt64);
     let mask32 = UOp::const_(u64_dt.clone(), ConstValue::UInt(0xFFFFFFFF));
     let pow32 = UOp::const_(u64_dt.clone(), ConstValue::UInt(1u64 << 32));
 
@@ -2822,9 +2822,9 @@ pub fn pm_shl_add_to_mulacc() -> &'static TypedPatternMatcher<()> {
 ///
 /// Shifts are typically 2-5x faster than divisions on modern CPUs and GPUs.
 pub fn pm_div_to_shr() -> &'static TypedPatternMatcher<()> {
-    use morok_ir::types::ConstValue;
-    use morok_ir::uop::cached_property::CachedProperty;
-    use morok_ir::uop::properties::VminVmaxProperty;
+    use svod_ir::types::ConstValue;
+    use svod_ir::uop::cached_property::CachedProperty;
+    use svod_ir::uop::properties::VminVmaxProperty;
 
     crate::cached_patterns! {
         // x // c where c is power of two → x >> log2(c)
@@ -2892,7 +2892,7 @@ pub fn pm_sqrt_decomposition() -> &'static TypedPatternMatcher<()> {
     crate::cached_patterns! {
         // SQRT(x) → POW(x, 0.5)
         Sqrt(x) if x.dtype().is_float() => |x| {
-            let half = UOp::const_(x.dtype(), morok_ir::types::ConstValue::Float(0.5));
+            let half = UOp::const_(x.dtype(), svod_ir::types::ConstValue::Float(0.5));
             x.try_pow(&half).ok()
         },
     }
@@ -2900,7 +2900,7 @@ pub fn pm_sqrt_decomposition() -> &'static TypedPatternMatcher<()> {
 
 /// ERF decomposition using Abramowitz & Stegun 7.1.26 polynomial approximation.
 ///
-/// Decomposed here because morok keeps Erf as a UOp. `@llvm.erf` is a libcall
+/// Decomposed here because svod keeps Erf as a UOp. `@llvm.erf` is a libcall
 /// intrinsic (not a native hardware op like sqrt/fabs), so it requires libm
 /// linkage which the LLVM JIT doesn't provide.
 ///
@@ -2940,7 +2940,7 @@ pub fn pm_erf_decomposition() -> &'static TypedPatternMatcher<()> {
 /// Multiplication is typically 2-3x faster than division on modern CPUs and GPUs.
 /// Guards against divide by zero (leaves as FDIV to preserve IEEE 754 semantics).
 pub fn pm_fdiv_to_mul() -> &'static TypedPatternMatcher<()> {
-    use morok_ir::types::ConstValue;
+    use svod_ir::types::ConstValue;
     crate::cached_patterns! {
         // x / c → x * (1/c) for float constants
         Fdiv(x, _c @const(c_val)) => |x, c_val| {
@@ -2972,7 +2972,7 @@ pub fn pm_fdiv_to_mul() -> &'static TypedPatternMatcher<()> {
 /// - !(c < x) → x < (c+1)  (for integers)
 /// - (c1 < x) & (x < c2) → x == (c1+1)  (when c2 == c1+2, range compression)
 pub fn pm_comparison_negations() -> &'static TypedPatternMatcher<()> {
-    use morok_ir::types::ConstValue;
+    use svod_ir::types::ConstValue;
 
     crate::cached_patterns! {
         // !(x < c) → (c-1) < x for integers

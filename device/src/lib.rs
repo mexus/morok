@@ -10,9 +10,9 @@
 //! # Examples
 //!
 //! ```no_run
-//! use morok_device::allocator::BufferOptions;
-//! use morok_device::{Buffer, registry};
-//! use morok_dtype::DType;
+//! use svod_device::allocator::BufferOptions;
+//! use svod_device::{Buffer, registry};
+//! use svod_dtype::DType;
 //!
 //! // Get a CPU device
 //! let cpu = registry::cpu().unwrap();

@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 
-use morok_ir::{ContiguousHint, Op, UOp};
+use svod_ir::{ContiguousHint, Op, UOp};
 
 use crate::rangeify::kernel::LocalAddBufferContext;
 use crate::rangeify::patterns::rangeify_codegen_patterns;

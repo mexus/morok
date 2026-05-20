@@ -1,4 +1,4 @@
-//! Schedule module for Morok compiler.
+//! Schedule module for Svod compiler.
 //!
 //! This module implements optimization passes for the IR,
 //! including symbolic simplification and graph transformations.
@@ -15,7 +15,7 @@
 //!
 //! # Pattern Matching and Rewriting
 //!
-//! Pattern matching infrastructure has moved to `morok_ir::pattern` and `morok_ir::rewrite`.
+//! Pattern matching infrastructure has moved to `svod_ir::pattern` and `svod_ir::rewrite`.
 //! This crate re-exports these modules for convenience.
 
 pub mod devectorize;
@@ -35,16 +35,16 @@ pub mod z3;
 #[cfg(test)]
 pub mod test;
 
-// Re-export pattern matching and rewriting from morok_ir
-// This maintains backward compatibility while the infrastructure lives in morok_ir
-pub use morok_ir::pattern;
-pub use morok_ir::rewrite;
+// Re-export pattern matching and rewriting from svod_ir
+// This maintains backward compatibility while the infrastructure lives in svod_ir
+pub use svod_ir::pattern;
+pub use svod_ir::rewrite;
 
 // Re-export main types
 pub use linearize::{CFGContext, linearize, linearize_with_cfg};
-pub use morok_ir::pattern::{Matcher, RewriteResult, TypedPatternMatcher};
-pub use morok_ir::rewrite::graph_rewrite;
 pub use rangeify::{RangeifyResult, rangeify, rangeify_with_map, try_get_kernel_graph};
+pub use svod_ir::pattern::{Matcher, RewriteResult, TypedPatternMatcher};
+pub use svod_ir::rewrite::graph_rewrite;
 
 // Re-export expand pass
 pub use expand::{expander, pm_group_for_reduce, pm_pre_expander, pre_expand};
@@ -68,10 +68,10 @@ pub use optimizer::{
 };
 
 // Re-export UOp for macro usage
-pub use morok_ir::UOp;
+pub use svod_ir::UOp;
 
 // Re-export the patterns! proc-macros
-pub use morok_macros::{cached_patterns, patterns};
+pub use svod_macros::{cached_patterns, patterns};
 
 /// Compute inverse permutation (argsort).
 pub(crate) fn argsort(perm: &[usize]) -> Vec<usize> {

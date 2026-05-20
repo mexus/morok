@@ -17,7 +17,7 @@ fn test_sync_strategy() {
 
 #[test]
 fn test_executor_creation() {
-    let registry = morok_device::registry::registry();
+    let registry = svod_device::registry::registry();
     let executor = UnifiedExecutor::new(registry);
     assert!(executor.contexts.is_empty());
 }

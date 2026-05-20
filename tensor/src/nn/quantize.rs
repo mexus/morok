@@ -1,7 +1,7 @@
 //! Quantization operations (clamp-cast, quantized conv/matmul).
 
 use bon::bon;
-use morok_dtype::DType;
+use svod_dtype::DType;
 
 use crate::Tensor;
 
@@ -17,8 +17,8 @@ impl Tensor {
     /// # Examples
     ///
     /// ```
-    /// # use morok_tensor::Tensor;
-    /// # use morok_dtype::DType;
+    /// # use svod_tensor::Tensor;
+    /// # use svod_dtype::DType;
     /// let x = Tensor::from_slice([300.0f32, -10.0, 128.0]);
     /// let mut y = x.clamp_cast(DType::UInt8).unwrap();
     /// y.realize().unwrap();
@@ -42,8 +42,8 @@ impl Tensor {
     /// # Examples
     ///
     /// ```
-    /// # use morok_tensor::Tensor;
-    /// # use morok_dtype::DType;
+    /// # use svod_tensor::Tensor;
+    /// # use svod_dtype::DType;
     /// # use ndarray::Array4;
     /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 3, 3), 128u8));
     /// let x_scale = Tensor::from_slice([0.1f32]);
@@ -109,8 +109,8 @@ impl Tensor {
     /// # Examples
     ///
     /// ```
-    /// # use morok_tensor::Tensor;
-    /// # use morok_dtype::DType;
+    /// # use svod_tensor::Tensor;
+    /// # use svod_dtype::DType;
     /// # use ndarray::Array4;
     /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 3, 3), 10u8));
     /// let weight = Tensor::from_ndarray(&Array4::from_elem((1, 1, 1, 1), 1u8));
@@ -169,8 +169,8 @@ impl Tensor {
     /// # Examples
     ///
     /// ```
-    /// # use morok_tensor::Tensor;
-    /// # use morok_dtype::DType;
+    /// # use svod_tensor::Tensor;
+    /// # use svod_dtype::DType;
     /// # use ndarray::Array2;
     /// let a = Tensor::from_ndarray(&Array2::from_elem((2, 3), 128u8));
     /// let a_scale = Tensor::from_slice([0.1f32]);

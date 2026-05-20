@@ -23,7 +23,7 @@
 
 use std::sync::Arc;
 
-use morok_dtype::DeviceSpec;
+use svod_dtype::DeviceSpec;
 
 use crate::buffer::Buffer;
 use crate::device::Program;

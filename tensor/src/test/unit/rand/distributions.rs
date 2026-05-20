@@ -10,7 +10,7 @@
 //! Sample size N=4096 keeps runtime fast while still giving ~4σ tolerance of
 //! ~0.02 around mean and stddev — plenty for catching algorithmic bugs.
 
-use morok_dtype::DType;
+use svod_dtype::DType;
 
 use crate::Tensor;
 use crate::rand::manual_seed;

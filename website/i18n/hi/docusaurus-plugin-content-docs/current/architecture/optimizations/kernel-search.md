@@ -4,11 +4,11 @@ sidebar_label: कर्नेल सर्च
 
 # कर्नेल ऑप्टिमाइज़ेशन सर्च
 
-Algebraic simplification के बाद, हर कर्नेल को *scheduling decisions* चाहिए: loops कैसे tile करें, कहाँ parallelize करें, tensor cores इस्तेमाल करें या नहीं। Morok दो strategies offer करता है: fast heuristics और thorough beam search।
+Algebraic simplification के बाद, हर कर्नेल को *scheduling decisions* चाहिए: loops कैसे tile करें, कहाँ parallelize करें, tensor cores इस्तेमाल करें या नहीं। Svod दो strategies offer करता है: fast heuristics और thorough beam search।
 
 यह [codegen pipeline](../codegen/overview.md) के Stage 7 में चलता है।
 
-Tinygrad source: `tinygrad/codegen/opt/`। Morok source: `schedule/src/optimizer/`।
+Tinygrad source: `tinygrad/codegen/opt/`। Svod source: `schedule/src/optimizer/`।
 
 ---
 
@@ -115,7 +115,7 @@ fn beam_search(scheduler: Scheduler, config: BeamConfig) -> Scheduler {
 
 ```bash
 # Disable optimization (debugging)
-MOROK_NOOPT=1 cargo run
+SVOD_NOOPT=1 cargo run
 
 # Enable beam search with width 8
 BEAM=8 cargo run
@@ -135,7 +135,7 @@ tensor.realize_with(config)?;
 
 ## तुलना: दूसरे कम्पाइलर कैसे ऑप्टिमाइज़ करते हैं
 
-| पहलू | XLA | TVM/Ansor | Triton | **Morok** |
+| पहलू | XLA | TVM/Ansor | Triton | **Svod** |
 |-------|-----|-----------|--------|-----------|
 | **फ़िलॉसफ़ी** | फ़िक्स्ड heuristics | सर्च-आधारित | प्रोग्रामर-गाइडेड | पैटर्न-आधारित |
 | **Fusion** | कंज़र्वेटिव नियम | Tile-and-fuse | Block-level | ग्राफ़ रीराइटिंग |
@@ -150,4 +150,4 @@ tensor.realize_with(config)?;
 
 **Triton** blocked algorithms के लिए Python-जैसा DSL expose करता है। Control और automation का अच्छा balance, लेकिन GPU programming expertise चाहिए।
 
-**Morok** optimizations को composable patterns में express करता है। Beam search ज़रूरत पड़ने पर auto-tuning जोड़ता है, results reuse के लिए AST hash से cache होते हैं।
+**Svod** optimizations को composable patterns में express करता है। Beam search ज़रूरत पड़ने पर auto-tuning जोड़ता है, results reuse के लिए AST hash से cache होते हैं।

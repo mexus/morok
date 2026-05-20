@@ -33,17 +33,17 @@ pub enum Error {
     EmptyModel,
 
     #[snafu(display("Tensor operation error: {source}"))]
-    Tensor { source: Box<morok_tensor::error::Error> },
+    Tensor { source: Box<svod_tensor::error::Error> },
 }
 
-impl From<morok_tensor::error::Error> for Error {
-    fn from(source: morok_tensor::error::Error) -> Self {
+impl From<svod_tensor::error::Error> for Error {
+    fn from(source: svod_tensor::error::Error) -> Self {
         Error::Tensor { source: Box::new(source) }
     }
 }
 
-impl From<morok_ir::error::Error> for Error {
-    fn from(source: morok_ir::error::Error) -> Self {
+impl From<svod_ir::error::Error> for Error {
+    fn from(source: svod_ir::error::Error) -> Self {
         Error::IrConstruction { details: source.to_string() }
     }
 }

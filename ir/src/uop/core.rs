@@ -14,7 +14,7 @@ use crate::op::Op;
 use crate::pattern::{Matcher, RewriteResult};
 use crate::shape;
 use crate::types::ConstValue;
-use morok_dtype::DType;
+use svod_dtype::DType;
 
 /// Matcher for `UOp::substitute` — looks up each node in a substitution map.
 struct SubstituteMatcher<'a>(&'a HashMap<UOpKey, Arc<UOp>>);
@@ -252,15 +252,15 @@ impl UOp {
     /// # Examples
     ///
     /// ```rust
-    /// # use morok_ir::UOp;
-    /// # use morok_dtype::{DType, AddrSpace, DeviceSpec};
+    /// # use svod_ir::UOp;
+    /// # use svod_dtype::{DType, AddrSpace, DeviceSpec};
     /// let buffer = UOp::new_buffer(DeviceSpec::Cpu, 10, DType::Float32);
     /// if let Some((base, addrspace, size)) = buffer.ptrdtype() {
     ///     assert_eq!(*base, DType::Float32);
     ///     assert_eq!(addrspace, AddrSpace::Global);
     /// }
     /// ```
-    pub fn ptrdtype(&self) -> Option<(&DType, morok_dtype::AddrSpace, Option<usize>)> {
+    pub fn ptrdtype(&self) -> Option<(&DType, svod_dtype::AddrSpace, Option<usize>)> {
         match &self.dtype {
             DType::Ptr { base, addrspace, size, .. } => Some((base.as_ref(), *addrspace, *size)),
             _ => None,
@@ -275,9 +275,9 @@ impl UOp {
     ///
     /// ```rust
     /// # use std::sync::Arc;
-    /// # use morok_ir::UOp;
-    /// # use morok_dtype::DType;
-    /// let int_const = UOp::const_(DType::Int32, morok_ir::ConstValue::Int(5));
+    /// # use svod_ir::UOp;
+    /// # use svod_dtype::DType;
+    /// let int_const = UOp::const_(DType::Int32, svod_ir::ConstValue::Int(5));
     /// let float_const = int_const.with_dtype(DType::Float32);
     /// assert_eq!(float_const.dtype(), DType::Float32);
     /// ```
@@ -381,8 +381,8 @@ impl UOp {
     /// # Examples
     ///
     /// ```rust
-    /// # use morok_ir::{UOp, ConstValue};
-    /// # use morok_dtype::DType;
+    /// # use svod_ir::{UOp, ConstValue};
+    /// # use svod_dtype::DType;
     /// let scalar = UOp::const_(DType::Float32, ConstValue::Float(1.0));
     /// assert_eq!(scalar.shape().unwrap().as_ref().map(|s| s.len()), Some(0)); // Scalar has empty shape
     /// ```
@@ -403,8 +403,8 @@ impl UOp {
     /// # Examples
     ///
     /// ```rust
-    /// # use morok_ir::{UOp, ConstValue};
-    /// # use morok_dtype::DType;
+    /// # use svod_ir::{UOp, ConstValue};
+    /// # use svod_dtype::DType;
     /// let five = UOp::const_(DType::Int32, ConstValue::Int(5));
     /// assert_eq!(five.vmin(), &ConstValue::Int(5));
     /// ```
@@ -422,8 +422,8 @@ impl UOp {
     /// # Examples
     ///
     /// ```rust
-    /// # use morok_ir::{UOp, ConstValue};
-    /// # use morok_dtype::DType;
+    /// # use svod_ir::{UOp, ConstValue};
+    /// # use svod_dtype::DType;
     /// let five = UOp::const_(DType::Int32, ConstValue::Int(5));
     /// assert_eq!(five.vmax(), &ConstValue::Int(5));
     /// ```
@@ -444,12 +444,12 @@ impl UOp {
     /// # Examples
     ///
     /// ```rust
-    /// # use morok_ir::UOp;
-    /// # use morok_dtype::{DType, DeviceSpec};
+    /// # use svod_ir::UOp;
+    /// # use svod_dtype::{DType, DeviceSpec};
     /// let buffer = UOp::new_buffer(DeviceSpec::Cpu, 10, DType::Float32);
     /// assert_eq!(buffer.device_spec(), Some(DeviceSpec::Cpu));
     /// ```
-    pub fn device_spec(&self) -> Option<morok_dtype::DeviceSpec> {
+    pub fn device_spec(&self) -> Option<svod_dtype::DeviceSpec> {
         match self.op() {
             Op::Device(spec) => Some(spec.clone()),
             Op::Buffer { device, .. } => {
@@ -495,9 +495,9 @@ impl UOp {
     /// # Examples
     ///
     /// ```rust
-    /// # use morok_ir::{UOp, SInt, shape::Shape};
-    /// # use morok_dtype::DType;
-    /// # use morok_dtype::DeviceSpec;
+    /// # use svod_ir::{UOp, SInt, shape::Shape};
+    /// # use svod_dtype::DType;
+    /// # use svod_dtype::DeviceSpec;
     /// let buffer = UOp::new_buffer(DeviceSpec::Cpu, 10, DType::Float32);
     /// let shape = Shape::from_iter([SInt::Const(2), SInt::Const(5)]);
     /// let reshaped = buffer.try_reshape(&shape).unwrap();
@@ -527,7 +527,7 @@ impl UOp {
     /// # Examples
     ///
     /// ```ignore
-    /// use morok_ir::UOp;
+    /// use svod_ir::UOp;
     ///
     /// // AFTER wrapping a buffer
     /// let buffer = UOp::new_buffer(...);
@@ -880,7 +880,7 @@ impl UOp {
     /// # Examples
     ///
     /// ```ignore
-    /// use morok_ir::{UOp, AxisType};
+    /// use svod_ir::{UOp, AxisType};
     ///
     /// // A simple computation inside a range
     /// let range = UOp::range(end, 0, AxisType::Loop);

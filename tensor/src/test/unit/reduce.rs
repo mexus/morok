@@ -1,8 +1,8 @@
 use crate::reduce::AxisSpec;
 use crate::test::helpers::*;
 use crate::*;
-use morok_dtype::DType;
 use ndarray::array;
+use svod_dtype::DType;
 
 #[test]
 fn test_axis_spec_all() {
@@ -702,7 +702,7 @@ crate::codegen_tests! {
 
     fn test_indices_cast_bug(config) {
         use crate::Tensor;
-        use morok_dtype::DType;
+        use svod_dtype::DType;
 
         crate::test::helpers::test_setup();
 

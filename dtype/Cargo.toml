@@ -1,12 +1,12 @@
 [package]
-name = "morok-dtype"
+name = "svod-dtype"
 
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Type system for the Morok ML compiler"
+description = "Type system for the Svod ML compiler"
 readme = "README.md"
 
 [dependencies]

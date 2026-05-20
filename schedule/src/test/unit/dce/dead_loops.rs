@@ -7,11 +7,11 @@
 //! Const(0,Index) with dead-Range markers, breaking `Range(Unroll, end=1)`
 //! inside REDUCE/END. Downstream `reduce_to_acc` handles dead/empty ranges.
 
-use morok_dtype::DType;
-use morok_ir::UOp;
-use morok_ir::types::ConstValue;
 use smallvec::smallvec;
 use std::sync::Arc;
+use svod_dtype::DType;
+use svod_ir::UOp;
+use svod_ir::types::ConstValue;
 
 use crate::rewrite::graph_rewrite;
 

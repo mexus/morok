@@ -1,9 +1,9 @@
 //! Tests for bounds check elimination using range analysis.
 
-use morok_dtype::DType;
-use morok_ir::types::{BinaryOp, ConstValue};
-use morok_ir::{Op, UOp};
 use std::sync::Arc;
+use svod_dtype::DType;
+use svod_ir::types::{BinaryOp, ConstValue};
+use svod_ir::{Op, UOp};
 
 use crate::rewrite::graph_rewrite;
 use crate::symbolic::{symbolic, symbolic_simple};

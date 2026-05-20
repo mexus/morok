@@ -11,7 +11,7 @@ fn test_registry_log_softmax() {
     assert!(result.is_ok());
 }
 
-morok_tensor::codegen_tests! {
+svod_tensor::codegen_tests! {
     fn test_registry_relu(config) {
         let registry = OpRegistry::new();
         let x = Tensor::from_slice([-2.0f32, -1.0, 0.0, 1.0, 2.0]);

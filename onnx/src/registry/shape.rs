@@ -1,6 +1,6 @@
-use morok_ir::SInt;
-use morok_ir::shape::{align_shapes_left, broadcast_shape};
-use morok_tensor::Tensor;
+use svod_ir::SInt;
+use svod_ir::shape::{align_shapes_left, broadcast_shape};
+use svod_tensor::Tensor;
 
 use crate::error::{Error, Result};
 
@@ -93,7 +93,7 @@ pub(crate) fn op_flatten(inputs: &[Option<Tensor>], attrs: &mut Attrs) -> Result
     let ndim = shape.len() as i64;
     let axis_raw = attrs.int("axis", 1);
     let axis = (if axis_raw < 0 { ndim + axis_raw } else { axis_raw }) as usize;
-    let pre = morok_ir::sint_prod(&shape[..axis]);
+    let pre = svod_ir::sint_prod(&shape[..axis]);
     let pre_val = pre
         .as_const()
         .map(|v| v as isize)
@@ -104,7 +104,7 @@ pub(crate) fn op_flatten(inputs: &[Option<Tensor>], attrs: &mut Attrs) -> Result
 pub(crate) fn op_expand(inputs: &[Option<Tensor>]) -> Result<Tensor> {
     let data = inp(inputs, 0);
     let target_i64 = tensor_to_i64_vec(inp(inputs, 1))?;
-    let target: morok_ir::shape::Shape = target_i64.iter().map(|&v| SInt::from(v as usize)).collect();
+    let target: svod_ir::shape::Shape = target_i64.iter().map(|&v| SInt::from(v as usize)).collect();
     let data_shape = data.shape()?;
     let aligned = align_shapes_left(&[data_shape, target]);
     let result_shape = broadcast_shape(&aligned[0], &aligned[1])
@@ -113,8 +113,8 @@ pub(crate) fn op_expand(inputs: &[Option<Tensor>]) -> Result<Tensor> {
 }
 
 pub(crate) fn op_pad(inputs: &[Option<Tensor>], attrs: &mut Attrs) -> Result<Tensor> {
-    use morok_tensor::nn::PadMode;
     use std::str::FromStr;
+    use svod_tensor::nn::PadMode;
 
     let pads = tensor_to_i64_vec(inp(inputs, 1))?;
     let mode_str = attrs.string("mode", "constant");

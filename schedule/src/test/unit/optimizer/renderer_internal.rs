@@ -1,5 +1,5 @@
 use super::*;
-use morok_ir::RendererDevice;
+use svod_ir::RendererDevice;
 
 #[test]
 fn test_renderer_cpu() {

@@ -4,7 +4,7 @@
 //! when working with the IR:
 //!
 //! ```rust,ignore
-//! use morok_ir::prelude::*;
+//! use svod_ir::prelude::*;
 //! ```
 
 // Core types
@@ -21,7 +21,7 @@ pub use crate::indexing::IndexSpec;
 pub use crate::sint::SInt;
 
 // Re-exports from dependencies
-pub use morok_dtype::DType;
-pub use morok_dtype::DeviceSpec;
+pub use svod_dtype::DType;
+pub use svod_dtype::DeviceSpec;
 
 pub use strum::AsRefStr;

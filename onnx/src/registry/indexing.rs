@@ -1,6 +1,6 @@
-use morok_dtype::DType;
-use morok_tensor::Tensor;
-use morok_tensor::indexing::ScatterReduction;
+use svod_dtype::DType;
+use svod_tensor::Tensor;
+use svod_tensor::indexing::ScatterReduction;
 
 use crate::error::{Error, Result};
 

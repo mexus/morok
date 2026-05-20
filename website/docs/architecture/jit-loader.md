@@ -4,9 +4,9 @@ sidebar_label: JIT Compiler
 
 # JIT Compiler
 
-Most ML compilers either link an entire LLVM toolchain into the binary — adding hundreds of megabytes of dependencies — or write temporary files to disk and `dlopen` the result. Morok does neither.
+Most ML compilers either link an entire LLVM toolchain into the binary — adding hundreds of megabytes of dependencies — or write temporary files to disk and `dlopen` the result. Svod does neither.
 
-When a kernel needs to execute, Morok pipes the generated source through `clang` on stdin, receives a relocatable ELF object on stdout, parses it in-process, copies the machine code into an anonymous memory mapping, applies relocations, flips the page permissions to executable, and calls the function pointer directly. The whole process happens in memory — no temp files touch the disk, no shared libraries are loaded, and no LLVM installation is required beyond `clang` on the PATH.
+When a kernel needs to execute, Svod pipes the generated source through `clang` on stdin, receives a relocatable ELF object on stdout, parses it in-process, copies the machine code into an anonymous memory mapping, applies relocations, flips the page permissions to executable, and calls the function pointer directly. The whole process happens in memory — no temp files touch the disk, no shared libraries are loaded, and no LLVM installation is required beyond `clang` on the PATH.
 
 This chapter describes how the CPU JIT loader works. GPU backends (CUDA, Metal, etc.) use their respective driver APIs for compilation and dispatch, and will be documented separately as they are added. The higher-level graph wrapper API that compiles a model graph once and replays it many times is documented in [JIT Graphs](./jit-graphs.md).
 

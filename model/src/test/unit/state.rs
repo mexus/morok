@@ -1,4 +1,4 @@
-use morok_tensor::Tensor;
+use svod_tensor::Tensor;
 
 #[test]
 fn test_safetensors_round_trip() {

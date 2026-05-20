@@ -8,11 +8,11 @@ You're debugging a slow model. The profiler says "kernel X takes 200ms" but you 
 
 This is the reality of modern ML compilation. TensorFlow's XLA has a similar story: Python → Graph → XLA HLO → MLIR → LLVM IR. Each layer was added to solve a real problem, but the accumulated complexity is staggering.
 
-Morok takes a different approach, borrowed from [Tinygrad](https://github.com/tinygrad/tinygrad): **one IR from tensors to machine code**.
+Svod takes a different approach, borrowed from [Tinygrad](https://github.com/tinygrad/tinygrad): **one IR from tensors to machine code**.
 
 ```text
 ┌──────────────────┐   ┌─────────────────┐   ┌───────────────┐
-│    TensorFlow    │   │     PyTorch     │   │     Morok     │
+│    TensorFlow    │   │     PyTorch     │   │     Svod      │
 ├──────────────────┤   ├─────────────────┤   ├───────────────┤
 │   Python API     │   │   Python API    │   │  Rust/Python  │
 │   TF Graph       │   │   FX Graph      │   │       ↓       │
@@ -90,7 +90,7 @@ Notice the arrows pointing to "(same RANGE as above)"? That's not just pretty-pr
 
 ## Hash Consing: Structural Sharing
 
-When you create the same expression twice in Morok, you get the *same pointer*. Not equal values—the same memory address.
+When you create the same expression twice in Svod, you get the *same pointer*. Not equal values—the same memory address.
 
 ```rust
 let a = UOp::binary(Add, x.clone(), y.clone());
@@ -141,7 +141,7 @@ ReduceSum(data, axes=[1], keepdims=0)
 
 Where's the loop? It's implicit—somewhere inside the runtime's implementation of `ReduceSum`. You can't see it, can't modify it, can't reason about it.
 
-Morok makes loops *explicit* using `RANGE` operations. The same reduction becomes:
+Svod makes loops *explicit* using `RANGE` operations. The same reduction becomes:
 
 ```text
 [REDUCE(Add)]
@@ -185,7 +185,7 @@ Why explicit loops matter:
 
 Traditional compilers have dozens of specialized passes: constant folding, dead code elimination, loop unrolling, operator fusion. Each pass has custom logic, custom data structures, custom bugs.
 
-Morok uses one mechanism: **pattern-based graph rewriting**.
+Svod uses one mechanism: **pattern-based graph rewriting**.
 
 ```rust
 patterns! {
@@ -238,7 +238,7 @@ Let's trace `C = A @ B` (a 4×4 matrix multiply) through the entire pipeline.
 
 ### Stage 1: Tensor Construction
 
-When you write `A.matmul(&B)`, Morok builds a high-level UOp graph:
+When you write `A.matmul(&B)`, Svod builds a high-level UOp graph:
 
 ```text
 [REDUCE_AXIS(Add, axes=[2])]
@@ -311,7 +311,7 @@ The key observation: **structure is visible at every stage**. There's no magic f
 
 Different IRs make different tradeoffs. Here's how they stack up:
 
-| Aspect | ONNX | XLA HLO | Triton | **Morok** |
+| Aspect | ONNX | XLA HLO | Triton | **Svod** |
 |--------|------|---------|--------|-----------|
 | **Purpose** | Model interchange | Backend optimization | GPU kernel DSL | Full compilation |
 | **Operators** | ~200 high-level | ~100–150 high-level | Tile operations | ~80 multi-level |
@@ -324,15 +324,15 @@ Different IRs make different tradeoffs. Here's how they stack up:
 
 **XLA HLO** is functional and pure—no side effects, immutable tensors. This enables algebraic optimization but requires a separate "buffer assignment" phase before code generation. The transition from HLO to LMHLO (buffer-based) is a fundamental boundary.
 
-**Triton** exposes more than ONNX but less than Morok. You write "tile-level" code—operations on blocks of data—and the compiler handles thread-level details. Explicit memory (`tl.load`, `tl.store`) but implicit parallelization within tiles.
+**Triton** exposes more than ONNX but less than Svod. You write "tile-level" code—operations on blocks of data—and the compiler handles thread-level details. Explicit memory (`tl.load`, `tl.store`) but implicit parallelization within tiles.
 
-**Morok** exposes everything: loops are explicit (`RANGE`), memory is explicit (`LOAD`/`STORE`), parallelization is explicit (`AxisType`). This means more to learn, but nothing is hidden.
+**Svod** exposes everything: loops are explicit (`RANGE`), memory is explicit (`LOAD`/`STORE`), parallelization is explicit (`AxisType`). This means more to learn, but nothing is hidden.
 
 ---
 
 ## Why This Matters: Practical Benefits
 
-Morok's transparent IR has practical benefits for ML engineers:
+Svod's transparent IR has practical benefits for ML engineers:
 
 **Debugging is direct.** Print the graph at any stage:
 
@@ -369,10 +369,10 @@ It works with the same engine as constant folding, fusion, and everything else.
 
 ## The Deeper Insight
 
-Morok/Tinygrad proves that compiler complexity is often *accidental*, not essential. The multi-layer IR stacks in TensorFlow and PyTorch accumulated organically—each layer solved a real problem, but the combined system is harder to understand than any individual part.
+Svod/Tinygrad proves that compiler complexity is often *accidental*, not essential. The multi-layer IR stacks in TensorFlow and PyTorch accumulated organically—each layer solved a real problem, but the combined system is harder to understand than any individual part.
 
 One well-designed IR, one transformation mechanism, and principled composition can replace thousands of lines of specialized passes. It's the Unix philosophy applied to compilers: do one thing well, and compose.
 
 The cost is explicitness—you see loops, memory accesses, and parallelization hints that other IRs hide. But visibility is a feature, not a bug. When your model is slow, you want to see *why*, not hope the compiler figures it out.
 
-That's the bet Morok makes: transparent complexity beats hidden complexity.
+That's the bet Svod makes: transparent complexity beats hidden complexity.

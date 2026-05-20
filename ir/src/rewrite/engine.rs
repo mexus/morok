@@ -28,7 +28,7 @@
 //! ## Example
 //!
 //! ```ignore
-//! use morok_ir::pattern::SimplifiedPatternMatcher;
+//! use svod_ir::pattern::SimplifiedPatternMatcher;
 //!
 //! // Create context
 //! let mut ctx = MyContext::new();

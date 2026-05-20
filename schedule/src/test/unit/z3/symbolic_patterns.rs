@@ -4,10 +4,10 @@
 //! Each test creates an expression, applies symbolic simplification, and verifies
 //! that the original and simplified versions are semantically equivalent.
 
-use morok_dtype::DType;
-use morok_ir::types::ConstValue;
-use morok_ir::{Op, UOp};
 use std::sync::Arc;
+use svod_dtype::DType;
+use svod_ir::types::ConstValue;
+use svod_ir::{Op, UOp};
 
 use crate::rewrite::graph_rewrite;
 use crate::symbolic::symbolic_simple;

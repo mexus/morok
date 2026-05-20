@@ -3,8 +3,8 @@
 use melior::ir::Type;
 use melior::ir::r#type::IntegerType;
 use melior::{Context, dialect::llvm};
-use morok_dtype::{DType, ScalarDType};
-use morok_ir::{ConstValue, ReduceOp};
+use svod_dtype::{DType, ScalarDType};
+use svod_ir::{ConstValue, ReduceOp};
 
 /// Convert a scalar DType to an MLIR type.
 pub fn mlir_scalar_type<'c>(ctx: &'c Context, s: ScalarDType) -> Type<'c> {

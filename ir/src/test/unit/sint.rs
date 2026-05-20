@@ -1,4 +1,4 @@
-use morok_dtype::DType;
+use svod_dtype::DType;
 
 use crate::{Op, SInt, UOp, sint_max, sint_min, sint_prod};
 

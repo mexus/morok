@@ -1,8 +1,8 @@
-use morok_dtype::DType;
-use morok_ir::SInt;
-use morok_tensor::{BoundVariable, Tensor};
 use ndarray::Array4;
 use snafu::ResultExt;
+use svod_dtype::DType;
+use svod_ir::SInt;
+use svod_tensor::{BoundVariable, Tensor};
 
 use crate::init::{fan_in_uniform, ones, zeros};
 use crate::state::{HasStateDict, StateDict, get_tensor, prefixed};

@@ -6,8 +6,8 @@
 //! exercises the full `VadInference` JIT path (prepare → step → output reads)
 //! — useful when actively touching VAD wiring but too slow for default CI.
 
-use morok_dtype::DType;
-use morok_tensor::Tensor;
+use svod_dtype::DType;
+use svod_tensor::Tensor;
 
 use crate::silero_vad::{CONTEXT_SIZE, HIDDEN, NUM_SAMPLES, SileroVad, VadInference};
 

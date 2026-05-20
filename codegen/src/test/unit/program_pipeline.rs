@@ -1,6 +1,6 @@
-use morok_device::device::{CompiledSpec, Compiler, ProgramSpec, Renderer};
-use morok_dtype::{AddrSpace, DType, DeviceSpec};
-use morok_ir::{Op, UOp};
+use svod_device::device::{CompiledSpec, Compiler, ProgramSpec, Renderer};
+use svod_dtype::{AddrSpace, DType, DeviceSpec};
+use svod_ir::{Op, UOp};
 
 struct MockRenderer {
     device: DeviceSpec,
@@ -11,7 +11,7 @@ struct LinearOnlyRenderer {
 }
 
 impl Renderer for LinearOnlyRenderer {
-    fn render(&self, ast: &std::sync::Arc<UOp>, name: Option<&str>) -> morok_device::Result<ProgramSpec> {
+    fn render(&self, ast: &std::sync::Arc<UOp>, name: Option<&str>) -> svod_device::Result<ProgramSpec> {
         assert!(matches!(ast.op(), Op::Linear { .. }), "renderer should receive LINEAR stage");
         let spec = ProgramSpec::new(
             name.unwrap_or("kernel").to_string(),
@@ -28,7 +28,7 @@ impl Renderer for LinearOnlyRenderer {
 }
 
 impl Renderer for MockRenderer {
-    fn render(&self, ast: &std::sync::Arc<UOp>, name: Option<&str>) -> morok_device::Result<ProgramSpec> {
+    fn render(&self, ast: &std::sync::Arc<UOp>, name: Option<&str>) -> svod_device::Result<ProgramSpec> {
         let mut spec = ProgramSpec::new(
             name.unwrap_or("kernel").to_string(),
             "// mock source".to_string(),
@@ -49,7 +49,7 @@ impl Renderer for MockRenderer {
 struct MockCompiler;
 
 impl Compiler for MockCompiler {
-    fn compile(&self, spec: &ProgramSpec) -> morok_device::Result<CompiledSpec> {
+    fn compile(&self, spec: &ProgramSpec) -> svod_device::Result<CompiledSpec> {
         let mut compiled = CompiledSpec::from_bytes(spec.name.clone(), vec![1, 2, 3], spec.ast.clone());
         compiled.var_names = spec.var_names.clone();
         compiled.global_size = spec.global_size.clone();
@@ -66,7 +66,7 @@ impl Compiler for MockCompiler {
 struct PanicCompiler;
 
 impl Compiler for PanicCompiler {
-    fn compile(&self, _spec: &ProgramSpec) -> morok_device::Result<CompiledSpec> {
+    fn compile(&self, _spec: &ProgramSpec) -> svod_device::Result<CompiledSpec> {
         panic!("compiler should not be invoked when PROGRAM already has BINARY")
     }
 
@@ -120,7 +120,7 @@ fn test_do_compile_requires_source_stage() {
 #[test]
 fn test_do_compile_reuses_existing_binary_stage() {
     let sink = UOp::sink(vec![UOp::native_const(2.0f32)]);
-    let linear = UOp::linear(morok_schedule::linearize_with_cfg(sink.clone()).into());
+    let linear = UOp::linear(svod_schedule::linearize_with_cfg(sink.clone()).into());
     let source = UOp::source("// binary source".to_string());
     let mut spec =
         ProgramSpec::new("precompiled".to_string(), "// precompiled source".to_string(), DeviceSpec::Cpu, sink.clone());
@@ -175,7 +175,7 @@ fn test_do_render_uses_linear_stage_input() {
 #[test]
 fn test_do_render_rejects_program_with_existing_source_stage() {
     let sink = UOp::sink(vec![UOp::native_const(8.0f32)]);
-    let linear = UOp::linear(morok_schedule::linearize_with_cfg(sink.clone()).into());
+    let linear = UOp::linear(svod_schedule::linearize_with_cfg(sink.clone()).into());
     let program = UOp::program(
         sink,
         UOp::device(DeviceSpec::Cpu),
@@ -193,7 +193,7 @@ fn test_do_render_rejects_program_with_existing_source_stage() {
 #[test]
 fn test_do_render_rejects_program_with_existing_binary_stage() {
     let sink = UOp::sink(vec![UOp::native_const(9.0f32)]);
-    let linear = UOp::linear(morok_schedule::linearize_with_cfg(sink.clone()).into());
+    let linear = UOp::linear(svod_schedule::linearize_with_cfg(sink.clone()).into());
     let program =
         UOp::program(sink, UOp::device(DeviceSpec::Cpu), Some(linear), None, Some(UOp::binary(vec![1, 2, 3])));
     let renderer = MockRenderer { device: DeviceSpec::Cpu };
@@ -217,7 +217,7 @@ fn test_do_compile_rejects_malformed_binary_stage() {
 #[test]
 fn test_do_compile_rejects_empty_source_stage() {
     let sink = UOp::sink(vec![UOp::native_const(7.0f32)]);
-    let linear = UOp::linear(morok_schedule::linearize_with_cfg(sink.clone()).into());
+    let linear = UOp::linear(svod_schedule::linearize_with_cfg(sink.clone()).into());
     let mut meta = ProgramSpec::new("empty_source".to_string(), String::new(), DeviceSpec::Cpu, sink.clone());
     meta.set_var_names(vec!["N".to_string()]);
     meta.buf_count = 1;
@@ -265,7 +265,7 @@ fn test_do_linearize_emits_cleaned_linear_stage() {
 #[test]
 fn test_get_program_progresses_from_stage1_to_binary() {
     let sink = UOp::sink(vec![UOp::native_const(3.0f32)]);
-    let linear = UOp::linear(morok_schedule::linearize_with_cfg(sink.clone()).into());
+    let linear = UOp::linear(svod_schedule::linearize_with_cfg(sink.clone()).into());
     let program = UOp::program(sink, UOp::device(DeviceSpec::Cpu), Some(linear), None, None);
 
     let advanced = crate::program_pipeline::get_program(
@@ -290,7 +290,7 @@ fn test_get_program_progresses_from_stage1_to_binary() {
 #[test]
 fn test_get_program_progresses_from_stage2_to_binary() {
     let sink = UOp::sink(vec![UOp::native_const(4.0f32)]);
-    let linear = UOp::linear(morok_schedule::linearize_with_cfg(sink.clone()).into());
+    let linear = UOp::linear(svod_schedule::linearize_with_cfg(sink.clone()).into());
     let source = UOp::source("// pre-rendered source".to_string());
     let program = UOp::program(sink, UOp::device(DeviceSpec::Cpu), Some(linear), Some(source), None);
 

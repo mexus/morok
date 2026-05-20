@@ -7,10 +7,10 @@ sidebar_position: 0
 
 कोई भी प्रोडक्शन ML कम्पाइलर खोलिए और आपको दर्जनों ऑप्टिमाइज़ेशन पासेज़ मिलेंगे: constant folding, dead code elimination, operator fusion, loop tiling, vectorization, memory layout optimization। हर पास के अपने डेटा स्ट्रक्चर, अपना traversal लॉजिक, अपने बग्स।
 
-Morok एक अलग तरीका अपनाता है: **हर चीज़ के लिए एक मैकेनिज़्म**।
+Svod एक अलग तरीका अपनाता है: **हर चीज़ के लिए एक मैकेनिज़्म**।
 
 ```text
-Traditional Compiler:              Morok:
+Traditional Compiler:              Svod:
 ┌─────────────────────────┐       ┌─────────────────────────┐
 │  Constant Folding       │       │                         │
 │  Dead Code Elimination  │       │   patterns! {           │
@@ -24,13 +24,13 @@ Traditional Compiler:              Morok:
                                        One mechanism
 ```
 
-Morok में हर ऑप्टिमाइज़ेशन एक **पैटर्न** के रूप में एक्सप्रेस होता है: "जब यह स्ट्रक्चर दिखे, उसे इस स्ट्रक्चर से बदल दो।" वही `graph_rewrite()` फ़ंक्शन [अल्जेब्रिक सिम्प्लिफ़िकेशन](./algebraic-simplification.md), [इंडेक्स अरिथमेटिक](./index-arithmetic.md), [strength reduction](./strength-reduction.md), और [range ऑप्टिमाइज़ेशन](./range-optimization.md) अप्लाई करता है।
+Svod में हर ऑप्टिमाइज़ेशन एक **पैटर्न** के रूप में एक्सप्रेस होता है: "जब यह स्ट्रक्चर दिखे, उसे इस स्ट्रक्चर से बदल दो।" वही `graph_rewrite()` फ़ंक्शन [अल्जेब्रिक सिम्प्लिफ़िकेशन](./algebraic-simplification.md), [इंडेक्स अरिथमेटिक](./index-arithmetic.md), [strength reduction](./strength-reduction.md), और [range ऑप्टिमाइज़ेशन](./range-optimization.md) अप्लाई करता है।
 
 ---
 
 ## `patterns!` DSL
 
-Morok ऑप्टिमाइज़ेशन पैटर्न लिखने के लिए एक domain-specific language प्रदान करता है:
+Svod ऑप्टिमाइज़ेशन पैटर्न लिखने के लिए एक domain-specific language प्रदान करता है:
 
 ```rust
 patterns! {

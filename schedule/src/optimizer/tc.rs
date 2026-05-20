@@ -6,8 +6,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use morok_ir::{AxisId, AxisType, BinaryOp, ConstValue, Op, ReduceOp, UOp, UOpKey, WmmaMetadata, WmmaUpcastAxes};
 use smallvec::SmallVec;
+use svod_ir::{AxisId, AxisType, BinaryOp, ConstValue, Op, ReduceOp, UOp, UOpKey, WmmaMetadata, WmmaUpcastAxes};
 
 use crate::argsort;
 use crate::optimizer::{
@@ -335,13 +335,13 @@ fn apply_axis_choice_impl(
 
     // Create WARP dimension
     let mut warp = UOp::range_axis(
-        UOp::const_(morok_dtype::DType::Index, ConstValue::Int(tc.threads as i64)),
+        UOp::const_(svod_dtype::DType::Index, ConstValue::Int(tc.threads as i64)),
         AxisId::Renumbered(scheduler.maxarg() + 1),
         AxisType::Warp,
     );
 
     // Step 1: Apply TC opts via shift_to — splits each axis into (reduced, new_rng)
-    let two = UOp::const_(morok_dtype::DType::Index, ConstValue::Int(2));
+    let two = UOp::const_(svod_dtype::DType::Index, ConstValue::Int(2));
     let mut ne: Vec<Arc<UOp>> = Vec::with_capacity(tc.opts.len());
 
     for opt in &tc.opts {
@@ -404,7 +404,7 @@ fn apply_axis_choice_impl(
         let placeholders: Vec<Arc<UOp>> = (0..ne.len())
             .map(|i| {
                 UOp::range_axis(
-                    UOp::const_(morok_dtype::DType::Index, ConstValue::Int(2)),
+                    UOp::const_(svod_dtype::DType::Index, ConstValue::Int(2)),
                     AxisId::Renumbered(ph_base + i),
                     AxisType::Upcast,
                 )
@@ -656,8 +656,8 @@ pub fn apply(
 }
 
 /// Short dtype name for WMMA function identifiers.
-fn wmma_dtype_name(dtype: &morok_ir::prelude::DType) -> &'static str {
-    use morok_dtype::ScalarDType;
+fn wmma_dtype_name(dtype: &svod_ir::prelude::DType) -> &'static str {
+    use svod_dtype::ScalarDType;
     match dtype.base() {
         ScalarDType::Float32 => "float",
         ScalarDType::Float16 => "half",

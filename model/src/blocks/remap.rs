@@ -6,7 +6,7 @@
 //! time keeps the JIT graph purely affine. We also strip
 //! `num_batches_tracked`, which is metadata of no inference use.
 
-use morok_tensor::Tensor;
+use svod_tensor::Tensor;
 
 use crate::state::StateDict;
 

@@ -6,10 +6,10 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use morok_ir::uop::cached_property::CachedProperty;
-use morok_ir::uop::properties::VminVmaxProperty;
-use morok_ir::{AxisType, ConstValue, Op, UOp, UOpKey};
 use smallvec::SmallVec;
+use svod_ir::uop::cached_property::CachedProperty;
+use svod_ir::uop::properties::VminVmaxProperty;
+use svod_ir::{AxisType, ConstValue, Op, UOp, UOpKey};
 
 use crate::optimizer::{Opt, OptOps, Scheduler, error::*, tc};
 
@@ -340,7 +340,7 @@ fn apply_nolocals(scheduler: &mut Scheduler) -> Result<(), OptError> {
 /// 2. Create validity condition: idx < old_size
 /// 3. Add validity gate to all INDEX ops using this range
 fn apply_padto(scheduler: &mut Scheduler, rng: Arc<UOp>, alignment: usize) -> Result<(), OptError> {
-    use morok_ir::ReduceOp;
+    use svod_ir::ReduceOp;
 
     let (end, axis_id, axis_type) = match rng.op() {
         Op::Range { end, axis_id, axis_type, .. } => (end.clone(), *axis_id, *axis_type),
@@ -490,7 +490,7 @@ fn buf_uses_range(buf_op: &Arc<UOp>, rng: &Arc<UOp>) -> bool {
 /// - RECIPROCAL, LOG2, EXP2, IDIV, POW (non-linear ops where padding zeros changes result)
 /// - Comparisons (LT, etc.) that could mask valid data
 fn has_unsafe_ops_before_reduce(reduce_op: &Arc<UOp>) -> bool {
-    use morok_ir::types::{BinaryOp, UnaryOp};
+    use svod_ir::types::{BinaryOp, UnaryOp};
 
     for node in reduce_op.toposort() {
         match node.op() {

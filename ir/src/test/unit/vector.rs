@@ -4,7 +4,7 @@
 
 use smallvec::smallvec;
 
-use morok_dtype::{AddrSpace, DType};
+use svod_dtype::{AddrSpace, DType};
 
 use crate::{ConstValue, UOp};
 

@@ -2,7 +2,7 @@
 
 use proptest::prelude::*;
 
-use morok_dtype::DType;
+use svod_dtype::DType;
 
 use crate::types::ConstValue;
 

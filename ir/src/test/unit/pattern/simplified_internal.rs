@@ -1,7 +1,7 @@
 use super::*;
 use crate::types::BinaryOp;
 use crate::{ConstValue, Op, UOp};
-use morok_dtype::DType;
+use svod_dtype::DType;
 
 fn const_int(v: i64) -> Arc<UOp> {
     UOp::const_(DType::Int32, ConstValue::Int(v))

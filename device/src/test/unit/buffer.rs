@@ -1,6 +1,6 @@
 use crate::{Buffer, BufferOptions, CpuAllocator};
-use morok_dtype::DType;
 use std::sync::Arc;
+use svod_dtype::DType;
 
 #[cfg(feature = "cuda")]
 use crate::CudaAllocator;

@@ -1,5 +1,5 @@
 #![allow(clippy::result_large_err)]
-//! ONNX operator registry - maps ONNX ops to Morok Tensor operations.
+//! ONNX operator registry - maps ONNX ops to Svod Tensor operations.
 
 pub mod proto;
 pub use proto::*;
@@ -13,10 +13,10 @@ mod nn;
 mod shape;
 mod transformer;
 
-use morok_dtype::{DType, ScalarDType};
-use morok_ir::{ConstValue, IntoUOp, SInt};
-use morok_tensor::Tensor;
-use morok_tensor::reduce::AxisSpec;
+use svod_dtype::{DType, ScalarDType};
+use svod_ir::{ConstValue, IntoUOp, SInt};
+use svod_tensor::Tensor;
+use svod_tensor::reduce::AxisSpec;
 
 use crate::error::{Error, Result, UnsupportedOpSnafu};
 use crate::parser::onnx::NodeProto;
@@ -25,7 +25,7 @@ use crate::parser::onnx::NodeProto;
 fn fold_variadic(
     inputs: &[Option<Tensor>],
     op_name: &str,
-    f: fn(&Tensor, &Tensor) -> std::result::Result<Tensor, morok_tensor::error::Error>,
+    f: fn(&Tensor, &Tensor) -> std::result::Result<Tensor, svod_tensor::error::Error>,
 ) -> Result<Tensor> {
     let valid: Vec<&Tensor> = inputs.iter().filter_map(Option::as_ref).collect();
     let first = valid
@@ -38,7 +38,7 @@ fn fold_variadic(
     Ok(acc)
 }
 
-/// Operator registry for dispatching ONNX ops to Morok Tensor operations.
+/// Operator registry for dispatching ONNX ops to Svod Tensor operations.
 pub struct OpRegistry;
 
 impl OpRegistry {

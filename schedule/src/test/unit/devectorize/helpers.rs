@@ -5,10 +5,10 @@
 
 use std::sync::Arc;
 
-use morok_dtype::{AddrSpace, DType, ScalarDType};
-use morok_ir::types::ConstValue;
-use morok_ir::{Op, UOp};
 use smallvec::SmallVec;
+use svod_dtype::{AddrSpace, DType, ScalarDType};
+use svod_ir::types::ConstValue;
+use svod_ir::{Op, UOp};
 
 use crate::devectorize::{
     bool_storage_patterns, correct_load_store_patterns, devectorize, load_store_folding_patterns,
@@ -96,13 +96,13 @@ pub fn create_buffer(size: usize) -> Arc<UOp> {
 /// Create a global buffer with specified element type.
 pub fn create_buffer_typed(size: usize, scalar: ScalarDType) -> Arc<UOp> {
     let dtype = DType::Scalar(scalar).ptr(Some(size), AddrSpace::Global);
-    UOp::new_buffer(morok_dtype::DeviceSpec::Cpu, size, dtype)
+    UOp::new_buffer(svod_dtype::DeviceSpec::Cpu, size, dtype)
 }
 
 /// Create a local (shared) memory buffer.
 pub fn create_buffer_local(size: usize, scalar: ScalarDType) -> Arc<UOp> {
     let dtype = DType::Scalar(scalar).ptr(Some(size), AddrSpace::Local);
-    UOp::new_buffer(morok_dtype::DeviceSpec::Cpu, size, dtype)
+    UOp::new_buffer(svod_dtype::DeviceSpec::Cpu, size, dtype)
 }
 
 /// Create a bool buffer.
@@ -217,7 +217,7 @@ pub fn create_vector_index_gated(buffer: Arc<UOp>, count: usize, gate: Arc<UOp>)
 /// INDEX(buffer, [range_var * scale + offset])
 /// Used for testing root extraction and grouping.
 pub fn create_index_with_range(buffer: Arc<UOp>, axis_id: usize, bound: i64, scale: i64, offset: i64) -> Arc<UOp> {
-    use morok_ir::{AxisId, AxisType, BinaryOp};
+    use svod_ir::{AxisId, AxisType, BinaryOp};
 
     let range = UOp::new(
         Op::Range {
@@ -594,7 +594,7 @@ pub fn unwrap_group(uop: &Arc<UOp>) -> Vec<Arc<UOp>> {
 // REDUCE/GEP Test Helpers
 // =============================================================================
 
-use morok_ir::{AxisId, AxisType, ReduceOp};
+use svod_ir::{AxisId, AxisType, ReduceOp};
 
 /// Apply pm_reduce patterns to a UOp.
 ///

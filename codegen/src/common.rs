@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use morok_ir::{Op, UOp};
+use svod_ir::{Op, UOp};
 
 use crate::{Error, Result};
 

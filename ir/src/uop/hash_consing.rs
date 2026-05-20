@@ -29,8 +29,8 @@ use smallvec::SmallVec;
 use crate::op::Op;
 use crate::types::*;
 use crate::uop::core::UOp;
-use morok_dtype::DType;
-use morok_dtype::DeviceSpec;
+use svod_dtype::DType;
+use svod_dtype::DeviceSpec;
 
 // Global atomic counter for unique identifiers.
 //

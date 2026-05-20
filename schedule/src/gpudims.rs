@@ -25,9 +25,9 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use morok_dtype::DType;
-use morok_ir::types::{AxisType, ConstValue};
-use morok_ir::{Op, UOp, UOpKey};
+use svod_dtype::DType;
+use svod_ir::types::{AxisType, ConstValue};
+use svod_ir::{Op, UOp, UOpKey};
 
 use crate::optimizer::Renderer;
 use crate::pattern::TypedPatternMatcher;
@@ -251,10 +251,10 @@ fn compute_store_masks(
         };
 
         // Check if store targets global memory
-        // In Morok, we check if the INDEX's buffer has Global addrspace
+        // In Svod, we check if the INDEX's buffer has Global addrspace
         let is_global_store = match index.op() {
             Op::Index { buffer, .. } => match buffer.dtype() {
-                DType::Ptr { addrspace, .. } => addrspace == morok_dtype::AddrSpace::Global,
+                DType::Ptr { addrspace, .. } => addrspace == svod_dtype::AddrSpace::Global,
                 _ => true, // Assume global if not a pointer type
             },
             _ => continue,

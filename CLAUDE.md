@@ -1,10 +1,10 @@
-# Morok
+# Svod
 
 Use Opus 4.6 powered agents.
 
 ## Skills
 
-Use `/morok-debug` for pipeline debugging (IR extraction, LLVM IR, tracing).
+Use `/svod-debug` for pipeline debugging (IR extraction, LLVM IR, tracing).
 Use `/tinygrad` for comparing with Tinygrad's implementation.
 
 ## Task planning

@@ -11,8 +11,8 @@
 //! ## Recipe
 //!
 //! ```no_run
-//! use morok_model::resnet::{OutputMode, ResNet, ResNetDepth, ResNetJit};
-//! use morok_model::jit::InputSpec;
+//! use svod_model::resnet::{OutputMode, ResNet, ResNetDepth, ResNetJit};
+//! use svod_model::jit::InputSpec;
 //!
 //! let model = ResNet::from_hub("timm/resnet34.a1_in1k", ResNetDepth::R34,
 //!     OutputMode::Classification { num_classes: 1000 })?;
@@ -31,7 +31,7 @@
 //! into the plan by [`prepare`](ResNetJit#method.prepare). Re-`prepare` for a
 //! different resolution. See [the JIT graphs page] for the wrapper contract.
 //!
-//! [the JIT graphs page]: https://morok.dev/docs/architecture/jit-graphs
+//! [the JIT graphs page]: https://svod.dev/docs/architecture/jit-graphs
 
 mod config;
 mod error;

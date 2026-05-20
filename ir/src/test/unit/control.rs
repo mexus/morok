@@ -6,7 +6,7 @@ use std::{f32::consts::PI, f64::consts::E};
 
 use smallvec::smallvec;
 
-use morok_dtype::DType;
+use svod_dtype::DType;
 
 use crate::{AxisId, AxisType, ConstValue, UOp};
 

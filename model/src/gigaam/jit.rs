@@ -3,13 +3,13 @@
 //! consumed by the predictor/joint step JITs) sees a uniform dtype regardless
 //! of whether the encoder ran in fp16, bf16, or fp32.
 //!
-//! The `jit_wrapper!` macro expands to `morok_model::jit::*` paths, so this
-//! file needs the `extern crate self as morok_model;` binding in scope.
+//! The `jit_wrapper!` macro expands to `svod_model::jit::*` paths, so this
+//! file needs the `extern crate self as svod_model;` binding in scope.
 
-extern crate self as morok_model;
+extern crate self as svod_model;
 
-use morok_macros::jit_wrapper;
 use snafu::ResultExt;
+use svod_macros::jit_wrapper;
 
 use super::model::GigaAm;
 use crate::gigaam::error::TensorSnafu;
@@ -26,7 +26,7 @@ jit_wrapper! {
 
         build(mel, lengths, b, t) {
             let out = model.encoder.forward_batch(mel, lengths, &b, &t)?;
-            out.cast(morok_dtype::DType::Float32).context(TensorSnafu)
+            out.cast(svod_dtype::DType::Float32).context(TensorSnafu)
         }
     }
 }

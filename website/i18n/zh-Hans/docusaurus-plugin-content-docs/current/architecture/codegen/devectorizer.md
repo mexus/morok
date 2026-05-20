@@ -58,7 +58,7 @@ WMMA(a, b, c) + add → WMMA(a, b, c + add)
 ```
 该模式实现了 NVIDIA 张量核心上高效的 FMA 式累加。
 
-**Morok**：`devectorize.rs`
+**Svod**：`devectorize.rs`
 
 ---
 
@@ -109,7 +109,7 @@ STORE(INDEX(...), value) → STORE(INDEX(..., gate=(lidx1 == 0)), value)
 ```
 这确保 store 仅在未使用的本地索引为 0 时执行。
 
-**Morok**：`gpudims.rs`
+**Svod**：`gpudims.rs`
 
 ---
 
@@ -139,7 +139,7 @@ LOAD(INDEX(ptr, i))
 
 注意：并非所有 INDEX 操作都会被包装成 LOAD。指针类型（已经是地址）和 image texture（特殊硬件）使用不同的访问方式。
 
-**Morok**：`devectorize.rs`
+**Svod**：`devectorize.rs`
 
 ---
 
@@ -185,7 +185,7 @@ PTRCAT 分组连续的指针访问：
 - `1`：完整 devectorization（默认）
 - `≥2`：同时跳过 `devectorize` 和 `correct_load_store`
 
-注意：Morok 始终运行 devectorizer，不暴露此环境变量。
+注意：Svod 始终运行 devectorizer，不暴露此环境变量。
 
 **模式**：`devectorize + load_store_folding + correct_load_store + load_store_indexing`
 
@@ -199,7 +199,7 @@ ADD(vec4_a, vec4_b) → [ADD(a[0], b[0]), ADD(a[1], b[1]), ...]
 
 **Image 修复**：image tensor buffer 的特殊处理。
 
-**Morok**：`devectorize.rs`
+**Svod**：`devectorize.rs`
 
 ---
 
@@ -252,13 +252,13 @@ Index 类型降低使用 3 阶段级联方法：
 dtype = i32 if bounds fit in [-2^31, 2^31-1] else i64
 ```
 
-**Morok**：`symbolic/index_lowering.rs`
+**Svod**：`symbolic/index_lowering.rs`
 
 ---
 
 ## 额外的 Devectorizer Pass
 
-Morok 在 Stage 14 和 15 之间运行了几个额外的 pass，没有直接对应的 Tinygrad 等价物：
+Svod 在 Stage 14 和 15 之间运行了几个额外的 pass，没有直接对应的 Tinygrad 等价物：
 
 | Pass | 用途 |
 |------|------|

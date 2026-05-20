@@ -2,10 +2,10 @@ use bon::bon;
 use snafu::ResultExt;
 use std::sync::Arc;
 
-use morok_device::{Buffer, registry};
-use morok_dtype::DType;
-use morok_dtype::ext::HasDType;
-use morok_ir::{DeviceSpec, SInt, UOp, shape::Shape};
+use svod_device::{Buffer, registry};
+use svod_dtype::DType;
+use svod_dtype::ext::HasDType;
+use svod_ir::{DeviceSpec, SInt, UOp, shape::Shape};
 
 use crate::Tensor;
 use crate::error::*;
@@ -17,7 +17,7 @@ impl Tensor {
     ///
     /// # Examples
     /// ```
-    /// # use morok_tensor::Tensor;
+    /// # use svod_tensor::Tensor;
     /// let a = Tensor::from_slice(&[1.0f32, 2.0, 3.0]);
     /// ```
     pub fn from_slice<T: HasDType, C: AsRef<[T]>>(source: C) -> Self {
@@ -103,7 +103,7 @@ impl Tensor {
     ///
     /// # Examples
     /// ```
-    /// # use morok_tensor::Tensor;
+    /// # use svod_tensor::Tensor;
     /// # use ndarray::array;
     /// let t = Tensor::from_ndarray(&array![[1.0f32, 2.0, 3.0], [4.0, 5.0, 6.0]]);
     /// let view = t.array_view::<f32>().unwrap();
@@ -157,7 +157,7 @@ impl Tensor {
     ///
     /// # Examples
     /// ```
-    /// # use morok_tensor::Tensor;
+    /// # use svod_tensor::Tensor;
     /// let t = Tensor::from_slice(&[1.0f32, 2.0, 3.0]);
     /// let result = t.as_ndarray::<f32>().unwrap();
     /// assert_eq!(result.shape(), &[3]);
@@ -203,7 +203,7 @@ impl Tensor {
     ///
     /// # Examples
     /// ```
-    /// # use morok_tensor::Tensor;
+    /// # use svod_tensor::Tensor;
     /// let t = Tensor::from_slice(&[1.0f32, 2.0, 3.0]);
     /// let v = t.as_vec::<f32>().unwrap();
     /// assert_eq!(v, vec![1.0, 2.0, 3.0]);
@@ -242,7 +242,7 @@ impl Tensor {
     ///
     /// # Examples
     /// ```
-    /// # use morok_tensor::Tensor;
+    /// # use svod_tensor::Tensor;
     /// # use ndarray::array;
     /// let t = Tensor::from_ndarray(&array![[1.0f32, 2.0], [3.0, 4.0]]);
     /// let view = t.array_view::<f32>().unwrap();
@@ -265,7 +265,7 @@ impl Tensor {
     ///
     /// # Examples
     /// ```
-    /// # use morok_tensor::Tensor;
+    /// # use svod_tensor::Tensor;
     /// # use ndarray::array;
     /// let t = Tensor::from_ndarray(&array![[0.0f32, 0.0, 0.0], [0.0, 0.0, 0.0]]);
     /// t.array_view_mut::<f32>().unwrap()[[1, 2]] = 42.0;

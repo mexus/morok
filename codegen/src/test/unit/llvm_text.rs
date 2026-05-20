@@ -1,6 +1,6 @@
 use super::*;
-use morok_dtype::{AddrSpace, DType};
-use morok_ir::{BinaryOp, Op};
+use svod_dtype::{AddrSpace, DType};
+use svod_ir::{BinaryOp, Op};
 
 #[test]
 fn test_simple_add() {
@@ -20,7 +20,7 @@ fn test_simple_add() {
 
     let store = out_idx.store(add);
     let sink = UOp::sink(vec![store]);
-    let linear = UOp::linear(morok_schedule::linearize_with_cfg(sink.clone()).into());
+    let linear = UOp::linear(svod_schedule::linearize_with_cfg(sink.clone()).into());
 
     let result = render(&linear, Some("test_add")).unwrap();
     println!("{}", result.code);

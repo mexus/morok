@@ -1,9 +1,9 @@
 //! Resize operations (ONNX Resize operator building block).
 
 use bon::bon;
-use morok_dtype::DType;
-use morok_ir::ConstValue;
 use snafu::ResultExt;
+use svod_dtype::DType;
+use svod_ir::ConstValue;
 
 use super::{AspectRatioPolicy, CoordinateTransformMode, NearestMode, ResizeMode};
 use crate::Tensor;
@@ -24,7 +24,7 @@ impl Tensor {
     /// Nearest-mode 2x upscale via `scales`:
     ///
     /// ```
-    /// # use morok_tensor::Tensor;
+    /// # use svod_tensor::Tensor;
     /// # use ndarray::Array4;
     /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 2, 2), 1.0f32));
     /// let mut y = x.resize().scales(&[1.0, 1.0, 2.0, 2.0]).call().unwrap();
@@ -37,7 +37,7 @@ impl Tensor {
     /// Resize to explicit output `sizes`:
     ///
     /// ```
-    /// # use morok_tensor::Tensor;
+    /// # use svod_tensor::Tensor;
     /// # use ndarray::Array4;
     /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 2, 2), 1.0f32));
     /// let mut y = x.resize().sizes(&[1, 1, 6, 6]).call().unwrap();
@@ -50,8 +50,8 @@ impl Tensor {
     /// Linear interpolation mode:
     ///
     /// ```
-    /// # use morok_tensor::Tensor;
-    /// # use morok_tensor::nn::ResizeMode;
+    /// # use svod_tensor::Tensor;
+    /// # use svod_tensor::nn::ResizeMode;
     /// # use ndarray::Array4;
     /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 2, 2), 1.0f32));
     /// let mut y = x.resize()
@@ -93,7 +93,7 @@ impl Tensor {
         // than going through `usize`. The result is the only thing using
         // `_shape_dims` is its discard binding — drop it once the rest of the
         // function stops needing fully-concrete shapes.
-        let _shape_dims = morok_ir::shape::to_vec_usize(&shape).context(UOpSnafu)?;
+        let _shape_dims = svod_ir::shape::to_vec_usize(&shape).context(UOpSnafu)?;
 
         let axes: Vec<usize> = axes.map(|a| a.to_vec()).unwrap_or_else(|| (0..ndim).collect());
 
@@ -115,7 +115,7 @@ impl Tensor {
         // trailing spatial dims) is actually used; the non-axes prefix is
         // copied into `expand_shape` later and never compared to a `usize`,
         // so it could stay as `SInt` and admit symbolic dims.
-        let x_dims = morok_ir::shape::to_vec_usize(&x_shape).context(UOpSnafu)?;
+        let x_dims = svod_ir::shape::to_vec_usize(&x_shape).context(UOpSnafu)?;
         let n_spatial = axes.len();
         let input_shape: Vec<usize> = x_dims[ndim - n_spatial..].to_vec();
 
@@ -267,7 +267,7 @@ impl Tensor {
                 // already does internally) so we can pass the symbolic dims
                 // through; then we'd substitute `out_sz` at the axis position
                 // and keep the rest of the shape as-is.
-                let cur_dims = morok_ir::shape::to_vec_usize(&cur_shape).context(UOpSnafu)?;
+                let cur_dims = svod_ir::shape::to_vec_usize(&cur_shape).context(UOpSnafu)?;
                 let out_sz = output_sizes[i];
 
                 let mut idx_shape = vec![1isize; ndim];
@@ -395,7 +395,7 @@ impl Tensor {
         if let Some(masks) = validity_mask {
             let extrap = Tensor::const_(ConstValue::Float(extrapolation_value), dtype.clone());
             let x_shape = x.shape()?;
-            let x_dims = morok_ir::shape::to_vec_usize(&x_shape).context(UOpSnafu)?;
+            let x_dims = svod_ir::shape::to_vec_usize(&x_shape).context(UOpSnafu)?;
             let expand_shape: Vec<isize> = x_dims.iter().map(|&d| d as isize).collect();
 
             // Each mask_i is 1D [out_sz_i]; reshape to [1,..,out_sz_i,..,1] and broadcast

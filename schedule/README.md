@@ -1,11 +1,11 @@
-# morok-schedule
+# svod-schedule
 
 Pattern matching engine and RANGEIFY transformation for kernel generation.
 
 ## Example
 
 ```rust
-use morok_schedule::{patterns, graph_rewrite};
+use svod_schedule::{patterns, graph_rewrite};
 
 let matcher = patterns! {
     // Identity folding
@@ -78,8 +78,8 @@ let optimized = graph_rewrite(&matcher, graph, &mut ());
 ## Testing
 
 ```bash
-cargo test -p morok-schedule
-cargo test -p morok-schedule --features z3  # with Z3 verification
+cargo test -p svod-schedule
+cargo test -p svod-schedule --features z3  # with Z3 verification
 ```
 
 ### Property-Based Testing
@@ -105,7 +105,7 @@ Uses [Z3](https://github.com/Z3Prover/z3) SMT solver to formally prove semantic 
 4. If SAT → found counterexample (bug)
 
 ```bash
-cargo test -p morok-schedule --features z3
+cargo test -p svod-schedule --features z3
 ```
 
 **Resources:**

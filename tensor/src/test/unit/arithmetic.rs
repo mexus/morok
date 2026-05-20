@@ -1,5 +1,5 @@
 use crate::*;
-use morok_ir::Op;
+use svod_ir::Op;
 
 #[test]
 fn simple() {
@@ -48,7 +48,7 @@ fn test_add_type_promotion() {
     let c = &a + &b;
 
     // Result should be promoted to Float32
-    assert_eq!(c.uop().dtype(), morok_dtype::DType::Float32);
+    assert_eq!(c.uop().dtype(), svod_dtype::DType::Float32);
 }
 
 #[test]
@@ -58,7 +58,7 @@ fn test_mul_type_promotion() {
     let c = &a * &b;
 
     // Result should be promoted to Float32
-    assert_eq!(c.uop().dtype(), morok_dtype::DType::Float32);
+    assert_eq!(c.uop().dtype(), svod_dtype::DType::Float32);
 }
 
 #[test]
@@ -73,7 +73,7 @@ fn test_shape_mismatch_error() {
     // With broadcasting, this now gives a BroadcastShapeMismatch error
     // (dimension 0: cannot broadcast 3 to 2 or vice versa)
     match result {
-        Err(Error::UOp { source: morok_ir::Error::BroadcastShapeMismatch { .. } }) => {
+        Err(Error::UOp { source: svod_ir::Error::BroadcastShapeMismatch { .. } }) => {
             // Expected - shapes [3] and [2] cannot be broadcasted
         }
         _ => panic!("Expected BroadcastShapeMismatch error"),
@@ -150,7 +150,7 @@ fn test_sub_same_shape() {
     let c = &a - &b;
 
     assert!(
-        matches!(c.uop().op(), Op::Binary(morok_ir::BinaryOp::Add, _, _)),
+        matches!(c.uop().op(), Op::Binary(svod_ir::BinaryOp::Add, _, _)),
         "Expected Binary Add (a + (-b)), got {:?}",
         c.uop().op()
     );
@@ -210,7 +210,7 @@ fn test_eq_comparison() {
     let b = Tensor::from_slice([1.0f32, 2.0, 3.0]);
     let c = a.try_eq(&b).unwrap();
 
-    assert_eq!(c.uop().dtype(), morok_dtype::DType::Bool);
+    assert_eq!(c.uop().dtype(), svod_dtype::DType::Bool);
 }
 
 #[test]
@@ -219,7 +219,7 @@ fn test_ne_comparison() {
     let b = Tensor::from_slice([1.0f32, 2.0, 4.0]);
     let c = a.try_ne(&b).unwrap();
 
-    assert_eq!(c.uop().dtype(), morok_dtype::DType::Bool);
+    assert_eq!(c.uop().dtype(), svod_dtype::DType::Bool);
 }
 
 #[test]
@@ -228,7 +228,7 @@ fn test_lt_comparison() {
     let b = Tensor::from_slice([2.0f32, 3.0, 4.0]);
     let c = a.try_lt(&b).unwrap();
 
-    assert_eq!(c.uop().dtype(), morok_dtype::DType::Bool);
+    assert_eq!(c.uop().dtype(), svod_dtype::DType::Bool);
 }
 
 #[test]
@@ -237,7 +237,7 @@ fn test_le_comparison() {
     let b = Tensor::from_slice([1.0f32, 2.0, 3.0]);
     let c = a.try_le(&b).unwrap();
 
-    assert_eq!(c.uop().dtype(), morok_dtype::DType::Bool);
+    assert_eq!(c.uop().dtype(), svod_dtype::DType::Bool);
 }
 
 #[test]
@@ -246,7 +246,7 @@ fn test_gt_comparison() {
     let b = Tensor::from_slice([1.0f32, 2.0, 3.0]);
     let c = a.try_gt(&b).unwrap();
 
-    assert_eq!(c.uop().dtype(), morok_dtype::DType::Bool);
+    assert_eq!(c.uop().dtype(), svod_dtype::DType::Bool);
 }
 
 #[test]
@@ -255,13 +255,13 @@ fn test_ge_comparison() {
     let b = Tensor::from_slice([1.0f32, 2.0, 3.0]);
     let c = a.try_ge(&b).unwrap();
 
-    assert_eq!(c.uop().dtype(), morok_dtype::DType::Bool);
+    assert_eq!(c.uop().dtype(), svod_dtype::DType::Bool);
 }
 
 #[test]
 fn test_provenance_tracking() {
-    use morok_dtype::DType;
-    use morok_ir::{ConstValue, UOp, provenance::PROVENANCE_TRACKER};
+    use svod_dtype::DType;
+    use svod_ir::{ConstValue, UOp, provenance::PROVENANCE_TRACKER};
 
     // Clear any existing provenance
     PROVENANCE_TRACKER.with(|t| t.borrow_mut().clear());
@@ -313,7 +313,7 @@ fn test_neg_basic() {
     let b = -&a;
 
     assert!(
-        matches!(b.uop().op(), Op::Binary(morok_ir::BinaryOp::Mul, _, _)),
+        matches!(b.uop().op(), Op::Binary(svod_ir::BinaryOp::Mul, _, _)),
         "Expected MUL operation, got {:?}",
         b.uop().op()
     );
@@ -363,7 +363,7 @@ fn test_sqrt_basic() {
     }
 
     // Verify dtype is preserved
-    assert_eq!(b.uop().dtype(), morok_dtype::DType::Float32);
+    assert_eq!(b.uop().dtype(), svod_dtype::DType::Float32);
 }
 
 #[test]
@@ -384,7 +384,7 @@ fn test_rsqrt_basic() {
         panic!("Expected Unary Rsqrt operation");
     }
 
-    assert_eq!(b.uop().dtype(), morok_dtype::DType::Float32);
+    assert_eq!(b.uop().dtype(), svod_dtype::DType::Float32);
 }
 
 #[test]
@@ -398,7 +398,7 @@ fn test_exp_basic() {
         panic!("Expected Unary Exp operation");
     }
 
-    assert_eq!(b.uop().dtype(), morok_dtype::DType::Float32);
+    assert_eq!(b.uop().dtype(), svod_dtype::DType::Float32);
 }
 
 #[test]
@@ -412,7 +412,7 @@ fn test_log_basic() {
         panic!("Expected Unary Log operation");
     }
 
-    assert_eq!(b.uop().dtype(), morok_dtype::DType::Float32);
+    assert_eq!(b.uop().dtype(), svod_dtype::DType::Float32);
 }
 
 #[test]

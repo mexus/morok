@@ -1,7 +1,7 @@
 //! Tests for tensor core (TC) optimization.
 
 use crate::optimizer::{Renderer, Scheduler, tc::*};
-use morok_ir::{AxisId, AxisType, ReduceOp, UOp};
+use svod_ir::{AxisId, AxisType, ReduceOp, UOp};
 
 // ===== Matching Tests =====
 
@@ -158,7 +158,7 @@ fn test_select_tensor_core_out_of_bounds() {
 #[test]
 fn test_base_shape() {
     use crate::optimizer::renderer::{CUDA_81616, SwizzleAxis};
-    use morok_dtype::DType;
+    use svod_dtype::DType;
 
     let tc = CUDA_81616.build(DType::Float16, DType::Float32);
     let shape = swizzle::base_shape(&tc);
@@ -182,7 +182,7 @@ fn test_base_shape() {
 #[test]
 fn test_permutes_for_shape() {
     use crate::optimizer::renderer::CUDA_81616;
-    use morok_dtype::DType;
+    use svod_dtype::DType;
 
     let tc = CUDA_81616.build(DType::Float16, DType::Float32);
     let shape = swizzle::base_shape(&tc);
@@ -202,7 +202,7 @@ fn test_permutes_for_shape() {
 #[test]
 fn test_reduce_axes_count() {
     use crate::optimizer::renderer::CUDA_81616;
-    use morok_dtype::DType;
+    use svod_dtype::DType;
 
     let tc = CUDA_81616.build(DType::Float16, DType::Float32);
     let count = swizzle::get_reduce_axes_count(&tc);
@@ -270,15 +270,15 @@ fn test_apply_tc_invalid_use_tc() {
 // TC Padding Tests
 // =============================================================================
 
-use morok_dtype::DType;
 use std::sync::Arc;
+use svod_dtype::DType;
 
 /// Helper to create a proper matmul pattern for TC padding tests.
 /// Creates: C[m,n] = sum_k A[m,k] * B[k,n]
 ///
 /// Unlike simplified tests, this creates inputs that depend on ranges
 /// so that detect_matmul() can find the M, N, K axes.
-fn create_matmul_pattern_for_padding(m: i64, n: i64, k: i64) -> Arc<morok_ir::UOp> {
+fn create_matmul_pattern_for_padding(m: i64, n: i64, k: i64) -> Arc<svod_ir::UOp> {
     let m_range = UOp::range_axis(UOp::index_const(m), AxisId::Renumbered(0), AxisType::Global);
     let n_range = UOp::range_axis(UOp::index_const(n), AxisId::Renumbered(1), AxisType::Global);
     let k_range = UOp::range_axis(UOp::index_const(k), AxisId::Renumbered(2), AxisType::Reduce);
@@ -310,7 +310,7 @@ fn create_matmul_pattern_for_padding(m: i64, n: i64, k: i64) -> Arc<morok_ir::UO
 /// Creates: C[m,n] = sum_k cast_f32(A[m,k] * B[k,n])
 /// This allows testing TC candidate retry where multiple TC entries share
 /// float16 input / float32 output but differ in K dimension.
-fn create_matmul_pattern_f16_accum_f32(m: i64, n: i64, k: i64) -> Arc<morok_ir::UOp> {
+fn create_matmul_pattern_f16_accum_f32(m: i64, n: i64, k: i64) -> Arc<svod_ir::UOp> {
     let m_range = UOp::range_axis(UOp::index_const(m), AxisId::Renumbered(0), AxisType::Global);
     let n_range = UOp::range_axis(UOp::index_const(n), AxisId::Renumbered(1), AxisType::Global);
     let k_range = UOp::range_axis(UOp::index_const(k), AxisId::Renumbered(2), AxisType::Reduce);
@@ -332,7 +332,7 @@ fn create_matmul_pattern_f16_accum_f32(m: i64, n: i64, k: i64) -> Arc<morok_ir::
 ///
 /// Axis ordering by axis_id is intentionally chosen so axis choice 0 maps to
 /// `n_bad` (non-divisible), while axis choice 1 maps to `n_good` (divisible).
-fn create_matmul_pattern_with_two_n_axes(n_bad: i64, n_good: i64) -> Arc<morok_ir::UOp> {
+fn create_matmul_pattern_with_two_n_axes(n_bad: i64, n_good: i64) -> Arc<svod_ir::UOp> {
     let m_range = UOp::range_axis(UOp::index_const(16), AxisId::Renumbered(0), AxisType::Global);
     let n_good_range = UOp::range_axis(UOp::index_const(n_good), AxisId::Renumbered(1), AxisType::Global);
     let k_range = UOp::range_axis(UOp::index_const(16), AxisId::Renumbered(2), AxisType::Reduce);
@@ -631,12 +631,12 @@ fn test_apply_tc_amx() {
     let axes = result.unwrap();
     // axes should be [N_range, M_range, K_range] — all valid UOps
     for (i, ax) in axes.iter().enumerate() {
-        assert!(matches!(ax.op(), morok_ir::Op::Range { .. }), "axes[{i}] should be a RANGE");
+        assert!(matches!(ax.op(), svod_ir::Op::Range { .. }), "axes[{i}] should be a RANGE");
     }
 
     // Verify WMMA is present in the resulting AST
     let ast = scheduler.ast();
-    let has_wmma = ast.toposort().iter().any(|u| matches!(u.op(), morok_ir::Op::Wmma { .. }));
+    let has_wmma = ast.toposort().iter().any(|u| matches!(u.op(), svod_ir::Op::Wmma { .. }));
     assert!(has_wmma, "AST should contain WMMA after TC apply");
 }
 

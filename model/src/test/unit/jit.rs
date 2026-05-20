@@ -1,7 +1,7 @@
-extern crate self as morok_model;
+extern crate self as svod_model;
 
-use morok_macros::jit_wrapper;
-use morok_tensor::{PrepareConfig, Tensor};
+use svod_macros::jit_wrapper;
+use svod_tensor::{PrepareConfig, Tensor};
 
 use crate::jit::InputSpec;
 
@@ -99,7 +99,7 @@ fn test_jit_profiled_execution_apis() {
     assert_eq!(result, vec![11.0, 22.0, 33.0]);
 }
 
-fn copy_tensor_to_buffer(tensor: &Tensor, dst: &mut morok_device::Buffer) {
+fn copy_tensor_to_buffer(tensor: &Tensor, dst: &mut svod_device::Buffer) {
     let src_buf = tensor.buffer().unwrap();
     let mut data = vec![0u8; src_buf.size()];
     src_buf.copyout(&mut data).unwrap();

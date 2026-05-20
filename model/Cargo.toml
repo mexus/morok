@@ -1,5 +1,5 @@
 [package]
-name = "morok-model"
+name = "svod-model"
 authors.workspace = true
 edition.workspace = true
 version.workspace = true
@@ -10,13 +10,13 @@ repository.workspace = true
 bon = "3.9.1"
 hf-hub = "0.5.0"
 hound = "3.5.1"
-morok-arch = { version = "0.1.0-alpha.2", path = "../arch" }
-morok-device = { version = "0.1.0-alpha.2", path = "../device" }
-morok-dtype = { version = "0.1.0-alpha.2", path = "../dtype", package = "morok-dtype" }
-morok-ir = { version = "0.1.0-alpha.2", path = "../ir", package = "morok-ir" }
-morok-macros = { version = "0.1.0-alpha.2", path = "../macros" }
-morok-runtime = { version = "0.1.0-alpha.2", path = "../runtime" }
-morok-tensor = { version = "0.1.0-alpha.2", path = "../tensor", package = "morok-tensor" }
+svod-arch = { version = "0.1.0-alpha.2", path = "../arch" }
+svod-device = { version = "0.1.0-alpha.2", path = "../device" }
+svod-dtype = { version = "0.1.0-alpha.2", path = "../dtype", package = "svod-dtype" }
+svod-ir = { version = "0.1.0-alpha.2", path = "../ir", package = "svod-ir" }
+svod-macros = { version = "0.1.0-alpha.2", path = "../macros" }
+svod-runtime = { version = "0.1.0-alpha.2", path = "../runtime" }
+svod-tensor = { version = "0.1.0-alpha.2", path = "../tensor", package = "svod-tensor" }
 ndarray.workspace = true
 prost = "0.14.3"
 nom = "7.1"

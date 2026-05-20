@@ -4,11 +4,11 @@
 //! - `OptOps`: Optimization operations (UPCAST, LOCAL, UNROLL, etc.)
 //! - `Opt`: An optimization descriptor combining operation and parameters
 //!
-//! Note: `AxisType` is re-exported from `morok_ir` where it's defined.
+//! Note: `AxisType` is re-exported from `svod_ir` where it's defined.
 use std::fmt;
 
 // Re-export AxisType from IR (where it belongs)
-pub use morok_ir::AxisType;
+pub use svod_ir::AxisType;
 
 use super::error::*;
 

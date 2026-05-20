@@ -9,10 +9,10 @@
 
 use std::sync::Arc;
 
-use morok_device::DeviceSpec;
-use morok_dtype::DType;
-use morok_ir::{Op, SInt, UOp};
 use smallvec::SmallVec;
+use svod_device::DeviceSpec;
+use svod_dtype::DType;
+use svod_ir::{Op, SInt, UOp};
 
 use crate::rangeify::kernel::{SplitReduceOpConfig, collect_range_ids, split_reduceop};
 
@@ -101,7 +101,7 @@ fn test_split_reduceop_disabled() {
     let config = SplitReduceOpConfig { enabled: false, ..Default::default() };
 
     let tensor = create_test_tensor(&[100000]);
-    let reduce = tensor.try_reduce_axis(morok_ir::ReduceOp::Add, vec![0]).unwrap();
+    let reduce = tensor.try_reduce_axis(svod_ir::ReduceOp::Add, vec![0]).unwrap();
 
     // Should return None when disabled
     assert!(split_reduceop(&reduce, &config).is_none());
@@ -113,7 +113,7 @@ fn test_split_reduceop_below_threshold() {
 
     // Small reduction: 1000 elements < threshold (32768)
     let tensor = create_test_tensor(&[1000]);
-    let reduce = tensor.try_reduce_axis(morok_ir::ReduceOp::Add, vec![0]).unwrap();
+    let reduce = tensor.try_reduce_axis(svod_ir::ReduceOp::Add, vec![0]).unwrap();
 
     // Should NOT split (below threshold)
     assert!(split_reduceop(&reduce, &config).is_none());
@@ -125,7 +125,7 @@ fn test_split_reduceop_basic_split() {
 
     // Large reduction: 100000 > threshold (32768)
     let tensor = create_test_tensor(&[100000]);
-    let reduce = tensor.try_reduce_axis(morok_ir::ReduceOp::Add, vec![0]).unwrap();
+    let reduce = tensor.try_reduce_axis(svod_ir::ReduceOp::Add, vec![0]).unwrap();
 
     // Should split
     let result = split_reduceop(&reduce, &config);
@@ -143,9 +143,7 @@ fn test_split_reduceop_basic_split() {
 fn test_split_reduceop_preserves_reduce_op() {
     let config = SplitReduceOpConfig::default();
 
-    for reduce_op in
-        [morok_ir::ReduceOp::Add, morok_ir::ReduceOp::Mul, morok_ir::ReduceOp::Max, morok_ir::ReduceOp::Min]
-    {
+    for reduce_op in [svod_ir::ReduceOp::Add, svod_ir::ReduceOp::Mul, svod_ir::ReduceOp::Max, svod_ir::ReduceOp::Min] {
         let tensor = create_test_tensor(&[100000]);
         let reduce = tensor.try_reduce_axis(reduce_op, vec![0]).unwrap();
 
@@ -170,7 +168,7 @@ fn test_split_reduceop_has_contiguous() {
     let config = SplitReduceOpConfig::default();
 
     let tensor = create_test_tensor(&[100000]);
-    let reduce = tensor.try_reduce_axis(morok_ir::ReduceOp::Add, vec![0]).unwrap();
+    let reduce = tensor.try_reduce_axis(svod_ir::ReduceOp::Add, vec![0]).unwrap();
 
     let result = split_reduceop(&reduce, &config);
     assert!(result.is_some(), "Should split large reduction");
@@ -189,7 +187,7 @@ fn test_split_reduceop_multidim_below_threshold() {
     // (1000, 1000) tensor, reduce on axis 1
     // Ratio: 1,000,000 / 1000 = 1000 < 32768, won't split
     let tensor = create_test_tensor(&[1000, 1000]);
-    let reduce = tensor.try_reduce_axis(morok_ir::ReduceOp::Add, vec![1]).unwrap();
+    let reduce = tensor.try_reduce_axis(svod_ir::ReduceOp::Add, vec![1]).unwrap();
 
     let result = split_reduceop(&reduce, &config);
     assert!(result.is_none(), "Should NOT split - ratio too low");
@@ -202,7 +200,7 @@ fn test_split_reduceop_multidim_above_threshold() {
     // (1000, 100000) tensor, reduce on axis 1
     // Ratio: 100,000,000 / 1000 = 100,000 > 32768
     let tensor = create_test_tensor(&[1000, 100000]);
-    let reduce = tensor.try_reduce_axis(morok_ir::ReduceOp::Add, vec![1]).unwrap();
+    let reduce = tensor.try_reduce_axis(svod_ir::ReduceOp::Add, vec![1]).unwrap();
 
     let result = split_reduceop(&reduce, &config);
     assert!(result.is_some(), "Should split large multidim reduction");
@@ -224,7 +222,7 @@ fn test_split_with_expand_detects_broadcast() {
     let config = SplitReduceOpConfig::default();
 
     // Create tensor: [100, 1, 1000] expanded to [100, 500, 1000]
-    use morok_ir::Op;
+    use svod_ir::Op;
     let buffer = UOp::new_buffer(DeviceSpec::Cpu, 100 * 1 * 1000, DType::Float32);
     let reshaped =
         buffer.try_reshape(&vec![SInt::Const(100), SInt::Const(1), SInt::Const(1000)].into_iter().collect()).unwrap();
@@ -237,7 +235,7 @@ fn test_split_with_expand_detects_broadcast() {
     // Total: 100 * 500 * 1000 = 50,000,000
     // After reduction: 100 * 1000 = 100,000
     // Ratio: 50,000,000 / 100,000 = 500 > 32,768 ✓
-    let reduce = expanded.try_reduce_axis(morok_ir::ReduceOp::Add, vec![1]).unwrap();
+    let reduce = expanded.try_reduce_axis(svod_ir::ReduceOp::Add, vec![1]).unwrap();
 
     // Attempt to split
     let result = split_reduceop(&reduce, &config);
@@ -261,7 +259,7 @@ fn test_split_with_nested_movement_ops() {
 
     // Expand to [50, 1000] (axis 1 broadcast)
     let expand_shape = UOp::vectorize(vec![UOp::index_const(50), UOp::index_const(1000)].into());
-    let expanded = UOp::new(morok_ir::Op::Expand { src: reshaped1, new_shape: expand_shape }, DType::Float32);
+    let expanded = UOp::new(svod_ir::Op::Expand { src: reshaped1, new_shape: expand_shape }, DType::Float32);
 
     // Reshape to [50000] (flatten)
     let reshaped2 = expanded.try_reshape(&vec![SInt::Const(50000)].into_iter().collect()).unwrap();
@@ -270,7 +268,7 @@ fn test_split_with_nested_movement_ops() {
     // Total: 50,000
     // After reduction: 1
     // Ratio: 50,000 / 1 = 50,000 > 32,768 ✓
-    let reduce = reshaped2.try_reduce_axis(morok_ir::ReduceOp::Add, vec![0]).unwrap();
+    let reduce = reshaped2.try_reduce_axis(svod_ir::ReduceOp::Add, vec![0]).unwrap();
 
     // Attempt to split
     let result = split_reduceop(&reduce, &config);
@@ -281,7 +279,7 @@ fn test_split_with_nested_movement_ops() {
 
     let transformed = result.unwrap();
     // Verify it has the expected structure (CONTIGUOUS in the middle)
-    let has_contiguous = transformed.toposort().iter().any(|node| matches!(node.op(), morok_ir::Op::Contiguous { .. }));
+    let has_contiguous = transformed.toposort().iter().any(|node| matches!(node.op(), svod_ir::Op::Contiguous { .. }));
     assert!(has_contiguous, "Split result should have CONTIGUOUS");
 }
 
@@ -298,13 +296,13 @@ fn test_split_skips_expanded_dimensions() {
 
     let expand_shape =
         UOp::vectorize(vec![UOp::index_const(100), UOp::index_const(50), UOp::index_const(100000)].into());
-    let expanded = UOp::new(morok_ir::Op::Expand { src: reshaped, new_shape: expand_shape }, DType::Float32);
+    let expanded = UOp::new(svod_ir::Op::Expand { src: reshaped, new_shape: expand_shape }, DType::Float32);
 
     // Reduce on axis 2
     // Total: 100 * 50 * 100000 = 500,000,000
     // After reduction: 100 * 50 = 5,000
     // Ratio: 500,000,000 / 5,000 = 100,000 > 32,768 ✓
-    let reduce = expanded.try_reduce_axis(morok_ir::ReduceOp::Add, vec![2]).unwrap();
+    let reduce = expanded.try_reduce_axis(svod_ir::ReduceOp::Add, vec![2]).unwrap();
 
     let result = split_reduceop(&reduce, &config);
 
@@ -314,6 +312,6 @@ fn test_split_skips_expanded_dimensions() {
 
     let transformed = result.unwrap();
     // Verify split happened
-    let has_contiguous = transformed.toposort().iter().any(|node| matches!(node.op(), morok_ir::Op::Contiguous { .. }));
+    let has_contiguous = transformed.toposort().iter().any(|node| matches!(node.op(), svod_ir::Op::Contiguous { .. }));
     assert!(has_contiguous, "Should have split successfully");
 }

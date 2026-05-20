@@ -6,7 +6,7 @@ sidebar_label: Execution Pipeline
 
 In most ML frameworks, computation happens immediately. Write `a + b` in PyTorch and it runs *now*—the GPU crunches numbers before you can even inspect the result. This eager execution is simple to understand, but it leaves optimization opportunities on the table. How can a compiler optimize a computation it hasn't seen yet?
 
-Morok takes the opposite approach: **lazy evaluation**. When you write `a.try_add(&b)?`, nothing computes. Morok builds a graph describing *what* to compute, not *when*. The magic happens when you call `realize()`—that single method triggers the entire compilation pipeline, from high-level tensor operations down to JIT-compiled machine code.
+Svod takes the opposite approach: **lazy evaluation**. When you write `a.try_add(&b)?`, nothing computes. Svod builds a graph describing *what* to compute, not *when*. The magic happens when you call `realize()`—that single method triggers the entire compilation pipeline, from high-level tensor operations down to JIT-compiled machine code.
 
 This chapter traces that journey.
 
@@ -50,7 +50,7 @@ Each box is a distinct phase. Let's walk through them.
 
 ## Lazy Evaluation: Building the Graph
 
-A `Tensor` in Morok is surprisingly lightweight:
+A `Tensor` in Svod is surprisingly lightweight:
 
 ```rust
 pub struct Tensor {
@@ -70,7 +70,7 @@ let a = Tensor::from_slice([1.0f32, 2.0, 3.0]);
 // `a.buffer` = Some(Arc<Buffer>) with actual data
 ```
 
-When you create a tensor from data, Morok allocates device memory and copies your bytes. The UOp graph contains a `BUFFER` node pointing to this allocation.
+When you create a tensor from data, Svod allocates device memory and copies your bytes. The UOp graph contains a `BUFFER` node pointing to this allocation.
 
 **2. Lazy operations** — no buffer, only graph:
 
@@ -91,7 +91,7 @@ Reshape, permute, and similar operations create new *views* of existing data. Th
 
 ### The Global Registry
 
-Morok maintains three global maps (lock-free, thread-safe):
+Svod maintains three global maps (lock-free, thread-safe):
 
 | Map | Key → Value | Purpose |
 |-----|-------------|---------|
@@ -281,7 +281,7 @@ Each group's kernels execute in parallel, then the next group starts.
 
 ## Code Generation: From UOp to LLVM IR
 
-With kernels scheduled, we generate actual code. Morok currently supports the LLVM backend:
+With kernels scheduled, we generate actual code. Svod currently supports the LLVM backend:
 
 | Backend | Compile Speed | Output Quality | Use Case |
 |---------|---------------|----------------|----------|
@@ -340,7 +340,7 @@ These passes transform the optimized AST into a form suitable for code generatio
 
 ### Backend Support
 
-Morok supports multiple code generation backends:
+Svod supports multiple code generation backends:
 
 | Backend | Output | Status |
 |---------|--------|--------|
@@ -535,7 +535,7 @@ Total: one function call, result ready.
 
 ## Comparison: How Other Frameworks Execute
 
-| Aspect | PyTorch | JAX | TVM | **Morok** |
+| Aspect | PyTorch | JAX | TVM | **Svod** |
 |--------|---------|-----|-----|-----------|
 | **Evaluation** | Eager (immediate) | Traced (jit decorator) | Lazy (te.compute) | Lazy (realize) |
 | **Graph capture** | torch.compile | jax.jit trace | Explicit schedule | Implicit via ops |
@@ -549,7 +549,7 @@ Total: one function call, result ready.
 
 **TVM**: Explicit separation of computation and schedule. Auto-scheduler searches for good schedules.
 
-**Morok**: Fully lazy—nothing executes until `realize()`. Hash consing provides automatic caching. Pattern-based optimization with optional beam search for production quality.
+**Svod**: Fully lazy—nothing executes until `realize()`. Hash consing provides automatic caching. Pattern-based optimization with optional beam search for production quality.
 
 ---
 

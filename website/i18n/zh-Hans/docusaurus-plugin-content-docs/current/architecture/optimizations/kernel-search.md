@@ -4,11 +4,11 @@ sidebar_label: 内核搜索
 
 # 内核优化搜索
 
-代数化简之后，每个内核需要*调度决策*：如何分块循环、在哪里并行化、是否使用 tensor core。Morok 提供两种策略：快速启发式和彻底的 beam 搜索。
+代数化简之后，每个内核需要*调度决策*：如何分块循环、在哪里并行化、是否使用 tensor core。Svod 提供两种策略：快速启发式和彻底的 beam 搜索。
 
 这在[代码生成流水线](../codegen/overview.md)的阶段 7 运行。
 
-Tinygrad 源码：`tinygrad/codegen/opt/`。Morok 源码：`schedule/src/optimizer/`。
+Tinygrad 源码：`tinygrad/codegen/opt/`。Svod 源码：`schedule/src/optimizer/`。
 
 ---
 
@@ -115,7 +115,7 @@ fn beam_search(scheduler: Scheduler, config: BeamConfig) -> Scheduler {
 
 ```bash
 # Disable optimization (debugging)
-MOROK_NOOPT=1 cargo run
+SVOD_NOOPT=1 cargo run
 
 # Enable beam search with width 8
 BEAM=8 cargo run
@@ -135,7 +135,7 @@ tensor.realize_with(config)?;
 
 ## 对比：其他编译器如何优化
 
-| 方面 | XLA | TVM/Ansor | Triton | **Morok** |
+| 方面 | XLA | TVM/Ansor | Triton | **Svod** |
 |--------|-----|-----------|--------|-----------|
 | **理念** | 固定启发式 | 基于搜索 | 程序员引导 | 基于模式 |
 | **融合** | 保守规则 | Tile-and-fuse | 块级别 | 图重写 |
@@ -150,4 +150,4 @@ tensor.realize_with(config)?;
 
 **Triton** 提供一个类 Python 的 DSL 来编写分块算法。在控制和自动化之间取得了良好平衡，但需要 GPU 编程专业知识。
 
-**Morok** 将优化表达为可组合的模式。Beam 搜索在需要时提供自动调优，结果按 AST 哈希缓存以供复用。
+**Svod** 将优化表达为可组合的模式。Beam 搜索在需要时提供自动调优，结果按 AST 哈希缓存以供复用。

@@ -93,7 +93,7 @@ impl Tensor {
     /// let result = nums.logical_not()?;  // [true, false, false]
     /// ```
     pub fn logical_not(&self) -> Result<Tensor> {
-        use morok_dtype::DType;
+        use svod_dtype::DType;
 
         // Cast to bool (non-zero becomes true)
         let as_bool = self.cast(DType::Bool)?;

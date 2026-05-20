@@ -6,17 +6,17 @@ use std::sync::Arc;
 
 use proptest::prelude::*;
 
-use morok_dtype::DType;
-use morok_ir::types::{BinaryOp, ConstValue};
-use morok_ir::uop::cached_property::CachedProperty;
-use morok_ir::uop::properties::VminVmaxProperty;
-use morok_ir::{Op, UOp};
+use svod_dtype::DType;
+use svod_ir::types::{BinaryOp, ConstValue};
+use svod_ir::uop::cached_property::CachedProperty;
+use svod_ir::uop::properties::VminVmaxProperty;
+use svod_ir::{Op, UOp};
 
 use crate::rewrite::graph_rewrite;
 use crate::symbolic::{symbolic, symbolic_simple};
 
 // Import generators from ir crate
-use morok_ir::test::property::generators::*;
+use svod_ir::test::property::generators::*;
 
 // ============================================================================
 // Identity Elimination Properties
@@ -606,7 +606,7 @@ proptest! {
 /// Evaluate a UOp expression tree by substituting variables with concrete values.
 /// Returns None if the expression can't be evaluated (e.g., contains unsupported ops).
 fn eval_uop(expr: &Arc<UOp>, vars: &std::collections::HashMap<String, i64>) -> Option<i64> {
-    use morok_ir::uop::eval::eval_binary_op;
+    use svod_ir::uop::eval::eval_binary_op;
     match expr.op() {
         Op::Const(cv) => match cv.0 {
             ConstValue::Int(v) => Some(v),
@@ -623,11 +623,11 @@ fn eval_uop(expr: &Arc<UOp>, vars: &std::collections::HashMap<String, i64>) -> O
                 _ => None,
             }
         }
-        Op::Ternary(morok_ir::TernaryOp::Where, cond, t, f) => {
+        Op::Ternary(svod_ir::TernaryOp::Where, cond, t, f) => {
             let cv = eval_uop(cond, vars)?;
             if cv != 0 { eval_uop(t, vars) } else { eval_uop(f, vars) }
         }
-        Op::Unary(morok_ir::UnaryOp::Not, x) => {
+        Op::Unary(svod_ir::UnaryOp::Not, x) => {
             let v = eval_uop(x, vars)?;
             Some(if v == 0 { 1 } else { 0 })
         }

@@ -4,7 +4,7 @@
 
 use std::f32::consts::{E, PI};
 
-use morok_dtype::DType;
+use svod_dtype::DType;
 
 use crate::UOp;
 

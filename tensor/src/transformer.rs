@@ -2,9 +2,9 @@
 
 use crate::Tensor;
 use bon::bon;
-use morok_dtype::DType;
-use morok_ir::ConstValue;
 use snafu::ensure;
+use svod_dtype::DType;
+use svod_ir::ConstValue;
 
 use crate::error::FloatDTypeRequiredSnafu;
 

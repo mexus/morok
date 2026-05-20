@@ -10,8 +10,8 @@
 
 use std::sync::Arc;
 
-use morok_dtype::DType;
-use morok_ir::{AddrSpace, AxisId, AxisType, BufferizeOpts, Op, SInt, UOp};
+use svod_dtype::DType;
+use svod_ir::{AddrSpace, AxisId, AxisType, BufferizeOpts, Op, SInt, UOp};
 use test_case::test_case;
 
 use crate::pattern::RewriteResult;
@@ -30,7 +30,7 @@ use crate::rewrite::graph_rewrite;
 /// converts Buffer → Param before buffer removal runs. This ensures buffer
 /// counting tests reflect actual behavior (Param is counted, Buffer is not).
 fn create_test_buffer(size: usize, dtype: DType, id: usize) -> Arc<UOp> {
-    let device = UOp::device(morok_device::DeviceSpec::Cpu);
+    let device = UOp::device(svod_device::DeviceSpec::Cpu);
     UOp::new(Op::Param { slot: id, size, device: Some(device) }, dtype.ptr(Some(size), AddrSpace::Global))
 }
 
@@ -166,14 +166,14 @@ fn create_reduce_graph(ctx: &mut IndexingContext, has_buffer_access: bool) -> (V
         // Create REDUCE operation that accesses the buffer
         // Op::Reduce takes: src, ranges (the reduce axes), reduce_op
         UOp::new(
-            Op::Reduce { src: indexed, ranges: vec![reduce_range].into(), reduce_op: morok_ir::ReduceOp::Add },
+            Op::Reduce { src: indexed, ranges: vec![reduce_range].into(), reduce_op: svod_ir::ReduceOp::Add },
             DType::Float32,
         )
     } else {
         // Create REDUCE without buffer access (just reduce a constant)
         let const_val = UOp::native_const(1.0f32);
         UOp::new(
-            Op::Reduce { src: const_val, ranges: vec![reduce_range].into(), reduce_op: morok_ir::ReduceOp::Add },
+            Op::Reduce { src: const_val, ranges: vec![reduce_range].into(), reduce_op: svod_ir::ReduceOp::Add },
             DType::Float32,
         )
     };
@@ -692,14 +692,14 @@ fn test_buffer_in_reduce_counts_runtime_buffer() {
     let mut ctx = IndexingContext::new();
     let loop_range = ctx.new_range(&SInt::Const(4), AxisType::Loop);
     let reduce_range = ctx.new_range(&SInt::Const(4), AxisType::Reduce);
-    let input = UOp::new_buffer(morok_device::DeviceSpec::Cpu, 16, DType::Float32);
+    let input = UOp::new_buffer(svod_device::DeviceSpec::Cpu, 16, DType::Float32);
     let indexed = UOp::index()
         .buffer(input)
         .indices(vec![loop_range.clone(), reduce_range.clone()])
         .call()
         .expect("runtime BUFFER index should construct");
     let reduced = UOp::new(
-        Op::Reduce { src: indexed, ranges: vec![reduce_range].into(), reduce_op: morok_ir::ReduceOp::Add },
+        Op::Reduce { src: indexed, ranges: vec![reduce_range].into(), reduce_op: svod_ir::ReduceOp::Add },
         DType::Float32,
     );
     let bufferized = UOp::bufferize(
@@ -770,12 +770,12 @@ fn test_multiple_reduces_with_buffer() {
 
     // Create nested REDUCE: reduce over axis1, then axis2
     let reduce1 = UOp::new(
-        Op::Reduce { src: indexed, ranges: vec![reduce_range1].into(), reduce_op: morok_ir::ReduceOp::Add },
+        Op::Reduce { src: indexed, ranges: vec![reduce_range1].into(), reduce_op: svod_ir::ReduceOp::Add },
         DType::Float32,
     );
 
     let reduce2 = UOp::new(
-        Op::Reduce { src: reduce1, ranges: vec![reduce_range2].into(), reduce_op: morok_ir::ReduceOp::Add },
+        Op::Reduce { src: reduce1, ranges: vec![reduce_range2].into(), reduce_op: svod_ir::ReduceOp::Add },
         DType::Float32,
     );
 
@@ -810,17 +810,13 @@ fn test_nested_reduce_with_buffer() {
     // Inner reduce (on the indexed buffer)
     let inner_reduce_range = ctx.new_range(&SInt::Const(5), AxisType::Reduce);
     let inner_reduce = UOp::new(
-        Op::Reduce {
-            src: indexed.clone(),
-            ranges: vec![inner_reduce_range].into(),
-            reduce_op: morok_ir::ReduceOp::Add,
-        },
+        Op::Reduce { src: indexed.clone(), ranges: vec![inner_reduce_range].into(), reduce_op: svod_ir::ReduceOp::Add },
         DType::Float32,
     );
 
     // Outer reduce (wraps inner reduce)
     let outer_reduce = UOp::new(
-        Op::Reduce { src: inner_reduce, ranges: vec![outer_reduce_range].into(), reduce_op: morok_ir::ReduceOp::Add },
+        Op::Reduce { src: inner_reduce, ranges: vec![outer_reduce_range].into(), reduce_op: svod_ir::ReduceOp::Add },
         DType::Float32,
     );
 
@@ -847,7 +843,7 @@ fn count_bufferizes(uop: &Arc<UOp>) -> usize {
     let mut visited = std::collections::HashSet::new();
 
     while let Some(current) = stack.pop() {
-        if !visited.insert(morok_ir::UOpKey(current.clone())) {
+        if !visited.insert(svod_ir::UOpKey(current.clone())) {
             continue;
         }
 
@@ -1034,7 +1030,7 @@ fn test_partial_contiguous_single_reduce() {
     // Create computation: REDUCE(INDEX(buffer, [loop, reduce]), [reduce])
     let indexed = UOp::index().buffer(buffer).indices(all_ranges.clone()).call().expect("Failed to create INDEX");
     let reduce = UOp::new(
-        Op::Reduce { src: indexed, ranges: vec![reduce_range.clone()].into(), reduce_op: morok_ir::ReduceOp::Add },
+        Op::Reduce { src: indexed, ranges: vec![reduce_range.clone()].into(), reduce_op: svod_ir::ReduceOp::Add },
         DType::Float32,
     );
 
@@ -1102,7 +1098,7 @@ fn test_partial_contiguous_mixed_axes() {
     // Create REDUCE accessing buffer
     let indexed = UOp::index().buffer(buffer).indices(all_ranges.clone()).call().expect("Failed to create INDEX");
     let reduce = UOp::new(
-        Op::Reduce { src: indexed, ranges: vec![reduce_range].into(), reduce_op: morok_ir::ReduceOp::Max },
+        Op::Reduce { src: indexed, ranges: vec![reduce_range].into(), reduce_op: svod_ir::ReduceOp::Max },
         DType::Float32,
     );
 
@@ -1123,7 +1119,7 @@ fn test_partial_contiguous_mixed_axes() {
 /// Should work correctly with Max, Mul, etc.
 #[test]
 fn test_partial_contiguous_different_reduce_ops() {
-    use morok_ir::ReduceOp;
+    use svod_ir::ReduceOp;
 
     for reduce_op in [ReduceOp::Add, ReduceOp::Max, ReduceOp::Mul] {
         let mut config = PcontigConfig::default();
@@ -1179,7 +1175,7 @@ fn test_partial_contiguous_multi_dimensional_reduce() {
         Op::Reduce {
             src: indexed,
             ranges: vec![reduce_range1, reduce_range2].into(),
-            reduce_op: morok_ir::ReduceOp::Add,
+            reduce_op: svod_ir::ReduceOp::Add,
         },
         DType::Float32,
     );
@@ -1226,7 +1222,7 @@ fn test_partial_contiguous_blocked_by_heuristics() {
 
     // Add reduce
     let reduce = UOp::new(
-        Op::Reduce { src: combined, ranges: vec![reduce_range].into(), reduce_op: morok_ir::ReduceOp::Add },
+        Op::Reduce { src: combined, ranges: vec![reduce_range].into(), reduce_op: svod_ir::ReduceOp::Add },
         DType::Float32,
     );
 
@@ -1394,7 +1390,7 @@ fn test_config_custom_max_buffers_threshold() {
 /// Uses REDUCE in compute to avoid cheap_inline pattern (REDUCE is not cheap).
 #[test]
 fn test_config_custom_ratio_threshold() {
-    use morok_ir::types::ReduceOp;
+    use svod_ir::types::ReduceOp;
 
     let matcher = buffer_removal_with_pcontig();
 
@@ -1509,8 +1505,8 @@ fn test_pipeline_integration_full_rangeify() {
     use crate::rangeify::rangeify;
 
     // Create a simple PERMUTE operation using a Buffer (pre-kernel pipeline uses Buffer, not codegen Param)
-    let src = UOp::new_buffer(morok_device::DeviceSpec::Cpu, 6, DType::Float32);
-    let reshaped = src.try_reshape(&smallvec::smallvec![morok_ir::SInt::Const(2), morok_ir::SInt::Const(3)]).unwrap();
+    let src = UOp::new_buffer(svod_device::DeviceSpec::Cpu, 6, DType::Float32);
+    let reshaped = src.try_reshape(&smallvec::smallvec![svod_ir::SInt::Const(2), svod_ir::SInt::Const(3)]).unwrap();
     let permute = reshaped.try_permute(vec![1, 0]).unwrap();
 
     // Run full rangeify pipeline (includes buffer removal at Step 7)
@@ -1846,7 +1842,7 @@ fn test_complex_multiple_sequential_reduces() {
         .call()
         .expect("Failed to create INDEX");
     let reduce1 = UOp::new(
-        Op::Reduce { src: indexed1, ranges: vec![reduce_range1].into(), reduce_op: morok_ir::ReduceOp::Add },
+        Op::Reduce { src: indexed1, ranges: vec![reduce_range1].into(), reduce_op: svod_ir::ReduceOp::Add },
         DType::Float32,
     );
 
@@ -1857,7 +1853,7 @@ fn test_complex_multiple_sequential_reduces() {
         .call()
         .expect("Failed to create INDEX");
     let reduce2 = UOp::new(
-        Op::Reduce { src: indexed2, ranges: vec![reduce_range2].into(), reduce_op: morok_ir::ReduceOp::Max },
+        Op::Reduce { src: indexed2, ranges: vec![reduce_range2].into(), reduce_op: svod_ir::ReduceOp::Max },
         DType::Float32,
     );
 

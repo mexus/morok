@@ -7,14 +7,14 @@ struct QueueProgram {
     calls: Arc<AtomicUsize>,
 }
 
-impl morok_device::Program for QueueProgram {
+impl svod_device::Program for QueueProgram {
     unsafe fn execute(
         &self,
         _buffers: &[*mut u8],
         _vals: &[i64],
         _global_size: Option<[usize; 3]>,
         _local_size: Option<[usize; 3]>,
-    ) -> morok_device::Result<()> {
+    ) -> svod_device::Result<()> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
@@ -57,7 +57,7 @@ fn test_cpu_queue_signal_is_not_dropped() {
 #[test]
 fn test_dyn_queue_wait_signal_are_forwarded() {
     let signal = CpuTimelineSignal::new();
-    let mut queue = morok_device::DynQueue::new(CpuQueue::new());
+    let mut queue = svod_device::DynQueue::new(CpuQueue::new());
 
     queue.signal(&signal, 11).wait(&signal, 11).submit().unwrap();
 

@@ -1,7 +1,7 @@
 use std::time::{Duration, Instant};
 
-use morok_device::Buffer;
 use snafu::ResultExt;
+use svod_device::Buffer;
 
 use crate::jit::{DeviceSnafu, JitError, Result};
 

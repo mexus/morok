@@ -145,7 +145,7 @@ devectorize 之后的向量结构（展示效果，不是精确的 UOp 结构）
 
 ```bash
 # See IR after each transformation
-MOROK_DEBUG=ir cargo test failing_test
+SVOD_DEBUG=ir cargo test failing_test
 ```
 
 ### 速查表
@@ -182,15 +182,15 @@ MOROK_DEBUG=ir cargo test failing_test
 
 ---
 
-## Tinygrad 与 Morok：架构差异
+## Tinygrad 与 Svod：架构差异
 
-本章描述的是基于 Tinygrad 实现的"理想" 22 阶段流水线。Morok 目前紧密遵循此设计，差异极小。
+本章描述的是基于 Tinygrad 实现的"理想" 22 阶段流水线。Svod 目前紧密遵循此设计，差异极小。
 
 ### 剩余的架构差异
 
-| 阶段 | Tinygrad | Morok | 备注 |
+| 阶段 | Tinygrad | Svod | 备注 |
 |------|----------|-------|------|
-| 1: 早期移动操作 | 通过 3 个特定模式将移动操作穿过 AFTER/END 包装器（INDEX、AFTER、END 上的移动） | 在 bufferization 期间移除移动操作 | 两种方法功能等价；Morok 的方法更简洁 |
+| 1: 早期移动操作 | 通过 3 个特定模式将移动操作穿过 AFTER/END 包装器（INDEX、AFTER、END 上的移动） | 在 bufferization 期间移除移动操作 | 两种方法功能等价；Svod 的方法更简洁 |
 
 ### 已对齐的阶段（此前不同）
 
@@ -198,22 +198,22 @@ MOROK_DEBUG=ir cargo test failing_test
 
 | 阶段 | 变更内容 |
 |------|----------|
-| 15: Index DType 降低 | Morok 现在有 `pm_lower_index_dtype()`，完整覆盖：Binary 操作、CONST、WHERE、VECTORIZE、SPECIAL、DEFINE_VAR、RANGE、CAST 清理 |
+| 15: Index DType 降低 | Svod 现在有 `pm_lower_index_dtype()`，完整覆盖：Binary 操作、CONST、WHERE、VECTORIZE、SPECIAL、DEFINE_VAR、RANGE、CAST 清理 |
 | 18: 分解 | 新增：`fast_division_patterns()`、`pm_div_to_shr()`、`pm_fdiv_to_mul()`、`pm_comparison_negations()`、德摩根定律 |
 | 19: 最终重写 | `pm_render()` 从 codegen 移到 schedule 流水线的 Stage 19 |
 
 ### 仅 Tinygrad 的模式
 
-Morok 有意不实现以下 Tinygrad 特有模式：
+Svod 有意不实现以下 Tinygrad 特有模式：
 
-| 模式 | 用途 | Morok 为何不需要 |
+| 模式 | 用途 | Svod 为何不需要 |
 |------|------|-----------------|
-| `to_bufferview` | 避免 DISK/TINYFS 设备的磁盘 buffer 复制 | Morok 不支持 DISK/TINYFS；内存后端不需要 |
-| AFTER/END 移动模式 | 将移动操作穿过时序包装器 | Morok 在 bufferization 期间直接移除移动操作 |
+| `to_bufferview` | 避免 DISK/TINYFS 设备的磁盘 buffer 复制 | Svod 不支持 DISK/TINYFS；内存后端不需要 |
+| AFTER/END 移动模式 | 将移动操作穿过时序包装器 | Svod 在 bufferization 期间直接移除移动操作 |
 
-### Morok 增强
+### Svod 增强
 
-Morok 有一些 Tinygrad 没有的模式/增强：
+Svod 有一些 Tinygrad 没有的模式/增强：
 
 | 增强 | 位置 | 用途 |
 |------|------|------|

@@ -1,19 +1,19 @@
 //! Device factory registry for runtime device creation and caching.
 //!
 //! This module provides a registry for full Device objects (renderer + compiler + runtime + allocator).
-//! It's separate from `morok_device::registry::DeviceRegistry` (which only manages allocators)
+//! It's separate from `svod_device::registry::DeviceRegistry` (which only manages allocators)
 //! to avoid circular dependencies between `device` and `runtime` crates.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use morok_device::Result as DeviceResult;
-use morok_device::device::Device;
-use morok_device::registry::DeviceRegistry;
-use morok_dtype::DeviceSpec;
 use once_cell::sync::Lazy;
 use parking_lot::RwLock;
 use snafu::ResultExt;
+use svod_device::Result as DeviceResult;
+use svod_device::device::Device;
+use svod_device::registry::DeviceRegistry;
+use svod_dtype::DeviceSpec;
 
 use crate::error::{DeviceSnafu, Result, UnsupportedDeviceSnafu};
 
@@ -22,7 +22,7 @@ use crate::error::{DeviceSnafu, Result, UnsupportedDeviceSnafu};
 /// The factory receives both the device specification and the allocator registry,
 /// allowing it to obtain the correct allocator for the device.
 ///
-/// Returns `DeviceResult<Device>` (from morok_device) since device creation
+/// Returns `DeviceResult<Device>` (from svod_device) since device creation
 /// errors come from the device crate.
 pub type DeviceFactory = Arc<dyn Fn(&DeviceSpec, &DeviceRegistry) -> DeviceResult<Device> + Send + Sync>;
 
@@ -39,7 +39,7 @@ pub type DeviceFactory = Arc<dyn Fn(&DeviceSpec, &DeviceRegistry) -> DeviceResul
 ///
 /// ```ignore
 /// // Get a device (creates if not cached)
-/// let alloc_registry = morok_device::registry::registry();
+/// let alloc_registry = svod_device::registry::registry();
 /// let device = DEVICE_FACTORIES.device(&DeviceSpec::Cpu, alloc_registry)?;
 ///
 /// // Register a custom factory
@@ -141,7 +141,7 @@ impl Default for DeviceFactoryRegistry {
 /// # Example
 ///
 /// ```ignore
-/// let device = morok_runtime::DEVICE_FACTORIES
-///     .device(&DeviceSpec::Cpu, morok_device::registry::registry())?;
+/// let device = svod_runtime::DEVICE_FACTORIES
+///     .device(&DeviceSpec::Cpu, svod_device::registry::registry())?;
 /// ```
 pub static DEVICE_FACTORIES: Lazy<DeviceFactoryRegistry> = Lazy::new(DeviceFactoryRegistry::new);

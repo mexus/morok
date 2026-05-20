@@ -7,11 +7,11 @@
 //!
 //! [`VadInference::probs`] exposes the raw per-chunk probability array (one
 //! entry per [`NUM_SAMPLES`] samples). [`VadInference::segment`] feeds those
-//! into [`morok_arch::vad::chunks_from_probs`] to produce sample ranges
-//! suitable for long-form ASR — see the `morok-arch::vad` module for
+//! into [`svod_arch::vad::chunks_from_probs`] to produce sample ranges
+//! suitable for long-form ASR — see the `svod-arch::vad` module for
 //! tunable knobs (min/max chunk duration, alignment, padding, etc.).
 
-extern crate self as morok_model;
+extern crate self as svod_model;
 
 mod splitter;
 
@@ -19,11 +19,11 @@ pub use splitter::{SileroVadSplitter, SileroVadSplitterError};
 
 use std::path::Path;
 
-use morok_dtype::DType;
-use morok_macros::jit_wrapper;
-use morok_tensor::Tensor;
-use morok_tensor::nn::{Conv1d, LSTMCell, Layer, PadMode};
 use snafu::{ResultExt, Snafu};
+use svod_dtype::DType;
+use svod_macros::jit_wrapper;
+use svod_tensor::Tensor;
+use svod_tensor::nn::{Conv1d, LSTMCell, Layer, PadMode};
 
 use crate::init::fan_in_uniform;
 use crate::state;
@@ -33,8 +33,8 @@ use crate::state;
 pub enum Error {
     #[snafu(display("{source}"))]
     Tensor {
-        #[snafu(source(from(morok_tensor::error::Error, Box::new)))]
-        source: Box<morok_tensor::error::Error>,
+        #[snafu(source(from(svod_tensor::error::Error, Box::new)))]
+        source: Box<svod_tensor::error::Error>,
     },
     #[snafu(display("{source}"))]
     State {
@@ -48,7 +48,7 @@ pub enum Error {
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// Number of input samples covered by one VAD probability entry. Exposed so
-/// callers can build [`morok_arch::vad::ChunkerOpts`] with the right
+/// callers can build [`svod_arch::vad::ChunkerOpts`] with the right
 /// `samples_per_prob`.
 pub const NUM_SAMPLES: usize = 512;
 pub(crate) const CONTEXT_SIZE: usize = 64;
@@ -219,7 +219,7 @@ impl crate::jit::RecurrentJit for SileroVadJit {
         self.execute()
     }
 
-    fn output_buffer(&self) -> crate::jit::Result<&morok_device::Buffer> {
+    fn output_buffer(&self) -> crate::jit::Result<&svod_device::Buffer> {
         self.output()
     }
 }
@@ -273,18 +273,18 @@ impl VadInference {
     }
 
     /// Convenience wrapper around [`Self::probs`] +
-    /// [`morok_arch::vad::chunks_from_probs`] with default chunker knobs and
+    /// [`svod_arch::vad::chunks_from_probs`] with default chunker knobs and
     /// the given `threshold`. Errors from the JIT or chunker are swallowed —
     /// callers that need fault-visibility should drive `probs()` and
     /// `chunks_from_probs` directly.
     pub fn segment(&mut self, waveform: &[f32], threshold: f32) -> Vec<(usize, usize)> {
         let Ok(probs) = self.probs(waveform) else { return Vec::new() };
-        let opts = morok_arch::vad::ChunkerOpts {
+        let opts = svod_arch::vad::ChunkerOpts {
             threshold,
             samples_per_prob: NUM_SAMPLES,
-            ..morok_arch::vad::ChunkerOpts::default()
+            ..svod_arch::vad::ChunkerOpts::default()
         };
-        morok_arch::vad::chunks_from_probs(&probs, &opts)
+        svod_arch::vad::chunks_from_probs(&probs, &opts)
             .unwrap_or_default()
             .into_iter()
             .map(|c| (c.start_sample, c.end_sample))

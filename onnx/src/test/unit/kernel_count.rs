@@ -4,8 +4,8 @@
 
 use std::path::Path;
 
-use morok_dtype::{DType, ScalarDType};
-use morok_tensor::{CpuBackend, PrepareConfig, Tensor};
+use svod_dtype::{DType, ScalarDType};
+use svod_tensor::{CpuBackend, PrepareConfig, Tensor};
 
 use crate::importer::OnnxImporter;
 
@@ -35,7 +35,7 @@ fn count_kernels(model_path: &Path) -> usize {
 }
 
 /// Tinygrad produces 58 kernels (1 is input preprocessing).
-/// Morok: 57 (input assigned directly, no preprocessing kernel).
+/// Svod: 57 (input assigned directly, no preprocessing kernel).
 ///
 /// ```sh
 /// curl -L -o /tmp/inception-v2-9.onnx \

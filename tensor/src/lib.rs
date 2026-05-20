@@ -2,12 +2,12 @@ use bon::bon;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use morok_device::Buffer;
-use morok_dtype::DType;
-use morok_dtype::ext::HasDType;
-use morok_ir::{CallInfo, ConstValue, ConstValueHash, DeviceSpec, Op, SInt, UOp, UOpKey, shape::Shape};
 use smallvec::smallvec;
 use snafu::ResultExt;
+use svod_device::Buffer;
+use svod_dtype::DType;
+use svod_dtype::ext::HasDType;
+use svod_ir::{CallInfo, ConstValue, ConstValueHash, DeviceSpec, Op, SInt, UOp, UOpKey, shape::Shape};
 
 /// Extract max value from an SInt for buffer allocation.
 ///
@@ -70,7 +70,7 @@ pub mod variable;
 
 // Re-export for public API
 pub use config::PrepareConfig;
-pub use morok_runtime::CpuBackend;
+pub use svod_runtime::CpuBackend;
 pub use tensor_registry::apply_map_to_tensors;
 pub use variable::{BoundVariable, Variable};
 
@@ -140,7 +140,7 @@ pub struct KernelInfo {
 /// # Examples
 ///
 /// ```
-/// # use morok_tensor::Tensor;
+/// # use svod_tensor::Tensor;
 /// let a = Tensor::from_slice(&[1.0f32, 2.0, 3.0]);
 /// let b = Tensor::from_slice(&[4.0f32, 5.0, 6.0]);
 /// let mut c = &a + &b;  // Lazy - only builds UOp graph
@@ -184,9 +184,8 @@ impl Tensor {
         let canonical = path
             .canonicalize()
             .map_err(|e| Error::IrConstruction { details: format!("DISK: {}: {e}", path.display()) })?;
-        let device = morok_dtype::DeviceSpec::Disk { path: canonical };
-        let buffer_uop =
-            UOp::new_buffer(device, file_size, morok_dtype::DType::Scalar(morok_dtype::ScalarDType::UInt8));
+        let device = svod_dtype::DeviceSpec::Disk { path: canonical };
+        let buffer_uop = UOp::new_buffer(device, file_size, svod_dtype::DType::Scalar(svod_dtype::ScalarDType::UInt8));
         Ok(Self::new(buffer_uop))
     }
 
@@ -291,8 +290,8 @@ impl Tensor {
     /// # Example
     ///
     /// ```ignore
-    /// use morok_tensor::{Tensor, Variable};
-    /// use morok_dtype::DType;
+    /// use svod_tensor::{Tensor, Variable};
+    /// use svod_dtype::DType;
     ///
     /// let batch = Variable::new("batch", 1, 32);
     /// let x = Tensor::full_dynamic(&[batch.bind(16)?.into(), 784.into()], 0.0, DType::Float32)?;
@@ -538,7 +537,7 @@ impl Tensor {
     /// let t = Tensor::from_slice(&[1.0f32, 2.0, 3.0]);
     /// let t_int = t.cast(DType::Int32)?;
     /// ```
-    pub fn cast(&self, dtype: morok_dtype::DType) -> Result<Self> {
+    pub fn cast(&self, dtype: svod_dtype::DType) -> Result<Self> {
         let casted = self.uop().cast(dtype);
         Ok(Self::new(casted))
     }
@@ -581,7 +580,7 @@ impl Tensor {
     /// - source and destination are both scalar (vector dtypes unsupported);
     /// - `(shape[-1] * src_size)` divides evenly by `dst_size`;
     /// - the last shape dim is concrete (not symbolic).
-    pub fn bitcast(&self, dtype: morok_dtype::DType) -> Result<Self> {
+    pub fn bitcast(&self, dtype: svod_dtype::DType) -> Result<Self> {
         let src_dt = self.uop().dtype();
         let src_scalar = src_dt.scalar().ok_or_else(|| Error::SymbolicShapeUnsupported {
             operation: "bitcast: non-scalar source dtype".to_string(),
@@ -620,7 +619,7 @@ impl Tensor {
             // Combine `rate` source words into one dst word: shift each by
             // `8*i*src_size`, OR them, squeeze the trailing axis.
             let rate = dst_size / src_size;
-            let mut new_shape: Vec<isize> = morok_ir::shape::to_vec_isize(&shape).context(UOpSnafu)?;
+            let mut new_shape: Vec<isize> = svod_ir::shape::to_vec_isize(&shape).context(UOpSnafu)?;
             let last_idx = new_shape.len() - 1;
             new_shape[last_idx] = (last_dim / rate) as isize;
             new_shape.push(rate as isize);
@@ -639,7 +638,7 @@ impl Tensor {
                     widened
                 } else {
                     let shift_t = Tensor::full(
-                        &morok_ir::shape::to_vec_usize(&widened.shape()?).context(UOpSnafu)?,
+                        &svod_ir::shape::to_vec_usize(&widened.shape()?).context(UOpSnafu)?,
                         ConstValue::UInt(shift_amount as u64),
                         dst_uint.clone(),
                     )?;
@@ -664,7 +663,7 @@ impl Tensor {
                     tmp.clone()
                 } else {
                     let shift_t = Tensor::full(
-                        &morok_ir::shape::to_vec_usize(&tmp.shape()?).context(UOpSnafu)?,
+                        &svod_ir::shape::to_vec_usize(&tmp.shape()?).context(UOpSnafu)?,
                         ConstValue::UInt(shift_amount as u64),
                         src_uint.clone(),
                     )?;
@@ -677,7 +676,7 @@ impl Tensor {
             // Collapse trailing two axes (... × last × rate) → (... × last*rate).
             let stacked_shape = stacked.shape()?;
             let nd = stacked_shape.len();
-            let mut new_shape: Vec<isize> = morok_ir::shape::to_vec_isize(&stacked_shape).context(UOpSnafu)?;
+            let mut new_shape: Vec<isize> = svod_ir::shape::to_vec_isize(&stacked_shape).context(UOpSnafu)?;
             let trailing = new_shape[nd - 2] * new_shape[nd - 1];
             new_shape.truncate(nd - 2);
             new_shape.push(trailing);
@@ -690,8 +689,8 @@ impl Tensor {
     }
 }
 
-fn uint_for_bytes(n: usize) -> morok_dtype::ScalarDType {
-    use morok_dtype::ScalarDType;
+fn uint_for_bytes(n: usize) -> svod_dtype::ScalarDType {
+    use svod_dtype::ScalarDType;
     match n {
         1 => ScalarDType::UInt8,
         2 => ScalarDType::UInt16,
@@ -719,7 +718,7 @@ impl Tensor {
         let target_uop = self.uop();
         if self.device().is_disk() {
             return Err(Error::IrConstruction {
-                details: "assign to DISK tensors is not supported by Morok runtime".to_string(),
+                details: "assign to DISK tensors is not supported by Svod runtime".to_string(),
             });
         }
 
@@ -791,7 +790,7 @@ impl Tensor {
     /// ```
     pub fn contiguous(&self) -> Self {
         let uop = self.uop();
-        if matches!(uop.op(), morok_ir::Op::Contiguous { .. }) {
+        if matches!(uop.op(), svod_ir::Op::Contiguous { .. }) {
             return self.clone();
         }
         let contiguous_uop = uop.contiguous();

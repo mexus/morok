@@ -34,9 +34,9 @@ Moving validity into INDEX enables better load combining and vectorization.
 
 **Note**: This pattern only matches when the alternative value is `0`. The transformation involves complex clause analysis: duplicate detection, range dependency checks, and data-dependent load verification.
 
-**Note**: The Morok implementation uses `gate=` instead of `valid=` (the Index struct has a `gate` field). The concept is identical.
+**Note**: The Svod implementation uses `gate=` instead of `valid=` (the Index struct has a `gate` field). The concept is identical.
 
-**Morok**: `pm_move_where_on_load()` in `symbolic/patterns.rs`
+**Svod**: `pm_move_where_on_load()` in `symbolic/patterns.rs`
 
 ---
 
@@ -54,7 +54,7 @@ Moving validity into INDEX enables better load combining and vectorization.
 
 **Pattern**: `symbolic_simple() + pm_pre_expander + pm_group_for_reduce + expander`
 
-Note: Morok uses `symbolic_simple()` (not `sym`) at this stage since `symbolic()` already ran at Stage 4. Tinygrad uses `sym` which includes additional patterns.
+Note: Svod uses `symbolic_simple()` (not `sym`) at this stage since `symbolic()` already ran at Stage 4. Tinygrad uses `sym` which includes additional patterns.
 
 ⚠️ **Important: Pattern Precedence**
 
@@ -143,7 +143,7 @@ REDUCE(src, [range(GROUP_REDUCE)])
 
 This enables efficient tensor core accumulation via shared memory.
 
-**Morok**: `expand.rs`
+**Svod**: `expand.rs`
 
 ---
 
@@ -171,4 +171,4 @@ The compiler moves frequently-accessed data to local buffers, similar to keeping
 | Strip CONTIGUOUS wrapper | Remove optimization hints before codegen |
 | NOOP removal | Clean up no-op operations |
 
-**Morok**: `rangeify/patterns.rs`, `rangeify/transforms.rs`, `optimizer/mod.rs`
+**Svod**: `rangeify/patterns.rs`, `rangeify/transforms.rs`, `optimizer/mod.rs`

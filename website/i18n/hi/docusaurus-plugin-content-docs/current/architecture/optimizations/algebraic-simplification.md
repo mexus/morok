@@ -4,7 +4,7 @@ sidebar_label: अल्जेब्रिक सिम्प्लिफ़ि�
 
 # अल्जेब्रिक सिम्प्लिफ़िकेशन पैटर्न
 
-Morok का symbolic simplifier UOp computation graphs को 140+ अल्जेब्रिक पैटर्न से रीराइट करता है, जो `schedule/src/symbolic/patterns.rs` में डिफ़ाइन हैं। ये पैटर्न पाइपलाइन में कई जगह फ़ायर होते हैं:
+Svod का symbolic simplifier UOp computation graphs को 140+ अल्जेब्रिक पैटर्न से रीराइट करता है, जो `schedule/src/symbolic/patterns.rs` में डिफ़ाइन हैं। ये पैटर्न पाइपलाइन में कई जगह फ़ायर होते हैं:
 
 | कहाँ | Matcher | Context |
 |------|---------|---------|
@@ -242,7 +242,7 @@ Constant pushing index extraction के लिए ज़रूरी है। 
 |--------|--------|-------|
 | `SUB(a, SUB(b, x))` | `ADD(x, SUB(a, b))` | Inner variable expose करे |
 
-Morok `SUB` को first-class IR op रखता है (Tinygrad से अलग जो `a-b` को `ADD(a, NEG(b))` में canonicalize करता है)। यह पैटर्न ensure करता है कि nested `SUB` आगे की simplification ब्लॉक न करें।
+Svod `SUB` को first-class IR op रखता है (Tinygrad से अलग जो `a-b` को `ADD(a, NEG(b))` में canonicalize करता है)। यह पैटर्न ensure करता है कि nested `SUB` आगे की simplification ब्लॉक न करें।
 
 ---
 
@@ -309,7 +309,7 @@ Self-comparison पैटर्न `!x.dtype().is_float()` से guarded है
 | `MAX(x, y)` | `x` | जब `x.vmin >= y.vmax` (bounds dominance prove करते हैं) |
 | `MAX(x, y)` | `y` | जब `y.vmin >= x.vmax` |
 
-Range analysis के लिए `VminVmaxProperty` इस्तेमाल करता है। अलग `MIN` पैटर्न नहीं — Morok `MIN(a,b)` को `NEG(MAX(NEG(a), NEG(b)))` में lower करता है इन पैटर्न से पहले।
+Range analysis के लिए `VminVmaxProperty` इस्तेमाल करता है। अलग `MIN` पैटर्न नहीं — Svod `MIN(a,b)` को `NEG(MAX(NEG(a), NEG(b)))` में lower करता है इन पैटर्न से पहले।
 
 ---
 
@@ -344,7 +344,7 @@ Tinygrad में भी यही गार्ड है: `symbolic.py:201-202
 
 ## 13. Invalid Propagation
 
-Invalid Morok का sentinel है out-of-bounds tensor regions के लिए जो padding operations बनाती हैं। ये पैटर्न identity पैटर्न जैसे `x*0=0` से **पहले** चलने चाहिए, वरना validity markers destroy हो जाते हैं।
+Invalid Svod का sentinel है out-of-bounds tensor regions के लिए जो padding operations बनाती हैं। ये पैटर्न identity पैटर्न जैसे `x*0=0` से **पहले** चलने चाहिए, वरना validity markers destroy हो जाते हैं।
 
 ### पैटर्न प्रायोरिटी Example
 

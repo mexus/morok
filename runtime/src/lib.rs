@@ -1,4 +1,4 @@
-//! Runtime execution for morok kernels.
+//! Runtime execution for svod kernels.
 //!
 //! Provides generic kernel execution interface with backend-specific implementations
 //! (LLVM JIT, native shared libraries, CUDA, etc.).

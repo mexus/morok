@@ -9,9 +9,9 @@
 
 use std::sync::Arc;
 
-use morok_dtype::{AddrSpace, DType, DeviceSpec, ImageKind};
-use morok_ir::types::ConstValue;
-use morok_ir::{Op, UOp};
+use svod_dtype::{AddrSpace, DType, DeviceSpec, ImageKind};
+use svod_ir::types::ConstValue;
+use svod_ir::{Op, UOp};
 
 use super::helpers::*;
 
@@ -325,8 +325,8 @@ fn test_image_fixup_preserves_nonzero_alt() {
 /// Test: Split preserves ranges in STORE.
 #[test]
 fn test_split_preserves_ranges() {
-    use morok_ir::AxisId;
     use smallvec::smallvec;
+    use svod_ir::AxisId;
 
     let buffer = create_buffer(128);
     let value = create_vector_float_iota(8);
@@ -340,7 +340,7 @@ fn test_split_preserves_ranges() {
         Op::Range {
             end: UOp::const_(DType::Index, ConstValue::Int(10)),
             axis_id: AxisId::Renumbered(0),
-            axis_type: morok_ir::AxisType::Loop,
+            axis_type: svod_ir::AxisType::Loop,
             deps: smallvec::SmallVec::new(),
         },
         DType::Index,

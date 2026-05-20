@@ -197,7 +197,7 @@ fn test_extract_uint32_from_uint64_data() {
 fn test_external_data_loading() {
     use std::io::Write;
 
-    let dir = std::env::temp_dir().join("morok_test_external_data");
+    let dir = std::env::temp_dir().join("svod_test_external_data");
     std::fs::create_dir_all(&dir).unwrap();
 
     let values: Vec<f32> = vec![1.0, 2.0, 3.0];
@@ -226,7 +226,7 @@ fn test_external_data_loading() {
 fn test_external_data_with_offset() {
     use std::io::Write;
 
-    let dir = std::env::temp_dir().join("morok_test_external_offset");
+    let dir = std::env::temp_dir().join("svod_test_external_offset");
     std::fs::create_dir_all(&dir).unwrap();
 
     let padding = vec![0u8; 8];

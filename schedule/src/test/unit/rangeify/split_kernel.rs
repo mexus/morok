@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
-use morok_dtype::{DType, DeviceSpec};
-use morok_ir::{AxisId, AxisType, ConstValue, Op, UOp};
 use smallvec::smallvec;
+use svod_dtype::{DType, DeviceSpec};
+use svod_ir::{AxisId, AxisType, ConstValue, Op, UOp};
 
 use super::helpers::extract_kernel;
 use crate::rangeify::kernel::{split_store, try_get_kernel_graph};

@@ -4,9 +4,9 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use morok_dtype::DType;
-use morok_dtype::DeviceSpec;
 use smallvec::smallvec;
+use svod_dtype::DType;
+use svod_dtype::DeviceSpec;
 
 use crate::pattern::{Matcher, RewriteResult};
 use crate::{AxisId, CallInfo, ConstValue, Op, SInt, UOp, UOpKey, shape::Shape}; // ConstValue kept for DType::Index
@@ -510,7 +510,7 @@ fn test_function_constructor_with_sources_shape_and_hash() {
 
 #[test]
 fn test_tuple_constructor_void_dtype() {
-    use morok_ir::Op;
+    use svod_ir::Op;
     let a = UOp::native_const(1.0f32);
     let b = UOp::native_const(2i32);
     let t = UOp::tuple(smallvec![a.clone(), b.clone()]);

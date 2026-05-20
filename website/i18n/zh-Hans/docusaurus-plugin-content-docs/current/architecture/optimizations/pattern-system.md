@@ -7,10 +7,10 @@ sidebar_position: 0
 
 打开任何一个生产级 ML 编译器，你会发现几十个优化 pass：常量折叠、死代码消除、算子融合、循环分块、向量化、内存布局优化。每个 pass 都有自己的数据结构、遍历逻辑和 bug。
 
-Morok 采用了不同的方案：**一种机制搞定一切**。
+Svod 采用了不同的方案：**一种机制搞定一切**。
 
 ```text
-Traditional Compiler:              Morok:
+Traditional Compiler:              Svod:
 ┌─────────────────────────┐       ┌─────────────────────────┐
 │  Constant Folding       │       │                         │
 │  Dead Code Elimination  │       │   patterns! {           │
@@ -24,13 +24,13 @@ Traditional Compiler:              Morok:
                                        One mechanism
 ```
 
-Morok 中的每一项优化都表达为一个**模式**："当你看到这种结构，就替换为那种结构。"同一个 `graph_rewrite()` 函数负责[代数化简](./algebraic-simplification.md)、[索引算术](./index-arithmetic.md)、[强度削减](./strength-reduction.md)和 [Range 优化](./range-optimization.md)。
+Svod 中的每一项优化都表达为一个**模式**："当你看到这种结构，就替换为那种结构。"同一个 `graph_rewrite()` 函数负责[代数化简](./algebraic-simplification.md)、[索引算术](./index-arithmetic.md)、[强度削减](./strength-reduction.md)和 [Range 优化](./range-optimization.md)。
 
 ---
 
 ## `patterns!` DSL
 
-Morok 提供了一种领域特定语言来编写优化模式：
+Svod 提供了一种领域特定语言来编写优化模式：
 
 ```rust
 patterns! {

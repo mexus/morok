@@ -24,10 +24,10 @@ fn test_build_linear_index() {
 
 #[test]
 fn test_extract_index_dimension_range() {
-    use morok_ir::AxisId;
+    use svod_ir::AxisId;
     // Create a RANGE with size 10
     let end = UOp::index_const(10);
-    let range = UOp::range_axis(end, AxisId::Renumbered(0), morok_ir::AxisType::Loop);
+    let range = UOp::range_axis(end, AxisId::Renumbered(0), svod_ir::AxisType::Loop);
 
     let dim = extract_index_dimension(&range);
     assert_eq!(dim, Some(10));
@@ -35,11 +35,11 @@ fn test_extract_index_dimension_range() {
 
 #[test]
 fn test_extract_index_dimension_complex_expression() {
-    use morok_ir::AxisId;
+    use svod_ir::AxisId;
     // Create Add(Mul(Range(4), stride), Range(8))
     // Should multiply all range sizes: 4 * 8 = 32
-    let r1 = UOp::range_axis(UOp::index_const(4), AxisId::Renumbered(0), morok_ir::AxisType::Loop);
-    let r2 = UOp::range_axis(UOp::index_const(8), AxisId::Renumbered(1), morok_ir::AxisType::Loop);
+    let r1 = UOp::range_axis(UOp::index_const(4), AxisId::Renumbered(0), svod_ir::AxisType::Loop);
+    let r2 = UOp::range_axis(UOp::index_const(8), AxisId::Renumbered(1), svod_ir::AxisType::Loop);
     let stride = UOp::index_const(8);
     let mul = UOp::new(Op::Binary(BinaryOp::Mul, r1, stride), DType::Index);
     let add = UOp::new(Op::Binary(BinaryOp::Add, mul, r2), DType::Index);

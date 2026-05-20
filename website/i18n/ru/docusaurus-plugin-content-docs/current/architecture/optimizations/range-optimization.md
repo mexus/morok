@@ -34,7 +34,7 @@ After:   RANGE(end=3) * 4 + RANGE(end=4)
 
 **Защита**: Срабатывает только при `end % c == 0` (точная делимость). Неделимые случаи остаются без изменений.
 
-Tinygrad: `simplify.py:60-64`. Morok: `pm_split_ranges()` в `rangeify/transforms.rs`.
+Tinygrad: `simplify.py:60-64`. Svod: `pm_split_ranges()` в `rangeify/transforms.rs`.
 
 ---
 
@@ -59,7 +59,7 @@ After:   RANGE(0..32)                 One loop, indices via divmod
 - Область REDUCE должна оставаться согласованной
 - Оба диапазона должны присутствовать в одних и тех же областях REDUCE
 
-Tinygrad: `simplify.py:39-41` (`simplify_merge_adjacent`). Morok: `pm_simplify_ranges()`.
+Tinygrad: `simplify.py:39-41` (`simplify_merge_adjacent`). Svod: `pm_simplify_ranges()`.
 
 ---
 
@@ -74,7 +74,7 @@ After:   END(comp, [r0, r1, r2])
 
 **Зачем**: Вложенные цепочки END возникают из последовательных преобразований. Выравнивание нормализует структуру, чтобы другие паттерны (слияние, разбиение) могли работать с чистым списком диапазонов.
 
-Tinygrad: `simplify.py:14-17`. Morok: `pm_flatten_range()`.
+Tinygrad: `simplify.py:14-17`. Svod: `pm_flatten_range()`.
 
 ---
 
@@ -95,7 +95,7 @@ After:   clamp(64 - length, 0, 64)                // Arithmetic: 3 ops
 
 Это самая мощная одиночная оптимизация — она может устранить целые циклы редукции, преобразуя O(N) вычислений в O(1).
 
-Tinygrad: `simplify.py:145-149`. Morok: `pm_load_collapse()`.
+Tinygrad: `simplify.py:145-149`. Svod: `pm_load_collapse()`.
 
 ---
 
@@ -134,7 +134,7 @@ Tinygrad: `simplify.py:145-149`. Morok: `pm_load_collapse()`.
 
 `x * bool.cast() → WHERE(bool, x, 0)` — преобразует умножение на приведённый bool в WHERE, который затем может быть проанализирован паттернами границ.
 
-Tinygrad: `simplify.py:82-142`. Morok: `pm_reduce_simplify()` + `reduce_collapse_inner_patterns()`.
+Tinygrad: `simplify.py:82-142`. Svod: `pm_reduce_simplify()` + `reduce_collapse_inner_patterns()`.
 
 ---
 
@@ -142,7 +142,7 @@ Tinygrad: `simplify.py:82-142`. Morok: `pm_reduce_simplify()` + `reduce_collapse
 
 **Что**: Решение, материализовать ли промежуточный результат в буфер или встроить вычисление. В кодовой базе часто называется «pcontig» (сокращение от partial contiguous — оптимизация, которая встраивает узлы BUFFERIZE, подставляя переменные диапазонов).
 
-Когда проход rangeify создаёт узел `BUFFERIZE` (помечая «здесь нужен буфер»), проход удаления буферов оценивает, стоит ли реально выделять память. `BUFFERIZE` — это промежуточное представление Morok между «здесь нужен буфер» и финальным `STORE`+`BUFFER`+`AFTER` — оно позволяет этому проходу решить, действительно ли материализация нужна. Если вычисление достаточно дешёвое, подставляются переменные диапазонов и выражение встраивается напрямую.
+Когда проход rangeify создаёт узел `BUFFERIZE` (помечая «здесь нужен буфер»), проход удаления буферов оценивает, стоит ли реально выделять память. `BUFFERIZE` — это промежуточное представление Svod между «здесь нужен буфер» и финальным `STORE`+`BUFFER`+`AFTER` — оно позволяет этому проходу решить, действительно ли материализация нужна. Если вычисление достаточно дешёвое, подставляются переменные диапазонов и выражение встраивается напрямую.
 
 ### Дерево решений
 
@@ -176,7 +176,7 @@ Is there a reduce in scope?
 | Тождественная свёртка | `INDEX(BUFFERIZE(compute, ranges), ranges) → compute` — одинаковые диапазоны сокращаются |
 | Выравнивание вложенности | `BUFFERIZE(BUFFERIZE(...))` — выравнивание вложенной буферизации |
 
-Morok: `buffer_removal_with_pcontig()` в `rangeify/patterns.rs`.
+Svod: `buffer_removal_with_pcontig()` в `rangeify/patterns.rs`.
 
 ---
 
@@ -195,7 +195,7 @@ Morok: `buffer_removal_with_pcontig()` в `rangeify/patterns.rs`.
 Даже когда ВСЕ диапазоны мертвы (скалярный выход), BUFFERIZE должен быть сохранён с пустыми диапазонами — его полное удаление вызывает `NoKernelsFound`, поскольку ни один STORE не будет создан при разбиении ядер.
 :::
 
-Morok: `dead_axis_removal()` в `rangeify/patterns.rs`.
+Svod: `dead_axis_removal()` в `rangeify/patterns.rs`.
 
 ---
 
@@ -211,7 +211,7 @@ Morok: `dead_axis_removal()` в `rangeify/patterns.rs`.
 
 Пример: `sum(x, r=0..N)`, где `x` не зависит от `r` → `x * N`. Сумма константы по N итерациям равна N-кратному значению этой константы.
 
-Tinygrad: `simplify.py:82-86`. Morok: `pm_reduce_simplify()`.
+Tinygrad: `simplify.py:82-86`. Svod: `pm_reduce_simplify()`.
 
 ---
 
@@ -238,4 +238,4 @@ After:   REDUCE(                       // shape [256] → scalar (second stage)
 
 **Защита**: Применяется, только когда размерность редукции может быть факторизована и отношение входа к выходу превышает порог. Нефакторизуемые размерности пропускаются.
 
-Morok: `split_reduceop()` в `rangeify/kernel.rs`.
+Svod: `split_reduceop()` в `rangeify/kernel.rs`.

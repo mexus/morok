@@ -7,8 +7,8 @@
 //! `tinygrad/nn/__init__.py` convention of storing `Tensor.uniform(...)` in
 //! the constructor without realizing.
 
-use morok_dtype::DType;
-use morok_tensor::Tensor;
+use svod_dtype::DType;
+use svod_tensor::Tensor;
 
 /// PyTorch / Tinygrad fan-in uniform: samples from `[-1/√fan_in, +1/√fan_in)`.
 /// Used for Conv/Linear weights, their biases, embeddings, and LSTM gates.

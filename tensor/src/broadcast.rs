@@ -11,7 +11,7 @@
 use snafu::ResultExt;
 
 use super::*;
-use morok_ir::shape::{align_shapes_left, broadcast_shape};
+use svod_ir::shape::{align_shapes_left, broadcast_shape};
 
 impl Tensor {
     /// Broadcast two tensors to a common shape for binary operations.
@@ -53,8 +53,8 @@ impl Tensor {
             return Ok((self.clone(), other.clone()));
         }
 
-        // Handle scalar cases (empty shape means scalar in morok)
-        // Actually, in morok scalars have shape [1], but let's handle both
+        // Handle scalar cases (empty shape means scalar in svod)
+        // Actually, in svod scalars have shape [1], but let's handle both
         if self_shape.is_empty() && other_shape.is_empty() {
             return Ok((self.clone(), other.clone()));
         }
@@ -98,7 +98,7 @@ impl Tensor {
     /// Returns error if:
     /// - Shape has more dimensions than target
     /// - Dimension sizes are incompatible (not 1 and not equal to target)
-    pub fn broadcast_to(&self, target_shape: &morok_ir::shape::Shape) -> Result<Tensor> {
+    pub fn broadcast_to(&self, target_shape: &svod_ir::shape::Shape) -> Result<Tensor> {
         let self_shape = self.shape()?;
 
         // Early return if already correct shape
@@ -114,8 +114,8 @@ impl Tensor {
         // Pad shape with 1s on left if needed
         let aligned_shape = if self_shape.len() < target_shape.len() {
             let padding = target_shape.len() - self_shape.len();
-            let mut new_shape = morok_ir::shape::Shape::new();
-            new_shape.extend(std::iter::repeat_n(morok_ir::SInt::from(1), padding));
+            let mut new_shape = svod_ir::shape::Shape::new();
+            new_shape.extend(std::iter::repeat_n(svod_ir::SInt::from(1), padding));
             new_shape.extend(self_shape.iter().cloned());
             new_shape
         } else {

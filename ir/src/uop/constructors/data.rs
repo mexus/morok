@@ -8,9 +8,9 @@
 
 use std::sync::Arc;
 
-use morok_dtype::DType;
-use morok_dtype::DeviceSpec;
-use morok_dtype::ext::HasDType;
+use svod_dtype::DType;
+use svod_dtype::DeviceSpec;
+use svod_dtype::ext::HasDType;
 
 use crate::IntoUOp;
 use crate::op::Op;
@@ -55,9 +55,9 @@ impl UOp {
     ///
     /// ```rust
     /// # use std::sync::Arc;
-    /// # use morok_ir::UOp;
-    /// # use morok_dtype::DType;
-    /// let x = UOp::const_(DType::Float32, morok_ir::ConstValue::Float(5.0));
+    /// # use svod_ir::UOp;
+    /// # use svod_dtype::DType;
+    /// let x = UOp::const_(DType::Float32, svod_ir::ConstValue::Float(5.0));
     /// let zero = x.const_like(0.0);
     /// assert_eq!(zero.dtype(), DType::Float32);
     /// ```

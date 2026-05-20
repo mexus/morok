@@ -145,7 +145,7 @@ UPCAST → UNROLL → CONTRACT (упрощённо — реальный IR со�
 
 ```bash
 # See IR after each transformation
-MOROK_DEBUG=ir cargo test failing_test
+SVOD_DEBUG=ir cargo test failing_test
 ```
 
 ### Краткий справочник
@@ -182,15 +182,15 @@ MOROK_DEBUG=ir cargo test failing_test
 
 ---
 
-## Tinygrad vs Morok: архитектурные различия
+## Tinygrad vs Svod: архитектурные различия
 
-Эта глава описывает «идеальный» 22-стадийный пайплайн, основанный на реализации Tinygrad. Morok сейчас близко следует этому дизайну с минимальными отличиями.
+Эта глава описывает «идеальный» 22-стадийный пайплайн, основанный на реализации Tinygrad. Svod сейчас близко следует этому дизайну с минимальными отличиями.
 
 ### Оставшиеся архитектурные различия
 
-| Стадия | Tinygrad | Morok | Примечания |
+| Стадия | Tinygrad | Svod | Примечания |
 |--------|----------|-------|------------|
-| 1: Ранние Movement Ops | Перемещает movement ops через обёртки AFTER/END через 3 специфичных паттерна (movement через INDEX, AFTER, END) | Удаляет movement ops во время буферизации | Оба подхода функционально эквивалентны; подход Morok чище |
+| 1: Ранние Movement Ops | Перемещает movement ops через обёртки AFTER/END через 3 специфичных паттерна (movement через INDEX, AFTER, END) | Удаляет movement ops во время буферизации | Оба подхода функционально эквивалентны; подход Svod чище |
 
 ### Выровненные стадии (ранее различались)
 
@@ -198,22 +198,22 @@ MOROK_DEBUG=ir cargo test failing_test
 
 | Стадия | Что изменилось |
 |--------|----------------|
-| 15: Понижение типа Index | Morok теперь имеет `pm_lower_index_dtype()` с полным покрытием паттернов: Binary ops, CONST, WHERE, VECTORIZE, SPECIAL, DEFINE_VAR, RANGE, CAST cleanup |
+| 15: Понижение типа Index | Svod теперь имеет `pm_lower_index_dtype()` с полным покрытием паттернов: Binary ops, CONST, WHERE, VECTORIZE, SPECIAL, DEFINE_VAR, RANGE, CAST cleanup |
 | 18: Декомпозиции | Добавлены: `fast_division_patterns()`, `pm_div_to_shr()`, `pm_fdiv_to_mul()`, `pm_comparison_negations()`, законы Де Моргана |
 | 19: Финальная перезапись | `pm_render()` перенесён из кодогенерации в стадию 19 пайплайна schedule |
 
 ### Паттерны только Tinygrad
 
-Morok намеренно не реализует эти Tinygrad-специфичные паттерны:
+Svod намеренно не реализует эти Tinygrad-специфичные паттерны:
 
-| Паттерн | Назначение | Почему Morok это не нужно |
+| Паттерн | Назначение | Почему Svod это не нужно |
 |---------|------------|--------------------------|
-| `to_bufferview` | Избежать копирования буферов с диска для DISK/TINYFS-устройств | Morok не поддерживает DISK/TINYFS; in-memory бэкенды не нуждаются в этом |
-| Паттерны перемещения AFTER/END | Перемещение movement ops через timing-обёртки | Morok удаляет movement ops во время буферизации |
+| `to_bufferview` | Избежать копирования буферов с диска для DISK/TINYFS-устройств | Svod не поддерживает DISK/TINYFS; in-memory бэкенды не нуждаются в этом |
+| Паттерны перемещения AFTER/END | Перемещение movement ops через timing-обёртки | Svod удаляет movement ops во время буферизации |
 
-### Расширения Morok
+### Расширения Svod
 
-У Morok есть паттерны/расширения, отсутствующие в Tinygrad:
+У Svod есть паттерны/расширения, отсутствующие в Tinygrad:
 
 | Расширение | Расположение | Назначение |
 |------------|--------------|------------|

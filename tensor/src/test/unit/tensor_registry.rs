@@ -1,6 +1,6 @@
 use super::*;
-use morok_dtype::DType;
-use morok_ir::ConstValue;
+use svod_dtype::DType;
+use svod_ir::ConstValue;
 
 #[test]
 fn test_register_and_get() {

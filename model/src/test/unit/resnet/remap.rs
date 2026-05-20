@@ -1,4 +1,4 @@
-use morok_tensor::Tensor;
+use svod_tensor::Tensor;
 
 use crate::blocks::remap::fold_batchnorm;
 use crate::state::StateDict;

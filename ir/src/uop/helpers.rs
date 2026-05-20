@@ -383,7 +383,7 @@ impl UOp {
     /// ```
     pub fn get_valid(self: &Arc<Self>) -> Arc<Self> {
         use crate::types::TernaryOp;
-        use morok_dtype::DType;
+        use svod_dtype::DType;
 
         match self.op() {
             Op::Ternary(TernaryOp::Where, cond, _, false_val) if Self::is_invalid_marker(false_val) => {
@@ -437,7 +437,7 @@ impl UOp {
     /// let padded = UOp::where_op(valid, actual_idx, invalid)?;
     /// ```
     pub fn invalid_marker() -> Arc<Self> {
-        use morok_dtype::DType;
+        use svod_dtype::DType;
 
         // Invalid marker for out-of-bounds indices (used in padding/masking)
         Self::new(Op::Invalid, DType::Index)

@@ -1,7 +1,7 @@
 //! Tests for `Tensor::rand_like` / `Tensor::randn_like` / `Tensor::randint_like`.
 
-use morok_dtype::DType;
-use morok_ir::shape::Shape;
+use svod_dtype::DType;
+use svod_ir::shape::Shape;
 
 use crate::Tensor;
 use crate::rand::manual_seed;

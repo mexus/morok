@@ -29,7 +29,7 @@
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 
-use morok_schedule::{Scheduler, apply_post_optimization_with_renderer, beam_search_cached, prepare_scheduler};
+use svod_schedule::{Scheduler, apply_post_optimization_with_renderer, beam_search_cached, prepare_scheduler};
 use tracing::{debug, trace};
 
 use crate::{
@@ -41,16 +41,16 @@ use crate::{
     },
     schedule::ScheduleItem,
 };
-use morok_device::{Buffer, device::Device};
-use morok_ir::pattern::is_any_const;
-use morok_ir::{DeviceSpec, Op, UOp, UOpKey};
-use morok_runtime::{
-    ExecutionPlan, ExecutionPlanBuilder, PreparedBufferView, PreparedCopy, PreparedCustomFunction, PreparedKernel,
-    PreparedOp,
-};
 use snafu::{OptionExt, ResultExt};
 use std::sync::Arc;
 use std::time::Duration;
+use svod_device::{Buffer, device::Device};
+use svod_ir::pattern::is_any_const;
+use svod_ir::{DeviceSpec, Op, UOp, UOpKey};
+use svod_runtime::{
+    ExecutionPlan, ExecutionPlanBuilder, PreparedBufferView, PreparedCopy, PreparedCustomFunction, PreparedKernel,
+    PreparedOp,
+};
 
 fn collect_pending_indices(tensors: &[&mut Tensor]) -> Vec<usize> {
     tensors
@@ -66,7 +66,7 @@ struct BufferStorageKey {
     id: u64,
     offset: usize,
     size: usize,
-    dtype: morok_dtype::DType,
+    dtype: svod_dtype::DType,
 }
 
 impl Tensor {
@@ -144,8 +144,8 @@ impl Tensor {
     /// # Example
     ///
     /// ```ignore
-    /// use morok_tensor::PrepareConfig;
-    /// use morok_schedule::{OptStrategy, OptimizerConfig};
+    /// use svod_tensor::PrepareConfig;
+    /// use svod_schedule::{OptStrategy, OptimizerConfig};
     ///
     /// let c = a.matmul(&b)?;
     /// let config = PrepareConfig::from(
@@ -287,8 +287,8 @@ impl Tensor {
     /// # Example
     ///
     /// ```ignore
-    /// use morok_tensor::PrepareConfig;
-    /// use morok_schedule::{OptimizerConfig, OptStrategy, BeamConfig};
+    /// use svod_tensor::PrepareConfig;
+    /// use svod_schedule::{OptimizerConfig, OptStrategy, BeamConfig};
     ///
     /// // Beam search with width 8 and 120s timeout
     /// let config = PrepareConfig::from(
@@ -583,7 +583,7 @@ fn extract_var_vals(root: &Arc<UOp>) -> Result<HashMap<String, i64>> {
 
 fn schedule_cache_disabled_by_env() -> bool {
     static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *DISABLED.get_or_init(|| std::env::var("MOROK_DISABLE_SCHEDULE_CACHE").as_deref() == Ok("1"))
+    *DISABLED.get_or_init(|| std::env::var("SVOD_DISABLE_SCHEDULE_CACHE").as_deref() == Ok("1"))
 }
 
 fn schedule_result_from_sink_with_cache(
@@ -614,9 +614,8 @@ fn schedule_result_from_sink_with_cache(
         }
         None => {
             let schedule_root = restore_bind_placeholders_for_schedule(&normalization.normalized, &normalization);
-            let rangeify_result = morok_schedule::rangeify_with_map(schedule_root, None).context(RangeifySnafu)?;
-            let (kernel_graph, _) =
-                morok_schedule::try_get_kernel_graph(rangeify_result.sink).context(RangeifySnafu)?;
+            let rangeify_result = svod_schedule::rangeify_with_map(schedule_root, None).context(RangeifySnafu)?;
+            let (kernel_graph, _) = svod_schedule::try_get_kernel_graph(rangeify_result.sink).context(RangeifySnafu)?;
             let pre_schedule = crate::schedule::create_pre_schedule(kernel_graph)?;
             let new_entry = Arc::new(crate::schedule_cache::CachedSchedule { pre_schedule: Arc::new(pre_schedule) });
             let guard = cache.guard();
@@ -636,8 +635,8 @@ fn schedule_result_from_sink_uncached(
     var_vals: HashMap<String, i64>,
     _config: &PrepareConfig,
 ) -> Result<crate::schedule::ScheduleResult> {
-    let rangeify_result = morok_schedule::rangeify_with_map(sink, None).context(RangeifySnafu)?;
-    let (kernel_graph, _) = morok_schedule::try_get_kernel_graph(rangeify_result.sink).context(RangeifySnafu)?;
+    let rangeify_result = svod_schedule::rangeify_with_map(sink, None).context(RangeifySnafu)?;
+    let (kernel_graph, _) = svod_schedule::try_get_kernel_graph(rangeify_result.sink).context(RangeifySnafu)?;
     let pre_schedule = crate::schedule::create_pre_schedule(kernel_graph.clone())?;
     let input_buffers = collect_input_buffers(&kernel_graph);
     let result = crate::schedule::instantiate_schedule(&pre_schedule, &input_buffers, &var_vals)?;
@@ -677,9 +676,9 @@ pub(crate) fn normalize_for_schedule_cache(sink: &Arc<UOp>) -> Result<ScheduleCa
         bind_mismatch: None,
     };
 
-    use morok_ir::op::pattern_derived::OpKey;
-    use morok_ir::pattern::{RewriteResult, SimplifiedPatternMatcher};
-    use morok_ir::rewrite::graph_rewrite;
+    use svod_ir::op::pattern_derived::OpKey;
+    use svod_ir::pattern::{RewriteResult, SimplifiedPatternMatcher};
+    use svod_ir::rewrite::graph_rewrite;
 
     let mut matcher = SimplifiedPatternMatcher::<NormalizeScheduleCacheCtx>::new();
 
@@ -1048,11 +1047,11 @@ type OptKey = (u64, DeviceSpec, &'static str, u64);
 ///
 /// Reads are lock-free via the underlying `papaya::HashMap`; the FIFO side
 /// structure is touched only on insert under a short-lived mutex. The cap is
-/// read once via `MOROK_OPT_CACHE_MAX` (default 4096); when capacity is
+/// read once via `SVOD_OPT_CACHE_MAX` (default 4096); when capacity is
 /// exceeded, the oldest insertions are evicted from both the map and the
 /// FIFO.
 struct OptCacheState {
-    map: papaya::HashMap<OptKey, Arc<morok_runtime::kernel_cache::CachedKernel>>,
+    map: papaya::HashMap<OptKey, Arc<svod_runtime::kernel_cache::CachedKernel>>,
     fifo: parking_lot::Mutex<std::collections::VecDeque<OptKey>>,
     cap: usize,
 }
@@ -1061,7 +1060,7 @@ impl OptCacheState {
     const DEFAULT_CAP: usize = 4096;
 
     fn new() -> Self {
-        let cap = std::env::var("MOROK_OPT_CACHE_MAX")
+        let cap = std::env::var("SVOD_OPT_CACHE_MAX")
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
             .filter(|&n| n > 0)
@@ -1069,7 +1068,7 @@ impl OptCacheState {
         Self { map: papaya::HashMap::new(), fifo: parking_lot::Mutex::new(std::collections::VecDeque::new()), cap }
     }
 
-    fn insert(&self, key: OptKey, val: Arc<morok_runtime::kernel_cache::CachedKernel>) {
+    fn insert(&self, key: OptKey, val: Arc<svod_runtime::kernel_cache::CachedKernel>) {
         let guard = self.map.guard();
         let was_new = self.map.insert(key.clone(), val, &guard).is_none();
         if !was_new {
@@ -1130,7 +1129,7 @@ fn prepare_execution_plan(
     // Liveness-based memory planning. `PlannerMode::Arena` (default) packs
     // plannable buffers into one or two large allocations; `Remap` swaps
     // per-pool `Arc<Buffer>`s; `Disabled` short-circuits. Mode is selected
-    // by `MOROK_MEMORY_PLANNER` (`Arena` if unset).
+    // by `SVOD_MEMORY_PLANNER` (`Arena` if unset).
     let planner_mode = crate::memory_planner::mode_from_env();
     let output_buffer_ids = collect_output_buffer_ids(&schedule_items, &schedule_result.output_uop_ids);
     let planner_result = crate::memory_planner::memory_planner(&schedule_items, &output_buffer_ids, planner_mode);
@@ -1149,7 +1148,7 @@ fn prepare_execution_plan(
 
     // Resolve primary plan device from the first schedule item for plan metadata.
     // Individual compiled kernels may still resolve/compile on per-item devices.
-    let alloc_registry = morok_device::registry::registry();
+    let alloc_registry = svod_device::registry::registry();
     let plan_device = if !schedule_items.is_empty() {
         let device_spec = schedule_items
             .iter()
@@ -1295,7 +1294,7 @@ fn prepare_execution_plan(
         // consistently with Copy/BufferView above.
         if let Op::CustomFunction { kind, attrs } = runtime_ast.op() {
             let buffer_indices = resolve_item_buffer_indices(item, &uop_id_to_idx)?;
-            let runtime_vars = attrs.iter().flat_map(morok_runtime::execution_plan::collect_runtime_vars).collect();
+            let runtime_vars = attrs.iter().flat_map(svod_runtime::execution_plan::collect_runtime_vars).collect();
             builder.add_op_with_instance_dependencies(
                 PreparedOp::CustomFunction(PreparedCustomFunction {
                     id: item.kernel.id,
@@ -1331,7 +1330,7 @@ fn prepare_execution_plan(
             Arc::clone(cached)
         } else {
             let optimizer_renderer = get_optimizer_renderer(&item_device);
-            let optimized_ast = if let morok_schedule::OptStrategy::Beam { .. } = config.optimizer.strategy {
+            let optimized_ast = if let svod_schedule::OptStrategy::Beam { .. } = config.optimizer.strategy {
                 beam_search_optimize(
                     item.ast.clone(),
                     &optimizer_renderer,
@@ -1340,20 +1339,19 @@ fn prepare_execution_plan(
                     &config.optimizer,
                 )?
             } else {
-                morok_schedule::optimize_kernel_with_config(item.ast.clone(), &optimizer_renderer, &config.optimizer)
+                svod_schedule::optimize_kernel_with_config(item.ast.clone(), &optimizer_renderer, &config.optimizer)
             };
 
             let kernel_name =
-                optimized_ast.metadata::<morok_schedule::optimizer::KernelInfo>().map(|info| info.function_name());
+                optimized_ast.metadata::<svod_schedule::optimizer::KernelInfo>().map(|info| info.function_name());
 
             let ast_decomposed = match item_device.renderer.decompositor() {
-                Some(matcher) => morok_ir::decompositions::decompose_with(&optimized_ast, &matcher),
+                Some(matcher) => svod_ir::decompositions::decompose_with(&optimized_ast, &matcher),
                 None => optimized_ast,
             };
-            let program =
-                morok_codegen::program_pipeline::program_from_sink(ast_decomposed, item_device.device.clone());
+            let program = svod_codegen::program_pipeline::program_from_sink(ast_decomposed, item_device.device.clone());
 
-            let result = morok_runtime::kernel_cache::get_or_compile_kernel(
+            let result = svod_runtime::kernel_cache::get_or_compile_kernel(
                 crate::schedule_cache::content_hash(&program),
                 item_codegen,
                 || {
@@ -1364,7 +1362,7 @@ fn prepare_execution_plan(
                         kernel_name.as_deref(),
                     )?;
                     let program = (item_device.runtime)(&compiled).context(CreateProgramSnafu)?;
-                    Ok(morok_runtime::kernel_cache::CachedKernel {
+                    Ok(svod_runtime::kernel_cache::CachedKernel {
                         program,
                         device: item_codegen.to_string(),
                         code: spec.src.clone(),
@@ -1406,7 +1404,7 @@ fn prepare_execution_plan(
                 ),
             })?;
 
-        let runtime_vars = morok_runtime::execution_plan::collect_runtime_vars(&item.ast);
+        let runtime_vars = svod_runtime::execution_plan::collect_runtime_vars(&item.ast);
         let prepared = PreparedKernel {
             id: item.kernel.id,
             ast: item.ast.clone(),
@@ -1476,10 +1474,10 @@ fn collect_non_overridable_fixedvars(item: &ScheduleItem) -> HashMap<String, i64
 /// Render/compile entrypoint backed by PROGRAM pipeline stages.
 fn compile_with_program_pipeline_components(
     kernel_ast: Arc<UOp>,
-    renderer: &dyn morok_device::device::Renderer,
-    compiler: &dyn morok_device::device::Compiler,
+    renderer: &dyn svod_device::device::Renderer,
+    compiler: &dyn svod_device::device::Compiler,
     kernel_name: Option<&str>,
-) -> Result<(morok_device::device::ProgramSpec, morok_device::device::CompiledSpec)> {
+) -> Result<(svod_device::device::ProgramSpec, svod_device::device::CompiledSpec)> {
     let mut program = match kernel_ast.op() {
         Op::Program { .. } => kernel_ast,
         other => {
@@ -1490,24 +1488,24 @@ fn compile_with_program_pipeline_components(
         }
     };
 
-    program = morok_codegen::program_pipeline::get_program(
+    program = svod_codegen::program_pipeline::get_program(
         &program,
         renderer,
         compiler,
         kernel_name,
-        morok_codegen::program_pipeline::ProgramTarget::Source,
+        svod_codegen::program_pipeline::ProgramTarget::Source,
     )
     .context(RenderKernelSnafu)?;
 
-    let rendered_entry = morok_device::device::ProgramSpec::from_uop(&program).map(|spec| spec.name).map_err(|e| {
+    let rendered_entry = svod_device::device::ProgramSpec::from_uop(&program).map(|spec| spec.name).map_err(|e| {
         crate::error::Error::IrConstruction { details: format!("PROGRAM pipeline produced invalid SOURCE stage: {e}") }
     })?;
 
     let (program, compiled) =
-        morok_codegen::program_pipeline::do_compile(&program, compiler).context(CompileKernelSnafu)?;
+        svod_codegen::program_pipeline::do_compile(&program, compiler).context(CompileKernelSnafu)?;
 
     let spec =
-        morok_device::device::ProgramSpec::from_uop(&program).map_err(|e| crate::error::Error::IrConstruction {
+        svod_device::device::ProgramSpec::from_uop(&program).map_err(|e| crate::error::Error::IrConstruction {
             details: format!(
                 "PROGRAM pipeline produced invalid ProgramSpec after compile (entry='{}'): {e}",
                 rendered_entry
@@ -1518,7 +1516,7 @@ fn compile_with_program_pipeline_components(
 
 /// Resolve the device string for cache keying (includes compiler cache key).
 pub(crate) fn resolve_codegen(param_buffers: &[(u64, Arc<UOp>)], config: &PrepareConfig) -> Result<&'static str> {
-    let alloc_registry = morok_device::registry::registry();
+    let alloc_registry = svod_device::registry::registry();
     let spec = param_buffers
         .iter()
         .find_map(|(id, _)| {
@@ -1542,18 +1540,18 @@ pub(crate) fn resolve_codegen(param_buffers: &[(u64, Arc<UOp>)], config: &Prepar
 }
 
 /// Get the optimizer renderer for a device.
-fn get_optimizer_renderer(device: &Device) -> morok_schedule::OptimizerRenderer {
+fn get_optimizer_renderer(device: &Device) -> svod_schedule::OptimizerRenderer {
     match device.device {
         DeviceSpec::Cpu => {
-            if std::env::var("MOROK_AMX").as_deref() == Ok("1") {
-                morok_schedule::OptimizerRenderer::apple_amx()
+            if std::env::var("SVOD_AMX").as_deref() == Ok("1") {
+                svod_schedule::OptimizerRenderer::apple_amx()
             } else {
-                morok_schedule::OptimizerRenderer::cpu()
+                svod_schedule::OptimizerRenderer::cpu()
             }
         }
-        DeviceSpec::Cuda { .. } => morok_schedule::OptimizerRenderer::cuda(),
-        DeviceSpec::Metal { .. } => morok_schedule::OptimizerRenderer::metal(),
-        _ => morok_schedule::OptimizerRenderer::cpu(),
+        DeviceSpec::Cuda { .. } => svod_schedule::OptimizerRenderer::cuda(),
+        DeviceSpec::Metal { .. } => svod_schedule::OptimizerRenderer::metal(),
+        _ => svod_schedule::OptimizerRenderer::cpu(),
     }
 }
 
@@ -1582,10 +1580,10 @@ pub(crate) fn fmt_op_counts(counts: &[(String, usize)]) -> String {
 
 fn beam_search_optimize(
     ast: Arc<UOp>,
-    renderer: &morok_schedule::OptimizerRenderer,
+    renderer: &svod_schedule::OptimizerRenderer,
     device: &Device,
     buffers: &[Buffer],
-    optimizer_config: &morok_schedule::OptimizerConfig,
+    optimizer_config: &svod_schedule::OptimizerConfig,
 ) -> Result<Arc<UOp>> {
     let beam_config = &optimizer_config.beam;
     // Prepare scheduler (applies symbolic simplification and loop→global).
@@ -1599,7 +1597,7 @@ fn beam_search_optimize(
 
     // Clone buffers for the closure (Buffer is Clone + Send + Sync)
     let buffers: Vec<Buffer> = buffers.to_vec();
-    let bench_config = morok_runtime::BenchmarkConfig::default();
+    let bench_config = svod_runtime::BenchmarkConfig::default();
 
     // Clone device components for the closure
     let dev_renderer = device.renderer.clone();
@@ -1613,7 +1611,7 @@ fn beam_search_optimize(
     // are O(1) thread-pool dispatch — but the lazy init can dominate the first
     // 1-2 measurements at the small kernel sizes BEAM-time uses, biasing
     // ranking against fast candidates that happen to run first.
-    morok_runtime::warmup_thread_pool();
+    svod_runtime::warmup_thread_pool();
 
     // Per-candidate **compile-only** timeout (default 10s). Rust can't
     // safely deliver SIGALRM to a worker, so we use a two-stage detached
@@ -1649,7 +1647,7 @@ fn beam_search_optimize(
     // `least_compute_ops*1000` compute-bloat filter. The optional `early_stop`
     // argument is propagated into `BenchmarkConfig` so `benchmark_kernel` can
     // abort the run loop the moment any single run exceeds the threshold.
-    let compile_and_time = |s: &Scheduler, early_stop: Option<Duration>| -> Option<morok_schedule::CandidateMetrics> {
+    let compile_and_time = |s: &Scheduler, early_stop: Option<Duration>| -> Option<svod_schedule::CandidateMetrics> {
         use std::panic::{AssertUnwindSafe, catch_unwind};
         use std::sync::mpsc;
 
@@ -1668,7 +1666,7 @@ fn beam_search_optimize(
         // Snapshot the applied-opts chain so the diagnostic line in the worker
         // thread can identify which BEAM branch triggered the drop without
         // having to send the full Scheduler back across the channel.
-        let opts_snapshot: Vec<morok_schedule::optimizer::Opt> = s_owned.applied_opts.clone();
+        let opts_snapshot: Vec<svod_schedule::optimizer::Opt> = s_owned.applied_opts.clone();
 
         // Two-stage signal: CompileDone fires when codegen/compile/runtime-link
         // finish; Final carries the benchmark result (or None on failure/panic).
@@ -1676,7 +1674,7 @@ fn beam_search_optimize(
         // JoinHandle so the parent can abandon the worker on compile timeout.
         enum WorkerMsg {
             CompileDone,
-            Final(Option<morok_schedule::CandidateMetrics>),
+            Final(Option<svod_schedule::CandidateMetrics>),
         }
         let (tx, rx) = mpsc::sync_channel::<WorkerMsg>(2);
         let tx_compile = tx.clone();
@@ -1705,28 +1703,28 @@ fn beam_search_optimize(
 
                 // Extract kernel name before decomposition (which loses metadata)
                 let kernel_name =
-                    optimized.metadata::<morok_schedule::optimizer::KernelInfo>().map(|info| info.function_name());
+                    optimized.metadata::<svod_schedule::optimizer::KernelInfo>().map(|info| info.function_name());
 
                 // Pre-codegen metrics: structural hash for `seen_libs`, ALU node
                 // count for `least_compute_ops`. Computed before compile so even
                 // failed compiles still consume a slot fairly.
-                let ir_hash = morok_schedule::hash_post_codegen_ir(&optimized);
-                let compute_ops = morok_schedule::compute_ops_estimate(&optimized);
+                let ir_hash = svod_schedule::hash_post_codegen_ir(&optimized);
+                let compute_ops = svod_schedule::compute_ops_estimate(&optimized);
 
                 // Apply decomposition
                 let decomposed = match dev_renderer_c.decompositor() {
-                    Some(m) => morok_ir::decompositions::decompose_with(&optimized, &m),
+                    Some(m) => svod_ir::decompositions::decompose_with(&optimized, &m),
                     None => optimized,
                 };
-                let mut program = morok_codegen::program_pipeline::program_from_sink(decomposed, dev_device_c.clone());
+                let mut program = svod_codegen::program_pipeline::program_from_sink(decomposed, dev_device_c.clone());
 
                 // Linearize *now* so we can count flat uops. Counting the
                 // post-optimization AST `toposort()` (the earlier behavior)
-                // under-counts because morok's high-level Reduce/Index/Cast
+                // under-counts because svod's high-level Reduce/Index/Cast
                 // nodes get fanned out into many flat uops by the codegen
                 // pipeline. Counting post-linearize gives the number to
                 // compare against `BEAM_UOPS_MAX`.
-                program = match morok_codegen::program_pipeline::do_linearize(&program) {
+                program = match svod_codegen::program_pipeline::do_linearize(&program) {
                     Ok(p) => p,
                     Err(e) => {
                         if log_surpass_c {
@@ -1735,9 +1733,9 @@ fn beam_search_optimize(
                         return None;
                     }
                 };
-                let (linear_uops_count, top_op_counts) = if let morok_ir::Op::Program { linear: Some(linear), .. } =
+                let (linear_uops_count, top_op_counts) = if let svod_ir::Op::Program { linear: Some(linear), .. } =
                     program.op()
-                    && let morok_ir::Op::Linear { ops } = linear.op()
+                    && let svod_ir::Op::Linear { ops } = linear.op()
                 {
                     (ops.len(), if log_surpass_c { count_top_ops(ops, 8) } else { Vec::new() })
                 } else {
@@ -1803,7 +1801,7 @@ fn beam_search_optimize(
                 // Bound BEAM dispatch grid: if `prod(global_size) > MAX_TEST_GLOBAL_SIZE`,
                 // halve the largest dim (>16) until it fits, then scale the measured
                 // time by `factor = original_size / shrunk_size` to recover the
-                // full-grid estimate. Morok's CPU dispatch has `global_size[0]` = thread
+                // full-grid estimate. Svod's CPU dispatch has `global_size[0]` = thread
                 // count, typically ≤ 16, so this is a no-op for CPU and only engages
                 // for GPU-style large grids.
                 const MAX_TEST_GLOBAL_SIZE: usize = 65536;
@@ -1836,7 +1834,7 @@ fn beam_search_optimize(
                 // GPU backends keep the invalidate.
                 bench_config.clear_l2 = renderer_c.device.has_hardware_cache_invalidate();
                 let result = unsafe {
-                    morok_runtime::benchmark_kernel(
+                    svod_runtime::benchmark_kernel(
                         program.as_ref(),
                         &buffer_ptrs,
                         &vals,
@@ -1850,7 +1848,7 @@ fn beam_search_optimize(
                 // Scale measured time back to the full-grid estimate.
                 let scaled_nanos = (result.min.as_nanos() as f64 * factor).min(u64::MAX as f64);
                 let timing = Duration::from_nanos(scaled_nanos as u64);
-                Some(morok_schedule::CandidateMetrics { timing, ir_hash, compute_ops })
+                Some(svod_schedule::CandidateMetrics { timing, ir_hash, compute_ops })
             }));
             let final_result = match result {
                 Ok(opt) => opt,

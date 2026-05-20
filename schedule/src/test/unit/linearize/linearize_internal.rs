@@ -1,7 +1,7 @@
 use super::*;
-use morok_dtype::DType;
-use morok_ir::types::ConstValue;
 use smallvec::smallvec;
+use svod_dtype::DType;
+use svod_ir::types::ConstValue;
 
 #[test]
 fn test_linearize_single_const() {

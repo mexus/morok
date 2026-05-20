@@ -11,9 +11,9 @@
 use std::f32::consts::PI;
 use std::sync::Arc;
 
-use morok_device::DeviceSpec;
-use morok_dtype::DType;
-use morok_ir::{AxisId, AxisType, BufferizeOpts, ConstValue, Op, ReduceOp, UOp};
+use svod_device::DeviceSpec;
+use svod_dtype::DType;
+use svod_ir::{AxisId, AxisType, BufferizeOpts, ConstValue, Op, ReduceOp, UOp};
 
 use crate::pattern::RewriteResult;
 use crate::rangeify::IndexingContext;
@@ -150,7 +150,7 @@ fn test_buffer_folding_copy_const() {
 
     // Test: COPY(CONST, device) → CONST
     let const_val = UOp::native_const(1.0f32);
-    let device = UOp::device(morok_ir::DeviceSpec::Cpu);
+    let device = UOp::device(svod_ir::DeviceSpec::Cpu);
     let copy = const_val.copy(device);
 
     let result = matcher.rewrite(&copy, &mut ());

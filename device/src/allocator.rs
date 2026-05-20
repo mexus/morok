@@ -186,7 +186,7 @@ pub trait Allocator: Send + Sync + std::fmt::Debug {
     fn name(&self) -> &str;
 
     /// Get the device specification for this allocator.
-    fn device_spec(&self) -> morok_dtype::DeviceSpec;
+    fn device_spec(&self) -> svod_dtype::DeviceSpec;
 }
 
 /// CPU allocator using system memory.
@@ -203,8 +203,8 @@ impl Allocator for CpuAllocator {
         "CPU"
     }
 
-    fn device_spec(&self) -> morok_dtype::DeviceSpec {
-        morok_dtype::DeviceSpec::Cpu
+    fn device_spec(&self) -> svod_dtype::DeviceSpec {
+        svod_dtype::DeviceSpec::Cpu
     }
 }
 
@@ -247,8 +247,8 @@ impl Allocator for DiskAllocator {
         "DISK"
     }
 
-    fn device_spec(&self) -> morok_dtype::DeviceSpec {
-        morok_dtype::DeviceSpec::Disk { path: self.path.clone() }
+    fn device_spec(&self) -> svod_dtype::DeviceSpec {
+        svod_dtype::DeviceSpec::Disk { path: self.path.clone() }
     }
 }
 
@@ -303,8 +303,8 @@ impl Allocator for CudaAllocator {
         "CUDA"
     }
 
-    fn device_spec(&self) -> morok_dtype::DeviceSpec {
-        morok_dtype::DeviceSpec::Cuda { device_id: self.device_id }
+    fn device_spec(&self) -> svod_dtype::DeviceSpec {
+        svod_dtype::DeviceSpec::Cuda { device_id: self.device_id }
     }
 }
 
@@ -436,7 +436,7 @@ impl Allocator for LruAllocator {
         &self.name
     }
 
-    fn device_spec(&self) -> morok_dtype::DeviceSpec {
+    fn device_spec(&self) -> svod_dtype::DeviceSpec {
         self.inner.device_spec()
     }
 }

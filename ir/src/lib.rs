@@ -1,7 +1,7 @@
-//! Intermediate Representation (IR) for the Morok compiler.
+//! Intermediate Representation (IR) for the Svod compiler.
 //!
 //! This crate defines the core IR data structures and operations used throughout
-//! the Morok compiler pipeline.
+//! the Svod compiler pipeline.
 //!
 //! # Module Organization
 //!
@@ -14,8 +14,8 @@
 //! - [`shape`] - Shape inference utilities
 //! - [`sint`] - Symbolic integers
 
-// Make this crate available as `morok_ir` for proc-macro generated code
-extern crate self as morok_ir;
+// Make this crate available as `svod_ir` for proc-macro generated code
+extern crate self as svod_ir;
 
 // Module declarations
 pub mod decompositions;
@@ -57,5 +57,5 @@ pub use rewrite::{
 };
 
 // Re-export external types for convenience
-pub use morok_dtype::DType;
-pub use morok_dtype::DeviceSpec;
+pub use svod_dtype::DType;
+pub use svod_dtype::DeviceSpec;

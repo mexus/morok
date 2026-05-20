@@ -1,7 +1,7 @@
 use crate::*;
-use morok_schedule::testing::setup_test_tracing;
 use ndarray::array;
 use proptest::prelude::*;
+use svod_schedule::testing::setup_test_tracing;
 
 fn get_shape(tensor: &Tensor) -> Vec<usize> {
     tensor.uop().shape().unwrap().unwrap().iter().map(|s| s.as_const().unwrap()).collect()

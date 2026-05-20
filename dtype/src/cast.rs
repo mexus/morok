@@ -112,7 +112,7 @@ impl DType {
             .iter()
             .min()?; // min by discriminant (= priority: lower = more specific)
 
-        // Morok extension: preserve vector count if all inputs have the same vcount > 1.
+        // Svod extension: preserve vector count if all inputs have the same vcount > 1.
         // Tinygrad's least_upper_dtype always returns scalar; we extend it to preserve
         // vector width when all operands agree, avoiding unnecessary devectorize/revectorize.
         let vcount = dtypes[0].vcount();

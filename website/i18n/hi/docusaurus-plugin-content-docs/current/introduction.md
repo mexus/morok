@@ -2,11 +2,11 @@
 sidebar_label: परिचय
 ---
 
-# Morok
+# Svod
 
 > **अल्फ़ा सॉफ़्टवेयर।** कोर फ़ंक्शनैलिटी टेस्टेड है, लेकिन APIs अस्थिर हैं और बिना नोटिस के बदल सकते हैं।
 
-Morok एक Rust-आधारित ML कम्पाइलर है जो [Tinygrad](https://github.com/tinygrad/tinygrad) से प्रेरित है। इसमें UOp-आधारित IR के साथ lazy tensor इवैल्यूएशन, पैटर्न-ड्रिवन ऑप्टिमाइज़ेशन, और मल्टी-बैकएंड कोड जनरेशन शामिल है।
+Svod एक Rust-आधारित ML कम्पाइलर है जो [Tinygrad](https://github.com/tinygrad/tinygrad) से प्रेरित है। इसमें UOp-आधारित IR के साथ lazy tensor इवैल्यूएशन, पैटर्न-ड्रिवन ऑप्टिमाइज़ेशन, और मल्टी-बैकएंड कोड जनरेशन शामिल है।
 
 ## मुख्य विशेषताएँ
 
@@ -18,28 +18,28 @@ Morok एक Rust-आधारित ML कम्पाइलर है जो [
 | **80+ IR ऑपरेशन** | अरिथमेटिक, मेमोरी, कंट्रोल फ़्लो, WMMA tensor cores |
 | **20+ ऑप्टिमाइज़ेशन** | कॉन्स्टेंट फ़ोल्डिंग, tensor cores, वेक्टराइज़ेशन, लूप अनरोलिंग |
 
-आर्किटेक्चर की डिटेल्स के लिए [डॉक्यूमेंटेशन साइट](https://npatsakula.github.io/morok/) देखें।
+आर्किटेक्चर की डिटेल्स के लिए [डॉक्यूमेंटेशन साइट](https://npatsakula.github.io/svod/) देखें।
 
 ## वर्कस्पेस
 
 | Crate | विवरण |
 |-------|-------|
-| [dtype](https://github.com/npatsakula/morok/tree/main/dtype/) | टाइप सिस्टम: scalars, vectors, pointers, images |
-| [macros](https://github.com/npatsakula/morok/tree/main/macros/) | प्रोसीज़रल मैक्रोज़ (`patterns!` DSL) |
-| [ir](https://github.com/npatsakula/morok/tree/main/ir/) | UOp ग्राफ़ IR: 80+ ops, symbolic integers, प्रोवेनेंस |
-| [device](https://github.com/npatsakula/morok/tree/main/device/) | बफ़र मैनेजमेंट: lazy alloc, zero-copy views, LRU कैशिंग |
-| [schedule](https://github.com/npatsakula/morok/tree/main/schedule/) | ऑप्टिमाइज़ेशन इंजन: 20+ पासेज़, RANGEIFY, Z3 वेरिफ़िकेशन |
-| [codegen](https://github.com/npatsakula/morok/tree/main/codegen/) | कोड जनरेशन: Clang (डिफ़ॉल्ट), LLVM JIT, MLIR |
-| [runtime](https://github.com/npatsakula/morok/tree/main/runtime/) | JIT कम्पाइलेशन और कर्नेल एक्ज़ीक्यूशन |
-| [tensor](https://github.com/npatsakula/morok/tree/main/tensor/) | हाई-लेवल lazy tensor API |
-| [onnx](https://github.com/npatsakula/morok/tree/main/onnx/) | ONNX मॉडल इम्पोर्टर |
-| [arch](https://github.com/npatsakula/morok/tree/main/arch/) | इन्फ़रेंस प्रिमिटिव्स |
-| [model](https://github.com/npatsakula/morok/tree/main/model/) | प्री-ट्रेन्ड मॉडल्स |
+| [dtype](https://github.com/npatsakula/svod/tree/main/dtype/) | टाइप सिस्टम: scalars, vectors, pointers, images |
+| [macros](https://github.com/npatsakula/svod/tree/main/macros/) | प्रोसीज़रल मैक्रोज़ (`patterns!` DSL) |
+| [ir](https://github.com/npatsakula/svod/tree/main/ir/) | UOp ग्राफ़ IR: 80+ ops, symbolic integers, प्रोवेनेंस |
+| [device](https://github.com/npatsakula/svod/tree/main/device/) | बफ़र मैनेजमेंट: lazy alloc, zero-copy views, LRU कैशिंग |
+| [schedule](https://github.com/npatsakula/svod/tree/main/schedule/) | ऑप्टिमाइज़ेशन इंजन: 20+ पासेज़, RANGEIFY, Z3 वेरिफ़िकेशन |
+| [codegen](https://github.com/npatsakula/svod/tree/main/codegen/) | कोड जनरेशन: Clang (डिफ़ॉल्ट), LLVM JIT, MLIR |
+| [runtime](https://github.com/npatsakula/svod/tree/main/runtime/) | JIT कम्पाइलेशन और कर्नेल एक्ज़ीक्यूशन |
+| [tensor](https://github.com/npatsakula/svod/tree/main/tensor/) | हाई-लेवल lazy tensor API |
+| [onnx](https://github.com/npatsakula/svod/tree/main/onnx/) | ONNX मॉडल इम्पोर्टर |
+| [arch](https://github.com/npatsakula/svod/tree/main/arch/) | इन्फ़रेंस प्रिमिटिव्स |
+| [model](https://github.com/npatsakula/svod/tree/main/model/) | प्री-ट्रेन्ड मॉडल्स |
 
 ## त्वरित उदाहरण
 
 ```rust
-use morok_tensor::Tensor;
+use svod_tensor::Tensor;
 use ndarray::array;
 
 // Zero-copy from ndarray (C-contiguous fast path)
@@ -58,7 +58,7 @@ assert_eq!(view, array![[6.0, 8.0], [10.0, 12.0]].into_dyn());
 ## Pattern DSL उदाहरण
 
 ```rust
-use morok_schedule::patterns;
+use svod_schedule::patterns;
 
 let optimizer = patterns! {
     // Identity folding (commutative)

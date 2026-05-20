@@ -5,16 +5,16 @@
 //! - LLVM JIT (maximum optimization, slower compilation)
 //!
 //! The backend can be selected via:
-//! - `MOROK_CPU_BACKEND` environment variable ("clang" or "llvm")
+//! - `SVOD_CPU_BACKEND` environment variable ("clang" or "llvm")
 //! - Explicit `create_cpu_device_with_backend()` call
 
 use std::sync::Arc;
 
-use morok_device::Result;
-use morok_device::device::{Compiler, Device, Program, ProgramSpec, Renderer, RuntimeFactory};
-use morok_device::registry::DeviceRegistry;
-use morok_dtype::DeviceSpec;
-use morok_ir::UOp;
+use svod_device::Result;
+use svod_device::device::{Compiler, Device, Program, ProgramSpec, Renderer, RuntimeFactory};
+use svod_device::registry::DeviceRegistry;
+use svod_dtype::DeviceSpec;
+use svod_ir::UOp;
 
 use crate::LlvmKernel;
 use crate::clang::ClangKernel;
@@ -37,9 +37,9 @@ pub enum CpuBackend {
 }
 
 impl CpuBackend {
-    /// Select backend from environment variable MOROK_CPU_BACKEND.
+    /// Select backend from environment variable SVOD_CPU_BACKEND.
     pub fn from_env() -> Self {
-        match std::env::var("MOROK_CPU_BACKEND").as_deref() {
+        match std::env::var("SVOD_CPU_BACKEND").as_deref() {
             Ok("clang") | Ok("CLANG") => CpuBackend::Clang,
             Ok("llvm") | Ok("LLVM") => CpuBackend::Llvm,
             #[cfg(feature = "mlir")]
@@ -74,7 +74,7 @@ unsafe fn execute_parallel(
 ) -> Result<()> {
     use rayon::prelude::*;
 
-    let core_id_idx = var_names.iter().position(|n| n == "core_id").ok_or_else(|| morok_device::Error::Runtime {
+    let core_id_idx = var_names.iter().position(|n| n == "core_id").ok_or_else(|| svod_device::Error::Runtime {
         message: "parallel CPU launch requires core_id runtime variable".to_string(),
     })?;
     let fn_ptr_usize = fn_ptr as usize;
@@ -163,8 +163,8 @@ struct ClangRendererWrapper {
 
 impl Renderer for ClangRendererWrapper {
     fn render(&self, ast: &Arc<UOp>, name: Option<&str>) -> Result<ProgramSpec> {
-        let rendered = morok_codegen::c::render(ast, name.or(Some("kernel")))
-            .map_err(|e| morok_device::Error::Runtime { message: format!("C rendering failed: {}", e) })?;
+        let rendered = svod_codegen::c::render(ast, name.or(Some("kernel")))
+            .map_err(|e| svod_device::Error::Runtime { message: format!("C rendering failed: {}", e) })?;
 
         let mut spec = ProgramSpec::new(rendered.name.clone(), rendered.code.clone(), self.device.clone(), ast.clone());
 
@@ -186,8 +186,8 @@ impl Renderer for ClangRendererWrapper {
 struct ClangCompiler;
 
 impl Compiler for ClangCompiler {
-    fn compile(&self, spec: &ProgramSpec) -> Result<morok_device::device::CompiledSpec> {
-        let mut compiled = morok_device::device::CompiledSpec::from_source(
+    fn compile(&self, spec: &ProgramSpec) -> Result<svod_device::device::CompiledSpec> {
+        let mut compiled = svod_device::device::CompiledSpec::from_source(
             spec.name.clone(),
             spec.src.clone(),
             spec.ast.clone(),
@@ -205,13 +205,13 @@ impl Compiler for ClangCompiler {
 }
 
 /// Runtime factory for creating Clang programs.
-fn create_clang_program(spec: &morok_device::device::CompiledSpec) -> Result<Box<dyn Program>> {
-    let src = spec.src.as_ref().ok_or_else(|| morok_device::Error::Runtime {
+fn create_clang_program(spec: &svod_device::device::CompiledSpec) -> Result<Box<dyn Program>> {
+    let src = spec.src.as_ref().ok_or_else(|| svod_device::Error::Runtime {
         message: "Clang backend requires source code in CompiledSpec".to_string(),
     })?;
 
     let kernel = ClangKernel::compile(src, &spec.name, spec.var_names.clone(), spec.buf_count)
-        .map_err(|e| morok_device::Error::Runtime { message: format!("Clang compilation failed: {}", e) })?;
+        .map_err(|e| svod_device::Error::Runtime { message: format!("Clang compilation failed: {}", e) })?;
 
     Ok(Box::new(ClangProgram { kernel }))
 }
@@ -247,8 +247,8 @@ impl Program for LlvmProgram {
 struct LlvmCompiler;
 
 impl Compiler for LlvmCompiler {
-    fn compile(&self, spec: &morok_device::device::ProgramSpec) -> Result<morok_device::device::CompiledSpec> {
-        let mut compiled = morok_device::device::CompiledSpec::from_source(
+    fn compile(&self, spec: &svod_device::device::ProgramSpec) -> Result<svod_device::device::CompiledSpec> {
+        let mut compiled = svod_device::device::CompiledSpec::from_source(
             spec.name.clone(),
             spec.src.clone(),
             spec.ast.clone(),
@@ -272,8 +272,8 @@ struct LlvmRendererWrapper {
 
 impl Renderer for LlvmRendererWrapper {
     fn render(&self, ast: &Arc<UOp>, name: Option<&str>) -> Result<ProgramSpec> {
-        let rendered = morok_codegen::llvm::text::render(ast, name.or(Some("kernel")))
-            .map_err(|e| morok_device::Error::Runtime { message: format!("LLVM rendering failed: {}", e) })?;
+        let rendered = svod_codegen::llvm::text::render(ast, name.or(Some("kernel")))
+            .map_err(|e| svod_device::Error::Runtime { message: format!("LLVM rendering failed: {}", e) })?;
 
         let mut spec = ProgramSpec::new(rendered.name.clone(), rendered.code.clone(), self.device.clone(), ast.clone());
 
@@ -292,13 +292,13 @@ impl Renderer for LlvmRendererWrapper {
 }
 
 /// Runtime factory for creating LLVM programs.
-fn create_llvm_program(spec: &morok_device::device::CompiledSpec) -> Result<Box<dyn Program>> {
-    let src = spec.src.as_ref().ok_or_else(|| morok_device::Error::Runtime {
+fn create_llvm_program(spec: &svod_device::device::CompiledSpec) -> Result<Box<dyn Program>> {
+    let src = spec.src.as_ref().ok_or_else(|| svod_device::Error::Runtime {
         message: "LLVM JIT requires source code in CompiledSpec".to_string(),
     })?;
 
     let kernel = crate::LlvmKernel::compile_ir(src, &spec.name, &spec.name, spec.var_names.clone(), spec.buf_count)
-        .map_err(|e| morok_device::Error::Runtime { message: format!("LLVM JIT compilation failed: {}", e) })?;
+        .map_err(|e| svod_device::Error::Runtime { message: format!("LLVM JIT compilation failed: {}", e) })?;
 
     Ok(Box::new(LlvmProgram { kernel }))
 }
@@ -333,10 +333,9 @@ mod mlir_backend {
     ) -> Result<()> {
         use rayon::prelude::*;
 
-        let core_id_idx =
-            var_names.iter().position(|n| n == "core_id").ok_or_else(|| morok_device::Error::Runtime {
-                message: "parallel MLIR CPU launch requires core_id runtime variable".to_string(),
-            })?;
+        let core_id_idx = var_names.iter().position(|n| n == "core_id").ok_or_else(|| svod_device::Error::Runtime {
+            message: "parallel MLIR CPU launch requires core_id runtime variable".to_string(),
+        })?;
         let fn_ptr_usize = fn_ptr as usize;
 
         // Convert raw pointers to usize for Send-safe cross-thread sharing.
@@ -401,8 +400,8 @@ mod mlir_backend {
 
     impl Renderer for MlirRendererWrapper {
         fn render(&self, ast: &Arc<UOp>, name: Option<&str>) -> Result<ProgramSpec> {
-            let rendered = morok_codegen::mlir::render(ast, name.or(Some("kernel")))
-                .map_err(|e| morok_device::Error::Runtime { message: format!("MLIR rendering failed: {}", e) })?;
+            let rendered = svod_codegen::mlir::render(ast, name.or(Some("kernel")))
+                .map_err(|e| svod_device::Error::Runtime { message: format!("MLIR rendering failed: {}", e) })?;
 
             let mut spec =
                 ProgramSpec::new(rendered.name.clone(), rendered.code.clone(), self.device.clone(), ast.clone());
@@ -420,8 +419,8 @@ mod mlir_backend {
             &self.device
         }
 
-        fn decompositor(&self) -> Option<morok_ir::pattern::TypedPatternMatcher<()>> {
-            use morok_ir::decompositions::ptrcat_decomposition_patterns;
+        fn decompositor(&self) -> Option<svod_ir::pattern::TypedPatternMatcher<()>> {
+            use svod_ir::decompositions::ptrcat_decomposition_patterns;
             Some(ptrcat_decomposition_patterns())
         }
     }
@@ -430,8 +429,8 @@ mod mlir_backend {
     pub struct MlirCompiler;
 
     impl Compiler for MlirCompiler {
-        fn compile(&self, spec: &morok_device::device::ProgramSpec) -> Result<morok_device::device::CompiledSpec> {
-            let mut compiled = morok_device::device::CompiledSpec::from_source(
+        fn compile(&self, spec: &svod_device::device::ProgramSpec) -> Result<svod_device::device::CompiledSpec> {
+            let mut compiled = svod_device::device::CompiledSpec::from_source(
                 spec.name.clone(),
                 spec.src.clone(),
                 spec.ast.clone(),
@@ -449,13 +448,13 @@ mod mlir_backend {
     }
 
     /// Runtime factory for creating MLIR programs.
-    pub fn create_mlir_program(spec: &morok_device::device::CompiledSpec) -> Result<Box<dyn Program>> {
-        let src = spec.src.as_ref().ok_or_else(|| morok_device::Error::Runtime {
+    pub fn create_mlir_program(spec: &svod_device::device::CompiledSpec) -> Result<Box<dyn Program>> {
+        let src = spec.src.as_ref().ok_or_else(|| svod_device::Error::Runtime {
             message: "MLIR backend requires source code (MLIR text) in CompiledSpec".to_string(),
         })?;
 
         let kernel = crate::mlir::MlirKernel::compile(src, &spec.name, spec.var_names.clone()).map_err(|e| {
-            morok_device::Error::Runtime { message: format!("MLIR ExecutionEngine compilation failed: {}", e) }
+            svod_device::Error::Runtime { message: format!("MLIR ExecutionEngine compilation failed: {}", e) }
         })?;
 
         Ok(Box::new(MlirProgram { kernel }))
@@ -472,7 +471,7 @@ use mlir_backend::{MlirCompiler, MlirRendererWrapper, create_mlir_program};
 /// Create a CPU device with the default backend.
 ///
 /// The default backend is selected by:
-/// 1. `MOROK_CPU_BACKEND` environment variable ("clang" or "llvm")
+/// 1. `SVOD_CPU_BACKEND` environment variable ("clang" or "llvm")
 /// 2. If not set, defaults to Clang
 pub fn create_cpu_device(registry: &DeviceRegistry) -> Result<Device> {
     create_cpu_device_with_backend(registry, CpuBackend::from_env())

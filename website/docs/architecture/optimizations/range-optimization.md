@@ -34,7 +34,7 @@ After:   RANGE(end=3) * 4 + RANGE(end=4)
 
 **Guard**: Only fires when `end % c == 0` (exact divisibility). Non-divisible cases are left as-is.
 
-Tinygrad: `simplify.py:60-64`. Morok: `pm_split_ranges()` in `rangeify/transforms.rs`.
+Tinygrad: `simplify.py:60-64`. Svod: `pm_split_ranges()` in `rangeify/transforms.rs`.
 
 ---
 
@@ -59,7 +59,7 @@ After:   RANGE(0..32)                 One loop, indices via divmod
 - REDUCE scope must remain consistent
 - Both ranges must appear in the same REDUCE scopes
 
-Tinygrad: `simplify.py:39-41` (`simplify_merge_adjacent`). Morok: `pm_simplify_ranges()`.
+Tinygrad: `simplify.py:39-41` (`simplify_merge_adjacent`). Svod: `pm_simplify_ranges()`.
 
 ---
 
@@ -74,7 +74,7 @@ After:   END(comp, [r0, r1, r2])
 
 **Why**: Nested END chains arise from successive transformations. Flattening normalizes the structure so other patterns (merging, splitting) can operate on a clean range list.
 
-Tinygrad: `simplify.py:14-17`. Morok: `pm_flatten_range()`.
+Tinygrad: `simplify.py:14-17`. Svod: `pm_flatten_range()`.
 
 ---
 
@@ -95,7 +95,7 @@ After:   clamp(64 - length, 0, 64)                // Arithmetic: 3 ops
 
 This is the most powerful single optimization — it can eliminate entire reduction loops, converting O(N) computation to O(1).
 
-Tinygrad: `simplify.py:145-149`. Morok: `pm_load_collapse()`.
+Tinygrad: `simplify.py:145-149`. Svod: `pm_load_collapse()`.
 
 ---
 
@@ -134,7 +134,7 @@ Move comparisons outside the reduce scope to expose bound patterns:
 
 `x * bool.cast() → WHERE(bool, x, 0)` — converts multiplication by a boolean cast into a WHERE, which can then be analyzed by the bound patterns.
 
-Tinygrad: `simplify.py:82-142`. Morok: `pm_reduce_simplify()` + `reduce_collapse_inner_patterns()`.
+Tinygrad: `simplify.py:82-142`. Svod: `pm_reduce_simplify()` + `reduce_collapse_inner_patterns()`.
 
 ---
 
@@ -142,7 +142,7 @@ Tinygrad: `simplify.py:82-142`. Morok: `pm_reduce_simplify()` + `reduce_collapse
 
 **What**: Decide whether to materialize an intermediate result to a buffer or inline the computation. Often called "pcontig" in the codebase (short for partial contiguous — the optimization that inlines BUFFERIZE nodes by substituting range variables).
 
-When the rangeify pass creates a `BUFFERIZE` node (marking "this needs a buffer"), the buffer removal pass evaluates whether actually allocating memory is worthwhile. A `BUFFERIZE` is Morok's intermediate representation between "this needs a buffer" and the final `STORE`+`BUFFER`+`AFTER` — it lets this pass decide if materialization is actually needed. If the computation is cheap enough, it substitutes the range variables and inlines the expression directly.
+When the rangeify pass creates a `BUFFERIZE` node (marking "this needs a buffer"), the buffer removal pass evaluates whether actually allocating memory is worthwhile. A `BUFFERIZE` is Svod's intermediate representation between "this needs a buffer" and the final `STORE`+`BUFFER`+`AFTER` — it lets this pass decide if materialization is actually needed. If the computation is cheap enough, it substitutes the range variables and inlines the expression directly.
 
 ### Decision Tree
 
@@ -176,7 +176,7 @@ Unary operations (like negation) are NOT inlined when inside a reduce scope, eve
 | Identity fold | `INDEX(BUFFERIZE(compute, ranges), ranges) → compute` — same ranges cancel |
 | Nested flatten | `BUFFERIZE(BUFFERIZE(...))` — flatten nested bufferization |
 
-Morok: `buffer_removal_with_pcontig()` in `rangeify/patterns.rs`.
+Svod: `buffer_removal_with_pcontig()` in `rangeify/patterns.rs`.
 
 ---
 
@@ -195,7 +195,7 @@ Dead axes are removed from BUFFERIZE, then the shape is restored via RESHAPE (in
 Even when ALL ranges are dead (scalar output), BUFFERIZE must be kept with empty ranges — removing it entirely causes `NoKernelsFound` since no STORE gets created during kernel splitting.
 :::
 
-Morok: `dead_axis_removal()` in `rangeify/patterns.rs`.
+Svod: `dead_axis_removal()` in `rangeify/patterns.rs`.
 
 ---
 
@@ -211,7 +211,7 @@ Morok: `dead_axis_removal()` in `rangeify/patterns.rs`.
 
 Example: `sum(x, r=0..N)` where `x` doesn't depend on `r` → `x * N`. The sum of a constant over N iterations is N times the constant.
 
-Tinygrad: `simplify.py:82-86`. Morok: `pm_reduce_simplify()`.
+Tinygrad: `simplify.py:82-86`. Svod: `pm_reduce_simplify()`.
 
 ---
 
@@ -238,4 +238,4 @@ After:   REDUCE(                       // shape [256] → scalar (second stage)
 
 **Guard**: Only applies when the reduction dimension can be factored and the input/output ratio exceeds the threshold. Non-factorizable dimensions are skipped.
 
-Morok: `split_reduceop()` in `rangeify/kernel.rs`.
+Svod: `split_reduceop()` in `rangeify/kernel.rs`.

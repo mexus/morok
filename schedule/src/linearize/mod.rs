@@ -24,7 +24,7 @@
 //! # Usage
 //!
 //! ```ignore
-//! use morok_schedule::linearize::{linearize_with_cfg, linearize, CFGContext, pm_split_ends};
+//! use svod_schedule::linearize::{linearize_with_cfg, linearize, CFGContext, pm_split_ends};
 //!
 //! // For backends that need proper control flow ordering:
 //! let instructions = linearize_with_cfg(kernel_ast);
@@ -46,11 +46,11 @@ mod linearize;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use morok_ir::UOp;
-use morok_ir::op::Op;
-use morok_ir::pattern::TypedPatternMatcher;
-use morok_ir::rewrite::{graph_rewrite, graph_rewrite_bottom_up};
 use smallvec::{SmallVec, smallvec};
+use svod_ir::UOp;
+use svod_ir::op::Op;
+use svod_ir::pattern::TypedPatternMatcher;
+use svod_ir::rewrite::{graph_rewrite, graph_rewrite_bottom_up};
 
 pub use cfg_context::CFGContext;
 pub use linearize::linearize;
@@ -155,7 +155,7 @@ fn split_end(computation: &Arc<UOp>, ranges: &SmallVec<[Arc<UOp>; 4]>) -> Option
 /// Matches Tinygrad's `pm_add_control_flow` (linearizer.py:89-91) which adds
 /// CFG predecessors as extra sources to RANGE nodes via `x.replace(src=x.src+(y,))`.
 ///
-/// In Morok, we add predecessors to the `deps` field of `Op::Range`, which makes
+/// In Svod, we add predecessors to the `deps` field of `Op::Range`, which makes
 /// `InScopeRangesProperty` (via `children()`) naturally accumulate parent loop
 /// ranges. This gives nested RANGE nodes a higher `run_count`, ensuring they
 /// sort after operations that must appear outside them.

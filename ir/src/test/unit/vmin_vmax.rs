@@ -3,7 +3,7 @@
 use std::f32::consts::PI;
 
 use crate::{AxisId, ConstValue, Op, UOp};
-use morok_dtype::DType;
+use svod_dtype::DType;
 
 // ============================================================================
 // Test Constants

@@ -11,8 +11,8 @@
 //! # Example
 //!
 //! ```ignore
-//! use morok_tensor::{Variable, Tensor};
-//! use morok_dtype::DType;
+//! use svod_tensor::{Variable, Tensor};
+//! use svod_dtype::DType;
 //!
 //! let batch = Variable::new("batch", 1, 32);
 //! let bound = batch.bind(16)?;
@@ -23,8 +23,8 @@
 
 use std::sync::Arc;
 
-use morok_dtype::DType;
-use morok_ir::{ConstValue, Op, SInt, UOp};
+use svod_dtype::DType;
+use svod_ir::{ConstValue, Op, SInt, UOp};
 
 use crate::error::{Result, VariableOutOfRangeSnafu};
 use snafu::ensure;

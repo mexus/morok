@@ -1,13 +1,13 @@
 use std::path::Path;
 
-use morok_dtype::{DType, ScalarDType};
-use morok_ir::ConstValue;
-use morok_tensor::Tensor;
+use svod_dtype::{DType, ScalarDType};
+use svod_ir::ConstValue;
+use svod_tensor::Tensor;
 
 use crate::error::{Error, Result, UnsupportedDTypeSnafu};
 use crate::parser::onnx::{TensorProto, tensor_proto};
 
-/// Convert ONNX DataType to Morok DType.
+/// Convert ONNX DataType to Svod DType.
 pub fn convert_onnx_dtype(onnx_dtype: i32) -> Result<DType> {
     use tensor_proto::DataType;
 

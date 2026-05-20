@@ -14,12 +14,12 @@
 //! `frames_to_words` grouping all live inside [`HeadDecoder`].
 
 use bon::bon;
-use morok_arch::ctc::CtcDecoder;
-use morok_arch::rnnt::{RnntDecoder, RnntOpts};
-use morok_tensor::PrepareConfig;
 use snafu::{ResultExt, Snafu};
+use svod_arch::ctc::CtcDecoder;
+use svod_arch::rnnt::{RnntDecoder, RnntOpts};
+use svod_tensor::PrepareConfig;
 
-pub use morok_arch::rnnt::Word;
+pub use svod_arch::rnnt::Word;
 
 use crate::audio::{AudioChunk, EncoderBounds, MelConfig, MelSpectrogram, Splitter};
 use crate::gigaam::SubsamplingMode;
@@ -32,7 +32,7 @@ use crate::jit::InputSpec;
 /// User-facing knobs for [`Transcriber::transcribe`].
 ///
 /// Construct with [`TranscribeOpts::builder`] (per-field overrides) or
-/// [`TranscribeOpts::from_env`] (read `MOROK_*` env vars with sensible
+/// [`TranscribeOpts::from_env`] (read `SVOD_*` env vars with sensible
 /// fallbacks). The two agree — `from_env()` is just `builder().build()` —
 /// so `builder().word_timestamps(true).build()` still consults env for the
 /// rest of the fields.
@@ -41,9 +41,9 @@ use crate::jit::InputSpec;
 ///
 /// | Field             | Env var                | Fallback |
 /// |-------------------|------------------------|----------|
-/// | `word_timestamps` | `MOROK_TIMESTAMPS=1`   | `false`  |
-/// | `beam_decode`     | `MOROK_BEAM_DECODE=1`  | `false`  |
-/// | `max_scores_mib`  | `MOROK_MAX_SCORES_MIB` | `256`    |
+/// | `word_timestamps` | `SVOD_TIMESTAMPS=1`   | `false`  |
+/// | `beam_decode`     | `SVOD_BEAM_DECODE=1`  | `false`  |
+/// | `max_scores_mib`  | `SVOD_MAX_SCORES_MIB` | `256`    |
 ///
 /// VAD-specific knobs (`threshold`, `min_duration`, …) live on
 /// [`SileroVadSplitter`](super::SileroVadSplitter), not here.
@@ -70,21 +70,21 @@ impl Default for TranscribeOpts {
 #[bon]
 impl TranscribeOpts {
     /// Build via the [`bon`] builder. Each field default consults its
-    /// `MOROK_*` env var (see the struct docs for the full table) before
+    /// `SVOD_*` env var (see the struct docs for the full table) before
     /// falling back to a literal — so `builder().build()` produces the same
     /// values as [`from_env`](Self::from_env), and partial overrides
     /// (`.word_timestamps(true).build()`) still env-read the rest.
     #[builder]
     pub fn builder(
-        #[builder(default = std::env::var("MOROK_TIMESTAMPS").as_deref() == Ok("1"))] word_timestamps: bool,
-        #[builder(default = std::env::var("MOROK_BEAM_DECODE").as_deref() == Ok("1"))] beam_decode: bool,
-        #[builder(default = std::env::var("MOROK_MAX_SCORES_MIB").ok().and_then(|s| s.parse().ok()).unwrap_or(256))]
+        #[builder(default = std::env::var("SVOD_TIMESTAMPS").as_deref() == Ok("1"))] word_timestamps: bool,
+        #[builder(default = std::env::var("SVOD_BEAM_DECODE").as_deref() == Ok("1"))] beam_decode: bool,
+        #[builder(default = std::env::var("SVOD_MAX_SCORES_MIB").ok().and_then(|s| s.parse().ok()).unwrap_or(256))]
         max_scores_mib: usize,
     ) -> Self {
         Self { word_timestamps, beam_decode, max_scores_mib }
     }
 
-    /// Build from `MOROK_*` env vars with the same fallbacks as the
+    /// Build from `SVOD_*` env vars with the same fallbacks as the
     /// builder. Equivalent to `Self::builder().build()`.
     pub fn from_env() -> Self {
         Self::builder().build()
@@ -189,7 +189,7 @@ fn transpose_dt_to_td(src: &[f32], d_model: usize, t_exec_sub: usize, actual_sub
 }
 
 fn rnnt_decode_err<E: std::error::Error + 'static>(
-    e: morok_arch::rnnt::RnntDecodeError<crate::jit::JitError>,
+    e: svod_arch::rnnt::RnntDecodeError<crate::jit::JitError>,
 ) -> TranscribeError<E> {
     TranscribeError::RnntDecode { source: Box::new(e) }
 }
@@ -198,7 +198,7 @@ fn rnnt_decode_err<E: std::error::Error + 'static>(
 
 /// Generic over the splitter error type so per-impl errors stay
 /// pattern-matchable rather than being type-erased into `Box<dyn Error>`.
-/// Mirrors the `morok_arch::rnnt::RnntDecodeError<JitError>` shape.
+/// Mirrors the `svod_arch::rnnt::RnntDecodeError<JitError>` shape.
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub(crate)))]
 pub enum TranscribeError<E: std::error::Error + 'static> {
@@ -210,9 +210,9 @@ pub enum TranscribeError<E: std::error::Error + 'static> {
         source: Box<crate::jit::JitError>,
     },
     #[snafu(display("{source}"))]
-    CtcDecode { source: morok_arch::ctc::DecodeError },
+    CtcDecode { source: svod_arch::ctc::DecodeError },
     #[snafu(display("{source}"))]
-    RnntDecode { source: Box<morok_arch::rnnt::RnntDecodeError<crate::jit::JitError>> },
+    RnntDecode { source: Box<svod_arch::rnnt::RnntDecodeError<crate::jit::JitError>> },
     #[snafu(display("{source}"))]
     Model {
         #[snafu(source(from(crate::gigaam::error::Error, Box::new)))]
@@ -220,13 +220,13 @@ pub enum TranscribeError<E: std::error::Error + 'static> {
     },
     #[snafu(display("{source}"))]
     Tensor {
-        #[snafu(source(from(morok_tensor::error::Error, Box::new)))]
-        source: Box<morok_tensor::error::Error>,
+        #[snafu(source(from(svod_tensor::error::Error, Box::new)))]
+        source: Box<svod_tensor::error::Error>,
     },
     #[snafu(display("{source}"))]
     Device {
-        #[snafu(source(from(morok_device::error::Error, Box::new)))]
-        source: Box<morok_device::error::Error>,
+        #[snafu(source(from(svod_device::error::Error, Box::new)))]
+        source: Box<svod_device::error::Error>,
     },
     #[snafu(display("WAV is {wav_sr} Hz, model expects {model_sr} Hz (resample first)"))]
     SampleRateMismatch { wav_sr: u32, model_sr: u32 },
@@ -306,9 +306,9 @@ impl<S: Splitter> Transcriber<S> {
             Head::Ctc(_) => {
                 let decoder = if opts.beam_decode {
                     match &model.config.decoder {
-                        CtcDecoder::Greedy(g) => CtcDecoder::Beam(Box::new(morok_arch::ctc::BeamDecoder::new(
+                        CtcDecoder::Greedy(g) => CtcDecoder::Beam(Box::new(svod_arch::ctc::BeamDecoder::new(
                             g.vocabulary().to_vec(),
-                            morok_arch::ctc::BeamOpts::default(),
+                            svod_arch::ctc::BeamOpts::default(),
                         ))),
                         other => other.clone(),
                     }

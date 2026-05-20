@@ -7,8 +7,8 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use morok_dtype::{DType, ScalarDType};
-use morok_ir::{BinaryOp, Op, ReduceOp, TernaryOp, UnaryOp, prelude::*};
+use svod_dtype::{DType, ScalarDType};
+use svod_ir::{BinaryOp, Op, ReduceOp, TernaryOp, UnaryOp, prelude::*};
 
 use super::types::{c_cast, c_dtype, c_math_fn};
 use crate::common::format_custom_template_strict;

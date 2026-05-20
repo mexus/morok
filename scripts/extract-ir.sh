@@ -8,9 +8,9 @@
 #   ./scripts/extract-ir.sh <test_name> [-p <package>] [-o <output>] [-t <target>]
 #
 # Examples:
-#   ./scripts/extract-ir.sh test_sum_axis1_value -p morok-tensor
-#   ./scripts/extract-ir.sh light_densenet121 -p morok-onnx -o /tmp/ir.txt
-#   ./scripts/extract-ir.sh light_densenet121 -p morok-onnx -t optimizer  # only optimizer stages
+#   ./scripts/extract-ir.sh test_sum_axis1_value -p svod-tensor
+#   ./scripts/extract-ir.sh light_densenet121 -p svod-onnx -o /tmp/ir.txt
+#   ./scripts/extract-ir.sh light_densenet121 -p svod-onnx -t optimizer  # only optimizer stages
 
 set -euo pipefail
 
@@ -26,7 +26,7 @@ Arguments:
   test_name       Cargo test name filter (passed to `cargo test`)
 
 Options:
-  -p <package>    Cargo package filter (e.g. morok-tensor)
+  -p <package>    Cargo package filter (e.g. svod-tensor)
   -o <output>     Output file (default: ir_<test_name>.txt)
   -t <target>     Filter by target module (regex, e.g. "optimizer", "codegen")
   -h              Show this help
@@ -54,12 +54,12 @@ done
 
 OUTPUT="${OUTPUT:-ir_${TEST_NAME}.txt}"
 
-RUST_LOG="morok_schedule::rangeify::transforms=debug,\
-morok_schedule::rangeify::indexing=debug,\
-morok_schedule::rangeify::kernel=debug,\
-morok_schedule::optimizer=debug,\
-morok_schedule::linearize=debug,\
-morok_codegen=debug"
+RUST_LOG="svod_schedule::rangeify::transforms=debug,\
+svod_schedule::rangeify::indexing=debug,\
+svod_schedule::rangeify::kernel=debug,\
+svod_schedule::optimizer=debug,\
+svod_schedule::linearize=debug,\
+svod_codegen=debug"
 
 CARGO_ARGS=(test --release "$TEST_NAME" -- --nocapture --test-threads=1)
 [[ -n "$PACKAGE" ]] && CARGO_ARGS=(test --release "$TEST_NAME" -p "$PACKAGE" --lib -- --nocapture --test-threads=1)

@@ -9,11 +9,11 @@
 //! Based on Tinygrad's fix_group_for_reduce (expander.py:128-141).
 
 use super::helpers::*;
-use morok_dtype::DType;
-use morok_ir::types::ConstValue;
-use morok_ir::{AddrSpace, AxisId, AxisType, Op, ReduceOp, UOp};
 use smallvec::smallvec;
 use std::sync::Arc;
+use svod_dtype::DType;
+use svod_ir::types::ConstValue;
+use svod_ir::{AddrSpace, AxisId, AxisType, Op, ReduceOp, UOp};
 
 /// Create a GROUP_REDUCE range for testing.
 fn create_group_reduce_range(axis_id: usize, size: i64) -> Arc<UOp> {

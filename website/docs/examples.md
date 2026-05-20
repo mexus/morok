@@ -4,7 +4,7 @@ sidebar_label: Hands-On Examples
 
 # Hands-On: From Tensors to Models
 
-This chapter teaches Morok through progressive examples. You'll start with basic tensor operations and build up to a working neural network classifier.
+This chapter teaches Svod through progressive examples. You'll start with basic tensor operations and build up to a working neural network classifier.
 
 **What you'll learn:**
 - Creating and manipulating tensors
@@ -15,9 +15,9 @@ This chapter teaches Morok through progressive examples. You'll start with basic
 
 **Prerequisites:**
 - Basic Rust knowledge
-- Add `morok_tensor` to your `Cargo.toml`
+- Add `svod_tensor` to your `Cargo.toml`
 
-**Key pattern:** Morok uses *lazy evaluation*. Operations build a computation graph without executing. Call `realize()` to compile and run everything at once.
+**Key pattern:** Svod uses *lazy evaluation*. Operations build a computation graph without executing. Call `realize()` to compile and run everything at once.
 
 ---
 
@@ -26,7 +26,7 @@ This chapter teaches Morok through progressive examples. You'll start with basic
 Let's create tensors, perform operations, and get results.
 
 ```rust
-use morok_tensor::Tensor;
+use svod_tensor::Tensor;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create tensors from slices
@@ -53,7 +53,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 2. `&a + &b` doesn't compute anything yet. It returns a new `Tensor` that *represents* the addition. The `&` borrows the tensors so we can reuse them.
 
-3. `realize()` is where the magic happens. Morok:
+3. `realize()` is where the magic happens. Svod:
    - Analyzes the computation graph
    - Fuses operations where possible
    - Generates optimized code
@@ -178,14 +178,14 @@ The inner dimensions must match (the `K`). Think of it as: "for each row of left
 
 ## Example 4: Building a Linear Layer
 
-A linear layer computes `y = x @ W.T + b`. Morok provides `nn::Linear` out of the box.
+A linear layer computes `y = x @ W.T + b`. Svod provides `nn::Linear` out of the box.
 
 ```rust
-use morok_tensor::{Tensor, nn::{Linear, Layer}};
+use svod_tensor::{Tensor, nn::{Linear, Layer}};
 
 fn linear_example() -> Result<(), Box<dyn std::error::Error>> {
     // Create a layer: 4 inputs → 2 outputs
-    let layer = Linear::with_dims(4, 2, morok_dtype::DType::Float32);
+    let layer = Linear::with_dims(4, 2, svod_dtype::DType::Float32);
 
     // Single sample with 4 features
     let input = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0]);
@@ -216,12 +216,12 @@ This convention makes it easy to read the weight matrix: row `i` contains all we
 Let's build a complete neural network using `sequential()` to chain layers.
 
 ```rust
-use morok_tensor::{Tensor, nn::{Linear, Relu, Layer}};
+use svod_tensor::{Tensor, nn::{Linear, Relu, Layer}};
 
 fn mnist_example() -> Result<(), Box<dyn std::error::Error>> {
     // Architecture: 784 (28×28 pixels) → 128 (hidden) → 10 (digits)
-    let fc1 = Linear::with_dims(784, 128, morok_dtype::DType::Float32);
-    let fc2 = Linear::with_dims(128, 10, morok_dtype::DType::Float32);
+    let fc1 = Linear::with_dims(784, 128, svod_dtype::DType::Float32);
+    let fc2 = Linear::with_dims(128, 10, svod_dtype::DType::Float32);
 
     // Simulate a 28×28 grayscale image (flattened to 784)
     let fake_image: Vec<f32> = (0..784)
@@ -263,7 +263,7 @@ fn mnist_example() -> Result<(), Box<dyn std::error::Error>> {
 
 ## Example 6: Under the Hood
 
-Want to see what Morok generates? Here's how to inspect the IR and generated code.
+Want to see what Svod generates? Here's how to inspect the IR and generated code.
 
 ```rust
 fn inspect_compilation() -> Result<(), Box<dyn std::error::Error>> {
@@ -288,9 +288,9 @@ fn inspect_compilation() -> Result<(), Box<dyn std::error::Error>> {
 
 **What you'll see:**
 
-1. **IR Graph:** The UOp tree shows operations like `BUFFER`, `LOAD`, `ADD`, `STORE`. This is Morok's intermediate representation before optimization.
+1. **IR Graph:** The UOp tree shows operations like `BUFFER`, `LOAD`, `ADD`, `STORE`. This is Svod's intermediate representation before optimization.
 
-2. **Generated Code:** The actual LLVM IR or GPU code that runs. Notice how Morok fuses the loads and add into a single kernel—no intermediate buffers needed.
+2. **Generated Code:** The actual LLVM IR or GPU code that runs. Notice how Svod fuses the loads and add into a single kernel—no intermediate buffers needed.
 
 **Debugging tip:** If something seems slow or wrong, print the IR tree. Look for:
 - Unexpected operations (redundant reshapes, extra copies)
@@ -301,7 +301,7 @@ fn inspect_compilation() -> Result<(), Box<dyn std::error::Error>> {
 
 ## Summary
 
-You've learned the core patterns for using Morok:
+You've learned the core patterns for using Svod:
 
 | Task | Code |
 |------|------|
@@ -321,7 +321,7 @@ You've learned the core patterns for using Morok:
 
 1. Build your computation graph with operations
 2. Call `realize()` once at the end
-3. Morok optimizes and executes everything together
+3. Svod optimizes and executes everything together
 
 **Next steps:**
 

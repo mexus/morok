@@ -6,7 +6,7 @@
 //! - Multi-consumer patterns
 //! - Complex indexing scenarios
 
-use morok_ir::{DType, Op, UOp};
+use svod_ir::{DType, Op, UOp};
 
 use crate::rangeify::transforms::rangeify;
 
@@ -123,8 +123,8 @@ fn test_deeply_nested_bufferize() {
 
 #[test]
 fn test_bufferize_multiple_consumers() {
-    use morok_ir::SInt;
-    use morok_ir::shape::Shape;
+    use svod_ir::SInt;
+    use svod_ir::shape::Shape;
 
     // Test single BUFFERIZE with multiple consumers
     // Pattern: buf = BUFFERIZE(x); y = f(buf); z = g(buf)

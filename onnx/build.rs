@@ -22,15 +22,15 @@ mod {fn_name} {{
 
     #[test]
     {attr}fn clang() {{
-        ::morok_schedule::testing::setup_test_tracing();
-        let config = morok_tensor::PrepareConfig::for_cpu_backend(morok_tensor::CpuBackend::Clang);
+        ::svod_schedule::testing::setup_test_tracing();
+        let config = svod_tensor::PrepareConfig::for_cpu_backend(svod_tensor::CpuBackend::Clang);
         {helper_call}
     }}
 
     #[test]
     {attr}fn llvm() {{
-        ::morok_schedule::testing::setup_test_tracing();
-        let config = morok_tensor::PrepareConfig::for_cpu_backend(morok_tensor::CpuBackend::Llvm);
+        ::svod_schedule::testing::setup_test_tracing();
+        let config = svod_tensor::PrepareConfig::for_cpu_backend(svod_tensor::CpuBackend::Llvm);
         {helper_call}
     }}
 }}

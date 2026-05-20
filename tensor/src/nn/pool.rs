@@ -1,8 +1,8 @@
 //! Sliding-window pooling: pool, avg_pool2d, max_pool2d, max_pool2d_with_indices.
 
 use bon::bon;
-use morok_dtype::DType;
-use morok_ir::{ConstValue, SInt, UOp};
+use svod_dtype::DType;
+use svod_ir::{ConstValue, SInt, UOp};
 
 use crate::Tensor;
 use crate::error::DivisibilitySnafu;
@@ -161,7 +161,7 @@ impl Tensor {
     /// Basic 2x2 average pooling:
     ///
     /// ```
-    /// # use morok_tensor::Tensor;
+    /// # use svod_tensor::Tensor;
     /// # use ndarray::Array4;
     /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 4, 4), 1.0f32));
     /// let mut y = x.avg_pool2d().kernel_size(&[2, 2]).call().unwrap();
@@ -174,7 +174,7 @@ impl Tensor {
     /// With explicit stride:
     ///
     /// ```
-    /// # use morok_tensor::Tensor;
+    /// # use svod_tensor::Tensor;
     /// # use ndarray::Array4;
     /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 4, 4), 1.0f32));
     /// let y = x.avg_pool2d().kernel_size(&[2, 2]).stride(&[1, 1]).call().unwrap();
@@ -185,7 +185,7 @@ impl Tensor {
     /// With padding and `count_include_pad` disabled:
     ///
     /// ```
-    /// # use morok_tensor::Tensor;
+    /// # use svod_tensor::Tensor;
     /// # use ndarray::Array4;
     /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 2, 2), 1.0f32));
     /// let mut y = x.avg_pool2d()
@@ -294,7 +294,7 @@ impl Tensor {
     /// Basic 2x2 max pooling:
     ///
     /// ```
-    /// # use morok_tensor::Tensor;
+    /// # use svod_tensor::Tensor;
     /// # use ndarray::Array4;
     /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 4, 4), 1.0f32));
     /// let mut y = x.max_pool2d().kernel_size(&[2, 2]).call().unwrap();
@@ -307,7 +307,7 @@ impl Tensor {
     /// With stride and padding:
     ///
     /// ```
-    /// # use morok_tensor::Tensor;
+    /// # use svod_tensor::Tensor;
     /// # use ndarray::Array4;
     /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 4, 4), 1.0f32));
     /// let mut y = x.max_pool2d()
@@ -373,7 +373,7 @@ impl Tensor {
     /// # Examples
     ///
     /// ```
-    /// # use morok_tensor::Tensor;
+    /// # use svod_tensor::Tensor;
     /// # use ndarray::Array4;
     /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 4, 4), 1.0f32));
     /// let (mut values, indices) = x.max_pool2d_with_indices()
@@ -475,7 +475,7 @@ impl Tensor {
     /// Round-trip with max_pool2d_with_indices:
     ///
     /// ```
-    /// # use morok_tensor::Tensor;
+    /// # use svod_tensor::Tensor;
     /// # use ndarray::Array4;
     /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 4, 4), 1.0f32));
     /// let (values, indices) = x.max_pool2d_with_indices()
@@ -573,7 +573,7 @@ impl Tensor {
     /// Reconstruct a 4x4 image from 2x2 blocks with no overlap:
     ///
     /// ```
-    /// # use morok_tensor::Tensor;
+    /// # use svod_tensor::Tensor;
     /// # use ndarray::Array3;
     /// // 1 batch, 1 channel, 2x2 block = 4 cols, 4 sliding positions
     /// let cols = Tensor::from_ndarray(&Array3::from_elem((1, 4, 4), 1.0f32));

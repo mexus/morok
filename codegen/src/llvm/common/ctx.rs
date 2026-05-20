@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use morok_ir::{ConstValue, Op, prelude::*};
+use svod_ir::{ConstValue, Op, prelude::*};
 
 use super::types::{lconst, ldt};
 

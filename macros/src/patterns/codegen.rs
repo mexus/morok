@@ -146,8 +146,8 @@ enum OpClass {
 }
 
 /// Binary IR operations.
-/// NOTE: Must stay in sync with morok_ir::types::BinaryOp variants.
-/// The generated metadata at morok_ir::op::pattern_derived::pattern_metadata::BINARY_OPS
+/// NOTE: Must stay in sync with svod_ir::types::BinaryOp variants.
+/// The generated metadata at svod_ir::op::pattern_derived::pattern_metadata::BINARY_OPS
 /// can be used for runtime validation.
 const BINARY_OPS: &[&str] = &[
     "Add", "Mul", "Sub", "Mod", "Max", "Pow", "Idiv", "Fdiv", "Lt", "Le", "Eq", "Ne", "Gt", "Ge", "And", "Or", "Xor",
@@ -155,7 +155,7 @@ const BINARY_OPS: &[&str] = &[
 ];
 
 /// Unary IR operations.
-/// NOTE: Must stay in sync with morok_ir::types::UnaryOp variants.
+/// NOTE: Must stay in sync with svod_ir::types::UnaryOp variants.
 const UNARY_OPS: &[&str] = &[
     "Neg",
     "Not",
@@ -180,7 +180,7 @@ const UNARY_OPS: &[&str] = &[
 ];
 
 /// Ternary IR operations.
-/// NOTE: Must stay in sync with morok_ir::types::TernaryOp variants.
+/// NOTE: Must stay in sync with svod_ir::types::TernaryOp variants.
 const TERNARY_OPS: &[&str] = &["Where", "MulAcc"];
 
 /// Single-source operations mapped to their pattern helper method names.
@@ -350,16 +350,16 @@ fn generate_op_validation(op_names: &std::collections::HashSet<String>) -> Token
             let op_ident = format_ident!("{}", name);
             match op_class {
                 OpClass::Binary => quote! {
-                    let _ = morok_ir::BinaryOp::#op_ident;
+                    let _ = svod_ir::BinaryOp::#op_ident;
                 },
                 OpClass::Unary => quote! {
-                    let _ = morok_ir::UnaryOp::#op_ident;
+                    let _ = svod_ir::UnaryOp::#op_ident;
                 },
                 OpClass::Ternary => quote! {
-                    let _ = morok_ir::TernaryOp::#op_ident;
+                    let _ = svod_ir::TernaryOp::#op_ident;
                 },
                 OpClass::SingleSource | OpClass::Special => quote! {
-                    let _ = morok_ir::op::pattern_derived::OpKey::#op_ident;
+                    let _ = svod_ir::op::pattern_derived::OpKey::#op_ident;
                 },
             }
         })
@@ -407,19 +407,19 @@ fn compute_op_keys(pattern: &Pattern, iter_ctx: Option<&IterContext>) -> Vec<Tok
 
         // Constants - OpKey::Const
         Pattern::Const(_) | Pattern::ConstWithValue { .. } => {
-            vec![quote! { morok_ir::op::pattern_derived::OpKey::Const }]
+            vec![quote! { svod_ir::op::pattern_derived::OpKey::Const }]
         }
 
         // VConst - OpKey::VConst
         Pattern::VConstWithValue { .. } => {
-            vec![quote! { morok_ir::op::pattern_derived::OpKey::VConst }]
+            vec![quote! { svod_ir::op::pattern_derived::OpKey::VConst }]
         }
 
         // AnyConst - matches both Const and VConst
         Pattern::AnyConstWithValue { .. } => {
             vec![
-                quote! { morok_ir::op::pattern_derived::OpKey::Const },
-                quote! { morok_ir::op::pattern_derived::OpKey::VConst },
+                quote! { svod_ir::op::pattern_derived::OpKey::Const },
+                quote! { svod_ir::op::pattern_derived::OpKey::VConst },
             ]
         }
 
@@ -430,13 +430,13 @@ fn compute_op_keys(pattern: &Pattern, iter_ctx: Option<&IterContext>) -> Vec<Tok
                     let op_ident = &ctx.op_ident;
                     match ctx.op_kind {
                         OpKind::Unary => vec![quote! {
-                            morok_ir::op::pattern_derived::OpKey::Unary(morok_ir::UnaryOp::#op_ident)
+                            svod_ir::op::pattern_derived::OpKey::Unary(svod_ir::UnaryOp::#op_ident)
                         }],
                         OpKind::Binary => vec![quote! {
-                            morok_ir::op::pattern_derived::OpKey::Binary(morok_ir::BinaryOp::#op_ident)
+                            svod_ir::op::pattern_derived::OpKey::Binary(svod_ir::BinaryOp::#op_ident)
                         }],
                         OpKind::Ternary => vec![quote! {
-                            morok_ir::op::pattern_derived::OpKey::Ternary(morok_ir::TernaryOp::#op_ident)
+                            svod_ir::op::pattern_derived::OpKey::Ternary(svod_ir::TernaryOp::#op_ident)
                         }],
                     }
                 } else {
@@ -478,7 +478,7 @@ fn compute_op_key_for_op(op_name: &str) -> Vec<TokenStream2> {
     if BINARY_OPS.contains(&op_name) {
         let op_ident = format_ident!("{}", op_name);
         return vec![quote! {
-            morok_ir::op::pattern_derived::OpKey::Binary(morok_ir::BinaryOp::#op_ident)
+            svod_ir::op::pattern_derived::OpKey::Binary(svod_ir::BinaryOp::#op_ident)
         }];
     }
 
@@ -486,7 +486,7 @@ fn compute_op_key_for_op(op_name: &str) -> Vec<TokenStream2> {
     if UNARY_OPS.contains(&op_name) {
         let op_ident = format_ident!("{}", op_name);
         return vec![quote! {
-            morok_ir::op::pattern_derived::OpKey::Unary(morok_ir::UnaryOp::#op_ident)
+            svod_ir::op::pattern_derived::OpKey::Unary(svod_ir::UnaryOp::#op_ident)
         }];
     }
 
@@ -494,14 +494,14 @@ fn compute_op_key_for_op(op_name: &str) -> Vec<TokenStream2> {
     if TERNARY_OPS.contains(&op_name) {
         let op_ident = format_ident!("{}", op_name);
         return vec![quote! {
-            morok_ir::op::pattern_derived::OpKey::Ternary(morok_ir::TernaryOp::#op_ident)
+            svod_ir::op::pattern_derived::OpKey::Ternary(svod_ir::TernaryOp::#op_ident)
         }];
     }
 
     // For other ops, use the variant-specific OpKey
     let op_ident = format_ident!("{}", op_name);
     vec![quote! {
-        morok_ir::op::pattern_derived::OpKey::#op_ident
+        svod_ir::op::pattern_derived::OpKey::#op_ident
     }]
 }
 
@@ -592,8 +592,8 @@ fn generate_inline_match(
             let uop_ident = Ident::new(&actual_name, uop_name.span());
             Ok(InlineMatchOutput::simple(
                 quote! {
-                    let morok_ir::Op::Const(__cv) = #tree_var.op() else {
-                        return morok_ir::pattern::RewriteResult::NoMatch;
+                    let svod_ir::Op::Const(__cv) = #tree_var.op() else {
+                        return svod_ir::pattern::RewriteResult::NoMatch;
                     };
                     let #value_name = __cv.0.clone();
                 },
@@ -607,8 +607,8 @@ fn generate_inline_match(
             let uop_ident = Ident::new(&actual_name, uop_name.span());
             Ok(InlineMatchOutput::simple(
                 quote! {
-                    let morok_ir::Op::VConst { values: __vconst_values } = #tree_var.op() else {
-                        return morok_ir::pattern::RewriteResult::NoMatch;
+                    let svod_ir::Op::VConst { values: __vconst_values } = #tree_var.op() else {
+                        return svod_ir::pattern::RewriteResult::NoMatch;
                     };
                     let #values_name = __vconst_values.clone();
                 },
@@ -622,10 +622,10 @@ fn generate_inline_match(
             let uop_ident = Ident::new(&actual_name, uop_name.span());
             Ok(InlineMatchOutput::simple(
                 quote! {
-                    let #values_name: Vec<morok_ir::ConstValue> = match #tree_var.op() {
-                        morok_ir::Op::Const(cv) => vec![cv.0.clone()],
-                        morok_ir::Op::VConst { values } => values.clone(),
-                        _ => return morok_ir::pattern::RewriteResult::NoMatch,
+                    let #values_name: Vec<svod_ir::ConstValue> = match #tree_var.op() {
+                        svod_ir::Op::Const(cv) => vec![cv.0.clone()],
+                        svod_ir::Op::VConst { values } => values.clone(),
+                        _ => return svod_ir::pattern::RewriteResult::NoMatch,
                     };
                 },
                 vec![(uop_ident, quote! { #tree_var })],
@@ -645,7 +645,7 @@ fn generate_inline_match(
             Ok(InlineMatchOutput::simple(
                 quote! {
                     if #tree_var.is_some() {
-                        return morok_ir::pattern::RewriteResult::NoMatch;
+                        return svod_ir::pattern::RewriteResult::NoMatch;
                     }
                 },
                 vec![],
@@ -661,7 +661,7 @@ fn generate_inline_match(
             // Prepend the Option unwrap to match_code, keep inner's orderings
             let match_code = quote! {
                 let Some(#inner_var) = #tree_var else {
-                    return morok_ir::pattern::RewriteResult::NoMatch;
+                    return svod_ir::pattern::RewriteResult::NoMatch;
                 };
                 #inner_code
             };
@@ -694,8 +694,8 @@ fn generate_inline_op_tuple_match(
 
             // Generate match code
             let match_code = quote! {
-                let morok_ir::Op::Binary(morok_ir::BinaryOp::#binary_op, #left_var, #right_var) = #tree_var.op() else {
-                    return morok_ir::pattern::RewriteResult::NoMatch;
+                let svod_ir::Op::Binary(svod_ir::BinaryOp::#binary_op, #left_var, #right_var) = #tree_var.op() else {
+                    return svod_ir::pattern::RewriteResult::NoMatch;
                 };
             };
 
@@ -743,8 +743,8 @@ fn generate_inline_op_tuple_match(
             let src_var = format_ident!("{}_src", tree_var);
 
             let match_code = quote! {
-                let morok_ir::Op::Unary(morok_ir::UnaryOp::#unary_op, #src_var) = #tree_var.op() else {
-                    return morok_ir::pattern::RewriteResult::NoMatch;
+                let svod_ir::Op::Unary(svod_ir::UnaryOp::#unary_op, #src_var) = #tree_var.op() else {
+                    return svod_ir::pattern::RewriteResult::NoMatch;
                 };
             };
 
@@ -782,8 +782,8 @@ fn generate_inline_op_tuple_match(
             let c_var = format_ident!("{}_c", tree_var);
 
             let match_code = quote! {
-                let morok_ir::Op::Ternary(morok_ir::TernaryOp::#ternary_op, #a_var, #b_var, #c_var) = #tree_var.op() else {
-                    return morok_ir::pattern::RewriteResult::NoMatch;
+                let svod_ir::Op::Ternary(svod_ir::TernaryOp::#ternary_op, #a_var, #b_var, #c_var) = #tree_var.op() else {
+                    return svod_ir::pattern::RewriteResult::NoMatch;
                 };
             };
 
@@ -847,8 +847,8 @@ fn generate_inline_single_source_match(
     let src_var = format_ident!("{}_src", tree_var);
 
     let match_code = quote! {
-        let morok_ir::Op::#op_ident { src: #src_var, .. } = #tree_var.op() else {
-            return morok_ir::pattern::RewriteResult::NoMatch;
+        let svod_ir::Op::#op_ident { src: #src_var, .. } = #tree_var.op() else {
+            return svod_ir::pattern::RewriteResult::NoMatch;
         };
     };
 
@@ -892,8 +892,8 @@ fn generate_inline_special_op_match(
     // Handle zero-argument case: match any op of this type
     if args.is_empty() {
         let match_code = quote! {
-            let morok_ir::Op::#op_ident { .. } = #tree_var.op() else {
-                return morok_ir::pattern::RewriteResult::NoMatch;
+            let svod_ir::Op::#op_ident { .. } = #tree_var.op() else {
+                return svod_ir::pattern::RewriteResult::NoMatch;
             };
         };
         return Ok(InlineMatchOutput::simple(match_code, vec![]));
@@ -941,8 +941,8 @@ fn generate_inline_special_op_match(
 
     // Generate the match code
     let match_code = quote! {
-        let morok_ir::Op::#op_ident { #(#field_bindings,)* .. } = #tree_var.op() else {
-            return morok_ir::pattern::RewriteResult::NoMatch;
+        let svod_ir::Op::#op_ident { #(#field_bindings,)* .. } = #tree_var.op() else {
+            return svod_ir::pattern::RewriteResult::NoMatch;
         };
     };
 
@@ -1034,8 +1034,8 @@ fn generate_inline_op_struct_match(
         .collect();
 
     let match_code = quote! {
-        let morok_ir::Op::#op_ident { #(#field_bindings,)* .. } = #tree_var.op() else {
-            return morok_ir::pattern::RewriteResult::NoMatch;
+        let svod_ir::Op::#op_ident { #(#field_bindings,)* .. } = #tree_var.op() else {
+            return svod_ir::pattern::RewriteResult::NoMatch;
         };
     };
 
@@ -1057,8 +1057,8 @@ fn generate_inline_const_match(const_pat: &ConstPattern, tree_var: &Ident) -> Re
     match const_pat {
         ConstPattern::Any => {
             let match_code = quote! {
-                let morok_ir::Op::Const(_) = #tree_var.op() else {
-                    return morok_ir::pattern::RewriteResult::NoMatch;
+                let svod_ir::Op::Const(_) = #tree_var.op() else {
+                    return svod_ir::pattern::RewriteResult::NoMatch;
                 };
             };
             let const_ident = Ident::new(binding_names::CONST, proc_macro2::Span::call_site());
@@ -1067,8 +1067,8 @@ fn generate_inline_const_match(const_pat: &ConstPattern, tree_var: &Ident) -> Re
 
         ConstPattern::Zero | ConstPattern::Int(0) => {
             let match_code = quote! {
-                if !morok_ir::pattern::helpers::is_zero(#tree_var) {
-                    return morok_ir::pattern::RewriteResult::NoMatch;
+                if !svod_ir::pattern::helpers::is_zero(#tree_var) {
+                    return svod_ir::pattern::RewriteResult::NoMatch;
                 }
             };
             let zero_ident = Ident::new(binding_names::ZERO, proc_macro2::Span::call_site());
@@ -1077,8 +1077,8 @@ fn generate_inline_const_match(const_pat: &ConstPattern, tree_var: &Ident) -> Re
 
         ConstPattern::One => {
             let match_code = quote! {
-                if !morok_ir::pattern::helpers::is_one(#tree_var) {
-                    return morok_ir::pattern::RewriteResult::NoMatch;
+                if !svod_ir::pattern::helpers::is_one(#tree_var) {
+                    return svod_ir::pattern::RewriteResult::NoMatch;
                 }
             };
             let one_ident = Ident::new(binding_names::ONE, proc_macro2::Span::call_site());
@@ -1087,11 +1087,11 @@ fn generate_inline_const_match(const_pat: &ConstPattern, tree_var: &Ident) -> Re
 
         ConstPattern::Int(value) => {
             let match_code = quote! {
-                let morok_ir::Op::Const(cv) = #tree_var.op() else {
-                    return morok_ir::pattern::RewriteResult::NoMatch;
+                let svod_ir::Op::Const(cv) = #tree_var.op() else {
+                    return svod_ir::pattern::RewriteResult::NoMatch;
                 };
                 if cv.0.try_int().map(|v| v == #value).unwrap_or(false) == false {
-                    return morok_ir::pattern::RewriteResult::NoMatch;
+                    return svod_ir::pattern::RewriteResult::NoMatch;
                 }
             };
             Ok(InlineMatchOutput::simple(match_code, vec![]))
@@ -1099,11 +1099,11 @@ fn generate_inline_const_match(const_pat: &ConstPattern, tree_var: &Ident) -> Re
 
         ConstPattern::Float(value) => {
             let match_code = quote! {
-                let morok_ir::Op::Const(cv) = #tree_var.op() else {
-                    return morok_ir::pattern::RewriteResult::NoMatch;
+                let svod_ir::Op::Const(cv) = #tree_var.op() else {
+                    return svod_ir::pattern::RewriteResult::NoMatch;
                 };
                 if cv.0.try_float().map(|v| (v - #value).abs() < 1e-10).unwrap_or(false) == false {
-                    return morok_ir::pattern::RewriteResult::NoMatch;
+                    return svod_ir::pattern::RewriteResult::NoMatch;
                 }
             };
             Ok(InlineMatchOutput::simple(match_code, vec![]))
@@ -1137,8 +1137,8 @@ fn generate_inline_op_var_match(
             }
             let src_var = format_ident!("__src");
             let match_code = quote! {
-                let morok_ir::Op::Unary(morok_ir::UnaryOp::#op_ident, #src_var) = #tree_var.op() else {
-                    return morok_ir::pattern::RewriteResult::NoMatch;
+                let svod_ir::Op::Unary(svod_ir::UnaryOp::#op_ident, #src_var) = #tree_var.op() else {
+                    return svod_ir::pattern::RewriteResult::NoMatch;
                 };
             };
 
@@ -1171,8 +1171,8 @@ fn generate_inline_op_var_match(
             let left_var = format_ident!("__left");
             let right_var = format_ident!("__right");
             let match_code = quote! {
-                let morok_ir::Op::Binary(morok_ir::BinaryOp::#op_ident, #left_var, #right_var) = #tree_var.op() else {
-                    return morok_ir::pattern::RewriteResult::NoMatch;
+                let svod_ir::Op::Binary(svod_ir::BinaryOp::#op_ident, #left_var, #right_var) = #tree_var.op() else {
+                    return svod_ir::pattern::RewriteResult::NoMatch;
                 };
             };
 
@@ -1216,8 +1216,8 @@ fn generate_inline_op_var_match(
             let b_var = format_ident!("__b");
             let c_var = format_ident!("__c");
             let match_code = quote! {
-                let morok_ir::Op::Ternary(morok_ir::TernaryOp::#op_ident, #a_var, #b_var, #c_var) = #tree_var.op() else {
-                    return morok_ir::pattern::RewriteResult::NoMatch;
+                let svod_ir::Op::Ternary(svod_ir::TernaryOp::#op_ident, #a_var, #b_var, #c_var) = #tree_var.op() else {
+                    return svod_ir::pattern::RewriteResult::NoMatch;
                 };
             };
 
@@ -1292,13 +1292,13 @@ fn generate_inline_alternatives_match(
     // Convention: field names like `reduce_op`, `unary_op`, `binary_op` map to their enum types
     let tree_var_str = tree_var.to_string();
     let (enum_type, field_name) = if tree_var_str.ends_with("_reduce_op") || tree_var_str == "reduce_op" {
-        (quote! { morok_ir::ReduceOp }, "reduce_op")
+        (quote! { svod_ir::ReduceOp }, "reduce_op")
     } else if tree_var_str.ends_with("_unary_op") || tree_var_str == "unary_op" {
-        (quote! { morok_ir::UnaryOp }, "unary_op")
+        (quote! { svod_ir::UnaryOp }, "unary_op")
     } else if tree_var_str.ends_with("_binary_op") || tree_var_str == "binary_op" {
-        (quote! { morok_ir::BinaryOp }, "binary_op")
+        (quote! { svod_ir::BinaryOp }, "binary_op")
     } else if tree_var_str.ends_with("_ternary_op") || tree_var_str == "ternary_op" {
-        (quote! { morok_ir::TernaryOp }, "ternary_op")
+        (quote! { svod_ir::TernaryOp }, "ternary_op")
     } else {
         return Err(Error::new(
             proc_macro2::Span::call_site(),
@@ -1314,7 +1314,7 @@ fn generate_inline_alternatives_match(
 
     let match_code = quote! {
         if !matches!(#tree_var, #(#variant_patterns)|*) {
-            return morok_ir::pattern::RewriteResult::NoMatch;
+            return svod_ir::pattern::RewriteResult::NoMatch;
         }
     };
 
@@ -1357,8 +1357,8 @@ fn generate_inline_commutative_match(
 
     // Generate ONLY the outer op match (shared across all orderings)
     let match_code = quote! {
-        let morok_ir::Op::Binary(morok_ir::BinaryOp::#binary_op, #left_var, #right_var) = #tree_var.op() else {
-            return morok_ir::pattern::RewriteResult::NoMatch;
+        let svod_ir::Op::Binary(svod_ir::BinaryOp::#binary_op, #left_var, #right_var) = #tree_var.op() else {
+            return svod_ir::pattern::RewriteResult::NoMatch;
         };
     };
 
@@ -1473,7 +1473,7 @@ fn generate_simplified_alternatives_rule(
                 let dup_ident = format_ident!("{}", dup);
                 quote! {
                     if !std::sync::Arc::ptr_eq(#orig_ident, #dup_ident) {
-                        return morok_ir::pattern::RewriteResult::NoMatch;
+                        return svod_ir::pattern::RewriteResult::NoMatch;
                     }
                 }
             })
@@ -1498,7 +1498,7 @@ fn generate_simplified_alternatives_rule(
                         #(#ptr_eq_checks)*
                         #rewrite_expr
                     })();
-                    if !matches!(__try_result, morok_ir::pattern::RewriteResult::NoMatch) {
+                    if !matches!(__try_result, svod_ir::pattern::RewriteResult::NoMatch) {
                         return __try_result;
                     }
                 }
@@ -1516,9 +1516,9 @@ fn generate_simplified_alternatives_rule(
     if op_keys.is_empty() {
         Ok(quote! {
             __matcher.add_wildcard(
-                |#tree_var: &std::sync::Arc<morok_ir::UOp>, #ctx_param| {
+                |#tree_var: &std::sync::Arc<svod_ir::UOp>, #ctx_param| {
                     #(#alt_blocks)*
-                    morok_ir::pattern::RewriteResult::NoMatch
+                    svod_ir::pattern::RewriteResult::NoMatch
                 }
             );
         })
@@ -1526,9 +1526,9 @@ fn generate_simplified_alternatives_rule(
         Ok(quote! {
             __matcher.add(
                 &[#(#op_keys),*],
-                |#tree_var: &std::sync::Arc<morok_ir::UOp>, #ctx_param| {
+                |#tree_var: &std::sync::Arc<svod_ir::UOp>, #ctx_param| {
                     #(#alt_blocks)*
-                    morok_ir::pattern::RewriteResult::NoMatch
+                    svod_ir::pattern::RewriteResult::NoMatch
                 }
             );
         })
@@ -1565,7 +1565,7 @@ fn generate_simplified_rule(
             let dup_ident = format_ident!("{}", dup);
             quote! {
                 if !std::sync::Arc::ptr_eq(#orig_ident, #dup_ident) {
-                    return morok_ir::pattern::RewriteResult::NoMatch;
+                    return svod_ir::pattern::RewriteResult::NoMatch;
                 }
             }
         })
@@ -1576,9 +1576,9 @@ fn generate_simplified_rule(
         let var_name = &ctx.var_name;
         let op_ident = &ctx.op_ident;
         match ctx.op_kind {
-            OpKind::Unary => Some(quote! { let #var_name = morok_ir::UnaryOp::#op_ident; }),
-            OpKind::Binary => Some(quote! { let #var_name = morok_ir::BinaryOp::#op_ident; }),
-            OpKind::Ternary => Some(quote! { let #var_name = morok_ir::TernaryOp::#op_ident; }),
+            OpKind::Unary => Some(quote! { let #var_name = svod_ir::UnaryOp::#op_ident; }),
+            OpKind::Binary => Some(quote! { let #var_name = svod_ir::BinaryOp::#op_ident; }),
+            OpKind::Ternary => Some(quote! { let #var_name = svod_ir::TernaryOp::#op_ident; }),
         }
     } else {
         None
@@ -1627,7 +1627,7 @@ fn generate_simplified_rule(
                             #(#ptr_eq_checks)*
                             #rewrite_expr
                         })();
-                        if !matches!(__result, morok_ir::pattern::RewriteResult::NoMatch) {
+                        if !matches!(__result, svod_ir::pattern::RewriteResult::NoMatch) {
                             return __result;
                         }
                     }
@@ -1667,7 +1667,7 @@ fn generate_simplified_rule(
         // Wildcard pattern
         Ok(quote! {
             __matcher.add_wildcard(
-                move |#tree_var: &std::sync::Arc<morok_ir::UOp>, #ctx_param| {
+                move |#tree_var: &std::sync::Arc<svod_ir::UOp>, #ctx_param| {
                     #body
                 }
             );
@@ -1676,7 +1676,7 @@ fn generate_simplified_rule(
         Ok(quote! {
             __matcher.add(
                 &[#(#op_keys),*],
-                move |#tree_var: &std::sync::Arc<morok_ir::UOp>, #ctx_param| {
+                move |#tree_var: &std::sync::Arc<svod_ir::UOp>, #ctx_param| {
                     #body
                 }
             );
@@ -1701,14 +1701,14 @@ fn generate_simplified_rewrite_expr(rhs: &RewriteExpr, guard: &Option<syn::Expr>
             if let Some(guard_expr) = guard {
                 quote! {
                     if #guard_expr {
-                        morok_ir::pattern::RewriteResult::Rewritten(#rhs_expr)
+                        svod_ir::pattern::RewriteResult::Rewritten(#rhs_expr)
                     } else {
-                        morok_ir::pattern::RewriteResult::NoMatch
+                        svod_ir::pattern::RewriteResult::NoMatch
                     }
                 }
             } else {
                 quote! {
-                    morok_ir::pattern::RewriteResult::Rewritten(#rhs_expr)
+                    svod_ir::pattern::RewriteResult::Rewritten(#rhs_expr)
                 }
             }
         }
@@ -1725,8 +1725,8 @@ fn generate_simplified_rewrite_expr(rhs: &RewriteExpr, guard: &Option<syn::Expr>
 
             let conversion = quote! {
                 match #wrapped {
-                    Some(__v) => morok_ir::pattern::RewriteResult::Rewritten(__v),
-                    None => morok_ir::pattern::RewriteResult::NoMatch,
+                    Some(__v) => svod_ir::pattern::RewriteResult::Rewritten(__v),
+                    None => svod_ir::pattern::RewriteResult::NoMatch,
                 }
             };
 
@@ -1735,7 +1735,7 @@ fn generate_simplified_rewrite_expr(rhs: &RewriteExpr, guard: &Option<syn::Expr>
                     if #guard_expr {
                         #conversion
                     } else {
-                        morok_ir::pattern::RewriteResult::NoMatch
+                        svod_ir::pattern::RewriteResult::NoMatch
                     }
                 }
             } else {
@@ -1771,7 +1771,7 @@ pub fn generate_simplified_pattern_matcher(patterns: &PatternList) -> Result<Tok
         Ok(quote! {
             {
                 #validation_code
-                let mut __matcher = morok_ir::pattern::SimplifiedPatternMatcher::<#ctx_type>::new();
+                let mut __matcher = svod_ir::pattern::SimplifiedPatternMatcher::<#ctx_type>::new();
                 #(#pattern_exprs)*
                 __matcher
             }
@@ -1780,7 +1780,7 @@ pub fn generate_simplified_pattern_matcher(patterns: &PatternList) -> Result<Tok
         Ok(quote! {
             {
                 #validation_code
-                let mut __matcher = morok_ir::pattern::SimplifiedPatternMatcher::<()>::new();
+                let mut __matcher = svod_ir::pattern::SimplifiedPatternMatcher::<()>::new();
                 #(#pattern_exprs)*
                 __matcher
             }
@@ -1800,7 +1800,7 @@ pub fn generate_cached_pattern_matcher(patterns: &PatternList) -> Result<TokenSt
         {
             use std::sync::LazyLock;
             static __CACHED: LazyLock<
-                morok_ir::pattern::SimplifiedPatternMatcher<#ctx_type>
+                svod_ir::pattern::SimplifiedPatternMatcher<#ctx_type>
             > = LazyLock::new(|| #inner);
             &*__CACHED
         }
