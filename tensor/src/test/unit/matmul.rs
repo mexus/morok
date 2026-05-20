@@ -1,7 +1,7 @@
 use crate::*;
-use morok_dtype::DType;
-use morok_schedule::{BeamConfig, OptStrategy, OptimizerConfig, testing::setup_test_tracing};
 use ndarray::{Array2, array};
+use svod_dtype::DType;
+use svod_schedule::{BeamConfig, OptStrategy, OptimizerConfig, testing::setup_test_tracing};
 
 fn prep_config(optimizer: OptimizerConfig) -> PrepareConfig {
     optimizer.into()
@@ -10,13 +10,13 @@ fn env_config() -> PrepareConfig {
     PrepareConfig::from_env()
 }
 
-/// Helper to compare morok result against ndarray reference with tolerance.
+/// Helper to compare svod result against ndarray reference with tolerance.
 fn assert_matmul_close(actual: &[f32], expected: &Array2<f32>, tol: f32) {
     let expected_flat: Vec<f32> = expected.iter().copied().collect();
     assert_eq!(actual.len(), expected_flat.len(), "Length mismatch: {} != {}", actual.len(), expected_flat.len());
 
     for (i, (a, e)) in actual.iter().zip(expected_flat.iter()).enumerate() {
-        assert!((a - e).abs() < tol, "Mismatch at index {}: morok={} vs ndarray={} (diff: {})", i, a, e, (a - e).abs());
+        assert!((a - e).abs() < tol, "Mismatch at index {}: svod={} vs ndarray={} (diff: {})", i, a, e, (a - e).abs());
     }
 }
 
@@ -73,7 +73,7 @@ crate::codegen_tests! {
         let a_nd = Array2::from_shape_vec((2, 2), vec![1.0f32, 2.0, 3.0, 4.0]).unwrap();
         let b_nd = Array2::from_shape_vec((2, 2), vec![5.0f32, 6.0, 7.0, 8.0]).unwrap();
 
-        // Compute with morok
+        // Compute with svod
         let a = Tensor::from_ndarray(&a_nd);
         let b = Tensor::from_ndarray(&b_nd);
         let mut c = a.matmul(&b).unwrap();
@@ -207,8 +207,8 @@ crate::codegen_tests! {
         let expected = v_nd.dot(&m_nd);
 
         assert_eq!(c.shape().unwrap()[0].as_const().unwrap(), 3);
-        let morok_result = c.as_vec::<f32>().unwrap();
-        for (i, (a, e)) in morok_result.iter().zip(expected.iter()).enumerate() {
+        let svod_result = c.as_vec::<f32>().unwrap();
+        for (i, (a, e)) in svod_result.iter().zip(expected.iter()).enumerate() {
             assert!((a - e).abs() < 1e-5, "Mismatch at index {}: {} != {}", i, a, e);
         }
     }
@@ -228,8 +228,8 @@ crate::codegen_tests! {
         let expected = m_nd.dot(&v_nd);
 
         assert_eq!(c.shape().unwrap()[0].as_const().unwrap(), 3);
-        let morok_result = c.as_vec::<f32>().unwrap();
-        for (i, (a, e)) in morok_result.iter().zip(expected.iter()).enumerate() {
+        let svod_result = c.as_vec::<f32>().unwrap();
+        for (i, (a, e)) in svod_result.iter().zip(expected.iter()).enumerate() {
             assert!((a - e).abs() < 1e-5, "Mismatch at index {}: {} != {}", i, a, e);
         }
     }
@@ -245,10 +245,10 @@ crate::codegen_tests! {
         let i = Tensor::from_ndarray(&i_nd);
         let mut c = a.matmul(&i).unwrap();
         c.realize_with(&config).unwrap();
-        let morok_result = c.as_vec::<f32>().unwrap();
+        let svod_result = c.as_vec::<f32>().unwrap();
 
         // Result should equal original A
-        for (i, (actual, expected)) in morok_result.iter().zip(a_data.iter()).enumerate() {
+        for (i, (actual, expected)) in svod_result.iter().zip(a_data.iter()).enumerate() {
             assert!((actual - expected).abs() < 1e-5, "Mismatch at index {}: {} != {}", i, actual, expected);
         }
     }
@@ -434,7 +434,7 @@ fn test_matmul_explicit_dtype() {
 }
 
 #[test]
-#[ignore] // Run with: cargo test -p morok-tensor test_print_matmul_ir -- --ignored --nocapture
+#[ignore] // Run with: cargo test -p svod-tensor test_print_matmul_ir -- --ignored --nocapture
 fn test_print_matmul_ir() {
     // Create 4x4 matmul to see generated IR
     let a = Tensor::from_ndarray(&Array2::from_shape_vec((4, 4), (0..16).map(|i| i as f32).collect()).unwrap());
@@ -452,7 +452,7 @@ fn test_print_matmul_ir() {
 }
 
 #[test]
-#[ignore] // Run with: cargo test -p morok-tensor test_print_matmul_512x512_ir -- --ignored --nocapture
+#[ignore] // Run with: cargo test -p svod-tensor test_print_matmul_512x512_ir -- --ignored --nocapture
 fn test_print_matmul_512x512_ir() {
     const SIZE: usize = 512;
     let a = Tensor::from_ndarray(
@@ -589,7 +589,7 @@ fn test_matmul_512x512_vectorized() {
     let b = Tensor::from_ndarray(&Array2::<f32>::ones((SIZE, SIZE)));
     let mut c = a.matmul(&b).unwrap();
 
-    // Use from_env() to respect MOROK_OUTPUT_UPCAST and other env vars
+    // Use from_env() to respect SVOD_OUTPUT_UPCAST and other env vars
     // Note: Beam search has a pre-existing bug with horizontal reduction, using Heuristic
     let config = env_config();
     c.realize_with(&config).unwrap();
@@ -618,7 +618,7 @@ fn test_matmul_64x64_vectorized() {
 }
 
 #[test]
-#[ignore] // Run with: cargo test -p morok-tensor test_print_matmul_64x64_ir -- --ignored --nocapture
+#[ignore] // Run with: cargo test -p svod-tensor test_print_matmul_64x64_ir -- --ignored --nocapture
 fn test_print_matmul_64x64_ir() {
     const SIZE: usize = 64;
     let a = Tensor::from_ndarray(&Array2::<f32>::ones((SIZE, SIZE)));

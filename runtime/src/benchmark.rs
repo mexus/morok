@@ -6,7 +6,7 @@
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-use morok_device::device::Program;
+use svod_device::device::Program;
 
 use crate::Result;
 

@@ -34,7 +34,7 @@ pub type Shape = SmallVec<[SInt; 4]>;
 /// # Examples
 ///
 /// ```rust
-/// # use morok_ir::{SInt, shape::is_static};
+/// # use svod_ir::{SInt, shape::is_static};
 /// # use smallvec::smallvec;
 /// let shape = smallvec![SInt::from(3), SInt::from(4), SInt::from(5)];
 /// assert!(is_static(&shape));
@@ -48,7 +48,7 @@ pub fn is_static(shape: &Shape) -> bool {
 /// # Examples
 ///
 /// ```rust
-/// # use morok_ir::{SInt, shape::to_static};
+/// # use svod_ir::{SInt, shape::to_static};
 /// # use smallvec::smallvec;
 /// let shape = smallvec![SInt::from(3), SInt::from(4)];
 /// assert_eq!(to_static(&shape), Some(smallvec![3, 4]));
@@ -68,7 +68,7 @@ pub fn to_static(shape: &Shape) -> Option<SmallVec<[usize; 4]>> {
 ///
 /// # Examples
 /// ```rust
-/// # use morok_ir::shape::validate_shape;
+/// # use svod_ir::shape::validate_shape;
 /// let valid = vec![1, 2, 3];
 /// assert!(validate_shape(&valid).is_ok());
 /// let invalid = vec![1, -2, 3];
@@ -108,7 +108,7 @@ pub fn max_shapes_equal(lhs: &Shape, rhs: &Shape) -> bool {
 /// # Examples
 ///
 /// ```rust
-/// # use morok_ir::{SInt, shape::all_shapes_equal};
+/// # use svod_ir::{SInt, shape::all_shapes_equal};
 /// # use smallvec::smallvec;
 /// let shape1 = smallvec![SInt::from(3), SInt::from(4)];
 /// let shape2 = smallvec![SInt::from(3), SInt::from(4)];
@@ -131,7 +131,7 @@ pub fn all_shapes_equal(shapes: &[Shape]) -> bool {
 /// # Examples
 ///
 /// ```rust
-/// # use morok_ir::{SInt, shape::align_shapes_left};
+/// # use svod_ir::{SInt, shape::align_shapes_left};
 /// # use smallvec::smallvec;
 /// let shape1 = smallvec![SInt::from(5)];
 /// let shape2 = smallvec![SInt::from(3), SInt::from(5)];
@@ -168,7 +168,7 @@ pub fn align_shapes_left(shapes: &[Shape]) -> Vec<Shape> {
 /// # Examples
 ///
 /// ```rust
-/// # use morok_ir::{SInt, shape::can_broadcast};
+/// # use svod_ir::{SInt, shape::can_broadcast};
 /// # use smallvec::smallvec;
 /// let shape1 = smallvec![SInt::from(1), SInt::from(5)];
 /// let shape2 = smallvec![SInt::from(3), SInt::from(5)];
@@ -208,7 +208,7 @@ pub fn can_broadcast(lhs: &Shape, rhs: &Shape) -> bool {
 /// # Examples
 ///
 /// ```rust
-/// # use morok_ir::{SInt, shape::broadcast_shape};
+/// # use svod_ir::{SInt, shape::broadcast_shape};
 /// # use smallvec::smallvec;
 /// let shape1 = smallvec![SInt::from(1), SInt::from(5)];
 /// let shape2 = smallvec![SInt::from(3), SInt::from(5)];
@@ -365,8 +365,8 @@ fn extract_ranges_from_uops(begins_uop: &Arc<UOp>, ends_uop: &Arc<UOp>) -> Optio
 /// # Examples
 ///
 /// ```rust
-/// # use morok_ir::{SInt, shape::shape_to_uop};
-/// # use morok_dtype::DType;
+/// # use svod_ir::{SInt, shape::shape_to_uop};
+/// # use svod_dtype::DType;
 /// # use smallvec::smallvec;
 /// let shape = smallvec![SInt::from(3), SInt::from(4), SInt::from(5)];
 /// let shape_uop = shape_to_uop(&shape);
@@ -378,8 +378,8 @@ fn extract_ranges_from_uops(begins_uop: &Arc<UOp>, ends_uop: &Arc<UOp>) -> Optio
 /// // VConst with empty values represents scalar
 /// ```
 pub fn shape_to_uop(shape: &Shape) -> Arc<UOp> {
-    use morok_dtype::DType;
     use smallvec::SmallVec;
+    use svod_dtype::DType;
 
     // Empty shape = scalar: use VConst with empty values
     // extract_shape_from_uop will decode this back to empty Shape
@@ -398,8 +398,8 @@ pub fn shape_to_uop(shape: &Shape) -> Arc<UOp> {
 /// # Panics
 /// Panics if `ranges` is empty; handle scalars at the callsite.
 pub fn ranges_to_uops(ranges: &[(SInt, SInt)]) -> (Arc<UOp>, Arc<UOp>) {
-    use morok_dtype::DType;
     use smallvec::SmallVec;
+    use svod_dtype::DType;
 
     assert!(!ranges.is_empty(), "ranges_to_uops does not support empty ranges (scalars); handle at callsite");
 
@@ -440,7 +440,7 @@ pub fn infer_shape_from_op(uop: &UOp) -> crate::Result<Option<Shape>> {
 
         // DefineLocal: shape from PtrDType.size
         Op::DefineLocal(_id) => {
-            use morok_dtype::DType;
+            use svod_dtype::DType;
             match uop.dtype() {
                 DType::Ptr { size: Some(s), .. } => Some(smallvec![SInt::from(s)]),
                 DType::Ptr { size: None, .. } => {

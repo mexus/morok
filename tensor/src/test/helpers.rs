@@ -24,7 +24,7 @@ impl RealizeTestExt for Tensor {
 /// The kernel name dedup counter is the only non-RAII global state that
 /// needs reset between tests.
 pub fn test_setup() {
-    morok_runtime::kernel_cache::clear_all();
+    svod_runtime::kernel_cache::clear_all();
 }
 
 /// Compare float slices with tolerance.

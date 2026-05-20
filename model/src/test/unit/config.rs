@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use morok_arch::ctc::CtcDecoder;
+use svod_arch::ctc::CtcDecoder;
 
 use crate::gigaam::{ConvNormType, GigaAmConfig, SubsamplingMode};
 
@@ -99,7 +99,7 @@ fn expect_config_err(result: Result<GigaAmConfig, crate::gigaam::Error>) -> crat
 
 fn parse_temp_config(json: &str) -> Result<GigaAmConfig, crate::gigaam::Error> {
     let stamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
-    let path = std::env::temp_dir().join(format!("morok_gigaam_config_{stamp}.json"));
+    let path = std::env::temp_dir().join(format!("svod_gigaam_config_{stamp}.json"));
     std::fs::write(&path, json).unwrap();
     let out = GigaAmConfig::from_json(&path);
     let _ = std::fs::remove_file(path);

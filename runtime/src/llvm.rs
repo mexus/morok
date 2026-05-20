@@ -36,13 +36,13 @@ impl LlvmKernel {
 
         debug!(kernel.name = %name, ir.length = ir.len(), "Compiling LLVM IR via external clang");
 
-        if let Ok(dir) = std::env::var("MOROK_DUMP_LLVM_IR") {
+        if let Ok(dir) = std::env::var("SVOD_DUMP_LLVM_IR") {
             let path = std::path::Path::new(&dir).join(format!("{name}.ll"));
             let _ = std::fs::create_dir_all(&dir);
             let _ = std::fs::write(&path, ir);
         }
 
-        if let Ok(dir) = std::env::var("MOROK_DUMP_POST_O2_IR") {
+        if let Ok(dir) = std::env::var("SVOD_DUMP_POST_O2_IR") {
             // Run the same `-O2 -funroll-loops -fvectorize -fslp-vectorize`
             // pipeline as the JIT compile but emit textual LLVM IR instead
             // of an object file. Writes `<dir>/<name>.post.ll`.
@@ -63,7 +63,7 @@ impl LlvmKernel {
     }
 
     /// Compile a RenderedKernel from the codegen crate.
-    pub fn compile(kernel: &morok_codegen::RenderedKernel) -> Result<Self> {
+    pub fn compile(kernel: &svod_codegen::RenderedKernel) -> Result<Self> {
         Self::compile_ir(&kernel.code, &kernel.name, &kernel.name, kernel.var_names.clone(), kernel.buffer_args.len())
     }
 

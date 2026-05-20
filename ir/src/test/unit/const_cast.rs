@@ -1,6 +1,6 @@
 use std::f64::consts::PI;
 
-use morok_dtype::{DType, ScalarDType};
+use svod_dtype::{DType, ScalarDType};
 use test_case::test_case;
 
 use crate::types::ConstValue;

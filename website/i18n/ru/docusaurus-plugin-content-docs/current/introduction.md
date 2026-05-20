@@ -2,7 +2,7 @@
 sidebar_label: Введение
 ---
 
-# Morok
+# Svod
 
 > **Альфа-версия.** Основная функциональность протестирована, но API нестабильны и могут измениться без предупреждения.
 
@@ -18,28 +18,28 @@ ML-компилятор на Rust, вдохновлённый [Tinygrad](https:/
 | **80+ IR-операций** | Арифметика, память, control flow, WMMA tensor cores |
 | **20+ оптимизаций** | Свёртка констант, tensor cores, векторизация, развёртка циклов |
 
-Подробнее об архитектуре — на [сайте документации](https://npatsakula.github.io/morok/).
+Подробнее об архитектуре — на [сайте документации](https://npatsakula.github.io/svod/).
 
 ## Структура проекта
 
 | Крейт | Описание |
 |-------|----------|
-| [dtype](https://github.com/npatsakula/morok/tree/main/dtype/) | Система типов: скаляры, векторы, указатели, изображения |
-| [macros](https://github.com/npatsakula/morok/tree/main/macros/) | Процедурные макросы (DSL `patterns!`) |
-| [ir](https://github.com/npatsakula/morok/tree/main/ir/) | UOp-граф IR: 80+ операций, символьные целые, трассировка происхождения |
-| [device](https://github.com/npatsakula/morok/tree/main/device/) | Управление буферами: ленивое выделение, zero-copy view, LRU-кэширование |
-| [schedule](https://github.com/npatsakula/morok/tree/main/schedule/) | Движок оптимизаций: 20+ проходов, RANGEIFY, Z3-верификация |
-| [codegen](https://github.com/npatsakula/morok/tree/main/codegen/) | Кодогенерация: Clang (по умолчанию), LLVM JIT, MLIR |
-| [runtime](https://github.com/npatsakula/morok/tree/main/runtime/) | JIT-компиляция и выполнение ядер |
-| [tensor](https://github.com/npatsakula/morok/tree/main/tensor/) | Высокоуровневый API ленивых тензоров |
-| [onnx](https://github.com/npatsakula/morok/tree/main/onnx/) | Импортер ONNX-моделей |
-| [arch](https://github.com/npatsakula/morok/tree/main/arch/) | Примитивы инференса |
-| [model](https://github.com/npatsakula/morok/tree/main/model/) | Предобученные модели |
+| [dtype](https://github.com/npatsakula/svod/tree/main/dtype/) | Система типов: скаляры, векторы, указатели, изображения |
+| [macros](https://github.com/npatsakula/svod/tree/main/macros/) | Процедурные макросы (DSL `patterns!`) |
+| [ir](https://github.com/npatsakula/svod/tree/main/ir/) | UOp-граф IR: 80+ операций, символьные целые, трассировка происхождения |
+| [device](https://github.com/npatsakula/svod/tree/main/device/) | Управление буферами: ленивое выделение, zero-copy view, LRU-кэширование |
+| [schedule](https://github.com/npatsakula/svod/tree/main/schedule/) | Движок оптимизаций: 20+ проходов, RANGEIFY, Z3-верификация |
+| [codegen](https://github.com/npatsakula/svod/tree/main/codegen/) | Кодогенерация: Clang (по умолчанию), LLVM JIT, MLIR |
+| [runtime](https://github.com/npatsakula/svod/tree/main/runtime/) | JIT-компиляция и выполнение ядер |
+| [tensor](https://github.com/npatsakula/svod/tree/main/tensor/) | Высокоуровневый API ленивых тензоров |
+| [onnx](https://github.com/npatsakula/svod/tree/main/onnx/) | Импортер ONNX-моделей |
+| [arch](https://github.com/npatsakula/svod/tree/main/arch/) | Примитивы инференса |
+| [model](https://github.com/npatsakula/svod/tree/main/model/) | Предобученные модели |
 
 ## Быстрый пример
 
 ```rust
-use morok_tensor::Tensor;
+use svod_tensor::Tensor;
 use ndarray::array;
 
 // Zero-copy from ndarray (C-contiguous fast path)
@@ -58,7 +58,7 @@ assert_eq!(view, array![[6.0, 8.0], [10.0, 12.0]].into_dyn());
 ## Пример DSL паттернов
 
 ```rust
-use morok_schedule::patterns;
+use svod_schedule::patterns;
 
 let optimizer = patterns! {
     // Identity folding (commutative)

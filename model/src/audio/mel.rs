@@ -1,6 +1,6 @@
 //! Audio preprocessing: mel spectrogram, STFT, mel filterbanks.
 //!
-//! Runs eagerly on CPU using `realfft` — not through Morok's lazy tensor pipeline.
+//! Runs eagerly on CPU using `realfft` — not through Svod's lazy tensor pipeline.
 
 use std::f32::consts::PI;
 

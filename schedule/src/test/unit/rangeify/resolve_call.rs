@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
-use morok_dtype::{DType, DeviceSpec};
-use morok_ir::{BinaryOp, CallInfo, Error, Op, UOp};
 use smallvec::smallvec;
+use svod_dtype::{DType, DeviceSpec};
+use svod_ir::{BinaryOp, CallInfo, Error, Op, UOp};
 
 use crate::rangeify::{rangeify, transforms::resolve_calls};
 
@@ -77,7 +77,7 @@ fn test_resolve_call_preserves_program_call() {
 /// SINK is in tinygrad's `_OPAQUE_CALL_BODIES` — wrap with CALL.
 #[test]
 fn test_resolve_call_preserves_sink_call() {
-    let body = UOp::sink_with_info(vec![UOp::native_const(1.0f32)], morok_ir::KernelInfo::default());
+    let body = UOp::sink_with_info(vec![UOp::native_const(1.0f32)], svod_ir::KernelInfo::default());
     let call = body.call(smallvec![], CallInfo::default());
 
     let resolved = resolve_calls(call).expect("resolve_calls should succeed");
@@ -235,7 +235,7 @@ fn test_rangeify_pipeline_runs_resolve_call() {
 #[test]
 fn test_rangeify_preserves_kernel_call_body_boundaries() {
     let detached = UOp::native_const(1.0f32).detach();
-    let body = UOp::sink_with_info(vec![detached], morok_ir::KernelInfo::default());
+    let body = UOp::sink_with_info(vec![detached], svod_ir::KernelInfo::default());
     let function = body.call(smallvec![], CallInfo::default());
 
     let (out, _ctx) = rangeify(function, None).expect("rangeify should succeed");

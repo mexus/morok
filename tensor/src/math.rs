@@ -5,8 +5,8 @@
 //! - Rounding functions: floor, ceil, round, trunc
 //! - Advanced math: erf (error function), reciprocal, square, sign
 
-use morok_ir::ConstValue;
 use snafu::ResultExt;
+use svod_ir::ConstValue;
 
 use super::*;
 
@@ -227,13 +227,13 @@ impl Tensor {
     /// Returns `true` where elements are infinite.
     ///
     /// Detects ±∞ via bitcast to the corresponding unsigned integer type and a
-    /// bit-pattern compare. Operating in integer space sidesteps Morok's float
+    /// bit-pattern compare. Operating in integer space sidesteps Svod's float
     /// range analysis, which folds `x == ±inf` to false because `dtype_bounds`
     /// returns finite ±max for floats. Tinygrad gets away with the float compare
     /// because its `dtype.min/max` are ±inf.
     #[track_caller]
     pub fn isinf(&self, detect_positive: bool, detect_negative: bool) -> Result<Tensor> {
-        use morok_dtype::{DType, ScalarDType};
+        use svod_dtype::{DType, ScalarDType};
         let dtype = self.uop().dtype();
         // (uint_bitcast_dtype, +inf bit pattern, -inf bit pattern, abs-mask)
         let (uint_dt, pos_bits, neg_bits, abs_mask): (DType, i64, i64, i64) = match dtype {

@@ -8,8 +8,8 @@ pub(crate) use crate::parser::onnx::{
     tensor_proto,
 };
 pub(crate) use crate::registry::*;
-pub(crate) use morok_dtype::{DType, ScalarDType};
-pub(crate) use morok_tensor::{PrepareConfig, Tensor};
+pub(crate) use svod_dtype::{DType, ScalarDType};
+pub(crate) use svod_tensor::{PrepareConfig, Tensor};
 
 use crate::importer::OnnxImporter;
 

@@ -1,12 +1,12 @@
 use super::*;
 use crate::schedule::ScheduleItem;
-use morok_device::Buffer;
-use morok_ir::UOp;
 use std::collections::HashSet;
 use std::sync::Arc;
+use svod_device::Buffer;
+use svod_ir::UOp;
 
 fn make_buffer(numel: usize) -> Buffer {
-    let alloc = morok_device::registry::cpu().expect("cpu allocator");
+    let alloc = svod_device::registry::cpu().expect("cpu allocator");
     Buffer::new(alloc, DType::Float32, vec![numel], Default::default())
 }
 
@@ -140,8 +140,8 @@ fn test_buffer_pool_key_is_shape_agnostic() {
     // the same pool regardless of logical shape — codegen reads shape from the
     // UOp graph, not from the Buffer.
     let b_flat = make_buffer(256);
-    let b_2d = morok_device::Buffer::new(
-        morok_device::registry::cpu().expect("cpu"),
+    let b_2d = svod_device::Buffer::new(
+        svod_device::registry::cpu().expect("cpu"),
         DType::Float32,
         vec![16, 16],
         Default::default(),

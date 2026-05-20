@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use morok_ir::{BinaryOp, BufferizeOpts, ConstValue, DType, Op, UOp};
+use svod_ir::{BinaryOp, BufferizeOpts, ConstValue, DType, Op, UOp};
 
 use crate::rangeify::indexing::{get_const_value, is_const, is_identity_value, is_zero_value};
 

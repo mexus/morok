@@ -1,19 +1,19 @@
 [package]
-name = "morok-schedule"
+name = "svod-schedule"
 
 version.workspace = true
 authors.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Optimization passes and pattern engine for the Morok ML compiler"
+description = "Optimization passes and pattern engine for the Svod ML compiler"
 readme = "README.md"
 
 [dependencies]
-morok-ir = { path = "../ir", version = "=0.1.0-alpha.2" }
-morok-dtype = { path = "../dtype", version = "=0.1.0-alpha.2" }
-morok-device = { path = "../device", version = "=0.1.0-alpha.2" }
-morok-macros = { path = "../macros", version = "=0.1.0-alpha.2" }
+svod-ir = { path = "../ir", version = "=0.1.0-alpha.2" }
+svod-dtype = { path = "../dtype", version = "=0.1.0-alpha.2" }
+svod-device = { path = "../device", version = "=0.1.0-alpha.2" }
+svod-macros = { path = "../macros", version = "=0.1.0-alpha.2" }
 smallvec = { workspace = true, features = ["union"] }
 rayon = "1.11"
 once_cell = "1.21"
@@ -38,18 +38,18 @@ indexmap = "2.13.0"
 default = []
 testing = ["dep:tracing-subscriber"]
 z3 = ["dep:z3"]
-proptest = ["dep:proptest-derive", "morok-ir/proptest"]
-serde = ["morok-ir/serde"]
+proptest = ["dep:proptest-derive", "svod-ir/proptest"]
+serde = ["svod-ir/serde"]
 # Enable trace-level spans in hot paths (compile-time control)
 tracing-verbose = []
 # Devices
-cuda = ["morok-device/cuda"]
-metal = ["morok-device/metal"]
-webgpu = ["morok-device/webgpu"]
+cuda = ["svod-device/cuda"]
+metal = ["svod-device/metal"]
+webgpu = ["svod-device/webgpu"]
 
 [dev-dependencies]
 proptest = "1.9.0"
-morok-ir = { path = "../ir", version = "=0.1.0-alpha.2", features = [
+svod-ir = { path = "../ir", version = "=0.1.0-alpha.2", features = [
   "proptest",
 ] }
 test-case = "3.3.1"

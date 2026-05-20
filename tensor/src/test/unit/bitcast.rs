@@ -2,7 +2,7 @@
 //! reinterpretation (u32 ↔ u16, u32 ↔ u64). Round-trips must be byte-identical
 //! to host memory's little-endian representation.
 
-use morok_dtype::DType;
+use svod_dtype::DType;
 
 use crate::Tensor;
 

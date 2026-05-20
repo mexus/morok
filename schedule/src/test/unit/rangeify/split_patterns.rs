@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
-use morok_dtype::{AddrSpace, DType};
-use morok_ir::{AxisId, AxisType, ConstValue, Op, UOp};
 use smallvec::smallvec;
+use svod_dtype::{AddrSpace, DType};
+use svod_ir::{AxisId, AxisType, ConstValue, Op, UOp};
 
 use crate::rangeify::{RangeifyBufferContext, patterns::to_param_patterns};
 
@@ -10,7 +10,7 @@ use crate::rangeify::{RangeifyBufferContext, patterns::to_param_patterns};
 fn apply_patterns(uop: &Arc<UOp>, ctx: &mut RangeifyBufferContext) -> Option<Arc<UOp>> {
     let matcher = to_param_patterns();
     match matcher.rewrite(uop, ctx) {
-        morok_ir::pattern::RewriteResult::Rewritten(result) => Some(result),
+        svod_ir::pattern::RewriteResult::Rewritten(result) => Some(result),
         _ => None,
     }
 }
@@ -21,7 +21,7 @@ fn test_debuf_global() {
 
     // Create a BUFFER operation directly
     let unique = UOp::buffer_id(Some(0));
-    let device = UOp::device(morok_device::DeviceSpec::Cpu);
+    let device = UOp::device(svod_device::DeviceSpec::Cpu);
     let buffer = UOp::new(Op::Buffer { unique, device, size: 100 }, DType::Float32);
 
     // Apply pattern via matcher
@@ -165,12 +165,12 @@ fn test_debuf_counter_increment() {
 
     // Create first buffer
     let unique1 = UOp::buffer_id(Some(1));
-    let device1 = UOp::device(morok_device::DeviceSpec::Cpu);
+    let device1 = UOp::device(svod_device::DeviceSpec::Cpu);
     let buffer1 = UOp::new(Op::Buffer { unique: unique1, device: device1, size: 100 }, DType::Float32);
 
     // Create second buffer
     let unique2 = UOp::buffer_id(Some(2));
-    let device2 = UOp::device(morok_device::DeviceSpec::Cpu);
+    let device2 = UOp::device(svod_device::DeviceSpec::Cpu);
     let buffer2 = UOp::new(Op::Buffer { unique: unique2, device: device2, size: 200 }, DType::Float32);
 
     // Apply patterns to first buffer
@@ -195,7 +195,7 @@ fn test_debuf_buffer_mapping() {
     let mut ctx = RangeifyBufferContext::new();
 
     let unique = UOp::buffer_id(Some(0));
-    let device = UOp::device(morok_device::DeviceSpec::Cpu);
+    let device = UOp::device(svod_device::DeviceSpec::Cpu);
     let buffer = UOp::new(Op::Buffer { unique, device, size: 100 }, DType::Float32);
 
     let result = apply_patterns(&buffer, &mut ctx);
@@ -367,7 +367,7 @@ fn test_handle_after_mstack_advanced() {
             assert!(std::sync::Arc::ptr_eq(&buf, &buf1));
 
             // MSTACK should be tracked in context
-            assert!(ctx.buffer_map.contains_key(&morok_ir::UOpKey(mstack)));
+            assert!(ctx.buffer_map.contains_key(&svod_ir::UOpKey(mstack)));
         }
         _ => panic!("Expected Rewritten result"),
     }

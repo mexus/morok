@@ -7,7 +7,7 @@
 //! one piece of new pure-logic — `ctc_frames_to_words` — is testable in
 //! isolation and lives here.
 
-use morok_arch::rnnt::Word;
+use svod_arch::rnnt::Word;
 
 use crate::gigaam::TranscribeOpts;
 use crate::gigaam::transcribe::ctc_frames_to_words;

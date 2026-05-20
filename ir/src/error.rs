@@ -1,7 +1,7 @@
-use morok_dtype::DType;
-use morok_dtype::DeviceSpec;
 use smallvec::SmallVec;
 use snafu::Snafu;
+use svod_dtype::DType;
+use svod_dtype::DeviceSpec;
 
 use crate::{BinaryOp, UnaryOp, shape::Shape};
 

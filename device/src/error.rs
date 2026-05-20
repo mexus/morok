@@ -30,7 +30,7 @@ pub enum Error {
 
     /// Element type mismatch.
     #[snafu(display("type mismatch: buffer has {actual:?}, requested {expected:?}"))]
-    TypeMismatch { expected: morok_dtype::DType, actual: morok_dtype::DType },
+    TypeMismatch { expected: svod_dtype::DType, actual: svod_dtype::DType },
 
     /// Failed to create ndarray view from buffer shape.
     #[snafu(display("ndarray shape error: {source}"))]

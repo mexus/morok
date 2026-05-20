@@ -5,9 +5,9 @@
 
 use std::sync::Arc;
 
-use morok_dtype::DType;
-use morok_ir::types::ConstValue;
-use morok_ir::{Op, UOp};
+use svod_dtype::DType;
+use svod_ir::types::ConstValue;
+use svod_ir::{Op, UOp};
 
 use crate::expand::pre_expand;
 use crate::rewrite::graph_rewrite;
@@ -104,7 +104,7 @@ pub fn create_contract(src: Arc<UOp>, axes: Vec<(usize, usize)>) -> Arc<UOp> {
 
 /// Create a CONTRACT operation with explicit void dtype (for STORE-like operations).
 pub fn create_contract_void(src: Arc<UOp>, axes: Vec<(usize, usize)>) -> Arc<UOp> {
-    UOp::new(morok_ir::Op::Contract { src: src.clone(), upcast_ranges: axes }, DType::Void)
+    UOp::new(svod_ir::Op::Contract { src: src.clone(), upcast_ranges: axes }, DType::Void)
 }
 
 // =============================================================================
@@ -266,7 +266,7 @@ pub fn assert_vcount(uop: &Arc<UOp>, expected: usize) {
 // BUFFERIZE Builders
 // =============================================================================
 
-use morok_ir::BufferizeOpts;
+use svod_ir::BufferizeOpts;
 
 /// Create a BUFFERIZE operation.
 pub fn create_bufferize(compute: Arc<UOp>, ranges: Vec<Arc<UOp>>, opts: BufferizeOpts) -> Arc<UOp> {
@@ -275,7 +275,7 @@ pub fn create_bufferize(compute: Arc<UOp>, ranges: Vec<Arc<UOp>>, opts: Bufferiz
 
 /// Create a BUFFERIZE with global memory target.
 pub fn create_bufferize_global(compute: Arc<UOp>, ranges: Vec<Arc<UOp>>) -> Arc<UOp> {
-    use morok_dtype::DeviceSpec;
+    use svod_dtype::DeviceSpec;
     create_bufferize(compute, ranges, BufferizeOpts::new(DeviceSpec::Cpu))
 }
 
@@ -481,8 +481,8 @@ pub fn extract_result_values(uop: &Arc<UOp>) -> Vec<i64> {
 }
 
 /// Evaluate binary operation on i64 values.
-fn eval_binary_i64(op: morok_ir::types::BinaryOp, lhs: i64, rhs: i64) -> i64 {
-    use morok_ir::types::BinaryOp;
+fn eval_binary_i64(op: svod_ir::types::BinaryOp, lhs: i64, rhs: i64) -> i64 {
+    use svod_ir::types::BinaryOp;
     match op {
         BinaryOp::Add => lhs.wrapping_add(rhs),
         BinaryOp::Sub => lhs.wrapping_sub(rhs),

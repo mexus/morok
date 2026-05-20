@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 
-use morok_dtype::DType;
-use morok_tensor::Tensor;
-use morok_tensor::reduce::AxisSpec;
+use svod_dtype::DType;
+use svod_tensor::Tensor;
+use svod_tensor::reduce::AxisSpec;
 
 use crate::error::{Error, Result};
 use crate::parser::onnx::{AttributeProto, GraphProto, NodeProto, TensorProto};

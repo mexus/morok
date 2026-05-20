@@ -3,8 +3,8 @@
 //! This module provides helper functions to create common test patterns
 //! (reduces, matmul, etc.) and assertion utilities for validating scheduler state.
 
-use morok_ir::{AxisId, AxisType, Op, ReduceOp, UOp};
 use std::sync::Arc;
+use svod_ir::{AxisId, AxisType, Op, ReduceOp, UOp};
 
 use crate::optimizer::Scheduler;
 

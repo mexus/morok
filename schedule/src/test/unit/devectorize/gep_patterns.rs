@@ -12,9 +12,9 @@
 
 use std::sync::Arc;
 
-use morok_dtype::DType;
-use morok_ir::types::ConstValue;
-use morok_ir::{Op, TernaryOp, UOp};
+use svod_dtype::DType;
+use svod_ir::types::ConstValue;
+use svod_ir::{Op, TernaryOp, UOp};
 
 use super::helpers::*;
 

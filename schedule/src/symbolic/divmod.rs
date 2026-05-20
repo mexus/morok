@@ -5,10 +5,10 @@
 
 use std::sync::Arc;
 
-use morok_ir::types::{BinaryOp, ConstValue};
-use morok_ir::uop::cached_property::CachedProperty;
-use morok_ir::uop::properties::VminVmaxProperty;
-use morok_ir::{IntoUOp, Op, UOp};
+use svod_ir::types::{BinaryOp, ConstValue};
+use svod_ir::uop::cached_property::CachedProperty;
+use svod_ir::uop::properties::VminVmaxProperty;
+use svod_ir::{IntoUOp, Op, UOp};
 
 /// Tinygrad's fold_divmod_congruence (divandmod.py:46-50).
 ///

@@ -58,7 +58,7 @@ WMMA(a, b, c) + add → WMMA(a, b, c + add)
 ```
 This pattern enables efficient FMA-style accumulation on NVIDIA tensor cores.
 
-**Morok**: `devectorize.rs`
+**Svod**: `devectorize.rs`
 
 ---
 
@@ -109,7 +109,7 @@ STORE(INDEX(...), value) → STORE(INDEX(..., gate=(lidx1 == 0)), value)
 ```
 This ensures stores only execute when unused local indices are 0.
 
-**Morok**: `gpudims.rs`
+**Svod**: `gpudims.rs`
 
 ---
 
@@ -139,7 +139,7 @@ Also removes redundant loads from stores (write-only access).
 
 Note: Not all INDEX operations get wrapped in LOAD. Pointer types (already addresses) and image textures (special hardware) use different access methods.
 
-**Morok**: `devectorize.rs`
+**Svod**: `devectorize.rs`
 
 ---
 
@@ -185,7 +185,7 @@ This reduces memory bus transactions.
 - `1`: Full devectorization (default)
 - `≥2`: Skip both `devectorize` and `correct_load_store`
 
-Note: Morok always runs the devectorizer and does not expose this env var.
+Note: Svod always runs the devectorizer and does not expose this env var.
 
 **Pattern**: `devectorize + load_store_folding + correct_load_store + load_store_indexing`
 
@@ -199,7 +199,7 @@ ADD(vec4_a, vec4_b) → [ADD(a[0], b[0]), ADD(a[1], b[1]), ...]
 
 **Image fixup**: Special handling for image tensor buffers.
 
-**Morok**: `devectorize.rs`
+**Svod**: `devectorize.rs`
 
 ---
 
@@ -252,13 +252,13 @@ The `select_concrete_dtype()` function determines i32 vs i64 using vmin/vmax bou
 dtype = i32 if bounds fit in [-2^31, 2^31-1] else i64
 ```
 
-**Morok**: `symbolic/index_lowering.rs`
+**Svod**: `symbolic/index_lowering.rs`
 
 ---
 
 ## Additional Devectorizer Passes
 
-Morok runs several additional passes between Stage 14 and 15 that don't have direct Tinygrad equivalents:
+Svod runs several additional passes between Stage 14 and 15 that don't have direct Tinygrad equivalents:
 
 | Pass | Purpose |
 |------|---------|

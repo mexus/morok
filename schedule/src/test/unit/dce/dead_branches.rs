@@ -1,9 +1,9 @@
 //! Tests for dead branch elimination in WHERE operations.
 
-use morok_dtype::DType;
-use morok_ir::types::TernaryOp;
-use morok_ir::{Op, UOp};
 use std::sync::Arc;
+use svod_dtype::DType;
+use svod_ir::types::TernaryOp;
+use svod_ir::{Op, UOp};
 
 use crate::rewrite::graph_rewrite;
 use crate::symbolic::symbolic_simple;

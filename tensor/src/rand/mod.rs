@@ -1,7 +1,7 @@
 //! THREEFRY-backed deterministic random tensor generation.
 //!
 //! The IR-level `BinaryOp::Threefry` and its decomposition pattern
-//! (`pm_threefry_decomp` in `morok-schedule`) already exist. This module
+//! (`pm_threefry_decomp` in `svod-schedule`) already exist. This module
 //! provides the Tensor-layer wrapper:
 //!
 //! - `manual_seed(seed)` resets per-device RNG state.

@@ -1,10 +1,10 @@
 use crate::Buffer;
 use crate::allocator::{Allocator, BufferOptions, CpuAllocator, LruAllocator};
-use morok_dtype::test::proptests::generators;
-use morok_dtype::{DType, ScalarDType};
 use proptest::prelude::*;
 use std::sync::Arc;
 use strum::VariantArray;
+use svod_dtype::test::proptests::generators;
+use svod_dtype::{DType, ScalarDType};
 use tinyvec::ArrayVec;
 
 /// Helper to create an LRU allocator for testing.

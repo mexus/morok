@@ -27,14 +27,14 @@ sidebar_label: Фаза 1 — Rangeify
 | Movement на INDEX | Применить movement к выражениям индексов | `INDEX(PERMUTE(arr), [i, j]) → INDEX(arr, [j, i])` | `movement_op_patterns()` |
 | Movement через AFTER | Протянуть RESHAPE через timing-обёртку (Tinygrad-специфично) | `AFTER(RESHAPE(x, arg), [dep1, dep2]) → RESHAPE(AFTER(x, [dep2]), arg)` | Только Tinygrad |
 | Movement через END | Развернуть movement из END-обёртки (Tinygrad-специфично) | `END(RESHAPE(x), ranges) → END(x, ranges)` | Только Tinygrad |
-| Упрощение вложенных INDEX | Удалить избыточные вложенные INDEX (Morok) | `INDEX(INDEX(ptr, [i]), [i]) → INDEX(ptr, [i])` | `movement_op_patterns()` |
+| Упрощение вложенных INDEX | Удалить избыточные вложенные INDEX (Svod) | `INDEX(INDEX(ptr, [i]), [i]) → INDEX(ptr, [i])` | `movement_op_patterns()` |
 | Конкатенация вложенных INDEX | Свернуть вложенные INDEX для PtrDType | `INDEX(INDEX(ptr, i), j) → INDEX(ptr, i, j)` | `pm_syntactic_sugar` |
 
 **Почему bottom-up?** Дочерние узлы должны быть вычищены до обработки родительских. Movement ops глубоко вложены; очистка снизу предотвращает пропущенные паттерны.
 
-**Примечание**: Tinygrad и Morok подходят к этому по-разному. Tinygrad перемещает movement ops через обёртки (AFTER, END), потому что повторно применяет их во время буферизации. Morok полностью удаляет movement ops, трансформируя индексы во время буферизации, поэтому паттерны для AFTER/END не нужны.
+**Примечание**: Tinygrad и Svod подходят к этому по-разному. Tinygrad перемещает movement ops через обёртки (AFTER, END), потому что повторно применяет их во время буферизации. Svod полностью удаляет movement ops, трансформируя индексы во время буферизации, поэтому паттерны для AFTER/END не нужны.
 
-**Morok**: `movement_op_patterns()` в `rangeify/patterns.rs`
+**Svod**: `movement_op_patterns()` в `rangeify/patterns.rs`
 
 ---
 
@@ -68,7 +68,7 @@ count = clamp(64 - length, 0, 64)
 
 **Примечание**: Перемещение WHERE через INDEX (`pm_move_where_on_load`) — отдельная оптимизация, которая ставит условия перед загрузками, чтобы пропустить обращения к памяти, но не устраняет REDUCE.
 
-**Morok**: `pm_load_collapse()` в `rangeify/patterns.rs`
+**Svod**: `pm_load_collapse()` в `rangeify/patterns.rs`
 
 ---
 
@@ -104,7 +104,7 @@ After:   RANGE(end=3) * 4 + RANGE(end=4)
 
 **Примечание**: Разделение применяется только когда `end % mod == 0` (проверка делимости).
 
-**Morok**: `pm_split_ranges()` + `pm_flatten_range()` в `rangeify/transforms.rs`
+**Svod**: `pm_split_ranges()` + `pm_flatten_range()` в `rangeify/transforms.rs`
 
 ---
 
@@ -152,7 +152,7 @@ NOT(NOT(x)) → x
 - Свёртка WHERE (объединение WHERE с одинаковыми условиями)
 - Цепочка reduce mul (вынос умножений за reduce)
 
-**Morok**: `symbolic()` в `symbolic/patterns.rs`
+**Svod**: `symbolic()` в `symbolic/patterns.rs`
 
 ---
 
@@ -185,7 +185,7 @@ RANGE(0..32)
 
 Компилятор объединяет, только если это экономит операции. Слияние может потребовать деления/остатка для пересчёта индексов. Если это обходится дороже, чем экономит, слияние пропускается.
 
-**Morok**: `simplify_merge_adjacent()` в `rangeify/transforms.rs`
+**Svod**: `simplify_merge_adjacent()` в `rangeify/transforms.rs`
 
 ---
 
@@ -257,4 +257,4 @@ Optimization Search:
 
 **Примечание**: NOLOCALS — ограничение, которое устанавливает `dont_use_locals = True`, запрещая дальнейшие LOCAL-действия и влияя на решения по использованию shared-памяти.
 
-**Morok**: `optimizer/mod.rs`, `optimizer/opts.rs`
+**Svod**: `optimizer/mod.rs`, `optimizer/opts.rs`

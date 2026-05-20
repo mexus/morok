@@ -1,7 +1,7 @@
 use super::*;
-use morok_dtype::DType;
+use svod_dtype::DType;
 
-use morok_ir::types::ConstValue;
+use svod_ir::types::ConstValue;
 
 #[test]
 fn test_verify_identity_add_zero() {

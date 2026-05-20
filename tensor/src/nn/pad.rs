@@ -1,7 +1,7 @@
 //! Padding helpers: flat-to-pair conversion, auto-pad, pool pad resolution.
 
 use bon::bon;
-use morok_ir::{ConstValue, SInt, UOp};
+use svod_ir::{ConstValue, SInt, UOp};
 
 use super::{AutoPad, PadMode};
 use crate::Tensor;
@@ -16,13 +16,13 @@ type Result<T> = crate::Result<T>;
 /// # Examples
 ///
 /// ```
-/// # use morok_tensor::nn::pad::flat_pads_to_pairs;
+/// # use svod_tensor::nn::pad::flat_pads_to_pairs;
 /// let pairs = flat_pads_to_pairs(&[1, 2, 3, 4]);
 /// assert_eq!(pairs, vec![(1, 3), (2, 4)]);
 /// ```
 ///
 /// ```
-/// # use morok_tensor::nn::pad::flat_pads_to_pairs;
+/// # use svod_tensor::nn::pad::flat_pads_to_pairs;
 /// let pairs = flat_pads_to_pairs(&[0, 0, 1, 1, 1, 1, 0, 0]);
 /// assert_eq!(pairs, vec![(0, 1), (0, 1), (1, 0), (1, 0)]);
 /// ```
@@ -37,8 +37,8 @@ pub fn flat_pads_to_pairs(pads: &[i64]) -> Vec<(isize, isize)> {
 /// # Examples
 ///
 /// ```
-/// # use morok_tensor::nn::AutoPad;
-/// # use morok_tensor::nn::pad::auto_pad_split;
+/// # use svod_tensor::nn::AutoPad;
+/// # use svod_tensor::nn::pad::auto_pad_split;
 /// // Total pad of 3: SAME_UPPER puts floor at begin, ceil at end
 /// let flat = auto_pad_split(&[3], AutoPad::SameUpper);
 /// assert_eq!(flat, vec![1, 2]); // begin=1, end=2
@@ -65,18 +65,18 @@ pub fn auto_pad_split(total_pads: &[isize], auto_pad: AutoPad) -> Vec<isize> {
 /// # Examples
 ///
 /// ```
-/// # use morok_tensor::nn::AutoPad;
-/// # use morok_tensor::nn::pad::resolve_pool_pads;
-/// # use morok_ir::SInt;
+/// # use svod_tensor::nn::AutoPad;
+/// # use svod_tensor::nn::pad::resolve_pool_pads;
+/// # use svod_ir::SInt;
 /// // VALID mode: no padding regardless of explicit pads
 /// let pads = resolve_pool_pads(&[SInt::from(5), SInt::from(5)], &[], &[3, 3], &[1, 1], &[1, 1], AutoPad::Valid);
 /// assert_eq!(pads, vec![(0, 0), (0, 0)]);
 /// ```
 ///
 /// ```
-/// # use morok_tensor::nn::AutoPad;
-/// # use morok_tensor::nn::pad::resolve_pool_pads;
-/// # use morok_ir::SInt;
+/// # use svod_tensor::nn::AutoPad;
+/// # use svod_tensor::nn::pad::resolve_pool_pads;
+/// # use svod_ir::SInt;
 /// // SAME_UPPER: compute pads to keep output size = ceil(input/stride)
 /// let pads = resolve_pool_pads(&[SInt::from(5), SInt::from(5)], &[], &[3, 3], &[1, 1], &[1, 1], AutoPad::SameUpper);
 /// assert_eq!(pads, vec![(1, 1), (1, 1)]);
@@ -131,7 +131,7 @@ impl Tensor {
     /// Zero padding (delegates to `try_pad`):
     ///
     /// ```
-    /// # use morok_tensor::Tensor;
+    /// # use svod_tensor::Tensor;
     /// let x = Tensor::from_slice([1.0f32, 2.0, 3.0]);
     /// let mut y = x.try_pad_value(&[(1, 1)], 0.0).unwrap();
     /// y.realize().unwrap();
@@ -141,7 +141,7 @@ impl Tensor {
     /// Negative-infinity padding (useful for max pooling):
     ///
     /// ```
-    /// # use morok_tensor::Tensor;
+    /// # use svod_tensor::Tensor;
     /// let x = Tensor::from_slice([1.0f32, 2.0, 3.0]);
     /// let mut y = x.try_pad_value(&[(1, 0)], f64::NEG_INFINITY).unwrap();
     /// y.realize().unwrap();
@@ -181,7 +181,7 @@ impl Tensor {
     /// Constant padding (default mode):
     ///
     /// ```
-    /// # use morok_tensor::Tensor;
+    /// # use svod_tensor::Tensor;
     /// let x = Tensor::from_slice([1.0f32, 2.0, 3.0]);
     /// let mut y = x.pad_with().padding(&[(1, 1)]).call().unwrap();
     /// y.realize().unwrap();
@@ -191,7 +191,7 @@ impl Tensor {
     /// Constant padding with a custom fill value:
     ///
     /// ```
-    /// # use morok_tensor::Tensor;
+    /// # use svod_tensor::Tensor;
     /// let x = Tensor::from_slice([1.0f32, 2.0, 3.0]);
     /// let mut y = x.pad_with().padding(&[(1, 1)]).value(-f64::INFINITY).call().unwrap();
     /// y.realize().unwrap();
@@ -201,8 +201,8 @@ impl Tensor {
     /// Replicate (edge) padding:
     ///
     /// ```
-    /// # use morok_tensor::Tensor;
-    /// # use morok_tensor::nn::PadMode;
+    /// # use svod_tensor::Tensor;
+    /// # use svod_tensor::nn::PadMode;
     /// let x = Tensor::from_slice([1.0f32, 2.0, 3.0]);
     /// let mut y = x.pad_with().padding(&[(2, 2)]).mode(PadMode::Replicate).call().unwrap();
     /// y.realize().unwrap();
@@ -212,8 +212,8 @@ impl Tensor {
     /// Reflect padding:
     ///
     /// ```
-    /// # use morok_tensor::Tensor;
-    /// # use morok_tensor::nn::PadMode;
+    /// # use svod_tensor::Tensor;
+    /// # use svod_tensor::nn::PadMode;
     /// let x = Tensor::from_slice([1.0f32, 2.0, 3.0]);
     /// let mut y = x.pad_with().padding(&[(2, 2)]).mode(PadMode::Reflect).call().unwrap();
     /// y.realize().unwrap();
@@ -223,8 +223,8 @@ impl Tensor {
     /// Circular (wrap) padding:
     ///
     /// ```
-    /// # use morok_tensor::Tensor;
-    /// # use morok_tensor::nn::PadMode;
+    /// # use svod_tensor::Tensor;
+    /// # use svod_tensor::nn::PadMode;
     /// let x = Tensor::from_slice([1.0f32, 2.0, 3.0]);
     /// let mut y = x.pad_with().padding(&[(2, 2)]).mode(PadMode::Circular).call().unwrap();
     /// y.realize().unwrap();

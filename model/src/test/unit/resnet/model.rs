@@ -1,5 +1,5 @@
-use morok_dtype::DType;
-use morok_tensor::{Tensor, Variable};
+use svod_dtype::DType;
+use svod_tensor::{Tensor, Variable};
 use test_case::test_case;
 
 use crate::resnet::{OutputMode, ResNet, ResNetConfig, ResNetDepth};
@@ -159,8 +159,8 @@ fn head_dimensions_per_depth(depth: ResNetDepth, expected_in: usize) {
 #[test]
 #[ignore = "heavy: full ResNet-18 graph compile through the CPU backend"]
 fn features_r18_returns_512_channel_map() {
-    use morok_dtype::DType;
-    use morok_tensor::{Tensor, Variable};
+    use svod_dtype::DType;
+    use svod_tensor::{Tensor, Variable};
 
     let max_batch = 1;
     let config = ResNetConfig::new(ResNetDepth::R18, OutputMode::Features).with_max_batch_size(max_batch);
@@ -181,8 +181,8 @@ fn features_r18_returns_512_channel_map() {
 #[test]
 #[ignore = "heavy: full ResNet-50 graph compile through the CPU backend"]
 fn features_r50_returns_2048_channel_map() {
-    use morok_dtype::DType;
-    use morok_tensor::{Tensor, Variable};
+    use svod_dtype::DType;
+    use svod_tensor::{Tensor, Variable};
 
     let max_batch = 1;
     let config = ResNetConfig::new(ResNetDepth::R50, OutputMode::Features).with_max_batch_size(max_batch);

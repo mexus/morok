@@ -1,9 +1,9 @@
 ---
-name: morok-debug
-description: Debug Morok tensor pipeline issues by extracting IR at each stage, visualizing UOp trees, and comparing with Tinygrad. Use when tests fail, produce wrong results, or crash.
+name: svod-debug
+description: Debug Svod tensor pipeline issues by extracting IR at each stage, visualizing UOp trees, and comparing with Tinygrad. Use when tests fail, produce wrong results, or crash.
 ---
 
-# Morok Pipeline Debugging
+# Svod Pipeline Debugging
 
 ## Three-Step Analysis
 
@@ -26,15 +26,15 @@ Sometimes it's hard to understand if IR is correct, but we have two sources of i
 ### Step 1: Extract all pipeline stages
 ```bash
 # Uses JSON structured logging (rg + jaq required)
-./scripts/extract-ir.sh test_name -p morok-tensor -o /tmp/debug_ir.txt
+./scripts/extract-ir.sh test_name -p svod-tensor -o /tmp/debug_ir.txt
 
 # Filter to specific module (e.g., only optimizer stages)
-./scripts/extract-ir.sh test_name -p morok-tensor -t optimizer
+./scripts/extract-ir.sh test_name -p svod-tensor -t optimizer
 ```
 
 ### Step 2: Check LLVM IR
 ```bash
-RUST_LOG=morok_codegen::llvm::text=debug cargo test test_name -- --nocapture 2>&1 | rg 'linearized node'
+RUST_LOG=svod_codegen::llvm::text=debug cargo test test_name -- --nocapture 2>&1 | rg 'linearized node'
 ```
 
 ### Step 3: Compare with Tinygrad
@@ -96,20 +96,20 @@ Use `scripts/extract-ir.sh` to extract all pipeline stage trees into a single re
 
 ```bash
 # Basic: extract IR for a specific test
-./scripts/extract-ir.sh test_sum_axis1_value -p morok-tensor
+./scripts/extract-ir.sh test_sum_axis1_value -p svod-tensor
 
 # With custom output file
-./scripts/extract-ir.sh test_argmax_value_1d -p morok-tensor -o /tmp/argmax_ir.txt
+./scripts/extract-ir.sh test_argmax_value_1d -p svod-tensor -o /tmp/argmax_ir.txt
 
 # ONNX model tests
-./scripts/extract-ir.sh light_densenet121 -p morok-onnx
+./scripts/extract-ir.sh light_densenet121 -p svod-onnx
 
 # Filter to specific pipeline phase
-./scripts/extract-ir.sh test_name -p morok-tensor -t optimizer
+./scripts/extract-ir.sh test_name -p svod-tensor -t optimizer
 ```
 
 **Prerequisites**: `rg` (ripgrep) and `jaq` must be installed. Tests use JSON
-tracing via `morok_schedule::testing::setup_test_tracing()`.
+tracing via `svod_schedule::testing::setup_test_tracing()`.
 
 The script extracts fields: `uop.tree`, `ast.pre`, `ast.optimized`, `ast.initial`, `generated_c`.
 
@@ -123,7 +123,7 @@ The script extracts fields: `uop.tree`, `ast.pre`, `ast.optimized`, `ast.initial
 Add temporary debugging code directly in your test or tensor operation:
 
 ```rust
-use morok_ir::prelude::*;
+use svod_ir::prelude::*;
 
 // After each pipeline stage
 println!("--- After Stage N ---");
@@ -152,10 +152,10 @@ For quick single-stage checks without the full extraction script:
 
 ```bash
 # Extract IR after Stage 0 (Rangeify)
-RUST_LOG=morok_schedule::rangeify::transforms=debug cargo test test_name -- --nocapture 2>&1 | rg 'range assignment complete'
+RUST_LOG=svod_schedule::rangeify::transforms=debug cargo test test_name -- --nocapture 2>&1 | rg 'range assignment complete'
 
 # Extract IR after a specific optimizer stage
-RUST_LOG=morok_schedule::optimizer=debug cargo test test_name -- --nocapture 2>&1 | rg 'Stage 18-19'
+RUST_LOG=svod_schedule::optimizer=debug cargo test test_name -- --nocapture 2>&1 | rg 'Stage 18-19'
 ```
 
 **Note**: Output is JSON. Use `scripts/extract-ir.sh` for readable, formatted output.
@@ -170,12 +170,12 @@ RUST_LOG=morok_schedule::optimizer=debug cargo test test_name -- --nocapture 2>&
 
 ### Enable tracing in a test
 
-Call the shared initializer from `morok-schedule` (requires `testing` feature):
+Call the shared initializer from `svod-schedule` (requires `testing` feature):
 
 ```rust
 #[test]
 fn test_my_failing_test() {
-    morok_schedule::testing::setup_test_tracing();
+    svod_schedule::testing::setup_test_tracing();
     // ... test code
 }
 ```
@@ -197,11 +197,11 @@ The ONNX importer has per-node tracing spans (`onnx_node` with `idx` and `op` fi
 
 ```bash
 # Non-intrusive: log node names and ops
-RUST_LOG=morok_onnx::importer=debug cargo test light_densenet121 -p morok-onnx -- --nocapture
+RUST_LOG=svod_onnx::importer=debug cargo test light_densenet121 -p svod-onnx -- --nocapture
 
 # Intrusive bisection: realize every node, dump first 5 values
 # WARNING: breaks fusion — use only for numerical debugging
-RUST_LOG=morok_onnx::importer=trace cargo test light_densenet121 -p morok-onnx -- --nocapture
+RUST_LOG=svod_onnx::importer=trace cargo test light_densenet121 -p svod-onnx -- --nocapture
 ```
 
 At `trace` level, each node output is realized and its shape + first 5 f32 values are logged
@@ -213,7 +213,7 @@ At `trace` level, each node output is realized and its shape + first 5 f32 value
 
 ### In code
 ```rust
-use morok_ir::prelude::*;
+use svod_ir::prelude::*;
 
 println!("{}", uop.tree());       // Compact tree with back-references
 println!("{}", uop.tree_full());  // Full tree expanding all nodes
@@ -234,7 +234,7 @@ println!("{}", uop.tree_full());  // Full tree expanding all nodes
 
 ### Using render() API
 ```rust
-use morok_codegen::llvm::text::render;
+use svod_codegen::llvm::text::render;
 
 let rendered = render(&uop_graph, Some("my_kernel"))?;
 println!("{}", rendered.code);
@@ -254,15 +254,15 @@ for kernel in plan.kernels() {
 
 | Target | Information |
 |--------|-------------|
-| `morok_onnx::importer=debug` | ONNX node processing (idx, op_type) |
-| `morok_onnx::importer=trace` | ONNX node values (intrusive realization) |
-| `morok_schedule::rangeify::transforms=debug` | Rangeify stages (`uop.tree` field) |
-| `morok_schedule::rangeify::indexing=debug` | Range assignment details |
-| `morok_schedule::rangeify::kernel=debug` | Kernel splitting |
-| `morok_schedule::optimizer=debug` | Pre-opt (`ast.pre`) + Post-opt (`ast.optimized`) stages |
-| `morok_schedule::linearize=debug` | Linearization passes |
-| `morok_codegen=debug` | LLVM rendering and codegen |
-| `morok_ir::pattern::simplified=trace` | Pattern matching details |
+| `svod_onnx::importer=debug` | ONNX node processing (idx, op_type) |
+| `svod_onnx::importer=trace` | ONNX node values (intrusive realization) |
+| `svod_schedule::rangeify::transforms=debug` | Rangeify stages (`uop.tree` field) |
+| `svod_schedule::rangeify::indexing=debug` | Range assignment details |
+| `svod_schedule::rangeify::kernel=debug` | Kernel splitting |
+| `svod_schedule::optimizer=debug` | Pre-opt (`ast.pre`) + Post-opt (`ast.optimized`) stages |
+| `svod_schedule::linearize=debug` | Linearization passes |
+| `svod_codegen=debug` | LLVM rendering and codegen |
+| `svod_ir::pattern::simplified=trace` | Pattern matching details |
 
 The `scripts/extract-ir.sh` script sets all relevant targets automatically.
 
@@ -277,7 +277,7 @@ The `scripts/extract-ir.sh` script sets all relevant targets automatically.
 
 ### ONNX model gives wrong output
 
-1. Run with `RUST_LOG=morok_onnx::importer=trace` to dump per-node values
+1. Run with `RUST_LOG=svod_onnx::importer=trace` to dump per-node values
 2. Compare values with ONNX runtime reference output
 3. Find the first diverging node, then investigate its op implementation
 
@@ -290,7 +290,7 @@ The `scripts/extract-ir.sh` script sets all relevant targets automatically.
 ### Pattern not matching
 
 ```bash
-RUST_LOG=morok_ir::pattern::simplified=trace cargo test test_name 2>&1 | rg 'pattern'
+RUST_LOG=svod_ir::pattern::simplified=trace cargo test test_name 2>&1 | rg 'pattern'
 ```
 
 ## Key Files

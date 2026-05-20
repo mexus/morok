@@ -1,6 +1,6 @@
 ---
 name: tinygrad-debug
-description: Extract IR, AST, generated code, and patterns from the Tinygrad codebase at submodules/tinygrad. Use when comparing Morok with Tinygrad, debugging pipeline differences, or understanding Tinygrad's implementation.
+description: Extract IR, AST, generated code, and patterns from the Tinygrad codebase at submodules/tinygrad. Use when comparing Svod with Tinygrad, debugging pipeline differences, or understanding Tinygrad's implementation.
 ---
 
 # Tinygrad Investigation
@@ -121,7 +121,7 @@ expander.pdict[Ops.UNROLL]  # All patterns matching UNROLL
 # upat.location - (filename, lineno)
 ```
 
-## Comparing Morok vs Tinygrad IR
+## Comparing Svod vs Tinygrad IR
 
 1. **Tinygrad IR**:
 ```python
@@ -131,9 +131,9 @@ ast = Tensor([1,2,3,4]).sum().schedule()[-1].ast
 print(pyrender(ast))
 ```
 
-2. **Morok IR** (from AGENTS.md):
+2. **Svod IR** (from AGENTS.md):
 ```bash
-RUST_LOG=morok_tensor::realize=debug cargo test test_name 2>&1 | rg 'range assignment complete'
+RUST_LOG=svod_tensor::realize=debug cargo test test_name 2>&1 | rg 'range assignment complete'
 ```
 
 3. **Compare**: Look for differences in RANGE axis types, INDEX structure, REDUCE patterns.

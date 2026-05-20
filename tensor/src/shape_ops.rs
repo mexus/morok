@@ -9,9 +9,9 @@
 //! - Unsqueeze: Add dimensions of size 1
 
 use bon::bon;
-use morok_ir::IntoShrinkRange;
 use snafu::ResultExt;
 use strum::{Display, EnumString};
+use svod_ir::IntoShrinkRange;
 
 use super::*;
 
@@ -34,7 +34,7 @@ impl Tensor {
     /// # Examples
     ///
     /// ```
-    /// # use morok_tensor::Tensor;
+    /// # use svod_tensor::Tensor;
     /// let t = Tensor::from_slice(&[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]);
     /// let reshaped = t.try_reshape(&[2, 3]).unwrap();  // [6] -> [2, 3]
     /// let inferred = t.try_reshape(&[-1, 2]).unwrap(); // [6] -> [3, 2]
@@ -99,7 +99,7 @@ impl Tensor {
     /// # Examples
     ///
     /// ```
-    /// # use morok_tensor::Tensor;
+    /// # use svod_tensor::Tensor;
     /// // Tensor with shape [2, 3, 4]
     /// // t.try_permute(&[2, 0, 1]) -> shape [4, 2, 3]
     /// // t.try_permute(&[1, 0, 2]) -> shape [3, 2, 4]
@@ -129,7 +129,7 @@ impl Tensor {
     /// # Examples
     ///
     /// ```
-    /// # use morok_tensor::Tensor;
+    /// # use svod_tensor::Tensor;
     /// // Tensor with shape [2, 3, 4]
     /// // t.try_transpose(0, 1) -> shape [3, 2, 4]
     /// // t.try_transpose(-1, 0) -> shape [4, 3, 2]  (negative indices supported)
@@ -162,7 +162,7 @@ impl Tensor {
     /// # Examples
     ///
     /// ```
-    /// # use morok_tensor::Tensor;
+    /// # use svod_tensor::Tensor;
     /// // Tensor with shape [1, 3, 1]
     /// // t.try_expand(&[4, -1, 5]) -> shape [4, 3, 5]
     /// ```
@@ -175,7 +175,7 @@ impl Tensor {
     /// # Examples
     ///
     /// ```
-    /// # use morok_tensor::Tensor;
+    /// # use svod_tensor::Tensor;
     /// // Tensor with shape [1, 3, 1, 4]
     /// // t.try_squeeze(None) -> shape [3, 4]
     /// // t.try_squeeze(Some(0)) -> shape [3, 1, 4]
@@ -230,7 +230,7 @@ impl Tensor {
     /// # Examples
     ///
     /// ```
-    /// # use morok_tensor::Tensor;
+    /// # use svod_tensor::Tensor;
     /// // Tensor with shape [3, 4]
     /// // t.try_unsqueeze(0) -> shape [1, 3, 4]
     /// // t.try_unsqueeze(1) -> shape [3, 1, 4]
@@ -321,7 +321,7 @@ impl Tensor {
     ///
     /// # Examples
     /// ```ignore
-    /// use morok_ir::SInt;
+    /// use svod_ir::SInt;
     /// let t = Tensor::from_slice(&[1.0f32, 2.0, 3.0]).try_reshape(&[1, 3])?;
     /// let tiled = t.repeat(&[SInt::from(3), SInt::from(2)])?;  // Shape [3, 6]
     /// ```
@@ -379,7 +379,7 @@ impl Tensor {
     /// # Examples
     ///
     /// ```
-    /// # use morok_tensor::Tensor;
+    /// # use svod_tensor::Tensor;
     /// let t = Tensor::from_slice(&[1.0f32, 2.0, 3.0]);  // Shape [3]
     /// let padded = t.try_pad(&[(1, 2)]).unwrap();  // Shape [6]: [0, 1, 2, 3, 0, 0]
     /// ```
@@ -445,7 +445,7 @@ impl Tensor {
     /// # Examples
     ///
     /// ```
-    /// # use morok_tensor::Tensor;
+    /// # use svod_tensor::Tensor;
     /// let a = Tensor::from_slice(&[1.0f32, 2.0, 3.0]).try_reshape(&[3]).unwrap();
     /// let b = Tensor::from_slice(&[4.0f32, 5.0]).try_reshape(&[2]).unwrap();
     /// let c = Tensor::cat(&[&a, &b], 0).unwrap();  // Shape [5]: [1, 2, 3, 4, 5]
@@ -536,7 +536,7 @@ impl Tensor {
     pub fn unflatten(&self, dim: isize, sizes: &[isize]) -> Result<Tensor> {
         let shape = self.shape()?;
         let dim = Self::normalize_axis(dim, shape.len())?;
-        let mut new_shape = morok_ir::shape::to_vec_isize(&shape).context(UOpSnafu)?;
+        let mut new_shape = svod_ir::shape::to_vec_isize(&shape).context(UOpSnafu)?;
         new_shape.splice(dim..=dim, sizes.iter().copied());
         self.try_reshape(&new_shape)
     }
@@ -579,7 +579,7 @@ impl Tensor {
     /// # Examples
     ///
     /// ```
-    /// # use morok_tensor::Tensor;
+    /// # use svod_tensor::Tensor;
     /// let t = Tensor::from_slice(&[1.0f32; 6]).try_reshape(&[2, 3]).unwrap();
     /// let shape_tensor = t.shape_tensor().unwrap();  // Tensor([2, 3]) with dtype int64
     /// ```
@@ -602,7 +602,7 @@ impl Tensor {
         let scalars: Result<Vec<Tensor>> = shape
             .iter()
             .map(|d| {
-                let uop = d.to_uop(morok_dtype::DType::Int64);
+                let uop = d.to_uop(svod_dtype::DType::Int64);
                 uop.try_reshape(&shape_sint).map(Tensor::new).context(UOpSnafu)
             })
             .collect();
@@ -619,7 +619,7 @@ impl Tensor {
     /// # Examples
     ///
     /// ```
-    /// # use morok_tensor::Tensor;
+    /// # use svod_tensor::Tensor;
     /// let t = Tensor::from_slice(&[1.0f32, 2.0, 3.0, 4.0, 5.0]);
     /// let sliced = t.try_shrink(&[(1, 4)]).unwrap();  // Elements [2, 3, 4]
     /// ```
@@ -629,7 +629,7 @@ impl Tensor {
     /// Returns error if negative indices are used with symbolic shape dimensions.
     #[track_caller]
     pub fn try_shrink<R: IntoShrinkRange>(&self, ranges: impl IntoIterator<Item = R>) -> Result<Tensor> {
-        use morok_ir::ShrinkRange;
+        use svod_ir::ShrinkRange;
 
         let shape = self.shape()?;
         let resolved: Vec<ShrinkRange> = ranges.into_iter().map(|r| r.into_shrink_range()).collect();
@@ -738,7 +738,7 @@ impl Tensor {
     /// # Errors
     ///
     /// Returns error if axis is out of range.
-    pub(crate) fn dim(&self, axis: isize) -> Result<morok_ir::SInt> {
+    pub(crate) fn dim(&self, axis: isize) -> Result<svod_ir::SInt> {
         let shape = self.shape()?;
         let idx = Self::normalize_axis(axis, shape.len())?;
         Ok(shape[idx].clone())

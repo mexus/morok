@@ -3,9 +3,9 @@
 //! Tests the full Device pipeline: render → compile → runtime factory → execute
 
 use crate::devices::cpu::{CpuBackend, create_cpu_device_with_backend};
-use morok_device::registry::DeviceRegistry;
-use morok_dtype::{AddrSpace, DType};
-use morok_ir::{ConstValue, UOp};
+use svod_device::registry::DeviceRegistry;
+use svod_dtype::{AddrSpace, DType};
+use svod_ir::{ConstValue, UOp};
 
 fn build_copy_sink() -> std::sync::Arc<UOp> {
     let ptr_dtype = DType::Float32.ptr(None, AddrSpace::Global);
@@ -33,8 +33,8 @@ fn test_cpu_device_creation_llvm() {
 
 #[test]
 fn test_compile_and_runtime_pipeline_llvm() {
-    use morok_device::device::ProgramSpec;
-    use morok_dtype::DeviceSpec;
+    use svod_device::device::ProgramSpec;
+    use svod_dtype::DeviceSpec;
 
     let registry = DeviceRegistry::default();
     let device = create_cpu_device_with_backend(&registry, CpuBackend::Llvm).unwrap();
@@ -72,8 +72,8 @@ entry:
 
 #[test]
 fn test_compile_invalid_ir() {
-    use morok_device::device::ProgramSpec;
-    use morok_dtype::DeviceSpec;
+    use svod_device::device::ProgramSpec;
+    use svod_dtype::DeviceSpec;
 
     let registry = DeviceRegistry::default();
     let device = create_cpu_device_with_backend(&registry, CpuBackend::Llvm).unwrap();

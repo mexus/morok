@@ -6,7 +6,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use morok_dtype::DeviceSpec;
+use svod_dtype::DeviceSpec;
 
 use crate::kernel_cache::CachedKernel;
 

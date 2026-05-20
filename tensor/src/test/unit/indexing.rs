@@ -1,7 +1,7 @@
 use crate::test::helpers::RealizeTestExt;
 use crate::*;
-use morok_dtype::DType;
 use ndarray::array;
+use svod_dtype::DType;
 
 fn get_shape(tensor: &Tensor) -> Vec<usize> {
     tensor.uop().shape().unwrap().unwrap().iter().map(|s| s.as_const().unwrap()).collect()

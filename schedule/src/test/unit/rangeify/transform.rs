@@ -1,5 +1,5 @@
-use morok_dtype::DType;
-use morok_ir::{AxisId, AxisType, Op, UOp};
+use svod_dtype::DType;
+use svod_ir::{AxisId, AxisType, Op, UOp};
 
 use crate::rangeify::{
     IndexingContext,
@@ -9,8 +9,8 @@ use crate::rangeify::{
 #[test]
 fn test_transform_buffer_source() {
     // Create two BUFFER operations with the same shape for a valid binary op
-    let buffer1 = UOp::new_buffer(morok_device::DeviceSpec::Cpu, 40, DType::Float32);
-    let buffer2 = UOp::new_buffer(morok_device::DeviceSpec::Cpu, 40, DType::Float32);
+    let buffer1 = UOp::new_buffer(svod_device::DeviceSpec::Cpu, 40, DType::Float32);
+    let buffer2 = UOp::new_buffer(svod_device::DeviceSpec::Cpu, 40, DType::Float32);
 
     let range = UOp::range_axis(UOp::index_const(10), AxisId::Renumbered(0), AxisType::Loop);
 
@@ -87,7 +87,7 @@ fn test_transform_movement_chain_on_buffer() {
     // Movement ops (RESHAPE, PERMUTE, etc.) on BUFFERs are NOT transformed by
     // transform_sources_with_bufferize — they're deferred to the BPM pattern
     // rewrite engine (movement-through-INDEX in pm_add_buffers_patterns).
-    let buffer = UOp::new_buffer(morok_device::DeviceSpec::Cpu, 12, DType::Float32);
+    let buffer = UOp::new_buffer(svod_device::DeviceSpec::Cpu, 12, DType::Float32);
 
     // RESHAPE(BUFFER) to 3x4 shape
     let reshape_shape = UOp::vectorize(vec![UOp::index_const(3), UOp::index_const(4)].into());
@@ -96,7 +96,7 @@ fn test_transform_movement_chain_on_buffer() {
     assert!(reshape.op().is_movement(), "RESHAPE should be identified as movement op");
 
     // Create an ADD that uses the reshaped buffer
-    let buffer2 = UOp::new_buffer(morok_device::DeviceSpec::Cpu, 12, DType::Float32);
+    let buffer2 = UOp::new_buffer(svod_device::DeviceSpec::Cpu, 12, DType::Float32);
     let reshape_shape2 = UOp::vectorize(vec![UOp::index_const(3), UOp::index_const(4)].into());
     let reshape2 = UOp::new(Op::Reshape { src: buffer2.clone(), new_shape: reshape_shape2 }, DType::Float32);
     let add = reshape.try_add(&reshape2).unwrap();
@@ -120,8 +120,8 @@ fn test_rangeify_with_symbolic_simplification() {
     // and ensure the full pipeline (including symbolic simplification) runs successfully.
 
     // Create a simple PERMUTE operation: swap axes (use Buffer for pre-kernel pipeline)
-    let src = UOp::new_buffer(morok_device::DeviceSpec::Cpu, 6, DType::Float32);
-    let reshaped = src.try_reshape(&smallvec::smallvec![morok_ir::SInt::Const(2), morok_ir::SInt::Const(3)]).unwrap();
+    let src = UOp::new_buffer(svod_device::DeviceSpec::Cpu, 6, DType::Float32);
+    let reshaped = src.try_reshape(&smallvec::smallvec![svod_ir::SInt::Const(2), svod_ir::SInt::Const(3)]).unwrap();
     let permute = reshaped.try_permute(vec![1, 0]).unwrap();
 
     // Run full rangeify pipeline (includes symbolic simplification in Step 8)

@@ -6,8 +6,8 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use morok_dtype::ScalarDType;
-use morok_ir::{Op, UOp, WmmaMetadata};
+use svod_dtype::ScalarDType;
+use svod_ir::{Op, UOp, WmmaMetadata};
 
 use super::types::c_dtype;
 

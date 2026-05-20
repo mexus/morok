@@ -1,15 +1,15 @@
 use super::*;
 
-use morok_dtype::DType;
-use morok_ir::CustomFunctionKind;
+use svod_dtype::DType;
+use svod_ir::CustomFunctionKind;
 
 #[test]
 fn test_encdec_returns_typed_unsupported() {
-    let alloc = morok_device::registry::cpu().expect("cpu allocator");
+    let alloc = svod_device::registry::cpu().expect("cpu allocator");
     let dst = Buffer::new(alloc.clone(), DType::Float32, vec![4], Default::default());
     let src = Buffer::new(alloc, DType::Float32, vec![4], Default::default());
 
-    let attr = morok_ir::UOp::index_const(7);
+    let attr = svod_ir::UOp::index_const(7);
     let mut bufs = vec![dst, src];
     let err = run_custom_function(&CustomFunctionKind::EncDec, &[attr], &mut bufs, &HashMap::new())
         .expect_err("encdec should report unsupported runtime behavior");

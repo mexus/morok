@@ -8,8 +8,8 @@
 
 use std::sync::Arc;
 
-use morok_dtype::DType;
-use morok_ir::{BufferizeOpts, ConstValue, Op, UOp};
+use svod_dtype::DType;
+use svod_ir::{BufferizeOpts, ConstValue, Op, UOp};
 
 use crate::rangeify::RangeifyContext;
 

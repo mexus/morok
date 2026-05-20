@@ -1,17 +1,17 @@
 [package]
-name = "morok-device"
+name = "svod-device"
 
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Device abstraction layer for the Morok ML compiler"
+description = "Device abstraction layer for the Svod ML compiler"
 readme = "README.md"
 
 [dependencies]
-morok-dtype = { path = "../dtype", version = "=0.1.0-alpha.2" }
-morok-ir = { path = "../ir", version = "=0.1.0-alpha.2" }
+svod-dtype = { path = "../dtype", version = "=0.1.0-alpha.2" }
+svod-ir = { path = "../ir", version = "=0.1.0-alpha.2" }
 
 ndarray.workspace = true
 enum_delegate.workspace = true
@@ -34,7 +34,7 @@ tinyvec = "1.10"
 
 [features]
 default = []
-proptest = ["dep:proptest", "dep:proptest-derive", "morok-dtype/proptest"]
+proptest = ["dep:proptest", "dep:proptest-derive", "svod-dtype/proptest"]
 # Devices
 cuda = ["dep:cudarc"]
 webgpu = []

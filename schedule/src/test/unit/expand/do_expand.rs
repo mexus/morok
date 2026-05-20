@@ -10,9 +10,9 @@
 //! Value assertions match Tinygrad's exact test expectations.
 
 use super::helpers::*;
-use morok_dtype::DType;
-use morok_ir::UOp;
-use morok_ir::types::ConstValue;
+use svod_dtype::DType;
+use svod_ir::UOp;
+use svod_ir::types::ConstValue;
 
 // =============================================================================
 // Broadcast Expansion Tests
@@ -277,7 +277,7 @@ fn test_broadcast_const_emits_single_vconst() {
     let broadcast = scalar.broadcast(8);
 
     assert!(
-        matches!(broadcast.op(), morok_ir::Op::VConst { .. }),
+        matches!(broadcast.op(), svod_ir::Op::VConst { .. }),
         "broadcast(Const, 8) should produce Op::VConst, got {:?}",
         broadcast.op()
     );

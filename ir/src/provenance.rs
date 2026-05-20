@@ -240,7 +240,7 @@ thread_local! {
 /// Get the workspace root path, computed from CARGO_MANIFEST_DIR at compile time.
 ///
 /// For workspace member crates (like "ir"), CARGO_MANIFEST_DIR points to the crate directory
-/// (e.g., `/path/to/morok/ir`). The workspace root is the parent directory (`/path/to/morok`).
+/// (e.g., `/path/to/svod/ir`). The workspace root is the parent directory (`/path/to/svod`).
 ///
 /// This is computed once on first use and cached forever.
 fn workspace_root() -> &'static Path {

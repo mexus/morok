@@ -1,14 +1,14 @@
 //! UOp → Z3 conversion.
 //!
-//! Converts Morok IR (UOps) to Z3 expressions for verification.
+//! Converts Svod IR (UOps) to Z3 expressions for verification.
 //! Uses z3 crate v0.19.4's global context model.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use morok_dtype::DType;
-use morok_ir::types::{BinaryOp, ConstValue, TernaryOp, UnaryOp};
-use morok_ir::{Op, UOp};
+use svod_dtype::DType;
+use svod_ir::types::{BinaryOp, ConstValue, TernaryOp, UnaryOp};
+use svod_ir::{Op, UOp};
 use z3::Solver;
 use z3::ast::{Bool, Dynamic, Int};
 
@@ -311,7 +311,7 @@ fn const_value_to_i64(cv: &ConstValue) -> Option<i64> {
 
 /// Get conservative bounds for a dtype.
 fn dtype_bounds(dtype: DType) -> (i64, i64) {
-    use morok_dtype::ScalarDType;
+    use svod_dtype::ScalarDType;
 
     match dtype {
         DType::Scalar(sdt) => match sdt {

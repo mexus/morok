@@ -1,9 +1,9 @@
 //! Normalization: layernorm, rms_norm, group_norm.
 
 use bon::bon;
-use morok_dtype::DType;
-use morok_ir::{ConstValue, UOp};
 use snafu::ResultExt;
+use svod_dtype::DType;
+use svod_ir::{ConstValue, UOp};
 
 use crate::Tensor;
 use crate::error::{NdimMinimumSnafu, ParamRangeSnafu, UOpSnafu};
@@ -23,7 +23,7 @@ impl Tensor {
     /// # Examples
     ///
     /// ```
-    /// # use morok_tensor::Tensor;
+    /// # use svod_tensor::Tensor;
     /// # use ndarray::array;
     /// let x = Tensor::from_ndarray(&array![[1.0f32, 2.0, 3.0], [4.0, 5.0, 6.0]]);
     /// let mut y = x.layernorm(-1, 1e-5).unwrap();
@@ -45,7 +45,7 @@ impl Tensor {
     /// # Examples
     ///
     /// ```
-    /// # use morok_tensor::Tensor;
+    /// # use svod_tensor::Tensor;
     /// # use ndarray::array;
     /// let x = Tensor::from_ndarray(&array![[1.0f32, 2.0, 3.0]]);
     /// let (_normed, mut mean, _inv_std) = x.layernorm_with_stats(-1, 1e-5).unwrap();
@@ -82,7 +82,7 @@ impl Tensor {
     /// # Examples
     ///
     /// ```
-    /// # use morok_tensor::Tensor;
+    /// # use svod_tensor::Tensor;
     /// # use ndarray::array;
     /// let x = Tensor::from_ndarray(&array![[1.0f32, 2.0, 3.0]]);
     /// let mut y = x.rms_norm(-1, 1e-5).unwrap();
@@ -124,7 +124,7 @@ impl Tensor {
     /// L2 normalization (default `p=2`):
     ///
     /// ```
-    /// # use morok_tensor::Tensor;
+    /// # use svod_tensor::Tensor;
     /// # use ndarray::array;
     /// let x = Tensor::from_ndarray(&array![[3.0f32, 4.0]]);
     /// let mut y = x.lp_normalize(-1, 2).unwrap();
@@ -138,7 +138,7 @@ impl Tensor {
     /// L1 normalization (`p=1`):
     ///
     /// ```
-    /// # use morok_tensor::Tensor;
+    /// # use svod_tensor::Tensor;
     /// # use ndarray::array;
     /// let x = Tensor::from_ndarray(&array![[3.0f32, 4.0]]);
     /// let mut y = x.lp_normalize(-1, 1).unwrap();
@@ -165,7 +165,7 @@ impl Tensor {
     /// # Examples
     ///
     /// ```
-    /// # use morok_tensor::Tensor;
+    /// # use svod_tensor::Tensor;
     /// # use ndarray::array;
     /// let x = Tensor::from_ndarray(&array![[1.0f32, 2.0, 3.0], [4.0, 5.0, 6.0]]);
     /// let mut y = x.mean_variance_normalize(&[0, 1], 1e-5).unwrap();
@@ -195,7 +195,7 @@ impl Tensor {
     /// # Examples
     ///
     /// ```
-    /// # use morok_tensor::Tensor;
+    /// # use svod_tensor::Tensor;
     /// # use ndarray::Array4;
     /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 4, 2, 2), 1.0f32));
     /// let scale = Tensor::from_slice([1.0f32; 4]);
@@ -208,7 +208,7 @@ impl Tensor {
     /// Custom epsilon:
     ///
     /// ```
-    /// # use morok_tensor::Tensor;
+    /// # use svod_tensor::Tensor;
     /// # use ndarray::Array4;
     /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 4, 2, 2), 1.0f32));
     /// let scale = Tensor::from_slice([1.0f32; 4]);
@@ -240,7 +240,7 @@ impl Tensor {
         let normed = reshaped.layernorm(-1, eps)?;
         // Cast back and reshape to original
         let normed = if self.uop().dtype() != DType::Float32 { normed.cast(self.uop().dtype())? } else { normed };
-        let orig_shape = morok_ir::shape::to_vec_isize(&x_shape).context(UOpSnafu)?;
+        let orig_shape = svod_ir::shape::to_vec_isize(&x_shape).context(UOpSnafu)?;
         let normed = normed.try_reshape(&orig_shape)?;
 
         // Scale and bias: reshape to (1, C, 1, 1, ...)

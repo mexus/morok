@@ -2,11 +2,11 @@
 sidebar_label: 简介
 ---
 
-# Morok
+# Svod
 
 > **Alpha 阶段软件。** 核心功能已测试，但 API 尚不稳定，可能随时更改。
 
-Morok 是一个基于 Rust 的 ML 编译器，灵感来自 [Tinygrad](https://github.com/tinygrad/tinygrad)。它具有基于 UOp 的 IR 惰性张量求值、模式驱动优化和多后端代码生成。
+Svod 是一个基于 Rust 的 ML 编译器，灵感来自 [Tinygrad](https://github.com/tinygrad/tinygrad)。它具有基于 UOp 的 IR 惰性张量求值、模式驱动优化和多后端代码生成。
 
 ## 亮点
 
@@ -18,28 +18,28 @@ Morok 是一个基于 Rust 的 ML 编译器，灵感来自 [Tinygrad](https://gi
 | **80+ IR 操作** | 算术、内存、控制流、WMMA tensor core |
 | **20+ 优化** | 常量折叠、tensor core、向量化、循环展开 |
 
-架构详情请参阅[文档站点](https://npatsakula.github.io/morok/)。
+架构详情请参阅[文档站点](https://npatsakula.github.io/svod/)。
 
 ## 工作空间
 
 | Crate | 描述 |
 |-------|-------------|
-| [dtype](https://github.com/npatsakula/morok/tree/main/dtype/) | 类型系统：标量、向量、指针、图像 |
-| [macros](https://github.com/npatsakula/morok/tree/main/macros/) | 过程宏（`patterns!` DSL） |
-| [ir](https://github.com/npatsakula/morok/tree/main/ir/) | UOp 图 IR：80+ 操作、符号整数、溯源 |
-| [device](https://github.com/npatsakula/morok/tree/main/device/) | 缓冲区管理：惰性分配、零拷贝视图、LRU 缓存 |
-| [schedule](https://github.com/npatsakula/morok/tree/main/schedule/) | 优化引擎：20+ 趟、RANGEIFY、Z3 验证 |
-| [codegen](https://github.com/npatsakula/morok/tree/main/codegen/) | 代码生成：Clang（默认）、LLVM JIT、MLIR |
-| [runtime](https://github.com/npatsakula/morok/tree/main/runtime/) | JIT 编译与内核执行 |
-| [tensor](https://github.com/npatsakula/morok/tree/main/tensor/) | 高层惰性张量 API |
-| [onnx](https://github.com/npatsakula/morok/tree/main/onnx/) | ONNX 模型导入器 |
-| [arch](https://github.com/npatsakula/morok/tree/main/arch/) | 推理原语 |
-| [model](https://github.com/npatsakula/morok/tree/main/model/) | 预训练模型 |
+| [dtype](https://github.com/npatsakula/svod/tree/main/dtype/) | 类型系统：标量、向量、指针、图像 |
+| [macros](https://github.com/npatsakula/svod/tree/main/macros/) | 过程宏（`patterns!` DSL） |
+| [ir](https://github.com/npatsakula/svod/tree/main/ir/) | UOp 图 IR：80+ 操作、符号整数、溯源 |
+| [device](https://github.com/npatsakula/svod/tree/main/device/) | 缓冲区管理：惰性分配、零拷贝视图、LRU 缓存 |
+| [schedule](https://github.com/npatsakula/svod/tree/main/schedule/) | 优化引擎：20+ 趟、RANGEIFY、Z3 验证 |
+| [codegen](https://github.com/npatsakula/svod/tree/main/codegen/) | 代码生成：Clang（默认）、LLVM JIT、MLIR |
+| [runtime](https://github.com/npatsakula/svod/tree/main/runtime/) | JIT 编译与内核执行 |
+| [tensor](https://github.com/npatsakula/svod/tree/main/tensor/) | 高层惰性张量 API |
+| [onnx](https://github.com/npatsakula/svod/tree/main/onnx/) | ONNX 模型导入器 |
+| [arch](https://github.com/npatsakula/svod/tree/main/arch/) | 推理原语 |
+| [model](https://github.com/npatsakula/svod/tree/main/model/) | 预训练模型 |
 
 ## 快速示例
 
 ```rust
-use morok_tensor::Tensor;
+use svod_tensor::Tensor;
 use ndarray::array;
 
 // Zero-copy from ndarray (C-contiguous fast path)
@@ -58,7 +58,7 @@ assert_eq!(view, array![[6.0, 8.0], [10.0, 12.0]].into_dyn());
 ## 模式 DSL 示例
 
 ```rust
-use morok_schedule::patterns;
+use svod_schedule::patterns;
 
 let optimizer = patterns! {
     // Identity folding (commutative)

@@ -1,4 +1,4 @@
-//! Pattern DSL proc-macro for morok.
+//! Pattern DSL proc-macro for svod.
 //!
 //! This module provides the `patterns!` proc-macro for declarative pattern
 //! definitions that compile down to efficient `SimplifiedPatternMatcher` instances.

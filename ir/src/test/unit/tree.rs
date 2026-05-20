@@ -1,4 +1,4 @@
-use morok_ir::{ConstValue, DType, UOp};
+use svod_ir::{ConstValue, DType, UOp};
 
 #[test]
 fn test_tree_simple() {

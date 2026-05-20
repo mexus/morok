@@ -16,9 +16,9 @@ mod tlsf;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use morok_device::Buffer;
-use morok_dtype::{DType, DeviceSpec};
-use morok_ir::{Op, UOp};
+use svod_device::Buffer;
+use svod_dtype::{DType, DeviceSpec};
+use svod_ir::{Op, UOp};
 use tracing::{debug, trace};
 
 use crate::schedule::Schedule;
@@ -51,7 +51,7 @@ pub enum PlannerMode {
     Arena,
 }
 
-/// Pure parser for the `MOROK_MEMORY_PLANNER` env var, exposed for testing.
+/// Pure parser for the `SVOD_MEMORY_PLANNER` env var, exposed for testing.
 ///
 /// Default (env unset) is [`PlannerMode::Arena`], matching tinygrad's
 /// `NO_MEMORY_PLANNER=0` default — the arena planner runs unless the user
@@ -70,9 +70,9 @@ pub fn parse_mode(raw: Option<&str>) -> PlannerMode {
     }
 }
 
-/// Read `MOROK_MEMORY_PLANNER` from the environment and resolve to a [`PlannerMode`].
+/// Read `SVOD_MEMORY_PLANNER` from the environment and resolve to a [`PlannerMode`].
 pub fn mode_from_env() -> PlannerMode {
-    parse_mode(std::env::var("MOROK_MEMORY_PLANNER").ok().as_deref())
+    parse_mode(std::env::var("SVOD_MEMORY_PLANNER").ok().as_deref())
 }
 
 type LogicalBufferView = (usize, usize, DType, Vec<usize>);
@@ -427,7 +427,7 @@ type LaneKey = (DeviceSpec, bool);
 /// `Buffer::view` into a per-lane arena allocated by [`tlsf::TlsfAllocator`].
 ///
 /// Tinygrad rewrites the UOp graph to swap each `BUFFER` for a
-/// `BUFFER_VIEW(arena, ...)`; Morok achieves the same effect at runtime by
+/// `BUFFER_VIEW(arena, ...)`; Svod achieves the same effect at runtime by
 /// populating [`MemoryPlannerResult::buffer_replace`] with arena views, which
 /// the existing [`apply_buffer_replacements`] then swaps into the schedule.
 fn memory_plan_arena(schedule: &Schedule, output_buffer_ids: &HashSet<u64>) -> MemoryPlannerResult {
@@ -575,9 +575,9 @@ fn memory_plan_arena(schedule: &Schedule, output_buffer_ids: &HashSet<u64>) -> M
         let prototype = lane_proto.get(lane).expect("every populated lane must have a prototype");
         let arena = Buffer::new(
             prototype.allocator_arc(),
-            morok_dtype::DType::UInt8,
+            svod_dtype::DType::UInt8,
             vec![arena_size],
-            morok_device::allocator::BufferOptions::default(),
+            svod_device::allocator::BufferOptions::default(),
         );
         arenas.insert(lane.clone(), arena);
     }

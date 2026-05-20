@@ -59,7 +59,7 @@ mod dlopen_impl {
             let mut args = vec!["-shared", "-O2", march, "-fPIC", "-fno-math-errno", "-fno-ident", "-lm"];
             // Reserve x18 only on macOS ARM, where the kernel clobbers it on
             // context switch. Linux ARM treats x18 as a free GPR; Windows ARM
-            // is not a target morok currently supports.
+            // is not a target svod currently supports.
             #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
             args.push("-ffixed-x18");
             args.extend_from_slice(&["-o", so_path.to_str().unwrap(), src_path.to_str().unwrap()]);

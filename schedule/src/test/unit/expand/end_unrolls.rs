@@ -14,8 +14,8 @@
 
 use std::sync::Arc;
 
-use morok_dtype::DType;
-use morok_ir::{AxisId, AxisType, Op, UOp};
+use svod_dtype::DType;
+use svod_ir::{AxisId, AxisType, Op, UOp};
 
 use super::helpers::*;
 
@@ -26,7 +26,7 @@ use super::helpers::*;
 /// Test: END(comp, [UNROLL(...)]) → UNROLL removed from ranges.
 ///
 /// For void computation, CONTRACT(void, src) is simplified to src
-/// because void has vcount=1 (Morok optimizes this directly).
+/// because void has vcount=1 (Svod optimizes this directly).
 #[test]
 fn test_end_single_unroll() {
     let computation = UOp::noop();
@@ -43,7 +43,7 @@ fn test_end_single_unroll() {
                 assert!(!matches!(r.op(), Op::Unroll { .. }), "UNROLL should be removed from ranges");
             }
             // For void dtype, CONTRACT is simplified to src directly
-            // (Morok: vcount=1 shortcut, Tinygrad: VECTORIZE→unwrap)
+            // (Svod: vcount=1 shortcut, Tinygrad: VECTORIZE→unwrap)
             // So computation may be NOOP, CONTRACT, or the result of contraction
             assert!(
                 matches!(c.op(), Op::Noop | Op::Contract { .. } | Op::Vectorize { .. }),
@@ -83,13 +83,13 @@ fn test_end_mixed_ranges() {
 
     // Mixed: Range, UNROLL, Range
     let range1 = UOp::range_axis(
-        UOp::const_(DType::Index, morok_ir::types::ConstValue::Int(8)),
+        UOp::const_(DType::Index, svod_ir::types::ConstValue::Int(8)),
         AxisId::Renumbered(0),
         AxisType::Reduce,
     );
     let unroll = create_unroll_iota(1, 4);
     let range2 = UOp::range_axis(
-        UOp::const_(DType::Index, morok_ir::types::ConstValue::Int(16)),
+        UOp::const_(DType::Index, svod_ir::types::ConstValue::Int(16)),
         AxisId::Renumbered(2),
         AxisType::Loop,
     );
@@ -118,7 +118,7 @@ fn test_end_mixed_ranges() {
 fn test_end_no_unroll_passthrough() {
     let computation = UOp::noop();
     let range = UOp::range_axis(
-        UOp::const_(DType::Index, morok_ir::types::ConstValue::Int(16)),
+        UOp::const_(DType::Index, svod_ir::types::ConstValue::Int(16)),
         AxisId::Renumbered(0),
         AxisType::Reduce,
     );
@@ -197,13 +197,13 @@ fn test_end_preserves_non_unroll_order() {
     let computation = UOp::noop();
 
     let range_a = UOp::range_axis(
-        UOp::const_(DType::Index, morok_ir::types::ConstValue::Int(8)),
+        UOp::const_(DType::Index, svod_ir::types::ConstValue::Int(8)),
         AxisId::Renumbered(0),
         AxisType::Reduce,
     );
     let unroll = create_unroll_iota(1, 4);
     let range_b = UOp::range_axis(
-        UOp::const_(DType::Index, morok_ir::types::ConstValue::Int(16)),
+        UOp::const_(DType::Index, svod_ir::types::ConstValue::Int(16)),
         AxisId::Renumbered(2),
         AxisType::Loop,
     );

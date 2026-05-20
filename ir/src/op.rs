@@ -9,8 +9,8 @@ use smallvec::SmallVec;
 
 use crate::types::*;
 use crate::uop::UOp;
-use morok_dtype::DType;
-use morok_dtype::DeviceSpec;
+use svod_dtype::DType;
+use svod_dtype::DeviceSpec;
 
 /// Operation type with typed operands.
 ///
@@ -28,7 +28,7 @@ use morok_dtype::DeviceSpec;
 /// UOp hashes by content (dtype + op), enabling content-based hashing for caching.
 #[derive(Debug, Clone, Hash)]
 #[derive(strum::AsRefStr)]
-#[derive(morok_macros::PatternEnum)]
+#[derive(svod_macros::PatternEnum)]
 #[pattern(grouped = [Unary, Binary, Ternary])]
 pub enum Op {
     // Nullary operations (8 variants)
@@ -548,7 +548,7 @@ impl Op {
     /// # Examples
     ///
     /// ```ignore
-    /// use morok_ir::Op;
+    /// use svod_ir::Op;
     ///
     /// // BUFFERIZE ends ranges starting at source index 1
     /// let bufferize_op = Op::Bufferize { /* ... */ };
@@ -626,7 +626,7 @@ impl Op {
     /// # Examples
     ///
     /// ```ignore
-    /// use morok_ir::{Op, UOp};
+    /// use svod_ir::{Op, UOp};
     ///
     /// // END operation ends its range arguments
     /// let range = UOp::range(/* ... */);

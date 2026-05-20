@@ -3,14 +3,14 @@ use std::sync::Arc;
 use crate::*;
 
 fn cfg() -> PrepareConfig {
-    PrepareConfig::from(morok_schedule::OptimizerConfig::default())
+    PrepareConfig::from(svod_schedule::OptimizerConfig::default())
 }
 
 /// Verify that same-shape computations produce identical content hashes
 /// after normalization (the key property that enables kernel caching).
 #[test]
 fn test_same_shape_same_hash() {
-    morok_schedule::testing::setup_test_tracing();
+    svod_schedule::testing::setup_test_tracing();
     let cfg = cfg();
 
     let c1 = &Tensor::from_slice([1.0f32, 2.0, 3.0]) + &Tensor::from_slice([4.0f32, 5.0, 6.0]);
@@ -25,7 +25,7 @@ fn test_same_shape_same_hash() {
 /// Verify that different shapes produce different hashes.
 #[test]
 fn test_different_shape_different_hash() {
-    morok_schedule::testing::setup_test_tracing();
+    svod_schedule::testing::setup_test_tracing();
     let cfg = cfg();
 
     let c1 = &Tensor::from_slice([1.0f32, 2.0, 3.0]) + &Tensor::from_slice([4.0f32, 5.0, 6.0]);
@@ -39,7 +39,7 @@ fn test_different_shape_different_hash() {
 /// Verify that different ops produce different hashes.
 #[test]
 fn test_different_op_different_hash() {
-    morok_schedule::testing::setup_test_tracing();
+    svod_schedule::testing::setup_test_tracing();
     let cfg = cfg();
 
     let add = &Tensor::from_slice([1.0f32, 2.0, 3.0]) + &Tensor::from_slice([4.0f32, 5.0, 6.0]);
@@ -54,7 +54,7 @@ fn test_different_op_different_hash() {
 /// The second call should reuse cached compiled kernels (not re-optimize/recompile).
 #[test]
 fn test_repeated_realize_correct() {
-    morok_schedule::testing::setup_test_tracing();
+    svod_schedule::testing::setup_test_tracing();
     let cfg = cfg();
 
     let mut c1 = &Tensor::from_slice([1.0f32, 2.0, 3.0]) + &Tensor::from_slice([4.0f32, 5.0, 6.0]);
@@ -107,19 +107,19 @@ fn batch_cache_key(tensors: &[&Tensor], cfg: &PrepareConfig) -> (u64, &'static s
 #[test]
 fn test_resolve_codegen_skips_disk_buffers() {
     let config = cfg();
-    let registry = morok_device::registry::registry();
+    let registry = svod_device::registry::registry();
     let expected = config
-        .resolve_device(&morok_dtype::DeviceSpec::Cpu, registry)
+        .resolve_device(&svod_dtype::DeviceSpec::Cpu, registry)
         .expect("CPU device should resolve")
         .compiler
         .cache_key();
 
     let disk = UOp::new_buffer(
-        morok_dtype::DeviceSpec::Disk { path: std::path::PathBuf::from("weights.bin") },
+        svod_dtype::DeviceSpec::Disk { path: std::path::PathBuf::from("weights.bin") },
         16,
         DType::Float32,
     );
-    let cpu = UOp::new_buffer(morok_dtype::DeviceSpec::Cpu, 16, DType::Float32);
+    let cpu = UOp::new_buffer(svod_dtype::DeviceSpec::Cpu, 16, DType::Float32);
 
     let mixed = crate::realize::resolve_codegen(&[(disk.id, disk.clone()), (cpu.id, cpu)], &config)
         .expect("DISK buffers should not be selected for codegen");
@@ -168,7 +168,7 @@ fn test_prepare_batch_with_reuses_same_schedule_cache_entry() {
 /// Verify matmul kernel caching produces correct results on repeated calls.
 #[test]
 fn test_repeated_matmul_correct() {
-    morok_schedule::testing::setup_test_tracing();
+    svod_schedule::testing::setup_test_tracing();
     let cfg = cfg();
 
     let a1 = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0]).try_reshape([2, 2]).unwrap();
@@ -187,7 +187,7 @@ fn test_repeated_matmul_correct() {
 /// Verify that different bind values normalize to same schedule cache key.
 #[test]
 fn test_different_bind_values_same_hash() {
-    morok_schedule::testing::setup_test_tracing();
+    svod_schedule::testing::setup_test_tracing();
     let cfg = cfg();
 
     let n = Variable::new("N", 1, 32);
@@ -327,7 +327,7 @@ fn test_post_sched_cache_restore_replaces_params() {
 #[test]
 fn test_post_sched_cache_restore_materializes_lunique_buffers() {
     let lunique = UOp::lunique(Some(0));
-    let device = UOp::device(morok_dtype::DeviceSpec::Cpu);
+    let device = UOp::device(svod_dtype::DeviceSpec::Cpu);
     let placeholder = UOp::new(Op::Buffer { unique: lunique, device, size: 8 }, DType::Float32);
     let root = UOp::sink(vec![placeholder]);
 
@@ -362,8 +362,8 @@ fn test_post_sched_cache_restore_rewrites_call_boundary_params() {
     let sink = UOp::sink(vec![c.uop().contiguous()]);
 
     let normalization = crate::realize::normalize_for_schedule_cache(&sink).expect("normalize call boundary sink");
-    let rangeify = morok_schedule::rangeify_with_map(normalization.normalized.clone(), None).unwrap();
-    let (kernel_graph, _) = morok_schedule::try_get_kernel_graph(rangeify.sink).unwrap();
+    let rangeify = svod_schedule::rangeify_with_map(normalization.normalized.clone(), None).unwrap();
+    let (kernel_graph, _) = svod_schedule::try_get_kernel_graph(rangeify.sink).unwrap();
 
     let restored = crate::realize::restore_post_schedule_cache(&kernel_graph, &normalization);
 
@@ -379,8 +379,8 @@ fn test_post_sched_cache_restore_rewrites_call_boundary_params() {
 
 #[test]
 fn test_buffer_view_normalization_and_restore_parity() {
-    let base_a = UOp::new_buffer(morok_dtype::DeviceSpec::Cpu, 16, DType::Float32);
-    let base_b = UOp::new_buffer(morok_dtype::DeviceSpec::Cpu, 16, DType::Float32);
+    let base_a = UOp::new_buffer(svod_dtype::DeviceSpec::Cpu, 16, DType::Float32);
+    let base_b = UOp::new_buffer(svod_dtype::DeviceSpec::Cpu, 16, DType::Float32);
     let view_a = base_a.view(8, 2);
     let view_b = base_b.view(8, 2);
 
@@ -436,7 +436,7 @@ fn test_normalize_for_schedule_cache_rejects_conflicting_bind_values() {
 // These exercise the contract that the schedule-cache code path produces
 // numerically identical outputs to the cache-cold rangeify/scheduling path.
 // They use `PrepareConfig::disable_schedule_cache` to force the cold path
-// without mutating the process-global `MOROK_DISABLE_SCHEDULE_CACHE` env var.
+// without mutating the process-global `SVOD_DISABLE_SCHEDULE_CACHE` env var.
 // ============================================================================
 
 fn cfg_with_cache_disabled() -> PrepareConfig {
@@ -447,7 +447,7 @@ fn cfg_with_cache_disabled() -> PrepareConfig {
 
 #[test]
 fn test_cache_disabled_equals_enabled_outputs_static_shape() {
-    morok_schedule::testing::setup_test_tracing();
+    svod_schedule::testing::setup_test_tracing();
 
     let lhs = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
     let rhs = [10.0f32, 20.0, 30.0, 40.0, 50.0, 60.0];
@@ -465,7 +465,7 @@ fn test_cache_disabled_equals_enabled_outputs_static_shape() {
 
 #[test]
 fn test_cache_disabled_equals_enabled_outputs_dynamic_shape() {
-    morok_schedule::testing::setup_test_tracing();
+    svod_schedule::testing::setup_test_tracing();
 
     let n = Variable::new("N", 1, 16);
     let bound = [n.bind(5).unwrap().as_sint()];
@@ -489,7 +489,7 @@ fn test_cache_hit_order_independence_dynamic_shape() {
     // Bind n=3 then n=7 in one tensor pair; bind n=7 then n=3 in another;
     // verify both produce per-bind-value-correct outputs regardless of which
     // ordering populates the schedule cache first.
-    morok_schedule::testing::setup_test_tracing();
+    svod_schedule::testing::setup_test_tracing();
     let cfg = cfg();
     let n = Variable::new("N", 1, 16);
 
@@ -538,7 +538,7 @@ fn test_cache_hit_order_independence_dynamic_shape() {
 fn test_cache_disabled_matches_enabled_var_names_and_kernel_count() {
     // Beyond numerical output, verify the prepared plan structure matches
     // between cold and warm paths: same kernel count, same buffer counts.
-    morok_schedule::testing::setup_test_tracing();
+    svod_schedule::testing::setup_test_tracing();
     let lhs = [1.0f32, 2.0, 3.0, 4.0];
     let rhs = [10.0f32, 20.0, 30.0, 40.0];
 

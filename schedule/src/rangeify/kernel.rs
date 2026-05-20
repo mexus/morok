@@ -14,12 +14,12 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use indexmap::IndexMap;
-use morok_dtype::DeviceSpec;
-use morok_ir::{CallInfo, Op, SInt, UOp, UOpKey};
 use smallvec::SmallVec;
+use svod_dtype::DeviceSpec;
+use svod_ir::{CallInfo, Op, SInt, UOp, UOpKey};
 use tracing::{debug, trace};
 
-pub use morok_ir::KernelInfo;
+pub use svod_ir::KernelInfo;
 
 // ============================================================================
 // CONFIGURATION
@@ -98,7 +98,7 @@ impl SplitReduceOpConfig {
 
 /// Context for tracking state during kernel splitting.
 ///
-/// Simplified from original 8 fields to 6 fields, removing Morok-specific
+/// Simplified from original 8 fields to 6 fields, removing Svod-specific
 /// `kernel_deps` and `buffer_id_mapping` that are no longer needed after
 /// aligning with fix_assign approach.
 #[derive(Clone)]
@@ -207,7 +207,7 @@ pub struct LocalAddBufferContext {
     /// Range renumber counter
     pub range: usize,
     /// Optimization hints extracted from CONTIGUOUS.opts (ctx.opts)
-    pub opts: Vec<morok_ir::ContiguousHint>,
+    pub opts: Vec<svod_ir::ContiguousHint>,
 }
 
 impl LocalAddBufferContext {
@@ -369,7 +369,7 @@ pub fn split_store(_ctx: &mut Vec<Arc<UOp>>, x: &Arc<UOp>) -> Option<Arc<UOp>> {
     Some(call)
 }
 
-fn validate_normal_kernel_devices(root: &Arc<UOp>) -> morok_ir::Result<()> {
+fn validate_normal_kernel_devices(root: &Arc<UOp>) -> svod_ir::Result<()> {
     for node in root.toposort() {
         let Op::Call { body, args, .. } = node.op() else {
             continue;
@@ -391,7 +391,7 @@ fn validate_normal_kernel_devices(root: &Arc<UOp>) -> morok_ir::Result<()> {
             }
         }
         if devices.len() > 1 {
-            return Err(morok_ir::Error::KernelSplitMixedDevices { devices });
+            return Err(svod_ir::Error::KernelSplitMixedDevices { devices });
         }
     }
 
@@ -405,7 +405,7 @@ fn validate_normal_kernel_devices(root: &Arc<UOp>) -> morok_ir::Result<()> {
 /// ensures kernel B's AFTER node depends on kernel A's AFTER node.
 ///
 /// Uses buf_uop() to walk through AFTER chains and get underlying buffer IDs.
-fn fix_assign(root: &Arc<UOp>) -> morok_ir::Result<Arc<UOp>> {
+fn fix_assign(root: &Arc<UOp>) -> svod_ir::Result<Arc<UOp>> {
     // Map buf_uop().id -> AFTER node that produces it
     let mut kernel_assign: HashMap<u64, Arc<UOp>> = HashMap::new();
     #[allow(clippy::mutable_key_type)]
@@ -463,7 +463,7 @@ fn fix_assign(root: &Arc<UOp>) -> morok_ir::Result<Arc<UOp>> {
 
             // Cycle detection
             if u.any_in_subtree(|x| matches!(x.op(), Op::After { .. }) && x.buf_uop().id == s_buf_id) {
-                return Err(morok_ir::Error::KernelSplitDependencyCycle {
+                return Err(svod_ir::Error::KernelSplitDependencyCycle {
                     writer_buffer: buf_id,
                     read_buffer: s_buf_id,
                 });
@@ -491,7 +491,7 @@ fn fix_assign(root: &Arc<UOp>) -> morok_ir::Result<Arc<UOp>> {
 ///
 /// # Returns
 /// Returns `(result, RangeifyBufferContext)`.
-pub fn try_get_kernel_graph(root: Arc<UOp>) -> morok_ir::Result<(Arc<UOp>, RangeifyBufferContext)> {
+pub fn try_get_kernel_graph(root: Arc<UOp>) -> svod_ir::Result<(Arc<UOp>, RangeifyBufferContext)> {
     use super::transforms::pm_add_buffers_patterns;
     use crate::rewrite::graph_rewrite_bottom_up;
 
@@ -509,8 +509,8 @@ pub fn try_get_kernel_graph(root: Arc<UOp>) -> morok_ir::Result<(Arc<UOp>, Range
     // PASS 1: bufferize → store (pm_gate_kernel_sink + pm_add_buffers + pm_add_range_tags, bottom_up=True)
     let t_stage = std::time::Instant::now();
     let after_buffers = {
-        use morok_ir::op::pattern_derived::OpKey;
-        use morok_ir::pattern::RewriteResult;
+        use svod_ir::op::pattern_derived::OpKey;
+        use svod_ir::pattern::RewriteResult;
         let mut matcher = pm_add_buffers_patterns();
         // Skip the SINK subtree of an already-formed kernel AST.
         matcher.add(&[OpKey::Sink], |node, _ctx| {
@@ -560,9 +560,9 @@ pub fn try_get_kernel_graph(root: Arc<UOp>) -> morok_ir::Result<(Arc<UOp>, Range
 /// - Gate on marked SINK nodes to prevent descending into already-split subtrees
 /// - STORE/END → CALL via split_store
 fn split_all_stores(root: &Arc<UOp>) -> Arc<UOp> {
-    use morok_ir::op::pattern_derived::OpKey;
-    use morok_ir::pattern::RewriteResult;
-    use morok_ir::rewrite::graph_rewrite_bottom_up;
+    use svod_ir::op::pattern_derived::OpKey;
+    use svod_ir::pattern::RewriteResult;
+    use svod_ir::rewrite::graph_rewrite_bottom_up;
 
     // Combined gate + split in bpm (pm_gate_kernel_sink + split_kernels, bottom_up=True)
     let mut matcher = crate::patterns! {
@@ -617,7 +617,7 @@ fn detect_expanded_dimensions(source: &Arc<UOp>, input_shape: &[SInt]) -> Vec<bo
         .map(|(axis_id, dim)| match dim {
             SInt::Const(n) if *n > 1 => {
                 let end = UOp::index_const(*n as i64);
-                UOp::range_axis(end, morok_ir::AxisId::Unrenumbered(axis_id), morok_ir::AxisType::Loop)
+                UOp::range_axis(end, svod_ir::AxisId::Unrenumbered(axis_id), svod_ir::AxisType::Loop)
             }
             _ => UOp::index_const(0),
         })

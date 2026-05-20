@@ -1,11 +1,11 @@
 [package]
-name = "morok-macros"
+name = "svod-macros"
 version.workspace = true
 authors.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Procedural macros for the Morok ML compiler"
+description = "Procedural macros for the Svod ML compiler"
 readme = "README.md"
 
 [lib]

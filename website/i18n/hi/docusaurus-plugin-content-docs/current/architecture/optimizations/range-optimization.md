@@ -34,7 +34,7 @@ After:   RANGE(end=3) * 4 + RANGE(end=4)
 
 **गार्ड**: सिर्फ़ तब fire करता है जब `end % c == 0` (exact divisibility)। Non-divisible cases जैसे हैं वैसे रहते हैं।
 
-Tinygrad: `simplify.py:60-64`। Morok: `pm_split_ranges()` in `rangeify/transforms.rs`।
+Tinygrad: `simplify.py:60-64`। Svod: `pm_split_ranges()` in `rangeify/transforms.rs`।
 
 ---
 
@@ -59,7 +59,7 @@ After:   RANGE(0..32)                 One loop, indices via divmod
 - REDUCE scope consistent रहना चाहिए
 - दोनों ranges same REDUCE scopes में दिखनी चाहिए
 
-Tinygrad: `simplify.py:39-41` (`simplify_merge_adjacent`)। Morok: `pm_simplify_ranges()`।
+Tinygrad: `simplify.py:39-41` (`simplify_merge_adjacent`)। Svod: `pm_simplify_ranges()`।
 
 ---
 
@@ -74,7 +74,7 @@ After:   END(comp, [r0, r1, r2])
 
 **क्यों**: Nested END chains successive transformations से arise होते हैं। Flattening structure normalize करता है ताकि दूसरे पैटर्न (merging, splitting) clean range list पर operate कर सकें।
 
-Tinygrad: `simplify.py:14-17`। Morok: `pm_flatten_range()`।
+Tinygrad: `simplify.py:14-17`। Svod: `pm_flatten_range()`।
 
 ---
 
@@ -95,7 +95,7 @@ After:   clamp(64 - length, 0, 64)                // Arithmetic: 3 ops
 
 यह सबसे powerful single optimization है — यह पूरे reduction loops eliminate कर सकता है, O(N) computation को O(1) में convert करके।
 
-Tinygrad: `simplify.py:145-149`। Morok: `pm_load_collapse()`।
+Tinygrad: `simplify.py:145-149`। Svod: `pm_load_collapse()`।
 
 ---
 
@@ -134,7 +134,7 @@ Comparisons को reduce scope के बाहर move करते हैं 
 
 `x * bool.cast() → WHERE(bool, x, 0)` — boolean cast से multiplication को WHERE में convert करता है, जिसे फिर bound patterns analyze कर सकते हैं।
 
-Tinygrad: `simplify.py:82-142`। Morok: `pm_reduce_simplify()` + `reduce_collapse_inner_patterns()`।
+Tinygrad: `simplify.py:82-142`। Svod: `pm_reduce_simplify()` + `reduce_collapse_inner_patterns()`।
 
 ---
 
@@ -142,7 +142,7 @@ Tinygrad: `simplify.py:82-142`। Morok: `pm_reduce_simplify()` + `reduce_collap
 
 **क्या**: Decide करना कि intermediate result को buffer में materialize करें या computation inline करें। Codebase में अक्सर "pcontig" कहलाता है (short for partial contiguous — वो optimization जो BUFFERIZE nodes को range variables substitute करके inline करता है)।
 
-जब rangeify pass `BUFFERIZE` node बनाता है ("इसे buffer चाहिए" mark करता है), buffer removal pass evaluate करता है कि actually memory allocate करना worth है या नहीं। `BUFFERIZE` Morok का intermediate representation है "इसे buffer चाहिए" और final `STORE`+`BUFFER`+`AFTER` के बीच — यह इस pass को decide करने देता है कि materialization actually ज़रूरी है या नहीं। अगर computation काफ़ी cheap है, तो range variables substitute करके expression directly inline कर देता है।
+जब rangeify pass `BUFFERIZE` node बनाता है ("इसे buffer चाहिए" mark करता है), buffer removal pass evaluate करता है कि actually memory allocate करना worth है या नहीं। `BUFFERIZE` Svod का intermediate representation है "इसे buffer चाहिए" और final `STORE`+`BUFFER`+`AFTER` के बीच — यह इस pass को decide करने देता है कि materialization actually ज़रूरी है या नहीं। अगर computation काफ़ी cheap है, तो range variables substitute करके expression directly inline कर देता है।
 
 ### Decision Tree
 
@@ -176,7 +176,7 @@ Unary operations (जैसे negation) reduce scope में होने प
 | Identity fold | `INDEX(BUFFERIZE(compute, ranges), ranges) → compute` — same ranges cancel |
 | Nested flatten | `BUFFERIZE(BUFFERIZE(...))` — nested bufferization flatten |
 
-Morok: `buffer_removal_with_pcontig()` in `rangeify/patterns.rs`।
+Svod: `buffer_removal_with_pcontig()` in `rangeify/patterns.rs`।
 
 ---
 
@@ -195,7 +195,7 @@ Dead axes BUFFERIZE से remove होते हैं, फिर shape RESHAP
 जब सभी ranges dead हों (scalar output), BUFFERIZE empty ranges के साथ रखना ज़रूरी — इसे पूरी तरह remove करने से `NoKernelsFound` होता है क्योंकि kernel splitting के दौरान कोई STORE नहीं बनता।
 :::
 
-Morok: `dead_axis_removal()` in `rangeify/patterns.rs`।
+Svod: `dead_axis_removal()` in `rangeify/patterns.rs`।
 
 ---
 
@@ -211,7 +211,7 @@ Morok: `dead_axis_removal()` in `rangeify/patterns.rs`।
 
 Example: `sum(x, r=0..N)` जहाँ `x` `r` पर depend नहीं करता → `x * N`। N iterations पर constant का sum, constant times N है।
 
-Tinygrad: `simplify.py:82-86`। Morok: `pm_reduce_simplify()`।
+Tinygrad: `simplify.py:82-86`। Svod: `pm_reduce_simplify()`।
 
 ---
 
@@ -238,4 +238,4 @@ After:   REDUCE(                       // shape [256] → scalar (second stage)
 
 **गार्ड**: सिर्फ़ तब apply होता है जब reduction dimension factor हो सके और input/output ratio threshold exceed करे। Non-factorizable dimensions skip होती हैं।
 
-Morok: `split_reduceop()` in `rangeify/kernel.rs`।
+Svod: `split_reduceop()` in `rangeify/kernel.rs`।

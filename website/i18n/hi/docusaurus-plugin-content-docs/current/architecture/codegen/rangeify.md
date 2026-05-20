@@ -27,14 +27,14 @@ sidebar_label: Phase 1 — Rangeify
 | INDEX पर Movement | Index एक्सप्रेशन पर movement अप्लाई करें | `INDEX(PERMUTE(arr), [i, j]) → INDEX(arr, [j, i])` | `movement_op_patterns()` |
 | AFTER के ज़रिए Movement | RESHAPE को टाइमिंग wrapper से बाहर निकालें (Tinygrad-स्पेसिफ़िक) | `AFTER(RESHAPE(x, arg), [dep1, dep2]) → RESHAPE(AFTER(x, [dep2]), arg)` | केवल Tinygrad |
 | END के ज़रिए Movement | END wrapper से movement हटाएँ (Tinygrad-स्पेसिफ़िक) | `END(RESHAPE(x), ranges) → END(x, ranges)` | केवल Tinygrad |
-| Nested INDEX सिम्प्लीफ़िकेशन | रिडंडेंट nested INDEX हटाएँ (Morok) | `INDEX(INDEX(ptr, [i]), [i]) → INDEX(ptr, [i])` | `movement_op_patterns()` |
+| Nested INDEX सिम्प्लीफ़िकेशन | रिडंडेंट nested INDEX हटाएँ (Svod) | `INDEX(INDEX(ptr, [i]), [i]) → INDEX(ptr, [i])` | `movement_op_patterns()` |
 | Nested INDEX कॉन्कैट | PtrDType के लिए nested INDEX फ़्लैटन करें | `INDEX(INDEX(ptr, i), j) → INDEX(ptr, i, j)` | `pm_syntactic_sugar` |
 
 **Bottom-up क्यों?** चाइल्ड नोड्स पहले साफ़ होने चाहिए ताकि parents मैच कर सकें। Movement ops गहराई में नेस्ट होते हैं; नीचे से साफ़ करने से मिस्ड patterns नहीं होते।
 
-**नोट**: Tinygrad और Morok का अप्रोच अलग है। Tinygrad movement ops को wrappers (AFTER, END) से गुज़ारता है क्योंकि bufferization के दौरान movement ops दोबारा अप्लाई होते हैं। Morok bufferization के दौरान indices ट्रांसफ़ॉर्म करके movement ops पूरी तरह हटा देता है, इसलिए AFTER/END patterns की ज़रूरत नहीं।
+**नोट**: Tinygrad और Svod का अप्रोच अलग है। Tinygrad movement ops को wrappers (AFTER, END) से गुज़ारता है क्योंकि bufferization के दौरान movement ops दोबारा अप्लाई होते हैं। Svod bufferization के दौरान indices ट्रांसफ़ॉर्म करके movement ops पूरी तरह हटा देता है, इसलिए AFTER/END patterns की ज़रूरत नहीं।
 
-**Morok**: `movement_op_patterns()` in `rangeify/patterns.rs`
+**Svod**: `movement_op_patterns()` in `rangeify/patterns.rs`
 
 ---
 
@@ -68,7 +68,7 @@ count = clamp(64 - length, 0, 64)
 
 **नोट**: INDEX पर WHERE मूवमेंट (`pm_move_where_on_load`) एक अलग ऑप्टिमाइज़ेशन है जो मेमोरी एक्सेस स्किप करने के लिए loads से पहले conditionals लगाता है, लेकिन यह REDUCE ऑपरेशन एलिमिनेट नहीं करता।
 
-**Morok**: `pm_load_collapse()` in `rangeify/patterns.rs`
+**Svod**: `pm_load_collapse()` in `rangeify/patterns.rs`
 
 ---
 
@@ -104,7 +104,7 @@ After:   RANGE(end=3) * 4 + RANGE(end=4)
 
 **नोट**: स्प्लिट तभी अप्लाई होता है जब `end % mod == 0` (divisibility check)।
 
-**Morok**: `pm_split_ranges()` + `pm_flatten_range()` in `rangeify/transforms.rs`
+**Svod**: `pm_split_ranges()` + `pm_flatten_range()` in `rangeify/transforms.rs`
 
 ---
 
@@ -152,7 +152,7 @@ NOT(NOT(x)) → x
 - Where folding (एक ही condition वाले WHERE कम्बाइन करना)
 - Reduce mul chain (reduce से बाहर multiplications ले जाना)
 
-**Morok**: `symbolic()` in `symbolic/patterns.rs`
+**Svod**: `symbolic()` in `symbolic/patterns.rs`
 
 ---
 
@@ -185,7 +185,7 @@ RANGE(0..32)
 
 कम्पाइलर तभी मर्ज करता है जब ऑपरेशन बचते हैं। मर्जिंग के लिए indices recalculate करने में division/modulo लग सकता है। अगर इसकी कॉस्ट बचत से ज़्यादा है, तो मर्ज स्किप होता है।
 
-**Morok**: `simplify_merge_adjacent()` in `rangeify/transforms.rs`
+**Svod**: `simplify_merge_adjacent()` in `rangeify/transforms.rs`
 
 ---
 
@@ -257,4 +257,4 @@ Optimization Search:
 
 **नोट**: NOLOCALS एक constraint है जो `dont_use_locals = True` सेट करता है, जिससे आगे LOCAL एक्शन और shared memory यूज़ डिसीज़न प्रभावित होते हैं।
 
-**Morok**: `optimizer/mod.rs`, `optimizer/opts.rs`
+**Svod**: `optimizer/mod.rs`, `optimizer/opts.rs`

@@ -39,13 +39,13 @@ fn test_beam_actions_contains_expected_types() {
     assert!(has_unroll);
     assert!(has_tc);
     assert!(has_swap);
-    // NOLOCALS is env-gated (`MOROK_NOLOCALS`), tested separately.
+    // NOLOCALS is env-gated (`SVOD_NOLOCALS`), tested separately.
 }
 
 #[test]
 fn test_beam_search_with_mock_scoring() {
     use super::super::renderer::Renderer;
-    use morok_ir::UOp;
+    use svod_ir::UOp;
 
     // Create a simple scheduler
     let val = UOp::native_const(1.0f32);
@@ -75,7 +75,7 @@ fn test_beam_search_with_mock_scoring() {
 #[test]
 fn test_validate_limits() {
     use super::super::renderer::Renderer;
-    use morok_ir::UOp;
+    use svod_ir::UOp;
 
     let val = UOp::native_const(1.0f32);
     let sink = UOp::sink(vec![val]);
@@ -97,7 +97,7 @@ fn test_validate_limits() {
 #[test]
 fn test_replay_opts_empty() {
     use super::super::renderer::Renderer;
-    use morok_ir::UOp;
+    use svod_ir::UOp;
 
     let val = UOp::native_const(1.0f32);
     let sink = UOp::sink(vec![val]);
@@ -204,7 +204,7 @@ fn test_beam_actions_contains_thread() {
 #[test]
 fn test_thread_action_applied_to_loop_axis() {
     use super::super::renderer::Renderer;
-    use morok_ir::{AxisId, AxisType, UOp};
+    use svod_ir::{AxisId, AxisType, UOp};
 
     // Create a kernel with Loop axis (CPU threading target)
     let end_64 = UOp::index_const(64);
@@ -236,7 +236,7 @@ fn test_thread_action_applied_to_loop_axis() {
 #[test]
 fn test_generate_actions_includes_thread_for_cpu() {
     use super::super::renderer::Renderer;
-    use morok_ir::{AxisId, AxisType, UOp};
+    use svod_ir::{AxisId, AxisType, UOp};
 
     // Create a kernel with Loop axis
     let end_64 = UOp::index_const(64);

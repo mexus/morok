@@ -12,9 +12,9 @@
 //!
 //! See `website/docs/architecture/jit-graphs.md` for the wrapper contract.
 
-extern crate self as morok_model;
+extern crate self as svod_model;
 
-use morok_macros::jit_wrapper;
+use svod_macros::jit_wrapper;
 
 use super::model::ResNet;
 

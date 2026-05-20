@@ -10,9 +10,9 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use morok_device::DeviceSpec;
-use morok_dtype::DType;
-use morok_ir::{AddrSpace, AxisType, BufferizeOpts, Op, SInt, UOp, UOpKey};
+use svod_device::DeviceSpec;
+use svod_dtype::DType;
+use svod_ir::{AddrSpace, AxisType, BufferizeOpts, Op, SInt, UOp, UOpKey};
 use test_case::test_case;
 
 use crate::rangeify::indexing::IndexingContext;

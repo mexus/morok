@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use crate::rangeify::patterns::dead_axis_removal;
 use crate::rewrite::graph_rewrite_bottom_up;
-use morok_dtype::DType;
-use morok_ir::{ConstValue, Op, UOp};
+use svod_dtype::DType;
+use svod_ir::{ConstValue, Op, UOp};
 
 /// Helper to check if result contains RESHAPE(BUFFERIZE_no_ranges), optionally wrapped in EXPAND.
 /// Identity expand is eliminated at construction time, so EXPAND may not be present.
@@ -216,7 +216,7 @@ fn test_dead_axis_skips_after_compute() {
     // ranges define consumer access, not the wrapped computation's shape, so
     // dead-axis cleanup would mangle assign-chain semantics.
     use smallvec::smallvec;
-    let buf = UOp::new_buffer(morok_dtype::DeviceSpec::Cpu, 4, DType::Float32);
+    let buf = UOp::new_buffer(svod_dtype::DeviceSpec::Cpu, 4, DType::Float32);
     let dep = UOp::noop();
     let after = buf.after(smallvec![dep]);
     let dead_range = UOp::range_const(1, 0);

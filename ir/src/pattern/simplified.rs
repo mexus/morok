@@ -20,7 +20,7 @@
 //! # Usage with patterns! macro
 //!
 //! ```ignore
-//! use morok_macros::patterns;
+//! use svod_macros::patterns;
 //!
 //! let matcher = patterns! {
 //!     Add(x, @zero) ~> x,              // Indexed under OpKey::Binary(BinaryOp::Add)
@@ -65,7 +65,7 @@ pub type PatternClosure<C> = Arc<dyn Fn(&Arc<UOp>, &mut C) -> RewriteResult + Se
 /// Typically used via the `patterns!` macro:
 ///
 /// ```ignore
-/// use morok_macros::patterns;
+/// use svod_macros::patterns;
 ///
 /// let matcher = patterns! {
 ///     Add(x, @zero) ~> x,
@@ -166,7 +166,7 @@ impl<C> SimplifiedPatternMatcher<C> {
     ///
     /// Enable debug-level tracing to see pattern matching activity:
     /// ```bash
-    /// RUST_LOG=morok_ir::pattern=debug cargo run
+    /// RUST_LOG=svod_ir::pattern=debug cargo run
     /// ```
     pub fn rewrite(&self, uop: &Arc<UOp>, ctx: &mut C) -> RewriteResult {
         let key = OpKey::from_op(uop.op());

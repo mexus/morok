@@ -4,7 +4,7 @@
 //! (loading a hub VAD into a unit test would be too heavy); only the
 //! pure-logic splitter and the bounds getters are exercised here.
 
-use morok_arch::vad::AudioChunk;
+use svod_arch::vad::AudioChunk;
 
 use crate::audio::{EncoderBounds, FixedLengthSplitter, Splitter};
 

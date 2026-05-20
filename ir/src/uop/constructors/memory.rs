@@ -10,10 +10,10 @@
 use std::sync::Arc;
 
 use bon::bon;
-use morok_dtype::DType;
-use morok_dtype::DeviceSpec;
 use smallvec::SmallVec;
 use snafu::ensure;
+use svod_dtype::DType;
+use svod_dtype::DeviceSpec;
 
 use crate::Result;
 use crate::error::IndexTypeMismatchSnafu;
@@ -72,7 +72,7 @@ impl UOp {
             ensure!(
                 matches!(
                     base,
-                    morok_dtype::ScalarDType::Index | morok_dtype::ScalarDType::Int64 | morok_dtype::ScalarDType::Int32
+                    svod_dtype::ScalarDType::Index | svod_dtype::ScalarDType::Int64 | svod_dtype::ScalarDType::Int32
                 ),
                 IndexTypeMismatchSnafu { actual: idx.dtype() }
             );
@@ -287,7 +287,7 @@ impl UOp {
 
     /// Define register memory (void pointer - type determined by usage).
     pub fn define_reg(size: usize) -> Arc<Self> {
-        use morok_dtype::AddrSpace;
+        use svod_dtype::AddrSpace;
         let id = crate::uop::hash_consing::next_unique_id();
         let ptr_dtype = DType::Void.ptr(Some(size), AddrSpace::Reg);
         Self::new(Op::DefineReg { size, id }, ptr_dtype)
@@ -298,7 +298,7 @@ impl UOp {
     /// Creates a typed register accumulator for use in reductions.
     /// The element_dtype specifies the type of each element (e.g., Float32 for a float accumulator).
     pub fn define_reg_typed(size: usize, element_dtype: DType) -> Arc<Self> {
-        use morok_dtype::AddrSpace;
+        use svod_dtype::AddrSpace;
         let id = crate::uop::hash_consing::next_unique_id();
         let ptr_dtype =
             DType::Ptr { base: Box::new(element_dtype), addrspace: AddrSpace::Reg, size: Some(size), vcount: 1 };

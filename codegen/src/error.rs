@@ -40,6 +40,6 @@ pub enum Error {
     #[snafu(display("IR error: {source}"))]
     IrError {
         #[snafu(source)]
-        source: morok_ir::Error,
+        source: svod_ir::Error,
     },
 }

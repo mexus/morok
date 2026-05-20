@@ -23,7 +23,7 @@ use std::time::Duration;
 
 use once_cell::sync::Lazy;
 
-use morok_ir::{AxisType, ConstValue, Op, UOp};
+use svod_ir::{AxisType, ConstValue, Op, UOp};
 
 use super::Scheduler;
 use super::config::BeamConfig;
@@ -131,8 +131,8 @@ pub static BEAM_ACTIONS: Lazy<Vec<Opt>> = Lazy::new(|| {
         }
     }
 
-    // NOLOCALS — only when explicitly enabled via `MOROK_NOLOCALS`.
-    if std::env::var("MOROK_NOLOCALS").is_ok() {
+    // NOLOCALS — only when explicitly enabled via `SVOD_NOLOCALS`.
+    if std::env::var("SVOD_NOLOCALS").is_ok() {
         actions.push(Opt::nolocals());
     }
 
@@ -627,7 +627,7 @@ pub fn get_applied_opts(scheduler: &Scheduler) -> &[Opt] {
 /// Lazy-initialized on first access. Returns None if cache directory
 /// cannot be created or database cannot be opened.
 static CACHE_DB: Lazy<Option<sled::Db>> = Lazy::new(|| {
-    let cache_dir = dirs::cache_dir()?.join("morok");
+    let cache_dir = dirs::cache_dir()?.join("svod");
     std::fs::create_dir_all(&cache_dir).ok()?;
     sled::open(cache_dir.join("beam_cache")).ok()
 });
@@ -644,7 +644,7 @@ struct CacheKey {
     /// Beam width used for search.
     beam_width: usize,
     /// Renderer/TC backend.
-    device: morok_ir::RendererDevice,
+    device: svod_ir::RendererDevice,
     /// Upcast/unroll product cap at search time.
     max_upcast: usize,
     /// Local/warp/group_reduce product cap at search time.

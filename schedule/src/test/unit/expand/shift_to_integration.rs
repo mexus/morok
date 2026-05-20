@@ -5,10 +5,10 @@
 
 use std::sync::Arc;
 
-use morok_dtype::DType;
-use morok_ir::types::ConstValue;
-use morok_ir::{AxisId, AxisType, Op, ReduceOp, UOp};
 use smallvec::smallvec;
+use svod_dtype::DType;
+use svod_ir::types::ConstValue;
+use svod_ir::{AxisId, AxisType, Op, ReduceOp, UOp};
 
 use crate::expand::pre_expand;
 use crate::optimizer::Renderer;

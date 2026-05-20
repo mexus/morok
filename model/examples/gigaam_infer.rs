@@ -10,15 +10,15 @@
 //! that already segmented the input.
 //!
 //! Usage:
-//!   cargo run -p morok-model --release --example gigaam_infer -- audio.wav
+//!   cargo run -p svod-model --release --example gigaam_infer -- audio.wav
 //!
 //! Env knobs (all optional):
-//!   MOROK_AMX=1                 Enable AMX renderer (Apple Silicon).
-//!   MOROK_BEAM_DECODE=1         Promote greedy CTC to beam search.
-//!   MOROK_TIMESTAMPS=1          Emit per-word `[start - end] word` lines.
-//!   MOROK_GIGAAM_REVISION=name  HF Hub revision (default `ctc`).
-//!   MOROK_MAX_SCORES_MIB=N      SDPA scores buffer budget (default 256).
-//!   MOROK_VAD_THRESHOLD=f       Silero VAD threshold (default 0.5).
+//!   SVOD_AMX=1                 Enable AMX renderer (Apple Silicon).
+//!   SVOD_BEAM_DECODE=1         Promote greedy CTC to beam search.
+//!   SVOD_TIMESTAMPS=1          Emit per-word `[start - end] word` lines.
+//!   SVOD_GIGAAM_REVISION=name  HF Hub revision (default `ctc`).
+//!   SVOD_MAX_SCORES_MIB=N      SDPA scores buffer budget (default 256).
+//!   SVOD_VAD_THRESHOLD=f       Silero VAD threshold (default 0.5).
 //!
 //! See `gigaam_rnnt_infer.rs` for the RN-T variant (same pattern, RN-T-default
 //! revision).
@@ -26,13 +26,13 @@
 use std::env;
 use std::time::Instant;
 
-use morok_model::gigaam::{GigaAm, TranscribeOpts, Transcriber};
-use morok_model::silero_vad::SileroVadSplitter;
+use svod_model::gigaam::{GigaAm, TranscribeOpts, Transcriber};
+use svod_model::silero_vad::SileroVadSplitter;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let t_total = Instant::now();
     let wav_path = env::args().nth(1).ok_or("usage: gigaam_infer <audio.wav>")?;
-    let revision = env::var("MOROK_GIGAAM_REVISION").unwrap_or_else(|_| "ctc".to_string());
+    let revision = env::var("SVOD_GIGAAM_REVISION").unwrap_or_else(|_| "ctc".to_string());
     let opts = TranscribeOpts::from_env();
 
     println!("Loading audio: {wav_path}");

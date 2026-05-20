@@ -7,7 +7,7 @@ sidebar_label: Strength Reduction
 Strength reduction replaces expensive operations with cheaper equivalents. These patterns run late in the pipeline (Stages 18-19) because earlier passes need to see the original operation structure. For example, `Add(Mul(a, b), c)` must remain visible for algebraic simplification before being fused into `MULACC(a, b, c)`.
 
 Tinygrad source: `tinygrad/uop/decompositions.py:438-480` (`get_late_rewrite_patterns`).
-Morok source: `schedule/src/rangeify/patterns.rs` (late decomposition group) + `schedule/src/symbolic/fast_div.rs`.
+Svod source: `schedule/src/rangeify/patterns.rs` (late decomposition group) + `schedule/src/symbolic/fast_div.rs`.
 
 *Cycle estimates throughout this page are approximate for modern x86-64. Actual latencies vary by microarchitecture and pipeline state.*
 
@@ -27,7 +27,7 @@ The most impactful strength reduction. Integer division and modulo by constants 
 
 The modulo optimization works because `2^n - 1` is a bitmask of the lower n bits. Example: `x % 8` = `x & 0b111`.
 
-Tinygrad: `decompositions.py:448-454`. Morok: `pm_mod_to_and`, `pm_mul_to_shl`, `pm_div_to_shr` in `rangeify/patterns.rs`.
+Tinygrad: `decompositions.py:448-454`. Svod: `pm_mod_to_and`, `pm_mul_to_shl`, `pm_div_to_shr` in `rangeify/patterns.rs`.
 
 :::caution Signed Division
 For signed integers, `x // 2^n` is NOT simply `x >> n`. Arithmetic right shift rounds toward negative infinity, but integer division rounds toward zero.
@@ -41,9 +41,9 @@ floor(x / 2^n) = (x + 2^n - 1) >> n    when x < 0
                   x >> n                  when x >= 0
 ```
 
-Morok checks `vmin >= 0` via range analysis (`VminVmaxProperty`) to skip the bias when the dividend is provably non-negative. Tinygrad uses dtype membership (`dtypes.uints`) for the same purpose.
+Svod checks `vmin >= 0` via range analysis (`VminVmaxProperty`) to skip the bias when the dividend is provably non-negative. Tinygrad uses dtype membership (`dtypes.uints`) for the same purpose.
 
-Tinygrad: `decompositions.py:452-454`. Morok: `pm_div_to_shr` in `rangeify/patterns.rs`.
+Tinygrad: `decompositions.py:452-454`. Svod: `pm_div_to_shr` in `rangeify/patterns.rs`.
 :::
 
 Generated C output for signed power-of-two division:
@@ -93,7 +93,7 @@ From Hacker's Delight Chapter 10 (Tinygrad's `magicgu`, `decompositions.py:272-2
 
 The loop finds the smallest `s` that produces a valid magic number. Smaller `s` means smaller `M`, which is critical for fitting the intermediate product `x * M` in narrow integer types.
 
-Morok implementation: `magic_unsigned()` in `schedule/src/symbolic/fast_div.rs`.
+Svod implementation: `magic_unsigned()` in `schedule/src/symbolic/fast_div.rs`.
 
 ### Three-stage strategy
 
@@ -147,7 +147,7 @@ Float multiply is 1-2 cycles (fully pipelined), while float divide is 10-20 cycl
 - Skip if `1/c` is not finite (overflow to `inf` means `c` is too small)
 - Only for float types
 
-Tinygrad: `decompositions.py:477-479` (FDIV-based backends emit `RECIP` as `1/x`). Morok: `pm_fdiv_to_mul` in `rangeify/patterns.rs`.
+Tinygrad: `decompositions.py:477-479` (FDIV-based backends emit `RECIP` as `1/x`). Svod: `pm_fdiv_to_mul` in `rangeify/patterns.rs`.
 
 ```c
 // Before
@@ -167,11 +167,11 @@ This maps to hardware FMA instructions (`vfmadd` on x86 AVX, `fmadd` on ARM NEON
 
 **Why applied late**: Earlier passes need to see `Add(Mul(a, b), c)` structure for algebraic simplification. If fused early, patterns like `(x*2 + x*3)` could not simplify to `x*5` because the `Mul` nodes would be buried inside MULACC.
 
-**Shift-add fusion (Tinygrad only)**: Tinygrad also fuses `(x << n) + c` to `MULACC(x, 2^n, c)`, catching cases where MUL-to-SHL ran first in the same fixed-point pass. This pattern is not yet ported to Morok.
+**Shift-add fusion (Tinygrad only)**: Tinygrad also fuses `(x << n) + c` to `MULACC(x, 2^n, c)`, catching cases where MUL-to-SHL ran first in the same fixed-point pass. This pattern is not yet ported to Svod.
 
 **Guards**: Only matches when all three operands (`a`, `b`, `c`) share the same float dtype. Integer FMA is not fused because hardware FMA instructions are float-only.
 
-Tinygrad: `decompositions.py:472-475`. Morok: `pm_fma_decomposition` in `rangeify/patterns.rs`.
+Tinygrad: `decompositions.py:472-475`. Svod: `pm_fma_decomposition` in `rangeify/patterns.rs`.
 
 ---
 
@@ -181,7 +181,7 @@ Tinygrad: `decompositions.py:472-475`. Morok: `pm_fma_decomposition` in `rangeif
 
 NEG is a single instruction (flip sign bit for float via `xorps`, negate for int via `neg`). Multiplication by -1 unnecessarily occupies the multiplier pipeline for 3-4 cycles.
 
-Only fires when the backend supports `NEG` as a native op. Tinygrad: `decompositions.py:458-459`. Morok: `pm_neg_from_mul`.
+Only fires when the backend supports `NEG` as a native op. Tinygrad: `decompositions.py:458-459`. Svod: `pm_neg_from_mul`.
 
 ---
 
@@ -203,7 +203,7 @@ The range compression (row 3) is particularly valuable. When the open interval `
 The negation patterns guard against overflow: `!(x < c)` becomes `(c-1) < x` only if `c-1` does not underflow, and `!(c < x)` becomes `x < (c+1)` only if `c+1` does not overflow. Both use `checked_sub` / `checked_add` and return `None` (no transformation) on overflow.
 :::
 
-Tinygrad: `decompositions.py:461-470`. Morok: `pm_comparison_negations` in `rangeify/patterns.rs`.
+Tinygrad: `decompositions.py:461-470`. Svod: `pm_comparison_negations` in `rangeify/patterns.rs`.
 
 ---
 
@@ -220,7 +220,7 @@ These appear in *two* places in the pipeline:
 
 2. **Late** (Stage 18-19): `symbolic_simple()` includes boolean patterns and runs alongside the strength reduction patterns in `PM_FINAL`. This catches new De Morgan opportunities created by comparison negation patterns -- for example, after `!(x < 3)` and `!(x < 7)` are rewritten to `2 < x` and `6 < x`, any AND/OR combining them may now have new NOT-elimination opportunities.
 
-Morok: `boolean_dsl_patterns()` in `schedule/src/symbolic/patterns.rs`.
+Svod: `boolean_dsl_patterns()` in `schedule/src/symbolic/patterns.rs`.
 
 ---
 
@@ -234,11 +234,11 @@ where t = 1 / (1 + 0.3275911 * |x|)
       P(t) = Horner(t, [1.061405429, -1.453152027, 1.421413741, -0.284496736, 0.254829592])
 ```
 
-**Why**: `@llvm.erf` is a libcall intrinsic (requires libm linkage), not a native hardware instruction. The LLVM JIT backend does not link libm, so `erf` must be decomposed before codegen. Tinygrad decomposes `erf` at the tensor level (`elementwise.py`), so it never reaches the renderer; Morok keeps `Erf` as a UOp until this late pass.
+**Why**: `@llvm.erf` is a libcall intrinsic (requires libm linkage), not a native hardware instruction. The LLVM JIT backend does not link libm, so `erf` must be decomposed before codegen. Tinygrad decomposes `erf` at the tensor level (`elementwise.py`), so it never reaches the renderer; Svod keeps `Erf` as a UOp until this late pass.
 
 Maximum error: ~1.5e-7 (sufficient for float32 ML workloads).
 
-Morok: `pm_erf_decomposition` in `rangeify/patterns.rs`.
+Svod: `pm_erf_decomposition` in `rangeify/patterns.rs`.
 
 ---
 

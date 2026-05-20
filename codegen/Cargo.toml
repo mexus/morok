@@ -1,18 +1,18 @@
 [package]
-name = "morok-codegen"
+name = "svod-codegen"
 version.workspace = true
 authors.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Backend code generation for the Morok ML compiler"
+description = "Backend code generation for the Svod ML compiler"
 readme = "README.md"
 
 [dependencies]
-morok-dtype = { path = "../dtype", version = "=0.1.0-alpha.2" }
-morok-ir = { path = "../ir", version = "=0.1.0-alpha.2" }
-morok-device = { path = "../device", version = "=0.1.0-alpha.2" }
-morok-schedule = { path = "../schedule", version = "=0.1.0-alpha.2" }
+svod-dtype = { path = "../dtype", version = "=0.1.0-alpha.2" }
+svod-ir = { path = "../ir", version = "=0.1.0-alpha.2" }
+svod-device = { path = "../device", version = "=0.1.0-alpha.2" }
+svod-schedule = { path = "../schedule", version = "=0.1.0-alpha.2" }
 snafu = "0.8.9"
 itertools = "0.14.0"
 tracing = "0.1"

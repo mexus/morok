@@ -34,10 +34,10 @@ fn test_output_indices_from_program_metadata_rejects_out_of_range_position() {
 
 #[test]
 fn test_resolve_compiled_kernel_buffer_indices_reorders_by_program_globals() {
-    let p0 = UOp::param(0, 4, morok_dtype::DType::Float32, None);
-    let p1 = UOp::param(1, 4, morok_dtype::DType::Float32, None);
+    let p0 = UOp::param(0, 4, svod_dtype::DType::Float32, None);
+    let p1 = UOp::param(1, 4, svod_dtype::DType::Float32, None);
     let body = UOp::sink(vec![p0.clone(), p1.clone()]);
-    let call = body.call(SmallVec::from_vec(vec![p1.clone(), p0.clone()]), morok_ir::CallInfo::default());
+    let call = body.call(SmallVec::from_vec(vec![p1.clone(), p0.clone()]), svod_ir::CallInfo::default());
     let item = crate::schedule::ScheduleItem {
         kernel: call,
         ast: body,
@@ -59,10 +59,10 @@ fn test_resolve_compiled_kernel_buffer_indices_reorders_by_program_globals() {
 
 #[test]
 fn test_resolve_compiled_kernel_buffer_indices_treats_globals_as_buffer_positions() {
-    let p0 = UOp::param(0, 4, morok_dtype::DType::Float32, None);
-    let p1 = UOp::param(1, 4, morok_dtype::DType::Float32, None);
+    let p0 = UOp::param(0, 4, svod_dtype::DType::Float32, None);
+    let p1 = UOp::param(1, 4, svod_dtype::DType::Float32, None);
     let body = UOp::sink(vec![p0.clone(), p1.clone()]);
-    let call = body.call(SmallVec::from_vec(vec![p1.clone(), p0.clone()]), morok_ir::CallInfo::default());
+    let call = body.call(SmallVec::from_vec(vec![p1.clone(), p0.clone()]), svod_ir::CallInfo::default());
     let item = crate::schedule::ScheduleItem {
         kernel: call,
         ast: body,
@@ -84,9 +84,9 @@ fn test_resolve_compiled_kernel_buffer_indices_treats_globals_as_buffer_position
 
 #[test]
 fn test_resolve_compiled_kernel_buffer_indices_rejects_out_of_range_global_position() {
-    let p0 = UOp::param(0, 4, morok_dtype::DType::Float32, None);
+    let p0 = UOp::param(0, 4, svod_dtype::DType::Float32, None);
     let body = UOp::sink(vec![p0.clone()]);
-    let call = body.call(SmallVec::from_vec(vec![p0.clone()]), morok_ir::CallInfo::default());
+    let call = body.call(SmallVec::from_vec(vec![p0.clone()]), svod_ir::CallInfo::default());
     let item = crate::schedule::ScheduleItem {
         kernel: call,
         ast: body,
@@ -114,8 +114,8 @@ fn test_restore_post_schedule_pre_schedule_rewrites_runtime_buf_uops() {
     let sink = UOp::sink(vec![c.uop().contiguous()]);
 
     let normalization = normalize_for_schedule_cache(&sink).expect("normalize schedule cache");
-    let rangeify = morok_schedule::rangeify_with_map(normalization.normalized.clone(), None).expect("rangeify");
-    let (kernel_graph_cached, _) = morok_schedule::try_get_kernel_graph(rangeify.sink).expect("kernel graph");
+    let rangeify = svod_schedule::rangeify_with_map(normalization.normalized.clone(), None).expect("rangeify");
+    let (kernel_graph_cached, _) = svod_schedule::try_get_kernel_graph(rangeify.sink).expect("kernel graph");
     let pre_schedule_cached = crate::schedule::create_pre_schedule(kernel_graph_cached).expect("pre schedule");
 
     assert!(
@@ -158,16 +158,16 @@ fn test_restore_post_schedule_pre_schedule_rewrites_runtime_buf_uops() {
 
 struct TestRenderer;
 
-impl morok_device::device::Renderer for TestRenderer {
+impl svod_device::device::Renderer for TestRenderer {
     fn render(
         &self,
         ast: &std::sync::Arc<UOp>,
         name: Option<&str>,
-    ) -> morok_device::Result<morok_device::device::ProgramSpec> {
-        let mut spec = morok_device::device::ProgramSpec::new(
+    ) -> svod_device::Result<svod_device::device::ProgramSpec> {
+        let mut spec = svod_device::device::ProgramSpec::new(
             name.unwrap_or("kernel").to_string(),
             "// test source".to_string(),
-            morok_dtype::DeviceSpec::Cpu,
+            svod_dtype::DeviceSpec::Cpu,
             ast.clone(),
         );
         spec.set_buffer_metadata(vec![0], vec![0], vec![]);
@@ -175,20 +175,20 @@ impl morok_device::device::Renderer for TestRenderer {
         Ok(spec)
     }
 
-    fn device(&self) -> &morok_dtype::DeviceSpec {
-        static DEVICE: morok_dtype::DeviceSpec = morok_dtype::DeviceSpec::Cpu;
+    fn device(&self) -> &svod_dtype::DeviceSpec {
+        static DEVICE: svod_dtype::DeviceSpec = svod_dtype::DeviceSpec::Cpu;
         &DEVICE
     }
 }
 
 struct TestCompiler;
 
-impl morok_device::device::Compiler for TestCompiler {
+impl svod_device::device::Compiler for TestCompiler {
     fn compile(
         &self,
-        spec: &morok_device::device::ProgramSpec,
-    ) -> morok_device::Result<morok_device::device::CompiledSpec> {
-        Ok(morok_device::device::CompiledSpec::from_bytes(spec.name.clone(), vec![1, 2, 3], spec.ast.clone()))
+        spec: &svod_device::device::ProgramSpec,
+    ) -> svod_device::Result<svod_device::device::CompiledSpec> {
+        Ok(svod_device::device::CompiledSpec::from_bytes(spec.name.clone(), vec![1, 2, 3], spec.ast.clone()))
     }
 
     fn cache_key(&self) -> &'static str {
@@ -199,7 +199,7 @@ impl morok_device::device::Compiler for TestCompiler {
 #[test]
 fn test_compile_with_program_pipeline_components_accepts_program_input() {
     let sink = UOp::sink(vec![UOp::native_const(1.0f32)]);
-    let program = morok_codegen::program_pipeline::program_from_sink(sink, morok_dtype::DeviceSpec::Cpu);
+    let program = svod_codegen::program_pipeline::program_from_sink(sink, svod_dtype::DeviceSpec::Cpu);
 
     let (spec, compiled) =
         compile_with_program_pipeline_components(program, &TestRenderer, &TestCompiler, Some("p_test"))
@@ -222,8 +222,8 @@ fn test_compile_with_program_pipeline_components_rejects_non_program_input() {
 #[test]
 fn test_compile_with_program_pipeline_components_accepts_stage1_program_input() {
     let sink = UOp::sink(vec![UOp::native_const(1.0f32)]);
-    let linear = UOp::linear(morok_schedule::linearize_with_cfg(sink.clone()).into());
-    let program = UOp::program(sink, UOp::device(morok_dtype::DeviceSpec::Cpu), Some(linear), None, None);
+    let linear = UOp::linear(svod_schedule::linearize_with_cfg(sink.clone()).into());
+    let program = UOp::program(sink, UOp::device(svod_dtype::DeviceSpec::Cpu), Some(linear), None, None);
 
     let (spec, compiled) =
         compile_with_program_pipeline_components(program, &TestRenderer, &TestCompiler, Some("p_test"))
@@ -235,10 +235,10 @@ fn test_compile_with_program_pipeline_components_accepts_stage1_program_input() 
 #[test]
 fn test_compile_with_program_pipeline_components_accepts_stage2_program_input() {
     let sink = UOp::sink(vec![UOp::native_const(1.0f32)]);
-    let linear = UOp::linear(morok_schedule::linearize_with_cfg(sink.clone()).into());
+    let linear = UOp::linear(svod_schedule::linearize_with_cfg(sink.clone()).into());
     let program = UOp::program(
         sink,
-        UOp::device(morok_dtype::DeviceSpec::Cpu),
+        UOp::device(svod_dtype::DeviceSpec::Cpu),
         Some(linear),
         Some(UOp::source("// pre-rendered source".to_string())),
         None,
@@ -256,7 +256,7 @@ fn test_compile_with_program_pipeline_components_rejects_malformed_program_state
     let sink = UOp::sink(vec![UOp::native_const(1.0f32)]);
     let program = UOp::program(
         sink,
-        UOp::device(morok_dtype::DeviceSpec::Cpu),
+        UOp::device(svod_dtype::DeviceSpec::Cpu),
         None,
         Some(UOp::source("// malformed source".to_string())),
         None,
@@ -276,7 +276,7 @@ fn test_collect_non_overridable_fixedvars_locks_only_loop_var_names() {
     // so they remain overridable. This separates loop counters from runtime
     // variable binds.
     let body = UOp::sink(vec![UOp::native_const(1.0f32)]);
-    let call = body.call(SmallVec::new(), morok_ir::CallInfo::default());
+    let call = body.call(SmallVec::new(), svod_ir::CallInfo::default());
 
     let item = crate::schedule::ScheduleItem {
         kernel: call,
@@ -356,21 +356,21 @@ fn test_realize_sum() {
 fn test_tensor_device_default_cpu() {
     // Tensors created with from_slice default to CPU
     let a = Tensor::from_slice([1.0f32, 2.0, 3.0]);
-    assert_eq!(a.device(), morok_ir::DeviceSpec::Cpu);
+    assert_eq!(a.device(), svod_ir::DeviceSpec::Cpu);
 }
 
 #[test]
 fn test_tensor_to_same_device_is_noop() {
     // Moving to the same device should return a clone
     let a = Tensor::from_slice([1.0f32, 2.0, 3.0]);
-    let b = a.to(morok_ir::DeviceSpec::Cpu);
+    let b = a.to(svod_ir::DeviceSpec::Cpu);
     // Both should point to the same UOp (clone shares Rc)
     assert_eq!(a.device(), b.device());
 }
 
 #[test]
 fn test_tensor_to_different_device_creates_copy() {
-    use morok_ir::DeviceSpec;
+    use svod_ir::DeviceSpec;
     // Moving to a different device should create a COPY UOp
     let a = Tensor::from_slice([1.0f32, 2.0, 3.0]);
     let b = a.to(DeviceSpec::Cuda { device_id: 0 });
@@ -419,7 +419,7 @@ fn test_prepare_execution_plan_marks_cpu_kernels_host_parallel_safe() {
         .prepared_ops()
         .iter()
         .filter_map(|op| match op {
-            morok_runtime::PreparedOp::CompiledProgram(kernel) => Some(kernel),
+            svod_runtime::PreparedOp::CompiledProgram(kernel) => Some(kernel),
             _ => None,
         })
         .collect();
@@ -487,13 +487,13 @@ fn test_prepare_and_execute_twice() {
 fn test_prepare_execution_plan_lowers_explicit_custom_function_op() {
     crate::test::helpers::test_setup();
 
-    let alloc = morok_device::registry::cpu().expect("cpu allocator");
-    let src = Buffer::new(alloc.clone(), morok_dtype::DType::Float32, vec![4], Default::default());
-    let dst = Buffer::new(alloc, morok_dtype::DType::Float32, vec![4], Default::default());
+    let alloc = svod_device::registry::cpu().expect("cpu allocator");
+    let src = Buffer::new(alloc.clone(), svod_dtype::DType::Float32, vec![4], Default::default());
+    let dst = Buffer::new(alloc, svod_dtype::DType::Float32, vec![4], Default::default());
 
     let attr = UOp::index_const(42);
-    let ast = UOp::custom_function(morok_ir::CustomFunctionKind::EncDec, smallvec::smallvec![attr.clone()]);
-    let kernel = ast.call(smallvec::smallvec![], morok_ir::CallInfo::default());
+    let ast = UOp::custom_function(svod_ir::CustomFunctionKind::EncDec, smallvec::smallvec![attr.clone()]);
+    let kernel = ast.call(smallvec::smallvec![], svod_ir::CallInfo::default());
     let schedule_result = crate::schedule::ScheduleResult {
         items: vec![crate::schedule::ScheduleItem {
             kernel,
@@ -514,7 +514,7 @@ fn test_prepare_execution_plan_lowers_explicit_custom_function_op() {
         .prepared_ops()
         .iter()
         .find_map(|op| match op {
-            morok_runtime::PreparedOp::CustomFunction(custom) => Some(custom),
+            svod_runtime::PreparedOp::CustomFunction(custom) => Some(custom),
             _ => None,
         })
         .expect("explicit custom function body should lower to PreparedOp::CustomFunction");

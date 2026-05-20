@@ -13,8 +13,8 @@
 
 use std::sync::Arc;
 
-use morok_ir::pattern::TypedPatternMatcher;
-use morok_ir::{Op, prelude::*};
+use svod_ir::pattern::TypedPatternMatcher;
+use svod_ir::{Op, prelude::*};
 
 use crate::common::is_output_buffer;
 use crate::llvm::common::{RenderContext, ldt};

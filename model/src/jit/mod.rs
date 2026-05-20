@@ -1,5 +1,5 @@
-use morok_dtype::DType;
 use snafu::Snafu;
+use svod_dtype::DType;
 
 mod recurrent;
 pub use recurrent::{JitRecurrent, LstmState, RecurrentJit, StepTiming};
@@ -42,7 +42,7 @@ pub enum JitError {
     InputBufferNotFound { name: &'static str },
 
     #[snafu(display("duplicate JIT input buffer: {name} aliases {duplicate_of} with {buffer_id:?}"))]
-    DuplicateInputBuffer { name: &'static str, duplicate_of: &'static str, buffer_id: morok_device::BufferId },
+    DuplicateInputBuffer { name: &'static str, duplicate_of: &'static str, buffer_id: svod_device::BufferId },
 
     /// Wraps the user-supplied error type returned by a `jit_wrapper!` build
     /// closure. Genuine `Box<dyn>` because the closure's `E` is arbitrary.
@@ -51,14 +51,14 @@ pub enum JitError {
 
     #[snafu(display("{source}"))]
     Tensor {
-        #[snafu(source(from(morok_tensor::error::Error, Box::new)))]
-        source: Box<morok_tensor::error::Error>,
+        #[snafu(source(from(svod_tensor::error::Error, Box::new)))]
+        source: Box<svod_tensor::error::Error>,
     },
 
     #[snafu(display("{source}"))]
     Device {
-        #[snafu(source(from(morok_device::error::Error, Box::new)))]
-        source: Box<morok_device::error::Error>,
+        #[snafu(source(from(svod_device::error::Error, Box::new)))]
+        source: Box<svod_device::error::Error>,
     },
 
     /// `JitRecurrent::new` rejected a JIT whose output element count does not
@@ -74,7 +74,7 @@ pub enum JitError {
     OutputLayoutMismatch { declared_head: usize, declared_state: usize, actual: usize },
 
     #[snafu(display("{source}"))]
-    Runtime { source: morok_runtime::Error },
+    Runtime { source: svod_runtime::Error },
 }
 
 pub type Result<T> = std::result::Result<T, JitError>;

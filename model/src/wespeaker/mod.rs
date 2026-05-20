@@ -26,7 +26,7 @@
 //!
 //! - **`shortcut.{0,1}` naming.** pyannote's `BasicBlock` calls the
 //!   downsample sub-module `shortcut` rather than torchvision's `downsample`.
-//!   The morok [`crate::blocks::BasicBlock`] uses the torchvision keys, so
+//!   The svod [`crate::blocks::BasicBlock`] uses the torchvision keys, so
 //!   the loader renames `.shortcut.` → `.downsample.` in every key on the
 //!   way in.
 //!
@@ -34,7 +34,7 @@
 //!
 //! pyannote's `StatsPool` `F.interpolate(weights, size=T, mode="nearest")`
 //! is implemented in [`tstp`] as a precomputed one-hot matmul instead of via
-//! [`morok_tensor::Tensor::resize`]. Reason: `resize()` (and its siblings
+//! [`svod_tensor::Tensor::resize`]. Reason: `resize()` (and its siblings
 //! `gather` / `index_select`) call `to_vec_usize(full_shape)` and abort on
 //! any symbolic dim, even when only the spatial dims are actually consumed.
 //! Once that's relaxed in the tensor crate (search `TODO(symbolic-batch)`)

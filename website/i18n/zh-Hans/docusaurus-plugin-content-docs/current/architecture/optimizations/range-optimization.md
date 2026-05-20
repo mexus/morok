@@ -34,7 +34,7 @@ After:   RANGE(end=3) * 4 + RANGE(end=4)
 
 **守卫**：仅当 `end % c == 0`（精确整除）时触发。不可整除的情况保持不变。
 
-Tinygrad：`simplify.py:60-64`。Morok：`rangeify/transforms.rs` 中的 `pm_split_ranges()`。
+Tinygrad：`simplify.py:60-64`。Svod：`rangeify/transforms.rs` 中的 `pm_split_ranges()`。
 
 ---
 
@@ -59,7 +59,7 @@ After:   RANGE(0..32)                 One loop, indices via divmod
 - REDUCE 作用域必须保持一致
 - 两个范围必须出现在相同的 REDUCE 作用域中
 
-Tinygrad：`simplify.py:39-41`（`simplify_merge_adjacent`）。Morok：`pm_simplify_ranges()`。
+Tinygrad：`simplify.py:39-41`（`simplify_merge_adjacent`）。Svod：`pm_simplify_ranges()`。
 
 ---
 
@@ -74,7 +74,7 @@ After:   END(comp, [r0, r1, r2])
 
 **原因**：嵌套 END 链产生于连续变换。展平将结构归一化，使其他模式（合并、分割）能在干净的范围列表上操作。
 
-Tinygrad：`simplify.py:14-17`。Morok：`pm_flatten_range()`。
+Tinygrad：`simplify.py:14-17`。Svod：`pm_flatten_range()`。
 
 ---
 
@@ -95,7 +95,7 @@ After:   clamp(64 - length, 0, 64)                // Arithmetic: 3 ops
 
 这是最强大的单项优化——它可以消除整个规约循环，将 O(N) 计算转换为 O(1)。
 
-Tinygrad：`simplify.py:145-149`。Morok：`pm_load_collapse()`。
+Tinygrad：`simplify.py:145-149`。Svod：`pm_load_collapse()`。
 
 ---
 
@@ -134,7 +134,7 @@ NE 门控模式对聚集操作特别重要——它识别出对所有 `idx == r`
 
 `x * bool.cast()` -> `WHERE(bool, x, 0)`——将布尔 cast 的乘法转换为 WHERE，然后可以被边界模式分析。
 
-Tinygrad：`simplify.py:82-142`。Morok：`pm_reduce_simplify()` + `reduce_collapse_inner_patterns()`。
+Tinygrad：`simplify.py:82-142`。Svod：`pm_reduce_simplify()` + `reduce_collapse_inner_patterns()`。
 
 ---
 
@@ -142,7 +142,7 @@ Tinygrad：`simplify.py:82-142`。Morok：`pm_reduce_simplify()` + `reduce_colla
 
 **功能**：决定是否将中间结果物化到缓冲区还是内联计算。在代码库中通常称为"pcontig"（partial contiguous 的缩写——通过替换范围变量来内联 BUFFERIZE 节点的优化）。
 
-当 rangeify pass 创建 `BUFFERIZE` 节点（标记"这需要一个缓冲区"）时，缓冲区移除 pass 评估实际分配内存是否值得。`BUFFERIZE` 是 Morok 在"这需要一个缓冲区"和最终 `STORE`+`BUFFER`+`AFTER` 之间的中间表示——它让这个 pass 决定物化是否真正必要。如果计算足够廉价，它替换范围变量并直接内联表达式。
+当 rangeify pass 创建 `BUFFERIZE` 节点（标记"这需要一个缓冲区"）时，缓冲区移除 pass 评估实际分配内存是否值得。`BUFFERIZE` 是 Svod 在"这需要一个缓冲区"和最终 `STORE`+`BUFFER`+`AFTER` 之间的中间表示——它让这个 pass 决定物化是否真正必要。如果计算足够廉价，它替换范围变量并直接内联表达式。
 
 ### 决策树
 
@@ -176,7 +176,7 @@ Is there a reduce in scope?
 | 恒等折叠 | `INDEX(BUFFERIZE(compute, ranges), ranges)` -> `compute`——相同范围消去 |
 | 嵌套展平 | `BUFFERIZE(BUFFERIZE(...))`——展平嵌套缓冲化 |
 
-Morok：`rangeify/patterns.rs` 中的 `buffer_removal_with_pcontig()`。
+Svod：`rangeify/patterns.rs` 中的 `buffer_removal_with_pcontig()`。
 
 ---
 
@@ -195,7 +195,7 @@ Morok：`rangeify/patterns.rs` 中的 `buffer_removal_with_pcontig()`。
 即使所有范围都为死（标量输出），BUFFERIZE 也必须以空范围保留——完全移除会导致 `NoKernelsFound`，因为内核分割期间不会创建 STORE。
 :::
 
-Morok：`rangeify/patterns.rs` 中的 `dead_axis_removal()`。
+Svod：`rangeify/patterns.rs` 中的 `dead_axis_removal()`。
 
 ---
 
@@ -211,7 +211,7 @@ Morok：`rangeify/patterns.rs` 中的 `dead_axis_removal()`。
 
 示例：`sum(x, r=0..N)`，其中 `x` 不依赖于 `r` -> `x * N`。常量在 N 次迭代上的和是 N 乘以该常量。
 
-Tinygrad：`simplify.py:82-86`。Morok：`pm_reduce_simplify()`。
+Tinygrad：`simplify.py:82-86`。Svod：`pm_reduce_simplify()`。
 
 ---
 
@@ -238,4 +238,4 @@ After:   REDUCE(                       // shape [256] → scalar (second stage)
 
 **守卫**：仅当规约维度可因式分解且输入/输出比超过阈值时应用。不可因式分解的维度被跳过。
 
-Morok：`rangeify/kernel.rs` 中的 `split_reduceop()`。
+Svod：`rangeify/kernel.rs` 中的 `split_reduceop()`。

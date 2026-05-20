@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 
-const REPO_URL = 'https://github.com/npatsakula/morok/tree/main';
+const REPO_URL = 'https://github.com/npatsakula/svod/tree/main';
 
 export default function readmeIntroPlugin(context) {
   return {

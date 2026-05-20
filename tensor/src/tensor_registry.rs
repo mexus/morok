@@ -28,7 +28,7 @@
 //! - Value is `Arc<Buffer>` (strong ref — kept alive for the duration of the computation)
 //! - Stale entries cleaned via `gc_dead_refs()` when the UOp is no longer alive
 //!
-//! Unlike Tinygrad (which stores buffers inline in UOps), Morok uses a separate
+//! Unlike Tinygrad (which stores buffers inline in UOps), Svod uses a separate
 //! index because UOps are immutable and hash-consed. Unique buffer IDs guarantee
 //! entries never collide, so stale entries are harmless — only a memory concern.
 //!
@@ -38,10 +38,10 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 
-use morok_device::Buffer;
-use morok_ir::{Op, UOp, UOpKey};
 use papaya::HashMap as PapayaMap;
 use parking_lot::RwLock;
+use svod_device::Buffer;
+use svod_ir::{Op, UOp, UOpKey};
 
 /// Atomic counter for unique tensor IDs.
 static TENSOR_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -244,7 +244,7 @@ pub fn gc_dead_refs() {
     }
 
     // Clean stale buffer entries (UOp no longer alive in the cache)
-    let live_uop_ids = morok_ir::uop::live_uop_ids();
+    let live_uop_ids = svod_ir::uop::live_uop_ids();
     let buf_map = buffers();
     let buf_guard = buf_map.guard();
     let stale_bufs: Vec<u64> =
@@ -265,7 +265,7 @@ pub fn gc_unused_tensors() {
 
 /// Apply a transformation map to ALL live tensors globally.
 ///
-/// This is Morok's equivalent of Tinygrad's `_apply_map_to_tensors`.
+/// This is Svod's equivalent of Tinygrad's `_apply_map_to_tensors`.
 /// When rangeify creates a becomes_map (old UOp → new UOp), this function
 /// ensures ALL tensors see the same transformed versions.
 ///

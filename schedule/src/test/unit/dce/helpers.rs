@@ -1,8 +1,8 @@
 //! Test helpers for DCE tests.
 
-use morok_ir::types::ConstValue;
-use morok_ir::{Op, UOp};
 use std::sync::Arc;
+use svod_ir::types::ConstValue;
+use svod_ir::{Op, UOp};
 
 use crate::TypedPatternMatcher;
 use crate::symbolic::symbolic_simple;

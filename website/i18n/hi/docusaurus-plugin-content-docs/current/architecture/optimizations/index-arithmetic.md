@@ -16,7 +16,7 @@ Tensor compilers अपने ऑप्टिमाइज़ेशन बजट 
 - **Stage 15** (index dtype lowering via `pm_lower_index_dtype`)
 - **Stage 16** (post-index symbolic)
 
-Morok source: `schedule/src/symbolic/patterns.rs`, `schedule/src/symbolic/index_lowering.rs`
+Svod source: `schedule/src/symbolic/patterns.rs`, `schedule/src/symbolic/index_lowering.rs`
 
 Tinygrad source: `tinygrad/uop/divandmod.py`, `tinygrad/uop/symbolic.py`
 
@@ -185,7 +185,7 @@ Constant divisors के लिए recursive decomposition। Divisor और क
 
 **Example**: `(6*a + 4*b) // 12` → `((6*a + 4*b) // 2) // 6` → `(3*a + 2*b) // 6` → `(3*a + 2*b) // 6` (फिर rule 7 finish करता है)।
 
-Tinygrad: `divandmod.py:62-67`। Morok: `nest_div_by_smallest_factor` in `fold_divmod_general`।
+Tinygrad: `divandmod.py:62-67`। Svod: `nest_div_by_smallest_factor` in `fold_divmod_general`।
 
 :::caution
 Rules 5-8 को non-negative numerators चाहिए (`x_min >= 0`)। Negative operands के साथ floor division की rounding semantics अलग होती है (Python/Tinygrad में negative infinity की तरफ़, hardware में zero की तरफ़)। Implementation negative ranges के लिए `None` return करता है, बाद के passes को expression handle करने देता है।
@@ -216,7 +216,7 @@ Coefficient reduction पैटर्न `(r*8 + v) % 7` -> `(r*1 + v) % 7 = (r 
 
 ## 5. Index Dtype Lowering (3-Phase Cascade)
 
-Tinygrad: `ops.py:1291-1313`। Morok: `schedule/src/symbolic/index_lowering.rs`।
+Tinygrad: `ops.py:1291-1313`। Svod: `schedule/src/symbolic/index_lowering.rs`।
 
 Abstract `Index` type कोई width नहीं रखता — यह represent करता है "इस index के लिए जो भी integer width चाहिए।" Lowering pass `Index` को concrete `i32` या `i64` में convert करता है value bounds के basis पर।
 

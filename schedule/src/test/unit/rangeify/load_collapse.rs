@@ -5,9 +5,9 @@
 
 use std::sync::Arc;
 
-use morok_dtype::DType;
-use morok_ir::{AxisId, AxisType, ConstValue, Op, ReduceOp, UOp};
 use smallvec::smallvec;
+use svod_dtype::DType;
+use svod_ir::{AxisId, AxisType, ConstValue, Op, ReduceOp, UOp};
 
 use crate::pattern::RewriteResult;
 use crate::rangeify::patterns::pm_load_collapse;
@@ -176,7 +176,7 @@ fn test_mul_casted_bool() {
 
     if let RewriteResult::Rewritten(rewritten) = result {
         // Should be WHERE(gate, x, 0)
-        assert!(matches!(rewritten.op(), Op::Ternary(morok_ir::TernaryOp::Where, ..)), "Should convert to WHERE");
+        assert!(matches!(rewritten.op(), Op::Ternary(svod_ir::TernaryOp::Where, ..)), "Should convert to WHERE");
     }
 }
 
@@ -196,7 +196,7 @@ fn test_ne_lifting() {
     // Both x, y, c are consts (range-free), so pattern should match
     if let RewriteResult::Rewritten(rewritten) = result {
         // Should be x != (c - y) = x != 7
-        if let Op::Binary(morok_ir::BinaryOp::Ne, lhs, rhs) = rewritten.op() {
+        if let Op::Binary(svod_ir::BinaryOp::Ne, lhs, rhs) = rewritten.op() {
             // lhs should be x (or equivalent)
             // rhs should be c - y = 7
             assert_eq!(lhs.dtype(), DType::Index, "LHS should be Index dtype");

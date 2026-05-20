@@ -1,10 +1,10 @@
 use std::sync::Arc;
 
-use morok_device::device::{CompiledSpec, Compiler, ProgramSpec, Renderer};
-use morok_device::{Error, Result};
-use morok_dtype::DeviceSpec;
-use morok_ir::{Op, UOp};
-use morok_schedule::linearize::line_rewrite_cleanups;
+use svod_device::device::{CompiledSpec, Compiler, ProgramSpec, Renderer};
+use svod_device::{Error, Result};
+use svod_dtype::DeviceSpec;
+use svod_ir::{Op, UOp};
+use svod_schedule::linearize::line_rewrite_cleanups;
 
 type ProgramParts = (Arc<UOp>, Arc<UOp>, Option<Arc<UOp>>, Option<Arc<UOp>>, Option<Arc<UOp>>);
 
@@ -101,7 +101,7 @@ pub fn do_linearize(program: &Arc<UOp>) -> Result<Arc<UOp>> {
         return Ok(program.clone());
     }
 
-    let linear_ops = morok_schedule::linearize_with_cfg(sink);
+    let linear_ops = svod_schedule::linearize_with_cfg(sink);
     let linear_clean = line_rewrite_cleanups(linear_ops);
     let linear_uop = UOp::linear(linear_clean.into());
     rebuild_program(program, Some(linear_uop), source, binary)

@@ -4,9 +4,9 @@
 //! It describes what optimizations a backend supports (local memory, threading, etc.)
 //! and provides tensor core configurations for hardware-accelerated matrix multiplication.
 
-use morok_dtype::DType;
-use morok_ir::RendererDevice;
 use smallvec::SmallVec;
+use svod_dtype::DType;
+use svod_ir::RendererDevice;
 
 /// Tensor core optimization operation.
 ///

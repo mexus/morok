@@ -1,4 +1,4 @@
-use morok_dtype::DType;
+use svod_dtype::DType;
 
 use crate::Tensor;
 use crate::nn::Layer;

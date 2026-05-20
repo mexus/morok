@@ -2,8 +2,8 @@ use std::{f32::consts::PI, sync::Arc};
 
 use crate::rangeify::patterns::buffer_folding;
 use crate::rewrite::graph_rewrite;
-use morok_dtype::DType;
-use morok_ir::{ConstValue, UOp};
+use svod_dtype::DType;
+use svod_ir::{ConstValue, UOp};
 
 // Helper functions for creating test UOps
 fn create_const(val: i64) -> Arc<UOp> {
@@ -70,7 +70,7 @@ fn test_noop_bufferize_multiple_ranges() {
 
     // Should fold to just x (after possible noop shrink)
     assert!(
-        !matches!(result.op(), morok_ir::Op::Bufferize { .. }),
+        !matches!(result.op(), svod_ir::Op::Bufferize { .. }),
         "Noop BUFFERIZE with multiple ranges should be removed"
     );
 }
@@ -151,7 +151,7 @@ fn test_index_const_multiple_indices() {
 fn test_copy_const_folding() {
     // COPY(CONST, device) → CONST
     let const_val = create_const(99);
-    let device = UOp::device(morok_device::DeviceSpec::Cpu);
+    let device = UOp::device(svod_device::DeviceSpec::Cpu);
 
     let copy = const_val.copy(device);
 
@@ -167,7 +167,7 @@ fn test_copy_const_different_devices() {
     // Test copying constants to different devices - all should fold
     let const_val = UOp::native_const(1.5f32);
 
-    let devices = vec![morok_device::DeviceSpec::Cpu, morok_device::DeviceSpec::Cuda { device_id: 0 }];
+    let devices = vec![svod_device::DeviceSpec::Cpu, svod_device::DeviceSpec::Cuda { device_id: 0 }];
 
     for device_spec in devices {
         let device = UOp::device(device_spec);

@@ -4,14 +4,14 @@ sidebar_label: ONNX इन्फ़रेंस
 
 # ONNX मॉडल इन्फ़रेंस
 
-Morok का ONNX इम्पोर्टर मॉडल इन्फ़रेंस का सबसे अच्छा तरीका है। यह स्टैंडर्ड `.onnx` फ़ाइलें लोड करता है, ऑपरेटरों को Morok के lazy tensor ऑपरेशनों में तोड़ता है, और पूरी ऑप्टिमाइज़ेशन पाइपलाइन से कम्पाइल करता है — कोई C++ रनटाइम नहीं चाहिए।
+Svod का ONNX इम्पोर्टर मॉडल इन्फ़रेंस का सबसे अच्छा तरीका है। यह स्टैंडर्ड `.onnx` फ़ाइलें लोड करता है, ऑपरेटरों को Svod के lazy tensor ऑपरेशनों में तोड़ता है, और पूरी ऑप्टिमाइज़ेशन पाइपलाइन से कम्पाइल करता है — कोई C++ रनटाइम नहीं चाहिए।
 
 **वर्तमान स्थिति:**
 
 | क्षमता | स्थिति |
 |--------|--------|
 | फ़ॉरवर्ड इन्फ़रेंस | समर्थित |
-| 162 / 200 ONNX ऑपरेटर | [पैरिटी विवरण](https://github.com/npatsakula/morok/blob/main/onnx/PARITY.md) |
+| 162 / 200 ONNX ऑपरेटर | [पैरिटी विवरण](https://github.com/npatsakula/svod/blob/main/onnx/PARITY.md) |
 | CNN आर्किटेक्चर (ResNet, DenseNet, VGG, ...) | 9 मॉडल सत्यापित |
 | Microsoft एक्सटेंशन (Attention, RotaryEmbedding) | समर्थित |
 | डायनामिक बैच साइज़ | समर्थित (Variable API) |
@@ -19,18 +19,18 @@ Morok का ONNX इम्पोर्टर मॉडल इन्फ़रे
 
 **दूसरे फ़्रेमवर्क से तुलना**
 
-Pure-Rust फ़्रेमवर्कों में Morok का ONNX ऑपरेटर कवरेज सबसे ज़्यादा है — 162 ऑपरेटर, दोनों बैकएंड (Clang + LLVM) पर 1361 पासिंग conformance टेस्ट। `candle` और `burn` में ऑपरेटर कम हैं और इतने बड़े टेस्ट सूट नहीं हैं। अगर प्रोडक्शन ONNX मॉडलों के साथ पूरी कम्पैटिबिलिटी चाहिए, तो `ort` इस्तेमाल करें — C++ ONNX Runtime का Rust रैपर, जो पूरा ONNX स्पेक कवर करता है।
+Pure-Rust फ़्रेमवर्कों में Svod का ONNX ऑपरेटर कवरेज सबसे ज़्यादा है — 162 ऑपरेटर, दोनों बैकएंड (Clang + LLVM) पर 1361 पासिंग conformance टेस्ट। `candle` और `burn` में ऑपरेटर कम हैं और इतने बड़े टेस्ट सूट नहीं हैं। अगर प्रोडक्शन ONNX मॉडलों के साथ पूरी कम्पैटिबिलिटी चाहिए, तो `ort` इस्तेमाल करें — C++ ONNX Runtime का Rust रैपर, जो पूरा ONNX स्पेक कवर करता है।
 
 ---
 
 ## त्वरित शुरुआत
 
-अपनी `Cargo.toml` में `morok-onnx` और `morok-tensor` जोड़ें:
+अपनी `Cargo.toml` में `svod-onnx` और `svod-tensor` जोड़ें:
 
 ```toml
 [dependencies]
-morok-onnx = { git = "https://github.com/npatsakula/morok" }
-morok-tensor = { git = "https://github.com/npatsakula/morok" }
+svod-onnx = { git = "https://github.com/npatsakula/svod" }
+svod-tensor = { git = "https://github.com/npatsakula/svod" }
 ```
 
 ### सरल: ऑल-इनिशियलाइज़र मॉडल
@@ -38,8 +38,8 @@ morok-tensor = { git = "https://github.com/npatsakula/morok" }
 उन मॉडलों के लिए जहाँ सभी इनपुट फ़ाइल में अंतर्निहित हैं (कोई रनटाइम इनपुट नहीं):
 
 ```rust
-use morok_onnx::{OnnxImporter, OnnxModel};
-use morok_tensor::Tensor;
+use svod_onnx::{OnnxImporter, OnnxModel};
+use svod_tensor::Tensor;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut importer = OnnxImporter::new();
@@ -61,8 +61,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 अधिकांश मॉडलों को रनटाइम डेटा (इमेज, टोकन, ऑडियो) की आवश्यकता होती है। `OnnxModel` को destructure करें और इनपुट tensor की ownership लेने के लिए `remove()` इस्तेमाल करें:
 
 ```rust
-use morok_onnx::{OnnxImporter, OnnxModel};
-use morok_tensor::Tensor;
+use svod_onnx::{OnnxImporter, OnnxModel};
+use svod_tensor::Tensor;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut importer = OnnxImporter::new();
@@ -98,7 +98,7 @@ model.onnx → import(path, dims) → OnnxModel { inputs, outputs, variables } �
 
 ### ऑपरेटर विघटन
 
-हर ONNX ऑपरेटर Morok Tensor ऑपरेशनों में टूटता है। कॉम्प्लेक्सिटी अलग-अलग होती है:
+हर ONNX ऑपरेटर Svod Tensor ऑपरेशनों में टूटता है। कॉम्प्लेक्सिटी अलग-अलग होती है:
 
 **प्रत्यक्ष मैपिंग** — लगभग 60 ऑपरेटर एक tensor मेथड पर 1:1 मैप होते हैं:
 
@@ -204,13 +204,13 @@ let model = importer.import_model_with_inputs(
 
 ### सिमैंटिक If: दोनों ब्रांच हमेशा एक्ज़ीक्यूट होती हैं
 
-ONNX के `If` ऑपरेटर में डेटा-डिपेंडेंट कंट्रोल फ़्लो होता है — कंडीशन तय करती है कि कौन सी ब्रांच चलेगी। Morok का lazy इवैल्यूएशन मॉडल इसके साथ मौलिक रूप से असंगत है: चूँकि ट्रेस टाइम पर कुछ भी एक्ज़ीक्यूट नहीं होता, कंडीशन का मान अज्ञात होता है।
+ONNX के `If` ऑपरेटर में डेटा-डिपेंडेंट कंट्रोल फ़्लो होता है — कंडीशन तय करती है कि कौन सी ब्रांच चलेगी। Svod का lazy इवैल्यूएशन मॉडल इसके साथ मौलिक रूप से असंगत है: चूँकि ट्रेस टाइम पर कुछ भी एक्ज़ीक्यूट नहीं होता, कंडीशन का मान अज्ञात होता है।
 
-**Morok का समाधान:** *दोनों* ब्रांचों को ट्रेस करें, फिर `Tensor::where_()` से परिणामों को मर्ज करें:
+**Svod का समाधान:** *दोनों* ब्रांचों को ट्रेस करें, फिर `Tensor::where_()` से परिणामों को मर्ज करें:
 
 ```text
 ONNX:    if condition { then_branch } else { else_branch }
-Morok:   then_result.where_(&condition, &else_result)
+Svod:   then_result.where_(&condition, &else_result)
 ```
 
 यह **एक बार ट्रेस करो, कई बार चलाओ** सक्षम करता है — कम्पाइल्ड ग्राफ़ रनटाइम पर किसी भी कंडीशन वैल्यू को हैंडल करता है। लेकिन इसकी एक कठोर बाधा है: **दोनों ब्रांचों को समान आउटपुट शेप और DType प्रोड्यूस करना चाहिए।** शेप-पॉलीमॉर्फ़िक ब्रांचों वाले मॉडल (जहाँ then-ब्रांच `[3, 4]` और else-ब्रांच `[5, 6]` प्रोड्यूस करती है) को ट्रेस नहीं किया जा सकता।
@@ -268,7 +268,7 @@ plan.execute_with_vars(&[bound.as_var_val()])?;
 | श्रेणी | उदाहरण | कारण |
 |--------|--------|------|
 | क्वांटाइज़ेशन | DequantizeLinear, QuantizeLinear | IR में क्वांटाइज़्ड DType सपोर्ट आवश्यक |
-| सीक्वेंस ऑप्स | SequenceConstruct, SequenceAt | नॉन-tensor टाइप Morok के टाइप सिस्टम में नहीं हैं |
+| सीक्वेंस ऑप्स | SequenceConstruct, SequenceAt | नॉन-tensor टाइप Svod के टाइप सिस्टम में नहीं हैं |
 | रैंडम | RandomNormal, RandomUniform | स्टेटफ़ुल RNG अभी तक इम्प्लीमेंट नहीं |
 | सिग्नल प्रोसेसिंग | DFT, STFT, MelWeightMatrix | कम प्राथमिकता; विशिष्ट उपयोग |
 | टेक्स्ट | StringNormalizer, TfIdfVectorizer | स्ट्रिंग टाइप समर्थित नहीं |
@@ -284,7 +284,7 @@ plan.execute_with_vars(&[bound.as_var_val()])?;
 मध्यवर्ती आउटपुट डंप करने के लिए ट्रेस लॉग लेवल सेट करें:
 
 ```bash
-RUST_LOG=morok_onnx::importer=trace cargo run
+RUST_LOG=svod_onnx::importer=trace cargo run
 ```
 
 यह प्रत्येक नोड के आउटपुट को अलग-अलग realize करता है और पहले 5 मान प्रिंट करता है — जब कोई मॉडल गलत परिणाम देता है तो न्यूमेरिकल बाइसेक्शन के लिए उपयोगी है। ध्यान दें कि यह कर्नेल फ़्यूज़न को तोड़ता है (प्रत्येक नोड अलग से चलता है), इसलिए यह पूरी तरह से एक डीबगिंग टूल है।
@@ -314,7 +314,7 @@ println!("Variables: {:?}", model.variables.keys().collect::<Vec<_>>());
 | **एंट्री पॉइंट** | `OnnxImporter::new()` |
 | **सरल इम्पोर्ट** | `importer.import("model.onnx", &[])?` |
 | **डायनामिक dims** | `importer.import(path, &[("batch", 4)])?` |
-| **ऑपरेटर** | 162 / 200 ([पूर्ण पैरिटी तालिका](https://github.com/npatsakula/morok/blob/main/onnx/PARITY.md)) |
+| **ऑपरेटर** | 162 / 200 ([पूर्ण पैरिटी तालिका](https://github.com/npatsakula/svod/blob/main/onnx/PARITY.md)) |
 | **सत्यापित मॉडल** | ResNet50, DenseNet121, VGG19, Inception, AlexNet, ShuffleNet, SqueezeNet, ZFNet |
 | **बैकएंड** | Clang + LLVM (समान परिणाम) |
 | **एक्सटेंशन** | com.microsoft Attention, RotaryEmbedding, SkipLayerNorm, EmbedLayerNorm |

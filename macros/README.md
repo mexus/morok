@@ -1,14 +1,14 @@
-# morok-macros
+# svod-macros
 
-Procedural macros for the Morok ML compiler.
+Procedural macros for the Svod ML compiler.
 
 ## `patterns!`
 
-Generates a pattern matcher from declarative rewrite rules. Used by `morok-schedule`
+Generates a pattern matcher from declarative rewrite rules. Used by `svod-schedule`
 to build the optimization engine.
 
 ```rust
-use morok_schedule::patterns;
+use svod_schedule::patterns;
 
 let matcher = patterns! {
     Add[x, @zero] ~> x,
@@ -17,4 +17,4 @@ let matcher = patterns! {
 };
 ```
 
-See [`morok-schedule` README](../schedule/README.md) for the full DSL reference.
+See [`svod-schedule` README](../schedule/README.md) for the full DSL reference.

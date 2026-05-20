@@ -7,7 +7,7 @@ sidebar_label: Снижение стоимости
 Снижение стоимости заменяет дорогие операции более дешёвыми эквивалентами. Эти паттерны выполняются поздно в пайплайне (Стадии 18–19), поскольку более ранним проходам нужна видимость исходной структуры операций. Например, `Add(Mul(a, b), c)` должен оставаться видимым для алгебраического упрощения, прежде чем будет слит в `MULACC(a, b, c)`.
 
 Исходники Tinygrad: `tinygrad/uop/decompositions.py:438-480` (`get_late_rewrite_patterns`).
-Исходники Morok: `schedule/src/rangeify/patterns.rs` (группа поздней декомпозиции) + `schedule/src/symbolic/fast_div.rs`.
+Исходники Svod: `schedule/src/rangeify/patterns.rs` (группа поздней декомпозиции) + `schedule/src/symbolic/fast_div.rs`.
 
 *Оценки тактов на этой странице приблизительны для современного x86-64. Реальные задержки зависят от микроархитектуры и состояния конвейера.*
 
@@ -27,7 +27,7 @@ sidebar_label: Снижение стоимости
 
 Оптимизация модуля работает потому, что `2^n - 1` является битовой маской нижних n бит. Пример: `x % 8` = `x & 0b111`.
 
-Tinygrad: `decompositions.py:448-454`. Morok: `pm_mod_to_and`, `pm_mul_to_shl`, `pm_div_to_shr` в `rangeify/patterns.rs`.
+Tinygrad: `decompositions.py:448-454`. Svod: `pm_mod_to_and`, `pm_mul_to_shl`, `pm_div_to_shr` в `rangeify/patterns.rs`.
 
 :::caution Знаковое деление
 Для знаковых целых `x // 2^n` — это НЕ просто `x >> n`. Арифметический сдвиг вправо округляет к отрицательной бесконечности, а целочисленное деление — к нулю.
@@ -41,9 +41,9 @@ floor(x / 2^n) = (x + 2^n - 1) >> n    when x < 0
                   x >> n                  when x >= 0
 ```
 
-Morok проверяет `vmin >= 0` через анализ диапазонов (`VminVmaxProperty`), чтобы пропустить поправку, когда делимое доказуемо неотрицательно. Tinygrad использует принадлежность к типу (`dtypes.uints`) для той же цели.
+Svod проверяет `vmin >= 0` через анализ диапазонов (`VminVmaxProperty`), чтобы пропустить поправку, когда делимое доказуемо неотрицательно. Tinygrad использует принадлежность к типу (`dtypes.uints`) для той же цели.
 
-Tinygrad: `decompositions.py:452-454`. Morok: `pm_div_to_shr` в `rangeify/patterns.rs`.
+Tinygrad: `decompositions.py:452-454`. Svod: `pm_div_to_shr` в `rangeify/patterns.rs`.
 :::
 
 Сгенерированный C-код для знакового деления на степень двойки:
@@ -93,7 +93,7 @@ int result = x >> 3;
 
 Цикл находит наименьшее `s`, дающее валидное магическое число. Меньшее `s` означает меньшее `M`, что критически важно для размещения промежуточного произведения `x * M` в узких целочисленных типах.
 
-Реализация в Morok: `magic_unsigned()` в `schedule/src/symbolic/fast_div.rs`.
+Реализация в Svod: `magic_unsigned()` в `schedule/src/symbolic/fast_div.rs`.
 
 ### Трёхэтапная стратегия
 
@@ -147,7 +147,7 @@ x / 7 where x in [0, 255]:
 - Пропуск если `1/c` не конечно (переполнение до `inf` означает, что `c` слишком мало)
 - Только для вещественных типов
 
-Tinygrad: `decompositions.py:477-479` (backend-ы на основе FDIV генерируют `RECIP` как `1/x`). Morok: `pm_fdiv_to_mul` в `rangeify/patterns.rs`.
+Tinygrad: `decompositions.py:477-479` (backend-ы на основе FDIV генерируют `RECIP` как `1/x`). Svod: `pm_fdiv_to_mul` в `rangeify/patterns.rs`.
 
 ```c
 // Before
@@ -167,11 +167,11 @@ float result = x * 0.31831f;  // 1/pi
 
 **Почему применяется поздно**: Более ранним проходам нужно видеть структуру `Add(Mul(a, b), c)` для алгебраического упрощения. Если слить рано, паттерны вроде `(x*2 + x*3)` не смогли бы упроститься до `x*5`, поскольку узлы `Mul` были бы скрыты внутри MULACC.
 
-**Слияние сдвиг-сложение (только Tinygrad)**: Tinygrad также сливает `(x << n) + c` в `MULACC(x, 2^n, c)`, перехватывая случаи, когда MUL-в-SHL сработал первым в том же проходе фиксированной точки. Этот паттерн пока не портирован в Morok.
+**Слияние сдвиг-сложение (только Tinygrad)**: Tinygrad также сливает `(x << n) + c` в `MULACC(x, 2^n, c)`, перехватывая случаи, когда MUL-в-SHL сработал первым в том же проходе фиксированной точки. Этот паттерн пока не портирован в Svod.
 
 **Защиты**: Совпадает только когда все три операнда (`a`, `b`, `c`) имеют одинаковый вещественный dtype. Целочисленный FMA не сливается, поскольку аппаратные инструкции FMA работают только с вещественными числами.
 
-Tinygrad: `decompositions.py:472-475`. Morok: `pm_fma_decomposition` в `rangeify/patterns.rs`.
+Tinygrad: `decompositions.py:472-475`. Svod: `pm_fma_decomposition` в `rangeify/patterns.rs`.
 
 ---
 
@@ -181,7 +181,7 @@ Tinygrad: `decompositions.py:472-475`. Morok: `pm_fma_decomposition` в `rangeif
 
 NEG — это одна инструкция (переключение бита знака для float через `xorps`, отрицание для int через `neg`). Умножение на -1 излишне занимает конвейер умножителя на 3–4 такта.
 
-Срабатывает только когда backend поддерживает `NEG` как нативную операцию. Tinygrad: `decompositions.py:458-459`. Morok: `pm_neg_from_mul`.
+Срабатывает только когда backend поддерживает `NEG` как нативную операцию. Tinygrad: `decompositions.py:458-459`. Svod: `pm_neg_from_mul`.
 
 ---
 
@@ -203,7 +203,7 @@ NEG — это одна инструкция (переключение бита 
 Паттерны отрицания защищены от переполнения: `!(x < c)` превращается в `(c-1) < x` только если `c-1` не вызывает underflow, а `!(c < x)` превращается в `x < (c+1)` только если `c+1` не вызывает overflow. В обоих случаях используются `checked_sub` / `checked_add` с возвратом `None` (без преобразования) при переполнении.
 :::
 
-Tinygrad: `decompositions.py:461-470`. Morok: `pm_comparison_negations` в `rangeify/patterns.rs`.
+Tinygrad: `decompositions.py:461-470`. Svod: `pm_comparison_negations` в `rangeify/patterns.rs`.
 
 ---
 
@@ -220,7 +220,7 @@ Tinygrad: `decompositions.py:461-470`. Morok: `pm_comparison_negations` в `rang
 
 2. **Поздние** (Стадия 18–19): `symbolic_simple()` включает булевы паттерны и выполняется совместно с паттернами снижения стоимости в `PM_FINAL`. Перехватывает новые возможности де Моргана, созданные паттернами отрицания сравнений — например, после перезаписи `!(x < 3)` и `!(x < 7)` в `2 < x` и `6 < x`, любое AND/OR, комбинирующее их, может получить новые возможности устранения NOT.
 
-Morok: `boolean_dsl_patterns()` в `schedule/src/symbolic/patterns.rs`.
+Svod: `boolean_dsl_patterns()` в `schedule/src/symbolic/patterns.rs`.
 
 ---
 
@@ -234,11 +234,11 @@ where t = 1 / (1 + 0.3275911 * |x|)
       P(t) = Horner(t, [1.061405429, -1.453152027, 1.421413741, -0.284496736, 0.254829592])
 ```
 
-**Зачем**: `@llvm.erf` — это intrinsic с вызовом библиотеки (требует линковки libm), а не нативная аппаратная инструкция. JIT-backend LLVM не линкует libm, поэтому `erf` должен быть декомпозирован перед кодогенерацией. Tinygrad декомпозирует `erf` на уровне тензоров (`elementwise.py`), поэтому он никогда не достигает рендера; Morok сохраняет `Erf` как UOp до этого позднего прохода.
+**Зачем**: `@llvm.erf` — это intrinsic с вызовом библиотеки (требует линковки libm), а не нативная аппаратная инструкция. JIT-backend LLVM не линкует libm, поэтому `erf` должен быть декомпозирован перед кодогенерацией. Tinygrad декомпозирует `erf` на уровне тензоров (`elementwise.py`), поэтому он никогда не достигает рендера; Svod сохраняет `Erf` как UOp до этого позднего прохода.
 
 Максимальная погрешность: ~1.5e-7 (достаточно для float32 ML-нагрузок).
 
-Morok: `pm_erf_decomposition` в `rangeify/patterns.rs`.
+Svod: `pm_erf_decomposition` в `rangeify/patterns.rs`.
 
 ---
 

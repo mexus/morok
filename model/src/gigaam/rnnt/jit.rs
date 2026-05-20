@@ -7,9 +7,9 @@
 //! the RN-T variant in their build closure (returning a typed `Err` via
 //! `JitError::Build` if it isn't).
 
-extern crate self as morok_model;
+extern crate self as svod_model;
 
-use morok_macros::jit_wrapper;
+use svod_macros::jit_wrapper;
 
 use crate::gigaam::model::GigaAm;
 

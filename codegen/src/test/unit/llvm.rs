@@ -1,20 +1,20 @@
 //! LLVM renderer tests for loop and reduction codegen.
 
-use morok_dtype::{DType, DeviceSpec};
-use morok_ir::{AxisId, AxisType, ConstValue, ReduceOp, UOp};
 use smallvec::SmallVec;
+use svod_dtype::{DType, DeviceSpec};
+use svod_ir::{AxisId, AxisType, ConstValue, ReduceOp, UOp};
 
 use crate::llvm::text::render;
 
 fn render_linearized(root: &std::sync::Arc<UOp>, name: Option<&str>) -> crate::Result<crate::RenderedKernel> {
-    let linear = UOp::linear(morok_schedule::linearize_with_cfg(root.clone()).into());
+    let linear = UOp::linear(svod_schedule::linearize_with_cfg(root.clone()).into());
     render(&linear, name)
 }
 
 #[test]
 fn test_render_linear_input_succeeds() {
     let sink = UOp::sink(vec![UOp::native_const(1.0f32)]);
-    let linear = UOp::linear(morok_schedule::linearize_with_cfg(sink.clone()).into());
+    let linear = UOp::linear(svod_schedule::linearize_with_cfg(sink.clone()).into());
 
     let rendered = render(&linear, Some("test_linear")).expect("LLVM codegen from LINEAR should succeed");
     assert!(rendered.code.contains("test_linear"));
@@ -160,7 +160,7 @@ fn test_reduce_empty_ranges() {
 
 #[test]
 fn test_multi_index_requires_linearization() {
-    let ptr_dtype = DType::Float32.ptr(None, morok_dtype::AddrSpace::Global);
+    let ptr_dtype = DType::Float32.ptr(None, svod_dtype::AddrSpace::Global);
     let buffer = UOp::param(0, 1024, ptr_dtype, None);
     let i = UOp::const_(DType::Index, ConstValue::Int(1));
     let j = UOp::const_(DType::Index, ConstValue::Int(2));

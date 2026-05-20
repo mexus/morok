@@ -14,11 +14,11 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
-use morok_device::Buffer;
-use morok_device::device::Device;
-use morok_device::registry;
-use morok_dtype::{DType, DeviceSpec};
-use morok_ir::{Op, UOp};
+use svod_device::Buffer;
+use svod_device::device::Device;
+use svod_device::registry;
+use svod_dtype::{DType, DeviceSpec};
+use svod_ir::{Op, UOp};
 use tracing::{debug, trace};
 
 use crate::error::*;
@@ -869,15 +869,13 @@ fn find_first_input_buffer_device(
                 if device_spec.is_disk() {
                     continue;
                 }
-                return morok_runtime::DEVICE_FACTORIES
-                    .device(&device_spec, alloc_registry)
-                    .context(DeviceFactorySnafu);
+                return svod_runtime::DEVICE_FACTORIES.device(&device_spec, alloc_registry).context(DeviceFactorySnafu);
             }
         }
     }
 
     // Fallback to CPU if no input buffers found
-    morok_runtime::DEVICE_FACTORIES.device(&DeviceSpec::Cpu, alloc_registry).context(DeviceFactorySnafu)
+    svod_runtime::DEVICE_FACTORIES.device(&DeviceSpec::Cpu, alloc_registry).context(DeviceFactorySnafu)
 }
 
 /// Collect buffers for a callable from its sources.
@@ -979,7 +977,7 @@ fn collect_callable_buffers(
 
                 // Extract the base scalar dtype from the Ptr type
                 let scalar_dtype = match ptr_dtype {
-                    morok_dtype::DType::Ptr { base, .. } => *base,
+                    svod_dtype::DType::Ptr { base, .. } => *base,
                     other => {
                         return ExpectedPtrDtypeSnafu { context: "DEFINE_LOCAL", actual: other.clone() }.fail();
                     }

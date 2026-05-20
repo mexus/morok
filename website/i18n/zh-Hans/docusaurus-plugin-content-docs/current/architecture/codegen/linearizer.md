@@ -48,7 +48,7 @@ After:   ADD(GEP(arr_a, idx), GEP(arr_b, idx))
 
 大多数后端（CPU、GPU）不需要这一步。只有专用硬件使用它。
 
-**注意**：Morok 目前未实现此阶段。`Renderer` trait 有 `render()`、`backend_name()` 和 `decompositor()` 方法，但还没有 `pre_matcher` 支持。这是未来为 DSP 等专用后端预留的增强。
+**注意**：Svod 目前未实现此阶段。`Renderer` trait 有 `render()`、`backend_name()` 和 `decompositor()` 方法，但还没有 `pre_matcher` 支持。这是未来为 DSP 等专用后端预留的增强。
 
 ---
 
@@ -82,7 +82,7 @@ After:   ADD(GEP(arr_a, idx), GEP(arr_b, idx))
 
 超越函数近似（SIN、EXP、LOG 等）通过 `decompositor()` 路径实现（参见 `ir/src/decompositions/transcendentals.rs`）。
 
-**Morok**：`optimizer/mod.rs`
+**Svod**：`optimizer/mod.rs`
 
 ---
 
@@ -127,7 +127,7 @@ END(END(op, range_a), range_b)
 
 **extra_matcher**：每个后端可以添加自己的最终模式。这样无需修改通用流水线就能实现硬件特定优化。
 
-**Morok**：`devectorize.rs`、`linearize/mod.rs`、`optimizer/mod.rs`
+**Svod**：`devectorize.rs`、`linearize/mod.rs`、`optimizer/mod.rs`
 
 ---
 
@@ -164,7 +164,7 @@ RANGE_B waits for RANGE_A to complete
 
 自底向上遍历确保依赖从叶到根正确传播。
 
-**Morok**：`schedule/src/linearize/mod.rs`
+**Svod**：`schedule/src/linearize/mod.rs`
 
 ---
 
@@ -188,7 +188,7 @@ RANGE_B waits for RANGE_A to complete
 | DEFINE_VAR | -19 | 变量必须先定义 |
 | DEFINE_LOCAL | -18 | 分配优先 |
 | DEFINE_REG | -17 | 寄存器优先 |
-| CONST | -10 | 常量尽早放置以便复用（Morok 扩展；Tinygrad 默认为 0） |
+| CONST | -10 | 常量尽早放置以便复用（Svod 扩展；Tinygrad 默认为 0） |
 | LOAD | -1 | Load 在使用之前 |
 | END | -5 | 关闭 range |
 | STORE | +1 | Store 在计算之后 |
@@ -208,7 +208,7 @@ run_count = prod(int(r.vmax) + 1 for r in u.ranges)
 ```
 这根据包围的 range 计算操作执行多少次。
 
-**Morok**：`schedule/src/linearize/mod.rs`
+**Svod**：`schedule/src/linearize/mod.rs`
 
 ---
 
@@ -236,4 +236,4 @@ STORE(INDEX(ptr, idx, valid=cond), value)
 
 到此为止，指令列表已准备好进行代码生成。
 
-**Morok**：`schedule/src/linearize/mod.rs`（谓词写入路径）
+**Svod**：`schedule/src/linearize/mod.rs`（谓词写入路径）

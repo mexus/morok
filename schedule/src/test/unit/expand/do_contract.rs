@@ -10,7 +10,7 @@
 //! Value assertions match Tinygrad's exact test expectations.
 
 use super::helpers::*;
-use morok_ir::{Op, UOp};
+use svod_ir::{Op, UOp};
 
 // =============================================================================
 // Full Contraction Tests
@@ -250,7 +250,7 @@ fn test_contract_middle_axis() {
 #[test]
 fn test_contract_non_unroll_source() {
     // Create a simple scalar constant
-    let scalar = UOp::const_(morok_dtype::DType::Int64, morok_ir::types::ConstValue::Int(4));
+    let scalar = UOp::const_(svod_dtype::DType::Int64, svod_ir::types::ConstValue::Int(4));
 
     // CONTRACT without UNROLL source
     let contract = create_contract(scalar, vec![(0, 4)]);
@@ -346,7 +346,7 @@ fn test_contract_partial_dtype_same_sizes() {
 fn test_contract_void_dtype_preserved() {
     use super::helpers::create_contract_void;
     use super::helpers::create_unroll_multi_axis_with_dtype;
-    use morok_dtype::DType;
+    use svod_dtype::DType;
 
     // UNROLL with Void dtype (like STORE)
     let unroll = create_unroll_multi_axis_with_dtype(vec![(1, 4), (2, 4)], DType::Void);

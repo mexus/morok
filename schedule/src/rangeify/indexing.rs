@@ -6,8 +6,8 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use morok_dtype::DType;
-use morok_ir::{AxisId, AxisType, BinaryOp, ConstValue, Op, SInt, UOp, UOpKey};
+use svod_dtype::DType;
+use svod_ir::{AxisId, AxisType, BinaryOp, ConstValue, Op, SInt, UOp, UOpKey};
 use tracing::{debug, info_span, instrument, trace, warn};
 
 use crate::argsort;
@@ -78,7 +78,7 @@ impl IndexingContext {
         let axis_id = AxisId::Unrenumbered(self.range_idx);
         self.range_idx += 1;
 
-        let size_uop = size.to_uop(morok_dtype::DType::Index);
+        let size_uop = size.to_uop(svod_dtype::DType::Index);
 
         UOp::range_axis(size_uop, axis_id, axistype)
     }
@@ -93,7 +93,7 @@ impl IndexingContext {
     }
 
     /// Mark a UOp for realization on all axes.
-    pub fn mark_realize_all(&mut self, uop: &Arc<UOp>) -> morok_ir::Result<()> {
+    pub fn mark_realize_all(&mut self, uop: &Arc<UOp>) -> svod_ir::Result<()> {
         if let Some(shape) = uop.shape()? {
             let axes = (0..shape.len()).collect();
             self.realize_map.insert(UOpKey(Arc::clone(uop)), Some(axes));
@@ -216,7 +216,7 @@ impl SimplifyCache {
 /// Run range assignment on a UOp graph. Returns (transformed_sink, context).
 #[allow(clippy::mutable_key_type)]
 #[instrument(skip(sink), fields(sink_id = sink.id))]
-pub fn run_rangeify(sink: Arc<UOp>) -> morok_ir::Result<(Arc<UOp>, IndexingContext)> {
+pub fn run_rangeify(sink: Arc<UOp>) -> svod_ir::Result<(Arc<UOp>, IndexingContext)> {
     let mut ctx = IndexingContext::new();
     let mut simplify_cache = SimplifyCache::default();
 
@@ -313,7 +313,7 @@ pub fn run_rangeify(sink: Arc<UOp>) -> morok_ir::Result<(Arc<UOp>, IndexingConte
         .into_iter()
         .find(|n| matches!(n.op(), Op::Pad { .. } | Op::ReduceAxis { .. }));
     if leaked.is_some() {
-        return Err(morok_ir::Error::SymbolicShapeUnsupported {
+        return Err(svod_ir::Error::SymbolicShapeUnsupported {
             operation: "rangeify leaked high-level PAD/ReduceAxis after recovery".to_string(),
         });
     }
@@ -431,7 +431,7 @@ pub(crate) fn merge_consumer_ranges(
     uop: &Arc<UOp>,
     consumer_rngs: &[Vec<Arc<UOp>>],
     ctx: &mut IndexingContext,
-) -> morok_ir::Result<Vec<Arc<UOp>>> {
+) -> svod_ir::Result<Vec<Arc<UOp>>> {
     let Some(shape) = uop.shape()? else {
         return Ok(Vec::new());
     };
@@ -514,7 +514,7 @@ pub(crate) fn merge_consumer_ranges(
     }
 
     if !realize_axes.is_empty() {
-        if uop.dtype().scalar() == Some(morok_dtype::ScalarDType::Index) {
+        if uop.dtype().scalar() == Some(svod_dtype::ScalarDType::Index) {
             debug!(realize_axes = ?realize_axes, "range conflict on Index op - marking axes for realization");
         } else {
             warn!(realize_axes = ?realize_axes, "range conflict detected - marking axes for realization");
@@ -533,7 +533,7 @@ fn assign_ranges(
     consumer_map: &HashMap<UOpKey, Vec<Arc<UOp>>>,
     ctx: &mut IndexingContext,
     simplify_cache: &mut SimplifyCache,
-) -> morok_ir::Result<()> {
+) -> svod_ir::Result<()> {
     // Local variable for ending_ranges - only used within this function
     let mut ending_ranges: HashMap<UOpKey, Vec<Arc<UOp>>> = HashMap::new();
 
@@ -544,7 +544,7 @@ fn assign_ranges(
 
         // Keep Index-typed dataflow in range assignment so movement-heavy integer
         // branches can be lowered; skip only literal/index-definition helpers.
-        if x.dtype().scalar() == Some(morok_dtype::ScalarDType::Index)
+        if x.dtype().scalar() == Some(svod_dtype::ScalarDType::Index)
             && matches!(x.op(), Op::Const(_) | Op::DefineVar { .. } | Op::Bind { .. } | Op::Index { .. })
         {
             continue;
@@ -602,7 +602,7 @@ fn assign_ranges(
                     // fall-through would leak unrealized stores into later
                     // passes.
                     if s.is_none() {
-                        return Err(morok_ir::Error::StoreMissingShape { uop_id: x.id });
+                        return Err(svod_ir::Error::StoreMissingShape { uop_id: x.id });
                     }
                     s
                 }
@@ -878,7 +878,7 @@ pub fn apply_movement_op(
                 if !flip {
                     Arc::clone(rng)
                 } else {
-                    let shape_uop = shape.to_uop(morok_dtype::DType::Index);
+                    let shape_uop = shape.to_uop(svod_dtype::DType::Index);
                     let shape_minus_1 = shape_uop.try_sub(&UOp::index_const(1)).unwrap();
                     shape_minus_1.try_sub(rng).unwrap()
                 }
@@ -940,7 +940,7 @@ pub fn apply_movement_op(
                     if is_const_zero(begin) && is_const_zero(end) {
                         return Arc::clone(rng);
                     }
-                    let shape_plus_begin = shape.to_uop(morok_dtype::DType::Index).try_add(begin).unwrap();
+                    let shape_plus_begin = shape.to_uop(svod_dtype::DType::Index).try_add(begin).unwrap();
                     let valid_low = rng.try_cmplt(begin).unwrap().not();
                     let valid_high = rng.try_cmplt(&shape_plus_begin).unwrap();
                     let valid = valid_low.try_and_op(&valid_high).unwrap();
@@ -1001,7 +1001,7 @@ fn apply_reshape_core(
     rngs: &[Arc<UOp>],
     simplify_cache: &mut SimplifyCache,
 ) -> Vec<Arc<UOp>> {
-    use morok_ir::rewrite::graph_rewrite;
+    use svod_ir::rewrite::graph_rewrite;
 
     // Pad with CONST(0) on the left when rngs.len() < out_shape.len()
     // (trailing-dimension alignment for partial INDEX)
@@ -1022,7 +1022,7 @@ fn apply_reshape_core(
     let mut axes_in = Vec::new();
     for (shape_dim, rng) in out_shape.iter().zip(padded_rngs.iter()).rev() {
         axes_in.push(acc.try_mul(rng).unwrap());
-        let dim_uop = shape_dim.to_uop(morok_dtype::DType::Index);
+        let dim_uop = shape_dim.to_uop(svod_dtype::DType::Index);
         acc = acc.try_mul(&dim_uop).unwrap();
     }
     let combined = axes_in.into_iter().reduce(|a, b| a.try_add(&b).unwrap()).unwrap_or_else(|| UOp::index_const(0));
@@ -1031,7 +1031,7 @@ fn apply_reshape_core(
     let mut axes_out = Vec::new();
     let mut remaining = combined;
     for shape_dim in in_shape.iter().rev() {
-        let dim_uop = shape_dim.to_uop(morok_dtype::DType::Index);
+        let dim_uop = shape_dim.to_uop(svod_dtype::DType::Index);
         axes_out.push(remaining.try_mod(&dim_uop).unwrap());
         remaining = remaining.try_div(&dim_uop).unwrap();
     }
@@ -1350,7 +1350,7 @@ pub fn get_binary_op(uop: &Arc<UOp>) -> Option<BinaryOp> {
 
 /// Check if a BUFFERIZE operation is for local memory.
 pub fn is_local_bufferize(uop: &Arc<UOp>) -> bool {
-    if let Op::Bufferize { opts, .. } = uop.op() { opts.addrspace == morok_ir::AddrSpace::Local } else { false }
+    if let Op::Bufferize { opts, .. } = uop.op() { opts.addrspace == svod_ir::AddrSpace::Local } else { false }
 }
 
 // ============================================================================

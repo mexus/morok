@@ -3,10 +3,10 @@
 //! Provides a unified JSON tracing setup for all crates. Requires the `testing` feature.
 //!
 //! ```ignore
-//! morok_schedule::testing::setup_test_tracing();
+//! svod_schedule::testing::setup_test_tracing();
 //! ```
 //!
-//! Controlled by `RUST_LOG` (e.g., `RUST_LOG=morok_onnx::importer=trace`).
+//! Controlled by `RUST_LOG` (e.g., `RUST_LOG=svod_onnx::importer=trace`).
 //! Compatible with `scripts/extract-ir.sh` (JSON structured output).
 
 /// Initialize a JSON tracing subscriber for tests.

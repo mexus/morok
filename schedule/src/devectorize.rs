@@ -18,8 +18,8 @@ use std::sync::Arc;
 use std::sync::LazyLock;
 
 use itertools::Itertools;
-use morok_dtype::{AddrSpace, DType, ScalarDType};
-use morok_ir::{AxisId, BinaryOp, ConstValue, Op, ReduceOp, TernaryOp, UOp, UOpKey, UnaryOp, WmmaMetadata};
+use svod_dtype::{AddrSpace, DType, ScalarDType};
+use svod_ir::{AxisId, BinaryOp, ConstValue, Op, ReduceOp, TernaryOp, UOp, UOpKey, UnaryOp, WmmaMetadata};
 
 use crate::TypedPatternMatcher;
 use smallvec::SmallVec;
@@ -411,7 +411,7 @@ fn f2f_clamp(val: &Arc<UOp>, dt: ScalarDType) -> Arc<UOp> {
 /// FP8 STORE decomposition patterns (bpm — sees ORIGINAL children).
 ///
 /// The STORE pattern must run in the bpm slot so it sees the ORIGINAL index dtype
-/// (still FP8) before Pattern 1 changes it to UInt8. This is the Morok equivalent
+/// (still FP8) before Pattern 1 changes it to UInt8. This is the Svod equivalent
 /// of using the `tag` mechanism — bpm sees ORIGINAL children pre-Pattern 1.
 pub fn pm_float_decomp_store() -> crate::TypedPatternMatcher<Fp8DecompCtx> {
     crate::patterns! {

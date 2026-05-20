@@ -1,4 +1,4 @@
-//! Proc-macros for morok.
+//! Proc-macros for svod.
 //!
 //! This crate provides:
 //! - `#[derive(PatternEnum)]` for generating pattern matching infrastructure from Op enum
@@ -85,7 +85,7 @@ pub fn derive_pattern_enum(input: TokenStream) -> TokenStream {
 
 /// Proc-macro for declarative pattern rewrite rules.
 ///
-/// Generates a `SimplifiedPatternMatcher` (in `morok_ir::pattern`) from a list
+/// Generates a `SimplifiedPatternMatcher` (in `svod_ir::pattern`) from a list
 /// of pattern rewrite rules.
 /// Patterns are compiled to efficient Rust code with O(1) dispatch via `OpKey`.
 ///
@@ -192,7 +192,7 @@ pub fn derive_pattern_enum(input: TokenStream) -> TokenStream {
 /// # Generated Code
 ///
 /// This macro generates a `SimplifiedPatternMatcher` (defined in
-/// `morok_ir::pattern`) with:
+/// `svod_ir::pattern`) with:
 /// - Compile-time validation of all operation names
 /// - O(1) dispatch via OpKey hashmap
 /// - Inline pattern matching (no runtime pattern interpretation)

@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use morok_ir::{AxisId, AxisType, DType, Op, UOp};
+use svod_ir::{AxisId, AxisType, DType, Op, UOp};
 
 use crate::passes::pm_linearize_multi_index;
 
@@ -19,7 +19,7 @@ fn make_range(size: i64, axis_id: usize) -> Arc<UOp> {
 /// This creates a buffer with a proper multi-dimensional shape.
 fn make_bufferize(dims: &[i64]) -> Arc<UOp> {
     // Create a dummy computation (const value)
-    let compute = UOp::const_(DType::Float32, morok_ir::ConstValue::Float(0.0));
+    let compute = UOp::const_(DType::Float32, svod_ir::ConstValue::Float(0.0));
 
     // Create ranges for each dimension
     let ranges: Vec<Arc<UOp>> = dims.iter().enumerate().map(|(i, &size)| make_range(size, i)).collect();
@@ -107,7 +107,7 @@ fn test_unbounded_buffer_still_linearizes() {
     // Create a buffer with unbounded size (no concrete shape)
     // With index-based dimension extraction, linearization should still work
     // because dimensions come from the RANGE indices, not the buffer
-    let ptr_dtype = DType::Float32.ptr(None, morok_dtype::AddrSpace::Global);
+    let ptr_dtype = DType::Float32.ptr(None, svod_dtype::AddrSpace::Global);
     let buffer = UOp::param(0, 1024, ptr_dtype, None);
     let i = make_range(4, 0);
     let j = make_range(8, 1);
@@ -126,7 +126,7 @@ fn test_unbounded_buffer_still_linearizes() {
 
 #[test]
 fn test_symbolic_dimension_is_linearized() {
-    let ptr_dtype = DType::Float32.ptr(None, morok_dtype::AddrSpace::Global);
+    let ptr_dtype = DType::Float32.ptr(None, svod_dtype::AddrSpace::Global);
     let buffer = UOp::param(0, 1024, ptr_dtype, None);
 
     let i = make_range(4, 0);

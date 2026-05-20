@@ -17,9 +17,9 @@
 //! Supports `Float16`, `BFloat16`, `Float32`, `Float64` on `DeviceSpec::Cpu`.
 //! Multi-device support is a straightforward extension of the same pipeline.
 
-use morok_dtype::{DType, DeviceSpec, ScalarDType};
-use morok_ir::{ConstValue, UOp, shape::Shape, shape::to_vec_usize};
 use snafu::ResultExt;
+use svod_dtype::{DType, DeviceSpec, ScalarDType};
+use svod_ir::{ConstValue, UOp, shape::Shape, shape::to_vec_usize};
 
 use crate::{Error, Result, Tensor, UOpSnafu};
 

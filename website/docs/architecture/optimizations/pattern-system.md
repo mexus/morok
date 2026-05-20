@@ -7,10 +7,10 @@ sidebar_position: 0
 
 Open any production ML compiler and you'll find dozens of optimization passes: constant folding, dead code elimination, operator fusion, loop tiling, vectorization, memory layout optimization. Each pass has its own data structures, its own traversal logic, its own bugs.
 
-Morok takes a different approach: **one mechanism for everything**.
+Svod takes a different approach: **one mechanism for everything**.
 
 ```text
-Traditional Compiler:              Morok:
+Traditional Compiler:              Svod:
 ┌─────────────────────────┐       ┌─────────────────────────┐
 │  Constant Folding       │       │                         │
 │  Dead Code Elimination  │       │   patterns! {           │
@@ -24,13 +24,13 @@ Traditional Compiler:              Morok:
                                        One mechanism
 ```
 
-Every optimization in Morok is expressed as a **pattern**: "when you see this structure, replace it with that structure." The same `graph_rewrite()` function applies [algebraic simplification](./algebraic-simplification.md), [index arithmetic](./index-arithmetic.md), [strength reduction](./strength-reduction.md), and [range optimization](./range-optimization.md).
+Every optimization in Svod is expressed as a **pattern**: "when you see this structure, replace it with that structure." The same `graph_rewrite()` function applies [algebraic simplification](./algebraic-simplification.md), [index arithmetic](./index-arithmetic.md), [strength reduction](./strength-reduction.md), and [range optimization](./range-optimization.md).
 
 ---
 
 ## The `patterns!` DSL
 
-Morok provides a domain-specific language for writing optimization patterns:
+Svod provides a domain-specific language for writing optimization patterns:
 
 ```rust
 patterns! {

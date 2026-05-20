@@ -10,16 +10,16 @@
 //! These patterns are separated from rangeify patterns because they apply
 //! universally to any UOp graph, not just during schedule transformation.
 
-use morok_dtype::{DType, ScalarDType};
-use morok_ir::types::{BinaryOp, ConstValue, ConstValueHash};
-use morok_ir::uop::cached_property::CachedProperty;
-use morok_ir::uop::comparison_analysis::ComparisonAnalyzer;
-use morok_ir::uop::eval::{
+use svod_dtype::{DType, ScalarDType};
+use svod_ir::types::{BinaryOp, ConstValue, ConstValueHash};
+use svod_ir::uop::cached_property::CachedProperty;
+use svod_ir::uop::comparison_analysis::ComparisonAnalyzer;
+use svod_ir::uop::eval::{
     eval_add_typed, eval_binary_op, eval_binary_op_broadcast, eval_binary_op_broadcast_typed, eval_mul_typed,
     eval_sub_typed, eval_unary_op_vec_typed,
 };
-use morok_ir::uop::properties::VminVmaxProperty;
-use morok_ir::{IntoUOp, Op, UOp};
+use svod_ir::uop::properties::VminVmaxProperty;
+use svod_ir::{IntoUOp, Op, UOp};
 
 use crate::TypedPatternMatcher;
 use crate::rangeify::indexing::get_const_value;
@@ -34,7 +34,7 @@ use tracing::trace;
 /// Folds constant expressions at compile time for unary, binary, and ternary operations.
 /// Uses dtype-aware evaluation to ensure results respect type boundaries (e.g., Int32 wraps at 32 bits).
 pub fn constant_folding_dsl_patterns() -> &'static TypedPatternMatcher {
-    use morok_ir::uop::eval::{eval_binary_op_typed, eval_ternary_op_typed, eval_unary_op_typed};
+    use svod_ir::uop::eval::{eval_binary_op_typed, eval_ternary_op_typed, eval_unary_op_typed};
 
     crate::cached_patterns! {
         // Unary constant folding - 6 operations in one declaration
@@ -211,14 +211,14 @@ pub fn propagate_invalid() -> &'static TypedPatternMatcher {
         // to bare INVALID (condition proven always-false by range analysis), the graph rewrite
         // engine rebuilds the parent WHERE via with_sources, placing bare INVALID in the true branch.
         // Upstream avoids this because their pattern ordering resolves it during reconstruction;
-        // Morok needs explicit canonicalization.
+        // Svod needs explicit canonicalization.
         Where(cond, inv, x) if matches!(inv.op(), Op::Invalid) => {
             let invalid = if inv.dtype() == x.dtype() { inv.clone() } else { UOp::new(Op::Invalid, x.dtype()) };
             // Inline NOT simplification: if cond is already NOT(c), flipping gives c (not NOT(NOT(c))).
             // Without this, repeated canonicalization creates NOT(NOT(NOT(...))) chains because
             // the rewrite engine doesn't process children between pattern applications on the same node.
             let flipped = match cond.op() {
-                Op::Unary(morok_ir::UnaryOp::Not, inner) => Arc::clone(inner),
+                Op::Unary(svod_ir::UnaryOp::Not, inner) => Arc::clone(inner),
                 _ => cond.not(),
             };
             UOp::try_where(flipped, x.clone(), invalid).ok()
@@ -600,7 +600,7 @@ pub fn range_based_mod_div_patterns() -> &'static TypedPatternMatcher {
             let (vmin, vmax) = VminVmaxProperty::get(x);
             if let (ConstValue::Int(min), ConstValue::Int(max), ConstValue::Int(n_int)) = (vmin, vmax, n_val)
                 && n_int > 0 {
-                    // Truncation division (Rust's `/` rounds toward zero) matches Morok's
+                    // Truncation division (Rust's `/` rounds toward zero) matches Svod's
                     // IDIV semantics. n_int > 0 is already guarded above.
                     let min_div = *min / n_int;
                     let max_div = *max / n_int;
@@ -823,7 +823,7 @@ pub fn division_dsl_patterns() -> &'static TypedPatternMatcher {
 /// This is used for double-cast optimization: x.cast(a).cast(b) → x.cast(b)
 /// is only safe if `a` can hold all values of `b` (so no truncation occurs in `a`).
 fn can_safe_cast(to: &DType, from: &DType) -> bool {
-    use morok_dtype::ScalarDType;
+    use svod_dtype::ScalarDType;
 
     // Get base scalar types for comparison
     let to_scalar = match to {
@@ -1176,7 +1176,7 @@ pub fn dead_loop_patterns() -> &'static TypedPatternMatcher {
 /// Only applies to computation nodes (Binary, Unary, Ternary, DefineVar, Special)
 /// to avoid collapsing structural nodes like Range, Buffer, etc.
 pub fn vmin_vmax_collapse_patterns() -> &'static TypedPatternMatcher {
-    use morok_ir::uop::properties::SoundVminVmaxProperty;
+    use svod_ir::uop::properties::SoundVminVmaxProperty;
 
     fn is_collapsible(uop: &Arc<UOp>) -> bool {
         matches!(uop.op(), Op::Binary(..) | Op::Unary(..) | Op::Ternary(..) | Op::DefineVar { .. } | Op::Special { .. })
@@ -1989,7 +1989,7 @@ fn reciprocal_patterns() -> &'static TypedPatternMatcher {
 /// - (x*c).reduce(ADD) → reduce(x, ADD) * c  (move const multiply after reduce)
 /// - MUL(...).reduce(r) → reduce_mul_chain(r) (factor multiplicative terms out)
 fn reduce_sym_patterns() -> &'static TypedPatternMatcher {
-    use morok_ir::types::ReduceOp;
+    use svod_ir::types::ReduceOp;
 
     crate::cached_patterns! {
         // Pull scalar const OUT of reduce: REDUCE(x * c, ADD) → REDUCE(x, ADD) * c
@@ -2030,9 +2030,9 @@ fn reduce_sym_patterns() -> &'static TypedPatternMatcher {
 fn reduce_mul_chain_sym(
     src: &Arc<UOp>,
     ranges: &SmallVec<[Arc<UOp>; 4]>,
-    reduce_op: morok_ir::types::ReduceOp,
+    reduce_op: svod_ir::types::ReduceOp,
 ) -> Option<Arc<UOp>> {
-    use morok_ir::types::ReduceOp;
+    use svod_ir::types::ReduceOp;
 
     if !matches!(reduce_op, ReduceOp::Add | ReduceOp::Max) {
         return None;
@@ -2449,7 +2449,7 @@ pub fn div_mod_recombine_dsl_patterns() -> &'static TypedPatternMatcher {
 /// Narrows Int64 binary operations to Int32 when both operands and the result
 /// fit in i32 range, reducing register pressure and enabling 32-bit ALU usage.
 pub fn long_to_int_narrowing_patterns() -> &'static TypedPatternMatcher {
-    use morok_ir::uop::properties::SoundVminVmaxProperty;
+    use svod_ir::uop::properties::SoundVminVmaxProperty;
 
     fn fits_i32(uop: &Arc<UOp>) -> bool {
         let Some((vmin, vmax)) = SoundVminVmaxProperty::get(uop) else { return false };

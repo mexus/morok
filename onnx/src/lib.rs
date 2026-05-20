@@ -1,13 +1,13 @@
-//! ONNX model frontend for Morok.
+//! ONNX model frontend for Svod.
 //!
-//! This crate provides ONNX model parsing and conversion to Morok Tensors.
+//! This crate provides ONNX model parsing and conversion to Svod Tensors.
 //!
 //! # Example
 //!
 //! ```ignore
-//! use morok_onnx::OnnxImporter;
+//! use svod_onnx::OnnxImporter;
 //!
-//! // Import model — returns inputs, outputs, and variables as normal Morok types
+//! // Import model — returns inputs, outputs, and variables as normal Svod types
 //! let model = OnnxImporter::new().import("model.onnx", &[("batch", 4)])?;
 //!
 //! // Outputs are lazy Tensors — realize to execute

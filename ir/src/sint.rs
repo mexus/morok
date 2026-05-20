@@ -42,8 +42,8 @@ fn symbolic_contains_max_term(expr: &Arc<UOp>, needle: &Arc<UOp>) -> bool {
 /// # Examples
 ///
 /// ```rust
-/// # use morok_ir::{SInt, UOp, ConstValue, Op};
-/// # use morok_dtype::DType;
+/// # use svod_ir::{SInt, UOp, ConstValue, Op};
+/// # use svod_dtype::DType;
 /// // Concrete dimension
 /// let static_dim = SInt::from(32);
 /// assert!(static_dim.is_const());
@@ -156,7 +156,7 @@ impl SInt {
     }
 
     /// Convert to UOp (const or passthrough). Panics on Infer.
-    pub fn to_uop(&self, dtype: morok_dtype::DType) -> Arc<UOp> {
+    pub fn to_uop(&self, dtype: svod_dtype::DType) -> Arc<UOp> {
         match self {
             SInt::Const(v) => UOp::const_(dtype, crate::ConstValue::Int(*v as i64)),
             SInt::Symbolic(uop) => {
@@ -210,8 +210,8 @@ impl SInt {
                     return self.clone();
                 }
 
-                let a = self.to_uop(morok_dtype::DType::Index);
-                let b = rhs.to_uop(morok_dtype::DType::Index);
+                let a = self.to_uop(svod_dtype::DType::Index);
+                let b = rhs.to_uop(svod_dtype::DType::Index);
 
                 if symbolic_contains_max_term(&a, &b) {
                     return self.clone();
@@ -245,8 +245,8 @@ impl SInt {
             }
             (SInt::Const(a), SInt::Const(b)) => SInt::Const(*a.min(b)),
             _ => {
-                let a = self.to_uop(morok_dtype::DType::Index);
-                let b = rhs.to_uop(morok_dtype::DType::Index);
+                let a = self.to_uop(svod_dtype::DType::Index);
+                let b = rhs.to_uop(svod_dtype::DType::Index);
                 // min(a, b) = -max(-a, -b)
                 let neg_max = a.neg().try_max(&b.neg()).unwrap();
                 SInt::Symbolic(neg_max.neg())
@@ -271,8 +271,8 @@ macro_rules! impl_sint_binop {
                     }
                     (SInt::Const(a), SInt::Const(b)) => SInt::Const(a $concrete_op b),
                     _ => {
-                        let a = self.to_uop(morok_dtype::DType::Index);
-                        let b = rhs.to_uop(morok_dtype::DType::Index);
+                        let a = self.to_uop(svod_dtype::DType::Index);
+                        let b = rhs.to_uop(svod_dtype::DType::Index);
                         SInt::Symbolic(a.$uop_method(&b).unwrap())
                     }
                 }
@@ -332,8 +332,8 @@ impl std::ops::Sub for &SInt {
             (_, SInt::Const(0)) => self.clone(),
             _ if self == rhs => SInt::Const(0),
             _ => {
-                let a = self.to_uop(morok_dtype::DType::Index);
-                let b = rhs.to_uop(morok_dtype::DType::Index);
+                let a = self.to_uop(svod_dtype::DType::Index);
+                let b = rhs.to_uop(svod_dtype::DType::Index);
                 SInt::Symbolic(a.try_sub(&b).unwrap())
             }
         }
@@ -586,7 +586,7 @@ impl IntoShrinkRange for &(SInt, SInt) {
 /// # Examples
 ///
 /// ```rust
-/// # use morok_ir::{SInt, sint_prod};
+/// # use svod_ir::{SInt, sint_prod};
 /// let dims = vec![SInt::from(2), SInt::from(3), SInt::from(4)];
 /// let result = sint_prod(&dims);
 /// assert_eq!(result.as_const(), Some(24));
@@ -600,7 +600,7 @@ pub fn sint_prod(values: &[SInt]) -> SInt {
 /// # Examples
 ///
 /// ```rust
-/// # use morok_ir::{SInt, sint_max};
+/// # use svod_ir::{SInt, sint_max};
 /// let a = SInt::from(10);
 /// let b = SInt::from(20);
 /// let result = sint_max(&[a, b]);
@@ -619,7 +619,7 @@ pub fn sint_max(values: &[SInt]) -> SInt {
 /// # Examples
 ///
 /// ```rust
-/// # use morok_ir::{SInt, sint_min};
+/// # use svod_ir::{SInt, sint_min};
 /// let a = SInt::from(10);
 /// let b = SInt::from(20);
 /// let result = sint_min(&[a, b]);

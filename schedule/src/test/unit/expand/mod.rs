@@ -16,13 +16,13 @@ pub mod shift_to_integration;
 pub mod swizzle;
 
 use crate::expand::*;
-use morok_ir::{AxisType, prelude::*};
+use svod_ir::{AxisType, prelude::*};
 
 #[test]
 fn test_pre_expand_passthrough() {
     // A simple REDUCE with proper Range ops should pass through unchanged
     let end = UOp::const_(DType::Index, ConstValue::Int(32));
-    let range = UOp::range_axis(end, morok_ir::AxisId::Renumbered(0), AxisType::Reduce);
+    let range = UOp::range_axis(end, svod_ir::AxisId::Renumbered(0), AxisType::Reduce);
     let src = UOp::const_(DType::Float32, ConstValue::Float(0.0));
     let reduce = src.reduce(smallvec::smallvec![range.clone()], ReduceOp::Add);
 
@@ -54,7 +54,7 @@ fn test_vectorize_expansion_with_mixed_sources() {
 
     // Create a Binary op with UNROLL - this will trigger expansion
     // The scalar source will be broadcast, creating a vector
-    let binary = UOp::new(Op::Binary(morok_ir::BinaryOp::Add, scalar.clone(), unroll.clone()), DType::Float32);
+    let binary = UOp::new(Op::Binary(svod_ir::BinaryOp::Add, scalar.clone(), unroll.clone()), DType::Float32);
 
     // Run pre_expand - should not panic
     let result = pre_expand(&binary);
@@ -97,7 +97,7 @@ fn test_fix_reduce_unroll_with_unroll_ops() {
 
     // Create a Reduce range
     let reduce_end = UOp::const_(DType::Index, ConstValue::Int(16));
-    let reduce_range = UOp::range_axis(reduce_end, morok_ir::AxisId::Renumbered(0), AxisType::Reduce);
+    let reduce_range = UOp::range_axis(reduce_end, svod_ir::AxisId::Renumbered(0), AxisType::Reduce);
 
     let src = UOp::const_(DType::Float32, ConstValue::Float(0.0));
     let reduce = src.reduce(smallvec::smallvec![reduce_range.clone(), unroll], ReduceOp::Add);
@@ -145,7 +145,7 @@ fn test_reduce_empty_ranges_bug() {
     // Range(R0, Reduce): the reduce axis (axis 1)
     // RANGE(R3, Unroll): unrolled axis (axis 0)
     let reduce_end = UOp::const_(DType::Index, ConstValue::Int(2));
-    let reduce_range = UOp::range_axis(reduce_end, morok_ir::AxisId::Renumbered(0), AxisType::Reduce);
+    let reduce_range = UOp::range_axis(reduce_end, svod_ir::AxisId::Renumbered(0), AxisType::Reduce);
 
     // Create UNROLL for axis 0 (keepdim behavior)
     let values = UOp::vconst(vec![ConstValue::Int(0), ConstValue::Int(1)], DType::Int64);
@@ -190,7 +190,7 @@ fn test_pre_expand_single_pass_handles_unroll_and_reduce_together() {
 
     // Range(Reduce) with axis id 0.
     let reduce_end = UOp::const_(DType::Index, ConstValue::Int(8));
-    let reduce_range = UOp::range_axis(reduce_end, morok_ir::AxisId::Renumbered(0), AxisType::Reduce);
+    let reduce_range = UOp::range_axis(reduce_end, svod_ir::AxisId::Renumbered(0), AxisType::Reduce);
 
     let src = UOp::const_(DType::Float32, ConstValue::Float(0.0));
     let reduce = src.reduce(smallvec::smallvec![reduce_range, unroll], ReduceOp::Add);

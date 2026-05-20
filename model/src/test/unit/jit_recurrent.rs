@@ -1,8 +1,8 @@
-extern crate self as morok_model;
+extern crate self as svod_model;
 
-use morok_dtype::DType;
-use morok_macros::jit_wrapper;
-use morok_tensor::Tensor;
+use svod_dtype::DType;
+use svod_macros::jit_wrapper;
+use svod_tensor::Tensor;
 
 use snafu::ResultExt;
 
@@ -58,7 +58,7 @@ impl RecurrentJit for RecurrentTestJit {
         self.execute()
     }
 
-    fn output_buffer(&self) -> Result<&morok_device::Buffer> {
+    fn output_buffer(&self) -> Result<&svod_device::Buffer> {
         self.output()
     }
 }

@@ -13,10 +13,10 @@
 
 use std::sync::Arc;
 
-use morok_dtype::{DType, ScalarDType};
-use morok_ir::types::ConstValue;
-use morok_ir::{AxisId, AxisType, BinaryOp, Op, UOp};
 use smallvec::smallvec;
+use svod_dtype::{DType, ScalarDType};
+use svod_ir::types::ConstValue;
+use svod_ir::{AxisId, AxisType, BinaryOp, Op, UOp};
 
 use super::helpers::*;
 

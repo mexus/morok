@@ -5,9 +5,9 @@
 
 use std::sync::Arc;
 
-use morok_device::DeviceSpec;
-use morok_dtype::DType;
-use morok_ir::{AxisId, AxisType, Op, SInt, UOp};
+use svod_device::DeviceSpec;
+use svod_dtype::DType;
+use svod_ir::{AxisId, AxisType, Op, SInt, UOp};
 
 use crate::rangeify::patterns::movement_op_patterns;
 use crate::rewrite::graph_rewrite;

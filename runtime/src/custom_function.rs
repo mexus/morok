@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use morok_device::Buffer;
-use morok_ir::{CustomFunctionKind, UOp};
+use svod_device::Buffer;
+use svod_ir::{CustomFunctionKind, UOp};
 
 use crate::{Error, Result};
 

@@ -20,10 +20,10 @@
 
 use std::path::Path;
 
-use morok_dtype::DType;
-use morok_ir::SInt;
-use morok_tensor::{BoundVariable, Tensor};
 use snafu::ResultExt;
+use svod_dtype::DType;
+use svod_ir::SInt;
+use svod_tensor::{BoundVariable, Tensor};
 
 use crate::blocks::{BatchNormWeights, BlockKind, Conv2dWeights, ResidualStage, remap};
 use crate::state::{self, HasStateDict, StateDict, get_tensor};
@@ -220,7 +220,7 @@ impl HasStateDict for WeSpeakerResNet34 {
 }
 
 /// pyannote's WeSpeaker module names the residual-shortcut conv `shortcut.0`
-/// and the BN `shortcut.1`. The morok [`BasicBlock`] expects torchvision's
+/// and the BN `shortcut.1`. The svod [`BasicBlock`] expects torchvision's
 /// `downsample.0` / `downsample.1` naming for the same slots. Rewrite the
 /// substring `.shortcut.` to `.downsample.` whenever it appears in a key.
 fn rename_shortcut_to_downsample(key: &str) -> String {

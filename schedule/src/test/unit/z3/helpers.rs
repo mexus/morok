@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use morok_ir::UOp;
+use svod_ir::UOp;
 
 use crate::rewrite::graph_rewrite;
 use crate::symbolic::symbolic_simple;

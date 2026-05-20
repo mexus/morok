@@ -6,9 +6,9 @@
 use std::sync::Arc;
 
 use crate::patterns;
-use morok_dtype::DType;
-use morok_ir::pattern::RewriteResult;
-use morok_ir::{BinaryOp, ConstValue, Op, UOp};
+use svod_dtype::DType;
+use svod_ir::pattern::RewriteResult;
+use svod_ir::{BinaryOp, ConstValue, Op, UOp};
 
 /// Helper to create a binary operation UOp
 fn binary(op: BinaryOp, lhs: Arc<UOp>, rhs: Arc<UOp>) -> Arc<UOp> {
@@ -221,7 +221,7 @@ fn test_guard_with_pointer_equality() {
     }
 
     // Test a & b - should NOT match (different values = different pointers)
-    // Note: Morok uses hash-consing, so Const(42) and Const(42) will share the same Rc
+    // Note: Svod uses hash-consing, so Const(42) and Const(42) will share the same Rc
     // We need to use actually different values to test this
     let b = UOp::native_const(99i32); // Different value = different Rc
     let and_diff = a.try_and_op(&b).unwrap();
@@ -572,7 +572,7 @@ fn test_nested_struct_pattern() {
 
 #[test]
 fn test_nested_struct_field_extraction() {
-    use morok_ir::types::{AddrSpace, BufferizeOpts};
+    use svod_ir::types::{AddrSpace, BufferizeOpts};
 
     // Test nested struct field extraction:
     // Index { buffer: Bufferize { compute, ranges, .. }, indices, gate: None }
@@ -604,7 +604,7 @@ fn test_nested_struct_field_extraction() {
 
 #[test]
 fn test_nested_struct_field_extraction_mismatch() {
-    use morok_ir::types::{AddrSpace, BufferizeOpts};
+    use svod_ir::types::{AddrSpace, BufferizeOpts};
 
     // Test that guard fails when ranges.len() != indices.len()
     let matcher = patterns! {
@@ -749,7 +749,7 @@ fn test_for_loop_ternary_expansion() {
 
 #[test]
 fn test_for_loop_with_op_var_access() {
-    use morok_ir::UnaryOp;
+    use svod_ir::UnaryOp;
 
     // Test that the operation variable `op` is accessible in the closure
     let matcher = patterns! {
@@ -982,8 +982,8 @@ fn test_rest_pattern_end() {
 
 #[test]
 fn test_rest_pattern_reduce() {
-    use morok_ir::types::ReduceOp;
     use smallvec::smallvec;
+    use svod_ir::types::ReduceOp;
 
     // Test Reduce(_, ..) matching - verifies the `..` syntax works for variable-arity ops
     let matcher = patterns! {
@@ -1016,8 +1016,8 @@ fn test_rest_pattern_reduce() {
 
 #[test]
 fn test_rest_pattern_with_guard() {
-    use morok_ir::types::ReduceOp;
     use smallvec::smallvec;
+    use svod_ir::types::ReduceOp;
 
     // Test that guards work correctly with rest patterns
     let matcher = patterns! {
@@ -1051,7 +1051,7 @@ fn test_rest_pattern_with_guard() {
 
 #[test]
 fn test_bufferize_variable_ranges() {
-    use morok_ir::types::{AddrSpace, BufferizeOpts};
+    use svod_ir::types::{AddrSpace, BufferizeOpts};
 
     // Test Bufferize { compute: c, .. } with varying number of ranges
     // This pattern should match Bufferize with 0, 1, 2, or more ranges
@@ -1174,7 +1174,7 @@ fn test_index_gate_bare_binding() {
 
 #[test]
 fn test_tuple_prefix_semantics_vs_exact() {
-    use morok_ir::types::{AddrSpace, BufferizeOpts};
+    use svod_ir::types::{AddrSpace, BufferizeOpts};
 
     // Verify that Tuple now uses prefix semantics (matches first N, ignores rest)
     // rather than exact semantics (requires exactly N children)
@@ -1404,7 +1404,7 @@ fn test_permutation_pattern_commutative_const_folding() {
 
 #[test]
 fn test_copy_struct_pattern() {
-    use morok_device::DeviceSpec;
+    use svod_device::DeviceSpec;
 
     // Test Copy { src, device } struct pattern matching
     let matcher = patterns! {
@@ -1554,7 +1554,7 @@ fn test_commutative_pattern_with_special_zero() {
         Add[x, @zero] ~> x
     };
 
-    let x = UOp::var("a", morok_dtype::DType::Int32, 0, i64::MAX);
+    let x = UOp::var("a", svod_dtype::DType::Int32, 0, i64::MAX);
     let zero = UOp::native_const(0i32);
 
     // Add(x, 0) should match
@@ -1585,7 +1585,7 @@ fn test_commutative_pattern_with_graph_rewrite() {
         Add[x, @zero] ~> x
     };
 
-    let x = UOp::var("a", morok_dtype::DType::Int32, 0, i64::MAX);
+    let x = UOp::var("a", svod_dtype::DType::Int32, 0, i64::MAX);
     let zero = UOp::native_const(0i32);
 
     // Add(0, x) via graph_rewrite
@@ -1603,7 +1603,7 @@ fn test_symbolic_simple_add_zero() {
     // Test combining two matchers
     let matcher = constant_folding_dsl_patterns() + identity_and_zero_patterns();
 
-    let x = UOp::var("a", morok_dtype::DType::Int32, 0, i64::MAX);
+    let x = UOp::var("a", svod_dtype::DType::Int32, 0, i64::MAX);
     let zero = UOp::native_const(0i32);
 
     // Add(0, x) via graph_rewrite with combined patterns
@@ -1768,7 +1768,7 @@ fn test_for_loop_unary_wildcard() {
     let c = UOp::native_const(42.0f32);
 
     // Test Neg(const) — construct raw Unary(Neg) since .neg() produces MUL
-    let neg_c = UOp::new(Op::Unary(morok_ir::UnaryOp::Neg, c.clone()), c.dtype());
+    let neg_c = UOp::new(Op::Unary(svod_ir::UnaryOp::Neg, c.clone()), c.dtype());
     match matcher.rewrite(&neg_c, &mut ()) {
         RewriteResult::Rewritten(r) => assert!(Arc::ptr_eq(&r, &c)),
         _ => panic!("Neg(const) from unary [*] should match"),

@@ -6,9 +6,9 @@
 use std::iter;
 
 use bon::bon;
-use morok_dtype::DType;
-use morok_ir::{SInt, shape::Shape};
 use snafu::{ResultExt, ensure};
+use svod_dtype::DType;
+use svod_ir::{SInt, shape::Shape};
 
 use crate::{Result, Tensor, UOpSnafu, error::*};
 

@@ -1,9 +1,9 @@
 //! GridSample: spatial sampling via coordinate grids (ONNX GridSample operator).
 
 use bon::bon;
-use morok_dtype::DType;
-use morok_ir::ConstValue;
 use snafu::ResultExt;
+use svod_dtype::DType;
+use svod_ir::ConstValue;
 
 use crate::Tensor;
 use crate::error::{NdimMinimumSnafu, UOpSnafu};
@@ -26,7 +26,7 @@ impl Tensor {
     /// Identity transform producing a 4x4 grid:
     ///
     /// ```
-    /// # use morok_tensor::Tensor;
+    /// # use svod_tensor::Tensor;
     /// # use ndarray::array;
     /// let theta = Tensor::from_ndarray(&array![[[1.0f32, 0.0, 0.0], [0.0, 1.0, 0.0]]]);
     /// let grid = Tensor::affine_grid().theta(&theta).size(&[1, 1, 4, 4]).call().unwrap();
@@ -38,7 +38,7 @@ impl Tensor {
     /// With `align_corners`:
     ///
     /// ```
-    /// # use morok_tensor::Tensor;
+    /// # use svod_tensor::Tensor;
     /// # use ndarray::array;
     /// let theta = Tensor::from_ndarray(&array![[[1.0f32, 0.0, 0.0], [0.0, 1.0, 0.0]]]);
     /// let grid = Tensor::affine_grid()
@@ -113,7 +113,7 @@ impl Tensor {
     /// Sample with a grid from `affine_grid`:
     ///
     /// ```
-    /// # use morok_tensor::Tensor;
+    /// # use svod_tensor::Tensor;
     /// # use ndarray::{array, Array4};
     /// let theta = Tensor::from_ndarray(&array![[[1.0f32, 0.0, 0.0], [0.0, 1.0, 0.0]]]);
     /// let grid = Tensor::affine_grid().theta(&theta).size(&[1, 1, 4, 4]).call().unwrap();
@@ -127,8 +127,8 @@ impl Tensor {
     /// With nearest-mode interpolation:
     ///
     /// ```
-    /// # use morok_tensor::Tensor;
-    /// # use morok_tensor::nn::GridSampleMode;
+    /// # use svod_tensor::Tensor;
+    /// # use svod_tensor::nn::GridSampleMode;
     /// # use ndarray::{array, Array4};
     /// let theta = Tensor::from_ndarray(&array![[[1.0f32, 0.0, 0.0], [0.0, 1.0, 0.0]]]);
     /// let grid = Tensor::affine_grid().theta(&theta).size(&[1, 1, 4, 4]).call().unwrap();
@@ -154,8 +154,8 @@ impl Tensor {
         snafu::ensure!(x_ndim >= 3, NdimMinimumSnafu { op: "grid_sample", min: 3_usize, actual: x_ndim });
         let x_shape = self.shape()?;
         let grid_shape = grid.shape()?;
-        let x_dims = morok_ir::shape::to_vec_usize(&x_shape).context(UOpSnafu)?;
-        let grid_dims = morok_ir::shape::to_vec_usize(&grid_shape).context(UOpSnafu)?;
+        let x_dims = svod_ir::shape::to_vec_usize(&x_shape).context(UOpSnafu)?;
+        let grid_dims = svod_ir::shape::to_vec_usize(&grid_shape).context(UOpSnafu)?;
         let n_spatial = x_dims.len() - 2;
 
         let n = x_dims[0];

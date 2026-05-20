@@ -7,7 +7,7 @@
 //! where `RnntRuntime` carries the RN-T-only inference metadata (vocabulary,
 //! max symbols per step, SentencePiece flag).
 //!
-//! The decoder layer in `morok_arch` is not unified by this struct — CTC and
+//! The decoder layer in `svod_arch` is not unified by this struct — CTC and
 //! RN-T still use their respective `CtcDecoder` / `JointStep` shapes — but the
 //! model construction, weight loading, and encoder JIT all flow through one
 //! type.
@@ -36,7 +36,7 @@ pub struct GigaAm {
 }
 
 /// Head variant. `Ctc` holds the small Conv1d projection consumed by
-/// `morok_arch::ctc` decoders. `Rnnt` holds the predictor+joint pair plus
+/// `svod_arch::ctc` decoders. `Rnnt` holds the predictor+joint pair plus
 /// the runtime metadata (vocab, max-symbols-per-step, SP flag) used by the
 /// arch's `JointStep`-driven decoder.
 #[derive(Clone)]
@@ -134,7 +134,7 @@ impl GigaAm {
     /// over `config.transducer.vocabulary` if `Some`.
     ///
     /// Auto-detects PyTorch key format (`encoder.` / `model.encoder.` /
-    /// `head.decoder.` / `head.joint.` prefixes) and remaps to morok layout
+    /// `head.decoder.` / `head.joint.` prefixes) and remaps to svod layout
     /// before loading.
     pub fn from_state_dict(sd: &StateDict, config: GigaAmConfig, vocab_override: Option<Vec<String>>) -> Result<Self> {
         let is_pytorch = sd.keys().any(|k| {

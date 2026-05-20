@@ -259,7 +259,7 @@ impl Tensor {
             let new_dim_size = dim_size.div_ceil(stride as usize);
 
             // Reshape dim into [new_dim_size, stride], take [:, 0]
-            let mut new_shape = morok_ir::shape::to_vec_isize(&cur_shape).context(UOpSnafu)?;
+            let mut new_shape = svod_ir::shape::to_vec_isize(&cur_shape).context(UOpSnafu)?;
 
             // Pad if needed so dim is evenly divisible by stride
             let padded_size = new_dim_size * stride as usize;

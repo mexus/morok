@@ -9,8 +9,8 @@
 
 use std::sync::Arc;
 
-use morok_dtype::DType;
 use smallvec::SmallVec;
+use svod_dtype::DType;
 
 use crate::op::Op;
 use crate::types::{AxisId, AxisType, ConstValue};

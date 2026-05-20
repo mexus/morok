@@ -14,9 +14,9 @@
 
 use std::path::Path;
 
-use morok_arch::ctc::{CtcDecoder, GreedyDecoder};
 use serde::Deserialize;
 use snafu::ResultExt;
+use svod_arch::ctc::{CtcDecoder, GreedyDecoder};
 
 use super::error::{ConfigIoSnafu, ConfigSnafu, Error, Result};
 
@@ -266,14 +266,14 @@ fn validate_preprocessor(pre: &RawPreprocessor) -> Result<()> {
     {
         return Err(Error::DecoderConfig {
             message: format!(
-                "unsupported mel_scale {scale:?}; Morok GigaAM currently matches torchaudio's HTK mel frontend"
+                "unsupported mel_scale {scale:?}; Svod GigaAM currently matches torchaudio's HTK mel frontend"
             ),
         });
     }
     if let Some(norm) = pre.mel_norm.as_deref() {
         return Err(Error::DecoderConfig {
             message: format!(
-                "unsupported mel_norm {norm:?}; Morok GigaAM currently supports only null/no mel normalization"
+                "unsupported mel_norm {norm:?}; Svod GigaAM currently supports only null/no mel normalization"
             ),
         });
     }
@@ -292,7 +292,7 @@ fn validate_encoder(encoder: &RawEncoder) -> Result<()> {
     if encoder.self_attention_model != "rotary" {
         return Err(Error::DecoderConfig {
             message: format!(
-                "unsupported self_attention_model {:?}; Morok GigaAM currently implements rotary attention only",
+                "unsupported self_attention_model {:?}; Svod GigaAM currently implements rotary attention only",
                 encoder.self_attention_model
             ),
         });
@@ -300,7 +300,7 @@ fn validate_encoder(encoder: &RawEncoder) -> Result<()> {
     if encoder.subsampling_factor != 4 {
         return Err(Error::DecoderConfig {
             message: format!(
-                "unsupported subsampling_factor {}; Morok GigaAM currently implements exactly two stride-2 subsampling layers",
+                "unsupported subsampling_factor {}; Svod GigaAM currently implements exactly two stride-2 subsampling layers",
                 encoder.subsampling_factor
             ),
         });
@@ -331,7 +331,7 @@ fn raw_to_decoder(decoding: Option<&serde_json::Value>, vocab_size: usize) -> Re
         let g: GreedyDecoder = serde_json::from_value(decoding.clone()).context(ConfigSnafu)?;
         CtcDecoder::Greedy(g)
     } else if target.contains("CTCBeamDecoding") {
-        let b: morok_arch::ctc::BeamDecoder = serde_json::from_value(decoding.clone()).context(ConfigSnafu)?;
+        let b: svod_arch::ctc::BeamDecoder = serde_json::from_value(decoding.clone()).context(ConfigSnafu)?;
         CtcDecoder::Beam(Box::new(b))
     } else {
         // Unknown / missing target. If there's a vocabulary array, default to

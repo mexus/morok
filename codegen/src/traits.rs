@@ -1,9 +1,9 @@
 //! Core traits for code generation.
 
 use crate::{RenderedKernel, Result};
-use morok_ir::UOp;
-use morok_ir::pattern::TypedPatternMatcher;
 use std::sync::Arc;
+use svod_ir::UOp;
+use svod_ir::pattern::TypedPatternMatcher;
 
 /// Backend-agnostic code generation interface.
 ///

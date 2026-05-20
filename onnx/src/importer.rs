@@ -1,15 +1,15 @@
-//! ONNX model importer - converts ONNX protobuf to Morok Tensors.
+//! ONNX model importer - converts ONNX protobuf to Svod Tensors.
 
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufReader, Read};
 use std::path::Path;
 
-use morok_dtype::DType;
-use morok_ir::SInt;
-use morok_tensor::{Tensor, Variable};
 use prost::Message;
 use snafu::ResultExt;
+use svod_dtype::DType;
+use svod_ir::SInt;
+use svod_tensor::{Tensor, Variable};
 
 use crate::error::{EmptyModelSnafu, IoSnafu, MissingInputSnafu, ProtobufDecodeSnafu, Result};
 use crate::parser::onnx::{GraphProto, ModelProto, NodeProto, ValueInfoProto};
@@ -117,7 +117,7 @@ impl OnnxGraph {
     }
 }
 
-/// Imported ONNX model — normal Morok types, ready to use.
+/// Imported ONNX model — normal Svod types, ready to use.
 ///
 /// Contains the lazy computation graph as input/output Tensors and any
 /// dynamic dimension Variables extracted from the ONNX graph.
@@ -146,7 +146,7 @@ pub struct OnnxModel {
 
 /// ONNX model importer.
 ///
-/// Converts ONNX models to Morok Tensors via a single `import()` call that
+/// Converts ONNX models to Svod Tensors via a single `import()` call that
 /// returns an [`OnnxModel`] with inputs, outputs, and auto-extracted variables.
 pub struct OnnxImporter {
     registry: OpRegistry,
@@ -309,7 +309,7 @@ impl OnnxImporter {
                 let reshaped = bitcasted.try_reshape(&ir_dims).map_err(|e| crate::error::Error::IrConstruction {
                     details: format!("DISK reshape '{}': {e}", init.name),
                 })?;
-                let copied = reshaped.copy_to_device(morok_dtype::DeviceSpec::Cpu);
+                let copied = reshaped.copy_to_device(svod_dtype::DeviceSpec::Cpu);
                 let tensor = Tensor::from_lazy(copied);
                 initializers.insert(init.name.clone(), tensor);
             } else {
@@ -489,7 +489,7 @@ impl OnnxImporter {
 
             // At trace level: realize each output and dump first values.
             // Intrusive (breaks fusion) — use for numerical bisection only.
-            // RUST_LOG=morok_onnx::importer=trace to enable.
+            // RUST_LOG=svod_onnx::importer=trace to enable.
             #[allow(clippy::result_large_err)]
             if tracing::enabled!(tracing::Level::TRACE) {
                 for out_name in &node.output {

@@ -3,9 +3,9 @@
 //! Tests zero-size operations, empty structures, and other corner cases
 //! that could cause crashes or incorrect behavior.
 
-use morok_dtype::DType;
-use morok_ir::{AddrSpace, AxisId, AxisType, BufferizeOpts, ConstValue, Op, UOp};
 use smallvec::SmallVec;
+use svod_dtype::DType;
+use svod_ir::{AddrSpace, AxisId, AxisType, BufferizeOpts, ConstValue, Op, UOp};
 
 use crate::rangeify::{RangeifyBufferContext, bufferize_to_store, try_get_kernel_graph};
 use crate::test::unit::rangeify::helpers::extract_kernel;

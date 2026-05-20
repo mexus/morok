@@ -7,13 +7,13 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use morok_dtype::{AddrSpace, DType};
-use morok_ir::types::{AxisId, AxisType};
-use morok_ir::{Op, UOp};
+use svod_dtype::{AddrSpace, DType};
+use svod_ir::types::{AxisId, AxisType};
+use svod_ir::{Op, UOp};
 
 /// Helper: Create a LOCAL RANGE with the given end value.
 fn create_local_range(end_value: i64, axis_id: usize) -> Arc<UOp> {
-    let end = UOp::const_(DType::Index, morok_ir::types::ConstValue::Int(end_value));
+    let end = UOp::const_(DType::Index, svod_ir::types::ConstValue::Int(end_value));
     UOp::range_axis(end, AxisId::Renumbered(axis_id), AxisType::Local)
 }
 

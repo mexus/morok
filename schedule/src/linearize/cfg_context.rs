@@ -8,9 +8,9 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use morok_ir::UOp;
-use morok_ir::op::Op;
-use morok_ir::uop::core::UOpKey;
+use svod_ir::UOp;
+use svod_ir::op::Op;
+use svod_ir::uop::core::UOpKey;
 
 /// Control flow graph context for linearization.
 ///

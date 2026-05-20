@@ -1,11 +1,11 @@
 use super::*;
 
-use morok_device::device::Program;
-use morok_dtype::DType;
-use morok_ir::{CustomFunctionKind, UOp};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
+use svod_device::device::Program;
+use svod_dtype::DType;
+use svod_ir::{CustomFunctionKind, UOp};
 
 fn default_launch_size() -> [Arc<UOp>; 3] {
     [UOp::index_const(1), UOp::index_const(1), UOp::index_const(1)]
@@ -33,8 +33,8 @@ fn test_empty_plan_output_buffer_returns_none() {
 
 #[test]
 fn test_builder_map_buffer_alias() {
-    let alloc = morok_device::registry::cpu().expect("cpu allocator");
-    let buf = Buffer::new(alloc, morok_dtype::DType::Float32, vec![8], Default::default());
+    let alloc = svod_device::registry::cpu().expect("cpu allocator");
+    let buf = Buffer::new(alloc, svod_dtype::DType::Float32, vec![8], Default::default());
 
     let mut builder = ExecutionPlanBuilder::new(DeviceSpec::Cpu);
     let idx = builder.add_buffer(10, buf);
@@ -49,8 +49,8 @@ fn test_builder_map_buffer_alias() {
 
 #[test]
 fn test_builder_requires_explicit_output_indices() {
-    let alloc = morok_device::registry::cpu().expect("cpu allocator");
-    let buf = Buffer::new(alloc, morok_dtype::DType::Float32, vec![8], Default::default());
+    let alloc = svod_device::registry::cpu().expect("cpu allocator");
+    let buf = Buffer::new(alloc, svod_dtype::DType::Float32, vec![8], Default::default());
 
     let mut builder = ExecutionPlanBuilder::new(DeviceSpec::Cpu);
     builder.add_buffer(10, buf);
@@ -66,7 +66,7 @@ fn test_builder_requires_explicit_output_indices() {
 
 #[test]
 fn test_execute_buffer_copy_op() {
-    let alloc = morok_device::registry::cpu().expect("cpu allocator");
+    let alloc = svod_device::registry::cpu().expect("cpu allocator");
 
     let mut src = Buffer::new(alloc.clone(), DType::Float32, vec![4], Default::default());
     let dst = Buffer::new(alloc, DType::Float32, vec![4], Default::default());
@@ -104,7 +104,7 @@ fn test_execute_buffer_copy_op() {
 
 #[test]
 fn test_execute_buffer_view_op() {
-    let alloc = morok_device::registry::cpu().expect("cpu allocator");
+    let alloc = svod_device::registry::cpu().expect("cpu allocator");
 
     let mut base = Buffer::new(alloc.clone(), DType::Float32, vec![8], Default::default());
     let output_placeholder = Buffer::new(alloc, DType::Float32, vec![4], Default::default());
@@ -151,7 +151,7 @@ fn test_execute_buffer_view_op() {
 
 #[test]
 fn test_execute_custom_function_op_returns_unsupported() {
-    let alloc = morok_device::registry::cpu().expect("cpu allocator");
+    let alloc = svod_device::registry::cpu().expect("cpu allocator");
     let src = Buffer::new(alloc.clone(), DType::Float32, vec![4], Default::default());
     let dst = Buffer::new(alloc, DType::Float32, vec![4], Default::default());
 
@@ -161,7 +161,7 @@ fn test_execute_custom_function_op_returns_unsupported() {
     builder.add_op(PreparedOp::CustomFunction(PreparedCustomFunction {
         id: 200,
         kind: CustomFunctionKind::EncDec,
-        attrs: smallvec::smallvec![morok_ir::UOp::index_const(3)],
+        attrs: smallvec::smallvec![svod_ir::UOp::index_const(3)],
         buffer_indices: vec![dst_idx, src_idx],
         fixedvars: HashMap::new(),
         dependencies: Vec::new(),
@@ -192,7 +192,7 @@ impl Program for Copy4F32Program {
         _vals: &[i64],
         _global_size: Option<[usize; 3]>,
         _local_size: Option<[usize; 3]>,
-    ) -> morok_device::Result<()> {
+    ) -> svod_device::Result<()> {
         self.calls.fetch_add(1, Ordering::Relaxed);
         let bytes = 4 * std::mem::size_of::<f32>();
         unsafe {
@@ -208,7 +208,7 @@ impl Program for Copy4F32Program {
 
 #[test]
 fn test_builder_rejects_invalid_compiled_output_index() {
-    let alloc = morok_device::registry::cpu().expect("cpu allocator");
+    let alloc = svod_device::registry::cpu().expect("cpu allocator");
     let a = Buffer::new(alloc.clone(), DType::Float32, vec![4], Default::default());
     let b = Buffer::new(alloc, DType::Float32, vec![4], Default::default());
 
@@ -267,7 +267,7 @@ impl Program for ObserveParallelProgram {
         _vals: &[i64],
         _global_size: Option<[usize; 3]>,
         _local_size: Option<[usize; 3]>,
-    ) -> morok_device::Result<()> {
+    ) -> svod_device::Result<()> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         let active_now = self.active.fetch_add(1, Ordering::SeqCst) + 1;
 
@@ -312,7 +312,7 @@ impl Program for RecordLaunchProgram {
         vals: &[i64],
         global_size: Option<[usize; 3]>,
         _local_size: Option<[usize; 3]>,
-    ) -> morok_device::Result<()> {
+    ) -> svod_device::Result<()> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.global_x.store(global_size.map(|size| size[0]).unwrap_or(0), Ordering::SeqCst);
         self.first_val.store(vals.first().copied().unwrap_or(0) as usize, Ordering::SeqCst);
@@ -345,7 +345,7 @@ fn add_record_launch_kernel(
             code: String::new(),
             entry_point: "record_launch".to_string(),
             var_names: vec![match var.op() {
-                morok_ir::Op::DefineVar { name, .. } => name.clone(),
+                svod_ir::Op::DefineVar { name, .. } => name.clone(),
                 _ => "N".to_string(),
             }],
             globals: vec![0],
@@ -369,7 +369,7 @@ fn add_record_launch_kernel(
 
 #[test]
 fn test_execute_mixed_ops_compiled_copy_view_in_order() {
-    let alloc = morok_device::registry::cpu().expect("cpu allocator");
+    let alloc = svod_device::registry::cpu().expect("cpu allocator");
 
     let mut src = Buffer::new(alloc.clone(), DType::Float32, vec![4], Default::default());
     let mut mid = Buffer::new(alloc.clone(), DType::Float32, vec![4], Default::default());
@@ -463,7 +463,7 @@ fn test_execute_mixed_ops_compiled_copy_view_in_order() {
 
 #[test]
 fn test_execute_mixed_ops_respects_dependencies_not_insertion_order() {
-    let alloc = morok_device::registry::cpu().expect("cpu allocator");
+    let alloc = svod_device::registry::cpu().expect("cpu allocator");
 
     let mut src = Buffer::new(alloc.clone(), DType::Float32, vec![4], Default::default());
     let mut mid = Buffer::new(alloc.clone(), DType::Float32, vec![4], Default::default());
@@ -543,7 +543,7 @@ fn test_execute_mixed_ops_respects_dependencies_not_insertion_order() {
 
 #[test]
 fn test_execute_mixed_ops_missing_dependency_errors() {
-    let alloc = morok_device::registry::cpu().expect("cpu allocator");
+    let alloc = svod_device::registry::cpu().expect("cpu allocator");
     let dst = Buffer::new(alloc.clone(), DType::Float32, vec![4], Default::default());
     let src = Buffer::new(alloc, DType::Float32, vec![4], Default::default());
 
@@ -568,7 +568,7 @@ fn test_execute_mixed_ops_missing_dependency_errors() {
 
 #[test]
 fn test_execute_mixed_ops_cycle_errors() {
-    let alloc = morok_device::registry::cpu().expect("cpu allocator");
+    let alloc = svod_device::registry::cpu().expect("cpu allocator");
     let a = Buffer::new(alloc.clone(), DType::Float32, vec![4], Default::default());
     let b = Buffer::new(alloc, DType::Float32, vec![4], Default::default());
 
@@ -598,7 +598,7 @@ fn test_execute_mixed_ops_cycle_errors() {
 
 #[test]
 fn test_execute_mixed_ops_allows_duplicate_ids_in_expanded_schedule_order() {
-    let alloc = morok_device::registry::cpu().expect("cpu allocator");
+    let alloc = svod_device::registry::cpu().expect("cpu allocator");
 
     let mut src = Buffer::new(alloc.clone(), DType::Float32, vec![4], Default::default());
     let mid = Buffer::new(alloc.clone(), DType::Float32, vec![4], Default::default());
@@ -644,7 +644,7 @@ fn test_execute_mixed_ops_allows_duplicate_ids_in_expanded_schedule_order() {
 
 #[test]
 fn test_execute_copy_invalid_indices_errors() {
-    let alloc = morok_device::registry::cpu().expect("cpu allocator");
+    let alloc = svod_device::registry::cpu().expect("cpu allocator");
     let dst = Buffer::new(alloc, DType::Float32, vec![4], Default::default());
 
     let mut builder = ExecutionPlanBuilder::new(DeviceSpec::Cpu);
@@ -668,7 +668,7 @@ fn test_execute_copy_invalid_indices_errors() {
 
 #[test]
 fn test_execute_buffer_view_missing_indices_errors() {
-    let alloc = morok_device::registry::cpu().expect("cpu allocator");
+    let alloc = svod_device::registry::cpu().expect("cpu allocator");
     let out = Buffer::new(alloc, DType::Float32, vec![4], Default::default());
 
     let mut builder = ExecutionPlanBuilder::new(DeviceSpec::Cpu);
@@ -694,7 +694,7 @@ fn test_execute_buffer_view_missing_indices_errors() {
 
 #[test]
 fn test_build_compiled_program_invalid_buffer_indices_errors() {
-    let alloc = morok_device::registry::cpu().expect("cpu allocator");
+    let alloc = svod_device::registry::cpu().expect("cpu allocator");
     let dst = {
         let dst = Buffer::new(alloc, DType::Float32, vec![4], Default::default());
         dst.ensure_allocated().expect("dst allocation");
@@ -742,7 +742,7 @@ fn test_build_compiled_program_invalid_buffer_indices_errors() {
 
 #[test]
 fn test_execute_custom_function_invalid_indices_errors() {
-    let alloc = morok_device::registry::cpu().expect("cpu allocator");
+    let alloc = svod_device::registry::cpu().expect("cpu allocator");
     let dst = Buffer::new(alloc, DType::Float32, vec![4], Default::default());
 
     let mut builder = ExecutionPlanBuilder::new(DeviceSpec::Cpu);
@@ -770,7 +770,7 @@ fn test_execute_custom_function_invalid_indices_errors() {
 
 #[test]
 fn test_execute_with_vars_does_not_override_fixedvars() {
-    let alloc = morok_device::registry::cpu().expect("cpu allocator");
+    let alloc = svod_device::registry::cpu().expect("cpu allocator");
 
     let mut src = Buffer::new(alloc.clone(), DType::Float32, vec![4], Default::default());
     let mut dst = Buffer::new(alloc, DType::Float32, vec![4], Default::default());
@@ -823,7 +823,7 @@ fn test_execute_with_vars_does_not_override_fixedvars() {
 
 #[test]
 fn test_execute_with_vars_updates_non_fixed_vars() {
-    let alloc = morok_device::registry::cpu().expect("cpu allocator");
+    let alloc = svod_device::registry::cpu().expect("cpu allocator");
 
     let mut src = Buffer::new(alloc.clone(), DType::Float32, vec![4], Default::default());
     let mut dst = Buffer::new(alloc, DType::Float32, vec![4], Default::default());
@@ -876,7 +876,7 @@ fn test_execute_with_vars_updates_non_fixed_vars() {
 
 #[test]
 fn test_execute_with_vars_updates_symbolic_global_size_without_recompile() {
-    let alloc = morok_device::registry::cpu().expect("cpu allocator");
+    let alloc = svod_device::registry::cpu().expect("cpu allocator");
     let dst = Buffer::new(alloc, DType::Float32, vec![4], Default::default());
     dst.ensure_allocated().expect("allocate dst");
 
@@ -902,7 +902,7 @@ fn test_execute_with_vars_updates_symbolic_global_size_without_recompile() {
 
 #[test]
 fn test_execute_with_vars_rejects_out_of_bounds_launch_var_before_dispatch() {
-    let alloc = morok_device::registry::cpu().expect("cpu allocator");
+    let alloc = svod_device::registry::cpu().expect("cpu allocator");
     let dst = Buffer::new(alloc, DType::Float32, vec![4], Default::default());
     dst.ensure_allocated().expect("allocate dst");
 
@@ -930,7 +930,7 @@ fn test_execute_with_vars_rejects_out_of_bounds_launch_var_before_dispatch() {
 
 #[test]
 fn test_execute_with_vars_profiled_updates_symbolic_global_size() {
-    let alloc = morok_device::registry::cpu().expect("cpu allocator");
+    let alloc = svod_device::registry::cpu().expect("cpu allocator");
     let dst = Buffer::new(alloc, DType::Float32, vec![4], Default::default());
     dst.ensure_allocated().expect("allocate dst");
 
@@ -955,7 +955,7 @@ fn test_execute_with_vars_profiled_updates_symbolic_global_size() {
 
 #[test]
 fn test_execute_with_vars_does_not_override_core_id_runtime_var() {
-    let alloc = morok_device::registry::cpu().expect("cpu allocator");
+    let alloc = svod_device::registry::cpu().expect("cpu allocator");
     let dst = Buffer::new(alloc, DType::Float32, vec![4], Default::default());
     dst.ensure_allocated().expect("allocate dst");
 
@@ -979,7 +979,7 @@ fn test_execute_with_vars_does_not_override_core_id_runtime_var() {
 
 #[test]
 fn test_execute_parallel_safe_compiled_ops_can_overlap() {
-    let alloc = morok_device::registry::cpu().expect("cpu allocator");
+    let alloc = svod_device::registry::cpu().expect("cpu allocator");
 
     let dst_a = Buffer::new(alloc.clone(), DType::Float32, vec![4], Default::default());
     let src_a = Buffer::new(alloc.clone(), DType::Float32, vec![4], Default::default());
@@ -1074,7 +1074,7 @@ fn test_execute_parallel_safe_compiled_ops_can_overlap() {
 
 #[test]
 fn test_execute_threaded_cpu_kernels_do_not_use_outer_overlap() {
-    let alloc = morok_device::registry::cpu().expect("cpu allocator");
+    let alloc = svod_device::registry::cpu().expect("cpu allocator");
 
     let dst_a = Buffer::new(alloc.clone(), DType::Float32, vec![4], Default::default());
     let src_a = Buffer::new(alloc.clone(), DType::Float32, vec![4], Default::default());
@@ -1174,7 +1174,7 @@ fn test_execute_threaded_cpu_kernels_do_not_use_outer_overlap() {
 
 #[test]
 fn test_execute_unsafe_compiled_ops_are_serialized() {
-    let alloc = morok_device::registry::cpu().expect("cpu allocator");
+    let alloc = svod_device::registry::cpu().expect("cpu allocator");
 
     let dst_a = Buffer::new(alloc.clone(), DType::Float32, vec![4], Default::default());
     let src_a = Buffer::new(alloc.clone(), DType::Float32, vec![4], Default::default());
@@ -1239,7 +1239,7 @@ fn test_execute_unsafe_compiled_ops_are_serialized() {
 
 #[test]
 fn test_execute_mixed_op_types_are_serialized_across_barriers() {
-    let alloc = morok_device::registry::cpu().expect("cpu allocator");
+    let alloc = svod_device::registry::cpu().expect("cpu allocator");
 
     let dst_a = Buffer::new(alloc.clone(), DType::Float32, vec![4], Default::default());
     let src_a = Buffer::new(alloc.clone(), DType::Float32, vec![4], Default::default());
@@ -1389,7 +1389,7 @@ fn test_instance_dependencies_reject_unknown_op_index() {
 
 #[test]
 fn test_execute_with_vars_profiled_updates_non_fixed_vars() {
-    let alloc = morok_device::registry::cpu().expect("cpu allocator");
+    let alloc = svod_device::registry::cpu().expect("cpu allocator");
 
     let src = Buffer::new(alloc.clone(), DType::Float32, vec![4], Default::default());
     let dst = Buffer::new(alloc, DType::Float32, vec![4], Default::default());

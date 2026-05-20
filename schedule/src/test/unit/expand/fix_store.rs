@@ -5,10 +5,10 @@
 //! - Wraps result in CONTRACT with collected axes
 
 use super::helpers::*;
-use morok_dtype::DType;
-use morok_ir::types::ConstValue;
-use morok_ir::{AxisId, AxisType, Op, UOp};
 use smallvec::smallvec;
+use svod_dtype::DType;
+use svod_ir::types::ConstValue;
+use svod_ir::{AxisId, AxisType, Op, UOp};
 
 // =============================================================================
 // STORE Partition Tests

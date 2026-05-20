@@ -1,4 +1,4 @@
-"""Compare GigaAM CTC inference output between Morok and PyTorch.
+"""Compare GigaAM CTC inference output between Svod and PyTorch.
 
 Usage:
     cd submodules/GigaAM

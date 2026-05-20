@@ -4,7 +4,7 @@ sidebar_label: Op Bestiary
 
 # Op Bestiary: A Field Guide to UOp Operations
 
-When debugging Morok IR dumps, you'll encounter operations that aren't obvious from their names. This chapter documents non-trivial operations with signatures, field explanations, and examples.
+When debugging Svod IR dumps, you'll encounter operations that aren't obvious from their names. This chapter documents non-trivial operations with signatures, field explanations, and examples.
 
 **What's covered:** Operations that require explanation—loop control, reductions, memory operations, kernel structure, vectorization, tensor cores.
 
@@ -123,9 +123,9 @@ Used **after** rangeify. Accumulates values across RANGE iterations and closes t
 | `Add` | 0 | `acc + value` | ✓ |
 | `Mul` | 1 | `acc * value` | ✓ |
 | `Max` | -∞ | `max(acc, value)` | ✓ |
-| `Min` | +∞ | `min(acc, value)` | Morok-only |
+| `Min` | +∞ | `min(acc, value)` | Svod-only |
 
-> **Compatibility:** Tinygrad's spec restricts REDUCE_AXIS to `{Add, Mul, Max}`. Morok extends this with `Min`.
+> **Compatibility:** Tinygrad's spec restricts REDUCE_AXIS to `{Add, Mul, Max}`. Svod extends this with `Min`.
 
 **Example:**
 ```text
@@ -263,7 +263,7 @@ Write value to buffer. The buffer is accessed through the INDEX node (via `index
 
 For gated stores, use an INDEX with a gate (INDEX has an optional `gate` field).
 
-> **Compatibility:** Morok's STORE has no separate `buffer` field—sources are: index=0, value=1, ranges=2+ (range_start=2). Tinygrad's layout is similar.
+> **Compatibility:** Svod's STORE has no separate `buffer` field—sources are: index=0, value=1, ranges=2+ (range_start=2). Tinygrad's layout is similar.
 
 **Example:**
 ```text

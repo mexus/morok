@@ -1,11 +1,11 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
-use morok_dtype::DType;
 use smallvec::{SmallVec, smallvec};
+use svod_dtype::DType;
 
-use morok_dtype::ext::HasDType;
 use snafu::ResultExt;
+use svod_dtype::ext::HasDType;
 
 use crate::allocator::{Allocator, BufferOptions, RawBuffer};
 use crate::error::{

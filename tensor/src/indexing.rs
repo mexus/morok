@@ -45,8 +45,8 @@ impl Tensor {
         // dim could be passed through as `SInt`, and the comparison could be
         // restricted to dims that are concrete on both sides. As-is, gather
         // is unusable on tensors whose shape contains any symbolic dim.
-        let self_dims = morok_ir::shape::to_vec_usize(&self_shape).context(UOpSnafu)?;
-        let index_dims = morok_ir::shape::to_vec_usize(&index_shape).context(UOpSnafu)?;
+        let self_dims = svod_ir::shape::to_vec_usize(&self_shape).context(UOpSnafu)?;
+        let index_dims = svod_ir::shape::to_vec_usize(&index_shape).context(UOpSnafu)?;
 
         snafu::ensure!(
             self_dims.iter().zip(&index_dims).enumerate().all(|(d, (s, i))| d == dim || s >= i),
@@ -80,7 +80,7 @@ impl Tensor {
         // `expand_shape` below (line 90). Forcing every dim through `usize`
         // makes this unusable when the input has a symbolic dim (e.g. a JIT
         // batch). The same SInt-aware `try_expand` shape would suffice.
-        let self_dims = morok_ir::shape::to_vec_usize(&self_shape).context(UOpSnafu)?;
+        let self_dims = svod_ir::shape::to_vec_usize(&self_shape).context(UOpSnafu)?;
 
         // Reshape 1D index [K] → [1, ..., K, ..., 1] matching input ndim
         let idx_len = index.shape()?[0].as_const().expect("index_select: index length must be concrete");
@@ -134,9 +134,9 @@ impl Tensor {
         let ndim = self_shape.len();
         let dim = Self::normalize_axis(dim, ndim)?;
 
-        let self_dims = morok_ir::shape::to_vec_usize(&self_shape).context(UOpSnafu)?;
-        let index_dims = morok_ir::shape::to_vec_usize(&index_shape).context(UOpSnafu)?;
-        let src_dims = morok_ir::shape::to_vec_usize(&src_shape).context(UOpSnafu)?;
+        let self_dims = svod_ir::shape::to_vec_usize(&self_shape).context(UOpSnafu)?;
+        let index_dims = svod_ir::shape::to_vec_usize(&index_shape).context(UOpSnafu)?;
+        let src_dims = svod_ir::shape::to_vec_usize(&src_shape).context(UOpSnafu)?;
 
         snafu::ensure!(
             index_shape.len() == ndim && src_shape.len() == ndim,
@@ -174,7 +174,7 @@ impl Tensor {
 
         // Pad both to self.shape on non-dim axes
         let src_cur = src.shape()?;
-        let src_cur_dims = morok_ir::shape::to_vec_usize(&src_cur).context(UOpSnafu)?;
+        let src_cur_dims = svod_ir::shape::to_vec_usize(&src_cur).context(UOpSnafu)?;
         let padding: Vec<(isize, isize)> =
             (0..ndim).map(|d| (0, (self_dims[d] as isize - src_cur_dims[d] as isize).max(0))).collect();
         let needs_pad = padding.iter().any(|&(_, e)| e > 0);
@@ -254,7 +254,7 @@ impl Tensor {
     pub fn masked_select(&self, mask: &Tensor) -> Result<Tensor> {
         let x = self.flatten()?;
         let mask_flat = mask.broadcast_to(&self.shape()?)?.flatten()?;
-        let mask_cumsum = mask_flat.cast(morok_dtype::DType::Int32)?.cumsum(0)?;
+        let mask_cumsum = mask_flat.cast(svod_dtype::DType::Int32)?.cumsum(0)?;
         // Realize to get output size (data-dependent shape)
         let n = mask_flat.numel()?;
         let mut count_t = mask_cumsum.try_shrink([((n - 1) as isize, n as isize)])?;
@@ -266,8 +266,8 @@ impl Tensor {
         }
 
         // Build gather indices: zeros.scatter(0, cumsum, 1).cumsum
-        let zeros = Tensor::full(&[count], ConstValue::Int(0), morok_dtype::DType::Int32)?;
-        let ones = Tensor::full(&[n], ConstValue::Int(1), morok_dtype::DType::Int32)?;
+        let zeros = Tensor::full(&[count], ConstValue::Int(0), svod_dtype::DType::Int32)?;
+        let ones = Tensor::full(&[n], ConstValue::Int(1), svod_dtype::DType::Int32)?;
         let idxs = zeros.scatter_reduce(0, &mask_cumsum, &ones, ScatterReduction::Sum, false)?.cumsum(0)?;
         x.gather(0, &idxs)
     }
@@ -301,9 +301,9 @@ impl Tensor {
 
         if orig_len <= 1 {
             let idx = Tensor::full(
-                &morok_ir::shape::to_vec_usize(&shape).unwrap(),
+                &svod_ir::shape::to_vec_usize(&shape).unwrap(),
                 ConstValue::Int(0),
-                morok_dtype::DType::Int32,
+                svod_dtype::DType::Int32,
             )?;
             return Ok((self.clone(), idx));
         }
@@ -366,7 +366,7 @@ impl Tensor {
         let flatten_end = dim + n_stages - 1;
         // Flatten dims [dim..dim+n_stages] back to one
         let cur_shape = x.shape()?;
-        let cur_dims = morok_ir::shape::to_vec_usize(&cur_shape).context(UOpSnafu)?;
+        let cur_dims = svod_ir::shape::to_vec_usize(&cur_shape).context(UOpSnafu)?;
         let mut flat_shape: Vec<isize> = Vec::new();
         for (i, &d) in cur_dims.iter().enumerate() {
             if i == dim {
@@ -381,7 +381,7 @@ impl Tensor {
 
         // Shrink to original size
         let x_shape = x.shape()?;
-        let x_dims = morok_ir::shape::to_vec_usize(&x_shape).context(UOpSnafu)?;
+        let x_dims = svod_ir::shape::to_vec_usize(&x_shape).context(UOpSnafu)?;
         let shrink_ranges: Vec<(isize, isize)> =
             x_dims.iter().enumerate().map(|(d, &s)| (0, if d == dim { orig_len } else { s } as isize)).collect();
         x = x.try_shrink(&shrink_ranges)?;
@@ -390,7 +390,7 @@ impl Tensor {
         // Create 2D tril mask first (tril operates on last 2 dims), then reshape
         // to broadcast shape [1, ..., orig_len, orig_len, 1, ..., 1]
         // Tinygrad: Tensor.ones(orig_len, orig_len).tril().reshape((None, None) + (1,)*(ndim-dim-1))
-        let tril_2d = Tensor::full(&[orig_len, orig_len], true, morok_dtype::DType::Bool)?.tril(0)?;
+        let tril_2d = Tensor::full(&[orig_len, orig_len], true, svod_dtype::DType::Bool)?.tril(0)?;
         let mut tril_reshape: Vec<isize> = vec![1; ndim + 1];
         tril_reshape[dim] = orig_len as isize;
         tril_reshape[dim + 1] = orig_len as isize;
@@ -415,7 +415,7 @@ impl Tensor {
         let mut idx_shape = vec![1isize; ndim + 1];
         idx_shape[dim] = orig_len as isize;
         let idx = (cond
-            .cast(morok_dtype::DType::Int32)?
+            .cast(svod_dtype::DType::Int32)?
             .try_mul(&Tensor::arange(0, Some(orig_len as i64), None)?.try_reshape(&idx_shape)?)?)
         .sum(dim as isize)?;
 
@@ -435,7 +435,7 @@ impl Tensor {
         let (x, idx) = self.sort(dim, largest)?;
         // Shrink to first k along dim
         let x_shape = x.shape()?;
-        let x_dims = morok_ir::shape::to_vec_usize(&x_shape).context(UOpSnafu)?;
+        let x_dims = svod_ir::shape::to_vec_usize(&x_shape).context(UOpSnafu)?;
         let shrink: Vec<(isize, isize)> =
             x_dims.iter().enumerate().map(|(d, &s)| (0, if d == norm_dim { k } else { s } as isize)).collect();
         Ok((x.try_shrink(&shrink)?, idx.try_shrink(&shrink)?))
@@ -450,7 +450,7 @@ impl Tensor {
     pub fn nonzero(&self) -> Result<Tensor> {
         let shape = self.shape()?;
         let ndim = shape.len();
-        let dims = morok_ir::shape::to_vec_usize(&shape).context(UOpSnafu)?;
+        let dims = svod_ir::shape::to_vec_usize(&shape).context(UOpSnafu)?;
         let numel: usize = dims.iter().product();
 
         let mask = self.try_ne(&Tensor::const_(ConstValue::Int(0), self.uop().dtype()))?.flatten()?;
@@ -479,7 +479,7 @@ impl Tensor {
     /// batch element `i` along `batch_axis`, leaving the rest unchanged.
     #[track_caller]
     pub fn reverse_sequence(&self, sequence_lens: &Tensor, time_axis: usize, batch_axis: usize) -> Result<Self> {
-        let dims = morok_ir::shape::to_vec_usize(&self.shape()?).context(UOpSnafu)?;
+        let dims = svod_ir::shape::to_vec_usize(&self.shape()?).context(UOpSnafu)?;
         let ndim = dims.len();
         let time_len = dims[time_axis];
 
@@ -496,7 +496,7 @@ impl Tensor {
         perm.swap(1, batch_pos);
         let perm_i: Vec<isize> = perm.iter().map(|&p| p as isize).collect();
         let work = self.try_permute(&perm_i)?;
-        let work_dims = morok_ir::shape::to_vec_usize(&work.shape()?).context(UOpSnafu)?;
+        let work_dims = svod_ir::shape::to_vec_usize(&work.shape()?).context(UOpSnafu)?;
 
         // t = arange(T) as [T, 1], seq_lens as [1, B]
         let idx_dt = sequence_lens.uop().dtype();
@@ -530,9 +530,9 @@ impl Tensor {
     /// Gather values using N-dimensional indices.
     pub fn gather_nd(&self, indices: &Tensor, batch_dims: usize) -> Result<Tensor> {
         let x_shape = self.shape()?;
-        let x_dims = morok_ir::shape::to_vec_usize(&x_shape).context(UOpSnafu)?;
+        let x_dims = svod_ir::shape::to_vec_usize(&x_shape).context(UOpSnafu)?;
         let idx_shape = indices.shape()?;
-        let idx_dims = morok_ir::shape::to_vec_usize(&idx_shape).context(UOpSnafu)?;
+        let idx_dims = svod_ir::shape::to_vec_usize(&idx_shape).context(UOpSnafu)?;
         let last_idx_dim = *idx_dims.last().unwrap();
 
         if batch_dims == 0 {
@@ -583,7 +583,7 @@ impl Tensor {
 
             let mut flat_idx = Tensor::const_(ConstValue::Int(0), DType::Int64);
             let idx_flat_shape = idx_flat.shape()?;
-            let idx_flat_dims = morok_ir::shape::to_vec_usize(&idx_flat_shape).context(UOpSnafu)?;
+            let idx_flat_dims = svod_ir::shape::to_vec_usize(&idx_flat_shape).context(UOpSnafu)?;
             for (k, stride) in strides.iter().enumerate() {
                 let mut ranges: Vec<(isize, isize)> = idx_flat_dims.iter().map(|&s| (0, s as isize)).collect();
                 ranges[idx_flat_dims.len() - 1] = (k as isize, k as isize + 1);
@@ -620,7 +620,7 @@ impl Tensor {
     /// Scatter updates into a tensor using N-dimensional indices.
     pub fn scatter_nd(&self, indices: &Tensor, updates: &Tensor, reduction: &str) -> Result<Tensor> {
         let x_shape = self.shape()?;
-        let x_dims = morok_ir::shape::to_vec_usize(&x_shape).context(UOpSnafu)?;
+        let x_dims = svod_ir::shape::to_vec_usize(&x_shape).context(UOpSnafu)?;
         let idx_shape = indices.shape()?;
         let last_idx_dim = idx_shape[idx_shape.len() - 1].as_const().unwrap();
         let strides: Vec<i64> =
@@ -680,8 +680,8 @@ impl Tensor {
         let data_shape = self.shape()?;
         let ndim = data_shape.len();
         let axis = Self::normalize_axis(axis, ndim)?;
-        let data_dims = morok_ir::shape::to_vec_usize(&data_shape).context(UOpSnafu)?;
-        let update_dims = morok_ir::shape::to_vec_usize(&update.shape()?).context(UOpSnafu)?;
+        let data_dims = svod_ir::shape::to_vec_usize(&data_shape).context(UOpSnafu)?;
+        let update_dims = svod_ir::shape::to_vec_usize(&update.shape()?).context(UOpSnafu)?;
 
         let batch_size = data_dims[0];
         let max_seq = data_dims[axis];

@@ -8,12 +8,12 @@ use std::sync::Arc;
 use half::bf16;
 use proptest::prelude::*;
 
-use morok_dtype::{DType, ScalarDType};
+use svod_dtype::{DType, ScalarDType};
 
 use crate::UOp;
 use crate::types::{BinaryOp, ConstValue, TernaryOp, UnaryOp};
 
-use morok_dtype::ScalarDType as Scalar;
+use svod_dtype::ScalarDType as Scalar;
 static NON_SUPPORTED: &[Scalar] = &[Scalar::FP8E4M3, Scalar::FP8E5M2, Scalar::Index, Scalar::Void];
 
 pub fn const_(dtype: ScalarDType) -> impl Strategy<Value = ConstValue> {
@@ -38,7 +38,7 @@ pub fn const_(dtype: ScalarDType) -> impl Strategy<Value = ConstValue> {
 
 /// Generate scalar DType suitable for arithmetic operations.
 pub fn arithmetic_sdtype() -> impl Strategy<Value = ScalarDType> {
-    morok_dtype::test::proptests::generators::scalar_generator()
+    svod_dtype::test::proptests::generators::scalar_generator()
         .prop_filter("only supported types", |sdtype| !NON_SUPPORTED.contains(sdtype))
 }
 
@@ -76,7 +76,7 @@ pub fn nonzero_int() -> impl Strategy<Value = ConstValue> {
 
 /// Generate integer DType (signed and unsigned).
 pub fn arb_int_dtype() -> impl Strategy<Value = DType> {
-    morok_dtype::test::proptests::generators::int_dtype().prop_map(Into::into)
+    svod_dtype::test::proptests::generators::int_dtype().prop_map(Into::into)
 }
 
 /// Generate float DType.
@@ -245,7 +245,7 @@ pub fn arb_arithmetic_tree_up_to(dtype: DType, max_depth: usize) -> impl Strateg
 /// Uses small values to avoid overflow when combined in arithmetic trees.
 /// Z3 uses unbounded integers, so we need to avoid values that would overflow.
 pub fn arb_bounded_const(dtype: DType) -> impl Strategy<Value = Arc<UOp>> {
-    use morok_dtype::ScalarDType::*;
+    use svod_dtype::ScalarDType::*;
     (-100i64..=100).prop_map(move |v| {
         let cv = match dtype.scalar().unwrap() {
             Int8 | Int16 | Int32 | Int64 | Index => ConstValue::Int(v),

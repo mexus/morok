@@ -1,7 +1,7 @@
-# morok-model
+# svod-model
 
 High-level inference for pretrained deep learning models on top of
-`morok-tensor`. Each model is a pure-Rust port of an upstream checkpoint,
+`svod-tensor`. Each model is a pure-Rust port of an upstream checkpoint,
 fetched from HuggingFace Hub at runtime and executed through JIT-compiled
 plans.
 
@@ -27,9 +27,9 @@ plans.
 ## Examples
 
 ```bash
-cargo run -p morok-model --release --example gigaam_infer -- audio.wav
-cargo run -p morok-model --release --example gigaam_rnnt_infer -- audio.wav
-cargo run -p morok-model --release --example test_vad -- audio.wav
-cargo run -p morok-model --release --example resnet_classify -- --hub --image dog.bin --side 224
-cargo run -p morok-model --release --example wespeaker_parity -- --hub --data reference.npz
+cargo run -p svod-model --release --example gigaam_infer -- audio.wav
+cargo run -p svod-model --release --example gigaam_rnnt_infer -- audio.wav
+cargo run -p svod-model --release --example test_vad -- audio.wav
+cargo run -p svod-model --release --example resnet_classify -- --hub --image dog.bin --side 224
+cargo run -p svod-model --release --example wespeaker_parity -- --hub --data reference.npz
 ```

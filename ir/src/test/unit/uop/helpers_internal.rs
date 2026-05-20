@@ -1,5 +1,5 @@
 use super::*;
-use morok_dtype::DType;
+use svod_dtype::DType;
 
 #[test]
 fn test_const_factor_constant() {

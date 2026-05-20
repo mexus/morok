@@ -1,20 +1,20 @@
 //! C renderer tests for code generation verification.
 
-use morok_dtype::{DType, DeviceSpec};
-use morok_ir::{AxisId, AxisType, ConstValue, ReduceOp, UOp, WmmaMetadata, WmmaUpcastAxes};
 use smallvec::SmallVec;
+use svod_dtype::{DType, DeviceSpec};
+use svod_ir::{AxisId, AxisType, ConstValue, ReduceOp, UOp, WmmaMetadata, WmmaUpcastAxes};
 
 use crate::c::render;
 
 fn render_linearized(root: &std::sync::Arc<UOp>, name: Option<&str>) -> crate::Result<crate::RenderedKernel> {
-    let linear = UOp::linear(morok_schedule::linearize_with_cfg(root.clone()).into());
+    let linear = UOp::linear(svod_schedule::linearize_with_cfg(root.clone()).into());
     render(&linear, name)
 }
 
 #[test]
 fn test_render_linear_input_succeeds() {
     let sink = UOp::sink(vec![UOp::native_const(1.0f32)]);
-    let linear = UOp::linear(morok_schedule::linearize_with_cfg(sink.clone()).into());
+    let linear = UOp::linear(svod_schedule::linearize_with_cfg(sink.clone()).into());
 
     let rendered = render(&linear, Some("test_linear")).expect("C codegen from LINEAR should succeed");
     assert!(rendered.code.contains("test_linear"));
@@ -94,7 +94,7 @@ fn test_reduce_empty_ranges() {
 
 #[test]
 fn test_multi_index_requires_linearization() {
-    let ptr_dtype = DType::Float32.ptr(None, morok_dtype::AddrSpace::Global);
+    let ptr_dtype = DType::Float32.ptr(None, svod_dtype::AddrSpace::Global);
     let buffer = UOp::param(0, 1024, ptr_dtype, None);
     let i = UOp::const_(DType::Index, ConstValue::Int(1));
     let j = UOp::const_(DType::Index, ConstValue::Int(2));
@@ -112,7 +112,7 @@ fn test_multi_index_requires_linearization() {
 
 #[test]
 fn test_gated_load_with_casted_index_emits_conditional() {
-    let ptr_dtype = DType::Float32.ptr(None, morok_dtype::AddrSpace::Global);
+    let ptr_dtype = DType::Float32.ptr(None, svod_dtype::AddrSpace::Global);
     let buffer = UOp::param(0, 1024, ptr_dtype.clone(), None);
     let out = UOp::param(1, 1024, ptr_dtype, None);
     let idx = UOp::const_(DType::Index, ConstValue::Int(1));
@@ -131,7 +131,7 @@ fn test_gated_load_with_casted_index_emits_conditional() {
 
 #[test]
 fn test_gated_load_requires_alt() {
-    let ptr_dtype = DType::Float32.ptr(None, morok_dtype::AddrSpace::Global);
+    let ptr_dtype = DType::Float32.ptr(None, svod_dtype::AddrSpace::Global);
     let buffer = UOp::param(0, 1024, ptr_dtype, None);
     let idx = UOp::const_(DType::Index, ConstValue::Int(1));
     let gate = UOp::const_(DType::Bool, ConstValue::Bool(true));
@@ -155,7 +155,7 @@ fn amx_f32_metadata() -> WmmaMetadata {
         dims: (16, 16, 1),
         dtype_in: DType::Float32,
         dtype_out: DType::Float32,
-        device: morok_ir::RendererDevice::AppleAmx,
+        device: svod_ir::RendererDevice::AppleAmx,
         threads: 1,
         upcast_axes: WmmaUpcastAxes { a: vec![(2, 256)], b: vec![(2, 256)], c: vec![(2, 256)] },
         reduce_axes: vec![],
@@ -170,7 +170,7 @@ fn amx_f16_to_f32_metadata() -> WmmaMetadata {
         dims: (16, 16, 1),
         dtype_in: DType::Float16,
         dtype_out: DType::Float32,
-        device: morok_ir::RendererDevice::AppleAmx,
+        device: svod_ir::RendererDevice::AppleAmx,
         threads: 1,
         upcast_axes: WmmaUpcastAxes { a: vec![(2, 256)], b: vec![(2, 256)], c: vec![(2, 256)] },
         reduce_axes: vec![],
@@ -185,7 +185,7 @@ fn amx_tile_grid_metadata() -> WmmaMetadata {
         dims: (16, 16, 1),
         dtype_in: DType::Float32,
         dtype_out: DType::Float32,
-        device: morok_ir::RendererDevice::AppleAmx,
+        device: svod_ir::RendererDevice::AppleAmx,
         threads: 1,
         upcast_axes: WmmaUpcastAxes { a: vec![(2, 256)], b: vec![(2, 256)], c: vec![(2, 256)] },
         reduce_axes: vec![],

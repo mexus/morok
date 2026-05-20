@@ -11,8 +11,8 @@
 
 use std::sync::Arc;
 
-use morok_ir::UOp;
-use morok_ir::types::ConstValue;
+use svod_ir::UOp;
+use svod_ir::types::ConstValue;
 
 use crate::TypedPatternMatcher;
 use crate::patterns;
@@ -81,7 +81,7 @@ fn vmax_as_i64(uop: &Arc<UOp>) -> Option<i64> {
 
 /// Emit `(x * m) >> s`, with signed adjustment if needed.
 /// Matches Tinygrad decompositions.py:291.
-fn emit_fast_div(x: &Arc<UOp>, m: i64, s: u32, is_unsigned: bool, dtype: &morok_ir::DType) -> Option<Arc<UOp>> {
+fn emit_fast_div(x: &Arc<UOp>, m: i64, s: u32, is_unsigned: bool, dtype: &svod_ir::DType) -> Option<Arc<UOp>> {
     let m_const = UOp::const_(dtype.clone(), ConstValue::Int(m));
     let s_const = UOp::const_(dtype.clone(), ConstValue::Int(s as i64));
     let mul_result = x.mul(&m_const);
@@ -98,8 +98,8 @@ fn emit_fast_div(x: &Arc<UOp>, m: i64, s: u32, is_unsigned: bool, dtype: &morok_
 }
 
 /// Check if m*vmin and m*vmax fit within a dtype's representable range.
-fn fits_in_dtype(m: i64, vmin: i64, vmax: i64, dtype: &morok_ir::DType) -> bool {
-    use morok_ir::uop::range_eval::dtype_bounds;
+fn fits_in_dtype(m: i64, vmin: i64, vmax: i64, dtype: &svod_ir::DType) -> bool {
+    use svod_ir::uop::range_eval::dtype_bounds;
     let (dt_min, dt_max) = dtype_bounds(dtype);
     let dt_min_i = match dt_min {
         ConstValue::Int(v) => v,
@@ -172,7 +172,7 @@ pub fn fast_division_patterns() -> TypedPatternMatcher {
 
             // 3. Widen to Int64 if current dtype is narrower (decompositions.py:297-299)
             if dtype.bytes() < 8 {
-                let wide = morok_ir::DType::Int64;
+                let wide = svod_ir::DType::Int64;
                 if fits_in_dtype(m, vmin, vmax, &wide) {
                     let wide_x = x.cast(wide.clone());
                     let result = emit_fast_div(&wide_x, m, s, is_unsigned, &wide)?;

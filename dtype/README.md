@@ -1,11 +1,11 @@
-# morok-dtype
+# svod-dtype
 
-Type system for the morok compiler: scalar types, vectors, pointers, and images.
+Type system for the svod compiler: scalar types, vectors, pointers, and images.
 
 ## Example
 
 ```rust
-use morok_dtype::{DType, AddrSpace};
+use svod_dtype::{DType, AddrSpace};
 
 let f32_type = DType::float32();
 let vec4 = f32_type.vec(4);
@@ -29,5 +29,5 @@ let ptr = f32_type.ptr(AddrSpace::Global);
 ## Testing
 
 ```bash
-cargo test -p morok-dtype
+cargo test -p svod-dtype
 ```

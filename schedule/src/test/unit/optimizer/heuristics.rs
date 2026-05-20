@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
-use morok_dtype::{DType, DeviceSpec, ImageKind};
-use morok_ir::{AxisId, AxisType, ReduceOp, UOp};
+use svod_dtype::{DType, DeviceSpec, ImageKind};
+use svod_ir::{AxisId, AxisType, ReduceOp, UOp};
 
 use crate::optimizer::config::{HeuristicsConfig, TcOpt};
 use crate::optimizer::heuristics::{apply_image_upcasts, apply_matvec_fast_path, try_tensor_cores};

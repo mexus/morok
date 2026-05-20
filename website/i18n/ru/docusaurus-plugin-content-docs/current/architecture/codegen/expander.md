@@ -34,9 +34,9 @@ LOAD(INDEX(ptr, idx, valid=valid), alt)
 
 **Примечание**: Этот паттерн срабатывает только когда альтернативное значение равно `0`. Трансформация включает сложный анализ клауз: обнаружение дубликатов, проверки зависимостей от RANGE, верификацию data-dependent загрузок.
 
-**Примечание**: Реализация Morok использует `gate=` вместо `valid=` (у структуры Index есть поле `gate`). Концепция идентична.
+**Примечание**: Реализация Svod использует `gate=` вместо `valid=` (у структуры Index есть поле `gate`). Концепция идентична.
 
-**Morok**: `pm_move_where_on_load()` в `symbolic/patterns.rs`
+**Svod**: `pm_move_where_on_load()` в `symbolic/patterns.rs`
 
 ---
 
@@ -54,7 +54,7 @@ LOAD(INDEX(ptr, idx, valid=valid), alt)
 
 **Паттерн**: `symbolic_simple() + pm_pre_expander + pm_group_for_reduce + expander`
 
-Примечание: Morok использует `symbolic_simple()` (не `sym`) на этой стадии, поскольку `symbolic()` уже отработал на стадии 4. Tinygrad использует `sym`, который включает дополнительные паттерны.
+Примечание: Svod использует `symbolic_simple()` (не `sym`) на этой стадии, поскольку `symbolic()` уже отработал на стадии 4. Tinygrad использует `sym`, который включает дополнительные паттерны.
 
 **Важно: приоритет паттернов**
 
@@ -143,7 +143,7 @@ REDUCE(src, [range(GROUP_REDUCE)])
 
 Это обеспечивает эффективную аккумуляцию через тензорные ядра с использованием shared-памяти.
 
-**Morok**: `expand.rs`
+**Svod**: `expand.rs`
 
 ---
 
@@ -171,4 +171,4 @@ REDUCE(src, [range(GROUP_REDUCE)])
 | Удаление обёртки CONTIGUOUS | Удаление оптимизационных хинтов перед кодогенерацией |
 | Удаление NOOP | Чистка нопов |
 
-**Morok**: `rangeify/patterns.rs`, `rangeify/transforms.rs`, `optimizer/mod.rs`
+**Svod**: `rangeify/patterns.rs`, `rangeify/transforms.rs`, `optimizer/mod.rs`

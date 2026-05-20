@@ -4,7 +4,7 @@ sidebar_label: 代数化简
 
 # 代数化简模式
 
-Morok 的符号化简器使用 `schedule/src/symbolic/patterns.rs` 中定义的 140+ 个代数模式重写 UOp 计算图。这些模式在流水线的多个阶段触发：
+Svod 的符号化简器使用 `schedule/src/symbolic/patterns.rs` 中定义的 140+ 个代数模式重写 UOp 计算图。这些模式在流水线的多个阶段触发：
 
 | 位置 | 匹配器 | 上下文 |
 |-------|---------|---------|
@@ -242,7 +242,7 @@ VConst 折叠覆盖 11 个二元操作（不含 Pow 和 Fdiv）以及全部 7 �
 |---------|--------|-------|
 | `SUB(a, SUB(b, x))` | `ADD(x, SUB(a, b))` | 暴露内部变量 |
 
-Morok 保留 `SUB` 作为一等 IR 操作（不同于 Tinygrad 将 `a-b` 规范化为 `ADD(a, NEG(b))`）。此模式确保嵌套 `SUB` 不会阻断进一步化简。
+Svod 保留 `SUB` 作为一等 IR 操作（不同于 Tinygrad 将 `a-b` 规范化为 `ADD(a, NEG(b))`）。此模式确保嵌套 `SUB` 不会阻断进一步化简。
 
 ---
 
@@ -309,7 +309,7 @@ Morok 保留 `SUB` 作为一等 IR 操作（不同于 Tinygrad 将 `a-b` 规范�
 | `MAX(x, y)` | `x` | 当 `x.vmin >= y.vmax`（边界证明占优） |
 | `MAX(x, y)` | `y` | 当 `y.vmin >= x.vmax` |
 
-使用 `VminVmaxProperty` 进行范围分析。没有单独的 `MIN` 模式——Morok 在这些模式触发之前将 `MIN(a,b)` 降级为 `NEG(MAX(NEG(a), NEG(b)))`。
+使用 `VminVmaxProperty` 进行范围分析。没有单独的 `MIN` 模式——Svod 在这些模式触发之前将 `MIN(a,b)` 降级为 `NEG(MAX(NEG(a), NEG(b)))`。
 
 ---
 
@@ -344,7 +344,7 @@ Tinygrad 有相同的守卫：`symbolic.py:201-202`。
 
 ## 13. Invalid 传播
 
-Invalid 是 Morok 对填充操作创建的越界张量区域的哨兵值。这些模式必须在恒等模式（如 `x*0=0`）**之前**运行，否则有效性标记会被破坏。
+Invalid 是 Svod 对填充操作创建的越界张量区域的哨兵值。这些模式必须在恒等模式（如 `x*0=0`）**之前**运行，否则有效性标记会被破坏。
 
 ### 模式优先级示例
 

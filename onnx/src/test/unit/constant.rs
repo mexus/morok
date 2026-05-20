@@ -1,6 +1,6 @@
 use crate::test::helpers::*;
 
-morok_tensor::codegen_tests! {
+svod_tensor::codegen_tests! {
     fn test_constant_value_float(config) {
         let registry = OpRegistry::new();
         let node = NodeProto {

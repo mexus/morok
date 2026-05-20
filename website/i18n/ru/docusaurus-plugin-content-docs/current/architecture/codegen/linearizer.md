@@ -48,7 +48,7 @@ After:   ADD(GEP(arr_a, idx), GEP(arr_b, idx))
 
 Большинству бэкендов (CPU, GPU) это не нужно. Только специализированное железо использует эту стадию.
 
-**Примечание**: Morok пока не реализует эту стадию. Трейт `Renderer` имеет методы `render()`, `backend_name()` и `decompositor()`, но поддержки `pre_matcher` пока нет. Это будущее расширение для DSP и других специализированных бэкендов.
+**Примечание**: Svod пока не реализует эту стадию. Трейт `Renderer` имеет методы `render()`, `backend_name()` и `decompositor()`, но поддержки `pre_matcher` пока нет. Это будущее расширение для DSP и других специализированных бэкендов.
 
 ---
 
@@ -82,7 +82,7 @@ After:   ADD(GEP(arr_a, idx), GEP(arr_b, idx))
 
 Аппроксимации трансцендентных функций (SIN, EXP, LOG и т.д.) реализованы через путь `decompositor()` (см. `ir/src/decompositions/transcendentals.rs`).
 
-**Morok**: `optimizer/mod.rs`
+**Svod**: `optimizer/mod.rs`
 
 ---
 
@@ -127,7 +127,7 @@ END(END(op, range_a), range_b)
 
 **extra_matcher**: Каждый бэкенд может добавить свои финальные паттерны. Это позволяет выполнять аппаратно-специфичные оптимизации, не трогая общий пайплайн.
 
-**Morok**: `devectorize.rs`, `linearize/mod.rs`, `optimizer/mod.rs`
+**Svod**: `devectorize.rs`, `linearize/mod.rs`, `optimizer/mod.rs`
 
 ---
 
@@ -164,7 +164,7 @@ RANGE_B waits for RANGE_A to complete
 
 Bottom-up обход гарантирует, что зависимости корректно распространяются от листьев к корням.
 
-**Morok**: `schedule/src/linearize/mod.rs`
+**Svod**: `schedule/src/linearize/mod.rs`
 
 ---
 
@@ -188,7 +188,7 @@ Bottom-up обход гарантирует, что зависимости ко�
 | DEFINE_VAR | -19 | Переменные должны быть определены первыми |
 | DEFINE_LOCAL | -18 | Аллокации первыми |
 | DEFINE_REG | -17 | Регистры первыми |
-| CONST | -10 | Константы раньше для переиспользования (расширение Morok; в Tinygrad по умолчанию 0) |
+| CONST | -10 | Константы раньше для переиспользования (расширение Svod; в Tinygrad по умолчанию 0) |
 | LOAD | -1 | Загрузки до использования |
 | END | -5 | Закрывает RANGE |
 | STORE | +1 | Записи после вычислений |
@@ -208,7 +208,7 @@ run_count = prod(int(r.vmax) + 1 for r in u.ranges)
 ```
 Это вычисляет, сколько раз операция выполняется, исходя из охватывающих RANGE.
 
-**Morok**: `schedule/src/linearize/mod.rs`
+**Svod**: `schedule/src/linearize/mod.rs`
 
 ---
 
@@ -236,4 +236,4 @@ STORE(INDEX(ptr, idx, valid=cond), value)
 
 На этом этапе список инструкций готов к кодогенерации.
 
-**Morok**: `schedule/src/linearize/mod.rs` (путь predicated stores)
+**Svod**: `schedule/src/linearize/mod.rs` (путь predicated stores)

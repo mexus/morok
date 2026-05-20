@@ -32,7 +32,7 @@ pub mod split_patterns;
 pub mod split_reduceop;
 pub mod transform;
 
-use morok_ir::UOp;
+use svod_ir::UOp;
 
 use crate::rangeify::RangeifyContext;
 use crate::rangeify::patterns as rangeify_patterns;

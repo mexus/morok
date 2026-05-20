@@ -1,16 +1,16 @@
 ---
 name: patterns
-description: Reference for Morok's patterns! DSL and rewrite engine API. Use when writing optimization patterns, debugging pattern matching, or understanding rewrite limitations.
+description: Reference for Svod's patterns! DSL and rewrite engine API. Use when writing optimization patterns, debugging pattern matching, or understanding rewrite limitations.
 ---
 
-# Morok Patterns! DSL and Rewrite Engine
+# Svod Patterns! DSL and Rewrite Engine
 
 ## Pattern Syntax Quick Reference
 
 ### Basic Pattern Structure
 
 ```rust
-use morok_schedule::patterns;
+use svod_schedule::patterns;
 
 let matcher = patterns! {
     // Infallible rewrite (always returns Arc<UOp>)
@@ -260,7 +260,7 @@ The rewrite engine uses a 3-stage algorithm matching Tinygrad's `unified_rewrite
 ### Creating Pattern Matchers
 
 ```rust
-use morok_schedule::patterns;
+use svod_schedule::patterns;
 
 // Simple matcher
 let matcher = patterns! {
@@ -323,7 +323,7 @@ let pass = matcher_a().with_context::<SharedCtx>()
 Patterns are applied in Stage 1, after children have been processed. Use this when patterns need to see the already-optimized children.
 
 ```rust
-use morok_schedule::rewrite::graph_rewrite;
+use svod_schedule::rewrite::graph_rewrite;
 
 let result = graph_rewrite(&matcher, root, &mut ());
 
@@ -341,7 +341,7 @@ let result = graph_rewrite(&matcher, root, &mut ctx);
 Patterns are applied in Stage 0, before children are processed. Use this when patterns need to see the original graph structure.
 
 ```rust
-use morok_schedule::rewrite::graph_rewrite_bottom_up;
+use svod_schedule::rewrite::graph_rewrite_bottom_up;
 
 let result = graph_rewrite_bottom_up(&matcher, root, &mut ctx);
 ```
@@ -356,7 +356,7 @@ let result = graph_rewrite_bottom_up(&matcher, root, &mut ctx);
 Use both `pm` (Stage 1) and `bpm` (Stage 0) patterns:
 
 ```rust
-use morok_schedule::rewrite::graph_rewrite_with_bpm;
+use svod_schedule::rewrite::graph_rewrite_with_bpm;
 
 // bpm patterns see ORIGINAL children (Stage 0)
 // pm patterns see OPTIMIZED children (Stage 1)
@@ -368,7 +368,7 @@ let result = graph_rewrite_with_bpm(&pm, &bpm, root, &mut ctx);
 Returns both result and transformation map:
 
 ```rust
-use morok_schedule::rewrite::graph_rewrite_with_map;
+use svod_schedule::rewrite::graph_rewrite_with_map;
 
 let output = graph_rewrite_with_map(&matcher, root, &mut ctx);
 // output.root - the rewritten root
@@ -388,13 +388,13 @@ let output = graph_rewrite_with_map(&matcher, root, &mut ctx);
 ### Running Optimization Passes
 
 ```rust
-use morok_schedule::symbolic::patterns::symbolic;
+use svod_schedule::symbolic::patterns::symbolic;
 
 // Symbolic simplification (17+ pattern categories)
 let optimized = graph_rewrite(&symbolic(), graph, &mut ());
 
 // Rangeify transformations
-use morok_schedule::rangeify::patterns::{
+use svod_schedule::rangeify::patterns::{
     apply_rangeify_patterns, buffer_folding, dead_axis_removal,
     movement_op_patterns
 };
@@ -442,7 +442,7 @@ let result = graph_rewrite(&full_pipeline, graph, &mut ctx);
 
 The rewrite engine semantics match Tinygrad's `unified_rewrite` (ops.py:1177-1234):
 
-| Tinygrad | Morok | Patterns See |
+| Tinygrad | Svod | Patterns See |
 |----------|-------|--------------|
 | `graph_rewrite(pm, bottom_up=False)` | `graph_rewrite(pm)` | OPTIMIZED children |
 | `graph_rewrite(pm, bottom_up=True)` | `graph_rewrite_bottom_up(bpm)` | ORIGINAL children |
@@ -462,8 +462,8 @@ The rewrite engine semantics match Tinygrad's `unified_rewrite` (ops.py:1177-123
 ### Debugging
 
 ```bash
-RUST_LOG=morok_ir::pattern=debug cargo test test_name        # Pattern matching details
-RUST_LOG=morok_ir::pattern::simplified=trace cargo test      # Which patterns are tried
+RUST_LOG=svod_ir::pattern=debug cargo test test_name        # Pattern matching details
+RUST_LOG=svod_ir::pattern::simplified=trace cargo test      # Which patterns are tried
 ```
 
 ## Key Files

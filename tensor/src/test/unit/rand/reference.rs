@@ -7,7 +7,7 @@
 //! uv run --with=numpy --with=jax python3 -c "..."
 //! ```
 
-use morok_dtype::{DType, ScalarDType};
+use svod_dtype::{DType, ScalarDType};
 
 use crate::Tensor;
 use crate::rand::manual_seed;

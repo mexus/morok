@@ -1,7 +1,7 @@
 //! Multi-dtype `Tensor::rand` tests — range/finite invariants plus
 //! statistical sanity for f16, bf16, f64.
 
-use morok_dtype::{DType, DeviceSpec};
+use svod_dtype::{DType, DeviceSpec};
 
 use crate::Tensor;
 use crate::rand::manual_seed;

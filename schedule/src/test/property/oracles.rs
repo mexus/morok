@@ -7,16 +7,16 @@ use std::sync::Arc;
 
 use proptest::prelude::*;
 
-use morok_dtype::DType;
-use morok_ir::UOp;
-use morok_ir::types::ConstValue;
+use svod_dtype::DType;
+use svod_ir::UOp;
+use svod_ir::types::ConstValue;
 
 use crate::rewrite::graph_rewrite;
 use crate::symbolic::symbolic_simple;
 use crate::z3::verify_equivalence;
 
 // Import generators from ir crate
-use morok_ir::test::property::generators::*;
+use svod_ir::test::property::generators::*;
 
 // ============================================================================
 // Multi-Oracle Testing
@@ -48,8 +48,8 @@ proptest! {
 
                 // Check for zero constant (Int(0) or UInt(0) both represent zero)
                 let is_zero = |cv: &ConstValue| matches!(cv, ConstValue::Int(0) | ConstValue::UInt(0));
-                let is_constant_zero = matches!(simplified.op(), morok_ir::Op::Const(cv) if is_zero(&cv.0))
-                    && matches!(expected.op(), morok_ir::Op::Const(cv) if is_zero(&cv.0));
+                let is_constant_zero = matches!(simplified.op(), svod_ir::Op::Const(cv) if is_zero(&cv.0))
+                    && matches!(expected.op(), svod_ir::Op::Const(cv) if is_zero(&cv.0));
 
                 prop_assert!(is_expected || is_constant_zero,
                     "Simplified result should match expected. Got: {:?}, Expected: {:?}",
@@ -79,7 +79,7 @@ proptest! {
     fn z3_verify_identity_add_zero(x in arb_var_uop(DType::Int32)) {
         let zero = UOp::native_const(0i32);
         let expr = UOp::new(
-            morok_ir::Op::Binary(morok_ir::types::BinaryOp::Add, Arc::clone(&x), zero),
+            svod_ir::Op::Binary(svod_ir::types::BinaryOp::Add, Arc::clone(&x), zero),
             DType::Int32,
         );
 
@@ -118,7 +118,7 @@ proptest! {
         let x = UOp::var(&name, DType::Int32, min_val, min_val + range_size);
 
         let expr = UOp::new(
-            morok_ir::Op::Binary(morok_ir::types::BinaryOp::Idiv, Arc::clone(&x), Arc::clone(&x)),
+            svod_ir::Op::Binary(svod_ir::types::BinaryOp::Idiv, Arc::clone(&x), Arc::clone(&x)),
             DType::Int32,
         );
 
@@ -127,7 +127,7 @@ proptest! {
 
         // Should simplify to 1
         match simplified.op() {
-            morok_ir::Op::Const(cv) => {
+            svod_ir::Op::Const(cv) => {
                 prop_assert_eq!(cv.0, ConstValue::Int(1));
             }
             _ => prop_assert!(false, "x / x should simplify to 1"),
@@ -232,30 +232,30 @@ fn rebuild_with_dtype(kpg: &KnownPropertyGraph, dtype: DType) -> Arc<UOp> {
         KnownPropertyGraph::AddZero { .. } => {
             let x = UOp::var("x", dtype.clone(), 0, 100);
             let zero = UOp::native_const(0i64);
-            UOp::new(morok_ir::Op::Binary(morok_ir::types::BinaryOp::Add, x, zero), dtype)
+            UOp::new(svod_ir::Op::Binary(svod_ir::types::BinaryOp::Add, x, zero), dtype)
         }
         KnownPropertyGraph::MulOne { .. } => {
             let x = UOp::var("x", dtype.clone(), 0, 100);
             let one = UOp::native_const(1i64);
-            UOp::new(morok_ir::Op::Binary(morok_ir::types::BinaryOp::Mul, x, one), dtype)
+            UOp::new(svod_ir::Op::Binary(svod_ir::types::BinaryOp::Mul, x, one), dtype)
         }
         KnownPropertyGraph::SubZero { .. } => {
             let x = UOp::var("x", dtype.clone(), 0, 100);
             let zero = UOp::native_const(0i64);
-            UOp::new(morok_ir::Op::Binary(morok_ir::types::BinaryOp::Sub, x, zero), dtype)
+            UOp::new(svod_ir::Op::Binary(svod_ir::types::BinaryOp::Sub, x, zero), dtype)
         }
         KnownPropertyGraph::MulZero { .. } => {
             let x = UOp::var("x", dtype.clone(), 0, 100);
             let zero = UOp::native_const(0i64);
-            UOp::new(morok_ir::Op::Binary(morok_ir::types::BinaryOp::Mul, x, zero), dtype)
+            UOp::new(svod_ir::Op::Binary(svod_ir::types::BinaryOp::Mul, x, zero), dtype)
         }
         KnownPropertyGraph::SubSelf { .. } => {
             let x = UOp::var("x", dtype.clone(), 0, 100);
-            UOp::new(morok_ir::Op::Binary(morok_ir::types::BinaryOp::Sub, Arc::clone(&x), x), dtype)
+            UOp::new(svod_ir::Op::Binary(svod_ir::types::BinaryOp::Sub, Arc::clone(&x), x), dtype)
         }
         KnownPropertyGraph::AddSelf { .. } => {
             let x = UOp::var("x", dtype.clone(), 0, 100);
-            UOp::new(morok_ir::Op::Binary(morok_ir::types::BinaryOp::Add, Arc::clone(&x), x), dtype)
+            UOp::new(svod_ir::Op::Binary(svod_ir::types::BinaryOp::Add, Arc::clone(&x), x), dtype)
         }
     }
 }
@@ -264,7 +264,7 @@ fn rebuild_with_dtype(kpg: &KnownPropertyGraph, dtype: DType) -> Arc<UOp> {
 ///
 /// Returns: (op_type, is_const, is_var, child_count)
 fn optimization_form(uop: &Arc<UOp>) -> (String, bool, bool, usize) {
-    use morok_ir::Op;
+    use svod_ir::Op;
 
     match uop.op() {
         Op::Const(_) => ("const".to_string(), true, false, 0),

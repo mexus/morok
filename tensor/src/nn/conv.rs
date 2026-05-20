@@ -2,7 +2,7 @@
 
 use bon::bon;
 
-use morok_ir::SInt;
+use svod_ir::SInt;
 
 use crate::Tensor;
 use crate::reduce::AxisSpec;
@@ -22,7 +22,7 @@ impl Tensor {
     /// Basic 2D convolution with uniform data:
     ///
     /// ```
-    /// # use morok_tensor::Tensor;
+    /// # use svod_tensor::Tensor;
     /// # use ndarray::Array4;
     /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 5, 5), 1.0f32));
     /// let w = Tensor::from_ndarray(&Array4::from_elem((1, 1, 3, 3), 1.0f32));
@@ -35,7 +35,7 @@ impl Tensor {
     /// With stride:
     ///
     /// ```
-    /// # use morok_tensor::Tensor;
+    /// # use svod_tensor::Tensor;
     /// # use ndarray::Array4;
     /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 5, 5), 1.0f32));
     /// let w = Tensor::from_ndarray(&Array4::from_elem((1, 1, 3, 3), 1.0f32));
@@ -49,7 +49,7 @@ impl Tensor {
     /// With padding:
     ///
     /// ```
-    /// # use morok_tensor::Tensor;
+    /// # use svod_tensor::Tensor;
     /// # use ndarray::Array4;
     /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 3, 3), 1.0f32));
     /// let w = Tensor::from_ndarray(&Array4::from_elem((1, 1, 3, 3), 1.0f32));
@@ -67,7 +67,7 @@ impl Tensor {
     /// With bias:
     ///
     /// ```
-    /// # use morok_tensor::Tensor;
+    /// # use svod_tensor::Tensor;
     /// # use ndarray::Array4;
     /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 3, 3), 1.0f32));
     /// let w = Tensor::from_ndarray(&Array4::from_elem((1, 1, 3, 3), 1.0f32));
@@ -86,7 +86,7 @@ impl Tensor {
         stride: Option<&[usize]>,
         dilation: Option<&[usize]>,
         padding: Option<&[(isize, isize)]>,
-        acc_dtype: Option<morok_dtype::DType>,
+        acc_dtype: Option<svod_dtype::DType>,
     ) -> Result<Tensor> {
         let x_shape = self.shape()?;
         let w_shape = weight.shape()?;
@@ -197,7 +197,7 @@ impl Tensor {
     /// Basic transposed convolution (upsampling):
     ///
     /// ```
-    /// # use morok_tensor::Tensor;
+    /// # use svod_tensor::Tensor;
     /// # use ndarray::Array4;
     /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 2, 2), 1.0f32));
     /// let w = Tensor::from_ndarray(&Array4::from_elem((1, 1, 3, 3), 1.0f32));
@@ -212,7 +212,7 @@ impl Tensor {
     /// With stride (stronger upsampling):
     ///
     /// ```
-    /// # use morok_tensor::Tensor;
+    /// # use svod_tensor::Tensor;
     /// # use ndarray::Array4;
     /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 2, 2), 1.0f32));
     /// let w = Tensor::from_ndarray(&Array4::from_elem((1, 1, 3, 3), 1.0f32));
@@ -225,7 +225,7 @@ impl Tensor {
     /// With padding and output padding:
     ///
     /// ```
-    /// # use morok_tensor::Tensor;
+    /// # use svod_tensor::Tensor;
     /// # use ndarray::Array4;
     /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 2, 2), 1.0f32));
     /// let w = Tensor::from_ndarray(&Array4::from_elem((1, 1, 3, 3), 1.0f32));

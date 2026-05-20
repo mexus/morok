@@ -4,33 +4,33 @@ sidebar_label: ONNX Inference
 
 # ONNX Model Inference
 
-Morok's ONNX importer is the recommended way to run model inference. It loads standard `.onnx` files, decomposes operators into Morok's lazy tensor operations, and compiles them through the full optimization pipeline — no C++ runtime required.
+Svod's ONNX importer is the recommended way to run model inference. It loads standard `.onnx` files, decomposes operators into Svod's lazy tensor operations, and compiles them through the full optimization pipeline — no C++ runtime required.
 
 **Current status:**
 
 | Capability | Status |
 |------------|--------|
 | Forward inference | Supported |
-| 162 / 200 ONNX operators | [Parity details](https://github.com/npatsakula/morok/blob/main/onnx/PARITY.md) |
+| 162 / 200 ONNX operators | [Parity details](https://github.com/npatsakula/svod/blob/main/onnx/PARITY.md) |
 | CNN architectures (ResNet, DenseNet, VGG, ...) | 9 models validated |
 | Microsoft extensions (Attention, RotaryEmbedding) | Supported |
 | Dynamic batch size | Supported (Variable API) |
 | Training / backward pass | Not supported |
 
-**How does Morok compare to other Rust ML frameworks?**
+**How does Svod compare to other Rust ML frameworks?**
 
-Among pure-Rust frameworks, Morok offers the broadest ONNX operator coverage — 162 operators with 1361 passing conformance tests across dual backends (Clang + LLVM). `candle` and `burn` each support fewer operators and lack conformance test suites of comparable scope. That said, if you need maximum compatibility with production ONNX models, use `ort` — a Rust wrapper around the C++ ONNX Runtime — which covers the full ONNX spec.
+Among pure-Rust frameworks, Svod offers the broadest ONNX operator coverage — 162 operators with 1361 passing conformance tests across dual backends (Clang + LLVM). `candle` and `burn` each support fewer operators and lack conformance test suites of comparable scope. That said, if you need maximum compatibility with production ONNX models, use `ort` — a Rust wrapper around the C++ ONNX Runtime — which covers the full ONNX spec.
 
 ---
 
 ## Quick Start
 
-Add `morok-onnx` and `morok-tensor` to your `Cargo.toml`:
+Add `svod-onnx` and `svod-tensor` to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-morok-onnx = { git = "https://github.com/npatsakula/morok" }
-morok-tensor = { git = "https://github.com/npatsakula/morok" }
+svod-onnx = { git = "https://github.com/npatsakula/svod" }
+svod-tensor = { git = "https://github.com/npatsakula/svod" }
 ```
 
 ### Simple: All-Initializer Models
@@ -38,8 +38,8 @@ morok-tensor = { git = "https://github.com/npatsakula/morok" }
 For models where all inputs are baked into the file (no runtime inputs):
 
 ```rust
-use morok_onnx::{OnnxImporter, OnnxModel};
-use morok_tensor::Tensor;
+use svod_onnx::{OnnxImporter, OnnxModel};
+use svod_tensor::Tensor;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut importer = OnnxImporter::new();
@@ -61,8 +61,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 Most models need runtime data (images, tokens, audio). Destructure the `OnnxModel` and use `remove()` to take ownership of input tensors:
 
 ```rust
-use morok_onnx::{OnnxImporter, OnnxModel};
-use morok_tensor::Tensor;
+use svod_onnx::{OnnxImporter, OnnxModel};
+use svod_tensor::Tensor;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut importer = OnnxImporter::new();
@@ -98,7 +98,7 @@ For advanced use cases (inspecting graph structure before import), `import_model
 
 ### Operator Decomposition
 
-Every ONNX operator is decomposed into Morok Tensor operations. The complexity varies:
+Every ONNX operator is decomposed into Svod Tensor operations. The complexity varies:
 
 **Direct mappings** — about 60 operators map 1:1 to a tensor method:
 
@@ -205,13 +205,13 @@ Standard ONNX transformer operators (`Attention` from the ai.onnx domain) are al
 
 ### Semantic If: Both Branches Always Execute
 
-ONNX's `If` operator has data-dependent control flow — the condition determines which branch runs. Morok's lazy evaluation model is fundamentally incompatible with this: since nothing executes at trace time, the condition value is unknown.
+ONNX's `If` operator has data-dependent control flow — the condition determines which branch runs. Svod's lazy evaluation model is fundamentally incompatible with this: since nothing executes at trace time, the condition value is unknown.
 
-**Morok's solution:** Trace *both* branches, then merge results with `Tensor::where_()`:
+**Svod's solution:** Trace *both* branches, then merge results with `Tensor::where_()`:
 
 ```text
 ONNX:    if condition { then_branch } else { else_branch }
-Morok:   then_result.where_(&condition, &else_result)
+Svod:   then_result.where_(&condition, &else_result)
 ```
 
 This enables **trace-once, run-many** — the compiled graph handles any condition value at runtime. But it has a hard constraint: **both branches must produce identical output shapes and dtypes.** Models with shape-polymorphic branches (where the then-branch produces `[3, 4]` and the else-branch produces `[5, 6]`) cannot be traced.
@@ -269,7 +269,7 @@ The importer is inference-only. There is no backward pass, gradient computation,
 | Category | Examples | Why |
 |----------|----------|-----|
 | Quantization | DequantizeLinear, QuantizeLinear | Requires quantized dtype support in IR |
-| Sequence ops | SequenceConstruct, SequenceAt | Non-tensor types not in Morok's type system |
+| Sequence ops | SequenceConstruct, SequenceAt | Non-tensor types not in Svod's type system |
 | Random | RandomNormal, RandomUniform | Stateful RNG not yet implemented |
 | Signal processing | DFT, STFT, MelWeightMatrix | Low priority; niche use cases |
 | Text | StringNormalizer, TfIdfVectorizer | String types not supported |
@@ -285,7 +285,7 @@ For models using these operators, consider `ort` (ONNX Runtime wrapper) which co
 Set the trace log level to dump intermediate outputs:
 
 ```bash
-RUST_LOG=morok_onnx::importer=trace cargo run
+RUST_LOG=svod_onnx::importer=trace cargo run
 ```
 
 This realizes each node's output individually and prints the first 5 values — useful for numerical bisection when a model produces wrong results. Note that this breaks kernel fusion (each node runs separately), so it's purely a debugging tool.
@@ -315,7 +315,7 @@ println!("Variables: {:?}", model.variables.keys().collect::<Vec<_>>());
 | **Entry point** | `OnnxImporter::new()` |
 | **Simple import** | `importer.import("model.onnx", &[])?` |
 | **Dynamic dims** | `importer.import(path, &[("batch", 4)])?` |
-| **Operators** | 162 / 200 ([full parity table](https://github.com/npatsakula/morok/blob/main/onnx/PARITY.md)) |
+| **Operators** | 162 / 200 ([full parity table](https://github.com/npatsakula/svod/blob/main/onnx/PARITY.md)) |
 | **Validated models** | ResNet50, DenseNet121, VGG19, Inception, AlexNet, ShuffleNet, SqueezeNet, ZFNet |
 | **Backends** | Clang + LLVM (identical results) |
 | **Extensions** | com.microsoft Attention, RotaryEmbedding, SkipLayerNorm, EmbedLayerNorm |

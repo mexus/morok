@@ -16,7 +16,7 @@ These patterns run at multiple stages of the [codegen pipeline](../codegen/overv
 - **Stage 15** (index dtype lowering via `pm_lower_index_dtype`)
 - **Stage 16** (post-index symbolic)
 
-Morok source: `schedule/src/symbolic/patterns.rs`, `schedule/src/symbolic/index_lowering.rs`
+Svod source: `schedule/src/symbolic/patterns.rs`, `schedule/src/symbolic/index_lowering.rs`
 
 Tinygrad source: `tinygrad/uop/divandmod.py`, `tinygrad/uop/symbolic.py`
 
@@ -185,7 +185,7 @@ Recursive decomposition for constant divisors. Finds the smallest factor shared 
 
 **Example**: `(6*a + 4*b) // 12` → `((6*a + 4*b) // 2) // 6` → `(3*a + 2*b) // 6` → `(3*a + 2*b) // 6` (then rule 7 finishes).
 
-Tinygrad: `divandmod.py:62-67`. Morok: `nest_div_by_smallest_factor` in `fold_divmod_general`.
+Tinygrad: `divandmod.py:62-67`. Svod: `nest_div_by_smallest_factor` in `fold_divmod_general`.
 
 :::caution
 Rules 5-8 require non-negative numerators (`x_min >= 0`). Floor division with negative operands has different rounding semantics (toward negative infinity in Python/Tinygrad, toward zero in hardware). The implementation returns `None` for negative ranges, falling through to let later passes handle the expression.
@@ -216,7 +216,7 @@ The coefficient reduction pattern converts `(r*8 + v) % 7` -> `(r*1 + v) % 7 = (
 
 ## 5. Index Dtype Lowering (3-Phase Cascade)
 
-Tinygrad: `ops.py:1291-1313`. Morok: `schedule/src/symbolic/index_lowering.rs`.
+Tinygrad: `ops.py:1291-1313`. Svod: `schedule/src/symbolic/index_lowering.rs`.
 
 The abstract `Index` type carries no width -- it represents "whatever integer width is needed for this index." The lowering pass converts `Index` to concrete `i32` or `i64` based on value bounds.
 

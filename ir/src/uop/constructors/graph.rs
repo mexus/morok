@@ -9,8 +9,8 @@
 
 use std::sync::Arc;
 
-use morok_dtype::{AddrSpace, DType};
 use smallvec::SmallVec;
+use svod_dtype::{AddrSpace, DType};
 
 use crate::op::Op;
 use crate::types::{CallInfo, CustomFunctionKind, KernelInfo};

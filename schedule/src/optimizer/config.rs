@@ -31,10 +31,10 @@ impl OptStrategy {
     ///
     /// # Environment Variables
     ///
-    /// * `MOROK_NOOPT=1` - Disable all optimizations
+    /// * `SVOD_NOOPT=1` - Disable all optimizations
     /// * `BEAM=N` - Use beam search with width N
     pub fn from_env() -> Self {
-        if std::env::var("MOROK_NOOPT").is_ok() {
+        if std::env::var("SVOD_NOOPT").is_ok() {
             return Self::None;
         }
 
@@ -287,27 +287,27 @@ impl HeuristicsConfig {
     ///
     /// # Environment Variables
     ///
-    /// * `MOROK_THREADS` - Maximum thread count (default: available_parallelism)
-    /// * `MOROK_MV` - Enable/disable matvec fast-path (`0` disables)
-    /// * `MOROK_MV_BLOCKSIZE` / `MV_BLOCKSIZE` - Matvec local block size
-    /// * `MOROK_MV_THREADS_PER_ROW` / `MV_THREADS_PER_ROW` - Matvec reduce split
-    /// * `MOROK_MV_ROWS_PER_THREAD` / `MV_ROWS_PER_THREAD` - Matvec output split
-    /// * `MOROK_K_VECTORIZE` - Enable K-axis vectorization (default: disabled)
-    /// * `MOROK_NO_OUTPUT_UPCAST` - Disable output dimension upcasting (default: enabled)
+    /// * `SVOD_THREADS` - Maximum thread count (default: available_parallelism)
+    /// * `SVOD_MV` - Enable/disable matvec fast-path (`0` disables)
+    /// * `SVOD_MV_BLOCKSIZE` / `MV_BLOCKSIZE` - Matvec local block size
+    /// * `SVOD_MV_THREADS_PER_ROW` / `MV_THREADS_PER_ROW` - Matvec reduce split
+    /// * `SVOD_MV_ROWS_PER_THREAD` / `MV_ROWS_PER_THREAD` - Matvec output split
+    /// * `SVOD_K_VECTORIZE` - Enable K-axis vectorization (default: disabled)
+    /// * `SVOD_NO_OUTPUT_UPCAST` - Disable output dimension upcasting (default: enabled)
     pub fn from_env() -> Self {
         let parse_usize = |keys: &[&str], default: usize| {
             keys.iter().find_map(|k| std::env::var(k).ok().and_then(|v| v.parse::<usize>().ok())).unwrap_or(default)
         };
 
         let thread_count =
-            std::env::var("MOROK_THREADS").ok().and_then(|s| s.parse().ok()).unwrap_or_else(default_thread_count);
-        let matvec_enabled = std::env::var("MOROK_MV").map(|v| v != "0").unwrap_or(true);
-        let matvec_blocksize = parse_usize(&["MOROK_MV_BLOCKSIZE", "MV_BLOCKSIZE"], 4);
-        let threads_per_row = parse_usize(&["MOROK_MV_THREADS_PER_ROW", "MV_THREADS_PER_ROW"], 8);
-        let rows_per_thread = parse_usize(&["MOROK_MV_ROWS_PER_THREAD", "MV_ROWS_PER_THREAD"], 4);
-        let k_vectorize = std::env::var("MOROK_K_VECTORIZE").is_ok();
-        // Default enabled, use MOROK_NO_OUTPUT_UPCAST to disable
-        let output_upcast = std::env::var("MOROK_NO_OUTPUT_UPCAST").is_err();
+            std::env::var("SVOD_THREADS").ok().and_then(|s| s.parse().ok()).unwrap_or_else(default_thread_count);
+        let matvec_enabled = std::env::var("SVOD_MV").map(|v| v != "0").unwrap_or(true);
+        let matvec_blocksize = parse_usize(&["SVOD_MV_BLOCKSIZE", "MV_BLOCKSIZE"], 4);
+        let threads_per_row = parse_usize(&["SVOD_MV_THREADS_PER_ROW", "MV_THREADS_PER_ROW"], 8);
+        let rows_per_thread = parse_usize(&["SVOD_MV_ROWS_PER_THREAD", "MV_ROWS_PER_THREAD"], 4);
+        let k_vectorize = std::env::var("SVOD_K_VECTORIZE").is_ok();
+        // Default enabled, use SVOD_NO_OUTPUT_UPCAST to disable
+        let output_upcast = std::env::var("SVOD_NO_OUTPUT_UPCAST").is_err();
 
         Self {
             matvec_enabled,
@@ -422,7 +422,7 @@ impl OptimizerConfig {
     ///
     /// # Environment Variables
     ///
-    /// * `MOROK_NOOPT=1` - Disable all optimizations
+    /// * `SVOD_NOOPT=1` - Disable all optimizations
     /// * `BEAM=N` - Use beam search with width N
     pub fn from_env() -> Self {
         let strategy = OptStrategy::from_env();

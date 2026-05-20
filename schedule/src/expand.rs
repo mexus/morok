@@ -20,9 +20,9 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use morok_dtype::DType;
-use morok_ir::prelude::*;
-use morok_ir::{AxisId, AxisType};
+use svod_dtype::DType;
+use svod_ir::prelude::*;
+use svod_ir::{AxisId, AxisType};
 
 use crate::TypedPatternMatcher;
 use smallvec::{SmallVec, smallvec};
@@ -501,7 +501,7 @@ fn do_expand(uop: &Arc<UOp>) -> Option<Arc<UOp>> {
     //
     // NOTE: With K-vectorization disabled, this is the only vectorization path.
     // fix_reduce_unroll may still set Vector dtype for K-axis UPCAST if enabled,
-    // but that's now opt-in via MOROK_K_VECTORIZE.
+    // but that's now opt-in via SVOD_K_VECTORIZE.
     let base_dtype = uop.dtype();
     let base_count = base_dtype.vcount();
     let new_dtype = if let Some(scalar) = base_dtype.scalar() {

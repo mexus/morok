@@ -13,9 +13,9 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use morok_dtype::DType;
-use morok_ir::{Op, UOp};
 use smallvec::smallvec;
+use svod_dtype::DType;
+use svod_ir::{Op, UOp};
 
 use super::helpers::*;
 use crate::devectorize::{TAG_MERGEABLE, merge_sibling_ends};

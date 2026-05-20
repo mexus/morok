@@ -17,9 +17,9 @@ use std::sync::Arc;
 use super::context::RangeifyContext;
 use super::indexing::IndexingContext;
 use super::kernel::RangeifyBufferContext;
-use morok_ir::shape::Shape;
-use morok_ir::{AddrSpace, AxisType, BufferizeOpts, ConstValue, DType, Op, UOp, UOpKey};
 use smallvec::{SmallVec, smallvec};
+use svod_ir::shape::Shape;
+use svod_ir::{AddrSpace, AxisType, BufferizeOpts, ConstValue, DType, Op, UOp, UOpKey};
 
 // ============================================================================
 // ADD_TAGS
@@ -79,7 +79,7 @@ pub fn add_tags_patterns() -> crate::TypedPatternMatcher<AddTagsCtx> {
             }
             if should_skip_tag(x.op()) { return None; }
             // Index-typed scalars are not tagged.
-            if x.dtype().base() == morok_dtype::ScalarDType::Index { return None; }
+            if x.dtype().base() == svod_dtype::ScalarDType::Index { return None; }
             // MStack/MSelect: only tag if NOT all sources are PARAM.
             if matches!(x.op(), Op::MStack { .. } | Op::MSelect { .. })
                 && x.op().sources().iter().all(|s| matches!(s.op(), Op::Param { .. }))
@@ -92,7 +92,7 @@ pub fn add_tags_patterns() -> crate::TypedPatternMatcher<AddTagsCtx> {
     }
 }
 
-fn resolve_single_function(function: &Arc<UOp>) -> morok_ir::Result<Option<Arc<UOp>>> {
+fn resolve_single_function(function: &Arc<UOp>) -> svod_ir::Result<Option<Arc<UOp>>> {
     let Op::Function { body, args, info } = function.op() else {
         return Ok(None);
     };
@@ -116,7 +116,7 @@ fn resolve_single_function(function: &Arc<UOp>) -> morok_ir::Result<Option<Arc<U
     let mut subs: HashMap<UOpKey, Arc<UOp>> = HashMap::new();
     for (slot, param) in params {
         let Some(arg) = args.get(slot) else {
-            return Err(morok_ir::Error::CallArgCountMismatch { expected: slot + 1, got: args.len() });
+            return Err(svod_ir::Error::CallArgCountMismatch { expected: slot + 1, got: args.len() });
         };
         let expected_shape = param.shape()?.cloned();
         let got_shape = arg.shape()?.cloned();
@@ -124,11 +124,11 @@ fn resolve_single_function(function: &Arc<UOp>) -> morok_ir::Result<Option<Arc<U
         // same vmax match. Both-None is a graph bug — FUNCTION param/arg
         // pairs always carry shapes; reject rather than silently pass.
         let mismatch = match (&expected_shape, &got_shape) {
-            (Some(p), Some(a)) => !morok_ir::shape::max_shapes_equal(p, a),
+            (Some(p), Some(a)) => !svod_ir::shape::max_shapes_equal(p, a),
             _ => true,
         };
         if mismatch {
-            return Err(morok_ir::Error::CallArgShapeMismatch {
+            return Err(svod_ir::Error::CallArgShapeMismatch {
                 arg_index: slot,
                 expected: expected_shape.map(Box::new),
                 got: got_shape.map(Box::new),
@@ -138,7 +138,7 @@ fn resolve_single_function(function: &Arc<UOp>) -> morok_ir::Result<Option<Arc<U
         let expected_dtype = param.dtype();
         let got_dtype = arg.dtype();
         if expected_dtype != got_dtype {
-            return Err(morok_ir::Error::CallArgDTypeMismatch {
+            return Err(svod_ir::Error::CallArgDTypeMismatch {
                 arg_index: slot,
                 expected: expected_dtype,
                 got: got_dtype,
@@ -199,7 +199,7 @@ fn resolve_toposort(root: &Arc<UOp>) -> Vec<Arc<UOp>> {
 /// Preserves callable/boundary FUNCTION bodies as opaque CALLs and keeps
 /// precompile functions intact.
 #[allow(clippy::mutable_key_type)]
-pub(crate) fn resolve_calls(root: Arc<UOp>) -> morok_ir::Result<Arc<UOp>> {
+pub(crate) fn resolve_calls(root: Arc<UOp>) -> svod_ir::Result<Arc<UOp>> {
     let topo = resolve_toposort(&root);
     let mut rewritten: HashMap<UOpKey, Arc<UOp>> = HashMap::new();
 
@@ -256,7 +256,7 @@ fn resolve_gettuple(node: &Arc<UOp>) -> Arc<UOp> {
 pub fn rangeify(
     sink: Arc<UOp>,
     pcontig_config: Option<&super::kernel::PcontigConfig>,
-) -> morok_ir::Result<(Arc<UOp>, RangeifyContext)> {
+) -> svod_ir::Result<(Arc<UOp>, RangeifyContext)> {
     let result = rangeify_with_map(sink, pcontig_config)?;
     Ok((result.sink, result.context))
 }
@@ -292,7 +292,7 @@ pub struct RangeifyResult {
 pub fn rangeify_with_map(
     sink: Arc<UOp>,
     pcontig_config: Option<&super::kernel::PcontigConfig>,
-) -> morok_ir::Result<RangeifyResult> {
+) -> svod_ir::Result<RangeifyResult> {
     // add_tags: assign sequential integer tags to UOps.
     // MUST run FIRST — tags track tensor identity through the entire pipeline.
     let t_stage = std::time::Instant::now();
@@ -565,8 +565,8 @@ fn mark_range_mod(ctx: &mut SplitRangesContext, r: &Arc<UOp>, c: &Arc<UOp>) {
 /// - Create `r_inner = RANGE(mod_val)` with same axis type, shifted axis_id
 /// - Substitute `r → r_outer * mod_val + r_inner`
 fn do_split_ranges_substitute(ctx: &mut SplitRangesContext, sink: &Arc<UOp>) -> Option<Arc<UOp>> {
-    use morok_ir::AxisId;
-    use morok_ir::rewrite::graph_rewrite_bottom_up;
+    use svod_ir::AxisId;
+    use svod_ir::rewrite::graph_rewrite_bottom_up;
 
     if ctx.marked_ranges.is_empty() {
         return None;
@@ -683,16 +683,16 @@ fn flatten_bufferize(bufferize: &Arc<UOp>) -> Option<Arc<UOp>> {
         return None;
     }
     // Extract shape from ranges: RANGE(end) → SInt::from(end), CONST(0) → 1
-    let shape: Vec<morok_ir::SInt> = ranges
+    let shape: Vec<svod_ir::SInt> = ranges
         .iter()
         .map(|r| match r.op() {
-            Op::Range { end, .. } => morok_ir::SInt::from(end.clone()),
-            _ => morok_ir::SInt::from(1usize),
+            Op::Range { end, .. } => svod_ir::SInt::from(end.clone()),
+            _ => svod_ir::SInt::from(1usize),
         })
         .collect();
 
     // Flatten: apply_reshape_ranges(in_shape=(prod,), out_shape=shape, rngs=ranges)
-    let flat_shape = vec![morok_ir::sint_prod(&shape)];
+    let flat_shape = vec![svod_ir::sint_prod(&shape)];
     let ranges_vec: Vec<Arc<UOp>> = ranges.iter().cloned().collect();
     let flat_indices = super::indexing::apply_reshape_ranges(&flat_shape, &shape, &ranges_vec);
     assert_eq!(flat_indices.len(), 1, "flatten_bufferize: expected 1 flat index, got {}", flat_indices.len());
@@ -708,11 +708,11 @@ fn flatten_bufferize(bufferize: &Arc<UOp>) -> Option<Arc<UOp>> {
         ranges.iter().any(|r| matches!(r.op(), Op::Range { end, .. } if !matches!(end.op(), Op::Const(_))));
 
     if has_symbolic {
-        let sym_ranges: Vec<(morok_ir::SInt, morok_ir::SInt)> = ranges
+        let sym_ranges: Vec<(svod_ir::SInt, svod_ir::SInt)> = ranges
             .iter()
             .map(|r| match r.op() {
-                Op::Range { end, .. } => (morok_ir::SInt::from(0usize), morok_ir::SInt::from(end.clone())),
-                _ => (morok_ir::SInt::from(0usize), morok_ir::SInt::from(1usize)),
+                Op::Range { end, .. } => (svod_ir::SInt::from(0usize), svod_ir::SInt::from(end.clone())),
+                _ => (svod_ir::SInt::from(0usize), svod_ir::SInt::from(1usize)),
             })
             .collect();
         Some(reshaped.try_shrink(&sym_ranges).expect("flatten_bufferize: try_shrink failed for symbolic ranges"))
@@ -880,7 +880,7 @@ pub(crate) fn transform_single_source(
 
 /// Create a fresh LOOP range with the same axis_id and a new constant size.
 fn create_loop_range_from_outer(outer: &Arc<UOp>, size: usize) -> Option<Arc<UOp>> {
-    use morok_ir::AxisType;
+    use svod_ir::AxisType;
     let Op::Range { axis_id, .. } = outer.op() else {
         return None;
     };
@@ -888,8 +888,8 @@ fn create_loop_range_from_outer(outer: &Arc<UOp>, size: usize) -> Option<Arc<UOp
 }
 
 /// Convert ReduceOp to binary operation.
-fn reduce_op_to_binary(op: morok_ir::ReduceOp, lhs: &Arc<UOp>, rhs: &Arc<UOp>) -> Option<Arc<UOp>> {
-    use morok_ir::types::{BinaryOp, ReduceOp};
+fn reduce_op_to_binary(op: svod_ir::ReduceOp, lhs: &Arc<UOp>, rhs: &Arc<UOp>) -> Option<Arc<UOp>> {
+    use svod_ir::types::{BinaryOp, ReduceOp};
     let dtype = lhs.dtype();
     Some(match op {
         ReduceOp::Add => UOp::new(Op::Binary(BinaryOp::Add, lhs.clone(), rhs.clone()), dtype),
@@ -897,7 +897,7 @@ fn reduce_op_to_binary(op: morok_ir::ReduceOp, lhs: &Arc<UOp>, rhs: &Arc<UOp>) -
         ReduceOp::Max => UOp::new(Op::Binary(BinaryOp::Max, lhs.clone(), rhs.clone()), dtype),
         ReduceOp::Min => {
             // Min uses WHERE(a < b, a, b) pattern
-            let cond = UOp::new(Op::Binary(BinaryOp::Lt, lhs.clone(), rhs.clone()), morok_dtype::DType::Bool);
+            let cond = UOp::new(Op::Binary(BinaryOp::Lt, lhs.clone(), rhs.clone()), svod_dtype::DType::Bool);
             UOp::try_where(cond, lhs.clone(), rhs.clone()).expect("reduce_op_to_binary: try_where failed for Min")
         }
     })
@@ -974,7 +974,7 @@ fn collect_range_uops(ranges: &SmallVec<[Arc<UOp>; 4]>) -> SmallVec<[Arc<UOp>; 4
 
 fn new_lunique_buffer(
     ctx: &mut RangeifyBufferContext,
-    device: morok_ir::DeviceSpec,
+    device: svod_ir::DeviceSpec,
     size: usize,
     dtype: DType,
 ) -> Arc<UOp> {
@@ -1082,7 +1082,7 @@ pub fn bufferize_to_store(
         }
 
         let wrap_range = reduce_ranges[0].clone();
-        let device = opts.device.clone().unwrap_or(morok_ir::DeviceSpec::Cpu);
+        let device = opts.device.clone().unwrap_or(svod_ir::DeviceSpec::Cpu);
 
         // Create buffer
         let buf = new_lunique_buffer(ctx, device, size, base_dtype.clone());
@@ -1152,7 +1152,7 @@ pub fn bufferize_to_store(
         existing_buffer.clone()
     } else if effective_addrspace == AddrSpace::Global {
         // Create BUFFER node — BUFFER → PARAM conversion happens later in split_store.
-        let device = opts.device.clone().unwrap_or(morok_ir::DeviceSpec::Cpu);
+        let device = opts.device.clone().unwrap_or(svod_ir::DeviceSpec::Cpu);
         new_lunique_buffer(ctx, device, size, base_dtype.clone())
     } else {
         // For local address space (only when allow_locals=true), create DEFINE_LOCAL directly.
@@ -1268,7 +1268,7 @@ pub(crate) fn get_range_size(range: &Arc<UOp>) -> Option<Arc<UOp>> {
 /// 5. If REDUCE is eliminated (no_range), reverse-substitute back
 #[allow(clippy::mutable_key_type)]
 fn reduce_collapse_with(src: &Arc<UOp>, ranges: &[Arc<UOp>], pm: &crate::TypedPatternMatcher<()>) -> Option<Arc<UOp>> {
-    use morok_ir::ReduceOp;
+    use svod_ir::ReduceOp;
 
     if ranges.is_empty() {
         return None;
@@ -1358,8 +1358,8 @@ pub fn reduce_load_collapse(src: &Arc<UOp>, ranges: &[Arc<UOp>]) -> Option<Arc<U
     reduce_collapse_with(src, ranges, super::patterns::build_reduce_load_collapse_matcher())
 }
 
-pub(crate) fn cast_to_dtype(value: &Arc<UOp>, target_dtype: &morok_dtype::DType) -> Option<Arc<UOp>> {
-    use morok_dtype::DType;
+pub(crate) fn cast_to_dtype(value: &Arc<UOp>, target_dtype: &svod_dtype::DType) -> Option<Arc<UOp>> {
+    use svod_dtype::DType;
 
     let scalar_type = match target_dtype {
         DType::Scalar(s) => DType::Scalar(*s),
@@ -1672,8 +1672,8 @@ pub fn find_bufs(store: &Arc<UOp>) -> HashMap<UOpKey, OpAccessType> {
 /// For DISK devices, creates a zero-copy typed view with byte offset into the
 /// memory-mapped file instead of a compute kernel.
 fn late_buffer_view(compute: &Arc<UOp>, bufferize: &Arc<UOp>) -> Option<Arc<UOp>> {
-    use morok_ir::uop::cached_property::CachedProperty;
-    use morok_ir::uop::properties::VminVmaxProperty;
+    use svod_ir::uop::cached_property::CachedProperty;
+    use svod_ir::uop::properties::VminVmaxProperty;
 
     let Op::Bufferize { opts, ranges, .. } = bufferize.op() else { return None };
 
@@ -1687,7 +1687,7 @@ fn late_buffer_view(compute: &Arc<UOp>, bufferize: &Arc<UOp>) -> Option<Arc<UOp>
         .iter()
         .map(|r| {
             if let Op::Range { end, .. } = r.op()
-                && let (_, morok_ir::ConstValue::Int(v)) = VminVmaxProperty::get(end)
+                && let (_, svod_ir::ConstValue::Int(v)) = VminVmaxProperty::get(end)
             {
                 return *v as usize;
             }
@@ -1730,7 +1730,7 @@ fn late_buffer_view(compute: &Arc<UOp>, bufferize: &Arc<UOp>) -> Option<Arc<UOp>
             let mut total: i64 = 0;
             for idx in indices.iter() {
                 let (vmin, _) = VminVmaxProperty::get(idx);
-                if let morok_ir::ConstValue::Int(v) = vmin {
+                if let svod_ir::ConstValue::Int(v) = vmin {
                     total += v;
                 }
             }

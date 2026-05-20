@@ -71,7 +71,7 @@ pub fn shrink_uop(uop: &Arc<UOp>) -> Vec<Arc<UOp>> {
 }
 
 /// Shrink a constant value towards zero.
-fn shrink_const_value(cv: &ConstValue, dtype: &morok_dtype::DType) -> Vec<Arc<UOp>> {
+fn shrink_const_value(cv: &ConstValue, dtype: &svod_dtype::DType) -> Vec<Arc<UOp>> {
     let mut shrunk = Vec::new();
 
     match cv {
@@ -157,7 +157,7 @@ pub fn uop_op_count(uop: &Arc<UOp>) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use morok_dtype::DType;
+    use svod_dtype::DType;
 
     #[test]
     fn test_shrink_const() {

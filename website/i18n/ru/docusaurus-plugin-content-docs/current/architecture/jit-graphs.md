@@ -74,7 +74,7 @@ jit_wrapper! {
 переменную (макрос отклоняет имена, не совпадающие ни с тем, ни с
 другим, на этапе раскрытия). Внутри блока каждый вход — это `&Tensor`
 (макрос выделяет нулевой плейсхолдер при запуске `prepare()`), каждая
-переменная — это `morok_tensor::Variable`, уже привязанная к своей
+переменная — это `svod_tensor::Variable`, уже привязанная к своей
 верхней границе, а `model` — разделяемая ссылка на значение модели,
 которым владеет обёртка. Замыкание возвращает `Result<Tensor, E>` для
 любого `E: std::error::Error + Send + Sync + 'static`; сбои всплывают
@@ -251,7 +251,7 @@ jit_wrapper! {
 
         build(mel, lengths, b, t) {
             let out = model.encoder.forward_batch(mel, lengths, &b, &t)?;
-            out.cast(morok_dtype::DType::Float32).context(TensorSnafu)
+            out.cast(svod_dtype::DType::Float32).context(TensorSnafu)
         }
     }
 }

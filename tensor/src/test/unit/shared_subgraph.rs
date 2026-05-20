@@ -11,8 +11,8 @@
 
 use crate::Tensor;
 use crate::test::helpers::*;
-use morok_dtype::DType;
 use ndarray::Array2;
+use svod_dtype::DType;
 crate::codegen_tests! {
     #[test_case(2 ; "N=2")]
     #[test_case(4 ; "N=4")]

@@ -1,12 +1,12 @@
-# morok-device
+# svod-device
 
 Device abstraction with lazy buffer allocation, zero-copy views, and LRU caching.
 
 ## Example
 
 ```rust
-use morok_device::{Buffer, BufferOptions, registry};
-use morok_dtype::DType;
+use svod_device::{Buffer, BufferOptions, registry};
+use svod_dtype::DType;
 
 // CPU buffer (lazy allocation)
 let cpu = registry::cpu();
@@ -75,6 +75,6 @@ spec.canonicalize()          // → "CUDA:0"
 ## Testing
 
 ```bash
-cargo test -p morok-device
-cargo test -p morok-device --features cuda  # with CUDA
+cargo test -p svod-device
+cargo test -p svod-device --features cuda  # with CUDA
 ```

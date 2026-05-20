@@ -11,8 +11,8 @@ use melior::ir::block::BlockLike;
 use melior::ir::operation::OperationBuilder;
 use melior::ir::r#type::IntegerType;
 use melior::ir::{Block, Location, Type, Value};
-use morok_dtype::DType;
-use morok_ir::{BinaryOp, ReduceOp, TernaryOp, UnaryOp};
+use svod_dtype::DType;
+use svod_ir::{BinaryOp, ReduceOp, TernaryOp, UnaryOp};
 
 use super::types::mlir_type;
 
@@ -57,14 +57,14 @@ pub fn const_float<'c>(
 pub fn build_const<'c>(
     ctx: &'c Context,
     block: &Block<'c>,
-    val: &morok_ir::ConstValue,
+    val: &svod_ir::ConstValue,
     dtype: &DType,
     loc: Location<'c>,
 ) -> Value<'c, 'c> {
     let mlir_ty = mlir_type(ctx, dtype);
 
     match val {
-        morok_ir::ConstValue::Int(i) => {
+        svod_ir::ConstValue::Int(i) => {
             if dtype.is_float() {
                 // AMX accumulator init uses Int(0) for float zero
                 const_float(ctx, block, *i as f64, mlir_ty, loc)
@@ -72,18 +72,18 @@ pub fn build_const<'c>(
                 const_int(ctx, block, *i, mlir_ty, loc)
             }
         }
-        morok_ir::ConstValue::UInt(u) => {
+        svod_ir::ConstValue::UInt(u) => {
             if dtype.is_float() {
                 const_float(ctx, block, *u as f64, mlir_ty, loc)
             } else {
                 const_int(ctx, block, *u as i64, mlir_ty, loc)
             }
         }
-        morok_ir::ConstValue::Float(f) => {
+        svod_ir::ConstValue::Float(f) => {
             debug_assert!(dtype.is_float(), "Float ConstValue with non-float dtype {dtype:?}");
             const_float(ctx, block, *f, mlir_ty, loc)
         }
-        morok_ir::ConstValue::Bool(b) => {
+        svod_ir::ConstValue::Bool(b) => {
             debug_assert!(dtype.is_bool(), "Bool ConstValue with non-bool dtype {dtype:?}");
             const_int(ctx, block, i64::from(*b), IntegerType::new(ctx, 1).into(), loc)
         }
@@ -94,7 +94,7 @@ pub fn build_const<'c>(
 pub fn build_vconst<'c>(
     ctx: &'c Context,
     block: &Block<'c>,
-    values: &[morok_ir::ConstValue],
+    values: &[svod_ir::ConstValue],
     dtype: &DType,
     loc: Location<'c>,
 ) -> Value<'c, 'c> {

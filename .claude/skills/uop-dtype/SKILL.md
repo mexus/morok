@@ -167,7 +167,7 @@ UOp::wmma(a, b, c, WmmaMetadata {
 ### Address Spaces
 
 ```rust
-use morok_dtype::AddrSpace::*;
+use svod_dtype::AddrSpace::*;
 
 AddrSpace::Global    // GPU global memory / CPU main memory
 AddrSpace::Local     // GPU shared memory / CPU L1 cache
@@ -221,7 +221,7 @@ The constructors module provides validation helpers:
 ### Creating Constants
 
 ```rust
-use morok_ir::{UOp, ConstValue, DType};
+use svod_ir::{UOp, ConstValue, DType};
 
 // Float constant
 let float_zero = UOp::const_(DType::Float32, ConstValue::Float(0.0));
@@ -244,7 +244,7 @@ let like_zero = some_uop.const_like(0.0);
 ### Building Index Operations
 
 ```rust
-use morok_ir::UOp;
+use svod_ir::UOp;
 
 // Simple index
 let index = UOp::index()
@@ -270,8 +270,8 @@ let ptr_index = UOp::index()
 ### Building Buffers
 
 ```rust
-use morok_ir::{UOp, DeviceSpec, DType, AddrSpace};
-use morok_dtype::DeviceSpec::*;
+use svod_ir::{UOp, DeviceSpec, DType, AddrSpace};
+use svod_dtype::DeviceSpec::*;
 
 // Global memory buffer
 let global_buf = UOp::new_buffer(
@@ -290,7 +290,7 @@ let ptr_dtype = DType::Float32.ptr(Some(1024), AddrSpace::Global);
 ### Vector Operations
 
 ```rust
-use morok_ir::UOp;
+use svod_ir::UOp;
 
 // Create vector from elements
 let vec4 = UOp::try_vectorize(vec![x, y, z, w])?;
@@ -308,7 +308,7 @@ let combined = unrolled_uop.contract(vec![(0, 16)]);
 ### Range Operations
 
 ```rust
-use morok_ir::{UOp, AxisId, AxisType};
+use svod_ir::{UOp, AxisId, AxisType};
 
 // Loop range (inside kernel)
 let loop_range = UOp::range_const(64, 0);
@@ -330,7 +330,7 @@ let block_idx = UOp::special(end_uop, "blockIdx.x".to_string());
 ### Control Flow
 
 ```rust
-use morok_ir::UOp;
+use svod_ir::UOp;
 use smallvec::smallvec;
 
 // Create computation with ranges
@@ -357,14 +357,14 @@ let end_if = UOp::endif(if_block);
 | `ir/src/uop/constructors/shape.rs` | Shape manipulation |
 | `ir/src/uop/constructors/graph.rs` | Graph organization |
 | `ir/src/uop/constructors/hardware.rs` | WMMA, vectorization |
-| `morok_dtype/src/lib.rs` | DType enum and methods |
+| `svod_dtype/src/lib.rs` | DType enum and methods |
 
 ## Tensor API Layer (`tensor/src/`)
 
 The tensor layer provides ergonomic APIs on top of UOp constructors:
 
 ```rust
-use morok_tensor::Tensor;
+use svod_tensor::Tensor;
 
 // Arithmetic operations (auto-broadcasting)
 let c = &a + &b;  // Calls UOp::try_add with broadcasting
@@ -405,13 +405,13 @@ let result = UOp::add(&a, &b);  // Panics on type mismatch
 
 ```bash
 # Log UOp construction (useful for pattern matching debugging)
-RUST_LOG=morok_ir::uop=trace cargo test test_name
+RUST_LOG=svod_ir::uop=trace cargo test test_name
 ```
 
 ### Validate IR structure
 
 ```rust
-use morok_ir::UOp;
+use svod_ir::UOp;
 
 // Check UOp tree structure
 println!("{}", uop.tree());           // Compact with back-references

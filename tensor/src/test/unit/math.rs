@@ -2,7 +2,7 @@
 
 use crate::test::helpers::*;
 use crate::*;
-use morok_dtype::DType;
+use svod_dtype::DType;
 
 // Trigonometric tests
 #[test]

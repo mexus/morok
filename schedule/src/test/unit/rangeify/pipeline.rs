@@ -10,28 +10,28 @@
 
 use std::{f32::consts::PI, sync::Arc};
 
-use morok_device::DeviceSpec;
-use morok_dtype::DType;
-use morok_ir::{AxisId, AxisType, BufferizeOpts, CallInfo, ConstValue, Op, ReduceOp, UOp};
 use smallvec::smallvec;
+use svod_device::DeviceSpec;
+use svod_dtype::DType;
+use svod_ir::{AxisId, AxisType, BufferizeOpts, CallInfo, ConstValue, Op, ReduceOp, UOp};
 
 use crate::rangeify::{rangeify, run_rangeify, try_get_kernel_graph};
 
 struct NoRewrite;
 
-impl morok_ir::Matcher<()> for NoRewrite {
-    fn rewrite(&self, _uop: &Arc<UOp>, _ctx: &mut ()) -> morok_ir::RewriteResult {
-        morok_ir::RewriteResult::NoMatch
+impl svod_ir::Matcher<()> for NoRewrite {
+    fn rewrite(&self, _uop: &Arc<UOp>, _ctx: &mut ()) -> svod_ir::RewriteResult {
+        svod_ir::RewriteResult::NoMatch
     }
 }
 
 struct StripDetach;
 
-impl morok_ir::Matcher<()> for StripDetach {
-    fn rewrite(&self, uop: &Arc<UOp>, _ctx: &mut ()) -> morok_ir::RewriteResult {
+impl svod_ir::Matcher<()> for StripDetach {
+    fn rewrite(&self, uop: &Arc<UOp>, _ctx: &mut ()) -> svod_ir::RewriteResult {
         match uop.op() {
-            Op::Detach { src } => morok_ir::RewriteResult::Rewritten(src.clone()),
-            _ => morok_ir::RewriteResult::NoMatch,
+            Op::Detach { src } => svod_ir::RewriteResult::Rewritten(src.clone()),
+            _ => svod_ir::RewriteResult::NoMatch,
         }
     }
 }
@@ -96,15 +96,14 @@ fn test_graph_rewrite_with_bpm_preserve_calls_only_rewrites_with_explicit_full_t
     let function = detached.function(smallvec![arg], CallInfo::default());
 
     let preserved_call =
-        morok_ir::rewrite::graph_rewrite_with_bpm_preserve_calls(&NoRewrite, &StripDetach, call, &mut ());
+        svod_ir::rewrite::graph_rewrite_with_bpm_preserve_calls(&NoRewrite, &StripDetach, call, &mut ());
     let Op::Call { body: preserved_call_body, .. } = preserved_call.op() else { panic!("expected CALL root") };
     assert!(
         preserved_call_body.toposort().iter().any(|u| matches!(u.op(), Op::Detach { .. })),
         "preserve-calls rewrite should keep CALL body unchanged"
     );
 
-    let full_call =
-        morok_ir::rewrite::graph_rewrite_with_bpm(&NoRewrite, &StripDetach, preserved_call.clone(), &mut ());
+    let full_call = svod_ir::rewrite::graph_rewrite_with_bpm(&NoRewrite, &StripDetach, preserved_call.clone(), &mut ());
     let Op::Call { body: full_call_body, .. } = full_call.op() else { panic!("expected CALL root") };
     assert!(
         !full_call_body.toposort().iter().any(|u| matches!(u.op(), Op::Detach { .. })),
@@ -112,7 +111,7 @@ fn test_graph_rewrite_with_bpm_preserve_calls_only_rewrites_with_explicit_full_t
     );
 
     let preserved_function =
-        morok_ir::rewrite::graph_rewrite_with_bpm_preserve_calls(&NoRewrite, &StripDetach, function, &mut ());
+        svod_ir::rewrite::graph_rewrite_with_bpm_preserve_calls(&NoRewrite, &StripDetach, function, &mut ());
     let Op::Function { body: preserved_function_body, .. } = preserved_function.op() else {
         panic!("expected FUNCTION root")
     };
@@ -122,7 +121,7 @@ fn test_graph_rewrite_with_bpm_preserve_calls_only_rewrites_with_explicit_full_t
     );
 
     let full_function =
-        morok_ir::rewrite::graph_rewrite_with_bpm(&NoRewrite, &StripDetach, preserved_function.clone(), &mut ());
+        svod_ir::rewrite::graph_rewrite_with_bpm(&NoRewrite, &StripDetach, preserved_function.clone(), &mut ());
     let Op::Function { body: full_function_body, .. } = full_function.op() else { panic!("expected FUNCTION root") };
     assert!(
         !full_function_body.toposort().iter().any(|u| matches!(u.op(), Op::Detach { .. })),
@@ -477,7 +476,7 @@ fn test_pipeline_maintains_computation_semantics() {
 fn test_pipeline_reduce_unparented_add() {
     // Test: reduce_unparented optimization for ADD
     // REDUCE(CONST(5), [range(10)], ADD) should become CONST(50)
-    use morok_ir::ReduceOp;
+    use svod_ir::ReduceOp;
 
     let const_val = UOp::native_const(5i32);
     let range = UOp::range_axis(UOp::index_const(10), AxisId::Renumbered(0), AxisType::Reduce);
@@ -488,7 +487,7 @@ fn test_pipeline_reduce_unparented_add() {
     // Should be optimized to a multiplication or constant
     // REDUCE(5, [10], ADD) → 5 * 10 = 50
     match rangeified.op() {
-        Op::Binary(morok_ir::BinaryOp::Mul, _, _) => {
+        Op::Binary(svod_ir::BinaryOp::Mul, _, _) => {
             // Optimized to multiplication
         }
         Op::Const(cv_hash) => {
@@ -508,7 +507,7 @@ fn test_pipeline_reduce_unparented_add() {
 fn test_pipeline_reduce_unparented_max() {
     // Test: reduce_unparented optimization for MAX
     // REDUCE(CONST(42), [range(5)], MAX) should become CONST(42)
-    use morok_ir::ReduceOp;
+    use svod_ir::ReduceOp;
 
     let const_val = UOp::native_const(42i32);
     let range = UOp::range_axis(UOp::index_const(5), AxisId::Renumbered(0), AxisType::Reduce);
@@ -532,8 +531,8 @@ fn test_pipeline_reduce_unparented_max() {
 #[test]
 fn test_pipeline_split_reduceop_large_reduction() {
     // Test: split_reduceop should split large REDUCE_AXIS operations
-    use morok_device::DeviceSpec;
-    use morok_ir::ReduceOp;
+    use svod_device::DeviceSpec;
+    use svod_ir::ReduceOp;
 
     // Create a tensor with shape (100000,) - large enough to trigger split
     let total_size = 100000;
@@ -559,8 +558,8 @@ fn test_pipeline_split_reduceop_large_reduction() {
 #[test]
 fn test_pipeline_split_reduceop_below_threshold() {
     // Test: split_reduceop should NOT split small REDUCE_AXIS operations
-    use morok_device::DeviceSpec;
-    use morok_ir::ReduceOp;
+    use svod_device::DeviceSpec;
+    use svod_ir::ReduceOp;
 
     // Create a tensor with shape (1000,) - below threshold (32768)
     let total_size = 1000;
@@ -583,7 +582,7 @@ fn test_pipeline_split_reduceop_below_threshold() {
 #[test]
 fn test_pipeline_reduction_optimizations_dont_break_graph() {
     // Test: Reduction optimizations preserve graph validity
-    use morok_ir::ReduceOp;
+    use svod_ir::ReduceOp;
 
     // Create a realistic reduction scenario
     let data = UOp::native_const(PI);

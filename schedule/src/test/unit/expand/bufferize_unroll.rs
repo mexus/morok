@@ -12,9 +12,9 @@
 //!
 //! Based on Tinygrad's expander.py:91-92.
 
-use morok_dtype::DType;
-use morok_ir::types::ConstValue;
-use morok_ir::{Op, UOp};
+use svod_dtype::DType;
+use svod_ir::types::ConstValue;
+use svod_ir::{Op, UOp};
 
 use super::helpers::*;
 
@@ -174,8 +174,8 @@ fn test_bufferize_contract_dtype_matches() {
 /// Test: BufferizeOpts are preserved through transformation.
 #[test]
 fn test_bufferize_preserves_opts() {
-    use morok_dtype::AddrSpace;
-    use morok_ir::BufferizeOpts;
+    use svod_dtype::AddrSpace;
+    use svod_ir::BufferizeOpts;
 
     let compute = create_unroll_iota(0, 4);
     let range = create_unroll_iota(0, 4);

@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 
-use morok_ir::UOp;
+use svod_ir::UOp;
 
 use crate::z3::convert::Z3Context;
 

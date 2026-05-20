@@ -1,9 +1,9 @@
 use std::sync::Arc;
 
-use morok_dtype::{DType, ScalarDType};
-use morok_ir::types::ConstValue;
-use morok_ir::{Op, UOp};
 use smallvec::smallvec;
+use svod_dtype::{DType, ScalarDType};
+use svod_ir::types::ConstValue;
+use svod_ir::{Op, UOp};
 
 use super::helpers::{apply_pm_render, create_bool_const, create_buffer_typed};
 
@@ -22,7 +22,7 @@ fn test_fp8_decomp_preserves_alt_on_gated_load() {
     assert_eq!(count_gated_loads_without_alt(&rendered), 0, "pm_render must attach alt values for gated FP8 loads");
 
     let mut ctx = crate::devectorize::Fp8DecompCtx { from: ScalarDType::FP8E5M2, to: ScalarDType::Float16 };
-    let decomposed = morok_ir::rewrite::graph_rewrite_with_bpm(
+    let decomposed = svod_ir::rewrite::graph_rewrite_with_bpm(
         &crate::devectorize::pm_float_decomp(),
         &crate::devectorize::pm_float_decomp_store(),
         rendered,

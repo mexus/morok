@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use morok_ir::UOp;
+use svod_ir::UOp;
 
 use crate::rangeify::transforms::{flatten_range_impl, flatten_ranges};
 
@@ -44,8 +44,8 @@ fn test_flatten_ranges_identity() {
 #[test]
 fn test_flatten_range_nested_end() {
     // END(END(x, [r1]), [r2]) → END(x, [r1, r2])
-    use morok_ir::Op;
     use smallvec::smallvec;
+    use svod_ir::Op;
 
     let computation = UOp::native_const(1.0f32);
     let r1 = UOp::range(UOp::index_const(10), 0);
@@ -73,8 +73,8 @@ fn test_flatten_range_nested_end() {
 #[test]
 fn test_flatten_range_deeply_nested() {
     // END(END(END(x, [r1]), [r2]), [r3]) → END(x, [r1, r2, r3])
-    use morok_ir::Op;
     use smallvec::smallvec;
+    use svod_ir::Op;
 
     let computation = UOp::native_const(1.0f32);
     let r1 = UOp::range(UOp::index_const(10), 0);
@@ -102,8 +102,8 @@ fn test_flatten_range_deeply_nested() {
 #[test]
 fn test_flatten_range_preserves_computation() {
     // Flattening should preserve the inner computation
-    use morok_ir::Op;
     use smallvec::smallvec;
+    use svod_ir::Op;
 
     // Create a binary computation: 1.0 + 2.0
     let a = UOp::native_const(1.0f32);
@@ -141,8 +141,8 @@ fn test_flatten_range_preserves_computation() {
 #[test]
 fn test_flatten_ranges_full_graph() {
     // Test full graph flattening via flatten_ranges
-    use morok_ir::Op;
     use smallvec::smallvec;
+    use svod_ir::Op;
 
     let computation = UOp::native_const(1.0f32);
     let r1 = UOp::range(UOp::index_const(10), 0);

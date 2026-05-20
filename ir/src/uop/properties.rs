@@ -30,8 +30,8 @@ cached_property! {
     /// # Example
     ///
     /// ```ignore
-    /// use morok_ir::uop::properties::ShapeProperty;
-    /// use morok_ir::uop::cached_property::CachedProperty;
+    /// use svod_ir::uop::properties::ShapeProperty;
+    /// use svod_ir::uop::cached_property::CachedProperty;
     ///
     /// let shape_result = ShapeProperty::get(&my_uop);
     /// ```
@@ -176,8 +176,8 @@ cached_property! {
     /// # Example
     ///
     /// ```ignore
-    /// use morok_ir::uop::properties::VminVmaxProperty;
-    /// use morok_ir::uop::cached_property::CachedProperty;
+    /// use svod_ir::uop::properties::VminVmaxProperty;
+    /// use svod_ir::uop::cached_property::CachedProperty;
     ///
     /// let (vmin, vmax) = VminVmaxProperty::get(&my_uop);
     /// println!("Value range: [{:?}, {:?}]", vmin, vmax);

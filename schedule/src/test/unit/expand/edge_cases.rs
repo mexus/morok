@@ -1,16 +1,16 @@
-//! Morok-specific edge case tests for expand.rs.
+//! Svod-specific edge case tests for expand.rs.
 //!
-//! These test edge cases and cleanup patterns specific to Morok's implementation:
+//! These test edge cases and cleanup patterns specific to Svod's implementation:
 //! - Empty UNROLL unwrapping
 //! - Double UNROLL collapsing
 //! - BARRIER with UNROLL handling
 //! - CONTRACT on void dtype
 
 use super::helpers::*;
-use morok_dtype::DType;
-use morok_ir::types::ConstValue;
-use morok_ir::{Op, UOp};
 use smallvec::smallvec;
+use svod_dtype::DType;
+use svod_ir::types::ConstValue;
+use svod_ir::{Op, UOp};
 
 // =============================================================================
 // Empty UNROLL Tests

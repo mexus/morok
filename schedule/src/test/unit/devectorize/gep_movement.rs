@@ -20,9 +20,9 @@
 
 use std::sync::Arc;
 
-use morok_dtype::ScalarDType;
-use morok_ir::{Op, UOp};
 use smallvec::smallvec;
+use svod_dtype::ScalarDType;
+use svod_ir::{Op, UOp};
 
 use super::helpers::*;
 

@@ -1,4 +1,4 @@
-use morok_tensor::Tensor;
+use svod_tensor::Tensor;
 
 use crate::state::StateDict;
 
@@ -104,10 +104,10 @@ fn remap_key(key: &str, config: &GigaAmConfig) -> Option<String> {
 
 /// Encoder-layer key remapping. The 7 "passthrough" sub-modules (4 norms + 2
 /// feed-forwards + final_norm) all share the same rename shape: replace the
-/// `rest[0]` prefix with the morok target prefix and keep the remaining
+/// `rest[0]` prefix with the svod target prefix and keep the remaining
 /// path segments verbatim. `self_attn` and `conv` need bespoke logic.
 fn remap_encoder_layer(i: &str, rest: &[&str], config: &GigaAmConfig) -> Option<String> {
-    // (rest[0] prefix → morok target prefix)
+    // (rest[0] prefix → svod target prefix)
     const PASSTHROUGH: &[(&str, &str)] = &[
         ("norm_feed_forward1", "ffn1.norm"),
         ("feed_forward1", "ffn1"),
@@ -152,7 +152,7 @@ fn remap_encoder_layer(i: &str, rest: &[&str], config: &GigaAmConfig) -> Option<
 }
 
 /// Decode a PyTorch LSTM parameter token like `weight_ih_l0` or `bias_hh_l2`
-/// into morok's `head.predictor.lstm.{layer}.{w_ih,w_hh,b_ih,b_hh}` shape.
+/// into svod's `head.predictor.lstm.{layer}.{w_ih,w_hh,b_ih,b_hh}` shape.
 fn remap_rnnt_lstm_param(token: &str) -> Option<String> {
     // Strip `_l{N}` suffix.
     let (base, layer) = token.rsplit_once("_l")?;

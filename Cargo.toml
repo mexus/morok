@@ -15,14 +15,14 @@ members = [
 exclude = ["submodules"]
 
 [workspace.metadata.crane]
-name = "morok"
+name = "svod"
 
 [workspace.package]
 authors = ["Patsakula Nikita <nikita.patsakula@gmail.com>"]
 edition = "2024"
 version = "0.1.0-alpha.2"
 license = "MIT"
-repository = "https://github.com/npatsakula/morok"
+repository = "https://github.com/npatsakula/svod"
 
 [workspace.dependencies]
 ndarray = "0.17"

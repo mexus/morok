@@ -5,8 +5,8 @@
 
 use std::sync::Arc;
 
-use morok_dtype::DType;
-use morok_ir::{AxisId, AxisType, BinaryOp, Op, ReduceOp, TernaryOp};
+use svod_dtype::DType;
+use svod_ir::{AxisId, AxisType, BinaryOp, Op, ReduceOp, TernaryOp};
 
 use crate::optimizer::config::HeuristicsConfig;
 use crate::optimizer::{Opt, Scheduler, apply_opt};
@@ -186,12 +186,12 @@ pub fn count_strides(scheduler: &Scheduler, axis: usize) -> (usize, usize) {
                     // c.op is Ops.MUL and one side is rng and other is CONST
                     if Arc::ptr_eq(lhs, target_rng)
                         && let Op::Const(cv) = rhs.op()
-                        && let morok_ir::ConstValue::Int(v) = cv.0
+                        && let svod_ir::ConstValue::Int(v) = cv.0
                     {
                         sum_strides += v as usize;
                     } else if Arc::ptr_eq(rhs, target_rng)
                         && let Op::Const(cv) = lhs.op()
-                        && let morok_ir::ConstValue::Int(v) = cv.0
+                        && let svod_ir::ConstValue::Int(v) = cv.0
                     {
                         sum_strides += v as usize;
                     }
@@ -264,7 +264,7 @@ pub fn apply_image_upcasts(scheduler: &mut Scheduler) -> bool {
 
 /// Default upcast fallback: 4x vectorization on first upcastable axis.
 pub fn apply_default_upcast(scheduler: &mut Scheduler) -> bool {
-    use morok_ir::Op;
+    use svod_ir::Op;
     use tracing::debug;
 
     if !scheduler.axes_of(&[AxisType::Upcast]).is_empty() {
@@ -286,7 +286,7 @@ pub fn apply_default_upcast(scheduler: &mut Scheduler) -> bool {
     if axis_idx < rngs.len()
         && let Op::Range { end, .. } = rngs[axis_idx].op()
         && let Op::Const(cv) = end.op()
-        && let morok_ir::ConstValue::Int(size) = cv.0
+        && let svod_ir::ConstValue::Int(size) = cv.0
         && size % DEFAULT_UPCAST_FACTOR as i64 != 0
     {
         debug!(axis_idx, size, factor = DEFAULT_UPCAST_FACTOR, "apply_default_upcast: skipping (size not divisible)");
@@ -325,7 +325,7 @@ pub fn apply_unroll(scheduler: &mut Scheduler) -> bool {
     let size = if last_unrollable < rngs.len()
         && let Op::Range { end, .. } = rngs[last_unrollable].op()
         && let Op::Const(cv) = end.op()
-        && let morok_ir::ConstValue::Int(sz) = cv.0
+        && let svod_ir::ConstValue::Int(sz) = cv.0
     {
         sz as usize
     } else {
@@ -348,7 +348,7 @@ pub fn apply_unroll(scheduler: &mut Scheduler) -> bool {
                     if last2 < rngs2.len()
                         && let Op::Range { end, .. } = rngs2[last2].op()
                         && let Op::Const(cv) = end.op()
-                        && let morok_ir::ConstValue::Int(sz2) = cv.0
+                        && let svod_ir::ConstValue::Int(sz2) = cv.0
                         && sz2 <= 3
                     {
                         let _ = apply_opt(scheduler, &Opt::unroll(unrollable2.len() - 1, 0), true);
@@ -399,7 +399,7 @@ pub fn apply_masked_upcasts(scheduler: &mut Scheduler) -> bool {
         let rng = &rngs[axis_idx];
         if let Op::Range { end, .. } = rng.op()
             && let Op::Const(cv) = end.op()
-            && let morok_ir::ConstValue::Int(size) = cv.0
+            && let svod_ir::ConstValue::Int(size) = cv.0
             && size > 1
             && size <= 7
             && product * size <= 49
@@ -422,7 +422,7 @@ pub fn apply_masked_upcasts(scheduler: &mut Scheduler) -> bool {
 /// Grouped reduction for small output dimensions.
 ///
 /// When the product of upcastable output dimensions is small (<= 2048,
-/// or 240 under `MOROK_NOLOCALS`), apply GROUPTOP on output axes to enable
+/// or 240 under `SVOD_NOLOCALS`), apply GROUPTOP on output axes to enable
 /// local reduction.
 pub fn try_grouped_reduction(scheduler: &mut Scheduler, config: &HeuristicsConfig) -> bool {
     if !scheduler.renderer().has_local || config.disable_locals || !scheduler.renderer().has_shared {
@@ -434,7 +434,7 @@ pub fn try_grouped_reduction(scheduler: &mut Scheduler, config: &HeuristicsConfi
     let full_shape = scheduler.full_shape();
     let group_for_reduces: i64 = upcastable.iter().map(|&i| full_shape.get(i).copied().unwrap_or(1)).product();
 
-    let threshold: i64 = if std::env::var("MOROK_NOLOCALS").is_ok() { 240 } else { 2048 };
+    let threshold: i64 = if std::env::var("SVOD_NOLOCALS").is_ok() { 240 } else { 2048 };
     if group_for_reduces > threshold {
         return false;
     }
@@ -501,7 +501,7 @@ pub fn apply_matmul_tiling(scheduler: &mut Scheduler, config: &HeuristicsConfig)
         }
         if let Op::Range { end, .. } = rngs[axis_idx].op()
             && let Op::Const(cv) = end.op()
-            && let morok_ir::ConstValue::Int(size) = cv.0
+            && let svod_ir::ConstValue::Int(size) = cv.0
             && size >= 4
         {
             axes_with_sizes.push((axis_idx, size as usize));
@@ -724,7 +724,7 @@ fn estimate_total_elements(scheduler: &Scheduler) -> i64 {
         let extent = match rng.op() {
             Op::Range { end, .. } => {
                 if let Op::Const(cv) = end.op()
-                    && let morok_ir::ConstValue::Int(sz) = cv.0
+                    && let svod_ir::ConstValue::Int(sz) = cv.0
                     && sz > 0
                 {
                     sz
@@ -774,7 +774,7 @@ pub fn apply_heuristic_upcasts(scheduler: &mut Scheduler) -> bool {
                     if idx < rngs.len()
                         && let Op::Range { end, .. } = rngs[idx].op()
                         && let Op::Const(cv) = end.op()
-                        && let morok_ir::ConstValue::Int(sz) = cv.0
+                        && let svod_ir::ConstValue::Int(sz) = cv.0
                     {
                         Some(sz)
                     } else {
@@ -834,7 +834,7 @@ pub fn apply_heuristic_upcasts(scheduler: &mut Scheduler) -> bool {
             for &upcast_amount in &[3usize, 4] {
                 let size = if let Op::Range { end, .. } = rng.op()
                     && let Op::Const(cv) = end.op()
-                    && let morok_ir::ConstValue::Int(sz) = cv.0
+                    && let svod_ir::ConstValue::Int(sz) = cv.0
                 {
                     sz
                 } else {
@@ -1011,7 +1011,7 @@ pub fn try_tensor_cores(scheduler: &mut Scheduler, config: &HeuristicsConfig) ->
 
         // On AMX, discard the TC'd `trial` and fall through to the regular
         // UPCAST → THREAD → LOCAL chain on the untouched scheduler.
-        // Previously morok committed the TC'd trial back into the scheduler
+        // Previously svod committed the TC'd trial back into the scheduler
         // on AMX, producing kernels with TC + 8 internal `U(0)/U(1)` upcasts
         // and bloated LLVM IR.
         if trial.renderer().is_amx() {

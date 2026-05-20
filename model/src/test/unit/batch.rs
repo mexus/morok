@@ -1,6 +1,6 @@
-use morok_arch::ctc::{CtcDecoder, GreedyDecoder};
-use morok_dtype::DType;
-use morok_tensor::{Tensor, Variable};
+use svod_arch::ctc::{CtcDecoder, GreedyDecoder};
+use svod_dtype::DType;
+use svod_tensor::{Tensor, Variable};
 
 use crate::gigaam::{ConvNormType, GigaAm, GigaAmConfig, GigaAmEncoderJit, SubsamplingMode};
 
@@ -247,7 +247,7 @@ fn test_encode_batch_respects_dynamic_seq_len() {
 
 fn assert_runtime_bounds_err(err: crate::jit::JitError) {
     match err {
-        crate::jit::JitError::Runtime { source: morok_runtime::Error::Execution { reason } } => {
+        crate::jit::JitError::Runtime { source: svod_runtime::Error::Execution { reason } } => {
             assert!(reason.contains("outside bounds"), "unexpected runtime error: {reason}");
         }
         other => panic!("expected runtime bounds error, got {other:?}"),

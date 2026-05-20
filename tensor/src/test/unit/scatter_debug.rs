@@ -7,7 +7,7 @@ use crate::*;
 /// results before pattern chains completed (PtrCat not eliminated).
 #[test]
 fn test_scatternd_debug() {
-    let cfg = PrepareConfig::from(morok_schedule::OptimizerConfig::default());
+    let cfg = PrepareConfig::from(svod_schedule::OptimizerConfig::default());
 
     let data: Vec<f32> = vec![
         1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 8.0, 7.0, 6.0, 5.0, 4.0, 3.0, 2.0, 1.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0,
@@ -26,12 +26,8 @@ fn test_scatternd_debug() {
     ];
 
     let x = Tensor::from_slice(&data).try_reshape([4, 4, 4]).unwrap();
-    let idx = Tensor::from_slice_with()
-        .source(&indices)
-        .device(morok_ir::DeviceSpec::Cpu)
-        .call()
-        .try_reshape([2, 1])
-        .unwrap();
+    let idx =
+        Tensor::from_slice_with().source(&indices).device(svod_ir::DeviceSpec::Cpu).call().try_reshape([2, 1]).unwrap();
     let upd = Tensor::from_slice(&updates).try_reshape([2, 4, 4]).unwrap();
 
     let mut result = x.scatter_nd(&idx, &upd, "none").unwrap();

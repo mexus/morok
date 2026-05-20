@@ -4,9 +4,9 @@
 //! Used by nn modules that want to sample noise matching some reference
 //! tensor (dropout masks, noise injection, gaussian-init layers, etc.).
 
-use morok_dtype::DType;
-use morok_ir::shape::to_vec_usize;
 use snafu::ResultExt;
+use svod_dtype::DType;
+use svod_ir::shape::to_vec_usize;
 
 use crate::{Result, Tensor, UOpSnafu};
 

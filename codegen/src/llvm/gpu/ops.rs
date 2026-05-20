@@ -8,8 +8,8 @@
 //! - WMMA: @llvm.amdgcn.wmma / @llvm.amdgcn.mfma intrinsics
 
 use crate::llvm::common::RenderContext;
-use morok_ir::UOp;
 use std::sync::Arc;
+use svod_ir::UOp;
 
 /// Render a UOp to LLVM IR string for GPU backend.
 ///

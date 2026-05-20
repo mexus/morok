@@ -5,7 +5,7 @@
 
 use std::f32::consts::PI;
 
-use morok_ir::{Op, UOp};
+use svod_ir::{Op, UOp};
 
 use crate::rangeify::try_get_kernel_graph;
 use crate::test::unit::rangeify::helpers::{count_bufferizes, count_codegen_params, count_kernels, extract_kernel};
@@ -130,17 +130,17 @@ fn test_pipeline_mixed_addrspace() {
 fn test_pipeline_reshape_buffer_to_load() {
     // Test that RESHAPE(BUFFER) input is transformed correctly through the pipeline.
     // Uses SINK(CONTIGUOUS(compute)) — the Tinygrad-aligned graph structure.
-    use morok_dtype::DType;
+    use svod_dtype::DType;
 
     // Create input buffer with size 12
-    let input_buffer = UOp::new_buffer(morok_device::DeviceSpec::Cpu, 12, DType::Float32);
+    let input_buffer = UOp::new_buffer(svod_device::DeviceSpec::Cpu, 12, DType::Float32);
 
     // RESHAPE to 3x4
     let reshape_shape = UOp::vectorize(vec![UOp::index_const(3), UOp::index_const(4)].into());
     let reshaped = UOp::new(Op::Reshape { src: input_buffer, new_shape: reshape_shape }, DType::Float32);
 
     // Create another RESHAPE(BUFFER) with same shape
-    let input_buffer2 = UOp::new_buffer(morok_device::DeviceSpec::Cpu, 12, DType::Float32);
+    let input_buffer2 = UOp::new_buffer(svod_device::DeviceSpec::Cpu, 12, DType::Float32);
     let reshape_shape2 = UOp::vectorize(vec![UOp::index_const(3), UOp::index_const(4)].into());
     let reshaped2 = UOp::new(Op::Reshape { src: input_buffer2, new_shape: reshape_shape2 }, DType::Float32);
 
@@ -163,17 +163,17 @@ fn test_pipeline_reshape_buffer_to_load() {
 fn test_full_pipeline_creates_load_for_input_buffers() {
     // Test the FULL pipeline (rangeify + kernel split) creates LOAD for input buffers.
     // Uses SINK(CONTIGUOUS(compute)) — the Tinygrad-aligned graph structure.
-    use morok_dtype::DType;
+    use svod_dtype::DType;
 
     // Create input buffer with size 12
-    let input_buffer = UOp::new_buffer(morok_device::DeviceSpec::Cpu, 12, DType::Float32);
+    let input_buffer = UOp::new_buffer(svod_device::DeviceSpec::Cpu, 12, DType::Float32);
 
     // RESHAPE to 3x4
     let reshape_shape = UOp::vectorize(vec![UOp::index_const(3), UOp::index_const(4)].into());
     let reshaped = UOp::new(Op::Reshape { src: input_buffer, new_shape: reshape_shape }, DType::Float32);
 
     // Create another RESHAPE(BUFFER) with same shape
-    let input_buffer2 = UOp::new_buffer(morok_device::DeviceSpec::Cpu, 12, DType::Float32);
+    let input_buffer2 = UOp::new_buffer(svod_device::DeviceSpec::Cpu, 12, DType::Float32);
     let reshape_shape2 = UOp::vectorize(vec![UOp::index_const(3), UOp::index_const(4)].into());
     let reshaped2 = UOp::new(Op::Reshape { src: input_buffer2, new_shape: reshape_shape2 }, DType::Float32);
 
@@ -194,7 +194,7 @@ fn test_full_pipeline_creates_load_for_input_buffers() {
             Op::Bufferize { .. } => "BUFFERIZE",
             Op::Buffer { .. } => "BUFFER",
             Op::Index { .. } => "INDEX",
-            Op::Binary(morok_ir::BinaryOp::Add, _, _) => "ADD",
+            Op::Binary(svod_ir::BinaryOp::Add, _, _) => "ADD",
             Op::Reshape { .. } => "RESHAPE",
             Op::Sink { .. } => "SINK",
             _ => continue,
@@ -226,7 +226,7 @@ fn test_full_pipeline_creates_load_for_input_buffers() {
                 continue;
             }
             Op::Binary(op, _, _) => match op {
-                morok_ir::BinaryOp::Add => "ADD",
+                svod_ir::BinaryOp::Add => "ADD",
                 _ => "BINARY",
             },
             Op::Param { slot, device: None, .. } => {

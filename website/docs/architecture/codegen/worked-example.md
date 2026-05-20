@@ -145,7 +145,7 @@ When a kernel produces wrong results, the bug lives in one of these 22 stages. U
 
 ```bash
 # See IR after each transformation
-MOROK_DEBUG=ir cargo test failing_test
+SVOD_DEBUG=ir cargo test failing_test
 ```
 
 ### Quick Reference
@@ -182,15 +182,15 @@ Each stage has a single responsibility. Each builds on the last. The result: hig
 
 ---
 
-## Tinygrad vs Morok: Architectural Differences
+## Tinygrad vs Svod: Architectural Differences
 
-This chapter describes the "ideal" 22-stage pipeline based on Tinygrad's implementation. Morok now closely follows this design with minimal differences.
+This chapter describes the "ideal" 22-stage pipeline based on Tinygrad's implementation. Svod now closely follows this design with minimal differences.
 
 ### Remaining Architectural Differences
 
-| Stage | Tinygrad | Morok | Notes |
+| Stage | Tinygrad | Svod | Notes |
 |--------|-----------|-------|--------|
-| 1: Early Movement Ops | Moves movement ops through AFTER/END wrappers via 3 specific patterns (movement through INDEX, AFTER, END) | Removes movement ops during bufferization | Both approaches achieve functional equivalence; Morok's is cleaner |
+| 1: Early Movement Ops | Moves movement ops through AFTER/END wrappers via 3 specific patterns (movement through INDEX, AFTER, END) | Removes movement ops during bufferization | Both approaches achieve functional equivalence; Svod's is cleaner |
 
 ### Aligned Stages (Previously Different)
 
@@ -198,22 +198,22 @@ The following stages were aligned with Tinygrad as of this implementation:
 
 | Stage | What Changed |
 |-------|--------------|
-| 15: Index Dtype Lowering | Morok now has `pm_lower_index_dtype()` with full pattern coverage: Binary ops, CONST, WHERE, VECTORIZE, SPECIAL, DEFINE_VAR, RANGE, CAST cleanup |
+| 15: Index Dtype Lowering | Svod now has `pm_lower_index_dtype()` with full pattern coverage: Binary ops, CONST, WHERE, VECTORIZE, SPECIAL, DEFINE_VAR, RANGE, CAST cleanup |
 | 18: Decompositions | Added: `fast_division_patterns()`, `pm_div_to_shr()`, `pm_fdiv_to_mul()`, `pm_comparison_negations()`, De Morgan's laws |
 | 19: Final Rewrite | `pm_render()` moved from codegen to Stage 19 in schedule pipeline |
 
 ### Tinygrad-Only Patterns
 
-Morok intentionally does not implement these Tinygrad-specific patterns:
+Svod intentionally does not implement these Tinygrad-specific patterns:
 
-| Pattern | Purpose | Why Morok Doesn't Need It |
+| Pattern | Purpose | Why Svod Doesn't Need It |
 |----------|-----------|-----------------------------|
-| `to_bufferview` | Avoid disk buffer copies for DISK/TINYFS devices | Morok doesn't support DISK/TINYFS; in-memory backends don't need this |
-| AFTER/END movement patterns | Move movement ops through timing wrappers | Morok removes movement ops during bufferization instead |
+| `to_bufferview` | Avoid disk buffer copies for DISK/TINYFS devices | Svod doesn't support DISK/TINYFS; in-memory backends don't need this |
+| AFTER/END movement patterns | Move movement ops through timing wrappers | Svod removes movement ops during bufferization instead |
 
-### Morok Enhancements
+### Svod Enhancements
 
-Morok has some patterns/enhancements not in Tinygrad:
+Svod has some patterns/enhancements not in Tinygrad:
 
 | Enhancement | Location | Purpose |
 |-------------|---------|---------|

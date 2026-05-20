@@ -1,5 +1,5 @@
 //! Per-utterance RNN-T step backend implementing
-//! [`morok_arch::rnnt::JointStep`]. Wraps the predictor and joint JITs +
+//! [`svod_arch::rnnt::JointStep`]. Wraps the predictor and joint JITs +
 //! committed/tentative LSTM state.
 //!
 //! For B=1 the search loop owns one of these and drives it through the
@@ -9,8 +9,8 @@
 
 use std::time::{Duration, Instant};
 
-use morok_arch::rnnt::JointStep;
 use snafu::ResultExt;
+use svod_arch::rnnt::JointStep;
 
 use crate::jit::{DeviceSnafu, InputSpec, JitError, JitRecurrent, LstmState, RecurrentJit};
 
@@ -36,7 +36,7 @@ impl RecurrentJit for RnntPredictorStepJit {
         self.execute()
     }
 
-    fn output_buffer(&self) -> crate::jit::Result<&morok_device::Buffer> {
+    fn output_buffer(&self) -> crate::jit::Result<&svod_device::Buffer> {
         self.output()
     }
 }

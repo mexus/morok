@@ -4,8 +4,8 @@
 //! including relu, sigmoid, tanh, softmax, and their variants.
 
 use bon::bon;
-use morok_ir::{ConstValue, UOp};
 use snafu::ResultExt;
+use svod_ir::{ConstValue, UOp};
 
 use crate::reduce::AxisSpec;
 use crate::{Result, Tensor, error::UOpSnafu};

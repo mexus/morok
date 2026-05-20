@@ -12,8 +12,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use morok_dtype::DeviceSpec;
-use morok_ir::{BinaryOp, ConstValue, Op, UOp, UnaryOp};
+use svod_dtype::DeviceSpec;
+use svod_ir::{BinaryOp, ConstValue, Op, UOp, UnaryOp};
 
 use crate::allocator::Allocator;
 use crate::error::{Error, Result};
@@ -336,7 +336,7 @@ pub trait Renderer: Send + Sync {
     /// Returns `None`, meaning no decomposition is needed (backend supports all ops).
     /// Backends that don't support certain operations (e.g., transcendentals)
     /// should override this to return appropriate patterns.
-    fn decompositor(&self) -> Option<morok_ir::pattern::TypedPatternMatcher<()>> {
+    fn decompositor(&self) -> Option<svod_ir::pattern::TypedPatternMatcher<()>> {
         None
     }
 }

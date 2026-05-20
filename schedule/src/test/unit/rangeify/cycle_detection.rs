@@ -5,9 +5,9 @@
 
 use std::sync::Arc;
 
-use morok_device::DeviceSpec;
-use morok_dtype::DType;
-use morok_ir::{UOp, UOpKey};
+use svod_device::DeviceSpec;
+use svod_dtype::DType;
+use svod_ir::{UOp, UOpKey};
 
 use crate::rangeify::transforms::{OpAccessType, as_buf, find_bufs};
 

@@ -522,7 +522,7 @@ fn eval_mulacc(a: ConstValue, b: ConstValue, c: ConstValue) -> Option<ConstValue
 // Dtype-Aware Evaluation (with truncation for constant folding)
 // ============================================================================
 
-use morok_dtype::ScalarDType;
+use svod_dtype::ScalarDType;
 
 /// Evaluate unary op with dtype-aware truncation (for constant folding).
 ///

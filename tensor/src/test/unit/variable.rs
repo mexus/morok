@@ -1,7 +1,7 @@
 #![allow(clippy::approx_constant)]
 
-use morok_dtype::DType;
-use morok_ir::{ConstValue, SInt};
+use svod_dtype::DType;
+use svod_ir::{ConstValue, SInt};
 use test_case::test_case;
 
 use crate::test::helpers::*;
@@ -323,7 +323,7 @@ crate::codegen_tests! {
     #[test_case(8, 8, &[1.0; 8], 8.0; "bind_max")]
     fn test_symbolic_batch_sum(config, bind_val: i64, max_val: i64, data: &[f32], expected: f32) {
         test_setup();
-        morok_schedule::testing::setup_test_tracing();
+        svod_schedule::testing::setup_test_tracing();
         let batch = Variable::new("N", 1, max_val);
         let shape = [batch.bind(bind_val).unwrap().as_sint()];
         let input = Tensor::empty_dynamic(&shape, DType::Float32);

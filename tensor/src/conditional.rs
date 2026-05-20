@@ -4,8 +4,8 @@
 //! minimum, and clamp that are fundamental for many ML operations.
 
 use bon::bon;
-use morok_ir::UOp;
 use snafu::ResultExt;
+use svod_ir::UOp;
 
 use crate::{Result, Tensor, error::UOpSnafu};
 
@@ -33,7 +33,7 @@ impl Tensor {
     /// // result = [0.0, 0.0, 3.0, 4.0]
     /// ```
     pub fn where_(&self, condition: &Tensor, other: &Tensor) -> Result<Self> {
-        use morok_ir::shape::{align_shapes_left, broadcast_shapes};
+        use svod_ir::shape::{align_shapes_left, broadcast_shapes};
 
         let cond_shape = condition.shape()?;
         let self_shape = self.shape()?;

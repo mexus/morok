@@ -4,7 +4,7 @@ sidebar_label: Практические примеры
 
 # Практика: от тензоров до моделей
 
-Эта глава обучает Morok через последовательные примеры. Начнём с базовых тензорных операций и дойдём до рабочего нейросетевого классификатора.
+Эта глава обучает Svod через последовательные примеры. Начнём с базовых тензорных операций и дойдём до рабочего нейросетевого классификатора.
 
 **Чему вы научитесь:**
 - Создание и манипуляции с тензорами
@@ -15,9 +15,9 @@ sidebar_label: Практические примеры
 
 **Предварительные требования:**
 - Базовое знание Rust
-- Добавить `morok_tensor` в `Cargo.toml`
+- Добавить `svod_tensor` в `Cargo.toml`
 
-**Ключевой паттерн:** Morok использует *ленивые вычисления*. Операции строят граф вычислений без выполнения. Вызов `realize()` компилирует и запускает всё разом.
+**Ключевой паттерн:** Svod использует *ленивые вычисления*. Операции строят граф вычислений без выполнения. Вызов `realize()` компилирует и запускает всё разом.
 
 ---
 
@@ -26,7 +26,7 @@ sidebar_label: Практические примеры
 Создадим тензоры, выполним операции и получим результаты.
 
 ```rust
-use morok_tensor::Tensor;
+use svod_tensor::Tensor;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create tensors from slices
@@ -53,7 +53,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 2. `&a + &b` ничего не вычисляет. Возвращается новый `Tensor`, который *описывает* сложение. `&` заимствует тензоры, чтобы их можно было использовать повторно.
 
-3. `realize()` — здесь происходит магия. Morok:
+3. `realize()` — здесь происходит магия. Svod:
    - Анализирует граф вычислений
    - Фьюзит операции, где это возможно
    - Генерирует оптимизированный код
@@ -178,14 +178,14 @@ fn matmul_example() -> Result<(), Box<dyn std::error::Error>> {
 
 ## Пример 4: Линейный слой
 
-Линейный слой вычисляет `y = x @ W.T + b`. Morok предоставляет `nn::Linear` из коробки.
+Линейный слой вычисляет `y = x @ W.T + b`. Svod предоставляет `nn::Linear` из коробки.
 
 ```rust
-use morok_tensor::{Tensor, nn::{Linear, Layer}};
+use svod_tensor::{Tensor, nn::{Linear, Layer}};
 
 fn linear_example() -> Result<(), Box<dyn std::error::Error>> {
     // Create a layer: 4 inputs → 2 outputs
-    let layer = Linear::with_dims(4, 2, morok_dtype::DType::Float32);
+    let layer = Linear::with_dims(4, 2, svod_dtype::DType::Float32);
 
     // Single sample with 4 features
     let input = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0]);
@@ -216,12 +216,12 @@ fn linear_example() -> Result<(), Box<dyn std::error::Error>> {
 Построим полноценную нейросеть, используя `sequential()` для цепочки слоёв.
 
 ```rust
-use morok_tensor::{Tensor, nn::{Linear, Relu, Layer}};
+use svod_tensor::{Tensor, nn::{Linear, Relu, Layer}};
 
 fn mnist_example() -> Result<(), Box<dyn std::error::Error>> {
     // Architecture: 784 (28×28 pixels) → 128 (hidden) → 10 (digits)
-    let fc1 = Linear::with_dims(784, 128, morok_dtype::DType::Float32);
-    let fc2 = Linear::with_dims(128, 10, morok_dtype::DType::Float32);
+    let fc1 = Linear::with_dims(784, 128, svod_dtype::DType::Float32);
+    let fc2 = Linear::with_dims(128, 10, svod_dtype::DType::Float32);
 
     // Simulate a 28×28 grayscale image (flattened to 784)
     let fake_image: Vec<f32> = (0..784)
@@ -263,7 +263,7 @@ fn mnist_example() -> Result<(), Box<dyn std::error::Error>> {
 
 ## Пример 6: Под капотом
 
-Хотите увидеть, что генерирует Morok? Вот как заглянуть в IR и сгенерированный код.
+Хотите увидеть, что генерирует Svod? Вот как заглянуть в IR и сгенерированный код.
 
 ```rust
 fn inspect_compilation() -> Result<(), Box<dyn std::error::Error>> {
@@ -288,9 +288,9 @@ fn inspect_compilation() -> Result<(), Box<dyn std::error::Error>> {
 
 **Что вы увидите:**
 
-1. **IR-граф:** UOp-дерево показывает операции вроде `BUFFER`, `LOAD`, `ADD`, `STORE`. Это промежуточное представление Morok до оптимизаций.
+1. **IR-граф:** UOp-дерево показывает операции вроде `BUFFER`, `LOAD`, `ADD`, `STORE`. Это промежуточное представление Svod до оптимизаций.
 
-2. **Сгенерированный код:** Реальный LLVM IR или GPU-код, который выполняется. Обратите внимание, как Morok фьюзит загрузки и сложение в одно ядро — промежуточные буферы не нужны.
+2. **Сгенерированный код:** Реальный LLVM IR или GPU-код, который выполняется. Обратите внимание, как Svod фьюзит загрузки и сложение в одно ядро — промежуточные буферы не нужны.
 
 **Совет по отладке:** Если что-то кажется медленным или неправильным, напечатайте IR-дерево. Ищите:
 - Неожиданные операции (лишние reshape, дополнительные копии)
@@ -301,7 +301,7 @@ fn inspect_compilation() -> Result<(), Box<dyn std::error::Error>> {
 
 ## Итого
 
-Вы освоили основные паттерны работы с Morok:
+Вы освоили основные паттерны работы с Svod:
 
 | Задача | Код |
 |--------|-----|
@@ -321,7 +321,7 @@ fn inspect_compilation() -> Result<(), Box<dyn std::error::Error>> {
 
 1. Постройте граф вычислений с помощью операций
 2. Вызовите `realize()` один раз в конце
-3. Morok оптимизирует и выполняет всё вместе
+3. Svod оптимизирует и выполняет всё вместе
 
 **Дальше:**
 

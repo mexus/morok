@@ -1,4 +1,4 @@
-//! Kernel optimization layer for morok-schedule.
+//! Kernel optimization layer for svod-schedule.
 //!
 //! Provides a `Scheduler` that applies optimization primitives (OptOps) to transform
 //! kernel execution for better performance on specific backends.
@@ -26,7 +26,7 @@
 //! # Example
 //!
 //! ```ignore
-//! use morok_schedule::optimizer::{Scheduler, Renderer, Opt, OptOps};
+//! use svod_schedule::optimizer::{Scheduler, Renderer, Opt, OptOps};
 //!
 //! // Create scheduler with CUDA backend
 //! let renderer = Renderer::cuda();
@@ -106,9 +106,9 @@ use std::sync::{Arc, LazyLock};
 ///
 /// # Environment Variables
 ///
-/// * `MOROK_NOOPT=1` - Disable all optimizations (for debugging)
+/// * `SVOD_NOOPT=1` - Disable all optimizations (for debugging)
 /// * `BEAM=N` - Use beam search with width N (future)
-pub fn optimize_kernel(ast: Arc<morok_ir::UOp>, renderer: &Renderer) -> Arc<morok_ir::UOp> {
+pub fn optimize_kernel(ast: Arc<svod_ir::UOp>, renderer: &Renderer) -> Arc<svod_ir::UOp> {
     optimize_kernel_with_config(ast, renderer, &OptimizerConfig::from_env())
 }
 
@@ -131,7 +131,7 @@ pub fn optimize_kernel(ast: Arc<morok_ir::UOp>, renderer: &Renderer) -> Arc<moro
 /// Called by both heuristic and beam search paths for consistent behavior.
 /// For GPU pipelines, use `apply_post_optimization_with_renderer` to enable GPU dimension injection.
 #[tracing::instrument(skip_all)]
-pub fn apply_post_optimization(ast: Arc<morok_ir::UOp>) -> Arc<morok_ir::UOp> {
+pub fn apply_post_optimization(ast: Arc<svod_ir::UOp>) -> Arc<svod_ir::UOp> {
     apply_post_optimization_with_renderer(ast, None)
 }
 
@@ -146,23 +146,20 @@ pub fn apply_post_optimization(ast: Arc<morok_ir::UOp>) -> Arc<morok_ir::UOp> {
 /// * `ast` - The kernel AST to optimize
 /// * `renderer` - Optional renderer for GPU dimension injection
 #[tracing::instrument(skip_all)]
-pub fn apply_post_optimization_with_renderer(
-    ast: Arc<morok_ir::UOp>,
-    renderer: Option<&Renderer>,
-) -> Arc<morok_ir::UOp> {
+pub fn apply_post_optimization_with_renderer(ast: Arc<svod_ir::UOp>, renderer: Option<&Renderer>) -> Arc<svod_ir::UOp> {
     // Save metadata before graph_rewrite destroys it (e.g., KernelInfo with kernel name)
     let saved_metadata = ast.metadata_raw();
 
     tracing::debug!(ast.initial = ast.tree(), node_count = ast.node_count(), "kernel initial");
 
-    // Env-gated per-stage diagnostic. Set MOROK_PER_STAGE_UOPS=1 to print
+    // Env-gated per-stage diagnostic. Set SVOD_PER_STAGE_UOPS=1 to print
     // node_count to stderr after each post-opt stage. Used to pinpoint
-    // which pass blows up on a bloated input. Set MOROK_DUMP_STAGE=<prefix>
+    // which pass blows up on a bloated input. Set SVOD_DUMP_STAGE=<prefix>
     // to also dump the full UOp tree at any stage whose label starts with
-    // that prefix (e.g. MOROK_DUMP_STAGE=13 dumps stage 13-pm_add_loads).
-    let dump_per_stage = std::env::var("MOROK_PER_STAGE_UOPS").is_ok();
-    let dump_stage_prefix = std::env::var("MOROK_DUMP_STAGE").ok();
-    let print_stage = |label: &str, node: &Arc<morok_ir::UOp>| {
+    // that prefix (e.g. SVOD_DUMP_STAGE=13 dumps stage 13-pm_add_loads).
+    let dump_per_stage = std::env::var("SVOD_PER_STAGE_UOPS").is_ok();
+    let dump_stage_prefix = std::env::var("SVOD_DUMP_STAGE").ok();
+    let print_stage = |label: &str, node: &Arc<svod_ir::UOp>| {
         if dump_per_stage {
             eprintln!("[per-stage] {} : node_count={}", label, node.node_count());
         }
@@ -225,10 +222,10 @@ pub fn apply_post_optimization_with_renderer(
     // CONTIGUOUS(BUFFER) becomes the STORE value directly, and codegen rejects
     // it (STORE expects a value, not a buffer pointer).
     // Helper closure: check for UNROLL(GROUP) in graph
-    let check_unroll_group = |label: &str, root: &Arc<morok_ir::UOp>| {
+    let check_unroll_group = |label: &str, root: &Arc<svod_ir::UOp>| {
         for node in root.toposort() {
-            if let morok_ir::Op::Unroll { src, unroll_axes, .. } = node.op()
-                && matches!(src.op(), morok_ir::Op::Group { .. })
+            if let svod_ir::Op::Unroll { src, unroll_axes, .. } = node.op()
+                && matches!(src.op(), svod_ir::Op::Group { .. })
             {
                 tracing::error!(id = node.id, axes = ?unroll_axes, stage = label, "UNROLL(GROUP) found!");
             }
@@ -303,7 +300,7 @@ pub fn apply_post_optimization_with_renderer(
         check_unroll_group("after_pm_add_loads", &with_loads);
         // Also check for any UNROLL or CONTRACT
         for node in with_loads.toposort() {
-            if let morok_ir::Op::Unroll { src, unroll_axes, .. } = node.op() {
+            if let svod_ir::Op::Unroll { src, unroll_axes, .. } = node.op() {
                 tracing::error!(
                     id = node.id,
                     src_op = src.op().as_ref(),
@@ -311,7 +308,7 @@ pub fn apply_post_optimization_with_renderer(
                     "BEFORE devectorize: found UNROLL!"
                 );
             }
-            if let morok_ir::Op::Contract { src, upcast_ranges, .. } = node.op() {
+            if let svod_ir::Op::Contract { src, upcast_ranges, .. } = node.op() {
                 tracing::error!(
                     id = node.id,
                     src_op = src.op().as_ref(),
@@ -410,11 +407,11 @@ pub fn apply_post_optimization_with_renderer(
     let fp8_bpm = pm_float_decomp_store();
     let mut fp8_decomposed = rendered;
     for (fr, to) in [
-        (morok_dtype::ScalarDType::FP8E5M2, morok_dtype::ScalarDType::Float16),
-        (morok_dtype::ScalarDType::FP8E4M3, morok_dtype::ScalarDType::Float16),
+        (svod_dtype::ScalarDType::FP8E5M2, svod_dtype::ScalarDType::Float16),
+        (svod_dtype::ScalarDType::FP8E4M3, svod_dtype::ScalarDType::Float16),
     ] {
         let mut ctx = Fp8DecompCtx { from: fr, to };
-        fp8_decomposed = morok_ir::rewrite::graph_rewrite_with_bpm(&fp8_pm, &fp8_bpm, fp8_decomposed, &mut ctx);
+        fp8_decomposed = svod_ir::rewrite::graph_rewrite_with_bpm(&fp8_pm, &fp8_bpm, fp8_decomposed, &mut ctx);
     }
     tracing::debug!(
         ast.optimized = fp8_decomposed.tree(),
@@ -443,9 +440,9 @@ pub fn apply_post_optimization_with_renderer(
     }
 }
 
-fn assert_gated_loads_have_alt(stage: &str, root: &Arc<morok_ir::UOp>) {
+fn assert_gated_loads_have_alt(stage: &str, root: &Arc<svod_ir::UOp>) {
     for node in root.toposort() {
-        let morok_ir::Op::Load { index, alt, .. } = node.op() else {
+        let svod_ir::Op::Load { index, alt, .. } = node.op() else {
             continue;
         };
         if index_has_gate(index) && alt.is_none() {
@@ -454,10 +451,10 @@ fn assert_gated_loads_have_alt(stage: &str, root: &Arc<morok_ir::UOp>) {
     }
 }
 
-fn index_has_gate(index: &Arc<morok_ir::UOp>) -> bool {
+fn index_has_gate(index: &Arc<svod_ir::UOp>) -> bool {
     match index.op() {
-        morok_ir::Op::Index { gate: Some(_), .. } => true,
-        morok_ir::Op::Cast { src, .. } => index_has_gate(src),
+        svod_ir::Op::Index { gate: Some(_), .. } => true,
+        svod_ir::Op::Cast { src, .. } => index_has_gate(src),
         _ => false,
     }
 }
@@ -525,7 +522,7 @@ fn pm_mod_to_idiv() -> &'static crate::TypedPatternMatcher {
 ///
 /// Called by both heuristic and beam search paths.
 #[tracing::instrument(skip_all)]
-pub fn apply_pre_optimization(ast: Arc<morok_ir::UOp>) -> Arc<morok_ir::UOp> {
+pub fn apply_pre_optimization(ast: Arc<svod_ir::UOp>) -> Arc<svod_ir::UOp> {
     tracing::debug!(ast.initial = ast.tree(), node_count = ast.node_count(), "kernel initial");
 
     use crate::rangeify::transforms::SplitRangesContext;
@@ -596,10 +593,10 @@ pub fn apply_pre_optimization(ast: Arc<morok_ir::UOp>) -> Arc<morok_ir::UOp> {
 /// beam search requires a `compile_and_time` function from the runtime.
 /// Use `optimize_kernel_beam()` for actual beam search optimization.
 pub fn optimize_kernel_with_config(
-    ast: Arc<morok_ir::UOp>,
+    ast: Arc<svod_ir::UOp>,
     renderer: &Renderer,
     config: &OptimizerConfig,
-) -> Arc<morok_ir::UOp> {
+) -> Arc<svod_ir::UOp> {
     // Pre-optimization: per-kernel stages.
     let pre_optimized = apply_pre_optimization(ast);
 
@@ -625,10 +622,10 @@ pub fn optimize_kernel_with_config(
 ///
 /// Prefer `optimize_kernel_with_config` for new code.
 pub fn optimize_kernel_with_strategy(
-    ast: Arc<morok_ir::UOp>,
+    ast: Arc<svod_ir::UOp>,
     renderer: &Renderer,
     strategy: OptStrategy,
-) -> Arc<morok_ir::UOp> {
+) -> Arc<svod_ir::UOp> {
     let config = OptimizerConfig { strategy, ..Default::default() };
     optimize_kernel_with_config(ast, renderer, &config)
 }
@@ -653,8 +650,8 @@ pub fn optimize_kernel_with_strategy(
 /// # Example
 ///
 /// ```ignore
-/// use morok_schedule::optimizer::{optimize_kernel_beam, BeamConfig, Renderer};
-/// use morok_runtime::{BenchmarkConfig, benchmark_kernel};
+/// use svod_schedule::optimizer::{optimize_kernel_beam, BeamConfig, Renderer};
+/// use svod_runtime::{BenchmarkConfig, benchmark_kernel};
 ///
 /// let config = BeamConfig::from_env();
 /// let renderer = Renderer::cpu();
@@ -670,7 +667,7 @@ pub fn optimize_kernel_with_strategy(
 /// let optimized_ast = result.scheduler.get_optimized_ast(None);
 /// ```
 pub fn optimize_kernel_beam<F>(
-    ast: Arc<morok_ir::UOp>,
+    ast: Arc<svod_ir::UOp>,
     renderer: &Renderer,
     config: &BeamConfig,
     compile_and_time: F,
@@ -704,7 +701,7 @@ where
 /// # Returns
 ///
 /// A `Scheduler` with loops converted to globals (if applicable).
-pub fn prepare_scheduler(ast: Arc<morok_ir::UOp>, renderer: &Renderer) -> Scheduler {
+pub fn prepare_scheduler(ast: Arc<svod_ir::UOp>, renderer: &Renderer) -> Scheduler {
     let pre_optimized = apply_pre_optimization(ast);
     let mut scheduler = Scheduler::new(pre_optimized, renderer.clone());
     let _ = scheduler.convert_loop_to_global(); // GPU: LOOP→GLOBAL
@@ -714,7 +711,7 @@ pub fn prepare_scheduler(ast: Arc<morok_ir::UOp>, renderer: &Renderer) -> Schedu
 }
 
 /// Apply heuristic-based optimizations.
-fn optimize_heuristic(ast: Arc<morok_ir::UOp>, renderer: &Renderer, config: &HeuristicsConfig) -> Arc<morok_ir::UOp> {
+fn optimize_heuristic(ast: Arc<svod_ir::UOp>, renderer: &Renderer, config: &HeuristicsConfig) -> Arc<svod_ir::UOp> {
     // Step 1: Create scheduler (AST already simplified by apply_pre_optimization Stage 3)
     let mut scheduler = Scheduler::new(ast, renderer.clone());
 

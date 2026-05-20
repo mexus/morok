@@ -1,11 +1,11 @@
 use std::sync::Arc;
 
-use morok_device::device::Device;
-use morok_device::registry::DeviceRegistry;
-use morok_ir::DeviceSpec;
-use morok_runtime::CpuBackend;
-use morok_schedule::OptimizerConfig;
 use snafu::ResultExt;
+use svod_device::device::Device;
+use svod_device::registry::DeviceRegistry;
+use svod_ir::DeviceSpec;
+use svod_runtime::CpuBackend;
+use svod_schedule::OptimizerConfig;
 
 use crate::error::{DeviceFactorySnafu, DeviceSnafu};
 
@@ -19,12 +19,12 @@ pub(crate) trait DeviceResolver: Send + Sync {
 }
 
 /// Default resolver: delegates to `DEVICE_FACTORIES` singleton (reads env vars
-/// like `MOROK_CPU_BACKEND` at first device creation, then caches).
+/// like `SVOD_CPU_BACKEND` at first device creation, then caches).
 struct EnvResolver;
 
 impl DeviceResolver for EnvResolver {
     fn resolve(&self, spec: &DeviceSpec, registry: &DeviceRegistry) -> crate::Result<Arc<Device>> {
-        morok_runtime::DEVICE_FACTORIES.device(spec, registry).context(DeviceFactorySnafu)
+        svod_runtime::DEVICE_FACTORIES.device(spec, registry).context(DeviceFactorySnafu)
     }
 }
 
@@ -36,9 +36,9 @@ impl DeviceResolver for CpuBackendResolver {
     fn resolve(&self, spec: &DeviceSpec, registry: &DeviceRegistry) -> crate::Result<Arc<Device>> {
         match spec {
             DeviceSpec::Cpu => {
-                Ok(Arc::new(morok_runtime::create_cpu_device_with_backend(registry, self.0).context(DeviceSnafu)?))
+                Ok(Arc::new(svod_runtime::create_cpu_device_with_backend(registry, self.0).context(DeviceSnafu)?))
             }
-            _ => morok_runtime::DEVICE_FACTORIES.device(spec, registry).context(DeviceFactorySnafu),
+            _ => svod_runtime::DEVICE_FACTORIES.device(spec, registry).context(DeviceFactorySnafu),
         }
     }
 }
@@ -46,14 +46,14 @@ impl DeviceResolver for CpuBackendResolver {
 /// Configuration for `prepare()`/`realize()` that bundles optimizer settings
 /// with device resolution (codegen backend selection).
 ///
-/// Instead of relying on the `MOROK_CPU_BACKEND` env var (global mutable state),
+/// Instead of relying on the `SVOD_CPU_BACKEND` env var (global mutable state),
 /// the backend is selected per-call via a [`DeviceResolver`].
 #[allow(rustdoc::private_intra_doc_links)]
 pub struct PrepareConfig {
     pub optimizer: OptimizerConfig,
     pub(crate) resolver: Arc<dyn DeviceResolver>,
     /// When `true`, force the cache-cold rangeify/scheduling path even if
-    /// `MOROK_DISABLE_SCHEDULE_CACHE` is unset. Primarily useful in tests
+    /// `SVOD_DISABLE_SCHEDULE_CACHE` is unset. Primarily useful in tests
     /// that need to compare cache-warm vs cache-cold outputs without mutating
     /// process-global env state.
     pub disable_schedule_cache: bool,
@@ -75,14 +75,14 @@ impl Default for PrepareConfig {
 }
 
 impl PrepareConfig {
-    /// Read both `MOROK_CPU_BACKEND` and optimizer env vars.
+    /// Read both `SVOD_CPU_BACKEND` and optimizer env vars.
     pub fn from_env() -> Self {
         Self { optimizer: OptimizerConfig::from_env(), resolver: Arc::new(EnvResolver), disable_schedule_cache: false }
     }
 
     /// Convenience constructor: specific CPU backend with optimizer settings
-    /// resolved from env (`BEAM`, `MOROK_NOOPT`, `IGNORE_BEAM_CACHE`,
-    /// `BEAM_*`, `MOROK_*`). Used by the `codegen_tests!` macro so a single
+    /// resolved from env (`BEAM`, `SVOD_NOOPT`, `IGNORE_BEAM_CACHE`,
+    /// `BEAM_*`, `SVOD_*`). Used by the `codegen_tests!` macro so a single
     /// `BEAM=4 cargo test` flips every codegen-test target to BEAM
     /// without changing test bodies.
     pub fn for_cpu_backend(backend: CpuBackend) -> Self {
@@ -160,7 +160,7 @@ macro_rules! codegen_tests {
             #[test]
             $(#[$meta])*
             fn clang() {
-                ::morok_schedule::testing::setup_test_tracing();
+                ::svod_schedule::testing::setup_test_tracing();
                 let $config = $crate::PrepareConfig::for_cpu_backend($crate::CpuBackend::Clang);
                 $body
             }
@@ -168,7 +168,7 @@ macro_rules! codegen_tests {
             #[test]
             $(#[$meta])*
             fn llvm() {
-                ::morok_schedule::testing::setup_test_tracing();
+                ::svod_schedule::testing::setup_test_tracing();
                 let $config = $crate::PrepareConfig::for_cpu_backend($crate::CpuBackend::Llvm);
                 $body
             }
@@ -200,7 +200,7 @@ macro_rules! codegen_tests {
             #[allow(unused_parens)]
             $(#[$meta])*
             fn clang() {
-                ::morok_schedule::testing::setup_test_tracing();
+                ::svod_schedule::testing::setup_test_tracing();
                 let mut runner = $runner;
                 runner.run(&($($strategy),+), |($($param),+)| {
                     let $config = $crate::PrepareConfig::for_cpu_backend($crate::CpuBackend::Clang);
@@ -213,7 +213,7 @@ macro_rules! codegen_tests {
             #[allow(unused_parens)]
             $(#[$meta])*
             fn llvm() {
-                ::morok_schedule::testing::setup_test_tracing();
+                ::svod_schedule::testing::setup_test_tracing();
                 let mut runner = $runner;
                 runner.run(&($($strategy),+), |($($param),+)| {
                     let $config = $crate::PrepareConfig::for_cpu_backend($crate::CpuBackend::Llvm);
@@ -234,7 +234,7 @@ macro_rules! codegen_tests {
 
                 $(#[$meta])*
                 fn $name($($param: $ty),+) {
-                    ::morok_schedule::testing::setup_test_tracing();
+                    ::svod_schedule::testing::setup_test_tracing();
                     let $config = $crate::PrepareConfig::for_cpu_backend($crate::CpuBackend::Clang);
                     $body
                 }
@@ -246,7 +246,7 @@ macro_rules! codegen_tests {
 
                 $(#[$meta])*
                 fn $name($($param: $ty),+) {
-                    ::morok_schedule::testing::setup_test_tracing();
+                    ::svod_schedule::testing::setup_test_tracing();
                     let $config = $crate::PrepareConfig::for_cpu_backend($crate::CpuBackend::Llvm);
                     $body
                 }

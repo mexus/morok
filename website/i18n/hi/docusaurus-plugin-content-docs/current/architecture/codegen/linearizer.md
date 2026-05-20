@@ -48,7 +48,7 @@ After:   ADD(GEP(arr_a, idx), GEP(arr_b, idx))
 
 ज़्यादातर बैकएंड (CPU, GPU) को इसकी ज़रूरत नहीं। सिर्फ़ स्पेशलाइज़्ड हार्डवेयर इस्तेमाल करता है।
 
-**नोट**: Morok अभी इस स्टेज को इम्प्लीमेंट नहीं करता। `Renderer` trait में `render()`, `backend_name()`, और `decompositor()` मेथड हैं, लेकिन `pre_matcher` सपोर्ट अभी नहीं है। यह DSP और दूसरे स्पेशलाइज़्ड बैकएंड के लिए फ़्यूचर एनहैंसमेंट है।
+**नोट**: Svod अभी इस स्टेज को इम्प्लीमेंट नहीं करता। `Renderer` trait में `render()`, `backend_name()`, और `decompositor()` मेथड हैं, लेकिन `pre_matcher` सपोर्ट अभी नहीं है। यह DSP और दूसरे स्पेशलाइज़्ड बैकएंड के लिए फ़्यूचर एनहैंसमेंट है।
 
 ---
 
@@ -82,7 +82,7 @@ After:   ADD(GEP(arr_a, idx), GEP(arr_b, idx))
 
 Transcendental function approximations (SIN, EXP, LOG, आदि) `decompositor()` pathway से इम्प्लीमेंट हैं (`ir/src/decompositions/transcendentals.rs` देखें)।
 
-**Morok**: `optimizer/mod.rs`
+**Svod**: `optimizer/mod.rs`
 
 ---
 
@@ -127,7 +127,7 @@ END(END(op, range_a), range_b)
 
 **extra_matcher**: हर बैकएंड अपने फ़ाइनल patterns जोड़ सकता है। इससे जेनेरिक पाइपलाइन बदले बिना हार्डवेयर-स्पेसिफ़िक ऑप्टिमाइज़ेशन मिलते हैं।
 
-**Morok**: `devectorize.rs`, `linearize/mod.rs`, `optimizer/mod.rs`
+**Svod**: `devectorize.rs`, `linearize/mod.rs`, `optimizer/mod.rs`
 
 ---
 
@@ -164,7 +164,7 @@ RANGE_B waits for RANGE_A to complete
 
 Bottom-up ट्रैवर्सल सुनिश्चित करता है कि डिपेंडेंसी leaves से roots तक सही बहे।
 
-**Morok**: `schedule/src/linearize/mod.rs`
+**Svod**: `schedule/src/linearize/mod.rs`
 
 ---
 
@@ -188,7 +188,7 @@ Bottom-up ट्रैवर्सल सुनिश्चित करता �
 | DEFINE_VAR | -19 | वेरिएबल पहले डिफ़ाइन होने चाहिए |
 | DEFINE_LOCAL | -18 | एलोकेशन पहले |
 | DEFINE_REG | -17 | रजिस्टर पहले |
-| CONST | -10 | Reuse के लिए constants जल्दी (Morok एक्सटेंशन; Tinygrad डिफ़ॉल्ट 0) |
+| CONST | -10 | Reuse के लिए constants जल्दी (Svod एक्सटेंशन; Tinygrad डिफ़ॉल्ट 0) |
 | LOAD | -1 | इस्तेमाल से पहले Loads |
 | END | -5 | Ranges बंद करता है |
 | STORE | +1 | कम्प्यूटेशन के बाद Stores |
@@ -208,7 +208,7 @@ run_count = prod(int(r.vmax) + 1 for r in u.ranges)
 ```
 यह कैलकुलेट करता है कि enclosing ranges के आधार पर ऑपरेशन कितनी बार एक्ज़ीक्यूट होता है।
 
-**Morok**: `schedule/src/linearize/mod.rs`
+**Svod**: `schedule/src/linearize/mod.rs`
 
 ---
 
@@ -236,4 +236,4 @@ STORE(INDEX(ptr, idx, valid=cond), value)
 
 इस पॉइंट पर, इंस्ट्रक्शन लिस्ट कोड जनरेशन के लिए तैयार है।
 
-**Morok**: `schedule/src/linearize/mod.rs` (predicated stores path)
+**Svod**: `schedule/src/linearize/mod.rs` (predicated stores path)

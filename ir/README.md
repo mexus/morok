@@ -1,12 +1,12 @@
-# morok-ir
+# svod-ir
 
 Core IR with UOp graph representation, operations, and symbolic integers.
 
 ## Example
 
 ```rust
-use morok_ir::{UOp, ConstValue};
-use morok_dtype::DType;
+use svod_ir::{UOp, ConstValue};
+use svod_dtype::DType;
 
 let a = UOp::const_(DType::float32(), ConstValue::Float(1.0));
 let b = UOp::const_(DType::float32(), ConstValue::Float(2.0));
@@ -23,7 +23,7 @@ let sum = a.try_add_op(&b).unwrap();  // panics if types incompatible
 UOp creation locations are automatically tracked via `#[track_caller]`. This enables debugging by tracing where each node originated in Rust source code.
 
 ```rust
-use morok_ir::provenance::PROVENANCE_TRACKER;
+use svod_ir::provenance::PROVENANCE_TRACKER;
 
 let c = UOp::const_(DType::Float32, ConstValue::Float(1.5));
 
@@ -75,5 +75,5 @@ PROVENANCE_TRACKER.with(|t| {
 ## Testing
 
 ```bash
-cargo test -p morok-ir
+cargo test -p svod-ir
 ```

@@ -1,8 +1,8 @@
 //! Unit tests for AMX helper functions.
 
 use crate::mlir::amx::{fma_opcode_and_flags, validate_amx_dtypes, z_row_stride};
-use morok_dtype::DType;
-use morok_ir::{RendererDevice, WmmaMetadata, WmmaUpcastAxes};
+use svod_dtype::DType;
+use svod_ir::{RendererDevice, WmmaMetadata, WmmaUpcastAxes};
 
 /// Helper to create minimal WmmaMetadata for testing.
 fn make_metadata(dtype_in: DType, dtype_out: DType) -> WmmaMetadata {

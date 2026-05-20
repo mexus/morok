@@ -15,10 +15,10 @@
 
 use std::sync::Arc;
 
-use morok_dtype::DType;
-use morok_ir::types::ConstValue;
-use morok_ir::{BinaryOp, Op, ReduceOp, UOp};
 use smallvec::smallvec;
+use svod_dtype::DType;
+use svod_ir::types::ConstValue;
+use svod_ir::{BinaryOp, Op, ReduceOp, UOp};
 
 use super::helpers::*;
 
@@ -330,7 +330,7 @@ fn test_reduce_in_full_pipeline() {
     use crate::devectorize::pm_reduce;
     use crate::rewrite::graph_rewrite;
     use crate::symbolic::patterns::gep_pushing_patterns;
-    use morok_dtype::{AddrSpace, DeviceSpec};
+    use svod_dtype::{AddrSpace, DeviceSpec};
 
     // Create a realistic REDUCE scenario
     let reduce_range = create_range_reduce(32, 0);

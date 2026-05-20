@@ -12,7 +12,7 @@ use std::sync::{Arc, OnceLock};
 
 use papaya::HashMap;
 
-use morok_ir::UOp;
+use svod_ir::UOp;
 
 /// Compute a deterministic content hash for a UOp tree.
 ///

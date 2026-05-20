@@ -1,11 +1,11 @@
 //! CTC projection head: `Conv1d(d_model, vocab_size, k=1)` + transpose +
 //! `LogSoftmax`. Produces the `[B, T, vocab_size]` log-probabilities consumed
-//! by `morok_arch::ctc` decoders — the head itself is just the final
+//! by `svod_arch::ctc` decoders — the head itself is just the final
 //! projection layer, not the decoder.
 
-use morok_dtype::DType;
-use morok_tensor::Tensor;
 use snafu::ResultExt;
+use svod_dtype::DType;
+use svod_tensor::Tensor;
 
 use crate::init::fan_in_uniform;
 use crate::state::{HasStateDict, StateDict};

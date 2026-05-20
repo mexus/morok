@@ -6,9 +6,9 @@
 
 use crate::types::{BinaryOp, ConstValue, TernaryOp, UnaryOp};
 use crate::{Op, UOp};
-use morok_dtype::DType;
 use std::cmp::Ordering;
 use std::sync::Arc;
+use svod_dtype::DType;
 
 /// Sound range analysis — returns `None` for ops where range cannot be soundly computed.
 ///

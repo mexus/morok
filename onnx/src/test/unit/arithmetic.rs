@@ -37,7 +37,7 @@ fn test_cast_fallback() {
     assert!(result.is_ok(), "Cast with invalid dtype should fallback, not crash");
 }
 
-morok_tensor::codegen_tests! {
+svod_tensor::codegen_tests! {
     fn test_registry_add(config) {
         let registry = OpRegistry::new();
         let a = Tensor::from_slice([1.0f32, 2.0, 3.0]);

@@ -4,11 +4,11 @@ sidebar_label: Kernel Search
 
 # Kernel Optimization Search
 
-After algebraic simplification, each kernel needs *scheduling decisions*: how to tile loops, where to parallelize, whether to use tensor cores. Morok offers two strategies: fast heuristics and thorough beam search.
+After algebraic simplification, each kernel needs *scheduling decisions*: how to tile loops, where to parallelize, whether to use tensor cores. Svod offers two strategies: fast heuristics and thorough beam search.
 
 This runs at Stage 7 of the [codegen pipeline](../codegen/overview.md).
 
-Tinygrad source: `tinygrad/codegen/opt/`. Morok source: `schedule/src/optimizer/`.
+Tinygrad source: `tinygrad/codegen/opt/`. Svod source: `schedule/src/optimizer/`.
 
 ---
 
@@ -115,7 +115,7 @@ fn beam_search(scheduler: Scheduler, config: BeamConfig) -> Scheduler {
 
 ```bash
 # Disable optimization (debugging)
-MOROK_NOOPT=1 cargo run
+SVOD_NOOPT=1 cargo run
 
 # Enable beam search with width 8
 BEAM=8 cargo run
@@ -135,7 +135,7 @@ tensor.realize_with(config)?;
 
 ## Comparison: How Other Compilers Optimize
 
-| Aspect | XLA | TVM/Ansor | Triton | **Morok** |
+| Aspect | XLA | TVM/Ansor | Triton | **Svod** |
 |--------|-----|-----------|--------|-----------|
 | **Philosophy** | Fixed heuristics | Search-based | Programmer-guided | Pattern-based |
 | **Fusion** | Conservative rules | Tile-and-fuse | Block-level | Graph rewriting |
@@ -150,4 +150,4 @@ tensor.realize_with(config)?;
 
 **Triton** exposes a Python-like DSL for blocked algorithms. Good balance of control and automation, but requires GPU programming expertise.
 
-**Morok** expresses optimizations as composable patterns. Beam search adds auto-tuning when needed, with results cached by AST hash for reuse.
+**Svod** expresses optimizations as composable patterns. Beam search adds auto-tuning when needed, with results cached by AST hash for reuse.

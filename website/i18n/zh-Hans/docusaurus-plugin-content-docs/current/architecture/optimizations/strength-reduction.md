@@ -7,7 +7,7 @@ sidebar_label: 强度削减
 强度削减将昂贵的操作替换为更廉价的等价操作。这些模式在流水线的后期（阶段 18-19）运行，因为早期 pass 需要看到原始操作结构。例如，`Add(Mul(a, b), c)` 必须保持可见，以便代数化简进行处理，之后才能融合为 `MULACC(a, b, c)`。
 
 Tinygrad 源码：`tinygrad/uop/decompositions.py:438-480`（`get_late_rewrite_patterns`）。
-Morok 源码：`schedule/src/rangeify/patterns.rs`（晚期分解组）+ `schedule/src/symbolic/fast_div.rs`。
+Svod 源码：`schedule/src/rangeify/patterns.rs`（晚期分解组）+ `schedule/src/symbolic/fast_div.rs`。
 
 *本页所有周期估算为现代 x86-64 的近似值。实际延迟因微架构和流水线状态而异。*
 
@@ -27,7 +27,7 @@ Morok 源码：`schedule/src/rangeify/patterns.rs`（晚期分解组）+ `schedu
 
 取模优化之所以有效是因为 `2^n - 1` 是低 n 位的位掩码。示例：`x % 8` = `x & 0b111`。
 
-Tinygrad：`decompositions.py:448-454`。Morok：`rangeify/patterns.rs` 中的 `pm_mod_to_and`、`pm_mul_to_shl`、`pm_div_to_shr`。
+Tinygrad：`decompositions.py:448-454`。Svod：`rangeify/patterns.rs` 中的 `pm_mod_to_and`、`pm_mul_to_shl`、`pm_div_to_shr`。
 
 :::caution 有符号除法
 对于有符号整数，`x // 2^n` **不是**简单的 `x >> n`。算术右移向负无穷取整，但整数除法向零取整。
@@ -41,9 +41,9 @@ floor(x / 2^n) = (x + 2^n - 1) >> n    when x < 0
                   x >> n                  when x >= 0
 ```
 
-Morok 通过范围分析（`VminVmaxProperty`）检查 `vmin >= 0`，当被除数可证明非负时跳过偏置。Tinygrad 使用 dtype 成员（`dtypes.uints`）达到相同目的。
+Svod 通过范围分析（`VminVmaxProperty`）检查 `vmin >= 0`，当被除数可证明非负时跳过偏置。Tinygrad 使用 dtype 成员（`dtypes.uints`）达到相同目的。
 
-Tinygrad：`decompositions.py:452-454`。Morok：`rangeify/patterns.rs` 中的 `pm_div_to_shr`。
+Tinygrad：`decompositions.py:452-454`。Svod：`rangeify/patterns.rs` 中的 `pm_div_to_shr`。
 :::
 
 有符号二的幂除法的生成 C 代码：
@@ -93,7 +93,7 @@ int result = x >> 3;
 
 循环找到产生有效魔术数的最小 `s`。更小的 `s` 意味着更小的 `M`，这对于在窄整数类型中容纳中间乘积 `x * M` 至关重要。
 
-Morok 实现：`schedule/src/symbolic/fast_div.rs` 中的 `magic_unsigned()`。
+Svod 实现：`schedule/src/symbolic/fast_div.rs` 中的 `magic_unsigned()`。
 
 ### 三阶段策略
 
@@ -147,7 +147,7 @@ x / 7 where x in [0, 255]:
 - 如果 `1/c` 不是有限值则跳过（溢出到 `inf` 意味着 `c` 太小）
 - 仅用于浮点类型
 
-Tinygrad：`decompositions.py:477-479`（基于 FDIV 的后端将 `RECIP` 作为 `1/x` 发出）。Morok：`rangeify/patterns.rs` 中的 `pm_fdiv_to_mul`。
+Tinygrad：`decompositions.py:477-479`（基于 FDIV 的后端将 `RECIP` 作为 `1/x` 发出）。Svod：`rangeify/patterns.rs` 中的 `pm_fdiv_to_mul`。
 
 ```c
 // Before
@@ -167,11 +167,11 @@ float result = x * 0.31831f;  // 1/pi
 
 **为何晚期应用**：早期 pass 需要看到 `Add(Mul(a, b), c)` 结构进行代数化简。如果过早融合，`(x*2 + x*3)` 这样的模式无法化简为 `x*5`，因为 `Mul` 节点会被埋入 MULACC 内。
 
-**移位-加法融合（仅 Tinygrad）**：Tinygrad 还将 `(x << n) + c` 融合为 `MULACC(x, 2^n, c)`，捕获在同一不动点 pass 中 MUL 转 SHL 先运行的情况。此模式尚未移植到 Morok。
+**移位-加法融合（仅 Tinygrad）**：Tinygrad 还将 `(x << n) + c` 融合为 `MULACC(x, 2^n, c)`，捕获在同一不动点 pass 中 MUL 转 SHL 先运行的情况。此模式尚未移植到 Svod。
 
 **守卫**：仅当三个操作数（`a`、`b`、`c`）共享相同的浮点 dtype 时匹配。整数 FMA 不做融合，因为硬件 FMA 指令仅支持浮点。
 
-Tinygrad：`decompositions.py:472-475`。Morok：`rangeify/patterns.rs` 中的 `pm_fma_decomposition`。
+Tinygrad：`decompositions.py:472-475`。Svod：`rangeify/patterns.rs` 中的 `pm_fma_decomposition`。
 
 ---
 
@@ -181,7 +181,7 @@ Tinygrad：`decompositions.py:472-475`。Morok：`rangeify/patterns.rs` 中的 `
 
 NEG 是单条指令（浮点通过 `xorps` 翻转符号位，整数通过 `neg` 取反）。乘以 -1 不必要地占用乘法器流水线 3-4 个周期。
 
-仅当后端支持 `NEG` 作为原生操作时触发。Tinygrad：`decompositions.py:458-459`。Morok：`pm_neg_from_mul`。
+仅当后端支持 `NEG` 作为原生操作时触发。Tinygrad：`decompositions.py:458-459`。Svod：`pm_neg_from_mul`。
 
 ---
 
@@ -203,7 +203,7 @@ NEG 是单条指令（浮点通过 `xorps` 翻转符号位，整数通过 `neg` 
 取反模式防范溢出：`!(x < c)` 变为 `(c-1) < x` 仅当 `c-1` 不下溢时，`!(c < x)` 变为 `x < (c+1)` 仅当 `c+1` 不上溢时。两者都使用 `checked_sub` / `checked_add`，溢出时返回 `None`（不做变换）。
 :::
 
-Tinygrad：`decompositions.py:461-470`。Morok：`rangeify/patterns.rs` 中的 `pm_comparison_negations`。
+Tinygrad：`decompositions.py:461-470`。Svod：`rangeify/patterns.rs` 中的 `pm_comparison_negations`。
 
 ---
 
@@ -220,7 +220,7 @@ Tinygrad：`decompositions.py:461-470`。Morok：`rangeify/patterns.rs` 中的 `
 
 2. **晚期**（阶段 18-19）：`symbolic_simple()` 包含布尔模式，与 `PM_FINAL` 中的强度削减模式一起运行。这捕获比较取反模式创建的新德摩根机会——例如，`!(x < 3)` 和 `!(x < 7)` 被重写为 `2 < x` 和 `6 < x` 后，组合它们的 AND/OR 可能有新的 NOT 消除机会。
 
-Morok：`schedule/src/symbolic/patterns.rs` 中的 `boolean_dsl_patterns()`。
+Svod：`schedule/src/symbolic/patterns.rs` 中的 `boolean_dsl_patterns()`。
 
 ---
 
@@ -234,11 +234,11 @@ where t = 1 / (1 + 0.3275911 * |x|)
       P(t) = Horner(t, [1.061405429, -1.453152027, 1.421413741, -0.284496736, 0.254829592])
 ```
 
-**原因**：`@llvm.erf` 是一个库调用内置函数（需要 libm 链接），不是原生硬件指令。LLVM JIT 后端不链接 libm，所以 `erf` 必须在代码生成之前分解。Tinygrad 在张量层面分解 `erf`（`elementwise.py`），所以它永远不会到达渲染器；Morok 将 `Erf` 保留为 UOp 直到此晚期 pass。
+**原因**：`@llvm.erf` 是一个库调用内置函数（需要 libm 链接），不是原生硬件指令。LLVM JIT 后端不链接 libm，所以 `erf` 必须在代码生成之前分解。Tinygrad 在张量层面分解 `erf`（`elementwise.py`），所以它永远不会到达渲染器；Svod 将 `Erf` 保留为 UOp 直到此晚期 pass。
 
 最大误差：约 1.5e-7（对 float32 ML 工作负载足够）。
 
-Morok：`rangeify/patterns.rs` 中的 `pm_erf_decomposition`。
+Svod：`rangeify/patterns.rs` 中的 `pm_erf_decomposition`。
 
 ---
 

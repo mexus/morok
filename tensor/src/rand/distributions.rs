@@ -11,8 +11,8 @@
 //! | `kaiming_uniform(shape, a)` | `uniform(-b, b)`, `b = √(6 / ((1+a²) · prod(shape[1..])))` |
 //! | `kaiming_normal(shape, a)` | `randn · √(2 / ((1+a²) · prod(shape[1..])))` |
 
-use morok_dtype::DType;
-use morok_ir::ConstValue;
+use svod_dtype::DType;
+use svod_ir::ConstValue;
 
 use crate::{Error, Result, Tensor};
 

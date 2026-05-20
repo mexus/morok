@@ -1,7 +1,7 @@
 use crate::test::helpers::*;
 use ndarray::array;
 
-morok_tensor::codegen_tests! {
+svod_tensor::codegen_tests! {
     fn test_registry_gather(config) {
         let registry = OpRegistry::new();
         let data = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0, 5.0]);

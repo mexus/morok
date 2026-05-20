@@ -1,12 +1,12 @@
 [package]
-name = "morok-arch"
+name = "svod-arch"
 
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Architecture-level algorithms for the Morok ML compiler"
+description = "Architecture-level algorithms for the Svod ML compiler"
 
 [dependencies]
 serde = { version = "1.0", features = ["derive"], optional = true }

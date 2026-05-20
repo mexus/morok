@@ -1,9 +1,9 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use morok_dtype::DType;
-use morok_tensor::Tensor;
 use snafu::{ResultExt, Snafu};
+use svod_dtype::DType;
+use svod_tensor::Tensor;
 
 pub type StateDict = HashMap<String, Tensor>;
 
@@ -19,8 +19,8 @@ pub enum Error {
     MissingKey { key: String },
     #[snafu(display("{source}"))]
     Tensor {
-        #[snafu(source(from(morok_tensor::error::Error, Box::new)))]
-        source: Box<morok_tensor::error::Error>,
+        #[snafu(source(from(svod_tensor::error::Error, Box::new)))]
+        source: Box<svod_tensor::error::Error>,
     },
 }
 

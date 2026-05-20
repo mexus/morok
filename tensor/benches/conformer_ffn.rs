@@ -10,26 +10,26 @@
 //! Override via env vars: `BT=2750 D=768 FF=3072`.
 //!
 //! Configurations exercised:
-//!   - heuristic   (morok's hand-coded heuristic, default)
+//!   - heuristic   (svod's hand-coded heuristic, default)
 //!   - beam_w1    (beam width 1 — single-best candidate per step)
 //!   - beam_w2    (beam width 2)
 //!   - beam_w4    (beam width 4)
 //!
-//! AMX is opt-in via the `MOROK_AMX=1` env var (it switches the optimizer
+//! AMX is opt-in via the `SVOD_AMX=1` env var (it switches the optimizer
 //! renderer from `cpu` to `apple_amx`, which exposes AMX TensorCore tiles
 //! to beam search). Heuristic + AMX won't fire AMX kernels by design — only
 //! beam search applies the TC ops.
 //!
 //! Run with:
-//!   `cargo bench -p morok-tensor --bench conformer_ffn`
-//!   `MOROK_AMX=1 cargo bench -p morok-tensor --bench conformer_ffn`
+//!   `cargo bench -p svod-tensor --bench conformer_ffn`
+//!   `SVOD_AMX=1 cargo bench -p svod-tensor --bench conformer_ffn`
 
 use std::time::Duration;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use morok_dtype::DType;
-use morok_schedule::{HeuristicsConfig, OptStrategy, OptimizerConfig};
-use morok_tensor::{PrepareConfig, Tensor};
+use svod_dtype::DType;
+use svod_schedule::{HeuristicsConfig, OptStrategy, OptimizerConfig};
+use svod_tensor::{PrepareConfig, Tensor};
 
 /// Shape envelope for the FFN forward pass.
 #[derive(Clone, Copy, Debug)]
@@ -91,7 +91,7 @@ fn make_configs() -> Vec<(&'static str, PrepareConfig)> {
 
 fn bench_ffn(c: &mut Criterion) {
     let shape = FfnShape { bt: parse_env("BT", 2750), d: parse_env("D", 768), ff: parse_env("FF", 3072) };
-    let amx = std::env::var("MOROK_AMX").as_deref() == Ok("1");
+    let amx = std::env::var("SVOD_AMX").as_deref() == Ok("1");
 
     eprintln!(
         "\n=== Conformer FFN bench  shape: B*T={} D={} FF={} dtype=f32 amx={} ===",
@@ -113,7 +113,7 @@ fn bench_ffn(c: &mut Criterion) {
         let plan = result.prepare_with(&config).expect("prepare should succeed");
         let prepare_ms = prepare_start.elapsed().as_secs_f64() * 1000.0;
 
-        // Print the kernels morok generated for this config so we can see
+        // Print the kernels svod generated for this config so we can see
         // what tile shapes / opts the optimizer landed on.
         eprintln!("\n--- {label} ---  prepare={:.1}ms  kernels={}", prepare_ms, plan.kernels().count());
         for (i, prepared) in plan.prepared_kernels().into_iter().enumerate() {

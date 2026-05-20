@@ -57,7 +57,7 @@ jit_wrapper! {
 | `vars { name: (min, max), ... }` | compile-time bounds के साथ symbolic shape variables | optional |
 | `build(args...) { ... }` | closure जो inputs और vars से output tensor बनाती है; `model` scope में होता है | हाँ |
 
-`build` arguments में हर एक को या तो किसी input का या किसी declared var का नाम होना चाहिए (macro expansion time पर ऐसे नामों को reject कर देता है जो match नहीं होते)। Block के अंदर, हर input एक `&Tensor` होता है (macro `prepare()` चलने पर एक zero-initialized placeholder allocate करता है), हर var एक `morok_tensor::Variable` होता है जो पहले से अपने upper bound से bound होता है, और `model` wrapper की owned model value का shared reference होता है। Closure किसी भी `E: std::error::Error + Send + Sync + 'static` के लिए `Result<Tensor, E>` return करती है; failures `JitError::Build` के रूप में सामने आती हैं।
+`build` arguments में हर एक को या तो किसी input का या किसी declared var का नाम होना चाहिए (macro expansion time पर ऐसे नामों को reject कर देता है जो match नहीं होते)। Block के अंदर, हर input एक `&Tensor` होता है (macro `prepare()` चलने पर एक zero-initialized placeholder allocate करता है), हर var एक `svod_tensor::Variable` होता है जो पहले से अपने upper bound से bound होता है, और `model` wrapper की owned model value का shared reference होता है। Closure किसी भी `E: std::error::Error + Send + Sync + 'static` के लिए `Result<Tensor, E>` return करती है; failures `JitError::Build` के रूप में सामने आती हैं।
 
 ---
 
@@ -187,7 +187,7 @@ jit_wrapper! {
 
         build(mel, lengths, b, t) {
             let out = model.encoder.forward_batch(mel, lengths, &b, &t)?;
-            out.cast(morok_dtype::DType::Float32).context(TensorSnafu)
+            out.cast(svod_dtype::DType::Float32).context(TensorSnafu)
         }
     }
 }

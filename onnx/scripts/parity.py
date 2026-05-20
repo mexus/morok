@@ -377,7 +377,7 @@ def _run_cargo_tests(test_filter: str, module: str) -> BackendResults:
             "test",
             "--release",
             "-p",
-            "morok-onnx",
+            "svod-onnx",
             test_filter,
             "--",
             "-Z",

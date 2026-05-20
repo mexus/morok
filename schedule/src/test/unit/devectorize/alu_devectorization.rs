@@ -5,9 +5,9 @@
 //!
 //! Based on Tinygrad's no_vectorized_alu (devectorizer.py:219-223).
 
-use morok_dtype::DType;
-use morok_ir::types::ConstValue;
-use morok_ir::{BinaryOp, Op, TernaryOp, UOp, UnaryOp};
+use svod_dtype::DType;
+use svod_ir::types::ConstValue;
+use svod_ir::{BinaryOp, Op, TernaryOp, UOp, UnaryOp};
 
 use super::helpers::*;
 

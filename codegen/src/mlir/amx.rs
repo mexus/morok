@@ -16,9 +16,9 @@ use melior::ir::BlockLike;
 use melior::ir::attribute::{IntegerAttribute, StringAttribute, TypeAttribute};
 use melior::ir::r#type::IntegerType;
 use melior::ir::{Attribute, Block, Location, Type, Value};
-use morok_dtype::DType;
-use morok_dtype::ScalarDType;
-use morok_ir::WmmaMetadata;
+use svod_dtype::DType;
+use svod_dtype::ScalarDType;
+use svod_ir::WmmaMetadata;
 
 use super::ops::const_i64;
 

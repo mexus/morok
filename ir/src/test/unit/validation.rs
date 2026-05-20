@@ -6,7 +6,7 @@ use std::f32::consts::{E, PI};
 
 use smallvec::smallvec;
 
-use morok_dtype::DType;
+use svod_dtype::DType;
 
 use crate::{ConstValue, SInt, UOp, error::Error};
 

@@ -27,14 +27,14 @@ sidebar_label: 阶段 1 — Rangeify
 | INDEX 上的移动操作 | 将移动应用到索引表达式 | `INDEX(PERMUTE(arr), [i, j]) → INDEX(arr, [j, i])` | `movement_op_patterns()` |
 | 穿过 AFTER 的移动操作 | 将 RESHAPE 穿过时序包装器（Tinygrad 特有） | `AFTER(RESHAPE(x, arg), [dep1, dep2]) → RESHAPE(AFTER(x, [dep2]), arg)` | 仅 Tinygrad |
 | 穿过 END 的移动操作 | 从 END 包装器中解除移动操作（Tinygrad 特有） | `END(RESHAPE(x), ranges) → END(x, ranges)` | 仅 Tinygrad |
-| 嵌套 INDEX 简化 | 移除冗余的嵌套 INDEX（Morok） | `INDEX(INDEX(ptr, [i]), [i]) → INDEX(ptr, [i])` | `movement_op_patterns()` |
+| 嵌套 INDEX 简化 | 移除冗余的嵌套 INDEX（Svod） | `INDEX(INDEX(ptr, [i]), [i]) → INDEX(ptr, [i])` | `movement_op_patterns()` |
 | 嵌套 INDEX 拼接 | 对 PtrDType 展平嵌套 INDEX | `INDEX(INDEX(ptr, i), j) → INDEX(ptr, i, j)` | `pm_syntactic_sugar` |
 
 **为什么自底向上？** 子节点必须先清理好，父节点才能匹配。移动操作嵌套很深；从底部开始清理可以防止遗漏模式。
 
-**注意**：Tinygrad 和 Morok 在这里的方法不同。Tinygrad 将移动操作穿过包装器（AFTER、END），因为它在 bufferization 期间会重新应用移动操作。Morok 在 bufferization 期间通过转换索引来彻底移除移动操作，因此不需要 AFTER/END 模式。
+**注意**：Tinygrad 和 Svod 在这里的方法不同。Tinygrad 将移动操作穿过包装器（AFTER、END），因为它在 bufferization 期间会重新应用移动操作。Svod 在 bufferization 期间通过转换索引来彻底移除移动操作，因此不需要 AFTER/END 模式。
 
-**Morok**：`rangeify/patterns.rs` 中的 `movement_op_patterns()`
+**Svod**：`rangeify/patterns.rs` 中的 `movement_op_patterns()`
 
 ---
 
@@ -68,7 +68,7 @@ count = clamp(64 - length, 0, 64)
 
 **注意**：WHERE 穿过 INDEX 的移动（`pm_move_where_on_load`）是一个独立的优化——它在 load 之前放置条件判断以跳过内存访问，但不会消除 REDUCE 操作。
 
-**Morok**：`rangeify/patterns.rs` 中的 `pm_load_collapse()`
+**Svod**：`rangeify/patterns.rs` 中的 `pm_load_collapse()`
 
 ---
 
@@ -104,7 +104,7 @@ After:   RANGE(end=3) * 4 + RANGE(end=4)
 
 **注意**：分割仅在 `end % mod == 0`（整除检查）时适用。
 
-**Morok**：`rangeify/transforms.rs` 中的 `pm_split_ranges()` + `pm_flatten_range()`
+**Svod**：`rangeify/transforms.rs` 中的 `pm_split_ranges()` + `pm_flatten_range()`
 
 ---
 
@@ -152,7 +152,7 @@ NOT(NOT(x)) → x
 - Where 折叠（合并相同条件的 WHERE）
 - Reduce mul 链（将乘法移到 reduce 外面）
 
-**Morok**：`symbolic/patterns.rs` 中的 `symbolic()`
+**Svod**：`symbolic/patterns.rs` 中的 `symbolic()`
 
 ---
 
@@ -185,7 +185,7 @@ RANGE(0..32)
 
 编译器只在能节省操作时才合并。合并可能需要除法/取模来重算索引。如果代价大于收益，就跳过合并。
 
-**Morok**：`rangeify/transforms.rs` 中的 `simplify_merge_adjacent()`
+**Svod**：`rangeify/transforms.rs` 中的 `simplify_merge_adjacent()`
 
 ---
 
@@ -257,4 +257,4 @@ Optimization Search:
 
 **注意**：NOLOCALS 是一个约束，设置 `dont_use_locals = True`，阻止后续 LOCAL 动作并影响共享内存使用决策。
 
-**Morok**：`optimizer/mod.rs`、`optimizer/opts.rs`
+**Svod**：`optimizer/mod.rs`、`optimizer/opts.rs`

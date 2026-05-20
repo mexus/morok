@@ -1,8 +1,8 @@
 //! Silero-VAD-driven [`Splitter`](crate::audio::Splitter) implementation.
 //!
-//! Wraps [`VadInference`] + [`morok_arch::vad::chunks_from_probs`] so the
+//! Wraps [`VadInference`] + [`svod_arch::vad::chunks_from_probs`] so the
 //! pre-refactor `Transcriber` chunking flow is reachable through the generic
-//! splitter trait. Knobs forward to [`ChunkerOpts`](morok_arch::vad::ChunkerOpts)
+//! splitter trait. Knobs forward to [`ChunkerOpts`](svod_arch::vad::ChunkerOpts)
 //! except for `sample_rate`, `samples_per_prob`, and `align_to` — those come
 //! from [`EncoderBounds`](crate::audio::EncoderBounds) at split time.
 
@@ -13,7 +13,7 @@ use crate::audio::{AudioChunk, EncoderBounds, Splitter, trim_chunks_to_waveform}
 use crate::silero_vad::{NUM_SAMPLES, SileroVad, VadInference};
 
 /// VAD-driven splitter. Construction: [`from_hub`](Self::from_hub) loads the
-/// default model from HF and pulls overrides from `MOROK_VAD_THRESHOLD`. For
+/// default model from HF and pulls overrides from `SVOD_VAD_THRESHOLD`. For
 /// custom knobs use [`builder`](Self::builder) and supply a pre-loaded
 /// [`VadInference`].
 pub struct SileroVadSplitter {
@@ -32,12 +32,12 @@ pub struct SileroVadSplitter {
 #[bon]
 impl SileroVadSplitter {
     /// Build from an already-loaded [`VadInference`]. All knob defaults match
-    /// [`ChunkerOpts::default`](morok_arch::vad::ChunkerOpts) except
-    /// `threshold`, which consults `MOROK_VAD_THRESHOLD`.
+    /// [`ChunkerOpts::default`](svod_arch::vad::ChunkerOpts) except
+    /// `threshold`, which consults `SVOD_VAD_THRESHOLD`.
     #[builder]
     pub fn builder(
         vad: VadInference,
-        #[builder(default = std::env::var("MOROK_VAD_THRESHOLD").ok().and_then(|s| s.parse().ok()).unwrap_or(0.5))]
+        #[builder(default = std::env::var("SVOD_VAD_THRESHOLD").ok().and_then(|s| s.parse().ok()).unwrap_or(0.5))]
         threshold: f32,
         #[builder(default = 15.0)] min_duration: f32,
         #[builder(default = 22.0)] max_duration: f32,
@@ -87,7 +87,7 @@ impl Splitter for SileroVadSplitter {
         // `min_duration` clamp the arch chunker's `MinExceedsMax` validator
         // fires when encoder capacity < 15s.
         let cap = bounds.encoder_capacity_secs();
-        let chunker_opts = morok_arch::vad::ChunkerOpts {
+        let chunker_opts = svod_arch::vad::ChunkerOpts {
             sample_rate: bounds.sample_rate,
             samples_per_prob: NUM_SAMPLES,
             threshold: self.threshold,
@@ -102,7 +102,7 @@ impl Splitter for SileroVadSplitter {
             pad_samples: self.pad_samples,
             align_to: bounds.align_to_samples().max(1),
         };
-        let mut chunks = morok_arch::vad::chunks_from_probs(&probs, &chunker_opts).context(ChunkSnafu)?;
+        let mut chunks = svod_arch::vad::chunks_from_probs(&probs, &chunker_opts).context(ChunkSnafu)?;
         // `align_to` rounds chunk ends up to a stride multiple, which can push
         // the trailing chunk past `waveform.len()`. The `Splitter` contract
         // forbids that, so clamp the tail before returning.
@@ -114,14 +114,14 @@ impl Splitter for SileroVadSplitter {
     /// splitter's config. Translating to samples lets `Transcriber::new`
     /// size JIT buffers to this chunker's actual emission rather than the
     /// encoder's full capacity. Shared bound math lives in
-    /// [`morok_arch::vad::strict_chunk_sample_bound`].
+    /// [`svod_arch::vad::strict_chunk_sample_bound`].
     fn max_chunk_samples(&self, bounds: &EncoderBounds) -> usize {
         let cap = bounds.encoder_capacity_secs();
         let secs = self.strict_limit_duration.min(cap);
         let probs_per_sec = bounds.sample_rate as f32 / NUM_SAMPLES as f32;
         let strict_limit_probs = (secs * probs_per_sec).ceil() as usize;
         let radius = self.trough_search_probs.unwrap_or(self.min_silence_probs);
-        morok_arch::vad::strict_chunk_sample_bound(
+        svod_arch::vad::strict_chunk_sample_bound(
             strict_limit_probs,
             radius,
             NUM_SAMPLES,
@@ -150,5 +150,5 @@ pub enum SileroVadSplitterError {
         source: Box<crate::jit::JitError>,
     },
     #[snafu(display("chunker: {source}"))]
-    Chunk { source: morok_arch::vad::Error },
+    Chunk { source: svod_arch::vad::Error },
 }

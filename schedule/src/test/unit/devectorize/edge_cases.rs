@@ -5,10 +5,10 @@
 
 use std::sync::Arc;
 
-use morok_dtype::{DType, ScalarDType};
-use morok_ir::types::ConstValue;
-use morok_ir::{Op, UOp};
 use smallvec::SmallVec;
+use svod_dtype::{DType, ScalarDType};
+use svod_ir::types::ConstValue;
+use svod_ir::{Op, UOp};
 
 use super::helpers::*;
 
@@ -413,13 +413,13 @@ fn test_regression_gep_indices_preserved() {
 fn test_fold_expanded_index_groups_contiguous() {
     use crate::devectorize::load_store_folding_patterns;
     use crate::rewrite::graph_rewrite;
-    use morok_dtype::AddrSpace;
+    use svod_dtype::AddrSpace;
 
     let buf = UOp::param(0, 64, DType::Scalar(ScalarDType::Float32).ptr(Some(64), AddrSpace::Global), None);
     let r1 = UOp::range_axis(
         UOp::const_(DType::Index, ConstValue::Int(16)),
-        morok_ir::AxisId::Renumbered(0),
-        morok_ir::AxisType::Loop,
+        svod_ir::AxisId::Renumbered(0),
+        svod_ir::AxisType::Loop,
     );
 
     // VECTORIZE(INDEX(buf, R+0), INDEX(buf, R+1), INDEX(buf, R+2), INDEX(buf, R+3))
@@ -457,13 +457,13 @@ fn test_fold_expanded_index_groups_contiguous() {
 fn test_fold_expanded_index_no_group_scattered() {
     use crate::devectorize::load_store_folding_patterns;
     use crate::rewrite::graph_rewrite;
-    use morok_dtype::AddrSpace;
+    use svod_dtype::AddrSpace;
 
     let buf = UOp::param(0, 64, DType::Scalar(ScalarDType::Float32).ptr(Some(64), AddrSpace::Global), None);
     let r1 = UOp::range_axis(
         UOp::const_(DType::Index, ConstValue::Int(16)),
-        morok_ir::AxisId::Renumbered(0),
-        morok_ir::AxisType::Loop,
+        svod_ir::AxisId::Renumbered(0),
+        svod_ir::AxisType::Loop,
     );
 
     // VECTORIZE(INDEX(buf, R+0), INDEX(buf, R+16), INDEX(buf, R+32), INDEX(buf, R+48))
@@ -508,7 +508,7 @@ fn test_fold_expanded_index_no_group_scattered() {
 #[test]
 fn test_scatternd_ptrcat_elimination() {
     use crate::devectorize::devectorize;
-    use morok_dtype::AddrSpace;
+    use svod_dtype::AddrSpace;
 
     let dg0 = UOp::param(0, 64, DType::Scalar(ScalarDType::Float32).ptr(Some(64), AddrSpace::Global), None);
     let dg1 = UOp::param(1, 2, DType::Scalar(ScalarDType::Int64).ptr(Some(2), AddrSpace::Global), None);
@@ -520,8 +520,8 @@ fn test_scatternd_ptrcat_elimination() {
 
     let r1 = UOp::range_axis(
         UOp::const_(DType::Index, ConstValue::Int(16)),
-        morok_ir::AxisId::Renumbered(1),
-        morok_ir::AxisType::Loop,
+        svod_ir::AxisId::Renumbered(1),
+        svod_ir::AxisType::Loop,
     );
 
     // Shared offset vector (used by both STORE and LOAD INDEXes)

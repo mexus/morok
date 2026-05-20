@@ -16,7 +16,7 @@ sidebar_label: Индексная арифметика
 - **Стадия 15** (снижение типа индексов через `pm_lower_index_dtype`)
 - **Стадия 16** (пост-индексное символьное)
 
-Исходники Morok: `schedule/src/symbolic/patterns.rs`, `schedule/src/symbolic/index_lowering.rs`
+Исходники Svod: `schedule/src/symbolic/patterns.rs`, `schedule/src/symbolic/index_lowering.rs`
 
 Исходники Tinygrad: `tinygrad/uop/divandmod.py`, `tinygrad/uop/symbolic.py`
 
@@ -185,7 +185,7 @@ Idiv(Add[Idiv(a, c1), _c2], _c3)
 
 **Пример**: `(6*a + 4*b) // 12` → `((6*a + 4*b) // 2) // 6` → `(3*a + 2*b) // 6` → `(3*a + 2*b) // 6` (затем правило 7 завершает).
 
-Tinygrad: `divandmod.py:62-67`. Morok: `nest_div_by_smallest_factor` в `fold_divmod_general`.
+Tinygrad: `divandmod.py:62-67`. Svod: `nest_div_by_smallest_factor` в `fold_divmod_general`.
 
 :::caution
 Правила 5–8 требуют неотрицательных числителей (`x_min >= 0`). Деление с округлением вниз с отрицательными операндами имеет иную семантику округления (к отрицательной бесконечности в Python/Tinygrad, к нулю в аппаратуре). Реализация возвращает `None` для отрицательных диапазонов, позволяя последующим проходам обработать выражение.
@@ -216,7 +216,7 @@ Tinygrad: `divandmod.py:62-67`. Morok: `nest_div_by_smallest_factor` в `fold_di
 
 ## 5. Снижение типа Index (3-фазный каскад)
 
-Tinygrad: `ops.py:1291-1313`. Morok: `schedule/src/symbolic/index_lowering.rs`.
+Tinygrad: `ops.py:1291-1313`. Svod: `schedule/src/symbolic/index_lowering.rs`.
 
 Абстрактный тип `Index` не имеет фиксированной разрядности — он представляет «целое число той разрядности, которая необходима для данного индекса». Проход снижения преобразует `Index` в конкретный `i32` или `i64` на основе границ значений.
 

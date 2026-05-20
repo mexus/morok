@@ -5,8 +5,8 @@
 
 use std::sync::Arc;
 
-use morok_dtype::{AddrSpace, DType, ScalarDType};
-use morok_ir::{AxisId, AxisType, ConstValue, Op, UOp};
+use svod_dtype::{AddrSpace, DType, ScalarDType};
+use svod_ir::{AxisId, AxisType, ConstValue, Op, UOp};
 
 use crate::pattern::RewriteResult;
 use crate::symbolic::index_lowering::pm_lower_index_dtype;

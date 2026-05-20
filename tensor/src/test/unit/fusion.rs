@@ -10,7 +10,7 @@ fn kernel_count(tensor: &mut Tensor) -> usize {
 }
 
 fn e(shape: &[usize]) -> Tensor {
-    Tensor::empty(shape, morok_dtype::DType::Float32)
+    Tensor::empty(shape, svod_dtype::DType::Float32)
 }
 
 // =========================================================================
@@ -95,7 +95,7 @@ fn test_attention_kernels() {
     let k = x.matmul(&wk).unwrap().try_reshape([6, 512, 16, 48]).unwrap().try_permute(&[0, 2, 1, 3]).unwrap();
     let v = x.matmul(&wv).unwrap().try_reshape([6, 512, 16, 48]).unwrap().try_permute(&[0, 2, 1, 3]).unwrap();
     let kt = k.try_permute(&[0, 1, 3, 2]).unwrap();
-    let scale = Tensor::const_(1.0f32 / 48.0f32.sqrt(), morok_dtype::DType::Float32);
+    let scale = Tensor::const_(1.0f32 / 48.0f32.sqrt(), svod_dtype::DType::Float32);
     let attn = &q.matmul(&kt).unwrap() * &scale;
     let attn_w = attn.softmax(-1isize).unwrap();
     let attn_out = attn_w.matmul(&v).unwrap().try_permute(&[0, 2, 1, 3]).unwrap().try_reshape([6, 512, 768]).unwrap();

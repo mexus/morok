@@ -49,7 +49,7 @@ impl Tensor {
     /// # Examples
     ///
     /// ```
-    /// # use morok_tensor::Tensor;
+    /// # use svod_tensor::Tensor;
     /// # use ndarray::{array, Array3};
     /// // seq=2, batch=1, input=3
     /// let x = Tensor::from_ndarray(&Array3::from_elem((2, 1, 3), 0.1f32));
@@ -174,7 +174,7 @@ impl Tensor {
     /// # Examples
     ///
     /// ```
-    /// # use morok_tensor::Tensor;
+    /// # use svod_tensor::Tensor;
     /// # use ndarray::{array, Array3};
     /// // seq=2, batch=1, input=3, hidden=4
     /// let x = Tensor::from_ndarray(&Array3::from_elem((2, 1, 3), 0.1f32));
@@ -335,7 +335,7 @@ impl Tensor {
     /// # Examples
     ///
     /// ```
-    /// # use morok_tensor::Tensor;
+    /// # use svod_tensor::Tensor;
     /// # use ndarray::Array3;
     /// // seq=2, batch=1, input=3, hidden=4
     /// let x = Tensor::from_ndarray(&Array3::from_elem((2, 1, 3), 0.1f32));

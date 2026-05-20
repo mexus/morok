@@ -3,7 +3,7 @@ import type { Config } from "@docusaurus/types";
 import type * as Preset from "@docusaurus/preset-classic";
 
 const config: Config = {
-  title: "Morok",
+  title: "Svod",
   tagline: "Rust-based ML compiler with UOp IR",
   favicon: "img/favicon.ico",
 
@@ -15,7 +15,7 @@ const config: Config = {
   baseUrl: "/",
 
   organizationName: "Patsakula Nikita",
-  projectName: "morok",
+  projectName: "svod",
 
   onBrokenLinks: "throw",
 
@@ -51,7 +51,7 @@ const config: Config = {
       {
         docs: {
           sidebarPath: "./sidebars.ts",
-          editUrl: "https://github.com/npatsakula/morok/edit/main/website/",
+          editUrl: "https://github.com/npatsakula/svod/edit/main/website/",
         },
         blog: false,
         theme: {
@@ -67,9 +67,9 @@ const config: Config = {
       respectPrefersColorScheme: true,
     },
     navbar: {
-      title: "Morok",
+      title: "Svod",
       logo: {
-        alt: "Morok Logo",
+        alt: "Svod Logo",
         src: "img/logo.svg",
       },
       items: [
@@ -84,7 +84,7 @@ const config: Config = {
           position: "right",
         },
         {
-          href: "https://github.com/npatsakula/morok",
+          href: "https://github.com/npatsakula/svod",
           label: "GitHub",
           position: "right",
         },
@@ -107,12 +107,12 @@ const config: Config = {
           items: [
             {
               label: "GitHub",
-              href: "https://github.com/npatsakula/morok",
+              href: "https://github.com/npatsakula/svod",
             },
           ],
         },
       ],
-      copyright: `Copyright © ${new Date().getFullYear()} Morok. Built with Docusaurus.`,
+      copyright: `Copyright © ${new Date().getFullYear()} Svod. Built with Docusaurus.`,
     },
     prism: {
       theme: prismThemes.github,

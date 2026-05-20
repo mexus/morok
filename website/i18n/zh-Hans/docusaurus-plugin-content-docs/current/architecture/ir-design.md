@@ -8,11 +8,11 @@ sidebar_label: IR 设计哲学
 
 这就是现代 ML 编译的现实。TensorFlow 的 XLA 也类似：Python → Graph → XLA HLO → MLIR → LLVM IR。每一层都是为了解决真实问题而添加的，但累积的复杂度令人咋舌。
 
-Morok 采用了不同的方案，借鉴自 [Tinygrad](https://github.com/tinygrad/tinygrad)：**从张量到机器码，只用一个 IR**。
+Svod 采用了不同的方案，借鉴自 [Tinygrad](https://github.com/tinygrad/tinygrad)：**从张量到机器码，只用一个 IR**。
 
 ```text
 ┌──────────────────┐   ┌─────────────────┐   ┌───────────────┐
-│    TensorFlow    │   │     PyTorch     │   │     Morok     │
+│    TensorFlow    │   │     PyTorch     │   │     Svod      │
 ├──────────────────┤   ├─────────────────┤   ├───────────────┤
 │   Python API     │   │   Python API    │   │  Rust/Python  │
 │   TF Graph       │   │   FX Graph      │   │       ↓       │
@@ -89,7 +89,7 @@ pub enum Op {
 
 ## Hash Consing：结构共享
 
-在 Morok 中创建同一个表达式两次，你会得到*同一个指针*。不是值相等——而是同一个内存地址。
+在 Svod 中创建同一个表达式两次，你会得到*同一个指针*。不是值相等——而是同一个内存地址。
 
 ```rust
 let a = UOp::binary(Add, x.clone(), y.clone());
@@ -140,7 +140,7 @@ ReduceSum(data, axes=[1], keepdims=0)
 
 循环在哪里？它是隐式的——藏在运行时 `ReduceSum` 实现的某处。你看不到它，改不了它，也无法推理它。
 
-Morok 用 `RANGE` 操作使循环*显式化*。同样的规约变成：
+Svod 用 `RANGE` 操作使循环*显式化*。同样的规约变成：
 
 ```text
 [REDUCE(Add)]
@@ -184,7 +184,7 @@ AxisType 层次结构（Loop → Global/Thread → Warp → Local/GroupReduce �
 
 传统编译器有几十个专用 pass：常量折叠、死代码消除、循环展开、算子融合。每个 pass 都有自己的逻辑、数据结构和 bug。
 
-Morok 只用一种机制：**基于模式的图重写**。
+Svod 只用一种机制：**基于模式的图重写**。
 
 ```rust
 patterns! {
@@ -237,7 +237,7 @@ After Add:      x                 # Add(x, 0) → x
 
 ### 阶段 1：张量构建
 
-当你写 `A.matmul(&B)` 时，Morok 构建一个高层 UOp 图：
+当你写 `A.matmul(&B)` 时，Svod 构建一个高层 UOp 图：
 
 ```text
 [REDUCE_AXIS(Add, axes=[2])]
@@ -309,7 +309,7 @@ __global__ void matmul(float* C, float* A, float* B) {
 
 不同的 IR 做了不同的取舍。以下是对比：
 
-| 方面 | ONNX | XLA HLO | Triton | **Morok** |
+| 方面 | ONNX | XLA HLO | Triton | **Svod** |
 |--------|------|---------|--------|-----------|
 | **定位** | 模型交换格式 | 后端优化 | GPU kernel DSL | 完整编译 |
 | **算子** | ~200 高层 | ~100–150 高层 | Tile 操作 | ~80 多层级 |
@@ -322,15 +322,15 @@ __global__ void matmul(float* C, float* A, float* B) {
 
 **XLA HLO** 是函数式的、纯的——没有副作用，张量不可变。这使代数优化成为可能，但在代码生成前需要单独的"buffer 分配"阶段。从 HLO 到 LMHLO（基于 buffer）的转换是一个根本性的边界。
 
-**Triton** 暴露的比 ONNX 多但比 Morok 少。你写"tile 级别"的代码——对数据块的操作——编译器处理线程级细节。内存是显式的（`tl.load`、`tl.store`），但 tile 内的并行化是隐式的。
+**Triton** 暴露的比 ONNX 多但比 Svod 少。你写"tile 级别"的代码——对数据块的操作——编译器处理线程级细节。内存是显式的（`tl.load`、`tl.store`），但 tile 内的并行化是隐式的。
 
-**Morok** 暴露一切：循环是显式的（`RANGE`），内存是显式的（`LOAD`/`STORE`），并行化是显式的（`AxisType`）。这意味着需要学更多，但没有东西被隐藏。
+**Svod** 暴露一切：循环是显式的（`RANGE`），内存是显式的（`LOAD`/`STORE`），并行化是显式的（`AxisType`）。这意味着需要学更多，但没有东西被隐藏。
 
 ---
 
 ## 为什么这很重要：实际好处
 
-Morok 透明的 IR 对 ML 工程师有实际好处：
+Svod 透明的 IR 对 ML 工程师有实际好处：
 
 **调试是直接的。** 在任何阶段打印图：
 
@@ -367,10 +367,10 @@ patterns! {
 
 ## 更深层的洞察
 
-Morok/Tinygrad 证明了编译器的复杂度通常是*偶然的*，而非本质的。TensorFlow 和 PyTorch 中的多层 IR 栈是有机积累的——每一层都解决了实际问题，但组合起来的系统比任何单个部分都更难理解。
+Svod/Tinygrad 证明了编译器的复杂度通常是*偶然的*，而非本质的。TensorFlow 和 PyTorch 中的多层 IR 栈是有机积累的——每一层都解决了实际问题，但组合起来的系统比任何单个部分都更难理解。
 
 一个设计精良的 IR、一种变换机制和有原则的组合，可以替代数千行专用 pass。这是 Unix 哲学在编译器中的应用：做好一件事，然后组合。
 
 代价是显式性——你会看到其他 IR 隐藏的循环、内存访问和并行化提示。但可见性是特性，不是缺陷。当你的模型运行缓慢时，你想*看到*原因，而不是寄希望于编译器自己搞定。
 
-这就是 Morok 的赌注：透明的复杂度胜过隐藏的复杂度。
+这就是 Svod 的赌注：透明的复杂度胜过隐藏的复杂度。

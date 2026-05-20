@@ -9,15 +9,15 @@
 
 use std::sync::Arc;
 
-use morok_dtype::DType;
-use morok_ir::{Op, ReduceOp, UOp};
 use smallvec::smallvec;
+use svod_dtype::DType;
+use svod_ir::{Op, ReduceOp, UOp};
 
 use crate::rangeify::try_get_kernel_graph;
 
 /// Helper to create a simple buffer
 fn create_buffer(size: usize) -> Arc<UOp> {
-    UOp::new_buffer(morok_dtype::DeviceSpec::Cpu, size, DType::Float32)
+    UOp::new_buffer(svod_dtype::DeviceSpec::Cpu, size, DType::Float32)
 }
 
 // ===== Basic Fusion Tests =====

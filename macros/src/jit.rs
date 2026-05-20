@@ -135,13 +135,13 @@ pub(crate) fn generate(jit: JitWrapper) -> Result<TokenStream> {
     let build_arg_sources: Vec<TokenStream> = build_args.iter().map(|arg| quote! { #arg }).collect();
 
     let prepare_params: Vec<TokenStream> =
-        input_names.iter().map(|n| quote! { #n: morok_model::jit::InputSpec }).collect();
+        input_names.iter().map(|n| quote! { #n: svod_model::jit::InputSpec }).collect();
 
     let var_inits =
         var_names.iter().zip(var_field_names.iter()).zip(var_min_exprs.iter().zip(var_max_exprs.iter())).map(
             |((var_name, field_name), (min_expr, max_expr))| {
                 quote! {
-                    let #field_name = morok_tensor::Variable::new(
+                    let #field_name = svod_tensor::Variable::new(
                         stringify!(#var_name),
                         (#min_expr) as i64,
                         (#max_expr) as i64,
@@ -195,7 +195,7 @@ pub(crate) fn generate(jit: JitWrapper) -> Result<TokenStream> {
                         "{}: with_{}_bound({max}) creates empty range (min={min})",
                         #name_str, #name_str,
                     );
-                    self.#field_name = morok_tensor::Variable::new(stringify!(#var_name), min, max_i64);
+                    self.#field_name = svod_tensor::Variable::new(stringify!(#var_name), min, max_i64);
                     self
                 }
             }))
@@ -209,7 +209,7 @@ pub(crate) fn generate(jit: JitWrapper) -> Result<TokenStream> {
                         "{}: with_{}_min_bound({min}) exceeds upper bound max={max}",
                         #name_str, #name_str,
                     );
-                    self.#field_name = morok_tensor::Variable::new(stringify!(#var_name), min_i64, max);
+                    self.#field_name = svod_tensor::Variable::new(stringify!(#var_name), min_i64, max);
                     self
                 }
             }))
@@ -218,7 +218,7 @@ pub(crate) fn generate(jit: JitWrapper) -> Result<TokenStream> {
                 pub fn #fixed_setter(mut self, value: usize) -> Self {
                     assert!(value > 0, "{}: with_{}_fixed(0) is not allowed", #name_str, #name_str);
                     let v = value as i64;
-                    self.#field_name = morok_tensor::Variable::new(stringify!(#var_name), v, v);
+                    self.#field_name = svod_tensor::Variable::new(stringify!(#var_name), v, v);
                     self
                 }
             }))
@@ -228,7 +228,7 @@ pub(crate) fn generate(jit: JitWrapper) -> Result<TokenStream> {
         quote! {
             let #var_name = self.#field_name
                 .bind(self.#field_name.bounds().1)
-                .map_err(|e| morok_model::jit::JitError::Tensor { source: Box::new(e) })?;
+                .map_err(|e| svod_model::jit::JitError::Tensor { source: Box::new(e) })?;
         }
     });
 
@@ -242,11 +242,11 @@ pub(crate) fn generate(jit: JitWrapper) -> Result<TokenStream> {
 
     let input_realizations = input_names.iter().zip(input_realized_locals.iter()).map(|(input_name, local)| {
         quote! {
-            let mut #local = morok_tensor::Tensor::zeros(&#input_name.shape, #input_name.dtype.clone())
-                .map_err(|e| morok_model::jit::JitError::Tensor { source: Box::new(e) })?;
+            let mut #local = svod_tensor::Tensor::zeros(&#input_name.shape, #input_name.dtype.clone())
+                .map_err(|e| svod_model::jit::JitError::Tensor { source: Box::new(e) })?;
             #local
                 .realize_with(config)
-                .map_err(|e| morok_model::jit::JitError::Tensor { source: Box::new(e) })?;
+                .map_err(|e| svod_model::jit::JitError::Tensor { source: Box::new(e) })?;
             let #input_name = &#local;
         }
     });
@@ -255,7 +255,7 @@ pub(crate) fn generate(jit: JitWrapper) -> Result<TokenStream> {
         input_names.iter().zip(input_buffer_id_fields.iter()).zip(input_ast_id_locals.iter()).map(
             |((input_name, buf_field), ast_field)| {
                 quote! {
-                    let #buf_field = #input_name.buffer().ok_or(morok_model::jit::JitError::NotPrepared)?.id();
+                    let #buf_field = #input_name.buffer().ok_or(svod_model::jit::JitError::NotPrepared)?.id();
                     let #ast_field = #input_name.uop().id;
                 }
             },
@@ -269,7 +269,7 @@ pub(crate) fn generate(jit: JitWrapper) -> Result<TokenStream> {
                     let right_name_str = right_name.to_string();
                     quote! {
                         if #left_buf_field == #right_buf_field {
-                            return Err(morok_model::jit::JitError::DuplicateInputBuffer {
+                            return Err(svod_model::jit::JitError::DuplicateInputBuffer {
                                 name: #right_name_str,
                                 duplicate_of: #left_name_str,
                                 buffer_id: #right_buf_field,
@@ -312,8 +312,8 @@ pub(crate) fn generate(jit: JitWrapper) -> Result<TokenStream> {
         .map(|(((accessor, idx_field), buf_id_field), input_name)| {
             let name_str = input_name.to_string();
             quote! {
-                pub fn #accessor(&mut self) -> morok_model::jit::Result<&mut morok_device::Buffer> {
-                    let state = self.state.as_mut().ok_or(morok_model::jit::JitError::NotPrepared)?;
+                pub fn #accessor(&mut self) -> svod_model::jit::Result<&mut svod_device::Buffer> {
+                    let state = self.state.as_mut().ok_or(svod_model::jit::JitError::NotPrepared)?;
                     let idx = match state.#idx_field {
                         Some(idx) => idx,
                         None => {
@@ -322,13 +322,13 @@ pub(crate) fn generate(jit: JitWrapper) -> Result<TokenStream> {
                                 .buffers()
                                 .iter()
                                 .position(|b| b.id() == state.#buf_id_field)
-                                .ok_or(morok_model::jit::JitError::InputBufferNotFound { name: #name_str })?;
+                                .ok_or(svod_model::jit::JitError::InputBufferNotFound { name: #name_str })?;
                             state.#idx_field = Some(idx);
                             idx
                         }
                     };
                     state.plan.buffer_at_mut(idx)
-                        .ok_or(morok_model::jit::JitError::InputBufferNotFound { name: #name_str })
+                        .ok_or(svod_model::jit::JitError::InputBufferNotFound { name: #name_str })
                 }
             }
         });
@@ -337,13 +337,13 @@ pub(crate) fn generate(jit: JitWrapper) -> Result<TokenStream> {
         pub struct #name {
             model: #model_ty,
             state: Option<#state_name>,
-            #( #var_field_names: morok_tensor::Variable, )*
+            #( #var_field_names: svod_tensor::Variable, )*
         }
 
         struct #state_name {
-            plan: morok_runtime::ExecutionPlan,
+            plan: svod_runtime::ExecutionPlan,
             #( #input_id_fields: Option<usize>, )*
-            #( #input_buffer_id_fields: morok_device::BufferId, )*
+            #( #input_buffer_id_fields: svod_device::BufferId, )*
         }
 
         impl #name {
@@ -358,28 +358,28 @@ pub(crate) fn generate(jit: JitWrapper) -> Result<TokenStream> {
 
             #(#with_var_bound_methods)*
 
-            pub fn prepare(&mut self, #(#prepare_params),*) -> morok_model::jit::Result<()> {
-                let config = morok_tensor::PrepareConfig::from_env();
+            pub fn prepare(&mut self, #(#prepare_params),*) -> svod_model::jit::Result<()> {
+                let config = svod_tensor::PrepareConfig::from_env();
                 self.prepare_with_config(#(#input_names,)* &config)
             }
 
             pub fn prepare_with_config(
                 &mut self,
                 #(#prepare_params,)*
-                config: &morok_tensor::PrepareConfig,
-            ) -> morok_model::jit::Result<()> {
+                config: &svod_tensor::PrepareConfig,
+            ) -> svod_model::jit::Result<()> {
                 #(#input_realizations)*
                 #(#buffer_id_extractions)*
                 #(#duplicate_input_checks)*
 
                 #(#prepare_var_bindings)*
 
-                let output: morok_tensor::Tensor = #build_closure
-                    .map_err(|e| morok_model::jit::JitError::Build { source: Box::new(e) as _ })?;
+                let output: svod_tensor::Tensor = #build_closure
+                    .map_err(|e| svod_model::jit::JitError::Build { source: Box::new(e) as _ })?;
 
                 let mut output = output;
-                let plan = morok_tensor::Tensor::prepare_batch_with(std::iter::once(&mut output), config)
-                    .map_err(|e| morok_model::jit::JitError::Tensor { source: Box::new(e) })?;
+                let plan = svod_tensor::Tensor::prepare_batch_with(std::iter::once(&mut output), config)
+                    .map_err(|e| svod_model::jit::JitError::Tensor { source: Box::new(e) })?;
 
                 #(#index_resolution)*
 
@@ -389,56 +389,56 @@ pub(crate) fn generate(jit: JitWrapper) -> Result<TokenStream> {
 
             #(#accessor_impls)*
 
-            pub fn output(&self) -> morok_model::jit::Result<&morok_device::Buffer> {
-                let state = self.state.as_ref().ok_or(morok_model::jit::JitError::NotPrepared)?;
-                state.plan.output_buffer().ok_or(morok_model::jit::JitError::NotPrepared)
+            pub fn output(&self) -> svod_model::jit::Result<&svod_device::Buffer> {
+                let state = self.state.as_ref().ok_or(svod_model::jit::JitError::NotPrepared)?;
+                state.plan.output_buffer().ok_or(svod_model::jit::JitError::NotPrepared)
             }
 
-            pub fn buffers(&self) -> morok_model::jit::Result<&[morok_device::Buffer]> {
-                let state = self.state.as_ref().ok_or(morok_model::jit::JitError::NotPrepared)?;
+            pub fn buffers(&self) -> svod_model::jit::Result<&[svod_device::Buffer]> {
+                let state = self.state.as_ref().ok_or(svod_model::jit::JitError::NotPrepared)?;
                 Ok(state.plan.buffers())
             }
 
-            pub fn output_buffers(&self) -> morok_model::jit::Result<Vec<&morok_device::Buffer>> {
-                let state = self.state.as_ref().ok_or(morok_model::jit::JitError::NotPrepared)?;
+            pub fn output_buffers(&self) -> svod_model::jit::Result<Vec<&svod_device::Buffer>> {
+                let state = self.state.as_ref().ok_or(svod_model::jit::JitError::NotPrepared)?;
                 Ok(state.plan.output_buffers())
             }
 
-            pub fn input_buffer_ids(&self) -> morok_model::jit::Result<Vec<morok_device::BufferId>> {
-                let state = self.state.as_ref().ok_or(morok_model::jit::JitError::NotPrepared)?;
+            pub fn input_buffer_ids(&self) -> svod_model::jit::Result<Vec<svod_device::BufferId>> {
+                let state = self.state.as_ref().ok_or(svod_model::jit::JitError::NotPrepared)?;
                 Ok(vec![#( state.#input_buffer_id_fields ),*])
             }
 
-            pub fn prepared_kernels(&self) -> morok_model::jit::Result<Vec<&morok_runtime::PreparedKernel>> {
-                let state = self.state.as_ref().ok_or(morok_model::jit::JitError::NotPrepared)?;
+            pub fn prepared_kernels(&self) -> svod_model::jit::Result<Vec<&svod_runtime::PreparedKernel>> {
+                let state = self.state.as_ref().ok_or(svod_model::jit::JitError::NotPrepared)?;
                 Ok(state.plan.prepared_kernels())
             }
 
-            pub fn execute(&mut self) -> morok_model::jit::Result<()> {
-                let state = self.state.as_mut().ok_or(morok_model::jit::JitError::NotPrepared)?;
+            pub fn execute(&mut self) -> svod_model::jit::Result<()> {
+                let state = self.state.as_mut().ok_or(svod_model::jit::JitError::NotPrepared)?;
                 state.plan.execute()
-                    .map_err(|e| morok_model::jit::JitError::Runtime { source: e })
+                    .map_err(|e| svod_model::jit::JitError::Runtime { source: e })
             }
 
-            pub fn execute_profiled(&mut self) -> morok_model::jit::Result<Vec<morok_runtime::KernelProfile>> {
-                let state = self.state.as_mut().ok_or(morok_model::jit::JitError::NotPrepared)?;
+            pub fn execute_profiled(&mut self) -> svod_model::jit::Result<Vec<svod_runtime::KernelProfile>> {
+                let state = self.state.as_mut().ok_or(svod_model::jit::JitError::NotPrepared)?;
                 state.plan.execute_profiled()
-                    .map_err(|e| morok_model::jit::JitError::Runtime { source: e })
+                    .map_err(|e| svod_model::jit::JitError::Runtime { source: e })
             }
 
-            pub fn execute_with_vars(&mut self, vars: &[(&str, i64)]) -> morok_model::jit::Result<()> {
-                let state = self.state.as_mut().ok_or(morok_model::jit::JitError::NotPrepared)?;
+            pub fn execute_with_vars(&mut self, vars: &[(&str, i64)]) -> svod_model::jit::Result<()> {
+                let state = self.state.as_mut().ok_or(svod_model::jit::JitError::NotPrepared)?;
                 state.plan.execute_with_vars(vars)
-                    .map_err(|e| morok_model::jit::JitError::Runtime { source: e })
+                    .map_err(|e| svod_model::jit::JitError::Runtime { source: e })
             }
 
             pub fn execute_with_vars_profiled(
                 &mut self,
                 vars: &[(&str, i64)],
-            ) -> morok_model::jit::Result<Vec<morok_runtime::KernelProfile>> {
-                let state = self.state.as_mut().ok_or(morok_model::jit::JitError::NotPrepared)?;
+            ) -> svod_model::jit::Result<Vec<svod_runtime::KernelProfile>> {
+                let state = self.state.as_mut().ok_or(svod_model::jit::JitError::NotPrepared)?;
                 state.plan.execute_with_vars_profiled(vars)
-                    .map_err(|e| morok_model::jit::JitError::Runtime { source: e })
+                    .map_err(|e| svod_model::jit::JitError::Runtime { source: e })
             }
         }
     };

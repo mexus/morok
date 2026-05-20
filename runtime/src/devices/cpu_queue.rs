@@ -5,9 +5,9 @@
 
 use std::sync::Arc;
 
-use morok_device::device::Program as DeviceProgram;
-use morok_device::{Buffer, CpuTimelineSignal, ExecParams, HardwareQueue, TimelineSignal};
-use morok_dtype::DeviceSpec;
+use svod_device::device::Program as DeviceProgram;
+use svod_device::{Buffer, CpuTimelineSignal, ExecParams, HardwareQueue, TimelineSignal};
+use svod_dtype::DeviceSpec;
 
 use crate::error::Result;
 
@@ -171,18 +171,18 @@ impl HardwareQueue for CpuQueue {
         self
     }
 
-    fn submit(&mut self) -> morok_device::Result<()> {
+    fn submit(&mut self) -> svod_device::Result<()> {
         if !self.errors.is_empty() {
             let errors = std::mem::take(&mut self.errors);
             self.pending.clear();
-            return Err(morok_device::Error::Runtime { message: errors.join("; ") });
+            return Err(svod_device::Error::Runtime { message: errors.join("; ") });
         }
 
         // CPU queue is intentionally serial; parallelism across kernels is handled by ExecutionPlan.
         let ops = std::mem::take(&mut self.pending);
 
         for op in ops {
-            Self::execute_op(op).map_err(|e| morok_device::Error::Runtime { message: e.to_string() })?;
+            Self::execute_op(op).map_err(|e| svod_device::Error::Runtime { message: e.to_string() })?;
         }
 
         Ok(())

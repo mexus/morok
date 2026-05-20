@@ -7,28 +7,28 @@
 //! SentencePiece `▁ → space` post-processing happens inside the transcriber.
 //!
 //! Usage:
-//!   cargo run -p morok-model --release --example gigaam_rnnt_infer -- audio.wav
+//!   cargo run -p svod-model --release --example gigaam_rnnt_infer -- audio.wav
 //!
 //! Env knobs (all optional):
-//!   MOROK_AMX=1                 Enable AMX renderer (Apple Silicon).
-//!   MOROK_TIMESTAMPS=1          Emit per-word `[start - end] word` lines.
-//!   MOROK_RNNT_REPO=<repo>      HF Hub repo (default `vpermilp/GigaAM-v3`).
-//!   MOROK_RNNT_REVISION=<rev>   HF Hub revision (default `e2e_rnnt`).
-//!   MOROK_MAX_SCORES_MIB=N      SDPA scores buffer budget (default 256).
-//!   MOROK_VAD_THRESHOLD=f       Silero VAD threshold (default 0.5).
+//!   SVOD_AMX=1                 Enable AMX renderer (Apple Silicon).
+//!   SVOD_TIMESTAMPS=1          Emit per-word `[start - end] word` lines.
+//!   SVOD_RNNT_REPO=<repo>      HF Hub repo (default `vpermilp/GigaAM-v3`).
+//!   SVOD_RNNT_REVISION=<rev>   HF Hub revision (default `e2e_rnnt`).
+//!   SVOD_MAX_SCORES_MIB=N      SDPA scores buffer budget (default 256).
+//!   SVOD_VAD_THRESHOLD=f       Silero VAD threshold (default 0.5).
 
 use std::env;
 use std::time::Instant;
 
-use morok_model::gigaam::{GigaAm, TranscribeOpts, Transcriber};
-use morok_model::silero_vad::SileroVadSplitter;
+use svod_model::gigaam::{GigaAm, TranscribeOpts, Transcriber};
+use svod_model::silero_vad::SileroVadSplitter;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
     let t_total = Instant::now();
     let wav_path = env::args().nth(1).ok_or("usage: gigaam_rnnt_infer <audio.wav>")?;
-    let repo = env::var("MOROK_RNNT_REPO").unwrap_or_else(|_| "vpermilp/GigaAM-v3".to_string());
-    let revision = env::var("MOROK_RNNT_REVISION").unwrap_or_else(|_| "e2e_rnnt".to_string());
+    let repo = env::var("SVOD_RNNT_REPO").unwrap_or_else(|_| "vpermilp/GigaAM-v3".to_string());
+    let revision = env::var("SVOD_RNNT_REVISION").unwrap_or_else(|_| "e2e_rnnt".to_string());
     let opts = TranscribeOpts::from_env();
 
     println!("Loading audio: {wav_path}");
@@ -39,10 +39,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\nLoading GigaAM RNN-T from {repo} ({revision})...");
     let model = GigaAm::from_hub_with_revision(&repo, &revision)?;
     if model.head.as_rnnt().is_none() {
-        return Err(format!(
-            "{repo}@{revision} has a CTC head, not RN-T. Set MOROK_RNNT_REVISION to an RN-T revision."
-        )
-        .into());
+        return Err(
+            format!("{repo}@{revision} has a CTC head, not RN-T. Set SVOD_RNNT_REVISION to an RN-T revision.").into()
+        );
     }
     let splitter = SileroVadSplitter::from_hub()?;
     let mut transcriber = Transcriber::new(model, splitter, opts.clone())?;

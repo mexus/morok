@@ -1,7 +1,7 @@
 #![allow(clippy::approx_constant)]
 
 use crate::*;
-use morok_dtype::DType;
+use svod_dtype::DType;
 
 #[test]
 fn test_relu_basic() {

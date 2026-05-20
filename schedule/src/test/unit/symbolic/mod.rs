@@ -5,9 +5,9 @@ use crate::{
     rewrite::graph_rewrite,
     symbolic::{sym, symbolic, symbolic_simple},
 };
-use morok_dtype::DType;
-use morok_ir::{BinaryOp, ConstValue, Op, TernaryOp, UOp, UnaryOp};
 use std::{f32::consts::PI, sync::Arc};
+use svod_dtype::DType;
+use svod_ir::{BinaryOp, ConstValue, Op, TernaryOp, UOp, UnaryOp};
 
 #[test]
 fn test_symbolic_simple_identity_folding() {
@@ -177,7 +177,7 @@ fn test_division_by_neg_one() {
 
     let result = graph_rewrite(&matcher, div, &mut ());
     // x // -1 → neg(x) → MUL(x, -1)
-    if let Op::Binary(morok_ir::BinaryOp::Mul, inner, c) = result.op() {
+    if let Op::Binary(svod_ir::BinaryOp::Mul, inner, c) = result.op() {
         assert!(std::sync::Arc::ptr_eq(inner, &x));
         assert!(matches!(c.op(), Op::Const(cv) if cv.0.is_neg_one()));
     } else {
@@ -1300,13 +1300,13 @@ fn test_propagate_invalid_through_neg() {
     let result = graph_rewrite(&matcher, negated, &mut ());
 
     // Should be WHERE(cond, MUL(x, -1), Invalid)
-    let Op::Ternary(morok_ir::TernaryOp::Where, c, inner, inv) = result.op() else {
+    let Op::Ternary(svod_ir::TernaryOp::Where, c, inner, inv) = result.op() else {
         panic!("Expected WHERE, got: {}", result.tree());
     };
     assert!(Arc::ptr_eq(c, &cond), "condition should be preserved");
     assert!(matches!(inv.op(), Op::Invalid), "false branch should be Invalid");
     assert!(
-        matches!(inner.op(), Op::Binary(morok_ir::BinaryOp::Mul, _, _)),
+        matches!(inner.op(), Op::Binary(svod_ir::BinaryOp::Mul, _, _)),
         "true branch should be MUL(x, -1), got: {}",
         inner.tree()
     );
@@ -2719,7 +2719,7 @@ fn test_drop_and_clauses_single_clause_no_change() {
 
 #[test]
 fn test_sound_vmin_vmax_const() {
-    use morok_ir::uop::range_eval::compute_sound_vmin_vmax;
+    use svod_ir::uop::range_eval::compute_sound_vmin_vmax;
 
     let c = UOp::native_const(42i32);
     let result = compute_sound_vmin_vmax(&c);
@@ -2728,7 +2728,7 @@ fn test_sound_vmin_vmax_const() {
 
 #[test]
 fn test_sound_vmin_vmax_range() {
-    use morok_ir::uop::range_eval::compute_sound_vmin_vmax;
+    use svod_ir::uop::range_eval::compute_sound_vmin_vmax;
 
     let r = UOp::range_const(10, 0);
     let result = compute_sound_vmin_vmax(&r);
@@ -2737,7 +2737,7 @@ fn test_sound_vmin_vmax_range() {
 
 #[test]
 fn test_sound_vmin_vmax_add() {
-    use morok_ir::uop::range_eval::compute_sound_vmin_vmax;
+    use svod_ir::uop::range_eval::compute_sound_vmin_vmax;
 
     let r = UOp::range_const(10, 0);
     let c = UOp::index_const(5);
@@ -2748,11 +2748,11 @@ fn test_sound_vmin_vmax_add() {
 
 #[test]
 fn test_sound_vmin_vmax_and_const_mask() {
-    use morok_ir::uop::range_eval::compute_sound_vmin_vmax;
+    use svod_ir::uop::range_eval::compute_sound_vmin_vmax;
 
     let r = UOp::range_const(100, 0);
     let mask = UOp::native_const(7i32);
-    let r_int = r.cast(DType::Scalar(morok_dtype::ScalarDType::Int32));
+    let r_int = r.cast(DType::Scalar(svod_dtype::ScalarDType::Int32));
     let result_node = r_int.and_(&mask);
     let result = compute_sound_vmin_vmax(&result_node);
     assert_eq!(result, Some((ConstValue::Int(0), ConstValue::Int(7))));
@@ -2760,12 +2760,12 @@ fn test_sound_vmin_vmax_and_const_mask() {
 
 #[test]
 fn test_sound_vmin_vmax_and_variable_mask_unsound() {
-    use morok_ir::uop::range_eval::compute_sound_vmin_vmax;
+    use svod_ir::uop::range_eval::compute_sound_vmin_vmax;
 
     let r1 = UOp::range_const(100, 0);
     let r2 = UOp::range_const(50, 1);
-    let r1_int = r1.cast(DType::Scalar(morok_dtype::ScalarDType::Int32));
-    let r2_int = r2.cast(DType::Scalar(morok_dtype::ScalarDType::Int32));
+    let r1_int = r1.cast(DType::Scalar(svod_dtype::ScalarDType::Int32));
+    let r2_int = r2.cast(DType::Scalar(svod_dtype::ScalarDType::Int32));
     let result_node = r1_int.and_(&r2_int);
     let result = compute_sound_vmin_vmax(&result_node);
     assert!(result.is_none(), "AND with variable mask should be unsound");
@@ -2773,9 +2773,9 @@ fn test_sound_vmin_vmax_and_variable_mask_unsound() {
 
 #[test]
 fn test_sound_vmin_vmax_load_unsound() {
-    use morok_ir::uop::range_eval::compute_sound_vmin_vmax;
+    use svod_ir::uop::range_eval::compute_sound_vmin_vmax;
 
-    let buf = UOp::new_buffer(morok_dtype::DeviceSpec::Cpu, 100, DType::Scalar(morok_dtype::ScalarDType::Float32));
+    let buf = UOp::new_buffer(svod_dtype::DeviceSpec::Cpu, 100, DType::Scalar(svod_dtype::ScalarDType::Float32));
     let idx = UOp::index_const(0);
     let index = UOp::index().buffer(buf.clone()).indices(vec![idx]).call().unwrap();
     let load = UOp::load().buffer(buf).index(index).call();
@@ -2785,7 +2785,7 @@ fn test_sound_vmin_vmax_load_unsound() {
 
 #[test]
 fn test_sound_vmin_vmax_nested_sound() {
-    use morok_ir::uop::range_eval::compute_sound_vmin_vmax;
+    use svod_ir::uop::range_eval::compute_sound_vmin_vmax;
 
     let c = UOp::index_const(3);
     let r = UOp::range_const(10, 0);
@@ -2805,8 +2805,8 @@ fn test_sym_phase3_neg_distribution() {
 
     let x = UOp::range_const(10, 0);
     let y = UOp::range_const(20, 1);
-    let x_int = x.cast(DType::Scalar(morok_dtype::ScalarDType::Int32));
-    let y_int = y.cast(DType::Scalar(morok_dtype::ScalarDType::Int32));
+    let x_int = x.cast(DType::Scalar(svod_dtype::ScalarDType::Int32));
+    let y_int = y.cast(DType::Scalar(svod_dtype::ScalarDType::Int32));
     let sum = x_int.try_add(&y_int).unwrap();
     let neg_one = UOp::native_const(-1i32);
     let product = neg_one.try_mul(&sum).unwrap();
@@ -2819,8 +2819,8 @@ fn test_sym_phase3_neg_distribution() {
 
 #[test]
 fn test_substitute_gated_skips_irrelevant_subtrees() {
-    use morok_ir::UOpKey;
     use std::collections::HashMap;
+    use svod_ir::UOpKey;
 
     let r0 = UOp::range_const(10, 0);
     let r1 = UOp::range_const(20, 1);
@@ -2846,7 +2846,7 @@ fn test_substitute_gated_empty_map() {
 
     let r0 = UOp::range_const(10, 0);
     #[allow(clippy::mutable_key_type)]
-    let map: HashMap<morok_ir::UOpKey, Arc<UOp>> = HashMap::new();
+    let map: HashMap<svod_ir::UOpKey, Arc<UOp>> = HashMap::new();
     let result = r0.substitute_gated(&map);
     assert!(Arc::ptr_eq(&result, &r0), "Empty map should return original");
 }

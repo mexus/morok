@@ -1,8 +1,8 @@
-# morok-onnx
+# svod-onnx
 
 ![ONNX coverage](assets/coverage.svg)
 
-ONNX model frontend for Morok. Parses `.onnx` files and builds lazy Morok
+ONNX model frontend for Svod. Parses `.onnx` files and builds lazy Svod
 tensor graphs that can be compiled once and executed repeatedly.
 
 ## Quick Start

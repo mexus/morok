@@ -145,7 +145,7 @@ Devectorize के बाद वेक्टर स्ट्रक्चर (इ
 
 ```bash
 # See IR after each transformation
-MOROK_DEBUG=ir cargo test failing_test
+SVOD_DEBUG=ir cargo test failing_test
 ```
 
 ### क्विक रेफ़रेंस
@@ -182,15 +182,15 @@ MOROK_DEBUG=ir cargo test failing_test
 
 ---
 
-## Tinygrad बनाम Morok: आर्किटेक्चरल अंतर
+## Tinygrad बनाम Svod: आर्किटेक्चरल अंतर
 
-यह चैप्टर Tinygrad के इम्प्लीमेंटेशन पर आधारित "ideal" 22-स्टेज पाइपलाइन बताता है। Morok अब इस डिज़ाइन को न्यूनतम अंतर के साथ फ़ॉलो करता है।
+यह चैप्टर Tinygrad के इम्प्लीमेंटेशन पर आधारित "ideal" 22-स्टेज पाइपलाइन बताता है। Svod अब इस डिज़ाइन को न्यूनतम अंतर के साथ फ़ॉलो करता है।
 
 ### बचे हुए आर्किटेक्चरल अंतर
 
-| स्टेज | Tinygrad | Morok | नोट्स |
+| स्टेज | Tinygrad | Svod | नोट्स |
 |-------|----------|-------|-------|
-| 1: Early Movement Ops | 3 स्पेसिफ़िक patterns (INDEX, AFTER, END से movement) से movement ops को wrappers से गुज़ारता है | Bufferization के दौरान movement ops हटाता है | दोनों अप्रोच functionally equivalent हैं; Morok का ज़्यादा क्लीन है |
+| 1: Early Movement Ops | 3 स्पेसिफ़िक patterns (INDEX, AFTER, END से movement) से movement ops को wrappers से गुज़ारता है | Bufferization के दौरान movement ops हटाता है | दोनों अप्रोच functionally equivalent हैं; Svod का ज़्यादा क्लीन है |
 
 ### Aligned स्टेज (पहले अलग थे)
 
@@ -198,22 +198,22 @@ MOROK_DEBUG=ir cargo test failing_test
 
 | स्टेज | क्या बदला |
 |-------|----------|
-| 15: Index Dtype Lowering | Morok में अब `pm_lower_index_dtype()` है पूर्ण pattern coverage के साथ: Binary ops, CONST, WHERE, VECTORIZE, SPECIAL, DEFINE_VAR, RANGE, CAST cleanup |
+| 15: Index Dtype Lowering | Svod में अब `pm_lower_index_dtype()` है पूर्ण pattern coverage के साथ: Binary ops, CONST, WHERE, VECTORIZE, SPECIAL, DEFINE_VAR, RANGE, CAST cleanup |
 | 18: Decompositions | जोड़ा: `fast_division_patterns()`, `pm_div_to_shr()`, `pm_fdiv_to_mul()`, `pm_comparison_negations()`, De Morgan's laws |
 | 19: Final Rewrite | `pm_render()` codegen से Stage 19 में schedule पाइपलाइन में मूव किया |
 
 ### केवल Tinygrad के Patterns
 
-Morok जानबूझकर इन Tinygrad-स्पेसिफ़िक patterns को इम्प्लीमेंट नहीं करता:
+Svod जानबूझकर इन Tinygrad-स्पेसिफ़िक patterns को इम्प्लीमेंट नहीं करता:
 
-| Pattern | उद्देश्य | Morok को क्यों नहीं चाहिए |
+| Pattern | उद्देश्य | Svod को क्यों नहीं चाहिए |
 |---------|----------|---------------------------|
-| `to_bufferview` | DISK/TINYFS डिवाइसों के लिए डिस्क बफ़र कॉपी से बचें | Morok DISK/TINYFS सपोर्ट नहीं करता; in-memory बैकएंड को इसकी ज़रूरत नहीं |
-| AFTER/END movement patterns | Movement ops को टाइमिंग wrappers से गुज़ारें | Morok bufferization के दौरान movement ops हटाता है |
+| `to_bufferview` | DISK/TINYFS डिवाइसों के लिए डिस्क बफ़र कॉपी से बचें | Svod DISK/TINYFS सपोर्ट नहीं करता; in-memory बैकएंड को इसकी ज़रूरत नहीं |
+| AFTER/END movement patterns | Movement ops को टाइमिंग wrappers से गुज़ारें | Svod bufferization के दौरान movement ops हटाता है |
 
-### Morok एनहैंसमेंट
+### Svod एनहैंसमेंट
 
-Morok में कुछ patterns/एनहैंसमेंट हैं जो Tinygrad में नहीं:
+Svod में कुछ patterns/एनहैंसमेंट हैं जो Tinygrad में नहीं:
 
 | एनहैंसमेंट | लोकेशन | उद्देश्य |
 |------------|--------|----------|
