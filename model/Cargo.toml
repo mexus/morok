@@ -10,13 +10,13 @@ repository.workspace = true
 bon = "3.9.1"
 hf-hub = "0.5.0"
 hound = "3.5.1"
-svod-arch = { version = "0.1.0-alpha.2", path = "../arch" }
-svod-device = { version = "0.1.0-alpha.2", path = "../device" }
-svod-dtype = { version = "0.1.0-alpha.2", path = "../dtype", package = "svod-dtype" }
-svod-ir = { version = "0.1.0-alpha.2", path = "../ir", package = "svod-ir" }
-svod-macros = { version = "0.1.0-alpha.2", path = "../macros" }
-svod-runtime = { version = "0.1.0-alpha.2", path = "../runtime" }
-svod-tensor = { version = "0.1.0-alpha.2", path = "../tensor", package = "svod-tensor" }
+svod-arch = { path = "../arch", version = "=0.1.0-alpha.3" }
+svod-device = { path = "../device", version = "=0.1.0-alpha.3" }
+svod-dtype = { path = "../dtype", version = "=0.1.0-alpha.3" }
+svod-ir = { path = "../ir", version = "=0.1.0-alpha.3" }
+svod-macros = { path = "../macros", version = "=0.1.0-alpha.3" }
+svod-runtime = { path = "../runtime", version = "=0.1.0-alpha.3" }
+svod-tensor = { path = "../tensor", version = "=0.1.0-alpha.3" }
 ndarray.workspace = true
 prost = "0.14.3"
 nom = "7.1"
