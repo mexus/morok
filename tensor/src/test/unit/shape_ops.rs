@@ -759,3 +759,81 @@ fn test_shape_tensor_dtype() {
     // Shape tensor should be int64
     assert_eq!(shape.uop().dtype(), svod_dtype::DType::Int64);
 }
+
+// =========================================================================
+// chunk
+// =========================================================================
+
+#[test]
+fn test_chunk_even_with_remainder() {
+    // dim_size=11, chunks=6 → ceil(11/6)=2 → [2,2,2,2,2,1]
+    let x = Tensor::from_slice((0..11).map(|i| i as f32).collect::<Vec<_>>());
+    let chunks = x.chunk(6, 0).unwrap();
+    let sizes: Vec<usize> = chunks.iter().map(|c| get_shape(c)[0]).collect();
+    assert_eq!(sizes, vec![2, 2, 2, 2, 2, 1]);
+}
+
+#[test]
+fn test_chunk_returns_fewer_than_requested() {
+    // dim_size=13, chunks=6 → ceil(13/6)=3 → [3,3,3,3,1] (5 chunks, not 6)
+    let x = Tensor::from_slice((0..13).map(|i| i as f32).collect::<Vec<_>>());
+    let chunks = x.chunk(6, 0).unwrap();
+    let sizes: Vec<usize> = chunks.iter().map(|c| get_shape(c)[0]).collect();
+    assert_eq!(sizes, vec![3, 3, 3, 3, 1]);
+}
+
+#[test]
+fn test_chunk_more_than_dim_size() {
+    // dim_size=3, chunks=6 → clamps to 3 chunks of size 1
+    let x = Tensor::from_slice([0.0f32, 1.0, 2.0]);
+    let chunks = x.chunk(6, 0).unwrap();
+    let sizes: Vec<usize> = chunks.iter().map(|c| get_shape(c)[0]).collect();
+    assert_eq!(sizes, vec![1, 1, 1]);
+}
+
+#[test]
+fn test_chunk_zero_chunks_is_err() {
+    let x = Tensor::from_slice([0.0f32, 1.0, 2.0]);
+    assert!(x.chunk(0, 0).is_err(), "chunks==0 must return Err");
+}
+
+#[test]
+fn test_chunk_empty_dim_returns_zero_sized_chunks() {
+    // dim_size==0 → `chunks` zero-sized tensors.
+    let x = Tensor::full(&[3, 0], 0.0f32, svod_dtype::DType::Float32).unwrap();
+    let chunks = x.chunk(2, 1).unwrap();
+    assert_eq!(chunks.len(), 2);
+    for c in &chunks {
+        assert_eq!(get_shape(c), vec![3, 0]);
+    }
+}
+
+#[test]
+fn test_chunk_values_1d() {
+    // 6 elements → 3 even chunks of size 2; assert exact values per slice.
+    let x = Tensor::from_slice([10.0f32, 11.0, 12.0, 13.0, 14.0, 15.0]);
+    let chunks = x.chunk(3, 0).unwrap();
+    assert_eq!(chunks.len(), 3);
+    let expected: [Vec<f32>; 3] = [vec![10.0, 11.0], vec![12.0, 13.0], vec![14.0, 15.0]];
+    for (i, c) in chunks.into_iter().enumerate() {
+        let mut c = c;
+        c.realize().unwrap();
+        assert_eq!(get_shape(&c), vec![2], "chunk {i} shape");
+        assert_eq!(c.as_vec::<f32>().unwrap(), expected[i], "chunk {i} values");
+    }
+}
+
+#[test]
+fn test_chunk_values_2d_along_dim1() {
+    // [2,4] data, chunk into 2 along dim 1 → two [2,2] slices; assert exact values.
+    let x = Tensor::from_slice([0.0f32, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]).try_reshape([2, 4]).unwrap();
+    let chunks = x.chunk(2, 1).unwrap();
+    assert_eq!(chunks.len(), 2);
+    let expected: [Vec<f32>; 2] = [vec![0.0, 1.0, 4.0, 5.0], vec![2.0, 3.0, 6.0, 7.0]];
+    for (i, c) in chunks.into_iter().enumerate() {
+        let mut c = c;
+        c.realize().unwrap();
+        assert_eq!(get_shape(&c), vec![2, 2], "chunk {i} shape");
+        assert_eq!(c.as_vec::<f32>().unwrap(), expected[i], "chunk {i} values");
+    }
+}

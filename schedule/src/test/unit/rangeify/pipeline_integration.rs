@@ -152,7 +152,7 @@ fn test_pipeline_reshape_buffer_to_load() {
     let sink = UOp::sink(vec![contiguous]);
 
     // Run rangeify pipeline
-    let (rangeified, _ctx) = crate::rangeify::rangeify(sink, None).expect("Rangeify should succeed");
+    let (rangeified, _ctx) = crate::rangeify::rangeify(sink).expect("Rangeify should succeed");
 
     // Verify RESHAPE operations have been eliminated
     let has_reshape = rangeified.toposort().iter().any(|node| matches!(node.op(), Op::Reshape { .. }));
@@ -185,7 +185,7 @@ fn test_full_pipeline_creates_load_for_input_buffers() {
     let sink = UOp::sink(vec![contiguous]);
 
     // Run rangeify pipeline (Phases 1-4)
-    let (rangeified, _ctx) = crate::rangeify::rangeify(sink.clone(), None).expect("Rangeify should succeed");
+    let (rangeified, _ctx) = crate::rangeify::rangeify(sink.clone()).expect("Rangeify should succeed");
 
     // Print rangeified graph
     println!("After rangeify:");

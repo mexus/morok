@@ -125,7 +125,7 @@ fn test_rangeify_with_symbolic_simplification() {
     let permute = reshaped.try_permute(vec![1, 0]).unwrap();
 
     // Run full rangeify pipeline (includes symbolic simplification in Step 8)
-    let (result, _ctx) = crate::rangeify::rangeify(permute, None).unwrap();
+    let (result, _ctx) = crate::rangeify::rangeify(permute).unwrap();
 
     // Verify the pipeline completed successfully without panicking.
     // This is primarily a smoke test to ensure symbolic simplification

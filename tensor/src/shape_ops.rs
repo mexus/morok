@@ -9,7 +9,7 @@
 //! - Unsqueeze: Add dimensions of size 1
 
 use bon::bon;
-use snafu::ResultExt;
+use snafu::{OptionExt, ResultExt};
 use strum::{Display, EnumString};
 use svod_ir::IntoShrinkRange;
 
@@ -356,6 +356,50 @@ impl Tensor {
         Ok(result)
     }
 
+    /// Split tensor into approximately equal chunks along a dimension.
+    ///
+    /// Attempts to split the tensor into `chunks` parts of roughly equal size.
+    /// If the dimension is not evenly divisible, earlier chunks may be larger.
+    /// Returns at most `chunks` parts (may be fewer if the dimension is smaller).
+    ///
+    /// # Examples
+    /// ```ignore
+    /// let t = Tensor::from_slice(&[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]).try_reshape(&[2, 3])?;
+    /// let parts = t.chunk(2, 1)?;  // Two tensors of shape [2, 2] and [2, 1]
+    /// ```
+    #[track_caller]
+    pub fn chunk(&self, chunks: usize, dim: isize) -> Result<Vec<Tensor>> {
+        snafu::ensure!(
+            chunks > 0,
+            ParamRangeSnafu { op: "chunk", param: "chunks", value: chunks.to_string(), constraint: "> 0" }
+        );
+        let shape = self.shape()?;
+        let ndim = shape.len();
+        let dim = Self::normalize_axis(dim, ndim)?;
+        let dim_size = shape[dim].as_const().context(SymbolicShapeUnsupportedSnafu { operation: "chunk" })?;
+        // Empty dim → `chunks` zero-sized tensors.
+        if dim_size == 0 {
+            return self.split(&vec![0; chunks], dim as isize);
+        }
+        let actual_chunks = chunks.min(dim_size);
+        let chunk_size = dim_size.div_ceil(actual_chunks);
+        let mut sizes = Vec::with_capacity(actual_chunks);
+        let mut remaining = dim_size;
+        while remaining > 0 {
+            let sz = chunk_size.min(remaining);
+            sizes.push(sz);
+            remaining -= sz;
+        }
+        self.split(&sizes, dim as isize)
+    }
+
+    /// Alias for [`try_reshape`](Self::try_reshape) — `view` does not enforce
+    /// contiguity, since the lazy IR backend picks copy-vs-view per kernel.
+    #[track_caller]
+    pub fn view(&self, new_shape: impl IntoIterator<Item = impl Into<SInt>>) -> Result<Tensor> {
+        self.try_reshape(new_shape)
+    }
+
     /// Flatten tensor to 1D.
     ///
     /// Reshapes tensor to have a single dimension containing all elements.
@@ -645,7 +689,7 @@ impl Tensor {
         }
 
         // Convert to (SInt, SInt), resolving negative isize indices.
-        // None means "keep entire dim" (matches Tinygrad's shrink(None) semantics).
+        // `ShrinkRange::None` means "keep entire dim".
         let ranges_sint: Vec<(SInt, SInt)> = resolved
             .into_iter()
             .enumerate()
@@ -784,7 +828,7 @@ impl Tensor {
         row.try_add(&diag)?.try_le(&col)
     }
 
-    /// Keep upper triangle, zero below. Matches Tinygrad `Tensor.triu(diagonal)`.
+    /// Keep upper triangle, zero below.
     pub fn triu(&self, diagonal: i64) -> Result<Tensor> {
         let shape = self.shape()?;
         let ndim = shape.len();
@@ -795,7 +839,7 @@ impl Tensor {
         self.where_(&mask, &zero)
     }
 
-    /// Keep lower triangle, zero above. Matches Tinygrad `Tensor.tril(diagonal)`.
+    /// Keep lower triangle, zero above.
     pub fn tril(&self, diagonal: i64) -> Result<Tensor> {
         let shape = self.shape()?;
         let ndim = shape.len();

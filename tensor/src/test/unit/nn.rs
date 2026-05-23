@@ -634,7 +634,7 @@ fn test_densenet_two_layer_kernel_count() {
     let sink = svod_ir::UOp::sink(vec![uop.clone()]);
     // Normalize Buffer→Param before rangeify (matches real pipeline)
     let normalization = crate::realize::normalize_for_schedule_cache(&sink).expect("normalize schedule cache");
-    let (rangeified, _ctx) = svod_schedule::rangeify::rangeify(normalization.normalized, None).unwrap();
+    let (rangeified, _ctx) = svod_schedule::rangeify::rangeify(normalization.normalized).unwrap();
     let (kernels_root, _kctx) = svod_schedule::rangeify::try_get_kernel_graph(rangeified)
         .expect("kernel split pipeline should succeed for dense layer kernel count");
 

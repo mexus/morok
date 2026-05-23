@@ -40,7 +40,7 @@ impl svod_ir::Matcher<()> for StripDetach {
 
 /// Helper to unwrap full rangeify pipeline (includes all optimizations)
 fn rangeify_unwrap(uop: Arc<UOp>) -> Arc<UOp> {
-    match rangeify(uop, None) {
+    match rangeify(uop) {
         Ok((rangeified, _ctx)) => rangeified,
         Err(_) => panic!("rangeify failed"),
     }

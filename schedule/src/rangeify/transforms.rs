@@ -253,11 +253,8 @@ fn resolve_gettuple(node: &Arc<UOp>) -> Arc<UOp> {
 ///
 /// Converts movement operations (RESHAPE, PERMUTE, EXPAND, PAD, SHRINK, FLIP)
 /// into BUFFERIZE + INDEX operations with explicit loop ranges.
-pub fn rangeify(
-    sink: Arc<UOp>,
-    pcontig_config: Option<&super::kernel::PcontigConfig>,
-) -> svod_ir::Result<(Arc<UOp>, RangeifyContext)> {
-    let result = rangeify_with_map(sink, pcontig_config)?;
+pub fn rangeify(sink: Arc<UOp>) -> svod_ir::Result<(Arc<UOp>, RangeifyContext)> {
+    let result = rangeify_with_map(sink)?;
     Ok((result.sink, result.context))
 }
 
@@ -281,7 +278,7 @@ pub struct RangeifyResult {
 /// # Pipeline
 ///
 /// **Stage 0**: Range assignment (run_rangeify)
-/// **Stage 1**: pm_mops + pm_syntactic_sugar (BOTTOM_UP) - Early movement ops
+/// **Stage 1**: movement_op_patterns + pm_syntactic_sugar (BOTTOM_UP) - Early movement ops
 /// **Stage 2**: pm_load_collapse - Collapse load tensor indexing
 /// **Stage 3**: pm_split_ranges + pm_flatten_range - Range splitting
 /// **Stage 4**: sym + pm_flatten_range - Initial symbolic (TOP_DOWN)
@@ -289,10 +286,7 @@ pub struct RangeifyResult {
 /// **Stage 6**: apply_opts - Post-range optimization (happens in optimizer)
 #[allow(clippy::mutable_key_type)]
 #[tracing::instrument(skip_all)]
-pub fn rangeify_with_map(
-    sink: Arc<UOp>,
-    pcontig_config: Option<&super::kernel::PcontigConfig>,
-) -> svod_ir::Result<RangeifyResult> {
+pub fn rangeify_with_map(sink: Arc<UOp>) -> svod_ir::Result<RangeifyResult> {
     // add_tags: assign sequential integer tags to UOps.
     // MUST run FIRST — tags track tensor identity through the entire pipeline.
     let t_stage = std::time::Instant::now();
@@ -315,8 +309,8 @@ pub fn rangeify_with_map(
         "resolve_function complete"
     );
 
-    // Combined early pass: pm_syntactic_sugar + pm_mops + earliest_rewrites
-    // + replace_contiguous, bottom_up.
+    // Combined early pass: pm_syntactic_sugar + movement_op_patterns +
+    // earliest_rewrites + replace_contiguous, bottom_up.
     let t_stage = std::time::Instant::now();
     let early_combined = super::patterns::pm_syntactic_sugar().with_context::<super::patterns::ReplaceContiguousCtx>()
         + super::patterns::movement_op_patterns().with_context::<super::patterns::ReplaceContiguousCtx>()
@@ -359,23 +353,22 @@ pub fn rangeify_with_map(
     );
 
     // =========================================================================
-    // Mega-pass: symbolic + reduce_simplify + buffer_folding + buffer_removal.
-    // One fixpoint pass combining all simplification + buffer removal.
-    // Uses PcontigConfig as the shared context (buffer_removal needs it;
-    // other patterns are lifted via with_context()).
+    // Fused fixpoint: symbolic + reduce-simplify + movement-op rewriting +
+    // const folding + dead-axis pruning + bufferize removal. Pattern groups
+    // re-fire each other's outputs until the graph stabilizes — splitting
+    // them into separate passes loses simplifications that only appear after
+    // a substitution.
     // =========================================================================
     {
-        use super::kernel::PcontigConfig;
         let t_stage = std::time::Instant::now();
         use std::sync::LazyLock;
-        static MEGA_PASS: LazyLock<crate::TypedPatternMatcher<PcontigConfig>> = LazyLock::new(|| {
-            crate::symbolic::symbolic().with_context::<PcontigConfig>()
-                + super::patterns::pm_reduce_simplify().with_context()
-                + super::patterns::buffer_folding().with_context()
-                + super::patterns::dead_axis_removal().with_context()
-                // movement_op_patterns runs alongside buffer-folding so movement
-                + super::patterns::movement_op_patterns().with_context()
-                + super::patterns::buffer_removal_with_pcontig()
+        static MEGA_PASS: LazyLock<crate::TypedPatternMatcher> = LazyLock::new(|| {
+            crate::symbolic::symbolic()
+                + super::patterns::pm_reduce_simplify()
+                + super::patterns::movement_op_patterns()
+                + super::patterns::buffer_folding()
+                + super::patterns::dead_axis_removal()
+                + super::patterns::pm_remove_bufferize()
         });
         let mega_pass = &*MEGA_PASS;
         tracing::debug!(
@@ -384,8 +377,7 @@ pub fn rangeify_with_map(
             indexed_buckets = mega_pass.indexed_count(),
             "mega-pass pattern stats"
         );
-        let mut pcontig = pcontig_config.cloned().unwrap_or_default();
-        sink = crate::rewrite::graph_rewrite_preserve_calls(mega_pass, sink, &mut pcontig);
+        sink = crate::rewrite::graph_rewrite_preserve_calls(mega_pass, sink, &mut ());
         tracing::debug!(
             node_count = sink.node_count(),
             elapsed_ms = t_stage.elapsed().as_millis() as u64,
@@ -1815,24 +1807,19 @@ pub fn pm_add_buffers_patterns() -> crate::TypedPatternMatcher<super::kernel::Ra
         // Flatten multi-range BUFFERIZE to 1D.
         buf @ Bufferize { compute: _ } if matches!(buf.op(), Op::Bufferize { ranges, .. } if ranges.len() > 1)
             => |buf, _ctx| { flatten_bufferize(buf) },
-        // pm_mops rule 1: push movement ops through INDEX.
+        // Movement-op rewrites: push through INDEX / AFTER, strip from END.
         idx @ Index { buffer: mop, indices, gate } if mop.op().is_movement()
             => |idx, mop, indices, gate, _ctx| {
                 super::patterns::transform_movement_through_index(mop, indices, gate, idx.dtype())
             },
-        // pm_mops rule 2a: push movement ops through AFTER.
-        // AFTER(MOVEMENT(x, ...), deps) → MOVEMENT(AFTER(x, deps), ...)
         after @ After { passthrough: mop, deps } if mop.op().is_movement()
             => |after, mop, deps, _ctx| {
                 push_movement_through_after(after, mop, deps)
             },
-        // pm_mops rule 2b: push INDEX through AFTER.
         after @ After { passthrough: idx @ Index { buffer, indices, gate }, deps }
             => |after, idx, buffer, indices, gate, deps, _ctx| {
                 push_index_through_after(after, idx, buffer, indices, gate, deps)
             },
-        // pm_mops rule 3: strip movement ops from END.
-        // END(MOVEMENT(x, ...), ranges) → END(x, ranges)
         End { computation: mop, ranges } if mop.op().is_movement()
             => |mop, ranges, _ctx| {
                 let src = &mop.op().sources()[0];
@@ -1867,22 +1854,19 @@ pub fn pm_add_buffers_local_patterns() -> crate::TypedPatternMatcher<super::kern
         // Flatten multi-range BUFFERIZE to 1D.
         buf @ Bufferize { compute: _ } if matches!(buf.op(), Op::Bufferize { ranges, .. } if ranges.len() > 1)
             => |buf, _ctx| { flatten_bufferize(buf) },
-        // pm_mops rule 1: push movement ops through INDEX.
+        // Movement-op rewrites: push through INDEX / AFTER, strip from END.
         idx @ Index { buffer: mop, indices, gate } if mop.op().is_movement()
             => |idx, mop, indices, gate, _ctx| {
                 super::patterns::transform_movement_through_index(mop, indices, gate, idx.dtype())
             },
-        // pm_mops rule 2a: push movement ops through AFTER.
         after @ After { passthrough: mop, deps } if mop.op().is_movement()
             => |after, mop, deps, _ctx| {
                 push_movement_through_after(after, mop, deps)
             },
-        // pm_mops rule 2b: push INDEX through AFTER.
         after @ After { passthrough: idx @ Index { buffer, indices, gate }, deps }
             => |after, idx, buffer, indices, gate, deps, _ctx| {
                 push_index_through_after(after, idx, buffer, indices, gate, deps)
             },
-        // pm_mops rule 3: strip movement ops from END.
         End { computation: mop, ranges } if mop.op().is_movement()
             => |mop, ranges, _ctx| {
                 let src = &mop.op().sources()[0];

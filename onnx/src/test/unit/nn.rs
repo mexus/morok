@@ -241,7 +241,7 @@ fn test_rnnt_encoder_kernel_count() {
     let contiguouses = vec![encoded.uop().contiguous(), encoded_len.uop().contiguous()];
     let sink = svod_ir::UOp::sink(contiguouses);
 
-    let (rangeified, _ctx) = svod_schedule::rangeify::rangeify(sink, None).unwrap();
+    let (rangeified, _ctx) = svod_schedule::rangeify::rangeify(sink).unwrap();
     let (kernels_root, _kctx) = svod_schedule::rangeify::try_get_kernel_graph(rangeified)
         .expect("kernel split pipeline should succeed for RNNT kernel count");
 

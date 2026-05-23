@@ -1,21 +1,37 @@
 //! Memory planner for buffer reuse optimization.
 //!
-//! This module implements liveness-based memory planning following Tinygrad's approach.
-//! The memory planner analyzes buffer lifetimes across the schedule and reuses buffers
-//! with non-overlapping lifetimes, reducing memory consumption.
+//! Liveness is measured in EXECUTION LEVELS (the runtime's parallel-execution
+//! waves), not schedule order. Because the executor runs each level fully —
+//! with a hard barrier and synchronous CPU writes — before the next, a buffer
+//! last used in level `L` may share storage with one first used in a level
+//! `> L` with NO injected dependency. Reuse is strictly cross-level: same-level
+//! buffers may run concurrently, and the runtime's conflict check (by buffer
+//! handle id) is blind to arena-view aliasing, so same-level sharing is unsafe.
+//!
+//! The planner injects ZERO ordering edges — reuse safety comes entirely from
+//! the level barrier. The previous design injected edges and was the source of
+//! a buffer-clobber drift.
 //!
 //! # Algorithm
 //!
-//! 1. **Liveness Analysis**: Track first/last appearance of each buffer in schedule
-//! 2. **Event Timeline**: Create sorted alloc/free events (frees before allocs at same step)
-//! 3. **Pool-Based Allocation**: Reuse buffers by (device, dtype, size) key
-//! 4. **Apply Replacements**: Map logical buffers to physical buffers
+//! 1. **Levels**: [`compute_item_levels`] assigns each schedule item its
+//!    execution level (matching the runtime's per-op leveling).
+//! 2. **Liveness**: track `[first_level, last_level]` of each buffer.
+//! 3. **Packing**: [`PlannerMode::Arena`] packs buffers into a per-device TLSF
+//!    arena keyed by level; [`PlannerMode::Remap`] pools whole buffers by
+//!    `(device, dtype, size)`. Both only ever overlap level-disjoint buffers.
+//! 4. **Apply**: map logical buffers to physical (arena views / pooled buffers).
+//!
+//! `SVOD_MEMORY_PLANNER=off` disables planning entirely — the escape hatch if
+//! a workload with very wide levels regresses on peak memory (level-interval
+//! reuse is less aggressive than dependency-forced reuse).
 
 mod tlsf;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use snafu::ResultExt;
 use svod_device::Buffer;
 use svod_dtype::{DType, DeviceSpec};
 use svod_ir::{Op, UOp};
@@ -32,22 +48,20 @@ const MIN_BLOCK_SIZE: usize = 256;
 /// - `Remap` runs liveness-based pool reuse: groups buffers by
 ///   `(device, dtype, rounded_size)` and lets disjoint-lifetime buffers
 ///   share an underlying allocation.
-/// - `Arena` packs all plannable buffers into one or two large
-///   per-`(device, copy-lane)` arenas using a TLSF allocator and rewrites
-///   each logical buffer as a `Buffer::view` into its lane's arena
-///   (tinygrad parity).
+/// - `Arena` packs all plannable buffers into one per-device arena using a TLSF
+///   allocator and rewrites each logical buffer as a `Buffer::view` into it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlannerMode {
     /// Skip the planner entirely. Each `Buffer` keeps its original allocation
     /// and is freed by lazy `Drop`. Useful for memory-debugging baselines.
     Disabled,
     /// Liveness-based pool reuse: groups buffers by
-    /// `(device, dtype, rounded_size)` and lets disjoint-lifetime buffers
+    /// `(device, dtype, rounded_size)` and lets level-disjoint buffers
     /// share an underlying allocation via `Arc<Buffer>` swap.
     Remap,
-    /// Tinygrad-style packing: pack every plannable buffer into one or two
-    /// per-`(device, copy-lane)` arenas using a TLSF allocator and rewrite
-    /// each logical buffer as a fresh `Buffer::view` into its lane's arena.
+    /// Arena packing: pack every plannable buffer into a per-device arena using
+    /// a TLSF allocator and rewrite each logical buffer as a fresh
+    /// `Buffer::view` into it.
     Arena,
 }
 
@@ -105,13 +119,20 @@ pub struct BufferPoolKey {
     pub size: usize,
 }
 
-/// Liveness information for a buffer.
+/// Liveness information for a buffer, measured in EXECUTION LEVELS.
+///
+/// The runtime executes `op_levels` with a hard barrier between levels (level
+/// L fully completes — CPU writes visible — before L+1 starts). So a buffer
+/// last used in level `last_level` may safely share storage with one first
+/// used in a level `> last_level`, with NO injected dependency. Equality of
+/// levels is unsafe (same-level ops run concurrently and the runtime's
+/// handle-id conflict check can't see arena-view aliasing).
 #[derive(Debug, Clone)]
 pub struct BufferLiveness {
-    /// Index of first schedule step that uses this buffer.
-    pub first_appearance: usize,
-    /// Index of last schedule step that uses this buffer.
-    pub last_appearance: usize,
+    /// Lowest execution level that uses this buffer.
+    pub first_level: usize,
+    /// Highest execution level that uses this buffer.
+    pub last_level: usize,
     /// Pool key for buffer grouping.
     pub pool_key: BufferPoolKey,
     /// Representative logical buffer for this allocation ID.
@@ -121,26 +142,12 @@ pub struct BufferLiveness {
 /// Buffer allocation/deallocation event for timeline scheduling.
 #[derive(Debug, Clone)]
 struct BufferEvent {
-    /// Schedule item index when this event occurs.
+    /// Execution level when this event occurs.
     timestep: usize,
     /// True for allocation, false for deallocation.
     is_alloc: bool,
     /// Physical buffer allocation identifier.
     buffer_id: u64,
-}
-
-/// Schedule-order dependency introduced by a physical buffer reuse.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ReuseDependency {
-    /// Schedule item that last uses the old logical buffer occupying the storage.
-    pub predecessor_step: usize,
-    /// Schedule item that first uses the new logical buffer reusing that storage.
-    pub successor_step: usize,
-}
-
-struct ReusableBuffer {
-    buffer: Buffer,
-    released_by_step: usize,
 }
 
 /// Collected planner inputs derived from schedule traversal.
@@ -173,8 +180,6 @@ pub struct MemoryPlannerResult {
     pub memory_saved: usize,
     /// Number of buffers that were reused.
     pub buffers_reused: usize,
-    /// Execution ordering constraints required by reuse decisions.
-    pub reuse_dependencies: Vec<ReuseDependency>,
 }
 
 // ============================================================================
@@ -265,12 +270,60 @@ fn should_skip_buffer(buffer: &Buffer, output_buffer_ids: &HashSet<u64>, noopt_b
         || noopt_buffer_ids.contains(&buffer.id().0)
 }
 
-fn analyze_liveness(schedule: &Schedule, output_buffer_ids: &HashSet<u64>) -> PlannerInput {
+/// Compute a per-schedule-item execution level via the SHARED leveling routine
+/// ([`svod_runtime::compute_topological_levels`]) — the same function the
+/// runtime executor uses for `op_levels`. Keyed on `kernel.id` +
+/// `ScheduleItem.dependencies`; `levels[i]` is item `i`'s longest
+/// dependency-path length. Returns `Err` (loud) on a cyclic or unresolved-dep
+/// schedule, matching the runtime — the planner no longer silently skips.
+///
+/// Sharing one implementation guarantees these levels equal the runtime's
+/// per-op levels (so level-interval reuse decisions match real execution
+/// order), provided op emission stays 1:1 with schedule items — enforced by the
+/// BufferView guard + the `op_count` assert in `prepare_execution_plan`.
+pub fn compute_item_levels(schedule: &Schedule) -> crate::Result<Vec<usize>> {
+    let node_ids: Vec<u64> = schedule.iter().map(|it| it.kernel.id).collect();
+    let callable_deps: Vec<Vec<u64>> = schedule.iter().map(|it| it.dependencies.clone()).collect();
+
+    // The planner injects zero ordering edges (level-interval reuse), so there
+    // are no index deps. Flatten the wave structure to a per-item scalar level.
+    let waves = svod_runtime::compute_topological_levels(&node_ids, &callable_deps, None)
+        .context(crate::error::ExecutionSnafu)?;
+    let mut level_of = vec![0usize; schedule.len()];
+    for (level_idx, wave) in waves.iter().enumerate() {
+        for &node_idx in wave {
+            level_of[node_idx] = level_idx;
+        }
+    }
+    Ok(level_of)
+}
+
+/// Derive each buffer's live level-interval from `item.buffers` alone.
+///
+/// # Completeness invariant
+///
+/// `item.buffers` is closed over every buffer the kernel reads or writes — so
+/// iterating it here cannot under-count a buffer's lifetime (which, with zero
+/// injected ordering edges, would be the only way reuse could clobber live
+/// data). It holds because a kernel's buffer set is built from its CALL args,
+/// and those args come from a FULL bottom-up traversal of the kernel AST:
+/// `split_store` (`schedule/src/rangeify/kernel.rs`) runs `graph_rewrite_bottom_up`
+/// with `local_to_param_patterns`/`map_after_like_node`, recording every
+/// Buffer/Param/After/MStack/MSelect node into the CALL, which
+/// `collect_callable_buffers` (`tensor/src/schedule.rs`) materializes into
+/// `item.buffers`.
+///
+/// Documentation only — no verifying assert: at planning time the AST is
+/// already PARAM-rewritten (Buffer→codegen `PARAM`, no handle id), so a check
+/// re-deriving "buffers the AST touches" would duplicate `collect_callable_buffers`
+/// and risk false positives. The invariant is enforced upstream at CALL build.
+fn analyze_liveness(schedule: &Schedule, item_levels: &[usize], output_buffer_ids: &HashSet<u64>) -> PlannerInput {
     let noopt_buffer_ids = collect_noopt_buffer_ids(schedule);
     let mut liveness: HashMap<u64, BufferLiveness> = HashMap::new();
     let mut occurrences: Vec<(BufferKey, u64)> = Vec::new();
 
     for (step_idx, item) in schedule.iter().enumerate() {
+        let level = item_levels[step_idx];
         for (buf_idx, buffer) in item.buffers.iter().enumerate() {
             let key = BufferKey { kernel_idx: step_idx, buffer_idx: buf_idx };
             let buf_id = buffer.id().0;
@@ -291,12 +344,12 @@ fn analyze_liveness(schedule: &Schedule, output_buffer_ids: &HashSet<u64>) -> Pl
             liveness
                 .entry(buf_id)
                 .and_modify(|info| {
-                    info.first_appearance = info.first_appearance.min(step_idx);
-                    info.last_appearance = info.last_appearance.max(step_idx);
+                    info.first_level = info.first_level.min(level);
+                    info.last_level = info.last_level.max(level);
                 })
                 .or_insert_with(|| BufferLiveness {
-                    first_appearance: step_idx,
-                    last_appearance: step_idx,
+                    first_level: level,
+                    last_level: level,
                     pool_key,
                     prototype: buffer.clone(),
                 });
@@ -323,14 +376,15 @@ fn build_event_timeline(liveness: &HashMap<u64, BufferLiveness>) -> Vec<BufferEv
     let mut events = Vec::with_capacity(liveness.len() * 2);
 
     for (&buf_id, info) in liveness {
-        // Allocation event at first appearance
-        events.push(BufferEvent { timestep: info.first_appearance, is_alloc: true, buffer_id: buf_id });
-
-        // Deallocation event after last appearance
-        events.push(BufferEvent { timestep: info.last_appearance + 1, is_alloc: false, buffer_id: buf_id });
+        // Allocate at the buffer's first level; free one level past its last.
+        events.push(BufferEvent { timestep: info.first_level, is_alloc: true, buffer_id: buf_id });
+        events.push(BufferEvent { timestep: info.last_level + 1, is_alloc: false, buffer_id: buf_id });
     }
 
-    // Sort by (timestep, is_alloc) - false < true ensures frees before allocs
+    // Sort by (timestep, is_alloc) — false < true ensures frees precede allocs
+    // at the same level. A free at `last_level + 1` can only be matched by an
+    // alloc at `first_level >= last_level + 1`, i.e. `last_level < first_level`
+    // (strictly level-disjoint), so pool reuse never aliases within a level.
     events.sort_by_key(|e| (e.timestep, e.is_alloc, e.buffer_id));
 
     events
@@ -352,11 +406,10 @@ fn process_events(
     events: &[BufferEvent],
     liveness: &HashMap<u64, BufferLiveness>,
     occurrences: &[(BufferKey, u64)],
-) -> (HashMap<BufferKey, Buffer>, usize, usize, Vec<ReuseDependency>) {
-    let mut free_pools: HashMap<BufferPoolKey, Vec<ReusableBuffer>> = HashMap::new();
+) -> (HashMap<BufferKey, Buffer>, usize, usize) {
+    let mut free_pools: HashMap<BufferPoolKey, Vec<Buffer>> = HashMap::new();
     let mut memory_saved: usize = 0;
     let mut buffers_reused: usize = 0;
-    let mut reuse_dependencies = Vec::new();
     let mut chosen_by_id: HashMap<u64, Buffer> = HashMap::new();
 
     // Track live assignment during timeline simulation.
@@ -370,18 +423,15 @@ fn process_events(
         let pool_key = &info.pool_key;
 
         if event.is_alloc {
-            // Try to reuse a buffer from the pool
+            // Reuse a pooled buffer if available. The event timeline guarantees
+            // any pooled buffer was freed at a strictly-earlier level, so reuse
+            // is safe with no injected dependency (per-level barrier).
             if let Some(pool) = free_pools.get_mut(pool_key)
                 && let Some(reused) = pool.pop()
             {
-                trace!(timestep = event.timestep, reused_buffer_id = reused.buffer.id().0, "reusing buffer from pool");
-
-                reuse_dependencies.push(ReuseDependency {
-                    predecessor_step: reused.released_by_step,
-                    successor_step: event.timestep,
-                });
-                chosen_by_id.insert(event.buffer_id, reused.buffer.clone());
-                active_buffers.insert(event.buffer_id, reused.buffer);
+                trace!(level = event.timestep, reused_buffer_id = reused.id().0, "reusing buffer from pool");
+                chosen_by_id.insert(event.buffer_id, reused.clone());
+                active_buffers.insert(event.buffer_id, reused);
                 memory_saved += pool_key.size;
                 buffers_reused += 1;
                 continue;
@@ -393,10 +443,7 @@ fn process_events(
         } else {
             // Deallocation - return buffer to pool
             if let Some(buffer) = active_buffers.remove(&event.buffer_id) {
-                free_pools
-                    .entry(pool_key.clone())
-                    .or_default()
-                    .push(ReusableBuffer { buffer, released_by_step: info.last_appearance });
+                free_pools.entry(pool_key.clone()).or_default().push(buffer);
             }
         }
     }
@@ -410,101 +457,56 @@ fn process_events(
         }
     }
 
-    (buffer_replace, memory_saved, buffers_reused, reuse_dependencies)
+    (buffer_replace, memory_saved, buffers_reused)
 }
 
 // ============================================================================
 // ARENA-BASED ALLOCATION
 // ============================================================================
 
-/// Per-`(device, lane)` arena identifier. The `bool` separates the copy lane
-/// (`true`) from the compute lane (`false`); this mirrors tinygrad's lane
-/// keying and prevents introducing copy→compute→copy dependencies that
-/// would force serialization.
-type LaneKey = (DeviceSpec, bool);
+/// Per-device arena identifier. Buffers are packed into one arena per device;
+/// reuse safety comes entirely from strict level-disjointness (see
+/// [`BufferLiveness`]), so no copy/compute lane split or injected dependency is
+/// needed.
+type LaneKey = DeviceSpec;
 
 /// Tinygrad-style arena planner: replaces every plannable buffer with a
-/// `Buffer::view` into a per-lane arena allocated by [`tlsf::TlsfAllocator`].
+/// `Buffer::view` into a per-device arena allocated by [`tlsf::TlsfAllocator`].
 ///
-/// Tinygrad rewrites the UOp graph to swap each `BUFFER` for a
-/// `BUFFER_VIEW(arena, ...)`; Svod achieves the same effect at runtime by
-/// populating [`MemoryPlannerResult::buffer_replace`] with arena views, which
-/// the existing [`apply_buffer_replacements`] then swaps into the schedule.
-fn memory_plan_arena(schedule: &Schedule, output_buffer_ids: &HashSet<u64>) -> MemoryPlannerResult {
-    let empty_result = || MemoryPlannerResult {
-        buffer_replace: HashMap::new(),
-        memory_saved: 0,
-        buffers_reused: 0,
-        reuse_dependencies: Vec::new(),
-    };
+/// Liveness is measured in execution LEVELS: a buffer occupies its arena offset
+/// from its `first_level` until `last_level + 1`. The TLSF timeline (frees
+/// before allocs at equal level) therefore only ever overlaps level-disjoint
+/// buffers, and the per-level barrier makes that reuse safe with no injected
+/// dependency. Each logical buffer is swapped for its arena view via
+/// [`apply_buffer_replacements`].
+fn memory_plan_arena(
+    schedule: &Schedule,
+    item_levels: &[usize],
+    output_buffer_ids: &HashSet<u64>,
+) -> MemoryPlannerResult {
+    let empty_result = || MemoryPlannerResult { buffer_replace: HashMap::new(), memory_saved: 0, buffers_reused: 0 };
 
-    let planner_input = analyze_liveness(schedule, output_buffer_ids);
+    let planner_input = analyze_liveness(schedule, item_levels, output_buffer_ids);
     let liveness = planner_input.liveness;
     if liveness.is_empty() {
         return empty_result();
     }
 
-    // Identify copy-lane buffers: any plannable buffer that appears as an
-    // argument to a Copy schedule item.
-    let mut copy_bufs: HashSet<u64> = HashSet::new();
-    for item in schedule {
-        let runtime_ast = crate::realize::runtime_effect_ast(&item.ast);
-        if !matches!(runtime_ast.op(), Op::Copy { .. }) {
-            continue;
-        }
-        for buffer in &item.buffers {
-            let id = buffer.id().0;
-            if liveness.contains_key(&id) {
-                copy_bufs.insert(id);
-            }
-        }
-    }
+    let lane_key = |id: u64| -> LaneKey { liveness[&id].prototype.allocator().device_spec() };
 
-    let lane_key = |id: u64| -> LaneKey {
-        let info = &liveness[&id];
-        (info.prototype.allocator().device_spec(), copy_bufs.contains(&id))
-    };
-
-    // `buf_hold`: copy buffers stay live past their last appearance to avoid
-    // clobbering before downstream copies finish.
-    let buf_hold: HashMap<u64, usize> = copy_bufs
-        .iter()
-        .map(|&id| {
-            let info = &liveness[&id];
-            (id, info.last_appearance - info.first_appearance + 1)
-        })
-        .collect();
-
-    // Per-buffer rounded size and byte size: round to `block_size` so the
-    // TLSF allocator's bucket math stays correct.
+    // Per-buffer rounded size: round to `block_size` so the TLSF bucket math stays correct.
     let nbytes_rounded: HashMap<u64, usize> =
         liveness.iter().map(|(&id, info)| (id, round_up(info.prototype.size(), MIN_BLOCK_SIZE))).collect();
 
-    // Build event timeline with copy-lane hold extension on free events.
-    let mut events: Vec<BufferEvent> = Vec::with_capacity(liveness.len() * 2);
-    for (&id, info) in &liveness {
-        events.push(BufferEvent { timestep: info.first_appearance, is_alloc: true, buffer_id: id });
-        events.push(BufferEvent {
-            timestep: info.last_appearance + 1 + buf_hold.get(&id).copied().unwrap_or(0),
-            is_alloc: false,
-            buffer_id: id,
-        });
-    }
-    events.sort_by_key(|e| (e.timestep, e.is_alloc, e.buffer_id));
+    let events = build_event_timeline(&liveness);
 
-    // Per-lane TLSF allocators. Generous size budget = 2 × Σ(rounded sizes)
+    // Per-device TLSF allocators. Generous size budget = 2 × Σ(rounded sizes)
     // so even worst-case fragmentation can fit.
     let total_bytes: usize = nbytes_rounded.values().sum();
     let arena_budget = total_bytes.saturating_mul(2).max(MIN_BLOCK_SIZE);
     let mut tlsfs: HashMap<LaneKey, tlsf::TlsfAllocator> = HashMap::new();
     let mut offsets: HashMap<u64, usize> = HashMap::new();
     let mut peaks: HashMap<LaneKey, usize> = HashMap::new();
-    // Track ranges freed within this lane so a later allocator-overlap
-    // becomes an explicit `ReuseDependency`. We record `(offset, end, last_step)`
-    // for every free; on alloc, any live entry whose `[offset, end)` overlaps
-    // the new alloc emits a dep.
-    let mut freed_ranges: HashMap<LaneKey, Vec<(usize, usize, usize)>> = HashMap::new();
-    let mut reuse_dependencies: Vec<ReuseDependency> = Vec::new();
 
     for event in &events {
         let lane = lane_key(event.buffer_id);
@@ -527,40 +529,15 @@ fn memory_plan_arena(schedule: &Schedule, output_buffer_ids: &HashSet<u64>) -> M
             if used_end > *peak {
                 *peak = used_end;
             }
-            // Emit reuse dependencies for any freed range this alloc
-            // overlaps — they share storage now that the offset is reused.
-            let alloc_end = off + req;
-            if let Some(ranges) = freed_ranges.get(&lane) {
-                for &(prev_off, prev_end, prev_last_step) in ranges {
-                    let overlaps = off < prev_end && prev_off < alloc_end;
-                    if overlaps {
-                        reuse_dependencies.push(ReuseDependency {
-                            predecessor_step: prev_last_step,
-                            successor_step: info.first_appearance,
-                        });
-                    }
-                }
-            }
-            // Drop freed ranges that this alloc overlaps. Their ReuseDependency
-            // edges were just emitted above, and a future overlapping alloc
-            // should depend on the *current* allocation's last appearance, not
-            // the older eclipsed range — leaving them in would re-emit
-            // redundant deps. The retain predicate keeps only ranges fully
-            // disjoint from `[off, alloc_end)`.
-            if let Some(ranges) = freed_ranges.get_mut(&lane) {
-                ranges.retain(|&(o, e, _)| o >= alloc_end || e <= off);
-            }
-        } else if let Some(off) = offsets.get(&event.buffer_id).copied() {
-            let req = nbytes_rounded[&event.buffer_id];
-            if let Err(e) = alloc.free(off) {
-                tracing::warn!(?e, "arena planner: TLSF free failed; skipping arena rewrite");
-                return empty_result();
-            }
-            freed_ranges.entry(lane).or_default().push((off, off + req, info.last_appearance));
+        } else if let Some(off) = offsets.get(&event.buffer_id).copied()
+            && let Err(e) = alloc.free(off)
+        {
+            tracing::warn!(?e, "arena planner: TLSF free failed; skipping arena rewrite");
+            return empty_result();
         }
     }
 
-    // Allocate one arena buffer per lane, sized to the lane's peak. Precompute a
+    // Allocate one arena buffer per device, sized to its peak. Precompute a
     // lane→prototype map so we don't re-scan `liveness` once per lane.
     let mut lane_proto: HashMap<LaneKey, Buffer> = HashMap::with_capacity(peaks.len());
     for (&id, info) in &liveness {
@@ -583,9 +560,10 @@ fn memory_plan_arena(schedule: &Schedule, output_buffer_ids: &HashSet<u64>) -> M
     }
 
     // Build buffer_replace by viewing each plannable buffer's slice of its
-    // lane's arena. `Buffer::view` mints a fresh handle id per view (Path Y),
-    // so disjoint views naturally appear as independent buffers to the
-    // hazard model.
+    // arena. `Buffer::view` mints a fresh handle id per view, so disjoint views
+    // appear as independent buffers to the runtime hazard model. A view failure
+    // aborts the WHOLE rewrite (all-or-nothing) — a partial rewrite would leave
+    // one buffer un-aliased while others assume the full plan.
     let mut buffer_replace: HashMap<BufferKey, Buffer> = HashMap::new();
     let mut buffers_reused = 0usize;
     for (key, buf_id) in &planner_input.occurrences {
@@ -595,13 +573,12 @@ fn memory_plan_arena(schedule: &Schedule, output_buffer_ids: &HashSet<u64>) -> M
         let Some(arena) = arenas.get(&lane_key(*buf_id)) else {
             continue;
         };
-        let info = &liveness[buf_id];
-        let byte_size = info.prototype.size();
+        let byte_size = liveness[buf_id].prototype.size();
         let view = match arena.view(offset, byte_size) {
             Ok(v) => v,
             Err(e) => {
-                tracing::warn!(?e, "arena planner: view failed; skipping rewrite for one slot");
-                continue;
+                tracing::warn!(?e, "arena planner: view failed; aborting arena rewrite");
+                return empty_result();
             }
         };
         buffer_replace.insert(*key, view);
@@ -619,7 +596,7 @@ fn memory_plan_arena(schedule: &Schedule, output_buffer_ids: &HashSet<u64>) -> M
         "arena memory planner complete"
     );
 
-    MemoryPlannerResult { buffer_replace, memory_saved, buffers_reused, reuse_dependencies }
+    MemoryPlannerResult { buffer_replace, memory_saved, buffers_reused }
 }
 
 // ============================================================================
@@ -643,14 +620,16 @@ fn memory_plan_arena(schedule: &Schedule, output_buffer_ids: &HashSet<u64>) -> M
 /// # Returns
 ///
 /// `MemoryPlannerResult` containing buffer replacements and statistics.
+/// * `item_levels` - Per-schedule-item execution level (see
+///   [`compute_item_levels`]); liveness and reuse are measured in these levels.
 #[allow(rustdoc::private_intra_doc_links)]
-pub fn memory_planner(schedule: &Schedule, output_buffer_ids: &HashSet<u64>, mode: PlannerMode) -> MemoryPlannerResult {
-    let empty_result = || MemoryPlannerResult {
-        buffer_replace: HashMap::new(),
-        memory_saved: 0,
-        buffers_reused: 0,
-        reuse_dependencies: Vec::new(),
-    };
+pub fn memory_planner(
+    schedule: &Schedule,
+    item_levels: &[usize],
+    output_buffer_ids: &HashSet<u64>,
+    mode: PlannerMode,
+) -> MemoryPlannerResult {
+    let empty_result = || MemoryPlannerResult { buffer_replace: HashMap::new(), memory_saved: 0, buffers_reused: 0 };
 
     if matches!(mode, PlannerMode::Disabled) {
         return empty_result();
@@ -661,11 +640,11 @@ pub fn memory_planner(schedule: &Schedule, output_buffer_ids: &HashSet<u64>, mod
     }
 
     if matches!(mode, PlannerMode::Arena) {
-        return memory_plan_arena(schedule, output_buffer_ids);
+        return memory_plan_arena(schedule, item_levels, output_buffer_ids);
     }
 
     // Phase 1: Liveness analysis
-    let planner_input = analyze_liveness(schedule, output_buffer_ids);
+    let planner_input = analyze_liveness(schedule, item_levels, output_buffer_ids);
     let liveness = planner_input.liveness;
 
     if liveness.is_empty() {
@@ -677,8 +656,7 @@ pub fn memory_planner(schedule: &Schedule, output_buffer_ids: &HashSet<u64>, mod
     let events = build_event_timeline(&liveness);
 
     // Phase 3: Process events and compute replacements
-    let (buffer_replace, memory_saved, buffers_reused, reuse_dependencies) =
-        process_events(&events, &liveness, &planner_input.occurrences);
+    let (buffer_replace, memory_saved, buffers_reused) = process_events(&events, &liveness, &planner_input.occurrences);
 
     debug!(
         buffers_analyzed = liveness.len(),
@@ -687,7 +665,7 @@ pub fn memory_planner(schedule: &Schedule, output_buffer_ids: &HashSet<u64>, mod
         "memory planner complete"
     );
 
-    MemoryPlannerResult { buffer_replace, memory_saved, buffers_reused, reuse_dependencies }
+    MemoryPlannerResult { buffer_replace, memory_saved, buffers_reused }
 }
 
 /// Apply buffer replacements to the schedule.
@@ -700,32 +678,6 @@ pub fn apply_buffer_replacements(schedule: &mut Schedule, replacements: &HashMap
             && let Some(buffer) = item.buffers.get_mut(key.buffer_idx)
         {
             *buffer = replacement.clone();
-        }
-    }
-}
-
-/// Add execution-order edges required by physical buffer reuse.
-pub fn apply_reuse_dependencies(schedule: &mut Schedule, reuse_dependencies: &[ReuseDependency]) {
-    for dep in reuse_dependencies {
-        if dep.predecessor_step == dep.successor_step {
-            continue;
-        }
-
-        debug_assert!(
-            dep.successor_step > dep.predecessor_step,
-            "reuse dependency must be forward-edge: predecessor={} >= successor={}",
-            dep.predecessor_step,
-            dep.successor_step,
-        );
-
-        if dep.predecessor_step >= schedule.len() {
-            continue;
-        }
-        let Some(successor) = schedule.get_mut(dep.successor_step) else {
-            continue;
-        };
-        if !successor.instance_dependencies.contains(&dep.predecessor_step) {
-            successor.instance_dependencies.push(dep.predecessor_step);
         }
     }
 }

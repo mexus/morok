@@ -26,6 +26,7 @@ pub mod execution_plan;
 pub mod executor;
 pub mod jit_loader;
 pub mod kernel_cache;
+pub mod leveling;
 pub mod llvm;
 #[cfg(feature = "mlir")]
 pub mod mlir;
@@ -48,5 +49,6 @@ pub use executor::{
     DeviceContext, ExecutionGraph, ExecutionNode, KernelBufferAccess, SyncStrategy, UnifiedExecutor, global_executor,
 };
 pub use kernel_cache::*;
+pub use leveling::{compute_topological_levels, compute_topological_order};
 pub use llvm::*;
 pub use profiler::KernelProfile;

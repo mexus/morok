@@ -614,7 +614,7 @@ fn schedule_result_from_sink_with_cache(
         }
         None => {
             let schedule_root = restore_bind_placeholders_for_schedule(&normalization.normalized, &normalization);
-            let rangeify_result = svod_schedule::rangeify_with_map(schedule_root, None).context(RangeifySnafu)?;
+            let rangeify_result = svod_schedule::rangeify_with_map(schedule_root).context(RangeifySnafu)?;
             let (kernel_graph, _) = svod_schedule::try_get_kernel_graph(rangeify_result.sink).context(RangeifySnafu)?;
             let pre_schedule = crate::schedule::create_pre_schedule(kernel_graph)?;
             let new_entry = Arc::new(crate::schedule_cache::CachedSchedule { pre_schedule: Arc::new(pre_schedule) });
@@ -635,7 +635,7 @@ fn schedule_result_from_sink_uncached(
     var_vals: HashMap<String, i64>,
     _config: &PrepareConfig,
 ) -> Result<crate::schedule::ScheduleResult> {
-    let rangeify_result = svod_schedule::rangeify_with_map(sink, None).context(RangeifySnafu)?;
+    let rangeify_result = svod_schedule::rangeify_with_map(sink).context(RangeifySnafu)?;
     let (kernel_graph, _) = svod_schedule::try_get_kernel_graph(rangeify_result.sink).context(RangeifySnafu)?;
     let pre_schedule = crate::schedule::create_pre_schedule(kernel_graph.clone())?;
     let input_buffers = collect_input_buffers(&kernel_graph);
@@ -1132,7 +1132,15 @@ fn prepare_execution_plan(
     // by `SVOD_MEMORY_PLANNER` (`Arena` if unset).
     let planner_mode = crate::memory_planner::mode_from_env();
     let output_buffer_ids = collect_output_buffer_ids(&schedule_items, &schedule_result.output_uop_ids);
-    let planner_result = crate::memory_planner::memory_planner(&schedule_items, &output_buffer_ids, planner_mode);
+    // Reuse is keyed by execution LEVEL (computed from callable deps, matching
+    // the runtime's per-op leveling), so storage is only shared across the
+    // per-level barrier — no ordering edges are injected. This is why the
+    // planner never touches `instance_dependencies` (asserted below): the only
+    // former writer of it (reuse deps) is gone, which also makes the
+    // schedule-index ↔ op-index mapping a non-issue.
+    let item_levels = crate::memory_planner::compute_item_levels(&schedule_items)?;
+    let planner_result =
+        crate::memory_planner::memory_planner(&schedule_items, &item_levels, &output_buffer_ids, planner_mode);
     if !planner_result.buffer_replace.is_empty() {
         trace!(
             replacements = planner_result.buffer_replace.len(),
@@ -1140,9 +1148,11 @@ fn prepare_execution_plan(
             memory_saved_bytes = planner_result.memory_saved,
             "applying memory planner buffer replacements"
         );
-        crate::memory_planner::apply_reuse_dependencies(&mut schedule_items, &planner_result.reuse_dependencies);
         crate::memory_planner::apply_buffer_replacements(&mut schedule_items, &planner_result.buffer_replace);
     }
+    // The planner injects zero ordering edges; the real safety invariant (op
+    // emission is 1:1 with schedule items, so planner levels == runtime levels)
+    // is asserted after the emission loop below via `builder.op_count()`.
 
     debug!(num_items = schedule_items.len(), "schedule items ready for execution plan");
 
@@ -1254,37 +1264,52 @@ fn prepare_execution_plan(
         if let Op::BufferView { size, offset, .. } = runtime_ast.op() {
             let buffer_indices = resolve_item_buffer_indices(item, &uop_id_to_idx)?;
 
-            if item.buffers.len() >= 2 && item.buffer_uop_ids.len() >= 2 && buffer_indices.len() >= 2 {
-                let base = &item.buffers[1];
-                let byte_offset = offset * base.dtype().bytes();
-                let byte_size = size * runtime_ast.dtype().bytes();
-                let view = base.view(byte_offset, byte_size).map_err(|e| crate::error::Error::IrConstruction {
+            // A BUFFER_VIEW must carry [output, base]. Anything less is malformed
+            // IR — fail loud rather than silently emit no op, which would break
+            // the 1:1 op↔item emission the memory planner's leveling relies on.
+            if item.buffers.len() < 2 || item.buffer_uop_ids.len() < 2 || buffer_indices.len() < 2 {
+                return IrConstructionSnafu {
                     details: format!(
-                        "BUFFER_VIEW failed for kernel {}: base_buffer_id={}, byte_offset={}, byte_size={}: {e}",
+                        "BUFFER_VIEW kernel {} must have >=2 buffers (output, base) for 1:1 op emission; \
+                         got buffers={}, buffer_uop_ids={}, buffer_indices={}",
                         item.kernel.id,
-                        base.id().0,
-                        byte_offset,
-                        byte_size
+                        item.buffers.len(),
+                        item.buffer_uop_ids.len(),
+                        buffer_indices.len(),
                     ),
-                })?;
-                // Register the view under the output buffer's UOp ID so downstream
-                // COPY/kernel items find it as their source buffer.
-                let output_uop_id = item.buffer_uop_ids[0];
-                if let Some(&idx) = uop_id_to_idx.get(&output_uop_id) {
-                    builder.replace_buffer(idx, view);
                 }
-
-                builder.add_op_with_instance_dependencies(
-                    PreparedOp::BufferView(PreparedBufferView {
-                        id: item.kernel.id,
-                        buffer_indices,
-                        byte_offset,
-                        byte_size,
-                        dependencies: item.dependencies.clone(),
-                    }),
-                    item.instance_dependencies.clone(),
-                );
+                .fail();
             }
+
+            let base = &item.buffers[1];
+            let byte_offset = offset * base.dtype().bytes();
+            let byte_size = size * runtime_ast.dtype().bytes();
+            let view = base.view(byte_offset, byte_size).map_err(|e| crate::error::Error::IrConstruction {
+                details: format!(
+                    "BUFFER_VIEW failed for kernel {}: base_buffer_id={}, byte_offset={}, byte_size={}: {e}",
+                    item.kernel.id,
+                    base.id().0,
+                    byte_offset,
+                    byte_size
+                ),
+            })?;
+            // Register the view under the output buffer's UOp ID so downstream
+            // COPY/kernel items find it as their source buffer.
+            let output_uop_id = item.buffer_uop_ids[0];
+            if let Some(&idx) = uop_id_to_idx.get(&output_uop_id) {
+                builder.replace_buffer(idx, view);
+            }
+
+            builder.add_op_with_instance_dependencies(
+                PreparedOp::BufferView(PreparedBufferView {
+                    id: item.kernel.id,
+                    buffer_indices,
+                    byte_offset,
+                    byte_size,
+                    dependencies: item.dependencies.clone(),
+                }),
+                item.instance_dependencies.clone(),
+            );
             continue;
         }
 
@@ -1425,6 +1450,16 @@ fn prepare_execution_plan(
             item.instance_dependencies.clone(),
         );
     }
+
+    // 1:1 op↔item emission is the invariant that makes the planner's
+    // (schedule-item) levels equal the runtime's (per-op) levels. Every branch
+    // above emits exactly one op per item (the BufferView `<2` case is now a
+    // hard error), so this must hold.
+    debug_assert_eq!(
+        builder.op_count(),
+        schedule_items.len(),
+        "execution plan must emit exactly one prepared op per schedule item (1:1 emission)"
+    );
 
     // Deterministic output identification via ScheduleResult.output_uop_ids
     let mut output_buffer_indices = Vec::with_capacity(schedule_result.output_uop_ids.len());

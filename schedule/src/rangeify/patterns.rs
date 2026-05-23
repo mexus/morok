@@ -29,7 +29,7 @@ use crate::rangeify::transforms::{cast_to_dtype, get_range_size, partition_reduc
 use super::indexing::IndexingContext;
 use super::indexing::{is_dead_axis, ranges_equal};
 use super::kernel::{LocalAddBufferContext, RangeifyBufferContext};
-use super::kernel::{PcontigConfig, SplitReduceOpConfig, split_reduceop};
+use super::kernel::{SplitReduceOpConfig, split_reduceop};
 use super::transforms::transform_sources_with_bufferize;
 
 // ============================================================================
@@ -52,58 +52,9 @@ fn has_zero_size(uop: &Arc<UOp>) -> bool {
     }
 }
 
-/// Check if an op is cheap to inline (no buffering needed).
-///
-/// Note: Unary ops are included here but may need buffering in reduce context.
-/// Use `unary_in_reduce_context()` to check before inlining Unary ops.
-pub fn is_cheap_to_inline(op: &Op) -> bool {
-    matches!(
-        op,
-        // Nullary - always cheap
-        Op::Const(_)
-            | Op::Unique(_)
-            | Op::Device(_)
-            | Op::Noop
-            | Op::DefineVar { .. }
-            | Op::DefineReg { .. }
-            | Op::VConst { .. }
-            // Simple operations - cheap to recompute
-            | Op::Unary(..)
-            | Op::Binary(..)
-            | Op::Ternary(..)
-            | Op::Cast { .. }
-            | Op::BitCast { .. }
-            // Vector operations - cheap
-            | Op::Gep { .. }
-            | Op::Vectorize { .. }
-            // Index/pointer operations - cheap
-            | Op::PointerIndex { .. }
-    )
-}
-
-/// Check if a Unary op is within a reduce context (has REDUCE ranges in scope).
-///
-/// If a Unary op has reduce ranges in scope, it means it's being computed inside
-/// a reduction loop and must NOT be inlined (would recompute N times per element).
-fn unary_in_reduce_context(compute: &Arc<UOp>) -> bool {
-    if !matches!(compute.op(), Op::Unary(..)) {
-        return false;
-    }
-    compute
-        .in_scope_ranges()
-        .iter()
-        .any(|key| if let Op::Range { axis_type, .. } = key.0.op() { *axis_type == AxisType::Reduce } else { false })
-}
-
-/// Block inlining of BUFFERIZE when it wraps a Unary op in reduce context.
-/// Returns None to keep the BUFFERIZE as-is (no transformation).
-fn block_reduce_unary_inline(_buf: &Arc<UOp>) -> Option<Arc<UOp>> {
-    None
-}
-
-/// Check if an op must always run (shouldn't be buffered).
+/// Ops whose buffers must materialize and therefore cannot be inlined.
 pub fn is_always_run_op(op: &Op) -> bool {
-    matches!(op, Op::Contiguous { .. } | Op::Copy { .. })
+    matches!(op, Op::Contiguous { .. } | Op::Copy { .. } | Op::Noop)
 }
 
 /// Check if operation is elementwise (Binary or Ternary).
@@ -406,13 +357,24 @@ fn convert_reduceaxis_with_context(x: &Arc<UOp>, ctx: &mut IndexingContext) -> O
 // BUFFER FOLDING PATTERNS
 // ============================================================================
 
-/// Pattern matcher for buffer folding and constant propagation.
+/// Const folding through BUFFERIZE / INDEX / COPY / MSTACK and noop-bufferize
+/// removal.
 #[tracing::instrument]
 pub fn buffer_folding() -> TypedPatternMatcher {
     crate::patterns! {
         Bufferize { compute: c @ Const(_), .. } ~> |c| c.clone(),
         Index { buffer: c @ Const(_), .. } ~> |c| c.clone(),
         Copy { src: c @ Const(_), .. } ~> |c| c.clone(),
+        idx @ Index { buffer: MStack { buffers }, .. }
+            if !buffers.is_empty() && matches!(buffers[0].base().op(), Op::Const(_))
+            => |idx, buffers| {
+                let base = buffers[0].base();
+                if let Op::Const(cv) = base.op() {
+                    Some(idx.const_like(cv.0))
+                } else {
+                    None
+                }
+            },
         Index { buffer: buf @ Bufferize { compute, ranges, .. }, indices, gate: None }
             if ranges_equal(ranges, indices) && !matches!(compute.op(), Op::BufferView { .. })
             => |compute, buf, ranges| {
@@ -438,9 +400,8 @@ pub fn buffer_folding() -> TypedPatternMatcher {
     }
 }
 
-/// Pattern matcher for dead axis removal.
-///
-/// When dead axes are removed from BUFFERIZE, preserves shape via RESHAPE + EXPAND.
+/// Strip dead axes (size-1 or unreferenced ranges) from BUFFERIZE,
+/// preserving the original shape via RESHAPE + EXPAND.
 pub fn dead_axis_removal() -> TypedPatternMatcher {
     crate::patterns! {
         // Filter dead axes from BUFFERIZE with shape preservation
@@ -539,337 +500,130 @@ fn cleanup_dead_axes_bufferize(
 // BUFFER REMOVAL PATTERNS
 // ============================================================================
 
-/// Pattern matcher for cost-based buffer removal.
-///
-/// Unary ops in reduce context are NOT inlined to avoid recomputing N times
-/// inside the reduction loop (e.g., argmax(-x) needs to compute -x once, not per element).
-pub fn buffer_removal() -> TypedPatternMatcher {
+/// Cost-bounded inlining of `INDEX(BUFFERIZE(...))` plus two cleanup rules
+/// that fire after substitution:
+/// - `STORE(x, x) → NOOP`
+/// - `END(NOOP, ..) → NOOP`
+pub fn pm_remove_bufferize() -> TypedPatternMatcher {
     crate::patterns! {
-        // Unary in REDUCE context must NOT be inlined - check FIRST
-        buf @ Bufferize { compute } if unary_in_reduce_context(compute) => |buf| block_reduce_unary_inline(buf),
-        // Other cheap ops (including non-reduce Unary) can inline
-        Bufferize { compute, .. } if is_cheap_to_inline(compute.op()) ~> |compute| compute.clone(),
-        Bufferize { compute: Bufferize { compute: inner, .. }, ranges, opts }
-            => |inner, ranges, opts| Some(UOp::bufferize(Arc::clone(inner), ranges.to_vec(), opts.clone())),
+        Index { buffer: Bufferize { compute: src, ranges: buf_ranges, opts }, indices: idx_ranges, .. }
+            => |src, buf_ranges, idx_ranges, opts| {
+                remove_bufferize(src, buf_ranges, idx_ranges, opts)
+            },
+        Store { index: x, value: y, .. } if Arc::ptr_eq(x, y) => |_x| Some(UOp::noop()),
+        End { computation: noop, .. } if matches!(noop.op(), Op::Noop) => |noop| Some(noop.clone()),
     }
 }
 
-/// Pattern matcher for cost-based buffer removal with partial contiguous support.
-pub fn buffer_removal_with_pcontig() -> TypedPatternMatcher<PcontigConfig> {
-    crate::patterns! {
-        @context PcontigConfig;
-        // Partial contiguous removal - ungated INDEX with WHERE-Invalid in indices.
-        // WHERE-Invalid stays in INDEX indices (not extracted to gate). Extract cond,
-        // inline with clean idx, wrap result with WHERE(cond, inlined, 0).
-        // Must be before the general ungated pattern to match first.
-        Index {
-            buffer: buffer @ Bufferize { compute: src, ranges: buf_ranges, .. },
-            indices: idx_ranges,
-            gate: None
-        } if idx_ranges.len() == 1
-          && matches!(idx_ranges[0].op(), Op::Ternary(svod_ir::TernaryOp::Where, _, _, f) if matches!(f.op(), Op::Invalid))
-        => |buffer, src, buf_ranges, idx_ranges, ctx| {
-            let Op::Ternary(svod_ir::TernaryOp::Where, cond, clean_idx, _) = idx_ranges[0].op() else {
-                unreachable!()
-            };
-            let clean_indices: SmallVec<[Arc<UOp>; 4]> = smallvec::smallvec![clean_idx.clone()];
-            let inlined = apply_pcontig_removal_inner(buffer, src, buf_ranges, &clean_indices, ctx)?;
-            let zero = UOp::const_(inlined.dtype(), ConstValue::zero(inlined.dtype().scalar()?));
-            UOp::try_where(cond.clone(), inlined, zero).ok()
-        },
-
-        // Partial contiguous removal - ungated INDEX (no WHERE-Invalid)
-        Index {
-            buffer: buffer @ Bufferize { compute: src, ranges: buf_ranges, .. },
-            indices: idx_ranges,
-            gate: None
-        } => |buffer, src, buf_ranges, idx_ranges, ctx| {
-            apply_pcontig_removal_inner(buffer, src, buf_ranges, idx_ranges, ctx)
-        },
-
-        // Partial contiguous removal - gated INDEX (from pm_move_where_on_load)
-        // Inline the buffer, then wrap with WHERE(gate, inlined, 0) so out-of-bounds
-        // values become zero.
-        Index {
-            buffer: buffer @ Bufferize { compute: src, ranges: buf_ranges, .. },
-            indices: idx_ranges,
-            gate: Some(gate)
-        } => |buffer, src, buf_ranges, idx_ranges, gate, ctx| {
-            let inlined = apply_pcontig_removal_inner(buffer, src, buf_ranges, idx_ranges, ctx)?;
-            let zero = UOp::const_(inlined.dtype(), ConstValue::zero(inlined.dtype().scalar()?));
-            UOp::try_where(gate.clone(), inlined, zero).ok()
-        },
-
-        // Constant buffer folding — BUFFERIZE(CONST) → CONST.
-        // Only matches bare constants, not arbitrary cheap ops.
-        Bufferize { compute: compute @ Const(_), .. }
-            if ctx.level > 0
-            => |compute| Some(compute.clone()),
-
-        // Flatten nested Bufferize
-        Bufferize { compute: Bufferize { compute: inner, .. }, ranges, opts }
-            => |inner, ranges, opts| Some(UOp::bufferize(Arc::clone(inner), ranges.to_vec(), opts.clone())),
-    }
-}
-
-/// Remove a BUFFERIZE+INDEX pair by inlining the computation.
+/// Inline a BUFFERIZE into its INDEX consumer by substituting buffer ranges
+/// with the consumer's index ranges. Bails when:
+/// 1. `src` is an always-run op or the Bufferize is non-removable
+///    (multi-consumer realize boundary).
+/// 2. The compute touches more than 3 distinct GLOBAL Bufferizes / MStacks /
+///    Params (would expand kernel input pressure).
+/// 3. Any reduce body reads a buffer (would compound reads inside the loop).
 ///
-/// 1. Always-run ops (Contiguous/Copy) → keep
-/// 2. Buffer count > threshold (bypassed at level > 2) → keep
-/// 3. No buffer in reduce scope → simple range substitution (always inline)
-/// 4. Buffer in reduce at level ≤ 2 → keep (`PCONTIG ≤ 2` default)
-/// 5. Buffer in reduce at level > 2 → ratio check + partial contiguous
+/// CONST range keys are skipped during substitution — they're broadcast slots,
+/// not real loop variables.
 #[allow(clippy::mutable_key_type)]
-fn apply_pcontig_removal_inner(
-    buffer: &Arc<UOp>,
+fn remove_bufferize(
     src: &Arc<UOp>,
     buf_ranges: &SmallVec<[Arc<UOp>; 4]>,
     idx_ranges: &SmallVec<[Arc<UOp>; 4]>,
-    config: &mut PcontigConfig,
+    opts: &BufferizeOpts,
 ) -> Option<Arc<UOp>> {
     use std::collections::{HashMap, HashSet};
-    use svod_ir::{AddrSpace, AxisType, BufferizeOpts, ConstValue};
 
-    if config.level == 0 || is_always_run_op(src.op()) {
+    debug_assert_eq!(buf_ranges.len(), idx_ranges.len(), "INDEX/BUFFERIZE range arity mismatch");
+    debug_assert!(
+        buf_ranges.iter().all(|r| matches!(r.op(), Op::Range { .. } | Op::Const(_))),
+        "BUFFERIZE ranges must be Range or Const"
+    );
+
+    if is_always_run_op(src.op()) || !opts.removable {
         return None;
     }
 
-    // Non-removable BUFFERIZEs are multi-consumer realize boundaries.
-    // Inlining them duplicates computation into each consumer's kernel.
-    if let Op::Bufferize { opts, .. } = buffer.op()
-        && !opts.removable
-    {
-        tracing::debug!(src_id = src.id, src_op = src.op().as_ref(), "buffer_removal: KEPT (non-removable)");
-        return None;
-    }
-
-    // Single-pass collection of buffers, indexes, reduces in the src subtree.
-    let mut accessed_buffers = Vec::new();
-    let mut indexes = Vec::new();
-    let mut reduces = Vec::new();
-    let mut visited = HashSet::new();
+    let mut accessed_buffers: Vec<Arc<UOp>> = Vec::new();
+    let mut reduces: Vec<Arc<UOp>> = Vec::new();
+    let mut visited: HashSet<UOpKey> = HashSet::new();
 
     fn collect(
         uop: &Arc<UOp>,
         buffers: &mut Vec<Arc<UOp>>,
-        indexes: &mut Vec<Arc<UOp>>,
         reduces: &mut Vec<Arc<UOp>>,
         visited: &mut HashSet<UOpKey>,
-    ) -> bool {
-        let key = UOpKey(Arc::clone(uop));
-        if !visited.insert(key) {
-            return true;
+    ) {
+        if !visited.insert(UOpKey(Arc::clone(uop))) {
+            return;
         }
-
         match uop.op() {
-            // STORE doesn't count toward buffer accesses, and we don't look inside it.
-            Op::Store { .. } => return false,
-            // BUFFERIZE(Global) and MSTACK count + stop traversal.
+            // STORE doesn't count, and we don't look inside it.
+            Op::Store { .. } => return,
+            // GLOBAL Bufferize and MStack count + stop traversal.
             Op::Bufferize { opts, .. } if opts.addrspace == AddrSpace::Global => {
                 buffers.push(Arc::clone(uop));
-                return false; // Stop traversing into GLOBAL bufferize
+                return;
             }
             Op::MStack { .. } => {
                 buffers.push(Arc::clone(uop));
-                return false; // Stop traversing into MSTACK.
+                return;
             }
-            // PARAM counts but continues traversal. BUFFER is treated like PARAM
-            // here because BUFFER → PARAM normalization may run later.
+            // PARAM (and pre-normalize BUFFER) count but traversal continues.
             Op::Param { .. } | Op::Buffer { .. } => {
                 buffers.push(Arc::clone(uop));
             }
-            Op::Index { .. } => indexes.push(Arc::clone(uop)),
             Op::Reduce { .. } => reduces.push(Arc::clone(uop)),
             _ => {}
         }
-
         for child in uop.op().sources() {
-            collect(&child, buffers, indexes, reduces, visited);
+            collect(&child, buffers, reduces, visited);
         }
-        true
     }
+    collect(src, &mut accessed_buffers, &mut reduces, &mut visited);
 
-    collect(src, &mut accessed_buffers, &mut indexes, &mut reduces, &mut visited);
-
-    // Deduplicate buffers
-    let mut seen = HashSet::new();
+    let mut seen: HashSet<UOpKey> = HashSet::new();
     accessed_buffers.retain(|b| seen.insert(UOpKey(Arc::clone(b))));
 
-    // Buffer count threshold — bypassed at level > 2.
-    if accessed_buffers.len() > config.max_buffers_threshold && config.level <= 2 {
+    if accessed_buffers.len() > 3 {
         tracing::debug!(
             src_id = src.id,
             src_op = src.op().as_ref(),
             buf_count = accessed_buffers.len(),
-            threshold = config.max_buffers_threshold,
-            buf_ops = ?accessed_buffers.iter().map(|b| (b.id, b.op().as_ref())).collect::<Vec<_>>(),
-            "buffer_removal: KEPT (buffer count exceeds threshold)"
+            "remove_bufferize: KEPT (>3 accessed buffers)"
         );
         return None;
     }
 
-    // Check if any reduce body accesses a buffer
-    let buffer_in_reduce = if reduces.is_empty() {
-        false
-    } else {
+    if !reduces.is_empty() {
         let reduce_sources: Vec<Arc<UOp>> = reduces
             .iter()
             .filter_map(|r| if let Op::Reduce { src, .. } = r.op() { Some(Arc::clone(src)) } else { None })
             .collect();
-
-        if reduce_sources.is_empty() {
-            false
-        } else {
+        if !reduce_sources.is_empty() {
             let sink = UOp::sink(reduce_sources);
-            // Checks for PARAM or BUFFERIZE in reduce body. BUFFER is treated
-            // like PARAM here because BUFFER → PARAM normalization may run later.
-            sink.any_in_subtree(|n| matches!(n.op(), Op::Param { .. } | Op::Buffer { .. } | Op::Bufferize { .. }))
-        }
-    };
-
-    // No buffer in reduce: range substitution with gating (always inline).
-    // Filter: skip CONST ranges (they're broadcast dims, not real ranges).
-    // Gating: only substitute in subexpressions that contain the ranges.
-    if !buffer_in_reduce {
-        tracing::debug!(
-            src_id = src.id,
-            src_op = src.op().as_ref(),
-            buf_count = accessed_buffers.len(),
-            "buffer_removal: REMOVED (no buffer_in_reduce)"
-        );
-        let subs_map: HashMap<UOpKey, Arc<UOp>> = buf_ranges
-            .iter()
-            .zip(idx_ranges.iter())
-            .filter(|(k, _)| !matches!(k.op(), Op::Const(_)))
-            .map(|(k, v)| (UOpKey(Arc::clone(k)), Arc::clone(v)))
-            .collect();
-        return Some(src.substitute_gated(&subs_map));
-    }
-
-    // Buffer in reduce: at level ≤ 2, always keep.
-    if config.level <= 2 {
-        tracing::debug!(
-            src_id = src.id,
-            src_op = src.op().as_ref(),
-            reduce_count = reduces.len(),
-            buf_count = accessed_buffers.len(),
-            "buffer_removal: KEPT (buffer_in_reduce at level<=2)"
-        );
-        return None;
-    }
-
-    // Output/input ratio check — only computed here (level > 2 with buffer_in_reduce)
-    let output_size = match buffer.op() {
-        Op::Bufferize { ranges, .. } => {
-            let mut product = 1usize;
-            for range in ranges {
-                if let Op::Range { end, .. } = range.op()
-                    && let Op::Const(cv) = end.op()
-                    && let ConstValue::Int(n) = cv.0
-                    && n > 0
-                {
-                    product = product.checked_mul(n as usize)?;
-                } else {
-                    return None;
-                }
+            let buffer_in_reduce =
+                sink.any_in_subtree(|n| matches!(n.op(), Op::Param { .. } | Op::Buffer { .. } | Op::Bufferize { .. }));
+            if buffer_in_reduce {
+                tracing::debug!(
+                    src_id = src.id,
+                    src_op = src.op().as_ref(),
+                    "remove_bufferize: KEPT (buffer_in_reduce)"
+                );
+                return None;
             }
-            let element_size = buffer.dtype().base().bytes();
-            product.checked_mul(element_size)?
         }
-        Op::Buffer { size, .. } => *size,
-        _ => return None,
-    };
-
-    let input_size: usize = accessed_buffers
-        .iter()
-        .filter_map(|buf| match buf.op() {
-            Op::Bufferize { ranges, .. } => {
-                let mut product = 1usize;
-                for range in ranges {
-                    if let Op::Range { end, .. } = range.op()
-                        && let Op::Const(cv) = end.op()
-                        && let ConstValue::Int(n) = cv.0
-                        && n > 0
-                    {
-                        product = product.checked_mul(n as usize)?;
-                    }
-                }
-                let elem_size = buf.dtype().base().bytes();
-                product.checked_mul(elem_size)
-            }
-            // After fix A1, accessed_buffers only contains Bufferize(Global), MStack, Param
-            Op::Param { size, .. } => Some(*size),
-            Op::MStack { .. } => Some(1),
-            _ => None,
-        })
-        .sum();
-
-    let ratio = (output_size + 1) as f64 / (input_size + 1) as f64;
-    if ratio < config.out_in_ratio_threshold {
-        return None;
     }
 
-    // Partial contiguous path: filter local indexes and extract exclude ranges
-    let local_indexes: Vec<_> = indexes
+    // Skip CONST keys (broadcast slots, not loop vars) and dead-load `Invalid`
+    // values — substituting a bare Invalid index would poison the inlined expr.
+    let subs_map: HashMap<UOpKey, Arc<UOp>> = buf_ranges
         .iter()
-        .filter(|idx| {
-            matches!(idx.op(), Op::Index { buffer, .. }
-                if matches!(buffer.op(), Op::Bufferize { opts, .. }
-                    if opts.addrspace == AddrSpace::Local))
-        })
+        .zip(idx_ranges.iter())
+        .filter(|(k, v)| !matches!(k.op(), Op::Const(_)) && !matches!(v.op(), Op::Invalid))
+        .map(|(k, v)| (UOpKey(Arc::clone(k)), Arc::clone(v)))
         .collect();
-
-    let mut exclude_ranges = HashSet::new();
-    for idx in &local_indexes {
-        if let Op::Index { indices, .. } = idx.op() {
-            for range in indices {
-                for r in range.in_scope_ranges() {
-                    exclude_ranges.insert(r.clone());
-                }
-            }
-        }
-    }
-
-    // Partition ranges into materialize vs substitute
-    let mut materialize = Vec::new();
-    let mut substitute = Vec::new();
-
-    for (buf_rng, idx_rng) in buf_ranges.iter().zip(idx_ranges.iter()) {
-        if matches!(buf_rng.op(), Op::Const(_)) {
-            continue;
-        }
-
-        let buf_key = UOpKey(Arc::clone(buf_rng));
-        let should_materialize = exclude_ranges.contains(&buf_key)
-            || idx_rng.in_scope_ranges().iter().any(|r| {
-                if let Op::Range { axis_type, .. } = r.0.op() { matches!(axis_type, AxisType::Reduce) } else { false }
-            });
-
-        if should_materialize {
-            materialize.push((Arc::clone(buf_rng), Arc::clone(idx_rng)));
-        } else {
-            substitute.push((Arc::clone(buf_rng), Arc::clone(idx_rng)));
-        }
-    }
-
-    if substitute.is_empty() {
-        return None;
-    }
-
-    // Apply substitution
-    let subs_map: HashMap<UOpKey, Arc<UOp>> = substitute.into_iter().map(|(k, v)| (UOpKey(k), v)).collect();
-    let substituted = src.substitute_gated(&subs_map);
-
-    if materialize.is_empty() {
-        return Some(substituted);
-    }
-
-    // Create partial bufferize + index
-    let (mat_buf_rngs, mat_idx_rngs): (Vec<_>, Vec<_>) = materialize.into_iter().unzip();
-    let opts = BufferizeOpts::local();
-    let bufferized = UOp::bufferize(substituted, mat_buf_rngs, opts);
-
-    UOp::index().buffer(bufferized).indices(mat_idx_rngs).call().ok()
+    Some(src.substitute_gated(&subs_map))
 }
 
 // ============================================================================
@@ -1034,33 +788,30 @@ pub fn pm_reduce_simplify() -> &'static TypedPatternMatcher {
 }
 
 // ============================================================================
-// MOVEMENT OP PATTERNS (pm_mops equivalent)
+// MOVEMENT OP PATTERNS
 // ============================================================================
 
-/// Create pattern matcher for pushing movement ops through INDEX operations.
+/// Push movement ops (RESHAPE / PERMUTE / EXPAND / PAD / SHRINK / FLIP)
+/// through INDEX, AFTER, and END so they can be folded into surrounding
+/// loop-range arithmetic. Also flattens redundantly nested INDEX nodes.
 pub fn movement_op_patterns() -> TypedPatternMatcher {
     crate::patterns! {
-        // pm_mops rule 1: Movement op on INDEX → apply_movement_op to indices.
         idx @ Index { buffer: mop, indices, gate } if mop.op().is_movement() => |idx, mop, indices, gate| {
             transform_movement_through_index(mop, indices, gate, idx.dtype())
         },
-        // pm_mops rule 2a: AFTER(MOVEMENT(x, ...), deps) → MOVEMENT(AFTER(x, deps), ...).
         after @ After { passthrough: mop, deps } if mop.op().is_movement()
             => |after, mop, deps| {
                 super::transforms::push_movement_through_after(after, mop, deps)
             },
-        // pm_mops rule 2b: AFTER(INDEX(x, idxs), deps) → INDEX(AFTER(x, deps), idxs).
         after @ After { passthrough: idx @ Index { buffer, indices, gate }, deps }
             => |after, idx, buffer, indices, gate, deps| {
                 super::transforms::push_index_through_after(after, idx, buffer, indices, gate, deps)
             },
-        // pm_mops rule 3: END(MOVEMENT(x, ...), ranges) → END(x, ranges).
         End { computation: mop, ranges } if mop.op().is_movement()
             => |mop, ranges| {
                 let src = &mop.op().sources()[0];
                 Some(src.end(ranges.clone()))
             },
-        // Flatten nested INDEX when both have gate: None and matching single indices
         Index {
             buffer: inner @ Index { indices: inner_indices, gate: None },
             indices: outer_indices,
