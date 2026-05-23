@@ -25,8 +25,7 @@
 //! let output = plan.output_buffer();
 //! ```
 
-use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -213,101 +212,10 @@ fn validate_var_bound(name: &str, value: i64, min_val: i64, max_val: i64) -> Res
     Ok(())
 }
 
-struct DependencyGraph {
-    op_ids: Vec<u64>,
-    in_degree: Vec<usize>,
-    successors: Vec<Vec<usize>>,
-}
-
-fn build_dependency_graph(ops: &[PreparedOp], instance_deps_per_op: Option<&[Vec<usize>]>) -> Result<DependencyGraph> {
-    if let Some(instance_deps) = instance_deps_per_op
-        && instance_deps.len() != ops.len()
-    {
-        return Err(crate::error::Error::Execution {
-            reason: format!(
-                "prepared op instance dependency table length mismatch: ops={}, instance_deps={}",
-                ops.len(),
-                instance_deps.len()
-            ),
-        });
-    }
-
-    let mut op_ids = Vec::with_capacity(ops.len());
-    let mut deps_per_op = Vec::with_capacity(ops.len());
-    let mut id_counts: HashMap<u64, usize> = HashMap::with_capacity(ops.len());
-
-    for op in ops {
-        let (op_id, deps) = op_identity(op);
-        op_ids.push(op_id);
-        deps_per_op.push(deps);
-        *id_counts.entry(op_id).or_insert(0) += 1;
-    }
-
-    let has_duplicate_ids = id_counts.values().any(|&count| count > 1);
-
-    let mut in_degree = vec![0usize; ops.len()];
-    let mut successors: Vec<Vec<usize>> = vec![Vec::new(); ops.len()];
-
-    if !has_duplicate_ids {
-        let mut id_to_idx: HashMap<u64, usize> = HashMap::with_capacity(ops.len());
-        for (idx, &op_id) in op_ids.iter().enumerate() {
-            id_to_idx.insert(op_id, idx);
-        }
-
-        for (idx, deps) in deps_per_op.iter().enumerate() {
-            for dep in deps {
-                let Some(&dep_idx) = id_to_idx.get(dep) else {
-                    return Err(crate::error::Error::Execution {
-                        reason: format!("prepared op {} depends on unknown op id {}", op_ids[idx], dep),
-                    });
-                };
-                in_degree[idx] += 1;
-                successors[dep_idx].push(idx);
-            }
-        }
-    } else {
-        // Expanded schedules may contain repeated op IDs for per-iteration items.
-        // Resolve dependencies against the most recent prior op with that ID.
-        let mut last_seen: HashMap<u64, usize> = HashMap::with_capacity(ops.len());
-
-        for (idx, deps) in deps_per_op.iter().enumerate() {
-            for dep in deps {
-                let Some(&dep_idx) = last_seen.get(dep) else {
-                    return Err(crate::error::Error::Execution {
-                        reason: format!(
-                            "prepared op {} depends on unknown prior op id {} (duplicate-id schedule mode)",
-                            op_ids[idx], dep
-                        ),
-                    });
-                };
-                in_degree[idx] += 1;
-                successors[dep_idx].push(idx);
-            }
-
-            last_seen.insert(op_ids[idx], idx);
-        }
-    }
-
-    if let Some(instance_deps_per_op) = instance_deps_per_op {
-        for (idx, instance_deps) in instance_deps_per_op.iter().enumerate() {
-            for &dep_idx in instance_deps {
-                if dep_idx >= ops.len() {
-                    return Err(crate::error::Error::Execution {
-                        reason: format!("prepared op {} depends on unknown op index {}", op_ids[idx], dep_idx),
-                    });
-                }
-                if dep_idx == idx {
-                    return Err(crate::error::Error::Execution {
-                        reason: format!("prepared op {} cannot depend on itself by op index {}", op_ids[idx], dep_idx),
-                    });
-                }
-                in_degree[idx] += 1;
-                successors[dep_idx].push(idx);
-            }
-        }
-    }
-
-    Ok(DependencyGraph { op_ids, in_degree, successors })
+/// Extract `(node_ids, callable_deps)` from prepared ops for the shared
+/// topological-leveling routines in [`crate::leveling`].
+fn op_graph_inputs(ops: &[PreparedOp]) -> (Vec<u64>, Vec<Vec<u64>>) {
+    ops.iter().map(op_identity).unzip()
 }
 
 #[cfg(test)]
@@ -319,39 +227,9 @@ fn compute_mixed_op_order_with_instance_dependencies(
     ops: &[PreparedOp],
     instance_deps_per_op: &[Vec<usize>],
 ) -> Result<Vec<usize>> {
-    let instance_deps = (!instance_deps_per_op.is_empty()).then_some(instance_deps_per_op);
-    let DependencyGraph { op_ids, mut in_degree, successors } = build_dependency_graph(ops, instance_deps)?;
-
-    let mut ready: BinaryHeap<Reverse<usize>> = BinaryHeap::new();
-    for (idx, &deg) in in_degree.iter().enumerate() {
-        if deg == 0 {
-            ready.push(Reverse(idx));
-        }
-    }
-
-    let mut order = Vec::with_capacity(ops.len());
-    while let Some(Reverse(idx)) = ready.pop() {
-        order.push(idx);
-        for &succ in &successors[idx] {
-            in_degree[succ] -= 1;
-            if in_degree[succ] == 0 {
-                ready.push(Reverse(succ));
-            }
-        }
-    }
-
-    if order.len() != ops.len() {
-        let blocked: Vec<u64> = in_degree
-            .iter()
-            .enumerate()
-            .filter_map(|(idx, &deg)| if deg > 0 { Some(op_ids[idx]) } else { None })
-            .collect();
-        return Err(crate::error::Error::Execution {
-            reason: format!("cycle detected in prepared op dependencies: blocked_ids={blocked:?}"),
-        });
-    }
-
-    Ok(order)
+    let (node_ids, callable_deps) = op_graph_inputs(ops);
+    let index_deps = (!instance_deps_per_op.is_empty()).then_some(instance_deps_per_op);
+    crate::leveling::compute_topological_order(&node_ids, &callable_deps, index_deps)
 }
 
 #[cfg(test)]
@@ -363,52 +241,9 @@ fn compute_execution_levels_with_instance_dependencies(
     ops: &[PreparedOp],
     instance_deps_per_op: &[Vec<usize>],
 ) -> Result<Vec<Vec<usize>>> {
-    let instance_deps = (!instance_deps_per_op.is_empty()).then_some(instance_deps_per_op);
-    let DependencyGraph { op_ids, mut in_degree, successors } = build_dependency_graph(ops, instance_deps)?;
-
-    let mut ready: BinaryHeap<Reverse<usize>> = BinaryHeap::new();
-    for (idx, &deg) in in_degree.iter().enumerate() {
-        if deg == 0 {
-            ready.push(Reverse(idx));
-        }
-    }
-
-    let mut levels: Vec<Vec<usize>> = Vec::new();
-    let mut visited = 0usize;
-
-    while !ready.is_empty() {
-        let mut level: Vec<usize> = Vec::new();
-        while let Some(Reverse(idx)) = ready.pop() {
-            level.push(idx);
-        }
-
-        let mut next_ready: BinaryHeap<Reverse<usize>> = BinaryHeap::new();
-        for &idx in &level {
-            visited += 1;
-            for &succ in &successors[idx] {
-                in_degree[succ] -= 1;
-                if in_degree[succ] == 0 {
-                    next_ready.push(Reverse(succ));
-                }
-            }
-        }
-
-        levels.push(level);
-        ready = next_ready;
-    }
-
-    if visited != ops.len() {
-        let blocked: Vec<u64> = in_degree
-            .iter()
-            .enumerate()
-            .filter_map(|(idx, &deg)| if deg > 0 { Some(op_ids[idx]) } else { None })
-            .collect();
-        return Err(crate::error::Error::Execution {
-            reason: format!("cycle detected in prepared op dependencies: blocked_ids={blocked:?}"),
-        });
-    }
-
-    Ok(levels)
+    let (node_ids, callable_deps) = op_graph_inputs(ops);
+    let index_deps = (!instance_deps_per_op.is_empty()).then_some(instance_deps_per_op);
+    crate::leveling::compute_topological_levels(&node_ids, &callable_deps, index_deps)
 }
 
 /// Pre-compiled execution plan for a computation graph.
@@ -1280,6 +1115,12 @@ impl ExecutionPlanBuilder {
     pub fn add_op_with_instance_dependencies(&mut self, op: PreparedOp, instance_dependencies: Vec<usize>) {
         self.ops.push(op);
         self.op_instance_dependencies.push(instance_dependencies);
+    }
+
+    /// Number of prepared ops added so far. Callers use this to assert 1:1
+    /// emission against their source schedule.
+    pub fn op_count(&self) -> usize {
+        self.ops.len()
     }
 
     /// Build the ExecutionPlan.

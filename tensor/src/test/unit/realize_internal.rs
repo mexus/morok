@@ -114,7 +114,7 @@ fn test_restore_post_schedule_pre_schedule_rewrites_runtime_buf_uops() {
     let sink = UOp::sink(vec![c.uop().contiguous()]);
 
     let normalization = normalize_for_schedule_cache(&sink).expect("normalize schedule cache");
-    let rangeify = svod_schedule::rangeify_with_map(normalization.normalized.clone(), None).expect("rangeify");
+    let rangeify = svod_schedule::rangeify_with_map(normalization.normalized.clone()).expect("rangeify");
     let (kernel_graph_cached, _) = svod_schedule::try_get_kernel_graph(rangeify.sink).expect("kernel graph");
     let pre_schedule_cached = crate::schedule::create_pre_schedule(kernel_graph_cached).expect("pre schedule");
 

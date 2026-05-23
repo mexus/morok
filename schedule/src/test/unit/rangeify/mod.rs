@@ -5,7 +5,6 @@ pub mod bufferize_to_store;
 pub mod codegen_integration;
 pub mod codegen_patterns;
 pub mod context;
-pub mod cost_based;
 pub mod cycle_detection;
 pub mod dead_axis;
 pub mod deduplication;
@@ -20,12 +19,12 @@ pub mod kernel_count;
 pub mod late_decompositions;
 pub mod load_collapse;
 pub mod movement_patterns;
-pub mod partial_contiguous;
 pub mod patterns;
 pub mod pipeline;
 pub mod pipeline_integration;
 pub mod range_merging;
 pub mod reduce_simplify;
+pub mod remove_bufferize;
 pub mod resolve_call;
 pub mod split_kernel;
 pub mod split_patterns;
@@ -78,16 +77,11 @@ fn test_rangeify_context_get_missing() {
 
 #[test]
 fn test_pattern_matchers_stub() {
-    // Test that stub pattern matchers return empty matchers
-    let m3 = rangeify_patterns::buffer_folding();
-    let m4 = rangeify_patterns::buffer_removal();
-
+    let m = rangeify_patterns::buffer_folding();
     let x = UOp::native_const(1.0f32);
 
-    // Should all return NoMatch since they're empty
     use crate::pattern::RewriteResult;
-    assert!(matches!(m3.rewrite(&x, &mut ()), RewriteResult::NoMatch));
-    assert!(matches!(m4.rewrite(&x, &mut ()), RewriteResult::NoMatch));
+    assert!(matches!(m.rewrite(&x, &mut ()), RewriteResult::NoMatch));
 }
 
 #[test]

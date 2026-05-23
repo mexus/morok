@@ -228,7 +228,7 @@ fn test_rangeify_pipeline_runs_resolve_call() {
     let a1 = UOp::new_buffer(DeviceSpec::Cpu, 8, DType::Float32);
     let function = body.function(smallvec![a0, a1], CallInfo::default());
 
-    let (out, _ctx) = rangeify(function, None).expect("rangeify should succeed");
+    let (out, _ctx) = rangeify(function).expect("rangeify should succeed");
     assert!(!out.toposort().iter().any(|u| matches!(u.op(), Op::Function { .. })));
 }
 
@@ -238,7 +238,7 @@ fn test_rangeify_preserves_kernel_call_body_boundaries() {
     let body = UOp::sink_with_info(vec![detached], svod_ir::KernelInfo::default());
     let function = body.call(smallvec![], CallInfo::default());
 
-    let (out, _ctx) = rangeify(function, None).expect("rangeify should succeed");
+    let (out, _ctx) = rangeify(function).expect("rangeify should succeed");
     let call_node = out
         .toposort()
         .into_iter()

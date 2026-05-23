@@ -1027,7 +1027,8 @@ fn apply_reshape_core(
     }
     let combined = axes_in.into_iter().reduce(|a, b| a.try_add(&b).unwrap()).unwrap_or_else(|| UOp::index_const(0));
 
-    // Unflatten into in_shape via Mod/Idiv
+    // Unflatten `combined` into in_shape via Mod/Idiv. Redundant mods are
+    // dropped by the downstream RESHAPE_SIMPLIFY chain.
     let mut axes_out = Vec::new();
     let mut remaining = combined;
     for shape_dim in in_shape.iter().rev() {

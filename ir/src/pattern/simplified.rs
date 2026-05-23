@@ -223,8 +223,8 @@ impl SimplifiedPatternMatcher<()> {
     /// with context-dependent ones via `+`:
     ///
     /// ```ignore
-    /// let mega = symbolic().with_context::<PcontigConfig>()
-    ///     + buffer_removal_with_pcontig(); // TypedPatternMatcher<PcontigConfig>
+    /// let mega = symbolic().with_context::<SomeCtx>()
+    ///     + some_ctx_aware_pattern(); // TypedPatternMatcher<SomeCtx>
     /// ```
     pub fn with_context<D: 'static + Send + Sync>(&self) -> SimplifiedPatternMatcher<D> {
         let mut result = SimplifiedPatternMatcher::<D>::new();

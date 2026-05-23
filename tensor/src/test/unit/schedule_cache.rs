@@ -362,7 +362,7 @@ fn test_post_sched_cache_restore_rewrites_call_boundary_params() {
     let sink = UOp::sink(vec![c.uop().contiguous()]);
 
     let normalization = crate::realize::normalize_for_schedule_cache(&sink).expect("normalize call boundary sink");
-    let rangeify = svod_schedule::rangeify_with_map(normalization.normalized.clone(), None).unwrap();
+    let rangeify = svod_schedule::rangeify_with_map(normalization.normalized.clone()).unwrap();
     let (kernel_graph, _) = svod_schedule::try_get_kernel_graph(rangeify.sink).unwrap();
 
     let restored = crate::realize::restore_post_schedule_cache(&kernel_graph, &normalization);

@@ -380,7 +380,7 @@ fn test_integration_with_rangeify_pipeline() {
     let (_, computation) = create_multi_buffer_computation(10, device);
 
     // Run through rangeify (which includes buffer limit enforcement at Step 8.5)
-    let result = crate::rangeify::rangeify(computation.clone(), None);
+    let result = crate::rangeify::rangeify(computation.clone());
 
     // Should complete without errors
     assert!(result.is_ok(), "Rangeify pipeline should complete successfully with buffer limit enforcement");

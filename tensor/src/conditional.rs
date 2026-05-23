@@ -146,4 +146,55 @@ impl Tensor {
     pub fn clip(&self, min: Option<&Tensor>, max: Option<&Tensor>) -> Result<Self> {
         self.clamp().maybe_min(min).maybe_max(max).call()
     }
+
+    /// Fill elements where `mask` is true with `value`.
+    ///
+    /// `mask` must be broadcastable to `self`'s shape. `value` is either a
+    /// scalar convertible to `ConstValue` (`i8`/`i16`/`i32`/`i64`/`u8`/`u16`/
+    /// `u32`/`u64`/`f32`/`f64`/`bool`) or a `&Tensor`.
+    ///
+    /// # Examples
+    /// ```ignore
+    /// let x = Tensor::from_slice(&[1.0f32, 2.0, 3.0, 4.0]);
+    /// let mask = Tensor::from_slice(&[true, false, true, false]);
+    /// // Scalar value:
+    /// let r1 = x.masked_fill(&mask, 0.0f32)?;            // [0.0, 2.0, 0.0, 4.0]
+    /// // Tensor value:
+    /// let fill = Tensor::from_slice(&[-1.0f32, -2.0, -3.0, -4.0]);
+    /// let r2 = x.masked_fill(&mask, &fill)?;             // [-1.0, 2.0, -3.0, 4.0]
+    /// ```
+    pub fn masked_fill<'a>(&self, mask: &Tensor, value: impl Into<MaskedFillValue<'a>>) -> Result<Self> {
+        let fill_tensor: std::borrow::Cow<'_, Tensor> = match value.into() {
+            MaskedFillValue::Scalar(cv) => std::borrow::Cow::Owned(Tensor::full(&[1], cv, self.uop().dtype())?),
+            MaskedFillValue::Tensor(t) => std::borrow::Cow::Borrowed(t),
+        };
+        fill_tensor.where_(mask, self)
+    }
 }
+
+/// Argument adapter for [`Tensor::masked_fill`]. Accepts either a borrowed
+/// tensor or any scalar that implements `Into<ConstValue>`.
+pub enum MaskedFillValue<'a> {
+    /// Constant scalar — broadcast to `self`'s shape via `Tensor::full`.
+    Scalar(svod_ir::ConstValue),
+    /// Tensor — broadcast directly through `where_`.
+    Tensor(&'a Tensor),
+}
+
+impl<'a> From<&'a Tensor> for MaskedFillValue<'a> {
+    fn from(t: &'a Tensor) -> Self {
+        MaskedFillValue::Tensor(t)
+    }
+}
+
+macro_rules! impl_scalar_into_masked_fill_value {
+    ($($ty:ty),+ $(,)?) => { $(
+        impl<'a> From<$ty> for MaskedFillValue<'a> {
+            fn from(v: $ty) -> Self {
+                MaskedFillValue::Scalar(svod_ir::ConstValue::from(v))
+            }
+        }
+    )+ };
+}
+
+impl_scalar_into_masked_fill_value!(i8, i16, i32, i64, u8, u16, u32, u64, f32, f64, bool);

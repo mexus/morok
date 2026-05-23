@@ -28,16 +28,15 @@ pub use kernel::try_get_kernel_graph;
 pub use transforms::{RangeifyResult, rangeify, rangeify_with_map};
 
 // Configuration
-pub use kernel::{PcontigConfig, SplitReduceOpConfig};
+pub use kernel::SplitReduceOpConfig;
 
 // Pattern matchers
 pub use patterns::{
-    apply_rangeify_patterns, buffer_folding, buffer_limit_patterns, buffer_removal, buffer_removal_with_pcontig,
-    dead_axis_removal, early_rewrites, movement_op_patterns, pm_comparison_negations, pm_div_to_shr,
-    pm_erf_decomposition, pm_fdiv_to_mul, pm_fma_decomposition, pm_load_collapse, pm_max_decomposition, pm_mod_to_and,
-    pm_mul_to_shl, pm_neg_from_mul, pm_reduce_simplify, pm_sqrt_decomposition, pm_syntactic_sugar,
-    rangeify_codegen_patterns, rangeify_codegen_simple, rangeify_codegen_with_kernel_ctx, split_reduceop_patterns,
-    to_param_patterns,
+    apply_rangeify_patterns, buffer_folding, buffer_limit_patterns, dead_axis_removal, early_rewrites,
+    movement_op_patterns, pm_comparison_negations, pm_div_to_shr, pm_erf_decomposition, pm_fdiv_to_mul,
+    pm_fma_decomposition, pm_load_collapse, pm_max_decomposition, pm_mod_to_and, pm_mul_to_shl, pm_neg_from_mul,
+    pm_reduce_simplify, pm_remove_bufferize, pm_sqrt_decomposition, pm_syntactic_sugar, rangeify_codegen_patterns,
+    rangeify_codegen_simple, rangeify_codegen_with_kernel_ctx, split_reduceop_patterns, to_param_patterns,
 };
 
 // Transforms
