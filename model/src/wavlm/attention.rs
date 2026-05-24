@@ -24,8 +24,8 @@
 
 use snafu::ResultExt;
 use svod_dtype::DType;
-use svod_tensor::Tensor;
 use svod_tensor::reduce::AxisSpec;
+use svod_tensor::{Tensor, s};
 
 use crate::init::{fan_in_uniform, ones, zeros};
 use crate::state::{self, HasStateDict, StateDict, get_tensor, prefixed};
@@ -249,8 +249,7 @@ impl GatedRelPosAttention {
 
         // Py:712  attn_mask_rel_pos = attn_mask_rel_pos.view((-1, seq_len, seq_len))
         // Py:713  attn_mask_rel_pos = attn_mask_rel_pos.reshape(bsz, h, seq_len, seq_len)[:, self.remaining_heads, :, :]
-        let head_idx = Tensor::from_slice(self.remaining_heads.iter().map(|&i| i as i64).collect::<Vec<_>>());
-        let attn_mask = attn_mask_rel_pos.index_select(1, &head_idx).context(TensorSnafu)?; // (B, nk, L, L)
+        let attn_mask = attn_mask_rel_pos.getitem(s![.., self.remaining_heads.clone(), .., ..]).context(TensorSnafu)?; // (B, nk, L, L)
 
         // =================================================================
         // Q / K / V projections (SelfAttention.forward, lines 455-458)

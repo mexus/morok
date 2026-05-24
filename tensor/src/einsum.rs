@@ -4,9 +4,9 @@ use std::collections::HashMap;
 
 use snafu::ResultExt;
 
-use crate::Tensor;
 use crate::error::UOpSnafu;
 use crate::reduce::AxisSpec;
+use crate::{Tensor, s};
 
 type Result<T> = crate::Result<T>;
 
@@ -130,13 +130,8 @@ impl Tensor {
                         // unflatten last dim into [n, n+1]
                         x = x.unflatten(-1, &[n as isize, (n + 1) as isize])?;
 
-                        // take element 0 along last dim (shrink + squeeze)
-                        let cur_ndim = x.ndim()?;
-                        let mut ranges: Vec<(isize, isize)> =
-                            x.shape()?.iter().map(|d| (0, d.as_const().unwrap() as isize)).collect();
-                        ranges[cur_ndim - 1] = (0, 1);
-                        x = x.try_shrink(&ranges)?;
-                        x = x.try_squeeze(Some(-1))?;
+                        // take element 0 along last dim (collapses it)
+                        x = x.getitem(s![Ellipsis, 0])?;
                     } else {
                         // 2D diagonal: use flatten + stride approach
                         // For a [n, n] matrix, diagonal = flatten then take every (n+1)th element
