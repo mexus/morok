@@ -9,6 +9,7 @@ use snafu::ResultExt;
 use svod_ir::ConstValue;
 
 use super::*;
+use crate::s;
 
 /// Horner's method for polynomial evaluation: `coeffs[0]*x^(n-1) + ... + coeffs[n-1]`.
 fn poly_n(x: &Tensor, coefficients: &[f64]) -> Result<Tensor> {
@@ -495,6 +496,139 @@ impl Tensor {
 
         Ok(det_val.unwrap())
     }
+
+    // =========================================================================
+    // Decompositions (prototype, concrete square last-two-dims only).
+    //
+    // These showcase the `s!`/`getitem`/`set` indexing API: the per-step
+    // slice reads/writes that a hand-rolled `pad`/`where_` expansion made
+    // painful are now one-liners that read like the reference math.
+    // =========================================================================
+
+    /// Lower-triangular Cholesky factor `L` such that `A = L Lᵀ`, batched over
+    /// leading dims (last two dims must be square). `A` must be symmetric
+    /// positive-definite; a non-SPD input yields NaNs (`sqrt` of a non-positive
+    /// pivot). Cholesky–Banachiewicz recurrence: columns are built and `cat`-ed
+    /// (no full-matrix rewrite per step), so the graph is O(n) and the work
+    /// O(n³).
+    pub fn cholesky(&self) -> Result<Tensor> {
+        let (dims, n, float_dt) = self.square_setup("cholesky")?;
+        let batch = &dims[..dims.len() - 2];
+        let a = to_float(self, &float_dt)?;
+        if n == 0 {
+            return Ok(a);
+        }
+        let nn = n as i64;
+
+        // Column 0: L[:,0] = A[:,0] / sqrt(A[0,0]) (so L[0,0] = sqrt(A[0,0])).
+        let d0 = a.getitem(s![Ellipsis, 0, 0])?.try_sqrt()?;
+        let col0 = a.getitem(s![Ellipsis, .., 0])?.try_div(&d0.try_unsqueeze(-1)?)?; // [.., n]
+        let mut l = col0.try_unsqueeze(-1)?; // columns built so far: [.., n, 1]
+
+        for j in 1..nn {
+            let row_j = l.getitem(s![Ellipsis, j, ..])?; // row j of built cols → [.., j]
+            let diag = a.getitem(s![Ellipsis, j, j])?.try_sub(&row_j.try_mul(&row_j)?.sum(-1isize)?)?.try_sqrt()?;
+            // Below-diagonal rows j..n: (A[i,j] - L[i,:j]·L[j,:j]) / diag.
+            let below = l.getitem(s![Ellipsis, j..nn, ..])?; // [.., n-j, j]
+            let dot = below.try_mul(&row_j.try_unsqueeze(-2)?)?.sum(-1isize)?; // [.., n-j]
+            let col_below = a.getitem(s![Ellipsis, j..nn, j])?.try_sub(&dot)?.try_div(&diag.try_unsqueeze(-1)?)?;
+            // Full column = j zeros (upper triangle) ++ col_below, appended to L.
+            let mut zshape: Vec<usize> = batch.to_vec();
+            zshape.push(j as usize);
+            let zeros_above = Tensor::full(&zshape, 0.0, float_dt.clone())?;
+            let col = Tensor::cat(&[&zeros_above, &col_below], -1)?.try_unsqueeze(-1)?; // [.., n, 1]
+            l = Tensor::cat(&[&l, &col], -1)?;
+        }
+        Ok(l)
+    }
+
+    /// QR decomposition via Householder reflections (batched; last two dims
+    /// `[m, n]`). Returns `(Q, R)` with `Q` orthonormal `[.., m, m]` and `R`
+    /// upper-triangular `[.., m, n]`, `A = Q R`. The reflector loop is O(min(m,n))
+    /// graph steps, each a whole-matrix update.
+    pub fn qr(&self) -> Result<(Tensor, Tensor)> {
+        let shape = self.shape()?;
+        let ndim = shape.len();
+        snafu::ensure!(
+            ndim >= 2,
+            crate::error::ShapeMismatchSnafu {
+                context: "qr".to_string(),
+                expected: "≥2-D".to_string(),
+                actual: format!("{ndim}-D")
+            }
+        );
+        let cdim = |d: usize| {
+            shape[d].as_const().ok_or_else(|| Error::SymbolicShapeUnsupported { operation: "qr".to_string() })
+        };
+        let (m, n) = (cdim(ndim - 2)?, cdim(ndim - 1)?);
+        let batch: Vec<usize> = shape[..ndim - 2].iter().map(|s| s.as_const().unwrap()).collect();
+        let float_dt = if self.uop().dtype().is_float() { self.uop().dtype() } else { DType::Float32 };
+
+        let mut r = to_float(self, &float_dt)?;
+        let mut q = batched_eye(&batch, m, float_dt.clone())?;
+        let mi = m as i64;
+        let zero = Tensor::const_(0.0, float_dt.clone());
+        let one = Tensor::const_(1.0, float_dt.clone());
+        let neg_one = Tensor::const_(-1.0, float_dt.clone());
+
+        for i in 0..m.min(n) as i64 {
+            let x = r.getitem(s![Ellipsis, i..mi, i])?; // reflector source [.., m-i]
+            let norm = x.try_mul(&x)?.sum(-1isize)?.try_sqrt()?; // [..]
+            let x0 = x.getitem(s![Ellipsis, 0])?; // [..]
+            let x0_nz = x0.try_ne(&zero)?;
+            let sgn = x0.sign()?.try_neg()?.where_(&x0_nz, &neg_one)?; // x0!=0 ? -sign(x0) : -1
+            let u1 = x0.try_sub(&sgn.try_mul(&norm)?)?;
+            let norm_nz = norm.try_ne(&zero)?;
+            let denom = u1.where_(&norm_nz, &one)?.try_unsqueeze(-1)?.try_unsqueeze(-1)?; // [..,1,1]
+            let mut w = x.try_unsqueeze(-1)?.try_div(&denom)?; // [.., m-i, 1]
+            w = w.set(s![Ellipsis, 0, 0], &one)?;
+            let tau = sgn.try_neg()?.try_mul(&u1)?.try_div(&norm.where_(&norm_nz, &one)?)?;
+            let tau = tau.try_unsqueeze(-1)?.try_unsqueeze(-1)?; // [..,1,1]
+            let tau = tau.where_(&norm_nz.try_unsqueeze(-1)?.try_unsqueeze(-1)?, &zero)?;
+
+            // R[i:, :] -= (w·tau) @ (wᵀ @ R[i:, :])
+            let rblk = r.getitem(s![Ellipsis, i..mi, ..])?; // [.., m-i, n]
+            let inner = w.try_transpose(-2, -1)?.matmul(&rblk)?; // [..,1,n]
+            let rupd = w.try_mul(&tau)?.matmul(&inner)?; // [.., m-i, n]
+            r = r.set(s![Ellipsis, i..mi, ..], &rblk.try_sub(&rupd)?)?;
+
+            // Q[:, i:] -= (Q[:, i:] @ w) @ (tau·w)ᵀ
+            let qblk = q.getitem(s![Ellipsis, .., i..mi])?; // [.., m, m-i]
+            let qw = qblk.matmul(&w)?; // [.., m, 1]
+            let qupd = qw.matmul(&tau.try_mul(&w)?.try_transpose(-2, -1)?)?; // [.., m, m-i]
+            q = q.set(s![Ellipsis, .., i..mi], &qblk.try_sub(&qupd)?)?;
+        }
+        Ok((q, r))
+    }
+
+    /// Validate a batched square matrix and return (concrete dims, n, float dtype).
+    fn square_setup(&self, op: &str) -> Result<(Vec<usize>, usize, DType)> {
+        let shape = self.shape()?;
+        let ndim = shape.len();
+        snafu::ensure!(
+            ndim >= 2,
+            crate::error::ShapeMismatchSnafu {
+                context: op.to_string(),
+                expected: "≥2-D".to_string(),
+                actual: format!("{ndim}-D")
+            }
+        );
+        let to_dim =
+            |d: usize| shape[d].as_const().ok_or_else(|| Error::SymbolicShapeUnsupported { operation: op.to_string() });
+        let (m, n) = (to_dim(ndim - 2)?, to_dim(ndim - 1)?);
+        snafu::ensure!(
+            m == n,
+            crate::error::ShapeMismatchSnafu {
+                context: op.to_string(),
+                expected: "square last two dims".to_string(),
+                actual: format!("[{m}, {n}]")
+            }
+        );
+        let dims: Vec<usize> = shape.iter().map(|s| s.as_const().unwrap()).collect();
+        let dtype = self.uop().dtype();
+        let float_dt = if dtype.is_float() { dtype } else { DType::Float32 };
+        Ok((dims, n, float_dt))
+    }
 }
 
 /// Shrink only the last two dimensions of a tensor, preserving batch dims.
@@ -505,4 +639,24 @@ fn shrink_last2(tensor: &Tensor, ndim: usize, row_range: (isize, isize), col_ran
     ranges.push(row_range);
     ranges.push(col_range);
     tensor.try_shrink(&ranges)
+}
+
+/// Cast to `float_dt` unless already float (used by the decompositions).
+fn to_float(t: &Tensor, float_dt: &DType) -> Result<Tensor> {
+    if t.uop().dtype().is_float() { Ok(t.clone()) } else { t.cast(float_dt.clone()) }
+}
+
+/// A `[batch.., n, n]` identity (the eye broadcast across the leading batch dims).
+fn batched_eye(batch: &[usize], n: usize, dtype: DType) -> Result<Tensor> {
+    let mut e = Tensor::eye(n, n, dtype)?; // [n, n]
+    if batch.is_empty() {
+        return Ok(e);
+    }
+    for _ in 0..batch.len() {
+        e = e.try_unsqueeze(0)?;
+    }
+    let mut target: Vec<isize> = batch.iter().map(|&d| d as isize).collect();
+    target.push(n as isize);
+    target.push(n as isize);
+    e.try_expand(&target)
 }

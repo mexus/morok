@@ -55,6 +55,24 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// return its `state_dict` as a [`StateDict`], stripping `strip_prefix` from
 /// each key (use `""` to keep keys verbatim).
 pub fn load_pyannote_pytorch_bin(path: &Path, strip_prefix: &str) -> Result<StateDict> {
+    load_pytorch_bin_with_state_dict_key(path, strip_prefix, Some("state_dict"))
+}
+
+/// Load a torch-pickled checkpoint whose top level is *directly* an
+/// `OrderedDict` of tensors (no `state_dict` wrapper). This is the layout
+/// DiariZen ships in `pytorch_model.bin`.
+pub fn load_flat_pytorch_bin(path: &Path, strip_prefix: &str) -> Result<StateDict> {
+    load_pytorch_bin_with_state_dict_key(path, strip_prefix, None)
+}
+
+/// Shared loader body. When `state_dict_key` is `Some(k)`, descend into the
+/// top-level dict's `k` entry and decode tensors from that nested OrderedDict.
+/// When `None`, treat the top-level itself as the tensor OrderedDict.
+fn load_pytorch_bin_with_state_dict_key(
+    path: &Path,
+    strip_prefix: &str,
+    state_dict_key: Option<&str>,
+) -> Result<StateDict> {
     let raw_file = File::open(path).context(IoSnafu)?;
     let mut zp = ZipArchive::new(raw_file.try_clone().context(IoSnafu)?).context(ZipSnafu)?;
 
@@ -72,28 +90,33 @@ pub fn load_pyannote_pytorch_bin(path: &Path, strip_prefix: &str) -> Result<Stat
         .map_err(|e| Error::Parse { message: format!("{e:?}") })?;
     let (vals, _memo) = evaluate(&ops, true).map_err(|e| Error::Parse { message: format!("{e:?}") })?;
 
-    // 4. Toplevel for pyannote checkpoints (`torch.save({"state_dict": ...,
-    //    "pyannote.audio": ..., "pytorch-lightning_version": ...})`) parses
-    //    via repugnant-pickle as `Seq(Dict, [Seq(Tuple, [(k,v), (k,v), ...])])`
-    //    — a single-item Dict whose lone slot is a Tuple of (k, v) sub-tuples.
-    //    Walk through it, find the `state_dict` entry, and unwrap the
-    //    `Build(Global(OrderedDict, [_, items_tuple]), _state)` it points to.
+    // 4. Resolve the iterable of `(key, tensor_value)` pairs:
+    //    - Lightning-style wrapper: `{state_dict: OrderedDict(...)}`. Descend
+    //      one level into the named key.
+    //    - Flat layout (DiariZen): top-level itself is the OrderedDict.
     let toplevel = vals.first().ok_or_else(|| Error::Structure { context: "no toplevel value".into() })?;
-    let top_items = unwrap_outer_dict(toplevel)
-        .ok_or_else(|| Error::Structure { context: "toplevel not recognised as a dict-of-pairs".into() })?;
-    let state_dict_value = top_items
-        .iter()
-        .find_map(|item| match item {
-            Value::Seq(SequenceType::Tuple, seq)
-                if seq.len() == 2 && matches!(&seq[0], Value::String("state_dict")) =>
-            {
-                Some(&seq[1])
-            }
-            _ => None,
-        })
-        .ok_or_else(|| Error::Structure { context: "no 'state_dict' key at toplevel".into() })?;
-    let sd_items = unwrap_ordered_dict_items(state_dict_value)
-        .ok_or_else(|| Error::Structure { context: "state_dict value is not an OrderedDict".into() })?;
+    let sd_items: &Vec<Value<'_>> = match state_dict_key {
+        Some(key) => {
+            let top_items = unwrap_outer_dict(toplevel)
+                .ok_or_else(|| Error::Structure { context: "toplevel not recognised as a dict-of-pairs".into() })?;
+            let state_dict_value = top_items
+                .iter()
+                .find_map(|item| match item {
+                    Value::Seq(SequenceType::Tuple, seq)
+                        if seq.len() == 2 && matches!(&seq[0], Value::String(s) if *s == key) =>
+                    {
+                        Some(&seq[1])
+                    }
+                    _ => None,
+                })
+                .ok_or_else(|| Error::Structure { context: format!("no '{key}' key at toplevel") })?;
+            unwrap_ordered_dict_items(state_dict_value)
+                .ok_or_else(|| Error::Structure { context: format!("{key} value is not an OrderedDict") })?
+        }
+        None => unwrap_ordered_dict_items(toplevel)
+            .or_else(|| unwrap_outer_dict(toplevel))
+            .ok_or_else(|| Error::Structure { context: "toplevel not recognised as a flat OrderedDict".into() })?,
+    };
 
     // 5. For each entry, decode `_rebuild_tensor_v2` args and read bytes from
     //    the right place in the zip. Cache each storage member's data_start so

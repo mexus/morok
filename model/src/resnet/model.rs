@@ -129,9 +129,9 @@ impl ResNet {
     }
 
     /// Build from a preloaded state dict. Runs [`remap::fold_batchnorm`] first
-    /// to translate `running_var` into `invstd` and drop
-    /// `num_batches_tracked` — the loaded layer structs read directly from the
-    /// post-fold layout.
+    /// to translate `running_var` keys into `invstd` keys (and compute the
+    /// value transform) and drop `num_batches_tracked` — the loaded layer
+    /// structs read directly from the post-fold layout.
     pub fn from_state_dict(sd: &StateDict, config: ResNetConfig) -> Result<Self> {
         let sd = remap::fold_batchnorm(sd.clone())?;
         let mut model = Self::with_zero_weights(config);

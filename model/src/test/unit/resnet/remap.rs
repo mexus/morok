@@ -18,9 +18,10 @@ fn fold_replaces_running_var_with_invstd() {
 
     let folded = fold_batchnorm(sd).expect("fold");
     assert!(!folded.contains_key("bn1.num_batches_tracked"), "num_batches_tracked must be dropped");
+    assert!(!folded.contains_key("bn1.running_var"), "running_var key must be renamed");
     assert!(folded.contains_key("bn1.weight"), "non-BN-stats keys preserved");
 
-    let invstd = folded.get("bn1.running_var").expect("running_var slot still present after fold");
+    let invstd = folded.get("bn1.invstd").expect("invstd key present after fold");
     let invstd_vals = invstd.as_vec::<f32>().expect("read invstd");
     // invstd = 1 / sqrt(var + 1e-5)
     let expected = vec![1.0 / (0.25_f32 + 1e-5).sqrt(), 1.0 / (1.0_f32 + 1e-5).sqrt()];
@@ -45,7 +46,8 @@ fn fold_handles_multiple_bn_layers() {
     let folded = fold_batchnorm(sd).expect("fold");
     for prefix in ["bn1", "layer1.0.bn1", "layer4.2.downsample.1"] {
         assert!(!folded.contains_key(&format!("{prefix}.num_batches_tracked")));
-        let invstd = folded.get(&format!("{prefix}.running_var")).unwrap();
+        assert!(!folded.contains_key(&format!("{prefix}.running_var")), "running_var key renamed");
+        let invstd = folded.get(&format!("{prefix}.invstd")).unwrap();
         let v = invstd.as_vec::<f32>().unwrap();
         let expected = 1.0_f32 / (1.0_f32 + 1e-5).sqrt();
         assert!((v[0] - expected).abs() < 1e-6);

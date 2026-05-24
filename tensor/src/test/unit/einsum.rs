@@ -26,6 +26,20 @@ crate::codegen_tests! {
         assert!((result.as_vec::<f32>().unwrap()[0] - 5.0).abs() < 1e-5);
     }
 
+    // ndim > 2 repeated-index diagonal — exercises the `getitem(s![Ellipsis, 0])`
+    // branch (the 2D trace above takes the flatten+stride path instead).
+    fn test_einsum_batched_diagonal(config) {
+        let a = Tensor::from_ndarray(&array![
+            [[1.0f32, 2.0, 3.0], [4.0, 5.0, 6.0], [7.0, 8.0, 9.0]],
+            [[10.0, 11.0, 12.0], [13.0, 14.0, 15.0], [16.0, 17.0, 18.0]]
+        ]); // [2, 3, 3]
+        let mut result = Tensor::einsum("bii->bi", &[&a]).unwrap();
+        result.realize_with(&config).unwrap();
+        assert_eq!(get_shape(&result), vec![2, 3]);
+        // per-batch diagonals: [1,5,9] and [10,14,18]
+        assert_eq!(result.as_vec::<f32>().unwrap(), vec![1.0, 5.0, 9.0, 10.0, 14.0, 18.0]);
+    }
+
     fn test_einsum_transpose(config) {
         let a = Tensor::from_ndarray(&array![[1.0f32, 2.0, 3.0], [4.0, 5.0, 6.0]]);
         let mut result = Tensor::einsum("ij->ji", &[&a]).unwrap();

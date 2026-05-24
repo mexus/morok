@@ -198,3 +198,55 @@ crate::codegen_tests! {
         assert_close_f32(&t.shrink(0.0, 0.5).unwrap().realize_with_and(&config).as_vec::<f32>().unwrap(), &[-2.0, 0.0, 0.0, 0.0, 2.0], 1e-4);
     }
 }
+
+// =========================================================================
+// Decompositions (cholesky / eigh) — built on the s!/getitem/set indexing API.
+// =========================================================================
+crate::codegen_tests! {
+    fn test_cholesky_2x2(config) {
+        // A = [[4,2],[2,3]] → L = [[2,0],[1,√2]]
+        let a = Tensor::from_slice([4.0f32, 2.0, 2.0, 3.0]).try_reshape([2, 2]).unwrap();
+        let mut l = a.cholesky().unwrap();
+        assert_close_f32(
+            &l.realize_with_and(&config).as_vec::<f32>().unwrap(),
+            &[2.0, 0.0, 1.0, std::f32::consts::SQRT_2],
+            1e-4,
+        );
+    }
+
+    fn test_cholesky_3x3_reconstruct(config) {
+        // SPD matrix; verify L @ Lᵀ ≈ A.
+        let vals = [4.0f32, 2.0, 2.0, 2.0, 5.0, 3.0, 2.0, 3.0, 6.0];
+        let a = Tensor::from_slice(vals).try_reshape([3, 3]).unwrap();
+        let l = a.cholesky().unwrap();
+        let mut recon = l.matmul(&l.try_transpose(-2, -1).unwrap()).unwrap();
+        assert_close_f32(&recon.realize_with_and(&config).as_vec::<f32>().unwrap(), &vals, 1e-4);
+    }
+
+    fn test_qr_3x3_reconstruct(config) {
+        // Verify Q @ R ≈ A and Qᵀ Q ≈ I (Q orthonormal).
+        let vals = [12.0f32, -51.0, 4.0, 6.0, 167.0, -68.0, -4.0, 24.0, -41.0];
+        let a = Tensor::from_slice(vals).try_reshape([3, 3]).unwrap();
+        let (q, r) = a.qr().unwrap();
+        let mut recon = q.matmul(&r).unwrap();
+        assert_close_f32(&recon.realize_with_and(&config).as_vec::<f32>().unwrap(), &vals, 1e-3);
+        let mut qtq = q.try_transpose(-2, -1).unwrap().matmul(&q).unwrap();
+        assert_close_f32(
+            &qtq.realize_with_and(&config).as_vec::<f32>().unwrap(),
+            &[1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+            1e-4,
+        );
+    }
+
+    // Regression: batched (ndim>2) qr previously panicked in `w.set(s![Ellipsis,0,0],..)`.
+    fn test_qr_batched_reconstruct(config) {
+        let vals = [
+            12.0f32, -51.0, 4.0, 6.0, 167.0, -68.0, -4.0, 24.0, -41.0, // batch 0
+            2.0, 0.0, 1.0, 0.0, 3.0, 0.0, 1.0, 0.0, 2.0, // batch 1
+        ];
+        let a = Tensor::from_slice(vals).try_reshape([2, 3, 3]).unwrap();
+        let (q, r) = a.qr().unwrap();
+        let mut recon = q.matmul(&r).unwrap();
+        assert_close_f32(&recon.realize_with_and(&config).as_vec::<f32>().unwrap(), &vals, 1e-3);
+    }
+}
