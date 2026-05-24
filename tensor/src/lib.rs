@@ -52,6 +52,7 @@ pub mod conditional;
 pub mod config;
 pub mod data;
 pub mod einsum;
+pub mod index;
 pub mod indexing;
 pub mod math;
 pub mod matmul;
@@ -70,6 +71,7 @@ pub mod variable;
 
 // Re-export for public API
 pub use config::PrepareConfig;
+pub use index::{Idx, IndexSpec};
 pub use svod_runtime::CpuBackend;
 pub use tensor_registry::apply_map_to_tensors;
 pub use variable::{BoundVariable, Variable};

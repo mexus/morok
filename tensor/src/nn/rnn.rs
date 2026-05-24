@@ -3,6 +3,7 @@
 use bon::bon;
 
 use crate::error::{NdimExactSnafu, ParamRangeSnafu};
+use crate::s;
 
 use super::*;
 
@@ -83,7 +84,6 @@ impl Tensor {
         let x_shape = x.shape()?;
         let seq_length = x_shape[0].as_const().expect("static seq_length");
         let batch_size = x_shape[1].as_const().expect("static batch_size");
-        let input_size = x_shape[2].as_const().expect("static input_size");
         let num_directions = w.shape()?[0].as_const().expect("static num_directions");
         let dtype = x.uop().dtype();
 
@@ -118,9 +118,7 @@ impl Tensor {
 
         let mut h_list = Vec::with_capacity(seq_length);
         for t in 0..seq_length {
-            let x_t =
-                x.try_shrink([(t as isize, t as isize + 1), (0, batch_size as isize), (0, input_size as isize)])?;
-            let x_t = x_t.try_squeeze(Some(0))?; // [batch, input]
+            let x_t = x.getitem(s![t as i64, .., ..])?; // [batch, input]
 
             let mut gate = x_t.matmul(&wt)?.try_add(&h_t.matmul(&rt)?)?;
             if let Some(ref b) = combined_bias {
@@ -208,7 +206,6 @@ impl Tensor {
         let x_shape = x.shape()?;
         let seq_length = x_shape[0].as_const().expect("static seq_length");
         let batch_size = x_shape[1].as_const().expect("static batch_size");
-        let input_size = x_shape[2].as_const().expect("static input_size");
         let num_directions = w.shape()?[0].as_const().expect("static num_directions");
         let dtype = x.uop().dtype();
 
@@ -256,9 +253,7 @@ impl Tensor {
 
         let mut h_list = Vec::with_capacity(seq_length);
         for t in 0..seq_length {
-            let x_t =
-                x.try_shrink([(t as isize, t as isize + 1), (0, batch_size as isize), (0, input_size as isize)])?;
-            let x_t = x_t.try_squeeze(Some(0))?; // [batch, input]
+            let x_t = x.getitem(s![t as i64, .., ..])?; // [batch, input]
 
             // z, r gates: combined matmul
             let mut gates = x_t.matmul(&gates_w)?.try_add(&h_t.matmul(&gates_r)?)?;
@@ -377,7 +372,6 @@ impl Tensor {
         let x_shape = x.shape()?;
         let seq_length = x_shape[0].as_const().expect("static seq_length");
         let batch_size = x_shape[1].as_const().expect("static batch_size");
-        let input_size = x_shape[2].as_const().expect("static input_size");
         let num_directions = w.shape()?[0].as_const().expect("static num_directions");
         let dtype = x.uop().dtype();
 
@@ -428,9 +422,7 @@ impl Tensor {
 
         let mut h_list = Vec::with_capacity(seq_length);
         for t in 0..seq_length {
-            let x_t =
-                x.try_shrink([(t as isize, t as isize + 1), (0, batch_size as isize), (0, input_size as isize)])?;
-            let x_t = x_t.try_squeeze(Some(0))?; // [batch, input]
+            let x_t = x.getitem(s![t as i64, .., ..])?; // [batch, input]
 
             // gates = X_t @ W^T + H_{t-1} @ R^T + bias
             let mut gates = x_t.matmul(&wt)?.try_add(&h_t.matmul(&rt)?)?;

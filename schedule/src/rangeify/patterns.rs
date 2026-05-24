@@ -1057,13 +1057,12 @@ fn map_after_like_node(node: &Arc<UOp>, ctx: &mut LocalAddBufferContext) -> Opti
         _ => buf,
     };
 
-    if ctx.has_buffer(&buf) {
-        debug_assert!(false, "handle_after_like: duplicate buffer mapping for buf id={}", buf.id);
-        tracing::warn!(buf_id = buf.id, "handle_after_like: duplicate buffer mapping, skipping");
-        return None;
-    }
-
-    // Map buf -> node (AFTER/MSTACK/MSELECT), then replace node in AST with buf.
+    // A reused buffer (the level-interval planner aliases non-overlapping
+    // lifetimes) can be the target of more than one AFTER within a kernel's
+    // input cone. That is legal: keep the last writer as this kernel's source
+    // (matching tinygrad's `{u.buf_uop: u for u in afters}` last-wins), and let
+    // `fix_assign` re-derive the cross-kernel ordering globally from `buf_uop`.
+    // Either way the node is replaced by its buffer so consumers read the buffer.
     ctx.map_buffer(buf.clone(), node.clone());
     Some(buf)
 }

@@ -22,7 +22,7 @@ use std::path::Path;
 use snafu::ResultExt;
 use svod_dtype::DType;
 use svod_ir::SInt;
-use svod_tensor::{BoundVariable, Tensor};
+use svod_tensor::{BoundVariable, Tensor, s};
 
 use crate::init::{fan_in_uniform, zeros};
 use crate::state::{self, HasStateDict, StateDict, get_tensor, prefixed};
@@ -117,11 +117,8 @@ impl DiariZenSegmentationModel {
     }
 
     fn select_channel(&self, waveforms: &Tensor) -> Result<Tensor> {
-        waveforms
-            .try_shrink([None, Some((0isize, 1isize)), None])
-            .context(TensorSnafu)?
-            .try_squeeze(Some(1))
-            .context(TensorSnafu)
+        // Py: waveforms[:, 0, :]
+        waveforms.getitem(s![.., 0, ..]).context(TensorSnafu)
     }
 
     fn head_forward(&self, stacked: &Tensor) -> Result<Tensor> {

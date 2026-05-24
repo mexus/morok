@@ -11,6 +11,7 @@ pub mod cumsum;
 pub mod custom_kernel;
 pub mod data;
 pub mod einsum;
+pub mod index;
 pub mod indexing;
 pub mod math;
 pub mod matmul;
