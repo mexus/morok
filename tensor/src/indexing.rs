@@ -37,31 +37,42 @@ impl Tensor {
             }
         );
 
-        // TODO(symbolic-batch): both `to_vec_usize` calls require every dim of
-        // both `self` and `index` to be concrete. The arithmetic that uses
-        // them — the size-comparison loop and the `shrink` bounds — only
-        // needs the dims along which we shrink, not the symbolic prefix
-        // (typically a JIT batch bound to a `BoundVariable`). The symbolic
-        // dim could be passed through as `SInt`, and the comparison could be
-        // restricted to dims that are concrete on both sides. As-is, gather
-        // is unusable on tensors whose shape contains any symbolic dim.
-        let self_dims = svod_ir::shape::to_vec_usize(&self_shape).context(UOpSnafu)?;
-        let index_dims = svod_ir::shape::to_vec_usize(&index_shape).context(UOpSnafu)?;
-
+        // Compatibility holds where both dims are concrete; symbolic dims
+        // (e.g. a JIT batch bound to a `BoundVariable`) pass through untouched.
+        let compatible = self_shape.iter().zip(index_shape.iter()).enumerate().all(|(d, (s, i))| {
+            if d == dim {
+                return true;
+            }
+            match (s.as_const(), i.as_const()) {
+                (Some(s), Some(i)) => s >= i,
+                // A symbolic non-gather dim must be the *identical* extent on
+                // both sides — gather doesn't broadcast, and the shrink below
+                // would be ill-defined otherwise.
+                _ => s == i,
+            }
+        });
         snafu::ensure!(
-            self_dims.iter().zip(&index_dims).enumerate().all(|(d, (s, i))| d == dim || s >= i),
+            compatible,
             ShapeMismatchSnafu {
                 context: "gather",
                 expected: "self[d] >= index[d] for d != dim".to_string(),
-                actual: format!("self={self_dims:?}, index={index_dims:?}")
+                actual: format!("self={self_shape:?}, index={index_shape:?}")
             }
         );
 
-        let shrink: Vec<_> =
-            (0..ndim).map(|d| (0, (if d == dim { self_dims[d] } else { index_dims[d] }) as isize)).collect();
-        let x = self.try_shrink(&shrink)?.try_unsqueeze(-1)?.try_transpose(-1, dim as isize)?;
+        // Shrink `self` to `index`'s size on every non-gather axis; keep the
+        // gather axis full (`None`). Non-gather dims pass through as `SInt`, so
+        // a symbolic batch survives. Port of tinygrad `Tensor.gather`.
+        let shrink: Vec<_> = (0..ndim)
+            .map(|d| if d == dim { None } else { Some((svod_ir::SInt::Const(0), index_shape[d].clone())) })
+            .collect();
+        let x = self.try_shrink(shrink)?.try_unsqueeze(-1)?.try_transpose(-1, dim as isize)?;
 
-        let arange = Tensor::arange(0, Some(self_dims[dim] as i64), None)?.cast(index.uop().dtype())?;
+        // The gather axis is materialized as an arange, so it must be concrete.
+        let dim_size = self_shape[dim].as_const().ok_or_else(|| crate::error::Error::SymbolicShapeUnsupported {
+            operation: "gather along a symbolic dim".to_string(),
+        })?;
+        let arange = Tensor::arange(0, Some(dim_size as i64), None)?.cast(index.uop().dtype())?;
         let mask = index.try_unsqueeze(-1)?.try_eq(&arange)?;
 
         x.where_(&mask, &Self::new(x.uop().const_like(0)))?.sum_with().axes(-1).dtype(self.uop().dtype()).call()
@@ -76,22 +87,18 @@ impl Tensor {
         let self_shape = self.shape()?;
         let ndim = self_shape.len();
         let dim = Self::normalize_axis(dim, ndim)?;
-        // TODO(symbolic-batch): `self_dims` is consumed only to build
-        // `expand_shape` below (line 90). Forcing every dim through `usize`
-        // makes this unusable when the input has a symbolic dim (e.g. a JIT
-        // batch). The same SInt-aware `try_expand` shape would suffice.
-        let self_dims = svod_ir::shape::to_vec_usize(&self_shape).context(UOpSnafu)?;
-
-        // Reshape 1D index [K] → [1, ..., K, ..., 1] matching input ndim
+        // Reshape 1D index [K] → [1, ..., K, ..., 1] matching input ndim.
         let idx_len = index.shape()?[0].as_const().expect("index_select: index length must be concrete");
         let mut idx_shape = vec![1isize; ndim];
         idx_shape[dim] = idx_len as isize;
         let idx_nd = index.try_reshape(&idx_shape)?;
 
-        // Expand to [self[0], ..., K, ..., self[-1]] (K at dim position)
-        let mut expand_shape: Vec<isize> = self_dims.iter().map(|&d| d as isize).collect();
-        expand_shape[dim] = idx_len as isize;
-        let idx_expanded = idx_nd.try_expand(&expand_shape)?;
+        // Expand to `self`'s shape with K at the `dim` position. Built from
+        // `self_shape` as `SInt`, so a symbolic dim (e.g. a JIT batch) passes
+        // through untouched instead of forcing the whole shape concrete.
+        let mut expand_shape: Vec<_> = self_shape.iter().cloned().collect();
+        expand_shape[dim] = svod_ir::SInt::Const(idx_len);
+        let idx_expanded = idx_nd.try_expand(expand_shape)?;
 
         self.gather(dim as isize, &idx_expanded)
     }

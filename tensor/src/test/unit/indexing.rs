@@ -2,6 +2,7 @@ use crate::test::helpers::RealizeTestExt;
 use crate::*;
 use ndarray::array;
 use svod_dtype::DType;
+use svod_ir::SInt;
 
 fn get_shape(tensor: &Tensor) -> Vec<usize> {
     tensor.uop().shape().unwrap().unwrap().iter().map(|s| s.as_const().unwrap()).collect()
@@ -215,6 +216,64 @@ crate::codegen_tests! {
         assert_eq!(view[[1, 1]], 0);
         assert_eq!(view[[2, 0]], 1);
         assert_eq!(view[[2, 1]], 1);
+    }
+
+    // =========================================================================
+    // Symbolic-batch indexing (the WavLM JIT path: dim 0 is a bound Variable)
+    // =========================================================================
+
+    fn test_index_select_symbolic_batch(config) {
+        // `index_select` along dim 1 of a tensor whose batch dim (0) is a
+        // symbolic JIT-style variable. Must equal the concrete-batch result.
+        let data = Tensor::from_ndarray(&array![
+            [[1.0f32, 2.0], [3.0, 4.0], [5.0, 6.0], [7.0, 8.0]],
+            [[9.0, 10.0], [11.0, 12.0], [13.0, 14.0], [15.0, 16.0]],
+            [[17.0, 18.0], [19.0, 20.0], [21.0, 22.0], [23.0, 24.0]]
+        ]); // [3, 4, 2]
+        let head = Tensor::from_slice([0i64, 2, 3]);
+
+        let mut concrete = data.index_select(1, &head).unwrap().contiguous();
+        concrete.realize_with(&config).unwrap();
+        let want = concrete.as_vec::<f32>().unwrap();
+
+        // Bind the batch dim to a symbolic variable (= 3); the shape carries
+        // `SInt::Symbolic(BIND(var, 3))` through index_select → gather. `max ==
+        // bind` so the realized buffer is exactly batch-sized (buffers are
+        // otherwise allocated to the variable's max).
+        let b = Variable::new("isb", 1, 3).bind(3).unwrap();
+        let sym = data.try_shrink([Some((SInt::Const(0), b.as_sint())), None, None]).unwrap();
+        let mut got = sym.index_select(1, &head).unwrap().contiguous();
+        got.realize_with(&config).unwrap();
+        // The result shape is still symbolic, so read the flat realized buffer.
+        let got_flat: Vec<f32> = got.array_view::<f32>().unwrap().iter().copied().collect();
+
+        assert_eq!(got_flat.len(), 3 * 3 * 2);
+        assert_eq!(got_flat, want);
+    }
+
+    fn test_gather_symbolic_batch(config) {
+        // `gather` with a symbolic batch dim on BOTH self and index (the only
+        // legal symbolic non-gather extent: identical on both sides).
+        let data = Tensor::from_ndarray(&array![
+            [10.0f32, 11.0, 12.0, 13.0, 14.0],
+            [20.0, 21.0, 22.0, 23.0, 24.0],
+            [30.0, 31.0, 32.0, 33.0, 34.0]
+        ]); // [3, 5]
+        let idx = Tensor::from_ndarray(&array![[0i64, 4], [1, 3], [2, 0]]); // [3, 2]
+
+        let mut concrete = data.gather(1, &idx).unwrap().contiguous();
+        concrete.realize_with(&config).unwrap();
+        let want = concrete.as_vec::<f32>().unwrap(); // [10,14, 21,23, 32,30]
+
+        let b = Variable::new("gsb", 1, 3).bind(3).unwrap();
+        let data_sym = data.try_shrink([Some((SInt::Const(0), b.as_sint())), None]).unwrap();
+        let idx_sym = idx.try_shrink([Some((SInt::Const(0), b.as_sint())), None]).unwrap();
+        let mut got = data_sym.gather(1, &idx_sym).unwrap().contiguous();
+        got.realize_with(&config).unwrap();
+        let got_flat: Vec<f32> = got.array_view::<f32>().unwrap().iter().copied().collect();
+
+        assert_eq!(got_flat.len(), 3 * 2);
+        assert_eq!(got_flat, want);
     }
 }
 

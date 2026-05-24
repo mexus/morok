@@ -1,6 +1,7 @@
 mod audio;
 mod batch;
 mod config;
+mod diarizen;
 mod jit;
 mod jit_recurrent;
 mod mel;
@@ -11,4 +12,5 @@ mod splitter;
 mod state;
 mod state_dict;
 mod transcribe;
+mod wavlm;
 mod wespeaker;

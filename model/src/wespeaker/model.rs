@@ -141,8 +141,8 @@ impl WeSpeakerResNet34 {
 
     /// Build from a preloaded state dict. The state dict must use the
     /// `resnet.`-stripped WeSpeaker key layout (see module docs). Runs
-    /// [`remap::fold_batchnorm`] first to translate `running_var` into
-    /// `invstd`.
+    /// [`remap::fold_batchnorm`] first to translate `running_var` keys into
+    /// `invstd` keys (and compute the value transform).
     pub fn from_state_dict(sd: &StateDict, config: WeSpeakerConfig) -> Result<Self> {
         let sd = remap::fold_batchnorm(sd.clone())?;
         let mut model = Self::with_zero_weights(config);
