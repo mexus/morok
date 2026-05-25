@@ -76,11 +76,16 @@ impl AmdSignal {
     /// configurations may fault the GPU, and waiting the full 30 s timeout
     /// for each rejected candidate is unaffordable.
     pub fn wait_signal_value(&self, target: u64, timeout_ms: u64) -> Result<()> {
-        let start = std::time::Instant::now();
+        let mut start = std::time::Instant::now();
+        let mut prev = u64::MAX;
         loop {
             let v = unsafe { self.host_ptr.as_ref().load(Ordering::Acquire) };
             if v >= target {
                 return Ok(());
+            }
+            if v != prev {
+                prev = v; // progress: timeout is for *no* progress, so reset.
+                start = std::time::Instant::now();
             }
             if timeout_ms > 0 && start.elapsed().as_millis() as u64 >= timeout_ms {
                 // Drain any pending fault info before reporting the timeout —
@@ -107,7 +112,8 @@ impl AmdSignal {
     /// completed dispatch). Returns `Err(Runtime)` immediately on a GPU
     /// fault, or after `timeout_ms` if the signal never reaches `target`.
     pub fn wait_decrement_to(&self, target: u64, timeout_ms: u64) -> Result<()> {
-        let start = std::time::Instant::now();
+        let mut start = std::time::Instant::now();
+        let mut prev = u64::MAX;
         loop {
             // Read as i64 to compare across the HSA decrement convention: if
             // the GPU goes below `target` (shouldn't happen for a balanced
@@ -115,6 +121,10 @@ impl AmdSignal {
             let v = unsafe { self.host_ptr.as_ref().load(Ordering::Acquire) };
             if (v as i64) <= (target as i64) {
                 return Ok(());
+            }
+            if v != prev {
+                prev = v;
+                start = std::time::Instant::now();
             }
             if timeout_ms > 0 && start.elapsed().as_millis() as u64 >= timeout_ms {
                 let fault = self.device.upgrade().and_then(|d| d.poll_faults_nonblocking());
@@ -203,14 +213,20 @@ impl TimelineSignal for AmdSignal {
     }
 
     fn wait(&self, target: u64, timeout_ms: u64) -> Result<()> {
-        let start = std::time::Instant::now();
+        let mut start = std::time::Instant::now();
+        let mut prev = u64::MAX;
         // Tinygrad's tiered strategy (`hcq.py:294`): spin → yield → KFD
         // WAIT_EVENTS sleep. The shared helper handles the escalation tiers
         // and surfaces GPU faults so BEAM search can bail on a bad config
         // instead of blocking for the full timeout.
         loop {
-            if self.value() >= target {
+            let v = self.value();
+            if v >= target {
                 return Ok(());
+            }
+            if v != prev {
+                prev = v;
+                start = std::time::Instant::now();
             }
             if timeout_ms > 0 && start.elapsed().as_millis() as u64 >= timeout_ms {
                 let fault = self.device.upgrade().and_then(|d| d.poll_faults_nonblocking());

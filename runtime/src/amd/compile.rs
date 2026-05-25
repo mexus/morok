@@ -56,7 +56,7 @@ pub fn compile_ir_to_amd_object(ir: &str, arch: AmdArch) -> crate::Result<Vec<u8
         "-x",
         "ir",
         "-c",
-        "-O2",
+        "-O3",
         "--target=amdgcn-amd-amdhsa",
         &mcpu_arg,
         "-mcumode",

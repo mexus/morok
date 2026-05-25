@@ -62,6 +62,10 @@ pub enum Error {
     #[snafu(display("AMD allocation failed: {reason}"))]
     AmdAllocFailed { reason: String },
 
+    /// Kernel requests more LDS/group-segment than the device exposes.
+    #[snafu(display("group_segment too large: {requested} > device limit {limit} (lds_size_in_kb {lds_kb})"))]
+    GroupSegmentTooLarge { requested: u32, limit: u32, lds_kb: u32 },
+
     /// Device requested but unavailable on this host (wrong OS, missing libs).
     #[snafu(display("device unavailable: {reason}"))]
     DeviceUnavailable { reason: String },
