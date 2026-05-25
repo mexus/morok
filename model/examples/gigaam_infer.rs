@@ -30,6 +30,8 @@ use svod_model::gigaam::{GigaAm, TranscribeOpts, Transcriber};
 use svod_model::silero_vad::SileroVadSplitter;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    tracing_subscriber::fmt::init();
+
     let t_total = Instant::now();
     let wav_path = env::args().nth(1).ok_or("usage: gigaam_infer <audio.wav>")?;
     let revision = env::var("SVOD_GIGAAM_REVISION").unwrap_or_else(|_| "ctc".to_string());
