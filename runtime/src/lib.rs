@@ -15,6 +15,7 @@
 //! The `benchmark` module provides timing utilities for measuring kernel
 //! execution performance, used by beam search auto-tuning.
 
+pub mod amd;
 pub mod benchmark;
 pub mod clang;
 pub mod custom_function;
