@@ -63,6 +63,10 @@ struct ScratchState {
     size_per_thread: u32,
     /// Packed `COMPUTE_TMPRING_SIZE` register value.
     tmpring_size: u32,
+    /// KFD handle + total byte size of the backing alloc — needed to free the
+    /// old buffer when scratch grows (mirror tinygrad `_realloc`).
+    handle: u64,
+    size: usize,
 }
 
 /// Open handle to one AMD GPU node.
@@ -247,7 +251,8 @@ impl AmdDevice {
         // of SCRATCH_EN, and an invalid base produces an MMU fault at the
         // first dispatch. Programs that need more bytes/thread call
         // `ensure_has_local_memory` at load time to grow the backing.
-        let (scratch_va, scratch_size, tmpring_size, size_per_thread) = alloc_scratch(&kfd_fd, &node, &arch, 128)?;
+        let (scratch_va, scratch_size, tmpring_size, size_per_thread, scratch_handle) =
+            alloc_scratch(&kfd_fd, &node, &arch, 128)?;
 
         debug!(
             node = node.node_id,
@@ -276,7 +281,13 @@ impl AmdDevice {
             queue_event_mailbox_ptr,
             mem_fault_event_id: mem_event.event_id,
             hw_fault_event_id: hw_event.event_id,
-            scratch_state: Mutex::new(ScratchState { gpu_va: scratch_va, size_per_thread, tmpring_size }),
+            scratch_state: Mutex::new(ScratchState {
+                gpu_va: scratch_va,
+                size_per_thread,
+                tmpring_size,
+                handle: scratch_handle,
+                size: scratch_size,
+            }),
             timeline_signal: OnceLock::new(),
             timeline_value: AtomicU64::new(1),
             poisoned: AtomicBool::new(false),
@@ -341,28 +352,53 @@ impl AmdDevice {
     /// a fresh scratch buffer with the larger size and update the device's
     /// (gpu_va, tmpring_size) atomically.
     ///
-    /// The old scratch buffer is intentionally leaked: KFD reclaims it on
-    /// process exit, and synchronizing the timeline to safely free it would
-    /// stall every concurrent dispatch. Tinygrad uses `_realloc` (which DOES
-    /// free) but our buffers are larger / fewer growth events expected; the
-    /// leak is bounded by the largest kernel's scratch size and lives until
-    /// process exit.
+    /// The old scratch buffer is freed (sync → unmap → munmap → free), mirroring
+    /// tinygrad's `_realloc` (`hcq.py`). Growth only happens at program load, not
+    /// on the dispatch hot path, so the synchronize is rare and cheap; freeing is
+    /// load-bearing — leaking it exhausts VRAM across large multi-kernel models.
     pub fn ensure_has_local_memory(&self, private_segment_size: u32) -> Result<()> {
         let current = self.scratch_state.lock().size_per_thread;
         if private_segment_size <= current {
             return Ok(());
         }
-        let (va, _size, tmpring, rounded) = alloc_scratch(&self.kfd_fd, &self.node, &self.arch, private_segment_size)?;
-        let mut state = self.scratch_state.lock();
-        // Re-check under lock — another caller might have grown to a larger
-        // size between our check and this allocation. In that case keep the
-        // larger backing.
-        if rounded > state.size_per_thread {
-            state.gpu_va = va;
-            state.size_per_thread = rounded;
-            state.tmpring_size = tmpring;
-        }
+        let (va, size, tmpring, rounded, handle) =
+            alloc_scratch(&self.kfd_fd, &self.node, &self.arch, private_segment_size)?;
+        let stale = {
+            let mut state = self.scratch_state.lock();
+            // Re-check under lock — another caller might have grown larger between
+            // our check and this alloc. Keep the larger; the loser is freed below.
+            if rounded > state.size_per_thread {
+                let old = (state.gpu_va, state.size, state.handle);
+                *state = ScratchState { gpu_va: va, size_per_thread: rounded, tmpring_size: tmpring, handle, size };
+                old
+            } else {
+                (va, size, handle)
+            }
+        };
+        self.free_scratch(stale.0, stale.1, stale.2);
         Ok(())
+    }
+
+    /// Drain, then unmap → munmap → free a scratch backing buffer. Old scratch is
+    /// no longer referenced once the timeline drains (sole user is dispatch).
+    fn free_scratch(&self, va: u64, size: usize, handle: u64) {
+        if let Err(e) = self.synchronize() {
+            tracing::warn!(?e, va, "scratch realloc: synchronize failed; freeing anyway");
+        }
+        let mut gpu_id = self.node.gpu_id;
+        let mut unmap = kfd::kfd_ioctl_unmap_memory_from_gpu_args {
+            handle,
+            device_ids_array_ptr: &mut gpu_id as *mut _ as u64,
+            n_devices: 1,
+            n_success: 0,
+        };
+        // SAFETY: fd alive; handle from a successful alloc_scratch.
+        let _ = unsafe { ioctl::kfd_unmap_memory_from_gpu(self.kfd_fd.as_raw_fd(), &mut unmap as *mut _) };
+        // SAFETY: va is the VA reserved by alloc_scratch's mmap.
+        unsafe { libc::munmap(va as *mut _, size) };
+        let mut free = kfd::kfd_ioctl_free_memory_of_gpu_args { handle };
+        // SAFETY: same handle.
+        let _ = unsafe { ioctl::kfd_free_memory_of_gpu(self.kfd_fd.as_raw_fd(), &mut free as *mut _) };
     }
 
     /// Device-global timeline signal (panics if [`init_timeline`] hasn't been
@@ -619,7 +655,7 @@ fn alloc_scratch(
     node: &AmdNode,
     arch: &AmdArch,
     private_segment_size: u32,
-) -> Result<(u64, usize, u32, u32)> {
+) -> Result<(u64, usize, u32, u32, u64)> {
     use libc::{MAP_ANONYMOUS, MAP_NORESERVE, MAP_PRIVATE, PROT_NONE, mmap, munmap};
 
     const LANES_PER_WAVE: u32 = 64;
@@ -683,7 +719,7 @@ fn alloc_scratch(
     let waves = num_waves.min(max_scratch_waves);
     let tmpring_size = pack_tmpring(waves, wave_scratch, arch);
 
-    Ok((va as u64, total, tmpring_size, size_per_thread))
+    Ok((va as u64, total, tmpring_size, size_per_thread, handle))
 }
 
 /// Pack `COMPUTE_TMPRING_SIZE`: WAVES in bits 0..12, WAVESIZE at bit 12 with an
