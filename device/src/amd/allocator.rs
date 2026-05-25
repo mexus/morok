@@ -146,6 +146,8 @@ impl Allocator for AmdAllocator {
 /// already encoded in `flags`; everything else (VA reservation, KFD alloc,
 /// host mmap, map_memory_to_gpu) is identical.
 fn do_alloc(dev: &Arc<AmdDevice>, size: usize, flags: u32, cpu_accessible: bool, zero_init: bool) -> Result<RawBuffer> {
+    // KFD VA reservation + map are page-granular; a 0-byte mmap is EINVAL.
+    let size = size.max(1).next_multiple_of(0x1000);
     let va = reserve_va(size)?;
     let mut args = kfd::kfd_ioctl_alloc_memory_of_gpu_args {
         va_addr: va as u64,
