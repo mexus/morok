@@ -69,4 +69,11 @@ pub enum Error {
     /// Device requested but unavailable on this host (wrong OS, missing libs).
     #[snafu(display("device unavailable: {reason}"))]
     DeviceUnavailable { reason: String },
+
+    /// Allocator does not implement an optional operation (e.g. `_transfer`,
+    /// `_offset`, `_map`). Mirrors tinygrad's `NotImplementedError` defaults on
+    /// the `Allocator` base (device.py:239-247) — reachable only via
+    /// cross-backend misuse, never on the CPU path.
+    #[snafu(display("allocator does not support operation: {op}"))]
+    Unsupported { op: &'static str },
 }

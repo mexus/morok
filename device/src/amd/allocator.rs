@@ -21,10 +21,10 @@ use libc::{
 use svod_dtype::DeviceSpec;
 use tracing::debug;
 
-use crate::allocator::{Allocator, BufferOptions, RawBuffer};
+use crate::allocator::{Allocator, BufferSpec, RawBuffer};
 use crate::amd::device::AmdDevice;
 use crate::amd::sys::{ioctl, kfd};
-use crate::error::{Error, Result};
+use crate::error::{Error, Result, UnsupportedSnafu};
 
 /// VRAM-/GTT-backed buffer allocator routed through KFD ioctls.
 pub struct AmdAllocator {
@@ -76,18 +76,66 @@ impl std::fmt::Debug for AmdAllocator {
 }
 
 impl Allocator for AmdAllocator {
-    fn alloc(&self, size: usize, options: &BufferOptions) -> Result<RawBuffer> {
+    fn _alloc(&self, size: usize, options: &BufferSpec, zero: bool) -> Result<RawBuffer> {
         let mut flags = kfd::KFD_IOC_ALLOC_MEM_FLAGS_VRAM
             | kfd::KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE
             | kfd::KFD_IOC_ALLOC_MEM_FLAGS_EXECUTABLE
             | kfd::KFD_IOC_ALLOC_MEM_FLAGS_NO_SUBSTITUTE;
-        if options.cpu_accessible {
+        if options.cpu_access {
             flags |= kfd::KFD_IOC_ALLOC_MEM_FLAGS_PUBLIC;
         }
-        do_alloc(&self.dev, size, flags, options.cpu_accessible, options.zero_init)
+        do_alloc(&self.dev, size, flags, options.cpu_access, zero)
     }
 
-    fn free(&self, buffer: RawBuffer, _options: &BufferOptions) {
+    fn _copyin(&self, dest: &RawBuffer, dest_off: usize, src: &[u8]) -> Result<()> {
+        match dest {
+            RawBuffer::AmdDevice { host_ptr: Some(ptr), .. } => {
+                // SAFETY: BAR-backed VRAM mapping valid for the buffer's lifetime;
+                // scheduler exclusivity. `dest_off + src.len()` is bounded by the caller.
+                let dst = unsafe { std::slice::from_raw_parts_mut(ptr.as_ptr().add(dest_off), src.len()) };
+                dst.copy_from_slice(src);
+                Ok(())
+            }
+            RawBuffer::AmdDevice { host_ptr: None, .. } => {
+                todo!("Phase 3: copyin into device-only AMD VRAM via SDMA")
+            }
+            other => unreachable!("AmdAllocator::_copyin on non-AMD buffer: {other:?}"),
+        }
+    }
+
+    fn _copyout(&self, dest: &mut [u8], src: &RawBuffer, src_off: usize) -> Result<()> {
+        match src {
+            RawBuffer::AmdDevice { host_ptr: Some(ptr), .. } => {
+                let src_slice = unsafe { std::slice::from_raw_parts(ptr.as_ptr().add(src_off), dest.len()) };
+                dest.copy_from_slice(src_slice);
+                Ok(())
+            }
+            RawBuffer::AmdDevice { host_ptr: None, .. } => {
+                todo!("Phase 3: copyout from device-only AMD VRAM via SDMA")
+            }
+            other => unreachable!("AmdAllocator::_copyout on non-AMD buffer: {other:?}"),
+        }
+    }
+
+    fn _transfer(&self, dest: &RawBuffer, dest_off: usize, src: &RawBuffer, src_off: usize, sz: usize) -> Result<()> {
+        match (dest, src) {
+            (
+                RawBuffer::AmdDevice { host_ptr: Some(dst_ptr), .. },
+                RawBuffer::AmdDevice { host_ptr: Some(src_ptr), .. },
+            ) => {
+                let dst = unsafe { std::slice::from_raw_parts_mut(dst_ptr.as_ptr().add(dest_off), sz) };
+                let src_slice = unsafe { std::slice::from_raw_parts(src_ptr.as_ptr().add(src_off), sz) };
+                dst.copy_from_slice(src_slice);
+                Ok(())
+            }
+            (RawBuffer::AmdDevice { .. }, RawBuffer::AmdDevice { .. }) => {
+                todo!("Phase 3: AMD↔AMD transfer involving device-only VRAM via SDMA")
+            }
+            _ => UnsupportedSnafu { op: "transfer" }.fail(),
+        }
+    }
+
+    fn _free(&self, buffer: RawBuffer, _options: &BufferSpec) {
         let (gpu_addr, host_ptr, size, handle, device) = match buffer {
             RawBuffer::AmdDevice { gpu_addr, host_ptr, size, handle, device } => {
                 (gpu_addr, host_ptr, size, handle, device)
@@ -268,10 +316,10 @@ mod tests {
                 return;
             }
         };
-        let opts = BufferOptions { zero_init: true, cpu_accessible: true, ..Default::default() };
-        let buf = alloc.alloc(4096, &opts).expect("alloc 4 KiB");
+        let opts = BufferSpec { cpu_access: true, ..Default::default() };
+        let buf = alloc.alloc(4096, &opts, /*zero=*/ true).expect("alloc 4 KiB");
         assert_eq!(buf.size(), 4096);
         assert!(buf.cpu_accessible());
-        alloc.free(buf, &opts);
+        alloc.free(buf, 4096, &opts);
     }
 }

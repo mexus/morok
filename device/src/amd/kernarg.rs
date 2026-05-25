@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 
-use crate::allocator::{Allocator, BufferOptions, RawBuffer};
+use crate::allocator::{Allocator, BufferSpec, RawBuffer};
 use crate::amd::AmdAllocator;
 use crate::error::{Error, Result};
 
@@ -34,8 +34,8 @@ unsafe impl Sync for KernargArena {}
 
 impl KernargArena {
     pub fn new(allocator: &AmdAllocator) -> Result<Arc<Self>> {
-        let opts = BufferOptions { zero_init: true, cpu_accessible: true, uncached: true, nolru: true };
-        let buffer = allocator.alloc(ARENA_BYTES, &opts)?;
+        let opts = BufferSpec { cpu_access: true, uncached: true, nolru: true, ..Default::default() };
+        let buffer = allocator.alloc(ARENA_BYTES, &opts, /*zero=*/ true)?;
         let (base_gpu, base_host) = match &buffer {
             RawBuffer::AmdDevice { gpu_addr, host_ptr: Some(h), .. } => (*gpu_addr, *h),
             _ => return Err(Error::AmdAllocFailed { reason: "kernarg arena requires host-visible buffer".into() }),

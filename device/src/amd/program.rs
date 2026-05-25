@@ -15,7 +15,7 @@ use object::read::elf::FileHeader;
 use object::{LittleEndian, Object, ObjectSection, ObjectSymbol, RelocationFlags, RelocationTarget};
 use tracing::debug;
 
-use crate::allocator::{Allocator, BufferOptions, RawBuffer};
+use crate::allocator::{Allocator, BufferSpec, RawBuffer};
 use crate::amd::AmdAllocator;
 use crate::amd::device::AmdDevice;
 use crate::amd::kernarg::KernargArena;
@@ -301,8 +301,8 @@ impl AmdProgram {
         // Allocate VRAM for the code object (EXECUTABLE flag is set on every
         // AmdAllocator alloc; clang's amdgcn output runs on the GPU side).
         let size = parsed.image.len().next_multiple_of(0x1000);
-        let opts = BufferOptions { zero_init: false, cpu_accessible: true, nolru: true, ..Default::default() };
-        let code_buf = allocator.alloc(size, &opts)?;
+        let opts = BufferSpec { cpu_access: true, nolru: true, ..Default::default() };
+        let code_buf = allocator.alloc(size, &opts, /*zero=*/ false)?;
         let (code_gpu, code_host) = match &code_buf {
             RawBuffer::AmdDevice { gpu_addr, host_ptr: Some(h), .. } => (*gpu_addr, *h),
             _ => return Err(Error::AmdAllocFailed { reason: "code object requires host-visible AMD buffer".into() }),
@@ -578,7 +578,7 @@ impl Program for AmdProgram {
                 l[2],
                 self.queue.is_pm4(),
                 kernarg_gpu,
-                bufs_str.join(" ")
+                format!("scratch={:#x} {}", self.dev.scratch_gpu_va(), bufs_str.join(" "))
             );
         }
 

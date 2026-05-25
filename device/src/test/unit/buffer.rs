@@ -1,4 +1,4 @@
-use crate::{Buffer, BufferOptions, CpuAllocator};
+use crate::{Buffer, BufferSpec, CpuAllocator};
 use std::sync::Arc;
 use svod_dtype::DType;
 
@@ -8,7 +8,7 @@ use crate::CudaAllocator;
 #[test]
 fn test_lazy_allocation() {
     let allocator = Arc::new(CpuAllocator);
-    let buffer = Buffer::new(allocator, DType::Float32, vec![10], BufferOptions::default());
+    let buffer = Buffer::new(allocator, DType::Float32, vec![10], BufferSpec::default());
 
     assert!(!buffer.is_allocated());
     buffer.ensure_allocated().unwrap();
@@ -18,7 +18,7 @@ fn test_lazy_allocation() {
 #[test]
 fn test_buffer_view() {
     let allocator = Arc::new(CpuAllocator);
-    let buffer = Buffer::allocate(allocator, DType::Float32, vec![10], BufferOptions::default()).unwrap();
+    let buffer = Buffer::allocate(allocator, DType::Float32, vec![10], BufferSpec::default()).unwrap();
 
     let view = buffer.view(4, 16).unwrap();
     assert_eq!(view.offset(), 4);
@@ -31,7 +31,7 @@ fn test_view_has_distinct_handle_id() {
     // Disjoint views of one allocation must compare as different handles
     // so the parallel-hazard model can treat them as independent.
     let allocator = Arc::new(CpuAllocator);
-    let buffer = Buffer::allocate(allocator, DType::Float32, vec![16], BufferOptions::default()).unwrap();
+    let buffer = Buffer::allocate(allocator, DType::Float32, vec![16], BufferSpec::default()).unwrap();
     let view_a = buffer.view(0, 16).unwrap();
     let view_b = buffer.view(16, 16).unwrap();
 
@@ -44,7 +44,7 @@ fn test_view_shares_storage_id() {
     // Storage identity must be shared between a base and its views; this is
     // what alias detection in the memory planner relies on.
     let allocator = Arc::new(CpuAllocator);
-    let buffer = Buffer::allocate(allocator, DType::Float32, vec![16], BufferOptions::default()).unwrap();
+    let buffer = Buffer::allocate(allocator, DType::Float32, vec![16], BufferSpec::default()).unwrap();
     let view = buffer.view(8, 16).unwrap();
 
     assert_eq!(buffer.storage_id(), view.storage_id(), "view must share its base's storage id");
@@ -53,8 +53,8 @@ fn test_view_shares_storage_id() {
 #[test]
 fn test_independent_buffers_have_distinct_storage_ids() {
     let allocator = Arc::new(CpuAllocator);
-    let a = Buffer::allocate(allocator.clone(), DType::Float32, vec![8], BufferOptions::default()).unwrap();
-    let b = Buffer::allocate(allocator, DType::Float32, vec![8], BufferOptions::default()).unwrap();
+    let a = Buffer::allocate(allocator.clone(), DType::Float32, vec![8], BufferSpec::default()).unwrap();
+    let b = Buffer::allocate(allocator, DType::Float32, vec![8], BufferSpec::default()).unwrap();
 
     assert_ne!(a.storage_id(), b.storage_id(), "independent allocations must have distinct storage ids");
     assert_ne!(a.id(), b.id());
@@ -63,7 +63,7 @@ fn test_independent_buffers_have_distinct_storage_ids() {
 #[test]
 fn test_invalid_view() {
     let allocator = Arc::new(CpuAllocator);
-    let buffer = Buffer::allocate(allocator, DType::Float32, vec![10], BufferOptions::default()).unwrap();
+    let buffer = Buffer::allocate(allocator, DType::Float32, vec![10], BufferSpec::default()).unwrap();
 
     // Try to create a view that exceeds buffer size
     let result = buffer.view(36, 16);
@@ -81,7 +81,7 @@ fn test_unified_memory_allocation() {
         }
     };
 
-    let options = BufferOptions { cpu_accessible: true, zero_init: false, ..Default::default() };
+    let options = BufferSpec { cpu_access: true, ..Default::default() };
     let buffer = Buffer::allocate(allocator, DType::Float32, vec![10], options).unwrap();
 
     assert!(buffer.is_allocated());
@@ -99,7 +99,7 @@ fn test_unified_memory_cpu_access() {
         }
     };
 
-    let options = BufferOptions { cpu_accessible: true, zero_init: false, ..Default::default() };
+    let options = BufferSpec { cpu_access: true, ..Default::default() };
     let mut buffer = Buffer::allocate(allocator, DType::Float32, vec![10], options).unwrap();
 
     // Write data from CPU
@@ -127,7 +127,7 @@ fn test_unified_memory_view() {
         }
     };
 
-    let options = BufferOptions { cpu_accessible: true, zero_init: false, ..Default::default() };
+    let options = BufferSpec { cpu_access: true, ..Default::default() };
     let buffer = Buffer::allocate(allocator, DType::Float32, vec![10], options).unwrap();
 
     // Create view into unified buffer
@@ -148,11 +148,11 @@ fn test_copy_device_to_unified() {
     };
 
     // Create device-only buffer
-    let device_opts = BufferOptions { cpu_accessible: false, zero_init: false, ..Default::default() };
+    let device_opts = BufferSpec { cpu_access: false, ..Default::default() };
     let mut device_buf = Buffer::allocate(allocator.clone(), DType::Float32, vec![10], device_opts).unwrap();
 
     // Create unified buffer
-    let unified_opts = BufferOptions { cpu_accessible: true, zero_init: false, ..Default::default() };
+    let unified_opts = BufferSpec { cpu_access: true, ..Default::default() };
     let mut unified_buf = Buffer::allocate(allocator, DType::Float32, vec![10], unified_opts).unwrap();
 
     // Write test data to device buffer
@@ -184,11 +184,11 @@ fn test_copy_unified_to_device() {
     };
 
     // Create unified buffer
-    let unified_opts = BufferOptions { cpu_accessible: true, zero_init: false, ..Default::default() };
+    let unified_opts = BufferSpec { cpu_access: true, ..Default::default() };
     let mut unified_buf = Buffer::allocate(allocator.clone(), DType::Float32, vec![10], unified_opts).unwrap();
 
     // Create device-only buffer
-    let device_opts = BufferOptions { cpu_accessible: false, zero_init: false, ..Default::default() };
+    let device_opts = BufferSpec { cpu_access: false, ..Default::default() };
     let mut device_buf = Buffer::allocate(allocator, DType::Float32, vec![10], device_opts).unwrap();
 
     // Write test data to unified buffer
@@ -219,8 +219,8 @@ fn test_copy_unified_to_unified() {
         }
     };
 
-    let options = BufferOptions { cpu_accessible: true, zero_init: false, ..Default::default() };
-    let mut src_buf = Buffer::allocate(allocator.clone(), DType::Float32, vec![10], options.clone()).unwrap();
+    let options = BufferSpec { cpu_access: true, ..Default::default() };
+    let mut src_buf = Buffer::allocate(allocator.clone(), DType::Float32, vec![10], options).unwrap();
     let mut dst_buf = Buffer::allocate(allocator, DType::Float32, vec![10], options).unwrap();
 
     // Write test data to source
@@ -251,8 +251,9 @@ fn test_unified_memory_zero_init() {
         }
     };
 
-    let options = BufferOptions { cpu_accessible: true, zero_init: true, ..Default::default() };
-    let buffer = Buffer::allocate(allocator, DType::Float32, vec![10], options).unwrap();
+    let options = BufferSpec { cpu_access: true, ..Default::default() };
+    let buffer =
+        Buffer::allocate_with_zero_init(allocator, DType::Float32, vec![10], options, /*zero_init=*/ true).unwrap();
 
     // Read data and verify it's zeroed
     let mut output_data = vec![1f32; 10]; // Initialize with non-zero
