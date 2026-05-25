@@ -5,7 +5,7 @@
 //! and provides tensor core configurations for hardware-accelerated matrix multiplication.
 
 use smallvec::SmallVec;
-use svod_dtype::DType;
+use svod_dtype::{AmdArch, DType};
 use svod_ir::RendererDevice;
 
 /// Tensor core optimization operation.
@@ -315,6 +315,17 @@ impl Renderer {
             buffer_max: None,
             tensor_cores: TensorCore::cdna4_tensor_cores(),
             supports_float4: true,
+        }
+    }
+
+    /// Select the AMD optimizer profile matching a gfx arch. CDNA gfx942 maps
+    /// to CDNA3 and gfx950 to CDNA4; RDNA3/RDNA4 families map to their profiles.
+    pub fn for_amd_arch(arch: AmdArch) -> Self {
+        match arch {
+            AmdArch::Gfx942 => Self::amd_cdna3(),
+            AmdArch::Gfx950 => Self::amd_cdna4(),
+            _ if arch.is_rdna4() => Self::amd_rdna4(),
+            _ => Self::amd_rdna3(),
         }
     }
 

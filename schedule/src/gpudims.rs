@@ -182,10 +182,12 @@ fn add_gpudims(ctx: &Renderer, sink: &Arc<UOp>) -> Option<Arc<UOp>> {
         // For locals, we use product limit rather than per-dimension
         // Convert to per-dimension limits if needed
         let local_max: Option<Vec<usize>> = local_max_product.map(|max| {
-            // Simple heuristic: distribute limit evenly if multiple dimensions
-            let n = local_shape.len().max(1);
-            let per_dim = (max as f64).powf(1.0 / n as f64).floor() as usize;
-            vec![per_dim.max(1); n]
+            // Per-axis cap is the full product (matches tinygrad's per-dim
+            // local maxima); the workgroup-size product is enforced by the
+            // optimizer, not by crushing each axis to product^(1/n). The
+            // cube-root split made non-cubic local shapes like [32,2,2]
+            // unfittable (32 > 1024^(1/3)=10) and panicked at split_dims.
+            vec![max.max(1); local_shape.len().max(1)]
         });
         let local_max_slice = local_max.as_deref();
 
@@ -418,11 +420,8 @@ fn get_grouped_dims(prefix: &str, dims: &[Arc<UOp>], max_sizes: Option<&[usize]>
         }
     };
 
-    let raw_idxs: Vec<Arc<UOp>> = limited
-        .iter()
-        .enumerate()
-        .map(|(i, s)| UOp::special(s.clone(), format!("{prefix}{i}")))
-        .collect();
+    let raw_idxs: Vec<Arc<UOp>> =
+        limited.iter().enumerate().map(|(i, s)| UOp::special(s.clone(), format!("{prefix}{i}"))).collect();
 
     if limited.len() < dims.len() {
         // Contraction: more original dims than limited dims — decompose via
@@ -500,11 +499,7 @@ fn split_dims(dims: &[Arc<UOp>], max_sizes: &[usize]) -> Option<Vec<Arc<UOp>>> {
         }
     }
     let result = if is_one(&working[2]) {
-        if is_one(&working[1]) {
-            vec![working[0].clone()]
-        } else {
-            vec![working[0].clone(), working[1].clone()]
-        }
+        if is_one(&working[1]) { vec![working[0].clone()] } else { vec![working[0].clone(), working[1].clone()] }
     } else {
         working
     };
@@ -658,11 +653,7 @@ fn flatten_unflatten_dims(
         2 => vec![flat.idiv(&original_dims[1]), flat.mod_(&original_dims[1])],
         3 => {
             let d12 = original_dims[2].mul(&original_dims[1]);
-            vec![
-                flat.idiv(&d12),
-                flat.idiv(&original_dims[2]).mod_(&original_dims[1]),
-                flat.mod_(&original_dims[2]),
-            ]
+            vec![flat.idiv(&d12), flat.idiv(&original_dims[2]).mod_(&original_dims[1]), flat.mod_(&original_dims[2])]
         }
         _ => raw_idxs.to_vec(),
     }

@@ -44,6 +44,15 @@ fn test_group_dims_impossible() {
 }
 
 #[test]
+fn test_non_cubic_local_dims_fit_product_cap() {
+    // Regression: a 1024-product local shape with per-axis caps = product
+    // ([1024;3]) fits [32,2,2] unchanged. The old cube-root cap (10 each)
+    // made axis 0 (32) unfittable and panicked at split_dims.
+    let result = group_dims(&d(&[32, 2, 2]), &[1024, 1024, 1024]);
+    assert_eq!(dmax(&result.unwrap()), vec![32, 2, 2]);
+}
+
+#[test]
 fn test_split_dims_simple() {
     // 100 exceeds 64, should split.
     let result = split_dims(&d(&[100]), &[64, 64, 64]).unwrap();

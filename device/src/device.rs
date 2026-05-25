@@ -391,6 +391,13 @@ pub trait Renderer: Send + Sync {
     /// This is used for cache key construction and device selection.
     fn device(&self) -> &DeviceSpec;
 
+    /// AMD arch backing this renderer, if any. Arch is a hardware property of
+    /// the opened device (not the `DeviceSpec`), so AMD backends expose it here
+    /// to pick the matching optimizer profile. Non-AMD renderers return `None`.
+    fn amd_arch(&self) -> Option<svod_dtype::AmdArch> {
+        None
+    }
+
     /// Returns decomposition patterns for operations this backend doesn't support.
     ///
     /// This is used by the realization pass to decompose complex operations

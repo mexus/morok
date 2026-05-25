@@ -1586,10 +1586,14 @@ fn get_optimizer_renderer(device: &Device) -> svod_schedule::OptimizerRenderer {
         }
         DeviceSpec::Cuda { .. } => svod_schedule::OptimizerRenderer::cuda(),
         DeviceSpec::Metal { .. } => svod_schedule::OptimizerRenderer::metal(),
-        // AMD shares the GPU optimizer profile with CUDA (work-item/group
-        // splits, local-memory friendly). A dedicated AMD optimizer profile
-        // is a Phase 1 follow-up if benchmarks diverge.
-        DeviceSpec::Amd { .. } => svod_schedule::OptimizerRenderer::cuda(),
+        // AMD picks the profile (wave size, LDS, WMMA/MFMA tensor cores) from
+        // the opened device's arch, exposed via the renderer. Falls back to
+        // RDNA3 if the renderer can't report arch.
+        DeviceSpec::Amd { .. } => device
+            .renderer
+            .amd_arch()
+            .map(svod_schedule::OptimizerRenderer::for_amd_arch)
+            .unwrap_or_else(svod_schedule::OptimizerRenderer::amd_rdna3),
         _ => svod_schedule::OptimizerRenderer::cpu(),
     }
 }

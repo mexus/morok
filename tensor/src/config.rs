@@ -146,8 +146,8 @@ pub fn amd_test_arch() -> Option<svod_dtype::AmdArch> {
 /// override the thread-local default device. Idempotent — safe to call from
 /// multiple `PrepareConfig::from_env` sites.
 fn normalize_default_device_from_env() {
-    use svod_device::registry::DeviceSpecExt;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use svod_device::registry::DeviceSpecExt;
     static DONE: AtomicBool = AtomicBool::new(false);
     if DONE.swap(true, Ordering::AcqRel) {
         return;

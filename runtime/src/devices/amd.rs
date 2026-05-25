@@ -95,6 +95,10 @@ impl Renderer for AmdRendererWrapper {
     fn device(&self) -> &DeviceSpec {
         &self.device
     }
+
+    fn amd_arch(&self) -> Option<AmdArch> {
+        Some(self.arch)
+    }
 }
 
 struct AmdCompiler {
