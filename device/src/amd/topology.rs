@@ -32,6 +32,9 @@ pub struct AmdNode {
     pub gfx_target_version: u32,
     pub simd_count: u32,
     pub array_count: u32,
+    /// Shader arrays per shader-engine. Used to derive the SE count for scratch
+    /// wave budgeting; defaults to 1 when KFD omits it.
+    pub simd_arrays_per_engine: u32,
     pub simd_per_cu: u32,
     pub max_waves_per_simd: u32,
     pub lds_size_in_kb: u32,
@@ -104,6 +107,7 @@ pub fn enumerate() -> Vec<AmdNode> {
             gfx_target_version: map.get("gfx_target_version").copied().unwrap_or(0) as u32,
             simd_count: map.get("simd_count").copied().unwrap_or(0) as u32,
             array_count: map.get("array_count").copied().unwrap_or(0) as u32,
+            simd_arrays_per_engine: (map.get("simd_arrays_per_engine").copied().unwrap_or(1) as u32).max(1),
             simd_per_cu,
             max_waves_per_simd,
             lds_size_in_kb: map.get("lds_size_in_kb").copied().unwrap_or(0) as u32,
@@ -188,7 +192,7 @@ mod tests {
         let mut f = std::fs::File::create(n1.join("properties")).unwrap();
         write!(
             f,
-            "gpu_id 5710\nsimd_count 4\ngfx_target_version 110000\ndrm_render_minor 128\nwave_front_size 32\nnum_cp_queues 8\n"
+            "gpu_id 5710\nsimd_count 4\narray_count 4\nsimd_arrays_per_engine 2\ngfx_target_version 110000\ndrm_render_minor 128\nwave_front_size 32\nnum_cp_queues 8\n"
         )
         .unwrap();
 
@@ -206,6 +210,7 @@ mod tests {
         assert_eq!(nodes[0].drm_render_minor, 128);
         assert_eq!(nodes[0].wave_front_size, 32);
         assert_eq!(nodes[0].num_cp_queues, 8);
+        assert_eq!(nodes[0].simd_arrays_per_engine, 2);
     }
 
     fn tempfile_dir() -> PathBuf {

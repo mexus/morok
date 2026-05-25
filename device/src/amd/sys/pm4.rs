@@ -238,8 +238,15 @@ pub const GCR_GL2_WB: u32 = 1 << 15;
 
 /// All cache levels invalidated/written-back. Equivalent to tinygrad's
 /// `acquire_mem()` default (`gli=glm=glk=glv=gl1=gl2=1`). Yields 0xC3F1.
-pub const GCR_FLAGS_ALL: u32 =
-    GCR_GLI_INV | GCR_GLM_WB | GCR_GLM_INV | GCR_GLK_WB | GCR_GLK_INV | GCR_GLV_INV | GCR_GL1_INV | GCR_GL2_INV | GCR_GL2_WB;
+pub const GCR_FLAGS_ALL: u32 = GCR_GLI_INV
+    | GCR_GLM_WB
+    | GCR_GLM_INV
+    | GCR_GLK_WB
+    | GCR_GLK_INV
+    | GCR_GLV_INV
+    | GCR_GL1_INV
+    | GCR_GL2_INV
+    | GCR_GL2_WB;
 
 /// Mild flush: skips GLI and GL2 invalidate/writeback. Equivalent to
 /// tinygrad's `_exec` pre-dispatch `acquire_mem(gli=0, gl2=0)`. Yields 0x03F0.
