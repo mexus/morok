@@ -188,15 +188,48 @@ fn validate_var_bound(name: &str, value: i64, min_val: i64, max_val: i64) -> Res
 }
 
 fn checked_launch_binary(op: BinaryOp, lhs: i64, rhs: i64) -> Result<i64> {
-    let value = match op {
+    // EXHAUSTIVE match — no `_` catch-all. When a new `BinaryOp` variant is
+    // added to `svod_ir::types::BinaryOp`, the compiler will fail this match
+    // and force an explicit decision, instead of silently producing wrong
+    // launch dims at runtime. Tinygrad codegens `sym_infer` from the renderer
+    // pipeline (`ops.py:918-932`) so it inherits every operator automatically;
+    // until svod unifies the two evaluators, this exhaustive match is the
+    // belt-and-suspenders that approximates the same guarantee.
+    let value: Option<i64> = match op {
+        // Integer arithmetic — checked for overflow.
         BinaryOp::Add => lhs.checked_add(rhs),
         BinaryOp::Sub => lhs.checked_sub(rhs),
         BinaryOp::Mul => lhs.checked_mul(rhs),
         BinaryOp::Idiv => (rhs != 0).then(|| lhs.checked_div(rhs)).flatten(),
         BinaryOp::Mod => (rhs != 0).then(|| lhs.checked_rem(rhs)).flatten(),
         BinaryOp::Max => Some(lhs.max(rhs)),
-        _ => {
-            return Err(Error::Runtime { message: format!("unsupported binary op in launch-size expression: {op:?}") });
+        // Integer power: only support non-negative exponents that fit in u32.
+        BinaryOp::Pow => u32::try_from(rhs).ok().and_then(|e| lhs.checked_pow(e)),
+        // Bitwise / shift. Negative shifts and shifts ≥ 64 are rejected.
+        BinaryOp::Shl => u32::try_from(rhs).ok().filter(|&r| r < 64).and_then(|r| lhs.checked_shl(r)),
+        BinaryOp::Shr => u32::try_from(rhs).ok().filter(|&r| r < 64).and_then(|r| lhs.checked_shr(r)),
+        BinaryOp::And => Some(lhs & rhs),
+        BinaryOp::Or => Some(lhs | rhs),
+        BinaryOp::Xor => Some(lhs ^ rhs),
+        // Comparisons — fold to 0/1 (consistent with IR's symbolic rewrite
+        // pipeline where Bool is i1 and may participate in arithmetic via
+        // CAST).
+        BinaryOp::Lt => Some(i64::from(lhs < rhs)),
+        BinaryOp::Le => Some(i64::from(lhs <= rhs)),
+        BinaryOp::Eq => Some(i64::from(lhs == rhs)),
+        BinaryOp::Ne => Some(i64::from(lhs != rhs)),
+        BinaryOp::Gt => Some(i64::from(lhs > rhs)),
+        BinaryOp::Ge => Some(i64::from(lhs >= rhs)),
+        // Float-only / nonsense for launch dims.
+        BinaryOp::Fdiv => {
+            return Err(Error::Runtime {
+                message: "Fdiv (float division) in launch-size expression — launch dims must be integer".into(),
+            });
+        }
+        BinaryOp::Threefry => {
+            return Err(Error::Runtime {
+                message: "Threefry (PRNG) in launch-size expression — this is almost certainly a scheduler bug".into(),
+            });
         }
     };
 
@@ -223,17 +256,49 @@ fn eval_launch_expr(expr: &Arc<UOp>, vars: &HashMap<&str, i64>) -> Result<i64> {
         Op::Binary(op, lhs, rhs) => {
             checked_launch_binary(*op, eval_launch_expr(lhs, vars)?, eval_launch_expr(rhs, vars)?)
         }
-        Op::Unary(UnaryOp::Neg, src) => eval_launch_expr(src, vars)?
-            .checked_neg()
-            .ok_or_else(|| Error::Runtime { message: "invalid launch-size negation overflow".to_string() }),
-        Op::Unary(UnaryOp::Abs, src) => eval_launch_expr(src, vars)?
-            .checked_abs()
-            .ok_or_else(|| Error::Runtime { message: "invalid launch-size abs overflow".to_string() }),
+        Op::Unary(op, src) => checked_launch_unary(*op, eval_launch_expr(src, vars)?),
         Op::Cast { src, .. } | Op::BitCast { src, .. } | Op::After { passthrough: src, .. } => {
             eval_launch_expr(src, vars)
         }
         other => Err(Error::Runtime { message: format!("unsupported launch-size expression op: {other:?}") }),
     }
+}
+
+fn checked_launch_unary(op: UnaryOp, src: i64) -> Result<i64> {
+    // EXHAUSTIVE match (no `_` catch-all) so a new `UnaryOp` variant fails the
+    // build instead of silently corrupting launch dims. See the analogous
+    // comment on `checked_launch_binary` for the longer rationale.
+    let value: Option<i64> = match op {
+        UnaryOp::Neg => src.checked_neg(),
+        UnaryOp::Abs => src.checked_abs(),
+        UnaryOp::Not => Some(!src),
+        UnaryOp::Sign => Some(src.signum()),
+        UnaryOp::Square => src.checked_mul(src),
+        // For integer launch dims `trunc/floor/ceil/round` are identity since
+        // the input is already an integer. Tinygrad's `sym_infer` collapses
+        // these via the rewrite engine; the explicit arms here are the same
+        // outcome.
+        UnaryOp::Trunc | UnaryOp::Floor | UnaryOp::Ceil | UnaryOp::Round => Some(src),
+        // Float-only — these have no meaning on integer launch dims and would
+        // never reach here from a correct schedule.
+        UnaryOp::Sqrt
+        | UnaryOp::Rsqrt
+        | UnaryOp::Exp
+        | UnaryOp::Exp2
+        | UnaryOp::Log
+        | UnaryOp::Log2
+        | UnaryOp::Sin
+        | UnaryOp::Cos
+        | UnaryOp::Tan
+        | UnaryOp::Reciprocal
+        | UnaryOp::Erf => {
+            return Err(Error::Runtime {
+                message: format!("float-only unary op {op:?} in launch-size expression — schedule bug"),
+            });
+        }
+    };
+
+    value.ok_or_else(|| Error::Runtime { message: format!("invalid launch-size unary arithmetic: {op:?} {src}") })
 }
 
 fn eval_launch_size(size: &[Arc<UOp>; 3], vars: &HashMap<&str, i64>) -> Result<[usize; 3]> {
@@ -606,28 +671,30 @@ impl ProgramSpec {
         (axis < 3).then_some((kind, axis))
     }
 
-    fn is_const_one(uop: &Arc<UOp>) -> bool {
-        matches!(uop.op(), Op::Const(value) if matches!(value.0, ConstValue::Int(1) | ConstValue::UInt(1)))
-    }
-
-    fn has_non_default_launch_dims(&self) -> bool {
-        !self.global_size.iter().all(Self::is_const_one)
-            || !matches!(&self.local_size, Some(local) if local.iter().all(Self::is_const_one))
-    }
-
     fn extract_param_slot_from_index(index: &Arc<UOp>) -> Option<usize> {
-        fn slot_from_buffer(buffer: &Arc<UOp>) -> Option<usize> {
-            if let Op::Param { slot, device: None, .. } = buffer.op() { Some(*slot) } else { None }
-        }
-
-        match index.op() {
-            Op::Index { buffer, .. } => slot_from_buffer(buffer),
-            Op::Cast { src, .. } => match src.op() {
-                Op::Index { buffer, .. } => slot_from_buffer(buffer),
+        /// Walk an arbitrary UOp expression chasing the underlying `Op::Param` slot.
+        /// Handles passthroughs (`Cast`, `Bitcast`), and vector wrappers
+        /// (`Vectorize` with all-identical `Param` elements, `Gep` into such a
+        /// vector). Devectorize doesn't always eliminate vectorized PARAM
+        /// pointers (e.g. scatter stores at `cpu/ops.rs:15-18`), so a kernel's
+        /// output `Op::Store` may have an `index` whose `buffer` is a
+        /// `Vectorize` of N copies of the same `Op::Param`. Tinygrad's
+        /// equivalent metadata derivation looks through these wrappers too —
+        /// here we mirror that behavior.
+        fn walk(uop: &Arc<UOp>) -> Option<usize> {
+            match uop.op() {
+                Op::Param { slot, device: None, .. } => Some(*slot),
+                Op::Index { buffer, .. } => walk(buffer),
+                Op::Cast { src, .. } | Op::BitCast { src, .. } => walk(src),
+                Op::Gep { vector, .. } => walk(vector),
+                Op::Vectorize { elements } => {
+                    let first = walk(elements.first()?)?;
+                    elements.iter().skip(1).all(|e| walk(e) == Some(first)).then_some(first)
+                }
                 _ => None,
-            },
-            _ => None,
+            }
         }
+        walk(index)
     }
 
     fn derive_metadata_from_sink(sink: &Arc<UOp>) -> DerivedProgramMetadata {
@@ -755,9 +822,19 @@ impl ProgramSpec {
         spec.outs = meta.as_ref().map(|m| m.outs.clone()).filter(|outs| !outs.is_empty()).unwrap_or(derived.outs);
         spec.ins = meta.as_ref().map(|m| m.ins.clone()).filter(|ins| !ins.is_empty()).unwrap_or(derived.ins);
         spec.buf_count = meta.as_ref().map(|m| m.buf_count).filter(|count| *count > 0).unwrap_or(spec.globals.len());
-        let meta_launch = meta.as_ref().filter(|m| m.has_non_default_launch_dims());
-        spec.global_size = meta_launch.map(|m| m.global_size.clone()).unwrap_or(derived.global_size);
-        spec.local_size = meta_launch.map(|m| m.local_size.clone()).unwrap_or(derived.local_size);
+        // Launch dims: always derive from the SPECIAL UOps in the SINK,
+        // ignoring any upstream `meta` value. Tinygrad does the same
+        // (`uop/ops.py:1043-1046` — `ProgramInfo.from_sink` iterates SPECIAL
+        // and sets `special_size[name_suffix] = end`). Keeping a meta override
+        // here causes a dispatch-vs-IR mismatch: the meta-supplied
+        // `global_size` is in kernel-name positional order ([g_x_size,
+        // g_y_size]) but the SPECIAL UOps (post-gpudims `reverse=true`) may
+        // assign axes to gidx in the opposite order, so the AQL/PM4 dispatch
+        // packet ends up with grid_size_x grid_size_y swapped relative to
+        // what the LLVM IR's `workgroup.id.x` / `workgroup.id.y` use —
+        // manifests as a 21× OOB on `r_g1375g64...` (`Phase 10/11`).
+        spec.global_size = derived.global_size;
+        spec.local_size = derived.local_size;
 
         Ok(spec)
     }

@@ -104,6 +104,22 @@ pub enum RawBuffer {
         data: UnsafeCell<UnifiedSlice<u8>>,
         device: Arc<CudaContext>,
     },
+    /// AMD GPU VRAM/GTT buffer allocated via KFD ioctls.
+    ///
+    /// `gpu_addr` is the GPU virtual address that kernels see in their
+    /// kernarg slot. `host_ptr` is `Some(_)` only when `cpu_accessible`; the
+    /// pointer is a host-side mmap of the same buffer, suitable for memcpy.
+    /// `handle` is KFD's opaque allocation handle, used for the matching
+    /// free/unmap ioctls. `device` keeps the underlying KFD/DRM fds alive
+    /// for the lifetime of the buffer.
+    #[cfg(target_os = "linux")]
+    AmdDevice {
+        gpu_addr: u64,
+        host_ptr: Option<std::ptr::NonNull<u8>>,
+        size: usize,
+        handle: u64,
+        device: std::sync::Arc<crate::amd::AmdDevice>,
+    },
 }
 
 // SAFETY: RawBuffer access is synchronized by the scheduler at a higher level.
@@ -127,6 +143,13 @@ impl std::fmt::Debug for RawBuffer {
             RawBuffer::CudaUnified { device, .. } => {
                 f.debug_struct("CudaUnified").field("device", device).finish_non_exhaustive()
             }
+            #[cfg(target_os = "linux")]
+            RawBuffer::AmdDevice { gpu_addr, size, host_ptr, .. } => f
+                .debug_struct("AmdDevice")
+                .field("gpu_addr", gpu_addr)
+                .field("size", size)
+                .field("cpu_accessible", &host_ptr.is_some())
+                .finish_non_exhaustive(),
         }
     }
 }
@@ -142,6 +165,8 @@ impl RawBuffer {
             RawBuffer::CudaDevice { data, .. } => unsafe { (&*data.get()).len() },
             #[cfg(feature = "cuda")]
             RawBuffer::CudaUnified { data, .. } => unsafe { (&*data.get()).len() },
+            #[cfg(target_os = "linux")]
+            RawBuffer::AmdDevice { size, .. } => *size,
         }
     }
 
@@ -154,6 +179,8 @@ impl RawBuffer {
             RawBuffer::CudaDevice { .. } => false,
             #[cfg(feature = "cuda")]
             RawBuffer::CudaUnified { .. } => true,
+            #[cfg(target_os = "linux")]
+            RawBuffer::AmdDevice { host_ptr, .. } => host_ptr.is_some(),
         }
     }
 }
@@ -392,6 +419,19 @@ impl Allocator for LruAllocator {
                         unsafe { (*data.get()).fill(0) };
                     }
                     RawBuffer::Mmap { .. } => panic!("DISK device is read-only: cannot zero-init mmap buffer"),
+                    #[cfg(target_os = "linux")]
+                    RawBuffer::AmdDevice { host_ptr: Some(ptr), size, .. } => {
+                        // SAFETY: Buffer just retrieved from cache; no other references.
+                        unsafe { std::ptr::write_bytes(ptr.as_ptr(), 0, *size) };
+                    }
+                    #[cfg(target_os = "linux")]
+                    RawBuffer::AmdDevice { host_ptr: None, .. } => {
+                        // Device-only AMD VRAM: SDMA memset lands in Phase 5.
+                        // For now, drop the cached buffer and force a fresh
+                        // KFD alloc — never silently hand back un-zeroed data.
+                        drop(buffer);
+                        return self.inner.alloc(size, options);
+                    }
                     #[cfg(feature = "cuda")]
                     RawBuffer::CudaDevice { data, device } => {
                         let cuda_data = unsafe { &mut *data.get() };
@@ -421,10 +461,25 @@ impl Allocator for LruAllocator {
     fn free(&self, buffer: RawBuffer, options: &BufferOptions) {
         let key = CacheKey { size: buffer.size(), cpu_accessible: options.cpu_accessible };
 
-        let mut cache = self.cache.lock().unwrap();
-        let buffers = cache.entry(key).or_default();
-        if buffers.len() < self.max_buffers_per_size {
-            buffers.push(buffer);
+        // Push onto the per-key cache if space remains. When the cache is
+        // full, route the overflow through `inner.free` so the underlying
+        // allocator can actually release the handle. Without this, AMD/CUDA
+        // backends leak the GPU mapping (RawBuffer has no Drop). Mirrors
+        // tinygrad's `HCQAllocatorBase._free` eviction path
+        // (`hcq.py:564-568`), which is also where tinygrad synchronizes the
+        // device timeline before tearing down the GPU pagetable entries.
+        let overflow = {
+            let mut cache = self.cache.lock().unwrap();
+            let buffers = cache.entry(key).or_default();
+            if buffers.len() < self.max_buffers_per_size {
+                buffers.push(buffer);
+                None
+            } else {
+                Some(buffer)
+            }
+        };
+        if let Some(buf) = overflow {
+            self.inner.free(buf, options);
         }
     }
 

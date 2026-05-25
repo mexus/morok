@@ -48,4 +48,21 @@ pub enum Error {
     /// CUDA-specific errors.
     #[snafu(display("CUDA error: {source}"))]
     CudaError { source: cudarc::driver::DriverError },
+
+    /// AMD GPU not present (no `/dev/kfd`, empty topology, permission denied,
+    /// or selected device index out of range).
+    #[snafu(display("no AMD GPU available: {reason}"))]
+    NoAmdGpu { reason: String },
+
+    /// AMD KFD ioctl failure.
+    #[snafu(display("AMD ioctl {ioctl} failed (errno {errno})"))]
+    AmdIoctl { ioctl: &'static str, errno: i32 },
+
+    /// AMD allocation failure (VRAM exhaustion, BAR-resize required, etc.).
+    #[snafu(display("AMD allocation failed: {reason}"))]
+    AmdAllocFailed { reason: String },
+
+    /// Device requested but unavailable on this host (wrong OS, missing libs).
+    #[snafu(display("device unavailable: {reason}"))]
+    DeviceUnavailable { reason: String },
 }

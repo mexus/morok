@@ -223,6 +223,33 @@ impl Buffer {
                 Ok(bytes)
             }
             RawBuffer::Mmap { data, .. } => Ok(&data[self.offset..self.offset + self.size]),
+            #[cfg(target_os = "linux")]
+            RawBuffer::AmdDevice { host_ptr: Some(ptr), .. } => {
+                // SAFETY: same invariants as the CPU arm — scheduler ensures
+                // exclusivity, and the BAR-backed VRAM mapping is valid for
+                // the lifetime of the RawBuffer.
+                let base = unsafe { ptr.as_ptr().add(self.offset) };
+                Ok(unsafe { std::slice::from_raw_parts(base, self.size) })
+            }
+            #[cfg(target_os = "linux")]
+            RawBuffer::AmdDevice { host_ptr: None, gpu_addr, size, .. } => {
+                // Diagnostic: this is the path that fires when a buffer was
+                // alloc'd with `cpu_accessible: false` (no host mmap). The
+                // public Tensor / runtime path always uses
+                // `BufferOptions::default()` (cpu_accessible: true), so any
+                // hit here is a regression in some downstream allocation path.
+                tracing::warn!(
+                    buffer_id = self.id.0,
+                    storage_id = self.data.storage_id.0,
+                    gpu_addr = *gpu_addr,
+                    full_size = *size,
+                    view_offset = self.offset,
+                    view_size = self.size,
+                    allocator = self.data.allocator.name(),
+                    "AMD buffer alloc'd without cpu_accessible=true; CPU read will fail"
+                );
+                NotCpuAccessibleSnafu.fail()
+            }
             #[cfg(feature = "cuda")]
             _ => NotCpuAccessibleSnafu.fail(),
         }
@@ -250,6 +277,13 @@ impl Buffer {
             }
             // Mmap is read-only — no mutable access
             RawBuffer::Mmap { .. } => NotCpuAccessibleSnafu.fail(),
+            #[cfg(target_os = "linux")]
+            RawBuffer::AmdDevice { host_ptr: Some(ptr), .. } => {
+                let base = unsafe { ptr.as_ptr().add(self.offset) };
+                Ok(unsafe { std::slice::from_raw_parts_mut(base, self.size) })
+            }
+            #[cfg(target_os = "linux")]
+            RawBuffer::AmdDevice { host_ptr: None, .. } => NotCpuAccessibleSnafu.fail(),
             #[cfg(feature = "cuda")]
             _ => NotCpuAccessibleSnafu.fail(),
         }
@@ -283,6 +317,28 @@ impl Buffer {
                 let typed = unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const T, count) };
                 ndarray::ArrayViewD::from_shape(ndarray::IxDyn(&self.shape), typed).context(NdarrayShapeSnafu)
             }
+            #[cfg(target_os = "linux")]
+            RawBuffer::AmdDevice { host_ptr: Some(ptr), .. } => {
+                let bytes_ptr = unsafe { ptr.as_ptr().add(self.offset) } as *const T;
+                let count = self.size / T::DTYPE.bytes();
+                let typed = unsafe { std::slice::from_raw_parts(bytes_ptr, count) };
+                ndarray::ArrayViewD::from_shape(ndarray::IxDyn(&self.shape), typed).context(NdarrayShapeSnafu)
+            }
+            #[cfg(target_os = "linux")]
+            RawBuffer::AmdDevice { host_ptr: None, gpu_addr, size, .. } => {
+                tracing::warn!(
+                    buffer_id = self.id.0,
+                    storage_id = self.data.storage_id.0,
+                    gpu_addr = *gpu_addr,
+                    full_size = *size,
+                    view_offset = self.offset,
+                    view_size = self.size,
+                    requested_dtype = ?T::DTYPE,
+                    allocator = self.data.allocator.name(),
+                    "AMD buffer alloc'd without cpu_accessible=true; as_array() will fail"
+                );
+                NotCpuAccessibleSnafu.fail()
+            }
             #[cfg(feature = "cuda")]
             _ => NotCpuAccessibleSnafu.fail(),
         }
@@ -310,6 +366,15 @@ impl Buffer {
                 let typed = unsafe { std::slice::from_raw_parts_mut(bytes.as_mut_ptr() as *mut T, count) };
                 ndarray::ArrayViewMutD::from_shape(ndarray::IxDyn(&self.shape), typed).context(NdarrayShapeSnafu)
             }
+            #[cfg(target_os = "linux")]
+            RawBuffer::AmdDevice { host_ptr: Some(ptr), .. } => {
+                // SAFETY: BAR-backed VRAM mapping is valid for the buffer's
+                // lifetime; scheduler ensures no concurrent kernel writes.
+                let bytes_ptr = unsafe { ptr.as_ptr().add(self.offset) } as *mut T;
+                let count = self.size / T::DTYPE.bytes();
+                let typed = unsafe { std::slice::from_raw_parts_mut(bytes_ptr, count) };
+                ndarray::ArrayViewMutD::from_shape(ndarray::IxDyn(&self.shape), typed).context(NdarrayShapeSnafu)
+            }
             _ => NotCpuAccessibleSnafu.fail(),
         }
     }
@@ -326,6 +391,12 @@ impl Buffer {
                 let bytes = unsafe { &(&(*data.get()))[self.offset..self.offset + self.size] };
                 let count = bytes.len() / T::DTYPE.bytes();
                 Ok(unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const T, count) })
+            }
+            #[cfg(target_os = "linux")]
+            RawBuffer::AmdDevice { host_ptr: Some(ptr), .. } => {
+                let bytes_ptr = unsafe { ptr.as_ptr().add(self.offset) } as *const T;
+                let count = self.size / T::DTYPE.bytes();
+                Ok(unsafe { std::slice::from_raw_parts(bytes_ptr, count) })
             }
             _ => NotCpuAccessibleSnafu.fail(),
         }
@@ -403,6 +474,18 @@ impl Buffer {
                 Ok(())
             }
             RawBuffer::Mmap { .. } => panic!("DISK device is read-only: copyin not supported"),
+            #[cfg(target_os = "linux")]
+            RawBuffer::AmdDevice { host_ptr: Some(ptr), .. } => {
+                // SAFETY: scheduler exclusivity contract; offset+size bounded
+                // by `expected == actual` check above.
+                let dst = unsafe { std::slice::from_raw_parts_mut(ptr.as_ptr().add(self.offset), self.size) };
+                dst.copy_from_slice(src);
+                Ok(())
+            }
+            #[cfg(target_os = "linux")]
+            RawBuffer::AmdDevice { host_ptr: None, .. } => {
+                todo!("Phase 5: copyin into device-only AMD VRAM via SDMA")
+            }
             #[cfg(feature = "cuda")]
             RawBuffer::CudaDevice { data, device } => {
                 // SAFETY: Scheduler guarantees exclusive access
@@ -441,6 +524,16 @@ impl Buffer {
             RawBuffer::Mmap { data, .. } => {
                 dst.copy_from_slice(&data[self.offset..self.offset + self.size]);
                 Ok(())
+            }
+            #[cfg(target_os = "linux")]
+            RawBuffer::AmdDevice { host_ptr: Some(ptr), .. } => {
+                let src_slice = unsafe { std::slice::from_raw_parts(ptr.as_ptr().add(self.offset), self.size) };
+                dst.copy_from_slice(src_slice);
+                Ok(())
+            }
+            #[cfg(target_os = "linux")]
+            RawBuffer::AmdDevice { host_ptr: None, .. } => {
+                todo!("Phase 5: copyout from device-only AMD VRAM via SDMA")
             }
             #[cfg(feature = "cuda")]
             RawBuffer::CudaDevice { data, device } => {
@@ -496,6 +589,35 @@ impl Buffer {
             }
             // Mmap as destination is not supported (read-only)
             (RawBuffer::Mmap { .. }, _) => panic!("DISK device is read-only: copy_from not supported"),
+            // AMD ↔ CPU via host_ptr; SDMA paths for device-only deferred to Phase 5.
+            #[cfg(target_os = "linux")]
+            (RawBuffer::AmdDevice { host_ptr: Some(dst_ptr), .. }, RawBuffer::Cpu { data: src_data, .. }) => {
+                let dst = unsafe { std::slice::from_raw_parts_mut(dst_ptr.as_ptr().add(self.offset), self.size) };
+                let src_ref = unsafe { &*src_data.get() };
+                dst.copy_from_slice(&src_ref[src.offset..src.offset + src.size]);
+                Ok(())
+            }
+            #[cfg(target_os = "linux")]
+            (RawBuffer::Cpu { data: dst_data, .. }, RawBuffer::AmdDevice { host_ptr: Some(src_ptr), .. }) => {
+                let dst_mut = unsafe { &mut *dst_data.get() };
+                let src_slice = unsafe { std::slice::from_raw_parts(src_ptr.as_ptr().add(src.offset), src.size) };
+                dst_mut[self.offset..self.offset + self.size].copy_from_slice(src_slice);
+                Ok(())
+            }
+            #[cfg(target_os = "linux")]
+            (
+                RawBuffer::AmdDevice { host_ptr: Some(dst_ptr), .. },
+                RawBuffer::AmdDevice { host_ptr: Some(src_ptr), .. },
+            ) => {
+                let dst = unsafe { std::slice::from_raw_parts_mut(dst_ptr.as_ptr().add(self.offset), self.size) };
+                let src_slice = unsafe { std::slice::from_raw_parts(src_ptr.as_ptr().add(src.offset), src.size) };
+                dst.copy_from_slice(src_slice);
+                Ok(())
+            }
+            #[cfg(target_os = "linux")]
+            (RawBuffer::AmdDevice { .. }, _) | (_, RawBuffer::AmdDevice { .. }) => {
+                todo!("Phase 5: copy_from involving device-only AMD VRAM via SDMA")
+            }
             // CudaDevice -> CudaDevice
             #[cfg(feature = "cuda")]
             (
@@ -618,6 +740,13 @@ impl Buffer {
                 // Read-only mmap: writing through this pointer is UB.
                 unsafe { data.as_ptr().add(self.offset) as *mut u8 }
             }
+            #[cfg(target_os = "linux")]
+            RawBuffer::AmdDevice { gpu_addr, .. } => {
+                // GPU virtual address — what AMD kernels see in their kernarg
+                // buffer for buffer parameters. The CPU never dereferences
+                // this pointer; it's just stuffed into the kernarg slot.
+                (*gpu_addr as usize + self.offset) as *mut u8
+            }
             #[cfg(feature = "cuda")]
             RawBuffer::CudaDevice { .. } | RawBuffer::CudaUnified { .. } => {
                 // TODO: CUDA device memory support for kernels
@@ -641,6 +770,8 @@ impl Buffer {
                 unsafe { (*data.get()).as_ptr() as usize }
             }
             RawBuffer::Mmap { data, .. } => data.as_ptr() as usize,
+            #[cfg(target_os = "linux")]
+            RawBuffer::AmdDevice { gpu_addr, .. } => *gpu_addr as usize,
             #[cfg(feature = "cuda")]
             RawBuffer::CudaDevice { data, .. } => {
                 // For CUDA device memory, we use the CudaSlice's internal pointer

@@ -16,12 +16,39 @@ fn test_device_spec_parse() {
 }
 
 #[test]
+fn test_device_spec_parse_amd() {
+    assert_eq!(DeviceSpec::parse("AMD").unwrap(), DeviceSpec::Amd { device_id: 0 });
+    assert_eq!(DeviceSpec::parse("AMD:1").unwrap(), DeviceSpec::Amd { device_id: 1 });
+    assert_eq!(DeviceSpec::parse("hip:2").unwrap(), DeviceSpec::Amd { device_id: 2 });
+}
+
+#[test]
 fn test_device_spec_canonicalize() {
     assert_eq!(DeviceSpec::Cpu.canonicalize(), "CPU");
 
     #[cfg(feature = "cuda")]
     {
         assert_eq!(DeviceSpec::Cuda { device_id: 1 }.canonicalize(), "CUDA:1");
+    }
+
+    assert_eq!(DeviceSpec::Amd { device_id: 0 }.canonicalize(), "AMD:0");
+    assert_eq!(DeviceSpec::Amd { device_id: 2 }.canonicalize(), "AMD:2");
+}
+
+#[test]
+fn test_amd_device_open_returns_clean_result() {
+    // On hosts without AMD GPU: NoAmdGpu.
+    // On hosts with an unsupported arch (e.g. RDNA2/gfx1036): AmdAllocFailed.
+    // On hosts with a supported gfx target: Ok. Never panics; that's the
+    // load-bearing assertion.
+    use crate::error::Error;
+    match crate::registry::get_device("AMD:0") {
+        Ok(_)
+        | Err(Error::NoAmdGpu { .. })
+        | Err(Error::AmdAllocFailed { .. })
+        | Err(Error::AmdIoctl { .. })
+        | Err(Error::DeviceUnavailable { .. }) => {}
+        Err(other) => panic!("unexpected error variant: {other:?}"),
     }
 }
 

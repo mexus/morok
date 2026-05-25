@@ -25,6 +25,7 @@
 //! ```
 
 pub mod allocator;
+pub mod amd;
 pub mod buffer;
 pub mod device;
 pub mod error;
