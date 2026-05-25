@@ -10,10 +10,12 @@ use svod_ir::{DeviceSpec, SInt, UOp, shape::Shape};
 use crate::Tensor;
 use crate::error::*;
 use crate::tensor_registry;
+use svod_dtype::default_device::default_device;
 
 #[bon]
 impl Tensor {
-    /// Create tensor from slice on CPU (default device).
+    /// Create tensor from slice on the active default device (CPU unless
+    /// overridden via `set_default_device` or the `SVOD_DEVICE` env var).
     ///
     /// # Examples
     /// ```
@@ -26,7 +28,7 @@ impl Tensor {
             unsafe { std::slice::from_raw_parts(source.as_ptr() as *const u8, source.len() * T::DTYPE.bytes()) },
             &[source.len()],
             T::DTYPE,
-            DeviceSpec::Cpu,
+            default_device(),
         )
     }
 
@@ -34,7 +36,7 @@ impl Tensor {
     #[builder]
     pub fn from_slice_with<T: HasDType, C: AsRef<[T]>>(
         source: C,
-        #[builder(default = DeviceSpec::Cpu)] device: DeviceSpec,
+        #[builder(default = default_device())] device: DeviceSpec,
     ) -> Self {
         let source = source.as_ref();
         Self::from_bytes_shaped(
@@ -51,6 +53,9 @@ impl Tensor {
     ///
     /// Builds the buffer UOp with the target shape directly — no reshape,
     /// so the returned tensor retains its buffer for zero-copy `array_view`.
+    /// Routes to whichever allocator the registry returns for `device`; for
+    /// AMD this means data is mmapped through the host-visible VRAM aperture
+    /// and the GPU sees the buffer directly.
     fn from_bytes_shaped(bytes: &[u8], shape: &[usize], dtype: DType, device: DeviceSpec) -> Self {
         let numel: usize = shape.iter().product();
         let ir_shape = Shape::from_iter(shape.iter().map(|&d| SInt::Const(d)));
@@ -58,10 +63,12 @@ impl Tensor {
         let buffer_uop = UOp::new_buffer(device.clone(), numel, dtype.clone());
         let buffer_uop_id = buffer_uop.id;
 
-        let allocator = match &device {
-            DeviceSpec::Cpu => registry::cpu().expect("CPU always should be accessible"),
-            _ => registry::cpu().expect("CPU fallback for unsupported device"),
-        };
+        let allocator = registry::registry().get(&device).unwrap_or_else(|e| {
+            panic!(
+                "Failed to get allocator for {device:?}: {e}\n\
+                 Hint: set SVOD_DEVICE=CPU (or unset it) to fall back to the CPU backend."
+            )
+        });
 
         let mut buffer = Buffer::new(allocator, dtype.clone(), shape.to_vec(), Default::default());
         buffer.copyin(bytes).expect("Buffer write always successful");
@@ -92,7 +99,7 @@ impl Tensor {
                 ),
             });
         }
-        Ok(Self::from_bytes_shaped(data, shape, dtype, DeviceSpec::Cpu))
+        Ok(Self::from_bytes_shaped(data, shape, dtype, default_device()))
     }
 
     /// Create tensor from an ndarray (owned `Array` or `ArrayView`).
@@ -128,13 +135,13 @@ impl Tensor {
         if let Some(slice) = array.as_slice() {
             let bytes =
                 unsafe { std::slice::from_raw_parts(slice.as_ptr() as *const u8, slice.len() * T::DTYPE.bytes()) };
-            Self::from_bytes_shaped(bytes, &shape, T::DTYPE, DeviceSpec::Cpu)
+            Self::from_bytes_shaped(bytes, &shape, T::DTYPE, default_device())
         } else {
             // Slow path: Fortran-order or non-contiguous — collect in logical order
             let data: Vec<T> = array.iter().cloned().collect();
             let bytes =
                 unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * T::DTYPE.bytes()) };
-            Self::from_bytes_shaped(bytes, &shape, T::DTYPE, DeviceSpec::Cpu)
+            Self::from_bytes_shaped(bytes, &shape, T::DTYPE, default_device())
         }
     }
 

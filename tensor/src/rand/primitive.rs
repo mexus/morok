@@ -26,12 +26,13 @@ use crate::{Error, Result, Tensor, UOpSnafu};
 use super::state;
 
 impl Tensor {
-    /// Uniform `[0, 1)` random tensor with float32 dtype on the default CPU device.
+    /// Uniform `[0, 1)` random tensor with float32 dtype on the active default
+    /// device (CPU unless overridden via `set_default_device` or `SVOD_DEVICE`).
     ///
     /// THREEFRY-backed; deterministic for a fixed seed (set via
     /// [`crate::rand::manual_seed`]).
     pub fn rand(shape: &[usize]) -> Result<Tensor> {
-        Self::rand_with(shape, DType::Float32, DeviceSpec::Cpu)
+        Self::rand_with(shape, DType::Float32, svod_dtype::default_device::default_device())
     }
 
     /// Variant of [`Tensor::rand`] with explicit dtype and device.

@@ -1164,7 +1164,7 @@ fn prepare_execution_plan(
             .iter()
             .flat_map(|item| item.buffers.iter().map(|b| b.allocator().device_spec()))
             .find(|spec| !spec.is_disk())
-            .unwrap_or(DeviceSpec::Cpu);
+            .unwrap_or_else(svod_dtype::default_device::default_device);
         config.resolve_device(&device_spec, alloc_registry)?
     } else {
         return EmptyScheduleSnafu.fail();
@@ -1340,7 +1340,7 @@ fn prepare_execution_plan(
             .iter()
             .map(|b| b.allocator().device_spec())
             .find(|spec| !spec.is_disk())
-            .unwrap_or(DeviceSpec::Cpu);
+            .unwrap_or_else(svod_dtype::default_device::default_device);
         let item_device = config.resolve_device(&item_device_spec, alloc_registry)?;
         let item_codegen: &'static str = item_device.compiler.cache_key();
 
@@ -1569,7 +1569,7 @@ pub(crate) fn resolve_codegen(param_buffers: &[(u64, Arc<UOp>)], config: &Prepar
                 (!spec.is_disk()).then_some(spec.clone())
             })
         })
-        .unwrap_or(DeviceSpec::Cpu);
+        .unwrap_or_else(svod_dtype::default_device::default_device);
     let device = config.resolve_device(&spec, alloc_registry)?;
     Ok(device.compiler.cache_key())
 }
@@ -1586,6 +1586,10 @@ fn get_optimizer_renderer(device: &Device) -> svod_schedule::OptimizerRenderer {
         }
         DeviceSpec::Cuda { .. } => svod_schedule::OptimizerRenderer::cuda(),
         DeviceSpec::Metal { .. } => svod_schedule::OptimizerRenderer::metal(),
+        // AMD shares the GPU optimizer profile with CUDA (work-item/group
+        // splits, local-memory friendly). A dedicated AMD optimizer profile
+        // is a Phase 1 follow-up if benchmarks diverge.
+        DeviceSpec::Amd { .. } => svod_schedule::OptimizerRenderer::cuda(),
         _ => svod_schedule::OptimizerRenderer::cpu(),
     }
 }

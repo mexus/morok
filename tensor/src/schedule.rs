@@ -17,7 +17,7 @@ use std::sync::Arc;
 use svod_device::Buffer;
 use svod_device::device::Device;
 use svod_device::registry;
-use svod_dtype::{DType, DeviceSpec};
+use svod_dtype::DType;
 use svod_ir::{Op, UOp};
 use tracing::{debug, trace};
 
@@ -874,8 +874,15 @@ fn find_first_input_buffer_device(
         }
     }
 
-    // Fallback to CPU if no input buffers found
-    svod_runtime::DEVICE_FACTORIES.device(&DeviceSpec::Cpu, alloc_registry).context(DeviceFactorySnafu)
+    // Fallback to the active default device if no input buffers found. Routes
+    // to `SVOD_DEVICE` / `set_default_device` instead of always picking CPU,
+    // so JIT placeholders (`Tensor::zeros` + `realize`) materialize on the
+    // current target. Critical for ending up with a uniform device per
+    // kernel (otherwise `KernelSplitMixedDevices` fires when AMD weights meet
+    // a CPU-allocated placeholder).
+    svod_runtime::DEVICE_FACTORIES
+        .device(&svod_dtype::default_device::default_device(), alloc_registry)
+        .context(DeviceFactorySnafu)
 }
 
 /// Collect buffers for a callable from its sources.

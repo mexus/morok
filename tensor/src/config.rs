@@ -49,6 +49,7 @@ impl DeviceResolver for CpuBackendResolver {
 /// Instead of relying on the `SVOD_CPU_BACKEND` env var (global mutable state),
 /// the backend is selected per-call via a [`DeviceResolver`].
 #[allow(rustdoc::private_intra_doc_links)]
+#[derive(Clone)]
 pub struct PrepareConfig {
     pub optimizer: OptimizerConfig,
     pub(crate) resolver: Arc<dyn DeviceResolver>,
@@ -77,6 +78,10 @@ impl Default for PrepareConfig {
 impl PrepareConfig {
     /// Read both `SVOD_CPU_BACKEND` and optimizer env vars.
     pub fn from_env() -> Self {
+        // Re-resolve `SVOD_DEVICE` through the registry parser so all
+        // consumers (tensor construction, schedule rangeify, runtime factory)
+        // see the same canonical DeviceSpec value.
+        normalize_default_device_from_env();
         Self { optimizer: OptimizerConfig::from_env(), resolver: Arc::new(EnvResolver), disable_schedule_cache: false }
     }
 
@@ -93,6 +98,70 @@ impl PrepareConfig {
         }
     }
 
+    /// AMD variant for the `codegen_tests!` macro: returns `Some(_)` only
+    /// when this host has a [supported](svod_dtype::AmdArch) AMD GPU
+    /// (RDNA3 + CDNA). On other hosts the macro's `amd::*` tests skip with
+    /// a clear message.
+    ///
+    /// **Status**: the AMD realize pipeline (CPU→VRAM staging + dispatch +
+    /// result copy-back) is not yet wired in `realize.rs`; until it is, this
+    /// function returns `None` even on supported hardware. The macro
+    /// scaffold is in place so that flipping the pipeline integration is a
+    /// one-line change here.
+    #[cfg(target_os = "linux")]
+    pub fn for_amd_if_available() -> Option<Self> {
+        // Detect supported AMD device. Returns None when the host has no
+        // /dev/kfd, no GPU nodes, or only unsupported gfx targets.
+        let _arch = amd_test_arch()?;
+        // TODO(phase 7.1): swap to an AmdBackendResolver once realize.rs
+        // supports cross-device buffer staging. Returning None for now means
+        // the codegen_tests!::amd variant always skips on this host — by
+        // design, not a bug.
+        None
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub fn for_amd_if_available() -> Option<Self> {
+        None
+    }
+}
+
+/// Detect a supported AMD GPU on this host. Returns the gfx-family arch of
+/// device 0 when (a) `/dev/kfd` exists, (b) KFD topology has a GPU node, and
+/// (c) the gfx target maps to one of `AmdArch`'s supported families
+/// (RDNA3 + CDNA).
+#[cfg(target_os = "linux")]
+pub fn amd_test_arch() -> Option<svod_dtype::AmdArch> {
+    let nodes = svod_device::amd::topology::enumerate();
+    nodes.into_iter().find_map(|n| svod_dtype::AmdArch::from_gfx_target_version(n.gfx_target_version))
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn amd_test_arch() -> Option<svod_dtype::AmdArch> {
+    None
+}
+
+/// If `SVOD_DEVICE` is set and svod-dtype parsed it with a placeholder
+/// arch, re-parse it via the registry (which queries KFD topology) and
+/// override the thread-local default device. Idempotent — safe to call from
+/// multiple `PrepareConfig::from_env` sites.
+fn normalize_default_device_from_env() {
+    use svod_device::registry::DeviceSpecExt;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let Ok(raw) = std::env::var("SVOD_DEVICE") else {
+        return;
+    };
+    let Ok(normalized) = <DeviceSpec as DeviceSpecExt>::parse(raw.trim()) else {
+        return;
+    };
+    svod_dtype::default_device::set_default_device(normalized);
+}
+
+impl PrepareConfig {
     /// Resolve a `DeviceSpec` into a `Device` using this config's resolver.
     pub(crate) fn resolve_device(&self, spec: &DeviceSpec, registry: &DeviceRegistry) -> crate::Result<Arc<Device>> {
         self.resolver.resolve(spec, registry)
@@ -172,6 +241,25 @@ macro_rules! codegen_tests {
                 let $config = $crate::PrepareConfig::for_cpu_backend($crate::CpuBackend::Llvm);
                 $body
             }
+
+            /// AMD variant — runs only when a supported AMD GPU is detected
+            /// on this host (RDNA3 + CDNA). On unsupported hardware or hosts
+            /// without `/dev/kfd` this test exits with a skip message rather
+            /// than a failure, so the unified test suite still runs on any
+            /// CI runner.
+            #[test]
+            $(#[$meta])*
+            fn amd() {
+                ::svod_schedule::testing::setup_test_tracing();
+                let $config = match $crate::PrepareConfig::for_amd_if_available() {
+                    Some(cfg) => cfg,
+                    None => {
+                        eprintln!("amd codegen_tests variant: skipped (no supported AMD GPU)");
+                        return;
+                    }
+                };
+                $body
+            }
         }
         $crate::codegen_tests!($($rest)*);
     };
@@ -221,6 +309,26 @@ macro_rules! codegen_tests {
                     Ok(())
                 }).unwrap();
             }
+
+            #[test]
+            #[allow(unused_parens)]
+            $(#[$meta])*
+            fn amd() {
+                ::svod_schedule::testing::setup_test_tracing();
+                let amd_cfg = match $crate::PrepareConfig::for_amd_if_available() {
+                    Some(cfg) => cfg,
+                    None => {
+                        eprintln!("amd codegen_tests variant: skipped (no supported AMD GPU)");
+                        return;
+                    }
+                };
+                let mut runner = $runner;
+                runner.run(&($($strategy),+), |($($param),+)| {
+                    let $config = amd_cfg.clone();
+                    $body
+                    Ok(())
+                }).unwrap();
+            }
         }
     };
 
@@ -248,6 +356,24 @@ macro_rules! codegen_tests {
                 fn $name($($param: $ty),+) {
                     ::svod_schedule::testing::setup_test_tracing();
                     let $config = $crate::PrepareConfig::for_cpu_backend($crate::CpuBackend::Llvm);
+                    $body
+                }
+            }
+            mod amd {
+                #[allow(unused_imports)]
+                use super::super::*;
+                use ::test_case::test_case;
+
+                $(#[$meta])*
+                fn $name($($param: $ty),+) {
+                    ::svod_schedule::testing::setup_test_tracing();
+                    let $config = match $crate::PrepareConfig::for_amd_if_available() {
+                        Some(cfg) => cfg,
+                        None => {
+                            eprintln!("amd codegen_tests variant: skipped (no supported AMD GPU)");
+                            return;
+                        }
+                    };
                     $body
                 }
             }

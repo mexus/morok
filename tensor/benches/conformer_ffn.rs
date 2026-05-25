@@ -119,6 +119,7 @@ fn bench_ffn(c: &mut Criterion) {
         for (i, prepared) in plan.prepared_kernels().into_iter().enumerate() {
             // Just the entry-point name; full code is huge.
             eprintln!("  k{i}: {}", prepared.kernel.entry_point);
+            println!("{}", prepared.ast.tree());
             println!("{}", prepared.kernel.code);
         }
 
