@@ -1,0 +1,266 @@
+//! AMD-specific UOp lowering.
+//!
+//! Intercepts AMD-only ops (`Special`, `Barrier`, `DefineLocal`, fp8 `Cast`,
+//! `Wmma`) and falls through to the CPU emitter for everything else. Tinygrad
+//! reference: `submodules/new_new_tinygrad/tinygrad/renderer/llvmir.py:208-289`.
+
+use std::sync::Arc;
+
+use svod_dtype::{DType, ScalarDType};
+use svod_ir::{Op, UnaryOp, prelude::*};
+
+use crate::llvm::amd::wmma;
+use crate::llvm::common::{LlvmTarget, RenderContext, ldt};
+use crate::llvm::cpu;
+
+/// Render a UOp to LLVM IR for the AMD target.
+///
+/// Returns `Some(())` when the op was handled (either AMD-specific or by
+/// delegating to [`cpu::render_uop`]); `None` for meta-ops that don't produce
+/// instructions.
+pub fn render_uop(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec<String>, target: LlvmTarget) -> Option<()> {
+    debug_assert!(target.is_amd(), "amd::render_uop called with non-AMD target {target:?}");
+    let arch = target.amd_arch().expect("AMD target");
+
+    match uop.op() {
+        // ── AMD-specific overrides ───────────────────────────────────────
+        Op::Special { name, .. } => render_special(uop, name, ctx, kernel),
+        Op::Barrier { .. } => render_barrier(kernel),
+        Op::DefineLocal(_) => render_define_local(uop, ctx, kernel),
+        Op::DefineReg { .. } => render_define_reg(uop, ctx, kernel),
+        Op::Wmma { a, b, c, metadata } => wmma::render_wmma_amd(uop, a, b, c, metadata, arch, ctx, kernel),
+        Op::Unary(UnaryOp::Sqrt, _) | Op::Unary(UnaryOp::Log2, _) | Op::Unary(UnaryOp::Exp2, _) => {
+            guard_unsupported_f64_transcendental(uop, ctx).or_else(|| cpu::render_uop(uop, ctx, kernel))
+        }
+        Op::Cast { src, .. } if is_fp8_cast(uop, src) => render_fp8_cast(uop, src, ctx, kernel),
+        // ── Everything else: shared CPU path (ALU, INDEX, LOAD, STORE, …) ─
+        _ => cpu::render_uop(uop, ctx, kernel),
+    }
+}
+
+// ── SPECIAL: workgroup / workitem / direct-global axis ────────────────────
+
+/// Parse a SPECIAL axis name: `'g'/'l'/'i'` prefix + 0/1/2 axis suffix.
+///
+/// Matches `device::ProgramSpec::special_launch_axis` (`device/src/device.rs:594`),
+/// which is the producer side for these strings.
+fn parse_special_axis(name: &str) -> Option<(char, u8)> {
+    let prefix = name.chars().next()?;
+    if !matches!(prefix, 'g' | 'l' | 'i') {
+        return None;
+    }
+    let suffix_start = name.rfind(|c: char| !c.is_ascii_digit()).map(|i| i + 1).unwrap_or(0);
+    if suffix_start == name.len() {
+        return None;
+    }
+    let axis: u8 = name[suffix_start..].parse().ok()?;
+    (axis < 3).then_some((prefix, axis))
+}
+
+const AXIS_LETTERS: [char; 3] = ['x', 'y', 'z'];
+
+fn render_special(uop: &Arc<UOp>, name: &str, ctx: &mut RenderContext, kernel: &mut Vec<String>) -> Option<()> {
+    let dst = ctx.name(uop);
+    let (kind, axis) = match parse_special_axis(name) {
+        Some(parsed) => parsed,
+        None => {
+            ctx.set_invalid_graph(format!("AMD renderer: malformed SPECIAL axis name {name:?}"));
+            return None;
+        }
+    };
+    let dim = AXIS_LETTERS[axis as usize];
+
+    match kind {
+        'g' => kernel.push(format!("  {dst} = tail call i32 @llvm.amdgcn.workgroup.id.{dim}()")),
+        'l' => kernel.push(format!("  {dst} = tail call i32 @llvm.amdgcn.workitem.id.{dim}()")),
+        'i' => {
+            // Direct-global axis: tinygrad emits `g*lsz + l`, but svod's
+            // ProgramSpec drops `local_size` entirely for `i` prefixes
+            // (`device/src/device.rs:660`). The kernel sees one flat axis,
+            // so workgroup.id.x suffices (workgroup_size_x = 1 in the AQL
+            // packet under DirectGlobal launch).
+            kernel.push(format!("  {dst} = tail call i32 @llvm.amdgcn.workgroup.id.{dim}()"));
+        }
+        _ => unreachable!(),
+    }
+    Some(())
+}
+
+// ── BARRIER: workgroup-scope fence + s.barrier ────────────────────────────
+
+fn render_barrier(kernel: &mut Vec<String>) -> Option<()> {
+    // Tinygrad `llvmir.py:209`.
+    kernel.push("  fence syncscope(\"workgroup\") release".to_string());
+    kernel.push("  tail call void @llvm.amdgcn.s.barrier()".to_string());
+    kernel.push("  fence syncscope(\"workgroup\") acquire".to_string());
+    Some(())
+}
+
+// ── DEFINE_LOCAL: addrspace(3) module-level global ────────────────────────
+
+fn render_define_local(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec<String>) -> Option<()> {
+    let dst = ctx.name(uop); // e.g. "%local42"
+    let id = match uop.op() {
+        Op::DefineLocal(id) => *id,
+        _ => unreachable!(),
+    };
+    let (base_dtype, size) = match uop.dtype() {
+        DType::Ptr { base, size, .. } => (base.as_ref().clone(), size.unwrap_or(1)),
+        other => (other, 1),
+    };
+    let base_ty = ldt(&base_dtype);
+    let global_name = format!("@local{id}");
+    // Declare the LDS-backed global at module scope.
+    ctx.push_module_prefix(format!(
+        "{global_name} = internal unnamed_addr addrspace(3) global [{size} x {base_ty}] undef, align 16"
+    ));
+    // Tinygrad addrspacecasts `addrspace(3) global → ptr` so downstream
+    // GEP/LOAD/STORE can use the generic `ptr` type (`llvmir.py:175-179`).
+    // Without this cast, GEP emits `getelementptr ..., ptr @local0, ...`
+    // which clang rejects (`@local0` is `ptr addrspace(3)`).
+    kernel.push(format!("  {dst} = addrspacecast ptr addrspace(3) {global_name} to ptr"));
+    Some(())
+}
+
+// ── DEFINE_REG: addrspace(5) alloca ───────────────────────────────────────
+//
+// AMDGPU LLVM requires alloca to live in `addrspace(5)` (private/scratch
+// memory) inside `amdgpu_kernel` functions. Tinygrad emits the alloca in
+// addrspace(5) implicitly via `target triple = amdgcn-amd-amdhsa` which
+// makes addrspace(5) the alloca default for that triple in some LLVM
+// versions. To be explicit (and avoid relying on backend-default
+// behavior), we emit it directly and addrspacecast to a generic pointer
+// for downstream GEP/LOAD/STORE.
+
+fn render_define_reg(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec<String>) -> Option<()> {
+    let dst = ctx.name(uop);
+    let (alloc_size, base) = match uop.dtype() {
+        DType::Ptr { size, base, .. } => (size.unwrap_or(1), ldt(&base)),
+        other => (1, ldt(&other)),
+    };
+    let raw = format!("{dst}.raw");
+    kernel.push(format!("  {raw} = alloca [{alloc_size} x {base}], align 4, addrspace(5)"));
+    kernel.push(format!("  {dst} = addrspacecast ptr addrspace(5) {raw} to ptr"));
+    Some(())
+}
+
+// ── FP8 CAST: amdgcn cvt intrinsics ───────────────────────────────────────
+
+fn is_fp8_cast(uop: &Arc<UOp>, src: &Arc<UOp>) -> bool {
+    let dst = uop.dtype();
+    let src_dt = src.dtype();
+    // Only handle scalar casts between FP8 and f32; vector lanes are decomposed
+    // upstream by the rangeify/devectorize passes.
+    matches!(
+        (dst.scalar(), src_dt.scalar()),
+        (Some(ScalarDType::FP8E4M3 | ScalarDType::FP8E5M2), Some(ScalarDType::Float32))
+            | (Some(ScalarDType::Float32), Some(ScalarDType::FP8E4M3 | ScalarDType::FP8E5M2))
+    ) && dst.vcount() == 1
+        && src_dt.vcount() == 1
+}
+
+fn render_fp8_cast(uop: &Arc<UOp>, src: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec<String>) -> Option<()> {
+    let dst_dt = uop.dtype();
+    let src_dt = src.dtype();
+    let dst_name = ctx.name(uop);
+    let src_name = ctx.get(src).to_string();
+
+    match (dst_dt.scalar(), src_dt.scalar()) {
+        // f32 → fp8 via inlined helper `@f32_to_fp8`.
+        (Some(d @ (ScalarDType::FP8E4M3 | ScalarDType::FP8E5M2)), Some(ScalarDType::Float32)) => {
+            let is_bf8 = matches!(d, ScalarDType::FP8E5M2);
+            kernel.push(format!(
+                "  {dst_name} = call i8 @f32_to_fp8(float {src_name}, i1 {})",
+                if is_bf8 { 1 } else { 0 }
+            ));
+        }
+        // fp8 → f32 via amdgcn cvt.
+        (Some(ScalarDType::Float32), Some(s @ (ScalarDType::FP8E4M3 | ScalarDType::FP8E5M2))) => {
+            let kind = if matches!(s, ScalarDType::FP8E5M2) { "bf8" } else { "fp8" };
+            let tmp = format!("{dst_name}_i32");
+            kernel.push(format!("  {tmp} = zext i8 {src_name} to i32"));
+            kernel.push(format!("  {dst_name} = call float @llvm.amdgcn.cvt.f32.{kind}(i32 {tmp}, i32 0)"));
+        }
+        _ => unreachable!("is_fp8_cast guard"),
+    }
+    Some(())
+}
+
+// ── Transcendentals: error on f64 paths until we wire xlog2/xexp2 ────────
+
+fn guard_unsupported_f64_transcendental(uop: &Arc<UOp>, ctx: &mut RenderContext) -> Option<()> {
+    if matches!(uop.dtype().scalar(), Some(ScalarDType::Float64))
+        && matches!(uop.op(), Op::Unary(UnaryOp::Log2, _) | Op::Unary(UnaryOp::Exp2, _))
+    {
+        ctx.set_invalid_graph(
+            "AMD renderer: @llvm.log2.f64/@llvm.exp2.f64 are not supported on amdgcn; \
+             apply the xlog2/xexp2 decomposition pass before rendering",
+        );
+        return Some(());
+    }
+    None
+}
+
+/// Module-level prefix lines required when the kernel uses fp8 conversions.
+/// Returns the verbatim `@f32_to_fp8` helper from tinygrad `llvmir.py:245-255`
+/// when any node in the linear list touches fp8, otherwise an empty string.
+pub fn fp8_helper_prefix(nodes: &[Arc<UOp>]) -> Option<&'static str> {
+    let uses_fp8 = nodes.iter().any(|n| {
+        let dt = n.dtype();
+        matches!(dt.scalar(), Some(ScalarDType::FP8E4M3 | ScalarDType::FP8E5M2))
+    });
+    if !uses_fp8 {
+        return None;
+    }
+    Some(FP8_HELPER)
+}
+
+/// Inlined f32 → fp8/bf8 conversion (verbatim port of tinygrad's helper at
+/// `submodules/new_new_tinygrad/tinygrad/renderer/llvmir.py:245-255`). The
+/// helper handles NaN/Inf preservation, clamping to the fp8 representable
+/// range, and packs via amdgcn `cvt.pk.{fp8,bf8}.f32`.
+const FP8_HELPER: &str = r#"define i8 @f32_to_fp8(float %val, i1 %is_bf8) {
+entry:
+  %ival = bitcast float %val to i32
+  %exp = and i32 %ival, 2139095040
+  %is_special = icmp eq i32 %exp, 2139095040
+  br i1 %is_special, label %select_clip, label %clip
+clip:
+  br i1 %is_bf8, label %bf8_clip, label %fp8_clip
+bf8_clip:
+  %clamped_bf8 = call float @llvm.amdgcn.fmed3.f32(float %val, float 57344.0, float -57344.0)
+  br label %select_clip
+fp8_clip:
+  %clamped_fp8 = call float @llvm.amdgcn.fmed3.f32(float %val, float 448.0, float -448.0)
+  br label %select_clip
+select_clip:
+  %phi_val = phi float [%val, %entry], [%clamped_bf8, %bf8_clip], [%clamped_fp8, %fp8_clip]
+  br i1 %is_bf8, label %do_bf8, label %do_fp8
+do_bf8:
+  %packed_bf8 = call i32 @llvm.amdgcn.cvt.pk.bf8.f32(float %phi_val, float %phi_val, i32 0, i1 false)
+  br label %exit
+do_fp8:
+  %packed_fp8 = call i32 @llvm.amdgcn.cvt.pk.fp8.f32(float %phi_val, float %phi_val, i32 0, i1 false)
+  br label %exit
+exit:
+  %packed = phi i32 [%packed_bf8, %do_bf8], [%packed_fp8, %do_fp8]
+  %trunc = trunc i32 %packed to i8
+  ret i8 %trunc
+}"#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_special_axis_g_l_i() {
+        assert_eq!(parse_special_axis("g0"), Some(('g', 0)));
+        assert_eq!(parse_special_axis("gidx0"), Some(('g', 0)));
+        assert_eq!(parse_special_axis("l1"), Some(('l', 1)));
+        assert_eq!(parse_special_axis("lidx2"), Some(('l', 2)));
+        assert_eq!(parse_special_axis("idx0"), Some(('i', 0)));
+        assert_eq!(parse_special_axis("foo"), None);
+        assert_eq!(parse_special_axis("g3"), None); // axis must be < 3
+        assert_eq!(parse_special_axis("g"), None); // missing digit
+    }
+}
