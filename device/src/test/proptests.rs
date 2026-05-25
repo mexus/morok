@@ -158,7 +158,7 @@ proptest! {
                 alloc.clone() as Arc<dyn Allocator>,
                 spec.dtype.clone(),
                 spec.shape.to_vec(),
-                BufferOptions { zero_init: false, cpu_accessible: false },
+                BufferOptions { zero_init: false, cpu_accessible: false, ..Default::default() },
             )?;
         }
 
@@ -170,7 +170,7 @@ proptest! {
             alloc.clone() as Arc<dyn Allocator>,
             spec.dtype.clone(),
             spec.shape.to_vec(),
-            BufferOptions { zero_init: true, cpu_accessible: false },
+            BufferOptions { zero_init: true, cpu_accessible: false, ..Default::default() },
         )?;
 
         // Cache should be empty (buffer was reused)

@@ -266,7 +266,7 @@ mod tests {
                 return;
             }
         };
-        let opts = BufferOptions { zero_init: true, cpu_accessible: true };
+        let opts = BufferOptions { zero_init: true, cpu_accessible: true, ..Default::default() };
         let buf = alloc.alloc(4096, &opts).expect("alloc 4 KiB");
         assert_eq!(buf.size(), 4096);
         assert!(buf.cpu_accessible());

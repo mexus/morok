@@ -672,7 +672,7 @@ fn create_queue(allocator: &AmdAllocator, queue_type: u32, ring_size: usize, aql
     let ctx_save_restore_size = wg_data_size + ctl_stack_size;
     let cwsr_buffer_size = (ctx_save_restore_size + debug_memory_size) * xccs;
     let cwsr_buffer_size = cwsr_buffer_size.next_multiple_of(0x1000);
-    let plain = BufferOptions { zero_init: false, cpu_accessible: false };
+    let plain = BufferOptions { zero_init: false, cpu_accessible: false, nolru: true, ..Default::default() };
     let eop_buf = allocator.alloc(0x1000, &plain)?;
     let ctx_buf = allocator.alloc(cwsr_buffer_size, &plain)?;
     if let crate::allocator::RawBuffer::AmdDevice { gpu_addr, .. } = &eop_buf {

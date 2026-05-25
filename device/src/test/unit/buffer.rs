@@ -81,7 +81,7 @@ fn test_unified_memory_allocation() {
         }
     };
 
-    let options = BufferOptions { cpu_accessible: true, zero_init: false };
+    let options = BufferOptions { cpu_accessible: true, zero_init: false, ..Default::default() };
     let buffer = Buffer::allocate(allocator, DType::Float32, vec![10], options).unwrap();
 
     assert!(buffer.is_allocated());
@@ -99,7 +99,7 @@ fn test_unified_memory_cpu_access() {
         }
     };
 
-    let options = BufferOptions { cpu_accessible: true, zero_init: false };
+    let options = BufferOptions { cpu_accessible: true, zero_init: false, ..Default::default() };
     let mut buffer = Buffer::allocate(allocator, DType::Float32, vec![10], options).unwrap();
 
     // Write data from CPU
@@ -127,7 +127,7 @@ fn test_unified_memory_view() {
         }
     };
 
-    let options = BufferOptions { cpu_accessible: true, zero_init: false };
+    let options = BufferOptions { cpu_accessible: true, zero_init: false, ..Default::default() };
     let buffer = Buffer::allocate(allocator, DType::Float32, vec![10], options).unwrap();
 
     // Create view into unified buffer
@@ -148,11 +148,11 @@ fn test_copy_device_to_unified() {
     };
 
     // Create device-only buffer
-    let device_opts = BufferOptions { cpu_accessible: false, zero_init: false };
+    let device_opts = BufferOptions { cpu_accessible: false, zero_init: false, ..Default::default() };
     let mut device_buf = Buffer::allocate(allocator.clone(), DType::Float32, vec![10], device_opts).unwrap();
 
     // Create unified buffer
-    let unified_opts = BufferOptions { cpu_accessible: true, zero_init: false };
+    let unified_opts = BufferOptions { cpu_accessible: true, zero_init: false, ..Default::default() };
     let mut unified_buf = Buffer::allocate(allocator, DType::Float32, vec![10], unified_opts).unwrap();
 
     // Write test data to device buffer
@@ -184,11 +184,11 @@ fn test_copy_unified_to_device() {
     };
 
     // Create unified buffer
-    let unified_opts = BufferOptions { cpu_accessible: true, zero_init: false };
+    let unified_opts = BufferOptions { cpu_accessible: true, zero_init: false, ..Default::default() };
     let mut unified_buf = Buffer::allocate(allocator.clone(), DType::Float32, vec![10], unified_opts).unwrap();
 
     // Create device-only buffer
-    let device_opts = BufferOptions { cpu_accessible: false, zero_init: false };
+    let device_opts = BufferOptions { cpu_accessible: false, zero_init: false, ..Default::default() };
     let mut device_buf = Buffer::allocate(allocator, DType::Float32, vec![10], device_opts).unwrap();
 
     // Write test data to unified buffer
@@ -219,7 +219,7 @@ fn test_copy_unified_to_unified() {
         }
     };
 
-    let options = BufferOptions { cpu_accessible: true, zero_init: false };
+    let options = BufferOptions { cpu_accessible: true, zero_init: false, ..Default::default() };
     let mut src_buf = Buffer::allocate(allocator.clone(), DType::Float32, vec![10], options.clone()).unwrap();
     let mut dst_buf = Buffer::allocate(allocator, DType::Float32, vec![10], options).unwrap();
 
@@ -251,7 +251,7 @@ fn test_unified_memory_zero_init() {
         }
     };
 
-    let options = BufferOptions { cpu_accessible: true, zero_init: true };
+    let options = BufferOptions { cpu_accessible: true, zero_init: true, ..Default::default() };
     let buffer = Buffer::allocate(allocator, DType::Float32, vec![10], options).unwrap();
 
     // Read data and verify it's zeroed

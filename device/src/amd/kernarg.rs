@@ -34,7 +34,7 @@ unsafe impl Sync for KernargArena {}
 
 impl KernargArena {
     pub fn new(allocator: &AmdAllocator) -> Result<Arc<Self>> {
-        let opts = BufferOptions { zero_init: true, cpu_accessible: true };
+        let opts = BufferOptions { zero_init: true, cpu_accessible: true, uncached: true, nolru: true };
         let buffer = allocator.alloc(ARENA_BYTES, &opts)?;
         let (base_gpu, base_host) = match &buffer {
             RawBuffer::AmdDevice { gpu_addr, host_ptr: Some(h), .. } => (*gpu_addr, *h),

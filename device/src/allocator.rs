@@ -196,11 +196,18 @@ pub struct BufferOptions {
     /// CPU allocator: always true (host memory is always accessible).
     /// CUDA allocator: false = device-only (cuMemAlloc), true = unified (cuMemAllocManaged).
     pub cpu_accessible: bool,
+    /// GTT-coherent uncached memory (signal/ring/kernarg). Distinct cache type
+    /// from VRAM — can't be reused as cached. Mirrors tinygrad `BufferSpec.uncached`.
+    pub uncached: bool,
+    /// Never cache this buffer in the LRU pool: free goes straight to teardown.
+    /// For lifetime-bound buffers (code object, scratch, queue/signal infra).
+    /// Mirrors tinygrad `BufferSpec.nolru`.
+    pub nolru: bool,
 }
 
 impl Default for BufferOptions {
     fn default() -> Self {
-        Self { zero_init: false, cpu_accessible: true }
+        Self { zero_init: false, cpu_accessible: true, uncached: false, nolru: false }
     }
 }
 
@@ -350,6 +357,7 @@ impl Allocator for CudaAllocator {
 struct CacheKey {
     size: usize,
     cpu_accessible: bool,
+    uncached: bool,
 }
 
 /// LRU allocator that caches freed buffers for reuse.
@@ -375,7 +383,7 @@ impl LruAllocator {
     /// Only available in tests for cache introspection.
     #[cfg(test)]
     pub(crate) fn cache_count(&self, size: usize, cpu_accessible: bool) -> usize {
-        let key = CacheKey { size, cpu_accessible };
+        let key = CacheKey { size, cpu_accessible, uncached: false };
         let cache = self.cache.lock().unwrap();
         cache.get(&key).map(|v| v.len()).unwrap_or(0)
     }
@@ -392,7 +400,11 @@ impl LruAllocator {
 
 impl Allocator for LruAllocator {
     fn alloc(&self, size: usize, options: &BufferOptions) -> Result<RawBuffer> {
-        let key = CacheKey { size, cpu_accessible: options.cpu_accessible };
+        // nolru buffers (code object, infra) never pool: deterministic free.
+        if options.nolru {
+            return self.inner.alloc(size, options);
+        }
+        let key = CacheKey { size, cpu_accessible: options.cpu_accessible, uncached: options.uncached };
 
         // Try cache first
         let buffer = {
@@ -459,7 +471,12 @@ impl Allocator for LruAllocator {
     }
 
     fn free(&self, buffer: RawBuffer, options: &BufferOptions) {
-        let key = CacheKey { size: buffer.size(), cpu_accessible: options.cpu_accessible };
+        // nolru/external bypass the pool — free immediately (mirror device.py:268).
+        if options.nolru {
+            self.inner.free(buffer, options);
+            return;
+        }
+        let key = CacheKey { size: buffer.size(), cpu_accessible: options.cpu_accessible, uncached: options.uncached };
 
         // Push onto the per-key cache if space remains. When the cache is
         // full, route the overflow through `inner.free` so the underlying
