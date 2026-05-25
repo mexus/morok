@@ -329,7 +329,9 @@ impl ExecutionPlan {
             kernel
                 .kernel
                 .program
-                .execute(&buffer_ptrs, &kernel.vals, global_size, local_size)
+                // wait=false: async submit. GPU ordering is enforced by the
+                // device timeline; host reads (copyout / as_*) synchronize.
+                .execute(&buffer_ptrs, &kernel.vals, global_size, local_size, /*wait=*/ false)
                 .map_err(|e| crate::error::Error::Execution { reason: format!("Kernel {} failed: {}", kernel.id, e) })
         }
     }

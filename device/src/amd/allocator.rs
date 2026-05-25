@@ -90,6 +90,12 @@ impl Allocator for AmdAllocator {
     fn _copyin(&self, dest: &RawBuffer, dest_off: usize, src: &[u8]) -> Result<()> {
         match dest {
             RawBuffer::AmdDevice { host_ptr: Some(ptr), .. } => {
+                // Drain first: a recycled VA may still be referenced by an
+                // in-flight kernel (dispatch is async + the LRU recycles
+                // without syncing). Direct host writes aren't ordered on the
+                // GPU timeline, so synchronize. Matches tinygrad's
+                // no-copy-queue `_copyin` (hcq.py:578).
+                self.dev.synchronize()?;
                 // SAFETY: BAR-backed VRAM mapping valid for the buffer's lifetime;
                 // scheduler exclusivity. `dest_off + src.len()` is bounded by the caller.
                 let dst = unsafe { std::slice::from_raw_parts_mut(ptr.as_ptr().add(dest_off), src.len()) };
@@ -106,6 +112,10 @@ impl Allocator for AmdAllocator {
     fn _copyout(&self, dest: &mut [u8], src: &RawBuffer, src_off: usize) -> Result<()> {
         match src {
             RawBuffer::AmdDevice { host_ptr: Some(ptr), .. } => {
+                // Dispatch is async (`AmdProgram::execute` does not block), so
+                // drain the device timeline before reading GPU-written results.
+                // Mirrors tinygrad `HCQAllocator._copyout` (hcq.py:613).
+                self.dev.synchronize()?;
                 let src_slice = unsafe { std::slice::from_raw_parts(ptr.as_ptr().add(src_off), dest.len()) };
                 dest.copy_from_slice(src_slice);
                 Ok(())

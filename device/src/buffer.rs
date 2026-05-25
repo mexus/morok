@@ -254,7 +254,10 @@ impl Buffer {
             }
             RawBuffer::Mmap { data, .. } => Ok(&data[self.offset..self.offset + self.size]),
             #[cfg(target_os = "linux")]
-            RawBuffer::AmdDevice { host_ptr: Some(ptr), .. } => {
+            RawBuffer::AmdDevice { host_ptr: Some(ptr), device, .. } => {
+                // Async dispatch: drain before raw host access — host-pointer
+                // reads/writes aren't ordered on the GPU timeline.
+                device.synchronize()?;
                 // SAFETY: same invariants as the CPU arm — scheduler ensures
                 // exclusivity, and the BAR-backed VRAM mapping is valid for
                 // the lifetime of the RawBuffer.
@@ -308,7 +311,10 @@ impl Buffer {
             // Mmap is read-only — no mutable access
             RawBuffer::Mmap { .. } => NotCpuAccessibleSnafu.fail(),
             #[cfg(target_os = "linux")]
-            RawBuffer::AmdDevice { host_ptr: Some(ptr), .. } => {
+            RawBuffer::AmdDevice { host_ptr: Some(ptr), device, .. } => {
+                // Async dispatch: drain before raw host access — host-pointer
+                // reads/writes aren't ordered on the GPU timeline.
+                device.synchronize()?;
                 let base = unsafe { ptr.as_ptr().add(self.offset) };
                 Ok(unsafe { std::slice::from_raw_parts_mut(base, self.size) })
             }
@@ -348,7 +354,10 @@ impl Buffer {
                 ndarray::ArrayViewD::from_shape(ndarray::IxDyn(&self.shape), typed).context(NdarrayShapeSnafu)
             }
             #[cfg(target_os = "linux")]
-            RawBuffer::AmdDevice { host_ptr: Some(ptr), .. } => {
+            RawBuffer::AmdDevice { host_ptr: Some(ptr), device, .. } => {
+                // Async dispatch: drain before raw host access — host-pointer
+                // reads/writes aren't ordered on the GPU timeline.
+                device.synchronize()?;
                 let bytes_ptr = unsafe { ptr.as_ptr().add(self.offset) } as *const T;
                 let count = self.size / T::DTYPE.bytes();
                 let typed = unsafe { std::slice::from_raw_parts(bytes_ptr, count) };
@@ -397,7 +406,10 @@ impl Buffer {
                 ndarray::ArrayViewMutD::from_shape(ndarray::IxDyn(&self.shape), typed).context(NdarrayShapeSnafu)
             }
             #[cfg(target_os = "linux")]
-            RawBuffer::AmdDevice { host_ptr: Some(ptr), .. } => {
+            RawBuffer::AmdDevice { host_ptr: Some(ptr), device, .. } => {
+                // Async dispatch: drain before raw host access — host-pointer
+                // reads/writes aren't ordered on the GPU timeline.
+                device.synchronize()?;
                 // SAFETY: BAR-backed VRAM mapping is valid for the buffer's
                 // lifetime; scheduler ensures no concurrent kernel writes.
                 let bytes_ptr = unsafe { ptr.as_ptr().add(self.offset) } as *mut T;
@@ -423,7 +435,10 @@ impl Buffer {
                 Ok(unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const T, count) })
             }
             #[cfg(target_os = "linux")]
-            RawBuffer::AmdDevice { host_ptr: Some(ptr), .. } => {
+            RawBuffer::AmdDevice { host_ptr: Some(ptr), device, .. } => {
+                // Async dispatch: drain before raw host access — host-pointer
+                // reads/writes aren't ordered on the GPU timeline.
+                device.synchronize()?;
                 let bytes_ptr = unsafe { ptr.as_ptr().add(self.offset) } as *const T;
                 let count = self.size / T::DTYPE.bytes();
                 Ok(unsafe { std::slice::from_raw_parts(bytes_ptr, count) })

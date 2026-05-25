@@ -241,6 +241,60 @@ struct QueueInner {
 unsafe impl Send for QueueInner {}
 unsafe impl Sync for QueueInner {}
 
+impl QueueInner {
+    /// Append raw PM4 dwords to the ring, wrapping at dword granularity
+    /// (`ops_amd.py:417`). `write_idx` is counted in dwords for PM4 queues.
+    /// Caller holds the queue lock — this is part of one atomic dispatch.
+    fn push_pm4(&mut self, dwords: &[u32]) {
+        let ring_dwords = self.ring_size / 4;
+        let mut idx = (self.write_idx as usize) % ring_dwords;
+        for &dw in dwords {
+            // SAFETY: ring_host points to ring_size bytes; idx < ring_dwords.
+            unsafe { std::ptr::write_volatile((self.ring_host.as_ptr() as *mut u32).add(idx), dw) };
+            idx = (idx + 1) % ring_dwords;
+        }
+        self.write_idx += dwords.len() as u64;
+    }
+
+    /// Write one 64-byte AQL packet at the current slot. `write_idx` counts
+    /// 64-byte slots for AQL queues.
+    fn push_aql(&mut self, bytes: &[u8]) {
+        debug_assert_eq!(bytes.len(), AQL_PACKET_BYTES);
+        let off = (self.write_idx as usize * AQL_PACKET_BYTES) % self.ring_size;
+        // SAFETY: ring_host is mmapped + size-validated; off bounded by ring_size.
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.ring_host.as_ptr().add(off), AQL_PACKET_BYTES) };
+        self.write_idx += 1;
+    }
+
+    /// Bump-allocate `dwords` into the pm4_ibs arena (AQL path only) and return
+    /// the GPU VA of the copied region. Mirrors `ops_amd.py:_pm4_pkt`.
+    fn pm4_ib(&mut self, dwords: &[u32]) -> u64 {
+        let bytes = std::mem::size_of_val(dwords);
+        let aligned = self.pm4_ibs_cursor.next_multiple_of(16);
+        let start = if aligned + bytes > self.pm4_ibs_size { 0 } else { aligned };
+        let gpu_addr = self.pm4_ibs_gpu + start as u64;
+        // SAFETY: pm4_ibs_host is mmapped GTT; start + bytes ≤ size by construction.
+        unsafe {
+            std::ptr::copy_nonoverlapping(dwords.as_ptr() as *const u8, self.pm4_ibs_host.as_ptr().add(start), bytes)
+        };
+        self.pm4_ibs_cursor = start + bytes;
+        gpu_addr
+    }
+
+    /// Publish the current `write_idx` to GART + ring the doorbell. AQL uses
+    /// the **last completed** slot (`write_idx - 1`); PM4 uses the **next**
+    /// dword (`write_idx`). See `ops_amd.py:_signal_doorbell`.
+    fn ring_doorbell(&self, is_pm4: bool) {
+        // GART wptr first (`ops_amd.py:681`): without it KFD sees the doorbell
+        // change but reads a stale wptr.
+        unsafe { std::ptr::write_volatile(self.write_ptr_host.as_ptr(), self.write_idx) };
+        std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
+        let doorbell_value = if is_pm4 { self.write_idx } else { self.write_idx - 1 };
+        // SAFETY: doorbell is mmapped MMIO; aligned 64-bit store.
+        unsafe { std::ptr::write_volatile(self.doorbell.as_ptr(), doorbell_value) };
+    }
+}
+
 impl AmdComputeQueue {
     /// Create a compute queue. Tinygrad's selection at `ops_amd.py:989`:
     /// `is_aql = xccs > 1`. Single-XCC GPUs (the gfx11/12 default) use the
@@ -274,174 +328,35 @@ impl AmdComputeQueue {
         self.is_pm4
     }
 
-    pub fn enqueue_packet(&self, packet: &HsaKernelDispatchPacket) {
-        debug_assert_eq!(size_of::<HsaKernelDispatchPacket>(), AQL_PACKET_BYTES);
-        let mut g = self.inner.lock();
-        let off = (g.write_idx as usize * AQL_PACKET_BYTES) % g.ring_size;
-        // SAFETY: ring_host is mmapped + size-validated at creation; offset is
-        // bounded by ring_size; AQL packet is 64-byte aligned.
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                packet as *const _ as *const u8,
-                g.ring_host.as_ptr().add(off),
-                AQL_PACKET_BYTES,
-            );
-        }
-        g.write_idx += 1;
-    }
-
-    /// Ring the doorbell so the GPU's CP picks up everything currently in the
-    /// ring. Branches on queue type because AQL and PM4 use different
-    /// doorbell-value conventions (`ops_amd.py:_signal_doorbell`):
-    /// - AQL: doorbell carries the **last completed** AQL slot index
-    ///   (`write_idx - 1`).
-    /// - PM4: doorbell carries the **next dword to consume** (`write_idx`).
-    pub fn submit(&self) -> Result<()> {
-        let g = self.inner.lock();
-        // Update GART wptr first (matches `ops_amd.py:681`); without it KFD's
-        // dispatch logic sees the doorbell change but reads a stale wptr.
-        unsafe { std::ptr::write_volatile(g.write_ptr_host.as_ptr(), g.write_idx) };
-        std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
-        // SAFETY: doorbell pointer is mmapped MMIO; aligned 64-bit store.
-        let doorbell_value = if self.is_pm4 { g.write_idx } else { g.write_idx - 1 };
-        unsafe { std::ptr::write_volatile(g.doorbell.as_ptr(), doorbell_value) };
-        Ok(())
-    }
-
-    /// Current `read_dispatch_id` from GART — the GPU command processor
-    /// advances this as it consumes packets. Equal to `write_idx` once the
-    /// queue has drained.
+    /// Current `read_dispatch_id` from GART — the CP advances it as it consumes
+    /// packets. Used by completion polling; equals `write_idx` once drained.
     pub fn read_idx(&self) -> u64 {
         let g = self.inner.lock();
         unsafe { std::ptr::read_volatile(g.read_ptr_host.as_ptr()) }
     }
 
-    /// Current `write_dispatch_id` (the host-side wptr we last wrote into
-    /// GART). Used together with `read_idx()` for queue-completion polling.
+    /// Current host-side `write_dispatch_id`.
     pub fn write_idx(&self) -> u64 {
-        let g = self.inner.lock();
-        g.write_idx
+        self.inner.lock().write_idx
     }
 
-    /// Allocate `bytes` from the pm4_ibs bump arena and copy `dwords` in.
-    /// Returns the GPU VA of the start of the copied region.
-    fn pm4_ibs_alloc(&self, dwords: &[u32]) -> u64 {
-        let bytes = std::mem::size_of_val(dwords);
-        let mut g = self.inner.lock();
-        let aligned = g.pm4_ibs_cursor.next_multiple_of(16);
-        let start = if aligned + bytes > g.pm4_ibs_size { 0 } else { aligned };
-        let gpu_addr = g.pm4_ibs_gpu + start as u64;
-        // SAFETY: pm4_ibs_host is mmapped GTT, cursor + bytes ≤ size by construction.
-        unsafe {
-            std::ptr::copy_nonoverlapping(dwords.as_ptr() as *const u8, g.pm4_ibs_host.as_ptr().add(start), bytes);
-        }
-        g.pm4_ibs_cursor = start + bytes;
-        gpu_addr
-    }
-
-    /// Wrap a PM4 dword stream in an AQL vendor-specific indirect-buffer
-    /// packet, then enqueue it on the ring. Mirrors tinygrad's `_pm4_pkt`
-    /// at `ops_amd.py:433-435`. AQL-queue path only.
-    fn enqueue_pm4_via_vendor_ib(&self, pm4: &[u32]) {
-        let gpu_addr = self.pm4_ibs_alloc(pm4);
-        let packet = build_aql_vendor_ib_packet(gpu_addr, pm4.len() as u32);
-        let mut g = self.inner.lock();
-        let off = (g.write_idx as usize * AQL_PACKET_BYTES) % g.ring_size;
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                packet.as_ptr() as *const u8,
-                g.ring_host.as_ptr().add(off),
-                AQL_PACKET_BYTES,
-            );
-        }
-        g.write_idx += 1;
-    }
-
-    /// Append raw PM4 dwords to the compute ring, wrapping at the dword
-    /// granularity (matches tinygrad's per-dword `% ring_dwords` write loop
-    /// at `ops_amd.py:417`). `write_idx` is counted in dwords for PM4
-    /// queues — same field, different unit than AQL's 64-byte slot count.
-    fn enqueue_dwords_pm4(&self, dwords: &[u32]) {
-        let mut g = self.inner.lock();
-        let ring_dwords = g.ring_size / 4;
-        let mut idx = (g.write_idx as usize) % ring_dwords;
-        for &dw in dwords {
-            // SAFETY: ring_host points to ring_size bytes; idx < ring_dwords.
-            unsafe {
-                let p = (g.ring_host.as_ptr() as *mut u32).add(idx);
-                std::ptr::write_volatile(p, dw);
-            }
-            idx = (idx + 1) % ring_dwords;
-        }
-        g.write_idx += dwords.len() as u64;
-    }
-
-    /// `wait`: PM4 WAIT_REG_MEM polling `signal_addr` until its low 32 bits
-    /// are ≥ `value`. On PM4 queues the dwords go straight into the ring;
-    /// on AQL queues they're wrapped in a vendor IB packet
-    /// (`ops_amd.py:_pm4_pkt`).
-    pub fn wait_signal(&self, signal_addr: u64, value: u32) {
-        let p = pm4::wait_reg_mem(signal_addr, value, 0xFFFF_FFFF);
-        if self.is_pm4 {
-            self.enqueue_dwords_pm4(&p);
-        } else {
-            self.enqueue_pm4_via_vendor_ib(&p);
-        }
-    }
-
-    /// `signal`: PM4 RELEASE_MEM that writes `value` (low 32 bits) to
-    /// `signal_addr` after a system-scope cache flush. Mirrors tinygrad's
-    /// `AMDComputeQueue.signal` at `ops_amd.py:385-394`.
-    pub fn signal(&self, signal_addr: u64, value: u32) {
-        let p = pm4::release_mem(signal_addr, value, /*cache_flush=*/ true);
-        if self.is_pm4 {
-            self.enqueue_dwords_pm4(&p);
-        } else {
-            self.enqueue_pm4_via_vendor_ib(&p);
-        }
-    }
-
-    /// `memory_barrier`: HDP flush handshake + PM4 ACQUIRE_MEM cache
-    /// invalidate. Mirrors tinygrad `ops_amd.py:133-137`:
+    /// Atomically build + submit one PM4 (single-XCC) kernel dispatch.
     ///
-    /// ```python
-    /// def memory_barrier(self):
-    ///     pf = '0' if self.nbio.version[:2] != (7, 11) else '1'
-    ///     self.wait_reg_mem(reg=BIF_BX_PF{pf}_GPU_HDP_FLUSH_REQ,
-    ///                       reg_done=BIF_BX_PF{pf}_GPU_HDP_FLUSH_DONE,
-    ///                       value=0xffffffff)
-    ///     return self.acquire_mem()
-    /// ```
+    /// Holds the ring lock across timeline-value acquisition, ring blit, and
+    /// doorbell. This is load-bearing under Svod's rayon-parallel dispatch
+    /// (`execution_plan::execute_parallel_group`): without it, two concurrent
+    /// dispatches can interleave in the ring or be assigned timeline values out
+    /// of ring order, making the CP wait on a signal queued *later* in the same
+    /// ring — a deadlock that surfaces as a 30 s timeout + poison. tinygrad's
+    /// single-threaded (GIL) dispatch gets this ordering for free; we serialize
+    /// the submit critical section explicitly. The kernel still executes
+    /// asynchronously — only the microsecond-scale submit is serialized.
     ///
-    /// The HDP flush is **load-bearing**: without it, host writes to GTT
-    /// memory (kernarg arena, ring buffers) may sit in CPU caches and the
-    /// GPU's command processor reads stale data, causing kernels to either
-    /// not launch or read garbage kernarg pointers. Symptom is "signal
-    /// never fires" / "GPU 100% loaded but no progress".
-    pub fn memory_barrier(&self) {
-        let hdp = pm4::hdp_flush();
-        let acquire = pm4::acquire_mem();
-        if self.is_pm4 {
-            self.enqueue_dwords_pm4(&hdp);
-            self.enqueue_dwords_pm4(&acquire);
-        } else {
-            self.enqueue_pm4_via_vendor_ib(&hdp);
-            self.enqueue_pm4_via_vendor_ib(&acquire);
-        }
-    }
-
-    /// PM4 single-XCC kernel dispatch. Builds the SET_SH_REG + DISPATCH_DIRECT
-    /// stream described at `ops_amd.py:320-368`, minus the SQTT/PMC/dispatch_ptr
-    /// extras we don't yet support. The shader entry point is
-    /// `prog_addr = code_gpu + kd_offset + kd.kernel_code_entry_byte_offset`
-    /// (`ops_amd.py:598`), pre-shifted right by 8 because COMPUTE_PGM_LO/HI
-    /// hold the upper bits of a 256-byte-aligned shader address.
-    ///
-    /// `wave32` comes from `kd.kernel_code_properties & 0x400`
-    /// (`ops_amd.py:591`). `target_major` is 9/11/12 — the `cs_w32_en` bit is
-    /// only defined on gfx11/12.
+    /// Sequence mirrors `hcq.py:371-378`:
+    /// `wait(timeline, prev) → memory_barrier → exec → signal(timeline, next)`.
+    /// Returns the timeline value this dispatch signals.
     #[allow(clippy::too_many_arguments)]
-    pub fn exec_pm4(
+    pub fn dispatch_pm4(
         &self,
         rsrc1: u32,
         rsrc2: u32,
@@ -454,98 +369,151 @@ impl AmdComputeQueue {
         grid: [u32; 3],
         wave32: bool,
         target_major: u32,
-    ) {
-        debug_assert!(self.is_pm4, "exec_pm4 called on AQL queue");
-        let mut q: Vec<u32> = Vec::with_capacity(64);
+    ) -> Result<u64> {
+        debug_assert!(self.is_pm4, "dispatch_pm4 called on AQL queue");
+        let timeline_addr = self.dev.timeline_signal().value_addr();
+        let mut g = self.inner.lock();
+        let prev = self.dev.timeline_value().saturating_sub(1);
+        let next = self.dev.next_timeline();
 
-        // 1. Pre-dispatch cache-invalidate. Tinygrad emits `acquire_mem(gli=0,
-        //    gl2=0)` here (`ops_amd.py:323`) — skips GLI invalidate (instr
-        //    cache: still good from prior dispatch of the same kernel) and
-        //    GL2 invalidate/writeback (the full memory_barrier already did
-        //    GL2 at the wait→exec transition). Hitting GL2 again here is
-        //    expensive and unnecessary.
-        q.extend_from_slice(&pm4::acquire_mem_with(pm4::GCR_FLAGS_NO_GLI_GL2));
+        let mut q: Vec<u32> = Vec::with_capacity(96);
+        // wait(timeline, prev): no-op on the first dispatch (prev == 0).
+        q.extend_from_slice(&pm4::wait_reg_mem(timeline_addr, prev as u32, 0xFFFF_FFFF));
+        // memory_barrier: HDP flush handshake + ACQUIRE_MEM cache invalidate.
+        q.extend_from_slice(&pm4::hdp_flush());
+        q.extend_from_slice(&pm4::acquire_mem());
+        // exec: SET_SH_REG stream + DISPATCH_DIRECT.
+        build_exec_pm4(
+            &mut q,
+            rsrc1,
+            rsrc2,
+            rsrc3,
+            prog_addr,
+            user_data,
+            scratch_addr,
+            tmpring_size,
+            local,
+            grid,
+            wave32,
+            target_major,
+        );
+        // signal(timeline, next): RELEASE_MEM after a system-scope cache flush.
+        q.extend_from_slice(&pm4::release_mem(timeline_addr, next as u32, /*cache_flush=*/ true));
 
-        // 2. Shader address: COMPUTE_PGM_LO/HI hold (prog_addr >> 8).
-        let prog_shr = prog_addr >> 8;
-        q.extend(pm4::set_sh_reg(pm4::COMPUTE_PGM_LO, &[prog_shr as u32, (prog_shr >> 32) as u32]));
-
-        // 3. RSRC1/2 in one packet; RSRC3 separately.
-        q.extend(pm4::set_sh_reg(pm4::COMPUTE_PGM_RSRC1, &[rsrc1, rsrc2]));
-        q.extend(pm4::set_sh_reg(pm4::COMPUTE_PGM_RSRC3, &[rsrc3]));
-
-        // 4. Scratch: per-device scratch buffer is allocated up-front in
-        //    AmdDevice::open (mirroring tinygrad's `_ensure_has_local_memory`
-        //    at ops_amd.py:1010). Even kernels with `SCRATCH_EN=0` need
-        //    valid `COMPUTE_DISPATCH_SCRATCH_BASE_LO/HI` for the wave-init
-        //    path on RDNA3+; without them the GPU faults on first dispatch.
-        q.extend(pm4::set_sh_reg(pm4::COMPUTE_TMPRING_SIZE, &[tmpring_size]));
-        let scratch_shr = scratch_addr >> 8;
-        q.extend(pm4::set_sh_reg(
-            pm4::COMPUTE_DISPATCH_SCRATCH_BASE_LO,
-            &[scratch_shr as u32, (scratch_shr >> 32) as u32],
-        ));
-
-        // 5. Restart points are always zero (no preempt-resume support yet).
-        q.extend(pm4::set_sh_reg(pm4::COMPUTE_RESTART_X, &[0, 0, 0]));
-
-        // 6. COMPUTE_USER_DATA_0..N — user SGPR pre-load slots, populated
-        //    based on `kernel_code_properties`. Mirrors tinygrad
-        //    `ops_amd.py:325-342, 358`. Order (when enabled):
-        //      [0..4]  private_segment_buffer (4 dwords: scratch hilo + flags)
-        //      [+0..2] dispatch_ptr (2 dwords)
-        //      [+0..2] kernarg_segment_ptr (2 dwords)  ← always last
-        //    The caller assembles the slice in `AmdProgram::execute`.
-        q.extend(pm4::set_sh_reg(pm4::COMPUTE_USER_DATA_0, user_data));
-
-        // 7. RESOURCE_LIMITS: 0 = no per-SH wave caps.
-        q.extend(pm4::set_sh_reg(pm4::COMPUTE_RESOURCE_LIMITS, &[0]));
-
-        // 8. Eight consecutive registers START_X..NUM_THREAD_Z + 2 reserved.
-        //    Order: START_X=0, START_Y=0, START_Z=0, NUM_THREAD_X=local_x,
-        //    NUM_THREAD_Y=local_y, NUM_THREAD_Z=local_z, 2× reserved=0.
-        q.extend(pm4::set_sh_reg(pm4::COMPUTE_START_X, &[0, 0, 0, local[0], local[1], local[2], 0, 0]));
-
-        // 9. Launch.
-        let mut di = pm4::DISPATCH_INITIATOR_FORCE_START_AT_000 | pm4::DISPATCH_INITIATOR_COMPUTE_SHADER_EN;
-        if target_major != 9 && wave32 {
-            di |= pm4::DISPATCH_INITIATOR_CS_W32_EN;
-        }
-        q.extend_from_slice(&pm4::dispatch_direct(grid, di));
-
-        // 10. CS_PARTIAL_FLUSH so subsequent dispatches see clean state.
-        q.extend_from_slice(&pm4::event_write(pm4::CS_PARTIAL_FLUSH, pm4::EVENT_INDEX_PARTIAL_FLUSH));
-
-        self.enqueue_dwords_pm4(&q);
+        g.push_pm4(&q);
+        g.ring_doorbell(/*is_pm4=*/ true);
+        Ok(next)
     }
 
-    /// Block until the GPU has consumed all packets up to and including
-    /// `target_write_idx`. Returns `Err(Runtime)` after `timeout_ms`. This
-    /// is the AQL-only fallback used when we don't have a per-dispatch
-    /// signal mechanism (the kernel-dispatch packet's `completion_signal`
-    /// field isn't honored by AMD AQL hardware).
-    pub fn wait_for_packet_completion(&self, target_write_idx: u64, timeout_ms: u64) -> Result<()> {
-        let start = std::time::Instant::now();
-        loop {
-            let rptr = self.read_idx();
-            if rptr >= target_write_idx {
-                return Ok(());
-            }
-            if timeout_ms > 0 && start.elapsed().as_millis() as u64 >= timeout_ms {
-                return Err(Error::Runtime {
-                    message: format!(
-                        "AmdComputeQueue::wait_for_packet_completion timed out: read_ptr={rptr} \
-                         target={target_write_idx} (write_idx={})",
-                        self.write_idx()
-                    ),
-                });
-            }
-            std::hint::spin_loop();
-            if start.elapsed().as_micros() >= 100 {
-                std::thread::yield_now();
-            }
-        }
+    /// Atomically build + submit one AQL (multi-XCC CDNA) kernel dispatch. Same
+    /// ordering guarantee as [`dispatch_pm4`]; PM4 helpers are wrapped in AQL
+    /// vendor-IB packets (`ops_amd.py:_pm4_pkt`) and the kernel launch is a real
+    /// `HsaKernelDispatchPacket`.
+    pub fn dispatch_aql(&self, packet: &HsaKernelDispatchPacket) -> Result<u64> {
+        debug_assert!(!self.is_pm4, "dispatch_aql called on PM4 queue");
+        debug_assert_eq!(size_of::<HsaKernelDispatchPacket>(), AQL_PACKET_BYTES);
+        let timeline_addr = self.dev.timeline_signal().value_addr();
+        let mut g = self.inner.lock();
+        let prev = self.dev.timeline_value().saturating_sub(1);
+        let next = self.dev.next_timeline();
+
+        // wait → barrier(hdp, acquire) → exec → signal, each PM4 op wrapped in a
+        // vendor-IB AQL packet (exec is a native dispatch packet).
+        let wait = pm4::wait_reg_mem(timeline_addr, prev as u32, 0xFFFF_FFFF);
+        let ib = g.pm4_ib(&wait);
+        let p = build_aql_vendor_ib_packet(ib, wait.len() as u32);
+        g.push_aql(dwords_as_bytes(&p));
+
+        let hdp = pm4::hdp_flush();
+        let ib = g.pm4_ib(&hdp);
+        let p = build_aql_vendor_ib_packet(ib, hdp.len() as u32);
+        g.push_aql(dwords_as_bytes(&p));
+
+        let acq = pm4::acquire_mem();
+        let ib = g.pm4_ib(&acq);
+        let p = build_aql_vendor_ib_packet(ib, acq.len() as u32);
+        g.push_aql(dwords_as_bytes(&p));
+
+        // exec: native 64-byte kernel-dispatch packet.
+        let packet_bytes = unsafe { std::slice::from_raw_parts(packet as *const _ as *const u8, AQL_PACKET_BYTES) };
+        g.push_aql(packet_bytes);
+
+        let sig = pm4::release_mem(timeline_addr, next as u32, /*cache_flush=*/ true);
+        let ib = g.pm4_ib(&sig);
+        let p = build_aql_vendor_ib_packet(ib, sig.len() as u32);
+        g.push_aql(dwords_as_bytes(&p));
+
+        g.ring_doorbell(/*is_pm4=*/ false);
+        Ok(next)
     }
+}
+
+/// View a `[u32; 16]` AQL packet as its 64 little-endian bytes.
+fn dwords_as_bytes(p: &[u32; 16]) -> &[u8] {
+    // SAFETY: 16 u32 == 64 bytes, contiguous, any bit pattern valid.
+    unsafe { std::slice::from_raw_parts(p.as_ptr() as *const u8, AQL_PACKET_BYTES) }
+}
+
+/// Build the PM4 SET_SH_REG + DISPATCH_DIRECT stream for a single-XCC dispatch,
+/// appending into `q`. Port of `ops_amd.py:320-368` (minus SQTT/PMC/dispatch_ptr).
+/// The shader entry point is pre-shifted right by 8 (COMPUTE_PGM_LO/HI hold the
+/// upper bits of a 256-byte-aligned address). `wave32` comes from
+/// `kd.kernel_code_properties & 0x400`; `cs_w32_en` is gfx11/12-only.
+#[allow(clippy::too_many_arguments)]
+fn build_exec_pm4(
+    q: &mut Vec<u32>,
+    rsrc1: u32,
+    rsrc2: u32,
+    rsrc3: u32,
+    prog_addr: u64,
+    user_data: &[u32],
+    scratch_addr: u64,
+    tmpring_size: u32,
+    local: [u32; 3],
+    grid: [u32; 3],
+    wave32: bool,
+    target_major: u32,
+) {
+    // 1. Pre-dispatch cache-invalidate, skipping GLI/GL2 (already flushed by the
+    //    preceding memory_barrier). Matches `ops_amd.py:323`.
+    q.extend_from_slice(&pm4::acquire_mem_with(pm4::GCR_FLAGS_NO_GLI_GL2));
+
+    // 2. Shader address: COMPUTE_PGM_LO/HI hold (prog_addr >> 8).
+    let prog_shr = prog_addr >> 8;
+    q.extend(pm4::set_sh_reg(pm4::COMPUTE_PGM_LO, &[prog_shr as u32, (prog_shr >> 32) as u32]));
+
+    // 3. RSRC1/2 together; RSRC3 separately.
+    q.extend(pm4::set_sh_reg(pm4::COMPUTE_PGM_RSRC1, &[rsrc1, rsrc2]));
+    q.extend(pm4::set_sh_reg(pm4::COMPUTE_PGM_RSRC3, &[rsrc3]));
+
+    // 4. Scratch / tmpring (valid base required for wave init on RDNA3+ even
+    //    when SCRATCH_EN=0).
+    q.extend(pm4::set_sh_reg(pm4::COMPUTE_TMPRING_SIZE, &[tmpring_size]));
+    let scratch_shr = scratch_addr >> 8;
+    q.extend(pm4::set_sh_reg(pm4::COMPUTE_DISPATCH_SCRATCH_BASE_LO, &[scratch_shr as u32, (scratch_shr >> 32) as u32]));
+
+    // 5. Restart points always zero (no preempt-resume).
+    q.extend(pm4::set_sh_reg(pm4::COMPUTE_RESTART_X, &[0, 0, 0]));
+
+    // 6. COMPUTE_USER_DATA_0..N — user SGPR pre-load (scratch desc + kernarg ptr),
+    //    assembled by the caller.
+    q.extend(pm4::set_sh_reg(pm4::COMPUTE_USER_DATA_0, user_data));
+
+    // 7. RESOURCE_LIMITS: 0 = no per-SH wave caps.
+    q.extend(pm4::set_sh_reg(pm4::COMPUTE_RESOURCE_LIMITS, &[0]));
+
+    // 8. START_X..NUM_THREAD_Z + 2 reserved (local size in NUM_THREAD_*).
+    q.extend(pm4::set_sh_reg(pm4::COMPUTE_START_X, &[0, 0, 0, local[0], local[1], local[2], 0, 0]));
+
+    // 9. Launch.
+    let mut di = pm4::DISPATCH_INITIATOR_FORCE_START_AT_000 | pm4::DISPATCH_INITIATOR_COMPUTE_SHADER_EN;
+    if target_major != 9 && wave32 {
+        di |= pm4::DISPATCH_INITIATOR_CS_W32_EN;
+    }
+    q.extend_from_slice(&pm4::dispatch_direct(grid, di));
+
+    // 10. CS_PARTIAL_FLUSH so the next dispatch sees clean state.
+    q.extend_from_slice(&pm4::event_write(pm4::CS_PARTIAL_FLUSH, pm4::EVENT_INDEX_PARTIAL_FLUSH));
 }
 
 impl AmdCopyQueue {
@@ -859,18 +827,15 @@ mod tests {
         assert_eq!(words[7], 0xfeed_face);
     }
 
-    /// Live AQL queue creation. Skipped without a supported AMD GPU.
+    /// Live compute queue creation (exercises the KFD CREATE_QUEUE path).
+    /// Skipped without a supported AMD GPU. A real dispatch needs the device
+    /// timeline wired up by the factory, so we only assert creation here.
     #[test]
     fn compute_queue_create_if_hw_supports() {
         let alloc = match AmdAllocator::new(0) {
             Ok(a) => a,
             Err(_) => return,
         };
-        let q = AmdComputeQueue::create(&alloc).expect("create AQL queue");
-        // Construct a no-op packet and submit. The GPU will execute nothing
-        // useful but the queue should at least accept the doorbell write.
-        let packet = build_dispatch_packet([1, 1, 1], [1, 1, 1], 0, 0, 0, 0, 0);
-        q.enqueue_packet(&packet);
-        q.submit().expect("submit");
+        let _q = AmdComputeQueue::create(&alloc).expect("create compute queue");
     }
 }

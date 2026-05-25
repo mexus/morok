@@ -42,6 +42,12 @@ pub trait Program: Send + Sync {
     /// * `vals` - Variable values in positional order (matches `var_names` in CompiledSpec)
     /// * `global_size` - Global work size (for GPU backends, None for CPU)
     /// * `local_size` - Local work size (for GPU backends, None for CPU)
+    /// * `wait` - Block until this dispatch completes before returning. Mirrors
+    ///   tinygrad `HCQProgram.__call__(wait=...)` (`hcq.py:355`): GPU backends
+    ///   submit asynchronously and rely on the device timeline for ordering, so
+    ///   `wait=false` returns right after submit. Pass `true` only when the
+    ///   caller needs completion *without* a subsequent synchronizing read
+    ///   (e.g. benchmark timing). Synchronous backends (CPU) ignore it.
     ///
     /// # Safety
     ///
@@ -55,6 +61,7 @@ pub trait Program: Send + Sync {
         vals: &[i64],
         global_size: Option<[usize; 3]>,
         local_size: Option<[usize; 3]>,
+        wait: bool,
     ) -> Result<()>;
 
     /// Get the kernel name (for debugging/profiling).
@@ -442,7 +449,7 @@ pub type CompilerPair = (Arc<dyn Renderer>, Arc<dyn Compiler>);
 /// let spec = cpu_device.renderer.render(&kernel_ast, Some("E_L3"))?;
 /// let compiled = cpu_device.compiler.compile(&spec)?;
 /// let program = (cpu_device.runtime)(&compiled)?;
-/// unsafe { program.execute(&buffers, &vals, None, None)?; }
+/// unsafe { program.execute(&buffers, &vals, None, None, /*wait=*/ true)?; }
 /// ```
 pub struct Device {
     /// Device specification

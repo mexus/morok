@@ -192,6 +192,7 @@ impl Program for Copy4F32Program {
         _vals: &[i64],
         _global_size: Option<[usize; 3]>,
         _local_size: Option<[usize; 3]>,
+        _wait: bool,
     ) -> svod_device::Result<()> {
         self.calls.fetch_add(1, Ordering::Relaxed);
         let bytes = 4 * std::mem::size_of::<f32>();
@@ -267,6 +268,7 @@ impl Program for ObserveParallelProgram {
         _vals: &[i64],
         _global_size: Option<[usize; 3]>,
         _local_size: Option<[usize; 3]>,
+        _wait: bool,
     ) -> svod_device::Result<()> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         let active_now = self.active.fetch_add(1, Ordering::SeqCst) + 1;
@@ -312,6 +314,7 @@ impl Program for RecordLaunchProgram {
         vals: &[i64],
         global_size: Option<[usize; 3]>,
         _local_size: Option<[usize; 3]>,
+        _wait: bool,
     ) -> svod_device::Result<()> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.global_x.store(global_size.map(|size| size[0]).unwrap_or(0), Ordering::SeqCst);

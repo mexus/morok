@@ -78,7 +78,7 @@ impl CpuQueue {
                 // SAFETY: Scheduler guarantees exclusive access during execution
                 unsafe {
                     program
-                        .execute(&buffer_ptrs, &vals, global_size, local_size)
+                        .execute(&buffer_ptrs, &vals, global_size, local_size, /*wait=*/ false)
                         .map_err(|e| crate::Error::Device { source: e })?;
                 }
             }

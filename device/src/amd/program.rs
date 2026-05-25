@@ -485,6 +485,7 @@ impl Program for AmdProgram {
         vals: &[i64],
         global_size: Option<[usize; 3]>,
         local_size: Option<[usize; 3]>,
+        wait: bool,
     ) -> Result<()> {
         // Device poisoned by an earlier fault: refuse to dispatch (the GPU
         // state and any cached buffer mappings are no longer trustworthy).
@@ -552,23 +553,21 @@ impl Program for AmdProgram {
         //   wait(dev.timeline, dev.timeline_value-1) → memory_barrier → exec
         //   → signal(dev.timeline, dev.next_timeline()) → submit
         //
-        // Using the **device-global** timeline (not a per-program one) so
-        // `AmdDevice::synchronize` can drain everything submitted by any
-        // program on this device before `AmdAllocator::free` unmaps a buffer
-        // — fixes the NotPresent faults caused by unmapping a buffer whose
-        // VA is still queued in a pending kernel.
+        // The wait/signal timeline values are acquired *inside* `dispatch_*`
+        // under the ring lock (so concurrent rayon dispatches stay ordered);
+        // execute() must NOT call `next_timeline()` here or it would
+        // double-increment the counter. The device-global timeline lets
+        // `AmdDevice::synchronize` drain everything before `AmdAllocator::_free`
+        // unmaps a buffer whose VA may still be queued in a pending kernel.
         let g = global_size.unwrap_or([1, 1, 1]);
         let l = local_size.unwrap_or([1, 1, 1]);
-        let timeline_signal = self.dev.timeline_signal();
-        let prev = self.dev.timeline_value().saturating_sub(1);
-        let next = self.dev.next_timeline();
 
         if std::env::var("SVOD_DEBUG_DISPATCH").is_ok() {
             let bufs_str: Vec<String> =
                 buffers.iter().enumerate().map(|(i, b)| format!("buf{}={:#x}", i, *b as u64)).collect();
             eprintln!(
-                "[dispatch #{}] kernel={} grid=[{}, {}, {}] local=[{}, {}, {}] is_pm4={} kernarg_gpu={:#x} {}",
-                prev,
+                "[dispatch tv={}] kernel={} grid=[{}, {}, {}] local=[{}, {}, {}] is_pm4={} kernarg_gpu={:#x} {}",
+                self.dev.timeline_value(),
                 self.name,
                 g[0],
                 g[1],
@@ -582,10 +581,6 @@ impl Program for AmdProgram {
             );
         }
 
-        // wait: poll signal addr until ≥ prev (no-op on first dispatch).
-        self.queue.wait_signal(timeline_signal.value_addr(), prev as u32);
-        // memory_barrier: invalidate caches before the dispatch.
-        self.queue.memory_barrier();
         // Assemble the USER_DATA SGPR pre-load prefix per the kernel's
         // `kernel_code_properties` bits. Mirrors tinygrad `ops_amd.py:325-342`:
         //   - if ENABLE_SGPR_PRIVATE_SEGMENT_BUFFER (bit 0): 4 dwords
@@ -603,9 +598,14 @@ impl Program for AmdProgram {
         }
         user_data.push(kernarg_gpu as u32);
         user_data.push((kernarg_gpu >> 32) as u32);
-        // exec: PM4 single-XCC path or AQL kernel-dispatch packet.
-        if self.queue.is_pm4() {
-            self.queue.exec_pm4(
+
+        // Atomically build + submit the whole wait→barrier→exec→signal stream.
+        // `dispatch_*` holds the ring lock across timeline acquisition + blit +
+        // doorbell, so concurrent rayon dispatches stay ordered (see
+        // `AmdComputeQueue::dispatch_pm4`). Returns the timeline value this
+        // dispatch signals on completion.
+        let signalled = if self.queue.is_pm4() {
+            self.queue.dispatch_pm4(
                 self.rsrc1,
                 self.rsrc2,
                 self.rsrc3,
@@ -617,9 +617,8 @@ impl Program for AmdProgram {
                 [g[0] as u32, g[1] as u32, g[2] as u32],
                 self.wave32,
                 self.target_major,
-            );
+            )?
         } else {
-            // Packed struct: copy fields to locals.
             let priv_seg = self.kd.private_segment_fixed_size;
             let group_seg = self.kd.group_segment_fixed_size;
             let packet = build_dispatch_packet(
@@ -633,27 +632,18 @@ impl Program for AmdProgram {
                 kernarg_gpu,
                 /*completion_signal=*/ 0,
             );
-            self.queue.enqueue_packet(&packet);
-        }
-        // signal: PM4 RELEASE_MEM writing `next` to timeline signal addr.
-        self.queue.signal(timeline_signal.value_addr(), next as u32);
-        self.queue.submit()?;
+            self.queue.dispatch_aql(&packet)?
+        };
 
-        // 3. Block on host-visible signal slot reaching `next`.
-        //    Tinygrad's `HCQProgram.__call__` doesn't block by default
-        //    (`hcq.py:380`), but svod's pipeline reads back outputs on the
-        //    return path without an explicit synchronize, so we keep the
-        //    per-dispatch wait. The device timeline is still the single
-        //    source of truth: `AmdAllocator::free` calls
-        //    `AmdDevice::synchronize` separately to drain anything queued
-        //    by other paths.
-        // On fault/timeout, poison the device and drain so no in-flight kernel
-        // still references a buffer that's about to be dropped into the LRU
-        // cache (the flaky NotPresent root cause). wait_signal_value attaches
-        // the fault via poll_faults_nonblocking, which already poisons.
-        if let Err(e) = timeline_signal.wait_signal_value(next, 30_000) {
-            self.dev.poison(&e.to_string());
-            return Err(e);
+        // Async by default (tinygrad `hcq.py:380`): the dispatch is submitted
+        // and we return immediately. GPU-side ordering is the device timeline
+        // (every dispatch waits the previous value); host reads synchronize via
+        // `AmdAllocator::_copyout` / the `Buffer::as_*` guards, and buffer frees
+        // drain via `AmdAllocator::_free`. Only block when `wait` is set (e.g.
+        // benchmark timing) — `synchronize()` drains through `signalled`.
+        if wait {
+            let _ = signalled;
+            self.dev.synchronize()?;
         }
         Ok(())
     }
