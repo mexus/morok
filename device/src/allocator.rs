@@ -478,6 +478,12 @@ impl Allocator for LruAllocator {
         }
         let key = CacheKey { size: buffer.size(), cpu_accessible: options.cpu_accessible, uncached: options.uncached };
 
+        // Drain before recycling: the freed buffer's VA can only be safely
+        // re-handed once the GPU has finished every kernel that still holds its
+        // GVA. Mirrors tinygrad's `_free` synchronize (`hcq.py:566`). No-op on
+        // CPU and on an already-drained AMD timeline; fixes stale-VA NotPresent.
+        let _ = self.inner.synchronize();
+
         // Push onto the per-key cache if space remains. When the cache is
         // full, route the overflow through `inner.free` so the underlying
         // allocator can actually release the handle. Without this, AMD/CUDA
