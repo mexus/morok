@@ -68,9 +68,10 @@ pub fn render_wmma_amd(
              {c_ty} {c_name}, i32 0, i32 0, i32 0)"
         ));
     } else {
-        // WMMA signature: optional `i1 false` trailing arg for signed-int paths
-        // and integer accumulators; float-accumulating WMMAs take just (A,B,C).
-        let needs_tail = matches!(acc_scalar, Some(ScalarDType::Int32 | ScalarDType::Int16));
+        // WMMA signature: any non-f32 accumulator (f16/bf16/int) takes a trailing
+        // `i1 false` (the clamp/opsel bit); f32-accumulating WMMAs take (A,B,C)
+        // only. Mirrors tinygrad `dtype.scalar() != float` (`llvmir.py:62`).
+        let needs_tail = !matches!(acc_scalar, Some(ScalarDType::Float32));
         let tail = if needs_tail { ", i1 false" } else { "" };
         kernel.push(format!(
             "  {dst} = call {acc_ty} @{intrinsic}({a_ty} {a_name}, {b_ty} {b_name}, {c_ty} {c_name}{tail})"
@@ -106,12 +107,17 @@ fn resolve_intrinsic(
     let acc_dt = acc_dt?;
 
     if arch.is_cdna() {
-        let in_suffix = match in_dt {
-            ScalarDType::Float16 => "f16",
-            ScalarDType::BFloat16 => "bf16",
-            ScalarDType::Float32 => "f32",
-            ScalarDType::FP8E4M3 => "fp8.fp8",
-            ScalarDType::FP8E5M2 => "bf8.bf8",
+        // CDNA fp8/bf8 carry their own leading dot; bf16/f16 use `bf16.1k`/`f16`
+        // for K=16 and the dotted `.bf16`/`.f16` forms for K=32 (tinygrad
+        // `llvmir.py:51-56`). Other suffixes append directly after `{k}`.
+        let in_suffix = match (in_dt, k) {
+            (ScalarDType::Float16, 32) => ".f16",
+            (ScalarDType::BFloat16, 32) => ".bf16",
+            (ScalarDType::Float16, _) => "f16",
+            (ScalarDType::BFloat16, _) => "bf16.1k",
+            (ScalarDType::Float32, _) => "f32",
+            (ScalarDType::FP8E4M3, _) => ".fp8.fp8",
+            (ScalarDType::FP8E5M2, _) => ".bf8.bf8",
             _ => return None,
         };
         let acc_suffix = match acc_dt {
@@ -152,7 +158,17 @@ mod tests {
     fn cdna_mfma_naming() {
         let name =
             resolve_intrinsic(AmdArch::Gfx942, Some(ScalarDType::BFloat16), Some(ScalarDType::Float32), (16, 16, 16));
-        assert_eq!(name.as_deref(), Some("llvm.amdgcn.mfma.f32.16x16x16bf16"));
+        assert_eq!(name.as_deref(), Some("llvm.amdgcn.mfma.f32.16x16x16bf16.1k"));
+    }
+
+    #[test]
+    fn cdna_mfma_k32_and_fp8() {
+        let k32 =
+            resolve_intrinsic(AmdArch::Gfx942, Some(ScalarDType::Float16), Some(ScalarDType::Float32), (16, 16, 32));
+        assert_eq!(k32.as_deref(), Some("llvm.amdgcn.mfma.f32.16x16x32.f16"));
+        let fp8 =
+            resolve_intrinsic(AmdArch::Gfx942, Some(ScalarDType::FP8E4M3), Some(ScalarDType::Float32), (16, 16, 16));
+        assert_eq!(fp8.as_deref(), Some("llvm.amdgcn.mfma.f32.16x16x16.fp8.fp8"));
     }
 
     #[test]
