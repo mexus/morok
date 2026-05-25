@@ -23,6 +23,7 @@ use crate::amd::signal::AmdSignal;
 use crate::amd::sys::{ioctl, kfd};
 use crate::amd::topology::{AmdNode, enumerate};
 use crate::error::{Error, Result};
+use crate::sync::TimelineSignal;
 
 /// Per-process cache of opened `AmdDevice`s, keyed by `device_id`. KFD only
 /// accepts one `ACQUIRE_VM` per (process, GPU); the cache ensures that
@@ -134,6 +135,12 @@ pub struct AmdDevice {
     /// gate is a single Relaxed load; the message is written once on latch.
     poisoned: AtomicBool,
     error_msg: OnceLock<String>,
+    /// Whether an SDMA copy queue is available. Set by the factory after it
+    /// tries to create one (`ops_amd.py:1000` / `has_sdma_queue`). Defaults to
+    /// `false` so that — before wiring, and on hardware without SDMA (e.g.
+    /// APUs) — `AmdAllocator::_alloc` forces `cpu_access` and copies go through
+    /// the host `memmove` path (`ops_amd.py:649`, hcq.py:576-578).
+    has_sdma_queue: AtomicBool,
 }
 
 impl AmdDevice {
@@ -292,7 +299,21 @@ impl AmdDevice {
             timeline_value: AtomicU64::new(1),
             poisoned: AtomicBool::new(false),
             error_msg: OnceLock::new(),
+            has_sdma_queue: AtomicBool::new(false),
         }))
+    }
+
+    /// Record whether an SDMA copy queue was successfully created. Called once
+    /// from the device factory. When `false`, `AmdAllocator::_alloc` forces
+    /// `cpu_access` so every buffer is host-visible and copies use `memmove`.
+    pub fn set_has_sdma_queue(&self, present: bool) {
+        self.has_sdma_queue.store(present, Ordering::Release);
+    }
+
+    /// Whether an SDMA copy queue is available (`ops_amd.py` `has_sdma_queue`).
+    #[inline]
+    pub fn has_sdma_queue(&self) -> bool {
+        self.has_sdma_queue.load(Ordering::Acquire)
     }
 
     /// Block in the kernel for up to `timeout_ms` waiting on **any** of the
@@ -445,7 +466,22 @@ impl AmdDevice {
         if target == 0 {
             return Ok(());
         }
-        signal.wait_signal_value(target, 30_000).inspect_err(|e| self.poison(&e.to_string()))
+        signal.wait_signal_value(target, 30_000).inspect_err(|e| self.poison(&e.to_string()))?;
+
+        // Timeline wraparound (`hcq.py:442,480`). PM4 WAIT_REG_MEM / RELEASE_MEM
+        // compare the *low 32 bits* of the signal, so the counter must stay
+        // below 2^32. We've just drained to `target` (GPU idle), so it's safe to
+        // reset the signal slot to 0 and restart the counter at 1 — tinygrad
+        // swaps to a shadow signal only to avoid draining, which we already did.
+        // Unreachable in practice (2^31 dispatches); resets at most once per
+        // 2-billion-kernel run. The reset assumes quiescence at the wrap point,
+        // which holds for the single device timeline outside a concurrent burst
+        // straddling exactly 2^31.
+        if self.timeline_value.load(Ordering::Acquire) > (1u64 << 31) {
+            signal.set(0);
+            self.timeline_value.store(1, Ordering::Release);
+        }
+        Ok(())
     }
 
     /// `true` once a fault/timeout has poisoned the device. Hot-path gate.
