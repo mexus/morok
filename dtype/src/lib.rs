@@ -1,10 +1,14 @@
+pub mod amd_arch;
 pub mod cast;
+pub mod default_device;
 pub mod ext;
 
 #[cfg(any(test, feature = "proptest"))]
 pub mod test;
 
 use std::path::PathBuf;
+
+pub use amd_arch::AmdArch;
 
 /// Device specification parsed from a device string.
 ///
@@ -18,6 +22,13 @@ pub enum DeviceSpec {
     Cpu,
     /// CUDA GPU device with specific device ID
     Cuda { device_id: usize },
+    /// AMD GPU device with specific device ID. KFD-direct runtime on Linux.
+    /// `arch` is intentionally NOT part of the spec — it's a hardware property
+    /// of the opened `AmdDevice` accessible via `dev.arch`. Mirrors tinygrad's
+    /// string-keyed `"AMD:N"` device identity, which avoids the
+    /// "two specs for the same physical device" trap that arises when arch
+    /// metadata is baked into the spec.
+    Amd { device_id: usize },
     /// Metal GPU device (Apple Silicon) with specific device ID
     Metal { device_id: usize },
     /// WebGPU device (browser or native WebGPU)
@@ -43,6 +54,7 @@ impl DeviceSpec {
         match self {
             DeviceSpec::Cpu => "CPU".to_string(),
             DeviceSpec::Cuda { device_id } => format!("CUDA:{device_id}"),
+            DeviceSpec::Amd { device_id } => format!("AMD:{device_id}"),
             DeviceSpec::Metal { device_id } => format!("Metal:{device_id}"),
             DeviceSpec::WebGpu => "WebGPU".to_string(),
             DeviceSpec::Disk { path } => format!("DISK:{}", path.display()),
@@ -62,6 +74,7 @@ impl DeviceSpec {
         match self {
             DeviceSpec::Cpu | DeviceSpec::Disk { .. } => None,
             DeviceSpec::Cuda { .. } => Some(128),
+            DeviceSpec::Amd { .. } => Some(128),
             DeviceSpec::Metal { .. } => Some(31),
             DeviceSpec::WebGpu => Some(8),
         }
@@ -85,6 +98,7 @@ impl DeviceSpec {
         match self {
             DeviceSpec::Cpu => "CPU",
             DeviceSpec::Cuda { .. } => "CUDA",
+            DeviceSpec::Amd { .. } => "AMD",
             DeviceSpec::Metal { .. } => "METAL",
             DeviceSpec::WebGpu => "WEBGPU",
             DeviceSpec::Disk { .. } => "DISK",
