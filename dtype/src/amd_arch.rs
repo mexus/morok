@@ -10,7 +10,6 @@ use core::fmt;
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum AmdArch {
     // CDNA — datacenter; MFMA, wave64.
-    Gfx90a,
     Gfx942,
     Gfx950,
     // RDNA3 — Radeon 7000; WMMA, wave32.
@@ -26,7 +25,7 @@ pub enum AmdArch {
 impl AmdArch {
     /// CDNA family (datacenter; MFMA intrinsics, wave64).
     pub const fn is_cdna(self) -> bool {
-        matches!(self, Self::Gfx90a | Self::Gfx942 | Self::Gfx950)
+        matches!(self, Self::Gfx942 | Self::Gfx950)
     }
 
     /// RDNA3 family (Radeon 7000; WMMA intrinsics, wave32).
@@ -56,7 +55,6 @@ impl AmdArch {
     /// clang `-mcpu=...` string.
     pub const fn mcpu(self) -> &'static str {
         match self {
-            Self::Gfx90a => "gfx90a",
             Self::Gfx942 => "gfx942",
             Self::Gfx950 => "gfx950",
             Self::Gfx1100 => "gfx1100",
@@ -78,7 +76,6 @@ impl AmdArch {
         // (decimal, not hex — the `gfx%d%x%x` string formatting in tinygrad's
         // `ops_amd.py:960` re-hexifies minor/step purely for display).
         Some(match v {
-            90_010 => Self::Gfx90a,
             90_402 => Self::Gfx942,
             90_500 => Self::Gfx950,
             110_000 => Self::Gfx1100,
@@ -94,7 +91,6 @@ impl AmdArch {
     /// Parse a `gfx{family}` string (case-insensitive).
     pub fn parse(s: &str) -> Option<Self> {
         match s.to_ascii_lowercase().as_str() {
-            "gfx90a" => Some(Self::Gfx90a),
             "gfx942" => Some(Self::Gfx942),
             "gfx950" => Some(Self::Gfx950),
             "gfx1100" => Some(Self::Gfx1100),
@@ -120,7 +116,7 @@ mod tests {
 
     #[test]
     fn version_round_trip() {
-        for arch in [AmdArch::Gfx90a, AmdArch::Gfx1100, AmdArch::Gfx1201] {
+        for arch in [AmdArch::Gfx942, AmdArch::Gfx1100, AmdArch::Gfx1201] {
             let s = arch.mcpu();
             assert_eq!(AmdArch::parse(s), Some(arch));
         }

@@ -12,15 +12,15 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use svod_dtype::AmdArch;
 use nix::fcntl::{OFlag, open};
 use nix::sys::stat::Mode;
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
+use svod_dtype::AmdArch;
 use tracing::debug;
 
-use crate::amd::sys::{ioctl, kfd};
 use crate::amd::signal::AmdSignal;
+use crate::amd::sys::{ioctl, kfd};
 use crate::amd::topology::{AmdNode, enumerate};
 use crate::error::{Error, Result};
 
@@ -163,7 +163,7 @@ impl AmdDevice {
         let arch = AmdArch::from_gfx_target_version(node.gfx_target_version).ok_or_else(|| Error::AmdAllocFailed {
             reason: format!(
                 "unsupported gfx target {} (decoded major.minor.step = {}.{}.{}); supported families: \
-                 CDNA gfx90a/942/950, RDNA3 gfx1100/1101/1102/1151, RDNA4 gfx1200/1201 \
+                 CDNA gfx942/950, RDNA3 gfx1100/1101/1102/1151, RDNA4 gfx1200/1201 \
                  (matches tinygrad's `assert target[0] in (11, 12) or target in ((9,4,2),(9,5,0))` \
                  in ops_amd.py:962)",
                 node.gfx_target_version,
@@ -583,28 +583,36 @@ fn alloc_event_page(kfd_fd: &OwnedFd, drm_fd: &OwnedFd, node: &AmdNode) -> Resul
 /// - `num_waves = (size_per_xcc / (wave_scratch * 256)) / se_cnt`
 /// - `max_scratch_waves = cu_cnt * max_slots_scratch_cu * xccs`
 /// - `WAVES = min(num_waves, max_scratch_waves)`, `WAVESIZE = wave_scratch`
-fn alloc_scratch(kfd_fd: &OwnedFd, node: &AmdNode, _arch: &AmdArch, private_segment_size: u32) -> Result<(u64, usize, u32, u32)> {
+fn alloc_scratch(
+    kfd_fd: &OwnedFd,
+    node: &AmdNode,
+    arch: &AmdArch,
+    private_segment_size: u32,
+) -> Result<(u64, usize, u32, u32)> {
     use libc::{MAP_ANONYMOUS, MAP_NORESERVE, MAP_PRIVATE, PROT_NONE, mmap, munmap};
 
     const LANES_PER_WAVE: u32 = 64;
-    const MEM_ALIGNMENT_SIZE: u32 = 256;
     const PAGE: usize = 0x1000;
+    // gfx9 (CDNA) scratch is 1024-byte aligned; gfx11/12 (RDNA) use 256.
+    let mem_alignment_size: u32 = if arch.is_cdna() { 1024 } else { 256 };
 
     let xccs = node.num_xcc.max(1);
     let simd_per_cu = node.simd_per_cu.max(1);
     let cu_cnt = ((node.simd_count.max(1) / simd_per_cu) / xccs).max(1);
     let max_slots = node.max_slots_scratch_cu.max(1);
-    let se_cnt = node.array_count.max(1);
+    let se_cnt = (node.array_count.max(1) / node.simd_arrays_per_engine.max(1) / xccs).max(1);
 
     // Round up to the per-lane alignment stride.
-    let size_per_thread = private_segment_size.max(1).next_multiple_of(MEM_ALIGNMENT_SIZE / LANES_PER_WAVE);
-    let size_per_xcc = (size_per_thread as usize) * (LANES_PER_WAVE as usize) * (max_slots as usize) * (cu_cnt as usize);
+    let size_per_thread = private_segment_size.max(1).next_multiple_of(mem_alignment_size / LANES_PER_WAVE);
+    let size_per_xcc =
+        (size_per_thread as usize) * (LANES_PER_WAVE as usize) * (max_slots as usize) * (cu_cnt as usize);
     let total = (size_per_xcc * xccs as usize).next_multiple_of(PAGE);
 
     // Reserve VA + KFD alloc as plain VRAM (GPU-only; no host access needed —
     // the GPU writes register spills here and reads them back).
     // SAFETY: standard libc::mmap; PROT_NONE reservation.
-    let va = unsafe { mmap(std::ptr::null_mut(), total, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0) };
+    let va =
+        unsafe { mmap(std::ptr::null_mut(), total, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0) };
     if va == libc::MAP_FAILED {
         return Err(Error::AmdAllocFailed { reason: "scratch VA reservation failed".into() });
     }
@@ -636,14 +644,28 @@ fn alloc_scratch(kfd_fd: &OwnedFd, node: &AmdNode, _arch: &AmdArch, private_segm
         return Err(Error::AmdIoctl { ioctl: "AMDKFD_IOC_MAP_MEMORY_TO_GPU(scratch)", errno: e as i32 });
     }
 
-    // Pack TMPRING_SIZE per gfx11 layout (waves: bits 0..12, wavesize: bits 12..27).
-    let wave_scratch = ((LANES_PER_WAVE * size_per_thread) + MEM_ALIGNMENT_SIZE - 1) / MEM_ALIGNMENT_SIZE;
+    // gfx9 divides scratch evenly across SEs (1); gfx11/12 divide by se_cnt.
+    let wave_scratch = (LANES_PER_WAVE * size_per_thread).div_ceil(mem_alignment_size);
     let max_scratch_waves = cu_cnt * max_slots * xccs;
-    let num_waves = ((size_per_xcc as u32) / (wave_scratch * MEM_ALIGNMENT_SIZE)) / se_cnt;
+    let se_div = if arch.is_cdna() { 1 } else { se_cnt };
+    let num_waves = ((size_per_xcc as u32) / (wave_scratch * mem_alignment_size)) / se_div;
     let waves = num_waves.min(max_scratch_waves);
-    let tmpring_size = (waves & 0xFFF) | ((wave_scratch & 0x7FFF) << 12);
+    let tmpring_size = pack_tmpring(waves, wave_scratch, arch);
 
     Ok((va as u64, total, tmpring_size, size_per_thread))
+}
+
+/// Pack `COMPUTE_TMPRING_SIZE`: WAVES in bits 0..12, WAVESIZE at bit 12 with an
+/// arch-specific field width — gfx9 13b, gfx11 15b, gfx12 18b.
+fn pack_tmpring(waves: u32, wave_scratch: u32, arch: &AmdArch) -> u32 {
+    let wavesize_mask: u32 = if arch.is_cdna() {
+        0x1FFF
+    } else if arch.is_rdna4() {
+        0x3FFFF
+    } else {
+        0x7FFF
+    };
+    (waves & 0xFFF) | ((wave_scratch & wavesize_mask) << 12)
 }
 
 fn open_owned(path: &str) -> Result<OwnedFd> {
@@ -705,5 +727,14 @@ mod tests {
             }
             Err(e) => panic!("unexpected error variant: {e:?}"),
         }
+    }
+
+    #[test]
+    fn pack_tmpring_wavesize_width_by_arch() {
+        // wave_scratch=0x3FFFF: cdna(13b) truncates, rdna3(15b) truncates, rdna4(18b) keeps it.
+        assert_eq!(pack_tmpring(1, 0x3FFFF, &AmdArch::Gfx942) >> 12, 0x1FFF);
+        assert_eq!(pack_tmpring(1, 0x3FFFF, &AmdArch::Gfx1100) >> 12, 0x7FFF);
+        assert_eq!(pack_tmpring(1, 0x3FFFF, &AmdArch::Gfx1200) >> 12, 0x3FFFF);
+        assert_eq!(pack_tmpring(0xABC, 0, &AmdArch::Gfx1100) & 0xFFF, 0xABC);
     }
 }

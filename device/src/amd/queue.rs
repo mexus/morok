@@ -614,6 +614,7 @@ fn create_queue(allocator: &AmdAllocator, queue_type: u32, ring_size: usize, aql
 
     if aql {
         // Initialize the GART descriptor (mirrors `ops_amd.py:1045-1048`).
+        // max_cu_id is total CUs across all XCCs - 1 (tinygrad cu_cnt*xccs-1).
         let cu_cnt = dev.node.simd_count.max(1) / dev.node.simd_per_cu.max(1);
         let waves_per_cu = dev.node.max_waves_per_simd * dev.node.simd_per_cu;
         let desc = crate::amd::sys::hsa::AmdQueueT {
@@ -752,7 +753,7 @@ fn compute_ctx_sizes(dev: &AmdDevice) -> (usize, usize, usize) {
     // tuples (`ops_amd.py:971`); CDNA (gfx9.x) uses 0x80000, the listed
     // RDNA3/RDNA4 tuples use 0x60000, Gfx1102 alone uses 0x40000.
     let vgpr_per_cu: usize = match dev.arch {
-        svod_dtype::AmdArch::Gfx90a | svod_dtype::AmdArch::Gfx942 | svod_dtype::AmdArch::Gfx950 => 0x80000,
+        svod_dtype::AmdArch::Gfx942 | svod_dtype::AmdArch::Gfx950 => 0x80000,
         svod_dtype::AmdArch::Gfx1100
         | svod_dtype::AmdArch::Gfx1101
         | svod_dtype::AmdArch::Gfx1151

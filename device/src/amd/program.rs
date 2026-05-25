@@ -322,8 +322,16 @@ impl AmdProgram {
         //   pm4_prog_addr = aql_prog_addr + kernel_code_entry_byte_offset
         let group_segment = parsed.kd.group_segment_fixed_size;
         let lds_size: u32 = ((group_segment.saturating_add(511) / 512) as u32) & 0x1FF;
+        let lds_limit = device.node.lds_size_in_kb.saturating_mul(1024) / 512;
+        if lds_size > lds_limit {
+            return Err(Error::GroupSegmentTooLarge {
+                requested: lds_size,
+                limit: lds_limit,
+                lds_kb: device.node.lds_size_in_kb,
+            });
+        }
         let target_major: u32 = match device.arch {
-            svod_dtype::AmdArch::Gfx90a | svod_dtype::AmdArch::Gfx942 | svod_dtype::AmdArch::Gfx950 => 9,
+            svod_dtype::AmdArch::Gfx942 | svod_dtype::AmdArch::Gfx950 => 9,
             svod_dtype::AmdArch::Gfx1100
             | svod_dtype::AmdArch::Gfx1101
             | svod_dtype::AmdArch::Gfx1102
@@ -408,8 +416,7 @@ impl AmdProgram {
                 (6, "private_segment_size"),
                 (10, "wavefront_size32"),
             ];
-            let set: Vec<&str> =
-                bits.iter().filter(|(b, _)| (kcp & (1u16 << b)) != 0).map(|(_, n)| *n).collect();
+            let set: Vec<&str> = bits.iter().filter(|(b, _)| (kcp & (1u16 << b)) != 0).map(|(_, n)| *n).collect();
             eprintln!("[program-load]   enabled bits: {:?}", set);
             // Diagnostic: confirm the kd relocation produced the right delta.
             // `entry` is the relocated `kernel_code_entry_byte_offset` field —
@@ -612,7 +619,9 @@ impl Program for AmdProgram {
             let group_seg = self.kd.group_segment_fixed_size;
             let packet = build_dispatch_packet(
                 [l[0] as u16, l[1] as u16, l[2] as u16],
-                [g[0] as u32, g[1] as u32, g[2] as u32],
+                // AQL grid_size is total threads (workgroups * local), unlike
+                // the PM4 DISPATCH_DIRECT path which counts workgroups.
+                [(g[0] * l[0]) as u32, (g[1] * l[1]) as u32, (g[2] * l[2]) as u32],
                 priv_seg,
                 group_seg,
                 self.aql_prog_addr,
