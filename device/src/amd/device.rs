@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::Arc;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use nix::fcntl::{OFlag, open};
 use nix::sys::stat::Mode;
@@ -124,6 +124,12 @@ pub struct AmdDevice {
     /// Highest timeline value submitted so far (next submit will use this and
     /// then increment). Mirrors `HCQCompiled.timeline_value` (`hcq.py:405`).
     timeline_value: AtomicU64,
+    /// Poison latch. Once a GPU fault/timeout is observed, the device is dead:
+    /// every `synchronize`/`execute` fails fast. Mirrors tinygrad's
+    /// `error_state` (`hcq.py:421`). `AtomicBool` so the per-dispatch hot path
+    /// gate is a single Relaxed load; the message is written once on latch.
+    poisoned: AtomicBool,
+    error_msg: OnceLock<String>,
 }
 
 impl AmdDevice {
@@ -273,6 +279,8 @@ impl AmdDevice {
             scratch_state: Mutex::new(ScratchState { gpu_va: scratch_va, size_per_thread, tmpring_size }),
             timeline_signal: OnceLock::new(),
             timeline_value: AtomicU64::new(1),
+            poisoned: AtomicBool::new(false),
+            error_msg: OnceLock::new(),
         }))
     }
 
@@ -387,6 +395,10 @@ impl AmdDevice {
     /// of GPU-written output buffers) for which `AmdProgram::execute` no
     /// longer blocks per-dispatch.
     pub fn synchronize(&self) -> Result<()> {
+        // Once latched, the device is dead — re-raise the recorded fault.
+        if let Some(err) = self.poison_error() {
+            return Err(err);
+        }
         // Skip cleanly when the timeline hasn't been wired up yet — the
         // factory installs it after `open()`, but allocator paths run during
         // device construction (e.g. ring/GART buffers) need to be a no-op.
@@ -397,7 +409,26 @@ impl AmdDevice {
         if target == 0 {
             return Ok(());
         }
-        signal.wait_signal_value(target, 30_000)
+        signal.wait_signal_value(target, 30_000).inspect_err(|e| self.poison(&e.to_string()))
+    }
+
+    /// `true` once a fault/timeout has poisoned the device. Hot-path gate.
+    #[inline]
+    pub fn is_poisoned(&self) -> bool {
+        self.poisoned.load(Ordering::Relaxed)
+    }
+
+    /// Latch a fault: device becomes unusable, message recorded once.
+    pub fn poison(&self, msg: &str) {
+        let _ = self.error_msg.set(msg.to_string());
+        self.poisoned.store(true, Ordering::Relaxed);
+    }
+
+    /// Recorded fault if poisoned, else `None`.
+    pub fn poison_error(&self) -> Option<Error> {
+        self.is_poisoned().then(|| Error::Runtime {
+            message: self.error_msg.get().cloned().unwrap_or_else(|| "AMD device poisoned".into()),
+        })
     }
 
     /// Non-blocking check: did the memory-fault or hw-exception event fire
@@ -430,26 +461,26 @@ impl AmdDevice {
         // matches the event we registered.
         let mem = unsafe { events[0].__bindgen_anon_1.memory_exception_data };
         if mem.gpu_id != 0 {
-            return Some(Error::Runtime {
-                message: format!(
-                    "AMD GPU memory fault on gpu_id={} va={:#x} (NotPresent={} ReadOnly={} NoExecute={} ErrorType={})",
-                    mem.gpu_id,
-                    { mem.va },
-                    mem.failure.NotPresent,
-                    mem.failure.ReadOnly,
-                    mem.failure.NoExecute,
-                    { mem.ErrorType },
-                ),
-            });
+            let msg = format!(
+                "AMD GPU memory fault on gpu_id={} va={:#x} (NotPresent={} ReadOnly={} NoExecute={} ErrorType={})",
+                mem.gpu_id,
+                { mem.va },
+                mem.failure.NotPresent,
+                mem.failure.ReadOnly,
+                mem.failure.NoExecute,
+                { mem.ErrorType },
+            );
+            self.poison(&msg);
+            return Some(Error::Runtime { message: msg });
         }
         let hw = unsafe { events[1].__bindgen_anon_1.hw_exception_data };
         if hw.gpu_id != 0 {
-            return Some(Error::Runtime {
-                message: format!(
-                    "AMD GPU hardware exception on gpu_id={} reset_type={} reset_cause={} memory_lost={}",
-                    hw.gpu_id, hw.reset_type, hw.reset_cause, hw.memory_lost,
-                ),
-            });
+            let msg = format!(
+                "AMD GPU hardware exception on gpu_id={} reset_type={} reset_cause={} memory_lost={}",
+                hw.gpu_id, hw.reset_type, hw.reset_cause, hw.memory_lost,
+            );
+            self.poison(&msg);
+            return Some(Error::Runtime { message: msg });
         }
         None
     }

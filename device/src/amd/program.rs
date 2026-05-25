@@ -301,7 +301,7 @@ impl AmdProgram {
         // Allocate VRAM for the code object (EXECUTABLE flag is set on every
         // AmdAllocator alloc; clang's amdgcn output runs on the GPU side).
         let size = parsed.image.len().next_multiple_of(0x1000);
-        let opts = BufferOptions { zero_init: false, cpu_accessible: true };
+        let opts = BufferOptions { zero_init: false, cpu_accessible: true, nolru: true, ..Default::default() };
         let code_buf = allocator.alloc(size, &opts)?;
         let (code_gpu, code_host) = match &code_buf {
             RawBuffer::AmdDevice { gpu_addr, host_ptr: Some(h), .. } => (*gpu_addr, *h),
@@ -486,6 +486,11 @@ impl Program for AmdProgram {
         global_size: Option<[usize; 3]>,
         local_size: Option<[usize; 3]>,
     ) -> Result<()> {
+        // Device poisoned by an earlier fault: refuse to dispatch (the GPU
+        // state and any cached buffer mappings are no longer trustworthy).
+        if let Some(err) = self.dev.poison_error() {
+            return Err(err);
+        }
         if buffers.len() != self.buf_count {
             return Err(Error::Runtime {
                 message: format!("AmdProgram: expected {} buffers, got {}", self.buf_count, buffers.len()),
@@ -642,7 +647,14 @@ impl Program for AmdProgram {
         //    source of truth: `AmdAllocator::free` calls
         //    `AmdDevice::synchronize` separately to drain anything queued
         //    by other paths.
-        timeline_signal.wait_signal_value(next, 30_000)?;
+        // On fault/timeout, poison the device and drain so no in-flight kernel
+        // still references a buffer that's about to be dropped into the LRU
+        // cache (the flaky NotPresent root cause). wait_signal_value attaches
+        // the fault via poll_faults_nonblocking, which already poisons.
+        if let Err(e) = timeline_signal.wait_signal_value(next, 30_000) {
+            self.dev.poison(&e.to_string());
+            return Err(e);
+        }
         Ok(())
     }
 
