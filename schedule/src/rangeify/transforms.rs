@@ -1074,7 +1074,7 @@ pub fn bufferize_to_store(
         }
 
         let wrap_range = reduce_ranges[0].clone();
-        let device = opts.device.clone().unwrap_or(svod_ir::DeviceSpec::Cpu);
+        let device = opts.device.clone().unwrap_or_else(svod_dtype::default_device::default_device);
 
         // Create buffer
         let buf = new_lunique_buffer(ctx, device, size, base_dtype.clone());
@@ -1144,7 +1144,7 @@ pub fn bufferize_to_store(
         existing_buffer.clone()
     } else if effective_addrspace == AddrSpace::Global {
         // Create BUFFER node — BUFFER → PARAM conversion happens later in split_store.
-        let device = opts.device.clone().unwrap_or(svod_ir::DeviceSpec::Cpu);
+        let device = opts.device.clone().unwrap_or_else(svod_dtype::default_device::default_device);
         new_lunique_buffer(ctx, device, size, base_dtype.clone())
     } else {
         // For local address space (only when allow_locals=true), create DEFINE_LOCAL directly.
