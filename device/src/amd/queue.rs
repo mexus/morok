@@ -363,8 +363,6 @@ impl AmdComputeQueue {
         rsrc3: u32,
         prog_addr: u64,
         user_data: &[u32],
-        scratch_addr: u64,
-        tmpring_size: u32,
         local: [u32; 3],
         grid: [u32; 3],
         wave32: bool,
@@ -372,6 +370,15 @@ impl AmdComputeQueue {
     ) -> Result<u64> {
         debug_assert!(self.is_pm4, "dispatch_pm4 called on AQL queue");
         let timeline_addr = self.dev.timeline_signal().value_addr();
+        // Serialize the whole submit (incl. the live scratch read below) against
+        // scratch realloc: `ensure_has_local_memory` holds this same lock while
+        // it drains + unmaps the old scratch VA, so a kernel can never be
+        // programmed with a scratch base that's freed before it runs.
+        let _disp = self.dev.lock_dispatch();
+        // Read the scratch VA + tmpring UNDER the dispatch lock so they reflect
+        // the current (post-realloc) scratch buffer, not a stale one.
+        let scratch_addr = self.dev.scratch_gpu_va();
+        let tmpring_size = self.dev.tmpring_size();
         let mut g = self.inner.lock();
         let prev = self.dev.timeline_value().saturating_sub(1);
         let next = self.dev.next_timeline();
@@ -413,6 +420,9 @@ impl AmdComputeQueue {
         debug_assert!(!self.is_pm4, "dispatch_aql called on PM4 queue");
         debug_assert_eq!(size_of::<HsaKernelDispatchPacket>(), AQL_PACKET_BYTES);
         let timeline_addr = self.dev.timeline_signal().value_addr();
+        // Serialize submit vs scratch realloc (the AQL scratch descriptor is
+        // rewritten by `ensure_has_local_memory` under this same lock).
+        let _disp = self.dev.lock_dispatch();
         let mut g = self.inner.lock();
         let prev = self.dev.timeline_value().saturating_sub(1);
         let next = self.dev.next_timeline();

@@ -605,14 +605,15 @@ impl Program for AmdProgram {
         // `AmdComputeQueue::dispatch_pm4`). Returns the timeline value this
         // dispatch signals on completion.
         let signalled = if self.queue.is_pm4() {
+            // scratch VA + tmpring are read inside dispatch_pm4 under the
+            // device dispatch lock (so a concurrent scratch realloc can't free
+            // the VA between read and submit) — not passed from here.
             self.queue.dispatch_pm4(
                 self.rsrc1,
                 self.rsrc2,
                 self.rsrc3,
                 self.pm4_prog_addr,
                 &user_data,
-                self.dev.scratch_gpu_va(),
-                self.dev.tmpring_size(),
                 [l[0] as u32, l[1] as u32, l[2] as u32],
                 [g[0] as u32, g[1] as u32, g[2] as u32],
                 self.wave32,

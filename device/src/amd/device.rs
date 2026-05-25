@@ -141,6 +141,18 @@ pub struct AmdDevice {
     /// APUs) — `AmdAllocator::_alloc` forces `cpu_access` and copies go through
     /// the host `memmove` path (`ops_amd.py:649`, hcq.py:576-578).
     has_sdma_queue: AtomicBool,
+    /// Serializes a dispatch's submit critical section (timeline-value
+    /// acquisition + reading the live scratch VA + ring blit) against teardown
+    /// of any *live* GPU resource (scratch realloc free, buffer unmap). Without
+    /// it, async dispatch captures a VA (e.g. the scratch base in
+    /// `AmdProgram::execute`/`dispatch_pm4`) but publishes its timeline value
+    /// only under the ring lock, so a concurrent thread's `synchronize()`
+    /// snapshot can miss the unpublished dispatch and unmap a VA the kernel is
+    /// about to program — a NotPresent fault on the freed VA. tinygrad avoids
+    /// this with the GIL; Svod runs concurrent `realize()`s against one shared
+    /// device, so we serialize explicitly. Held only for the brief submit
+    /// window and for the (rare) teardown drain.
+    dispatch_lock: Mutex<()>,
 }
 
 impl AmdDevice {
@@ -300,7 +312,17 @@ impl AmdDevice {
             poisoned: AtomicBool::new(false),
             error_msg: OnceLock::new(),
             has_sdma_queue: AtomicBool::new(false),
+            dispatch_lock: Mutex::new(()),
         }))
+    }
+
+    /// Acquire the dispatch/teardown serialization lock. Held by `dispatch_*`
+    /// across [timeline acquire + live-scratch read + ring blit], and by
+    /// scratch realloc / buffer `_free` across [drain + unmap], so a teardown
+    /// can never unmap a VA that an in-flight-but-unpublished dispatch will
+    /// program. See [`Self::dispatch_lock`].
+    pub fn lock_dispatch(&self) -> parking_lot::MutexGuard<'_, ()> {
+        self.dispatch_lock.lock()
     }
 
     /// Record whether an SDMA copy queue was successfully created. Called once
@@ -384,6 +406,13 @@ impl AmdDevice {
         }
         let (va, size, tmpring, rounded, handle) =
             alloc_scratch(&self.kfd_fd, &self.node, &self.arch, private_segment_size)?;
+        // Hold the dispatch lock across the swap + free so the old scratch VA is
+        // unmapped only when no in-flight dispatch can still program it: a
+        // concurrent `dispatch_pm4` reads the scratch VA under this same lock,
+        // so it sees either the old VA (and has published its timeline value,
+        // which `free_scratch`'s drain then covers) or the new VA. Closes the
+        // scratch-realloc NotPresent race under concurrent `realize()`.
+        let _disp = self.lock_dispatch();
         let stale = {
             let mut state = self.scratch_state.lock();
             // Re-check under lock — another caller might have grown larger between

@@ -620,7 +620,11 @@ impl LruAllocator {
             }
             RawBuffer::Mmap { .. } => panic!("DISK device is read-only: cannot zero-init mmap buffer"),
             #[cfg(target_os = "linux")]
-            RawBuffer::AmdDevice { host_ptr: Some(ptr), size, .. } => {
+            RawBuffer::AmdDevice { host_ptr: Some(ptr), size, device, .. } => {
+                // Drain first: this VA was just recycled from the pool and its
+                // previous owner's async kernel may still be writing it. A host
+                // memset isn't ordered on the GPU timeline, so synchronize.
+                device.synchronize()?;
                 unsafe { std::ptr::write_bytes(ptr.as_ptr(), 0, *size) };
                 Ok(true)
             }
