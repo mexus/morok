@@ -14,6 +14,7 @@ impl svod_device::Program for QueueProgram {
         _vals: &[i64],
         _global_size: Option<[usize; 3]>,
         _local_size: Option<[usize; 3]>,
+        _wait: bool,
     ) -> svod_device::Result<()> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         Ok(())

@@ -100,6 +100,56 @@ pub fn all_decomposition_patterns() -> TypedPatternMatcher<()> {
     }
 }
 
+/// Decomposition patterns for the AMD backend.
+///
+/// AMD's hardware `v_exp_f32`/`v_log_f32` (emitted as `@llvm.exp2`/`@llvm.log2`)
+/// are lower precision than CPU libm, so the exp/log/trig family is routed
+/// through the SLEEF `~1 ULP` polynomials instead. This mirrors tinygrad's
+/// `TRANSCENDENTAL=2` force mode (`uop/decompositions.py`), and uses the same
+/// coefficients (`transcendentals.rs`).
+///
+/// `Sqrt`/`Rsqrt` are deliberately **omitted** — AMD's `@llvm.sqrt` is
+/// IEEE-correct (~0.5 ULP), better than the polynomial, and tinygrad likewise
+/// keeps `SQRT` native in `AMDLLVMRenderer.code_for_op`.
+///
+/// Every pattern is guarded to `f16`/`f32`/`f64` (tinygrad's
+/// `TRANSCENDENTAL_DTYPES`): the polynomials are only defined for those, and
+/// integer `Pow` (ONNX `test_pow_types_*`) / `bf16` / `fp8` must keep their
+/// native lowering.
+pub fn amd_decomposition_patterns() -> TypedPatternMatcher<()> {
+    use crate::DType;
+    fn transc(d: &DType) -> bool {
+        use svod_dtype::ScalarDType::{Float16, Float32, Float64};
+        matches!(d.base(), Float16 | Float32 | Float64)
+    }
+    patterns! {
+        Exp2(src) if transc(&src.dtype()) ~> |src| xexp2(src),
+        Log2(src) if transc(&src.dtype()) ~> |src| xlog2(src),
+        Exp(src)  if transc(&src.dtype()) ~> |src| xexp(src),
+        Log(src)  if transc(&src.dtype()) ~> |src| xlog(src),
+        Sin(src)  if transc(&src.dtype()) ~> |src| xsin(src),
+        Cos(src)  if transc(&src.dtype()) ~> |src| xcos(src),
+        Tan(src)  if transc(&src.dtype()) ~> |src| xtan(src),
+        Erf(src)  if transc(&src.dtype()) ~> |src| xerf(src),
+
+        // Binary pow: x^y = exp2(y * log2(x))
+        Pow(base, exp) if transc(&base.dtype()) ~> |base, exp| xpow(base, exp),
+
+        // bf16/fp8/int fall back to f32 then cast back (tinygrad's cast arm).
+        // Int `Pow` would otherwise hit `@llvm.pow.f64`, which amdgcn can't
+        // select; bf16/fp8 transcendentals have no native intrinsic either.
+        Exp2(src) ~> |src| xexp2(&src.cast(DType::Float32)).cast(src.dtype()),
+        Log2(src) ~> |src| xlog2(&src.cast(DType::Float32)).cast(src.dtype()),
+        Exp(src)  ~> |src| xexp(&src.cast(DType::Float32)).cast(src.dtype()),
+        Log(src)  ~> |src| xlog(&src.cast(DType::Float32)).cast(src.dtype()),
+        Sin(src)  ~> |src| xsin(&src.cast(DType::Float32)).cast(src.dtype()),
+        Cos(src)  ~> |src| xcos(&src.cast(DType::Float32)).cast(src.dtype()),
+        Tan(src)  ~> |src| xtan(&src.cast(DType::Float32)).cast(src.dtype()),
+        Erf(src)  ~> |src| xerf(&src.cast(DType::Float32)).cast(src.dtype()),
+        Pow(base, exp) ~> |base, exp| xpow(&base.cast(DType::Float32), &exp.cast(DType::Float32)).cast(base.dtype()),
+    }
+}
+
 /// Apply decomposition to a UOp graph using the provided pattern matcher.
 ///
 /// Uses `graph_rewrite_bottom_up` to traverse the graph and apply decomposition
