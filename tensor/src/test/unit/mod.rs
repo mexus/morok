@@ -27,7 +27,6 @@ pub mod transformer;
 pub mod triangular;
 pub mod variable;
 
-pub mod fusion;
 pub mod scatter_debug;
 pub mod schedule;
 pub mod schedule_cache;
