@@ -33,7 +33,7 @@ use parking_lot::Mutex;
 
 use crate::allocator::RawBuffer;
 use crate::amd::AmdAllocator;
-use crate::amd::device::AmdDevice;
+use crate::amd::connector::AmdConnector;
 use crate::amd::hw_queue::{AmdHwQueue, Sym, VarVals};
 use crate::amd::program::AmdProgram;
 use crate::amd::queue::AmdComputeQueue;
@@ -44,7 +44,13 @@ use crate::sync::TimelineSignal;
 
 /// A captured, replayable AMD kernel chain.
 pub struct AmdGraph {
-    dev: Arc<AmdDevice>,
+    /// Per-graph connector — owns the scratch, timeline signal/value, and the
+    /// (transitional) dispatch lock used for replay. Built fresh in
+    /// [`AmdGraph::capture`] from the captured kernels' shared device core.
+    /// Step 5 of the connector refactor: replaces `dev: Arc<AmdDevice>` so
+    /// the graph runs on isolated dispatch state — no per-call sibling can
+    /// race its timeline reservation or scratch realloc.
+    connector: Arc<AmdConnector>,
     /// The single PM4 command stream for the whole chain (preamble + N execs +
     /// final signal), bound into a host-visible page. `submit` mutates its
     /// patch state, so it sits behind a `Mutex` — replay takes `&self`
@@ -108,9 +114,24 @@ impl AmdGraph {
                 return Ok(None);
             }
         }
-        if let Some(err) = dev.poison_error() {
+        if let Some(err) = dev.core().poison_error() {
             return Err(err);
         }
+
+        // ── Build a fresh per-graph connector (Step 5 of the connector refactor).
+        // Owns its own scratch + timeline so replay no longer contends with
+        // per-call dispatchers on the device's default connector. Grown to fit
+        // the captured kernels' private-segment requirement; timeline signal
+        // acquired from the shared pool (same pool the per-call signals come
+        // from — pool access is rare, intra-pool Mutex is fine).
+        let connector = AmdConnector::new(Arc::clone(dev.core()))?;
+        let mut max_priv_seg = 128u32;
+        for p in &progs {
+            max_priv_seg = max_priv_seg.max(p.private_segment_size());
+        }
+        connector.ensure_has_local_memory(max_priv_seg)?;
+        let timeline_sig = Arc::new(progs[0].signal_pool().acquire()?);
+        connector.init_timeline(timeline_sig);
 
         // ── Lay out one 16-byte-aligned kernarg slot per kernel inside a single
         // dedicated page (← `kernargs_bufs` + per-kernel `BumpAllocator.alloc`,
@@ -159,7 +180,7 @@ impl AmdGraph {
 
         // ── Build the one command stream. (← `comp_queues[dev]`, plus the
         // preamble/exec/final loop at `graph/hcq.py:158-217`.)
-        let mut comp_queue = AmdHwQueue::new(Arc::clone(&dev), Arc::clone(&queue));
+        let mut comp_queue = AmdHwQueue::new(Arc::clone(&connector), Arc::clone(&queue));
 
         // Preamble (← graph/hcq.py:158-160).
         comp_queue.preamble(kick_sig.value_addr(), self_sig.value_addr());
@@ -201,12 +222,16 @@ impl AmdGraph {
                 kernels.len(),
                 kick_sig.value_addr(),
                 self_sig.value_addr(),
-                dev.scratch_gpu_va(),
+                connector.scratch_gpu_va(),
             );
         }
+        // `dev` is now unused — keep the variable name for the construction trace
+        // above (it still drives validation) but drop the local: capture stores
+        // the connector, not the device.
+        drop(dev);
 
         Ok(Some(Box::new(AmdGraph {
-            dev,
+            connector,
             comp_queue: Mutex::new(comp_queue),
             _kernargs_buf: kernargs_buf,
             kick_sig,
@@ -228,7 +253,7 @@ impl Graph for AmdGraph {
     /// plan-stable too — only the timeline/kickoff symbols change per replay.
     fn replay(&self, vals: &[i64]) -> Result<()> {
         let _ = vals;
-        if let Some(err) = self.dev.poison_error() {
+        if let Some(err) = self.connector.core().poison_error() {
             return Err(err);
         }
 
@@ -241,29 +266,28 @@ impl Graph for AmdGraph {
         };
         let last = *self.last_timeline.lock();
         if last > 0 {
-            self.dev.timeline_signal().wait(last, 30_000)?;
+            self.connector.timeline_signal().wait(last, 30_000)?;
         }
 
-        // 2. Reserve this replay's device-timeline step and submit the IB —
-        //    atomically under the dispatch lock so a concurrent per-call
-        //    `dispatch_pm4` can't grab a timeline value between our reservation
-        //    and ring push (which would deadlock the CP; see
-        //    `AmdComputeQueue::submit_dwords`). The graph holds the lock across
-        //    [reserve → patch → push]; the lengthy waits/synchronize stay
-        //    OUTSIDE it so dispatch isn't stalled on the GPU.
+        // 2. Reserve this replay's timeline step and submit the IB. Under Step 5
+        //    of the connector refactor the graph owns its connector
+        //    exclusively, so the timeline + ring are not contended by any
+        //    sibling dispatcher — the prior `lock_dispatch()` critical section
+        //    around [reserve → patch → push] is no longer needed and would
+        //    be deleted in Step 7. We keep the bracketed block to scope the
+        //    `comp_queue` lock acquisition.
         let signalled = {
-            let _disp = self.dev.lock_dispatch();
             // VirtTimelineVal = timeline_value-1 (what the preamble waits for);
-            // the final signal writes +1, advancing the device timeline by
+            // the final signal writes +1, advancing the connector timeline by
             // exactly one step. `next_timeline` reserves that same value.
-            let prev = self.dev.timeline_value().saturating_sub(1);
-            let signalled = self.dev.next_timeline();
+            let prev = self.connector.timeline_value().saturating_sub(1);
+            let signalled = self.connector.next_timeline();
 
             // Resolve the graph's symbols (← `hcq_var_vals`, graph/hcq.py:275-285).
             let mut var_vals: VarVals = VarVals::new();
             var_vals.insert(Sym::Kickoff, kickoff_value);
             var_vals.insert(Sym::VirtTimelineVal, prev);
-            var_vals.insert(Sym::VirtTimelineSigAddr, self.dev.timeline_signal().value_addr());
+            var_vals.insert(Sym::VirtTimelineSigAddr, self.connector.timeline_signal().value_addr());
 
             // submit → apply_var_vals (patch hw_page + kernargs) → _submit (one
             //  doorbell). (← graph/hcq.py:290.)

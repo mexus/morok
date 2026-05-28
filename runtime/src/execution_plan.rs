@@ -286,6 +286,18 @@ pub struct ExecutionPlan {
     /// dispatch. Replaces N packet-builds + N doorbells with one submit; see
     /// `svod_device::Graph` (AMD indirect buffer).
     graph: std::sync::OnceLock<Option<Box<dyn svod_device::Graph>>>,
+
+    /// Per-plan AMD connector — owns this plan's scratch, timeline, dispatch
+    /// lock. Lazy-init on the first AMD kernel dispatch from the program's
+    /// `Arc<AmdDeviceCore>` (cheap: the core is process-cached via
+    /// `DEVICE_CACHE` and we Arc::clone it). Decouples this plan's dispatch
+    /// state from other plans' on the same physical AMD:N — Step 4 of the
+    /// connector refactor (`snug-honking-robin`).
+    ///
+    /// Non-AMD plans never touch this field; CPU programs continue to use
+    /// `Program::execute(...)`.
+    #[cfg(target_os = "linux")]
+    amd_connector: std::sync::OnceLock<std::sync::Arc<svod_device::amd::AmdConnector>>,
 }
 
 // ============================================================================
@@ -367,10 +379,60 @@ impl ExecutionPlan {
         factory(&kernels).map_err(|e| crate::error::Error::Execution { reason: format!("graph capture: {e}") })
     }
 
+    /// Lazy-init the plan's own AMD connector and return it. Cheap to call
+    /// repeatedly — the connector lives for the plan's lifetime. Built from
+    /// the program's `Arc<AmdDeviceCore>` (process-cached via `DEVICE_CACHE`)
+    /// and seeded with a timeline signal acquired from the program's signal
+    /// pool. Step 4 of the connector refactor — gives this plan a private
+    /// scratch + timeline so cross-plan dispatches no longer contend on the
+    /// shared device default connector.
+    #[cfg(target_os = "linux")]
+    fn amd_connector_for(
+        &self,
+        prog: &svod_device::amd::AmdProgram,
+    ) -> Result<std::sync::Arc<svod_device::amd::AmdConnector>> {
+        if let Some(c) = self.amd_connector.get() {
+            return Ok(std::sync::Arc::clone(c));
+        }
+        // Build outside the OnceLock::get_or_init so we can propagate errors
+        // (SignalPool::acquire returns Result). One-shot init race: if two
+        // threads see empty, both build a connector; only one wins set().
+        let new_conn = svod_device::amd::AmdConnector::new(std::sync::Arc::clone(prog.device().core()))
+            .map_err(|e| crate::error::Error::Execution { reason: format!("AmdConnector::new: {e}") })?;
+        let sig = std::sync::Arc::new(
+            prog.signal_pool()
+                .acquire()
+                .map_err(|e| crate::error::Error::Execution { reason: format!("timeline signal acquire: {e}") })?,
+        );
+        new_conn.init_timeline(sig);
+        // Race: another thread may have already installed one. set() returns
+        // Err with our value if so; either way we then return the installed
+        // connector via get().
+        let _ = self.amd_connector.set(new_conn);
+        Ok(std::sync::Arc::clone(self.amd_connector.get().expect("connector set above")))
+    }
+
     #[inline]
-    fn execute_kernel(kernel: &PreparedKernel) -> Result<()> {
+    fn execute_kernel(&self, kernel: &PreparedKernel) -> Result<()> {
         let buffer_ptrs: SmallVec<[*mut u8; 8]> = kernel.buffer_ptrs.iter().map(|&ptr| ptr as *mut u8).collect();
         let (global_size, local_size) = Self::kernel_launch_sizes(kernel)?;
+        // Fast path for AMD: downcast and dispatch via `execute_on` with the
+        // plan's own connector. Step 4 of the connector refactor — keeps each
+        // plan's scratch/timeline/dispatch-lock state isolated.
+        #[cfg(target_os = "linux")]
+        if let Some(amd) = kernel.kernel.program.as_any().downcast_ref::<svod_device::amd::AmdProgram>() {
+            let conn = self.amd_connector_for(amd)?;
+            // Grow this connector's scratch to fit the program. Mirrors
+            // tinygrad's `_ensure_has_local_memory` at program load
+            // (`ops_amd.py:589-590`) but applied per-connector.
+            conn.ensure_has_local_memory(amd.private_segment_size())
+                .map_err(|e| crate::error::Error::Execution { reason: format!("scratch grow: {e}") })?;
+            return unsafe {
+                amd.execute_on(&conn, &buffer_ptrs, &kernel.vals, global_size, local_size, /*wait=*/ false).map_err(
+                    |e| crate::error::Error::Execution { reason: format!("Kernel {} failed: {}", kernel.id, e) },
+                )
+            };
+        }
         unsafe {
             kernel
                 .kernel
@@ -563,7 +625,7 @@ impl ExecutionPlan {
     #[inline]
     fn execute_op(&self, op: &PreparedOp) -> Result<()> {
         match op {
-            PreparedOp::CompiledProgram(kernel) => Self::execute_kernel(kernel),
+            PreparedOp::CompiledProgram(kernel) => self.execute_kernel(kernel),
             PreparedOp::BufferCopy(copy) => self.execute_copy(copy),
             PreparedOp::BufferView(view) => self.execute_buffer_view(view),
             PreparedOp::CustomFunction(custom) => self.execute_custom_function(custom),
@@ -668,7 +730,7 @@ impl ExecutionPlan {
                         reason: format!("parallel execution expected compiled kernel at op index {idx}"),
                     });
                 };
-                Self::execute_kernel(kernel)?;
+                self.execute_kernel(kernel)?;
             }
             return Ok(());
         }
@@ -681,7 +743,7 @@ impl ExecutionPlan {
                         reason: format!("parallel execution expected compiled kernel at op index {idx}"),
                     });
                 };
-                Self::execute_kernel(kernel)
+                self.execute_kernel(kernel)
             })
             .collect::<Result<Vec<_>>>()?;
 
@@ -698,7 +760,7 @@ impl ExecutionPlan {
                     });
                 };
                 let start = Instant::now();
-                Self::execute_kernel(kernel)?;
+                self.execute_kernel(kernel)?;
                 profiles.push((
                     idx,
                     KernelProfile {
@@ -730,7 +792,7 @@ impl ExecutionPlan {
                     });
                 };
                 let start = Instant::now();
-                Self::execute_kernel(kernel)?;
+                self.execute_kernel(kernel)?;
                 profiles.push((
                     idx,
                     KernelProfile {
@@ -753,7 +815,7 @@ impl ExecutionPlan {
                     });
                 };
                 let start = Instant::now();
-                Self::execute_kernel(kernel)?;
+                self.execute_kernel(kernel)?;
                 Ok((
                     idx,
                     KernelProfile {
@@ -927,7 +989,7 @@ impl ExecutionPlan {
                         }
 
                         let start = Instant::now();
-                        Self::execute_kernel(kernel)?;
+                        self.execute_kernel(kernel)?;
                         profiles.push(KernelProfile {
                             kernel: Arc::clone(&kernel.kernel),
                             device: kernel.device.clone(),
@@ -1249,6 +1311,8 @@ impl ExecutionPlanBuilder {
             runtime_var_vals: HashMap::new(),
             alias_ids: self.alias_ids,
             graph: std::sync::OnceLock::new(),
+            #[cfg(target_os = "linux")]
+            amd_connector: std::sync::OnceLock::new(),
         })
     }
 }

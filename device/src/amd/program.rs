@@ -522,6 +522,14 @@ impl AmdProgram {
         (self.buf_count, self.var_count)
     }
 
+    /// Required private (scratch) segment size in bytes-per-thread, from the
+    /// kernel descriptor (`kd.private_segment_fixed_size`). Used by callers
+    /// to size the connector's scratch before dispatch
+    /// (`AmdConnector::ensure_has_local_memory`).
+    pub fn private_segment_size(&self) -> u32 {
+        self.kd.private_segment_fixed_size
+    }
+
     /// Shared per-process signal pool — the graph carves its kickoff / self
     /// signals from it (reachable via `AmdProgram` because the graph downcasts
     /// the first captured kernel's `dyn Program`). Mirrors tinygrad reaching
@@ -577,9 +585,22 @@ impl std::fmt::Debug for AmdProgram {
     }
 }
 
-impl Program for AmdProgram {
-    unsafe fn execute(
+impl AmdProgram {
+    /// Connector-scoped dispatch entry point. Reads scratch / timeline /
+    /// dispatch lock from `conn` instead of `self.dev`'s default connector,
+    /// so future steps can plumb in a plan-/graph-owned connector with no
+    /// further AmdProgram changes. Equivalent to today's `execute` when
+    /// `conn == self.dev.connector()`.
+    ///
+    /// # Safety
+    ///
+    /// Same contract as [`Program::execute`]: `buffers` must point to live GPU
+    /// VAs that outlive the dispatch, `vals` must match the kernel's variable
+    /// arity, and launch dims must be valid for the kernel descriptor.
+    #[allow(clippy::missing_safety_doc)]
+    pub unsafe fn execute_on(
         &self,
+        conn: &crate::amd::connector::AmdConnector,
         buffers: &[*mut u8],
         vals: &[i64],
         global_size: Option<[usize; 3]>,
@@ -588,7 +609,7 @@ impl Program for AmdProgram {
     ) -> Result<()> {
         // Device poisoned by an earlier fault: refuse to dispatch (the GPU
         // state and any cached buffer mappings are no longer trustworthy).
-        if let Some(err) = self.dev.poison_error() {
+        if let Some(err) = conn.core().poison_error() {
             return Err(err);
         }
         if buffers.len() != self.buf_count {
@@ -638,10 +659,6 @@ impl Program for AmdProgram {
         }
         for v in vals {
             // Truncate i64 → i32 to match the kernel's `i32` var dtype.
-            // Caller-supplied vals are already within Variable's [min, max]
-            // bounds, which `define_var` clamps to fit i32. (Future-proof:
-            // if a kernel renders i64 vars, store dtype-per-var in
-            // AmdProgram and dispatch here on width.)
             let bytes = (*v as i32).to_le_bytes();
             unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), host_base.add(cursor), 4) };
             cursor += 4;
@@ -649,15 +666,8 @@ impl Program for AmdProgram {
         let kernarg_gpu = self.arena.gpu_at(off);
 
         // 2. Match tinygrad's HCQ submit sequence at `hcq.py:371-378`:
-        //   wait(dev.timeline, dev.timeline_value-1) → memory_barrier → exec
-        //   → signal(dev.timeline, dev.next_timeline()) → submit
-        //
-        // The wait/signal timeline values are acquired *inside* `dispatch_*`
-        // under the ring lock (so concurrent rayon dispatches stay ordered);
-        // execute() must NOT call `next_timeline()` here or it would
-        // double-increment the counter. The device-global timeline lets
-        // `AmdDevice::synchronize` drain everything before `AmdAllocator::_free`
-        // unmaps a buffer whose VA may still be queued in a pending kernel.
+        //   wait(conn.timeline, conn.timeline_value-1) → memory_barrier → exec
+        //   → signal(conn.timeline, conn.next_timeline()) → submit
         let g = global_size.unwrap_or([1, 1, 1]);
         let l = local_size.unwrap_or([1, 1, 1]);
 
@@ -666,7 +676,7 @@ impl Program for AmdProgram {
                 buffers.iter().enumerate().map(|(i, b)| format!("buf{}={:#x}", i, *b as u64)).collect();
             eprintln!(
                 "[dispatch tv={}] kernel={} grid=[{}, {}, {}] local=[{}, {}, {}] is_pm4={} kernarg_gpu={:#x} scratch={:#x} {}",
-                self.dev.timeline_value(),
+                conn.timeline_value(),
                 self.name,
                 g[0],
                 g[1],
@@ -676,33 +686,23 @@ impl Program for AmdProgram {
                 l[2],
                 self.queue.is_pm4(),
                 kernarg_gpu,
-                self.dev.scratch_gpu_va(),
+                conn.scratch_gpu_va(),
                 bufs_str.join(" "),
             );
         }
 
-        // USER_DATA SGPR pre-load. We only assemble the kernarg pointer here;
-        // the optional scratch SGPR descriptor (ENABLE_SGPR_PRIVATE_SEGMENT_BUFFER)
-        // is prepended inside `dispatch_pm4` under the dispatch lock, so it reads
-        // the live scratch VA in the same critical section as the
-        // `COMPUTE_DISPATCH_SCRATCH_BASE` register (a concurrent scratch realloc
-        // can no longer desync the descriptor from the register). ENABLE_SGPR_
-        // DISPATCH_PTR (bit 1) is rejected at program load. Mirrors tinygrad
-        // `ops_amd.py:325-342` (single `prg.dev.scratch.va_addr` read in `exec`).
+        // USER_DATA SGPR pre-load: kernarg pointer only — the optional scratch
+        // SGPR descriptor is prepended inside `dispatch_pm4` under the
+        // connector's dispatch lock so it reads the live scratch VA in the
+        // same critical section as `COMPUTE_DISPATCH_SCRATCH_BASE`. Mirrors
+        // tinygrad `ops_amd.py:325-342`.
         let mut user_data: smallvec::SmallVec<[u32; 8]> = smallvec::SmallVec::new();
         user_data.push(kernarg_gpu as u32);
         user_data.push((kernarg_gpu >> 32) as u32);
 
-        // Atomically build + submit the whole wait→barrier→exec→signal stream.
-        // `dispatch_*` holds the ring lock across timeline acquisition + blit +
-        // doorbell, so concurrent rayon dispatches stay ordered (see
-        // `AmdComputeQueue::dispatch_pm4`). Returns the timeline value this
-        // dispatch signals on completion.
         let signalled = if self.queue.is_pm4() {
-            // scratch VA + tmpring are read inside dispatch_pm4 under the
-            // device dispatch lock (so a concurrent scratch realloc can't free
-            // the VA between read and submit) — not passed from here.
             self.queue.dispatch_pm4(
+                conn,
                 self.rsrc1,
                 self.rsrc2,
                 self.rsrc3,
@@ -719,8 +719,6 @@ impl Program for AmdProgram {
             let group_seg = self.kd.group_segment_fixed_size;
             let packet = build_dispatch_packet(
                 [l[0] as u16, l[1] as u16, l[2] as u16],
-                // AQL grid_size is total threads (workgroups * local), unlike
-                // the PM4 DISPATCH_DIRECT path which counts workgroups.
                 [(g[0] * l[0]) as u32, (g[1] * l[1]) as u32, (g[2] * l[2]) as u32],
                 priv_seg,
                 group_seg,
@@ -728,20 +726,30 @@ impl Program for AmdProgram {
                 kernarg_gpu,
                 /*completion_signal=*/ 0,
             );
-            self.queue.dispatch_aql(&packet)?
+            self.queue.dispatch_aql(conn, &packet)?
         };
 
-        // Async by default (tinygrad `hcq.py:380`): the dispatch is submitted
-        // and we return immediately. GPU-side ordering is the device timeline
-        // (every dispatch waits the previous value); host reads synchronize via
-        // `AmdAllocator::_copyout` / the `Buffer::as_*` guards, and buffer frees
-        // drain via `AmdAllocator::_free`. Only block when `wait` is set (e.g.
-        // benchmark timing) — `synchronize()` drains through `signalled`.
         if wait {
             let _ = signalled;
-            self.dev.synchronize()?;
+            conn.synchronize()?;
         }
         Ok(())
+    }
+}
+
+impl Program for AmdProgram {
+    unsafe fn execute(
+        &self,
+        buffers: &[*mut u8],
+        vals: &[i64],
+        global_size: Option<[usize; 3]>,
+        local_size: Option<[usize; 3]>,
+        wait: bool,
+    ) -> Result<()> {
+        // Default path: dispatch on the program's owning device's default
+        // connector. Step 4 retargets this at `ExecutionPlan` by downcasting
+        // via `as_any()` and calling `execute_on` with the plan's connector.
+        unsafe { self.execute_on(self.dev.connector(), buffers, vals, global_size, local_size, wait) }
     }
 
     fn name(&self) -> &str {

@@ -78,10 +78,15 @@ impl AmdConnector {
     /// Build a connector against a freshly opened device core. Allocates the
     /// initial 128 B/thread scratch buffer (matches tinygrad's
     /// `_ensure_has_local_memory(128)` at `ops_amd.py:1010`).
+    ///
+    /// Registers `Weak::self` in the core's connector list so device-wide
+    /// `synchronize` (called by `AmdAllocator::_copyin`/`_copyout`/`_free`)
+    /// drains every connector's timeline — load-bearing once `ExecutionPlan`
+    /// and `AmdGraph` own their own connectors (Steps 4-5).
     pub fn new(core: Arc<AmdDeviceCore>) -> Result<Arc<Self>> {
         let (scratch_va, scratch_size, tmpring_size, size_per_thread, scratch_handle) =
             alloc_scratch(&core.kfd_fd, &core.node, &core.arch, 128)?;
-        Ok(Arc::new(Self {
+        let conn = Arc::new(Self {
             core,
             scratch_state: Mutex::new(ScratchState {
                 gpu_va: scratch_va,
@@ -93,7 +98,15 @@ impl AmdConnector {
             timeline_signal: OnceLock::new(),
             timeline_value: AtomicU64::new(1),
             dispatch_lock: Mutex::new(()),
-        }))
+        });
+        // Register with the core so `synchronize_all` finds us. Opportunistic
+        // GC: drop entries whose connector has already been dropped.
+        {
+            let mut list = conn.core.connectors.lock();
+            list.retain(|w| w.strong_count() > 0);
+            list.push(Arc::downgrade(&conn));
+        }
+        Ok(conn)
     }
 
     /// The immutable core this connector dispatches against.
@@ -119,6 +132,11 @@ impl AmdConnector {
     /// called — that's a factory-wiring bug, not a runtime condition).
     pub fn timeline_signal(&self) -> &Arc<AmdSignal> {
         self.timeline_signal.get().expect("timeline_signal not initialized; call init_timeline from factory")
+    }
+
+    /// Whether the timeline signal has been installed yet.
+    pub fn has_timeline_signal(&self) -> bool {
+        self.timeline_signal.get().is_some()
     }
 
     /// Reserve the next timeline value (`fetch_add(1)`). The caller emits a
@@ -224,5 +242,20 @@ impl AmdConnector {
         let mut free = kfd::kfd_ioctl_free_memory_of_gpu_args { handle };
         // SAFETY: same handle.
         let _ = unsafe { ioctl::kfd_free_memory_of_gpu(self.core.kfd_fd.as_raw_fd(), &mut free as *mut _) };
+    }
+}
+
+impl Drop for AmdConnector {
+    /// Drain in-flight GPU work before the connector dies, so a downstream
+    /// `AmdAllocator::_copyout` (or any host read of a buffer this connector
+    /// wrote) doesn't race the still-running kernel. Without this, a graph
+    /// dropped at the end of `ExecutionPlan::execute` would lose its
+    /// `timeline_signal` while its async dispatch is still pending — the
+    /// device-wide `synchronize_all` would then skip the dead connector and
+    /// host reads would observe partial / zero-initialized buffer state.
+    fn drop(&mut self) {
+        if let Err(e) = self.synchronize() {
+            tracing::warn!(?e, "AmdConnector drop: synchronize failed (in-flight work lost)");
+        }
     }
 }

@@ -32,7 +32,7 @@ use std::sync::Arc;
 
 use crate::allocator::RawBuffer;
 use crate::amd::AmdAllocator;
-use crate::amd::device::AmdDevice;
+use crate::amd::connector::AmdConnector;
 use crate::amd::program::AmdProgram;
 use crate::amd::queue::{AmdComputeQueue, build_exec_pm4};
 use crate::amd::sys::pm4;
@@ -181,7 +181,10 @@ impl AmdArgsState {
 
 /// A symbolic PM4 compute command builder. One per graph (single queue).
 pub struct AmdHwQueue {
-    dev: Arc<AmdDevice>,
+    /// Per-graph connector — provides scratch + timeline + (transitional)
+    /// dispatch lock. Owned exclusively by the graph in Step 5 of the
+    /// connector refactor.
+    connector: Arc<AmdConnector>,
     queue: Arc<AmdComputeQueue>,
     /// The dword stream (← `_q`). Concrete until `bind`, after which it lives in
     /// the host-visible page and `apply_var_vals` patches it in place.
@@ -208,9 +211,9 @@ unsafe impl Sync for AmdHwQueue {}
 
 impl AmdHwQueue {
     /// New empty queue (← `HWQueue.__init__`, `hcq.py:80`).
-    pub fn new(dev: Arc<AmdDevice>, queue: Arc<AmdComputeQueue>) -> Self {
+    pub fn new(connector: Arc<AmdConnector>, queue: Arc<AmdComputeQueue>) -> Self {
         Self {
-            dev,
+            connector,
             queue,
             q: Vec::new(),
             syms: Vec::new(),
@@ -321,14 +324,12 @@ impl AmdHwQueue {
             }
         }
 
-        // Snapshot scratch under the dispatch lock — same invariant as
-        // `dispatch_pm4`: a concurrent scratch realloc holds this lock while it
-        // unmaps the old VA, so the captured base stays live for the graph's
-        // life (program load already grew scratch to fit every captured kernel).
-        let (scratch_addr, tmpring_size) = {
-            let _disp = self.dev.lock_dispatch();
-            (self.dev.scratch_gpu_va(), self.dev.tmpring_size())
-        };
+        // Read the graph connector's own scratch. The connector is owned
+        // exclusively by this graph (Step 5 of the connector refactor), so
+        // there is no concurrent realloc to guard against — what used to be a
+        // `lock_dispatch()` critical section is now plain field access.
+        let scratch_addr = self.connector.scratch_gpu_va();
+        let tmpring_size = self.connector.tmpring_size();
 
         // USER_DATA SGPR prefix: optional 4-dword scratch descriptor, then the
         // 2-dword kernarg pointer — identical to `AmdProgram::execute`

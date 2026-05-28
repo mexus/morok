@@ -26,6 +26,7 @@ use tracing::debug;
 use crate::allocator::{Allocator, BufferSpec};
 
 use crate::amd::AmdAllocator;
+use crate::amd::connector::AmdConnector;
 use crate::amd::device::AmdDevice;
 use crate::amd::sys::hsa::{
     HSA_FENCE_SCOPE_SYSTEM, HSA_PACKET_HEADER_BARRIER, HSA_PACKET_HEADER_SCACQUIRE_FENCE_SCOPE,
@@ -358,6 +359,7 @@ impl AmdComputeQueue {
     #[allow(clippy::too_many_arguments)]
     pub fn dispatch_pm4(
         &self,
+        conn: &AmdConnector,
         rsrc1: u32,
         rsrc2: u32,
         rsrc3: u32,
@@ -370,16 +372,18 @@ impl AmdComputeQueue {
         target_major: u32,
     ) -> Result<u64> {
         debug_assert!(self.is_pm4, "dispatch_pm4 called on AQL queue");
-        let timeline_addr = self.dev.timeline_signal().value_addr();
+        let timeline_addr = conn.timeline_signal().value_addr();
         // Serialize the whole submit (incl. the live scratch read below) against
         // scratch realloc: `ensure_has_local_memory` holds this same lock while
         // it drains + unmaps the old scratch VA, so a kernel can never be
-        // programmed with a scratch base that's freed before it runs.
-        let _disp = self.dev.lock_dispatch();
+        // programmed with a scratch base that's freed before it runs. Targeted
+        // for deletion in Step 7 of the connector refactor — once each plan
+        // owns its connector, this lock has no contenders.
+        let _disp = conn.lock_dispatch();
         // Read the scratch VA + tmpring UNDER the dispatch lock so they reflect
         // the current (post-realloc) scratch buffer, not a stale one.
-        let scratch_addr = self.dev.scratch_gpu_va();
-        let tmpring_size = self.dev.tmpring_size();
+        let scratch_addr = conn.scratch_gpu_va();
+        let tmpring_size = conn.tmpring_size();
         // Assemble the full USER_DATA prefix here, under the lock, so the scratch
         // SGPR descriptor (words 0-3) is derived from the SAME `scratch_addr` as
         // the `COMPUTE_DISPATCH_SCRATCH_BASE` register below. Building it in
@@ -396,8 +400,8 @@ impl AmdComputeQueue {
         }
         full_user_data.extend_from_slice(user_data);
         let mut g = self.inner.lock();
-        let prev = self.dev.timeline_value().saturating_sub(1);
-        let next = self.dev.next_timeline();
+        let prev = conn.timeline_value().saturating_sub(1);
+        let next = conn.next_timeline();
 
         let mut q: Vec<u32> = Vec::with_capacity(96);
         // wait(timeline, prev): no-op on the first dispatch (prev == 0).
@@ -461,16 +465,17 @@ impl AmdComputeQueue {
     /// ordering guarantee as [`dispatch_pm4`]; PM4 helpers are wrapped in AQL
     /// vendor-IB packets (`ops_amd.py:_pm4_pkt`) and the kernel launch is a real
     /// `HsaKernelDispatchPacket`.
-    pub fn dispatch_aql(&self, packet: &HsaKernelDispatchPacket) -> Result<u64> {
+    pub fn dispatch_aql(&self, conn: &AmdConnector, packet: &HsaKernelDispatchPacket) -> Result<u64> {
         debug_assert!(!self.is_pm4, "dispatch_aql called on PM4 queue");
         debug_assert_eq!(size_of::<HsaKernelDispatchPacket>(), AQL_PACKET_BYTES);
-        let timeline_addr = self.dev.timeline_signal().value_addr();
+        let timeline_addr = conn.timeline_signal().value_addr();
         // Serialize submit vs scratch realloc (the AQL scratch descriptor is
-        // rewritten by `ensure_has_local_memory` under this same lock).
-        let _disp = self.dev.lock_dispatch();
+        // rewritten by `ensure_has_local_memory` under this same lock). Same
+        // Step 7 deletion target as `dispatch_pm4`.
+        let _disp = conn.lock_dispatch();
         let mut g = self.inner.lock();
-        let prev = self.dev.timeline_value().saturating_sub(1);
-        let next = self.dev.next_timeline();
+        let prev = conn.timeline_value().saturating_sub(1);
+        let next = conn.next_timeline();
 
         // wait → barrier(hdp, acquire) → exec → signal, each PM4 op wrapped in a
         // vendor-IB AQL packet (exec is a native dispatch packet).

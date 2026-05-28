@@ -8,9 +8,8 @@
 
 use std::collections::HashMap;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
-use std::sync::Arc;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock, Weak};
 
 use nix::fcntl::{OFlag, open};
 use nix::sys::stat::Mode;
@@ -123,6 +122,14 @@ pub struct AmdDeviceCore {
     /// device because a memory fault corrupts the whole VM, not just one queue.
     poisoned: AtomicBool,
     error_msg: OnceLock<String>,
+    /// Registry of every `AmdConnector` built against this core. Weak so
+    /// dropped connectors don't keep timelines alive. Used by
+    /// [`AmdDeviceCore::synchronize_all`] to drain ALL in-flight GPU work
+    /// before destructive host-visible operations
+    /// (`AmdAllocator::_copyin`/`_copyout`/`_free`). Each connector has its
+    /// own timeline signal — without iterating them, a copy-back from a buffer
+    /// written by a per-plan/per-graph connector races the dispatch.
+    pub(crate) connectors: parking_lot::Mutex<Vec<Weak<crate::amd::connector::AmdConnector>>>,
 }
 
 /// Open handle to one AMD GPU node.
@@ -291,6 +298,7 @@ impl AmdDevice {
             has_sdma_queue: AtomicBool::new(false),
             poisoned: AtomicBool::new(false),
             error_msg: OnceLock::new(),
+            connectors: parking_lot::Mutex::new(Vec::new()),
         });
         // Default connector — allocates the initial 128 B/thread scratch
         // buffer (`ops_amd.py:1010`). Per the refactor plan Steps 3-7, the
@@ -363,9 +371,31 @@ impl AmdDevice {
         self.connector.timeline_value()
     }
 
-    /// Drain all submitted GPU work on this device's default connector.
+    /// Drain all submitted GPU work on every connector backed by this device.
+    /// Must drain ALL connectors (not just the default) — once Steps 4-5 of
+    /// the connector refactor make `ExecutionPlan`/`AmdGraph` own their own
+    /// connectors, kernels signal on the OWNER's timeline. Skipping the
+    /// per-owner drain would let `AmdAllocator::_copyout`/`_copyin`/`_free`
+    /// observe an unfinished kernel's buffer.
     pub fn synchronize(&self) -> Result<()> {
-        self.connector.synchronize()
+        self.core.synchronize_all()
+    }
+}
+
+impl AmdDeviceCore {
+    /// Drain every connector currently backed by this core. Iterates the
+    /// `connectors` registry (Weak refs), upgrades each, and synchronises in
+    /// turn. Cheap when no per-owner connectors exist (the default connector
+    /// is registered the same way). Fast on idle connectors — each is a
+    /// no-op when its timeline is at value 0.
+    pub fn synchronize_all(&self) -> Result<()> {
+        // Snapshot to release the lock before doing potentially long waits.
+        let live: Vec<Arc<crate::amd::connector::AmdConnector>> =
+            self.connectors.lock().iter().filter_map(|w| w.upgrade()).collect();
+        for c in live {
+            c.synchronize()?;
+        }
+        Ok(())
     }
 }
 
