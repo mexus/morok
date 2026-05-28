@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use svod_codegen::llvm::LlvmTextRenderer;
 use svod_device::Result;
-use svod_device::amd::{AmdAllocator, AmdComputeQueue, AmdGraph, AmdProgram, KernargArena, SignalPool};
+use svod_device::amd::{AmdAllocator, AmdGraph, AmdProgram, SignalPool};
 use svod_device::device::{
     CompiledSpec, Compiler, Device, Graph, GraphFactory, GraphKernel, Program, ProgramSpec, Renderer, RuntimeFactory,
 };
@@ -30,28 +30,23 @@ pub fn create_amd_device(registry: &DeviceRegistry, device_id: usize, arch: AmdA
     let allocator = registry.get(&spec)?;
     let renderer = Arc::new(AmdRendererWrapper { device: spec.clone(), arch });
     let compiler = Arc::new(AmdCompiler { arch });
-    // Build the per-device runtime state ONCE: queue, kernarg arena, signal
-    // pool. AmdProgram::execute reuses these across dispatches. The
-    // AmdAllocator we instantiate here shares its underlying `Arc<AmdDevice>`
-    // with the one cached by the registry (see DEVICE_CACHE in
-    // device.rs), so we don't double-open `/dev/kfd` or ACQUIRE_VM twice.
+    // Build the per-device process-shared state: the signal pool (singleton
+    // per physical AMD:N, lives on AmdDeviceCore), then the default
+    // AmdConnector. Each `ExecutionPlan` / `AmdGraph` builds ITS OWN
+    // connector (own KFD ring + kernarg arena), so no compute-queue or
+    // kernarg arena needs to be pre-built here — they're per-owner.
     let amd_alloc = AmdAllocator::new(device_id)?;
     let device_handle = Arc::clone(&amd_alloc.dev);
-    let queue = AmdComputeQueue::create(&amd_alloc)?;
-    let arena = KernargArena::new(&amd_alloc, device_handle.core())?;
     let signal_pool = SignalPool::new(&amd_alloc)?;
-    // Seed the pool onto the device core so any future `AmdConnector` built
-    // directly against the core (e.g. graph/plan connectors in Commit B)
-    // can acquire its timeline signal without reaching back through an
-    // `AmdProgram`. Idempotent — only the first call wins.
-    device_handle.core().install_signal_pool(Arc::clone(&signal_pool));
-    // Install the device-global timeline signal. Mirrors tinygrad
-    // `HCQCompiled.__init__` (`hcq.py:415`): one signal owned by the device,
-    // reused across all submits + waits. `AmdAllocator::free` synchronizes
-    // against this before unmapping, which fixes the page-aligned NotPresent
-    // faults caused by tearing down a buffer mapping while the GPU still has
-    // pending references to its VA.
-    device_handle.init_timeline(Arc::new(signal_pool.acquire()?));
+    // Seed the pool onto the device core so `AmdConnector::new_with_resources`
+    // can acquire its timeline signal. Must precede default-connector build.
+    device_handle.core().install_signal_pool(signal_pool);
+    // Build and install the default connector. Used by `Program::execute`
+    // trait fallback (callers outside `ExecutionPlan`, e.g. `benchmark_kernel`)
+    // and by `AmdAllocator`'s device-wide synchronize chain.
+    let default_conn =
+        svod_device::amd::AmdConnector::new_with_resources(Arc::clone(device_handle.core()), &amd_alloc)?;
+    device_handle.install_default_connector(default_conn);
     let runtime: RuntimeFactory = Arc::new(move |compiled: &CompiledSpec| -> Result<Box<dyn Program>> {
         // `CompiledSpec.bytes` is the clang-produced amdgcn ELF.
         if compiled.bytes.is_empty() {
@@ -67,9 +62,6 @@ pub fn create_amd_device(registry: &DeviceRegistry, device_id: usize, arch: AmdA
         let prg = AmdProgram::load(
             Arc::clone(&device_handle),
             &alloc,
-            Arc::clone(&queue),
-            Arc::clone(&arena),
-            Arc::clone(&signal_pool),
             &compiled.bytes,
             &compiled.name,
             compiled.buf_count,

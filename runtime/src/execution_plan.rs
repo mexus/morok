@@ -389,20 +389,29 @@ impl ExecutionPlan {
         if let Some(c) = self.amd_connector.get() {
             return Ok(std::sync::Arc::clone(c));
         }
-        // Build outside the OnceLock::get_or_init so we can propagate errors
-        // (SignalPool::acquire returns Result). One-shot init race: if two
-        // threads see empty, both build a connector; only one wins set().
-        let new_conn = svod_device::amd::AmdConnector::new(std::sync::Arc::clone(prog.device().core()))
-            .map_err(|e| crate::error::Error::Execution { reason: format!("AmdConnector::new: {e}") })?;
-        let sig = std::sync::Arc::new(
-            prog.signal_pool()
-                .acquire()
-                .map_err(|e| crate::error::Error::Execution { reason: format!("timeline signal acquire: {e}") })?,
-        );
-        new_conn.init_timeline(sig);
-        // Race: another thread may have already installed one. set() returns
-        // Err with our value if so; either way we then return the installed
-        // connector via get().
+        // Build outside `OnceLock::get_or_init` so we can propagate errors
+        // (KFD queue creation, signal-pool acquire). One-shot init race: if
+        // two threads see empty, both build a connector; only one wins set().
+        // The loser is dropped; its `AmdConnector::Drop` synchronises and
+        // returns the timeline signal to the pool.
+        // Recover the AMD device_id from the plan's DeviceSpec. The program
+        // was loaded against the same device_id, so the allocator created
+        // here shares its underlying `Arc<AmdDeviceCore>` via DEVICE_CACHE.
+        let device_id = match &self.device {
+            DeviceSpec::Amd { device_id } => *device_id,
+            _ => {
+                return Err(crate::error::Error::Execution {
+                    reason: format!("amd_connector_for called on non-AMD plan (device={:?})", self.device),
+                });
+            }
+        };
+        let alloc = svod_device::amd::AmdAllocator::new(device_id)
+            .map_err(|e| crate::error::Error::Execution { reason: format!("plan allocator: {e}") })?;
+        let new_conn =
+            svod_device::amd::AmdConnector::new_with_resources(std::sync::Arc::clone(prog.device().core()), &alloc)
+                .map_err(|e| crate::error::Error::Execution {
+                    reason: format!("AmdConnector::new_with_resources: {e}"),
+                })?;
         let _ = self.amd_connector.set(new_conn);
         Ok(std::sync::Arc::clone(self.amd_connector.get().expect("connector set above")))
     }

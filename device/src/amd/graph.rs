@@ -36,7 +36,6 @@ use crate::amd::AmdAllocator;
 use crate::amd::connector::AmdConnector;
 use crate::amd::hw_queue::{AmdHwQueue, Sym, VarVals};
 use crate::amd::program::AmdProgram;
-use crate::amd::queue::AmdComputeQueue;
 use crate::amd::signal::{AmdSignal, SignalPool};
 use crate::device::{Graph, GraphKernel};
 use crate::error::{Error, Result};
@@ -127,12 +126,11 @@ impl AmdGraph {
             progs.push(p);
         }
         let dev = Arc::clone(progs[0].device());
-        let queue: Arc<AmdComputeQueue> = Arc::clone(progs[0].queue());
-        if !queue.is_pm4() {
-            return Ok(None);
-        }
+        // All captured kernels must share the same physical AMD:N. With per-
+        // connector queues each `AmdProgram` no longer carries an
+        // `Arc<AmdComputeQueue>`, but they all share `Arc<AmdDeviceCore>`.
         for p in &progs[1..] {
-            if !Arc::ptr_eq(p.device(), &dev) || !Arc::ptr_eq(p.queue(), &queue) {
+            if !Arc::ptr_eq(p.device(), &dev) {
                 return Ok(None);
             }
         }
@@ -140,20 +138,19 @@ impl AmdGraph {
             return Err(err);
         }
 
-        // ── Build a fresh per-graph connector (Step 5 of the connector refactor).
-        // Owns its own scratch + timeline so replay no longer contends with
-        // per-call dispatchers on the device's default connector. Grown to fit
-        // the captured kernels' private-segment requirement; timeline signal
-        // acquired from the shared pool (same pool the per-call signals come
-        // from — pool access is rare, intra-pool Mutex is fine).
-        let connector = AmdConnector::new(Arc::clone(dev.core()))?;
+        // ── Build a fresh per-graph connector with its own ring + arena +
+        // scratch + timeline signal. The connector's `new_with_resources`
+        // already registers in the device-core's connector list and acquires
+        // a timeline signal from the shared pool.
+        let connector = AmdConnector::new_with_resources(Arc::clone(dev.core()), allocator)?;
+        if !connector.queue().is_pm4() {
+            return Ok(None);
+        }
         let mut max_priv_seg = 128u32;
         for p in &progs {
             max_priv_seg = max_priv_seg.max(p.private_segment_size());
         }
         connector.ensure_has_local_memory(max_priv_seg)?;
-        let timeline_sig = Arc::new(progs[0].signal_pool().acquire()?);
-        connector.init_timeline(timeline_sig);
 
         // ── Lay out one 16-byte-aligned kernarg slot per kernel inside a single
         // dedicated page (← `kernargs_bufs` + per-kernel `BumpAllocator.alloc`,
@@ -194,15 +191,16 @@ impl AmdGraph {
             }
         };
 
-        // ── Per-graph signals from the shared pool (← `kick_signals` +
-        // `signals`, `graph/hcq.py:65-66`). Both start at 0.
-        let signal_pool = Arc::clone(progs[0].signal_pool());
+        // ── Per-graph kick + self signals from the device-core's shared
+        // pool (← `kick_signals` + `signals`, `graph/hcq.py:65-66`). Both
+        // start at 0.
+        let signal_pool = Arc::clone(dev.core().signal_pool().expect("signal pool installed by factory"));
         let kick_sig = signal_pool.acquire()?;
         let self_sig = signal_pool.acquire()?;
 
         // ── Build the one command stream. (← `comp_queues[dev]`, plus the
         // preamble/exec/final loop at `graph/hcq.py:158-217`.)
-        let mut comp_queue = AmdHwQueue::new(Arc::clone(&connector), Arc::clone(&queue));
+        let mut comp_queue = AmdHwQueue::new(Arc::clone(&connector));
 
         // Preamble (← graph/hcq.py:158-160).
         comp_queue.preamble(kick_sig.value_addr(), self_sig.value_addr());

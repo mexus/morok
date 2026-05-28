@@ -34,7 +34,7 @@ use crate::allocator::RawBuffer;
 use crate::amd::AmdAllocator;
 use crate::amd::connector::AmdConnector;
 use crate::amd::program::AmdProgram;
-use crate::amd::queue::{AmdComputeQueue, build_exec_pm4};
+use crate::amd::queue::build_exec_pm4;
 use crate::amd::sys::pm4;
 use crate::error::{Error, Result};
 
@@ -181,11 +181,9 @@ impl AmdArgsState {
 
 /// A symbolic PM4 compute command builder. One per graph (single queue).
 pub struct AmdHwQueue {
-    /// Per-graph connector — provides scratch + timeline + (transitional)
-    /// dispatch lock. Owned exclusively by the graph in Step 5 of the
-    /// connector refactor.
+    /// Per-graph connector — owns the ring + scratch + timeline this command
+    /// stream submits through.
     connector: Arc<AmdConnector>,
-    queue: Arc<AmdComputeQueue>,
     /// The dword stream (← `_q`). Concrete until `bind`, after which it lives in
     /// the host-visible page and `apply_var_vals` patches it in place.
     q: Vec<u32>,
@@ -211,10 +209,9 @@ unsafe impl Sync for AmdHwQueue {}
 
 impl AmdHwQueue {
     /// New empty queue (← `HWQueue.__init__`, `hcq.py:80`).
-    pub fn new(connector: Arc<AmdConnector>, queue: Arc<AmdComputeQueue>) -> Self {
+    pub fn new(connector: Arc<AmdConnector>) -> Self {
         Self {
             connector,
-            queue,
             q: Vec::new(),
             syms: Vec::new(),
             prev_resolved: Vec::new(),
@@ -466,7 +463,7 @@ impl AmdHwQueue {
         self.apply_var_vals(var_vals)?;
         let cmd = self.binded.as_ref().expect("AmdHwQueue::submit before bind").indirect_cmd;
         // `_submit` (← `ops_amd.py:407`): one doorbell via the queue primitive.
-        self.queue.submit_dwords(&cmd)
+        self.connector.queue().submit_dwords(&cmd)
     }
 }
 

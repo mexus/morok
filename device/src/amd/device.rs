@@ -155,11 +155,16 @@ pub struct AmdDeviceCore {
 pub struct AmdDevice {
     /// Immutable identity (cloneable across connectors).
     core: Arc<AmdDeviceCore>,
-    /// Default per-device connector. Owns scratch + timeline; vestigial after
-    /// Step 7 (every dispatcher now creates its own connector) but kept so
-    /// the few remaining `AmdDevice::synchronize()`-via-allocator call sites
-    /// (`_copyin`/`_copyout`/`_free`) still resolve.
-    connector: Arc<crate::amd::connector::AmdConnector>,
+    /// Default per-device connector — owns its own KFD ring + kernarg arena +
+    /// scratch + timeline. Lazy because `AmdConnector::new_with_resources`
+    /// needs an allocator, and the allocator needs an `AmdDevice` (DEVICE_CACHE
+    /// path); the factory installs this after `AmdDevice::open` returns.
+    /// Routed through by:
+    /// - `Program::execute` trait fallback (`AmdProgram::execute`) — when a
+    ///   caller dispatches a program without going through an
+    ///   `ExecutionPlan`/`AmdGraph` (e.g. `benchmark_kernel`).
+    /// - `AmdAllocator::_copyin`/`_copyout`/`_free` device-wide synchronize.
+    connector: OnceLock<Arc<crate::amd::connector::AmdConnector>>,
 }
 
 impl std::ops::Deref for AmdDevice {
@@ -308,13 +313,17 @@ impl AmdDevice {
             connectors: parking_lot::Mutex::new(Vec::new()),
             signal_pool: OnceLock::new(),
         });
-        // Default connector — allocates the initial 128 B/thread scratch
-        // buffer (`ops_amd.py:1010`). Per the refactor plan Steps 3-7, the
-        // ownership of this connector will move to `ExecutionPlan`/`AmdGraph`;
-        // for now it stays on `AmdDevice` so existing call sites keep
-        // working via delegation.
-        let connector = crate::amd::connector::AmdConnector::new(Arc::clone(&core))?;
-        Ok(Arc::new(Self { core, connector }))
+        // Default connector is installed by the factory AFTER this returns —
+        // building it here would recursively call `AmdAllocator::new`, which
+        // calls `AmdDevice::open`. The lazy `OnceLock` breaks the cycle.
+        Ok(Arc::new(Self { core, connector: OnceLock::new() }))
+    }
+
+    /// Install the default connector. Called once per device by the factory
+    /// after the allocator + signal pool are constructed; subsequent calls
+    /// are a no-op.
+    pub fn install_default_connector(&self, conn: Arc<crate::amd::connector::AmdConnector>) {
+        let _ = self.connector.set(conn);
     }
 
     /// Borrow the shared immutable core. Used by Step 3+ to build per-owner
@@ -325,52 +334,49 @@ impl AmdDevice {
         &self.core
     }
 
-    /// Borrow the device's default connector. Step 3+ will route per-call
-    /// `Program::execute` through this until `ExecutionPlan` owns its own.
+    /// Borrow the device's default connector. Panics if the factory hasn't
+    /// installed it yet — that's a wiring bug, not a runtime condition.
+    /// Used by `Program::execute` trait fallback (callers who don't go
+    /// through `ExecutionPlan::execute_on`) and by the device-wide
+    /// synchronize chain in `AmdAllocator`.
     #[inline]
     pub fn connector(&self) -> &Arc<crate::amd::connector::AmdConnector> {
-        &self.connector
+        self.connector.get().expect("AmdDevice default connector not installed; factory wiring bug")
     }
 
     // === Delegations to the default connector ===
-    // These keep the existing `self.dev.X()` call sites working unchanged.
-    // After Step 7 these are pure forwarding methods (no more lock state to
-    // delegate).
-
-    /// Install the default connector's timeline signal. Called once from
-    /// the device factory after the `SignalPool` is created.
-    pub fn init_timeline(&self, signal: Arc<AmdSignal>) {
-        self.connector.init_timeline(signal);
-    }
+    // Back-compat surface for `AmdAllocator::_copyin`/`_copyout`/`_free` and
+    // direct `Program::execute` callers. After the factory installs the
+    // default connector these are pure forwarding methods.
 
     /// Current scratch buffer GPU VA on the default connector.
     pub fn scratch_gpu_va(&self) -> u64 {
-        self.connector.scratch_gpu_va()
+        self.connector().scratch_gpu_va()
     }
 
     /// Packed `COMPUTE_TMPRING_SIZE` on the default connector.
     pub fn tmpring_size(&self) -> u32 {
-        self.connector.tmpring_size()
+        self.connector().tmpring_size()
     }
 
     /// Grow the default connector's scratch backing (delegate).
     pub fn ensure_has_local_memory(&self, private_segment_size: u32) -> Result<()> {
-        self.connector.ensure_has_local_memory(private_segment_size)
+        self.connector().ensure_has_local_memory(private_segment_size)
     }
 
     /// Default connector timeline signal (delegate; panics if not initialized).
     pub fn timeline_signal(&self) -> &Arc<AmdSignal> {
-        self.connector.timeline_signal()
+        self.connector().timeline_signal()
     }
 
     /// Reserve the next timeline value on the default connector.
     pub fn next_timeline(&self) -> u64 {
-        self.connector.next_timeline()
+        self.connector().next_timeline()
     }
 
     /// Highest submitted timeline value on the default connector.
     pub fn timeline_value(&self) -> u64 {
-        self.connector.timeline_value()
+        self.connector().timeline_value()
     }
 
     /// Drain all submitted GPU work on every connector backed by this device.

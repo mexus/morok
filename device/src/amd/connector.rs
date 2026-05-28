@@ -30,10 +30,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use parking_lot::Mutex;
 
+use crate::amd::AmdAllocator;
 use crate::amd::device::{AmdDeviceCore, ScratchState, alloc_scratch};
+use crate::amd::kernarg::KernargArena;
+use crate::amd::queue::AmdComputeQueue;
 use crate::amd::signal::AmdSignal;
 use crate::amd::sys::{ioctl, kfd};
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::sync::TimelineSignal;
 
 /// Per-owner dispatch state. One instance per `ExecutionPlan` / `AmdGraph` in
@@ -47,15 +50,23 @@ pub struct AmdConnector {
     /// Shared immutable identity. Cloned across all connectors backed by the
     /// same physical AMD:N (and across `AmdDevice` for back-compat).
     core: Arc<AmdDeviceCore>,
+    /// Per-connector KFD compute queue — own ring + doorbell + GART. Built
+    /// fresh by `new_with_resources`; with one connector per plan/graph this
+    /// means each owner pushes packets into an isolated ring, so the queue's
+    /// internal `Mutex<QueueInner>` is exercised only by intra-owner traffic
+    /// (effectively uncontended).
+    queue: Arc<AmdComputeQueue>,
+    /// Per-connector kernel-argument bump arena (16 MiB GTT). Wraps drain
+    /// every live connector via the core's registry (see
+    /// `KernargArena::bump`).
+    arena: Arc<KernargArena>,
     /// Per-connector scratch backing. Mirrors what used to live on
     /// `AmdDevice::scratch_state`; see that field's docstring for the
     /// `_ensure_has_local_memory` story (`ops_amd.py:1065-1081`).
     scratch_state: Mutex<ScratchState>,
     /// Per-connector timeline signal. Every kernel/copy submitted via this
     /// connector waits on the previous timeline value and signals the next
-    /// one. Lazy-init from the factory (signal pool depends on an
-    /// `AmdAllocator`, which depends on `Arc<AmdDevice>`, which contains
-    /// this connector — chicken/egg avoided via `OnceLock`).
+    /// one. Acquired from the core's shared `SignalPool` at construction.
     /// Mirrors `HCQCompiled.timeline_signal` (`hcq.py:415`).
     timeline_signal: OnceLock<Arc<AmdSignal>>,
     /// Highest timeline value submitted through this connector. Reserved by
@@ -65,19 +76,31 @@ pub struct AmdConnector {
 }
 
 impl AmdConnector {
-    /// Build a connector against a freshly opened device core. Allocates the
-    /// initial 128 B/thread scratch buffer (matches tinygrad's
-    /// `_ensure_has_local_memory(128)` at `ops_amd.py:1010`).
+    /// Build a connector with its own KFD compute queue + kernarg arena +
+    /// initial scratch. The timeline signal is acquired from the core's
+    /// shared `SignalPool` (which the factory must have installed before any
+    /// connector is built — `AmdDeviceCore::install_signal_pool`).
     ///
     /// Registers `Weak::self` in the core's connector list so device-wide
-    /// `synchronize` (called by `AmdAllocator::_copyin`/`_copyout`/`_free`)
-    /// drains every connector's timeline — load-bearing once `ExecutionPlan`
-    /// and `AmdGraph` own their own connectors (Steps 4-5).
-    pub fn new(core: Arc<AmdDeviceCore>) -> Result<Arc<Self>> {
+    /// `synchronize_all` (called by `AmdAllocator::_copyin`/`_copyout`/`_free`)
+    /// drains every connector before any host-visible buffer free.
+    pub fn new_with_resources(core: Arc<AmdDeviceCore>, allocator: &AmdAllocator) -> Result<Arc<Self>> {
         let (scratch_va, scratch_size, tmpring_size, size_per_thread, scratch_handle) =
             alloc_scratch(&core.kfd_fd, &core.node, &core.arch, 128)?;
+        let queue = AmdComputeQueue::create(allocator)?;
+        // The arena's `bump` wrap drains every live connector via the core
+        // registry; pass core in so the arena can reach `synchronize_all`.
+        let arena = KernargArena::new(allocator, &core)?;
+        let pool = core.signal_pool().cloned().ok_or_else(|| Error::Runtime {
+            message: "AmdConnector::new_with_resources: signal pool not installed on core — \
+                      install via AmdDeviceCore::install_signal_pool before building any connector"
+                .into(),
+        })?;
+        let timeline_sig = Arc::new(pool.acquire()?);
         let conn = Arc::new(Self {
             core,
+            queue,
+            arena,
             scratch_state: Mutex::new(ScratchState {
                 gpu_va: scratch_va,
                 size_per_thread,
@@ -88,14 +111,39 @@ impl AmdConnector {
             timeline_signal: OnceLock::new(),
             timeline_value: AtomicU64::new(1),
         });
+        let _ = conn.timeline_signal.set(timeline_sig);
         // Register with the core so `synchronize_all` finds us. Opportunistic
         // GC: drop entries whose connector has already been dropped.
         {
             let mut list = conn.core.connectors.lock();
             list.retain(|w| w.strong_count() > 0);
             list.push(Arc::downgrade(&conn));
+            // KFD queue resources (ring + GART + EOP + ctx-save + pm4_ibs)
+            // are ~16-48 MiB per connector. With per-owner connectors, a
+            // burst-heavy workload (e.g. BEAM creating many candidate plans)
+            // could cumulatively exhaust VRAM. Warn at a soft threshold so
+            // operators see it before OOM. ConnectorPool is the planned
+            // follow-up if telemetry shows this firing in real workloads.
+            if list.len() > 32 {
+                tracing::warn!(
+                    n_connectors = list.len(),
+                    "AmdConnector count exceeds 32 — consider a ConnectorPool if BEAM-style burst creates many plans"
+                );
+            }
         }
         Ok(conn)
+    }
+
+    /// Borrow this connector's KFD compute queue.
+    #[inline]
+    pub fn queue(&self) -> &Arc<AmdComputeQueue> {
+        &self.queue
+    }
+
+    /// Borrow this connector's kernarg arena.
+    #[inline]
+    pub fn arena(&self) -> &Arc<KernargArena> {
+        &self.arena
     }
 
     /// The immutable core this connector dispatches against.
@@ -104,22 +152,9 @@ impl AmdConnector {
         &self.core
     }
 
-    /// Install the connector's timeline signal. Called exactly once from the
-    /// device factory after the `SignalPool` is constructed. Subsequent
-    /// calls are a no-op.
-    pub fn init_timeline(&self, signal: Arc<AmdSignal>) {
-        let _ = self.timeline_signal.set(signal);
-    }
-
-    /// Connector timeline signal (panics if [`init_timeline`] hasn't been
-    /// called — that's a factory-wiring bug, not a runtime condition).
+    /// Connector timeline signal (always installed by `new_with_resources`).
     pub fn timeline_signal(&self) -> &Arc<AmdSignal> {
-        self.timeline_signal.get().expect("timeline_signal not initialized; call init_timeline from factory")
-    }
-
-    /// Whether the timeline signal has been installed yet.
-    pub fn has_timeline_signal(&self) -> bool {
-        self.timeline_signal.get().is_some()
+        self.timeline_signal.get().expect("timeline_signal must be set by new_with_resources")
     }
 
     /// Reserve the next timeline value (`fetch_add(1)`). The caller emits a

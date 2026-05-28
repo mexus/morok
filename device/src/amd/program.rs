@@ -18,9 +18,7 @@ use tracing::debug;
 use crate::allocator::{Allocator, BufferSpec, RawBuffer};
 use crate::amd::AmdAllocator;
 use crate::amd::device::AmdDevice;
-use crate::amd::kernarg::KernargArena;
-use crate::amd::queue::{AmdComputeQueue, build_dispatch_packet};
-use crate::amd::signal::SignalPool;
+use crate::amd::queue::build_dispatch_packet;
 use crate::amd::sys::hsa::AmdHsaKernelDescriptor;
 use crate::device::Program;
 use crate::error::{Error, Result};
@@ -229,17 +227,20 @@ pub fn parse_kernel(bytes: &[u8], kernel_name: &str) -> Result<ParsedKernel> {
 }
 
 /// Loaded AMDGPU program: code object resident in VRAM + kernel metadata.
+///
+/// Connector-agnostic by construction — programs hold only the immutable
+/// kernel descriptor (rsrc1/2/3, prog_addr, kd, arities) plus the device
+/// handle needed by `Program::execute` trait callers (who don't supply a
+/// connector). Plan and graph callers downcast to `AmdProgram` and route
+/// through `execute_on(&AmdConnector, …)` with their OWN connector — so
+/// one cached program safely services any number of plans on the same
+/// physical AMD:N.
 pub struct AmdProgram {
     name: String,
+    /// Device handle — used by the `Program::execute` trait method to route
+    /// dispatch through the default connector when the caller doesn't go
+    /// through `AmdProgram::execute_on`. Plan/graph callers ignore this.
     dev: Arc<AmdDevice>,
-    queue: Arc<AmdComputeQueue>,
-    arena: Arc<KernargArena>,
-    /// Held to keep the per-process signal page mapped for the lifetime of
-    /// the program. The actual timeline signal lives on `AmdDevice`; this
-    /// field exists only to extend the pool's lifetime to match the program
-    /// (signals borrow into the pool's backing GTT allocation).
-    #[allow(dead_code)]
-    signal_pool: Arc<SignalPool>,
     /// AQL `kernel_object` field: GPU VA of the kernel descriptor inside the
     /// loaded code object. Used by the AQL kernel-dispatch packet only.
     aql_prog_addr: u64,
@@ -276,13 +277,9 @@ pub struct AmdProgram {
 impl AmdProgram {
     /// Load `bytes` (an AMDGPU code object from clang) into VRAM and resolve
     /// the named kernel.
-    #[allow(clippy::too_many_arguments)]
     pub fn load(
         device: Arc<AmdDevice>,
         allocator: &AmdAllocator,
-        queue: Arc<AmdComputeQueue>,
-        arena: Arc<KernargArena>,
-        signal_pool: Arc<SignalPool>,
         bytes: &[u8],
         kernel_name: &str,
         buf_count: usize,
@@ -290,12 +287,12 @@ impl AmdProgram {
     ) -> Result<Self> {
         let parsed = parse_kernel(bytes, kernel_name)?;
 
-        // Grow the device scratch buffer to fit this program's private
-        // segment, if needed. Mirrors tinygrad `ops_amd.py:589-590`
-        // (`self.dev._ensure_has_local_memory(self.private_segment_size)`).
-        // Without this, kernels with `private_segment_fixed_size > 128`
-        // overflow the default 128 B/thread scratch backing allocated at
-        // device open — manifests as silent corruption or wave-init faults.
+        // Grow the DEFAULT connector's scratch to fit this program (covers
+        // `Program::execute` trait callers that route through the default
+        // connector). Plan/graph callers separately call
+        // `AmdConnector::ensure_has_local_memory` on their own connector
+        // before dispatch (`execution_plan.rs::execute_kernel`,
+        // `graph.rs::capture`). Mirrors tinygrad `ops_amd.py:589-590`.
         device.ensure_has_local_memory(parsed.kd.private_segment_fixed_size)?;
 
         // Allocate VRAM for the code object (EXECUTABLE flag is set on every
@@ -443,9 +440,6 @@ impl AmdProgram {
         Ok(Self {
             name: kernel_name.to_string(),
             dev: device,
-            queue,
-            arena,
-            signal_pool,
             aql_prog_addr,
             pm4_prog_addr,
             rsrc1,
@@ -477,18 +471,6 @@ impl AmdProgram {
     /// Shared device handle (timeline signal, scratch VA, dispatch lock).
     pub fn device(&self) -> &Arc<AmdDevice> {
         &self.dev
-    }
-
-    /// Shared compute queue this program dispatches through. The graph only
-    /// captures kernels that share one queue (single-XCC PM4 ring).
-    pub fn queue(&self) -> &Arc<AmdComputeQueue> {
-        &self.queue
-    }
-
-    /// Shared kernarg arena. The graph reserves one fixed slot per kernel at
-    /// capture and rewrites its 8 B buffer VAs + 4 B vals there each replay.
-    pub fn arena(&self) -> &Arc<KernargArena> {
-        &self.arena
     }
 
     /// `kd.kernarg_size` — byte count of one kernarg record (ABI padded).
@@ -528,14 +510,6 @@ impl AmdProgram {
     /// (`AmdConnector::ensure_has_local_memory`).
     pub fn private_segment_size(&self) -> u32 {
         self.kd.private_segment_fixed_size
-    }
-
-    /// Shared per-process signal pool — the graph carves its kickoff / self
-    /// signals from it (reachable via `AmdProgram` because the graph downcasts
-    /// the first captured kernel's `dyn Program`). Mirrors tinygrad reaching
-    /// signals through `dev.new_signal` (`hcq.py:451`).
-    pub fn signal_pool(&self) -> &Arc<SignalPool> {
-        &self.signal_pool
     }
 
     /// Fill one kernarg slot for graph capture. Port of
@@ -646,11 +620,14 @@ impl AmdProgram {
             });
         }
 
-        // 1. Bump kernarg arena.
-        let off = self.arena.bump(self.kernarg_size(), 16)?;
-        // SAFETY: arena returned a valid slot; bump semantics + FIFO AQL queue
-        // guarantee no concurrent writer for the same offset.
-        let host_base = unsafe { self.arena.host_at(off) };
+        // 1. Bump the connector's own kernarg arena. With per-owner connectors
+        // there's exactly one writer to each arena → wrap-and-drain is the
+        // only synchronization needed (handled inside `KernargArena::bump`).
+        let arena = conn.arena();
+        let off = arena.bump(self.kernarg_size(), 16)?;
+        // SAFETY: arena returned a valid slot; per-connector ownership means
+        // no concurrent writer for the same offset.
+        let host_base = unsafe { arena.host_at(off) };
         let mut cursor = 0usize;
         for buf in buffers {
             let bytes = (*buf as u64).to_le_bytes();
@@ -663,7 +640,7 @@ impl AmdProgram {
             unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), host_base.add(cursor), 4) };
             cursor += 4;
         }
-        let kernarg_gpu = self.arena.gpu_at(off);
+        let kernarg_gpu = arena.gpu_at(off);
 
         // 2. Match tinygrad's HCQ submit sequence at `hcq.py:371-378`:
         //   wait(conn.timeline, conn.timeline_value-1) → memory_barrier → exec
@@ -684,7 +661,7 @@ impl AmdProgram {
                 l[0],
                 l[1],
                 l[2],
-                self.queue.is_pm4(),
+                conn.queue().is_pm4(),
                 kernarg_gpu,
                 conn.scratch_gpu_va(),
                 bufs_str.join(" "),
@@ -692,16 +669,17 @@ impl AmdProgram {
         }
 
         // USER_DATA SGPR pre-load: kernarg pointer only — the optional scratch
-        // SGPR descriptor is prepended inside `dispatch_pm4` under the
-        // connector's dispatch lock so it reads the live scratch VA in the
-        // same critical section as `COMPUTE_DISPATCH_SCRATCH_BASE`. Mirrors
-        // tinygrad `ops_amd.py:325-342`.
+        // SGPR descriptor is prepended inside `dispatch_pm4` from the live
+        // `conn.scratch_gpu_va()` in the same place as
+        // `COMPUTE_DISPATCH_SCRATCH_BASE`. Mirrors tinygrad
+        // `ops_amd.py:325-342`.
         let mut user_data: smallvec::SmallVec<[u32; 8]> = smallvec::SmallVec::new();
         user_data.push(kernarg_gpu as u32);
         user_data.push((kernarg_gpu >> 32) as u32);
 
-        let signalled = if self.queue.is_pm4() {
-            self.queue.dispatch_pm4(
+        let queue = conn.queue();
+        let signalled = if queue.is_pm4() {
+            queue.dispatch_pm4(
                 conn,
                 self.rsrc1,
                 self.rsrc2,
@@ -726,7 +704,7 @@ impl AmdProgram {
                 kernarg_gpu,
                 /*completion_signal=*/ 0,
             );
-            self.queue.dispatch_aql(conn, &packet)?
+            queue.dispatch_aql(conn, &packet)?
         };
 
         if wait {
