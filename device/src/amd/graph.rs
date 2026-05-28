@@ -43,13 +43,19 @@ use crate::error::{Error, Result};
 use crate::sync::TimelineSignal;
 
 /// A captured, replayable AMD kernel chain.
+///
+/// SAFETY: do not reorder fields. The explicit `impl Drop for AmdGraph`
+/// below synchronises the connector before any field destructor runs; that
+/// synchronise then guarantees the in-flight kernels are done reading the
+/// kernargs page (`_kernargs_buf`), the bound IB host page (inside
+/// `comp_queue`), and the kick/self signals before those fields free their
+/// GPU mappings. The field order here is only a backstop — `Drop` is the
+/// load-bearing guarantee.
 pub struct AmdGraph {
-    /// Per-graph connector — owns the scratch, timeline signal/value, and the
-    /// (transitional) dispatch lock used for replay. Built fresh in
-    /// [`AmdGraph::capture`] from the captured kernels' shared device core.
-    /// Step 5 of the connector refactor: replaces `dev: Arc<AmdDevice>` so
-    /// the graph runs on isolated dispatch state — no per-call sibling can
-    /// race its timeline reservation or scratch realloc.
+    /// Per-graph connector — owns this graph's scratch + timeline signal +
+    /// timeline counter. Built fresh in [`AmdGraph::capture`] from the
+    /// captured kernels' shared device core, so per-call siblings can't
+    /// race its scratch realloc or timeline reservation.
     connector: Arc<AmdConnector>,
     /// The single PM4 command stream for the whole chain (preamble + N execs +
     /// final signal), bound into a host-visible page. `submit` mutates its
@@ -84,6 +90,22 @@ pub struct AmdGraph {
 // already `Send + Sync` (its host pointers are stable graph-owned mappings).
 unsafe impl Send for AmdGraph {}
 unsafe impl Sync for AmdGraph {}
+
+impl Drop for AmdGraph {
+    /// Drain any in-flight replay before the graph's GPU-visible backing
+    /// (kernargs page, bound IB host page, kick/self signals) drops. Without
+    /// this, a plan dropped at the end of `realize_with` whose graph still has
+    /// a queued dispatch would free the buffers the GPU is reading. The
+    /// connector's own `Drop` would have done the same synchronise eventually
+    /// (it fires before the other fields drop, by declaration order) — but
+    /// this explicit impl is what makes that contract load-bearing rather
+    /// than incidental.
+    fn drop(&mut self) {
+        if let Err(e) = self.connector.synchronize() {
+            tracing::warn!(?e, "AmdGraph drop: synchronize failed (in-flight replay lost)");
+        }
+    }
+}
 
 impl AmdGraph {
     /// Capture `kernels` into one PM4 command stream. Returns `Ok(None)` when
@@ -269,14 +291,17 @@ impl Graph for AmdGraph {
             self.connector.timeline_signal().wait(last, 30_000)?;
         }
 
-        // 2. Reserve this replay's timeline step and submit the IB. Under Step 5
-        //    of the connector refactor the graph owns its connector
-        //    exclusively, so the timeline + ring are not contended by any
-        //    sibling dispatcher — the prior `lock_dispatch()` critical section
-        //    around [reserve → patch → push] is no longer needed and would
-        //    be deleted in Step 7. We keep the bracketed block to scope the
-        //    `comp_queue` lock acquisition.
+        // 2. Reserve this replay's timeline step and submit the IB. The
+        //    timeline read + `next_timeline` reservation + symbol resolution
+        //    + submit all happen inside `comp_queue.lock()` so two concurrent
+        //    `replay()` callers can't interleave: without the lock, thread A
+        //    could read prev=N reserves next=N+1, thread B reads prev=N (!)
+        //    reserves next=N+2, then B's submit lands first → CP waits on
+        //    N+1 which only A's signal writes → deadlock. Per-connector
+        //    ownership eliminates cross-connector contention; this lock
+        //    guards the much narrower "two threads, same connector" case.
         let signalled = {
+            let mut q = self.comp_queue.lock();
             // VirtTimelineVal = timeline_value-1 (what the preamble waits for);
             // the final signal writes +1, advancing the connector timeline by
             // exactly one step. `next_timeline` reserves that same value.
@@ -291,7 +316,7 @@ impl Graph for AmdGraph {
 
             // submit → apply_var_vals (patch hw_page + kernargs) → _submit (one
             //  doorbell). (← graph/hcq.py:290.)
-            self.comp_queue.lock().submit(&var_vals)?;
+            q.submit(&var_vals)?;
             signalled
         };
         *self.last_timeline.lock() = signalled;

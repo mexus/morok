@@ -384,13 +384,31 @@ impl AmdDeviceCore {
     /// is registered the same way). Fast on idle connectors — each is a
     /// no-op when its timeline is at value 0.
     pub fn synchronize_all(&self) -> Result<()> {
-        // Snapshot to release the lock before doing potentially long waits.
+        // Snapshot strong refs to release the registry lock before doing
+        // potentially multi-second waits. The snapshot also keeps every
+        // connector alive until we've drained it, so a concurrent drop
+        // can't pull the rug out mid-iteration.
         let live: Vec<Arc<crate::amd::connector::AmdConnector>> =
             self.connectors.lock().iter().filter_map(|w| w.upgrade()).collect();
+        // Drain every connector; collect the first error but keep going so
+        // a single stuck connector doesn't strand buffer-frees on the others.
+        let mut first_err: Option<Error> = None;
         for c in live {
-            c.synchronize()?;
+            if let Err(e) = c.synchronize() {
+                tracing::warn!(?e, "synchronize_all: connector drain failed; continuing");
+                if first_err.is_none() {
+                    first_err = Some(e);
+                }
+            }
         }
-        Ok(())
+        // Opportunistic GC of `Drop`ped connector entries. The registry is
+        // touched here on every host read/free, so dead Weaks don't
+        // accumulate indefinitely between connector-creation events.
+        self.connectors.lock().retain(|w| w.strong_count() > 0);
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 }
 

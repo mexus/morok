@@ -237,7 +237,20 @@ impl Drop for AmdConnector {
     /// `timeline_signal` while its async dispatch is still pending — the
     /// device-wide `synchronize_all` would then skip the dead connector and
     /// host reads would observe partial / zero-initialized buffer state.
+    ///
+    /// Skipped during panic unwind: `synchronize` can block up to ~30 s per
+    /// connector (signal timeout) and an unwinding test with N live
+    /// connectors would pay N × 30 s before process teardown. The in-flight
+    /// work is then implicitly abandoned — the caller saw a panic anyway, so
+    /// observing partial GPU state is the lesser evil.
     fn drop(&mut self) {
+        if std::thread::panicking() {
+            tracing::warn!(
+                "AmdConnector drop during panic unwind: skipping synchronize; \
+                 in-flight GPU work abandoned"
+            );
+            return;
+        }
         if let Err(e) = self.synchronize() {
             tracing::warn!(?e, "AmdConnector drop: synchronize failed (in-flight work lost)");
         }

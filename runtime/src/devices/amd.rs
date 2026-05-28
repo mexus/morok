@@ -38,7 +38,7 @@ pub fn create_amd_device(registry: &DeviceRegistry, device_id: usize, arch: AmdA
     let amd_alloc = AmdAllocator::new(device_id)?;
     let device_handle = Arc::clone(&amd_alloc.dev);
     let queue = AmdComputeQueue::create(&amd_alloc)?;
-    let arena = KernargArena::new(&amd_alloc)?;
+    let arena = KernargArena::new(&amd_alloc, device_handle.core())?;
     let signal_pool = SignalPool::new(&amd_alloc)?;
     // Install the device-global timeline signal. Mirrors tinygrad
     // `HCQCompiled.__init__` (`hcq.py:415`): one signal owned by the device,

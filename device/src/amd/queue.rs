@@ -372,6 +372,13 @@ impl AmdComputeQueue {
         target_major: u32,
     ) -> Result<u64> {
         debug_assert!(self.is_pm4, "dispatch_pm4 called on AQL queue");
+        debug_assert!(
+            Arc::ptr_eq(self.dev.core(), conn.core()),
+            "dispatch_pm4: connector core ≠ queue core (queue gpu_id={}, conn gpu_id={}); \
+             cross-device dispatch silently corrupts scratch/timeline VAs",
+            self.dev.node.gpu_id,
+            conn.core().node.gpu_id,
+        );
         let timeline_addr = conn.timeline_signal().value_addr();
         // Step 7 of the connector refactor: this connector is owned by a single
         // plan/graph, so scratch realloc and dispatch cannot race — the prior
@@ -465,6 +472,12 @@ impl AmdComputeQueue {
     /// `HsaKernelDispatchPacket`.
     pub fn dispatch_aql(&self, conn: &AmdConnector, packet: &HsaKernelDispatchPacket) -> Result<u64> {
         debug_assert!(!self.is_pm4, "dispatch_aql called on PM4 queue");
+        debug_assert!(
+            Arc::ptr_eq(self.dev.core(), conn.core()),
+            "dispatch_aql: connector core ≠ queue core (queue gpu_id={}, conn gpu_id={})",
+            self.dev.node.gpu_id,
+            conn.core().node.gpu_id,
+        );
         debug_assert_eq!(size_of::<HsaKernelDispatchPacket>(), AQL_PACKET_BYTES);
         let timeline_addr = conn.timeline_signal().value_addr();
         // Step 7: connector is single-owner, no dispatch lock needed
