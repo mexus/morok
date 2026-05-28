@@ -15,7 +15,8 @@ use std::sync::{Arc, Weak};
 use parking_lot::Mutex;
 
 use crate::allocator::RawBuffer;
-use crate::amd::{AmdAllocator, AmdDevice};
+use crate::amd::AmdAllocator;
+use crate::amd::device::AmdDeviceCore;
 use crate::error::{Error, Result};
 use crate::sync::TimelineSignal;
 
@@ -42,10 +43,10 @@ pub struct AmdSignal {
     value_addr: u64,
     host_ptr: NonNull<AtomicU64>,
     pool: Weak<SignalPool>,
-    /// Owning device — used to escalate long waits to
+    /// Owning device core — used to escalate long waits to
     /// `AMDKFD_IOC_WAIT_EVENTS` on the device's `queue_event` (tinygrad
     /// `ops_amd.py:811`). `Weak` so signals don't extend device lifetime.
-    device: Weak<AmdDevice>,
+    device: Weak<AmdDeviceCore>,
 }
 
 // SAFETY: AtomicU64 covers all reads/writes; the host pointer comes from a
@@ -250,8 +251,8 @@ pub struct SignalPool {
     base_host: NonNull<u8>,
     free_slots: Mutex<Vec<u32>>,
     /// Captured at pool creation; signals downgrade-clone this into a `Weak`
-    /// so `wait` can call `AmdDevice::wait_events` for KFD escalation.
-    device: Arc<AmdDevice>,
+    /// so `wait` can call `AmdDeviceCore::wait_events` for KFD escalation.
+    device: Arc<AmdDeviceCore>,
 }
 
 // SAFETY: AtomicU64 covers concurrent reads/writes through `base_host`;
@@ -277,7 +278,7 @@ impl SignalPool {
             }
         };
         let free_slots = Mutex::new((0..SLOTS_PER_POOL as u32).rev().collect()); // pop low slots first
-        let device = Arc::clone(&allocator.dev);
+        let device = Arc::clone(allocator.dev.core());
         Ok(Arc::new(Self { _buffer: buffer, base_gpu, base_host, free_slots, device }))
     }
 

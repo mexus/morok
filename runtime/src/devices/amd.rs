@@ -40,6 +40,11 @@ pub fn create_amd_device(registry: &DeviceRegistry, device_id: usize, arch: AmdA
     let queue = AmdComputeQueue::create(&amd_alloc)?;
     let arena = KernargArena::new(&amd_alloc, device_handle.core())?;
     let signal_pool = SignalPool::new(&amd_alloc)?;
+    // Seed the pool onto the device core so any future `AmdConnector` built
+    // directly against the core (e.g. graph/plan connectors in Commit B)
+    // can acquire its timeline signal without reaching back through an
+    // `AmdProgram`. Idempotent — only the first call wins.
+    device_handle.core().install_signal_pool(Arc::clone(&signal_pool));
     // Install the device-global timeline signal. Mirrors tinygrad
     // `HCQCompiled.__init__` (`hcq.py:415`): one signal owned by the device,
     // reused across all submits + waits. `AmdAllocator::free` synchronizes

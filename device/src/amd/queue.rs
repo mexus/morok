@@ -27,7 +27,7 @@ use crate::allocator::{Allocator, BufferSpec};
 
 use crate::amd::AmdAllocator;
 use crate::amd::connector::AmdConnector;
-use crate::amd::device::AmdDevice;
+use crate::amd::device::AmdDeviceCore;
 use crate::amd::sys::hsa::{
     HSA_FENCE_SCOPE_SYSTEM, HSA_PACKET_HEADER_BARRIER, HSA_PACKET_HEADER_SCACQUIRE_FENCE_SCOPE,
     HSA_PACKET_HEADER_SCRELEASE_FENCE_SCOPE, HSA_PACKET_TYPE_BARRIER_AND, HSA_PACKET_TYPE_VENDOR_SPECIFIC,
@@ -180,7 +180,11 @@ pub fn build_sdma_linear_copy(src: u64, dst: u64, size: usize) -> [u32; 7] {
 /// `amd_queue_t` AQL descriptor.
 pub struct AmdComputeQueue {
     inner: Mutex<QueueInner>,
-    dev: Arc<AmdDevice>,
+    /// Immutable device identity (kfd_fd, drm_fd, node, arch, poison latch).
+    /// Rebased from `Arc<AmdDevice>` in Commit A of the connector refactor so
+    /// the queue can move into `AmdConnector` (Commit B) without forming a
+    /// strong cycle through `AmdDevice -> connector -> queue -> AmdDevice`.
+    core: Arc<AmdDeviceCore>,
     /// `true` when this queue submits raw PM4 dwords directly; `false` when
     /// it submits AQL packets (with PM4 wrapped in AQL vendor IB packets).
     /// Decided at queue creation from `num_xcc`, fixed for the queue's
@@ -192,7 +196,7 @@ pub struct AmdComputeQueue {
 /// Copy queue (SDMA).
 pub struct AmdCopyQueue {
     inner: Mutex<QueueInner>,
-    dev: Arc<AmdDevice>,
+    core: Arc<AmdDeviceCore>,
 }
 
 struct QueueInner {
@@ -304,22 +308,22 @@ impl AmdComputeQueue {
     /// dispatch is a 64-byte AQL packet and PM4 helpers are wrapped via
     /// the vendor IB packet at `ops_amd.py:433-435`.
     pub fn create(allocator: &AmdAllocator) -> Result<Arc<Self>> {
-        let dev = &allocator.dev;
+        let core = allocator.dev.core();
         // `SVOD_AMD_AQL=1` mirrors tinygrad's `AMD_AQL` override
         // (`ops_amd.py:989`) — forces AQL even on single-XCC, useful for
         // bisecting PM4 vs AQL bring-up issues.
         let force_aql = std::env::var("SVOD_AMD_AQL").ok().map(|s| s != "0").unwrap_or(false);
-        let is_pm4 = !force_aql && dev.node.num_xcc.max(1) == 1;
+        let is_pm4 = !force_aql && core.node.num_xcc.max(1) == 1;
         let queue_type = if is_pm4 { kfd::KFD_IOC_QUEUE_TYPE_COMPUTE } else { kfd::KFD_IOC_QUEUE_TYPE_COMPUTE_AQL };
         let inner = create_queue(allocator, queue_type, COMPUTE_RING_BYTES, !is_pm4)?;
         debug!(
-            gpu_id = dev.node.gpu_id,
-            num_xcc = dev.node.num_xcc,
+            gpu_id = core.node.gpu_id,
+            num_xcc = core.node.num_xcc,
             is_pm4 = is_pm4,
             force_aql_env = force_aql,
             "AmdComputeQueue created"
         );
-        Ok(Arc::new(Self { inner: Mutex::new(inner), dev: Arc::clone(&allocator.dev), is_pm4 }))
+        Ok(Arc::new(Self { inner: Mutex::new(inner), core: Arc::clone(core), is_pm4 }))
     }
 
     /// `true` when this queue submits raw PM4 dwords (single-XCC); `false`
@@ -373,10 +377,10 @@ impl AmdComputeQueue {
     ) -> Result<u64> {
         debug_assert!(self.is_pm4, "dispatch_pm4 called on AQL queue");
         debug_assert!(
-            Arc::ptr_eq(self.dev.core(), conn.core()),
+            Arc::ptr_eq(&self.core, conn.core()),
             "dispatch_pm4: connector core ≠ queue core (queue gpu_id={}, conn gpu_id={}); \
              cross-device dispatch silently corrupts scratch/timeline VAs",
-            self.dev.node.gpu_id,
+            self.core.node.gpu_id,
             conn.core().node.gpu_id,
         );
         let timeline_addr = conn.timeline_signal().value_addr();
@@ -453,7 +457,7 @@ impl AmdComputeQueue {
     /// would deadlock.
     pub fn submit_dwords(&self, dwords: &[u32]) -> Result<()> {
         debug_assert!(self.is_pm4, "submit_dwords on AQL queue");
-        if let Some(err) = self.dev.poison_error() {
+        if let Some(err) = self.core.poison_error() {
             return Err(err);
         }
         // Step 7: no `Release` fence here — `ring_doorbell` already issues
@@ -473,9 +477,9 @@ impl AmdComputeQueue {
     pub fn dispatch_aql(&self, conn: &AmdConnector, packet: &HsaKernelDispatchPacket) -> Result<u64> {
         debug_assert!(!self.is_pm4, "dispatch_aql called on PM4 queue");
         debug_assert!(
-            Arc::ptr_eq(self.dev.core(), conn.core()),
+            Arc::ptr_eq(&self.core, conn.core()),
             "dispatch_aql: connector core ≠ queue core (queue gpu_id={}, conn gpu_id={})",
-            self.dev.node.gpu_id,
+            self.core.node.gpu_id,
             conn.core().node.gpu_id,
         );
         debug_assert_eq!(size_of::<HsaKernelDispatchPacket>(), AQL_PACKET_BYTES);
@@ -589,7 +593,7 @@ pub(crate) fn build_exec_pm4(
 impl AmdCopyQueue {
     pub fn create(allocator: &AmdAllocator) -> Result<Arc<Self>> {
         let inner = create_queue(allocator, kfd::KFD_IOC_QUEUE_TYPE_SDMA, COPY_RING_BYTES, /*aql=*/ false)?;
-        Ok(Arc::new(Self { inner: Mutex::new(inner), dev: Arc::clone(&allocator.dev) }))
+        Ok(Arc::new(Self { inner: Mutex::new(inner), core: Arc::clone(allocator.dev.core()) }))
     }
 
     /// Submit a linear copy command (caller chunks for >`MAX_COPY_BYTES`).
@@ -619,18 +623,18 @@ impl AmdCopyQueue {
 
 impl std::fmt::Debug for AmdComputeQueue {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("AmdComputeQueue").field("gpu_id", &self.dev.node.gpu_id).finish_non_exhaustive()
+        f.debug_struct("AmdComputeQueue").field("gpu_id", &self.core.node.gpu_id).finish_non_exhaustive()
     }
 }
 
 impl std::fmt::Debug for AmdCopyQueue {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("AmdCopyQueue").field("gpu_id", &self.dev.node.gpu_id).finish_non_exhaustive()
+        f.debug_struct("AmdCopyQueue").field("gpu_id", &self.core.node.gpu_id).finish_non_exhaustive()
     }
 }
 
 fn create_queue(allocator: &AmdAllocator, queue_type: u32, ring_size: usize, aql: bool) -> Result<QueueInner> {
-    let dev = &allocator.dev;
+    let dev = allocator.dev.core();
     // Ring + GART are both VRAM with COHERENT | UNCACHED | PUBLIC flags —
     // tinygrad uses `iface.alloc(..., uncached=True, cpu_access=True)` for
     // both (`ops_amd.py:1040-1041`). Using plain VRAM (no UNCACHED) makes
@@ -780,7 +784,7 @@ fn create_queue(allocator: &AmdAllocator, queue_type: u32, ring_size: usize, aql
 
 /// Compute (wg_data_size, ctl_stack_size, debug_memory_size) for the ctx-save /
 /// restore region. Port of tinygrad `ops_amd.py:971-977`.
-fn compute_ctx_sizes(dev: &AmdDevice) -> (usize, usize, usize) {
+fn compute_ctx_sizes(dev: &AmdDeviceCore) -> (usize, usize, usize) {
     const PAGE: usize = 0x1000;
     let sgrp_per_cu: usize = 0x4000;
     let hwreg_per_cu: usize = 0x1000;
@@ -825,7 +829,7 @@ fn compute_ctx_sizes(dev: &AmdDevice) -> (usize, usize, usize) {
 /// Map a single 8 KiB doorbell window from `/dev/kfd` and return the per-queue
 /// doorbell pointer. KFD doorbells are page-aligned regions of MMIO addresses;
 /// the per-queue doorbell address = page_base + (doorbell_offset & 0x1fff).
-fn doorbell_mmap(dev: &AmdDevice, doorbell_offset: u64) -> Result<NonNull<u64>> {
+fn doorbell_mmap(dev: &AmdDeviceCore, doorbell_offset: u64) -> Result<NonNull<u64>> {
     const DOORBELL_PAGE_BYTES: usize = 0x2000;
     let page_base = doorbell_offset & !0x1fff;
     // SAFETY: standard libc::mmap; protections set for read+write MMIO.

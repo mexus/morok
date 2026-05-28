@@ -130,6 +130,12 @@ pub struct AmdDeviceCore {
     /// own timeline signal — without iterating them, a copy-back from a buffer
     /// written by a per-plan/per-graph connector races the dispatch.
     pub(crate) connectors: parking_lot::Mutex<Vec<Weak<crate::amd::connector::AmdConnector>>>,
+    /// Process-global signal pool, allocated once per physical device. Lazily
+    /// installed by the device factory and shared across every `AmdConnector`
+    /// (timeline signal acquired here at connector construction) — pool access
+    /// is rare (slot alloc on connector build), and one pool covers many
+    /// connectors at 4 KiB total VRAM.
+    signal_pool: OnceLock<Arc<crate::amd::signal::SignalPool>>,
 }
 
 /// Open handle to one AMD GPU node.
@@ -300,6 +306,7 @@ impl AmdDevice {
             poisoned: AtomicBool::new(false),
             error_msg: OnceLock::new(),
             connectors: parking_lot::Mutex::new(Vec::new()),
+            signal_pool: OnceLock::new(),
         });
         // Default connector — allocates the initial 128 B/thread scratch
         // buffer (`ops_amd.py:1010`). Per the refactor plan Steps 3-7, the
@@ -409,6 +416,19 @@ impl AmdDeviceCore {
             Some(e) => Err(e),
             None => Ok(()),
         }
+    }
+
+    /// Borrow the process-global signal pool (lazy-installed by the device
+    /// factory). `None` before the factory has run; once initialized, every
+    /// connector built against this core shares it.
+    pub fn signal_pool(&self) -> Option<&Arc<crate::amd::signal::SignalPool>> {
+        self.signal_pool.get()
+    }
+
+    /// Install the signal pool. Called once per physical device by the
+    /// runtime factory; subsequent calls are a no-op.
+    pub fn install_signal_pool(&self, pool: Arc<crate::amd::signal::SignalPool>) {
+        let _ = self.signal_pool.set(pool);
     }
 }
 
