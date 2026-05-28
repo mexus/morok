@@ -94,12 +94,17 @@ impl Drop for AmdGraph {
     /// Drain any in-flight replay before the graph's GPU-visible backing
     /// (kernargs page, bound IB host page, kick/self signals) drops. Without
     /// this, a plan dropped at the end of `realize_with` whose graph still has
-    /// a queued dispatch would free the buffers the GPU is reading. The
-    /// connector's own `Drop` would have done the same synchronise eventually
-    /// (it fires before the other fields drop, by declaration order) — but
-    /// this explicit impl is what makes that contract load-bearing rather
-    /// than incidental.
+    /// a queued dispatch would free the buffers the GPU is reading.
+    ///
+    /// Skipped during panic unwind — same rationale as `AmdConnector::Drop`:
+    /// `synchronize` can block up to 30 s per signal slot, and a panicking
+    /// test with several live graphs would otherwise pay N×30 s before
+    /// process teardown.
     fn drop(&mut self) {
+        if std::thread::panicking() {
+            tracing::warn!("AmdGraph drop during panic unwind: skipping synchronize; in-flight replay abandoned");
+            return;
+        }
         if let Err(e) = self.connector.synchronize() {
             tracing::warn!(?e, "AmdGraph drop: synchronize failed (in-flight replay lost)");
         }
@@ -137,15 +142,20 @@ impl AmdGraph {
         if let Some(err) = dev.core().poison_error() {
             return Err(err);
         }
+        // Probe pm4-ness from the device topology BEFORE allocating a
+        // per-graph connector — on multi-XCC CDNA the graph path is
+        // unsupported (AQL) and we should bail without burning ~50 MiB of
+        // KFD ring + GART + EOP + ctx-save + arena + scratch + signal slot
+        // only to throw them away.
+        if !crate::amd::queue::AmdComputeQueue::will_use_pm4(dev.core()) {
+            return Ok(None);
+        }
 
         // ── Build a fresh per-graph connector with its own ring + arena +
         // scratch + timeline signal. The connector's `new_with_resources`
         // already registers in the device-core's connector list and acquires
         // a timeline signal from the shared pool.
         let connector = AmdConnector::new_with_resources(Arc::clone(dev.core()), allocator)?;
-        if !connector.queue().is_pm4() {
-            return Ok(None);
-        }
         let mut max_priv_seg = 128u32;
         for p in &progs {
             max_priv_seg = max_priv_seg.max(p.private_segment_size());

@@ -246,6 +246,30 @@ struct QueueInner {
 unsafe impl Send for QueueInner {}
 unsafe impl Sync for QueueInner {}
 
+impl Drop for QueueInner {
+    /// Free the queue's KFD-allocated VRAM/GTT backings. `RawBuffer` itself
+    /// has no `Drop` (the existing `AmdAllocator::_free` consumes RawBuffer
+    /// by destructure), so a queue dropped directly — as happens for
+    /// per-connector queues — would otherwise leak ~50 MiB of ring + GART +
+    /// EOP + ctx-save + pm4_ibs every time. We call the in-place free path
+    /// (`RawBuffer::free_amd_device_in_place`) for each. `AmdComputeQueue::
+    /// Drop` has already invoked `kfd_destroy_queue` AND `AmdConnector::Drop`
+    /// has synchronised the timeline, so the GPU is idle on these buffers.
+    fn drop(&mut self) {
+        self._ring_buf.free_amd_device_in_place();
+        self._gart_buf.free_amd_device_in_place();
+        if let Some(eop) = self._eop_buf.as_ref() {
+            eop.free_amd_device_in_place();
+        }
+        if let Some(ctx) = self._ctx_buf.as_ref() {
+            ctx.free_amd_device_in_place();
+        }
+        if let Some(pm4) = self._pm4_ibs_buf.as_ref() {
+            pm4.free_amd_device_in_place();
+        }
+    }
+}
+
 impl QueueInner {
     /// Append raw PM4 dwords to the ring, wrapping at dword granularity
     /// (`ops_amd.py:417`). `write_idx` is counted in dwords for PM4 queues.
@@ -307,22 +331,24 @@ impl AmdComputeQueue {
     /// directly into the ring. Multi-XCC CDNA falls back to AQL, where each
     /// dispatch is a 64-byte AQL packet and PM4 helpers are wrapped via
     /// the vendor IB packet at `ops_amd.py:433-435`.
+    /// Predict whether `create` would build a PM4 queue for this device,
+    /// WITHOUT allocating anything. Used by `AmdGraph::capture` to skip the
+    /// (multi-MiB) per-graph connector build on AQL hardware where the graph
+    /// path is unsupported anyway. Same logic as `create`'s `is_pm4` decision.
+    pub fn will_use_pm4(core: &AmdDeviceCore) -> bool {
+        let force_aql = std::env::var("SVOD_AMD_AQL").ok().map(|s| s != "0").unwrap_or(false);
+        !force_aql && core.node.num_xcc.max(1) == 1
+    }
+
     pub fn create(allocator: &AmdAllocator) -> Result<Arc<Self>> {
         let core = allocator.dev.core();
         // `SVOD_AMD_AQL=1` mirrors tinygrad's `AMD_AQL` override
         // (`ops_amd.py:989`) — forces AQL even on single-XCC, useful for
         // bisecting PM4 vs AQL bring-up issues.
-        let force_aql = std::env::var("SVOD_AMD_AQL").ok().map(|s| s != "0").unwrap_or(false);
-        let is_pm4 = !force_aql && core.node.num_xcc.max(1) == 1;
+        let is_pm4 = Self::will_use_pm4(core);
         let queue_type = if is_pm4 { kfd::KFD_IOC_QUEUE_TYPE_COMPUTE } else { kfd::KFD_IOC_QUEUE_TYPE_COMPUTE_AQL };
         let inner = create_queue(allocator, queue_type, COMPUTE_RING_BYTES, !is_pm4)?;
-        debug!(
-            gpu_id = core.node.gpu_id,
-            num_xcc = core.node.num_xcc,
-            is_pm4 = is_pm4,
-            force_aql_env = force_aql,
-            "AmdComputeQueue created"
-        );
+        debug!(gpu_id = core.node.gpu_id, num_xcc = core.node.num_xcc, is_pm4 = is_pm4, "AmdComputeQueue created");
         Ok(Arc::new(Self { inner: Mutex::new(inner), core: Arc::clone(core), is_pm4 }))
     }
 
@@ -521,8 +547,15 @@ impl Drop for AmdComputeQueue {
     /// `RawBuffer::Drop` chain when `self.inner` drops next.
     ///
     /// `AmdConnector::Drop` has already synchronised the timeline before
-    /// reaching this point, so no GPU work is pending on this queue.
+    /// reaching this point on the happy path. During panic unwind the
+    /// connector skips `synchronize` to keep teardown bounded — destroying
+    /// the KFD queue with in-flight CP work risks a kernel-side fault that
+    /// crashes the process before useful diagnostics flush, so we also
+    /// skip and accept the queue-id leak (process exit reclaims it).
     fn drop(&mut self) {
+        if std::thread::panicking() {
+            return;
+        }
         let queue_id = self.inner.lock().queue_id;
         let mut args = kfd::kfd_ioctl_destroy_queue_args { queue_id, ..Default::default() };
         // SAFETY: `core.kfd_fd` is alive (held via Arc<AmdDeviceCore>); the

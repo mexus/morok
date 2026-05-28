@@ -87,11 +87,16 @@ impl AmdConnector {
     /// `synchronize_all` (called by `AmdAllocator::_copyin`/`_copyout`/`_free`)
     /// drains every connector before any host-visible buffer free.
     pub fn new_with_resources(core: Arc<AmdDeviceCore>, allocator: &AmdAllocator) -> Result<Arc<Self>> {
-        let (scratch_va, scratch_size, tmpring_size, size_per_thread, scratch_handle) =
-            alloc_scratch(&core.kfd_fd, &core.node, &core.arch, 128)?;
+        // Order matters: every step that allocates must come BEFORE
+        // `alloc_scratch`. Earlier-built resources (`AmdComputeQueue`,
+        // `KernargArena`, signal slot, timeline Arc) all have RAII cleanup
+        // (queue: `Drop for AmdComputeQueue` + `Drop for QueueInner`; arena:
+        // `Drop for KernargArena`; signal: `AmdSignal::Drop` returns slot to
+        // pool). The scratch backing is the lone raw KFD allocation — keeping
+        // it last means a failure before line 95 unwinds via `?` and the
+        // RAII cleanups run; failure of `alloc_scratch` itself returns
+        // without anything to leak.
         let queue = AmdComputeQueue::create(allocator)?;
-        // The arena's `bump` wrap drains every live connector via the core
-        // registry; pass core in so the arena can reach `synchronize_all`.
         let arena = KernargArena::new(allocator, &core)?;
         let pool = core.signal_pool().cloned().ok_or_else(|| Error::Runtime {
             message: "AmdConnector::new_with_resources: signal pool not installed on core — \
@@ -99,6 +104,8 @@ impl AmdConnector {
                 .into(),
         })?;
         let timeline_sig = Arc::new(pool.acquire()?);
+        let (scratch_va, scratch_size, tmpring_size, size_per_thread, scratch_handle) =
+            alloc_scratch(&core.kfd_fd, &core.node, &core.arch, 128)?;
         let conn = Arc::new(Self {
             core,
             queue,
@@ -115,23 +122,13 @@ impl AmdConnector {
         });
         let _ = conn.timeline_signal.set(timeline_sig);
         // Register with the core so `synchronize_all` finds us. Opportunistic
-        // GC: drop entries whose connector has already been dropped.
+        // GC: drop entries whose connector has already been dropped — this is
+        // also what bounds the live KFD queue count (Drop returns the id via
+        // `AmdComputeQueue::Drop`), so the previous >32 soft-warn is moot.
         {
             let mut list = conn.core.connectors.lock();
             list.retain(|w| w.strong_count() > 0);
             list.push(Arc::downgrade(&conn));
-            // KFD queue resources (ring + GART + EOP + ctx-save + pm4_ibs)
-            // are ~16-48 MiB per connector. With per-owner connectors, a
-            // burst-heavy workload (e.g. BEAM creating many candidate plans)
-            // could cumulatively exhaust VRAM. Warn at a soft threshold so
-            // operators see it before OOM. ConnectorPool is the planned
-            // follow-up if telemetry shows this firing in real workloads.
-            if list.len() > 32 {
-                tracing::warn!(
-                    n_connectors = list.len(),
-                    "AmdConnector count exceeds 32 — consider a ConnectorPool if BEAM-style burst creates many plans"
-                );
-            }
         }
         Ok(conn)
     }
@@ -190,12 +187,9 @@ impl AmdConnector {
         if let Some(err) = self.core.poison_error() {
             return Err(err);
         }
-        // Skip cleanly when the timeline hasn't been wired up yet — the
-        // factory installs it after `open()`, but allocator paths run during
-        // device construction (e.g. ring/GART buffers) need to be a no-op.
-        let Some(signal) = self.timeline_signal.get() else {
-            return Ok(());
-        };
+        // `new_with_resources` installs the timeline signal before returning,
+        // so by the time any caller can reach `synchronize` it is set.
+        let signal = self.timeline_signal.get().expect("timeline signal installed by new_with_resources");
         let target = self.timeline_value.load(Ordering::Acquire).saturating_sub(1);
         if target == 0 {
             return Ok(());
@@ -284,12 +278,19 @@ impl Drop for AmdConnector {
         if std::thread::panicking() {
             tracing::warn!(
                 "AmdConnector drop during panic unwind: skipping synchronize; \
-                 in-flight GPU work abandoned"
+                 in-flight GPU work + scratch backing abandoned"
             );
             return;
         }
         if let Err(e) = self.synchronize() {
             tracing::warn!(?e, "AmdConnector drop: synchronize failed (in-flight work lost)");
         }
+        // Free the scratch backing. `ScratchState` is `Copy` with no `Drop`,
+        // so without this every dropped connector would leak its ~50-200 MiB
+        // KFD scratch alloc + host VA reservation. `free_scratch` does its
+        // own synchronize internally (no-op now that we drained above) then
+        // unmaps/munmaps/frees via KFD.
+        let state = *self.scratch_state.lock();
+        self.free_scratch(state.gpu_va, state.size, state.handle);
     }
 }

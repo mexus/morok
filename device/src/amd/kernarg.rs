@@ -40,6 +40,16 @@ pub struct KernargArena {
 unsafe impl Send for KernargArena {}
 unsafe impl Sync for KernargArena {}
 
+impl Drop for KernargArena {
+    /// Free the 16 MiB GTT-coherent backing. `RawBuffer` lacks a `Drop` (the
+    /// allocator path consumes it by destructure), so the arena — owned
+    /// directly by `AmdConnector` — would otherwise leak its allocation
+    /// every time a connector drops.
+    fn drop(&mut self) {
+        self._buffer.free_amd_device_in_place();
+    }
+}
+
 impl KernargArena {
     pub fn new(allocator: &AmdAllocator, core: &Arc<AmdDeviceCore>) -> Result<Arc<Self>> {
         let opts = BufferSpec { cpu_access: true, uncached: true, nolru: true, ..Default::default() };
