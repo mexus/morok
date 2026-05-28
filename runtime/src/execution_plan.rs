@@ -290,12 +290,12 @@ pub struct ExecutionPlan {
     /// `svod_device::Graph` (AMD indirect buffer).
     graph: std::sync::OnceLock<Option<Box<dyn svod_device::Graph>>>,
 
-    /// Per-plan AMD connector — owns this plan's scratch, timeline, dispatch
-    /// lock. Lazy-init on the first AMD kernel dispatch from the program's
-    /// `Arc<AmdDeviceCore>` (cheap: the core is process-cached via
-    /// `DEVICE_CACHE` and we Arc::clone it). Decouples this plan's dispatch
-    /// state from other plans' on the same physical AMD:N — Step 4 of the
-    /// connector refactor (`snug-honking-robin`).
+    /// Per-plan AMD connector — owns this plan's KFD ring, kernarg arena,
+    /// scratch, and timeline. Lazy-init on the first AMD kernel dispatch
+    /// via `AmdConnector::new_with_resources(core, allocator)`, where `core`
+    /// is shared via `DEVICE_CACHE` and `allocator` is built fresh against
+    /// the same cached core (no extra KFD opens). Decouples this plan's
+    /// dispatch state from other plans' on the same physical AMD:N.
     ///
     /// Non-AMD plans never touch this field; CPU programs continue to use
     /// `Program::execute(...)`.
@@ -375,12 +375,10 @@ impl ExecutionPlan {
     }
 
     /// Lazy-init the plan's own AMD connector and return it. Cheap to call
-    /// repeatedly — the connector lives for the plan's lifetime. Built from
-    /// the program's `Arc<AmdDeviceCore>` (process-cached via `DEVICE_CACHE`)
-    /// and seeded with a timeline signal acquired from the program's signal
-    /// pool. Step 4 of the connector refactor — gives this plan a private
-    /// scratch + timeline so cross-plan dispatches no longer contend on the
-    /// shared device default connector.
+    /// repeatedly — the connector lives for the plan's lifetime. Built via
+    /// `AmdConnector::new_with_resources(core, allocator)` so it owns its
+    /// own KFD ring + kernarg arena + scratch + timeline; cross-plan
+    /// dispatches run on isolated rings.
     #[cfg(target_os = "linux")]
     fn amd_connector_for(
         &self,
@@ -421,8 +419,8 @@ impl ExecutionPlan {
         let buffer_ptrs: SmallVec<[*mut u8; 8]> = kernel.buffer_ptrs.iter().map(|&ptr| ptr as *mut u8).collect();
         let (global_size, local_size) = Self::kernel_launch_sizes(kernel)?;
         // Fast path for AMD: downcast and dispatch via `execute_on` with the
-        // plan's own connector. Step 4 of the connector refactor — keeps each
-        // plan's scratch/timeline/dispatch-lock state isolated.
+        // plan's own connector (own KFD ring + kernarg arena + scratch +
+        // timeline). Plans on the same physical AMD:N run on isolated rings.
         #[cfg(target_os = "linux")]
         if let Some(amd) = kernel.kernel.program.as_any().downcast_ref::<svod_device::amd::AmdProgram>() {
             let conn = self.amd_connector_for(amd)?;
@@ -717,17 +715,14 @@ impl ExecutionPlan {
 
     /// Execute the plan.
     ///
-    /// Walks `op_levels` level-by-level and runs each op in the level in order.
-    /// **Step 6 of the connector refactor** (`snug-honking-robin`) deleted the
-    /// previous rayon-driven intra-level parallelism: on AMD the ring is
-    /// fundamentally serial (per-connector `Mutex<QueueInner>`); on CPU the
-    /// previous overlap was already cancelled by the kernel-thread guard.
-    /// Per-plan ownership (Step 4) means multi-plan concurrency comes from
-    /// distinct plans running on distinct connectors, which is what BEAM
-    /// search relies on — not intra-plan rayon. We keep the level iteration
-    /// order (rather than a flat `op_order` topological linearization)
-    /// because iterative kernels (QR, etc.) are sensitive to within-level
-    /// scheduling order.
+    /// Walks `op_levels` level-by-level and runs each op within a level in
+    /// builder-insertion order. Multi-plan concurrency comes from distinct
+    /// `ExecutionPlan`s (e.g. BEAM search candidates) running on distinct
+    /// `AmdConnector`s with their own KFD rings — not from rayon inside one
+    /// plan. The level-by-level iteration (vs. a flat `op_order` topological
+    /// linearization) is load-bearing for iterative CPU kernels (QR, etc.)
+    /// whose codegen is sensitive to within-level scheduling order — see
+    /// `test_execute_walks_op_levels_in_level_order`.
     pub fn execute(&self) -> Result<()> {
         // Fast path: one captured indirect-buffer submit instead of per-kernel
         // packet build + doorbell. Built once, then every call just replays.

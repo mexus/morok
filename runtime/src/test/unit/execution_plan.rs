@@ -1023,3 +1023,96 @@ fn test_execute_with_vars_profiled_updates_non_fixed_vars() {
     assert_eq!(kernels[0].vals.as_slice(), &[42], "execute_with_vars_profiled should update non-fixed variables");
     assert_eq!(calls.load(Ordering::Relaxed), 1, "kernel should execute exactly once");
 }
+
+/// Pins that `ExecutionPlan::execute()` walks `op_levels` (level-by-level)
+/// rather than a flat topological linearization. Regression guard for the
+/// fix shipped in commit fcbb725 (Step 6 of the connector refactor): QR
+/// decomposition and other iterative CPU kernels are sensitive to within-
+/// level ordering, and a future refactor that switches back to flat
+/// `op_order` would silently regress them.
+///
+/// Construction: 4 ops, deps `A → C`, `B → D`. Level structure is
+/// `[[A,B], [C,D]]`. Any valid topological order respects A<C and B<D;
+/// only a level-by-level walk guarantees `{A,B}` both before `{C,D}` both.
+#[derive(Debug)]
+struct OrderRecorderProgram {
+    id: u64,
+    sink: Arc<parking_lot::Mutex<Vec<u64>>>,
+}
+
+impl Program for OrderRecorderProgram {
+    unsafe fn execute(
+        &self,
+        _buffers: &[*mut u8],
+        _vals: &[i64],
+        _global_size: Option<[usize; 3]>,
+        _local_size: Option<[usize; 3]>,
+        _wait: bool,
+    ) -> svod_device::Result<()> {
+        self.sink.lock().push(self.id);
+        Ok(())
+    }
+
+    fn name(&self) -> &str {
+        "order_recorder"
+    }
+}
+
+#[test]
+fn test_execute_walks_op_levels_in_level_order() {
+    let alloc = svod_device::registry::cpu().expect("cpu allocator");
+    let sink = Arc::new(parking_lot::Mutex::new(Vec::<u64>::new()));
+
+    fn record_kernel(id: u64, sink: &Arc<parking_lot::Mutex<Vec<u64>>>, deps: Vec<u64>) -> PreparedKernel {
+        PreparedKernel {
+            id,
+            ast: UOp::sink(vec![]),
+            kernel: Arc::new(CachedKernel {
+                program: Box::new(OrderRecorderProgram { id, sink: Arc::clone(sink) }),
+                device: "CPU".to_string(),
+                code: String::new(),
+                entry_point: format!("op{id}"),
+                var_names: Vec::new(),
+                globals: vec![0],
+                outs: vec![0],
+                ins: Vec::new(),
+                global_size: default_launch_size(),
+                local_size: Some(default_launch_size()),
+            }),
+            device: DeviceSpec::Cpu,
+            buffer_indices: vec![0],
+            output_indices: vec![0],
+            vals: Vec::new(),
+            fixedvars: HashMap::new(),
+            dependencies: deps,
+            buffer_ptrs: Vec::new(),
+            buffer_ids: Vec::new(),
+            runtime_vars: Vec::new(),
+        }
+    }
+
+    let mut builder = ExecutionPlanBuilder::new(DeviceSpec::Cpu);
+    let out = Buffer::new(alloc, DType::Float32, vec![1], Default::default());
+    out.ensure_allocated().expect("out alloc");
+    let out_idx = builder.add_buffer(900, out);
+    builder.set_output_buffer(out_idx);
+    // Level 0: ids 1, 2 (no deps).
+    // Level 1: ids 3 (deps [1]), 4 (deps [2]).
+    builder.add_op(PreparedOp::CompiledProgram(record_kernel(1, &sink, Vec::new())));
+    builder.add_op(PreparedOp::CompiledProgram(record_kernel(2, &sink, Vec::new())));
+    builder.add_op(PreparedOp::CompiledProgram(record_kernel(3, &sink, vec![1])));
+    builder.add_op(PreparedOp::CompiledProgram(record_kernel(4, &sink, vec![2])));
+    let plan = builder.build().expect("build plan");
+    plan.execute().expect("execute");
+
+    let order = sink.lock().clone();
+    assert_eq!(order.len(), 4, "expected 4 ops to run, got {order:?}");
+    // Level boundary: every level-0 id (1, 2) must precede every level-1 id (3, 4).
+    let pos = |id: u64| order.iter().position(|&x| x == id).expect("id not recorded");
+    let last_level0 = pos(1).max(pos(2));
+    let first_level1 = pos(3).min(pos(4));
+    assert!(
+        last_level0 < first_level1,
+        "level-1 op ran before a level-0 op (order={order:?}); execute() must walk op_levels, not flat op_order"
+    );
+}

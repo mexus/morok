@@ -347,15 +347,11 @@ impl AmdComputeQueue {
 
     /// Atomically build + submit one PM4 (single-XCC) kernel dispatch.
     ///
-    /// Holds the ring lock across timeline-value acquisition, ring blit, and
-    /// doorbell. This is load-bearing under Svod's rayon-parallel dispatch
-    /// (`execution_plan::execute_parallel_group`): without it, two concurrent
-    /// dispatches can interleave in the ring or be assigned timeline values out
-    /// of ring order, making the CP wait on a signal queued *later* in the same
-    /// ring — a deadlock that surfaces as a 30 s timeout + poison. tinygrad's
-    /// single-threaded (GIL) dispatch gets this ordering for free; we serialize
-    /// the submit critical section explicitly. The kernel still executes
-    /// asynchronously — only the microsecond-scale submit is serialized.
+    /// The queue's `inner` lock serializes packet assembly + ring blit +
+    /// doorbell. With one queue per `AmdConnector` (single-owner per plan or
+    /// graph) the lock is uncontended in practice, but it stays as a
+    /// defensive primitive — any future async use within one connector
+    /// (multi-threaded JIT replay, etc.) would still need it.
     ///
     /// Sequence mirrors `hcq.py:371-378`:
     /// `wait(timeline, prev) → memory_barrier → exec → signal(timeline, next)`.
@@ -384,10 +380,8 @@ impl AmdComputeQueue {
             conn.core().node.gpu_id,
         );
         let timeline_addr = conn.timeline_signal().value_addr();
-        // Step 7 of the connector refactor: this connector is owned by a single
-        // plan/graph, so scratch realloc and dispatch cannot race — the prior
-        // `lock_dispatch()` critical section around timeline+scratch+ring is
-        // gone. Within-connector ordering is still serial by ownership.
+        // The connector is single-owner — its scratch and timeline are not
+        // concurrently mutated, so we read them outside any lock.
         let scratch_addr = conn.scratch_gpu_va();
         let tmpring_size = conn.tmpring_size();
         // Assemble the full USER_DATA prefix here, under the lock, so the scratch
@@ -447,14 +441,10 @@ impl AmdComputeQueue {
     /// the graph's bound `hw_page`; the CP then runs the whole captured chain
     /// inline.
     ///
-    /// The CALLER must hold the device dispatch lock across the whole graph
-    /// submit (reserve timeline values → patch the IB → this push), so a
-    /// concurrent `dispatch_pm4` can't land a per-call dispatch between the
-    /// graph's reserved timeline value and its ring entry — that would make the
-    /// CP wait forever on a value only the later graph IB produces (the same
-    /// ordering deadlock `dispatch_pm4`'s lock guards against). Only the ring
-    /// `inner` lock is taken here; re-taking the (non-reentrant) dispatch lock
-    /// would deadlock.
+    /// With per-connector queues, each graph owns its connector and submits
+    /// through ITS OWN ring. The graph's own `comp_queue` `Mutex<AmdHwQueue>`
+    /// serialises capture vs replay within one graph; this primitive only
+    /// takes the queue's inner lock.
     pub fn submit_dwords(&self, dwords: &[u32]) -> Result<()> {
         debug_assert!(self.is_pm4, "submit_dwords on AQL queue");
         if let Some(err) = self.core.poison_error() {
@@ -484,8 +474,7 @@ impl AmdComputeQueue {
         );
         debug_assert_eq!(size_of::<HsaKernelDispatchPacket>(), AQL_PACKET_BYTES);
         let timeline_addr = conn.timeline_signal().value_addr();
-        // Step 7: connector is single-owner, no dispatch lock needed
-        // (cf. dispatch_pm4 comment).
+        // Single-owner connector — no external lock needed (cf. dispatch_pm4).
         let mut g = self.inner.lock();
         let prev = conn.timeline_value().saturating_sub(1);
         let next = conn.next_timeline();

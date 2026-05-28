@@ -202,8 +202,8 @@ pub struct AmdHwQueue {
 
 // SAFETY: the host pointers in `mv_sints`/`binded` are stable host-visible
 // mappings the graph owns for its lifetime; the only writers are `bind`
-// (capture) and `submit` (replay), which the graph serializes under the device
-// dispatch lock (see `queue::submit_dwords`).
+// (capture, single-threaded) and `submit` (replay, serialised by
+// `AmdGraph::comp_queue` `Mutex<AmdHwQueue>`).
 unsafe impl Send for AmdHwQueue {}
 unsafe impl Sync for AmdHwQueue {}
 
@@ -322,9 +322,8 @@ impl AmdHwQueue {
         }
 
         // Read the graph connector's own scratch. The connector is owned
-        // exclusively by this graph (Step 5 of the connector refactor), so
-        // there is no concurrent realloc to guard against — what used to be a
-        // `lock_dispatch()` critical section is now plain field access.
+        // exclusively by this graph, so there's no concurrent realloc to
+        // guard against — plain field access.
         let scratch_addr = self.connector.scratch_gpu_va();
         let tmpring_size = self.connector.tmpring_size();
 
@@ -455,10 +454,10 @@ impl AmdHwQueue {
     /// bound page's symbolic dwords + kernarg fields, then pushes the
     /// indirect-buffer reference with one doorbell.
     ///
-    /// Step 7 of the connector refactor: per-graph connector ownership means
-    /// there's no concurrent reader of the patched IB page to publish to —
-    /// the doorbell store inside `submit_dwords::ring_doorbell` provides the
-    /// host→GPU publication barrier.
+    /// Per-graph connector ownership means there's no concurrent reader of
+    /// the patched IB page to publish to — the doorbell store inside
+    /// `submit_dwords::ring_doorbell` provides the host→GPU publication
+    /// barrier.
     pub fn submit(&mut self, var_vals: &VarVals) -> Result<()> {
         self.apply_var_vals(var_vals)?;
         let cmd = self.binded.as_ref().expect("AmdHwQueue::submit before bind").indirect_cmd;

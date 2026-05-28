@@ -468,7 +468,9 @@ impl AmdProgram {
 /// `execute` path feeds into `dispatch_pm4`. Buffer VAs + vals are baked at
 /// capture; only the timeline wait/signal value dwords change on replay.
 impl AmdProgram {
-    /// Shared device handle (timeline signal, scratch VA, dispatch lock).
+    /// Device handle. Used by the `Program::execute` trait fallback to route
+    /// dispatch through the default connector, and by `AmdGraph::capture` to
+    /// reach the shared `Arc<AmdDeviceCore>` for the per-graph connector.
     pub fn device(&self) -> &Arc<AmdDevice> {
         &self.dev
     }
@@ -560,11 +562,11 @@ impl std::fmt::Debug for AmdProgram {
 }
 
 impl AmdProgram {
-    /// Connector-scoped dispatch entry point. Reads scratch / timeline /
-    /// dispatch lock from `conn` instead of `self.dev`'s default connector,
-    /// so future steps can plumb in a plan-/graph-owned connector with no
-    /// further AmdProgram changes. Equivalent to today's `execute` when
-    /// `conn == self.dev.connector()`.
+    /// Connector-scoped dispatch entry point. Reads queue / kernarg arena /
+    /// scratch / timeline from `conn` rather than from the device's default
+    /// connector, so plan and graph callers dispatch on their own isolated
+    /// ring. The `Program::execute` trait fallback below delegates here with
+    /// `self.dev.connector()` for callers that don't have their own.
     ///
     /// # Safety
     ///
@@ -724,9 +726,10 @@ impl Program for AmdProgram {
         local_size: Option<[usize; 3]>,
         wait: bool,
     ) -> Result<()> {
-        // Default path: dispatch on the program's owning device's default
-        // connector. Step 4 retargets this at `ExecutionPlan` by downcasting
-        // via `as_any()` and calling `execute_on` with the plan's connector.
+        // Fallback path for callers that don't supply a connector — dispatches
+        // through the device's default connector. `ExecutionPlan` and
+        // `AmdGraph` bypass this by downcasting via `as_any()` and calling
+        // `execute_on` with their own connector.
         unsafe { self.execute_on(self.dev.connector(), buffers, vals, global_size, local_size, wait) }
     }
 

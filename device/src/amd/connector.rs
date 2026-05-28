@@ -1,25 +1,26 @@
 //! `AmdConnector`: per-owner dispatch context.
 //!
-//! Step 2 of the per-owner connector refactor (plan `snug-honking-robin`).
-//! Pulls the mutable per-queue state — scratch buffer, timeline signal +
-//! counter, dispatch lock — off `AmdDevice` into a struct that future steps
-//! will instantiate per-`ExecutionPlan` / per-graph. Each connector owns its
-//! own dispatch slice; sharing happens only through the immutable
-//! `Arc<AmdDeviceCore>`.
+//! Holds the dispatch state that must NOT be shared across independent
+//! callers: a KFD compute queue (ring + doorbell), a kernarg bump arena,
+//! the scratch backing, and the timeline signal + counter. Every
+//! `ExecutionPlan` and every `AmdGraph` owns its own `AmdConnector` —
+//! `AmdDevice` keeps one default connector for the few callers that bypass
+//! the plan path (`AmdAllocator::_copyin`/`_copyout`/`_free` device-wide
+//! synchronize; the `Program::execute` trait fallback used by
+//! `benchmark_kernel`).
 //!
-//! Per Step 7 of the refactor, this struct now carries **no** dispatch lock:
-//! each connector has exactly one owner (an `ExecutionPlan` or `AmdGraph`),
-//! so the per-connector scratch + timeline + ring access are serialized by
-//! ownership rather than by an explicit `Mutex<()>`.
+//! Single-owner by construction means there's no dispatch lock: scratch
+//! realloc, timeline reservation, kernarg bump, and ring submission all run
+//! serially by ownership rather than under an explicit `Mutex<()>`. The
+//! queue's internal `Mutex<QueueInner>` stays as a defensive primitive but
+//! has exactly one writer in steady state.
 //!
-//! `queue` / `kernargs_arena` / `signal_pool` migrate into this struct in
-//! Step 3, where the factory + program-load wiring is reshaped so they
-//! don't need to be passed in from outside.
-//!
-//! Tinygrad analogue: there is no direct equivalent — tinygrad bundles all
-//! of this into `AMDDevice` (`runtime/ops_amd.py`) and relies on the GIL to
-//! serialize across concurrent dispatchers. Splitting it out is a deliberate
-//! Rust-side ownership-eliminates-locks divergence.
+//! Tinygrad analogue: `AMDDevice` (`runtime/ops_amd.py`) bundles all of
+//! this into one per-physical-GPU object and relies on the Python GIL to
+//! serialize concurrent dispatchers. The Svod split is a deliberate
+//! ownership-eliminates-locks divergence — sibling plans on the same
+//! physical GPU contend only at the per-core synchronize barrier (rare),
+//! not on a coarse device-wide dispatch mutex.
 
 #![cfg(target_os = "linux")]
 
@@ -39,12 +40,13 @@ use crate::amd::sys::{ioctl, kfd};
 use crate::error::{Error, Result};
 use crate::sync::TimelineSignal;
 
-/// Per-owner dispatch state. One instance per `ExecutionPlan` / `AmdGraph` in
-/// the final architecture; Step 2 ships exactly one per `AmdDevice` (the
-/// `default` connector) to keep the diff small.
+/// Per-owner dispatch state. One per `ExecutionPlan`, one per `AmdGraph`,
+/// plus one default per `AmdDevice` for trait-fallback callers (the rest of
+/// the runtime always goes through the plan/graph path).
 ///
-/// Owns: scratch backing, timeline signal + counter. Per-owner means no
-/// dispatch lock is needed — the connector has exactly one writer.
+/// Owns: KFD compute queue, kernarg arena, scratch backing, timeline signal,
+/// timeline counter. Single ownership means no dispatch lock — every
+/// mutation is serialized by the owner's exclusive access.
 #[derive(Debug)]
 pub struct AmdConnector {
     /// Shared immutable identity. Cloned across all connectors backed by the

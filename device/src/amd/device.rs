@@ -1,8 +1,14 @@
 //! `AmdDevice`: KFD-direct device handle.
 //!
-//! Phase 3 deliverable — opens `/dev/kfd` and `/dev/dri/renderD*`, parses
-//! topology, calls `AMDKFD_IOC_ACQUIRE_VM`. Queues/signals/kernarg arena are
-//! filled in by Phase 5/6.
+//! Opens `/dev/kfd` and `/dev/dri/renderD*`, parses topology, calls
+//! `AMDKFD_IOC_ACQUIRE_VM`. Owns an `Arc<AmdDeviceCore>` (the immutable
+//! per-physical-AMD:N identity — KFD/DRM fds, topology, event-page state,
+//! poison latch, shared signal pool) plus a lazily-installed default
+//! `AmdConnector` used by trait-fallback callers (`benchmark_kernel`) and
+//! by the device-wide synchronize chain (`AmdAllocator::_copyin`/`_copyout`
+//! /`_free`). Per-plan and per-graph callers build their own
+//! `AmdConnector` against the same shared core — they don't touch the
+//! default connector.
 
 #![cfg(target_os = "linux")]
 
@@ -29,10 +35,9 @@ use crate::error::{Error, Result};
 /// LRU-wrapped allocator + factory-side queue/arena setup — share the same
 /// `Arc<AmdDevice>` instead of double-opening.
 ///
-/// **Step 1 note**: the cache still hands out `Arc<AmdDevice>` for back-compat;
-/// the immutable identity it actually guards is `AmdDeviceCore`, exposed via
-/// `AmdDevice::core()` for future steps that will create per-owner
-/// `AmdConnector`s against the same shared core.
+/// The cached `Arc<AmdDevice>` carries the shared `Arc<AmdDeviceCore>` —
+/// per-plan and per-graph callers reach the core via `AmdDevice::core()` and
+/// build their own `AmdConnector` against it (no extra KFD opens).
 static DEVICE_CACHE: Lazy<Mutex<HashMap<usize, Arc<AmdDevice>>>> = Lazy::new(Default::default);
 
 /// Process-wide `/dev/kfd` handle. Tinygrad opens KFD once per process
@@ -75,16 +80,11 @@ pub(crate) struct ScratchState {
 }
 
 /// Immutable per-physical-AMD:N identity: KFD/DRM fds, topology, event-page
-/// state, fault latch. One instance per physical GPU in the process (KFD
-/// rejects double `ACQUIRE_VM`), shared as `Arc<AmdDeviceCore>` by every
-/// `AmdConnector` against this device.
-///
-/// **Step 1 of the per-owner connector refactor** (plan `snug-honking-robin`):
-/// the fields here previously lived directly on `AmdDevice` and were
-/// `Arc`-cloned together with the mutable per-queue state (scratch, timeline,
-/// dispatch lock). Splitting them out makes the future Step 2 trivial — an
-/// `AmdConnector` carrying its own queue/scratch/timeline against a shared
-/// `Arc<AmdDeviceCore>`. Until Step 2 lands, `AmdDevice` keeps both.
+/// state, fault latch, shared signal pool. One instance per physical GPU
+/// (KFD rejects double `ACQUIRE_VM`); shared as `Arc<AmdDeviceCore>` by
+/// every `AmdConnector` built against the device. Connector registry and
+/// `synchronize_all` live here so the host can drain every live connector
+/// before any destructive operation (`AmdAllocator::_free`, etc.).
 ///
 /// `event_page_*` is the GTT-pinned per-process event page (bound via
 /// `CREATE_EVENT(event_page_offset=handle)`). `queue_event_*` is the SIGNAL
@@ -140,17 +140,17 @@ pub struct AmdDeviceCore {
 
 /// Open handle to one AMD GPU node.
 ///
-/// Holds the immutable `AmdDeviceCore` plus the **default `AmdConnector`** —
-/// today's "single dispatcher" model. All accessors that previously read
-/// per-queue state (scratch, timeline, dispatch lock) now delegate to
-/// `self.connector`. Immutable Core fields stay reachable via [`Deref`].
+/// Holds the immutable `AmdDeviceCore` plus a default `AmdConnector` used
+/// by trait-fallback callers (`Program::execute` → `benchmark_kernel` etc.)
+/// and by the device-wide synchronize chain (`AmdAllocator::_copyin`/
+/// `_copyout`/`_free` route through `dev.synchronize() →
+/// core.synchronize_all()` which drains EVERY connector — default + per-
+/// plan + per-graph). Plan and graph callers build their own connector
+/// via `AmdConnector::new_with_resources` and bypass the default; the
+/// default connector is never on their hot path.
 ///
-/// Steps 3-7 of the refactor (`snug-honking-robin`) move ownership of the
-/// connector to `ExecutionPlan` / `AmdGraph` so this struct's default
-/// connector becomes vestigial and eventually unused. Until then, every
-/// `Program::execute`/`AmdGraph::replay`/`AmdAllocator::_free` keeps
-/// reaching through `self.dev.{scratch_gpu_va,…}` and lands on this
-/// connector.
+/// Immutable Core fields stay reachable via [`Deref`] — `self.dev.node`,
+/// `self.dev.kfd_fd`, `self.dev.poison_error()`, etc.
 #[derive(Debug)]
 pub struct AmdDevice {
     /// Immutable identity (cloneable across connectors).
