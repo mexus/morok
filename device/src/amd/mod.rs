@@ -10,6 +10,8 @@ pub mod topology;
 #[cfg(target_os = "linux")]
 pub mod allocator;
 #[cfg(target_os = "linux")]
+pub mod connector;
+#[cfg(target_os = "linux")]
 pub mod device;
 #[cfg(target_os = "linux")]
 pub mod graph;
@@ -27,7 +29,9 @@ pub mod signal;
 #[cfg(target_os = "linux")]
 pub use allocator::AmdAllocator;
 #[cfg(target_os = "linux")]
-pub use device::AmdDevice;
+pub use connector::AmdConnector;
+#[cfg(target_os = "linux")]
+pub use device::{AmdDevice, AmdDeviceCore};
 #[cfg(target_os = "linux")]
 pub use graph::AmdGraph;
 #[cfg(target_os = "linux")]

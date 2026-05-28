@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::Arc;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use nix::fcntl::{OFlag, open};
 use nix::sys::stat::Mode;
@@ -23,13 +23,17 @@ use crate::amd::signal::AmdSignal;
 use crate::amd::sys::{ioctl, kfd};
 use crate::amd::topology::{AmdNode, enumerate};
 use crate::error::{Error, Result};
-use crate::sync::TimelineSignal;
 
 /// Per-process cache of opened `AmdDevice`s, keyed by `device_id`. KFD only
 /// accepts one `ACQUIRE_VM` per (process, GPU); the cache ensures that
 /// concurrent `AmdAllocator::new(0)` calls — e.g. registry-cached
 /// LRU-wrapped allocator + factory-side queue/arena setup — share the same
 /// `Arc<AmdDevice>` instead of double-opening.
+///
+/// **Step 1 note**: the cache still hands out `Arc<AmdDevice>` for back-compat;
+/// the immutable identity it actually guards is `AmdDeviceCore`, exposed via
+/// `AmdDevice::core()` for future steps that will create per-owner
+/// `AmdConnector`s against the same shared core.
 static DEVICE_CACHE: Lazy<Mutex<HashMap<usize, Arc<AmdDevice>>>> = Lazy::new(Default::default);
 
 /// Process-wide `/dev/kfd` handle. Tinygrad opens KFD once per process
@@ -52,30 +56,36 @@ struct EventPageState {
 }
 
 /// Scratch backing memory + `COMPUTE_TMPRING_SIZE` packing. Held under a
-/// mutex on `AmdDevice` so [`AmdDevice::ensure_has_local_memory`] can grow
-/// the scratch buffer when a freshly-loaded program demands more bytes per
-/// thread than what's currently allocated.
+/// mutex on `AmdConnector` so [`AmdConnector::ensure_has_local_memory`] can
+/// grow the scratch buffer when a freshly-loaded program demands more bytes
+/// per thread than what's currently allocated. `pub(crate)` because Step 2
+/// moved the owning field into the sibling `connector` module.
 #[derive(Debug, Clone, Copy)]
-struct ScratchState {
+pub(crate) struct ScratchState {
     /// GPU VA of the current scratch buffer.
-    gpu_va: u64,
+    pub gpu_va: u64,
     /// Bytes per thread (rounded up to 4-byte slot stride for wave64).
     /// Equivalent to tinygrad's `max_private_segment_size` (ops_amd.py:1066).
-    size_per_thread: u32,
+    pub size_per_thread: u32,
     /// Packed `COMPUTE_TMPRING_SIZE` register value.
-    tmpring_size: u32,
+    pub tmpring_size: u32,
     /// KFD handle + total byte size of the backing alloc — needed to free the
     /// old buffer when scratch grows (mirror tinygrad `_realloc`).
-    handle: u64,
-    size: usize,
+    pub handle: u64,
+    pub size: usize,
 }
 
-/// Open handle to one AMD GPU node.
+/// Immutable per-physical-AMD:N identity: KFD/DRM fds, topology, event-page
+/// state, fault latch. One instance per physical GPU in the process (KFD
+/// rejects double `ACQUIRE_VM`), shared as `Arc<AmdDeviceCore>` by every
+/// `AmdConnector` against this device.
 ///
-/// Holds the KFD and DRM render fds plus parsed topology. Constructed via
-/// [`AmdDevice::open`]; callers receive an `Arc<AmdDevice>` so the same
-/// device handle can be shared by the allocator, queues, signals, and
-/// per-Program state without repeated KFD opens.
+/// **Step 1 of the per-owner connector refactor** (plan `snug-honking-robin`):
+/// the fields here previously lived directly on `AmdDevice` and were
+/// `Arc`-cloned together with the mutable per-queue state (scratch, timeline,
+/// dispatch lock). Splitting them out makes the future Step 2 trivial — an
+/// `AmdConnector` carrying its own queue/scratch/timeline against a shared
+/// `Arc<AmdDeviceCore>`. Until Step 2 lands, `AmdDevice` keeps both.
 ///
 /// `event_page_*` is the GTT-pinned per-process event page (bound via
 /// `CREATE_EVENT(event_page_offset=handle)`). `queue_event_*` is the SIGNAL
@@ -85,7 +95,7 @@ struct ScratchState {
 /// the GPU VA inside the event page where SDMA fence packets write the
 /// queue event_id (per tinygrad `ops_amd.py:738`).
 #[derive(Debug)]
-pub struct AmdDevice {
+pub struct AmdDeviceCore {
     pub node: AmdNode,
     pub arch: AmdArch,
     /// Shared `/dev/kfd` handle (one per process; see [`GLOBAL_KFD`]).
@@ -101,58 +111,49 @@ pub struct AmdDevice {
     pub queue_event_mailbox_ptr: u64,
     pub mem_fault_event_id: u32,
     pub hw_fault_event_id: u32,
-    /// Per-device scratch buffer + sizing. Initialized at open with
-    /// `private_segment_size = 128` (matches tinygrad's
-    /// `_ensure_has_local_memory(128)` at `ops_amd.py:1010`). Grown via
-    /// [`AmdDevice::ensure_has_local_memory`] when a program load reports a
-    /// larger `private_segment_fixed_size` — mirrors tinygrad
-    /// `ops_amd.py:589-590, 1065-1071`. Mutex because growth happens during
-    /// program load (not on the dispatch hot path); reads on the hot path
-    /// take the lock briefly to copy the (va, tmpring_size) pair.
-    ///
-    /// Even kernels with `SCRATCH_EN=0` need valid
-    /// `COMPUTE_DISPATCH_SCRATCH_BASE_LO/HI` for wave init on RDNA3+,
-    /// otherwise wave launch faults at random addresses. The old allocation
-    /// after a grow is intentionally leaked — AmdDevice lives in
-    /// `DEVICE_CACHE` for the whole process lifetime, so KFD frees it on
-    /// process exit.
-    scratch_state: Mutex<ScratchState>,
-    /// Device-global timeline signal. Every kernel/copy submit waits on the
-    /// previous timeline value and signals the next one; `synchronize()`
-    /// drains the queue by waiting until the GPU writes `timeline_value - 1`.
-    /// Mirrors tinygrad `HCQCompiled.timeline_signal` (`hcq.py:415`).
-    ///
-    /// Lazy-initialized via [`AmdDevice::init_timeline`] from the factory so
-    /// the `SignalPool` (which depends on an `AmdAllocator`, which depends on
-    /// `Arc<AmdDevice>`) can be wired up after `open()`.
-    timeline_signal: OnceLock<Arc<AmdSignal>>,
-    /// Highest timeline value submitted so far (next submit will use this and
-    /// then increment). Mirrors `HCQCompiled.timeline_value` (`hcq.py:405`).
-    timeline_value: AtomicU64,
+    /// Whether an SDMA copy queue is available on this physical device. Set
+    /// by the factory after it tries to create one (`ops_amd.py:1000`).
+    /// Today every AMD buffer is host-visible + memcpy'd, so this stays
+    /// `false` and the SDMA queue is dead code — kept on the core for the
+    /// future SDMA revival.
+    has_sdma_queue: AtomicBool,
     /// Poison latch. Once a GPU fault/timeout is observed, the device is dead:
-    /// every `synchronize`/`execute` fails fast. Mirrors tinygrad's
-    /// `error_state` (`hcq.py:421`). `AtomicBool` so the per-dispatch hot path
-    /// gate is a single Relaxed load; the message is written once on latch.
+    /// every `synchronize`/`execute` against any connector on this device
+    /// fails fast. Mirrors tinygrad's `error_state` (`hcq.py:421`). Per-physical
+    /// device because a memory fault corrupts the whole VM, not just one queue.
     poisoned: AtomicBool,
     error_msg: OnceLock<String>,
-    /// Whether an SDMA copy queue is available. Set by the factory after it
-    /// tries to create one (`ops_amd.py:1000` / `has_sdma_queue`). Defaults to
-    /// `false` so that — before wiring, and on hardware without SDMA (e.g.
-    /// APUs) — `AmdAllocator::_alloc` forces `cpu_access` and copies go through
-    /// the host `memmove` path (`ops_amd.py:649`, hcq.py:576-578).
-    has_sdma_queue: AtomicBool,
-    /// Serializes a dispatch's submit critical section (timeline-value
-    /// acquisition + reading the live scratch VA + ring blit) against teardown
-    /// of any *live* GPU resource (scratch realloc free, buffer unmap). Without
-    /// it, async dispatch captures a VA (e.g. the scratch base in
-    /// `AmdProgram::execute`/`dispatch_pm4`) but publishes its timeline value
-    /// only under the ring lock, so a concurrent thread's `synchronize()`
-    /// snapshot can miss the unpublished dispatch and unmap a VA the kernel is
-    /// about to program — a NotPresent fault on the freed VA. tinygrad avoids
-    /// this with the GIL; Svod runs concurrent `realize()`s against one shared
-    /// device, so we serialize explicitly. Held only for the brief submit
-    /// window and for the (rare) teardown drain.
-    dispatch_lock: Mutex<()>,
+}
+
+/// Open handle to one AMD GPU node.
+///
+/// Holds the immutable `AmdDeviceCore` plus the **default `AmdConnector`** —
+/// today's "single dispatcher" model. All accessors that previously read
+/// per-queue state (scratch, timeline, dispatch lock) now delegate to
+/// `self.connector`. Immutable Core fields stay reachable via [`Deref`].
+///
+/// Steps 3-7 of the refactor (`snug-honking-robin`) move ownership of the
+/// connector to `ExecutionPlan` / `AmdGraph` so this struct's default
+/// connector becomes vestigial and eventually unused. Until then, every
+/// `Program::execute`/`AmdGraph::replay`/`AmdAllocator::_free` keeps
+/// reaching through `self.dev.{scratch_gpu_va,…}` and lands on this
+/// connector.
+#[derive(Debug)]
+pub struct AmdDevice {
+    /// Immutable identity (cloneable across connectors).
+    core: Arc<AmdDeviceCore>,
+    /// Default per-device connector. Owns scratch, timeline, dispatch lock
+    /// for the duration of Steps 2-6. Step 7 retires this field together
+    /// with the `dispatch_lock` it carries.
+    connector: Arc<crate::amd::connector::AmdConnector>,
+}
+
+impl std::ops::Deref for AmdDevice {
+    type Target = AmdDeviceCore;
+    #[inline]
+    fn deref(&self) -> &AmdDeviceCore {
+        &self.core
+    }
 }
 
 impl AmdDevice {
@@ -263,16 +264,6 @@ impl AmdDevice {
         // here to wake up `WAIT_EVENTS` from `sleep()`.
         let queue_event_mailbox_ptr = event_page_va + (qe.event_slot_index as u64) * 8;
 
-        // Default scratch buffer — sized for 128 B/thread per tinygrad's
-        // `_ensure_has_local_memory(128)` at `ops_amd.py:1010`. Kernels with
-        // private_segment_fixed_size == 0 still need this set up: on RDNA3+
-        // the wave-init reads COMPUTE_DISPATCH_SCRATCH_BASE_LO/HI regardless
-        // of SCRATCH_EN, and an invalid base produces an MMU fault at the
-        // first dispatch. Programs that need more bytes/thread call
-        // `ensure_has_local_memory` at load time to grow the backing.
-        let (scratch_va, scratch_size, tmpring_size, size_per_thread, scratch_handle) =
-            alloc_scratch(&kfd_fd, &node, &arch, 128)?;
-
         debug!(
             node = node.node_id,
             gpu_id = node.gpu_id,
@@ -281,13 +272,10 @@ impl AmdDevice {
             queue_event_id = qe.event_id,
             mem_fault_event_id = mem_event.event_id,
             hw_fault_event_id = hw_event.event_id,
-            scratch_va = scratch_va,
-            scratch_size = scratch_size,
-            tmpring_size = tmpring_size,
             "AmdDevice opened"
         );
 
-        Ok(Arc::new(Self {
+        let core = Arc::new(AmdDeviceCore {
             node,
             arch,
             kfd_fd,
@@ -300,31 +288,88 @@ impl AmdDevice {
             queue_event_mailbox_ptr,
             mem_fault_event_id: mem_event.event_id,
             hw_fault_event_id: hw_event.event_id,
-            scratch_state: Mutex::new(ScratchState {
-                gpu_va: scratch_va,
-                size_per_thread,
-                tmpring_size,
-                handle: scratch_handle,
-                size: scratch_size,
-            }),
-            timeline_signal: OnceLock::new(),
-            timeline_value: AtomicU64::new(1),
+            has_sdma_queue: AtomicBool::new(false),
             poisoned: AtomicBool::new(false),
             error_msg: OnceLock::new(),
-            has_sdma_queue: AtomicBool::new(false),
-            dispatch_lock: Mutex::new(()),
-        }))
+        });
+        // Default connector — allocates the initial 128 B/thread scratch
+        // buffer (`ops_amd.py:1010`). Per the refactor plan Steps 3-7, the
+        // ownership of this connector will move to `ExecutionPlan`/`AmdGraph`;
+        // for now it stays on `AmdDevice` so existing call sites keep
+        // working via delegation.
+        let connector = crate::amd::connector::AmdConnector::new(Arc::clone(&core))?;
+        Ok(Arc::new(Self { core, connector }))
     }
 
-    /// Acquire the dispatch/teardown serialization lock. Held by `dispatch_*`
-    /// across [timeline acquire + live-scratch read + ring blit], and by
-    /// scratch realloc / buffer `_free` across [drain + unmap], so a teardown
-    /// can never unmap a VA that an in-flight-but-unpublished dispatch will
-    /// program. See [`Self::dispatch_lock`].
+    /// Borrow the shared immutable core. Used by Step 3+ to build per-owner
+    /// `AmdConnector`s against the same physical device without re-acquiring
+    /// KFD.
+    #[inline]
+    pub fn core(&self) -> &Arc<AmdDeviceCore> {
+        &self.core
+    }
+
+    /// Borrow the device's default connector. Step 3+ will route per-call
+    /// `Program::execute` through this until `ExecutionPlan` owns its own.
+    #[inline]
+    pub fn connector(&self) -> &Arc<crate::amd::connector::AmdConnector> {
+        &self.connector
+    }
+
+    // === Delegations to the default connector ===
+    // These keep the existing `self.dev.X()` call sites working unchanged
+    // through Step 2. Steps 3-5 retarget callers at `connector` directly,
+    // after which these delegates can be deleted.
+
+    /// Acquire the dispatch/teardown serialization lock (default connector).
+    /// Targeted for deletion in Step 7.
     pub fn lock_dispatch(&self) -> parking_lot::MutexGuard<'_, ()> {
-        self.dispatch_lock.lock()
+        self.connector.lock_dispatch()
     }
 
+    /// Install the default connector's timeline signal. Called once from
+    /// the device factory after the `SignalPool` is created.
+    pub fn init_timeline(&self, signal: Arc<AmdSignal>) {
+        self.connector.init_timeline(signal);
+    }
+
+    /// Current scratch buffer GPU VA on the default connector.
+    pub fn scratch_gpu_va(&self) -> u64 {
+        self.connector.scratch_gpu_va()
+    }
+
+    /// Packed `COMPUTE_TMPRING_SIZE` on the default connector.
+    pub fn tmpring_size(&self) -> u32 {
+        self.connector.tmpring_size()
+    }
+
+    /// Grow the default connector's scratch backing (delegate).
+    pub fn ensure_has_local_memory(&self, private_segment_size: u32) -> Result<()> {
+        self.connector.ensure_has_local_memory(private_segment_size)
+    }
+
+    /// Default connector timeline signal (delegate; panics if not initialized).
+    pub fn timeline_signal(&self) -> &Arc<AmdSignal> {
+        self.connector.timeline_signal()
+    }
+
+    /// Reserve the next timeline value on the default connector.
+    pub fn next_timeline(&self) -> u64 {
+        self.connector.next_timeline()
+    }
+
+    /// Highest submitted timeline value on the default connector.
+    pub fn timeline_value(&self) -> u64 {
+        self.connector.timeline_value()
+    }
+
+    /// Drain all submitted GPU work on this device's default connector.
+    pub fn synchronize(&self) -> Result<()> {
+        self.connector.synchronize()
+    }
+}
+
+impl AmdDeviceCore {
     /// Record whether an SDMA copy queue was successfully created. Called once
     /// from the device factory. When `false`, `AmdAllocator::_alloc` forces
     /// `cpu_access` so every buffer is host-visible and copies use `memmove`.
@@ -366,151 +411,6 @@ impl AmdDevice {
             return Err(Error::AmdIoctl { ioctl: "AMDKFD_IOC_WAIT_EVENTS", errno: e as i32 });
         }
         Ok(self.poll_faults_nonblocking())
-    }
-
-    /// Install the device-global timeline signal. Called exactly once from
-    /// the device factory after the `SignalPool` is created. Mirrors
-    /// tinygrad's `HCQCompiled.__init__` line `hcq.py:415`. Subsequent calls
-    /// are a no-op (the existing signal stays).
-    pub fn init_timeline(&self, signal: Arc<AmdSignal>) {
-        let _ = self.timeline_signal.set(signal);
-    }
-
-    /// Current scratch buffer GPU VA (set by [`ensure_has_local_memory`]).
-    /// Read under the scratch mutex; the call is on the dispatch hot path so
-    /// the lock window is intentionally tiny.
-    pub fn scratch_gpu_va(&self) -> u64 {
-        self.scratch_state.lock().gpu_va
-    }
-
-    /// Packed `COMPUTE_TMPRING_SIZE` for the current scratch buffer.
-    pub fn tmpring_size(&self) -> u32 {
-        self.scratch_state.lock().tmpring_size
-    }
-
-    /// Ensure the device's scratch backing has at least `private_segment_size`
-    /// bytes per thread. Mirrors tinygrad's `_ensure_has_local_memory` at
-    /// `ops_amd.py:1065-1081` — when a program load reports a larger
-    /// `private_segment_fixed_size` than the current backing supports, allocate
-    /// a fresh scratch buffer with the larger size and update the device's
-    /// (gpu_va, tmpring_size) atomically.
-    ///
-    /// The old scratch buffer is freed (sync → unmap → munmap → free), mirroring
-    /// tinygrad's `_realloc` (`hcq.py`). Growth only happens at program load, not
-    /// on the dispatch hot path, so the synchronize is rare and cheap; freeing is
-    /// load-bearing — leaking it exhausts VRAM across large multi-kernel models.
-    pub fn ensure_has_local_memory(&self, private_segment_size: u32) -> Result<()> {
-        let current = self.scratch_state.lock().size_per_thread;
-        if private_segment_size <= current {
-            return Ok(());
-        }
-        let (va, size, tmpring, rounded, handle) =
-            alloc_scratch(&self.kfd_fd, &self.node, &self.arch, private_segment_size)?;
-        // Hold the dispatch lock across the swap + free so the old scratch VA is
-        // unmapped only when no in-flight dispatch can still program it: a
-        // concurrent `dispatch_pm4` reads the scratch VA under this same lock,
-        // so it sees either the old VA (and has published its timeline value,
-        // which `free_scratch`'s drain then covers) or the new VA. Closes the
-        // scratch-realloc NotPresent race under concurrent `realize()`.
-        let _disp = self.lock_dispatch();
-        let stale = {
-            let mut state = self.scratch_state.lock();
-            // Re-check under lock — another caller might have grown larger between
-            // our check and this alloc. Keep the larger; the loser is freed below.
-            if rounded > state.size_per_thread {
-                let old = (state.gpu_va, state.size, state.handle);
-                *state = ScratchState { gpu_va: va, size_per_thread: rounded, tmpring_size: tmpring, handle, size };
-                old
-            } else {
-                (va, size, handle)
-            }
-        };
-        self.free_scratch(stale.0, stale.1, stale.2);
-        Ok(())
-    }
-
-    /// Drain, then unmap → munmap → free a scratch backing buffer. Old scratch is
-    /// no longer referenced once the timeline drains (sole user is dispatch).
-    fn free_scratch(&self, va: u64, size: usize, handle: u64) {
-        if let Err(e) = self.synchronize() {
-            tracing::warn!(?e, va, "scratch realloc: synchronize failed; freeing anyway");
-        }
-        let mut gpu_id = self.node.gpu_id;
-        let mut unmap = kfd::kfd_ioctl_unmap_memory_from_gpu_args {
-            handle,
-            device_ids_array_ptr: &mut gpu_id as *mut _ as u64,
-            n_devices: 1,
-            n_success: 0,
-        };
-        // SAFETY: fd alive; handle from a successful alloc_scratch.
-        let _ = unsafe { ioctl::kfd_unmap_memory_from_gpu(self.kfd_fd.as_raw_fd(), &mut unmap as *mut _) };
-        // SAFETY: va is the VA reserved by alloc_scratch's mmap.
-        unsafe { libc::munmap(va as *mut _, size) };
-        let mut free = kfd::kfd_ioctl_free_memory_of_gpu_args { handle };
-        // SAFETY: same handle.
-        let _ = unsafe { ioctl::kfd_free_memory_of_gpu(self.kfd_fd.as_raw_fd(), &mut free as *mut _) };
-    }
-
-    /// Device-global timeline signal (panics if [`init_timeline`] hasn't been
-    /// called — that's a programming error in the device factory wiring, not a
-    /// runtime condition).
-    pub fn timeline_signal(&self) -> &Arc<AmdSignal> {
-        self.timeline_signal.get().expect("timeline_signal not initialized; call init_timeline from factory")
-    }
-
-    /// Reserve the next timeline value (atomic `fetch_add(1)`). The caller
-    /// emits a queue signal packet that writes this value to the device
-    /// timeline signal slot. Mirrors `HCQCompiled.next_timeline` (`hcq.py:447`).
-    pub fn next_timeline(&self) -> u64 {
-        self.timeline_value.fetch_add(1, Ordering::AcqRel)
-    }
-
-    /// Highest submitted timeline value (i.e. the value the next `signal`
-    /// packet would write). `synchronize` waits until the GPU has written
-    /// `value - 1`.
-    pub fn timeline_value(&self) -> u64 {
-        self.timeline_value.load(Ordering::Acquire)
-    }
-
-    /// Drain all submitted GPU work on this device. Blocks until the device
-    /// timeline signal observes `timeline_value() - 1`.
-    ///
-    /// Tinygrad calls this from `_free` (`hcq.py:566`) so a buffer's KFD
-    /// unmap can't race with an in-flight kernel still holding its VA. Also
-    /// safe to call before externally-visible side effects (e.g. host reads
-    /// of GPU-written output buffers) for which `AmdProgram::execute` no
-    /// longer blocks per-dispatch.
-    pub fn synchronize(&self) -> Result<()> {
-        // Once latched, the device is dead — re-raise the recorded fault.
-        if let Some(err) = self.poison_error() {
-            return Err(err);
-        }
-        // Skip cleanly when the timeline hasn't been wired up yet — the
-        // factory installs it after `open()`, but allocator paths run during
-        // device construction (e.g. ring/GART buffers) need to be a no-op.
-        let Some(signal) = self.timeline_signal.get() else {
-            return Ok(());
-        };
-        let target = self.timeline_value.load(Ordering::Acquire).saturating_sub(1);
-        if target == 0 {
-            return Ok(());
-        }
-        signal.wait_signal_value(target, 30_000).inspect_err(|e| self.poison(&e.to_string()))?;
-
-        // Timeline wraparound (`hcq.py:442,480`). PM4 WAIT_REG_MEM / RELEASE_MEM
-        // compare the *low 32 bits* of the signal, so the counter must stay
-        // below 2^32. We've just drained to `target` (GPU idle), so it's safe to
-        // reset the signal slot to 0 and restart the counter at 1 — tinygrad
-        // swaps to a shadow signal only to avoid draining, which we already did.
-        // Unreachable in practice (2^31 dispatches); resets at most once per
-        // 2-billion-kernel run. The reset assumes quiescence at the wrap point,
-        // which holds for the single device timeline outside a concurrent burst
-        // straddling exactly 2^31.
-        if self.timeline_value.load(Ordering::Acquire) > (1u64 << 31) {
-            signal.set(0);
-            self.timeline_value.store(1, Ordering::Release);
-        }
-        Ok(())
     }
 
     /// `true` once a fault/timeout has poisoned the device. Hot-path gate.
@@ -715,7 +615,7 @@ fn alloc_event_page(kfd_fd: &OwnedFd, drm_fd: &OwnedFd, node: &AmdNode) -> Resul
 /// - `num_waves = (size_per_xcc / (wave_scratch * 256)) / se_cnt`
 /// - `max_scratch_waves = cu_cnt * max_slots_scratch_cu * xccs`
 /// - `WAVES = min(num_waves, max_scratch_waves)`, `WAVESIZE = wave_scratch`
-fn alloc_scratch(
+pub(crate) fn alloc_scratch(
     kfd_fd: &OwnedFd,
     node: &AmdNode,
     arch: &AmdArch,
