@@ -12,6 +12,10 @@ pub mod allocator;
 #[cfg(target_os = "linux")]
 pub mod device;
 #[cfg(target_os = "linux")]
+pub mod graph;
+#[cfg(target_os = "linux")]
+pub mod hw_queue;
+#[cfg(target_os = "linux")]
 pub mod kernarg;
 #[cfg(target_os = "linux")]
 pub mod program;
@@ -24,6 +28,10 @@ pub mod signal;
 pub use allocator::AmdAllocator;
 #[cfg(target_os = "linux")]
 pub use device::AmdDevice;
+#[cfg(target_os = "linux")]
+pub use graph::AmdGraph;
+#[cfg(target_os = "linux")]
+pub use hw_queue::{AmdArgsState, AmdHwQueue, Fmt, Sym, VarVals};
 #[cfg(target_os = "linux")]
 pub use kernarg::KernargArena;
 #[cfg(target_os = "linux")]

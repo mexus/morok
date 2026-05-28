@@ -5,6 +5,11 @@
 //! kernel versions and across gfx10/gfx11/gfx12 (CDNA gfx9 uses different
 //! values, not covered here).
 //!
+//! `<< 0` for offset-zero bitfields is kept intentionally so every member of a
+//! bitfield family reads uniformly (`x << OFFSET`) — clippy's `identity_op`
+//! would obscure that pattern.
+#![allow(clippy::identity_op)]
+//!
 //! Used by [`AmdComputeQueue`] to emit signal/barrier/wait packets through
 //! the AQL vendor-specific indirect-buffer mechanism. The AQL kernel-dispatch
 //! packet itself doesn't honor the HSA `completion_signal` field on AMD
@@ -164,6 +169,12 @@ pub const COMPUTE_RESOURCE_LIMITS: u32 = 0x215;
 pub const COMPUTE_TMPRING_SIZE: u32 = 0x218;
 pub const COMPUTE_RESTART_X: u32 = 0x21b;
 pub const COMPUTE_PGM_RSRC3: u32 = 0x228;
+// gfx9 (CDNA) places `regCOMPUTE_PGM_RSRC3` at a different SH-register offset:
+// vega `(3629 + GC_SEG0 0x2000) - SET_SH_REG_START 0x2c00 = 0x22d` vs navi
+// `(7112 + 0x1260) - 0x2c00 = 0x228`. Every *other* COMPUTE_* reg lands
+// identically across both arches, so only RSRC3 needs the split. Reached only on
+// a single-XCC gfx9 PM4 dispatch; multi-XCC CDNA uses the AQL path.
+pub const COMPUTE_PGM_RSRC3_GFX9: u32 = 0x22d;
 pub const COMPUTE_USER_DATA_0: u32 = 0x240;
 
 // ── COMPUTE_DISPATCH_INITIATOR field bits ─────────────────────────────────

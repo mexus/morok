@@ -12,8 +12,10 @@ use std::sync::Arc;
 
 use svod_codegen::llvm::LlvmTextRenderer;
 use svod_device::Result;
-use svod_device::amd::{AmdAllocator, AmdComputeQueue, AmdProgram, KernargArena, SignalPool};
-use svod_device::device::{CompiledSpec, Compiler, Device, Program, ProgramSpec, Renderer, RuntimeFactory};
+use svod_device::amd::{AmdAllocator, AmdComputeQueue, AmdGraph, AmdProgram, KernargArena, SignalPool};
+use svod_device::device::{
+    CompiledSpec, Compiler, Device, Graph, GraphFactory, GraphKernel, Program, ProgramSpec, Renderer, RuntimeFactory,
+};
 use svod_device::registry::DeviceRegistry;
 use svod_dtype::{AmdArch, DeviceSpec};
 use svod_ir::UOp;
@@ -70,7 +72,19 @@ pub fn create_amd_device(registry: &DeviceRegistry, device_id: usize, arch: AmdA
         )?;
         Ok(Box::new(prg) as Box<dyn Program>)
     });
-    Ok(Device::new(spec, allocator, renderer, compiler, runtime))
+
+    // Graph factory: pre-build a PM4 indirect buffer for a captured kernel
+    // chain and replay it with one doorbell (`svod_device::amd::AmdGraph`).
+    // Returns `Ok(None)` when the chain isn't graphable (AQL queue, non-AMD
+    // program), so the caller falls back to per-call dispatch. A fresh
+    // AmdAllocator shares the cached `Arc<AmdDevice>`, so capture allocates the
+    // IB page through the same KFD VM with no extra device open.
+    let graph: GraphFactory = Arc::new(move |kernels: &[GraphKernel]| -> Result<Option<Box<dyn Graph>>> {
+        let alloc = AmdAllocator::new(device_id)?;
+        AmdGraph::capture(&alloc, kernels)
+    });
+
+    Ok(Device::new(spec, allocator, renderer, compiler, runtime).with_graph(graph))
 }
 
 struct AmdRendererWrapper {

@@ -66,6 +66,37 @@ pub trait Program: Send + Sync {
 
     /// Get the kernel name (for debugging/profiling).
     fn name(&self) -> &str;
+
+    /// Downcast hook so a backend graph factory can recover its concrete
+    /// program (e.g. AMD rsrc/prog_addr) to pre-build dispatch packets.
+    /// Default returns nothing graphable.
+    fn as_any(&self) -> &dyn std::any::Any {
+        &()
+    }
+}
+
+/// One graphable kernel: a program plus its fixed buffer pointers and launch
+/// dims, captured once. Buffer pointers are plan-owned and stable across calls
+/// (`ExecutionPlan::buffers`), so a graph can bake them in and only re-patch
+/// variable-derived launch dims + `vals` on replay. Mirrors tinygrad's
+/// `(dev, prg, bufs, vars)` graph-call tuple (`engine/jit.py:99`).
+pub struct GraphKernel<'a> {
+    pub program: &'a dyn Program,
+    pub buffers: Vec<*mut u8>,
+    pub vals: Vec<i64>,
+    pub global_size: Option<[usize; 3]>,
+    pub local_size: Option<[usize; 3]>,
+}
+
+/// A pre-captured kernel chain replayed with one submit. Backends that can
+/// pre-build their dispatch packets (AMD indirect buffer) implement this so
+/// repeated inference pays per-graph, not per-kernel, launch cost. Replay is
+/// equivalent to running every captured kernel in order. Mirrors tinygrad's
+/// `GraphRunner` (`engine/jit.py:90`).
+pub trait Graph: Send + Sync {
+    /// Re-dispatch the captured chain. `vals` are positional updated launch
+    /// vars (same order as capture); empty replays the baked-in values.
+    fn replay(&self, vals: &[i64]) -> Result<()>;
 }
 
 /// Compilation result carrying source (JIT) or bytes (AOT).
@@ -432,6 +463,11 @@ pub trait Renderer: Send + Sync {
 /// allowing each backend to access what it needs.
 pub type RuntimeFactory = Arc<dyn Fn(&CompiledSpec) -> Result<Box<dyn Program>> + Send + Sync>;
 
+/// Builds a replayable graph from a captured kernel chain. Returns `Ok(None)`
+/// when this backend can't graph the chain (then callers fall back to per-call
+/// dispatch). AMD pre-builds an indirect buffer; CPU has no factory.
+pub type GraphFactory = Arc<dyn Fn(&[GraphKernel<'_>]) -> Result<Option<Box<dyn Graph>>> + Send + Sync>;
+
 /// A (Renderer, Compiler) pair for a specific backend.
 ///
 /// Devices can have multiple compiler pairs (e.g., different optimization levels).
@@ -478,6 +514,10 @@ pub struct Device {
     ///
     /// Takes (entry_point, compiled_bytes) and returns a Program.
     pub runtime: RuntimeFactory,
+
+    /// Optional graph factory for capture/replay. `None` means per-call
+    /// dispatch only (CPU); AMD installs one to build indirect-buffer graphs.
+    pub graph: Option<GraphFactory>,
 }
 
 impl Device {
@@ -493,7 +533,14 @@ impl Device {
         runtime: RuntimeFactory,
     ) -> Self {
         let compilers = vec![(renderer.clone(), compiler.clone())];
-        Self { device, allocator, compilers, renderer, compiler, runtime }
+        Self { device, allocator, compilers, renderer, compiler, runtime, graph: None }
+    }
+
+    /// Install a graph factory (capture/replay). Builder-style for backends
+    /// that can pre-build dispatch packets.
+    pub fn with_graph(mut self, factory: GraphFactory) -> Self {
+        self.graph = Some(factory);
+        self
     }
 
     /// Get the base device key (strips device ID).

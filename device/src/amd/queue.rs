@@ -362,6 +362,7 @@ impl AmdComputeQueue {
         rsrc2: u32,
         rsrc3: u32,
         prog_addr: u64,
+        enable_private_segment_sgpr: bool,
         user_data: &[u32],
         local: [u32; 3],
         grid: [u32; 3],
@@ -379,6 +380,21 @@ impl AmdComputeQueue {
         // the current (post-realloc) scratch buffer, not a stale one.
         let scratch_addr = self.dev.scratch_gpu_va();
         let tmpring_size = self.dev.tmpring_size();
+        // Assemble the full USER_DATA prefix here, under the lock, so the scratch
+        // SGPR descriptor (words 0-3) is derived from the SAME `scratch_addr` as
+        // the `COMPUTE_DISPATCH_SCRATCH_BASE` register below. Building it in
+        // `AmdProgram::execute` (outside the lock) let a concurrent scratch
+        // realloc slip in between the two reads, so the descriptor and the
+        // register could point at different buffers. Mirrors tinygrad's single
+        // `prg.dev.scratch.va_addr` read in `exec` (`ops_amd.py:328,354`).
+        let mut full_user_data: Vec<u32> = Vec::with_capacity(user_data.len() + 4);
+        if enable_private_segment_sgpr {
+            full_user_data.push(scratch_addr as u32);
+            full_user_data.push((scratch_addr >> 32) as u32 | (1u32 << 31));
+            full_user_data.push(0xFFFF_FFFF);
+            full_user_data.push(0x20c1_4000);
+        }
+        full_user_data.extend_from_slice(user_data);
         let mut g = self.inner.lock();
         let prev = self.dev.timeline_value().saturating_sub(1);
         let next = self.dev.next_timeline();
@@ -396,7 +412,7 @@ impl AmdComputeQueue {
             rsrc2,
             rsrc3,
             prog_addr,
-            user_data,
+            &full_user_data,
             scratch_addr,
             tmpring_size,
             local,
@@ -410,6 +426,35 @@ impl AmdComputeQueue {
         g.push_pm4(&q);
         g.ring_doorbell(/*is_pm4=*/ true);
         Ok(next)
+    }
+
+    /// Push a pre-built PM4 dword stream into the ring with ONE doorbell — the
+    /// primitive behind `AmdHwQueue::submit` (the graph's atomic `_submit`).
+    /// Mirrors tinygrad `AMDComputeQueue._submit` (`ops_amd.py:407-420`): blit
+    /// `cmds` into the ring, advance `put_value`, ring the doorbell.
+    ///
+    /// `dwords` is normally the 4-dword `PACKET3_INDIRECT_BUFFER` reference to
+    /// the graph's bound `hw_page`; the CP then runs the whole captured chain
+    /// inline.
+    ///
+    /// The CALLER must hold the device dispatch lock across the whole graph
+    /// submit (reserve timeline values → patch the IB → this push), so a
+    /// concurrent `dispatch_pm4` can't land a per-call dispatch between the
+    /// graph's reserved timeline value and its ring entry — that would make the
+    /// CP wait forever on a value only the later graph IB produces (the same
+    /// ordering deadlock `dispatch_pm4`'s lock guards against). Only the ring
+    /// `inner` lock is taken here; re-taking the (non-reentrant) dispatch lock
+    /// would deadlock.
+    pub fn submit_dwords(&self, dwords: &[u32]) -> Result<()> {
+        debug_assert!(self.is_pm4, "submit_dwords on AQL queue");
+        if let Some(err) = self.dev.poison_error() {
+            return Err(err);
+        }
+        let mut g = self.inner.lock();
+        std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
+        g.push_pm4(dwords);
+        g.ring_doorbell(/*is_pm4=*/ true);
+        Ok(())
     }
 
     /// Atomically build + submit one AQL (multi-XCC CDNA) kernel dispatch. Same
@@ -470,7 +515,7 @@ fn dwords_as_bytes(p: &[u32; 16]) -> &[u8] {
 /// upper bits of a 256-byte-aligned address). `wave32` comes from
 /// `kd.kernel_code_properties & 0x400`; `cs_w32_en` is gfx11/12-only.
 #[allow(clippy::too_many_arguments)]
-fn build_exec_pm4(
+pub(crate) fn build_exec_pm4(
     q: &mut Vec<u32>,
     rsrc1: u32,
     rsrc2: u32,
@@ -492,9 +537,10 @@ fn build_exec_pm4(
     let prog_shr = prog_addr >> 8;
     q.extend(pm4::set_sh_reg(pm4::COMPUTE_PGM_LO, &[prog_shr as u32, (prog_shr >> 32) as u32]));
 
-    // 3. RSRC1/2 together; RSRC3 separately.
+    // 3. RSRC1/2 together; RSRC3 separately (gfx9 uses a different SH offset).
     q.extend(pm4::set_sh_reg(pm4::COMPUTE_PGM_RSRC1, &[rsrc1, rsrc2]));
-    q.extend(pm4::set_sh_reg(pm4::COMPUTE_PGM_RSRC3, &[rsrc3]));
+    let rsrc3_reg = if target_major == 9 { pm4::COMPUTE_PGM_RSRC3_GFX9 } else { pm4::COMPUTE_PGM_RSRC3 };
+    q.extend(pm4::set_sh_reg(rsrc3_reg, &[rsrc3]));
 
     // 4. Scratch / tmpring (valid base required for wave init on RDNA3+ even
     //    when SCRATCH_EN=0).

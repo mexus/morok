@@ -468,6 +468,105 @@ impl AmdProgram {
     }
 }
 
+/// Graph-capture accessors. The AMD graph factory (`amd/graph.rs`) downcasts a
+/// `dyn Program` to `AmdProgram` via [`Program::as_any`] and reads these to
+/// pre-build the PM4 indirect-buffer chain once — same fields the per-call
+/// `execute` path feeds into `dispatch_pm4`. Buffer VAs + vals are baked at
+/// capture; only the timeline wait/signal value dwords change on replay.
+impl AmdProgram {
+    /// Shared device handle (timeline signal, scratch VA, dispatch lock).
+    pub fn device(&self) -> &Arc<AmdDevice> {
+        &self.dev
+    }
+
+    /// Shared compute queue this program dispatches through. The graph only
+    /// captures kernels that share one queue (single-XCC PM4 ring).
+    pub fn queue(&self) -> &Arc<AmdComputeQueue> {
+        &self.queue
+    }
+
+    /// Shared kernarg arena. The graph reserves one fixed slot per kernel at
+    /// capture and rewrites its 8 B buffer VAs + 4 B vals there each replay.
+    pub fn arena(&self) -> &Arc<KernargArena> {
+        &self.arena
+    }
+
+    /// `kd.kernarg_size` — byte count of one kernarg record (ABI padded).
+    pub fn kernarg_record_size(&self) -> usize {
+        self.kernarg_size()
+    }
+
+    /// COMPUTE_PGM_RSRC1/2/3 (PM4 path), pre-patched at load.
+    pub fn rsrc(&self) -> (u32, u32, u32) {
+        (self.rsrc1, self.rsrc2, self.rsrc3)
+    }
+
+    /// PM4 shader entry point (`prog_addr`; the LO/HI registers carry `>> 8`).
+    pub fn pm4_prog_addr(&self) -> u64 {
+        self.pm4_prog_addr
+    }
+
+    /// `(wave32, target_major)` — drive the `cs_w32_en` DISPATCH_INITIATOR bit.
+    pub fn wave32_target(&self) -> (bool, u32) {
+        (self.wave32, self.target_major)
+    }
+
+    /// Whether the kernel reads a 4-dword scratch descriptor from user SGPRs
+    /// 0-3 (prepended to USER_DATA before the kernarg pointer).
+    pub fn enable_private_segment_sgpr(&self) -> bool {
+        self.enable_private_segment_sgpr
+    }
+
+    /// `(buf_count, var_count)` — kernarg layout: `buf_count*8 + var_count*4`.
+    pub fn arg_counts(&self) -> (usize, usize) {
+        (self.buf_count, self.var_count)
+    }
+
+    /// Shared per-process signal pool — the graph carves its kickoff / self
+    /// signals from it (reachable via `AmdProgram` because the graph downcasts
+    /// the first captured kernel's `dyn Program`). Mirrors tinygrad reaching
+    /// signals through `dev.new_signal` (`hcq.py:451`).
+    pub fn signal_pool(&self) -> &Arc<SignalPool> {
+        &self.signal_pool
+    }
+
+    /// Fill one kernarg slot for graph capture. Port of
+    /// `HCQProgram.fill_kernargs` + `CLikeArgsState.__init__`
+    /// (`hcq.py:341,322-330`): writes the buffer VAs then scalar vals into the
+    /// caller-provided slot at `(slot_host, slot_gpu)` and returns the
+    /// [`AmdArgsState`] the graph's `AmdHwQueue::exec` binds.
+    ///
+    /// `bufs[pos]` is a concrete VA (`Ok`) or a [`Sym`] for a JIT input (`Err`)
+    /// — symbolic inputs are recorded so they get re-patched per replay. The
+    /// per-call `execute` path uses no kernarg page indirection, so this is the
+    /// graph-only entry point.
+    ///
+    /// # Safety
+    /// `slot_host` must point at a writable region of at least
+    /// `kernarg_record_size()` bytes that the caller owns for the graph's life.
+    pub unsafe fn fill_kernargs(
+        &self,
+        slot_host: *mut u8,
+        slot_gpu: u64,
+        bufs: &[std::result::Result<u64, crate::amd::hw_queue::Sym>],
+        vals: &[i64],
+    ) -> Result<crate::amd::hw_queue::AmdArgsState> {
+        let needed = bufs.len() * 8 + vals.len() * 4;
+        if needed > self.kernarg_size() {
+            return Err(Error::Runtime {
+                message: format!(
+                    "AmdProgram '{}': graph kernarg layout {needed} > kd.kernarg_size {}",
+                    self.name,
+                    self.kernarg_size()
+                ),
+            });
+        }
+        // SAFETY: caller guarantees slot_host owns >= kernarg_size() bytes and
+        // `needed <= kernarg_size()`.
+        Ok(unsafe { crate::amd::hw_queue::AmdArgsState::new(slot_host, slot_gpu, bufs, vals) })
+    }
+}
+
 impl std::fmt::Debug for AmdProgram {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AmdProgram")
@@ -566,7 +665,7 @@ impl Program for AmdProgram {
             let bufs_str: Vec<String> =
                 buffers.iter().enumerate().map(|(i, b)| format!("buf{}={:#x}", i, *b as u64)).collect();
             eprintln!(
-                "[dispatch tv={}] kernel={} grid=[{}, {}, {}] local=[{}, {}, {}] is_pm4={} kernarg_gpu={:#x} {}",
+                "[dispatch tv={}] kernel={} grid=[{}, {}, {}] local=[{}, {}, {}] is_pm4={} kernarg_gpu={:#x} scratch={:#x} {}",
                 self.dev.timeline_value(),
                 self.name,
                 g[0],
@@ -577,25 +676,20 @@ impl Program for AmdProgram {
                 l[2],
                 self.queue.is_pm4(),
                 kernarg_gpu,
-                format!("scratch={:#x} {}", self.dev.scratch_gpu_va(), bufs_str.join(" "))
+                self.dev.scratch_gpu_va(),
+                bufs_str.join(" "),
             );
         }
 
-        // Assemble the USER_DATA SGPR pre-load prefix per the kernel's
-        // `kernel_code_properties` bits. Mirrors tinygrad `ops_amd.py:325-342`:
-        //   - if ENABLE_SGPR_PRIVATE_SEGMENT_BUFFER (bit 0): 4 dwords
-        //     `[scratch_lo, scratch_hi | (1<<31), 0xffffffff, 0x20c14000]`
-        //   - if ENABLE_SGPR_DISPATCH_PTR (bit 1): 2 dwords — rejected at
-        //     program load until we wire up dispatch-packet allocation.
-        //   - always: 2 dwords `[kernarg_lo, kernarg_hi]`.
+        // USER_DATA SGPR pre-load. We only assemble the kernarg pointer here;
+        // the optional scratch SGPR descriptor (ENABLE_SGPR_PRIVATE_SEGMENT_BUFFER)
+        // is prepended inside `dispatch_pm4` under the dispatch lock, so it reads
+        // the live scratch VA in the same critical section as the
+        // `COMPUTE_DISPATCH_SCRATCH_BASE` register (a concurrent scratch realloc
+        // can no longer desync the descriptor from the register). ENABLE_SGPR_
+        // DISPATCH_PTR (bit 1) is rejected at program load. Mirrors tinygrad
+        // `ops_amd.py:325-342` (single `prg.dev.scratch.va_addr` read in `exec`).
         let mut user_data: smallvec::SmallVec<[u32; 8]> = smallvec::SmallVec::new();
-        if self.enable_private_segment_sgpr {
-            let scratch = self.dev.scratch_gpu_va();
-            user_data.push(scratch as u32);
-            user_data.push((scratch >> 32) as u32 | (1u32 << 31));
-            user_data.push(0xFFFF_FFFF);
-            user_data.push(0x20c1_4000);
-        }
         user_data.push(kernarg_gpu as u32);
         user_data.push((kernarg_gpu >> 32) as u32);
 
@@ -613,6 +707,7 @@ impl Program for AmdProgram {
                 self.rsrc2,
                 self.rsrc3,
                 self.pm4_prog_addr,
+                self.enable_private_segment_sgpr,
                 &user_data,
                 [l[0] as u32, l[1] as u32, l[2] as u32],
                 [g[0] as u32, g[1] as u32, g[2] as u32],
@@ -651,6 +746,13 @@ impl Program for AmdProgram {
 
     fn name(&self) -> &str {
         &self.name
+    }
+
+    /// Downcast hook for the AMD graph factory (`amd/graph.rs`): recovers the
+    /// concrete `AmdProgram` so it can read rsrc/prog_addr/arena and pre-build
+    /// the indirect-buffer dispatch chain. Mirrors `Program::as_any`'s contract.
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 }
 

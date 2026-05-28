@@ -97,9 +97,15 @@ pub(crate) fn split_end_with_tag(
     let sink = UOp::sink(ranges.iter().cloned().collect());
     let actual_ranges = sink.ranges().clone();
 
-    // No actual RANGEs found - nothing to split
+    // No actual RANGEs: this END closes no loops (its `ranges` were optimized to
+    // constants/expressions). Tinygrad's `do_split_ends` returns `e.src[0]` here —
+    // the empty `for` loop leaves `ret = e.src[0]` (linearizer.py:89-90) — so the
+    // empty END is eliminated and never reaches the renderer or `spec_program`'s
+    // `END closes only RANGEs` invariant. Mirror that: replace the END with its
+    // computation. (Returning `None`/keeping it left inert `END(_, [CONST])` nodes
+    // in LINEAR, which the renderer ignored but the spec whitelist rejects.)
     if actual_ranges.is_empty() {
-        return None;
+        return Some(computation.clone());
     }
 
     // Single RANGE - create simple single-range END

@@ -156,18 +156,18 @@ impl AmdSignal {
     #[inline]
     fn spin_or_escalate(&self, start: std::time::Instant) -> Option<Error> {
         let elapsed_ms = start.elapsed().as_millis() as u64;
-        if elapsed_ms >= WAIT_EVENTS_ESCALATE_MS {
-            if let Some(dev) = self.device.upgrade() {
-                // Sleep in the kernel for at most another tier worth of time;
-                // on return we re-check the host value and either complete
-                // or escalate again. wait_events watches the three KFD
-                // events (queue, mem fault, hw fault); a fault is returned
-                // here so we bail with the actual error instead of grinding
-                // through the rest of the timeout.
-                match dev.wait_events(WAIT_EVENTS_ESCALATE_MS as u32) {
-                    Ok(Some(fault)) => return Some(fault),
-                    Ok(None) | Err(_) => return None,
-                }
+        if elapsed_ms >= WAIT_EVENTS_ESCALATE_MS
+            && let Some(dev) = self.device.upgrade()
+        {
+            // Sleep in the kernel for at most another tier worth of time;
+            // on return we re-check the host value and either complete
+            // or escalate again. wait_events watches the three KFD
+            // events (queue, mem fault, hw fault); a fault is returned
+            // here so we bail with the actual error instead of grinding
+            // through the rest of the timeout.
+            match dev.wait_events(WAIT_EVENTS_ESCALATE_MS as u32) {
+                Ok(Some(fault)) => return Some(fault),
+                Ok(None) | Err(_) => return None,
             }
         }
         std::hint::spin_loop();

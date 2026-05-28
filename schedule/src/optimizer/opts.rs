@@ -251,45 +251,54 @@ fn apply_unroll(scheduler: &mut Scheduler, axis: usize, amount: usize) -> Result
 // SWAP - Axis reordering
 // ============================================================================
 
-/// Swap axis_id values of two GLOBAL ranges for memory access optimization.
+/// Swap two GLOBAL ranges for memory-access optimization.
+///
+/// Tinygrad's `OptOps.SWAP` (`codegen/opt/postrange.py`) tags the two replacement
+/// ranges (`tag=1`), runs the fixed-point `substitute`, then strips the tags with
+/// `graph_rewrite(remove_all_tags)`. That cannot be ported verbatim: Svod's
+/// hash-consing keys a parent on its children's *tag-blind* `content_hash`
+/// (`hash_consing::src_hashes`), so rebuilding a parent with the untagged child
+/// collides with the original tagged-child parent and `remove_all_tags` is a no-op
+/// above the tagged node — the tag never survives reconstruction.
+///
+/// Instead we apply the swap as a single-pass [`substitute_walk`]. The map is the
+/// simultaneous `{rng -> range(end1, axis_id2), altrng -> range(end2, axis_id1)}`;
+/// for equal-extent axes (square matmul, M==N) hash-consing makes the replacements
+/// collapse to `{rng -> altrng, altrng -> rng}`. A re-traversing fixed-point
+/// `substitute` would re-apply the map to its own output and hit the engine's
+/// cycle guard; the single-pass walk applies each mapping exactly once, yielding
+/// the correct simultaneous swap without tags.
+///
+/// [`substitute_walk`]: UOp::substitute_walk
 fn apply_swap(scheduler: &mut Scheduler, axis: usize, other_axis: usize) -> Result<(), OptError> {
-    if axis == other_axis {
-        return ValidationFailedSnafu { op: "SWAP", reason: "cannot swap axis with itself" }.fail();
-    }
-
     let rngs = scheduler.rngs();
-    if axis >= rngs.len() {
-        return AxisOutOfBoundsSnafu { axis, max: rngs.len() }.fail();
-    }
-    if other_axis >= rngs.len() {
-        return AxisOutOfBoundsSnafu { axis: other_axis, max: rngs.len() }.fail();
-    }
+    let rng = rngs.get(axis).ok_or_else(|| AxisOutOfBoundsSnafu { axis, max: rngs.len() }.build())?.clone();
+    let altrng =
+        rngs.get(other_axis).ok_or_else(|| AxisOutOfBoundsSnafu { axis: other_axis, max: rngs.len() }.build())?.clone();
 
-    let (rng1, rng2) = (&rngs[axis], &rngs[other_axis]);
-
-    let (end1, axis_id1, axis_type1) = match rng1.op() {
+    let (end1, axis_id1, axis_type1) = match rng.op() {
         Op::Range { end, axis_id, axis_type, .. } => (end.clone(), *axis_id, *axis_type),
         _ => return ExpectedRangeOperationSnafu.fail(),
     };
-
-    let (end2, axis_id2, axis_type2) = match rng2.op() {
+    let (end2, axis_id2, axis_type2) = match altrng.op() {
         Op::Range { end, axis_id, axis_type, .. } => (end.clone(), *axis_id, *axis_type),
         _ => return ExpectedRangeOperationSnafu.fail(),
     };
 
     if axis_type1 != AxisType::Global || axis_type2 != AxisType::Global {
-        return ValidationFailedSnafu { op: "SWAP", reason: "both axes must be GLOBAL" }.fail();
+        return ValidationFailedSnafu { op: "SWAP", reason: "swap only for globals" }.fail();
     }
 
-    let new_rng1 = UOp::range_axis(end1, axis_id2, axis_type1);
-    let new_rng2 = UOp::range_axis(end2, axis_id1, axis_type2);
+    let new_rng = UOp::range_axis(end1, axis_id2, axis_type1);
+    let new_altrng = UOp::range_axis(end2, axis_id1, axis_type2);
 
     #[allow(clippy::mutable_key_type)]
     let mut subst_map = HashMap::new();
-    subst_map.insert(UOpKey(rng1.clone()), new_rng1);
-    subst_map.insert(UOpKey(rng2.clone()), new_rng2);
-    let new_ast = scheduler.ast().substitute(&subst_map);
-    scheduler.set_ast(new_ast);
+    subst_map.insert(UOpKey(rng), new_rng);
+    subst_map.insert(UOpKey(altrng), new_altrng);
+
+    let swapped = scheduler.ast().substitute_walk(&subst_map);
+    scheduler.set_ast(swapped);
 
     Ok(())
 }
