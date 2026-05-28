@@ -407,31 +407,6 @@ fn test_prepare_simple_add() {
 }
 
 #[test]
-fn test_prepare_execution_plan_marks_cpu_kernels_host_parallel_safe() {
-    crate::test::helpers::test_setup();
-
-    let a = Tensor::from_slice([1.0f32, 2.0, 3.0]);
-    let b = Tensor::from_slice([4.0f32, 5.0, 6.0]);
-    let mut c = &a + &b;
-    let plan = c.prepare().expect("prepare should succeed");
-
-    let compiled: Vec<_> = plan
-        .prepared_ops()
-        .iter()
-        .filter_map(|op| match op {
-            svod_runtime::PreparedOp::CompiledProgram(kernel) => Some(kernel),
-            _ => None,
-        })
-        .collect();
-
-    assert!(!compiled.is_empty(), "prepare should produce compiled kernels");
-    assert!(
-        compiled.iter().all(|kernel| kernel.kernel.host_parallel_safe),
-        "CPU kernels should propagate host_parallel_safe metadata"
-    );
-}
-
-#[test]
 fn test_prepare_and_execute() {
     crate::test::helpers::test_setup();
 

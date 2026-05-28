@@ -46,11 +46,6 @@ pub struct CachedKernel {
     /// Input buffer slots read by LOAD operations.
     /// Matches Tinygrad's ProgramSpec.ins semantics.
     pub ins: Vec<usize>,
-    /// Whether host-level scheduling may overlap this program with other kernels.
-    ///
-    /// Thread-safety is required by the `Program` trait. This flag is about
-    /// backend/kernel semantics, not Rust synchronization safety.
-    pub host_parallel_safe: bool,
     /// Symbolic global work size evaluated with runtime vars before dispatch.
     pub global_size: [Arc<UOp>; 3],
     /// Symbolic local work size. None means direct global-id execution.

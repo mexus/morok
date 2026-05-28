@@ -7,11 +7,10 @@
 //! own dispatch slice; sharing happens only through the immutable
 //! `Arc<AmdDeviceCore>`.
 //!
-//! Step 2 ships exactly **one** connector per `AmdDevice` (the "default"
-//! connector), so visible behavior is unchanged. Steps 3-7 thread the
-//! connector through `Program::execute_on`, `AmdGraph`, and `ExecutionPlan`,
-//! at which point the `dispatch_lock` (still here transitionally) becomes
-//! removable.
+//! Per Step 7 of the refactor, this struct now carries **no** dispatch lock:
+//! each connector has exactly one owner (an `ExecutionPlan` or `AmdGraph`),
+//! so the per-connector scratch + timeline + ring access are serialized by
+//! ownership rather than by an explicit `Mutex<()>`.
 //!
 //! `queue` / `kernargs_arena` / `signal_pool` migrate into this struct in
 //! Step 3, where the factory + program-load wiring is reshaped so they
@@ -41,9 +40,8 @@ use crate::sync::TimelineSignal;
 /// the final architecture; Step 2 ships exactly one per `AmdDevice` (the
 /// `default` connector) to keep the diff small.
 ///
-/// Owns: scratch backing, timeline signal + counter, transitional
-/// `dispatch_lock`. Step 3 adds `queue`, `kernargs_arena`, and
-/// `signal_pool` ownership.
+/// Owns: scratch backing, timeline signal + counter. Per-owner means no
+/// dispatch lock is needed — the connector has exactly one writer.
 #[derive(Debug)]
 pub struct AmdConnector {
     /// Shared immutable identity. Cloned across all connectors backed by the
@@ -51,9 +49,7 @@ pub struct AmdConnector {
     core: Arc<AmdDeviceCore>,
     /// Per-connector scratch backing. Mirrors what used to live on
     /// `AmdDevice::scratch_state`; see that field's docstring for the
-    /// `_ensure_has_local_memory` story (`ops_amd.py:1065-1081`). Once each
-    /// connector has its own scratch, the dispatch_lock around
-    /// realloc-vs-dispatch becomes unnecessary (Step 6).
+    /// `_ensure_has_local_memory` story (`ops_amd.py:1065-1081`).
     scratch_state: Mutex<ScratchState>,
     /// Per-connector timeline signal. Every kernel/copy submitted via this
     /// connector waits on the previous timeline value and signals the next
@@ -66,12 +62,6 @@ pub struct AmdConnector {
     /// `next_timeline()` via `fetch_add(1)`. Mirrors `timeline_value`
     /// (`hcq.py:405`).
     timeline_value: AtomicU64,
-    /// Serializes [timeline acquire + live-scratch read + ring blit] against
-    /// teardown drains. **Transitional**: while connectors are shared across
-    /// dispatchers in Steps 2-6 this lock prevents scratch-realloc-vs-dispatch
-    /// VA races. Targeted for deletion in Step 7 once each connector has
-    /// exactly one owner.
-    dispatch_lock: Mutex<()>,
 }
 
 impl AmdConnector {
@@ -97,7 +87,6 @@ impl AmdConnector {
             }),
             timeline_signal: OnceLock::new(),
             timeline_value: AtomicU64::new(1),
-            dispatch_lock: Mutex::new(()),
         });
         // Register with the core so `synchronize_all` finds us. Opportunistic
         // GC: drop entries whose connector has already been dropped.
@@ -113,12 +102,6 @@ impl AmdConnector {
     #[inline]
     pub fn core(&self) -> &Arc<AmdDeviceCore> {
         &self.core
-    }
-
-    /// Acquire the dispatch/teardown serialization lock. See the field
-    /// docstring for the invariant and the deletion path (Step 7).
-    pub fn lock_dispatch(&self) -> parking_lot::MutexGuard<'_, ()> {
-        self.dispatch_lock.lock()
     }
 
     /// Install the connector's timeline signal. Called exactly once from the
@@ -204,9 +187,10 @@ impl AmdConnector {
         }
         let (va, size, tmpring, rounded, handle) =
             alloc_scratch(&self.core.kfd_fd, &self.core.node, &self.core.arch, private_segment_size)?;
-        // Hold the dispatch lock across the swap + free so the old scratch VA
-        // is unmapped only when no in-flight dispatch can still program it.
-        let _disp = self.lock_dispatch();
+        // Step 7: per-connector ownership means there's no in-flight dispatch
+        // on a sibling thread to race against. `free_scratch` still drains
+        // *this* connector's timeline before the unmap (just below) — that's
+        // the per-connector invariant that replaced the device-wide lock.
         let stale = {
             let mut state = self.scratch_state.lock();
             if rounded > state.size_per_thread {

@@ -149,9 +149,10 @@ pub struct AmdDeviceCore {
 pub struct AmdDevice {
     /// Immutable identity (cloneable across connectors).
     core: Arc<AmdDeviceCore>,
-    /// Default per-device connector. Owns scratch, timeline, dispatch lock
-    /// for the duration of Steps 2-6. Step 7 retires this field together
-    /// with the `dispatch_lock` it carries.
+    /// Default per-device connector. Owns scratch + timeline; vestigial after
+    /// Step 7 (every dispatcher now creates its own connector) but kept so
+    /// the few remaining `AmdDevice::synchronize()`-via-allocator call sites
+    /// (`_copyin`/`_copyout`/`_free`) still resolve.
     connector: Arc<crate::amd::connector::AmdConnector>,
 }
 
@@ -325,15 +326,9 @@ impl AmdDevice {
     }
 
     // === Delegations to the default connector ===
-    // These keep the existing `self.dev.X()` call sites working unchanged
-    // through Step 2. Steps 3-5 retarget callers at `connector` directly,
-    // after which these delegates can be deleted.
-
-    /// Acquire the dispatch/teardown serialization lock (default connector).
-    /// Targeted for deletion in Step 7.
-    pub fn lock_dispatch(&self) -> parking_lot::MutexGuard<'_, ()> {
-        self.connector.lock_dispatch()
-    }
+    // These keep the existing `self.dev.X()` call sites working unchanged.
+    // After Step 7 these are pure forwarding methods (no more lock state to
+    // delegate).
 
     /// Install the default connector's timeline signal. Called once from
     /// the device factory after the `SignalPool` is created.

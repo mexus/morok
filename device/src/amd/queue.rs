@@ -373,15 +373,10 @@ impl AmdComputeQueue {
     ) -> Result<u64> {
         debug_assert!(self.is_pm4, "dispatch_pm4 called on AQL queue");
         let timeline_addr = conn.timeline_signal().value_addr();
-        // Serialize the whole submit (incl. the live scratch read below) against
-        // scratch realloc: `ensure_has_local_memory` holds this same lock while
-        // it drains + unmaps the old scratch VA, so a kernel can never be
-        // programmed with a scratch base that's freed before it runs. Targeted
-        // for deletion in Step 7 of the connector refactor — once each plan
-        // owns its connector, this lock has no contenders.
-        let _disp = conn.lock_dispatch();
-        // Read the scratch VA + tmpring UNDER the dispatch lock so they reflect
-        // the current (post-realloc) scratch buffer, not a stale one.
+        // Step 7 of the connector refactor: this connector is owned by a single
+        // plan/graph, so scratch realloc and dispatch cannot race — the prior
+        // `lock_dispatch()` critical section around timeline+scratch+ring is
+        // gone. Within-connector ordering is still serial by ownership.
         let scratch_addr = conn.scratch_gpu_va();
         let tmpring_size = conn.tmpring_size();
         // Assemble the full USER_DATA prefix here, under the lock, so the scratch
@@ -454,8 +449,11 @@ impl AmdComputeQueue {
         if let Some(err) = self.dev.poison_error() {
             return Err(err);
         }
+        // Step 7: no `Release` fence here — `ring_doorbell` already issues
+        // its own publication barrier (`queue.rs:292`) and the connector is
+        // a single owner, so there's no concurrent reader of the staged
+        // packets to publish to.
         let mut g = self.inner.lock();
-        std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
         g.push_pm4(dwords);
         g.ring_doorbell(/*is_pm4=*/ true);
         Ok(())
@@ -469,10 +467,8 @@ impl AmdComputeQueue {
         debug_assert!(!self.is_pm4, "dispatch_aql called on PM4 queue");
         debug_assert_eq!(size_of::<HsaKernelDispatchPacket>(), AQL_PACKET_BYTES);
         let timeline_addr = conn.timeline_signal().value_addr();
-        // Serialize submit vs scratch realloc (the AQL scratch descriptor is
-        // rewritten by `ensure_has_local_memory` under this same lock). Same
-        // Step 7 deletion target as `dispatch_pm4`.
-        let _disp = conn.lock_dispatch();
+        // Step 7: connector is single-owner, no dispatch lock needed
+        // (cf. dispatch_pm4 comment).
         let mut g = self.inner.lock();
         let prev = conn.timeline_value().saturating_sub(1);
         let next = conn.next_timeline();

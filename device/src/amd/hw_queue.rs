@@ -455,11 +455,15 @@ impl AmdHwQueue {
     }
 
     /// `submit` (← `hcq.py:230`): apply `var_vals` then `_submit`. Patches the
-    /// bound page's symbolic dwords + kernarg fields, fences, then pushes the
+    /// bound page's symbolic dwords + kernarg fields, then pushes the
     /// indirect-buffer reference with one doorbell.
+    ///
+    /// Step 7 of the connector refactor: per-graph connector ownership means
+    /// there's no concurrent reader of the patched IB page to publish to —
+    /// the doorbell store inside `submit_dwords::ring_doorbell` provides the
+    /// host→GPU publication barrier.
     pub fn submit(&mut self, var_vals: &VarVals) -> Result<()> {
         self.apply_var_vals(var_vals)?;
-        std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
         let cmd = self.binded.as_ref().expect("AmdHwQueue::submit before bind").indirect_cmd;
         // `_submit` (← `ops_amd.py:407`): one doorbell via the queue primitive.
         self.queue.submit_dwords(&cmd)

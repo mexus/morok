@@ -25,11 +25,10 @@
 //! let output = plan.output_buffer();
 //! ```
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
-use rayon::prelude::*;
 use smallvec::SmallVec;
 use svod_device::device::ProgramSpec;
 use svod_device::{Buffer, BufferId};
@@ -260,7 +259,11 @@ pub struct ExecutionPlan {
     /// Precomputed dependency-safe operation order.
     op_order: Vec<usize>,
 
-    /// Topological levels of dependency-independent operations.
+    /// Topological levels of dependency-independent operations. Preserved as
+    /// the execution-iteration order (each level flushed before the next) for
+    /// consistency with pre-Step-6 plan semantics — some downstream kernel
+    /// algorithms (e.g. iterative QR) are sensitive to within-level
+    /// scheduling order vs. a single flat topological linearization.
     op_levels: Vec<Vec<usize>>,
 
     /// ALL buffers owned by this plan (inputs, intermediates, outputs).
@@ -329,14 +332,6 @@ impl ExecutionPlan {
                     reason: format!("Kernel {} launch dimensions failed: {e}", kernel.id),
                 })?;
         Ok((Some(dims.global_size), dims.local_size))
-    }
-
-    fn kernel_uses_cpu_threading(kernel: &PreparedKernel) -> Result<bool> {
-        if !matches!(kernel.device, DeviceSpec::Cpu) {
-            return Ok(false);
-        }
-        let (global_size, _) = Self::kernel_launch_sizes(kernel)?;
-        Ok(global_size.map(|[x, _, _]| x > 1).unwrap_or(false))
     }
 
     /// Lazily capture all kernels into a backend replay graph. Only AMD
@@ -632,206 +627,6 @@ impl ExecutionPlan {
         }
     }
 
-    #[inline]
-    fn op_requires_serial(op: &PreparedOp) -> bool {
-        match op {
-            PreparedOp::CompiledProgram(kernel) => !kernel.kernel.host_parallel_safe,
-            PreparedOp::BufferCopy(_) | PreparedOp::BufferView(_) | PreparedOp::CustomFunction(_) => true,
-        }
-    }
-
-    #[inline]
-    fn compiled_kernel_at(&self, idx: usize) -> Option<&PreparedKernel> {
-        match &self.ops[idx] {
-            PreparedOp::CompiledProgram(kernel) => Some(kernel),
-            _ => None,
-        }
-    }
-
-    fn kernels_conflict(lhs: &PreparedKernel, rhs: &PreparedKernel) -> bool {
-        let lhs_outputs: HashSet<BufferId> =
-            lhs.output_indices.iter().filter_map(|&out_idx| lhs.buffer_ids.get(out_idx).copied()).collect();
-        let rhs_outputs: HashSet<BufferId> =
-            rhs.output_indices.iter().filter_map(|&out_idx| rhs.buffer_ids.get(out_idx).copied()).collect();
-
-        if !lhs_outputs.is_disjoint(&rhs_outputs) {
-            return true;
-        }
-
-        let lhs_reads: HashSet<BufferId> = lhs
-            .buffer_ids
-            .iter()
-            .enumerate()
-            .filter_map(|(idx, &buf)| (!lhs.output_indices.contains(&idx)).then_some(buf))
-            .collect();
-        let rhs_reads: HashSet<BufferId> = rhs
-            .buffer_ids
-            .iter()
-            .enumerate()
-            .filter_map(|(idx, &buf)| (!rhs.output_indices.contains(&idx)).then_some(buf))
-            .collect();
-
-        !lhs_outputs.is_disjoint(&rhs_reads) || !rhs_outputs.is_disjoint(&lhs_reads)
-    }
-
-    fn partition_parallel_safe_group(&self, indices: &[usize]) -> Result<Vec<Vec<usize>>> {
-        let mut groups: Vec<Vec<usize>> = Vec::new();
-
-        for &idx in indices {
-            let Some(kernel) = self.compiled_kernel_at(idx) else {
-                return Err(crate::error::Error::Execution {
-                    reason: format!("parallel partition expected compiled kernel at op index {idx}"),
-                });
-            };
-
-            let mut placed = false;
-            for group in &mut groups {
-                let has_conflict = group.iter().any(|&existing_idx| {
-                    self.compiled_kernel_at(existing_idx)
-                        .map(|existing| Self::kernels_conflict(existing, kernel))
-                        .unwrap_or(true)
-                });
-                if !has_conflict {
-                    group.push(idx);
-                    placed = true;
-                    break;
-                }
-            }
-
-            if !placed {
-                groups.push(vec![idx]);
-            }
-        }
-
-        Ok(groups)
-    }
-
-    fn execute_parallel_group(&self, indices: &[usize]) -> Result<()> {
-        if indices.len() <= 1 {
-            if let Some(&idx) = indices.first() {
-                self.execute_op(&self.ops[idx])?;
-            }
-            return Ok(());
-        }
-
-        let has_threaded_cpu_kernel = indices.iter().try_fold(false, |acc, &idx| {
-            let Some(kernel) = self.compiled_kernel_at(idx) else {
-                return Err(crate::error::Error::Execution {
-                    reason: format!("parallel execution expected compiled kernel at op index {idx}"),
-                });
-            };
-            Ok(acc || Self::kernel_uses_cpu_threading(kernel)?)
-        })?;
-
-        if has_threaded_cpu_kernel {
-            for &idx in indices {
-                let Some(kernel) = self.compiled_kernel_at(idx) else {
-                    return Err(crate::error::Error::Execution {
-                        reason: format!("parallel execution expected compiled kernel at op index {idx}"),
-                    });
-                };
-                self.execute_kernel(kernel)?;
-            }
-            return Ok(());
-        }
-
-        indices
-            .par_iter()
-            .map(|&idx| {
-                let Some(kernel) = self.compiled_kernel_at(idx) else {
-                    return Err(crate::error::Error::Execution {
-                        reason: format!("parallel execution expected compiled kernel at op index {idx}"),
-                    });
-                };
-                self.execute_kernel(kernel)
-            })
-            .collect::<Result<Vec<_>>>()?;
-
-        Ok(())
-    }
-
-    fn execute_parallel_group_profiled(&self, indices: &[usize]) -> Result<Vec<(usize, KernelProfile)>> {
-        if indices.len() <= 1 {
-            let mut profiles = Vec::new();
-            if let Some(&idx) = indices.first() {
-                let Some(kernel) = self.compiled_kernel_at(idx) else {
-                    return Err(crate::error::Error::Execution {
-                        reason: format!("profiled execution expected compiled kernel at op index {idx}"),
-                    });
-                };
-                let start = Instant::now();
-                self.execute_kernel(kernel)?;
-                profiles.push((
-                    idx,
-                    KernelProfile {
-                        kernel: Arc::clone(&kernel.kernel),
-                        device: kernel.device.clone(),
-                        num_buffers: kernel.buffer_ptrs.len(),
-                        elapsed: start.elapsed(),
-                    },
-                ));
-            }
-            return Ok(profiles);
-        }
-
-        let has_threaded_cpu_kernel = indices.iter().try_fold(false, |acc, &idx| {
-            let Some(kernel) = self.compiled_kernel_at(idx) else {
-                return Err(crate::error::Error::Execution {
-                    reason: format!("profiled execution expected compiled kernel at op index {idx}"),
-                });
-            };
-            Ok(acc || Self::kernel_uses_cpu_threading(kernel)?)
-        })?;
-
-        if has_threaded_cpu_kernel {
-            let mut profiles = Vec::with_capacity(indices.len());
-            for &idx in indices {
-                let Some(kernel) = self.compiled_kernel_at(idx) else {
-                    return Err(crate::error::Error::Execution {
-                        reason: format!("profiled execution expected compiled kernel at op index {idx}"),
-                    });
-                };
-                let start = Instant::now();
-                self.execute_kernel(kernel)?;
-                profiles.push((
-                    idx,
-                    KernelProfile {
-                        kernel: Arc::clone(&kernel.kernel),
-                        device: kernel.device.clone(),
-                        num_buffers: kernel.buffer_ptrs.len(),
-                        elapsed: start.elapsed(),
-                    },
-                ));
-            }
-            return Ok(profiles);
-        }
-
-        let mut profiles = indices
-            .par_iter()
-            .map(|&idx| {
-                let Some(kernel) = self.compiled_kernel_at(idx) else {
-                    return Err(crate::error::Error::Execution {
-                        reason: format!("profiled execution expected compiled kernel at op index {idx}"),
-                    });
-                };
-                let start = Instant::now();
-                self.execute_kernel(kernel)?;
-                Ok((
-                    idx,
-                    KernelProfile {
-                        kernel: Arc::clone(&kernel.kernel),
-                        device: kernel.device.clone(),
-                        num_buffers: kernel.buffer_ptrs.len(),
-                        elapsed: start.elapsed(),
-                    },
-                ))
-            })
-            .collect::<Result<Vec<_>>>()?;
-
-        profiles.sort_by_key(|(idx, _)| *idx);
-        Ok(profiles)
-    }
-
     /// Get the first (or only) output buffer after execution.
     ///
     /// Returns `None` for plans with no output buffers (for example, plans
@@ -913,7 +708,17 @@ impl ExecutionPlan {
 
     /// Execute the plan.
     ///
-    /// Uses dependency-aware operation ordering for all prepared op types.
+    /// Walks `op_levels` level-by-level and runs each op in the level in order.
+    /// **Step 6 of the connector refactor** (`snug-honking-robin`) deleted the
+    /// previous rayon-driven intra-level parallelism: on AMD the ring is
+    /// fundamentally serial (per-connector `Mutex<QueueInner>`); on CPU the
+    /// previous overlap was already cancelled by the kernel-thread guard.
+    /// Per-plan ownership (Step 4) means multi-plan concurrency comes from
+    /// distinct plans running on distinct connectors, which is what BEAM
+    /// search relies on — not intra-plan rayon. We keep the level iteration
+    /// order (rather than a flat `op_order` topological linearization)
+    /// because iterative kernels (QR, etc.) are sensitive to within-level
+    /// scheduling order.
     pub fn execute(&self) -> Result<()> {
         // Fast path: one captured indirect-buffer submit instead of per-kernel
         // packet build + doorbell. Built once, then every call just replays.
@@ -923,29 +728,8 @@ impl ExecutionPlan {
                 .map_err(|e| crate::error::Error::Execution { reason: format!("graph replay failed: {e}") });
         }
         for level in &self.op_levels {
-            let mut pending_parallel: Vec<usize> = Vec::new();
-
             for &idx in level {
-                let op = &self.ops[idx];
-                if Self::op_requires_serial(op) {
-                    if !pending_parallel.is_empty() {
-                        let groups = self.partition_parallel_safe_group(&pending_parallel)?;
-                        for group in groups {
-                            self.execute_parallel_group(&group)?;
-                        }
-                        pending_parallel.clear();
-                    }
-                    self.execute_op(op)?;
-                } else {
-                    pending_parallel.push(idx);
-                }
-            }
-
-            if !pending_parallel.is_empty() {
-                let groups = self.partition_parallel_safe_group(&pending_parallel)?;
-                for group in groups {
-                    self.execute_parallel_group(&group)?;
-                }
+                self.execute_op(&self.ops[idx])?;
             }
         }
         Ok(())
@@ -969,25 +753,11 @@ impl ExecutionPlan {
     /// }
     /// ```
     pub fn execute_profiled(&self) -> Result<Vec<KernelProfile>> {
-        let mut profiles = Vec::new();
+        let mut profiles = Vec::with_capacity(self.op_order.len());
         for level in &self.op_levels {
-            let mut pending_parallel: Vec<usize> = Vec::new();
-
             for &idx in level {
                 match &self.ops[idx] {
-                    PreparedOp::CompiledProgram(kernel) if kernel.kernel.host_parallel_safe => {
-                        pending_parallel.push(idx);
-                    }
                     PreparedOp::CompiledProgram(kernel) => {
-                        if !pending_parallel.is_empty() {
-                            let groups = self.partition_parallel_safe_group(&pending_parallel)?;
-                            for group in groups {
-                                let mut prof = self.execute_parallel_group_profiled(&group)?;
-                                profiles.extend(prof.drain(..).map(|(_, p)| p));
-                            }
-                            pending_parallel.clear();
-                        }
-
                         let start = Instant::now();
                         self.execute_kernel(kernel)?;
                         profiles.push(KernelProfile {
@@ -997,47 +767,9 @@ impl ExecutionPlan {
                             elapsed: start.elapsed(),
                         });
                     }
-                    PreparedOp::BufferCopy(copy) => {
-                        if !pending_parallel.is_empty() {
-                            let groups = self.partition_parallel_safe_group(&pending_parallel)?;
-                            for group in groups {
-                                let mut prof = self.execute_parallel_group_profiled(&group)?;
-                                profiles.extend(prof.drain(..).map(|(_, p)| p));
-                            }
-                            pending_parallel.clear();
-                        }
-                        self.execute_copy(copy)?;
-                    }
-                    PreparedOp::BufferView(view) => {
-                        if !pending_parallel.is_empty() {
-                            let groups = self.partition_parallel_safe_group(&pending_parallel)?;
-                            for group in groups {
-                                let mut prof = self.execute_parallel_group_profiled(&group)?;
-                                profiles.extend(prof.drain(..).map(|(_, p)| p));
-                            }
-                            pending_parallel.clear();
-                        }
-                        self.execute_buffer_view(view)?;
-                    }
-                    PreparedOp::CustomFunction(custom) => {
-                        if !pending_parallel.is_empty() {
-                            let groups = self.partition_parallel_safe_group(&pending_parallel)?;
-                            for group in groups {
-                                let mut prof = self.execute_parallel_group_profiled(&group)?;
-                                profiles.extend(prof.drain(..).map(|(_, p)| p));
-                            }
-                            pending_parallel.clear();
-                        }
-                        self.execute_custom_function(custom)?;
-                    }
-                }
-            }
-
-            if !pending_parallel.is_empty() {
-                let groups = self.partition_parallel_safe_group(&pending_parallel)?;
-                for group in groups {
-                    let mut prof = self.execute_parallel_group_profiled(&group)?;
-                    profiles.extend(prof.drain(..).map(|(_, p)| p));
+                    PreparedOp::BufferCopy(copy) => self.execute_copy(copy)?,
+                    PreparedOp::BufferView(view) => self.execute_buffer_view(view)?,
+                    PreparedOp::CustomFunction(custom) => self.execute_custom_function(custom)?,
                 }
             }
         }

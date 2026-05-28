@@ -2,7 +2,6 @@ use super::*;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
 use svod_device::device::Program;
 use svod_dtype::DType;
 use svod_ir::{CustomFunctionKind, UOp};
@@ -228,7 +227,6 @@ fn test_builder_rejects_invalid_compiled_output_index() {
             globals: vec![0, 1],
             outs: vec![2],
             ins: vec![1],
-            host_parallel_safe: true,
             global_size: default_launch_size(),
             local_size: Some(default_launch_size()),
         }),
@@ -250,46 +248,6 @@ fn test_builder_rejects_invalid_compiled_output_index() {
             assert!(reason.contains("output index out of range"), "unexpected error: {reason}");
         }
         other => panic!("unexpected error variant: {other:?}"),
-    }
-}
-
-#[derive(Debug)]
-struct ObserveParallelProgram {
-    calls: Arc<AtomicUsize>,
-    active: Arc<AtomicUsize>,
-    max_active: Arc<AtomicUsize>,
-    sleep_ms: u64,
-}
-
-impl Program for ObserveParallelProgram {
-    unsafe fn execute(
-        &self,
-        _buffers: &[*mut u8],
-        _vals: &[i64],
-        _global_size: Option<[usize; 3]>,
-        _local_size: Option<[usize; 3]>,
-        _wait: bool,
-    ) -> svod_device::Result<()> {
-        self.calls.fetch_add(1, Ordering::SeqCst);
-        let active_now = self.active.fetch_add(1, Ordering::SeqCst) + 1;
-
-        loop {
-            let current_max = self.max_active.load(Ordering::SeqCst);
-            if active_now <= current_max {
-                break;
-            }
-            if self.max_active.compare_exchange(current_max, active_now, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
-                break;
-            }
-        }
-
-        std::thread::sleep(Duration::from_millis(self.sleep_ms));
-        self.active.fetch_sub(1, Ordering::SeqCst);
-        Ok(())
-    }
-
-    fn name(&self) -> &str {
-        "observe_parallel"
     }
 }
 
@@ -354,7 +312,6 @@ fn add_record_launch_kernel(
             globals: vec![0],
             outs: vec![0],
             ins: Vec::new(),
-            host_parallel_safe: true,
             global_size: [global_expr, UOp::index_const(1), UOp::index_const(1)],
             local_size: Some(default_launch_size()),
         }),
@@ -416,7 +373,6 @@ fn test_execute_mixed_ops_compiled_copy_view_in_order() {
             globals: vec![0, 1],
             outs: vec![0],
             ins: vec![1],
-            host_parallel_safe: true,
             global_size: default_launch_size(),
             local_size: Some(default_launch_size()),
         }),
@@ -506,7 +462,6 @@ fn test_execute_mixed_ops_respects_dependencies_not_insertion_order() {
             globals: vec![0, 1],
             outs: vec![0],
             ins: vec![1],
-            host_parallel_safe: true,
             global_size: default_launch_size(),
             local_size: Some(default_launch_size()),
         }),
@@ -718,7 +673,6 @@ fn test_build_compiled_program_invalid_buffer_indices_errors() {
             globals: vec![0, 1],
             outs: vec![0],
             ins: vec![1],
-            host_parallel_safe: true,
             global_size: default_launch_size(),
             local_size: Some(default_launch_size()),
         }),
@@ -800,7 +754,6 @@ fn test_execute_with_vars_does_not_override_fixedvars() {
             globals: vec![0, 1],
             outs: vec![0],
             ins: vec![1],
-            host_parallel_safe: true,
             global_size: default_launch_size(),
             local_size: Some(default_launch_size()),
         }),
@@ -853,7 +806,6 @@ fn test_execute_with_vars_updates_non_fixed_vars() {
             globals: vec![0, 1],
             outs: vec![0],
             ins: vec![1],
-            host_parallel_safe: true,
             global_size: default_launch_size(),
             local_size: Some(default_launch_size()),
         }),
@@ -981,373 +933,6 @@ fn test_execute_with_vars_does_not_override_core_id_runtime_var() {
 }
 
 #[test]
-fn test_execute_parallel_safe_compiled_ops_can_overlap() {
-    let alloc = svod_device::registry::cpu().expect("cpu allocator");
-
-    let dst_a = Buffer::new(alloc.clone(), DType::Float32, vec![4], Default::default());
-    let src_a = Buffer::new(alloc.clone(), DType::Float32, vec![4], Default::default());
-    let dst_b = Buffer::new(alloc.clone(), DType::Float32, vec![4], Default::default());
-    let src_b = Buffer::new(alloc, DType::Float32, vec![4], Default::default());
-    dst_a.ensure_allocated().expect("allocate dst_a");
-    src_a.ensure_allocated().expect("allocate src_a");
-    dst_b.ensure_allocated().expect("allocate dst_b");
-    src_b.ensure_allocated().expect("allocate src_b");
-
-    let calls = Arc::new(AtomicUsize::new(0));
-    let active = Arc::new(AtomicUsize::new(0));
-    let max_active = Arc::new(AtomicUsize::new(0));
-
-    let mut builder = ExecutionPlanBuilder::new(DeviceSpec::Cpu);
-    let dst_a_idx = builder.add_buffer(1000, dst_a);
-    let src_a_idx = builder.add_buffer(1001, src_a);
-    let dst_b_idx = builder.add_buffer(1002, dst_b);
-    let src_b_idx = builder.add_buffer(1003, src_b);
-
-    builder.add_kernel(PreparedKernel {
-        id: 100,
-        ast: UOp::sink(vec![]),
-        kernel: Arc::new(CachedKernel {
-            program: Box::new(ObserveParallelProgram {
-                calls: calls.clone(),
-                active: active.clone(),
-                max_active: max_active.clone(),
-                sleep_ms: 30,
-            }),
-            device: "CPU".to_string(),
-            code: String::new(),
-            entry_point: "parallel_a".to_string(),
-            var_names: Vec::new(),
-            globals: vec![0, 1],
-            outs: vec![0],
-            ins: vec![1],
-            host_parallel_safe: true,
-            global_size: default_launch_size(),
-            local_size: Some(default_launch_size()),
-        }),
-        device: DeviceSpec::Cpu,
-        buffer_indices: vec![dst_a_idx, src_a_idx],
-        output_indices: vec![0],
-        vals: Vec::new(),
-        fixedvars: HashMap::new(),
-        dependencies: Vec::new(),
-        buffer_ptrs: Vec::new(),
-        buffer_ids: Vec::new(),
-        runtime_vars: Vec::new(),
-    });
-
-    builder.add_kernel(PreparedKernel {
-        id: 101,
-        ast: UOp::sink(vec![]),
-        kernel: Arc::new(CachedKernel {
-            program: Box::new(ObserveParallelProgram {
-                calls: calls.clone(),
-                active,
-                max_active: max_active.clone(),
-                sleep_ms: 30,
-            }),
-            device: "CPU".to_string(),
-            code: String::new(),
-            entry_point: "parallel_b".to_string(),
-            var_names: Vec::new(),
-            globals: vec![0, 1],
-            outs: vec![0],
-            ins: vec![1],
-            host_parallel_safe: true,
-            global_size: default_launch_size(),
-            local_size: Some(default_launch_size()),
-        }),
-        device: DeviceSpec::Cpu,
-        buffer_indices: vec![dst_b_idx, src_b_idx],
-        output_indices: vec![0],
-        vals: Vec::new(),
-        fixedvars: HashMap::new(),
-        dependencies: Vec::new(),
-        buffer_ptrs: Vec::new(),
-        buffer_ids: Vec::new(),
-        runtime_vars: Vec::new(),
-    });
-
-    builder.set_output_buffer(dst_a_idx);
-    let plan = builder.build().expect("build plan");
-    plan.execute().expect("execute parallel-safe kernels");
-
-    assert_eq!(calls.load(Ordering::SeqCst), 2, "both kernels should run");
-    assert!(max_active.load(Ordering::SeqCst) >= 2, "independent host_parallel_safe kernels should overlap");
-}
-
-#[test]
-fn test_execute_threaded_cpu_kernels_do_not_use_outer_overlap() {
-    let alloc = svod_device::registry::cpu().expect("cpu allocator");
-
-    let dst_a = Buffer::new(alloc.clone(), DType::Float32, vec![4], Default::default());
-    let src_a = Buffer::new(alloc.clone(), DType::Float32, vec![4], Default::default());
-    let dst_b = Buffer::new(alloc.clone(), DType::Float32, vec![4], Default::default());
-    let src_b = Buffer::new(alloc, DType::Float32, vec![4], Default::default());
-    dst_a.ensure_allocated().expect("allocate dst_a");
-    src_a.ensure_allocated().expect("allocate src_a");
-    dst_b.ensure_allocated().expect("allocate dst_b");
-    src_b.ensure_allocated().expect("allocate src_b");
-
-    let calls = Arc::new(AtomicUsize::new(0));
-    let active = Arc::new(AtomicUsize::new(0));
-    let max_active = Arc::new(AtomicUsize::new(0));
-    let threaded_launch = [UOp::index_const(4), UOp::index_const(1), UOp::index_const(1)];
-
-    let mut builder = ExecutionPlanBuilder::new(DeviceSpec::Cpu);
-    let dst_a_idx = builder.add_buffer(1300, dst_a);
-    let src_a_idx = builder.add_buffer(1301, src_a);
-    let dst_b_idx = builder.add_buffer(1302, dst_b);
-    let src_b_idx = builder.add_buffer(1303, src_b);
-
-    builder.add_kernel(PreparedKernel {
-        id: 130,
-        ast: UOp::sink(vec![]),
-        kernel: Arc::new(CachedKernel {
-            program: Box::new(ObserveParallelProgram {
-                calls: calls.clone(),
-                active: active.clone(),
-                max_active: max_active.clone(),
-                sleep_ms: 30,
-            }),
-            device: "CPU".to_string(),
-            code: String::new(),
-            entry_point: "threaded_outer_a".to_string(),
-            var_names: Vec::new(),
-            globals: vec![0, 1],
-            outs: vec![0],
-            ins: vec![1],
-            host_parallel_safe: true,
-            global_size: threaded_launch.clone(),
-            local_size: Some(default_launch_size()),
-        }),
-        device: DeviceSpec::Cpu,
-        buffer_indices: vec![dst_a_idx, src_a_idx],
-        output_indices: vec![0],
-        vals: Vec::new(),
-        fixedvars: HashMap::new(),
-        dependencies: Vec::new(),
-        buffer_ptrs: Vec::new(),
-        buffer_ids: Vec::new(),
-        runtime_vars: Vec::new(),
-    });
-
-    builder.add_kernel(PreparedKernel {
-        id: 131,
-        ast: UOp::sink(vec![]),
-        kernel: Arc::new(CachedKernel {
-            program: Box::new(ObserveParallelProgram {
-                calls: calls.clone(),
-                active,
-                max_active: max_active.clone(),
-                sleep_ms: 30,
-            }),
-            device: "CPU".to_string(),
-            code: String::new(),
-            entry_point: "threaded_outer_b".to_string(),
-            var_names: Vec::new(),
-            globals: vec![0, 1],
-            outs: vec![0],
-            ins: vec![1],
-            host_parallel_safe: true,
-            global_size: threaded_launch,
-            local_size: Some(default_launch_size()),
-        }),
-        device: DeviceSpec::Cpu,
-        buffer_indices: vec![dst_b_idx, src_b_idx],
-        output_indices: vec![0],
-        vals: Vec::new(),
-        fixedvars: HashMap::new(),
-        dependencies: Vec::new(),
-        buffer_ptrs: Vec::new(),
-        buffer_ids: Vec::new(),
-        runtime_vars: Vec::new(),
-    });
-
-    builder.set_output_buffer(dst_a_idx);
-    let plan = builder.build().expect("build plan");
-    plan.execute().expect("execute threaded CPU kernels");
-
-    assert_eq!(calls.load(Ordering::SeqCst), 2, "both kernels should run");
-    assert_eq!(
-        max_active.load(Ordering::SeqCst),
-        1,
-        "threaded CPU kernels should not also overlap at the outer host level"
-    );
-}
-
-#[test]
-fn test_execute_unsafe_compiled_ops_are_serialized() {
-    let alloc = svod_device::registry::cpu().expect("cpu allocator");
-
-    let dst_a = Buffer::new(alloc.clone(), DType::Float32, vec![4], Default::default());
-    let src_a = Buffer::new(alloc.clone(), DType::Float32, vec![4], Default::default());
-    let dst_b = Buffer::new(alloc.clone(), DType::Float32, vec![4], Default::default());
-    let src_b = Buffer::new(alloc, DType::Float32, vec![4], Default::default());
-    dst_a.ensure_allocated().expect("allocate dst_a");
-    src_a.ensure_allocated().expect("allocate src_a");
-    dst_b.ensure_allocated().expect("allocate dst_b");
-    src_b.ensure_allocated().expect("allocate src_b");
-
-    let calls = Arc::new(AtomicUsize::new(0));
-    let active = Arc::new(AtomicUsize::new(0));
-    let max_active = Arc::new(AtomicUsize::new(0));
-
-    let mut builder = ExecutionPlanBuilder::new(DeviceSpec::Cpu);
-    let dst_a_idx = builder.add_buffer(1100, dst_a);
-    let src_a_idx = builder.add_buffer(1101, src_a);
-    let dst_b_idx = builder.add_buffer(1102, dst_b);
-    let src_b_idx = builder.add_buffer(1103, src_b);
-
-    for (id, dst_idx, src_idx) in [(110_u64, dst_a_idx, src_a_idx), (111_u64, dst_b_idx, src_b_idx)] {
-        builder.add_kernel(PreparedKernel {
-            id,
-            ast: UOp::sink(vec![]),
-            kernel: Arc::new(CachedKernel {
-                program: Box::new(ObserveParallelProgram {
-                    calls: calls.clone(),
-                    active: active.clone(),
-                    max_active: max_active.clone(),
-                    sleep_ms: 20,
-                }),
-                device: "CPU".to_string(),
-                code: String::new(),
-                entry_point: format!("unsafe_{id}"),
-                var_names: Vec::new(),
-                globals: vec![0, 1],
-                outs: vec![0],
-                ins: vec![1],
-                host_parallel_safe: false,
-                global_size: default_launch_size(),
-                local_size: Some(default_launch_size()),
-            }),
-            device: DeviceSpec::Cpu,
-            buffer_indices: vec![dst_idx, src_idx],
-            output_indices: vec![0],
-            vals: Vec::new(),
-            fixedvars: HashMap::new(),
-            dependencies: Vec::new(),
-            buffer_ptrs: Vec::new(),
-            buffer_ids: Vec::new(),
-            runtime_vars: Vec::new(),
-        });
-    }
-
-    builder.set_output_buffer(dst_a_idx);
-    let plan = builder.build().expect("build plan");
-    plan.execute().expect("execute unsafe kernels");
-
-    assert_eq!(calls.load(Ordering::SeqCst), 2, "both kernels should run");
-    assert_eq!(max_active.load(Ordering::SeqCst), 1, "host_parallel_safe=false kernels must remain serialized");
-}
-
-#[test]
-fn test_execute_mixed_op_types_are_serialized_across_barriers() {
-    let alloc = svod_device::registry::cpu().expect("cpu allocator");
-
-    let dst_a = Buffer::new(alloc.clone(), DType::Float32, vec![4], Default::default());
-    let src_a = Buffer::new(alloc.clone(), DType::Float32, vec![4], Default::default());
-    let dst_b = Buffer::new(alloc.clone(), DType::Float32, vec![4], Default::default());
-    let src_b = Buffer::new(alloc.clone(), DType::Float32, vec![4], Default::default());
-    let copy_dst = Buffer::new(alloc.clone(), DType::Float32, vec![4], Default::default());
-    let copy_src = Buffer::new(alloc, DType::Float32, vec![4], Default::default());
-    dst_a.ensure_allocated().expect("allocate dst_a");
-    src_a.ensure_allocated().expect("allocate src_a");
-    dst_b.ensure_allocated().expect("allocate dst_b");
-    src_b.ensure_allocated().expect("allocate src_b");
-    copy_dst.ensure_allocated().expect("allocate copy_dst");
-    copy_src.ensure_allocated().expect("allocate copy_src");
-
-    let calls = Arc::new(AtomicUsize::new(0));
-    let active = Arc::new(AtomicUsize::new(0));
-    let max_active = Arc::new(AtomicUsize::new(0));
-
-    let mut builder = ExecutionPlanBuilder::new(DeviceSpec::Cpu);
-    let dst_a_idx = builder.add_buffer(1200, dst_a);
-    let src_a_idx = builder.add_buffer(1201, src_a);
-    let dst_b_idx = builder.add_buffer(1202, dst_b);
-    let src_b_idx = builder.add_buffer(1203, src_b);
-    let copy_dst_idx = builder.add_buffer(1204, copy_dst);
-    let copy_src_idx = builder.add_buffer(1205, copy_src);
-
-    builder.add_kernel(PreparedKernel {
-        id: 120,
-        ast: UOp::sink(vec![]),
-        kernel: Arc::new(CachedKernel {
-            program: Box::new(ObserveParallelProgram {
-                calls: calls.clone(),
-                active: active.clone(),
-                max_active: max_active.clone(),
-                sleep_ms: 20,
-            }),
-            device: "CPU".to_string(),
-            code: String::new(),
-            entry_point: "mixed_a".to_string(),
-            var_names: Vec::new(),
-            globals: vec![0, 1],
-            outs: vec![0],
-            ins: vec![1],
-            host_parallel_safe: true,
-            global_size: default_launch_size(),
-            local_size: Some(default_launch_size()),
-        }),
-        device: DeviceSpec::Cpu,
-        buffer_indices: vec![dst_a_idx, src_a_idx],
-        output_indices: vec![0],
-        vals: Vec::new(),
-        fixedvars: HashMap::new(),
-        dependencies: Vec::new(),
-        buffer_ptrs: Vec::new(),
-        buffer_ids: Vec::new(),
-        runtime_vars: Vec::new(),
-    });
-
-    builder.add_op(PreparedOp::BufferCopy(PreparedCopy {
-        id: 121,
-        buffer_indices: vec![copy_dst_idx, copy_src_idx],
-        dependencies: Vec::new(),
-    }));
-
-    builder.add_kernel(PreparedKernel {
-        id: 122,
-        ast: UOp::sink(vec![]),
-        kernel: Arc::new(CachedKernel {
-            program: Box::new(ObserveParallelProgram {
-                calls: calls.clone(),
-                active,
-                max_active: max_active.clone(),
-                sleep_ms: 20,
-            }),
-            device: "CPU".to_string(),
-            code: String::new(),
-            entry_point: "mixed_b".to_string(),
-            var_names: Vec::new(),
-            globals: vec![0, 1],
-            outs: vec![0],
-            ins: vec![1],
-            host_parallel_safe: true,
-            global_size: default_launch_size(),
-            local_size: Some(default_launch_size()),
-        }),
-        device: DeviceSpec::Cpu,
-        buffer_indices: vec![dst_b_idx, src_b_idx],
-        output_indices: vec![0],
-        vals: Vec::new(),
-        fixedvars: HashMap::new(),
-        dependencies: Vec::new(),
-        buffer_ptrs: Vec::new(),
-        buffer_ids: Vec::new(),
-        runtime_vars: Vec::new(),
-    });
-
-    builder.set_output_buffer(dst_a_idx);
-    let plan = builder.build().expect("build plan");
-    plan.execute().expect("execute mixed-op plan");
-
-    assert_eq!(calls.load(Ordering::SeqCst), 2, "both kernels should run");
-    assert_eq!(max_active.load(Ordering::SeqCst), 1, "safe kernels separated by side-effectful ops must not overlap");
-}
-
-#[test]
 fn test_compute_execution_levels_duplicate_ids_is_deterministic() {
     let ops = vec![
         PreparedOp::BufferCopy(PreparedCopy { id: 42, buffer_indices: vec![0, 1], dependencies: vec![] }),
@@ -1415,7 +1000,6 @@ fn test_execute_with_vars_profiled_updates_non_fixed_vars() {
             globals: vec![0, 1],
             outs: vec![0],
             ins: vec![1],
-            host_parallel_safe: true,
             global_size: default_launch_size(),
             local_size: Some(default_launch_size()),
         }),
