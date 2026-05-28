@@ -136,7 +136,20 @@ pub struct AmdDeviceCore {
     /// is rare (slot alloc on connector build), and one pool covers many
     /// connectors at 4 KiB total VRAM.
     signal_pool: OnceLock<Arc<crate::amd::signal::SignalPool>>,
+    /// Pool of idle `AmdConnector`s. Plans `acquire_connector` here instead of
+    /// always building a fresh one — KFD queue creation costs ~50-100 MiB of
+    /// GPU memory per queue and the per-process KFD compute-queue limit is
+    /// typically 32. The pool bounds VRAM use at `CONNECTOR_POOL_CAP * cost`
+    /// and amortises queue-creation ioctls across BEAM-style plan churn.
+    /// Over-cap connectors drop normally (KFD queue destroyed via
+    /// `AmdComputeQueue::Drop`).
+    connector_pool: parking_lot::Mutex<Vec<Arc<crate::amd::connector::AmdConnector>>>,
 }
+
+/// Soft cap on pooled idle connectors per physical AMD:N. Matches the warning
+/// threshold in `AmdConnector::new_with_resources` — over this many idle
+/// connectors, the per-process KFD compute-queue limit is in real danger.
+pub const CONNECTOR_POOL_CAP: usize = 32;
 
 /// Open handle to one AMD GPU node.
 ///
@@ -312,6 +325,7 @@ impl AmdDevice {
             error_msg: OnceLock::new(),
             connectors: parking_lot::Mutex::new(Vec::new()),
             signal_pool: OnceLock::new(),
+            connector_pool: parking_lot::Mutex::new(Vec::new()),
         });
         // Default connector is installed by the factory AFTER this returns —
         // building it here would recursively call `AmdAllocator::new`, which
@@ -429,6 +443,34 @@ impl AmdDeviceCore {
     /// connector built against this core shares it.
     pub fn signal_pool(&self) -> Option<&Arc<crate::amd::signal::SignalPool>> {
         self.signal_pool.get()
+    }
+
+    /// Acquire an `AmdConnector` for this core — reuse an idle one from the
+    /// pool if available, otherwise build fresh via
+    /// `AmdConnector::new_with_resources`. Plans (`ExecutionPlan`) acquire
+    /// here on first AMD dispatch and `release_connector` on Drop, so a long-
+    /// running BEAM workload amortises ~50 MiB of KFD queue setup across all
+    /// candidate plans instead of paying it per plan.
+    pub fn acquire_connector(
+        self: &Arc<Self>,
+        allocator: &crate::amd::AmdAllocator,
+    ) -> Result<Arc<crate::amd::connector::AmdConnector>> {
+        if let Some(conn) = self.connector_pool.lock().pop() {
+            return Ok(conn);
+        }
+        crate::amd::connector::AmdConnector::new_with_resources(Arc::clone(self), allocator)
+    }
+
+    /// Return a connector to the pool. If the pool is at `CONNECTOR_POOL_CAP`,
+    /// the connector drops normally — `AmdConnector::Drop` synchronises and
+    /// `AmdComputeQueue::Drop` destroys the KFD queue, returning the queue id
+    /// to the kernel's per-process pool.
+    pub fn release_connector(&self, conn: Arc<crate::amd::connector::AmdConnector>) {
+        let mut pool = self.connector_pool.lock();
+        if pool.len() < CONNECTOR_POOL_CAP {
+            pool.push(conn);
+        }
+        // else: lock dropped at end of scope, conn dropped → cleanup runs.
     }
 
     /// Install the signal pool. Called once per physical device by the

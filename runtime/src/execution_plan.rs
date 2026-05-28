@@ -387,14 +387,10 @@ impl ExecutionPlan {
         if let Some(c) = self.amd_connector.get() {
             return Ok(std::sync::Arc::clone(c));
         }
-        // Build outside `OnceLock::get_or_init` so we can propagate errors
-        // (KFD queue creation, signal-pool acquire). One-shot init race: if
-        // two threads see empty, both build a connector; only one wins set().
-        // The loser is dropped; its `AmdConnector::Drop` synchronises and
-        // returns the timeline signal to the pool.
-        // Recover the AMD device_id from the plan's DeviceSpec. The program
-        // was loaded against the same device_id, so the allocator created
-        // here shares its underlying `Arc<AmdDeviceCore>` via DEVICE_CACHE.
+        // Acquire from the per-core connector pool (built fresh if empty).
+        // Recover the AMD device_id from the plan's DeviceSpec — the program
+        // was loaded against the same device_id, so the allocator shares
+        // `Arc<AmdDeviceCore>` via DEVICE_CACHE (no extra KFD opens).
         let device_id = match &self.device {
             DeviceSpec::Amd { device_id } => *device_id,
             _ => {
@@ -405,12 +401,20 @@ impl ExecutionPlan {
         };
         let alloc = svod_device::amd::AmdAllocator::new(device_id)
             .map_err(|e| crate::error::Error::Execution { reason: format!("plan allocator: {e}") })?;
-        let new_conn =
-            svod_device::amd::AmdConnector::new_with_resources(std::sync::Arc::clone(prog.device().core()), &alloc)
-                .map_err(|e| crate::error::Error::Execution {
-                    reason: format!("AmdConnector::new_with_resources: {e}"),
-                })?;
-        let _ = self.amd_connector.set(new_conn);
+        let new_conn = prog
+            .device()
+            .core()
+            .acquire_connector(&alloc)
+            .map_err(|e| crate::error::Error::Execution { reason: format!("acquire_connector: {e}") })?;
+        // One-shot init race: if two threads see empty, both `acquire`; only
+        // one wins `set()`. The loser's Arc drops at the end of this scope —
+        // its connector returns to the pool via the `Drop` chain (the Arc's
+        // ref count hits 0 only after `set` fails, so we explicitly route it
+        // back below).
+        let core_for_loser = std::sync::Arc::clone(prog.device().core());
+        if let Err(loser) = self.amd_connector.set(new_conn) {
+            core_for_loser.release_connector(loser);
+        }
         Ok(std::sync::Arc::clone(self.amd_connector.get().expect("connector set above")))
     }
 
@@ -858,6 +862,21 @@ impl ExecutionPlan {
 
         for &alias_id in &self.alias_ids {
             remove_fn(alias_id);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for ExecutionPlan {
+    /// Return the plan's AMD connector to the per-core pool so the next plan
+    /// reuses the same KFD queue + kernarg arena + scratch — amortising
+    /// ~50 MiB of KFD setup across BEAM-style plan churn. Pool cap drops
+    /// over-cap connectors normally (KFD queue id released to the kernel via
+    /// `AmdComputeQueue::Drop`).
+    fn drop(&mut self) {
+        if let Some(conn) = self.amd_connector.take() {
+            let core = std::sync::Arc::clone(conn.core());
+            core.release_connector(conn);
         }
     }
 }

@@ -510,6 +510,42 @@ impl AmdComputeQueue {
     }
 }
 
+impl Drop for AmdComputeQueue {
+    /// Destroy the in-kernel KFD compute queue object. Without this, every
+    /// `kfd_create_queue` ioctl leaves a queue id permanently registered with
+    /// the kernel until process exit — and the per-process compute-queue
+    /// limit (typically 32) is over LIFETIME creations, not concurrent ones,
+    /// so a long-running process that creates+drops plans (BEAM-style) would
+    /// eventually hit the cap with zero live connectors. The userspace ring
+    /// / GART / EOP / ctx-save / pm4_ibs buffers free via the underlying
+    /// `RawBuffer::Drop` chain when `self.inner` drops next.
+    ///
+    /// `AmdConnector::Drop` has already synchronised the timeline before
+    /// reaching this point, so no GPU work is pending on this queue.
+    fn drop(&mut self) {
+        let queue_id = self.inner.lock().queue_id;
+        let mut args = kfd::kfd_ioctl_destroy_queue_args { queue_id, ..Default::default() };
+        // SAFETY: `core.kfd_fd` is alive (held via Arc<AmdDeviceCore>); the
+        // queue_id was returned by KFD on the matching create_queue call.
+        let rc = unsafe { ioctl::kfd_destroy_queue(self.core.kfd_fd.as_raw_fd(), &mut args as *mut _) };
+        if let Err(e) = rc {
+            tracing::warn!(?e, queue_id, "AmdComputeQueue drop: kfd_destroy_queue failed");
+        }
+    }
+}
+
+impl Drop for AmdCopyQueue {
+    fn drop(&mut self) {
+        let queue_id = self.inner.lock().queue_id;
+        let mut args = kfd::kfd_ioctl_destroy_queue_args { queue_id, ..Default::default() };
+        // SAFETY: same invariants as AmdComputeQueue::drop.
+        let rc = unsafe { ioctl::kfd_destroy_queue(self.core.kfd_fd.as_raw_fd(), &mut args as *mut _) };
+        if let Err(e) = rc {
+            tracing::warn!(?e, queue_id, "AmdCopyQueue drop: kfd_destroy_queue failed");
+        }
+    }
+}
+
 /// View a `[u32; 16]` AQL packet as its 64 little-endian bytes.
 fn dwords_as_bytes(p: &[u32; 16]) -> &[u8] {
     // SAFETY: 16 u32 == 64 bytes, contiguous, any bit pattern valid.
