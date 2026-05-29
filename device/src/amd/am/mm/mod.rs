@@ -6,4 +6,5 @@
 //! the table walk are all unit-testable on any host. Port of tinygrad's
 //! `runtime/support/memory.py` + the AM page-table bits in `am/amdev.py`.
 
+pub mod pagetable;
 pub mod tlsf;
