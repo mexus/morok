@@ -44,6 +44,17 @@ pub const COMPUTE_RING_BYTES: usize = 16 * 1024 * 1024;
 /// SDMA ring is smaller; 1 MiB is plenty for short copy bursts.
 pub const COPY_RING_BYTES: usize = 1024 * 1024;
 
+/// Conservative upper bound on the dwords a single PM4 dispatch writes to the
+/// ring (wait, HDP flush, acquire_mem, the SET_SH_REG stream, DISPATCH_DIRECT,
+/// RELEASE_MEM — a typical dispatch is ~150). Bounds in-flight dispatches so
+/// the host can never lap the ring.
+const MAX_DISPATCH_DWORDS: usize = 1024;
+/// Max un-retired dispatches allowed before back-pressure blocks the host.
+/// Chosen so the combined ring footprint stays at half the ring even in the
+/// worst case (`* MAX_DISPATCH_DWORDS`), leaving generous margin while still
+/// letting the host run thousands of dispatches ahead of the GPU.
+const RING_MAX_INFLIGHT: u64 = (COMPUTE_RING_BYTES / 4 / MAX_DISPATCH_DWORDS / 2) as u64;
+
 /// Build a barrier-AND AQL packet header (used for wait/signal nodes).
 pub const fn barrier_and_header() -> u16 {
     HSA_PACKET_TYPE_BARRIER_AND
@@ -255,7 +266,17 @@ impl Drop for QueueInner {
     /// (`RawBuffer::free_amd_device_in_place`) for each. `AmdComputeQueue::
     /// Drop` has already invoked `kfd_destroy_queue` AND `AmdConnector::Drop`
     /// has synchronised the timeline, so the GPU is idle on these buffers.
+    ///
+    /// Skipped during panic unwind: `AmdConnector::Drop` and
+    /// `AmdComputeQueue::Drop` both skip their synchronize/destroy on panic, so
+    /// the GPU's CP may still be reading the ring/GART. Unmapping them here
+    /// would fault the VM mid-unwind and could crash before the panic's
+    /// diagnostics flush. Accept the buffer leak — the process is unwinding and
+    /// the OS reclaims at exit.
     fn drop(&mut self) {
+        if std::thread::panicking() {
+            return;
+        }
         self._ring_buf.free_amd_device_in_place();
         self._gart_buf.free_amd_device_in_place();
         if let Some(eop) = self._eop_buf.as_ref() {
@@ -274,8 +295,18 @@ impl QueueInner {
     /// Append raw PM4 dwords to the ring, wrapping at dword granularity
     /// (`ops_amd.py:417`). `write_idx` is counted in dwords for PM4 queues.
     /// Caller holds the queue lock — this is part of one atomic dispatch.
+    ///
+    /// Ring overflow is prevented up-stream by `wait_dispatch_headroom` (which
+    /// bounds in-flight dispatches via the timeline signal), so a single push
+    /// must never exceed the per-dispatch budget.
     fn push_pm4(&mut self, dwords: &[u32]) {
         let ring_dwords = self.ring_size / 4;
+        debug_assert!(
+            dwords.len() <= MAX_DISPATCH_DWORDS,
+            "single dispatch ({} dwords) exceeds MAX_DISPATCH_DWORDS ({MAX_DISPATCH_DWORDS}); \
+             raise the bound or lower RING_MAX_INFLIGHT",
+            dwords.len(),
+        );
         let mut idx = (self.write_idx as usize) % ring_dwords;
         for &dw in dwords {
             // SAFETY: ring_host points to ring_size bytes; idx < ring_dwords.
@@ -359,11 +390,34 @@ impl AmdComputeQueue {
         self.is_pm4
     }
 
-    /// Current `read_dispatch_id` from GART — the CP advances it as it consumes
-    /// packets. Used by completion polling; equals `write_idx` once drained.
+    /// Current `read_dispatch_id` from GART. NOTE: for a PM4 COMPUTE queue the
+    /// CP does not reliably advance this AQL-style field, so do NOT use it for
+    /// ring flow control — back-pressure goes through the timeline signal
+    /// (`wait_dispatch_headroom`). Kept for diagnostics/AQL.
     pub fn read_idx(&self) -> u64 {
         let g = self.inner.lock();
         unsafe { std::ptr::read_volatile(g.read_ptr_host.as_ptr()) }
+    }
+
+    /// Block until at most `RING_MAX_INFLIGHT` dispatches are un-retired, so a
+    /// host running `wait=false` faster than the GPU can't lap the ring and
+    /// overwrite unconsumed packets. Bounds the combined ring footprint to
+    /// `RING_MAX_INFLIGHT * MAX_DISPATCH_DWORDS` (half the ring).
+    ///
+    /// Gates on the connector's timeline SIGNAL — the proven completion
+    /// primitive `synchronize` already uses — not the PM4 read pointer (whose
+    /// COMPUTE-queue semantics are unreliable, which would deadlock a spin).
+    /// The dispatches we wait on were submitted (doorbell rung) in prior calls,
+    /// so the GPU will signal them; the wait always makes progress.
+    fn wait_dispatch_headroom(&self, conn: &AmdConnector) -> Result<()> {
+        let last_reserved = conn.timeline_value().saturating_sub(1);
+        if last_reserved > RING_MAX_INFLIGHT {
+            let target = last_reserved - RING_MAX_INFLIGHT;
+            conn.timeline_signal()
+                .wait_signal_value(target, 30_000)
+                .inspect_err(|e| self.core.poison(&e.to_string()))?;
+        }
+        Ok(())
     }
 
     /// Current host-side `write_dispatch_id`.
@@ -405,6 +459,13 @@ impl AmdComputeQueue {
             self.core.node.gpu_id,
             conn.core().node.gpu_id,
         );
+        // Keep the timeline < 2^32 (drain+reset at the watermark) before
+        // reserving this dispatch's value — done outside the queue lock since
+        // it may block on a drain.
+        conn.ensure_timeline_headroom()?;
+        // Ring back-pressure: block if too many dispatches are in flight, so an
+        // async (`wait=false`) burst can't lap the ring. Outside the lock.
+        self.wait_dispatch_headroom(conn)?;
         let timeline_addr = conn.timeline_signal().value_addr();
         // The connector is single-owner — its scratch and timeline are not
         // concurrently mutated, so we read them outside any lock.
@@ -499,6 +560,10 @@ impl AmdComputeQueue {
             conn.core().node.gpu_id,
         );
         debug_assert_eq!(size_of::<HsaKernelDispatchPacket>(), AQL_PACKET_BYTES);
+        // Keep the timeline < 2^32 (cf. dispatch_pm4) before reserving.
+        conn.ensure_timeline_headroom()?;
+        // Ring back-pressure (cf. dispatch_pm4).
+        self.wait_dispatch_headroom(conn)?;
         let timeline_addr = conn.timeline_signal().value_addr();
         // Single-owner connector — no external lock needed (cf. dispatch_pm4).
         let mut g = self.inner.lock();

@@ -29,7 +29,7 @@ pub mod signal;
 #[cfg(target_os = "linux")]
 pub use allocator::AmdAllocator;
 #[cfg(target_os = "linux")]
-pub use connector::AmdConnector;
+pub use connector::{AmdConnector, ConnectorLease};
 #[cfg(target_os = "linux")]
 pub use device::{AmdDevice, AmdDeviceCore};
 #[cfg(target_os = "linux")]

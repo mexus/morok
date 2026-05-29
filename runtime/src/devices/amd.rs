@@ -31,22 +31,19 @@ pub fn create_amd_device(registry: &DeviceRegistry, device_id: usize, arch: AmdA
     let renderer = Arc::new(AmdRendererWrapper { device: spec.clone(), arch });
     let compiler = Arc::new(AmdCompiler { arch });
     // Build the per-device process-shared state: the signal pool (singleton
-    // per physical AMD:N, lives on AmdDeviceCore), then the default
-    // AmdConnector. Each `ExecutionPlan` / `AmdGraph` builds ITS OWN
-    // connector (own KFD ring + kernarg arena), so no compute-queue or
-    // kernarg arena needs to be pre-built here — they're per-owner.
+    // per physical AMD:N, lives on AmdDeviceCore). Each `ExecutionPlan` /
+    // `AmdGraph` / per-call `Program::execute` leases or builds its OWN
+    // connector (own KFD ring + kernarg arena + scratch + timeline), so no
+    // compute-queue or arena is pre-built here.
     let amd_alloc = AmdAllocator::new(device_id)?;
     let device_handle = Arc::clone(&amd_alloc.dev);
     let signal_pool = SignalPool::new(&amd_alloc)?;
     // Seed the pool onto the device core so `AmdConnector::new_with_resources`
-    // can acquire its timeline signal. Must precede default-connector build.
+    // can acquire its timeline signal.
     device_handle.core().install_signal_pool(signal_pool);
-    // Build and install the default connector. Used by `Program::execute`
-    // trait fallback (callers outside `ExecutionPlan`, e.g. `benchmark_kernel`)
-    // and by `AmdAllocator`'s device-wide synchronize chain.
-    let default_conn =
-        svod_device::amd::AmdConnector::new_with_resources(Arc::clone(device_handle.core()), &amd_alloc)?;
-    device_handle.install_default_connector(default_conn);
+    // No default connector: every dispatcher leases/owns its own connector
+    // (`Program::execute` leases per call; plans/graphs hold one for their
+    // lifetime). The pool starts empty and warms on first lease.
     let runtime: RuntimeFactory = Arc::new(move |compiled: &CompiledSpec| -> Result<Box<dyn Program>> {
         // `CompiledSpec.bytes` is the clang-produced amdgcn ELF.
         if compiled.bytes.is_empty() {

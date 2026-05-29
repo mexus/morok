@@ -237,10 +237,14 @@ pub fn parse_kernel(bytes: &[u8], kernel_name: &str) -> Result<ParsedKernel> {
 /// physical AMD:N.
 pub struct AmdProgram {
     name: String,
-    /// Device handle — used by the `Program::execute` trait method to route
-    /// dispatch through the default connector when the caller doesn't go
-    /// through `AmdProgram::execute_on`. Plan/graph callers ignore this.
+    /// Device handle — used by the `Program::execute` trait method to lease a
+    /// connector when the caller doesn't go through `AmdProgram::execute_on`.
+    /// Plan/graph callers ignore this.
     dev: Arc<AmdDevice>,
+    /// Logical AMD device index (`AMD:N`), captured from the loading
+    /// allocator. Lets the trait `execute` rebuild an `AmdAllocator` (cheap —
+    /// shared via `DEVICE_CACHE`) to lease a connector when none is supplied.
+    device_id: usize,
     /// AQL `kernel_object` field: GPU VA of the kernel descriptor inside the
     /// loaded code object. Used by the AQL kernel-dispatch packet only.
     aql_prog_addr: u64,
@@ -287,13 +291,13 @@ impl AmdProgram {
     ) -> Result<Self> {
         let parsed = parse_kernel(bytes, kernel_name)?;
 
-        // Grow the DEFAULT connector's scratch to fit this program (covers
-        // `Program::execute` trait callers that route through the default
-        // connector). Plan/graph callers separately call
-        // `AmdConnector::ensure_has_local_memory` on their own connector
-        // before dispatch (`execution_plan.rs::execute_kernel`,
-        // `graph.rs::capture`). Mirrors tinygrad `ops_amd.py:589-590`.
-        device.ensure_has_local_memory(parsed.kd.private_segment_fixed_size)?;
+        // Scratch is no longer ensured here — there is no shared "default
+        // connector" to grow. Every dispatch site ensures scratch on the
+        // connector it owns/leases before `execute_on`: `ExecutionPlan`
+        // (`execution_plan.rs::execute_kernel`), `AmdGraph::capture`, and the
+        // `Program::execute` trait path (which leases a connector and calls
+        // `ensure_has_local_memory` on it). Mirrors tinygrad `ops_amd.py:589`
+        // but per-connector.
 
         // Allocate VRAM for the code object (EXECUTABLE flag is set on every
         // AmdAllocator alloc; clang's amdgcn output runs on the GPU side).
@@ -439,6 +443,7 @@ impl AmdProgram {
 
         Ok(Self {
             name: kernel_name.to_string(),
+            device_id: allocator.device_id,
             dev: device,
             aql_prog_addr,
             pm4_prog_addr,
@@ -563,10 +568,11 @@ impl std::fmt::Debug for AmdProgram {
 
 impl AmdProgram {
     /// Connector-scoped dispatch entry point. Reads queue / kernarg arena /
-    /// scratch / timeline from `conn` rather than from the device's default
-    /// connector, so plan and graph callers dispatch on their own isolated
-    /// ring. The `Program::execute` trait fallback below delegates here with
-    /// `self.dev.connector()` for callers that don't have their own.
+    /// scratch / timeline from `conn`, so plan and graph callers dispatch on
+    /// their own isolated ring. The `Program::execute` trait fallback below
+    /// leases a connector from the device pool and delegates here for callers
+    /// that don't supply one. Callers must have sized `conn`'s scratch
+    /// (`ensure_has_local_memory`) before calling.
     ///
     /// # Safety
     ///
@@ -726,11 +732,19 @@ impl Program for AmdProgram {
         local_size: Option<[usize; 3]>,
         wait: bool,
     ) -> Result<()> {
-        // Fallback path for callers that don't supply a connector — dispatches
-        // through the device's default connector. `ExecutionPlan` and
-        // `AmdGraph` bypass this by downcasting via `as_any()` and calling
-        // `execute_on` with their own connector.
-        unsafe { self.execute_on(self.dev.connector(), buffers, vals, global_size, local_size, wait) }
+        // Fallback path for callers that don't supply a connector (e.g.
+        // `benchmark_kernel` during BEAM). Lease an exclusive connector from
+        // the device pool for the duration of this call, ensure its scratch,
+        // dispatch, then drop the lease (returns it to the pool). Each call
+        // gets its own connector, so concurrent/orphaned BEAM workers can't
+        // race a shared queue. `ExecutionPlan` and `AmdGraph` bypass this by
+        // downcasting via `as_any()` and calling `execute_on` with a connector
+        // they hold for their own lifetime.
+        let alloc = crate::amd::AmdAllocator::new(self.device_id)?;
+        let lease = self.dev.core().lease_connector(&alloc)?;
+        lease.ensure_has_local_memory(self.kd.private_segment_fixed_size)?;
+        unsafe { self.execute_on(&lease, buffers, vals, global_size, local_size, wait) }
+        // `lease` drops here → connector returns to the pool.
     }
 
     fn name(&self) -> &str {

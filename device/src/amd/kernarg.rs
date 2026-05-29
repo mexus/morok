@@ -1,12 +1,14 @@
 //! `KernargArena`: bump allocator for AMDGPU kernel-argument buffers.
 //!
-//! Sized at 16 MiB GTT-coherent. Each `Program::execute` claims `kernarg_size`
-//! bytes (16-byte aligned per ABI). The arena wraps when it fills, and on
-//! wrap we drain every live `AmdConnector` via the arena's owning
-//! `AmdDeviceCore` — without that drain a wrap can clobber kernargs the GPU
-//! is still consuming (tinygrad's GIL + single-queue dispatch made this
-//! impossible to interleave; with per-owner connectors the host can sprint
-//! ahead of the GPU).
+//! Sized at 16 MiB GTT-coherent. **One per `AmdConnector`** — the bump cursor
+//! and the connector's dispatch timeline are then the same ordering, so a
+//! wrapped slot is provably free once the connector's timeline drains. Each
+//! `Program::execute` claims `kernarg_size` bytes (16-byte aligned per ABI).
+//! The arena wraps when it fills; on wrap we drain every live `AmdConnector`
+//! via the arena's owning `AmdDeviceCore` — without that drain a wrap can
+//! clobber kernargs the GPU is still consuming (tinygrad's GIL + single-queue
+//! dispatch made this impossible to interleave; with per-owner connectors the
+//! host can sprint ahead of the GPU).
 
 #![cfg(target_os = "linux")]
 
@@ -43,8 +45,10 @@ unsafe impl Sync for KernargArena {}
 impl Drop for KernargArena {
     /// Free the 16 MiB GTT-coherent backing. `RawBuffer` lacks a `Drop` (the
     /// allocator path consumes it by destructure), so the arena — owned
-    /// directly by `AmdConnector` — would otherwise leak its allocation
-    /// every time a connector drops.
+    /// directly by `AmdConnector` — would otherwise leak its allocation every
+    /// time a connector drops. Safe against unmap-while-busy because
+    /// `AmdConnector::Drop` synchronises this connector's timeline before the
+    /// `arena` field (and hence this `Drop`) runs.
     fn drop(&mut self) {
         self._buffer.free_amd_device_in_place();
     }

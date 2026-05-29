@@ -40,6 +40,11 @@ use crate::amd::sys::{ioctl, kfd};
 use crate::error::{Error, Result};
 use crate::sync::TimelineSignal;
 
+/// Timeline counter watermark for the 2^32 wraparound. PM4
+/// WAIT_REG_MEM/RELEASE_MEM compare the low 32 bits of the signal slot, so the
+/// counter must stay below 2^32; we drain + reset at 2^31 to keep headroom.
+const TIMELINE_WRAP_WATERMARK: u64 = 1 << 31;
+
 /// Per-owner dispatch state. One per `ExecutionPlan`, one per `AmdGraph`,
 /// plus one default per `AmdDevice` for trait-fallback callers (the rest of
 /// the runtime always goes through the plan/graph path).
@@ -58,9 +63,12 @@ pub struct AmdConnector {
     /// internal `Mutex<QueueInner>` is exercised only by intra-owner traffic
     /// (effectively uncontended).
     queue: Arc<AmdComputeQueue>,
-    /// Per-connector kernel-argument bump arena (16 MiB GTT). Wraps drain
-    /// every live connector via the core's registry (see
-    /// `KernargArena::bump`).
+    /// Per-connector kernel-argument bump arena (16 MiB GTT). Each connector
+    /// owns its own arena so the bump cursor and this connector's dispatch
+    /// timeline are the SAME ordering — a wrapped slot is provably free once
+    /// this connector's timeline drains. (A device-global arena fed by N
+    /// independent timelines loses that guarantee.) Freed on connector drop
+    /// via `Drop for KernargArena`, after `AmdConnector::Drop` has drained.
     arena: Arc<KernargArena>,
     /// Per-connector scratch backing. Mirrors what used to live on
     /// `AmdDevice::scratch_state`; see that field's docstring for the
@@ -93,9 +101,15 @@ impl AmdConnector {
         // (queue: `Drop for AmdComputeQueue` + `Drop for QueueInner`; arena:
         // `Drop for KernargArena`; signal: `AmdSignal::Drop` returns slot to
         // pool). The scratch backing is the lone raw KFD allocation — keeping
-        // it last means a failure before line 95 unwinds via `?` and the
-        // RAII cleanups run; failure of `alloc_scratch` itself returns
-        // without anything to leak.
+        // it last means a failure before then unwinds via `?` and the RAII
+        // cleanups run; failure of `alloc_scratch` itself returns without
+        // anything to leak.
+        //
+        // Per-connector arena (not device-global): the arena's bump cursor
+        // and this connector's timeline are one ordering, so slot reuse is
+        // safe by construction. `AmdConnector::Drop` drains this connector's
+        // timeline before the `arena` field's `Drop for KernargArena` unmaps
+        // it, so there's no unmap-while-busy.
         let queue = AmdComputeQueue::create(allocator)?;
         let arena = KernargArena::new(allocator, &core)?;
         let pool = core.signal_pool().cloned().ok_or_else(|| Error::Runtime {
@@ -139,7 +153,7 @@ impl AmdConnector {
         &self.queue
     }
 
-    /// Borrow this connector's kernarg arena.
+    /// Borrow this connector's own kernarg arena.
     #[inline]
     pub fn arena(&self) -> &Arc<KernargArena> {
         &self.arena
@@ -200,9 +214,28 @@ impl AmdConnector {
         // compare the *low 32 bits* of the signal, so the counter must stay
         // below 2^32. We've just drained to `target` (GPU idle), so it's safe
         // to reset the signal slot to 0 and restart the counter at 1.
-        if self.timeline_value.load(Ordering::Acquire) > (1u64 << 31) {
+        if self.timeline_value.load(Ordering::Acquire) > TIMELINE_WRAP_WATERMARK {
             signal.set(0);
             self.timeline_value.store(1, Ordering::Release);
+        }
+        Ok(())
+    }
+
+    /// Keep the timeline counter below 2^32 on the dispatch hot path.
+    ///
+    /// `synchronize` resets the counter on wraparound, but it is only called on
+    /// host reads / frees / scratch realloc — a connector dispatched in a long
+    /// `wait=false` loop never hits it, so the full-u64 counter would climb
+    /// past 2^32 while the GPU's RELEASE_MEM writes only the low 32 bits. A
+    /// later `synchronize` would then wait for a full-u64 `target` the signal
+    /// slot can never reach → false 30 s timeout. Calling this before reserving
+    /// each timeline value forces the drain+reset at the 2^31 watermark, so the
+    /// reserved value stays `< 2^32` and the `as u32` truncations stay lossless.
+    /// Single-owner → sequential, so the check + drain can't race a dispatcher.
+    /// Amortised cost is one drain per ~2^31 dispatches.
+    pub fn ensure_timeline_headroom(&self) -> Result<()> {
+        if self.timeline_value.load(Ordering::Acquire) > TIMELINE_WRAP_WATERMARK {
+            self.synchronize()?;
         }
         Ok(())
     }
@@ -292,5 +325,56 @@ impl Drop for AmdConnector {
         // unmaps/munmaps/frees via KFD.
         let state = *self.scratch_state.lock();
         self.free_scratch(state.gpu_va, state.size, state.handle);
+    }
+}
+
+/// Exclusive, leak-proof handle to a pooled `AmdConnector`.
+///
+/// Obtained from [`AmdDeviceCore::lease_connector`]; on drop the connector is
+/// returned to its core's pool (or destroyed if the pool is over capacity).
+/// Deliberately **not** `Clone`/`Copy` and exposes only `&AmdConnector` via
+/// `Deref` — so a leased connector cannot be aliased, which is what
+/// guarantees no two dispatchers ever share one KFD compute queue (the
+/// scratch-realloc-vs-dispatch race the old shared "default connector"
+/// allowed). Mirrors the pooled-queue-with-checkout pattern every GPU
+/// framework uses for autotuning (HIP's `GPU_MAX_HW_QUEUES` pool, PyTorch's
+/// CUDA stream pool); the KFD compute queue is a scarce hardware resource
+/// (~24/process on CDNA), so it is reused, never created per dispatch.
+///
+/// No synchronize on drop: a returned connector stays registered in
+/// `core.connectors`, so `synchronize_all` (the copyout/free fence) still
+/// drains it, and the next lessee's first dispatch waits on this connector's
+/// own timeline. Panic-drop inherits `AmdConnector::Drop`'s skip.
+pub struct ConnectorLease {
+    /// `Some` while leased; `None` after `Drop` has handed it back.
+    conn: Option<Arc<AmdConnector>>,
+    core: Arc<AmdDeviceCore>,
+}
+
+impl ConnectorLease {
+    pub(crate) fn new(conn: Arc<AmdConnector>, core: Arc<AmdDeviceCore>) -> Self {
+        Self { conn: Some(conn), core }
+    }
+}
+
+impl std::ops::Deref for ConnectorLease {
+    type Target = AmdConnector;
+    #[inline]
+    fn deref(&self) -> &AmdConnector {
+        self.conn.as_ref().expect("ConnectorLease dereferenced after drop")
+    }
+}
+
+impl std::fmt::Debug for ConnectorLease {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConnectorLease").finish_non_exhaustive()
+    }
+}
+
+impl Drop for ConnectorLease {
+    fn drop(&mut self) {
+        if let Some(conn) = self.conn.take() {
+            self.core.return_connector(conn);
+        }
     }
 }

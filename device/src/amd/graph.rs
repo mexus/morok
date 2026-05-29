@@ -31,9 +31,11 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 
+use std::collections::HashMap;
+
 use crate::allocator::RawBuffer;
 use crate::amd::AmdAllocator;
-use crate::amd::connector::AmdConnector;
+use crate::amd::connector::ConnectorLease;
 use crate::amd::hw_queue::{AmdHwQueue, Sym, VarVals};
 use crate::amd::program::AmdProgram;
 use crate::amd::signal::{AmdSignal, SignalPool};
@@ -51,11 +53,17 @@ use crate::sync::TimelineSignal;
 /// GPU mappings. The field order here is only a backstop — `Drop` is the
 /// load-bearing guarantee.
 pub struct AmdGraph {
-    /// Per-graph connector — owns this graph's scratch + timeline signal +
-    /// timeline counter. Built fresh in [`AmdGraph::capture`] from the
-    /// captured kernels' shared device core, so per-call siblings can't
-    /// race its scratch realloc or timeline reservation.
-    connector: Arc<AmdConnector>,
+    /// Per-graph connectors, keyed by physical `gpu_id` — one leased connector
+    /// per device the captured chain touches (own ring + scratch + timeline).
+    /// Today's PM4 graph path is single-device, so this holds exactly one
+    /// entry; the map is the shape multi-GPU capture will fill (one stream +
+    /// connector per device). Each lease is held for the graph's lifetime and
+    /// returns to its core's pool on drop, so per-call siblings can't race its
+    /// scratch realloc or timeline reservation.
+    connectors: HashMap<u32, ConnectorLease>,
+    /// The single device's `gpu_id` for the current single-device path — the
+    /// sole key in `connectors`. Multi-GPU replay will iterate the map instead.
+    primary_gpu: u32,
     /// The single PM4 command stream for the whole chain (preamble + N execs +
     /// final signal), bound into a host-visible page. `submit` mutates its
     /// patch state, so it sits behind a `Mutex` — replay takes `&self`
@@ -105,13 +113,23 @@ impl Drop for AmdGraph {
             tracing::warn!("AmdGraph drop during panic unwind: skipping synchronize; in-flight replay abandoned");
             return;
         }
-        if let Err(e) = self.connector.synchronize() {
-            tracing::warn!(?e, "AmdGraph drop: synchronize failed (in-flight replay lost)");
+        for lease in self.connectors.values() {
+            if let Err(e) = lease.synchronize() {
+                tracing::warn!(?e, "AmdGraph drop: synchronize failed (in-flight replay lost)");
+            }
         }
     }
 }
 
 impl AmdGraph {
+    /// The single-device connector driving this graph. Panics if the map is
+    /// empty (capture always inserts one). Multi-GPU replay will iterate
+    /// `self.connectors` per device instead of going through this helper.
+    /// Returns the lease; deref-coerces to `&AmdConnector` at call sites.
+    #[inline]
+    fn connector(&self) -> &ConnectorLease {
+        self.connectors.get(&self.primary_gpu).expect("graph connector present")
+    }
     /// Capture `kernels` into one PM4 command stream. Returns `Ok(None)` when
     /// the chain isn't graphable on the PM4 path (non-AMD program, AQL queue, or
     /// mixed devices/queues) so the caller falls back to per-call dispatch.
@@ -151,11 +169,12 @@ impl AmdGraph {
             return Ok(None);
         }
 
-        // ── Build a fresh per-graph connector with its own ring + arena +
-        // scratch + timeline signal. The connector's `new_with_resources`
-        // already registers in the device-core's connector list and acquires
-        // a timeline signal from the shared pool.
-        let connector = AmdConnector::new_with_resources(Arc::clone(dev.core()), allocator)?;
+        // ── Lease a per-graph connector (own ring + scratch + timeline) from
+        // the device pool. Held for the graph's lifetime and returned to the
+        // pool on drop — so no per-call sibling can race its scratch realloc
+        // or timeline reservation while the graph is alive.
+        let connector = dev.core().lease_connector(allocator)?;
+        let primary_gpu = dev.node.gpu_id;
         let mut max_priv_seg = 128u32;
         for p in &progs {
             max_priv_seg = max_priv_seg.max(p.private_segment_size());
@@ -209,8 +228,9 @@ impl AmdGraph {
         let self_sig = signal_pool.acquire()?;
 
         // ── Build the one command stream. (← `comp_queues[dev]`, plus the
-        // preamble/exec/final loop at `graph/hcq.py:158-217`.)
-        let mut comp_queue = AmdHwQueue::new(Arc::clone(&connector));
+        // preamble/exec/final loop at `graph/hcq.py:158-217`.) The queue is a
+        // pure command buffer — the connector is passed to `exec`/`submit`.
+        let mut comp_queue = AmdHwQueue::new();
 
         // Preamble (← graph/hcq.py:158-160).
         comp_queue.preamble(kick_sig.value_addr(), self_sig.value_addr());
@@ -236,7 +256,13 @@ impl AmdGraph {
 
             let g = k.global_size.unwrap_or([1, 1, 1]);
             let l = k.local_size.unwrap_or([1, 1, 1]);
-            comp_queue.exec(p, &args, [g[0] as u32, g[1] as u32, g[2] as u32], [l[0] as u32, l[1] as u32, l[2] as u32]);
+            comp_queue.exec(
+                &connector,
+                p,
+                &args,
+                [g[0] as u32, g[1] as u32, g[2] as u32],
+                [l[0] as u32, l[1] as u32, l[2] as u32],
+            );
         }
 
         // Final signal advancing the real device timeline by +1 (← graph/hcq.py:217).
@@ -257,11 +283,15 @@ impl AmdGraph {
         }
         // `dev` is now unused — keep the variable name for the construction trace
         // above (it still drives validation) but drop the local: capture stores
-        // the connector, not the device.
+        // the connector lease, not the device.
         drop(dev);
 
+        let mut connectors = HashMap::with_capacity(1);
+        connectors.insert(primary_gpu, connector);
+
         Ok(Some(Box::new(AmdGraph {
-            connector,
+            connectors,
+            primary_gpu,
             comp_queue: Mutex::new(comp_queue),
             _kernargs_buf: kernargs_buf,
             kick_sig,
@@ -283,7 +313,7 @@ impl Graph for AmdGraph {
     /// plan-stable too — only the timeline/kickoff symbols change per replay.
     fn replay(&self, vals: &[i64]) -> Result<()> {
         let _ = vals;
-        if let Some(err) = self.connector.core().poison_error() {
+        if let Some(err) = self.connector().core().poison_error() {
             return Err(err);
         }
 
@@ -296,7 +326,7 @@ impl Graph for AmdGraph {
         };
         let last = *self.last_timeline.lock();
         if last > 0 {
-            self.connector.timeline_signal().wait(last, 30_000)?;
+            self.connector().timeline_signal().wait(last, 30_000)?;
         }
 
         // 2. Reserve this replay's timeline step and submit the IB. The
@@ -313,18 +343,18 @@ impl Graph for AmdGraph {
             // VirtTimelineVal = timeline_value-1 (what the preamble waits for);
             // the final signal writes +1, advancing the connector timeline by
             // exactly one step. `next_timeline` reserves that same value.
-            let prev = self.connector.timeline_value().saturating_sub(1);
-            let signalled = self.connector.next_timeline();
+            let prev = self.connector().timeline_value().saturating_sub(1);
+            let signalled = self.connector().next_timeline();
 
             // Resolve the graph's symbols (← `hcq_var_vals`, graph/hcq.py:275-285).
             let mut var_vals: VarVals = VarVals::new();
             var_vals.insert(Sym::Kickoff, kickoff_value);
             var_vals.insert(Sym::VirtTimelineVal, prev);
-            var_vals.insert(Sym::VirtTimelineSigAddr, self.connector.timeline_signal().value_addr());
+            var_vals.insert(Sym::VirtTimelineSigAddr, self.connector().timeline_signal().value_addr());
 
             // submit → apply_var_vals (patch hw_page + kernargs) → _submit (one
             //  doorbell). (← graph/hcq.py:290.)
-            q.submit(&var_vals)?;
+            q.submit(self.connector(), &var_vals)?;
             signalled
         };
         *self.last_timeline.lock() = signalled;

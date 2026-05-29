@@ -300,7 +300,7 @@ pub struct ExecutionPlan {
     /// Non-AMD plans never touch this field; CPU programs continue to use
     /// `Program::execute(...)`.
     #[cfg(target_os = "linux")]
-    amd_connector: std::sync::OnceLock<std::sync::Arc<svod_device::amd::AmdConnector>>,
+    amd_connector: std::sync::OnceLock<svod_device::amd::ConnectorLease>,
 }
 
 // ============================================================================
@@ -383,14 +383,16 @@ impl ExecutionPlan {
     fn amd_connector_for(
         &self,
         prog: &svod_device::amd::AmdProgram,
-    ) -> Result<std::sync::Arc<svod_device::amd::AmdConnector>> {
-        if let Some(c) = self.amd_connector.get() {
-            return Ok(std::sync::Arc::clone(c));
+    ) -> Result<&svod_device::amd::ConnectorLease> {
+        if let Some(lease) = self.amd_connector.get() {
+            return Ok(lease);
         }
-        // Acquire from the per-core connector pool (built fresh if empty).
-        // Recover the AMD device_id from the plan's DeviceSpec — the program
-        // was loaded against the same device_id, so the allocator shares
-        // `Arc<AmdDeviceCore>` via DEVICE_CACHE (no extra KFD opens).
+        // Lease from the per-core connector pool (built fresh if empty). The
+        // lease is held for the plan's lifetime and returns to the pool when
+        // the plan drops (`OnceLock<ConnectorLease>` field destructor) — no
+        // manual release, so it can't leak. Recover the AMD device_id from the
+        // plan's DeviceSpec; the program was loaded against the same device_id,
+        // so the allocator shares `Arc<AmdDeviceCore>` via DEVICE_CACHE.
         let device_id = match &self.device {
             DeviceSpec::Amd { device_id } => *device_id,
             _ => {
@@ -401,21 +403,16 @@ impl ExecutionPlan {
         };
         let alloc = svod_device::amd::AmdAllocator::new(device_id)
             .map_err(|e| crate::error::Error::Execution { reason: format!("plan allocator: {e}") })?;
-        let new_conn = prog
+        let lease = prog
             .device()
             .core()
-            .acquire_connector(&alloc)
-            .map_err(|e| crate::error::Error::Execution { reason: format!("acquire_connector: {e}") })?;
-        // One-shot init race: if two threads see empty, both `acquire`; only
-        // one wins `set()`. The loser's Arc drops at the end of this scope —
-        // its connector returns to the pool via the `Drop` chain (the Arc's
-        // ref count hits 0 only after `set` fails, so we explicitly route it
-        // back below).
-        let core_for_loser = std::sync::Arc::clone(prog.device().core());
-        if let Err(loser) = self.amd_connector.set(new_conn) {
-            core_for_loser.release_connector(loser);
-        }
-        Ok(std::sync::Arc::clone(self.amd_connector.get().expect("connector set above")))
+            .lease_connector(&alloc)
+            .map_err(|e| crate::error::Error::Execution { reason: format!("lease_connector: {e}") })?;
+        // One-shot init race: if two threads see empty, both lease; only one
+        // wins `set()`. The loser's lease drops here → its connector returns
+        // to the pool automatically.
+        let _ = self.amd_connector.set(lease);
+        Ok(self.amd_connector.get().expect("connector set above"))
     }
 
     #[inline]
@@ -434,7 +431,8 @@ impl ExecutionPlan {
             conn.ensure_has_local_memory(amd.private_segment_size())
                 .map_err(|e| crate::error::Error::Execution { reason: format!("scratch grow: {e}") })?;
             return unsafe {
-                amd.execute_on(&conn, &buffer_ptrs, &kernel.vals, global_size, local_size, /*wait=*/ false).map_err(
+                // `conn` is `&ConnectorLease`, deref-coerces to `&AmdConnector`.
+                amd.execute_on(conn, &buffer_ptrs, &kernel.vals, global_size, local_size, /*wait=*/ false).map_err(
                     |e| crate::error::Error::Execution { reason: format!("Kernel {} failed: {}", kernel.id, e) },
                 )
             };
@@ -866,20 +864,10 @@ impl ExecutionPlan {
     }
 }
 
-#[cfg(target_os = "linux")]
-impl Drop for ExecutionPlan {
-    /// Return the plan's AMD connector to the per-core pool so the next plan
-    /// reuses the same KFD queue + kernarg arena + scratch — amortising
-    /// ~50 MiB of KFD setup across BEAM-style plan churn. Pool cap drops
-    /// over-cap connectors normally (KFD queue id released to the kernel via
-    /// `AmdComputeQueue::Drop`).
-    fn drop(&mut self) {
-        if let Some(conn) = self.amd_connector.take() {
-            let core = std::sync::Arc::clone(conn.core());
-            core.release_connector(conn);
-        }
-    }
-}
+// No explicit `Drop for ExecutionPlan`: the plan's `amd_connector`
+// (`OnceLock<ConnectorLease>`) returns its connector to the per-core pool via
+// the lease's own destructor when the plan drops — amortising ~50 MiB of KFD
+// setup across BEAM-style plan churn, with no manual release to leak.
 
 impl std::fmt::Debug for ExecutionPlan {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

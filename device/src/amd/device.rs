@@ -24,7 +24,6 @@ use parking_lot::Mutex;
 use svod_dtype::AmdArch;
 use tracing::debug;
 
-use crate::amd::signal::AmdSignal;
 use crate::amd::sys::{ioctl, kfd};
 use crate::amd::topology::{AmdNode, enumerate};
 use crate::error::{Error, Result};
@@ -146,21 +145,24 @@ pub struct AmdDeviceCore {
     connector_pool: parking_lot::Mutex<Vec<Arc<crate::amd::connector::AmdConnector>>>,
 }
 
-/// Soft cap on pooled idle connectors per physical AMD:N. Matches the warning
-/// threshold in `AmdConnector::new_with_resources` — over this many idle
-/// connectors, the per-process KFD compute-queue limit is in real danger.
-pub const CONNECTOR_POOL_CAP: usize = 32;
+/// Max idle connectors retained per physical AMD:N. Each pooled connector
+/// holds a live KFD compute queue, and the per-process hardware budget is
+/// small (~24 user compute queues on CDNA; HIP's `GPU_MAX_HW_QUEUES` defaults
+/// to 4). Retaining more idle queues than the GPU can run concurrently just
+/// invites runlist oversubscription, so we keep the pool small and reuse
+/// aggressively. Over-cap returns drop normally (queue destroyed via
+/// `AmdComputeQueue::Drop`).
+pub const CONNECTOR_POOL_CAP: usize = 4;
 
 /// Open handle to one AMD GPU node.
 ///
-/// Holds the immutable `AmdDeviceCore` plus a default `AmdConnector` used
-/// by trait-fallback callers (`Program::execute` → `benchmark_kernel` etc.)
-/// and by the device-wide synchronize chain (`AmdAllocator::_copyin`/
-/// `_copyout`/`_free` route through `dev.synchronize() →
-/// core.synchronize_all()` which drains EVERY connector — default + per-
-/// plan + per-graph). Plan and graph callers build their own connector
-/// via `AmdConnector::new_with_resources` and bypass the default; the
-/// default connector is never on their hot path.
+/// A thin owner of the immutable `AmdDeviceCore`. There is no per-device
+/// "default" connector: every dispatcher holds its own connector — plans and
+/// graphs build/lease one for their lifetime, and the `Program::execute`
+/// trait fallback leases one per call from `core.lease_connector`. The
+/// device-wide synchronize chain (`AmdAllocator::_copyin`/`_copyout`/`_free`)
+/// routes through `dev.synchronize() → core.synchronize_all()`, which drains
+/// EVERY connector registered on the core (pooled, leased, plan, and graph).
 ///
 /// Immutable Core fields stay reachable via [`Deref`] — `self.dev.node`,
 /// `self.dev.kfd_fd`, `self.dev.poison_error()`, etc.
@@ -168,16 +170,6 @@ pub const CONNECTOR_POOL_CAP: usize = 32;
 pub struct AmdDevice {
     /// Immutable identity (cloneable across connectors).
     core: Arc<AmdDeviceCore>,
-    /// Default per-device connector — owns its own KFD ring + kernarg arena +
-    /// scratch + timeline. Lazy because `AmdConnector::new_with_resources`
-    /// needs an allocator, and the allocator needs an `AmdDevice` (DEVICE_CACHE
-    /// path); the factory installs this after `AmdDevice::open` returns.
-    /// Routed through by:
-    /// - `Program::execute` trait fallback (`AmdProgram::execute`) — when a
-    ///   caller dispatches a program without going through an
-    ///   `ExecutionPlan`/`AmdGraph` (e.g. `benchmark_kernel`).
-    /// - `AmdAllocator::_copyin`/`_copyout`/`_free` device-wide synchronize.
-    connector: OnceLock<Arc<crate::amd::connector::AmdConnector>>,
 }
 
 impl std::ops::Deref for AmdDevice {
@@ -327,70 +319,15 @@ impl AmdDevice {
             signal_pool: OnceLock::new(),
             connector_pool: parking_lot::Mutex::new(Vec::new()),
         });
-        // Default connector is installed by the factory AFTER this returns —
-        // building it here would recursively call `AmdAllocator::new`, which
-        // calls `AmdDevice::open`. The lazy `OnceLock` breaks the cycle.
-        Ok(Arc::new(Self { core, connector: OnceLock::new() }))
+        Ok(Arc::new(Self { core }))
     }
 
-    /// Install the default connector. Called once per device by the factory
-    /// after the allocator + signal pool are constructed; subsequent calls
-    /// are a no-op.
-    pub fn install_default_connector(&self, conn: Arc<crate::amd::connector::AmdConnector>) {
-        let _ = self.connector.set(conn);
-    }
-
-    /// Borrow the shared immutable core. Used by Step 3+ to build per-owner
+    /// Borrow the shared immutable core — used to build/lease per-owner
     /// `AmdConnector`s against the same physical device without re-acquiring
     /// KFD.
     #[inline]
     pub fn core(&self) -> &Arc<AmdDeviceCore> {
         &self.core
-    }
-
-    /// Borrow the device's default connector. Panics if the factory hasn't
-    /// installed it yet — that's a wiring bug, not a runtime condition.
-    /// Used by `Program::execute` trait fallback (callers who don't go
-    /// through `ExecutionPlan::execute_on`) and by the device-wide
-    /// synchronize chain in `AmdAllocator`.
-    #[inline]
-    pub fn connector(&self) -> &Arc<crate::amd::connector::AmdConnector> {
-        self.connector.get().expect("AmdDevice default connector not installed; factory wiring bug")
-    }
-
-    // === Delegations to the default connector ===
-    // Back-compat surface for `AmdAllocator::_copyin`/`_copyout`/`_free` and
-    // direct `Program::execute` callers. After the factory installs the
-    // default connector these are pure forwarding methods.
-
-    /// Current scratch buffer GPU VA on the default connector.
-    pub fn scratch_gpu_va(&self) -> u64 {
-        self.connector().scratch_gpu_va()
-    }
-
-    /// Packed `COMPUTE_TMPRING_SIZE` on the default connector.
-    pub fn tmpring_size(&self) -> u32 {
-        self.connector().tmpring_size()
-    }
-
-    /// Grow the default connector's scratch backing (delegate).
-    pub fn ensure_has_local_memory(&self, private_segment_size: u32) -> Result<()> {
-        self.connector().ensure_has_local_memory(private_segment_size)
-    }
-
-    /// Default connector timeline signal (delegate; panics if not initialized).
-    pub fn timeline_signal(&self) -> &Arc<AmdSignal> {
-        self.connector().timeline_signal()
-    }
-
-    /// Reserve the next timeline value on the default connector.
-    pub fn next_timeline(&self) -> u64 {
-        self.connector().next_timeline()
-    }
-
-    /// Highest submitted timeline value on the default connector.
-    pub fn timeline_value(&self) -> u64 {
-        self.connector().timeline_value()
     }
 
     /// Drain all submitted GPU work on every connector backed by this device.
@@ -445,27 +382,34 @@ impl AmdDeviceCore {
         self.signal_pool.get()
     }
 
-    /// Acquire an `AmdConnector` for this core — reuse an idle one from the
-    /// pool if available, otherwise build fresh via
-    /// `AmdConnector::new_with_resources`. Plans (`ExecutionPlan`) acquire
-    /// here on first AMD dispatch and `release_connector` on Drop, so a long-
-    /// running BEAM workload amortises ~50 MiB of KFD queue setup across all
-    /// candidate plans instead of paying it per plan.
-    pub fn acquire_connector(
+    /// Lease an `AmdConnector` for this core — reuse an idle one from the pool
+    /// if available, otherwise build fresh via
+    /// `AmdConnector::new_with_resources`. The returned
+    /// [`ConnectorLease`](crate::amd::connector::ConnectorLease) returns the
+    /// connector to the pool on drop, so a long-running BEAM workload
+    /// amortises ~50 MiB of KFD queue setup across candidates instead of
+    /// paying it per dispatch — and the lease being exclusive + un-aliasable
+    /// is what stops two dispatchers from sharing one KFD queue.
+    ///
+    /// Pool-empty builds a fresh connector; if the per-process KFD
+    /// compute-queue budget is exhausted the underlying `create_queue` ioctl
+    /// errors and that propagates to the caller (BEAM drops the candidate).
+    pub fn lease_connector(
         self: &Arc<Self>,
         allocator: &crate::amd::AmdAllocator,
-    ) -> Result<Arc<crate::amd::connector::AmdConnector>> {
-        if let Some(conn) = self.connector_pool.lock().pop() {
-            return Ok(conn);
-        }
-        crate::amd::connector::AmdConnector::new_with_resources(Arc::clone(self), allocator)
+    ) -> Result<crate::amd::connector::ConnectorLease> {
+        let conn = match self.connector_pool.lock().pop() {
+            Some(c) => c,
+            None => crate::amd::connector::AmdConnector::new_with_resources(Arc::clone(self), allocator)?,
+        };
+        Ok(crate::amd::connector::ConnectorLease::new(conn, Arc::clone(self)))
     }
 
-    /// Return a connector to the pool. If the pool is at `CONNECTOR_POOL_CAP`,
-    /// the connector drops normally — `AmdConnector::Drop` synchronises and
-    /// `AmdComputeQueue::Drop` destroys the KFD queue, returning the queue id
-    /// to the kernel's per-process pool.
-    pub fn release_connector(&self, conn: Arc<crate::amd::connector::AmdConnector>) {
+    /// Return a connector to the pool (called by `ConnectorLease::Drop`). If
+    /// the pool is at `CONNECTOR_POOL_CAP`, the connector drops normally —
+    /// `AmdConnector::Drop` synchronises and `AmdComputeQueue::Drop` destroys
+    /// the KFD queue, returning the queue id to the kernel.
+    pub(crate) fn return_connector(&self, conn: Arc<crate::amd::connector::AmdConnector>) {
         let mut pool = self.connector_pool.lock();
         if pool.len() < CONNECTOR_POOL_CAP {
             pool.push(conn);

@@ -144,6 +144,13 @@ impl Allocator for AmdAllocator {
                 RawBuffer::AmdDevice { host_ptr: Some(dst_ptr), .. },
                 RawBuffer::AmdDevice { host_ptr: Some(src_ptr), .. },
             ) => {
+                // Drain before the host memmove: `src` may still be written by
+                // an in-flight kernel and `dst` may be an in-flight target.
+                // Host pointer access isn't ordered on any GPU timeline, so we
+                // fence the whole device first — same contract as `_copyin`/
+                // `_copyout`. (tinygrad routes same-device copies through the
+                // SDMA queue with explicit `wait(timeline)` on both sides.)
+                self.dev.synchronize()?;
                 let dst = unsafe { std::slice::from_raw_parts_mut(dst_ptr.as_ptr().add(dest_off), sz) };
                 let src_slice = unsafe { std::slice::from_raw_parts(src_ptr.as_ptr().add(src_off), sz) };
                 dst.copy_from_slice(src_slice);
@@ -172,13 +179,15 @@ impl Allocator for AmdAllocator {
             }
         };
         // 0. Drain the device's submitted work before tearing down the
-        //    mapping. Mirrors tinygrad `HCQAllocatorBase._free` at
-        //    `hcq.py:566` (`for dev in buf.mapped_devs: dev.synchronize()`).
-        //    Without this, the GPU can still hold pending references to
-        //    `gpu_addr` when we call `unmap_memory_from_gpu` below — the
-        //    KFD tears down the page-table entries and the kernel then
-        //    faults at the now-orphaned VA. Logged-and-ignore on failure:
-        //    free is called from `Drop`, so we can't propagate.
+        //    mapping. `device.synchronize()` → `core.synchronize_all()` drains
+        //    EVERY connector registered on this core — this is the per-VM
+        //    fence: all queues share one page table, so unmapping `gpu_addr`
+        //    while ANY queue's CP still references it faults the whole VM.
+        //    Draining all timelines guarantees every in-flight reader (on any
+        //    connector) has retired before the unmap. Mirrors tinygrad
+        //    `HCQAllocatorBase._free` (`hcq.py:566`,
+        //    `for dev in buf.mapped_devs: dev.synchronize()`). Logged-and-ignore
+        //    on failure: free is called from `Drop`, so we can't propagate.
         if let Err(e) = device.synchronize() {
             tracing::warn!(?e, gpu_addr, "AmdAllocator::free: device synchronize failed; freeing anyway");
         }
@@ -202,6 +211,14 @@ impl Allocator for AmdAllocator {
         let mut free_args = kfd::kfd_ioctl_free_memory_of_gpu_args { handle };
         // SAFETY: same as above.
         let _ = unsafe { ioctl::kfd_free_memory_of_gpu(device.kfd_fd.as_raw_fd(), &mut free_args as *mut _) };
+    }
+
+    /// Drain all in-flight GPU work on this device. Without this override the
+    /// trait default is a no-op, so `Buffer::synchronize()` (which delegates
+    /// to `allocator.synchronize()`) would silently NOT fence the AMD timeline
+    /// — e.g. `Buffer::copy_from`'s cross-device staging read relies on it.
+    fn synchronize(&self) -> Result<()> {
+        self.dev.synchronize()
     }
 
     fn name(&self) -> &str {

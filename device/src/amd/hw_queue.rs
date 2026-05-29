@@ -28,7 +28,6 @@
 #![cfg(target_os = "linux")]
 
 use std::collections::HashMap;
-use std::sync::Arc;
 
 use crate::allocator::RawBuffer;
 use crate::amd::AmdAllocator;
@@ -181,9 +180,6 @@ impl AmdArgsState {
 
 /// A symbolic PM4 compute command builder. One per graph (single queue).
 pub struct AmdHwQueue {
-    /// Per-graph connector — owns the ring + scratch + timeline this command
-    /// stream submits through.
-    connector: Arc<AmdConnector>,
     /// The dword stream (← `_q`). Concrete until `bind`, after which it lives in
     /// the host-visible page and `apply_var_vals` patches it in place.
     q: Vec<u32>,
@@ -208,10 +204,12 @@ unsafe impl Send for AmdHwQueue {}
 unsafe impl Sync for AmdHwQueue {}
 
 impl AmdHwQueue {
-    /// New empty queue (← `HWQueue.__init__`, `hcq.py:80`).
-    pub fn new(connector: Arc<AmdConnector>) -> Self {
+    /// New empty queue (← `HWQueue.__init__`, `hcq.py:80`). The connector is
+    /// NOT held here — it's supplied by the owning `AmdGraph` (which holds the
+    /// `ConnectorLease`) to `exec`/`submit`, so the lease stays the sole owner
+    /// of the connector and can't be aliased.
+    pub fn new() -> Self {
         Self {
-            connector,
             q: Vec::new(),
             syms: Vec::new(),
             prev_resolved: Vec::new(),
@@ -312,7 +310,14 @@ impl AmdHwQueue {
     /// VA + optional scratch prefix; same-queue ordering comes from the
     /// `acquire_mem` + `CS_PARTIAL_FLUSH`, so there is NO inter-kernel
     /// signal/wait.
-    pub fn exec(&mut self, prg: &AmdProgram, args: &AmdArgsState, global_size: [u32; 3], local_size: [u32; 3]) {
+    pub fn exec(
+        &mut self,
+        conn: &AmdConnector,
+        prg: &AmdProgram,
+        args: &AmdArgsState,
+        global_size: [u32; 3],
+        local_size: [u32; 3],
+    ) {
         // bind_args_state (← hcq.py:205): record symbolic kernarg fields.
         for (syms, mem, fmt) in &args.bind_data {
             for (i, sym) in syms.iter().enumerate() {
@@ -321,11 +326,11 @@ impl AmdHwQueue {
             }
         }
 
-        // Read the graph connector's own scratch. The connector is owned
-        // exclusively by this graph, so there's no concurrent realloc to
-        // guard against — plain field access.
-        let scratch_addr = self.connector.scratch_gpu_va();
-        let tmpring_size = self.connector.tmpring_size();
+        // Read the graph connector's own scratch. The connector is held by the
+        // owning graph's `ConnectorLease` (exclusive), so there's no concurrent
+        // realloc to guard against.
+        let scratch_addr = conn.scratch_gpu_va();
+        let tmpring_size = conn.tmpring_size();
 
         // USER_DATA SGPR prefix: optional 4-dword scratch descriptor, then the
         // 2-dword kernarg pointer — identical to `AmdProgram::execute`
@@ -458,11 +463,17 @@ impl AmdHwQueue {
     /// the patched IB page to publish to — the doorbell store inside
     /// `submit_dwords::ring_doorbell` provides the host→GPU publication
     /// barrier.
-    pub fn submit(&mut self, var_vals: &VarVals) -> Result<()> {
+    pub fn submit(&mut self, conn: &AmdConnector, var_vals: &VarVals) -> Result<()> {
         self.apply_var_vals(var_vals)?;
         let cmd = self.binded.as_ref().expect("AmdHwQueue::submit before bind").indirect_cmd;
         // `_submit` (← `ops_amd.py:407`): one doorbell via the queue primitive.
-        self.connector.queue().submit_dwords(&cmd)
+        conn.queue().submit_dwords(&cmd)
+    }
+}
+
+impl Default for AmdHwQueue {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

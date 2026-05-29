@@ -17,15 +17,14 @@ impl RealizeTestExt for Tensor {
 
 /// Setup function to call at the start of each test.
 ///
-/// Buffer UOp IDs are globally unique (monotonic counter via `Op::Unique`),
-/// so buffer entries never collide across parallel tests — no registry
-/// clearing or mutex serialization needed.
-///
-/// The kernel name dedup counter is the only non-RAII global state that
-/// needs reset between tests.
-pub fn test_setup() {
-    svod_runtime::kernel_cache::clear_all();
-}
+/// No-op today: the kernel cache is intentionally process-static and
+/// deduped by `(ast_id, device)`, so cross-test entries don't interfere —
+/// identical ASTs hand back the same `Arc<CachedKernel>`, distinct ASTs
+/// occupy distinct slots, and the cache is never torn down mid-process.
+/// `kernel_cache::clear_all` is `pub(crate)` precisely to keep external
+/// callers from bursting `AmdProgram::Drop` through the cache while live
+/// dispatches still resolve through it.
+pub fn test_setup() {}
 
 /// Compare float slices with tolerance.
 #[track_caller]
