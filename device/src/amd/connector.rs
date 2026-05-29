@@ -28,7 +28,6 @@
 
 #![cfg(target_os = "linux")]
 
-use std::os::fd::AsRawFd;
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -38,7 +37,6 @@ use crate::amd::device::{AmdDeviceCore, ScratchState, alloc_scratch};
 use crate::amd::kernarg::KernargArena;
 use crate::amd::queue::AmdComputeQueue;
 use crate::amd::signal::{AmdSignal, TIMELINE_WRAP_WATERMARK, Timeline};
-use crate::amd::sys::{ioctl, kfd};
 use crate::error::{Error, Result};
 
 /// Per-owner dispatch state. One per `ExecutionPlan`, one per `AmdGraph`,
@@ -114,7 +112,7 @@ impl AmdConnector {
         })?;
         let timeline = Timeline::new(Arc::new(pool.acquire()?));
         let (scratch_va, scratch_size, tmpring_size, size_per_thread, scratch_handle) =
-            alloc_scratch(&core.kfd_fd, &core.node, &core.arch, 128)?;
+            alloc_scratch(core.iface(), &core.node, &core.arch, 128)?;
         // Register the TIMELINE (not the connector) in the core so
         // `synchronize_all` can drain this connector's in-flight work via the
         // shared signal — without ever touching its queue. Opportunistic GC of
@@ -241,7 +239,7 @@ impl AmdConnector {
             return Ok(());
         }
         let (va, size, tmpring, rounded, handle) =
-            alloc_scratch(&self.core.kfd_fd, &self.core.node, &self.core.arch, private_segment_size)?;
+            alloc_scratch(self.core.iface(), &self.core.node, &self.core.arch, private_segment_size)?;
         // `free_scratch` (below) drains the connector's timeline before the
         // unmap — in single-queue mode that is the *shared* timeline, so it
         // fences every in-flight dispatcher, not just this thread. The old
@@ -267,20 +265,7 @@ impl AmdConnector {
         if let Err(e) = self.synchronize() {
             tracing::warn!(?e, va, "scratch realloc: synchronize failed; freeing anyway");
         }
-        let mut gpu_id = self.core.node.gpu_id;
-        let mut unmap = kfd::kfd_ioctl_unmap_memory_from_gpu_args {
-            handle,
-            device_ids_array_ptr: &mut gpu_id as *mut _ as u64,
-            n_devices: 1,
-            n_success: 0,
-        };
-        // SAFETY: fd alive; handle from a successful alloc_scratch.
-        let _ = unsafe { ioctl::kfd_unmap_memory_from_gpu(self.core.kfd_fd.as_raw_fd(), &mut unmap as *mut _) };
-        // SAFETY: va is the VA reserved by alloc_scratch's mmap.
-        unsafe { libc::munmap(va as *mut _, size) };
-        let mut free = kfd::kfd_ioctl_free_memory_of_gpu_args { handle };
-        // SAFETY: same handle.
-        let _ = unsafe { ioctl::kfd_free_memory_of_gpu(self.core.kfd_fd.as_raw_fd(), &mut free as *mut _) };
+        self.core.iface().free_raw(va, size, handle);
     }
 }
 

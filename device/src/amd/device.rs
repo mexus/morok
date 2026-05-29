@@ -52,10 +52,10 @@ static GLOBAL_KFD: Lazy<Mutex<Option<Arc<OwnedFd>>>> = Lazy::new(Default::defaul
 static EVENT_PAGE: Lazy<Mutex<Option<EventPageState>>> = Lazy::new(Default::default);
 
 #[derive(Debug, Clone, Copy)]
-struct EventPageState {
-    handle: u64,
-    va: u64,
-    size: usize,
+pub(crate) struct EventPageState {
+    pub(crate) handle: u64,
+    pub(crate) va: u64,
+    pub(crate) size: usize,
 }
 
 /// Scratch backing memory + `COMPUTE_TMPRING_SIZE` packing. Held under a
@@ -85,30 +85,16 @@ pub(crate) struct ScratchState {
 /// `synchronize_all` live here so the host can drain every live connector
 /// before any destructive operation (`AmdAllocator::_free`, etc.).
 ///
-/// `event_page_*` is the GTT-pinned per-process event page (bound via
-/// `CREATE_EVENT(event_page_offset=handle)`). `queue_event_*` is the SIGNAL
-/// event used by `AMDKFD_IOC_CREATE_QUEUE` for completion notification.
-/// `mem_fault_event_id` / `hw_fault_event_id` are MEMORY / HW_EXCEPTION
-/// events used by the fault-collection path. `queue_event_mailbox_ptr` is
-/// the GPU VA inside the event page where SDMA fence packets write the
-/// queue event_id (per tinygrad `ops_amd.py:738`).
+/// The backend seam: all KFD ioctls (memory alloc/free, queue ring setup/
+/// teardown, event waits) route through `iface`. KFD-specific state (the kfd/
+/// drm fds, ABI version, event ids, event page) lives on the [`KfdIface`]
+/// implementor, not the core. `node` + `arch` stay here as the device identity.
 #[derive(Debug)]
 pub struct AmdDeviceCore {
     pub node: AmdNode,
     pub arch: AmdArch,
-    /// Shared `/dev/kfd` handle (one per process; see [`GLOBAL_KFD`]).
-    pub kfd_fd: Arc<OwnedFd>,
-    pub drm_fd: OwnedFd,
-    pub kfd_version: (u32, u32),
-    /// VA + size of the GTT-pinned event page (held to keep it mapped).
-    pub event_page_va: u64,
-    pub event_page_size: usize,
-    /// KFD ids for the SIGNAL events used by queue completion / fault paths.
-    pub queue_event_id: u32,
-    pub queue_event_slot_index: u32,
-    pub queue_event_mailbox_ptr: u64,
-    pub mem_fault_event_id: u32,
-    pub hw_fault_event_id: u32,
+    /// Backend implementation (KFD today). All ioctls route through this.
+    iface: Arc<dyn crate::amd::iface::AmdIface>,
     /// Whether an SDMA copy queue is available on this physical device. Set
     /// by the factory after it tries to create one (`ops_amd.py:1000`).
     /// Today every AMD buffer is host-visible + memcpy'd, so this stays
@@ -250,77 +236,18 @@ impl AmdDevice {
             ),
         })?;
 
-        let kfd_fd = ensure_global_kfd()?;
-        let drm_path = format!("/dev/dri/renderD{}", node.drm_render_minor);
-        let drm_fd = open_owned(drm_path.as_str())?;
-
-        // GET_VERSION captures the KFD ABI version so we can gate RUNTIME_ENABLE
-        // (which only exists on kfd >= 1.14). Mirrors tinygrad `ops_amd.py:726`.
-        let mut ver_args = kfd::kfd_ioctl_get_version_args { major_version: 0, minor_version: 0 };
-        if let Err(e) = unsafe { ioctl::kfd_get_version(kfd_fd.as_raw_fd(), &mut ver_args as *mut _) } {
-            return Err(Error::AmdIoctl { ioctl: "AMDKFD_IOC_GET_VERSION", errno: e as i32 });
+        // Backend selection. Today only the KFD-direct backend exists; the
+        // `SVOD_AMD_BACKEND` knob is the seam where the userspace AM driver
+        // will plug in. All KFD bring-up + ioctls live on `KfdIface`.
+        let backend = std::env::var("SVOD_AMD_BACKEND").unwrap_or_else(|_| "kfd".into());
+        if backend != "kfd" {
+            return Err(Error::NoAmdGpu {
+                reason: format!("unknown SVOD_AMD_BACKEND={backend} (only 'kfd' supported)"),
+            });
         }
-        let kfd_version = (ver_args.major_version, ver_args.minor_version);
+        let iface: Arc<dyn crate::amd::iface::AmdIface> = Arc::new(crate::amd::iface::KfdIface::open(&node)?);
 
-        // ACQUIRE_VM tells KFD to register this DRM fd as the process's VM
-        // for this GPU. Required before any alloc/map ioctls.
-        let mut args = kfd::kfd_ioctl_acquire_vm_args { drm_fd: drm_fd.as_raw_fd() as u32, gpu_id: node.gpu_id };
-        // SAFETY: kfd_fd is a valid open fd; `args` is a well-typed ioctl
-        // argument matching the AMDKFD_IOC_ACQUIRE_VM signature.
-        let rc = unsafe { ioctl::kfd_acquire_vm(kfd_fd.as_raw_fd(), &mut args as *mut _) };
-        if let Err(e) = rc {
-            return Err(Error::AmdIoctl { ioctl: "AMDKFD_IOC_ACQUIRE_VM", errno: e as i32 });
-        }
-
-        // RUNTIME_ENABLE — only on KFD >= 1.14. Tinygrad gates it the same way
-        // (`ops_amd.py:728`); older kernels reject the ioctl with ENOTTY.
-        if kfd_version >= (1, 14) {
-            let mut rt = kfd::kfd_ioctl_runtime_enable_args { mode_mask: 0, ..Default::default() };
-            if let Err(e) = unsafe { ioctl::kfd_runtime_enable(kfd_fd.as_raw_fd(), &mut rt as *mut _) } {
-                return Err(Error::AmdIoctl { ioctl: "AMDKFD_IOC_RUNTIME_ENABLE", errno: e as i32 });
-            }
-        }
-
-        // Event-page setup. Mirrors `ops_amd.py:731-733`: allocated and bound
-        // exactly once per process; subsequent devices reuse it by calling
-        // `MAP_MEMORY_TO_GPU` for their `gpu_id`. Without the bound event page,
-        // AMDKFD_IOC_CREATE_QUEUE returns EINVAL.
-        let EventPageState { handle: _, va: event_page_va, size: event_page_size } =
-            ensure_event_page(&kfd_fd, &drm_fd, &node)?;
-        let mut qe = kfd::kfd_ioctl_create_event_args {
-            event_type: kfd::KFD_IOC_EVENT_SIGNAL,
-            auto_reset: 1,
-            ..Default::default()
-        };
-        if let Err(e) = unsafe { ioctl::kfd_create_event(kfd_fd.as_raw_fd(), &mut qe as *mut _) } {
-            return Err(Error::AmdIoctl { ioctl: "AMDKFD_IOC_CREATE_EVENT(queue signal)", errno: e as i32 });
-        }
-        let mut mem_event =
-            kfd::kfd_ioctl_create_event_args { event_type: kfd::KFD_IOC_EVENT_MEMORY, ..Default::default() };
-        if let Err(e) = unsafe { ioctl::kfd_create_event(kfd_fd.as_raw_fd(), &mut mem_event as *mut _) } {
-            return Err(Error::AmdIoctl { ioctl: "AMDKFD_IOC_CREATE_EVENT(mem fault)", errno: e as i32 });
-        }
-        let mut hw_event =
-            kfd::kfd_ioctl_create_event_args { event_type: kfd::KFD_IOC_EVENT_HW_EXCEPTION, ..Default::default() };
-        if let Err(e) = unsafe { ioctl::kfd_create_event(kfd_fd.as_raw_fd(), &mut hw_event as *mut _) } {
-            return Err(Error::AmdIoctl { ioctl: "AMDKFD_IOC_CREATE_EVENT(hw fault)", errno: e as i32 });
-        }
-
-        // The mailbox sits at event_page + slot_index * 8 (tinygrad
-        // `ops_amd.py:738`). SDMA fence packets write the queue event_id
-        // here to wake up `WAIT_EVENTS` from `sleep()`.
-        let queue_event_mailbox_ptr = event_page_va + (qe.event_slot_index as u64) * 8;
-
-        debug!(
-            node = node.node_id,
-            gpu_id = node.gpu_id,
-            arch = arch.mcpu(),
-            kfd_version = ?kfd_version,
-            queue_event_id = qe.event_id,
-            mem_fault_event_id = mem_event.event_id,
-            hw_fault_event_id = hw_event.event_id,
-            "AmdDevice opened"
-        );
+        debug!(node = node.node_id, gpu_id = node.gpu_id, arch = arch.mcpu(), backend = %backend, "AmdDevice opened");
 
         // KFD-safe single-queue mode (default ON). See `AmdDeviceCore::single_queue`.
         let single_queue = std::env::var("SVOD_AMD_SINGLE_QUEUE").ok().map(|s| s != "0").unwrap_or(true);
@@ -328,16 +255,7 @@ impl AmdDevice {
         let core = Arc::new(AmdDeviceCore {
             node,
             arch,
-            kfd_fd,
-            drm_fd,
-            kfd_version,
-            event_page_va,
-            event_page_size,
-            queue_event_id: qe.event_id,
-            queue_event_slot_index: qe.event_slot_index,
-            queue_event_mailbox_ptr,
-            mem_fault_event_id: mem_event.event_id,
-            hw_fault_event_id: hw_event.event_id,
+            iface,
             has_sdma_queue: AtomicBool::new(false),
             poisoned: AtomicBool::new(false),
             error_msg: OnceLock::new(),
@@ -407,6 +325,13 @@ impl AmdDeviceCore {
             Some(e) => Err(e),
             None => Ok(()),
         }
+    }
+
+    /// Borrow the backend seam — all KFD ioctls (alloc/free/ring/wait) route
+    /// through it. The allocator, queue, and connector helpers call this.
+    #[inline]
+    pub(crate) fn iface(&self) -> &Arc<dyn crate::amd::iface::AmdIface> {
+        &self.iface
     }
 
     /// Borrow the process-global signal pool (lazy-installed by the device
@@ -519,23 +444,13 @@ impl AmdDeviceCore {
     /// Returns `Ok(None)` for normal wake-ups (queue_event fired, timeout,
     /// or no event yet).
     pub fn wait_events(&self, timeout_ms: u32) -> Result<Option<Error>> {
-        let mut events: [kfd::kfd_event_data; 3] = [Default::default(); 3];
-        events[0].event_id = self.queue_event_id;
-        events[1].event_id = self.mem_fault_event_id;
-        events[2].event_id = self.hw_fault_event_id;
-        let mut args = kfd::kfd_ioctl_wait_events_args {
-            events_ptr: events.as_mut_ptr() as u64,
-            num_events: events.len() as u32,
-            wait_for_all: 0,
-            timeout: timeout_ms,
-            wait_result: 0,
-        };
-        // SAFETY: kfd_fd is alive; args + events live for the duration of the call.
-        let rc = unsafe { ioctl::kfd_wait_events(self.kfd_fd.as_raw_fd(), &mut args as *mut _) };
-        if let Err(e) = rc {
-            return Err(Error::AmdIoctl { ioctl: "AMDKFD_IOC_WAIT_EVENTS", errno: e as i32 });
+        let r = self.iface.wait_events(timeout_ms)?;
+        // Poison with the bare fault message (not `Error::Display`, which would
+        // prepend "runtime error: "). The backend already built the rich string.
+        if let Some(Error::Runtime { message }) = &r {
+            self.poison(message);
         }
-        Ok(self.poll_faults_nonblocking())
+        Ok(r)
     }
 
     /// `true` once a fault/timeout has poisoned the device. Hot-path gate.
@@ -564,51 +479,16 @@ impl AmdDeviceCore {
     /// error to a stalled dispatch and (b) from the WAIT_EVENTS escalation
     /// path to break out of polling early on a fault.
     pub fn poll_faults_nonblocking(&self) -> Option<Error> {
-        let mut events: [kfd::kfd_event_data; 2] = [Default::default(); 2];
-        events[0].event_id = self.mem_fault_event_id;
-        events[1].event_id = self.hw_fault_event_id;
-        let mut args = kfd::kfd_ioctl_wait_events_args {
-            events_ptr: events.as_mut_ptr() as u64,
-            num_events: events.len() as u32,
-            wait_for_all: 0,
-            timeout: 0,
-            wait_result: 0,
-        };
-        // SAFETY: kfd_fd is alive; args + events live for the duration of the call.
-        let rc = unsafe { ioctl::kfd_wait_events(self.kfd_fd.as_raw_fd(), &mut args as *mut _) };
-        if rc.is_err() {
-            // EAGAIN / ETIMEDOUT = no fault pending; treat as "no fault".
-            return None;
+        // Non-blocking poll = `wait_events` with timeout 0. Preserves the
+        // pre-refactor contract: ioctl error / no fault → `None`; fault →
+        // poison with the bare message + return `Some`.
+        match self.iface.wait_events(0) {
+            Ok(Some(Error::Runtime { message })) => {
+                self.poison(&message);
+                Some(Error::Runtime { message })
+            }
+            _ => None,
         }
-        // Inspect each event's union payload. `gpu_id != 0` signals the
-        // fault was actually written by KFD (the union is zero-initialized
-        // when nothing fired).
-        // SAFETY: bindgen union access — we read whichever payload type
-        // matches the event we registered.
-        let mem = unsafe { events[0].__bindgen_anon_1.memory_exception_data };
-        if mem.gpu_id != 0 {
-            let msg = format!(
-                "AMD GPU memory fault on gpu_id={} va={:#x} (NotPresent={} ReadOnly={} NoExecute={} ErrorType={})",
-                mem.gpu_id,
-                { mem.va },
-                mem.failure.NotPresent,
-                mem.failure.ReadOnly,
-                mem.failure.NoExecute,
-                { mem.ErrorType },
-            );
-            self.poison(&msg);
-            return Some(Error::Runtime { message: msg });
-        }
-        let hw = unsafe { events[1].__bindgen_anon_1.hw_exception_data };
-        if hw.gpu_id != 0 {
-            let msg = format!(
-                "AMD GPU hardware exception on gpu_id={} reset_type={} reset_cause={} memory_lost={}",
-                hw.gpu_id, hw.reset_type, hw.reset_cause, hw.memory_lost,
-            );
-            self.poison(&msg);
-            return Some(Error::Runtime { message: msg });
-        }
-        None
     }
 }
 
@@ -616,7 +496,7 @@ impl AmdDeviceCore {
 /// `Arc<OwnedFd>`. Mirrors tinygrad's `KFDIface.kfd` class attribute
 /// (`ops_amd.py:725`): all devices in a process share one KFD fd so events
 /// are visible across all of them.
-fn ensure_global_kfd() -> Result<Arc<OwnedFd>> {
+pub(crate) fn ensure_global_kfd() -> Result<Arc<OwnedFd>> {
     let mut g = GLOBAL_KFD.lock();
     if let Some(fd) = g.as_ref() {
         return Ok(Arc::clone(fd));
@@ -632,7 +512,7 @@ fn ensure_global_kfd() -> Result<Arc<OwnedFd>> {
 ///   `CREATE_EVENT(event_page_offset=handle)`, map into the first GPU.
 /// - subsequent devices: only `MAP_MEMORY_TO_GPU` the existing page into
 ///   their `gpu_id` (no re-alloc, no re-bind).
-fn ensure_event_page(kfd_fd: &OwnedFd, drm_fd: &OwnedFd, node: &AmdNode) -> Result<EventPageState> {
+pub(crate) fn ensure_event_page(kfd_fd: &OwnedFd, drm_fd: &OwnedFd, node: &AmdNode) -> Result<EventPageState> {
     let mut g = EVENT_PAGE.lock();
     if let Some(ep) = g.as_ref() {
         // Reuse: map the existing page into this device's GPU page table.
@@ -741,13 +621,11 @@ fn alloc_event_page(kfd_fd: &OwnedFd, drm_fd: &OwnedFd, node: &AmdNode) -> Resul
 /// - `max_scratch_waves = cu_cnt * max_slots_scratch_cu * xccs`
 /// - `WAVES = min(num_waves, max_scratch_waves)`, `WAVESIZE = wave_scratch`
 pub(crate) fn alloc_scratch(
-    kfd_fd: &OwnedFd,
+    iface: &Arc<dyn crate::amd::iface::AmdIface>,
     node: &AmdNode,
     arch: &AmdArch,
     private_segment_size: u32,
 ) -> Result<(u64, usize, u32, u32, u64)> {
-    use libc::{MAP_ANONYMOUS, MAP_NORESERVE, MAP_PRIVATE, PROT_NONE, mmap, munmap};
-
     const LANES_PER_WAVE: u32 = 64;
     const PAGE: usize = 0x1000;
     // gfx9 (CDNA) scratch is 1024-byte aligned; gfx11/12 (RDNA) use 256.
@@ -765,41 +643,18 @@ pub(crate) fn alloc_scratch(
         (size_per_thread as usize) * (LANES_PER_WAVE as usize) * (max_slots as usize) * (cu_cnt as usize);
     let total = (size_per_xcc * xccs as usize).next_multiple_of(PAGE);
 
-    // Reserve VA + KFD alloc as plain VRAM (GPU-only; no host access needed —
-    // the GPU writes register spills here and reads them back).
-    // SAFETY: standard libc::mmap; PROT_NONE reservation.
-    let va =
-        unsafe { mmap(std::ptr::null_mut(), total, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0) };
-    if va == libc::MAP_FAILED {
-        return Err(Error::AmdAllocFailed { reason: "scratch VA reservation failed".into() });
-    }
-    let mut args = kfd::kfd_ioctl_alloc_memory_of_gpu_args {
-        va_addr: va as u64,
-        size: total as u64,
-        gpu_id: node.gpu_id,
-        flags: kfd::KFD_IOC_ALLOC_MEM_FLAGS_VRAM
-            | kfd::KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE
-            | kfd::KFD_IOC_ALLOC_MEM_FLAGS_NO_SUBSTITUTE,
-        ..Default::default()
-    };
-    // SAFETY: kfd_fd is alive; args type-correct.
-    if let Err(e) = unsafe { ioctl::kfd_alloc_memory_of_gpu(kfd_fd.as_raw_fd(), &mut args as *mut _) } {
-        unsafe { munmap(va, total) };
-        return Err(Error::AmdIoctl { ioctl: "AMDKFD_IOC_ALLOC_MEMORY_OF_GPU(scratch)", errno: e as i32 });
-    }
-    let handle = args.handle;
-
-    let mut gpu_id = node.gpu_id;
-    let mut map_args = kfd::kfd_ioctl_map_memory_to_gpu_args {
-        handle,
-        device_ids_array_ptr: &mut gpu_id as *mut _ as u64,
-        n_devices: 1,
-        n_success: 0,
-    };
-    if let Err(e) = unsafe { ioctl::kfd_map_memory_to_gpu(kfd_fd.as_raw_fd(), &mut map_args as *mut _) } {
-        unsafe { munmap(va, total) };
-        return Err(Error::AmdIoctl { ioctl: "AMDKFD_IOC_MAP_MEMORY_TO_GPU(scratch)", errno: e as i32 });
-    }
+    // KFD alloc as plain VRAM (GPU-only; no host access needed — the GPU writes
+    // register spills here and reads them back). Plain VRAM = no EXECUTABLE, no
+    // PUBLIC (`cpu_access=false` keeps PUBLIC off); see `AllocKind::DeviceVram`.
+    let r = iface.alloc_raw(
+        total,
+        crate::amd::iface::AllocKind::DeviceVram { executable: false },
+        /*cpu_access=*/ false,
+        /*zero=*/ false,
+    )?;
+    let va = r.gpu_va;
+    let total = r.size;
+    let handle = r.handle;
 
     // gfx9 divides scratch evenly across SEs (1); gfx11/12 divide by se_cnt.
     let wave_scratch = (LANES_PER_WAVE * size_per_thread).div_ceil(mem_alignment_size);
@@ -809,7 +664,7 @@ pub(crate) fn alloc_scratch(
     let waves = num_waves.min(max_scratch_waves);
     let tmpring_size = pack_tmpring(waves, wave_scratch, arch);
 
-    Ok((va as u64, total, tmpring_size, size_per_thread, handle))
+    Ok((va, total, tmpring_size, size_per_thread, handle))
 }
 
 /// Pack `COMPUTE_TMPRING_SIZE`: WAVES in bits 0..12, WAVESIZE at bit 12 with an
@@ -825,7 +680,7 @@ fn pack_tmpring(waves: u32, wave_scratch: u32, arch: &AmdArch) -> u32 {
     (waves & 0xFFF) | ((wave_scratch & wavesize_mask) << 12)
 }
 
-fn open_owned(path: &str) -> Result<OwnedFd> {
+pub(crate) fn open_owned(path: &str) -> Result<OwnedFd> {
     match open(path, OFlag::O_RDWR | OFlag::O_CLOEXEC, Mode::empty()) {
         Ok(fd) => {
             // `nix::fcntl::open` in our pinned version returns a bare `RawFd`;

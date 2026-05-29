@@ -138,22 +138,7 @@ impl RawBuffer {
     /// only owners that know their resource is AMD-device-backed call it.
     pub(crate) fn free_amd_device_in_place(&self) {
         if let RawBuffer::AmdDevice { gpu_addr, size, handle, device, .. } = self {
-            use crate::amd::sys::{ioctl, kfd};
-            use std::os::fd::AsRawFd;
-            let mut gpu_id = device.node.gpu_id;
-            let mut unmap_args = kfd::kfd_ioctl_unmap_memory_from_gpu_args {
-                handle: *handle,
-                device_ids_array_ptr: &mut gpu_id as *mut _ as u64,
-                n_devices: 1,
-                n_success: 0,
-            };
-            // SAFETY: fd is alive (held via `device`); handle is from a successful alloc.
-            let _ = unsafe { ioctl::kfd_unmap_memory_from_gpu(device.kfd_fd.as_raw_fd(), &mut unmap_args as *mut _) };
-            // SAFETY: gpu_addr is the VA returned by our own mmap.
-            unsafe { libc::munmap(*gpu_addr as *mut _, *size) };
-            let mut free_args = kfd::kfd_ioctl_free_memory_of_gpu_args { handle: *handle };
-            // SAFETY: same handle.
-            let _ = unsafe { ioctl::kfd_free_memory_of_gpu(device.kfd_fd.as_raw_fd(), &mut free_args as *mut _) };
+            device.core().iface().free_raw(*gpu_addr, *size, *handle);
         }
     }
 }

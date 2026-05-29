@@ -18,6 +18,8 @@ pub mod graph;
 #[cfg(target_os = "linux")]
 pub mod hw_queue;
 #[cfg(target_os = "linux")]
+pub mod iface;
+#[cfg(target_os = "linux")]
 pub mod kernarg;
 #[cfg(target_os = "linux")]
 pub mod program;
@@ -36,6 +38,8 @@ pub use device::{AmdDevice, AmdDeviceCore};
 pub use graph::AmdGraph;
 #[cfg(target_os = "linux")]
 pub use hw_queue::{AmdArgsState, AmdHwQueue, Fmt, Sym, VarVals};
+#[cfg(target_os = "linux")]
+pub use iface::{AllocKind, AllocResult, AmdIface, KfdIface, QueueHandle, RingDesc};
 #[cfg(target_os = "linux")]
 pub use kernarg::KernargArena;
 #[cfg(target_os = "linux")]

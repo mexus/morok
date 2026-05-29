@@ -49,3 +49,6 @@ proptest = ["dep:proptest", "dep:proptest-derive", "svod-dtype/proptest"]
 cuda = ["dep:cudarc"]
 webgpu = []
 metal = []
+# AMD userspace driver (the AM backend, selected via SVOD_AMD_BACKEND=am). The
+# KFD backend is always compiled on Linux; this gates the future AM driver code.
+am = []

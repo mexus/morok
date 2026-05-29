@@ -16,11 +16,9 @@
 
 use std::cell::UnsafeCell;
 use std::mem::size_of;
-use std::os::fd::AsRawFd;
 use std::ptr::NonNull;
 use std::sync::Arc;
 
-use libc::{MAP_SHARED, PROT_READ, PROT_WRITE, mmap};
 use parking_lot::Mutex;
 use tracing::debug;
 
@@ -34,8 +32,8 @@ use crate::amd::sys::hsa::{
     HSA_PACKET_HEADER_SCRELEASE_FENCE_SCOPE, HSA_PACKET_TYPE_BARRIER_AND, HSA_PACKET_TYPE_VENDOR_SPECIFIC,
     HsaKernelDispatchPacket, HsaSignal, kernel_dispatch_header,
 };
+use crate::amd::sys::kfd;
 use crate::amd::sys::pm4;
-use crate::amd::sys::{ioctl, kfd};
 use crate::error::{Error, Result};
 
 /// AQL packets are exactly 64 bytes.
@@ -663,25 +661,14 @@ impl Drop for AmdComputeQueue {
         }
         // `&mut self` → exclusive; `get_mut` needs no unsafe.
         let queue_id = self.inner.get_mut().queue_id;
-        let mut args = kfd::kfd_ioctl_destroy_queue_args { queue_id, ..Default::default() };
-        // SAFETY: `core.kfd_fd` is alive (held via Arc<AmdDeviceCore>); the
-        // queue_id was returned by KFD on the matching create_queue call.
-        let rc = unsafe { ioctl::kfd_destroy_queue(self.core.kfd_fd.as_raw_fd(), &mut args as *mut _) };
-        if let Err(e) = rc {
-            tracing::warn!(?e, queue_id, "AmdComputeQueue drop: kfd_destroy_queue failed");
-        }
+        self.core.iface().teardown_ring(queue_id);
     }
 }
 
 impl Drop for AmdCopyQueue {
     fn drop(&mut self) {
         let queue_id = self.inner.lock().queue_id;
-        let mut args = kfd::kfd_ioctl_destroy_queue_args { queue_id, ..Default::default() };
-        // SAFETY: same invariants as AmdComputeQueue::drop.
-        let rc = unsafe { ioctl::kfd_destroy_queue(self.core.kfd_fd.as_raw_fd(), &mut args as *mut _) };
-        if let Err(e) = rc {
-            tracing::warn!(?e, queue_id, "AmdCopyQueue drop: kfd_destroy_queue failed");
-        }
+        self.core.iface().teardown_ring(queue_id);
     }
 }
 
@@ -848,18 +835,6 @@ fn create_queue(allocator: &AmdAllocator, queue_type: u32, ring_size: usize, aql
     // COMPUTE produces EINVAL.
     let wptr_offset: u64 = crate::amd::sys::hsa::OFFSET_WRITE_DISPATCH_ID as u64;
     let rptr_offset: u64 = crate::amd::sys::hsa::OFFSET_READ_DISPATCH_ID as u64;
-    let mut args = kfd::kfd_ioctl_create_queue_args {
-        ring_base_address: ring_gpu,
-        write_pointer_address: gart_gpu + wptr_offset,
-        read_pointer_address: gart_gpu + rptr_offset,
-        doorbell_offset: 0,
-        ring_size: ring_size as u32,
-        gpu_id: dev.node.gpu_id,
-        queue_type,
-        queue_percentage: kfd::KFD_MAX_QUEUE_PERCENTAGE,
-        queue_priority: 7,
-        ..Default::default()
-    };
     // Compute queues need EOP + ctx-save buffers. Tinygrad's sizing:
     //   ctx_save_restore_size (ioctl arg) = wg_data_size + ctl_stack_size
     //   cwsr_buffer_size (alloc size)     = round_up((ctx_save_restore_size
@@ -881,25 +856,37 @@ fn create_queue(allocator: &AmdAllocator, queue_type: u32, ring_size: usize, aql
     let plain = BufferSpec { cpu_access: false, nolru: true, ..Default::default() };
     let eop_buf = allocator.alloc(0x1000, &plain, /*zero=*/ false)?;
     let ctx_buf = allocator.alloc(cwsr_buffer_size, &plain, /*zero=*/ false)?;
-    if let crate::allocator::RawBuffer::AmdDevice { gpu_addr, .. } = &eop_buf {
-        args.eop_buffer_address = *gpu_addr;
-        args.eop_buffer_size = 0x1000;
-    }
-    if let crate::allocator::RawBuffer::AmdDevice { gpu_addr, .. } = &ctx_buf {
-        args.ctx_save_restore_address = *gpu_addr;
-        args.ctx_save_restore_size = ctx_save_restore_size as u32;
-        args.ctl_stack_size = ctl_stack_size as u32;
-    }
+    let eop_gpu = match &eop_buf {
+        crate::allocator::RawBuffer::AmdDevice { gpu_addr, .. } => *gpu_addr,
+        _ => 0,
+    };
+    let ctx_gpu = match &ctx_buf {
+        crate::allocator::RawBuffer::AmdDevice { gpu_addr, .. } => *gpu_addr,
+        _ => 0,
+    };
     let (eop_buf, ctx_buf) = (Some(eop_buf), Some(ctx_buf));
     let _ = aql; // queue_type already encodes AQL vs plain COMPUTE
 
-    // SAFETY: kfd_fd is alive; args is well-typed.
-    if let Err(e) = unsafe { ioctl::kfd_create_queue(dev.kfd_fd.as_raw_fd(), &mut args as *mut _) } {
-        return Err(Error::AmdIoctl { ioctl: "AMDKFD_IOC_CREATE_QUEUE", errno: e as i32 });
-    }
-
-    let doorbell = doorbell_mmap(dev, args.doorbell_offset)?;
-    debug!(queue_id = args.queue_id, doorbell_offset = args.doorbell_offset, "AMD queue created");
+    // CREATE_QUEUE + doorbell mmap through the backend seam. The ring/GART/EOP/
+    // ctx buffers above are allocated by us (above the seam); the iface only
+    // activates the HQD (register the queue + map its doorbell).
+    let desc = crate::amd::iface::RingDesc {
+        ring_gpu,
+        gart_gpu,
+        wptr_offset,
+        rptr_offset,
+        eop_gpu,
+        eop_size: 0x1000,
+        ctx_gpu,
+        ctx_save_restore_size: ctx_save_restore_size as u32,
+        ctl_stack_size: ctl_stack_size as u32,
+        ring_size,
+        gpu_id: dev.node.gpu_id,
+        queue_type,
+    };
+    let qh = dev.iface().setup_ring(&desc)?;
+    let queue_id = qh.queue_id;
+    let doorbell = qh.doorbell;
 
     // SAFETY: gart_host points to the GART page we just mmapped; the
     // write/read_dispatch_id fields live at fixed offsets inside the
@@ -937,7 +924,7 @@ fn create_queue(allocator: &AmdAllocator, queue_type: u32, ring_size: usize, aql
         pm4_ibs_size,
         pm4_ibs_cursor: 0,
         write_idx: 0,
-        queue_id: args.queue_id,
+        queue_id,
         _ring_buf: ring_buf,
         _gart_buf: gart_buf,
         _eop_buf: eop_buf,
@@ -988,33 +975,6 @@ fn compute_ctx_sizes(dev: &AmdDeviceCore) -> (usize, usize, usize) {
     let debug_memory_size = (wave_cnt * 32).next_multiple_of(64);
 
     (wg_data_size, ctl_stack_size, debug_memory_size)
-}
-
-/// Map a single 8 KiB doorbell window from `/dev/kfd` and return the per-queue
-/// doorbell pointer. KFD doorbells are page-aligned regions of MMIO addresses;
-/// the per-queue doorbell address = page_base + (doorbell_offset & 0x1fff).
-fn doorbell_mmap(dev: &AmdDeviceCore, doorbell_offset: u64) -> Result<NonNull<u64>> {
-    const DOORBELL_PAGE_BYTES: usize = 0x2000;
-    let page_base = doorbell_offset & !0x1fff;
-    // SAFETY: standard libc::mmap; protections set for read+write MMIO.
-    let p = unsafe {
-        mmap(
-            std::ptr::null_mut(),
-            DOORBELL_PAGE_BYTES,
-            PROT_READ | PROT_WRITE,
-            MAP_SHARED,
-            dev.kfd_fd.as_raw_fd(),
-            page_base as i64,
-        )
-    };
-    if p == libc::MAP_FAILED {
-        let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
-        return Err(Error::AmdAllocFailed { reason: format!("doorbell mmap failed (errno {errno})") });
-    }
-    let offset_in_page = (doorbell_offset & 0x1fff) as usize;
-    // SAFETY: offset_in_page < DOORBELL_PAGE_BYTES; alignment to u64 holds.
-    let ptr = unsafe { (p as *mut u8).add(offset_in_page) as *mut u64 };
-    Ok(NonNull::new(ptr).expect("doorbell page non-null"))
 }
 
 #[cfg(test)]

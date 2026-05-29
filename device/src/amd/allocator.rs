@@ -11,20 +11,15 @@
 
 #![cfg(target_os = "linux")]
 
-use std::os::fd::AsRawFd;
-use std::ptr::NonNull;
 use std::sync::Arc;
 
-use libc::{
-    MAP_ANONYMOUS, MAP_FIXED, MAP_NORESERVE, MAP_PRIVATE, MAP_SHARED, PROT_NONE, PROT_READ, PROT_WRITE, mmap, munmap,
-};
 use svod_dtype::DeviceSpec;
 use tracing::debug;
 
 use crate::allocator::{Allocator, BufferSpec, RawBuffer};
 use crate::amd::device::AmdDevice;
-use crate::amd::sys::{ioctl, kfd};
-use crate::error::{Error, Result, UnsupportedSnafu};
+use crate::amd::iface::AllocKind;
+use crate::error::{Result, UnsupportedSnafu};
 
 /// VRAM-/GTT-backed buffer allocator routed through KFD ioctls.
 pub struct AmdAllocator {
@@ -49,19 +44,7 @@ impl AmdAllocator {
     /// the `uncached` branch sets **GTT**, not VRAM (uncached and VRAM are
     /// mutually exclusive in tinygrad's flag composition).
     pub fn alloc_uncached(&self, size: usize) -> Result<RawBuffer> {
-        do_alloc(
-            &self.dev,
-            size,
-            kfd::KFD_IOC_ALLOC_MEM_FLAGS_GTT
-                | kfd::KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE
-                | kfd::KFD_IOC_ALLOC_MEM_FLAGS_EXECUTABLE
-                | kfd::KFD_IOC_ALLOC_MEM_FLAGS_NO_SUBSTITUTE
-                | kfd::KFD_IOC_ALLOC_MEM_FLAGS_PUBLIC
-                | kfd::KFD_IOC_ALLOC_MEM_FLAGS_COHERENT
-                | kfd::KFD_IOC_ALLOC_MEM_FLAGS_UNCACHED,
-            /*cpu_accessible=*/ true,
-            /*zero_init=*/ true,
-        )
+        do_alloc(&self.dev, size, AllocKind::UncachedGtt, /*cpu_accessible=*/ true, /*zero_init=*/ true)
     }
 }
 
@@ -82,14 +65,7 @@ impl Allocator for AmdAllocator {
         // mapping. Mirrors tinygrad `ops_amd.py:649`
         // (`cpu_access=options.cpu_access or not self.dev.has_sdma_queue`).
         let cpu_access = options.cpu_access || !self.dev.has_sdma_queue();
-        let mut flags = kfd::KFD_IOC_ALLOC_MEM_FLAGS_VRAM
-            | kfd::KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE
-            | kfd::KFD_IOC_ALLOC_MEM_FLAGS_EXECUTABLE
-            | kfd::KFD_IOC_ALLOC_MEM_FLAGS_NO_SUBSTITUTE;
-        if cpu_access {
-            flags |= kfd::KFD_IOC_ALLOC_MEM_FLAGS_PUBLIC;
-        }
-        do_alloc(&self.dev, size, flags, cpu_access, zero)
+        do_alloc(&self.dev, size, AllocKind::DeviceVram { executable: true }, cpu_access, zero)
     }
 
     fn _copyin(&self, dest: &RawBuffer, dest_off: usize, src: &[u8]) -> Result<()> {
@@ -191,26 +167,10 @@ impl Allocator for AmdAllocator {
         if let Err(e) = device.synchronize() {
             tracing::warn!(?e, gpu_addr, "AmdAllocator::free: device synchronize failed; freeing anyway");
         }
-        // 1. Unmap from GPU.
-        let mut gpu_id = device.node.gpu_id;
-        let mut unmap_args = kfd::kfd_ioctl_unmap_memory_from_gpu_args {
-            handle,
-            device_ids_array_ptr: &mut gpu_id as *mut _ as u64,
-            n_devices: 1,
-            n_success: 0,
-        };
-        // SAFETY: fd is alive; handle is from a successful alloc.
-        let _ = unsafe { ioctl::kfd_unmap_memory_from_gpu(device.kfd_fd.as_raw_fd(), &mut unmap_args as *mut _) };
-        // 2. Drop host mapping (PROT_READ|PROT_WRITE for host-visible, or the
-        //    PROT_NONE reservation for device-only). Both cases munmap the
-        //    same VA region.
+        // The unmap + munmap + free (host or PROT_NONE reservation share the
+        // same VA region) is the backend's job.
         let _ = host_ptr;
-        // SAFETY: gpu_addr is the VA returned by our own mmap.
-        unsafe { munmap(gpu_addr as *mut _, size) };
-        // 3. Free the KFD allocation.
-        let mut free_args = kfd::kfd_ioctl_free_memory_of_gpu_args { handle };
-        // SAFETY: same as above.
-        let _ = unsafe { ioctl::kfd_free_memory_of_gpu(device.kfd_fd.as_raw_fd(), &mut free_args as *mut _) };
+        device.core().iface().free_raw(gpu_addr, size, handle);
     }
 
     /// Drain all in-flight GPU work on this device. Without this override the
@@ -230,109 +190,31 @@ impl Allocator for AmdAllocator {
     }
 }
 
-/// Shared body for VRAM and GTT allocations. Differences (flag bits) are
-/// already encoded in `flags`; everything else (VA reservation, KFD alloc,
-/// host mmap, map_memory_to_gpu) is identical.
-fn do_alloc(dev: &Arc<AmdDevice>, size: usize, flags: u32, cpu_accessible: bool, zero_init: bool) -> Result<RawBuffer> {
-    // KFD VA reservation + map are page-granular; a 0-byte mmap is EINVAL.
-    let size = size.max(1).next_multiple_of(0x1000);
-    let va = reserve_va(size)?;
-    let mut args = kfd::kfd_ioctl_alloc_memory_of_gpu_args {
-        va_addr: va as u64,
-        size: size as u64,
-        gpu_id: dev.node.gpu_id,
-        flags,
-        ..Default::default()
-    };
-    if let Err(e) = unsafe { ioctl::kfd_alloc_memory_of_gpu(dev.kfd_fd.as_raw_fd(), &mut args as *mut _) } {
-        unsafe { munmap(va as *mut _, size) };
-        return Err(map_alloc_err(e, cpu_accessible));
-    }
-    let mem_handle = args.handle;
-    let mmap_offset = args.mmap_offset;
-
-    let host_ptr = if cpu_accessible {
-        let p = unsafe {
-            mmap(
-                va as *mut _,
-                size,
-                PROT_READ | PROT_WRITE,
-                MAP_SHARED | MAP_FIXED,
-                dev.drm_fd.as_raw_fd(),
-                mmap_offset as i64,
-            )
-        };
-        if p == libc::MAP_FAILED || !std::ptr::eq(p, va) {
-            free_kfd(dev, mem_handle);
-            unsafe { munmap(va as *mut _, size) };
-            return Err(Error::AmdAllocFailed {
-                reason: "host-visible mmap failed (enable resizable BAR for VRAM, or check GTT availability)".into(),
-            });
-        }
-        Some(unsafe { NonNull::new_unchecked(p as *mut u8) })
-    } else {
-        None
-    };
-
-    let mut gpu_id = dev.node.gpu_id;
-    let mut map_args = kfd::kfd_ioctl_map_memory_to_gpu_args {
-        handle: mem_handle,
-        device_ids_array_ptr: &mut gpu_id as *mut _ as u64,
-        n_devices: 1,
-        n_success: 0,
-    };
-    if let Err(e) = unsafe { ioctl::kfd_map_memory_to_gpu(dev.kfd_fd.as_raw_fd(), &mut map_args as *mut _) } {
-        free_kfd(dev, mem_handle);
-        unsafe { munmap(va as *mut _, size) };
-        return Err(Error::AmdIoctl { ioctl: "AMDKFD_IOC_MAP_MEMORY_TO_GPU", errno: e as i32 });
-    }
-    if map_args.n_success != 1 {
-        free_kfd(dev, mem_handle);
-        unsafe { munmap(va as *mut _, size) };
-        return Err(Error::AmdAllocFailed {
-            reason: format!("KFD map_memory_to_gpu reported {} success(es)", map_args.n_success),
-        });
-    }
-
-    if zero_init && let Some(p) = host_ptr {
-        unsafe { std::ptr::write_bytes(p.as_ptr(), 0, size) };
-    }
-
-    debug!(size, gpu_addr = va as u64, "AmdAllocator alloc done");
-
-    Ok(RawBuffer::AmdDevice { gpu_addr: va as u64, host_ptr, size, handle: mem_handle, device: Arc::clone(dev) })
-}
-
-/// Reserve `size` bytes of host VA so KFD can bind VRAM into it.
-fn reserve_va(size: usize) -> Result<*mut libc::c_void> {
-    // SAFETY: standard libc::mmap signature; no aliasing concerns at this point.
-    let p = unsafe { mmap(std::ptr::null_mut(), size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0) };
-    if p == libc::MAP_FAILED {
-        let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
-        return Err(Error::AmdAllocFailed { reason: format!("VA reservation mmap failed (errno {errno})") });
-    }
-    Ok(p)
-}
-
-fn free_kfd(dev: &AmdDevice, handle: u64) {
-    let mut args = kfd::kfd_ioctl_free_memory_of_gpu_args { handle };
-    // SAFETY: dev.kfd_fd is alive; handle is from a successful alloc.
-    let _ = unsafe { ioctl::kfd_free_memory_of_gpu(dev.kfd_fd.as_raw_fd(), &mut args as *mut _) };
-}
-
-fn map_alloc_err(e: nix::errno::Errno, cpu_accessible: bool) -> Error {
-    match e {
-        nix::errno::Errno::ENOMEM => Error::AmdAllocFailed { reason: "ENOMEM (VRAM exhausted)".into() },
-        nix::errno::Errno::EINVAL if cpu_accessible => {
-            Error::AmdAllocFailed { reason: "EINVAL on host-visible VRAM alloc — enable resizable BAR".into() }
-        }
-        other => Error::AmdIoctl { ioctl: "AMDKFD_IOC_ALLOC_MEMORY_OF_GPU", errno: other as i32 },
-    }
+/// Shared body for VRAM and GTT allocations. The KFD ioctls (VA reservation,
+/// alloc, host mmap, map_memory_to_gpu) live behind the backend seam; this just
+/// attaches the owning `AmdDevice` to the result so `RawBuffer::AmdDevice` can
+/// keep the KFD/DRM fds alive for the buffer's lifetime.
+fn do_alloc(
+    dev: &Arc<AmdDevice>,
+    size: usize,
+    kind: AllocKind,
+    cpu_accessible: bool,
+    zero_init: bool,
+) -> Result<RawBuffer> {
+    let r = dev.core().iface().alloc_raw(size, kind, cpu_accessible, zero_init)?;
+    Ok(RawBuffer::AmdDevice {
+        gpu_addr: r.gpu_va,
+        host_ptr: r.host_ptr,
+        size: r.size,
+        handle: r.handle,
+        device: Arc::clone(dev),
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::Error;
 
     /// Construction either succeeds (real hardware + supported arch) or
     /// returns a clean error variant; never panics.
