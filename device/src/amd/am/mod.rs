@@ -7,7 +7,9 @@
 //! ring setup) — and the `AmIface` implementor that ties them to the
 //! [`crate::amd::iface::AmdIface`] seam — land incrementally once a
 //! root-capable environment is available (AM unbinds amdgpu + mmaps the BARs,
-//! which needs `cap_sys_rawio`/root).
+//! which needs `cap_sys_rawio`/root). The whole module compiles unconditionally
+//! on Linux (pure logic, no extra deps); the AM backend is selected at runtime
+//! via `SVOD_AMD_BACKEND=am`, not at compile time.
 //!
 //! Arch parametrization is data-driven: register tables keyed by the `ip_ver`
 //! tuples read from IP discovery, with the gfx11/gfx12/gfx9 deltas as small
