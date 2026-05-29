@@ -43,5 +43,5 @@ pub use program::AmdProgram;
 #[cfg(target_os = "linux")]
 pub use queue::{AmdComputeQueue, AmdCopyQueue};
 #[cfg(target_os = "linux")]
-pub use signal::{AmdSignal, SignalPool};
+pub use signal::{AmdSignal, SignalPool, Timeline};
 pub use topology::{AmdNode, enumerate};

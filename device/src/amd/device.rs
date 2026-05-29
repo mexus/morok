@@ -121,14 +121,15 @@ pub struct AmdDeviceCore {
     /// device because a memory fault corrupts the whole VM, not just one queue.
     poisoned: AtomicBool,
     error_msg: OnceLock<String>,
-    /// Registry of every `AmdConnector` built against this core. Weak so
-    /// dropped connectors don't keep timelines alive. Used by
+    /// Registry of every connector's `Timeline` built against this core. Weak
+    /// so dropped connectors don't keep timelines alive. Used by
     /// [`AmdDeviceCore::synchronize_all`] to drain ALL in-flight GPU work
     /// before destructive host-visible operations
-    /// (`AmdAllocator::_copyin`/`_copyout`/`_free`). Each connector has its
-    /// own timeline signal — without iterating them, a copy-back from a buffer
-    /// written by a per-plan/per-graph connector races the dispatch.
-    pub(crate) connectors: parking_lot::Mutex<Vec<Weak<crate::amd::connector::AmdConnector>>>,
+    /// (`AmdAllocator::_copyin`/`_copyout`/`_free`). Holding `Weak<Timeline>`
+    /// (not `Weak<AmdConnector>`) means the drainer reads only the timeline
+    /// atomic + signal slot and NEVER touches a connector's queue — that
+    /// decoupling is what lets dispatch run lock-free.
+    pub(crate) timelines: parking_lot::Mutex<Vec<Weak<crate::amd::signal::Timeline>>>,
     /// Process-global signal pool, allocated once per physical device. Lazily
     /// installed by the device factory and shared across every `AmdConnector`
     /// (timeline signal acquired here at connector construction) — pool access
@@ -315,7 +316,7 @@ impl AmdDevice {
             has_sdma_queue: AtomicBool::new(false),
             poisoned: AtomicBool::new(false),
             error_msg: OnceLock::new(),
-            connectors: parking_lot::Mutex::new(Vec::new()),
+            timelines: parking_lot::Mutex::new(Vec::new()),
             signal_pool: OnceLock::new(),
             connector_pool: parking_lot::Mutex::new(Vec::new()),
         });
@@ -342,33 +343,38 @@ impl AmdDevice {
 }
 
 impl AmdDeviceCore {
-    /// Drain every connector currently backed by this core. Iterates the
-    /// `connectors` registry (Weak refs), upgrades each, and synchronises in
-    /// turn. Cheap when no per-owner connectors exist (the default connector
-    /// is registered the same way). Fast on idle connectors — each is a
-    /// no-op when its timeline is at value 0.
+    /// Drain every connector backed by this core — the per-VM fence before any
+    /// destructive host-visible op (`AmdAllocator::_copyin`/`_copyout`/`_free`).
+    /// Iterates the `timelines` registry and drains each via `Timeline::drain`,
+    /// which reads only the timeline atomic + signal slot — it NEVER touches a
+    /// connector's queue, so a concurrent owner can keep dispatching lock-free
+    /// while this runs. A freed/read buffer has no live handle, so the owner
+    /// can't add new work referencing it; draining each timeline to its current
+    /// value fences all in-flight readers. Fast on idle timelines (target 0).
     pub fn synchronize_all(&self) -> Result<()> {
-        // Snapshot strong refs to release the registry lock before doing
-        // potentially multi-second waits. The snapshot also keeps every
-        // connector alive until we've drained it, so a concurrent drop
-        // can't pull the rug out mid-iteration.
-        let live: Vec<Arc<crate::amd::connector::AmdConnector>> =
-            self.connectors.lock().iter().filter_map(|w| w.upgrade()).collect();
-        // Drain every connector; collect the first error but keep going so
-        // a single stuck connector doesn't strand buffer-frees on the others.
+        if let Some(err) = self.poison_error() {
+            return Err(err);
+        }
+        // Snapshot strong refs to release the registry lock before the
+        // potentially multi-second waits, keeping each timeline alive across
+        // its drain so a concurrent connector drop can't pull the rug out.
+        let live: Vec<Arc<crate::amd::signal::Timeline>> =
+            self.timelines.lock().iter().filter_map(|w| w.upgrade()).collect();
+        // Drain every timeline; collect the first error but keep going so a
+        // single stuck connector doesn't strand buffer-frees on the others.
         let mut first_err: Option<Error> = None;
-        for c in live {
-            if let Err(e) = c.synchronize() {
-                tracing::warn!(?e, "synchronize_all: connector drain failed; continuing");
+        for t in live {
+            if let Err(e) = t.drain(30_000) {
+                tracing::warn!(?e, "synchronize_all: timeline drain failed; continuing");
+                self.poison(&e.to_string());
                 if first_err.is_none() {
                     first_err = Some(e);
                 }
             }
         }
-        // Opportunistic GC of `Drop`ped connector entries. The registry is
-        // touched here on every host read/free, so dead Weaks don't
-        // accumulate indefinitely between connector-creation events.
-        self.connectors.lock().retain(|w| w.strong_count() > 0);
+        // Opportunistic GC of dropped timeline entries. The registry is touched
+        // here on every host read/free, so dead Weaks don't accumulate.
+        self.timelines.lock().retain(|w| w.strong_count() > 0);
         match first_err {
             Some(e) => Err(e),
             None => Ok(()),

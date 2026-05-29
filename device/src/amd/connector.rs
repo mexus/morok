@@ -26,8 +26,6 @@
 
 use std::os::fd::AsRawFd;
 use std::sync::Arc;
-use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use parking_lot::Mutex;
 
@@ -35,15 +33,9 @@ use crate::amd::AmdAllocator;
 use crate::amd::device::{AmdDeviceCore, ScratchState, alloc_scratch};
 use crate::amd::kernarg::KernargArena;
 use crate::amd::queue::AmdComputeQueue;
-use crate::amd::signal::AmdSignal;
+use crate::amd::signal::{AmdSignal, Timeline, TIMELINE_WRAP_WATERMARK};
 use crate::amd::sys::{ioctl, kfd};
 use crate::error::{Error, Result};
-use crate::sync::TimelineSignal;
-
-/// Timeline counter watermark for the 2^32 wraparound. PM4
-/// WAIT_REG_MEM/RELEASE_MEM compare the low 32 bits of the signal slot, so the
-/// counter must stay below 2^32; we drain + reset at 2^31 to keep headroom.
-const TIMELINE_WRAP_WATERMARK: u64 = 1 << 31;
 
 /// Per-owner dispatch state. One per `ExecutionPlan`, one per `AmdGraph`,
 /// plus one default per `AmdDevice` for trait-fallback callers (the rest of
@@ -74,15 +66,13 @@ pub struct AmdConnector {
     /// `AmdDevice::scratch_state`; see that field's docstring for the
     /// `_ensure_has_local_memory` story (`ops_amd.py:1065-1081`).
     scratch_state: Mutex<ScratchState>,
-    /// Per-connector timeline signal. Every kernel/copy submitted via this
-    /// connector waits on the previous timeline value and signals the next
-    /// one. Acquired from the core's shared `SignalPool` at construction.
-    /// Mirrors `HCQCompiled.timeline_signal` (`hcq.py:415`).
-    timeline_signal: OnceLock<Arc<AmdSignal>>,
-    /// Highest timeline value submitted through this connector. Reserved by
-    /// `next_timeline()` via `fetch_add(1)`. Mirrors `timeline_value`
-    /// (`hcq.py:405`).
-    timeline_value: AtomicU64,
+    /// Per-connector timeline: monotonic counter + the shared completion signal
+    /// the GPU writes on dispatch. `Arc` because it is ALSO registered in the
+    /// core (`Weak<Timeline>`) so `synchronize_all` can drain this connector's
+    /// in-flight work WITHOUT touching its queue — the decoupling that keeps
+    /// dispatch lock-free. Mirrors `HCQCompiled.timeline_signal/value`
+    /// (`hcq.py:405,415`).
+    timeline: Arc<Timeline>,
 }
 
 impl AmdConnector {
@@ -117,9 +107,18 @@ impl AmdConnector {
                       install via AmdDeviceCore::install_signal_pool before building any connector"
                 .into(),
         })?;
-        let timeline_sig = Arc::new(pool.acquire()?);
+        let timeline = Timeline::new(Arc::new(pool.acquire()?));
         let (scratch_va, scratch_size, tmpring_size, size_per_thread, scratch_handle) =
             alloc_scratch(&core.kfd_fd, &core.node, &core.arch, 128)?;
+        // Register the TIMELINE (not the connector) in the core so
+        // `synchronize_all` can drain this connector's in-flight work via the
+        // shared signal — without ever touching its queue. Opportunistic GC of
+        // dropped entries.
+        {
+            let mut list = core.timelines.lock();
+            list.retain(|w| w.strong_count() > 0);
+            list.push(Arc::downgrade(&timeline));
+        }
         let conn = Arc::new(Self {
             core,
             queue,
@@ -131,19 +130,8 @@ impl AmdConnector {
                 handle: scratch_handle,
                 size: scratch_size,
             }),
-            timeline_signal: OnceLock::new(),
-            timeline_value: AtomicU64::new(1),
+            timeline,
         });
-        let _ = conn.timeline_signal.set(timeline_sig);
-        // Register with the core so `synchronize_all` finds us. Opportunistic
-        // GC: drop entries whose connector has already been dropped — this is
-        // also what bounds the live KFD queue count (Drop returns the id via
-        // `AmdComputeQueue::Drop`), so the previous >32 soft-warn is moot.
-        {
-            let mut list = conn.core.connectors.lock();
-            list.retain(|w| w.strong_count() > 0);
-            list.push(Arc::downgrade(&conn));
-        }
         Ok(conn)
     }
 
@@ -165,23 +153,23 @@ impl AmdConnector {
         &self.core
     }
 
-    /// Connector timeline signal (always installed by `new_with_resources`).
+    /// Connector timeline signal (forwards to the shared `Timeline`).
     pub fn timeline_signal(&self) -> &Arc<AmdSignal> {
-        self.timeline_signal.get().expect("timeline_signal must be set by new_with_resources")
+        self.timeline.signal()
     }
 
     /// Reserve the next timeline value (`fetch_add(1)`). The caller emits a
     /// queue signal packet that writes this value to the connector's signal
     /// slot. Mirrors `HCQCompiled.next_timeline` (`hcq.py:447`).
     pub fn next_timeline(&self) -> u64 {
-        self.timeline_value.fetch_add(1, Ordering::AcqRel)
+        self.timeline.next()
     }
 
     /// Highest submitted timeline value (i.e. the value the next `signal`
     /// packet would write). `synchronize` waits until the GPU has written
     /// `value - 1`.
     pub fn timeline_value(&self) -> u64 {
-        self.timeline_value.load(Ordering::Acquire)
+        self.timeline.current()
     }
 
     /// Current scratch buffer GPU VA. Read under the scratch mutex; tiny
@@ -195,30 +183,15 @@ impl AmdConnector {
         self.scratch_state.lock().tmpring_size
     }
 
-    /// Drain all submitted GPU work on this connector. Blocks until the
-    /// connector's timeline signal observes `timeline_value() - 1`.
+    /// Drain all submitted GPU work on this connector. Blocks until the shared
+    /// timeline signal observes `timeline_value() - 1`, then wrap-resets. The
+    /// actual wait lives on `Timeline::drain` (touches only the atomic + signal
+    /// slot); this just adds the fast-fail poison gate and poison-on-failure.
     pub fn synchronize(&self) -> Result<()> {
         if let Some(err) = self.core.poison_error() {
             return Err(err);
         }
-        // `new_with_resources` installs the timeline signal before returning,
-        // so by the time any caller can reach `synchronize` it is set.
-        let signal = self.timeline_signal.get().expect("timeline signal installed by new_with_resources");
-        let target = self.timeline_value.load(Ordering::Acquire).saturating_sub(1);
-        if target == 0 {
-            return Ok(());
-        }
-        signal.wait_signal_value(target, 30_000).inspect_err(|e| self.core.poison(&e.to_string()))?;
-
-        // Timeline wraparound (`hcq.py:442,480`). PM4 WAIT_REG_MEM / RELEASE_MEM
-        // compare the *low 32 bits* of the signal, so the counter must stay
-        // below 2^32. We've just drained to `target` (GPU idle), so it's safe
-        // to reset the signal slot to 0 and restart the counter at 1.
-        if self.timeline_value.load(Ordering::Acquire) > TIMELINE_WRAP_WATERMARK {
-            signal.set(0);
-            self.timeline_value.store(1, Ordering::Release);
-        }
-        Ok(())
+        self.timeline.drain(30_000).inspect_err(|e| self.core.poison(&e.to_string()))
     }
 
     /// Keep the timeline counter below 2^32 on the dispatch hot path.
@@ -234,7 +207,7 @@ impl AmdConnector {
     /// Single-owner → sequential, so the check + drain can't race a dispatcher.
     /// Amortised cost is one drain per ~2^31 dispatches.
     pub fn ensure_timeline_headroom(&self) -> Result<()> {
-        if self.timeline_value.load(Ordering::Acquire) > TIMELINE_WRAP_WATERMARK {
+        if self.timeline.current() > TIMELINE_WRAP_WATERMARK {
             self.synchronize()?;
         }
         Ok(())
@@ -341,8 +314,8 @@ impl Drop for AmdConnector {
 /// CUDA stream pool); the KFD compute queue is a scarce hardware resource
 /// (~24/process on CDNA), so it is reused, never created per dispatch.
 ///
-/// No synchronize on drop: a returned connector stays registered in
-/// `core.connectors`, so `synchronize_all` (the copyout/free fence) still
+/// No synchronize on drop: the connector's `Timeline` stays registered in
+/// `core.timelines`, so `synchronize_all` (the copyout/free fence) still
 /// drains it, and the next lessee's first dispatch waits on this connector's
 /// own timeline. Panic-drop inherits `AmdConnector::Drop`'s skip.
 pub struct ConnectorLease {

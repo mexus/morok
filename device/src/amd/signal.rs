@@ -197,6 +197,77 @@ impl Drop for AmdSignal {
     }
 }
 
+/// Watermark for the 2^32 timeline wraparound. PM4 WAIT_REG_MEM/RELEASE_MEM
+/// compare the low 32 bits of the signal slot, so the counter must stay below
+/// 2^32; we drain + reset at 2^31 to keep headroom.
+pub const TIMELINE_WRAP_WATERMARK: u64 = 1 << 31;
+
+/// A connector's timeline: an owned monotonic counter plus the shared signal
+/// the GPU writes on dispatch completion. This is the ONE primitive that
+/// crosses owners — a connector dispatches against it (advancing `value`), and
+/// any thread can *drain* it (read `value`, poll the signal slot) without ever
+/// touching the connector's queue. The registry on `AmdDeviceCore` holds
+/// `Weak<Timeline>` (not `Weak<AmdConnector>`), so `synchronize_all` fences
+/// in-flight work purely through these atomics — keeping dispatch lock-free.
+#[derive(Debug)]
+pub struct Timeline {
+    signal: Arc<AmdSignal>,
+    /// Highest reserved value + ... i.e. the next value `next()` hands out.
+    /// Starts at 1; the value a dispatch SIGNALS is `next()`'s return.
+    value: AtomicU64,
+}
+
+impl Timeline {
+    pub fn new(signal: Arc<AmdSignal>) -> Arc<Self> {
+        Arc::new(Self { signal, value: AtomicU64::new(1) })
+    }
+
+    /// The shared completion signal (for emitting wait/signal packets).
+    #[inline]
+    pub fn signal(&self) -> &Arc<AmdSignal> {
+        &self.signal
+    }
+
+    /// GPU VA of the signal counter — what PM4/AQL wait/signal packets target.
+    #[inline]
+    pub fn value_addr(&self) -> u64 {
+        self.signal.value_addr()
+    }
+
+    /// Reserve the next timeline value (`fetch_add(1)`); the caller emits a
+    /// signal packet writing this value on completion.
+    #[inline]
+    pub fn next(&self) -> u64 {
+        self.value.fetch_add(1, Ordering::AcqRel)
+    }
+
+    /// Highest value reserved so far (the value the next `signal` packet writes
+    /// is `current()`; the last reserved is `current() - 1`).
+    #[inline]
+    pub fn current(&self) -> u64 {
+        self.value.load(Ordering::Acquire)
+    }
+
+    /// Block until the GPU has written `current() - 1` (all submitted work
+    /// drained), then wrap-reset if past the watermark. Touches only the
+    /// atomic + the signal's host slot — never a queue. The owner is the sole
+    /// writer of `value`, so a concurrent drainer reading it is race-free.
+    pub fn drain(&self, timeout_ms: u64) -> Result<()> {
+        let target = self.value.load(Ordering::Acquire).saturating_sub(1);
+        if target == 0 {
+            return Ok(());
+        }
+        self.signal.wait_signal_value(target, timeout_ms)?;
+        // Wraparound (`hcq.py:442,480`): we've drained to `target` (GPU idle),
+        // so it's safe to reset the slot to 0 and restart the counter at 1.
+        if self.value.load(Ordering::Acquire) > TIMELINE_WRAP_WATERMARK {
+            self.signal.set(0);
+            self.value.store(1, Ordering::Release);
+        }
+        Ok(())
+    }
+}
+
 impl TimelineSignal for AmdSignal {
     fn as_any(&self) -> &dyn Any {
         self
