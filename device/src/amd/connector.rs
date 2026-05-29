@@ -325,14 +325,13 @@ impl Drop for AmdConnector {
 /// drains it, and the next lessee's first dispatch waits on this connector's
 /// own timeline. Panic-drop inherits `AmdConnector::Drop`'s skip.
 pub struct ConnectorLease {
-    /// `Some` while leased; `None` after `Drop` has handed it back.
-    conn: Option<Arc<AmdConnector>>,
+    conn: Arc<AmdConnector>,
     core: Arc<AmdDeviceCore>,
 }
 
 impl ConnectorLease {
     pub(crate) fn new(conn: Arc<AmdConnector>, core: Arc<AmdDeviceCore>) -> Self {
-        Self { conn: Some(conn), core }
+        Self { conn, core }
     }
 }
 
@@ -340,7 +339,7 @@ impl std::ops::Deref for ConnectorLease {
     type Target = AmdConnector;
     #[inline]
     fn deref(&self) -> &AmdConnector {
-        self.conn.as_ref().expect("ConnectorLease dereferenced after drop")
+        &self.conn
     }
 }
 
@@ -352,10 +351,10 @@ impl std::fmt::Debug for ConnectorLease {
 
 impl Drop for ConnectorLease {
     fn drop(&mut self) {
-        // The core's `Dispatcher` decides what return means: pool it
-        // (multi-queue) or drop the shared-connector clone (single-queue).
-        if let Some(conn) = self.conn.take() {
-            self.core.return_connector(conn);
-        }
+        // The core's `Dispatcher` decides what return means: re-pool it
+        // (multi-queue, cloning only when it actually pools) or nothing
+        // (single-queue — the shared connector lives on the core). Either way
+        // this lease's `Arc` clone drops at scope end.
+        self.core.return_connector(&self.conn);
     }
 }

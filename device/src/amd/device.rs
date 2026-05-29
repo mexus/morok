@@ -19,7 +19,7 @@ use std::sync::{Arc, OnceLock, Weak};
 
 use nix::fcntl::{OFlag, open};
 use nix::sys::stat::Mode;
-use once_cell::sync::Lazy;
+use once_cell::sync::{Lazy, OnceCell};
 use parking_lot::Mutex;
 use svod_dtype::AmdArch;
 use tracing::debug;
@@ -152,10 +152,7 @@ enum Dispatcher {
     /// `AmdConnector::ensure_has_local_memory` — so there is no reentrant
     /// deadlock. Returning a lease is a no-op: the shared connector lives in
     /// `shared`, and a dropped lease just decrements its `Arc` refcount.
-    SingleQueue {
-        shared: parking_lot::Mutex<Option<Arc<crate::amd::connector::AmdConnector>>>,
-        lock: parking_lot::Mutex<()>,
-    },
+    SingleQueue { shared: OnceCell<Arc<crate::amd::connector::AmdConnector>>, lock: parking_lot::Mutex<()> },
 }
 
 /// Max idle connectors retained per physical AMD:N. Each pooled connector
@@ -256,7 +253,7 @@ impl AmdDevice {
         // KFD-safe single-queue is the default; SVOD_AMD_SINGLE_QUEUE=0 opts into
         // lock-free multi-queue. See `Dispatcher`.
         let dispatcher = if std::env::var("SVOD_AMD_SINGLE_QUEUE").ok().map(|s| s != "0").unwrap_or(true) {
-            Dispatcher::SingleQueue { shared: parking_lot::Mutex::new(None), lock: parking_lot::Mutex::new(()) }
+            Dispatcher::SingleQueue { shared: OnceCell::new(), lock: parking_lot::Mutex::new(()) }
         } else {
             Dispatcher::MultiQueue { pool: parking_lot::Mutex::new(Vec::new()) }
         };
@@ -380,17 +377,12 @@ impl AmdDeviceCore {
         allocator: &crate::amd::AmdAllocator,
     ) -> Result<crate::amd::connector::ConnectorLease> {
         let conn = match &self.dispatcher {
-            Dispatcher::SingleQueue { shared, .. } => {
-                let mut slot = shared.lock();
-                match slot.as_ref() {
-                    Some(c) => Arc::clone(c),
-                    None => {
-                        let c = crate::amd::connector::AmdConnector::new_with_resources(Arc::clone(self), allocator)?;
-                        *slot = Some(Arc::clone(&c));
-                        c
-                    }
-                }
-            }
+            // Build the one shared connector on first lease, reuse thereafter.
+            Dispatcher::SingleQueue { shared, .. } => shared
+                .get_or_try_init(|| {
+                    crate::amd::connector::AmdConnector::new_with_resources(Arc::clone(self), allocator)
+                })
+                .map(Arc::clone)?,
             Dispatcher::MultiQueue { pool } => match pool.lock().pop() {
                 Some(c) => c,
                 None => crate::amd::connector::AmdConnector::new_with_resources(Arc::clone(self), allocator)?,
@@ -399,20 +391,18 @@ impl AmdDeviceCore {
         Ok(crate::amd::connector::ConnectorLease::new(conn, Arc::clone(self)))
     }
 
-    /// Return a connector when its lease drops. Multi-queue: back to the idle
-    /// pool, or dropped if at [`CONNECTOR_POOL_CAP`] (`AmdComputeQueue::Drop`
-    /// destroys the KFD queue). Single-queue: a no-op — the shared connector
-    /// lives in the `Dispatcher`, and this dropped `Arc` clone just decrements
-    /// the refcount.
-    pub(crate) fn return_connector(&self, conn: Arc<crate::amd::connector::AmdConnector>) {
+    /// Return a connector when its lease drops. Multi-queue: clone it back into
+    /// the idle pool, unless at [`CONNECTOR_POOL_CAP`] (then the lease's `Arc`
+    /// drops → `AmdComputeQueue::Drop` destroys the KFD queue). Single-queue: a
+    /// no-op — the shared connector lives in the `Dispatcher`; the lease's `Arc`
+    /// clone just decrements the refcount when it drops.
+    pub(crate) fn return_connector(&self, conn: &Arc<crate::amd::connector::AmdConnector>) {
         if let Dispatcher::MultiQueue { pool } = &self.dispatcher {
             let mut pool = pool.lock();
             if pool.len() < CONNECTOR_POOL_CAP {
-                pool.push(conn);
+                pool.push(Arc::clone(conn));
             }
-            // else: conn dropped at scope end → cleanup runs.
         }
-        // SingleQueue: drop the clone; the canonical connector stays in `shared`.
     }
 
     /// Install the signal pool. Called once per physical device by the
