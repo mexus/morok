@@ -380,10 +380,7 @@ impl ExecutionPlan {
     /// own KFD ring + kernarg arena + scratch + timeline; cross-plan
     /// dispatches run on isolated rings.
     #[cfg(target_os = "linux")]
-    fn amd_connector_for(
-        &self,
-        prog: &svod_device::amd::AmdProgram,
-    ) -> Result<&svod_device::amd::ConnectorLease> {
+    fn amd_connector_for(&self, prog: &svod_device::amd::AmdProgram) -> Result<&svod_device::amd::ConnectorLease> {
         if let Some(lease) = self.amd_connector.get() {
             return Ok(lease);
         }

@@ -733,13 +733,14 @@ impl Program for AmdProgram {
         wait: bool,
     ) -> Result<()> {
         // Fallback path for callers that don't supply a connector (e.g.
-        // `benchmark_kernel` during BEAM). Lease an exclusive connector from
-        // the device pool for the duration of this call, ensure its scratch,
-        // dispatch, then drop the lease (returns it to the pool). Each call
-        // gets its own connector, so concurrent/orphaned BEAM workers can't
-        // race a shared queue. `ExecutionPlan` and `AmdGraph` bypass this by
-        // downcasting via `as_any()` and calling `execute_on` with a connector
-        // they hold for their own lifetime.
+        // `benchmark_kernel` during BEAM). Lease a connector, ensure its
+        // scratch, dispatch, then drop the lease. In multi-queue mode the lease
+        // is exclusive (its own KFD queue, pooled on drop) so concurrent BEAM
+        // workers can't race a shared queue; in single-queue mode every lease
+        // aliases the one device connector and `exec_guard` serializes the
+        // dispatch + scratch realloc instead. `ExecutionPlan` and `AmdGraph`
+        // bypass this by downcasting via `as_any()` and calling `execute_on`
+        // with a connector they hold for their own lifetime.
         let alloc = crate::amd::AmdAllocator::new(self.device_id)?;
         let lease = self.dev.core().lease_connector(&alloc)?;
         lease.ensure_has_local_memory(self.kd.private_segment_fixed_size)?;

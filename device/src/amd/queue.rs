@@ -485,9 +485,15 @@ impl AmdComputeQueue {
             self.core.node.gpu_id,
             conn.core().node.gpu_id,
         );
+        // Single-queue mode: serialize the whole dispatch (headroom waits +
+        // timeline reservation + ring write + doorbell) against other owners
+        // sharing this connector. A no-op in multi-queue mode (exclusive
+        // ownership → `exec_guard` returns `None`). Held for the method body so
+        // the timeline state and ring stay consistent across the back-pressure
+        // and wrap waits.
+        let _dispatch_guard = self.core.exec_guard();
         // Keep the timeline < 2^32 (drain+reset at the watermark) before
-        // reserving this dispatch's value — done outside the queue lock since
-        // it may block on a drain.
+        // reserving this dispatch's value.
         conn.ensure_timeline_headroom()?;
         // Ring back-pressure: block if too many dispatches are in flight, so an
         // async (`wait=false`) burst can't lap the ring. Outside the lock.
@@ -564,9 +570,15 @@ impl AmdComputeQueue {
         if let Some(err) = self.core.poison_error() {
             return Err(err);
         }
+        // Single-queue serialization (cf. dispatch_pm4); no-op in multi-queue.
+        // The graph factory falls back to per-call dispatch in single-queue
+        // mode, so this guard is defensive — it keeps `submit_dwords` correct
+        // if a shared connector ever drives a captured chain.
+        let _dispatch_guard = self.core.exec_guard();
         // No `Release` fence here — `ring_doorbell` already issues its own
-        // publication barrier and the connector is a single owner.
-        // SAFETY: single-owner invariant (see struct doc) — exclusive, no lock.
+        // publication barrier.
+        // SAFETY: exclusive access — single-owner in multi-queue mode, or held
+        // under `exec_guard` in single-queue mode (see struct doc).
         let g = unsafe { self.inner_mut() };
         g.push_pm4(dwords);
         g.ring_doorbell(/*is_pm4=*/ true);
@@ -586,6 +598,8 @@ impl AmdComputeQueue {
             conn.core().node.gpu_id,
         );
         debug_assert_eq!(size_of::<HsaKernelDispatchPacket>(), AQL_PACKET_BYTES);
+        // Single-queue serialization (cf. dispatch_pm4); no-op in multi-queue.
+        let _dispatch_guard = self.core.exec_guard();
         // Keep the timeline < 2^32 (cf. dispatch_pm4) before reserving.
         conn.ensure_timeline_headroom()?;
         // Ring back-pressure (cf. dispatch_pm4).

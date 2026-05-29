@@ -160,6 +160,14 @@ impl AmdGraph {
         if let Some(err) = dev.core().poison_error() {
             return Err(err);
         }
+        // KFD-safe single-queue mode shares ONE connector per device and
+        // serializes per-call dispatch via `exec_guard`. A captured graph keeps
+        // its own connector + ring (replayed with a single doorbell), which that
+        // serialization doesn't cover — so fall back to per-call dispatch, which
+        // IS serialized. Graph capture resumes when `SVOD_AMD_SINGLE_QUEUE=0`.
+        if dev.core().is_single_queue() {
+            return Ok(None);
+        }
         // Probe pm4-ness from the device topology BEFORE allocating a
         // per-graph connector — on multi-XCC CDNA the graph path is
         // unsupported (AQL) and we should bail without burning ~50 MiB of

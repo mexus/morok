@@ -144,6 +144,28 @@ pub struct AmdDeviceCore {
     /// Over-cap connectors drop normally (KFD queue destroyed via
     /// `AmdComputeQueue::Drop`).
     connector_pool: parking_lot::Mutex<Vec<Arc<crate::amd::connector::AmdConnector>>>,
+    /// KFD-safe single-queue mode (default ON; `SVOD_AMD_SINGLE_QUEUE=0` opts
+    /// out). When `true`, every owner shares ONE connector per physical device
+    /// and dispatch is serialized behind [`dispatch_lock`](Self::dispatch_lock)
+    /// — tinygrad's model, where the kernel only ever sees one compute queue
+    /// per GPU. The lock-free per-owner multi-queue path drives KFD's MES/
+    /// runlist scheduler into a state that crashes amdgpu under load; serializing
+    /// onto one queue sidesteps it until the userspace AM driver bypasses the
+    /// kernel entirely. Read once at open.
+    single_queue: bool,
+    /// Serializes dispatch + scratch-realloc against the shared connector in
+    /// single-queue mode. Taken by `dispatch_pm4`/`dispatch_aql`/`submit_dwords`
+    /// and the realloc branch of `AmdConnector::ensure_has_local_memory` — two
+    /// *non-nested* critical sections (scratch-ensure and dispatch are separate
+    /// calls in `execute_on`'s caller), so no reentrant deadlock. A no-op in
+    /// multi-queue mode: each connector is exclusively owned, so
+    /// [`exec_guard`](Self::exec_guard) returns `None` and dispatch stays
+    /// lock-free.
+    dispatch_lock: parking_lot::Mutex<()>,
+    /// The one shared connector for single-queue mode — built on first lease,
+    /// reused for the device's lifetime, never pooled/destroyed per lease.
+    /// `None` in multi-queue mode (the `connector_pool` is used instead).
+    shared_connector: parking_lot::Mutex<Option<Arc<crate::amd::connector::AmdConnector>>>,
 }
 
 /// Max idle connectors retained per physical AMD:N. Each pooled connector
@@ -300,6 +322,9 @@ impl AmdDevice {
             "AmdDevice opened"
         );
 
+        // KFD-safe single-queue mode (default ON). See `AmdDeviceCore::single_queue`.
+        let single_queue = std::env::var("SVOD_AMD_SINGLE_QUEUE").ok().map(|s| s != "0").unwrap_or(true);
+
         let core = Arc::new(AmdDeviceCore {
             node,
             arch,
@@ -319,6 +344,9 @@ impl AmdDevice {
             timelines: parking_lot::Mutex::new(Vec::new()),
             signal_pool: OnceLock::new(),
             connector_pool: parking_lot::Mutex::new(Vec::new()),
+            single_queue,
+            dispatch_lock: parking_lot::Mutex::new(()),
+            shared_connector: parking_lot::Mutex::new(None),
         });
         Ok(Arc::new(Self { core }))
     }
@@ -388,22 +416,58 @@ impl AmdDeviceCore {
         self.signal_pool.get()
     }
 
-    /// Lease an `AmdConnector` for this core — reuse an idle one from the pool
-    /// if available, otherwise build fresh via
-    /// `AmdConnector::new_with_resources`. The returned
-    /// [`ConnectorLease`](crate::amd::connector::ConnectorLease) returns the
-    /// connector to the pool on drop, so a long-running BEAM workload
-    /// amortises ~50 MiB of KFD queue setup across candidates instead of
-    /// paying it per dispatch — and the lease being exclusive + un-aliasable
-    /// is what stops two dispatchers from sharing one KFD queue.
+    /// Whether this device runs in KFD-safe single-queue mode (see
+    /// [`single_queue`](AmdDeviceCore::single_queue)). The graph factory checks
+    /// this to fall back to per-call dispatch — the captured-replay path keeps
+    /// its own connector/ring, which single-queue serialization doesn't cover.
+    #[inline]
+    pub fn is_single_queue(&self) -> bool {
+        self.single_queue
+    }
+
+    /// Acquire the dispatch lock in single-queue mode; `None` otherwise. Held
+    /// by the dispatch methods and the scratch-realloc path so the shared
+    /// connector's ring/timeline/scratch are mutated by one thread at a time.
+    /// In multi-queue mode each connector is exclusively owned, so this returns
+    /// `None` and dispatch stays lock-free.
+    #[inline]
+    pub(crate) fn exec_guard(&self) -> Option<parking_lot::MutexGuard<'_, ()>> {
+        self.single_queue.then(|| self.dispatch_lock.lock())
+    }
+
+    /// Lease an `AmdConnector` for this core.
     ///
-    /// Pool-empty builds a fresh connector; if the per-process KFD
+    /// **Single-queue mode (default):** every owner shares ONE connector per
+    /// physical device — built on the first lease, reused for the device's
+    /// lifetime. The returned [`ConnectorLease`](crate::amd::connector::ConnectorLease)
+    /// is *non-owning*: dropping it never pools/destroys the shared connector.
+    /// Concurrent dispatchers are serialized via [`exec_guard`](Self::exec_guard),
+    /// so the kernel only ever sees one compute queue per GPU.
+    ///
+    /// **Multi-queue mode (`SVOD_AMD_SINGLE_QUEUE=0`):** reuse an idle connector
+    /// from the pool if available, otherwise build fresh. The lease returns the
+    /// connector to the pool on drop, so a long-running BEAM workload amortises
+    /// ~50 MiB of KFD queue setup across candidates — and the lease being
+    /// exclusive + un-aliasable is what stops two dispatchers from sharing one
+    /// KFD queue. Pool-empty builds a fresh connector; if the per-process KFD
     /// compute-queue budget is exhausted the underlying `create_queue` ioctl
     /// errors and that propagates to the caller (BEAM drops the candidate).
     pub fn lease_connector(
         self: &Arc<Self>,
         allocator: &crate::amd::AmdAllocator,
     ) -> Result<crate::amd::connector::ConnectorLease> {
+        if self.single_queue {
+            let mut slot = self.shared_connector.lock();
+            let conn = match slot.as_ref() {
+                Some(c) => Arc::clone(c),
+                None => {
+                    let c = crate::amd::connector::AmdConnector::new_with_resources(Arc::clone(self), allocator)?;
+                    *slot = Some(Arc::clone(&c));
+                    c
+                }
+            };
+            return Ok(crate::amd::connector::ConnectorLease::shared(conn, Arc::clone(self)));
+        }
         let conn = match self.connector_pool.lock().pop() {
             Some(c) => c,
             None => crate::amd::connector::AmdConnector::new_with_resources(Arc::clone(self), allocator)?,
