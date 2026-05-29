@@ -1236,8 +1236,13 @@ fn is_define_or_after(uop: &Arc<UOp>) -> bool {
 /// Matches INDEX(VECTORIZE(Defines.or_after()), vec_idx) only.
 /// expand_index only matches VECTORIZE of defines.
 fn is_vector_index(uop: &Arc<UOp>) -> bool {
-    let Op::Index { buffer, indices, gate } = uop.op() else { return false };
-    if indices.len() != 1 || gate.is_some() {
+    // NB: a *gated* vector INDEX is still expandable — `expand_index_to_vectorize`
+    // splits the gate per lane and `fold_expanded_index` groups by gate id.
+    // tinygrad's `expand_index` (devectorizer.py) likewise fires on any
+    // vectorized-buffer INDEX regardless of gate; bailing on `gate.is_some()`
+    // left a VECTORIZE-of-pointers buffer unconsumed (it survived to the spec).
+    let Op::Index { buffer, indices, gate: _ } = uop.op() else { return false };
+    if indices.len() != 1 {
         return false;
     }
     let Some(idx) = indices.first() else { return false };
