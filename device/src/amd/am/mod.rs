@@ -15,3 +15,4 @@
 //! tinygrad's `runtime/support/am`). gfx11 is wired now; the rest are data adds.
 
 pub mod mm;
+pub mod regs;
