@@ -14,6 +14,7 @@
 
 #![cfg(target_os = "linux")]
 
+use std::cell::UnsafeCell;
 use std::mem::size_of;
 use std::os::fd::AsRawFd;
 use std::ptr::NonNull;
@@ -189,20 +190,34 @@ pub fn build_sdma_linear_copy(src: u64, dst: u64, size: usize) -> [u32; 7] {
 /// mapping, and submit primitive — the only differences are the packet
 /// format we write into the ring and whether the GART contains an
 /// `amd_queue_t` AQL descriptor.
+/// # Safety — single-owner interior mutability
+///
+/// `inner` is mutated through `&self` without a lock. The owning
+/// `ConnectorLease` guarantees exactly one thread issues sequential,
+/// non-reentrant dispatch/submit calls against this queue for its lifetime:
+/// the connector lives in exactly one owner slot (plan / graph / per-call
+/// lease) or the idle pool (where nobody dispatches), and a single owner
+/// dispatches its ops serially. The shared drainer (`synchronize_all`) reads
+/// only the timeline atomics + signal slot (via `Timeline`), NEVER this cell.
+/// Mirrors `RawBuffer`'s `UnsafeCell` + scheduler-exclusivity pattern
+/// (allocator.rs). This is the lock-free dispatch path the per-owner model is
+/// built for: distinct connectors' queues are interleaved by the GPU's MES,
+/// not by a CPU lock.
 pub struct AmdComputeQueue {
-    inner: Mutex<QueueInner>,
+    inner: UnsafeCell<QueueInner>,
     /// Immutable device identity (kfd_fd, drm_fd, node, arch, poison latch).
-    /// Rebased from `Arc<AmdDevice>` in Commit A of the connector refactor so
-    /// the queue can move into `AmdConnector` (Commit B) without forming a
-    /// strong cycle through `AmdDevice -> connector -> queue -> AmdDevice`.
     core: Arc<AmdDeviceCore>,
     /// `true` when this queue submits raw PM4 dwords directly; `false` when
     /// it submits AQL packets (with PM4 wrapped in AQL vendor IB packets).
-    /// Decided at queue creation from `num_xcc`, fixed for the queue's
-    /// lifetime — outside the Mutex so the hot-path dispatch doesn't lock
-    /// to read it.
+    /// Decided at queue creation from `num_xcc`, fixed for the queue's lifetime.
     is_pm4: bool,
 }
+
+// SAFETY: `QueueInner` is `Send`; the single-owner invariant above means no
+// two threads access `inner` concurrently, so it is sound to share `&self`
+// across threads (e.g. a plan moved between dispatches). `UnsafeCell` makes
+// the type `!Sync` by default, hence the manual impl.
+unsafe impl Sync for AmdComputeQueue {}
 
 /// Copy queue (SDMA).
 pub struct AmdCopyQueue {
@@ -356,6 +371,15 @@ impl QueueInner {
 }
 
 impl AmdComputeQueue {
+    /// Exclusive access to `inner` for the single owner. See the struct's
+    /// safety doc — the `ConnectorLease` guarantees one sequential dispatcher.
+    #[allow(clippy::mut_from_ref)]
+    #[inline]
+    unsafe fn inner_mut(&self) -> &mut QueueInner {
+        // SAFETY: single-owner invariant; no concurrent accessor of `inner`.
+        unsafe { &mut *self.inner.get() }
+    }
+
     /// Create a compute queue. Tinygrad's selection at `ops_amd.py:989`:
     /// `is_aql = xccs > 1`. Single-XCC GPUs (the gfx11/12 default) use the
     /// PM4 path (`KFD_IOC_QUEUE_TYPE_COMPUTE`), submitting raw PM4 dwords
@@ -371,7 +395,7 @@ impl AmdComputeQueue {
         !force_aql && core.node.num_xcc.max(1) == 1
     }
 
-    pub fn create(allocator: &AmdAllocator) -> Result<Arc<Self>> {
+    pub fn create(allocator: &AmdAllocator) -> Result<Box<Self>> {
         let core = allocator.dev.core();
         // `SVOD_AMD_AQL=1` mirrors tinygrad's `AMD_AQL` override
         // (`ops_amd.py:989`) — forces AQL even on single-XCC, useful for
@@ -380,7 +404,7 @@ impl AmdComputeQueue {
         let queue_type = if is_pm4 { kfd::KFD_IOC_QUEUE_TYPE_COMPUTE } else { kfd::KFD_IOC_QUEUE_TYPE_COMPUTE_AQL };
         let inner = create_queue(allocator, queue_type, COMPUTE_RING_BYTES, !is_pm4)?;
         debug!(gpu_id = core.node.gpu_id, num_xcc = core.node.num_xcc, is_pm4 = is_pm4, "AmdComputeQueue created");
-        Ok(Arc::new(Self { inner: Mutex::new(inner), core: Arc::clone(core), is_pm4 }))
+        Ok(Box::new(Self { inner: UnsafeCell::new(inner), core: Arc::clone(core), is_pm4 }))
     }
 
     /// `true` when this queue submits raw PM4 dwords (single-XCC); `false`
@@ -395,7 +419,8 @@ impl AmdComputeQueue {
     /// ring flow control — back-pressure goes through the timeline signal
     /// (`wait_dispatch_headroom`). Kept for diagnostics/AQL.
     pub fn read_idx(&self) -> u64 {
-        let g = self.inner.lock();
+        // SAFETY: single-owner invariant (see struct doc).
+        let g = unsafe { &*self.inner.get() };
         unsafe { std::ptr::read_volatile(g.read_ptr_host.as_ptr()) }
     }
 
@@ -422,7 +447,8 @@ impl AmdComputeQueue {
 
     /// Current host-side `write_dispatch_id`.
     pub fn write_idx(&self) -> u64 {
-        self.inner.lock().write_idx
+        // SAFETY: single-owner invariant (see struct doc).
+        unsafe { &*self.inner.get() }.write_idx
     }
 
     /// Atomically build + submit one PM4 (single-XCC) kernel dispatch.
@@ -486,7 +512,8 @@ impl AmdComputeQueue {
             full_user_data.push(0x20c1_4000);
         }
         full_user_data.extend_from_slice(user_data);
-        let mut g = self.inner.lock();
+        // SAFETY: single-owner invariant (see struct doc) — exclusive, no lock.
+        let g = unsafe { self.inner_mut() };
         let prev = conn.timeline_value().saturating_sub(1);
         let next = conn.next_timeline();
 
@@ -537,11 +564,10 @@ impl AmdComputeQueue {
         if let Some(err) = self.core.poison_error() {
             return Err(err);
         }
-        // Step 7: no `Release` fence here — `ring_doorbell` already issues
-        // its own publication barrier (`queue.rs:292`) and the connector is
-        // a single owner, so there's no concurrent reader of the staged
-        // packets to publish to.
-        let mut g = self.inner.lock();
+        // No `Release` fence here — `ring_doorbell` already issues its own
+        // publication barrier and the connector is a single owner.
+        // SAFETY: single-owner invariant (see struct doc) — exclusive, no lock.
+        let g = unsafe { self.inner_mut() };
         g.push_pm4(dwords);
         g.ring_doorbell(/*is_pm4=*/ true);
         Ok(())
@@ -565,8 +591,8 @@ impl AmdComputeQueue {
         // Ring back-pressure (cf. dispatch_pm4).
         self.wait_dispatch_headroom(conn)?;
         let timeline_addr = conn.timeline_signal().value_addr();
-        // Single-owner connector — no external lock needed (cf. dispatch_pm4).
-        let mut g = self.inner.lock();
+        // SAFETY: single-owner invariant (see struct doc) — exclusive, no lock.
+        let g = unsafe { self.inner_mut() };
         let prev = conn.timeline_value().saturating_sub(1);
         let next = conn.next_timeline();
 
@@ -621,7 +647,8 @@ impl Drop for AmdComputeQueue {
         if std::thread::panicking() {
             return;
         }
-        let queue_id = self.inner.lock().queue_id;
+        // `&mut self` → exclusive; `get_mut` needs no unsafe.
+        let queue_id = self.inner.get_mut().queue_id;
         let mut args = kfd::kfd_ioctl_destroy_queue_args { queue_id, ..Default::default() };
         // SAFETY: `core.kfd_fd` is alive (held via Arc<AmdDeviceCore>); the
         // queue_id was returned by KFD on the matching create_queue call.

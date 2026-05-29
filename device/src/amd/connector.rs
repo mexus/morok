@@ -49,19 +49,20 @@ pub struct AmdConnector {
     /// Shared immutable identity. Cloned across all connectors backed by the
     /// same physical AMD:N (and across `AmdDevice` for back-compat).
     core: Arc<AmdDeviceCore>,
-    /// Per-connector KFD compute queue — own ring + doorbell + GART. Built
-    /// fresh by `new_with_resources`; with one connector per plan/graph this
-    /// means each owner pushes packets into an isolated ring, so the queue's
-    /// internal `Mutex<QueueInner>` is exercised only by intra-owner traffic
-    /// (effectively uncontended).
-    queue: Arc<AmdComputeQueue>,
-    /// Per-connector kernel-argument bump arena (16 MiB GTT). Each connector
-    /// owns its own arena so the bump cursor and this connector's dispatch
-    /// timeline are the SAME ordering — a wrapped slot is provably free once
-    /// this connector's timeline drains. (A device-global arena fed by N
-    /// independent timelines loses that guarantee.) Freed on connector drop
-    /// via `Drop for KernargArena`, after `AmdConnector::Drop` has drained.
-    arena: Arc<KernargArena>,
+    /// Per-connector KFD compute queue — own ring + doorbell + GART. `Box`,
+    /// not `Arc`: the connector is its SOLE owner, so the queue's
+    /// `UnsafeCell<QueueInner>` is dispatched lock-free by the single owning
+    /// thread (no second handle can alias the cell). Distinct connectors'
+    /// queues are interleaved by the GPU's MES, not a CPU lock.
+    queue: Box<AmdComputeQueue>,
+    /// Per-connector kernel-argument bump arena (16 MiB GTT). `Box` (sole
+    /// owner). Each connector owns its own arena so the bump cursor and this
+    /// connector's dispatch timeline are the SAME ordering — a wrapped slot is
+    /// provably free once this connector's timeline drains. (A device-global
+    /// arena fed by N independent timelines loses that guarantee.) Freed on
+    /// connector drop via `Drop for KernargArena`, after `AmdConnector::Drop`
+    /// has drained.
+    arena: Box<KernargArena>,
     /// Per-connector scratch backing. Mirrors what used to live on
     /// `AmdDevice::scratch_state`; see that field's docstring for the
     /// `_ensure_has_local_memory` story (`ops_amd.py:1065-1081`).
@@ -137,13 +138,13 @@ impl AmdConnector {
 
     /// Borrow this connector's KFD compute queue.
     #[inline]
-    pub fn queue(&self) -> &Arc<AmdComputeQueue> {
+    pub fn queue(&self) -> &AmdComputeQueue {
         &self.queue
     }
 
     /// Borrow this connector's own kernarg arena.
     #[inline]
-    pub fn arena(&self) -> &Arc<KernargArena> {
+    pub fn arena(&self) -> &KernargArena {
         &self.arena
     }
 

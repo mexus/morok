@@ -55,14 +55,14 @@ impl Drop for KernargArena {
 }
 
 impl KernargArena {
-    pub fn new(allocator: &AmdAllocator, core: &Arc<AmdDeviceCore>) -> Result<Arc<Self>> {
+    pub fn new(allocator: &AmdAllocator, core: &Arc<AmdDeviceCore>) -> Result<Box<Self>> {
         let opts = BufferSpec { cpu_access: true, uncached: true, nolru: true, ..Default::default() };
         let buffer = allocator.alloc(ARENA_BYTES, &opts, /*zero=*/ true)?;
         let (base_gpu, base_host) = match &buffer {
             RawBuffer::AmdDevice { gpu_addr, host_ptr: Some(h), .. } => (*gpu_addr, *h),
             _ => return Err(Error::AmdAllocFailed { reason: "kernarg arena requires host-visible buffer".into() }),
         };
-        Ok(Arc::new(Self {
+        Ok(Box::new(Self {
             base_gpu,
             base_host,
             size: ARENA_BYTES,
