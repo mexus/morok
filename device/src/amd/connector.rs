@@ -9,15 +9,16 @@
 //! synchronize; the `Program::execute` trait fallback used by
 //! `benchmark_kernel`).
 //!
-//! In the default KFD-safe **single-queue mode** every owner shares ONE
-//! connector per physical device and dispatch (scratch realloc, timeline
-//! reservation, kernarg bump, ring submission) is serialized behind the core's
-//! `dispatch_lock` via [`AmdDeviceCore::exec_guard`] — tinygrad's one-queue-
-//! per-GPU model, which the kernel's MES scheduler can sustain. In **multi-
-//! queue mode** (`SVOD_AMD_SINGLE_QUEUE=0`) each connector is exclusively owned
-//! and there is no dispatch lock: the same operations run serially by ownership
-//! and `exec_guard` returns `None`. Either way each owner sees a `&AmdConnector`
-//! and the dispatch code is identical — only the guard differs.
+//! The per-device dispatch strategy lives in `AmdDeviceCore`'s `Dispatcher`. In
+//! the default KFD-safe **single-queue mode** every owner shares ONE connector
+//! per physical device and dispatch (scratch realloc, timeline reservation,
+//! kernarg bump, ring submission) is serialized behind the strategy's lock via
+//! [`AmdDeviceCore::exec_guard`] — tinygrad's one-queue-per-GPU model, which the
+//! kernel's MES scheduler can sustain. In **multi-queue mode**
+//! (`SVOD_AMD_SINGLE_QUEUE=0`) each connector is exclusively owned and there is
+//! no dispatch lock: the same operations run serially by ownership and
+//! `exec_guard` returns `None`. Either way each owner sees a `&AmdConnector` and
+//! the dispatch code is identical — only the guard differs.
 //!
 //! Tinygrad analogue: `AMDDevice` (`runtime/ops_amd.py`) bundles all of
 //! this into one per-physical-GPU object and relies on the Python GIL to
@@ -304,51 +305,34 @@ impl Drop for AmdConnector {
     }
 }
 
-/// Leak-proof handle to an `AmdConnector`, in one of two modes:
+/// Leak-proof handle to an `AmdConnector`, obtained from
+/// [`AmdDeviceCore::lease_connector`]. Exposes only `&AmdConnector` via `Deref`
+/// and is **not** `Clone`/`Copy`. On drop it hands the connector back to the
+/// core's [`Dispatcher`](crate::amd::device) via `return_connector`, which does
+/// the mode-appropriate thing:
 ///
-/// - **Pooled** ([`new`](Self::new), multi-queue mode): exclusive, un-aliasable
-///   ownership. On drop the connector returns to its core's pool (or is
-///   destroyed if the pool is over capacity). Deliberately **not** `Clone`/
-///   `Copy`, exposing only `&AmdConnector` via `Deref` — so a leased connector
-///   cannot be aliased, which is what guarantees no two dispatchers ever share
-///   one KFD compute queue (the scratch-realloc-vs-dispatch race the old shared
-///   "default connector" allowed). Mirrors the pooled-queue-with-checkout
-///   pattern every GPU framework uses for autotuning (HIP's `GPU_MAX_HW_QUEUES`
-///   pool, PyTorch's CUDA stream pool); the KFD compute queue is a scarce
-///   hardware resource (~24/process on CDNA), so it is reused, never created
-///   per dispatch.
-/// - **Shared** ([`shared`](Self::shared), single-queue mode): a non-owning
-///   alias of the device's one connector. Multiple shared leases point at the
-///   same connector; exclusivity is provided not by the lease but by
-///   [`AmdDeviceCore::exec_guard`], which serializes every dispatch. Dropping a
-///   shared lease only releases this owner's `Arc` clone — the connector lives
-///   on the core for the device's lifetime.
+/// - **multi-queue:** the lease is exclusive + un-aliasable, so no two
+///   dispatchers ever share one KFD compute queue (the scratch-realloc-vs-
+///   dispatch race the old shared "default connector" allowed); the connector
+///   returns to the idle pool on drop (mirrors the pooled-queue-with-checkout
+///   pattern — KFD compute queues are scarce, ~24/process, so they're reused);
+/// - **single-queue:** the lease aliases the device's one shared connector
+///   (exclusivity comes from the core's dispatch lock, not the lease); drop is a
+///   refcount decrement, the connector stays on the core.
 ///
 /// No synchronize on drop: the connector's `Timeline` stays registered in
 /// `core.timelines`, so `synchronize_all` (the copyout/free fence) still
 /// drains it, and the next lessee's first dispatch waits on this connector's
 /// own timeline. Panic-drop inherits `AmdConnector::Drop`'s skip.
 pub struct ConnectorLease {
-    /// `Some` while leased; `None` after a pooled `Drop` has handed it back.
+    /// `Some` while leased; `None` after `Drop` has handed it back.
     conn: Option<Arc<AmdConnector>>,
     core: Arc<AmdDeviceCore>,
-    /// `true`: pooled lease — `Drop` returns the connector to the idle pool.
-    /// `false`: shared single-queue lease — `Drop` is a no-op (the connector is
-    /// owned by the core and shared by all owners).
-    pooled: bool,
 }
 
 impl ConnectorLease {
-    /// A pooled (exclusive) lease — returned to the device pool on drop.
     pub(crate) fn new(conn: Arc<AmdConnector>, core: Arc<AmdDeviceCore>) -> Self {
-        Self { conn: Some(conn), core, pooled: true }
-    }
-
-    /// A shared lease over the device's single connector (single-queue mode).
-    /// Multiple shared leases alias one connector; dispatch is serialized by
-    /// [`AmdDeviceCore::exec_guard`].
-    pub(crate) fn shared(conn: Arc<AmdConnector>, core: Arc<AmdDeviceCore>) -> Self {
-        Self { conn: Some(conn), core, pooled: false }
+        Self { conn: Some(conn), core }
     }
 }
 
@@ -368,12 +352,10 @@ impl std::fmt::Debug for ConnectorLease {
 
 impl Drop for ConnectorLease {
     fn drop(&mut self) {
-        if self.pooled
-            && let Some(conn) = self.conn.take()
-        {
+        // The core's `Dispatcher` decides what return means: pool it
+        // (multi-queue) or drop the shared-connector clone (single-queue).
+        if let Some(conn) = self.conn.take() {
             self.core.return_connector(conn);
         }
-        // Shared lease: the `Arc<AmdConnector>` in `conn` drops here (a refcount
-        // decrement); the connector itself stays owned by the core.
     }
 }
