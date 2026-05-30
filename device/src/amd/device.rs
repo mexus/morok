@@ -642,6 +642,7 @@ pub(crate) fn alloc_scratch(
     let r = iface.alloc_raw(
         total,
         crate::amd::iface::AllocKind::DeviceVram { executable: false },
+        crate::amd::va_registry::AllocTag::Scratch,
         /*cpu_access=*/ false,
         /*zero=*/ false,
     )?;

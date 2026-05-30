@@ -37,6 +37,8 @@ pub mod program;
 pub mod queue;
 #[cfg(target_os = "linux")]
 pub mod signal;
+#[cfg(target_os = "linux")]
+pub mod va_registry;
 
 #[cfg(target_os = "linux")]
 pub use allocator::AmdAllocator;
@@ -59,3 +61,5 @@ pub use queue::{AmdComputeQueue, AmdCopyQueue};
 #[cfg(target_os = "linux")]
 pub use signal::{AmdSignal, SignalPool, Timeline};
 pub use topology::{AmdNode, enumerate};
+#[cfg(target_os = "linux")]
+pub use va_registry::AllocTag;

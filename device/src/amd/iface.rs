@@ -17,6 +17,7 @@
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::ptr::NonNull;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use libc::{
     MAP_ANONYMOUS, MAP_FIXED, MAP_NORESERVE, MAP_PRIVATE, MAP_SHARED, PROT_NONE, PROT_READ, PROT_WRITE, mmap, munmap,
@@ -25,6 +26,7 @@ use tracing::debug;
 
 use crate::amd::sys::{ioctl, kfd};
 use crate::amd::topology::AmdNode;
+use crate::amd::va_registry::{AllocTag, VaRegistry};
 use crate::error::{Error, Result};
 
 /// Backend seam for the AMD device. Every KFD ioctl that `AmdDeviceCore` (and
@@ -34,8 +36,16 @@ use crate::error::{Error, Result};
 pub trait AmdIface: Send + Sync + std::fmt::Debug {
     /// Reserve a host VA, KFD-allocate `size` bytes per `kind`, optionally map
     /// host-visible, and bind it into the GPU page table. `zero` zero-fills a
-    /// host-visible allocation.
-    fn alloc_raw(&self, size: usize, kind: AllocKind, cpu_access: bool, zero: bool) -> Result<AllocResult>;
+    /// host-visible allocation. `tag` records the allocation's purpose in the
+    /// VA registry so a later fault can be resolved back to it.
+    fn alloc_raw(
+        &self,
+        size: usize,
+        kind: AllocKind,
+        tag: AllocTag,
+        cpu_access: bool,
+        zero: bool,
+    ) -> Result<AllocResult>;
     /// Unmap from the GPU, drop the host mapping, and free the KFD allocation.
     /// Best-effort (called from `Drop`); ioctl errors are swallowed.
     fn free_raw(&self, gpu_va: u64, size: usize, handle: u64);
@@ -134,6 +144,14 @@ pub struct KfdIface {
     queue_event_mailbox_ptr: u64,
     mem_fault_event_id: u32,
     hw_fault_event_id: u32,
+    /// VA → allocation registry: every `alloc_raw` range, plus a bounded ring
+    /// of recently-freed ranges, so a fault VA can be resolved to its owning
+    /// (or stale, or nearest) allocation. See [`crate::amd::va_registry`].
+    va: VaRegistry,
+    /// One-shot latch so the terminal fault is logged at `error` exactly once,
+    /// even though `wait_events(0)` may re-observe the (non-auto-reset) fault
+    /// event on subsequent poll-fault calls.
+    fault_logged: AtomicBool,
 }
 
 impl KfdIface {
@@ -226,12 +244,21 @@ impl KfdIface {
             queue_event_mailbox_ptr,
             mem_fault_event_id: mem_event.event_id,
             hw_fault_event_id: hw_event.event_id,
+            va: VaRegistry::default(),
+            fault_logged: AtomicBool::new(false),
         })
     }
 }
 
 impl AmdIface for KfdIface {
-    fn alloc_raw(&self, size: usize, kind: AllocKind, cpu_accessible: bool, zero_init: bool) -> Result<AllocResult> {
+    fn alloc_raw(
+        &self,
+        size: usize,
+        kind: AllocKind,
+        tag: AllocTag,
+        cpu_accessible: bool,
+        zero_init: bool,
+    ) -> Result<AllocResult> {
         // KFD VA reservation + map are page-granular; a 0-byte mmap is EINVAL.
         let size = size.max(1).next_multiple_of(0x1000);
         let flags = compose_flags(kind, cpu_accessible);
@@ -298,12 +325,18 @@ impl AmdIface for KfdIface {
             unsafe { std::ptr::write_bytes(p.as_ptr(), 0, size) };
         }
 
-        debug!(size, gpu_addr = va as u64, "AmdAllocator alloc done");
+        self.va.insert(va as u64, size, mem_handle, tag);
+        debug!(size, gpu_addr = va as u64, handle = mem_handle, tag = ?tag, "AmdAllocator alloc done");
 
         Ok(AllocResult { gpu_va: va as u64, host_ptr, handle: mem_handle, size })
     }
 
     fn free_raw(&self, gpu_va: u64, size: usize, handle: u64) {
+        // Drop from the live registry into the freed-history ring *before* the
+        // unmap, so a fault VA that lands here is classified as RECENTLY-FREED
+        // (the use-after-free signal) rather than as a live allocation.
+        self.va.remove(gpu_va);
+        debug!(gpu_va, size, handle, "AmdIface free_raw");
         // 1. Unmap from GPU.
         let mut gpu_id = self.node.gpu_id;
         let mut unmap_args = kfd::kfd_ioctl_unmap_memory_from_gpu_args {
@@ -392,15 +425,44 @@ impl AmdIface for KfdIface {
         // matches the event we registered.
         let mem = unsafe { events[1].__bindgen_anon_1.memory_exception_data };
         if mem.gpu_id != 0 {
+            // Hoist every field into a local first: the enclosing struct is
+            // `repr(packed)`, so referencing a field in-place (as `format!` /
+            // `tracing!` do) is an unaligned-reference error. The braces force a
+            // by-value copy.
+            let gpu_id = mem.gpu_id;
+            let va = { mem.va };
+            let not_present = { mem.failure.NotPresent };
+            let read_only = { mem.failure.ReadOnly };
+            let no_execute = { mem.failure.NoExecute };
+            let imprecise = { mem.failure.imprecise };
+            let error_type = { mem.ErrorType };
+            // Resolve the raw VA to its owning / stale / nearest allocation —
+            // turns "fault at 0x7f…" into "fault +0x40 into a RECENTLY-FREED
+            // scratch region", which is what actually localizes the bug.
+            let class = self.va.classify(va);
+            let va_hex = format!("{va:#x}");
             let message = format!(
-                "AMD GPU memory fault on gpu_id={} va={:#x} (NotPresent={} ReadOnly={} NoExecute={} ErrorType={})",
-                mem.gpu_id,
-                { mem.va },
-                mem.failure.NotPresent,
-                mem.failure.ReadOnly,
-                mem.failure.NoExecute,
-                { mem.ErrorType },
+                "AMD GPU memory fault on gpu_id={gpu_id} va={va_hex} \
+                 (NotPresent={not_present} ReadOnly={read_only} NoExecute={no_execute} \
+                 Imprecise={imprecise} ErrorType={error_type}) — {class}",
             );
+            // Log at the fault site: the panic that eventually surfaces this is
+            // a delayed re-throw at the next `synchronize()`, far from here. Once
+            // only — the memory-fault event is not auto-reset, so subsequent
+            // `wait_events(0)` poll-fault calls re-observe the same fault.
+            if !self.fault_logged.swap(true, Ordering::Relaxed) {
+                tracing::error!(
+                    gpu_id,
+                    va = va_hex.as_str(),
+                    not_present,
+                    read_only,
+                    no_execute,
+                    imprecise,
+                    error_type,
+                    classification = %class,
+                    "AMD GPU memory fault"
+                );
+            }
             return Ok(Some(Error::Runtime { message }));
         }
         let hw = unsafe { events[2].__bindgen_anon_1.hw_exception_data };

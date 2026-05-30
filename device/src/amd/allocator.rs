@@ -19,6 +19,7 @@ use tracing::debug;
 use crate::allocator::{Allocator, BufferSpec, RawBuffer};
 use crate::amd::device::AmdDevice;
 use crate::amd::iface::AllocKind;
+use crate::amd::va_registry::AllocTag;
 use crate::error::{Result, UnsupportedSnafu};
 
 /// VRAM-/GTT-backed buffer allocator routed through KFD ioctls.
@@ -201,7 +202,14 @@ fn do_alloc(
     cpu_accessible: bool,
     zero_init: bool,
 ) -> Result<RawBuffer> {
-    let r = dev.core().iface().alloc_raw(size, kind, cpu_accessible, zero_init)?;
+    // Diagnostic tag for the VA registry: scratch is tagged at its own call
+    // site (`device::alloc_scratch`); everything routed through here is either a
+    // VRAM data/code/kernarg buffer or GTT control memory.
+    let tag = match kind {
+        AllocKind::DeviceVram { .. } => AllocTag::Vram,
+        AllocKind::UncachedGtt => AllocTag::Gtt,
+    };
+    let r = dev.core().iface().alloc_raw(size, kind, tag, cpu_accessible, zero_init)?;
     Ok(RawBuffer::AmdDevice {
         gpu_addr: r.gpu_va,
         host_ptr: r.host_ptr,
