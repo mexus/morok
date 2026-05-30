@@ -3,12 +3,13 @@
 //! Opens `/dev/kfd` and `/dev/dri/renderD*`, parses topology, calls
 //! `AMDKFD_IOC_ACQUIRE_VM`. Owns an `Arc<AmdDeviceCore>` (the immutable
 //! per-physical-AMD:N identity — KFD/DRM fds, topology, event-page state,
-//! poison latch, shared signal pool) plus a lazily-installed default
-//! `AmdConnector` used by trait-fallback callers (`benchmark_kernel`) and
-//! by the device-wide synchronize chain (`AmdAllocator::_copyin`/`_copyout`
-//! /`_free`). Per-plan and per-graph callers build their own
-//! `AmdConnector` against the same shared core — they don't touch the
-//! default connector.
+//! poison latch, shared signal pool). It holds no connector of its own:
+//! every owner obtains an `AmdConnector` via `AmdDeviceCore::lease_connector`
+//! — `ExecutionPlan` and `AmdGraph` hold a lease for their lifetime, the
+//! `Program::execute` trait fallback (`benchmark_kernel`) leases one per
+//! call, and the device-wide synchronize chain
+//! (`AmdAllocator::_copyin`/`_copyout`/`_free`) drains every registered
+//! connector's timeline via `synchronize_all` without leasing one.
 
 #![cfg(target_os = "linux")]
 
@@ -226,9 +227,7 @@ impl AmdDevice {
         let arch = AmdArch::from_gfx_target_version(node.gfx_target_version).ok_or_else(|| Error::AmdAllocFailed {
             reason: format!(
                 "unsupported gfx target {} (decoded major.minor.step = {}.{}.{}); supported families: \
-                 CDNA gfx942/950, RDNA3 gfx1100/1101/1102/1151, RDNA4 gfx1200/1201 \
-                 (matches tinygrad's `assert target[0] in (11, 12) or target in ((9,4,2),(9,5,0))` \
-                 in ops_amd.py:962)",
+                 CDNA gfx942/950, RDNA3 gfx1100/1101/1102/1151, RDNA4 gfx1200/1201",
                 node.gfx_target_version,
                 node.gfx_target_version / 10_000,
                 (node.gfx_target_version / 100) % 100,
@@ -280,11 +279,11 @@ impl AmdDevice {
     }
 
     /// Drain all submitted GPU work on every connector backed by this device.
-    /// Must drain ALL connectors (not just the default) — once Steps 4-5 of
-    /// the connector refactor make `ExecutionPlan`/`AmdGraph` own their own
-    /// connectors, kernels signal on the OWNER's timeline. Skipping the
-    /// per-owner drain would let `AmdAllocator::_copyout`/`_copyin`/`_free`
-    /// observe an unfinished kernel's buffer.
+    /// `ExecutionPlan` and `AmdGraph` each own their connector, so a kernel
+    /// signals on its OWNER's timeline; the drain must cover EVERY registered
+    /// connector, not a single one. Skipping a per-owner drain would let
+    /// `AmdAllocator::_copyout`/`_copyin`/`_free` observe an unfinished
+    /// kernel's buffer.
     pub fn synchronize(&self) -> Result<()> {
         self.core.synchronize_all()
     }

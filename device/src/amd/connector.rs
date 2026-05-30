@@ -3,11 +3,11 @@
 //! Holds the dispatch state that must NOT be shared across independent
 //! callers: a KFD compute queue (ring + doorbell), a kernarg bump arena,
 //! the scratch backing, and the timeline signal + counter. Every
-//! `ExecutionPlan` and every `AmdGraph` owns its own `AmdConnector` —
-//! `AmdDevice` keeps one default connector for the few callers that bypass
-//! the plan path (`AmdAllocator::_copyin`/`_copyout`/`_free` device-wide
-//! synchronize; the `Program::execute` trait fallback used by
-//! `benchmark_kernel`).
+//! `ExecutionPlan` and every `AmdGraph` owns its own `AmdConnector` for its
+//! lifetime, and the `Program::execute` trait fallback (`benchmark_kernel`)
+//! leases one per call — there is no shared per-device connector. The
+//! device-wide synchronize used by `AmdAllocator::_copyin`/`_copyout`/`_free`
+//! holds no connector; it drains every registered timeline directly.
 //!
 //! The per-device dispatch strategy lives in `AmdDeviceCore`'s `Dispatcher`. In
 //! the default KFD-safe **single-queue mode** every owner shares ONE connector
@@ -40,9 +40,9 @@ use crate::amd::queue::AmdComputeQueue;
 use crate::amd::signal::{AmdSignal, TIMELINE_WRAP_WATERMARK, Timeline};
 use crate::error::{Error, Result};
 
-/// Per-owner dispatch state. One per `ExecutionPlan`, one per `AmdGraph`,
-/// plus one default per `AmdDevice` for trait-fallback callers (the rest of
-/// the runtime always goes through the plan/graph path).
+/// Per-owner dispatch state. One per `ExecutionPlan`, one per `AmdGraph`, and
+/// one leased per call by the `Program::execute` trait fallback; there is no
+/// shared per-device connector.
 ///
 /// Owns: KFD compute queue, kernarg arena, scratch backing, timeline signal,
 /// timeline counter. Single ownership means no dispatch lock — every
@@ -311,7 +311,7 @@ impl Drop for AmdConnector {
 ///
 /// - **multi-queue:** the lease is exclusive + un-aliasable, so no two
 ///   dispatchers ever share one KFD compute queue (the scratch-realloc-vs-
-///   dispatch race the old shared "default connector" allowed); the connector
+///   dispatch race a single shared connector would allow); the connector
 ///   returns to the idle pool on drop (mirrors the pooled-queue-with-checkout
 ///   pattern — KFD compute queues are scarce, ~24/process, so they're reused);
 /// - **single-queue:** the lease aliases the device's one shared connector

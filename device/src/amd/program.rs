@@ -360,7 +360,7 @@ impl AmdProgram {
                 message: format!(
                     "AmdProgram '{kernel_name}': kernel_code_properties={:#06x} sets \
                      ENABLE_SGPR_DISPATCH_PTR — svod doesn't allocate an HSA dispatch \
-                     packet alongside kernargs yet (see tinygrad ops_amd.py:333-340)",
+                     packet alongside kernargs yet",
                     props
                 ),
             });
@@ -469,9 +469,9 @@ impl AmdProgram {
 /// `execute` path feeds into `dispatch_pm4`. Buffer VAs + vals are baked at
 /// capture; only the timeline wait/signal value dwords change on replay.
 impl AmdProgram {
-    /// Device handle. Used by the `Program::execute` trait fallback to route
-    /// dispatch through the default connector, and by `AmdGraph::capture` to
-    /// reach the shared `Arc<AmdDeviceCore>` for the per-graph connector.
+    /// Device handle. Used by the `Program::execute` trait fallback to lease a
+    /// connector per call, and by `AmdGraph::capture` to reach the shared
+    /// `Arc<AmdDeviceCore>` for the per-graph connector.
     pub fn device(&self) -> &Arc<AmdDevice> {
         &self.dev
     }

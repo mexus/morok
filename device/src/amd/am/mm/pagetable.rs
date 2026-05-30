@@ -130,7 +130,7 @@ pub fn get_pte_flags(
     if ip_ge(ip_ver, 12) {
         // gfx12 (RDNA4): MTYPE at bit 54 (2-bit), PDE_PTE_GFX12 = 1<<63,
         // IS_PTE = 1<<63. Constants captured but not validated on hardware.
-        unimplemented!("gfx12 PTE encoding — bring up with hardware validation against tinygrad AM_DEBUG");
+        unimplemented!("gfx12 PTE encoding — constants captured but not yet validated on hardware");
     } else if ip_ge(ip_ver, 10) {
         // gfx10/11 (NV10): MTYPE bits 48..=50; huge-page bit = PDE_PTE (54).
         let mtype = if uncached { MTYPE_UC_GFX11 } else { 0 };
@@ -142,7 +142,9 @@ pub fn get_pte_flags(
         // gfx9 (VG10/CDNA): MTYPE at bit 57 (2-bit); PDB1 tables set BFS(0x9),
         // PDB0 tables set TF, leaves above PDB0 set PDE_PTE. Captured for the
         // arch-parametric structure but not validated on hardware.
-        unimplemented!("gfx9 VG10 PTE encoding — bring up with hardware validation against tinygrad AM_DEBUG");
+        unimplemented!(
+            "gfx9 VG10 PTE encoding — captured for the arch-parametric structure but not yet validated on hardware"
+        );
     }
     extra
 }
