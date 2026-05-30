@@ -318,6 +318,22 @@ impl Renderer {
         }
     }
 
+    /// Per-axis local work-group size limits `(x, y, z)`, or `None` when only
+    /// the product cap ([`local_max`](Self::local_max)) applies.
+    ///
+    /// AMD/HIP caps the 3rd local axis at 64 below the 1024-thread product limit
+    /// (tinygrad's `local_max = (1024, 1024, 64)`), so a candidate with product
+    /// ≤ 1024 but z > 64 is still invalid and must be bounded at gpudims time.
+    pub fn local_max_axes(&self) -> Option<[usize; 3]> {
+        match self.device {
+            RendererDevice::AmdRdna3
+            | RendererDevice::AmdRdna4
+            | RendererDevice::AmdCdna3
+            | RendererDevice::AmdCdna4 => Some([1024, 1024, 64]),
+            _ => None,
+        }
+    }
+
     /// Select the AMD optimizer profile matching a gfx arch. CDNA gfx942 maps
     /// to CDNA3 and gfx950 to CDNA4; RDNA3/RDNA4 families map to their profiles.
     pub fn for_amd_arch(arch: AmdArch) -> Self {

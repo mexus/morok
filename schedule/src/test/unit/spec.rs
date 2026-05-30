@@ -11,7 +11,7 @@ use std::sync::Arc;
 use smallvec::smallvec;
 use svod_dtype::{AddrSpace, DType};
 use svod_ir::types::ConstValue;
-use svod_ir::{Op, UOp};
+use svod_ir::{BinaryOp, Op, TernaryOp, UOp};
 
 use crate::spec::{spec_program, spec_tensor, type_verify};
 
@@ -43,6 +43,50 @@ fn spec_program_accepts_integer_alu() {
     let sum = UOp::index_const(2).add(&UOp::index_const(3));
     let sink = UOp::sink(vec![sum]);
     assert!(type_verify(&sink, &spec_program()).is_ok());
+}
+
+#[test]
+fn spec_program_accepts_float_alu() {
+    // The Idiv/Mod-must-be-int rule must NOT reject legitimate float ALU:
+    // Fdiv/Max/Pow over floats, a bool-producing comparison, an int-shifted SHL,
+    // and a bool-conditioned WHERE all pass. (Guards against the verifier being
+    // over-broad and rejecting valid float ops.)
+    let f = UOp::const_(DType::Float32, ConstValue::Float(1.5));
+    let g = UOp::const_(DType::Float32, ConstValue::Float(2.0));
+    let cond = UOp::alu(BinaryOp::Lt, f.clone(), g.clone()); // f32,f32 -> bool
+
+    let sink = UOp::sink(vec![
+        UOp::alu(BinaryOp::Fdiv, f.clone(), g.clone()),
+        UOp::alu(BinaryOp::Max, f.clone(), g.clone()),
+        UOp::alu(BinaryOp::Pow, f.clone(), g.clone()),
+        cond.clone(),
+        UOp::alu(BinaryOp::Shl, UOp::index_const(3), UOp::index_const(1)),
+        UOp::new(Op::Ternary(TernaryOp::Where, cond, f, g), DType::Float32),
+    ]);
+    assert!(type_verify(&sink, &spec_program()).is_ok(), "legitimate float ALU must pass: {:?}", verify_err(&sink));
+}
+
+#[test]
+fn spec_program_rejects_float_mod_and_idiv() {
+    // Primitive Idiv/Mod are integer-only (tinygrad spec.py rule_alu). Float
+    // modulo must be decomposed upstream (e.g. ONNX float Mod -> x - trunc(x/y)*y);
+    // a float Binary(Mod)/Binary(Idiv) reaching the verifier is the latent bug
+    // this rule guards against. Built via UOp::new — the verifier, not the
+    // constructor, is what must reject them.
+    let f = UOp::const_(DType::Float32, ConstValue::Float(7.0));
+    let g = UOp::const_(DType::Float32, ConstValue::Float(3.0));
+
+    let bad_mod = UOp::new(Op::Binary(BinaryOp::Mod, f.clone(), g.clone()), DType::Float32);
+    assert!(
+        verify_err(&UOp::sink(vec![bad_mod])).contains("binary operand/result dtype mismatch"),
+        "float Mod must be rejected"
+    );
+
+    let bad_idiv = UOp::new(Op::Binary(BinaryOp::Idiv, f, g), DType::Float32);
+    assert!(
+        verify_err(&UOp::sink(vec![bad_idiv])).contains("binary operand/result dtype mismatch"),
+        "float Idiv must be rejected"
+    );
 }
 
 #[test]

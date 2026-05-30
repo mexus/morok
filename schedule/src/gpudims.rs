@@ -177,18 +177,24 @@ fn add_gpudims(ctx: &Renderer, sink: &Arc<UOp>) -> Option<Arc<UOp>> {
     } else {
         // Generate GPU indices
         let global_max = ctx.global_max.as_deref();
-        let local_max_product = ctx.local_max;
+        let n = local_shape.len().max(1);
 
-        // For locals, we use product limit rather than per-dimension
-        // Convert to per-dimension limits if needed
-        let local_max: Option<Vec<usize>> = local_max_product.map(|max| {
-            // Per-axis cap is the full product (matches tinygrad's per-dim
-            // local maxima); the workgroup-size product is enforced by the
-            // optimizer, not by crushing each axis to product^(1/n). The
-            // cube-root split made non-cubic local shapes like [32,2,2]
-            // unfittable (32 > 1024^(1/3)=10) and panicked at split_dims.
-            vec![max.max(1); local_shape.len().max(1)]
-        });
+        // Per-axis local-size caps. Some backends (AMD/HIP) cap the 3rd local
+        // axis below the workgroup product limit — e.g. (1024, 1024, 64) — so a
+        // beam candidate with product ≤ 1024 but z > 64 would otherwise pass
+        // `validate_limits` and only fault at dispatch. When the renderer
+        // exposes per-axis limits, apply them positionally (axes past the tuple
+        // fall back to the product cap). Otherwise cap every axis at the product
+        // limit — the workgroup-size product is enforced separately by the
+        // optimizer, so this is NOT a cube-root split (that made non-cubic
+        // shapes like [32,2,2] unfittable: 32 > 1024^(1/3) ≈ 10).
+        let local_max: Option<Vec<usize>> = match ctx.local_max_axes() {
+            Some(axes) => {
+                let product = ctx.local_max.unwrap_or(usize::MAX);
+                Some((0..n).map(|i| axes.get(i).copied().unwrap_or(product).max(1)).collect())
+            }
+            None => ctx.local_max.map(|max| vec![max.max(1); n]),
+        };
         let local_max_slice = local_max.as_deref();
 
         // Create global indices (gidx0, gidx1, ...)
