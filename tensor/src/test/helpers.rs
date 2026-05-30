@@ -21,9 +21,6 @@ impl RealizeTestExt for Tensor {
 /// deduped by `(ast_id, device)`, so cross-test entries don't interfere —
 /// identical ASTs hand back the same `Arc<CachedKernel>`, distinct ASTs
 /// occupy distinct slots, and the cache is never torn down mid-process.
-/// `kernel_cache::clear_all` is `pub(crate)` precisely to keep external
-/// callers from bursting `AmdProgram::Drop` through the cache while live
-/// dispatches still resolve through it.
 pub fn test_setup() {}
 
 /// Compare float slices with tolerance.

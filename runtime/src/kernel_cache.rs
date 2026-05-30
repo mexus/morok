@@ -61,7 +61,7 @@ type KernelKey = (u64, String);
 // Global kernel dedup cache using lock-free concurrent HashMap.
 //
 // Maps (UOp ID, device) -> Arc<CachedKernel>.
-// Kernels live until explicitly cleared via clear_all().
+// Kernels live for the process lifetime — the cache is never torn down.
 static KERNELS: OnceLock<HashMap<KernelKey, Arc<CachedKernel>>> = OnceLock::new();
 
 fn kernels() -> &'static HashMap<KernelKey, Arc<CachedKernel>> {

@@ -78,10 +78,6 @@ impl Default for PrepareConfig {
 impl PrepareConfig {
     /// Read both `SVOD_CPU_BACKEND` and optimizer env vars.
     pub fn from_env() -> Self {
-        // Re-resolve `SVOD_DEVICE` through the registry parser so all
-        // consumers (tensor construction, schedule rangeify, runtime factory)
-        // see the same canonical DeviceSpec value.
-        normalize_default_device_from_env();
         Self { optimizer: OptimizerConfig::from_env(), resolver: Arc::new(EnvResolver), disable_schedule_cache: false }
     }
 
@@ -141,25 +137,6 @@ pub fn amd_test_arch() -> Option<svod_dtype::AmdArch> {
     None
 }
 
-/// If `SVOD_DEVICE` is set and svod-dtype parsed it with a placeholder
-/// arch, re-parse it via the registry (which queries KFD topology) and
-/// override the thread-local default device. Idempotent — safe to call from
-/// multiple `PrepareConfig::from_env` sites.
-fn normalize_default_device_from_env() {
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use svod_device::registry::DeviceSpecExt;
-    static DONE: AtomicBool = AtomicBool::new(false);
-    if DONE.swap(true, Ordering::AcqRel) {
-        return;
-    }
-    let Ok(raw) = std::env::var("SVOD_DEVICE") else {
-        return;
-    };
-    let Ok(normalized) = <DeviceSpec as DeviceSpecExt>::parse(raw.trim()) else {
-        return;
-    };
-    svod_dtype::default_device::set_default_device(normalized);
-}
 
 impl PrepareConfig {
     /// Resolve a `DeviceSpec` into a `Device` using this config's resolver.
