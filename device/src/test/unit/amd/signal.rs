@@ -1,4 +1,3 @@
-
 use super::*;
 
 /// Live pool round-trip on real hardware (skipped when no supported AMD

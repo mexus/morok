@@ -111,7 +111,7 @@ impl Renderer for AmdRendererWrapper {
     fn decompositor(&self) -> Option<svod_ir::pattern::TypedPatternMatcher<()>> {
         // AMD's hardware exp2/log2 are lower precision than CPU libm; route the
         // exp/log/trig family through the SLEEF polynomial pass (sqrt stays
-        // native). See `amd_decomposition_patterns` for the tinygrad rationale.
+        // native). See `amd_decomposition_patterns` for the rationale.
         Some(svod_ir::decompositions::amd_decomposition_patterns())
     }
 }

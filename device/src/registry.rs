@@ -129,7 +129,7 @@ impl DeviceRegistry {
     }
 
     fn create_allocator(&self, spec: &DeviceSpec) -> Result<Arc<dyn Allocator>> {
-        // DISK: no LRU caching (Tinygrad: DiskAllocator extends Allocator, not LRUAllocator)
+        // DISK: no LRU caching — DiskAllocator is used directly, not wrapped in LruAllocator.
         if let DeviceSpec::Disk { path } = spec {
             return Ok(Arc::new(crate::allocator::DiskAllocator::new(path.clone())));
         }

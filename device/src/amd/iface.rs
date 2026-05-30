@@ -164,7 +164,7 @@ impl KfdIface {
         let drm_fd = crate::amd::device::open_owned(drm_path.as_str())?;
 
         // GET_VERSION captures the KFD ABI version so we can gate RUNTIME_ENABLE
-        // (which only exists on kfd >= 1.14). Mirrors tinygrad `ops_amd.py:726`.
+        // (which only exists on kfd >= 1.14).
         let mut ver_args = kfd::kfd_ioctl_get_version_args { major_version: 0, minor_version: 0 };
         if let Err(e) = unsafe { ioctl::kfd_get_version(kfd_fd.as_raw_fd(), &mut ver_args as *mut _) } {
             return Err(Error::AmdIoctl { ioctl: "AMDKFD_IOC_GET_VERSION", errno: e as i32 });
@@ -181,8 +181,8 @@ impl KfdIface {
             return Err(Error::AmdIoctl { ioctl: "AMDKFD_IOC_ACQUIRE_VM", errno: e as i32 });
         }
 
-        // RUNTIME_ENABLE — only on KFD >= 1.14. Tinygrad gates it the same way
-        // (`ops_amd.py:728`); older kernels reject the ioctl with ENOTTY.
+        // RUNTIME_ENABLE — only on KFD >= 1.14; older kernels reject the
+        // ioctl with ENOTTY.
         if kfd_version >= (1, 14) {
             let mut rt = kfd::kfd_ioctl_runtime_enable_args { mode_mask: 0, ..Default::default() };
             if let Err(e) = unsafe { ioctl::kfd_runtime_enable(kfd_fd.as_raw_fd(), &mut rt as *mut _) } {
@@ -190,7 +190,7 @@ impl KfdIface {
             }
         }
 
-        // Event-page setup. Mirrors `ops_amd.py:731-733`: allocated and bound
+        // Event-page setup: allocated and bound
         // exactly once per process; subsequent devices reuse it by calling
         // `MAP_MEMORY_TO_GPU` for their `gpu_id`. Without the bound event page,
         // AMDKFD_IOC_CREATE_QUEUE returns EINVAL.
@@ -217,9 +217,8 @@ impl KfdIface {
             return Err(Error::AmdIoctl { ioctl: "AMDKFD_IOC_CREATE_EVENT(hw fault)", errno: e as i32 });
         }
 
-        // The mailbox sits at event_page + slot_index * 8 (tinygrad
-        // `ops_amd.py:738`). SDMA fence packets write the queue event_id
-        // here to wake up `WAIT_EVENTS` from `sleep()`.
+        // The mailbox sits at event_page + slot_index * 8. SDMA fence packets
+        // write the queue event_id here to wake up `WAIT_EVENTS` from `sleep()`.
         let queue_event_mailbox_ptr = event_page_va + (qe.event_slot_index as u64) * 8;
 
         debug!(

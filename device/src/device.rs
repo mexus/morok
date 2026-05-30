@@ -1,4 +1,4 @@
-//! Device abstraction following Tinygrad's architecture.
+//! Device abstraction.
 //!
 //! This module provides a unified Device abstraction that owns:
 //! - **Renderer**: Transforms UOp graphs into source code (ProgramSpec)
@@ -28,11 +28,10 @@ use crate::error::{Error, Result};
 /// the same program from multiple host threads when dependency analysis proves
 /// the buffer accesses are independent.
 ///
-/// # Tinygrad Alignment
+/// # Calling convention
 ///
-/// This trait follows Tinygrad's `Program` interface where variable values are
-/// passed as a positional tuple/array (`vals`) rather than a named HashMap.
-/// The order matches `var_names` in `CompiledSpec`.
+/// Variable values are passed as a positional array (`vals`) rather than a
+/// named HashMap. The order matches `var_names` in `CompiledSpec`.
 pub trait Program: Send + Sync {
     /// Execute the kernel with given buffers and variable values.
     ///
@@ -42,11 +41,10 @@ pub trait Program: Send + Sync {
     /// * `vals` - Variable values in positional order (matches `var_names` in CompiledSpec)
     /// * `global_size` - Global work size (for GPU backends, None for CPU)
     /// * `local_size` - Local work size (for GPU backends, None for CPU)
-    /// * `wait` - Block until this dispatch completes before returning. Mirrors
-    ///   tinygrad `HCQProgram.__call__(wait=...)` (`hcq.py:355`): GPU backends
-    ///   submit asynchronously and rely on the device timeline for ordering, so
-    ///   `wait=false` returns right after submit. Pass `true` only when the
-    ///   caller needs completion *without* a subsequent synchronizing read
+    /// * `wait` - Block until this dispatch completes before returning. GPU
+    ///   backends submit asynchronously and rely on the device timeline for
+    ///   ordering, so `wait=false` returns right after submit. Pass `true`
+    ///   only when the caller needs completion *without* a subsequent synchronizing read
     ///   (e.g. benchmark timing). Synchronous backends (CPU) ignore it.
     ///
     /// # Safety
@@ -78,8 +76,8 @@ pub trait Program: Send + Sync {
 /// One graphable kernel: a program plus its fixed buffer pointers and launch
 /// dims, captured once. Buffer pointers are plan-owned and stable across calls
 /// (`ExecutionPlan::buffers`), so a graph can bake them in and only re-patch
-/// variable-derived launch dims + `vals` on replay. Mirrors tinygrad's
-/// `(dev, prg, bufs, vars)` graph-call tuple (`engine/jit.py:99`).
+/// variable-derived launch dims + `vals` on replay. Bundles the device,
+/// program, buffers, and launch vars of a single graph call.
 pub struct GraphKernel<'a> {
     pub program: &'a dyn Program,
     pub buffers: Vec<*mut u8>,
@@ -91,8 +89,7 @@ pub struct GraphKernel<'a> {
 /// A pre-captured kernel chain replayed with one submit. Backends that can
 /// pre-build their dispatch packets (AMD indirect buffer) implement this so
 /// repeated inference pays per-graph, not per-kernel, launch cost. Replay is
-/// equivalent to running every captured kernel in order. Mirrors tinygrad's
-/// `GraphRunner` (`engine/jit.py:90`).
+/// equivalent to running every captured kernel in order.
 pub trait Graph: Send + Sync {
     /// Re-dispatch the captured chain. `vals` are positional updated launch
     /// vars (same order as capture); empty replays the baked-in values.
@@ -229,10 +226,10 @@ fn checked_launch_binary(op: BinaryOp, lhs: i64, rhs: i64) -> Result<i64> {
     // EXHAUSTIVE match — no `_` catch-all. When a new `BinaryOp` variant is
     // added to `svod_ir::types::BinaryOp`, the compiler will fail this match
     // and force an explicit decision, instead of silently producing wrong
-    // launch dims at runtime. Tinygrad codegens `sym_infer` from the renderer
-    // pipeline (`ops.py:918-932`) so it inherits every operator automatically;
-    // until svod unifies the two evaluators, this exhaustive match is the
-    // belt-and-suspenders that approximates the same guarantee.
+    // launch dims at runtime. A symbolic evaluator codegen'd from the renderer
+    // pipeline would inherit every operator automatically; until svod unifies
+    // the two evaluators, this exhaustive match is the belt-and-suspenders
+    // that approximates the same guarantee.
     let value: Option<i64> = match op {
         // Integer arithmetic — checked for overflow.
         BinaryOp::Add => lhs.checked_add(rhs),
@@ -313,7 +310,7 @@ fn checked_launch_unary(op: UnaryOp, src: i64) -> Result<i64> {
         UnaryOp::Sign => Some(src.signum()),
         UnaryOp::Square => src.checked_mul(src),
         // For integer launch dims `trunc/floor/ceil/round` are identity since
-        // the input is already an integer. Tinygrad's `sym_infer` collapses
+        // the input is already an integer. A symbolic evaluator would collapse
         // these via the rewrite engine; the explicit arms here are the same
         // outcome.
         UnaryOp::Trunc | UnaryOp::Floor | UnaryOp::Ceil | UnaryOp::Round => Some(src),
@@ -475,8 +472,7 @@ pub type CompilerPair = (Arc<dyn Renderer>, Arc<dyn Compiler>);
 
 /// A device that owns renderer, compiler, runtime, and allocator.
 ///
-/// This follows Tinygrad's architecture where a Device is a complete
-/// compilation + execution unit for a specific backend.
+/// A Device is a complete compilation + execution unit for a specific backend.
 ///
 /// # Example
 ///
@@ -563,9 +559,8 @@ impl Device {
 /// This is returned by Renderer::render() and consumed by Compiler::compile().
 /// It bridges the gap between UOp graphs and compiled executables.
 ///
-/// # Tinygrad Alignment
+/// # Buffer metadata
 ///
-/// Buffer metadata (`globals`, `outs`, `ins`) matches Tinygrad's Program class:
 /// - `globals`: Buffer indices from PARAM ops
 /// - `outs`: Output buffer indices (written by STORE ops)
 /// - `ins`: Input buffer indices (read by LOAD ops)
@@ -597,15 +592,12 @@ pub struct ProgramSpec {
     pub var_names: Vec<String>,
 
     /// Global buffer indices (from PARAM slot values).
-    /// Matches Tinygrad's `globals` field.
     pub globals: Vec<usize>,
 
     /// Output buffer indices (written by STORE ops).
-    /// Matches Tinygrad's `outs` field.
     pub outs: Vec<usize>,
 
     /// Input buffer indices (read by LOAD ops, excluding outputs).
-    /// Matches Tinygrad's `ins` field.
     pub ins: Vec<usize>,
 
     /// Number of buffer arguments (for CIF construction at compile time).
@@ -697,8 +689,8 @@ impl ProgramSpec {
 
     /// Derive and apply metadata from `self.ast`.
     ///
-    /// This mirrors Tinygrad-style program metadata extraction from the kernel
-    /// graph and keeps renderer wrappers aligned on one metadata path.
+    /// Extracts program metadata from the kernel graph and keeps renderer
+    /// wrappers aligned on one metadata path.
     pub fn apply_derived_metadata_from_ast(&mut self) {
         let derived = Self::derive_metadata_from_sink(&self.ast);
         self.globals = derived.globals;
@@ -739,9 +731,8 @@ impl ProgramSpec {
         /// vector). Devectorize doesn't always eliminate vectorized PARAM
         /// pointers (e.g. scatter stores at `cpu/ops.rs:15-18`), so a kernel's
         /// output `Op::Store` may have an `index` whose `buffer` is a
-        /// `Vectorize` of N copies of the same `Op::Param`. Tinygrad's
-        /// equivalent metadata derivation looks through these wrappers too —
-        /// here we mirror that behavior.
+        /// `Vectorize` of N copies of the same `Op::Param`, so the metadata
+        /// derivation looks through these wrappers too.
         fn walk(uop: &Arc<UOp>) -> Option<usize> {
             match uop.op() {
                 Op::Param { slot, device: None, .. } => Some(*slot),
@@ -884,9 +875,8 @@ impl ProgramSpec {
         spec.ins = meta.as_ref().map(|m| m.ins.clone()).filter(|ins| !ins.is_empty()).unwrap_or(derived.ins);
         spec.buf_count = meta.as_ref().map(|m| m.buf_count).filter(|count| *count > 0).unwrap_or(spec.globals.len());
         // Launch dims: always derive from the SPECIAL UOps in the SINK,
-        // ignoring any upstream `meta` value. Tinygrad does the same
-        // (`uop/ops.py:1043-1046` — `ProgramInfo.from_sink` iterates SPECIAL
-        // and sets `special_size[name_suffix] = end`). Keeping a meta override
+        // ignoring any upstream `meta` value (iterate SPECIAL and set
+        // `special_size[name_suffix] = end`). Keeping a meta override
         // here causes a dispatch-vs-IR mismatch: the meta-supplied
         // `global_size` is in kernel-name positional order ([g_x_size,
         // g_y_size]) but the SPECIAL UOps (post-gpudims `reverse=true`) may

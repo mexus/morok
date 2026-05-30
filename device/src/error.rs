@@ -71,9 +71,8 @@ pub enum Error {
     DeviceUnavailable { reason: String },
 
     /// Allocator does not implement an optional operation (e.g. `_transfer`,
-    /// `_offset`, `_map`). Mirrors tinygrad's `NotImplementedError` defaults on
-    /// the `Allocator` base (device.py:239-247) — reachable only via
-    /// cross-backend misuse, never on the CPU path.
+    /// `_offset`, `_map`); the `Allocator` base defaults these to unsupported.
+    /// Reachable only via cross-backend misuse, never on the CPU path.
     #[snafu(display("allocator does not support operation: {op}"))]
     Unsupported { op: &'static str },
 }

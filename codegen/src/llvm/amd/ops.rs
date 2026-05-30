@@ -1,8 +1,7 @@
 //! AMD-specific UOp lowering.
 //!
 //! Intercepts AMD-only ops (`Special`, `Barrier`, `DefineLocal`, fp8 `Cast`,
-//! `Wmma`) and falls through to the CPU emitter for everything else. Tinygrad
-//! reference: `submodules/new_new_tinygrad/tinygrad/renderer/llvmir.py:208-289`.
+//! `Wmma`) and falls through to the CPU emitter for everything else.
 
 use std::sync::Arc;
 
@@ -74,7 +73,7 @@ fn render_special(uop: &Arc<UOp>, name: &str, ctx: &mut RenderContext, kernel: &
         'g' => kernel.push(format!("  {dst} = tail call i32 @llvm.amdgcn.workgroup.id.{dim}()")),
         'l' => kernel.push(format!("  {dst} = tail call i32 @llvm.amdgcn.workitem.id.{dim}()")),
         'i' => {
-            // Direct-global axis: tinygrad emits `g*lsz + l`, but svod's
+            // Direct-global axis: the usual lowering is `g*lsz + l`, but svod's
             // ProgramSpec drops `local_size` entirely for `i` prefixes
             // (`device/src/device.rs:660`). The kernel sees one flat axis,
             // so workgroup.id.x suffices (workgroup_size_x = 1 in the AQL
@@ -89,7 +88,6 @@ fn render_special(uop: &Arc<UOp>, name: &str, ctx: &mut RenderContext, kernel: &
 // ── BARRIER: workgroup-scope fence + s.barrier ────────────────────────────
 
 fn render_barrier(kernel: &mut Vec<String>) -> Option<()> {
-    // Tinygrad `llvmir.py:209`.
     kernel.push("  fence syncscope(\"workgroup\") release".to_string());
     kernel.push("  tail call void @llvm.amdgcn.s.barrier()".to_string());
     kernel.push("  fence syncscope(\"workgroup\") acquire".to_string());
@@ -114,8 +112,8 @@ fn render_define_local(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec
     ctx.push_module_prefix(format!(
         "{global_name} = internal unnamed_addr addrspace(3) global [{size} x {base_ty}] undef, align 16"
     ));
-    // Tinygrad addrspacecasts `addrspace(3) global → ptr` so downstream
-    // GEP/LOAD/STORE can use the generic `ptr` type (`llvmir.py:175-179`).
+    // Addrspacecast `addrspace(3) global → ptr` so downstream GEP/LOAD/STORE
+    // can use the generic `ptr` type.
     // Without this cast, GEP emits `getelementptr ..., ptr @local0, ...`
     // which clang rejects (`@local0` is `ptr addrspace(3)`).
     kernel.push(format!("  {dst} = addrspacecast ptr addrspace(3) {global_name} to ptr"));
@@ -125,8 +123,8 @@ fn render_define_local(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec
 // ── DEFINE_REG: addrspace(5) alloca ───────────────────────────────────────
 //
 // AMDGPU LLVM requires alloca to live in `addrspace(5)` (private/scratch
-// memory) inside `amdgpu_kernel` functions. Tinygrad emits the alloca in
-// addrspace(5) implicitly via `target triple = amdgcn-amd-amdhsa` which
+// memory) inside `amdgpu_kernel` functions. The alloca can land in
+// addrspace(5) implicitly via `target triple = amdgcn-amd-amdhsa`, which
 // makes addrspace(5) the alloca default for that triple in some LLVM
 // versions. To be explicit (and avoid relying on backend-default
 // behavior), we emit it directly and addrspacecast to a generic pointer
@@ -202,8 +200,8 @@ fn guard_unsupported_f64_transcendental(uop: &Arc<UOp>, ctx: &mut RenderContext)
 }
 
 /// Module-level prefix lines required when the kernel uses fp8 conversions.
-/// Returns the verbatim `@f32_to_fp8` helper from tinygrad `llvmir.py:245-255`
-/// when any node in the linear list touches fp8, otherwise an empty string.
+/// Returns the verbatim `@f32_to_fp8` helper when any node in the linear list
+/// touches fp8, otherwise an empty string.
 pub fn fp8_helper_prefix(nodes: &[Arc<UOp>]) -> Option<&'static str> {
     let uses_fp8 = nodes.iter().any(|n| {
         let dt = n.dtype();
@@ -215,9 +213,8 @@ pub fn fp8_helper_prefix(nodes: &[Arc<UOp>]) -> Option<&'static str> {
     Some(FP8_HELPER)
 }
 
-/// Inlined f32 → fp8/bf8 conversion (verbatim port of tinygrad's helper at
-/// `submodules/new_new_tinygrad/tinygrad/renderer/llvmir.py:245-255`). The
-/// helper handles NaN/Inf preservation, clamping to the fp8 representable
+/// Inlined f32 → fp8/bf8 conversion (verbatim port of the upstream helper).
+/// The helper handles NaN/Inf preservation, clamping to the fp8 representable
 /// range, and packs via amdgcn `cvt.pk.{fp8,bf8}.f32`.
 const FP8_HELPER: &str = r#"define i8 @f32_to_fp8(float %val, i1 %is_bf8) {
 entry:

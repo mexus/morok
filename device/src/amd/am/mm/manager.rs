@@ -1,8 +1,7 @@
 //! `MemoryManager`: virtual-address allocation + GMMU page-table mapping.
 //!
-//! Port of tinygrad's `MemoryManager` + `PageTableTraverseContext`
-//! (`runtime/support/memory.py`), over the injectable [`PhysMem`] backing so it
-//! is unit-tested without a GPU. Three TLSF sub-allocators (virtual address
+//! GMMU memory manager + page-table traversal, over the injectable [`PhysMem`]
+//! backing so it is unit-tested without a GPU. Three TLSF sub-allocators (virtual address
 //! space, physical VRAM, page-table pages) plus a 4-level page-table walk that
 //! maps/unmaps ranges, picking the largest huge page that fits + is aligned and
 //! reclaiming now-empty tables on unmap.
@@ -23,8 +22,8 @@ fn round_up(x: u64, m: u64) -> u64 {
 
 /// gfx11 physical-allocation chunk sizes `(size, align)`, largest first — so
 /// `valloc` grabs the longest contiguous segments it can (fewer PTEs / less TLB
-/// pressure). Port of tinygrad's `palloc_ranges` for `va_shifts=[12..39]`:
-/// `2 MiB`-aligned for chunks ≥ 2 MiB, else `4 KiB`.
+/// pressure). Derived from `va_shifts=[12..39]`: `2 MiB`-aligned for chunks
+/// ≥ 2 MiB, else `4 KiB`.
 pub fn gfx11_palloc_ranges() -> Vec<(u64, u64)> {
     (0..=27).rev().map(|i| (1u64 << (i + 12), if i >= 9 { 2 << 20 } else { 0x1000 })).collect()
 }
@@ -90,7 +89,7 @@ impl<P: PhysMem> MemoryManager<P> {
     /// Build a manager over `phys`. `vram_size` is the physical pool; the
     /// virtual space is `[va_base, va_base + va_size)`. When `reserve_ptable`,
     /// a slice of VRAM is carved for page tables (so they don't fragment the
-    /// data pool), mirroring tinygrad.
+    /// data pool).
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         phys: P,

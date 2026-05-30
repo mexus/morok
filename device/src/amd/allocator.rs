@@ -1,6 +1,6 @@
 //! `AmdAllocator`: KFD-direct VRAM/GTT allocator.
 //!
-//! Mirrors tinygrad's `ops_amd.py:748-776`. Each `alloc` reserves a host VA
+//! Each `alloc` reserves a host VA
 //! via PROT_NONE mmap, hands the VA to `AMDKFD_IOC_ALLOC_MEMORY_OF_GPU`,
 //! optionally maps it host-visible via `mmap(drm_fd, ...)`, and binds it
 //! into the GPU page table with `AMDKFD_IOC_MAP_MEMORY_TO_GPU`.
@@ -40,10 +40,8 @@ impl AmdAllocator {
 
     /// Allocate GTT-pinned system memory with `COHERENT | UNCACHED | PUBLIC`
     /// flags — host-visible, uncached, suitable for queue rings, GART pages,
-    /// and signal slots. Mirrors tinygrad's
-    /// `alloc(uncached=True, cpu_access=True)` at `ops_amd.py:751-757`:
-    /// the `uncached` branch sets **GTT**, not VRAM (uncached and VRAM are
-    /// mutually exclusive in tinygrad's flag composition).
+    /// and signal slots. The `uncached` branch sets **GTT**, not VRAM
+    /// (uncached and VRAM are mutually exclusive in the flag composition).
     pub fn alloc_uncached(&self, size: usize) -> Result<RawBuffer> {
         do_alloc(&self.dev, size, AllocKind::UncachedGtt, /*cpu_accessible=*/ true, /*zero_init=*/ true)
     }
@@ -63,8 +61,7 @@ impl Allocator for AmdAllocator {
     fn _alloc(&self, size: usize, options: &BufferSpec, zero: bool) -> Result<RawBuffer> {
         // Force cpu_access when there is no SDMA copy queue: without SDMA the
         // only way to move data is the host `memmove` path, which needs a host
-        // mapping. Mirrors tinygrad `ops_amd.py:649`
-        // (`cpu_access=options.cpu_access or not self.dev.has_sdma_queue`).
+        // mapping: `cpu_access = options.cpu_access || !has_sdma_queue`.
         let cpu_access = options.cpu_access || !self.dev.has_sdma_queue();
         do_alloc(&self.dev, size, AllocKind::DeviceVram { executable: true }, cpu_access, zero)
     }
@@ -75,8 +72,8 @@ impl Allocator for AmdAllocator {
                 // Drain first: a recycled VA may still be referenced by an
                 // in-flight kernel (dispatch is async + the LRU recycles
                 // without syncing). Direct host writes aren't ordered on the
-                // GPU timeline, so synchronize. Matches tinygrad's
-                // no-copy-queue `_copyin` (hcq.py:578).
+                // GPU timeline, so synchronize. Matches the no-copy-queue
+                // `_copyin` contract.
                 self.dev.synchronize()?;
                 // SAFETY: BAR-backed VRAM mapping valid for the buffer's lifetime;
                 // scheduler exclusivity. `dest_off + src.len()` is bounded by the caller.
@@ -100,7 +97,6 @@ impl Allocator for AmdAllocator {
             RawBuffer::AmdDevice { host_ptr: Some(ptr), .. } => {
                 // Dispatch is async (`AmdProgram::execute` does not block), so
                 // drain the device timeline before reading GPU-written results.
-                // Mirrors tinygrad `HCQAllocator._copyout` (hcq.py:613).
                 self.dev.synchronize()?;
                 let src_slice = unsafe { std::slice::from_raw_parts(ptr.as_ptr().add(src_off), dest.len()) };
                 dest.copy_from_slice(src_slice);
@@ -125,8 +121,7 @@ impl Allocator for AmdAllocator {
                 // an in-flight kernel and `dst` may be an in-flight target.
                 // Host pointer access isn't ordered on any GPU timeline, so we
                 // fence the whole device first — same contract as `_copyin`/
-                // `_copyout`. (tinygrad routes same-device copies through the
-                // SDMA queue with explicit `wait(timeline)` on both sides.)
+                // `_copyout`.
                 self.dev.synchronize()?;
                 let dst = unsafe { std::slice::from_raw_parts_mut(dst_ptr.as_ptr().add(dest_off), sz) };
                 let src_slice = unsafe { std::slice::from_raw_parts(src_ptr.as_ptr().add(src_off), sz) };
@@ -161,9 +156,7 @@ impl Allocator for AmdAllocator {
         //    fence: all queues share one page table, so unmapping `gpu_addr`
         //    while ANY queue's CP still references it faults the whole VM.
         //    Draining all timelines guarantees every in-flight reader (on any
-        //    connector) has retired before the unmap. Mirrors tinygrad
-        //    `HCQAllocatorBase._free` (`hcq.py:566`,
-        //    `for dev in buf.mapped_devs: dev.synchronize()`). Logged-and-ignore
+        //    connector) has retired before the unmap. Logged-and-ignore
         //    on failure: free is called from `Drop`, so we can't propagate.
         if let Err(e) = device.synchronize() {
             tracing::warn!(?e, gpu_addr, "AmdAllocator::free: device synchronize failed; freeing anyway");

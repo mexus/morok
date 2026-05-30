@@ -1,7 +1,8 @@
 //! PM4 packet builders for AMD GPU command processor.
 //!
-//! Direct port of tinygrad's `runtime/autogen/am/pm4_nv.py` (Navi family /
-//! gfx10+). The PM4 opcodes/bitfields are HARDWARE constants — stable across
+//! Source: submodules/new_new_tinygrad/tinygrad/runtime/autogen/am/pm4_nv.py
+//! (Navi family / gfx10+). The PM4 opcodes/bitfields are HARDWARE constants —
+//! stable across
 //! kernel versions and across gfx10/gfx11/gfx12 (CDNA gfx9 uses different
 //! values, not covered here).
 //!
@@ -13,8 +14,8 @@
 //! Used by [`AmdComputeQueue`] to emit signal/barrier/wait packets through
 //! the AQL vendor-specific indirect-buffer mechanism. The AQL kernel-dispatch
 //! packet itself doesn't honor the HSA `completion_signal` field on AMD
-//! hardware; tinygrad therefore wraps PM4 `RELEASE_MEM` in an AQL vendor IB
-//! packet to set the completion signal — see `ops_amd.py:385-394, 433-435`.
+//! hardware; we therefore wrap PM4 `RELEASE_MEM` in an AQL vendor IB
+//! packet to set the completion signal.
 
 #![allow(dead_code)]
 
@@ -63,8 +64,7 @@ pub const RELEASE_MEM_GCR_GL2_INV: u32 = 1 << 20;
 pub const RELEASE_MEM_GCR_GL2_WB: u32 = 1 << 21;
 pub const RELEASE_MEM_GCR_SEQ: u32 = 1 << 22;
 
-/// All cache-flush flags ORed — matches tinygrad's `cache_flush=True` path
-/// at `ops_amd.py:112-114`.
+/// All cache-flush flags ORed — uses the `cache_flush=True` path.
 pub const RELEASE_MEM_CACHE_FLUSH_ALL: u32 = RELEASE_MEM_GCR_GLV_INV
     | RELEASE_MEM_GCR_GL1_INV
     | RELEASE_MEM_GCR_GL2_INV
@@ -86,8 +86,7 @@ pub const fn release_mem_data_sel(x: u32) -> u32 {
 }
 
 /// `data_sel = send_32_bit_low` — write the low 32 bits of the value field
-/// (DW5..6) to the target address. Used by tinygrad's `signal()` at
-/// `ops_amd.py:388`.
+/// (DW5..6) to the target address. Used by the `signal()` path.
 pub const DATA_SEL_SEND_32_BIT_LOW: u32 = 1;
 /// `data_sel = send_64_bit_data`.
 pub const DATA_SEL_SEND_64_BIT_DATA: u32 = 2;
@@ -111,40 +110,37 @@ pub const fn wait_reg_mem_engine(x: u32) -> u32 {
     x << 8
 }
 
-/// `function = >= comparison`. Tinygrad uses this for signal-value waits at
-/// `ops_amd.py:31` and `:498`.
+/// `function = >= comparison`. Used for signal-value waits.
 pub const WAIT_REG_MEM_FUNC_GEQ: u32 = 5;
 
 // ── HDP flush register handshake addresses ────────────────────────────────
 //
-// Tinygrad `ops_amd.py:133-137` emits a register-space WAIT_REG_MEM against
-// the BIF HDP flush register pair before `acquire_mem` in `memory_barrier`.
-// Without this handshake, host writes to GTT (kernarg arena, ring) may not
-// be visible to the GPU's command processor when it consumes the next
-// packet — manifests as a hung dispatch with the signal never firing.
+// A register-space WAIT_REG_MEM against the BIF HDP flush register pair is
+// emitted before `acquire_mem` in `memory_barrier`. Without this handshake,
+// host writes to GTT (kernarg arena, ring) may not be visible to the GPU's
+// command processor when it consumes the next packet — manifests as a hung
+// dispatch with the signal never firing.
 //
 // The register pair address is **uniform across supported arches**:
-// gfx9 (vega_offsets) and gfx10+ (navi_offsets) both define
-// `NBIO_BASE_INST0_SEG2 = 0x0D20`, and every NBIO/NBIF dictionary in
-// `regs.py` defines the polled register at `(offset=262, segment=2)` —
-// only the symbolic name (PF0 vs PF1) differs across NBIO versions
-// (Strix Point's nbio_7_11_0 calls it `PF1_GPU_HDP_FLUSH_REQ` while older
-// nbios call the same physical register `PF0_GPU_HDP_FLUSH_REQ` —
-// tinygrad's `pf = '0' if version[:2] != (7, 11) else '1'` is purely a
-// name disambiguation, not an address change).
+// gfx9 and gfx10+ both define `NBIO_BASE_INST0_SEG2 = 0x0D20`, and every
+// NBIO/NBIF dictionary defines the polled register at `(offset=262,
+// segment=2)` — only the symbolic name (PF0 vs PF1) differs across NBIO
+// versions (Strix Point's nbio_7_11_0 calls it `PF1_GPU_HDP_FLUSH_REQ`
+// while older nbios call the same physical register `PF0_GPU_HDP_FLUSH_REQ`;
+// this is purely a name disambiguation, not an address change).
 pub const HDP_FLUSH_REQ_ADDR: u32 = 0xD20 + 262;
 pub const HDP_FLUSH_DONE_ADDR: u32 = 0xD20 + 263;
 
 // ── PACKET3 opcodes & constants (PM4 dispatch path, single-XCC) ──────────
 //
-// Mirrors `submodules/new_new_tinygrad/tinygrad/runtime/autogen/am/pm4_nv.py`.
-// These constants drive the raw-PM4 `AmdComputeQueue::exec_pm4` path that
-// tinygrad uses when `xccs == 1` (the gfx11/gfx12 default at `ops_amd.py:989`).
+// Source: submodules/new_new_tinygrad/tinygrad/runtime/autogen/am/pm4_nv.py
+// These constants drive the raw-PM4 `AmdComputeQueue::exec_pm4` path used
+// when `xccs == 1` (the gfx11/gfx12 default).
 
-pub const PACKET3_DISPATCH_DIRECT: u32 = 0x15; // pm4_nv.py:61
-pub const PACKET3_SET_SH_REG: u32 = 0x76; // pm4_nv.py:395
-pub const PACKET3_SET_SH_REG_START: u32 = 0x2c00; // pm4_nv.py:396
-pub const PACKET3_EVENT_WRITE: u32 = 0x46; // pm4_nv.py:291
+pub const PACKET3_DISPATCH_DIRECT: u32 = 0x15;
+pub const PACKET3_SET_SH_REG: u32 = 0x76;
+pub const PACKET3_SET_SH_REG_START: u32 = 0x2c00;
+pub const PACKET3_EVENT_WRITE: u32 = 0x46;
 
 // ── SH-relative COMPUTE_* register offsets ────────────────────────────────
 //
@@ -154,9 +150,7 @@ pub const PACKET3_EVENT_WRITE: u32 = 0x46; // pm4_nv.py:291
 // `GC_BASE=0x1260` with `field_offset=0x1ba0` — both sums equal `0x2e00`,
 // yielding `0x200` once `PACKET3_SET_SH_REG_START=0x2c00` is subtracted.
 //
-// Source: `submodules/new_new_tinygrad/tinygrad/runtime/autogen/am/regs.py`
-// (CDNA entry at line 351, RDNA3 at 1608, RDNA4 at 5576) and per-arch
-// `*_offsets.py` (`vega_offsets.py:199`, `navi_offsets.py` for gfx11/12).
+// Source: submodules/new_new_tinygrad/tinygrad/runtime/autogen/am/regs.py
 
 pub const COMPUTE_DISPATCH_INITIATOR: u32 = 0x200;
 pub const COMPUTE_START_X: u32 = 0x204;
@@ -178,8 +172,7 @@ pub const COMPUTE_PGM_RSRC3_GFX9: u32 = 0x22d;
 pub const COMPUTE_USER_DATA_0: u32 = 0x240;
 
 // ── COMPUTE_DISPATCH_INITIATOR field bits ─────────────────────────────────
-// Per `regs.py:1608` (gfx11) / `:5576` (gfx12). The `cs_w32_en` bit is only
-// defined on gfx11/12; gfx9 (CDNA) ignores it.
+// The `cs_w32_en` bit is only defined on gfx11/12; gfx9 (CDNA) ignores it.
 
 pub const DISPATCH_INITIATOR_COMPUTE_SHADER_EN: u32 = 1 << 0;
 pub const DISPATCH_INITIATOR_FORCE_START_AT_000: u32 = 1 << 2;
@@ -187,8 +180,7 @@ pub const DISPATCH_INITIATOR_CS_W32_EN: u32 = 1 << 15;
 
 // ── Event constants ───────────────────────────────────────────────────────
 // `EVENT_WRITE(CS_PARTIAL_FLUSH, EVENT_INDEX=4)` terminates a PM4 dispatch
-// stream — flushes CS state so the next dispatch sees clean queue state
-// (tinygrad `ops_amd.py:367`).
+// stream — flushes CS state so the next dispatch sees clean queue state.
 
 pub const CS_PARTIAL_FLUSH: u32 = 7;
 pub const EVENT_INDEX_PARTIAL_FLUSH: u32 = 4;
@@ -198,8 +190,7 @@ pub const EVENT_INDEX_PARTIAL_FLUSH: u32 = 4;
 /// Build a PM4 RELEASE_MEM packet that writes `value` (low 32 bits) to
 /// `addr`. With `cache_flush = true`, also flushes/invalidates all GPU
 /// caches before the write — required so prior kernel stores are visible
-/// at the signal site. Matches `AMDComputeQueue.signal` /
-/// `release_mem` at `ops_amd.py:110-131`.
+/// at the signal site.
 ///
 /// Layout (8 dwords total):
 /// ```text
@@ -232,7 +223,7 @@ pub fn release_mem(addr: u64, value: u32, cache_flush: bool) -> [u32; 8] {
 }
 
 // ── ACQUIRE_MEM GCR_CNTL cache-flag bit positions (gfx10+) ────────────────
-// Source: `submodules/new_new_tinygrad/tinygrad/runtime/autogen/am/pm4_nv.py:351-364`.
+// Source: submodules/new_new_tinygrad/tinygrad/runtime/autogen/am/pm4_nv.py
 // Each constant is the lambda `(x) << N` shift positions; here we encode the
 // `1`-set value directly.
 
@@ -247,7 +238,7 @@ pub const GCR_GL1_INV: u32 = 1 << 9;
 pub const GCR_GL2_INV: u32 = 1 << 14;
 pub const GCR_GL2_WB: u32 = 1 << 15;
 
-/// All cache levels invalidated/written-back. Equivalent to tinygrad's
+/// All cache levels invalidated/written-back. Equivalent to the
 /// `acquire_mem()` default (`gli=glm=glk=glv=gl1=gl2=1`). Yields 0xC3F1.
 pub const GCR_FLAGS_ALL: u32 = GCR_GLI_INV
     | GCR_GLM_WB
@@ -259,16 +250,16 @@ pub const GCR_FLAGS_ALL: u32 = GCR_GLI_INV
     | GCR_GL2_INV
     | GCR_GL2_WB;
 
-/// Mild flush: skips GLI and GL2 invalidate/writeback. Equivalent to
-/// tinygrad's `_exec` pre-dispatch `acquire_mem(gli=0, gl2=0)`. Yields 0x03F0.
+/// Mild flush: skips GLI and GL2 invalidate/writeback. Equivalent to the
+/// pre-dispatch `acquire_mem(gli=0, gl2=0)`. Yields 0x03F0.
 pub const GCR_FLAGS_NO_GLI_GL2: u32 = GCR_GLM_WB | GCR_GLM_INV | GCR_GLK_WB | GCR_GLK_INV | GCR_GLV_INV | GCR_GL1_INV;
 
-/// Build a PM4 ACQUIRE_MEM packet (cache invalidate). Tinygrad's
-/// `memory_barrier()` at `ops_amd.py:92-100` issues this after a
-/// WAIT_REG_MEM on the HDP-flush register. `cache_flags` selects which
-/// cache levels to invalidate/write-back — use [`GCR_FLAGS_ALL`] for the
-/// `memory_barrier` site and [`GCR_FLAGS_NO_GLI_GL2`] for the pre-dispatch
-/// site in `exec_pm4` (tinygrad's `acquire_mem(gli=0, gl2=0)`).
+/// Build a PM4 ACQUIRE_MEM packet (cache invalidate). `memory_barrier()`
+/// issues this after a WAIT_REG_MEM on the HDP-flush register. `cache_flags`
+/// selects which cache levels to invalidate/write-back — use
+/// [`GCR_FLAGS_ALL`] for the `memory_barrier` site and
+/// [`GCR_FLAGS_NO_GLI_GL2`] for the pre-dispatch site in `exec_pm4`
+/// (`acquire_mem(gli=0, gl2=0)`).
 ///
 /// Layout (8 dwords total):
 /// ```text
@@ -292,8 +283,8 @@ pub fn acquire_mem() -> [u32; 8] {
 }
 
 /// Build a PM4 WAIT_REG_MEM packet that polls memory at `addr` until
-/// `(*addr & mask) >= value`. Used by tinygrad's AQL `wait()` to block on
-/// a signal slot reaching the target value (`ops_amd.py:85-90`).
+/// `(*addr & mask) >= value`. Used by the AQL `wait()` to block on
+/// a signal slot reaching the target value.
 pub fn wait_reg_mem(addr: u64, value: u32, mask: u32) -> [u32; 7] {
     let info = wait_reg_mem_mem_space(1) // memory (not register)
         | wait_reg_mem_function(WAIT_REG_MEM_FUNC_GEQ)
@@ -313,7 +304,7 @@ pub fn wait_reg_mem(addr: u64, value: u32, mask: u32) -> [u32; 7] {
 /// matches the value the CP previously wrote to `reg_req`. This is the
 /// "register handshake" variant: `mem_space = 0` (register), `operation = 1`
 /// (signals CP to perform the write-then-poll handshake). Used by
-/// tinygrad's `memory_barrier` (`ops_amd.py:133-137`) to flush the HDP
+/// `memory_barrier` to flush the HDP
 /// before subsequent cache invalidations — without this handshake, host
 /// writes to GTT memory (kernarg arena, ring buffers) are not guaranteed
 /// to be visible to the GPU's command processor.
@@ -330,16 +321,15 @@ pub fn wait_reg_mem_register(reg_req: u32, reg_done: u32, value: u32, mask: u32)
 
 /// Build the HDP flush handshake packet for `memory_barrier`. Polls the
 /// BIF GPU_HDP_FLUSH_REQ/DONE register pair with `value = mask = 0xFFFF_FFFF`
-/// (full handshake — wait for all engines). Tinygrad `ops_amd.py:135-136`.
+/// (full handshake — wait for all engines).
 pub fn hdp_flush() -> [u32; 7] {
     wait_reg_mem_register(HDP_FLUSH_REQ_ADDR, HDP_FLUSH_DONE_ADDR, 0xFFFF_FFFF, 0xFFFF_FFFF)
 }
 
 /// Build a `PACKET3_SET_SH_REG`. `reg_offset` is the SH-relative offset
 /// (e.g. [`COMPUTE_PGM_LO`]). Successive `values` are written to consecutive
-/// registers, matching tinygrad's `wreg(reg, *args)` semantics at
-/// `ops_amd.py:69` (the same `wreg` call sets `PGM_LO` + `PGM_HI` in one
-/// packet, etc.).
+/// registers, matching the `wreg(reg, *args)` semantics (the same `wreg`
+/// call sets `PGM_LO` + `PGM_HI` in one packet, etc.).
 ///
 /// Output layout (2 + N dwords):
 /// ```text
@@ -358,15 +348,14 @@ pub fn set_sh_reg(reg_offset: u32, values: &[u32]) -> Vec<u32> {
 
 /// Build a `PACKET3_DISPATCH_DIRECT` packet — 5 dwords total. The PM4 CP
 /// reads `dim_x/y/z` and the `dispatch_initiator` value, then launches a
-/// compute dispatch with the previously-set COMPUTE_* registers. Mirrors
-/// the final packet emitted by `_exec` at `ops_amd.py:361-364`.
+/// compute dispatch with the previously-set COMPUTE_* registers.
 pub fn dispatch_direct(grid: [u32; 3], dispatch_initiator: u32) -> [u32; 5] {
     [packet3(PACKET3_DISPATCH_DIRECT, 3), grid[0], grid[1], grid[2], dispatch_initiator]
 }
 
 /// Build a `PACKET3_EVENT_WRITE` — 2 dwords. We use this to emit
 /// `CS_PARTIAL_FLUSH` after a `DISPATCH_DIRECT` so back-to-back dispatches
-/// see clean queue state (tinygrad `ops_amd.py:367`).
+/// see clean queue state.
 pub fn event_write(event_type: u32, event_index: u32) -> [u32; 2] {
     [packet3(PACKET3_EVENT_WRITE, 0), (event_type & 0x3f) | ((event_index & 0xf) << 8)]
 }

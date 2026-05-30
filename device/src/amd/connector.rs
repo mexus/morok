@@ -13,15 +13,15 @@
 //! the default KFD-safe **single-queue mode** every owner shares ONE connector
 //! per physical device and dispatch (scratch realloc, timeline reservation,
 //! kernarg bump, ring submission) is serialized behind the strategy's lock via
-//! [`AmdDeviceCore::exec_guard`] — tinygrad's one-queue-per-GPU model, which the
+//! [`AmdDeviceCore::exec_guard`] — a one-queue-per-GPU model, which the
 //! kernel's MES scheduler can sustain. In **multi-queue mode**
 //! (`SVOD_AMD_SINGLE_QUEUE=0`) each connector is exclusively owned and there is
 //! no dispatch lock: the same operations run serially by ownership and
 //! `exec_guard` returns `None`. Either way each owner sees a `&AmdConnector` and
 //! the dispatch code is identical — only the guard differs.
 //!
-//! Tinygrad analogue: `AMDDevice` (`runtime/ops_amd.py`) bundles all of
-//! this into one per-physical-GPU object and relies on the Python GIL to
+//! The conventional design bundles all of this into one per-physical-GPU
+//! object and relies on a global interpreter lock to
 //! serialize concurrent dispatchers. The Svod split is a deliberate
 //! ownership-eliminates-locks divergence — sibling plans on the same
 //! physical GPU contend only at the per-core synchronize barrier (rare),
@@ -68,14 +68,13 @@ pub struct AmdConnector {
     arena: Box<KernargArena>,
     /// Per-connector scratch backing. Mirrors what used to live on
     /// `AmdDevice::scratch_state`; see that field's docstring for the
-    /// `_ensure_has_local_memory` story (`ops_amd.py:1065-1081`).
+    /// scratch-grow-on-demand story.
     scratch_state: Mutex<ScratchState>,
     /// Per-connector timeline: monotonic counter + the shared completion signal
     /// the GPU writes on dispatch. `Arc` because it is ALSO registered in the
     /// core (`Weak<Timeline>`) so `synchronize_all` can drain this connector's
     /// in-flight work WITHOUT touching its queue — the decoupling that keeps
-    /// dispatch lock-free. Mirrors `HCQCompiled.timeline_signal/value`
-    /// (`hcq.py:405,415`).
+    /// dispatch lock-free. Pairs the device timeline signal with its counter.
     timeline: Arc<Timeline>,
 }
 
@@ -164,7 +163,7 @@ impl AmdConnector {
 
     /// Reserve the next timeline value (`fetch_add(1)`). The caller emits a
     /// queue signal packet that writes this value to the connector's signal
-    /// slot. Mirrors `HCQCompiled.next_timeline` (`hcq.py:447`).
+    /// slot.
     pub fn next_timeline(&self) -> u64 {
         self.timeline.next()
     }
@@ -218,9 +217,8 @@ impl AmdConnector {
     }
 
     /// Ensure the connector's scratch backing has at least
-    /// `private_segment_size` bytes per thread. Mirrors tinygrad's
-    /// `_ensure_has_local_memory` (`ops_amd.py:1065-1081`). The old scratch
-    /// buffer is freed (drain → unmap → munmap → free).
+    /// `private_segment_size` bytes per thread, growing it on demand. The old
+    /// scratch buffer is freed (drain → unmap → munmap → free).
     pub fn ensure_has_local_memory(&self, private_segment_size: u32) -> Result<()> {
         let current = self.scratch_state.lock().size_per_thread;
         if private_segment_size <= current {

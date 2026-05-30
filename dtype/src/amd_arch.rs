@@ -1,8 +1,7 @@
 //! AMD GPU architecture targets (gfx-family).
 //!
-//! Mirrors the arch set covered by tinygrad's AMDLLVMRenderer
-//! (`renderer/llvmir.py:259-289`) and HIPRenderer's `is_cdna` predicate
-//! (`renderer/cstyle.py:472`).
+//! Covers the arch set handled by the AMD LLVM renderer and the `is_cdna`
+//! predicate.
 
 use core::fmt;
 
@@ -40,8 +39,8 @@ impl AmdArch {
 
     /// `true` when the arch has hardware matrix-multiply intrinsics
     /// (CDNA's MFMA or RDNA3+'s WMMA). All supported arches have matrix cores
-    /// since RDNA2 was dropped to match tinygrad's `assert target[0] in (11, 12)
-    /// or target in ((9,4,2),(9,5,0))` (`ops_amd.py:962`).
+    /// since RDNA2 was dropped; only `(11, *)`, `(12, *)`, `(9,4,2)` and
+    /// `(9,5,0)` targets are accepted.
     pub const fn has_matrix_cores(self) -> bool {
         self.is_cdna() || self.is_rdna3() || self.is_rdna4()
     }
@@ -68,13 +67,13 @@ impl AmdArch {
 
     /// Map KFD's `gfx_target_version` integer to an `AmdArch`.
     ///
-    /// Format: `major*10000 + minor*100 + stepping` (mirrors tinygrad
-    /// `ops_amd.py:961` decoding of `/sys/.../properties` `gfx_target_version`).
+    /// Format: `major*10000 + minor*100 + stepping` (the encoding used by
+    /// `/sys/.../properties` `gfx_target_version`).
     pub fn from_gfx_target_version(v: u32) -> Option<Self> {
         // KFD's `gfx_target_version` encodes (major, minor, step) as
         //   v = major*10_000 + minor*100 + step
-        // (decimal, not hex — the `gfx%d%x%x` string formatting in tinygrad's
-        // `ops_amd.py:960` re-hexifies minor/step purely for display).
+        // (decimal, not hex — the `gfx%d%x%x` string formatting re-hexifies
+        // minor/step purely for display).
         Some(match v {
             90_402 => Self::Gfx942,
             90_500 => Self::Gfx950,

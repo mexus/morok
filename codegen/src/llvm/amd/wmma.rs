@@ -1,9 +1,5 @@
 //! AMD WMMA / MFMA intrinsic dispatch by gfx family.
 //!
-//! Tinygrad references:
-//! - RDNA3/RDNA4 `wmma.*` mangling: `renderer/amd/wmma.py`, `renderer/llvmir.py:259-289`
-//! - CDNA `mfma.*` mangling: same files
-//!
 //! The IR-level matrix shape is encoded in `WmmaMetadata::dims` as `(N, M, K)`.
 //! For each (arch, in_dtype, acc_dtype, dims) tuple we map to one of the
 //! `@llvm.amdgcn.{wmma|mfma}.*` intrinsics, packing inputs as needed.
@@ -43,10 +39,8 @@ pub fn render_wmma_amd(
     // WMMA operands are vectors (e.g. `<16 x half>` for inputs, `<8 x float>`
     // for accumulators). `DType::scalar()` returns `None` for `Vector{..}` —
     // we need `base()`, which unwraps both `Scalar` and `Vector` to the inner
-    // ScalarDType. Tinygrad's `.scalar()` works on both because of how their
-    // DType class is defined (`renderer/llvmir.py:57-62`); svod's `.scalar()`
-    // is stricter so we use `.base()` here. Wrapping in `Some` keeps the
-    // downstream API uniform.
+    // ScalarDType. svod's `.scalar()` is stricter than that, so we use
+    // `.base()` here. Wrapping in `Some` keeps the downstream API uniform.
     let in_scalar = Some(a.dtype().base());
     let acc_scalar = Some(uop.dtype().base());
 
@@ -70,7 +64,7 @@ pub fn render_wmma_amd(
     } else {
         // WMMA signature: any non-f32 accumulator (f16/bf16/int) takes a trailing
         // `i1 false` (the clamp/opsel bit); f32-accumulating WMMAs take (A,B,C)
-        // only. Mirrors tinygrad `dtype.scalar() != float` (`llvmir.py:62`).
+        // only (the `dtype.scalar() != float` case).
         let needs_tail = !matches!(acc_scalar, Some(ScalarDType::Float32));
         let tail = if needs_tail { ", i1 false" } else { "" };
         kernel.push(format!(
@@ -108,8 +102,8 @@ fn resolve_intrinsic(
 
     if arch.is_cdna() {
         // CDNA fp8/bf8 carry their own leading dot; bf16/f16 use `bf16.1k`/`f16`
-        // for K=16 and the dotted `.bf16`/`.f16` forms for K=32 (tinygrad
-        // `llvmir.py:51-56`). Other suffixes append directly after `{k}`.
+        // for K=16 and the dotted `.bf16`/`.f16` forms for K=32. Other suffixes
+        // append directly after `{k}`.
         let in_suffix = match (in_dt, k) {
             (ScalarDType::Float16, 32) => ".f16",
             (ScalarDType::BFloat16, 32) => ".bf16",

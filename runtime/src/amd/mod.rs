@@ -2,9 +2,9 @@
 //!
 //! Splits cleanly into:
 //! - [`compile`]: invokes the host `clang` with `--target=amdgcn-amd-amdhsa`
-//!   to lower AMDLLVMRenderer output (Phase 1) to an AMDGPU code object.
+//!   to lower the AMD LLVM renderer output (Phase 1) to an AMDGPU code object.
 //! - (later phases) device, allocator, queue, signal, program — KFD-direct
-//!   runtime mirroring tinygrad's `runtime/ops_amd.py`.
+//!   AMD runtime.
 //!
 //! All entry points are *infallible to compile* on non-Linux hosts; runtime
 //! calls return clean `Err(NoAmdGpu)` when there's no AMD GPU.

@@ -3,8 +3,7 @@
 //! Pure logic — no MMIO. The page-table entries are written through an
 //! injectable [`PhysMem`] backing (a plain buffer in tests, BAR-mapped VRAM in
 //! the real driver), so VA allocation, PTE/PDE encoding, huge-page selection,
-//! and the table walk are all unit-testable on any host. Port of tinygrad's
-//! `runtime/support/memory.py` + the AM page-table bits in `am/amdev.py`.
+//! and the table walk are all unit-testable on any host.
 
 pub mod manager;
 pub mod pagetable;
@@ -32,8 +31,7 @@ pub enum AddrSpace {
 }
 
 /// A live virtual mapping returned by [`manager::MemoryManager::valloc`] /
-/// [`map_range`](manager::MemoryManager::map_range). Port of tinygrad's
-/// `VirtMapping`.
+/// [`map_range`](manager::MemoryManager::map_range).
 #[derive(Clone, Debug)]
 pub struct VirtMapping {
     pub va_addr: u64,

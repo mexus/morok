@@ -1,5 +1,5 @@
-//! `AmdGraph`: PM4 graph capture/replay — a 1:1 port of tinygrad's `HCQGraph`
-//! (`runtime/graph/hcq.py:11`) for the single-device, single-XCC PM4 compute
+//! `AmdGraph`: PM4 graph capture/replay. Captures the kernel chain into one
+//! replayable PM4 command stream for the single-device, single-XCC PM4 compute
 //! path.
 //!
 //! The whole kernel chain is assembled once into one [`AmdHwQueue`] command
@@ -7,7 +7,7 @@
 //! repeated inference pays graph-launch cost once instead of the per-kernel
 //! `wait → barrier → exec → signal → doorbell` round-trip N times.
 //!
-//! Structure (faithful to `HCQGraph`):
+//! Structure:
 //! - The graph is ONE device-timeline step. A preamble does
 //!   `memory_barrier → wait(virt_timeline, timeline-1) → wait(kick, kickoff) →
 //!   signal(self, kickoff)`; per kernel just `exec()` (NO inter-kernel
@@ -22,8 +22,7 @@
 //!
 //! Scope: single device, single PM4 compute queue. AQL (multi-XCC), non-AMD
 //! programs, or mixed device/queue chains → `Ok(None)` (caller falls back to
-//! per-call dispatch). Mirrors `HCQGraph.supports_uop` rejecting non-PROGRAM /
-//! MOCK queues (`graph/hcq.py:318-336`).
+//! per-call dispatch).
 
 #![cfg(target_os = "linux")]
 
@@ -67,29 +66,24 @@ pub struct AmdGraph {
     /// The single PM4 command stream for the whole chain (preamble + N execs +
     /// final signal), bound into a host-visible page. `submit` mutates its
     /// patch state, so it sits behind a `Mutex` — replay takes `&self`
-    /// (`Graph::replay`) but serializes against itself. Mirrors tinygrad's
-    /// per-device `comp_queues[dev]` (`graph/hcq.py:51`).
+    /// (`Graph::replay`) but serializes against itself.
     comp_queue: Mutex<AmdHwQueue>,
     /// Dedicated kernarg page — one fixed slot per kernel, written at capture.
     /// Owning it (vs. the shared rolling `KernargArena` lapped by concurrent
     /// per-call dispatch → stale VAs → `NotPresent`) is what makes replay safe.
-    /// Mirrors `HCQGraph`'s per-graph `kernargs_bufs` (`graph/hcq.py:33`).
     _kernargs_buf: RawBuffer,
-    /// Per-graph kickoff signal (← `kick_signals`, `graph/hcq.py:65`). The
-    /// preamble waits this for `kickoff_value`; replay sets it after staging to
-    /// release the whole IB.
+    /// Per-graph kickoff signal. The preamble waits this for `kickoff_value`;
+    /// replay sets it after staging to release the whole IB.
     kick_sig: AmdSignal,
-    /// Per-graph "queue" signal the preamble sets to `kickoff_value`
-    /// (← `signals`, `graph/hcq.py:66`). Reset to 0 each replay
-    /// (`queue_signals_to_reset`, `graph/hcq.py:221`).
+    /// Per-graph "queue" signal the preamble sets to `kickoff_value`. Reset to
+    /// 0 each replay.
     self_sig: AmdSignal,
     /// Held to keep the signal pool's GTT page mapped while `kick_sig`/`self_sig`
     /// borrow into it.
     _signal_pool: Arc<SignalPool>,
-    /// Per-replay kickoff counter (← `kickoff_value`, `graph/hcq.py:68`).
+    /// Per-replay kickoff counter.
     kickoff_value: Mutex<u64>,
-    /// `last_timeline` device value waited on at the start of each replay
-    /// (← `last_timeline`, `graph/hcq.py:220`).
+    /// Device timeline value waited on at the start of each replay.
     last_timeline: Mutex<u64>,
 }
 
@@ -140,7 +134,7 @@ impl AmdGraph {
 
         // Recover the concrete AmdProgram for every kernel; assert they share one
         // device + one PM4 queue. A chain spanning two queues/devices would need
-        // tinygrad's multi-device `_resolve_deps` cross-queue sync — out of scope.
+        // multi-device cross-queue dependency resolution — out of scope.
         let mut progs: Vec<&AmdProgram> = Vec::with_capacity(kernels.len());
         for k in kernels {
             let Some(p) = k.program.as_any().downcast_ref::<AmdProgram>() else {
@@ -190,8 +184,7 @@ impl AmdGraph {
         connector.ensure_has_local_memory(max_priv_seg)?;
 
         // ── Lay out one 16-byte-aligned kernarg slot per kernel inside a single
-        // dedicated page (← `kernargs_bufs` + per-kernel `BumpAllocator.alloc`,
-        // `graph/hcq.py:33-41`). Validate the buffer/val counts up front.
+        // dedicated page. Validate the buffer/val counts up front.
         let mut slot_offsets: Vec<usize> = Vec::with_capacity(kernels.len());
         let mut total = 0usize;
         for (k, p) in kernels.iter().zip(&progs) {
@@ -229,22 +222,21 @@ impl AmdGraph {
         };
 
         // ── Per-graph kick + self signals from the device-core's shared
-        // pool (← `kick_signals` + `signals`, `graph/hcq.py:65-66`). Both
-        // start at 0.
+        // pool. Both start at 0.
         let signal_pool = Arc::clone(dev.core().signal_pool().expect("signal pool installed by factory"));
         let kick_sig = signal_pool.acquire()?;
         let self_sig = signal_pool.acquire()?;
 
-        // ── Build the one command stream. (← `comp_queues[dev]`, plus the
-        // preamble/exec/final loop at `graph/hcq.py:158-217`.) The queue is a
-        // pure command buffer — the connector is passed to `exec`/`submit`.
+        // ── Build the one command stream (preamble + exec loop + final
+        // signal). The queue is a pure command buffer — the connector is
+        // passed to `exec`/`submit`.
         let mut comp_queue = AmdHwQueue::new();
 
-        // Preamble (← graph/hcq.py:158-160).
+        // Preamble.
         comp_queue.preamble(kick_sig.value_addr(), self_sig.value_addr());
 
-        // Per-kernel: fill kernargs, then exec (← graph/hcq.py:162-210, AMD
-        // subset — no inter-kernel signal/wait).
+        // Per-kernel: fill kernargs, then exec (AMD subset — no inter-kernel
+        // signal/wait).
         for ((k, p), &off) in kernels.iter().zip(&progs).zip(&slot_offsets) {
             // SAFETY: off + record <= total <= allocation; the graph is the sole
             // writer of this slot for its lifetime.
@@ -252,8 +244,7 @@ impl AmdGraph {
             let slot_gpu = kernargs_gpu + off as u64;
 
             // Plain realize: buffer VAs are plan-stable, so every buffer is a
-            // concrete VA (`Ok`). JIT input replacement (tinygrad's
-            // `input_replace_to_var`, `graph/hcq.py:19-26`) would mark a position
+            // concrete VA (`Ok`). JIT input replacement would mark a position
             // `Err(Sym::InputVa(j,pos))`; the current `GraphKernel` carries no
             // input map, so none are symbolic here. The `Sym::InputVa` machinery
             // is in place for when JIT graphs land.
@@ -273,11 +264,10 @@ impl AmdGraph {
             );
         }
 
-        // Final signal advancing the real device timeline by +1 (← graph/hcq.py:217).
+        // Final signal advancing the real device timeline by +1.
         comp_queue.final_signal();
 
-        // Bind into a host-visible page + build the indirect-buffer reference
-        // (← `bind(dev)`, graph/hcq.py:217).
+        // Bind into a host-visible page + build the indirect-buffer reference.
         comp_queue.bind(allocator)?;
 
         if std::env::var_os("SVOD_DEBUG_DISPATCH").is_some() {
@@ -305,8 +295,7 @@ impl AmdGraph {
             kick_sig,
             self_sig,
             _signal_pool: signal_pool,
-            // last_timeline starts at 0 (← `{dev: (timeline_signal, 0)}`,
-            // graph/hcq.py:220).
+            // last_timeline starts at 0.
             kickoff_value: Mutex::new(0),
             last_timeline: Mutex::new(0),
         })))
@@ -314,7 +303,7 @@ impl AmdGraph {
 }
 
 impl Graph for AmdGraph {
-    /// Replay the captured chain (← `HCQGraph.__call__`, `graph/hcq.py:263`).
+    /// Replay the captured chain.
     ///
     /// `vals` is unused: the gated chains are all static (no runtime vars), so
     /// launch `vals` are baked into the kernarg slots at capture. Buffer VAs are
@@ -325,8 +314,7 @@ impl Graph for AmdGraph {
             return Err(err);
         }
 
-        // 1. Bump kickoff + wait the previous replay's timeline target
-        //    (← graph/hcq.py:271-272).
+        // 1. Bump kickoff + wait the previous replay's timeline target.
         let kickoff_value = {
             let mut k = self.kickoff_value.lock();
             *k += 1;
@@ -354,28 +342,28 @@ impl Graph for AmdGraph {
             let prev = self.connector().timeline_value().saturating_sub(1);
             let signalled = self.connector().next_timeline();
 
-            // Resolve the graph's symbols (← `hcq_var_vals`, graph/hcq.py:275-285).
+            // Resolve the graph's symbols.
             let mut var_vals: VarVals = VarVals::new();
             var_vals.insert(Sym::Kickoff, kickoff_value);
             var_vals.insert(Sym::VirtTimelineVal, prev);
             var_vals.insert(Sym::VirtTimelineSigAddr, self.connector().timeline_signal().value_addr());
 
             // submit → apply_var_vals (patch hw_page + kernargs) → _submit (one
-            //  doorbell). (← graph/hcq.py:290.)
+            //  doorbell).
             q.submit(self.connector(), &var_vals)?;
             signalled
         };
         *self.last_timeline.lock() = signalled;
 
         // 3. Reset the per-queue signal, then release the IB by setting the kick
-        //    signal to kickoff_value (← graph/hcq.py:295-296). Ordering matters:
+        //    signal to kickoff_value. Ordering matters:
         //    the GPU's preamble is parked on the kick wait until this store, and
         //    the IB is already in the ring (pushed above).
         self.self_sig.set(0);
         self.kick_sig.set(kickoff_value);
 
-        // Async return — no synchronize here (← `HCQGraph.__call__` only waits
-        // when `wait=True`, graph/hcq.py:298-300). Back-pressure is the *next*
+        // Async return — no synchronize here (only waits when `wait=True`).
+        // Back-pressure is the *next*
         // replay's `last_timeline` wait above; host reads drain to this replay's
         // final signal (`signalled`) via `AmdAllocator::_copyout` / the
         // `Buffer::as_*` guards / an explicit `synchronize`, identical to the

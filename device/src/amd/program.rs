@@ -44,8 +44,7 @@ pub struct ParsedKernel {
 
 /// Parse an AMDGPU code-object ELF and resolve the named kernel descriptor.
 ///
-/// Mirrors tinygrad `runtime/support/elf.py::elf_loader` (lines 32-50): PT_LOAD
-/// segments stay at their declared file offsets, no-vaddr sections get
+/// PT_LOAD segments stay at their declared file offsets, no-vaddr sections get
 /// appended aligned, then R_AMDGPU_REL64 / R_AMDGPU_ABS64 relocations get
 /// applied against the symbol table.
 pub fn parse_kernel(bytes: &[u8], kernel_name: &str) -> Result<ParsedKernel> {
@@ -66,7 +65,6 @@ pub fn parse_kernel(bytes: &[u8], kernel_name: &str) -> Result<ParsedKernel> {
     }
 
     // ── 2. Build the laid-out image (section-based, handles ET_REL+ET_DYN).
-    // Mirrors tinygrad `runtime/support/elf.py::elf_loader`:
     // SHF_ALLOC sections with a non-zero sh_addr go at their declared
     // virtual address; address-0 sections get appended aligned to the
     // running image end. The high-level object::File walk gives us
@@ -250,11 +248,11 @@ pub struct AmdProgram {
     aql_prog_addr: u64,
     /// PM4 shader entry point: `code_gpu + kd_offset + kernel_code_entry_byte_offset`.
     /// Used by `AmdComputeQueue::exec_pm4` (the COMPUTE_PGM_LO/HI register
-    /// pair carries `prog_addr >> 8`). Mirrors `ops_amd.py:598`.
+    /// pair carries `prog_addr >> 8`).
     pm4_prog_addr: u64,
     /// COMPUTE_PGM_RSRC1/2/3 values for the PM4 path, derived from the
     /// kernel descriptor at load time. `rsrc1` carries the gfx11 cwsr-priv
-    /// bit; `rsrc2` carries the LDS-size patch (`ops_amd.py:585-596`).
+    /// bit; `rsrc2` carries the LDS-size patch.
     rsrc1: u32,
     rsrc2: u32,
     rsrc3: u32,
@@ -266,7 +264,7 @@ pub struct AmdProgram {
     /// `kernel_code_properties & ENABLE_SGPR_PRIVATE_SEGMENT_BUFFER` — kernel
     /// reads a 4-dword scratch descriptor from user SGPRs 0-3. We prepend
     /// `[scratch_lo, scratch_hi|swizzle_bit, 0xffffffff, 0x20c14000]` to the
-    /// USER_DATA registers when set. Mirrors `ops_amd.py:326-331`.
+    /// USER_DATA registers when set.
     enable_private_segment_sgpr: bool,
     /// Decoded kernel descriptor (size of kernarg, LDS, scratch, etc.).
     kd: AmdHsaKernelDescriptor,
@@ -296,8 +294,7 @@ impl AmdProgram {
         // connector it owns/leases before `execute_on`: `ExecutionPlan`
         // (`execution_plan.rs::execute_kernel`), `AmdGraph::capture`, and the
         // `Program::execute` trait path (which leases a connector and calls
-        // `ensure_has_local_memory` on it). Mirrors tinygrad `ops_amd.py:589`
-        // but per-connector.
+        // `ensure_has_local_memory` on it) — scratch is ensured per-connector.
 
         // Allocate VRAM for the code object (EXECUTABLE flag is set on every
         // AmdAllocator alloc; clang's amdgcn output runs on the GPU side).
@@ -313,8 +310,7 @@ impl AmdProgram {
 
         let aql_prog_addr = code_gpu + parsed.kd_offset;
 
-        // Derive PM4-path fields from the kernel descriptor. Mirrors
-        // `ops_amd.py:585-598`:
+        // Derive PM4-path fields from the kernel descriptor:
         //   lds_size = round_up(group_segment_fixed_size, 512) / 512 (clamped 9 bits)
         //   target_major: 9 = CDNA, 11/12 = RDNA3/4
         //   rsrc1 |= 1<<20 on gfx11 (cwsr-priv shim)
@@ -519,11 +515,9 @@ impl AmdProgram {
         self.kd.private_segment_fixed_size
     }
 
-    /// Fill one kernarg slot for graph capture. Port of
-    /// `HCQProgram.fill_kernargs` + `CLikeArgsState.__init__`
-    /// (`hcq.py:341,322-330`): writes the buffer VAs then scalar vals into the
-    /// caller-provided slot at `(slot_host, slot_gpu)` and returns the
-    /// [`AmdArgsState`] the graph's `AmdHwQueue::exec` binds.
+    /// Fill one kernarg slot for graph capture: writes the buffer VAs then
+    /// scalar vals into the caller-provided slot at `(slot_host, slot_gpu)`
+    /// and returns the [`AmdArgsState`] the graph's `AmdHwQueue::exec` binds.
     ///
     /// `bufs[pos]` is a concrete VA (`Ok`) or a [`Sym`] for a JIT input (`Err`)
     /// — symbolic inputs are recorded so they get re-patched per replay. The
@@ -604,10 +598,10 @@ impl AmdProgram {
                 message: format!("AmdProgram: expected {} scalar vals, got {}", self.var_count, vals.len()),
             });
         }
-        // Kernarg layout matches tinygrad `hcq.py:330` (`CLikeArgsState`):
+        // Kernarg layout:
         //   - Each buffer argument = 8 bytes (64-bit GPU pointer)
-        //   - Each scalar variable = 4 bytes (uint32, `fmt='I'`)
-        // Tinygrad packs sints as i32 because svod's renderer also lowers
+        //   - Each scalar variable = 4 bytes (uint32)
+        // Scalars pack as i32 because svod's renderer lowers
         // `Index` → `i32` via `pm_lower_index_dtype`. The kernel descriptor
         // emitted by clang reflects this — a kernel with `(ptr, ptr, ..., i32
         // %v0, i32 %v1)` has `kernarg_size = bufs*8 + vars*4`, NOT bufs*8 +
@@ -650,7 +644,7 @@ impl AmdProgram {
         }
         let kernarg_gpu = arena.gpu_at(off);
 
-        // 2. Match tinygrad's HCQ submit sequence at `hcq.py:371-378`:
+        // 2. Submit sequence:
         //   wait(conn.timeline, conn.timeline_value-1) → memory_barrier → exec
         //   → signal(conn.timeline, conn.next_timeline()) → submit
         let g = global_size.unwrap_or([1, 1, 1]);
@@ -679,8 +673,7 @@ impl AmdProgram {
         // USER_DATA SGPR pre-load: kernarg pointer only — the optional scratch
         // SGPR descriptor is prepended inside `dispatch_pm4` from the live
         // `conn.scratch_gpu_va()` in the same place as
-        // `COMPUTE_DISPATCH_SCRATCH_BASE`. Mirrors tinygrad
-        // `ops_amd.py:325-342`.
+        // `COMPUTE_DISPATCH_SCRATCH_BASE`.
         let mut user_data: smallvec::SmallVec<[u32; 8]> = smallvec::SmallVec::new();
         user_data.push(kernarg_gpu as u32);
         user_data.push((kernarg_gpu >> 32) as u32);

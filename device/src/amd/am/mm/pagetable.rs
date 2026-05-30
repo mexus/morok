@@ -1,11 +1,10 @@
 //! GMMU page-table geometry + PTE/PDE bit encoding.
 //!
 //! Pure bit/arithmetic logic — no MMIO, no backing store — so it is fully
-//! unit-tested against tinygrad's exact constants. Port of the AM page-table
-//! pieces of tinygrad's `runtime/support/am/{amdev,ip}.py` + `memory.py`.
+//! unit-tested against the AMD hardware's exact constants.
 //!
 //! **gfx11 / RDNA3 is implemented and tested.** The arch split is by the
-//! `ip_ver` tuple read from IP discovery (tinygrad's `self.ip_ver[GC_HWIP]`),
+//! `ip_ver` tuple read from IP discovery (the GC IP-block version),
 //! exactly where gfx9 (VG10) and gfx12 differ — those branches are marked and
 //! filled in when their hardware can validate them. The page-table *shape*
 //! (4-level / 48-bit) is shared across gfx9/11/12, so geometry does not branch.
@@ -16,7 +15,7 @@ fn bit_length(x: u64) -> u32 {
     u64::BITS - x.leading_zeros()
 }
 
-// ── PTE/PDE flag bits (`am.py` AMDGPU_PTE_* / AMDGPU_PDE_*) ──────────────────
+// ── PTE/PDE flag bits (AMDGPU_PTE_* / AMDGPU_PDE_*) ──────────────────────────
 pub const PTE_VALID: u64 = 1 << 0;
 pub const PTE_SYSTEM: u64 = 1 << 1;
 pub const PTE_SNOOPED: u64 = 1 << 2;
@@ -41,7 +40,7 @@ const MTYPE_UC_GFX11: u64 = 3;
 /// Physical-address field: bits 12..=47 (page-aligned, 36 bits).
 pub const PADDR_MASK: u64 = 0x0000_FFFF_FFFF_F000;
 
-// ── Page-table level indices (`am.AMDGPU_VM_*`) ─────────────────────────────
+// ── Page-table level indices (AMDGPU_VM_*) ──────────────────────────────────
 pub const VM_PDB2: usize = 0; // root
 pub const VM_PDB1: usize = 1;
 pub const VM_PDB0: usize = 2;
@@ -58,8 +57,7 @@ fn ip_ge(v: IpVer, major: u8) -> bool {
 
 /// 4-level / 48-bit page-table geometry (gfx9/11/12 all share this shape).
 /// `pte_covers[lv]` = bytes one entry at level `lv` maps; `pte_cnt[lv]` =
-/// entries at that level. Port of `MemoryManager.__init__`'s `pte_covers` /
-/// `pte_cnt` setup for `va_shifts=[12,21,30,39]`, `va_bits=48`.
+/// entries at that level, for `va_shifts=[12,21,30,39]`, `va_bits=48`.
 #[derive(Clone, Debug)]
 pub struct Geometry {
     pub pte_covers: Vec<u64>,
@@ -192,8 +190,8 @@ pub fn entry_valid(entry: u64) -> bool {
 }
 
 /// TLB fragment exponent for a `[va, va+sz)` mapping: `log2(min(lowest set bit
-/// of va, lowest set bit of sz)) - 12` (fragment 0 = 4 KiB). Port of
-/// `MemoryManager._frag_size` (`must_cover=True`). Saturates at 0.
+/// of va, lowest set bit of sz)) - 12` (fragment 0 = 4 KiB), covering the whole
+/// range (`must_cover`). Saturates at 0.
 pub fn frag_size(va: u64, sz: u64) -> u32 {
     let va_pwr2 = if va > 0 { va & va.wrapping_neg() } else { 1u64 << 63 };
     let sz_pwr2 = sz & sz.wrapping_neg();

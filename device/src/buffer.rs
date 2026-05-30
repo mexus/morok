@@ -24,11 +24,11 @@ fn next_buffer_id() -> u64 {
 
 /// Unique identifier for a buffer handle.
 ///
-/// Mirrors tinygrad's distinct-identity-per-`BUFFER_VIEW` semantics: each
-/// `Buffer` value carries its own `BufferId`, including views — so two
-/// disjoint slices of a shared arena have different ids and the parallel
-/// hazard model can treat them as independent. Use [`Buffer::storage_id`]
-/// when storage-identity (rather than handle-identity) matters.
+/// Distinct identity per view: each `Buffer` value carries its own `BufferId`,
+/// including views — so two disjoint slices of a shared arena have different
+/// ids and the parallel hazard model can treat them as independent. Use
+/// [`Buffer::storage_id`] when storage-identity (rather than handle-identity)
+/// matters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct BufferId(pub u64);
 
@@ -108,10 +108,10 @@ impl Drop for BufferData {
 
 /// A device buffer that may be a view into another buffer.
 ///
-/// Handle-identity (`id`) is per-`Buffer` value, including views — mirroring
-/// tinygrad, where each `BUFFER_VIEW` produces a distinct UOp identity.
-/// Storage-identity (the underlying `Arc<BufferData>`) is shared between a
-/// buffer and its views; use [`Buffer::storage_id`] to compare it.
+/// Handle-identity (`id`) is per-`Buffer` value, including views — each view
+/// produces a distinct identity. Storage-identity (the underlying
+/// `Arc<BufferData>`) is shared between a buffer and its views; use
+/// [`Buffer::storage_id`] to compare it.
 #[derive(Debug, Clone)]
 pub struct Buffer {
     /// Per-handle unique identifier. Views get fresh ids; storage is shared
@@ -183,9 +183,9 @@ impl Buffer {
     ///
     /// The view shares storage with `self` (same `Arc<BufferData>`) but gets
     /// a **fresh `BufferId`** so the runtime parallel-hazard model treats
-    /// disjoint views of one arena as independent — mirroring tinygrad's
-    /// `BUFFER_VIEW`-as-distinct-identity semantics. Use
-    /// [`Buffer::storage_id`] to compare storage identity instead.
+    /// disjoint views of one arena as independent (each view is a distinct
+    /// identity). Use [`Buffer::storage_id`] to compare storage identity
+    /// instead.
     pub fn view(&self, offset: usize, size: usize) -> Result<Self> {
         // Validate view parameters
         if offset + size > self.size {
@@ -501,8 +501,7 @@ impl Buffer {
 
     /// Copy data from host memory into this buffer.
     ///
-    /// Delegates to the allocator's `_copyin` (tinygrad `Buffer.copyin` →
-    /// `allocator._copyin`, device.py:205-210). The per-backend logic lives on
+    /// Delegates to the allocator's `_copyin`. The per-backend logic lives on
     /// the allocator, not here.
     pub fn copyin(&mut self, src: &[u8]) -> Result<()> {
         self.ensure_allocated()?;
@@ -516,9 +515,8 @@ impl Buffer {
 
     /// Copy data from this buffer to host memory.
     ///
-    /// Delegates to the allocator's `_copyout` (tinygrad `Buffer.copyout` →
-    /// `allocator._copyout`, device.py:211-216). Device backends synchronize
-    /// their timeline inside `_copyout` before reading (hcq.py:613).
+    /// Delegates to the allocator's `_copyout`. Device backends synchronize
+    /// their timeline inside `_copyout` before reading.
     pub fn copyout(&self, dst: &mut [u8]) -> Result<()> {
         self.ensure_allocated()?;
 
@@ -532,10 +530,10 @@ impl Buffer {
     /// Copy data from another buffer to this buffer.
     ///
     /// Same allocator instance (same device) → on-device `_transfer`.
-    /// Cross-backend → bounce through host via `_copyout` then `_copyin`,
-    /// matching tinygrad (which has no CPU↔GPU `_transfer`; cross-backend COPY
-    /// goes through host). The source device is synchronized before the host
-    /// read so async dispatch never races a still-running writer.
+    /// Cross-backend → bounce through host via `_copyout` then `_copyin`
+    /// (there is no CPU↔GPU `_transfer`; cross-backend COPY goes through
+    /// host). The source device is synchronized before the host read so async
+    /// dispatch never races a still-running writer.
     pub fn copy_from(&mut self, src: &Buffer) -> Result<()> {
         self.ensure_allocated()?;
         src.ensure_allocated()?;

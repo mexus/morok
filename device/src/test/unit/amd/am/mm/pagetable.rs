@@ -1,10 +1,9 @@
-
 use super::*;
 
 const GFX11: IpVer = (11, 0, 0);
 
 #[test]
-fn gfx11_geometry_matches_tinygrad() {
+fn gfx11_geometry_layout() {
     let g = Geometry::gfx11();
     // pte_covers (level 0..3 = PDB2,PDB1,PDB0,PTB).
     assert_eq!(g.pte_covers, vec![1 << 39, 1 << 30, 1 << 21, 1 << 12]);

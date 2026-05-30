@@ -48,7 +48,7 @@ type RuntimeLaunchSizes = (Option<[usize; 3]>, Option<[usize; 3]>);
 /// A pre-compiled kernel ready for execution.
 ///
 /// Variable values are stored as positional `vals: Vec<i64>` rather than a named
-/// HashMap, matching Tinygrad's `vals: tuple[int, ...]` parameter style.
+/// HashMap.
 #[derive(Clone)]
 pub struct PreparedKernel {
     /// Unique identifier (from original AST).
@@ -74,8 +74,8 @@ pub struct PreparedKernel {
 
     /// Fixed variable bindings captured at prepare time.
     ///
-    /// These mirror Tinygrad's `fixedvars` semantics: values fixed by scheduling
-    /// (for example from bound ranges) are not overridden by `execute_with_vars`.
+    /// Values fixed by scheduling (for example from bound ranges) are not
+    /// overridden by `execute_with_vars`.
     pub fixedvars: HashMap<String, i64>,
 
     /// Kernel IDs that must complete before this one (dependencies).
@@ -422,9 +422,8 @@ impl ExecutionPlan {
         #[cfg(target_os = "linux")]
         if let Some(amd) = kernel.kernel.program.as_any().downcast_ref::<svod_device::amd::AmdProgram>() {
             let conn = self.amd_connector_for(amd)?;
-            // Grow this connector's scratch to fit the program. Mirrors
-            // tinygrad's `_ensure_has_local_memory` at program load
-            // (`ops_amd.py:589-590`) but applied per-connector.
+            // Grow this connector's scratch to fit the program: ensure local
+            // memory at program load, applied per-connector.
             conn.ensure_has_local_memory(amd.private_segment_size())
                 .map_err(|e| crate::error::Error::Execution { reason: format!("scratch grow: {e}") })?;
             return unsafe {

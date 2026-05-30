@@ -6,9 +6,9 @@
 //! `Program::execute` claims `kernarg_size` bytes (16-byte aligned per ABI).
 //! The arena wraps when it fills; on wrap we drain every live `AmdConnector`
 //! via the arena's owning `AmdDeviceCore` — without that drain a wrap can
-//! clobber kernargs the GPU is still consuming (tinygrad's GIL + single-queue
-//! dispatch made this impossible to interleave; with per-owner connectors the
-//! host can sprint ahead of the GPU).
+//! clobber kernargs the GPU is still consuming (a global interpreter lock +
+//! single-queue dispatch would make this impossible to interleave; with
+//! per-owner connectors the host can sprint ahead of the GPU).
 
 #![cfg(target_os = "linux")]
 

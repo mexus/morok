@@ -1,29 +1,28 @@
 //! `AmdHwQueue`: a symbolic PM4 command builder for graph capture/replay.
 //!
-//! 1:1 port of tinygrad's `HWQueue` (`runtime/support/hcq.py:75`) +
-//! `AMDComputeQueue` (`runtime/ops_amd.py:51`) for the single-device, single-XCC
+//! A hardware-queue command builder for the single-device, single-XCC
 //! PM4 compute path. The builder accumulates a dword stream (`q`) with symbolic
 //! patch points so the whole stream can be bound into a host-visible page once
 //! and replayed with one doorbell, re-resolving the symbolic dwords (timeline
 //! values/addresses, JIT input-buffer VAs) each call without rebuilding.
 //!
-//! Why a port (vs. the previous bespoke IB patching): tinygrad runs the whole
-//! graph as ONE device-timeline step gated by a kickoff signal, with same-queue
+//! Why this structure (vs. the previous bespoke IB patching): the whole
+//! graph runs as ONE device-timeline step gated by a kickoff signal, with same-queue
 //! kernels ordered purely by the `acquire_mem` + `CS_PARTIAL_FLUSH` already
 //! inside each `exec` (no inter-kernel signal/wait). The previous design threaded
 //! a per-kernel timeline chain and bumped the device timeline N times per replay,
-//! which drifted on multi-kernel chains and failed single-kernel under load. This
-//! mirrors the proven structure exactly. See `graph.rs` for the assembly order.
+//! which drifted on multi-kernel chains and failed single-kernel under load. See
+//! `graph.rs` for the assembly order.
 //!
-//! Symbolic model (← tinygrad `UOp.variable` + `sym_infer`): Svod PM4 isn't
-//! UOp-symbolic, so a [`Sym`] is an enum resolved through a `HashMap<Sym,u64>`
+//! Symbolic model: Svod PM4 dwords are concrete, so a [`Sym`] is an enum
+//! resolved through a `HashMap<Sym,u64>`
 //! ([`VarVals`]) at submit. Each use site additionally carries a `shift`
-//! (hi/lo of a 64-bit address) and an `add` (tinygrad's `var + 1` for the final
+//! (hi/lo of a 64-bit address) and an `add` (`var + 1` for the final
 //! signal), so one symbol covers `lo`, `hi`, and `+1` uses without extra enum
 //! variants. `q(&[QVal])` records concrete dwords directly and symbolic dwords
-//! in `q_sints` (← `q_sints`); `bind_sints_to_mem` records symbolic kernarg
-//! fields in `mv_sints` (← `mv_sints`). `apply_var_vals` patches both, skipping
-//! unchanged values via `prev_resolved` (← `_apply_var_vals`, `hcq.py:217`).
+//! in `q_sints`; `bind_sints_to_mem` records symbolic kernarg
+//! fields in `mv_sints`. `apply_var_vals` patches both, skipping
+//! unchanged values via `prev_resolved`.
 
 #![cfg(target_os = "linux")]
 
@@ -37,25 +36,24 @@ use crate::amd::queue::build_exec_pm4;
 use crate::amd::sys::pm4;
 use crate::error::{Error, Result};
 
-/// A symbol that resolves to a `u64` at submit time. Replaces tinygrad's
-/// `UOp.variable` (`graph/hcq.py:25,69,154-155`) — Svod PM4 dwords are concrete,
-/// so we model the small fixed set of graph-replay symbols as an enum keyed into
-/// [`VarVals`].
+/// A symbol that resolves to a `u64` at submit time. Svod PM4 dwords are
+/// concrete, so we model the small fixed set of graph-replay symbols as an enum
+/// keyed into [`VarVals`].
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Sym {
-    /// `kickoff_var` (`graph/hcq.py:69`): the per-replay kickoff counter. The
+    /// The per-replay kickoff counter. The
     /// preamble waits the kick signal for this value; the host sets the kick
     /// signal to it after staging to release the whole IB.
     Kickoff,
-    /// `timeline_var_<dev>` (`graph/hcq.py:155`): the virtual device-timeline
+    /// The virtual device-timeline
     /// value the graph's preamble waits for (resolved to `timeline_value-1`).
-    /// The final signal uses this symbol with `add = 1` (← `var + 1`).
+    /// The final signal uses this symbol with `add = 1` (i.e. `var + 1`).
     VirtTimelineVal,
-    /// `timeline_sig_<dev>` (`graph/hcq.py:154`): the GPU VA of the device
+    /// The GPU VA of the device
     /// timeline signal (the graph's wait/signal target address is itself a
     /// symbol so the graph drives the real device timeline at replay).
     VirtTimelineSigAddr,
-    /// `inp_<iidx>_<dev>` (`graph/hcq.py:25`): a JIT input-buffer VA patched per
+    /// A JIT input-buffer VA patched per
     /// replay. `(kernel_index, buffer_position)` identifies the kernarg slot.
     InputVa(usize, usize),
     /// A caller-supplied launch variable by name (`var_vals` in `__call__`).
@@ -63,10 +61,9 @@ pub enum Sym {
 }
 
 /// Resolved values for every [`Sym`] referenced by a queue, supplied at submit.
-/// Mirrors tinygrad's `hcq_var_vals` dict (`graph/hcq.py:275-285`).
 pub type VarVals = HashMap<Sym, u64>;
 
-/// Number-format of a symbolic kernarg field (← tinygrad `fmt` arg, `hcq.py:211`).
+/// Number-format of a symbolic kernarg field.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Fmt {
     /// `'Q'` — 64-bit (buffer VAs).
@@ -76,17 +73,16 @@ pub enum Fmt {
 }
 
 /// One value enqueued via [`AmdHwQueue::q`] — concrete dword or a symbol slot.
-/// Mirrors the `int` vs `UOp` branch in tinygrad's `q()` (`hcq.py:102-106`).
 enum QVal {
     /// A literal dword written verbatim.
     Dword(u32),
     /// A symbolic dword: `((resolved >> shift) as u32 + add)`. `shift` selects
-    /// lo/hi of a 64-bit address; `add` is tinygrad's `var + 1`.
+    /// lo/hi of a 64-bit address; `add` applies the `var + 1` offset.
     Sym { sym: Sym, shift: u32, add: u32 },
 }
 
-/// A symbolic dword inside `q`: where it lives + how to derive it (← `q_sints`,
-/// extended with `shift`/`add` so one [`Sym`] covers lo/hi/`+1` uses).
+/// A symbolic dword inside `q`: where it lives + how to derive it
+/// (extended with `shift`/`add` so one [`Sym`] covers lo/hi/`+1` uses).
 struct QSint {
     /// Offset into `q` (dword index) of the patched word.
     off: usize,
@@ -96,9 +92,9 @@ struct QSint {
     add: u32,
 }
 
-/// A symbolic kernarg field: where + how (← `mv_sints`). Unlike tinygrad we
+/// A symbolic kernarg field: where + how. We
 /// carry `fmt` (not a bit-`mask`) because Svod's kernarg fields are whole
-/// little-endian integers, never masked sub-fields (← `mv_sints`, `hcq.py:84`).
+/// little-endian integers, never masked sub-fields.
 struct MvSint {
     /// Host pointer to the start of the field's containing region.
     host: *mut u8,
@@ -121,22 +117,22 @@ struct Binded {
 }
 
 /// One captured kernel-arg state: where its kernarg slot lives + which fields
-/// are symbolic. 1:1 with tinygrad's `CLikeArgsState` (`hcq.py:322`), narrowed
+/// are symbolic, narrowed
 /// to the buffer-VAs-then-vals layout Svod's renderer emits.
 pub struct AmdArgsState {
     /// GPU VA of the kernarg slot (goes into USER_DATA, concrete at capture).
     buf_gpu: u64,
     /// `bind_data`: each entry is `(syms, host_ptr, fmt)` — the symbolic field
-    /// values `bind_args_state` records into the queue's `mv_sints`
-    /// (← `bind_data`, `hcq.py:318`). Concrete buffer VAs / vals are written
+    /// values `bind_args_state` records into the queue's `mv_sints`.
+    /// Concrete buffer VAs / vals are written
     /// straight into the page at construction; only JIT-replaced inputs are
     /// symbolic.
     bind_data: Vec<(Vec<Sym>, *mut u8, Fmt)>,
 }
 
 impl AmdArgsState {
-    /// Build the kernarg slot for one kernel. Port of `CLikeArgsState.__init__`
-    /// (`hcq.py:322-330`): write buffer VAs (`fmt='Q'`) then scalar vals
+    /// Build the kernarg slot for one kernel: write buffer VAs (`fmt='Q'`) then
+    /// scalar vals
     /// (`fmt='I'`) into the slot at `host`/`gpu`. `bufs[pos]` is either a
     /// concrete VA (`Ok`) or a [`Sym`] for a JIT input (`Err`) — symbolic ones
     /// are recorded in `bind_data` so the queue re-patches them each replay.
@@ -148,7 +144,7 @@ impl AmdArgsState {
     pub unsafe fn new(host: *mut u8, gpu: u64, bufs: &[std::result::Result<u64, Sym>], vals: &[i64]) -> Self {
         let mut bind_data = Vec::new();
         let mut cursor = 0usize;
-        // Buffer VAs: 8 bytes each (`fmt='Q'`, `hcq.py:328`).
+        // Buffer VAs: 8 bytes each (`fmt='Q'`).
         for b in bufs {
             // SAFETY: cursor + 8 <= buf_count*8 <= slot size by caller contract.
             let field = unsafe { host.add(cursor) };
@@ -166,7 +162,7 @@ impl AmdArgsState {
             }
             cursor += 8;
         }
-        // Scalar vals: 4 bytes each (`fmt='I'`, `hcq.py:330`); i64→i32 matching
+        // Scalar vals: 4 bytes each (`fmt='I'`); i64→i32 matching
         // the kernel's `i32` var dtype (same truncation as `AmdProgram::execute`).
         for v in vals {
             // SAFETY: cursor + 4 <= slot size.
@@ -180,17 +176,17 @@ impl AmdArgsState {
 
 /// A symbolic PM4 compute command builder. One per graph (single queue).
 pub struct AmdHwQueue {
-    /// The dword stream (← `_q`). Concrete until `bind`, after which it lives in
+    /// The dword stream. Concrete until `bind`, after which it lives in
     /// the host-visible page and `apply_var_vals` patches it in place.
     q: Vec<u32>,
-    /// Distinct symbols in first-reference order (← `syms`).
+    /// Distinct symbols in first-reference order.
     syms: Vec<Sym>,
     /// Per-symbol last-resolved value, parallel to `syms`; `apply_var_vals`
-    /// skips patches whose symbol didn't change (← `_prev_resolved_syms`).
+    /// skips patches whose symbol didn't change.
     prev_resolved: Vec<Option<u64>>,
-    /// Symbolic dwords in `q` (← `q_sints`).
+    /// Symbolic dwords in `q`.
     q_sints: Vec<QSint>,
-    /// Symbolic kernarg fields (← `mv_sints`).
+    /// Symbolic kernarg fields.
     mv_sints: Vec<MvSint>,
     /// `None` until `bind`; then the host page + indirect-buffer reference.
     binded: Option<Binded>,
@@ -204,7 +200,7 @@ unsafe impl Send for AmdHwQueue {}
 unsafe impl Sync for AmdHwQueue {}
 
 impl AmdHwQueue {
-    /// New empty queue (← `HWQueue.__init__`, `hcq.py:80`). The connector is
+    /// New empty queue. The connector is
     /// NOT held here — it's supplied by the owning `AmdGraph` (which holds the
     /// `ConnectorLease`) to `exec`/`submit`, so the lease stays the sole owner
     /// of the connector and can't be aliased.
@@ -219,7 +215,7 @@ impl AmdHwQueue {
         }
     }
 
-    /// Intern a symbol, returning its index (← `_new_sym`, `hcq.py:88`).
+    /// Intern a symbol, returning its index.
     fn new_sym(&mut self, sym: &Sym) -> usize {
         if let Some(i) = self.syms.iter().position(|s| s == sym) {
             return i;
@@ -230,7 +226,7 @@ impl AmdHwQueue {
     }
 
     /// Enqueue values — concrete dwords verbatim, symbols recorded for later
-    /// resolution (← `q`, `hcq.py:94`).
+    /// resolution.
     fn q(&mut self, values: Vec<QVal>) {
         for v in values {
             match v {
@@ -238,7 +234,7 @@ impl AmdHwQueue {
                 QVal::Sym { sym, shift, add } => {
                     let sym_idx = self.new_sym(&sym);
                     self.q_sints.push(QSint { off: self.q.len(), sym_idx, shift, add });
-                    self.q.push(0xbadc_0ded); // placeholder (← `hcq.py:105`)
+                    self.q.push(0xbadc_0ded); // placeholder
                 }
             }
         }
@@ -254,9 +250,9 @@ impl AmdHwQueue {
         }
     }
 
-    // *** commands (← AMDComputeQueue) ***
+    // *** commands ***
 
-    /// `wait_reg_mem`/`wait` (← `ops_amd.py:85,370`): poll memory at `addr`
+    /// `wait_reg_mem`/`wait`: poll memory at `addr`
     /// until `(*addr & mask) >= value`. Both may be symbolic (the graph waits
     /// the virtual device-timeline signal whose address is `VirtTimelineSigAddr`).
     /// Layout matches `pm4::wait_reg_mem`:
@@ -273,7 +269,7 @@ impl AmdHwQueue {
         self.q(pkt);
     }
 
-    /// `signal` (← `ops_amd.py:385`) = `release_mem(addr, value, cache_flush=true)`.
+    /// `signal` = `release_mem(addr, value, cache_flush=true)`.
     /// Writes the low 32 bits of `value` to `addr` after a full system-scope
     /// cache flush. Both may be symbolic (the graph signals the virtual device
     /// timeline). Layout matches `pm4::release_mem`:
@@ -294,15 +290,15 @@ impl AmdHwQueue {
         self.q(pkt);
     }
 
-    /// `memory_barrier` (← `ops_amd.py:133`): HDP-flush register handshake then
+    /// `memory_barrier`: HDP-flush register handshake then
     /// a full `acquire_mem`. Concrete (no symbols).
     fn memory_barrier(&mut self) {
         self.q.extend_from_slice(&pm4::hdp_flush());
         self.q.extend_from_slice(&pm4::acquire_mem());
     }
 
-    /// `exec` (← `ops_amd.py:320`) — the critical command. Records the kernarg
-    /// slot's symbolic fields into `mv_sints` (`bind_args_state`, `hcq.py:321`),
+    /// `exec` — the critical command. Records the kernarg
+    /// slot's symbolic fields into `mv_sints`,
     /// then emits the exact dword sequence `build_exec_pm4` produces for a
     /// per-call dispatch: `acquire_mem(gli=0,gl2=0)` → PGM/RSRC/TMPRING/SCRATCH/
     /// RESTART/USER_DATA/RESOURCE_LIMITS/START_X regs → `DISPATCH_DIRECT` →
@@ -318,7 +314,7 @@ impl AmdHwQueue {
         global_size: [u32; 3],
         local_size: [u32; 3],
     ) {
-        // bind_args_state (← hcq.py:205): record symbolic kernarg fields.
+        // bind_args_state: record symbolic kernarg fields.
         for (syms, mem, fmt) in &args.bind_data {
             for (i, sym) in syms.iter().enumerate() {
                 let sym_idx = self.new_sym(sym);
@@ -334,7 +330,7 @@ impl AmdHwQueue {
 
         // USER_DATA SGPR prefix: optional 4-dword scratch descriptor, then the
         // 2-dword kernarg pointer — identical to `AmdProgram::execute`
-        // (`program.rs:646-655` / `ops_amd.py:325-342`).
+        // (`program.rs:646-655`).
         let mut user_data: smallvec::SmallVec<[u32; 8]> = smallvec::SmallVec::new();
         if prg.enable_private_segment_sgpr() {
             user_data.push(scratch_addr as u32);
@@ -365,8 +361,8 @@ impl AmdHwQueue {
         );
     }
 
-    /// Preamble: `memory_barrier().wait(virt_timeline).wait(kick).signal(self)`
-    /// (← `graph/hcq.py:158-160`). `self_sig_addr` is the per-graph signal the
+    /// Preamble: `memory_barrier().wait(virt_timeline).wait(kick).signal(self)`.
+    /// `self_sig_addr` is the per-graph signal the
     /// preamble sets to `kickoff`; the kick wait gates the whole IB until the
     /// host stages the replay and releases it by setting the kick signal.
     pub fn preamble(&mut self, kick_sig_addr: u64, self_sig_addr: u64) {
@@ -376,15 +372,15 @@ impl AmdHwQueue {
         self.signal(SymU64::Concrete(self_sig_addr), SymU32::Sym(Sym::Kickoff));
     }
 
-    /// Final: `signal(virt_timeline_sig, virt_timeline_val + 1)`
-    /// (← `graph/hcq.py:217`). Advances the real device timeline by exactly +1
+    /// Final: `signal(virt_timeline_sig, virt_timeline_val + 1)`.
+    /// Advances the real device timeline by exactly +1
     /// per replay (the preamble waited `timeline-1`), so the graph composes with
     /// per-call dispatch and `AmdDevice::synchronize`.
     pub fn final_signal(&mut self) {
         self.signal(SymU64::Sym(Sym::VirtTimelineSigAddr), SymU32::SymAdd(Sym::VirtTimelineVal, 1));
     }
 
-    /// `bind` (← `ops_amd.py:396`): allocate a host-visible uncached page, copy
+    /// `bind`: allocate a host-visible uncached page, copy
     /// `q` into it, build the `INDIRECT_BUFFER` reference, and repoint future
     /// patches at the page (so `apply_var_vals` rewrites GPU-resident dwords).
     pub fn bind(&mut self, allocator: &AmdAllocator) -> Result<()> {
@@ -406,7 +402,7 @@ impl AmdHwQueue {
         Ok(())
     }
 
-    /// `_apply_var_vals` (← `hcq.py:217`): resolve every symbol, patch changed
+    /// `apply_var_vals`: resolve every symbol, patch changed
     /// `q` dwords and `mv_sints` kernarg fields in place. Skips symbols whose
     /// resolved value is unchanged since the last submit (`prev_resolved`).
     fn apply_var_vals(&mut self, var_vals: &VarVals) -> Result<()> {
@@ -455,7 +451,7 @@ impl AmdHwQueue {
         Ok(())
     }
 
-    /// `submit` (← `hcq.py:230`): apply `var_vals` then `_submit`. Patches the
+    /// `submit`: apply `var_vals` then push to the ring. Patches the
     /// bound page's symbolic dwords + kernarg fields, then pushes the
     /// indirect-buffer reference with one doorbell.
     ///
@@ -466,7 +462,7 @@ impl AmdHwQueue {
     pub fn submit(&mut self, conn: &AmdConnector, var_vals: &VarVals) -> Result<()> {
         self.apply_var_vals(var_vals)?;
         let cmd = self.binded.as_ref().expect("AmdHwQueue::submit before bind").indirect_cmd;
-        // `_submit` (← `ops_amd.py:407`): one doorbell via the queue primitive.
+        // Submit: one doorbell via the queue primitive.
         conn.queue().submit_dwords(&cmd)
     }
 }
@@ -484,7 +480,7 @@ enum SymU64 {
 }
 
 /// A 32-bit symbolic field (timeline/kickoff values), optionally with a `+add`
-/// (← tinygrad's `virt_timeline_val + 1`). Every graph wait/signal value is a
+/// (the `virt_timeline_val + 1` offset). Every graph wait/signal value is a
 /// symbol, so there is no concrete variant.
 enum SymU32 {
     Sym(Sym),

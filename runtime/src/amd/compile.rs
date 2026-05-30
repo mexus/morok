@@ -1,4 +1,4 @@
-//! `clang -target amdgcn-amd-amdhsa` driver: lowers AMDLLVMRenderer text-IR
+//! `clang -target amdgcn-amd-amdhsa` driver: lowers AMD LLVM text-IR
 //! to an AMDGPU code object (ELF) that the KFD runtime can dispatch.
 
 use std::io::Write;

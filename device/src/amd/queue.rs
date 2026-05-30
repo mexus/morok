@@ -38,7 +38,7 @@ use crate::error::{Error, Result};
 
 /// AQL packets are exactly 64 bytes.
 pub const AQL_PACKET_BYTES: usize = 64;
-/// 16 MiB ring — matches tinygrad's default at `ops_amd.py:994`.
+/// 16 MiB ring — the compute-ring default size.
 pub const COMPUTE_RING_BYTES: usize = 16 * 1024 * 1024;
 /// SDMA ring is smaller; 1 MiB is plenty for short copy bursts.
 pub const COPY_RING_BYTES: usize = 1024 * 1024;
@@ -63,7 +63,6 @@ pub const fn barrier_and_header() -> u16 {
 }
 
 /// AQL vendor-specific packet that wraps a PM4 indirect-buffer reference.
-/// Mirrors tinygrad's `_pm4_pkt` at `ops_amd.py:433-435`.
 ///
 /// 16 dwords / 64 bytes:
 /// ```text
@@ -149,7 +148,7 @@ pub fn build_barrier_packet(dep_signals: &[u64], value: u64, completion_signal: 
     // the AQL spec lays out barrier-AND packets at the same field offsets
     // when treated as raw 8-u64 words.
     let mut packet = HsaKernelDispatchPacket { header: barrier_and_header(), setup: 0, ..Default::default() };
-    // Mirror tinygrad's barrier-AND layout (ops_amd.py:370+):
+    // Barrier-AND layout:
     //   header(16) | reserved(48) | dep_signal[0..5] u64 | completion u64 | value u64
     // We pack dep_signal handles into the first 5 grid/segment-shaped slots.
     let words: &mut [u64] =
@@ -164,13 +163,12 @@ pub fn build_barrier_packet(dep_signals: &[u64], value: u64, completion_signal: 
     packet
 }
 
-/// SDMA linear copy packet (matches the in-flight ring dword layout described
-/// at `ops_amd.py:474-484`). All values are u32 dwords stored little-endian
+/// SDMA linear copy packet. All values are u32 dwords stored little-endian
 /// in the ring; the GPU consumes them as a packed command stream.
 pub fn build_sdma_linear_copy(src: u64, dst: u64, size: usize) -> [u32; 7] {
     // DW0: opcode 0x01 (copy) | sub-opcode 0x00 (linear). The sub-opcode
     // sits in bits 8..16, so the constant happens to be just 0x01 for the
-    // linear-copy combo. Tinygrad sets the count bits in DW1; with SDMA v5+
+    // linear-copy combo. The count bits go in DW1; with SDMA v5+
     // the limit per packet is 0x4000_0000 bytes (caller chunks if needed).
     let dw0: u32 = 0x01;
     let dw1: u32 = (size as u32) - 1;
@@ -230,8 +228,8 @@ struct QueueInner {
     /// Per-queue doorbell (`*mut u64` MMIO).
     doorbell: NonNull<u64>,
     /// Host pointer to the GART-resident `write_dispatch_id` slot — KFD
-    /// reads this in addition to the doorbell. Tinygrad updates it before
-    /// every doorbell ring (`ops_amd.py:681`). Skipping it makes the GPU's
+    /// reads this in addition to the doorbell. It must be updated before
+    /// every doorbell ring. Skipping it makes the GPU's
     /// command processor see the doorbell change but stall on a stale wptr.
     write_ptr_host: NonNull<u64>,
     /// Host pointer to the GART-resident `read_dispatch_id` slot. The GPU
@@ -240,7 +238,7 @@ struct QueueInner {
     /// dispatched.
     read_ptr_host: NonNull<u64>,
     /// 16 MiB host-visible uncached-coherent buffer for PM4 indirect
-    /// buffers (see `ops_amd.py:991`). The AQL vendor-specific packet
+    /// buffers (AQL path only). The AQL vendor-specific packet
     /// references PM4 dwords stored in this buffer via PACKET3_INDIRECT_BUFFER.
     /// Bump-allocated; wraps on overflow.
     pm4_ibs_host: NonNull<u8>,
@@ -305,8 +303,8 @@ impl Drop for QueueInner {
 }
 
 impl QueueInner {
-    /// Append raw PM4 dwords to the ring, wrapping at dword granularity
-    /// (`ops_amd.py:417`). `write_idx` is counted in dwords for PM4 queues.
+    /// Append raw PM4 dwords to the ring, wrapping at dword granularity.
+    /// `write_idx` is counted in dwords for PM4 queues.
     /// Caller holds the queue lock — this is part of one atomic dispatch.
     ///
     /// Ring overflow is prevented up-stream by `wait_dispatch_headroom` (which
@@ -340,7 +338,7 @@ impl QueueInner {
     }
 
     /// Bump-allocate `dwords` into the pm4_ibs arena (AQL path only) and return
-    /// the GPU VA of the copied region. Mirrors `ops_amd.py:_pm4_pkt`.
+    /// the GPU VA of the copied region.
     fn pm4_ib(&mut self, dwords: &[u32]) -> u64 {
         let bytes = std::mem::size_of_val(dwords);
         let aligned = self.pm4_ibs_cursor.next_multiple_of(16);
@@ -356,9 +354,9 @@ impl QueueInner {
 
     /// Publish the current `write_idx` to GART + ring the doorbell. AQL uses
     /// the **last completed** slot (`write_idx - 1`); PM4 uses the **next**
-    /// dword (`write_idx`). See `ops_amd.py:_signal_doorbell`.
+    /// dword (`write_idx`).
     fn ring_doorbell(&self, is_pm4: bool) {
-        // GART wptr first (`ops_amd.py:681`): without it KFD sees the doorbell
+        // GART wptr first: without it KFD sees the doorbell
         // change but reads a stale wptr.
         unsafe { std::ptr::write_volatile(self.write_ptr_host.as_ptr(), self.write_idx) };
         std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
@@ -378,12 +376,12 @@ impl AmdComputeQueue {
         unsafe { &mut *self.inner.get() }
     }
 
-    /// Create a compute queue. Tinygrad's selection at `ops_amd.py:989`:
-    /// `is_aql = xccs > 1`. Single-XCC GPUs (the gfx11/12 default) use the
+    /// Create a compute queue. The queue kind is selected by `is_aql =
+    /// xccs > 1`. Single-XCC GPUs (the gfx11/12 default) use the
     /// PM4 path (`KFD_IOC_QUEUE_TYPE_COMPUTE`), submitting raw PM4 dwords
     /// directly into the ring. Multi-XCC CDNA falls back to AQL, where each
     /// dispatch is a 64-byte AQL packet and PM4 helpers are wrapped via
-    /// the vendor IB packet at `ops_amd.py:433-435`.
+    /// the vendor IB packet.
     /// Predict whether `create` would build a PM4 queue for this device,
     /// WITHOUT allocating anything. Used by `AmdGraph::capture` to skip the
     /// (multi-MiB) per-graph connector build on AQL hardware where the graph
@@ -395,8 +393,7 @@ impl AmdComputeQueue {
 
     pub fn create(allocator: &AmdAllocator) -> Result<Box<Self>> {
         let core = allocator.dev.core();
-        // `SVOD_AMD_AQL=1` mirrors tinygrad's `AMD_AQL` override
-        // (`ops_amd.py:989`) — forces AQL even on single-XCC, useful for
+        // `SVOD_AMD_AQL=1` forces AQL even on single-XCC, useful for
         // bisecting PM4 vs AQL bring-up issues.
         let is_pm4 = Self::will_use_pm4(core);
         let queue_type = if is_pm4 { kfd::KFD_IOC_QUEUE_TYPE_COMPUTE } else { kfd::KFD_IOC_QUEUE_TYPE_COMPUTE_AQL };
@@ -457,7 +454,7 @@ impl AmdComputeQueue {
     /// defensive primitive — any future async use within one connector
     /// (multi-threaded JIT replay, etc.) would still need it.
     ///
-    /// Sequence mirrors `hcq.py:371-378`:
+    /// Sequence:
     /// `wait(timeline, prev) → memory_barrier → exec → signal(timeline, next)`.
     /// Returns the timeline value this dispatch signals.
     #[allow(clippy::too_many_arguments)]
@@ -506,8 +503,8 @@ impl AmdComputeQueue {
         // the `COMPUTE_DISPATCH_SCRATCH_BASE` register below. Building it in
         // `AmdProgram::execute` (outside the lock) let a concurrent scratch
         // realloc slip in between the two reads, so the descriptor and the
-        // register could point at different buffers. Mirrors tinygrad's single
-        // `prg.dev.scratch.va_addr` read in `exec` (`ops_amd.py:328,354`).
+        // register could point at different buffers. The scratch base address
+        // is read exactly once and reused for the descriptor and the register.
         let mut full_user_data: Vec<u32> = Vec::with_capacity(user_data.len() + 4);
         if enable_private_segment_sgpr {
             full_user_data.push(scratch_addr as u32);
@@ -551,9 +548,8 @@ impl AmdComputeQueue {
     }
 
     /// Push a pre-built PM4 dword stream into the ring with ONE doorbell — the
-    /// primitive behind `AmdHwQueue::submit` (the graph's atomic `_submit`).
-    /// Mirrors tinygrad `AMDComputeQueue._submit` (`ops_amd.py:407-420`): blit
-    /// `cmds` into the ring, advance `put_value`, ring the doorbell.
+    /// primitive behind `AmdHwQueue::submit` (the graph's atomic submit).
+    /// Blits `cmds` into the ring, advances the write index, rings the doorbell.
     ///
     /// `dwords` is normally the 4-dword `PACKET3_INDIRECT_BUFFER` reference to
     /// the graph's bound `hw_page`; the CP then runs the whole captured chain
@@ -585,7 +581,7 @@ impl AmdComputeQueue {
 
     /// Atomically build + submit one AQL (multi-XCC CDNA) kernel dispatch. Same
     /// ordering guarantee as [`dispatch_pm4`]; PM4 helpers are wrapped in AQL
-    /// vendor-IB packets (`ops_amd.py:_pm4_pkt`) and the kernel launch is a real
+    /// vendor-IB packets and the kernel launch is a real
     /// `HsaKernelDispatchPacket`.
     pub fn dispatch_aql(&self, conn: &AmdConnector, packet: &HsaKernelDispatchPacket) -> Result<u64> {
         debug_assert!(!self.is_pm4, "dispatch_aql called on PM4 queue");
@@ -679,7 +675,7 @@ fn dwords_as_bytes(p: &[u32; 16]) -> &[u8] {
 }
 
 /// Build the PM4 SET_SH_REG + DISPATCH_DIRECT stream for a single-XCC dispatch,
-/// appending into `q`. Port of `ops_amd.py:320-368` (minus SQTT/PMC/dispatch_ptr).
+/// appending into `q` (minus SQTT/PMC/dispatch_ptr).
 /// The shader entry point is pre-shifted right by 8 (COMPUTE_PGM_LO/HI hold the
 /// upper bits of a 256-byte-aligned address). `wave32` comes from
 /// `kd.kernel_code_properties & 0x400`; `cs_w32_en` is gfx11/12-only.
@@ -699,7 +695,7 @@ pub(crate) fn build_exec_pm4(
     target_major: u32,
 ) {
     // 1. Pre-dispatch cache-invalidate, skipping GLI/GL2 (already flushed by the
-    //    preceding memory_barrier). Matches `ops_amd.py:323`.
+    //    preceding memory_barrier).
     q.extend_from_slice(&pm4::acquire_mem_with(pm4::GCR_FLAGS_NO_GLI_GL2));
 
     // 2. Shader address: COMPUTE_PGM_LO/HI hold (prog_addr >> 8).
@@ -786,9 +782,8 @@ impl std::fmt::Debug for AmdCopyQueue {
 
 fn create_queue(allocator: &AmdAllocator, queue_type: u32, ring_size: usize, aql: bool) -> Result<QueueInner> {
     let dev = allocator.dev.core();
-    // Ring + GART are both VRAM with COHERENT | UNCACHED | PUBLIC flags —
-    // tinygrad uses `iface.alloc(..., uncached=True, cpu_access=True)` for
-    // both (`ops_amd.py:1040-1041`). Using plain VRAM (no UNCACHED) makes
+    // Ring + GART are both VRAM with COHERENT | UNCACHED | PUBLIC flags
+    // (uncached + cpu-accessible). Using plain VRAM (no UNCACHED) makes
     // KFD reject the create_queue ioctl with EINVAL.
     let ring_buf = allocator.alloc_uncached(ring_size)?;
     let (ring_gpu, ring_host) = match &ring_buf {
@@ -797,8 +792,8 @@ fn create_queue(allocator: &AmdAllocator, queue_type: u32, ring_size: usize, aql
     };
     // GART page holds the AQL queue descriptor (`amd_queue_t`, 256 bytes).
     // rptr/wptr live at fixed offsets inside it; KFD reads the descriptor
-    // when wiring up the queue. Matches tinygrad's `ops_amd.py:1041` exactly
-    // (`gart = iface.alloc(0x100, uncached=True, cpu_access=True)`).
+    // when wiring up the queue. The GART page is a 0x100-byte uncached,
+    // cpu-accessible allocation.
     let gart_buf = allocator.alloc_uncached(0x100)?;
     let (gart_gpu, gart_host) = match &gart_buf {
         crate::allocator::RawBuffer::AmdDevice { gpu_addr, host_ptr: Some(h), .. } => (*gpu_addr, *h),
@@ -806,8 +801,8 @@ fn create_queue(allocator: &AmdAllocator, queue_type: u32, ring_size: usize, aql
     };
 
     if aql {
-        // Initialize the GART descriptor (mirrors `ops_amd.py:1045-1048`).
-        // max_cu_id is total CUs across all XCCs - 1 (tinygrad cu_cnt*xccs-1).
+        // Initialize the GART descriptor.
+        // max_cu_id is total CUs across all XCCs - 1 (cu_cnt*xccs-1).
         let cu_cnt = dev.node.simd_count.max(1) / dev.node.simd_per_cu.max(1);
         let waves_per_cu = dev.node.max_waves_per_simd * dev.node.simd_per_cu;
         let desc = crate::amd::sys::hsa::AmdQueueT {
@@ -828,26 +823,26 @@ fn create_queue(allocator: &AmdAllocator, queue_type: u32, ring_size: usize, aql
         }
     }
 
-    // Both AQL and plain COMPUTE queues use the same rptr/wptr offsets —
-    // tinygrad passes the `amd_queue_t::{read,write}_dispatch_id` byte
-    // offsets unconditionally at `ops_amd.py:1054-1055`. KFD validates these
+    // Both AQL and plain COMPUTE queues use the same rptr/wptr offsets — the
+    // `amd_queue_t::{read,write}_dispatch_id` byte offsets are passed
+    // unconditionally. KFD validates these
     // against the queue type's expected layout; using (0, 8) for plain
     // COMPUTE produces EINVAL.
     let wptr_offset: u64 = crate::amd::sys::hsa::OFFSET_WRITE_DISPATCH_ID as u64;
     let rptr_offset: u64 = crate::amd::sys::hsa::OFFSET_READ_DISPATCH_ID as u64;
-    // Compute queues need EOP + ctx-save buffers. Tinygrad's sizing:
+    // Compute queues need EOP + ctx-save buffers. Sizing:
     //   ctx_save_restore_size (ioctl arg) = wg_data_size + ctl_stack_size
     //   cwsr_buffer_size (alloc size)     = round_up((ctx_save_restore_size
     //                                          + debug_memory_size) * xccs,
     //                                          PAGESIZE)
-    // (`ops_amd.py:976-977`, `:1050-1051`.) The buffer is larger than what we
+    // The buffer is larger than what we
     // tell KFD by `debug_memory_size * xccs` — that overflow region is where
     // KFD writes debug-trap state. Undersizing causes corruption when CWSR
     // fires; oversizing is harmless.
     //
     // EOP and ctx-save are *plain VRAM* (no PUBLIC/COHERENT/UNCACHED flags):
     // they're written by the GPU during preemption and never read from the
-    // CPU. Tinygrad uses the default `iface.alloc()` here.
+    // CPU, so the default allocation flags suffice.
     let (wg_data_size, ctl_stack_size, debug_memory_size) = compute_ctx_sizes(dev);
     let xccs = dev.node.num_xcc.max(1) as usize;
     let ctx_save_restore_size = wg_data_size + ctl_stack_size;
@@ -895,10 +890,9 @@ fn create_queue(allocator: &AmdAllocator, queue_type: u32, ring_size: usize, aql
     let read_ptr_host = unsafe { NonNull::new_unchecked(gart_host.as_ptr().add(rptr_offset as usize) as *mut u64) };
 
     // PM4 indirect-buffer arena. AQL compute queues need it (PM4 helpers
-    // get wrapped via `_pm4_pkt`); PM4 single-XCC compute queues and SDMA
-    // queues write straight into their ring with no IB indirection. Tinygrad
-    // matches: `pm4_ibs` is allocated only when `is_aql=True`
-    // (`ops_amd.py:991`).
+    // get wrapped in vendor-IB packets); PM4 single-XCC compute queues and SDMA
+    // queues write straight into their ring with no IB indirection. So the
+    // arena is allocated only on the AQL path.
     const PM4_IBS_BYTES: usize = 16 * 1024 * 1024;
     let pm4_needed = aql && queue_type == kfd::KFD_IOC_QUEUE_TYPE_COMPUTE_AQL;
     let (pm4_ibs_host, pm4_ibs_gpu, pm4_ibs_size, pm4_ibs_buf) = if pm4_needed {
@@ -934,7 +928,7 @@ fn create_queue(allocator: &AmdAllocator, queue_type: u32, ring_size: usize, aql
 }
 
 /// Compute (wg_data_size, ctl_stack_size, debug_memory_size) for the ctx-save /
-/// restore region. Port of tinygrad `ops_amd.py:971-977`.
+/// restore region.
 fn compute_ctx_sizes(dev: &AmdDeviceCore) -> (usize, usize, usize) {
     const PAGE: usize = 0x1000;
     let sgrp_per_cu: usize = 0x4000;
@@ -942,8 +936,8 @@ fn compute_ctx_sizes(dev: &AmdDeviceCore) -> (usize, usize, usize) {
     let is_cdna4 = dev.arch == svod_dtype::AmdArch::Gfx950;
     let lds_per_cu: usize = if is_cdna4 { (dev.node.lds_size_in_kb as usize) << 10 } else { 0x10000 };
 
-    // Per tinygrad: VGPR-per-CU branches on a small whitelist of gfx-target
-    // tuples (`ops_amd.py:971`); CDNA (gfx9.x) uses 0x80000, the listed
+    // VGPR-per-CU branches on a small whitelist of gfx-target
+    // tuples: CDNA (gfx9.x) uses 0x80000, the listed
     // RDNA3/RDNA4 tuples use 0x60000, Gfx1102 alone uses 0x40000.
     let vgpr_per_cu: usize = match dev.arch {
         svod_dtype::AmdArch::Gfx942 | svod_dtype::AmdArch::Gfx950 => 0x80000,
@@ -971,7 +965,7 @@ fn compute_ctx_sizes(dev: &AmdDeviceCore) -> (usize, usize, usize) {
 
     let waves_factor = if dev.arch.is_cdna() { 8 } else { 12 };
     let ctl_stack_size = (waves_factor * wave_cnt + 8 + 40).next_multiple_of(PAGE);
-    // tinygrad: `debug_memory_size = round_up(wave_cnt * 32, 64)`.
+    // `debug_memory_size = round_up(wave_cnt * 32, 64)`.
     let debug_memory_size = (wave_cnt * 32).next_multiple_of(64);
 
     (wg_data_size, ctl_stack_size, debug_memory_size)

@@ -20,17 +20,15 @@ use crate::amd::device::AmdDeviceCore;
 use crate::error::{Error, Result};
 use crate::sync::TimelineSignal;
 
-/// Spin / yield budget before escalating to a KFD WAIT_EVENTS sleep. Matches
-/// tinygrad's threshold in `hcq.py:294`: cheap polling for short waits, kernel
-/// blocking for long ones so a stalled wait doesn't pin a CPU.
+/// Spin / yield budget before escalating to a KFD WAIT_EVENTS sleep: cheap
+/// polling for short waits, kernel blocking for long ones so a stalled wait
+/// doesn't pin a CPU.
 const WAIT_EVENTS_ESCALATE_MS: u64 = 200;
 
-/// 16-byte slot inside the [`SignalPool`]'s shared GTT page. Matches
-/// tinygrad's `hcq.py:455` (`range(0, alc.size, 16)`); slot holds the u64
-/// value at offset 0 plus 8 bytes of padding.
+/// 16-byte slot inside the [`SignalPool`]'s shared GTT page; slot holds the
+/// u64 value at offset 0 plus 8 bytes of padding.
 const SLOT_BYTES: usize = 16;
-/// 4 KiB page / 16 B per slot = 256 signals per pool. Matches tinygrad's
-/// `sigalloc_size = 0x1000` default.
+/// 4 KiB page / 16 B per slot = 256 signals per pool.
 const SLOTS_PER_POOL: usize = 256;
 
 /// A pool-allocated AMD signal.
@@ -44,8 +42,8 @@ pub struct AmdSignal {
     host_ptr: NonNull<AtomicU64>,
     pool: Weak<SignalPool>,
     /// Owning device core — used to escalate long waits to
-    /// `AMDKFD_IOC_WAIT_EVENTS` on the device's `queue_event` (tinygrad
-    /// `ops_amd.py:811`). `Weak` so signals don't extend device lifetime.
+    /// `AMDKFD_IOC_WAIT_EVENTS` on the device's `queue_event`. `Weak` so
+    /// signals don't extend device lifetime.
     device: Weak<AmdDeviceCore>,
 }
 
@@ -147,8 +145,7 @@ impl AmdSignal {
     /// Tiered polling backoff: tight spin → `yield_now` → KFD `WAIT_EVENTS`
     /// once we've burned `WAIT_EVENTS_ESCALATE_MS` of wall time. The kernel
     /// wakes us when the device's `queue_event` fires, eliminating CPU burn
-    /// for stalled or long-running dispatches. Mirrors tinygrad `hcq.py:294`
-    /// → `KFDIface.sleep` (`ops_amd.py:811`).
+    /// for stalled or long-running dispatches.
     ///
     /// Returns `Some(Error)` when KFD reports a GPU fault during the kernel
     /// wait so callers can break out of the spin immediately. `None` for
@@ -258,8 +255,8 @@ impl Timeline {
             return Ok(());
         }
         self.signal.wait_signal_value(target, timeout_ms)?;
-        // Wraparound (`hcq.py:442,480`): we've drained to `target` (GPU idle),
-        // so it's safe to reset the slot to 0 and restart the counter at 1.
+        // Wraparound: we've drained to `target` (GPU idle), so it's safe to
+        // reset the slot to 0 and restart the counter at 1.
         if self.value.load(Ordering::Acquire) > TIMELINE_WRAP_WATERMARK {
             self.signal.set(0);
             self.value.store(1, Ordering::Release);
@@ -287,8 +284,8 @@ impl TimelineSignal for AmdSignal {
     fn wait(&self, target: u64, timeout_ms: u64) -> Result<()> {
         let mut start = std::time::Instant::now();
         let mut prev = u64::MAX;
-        // Tinygrad's tiered strategy (`hcq.py:294`): spin → yield → KFD
-        // WAIT_EVENTS sleep. The shared helper handles the escalation tiers
+        // Tiered strategy: spin → yield → KFD WAIT_EVENTS sleep. The shared
+        // helper handles the escalation tiers
         // and surfaces GPU faults so BEAM search can bail on a bad config
         // instead of blocking for the full timeout.
         loop {
@@ -337,9 +334,7 @@ impl SignalPool {
     /// Critical: the signal page must be **GTT-coherent + uncached** so that
     /// the GPU's decrement of the completion_signal field is immediately
     /// visible to the host (otherwise it sits in GPU L2 and we spin
-    /// forever). Matches tinygrad's
-    /// `iface.alloc(..., uncached=True, cpu_access=True)` for the signal
-    /// pool at `hcq.py:HCQCompiled.new_signal`.
+    /// forever).
     pub fn new(allocator: &AmdAllocator) -> Result<Arc<Self>> {
         let buffer = allocator.alloc_uncached(SLOT_BYTES * SLOTS_PER_POOL)?;
         let (base_gpu, base_host) = match &buffer {

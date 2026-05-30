@@ -1,4 +1,3 @@
-
 use super::*;
 
 /// On hosts without `/dev/kfd` (or without a supported GPU), `open` must

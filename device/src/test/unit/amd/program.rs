@@ -1,4 +1,3 @@
-
 use super::*;
 
 /// Compile a trivial amdgcn kernel via Phase 2, then parse it back and

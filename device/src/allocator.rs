@@ -82,8 +82,7 @@ impl Drop for AlignedBuffer {
 /// 3. **Kernel Execution**: Raw pointers passed to JIT code; Rust doesn't access
 ///    buffer data during execution
 ///
-/// This design follows Tinygrad's approach where buffer synchronization is the
-/// scheduler's responsibility, not the buffer's.
+/// Buffer synchronization is the scheduler's responsibility, not the buffer's.
 pub enum RawBuffer {
     Cpu {
         data: UnsafeCell<AlignedBuffer>,
@@ -201,33 +200,31 @@ impl RawBuffer {
     }
 }
 
-/// Buffer allocation spec. Mirrors tinygrad `BufferSpec` (device.py:77-84): it
-/// is the *whole* LRU cache key `(size, spec)`, hence `Hash + Eq + Copy`.
+/// Buffer allocation spec. It is the *whole* LRU cache key `(size, spec)`,
+/// hence `Hash + Eq + Copy`.
 ///
-/// `zero_init` is intentionally NOT a field — tinygrad's allocator never zeroes
-/// (`_alloc` returns raw memory); Svod threads it as a separate `alloc`
+/// `zero_init` is intentionally NOT a field — the backend allocator never
+/// zeroes (`_alloc` returns raw memory); Svod threads it as a separate `alloc`
 /// argument so it does not split the cache. A zeroed and a non-zeroed buffer of
 /// the same spec are interchangeable, because a cache hit re-zeroes on demand.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "proptest", derive(proptest_derive::Arbitrary))]
 pub struct BufferSpec {
     /// GTT-coherent uncached memory (signal/ring/kernarg). Distinct cache type
-    /// from VRAM — can't be reused as cached. tinygrad `BufferSpec.uncached`.
+    /// from VRAM — can't be reused as cached.
     pub uncached: bool,
     /// CPU-accessible mapping.
     ///
     /// CPU allocator: always honored (host memory is always accessible).
     /// CUDA allocator: false = device-only (cuMemAlloc), true = unified (cuMemAllocManaged).
-    /// AMD allocator: adds a host BAR mmap (`host_ptr: Some`). tinygrad `BufferSpec.cpu_access`.
+    /// AMD allocator: adds a host BAR mmap (`host_ptr: Some`).
     pub cpu_access: bool,
-    /// Host (GTT/userptr) memory rather than device VRAM. tinygrad `BufferSpec.host`.
+    /// Host (GTT/userptr) memory rather than device VRAM.
     pub host: bool,
     /// Never cache this buffer in the LRU pool: free goes straight to teardown.
     /// For lifetime-bound buffers (code object, scratch, queue/signal infra).
-    /// tinygrad `BufferSpec.nolru`.
     pub nolru: bool,
     /// Wraps a pre-existing pointer; bypasses LRU + ownership accounting.
-    /// tinygrad `BufferSpec.external_ptr`.
     pub external_ptr: Option<usize>,
 }
 
@@ -237,10 +234,9 @@ impl Default for BufferSpec {
     }
 }
 
-/// Device memory allocator. Mirrors tinygrad's `Allocator` (device.py:224-248):
-/// the public `alloc`/`free` are thin wrappers over the runtime-implemented
-/// `_alloc`/`_free`; copy/transfer/offset/map are overridable hooks that
-/// default to "unsupported" (tinygrad raises `NotImplementedError`).
+/// Device memory allocator: the public `alloc`/`free` are thin wrappers over
+/// the runtime-implemented `_alloc`/`_free`; copy/transfer/offset/map are
+/// overridable hooks that default to "unsupported".
 ///
 /// Object-safe (used as `Arc<dyn Allocator>`): the opaque is the single
 /// [`RawBuffer`] enum, so copy hooks take `&RawBuffer` + an explicit byte
@@ -253,35 +249,31 @@ pub trait Allocator: Send + Sync + std::fmt::Debug {
     }
 
     /// Free a buffer. `size` is the originally-requested allocation size (the
-    /// LRU cache key, mirroring tinygrad `free(opaque, size, options)`); the
-    /// base allocator ignores it and just releases the handle. The `RawBuffer`
-    /// is consumed (and dropped) here.
+    /// LRU cache key); the base allocator ignores it and just releases the
+    /// handle. The `RawBuffer` is consumed (and dropped) here.
     fn free(&self, buffer: RawBuffer, size: usize, options: &BufferSpec) {
         let _ = size;
         self._free(buffer, options);
     }
 
-    /// Backend allocation. tinygrad `Allocator._alloc`.
+    /// Backend allocation.
     fn _alloc(&self, size: usize, options: &BufferSpec, zero: bool) -> Result<RawBuffer>;
 
     /// Backend free. Default drops the `RawBuffer` (CPU/host memory frees via
     /// `Drop`); device backends override to release driver handles.
-    /// tinygrad `Allocator._free`.
     fn _free(&self, _buffer: RawBuffer, _options: &BufferSpec) {}
 
     /// Copy host bytes into `dest[dest_off..dest_off+src.len()]`.
-    /// tinygrad `Allocator._copyin`.
     fn _copyin(&self, _dest: &RawBuffer, _dest_off: usize, _src: &[u8]) -> Result<()> {
         UnsupportedSnafu { op: "copyin" }.fail()
     }
 
     /// Copy `src[src_off..src_off+dest.len()]` out into host bytes.
-    /// tinygrad `Allocator._copyout`.
     fn _copyout(&self, _dest: &mut [u8], _src: &RawBuffer, _src_off: usize) -> Result<()> {
         UnsupportedSnafu { op: "copyout" }.fail()
     }
 
-    /// Same-device copy of `sz` bytes. tinygrad `Allocator._transfer`.
+    /// Same-device copy of `sz` bytes.
     fn _transfer(
         &self,
         _dest: &RawBuffer,
@@ -293,17 +285,17 @@ pub trait Allocator: Send + Sync + std::fmt::Debug {
         UnsupportedSnafu { op: "transfer" }.fail()
     }
 
-    /// Mint a sub-buffer view (for cross-device base views). tinygrad `Allocator._offset`.
+    /// Mint a sub-buffer view (for cross-device base views).
     fn _offset(&self, _buf: &RawBuffer, _size: usize, _offset: usize) -> Result<RawBuffer> {
         UnsupportedSnafu { op: "offset" }.fail()
     }
 
-    /// Map a foreign buffer into this device's address space. tinygrad `Allocator._map`.
+    /// Map a foreign buffer into this device's address space.
     fn _map(&self, _buf: &RawBuffer) -> Result<RawBuffer> {
         UnsupportedSnafu { op: "map" }.fail()
     }
 
-    /// Unmap a previously mapped buffer. tinygrad `Allocator._unmap`.
+    /// Unmap a previously mapped buffer.
     fn _unmap(&self, _mb: &RawBuffer) {}
 
     fn synchronize(&self) -> Result<()> {
@@ -373,7 +365,7 @@ impl Allocator for CpuAllocator {
     }
 }
 
-/// DISK allocator using memory-mapped files (Tinygrad: ops_disk.py).
+/// DISK allocator using memory-mapped files.
 /// Read-only — cannot execute kernels. Data is transferred via COPY.
 #[derive(Debug, Clone)]
 pub struct DiskAllocator {
@@ -419,7 +411,7 @@ impl Allocator for DiskAllocator {
     }
 
     fn _copyin(&self, _dest: &RawBuffer, _dest_off: usize, _src: &[u8]) -> Result<()> {
-        // DISK is read-only (ops_disk.py never writes through the mmap).
+        // DISK is read-only: never write through the mmap.
         Err(crate::Error::CopyFailed { reason: "DISK device is read-only: copyin not supported".into() })
     }
 
@@ -558,16 +550,15 @@ impl Allocator for CudaAllocator {
     }
 }
 
-/// LRU allocator that caches freed buffers for reuse. Mirrors tinygrad
-/// `LRUAllocator` (device.py:250-270):
+/// LRU allocator that caches freed buffers for reuse:
 ///
-/// - the cache is keyed on the whole `(size, BufferSpec)` (device.py:259);
+/// - the cache is keyed on the whole `(size, BufferSpec)`;
 /// - `free` recycles into the pool *without synchronizing* — the
 ///   timeline-drain-before-teardown lives in the backend `_free` (e.g.
 ///   `AmdAllocator::_free`), reached only on real release (overflow, `nolru`,
 ///   `external_ptr`, or `free_cache`);
 /// - on allocation failure `free_cache` releases every pooled buffer through
-///   the backend `_free` and the alloc is retried (device.py:260-263).
+///   the backend `_free` and the alloc is retried.
 ///
 /// The cache key uses the *requested* `size` for both `alloc` and `free` (the
 /// `size` arg to `free`), so a backend that rounds up its actual allocation
@@ -591,7 +582,7 @@ impl LruAllocator {
         Self { inner, cache: Mutex::new(HashMap::new()), max_buffers_per_size, name }
     }
 
-    /// Release every pooled buffer through the backend `_free` (device.py:264-267).
+    /// Release every pooled buffer through the backend `_free`.
     /// Routing through `inner.free` is essential: `RawBuffer` has no `Drop`, so
     /// merely clearing the map would leak GPU mappings.
     fn free_cache(&self) {
@@ -664,13 +655,13 @@ impl LruAllocator {
 
 impl Allocator for LruAllocator {
     fn alloc(&self, size: usize, options: &BufferSpec, zero: bool) -> Result<RawBuffer> {
-        // nolru / external_ptr never pool: deterministic free (device.py:269).
+        // nolru / external_ptr never pool: deterministic free.
         if options.nolru || options.external_ptr.is_some() {
             return self.inner.alloc(size, options, zero);
         }
         let key = (size, *options);
 
-        // Pop from the per-key pool if present (device.py:259).
+        // Pop from the per-key pool if present.
         let buffer = {
             let mut cache = self.cache.lock().unwrap();
             if let Some(buffers) = cache.get_mut(&key)
@@ -695,8 +686,7 @@ impl Allocator for LruAllocator {
             return Ok(buffer);
         }
 
-        // Cache miss → backend alloc; on failure drain the pool and retry once
-        // (device.py:260-263).
+        // Cache miss → backend alloc; on failure drain the pool and retry once.
         match self.inner.alloc(size, options, zero) {
             Ok(buffer) => Ok(buffer),
             Err(e) => {
@@ -707,17 +697,17 @@ impl Allocator for LruAllocator {
     }
 
     fn free(&self, buffer: RawBuffer, size: usize, options: &BufferSpec) {
-        // nolru / external_ptr bypass the pool — real free now (device.py:269-270).
+        // nolru / external_ptr bypass the pool — real free now.
         if options.nolru || options.external_ptr.is_some() {
             self.inner.free(buffer, size, options);
             return;
         }
 
-        // Recycle into the pool. NOTE: no synchronize here — tinygrad's LRU
-        // recycle is intentionally undrained (device.py:269); the timeline
-        // drain happens in the backend `_free` on real teardown
-        // (`AmdAllocator::_free` / hcq.py:566). On overflow route through
-        // `inner.free` so the handle is actually released (RawBuffer has no Drop).
+        // Recycle into the pool. NOTE: no synchronize here — the LRU recycle is
+        // intentionally undrained; the timeline drain happens in the backend
+        // `_free` on real teardown (`AmdAllocator::_free`). On overflow route
+        // through `inner.free` so the handle is actually released (RawBuffer
+        // has no Drop).
         let overflow = {
             let mut cache = self.cache.lock().unwrap();
             let buffers = cache.entry((size, *options)).or_default();

@@ -39,16 +39,15 @@ use crate::error::{Error, Result};
 /// build their own `AmdConnector` against it (no extra KFD opens).
 static DEVICE_CACHE: Lazy<Mutex<HashMap<usize, Arc<AmdDevice>>>> = Lazy::new(Default::default);
 
-/// Process-wide `/dev/kfd` handle. Tinygrad opens KFD once per process
-/// (`KFDIface.kfd`) and all devices share it — events created on a per-device
-/// basis are addressed by `event_id` against this shared fd.
+/// Process-wide `/dev/kfd` handle. KFD is opened once per process and all
+/// devices share it — events created on a per-device basis are addressed by
+/// `event_id` against this shared fd.
 static GLOBAL_KFD: Lazy<Mutex<Option<Arc<OwnedFd>>>> = Lazy::new(Default::default);
 
-/// Process-wide event-page state. Tinygrad allocates the 0x8000 GTT event
-/// page exactly once per process (`KFDIface.event_page`); the first device
+/// Process-wide event-page state. The 0x8000 GTT event page is allocated
+/// exactly once per process; the first device
 /// allocates+binds it via `CREATE_EVENT(event_page_offset=handle)`,
-/// subsequent devices just `MAP_MEMORY_TO_GPU` it to their `gpu_id`. Matches
-/// `ops_amd.py:731-733`.
+/// subsequent devices just `MAP_MEMORY_TO_GPU` it to their `gpu_id`.
 static EVENT_PAGE: Lazy<Mutex<Option<EventPageState>>> = Lazy::new(Default::default);
 
 #[derive(Debug, Clone, Copy)]
@@ -68,12 +67,12 @@ pub(crate) struct ScratchState {
     /// GPU VA of the current scratch buffer.
     pub gpu_va: u64,
     /// Bytes per thread (rounded up to 4-byte slot stride for wave64).
-    /// Equivalent to tinygrad's `max_private_segment_size` (ops_amd.py:1066).
+    /// Equivalent to the kernel's `max_private_segment_size`.
     pub size_per_thread: u32,
     /// Packed `COMPUTE_TMPRING_SIZE` register value.
     pub tmpring_size: u32,
     /// KFD handle + total byte size of the backing alloc — needed to free the
-    /// old buffer when scratch grows (mirror tinygrad `_realloc`).
+    /// old buffer when scratch grows.
     pub handle: u64,
     pub size: usize,
 }
@@ -96,14 +95,14 @@ pub struct AmdDeviceCore {
     /// Backend implementation (KFD today). All ioctls route through this.
     iface: Arc<dyn crate::amd::iface::AmdIface>,
     /// Whether an SDMA copy queue is available on this physical device. Set
-    /// by the factory after it tries to create one (`ops_amd.py:1000`).
+    /// by the factory after it tries to create one.
     /// Today every AMD buffer is host-visible + memcpy'd, so this stays
     /// `false` and the SDMA queue is dead code — kept on the core for the
     /// future SDMA revival.
     has_sdma_queue: AtomicBool,
     /// Poison latch. Once a GPU fault/timeout is observed, the device is dead:
     /// every `synchronize`/`execute` against any connector on this device
-    /// fails fast. Mirrors tinygrad's `error_state` (`hcq.py:421`). Per-physical
+    /// fails fast. Per-physical
     /// device because a memory fault corrupts the whole VM, not just one queue.
     poisoned: AtomicBool,
     error_msg: OnceLock<String>,
@@ -145,7 +144,7 @@ enum Dispatcher {
     /// KFD-safe single-queue (default): every owner shares ONE connector per
     /// physical device — built on first lease, kept for the device's lifetime —
     /// and dispatch + scratch-realloc are serialized behind `lock`. The kernel
-    /// then only ever sees one compute queue per GPU (tinygrad's model),
+    /// then only ever sees one compute queue per GPU,
     /// sidestepping the MES/runlist overload the multi-queue path triggers under
     /// load. `lock` guards two *non-nested* critical sections — dispatch
     /// (`dispatch_pm4`/`dispatch_aql`/`submit_dwords`) and the realloc branch of
@@ -420,7 +419,7 @@ impl AmdDeviceCore {
         self.has_sdma_queue.store(present, Ordering::Release);
     }
 
-    /// Whether an SDMA copy queue is available (`ops_amd.py` `has_sdma_queue`).
+    /// Whether an SDMA copy queue is available.
     #[inline]
     pub fn has_sdma_queue(&self) -> bool {
         self.has_sdma_queue.load(Ordering::Acquire)
@@ -428,9 +427,8 @@ impl AmdDeviceCore {
 
     /// Block in the kernel for up to `timeout_ms` waiting on **any** of the
     /// device's three events (queue completion, memory fault, hw exception).
-    /// Mirrors tinygrad `KFDIface.sleep` at `ops_amd.py:811`: signal polling
-    /// escalates to this after a fixed spin/yield budget so a stalled wait
-    /// doesn't burn CPU.
+    /// Signal polling escalates to this after a fixed spin/yield budget so a
+    /// stalled wait doesn't burn CPU.
     ///
     /// Returns `Ok(Some(fault))` when a fault event fired (caller should bail
     /// with that error rather than continue polling the signal value).
@@ -486,8 +484,7 @@ impl AmdDeviceCore {
 }
 
 /// Ensure the process-wide `/dev/kfd` handle is open and return a shared
-/// `Arc<OwnedFd>`. Mirrors tinygrad's `KFDIface.kfd` class attribute
-/// (`ops_amd.py:725`): all devices in a process share one KFD fd so events
+/// `Arc<OwnedFd>`. All devices in a process share one KFD fd so events
 /// are visible across all of them.
 pub(crate) fn ensure_global_kfd() -> Result<Arc<OwnedFd>> {
     let mut g = GLOBAL_KFD.lock();
@@ -500,7 +497,7 @@ pub(crate) fn ensure_global_kfd() -> Result<Arc<OwnedFd>> {
 }
 
 /// Ensure the process-wide event page is allocated, bound, and mapped to
-/// `node.gpu_id`. Mirrors tinygrad `ops_amd.py:731-733`:
+/// `node.gpu_id`:
 /// - first device: allocate 0x8000 GTT|COHERENT|UNCACHED|PUBLIC, bind via
 ///   `CREATE_EVENT(event_page_offset=handle)`, map into the first GPU.
 /// - subsequent devices: only `MAP_MEMORY_TO_GPU` the existing page into
@@ -535,8 +532,7 @@ pub(crate) fn ensure_event_page(kfd_fd: &OwnedFd, drm_fd: &OwnedFd, node: &AmdNo
 
 /// Allocate the 0x8000-byte event page (GTT-pinned, uncached, host-visible).
 /// Returns `(va, size, kfd_handle)`. The handle goes into the
-/// `event_page_offset` field of the bind `AMDKFD_IOC_CREATE_EVENT` call
-/// (`ops_amd.py:733`).
+/// `event_page_offset` field of the bind `AMDKFD_IOC_CREATE_EVENT` call.
 fn alloc_event_page(kfd_fd: &OwnedFd, drm_fd: &OwnedFd, node: &AmdNode) -> Result<(u64, usize, u64)> {
     use libc::{
         MAP_ANONYMOUS, MAP_FIXED, MAP_NORESERVE, MAP_PRIVATE, MAP_SHARED, PROT_NONE, PROT_READ, PROT_WRITE, mmap,
@@ -597,7 +593,6 @@ fn alloc_event_page(kfd_fd: &OwnedFd, drm_fd: &OwnedFd, node: &AmdNode) -> Resul
 /// Allocate a scratch buffer sized for `private_segment_size` bytes per
 /// thread and compute the packed `COMPUTE_TMPRING_SIZE` value. Returns
 /// `(scratch_gpu_va, scratch_size, tmpring_size, rounded_size_per_thread)`.
-/// Mirrors tinygrad's `_ensure_has_local_memory` at `ops_amd.py:1065-1081`.
 ///
 /// Sizing (gfx11/12):
 /// - `lanes_per_wave = 64` (scratch lane stride is wave64-aligned per AMD)

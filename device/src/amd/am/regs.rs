@@ -1,10 +1,9 @@
 //! AM register access: vendored register tables + the resolver.
 //!
 //! The tables in `regs_gen.rs` are generated **once** (by
-//! `device/tools/gen_am_regs.py`, from tinygrad's `autogen/am/regs.py`) and
-//! committed — the cargo build never depends on the tinygrad submodule. At boot
-//! the right module is chosen by the discovered `ip_ver` ([`select`]), mirroring
-//! tinygrad's `import_asic_regs`. A `RegDef` carries the dword offset within its
+//! `device/tools/gen_am_regs.py`) and committed — the cargo build never depends
+//! on the tinygrad submodule. At boot the right module is chosen by the
+//! discovered `ip_ver` ([`select`]). A `RegDef` carries the dword offset within its
 //! IP segment plus its bitfields; the absolute MMIO address (segment base +
 //! offset) is resolved later from the IP-discovery register bases.
 
@@ -36,8 +35,8 @@ impl RegDef {
         self.fields.iter().find(|f| f.name == name)
     }
 
-    /// OR together `value << field.lo` for each named field (port of
-    /// `AMDReg.encode`). Panics on an unknown field name (a programming error).
+    /// OR together `value << field.lo` for each named field. Panics on an
+    /// unknown field name (a programming error).
     pub fn encode(&self, values: &[(&str, u32)]) -> u64 {
         let mut acc = 0u64;
         for (name, v) in values {
@@ -47,7 +46,7 @@ impl RegDef {
         acc
     }
 
-    /// Extract a field's value from a register word (port of `AMDReg.decode`).
+    /// Extract a field's value from a register word.
     pub fn get(&self, val: u64, name: &str) -> u32 {
         let f = self.field(name).unwrap_or_else(|| panic!("register {} has no field {name}", self.name));
         let width = (f.hi - f.lo + 1) as u32;
@@ -63,9 +62,8 @@ pub fn find<'a>(regs: &'a [RegDef], name: &str) -> Option<&'a RegDef> {
 }
 
 /// Select the register module for `prefix` (e.g. `"gc"`) whose version is the
-/// greatest `<= ip_ver` sharing the same major — tinygrad's `import_module`
-/// rule. `None` if no matching module is vendored (re-run the generator with a
-/// wider module list to add one).
+/// greatest `<= ip_ver` sharing the same major. `None` if no matching module is
+/// vendored (re-run the generator with a wider module list to add one).
 pub fn select(prefix: &str, ip_ver: (u8, u8, u8)) -> Option<&'static [RegDef]> {
     AM_REG_MODULES
         .iter()

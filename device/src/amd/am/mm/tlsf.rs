@@ -1,5 +1,4 @@
-//! Two-Level Segregated Fit (TLSF) allocator — port of tinygrad's
-//! `TLSFAllocator` (`runtime/support/memory.py`).
+//! Two-Level Segregated Fit (TLSF) allocator.
 //!
 //! The AM driver uses three instances of this: the process-global virtual
 //! address space, the per-device physical-VRAM pool, and the page-table pool.
@@ -46,9 +45,8 @@ pub struct TlsfAllocator {
     base: u64,
     block_size: u64,
     /// `bit_length(lv2_cnt)` — the second-level index width. With the default
-    /// `lv2_cnt = 16` this is **5**, not 16 and not 4 (matches tinygrad's
-    /// `self.l2_cnt = lv2_cnt.bit_length()`). Iteration over level-2 buckets
-    /// runs `0..(1 << l2_cnt)`.
+    /// `lv2_cnt = 16` this is **5**, not 16 and not 4. Iteration over level-2
+    /// buckets runs `0..(1 << l2_cnt)`.
     l2_cnt: u32,
     /// `storage[fl][sl]` → list of free-block start offsets in that bucket.
     storage: Vec<Vec<Vec<u64>>>,
@@ -59,7 +57,7 @@ pub struct TlsfAllocator {
 }
 
 impl TlsfAllocator {
-    /// Default minimum-block / second-level-count (tinygrad's defaults).
+    /// Default minimum-block / second-level-count.
     pub const DEFAULT_BLOCK_SIZE: u64 = 16;
     pub const DEFAULT_LV2_CNT: u64 = 16;
 
@@ -105,8 +103,7 @@ impl TlsfAllocator {
     }
 
     /// Insert a free block. `prev = None` means "inherit the existing block's
-    /// `prev`" (tinygrad's `prev is None` sentinel — it never sets `prev` to a
-    /// genuine `None` after construction).
+    /// `prev`" — a sentinel, never a genuine `None` after construction.
     fn insert_block(&mut self, start: u64, size: u64, prev: Option<u64>) {
         let prev = prev.or_else(|| self.blocks.get(&start).and_then(|b| b.prev));
         let (fl, sl) = (self.lv1(size), self.lv2(size));
@@ -185,7 +182,7 @@ impl TlsfAllocator {
 
     /// Allocate `req_size` bytes aligned to `align` (a power of two ≥ 1).
     /// Returns the absolute address (`base`-relative offset + `base`), or `None`
-    /// if no block fits. Mirrors tinygrad's `TLSFAllocator.alloc`.
+    /// if no block fits.
     pub fn alloc(&mut self, req_size: u64, align: u64) -> Option<u64> {
         let align = align.max(1);
         let req_size = req_size.max(self.block_size);

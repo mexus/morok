@@ -1,10 +1,9 @@
-
 use super::*;
 
 #[test]
-fn aql_packet_header_matches_tinygrad() {
+fn aql_packet_header_layout() {
     let h = kernel_dispatch_header();
-    // tinygrad AQL_HDR = TYPE_KERNEL_DISPATCH | barrier | sys-acq | sys-rel
+    // AQL packet header = TYPE_KERNEL_DISPATCH | barrier | sys-acq | sys-rel
     let expected: u16 = 2 | (1 << 8) | (HSA_FENCE_SCOPE_SYSTEM << 9) | (HSA_FENCE_SCOPE_SYSTEM << 11);
     assert_eq!(h, expected);
 }

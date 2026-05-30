@@ -13,8 +13,8 @@
 //!
 //! Arch parametrization is data-driven: register tables keyed by the `ip_ver`
 //! tuples read from IP discovery, with the gfx11/gfx12/gfx9 deltas as small
-//! inline `if ip_ver >= (X,Y,Z)` branches inside shared modules (mirrors
-//! tinygrad's `runtime/support/am`). gfx11 is wired now; the rest are data adds.
+//! inline `if ip_ver >= (X,Y,Z)` branches inside shared modules. gfx11 is wired
+//! now; the rest are data adds.
 
 pub mod mm;
 pub mod regs;
