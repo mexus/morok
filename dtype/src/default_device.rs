@@ -49,13 +49,23 @@ pub fn default_device() -> DeviceSpec {
 }
 
 /// Scoped override: runs `f` with `spec` as the default device, restoring
-/// the previous value on return.
+/// the previous value when the scope ends — including if `f` panics. The
+/// restore is RAII so a caught unwind can't leak the override onto the thread.
 pub fn with_default_device<R>(spec: DeviceSpec, f: impl FnOnce() -> R) -> R {
-    let prev = THREAD_DEFAULT.with(|t| t.borrow().clone());
+    let _guard = DefaultDeviceGuard { prev: THREAD_DEFAULT.with(|t| t.borrow().clone()) };
     set_default_device(spec);
-    let result = f();
-    THREAD_DEFAULT.with(|t| *t.borrow_mut() = prev);
-    result
+    f()
+}
+
+/// Restores the captured thread-local default on drop.
+struct DefaultDeviceGuard {
+    prev: Option<DeviceSpec>,
+}
+
+impl Drop for DefaultDeviceGuard {
+    fn drop(&mut self) {
+        THREAD_DEFAULT.with(|t| *t.borrow_mut() = self.prev.take());
+    }
 }
 
 /// Minimal `DeviceSpec` parser for the `SVOD_DEVICE` env var. We intentionally
@@ -78,3 +88,7 @@ fn parse_simple(s: &str) -> Option<DeviceSpec> {
         _ => None,
     }
 }
+
+#[cfg(test)]
+#[path = "test/unit/default_device.rs"]
+mod tests;
