@@ -678,9 +678,10 @@ impl Allocator for LruAllocator {
 
         if let Some(buffer) = buffer {
             if zero && !self.zero_cached(&buffer)? {
-                // Device-only buffer we can't memset on the host: drop it and
-                // allocate fresh so we never hand back un-zeroed data.
-                drop(buffer);
+                // Device-only buffer we can't memset on the host: free it (a
+                // bare `drop` leaks — RawBuffer has no Drop) and allocate fresh
+                // so we never hand back un-zeroed data.
+                self.inner.free(buffer, size, options);
                 return self.inner.alloc(size, options, zero);
             }
             return Ok(buffer);

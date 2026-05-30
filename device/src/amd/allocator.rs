@@ -86,7 +86,7 @@ impl Allocator for AmdAllocator {
                 // (host_ptr: Some) when `has_sdma_queue` is false. A device-only
                 // VRAM buffer can only exist on SDMA-capable hardware, where the
                 // copy must go through the SDMA staging ring (not yet wired).
-                Err(crate::Error::Unsupported { op: "copyin to device-only VRAM (needs SDMA staging)" })
+                UnsupportedSnafu { op: "copyin to device-only VRAM (needs SDMA staging)" }.fail()
             }
             other => unreachable!("AmdAllocator::_copyin on non-AMD buffer: {other:?}"),
         }
@@ -105,7 +105,7 @@ impl Allocator for AmdAllocator {
             RawBuffer::AmdDevice { host_ptr: None, .. } => {
                 // Unreachable without SDMA (see `_copyin`). Device-only VRAM
                 // copyout needs the SDMA staging ring.
-                Err(crate::Error::Unsupported { op: "copyout from device-only VRAM (needs SDMA staging)" })
+                UnsupportedSnafu { op: "copyout from device-only VRAM (needs SDMA staging)" }.fail()
             }
             other => unreachable!("AmdAllocator::_copyout on non-AMD buffer: {other:?}"),
         }
@@ -131,7 +131,7 @@ impl Allocator for AmdAllocator {
             (RawBuffer::AmdDevice { .. }, RawBuffer::AmdDevice { .. }) => {
                 // Device-only VRAM on at least one side: needs SDMA staging
                 // (unreachable without an SDMA queue — `_alloc` forces cpu_access).
-                Err(crate::Error::Unsupported { op: "AMD↔AMD transfer of device-only VRAM (needs SDMA)" })
+                UnsupportedSnafu { op: "AMD↔AMD transfer of device-only VRAM (needs SDMA)" }.fail()
             }
             _ => UnsupportedSnafu { op: "transfer" }.fail(),
         }
