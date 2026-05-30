@@ -314,6 +314,18 @@ impl Graph for AmdGraph {
             return Err(err);
         }
 
+        // Replay is serial per graph instance — tinygrad's `HCQGraph` likewise
+        // assumes single-threaded replay (it patches var/kickoff vals in place
+        // into a shared command buffer with no lock). `AmdGraph` is `Sync`, so
+        // rather than merely document the contract we enforce it: hold the
+        // command stream's lock across the WHOLE replay — the kickoff bump, the
+        // previous replay's timeline wait, the reservation + submit, and the
+        // signal release. Covering only the submit (as before) would let two
+        // callers interleave: A reads prev=N reserves N+1, B reads prev=N
+        // reserves N+2, B submits first → the CP waits on N+1 which only A's
+        // signal writes → deadlock.
+        let mut q = self.comp_queue.lock();
+
         // 1. Bump kickoff + wait the previous replay's timeline target.
         let kickoff_value = {
             let mut k = self.kickoff_value.lock();
@@ -325,34 +337,22 @@ impl Graph for AmdGraph {
             self.connector().timeline_signal().wait(last, 30_000)?;
         }
 
-        // 2. Reserve this replay's timeline step and submit the IB. The
-        //    timeline read + `next_timeline` reservation + symbol resolution
-        //    + submit all happen inside `comp_queue.lock()` so two concurrent
-        //    `replay()` callers can't interleave: without the lock, thread A
-        //    could read prev=N reserves next=N+1, thread B reads prev=N (!)
-        //    reserves next=N+2, then B's submit lands first → CP waits on
-        //    N+1 which only A's signal writes → deadlock. Per-connector
-        //    ownership eliminates cross-connector contention; this lock
-        //    guards the much narrower "two threads, same connector" case.
-        let signalled = {
-            let mut q = self.comp_queue.lock();
-            // VirtTimelineVal = timeline_value-1 (what the preamble waits for);
-            // the final signal writes +1, advancing the connector timeline by
-            // exactly one step. `next_timeline` reserves that same value.
-            let prev = self.connector().timeline_value().saturating_sub(1);
-            let signalled = self.connector().next_timeline();
+        // 2. Reserve this replay's timeline step and submit the IB.
+        // VirtTimelineVal = timeline_value-1 (what the preamble waits for); the
+        // final signal writes +1, advancing the connector timeline by exactly
+        // one step. `next_timeline` reserves that same value.
+        let prev = self.connector().timeline_value().saturating_sub(1);
+        let signalled = self.connector().next_timeline();
 
-            // Resolve the graph's symbols.
-            let mut var_vals: VarVals = VarVals::new();
-            var_vals.insert(Sym::Kickoff, kickoff_value);
-            var_vals.insert(Sym::VirtTimelineVal, prev);
-            var_vals.insert(Sym::VirtTimelineSigAddr, self.connector().timeline_signal().value_addr());
+        // Resolve the graph's symbols.
+        let mut var_vals: VarVals = VarVals::new();
+        var_vals.insert(Sym::Kickoff, kickoff_value);
+        var_vals.insert(Sym::VirtTimelineVal, prev);
+        var_vals.insert(Sym::VirtTimelineSigAddr, self.connector().timeline_signal().value_addr());
 
-            // submit → apply_var_vals (patch hw_page + kernargs) → _submit (one
-            //  doorbell).
-            q.submit(self.connector(), &var_vals)?;
-            signalled
-        };
+        // submit → apply_var_vals (patch hw_page + kernargs) → _submit (one
+        //  doorbell).
+        q.submit(self.connector(), &var_vals)?;
         *self.last_timeline.lock() = signalled;
 
         // 3. Reset the per-queue signal, then release the IB by setting the kick
