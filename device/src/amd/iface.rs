@@ -29,6 +29,9 @@ use crate::amd::topology::AmdNode;
 use crate::amd::va_registry::{AllocTag, VaRegistry};
 use crate::error::{Error, Result};
 
+/// Size of the doorbell MMIO window mapped per queue (two 4 KiB pages).
+const DOORBELL_PAGE_BYTES: usize = 0x2000;
+
 /// Backend seam for the AMD device. Every KFD ioctl that `AmdDeviceCore` (and
 /// its allocator / queue / connector helpers) needs is funnelled through one
 /// of these five methods, so a second backend (the userspace AM driver) can be
@@ -52,9 +55,9 @@ pub trait AmdIface: Send + Sync + std::fmt::Debug {
     /// Create a KFD compute/SDMA queue over a pre-allocated ring + GART and
     /// return its queue id + mmapped doorbell.
     fn setup_ring(&self, desc: &RingDesc) -> Result<QueueHandle>;
-    /// Destroy the in-kernel queue object. Does NOT munmap the doorbell
-    /// (preserves the pre-refactor behavior). Best-effort.
-    fn teardown_ring(&self, queue_id: u32);
+    /// Destroy the in-kernel queue object and `munmap` the queue's doorbell
+    /// page (`doorbell_base` is the mmap base from [`QueueHandle`]). Best-effort.
+    fn teardown_ring(&self, queue_id: u32, doorbell_base: NonNull<u8>);
     /// Block up to `timeout_ms` on the device's completion + fault events.
     /// `Ok(Some(Error::Runtime{..}))` on a fault, `Ok(None)` on a normal
     /// wake-up/timeout, `Err` if the WAIT_EVENTS ioctl itself failed.
@@ -108,6 +111,9 @@ pub struct RingDesc {
 /// per-queue doorbell pointer.
 pub struct QueueHandle {
     pub queue_id: u32,
+    /// mmap base of the doorbell page, kept so the page can be `munmap`'d on
+    /// teardown (each queue maps its own page).
+    pub doorbell_base: NonNull<u8>,
     pub doorbell: NonNull<u64>,
 }
 
@@ -385,18 +391,25 @@ impl AmdIface for KfdIface {
             return Err(Error::AmdIoctl { ioctl: "AMDKFD_IOC_CREATE_QUEUE", errno: e as i32 });
         }
 
-        let doorbell = self.doorbell_mmap(args.doorbell_offset)?;
+        let (doorbell_base, doorbell) = self.doorbell_mmap(args.doorbell_offset)?;
         debug!(queue_id = args.queue_id, doorbell_offset = args.doorbell_offset, "AMD queue created");
-        Ok(QueueHandle { queue_id: args.queue_id, doorbell })
+        Ok(QueueHandle { queue_id: args.queue_id, doorbell_base, doorbell })
     }
 
-    fn teardown_ring(&self, queue_id: u32) {
+    fn teardown_ring(&self, queue_id: u32, doorbell_base: NonNull<u8>) {
         let mut args = kfd::kfd_ioctl_destroy_queue_args { queue_id, ..Default::default() };
         // SAFETY: `kfd_fd` is alive (held via Arc<OwnedFd>); the queue_id was
         // returned by KFD on the matching create_queue call.
         let rc = unsafe { ioctl::kfd_destroy_queue(self.kfd_fd.as_raw_fd(), &mut args as *mut _) };
         if let Err(e) = rc {
             tracing::warn!(?e, queue_id, "teardown_ring: kfd_destroy_queue failed");
+        }
+        // Release the per-queue doorbell MMIO page mapped in `doorbell_mmap`.
+        // SAFETY: `doorbell_base` is the mmap base returned for this queue and
+        // is no longer referenced once the queue is destroyed.
+        if unsafe { munmap(doorbell_base.as_ptr().cast(), DOORBELL_PAGE_BYTES) } != 0 {
+            let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+            tracing::warn!(queue_id, errno, "teardown_ring: doorbell munmap failed");
         }
     }
 
@@ -483,12 +496,13 @@ impl KfdIface {
         let _ = unsafe { ioctl::kfd_free_memory_of_gpu(self.kfd_fd.as_raw_fd(), &mut args as *mut _) };
     }
 
-    /// Map a single 8 KiB doorbell window from `/dev/kfd` and return the
-    /// per-queue doorbell pointer. KFD doorbells are page-aligned regions of
-    /// MMIO addresses; the per-queue doorbell address = page_base +
-    /// (doorbell_offset & 0x1fff).
-    fn doorbell_mmap(&self, doorbell_offset: u64) -> Result<NonNull<u64>> {
-        const DOORBELL_PAGE_BYTES: usize = 0x2000;
+    /// Map a single doorbell window from `/dev/kfd` and return the mmap base
+    /// (kept for a later `munmap`) plus the per-queue doorbell pointer. KFD
+    /// doorbells are page-aligned regions of MMIO addresses; the per-queue
+    /// doorbell address = page_base + (doorbell_offset & 0x1fff). The base is
+    /// returned separately because `mmap` only guarantees 4 KiB alignment, so
+    /// the page base is not recoverable from the offset pointer alone.
+    fn doorbell_mmap(&self, doorbell_offset: u64) -> Result<(NonNull<u8>, NonNull<u64>)> {
         let page_base = doorbell_offset & !0x1fff;
         // SAFETY: standard libc::mmap; protections set for read+write MMIO.
         let p = unsafe {
@@ -505,10 +519,11 @@ impl KfdIface {
             let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
             return Err(Error::AmdAllocFailed { reason: format!("doorbell mmap failed (errno {errno})") });
         }
+        let base = NonNull::new(p as *mut u8).expect("doorbell page non-null");
         let offset_in_page = (doorbell_offset & 0x1fff) as usize;
         // SAFETY: offset_in_page < DOORBELL_PAGE_BYTES; alignment to u64 holds.
-        let ptr = unsafe { (p as *mut u8).add(offset_in_page) as *mut u64 };
-        Ok(NonNull::new(ptr).expect("doorbell page non-null"))
+        let ptr = unsafe { base.as_ptr().add(offset_in_page) as *mut u64 };
+        Ok((base, NonNull::new(ptr).expect("doorbell page non-null")))
     }
 }
 

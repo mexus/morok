@@ -227,16 +227,14 @@ struct QueueInner {
     ring_size: usize,
     /// Per-queue doorbell (`*mut u64` MMIO).
     doorbell: NonNull<u64>,
+    /// mmap base of the doorbell page, kept so the queue can `munmap` it on
+    /// teardown (each queue maps its own page).
+    doorbell_base: NonNull<u8>,
     /// Host pointer to the GART-resident `write_dispatch_id` slot — KFD
     /// reads this in addition to the doorbell. It must be updated before
     /// every doorbell ring. Skipping it makes the GPU's
     /// command processor see the doorbell change but stall on a stale wptr.
     write_ptr_host: NonNull<u64>,
-    /// Host pointer to the GART-resident `read_dispatch_id` slot. The GPU
-    /// command processor advances this as it consumes packets. Polling it
-    /// is the simplest way to know when our enqueued packets have been
-    /// dispatched.
-    read_ptr_host: NonNull<u64>,
     /// 16 MiB host-visible uncached-coherent buffer for PM4 indirect
     /// buffers (AQL path only). The AQL vendor-specific packet
     /// references PM4 dwords stored in this buffer via PACKET3_INDIRECT_BUFFER.
@@ -409,16 +407,6 @@ impl AmdComputeQueue {
         self.is_pm4
     }
 
-    /// Current `read_dispatch_id` from GART. NOTE: for a PM4 COMPUTE queue the
-    /// CP does not reliably advance this AQL-style field, so do NOT use it for
-    /// ring flow control — back-pressure goes through the timeline signal
-    /// (`wait_dispatch_headroom`). Kept for diagnostics/AQL.
-    pub fn read_idx(&self) -> u64 {
-        // SAFETY: single-owner invariant (see struct doc).
-        let g = unsafe { &*self.inner.get() };
-        unsafe { std::ptr::read_volatile(g.read_ptr_host.as_ptr()) }
-    }
-
     /// Block until at most `RING_MAX_INFLIGHT` dispatches are un-retired, so a
     /// host running `wait=false` faster than the GPU can't lap the ring and
     /// overwrite unconsumed packets. Bounds the combined ring footprint to
@@ -438,12 +426,6 @@ impl AmdComputeQueue {
                 .inspect_err(|e| self.core.poison(&e.to_string()))?;
         }
         Ok(())
-    }
-
-    /// Current host-side `write_dispatch_id`.
-    pub fn write_idx(&self) -> u64 {
-        // SAFETY: single-owner invariant (see struct doc).
-        unsafe { &*self.inner.get() }.write_idx
     }
 
     /// Atomically build + submit one PM4 (single-XCC) kernel dispatch.
@@ -656,15 +638,19 @@ impl Drop for AmdComputeQueue {
             return;
         }
         // `&mut self` → exclusive; `get_mut` needs no unsafe.
-        let queue_id = self.inner.get_mut().queue_id;
-        self.core.iface().teardown_ring(queue_id);
+        let inner = self.inner.get_mut();
+        let (queue_id, doorbell_base) = (inner.queue_id, inner.doorbell_base);
+        self.core.iface().teardown_ring(queue_id, doorbell_base);
     }
 }
 
 impl Drop for AmdCopyQueue {
     fn drop(&mut self) {
-        let queue_id = self.inner.lock().queue_id;
-        self.core.iface().teardown_ring(queue_id);
+        let (queue_id, doorbell_base) = {
+            let g = self.inner.lock();
+            (g.queue_id, g.doorbell_base)
+        };
+        self.core.iface().teardown_ring(queue_id, doorbell_base);
     }
 }
 
@@ -882,12 +868,12 @@ fn create_queue(allocator: &AmdAllocator, queue_type: u32, ring_size: usize, aql
     let qh = dev.iface().setup_ring(&desc)?;
     let queue_id = qh.queue_id;
     let doorbell = qh.doorbell;
+    let doorbell_base = qh.doorbell_base;
 
     // SAFETY: gart_host points to the GART page we just mmapped; the
     // write/read_dispatch_id fields live at fixed offsets inside the
     // AmdQueueT descriptor we wrote into the page.
     let write_ptr_host = unsafe { NonNull::new_unchecked(gart_host.as_ptr().add(wptr_offset as usize) as *mut u64) };
-    let read_ptr_host = unsafe { NonNull::new_unchecked(gart_host.as_ptr().add(rptr_offset as usize) as *mut u64) };
 
     // PM4 indirect-buffer arena. AQL compute queues need it (PM4 helpers
     // get wrapped in vendor-IB packets); PM4 single-XCC compute queues and SDMA
@@ -911,8 +897,8 @@ fn create_queue(allocator: &AmdAllocator, queue_type: u32, ring_size: usize, aql
         ring_host,
         ring_size,
         doorbell,
+        doorbell_base,
         write_ptr_host,
-        read_ptr_host,
         pm4_ibs_host,
         pm4_ibs_gpu,
         pm4_ibs_size,
