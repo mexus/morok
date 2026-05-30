@@ -108,9 +108,16 @@ fn batch_cache_key(tensors: &[&Tensor], cfg: &PrepareConfig) -> (u64, &'static s
 fn test_resolve_codegen_skips_disk_buffers() {
     let config = cfg();
     let registry = svod_device::registry::registry();
-    let expected = config
+    // A non-disk CPU buffer pins codegen to CPU; all-disk inputs fall back to
+    // the active default device (CPU, or AMD under SVOD_DEVICE=AMD:0).
+    let expected_cpu = config
         .resolve_device(&svod_dtype::DeviceSpec::Cpu, registry)
         .expect("CPU device should resolve")
+        .compiler
+        .cache_key();
+    let expected_default = config
+        .resolve_device(&svod_dtype::default_device::default_device(), registry)
+        .expect("default device should resolve")
         .compiler
         .cache_key();
 
@@ -123,11 +130,11 @@ fn test_resolve_codegen_skips_disk_buffers() {
 
     let mixed = crate::realize::resolve_codegen(&[(disk.id, disk.clone()), (cpu.id, cpu)], &config)
         .expect("DISK buffers should not be selected for codegen");
-    assert_eq!(mixed, expected);
+    assert_eq!(mixed, expected_cpu);
 
     let fallback = crate::realize::resolve_codegen(&[(disk.id, disk)], &config)
-        .expect("all-DISK inputs should fall back to CPU codegen");
-    assert_eq!(fallback, expected);
+        .expect("all-DISK inputs should fall back to default-device codegen");
+    assert_eq!(fallback, expected_default);
 }
 
 #[test]

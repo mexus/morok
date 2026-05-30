@@ -25,9 +25,10 @@ fn test_scatternd_debug() {
         4.0, 4.0, 4.0, 4.0, 8.0, 7.0, 6.0, 5.0, 4.0, 3.0, 2.0, 1.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0,
     ];
 
+    // All tensors use the active default device so the kernel isn't split
+    // across devices (CPU index + GPU data would trip KernelSplitMixedDevices).
     let x = Tensor::from_slice(&data).try_reshape([4, 4, 4]).unwrap();
-    let idx =
-        Tensor::from_slice_with().source(&indices).device(svod_ir::DeviceSpec::Cpu).call().try_reshape([2, 1]).unwrap();
+    let idx = Tensor::from_slice(&indices).try_reshape([2, 1]).unwrap();
     let upd = Tensor::from_slice(&updates).try_reshape([2, 4, 4]).unwrap();
 
     let mut result = x.scatter_nd(&idx, &upd, "none").unwrap();

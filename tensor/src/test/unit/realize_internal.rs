@@ -354,16 +354,17 @@ fn test_realize_sum() {
 
 #[test]
 fn test_tensor_device_default_cpu() {
-    // Tensors created with from_slice default to CPU
+    // Tensors created with from_slice land on the active default device
+    // (CPU, or AMD under SVOD_DEVICE=AMD:0).
     let a = Tensor::from_slice([1.0f32, 2.0, 3.0]);
-    assert_eq!(a.device(), svod_ir::DeviceSpec::Cpu);
+    assert_eq!(a.device(), svod_dtype::default_device::default_device());
 }
 
 #[test]
 fn test_tensor_to_same_device_is_noop() {
     // Moving to the same device should return a clone
     let a = Tensor::from_slice([1.0f32, 2.0, 3.0]);
-    let b = a.to(svod_ir::DeviceSpec::Cpu);
+    let b = a.to(a.device());
     // Both should point to the same UOp (clone shares Rc)
     assert_eq!(a.device(), b.device());
 }
@@ -373,11 +374,13 @@ fn test_tensor_to_different_device_creates_copy() {
     use svod_ir::DeviceSpec;
     // Moving to a different device should create a COPY UOp
     let a = Tensor::from_slice([1.0f32, 2.0, 3.0]);
+    let orig = a.device();
+    // Cuda is never the active default here, so it is always a different device.
     let b = a.to(DeviceSpec::Cuda { device_id: 0 });
     // b should report the new device
     assert_eq!(b.device(), DeviceSpec::Cuda { device_id: 0 });
-    // a should still be on CPU
-    assert_eq!(a.device(), DeviceSpec::Cpu);
+    // a should be unchanged
+    assert_eq!(a.device(), orig);
 }
 
 // More comprehensive tests will be added in Phase 1.5
