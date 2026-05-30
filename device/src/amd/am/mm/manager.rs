@@ -247,11 +247,11 @@ impl<P: PhysMem> MemoryManager<P> {
                 break;
             }
             let popped = w.stack.pop().unwrap();
+            if w.stack.is_empty() {
+                break; // unwound past the root (whole space consumed) — no parent to bump
+            }
             if popped.pte_idx as u64 == self.pte_cnt(popped.lv) {
                 w.stack.last_mut().unwrap().pte_idx += 1;
-            }
-            if w.stack.is_empty() {
-                break; // unwound past the root (whole space consumed)
             }
         }
     }

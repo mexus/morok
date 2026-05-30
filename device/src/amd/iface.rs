@@ -437,10 +437,10 @@ impl AmdIface for KfdIface {
         // matches the event we registered.
         let mem = unsafe { events[1].__bindgen_anon_1.memory_exception_data };
         if mem.gpu_id != 0 {
-            // Hoist every field into a local first: the enclosing struct is
-            // `repr(packed)`, so referencing a field in-place (as `format!` /
-            // `tracing!` do) is an unaligned-reference error. The braces force a
-            // by-value copy.
+            // Copy each field into a local before the format/tracing calls
+            // below. The bindgen union payload is `#[repr(C)]` (naturally
+            // aligned), so the by-value copies are for clarity, not to avoid an
+            // unaligned reference.
             let gpu_id = mem.gpu_id;
             let va = { mem.va };
             let not_present = { mem.failure.NotPresent };

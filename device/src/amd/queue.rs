@@ -29,7 +29,7 @@ use crate::amd::connector::AmdConnector;
 use crate::amd::device::AmdDeviceCore;
 use crate::amd::sys::hsa::{
     HSA_FENCE_SCOPE_SYSTEM, HSA_PACKET_HEADER_BARRIER, HSA_PACKET_HEADER_SCACQUIRE_FENCE_SCOPE,
-    HSA_PACKET_HEADER_SCRELEASE_FENCE_SCOPE, HSA_PACKET_TYPE_BARRIER_AND, HSA_PACKET_TYPE_VENDOR_SPECIFIC,
+    HSA_PACKET_HEADER_SCRELEASE_FENCE_SCOPE, HSA_PACKET_TYPE_VENDOR_SPECIFIC,
     HsaKernelDispatchPacket, HsaSignal, kernel_dispatch_header,
 };
 use crate::amd::sys::kfd;
@@ -53,14 +53,6 @@ const MAX_DISPATCH_DWORDS: usize = 1024;
 /// worst case (`* MAX_DISPATCH_DWORDS`), leaving generous margin while still
 /// letting the host run thousands of dispatches ahead of the GPU.
 const RING_MAX_INFLIGHT: u64 = (COMPUTE_RING_BYTES / 4 / MAX_DISPATCH_DWORDS / 2) as u64;
-
-/// Build a barrier-AND AQL packet header (used for wait/signal nodes).
-pub const fn barrier_and_header() -> u16 {
-    HSA_PACKET_TYPE_BARRIER_AND
-        | (1 << HSA_PACKET_HEADER_BARRIER)
-        | (HSA_FENCE_SCOPE_SYSTEM << HSA_PACKET_HEADER_SCACQUIRE_FENCE_SCOPE)
-        | (HSA_FENCE_SCOPE_SYSTEM << HSA_PACKET_HEADER_SCRELEASE_FENCE_SCOPE)
-}
 
 /// AQL vendor-specific packet that wraps a PM4 indirect-buffer reference.
 ///
@@ -139,28 +131,6 @@ pub fn build_dispatch_packet(
         reserved2: 0,
         completion_signal: HsaSignal { handle: completion_signal },
     }
-}
-
-/// Build a barrier-AND AQL packet (64 bytes; same layout as a kernel-dispatch
-/// packet, different header/type). Used for both `wait` and `signal`.
-pub fn build_barrier_packet(dep_signals: &[u64], value: u64, completion_signal: u64) -> HsaKernelDispatchPacket {
-    // We reuse `HsaKernelDispatchPacket` as the on-wire 64-byte container;
-    // the AQL spec lays out barrier-AND packets at the same field offsets
-    // when treated as raw 8-u64 words.
-    let mut packet = HsaKernelDispatchPacket { header: barrier_and_header(), setup: 0, ..Default::default() };
-    // Barrier-AND layout:
-    //   header(16) | reserved(48) | dep_signal[0..5] u64 | completion u64 | value u64
-    // We pack dep_signal handles into the first 5 grid/segment-shaped slots.
-    let words: &mut [u64] =
-        unsafe { std::slice::from_raw_parts_mut(&mut packet as *mut _ as *mut u64, AQL_PACKET_BYTES / 8) };
-    // words[0] header+reserved (kept as-is)
-    // words[1..6] = dep signal handles
-    for (i, sig) in dep_signals.iter().take(5).enumerate() {
-        words[1 + i] = *sig;
-    }
-    words[6] = value;
-    words[7] = completion_signal;
-    packet
 }
 
 /// SDMA linear copy packet. All values are u32 dwords stored little-endian
@@ -748,6 +718,10 @@ impl AmdCopyQueue {
 
     pub fn submit(&self) -> Result<()> {
         let g = self.inner.lock();
+        // GART wptr first, then the doorbell — same ordering as the compute
+        // queue's `ring_doorbell`. Skipping the wptr makes the SDMA engine see
+        // the doorbell change but stall on a stale write pointer.
+        unsafe { std::ptr::write_volatile(g.write_ptr_host.as_ptr(), g.write_idx) };
         std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
         unsafe { std::ptr::write_volatile(g.doorbell.as_ptr(), g.write_idx) };
         Ok(())

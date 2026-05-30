@@ -34,16 +34,6 @@ fn sdma_linear_copy_dwords_layout() {
     assert_eq!(dw[6], 0x0000_0002);
 }
 
-#[test]
-fn barrier_packet_packs_dep_signals() {
-    let p = build_barrier_packet(&[0xdead_beef, 0xcafe_babe], 7, 0xfeed_face);
-    let words: &[u64] = unsafe { std::slice::from_raw_parts(&p as *const _ as *const u64, 8) };
-    assert_eq!(words[1], 0xdead_beef);
-    assert_eq!(words[2], 0xcafe_babe);
-    assert_eq!(words[6], 7);
-    assert_eq!(words[7], 0xfeed_face);
-}
-
 /// Live compute queue creation (exercises the KFD CREATE_QUEUE path).
 /// Skipped without a supported AMD GPU. A real dispatch needs the device
 /// timeline wired up by the factory, so we only assert creation here.
