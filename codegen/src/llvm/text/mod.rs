@@ -145,7 +145,18 @@ impl Renderer for LlvmTextRenderer {
                 let dtype = ldt(&node.dtype());
                 let identity = reduce_identity(*reduce_op, &node.dtype());
                 let acc_name = format!("%reduce_{}", node.id);
-                kernel.push(format!("  {acc_name} = alloca {dtype}"));
+                match self.target {
+                    // AMDGPU rejects addrspace(0) allocas (`alloca on amdgpu must
+                    // be in addrspace(5)`); allocate in private/scratch and
+                    // addrspacecast to a generic `ptr` for the downstream
+                    // loads/stores, mirroring `render_define_reg`.
+                    LlvmTarget::Amd(_) => {
+                        let raw = format!("{acc_name}.raw");
+                        kernel.push(format!("  {raw} = alloca {dtype}, addrspace(5)"));
+                        kernel.push(format!("  {acc_name} = addrspacecast ptr addrspace(5) {raw} to ptr"));
+                    }
+                    LlvmTarget::Cpu => kernel.push(format!("  {acc_name} = alloca {dtype}")),
+                }
                 kernel.push(format!("  store {dtype} {identity}, ptr {acc_name}"));
                 ctx.register(node.id, acc_name);
             }
@@ -155,8 +166,14 @@ impl Renderer for LlvmTextRenderer {
         // Allocas placed in the entry block so LLVM's mem2reg can promote them
         // to vector registers across loop iterations. Without this, the WMMA
         // accumulator is materialized to memory every K iteration.
+        //
+        // CPU/AMX only: the AMX tensor cores can only load operands from memory,
+        // so they need these scratch slots. The AMDGPU path lowers WMMA straight
+        // to `llvm.amdgcn.wmma.*` intrinsics over SSA vectors (see `amd::wmma`),
+        // so emitting these allocas there is dead IR. Matches tinygrad's
+        // `AMDLLVMRenderer`, which only preallocates on the `tc.amx` path.
         let wmma_count = nodes.iter().filter(|n| matches!(n.op(), Op::Wmma { .. })).count();
-        if wmma_count > 0 {
+        if wmma_count > 0 && matches!(self.target, LlvmTarget::Cpu) {
             kernel.push("  ; WMMA AMX scratch buffers".to_string());
             for node in &nodes {
                 if let Op::Wmma { a, b, c, .. } = node.op() {

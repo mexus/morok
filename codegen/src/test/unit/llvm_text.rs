@@ -1,7 +1,8 @@
-use super::*;
+use smallvec::SmallVec;
 use svod_dtype::{AddrSpace, AmdArch, DType};
-use svod_ir::{BinaryOp, Op};
+use svod_ir::{AxisId, AxisType, BinaryOp, ConstValue, Op, ReduceOp, RendererDevice, WmmaMetadata, WmmaUpcastAxes};
 
+use super::*;
 use crate::Renderer;
 use crate::llvm::LlvmTextRenderer;
 
@@ -140,5 +141,158 @@ fn amd_define_local_emits_addrspace3_module_global() {
         result.code.contains("@local42 = internal unnamed_addr addrspace(3) global [16 x float] undef"),
         "missing addrspace(3) LDS global:\n{}",
         result.code
+    );
+}
+
+// ── Reduce / WMMA emission (parity with tinygrad's AMDLLVMRenderer) ──────────
+
+fn reduce_sum_sink() -> std::sync::Arc<svod_ir::UOp> {
+    // sum of 5.0 over the range 0..10.
+    let const_val = UOp::const_(DType::Float32, ConstValue::Float(5.0));
+    let range =
+        UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(10)), AxisId::Renumbered(0), AxisType::Reduce);
+    let reduce = const_val.reduce(smallvec::smallvec![range.clone()], ReduceOp::Add);
+    let ranges: SmallVec<[_; 4]> = smallvec::smallvec![range];
+    UOp::sink(vec![reduce.end(ranges)])
+}
+
+#[test]
+fn amd_reduce_accumulator_uses_addrspace5() {
+    // AMDGPU rejects addrspace(0) allocas (clang: "alloca on amdgpu must be in
+    // addrspace(5)"), so the reduce accumulator allocates in addrspace(5) and
+    // addrspacecasts to a generic `ptr` — same idiom as DEFINE_REG. (tinygrad
+    // can keep addrspace(0) allocas because it feeds the triple to the LLVM
+    // C-API TargetMachine; svod emits the triple into the IR text and compiles
+    // via the clang CLI, which applies the amdgcn datalayout at parse time.)
+    let result = render_amd_linearized(&reduce_sum_sink(), AmdArch::Gfx1151, "amd_reduce");
+    println!("{}", result.code);
+
+    assert!(result.code.contains("define amdgpu_kernel void @amd_reduce("), "missing kernel ABI:\n{}", result.code);
+    assert!(
+        result.code.contains("alloca float, addrspace(5)"),
+        "reduce accumulator must alloca in addrspace(5):\n{}",
+        result.code
+    );
+    assert!(
+        result.code.contains("addrspacecast ptr addrspace(5)"),
+        "reduce accumulator must addrspacecast to a generic ptr:\n{}",
+        result.code
+    );
+}
+
+#[test]
+fn amd_reduce_ir_assembles_with_llvm_as() {
+    // Smoke-test that the emitted AMD IR actually verifies, by piping it through
+    // `llvm-as` (skipped when no such tool is on PATH). This is the regression
+    // guard that caught the addrspace(0) reduce-accumulator bug.
+    let result = render_amd_linearized(&reduce_sum_sink(), AmdArch::Gfx1151, "amd_reduce_asm");
+    assert_llvm_ir_assembles(&result.code);
+}
+
+/// f16×f16→f32 WMMA metadata for an RDNA3 16×16×16 tile (`<16 x half>` inputs,
+/// `<8 x float>` accumulator).
+fn wmma_f16_f32_metadata() -> WmmaMetadata {
+    WmmaMetadata {
+        name: "WMMA_16_16_16_half_float".to_string(),
+        dims: (16, 16, 16),
+        dtype_in: DType::Float16,
+        dtype_out: DType::Float32,
+        device: RendererDevice::AppleAmx, // unused by the AMD path (keyed on `arch`)
+        threads: 32,
+        upcast_axes: WmmaUpcastAxes { a: vec![(2, 16)], b: vec![(2, 16)], c: vec![(2, 8)] },
+        reduce_axes: vec![],
+        tile_grid: (1, 1),
+    }
+}
+
+fn wmma_f16_f32_sink() -> std::sync::Arc<svod_ir::UOp> {
+    let a = UOp::const_(DType::Float16, ConstValue::Float(0.0)).broadcast(16);
+    let b = UOp::const_(DType::Float16, ConstValue::Float(0.0)).broadcast(16);
+    let c = UOp::const_(DType::Float32, ConstValue::Float(0.0)).broadcast(8);
+    UOp::sink(vec![UOp::wmma(a, b, c, wmma_f16_f32_metadata())])
+}
+
+#[test]
+fn amd_wmma_emits_intrinsic_without_amx_scratch() {
+    // AMD lowers WMMA to `llvm.amdgcn.wmma.*` over SSA vectors, so the CPU/AMX
+    // scratch allocas must NOT be emitted on the AMD path (they were, before
+    // the LlvmTarget::Cpu gate).
+    let result = render_amd_linearized(&wmma_f16_f32_sink(), AmdArch::Gfx1100, "amd_wmma");
+    println!("{}", result.code);
+
+    assert!(
+        result.code.contains("@llvm.amdgcn.wmma.f32.16x16x16.f16"),
+        "missing WMMA intrinsic call:\n{}",
+        result.code
+    );
+    assert!(!result.code.contains("_amx"), "AMD WMMA must not emit AMX scratch allocas:\n{}", result.code);
+    // NB: no llvm-as smoke here. These const operands splat into inline vector
+    // literals (`<16 x half> <half 0, ...>`), and the lightweight intrinsic-
+    // declaration synthesizer comma-splits inside them. Real WMMA operands are
+    // SSA values (loads/contracts) with no internal commas, so the path that
+    // breaks here is never produced in practice.
+}
+
+#[test]
+fn cpu_wmma_still_emits_amx_scratch() {
+    // Regression guard for the other side of the gate: the CPU/AMX path must
+    // keep preallocating its `_amx` scratch slots.
+    let a = UOp::const_(DType::Float32, ConstValue::Float(0.0)).broadcast(16);
+    let b = UOp::const_(DType::Float32, ConstValue::Float(0.0)).broadcast(16);
+    let c = UOp::const_(DType::Float32, ConstValue::Float(0.0)).broadcast(256);
+    let wmma = UOp::wmma(a, b, c, cpu_amx_f32_metadata());
+    let linear = UOp::linear(svod_schedule::linearize_with_cfg(UOp::sink(vec![wmma])).into());
+    let result = render(&linear, Some("cpu_wmma")).expect("CPU render");
+    assert!(result.code.contains("_amx"), "CPU WMMA must emit AMX scratch:\n{}", result.code);
+}
+
+fn cpu_amx_f32_metadata() -> WmmaMetadata {
+    WmmaMetadata {
+        name: "WMMA_16_16_1_float_float".to_string(),
+        dims: (16, 16, 1),
+        dtype_in: DType::Float32,
+        dtype_out: DType::Float32,
+        device: RendererDevice::AppleAmx,
+        threads: 1,
+        upcast_axes: WmmaUpcastAxes { a: vec![(2, 256)], b: vec![(2, 256)], c: vec![(2, 256)] },
+        reduce_axes: vec![],
+        tile_grid: (1, 1),
+    }
+}
+
+/// Pipe `ir` through an `llvm-as` on PATH and assert it parses. Skips (returns)
+/// when no `llvm-as` is installed, so the test is a no-op on machines without
+/// LLVM tools.
+fn assert_llvm_ir_assembles(ir: &str) {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let tool = ["llvm-as", "llvm-as-19", "llvm-as-18", "llvm-as-17", "llvm-as-16"].into_iter().find(|t| {
+        Command::new(t)
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    });
+    let Some(tool) = tool else {
+        eprintln!("skipping llvm-as smoke test: no llvm-as on PATH");
+        return;
+    };
+
+    let mut child = Command::new(tool)
+        .args(["-o", "/dev/null", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn llvm-as");
+    child.stdin.take().unwrap().write_all(ir.as_bytes()).expect("write IR to llvm-as");
+    let out = child.wait_with_output().expect("wait for llvm-as");
+    assert!(
+        out.status.success(),
+        "llvm-as rejected the emitted AMD IR:\n{ir}\n--- llvm-as stderr ---\n{}",
+        String::from_utf8_lossy(&out.stderr)
     );
 }
