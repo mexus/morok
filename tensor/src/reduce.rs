@@ -282,14 +282,23 @@ impl Tensor {
     /// ```
     #[track_caller]
     pub fn var(&self, axes: impl Into<AxisSpec>) -> Result<Self> {
-        var_impl(self, axes.into(), false)
+        var_impl(self, axes.into(), false, 1)
     }
 
-    /// Variance with keepdim option.
+    /// Variance with keepdim and correction options.
+    ///
+    /// `correction` is subtracted from the element count in the divisor (Bessel's
+    /// correction): `correction=1` (default) is the unbiased sample variance,
+    /// `correction=0` the population variance.
     #[builder]
     #[track_caller]
-    pub fn var_with(&self, axes: impl Into<AxisSpec>, #[builder(default = false)] keepdim: bool) -> Result<Self> {
-        var_impl(self, axes.into(), keepdim)
+    pub fn var_with(
+        &self,
+        axes: impl Into<AxisSpec>,
+        #[builder(default = false)] keepdim: bool,
+        #[builder(default = 1)] correction: i64,
+    ) -> Result<Self> {
+        var_impl(self, axes.into(), keepdim, correction)
     }
 
     /// Standard deviation of tensor elements over given axes.
@@ -305,14 +314,23 @@ impl Tensor {
     /// ```
     #[track_caller]
     pub fn std(&self, axes: impl Into<AxisSpec>) -> Result<Self> {
-        std_impl(self, axes.into(), false)
+        std_impl(self, axes.into(), false, 1)
     }
 
-    /// Standard deviation with keepdim option.
+    /// Standard deviation with keepdim and correction options.
+    ///
+    /// `correction` is subtracted from the element count in the divisor:
+    /// `correction=1` (default) is the unbiased sample std, `correction=0` the
+    /// population std.
     #[builder]
     #[track_caller]
-    pub fn std_with(&self, axes: impl Into<AxisSpec>, #[builder(default = false)] keepdim: bool) -> Result<Self> {
-        std_impl(self, axes.into(), keepdim)
+    pub fn std_with(
+        &self,
+        axes: impl Into<AxisSpec>,
+        #[builder(default = false)] keepdim: bool,
+        #[builder(default = 1)] correction: i64,
+    ) -> Result<Self> {
+        std_impl(self, axes.into(), keepdim, correction)
     }
 
     /// Variance and mean of tensor elements over given axes.
@@ -327,18 +345,21 @@ impl Tensor {
     /// ```
     #[track_caller]
     pub fn var_mean(&self, axes: impl Into<AxisSpec>) -> Result<(Self, Self)> {
-        var_mean_impl(self, axes.into(), false)
+        var_mean_impl(self, axes.into(), false, 1)
     }
 
-    /// Variance and mean with keepdim option.
+    /// Variance and mean with keepdim and correction options (see [`var_with`]).
+    ///
+    /// [`var_with`]: Tensor::var_with
     #[builder]
     #[track_caller]
     pub fn var_mean_with(
         &self,
         axes: impl Into<AxisSpec>,
         #[builder(default = false)] keepdim: bool,
+        #[builder(default = 1)] correction: i64,
     ) -> Result<(Self, Self)> {
-        var_mean_impl(self, axes.into(), keepdim)
+        var_mean_impl(self, axes.into(), keepdim, correction)
     }
 
     /// Standard deviation and mean of tensor elements over given axes.
@@ -353,18 +374,21 @@ impl Tensor {
     /// ```
     #[track_caller]
     pub fn std_mean(&self, axes: impl Into<AxisSpec>) -> Result<(Self, Self)> {
-        std_mean_impl(self, axes.into(), false)
+        std_mean_impl(self, axes.into(), false, 1)
     }
 
-    /// Standard deviation and mean with keepdim option.
+    /// Standard deviation and mean with keepdim and correction options (see [`var_with`]).
+    ///
+    /// [`var_with`]: Tensor::var_with
     #[builder]
     #[track_caller]
     pub fn std_mean_with(
         &self,
         axes: impl Into<AxisSpec>,
         #[builder(default = false)] keepdim: bool,
+        #[builder(default = 1)] correction: i64,
     ) -> Result<(Self, Self)> {
-        std_mean_impl(self, axes.into(), keepdim)
+        std_mean_impl(self, axes.into(), keepdim, correction)
     }
 
     /// Internal helper: inverse of tensor for argmin.
@@ -735,20 +759,20 @@ fn mean_impl(tensor: &Tensor, axes: impl Into<AxisSpec>, keepdim: bool) -> Resul
     if acc_dtype != output_dtype { mean.cast(output_dtype) } else { Ok(mean) }
 }
 
-/// Variance implementation using E[X²] - E[X]² formula.
-fn var_impl(tensor: &Tensor, axes: AxisSpec, keepdim: bool) -> Result<Tensor> {
-    let (var, _mean) = var_mean_impl(tensor, axes, keepdim)?;
+/// Variance implementation using the numerically-stable `(X - E[X])²` formula.
+fn var_impl(tensor: &Tensor, axes: AxisSpec, keepdim: bool, correction: i64) -> Result<Tensor> {
+    let (var, _mean) = var_mean_impl(tensor, axes, keepdim, correction)?;
     Ok(var)
 }
 
 /// Standard deviation implementation.
-fn std_impl(tensor: &Tensor, axes: AxisSpec, keepdim: bool) -> Result<Tensor> {
-    let variance = var_impl(tensor, axes, keepdim)?;
+fn std_impl(tensor: &Tensor, axes: AxisSpec, keepdim: bool, correction: i64) -> Result<Tensor> {
+    let variance = var_impl(tensor, axes, keepdim, correction)?;
     variance.try_sqrt()
 }
 
 /// Variance and mean implementation using single-pass algorithm.
-fn var_mean_impl(tensor: &Tensor, axes: AxisSpec, keepdim: bool) -> Result<(Tensor, Tensor)> {
+fn var_mean_impl(tensor: &Tensor, axes: AxisSpec, keepdim: bool, correction: i64) -> Result<(Tensor, Tensor)> {
     let shape = tensor.shape()?;
     let resolved_axes = Tensor::resolve_axis_spec(&axes, shape.len())?;
 
@@ -791,17 +815,28 @@ fn var_mean_impl(tensor: &Tensor, axes: AxisSpec, keepdim: bool) -> Result<(Tens
     // the long sum in fp16 and diverge under a reassociating BEAM opt.
     let sum_sq_dev = reduce_internal(&squared_dev, ReduceOp::Add, axes, keepdim, None, false)?;
 
-    // Divide by N-1 for unbiased estimate (Bessel's correction)
-    let denom = if count > 1 { count - 1 } else { count };
-    let denom_tensor = Tensor::new(UOp::const_(output_dtype, svod_ir::ConstValue::Float(denom as f64)));
-    let variance = &sum_sq_dev / &denom_tensor;
+    // Divide by max(0, N - correction) — tinygrad `reduced.div((n - correction).relu())`
+    // (mixin/__init__.py:461-463). correction=1 is the unbiased sample variance;
+    // correction=0 the population variance.
+    let denom = (count - correction).max(0);
+    let variance = if denom == 0 {
+        // n <= correction (e.g. a single element with correction=1): tinygrad divides
+        // by zero, giving IEEE NaN (reduced==0) or +inf (reduced>0). svod's `/` rejects
+        // a constant-zero divisor, so express the same IEEE result as `reduced * inf`
+        // (0*inf = NaN, k*inf = +inf), rather than silently forcing a denominator of 1.
+        let inf = Tensor::new(UOp::const_(output_dtype, svod_ir::ConstValue::Float(f64::INFINITY)));
+        &sum_sq_dev * &inf
+    } else {
+        let denom_tensor = Tensor::new(UOp::const_(output_dtype, svod_ir::ConstValue::Float(denom as f64)));
+        &sum_sq_dev / &denom_tensor
+    };
 
     Ok((variance, mean))
 }
 
 /// Standard deviation and mean implementation.
-fn std_mean_impl(tensor: &Tensor, axes: AxisSpec, keepdim: bool) -> Result<(Tensor, Tensor)> {
-    let (variance, mean) = var_mean_impl(tensor, axes, keepdim)?;
+fn std_mean_impl(tensor: &Tensor, axes: AxisSpec, keepdim: bool, correction: i64) -> Result<(Tensor, Tensor)> {
+    let (variance, mean) = var_mean_impl(tensor, axes, keepdim, correction)?;
     let std = variance.try_sqrt()?;
     Ok((std, mean))
 }

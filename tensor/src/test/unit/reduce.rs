@@ -588,6 +588,20 @@ crate::codegen_tests! {
         assert_close_f32(&r, &[2.5], 1e-2);
     }
 
+    // var correction parameter + single-element NaN (tinygrad relu(n-correction)).
+    fn test_var_correction_and_single_element(config) {
+        test_setup();
+        // correction=0 → population variance: var([1,2,3,4,5]) = 10/5 = 2.0
+        let t = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0, 5.0]);
+        let pop = t.var_with().axes(()).correction(0).call().unwrap()
+            .realize_with_and(&config).as_vec::<f32>().unwrap();
+        assert_close_f32(&pop, &[2.0], 1e-5);
+        // single element, default correction=1 → 0/0 = NaN (not a forced denom of 1)
+        let single = Tensor::from_slice([5.0f32]).var(()).unwrap()
+            .realize_with_and(&config).as_vec::<f32>().unwrap();
+        assert!(single[0].is_nan(), "var of a single element must be NaN (0/0), got {}", single[0]);
+    }
+
     // ========== Any Tests (from Tinygrad test_ops.py:1423-1432) ==========
 
     fn test_any_value_all_true(config) {
