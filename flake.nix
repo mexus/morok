@@ -51,7 +51,8 @@
           (crane'.filterCargoSources path type)
           || (pkgs.lib.hasSuffix ".proto" path)
           || (pkgs.lib.hasSuffix "config.json" path)
-          || (pkgs.lib.hasSuffix ".onnx" path);
+          || (pkgs.lib.hasSuffix ".onnx" path)
+          || (pkgs.lib.hasSuffix ".h" path);
 
         src = pkgs.lib.cleanSourceWith {
           src = ./.;
