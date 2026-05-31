@@ -716,16 +716,23 @@ fn mean_impl(tensor: &Tensor, axes: impl Into<AxisSpec>, keepdim: bool) -> Resul
         }
     }
 
-    // Determine output dtype (integers → float32, floats preserve)
+    // tinygrad mean (mixin/__init__.py:431-434): accumulate the sum in
+    // `sum_acc_dtype` (float32 for fp16/bf16/fp8), divide there, and only then
+    // cast back to the input float dtype (float32 for integers). Accumulating a
+    // long fp16 sum in fp16 is order-sensitive and diverges under a reassociating
+    // BEAM opt — the same class of bug as the float32 sum-acc parity fix.
     let dtype = tensor.uop().dtype();
-    let output_dtype = if Tensor::is_integer_dtype(&dtype) { DType::Float32 } else { dtype };
+    let is_int = Tensor::is_integer_dtype(&dtype);
+    let acc_dtype = if is_int { DType::Float32 } else { Tensor::sum_acc_dtype(&dtype) };
+    let output_dtype = if is_int { DType::Float32 } else { dtype };
 
-    // Sum with explicit accumulation dtype (no promotion needed, dtype is explicit)
-    let sum = reduce_internal(tensor, ReduceOp::Add, axes, keepdim, Some(output_dtype.clone()), false)?;
+    // Sum in the accumulation dtype (explicit dtype ⇒ no cast-back inside the reduce).
+    let sum = reduce_internal(tensor, ReduceOp::Add, axes, keepdim, Some(acc_dtype.clone()), false)?;
 
-    // Divide by count
-    let count_tensor = Tensor::new(UOp::const_(output_dtype.clone(), svod_ir::ConstValue::Float(count as f64)));
-    Ok(&sum / &count_tensor)
+    // Divide by count in the accumulation dtype, then cast the result back.
+    let count_tensor = Tensor::new(UOp::const_(acc_dtype.clone(), svod_ir::ConstValue::Float(count as f64)));
+    let mean = &sum / &count_tensor;
+    if acc_dtype != output_dtype { mean.cast(output_dtype) } else { Ok(mean) }
 }
 
 /// Variance implementation using E[X²] - E[X]² formula.
@@ -778,8 +785,11 @@ fn var_mean_impl(tensor: &Tensor, axes: AxisSpec, keepdim: bool) -> Result<(Tens
     // Square the deviations: (X - E[X])²
     let squared_dev = deviation.square()?;
 
-    // Sum squared deviations with explicit dtype
-    let sum_sq_dev = reduce_internal(&squared_dev, ReduceOp::Add, axes, keepdim, Some(output_dtype.clone()), false)?;
+    // Sum squared deviations with `None` so the reduce accumulates fp16/bf16/fp8
+    // in float32 and casts the result back — tinygrad var uses `squares.sum(...)`
+    // (mixin/__init__.py:458-463). An explicit narrow dtype here would accumulate
+    // the long sum in fp16 and diverge under a reassociating BEAM opt.
+    let sum_sq_dev = reduce_internal(&squared_dev, ReduceOp::Add, axes, keepdim, None, false)?;
 
     // Divide by N-1 for unbiased estimate (Bessel's correction)
     let denom = if count > 1 { count - 1 } else { count };

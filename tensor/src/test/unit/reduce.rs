@@ -558,6 +558,36 @@ crate::codegen_tests! {
         assert_close_f32(&t.mean(0).unwrap().realize_with_and(&config).as_vec::<f32>().unwrap(), &[2.5, 3.5, 4.5], 1e-6);
     }
 
+    // float16 mean/var must accumulate in float32 (tinygrad sum_acc_dtype parity).
+    // 1024 * 100.0 = 102400 overflows float16 (max 65504) → inf in ANY
+    // accumulation order; only a float32 accumulator keeps it finite. A float16
+    // accumulator (the bug) yields inf, and a reassociating BEAM opt on such a
+    // sum diverges. Result is cast back to the input float16 dtype.
+    fn test_mean_float16_accumulates_in_float32(config) {
+        test_setup();
+        let t = Tensor::from_slice(vec![100.0f32; 1024]).cast(DType::Float16).unwrap();
+        let m = t.mean(()).unwrap();
+        assert_eq!(m.uop().dtype(), DType::Float16, "mean must cast back to input dtype");
+        let v = m.cast(DType::Float32).unwrap().realize_with_and(&config).as_vec::<f32>().unwrap();
+        assert!(v[0].is_finite(), "float16 mean overflowed to {} — accumulated in float16, not float32", v[0]);
+        assert_close_f32(&v, &[100.0], 1e-2);
+    }
+
+    // float16 var parity: var([1,2,3,4,5]) = 10/(5-1) = 2.5 (Bessel correction,
+    // tinygrad var default correction=1). Exercises the float32 squared-deviation
+    // accumulation path and the cast-back to the input float16 dtype. (Unlike
+    // mean, var keeps the un-normalized sum in float16 — matching tinygrad
+    // `squares.sum()` — so an overflow distinguisher is not order-independent;
+    // the robust fp16-accumulation guard is the mean test above.)
+    fn test_var_float16_value(config) {
+        test_setup();
+        let t = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0, 5.0]).cast(DType::Float16).unwrap();
+        let v = t.var(()).unwrap();
+        assert_eq!(v.uop().dtype(), DType::Float16, "var must cast back to input dtype");
+        let r = v.cast(DType::Float32).unwrap().realize_with_and(&config).as_vec::<f32>().unwrap();
+        assert_close_f32(&r, &[2.5], 1e-2);
+    }
+
     // ========== Any Tests (from Tinygrad test_ops.py:1423-1432) ==========
 
     fn test_any_value_all_true(config) {
