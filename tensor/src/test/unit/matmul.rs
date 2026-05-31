@@ -86,6 +86,22 @@ crate::codegen_tests! {
         assert_matmul_close(&c.as_vec::<f32>().unwrap(), &expected, 1e-5);
     }
 
+    fn test_matmul_int8_returns_narrow_dtype(config) {
+        // tinygrad dot (mixin/__init__.py:366) casts the int32 accumulator back to
+        // least_upper_dtype(x,w): int8·int8 → int8, not the int32 accumulator.
+        // [[1,2],[3,4]]·[[5,6],[7,8]] = [[19,22],[43,50]] (all fit in i8).
+        let a = Tensor::from_ndarray(&Array2::from_shape_vec((2, 2), vec![1.0f32, 2.0, 3.0, 4.0]).unwrap())
+            .cast(DType::Int8)
+            .unwrap();
+        let b = Tensor::from_ndarray(&Array2::from_shape_vec((2, 2), vec![5.0f32, 6.0, 7.0, 8.0]).unwrap())
+            .cast(DType::Int8)
+            .unwrap();
+        let mut c = a.matmul(&b).unwrap();
+        assert_eq!(c.uop().dtype(), DType::Int8, "int8 matmul must return int8, not the int32 accumulator");
+        c.realize_with(&config).unwrap();
+        assert_eq!(c.as_vec::<i8>().unwrap(), vec![19i8, 22, 43, 50]);
+    }
+
     fn test_matmul_validated_3x3(config) {
         // 3x3 matmul with sequential values
         let a_data: Vec<f32> = (1..=9).map(|x| x as f32).collect();
