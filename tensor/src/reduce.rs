@@ -640,6 +640,14 @@ fn reduce_internal(
     } else if promote {
         // Auto-promote using sum_acc_dtype
         Tensor::sum_acc_dtype(&original_dtype)
+    } else if op == ReduceOp::Add && Tensor::should_cast_back_after_sum(&original_dtype) {
+        // float16/bf16/fp8 SUM-reduces accumulate in float32 even without
+        // `promote` (tinygrad `sum_acc_dtype` parity). Their 8-/10-bit mantissa
+        // makes a long sum highly order-sensitive, so a reassociating opt (BEAM
+        // GROUP/UPCAST/UNROLL) on a float16 accumulator diverges catastrophically
+        // (observed: wrong CTC tokens). The result is cast back to the input
+        // dtype below, so callers see no dtype change.
+        Tensor::sum_acc_dtype(&original_dtype)
     } else {
         // Preserve input dtype
         original_dtype.clone()
@@ -657,11 +665,12 @@ fn reduce_internal(
             .collect();
 
         let identity = reduction_identity(op, &acc_dtype);
-        let result = Tensor::full(&out_shape, identity, acc_dtype)?;
+        let result = Tensor::full(&out_shape, identity, acc_dtype.clone())?;
 
         let result = if !keepdim { result.remove_singleton_dims(&resolved_axes)? } else { result };
 
-        return if promote && dtype.is_none() && Tensor::should_cast_back_after_sum(&original_dtype) {
+        return if dtype.is_none() && acc_dtype != original_dtype && Tensor::should_cast_back_after_sum(&original_dtype)
+        {
             result.cast(original_dtype)
         } else {
             Ok(result)
@@ -682,8 +691,9 @@ fn reduce_internal(
         temp.remove_singleton_dims(&resolved_axes)?
     };
 
-    // Cast back if promoted and should cast back (fp16/bf16)
-    if promote && dtype.is_none() && Tensor::should_cast_back_after_sum(&original_dtype) {
+    // Cast back to the input dtype whenever we accumulated in a wider type
+    // (fp16/bf16/fp8), whether via `promote` or the float32 sum-acc upcast above.
+    if dtype.is_none() && acc_dtype != original_dtype && Tensor::should_cast_back_after_sum(&original_dtype) {
         result.cast(original_dtype)
     } else {
         Ok(result)
