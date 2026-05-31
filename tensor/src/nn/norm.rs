@@ -110,7 +110,11 @@ impl Tensor {
             .try_add(&Tensor::new(UOp::const_(DType::Float32, ConstValue::Float(eps))))?
             .try_rsqrt()?;
 
-        self.try_mul(&norm)
+        // Compute in f32, then cast the result back to the input dtype — tinygrad
+        // `nn.RMSNorm`: `self._norm(x.float()).cast(x.dtype)`. Without the cast-back
+        // an fp16 input would silently return f32 (the f32 `norm` promotes the mul).
+        let normalized = self.try_mul(&norm)?;
+        if original_dtype != DType::Float32 { normalized.cast(original_dtype) } else { Ok(normalized) }
     }
 
     /// Lp normalization along an axis.
