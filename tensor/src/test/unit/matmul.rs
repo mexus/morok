@@ -87,9 +87,8 @@ crate::codegen_tests! {
     }
 
     fn test_matmul_int8_returns_narrow_dtype(config) {
-        // tinygrad dot (mixin/__init__.py:366) casts the int32 accumulator back to
-        // least_upper_dtype(x,w): int8·int8 → int8, not the int32 accumulator.
-        // [[1,2],[3,4]]·[[5,6],[7,8]] = [[19,22],[43,50]] (all fit in i8).
+        // int8·int8 must return int8 (the promoted operand dtype), not the widened
+        // int32 sum accumulator. [[1,2],[3,4]]·[[5,6],[7,8]] = [[19,22],[43,50]] (fit i8).
         let a = Tensor::from_ndarray(&Array2::from_shape_vec((2, 2), vec![1.0f32, 2.0, 3.0, 4.0]).unwrap())
             .cast(DType::Int8)
             .unwrap();

@@ -811,14 +811,11 @@ fn fix_group_for_reduce(reduce: &Arc<UOp>) -> Option<Arc<UOp>> {
         .filter(|u| matches!(u.op(), Op::Range { axis_type: AxisType::Local, .. }))
         .collect();
 
-    // Step 1: Create partial reduce with non-GROUP_REDUCE ranges.
-    // Tinygrad: ret = x.replace(src=(x.src[0],)+tuple(reduce_r)) — ALWAYS a REDUCE,
-    // even when reduce_r is empty. A range-less REDUCE is NOT a no-op when its
-    // source is a CONTRACT: it is the horizontal collapse of the per-thread
-    // reduce-unroll lanes (devectorize::reduce_to_acc, empty-range branch).
-    // Short-circuiting to `src.clone()` skips that collapse, so an un-summed
-    // CONTRACT<reduce-unroll> is bufferized straight into LDS and the output
-    // store extracts upcast>unroll lanes from it → out-of-bounds extractelement.
+    // Step 1: partial reduce over the non-GROUP_REDUCE ranges. Always a REDUCE,
+    // even when `reduce_r` is empty: a range-less REDUCE over a CONTRACT source is
+    // the horizontal collapse of the per-thread reduce-unroll lanes (reduce_to_acc).
+    // Using `src.clone()` instead would bufferize the un-collapsed CONTRACT into
+    // LDS, sizing the accumulator to the reduce-unroll width, not the output width.
     let partial_reduce = UOp::new(
         Op::Reduce { src: src.clone(), ranges: reduce_r.into_iter().cloned().collect(), reduce_op: *reduce_op },
         reduce.dtype(),

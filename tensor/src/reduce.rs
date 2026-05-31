@@ -665,12 +665,9 @@ fn reduce_internal(
         // Auto-promote using sum_acc_dtype
         Tensor::sum_acc_dtype(&original_dtype)
     } else if op == ReduceOp::Add && Tensor::should_cast_back_after_sum(&original_dtype) {
-        // float16/bf16/fp8 SUM-reduces accumulate in float32 even without
-        // `promote` (tinygrad `sum_acc_dtype` parity). Their 8-/10-bit mantissa
-        // makes a long sum highly order-sensitive, so a reassociating opt (BEAM
-        // GROUP/UPCAST/UNROLL) on a float16 accumulator diverges catastrophically
-        // (observed: wrong CTC tokens). The result is cast back to the input
-        // dtype below, so callers see no dtype change.
+        // float16/bf16/fp8 sums accumulate in float32 even without `promote`: an
+        // 8-/10-bit mantissa makes a long sum order-sensitive, so a reassociating
+        // opt diverges. The result is cast back to the input dtype below.
         Tensor::sum_acc_dtype(&original_dtype)
     } else {
         // Preserve input dtype
@@ -740,20 +737,17 @@ fn mean_impl(tensor: &Tensor, axes: impl Into<AxisSpec>, keepdim: bool) -> Resul
         }
     }
 
-    // tinygrad mean (mixin/__init__.py:431-434): accumulate the sum in
-    // `sum_acc_dtype` (float32 for fp16/bf16/fp8), divide there, and only then
-    // cast back to the input float dtype (float32 for integers). Accumulating a
-    // long fp16 sum in fp16 is order-sensitive and diverges under a reassociating
-    // BEAM opt — the same class of bug as the float32 sum-acc parity fix.
+    // Accumulate and divide in `sum_acc_dtype` (float32 for fp16/bf16/fp8; float32
+    // for integers), then cast back to the input dtype. A long fp16 sum accumulated
+    // in fp16 is order-sensitive and diverges under a reassociating opt.
     let dtype = tensor.uop().dtype();
     let is_int = Tensor::is_integer_dtype(&dtype);
     let acc_dtype = if is_int { DType::Float32 } else { Tensor::sum_acc_dtype(&dtype) };
     let output_dtype = if is_int { DType::Float32 } else { dtype };
 
-    // Sum in the accumulation dtype (explicit dtype ⇒ no cast-back inside the reduce).
+    // Explicit dtype ⇒ the reduce does not cast back, so the sum stays in acc_dtype.
     let sum = reduce_internal(tensor, ReduceOp::Add, axes, keepdim, Some(acc_dtype.clone()), false)?;
 
-    // Divide by count in the accumulation dtype, then cast the result back.
     let count_tensor = Tensor::new(UOp::const_(acc_dtype.clone(), svod_ir::ConstValue::Float(count as f64)));
     let mean = &sum / &count_tensor;
     if acc_dtype != output_dtype { mean.cast(output_dtype) } else { Ok(mean) }
@@ -809,21 +803,18 @@ fn var_mean_impl(tensor: &Tensor, axes: AxisSpec, keepdim: bool, correction: i64
     // Square the deviations: (X - E[X])²
     let squared_dev = deviation.square()?;
 
-    // Sum squared deviations with `None` so the reduce accumulates fp16/bf16/fp8
-    // in float32 and casts the result back — tinygrad var uses `squares.sum(...)`
-    // (mixin/__init__.py:458-463). An explicit narrow dtype here would accumulate
-    // the long sum in fp16 and diverge under a reassociating BEAM opt.
+    // `None` lets the reduce accumulate fp16/bf16/fp8 in float32 and cast the result
+    // back; an explicit narrow dtype would accumulate the long sum in fp16 and
+    // diverge under a reassociating opt.
     let sum_sq_dev = reduce_internal(&squared_dev, ReduceOp::Add, axes, keepdim, None, false)?;
 
-    // Divide by max(0, N - correction) — tinygrad `reduced.div((n - correction).relu())`
-    // (mixin/__init__.py:461-463). correction=1 is the unbiased sample variance;
-    // correction=0 the population variance.
+    // Divide by max(0, N - correction): correction=1 is the unbiased sample
+    // variance, correction=0 the population variance.
     let denom = (count - correction).max(0);
     let variance = if denom == 0 {
-        // n <= correction (e.g. a single element with correction=1): tinygrad divides
-        // by zero, giving IEEE NaN (reduced==0) or +inf (reduced>0). svod's `/` rejects
-        // a constant-zero divisor, so express the same IEEE result as `reduced * inf`
-        // (0*inf = NaN, k*inf = +inf), rather than silently forcing a denominator of 1.
+        // n <= correction (e.g. a single element with correction=1) ⇒ divisor 0.
+        // svod's `/` rejects a constant-zero divisor, so express the IEEE result as
+        // `reduced * inf` (0*inf = NaN, k*inf = +inf).
         let inf = Tensor::new(UOp::const_(output_dtype, svod_ir::ConstValue::Float(f64::INFINITY)));
         &sum_sq_dev * &inf
     } else {

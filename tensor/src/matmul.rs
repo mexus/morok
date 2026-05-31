@@ -106,9 +106,9 @@ impl Tensor {
         // Step 4: Transpose, multiply, and sum
         let product = x_reshaped.try_mul(&w_reshaped.try_transpose(-1, axis_w)?)?;
 
-        // tinygrad dot (mixin/__init__.py:366) casts the contraction result to
-        // `least_upper_dtype(x, w)` — which `product` already carries — so an int8·int8
-        // dot returns int8, not the int32 accumulator that `sum` widens to.
+        // Cast the contraction result back to `product`'s dtype (the promoted
+        // operand dtype), so an int8·int8 dot returns int8 rather than the widened
+        // int32 sum accumulator. No-op for float dtypes.
         if let Some(dt) = dtype {
             product.sum_with().axes(-1).dtype(dt).call()
         } else {
