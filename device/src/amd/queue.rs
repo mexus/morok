@@ -29,8 +29,8 @@ use crate::amd::connector::AmdConnector;
 use crate::amd::device::AmdDeviceCore;
 use crate::amd::sys::hsa::{
     HSA_FENCE_SCOPE_SYSTEM, HSA_PACKET_HEADER_BARRIER, HSA_PACKET_HEADER_SCACQUIRE_FENCE_SCOPE,
-    HSA_PACKET_HEADER_SCRELEASE_FENCE_SCOPE, HSA_PACKET_TYPE_VENDOR_SPECIFIC,
-    HsaKernelDispatchPacket, HsaSignal, kernel_dispatch_header,
+    HSA_PACKET_HEADER_SCRELEASE_FENCE_SCOPE, HSA_PACKET_TYPE_VENDOR_SPECIFIC, HsaKernelDispatchPacket, HsaSignal,
+    kernel_dispatch_header,
 };
 use crate::amd::sys::kfd;
 use crate::amd::sys::pm4;

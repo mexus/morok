@@ -137,7 +137,6 @@ pub fn amd_test_arch() -> Option<svod_dtype::AmdArch> {
     None
 }
 
-
 impl PrepareConfig {
     /// Resolve a `DeviceSpec` into a `Device` using this config's resolver.
     pub(crate) fn resolve_device(&self, spec: &DeviceSpec, registry: &DeviceRegistry) -> crate::Result<Arc<Device>> {
