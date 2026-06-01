@@ -409,14 +409,16 @@ fn generate_intrinsic_declarations(kernel: &[String], target: &LlvmTarget) -> St
                 decls.push(decl.to_string());
             }
         }
-        // WMMA / MFMA intrinsics: variadic by family and dtype. We don't know
-        // the exact signature without re-parsing the call site, so emit a
-        // generic `declare ... @<name>(...)` form. The LLVM assembler tolerates
-        // multiple `declare`s as long as the signature at the call matches.
-        // Strategy: find unique `@llvm.amdgcn.{wmma,mfma}.<...>(` occurrences,
-        // copy the parameter types from one call site for each.
+        // WMMA / MFMA intrinsics: the signature varies by family and dtype, so
+        // we synthesize each `declare` from its call site's operand types. The
+        // operands already carry the intrinsic-required wire types (bf16 as
+        // i16, fp8 as a packed integer — bitcast in `render_wmma_amd`), so the
+        // declaration matches the call by construction. Dedup identical lines
+        // (a tiled matmul emits many calls to the same intrinsic).
         for line in kernel.iter() {
-            if let Some(decl) = wmma_declaration_from_call(line) {
+            if let Some(decl) = wmma_declaration_from_call(line)
+                && !decls.contains(&decl)
+            {
                 decls.push(decl);
             }
         }
@@ -480,9 +482,32 @@ fn wmma_declaration_from_call(line: &str) -> Option<String> {
     }
     for part in parts {
         let trimmed = part.trim();
-        if let Some(idx) = trimmed.find(' ') {
-            param_types.push(trimmed[..idx].to_string());
-        }
+        // The leading *type* token. A `<…>` vector/aggregate type runs to its
+        // matching `>` (the value or name follows it); a scalar type is the
+        // token before the first space (`i32 0`, `i1 false`). Splitting on the
+        // first space would truncate `<16 x half>` to `<16` — the bug this
+        // replaces — since the type itself contains spaces.
+        let ty = if trimmed.starts_with('<') {
+            let mut depth = 0usize;
+            let mut end = trimmed.len();
+            for (i, ch) in trimmed.char_indices() {
+                match ch {
+                    '<' => depth += 1,
+                    '>' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = i + 1;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            &trimmed[..end]
+        } else {
+            trimmed.split_whitespace().next().unwrap_or(trimmed)
+        };
+        param_types.push(ty.to_string());
     }
     Some(format!("declare {ret_ty} @{intrinsic_name}({})", param_types.join(", ")))
 }

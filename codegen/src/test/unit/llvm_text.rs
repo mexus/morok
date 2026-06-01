@@ -226,11 +226,10 @@ fn amd_wmma_emits_intrinsic_without_amx_scratch() {
         result.code
     );
     assert!(!result.code.contains("_amx"), "AMD WMMA must not emit AMX scratch allocas:\n{}", result.code);
-    // NB: no llvm-as smoke here. These const operands splat into inline vector
-    // literals (`<16 x half> <half 0, ...>`), and the lightweight intrinsic-
-    // declaration synthesizer comma-splits inside them. Real WMMA operands are
-    // SSA values (loads/contracts) with no internal commas, so the path that
-    // breaks here is never produced in practice.
+    // This test only guards the AMX-scratch gate, not IR validity: const
+    // operands splat into inline VConst literals that exercise a different
+    // naming path. The `assert_llvm_ir_assembles` coverage for the WMMA call
+    // and declaration lives in the SSA-operand tests below.
 }
 
 #[test]
@@ -258,6 +257,128 @@ fn cpu_amx_f32_metadata() -> WmmaMetadata {
         reduce_axes: vec![],
         tile_grid: (1, 1),
     }
+}
+
+// ── SSA-operand WMMA assemble tests ──────────────────────────────────────────
+//
+// Real WMMA operands are SSA vector values, not the const splats above. These
+// build operands from buffer loads (broadcast of a non-const load lowers to a
+// VECTORIZE → `%vN`), then assert the emitted IR assembles under `llvm-as` —
+// the regression guard for declaration synthesis + the bf16→i16 / fp8→i64
+// operand bitcasts.
+
+fn wmma_buf_load(slot: usize, dt: DType) -> std::sync::Arc<svod_ir::UOp> {
+    let p = UOp::param(slot, 1, dt.ptr(Some(1), AddrSpace::Global), None);
+    let idx = UOp::index_const(0);
+    // `ptr(true)` keeps the INDEX result a `ptr` (as the devectorizer does for
+    // LOAD sources), so the load renders `load <ty>, ptr %p` — not the
+    // `load <ty>, <ty> %p` that the bare element-typed default would emit.
+    let p_idx = UOp::index().buffer(p.clone()).indices(vec![idx]).ptr(true).call().unwrap();
+    UOp::load().buffer(p).index(p_idx).call()
+}
+
+fn wmma_meta(dims: (usize, usize, usize), in_dt: DType, out_dt: DType, c_count: usize) -> WmmaMetadata {
+    WmmaMetadata {
+        name: "WMMA_test".to_string(),
+        dims,
+        dtype_in: in_dt,
+        dtype_out: out_dt,
+        device: RendererDevice::AppleAmx, // unused by the AMD path (keyed on `arch`)
+        threads: 32,
+        upcast_axes: WmmaUpcastAxes { a: vec![(2, 16)], b: vec![(2, 16)], c: vec![(2, c_count)] },
+        reduce_axes: vec![],
+        tile_grid: (1, 1),
+    }
+}
+
+/// WMMA over SSA operands: A/B are `<in_count x in_dt>`, C is `<out_count x out_dt>`.
+fn wmma_ssa_sink(
+    in_dt: DType,
+    in_count: usize,
+    out_dt: DType,
+    out_count: usize,
+    meta: WmmaMetadata,
+) -> std::sync::Arc<svod_ir::UOp> {
+    let a = wmma_buf_load(0, in_dt.clone()).broadcast(in_count);
+    let b = wmma_buf_load(1, in_dt).broadcast(in_count);
+    let c = wmma_buf_load(2, out_dt).broadcast(out_count);
+    UOp::sink(vec![UOp::wmma(a, b, c, meta)])
+}
+
+#[test]
+fn amd_wmma_f16_f32_ssa_assembles() {
+    let meta = wmma_meta((16, 16, 16), DType::Float16, DType::Float32, 8);
+    let sink = wmma_ssa_sink(DType::Float16, 16, DType::Float32, 8, meta);
+    let result = render_amd_linearized(&sink, AmdArch::Gfx1151, "amd_wmma_f16");
+    println!("{}", result.code);
+    assert!(result.code.contains("<16 x half> %"), "operands must be SSA vectors:\n{}", result.code);
+    assert!(
+        result
+            .code
+            .contains("declare <8 x float> @llvm.amdgcn.wmma.f32.16x16x16.f16(<16 x half>, <16 x half>, <8 x float>)"),
+        "garbled WMMA declaration (the `<16` truncation bug):\n{}",
+        result.code
+    );
+    assert_llvm_ir_assembles(&result.code);
+}
+
+#[test]
+fn amd_wmma_bf16_f32_ssa_assembles() {
+    // gfx1151 (the live target) declares a bf16→f32 tensor core. bf16 operands
+    // must reach the intrinsic as `<16 x i16>`, not `<16 x bfloat>`.
+    let meta = wmma_meta((16, 16, 16), DType::BFloat16, DType::Float32, 8);
+    let sink = wmma_ssa_sink(DType::BFloat16, 16, DType::Float32, 8, meta);
+    let result = render_amd_linearized(&sink, AmdArch::Gfx1151, "amd_wmma_bf16");
+    println!("{}", result.code);
+    assert!(result.code.contains("bitcast <16 x bfloat>"), "missing bf16→i16 operand bitcast:\n{}", result.code);
+    assert!(
+        result.code.contains("@llvm.amdgcn.wmma.f32.16x16x16.bf16(<16 x i16>, <16 x i16>, <8 x float>)"),
+        "bf16 WMMA must use i16 wire types:\n{}",
+        result.code
+    );
+    assert_llvm_ir_assembles(&result.code);
+}
+
+#[test]
+fn amd_wmma_bf16_bf16_bitcasts_result() {
+    // bf16 accumulator: all three operands go as i16 and the i16 result is
+    // bitcast back to bf16 (tinygrad llvmir.py:292-294).
+    let meta = wmma_meta((16, 16, 16), DType::BFloat16, DType::BFloat16, 16);
+    let sink = wmma_ssa_sink(DType::BFloat16, 16, DType::BFloat16, 16, meta);
+    let result = render_amd_linearized(&sink, AmdArch::Gfx1100, "amd_wmma_bf16bf16");
+    println!("{}", result.code);
+    assert!(
+        result.code.contains("@llvm.amdgcn.wmma.bf16.16x16x16.bf16(<16 x i16>, <16 x i16>, <16 x i16>, i1)"),
+        "bf16→bf16 declaration wrong:\n{}",
+        result.code
+    );
+    assert!(
+        result.code.contains("bitcast <16 x i16>") && result.code.contains("to <16 x bfloat>"),
+        "missing i16→bf16 result bitcast:\n{}",
+        result.code
+    );
+    assert_llvm_ir_assembles(&result.code);
+}
+
+#[test]
+fn amd_wmma_fp8_packs_operands_to_i64() {
+    // CDNA fp8: the 8 fp8 lanes pack into one i64 (tinygrad bitcasts fp8.vec(8)
+    // → uint64). MFMA carries the trailing cbsz/abid/blgp immediates.
+    let meta = wmma_meta((16, 16, 32), DType::FP8E4M3, DType::Float32, 4);
+    let sink = wmma_ssa_sink(DType::FP8E4M3, 8, DType::Float32, 4, meta);
+    let result = render_amd_linearized(&sink, AmdArch::Gfx942, "amd_wmma_fp8");
+    println!("{}", result.code);
+    assert!(
+        result.code.contains("bitcast <8 x i8>") && result.code.contains(" to i64"),
+        "fp8 operands must pack into i64:\n{}",
+        result.code
+    );
+    assert!(
+        result.code.contains("(i64, i64, <4 x float>, i32, i32, i32)"),
+        "fp8 MFMA declaration wrong:\n{}",
+        result.code
+    );
+    assert_llvm_ir_assembles(&result.code);
 }
 
 /// Pipe `ir` through an `llvm-as` on PATH and assert it parses. Skips (returns)
