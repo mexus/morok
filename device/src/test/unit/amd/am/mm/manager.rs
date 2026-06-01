@@ -138,3 +138,16 @@ fn uncached_sets_mtype_on_leaf() {
     let pte = m.entry(paddr, m.geom.pte_idx(lv, rebased));
     assert_eq!((pte >> 48) & 0x7, 3, "uncached leaf must set MTYPE_UC");
 }
+
+#[test]
+#[should_panic(expected = "page-table walk made no progress")]
+fn unmap_subrange_of_huge_leaf_panics() {
+    let mut m = mm();
+    // A single 2 MiB huge leaf at PDB0 (2 MiB-aligned VA + paddr + size).
+    let va = VA_BASE + (4u64 << 20);
+    let pa = 2u64 << 20;
+    m.map_range(va, 2 << 20, &[(pa, 2 << 20)], AddrSpace::Phys, false, false);
+    // Unmapping only the first 4 KiB of a 2 MiB leaf can't be expressed (the
+    // leaf can't be split) — the walker must fail loudly, not spin forever.
+    m.unmap_range(va, 0x1000);
+}

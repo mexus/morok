@@ -291,6 +291,20 @@ impl<P: PhysMem> MemoryManager<P> {
         let floor = if w.mode == WalkMode::Inspect { 1 } else { 0 };
         let avail = self.pte_cnt(top.lv) - top.pte_idx as u64;
         let entries = (w.size / top.pte_covers).min(avail).max(floor);
+        // Parity with tinygrad (support/memory.py:165). In Free mode the descend
+        // stops at the first leaf, so a sub-leaf / misaligned unmap (size < a huge
+        // leaf's pte_covers) yields entries == 0 — which advances nothing and spins
+        // the walk forever. Fail loudly: unmap_range must cover whole leaves (it is
+        // only ever called with a full mapping's size).
+        debug_assert!(
+            entries > 0,
+            "page-table walk made no progress: size={:#x} pte_covers={:#x} lv={} mode={:?} \
+             (unmap_range must cover whole huge-page leaves)",
+            w.size,
+            top.pte_covers,
+            top.lv,
+            w.mode
+        );
         w.pending = Some((entries, top.pte_covers));
         Some(Step {
             off: w.off,
@@ -356,6 +370,11 @@ impl<P: PhysMem> MemoryManager<P> {
     }
 
     /// Invalidate every PTE in `[vaddr, vaddr+size)` and reclaim emptied tables.
+    ///
+    /// `[vaddr, vaddr+size)` must cover whole leaves: a partial unmap of a huge
+    /// (2 MiB / 1 GiB) leaf debug-asserts, since the walker cannot split a huge
+    /// page (neither does tinygrad). In practice this holds — `vfree` always
+    /// passes a full mapping's `size`.
     pub fn unmap_range(&mut self, vaddr: u64, size: u64) {
         let mut w = self.new_walk(vaddr, WalkMode::Free);
         w.size = size;
