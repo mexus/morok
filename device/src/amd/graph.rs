@@ -230,7 +230,7 @@ impl AmdGraph {
         // ── Build the one command stream (preamble + exec loop + final
         // signal). The queue is a pure command buffer — the connector is
         // passed to `exec`/`submit`.
-        let mut comp_queue = AmdHwQueue::new();
+        let mut comp_queue = AmdHwQueue::new(dev.core().arch.gfx_major());
 
         // Preamble.
         comp_queue.preamble(kick_sig.value_addr(), self_sig.value_addr());

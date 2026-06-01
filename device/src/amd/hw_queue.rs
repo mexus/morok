@@ -190,6 +190,10 @@ pub struct AmdHwQueue {
     mv_sints: Vec<MvSint>,
     /// `None` until `bind`; then the host page + indirect-buffer reference.
     binded: Option<Binded>,
+    /// gfx major version of the capturing device (the graph is single-device,
+    /// so it's fixed). The `signal`/`memory_barrier` cache encodings branch on
+    /// `target_major == 9`, same as `exec`'s per-kernel `target_major`.
+    target_major: u32,
 }
 
 // SAFETY: the host pointers in `mv_sints`/`binded` are stable host-visible
@@ -204,7 +208,7 @@ impl AmdHwQueue {
     /// NOT held here — it's supplied by the owning `AmdGraph` (which holds the
     /// `ConnectorLease`) to `exec`/`submit`, so the lease stays the sole owner
     /// of the connector and can't be aliased.
-    pub fn new() -> Self {
+    pub fn new(target_major: u32) -> Self {
         Self {
             q: Vec::new(),
             syms: Vec::new(),
@@ -212,6 +216,7 @@ impl AmdHwQueue {
             q_sints: Vec::new(),
             mv_sints: Vec::new(),
             binded: None,
+            target_major,
         }
     }
 
@@ -275,12 +280,18 @@ impl AmdHwQueue {
     /// timeline). Layout matches `pm4::release_mem`:
     /// `[hdr, event, memsel, addr_lo, addr_hi, value, value_hi, ctxid]`.
     fn signal(&mut self, addr: SymU64, value: SymU32) {
+        // gfx9 (CDNA) and gfx10+ (RDNA) encode the cache flush differently, and
+        // DST_SEL only exists on gfx10+ — same split as `pm4::release_mem`.
+        let gfx9 = self.target_major == 9;
+        let cache = if gfx9 { pm4::EOP_CACHE_FLUSH_GFX9 } else { pm4::RELEASE_MEM_CACHE_FLUSH_ALL };
         let event_dw = pm4::release_mem_event_type(pm4::CACHE_FLUSH_AND_INV_TS_EVENT)
             | pm4::release_mem_event_index(pm4::EVENT_INDEX_END_OF_PIPE)
-            | pm4::RELEASE_MEM_CACHE_FLUSH_ALL;
-        let memsel_dw = pm4::release_mem_data_sel(pm4::DATA_SEL_SEND_32_BIT_LOW)
-            | pm4::release_mem_int_sel(pm4::INT_SEL_INTERRUPT_AFTER_WRITE)
-            | pm4::release_mem_dst_sel(pm4::DST_SEL_MEMORY);
+            | cache;
+        let mut memsel_dw = pm4::release_mem_data_sel(pm4::DATA_SEL_SEND_32_BIT_LOW)
+            | pm4::release_mem_int_sel(pm4::INT_SEL_INTERRUPT_AFTER_WRITE);
+        if !gfx9 {
+            memsel_dw |= pm4::release_mem_dst_sel(pm4::DST_SEL_MEMORY);
+        }
         let mut pkt =
             vec![QVal::Dword(pm4::packet3(pm4::PACKET3_RELEASE_MEM, 6)), QVal::Dword(event_dw), QVal::Dword(memsel_dw)];
         pkt.extend(self.addr64(&addr));
@@ -294,7 +305,11 @@ impl AmdHwQueue {
     /// a full `acquire_mem`. Concrete (no symbols).
     fn memory_barrier(&mut self) {
         self.q.extend_from_slice(&pm4::hdp_flush());
-        self.q.extend_from_slice(&pm4::acquire_mem());
+        if self.target_major == 9 {
+            self.q.extend_from_slice(&pm4::acquire_mem_gfx9());
+        } else {
+            self.q.extend_from_slice(&pm4::acquire_mem());
+        }
     }
 
     /// `exec` — the critical command. Records the kernarg
@@ -464,12 +479,6 @@ impl AmdHwQueue {
         let cmd = self.binded.as_ref().expect("AmdHwQueue::submit before bind").indirect_cmd;
         // Submit: one doorbell via the queue primitive.
         conn.queue().submit_dwords(&cmd)
-    }
-}
-
-impl Default for AmdHwQueue {
-    fn default() -> Self {
-        Self::new()
     }
 }
 

@@ -111,7 +111,7 @@ impl AmdConnector {
                 .into(),
         })?;
         let timeline = Timeline::new(Arc::new(pool.acquire()?));
-        let (scratch_va, scratch_size, tmpring_size, size_per_thread, scratch_handle) =
+        let (scratch_va, scratch_size, tmpring_size, size_per_thread, scratch_handle, aql_desc) =
             alloc_scratch(core.iface(), &core.node, &core.arch, 128)?;
         // Register the TIMELINE (not the connector) in the core so
         // `synchronize_all` can drain this connector's in-flight work via the
@@ -135,6 +135,9 @@ impl AmdConnector {
             }),
             timeline,
         });
+        // Publish the initial scratch descriptor into the AQL queue's GART page
+        // (no-op on PM4 queues). Must happen before the first dispatch.
+        conn.queue().set_aql_scratch(&aql_desc);
         Ok(conn)
     }
 
@@ -237,23 +240,34 @@ impl AmdConnector {
         if private_segment_size <= self.scratch_state.lock().size_per_thread {
             return Ok(());
         }
-        let (va, size, tmpring, rounded, handle) =
+        let (va, size, tmpring, rounded, handle, aql_desc) =
             alloc_scratch(self.core.iface(), &self.core.node, &self.core.arch, private_segment_size)?;
         // `free_scratch` (below) drains the connector's timeline before the
         // unmap — in single-queue mode that is the *shared* timeline, so it
         // fences every in-flight dispatcher, not just this thread. The old
         // buffer is therefore unreferenced by the time it is freed.
-        let stale = {
+        let swapped = {
             let mut state = self.scratch_state.lock();
             if rounded > state.size_per_thread {
                 let old = (state.gpu_va, state.size, state.handle);
                 *state = ScratchState { gpu_va: va, size_per_thread: rounded, tmpring_size: tmpring, handle, size };
-                old
+                Some(old)
             } else {
-                (va, size, handle)
+                None
             }
         };
-        self.free_scratch(stale.0, stale.1, stale.2);
+        match swapped {
+            // Drain in-flight dispatches off the old scratch, then republish the
+            // AQL descriptor for the new buffer (idle queue → no torn read) and
+            // free the old backing. No-op republish on PM4 queues.
+            Some(old) => {
+                self.free_scratch(old.0, old.1, old.2);
+                self.queue.set_aql_scratch(&aql_desc);
+            }
+            // Lost the race — another dispatcher already grew scratch past our
+            // target. Free the buffer we redundantly allocated.
+            None => self.free_scratch(va, size, handle),
+        }
         Ok(())
     }
 

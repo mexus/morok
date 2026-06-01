@@ -45,3 +45,33 @@ fn compute_queue_create_if_hw_supports() {
     };
     let _q = AmdComputeQueue::create(&alloc).expect("create compute queue");
 }
+
+/// On real AQL hardware (multi-XCC CDNA), `set_aql_scratch` must land the
+/// scratch descriptor at the right `amd_queue_t` offsets in the GART page the
+/// firmware reads. Exercises the offsets + volatile writes end-to-end against a
+/// live queue; on PM4 hardware the queue has no descriptor and the write is a
+/// no-op (we skip the assertion there).
+#[test]
+fn set_aql_scratch_round_trips_through_gart() {
+    let alloc = match AmdAllocator::new(0) {
+        Ok(a) => a,
+        Err(_) => return,
+    };
+    let q = AmdComputeQueue::create(&alloc).expect("create compute queue");
+    if q.is_pm4() {
+        return; // PM4 queues program scratch via registers; no GART descriptor.
+    }
+    // A realistic descriptor, sized exactly as a 256-byte/thread scratch alloc
+    // would be on this device.
+    let (va, _size, tmpring, _rounded, _handle, desc) =
+        crate::amd::device::alloc_scratch(alloc.dev.core().iface(), &alloc.dev.node, &alloc.dev.arch, 256)
+            .expect("alloc scratch");
+    assert_ne!(desc, crate::amd::device::AqlScratchDesc::default(), "CDNA must synthesize a descriptor");
+    q.set_aql_scratch(&desc);
+    assert_eq!(q.read_aql_scratch(), desc, "GART descriptor must match what we wrote");
+    // Sanity: the descriptor points at the freshly allocated scratch buffer.
+    assert_eq!(desc.backing_va, va);
+    assert_eq!(desc.tmpring_size, tmpring);
+    // Free the scratch we allocated for the test.
+    alloc.dev.core().iface().free_raw(va, _size, _handle);
+}

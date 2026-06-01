@@ -9,15 +9,52 @@ fn packet3_header_layout() {
 
 #[test]
 fn release_mem_packet_shape() {
-    let pkt = release_mem(0x1234_5678_0000_4000, 42, true);
-    assert_eq!(pkt.len(), 8);
-    assert_eq!(pkt[3], 0x0000_4000); // addr lo
-    assert_eq!(pkt[4], 0x1234_5678); // addr hi
-    assert_eq!(pkt[5], 42); // value
-    // memsel_dw must have DATA_SEL=1 in bits 29-31 (value 1 << 29)
-    assert_eq!(pkt[2] & (0b111 << 29), 1 << 29);
-    // INT_SEL=2 in bits 24-26
-    assert_eq!((pkt[2] >> 24) & 0b111, 2);
+    for is_gfx9 in [false, true] {
+        let pkt = release_mem(0x1234_5678_0000_4000, 42, true, is_gfx9);
+        assert_eq!(pkt.len(), 8);
+        assert_eq!(pkt[3], 0x0000_4000); // addr lo
+        assert_eq!(pkt[4], 0x1234_5678); // addr hi
+        assert_eq!(pkt[5], 42); // value
+        // memsel_dw must have DATA_SEL=1 in bits 29-31 (value 1 << 29)
+        assert_eq!(pkt[2] & (0b111 << 29), 1 << 29);
+        // INT_SEL=2 in bits 24-26
+        assert_eq!((pkt[2] >> 24) & 0b111, 2);
+    }
+}
+
+#[test]
+fn release_mem_cache_flush_is_arch_specific() {
+    // gfx9 uses the TC action bits; gfx10+ uses the GCR bitfield. The event
+    // type/index (low bits of DW1) are shared.
+    let event = release_mem_event_type(CACHE_FLUSH_AND_INV_TS_EVENT) | release_mem_event_index(EVENT_INDEX_END_OF_PIPE);
+    let gfx9 = release_mem(0x4000, 1, true, true);
+    let gfx10 = release_mem(0x4000, 1, true, false);
+    assert_eq!(gfx9[1], event | EOP_CACHE_FLUSH_GFX9);
+    assert_eq!(gfx10[1], event | RELEASE_MEM_CACHE_FLUSH_ALL);
+    // gfx9 omits DST_SEL (memory implicit); gfx10+ sets it (DST_SEL_MEMORY=0,
+    // so both happen to be equal here, but the data/int sel must match).
+    assert_eq!(
+        gfx9[2],
+        release_mem_data_sel(DATA_SEL_SEND_32_BIT_LOW) | release_mem_int_sel(INT_SEL_INTERRUPT_AFTER_WRITE)
+    );
+}
+
+#[test]
+fn acquire_mem_gfx9_shape() {
+    let pkt = acquire_mem_gfx9();
+    assert_eq!(pkt.len(), 7);
+    assert_eq!(pkt[0], packet3(PACKET3_ACQUIRE_MEM, 5));
+    assert_eq!(pkt[2], 0xFFFF_FFFF); // coher size lo (full VA)
+    assert_eq!(pkt[3], 0xFFFF_FFFF); // coher size hi
+    assert_eq!(pkt[6], 0x0000_000A); // poll interval
+}
+
+#[test]
+fn pred_exec_shape() {
+    let pkt = pred_exec(0b1, 8);
+    assert_eq!(pkt[0], packet3(PACKET3_PRED_EXEC, 0));
+    assert_eq!(pkt[1] >> 24, 0b1); // xcc_mask
+    assert_eq!(pkt[1] & 0x3FFF, 8); // exec dword count
 }
 
 #[test]

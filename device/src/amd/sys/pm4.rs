@@ -1,10 +1,10 @@
 //! PM4 packet builders for AMD GPU command processor.
 //!
-//! Source: submodules/new_new_tinygrad/tinygrad/runtime/autogen/am/pm4_nv.py
-//! (Navi family / gfx10+). The PM4 opcodes/bitfields are HARDWARE constants —
-//! stable across
-//! kernel versions and across gfx10/gfx11/gfx12 (CDNA gfx9 uses different
-//! values, not covered here).
+//! The PM4 opcodes/bitfields are AMD hardware constants — the SOC15 PM4
+//! definitions for gfx9 (CDNA) and the Navi definitions for gfx10+ (RDNA) —
+//! stable across kernel versions. Most are shared across gfx9/10/11/12, but the
+//! RELEASE_MEM / ACQUIRE_MEM cache-flush encodings differ on gfx9 (the `*_gfx9`
+//! builders and `EOP_*` / `COHER_*` constants below cover that split).
 //!
 //! `<< 0` for offset-zero bitfields is kept intentionally so every member of a
 //! bitfield family reads uniformly (`x << OFFSET`) — clippy's `identity_op`
@@ -36,6 +36,9 @@ pub const PACKET3_WAIT_REG_MEM: u32 = 0x3C;
 pub const PACKET3_INDIRECT_BUFFER: u32 = 0x3F;
 pub const PACKET3_RELEASE_MEM: u32 = 0x49;
 pub const PACKET3_ACQUIRE_MEM: u32 = 0x58;
+/// `PRED_EXEC` — conditionally execute the following dwords on a subset of
+/// XCCs (gfx9 multi-XCC only). Used to fan a single signal write to one XCC.
+pub const PACKET3_PRED_EXEC: u32 = 0x23;
 
 /// `(1 << 23)` bit for the PACKET3_INDIRECT_BUFFER count dword, marking the
 /// IB as valid for the CP to execute.
@@ -72,6 +75,17 @@ pub const RELEASE_MEM_CACHE_FLUSH_ALL: u32 = RELEASE_MEM_GCR_GLV_INV
     | RELEASE_MEM_GCR_GLM_INV
     | RELEASE_MEM_GCR_GL2_WB
     | RELEASE_MEM_GCR_SEQ;
+
+// ── RELEASE_MEM cache-flush bits, gfx9 / SOC15 (DW1) ──────────────────────
+// gfx9 (CDNA) encodes the end-of-pipe cache flush via TC action bits, NOT the
+// gfx10+ GCR bitfield above. Using the GCR bits on gfx9 leaves the
+// CACHE_FLUSH_AND_INV_TS event waiting on a cache op that never completes, so
+// the signal write at the end of the packet never lands.
+pub const EOP_TC_WB_ACTION_EN: u32 = 1 << 15;
+pub const EOP_TC_NC_ACTION_EN: u32 = 1 << 19;
+
+/// gfx9 end-of-pipe cache flush: write-back + non-coherent invalidate.
+pub const EOP_CACHE_FLUSH_GFX9: u32 = EOP_TC_WB_ACTION_EN | EOP_TC_NC_ACTION_EN;
 
 // ── RELEASE_MEM bitfields (DW2) ───────────────────────────────────────────
 
@@ -133,7 +147,6 @@ pub const HDP_FLUSH_DONE_ADDR: u32 = 0xD20 + 263;
 
 // ── PACKET3 opcodes & constants (PM4 dispatch path, single-XCC) ──────────
 //
-// Source: submodules/new_new_tinygrad/tinygrad/runtime/autogen/am/pm4_nv.py
 // These constants drive the raw-PM4 `AmdComputeQueue::exec_pm4` path used
 // when `xccs == 1` (the gfx11/gfx12 default).
 
@@ -149,8 +162,6 @@ pub const PACKET3_EVENT_WRITE: u32 = 0x46;
 // `GC_BASE=0x2000` with `field_offset=0xe00`, while gfx11/12 use
 // `GC_BASE=0x1260` with `field_offset=0x1ba0` — both sums equal `0x2e00`,
 // yielding `0x200` once `PACKET3_SET_SH_REG_START=0x2c00` is subtracted.
-//
-// Source: submodules/new_new_tinygrad/tinygrad/runtime/autogen/am/regs.py
 
 pub const COMPUTE_DISPATCH_INITIATOR: u32 = 0x200;
 pub const COMPUTE_START_X: u32 = 0x204;
@@ -203,13 +214,24 @@ pub const EVENT_INDEX_PARTIAL_FLUSH: u32 = 4;
 /// dw6  value hi
 /// dw7  ctxid                      always 0 in our usage
 /// ```
-pub fn release_mem(addr: u64, value: u32, cache_flush: bool) -> [u32; 8] {
-    let cache = if cache_flush { RELEASE_MEM_CACHE_FLUSH_ALL } else { 0 };
+pub fn release_mem(addr: u64, value: u32, cache_flush: bool, is_gfx9: bool) -> [u32; 8] {
+    // gfx9 (CDNA) and gfx10+ (RDNA) encode the cache flush differently: gfx9
+    // uses the TC action bits in DW1, gfx10+ the GCR bitfield. DST_SEL only
+    // exists on gfx10+ (it is implicitly memory on gfx9).
+    let (cache, memsel_dw) = if is_gfx9 {
+        let cache = if cache_flush { EOP_CACHE_FLUSH_GFX9 } else { 0 };
+        let memsel =
+            release_mem_data_sel(DATA_SEL_SEND_32_BIT_LOW) | release_mem_int_sel(INT_SEL_INTERRUPT_AFTER_WRITE);
+        (cache, memsel)
+    } else {
+        let cache = if cache_flush { RELEASE_MEM_CACHE_FLUSH_ALL } else { 0 };
+        let memsel = release_mem_data_sel(DATA_SEL_SEND_32_BIT_LOW)
+            | release_mem_int_sel(INT_SEL_INTERRUPT_AFTER_WRITE)
+            | release_mem_dst_sel(DST_SEL_MEMORY);
+        (cache, memsel)
+    };
     let event_dw =
         release_mem_event_type(CACHE_FLUSH_AND_INV_TS_EVENT) | release_mem_event_index(EVENT_INDEX_END_OF_PIPE) | cache;
-    let memsel_dw = release_mem_data_sel(DATA_SEL_SEND_32_BIT_LOW)
-        | release_mem_int_sel(INT_SEL_INTERRUPT_AFTER_WRITE)
-        | release_mem_dst_sel(DST_SEL_MEMORY);
     [
         packet3(PACKET3_RELEASE_MEM, 6),
         event_dw,
@@ -223,8 +245,7 @@ pub fn release_mem(addr: u64, value: u32, cache_flush: bool) -> [u32; 8] {
 }
 
 // ── ACQUIRE_MEM GCR_CNTL cache-flag bit positions (gfx10+) ────────────────
-// Source: submodules/new_new_tinygrad/tinygrad/runtime/autogen/am/pm4_nv.py
-// Each constant is the lambda `(x) << N` shift positions; here we encode the
+// Each constant is the `(x) << N` shift position; here we encode the
 // `1`-set value directly.
 
 pub const GCR_GLI_INV: u32 = 1 << 0;
@@ -280,6 +301,36 @@ pub fn acquire_mem_with(cache_flags: u32) -> [u32; 8] {
 /// back every cache level. Used by `memory_barrier`.
 pub fn acquire_mem() -> [u32; 8] {
     acquire_mem_with(GCR_FLAGS_ALL)
+}
+
+// ── gfx9 / SOC15 ACQUIRE_MEM (CP_COHER_CNTL, DW1) ─────────────────────────
+// gfx9 has no GCR_CNTL dword; cache actions live in CP_COHER_CNTL (DW1) and
+// the packet is one dword shorter than the gfx10+ form.
+pub const COHER_SH_ICACHE_ACTION_ENA: u32 = 1 << 29;
+pub const COHER_SH_KCACHE_ACTION_ENA: u32 = 1 << 27;
+pub const COHER_TC_ACTION_ENA: u32 = 1 << 23;
+pub const COHER_TCL1_ACTION_ENA: u32 = 1 << 22;
+pub const COHER_TC_WB_ACTION_ENA: u32 = 1 << 18;
+
+/// gfx9 ACQUIRE_MEM (full cache invalidate + write-back). 7 dwords:
+/// `dw0` header, `dw1` CP_COHER_CNTL, `dw2..3` coher size (full VA),
+/// `dw4..5` coher base (0), `dw6` poll interval (`0x0A`).
+pub fn acquire_mem_gfx9() -> [u32; 7] {
+    let cp_coher_cntl = COHER_SH_ICACHE_ACTION_ENA
+        | COHER_SH_KCACHE_ACTION_ENA
+        | COHER_TC_ACTION_ENA
+        | COHER_TCL1_ACTION_ENA
+        | COHER_TC_WB_ACTION_ENA;
+    [packet3(PACKET3_ACQUIRE_MEM, 5), cp_coher_cntl, 0xFFFF_FFFF, 0xFFFF_FFFF, 0, 0, 0x0000_000A]
+}
+
+/// PRED_EXEC: execute the following `exec_count` dwords only on the XCCs whose
+/// bit is set in `xcc_mask`. gfx9 multi-XCC only, and only valid inside an IB
+/// (the CP ignores PRED_EXEC issued straight into a ring). Used to emit the
+/// end-of-pipe signal from a single XCC so the timeline is written exactly
+/// once instead of once per XCC.
+pub fn pred_exec(xcc_mask: u32, exec_count: u32) -> [u32; 2] {
+    [packet3(PACKET3_PRED_EXEC, 0), (xcc_mask << 24) | (exec_count & 0x3FFF)]
 }
 
 /// Build a PM4 WAIT_REG_MEM packet that polls memory at `addr` until

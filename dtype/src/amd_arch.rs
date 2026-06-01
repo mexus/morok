@@ -27,6 +27,16 @@ impl AmdArch {
         matches!(self, Self::Gfx942 | Self::Gfx950)
     }
 
+    /// gfx major version (`9` = CDNA, `11` = RDNA3, `12` = RDNA4) — the
+    /// discriminator several PM4 cache encodings branch on.
+    pub const fn gfx_major(self) -> u32 {
+        match self {
+            Self::Gfx942 | Self::Gfx950 => 9,
+            Self::Gfx1100 | Self::Gfx1101 | Self::Gfx1102 | Self::Gfx1151 => 11,
+            Self::Gfx1200 | Self::Gfx1201 => 12,
+        }
+    }
+
     /// RDNA3 family (Radeon 7000; WMMA intrinsics, wave32).
     pub const fn is_rdna3(self) -> bool {
         matches!(self, Self::Gfx1100 | Self::Gfx1101 | Self::Gfx1102 | Self::Gfx1151)

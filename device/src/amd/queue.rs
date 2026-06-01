@@ -205,6 +205,10 @@ struct QueueInner {
     /// every doorbell ring. Skipping it makes the GPU's
     /// command processor see the doorbell change but stall on a stale wptr.
     write_ptr_host: NonNull<u64>,
+    /// Host base of the GART page (the `AmdQueueT` descriptor). On AQL queues
+    /// the scratch fields at fixed offsets are patched here when the
+    /// connector's scratch buffer is (re)allocated; see `set_aql_scratch`.
+    gart_host: NonNull<u8>,
     /// 16 MiB host-visible uncached-coherent buffer for PM4 indirect
     /// buffers (AQL path only). The AQL vendor-specific packet
     /// references PM4 dwords stored in this buffer via PACKET3_INDIRECT_BUFFER.
@@ -318,6 +322,14 @@ impl QueueInner {
         };
         self.pm4_ibs_cursor = start + bytes;
         gpu_addr
+    }
+
+    /// Copy `pm4` into the IB arena and push a vendor-IB AQL packet that points
+    /// at it. The AQL-path wrapper around [`pm4_ib`] + [`push_aql`].
+    fn push_pm4_ib(&mut self, pm4: &[u32]) {
+        let ib = self.pm4_ib(pm4);
+        let p = build_aql_vendor_ib_packet(ib, pm4.len() as u32);
+        self.push_aql(dwords_as_bytes(&p));
     }
 
     /// Publish the current `write_idx` to GART + ring the doorbell. AQL uses
@@ -475,7 +487,11 @@ impl AmdComputeQueue {
         q.extend_from_slice(&pm4::wait_reg_mem(timeline_addr, prev as u32, 0xFFFF_FFFF));
         // memory_barrier: HDP flush handshake + ACQUIRE_MEM cache invalidate.
         q.extend_from_slice(&pm4::hdp_flush());
-        q.extend_from_slice(&pm4::acquire_mem());
+        if target_major == 9 {
+            q.extend_from_slice(&pm4::acquire_mem_gfx9());
+        } else {
+            q.extend_from_slice(&pm4::acquire_mem());
+        }
         // exec: SET_SH_REG stream + DISPATCH_DIRECT.
         build_exec_pm4(
             &mut q,
@@ -492,7 +508,12 @@ impl AmdComputeQueue {
             target_major,
         );
         // signal(timeline, next): RELEASE_MEM after a system-scope cache flush.
-        q.extend_from_slice(&pm4::release_mem(timeline_addr, next as u32, /*cache_flush=*/ true));
+        q.extend_from_slice(&pm4::release_mem(
+            timeline_addr,
+            next as u32,
+            /*cache_flush=*/ true,
+            target_major == 9,
+        ));
 
         g.push_pm4(&q);
         g.ring_doorbell(/*is_pm4=*/ true);
@@ -556,34 +577,110 @@ impl AmdComputeQueue {
         let prev = conn.timeline_value().saturating_sub(1);
         let next = conn.next_timeline();
 
-        // wait → barrier(hdp, acquire) → exec → signal, each PM4 op wrapped in a
-        // vendor-IB AQL packet (exec is a native dispatch packet).
-        let wait = pm4::wait_reg_mem(timeline_addr, prev as u32, 0xFFFF_FFFF);
-        let ib = g.pm4_ib(&wait);
-        let p = build_aql_vendor_ib_packet(ib, wait.len() as u32);
-        g.push_aql(dwords_as_bytes(&p));
+        // AQL queues exist only on multi-XCC CDNA (gfx9). The PM4 ops the CP
+        // runs from the vendor IBs therefore use the gfx9 cache encodings.
+        let is_gfx9 = self.core.arch.is_cdna();
+        let xccs = self.core.node.num_xcc.max(1);
 
-        let hdp = pm4::hdp_flush();
-        let ib = g.pm4_ib(&hdp);
-        let p = build_aql_vendor_ib_packet(ib, hdp.len() as u32);
-        g.push_aql(dwords_as_bytes(&p));
-
-        let acq = pm4::acquire_mem();
-        let ib = g.pm4_ib(&acq);
-        let p = build_aql_vendor_ib_packet(ib, acq.len() as u32);
-        g.push_aql(dwords_as_bytes(&p));
+        // wait → barrier(hdp, acquire) → exec → signal. The three pre-dispatch
+        // PM4 ops run back-to-back in ONE indirect buffer (one vendor-IB AQL
+        // packet) instead of three — the CP runs them sequentially either way,
+        // so batching just saves two AQL packets + their barrier handshakes per
+        // dispatch. exec is a native dispatch packet, and the signal stays in
+        // its own IB so PRED_EXEC can gate it to one XCC (below).
+        let mut prologue: Vec<u32> = Vec::with_capacity(22);
+        prologue.extend_from_slice(&pm4::wait_reg_mem(timeline_addr, prev as u32, 0xFFFF_FFFF));
+        prologue.extend_from_slice(&pm4::hdp_flush());
+        if is_gfx9 {
+            prologue.extend_from_slice(&pm4::acquire_mem_gfx9());
+        } else {
+            prologue.extend_from_slice(&pm4::acquire_mem());
+        }
+        g.push_pm4_ib(&prologue);
 
         // exec: native 64-byte kernel-dispatch packet.
         let packet_bytes = unsafe { std::slice::from_raw_parts(packet as *const _ as *const u8, AQL_PACKET_BYTES) };
         g.push_aql(packet_bytes);
 
-        let sig = pm4::release_mem(timeline_addr, next as u32, /*cache_flush=*/ true);
-        let ib = g.pm4_ib(&sig);
-        let p = build_aql_vendor_ib_packet(ib, sig.len() as u32);
-        g.push_aql(dwords_as_bytes(&p));
+        // signal(timeline, next): the CP broadcasts each vendor IB to every XCC
+        // pipe, so on multi-XCC the end-of-pipe RELEASE_MEM is gated to XCC0 via
+        // PRED_EXEC — otherwise all `xccs` pipes race to write the same timeline
+        // slot (and share one EOP buffer), which hangs the queue.
+        let sig = pm4::release_mem(timeline_addr, next as u32, /*cache_flush=*/ true, is_gfx9);
+        if xccs > 1 {
+            let mut gated = [0u32; 2 + 8];
+            let pred = pm4::pred_exec(/*xcc_mask=*/ 0b1, sig.len() as u32);
+            gated[..2].copy_from_slice(&pred);
+            gated[2..].copy_from_slice(&sig);
+            g.push_pm4_ib(&gated);
+        } else {
+            g.push_pm4_ib(&sig);
+        }
 
         g.ring_doorbell(/*is_pm4=*/ false);
         Ok(next)
+    }
+
+    /// Patch the AQL `amd_queue_t` scratch descriptor in the GART page. The AQL
+    /// packet processor reads private-segment (scratch) config from here, so it
+    /// must be refreshed whenever the connector's scratch buffer is allocated or
+    /// grown. No-op on PM4 queues, where scratch goes through registers per
+    /// dispatch. The caller holds the queue idle (the connector drains its
+    /// timeline before a scratch realloc), so no in-flight dispatch can observe
+    /// a half-written descriptor.
+    pub(crate) fn set_aql_scratch(&self, desc: &crate::amd::device::AqlScratchDesc) {
+        if self.is_pm4 {
+            return;
+        }
+        use crate::amd::sys::hsa;
+        // SAFETY: single-owner invariant (see struct doc); called only while the
+        // queue is drained.
+        let base = unsafe { self.inner_mut() }.gart_host.as_ptr();
+        // SAFETY: `base` is the GART page we mmapped; every offset lands inside
+        // the 256-byte AmdQueueT descriptor that occupies the page.
+        unsafe {
+            std::ptr::write_volatile(base.add(hsa::OFFSET_COMPUTE_TMPRING_SIZE) as *mut u32, desc.tmpring_size);
+            let rd = base.add(hsa::OFFSET_SCRATCH_RESOURCE_DESCRIPTOR) as *mut u32;
+            for (i, w) in desc.resource_descriptor.iter().enumerate() {
+                std::ptr::write_volatile(rd.add(i), *w);
+            }
+            std::ptr::write_volatile(
+                base.add(hsa::OFFSET_SCRATCH_BACKING_MEMORY_LOCATION) as *mut u64,
+                desc.backing_va,
+            );
+            std::ptr::write_volatile(
+                base.add(hsa::OFFSET_SCRATCH_WAVE64_LANE_BYTE_SIZE) as *mut u32,
+                desc.wave64_lane_byte_size,
+            );
+        }
+        std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
+    }
+
+    /// Read the AQL scratch descriptor back out of the GART page — the bytes the
+    /// firmware actually sees. Test-only: validates that `set_aql_scratch` wrote
+    /// the right values at the right offsets on real hardware.
+    #[cfg(test)]
+    pub(crate) fn read_aql_scratch(&self) -> crate::amd::device::AqlScratchDesc {
+        use crate::amd::sys::hsa;
+        // SAFETY: single-owner; GART page is host-visible and the AmdQueueT
+        // occupies it.
+        let base = unsafe { self.inner_mut() }.gart_host.as_ptr();
+        unsafe {
+            let rd = base.add(hsa::OFFSET_SCRATCH_RESOURCE_DESCRIPTOR) as *const u32;
+            crate::amd::device::AqlScratchDesc {
+                tmpring_size: std::ptr::read_volatile(base.add(hsa::OFFSET_COMPUTE_TMPRING_SIZE) as *const u32),
+                resource_descriptor: [
+                    std::ptr::read_volatile(rd),
+                    std::ptr::read_volatile(rd.add(1)),
+                    std::ptr::read_volatile(rd.add(2)),
+                    std::ptr::read_volatile(rd.add(3)),
+                ],
+                backing_va: std::ptr::read_volatile(base.add(hsa::OFFSET_SCRATCH_BACKING_MEMORY_LOCATION) as *const u64),
+                wave64_lane_byte_size: std::ptr::read_volatile(
+                    base.add(hsa::OFFSET_SCRATCH_WAVE64_LANE_BYTE_SIZE) as *const u32
+                ),
+            }
+        }
     }
 }
 
@@ -650,9 +747,14 @@ pub(crate) fn build_exec_pm4(
     wave32: bool,
     target_major: u32,
 ) {
-    // 1. Pre-dispatch cache-invalidate, skipping GLI/GL2 (already flushed by the
-    //    preceding memory_barrier).
-    q.extend_from_slice(&pm4::acquire_mem_with(pm4::GCR_FLAGS_NO_GLI_GL2));
+    // 1. Pre-dispatch cache-invalidate. gfx10+ skips GLI/GL2 (already flushed by
+    //    the preceding memory_barrier); gfx9 has no GCR bitfield, so it issues
+    //    the CP_COHER full flush (re-invalidating is redundant but safe).
+    if target_major == 9 {
+        q.extend_from_slice(&pm4::acquire_mem_gfx9());
+    } else {
+        q.extend_from_slice(&pm4::acquire_mem_with(pm4::GCR_FLAGS_NO_GLI_GL2));
+    }
 
     // 2. Shader address: COMPUTE_PGM_LO/HI hold (prog_addr >> 8).
     let prog_shr = prog_addr >> 8;
@@ -873,6 +975,7 @@ fn create_queue(allocator: &AmdAllocator, queue_type: u32, ring_size: usize, aql
         doorbell,
         doorbell_base,
         write_ptr_host,
+        gart_host,
         pm4_ibs_host,
         pm4_ibs_gpu,
         pm4_ibs_size,
@@ -913,9 +1016,13 @@ fn compute_ctx_sizes(dev: &AmdDeviceCore) -> (usize, usize, usize) {
     let cu_cnt = ((dev.node.simd_count.max(1) / dev.node.simd_per_cu.max(1)) as usize / xccs).max(1);
     let waves_per_cu = (dev.node.max_waves_per_simd as usize) * (dev.node.simd_per_cu as usize);
     let wave_cnt = if dev.arch.is_cdna() {
-        // gfx9 caps waves at min(cu_cnt*40, se_cnt*xccs*512); we don't have a
-        // sysfs se_cnt yet so we use the conservative cu_cnt*40.
-        (cu_cnt * 40).min(cu_cnt * waves_per_cu)
+        // gfx9 caps waves at min(cu_cnt*40, se_cnt*xccs*512). se_cnt is the
+        // shader-engine count per XCC (array_count / simd_arrays_per_engine /
+        // xccs). KFD >= 6.11 sizes the CWSR debug-memory area from this exact
+        // formula and rejects CREATE_QUEUE with EINVAL if our buffer is short,
+        // so it must match the kernel's `kfd_queue_acquire_buffers` value.
+        let se_cnt = (dev.node.array_count as usize / (dev.node.simd_arrays_per_engine.max(1) as usize) / xccs).max(1);
+        (cu_cnt * 40).min(se_cnt * xccs * 512)
     } else {
         cu_cnt * waves_per_cu
     };

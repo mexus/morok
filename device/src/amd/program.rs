@@ -327,14 +327,7 @@ impl AmdProgram {
                 lds_kb: device.node.lds_size_in_kb,
             });
         }
-        let target_major: u32 = match device.arch {
-            svod_dtype::AmdArch::Gfx942 | svod_dtype::AmdArch::Gfx950 => 9,
-            svod_dtype::AmdArch::Gfx1100
-            | svod_dtype::AmdArch::Gfx1101
-            | svod_dtype::AmdArch::Gfx1102
-            | svod_dtype::AmdArch::Gfx1151 => 11,
-            svod_dtype::AmdArch::Gfx1200 | svod_dtype::AmdArch::Gfx1201 => 12,
-        };
+        let target_major: u32 = device.arch.gfx_major();
         // Packed struct: copy fields to locals to avoid unaligned-ref warnings.
         let rsrc1_kd = parsed.kd.compute_pgm_rsrc1;
         let rsrc2_kd = parsed.kd.compute_pgm_rsrc2;

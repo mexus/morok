@@ -152,6 +152,16 @@ const _AMD_QUEUE_T_IS_256: () = assert!(std::mem::size_of::<AmdQueueT>() == 256)
 pub const OFFSET_READ_DISPATCH_ID: usize = 128;
 pub const OFFSET_WRITE_DISPATCH_ID: usize = 56;
 
+/// Byte offsets of the scratch (private-segment) fields the AQL packet
+/// processor reads from the GART `AmdQueueT`. Derived from the struct layout so
+/// they stay correct if the struct changes. Patched post-create whenever the
+/// connector's scratch buffer is (re)allocated.
+pub const OFFSET_COMPUTE_TMPRING_SIZE: usize = std::mem::offset_of!(AmdQueueT, compute_tmpring_size);
+pub const OFFSET_SCRATCH_RESOURCE_DESCRIPTOR: usize = std::mem::offset_of!(AmdQueueT, scratch_resource_descriptor);
+pub const OFFSET_SCRATCH_BACKING_MEMORY_LOCATION: usize =
+    std::mem::offset_of!(AmdQueueT, scratch_backing_memory_location);
+pub const OFFSET_SCRATCH_WAVE64_LANE_BYTE_SIZE: usize = std::mem::offset_of!(AmdQueueT, scratch_wave64_lane_byte_size);
+
 // queue_properties bits.
 pub const AMD_QUEUE_PROPERTIES_IS_PTR64: u32 = 1 << 0;
 pub const AMD_QUEUE_PROPERTIES_ENABLE_PROFILING: u32 = 1 << 1;

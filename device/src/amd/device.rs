@@ -78,6 +78,48 @@ pub(crate) struct ScratchState {
     pub size: usize,
 }
 
+/// The private-segment (scratch) fields the AQL packet processor reads from the
+/// `amd_queue_t` GART descriptor. On the PM4 dispatch path the same information
+/// is pushed via `COMPUTE_TMPRING_SIZE` / `COMPUTE_DISPATCH_SCRATCH_BASE` and
+/// the user-SGPR descriptor instead, so this is only consumed on multi-XCC
+/// CDNA (the lone AQL arch).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct AqlScratchDesc {
+    /// `amd_queue_t.scratch_backing_memory_location` — scratch buffer VA.
+    pub backing_va: u64,
+    /// `amd_queue_t.compute_tmpring_size`.
+    pub tmpring_size: u32,
+    /// `amd_queue_t.scratch_resource_descriptor` — a 4-dword SQ_BUF_RSRC.
+    pub resource_descriptor: [u32; 4],
+    /// `amd_queue_t.scratch_wave64_lane_byte_size` — per-lane byte size (wave64,
+    /// so just the per-thread private segment size).
+    pub wave64_lane_byte_size: u32,
+}
+
+/// gfx9 SQ_BUF_RSRC WORD3 for a scratch buffer: DST_SEL=XYZW (4,5,6,7),
+/// NUM_FORMAT=UINT(4), DATA_FORMAT=32(4), ELEMENT_SIZE=1, INDEX_STRIDE=3,
+/// ADD_TID_ENABLE=1, TYPE=SQ_RSRC_BUF(0).
+const SCRATCH_RSRC_WORD3_GFX9: u32 = 0x00EA_4FAC;
+
+impl AqlScratchDesc {
+    /// Build the gfx9 scratch descriptor. `size_per_xcc` goes in NUM_RECORDS
+    /// (WORD2) — the per-XCC slice of the shared backing buffer — and the
+    /// SWIZZLE_ENABLE bit (WORD1 bit 31) enables the per-thread scratch swizzle.
+    pub(crate) fn gfx9(scratch_va: u64, size_per_xcc: usize, tmpring_size: u32, private_segment_size: u32) -> Self {
+        Self {
+            backing_va: scratch_va,
+            tmpring_size,
+            resource_descriptor: [
+                scratch_va as u32,
+                ((scratch_va >> 32) as u32 & 0xFFFF) | 0x8000_0000,
+                size_per_xcc as u32,
+                SCRATCH_RSRC_WORD3_GFX9,
+            ],
+            wave64_lane_byte_size: private_segment_size,
+        }
+    }
+}
+
 /// Immutable per-physical-AMD:N identity: KFD/DRM fds, topology, event-page
 /// state, fault latch, shared signal pool. One instance per physical GPU
 /// (KFD rejects double `ACQUIRE_VM`); shared as `Arc<AmdDeviceCore>` by
@@ -591,7 +633,8 @@ fn alloc_event_page(kfd_fd: &OwnedFd, drm_fd: &OwnedFd, node: &AmdNode) -> Resul
 
 /// Allocate a scratch buffer sized for `private_segment_size` bytes per
 /// thread and compute the packed `COMPUTE_TMPRING_SIZE` value. Returns
-/// `(scratch_gpu_va, scratch_size, tmpring_size, rounded_size_per_thread)`.
+/// `(scratch_gpu_va, scratch_size, tmpring_size, rounded_size_per_thread,
+/// handle, aql_desc)`.
 ///
 /// Sizing (gfx11/12):
 /// - `lanes_per_wave = 64` (scratch lane stride is wave64-aligned per AMD)
@@ -612,7 +655,7 @@ pub(crate) fn alloc_scratch(
     node: &AmdNode,
     arch: &AmdArch,
     private_segment_size: u32,
-) -> Result<(u64, usize, u32, u32, u64)> {
+) -> Result<(u64, usize, u32, u32, u64, AqlScratchDesc)> {
     const LANES_PER_WAVE: u32 = 64;
     const PAGE: usize = 0x1000;
     // gfx9 (CDNA) scratch is 1024-byte aligned; gfx11/12 (RDNA) use 256.
@@ -652,7 +695,15 @@ pub(crate) fn alloc_scratch(
     let waves = num_waves.min(max_scratch_waves);
     let tmpring_size = pack_tmpring(waves, wave_scratch, arch);
 
-    Ok((va, total, tmpring_size, size_per_thread, handle))
+    // The AQL descriptor is only consumed on multi-XCC CDNA; non-CDNA arches
+    // dispatch via PM4 and never read it, so leave it zero there.
+    let aql_desc = if arch.is_cdna() {
+        AqlScratchDesc::gfx9(va, size_per_xcc, tmpring_size, private_segment_size)
+    } else {
+        AqlScratchDesc::default()
+    };
+
+    Ok((va, total, tmpring_size, size_per_thread, handle, aql_desc))
 }
 
 /// Pack `COMPUTE_TMPRING_SIZE`: WAVES in bits 0..12, WAVESIZE at bit 12 with an
