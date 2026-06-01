@@ -97,8 +97,17 @@
           TABLEGEN_210_PREFIX = "${mlirSysPrefix}";
           LIBCLANG_PATH = "${pkgs.libclang.lib}/lib/";
           ONNX_TEST_DATA = "${onnxTestData}/onnx/backend/test/data";
-          # Disable fortify since debug builds use -O0 but _FORTIFY_SOURCE requires optimization
-          hardeningDisable = [ "fortify" ];
+          # cc-wrapper appends NIX_HARDENING_ENABLE flags to *every* clang call,
+          # including the runtime `clang --target=amdgcn-amd-amdhsa` cross-compile
+          # in the AMD backend tests. The AMDGPU target rejects host-oriented
+          # flags, so drop the two that break the build:
+          #   - fortify: _FORTIFY_SOURCE needs optimization; debug builds are -O0.
+          #   - zerocallusedregs: `-fzero-call-used-regs=used-gpr` is unsupported
+          #     for amdgcn and fails the compile-smoke test.
+          hardeningDisable = [
+            "fortify"
+            "zerocallusedregs"
+          ];
 
         };
 
