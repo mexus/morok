@@ -32,6 +32,14 @@ use smallvec::SmallVec;
 /// index-tag space used by rangeify so it cannot collide with tracking tags.
 pub const TAG_MERGEABLE: usize = 0xFFFF_FFFF_FFFF_FFFE;
 
+/// Marks an expander-finalized `CONTRACT`/`WMMA`/`UNROLL` node. The tag makes
+/// the freshly-built tensor-core structure
+/// hash-distinct from the raw operand subtrees so `do_contract`/`do_expand`
+/// expand the WMMA per output tile instead of collapsing the tiles into a
+/// GEP-broadcast of one WMMA result. Picked outside the rangeify index-tag
+/// space (like [`TAG_MERGEABLE`]) and consumed by the expander before regalloc.
+pub const TAG_TC_FINAL: usize = 0xFFFF_FFFF_FFFF_FFFD;
+
 #[inline]
 fn is_mergeable_end(uop: &Arc<UOp>) -> bool {
     matches!(uop.op(), Op::End { .. }) && uop.tag().as_ref().is_some_and(|t| t.contains(&TAG_MERGEABLE))
@@ -297,6 +305,44 @@ pub fn bool_storage_patterns() -> &'static TypedPatternMatcher {
 pub struct Fp8DecompCtx {
     pub from: ScalarDType,
     pub to: ScalarDType,
+    /// Ids of nodes in the backward slice of a `Wmma` operand. A tensor core has
+    /// *native* fp8 matrix-core support (the AMD renderer packs fp8 lanes into
+    /// the MFMA operand directly), so these fp8 nodes must NOT be
+    /// software-decomposed to f16 — doing so rewrites the fp8 MFMA into a
+    /// non-existent f16 one that fails to compile and is dropped by BEAM. fp8 is
+    /// promoted only for ALU/CAST; WMMA operands are left fp8.
+    pub tc_operand_ids: HashSet<u64>,
+}
+
+impl Fp8DecompCtx {
+    /// True if `u` feeds a `Wmma` operand and so must stay native fp8 (the
+    /// tensor core packs the lanes itself) — exempt from software decomposition.
+    fn is_tc_operand(&self, u: &Arc<UOp>) -> bool {
+        self.tc_operand_ids.contains(&u.id)
+    }
+
+    /// True if `u` is an fp8 node that should be software-decomposed to `to`:
+    /// its (pointee) dtype is the fp8 `from` and it is not a tensor-core operand.
+    /// Single point of truth for the `pm_float_decomp` patterns — a new pattern
+    /// gating on this automatically inherits the TC-operand exemption (without
+    /// it, fp8 WMMA operands get rewritten into a non-existent f16 MFMA).
+    fn should_decomp(&self, u: &Arc<UOp>) -> bool {
+        u.dtype().base() == self.from && !self.is_tc_operand(u)
+    }
+}
+
+/// Collect the ids of every node feeding a `Wmma` operand (its A/B backward
+/// slices, self-inclusive). These fp8 nodes are exempt from `pm_float_decomp`
+/// because the tensor core consumes fp8 natively.
+pub fn tc_operand_slice_ids(root: &Arc<UOp>) -> HashSet<u64> {
+    let mut ids = HashSet::new();
+    for node in root.backward_slice() {
+        if let Op::Wmma { a, b, .. } = node.op() {
+            ids.extend(a.backward_slice_ids().iter().copied());
+            ids.extend(b.backward_slice_ids().iter().copied());
+        }
+    }
+    ids
 }
 
 /// Round-to-nearest-even for integer bitwise rounding.
@@ -446,14 +492,16 @@ pub fn pm_float_decomp() -> crate::TypedPatternMatcher<Fp8DecompCtx> {
 
         // Pattern 1: INDEX/DEFINE with FP8 ptr base → change ptr to UInt8
         x if matches!(x.op(), Op::Param { device: None, .. } | Op::DefineLocal(_) | Op::Index { .. })
-            && x.dtype().base() == ctx.from
+            && ctx.should_decomp(x)
         => {
             let uint8_ptr = x.dtype().with_ptr_base(DType::Scalar(ctx.from.float_to_uint()))?;
             Some(x.with_dtype(uint8_ptr))
         },
 
         // Pattern 2: LOAD with FP8 dtype → load as UInt8, f2f upcast to target float
-        load @ Load { buffer, index, alt } if load.dtype().base() == ctx.from => {
+        load @ Load { buffer, index, alt }
+            if ctx.should_decomp(load) =>
+        {
             let uint_dtype = DType::Scalar(ctx.from.float_to_uint()).vec(load.dtype().vcount());
             let uint_alt = alt.clone().map(|a| {
                 if a.dtype().base() == ctx.from {
@@ -477,7 +525,11 @@ pub fn pm_float_decomp() -> crate::TypedPatternMatcher<Fp8DecompCtx> {
         // Pattern 5: CAST to FP8 → full round-trip (Float16→FP8 bytes→Float16).
         // Must do the complete conversion (not just clamp) because the kernel may fuse
         // Cast(Float16→FP8) and Cast(FP8→Float32) without materializing the FP8 buffer.
-        x @ Cast { src: val, .. } if x.dtype().base() == ctx.from => {
+        // Exempt a Cast feeding a WMMA operand: when the matmul inputs aren't a
+        // materialized fp8 buffer, the operand IS a `Cast(f32→fp8)`, and the tensor
+        // core consumes that fp8 natively (the renderer packs the lanes) — software
+        // round-tripping it to f16 turns the fp8 MFMA into a non-existent f16 one.
+        x @ Cast { src: val, .. } if ctx.should_decomp(x) => {
             let target = DType::Scalar(ctx.to);
             let target_uint = DType::Scalar(ctx.to.float_to_uint());
             let float_val = val.cast(target);
@@ -490,7 +542,7 @@ pub fn pm_float_decomp() -> crate::TypedPatternMatcher<Fp8DecompCtx> {
         // Pattern 6: Any op with FP8 output dtype → promote to target float, cast FP8 sources
         x if !matches!(x.op(), Op::BitCast { .. })
             && x.dtype().is_float()
-            && x.dtype().base() == ctx.from
+            && ctx.should_decomp(x)
         => {
             let target_dtype = DType::Scalar(ctx.to);
             let new_dtype = if x.dtype().vcount() > 1 {

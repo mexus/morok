@@ -29,6 +29,7 @@
 
 #![cfg(target_os = "linux")]
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -70,12 +71,18 @@ pub struct AmdConnector {
     /// `AmdDevice::scratch_state`; see that field's docstring for the
     /// scratch-grow-on-demand story.
     scratch_state: Mutex<ScratchState>,
-    /// Per-connector timeline: monotonic counter + the shared completion signal
-    /// the GPU writes on dispatch. `Arc` because it is ALSO registered in the
-    /// core (`Weak<Timeline>`) so `synchronize_all` can drain this connector's
-    /// in-flight work WITHOUT touching its queue — the decoupling that keeps
-    /// dispatch lock-free. Pairs the device timeline signal with its counter.
+    /// Monotonic counter + completion signal. Still used by the PM4 single-XCC
+    /// path, the SDMA-style monotonic drain, and the (deferred) AQL graph
+    /// capture path; the AQL `execute_on` path uses `inflight` instead.
     timeline: Arc<Timeline>,
+    /// In-flight native per-op completion signals for the AQL `execute_on` path
+    /// (FIFO). Each AQL dispatch arms a pool signal to 1; the packet processor
+    /// decrements it to 0 on completion. The host reclaims retired slots on the
+    /// next [`acquire_signal`](Self::acquire_signal) or drains them in
+    /// [`synchronize`](Self::synchronize). This — not the monotonic `timeline` —
+    /// is how AQL completion is tracked. `synchronize_all` drains it via the
+    /// core's `Weak<AmdConnector>` registry without touching the queue.
+    inflight: Mutex<VecDeque<Arc<AmdSignal>>>,
 }
 
 impl AmdConnector {
@@ -111,17 +118,16 @@ impl AmdConnector {
                 .into(),
         })?;
         let timeline = Timeline::new(Arc::new(pool.acquire()?));
+        // Pre-reserve a generous scratch buffer once (ROCr-style stable pool): the
+        // mid-stream `set_aql_scratch` REALLOC (new VA + KFD-unmap of the old) on a
+        // live multi-XCC queue silently wedges the CP (confirmed: grow→~40% wedge,
+        // pre-sized→no wedge). ROCr never reallocs — it pre-reserves one pool
+        // (`max_scratch_len`) and sub-allocates. Pre-sizing here so no typical
+        // kernel triggers a grow. (A kernel exceeding this still hits the fragile grow
+        // path; the full fix is to update the SRD within this stable buffer instead
+        // of reallocating — tracked separately.)
         let (scratch_va, scratch_size, tmpring_size, size_per_thread, scratch_handle, aql_desc) =
-            alloc_scratch(core.iface(), &core.node, &core.arch, 128)?;
-        // Register the TIMELINE (not the connector) in the core so
-        // `synchronize_all` can drain this connector's in-flight work via the
-        // shared signal — without ever touching its queue. Opportunistic GC of
-        // dropped entries.
-        {
-            let mut list = core.timelines.lock();
-            list.retain(|w| w.strong_count() > 0);
-            list.push(Arc::downgrade(&timeline));
-        }
+            alloc_scratch(core.iface(), &core.node, &core.arch, 2048)?;
         let conn = Arc::new(Self {
             core,
             queue,
@@ -134,7 +140,18 @@ impl AmdConnector {
                 size: scratch_size,
             }),
             timeline,
+            inflight: Mutex::new(VecDeque::new()),
         });
+        // Register the connector in the core so `synchronize_all` can drain its
+        // in-flight work — both the monotonic `timeline` and the per-op
+        // completion `inflight` signals — via `Weak<AmdConnector>`, reading only
+        // signal slots and never touching the queue. Opportunistic GC of dropped
+        // entries.
+        {
+            let mut list = conn.core.connectors.lock();
+            list.retain(|w| w.strong_count() > 0);
+            list.push(Arc::downgrade(&conn));
+        }
         // Publish the initial scratch descriptor into the AQL queue's GART page
         // (no-op on PM4 queues). Must happen before the first dispatch.
         conn.queue().set_aql_scratch(&aql_desc);
@@ -197,7 +214,68 @@ impl AmdConnector {
         if let Some(err) = self.core.poison_error() {
             return Err(err);
         }
-        self.timeline.drain(30_000).inspect_err(|e| self.core.poison(&e.to_string()))
+        // Drain the monotonic timeline (PM4 / SDMA-style / graph work)...
+        self.timeline.drain(30_000).inspect_err(|e| self.core.poison(&e.to_string()))?;
+        // ...then every in-flight native completion signal (AQL per-op work).
+        // Snapshot under the lock, wait outside it, then drop the retired ones —
+        // `retain` keeps any signal a concurrent dispatch armed after the
+        // snapshot, so we never lose track of still-pending work.
+        let snapshot: Vec<Arc<AmdSignal>> = self.inflight.lock().iter().cloned().collect();
+        for sig in &snapshot {
+            sig.wait_done(30_000).inspect_err(|e| self.core.poison(&e.to_string()))?;
+        }
+        self.inflight.lock().retain(|s| !s.is_done());
+        Ok(())
+    }
+
+    /// Acquire a fresh native completion signal for one AQL dispatch. First
+    /// reclaims retired in-flight signals (FIFO — they return their pool slots
+    /// on drop), then takes a new slot. If the pool is momentarily exhausted,
+    /// blocks on the oldest in-flight dispatch: this is the back-pressure that
+    /// bounds how far the host can run ahead of the GPU (it replaces the old
+    /// timeline-headroom gate). The returned signal is armed to 1; the caller
+    /// places [`signal_handle`](AmdSignal::signal_handle) in the dispatch packet
+    /// and registers it via [`register_inflight`](Self::register_inflight).
+    pub fn acquire_signal(&self) -> Result<Arc<AmdSignal>> {
+        let pool = self
+            .core
+            .signal_pool()
+            .cloned()
+            .ok_or_else(|| Error::Runtime { message: "acquire_signal: signal pool not installed".into() })?;
+        loop {
+            // Reclaim any retired signals from the front (FIFO completion order).
+            {
+                let mut inflight = self.inflight.lock();
+                while inflight.front().is_some_and(|s| s.is_done()) {
+                    inflight.pop_front();
+                }
+            }
+            match pool.acquire() {
+                Ok(sig) => {
+                    sig.arm(1);
+                    return Ok(Arc::new(sig));
+                }
+                // Pool exhausted: block on the oldest in-flight dispatch, drop
+                // it, and retry. If nothing is in flight there is no slot to
+                // wait for, so surface the exhaustion error.
+                Err(e) => {
+                    let oldest = self.inflight.lock().front().cloned();
+                    match oldest {
+                        Some(sig) => {
+                            sig.wait_done(30_000).inspect_err(|e| self.core.poison(&e.to_string()))?;
+                            self.inflight.lock().pop_front();
+                        }
+                        None => return Err(e),
+                    }
+                }
+            }
+        }
+    }
+
+    /// Register a dispatched AQL completion signal as in-flight (FIFO). Kept
+    /// alive until it retires and a later acquire/synchronize reclaims it.
+    pub fn register_inflight(&self, sig: Arc<AmdSignal>) {
+        self.inflight.lock().push_back(sig);
     }
 
     /// Keep the timeline counter below 2^32 on the dispatch hot path.
@@ -257,12 +335,27 @@ impl AmdConnector {
             }
         };
         match swapped {
-            // Drain in-flight dispatches off the old scratch, then republish the
-            // AQL descriptor for the new buffer (idle queue → no torn read) and
-            // free the old backing. No-op republish on PM4 queues.
-            Some(old) => {
-                self.free_scratch(old.0, old.1, old.2);
+            // Ordering is load-bearing (see `set_aql_scratch`): drain the queue
+            // to idle, publish the NEW scratch descriptor (self-flushed to GART),
+            // and only THEN free the old backing. Publishing before the free means
+            // the live `amd_queue_t` never points at unmapped VRAM, so a stale
+            // descriptor read by the CP can't fault. Doing it the other way round
+            // (free then republish) intermittently wedges the queue. No-op
+            // republish on PM4 queues.
+            Some((old_va, old_size, old_handle)) => {
+                // Park-and-grow — the only safe ordering on a live multi-XCC queue.
+                // Drain to idle first so no dispatch is mid-flight or still reading
+                // the old scratch; publish the NEW descriptor (self-flushed to GART)
+                // so the live `amd_queue_t` never points at soon-to-be-unmapped
+                // VRAM; only THEN free the old backing. Skipping the drain (or
+                // freeing before republish) silently wedges the CP. Reaching this is
+                // rare now that scratch is pre-reserved; the robust path will resize
+                // within a stable buffer instead of reallocating (tracked separately).
+                if let Err(e) = self.synchronize() {
+                    tracing::warn!(?e, "scratch grow: drain failed; proceeding with republish");
+                }
                 self.queue.set_aql_scratch(&aql_desc);
+                self.core.iface().free_raw(old_va, old_size, old_handle);
             }
             // Lost the race — another dispatcher already grew scratch past our
             // target. Free the buffer we redundantly allocated.

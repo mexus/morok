@@ -38,6 +38,17 @@ impl AmdAllocator {
         Ok(Self { dev, device_id })
     }
 
+    /// The SDMA copy queue, required by the device-only copy arms. Present
+    /// whenever a device-local buffer exists (`_alloc` only drops `cpu_access`
+    /// once `has_sdma_queue` is true, which the factory sets after installing
+    /// the queue), so this `Err` is effectively unreachable in practice.
+    fn copy_queue(&self) -> Result<&Arc<crate::amd::queue::AmdCopyQueue>> {
+        self.dev
+            .core()
+            .copy_queue()
+            .ok_or(crate::error::Error::Unsupported { op: "device-only VRAM copy requires the SDMA copy queue" })
+    }
+
     /// Allocate GTT-pinned system memory with `COHERENT | UNCACHED | PUBLIC`
     /// flags — host-visible, uncached, suitable for queue rings, GART pages,
     /// and signal slots. The `uncached` branch sets **GTT**, not VRAM
@@ -63,7 +74,16 @@ impl Allocator for AmdAllocator {
         // only way to move data is the host `memmove` path, which needs a host
         // mapping: `cpu_access = options.cpu_access || !has_sdma_queue`.
         let cpu_access = options.cpu_access || !self.dev.has_sdma_queue();
-        do_alloc(&self.dev, size, AllocKind::DeviceVram { executable: true }, cpu_access, zero)
+        // The seam only zero-fills host-mapped buffers and now *rejects*
+        // `zero && !cpu_access`. So ask it to zero only when host-mapped; for a
+        // device-only buffer pass `zero=false` and SDMA-zero it ourselves below,
+        // keeping `zero=true` honored regardless of host visibility.
+        let seam_zero = zero && cpu_access;
+        let buf = do_alloc(&self.dev, size, AllocKind::DeviceVram { executable: true }, cpu_access, seam_zero)?;
+        if zero && let RawBuffer::AmdDevice { host_ptr: None, gpu_addr, size: bsize, .. } = &buf {
+            self.copy_queue()?.device_zero(*gpu_addr, *bsize)?;
+        }
+        Ok(buf)
     }
 
     fn _copyin(&self, dest: &RawBuffer, dest_off: usize, src: &[u8]) -> Result<()> {
@@ -79,14 +99,21 @@ impl Allocator for AmdAllocator {
                 // scheduler exclusivity. `dest_off + src.len()` is bounded by the caller.
                 let dst = unsafe { std::slice::from_raw_parts_mut(ptr.as_ptr().add(dest_off), src.len()) };
                 dst.copy_from_slice(src);
+                // Coherence: the next compute dispatch reading this VA does a full
+                // `acquire_mem` (L2 invalidate) in its prologue, so the host write
+                // is visible without extra bookkeeping here.
                 Ok(())
             }
-            RawBuffer::AmdDevice { host_ptr: None, .. } => {
-                // Unreachable without an SDMA queue: `_alloc` forces cpu_access
-                // (host_ptr: Some) when `has_sdma_queue` is false. A device-only
-                // VRAM buffer can only exist on SDMA-capable hardware, where the
-                // copy must go through the SDMA staging ring (not yet wired).
-                UnsupportedSnafu { op: "copyin to device-only VRAM (needs SDMA staging)" }.fail()
+            RawBuffer::AmdDevice { host_ptr: None, gpu_addr, .. } => {
+                // Device-local VRAM: drain in-flight kernels on the recycled VA,
+                // then stage host→device through the SDMA copy queue.
+                // PERF: `synchronize()` drains every connector timeline, not just
+                // this buffer's producer (RawBuffer has no last-writer timeline).
+                // Fine today — final outputs stay host-visible, so the hot readback
+                // avoids this arm. Scope to the producing timeline if device-only
+                // intermediate transfers ever become hot (see review finding #10).
+                self.dev.synchronize()?;
+                self.copy_queue()?.host_to_device(gpu_addr + dest_off as u64, src)
             }
             other => unreachable!("AmdAllocator::_copyin on non-AMD buffer: {other:?}"),
         }
@@ -102,10 +129,12 @@ impl Allocator for AmdAllocator {
                 dest.copy_from_slice(src_slice);
                 Ok(())
             }
-            RawBuffer::AmdDevice { host_ptr: None, .. } => {
-                // Unreachable without SDMA (see `_copyin`). Device-only VRAM
-                // copyout needs the SDMA staging ring.
-                UnsupportedSnafu { op: "copyout from device-only VRAM (needs SDMA staging)" }.fail()
+            RawBuffer::AmdDevice { host_ptr: None, gpu_addr, .. } => {
+                // Drain the producing kernels, then stage device→host through
+                // the SDMA copy queue (which host-waits each chunk before the
+                // memcpy out).
+                self.dev.synchronize()?;
+                self.copy_queue()?.device_to_host(dest, gpu_addr + src_off as u64)
             }
             other => unreachable!("AmdAllocator::_copyout on non-AMD buffer: {other:?}"),
         }
@@ -126,12 +155,15 @@ impl Allocator for AmdAllocator {
                 let dst = unsafe { std::slice::from_raw_parts_mut(dst_ptr.as_ptr().add(dest_off), sz) };
                 let src_slice = unsafe { std::slice::from_raw_parts(src_ptr.as_ptr().add(src_off), sz) };
                 dst.copy_from_slice(src_slice);
+                // Coherence handled by the consumer dispatch's full L2 acquire
+                // prologue (cf. `_copyin`).
                 Ok(())
             }
-            (RawBuffer::AmdDevice { .. }, RawBuffer::AmdDevice { .. }) => {
-                // Device-only VRAM on at least one side: needs SDMA staging
-                // (unreachable without an SDMA queue — `_alloc` forces cpu_access).
-                UnsupportedSnafu { op: "AMD↔AMD transfer of device-only VRAM (needs SDMA)" }.fail()
+            (RawBuffer::AmdDevice { gpu_addr: dst_gpu, .. }, RawBuffer::AmdDevice { gpu_addr: src_gpu, .. }) => {
+                // At least one side is device-only VRAM (no host mapping):
+                // direct device→device SDMA copy (both VAs always exist).
+                self.dev.synchronize()?;
+                self.copy_queue()?.device_to_device(dst_gpu + dest_off as u64, src_gpu + src_off as u64, sz)
             }
             _ => UnsupportedSnafu { op: "transfer" }.fail(),
         }
@@ -181,6 +213,15 @@ impl Allocator for AmdAllocator {
 
     fn device_spec(&self) -> DeviceSpec {
         DeviceSpec::Amd { device_id: self.device_id }
+    }
+
+    /// AMD keeps intermediates device-local: the SDMA copy queue provides the
+    /// host↔device and device→device copies the scheduler needs for buffers
+    /// allocated with `cpu_access: false`. Only meaningful once an SDMA queue is
+    /// installed (otherwise `_alloc` forces `cpu_access`), but the placement
+    /// decision is safe regardless — a host-mapped fallback still works.
+    fn supports_device_local(&self) -> bool {
+        true
     }
 }
 

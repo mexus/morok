@@ -344,12 +344,14 @@ impl ExecutionPlan {
     }
 
     fn build_graph(&self) -> Result<Option<Box<dyn svod_device::Graph>>> {
-        // Opt-in until replay is validated against the live AMD timeline/kernarg
-        // lifetime (NotPresent faults on freed intermediate VAs). Per-call is the
-        // safe default; SVOD_JIT_GRAPH=1 enables capture for benchmarking.
-        if std::env::var_os("SVOD_JIT_GRAPH").is_none() {
-            return Ok(None);
-        }
+        // Graph capture is on by default: an all-static compiled-kernel plan on a
+        // graphable device replays the whole chain as one native-AQL batch with a
+        // single doorbell, instead of the per-kernel build+doorbell round-trip.
+        // Validated against per-call across the tensor suite (incl. multi-kernel
+        // decompositions). Capture walks `op_levels` execution order, NOT the flat
+        // `op_order` topological sort (below). Non-graphable plans (runtime vars,
+        // non-AMD, PM4 single-XCC, mixed devices) fall back to per-call via the
+        // `Ok(None)` returns below.
         let all_static_kernels =
             self.ops.iter().all(|op| matches!(op, PreparedOp::CompiledProgram(k) if k.runtime_vars.is_empty()));
         if !all_static_kernels || self.ops.is_empty() {
@@ -359,17 +361,26 @@ impl ExecutionPlan {
             .device(&self.device, svod_device::registry::registry())
             .map_err(|e| crate::error::Error::Execution { reason: format!("device lookup: {e}") })?;
         let Some(factory) = dev.graph.clone() else { return Ok(None) };
-        let mut kernels = Vec::with_capacity(self.op_order.len());
-        for &idx in &self.op_order {
-            let PreparedOp::CompiledProgram(k) = &self.ops[idx] else { return Ok(None) };
-            let (global_size, local_size) = Self::kernel_launch_sizes(k)?;
-            kernels.push(svod_device::GraphKernel {
-                program: k.kernel.program.as_ref(),
-                buffers: k.buffer_ptrs.iter().map(|&p| p as *mut u8).collect(),
-                vals: k.vals.clone(),
-                global_size,
-                local_size,
-            });
+        // Capture in the SAME order `execute` runs the kernels — flatten
+        // `op_levels` (level-by-level, intra-level in index order), NOT the flat
+        // `op_order` topological sort. The two can differ, and a captured graph
+        // replays its packets in strict queue (FIFO) order; using `op_order`
+        // would dispatch a different sequence than the per-call path, corrupting
+        // results whenever a reused buffer's ordering relies on the level walk
+        // (e.g. multi-kernel decompositions like QR).
+        let mut kernels = Vec::with_capacity(self.ops.len());
+        for level in &self.op_levels {
+            for &idx in level {
+                let PreparedOp::CompiledProgram(k) = &self.ops[idx] else { return Ok(None) };
+                let (global_size, local_size) = Self::kernel_launch_sizes(k)?;
+                kernels.push(svod_device::GraphKernel {
+                    program: k.kernel.program.as_ref(),
+                    buffers: k.buffer_ptrs.iter().map(|&p| p as *mut u8).collect(),
+                    vals: k.vals.clone(),
+                    global_size,
+                    local_size,
+                });
+            }
         }
         factory(&kernels).map_err(|e| crate::error::Error::Execution { reason: format!("graph capture: {e}") })
     }

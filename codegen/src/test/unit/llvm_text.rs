@@ -361,6 +361,29 @@ fn amd_wmma_bf16_bf16_bitcasts_result() {
 }
 
 #[test]
+fn amd_wmma_bf16_k32_uses_native_bfloat_on_gfx950() {
+    // The CDNA4 (gfx950) K=32 `.bf16` double-rate MFMA takes native `<N x bfloat>`
+    // operands — passing them as `<N x i16>` fails LLVM's verifier outright
+    // (verified: `llc -mcpu=gfx950` accepts `<8 x bfloat>`, rejects `<8 x i16>`).
+    // So unlike the K=16 `bf16.1k` form, this path must NOT bitcast bf16 → i16.
+    let meta = wmma_meta((16, 16, 32), DType::BFloat16, DType::Float32, 4);
+    let sink = wmma_ssa_sink(DType::BFloat16, 8, DType::Float32, 4, meta);
+    let result = render_amd_linearized(&sink, AmdArch::Gfx950, "amd_wmma_bf16_k32");
+    println!("{}", result.code);
+    assert!(
+        result.code.contains("@llvm.amdgcn.mfma.f32.16x16x32.bf16(<8 x bfloat>, <8 x bfloat>, <4 x float>"),
+        "bf16-K32 MFMA must take native bfloat operands:\n{}",
+        result.code
+    );
+    assert!(
+        !result.code.contains("to <8 x i16>") && !result.code.contains("(<8 x i16>"),
+        "bf16-K32 operands must NOT be bitcast to i16:\n{}",
+        result.code
+    );
+    assert_llvm_ir_assembles(&result.code);
+}
+
+#[test]
 fn amd_wmma_fp8_packs_operands_to_i64() {
     // CDNA fp8: the 8 fp8 lanes pack into one i64 (tinygrad bitcasts fp8.vec(8)
     // → uint64). MFMA carries the trailing cbsz/abid/blgp immediates.
@@ -388,32 +411,48 @@ fn assert_llvm_ir_assembles(ir: &str) {
     use std::io::Write;
     use std::process::{Command, Stdio};
 
-    let tool = ["llvm-as", "llvm-as-19", "llvm-as-18", "llvm-as-17", "llvm-as-16"].into_iter().find(|t| {
-        Command::new(t)
-            .arg("--version")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
-    });
+    // Prefer the newest llvm-as available (versioned names first); a bare
+    // `llvm-as` on PATH is often an old system build.
+    let tool = ["llvm-as-20", "llvm-as-19", "llvm-as-18", "llvm-as-17", "llvm-as-16", "llvm-as-15", "llvm-as"]
+        .into_iter()
+        .find(|t| {
+            Command::new(t)
+                .arg("--version")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        });
     let Some(tool) = tool else {
         eprintln!("skipping llvm-as smoke test: no llvm-as on PATH");
         return;
     };
 
-    let mut child = Command::new(tool)
-        .args(["-o", "/dev/null", "-"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn llvm-as");
-    child.stdin.take().unwrap().write_all(ir.as_bytes()).expect("write IR to llvm-as");
-    let out = child.wait_with_output().expect("wait for llvm-as");
-    assert!(
-        out.status.success(),
-        "llvm-as rejected the emitted AMD IR:\n{ir}\n--- llvm-as stderr ---\n{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+    // Pipe `src` through `tool` and return its exit status + stderr.
+    let run = |src: &str| -> (bool, String) {
+        let mut child = Command::new(tool)
+            .args(["-o", "/dev/null", "-"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn llvm-as");
+        child.stdin.take().unwrap().write_all(src.as_bytes()).expect("write IR to llvm-as");
+        let out = child.wait_with_output().expect("wait for llvm-as");
+        (out.status.success(), String::from_utf8_lossy(&out.stderr).into_owned())
+    };
+
+    // Our IR uses opaque pointers (`ptr`), which LLVM defaults to from v15 on.
+    // A tool that can't parse them natively is LLVM ≤ 14 — which also predates
+    // the gfx94x/gfx950 MFMA + fp8-conversion intrinsics these tests exercise,
+    // so its verdict is unreliable. Skip rather than emit a false failure.
+    let probe = "define i32 @p(ptr %x) {\n  %v = load i32, ptr %x\n  ret i32 %v\n}\n";
+    if !run(probe).0 {
+        eprintln!("skipping llvm-as smoke test: {tool} is too old for opaque-pointer / gfx94x IR");
+        return;
+    }
+
+    let (ok, stderr) = run(ir);
+    assert!(ok, "llvm-as rejected the emitted AMD IR:\n{ir}\n--- llvm-as stderr ---\n{stderr}");
 }

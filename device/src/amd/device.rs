@@ -149,21 +149,25 @@ pub struct AmdDeviceCore {
     /// device because a memory fault corrupts the whole VM, not just one queue.
     poisoned: AtomicBool,
     error_msg: OnceLock<String>,
-    /// Registry of every connector's `Timeline` built against this core. Weak
-    /// so dropped connectors don't keep timelines alive. Used by
-    /// [`AmdDeviceCore::synchronize_all`] to drain ALL in-flight GPU work
-    /// before destructive host-visible operations
-    /// (`AmdAllocator::_copyin`/`_copyout`/`_free`). Holding `Weak<Timeline>`
-    /// (not `Weak<AmdConnector>`) means the drainer reads only the timeline
-    /// atomic + signal slot and NEVER touches a connector's queue — that
-    /// decoupling is what lets dispatch run lock-free.
-    pub(crate) timelines: parking_lot::Mutex<Vec<Weak<crate::amd::signal::Timeline>>>,
+    /// Registry of every connector built against this core. Weak so dropped
+    /// connectors don't stay alive. Used by [`AmdDeviceCore::synchronize_all`]
+    /// to drain ALL in-flight GPU work before destructive host-visible
+    /// operations (`AmdAllocator::_copyin`/`_copyout`/`_free`). The drain
+    /// (`AmdConnector::synchronize`) reads only signal slots — the monotonic
+    /// timeline and the per-op completion signals — and NEVER touches a
+    /// connector's queue, so a concurrent owner can keep dispatching.
+    pub(crate) connectors: parking_lot::Mutex<Vec<Weak<crate::amd::connector::AmdConnector>>>,
     /// Process-global signal pool, allocated once per physical device. Lazily
     /// installed by the device factory and shared across every `AmdConnector`
     /// (timeline signal acquired here at connector construction) — pool access
     /// is rare (slot alloc on connector build), and one pool covers many
     /// connectors at 4 KiB total VRAM.
     signal_pool: OnceLock<Arc<crate::amd::signal::SignalPool>>,
+    /// Process-global SDMA copy queue, installed by the factory once the signal
+    /// pool exists. Its presence is what flips `has_sdma_queue` true and so
+    /// enables device-local (non-host-visible) buffers; the allocator's
+    /// device-only copy arms route through it.
+    copy_queue: OnceLock<Arc<crate::amd::queue::AmdCopyQueue>>,
     /// How owners obtain a connector and whether dispatch is serialized. Built
     /// once at open from `SVOD_AMD_SINGLE_QUEUE`; see [`Dispatcher`]. Each mode
     /// owns only its own state — no cross-mode dead fields, and the mode is a
@@ -239,7 +243,7 @@ impl AmdDevice {
     /// - `Err(NoAmdGpu)` when there is no `/dev/kfd`, no GPU nodes in
     ///   topology, or `device_id` is out of range. Never panics.
     /// - `Err(AmdAllocFailed)` when the host has hardware we don't support
-    ///   (currently only RDNA3+CDNA per the Phase 0 `AmdArch` set).
+    ///   (hardware outside the supported `AmdArch` set).
     /// - `Err(AmdIoctl)` for KFD failures (permission denied, no event page).
     pub fn open(device_id: usize) -> Result<Arc<Self>> {
         // Fast path: device already opened by another caller (registry +
@@ -305,7 +309,8 @@ impl AmdDevice {
             has_sdma_queue: AtomicBool::new(false),
             poisoned: AtomicBool::new(false),
             error_msg: OnceLock::new(),
-            timelines: parking_lot::Mutex::new(Vec::new()),
+            copy_queue: OnceLock::new(),
+            connectors: parking_lot::Mutex::new(Vec::new()),
             signal_pool: OnceLock::new(),
             dispatcher,
         });
@@ -345,25 +350,25 @@ impl AmdDeviceCore {
             return Err(err);
         }
         // Snapshot strong refs to release the registry lock before the
-        // potentially multi-second waits, keeping each timeline alive across
+        // potentially multi-second waits, keeping each connector alive across
         // its drain so a concurrent connector drop can't pull the rug out.
-        let live: Vec<Arc<crate::amd::signal::Timeline>> =
-            self.timelines.lock().iter().filter_map(|w| w.upgrade()).collect();
-        // Drain every timeline; collect the first error but keep going so a
-        // single stuck connector doesn't strand buffer-frees on the others.
+        let live: Vec<Arc<crate::amd::connector::AmdConnector>> =
+            self.connectors.lock().iter().filter_map(|w| w.upgrade()).collect();
+        // Drain every connector (timeline + per-op signals); collect the first
+        // error but keep going so one stuck connector doesn't strand buffer-frees
+        // on the others.
         let mut first_err: Option<Error> = None;
-        for t in live {
-            if let Err(e) = t.drain(30_000) {
-                tracing::warn!(?e, "synchronize_all: timeline drain failed; continuing");
-                self.poison(&e.to_string());
+        for conn in live {
+            if let Err(e) = conn.synchronize() {
+                tracing::warn!(?e, "synchronize_all: connector drain failed; continuing");
                 if first_err.is_none() {
                     first_err = Some(e);
                 }
             }
         }
-        // Opportunistic GC of dropped timeline entries. The registry is touched
+        // Opportunistic GC of dropped connector entries. The registry is touched
         // here on every host read/free, so dead Weaks don't accumulate.
-        self.timelines.lock().retain(|w| w.strong_count() > 0);
+        self.connectors.lock().retain(|w| w.strong_count() > 0);
         match first_err {
             Some(e) => Err(e),
             None => Ok(()),
@@ -382,6 +387,19 @@ impl AmdDeviceCore {
     /// connector built against this core shares it.
     pub fn signal_pool(&self) -> Option<&Arc<crate::amd::signal::SignalPool>> {
         self.signal_pool.get()
+    }
+
+    /// Borrow the process-global SDMA copy queue. `None` until the factory
+    /// installs it (and thus `has_sdma_queue` is false). The allocator's
+    /// device-only copy arms require it.
+    pub fn copy_queue(&self) -> Option<&Arc<crate::amd::queue::AmdCopyQueue>> {
+        self.copy_queue.get()
+    }
+
+    /// Install the SDMA copy queue (factory, once). Idempotent: a second call
+    /// is dropped. Caller flips `has_sdma_queue` after this succeeds.
+    pub fn install_copy_queue(&self, queue: Arc<crate::amd::queue::AmdCopyQueue>) {
+        let _ = self.copy_queue.set(queue);
     }
 
     /// Whether dispatch is serialized onto one shared connector (single-queue
@@ -666,11 +684,19 @@ pub(crate) fn alloc_scratch(
     let cu_cnt = ((node.simd_count.max(1) / simd_per_cu) / xccs).max(1);
     let max_slots = node.max_slots_scratch_cu.max(1);
     let se_cnt = (node.array_count.max(1) / node.simd_arrays_per_engine.max(1) / xccs).max(1);
+    // ROCr sizes scratch for `AlignUp(cu_count, shader_engines) * MaxSlotsScratchCU`
+    // slots PER XCC (amd_aql_queue.cpp `calc_device_slots`), NOT raw `cu_count`.
+    // The CP rounds its per-dispatch occupancy demand up to the shader-engine
+    // boundary; sizing from raw `cu_cnt` under-provisions on a harvested 8-XCC
+    // part, so a high-occupancy dispatch traps with an insufficient-scratch
+    // exception (0x401) and the CP HALTS the queue waiting on `queue_inactive_
+    // signal` — which we never service, so it hangs forever with no fault.
+    let cu_slots = cu_cnt.next_multiple_of(se_cnt);
 
     // Round up to the per-lane alignment stride.
     let size_per_thread = private_segment_size.max(1).next_multiple_of(mem_alignment_size / LANES_PER_WAVE);
     let size_per_xcc =
-        (size_per_thread as usize) * (LANES_PER_WAVE as usize) * (max_slots as usize) * (cu_cnt as usize);
+        (size_per_thread as usize) * (LANES_PER_WAVE as usize) * (max_slots as usize) * (cu_slots as usize);
     let total = (size_per_xcc * xccs as usize).next_multiple_of(PAGE);
 
     // KFD alloc as plain VRAM (GPU-only; no host access needed — the GPU writes
@@ -689,10 +715,13 @@ pub(crate) fn alloc_scratch(
 
     // gfx9 divides scratch evenly across SEs (1); gfx11/12 divide by se_cnt.
     let wave_scratch = (LANES_PER_WAVE * size_per_thread).div_ceil(mem_alignment_size);
-    let max_scratch_waves = cu_cnt * max_slots * xccs;
+    let max_scratch_waves = cu_slots * max_slots * xccs;
     let se_div = if arch.is_cdna() { 1 } else { se_cnt };
     let num_waves = ((size_per_xcc as u32) / (wave_scratch * mem_alignment_size)) / se_div;
-    let waves = num_waves.min(max_scratch_waves);
+    // COMPUTE_TMPRING_SIZE.WAVES must be a multiple of the per-XCC shader-engine
+    // count (amd_aql_queue.cpp asserts `WAVES % (banks/xcc) == 0`); round down to
+    // that boundary (≥ one engine's worth) so the CP accepts the wave count.
+    let waves = (num_waves.min(max_scratch_waves) / se_cnt).max(1) * se_cnt;
     let tmpring_size = pack_tmpring(waves, wave_scratch, arch);
 
     // The AQL descriptor is only consumed on multi-XCC CDNA; non-CDNA arches

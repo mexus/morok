@@ -1,6 +1,6 @@
 //! `AmdProgram`: load an AMDGPU code object + dispatch it via AQL.
 //!
-//! Construction parses the ELF returned by Phase 2's `compile_ir_to_amd_object`
+//! Construction parses the ELF returned by `compile_ir_to_amd_object`
 //! and resolves the kernel descriptor (symbol `<name>.kd`). Execution claims
 //! a kernarg slot from the device arena, fills it with buffer GVAs + scalar
 //! vals, builds an AQL dispatch packet, and waits on the device timeline
@@ -247,7 +247,7 @@ pub struct AmdProgram {
     /// loaded code object. Used by the AQL kernel-dispatch packet only.
     aql_prog_addr: u64,
     /// PM4 shader entry point: `code_gpu + kd_offset + kernel_code_entry_byte_offset`.
-    /// Used by `AmdComputeQueue::exec_pm4` (the COMPUTE_PGM_LO/HI register
+    /// Used by `build_exec_pm4` (the COMPUTE_PGM_LO/HI register
     /// pair carries `prog_addr >> 8`).
     pm4_prog_addr: u64,
     /// COMPUTE_PGM_RSRC1/2/3 values for the PM4 path, derived from the
@@ -345,9 +345,17 @@ impl AmdProgram {
         // point — `dispatch_ptr` etc. require allocating an HSA dispatch
         // packet alongside kernargs, which isn't wired up yet. Fail fast at
         // load if the kernel needs one of the unsupported bits.
-        use crate::amd::sys::hsa::{ENABLE_SGPR_DISPATCH_PTR, ENABLE_SGPR_PRIVATE_SEGMENT_BUFFER};
-        let enable_private_segment_sgpr = (props & ENABLE_SGPR_PRIVATE_SEGMENT_BUFFER) != 0;
-        let enable_dispatch_ptr = (props & ENABLE_SGPR_DISPATCH_PTR) != 0;
+        use crate::amd::sys::hsa::{
+            amd_kernel_code_properties_t_AMD_KERNEL_CODE_PROPERTIES_ENABLE_SGPR_DISPATCH_PTR,
+            amd_kernel_code_properties_t_AMD_KERNEL_CODE_PROPERTIES_ENABLE_SGPR_PRIVATE_SEGMENT_BUFFER,
+        };
+        // `props` is the descriptor's u16 field; the generated constants are
+        // `amd_kernel_code_properties_t` (c_int), narrowed here.
+        let enable_private_segment_sgpr = (props
+            & amd_kernel_code_properties_t_AMD_KERNEL_CODE_PROPERTIES_ENABLE_SGPR_PRIVATE_SEGMENT_BUFFER as u16)
+            != 0;
+        let enable_dispatch_ptr =
+            (props & amd_kernel_code_properties_t_AMD_KERNEL_CODE_PROPERTIES_ENABLE_SGPR_DISPATCH_PTR as u16) != 0;
         if enable_dispatch_ptr {
             return Err(Error::Runtime {
                 message: format!(
@@ -484,6 +492,19 @@ impl AmdProgram {
         self.pm4_prog_addr
     }
 
+    /// AQL `kernel_object` — GPU VA of the kernel descriptor the AQL packet
+    /// processor reads (the dispatch packet's `kernel_object` field).
+    pub fn aql_prog_addr(&self) -> u64 {
+        self.aql_prog_addr
+    }
+
+    /// Required group (LDS) segment size in bytes, from the kernel descriptor
+    /// (`kd.group_segment_fixed_size`) — the dispatch packet's
+    /// `group_segment_size` field.
+    pub fn group_segment_size(&self) -> u32 {
+        self.kd.group_segment_fixed_size
+    }
+
     /// `(wave32, target_major)` — drive the `cs_w32_en` DISPATCH_INITIATOR bit.
     pub fn wave32_target(&self) -> (bool, u32) {
         (self.wave32, self.target_major)
@@ -508,25 +529,16 @@ impl AmdProgram {
         self.kd.private_segment_fixed_size
     }
 
-    /// Fill one kernarg slot for graph capture: writes the buffer VAs then
-    /// scalar vals into the caller-provided slot at `(slot_host, slot_gpu)`
-    /// and returns the [`AmdArgsState`] the graph's `AmdHwQueue::exec` binds.
-    ///
-    /// `bufs[pos]` is a concrete VA (`Ok`) or a [`Sym`] for a JIT input (`Err`)
-    /// — symbolic inputs are recorded so they get re-patched per replay. The
-    /// per-call `execute` path uses no kernarg page indirection, so this is the
-    /// graph-only entry point.
+    /// Bake one kernarg slot for graph capture: writes the buffer GPU VAs
+    /// (8 bytes each) then scalar vals (`i32`, 4 bytes each) into `slot_host`,
+    /// matching the renderer's `(ptr.., i32..)` layout — identical to the
+    /// per-call path in `execute_on`. The captured chain is static, so the
+    /// values are baked once; the graph owns the page for its lifetime.
     ///
     /// # Safety
     /// `slot_host` must point at a writable region of at least
     /// `kernarg_record_size()` bytes that the caller owns for the graph's life.
-    pub unsafe fn fill_kernargs(
-        &self,
-        slot_host: *mut u8,
-        slot_gpu: u64,
-        bufs: &[std::result::Result<u64, crate::amd::hw_queue::Sym>],
-        vals: &[i64],
-    ) -> Result<crate::amd::hw_queue::AmdArgsState> {
+    pub unsafe fn write_kernargs(&self, slot_host: *mut u8, bufs: &[u64], vals: &[i64]) -> Result<()> {
         let needed = bufs.len() * 8 + vals.len() * 4;
         if needed > self.kernarg_size() {
             return Err(Error::Runtime {
@@ -537,9 +549,19 @@ impl AmdProgram {
                 ),
             });
         }
-        // SAFETY: caller guarantees slot_host owns >= kernarg_size() bytes and
-        // `needed <= kernarg_size()`.
-        Ok(unsafe { crate::amd::hw_queue::AmdArgsState::new(slot_host, slot_gpu, bufs, vals) })
+        let mut cursor = 0usize;
+        // SAFETY: cursor stays within `needed <= kernarg_size() <= slot size`.
+        unsafe {
+            for b in bufs {
+                std::ptr::copy_nonoverlapping(b.to_le_bytes().as_ptr(), slot_host.add(cursor), 8);
+                cursor += 8;
+            }
+            for v in vals {
+                std::ptr::copy_nonoverlapping((*v as i32).to_le_bytes().as_ptr(), slot_host.add(cursor), 4);
+                cursor += 4;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -672,8 +694,10 @@ impl AmdProgram {
         user_data.push((kernarg_gpu >> 32) as u32);
 
         let queue = conn.queue();
-        let signalled = if queue.is_pm4() {
-            queue.dispatch_pm4(
+        if queue.is_pm4() {
+            // PM4 single-XCC path: completion via the connector's monotonic
+            // timeline (RELEASE_MEM), drained by `synchronize`.
+            let _signalled = queue.dispatch_pm4(
                 conn,
                 self.rsrc1,
                 self.rsrc2,
@@ -685,10 +709,19 @@ impl AmdProgram {
                 [g[0] as u32, g[1] as u32, g[2] as u32],
                 self.wave32,
                 self.target_major,
-            )?
+            )?;
+            if wait {
+                conn.synchronize()?;
+            }
         } else {
+            // AQL path: completion via the kernel packet's own native
+            // `completion_signal` (the packet processor decrements the countdown
+            // signal on retirement). The dispatch-header BARRIER bit serialises
+            // execution against the prior packet, and its system-scope
+            // acquire/release fences provide coherence on the in-order queue.
             let priv_seg = self.kd.private_segment_fixed_size;
             let group_seg = self.kd.group_segment_fixed_size;
+            let sig = conn.acquire_signal()?;
             let packet = build_dispatch_packet(
                 [l[0] as u16, l[1] as u16, l[2] as u16],
                 [(g[0] * l[0]) as u32, (g[1] * l[1]) as u32, (g[2] * l[2]) as u32],
@@ -696,14 +729,25 @@ impl AmdProgram {
                 group_seg,
                 self.aql_prog_addr,
                 kernarg_gpu,
-                /*completion_signal=*/ 0,
+                /*completion_signal=*/ sig.signal_handle(),
             );
-            queue.dispatch_aql(conn, &packet)?
-        };
-
-        if wait {
-            let _ = signalled;
-            conn.synchronize()?;
+            queue.dispatch_aql_native(&packet)?;
+            conn.register_inflight(Arc::clone(&sig));
+            if wait && let Err(e) = sig.wait_done(30_000) {
+                // If the CP halted the queue on an exception (e.g. 0x401
+                // insufficient-scratch), surface that code instead of a blind
+                // timeout.
+                if let Some(code) = queue.inactive_exception() {
+                    return Err(Error::Runtime {
+                        message: format!(
+                            "AQL dispatch '{}' did not complete: queue halted with \
+                             exception {code:#x}",
+                            self.name
+                        ),
+                    });
+                }
+                return Err(e);
+            }
         }
         Ok(())
     }
@@ -730,7 +774,16 @@ impl Program for AmdProgram {
         let alloc = crate::amd::AmdAllocator::new(self.device_id)?;
         let lease = self.dev.core().lease_connector(&alloc)?;
         lease.ensure_has_local_memory(self.kd.private_segment_fixed_size)?;
-        unsafe { self.execute_on(&lease, buffers, vals, global_size, local_size, wait) }
+        // Dispatch and (when waiting) drain through the poisoning `synchronize`,
+        // exactly like the plan/graph paths. A faulting/hung candidate latches the
+        // device error (`poison`) and BEAM fast-fails the remaining candidates
+        // rather than hanging 30s — or worse, wedging — per candidate. A KFD queue
+        // can't be recovered once faulted; the search stays useful by *avoiding*
+        // faults (resource caps in the action filter). Recovery would require a
+        // queue teardown+recreate (the AM `setup_ring` reset has no KFD equivalent),
+        // so we don't fake it with a signal gap-fill.
+        unsafe { self.execute_on(&lease, buffers, vals, global_size, local_size, wait)? };
+        Ok(())
         // `lease` drops here → connector returns to the pool.
     }
 

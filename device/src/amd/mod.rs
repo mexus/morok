@@ -26,8 +26,6 @@ pub mod device;
 #[cfg(target_os = "linux")]
 pub mod graph;
 #[cfg(target_os = "linux")]
-pub mod hw_queue;
-#[cfg(target_os = "linux")]
 pub mod iface;
 #[cfg(target_os = "linux")]
 pub mod kernarg;
@@ -48,8 +46,6 @@ pub use connector::{AmdConnector, ConnectorLease};
 pub use device::{AmdDevice, AmdDeviceCore};
 #[cfg(target_os = "linux")]
 pub use graph::AmdGraph;
-#[cfg(target_os = "linux")]
-pub use hw_queue::{AmdArgsState, AmdHwQueue, Fmt, Sym, VarVals};
 #[cfg(target_os = "linux")]
 pub use iface::{AllocKind, AllocResult, AmdIface, KfdIface, QueueHandle, RingDesc};
 #[cfg(target_os = "linux")]

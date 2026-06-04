@@ -92,6 +92,13 @@ pub struct ChunkerOpts {
     /// caller's responsibility — boundaries can shift by up to
     /// `align_to - 1` samples.
     pub align_to: usize,
+    /// True total sample count of the source waveform, when known. The prob
+    /// grid rounds up past the real audio (the final VAD window is zero-padded),
+    /// so `probs_len * samples_per_prob` overshoots the waveform end. Set this to
+    /// `waveform.len()` to clamp every chunk's end to the real audio at the
+    /// source; `None` (default) falls back to the prob-grid bound, so callers
+    /// that don't set it must clamp downstream.
+    pub max_total_samples: Option<usize>,
 }
 
 impl Default for ChunkerOpts {
@@ -110,6 +117,7 @@ impl Default for ChunkerOpts {
             trough_threshold: None,
             pad_samples: 0,
             align_to: 1,
+            max_total_samples: None,
         }
     }
 }
@@ -355,7 +363,10 @@ fn pack_segments(
 /// never overlap their neighbours' speech. Alignment-induced overlap
 /// (floor-start / ceil-end rounding) is clipped to preserve splits.
 fn post_process(chunks: &[(usize, usize)], probs_len: usize, opts: &ChunkerOpts) -> Vec<AudioChunk> {
-    let max_sample = probs_len * opts.samples_per_prob;
+    // The prob grid overshoots the real audio (final window zero-padded). Clamp
+    // to the true waveform length when the caller provided it.
+    let grid = probs_len * opts.samples_per_prob;
+    let max_sample = opts.max_total_samples.unwrap_or(grid).min(grid);
     let pad = opts.pad_samples;
     let align = opts.align_to;
 

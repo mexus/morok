@@ -3597,6 +3597,7 @@ dependencies = [
  "svod-tensor",
  "tempfile",
  "test-case",
+ "tracing",
  "tracing-subscriber",
  "zip 0.6.6",
 ]

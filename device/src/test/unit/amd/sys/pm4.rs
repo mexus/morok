@@ -50,6 +50,20 @@ fn acquire_mem_gfx9_shape() {
 }
 
 #[test]
+fn acquire_mem_gfx9_narrow_skips_l2() {
+    let full = acquire_mem_gfx9()[1];
+    let narrow = acquire_mem_gfx9_narrow()[1];
+    // Narrow keeps the per-CU caches (I-cache, K-cache, vector TCL1)…
+    assert_ne!(narrow & COHER_SH_ICACHE_ACTION_ENA, 0);
+    assert_ne!(narrow & COHER_SH_KCACHE_ACTION_ENA, 0);
+    assert_ne!(narrow & COHER_TCL1_ACTION_ENA, 0);
+    // …but drops the L2 (TC) invalidate + write-back that the EOP release does.
+    assert_eq!(narrow & COHER_TC_ACTION_ENA, 0);
+    assert_eq!(narrow & COHER_TC_WB_ACTION_ENA, 0);
+    assert_ne!(full & COHER_TC_ACTION_ENA, 0, "full acquire must still invalidate L2");
+}
+
+#[test]
 fn pred_exec_shape() {
     let pkt = pred_exec(0b1, 8);
     assert_eq!(pkt[0], packet3(PACKET3_PRED_EXEC, 0));

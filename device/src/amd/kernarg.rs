@@ -17,7 +17,7 @@ use std::sync::{Arc, Weak};
 
 use parking_lot::Mutex;
 
-use crate::allocator::{Allocator, BufferSpec, RawBuffer};
+use crate::allocator::RawBuffer;
 use crate::amd::AmdAllocator;
 use crate::amd::device::AmdDeviceCore;
 use crate::error::{Error, Result};
@@ -56,8 +56,15 @@ impl Drop for KernargArena {
 
 impl KernargArena {
     pub fn new(allocator: &AmdAllocator, core: &Arc<AmdDeviceCore>) -> Result<Box<Self>> {
-        let opts = BufferSpec { cpu_access: true, uncached: true, nolru: true, ..Default::default() };
-        let buffer = allocator.alloc(ARENA_BYTES, &opts, /*zero=*/ true)?;
+        // Allocate as COHERENT|UNCACHED GTT (the ring/GART/signal mapping), NOT
+        // via `alloc()` — `AmdAllocator::_alloc` ignores `BufferSpec::uncached`
+        // and would place the arena in write-combining VRAM. Kernargs are written
+        // by the host every dispatch and read by the CP; on a WC mapping the
+        // doorbell path (a no-op `Release` fence on x86, not an `sfence`) does not
+        // drain the WC buffer, so the CP can fetch a STALE kernarg — a wrong/freed
+        // buffer pointer — and wedge with no fault event. UncachedGtt is coherent,
+        // so the write is visible without a WC flush.
+        let buffer = allocator.alloc_uncached(ARENA_BYTES)?;
         let (base_gpu, base_host) = match &buffer {
             RawBuffer::AmdDevice { gpu_addr, host_ptr: Some(h), .. } => (*gpu_addr, *h),
             _ => return Err(Error::AmdAllocFailed { reason: "kernarg arena requires host-visible buffer".into() }),

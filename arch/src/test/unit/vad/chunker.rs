@@ -20,6 +20,7 @@ fn fast_opts() -> ChunkerOpts {
         trough_threshold: None,
         pad_samples: 0,
         align_to: 1,
+        max_total_samples: None,
     }
 }
 
@@ -163,6 +164,7 @@ fn test_chunker_align_to_640() {
         trough_threshold: None,
         pad_samples: 0,
         align_to: 640,
+        max_total_samples: None,
     };
     let chunks = chunks_from_probs(&probs, &opts).unwrap();
     assert_eq!(chunks, vec![AudioChunk { start_sample: 1280, end_sample: 3840 }]);
@@ -198,6 +200,7 @@ fn test_chunker_end_sample_can_exceed_waveform_len() {
         trough_threshold: None,
         pad_samples: 0,
         align_to: 640, // GigaAM: hop_length * subsampling_factor
+        max_total_samples: None,
     };
     let chunks = chunks_from_probs(&probs, &opts).unwrap();
     assert_eq!(chunks, vec![AudioChunk { start_sample: 0, end_sample: 2048 }]);
@@ -297,6 +300,7 @@ proptest! {
         trough_threshold: None,
             pad_samples,
             align_to,
+            max_total_samples: None,
         };
         let chunks = chunks_from_probs(&probs, &opts).unwrap();
         let max_sample = probs.len() * samples_per_prob;
@@ -361,6 +365,7 @@ proptest! {
         trough_threshold: None,
             pad_samples: 0,
             align_to: 1,
+            max_total_samples: None,
         };
         let chunks = chunks_from_probs(&probs, &opts).unwrap();
         let probs_per_sec = sample_rate as f32 / samples_per_prob as f32;
@@ -408,6 +413,7 @@ proptest! {
         trough_threshold: None,
             pad_samples: 0,
             align_to: 1,
+            max_total_samples: None,
         };
         let chunks = chunks_from_probs(&probs, &opts).unwrap();
         for (i, &p) in probs.iter().enumerate() {
@@ -465,6 +471,7 @@ fn test_chunker_split_long_runs_respects_min_piece_floor() {
         trough_threshold: None,
         pad_samples: 0,
         align_to: 1,
+        max_total_samples: None,
     };
     let chunks = chunks_from_probs(&probs, &opts).unwrap();
     assert!(!chunks.is_empty());
@@ -495,6 +502,7 @@ fn test_chunker_decoupled_trough_search_radius() {
         trough_threshold: None,
         pad_samples: 0,
         align_to: 1,
+        max_total_samples: None,
     };
     let chunks = chunks_from_probs(&probs, &opts).unwrap();
     assert_eq!(

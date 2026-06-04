@@ -147,7 +147,7 @@ pub const HDP_FLUSH_DONE_ADDR: u32 = 0xD20 + 263;
 
 // ── PACKET3 opcodes & constants (PM4 dispatch path, single-XCC) ──────────
 //
-// These constants drive the raw-PM4 `AmdComputeQueue::exec_pm4` path used
+// These constants drive the raw-PM4 `AmdComputeQueue::dispatch_pm4` path used
 // when `xccs == 1` (the gfx11/gfx12 default).
 
 pub const PACKET3_DISPATCH_DIRECT: u32 = 0x15;
@@ -279,7 +279,7 @@ pub const GCR_FLAGS_NO_GLI_GL2: u32 = GCR_GLM_WB | GCR_GLM_INV | GCR_GLK_WB | GC
 /// issues this after a WAIT_REG_MEM on the HDP-flush register. `cache_flags`
 /// selects which cache levels to invalidate/write-back — use
 /// [`GCR_FLAGS_ALL`] for the `memory_barrier` site and
-/// [`GCR_FLAGS_NO_GLI_GL2`] for the pre-dispatch site in `exec_pm4`
+/// [`GCR_FLAGS_NO_GLI_GL2`] for the pre-dispatch site in `build_exec_pm4`
 /// (`acquire_mem(gli=0, gl2=0)`).
 ///
 /// Layout (8 dwords total):
@@ -321,6 +321,20 @@ pub fn acquire_mem_gfx9() -> [u32; 7] {
         | COHER_TC_ACTION_ENA
         | COHER_TCL1_ACTION_ENA
         | COHER_TC_WB_ACTION_ENA;
+    [packet3(PACKET3_ACQUIRE_MEM, 5), cp_coher_cntl, 0xFFFF_FFFF, 0xFFFF_FFFF, 0, 0, 0x0000_000A]
+}
+
+/// gfx9 ACQUIRE_MEM, **narrowed**: invalidate the per-CU caches (I-cache,
+/// K-cache, vector TCL1) but **skip the L2 (TC) invalidate + write-back** —
+/// the per-exec `acquire_mem(gli=0, gl2=0)` form.
+///
+/// Safe as a per-dispatch prologue because the previous dispatch's
+/// `release_mem(cache_flush=true)` already flushed+invalidated L2 at end-of-pipe
+/// (`CACHE_FLUSH_AND_INV_TS`), so L2 is clean at the next dispatch's start — the
+/// full L2 invalidate here would be pure redundant stall. (The HDP flush still
+/// runs separately, so host writes remain visible.)
+pub fn acquire_mem_gfx9_narrow() -> [u32; 7] {
+    let cp_coher_cntl = COHER_SH_ICACHE_ACTION_ENA | COHER_SH_KCACHE_ACTION_ENA | COHER_TCL1_ACTION_ENA;
     [packet3(PACKET3_ACQUIRE_MEM, 5), cp_coher_cntl, 0xFFFF_FFFF, 0xFFFF_FFFF, 0, 0, 0x0000_000A]
 }
 

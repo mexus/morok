@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use svod_codegen::llvm::LlvmTextRenderer;
 use svod_device::Result;
-use svod_device::amd::{AmdAllocator, AmdGraph, AmdProgram, SignalPool};
+use svod_device::amd::{AmdAllocator, AmdCopyQueue, AmdGraph, AmdProgram, SignalPool};
 use svod_device::device::{
     CompiledSpec, Compiler, Device, Graph, GraphFactory, GraphKernel, Program, ProgramSpec, Renderer, RuntimeFactory,
 };
@@ -41,6 +41,20 @@ pub fn create_amd_device(registry: &DeviceRegistry, device_id: usize, arch: AmdA
     // Seed the pool onto the device core so `AmdConnector::new_with_resources`
     // can acquire its timeline signal.
     device_handle.core().install_signal_pool(signal_pool);
+    // Bring up the SDMA copy queue so host↔device staging works — this is what
+    // lets buffers be device-local (non-host-visible). A creation failure
+    // cleanly leaves has_sdma_queue=false, so buffers stay host-visible and use
+    // the memmove copy path (today's behaviour). Must run before any _alloc,
+    // which reads has_sdma_queue to decide cpu_access.
+    match AmdCopyQueue::create(&amd_alloc) {
+        Ok(copy_queue) => {
+            device_handle.core().install_copy_queue(copy_queue);
+            device_handle.core().set_has_sdma_queue(true);
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "SDMA copy queue unavailable; AMD buffers stay host-visible");
+        }
+    }
     // No default connector: every dispatcher leases/owns its own connector
     // (`Program::execute` leases per call; plans/graphs hold one for their
     // lifetime). The pool starts empty and warms on first lease.

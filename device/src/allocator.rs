@@ -224,13 +224,11 @@ pub struct BufferSpec {
     /// Never cache this buffer in the LRU pool: free goes straight to teardown.
     /// For lifetime-bound buffers (code object, scratch, queue/signal infra).
     pub nolru: bool,
-    /// Wraps a pre-existing pointer; bypasses LRU + ownership accounting.
-    pub external_ptr: Option<usize>,
 }
 
 impl Default for BufferSpec {
     fn default() -> Self {
-        Self { uncached: false, cpu_access: true, host: false, nolru: false, external_ptr: None }
+        Self { uncached: false, cpu_access: true, host: false, nolru: false }
     }
 }
 
@@ -305,6 +303,15 @@ pub trait Allocator: Send + Sync + std::fmt::Debug {
 
     /// Get the device specification for this allocator.
     fn device_spec(&self) -> svod_dtype::DeviceSpec;
+
+    /// Whether this allocator can keep intermediate buffers device-local (no
+    /// host mapping), so the scheduler should allocate non-output intermediates
+    /// with `cpu_access: false`. Defaults to `false` (host-visible everywhere);
+    /// backends with a device→device + host↔device copy path (e.g. AMD via the
+    /// SDMA copy queue) override it. Decorators forward to their inner allocator.
+    fn supports_device_local(&self) -> bool {
+        false
+    }
 }
 
 /// CPU allocator using system memory.
@@ -556,7 +563,7 @@ impl Allocator for CudaAllocator {
 /// - `free` recycles into the pool *without synchronizing* — the
 ///   timeline-drain-before-teardown lives in the backend `_free` (e.g.
 ///   `AmdAllocator::_free`), reached only on real release (overflow, `nolru`,
-///   `external_ptr`, or `free_cache`);
+///   or `free_cache`);
 /// - on allocation failure `free_cache` releases every pooled buffer through
 ///   the backend `_free` and the alloc is retried.
 ///
@@ -655,8 +662,8 @@ impl LruAllocator {
 
 impl Allocator for LruAllocator {
     fn alloc(&self, size: usize, options: &BufferSpec, zero: bool) -> Result<RawBuffer> {
-        // nolru / external_ptr never pool: deterministic free.
-        if options.nolru || options.external_ptr.is_some() {
+        // nolru never pools: deterministic free.
+        if options.nolru {
             return self.inner.alloc(size, options, zero);
         }
         let key = (size, *options);
@@ -698,8 +705,8 @@ impl Allocator for LruAllocator {
     }
 
     fn free(&self, buffer: RawBuffer, size: usize, options: &BufferSpec) {
-        // nolru / external_ptr bypass the pool — real free now.
-        if options.nolru || options.external_ptr.is_some() {
+        // nolru bypasses the pool — real free now.
+        if options.nolru {
             self.inner.free(buffer, size, options);
             return;
         }
@@ -760,5 +767,9 @@ impl Allocator for LruAllocator {
 
     fn device_spec(&self) -> svod_dtype::DeviceSpec {
         self.inner.device_spec()
+    }
+
+    fn supports_device_local(&self) -> bool {
+        self.inner.supports_device_local()
     }
 }

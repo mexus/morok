@@ -393,11 +393,27 @@ fn do_expand(uop: &Arc<UOp>) -> Option<Arc<UOp>> {
         return None;
     }
 
-    // Collect exclude_args for WMMA: all upcast axis IDs + reduce axis IDs.
-    // These axes are TC-internal and must not participate in expansion.
-    let exclude_args: Vec<usize> = if let Op::Wmma { metadata, .. } = op {
+    // Collect exclude_args for WMMA: the TC-internal tile-upcast axis IDs only —
+    // exactly `flatten(tc_upcast_axes)`, with the reduce axes left empty. The
+    // K-reduce axes live inside the operand CONTRACTs, not as WMMA UNROLL inputs,
+    // so they must NOT be added here:
+    // doing so can also exclude a later output-upcast axis that reuses the id,
+    // collapsing its tiles into a broadcast.
+    let exclude_args: Vec<usize> = if let Op::Wmma { metadata, a, b, .. } = op {
+        // The per-output-tile expansion relies on the operand CONTRACTs being
+        // hash-distinct from the raw operand subtrees — i.e. carrying
+        // TAG_TC_FINAL (applied in optimizer/tc.rs). Now that reduce axes are no
+        // longer in `exclude_args`, that tag is the only thing stopping a
+        // reduce-axis id that aliases an output-upcast id from collapsing the
+        // tiles to a broadcast. Trip in debug if a future TC-build path forgets
+        // it (release builds strip this).
+        debug_assert!(
+            a.tag().as_ref().is_some_and(|t| t.contains(&crate::devectorize::TAG_TC_FINAL))
+                && b.tag().as_ref().is_some_and(|t| t.contains(&crate::devectorize::TAG_TC_FINAL)),
+            "WMMA operand CONTRACTs must carry TAG_TC_FINAL (see optimizer/tc.rs); \
+             without it the output tiles collapse to a broadcast of one WMMA result",
+        );
         let mut ids = metadata.upcast_axes.all_axis_ids();
-        ids.extend(metadata.reduce_axes.iter());
         ids.sort_unstable();
         ids.dedup();
         ids
@@ -587,10 +603,12 @@ pub(crate) fn fix_reduce_unroll(reduce: &Arc<UOp>) -> Option<Arc<UOp>> {
         .flatten()
         .collect();
 
-    // Wrap source in CONTRACT if axes exist
+    // Wrap source in CONTRACT if axes exist. Tag it finalized (see
+    // `TAG_TC_FINAL`) so the expander keeps the per-tile structure distinct.
     let contracted_src = if !contract_axes.is_empty() {
         let total: usize = contract_axes.iter().map(|(_, sz)| sz).product();
         UOp::new(Op::Contract { src: src.clone(), upcast_ranges: contract_axes }, reduce.dtype().vec(total))
+            .with_tag(smallvec::smallvec![crate::devectorize::TAG_TC_FINAL])
     } else {
         src.clone()
     };
@@ -641,8 +659,8 @@ fn fix_store_unroll(store: &Arc<UOp>) -> Option<Arc<UOp>> {
             // Create new STORE with only non-UNROLL ranges
             let new_store = index.store_with_ranges(value.clone(), store_range.into_iter().cloned().collect());
 
-            // Wrap in CONTRACT with void dtype (matching Tinygrad)
-            Some(new_store.contract(contract_axes))
+            // Wrap in CONTRACT with void dtype, tagged finalized (see `TAG_TC_FINAL`).
+            Some(new_store.contract(contract_axes).with_tag(smallvec::smallvec![crate::devectorize::TAG_TC_FINAL]))
         }
         _ => None,
     }

@@ -406,11 +406,14 @@ pub fn apply_post_optimization_with_renderer(ast: Arc<svod_ir::UOp>, renderer: O
     let fp8_pm = pm_float_decomp();
     let fp8_bpm = pm_float_decomp_store();
     let mut fp8_decomposed = rendered;
+    // WMMA consumes fp8 operands natively (the renderer packs fp8 lanes into the
+    // MFMA), so exempt their backward slice from software fp8→f16 decomposition.
+    let tc_operand_ids = crate::devectorize::tc_operand_slice_ids(&fp8_decomposed);
     for (fr, to) in [
         (svod_dtype::ScalarDType::FP8E5M2, svod_dtype::ScalarDType::Float16),
         (svod_dtype::ScalarDType::FP8E4M3, svod_dtype::ScalarDType::Float16),
     ] {
-        let mut ctx = Fp8DecompCtx { from: fr, to };
+        let mut ctx = Fp8DecompCtx { from: fr, to, tc_operand_ids: tc_operand_ids.clone() };
         fp8_decomposed = svod_ir::rewrite::graph_rewrite_with_bpm(&fp8_pm, &fp8_bpm, fp8_decomposed, &mut ctx);
     }
     tracing::debug!(

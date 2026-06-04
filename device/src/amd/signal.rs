@@ -25,11 +25,16 @@ use crate::sync::TimelineSignal;
 /// doesn't pin a CPU.
 const WAIT_EVENTS_ESCALATE_MS: u64 = 200;
 
-/// 16-byte slot inside the [`SignalPool`]'s shared GTT page; slot holds the
-/// u64 value at offset 0 plus 8 bytes of padding.
-const SLOT_BYTES: usize = 16;
-/// 4 KiB page / 16 B per slot = 256 signals per pool.
-const SLOTS_PER_POOL: usize = 256;
+/// 64-byte slot laid out as an `amd_signal_t` (kind@0, value@8). The AQL packet
+/// processor reads a dispatch packet's `completion_signal.handle` as the struct
+/// base and atomically decrements the `value` field at offset 8; PM4 RELEASE_MEM
+/// and SDMA fence writes target that same `value`. So every signal — compute
+/// completion or copy timeline — shares this one layout.
+const SLOT_BYTES: usize = 64;
+/// 4 KiB page / 64 B per slot = 64 signals per pool.
+const SLOTS_PER_POOL: usize = 64;
+/// Byte offset of the `value` counter inside an `amd_signal_t` slot.
+const SIGNAL_VALUE_OFFSET: usize = 8;
 
 /// A pool-allocated AMD signal.
 ///
@@ -38,6 +43,10 @@ const SLOTS_PER_POOL: usize = 256;
 /// slot to its pool. The pool keeps the underlying VRAM allocation alive.
 pub struct AmdSignal {
     slot: u32,
+    /// `amd_signal_t` struct base (GPU VA) — the AQL `completion_signal.handle`.
+    base_gpu: u64,
+    /// GPU VA of the `value` counter (`base_gpu + SIGNAL_VALUE_OFFSET`) — what
+    /// PM4/SDMA packets write and what the host polls.
     value_addr: u64,
     host_ptr: NonNull<AtomicU64>,
     pool: Weak<SignalPool>,
@@ -53,9 +62,19 @@ unsafe impl Send for AmdSignal {}
 unsafe impl Sync for AmdSignal {}
 
 impl AmdSignal {
-    /// Raw GPU virtual address of the signal counter (for AQL/PM4 packets).
+    /// GPU VA of the `value` counter — what PM4/SDMA wait/signal packets write
+    /// and the host polls (`amd_signal_t.value`, at +8 from the struct base).
     pub fn value_addr(&self) -> u64 {
         self.value_addr
+    }
+
+    /// GPU VA of the `amd_signal_t` struct base — the value to place in an AQL
+    /// kernel-dispatch packet's `completion_signal.handle`. The packet processor
+    /// decrements the `value` field (at [`value_addr`](Self::value_addr)) when
+    /// the dispatch completes.
+    #[inline]
+    pub fn signal_handle(&self) -> u64 {
+        self.base_gpu
     }
 
     /// Slot index inside the pool. Useful for debugging.
@@ -63,23 +82,36 @@ impl AmdSignal {
         self.slot
     }
 
-    /// Spin-wait until the host-visible signal value is ≥ `target`. The PM4
-    /// RELEASE_MEM packet emitted via AQL vendor IB writes the literal value
-    /// (not decrement), so we use increment-convention here. Returns
-    /// `Err(Runtime)` immediately if KFD reports a memory or hw fault during
-    /// the wait, or after `timeout_ms` if the signal never reaches `target`
-    /// — preferred over a silent infinite spin when something upstream
-    /// prevents the GPU from running the kernel.
+    /// Current value (host read of the coherent slot).
+    #[inline]
+    fn load(&self) -> u64 {
+        // SAFETY: NonNull valid for the pool's lifetime; AtomicU64 is race-free.
+        unsafe { self.host_ptr.as_ref().load(Ordering::Acquire) }
+    }
+
+    /// Arm a native countdown completion signal to `count` (1 for one dispatch).
+    /// The AQL packet processor decrements it to 0 on completion; the host then
+    /// observes done via [`wait_done`](Self::wait_done).
+    #[inline]
+    pub fn arm(&self, count: i64) {
+        // SAFETY: same as `load`.
+        unsafe { self.host_ptr.as_ref().store(count as u64, Ordering::Release) };
+    }
+
+    /// Tiered busy-wait until `ready(value)` holds, or `timeout_ms` of *no
+    /// progress* elapses, or KFD reports a GPU fault. Shared by the
+    /// increment-convention ([`wait_signal_value`](Self::wait_signal_value)) and
+    /// countdown-convention ([`wait_done`](Self::wait_done)) waits.
     ///
-    /// Early-exit on fault is load-bearing for BEAM search: bad kernel
-    /// configurations may fault the GPU, and waiting the full 30 s timeout
-    /// for each rejected candidate is unaffordable.
-    pub fn wait_signal_value(&self, target: u64, timeout_ms: u64) -> Result<()> {
+    /// Early-exit on fault is load-bearing for BEAM search: a bad kernel config
+    /// may fault the GPU, and paying the full timeout per rejected candidate is
+    /// unaffordable.
+    fn poll_until(&self, ready: impl Fn(u64) -> bool, timeout_ms: u64, what: &str) -> Result<()> {
         let mut start = std::time::Instant::now();
         let mut prev = u64::MAX;
         loop {
-            let v = unsafe { self.host_ptr.as_ref().load(Ordering::Acquire) };
-            if v >= target {
+            let v = self.load();
+            if ready(v) {
                 return Ok(());
             }
             if v != prev {
@@ -87,18 +119,12 @@ impl AmdSignal {
                 start = std::time::Instant::now();
             }
             if timeout_ms > 0 && start.elapsed().as_millis() as u64 >= timeout_ms {
-                // Drain any pending fault info before reporting the timeout —
-                // a hung kernel almost always raised a fault that we want to
-                // surface alongside the deadline message.
+                // A hung kernel almost always raised a fault; surface it
+                // alongside the deadline.
                 let fault = self.device.upgrade().and_then(|d| d.poll_faults_nonblocking());
-                return Err(match fault {
-                    Some(e) => e,
-                    None => Error::Runtime {
-                        message: format!(
-                            "AmdSignal::wait_signal_value({target}) timed out after {timeout_ms} ms (current value={v})"
-                        ),
-                    },
-                });
+                return Err(fault.unwrap_or_else(|| Error::Runtime {
+                    message: format!("AmdSignal::{what} timed out after {timeout_ms} ms (current value={v})"),
+                }));
             }
             if let Some(fault) = self.spin_or_escalate(start) {
                 return Err(fault);
@@ -106,40 +132,23 @@ impl AmdSignal {
         }
     }
 
-    /// Spin-wait until the host-visible signal value reaches `target` going
-    /// *down* (HSA completion_signal convention: GPU decrements by 1 per
-    /// completed dispatch). Returns `Err(Runtime)` immediately on a GPU
-    /// fault, or after `timeout_ms` if the signal never reaches `target`.
-    pub fn wait_decrement_to(&self, target: u64, timeout_ms: u64) -> Result<()> {
-        let mut start = std::time::Instant::now();
-        let mut prev = u64::MAX;
-        loop {
-            // Read as i64 to compare across the HSA decrement convention: if
-            // the GPU goes below `target` (shouldn't happen for a balanced
-            // pre-set + 1 dispatch) we still wake up.
-            let v = unsafe { self.host_ptr.as_ref().load(Ordering::Acquire) };
-            if (v as i64) <= (target as i64) {
-                return Ok(());
-            }
-            if v != prev {
-                prev = v;
-                start = std::time::Instant::now();
-            }
-            if timeout_ms > 0 && start.elapsed().as_millis() as u64 >= timeout_ms {
-                let fault = self.device.upgrade().and_then(|d| d.poll_faults_nonblocking());
-                return Err(match fault {
-                    Some(e) => e,
-                    None => Error::Runtime {
-                        message: format!(
-                            "AmdSignal::wait_decrement_to({target}) timed out after {timeout_ms} ms (current value={v})"
-                        ),
-                    },
-                });
-            }
-            if let Some(fault) = self.spin_or_escalate(start) {
-                return Err(fault);
-            }
-        }
+    /// Spin-wait until the value is ≥ `target` (increment convention — SDMA
+    /// fence / monotonic timeline writes a literal increasing value).
+    pub fn wait_signal_value(&self, target: u64, timeout_ms: u64) -> Result<()> {
+        self.poll_until(|v| v >= target, timeout_ms, "wait_signal_value")
+    }
+
+    /// Spin-wait until a native countdown completion signal reaches 0 (any
+    /// `value as i64 <= 0`). Pairs with [`arm`](Self::arm).
+    pub fn wait_done(&self, timeout_ms: u64) -> Result<()> {
+        self.poll_until(|v| (v as i64) <= 0, timeout_ms, "wait_done")
+    }
+
+    /// Non-blocking check that a native countdown signal has retired (value
+    /// decremented to 0). Used to reclaim pool slots without waiting.
+    #[inline]
+    pub fn is_done(&self) -> bool {
+        (self.load() as i64) <= 0
     }
 
     /// Tiered polling backoff: tight spin → `yield_now` → KFD `WAIT_EVENTS`
@@ -282,32 +291,9 @@ impl TimelineSignal for AmdSignal {
     }
 
     fn wait(&self, target: u64, timeout_ms: u64) -> Result<()> {
-        let mut start = std::time::Instant::now();
-        let mut prev = u64::MAX;
-        // Tiered strategy: spin → yield → KFD WAIT_EVENTS sleep. The shared
-        // helper handles the escalation tiers
-        // and surfaces GPU faults so BEAM search can bail on a bad config
-        // instead of blocking for the full timeout.
-        loop {
-            let v = self.value();
-            if v >= target {
-                return Ok(());
-            }
-            if v != prev {
-                prev = v;
-                start = std::time::Instant::now();
-            }
-            if timeout_ms > 0 && start.elapsed().as_millis() as u64 >= timeout_ms {
-                let fault = self.device.upgrade().and_then(|d| d.poll_faults_nonblocking());
-                return Err(match fault {
-                    Some(e) => e,
-                    None => Error::Runtime { message: format!("AmdSignal::wait timed out (>= {target})") },
-                });
-            }
-            if let Some(fault) = self.spin_or_escalate(start) {
-                return Err(fault);
-            }
-        }
+        // Tiered strategy (spin → yield → KFD WAIT_EVENTS sleep) + fault
+        // surfacing live in the shared `poll_until` helper.
+        self.poll_until(|v| v >= target, timeout_ms, "wait")
     }
 }
 
@@ -354,13 +340,31 @@ impl SignalPool {
             reason: format!("SignalPool exhausted ({SLOTS_PER_POOL} slots in use)"),
         })?;
         let offset = slot as usize * SLOT_BYTES;
-        let value_addr = self.base_gpu + offset as u64;
-        // SAFETY: offset < page size; AtomicU64 fits in a 16-byte slot.
-        let host_ptr = unsafe { NonNull::new_unchecked(self.base_host.as_ptr().add(offset) as *mut AtomicU64) };
-        // Zero the slot so the new signal starts at 0.
-        // SAFETY: same as above.
+        let base_gpu = self.base_gpu + offset as u64;
+        let base_host = self.base_host.as_ptr();
+        // Lay out the amd_signal_t: zero the 64-byte slot, then set kind=USER so
+        // the AQL packet processor treats it as a value signal, value stays 0.
+        // SAFETY: offset + SLOT_BYTES <= page size by construction.
+        let slot_host = unsafe { base_host.add(offset) };
+        unsafe {
+            std::ptr::write_bytes(slot_host, 0, SLOT_BYTES);
+            std::ptr::write_volatile(
+                slot_host as *mut i64,
+                crate::amd::sys::hsa::amd_signal_kind_t_AMD_SIGNAL_KIND_USER as i64,
+            );
+        }
+        let value_addr = base_gpu + SIGNAL_VALUE_OFFSET as u64;
+        // SAFETY: the 8-byte value field sits at +SIGNAL_VALUE_OFFSET in the slot.
+        let host_ptr = unsafe { NonNull::new_unchecked(slot_host.add(SIGNAL_VALUE_OFFSET) as *mut AtomicU64) };
         unsafe { host_ptr.as_ref().store(0, Ordering::Release) };
-        Ok(AmdSignal { slot, value_addr, host_ptr, pool: Arc::downgrade(self), device: Arc::downgrade(&self.device) })
+        Ok(AmdSignal {
+            slot,
+            base_gpu,
+            value_addr,
+            host_ptr,
+            pool: Arc::downgrade(self),
+            device: Arc::downgrade(&self.device),
+        })
     }
 
     fn release_slot(&self, slot: u32) {

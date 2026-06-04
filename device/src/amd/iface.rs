@@ -38,9 +38,12 @@ const DOORBELL_PAGE_BYTES: usize = 0x2000;
 /// dropped in without editing any call site.
 pub trait AmdIface: Send + Sync + std::fmt::Debug {
     /// Reserve a host VA, KFD-allocate `size` bytes per `kind`, optionally map
-    /// host-visible, and bind it into the GPU page table. `zero` zero-fills a
-    /// host-visible allocation. `tag` records the allocation's purpose in the
-    /// VA registry so a later fault can be resolved back to it.
+    /// host-visible, and bind it into the GPU page table. `zero` zero-fills the
+    /// allocation, but this seam can only honor it for host-mapped buffers —
+    /// `zero=true` with `cpu_access=false` is rejected with an error (the caller
+    /// owns device-zeroing via the SDMA copy queue). `tag` records the
+    /// allocation's purpose in the VA registry so a later fault can be resolved
+    /// back to it.
     fn alloc_raw(
         &self,
         size: usize,
@@ -326,8 +329,25 @@ impl AmdIface for KfdIface {
             });
         }
 
-        if zero_init && let Some(p) = host_ptr {
-            unsafe { std::ptr::write_bytes(p.as_ptr(), 0, size) };
+        if zero_init {
+            match host_ptr {
+                Some(p) => unsafe { std::ptr::write_bytes(p.as_ptr(), 0, size) },
+                // This seam has no copy queue, so it cannot zero a device-only
+                // (non-host-mapped) buffer. Fail loud rather than silently return
+                // garbage: `AmdAllocator::_alloc` passes `zero=false` here for
+                // device-only buffers and zeroes them via SDMA itself, so a
+                // `zero_init && !cpu_access` request reaching this point is a
+                // caller bug (e.g. a future path that bypasses `_alloc`).
+                None => {
+                    self.free_kfd(mem_handle);
+                    unsafe { munmap(va as *mut _, size) };
+                    return Err(Error::AmdAllocFailed {
+                        reason: "zero_init requested for a device-only (non-host-mapped) allocation; \
+                                 the caller must device-zero (e.g. via the SDMA copy queue)"
+                            .into(),
+                    });
+                }
+            }
         }
 
         self.va.insert(va as u64, size, mem_handle, tag);

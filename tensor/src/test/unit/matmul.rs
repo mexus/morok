@@ -652,6 +652,71 @@ fn test_print_matmul_64x64_ir() {
     }
 }
 
+/// gfx942 (CDNA3) MFMA tensor-core matmul: end-to-end proof + numerical
+/// validation, parameterized over the low-precision input dtype. A
+/// `in_dtype·in_dtype` matmul accumulating in f32 matches a cdna3 tensor core,
+/// so BEAM must lower it to `intrinsic`. Inputs are small integers (−3..3 /
+/// −2..2, all exact in bf16/f16/fp8e4m3), so the MFMA result — accumulated
+/// across the residual K-tile loop and fanned out across the M/N output tiles —
+/// must equal the f32 reference exactly. Guards both the reduce-loop lowering
+/// and the per-tile expansion. `tol` stays small because the inputs round-trip
+/// losslessly and the accumulation is in f32.
+fn validate_mfma_square(size: usize, in_dtype: DType, intrinsic: &str, tol: f32) {
+    let a_data: Vec<f32> = (0..size * size).map(|x| ((x % 7) as f32) - 3.0).collect();
+    let b_data: Vec<f32> = (0..size * size).map(|x| ((x % 5) as f32) - 2.0).collect();
+    let a_nd = Array2::from_shape_vec((size, size), a_data).unwrap();
+    let b_nd = Array2::from_shape_vec((size, size), b_data).unwrap();
+
+    let beam = prep_config(
+        OptimizerConfig::builder()
+            .strategy(OptStrategy::Beam { width: 2 })
+            .beam(BeamConfig::builder().disable_cache(true).build())
+            .build(),
+    );
+    let build = || {
+        let a = Tensor::from_ndarray(&a_nd).cast(in_dtype.clone()).unwrap();
+        let b = Tensor::from_ndarray(&b_nd).cast(in_dtype.clone()).unwrap();
+        a.matmul_with().other(&b).dtype(DType::Float32).call().unwrap()
+    };
+
+    // 1) The selected kernel must actually use the expected MFMA (not a fallback).
+    let mut probe = build();
+    let plan = probe.prepare_with(&beam).expect("prepare should succeed");
+    let saw_mfma = plan.prepared_kernels().iter().any(|k| k.kernel.code.contains(intrinsic));
+    assert!(saw_mfma, "BEAM did not select {intrinsic} for a {in_dtype:?} {size}x{size} matmul on gfx942");
+
+    // 2) The MFMA result must match the f32 reference (exact for integer inputs).
+    let mut c = build();
+    c.realize_with(&beam).unwrap();
+    let expected = a_nd.dot(&b_nd);
+    assert_matmul_close(&c.as_vec::<f32>().unwrap(), &expected, tol);
+}
+
+/// Hardware-gated: `SVOD_DEVICE=AMD:0 cargo test -p svod-tensor test_matmul_bf16_mfma_validated -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn test_matmul_bf16_mfma_validated() {
+    validate_mfma_square(512, DType::BFloat16, "llvm.amdgcn.mfma.f32.16x16x16bf16.1k", 1.0);
+}
+
+/// gfx942 f16 16×16×16 MFMA (the `f16` plain form).
+#[test]
+#[ignore]
+fn test_matmul_f16_mfma_validated() {
+    validate_mfma_square(512, DType::Float16, "llvm.amdgcn.mfma.f32.16x16x16f16", 1.0);
+}
+
+/// gfx942 fp8 (e4m3) 16×16×32 MFMA. The cdna3 fp8 tensor core is K=32, so this
+/// also exercises the K=32 reduce-tile lowering and i64 operand packing. Uses a
+/// smaller matrix: the fp8 path compiles many BEAM candidates (each with the
+/// fp8-conversion prelude), so 512² BEAM is ~8min; 128² keeps it tractable while
+/// still tiling into the 16×16×32 core.
+#[test]
+#[ignore]
+fn test_matmul_fp8_mfma_validated() {
+    validate_mfma_square(128, DType::FP8E4M3, "llvm.amdgcn.mfma.f32.16x16x32.fp8.fp8", 1.0);
+}
+
 // ========== Validated Matmul Tests (64x64 with env_config) ==========
 
 #[test]

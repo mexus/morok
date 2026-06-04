@@ -56,11 +56,17 @@ pub fn render_wmma_amd(
     // `iN`. Bitcast each operand to its wire type before the call (and the
     // accumulator + result back, when it too is reinterpreted). Mirrors
     // tinygrad's `AMDLLVMRenderer` operand rewrite (`llvmir.py:274-298`).
-    let a_op = bitcast_operand(kernel, &dst, "a", &a.dtype(), &a_name);
-    let b_op = bitcast_operand(kernel, &dst, "b", &b.dtype(), &b_name);
-    let c_op = bitcast_operand(kernel, &dst, "c", &c.dtype(), &c_name);
+    // The K=32 dotted `.bf16` MFMA (CDNA4/gfx950) takes its operands as native
+    // `<N x bfloat>`; the K=16 `.bf16.1k` form takes `<N x i16>`. gfx942 never
+    // reaches here for K=32 bf16 — `resolve_intrinsic` returns `None` above —
+    // so this only flips the wire type on the gfx950 path.
+    let bf16_native = arch.is_cdna() && k == 32;
 
-    let (acc_wire, acc_reinterpreted) = wmma_wire_type(&uop.dtype());
+    let a_op = bitcast_operand(kernel, &dst, "a", &a.dtype(), &a_name, bf16_native);
+    let b_op = bitcast_operand(kernel, &dst, "b", &b.dtype(), &b_name, bf16_native);
+    let c_op = bitcast_operand(kernel, &dst, "c", &c.dtype(), &c_name, bf16_native);
+
+    let (acc_wire, acc_reinterpreted) = wmma_wire_type(&uop.dtype(), bf16_native);
     let call_dst = if acc_reinterpreted { format!("{dst}.r") } else { dst.clone() };
 
     let tail = if arch.is_cdna() {
@@ -86,10 +92,12 @@ pub fn render_wmma_amd(
 
 /// The LLVM type a WMMA/MFMA operand must be passed as, plus whether that
 /// differs from its natural `ldt` type (a bitcast is then required). bf16 lanes
-/// go as `i16`; fp8 lanes pack into one `iN`; every other dtype passes as-is.
-fn wmma_wire_type(dtype: &DType) -> (String, bool) {
+/// go as `i16` (the `bf16.1k`/RDNA `.bf16` intrinsics), except for the CDNA4
+/// K=32 `.bf16` form which takes native `<N x bfloat>` (`bf16_native`); fp8
+/// lanes pack into one `iN`; every other dtype passes as-is.
+fn wmma_wire_type(dtype: &DType, bf16_native: bool) -> (String, bool) {
     match dtype {
-        DType::Vector { scalar: ScalarDType::BFloat16, count } => (format!("<{count} x i16>"), true),
+        DType::Vector { scalar: ScalarDType::BFloat16, count } if !bf16_native => (format!("<{count} x i16>"), true),
         DType::Vector { scalar: ScalarDType::FP8E4M3 | ScalarDType::FP8E5M2, count } => {
             (format!("i{}", count * 8), true)
         }
@@ -101,8 +109,15 @@ fn wmma_wire_type(dtype: &DType) -> (String, bool) {
 /// and return the `"<wire-ty> <value>"` fragment for the call's argument list.
 /// The temp name is derived from the unique `dst` (`%vN.a` …) so no fresh-name
 /// counter is needed.
-fn bitcast_operand(kernel: &mut Vec<String>, dst: &str, suffix: &str, dtype: &DType, name: &str) -> String {
-    let (wire_ty, reinterpreted) = wmma_wire_type(dtype);
+fn bitcast_operand(
+    kernel: &mut Vec<String>,
+    dst: &str,
+    suffix: &str,
+    dtype: &DType,
+    name: &str,
+    bf16_native: bool,
+) -> String {
+    let (wire_ty, reinterpreted) = wmma_wire_type(dtype, bf16_native);
     if !reinterpreted {
         return format!("{wire_ty} {name}");
     }
@@ -138,17 +153,23 @@ fn resolve_intrinsic(
     let acc_dt = acc_dt?;
 
     if arch.is_cdna() {
-        // CDNA fp8/bf8 carry their own leading dot; bf16/f16 use `bf16.1k`/`f16`
-        // for K=16 and the dotted `.bf16`/`.f16` forms for K=32. Other suffixes
-        // append directly after `{k}`.
+        // Verified with `llc -mcpu=gfx942|gfx950` (ROCm 7.2): the f16/bf16 K=16
+        // forms (`f16`/`bf16.1k`) select on both CDNA3 (gfx942) and CDNA4
+        // (gfx950); the dotted K=32 double-rate forms (`.f16`/`.bf16`) select on
+        // gfx950 only; fp8/bf8 select only at K=32. Anything else has no MFMA
+        // intrinsic — return `None` so the caller raises `InvalidGraph` (and the
+        // optimizer decomposes it) instead of emitting a name LLVM silently
+        // lowers to a no-op extern call.
+        let is_cdna4 = matches!(arch, AmdArch::Gfx950);
         let in_suffix = match (in_dt, k) {
-            (ScalarDType::Float16, 32) => ".f16",
-            (ScalarDType::BFloat16, 32) => ".bf16",
+            (ScalarDType::Float16, 32) if is_cdna4 => ".f16",
+            (ScalarDType::BFloat16, 32) if is_cdna4 => ".bf16",
+            (ScalarDType::Float16 | ScalarDType::BFloat16, 32) => return None,
             (ScalarDType::Float16, _) => "f16",
             (ScalarDType::BFloat16, _) => "bf16.1k",
             (ScalarDType::Float32, _) => "f32",
-            (ScalarDType::FP8E4M3, _) => ".fp8.fp8",
-            (ScalarDType::FP8E5M2, _) => ".bf8.bf8",
+            (ScalarDType::FP8E4M3, 32) => ".fp8.fp8",
+            (ScalarDType::FP8E5M2, 32) => ".bf8.bf8",
             _ => return None,
         };
         let acc_suffix = match acc_dt {
