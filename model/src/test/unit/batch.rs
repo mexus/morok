@@ -25,7 +25,6 @@ pub(super) fn test_config() -> GigaAmConfig {
         mel_center: false,
         max_mel_frames: 512,
         max_encoder_frames: 128,
-        max_sub_blocks: 8,
         decoder: CtcDecoder::Greedy(GreedyDecoder::new(Vec::new())),
         transducer: None,
     }
@@ -88,40 +87,6 @@ fn test_rope_cache_uses_pos_emb_max_len_as_base() {
 }
 
 #[test]
-fn test_sub_inverse_64ts_minus_3_pins_output_length() {
-    // The encoder derives its symbolic mel-shrink length as `64·ts − 3` and
-    // reshapes the subsampled sequence axis to `16·ts`. That algebra is only
-    // valid if `output_length(64·ts − 3) == 16·ts` for every ts in range —
-    // pin it against the actual `output_length` (not the closed form) so a
-    // change to the subsampling stack trips here, not silently in the graph.
-    let model = model_with_random_weights();
-    for ts in 1..=64usize {
-        let mel = 64 * ts - 3;
-        assert_eq!(
-            model.encoder.subsampling_output_length(mel),
-            16 * ts,
-            "output_length(64*{ts}-3 = {mel}) != 16*{ts}",
-        );
-    }
-}
-
-#[test]
-fn test_mel_frames_for_sub_len_is_inverse() {
-    // `mel_frames_for_sub_len` is the monotone-search inverse of
-    // `subsampling_output_length`; for every target it returns the smallest
-    // pre-image, which must equal the `64·ts − 3` closed form the graph uses.
-    let model = model_with_random_weights();
-    for ts in 1..=8usize {
-        let target = 16 * ts;
-        let mel = model.encoder.mel_frames_for_sub_len(target, 4096).expect("pre-image exists");
-        assert_eq!(mel, 64 * ts - 3, "smallest pre-image of {target} should be 64*{ts}-3");
-        assert_eq!(model.encoder.subsampling_output_length(mel), target);
-    }
-    // No pre-image for an out-of-range target returns None rather than panicking.
-    assert_eq!(model.encoder.mel_frames_for_sub_len(16, 10), None);
-}
-
-#[test]
 fn test_subsampled_max_mel_fits_encoder_bound() {
     let model = model_with_random_weights();
     let cfg = test_config();
@@ -148,33 +113,31 @@ fn test_with_b_bound_panics_on_empty_range() {
 
 #[test]
 #[ignore = "heavy: realize-based bounds-error JIT smoke"]
-fn test_batched_jit_rejects_ts_above_max_sub_blocks() {
+fn test_batched_jit_rejects_t_above_max_mel_frames() {
     let model = model_with_random_weights();
     let cfg = test_config();
     let mut jit = GigaAmEncoderJit::new(model);
     jit.prepare(crate::jit::InputSpec::f32(&[1, cfg.n_mels, cfg.max_mel_frames]), crate::jit::InputSpec::i32(&[1]))
         .unwrap();
-    let err = jit.execute_with_vars(&[("b", 1), ("ts", cfg.max_sub_blocks as i64 + 1)]).unwrap_err();
+    let err = jit.execute_with_vars(&[("b", 1), ("t", cfg.max_mel_frames as i64 + 1)]).unwrap_err();
     assert_runtime_bounds_err(err);
 }
 
 #[test]
-#[ignore = "heavy: full encoder forward at max sub blocks"]
+#[ignore = "heavy: full encoder forward at max_mel_frames"]
 fn test_encode_batch_near_max_mel_runs() {
     let model = model_with_random_weights();
     let cfg = test_config();
-    let ts = cfg.max_sub_blocks;
-    // Encoder shrinks mel to the exact pre-image of 16·ts frames (64·ts − 3).
-    let t = 64 * ts - 3;
+    let t = cfg.max_mel_frames;
 
-    let x = Tensor::full(&[1, cfg.n_mels, cfg.max_mel_frames], 0.1f32, DType::Float32).unwrap();
+    let x = Tensor::full(&[1, cfg.n_mels, t], 0.1f32, DType::Float32).unwrap();
     let lengths = Tensor::from_slice([t as i32]);
     let b_var = Variable::new("B", 1, cfg.max_batch_size as i64);
-    let ts_var = Variable::new("TS", 1, cfg.max_sub_blocks as i64);
+    let t_var = Variable::new("T", 1, cfg.max_mel_frames as i64);
     let b1 = b_var.bind(1).unwrap();
-    let ts_bound = ts_var.bind(ts as i64).unwrap();
+    let t_bound = t_var.bind(t as i64).unwrap();
 
-    let mut out = model.encoder.forward_batch(&x, &lengths, &b1, &ts_bound).unwrap();
+    let mut out = model.encoder.forward_batch(&x, &lengths, &b1, &t_bound).unwrap();
     out.realize().unwrap();
     assert!(out.buffer().unwrap().size() > 0);
 }
@@ -185,19 +148,17 @@ fn test_single_vs_batch_consistency() {
     let model = model_with_random_weights();
     let d = test_config().d_model;
     let n_mels = test_config().n_mels;
-    // ts = 1 sub-block: encoder reads 64·ts − 3 = 61 mel frames, emits 16·ts.
-    let ts = 1usize;
-    let t = 64 * ts - 3;
-    let t_sub = 16 * ts;
+    let t = 10;
+    let t_sub = model.encoder.subsampling_output_length(t);
 
     let x1 = Tensor::full(&[1, n_mels, t], 0.5f32, DType::Float32).unwrap();
     let x2 = Tensor::full(&[1, n_mels, t], 0.3f32, DType::Float32).unwrap();
     let lengths_single = Tensor::from_slice([t as i32]);
 
     let b_var = Variable::new("B", 1, test_config().max_batch_size as i64);
-    let ts_var = Variable::new("TS", 1, test_config().max_sub_blocks as i64);
+    let t_var = Variable::new("T", 1, test_config().max_mel_frames as i64);
     let b1 = b_var.bind(1).unwrap();
-    let t1 = ts_var.bind(ts as i64).unwrap();
+    let t1 = t_var.bind(t as i64).unwrap();
 
     let mut out1 = model.encoder.forward_batch(&x1, &lengths_single, &b1, &t1).unwrap();
     out1.realize().unwrap();
@@ -242,17 +203,15 @@ fn test_single_vs_batch_consistency() {
 fn test_encode_batch_full_lengths_finite() {
     let model = model_with_random_weights();
     let cfg = test_config();
-    // ts = 4 sub-blocks → 64·4 − 3 = 253 mel frames, 64 sub-frames.
-    let ts = 4usize;
-    let t = 64 * ts - 3;
+    let t = 256usize;
 
     let x = Tensor::full(&[2, cfg.n_mels, t], 0.1f32, DType::Float32).unwrap();
     let lengths = Tensor::from_slice([t as i32, t as i32]);
 
     let b_var = Variable::new("B", 1, cfg.max_batch_size as i64);
-    let ts_var = Variable::new("TS", 1, cfg.max_sub_blocks as i64);
+    let t_var = Variable::new("T", 1, cfg.max_mel_frames as i64);
     let b2 = b_var.bind(2).unwrap();
-    let t_bound = ts_var.bind(ts as i64).unwrap();
+    let t_bound = t_var.bind(t as i64).unwrap();
 
     let mut out = model.encoder.forward_batch(&x, &lengths, &b2, &t_bound).unwrap();
     out.realize().unwrap();
@@ -269,7 +228,7 @@ fn test_encode_batch_full_lengths_finite() {
 fn test_encode_batch_respects_dynamic_seq_len() {
     let model = model_with_random_weights();
     let cfg = test_config();
-    let ts_dynamic = 4usize;
+    let t_dynamic = 64usize;
 
     let mut jit = GigaAmEncoderJit::new(model);
     jit.prepare(
@@ -277,12 +236,12 @@ fn test_encode_batch_respects_dynamic_seq_len() {
         crate::jit::InputSpec::i32(&[cfg.max_batch_size]),
     )
     .unwrap();
-    let profiles = jit.execute_with_vars_profiled(&[("b", 1), ("ts", ts_dynamic as i64)]).unwrap();
+    let profiles = jit.execute_with_vars_profiled(&[("b", 1), ("t", t_dynamic as i64)]).unwrap();
 
     assert!(!profiles.is_empty(), "expected kernels for profiled dynamic execute");
     assert!(
-        profiles.iter().any(|p| p.kernel.var_names.iter().any(|name| name == "ts")),
-        "expected at least one kernel to keep dynamic seq var 'ts'"
+        profiles.iter().any(|p| p.kernel.var_names.iter().any(|name| name == "t")),
+        "expected at least one kernel to keep dynamic seq var 't'"
     );
 }
 
@@ -302,26 +261,25 @@ fn test_with_b_bound_shrinks_upper_bound() {
     let cfg = test_config();
     let mut jit = GigaAmEncoderJit::new(model).with_b_bound(2);
     jit.prepare(crate::jit::InputSpec::f32(&[2, cfg.n_mels, 64]), crate::jit::InputSpec::i32(&[2])).unwrap();
-    jit.execute_with_vars(&[("b", 2), ("ts", 1)]).unwrap();
-    assert_runtime_bounds_err(jit.execute_with_vars(&[("b", 3), ("ts", 1)]).unwrap_err());
+    jit.execute_with_vars(&[("b", 2), ("t", 64)]).unwrap();
+    assert_runtime_bounds_err(jit.execute_with_vars(&[("b", 3), ("t", 64)]).unwrap_err());
 }
 
 #[test]
-#[ignore = "heavy: with_ts_fixed should fold the symbolic dim out of compiled kernels"]
-fn test_with_ts_fixed_specializes_kernels() {
+#[ignore = "heavy: with_t_fixed should fold the symbolic dim out of compiled kernels"]
+fn test_with_t_fixed_specializes_kernels() {
     let model = model_with_random_weights();
     let cfg = test_config();
-    let pinned_ts = 1usize;
-    let mel_frames = 64 * pinned_ts - 3;
-    let mut jit = GigaAmEncoderJit::new(model).with_ts_fixed(pinned_ts);
-    jit.prepare(crate::jit::InputSpec::f32(&[1, cfg.n_mels, mel_frames]), crate::jit::InputSpec::i32(&[1])).unwrap();
+    let pinned_t = 64usize;
+    let mut jit = GigaAmEncoderJit::new(model).with_t_fixed(pinned_t);
+    jit.prepare(crate::jit::InputSpec::f32(&[1, cfg.n_mels, pinned_t]), crate::jit::InputSpec::i32(&[1])).unwrap();
     let kernels = jit.prepared_kernels().unwrap();
-    let any_kernel_keeps_ts = kernels.iter().any(|k| k.kernel.var_names.iter().any(|n| n == "ts"));
-    assert!(!any_kernel_keeps_ts, "with_ts_fixed should fold `ts` out of kernel var lists");
+    let any_kernel_keeps_t = kernels.iter().any(|k| k.kernel.var_names.iter().any(|n| n == "t"));
+    assert!(!any_kernel_keeps_t, "with_t_fixed should fold `t` out of kernel var lists");
     let any_kernel_keeps_b = kernels.iter().any(|k| k.kernel.var_names.iter().any(|n| n == "b"));
     assert!(any_kernel_keeps_b, "`b` is still dynamic and should remain in some kernel's var list");
 
-    jit.execute_with_vars(&[("b", 1), ("ts", pinned_ts as i64)]).unwrap();
+    jit.execute_with_vars(&[("b", 1), ("t", pinned_t as i64)]).unwrap();
 }
 
 #[test]
@@ -331,6 +289,6 @@ fn test_with_b_min_bound_raises_lower_bound() {
     let cfg = test_config();
     let mut jit = GigaAmEncoderJit::new(model).with_b_min_bound(2);
     jit.prepare(crate::jit::InputSpec::f32(&[2, cfg.n_mels, 64]), crate::jit::InputSpec::i32(&[2])).unwrap();
-    jit.execute_with_vars(&[("b", 2), ("ts", 1)]).unwrap();
-    assert_runtime_bounds_err(jit.execute_with_vars(&[("b", 1), ("ts", 1)]).unwrap_err());
+    jit.execute_with_vars(&[("b", 2), ("t", 64)]).unwrap();
+    assert_runtime_bounds_err(jit.execute_with_vars(&[("b", 1), ("t", 64)]).unwrap_err());
 }

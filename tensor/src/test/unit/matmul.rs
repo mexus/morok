@@ -1,7 +1,9 @@
 use crate::*;
 use ndarray::{Array2, array};
 use svod_dtype::DType;
-use svod_schedule::{BeamConfig, HeuristicsConfig, OptStrategy, OptimizerConfig, TcSelect, testing::setup_test_tracing};
+use svod_schedule::{
+    BeamConfig, HeuristicsConfig, OptStrategy, OptimizerConfig, TcSelect, testing::setup_test_tracing,
+};
 
 fn prep_config(optimizer: OptimizerConfig) -> PrepareConfig {
     optimizer.into()

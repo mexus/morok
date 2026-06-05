@@ -1031,7 +1031,12 @@ pub fn try_tensor_cores(scheduler: &mut Scheduler, config: &HeuristicsConfig) ->
                 })
                 .fold(1i64, i64::saturating_mul);
             if macs < MIN_MACS {
-                tracing::debug!(axis_choice, tc_index = idx, macs, "try_tensor_cores: rate-neutral core, too little work");
+                tracing::debug!(
+                    axis_choice,
+                    tc_index = idx,
+                    macs,
+                    "try_tensor_cores: rate-neutral core, too little work"
+                );
                 rejections.push((axis_choice, "rate-neutral tensor core: too little work".to_string()));
                 continue;
             }

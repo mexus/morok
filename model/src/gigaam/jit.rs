@@ -21,11 +21,11 @@ jit_wrapper! {
 
         vars {
             b: (1, model.config.max_batch_size),
-            ts: (1, model.config.max_sub_blocks),
+            t: (1, model.config.max_mel_frames),
         }
 
-        build(mel, lengths, b, ts) {
-            let out = model.encoder.forward_batch(mel, lengths, &b, &ts)?;
+        build(mel, lengths, b, t) {
+            let out = model.encoder.forward_batch(mel, lengths, &b, &t)?;
             // Permute [B, d_model, T_sub] → [B, T_sub, d_model] on-device: the
             // RN-T decoder consumes frame-major rows, and doing it here turns
             // the host-side strided transpose over the slow mapping into one
