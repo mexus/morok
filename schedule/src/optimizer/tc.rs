@@ -111,6 +111,20 @@ fn get_range_size(range: &Arc<UOp>) -> Option<i64> {
     None
 }
 
+/// True if the range's extent is provably a multiple of `tile`: const fast
+/// path, then the algebraic `UOp::divides` proof for symbolic ends (a `16*ts`
+/// extent proves, a bare var does not). TC lowering with an unproven extent
+/// reads/writes out of tile, so callers must hard-fail on `false`.
+fn provably_divisible(range: &Arc<UOp>, tile: usize) -> bool {
+    if let Some(size) = get_range_size(range) {
+        return (size as usize).is_multiple_of(tile);
+    }
+    if let Op::Range { end, .. } = range.op() {
+        return end.divides(tile as i64).is_some();
+    }
+    false
+}
+
 // ============================================================================
 // SELECTION
 // ============================================================================
@@ -290,14 +304,25 @@ fn apply_axis_choice_impl(
         let mut padding_ops: Vec<(usize, usize, usize)> = Vec::new(); // (axes_idx, scheduler_idx, tc_dim)
 
         for (i, (axis, &tc_dim)) in axes.iter().zip(&tc_dims).enumerate() {
-            let dim_size = get_range_size(axis);
-            if let Some(size) = dim_size
-                && !(size as usize).is_multiple_of(tc_dim)
-            {
-                let axis_idx = scheduler.rngs().iter().position(|r| Arc::ptr_eq(r, axis)).ok_or_else(|| {
-                    ValidationFailedSnafu { op: "TC", reason: "axis not found in scheduler ranges" }.build()
-                })?;
-                padding_ops.push((i, axis_idx, tc_dim));
+            match get_range_size(axis) {
+                Some(size) => {
+                    if !(size as usize).is_multiple_of(tc_dim) {
+                        let axis_idx = scheduler.rngs().iter().position(|r| Arc::ptr_eq(r, axis)).ok_or_else(|| {
+                            ValidationFailedSnafu { op: "TC", reason: "axis not found in scheduler ranges" }.build()
+                        })?;
+                        padding_ops.push((i, axis_idx, tc_dim));
+                    }
+                }
+                // PADTO can't pad an unknown extent, so a symbolic dim must
+                // carry its own proof of divisibility or the TC is invalid.
+                None if !provably_divisible(axis, tc_dim) => {
+                    return ValidationFailedSnafu {
+                        op: "TC",
+                        reason: "symbolic dimension not provably divisible by tensor core size",
+                    }
+                    .fail();
+                }
+                None => {}
             }
         }
 
@@ -316,19 +341,21 @@ fn apply_axis_choice_impl(
             axes[axes_idx] = scheduler.rngs()[scheduler_idx].clone();
         }
     } else {
-        // Without tc_opt >= 2, reject non-divisible dimensions
+        // Without tc_opt >= 2, reject non-divisible dimensions (symbolic dims
+        // must prove divisibility — silently skipping them lowers a tile loop
+        // over an extent the tile may not cover).
         for (i, axis) in axes.iter().enumerate() {
-            let dim_size = get_range_size(axis);
             let tc_dim = match i {
                 0 => tc.dims.0,
                 1 => tc.dims.1,
                 _ => tc.dims.2,
             };
-            if let Some(size) = dim_size
-                && !(size as usize).is_multiple_of(tc_dim)
-            {
-                return ValidationFailedSnafu { op: "TC", reason: "dimension not divisible by tensor core size" }
-                    .fail();
+            if !provably_divisible(axis, tc_dim) {
+                return ValidationFailedSnafu {
+                    op: "TC",
+                    reason: "dimension not provably divisible by tensor core size",
+                }
+                .fail();
             }
         }
     }
@@ -508,11 +535,21 @@ fn apply_axis_choice_impl(
         let tc_tag = smallvec::smallvec![crate::devectorize::TAG_TC_FINAL];
         let a_contract = src_a.contract(a_axes).with_tag(tc_tag.clone());
         let b_contract = src_b.contract(b_axes).with_tag(tc_tag.clone());
-        let zero_acc = if tc.dtype_out.is_float() {
+        // The WMMA C/accumulator operand carries the full per-thread D-register
+        // width (`elements_per_thread.2`, == prod(c_axes)), NOT a scalar — see
+        // tinygrad postrange.py:300-303 which builds the zero accumulator as
+        // `dtype_out.vec(elements_per_thread[2])`. A scalar-0 here desyncs the
+        // C operand from A/B/D when the expander replicates the WMMA over the
+        // M/N output tiles: do_expand broadcasts a scalar C by `expand_sz`
+        // (e.g. 16) giving a count-16 operand, while A/B/D become count-64,
+        // and `devectorize_wmma` then can't group C into per-tile slices.
+        let c_count = tc.elements_per_thread.2;
+        let zero_scalar = if tc.dtype_out.is_float() {
             UOp::const_(tc.dtype_out.clone(), ConstValue::Float(0.0))
         } else {
             UOp::const_(tc.dtype_out.clone(), ConstValue::Int(0))
         };
+        let zero_acc = zero_scalar.broadcast(c_count);
         let wmma = UOp::wmma(a_contract, b_contract, zero_acc, metadata).with_tag(tc_tag.clone());
         let mut tc_uop = wmma.unroll_with_dtype(c_axes, tc.dtype_out.clone()).with_tag(tc_tag.clone());
 

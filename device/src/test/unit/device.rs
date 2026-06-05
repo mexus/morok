@@ -130,6 +130,27 @@ fn test_program_spec_derives_launch_dims_from_specials() {
 }
 
 #[test]
+fn test_program_spec_launch_dims_resolves_mulacc_extent() {
+    // The symbolic simplifier fuses `16*ts − 1` (from a reshaped `16·ts`
+    // sequence axis) into a single MulAcc launch extent. The launch-size
+    // evaluator must compute `ts*16 − 1` rather than reject the op.
+    let ts = UOp::define_var("ts".to_string(), 1, 8);
+    let sixteen = UOp::index_const(16);
+    let minus_one = UOp::index_const(-1);
+    let extent = UOp::try_mulacc(ts, sixteen, minus_one).expect("build MulAcc extent");
+    let g = UOp::special(extent, "gidx0".to_string());
+    let sink = UOp::sink(vec![g]);
+    let linear = UOp::linear(sink.toposort().into());
+    let source = UOp::source("void mulacc_kernel() {}".to_string());
+    let program = UOp::program(sink, UOp::device(DeviceSpec::Cpu), Some(linear), Some(source), None);
+
+    let spec = crate::device::ProgramSpec::from_uop(&program).expect("program spec from mulacc special");
+    let vars = std::collections::HashMap::from([("ts", 8i64)]);
+    let launch = spec.launch_dims(&vars).expect("resolve launch dims with MulAcc extent");
+    assert_eq!(launch.global_size, [127, 1, 1], "ts*16 - 1 = 8*16 - 1 = 127");
+}
+
+#[test]
 fn test_program_spec_direct_global_special_disables_local_size() {
     let idx = UOp::special(UOp::index_const(16), "idx0".to_string());
     let sink = UOp::sink(vec![idx]);

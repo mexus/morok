@@ -352,6 +352,89 @@ fn create_matmul_pattern_with_two_n_axes(n_bad: i64, n_good: i64) -> Arc<svod_ir
     UOp::sink(vec![reduce, m_range, n_good_range, n_bad_range])
 }
 
+/// Matmul whose M extent is the given UOp (symbolic ends exercise the
+/// `provably_divisible` path: `get_range_size()` returns None for them).
+fn create_matmul_pattern_symbolic_m(m_end: Arc<svod_ir::UOp>, n: i64, k: i64) -> Arc<svod_ir::UOp> {
+    let m_range = UOp::range_axis(m_end, AxisId::Renumbered(0), AxisType::Global);
+    let n_range = UOp::range_axis(UOp::index_const(n), AxisId::Renumbered(1), AxisType::Global);
+    let k_range = UOp::range_axis(UOp::index_const(k), AxisId::Renumbered(2), AxisType::Reduce);
+
+    let m_float = m_range.clone().cast(DType::Float32);
+    let k_float = k_range.clone().cast(DType::Float32);
+    let n_float = n_range.clone().cast(DType::Float32);
+
+    let a_val = m_float.try_add(&k_float).unwrap();
+    let b_val = k_float.try_add(&n_float).unwrap();
+
+    let mul = a_val.try_mul(&b_val).unwrap();
+    let reduce = mul.reduce(vec![k_range].into(), ReduceOp::Add);
+
+    UOp::sink(vec![reduce, m_range, n_range])
+}
+
+fn sym_var(name: &str) -> Arc<svod_ir::UOp> {
+    UOp::var(name, svod_dtype::DType::Index, 1, 1 << 16)
+}
+
+#[test_case::test_case(1; "no padding")]
+#[test_case::test_case(2; "padding cannot pad symbolic")]
+fn test_tc_rejects_bare_symbolic_dim(tc_opt: usize) {
+    // M is a bare variable — not provably divisible by 16; must hard-fail in
+    // BOTH tc_opt branches, never silently pass (the old behaviour). CDNA3
+    // carries an fp32 TC, so dtype matching succeeds and the divisibility gate
+    // is the failure point.
+    let sink = create_matmul_pattern_symbolic_m(sym_var("M"), 16, 16);
+    let mut scheduler = Scheduler::new(sink, Renderer::amd_cdna3());
+
+    let result = apply(&mut scheduler, -1, tc_opt, 1);
+    assert!(result.is_err(), "bare symbolic M must be rejected (tc_opt={tc_opt})");
+    let err_msg = format!("{:?}", result.unwrap_err());
+    assert!(err_msg.contains("not provably divisible"), "should fail on symbolic divisibility: {err_msg}");
+}
+
+#[test_case::test_case(1; "no padding")]
+#[test_case::test_case(2; "padding")]
+fn test_tc_accepts_provably_divisible_symbolic_dim(tc_opt: usize) {
+    // M = 16 * ts proves divisibility via UOp::divides and the fp32 CDNA3 TC
+    // applies end-to-end (WMMA lands in the AST).
+    let m_end = UOp::index_const(16).try_mul(&sym_var("ts")).unwrap();
+    let sink = create_matmul_pattern_symbolic_m(m_end, 16, 16);
+    let mut scheduler = Scheduler::new(sink, Renderer::amd_cdna3());
+
+    let result = apply(&mut scheduler, -1, tc_opt, 1);
+    assert!(result.is_ok(), "16*ts must pass the divisibility gate: {:?}", result.err());
+    let has_wmma = scheduler.ast().toposort().iter().any(|u| matches!(u.op(), svod_ir::Op::Wmma { .. }));
+    assert!(has_wmma, "AST should contain WMMA after symbolic TC apply");
+}
+
+#[test]
+fn test_tc_rejects_symbolic_wrong_factor() {
+    // M = 8 * ts is NOT provably divisible by 16.
+    let m_end = UOp::index_const(8).try_mul(&sym_var("ts")).unwrap();
+    let sink = create_matmul_pattern_symbolic_m(m_end, 16, 16);
+    let mut scheduler = Scheduler::new(sink, Renderer::amd_cdna3());
+
+    let result = apply(&mut scheduler, -1, 1, 1);
+    assert!(result.is_err(), "8*ts must be rejected for a 16-tile");
+}
+
+#[test]
+fn test_tc_accepts_divisible_symbolic_any_associativity() {
+    // The encoder's M end is b * (16 * ts); after simplification the const can
+    // sit at any tree position — divides recurses Mul either way.
+    let (b, ts, c16) = (sym_var("b"), sym_var("ts"), UOp::index_const(16));
+    for m_end in [
+        b.try_mul(&c16.try_mul(&ts).unwrap()).unwrap(),
+        b.try_mul(&c16).unwrap().try_mul(&ts).unwrap(),
+        b.try_mul(&ts).unwrap().try_mul(&c16).unwrap(),
+    ] {
+        let sink = create_matmul_pattern_symbolic_m(m_end, 16, 16);
+        let mut scheduler = Scheduler::new(sink, Renderer::amd_cdna3());
+        let result = apply(&mut scheduler, -1, 1, 1);
+        assert!(result.is_ok(), "b*16*ts must pass the divisibility gate: {:?}", result.err());
+    }
+}
+
 #[test]
 fn test_tc_no_padding_divisible_dims() {
     // 16x16x16 matmul - perfectly divisible by TC dimensions

@@ -26,6 +26,7 @@ fn make_config(conv_norm: ConvNormType) -> GigaAmConfig {
         mel_center: false,
         max_mel_frames: 20000,
         max_encoder_frames: 5000,
+        max_sub_blocks: 312,
         decoder: CtcDecoder::Greedy(GreedyDecoder::new(Vec::new())),
         transducer: None,
     }

@@ -294,6 +294,7 @@ impl HeuristicsConfig {
     /// * `SVOD_MV_ROWS_PER_THREAD` / `MV_ROWS_PER_THREAD` - Matvec output split
     /// * `SVOD_K_VECTORIZE` - Enable K-axis vectorization (default: disabled)
     /// * `SVOD_NO_OUTPUT_UPCAST` - Disable output dimension upcasting (default: enabled)
+    /// * `SVOD_TC` - Tensor-core usage: `0` disables, `2` shape-only, else enabled
     pub fn from_env() -> Self {
         let parse_usize = |keys: &[&str], default: usize| {
             keys.iter().find_map(|k| std::env::var(k).ok().and_then(|v| v.parse::<usize>().ok())).unwrap_or(default)
@@ -308,6 +309,14 @@ impl HeuristicsConfig {
         let k_vectorize = std::env::var("SVOD_K_VECTORIZE").is_ok();
         // Default enabled, use SVOD_NO_OUTPUT_UPCAST to disable
         let output_upcast = std::env::var("SVOD_NO_OUTPUT_UPCAST").is_err();
+        // Tensor-core usage: `SVOD_TC=0` disables (vector matmul), `2` is
+        // shape-only, anything else (or unset) keeps the default Enabled. Lets
+        // bit-identity tests pin the numerics to the non-MFMA path.
+        let tc_enabled = match std::env::var("SVOD_TC").ok().as_deref() {
+            Some("0") => TcUsage::Disabled,
+            Some("2") => TcUsage::ShapeOnly,
+            _ => TcUsage::Enabled,
+        };
 
         Self {
             matvec_enabled,
@@ -317,6 +326,7 @@ impl HeuristicsConfig {
             thread_count,
             k_vectorize,
             output_upcast,
+            tc_enabled,
             ..Default::default()
         }
     }

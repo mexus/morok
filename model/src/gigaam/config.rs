@@ -55,6 +55,11 @@ pub struct GigaAmConfig {
     pub mel_center: bool,
     pub max_mel_frames: usize,
     pub max_encoder_frames: usize,
+    /// Maximum number of 16-frame post-subsampling blocks, derived as
+    /// `output_length(max_mel_frames) / 16` (floor). The encoder JIT binds its
+    /// `ts` var over `(1, max_sub_blocks)`; the sequence axis it produces is
+    /// `16·ts`, the clean factorisation the fp32 tensor-core gate proves.
+    pub max_sub_blocks: usize,
     /// CTC decoder built from the `decoding` section of the config, or an
     /// empty-vocabulary greedy decoder for synthetic configs that don't
     /// declare one.
@@ -112,6 +117,10 @@ impl GigaAmConfig {
             SubsamplingMode::Conv2d => 3,
         };
         let max_sub_frames = subsampled_len(subs_kernel, max_mel_frames);
+        // Number of whole 16-frame encoder blocks the largest input can fill.
+        // The encoder JIT binds `ts` over `(1, max_sub_blocks)` and emits a
+        // `16·ts` sequence axis (a clean Mul(16, ts) Range end for the TC gate).
+        let max_sub_blocks = (max_sub_frames / 16).max(1);
         if max_sub_frames > max_encoder_frames {
             return Err(Error::DecoderConfig {
                 message: format!(
@@ -151,6 +160,7 @@ impl GigaAmConfig {
             mel_center: raw.preprocessor.center,
             max_mel_frames,
             max_encoder_frames,
+            max_sub_blocks,
             decoder,
             transducer,
         })

@@ -30,11 +30,11 @@ jit_wrapper! {
 
         vars {
             b: (1, model.config.max_batch_size),
-            t: (1, model.config.max_mel_frames),
+            ts: (1, model.config.max_sub_blocks),
         }
 
-        build(mel, lengths, b, t) {
-            let out = model.encoder.forward_batch(mel, lengths, &b, &t)?;
+        build(mel, lengths, b, ts) {
+            let out = model.encoder.forward_batch(mel, lengths, &b, &ts)?;
             // Match the standalone encoder JIT's fp32 cast so the head sees the
             // same dtype regardless of the encoder's compute dtype.
             let out = out.cast(svod_dtype::DType::Float32).context(TensorSnafu)?;

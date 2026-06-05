@@ -402,11 +402,12 @@ fn do_expand(uop: &Arc<UOp>) -> Option<Arc<UOp>> {
     let exclude_args: Vec<usize> = if let Op::Wmma { metadata, a, b, .. } = op {
         // The per-output-tile expansion relies on the operand CONTRACTs being
         // hash-distinct from the raw operand subtrees — i.e. carrying
-        // TAG_TC_FINAL (applied in optimizer/tc.rs). Now that reduce axes are no
-        // longer in `exclude_args`, that tag is the only thing stopping a
-        // reduce-axis id that aliases an output-upcast id from collapsing the
-        // tiles to a broadcast. Trip in debug if a future TC-build path forgets
-        // it (release builds strip this).
+        // TAG_TC_FINAL (applied in optimizer/tc.rs and preserved through
+        // do_contract). Now that reduce axes are no longer in `exclude_args`,
+        // that tag is the only thing stopping a reduce-axis id that aliases an
+        // output-upcast id from collapsing the tiles to a broadcast. Trip in
+        // debug if a future TC-build path forgets it (release builds strip
+        // this).
         debug_assert!(
             a.tag().as_ref().is_some_and(|t| t.contains(&crate::devectorize::TAG_TC_FINAL))
                 && b.tag().as_ref().is_some_and(|t| t.contains(&crate::devectorize::TAG_TC_FINAL)),
@@ -518,13 +519,15 @@ fn do_expand(uop: &Arc<UOp>) -> Option<Arc<UOp>> {
     // NOTE: With K-vectorization disabled, this is the only vectorization path.
     // fix_reduce_unroll may still set Vector dtype for K-axis UPCAST if enabled,
     // but that's now opt-in via SVOD_K_VECTORIZE.
+    // Vectorize the result by `expand_sz`, mirroring Tinygrad expander.py:74
+    //   nsrc = UOp(root.op, root.dtype.scalar().vec(root.dtype.count*expand_sz), ...)
+    // Use `base()` (the scalar base of either Scalar OR Vector dtypes), NOT
+    // `scalar()` — the latter returns None for a Vector, which would collapse a
+    // multi-element output (e.g. a WMMA's count-4 D register) back to its
+    // single-tile width and silently drop the per-output-tile expansion.
     let base_dtype = uop.dtype();
     let base_count = base_dtype.vcount();
-    let new_dtype = if let Some(scalar) = base_dtype.scalar() {
-        DType::Scalar(scalar).vec(base_count * expand_sz)
-    } else {
-        base_dtype.clone()
-    };
+    let new_dtype = DType::Scalar(base_dtype.base()).vec(base_count * expand_sz);
 
     // GEP: recalculate indices for expanded vector
     // Tinygrad expander.py:60-63
@@ -711,11 +714,17 @@ fn do_contract(uop: &Arc<UOp>) -> Option<Arc<UOp>> {
         return None;
     };
 
-    // CONTRACT without UNROLL → VECTORIZE
+    // CONTRACT without UNROLL → VECTORIZE. Preserve the CONTRACT's tag on the
+    // scalar collapse: a 1-element-per-thread WMMA operand (fp32 MFMA) is an
+    // empty CONTRACT whose TAG_TC_FINAL must survive to the operand the WMMA
+    // sees (see do_expand's exclude_args).
     let Op::Unroll { src: unroll_inner, unroll_axes } = contract_src.op() else {
         let count = uop.dtype().vcount();
         if count == 1 {
-            return Some(contract_src.clone());
+            return Some(match uop.tag() {
+                Some(tag) => contract_src.with_tag(tag.clone()),
+                None => contract_src.clone(),
+            });
         }
         let sources: SmallVec<[Arc<UOp>; 4]> = (0..count).map(|_| contract_src.clone()).collect();
         return Some(UOp::vectorize(sources));
@@ -737,8 +746,15 @@ fn do_contract(uop: &Arc<UOp>) -> Option<Arc<UOp>> {
     let gep_indices = contract_gep_indices(contract_axes, unroll_axes, &remaining_axes);
     let gep_result = unroll_inner.gep(gep_indices);
 
-    // Return UNROLL with CONTRACT's dtype (Tinygrad: UOp(Ops.UNROLL, con.dtype, ...))
-    Some(gep_result.unroll_with_dtype(remaining_axes, uop.dtype()))
+    // Return UNROLL with CONTRACT's dtype (Tinygrad: UOp(Ops.UNROLL, con.dtype, ...)).
+    // Preserve the CONTRACT's tag here too — for WMMA operands it carries
+    // TAG_TC_FINAL, which keeps per-tile operand UNROLLs hash-distinct so the
+    // output tiles don't dedupe into one broadcast WMMA.
+    let unrolled = gep_result.unroll_with_dtype(remaining_axes, uop.dtype());
+    Some(match uop.tag() {
+        Some(tag) => unrolled.with_tag(tag.clone()),
+        None => unrolled,
+    })
 }
 
 /// Compute GEP indices for CONTRACT by nested iteration over remaining × contract axes.

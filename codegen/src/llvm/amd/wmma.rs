@@ -156,10 +156,11 @@ fn resolve_intrinsic(
         // Verified with `llc -mcpu=gfx942|gfx950` (ROCm 7.2): the f16/bf16 K=16
         // forms (`f16`/`bf16.1k`) select on both CDNA3 (gfx942) and CDNA4
         // (gfx950); the dotted K=32 double-rate forms (`.f16`/`.bf16`) select on
-        // gfx950 only; fp8/bf8 select only at K=32. Anything else has no MFMA
-        // intrinsic — return `None` so the caller raises `InvalidGraph` (and the
-        // optimizer decomposes it) instead of emitting a name LLVM silently
-        // lowers to a no-op extern call.
+        // gfx950 only; fp8/bf8 select only at K=32; f32 selects only at K=4
+        // (`v_mfma_f32_16x16x4_f32`, scalar A/B operands). Anything else has no
+        // MFMA intrinsic — return `None` so the caller raises `InvalidGraph`
+        // (and the optimizer decomposes it) instead of emitting a name LLVM
+        // silently lowers to a no-op extern call.
         let is_cdna4 = matches!(arch, AmdArch::Gfx950);
         let in_suffix = match (in_dt, k) {
             (ScalarDType::Float16, 32) if is_cdna4 => ".f16",
@@ -167,7 +168,8 @@ fn resolve_intrinsic(
             (ScalarDType::Float16 | ScalarDType::BFloat16, 32) => return None,
             (ScalarDType::Float16, _) => "f16",
             (ScalarDType::BFloat16, _) => "bf16.1k",
-            (ScalarDType::Float32, _) => "f32",
+            (ScalarDType::Float32, 4) => "f32",
+            (ScalarDType::Float32, _) => return None,
             (ScalarDType::FP8E4M3, 32) => ".fp8.fp8",
             (ScalarDType::FP8E5M2, 32) => ".bf8.bf8",
             _ => return None,

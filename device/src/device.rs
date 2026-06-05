@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use svod_dtype::DeviceSpec;
-use svod_ir::{BinaryOp, ConstValue, Op, UOp, UnaryOp};
+use svod_ir::{BinaryOp, ConstValue, Op, TernaryOp, UOp, UnaryOp};
 
 use crate::allocator::Allocator;
 use crate::error::{Error, Result};
@@ -277,6 +277,18 @@ fn checked_launch_binary(op: BinaryOp, lhs: i64, rhs: i64) -> Result<i64> {
     value.ok_or_else(|| Error::Runtime { message: format!("invalid launch-size arithmetic: {lhs} {op:?} {rhs}") })
 }
 
+/// Evaluate a ternary op in a launch-size expression. `MulAcc(a, b, c) = a*b+c`
+/// (overflow-checked); `Where(cond, t, f)` selects on a nonzero predicate.
+/// EXHAUSTIVE match so a new `TernaryOp` variant fails the compile, not silently
+/// at runtime.
+fn checked_launch_ternary(op: TernaryOp, a: i64, b: i64, c: i64) -> Result<i64> {
+    let value = match op {
+        TernaryOp::MulAcc => a.checked_mul(b).and_then(|ab| ab.checked_add(c)),
+        TernaryOp::Where => Some(if a != 0 { b } else { c }),
+    };
+    value.ok_or_else(|| Error::Runtime { message: format!("invalid launch-size ternary: {op:?}({a}, {b}, {c})") })
+}
+
 fn eval_launch_expr(expr: &Arc<UOp>, vars: &HashMap<&str, i64>) -> Result<i64> {
     match expr.op() {
         Op::Const(value) => const_value_to_i64(value.0),
@@ -297,6 +309,17 @@ fn eval_launch_expr(expr: &Arc<UOp>, vars: &HashMap<&str, i64>) -> Result<i64> {
         Op::Binary(op, lhs, rhs) => {
             checked_launch_binary(*op, eval_launch_expr(lhs, vars)?, eval_launch_expr(rhs, vars)?)
         }
+        // The symbolic simplifier fuses `a*b + c` (e.g. `16*ts − 1` from a
+        // reshaped symbolic sequence axis) into a single MulAcc; `Where` can
+        // appear when a launch dim is gated on a symbolic predicate. Evaluate
+        // both rather than rejecting — the alternative is the scheduler
+        // silently never fusing, which it does.
+        Op::Ternary(op, a, b, c) => checked_launch_ternary(
+            *op,
+            eval_launch_expr(a, vars)?,
+            eval_launch_expr(b, vars)?,
+            eval_launch_expr(c, vars)?,
+        ),
         Op::Unary(op, src) => checked_launch_unary(*op, eval_launch_expr(src, vars)?),
         Op::Cast { src, .. } | Op::BitCast { src, .. } | Op::After { passthrough: src, .. } => {
             eval_launch_expr(src, vars)

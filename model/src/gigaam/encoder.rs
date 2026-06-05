@@ -691,18 +691,33 @@ impl Encoder {
         x.try_transpose(-1, -2).context(TensorSnafu)
     }
 
-    /// Batched encoder path with dynamic batch and mel-frame length.
-    /// Input: `mel` `[B, n_mels, T_mel]`, `lengths` `[B]` valid lengths in mel frames.
-    /// Output: `[B, d_model, T_sub]`.
+    /// Batched encoder path with dynamic batch and post-subsampling length.
+    /// Input: `mel` `[B, n_mels, T_mel]`, `lengths` `[B]` valid lengths in mel
+    /// frames, `ts` = number of 16-frame encoder blocks after subsampling.
+    /// Output: `[B, d_model, T_sub]` with `T_sub = 16·ts`.
+    ///
+    /// Threading `ts` (rather than the raw mel-frame count) is what lets the
+    /// conformer matmuls fire on the fp32 CDNA3 tensor core: the sequence axis
+    /// becomes a clean `Mul(16, ts)` Range end, which the scheduler's TC gate
+    /// proves divisible by 16. The mel input is shrunk to the exact inverse of
+    /// subsampling (`64·ts − 3` frames, the smallest pre-image of `16·ts`), and
+    /// the subsampling output's sequence axis is reshaped to the symbolic
+    /// `16·ts` so all downstream Range ends inherit the clean factorisation.
     pub fn forward_batch(
         &self,
         mel: &Tensor,
         lengths: &Tensor,
         batch: &BoundVariable,
-        mel_len: &BoundVariable,
+        ts: &BoundVariable,
     ) -> Result<Tensor> {
         let b = batch.as_sint();
-        let t_mel = mel_len.as_sint();
+        let ts = ts.as_sint();
+        // Post-subsampling sequence length: clean Mul(16, ts) for the TC gate.
+        let t_sub = SInt::Const(16) * &ts;
+        // Exact inverse of subsampling: smallest mel-frame count whose
+        // subsampled length is `16·ts`. Kernel-independent for odd kernels
+        // (pad cancels), pinned against `output_length` in a unit test.
+        let t_mel = SInt::Const(64) * &ts - SInt::Const(3);
 
         let lengths = lengths.try_shrink([Some((SInt::Const(0), b.clone()))]).context(TensorSnafu)?;
         let lengths = lengths.cast(DType::Index).context(TensorSnafu)?;
@@ -722,8 +737,13 @@ impl Encoder {
         let x = x.cast(self.input_dtype()).context(TensorSnafu)?;
         let x = self.subsampling.forward(&x)?;
 
-        let shape = x.shape().context(TensorSnafu)?;
-        let t_sub = shape[1].clone();
+        // Reshape the sequence axis to the symbolic `16·ts`. The subsampling
+        // output already has exactly `16·ts` frames (mel was shrunk to the
+        // exact pre-image), so this is element-count-preserving — it only
+        // swaps the conv-ceildiv-derived extent for a clean `Mul(16, ts)` that
+        // the TC gate can prove divisible by 16.
+        let xs = x.shape().context(TensorSnafu)?;
+        let x = x.try_reshape([xs[0].clone(), t_sub.clone(), xs[2].clone()]).context(TensorSnafu)?;
 
         let range = Tensor::arange(self.max_encoder_frames as i64, None, None).context(TensorSnafu)?;
         let range = range.cast(DType::Index).context(TensorSnafu)?;
@@ -757,6 +777,18 @@ impl Encoder {
 
     pub fn subsampling_output_length(&self, mel_frames: usize) -> usize {
         self.subsampling.output_length(mel_frames)
+    }
+
+    /// Inverse of [`subsampling_output_length`](Self::subsampling_output_length):
+    /// the smallest mel-frame count whose subsampled length equals exactly
+    /// `target_sub`, or `None` if no `mel_frames <= max` produces it.
+    ///
+    /// `output_length` is monotone non-decreasing in `mel_frames`, so a forward
+    /// scan finds the smallest pre-image without trusting the closed-form
+    /// algebra (`64*ts - 3`); callers that need the symbolic expression derive
+    /// it separately and pin it against this routine in a unit test.
+    pub fn mel_frames_for_sub_len(&self, target_sub: usize, max: usize) -> Option<usize> {
+        (1..=max).find(|&m| self.subsampling.output_length(m) == target_sub)
     }
 
     /// Construct an `Encoder` from an already-remapped state dict + config.

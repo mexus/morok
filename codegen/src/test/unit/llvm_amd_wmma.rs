@@ -50,6 +50,22 @@ fn cdna_k32_dotted_forms_are_gfx950_only() {
 }
 
 #[test]
+fn cdna_f32_requires_k4() {
+    // fp32 MFMA selects only at K=4 (`v_mfma_f32_16x16x4_f32`, verified with
+    // `llc -mcpu=gfx942`); any other K must return `None` rather than name an
+    // unselectable intrinsic.
+    let k4 = resolve_intrinsic(AmdArch::Gfx942, Some(ScalarDType::Float32), Some(ScalarDType::Float32), (16, 16, 4));
+    assert_eq!(k4.as_deref(), Some("llvm.amdgcn.mfma.f32.16x16x4f32"));
+    for k in [8, 16, 32] {
+        assert!(
+            resolve_intrinsic(AmdArch::Gfx942, Some(ScalarDType::Float32), Some(ScalarDType::Float32), (16, 16, k))
+                .is_none(),
+            "f32 K={k} must not resolve"
+        );
+    }
+}
+
+#[test]
 fn rdna3_wmma_naming() {
     let name =
         resolve_intrinsic(AmdArch::Gfx1100, Some(ScalarDType::Float16), Some(ScalarDType::Float32), (16, 16, 16));

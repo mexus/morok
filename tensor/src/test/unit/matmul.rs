@@ -1,7 +1,7 @@
 use crate::*;
 use ndarray::{Array2, array};
 use svod_dtype::DType;
-use svod_schedule::{BeamConfig, OptStrategy, OptimizerConfig, testing::setup_test_tracing};
+use svod_schedule::{BeamConfig, HeuristicsConfig, OptStrategy, OptimizerConfig, TcSelect, testing::setup_test_tracing};
 
 fn prep_config(optimizer: OptimizerConfig) -> PrepareConfig {
     optimizer.into()
@@ -662,17 +662,20 @@ fn test_print_matmul_64x64_ir() {
 /// and the per-tile expansion. `tol` stays small because the inputs round-trip
 /// losslessly and the accumulation is in f32.
 fn validate_mfma_square(size: usize, in_dtype: DType, intrinsic: &str, tol: f32) {
+    let beam = OptimizerConfig::builder()
+        .strategy(OptStrategy::Beam { width: 2 })
+        .beam(BeamConfig::builder().disable_cache(true).build())
+        .build();
+    validate_mfma_square_with(beam, size, in_dtype, intrinsic, tol);
+}
+
+fn validate_mfma_square_with(opt: OptimizerConfig, size: usize, in_dtype: DType, intrinsic: &str, tol: f32) {
     let a_data: Vec<f32> = (0..size * size).map(|x| ((x % 7) as f32) - 3.0).collect();
     let b_data: Vec<f32> = (0..size * size).map(|x| ((x % 5) as f32) - 2.0).collect();
     let a_nd = Array2::from_shape_vec((size, size), a_data).unwrap();
     let b_nd = Array2::from_shape_vec((size, size), b_data).unwrap();
 
-    let beam = prep_config(
-        OptimizerConfig::builder()
-            .strategy(OptStrategy::Beam { width: 2 })
-            .beam(BeamConfig::builder().disable_cache(true).build())
-            .build(),
-    );
+    let beam = prep_config(opt);
     let build = || {
         let a = Tensor::from_ndarray(&a_nd).cast(in_dtype.clone()).unwrap();
         let b = Tensor::from_ndarray(&b_nd).cast(in_dtype.clone()).unwrap();
@@ -704,6 +707,44 @@ fn test_matmul_bf16_mfma_validated() {
 #[ignore]
 fn test_matmul_f16_mfma_validated() {
     validate_mfma_square(512, DType::Float16, "llvm.amdgcn.mfma.f32.16x16x16f16", 1.0);
+}
+
+/// Heuristic config pinned to the cdna3 fp32 tensor core. The core is
+/// BEAM-only (`heuristic_pick=false` — `v_mfma_f32_16x16x4_f32` matches the
+/// packed-vector fp32 rate, so an unconditional heuristic pick pessimizes), so
+/// these correctness tests force it via an explicit `tc_select` pin.
+fn f32_mfma_config() -> OptimizerConfig {
+    let renderer = svod_schedule::OptimizerRenderer::amd_cdna3();
+    let idx = renderer
+        .tensor_cores
+        .iter()
+        .position(|tc| tc.dtype_in == DType::Float32 && tc.dims == (16, 16, 4))
+        .expect("cdna3 fp32 16x16x4 tensor core");
+    OptimizerConfig::builder()
+        .strategy(OptStrategy::Heuristic)
+        .heuristics(HeuristicsConfig::builder().tc_select(TcSelect::Index(idx)).build())
+        .build()
+}
+
+/// gfx942 fp32 16×16×4 MFMA (`v_mfma_f32_16x16x4_f32`): scalar f32 A/B
+/// operands (ept 1/1), the smallest reduce tile (K=4 → 2 unroll bits), and a
+/// raw-fp32 input path with no cast prelude. Even size — every dim divides 16,
+/// so this proves the layout/swizzle and the K-tile loop; MFMA reorders the
+/// f32 accumulation but the integer inputs keep it exact.
+#[test]
+#[ignore]
+fn test_matmul_f32_mfma_validated() {
+    validate_mfma_square_with(f32_mfma_config(), 512, DType::Float32, "llvm.amdgcn.mfma.f32.16x16x4f32", 1.0);
+}
+
+/// fp32 MFMA multi-tile: 64×64 forces the 4×4 post-TC M/N tile upcasts on top
+/// of the residual K loop, the layer where the broadcast-collapse and
+/// scalar-accumulator bugs lived. (Odd non-divisible sizes don't get the fp32
+/// TC — PADTO selection is a follow-up.)
+#[test]
+#[ignore]
+fn test_matmul_f32_mfma_multitile_validated() {
+    validate_mfma_square_with(f32_mfma_config(), 64, DType::Float32, "llvm.amdgcn.mfma.f32.16x16x4f32", 1.0);
 }
 
 /// gfx942 fp8 (e4m3) 16×16×32 MFMA. The cdna3 fp8 tensor core is K=32, so this

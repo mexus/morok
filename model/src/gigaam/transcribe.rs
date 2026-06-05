@@ -270,7 +270,21 @@ impl<S: Splitter> Transcriber<S> {
         // codegen sees a clean factorisation.
         let chunk_samples_cap = splitter.max_chunk_samples(&model_bounds).min(model_bounds.max_samples());
         let chunk_mel = (chunk_samples_cap / hop_length).saturating_add(2 * subsampling_factor);
-        let max_t_mel = chunk_mel.max(1).next_power_of_two().min(model.config.max_mel_frames).max(subsampling_factor);
+        let mut max_t_mel =
+            chunk_mel.max(1).next_power_of_two().min(model.config.max_mel_frames).max(subsampling_factor);
+
+        // The encoder now binds `ts` (16-frame post-subsampling blocks) and
+        // shrinks its mel input to the exact pre-image of `16·ts` frames
+        // (`64·ts − 3`). The mel buffer must be wide enough to hold that
+        // pre-image for the JIT's `ts` ceiling, so the encoder never reads past
+        // the buffer. For a power-of-two `max_t_mel` this is a no-op
+        // (`64·ts_cap − 3 = max_t_mel − 3`); the `max` guards the clamped case.
+        let subs_kernel = match model.config.subsampling_mode {
+            SubsamplingMode::Conv1d => model.config.subs_kernel_size,
+            SubsamplingMode::Conv2d => 3,
+        };
+        let ts_cap = (subs_output_length(subs_kernel, max_t_mel) / 16).max(1);
+        max_t_mel = max_t_mel.max(64 * ts_cap - 3).min(model.config.max_mel_frames);
 
         // SDPA scores `[B, H, T_sub², dtype]` are live twice during attention;
         // budget `max_batch` so they stay under `2 * max_scores_mib`.
@@ -304,12 +318,12 @@ impl<S: Splitter> Transcriber<S> {
                 } else {
                     model.config.decoder.clone()
                 };
-                let mut jit = GigaAmCtcJit::new(model.clone()).with_b_bound(max_batch).with_t_bound(max_t_mel);
+                let mut jit = GigaAmCtcJit::new(model.clone()).with_b_bound(max_batch).with_ts_bound(ts_cap);
                 jit.prepare_with_config(mel_spec, lengths_spec, &prepare_config).context(JitSnafu)?;
                 HeadDecoder::Ctc { jit, decoder }
             }
             Head::Rnnt { runtime, .. } => {
-                let mut enc = GigaAmEncoderJit::new(model.clone()).with_b_bound(max_batch).with_t_bound(max_t_mel);
+                let mut enc = GigaAmEncoderJit::new(model.clone()).with_b_bound(max_batch).with_ts_bound(ts_cap);
                 // The output stays host-mapped: copyout is one contiguous
                 // memcpy (vs the old element-wise strided transpose). A
                 // device-local output (SDMA copyout) hangs the first execute —
@@ -447,7 +461,14 @@ impl<S: Splitter> Transcriber<S> {
             let b = (num_chunks - chunk_batch_start).min(max_batch);
             let chunk_lengths: Vec<usize> = (0..b).map(|bi| chunks_meta[chunk_batch_start + bi].2).collect();
             let t_exec = chunk_lengths.iter().copied().max().unwrap_or(1).max(1);
-            let t_exec_sub = subs_output_length(subs_kernel_size, t_exec);
+            // The encoder binds `ts` = number of 16-frame post-subsampling
+            // blocks (ceil of the largest real sub-length / 16) and emits a
+            // `16·ts` sequence axis — padded up to the next multiple of 16, the
+            // clean factorisation the fp32 tensor-core gate proves. Per-item
+            // decode still slices the real sub-length (`actual_sub`) out of this
+            // padded stride; the extra frames are zero/masked.
+            let ts_exec = subs_output_length(subs_kernel_size, t_exec).div_ceil(16).max(1);
+            let t_exec_sub = 16 * ts_exec;
 
             let t_stage = Instant::now();
             let batch_mels: Vec<Vec<f32>> = (0..b)
@@ -476,7 +497,7 @@ impl<S: Splitter> Transcriber<S> {
                     t_mel += t_pack.elapsed();
 
                     let t_enc = Instant::now();
-                    jit.execute_with_vars(&[("b", b as i64), ("t", t_exec as i64)]).context(JitSnafu)?;
+                    jit.execute_with_vars(&[("b", b as i64), ("ts", ts_exec as i64)]).context(JitSnafu)?;
                     let total_vocab = decoder.total_vocab();
                     let item_stride = t_exec_sub * total_vocab;
                     let logits_buf = jit.output().context(JitSnafu)?;
@@ -526,7 +547,7 @@ impl<S: Splitter> Transcriber<S> {
                     t_mel += t_pack.elapsed();
 
                     let t_enc = Instant::now();
-                    enc_jit.execute_with_vars(&[("b", b as i64), ("t", t_exec as i64)]).context(JitSnafu)?;
+                    enc_jit.execute_with_vars(&[("b", b as i64), ("ts", ts_exec as i64)]).context(JitSnafu)?;
                     let item_stride = t_exec_sub * d_model;
                     // Output is frame-major [B, t_exec_sub, d_model] (permuted
                     // on-device) in a device-local buffer: one contiguous
