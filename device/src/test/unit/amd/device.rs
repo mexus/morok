@@ -36,6 +36,44 @@ fn aql_scratch_descriptor_gfx9_encoding() {
     assert_eq!(d.wave64_lane_byte_size, 256); // wave64: priv_seg * 64 / 64
 }
 
+/// Cross-model parallelism (Pillar A): `assign_owner` must spread distinct
+/// owners across distinct pool queues (fill-empty-first) up to `hw_queues`, and
+/// the (hw_queues+1)-th owner must co-tenant an existing queue (the pool never
+/// exceeds `hw_queues` — what kills the KFD-queue-exhaustion crash). Manual
+/// probe: assumes isolated execution (the queue pool is process-global).
+#[test]
+#[ignore = "manual hardware probe; needs a real AMD GPU"]
+fn assign_owner_spreads_then_cotenants() {
+    use std::collections::HashSet;
+    let alloc = match crate::amd::AmdAllocator::new(0) {
+        Ok(a) => a,
+        Err(_) => {
+            eprintln!("skipping: no supported AMD GPU");
+            return;
+        }
+    };
+    let core = alloc.dev.core();
+    if core.signal_pool().is_none() {
+        core.install_signal_pool(crate::amd::signal::SignalPool::new(&alloc, 256).expect("signal pool"));
+    }
+    let n = core.hw_queues();
+    assert!(n >= 1, "hw_queues must be >= 1");
+    // Hold all owners alive so their queues stay referenced (strong_count > 1).
+    let owners: Vec<_> = (0..n).map(|_| core.assign_owner(&alloc).expect("assign")).collect();
+    let distinct: HashSet<_> = owners.iter().map(|o| o.queue_ptr()).collect();
+    assert_eq!(distinct.len(), n, "first {n} owners must land on {n} distinct queues (fill-empty-first)");
+    // The overflow owner has no idle queue left → co-tenants an existing one;
+    // the pool stays capped at `n` (no unbounded KFD-queue creation).
+    let extra = core.assign_owner(&alloc).expect("assign overflow");
+    assert!(
+        distinct.contains(&extra.queue_ptr()),
+        "overflow owner must co-tenant an existing queue, not grow the pool"
+    );
+    eprintln!(
+        "PROBE assign_owner: {n} owners → {n} distinct queues, overflow co-tenanted (pool capped at hw_queues={n})"
+    );
+}
+
 #[test]
 fn pack_tmpring_wavesize_width_by_arch() {
     // wave_scratch=0x3FFFF: cdna(13b) truncates, rdna3(15b) truncates, rdna4(18b) keeps it.

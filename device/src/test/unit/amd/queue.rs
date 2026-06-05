@@ -52,7 +52,7 @@ fn sdma_device_local_roundtrip() {
     // Bring up signal pool + copy queue (the device factory normally does this);
     // both installers are idempotent, so this is safe if a factory already ran.
     if core.signal_pool().is_none() {
-        core.install_signal_pool(crate::amd::signal::SignalPool::new(&alloc).expect("signal pool"));
+        core.install_signal_pool(crate::amd::signal::SignalPool::new(&alloc, 64).expect("signal pool"));
     }
     if core.copy_queue().is_none() {
         core.install_copy_queue(AmdCopyQueue::create(&alloc).expect("copy queue"));

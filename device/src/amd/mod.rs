@@ -41,7 +41,7 @@ pub mod va_registry;
 #[cfg(target_os = "linux")]
 pub use allocator::AmdAllocator;
 #[cfg(target_os = "linux")]
-pub use connector::{AmdConnector, ConnectorLease};
+pub use connector::{OwnerCtx, PoolQueue};
 #[cfg(target_os = "linux")]
 pub use device::{AmdDevice, AmdDeviceCore};
 #[cfg(target_os = "linux")]

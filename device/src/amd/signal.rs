@@ -31,8 +31,9 @@ const WAIT_EVENTS_ESCALATE_MS: u64 = 200;
 /// and SDMA fence writes target that same `value`. So every signal — compute
 /// completion or copy timeline — shares this one layout.
 const SLOT_BYTES: usize = 64;
-/// 4 KiB page / 64 B per slot = 64 signals per pool.
-const SLOTS_PER_POOL: usize = 64;
+/// 4 KiB page / 64 B per slot = 64 signals per page — the page-alignment quantum
+/// the pool rounds its slot count up to.
+const SLOTS_PER_PAGE: usize = 64;
 /// Byte offset of the `value` counter inside an `amd_signal_t` slot.
 const SIGNAL_VALUE_OFFSET: usize = 8;
 
@@ -210,11 +211,11 @@ pub const TIMELINE_WRAP_WATERMARK: u64 = 1 << 31;
 
 /// A connector's timeline: an owned monotonic counter plus the shared signal
 /// the GPU writes on dispatch completion. This is the ONE primitive that
-/// crosses owners — a connector dispatches against it (advancing `value`), and
+/// crosses owners — a `PoolQueue` dispatches against it (advancing `value`), and
 /// any thread can *drain* it (read `value`, poll the signal slot) without ever
-/// touching the connector's queue. The registry on `AmdDeviceCore` holds
-/// `Weak<Timeline>` (not `Weak<AmdConnector>`), so `synchronize_all` fences
-/// in-flight work purely through these atomics — keeping dispatch lock-free.
+/// taking the queue's dispatch lock. The registry on `AmdDeviceCore` holds
+/// `Weak<PoolQueue>`, and `drain_all` fences in-flight work purely through these
+/// atomics + the per-op signals — keeping concurrent dispatch unblocked.
 #[derive(Debug)]
 pub struct Timeline {
     signal: Arc<AmdSignal>,
@@ -297,12 +298,17 @@ impl TimelineSignal for AmdSignal {
     }
 }
 
-/// Pool over one shared host-visible GTT page; hands out [`AmdSignal`]s.
+/// Pool over a shared host-visible GTT region (one or more pages); hands out
+/// [`AmdSignal`]s. Sized at construction: a flat per-owner model needs only a
+/// handful, but DAG dispatch reserves one slot per kernel of the largest
+/// captured graph (low hundreds for GigaAM), so the pool spans several pages.
 pub struct SignalPool {
     /// Owning buffer — held to keep the GTT mapping alive while signals exist.
     _buffer: RawBuffer,
     base_gpu: u64,
     base_host: NonNull<u8>,
+    /// Total slots carved from the region (rounded up to whole pages).
+    slots: usize,
     free_slots: Mutex<Vec<u32>>,
     /// Captured at pool creation; signals downgrade-clone this into a `Weak`
     /// so `wait` can call `AmdDeviceCore::wait_events` for KFD escalation.
@@ -321,23 +327,26 @@ impl SignalPool {
     /// the GPU's decrement of the completion_signal field is immediately
     /// visible to the host (otherwise it sits in GPU L2 and we spin
     /// forever).
-    pub fn new(allocator: &AmdAllocator) -> Result<Arc<Self>> {
-        let buffer = allocator.alloc_uncached(SLOT_BYTES * SLOTS_PER_POOL)?;
+    pub fn new(allocator: &AmdAllocator, slots: usize) -> Result<Arc<Self>> {
+        // Round up to a whole page so the GTT allocation is page-aligned and
+        // every byte is usable as a slot.
+        let slots = slots.max(1).next_multiple_of(SLOTS_PER_PAGE);
+        let buffer = allocator.alloc_uncached(SLOT_BYTES * slots)?;
         let (base_gpu, base_host) = match &buffer {
             RawBuffer::AmdDevice { gpu_addr, host_ptr: Some(h), .. } => (*gpu_addr, *h),
             _ => {
                 return Err(Error::AmdAllocFailed { reason: "SignalPool requires host-visible AMD buffer".into() });
             }
         };
-        let free_slots = Mutex::new((0..SLOTS_PER_POOL as u32).rev().collect()); // pop low slots first
+        let free_slots = Mutex::new((0..slots as u32).rev().collect()); // pop low slots first
         let device = Arc::clone(allocator.dev.core());
-        Ok(Arc::new(Self { _buffer: buffer, base_gpu, base_host, free_slots, device }))
+        Ok(Arc::new(Self { _buffer: buffer, base_gpu, base_host, slots, free_slots, device }))
     }
 
     /// Carve off a new signal from the pool. Returns `Err` when exhausted.
     pub fn acquire(self: &Arc<Self>) -> Result<AmdSignal> {
         let slot = self.free_slots.lock().pop().ok_or_else(|| Error::AmdAllocFailed {
-            reason: format!("SignalPool exhausted ({SLOTS_PER_POOL} slots in use)"),
+            reason: format!("SignalPool exhausted ({} slots in use)", self.slots),
         })?;
         let offset = slot as usize * SLOT_BYTES;
         let base_gpu = self.base_gpu + offset as u64;
@@ -370,6 +379,14 @@ impl SignalPool {
     fn release_slot(&self, slot: u32) {
         self.free_slots.lock().push(slot);
     }
+
+    /// Currently-free slot count. Used by graph capture to decide whether a DAG
+    /// reservation (one slot per kernel, held for the graph's life) would leave
+    /// enough headroom for per-op AQL back-pressure + PM4 counters; if not,
+    /// capture falls back to blanket-BARRIER instead of starving dispatch.
+    pub fn free(&self) -> usize {
+        self.free_slots.lock().len()
+    }
 }
 
 impl std::fmt::Debug for SignalPool {
@@ -377,7 +394,7 @@ impl std::fmt::Debug for SignalPool {
         let free = self.free_slots.lock().len();
         f.debug_struct("SignalPool")
             .field("base_gpu", &format_args!("{:#x}", self.base_gpu))
-            .field("slots_total", &SLOTS_PER_POOL)
+            .field("slots_total", &self.slots)
             .field("slots_free", &free)
             .finish()
     }

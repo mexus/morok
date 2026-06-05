@@ -84,6 +84,12 @@ pub struct GraphKernel<'a> {
     pub vals: Vec<i64>,
     pub global_size: Option<[usize; 3]>,
     pub local_size: Option<[usize; 3]>,
+    /// Emission-order indices of the producer kernels this kernel must wait on
+    /// (RAW/WAR/WAW hazards over resolved buffer GVAs). Computed by the host
+    /// hazard analysis in the same flatten order the kernels are emitted, so a
+    /// DAG-aware backend can strip the per-dispatch BARRIER bit and gate only on
+    /// these producers' completion signals. Empty = no producer in this graph.
+    pub deps: Vec<usize>,
 }
 
 /// A pre-captured kernel chain replayed with one submit. Backends that can

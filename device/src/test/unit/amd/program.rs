@@ -122,7 +122,7 @@ fn aql_native_kernel_dispatch_probe() {
         return;
     }
     if core.signal_pool().is_none() {
-        core.install_signal_pool(crate::amd::signal::SignalPool::new(&alloc).expect("signal pool"));
+        core.install_signal_pool(crate::amd::signal::SignalPool::new(&alloc, 64).expect("signal pool"));
     }
 
     // One-buffer kernel: workitem 0 stores 0.0 into buf0[0].
@@ -151,8 +151,9 @@ attributes #0 = { alwaysinline nounwind "no-builtins" "amdgpu-flat-work-group-si
         }
     };
     let prog = AmdProgram::load(alloc.dev.clone(), &alloc, &bytes, "amd_native_probe", 1, 0).expect("load program");
-    let conn = crate::amd::connector::AmdConnector::new_with_resources(Arc::clone(core), &alloc).expect("connector");
-    assert!(!conn.queue().is_pm4(), "multi-XCC device must use an AQL queue");
+    let pool = crate::amd::connector::PoolQueue::new_with_resources(Arc::clone(core), &alloc).expect("pool queue");
+    let conn = crate::amd::connector::OwnerCtx::new(Arc::clone(&pool));
+    assert!(!conn.pool().queue().is_pm4(), "multi-XCC device must use an AQL queue");
 
     // Output buffer (host-visible GTT), seeded with a sentinel so the kernel's
     // store-of-0.0 is observable.
@@ -181,11 +182,11 @@ attributes #0 = { alwaysinline nounwind "no-builtins" "amdgpu-flat-work-group-si
     std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
 
     // Kernargs: a single 64-bit pointer = the output buffer GPU VA.
-    let off = conn.arena().bump(prog.kernarg_size(), 16).expect("kernarg bump");
+    let off = conn.pool().arena().bump(prog.kernarg_size(), 16).expect("kernarg bump");
     // SAFETY: fresh slot, sole writer.
-    let host_base = unsafe { conn.arena().host_at(off) };
+    let host_base = unsafe { conn.pool().arena().host_at(off) };
     unsafe { std::ptr::copy_nonoverlapping(out_gpu.to_le_bytes().as_ptr(), host_base, 8) };
-    let kernarg_gpu = conn.arena().gpu_at(off);
+    let kernarg_gpu = conn.pool().arena().gpu_at(off);
 
     // Packed-field copies (cf. execute_on) before passing by value.
     let priv_seg = prog.kd.private_segment_fixed_size;
@@ -199,7 +200,7 @@ attributes #0 = { alwaysinline nounwind "no-builtins" "amdgpu-flat-work-group-si
         kernarg_gpu,
         /*completion_signal=*/ sig_gpu,
     );
-    conn.queue().dispatch_aql_native(&packet).expect("native dispatch");
+    conn.pool().queue().dispatch_aql_native(&packet).expect("native dispatch");
 
     // Poll completion: value drops below the initial 1, or time out.
     // SAFETY: coherent GTT slot; firmware writes `value` at sig_gpu+value_off.
@@ -261,7 +262,7 @@ fn aql_graph_capture_replay() {
         return;
     }
     if core.signal_pool().is_none() {
-        core.install_signal_pool(crate::amd::signal::SignalPool::new(&alloc).expect("signal pool"));
+        core.install_signal_pool(crate::amd::signal::SignalPool::new(&alloc, 64).expect("signal pool"));
     }
 
     let ir = r#"; ModuleID = 'amd_graph_probe'
@@ -303,6 +304,7 @@ attributes #0 = { alwaysinline nounwind "no-builtins" "amdgpu-flat-work-group-si
         vals: vec![],
         global_size: Some([1, 1, 1]),
         local_size: Some([1, 1, 1]),
+        deps: vec![],
     }];
     let graph = match AmdGraph::capture(&alloc, &kernels).expect("capture") {
         Some(g) => g,
@@ -350,7 +352,7 @@ fn aql_graph_two_kernel_raw_dependency() {
         return;
     }
     if core.signal_pool().is_none() {
-        core.install_signal_pool(crate::amd::signal::SignalPool::new(&alloc).expect("signal pool"));
+        core.install_signal_pool(crate::amd::signal::SignalPool::new(&alloc, 64).expect("signal pool"));
     }
 
     let ir_set = r#"target triple = "amdgcn-amd-amdhsa"
@@ -394,13 +396,18 @@ attributes #0 = { alwaysinline nounwind "amdgpu-flat-work-group-size"="1,64" }
             vals: vec![],
             global_size: Some([1, 1, 1]),
             local_size: Some([1, 1, 1]),
+            deps: vec![],
         },
+        // Kernel B reads+writes the buffer A wrote: a true RAW (and WAW) on A.
+        // Declaring dep `0` makes DAG dispatch gate B's launch on A's completion
+        // signal via a `barrier_and`, the exact path this probe validates.
         GraphKernel {
             program: &prog_inc as &dyn Program,
             buffers: vec![out_gpu as *mut u8],
             vals: vec![],
             global_size: Some([1, 1, 1]),
             local_size: Some([1, 1, 1]),
+            deps: vec![0],
         },
     ];
     let graph = match AmdGraph::capture(&alloc, &kernels).expect("capture") {

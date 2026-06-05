@@ -1,14 +1,13 @@
 //! `KernargArena`: bump allocator for AMDGPU kernel-argument buffers.
 //!
-//! Sized at 16 MiB GTT-coherent. **One per `AmdConnector`** — the bump cursor
-//! and the connector's dispatch timeline are then the same ordering, so a
-//! wrapped slot is provably free once the connector's timeline drains. Each
-//! `Program::execute` claims `kernarg_size` bytes (16-byte aligned per ABI).
-//! The arena wraps when it fills; on wrap we drain every live `AmdConnector`
-//! via the arena's owning `AmdDeviceCore` — without that drain a wrap can
-//! clobber kernargs the GPU is still consuming (a global interpreter lock +
-//! single-queue dispatch would make this impossible to interleave; with
-//! per-owner connectors the host can sprint ahead of the GPU).
+//! Sized at 16 MiB GTT-coherent. **One per `PoolQueue`**. A dispatch holds the
+//! queue's dispatch lock across bump + kernarg write + ring submission, so the
+//! bump cursor order matches the ring order — a wrapped slot is provably free
+//! once the whole pool drains. Each `Program::execute` claims `kernarg_size`
+//! bytes (16-byte aligned per ABI). The arena wraps when it fills; on wrap we
+//! drain every live `PoolQueue` via the arena's owning `AmdDeviceCore` —
+//! without that drain a wrap can clobber kernargs the GPU is still consuming
+//! (the host can sprint ahead of the GPU on a `wait=false` burst).
 
 #![cfg(target_os = "linux")]
 
@@ -29,7 +28,7 @@ pub struct KernargArena {
     pub base_host: NonNull<u8>,
     pub size: usize,
     cursor: Mutex<usize>,
-    /// Back-reference to the device core, used to drain every live connector
+    /// Back-reference to the device core, used to drain every live pool queue
     /// on wrap (`AmdDeviceCore::synchronize_all`). `Weak` because the program
     /// that owns this arena also indirectly owns the core via `Arc<AmdDevice>`
     /// — a strong handle here would form a cycle.
@@ -45,10 +44,10 @@ unsafe impl Sync for KernargArena {}
 impl Drop for KernargArena {
     /// Free the 16 MiB GTT-coherent backing. `RawBuffer` lacks a `Drop` (the
     /// allocator path consumes it by destructure), so the arena — owned
-    /// directly by `AmdConnector` — would otherwise leak its allocation every
-    /// time a connector drops. Safe against unmap-while-busy because
-    /// `AmdConnector::Drop` synchronises this connector's timeline before the
-    /// `arena` field (and hence this `Drop`) runs.
+    /// directly by `PoolQueue` — would otherwise leak its allocation every
+    /// time a queue drops. Safe against unmap-while-busy because
+    /// `PoolQueue::Drop` drains the queue before the `arena` field (and hence
+    /// this `Drop`) runs.
     fn drop(&mut self) {
         self._buffer.free_amd_device_in_place();
     }
@@ -118,8 +117,9 @@ impl KernargArena {
 
     /// # Safety
     /// Caller must ensure `offset + size <= self.size` and that no concurrent
-    /// writer holds the same slot. With FIFO AQL execution and bump
-    /// semantics, the only producer of a given slot is the caller of `bump`.
+    /// writer holds the same slot. The dispatch lock held across bump + write +
+    /// dispatch (in `execute_on`) guarantees the only producer of a given slot
+    /// is the caller of `bump`, and that the GPU reads it before it is reused.
     pub unsafe fn host_at(&self, offset: usize) -> *mut u8 {
         unsafe { self.base_host.as_ptr().add(offset) }
     }

@@ -226,22 +226,21 @@ pub fn parse_kernel(bytes: &[u8], kernel_name: &str) -> Result<ParsedKernel> {
 
 /// Loaded AMDGPU program: code object resident in VRAM + kernel metadata.
 ///
-/// Connector-agnostic by construction — programs hold only the immutable
-/// kernel descriptor (rsrc1/2/3, prog_addr, kd, arities) plus the device
-/// handle needed by `Program::execute` trait callers (who don't supply a
-/// connector). Plan and graph callers downcast to `AmdProgram` and route
-/// through `execute_on(&AmdConnector, …)` with their OWN connector — so
-/// one cached program safely services any number of plans on the same
-/// physical AMD:N.
+/// Owner-agnostic by construction — programs hold only the immutable kernel
+/// descriptor (rsrc1/2/3, prog_addr, kd, arities) plus the device handle needed
+/// by `Program::execute` trait callers (who don't supply an owner). Plan and
+/// graph callers downcast to `AmdProgram` and route through
+/// `execute_on(&OwnerCtx, …)` with their OWN owner context — so one cached
+/// program safely services any number of plans on the same physical AMD:N.
 pub struct AmdProgram {
     name: String,
-    /// Device handle — used by the `Program::execute` trait method to lease a
-    /// connector when the caller doesn't go through `AmdProgram::execute_on`.
-    /// Plan/graph callers ignore this.
+    /// Device handle — used by the `Program::execute` trait method to assign an
+    /// owner (`PoolQueue`) when the caller doesn't go through
+    /// `AmdProgram::execute_on`. Plan/graph callers ignore this.
     dev: Arc<AmdDevice>,
     /// Logical AMD device index (`AMD:N`), captured from the loading
     /// allocator. Lets the trait `execute` rebuild an `AmdAllocator` (cheap —
-    /// shared via `DEVICE_CACHE`) to lease a connector when none is supplied.
+    /// shared via `DEVICE_CACHE`) to assign an owner when none is supplied.
     device_id: usize,
     /// AQL `kernel_object` field: GPU VA of the kernel descriptor inside the
     /// loaded code object. Used by the AQL kernel-dispatch packet only.
@@ -523,8 +522,8 @@ impl AmdProgram {
 
     /// Required private (scratch) segment size in bytes-per-thread, from the
     /// kernel descriptor (`kd.private_segment_fixed_size`). Used by callers
-    /// to size the connector's scratch before dispatch
-    /// (`AmdConnector::ensure_has_local_memory`).
+    /// to size the queue's scratch before dispatch
+    /// (`PoolQueue::ensure_has_local_memory`).
     pub fn private_segment_size(&self) -> u32 {
         self.kd.private_segment_fixed_size
     }
@@ -576,12 +575,13 @@ impl std::fmt::Debug for AmdProgram {
 }
 
 impl AmdProgram {
-    /// Connector-scoped dispatch entry point. Reads queue / kernarg arena /
-    /// scratch / timeline from `conn`, so plan and graph callers dispatch on
-    /// their own isolated ring. The `Program::execute` trait fallback below
-    /// leases a connector from the device pool and delegates here for callers
-    /// that don't supply one. Callers must have sized `conn`'s scratch
-    /// (`ensure_has_local_memory`) before calling.
+    /// Owner-scoped dispatch entry point. Reads queue / kernarg arena / scratch
+    /// / PM4 counter from the owner's shared `PoolQueue`. Holds the queue's
+    /// dispatch lock across the WHOLE op (kernarg bump + write + dispatch) so on
+    /// a shared queue the kernarg-slot order matches the ring order. The
+    /// `Program::execute` trait fallback below assigns an owner from the device
+    /// pool and delegates here for callers that don't supply one. Callers must
+    /// have sized the pool's scratch (`ensure_has_local_memory`) before calling.
     ///
     /// # Safety
     ///
@@ -591,16 +591,17 @@ impl AmdProgram {
     #[allow(clippy::missing_safety_doc)]
     pub unsafe fn execute_on(
         &self,
-        conn: &crate::amd::connector::AmdConnector,
+        owner: &crate::amd::connector::OwnerCtx,
         buffers: &[*mut u8],
         vals: &[i64],
         global_size: Option<[usize; 3]>,
         local_size: Option<[usize; 3]>,
         wait: bool,
     ) -> Result<()> {
+        let pool = owner.pool();
         // Device poisoned by an earlier fault: refuse to dispatch (the GPU
         // state and any cached buffer mappings are no longer trustworthy).
-        if let Some(err) = conn.core().poison_error() {
+        if let Some(err) = pool.core().poison_error() {
             return Err(err);
         }
         if buffers.len() != self.buf_count {
@@ -637,13 +638,20 @@ impl AmdProgram {
             });
         }
 
-        // 1. Bump the connector's own kernarg arena. With per-owner connectors
-        // there's exactly one writer to each arena → wrap-and-drain is the
-        // only synchronization needed (handled inside `KernargArena::bump`).
-        let arena = conn.arena();
+        // Hold the queue's dispatch lock across the WHOLE op (kernarg bump +
+        // write + dispatch). On a shared queue this makes the kernarg-slot
+        // order identical to the ring submission order, so the packet the
+        // doorbell publishes references the slot we just bumped (no cursor-vs-
+        // ring hazard between co-tenant owners). Lock order: dispatch_lock →
+        // queue inner Mutex (taken inside dispatch_*).
+        let _disp = pool.dispatch_guard();
+
+        // 1. Bump the queue's kernarg arena under the dispatch lock — the
+        // ordering above guarantees the slot stays valid through dispatch.
+        let arena = pool.arena();
         let off = arena.bump(self.kernarg_size(), 16)?;
-        // SAFETY: arena returned a valid slot; per-connector ownership means
-        // no concurrent writer for the same offset.
+        // SAFETY: arena returned a valid slot; the dispatch lock serializes
+        // writers, so no concurrent writer holds the same offset.
         let host_base = unsafe { arena.host_at(off) };
         let mut cursor = 0usize;
         for buf in buffers {
@@ -660,8 +668,8 @@ impl AmdProgram {
         let kernarg_gpu = arena.gpu_at(off);
 
         // 2. Submit sequence:
-        //   wait(conn.timeline, conn.timeline_value-1) → memory_barrier → exec
-        //   → signal(conn.timeline, conn.next_timeline()) → submit
+        //   PM4: wait(counter, prev) → memory_barrier → exec → signal(counter, next)
+        //   AQL: native kernel-dispatch packet with its own completion signal
         let g = global_size.unwrap_or([1, 1, 1]);
         let l = local_size.unwrap_or([1, 1, 1]);
 
@@ -670,7 +678,7 @@ impl AmdProgram {
                 buffers.iter().enumerate().map(|(i, b)| format!("buf{}={:#x}", i, *b as u64)).collect();
             eprintln!(
                 "[dispatch tv={}] kernel={} grid=[{}, {}, {}] local=[{}, {}, {}] is_pm4={} kernarg_gpu={:#x} scratch={:#x} {}",
-                conn.timeline_value(),
+                pool.pm4_value(),
                 self.name,
                 g[0],
                 g[1],
@@ -678,27 +686,28 @@ impl AmdProgram {
                 l[0],
                 l[1],
                 l[2],
-                conn.queue().is_pm4(),
+                pool.queue().is_pm4(),
                 kernarg_gpu,
-                conn.scratch_gpu_va(),
+                pool.scratch_gpu_va(),
                 bufs_str.join(" "),
             );
         }
 
         // USER_DATA SGPR pre-load: kernarg pointer only — the optional scratch
         // SGPR descriptor is prepended inside `dispatch_pm4` from the live
-        // `conn.scratch_gpu_va()` in the same place as
+        // `pool.scratch_gpu_va()` in the same place as
         // `COMPUTE_DISPATCH_SCRATCH_BASE`.
         let mut user_data: smallvec::SmallVec<[u32; 8]> = smallvec::SmallVec::new();
         user_data.push(kernarg_gpu as u32);
         user_data.push((kernarg_gpu >> 32) as u32);
 
-        let queue = conn.queue();
+        let queue = pool.queue();
         if queue.is_pm4() {
-            // PM4 single-XCC path: completion via the connector's monotonic
-            // timeline (RELEASE_MEM), drained by `synchronize`.
-            let _signalled = queue.dispatch_pm4(
-                conn,
+            // PM4 single-XCC path: completion via the queue's monotonic PM4
+            // counter (RELEASE_MEM); record this owner's high value so its
+            // owner-local `synchronize` waits exactly this dispatch.
+            let v = queue.dispatch_pm4(
+                pool,
                 self.rsrc1,
                 self.rsrc2,
                 self.rsrc3,
@@ -710,8 +719,13 @@ impl AmdProgram {
                 self.wave32,
                 self.target_major,
             )?;
+            owner.set_pm4_high(v);
+            // Release the dispatch lock before the (up to 30 s) blocking wait so
+            // co-tenant owners on this shared queue aren't serialized behind our
+            // wait — the dispatch is already published to the ring.
+            drop(_disp);
             if wait {
-                conn.synchronize()?;
+                owner.synchronize()?;
             }
         } else {
             // AQL path: completion via the kernel packet's own native
@@ -721,7 +735,7 @@ impl AmdProgram {
             // acquire/release fences provide coherence on the in-order queue.
             let priv_seg = self.kd.private_segment_fixed_size;
             let group_seg = self.kd.group_segment_fixed_size;
-            let sig = conn.acquire_signal()?;
+            let sig = pool.acquire_signal()?;
             let packet = build_dispatch_packet(
                 [l[0] as u16, l[1] as u16, l[2] as u16],
                 [(g[0] * l[0]) as u32, (g[1] * l[1]) as u32, (g[2] * l[2]) as u32],
@@ -732,7 +746,10 @@ impl AmdProgram {
                 /*completion_signal=*/ sig.signal_handle(),
             );
             queue.dispatch_aql_native(&packet)?;
-            conn.register_inflight(Arc::clone(&sig));
+            pool.register_inflight(Arc::clone(&sig));
+            owner.set_newest(Arc::clone(&sig));
+            // Release the dispatch lock before the blocking wait (see PM4 arm).
+            drop(_disp);
             if wait && let Err(e) = sig.wait_done(30_000) {
                 // If the CP halted the queue on an exception (e.g. 0x401
                 // insufficient-scratch), surface that code instead of a blind
@@ -762,29 +779,27 @@ impl Program for AmdProgram {
         local_size: Option<[usize; 3]>,
         wait: bool,
     ) -> Result<()> {
-        // Fallback path for callers that don't supply a connector (e.g.
-        // `benchmark_kernel` during BEAM). Lease a connector, ensure its
-        // scratch, dispatch, then drop the lease. In multi-queue mode the lease
-        // is exclusive (its own KFD queue, pooled on drop) so concurrent BEAM
-        // workers can't race a shared queue; in single-queue mode every lease
-        // aliases the one device connector and `exec_guard` serializes the
-        // dispatch + scratch realloc instead. `ExecutionPlan` and `AmdGraph`
-        // bypass this by downcasting via `as_any()` and calling `execute_on`
-        // with a connector they hold for their own lifetime.
+        // Fallback path for callers that don't supply an owner (e.g.
+        // `benchmark_kernel` during BEAM). Assign a shared `PoolQueue`, ensure
+        // its scratch, dispatch, then drop the owner context. Distinct owners
+        // spread onto distinct queues (cross-queue parallelism) until the pool
+        // is full, then co-tenant the least-loaded queue; the dispatch lock
+        // serializes a whole op (bump + write + dispatch) on a shared queue.
+        // `ExecutionPlan` and `AmdGraph` bypass this by downcasting via
+        // `as_any()` and calling `execute_on` with an owner they hold for their
+        // own lifetime.
         let alloc = crate::amd::AmdAllocator::new(self.device_id)?;
-        let lease = self.dev.core().lease_connector(&alloc)?;
-        lease.ensure_has_local_memory(self.kd.private_segment_fixed_size)?;
-        // Dispatch and (when waiting) drain through the poisoning `synchronize`,
-        // exactly like the plan/graph paths. A faulting/hung candidate latches the
-        // device error (`poison`) and BEAM fast-fails the remaining candidates
-        // rather than hanging 30s — or worse, wedging — per candidate. A KFD queue
-        // can't be recovered once faulted; the search stays useful by *avoiding*
-        // faults (resource caps in the action filter). Recovery would require a
-        // queue teardown+recreate (the AM `setup_ring` reset has no KFD equivalent),
-        // so we don't fake it with a signal gap-fill.
-        unsafe { self.execute_on(&lease, buffers, vals, global_size, local_size, wait)? };
+        let owner = self.dev.core().assign_owner(&alloc)?;
+        owner.pool().ensure_has_local_memory(self.kd.private_segment_fixed_size)?;
+        // Dispatch and (when waiting) drain through the poisoning owner-local
+        // `synchronize`, exactly like the plan/graph paths. A faulting/hung
+        // candidate latches the device error (`poison`) and BEAM fast-fails the
+        // remaining candidates rather than hanging 30s — or worse, wedging — per
+        // candidate. A KFD queue can't be recovered once faulted; the search
+        // stays useful by *avoiding* faults (resource caps in the action
+        // filter).
+        unsafe { self.execute_on(&owner, buffers, vals, global_size, local_size, wait)? };
         Ok(())
-        // `lease` drops here → connector returns to the pool.
     }
 
     fn name(&self) -> &str {

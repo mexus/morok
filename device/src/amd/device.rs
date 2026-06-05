@@ -3,13 +3,13 @@
 //! Opens `/dev/kfd` and `/dev/dri/renderD*`, parses topology, calls
 //! `AMDKFD_IOC_ACQUIRE_VM`. Owns an `Arc<AmdDeviceCore>` (the immutable
 //! per-physical-AMD:N identity — KFD/DRM fds, topology, event-page state,
-//! poison latch, shared signal pool). It holds no connector of its own:
-//! every owner obtains an `AmdConnector` via `AmdDeviceCore::lease_connector`
-//! — `ExecutionPlan` and `AmdGraph` hold a lease for their lifetime, the
-//! `Program::execute` trait fallback (`benchmark_kernel`) leases one per
-//! call, and the device-wide synchronize chain
-//! (`AmdAllocator::_copyin`/`_copyout`/`_free`) drains every registered
-//! connector's timeline via `synchronize_all` without leasing one.
+//! poison latch, shared signal pool, the bounded shared-queue pool). It holds
+//! no owner context of its own: every owner is assigned a shared `PoolQueue`
+//! via `AmdDeviceCore::assign_owner` — `ExecutionPlan` and `AmdGraph` hold an
+//! `OwnerCtx` for their lifetime, the `Program::execute` trait fallback
+//! (`benchmark_kernel`) assigns one per call, and the device-wide synchronize
+//! chain (`AmdAllocator::_copyin`/`_copyout`/`_free`) drains every registered
+//! pool queue via `synchronize_all`.
 
 #![cfg(target_os = "linux")]
 
@@ -20,7 +20,7 @@ use std::sync::{Arc, OnceLock, Weak};
 
 use nix::fcntl::{OFlag, open};
 use nix::sys::stat::Mode;
-use once_cell::sync::{Lazy, OnceCell};
+use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 use svod_dtype::AmdArch;
 use tracing::debug;
@@ -37,7 +37,7 @@ use crate::error::{Error, Result};
 ///
 /// The cached `Arc<AmdDevice>` carries the shared `Arc<AmdDeviceCore>` —
 /// per-plan and per-graph callers reach the core via `AmdDevice::core()` and
-/// build their own `AmdConnector` against it (no extra KFD opens).
+/// are assigned a shared `PoolQueue` against it (no extra KFD opens).
 static DEVICE_CACHE: Lazy<Mutex<HashMap<usize, Arc<AmdDevice>>>> = Lazy::new(Default::default);
 
 /// Process-wide `/dev/kfd` handle. KFD is opened once per process and all
@@ -59,10 +59,10 @@ pub(crate) struct EventPageState {
 }
 
 /// Scratch backing memory + `COMPUTE_TMPRING_SIZE` packing. Held under a
-/// mutex on `AmdConnector` so [`AmdConnector::ensure_has_local_memory`] can
-/// grow the scratch buffer when a freshly-loaded program demands more bytes
-/// per thread than what's currently allocated. `pub(crate)` because Step 2
-/// moved the owning field into the sibling `connector` module.
+/// mutex on `PoolQueue` so [`PoolQueue::ensure_has_local_memory`](crate::amd::connector::PoolQueue::ensure_has_local_memory)
+/// can grow the scratch buffer when a freshly-loaded program demands more
+/// bytes per thread than what's currently allocated. `pub(crate)` because the
+/// owning field lives in the sibling `connector` module.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ScratchState {
     /// GPU VA of the current scratch buffer.
@@ -121,11 +121,11 @@ impl AqlScratchDesc {
 }
 
 /// Immutable per-physical-AMD:N identity: KFD/DRM fds, topology, event-page
-/// state, fault latch, shared signal pool. One instance per physical GPU
-/// (KFD rejects double `ACQUIRE_VM`); shared as `Arc<AmdDeviceCore>` by
-/// every `AmdConnector` built against the device. Connector registry and
-/// `synchronize_all` live here so the host can drain every live connector
-/// before any destructive operation (`AmdAllocator::_free`, etc.).
+/// state, fault latch, shared signal pool, the bounded shared-queue pool. One
+/// instance per physical GPU (KFD rejects double `ACQUIRE_VM`); shared as
+/// `Arc<AmdDeviceCore>` by every `PoolQueue` built against the device. The
+/// queue registry and `synchronize_all` live here so the host can drain every
+/// live queue before any destructive operation (`AmdAllocator::_free`, etc.).
 ///
 /// The backend seam: all KFD ioctls (memory alloc/free, queue ring setup/
 /// teardown, event waits) route through `iface`. KFD-specific state (the kfd/
@@ -149,76 +149,48 @@ pub struct AmdDeviceCore {
     /// device because a memory fault corrupts the whole VM, not just one queue.
     poisoned: AtomicBool,
     error_msg: OnceLock<String>,
-    /// Registry of every connector built against this core. Weak so dropped
-    /// connectors don't stay alive. Used by [`AmdDeviceCore::synchronize_all`]
-    /// to drain ALL in-flight GPU work before destructive host-visible
-    /// operations (`AmdAllocator::_copyin`/`_copyout`/`_free`). The drain
-    /// (`AmdConnector::synchronize`) reads only signal slots — the monotonic
-    /// timeline and the per-op completion signals — and NEVER touches a
-    /// connector's queue, so a concurrent owner can keep dispatching.
-    pub(crate) connectors: parking_lot::Mutex<Vec<Weak<crate::amd::connector::AmdConnector>>>,
+    /// Registry of every pool queue built against this core. Weak so dropped
+    /// queues don't stay alive. Used by [`AmdDeviceCore::synchronize_all`] to
+    /// drain ALL in-flight GPU work before destructive host-visible operations
+    /// (`AmdAllocator::_copyin`/`_copyout`/`_free`). The drain
+    /// (`PoolQueue::drain_all`) reads only signal slots — the PM4 counter and
+    /// the per-op completion signals — and NEVER takes the queue's dispatch
+    /// lock, so a concurrent owner can keep dispatching.
+    pub(crate) connectors: parking_lot::Mutex<Vec<Weak<crate::amd::connector::PoolQueue>>>,
     /// Process-global signal pool, allocated once per physical device. Lazily
-    /// installed by the device factory and shared across every `AmdConnector`
-    /// (timeline signal acquired here at connector construction) — pool access
-    /// is rare (slot alloc on connector build), and one pool covers many
-    /// connectors at 4 KiB total VRAM.
+    /// installed by the device factory and shared across every `PoolQueue`
+    /// (PM4 counter signal acquired here at queue construction) — pool access
+    /// is rare (slot alloc on queue build), and one pool covers many
+    /// queues at 4 KiB total VRAM.
     signal_pool: OnceLock<Arc<crate::amd::signal::SignalPool>>,
     /// Process-global SDMA copy queue, installed by the factory once the signal
     /// pool exists. Its presence is what flips `has_sdma_queue` true and so
     /// enables device-local (non-host-visible) buffers; the allocator's
     /// device-only copy arms route through it.
     copy_queue: OnceLock<Arc<crate::amd::queue::AmdCopyQueue>>,
-    /// How owners obtain a connector and whether dispatch is serialized. Built
-    /// once at open from `SVOD_AMD_SINGLE_QUEUE`; see [`Dispatcher`]. Each mode
-    /// owns only its own state — no cross-mode dead fields, and the mode is a
-    /// type rather than a boolean re-checked at every call site.
-    dispatcher: Dispatcher,
+    /// Bounded pool of SHARED dispatch queues. Owners (plans / graphs / the
+    /// `Program::execute` fallback) are assigned one via [`assign_owner`](Self::assign_owner):
+    /// distinct owners spread onto distinct queues (cross-queue parallelism)
+    /// until the pool reaches [`hw_queues`](Self::hw_queues) queues, after which
+    /// they co-tenant the least-loaded queue. The pool never shrinks — a
+    /// `PoolQueue` is freed only when its last `Arc` drops (device close).
+    queue_pool: parking_lot::Mutex<Vec<Arc<crate::amd::connector::PoolQueue>>>,
+    /// Max distinct KFD compute queues in the pool. Read once at open from
+    /// `SVOD_AMD_HW_QUEUES` (default 4, min 1). The per-process hardware budget
+    /// is small (~24 user compute queues on CDNA; HIP's `GPU_MAX_HW_QUEUES`
+    /// defaults to 4), so we cap the pool and co-tenant beyond it.
+    hw_queues: usize,
 }
-
-/// Per-device dispatch strategy: how an owner (plan / graph / the
-/// `Program::execute` fallback) gets an [`AmdConnector`](crate::amd::connector::AmdConnector)
-/// and whether dispatch is serialized.
-#[derive(Debug)]
-enum Dispatcher {
-    /// Lock-free per-owner (`SVOD_AMD_SINGLE_QUEUE=0`): each owner leases an
-    /// exclusively-owned connector from the idle pool (bounded by
-    /// [`CONNECTOR_POOL_CAP`]); the GPU's MES interleaves the N queues, so
-    /// dispatch needs no CPU lock. Returning a lease puts the connector back in
-    /// the pool (or drops it over cap → `AmdComputeQueue::Drop` destroys the KFD
-    /// queue). The lease being exclusive + un-aliasable is what stops two
-    /// dispatchers from sharing one KFD queue.
-    MultiQueue { pool: parking_lot::Mutex<Vec<Arc<crate::amd::connector::AmdConnector>>> },
-    /// KFD-safe single-queue (default): every owner shares ONE connector per
-    /// physical device — built on first lease, kept for the device's lifetime —
-    /// and dispatch + scratch-realloc are serialized behind `lock`. The kernel
-    /// then only ever sees one compute queue per GPU,
-    /// sidestepping the MES/runlist overload the multi-queue path triggers under
-    /// load. `lock` guards two *non-nested* critical sections — dispatch
-    /// (`dispatch_pm4`/`dispatch_aql`/`submit_dwords`) and the realloc branch of
-    /// `AmdConnector::ensure_has_local_memory` — so there is no reentrant
-    /// deadlock. Returning a lease is a no-op: the shared connector lives in
-    /// `shared`, and a dropped lease just decrements its `Arc` refcount.
-    SingleQueue { shared: OnceCell<Arc<crate::amd::connector::AmdConnector>>, lock: parking_lot::Mutex<()> },
-}
-
-/// Max idle connectors retained per physical AMD:N. Each pooled connector
-/// holds a live KFD compute queue, and the per-process hardware budget is
-/// small (~24 user compute queues on CDNA; HIP's `GPU_MAX_HW_QUEUES` defaults
-/// to 4). Retaining more idle queues than the GPU can run concurrently just
-/// invites runlist oversubscription, so we keep the pool small and reuse
-/// aggressively. Over-cap returns drop normally (queue destroyed via
-/// `AmdComputeQueue::Drop`).
-pub const CONNECTOR_POOL_CAP: usize = 4;
 
 /// Open handle to one AMD GPU node.
 ///
 /// A thin owner of the immutable `AmdDeviceCore`. There is no per-device
-/// "default" connector: every dispatcher holds its own connector — plans and
-/// graphs build/lease one for their lifetime, and the `Program::execute`
-/// trait fallback leases one per call from `core.lease_connector`. The
+/// "default" queue: every owner is assigned a shared `PoolQueue` — plans and
+/// graphs hold an `OwnerCtx` for their lifetime, and the `Program::execute`
+/// trait fallback assigns one per call from `core.assign_owner`. The
 /// device-wide synchronize chain (`AmdAllocator::_copyin`/`_copyout`/`_free`)
 /// routes through `dev.synchronize() → core.synchronize_all()`, which drains
-/// EVERY connector registered on the core (pooled, leased, plan, and graph).
+/// EVERY pool queue registered on the core.
 ///
 /// Immutable Core fields stay reachable via [`Deref`] — `self.dev.node`,
 /// `self.dev.kfd_fd`, `self.dev.poison_error()`, etc.
@@ -294,13 +266,10 @@ impl AmdDevice {
 
         debug!(node = node.node_id, gpu_id = node.gpu_id, arch = arch.mcpu(), backend = %backend, "AmdDevice opened");
 
-        // KFD-safe single-queue is the default; SVOD_AMD_SINGLE_QUEUE=0 opts into
-        // lock-free multi-queue. See `Dispatcher`.
-        let dispatcher = if std::env::var("SVOD_AMD_SINGLE_QUEUE").ok().map(|s| s != "0").unwrap_or(true) {
-            Dispatcher::SingleQueue { shared: OnceCell::new(), lock: parking_lot::Mutex::new(()) }
-        } else {
-            Dispatcher::MultiQueue { pool: parking_lot::Mutex::new(Vec::new()) }
-        };
+        // Bounded shared-queue pool: `SVOD_AMD_HW_QUEUES` distinct KFD compute
+        // queues (default 4, min 1) that owners spread onto then co-tenant.
+        let hw_queues =
+            std::env::var("SVOD_AMD_HW_QUEUES").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(4).max(1);
 
         let core = Arc::new(AmdDeviceCore {
             node,
@@ -312,23 +281,24 @@ impl AmdDevice {
             copy_queue: OnceLock::new(),
             connectors: parking_lot::Mutex::new(Vec::new()),
             signal_pool: OnceLock::new(),
-            dispatcher,
+            queue_pool: parking_lot::Mutex::new(Vec::new()),
+            hw_queues,
         });
         Ok(Arc::new(Self { core }))
     }
 
-    /// Borrow the shared immutable core — used to build/lease per-owner
-    /// `AmdConnector`s against the same physical device without re-acquiring
+    /// Borrow the shared immutable core — used to assign owners onto shared
+    /// `PoolQueue`s against the same physical device without re-acquiring
     /// KFD.
     #[inline]
     pub fn core(&self) -> &Arc<AmdDeviceCore> {
         &self.core
     }
 
-    /// Drain all submitted GPU work on every connector backed by this device.
-    /// `ExecutionPlan` and `AmdGraph` each own their connector, so a kernel
-    /// signals on its OWNER's timeline; the drain must cover EVERY registered
-    /// connector, not a single one. Skipping a per-owner drain would let
+    /// Drain all submitted GPU work on every pool queue backed by this device.
+    /// Owners co-tenant a bounded set of shared queues, so a kernel signals on
+    /// its queue's slots; the drain must cover EVERY registered queue, not a
+    /// single one. Skipping a queue would let
     /// `AmdAllocator::_copyout`/`_copyin`/`_free` observe an unfinished
     /// kernel's buffer.
     pub fn synchronize(&self) -> Result<()> {
@@ -337,36 +307,36 @@ impl AmdDevice {
 }
 
 impl AmdDeviceCore {
-    /// Drain every connector backed by this core — the per-VM fence before any
+    /// Drain every pool queue backed by this core — the per-VM fence before any
     /// destructive host-visible op (`AmdAllocator::_copyin`/`_copyout`/`_free`).
-    /// Iterates the `timelines` registry and drains each via `Timeline::drain`,
-    /// which reads only the timeline atomic + signal slot — it NEVER touches a
-    /// connector's queue, so a concurrent owner can keep dispatching lock-free
-    /// while this runs. A freed/read buffer has no live handle, so the owner
-    /// can't add new work referencing it; draining each timeline to its current
-    /// value fences all in-flight readers. Fast on idle timelines (target 0).
+    /// Iterates the queue registry and drains each via `PoolQueue::drain_all`,
+    /// which reads only the PM4 counter atomic + signal slots — it NEVER takes a
+    /// queue's dispatch lock, so a concurrent owner can keep dispatching while
+    /// this runs. A freed/read buffer has no live handle, so owners can't add
+    /// new work referencing it; draining each queue fences all in-flight
+    /// readers. Fast on idle queues.
     pub fn synchronize_all(&self) -> Result<()> {
         if let Some(err) = self.poison_error() {
             return Err(err);
         }
         // Snapshot strong refs to release the registry lock before the
-        // potentially multi-second waits, keeping each connector alive across
-        // its drain so a concurrent connector drop can't pull the rug out.
-        let live: Vec<Arc<crate::amd::connector::AmdConnector>> =
+        // potentially multi-second waits, keeping each queue alive across its
+        // drain so a concurrent queue drop can't pull the rug out.
+        let live: Vec<Arc<crate::amd::connector::PoolQueue>> =
             self.connectors.lock().iter().filter_map(|w| w.upgrade()).collect();
-        // Drain every connector (timeline + per-op signals); collect the first
-        // error but keep going so one stuck connector doesn't strand buffer-frees
-        // on the others.
+        // Drain every queue (PM4 counter + per-op signals); collect the first
+        // error but keep going so one stuck queue doesn't strand buffer-frees on
+        // the others.
         let mut first_err: Option<Error> = None;
-        for conn in live {
-            if let Err(e) = conn.synchronize() {
-                tracing::warn!(?e, "synchronize_all: connector drain failed; continuing");
+        for q in live {
+            if let Err(e) = q.drain_all() {
+                tracing::warn!(?e, "synchronize_all: queue drain failed; continuing");
                 if first_err.is_none() {
                     first_err = Some(e);
                 }
             }
         }
-        // Opportunistic GC of dropped connector entries. The registry is touched
+        // Opportunistic GC of dropped queue entries. The registry is touched
         // here on every host read/free, so dead Weaks don't accumulate.
         self.connectors.lock().retain(|w| w.strong_count() > 0);
         match first_err {
@@ -389,6 +359,14 @@ impl AmdDeviceCore {
         self.signal_pool.get()
     }
 
+    /// The bounded queue-pool size (`SVOD_AMD_HW_QUEUES`, default 4) — the
+    /// cross-model parallelism ceiling. `assign_owner` spreads owners across up
+    /// to this many distinct queues before co-tenanting.
+    #[inline]
+    pub fn hw_queues(&self) -> usize {
+        self.hw_queues
+    }
+
     /// Borrow the process-global SDMA copy queue. `None` until the factory
     /// installs it (and thus `has_sdma_queue` is false). The allocator's
     /// device-only copy arms require it.
@@ -402,63 +380,41 @@ impl AmdDeviceCore {
         let _ = self.copy_queue.set(queue);
     }
 
-    /// Whether dispatch is serialized onto one shared connector (single-queue
-    /// mode). The graph factory checks this to fall back to per-call dispatch —
-    /// the captured-replay path keeps its own connector/ring, which the
-    /// single-queue dispatch lock doesn't cover.
-    #[inline]
-    pub fn is_single_queue(&self) -> bool {
-        matches!(self.dispatcher, Dispatcher::SingleQueue { .. })
-    }
-
-    /// Acquire the dispatch lock in single-queue mode; `None` in multi-queue.
-    /// Held by the dispatch methods and the scratch-realloc path so the shared
-    /// connector's ring/timeline/scratch are mutated by one thread at a time. In
-    /// multi-queue mode each connector is exclusively owned, so this is `None`
-    /// and dispatch stays lock-free.
-    #[inline]
-    pub(crate) fn exec_guard(&self) -> Option<parking_lot::MutexGuard<'_, ()>> {
-        match &self.dispatcher {
-            Dispatcher::SingleQueue { lock, .. } => Some(lock.lock()),
-            Dispatcher::MultiQueue { .. } => None,
-        }
-    }
-
-    /// Lease an `AmdConnector` for this core, per the [`Dispatcher`] mode:
-    /// the shared connector (single-queue) or a pooled exclusive one
-    /// (multi-queue). Either way the returned
-    /// [`ConnectorLease`](crate::amd::connector::ConnectorLease) `Deref`s to
-    /// `&AmdConnector`, so callers are mode-agnostic; [`return_connector`](Self::return_connector)
-    /// (run on lease drop) does the mode-appropriate thing.
-    pub fn lease_connector(
+    /// Assign a SHARED `PoolQueue` to a new owner (plan / graph / the
+    /// `Program::execute` fallback), returning an [`OwnerCtx`](crate::amd::connector::OwnerCtx)
+    /// bound to it. Strategy:
+    ///
+    /// - **fill-empty-first**: while the pool is below [`hw_queues`](Self::hw_queues)
+    ///   AND every existing queue already has at least one owner (no queue with
+    ///   `strong_count == 1`, i.e. held only by the pool vec), build a fresh
+    ///   queue. Spreading owners onto empty queues first maximises cross-queue
+    ///   parallelism — the AQL BARRIER bit serialises co-tenants on one ring, so
+    ///   co-tenanting is only worthwhile once the queue budget is spent.
+    /// - **least-loaded**: otherwise co-tenant the queue with the fewest owners
+    ///   (min `strong_count`), building the first one if the pool is empty.
+    ///
+    /// An owner with no current holder is exactly a `PoolQueue` whose only `Arc`
+    /// is the one in `queue_pool` (`strong_count == 1`); an `OwnerCtx` adds a
+    /// second `Arc`.
+    pub fn assign_owner(
         self: &Arc<Self>,
         allocator: &crate::amd::AmdAllocator,
-    ) -> Result<crate::amd::connector::ConnectorLease> {
-        let conn = match &self.dispatcher {
-            // Build the one shared connector on first lease, reuse thereafter.
-            Dispatcher::SingleQueue { shared, .. } => shared
-                .get_or_try_init(|| {
-                    crate::amd::connector::AmdConnector::new_with_resources(Arc::clone(self), allocator)
-                })
-                .map(Arc::clone)?,
-            Dispatcher::MultiQueue { pool } => match pool.lock().pop() {
-                Some(c) => c,
-                None => crate::amd::connector::AmdConnector::new_with_resources(Arc::clone(self), allocator)?,
-            },
-        };
-        Ok(crate::amd::connector::ConnectorLease::new(conn, Arc::clone(self)))
-    }
-
-    /// Return a connector when its lease drops. Multi-queue: clone it back into
-    /// the idle pool, unless at [`CONNECTOR_POOL_CAP`] (then the lease's `Arc`
-    /// drops → `AmdComputeQueue::Drop` destroys the KFD queue). Single-queue: a
-    /// no-op — the shared connector lives in the `Dispatcher`; the lease's `Arc`
-    /// clone just decrements the refcount when it drops.
-    pub(crate) fn return_connector(&self, conn: &Arc<crate::amd::connector::AmdConnector>) {
-        if let Dispatcher::MultiQueue { pool } = &self.dispatcher {
-            let mut pool = pool.lock();
-            if pool.len() < CONNECTOR_POOL_CAP {
-                pool.push(Arc::clone(conn));
+    ) -> Result<crate::amd::connector::OwnerCtx> {
+        use crate::amd::connector::{OwnerCtx, PoolQueue};
+        let mut queues = self.queue_pool.lock();
+        // Fill-empty-first: grow the pool while under cap and no queue is idle.
+        if queues.len() < self.hw_queues && !queues.iter().any(|q| Arc::strong_count(q) == 1) {
+            let q = PoolQueue::new_with_resources(Arc::clone(self), allocator)?;
+            queues.push(Arc::clone(&q));
+            return Ok(OwnerCtx::new(q));
+        }
+        // Otherwise co-tenant the least-loaded queue (or build the first one).
+        match queues.iter().min_by_key(|q| Arc::strong_count(q)).cloned() {
+            Some(q) => Ok(OwnerCtx::new(q)),
+            None => {
+                let q = PoolQueue::new_with_resources(Arc::clone(self), allocator)?;
+                queues.push(Arc::clone(&q));
+                Ok(OwnerCtx::new(q))
             }
         }
     }

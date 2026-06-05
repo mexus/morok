@@ -290,17 +290,18 @@ pub struct ExecutionPlan {
     /// `svod_device::Graph` (AMD indirect buffer).
     graph: std::sync::OnceLock<Option<Box<dyn svod_device::Graph>>>,
 
-    /// Per-plan AMD connector — owns this plan's KFD ring, kernarg arena,
-    /// scratch, and timeline. Lazy-init on the first AMD kernel dispatch
-    /// via `AmdConnector::new_with_resources(core, allocator)`, where `core`
-    /// is shared via `DEVICE_CACHE` and `allocator` is built fresh against
-    /// the same cached core (no extra KFD opens). Decouples this plan's
-    /// dispatch state from other plans' on the same physical AMD:N.
+    /// Per-plan AMD owner context — binds this plan to a shared `PoolQueue`
+    /// from the device pool (queue + kernarg arena + scratch + PM4 counter).
+    /// Lazy-init on the first AMD kernel dispatch via
+    /// `AmdDeviceCore::assign_owner(allocator)`, where the core is shared via
+    /// `DEVICE_CACHE`. Distinct plans spread onto distinct queues for
+    /// cross-queue parallelism (or co-tenant the least-loaded queue past the
+    /// pool cap).
     ///
     /// Non-AMD plans never touch this field; CPU programs continue to use
     /// `Program::execute(...)`.
     #[cfg(target_os = "linux")]
-    amd_connector: std::sync::OnceLock<svod_device::amd::ConnectorLease>,
+    amd_owner: std::sync::OnceLock<svod_device::amd::OwnerCtx>,
 }
 
 // ============================================================================
@@ -368,59 +369,117 @@ impl ExecutionPlan {
         // would dispatch a different sequence than the per-call path, corrupting
         // results whenever a reused buffer's ordering relies on the level walk
         // (e.g. multi-kernel decompositions like QR).
+        // Walk the emission order (level-by-level, intra-level index order) once,
+        // building the GraphKernel list AND a parallel hazard-dependency list in
+        // lock-step. Hazards are keyed on the RESOLVED buffer GVA (`buffer_ptrs`),
+        // not buffer ids: the memory planner aliases distinct logical buffers onto
+        // one GVA, so a GVA-keyed walk catches the WAR/WAW the logical
+        // `dependencies` field misses. For each emitted kernel `e`:
+        //   reads  = buffer_ptrs[j] for j NOT in output_indices
+        //   writes = buffer_ptrs[j] for j     in output_indices
+        //   deps   = last_writer[read]  (RAW)
+        //          ∪ last_writer[write] (WAW) ∪ readers[write] (WAR)
+        // then update: readers[read].push(e); for each write set last_writer=e and
+        // clear readers (a fresh writer; future readers depend on it via RAW).
+        //
+        // Soundness rests on `output_indices` being the COMPLETE write-set: a
+        // missed write would leave no last_writer and (BARRIER stripped) race a
+        // later reader. That holds here by construction — `output_indices` is
+        // derived from the kernel's STORE targets (`ProgramSpec.outs`) and a
+        // compiled kernel writes only via STOREs, and this walk only processes
+        // `CompiledProgram` ops (the `else { return Ok(None) }` below). Custom
+        // functions / copies are not graphed, so the invariant is not relied on
+        // for them.
         let mut kernels = Vec::with_capacity(self.ops.len());
+        let mut last_writer: HashMap<usize, usize> = HashMap::new();
+        let mut readers: HashMap<usize, Vec<usize>> = HashMap::new();
         for level in &self.op_levels {
             for &idx in level {
                 let PreparedOp::CompiledProgram(k) = &self.ops[idx] else { return Ok(None) };
                 let (global_size, local_size) = Self::kernel_launch_sizes(k)?;
+                let e = kernels.len();
+
+                let write_pos: std::collections::HashSet<usize> = k.output_indices.iter().copied().collect();
+                let writes: Vec<usize> =
+                    k.output_indices.iter().filter_map(|&j| k.buffer_ptrs.get(j).copied()).collect();
+                let reads: Vec<usize> =
+                    (0..k.buffer_ptrs.len()).filter(|j| !write_pos.contains(j)).map(|j| k.buffer_ptrs[j]).collect();
+
+                let mut deps: std::collections::HashSet<usize> = std::collections::HashSet::new();
+                for &b in &reads {
+                    if let Some(&w) = last_writer.get(&b) {
+                        deps.insert(w); // RAW
+                    }
+                }
+                for &b in &writes {
+                    if let Some(&w) = last_writer.get(&b) {
+                        deps.insert(w); // WAW
+                    }
+                    if let Some(rs) = readers.get(&b) {
+                        deps.extend(rs.iter().copied()); // WAR
+                    }
+                }
+                deps.remove(&e);
+                let mut deps: Vec<usize> = deps.into_iter().collect();
+                deps.sort_unstable();
+
+                // Commit this kernel's effect on the hazard state.
+                for &b in &reads {
+                    readers.entry(b).or_default().push(e);
+                }
+                for &b in &writes {
+                    last_writer.insert(b, e);
+                    readers.insert(b, Vec::new());
+                }
+
                 kernels.push(svod_device::GraphKernel {
                     program: k.kernel.program.as_ref(),
                     buffers: k.buffer_ptrs.iter().map(|&p| p as *mut u8).collect(),
                     vals: k.vals.clone(),
                     global_size,
                     local_size,
+                    deps,
                 });
             }
         }
         factory(&kernels).map_err(|e| crate::error::Error::Execution { reason: format!("graph capture: {e}") })
     }
 
-    /// Lazy-init the plan's own AMD connector and return it. Cheap to call
-    /// repeatedly — the connector lives for the plan's lifetime. Built via
-    /// `AmdConnector::new_with_resources(core, allocator)` so it owns its
-    /// own KFD ring + kernarg arena + scratch + timeline; cross-plan
-    /// dispatches run on isolated rings.
+    /// Lazy-init the plan's AMD owner context and return it. Cheap to call
+    /// repeatedly — the owner lives for the plan's lifetime. Built via
+    /// `AmdDeviceCore::assign_owner(allocator)`, which binds the plan to a
+    /// shared `PoolQueue` from the device pool; distinct plans spread onto
+    /// distinct queues for cross-queue parallelism.
     #[cfg(target_os = "linux")]
-    fn amd_connector_for(&self, prog: &svod_device::amd::AmdProgram) -> Result<&svod_device::amd::ConnectorLease> {
-        if let Some(lease) = self.amd_connector.get() {
-            return Ok(lease);
+    fn amd_owner_for(&self, prog: &svod_device::amd::AmdProgram) -> Result<&svod_device::amd::OwnerCtx> {
+        if let Some(owner) = self.amd_owner.get() {
+            return Ok(owner);
         }
-        // Lease from the per-core connector pool (built fresh if empty). The
-        // lease is held for the plan's lifetime and returns to the pool when
-        // the plan drops (`OnceLock<ConnectorLease>` field destructor) — no
-        // manual release, so it can't leak. Recover the AMD device_id from the
-        // plan's DeviceSpec; the program was loaded against the same device_id,
-        // so the allocator shares `Arc<AmdDeviceCore>` via DEVICE_CACHE.
+        // Assign a shared queue from the per-core pool. The owner is held for
+        // the plan's lifetime (`OnceLock<OwnerCtx>` field destructor). Recover
+        // the AMD device_id from the plan's DeviceSpec; the program was loaded
+        // against the same device_id, so the allocator shares
+        // `Arc<AmdDeviceCore>` via DEVICE_CACHE.
         let device_id = match &self.device {
             DeviceSpec::Amd { device_id } => *device_id,
             _ => {
                 return Err(crate::error::Error::Execution {
-                    reason: format!("amd_connector_for called on non-AMD plan (device={:?})", self.device),
+                    reason: format!("amd_owner_for called on non-AMD plan (device={:?})", self.device),
                 });
             }
         };
         let alloc = svod_device::amd::AmdAllocator::new(device_id)
             .map_err(|e| crate::error::Error::Execution { reason: format!("plan allocator: {e}") })?;
-        let lease = prog
+        let owner = prog
             .device()
             .core()
-            .lease_connector(&alloc)
-            .map_err(|e| crate::error::Error::Execution { reason: format!("lease_connector: {e}") })?;
-        // One-shot init race: if two threads see empty, both lease; only one
-        // wins `set()`. The loser's lease drops here → its connector returns
-        // to the pool automatically.
-        let _ = self.amd_connector.set(lease);
-        Ok(self.amd_connector.get().expect("connector set above"))
+            .assign_owner(&alloc)
+            .map_err(|e| crate::error::Error::Execution { reason: format!("assign_owner: {e}") })?;
+        // One-shot init race: if two threads see empty, both assign; only one
+        // wins `set()`. The loser's owner drops here harmlessly (its `Arc` over
+        // the shared queue just decrements).
+        let _ = self.amd_owner.set(owner);
+        Ok(self.amd_owner.get().expect("owner set above"))
     }
 
     #[inline]
@@ -428,18 +487,18 @@ impl ExecutionPlan {
         let buffer_ptrs: SmallVec<[*mut u8; 8]> = kernel.buffer_ptrs.iter().map(|&ptr| ptr as *mut u8).collect();
         let (global_size, local_size) = Self::kernel_launch_sizes(kernel)?;
         // Fast path for AMD: downcast and dispatch via `execute_on` with the
-        // plan's own connector (own KFD ring + kernarg arena + scratch +
-        // timeline). Plans on the same physical AMD:N run on isolated rings.
+        // plan's owner context over a shared `PoolQueue`. Distinct plans spread
+        // onto distinct queues (cross-queue parallelism).
         #[cfg(target_os = "linux")]
         if let Some(amd) = kernel.kernel.program.as_any().downcast_ref::<svod_device::amd::AmdProgram>() {
-            let conn = self.amd_connector_for(amd)?;
-            // Grow this connector's scratch to fit the program: ensure local
-            // memory at program load, applied per-connector.
-            conn.ensure_has_local_memory(amd.private_segment_size())
+            let owner = self.amd_owner_for(amd)?;
+            // Grow this queue's scratch to fit the program before dispatch.
+            owner
+                .pool()
+                .ensure_has_local_memory(amd.private_segment_size())
                 .map_err(|e| crate::error::Error::Execution { reason: format!("scratch grow: {e}") })?;
             return unsafe {
-                // `conn` is `&ConnectorLease`, deref-coerces to `&AmdConnector`.
-                amd.execute_on(conn, &buffer_ptrs, &kernel.vals, global_size, local_size, /*wait=*/ false).map_err(
+                amd.execute_on(owner, &buffer_ptrs, &kernel.vals, global_size, local_size, /*wait=*/ false).map_err(
                     |e| crate::error::Error::Execution { reason: format!("Kernel {} failed: {}", kernel.id, e) },
                 )
             };
@@ -726,8 +785,8 @@ impl ExecutionPlan {
     ///
     /// Walks `op_levels` level-by-level and runs each op within a level in
     /// builder-insertion order. Multi-plan concurrency comes from distinct
-    /// `ExecutionPlan`s (e.g. BEAM search candidates) running on distinct
-    /// `AmdConnector`s with their own KFD rings — not from rayon inside one
+    /// `ExecutionPlan`s (e.g. BEAM search candidates) spread onto distinct
+    /// shared `PoolQueue`s from the device pool — not from rayon inside one
     /// plan. The level-by-level iteration (vs. a flat `op_order` topological
     /// linearization) is load-bearing for iterative CPU kernels (QR, etc.)
     /// whose codegen is sensitive to within-level scheduling order — see
@@ -871,10 +930,10 @@ impl ExecutionPlan {
     }
 }
 
-// No explicit `Drop for ExecutionPlan`: the plan's `amd_connector`
-// (`OnceLock<ConnectorLease>`) returns its connector to the per-core pool via
-// the lease's own destructor when the plan drops — amortising ~50 MiB of KFD
-// setup across BEAM-style plan churn, with no manual release to leak.
+// No explicit `Drop for ExecutionPlan`: the plan's `amd_owner`
+// (`OnceLock<OwnerCtx>`) just holds an `Arc` over a shared `PoolQueue`. On plan
+// drop the `Arc` decrements; the queue itself stays in the per-core pool
+// (freed only at device close), so plan churn never tears down KFD queues.
 
 impl std::fmt::Debug for ExecutionPlan {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1062,7 +1121,7 @@ impl ExecutionPlanBuilder {
             alias_ids: self.alias_ids,
             graph: std::sync::OnceLock::new(),
             #[cfg(target_os = "linux")]
-            amd_connector: std::sync::OnceLock::new(),
+            amd_owner: std::sync::OnceLock::new(),
         })
     }
 }

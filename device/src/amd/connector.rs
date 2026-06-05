@@ -1,36 +1,28 @@
-//! `AmdConnector`: per-owner dispatch context.
+//! `PoolQueue`: a SHARED dispatch queue + lightweight per-owner contexts.
 //!
-//! Holds the dispatch state that must NOT be shared across independent
-//! callers: a KFD compute queue (ring + doorbell), a kernarg bump arena,
-//! the scratch backing, and the timeline signal + counter. Every
-//! `ExecutionPlan` and every `AmdGraph` owns its own `AmdConnector` for its
-//! lifetime, and the `Program::execute` trait fallback (`benchmark_kernel`)
-//! leases one per call — there is no shared per-device connector. The
-//! device-wide synchronize used by `AmdAllocator::_copyin`/`_copyout`/`_free`
-//! holds no connector; it drains every registered timeline directly.
+//! A `PoolQueue` bundles the dispatch state that backs a single KFD compute
+//! queue: the queue itself (ring + doorbell), a kernarg bump arena, the scratch
+//! backing, the PM4 monotonic completion counter, and the pool-level in-flight
+//! AQL signal list. It is a SHARED resource — multiple owners hold an
+//! `Arc<PoolQueue>` and co-tenant the same ring. Dispatch atomicity comes from
+//! `dispatch_lock`: an owner holds it
+//! across a whole op (kernarg bump + write + ring submission) so kernarg order
+//! ≡ ring order on a shared queue. Cross-queue parallelism comes from the pool
+//! holding several `PoolQueue`s — the GPU's MES interleaves their independent
+//! rings on the CP pipes.
 //!
-//! The per-device dispatch strategy lives in `AmdDeviceCore`'s `Dispatcher`. In
-//! the default KFD-safe **single-queue mode** every owner shares ONE connector
-//! per physical device and dispatch (scratch realloc, timeline reservation,
-//! kernarg bump, ring submission) is serialized behind the strategy's lock via
-//! [`AmdDeviceCore::exec_guard`] — a one-queue-per-GPU model, which the
-//! kernel's MES scheduler can sustain. In **multi-queue mode**
-//! (`SVOD_AMD_SINGLE_QUEUE=0`) each connector is exclusively owned and there is
-//! no dispatch lock: the same operations run serially by ownership and
-//! `exec_guard` returns `None`. Either way each owner sees a `&AmdConnector` and
-//! the dispatch code is identical — only the guard differs.
-//!
-//! The conventional design bundles all of this into one per-physical-GPU
-//! object and relies on a global interpreter lock to
-//! serialize concurrent dispatchers. The Svod split is a deliberate
-//! ownership-eliminates-locks divergence — sibling plans on the same
-//! physical GPU contend only at the per-core synchronize barrier (rare),
-//! not on a coarse device-wide dispatch mutex.
+//! [`OwnerCtx`] is the lightweight per-owner handle. It holds an
+//! `Arc<PoolQueue>` plus the owner's own completion bookkeeping (its last AQL
+//! signal / its last PM4 counter value), so `OwnerCtx::synchronize` can drain
+//! only this owner's work — the owner-local fast path. The whole-pool drain
+//! (`PoolQueue::drain_all`, reached via `AmdDeviceCore::synchronize_all`) is the
+//! host-visibility/free fence used by `AmdAllocator::_copyin`/`_copyout`/`_free`.
 
 #![cfg(target_os = "linux")]
 
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use parking_lot::Mutex;
 
@@ -41,94 +33,84 @@ use crate::amd::queue::AmdComputeQueue;
 use crate::amd::signal::{AmdSignal, TIMELINE_WRAP_WATERMARK, Timeline};
 use crate::error::{Error, Result};
 
-/// Per-owner dispatch state. One per `ExecutionPlan`, one per `AmdGraph`, and
-/// one leased per call by the `Program::execute` trait fallback; there is no
-/// shared per-device connector.
+/// A SHARED dispatch queue. Multiple owners hold `Arc<PoolQueue>` and co-tenant
+/// the same KFD compute queue; the pool holds a bounded number of these so
+/// distinct owners can run on distinct queues (cross-queue parallelism) without
+/// exhausting KFD queues.
 ///
-/// Owns: KFD compute queue, kernarg arena, scratch backing, timeline signal,
-/// timeline counter. Single ownership means no dispatch lock — every
-/// mutation is serialized by the owner's exclusive access.
+/// Owns: KFD compute queue, kernarg arena, scratch backing, PM4 completion
+/// counter, pool-level in-flight AQL signals. `dispatch_lock` serializes a
+/// whole op (bump + write + submit) so a shared ring's kernarg order matches
+/// its ring order.
 #[derive(Debug)]
-pub struct AmdConnector {
-    /// Shared immutable identity. Cloned across all connectors backed by the
-    /// same physical AMD:N (and across `AmdDevice` for back-compat).
+pub struct PoolQueue {
+    /// Shared immutable identity. Cloned across all queues backed by the same
+    /// physical AMD:N (and across `AmdDevice` for back-compat).
     core: Arc<AmdDeviceCore>,
-    /// Per-connector KFD compute queue — own ring + doorbell + GART. `Box`,
-    /// not `Arc`: the connector is its SOLE owner, so the queue's
-    /// `UnsafeCell<QueueInner>` is dispatched lock-free by the single owning
-    /// thread (no second handle can alias the cell). Distinct connectors'
-    /// queues are interleaved by the GPU's MES, not a CPU lock.
+    /// The KFD compute queue — own ring + doorbell + GART. Its `inner` is a
+    /// `parking_lot::Mutex<QueueInner>`, so a shared `Arc<PoolQueue>` can be
+    /// dispatched by several co-tenant owners safely; the brief critical
+    /// section is the packet write + doorbell. Distinct `PoolQueue`s' queues
+    /// are interleaved by the GPU's MES, not a CPU lock.
     queue: Box<AmdComputeQueue>,
-    /// Per-connector kernel-argument bump arena (16 MiB GTT). `Box` (sole
-    /// owner). Each connector owns its own arena so the bump cursor and this
-    /// connector's dispatch timeline are the SAME ordering — a wrapped slot is
-    /// provably free once this connector's timeline drains. (A device-global
-    /// arena fed by N independent timelines loses that guarantee.) Freed on
-    /// connector drop via `Drop for KernargArena`, after `AmdConnector::Drop`
-    /// has drained.
+    /// Kernel-argument bump arena (16 MiB GTT). One per `PoolQueue`. The
+    /// `dispatch_lock` held across bump + write + dispatch makes the bump cursor
+    /// order match the ring submission order, so a wrapped slot is provably free
+    /// once the whole pool drains. Freed on the queue's drop via
+    /// `Drop for KernargArena`, after `Drop for PoolQueue` has drained.
     arena: Box<KernargArena>,
-    /// Per-connector scratch backing. Mirrors what used to live on
-    /// `AmdDevice::scratch_state`; see that field's docstring for the
-    /// scratch-grow-on-demand story.
+    /// Scratch backing. Grown on demand by [`ensure_has_local_memory`](Self::ensure_has_local_memory)
+    /// under the `dispatch_lock` (park-and-grow on a live multi-XCC queue).
     scratch_state: Mutex<ScratchState>,
-    /// Monotonic counter + completion signal. Still used by the PM4 single-XCC
-    /// path, the SDMA-style monotonic drain, and the (deferred) AQL graph
-    /// capture path; the AQL `execute_on` path uses `inflight` instead.
-    timeline: Arc<Timeline>,
-    /// In-flight native per-op completion signals for the AQL `execute_on` path
-    /// (FIFO). Each AQL dispatch arms a pool signal to 1; the packet processor
-    /// decrements it to 0 on completion. The host reclaims retired slots on the
-    /// next [`acquire_signal`](Self::acquire_signal) or drains them in
-    /// [`synchronize`](Self::synchronize). This — not the monotonic `timeline` —
-    /// is how AQL completion is tracked. `synchronize_all` drains it via the
-    /// core's `Weak<AmdConnector>` registry without touching the queue.
+    /// PM4 monotonic completion counter + its signal. Used by the PM4 single-XCC
+    /// dispatch path and the SDMA-style monotonic drain. (The SDMA copy queue
+    /// has its own separate `Timeline`; this one is untouched by SDMA.) The AQL
+    /// `execute_on` path uses `inflight` instead.
+    pm4_counter: Arc<Timeline>,
+    /// Serializes a whole op (kernarg bump + write + ring submission) on this
+    /// shared queue, and the scratch park-and-grow. Lock order is always
+    /// `dispatch_lock` → queue inner `Mutex`, never the reverse.
+    dispatch_lock: Mutex<()>,
+    /// Pool-level in-flight native AQL completion signals (FIFO) — ALL owners'
+    /// in-flight work on this queue. Each AQL dispatch arms a pool signal to 1;
+    /// the packet processor decrements it to 0 on completion. Retired front
+    /// slots are reclaimed on the next [`acquire_signal`](Self::acquire_signal)
+    /// or drained by [`drain_all`](Self::drain_all). `synchronize_all` drains it
+    /// via the core's `Weak<PoolQueue>` registry without touching the queue.
     inflight: Mutex<VecDeque<Arc<AmdSignal>>>,
 }
 
-impl AmdConnector {
-    /// Build a connector with its own KFD compute queue + kernarg arena +
-    /// initial scratch. The timeline signal is acquired from the core's
-    /// shared `SignalPool` (which the factory must have installed before any
-    /// connector is built — `AmdDeviceCore::install_signal_pool`).
+impl PoolQueue {
+    /// Build a pool queue with its own KFD compute queue + kernarg arena +
+    /// pre-reserved scratch. The PM4 counter signal is acquired from the core's
+    /// shared `SignalPool` (which the factory must have installed first —
+    /// `AmdDeviceCore::install_signal_pool`).
     ///
-    /// Registers `Weak::self` in the core's connector list so device-wide
+    /// Registers `Weak::self` in the core's queue list so device-wide
     /// `synchronize_all` (called by `AmdAllocator::_copyin`/`_copyout`/`_free`)
-    /// drains every connector before any host-visible buffer free.
+    /// drains every queue before any host-visible buffer free.
     pub fn new_with_resources(core: Arc<AmdDeviceCore>, allocator: &AmdAllocator) -> Result<Arc<Self>> {
         // Order matters: every step that allocates must come BEFORE
         // `alloc_scratch`. Earlier-built resources (`AmdComputeQueue`,
-        // `KernargArena`, signal slot, timeline Arc) all have RAII cleanup
-        // (queue: `Drop for AmdComputeQueue` + `Drop for QueueInner`; arena:
-        // `Drop for KernargArena`; signal: `AmdSignal::Drop` returns slot to
-        // pool). The scratch backing is the lone raw KFD allocation — keeping
-        // it last means a failure before then unwinds via `?` and the RAII
-        // cleanups run; failure of `alloc_scratch` itself returns without
-        // anything to leak.
-        //
-        // Per-connector arena (not device-global): the arena's bump cursor
-        // and this connector's timeline are one ordering, so slot reuse is
-        // safe by construction. `AmdConnector::Drop` drains this connector's
-        // timeline before the `arena` field's `Drop for KernargArena` unmaps
-        // it, so there's no unmap-while-busy.
+        // `KernargArena`, signal slot, counter Arc) all have RAII cleanup, so a
+        // failure before the scratch alloc unwinds via `?`. The scratch backing
+        // is the lone raw KFD allocation — keeping it last means a failure
+        // before then leaks nothing.
         let queue = AmdComputeQueue::create(allocator)?;
         let arena = KernargArena::new(allocator, &core)?;
         let pool = core.signal_pool().cloned().ok_or_else(|| Error::Runtime {
-            message: "AmdConnector::new_with_resources: signal pool not installed on core — \
-                      install via AmdDeviceCore::install_signal_pool before building any connector"
+            message: "PoolQueue::new_with_resources: signal pool not installed on core — \
+                      install via AmdDeviceCore::install_signal_pool before building any queue"
                 .into(),
         })?;
-        let timeline = Timeline::new(Arc::new(pool.acquire()?));
+        let pm4_counter = Timeline::new(Arc::new(pool.acquire()?));
         // Pre-reserve a generous scratch buffer once (ROCr-style stable pool): the
         // mid-stream `set_aql_scratch` REALLOC (new VA + KFD-unmap of the old) on a
-        // live multi-XCC queue silently wedges the CP (confirmed: grow→~40% wedge,
-        // pre-sized→no wedge). ROCr never reallocs — it pre-reserves one pool
-        // (`max_scratch_len`) and sub-allocates. Pre-sizing here so no typical
-        // kernel triggers a grow. (A kernel exceeding this still hits the fragile grow
-        // path; the full fix is to update the SRD within this stable buffer instead
-        // of reallocating — tracked separately.)
+        // live multi-XCC queue silently wedges the CP. Pre-sizing here so no typical
+        // kernel triggers a grow.
         let (scratch_va, scratch_size, tmpring_size, size_per_thread, scratch_handle, aql_desc) =
             alloc_scratch(core.iface(), &core.node, &core.arch, 2048)?;
-        let conn = Arc::new(Self {
+        let q = Arc::new(Self {
             core,
             queue,
             arena,
@@ -139,64 +121,70 @@ impl AmdConnector {
                 handle: scratch_handle,
                 size: scratch_size,
             }),
-            timeline,
+            pm4_counter,
+            dispatch_lock: Mutex::new(()),
             inflight: Mutex::new(VecDeque::new()),
         });
-        // Register the connector in the core so `synchronize_all` can drain its
-        // in-flight work — both the monotonic `timeline` and the per-op
-        // completion `inflight` signals — via `Weak<AmdConnector>`, reading only
-        // signal slots and never touching the queue. Opportunistic GC of dropped
-        // entries.
+        // Register in the core so `synchronize_all` can drain this queue's
+        // in-flight work via `Weak<PoolQueue>`, reading only signal slots and
+        // never touching the queue. Opportunistic GC of dropped entries.
         {
-            let mut list = conn.core.connectors.lock();
+            let mut list = q.core.connectors.lock();
             list.retain(|w| w.strong_count() > 0);
-            list.push(Arc::downgrade(&conn));
+            list.push(Arc::downgrade(&q));
         }
         // Publish the initial scratch descriptor into the AQL queue's GART page
         // (no-op on PM4 queues). Must happen before the first dispatch.
-        conn.queue().set_aql_scratch(&aql_desc);
-        Ok(conn)
+        q.queue().set_aql_scratch(&aql_desc);
+        Ok(q)
     }
 
-    /// Borrow this connector's KFD compute queue.
+    /// Borrow this queue's KFD compute queue.
     #[inline]
     pub fn queue(&self) -> &AmdComputeQueue {
         &self.queue
     }
 
-    /// Borrow this connector's own kernarg arena.
+    /// Borrow this queue's kernarg arena.
     #[inline]
     pub fn arena(&self) -> &KernargArena {
         &self.arena
     }
 
-    /// The immutable core this connector dispatches against.
+    /// The immutable core this queue dispatches against.
     #[inline]
     pub fn core(&self) -> &Arc<AmdDeviceCore> {
         &self.core
     }
 
-    /// Connector timeline signal (forwards to the shared `Timeline`).
-    pub fn timeline_signal(&self) -> &Arc<AmdSignal> {
-        self.timeline.signal()
+    /// Acquire the dispatch lock. An owner holds this across a whole op (kernarg
+    /// bump + write + ring submission) so kernarg order ≡ ring order on the
+    /// shared queue, and the scratch park-and-grow holds it to fence co-tenant
+    /// dispatches during the swap. Lock order: `dispatch_lock` → queue inner.
+    #[inline]
+    pub fn dispatch_guard(&self) -> parking_lot::MutexGuard<'_, ()> {
+        self.dispatch_lock.lock()
     }
 
-    /// Reserve the next timeline value (`fetch_add(1)`). The caller emits a
-    /// queue signal packet that writes this value to the connector's signal
-    /// slot.
-    pub fn next_timeline(&self) -> u64 {
-        self.timeline.next()
+    /// PM4 completion-counter signal (forwards to the shared `Timeline`).
+    pub fn pm4_signal(&self) -> &Arc<AmdSignal> {
+        self.pm4_counter.signal()
     }
 
-    /// Highest submitted timeline value (i.e. the value the next `signal`
-    /// packet would write). `synchronize` waits until the GPU has written
-    /// `value - 1`.
-    pub fn timeline_value(&self) -> u64 {
-        self.timeline.current()
+    /// Reserve the next PM4 counter value (`fetch_add(1)`). The caller emits a
+    /// `RELEASE_MEM` packet that writes this value to the counter's signal slot.
+    pub fn next_pm4(&self) -> u64 {
+        self.pm4_counter.next()
     }
 
-    /// Current scratch buffer GPU VA. Read under the scratch mutex; tiny
-    /// lock window on the dispatch hot path.
+    /// Highest submitted PM4 counter value (the value the next `signal` packet
+    /// would write). A drain waits until the GPU has written `value - 1`.
+    pub fn pm4_value(&self) -> u64 {
+        self.pm4_counter.current()
+    }
+
+    /// Current scratch buffer GPU VA. Read under the scratch mutex; tiny lock
+    /// window on the dispatch hot path.
     pub fn scratch_gpu_va(&self) -> u64 {
         self.scratch_state.lock().gpu_va
     }
@@ -206,16 +194,17 @@ impl AmdConnector {
         self.scratch_state.lock().tmpring_size
     }
 
-    /// Drain all submitted GPU work on this connector. Blocks until the shared
-    /// timeline signal observes `timeline_value() - 1`, then wrap-resets. The
-    /// actual wait lives on `Timeline::drain` (touches only the atomic + signal
-    /// slot); this just adds the fast-fail poison gate and poison-on-failure.
-    pub fn synchronize(&self) -> Result<()> {
+    /// Drain ALL submitted GPU work on this queue (every owner's). Blocks until
+    /// the PM4 counter observes `pm4_value() - 1`, then waits every in-flight
+    /// AQL signal. Reads only signal slots — never takes `dispatch_lock` — so
+    /// holding `dispatch_lock` across a caller that also calls `drain_all`
+    /// (e.g. `ensure_has_local_memory`) is deadlock-free.
+    pub fn drain_all(&self) -> Result<()> {
         if let Some(err) = self.core.poison_error() {
             return Err(err);
         }
-        // Drain the monotonic timeline (PM4 / SDMA-style / graph work)...
-        self.timeline.drain(30_000).inspect_err(|e| self.core.poison(&e.to_string()))?;
+        // Drain the monotonic PM4 counter (PM4 / SDMA-style work)...
+        self.pm4_counter.drain(30_000).inspect_err(|e| self.core.poison(&e.to_string()))?;
         // ...then every in-flight native completion signal (AQL per-op work).
         // Snapshot under the lock, wait outside it, then drop the retired ones —
         // `retain` keeps any signal a concurrent dispatch armed after the
@@ -231,11 +220,11 @@ impl AmdConnector {
     /// Acquire a fresh native completion signal for one AQL dispatch. First
     /// reclaims retired in-flight signals (FIFO — they return their pool slots
     /// on drop), then takes a new slot. If the pool is momentarily exhausted,
-    /// blocks on the oldest in-flight dispatch: this is the back-pressure that
-    /// bounds how far the host can run ahead of the GPU (it replaces the old
-    /// timeline-headroom gate). The returned signal is armed to 1; the caller
-    /// places [`signal_handle`](AmdSignal::signal_handle) in the dispatch packet
-    /// and registers it via [`register_inflight`](Self::register_inflight).
+    /// blocks on the OLDEST in-flight dispatch (the queue head — pool-level, so
+    /// this is whichever owner's dispatch is oldest): the back-pressure that
+    /// bounds how far the host can run ahead of the GPU. The returned signal is
+    /// armed to 1; the caller places [`signal_handle`](AmdSignal::signal_handle)
+    /// in the dispatch packet and registers it via [`register_inflight`](Self::register_inflight).
     pub fn acquire_signal(&self) -> Result<Arc<AmdSignal>> {
         let pool = self
             .core
@@ -255,9 +244,9 @@ impl AmdConnector {
                     sig.arm(1);
                     return Ok(Arc::new(sig));
                 }
-                // Pool exhausted: block on the oldest in-flight dispatch, drop
-                // it, and retry. If nothing is in flight there is no slot to
-                // wait for, so surface the exhaustion error.
+                // Pool exhausted: block on the oldest in-flight dispatch (queue
+                // head), drop it, and retry. If nothing is in flight there is no
+                // slot to wait for, so surface the exhaustion error.
                 Err(e) => {
                     let oldest = self.inflight.lock().front().cloned();
                     match oldest {
@@ -272,58 +261,75 @@ impl AmdConnector {
         }
     }
 
-    /// Register a dispatched AQL completion signal as in-flight (FIFO). Kept
-    /// alive until it retires and a later acquire/synchronize reclaims it.
+    /// Reserve a raw signal slot held for a graph's lifetime — armed to 1 but
+    /// NOT registered in `inflight`. Unlike [`acquire_signal`](Self::acquire_signal),
+    /// these are not FIFO in-flight completion signals: a DAG graph holds one per
+    /// kernel for its whole lifetime and re-arms them each replay, so they must
+    /// not be reclaimed by the in-flight FIFO. Returns `Err` when the pool is
+    /// exhausted (the caller falls back to blanket-BARRIER capture).
+    pub fn reserve_signal(&self) -> Result<Arc<AmdSignal>> {
+        let pool = self
+            .core
+            .signal_pool()
+            .cloned()
+            .ok_or_else(|| Error::Runtime { message: "reserve_signal: signal pool not installed".into() })?;
+        let sig = pool.acquire()?;
+        sig.arm(1);
+        Ok(Arc::new(sig))
+    }
+
+    /// Register a dispatched AQL completion signal as in-flight (FIFO,
+    /// pool-level). Kept alive until it retires and a later acquire/drain
+    /// reclaims it.
     pub fn register_inflight(&self, sig: Arc<AmdSignal>) {
         self.inflight.lock().push_back(sig);
     }
 
-    /// Keep the timeline counter below 2^32 on the dispatch hot path.
+    /// Free slots in the shared signal pool (0 if not installed). Graph capture
+    /// checks this before reserving one slot per kernel so a large graph can't
+    /// drain the pool below the headroom per-op dispatch + PM4 counters need.
+    pub fn signal_free(&self) -> usize {
+        self.core.signal_pool().map(|p| p.free()).unwrap_or(0)
+    }
+
+    /// Keep the PM4 counter below 2^32 on the dispatch hot path.
     ///
-    /// `synchronize` resets the counter on wraparound, but it is only called on
-    /// host reads / frees / scratch realloc — a connector dispatched in a long
-    /// `wait=false` loop never hits it, so the full-u64 counter would climb
-    /// past 2^32 while the GPU's RELEASE_MEM writes only the low 32 bits. A
-    /// later `synchronize` would then wait for a full-u64 `target` the signal
-    /// slot can never reach → false 30 s timeout. Calling this before reserving
-    /// each timeline value forces the drain+reset at the 2^31 watermark, so the
+    /// A drain resets the counter on wraparound, but a queue dispatched in a
+    /// long `wait=false` PM4 loop never hits one, so the full-u64 counter would
+    /// climb past 2^32 while the GPU's `RELEASE_MEM` writes only the low 32
+    /// bits. A later drain would then wait for a full-u64 `target` the slot can
+    /// never reach → false 30 s timeout. Calling this before reserving each
+    /// counter value forces the drain+reset at the 2^31 watermark, so the
     /// reserved value stays `< 2^32` and the `as u32` truncations stay lossless.
-    /// Single-owner → sequential, so the check + drain can't race a dispatcher.
-    /// Amortised cost is one drain per ~2^31 dispatches.
-    pub fn ensure_timeline_headroom(&self) -> Result<()> {
-        if self.timeline.current() > TIMELINE_WRAP_WATERMARK {
-            self.synchronize()?;
+    /// The dispatch lock held across the op makes the check + drain sequential.
+    pub fn ensure_pm4_headroom(&self) -> Result<()> {
+        if self.pm4_counter.current() > TIMELINE_WRAP_WATERMARK {
+            self.drain_all()?;
         }
         Ok(())
     }
 
-    /// Ensure the connector's scratch backing has at least
-    /// `private_segment_size` bytes per thread, growing it on demand. The old
-    /// scratch buffer is freed (drain → unmap → munmap → free).
+    /// Ensure the queue's scratch backing has at least `private_segment_size`
+    /// bytes per thread, growing it on demand. The old scratch buffer is freed
+    /// (drain → unmap → munmap → free).
     pub fn ensure_has_local_memory(&self, private_segment_size: u32) -> Result<()> {
         let current = self.scratch_state.lock().size_per_thread;
         if private_segment_size <= current {
             return Ok(());
         }
         // Serialize the realloc (alloc new → swap → drain → free old) against
-        // concurrent dispatchers on this connector. In multi-queue mode the
-        // connector is exclusively owned so this is a no-op; in single-queue
-        // mode it is the shared connector and `exec_guard` holds the dispatch
-        // lock here. Non-nested with the `dispatch_pm4`/`dispatch_aql` guard
-        // (scratch-ensure and `execute_on` are separate calls in the caller),
-        // so no reentrant deadlock.
-        let _guard = self.core.exec_guard();
+        // concurrent co-tenant dispatchers on this shared queue. Holding the
+        // dispatch lock blocks every co-tenant from enqueuing the stale scratch
+        // VA during the swap. `drain_all` waits only on signals
+        // (never takes `dispatch_lock`), so this is deadlock-free.
+        let _g = self.dispatch_lock.lock();
         // Re-check under the guard: another dispatcher may have grown scratch
-        // while we waited for the lock (single-queue mode).
+        // while we waited for the lock.
         if private_segment_size <= self.scratch_state.lock().size_per_thread {
             return Ok(());
         }
         let (va, size, tmpring, rounded, handle, aql_desc) =
             alloc_scratch(self.core.iface(), &self.core.node, &self.core.arch, private_segment_size)?;
-        // `free_scratch` (below) drains the connector's timeline before the
-        // unmap — in single-queue mode that is the *shared* timeline, so it
-        // fences every in-flight dispatcher, not just this thread. The old
-        // buffer is therefore unreferenced by the time it is freed.
         let swapped = {
             let mut state = self.scratch_state.lock();
             if rounded > state.size_per_thread {
@@ -335,23 +341,15 @@ impl AmdConnector {
             }
         };
         match swapped {
-            // Ordering is load-bearing (see `set_aql_scratch`): drain the queue
-            // to idle, publish the NEW scratch descriptor (self-flushed to GART),
-            // and only THEN free the old backing. Publishing before the free means
-            // the live `amd_queue_t` never points at unmapped VRAM, so a stale
-            // descriptor read by the CP can't fault. Doing it the other way round
-            // (free then republish) intermittently wedges the queue. No-op
-            // republish on PM4 queues.
+            // Park-and-grow — the only safe ordering on a live multi-XCC queue.
+            // Drain to idle first so no dispatch is mid-flight or still reading
+            // the old scratch; publish the NEW descriptor (self-flushed to GART)
+            // so the live `amd_queue_t` never points at soon-to-be-unmapped
+            // VRAM; only THEN free the old backing. Skipping the drain (or
+            // freeing before republish) silently wedges the CP. No-op republish
+            // on PM4 queues.
             Some((old_va, old_size, old_handle)) => {
-                // Park-and-grow — the only safe ordering on a live multi-XCC queue.
-                // Drain to idle first so no dispatch is mid-flight or still reading
-                // the old scratch; publish the NEW descriptor (self-flushed to GART)
-                // so the live `amd_queue_t` never points at soon-to-be-unmapped
-                // VRAM; only THEN free the old backing. Skipping the drain (or
-                // freeing before republish) silently wedges the CP. Reaching this is
-                // rare now that scratch is pre-reserved; the robust path will resize
-                // within a stable buffer instead of reallocating (tracked separately).
-                if let Err(e) = self.synchronize() {
+                if let Err(e) = self.drain_all() {
                     tracing::warn!(?e, "scratch grow: drain failed; proceeding with republish");
                 }
                 self.queue.set_aql_scratch(&aql_desc);
@@ -364,102 +362,110 @@ impl AmdConnector {
         Ok(())
     }
 
-    /// Drain → unmap → munmap → free a scratch backing buffer. Old scratch is
-    /// no longer referenced once the timeline drains (sole user is dispatch
-    /// on this connector).
+    /// Drain → unmap → munmap → free a scratch backing buffer. Old scratch is no
+    /// longer referenced once the queue drains.
     fn free_scratch(&self, va: u64, size: usize, handle: u64) {
-        if let Err(e) = self.synchronize() {
-            tracing::warn!(?e, va, "scratch realloc: synchronize failed; freeing anyway");
+        if let Err(e) = self.drain_all() {
+            tracing::warn!(?e, va, "scratch realloc: drain failed; freeing anyway");
         }
         self.core.iface().free_raw(va, size, handle);
     }
 }
 
-impl Drop for AmdConnector {
-    /// Drain in-flight GPU work before the connector dies, so a downstream
-    /// `AmdAllocator::_copyout` (or any host read of a buffer this connector
-    /// wrote) doesn't race the still-running kernel. Without this, a graph
-    /// dropped at the end of `ExecutionPlan::execute` would lose its
-    /// `timeline_signal` while its async dispatch is still pending — the
-    /// device-wide `synchronize_all` would then skip the dead connector and
-    /// host reads would observe partial / zero-initialized buffer state.
+impl Drop for PoolQueue {
+    /// Drain in-flight GPU work before the queue dies (device close — the LAST
+    /// `Arc<PoolQueue>` dropping), so a downstream host read of a buffer this
+    /// queue wrote doesn't race a still-running kernel, and free the scratch
+    /// backing (`ScratchState` is `Copy` with no `Drop`).
     ///
-    /// Skipped during panic unwind: `synchronize` can block up to ~30 s per
-    /// connector (signal timeout) and an unwinding test with N live
-    /// connectors would pay N × 30 s before process teardown. The in-flight
-    /// work is then implicitly abandoned — the caller saw a panic anyway, so
-    /// observing partial GPU state is the lesser evil.
+    /// Skipped during panic unwind: `drain_all` can block up to ~30 s per queue
+    /// and an unwinding test would pay N × 30 s before teardown. The in-flight
+    /// work is then abandoned — the caller saw a panic anyway.
     fn drop(&mut self) {
         if std::thread::panicking() {
             tracing::warn!(
-                "AmdConnector drop during panic unwind: skipping synchronize; \
+                "PoolQueue drop during panic unwind: skipping drain; \
                  in-flight GPU work + scratch backing abandoned"
             );
             return;
         }
-        if let Err(e) = self.synchronize() {
-            tracing::warn!(?e, "AmdConnector drop: synchronize failed (in-flight work lost)");
+        if let Err(e) = self.drain_all() {
+            tracing::warn!(?e, "PoolQueue drop: drain failed (in-flight work lost)");
         }
-        // Free the scratch backing. `ScratchState` is `Copy` with no `Drop`,
-        // so without this every dropped connector would leak its ~50-200 MiB
-        // KFD scratch alloc + host VA reservation. `free_scratch` does its
-        // own synchronize internally (no-op now that we drained above) then
-        // unmaps/munmaps/frees via KFD.
         let state = *self.scratch_state.lock();
         self.free_scratch(state.gpu_va, state.size, state.handle);
     }
 }
 
-/// Leak-proof handle to an `AmdConnector`, obtained from
-/// [`AmdDeviceCore::lease_connector`]. Exposes only `&AmdConnector` via `Deref`
-/// and is **not** `Clone`/`Copy`. On drop it hands the connector back to the
-/// core's [`Dispatcher`](crate::amd::device) via `return_connector`, which does
-/// the mode-appropriate thing:
-///
-/// - **multi-queue:** the lease is exclusive + un-aliasable, so no two
-///   dispatchers ever share one KFD compute queue (the scratch-realloc-vs-
-///   dispatch race a single shared connector would allow); the connector
-///   returns to the idle pool on drop (mirrors the pooled-queue-with-checkout
-///   pattern — KFD compute queues are scarce, ~24/process, so they're reused);
-/// - **single-queue:** the lease aliases the device's one shared connector
-///   (exclusivity comes from the core's dispatch lock, not the lease); drop is a
-///   refcount decrement, the connector stays on the core.
-///
-/// No synchronize on drop: the connector's `Timeline` stays registered in
-/// `core.timelines`, so `synchronize_all` (the copyout/free fence) still
-/// drains it, and the next lessee's first dispatch waits on this connector's
-/// own timeline. Panic-drop inherits `AmdConnector::Drop`'s skip.
-pub struct ConnectorLease {
-    conn: Arc<AmdConnector>,
-    core: Arc<AmdDeviceCore>,
+/// Lightweight per-owner dispatch context. Holds an `Arc<PoolQueue>` (the shared
+/// queue this owner dispatches on) plus the owner's own completion bookkeeping,
+/// so [`synchronize`](Self::synchronize) can wait on ONLY this owner's work (the
+/// owner-local fast path). The whole-pool drain
+/// (`AmdDeviceCore::synchronize_all` → `PoolQueue::drain_all`) is the
+/// host-visibility/free fence.
+pub struct OwnerCtx {
+    pool: Arc<PoolQueue>,
+    /// AQL: this owner's last in-flight completion signal.
+    my_newest: Mutex<Option<Arc<AmdSignal>>>,
+    /// PM4: this owner's last reserved counter value (0 = none yet).
+    pm4_high: AtomicU64,
 }
 
-impl ConnectorLease {
-    pub(crate) fn new(conn: Arc<AmdConnector>, core: Arc<AmdDeviceCore>) -> Self {
-        Self { conn, core }
+impl OwnerCtx {
+    pub fn new(pool: Arc<PoolQueue>) -> Self {
+        Self { pool, my_newest: Mutex::new(None), pm4_high: AtomicU64::new(0) }
     }
-}
 
-impl std::ops::Deref for ConnectorLease {
-    type Target = AmdConnector;
+    /// Access the shared queue (queue / arena / scratch / acquire_signal /
+    /// dispatch_guard).
     #[inline]
-    fn deref(&self) -> &AmdConnector {
-        &self.conn
+    pub fn pool(&self) -> &Arc<PoolQueue> {
+        &self.pool
+    }
+
+    /// Record this owner's most recent in-flight AQL signal (the one to wait on
+    /// in the owner-local `synchronize`).
+    pub fn set_newest(&self, sig: Arc<AmdSignal>) {
+        *self.my_newest.lock() = Some(sig);
+    }
+
+    /// Record this owner's highest reserved PM4 counter value.
+    pub fn set_pm4_high(&self, v: u64) {
+        self.pm4_high.store(v, Ordering::Release);
+    }
+
+    /// Owner-local drain: wait on ONLY this owner's last submitted work. AQL:
+    /// wait its newest signal. PM4: wait the shared counter to reach this
+    /// owner's high value. Polls the device poison latch and bails on fault.
+    pub fn synchronize(&self) -> Result<()> {
+        if let Some(err) = self.pool.core.poison_error() {
+            return Err(err);
+        }
+        let newest = self.my_newest.lock().clone();
+        if let Some(sig) = newest {
+            sig.wait_done(30_000).inspect_err(|e| self.pool.core.poison(&e.to_string()))?;
+            return Ok(());
+        }
+        let high = self.pm4_high.load(Ordering::Acquire);
+        if high > 0 {
+            self.pool
+                .pm4_signal()
+                .wait_signal_value(high, 30_000)
+                .inspect_err(|e| self.pool.core.poison(&e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    /// Identity of the shared queue this owner dispatches on — used by the
+    /// concurrency test to assert distinct owners landed on distinct queues.
+    #[cfg(test)]
+    pub fn queue_ptr(&self) -> *const PoolQueue {
+        Arc::as_ptr(&self.pool)
     }
 }
 
-impl std::fmt::Debug for ConnectorLease {
+impl std::fmt::Debug for OwnerCtx {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ConnectorLease").finish_non_exhaustive()
-    }
-}
-
-impl Drop for ConnectorLease {
-    fn drop(&mut self) {
-        // The core's `Dispatcher` decides what return means: re-pool it
-        // (multi-queue, cloning only when it actually pools) or nothing
-        // (single-queue — the shared connector lives on the core). Either way
-        // this lease's `Arc` clone drops at scope end.
-        self.core.return_connector(&self.conn);
+        f.debug_struct("OwnerCtx").finish_non_exhaustive()
     }
 }

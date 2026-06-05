@@ -11,7 +11,7 @@ fn signal_pool_acquire_release_roundtrip() {
             return;
         }
     };
-    let pool = SignalPool::new(&alloc).expect("create pool");
+    let pool = SignalPool::new(&alloc, 64).expect("create pool");
     let s1 = pool.acquire().expect("acquire 1");
     let s2 = pool.acquire().expect("acquire 2");
     assert_ne!(s1.value_addr(), s2.value_addr());
@@ -35,9 +35,10 @@ fn signal_pool_exhaustion_is_clean_err() {
             return;
         }
     };
-    let pool = SignalPool::new(&alloc).expect("create pool");
+    const N: usize = 64;
+    let pool = SignalPool::new(&alloc, N).expect("create pool");
     let mut sigs = Vec::new();
-    for _ in 0..SLOTS_PER_POOL {
+    for _ in 0..N {
         sigs.push(pool.acquire().expect("ack"));
     }
     let err = pool.acquire().expect_err("pool must be exhausted");

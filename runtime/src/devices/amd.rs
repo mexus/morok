@@ -37,9 +37,13 @@ pub fn create_amd_device(registry: &DeviceRegistry, device_id: usize, arch: AmdA
     // compute-queue or arena is pre-built here.
     let amd_alloc = AmdAllocator::new(device_id)?;
     let device_handle = Arc::clone(&amd_alloc.dev);
-    let signal_pool = SignalPool::new(&amd_alloc)?;
-    // Seed the pool onto the device core so `AmdConnector::new_with_resources`
-    // can acquire its timeline signal.
+    // Signal-pool sizing: per-op AQL dispatch needs only a few slots, but a
+    // captured DAG graph reserves one slot per kernel (low hundreds) for its
+    // lifetime, across several concurrent owners. 1024 slots (64 KiB GTT) covers
+    // that with headroom; the pool rounds up to whole 64-slot pages.
+    let signal_pool = SignalPool::new(&amd_alloc, 1024)?;
+    // Seed the pool onto the device core so `PoolQueue::new_with_resources`
+    // can acquire its PM4 counter signal.
     device_handle.core().install_signal_pool(signal_pool);
     // Bring up the SDMA copy queue so host↔device staging works — this is what
     // lets buffers be device-local (non-host-visible). A creation failure

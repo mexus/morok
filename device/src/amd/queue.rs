@@ -7,14 +7,13 @@
 //! different `queue_type` codes. AQL packets are 64 bytes (`HsaKernelDispatchPacket`
 //! + `HsaBarrierAndPacket`); SDMA submissions are raw dword sequences.
 //!
-//! Dispatch goes through `dispatch_pm4` (single-XCC PM4 ring) or the AQL
-//! vendor-IB path (multi-XCC CDNA); both fence each dispatch on the connector
-//! timeline. `AmdCopyQueue::copy_fenced` stages host↔device / device↔device
-//! copies via SDMA, fenced on its own timeline.
+//! Dispatch goes through `dispatch_pm4` (single-XCC PM4 ring, fenced on the
+//! `PoolQueue`'s monotonic counter) or the native AQL path (multi-XCC CDNA,
+//! completion via per-op signals). `AmdCopyQueue::copy_fenced` stages
+//! host↔device / device↔device copies via SDMA, fenced on its own timeline.
 
 #![cfg(target_os = "linux")]
 
-use std::cell::UnsafeCell;
 use std::mem::size_of;
 use std::ptr::NonNull;
 use std::sync::Arc;
@@ -25,7 +24,7 @@ use tracing::debug;
 use crate::allocator::{Allocator, BufferSpec};
 
 use crate::amd::AmdAllocator;
-use crate::amd::connector::AmdConnector;
+use crate::amd::connector::PoolQueue;
 use crate::amd::device::AmdDeviceCore;
 use crate::amd::signal::Timeline;
 use crate::amd::sys::hsa::{
@@ -84,6 +83,37 @@ pub fn build_barrier_and(completion_signal: u64) -> [u32; 16] {
     p
 }
 
+/// Build an AQL `hsa_barrier_and_packet_t` (64 bytes) that gates a following
+/// dispatch on up to five producer completion signals — WITHOUT the header
+/// BARRIER bit. Because the BARRIER bit is clear, this packet does NOT wait for
+/// prior packets in the ring to complete: it only blocks until each (non-zero)
+/// `deps[i]` signal value reaches 0, so earlier *independent* kernels keep
+/// running. The system-scope acquire/release fences make the producers' writes
+/// visible to the consumer. Used by DAG-driven graph dispatch to enforce true
+/// data dependencies while leaving the per-dispatch BARRIER bit stripped.
+///
+/// Up to the first five `deps` are written into `dep_signal[0..5]` (dwords
+/// 2/3, 4/5, 6/7, 8/9, 10/11); callers chain multiple packets for >5 deps.
+/// `completion` (0 = none) at dwords 14/15.
+///
+/// Layout: `header`@0, `dep_signal[5]`@8..48, `completion_signal`@56.
+pub fn build_barrier_and_deps(deps: &[u64], completion: u64) -> [u32; 16] {
+    // BARRIER_AND type + system-scope acquire/release fences, but NO barrier bit.
+    let header: u32 = hsa_packet_type_t_HSA_PACKET_TYPE_BARRIER_AND
+        | (hsa_fence_scope_t_HSA_FENCE_SCOPE_SYSTEM << hsa_packet_header_t_HSA_PACKET_HEADER_SCACQUIRE_FENCE_SCOPE)
+        | (hsa_fence_scope_t_HSA_FENCE_SCOPE_SYSTEM << hsa_packet_header_t_HSA_PACKET_HEADER_SCRELEASE_FENCE_SCOPE);
+    let mut p = [0u32; 16];
+    p[0] = header; // dw0: header (low 16) + reserved (high 16 = 0)
+    // dep_signal[i] handle at dwords 2+2*i / 3+2*i (byte 8 + 8*i). Up to 5.
+    for (i, &dep) in deps.iter().take(5).enumerate() {
+        p[2 + 2 * i] = dep as u32;
+        p[3 + 2 * i] = (dep >> 32) as u32;
+    }
+    p[14] = completion as u32; // completion_signal.handle @ byte 56
+    p[15] = (completion >> 32) as u32;
+    p
+}
+
 /// Build an AQL vendor-specific packet (64 bytes) pointing the AQL packet
 /// processor at a PM4 indirect buffer (`pm4_addr`, `pm4_count` dwords). Used to
 /// run a PM4 `ACQUIRE_MEM` (full instruction-/scalar-cache + L2 invalidate) on
@@ -125,6 +155,36 @@ pub fn build_dispatch_packet(
     kernarg_address: u64,
     completion_signal: u64,
 ) -> hsa_kernel_dispatch_packet_t {
+    build_dispatch_packet_barrier(
+        workgroup_size,
+        grid_size,
+        private_segment_size,
+        group_segment_size,
+        kernel_object,
+        kernarg_address,
+        completion_signal,
+        /*barrier=*/ true,
+    )
+}
+
+/// Like [`build_dispatch_packet`] but with explicit control over the header
+/// BARRIER bit. When `barrier` is `false` the bit is cleared, so the AQL packet
+/// processor does NOT wait for all prior packets to COMPLETE before launching
+/// this kernel — letting independent kernels overlap. True data dependencies
+/// are then carried by preceding `barrier_and` packets (see
+/// [`build_barrier_and_deps`]). All other fields are identical to
+/// [`build_dispatch_packet`].
+#[allow(clippy::too_many_arguments)]
+pub fn build_dispatch_packet_barrier(
+    workgroup_size: [u16; 3],
+    grid_size: [u32; 3],
+    private_segment_size: u32,
+    group_segment_size: u32,
+    kernel_object: u64,
+    kernarg_address: u64,
+    completion_signal: u64,
+    barrier: bool,
+) -> hsa_kernel_dispatch_packet_t {
     let dims: u16 = if grid_size[2] > 1 {
         3
     } else if grid_size[1] > 1 {
@@ -135,8 +195,14 @@ pub fn build_dispatch_packet(
     let mut p = hsa_kernel_dispatch_packet_t::default();
     // `header` (u16) and `setup` (dims, in bits 0-1) share a union with the
     // `full_header` u32; setting the latter writes both in one little-endian
-    // store (header = low half, setup = high half).
-    p.__bindgen_anon_1.full_header = u32::from(kernel_dispatch_header()) | (u32::from(dims) << 16);
+    // store (header = low half, setup = high half). Clear ONLY the BARRIER bit
+    // in the low 16 when `barrier == false`; the `dims << 16` high half and the
+    // fence-scope bits are preserved.
+    let mut full_header = u32::from(kernel_dispatch_header()) | (u32::from(dims) << 16);
+    if !barrier {
+        full_header &= !(1u32 << hsa_packet_header_t_HSA_PACKET_HEADER_BARRIER);
+    }
+    p.__bindgen_anon_1.full_header = full_header;
     p.workgroup_size_x = workgroup_size[0];
     p.workgroup_size_y = workgroup_size[1];
     p.workgroup_size_z = workgroup_size[2];
@@ -157,21 +223,14 @@ pub fn build_dispatch_packet(
 /// mapping, and submit primitive — the only differences are the packet
 /// format we write into the ring and whether the GART contains an
 /// `amd_queue_t` AQL descriptor.
-/// # Safety — single-owner interior mutability
 ///
-/// `inner` is mutated through `&self` without a lock. The owning
-/// `ConnectorLease` guarantees exactly one thread issues sequential,
-/// non-reentrant dispatch/submit calls against this queue for its lifetime:
-/// the connector lives in exactly one owner slot (plan / graph / per-call
-/// lease) or the idle pool (where nobody dispatches), and a single owner
-/// dispatches its ops serially. The shared drainer (`synchronize_all`) reads
-/// only the timeline atomics + signal slot (via `Timeline`), NEVER this cell.
-/// Mirrors `RawBuffer`'s `UnsafeCell` + scheduler-exclusivity pattern
-/// (allocator.rs). This is the lock-free dispatch path the per-owner model is
-/// built for: distinct connectors' queues are interleaved by the GPU's MES,
-/// not by a CPU lock.
+/// `inner` is guarded by a per-queue `Mutex`: the brief critical section is the
+/// packet write + doorbell ring (and the rare scratch-descriptor patch), so a
+/// shared `Arc<AmdComputeQueue>` is safe when more owners than queues co-tenant
+/// one ring. Cross-queue parallelism comes from the pool holding many queues,
+/// each with its own lock — the MES interleaves them on the CP pipes.
 pub struct AmdComputeQueue {
-    inner: UnsafeCell<QueueInner>,
+    inner: Mutex<QueueInner>,
     /// Immutable device identity (kfd_fd, drm_fd, node, arch, poison latch).
     core: Arc<AmdDeviceCore>,
     /// `true` when this queue submits raw PM4 dwords directly; `false` when
@@ -179,12 +238,6 @@ pub struct AmdComputeQueue {
     /// Decided at queue creation from `num_xcc`, fixed for the queue's lifetime.
     is_pm4: bool,
 }
-
-// SAFETY: `QueueInner` is `Send`; the single-owner invariant above means no
-// two threads access `inner` concurrently, so it is sound to share `&self`
-// across threads (e.g. a plan moved between dispatches). `UnsafeCell` makes
-// the type `!Sync` by default, hence the manual impl.
-unsafe impl Sync for AmdComputeQueue {}
 
 /// Copy queue (SDMA). Stages host↔device and device↔device copies for
 /// device-local VRAM buffers. Each [`copy_fenced`](AmdCopyQueue::copy_fenced)
@@ -262,14 +315,14 @@ impl Drop for QueueInner {
     /// Free the queue's KFD-allocated VRAM/GTT backings. `RawBuffer` itself
     /// has no `Drop` (the existing `AmdAllocator::_free` consumes RawBuffer
     /// by destructure), so a queue dropped directly — as happens for
-    /// per-connector queues — would otherwise leak ~50 MiB of ring + GART +
+    /// pool queues — would otherwise leak ~50 MiB of ring + GART +
     /// EOP + ctx-save every time. We call the in-place free path
     /// (`RawBuffer::free_amd_device_in_place`) for each. `AmdComputeQueue::
-    /// Drop` has already invoked `kfd_destroy_queue` AND `AmdConnector::Drop`
-    /// has synchronised the timeline, so the GPU is idle on these buffers.
+    /// Drop` has already invoked `kfd_destroy_queue` AND `PoolQueue::Drop`
+    /// has drained the queue, so the GPU is idle on these buffers.
     ///
-    /// Skipped during panic unwind: `AmdConnector::Drop` and
-    /// `AmdComputeQueue::Drop` both skip their synchronize/destroy on panic, so
+    /// Skipped during panic unwind: `PoolQueue::Drop` and
+    /// `AmdComputeQueue::Drop` both skip their drain/destroy on panic, so
     /// the GPU's CP may still be reading the ring/GART. Unmapping them here
     /// would fault the VM mid-unwind and could crash before the panic's
     /// diagnostics flush. Accept the buffer leak — the process is unwinding and
@@ -360,15 +413,6 @@ impl QueueInner {
 }
 
 impl AmdComputeQueue {
-    /// Exclusive access to `inner` for the single owner. See the struct's
-    /// safety doc — the `ConnectorLease` guarantees one sequential dispatcher.
-    #[allow(clippy::mut_from_ref)]
-    #[inline]
-    unsafe fn inner_mut(&self) -> &mut QueueInner {
-        // SAFETY: single-owner invariant; no concurrent accessor of `inner`.
-        unsafe { &mut *self.inner.get() }
-    }
-
     /// Create a compute queue. The queue kind is selected by `is_aql =
     /// xccs > 1`. Single-XCC GPUs (the gfx11/12 default) use the
     /// PM4 path (`KFD_IOC_QUEUE_TYPE_COMPUTE`), submitting raw PM4 dwords
@@ -392,7 +436,7 @@ impl AmdComputeQueue {
         let queue_type = if is_pm4 { kfd::KFD_IOC_QUEUE_TYPE_COMPUTE } else { kfd::KFD_IOC_QUEUE_TYPE_COMPUTE_AQL };
         let inner = create_queue(allocator, queue_type, COMPUTE_RING_BYTES, !is_pm4, /*needs_cwsr=*/ true)?;
         debug!(gpu_id = core.node.gpu_id, num_xcc = core.node.num_xcc, is_pm4 = is_pm4, "AmdComputeQueue created");
-        Ok(Box::new(Self { inner: UnsafeCell::new(inner), core: Arc::clone(core), is_pm4 }))
+        Ok(Box::new(Self { inner: Mutex::new(inner), core: Arc::clone(core), is_pm4 }))
     }
 
     /// `true` when this queue submits raw PM4 dwords (single-XCC); `false`
@@ -407,18 +451,16 @@ impl AmdComputeQueue {
     /// overwrite unconsumed packets. Bounds the combined ring footprint to
     /// `RING_MAX_INFLIGHT * MAX_DISPATCH_DWORDS` (half the ring).
     ///
-    /// Gates on the connector's timeline SIGNAL — the proven completion
-    /// primitive `synchronize` already uses — not the PM4 read pointer (whose
+    /// Gates on the queue's PM4 counter SIGNAL — the proven completion
+    /// primitive `drain_all` already uses — not the PM4 read pointer (whose
     /// COMPUTE-queue semantics are unreliable, which would deadlock a spin).
     /// The dispatches we wait on were submitted (doorbell rung) in prior calls,
     /// so the GPU will signal them; the wait always makes progress.
-    fn wait_dispatch_headroom(&self, conn: &AmdConnector) -> Result<()> {
-        let last_reserved = conn.timeline_value().saturating_sub(1);
+    fn wait_dispatch_headroom(&self, pool: &PoolQueue) -> Result<()> {
+        let last_reserved = pool.pm4_value().saturating_sub(1);
         if last_reserved > RING_MAX_INFLIGHT {
             let target = last_reserved - RING_MAX_INFLIGHT;
-            conn.timeline_signal()
-                .wait_signal_value(target, 30_000)
-                .inspect_err(|e| self.core.poison(&e.to_string()))?;
+            pool.pm4_signal().wait_signal_value(target, 30_000).inspect_err(|e| self.core.poison(&e.to_string()))?;
         }
         Ok(())
     }
@@ -426,18 +468,17 @@ impl AmdComputeQueue {
     /// Atomically build + submit one PM4 (single-XCC) kernel dispatch.
     ///
     /// The queue's `inner` lock serializes packet assembly + ring blit +
-    /// doorbell. With one queue per `AmdConnector` (single-owner per plan or
-    /// graph) the lock is uncontended in practice, but it stays as a
-    /// defensive primitive — any future async use within one connector
-    /// (multi-threaded JIT replay, etc.) would still need it.
+    /// doorbell; the caller additionally holds `pool.dispatch_lock` across the
+    /// whole op so the PM4 counter reservation and ring submission stay ordered
+    /// against co-tenant owners on this shared queue.
     ///
     /// Sequence:
-    /// `wait(timeline, prev) → memory_barrier → exec → signal(timeline, next)`.
-    /// Returns the timeline value this dispatch signals.
+    /// `wait(counter, prev) → memory_barrier → exec → signal(counter, next)`.
+    /// Returns the counter value this dispatch signals.
     #[allow(clippy::too_many_arguments)]
     pub fn dispatch_pm4(
         &self,
-        conn: &AmdConnector,
+        pool: &PoolQueue,
         rsrc1: u32,
         rsrc2: u32,
         rsrc3: u32,
@@ -451,30 +492,25 @@ impl AmdComputeQueue {
     ) -> Result<u64> {
         debug_assert!(self.is_pm4, "dispatch_pm4 called on AQL queue");
         debug_assert!(
-            Arc::ptr_eq(&self.core, conn.core()),
-            "dispatch_pm4: connector core ≠ queue core (queue gpu_id={}, conn gpu_id={}); \
-             cross-device dispatch silently corrupts scratch/timeline VAs",
+            Arc::ptr_eq(&self.core, pool.core()),
+            "dispatch_pm4: pool core ≠ queue core (queue gpu_id={}, pool gpu_id={}); \
+             cross-device dispatch silently corrupts scratch/counter VAs",
             self.core.node.gpu_id,
-            conn.core().node.gpu_id,
+            pool.core().node.gpu_id,
         );
-        // Single-queue mode: serialize the whole dispatch (headroom waits +
-        // timeline reservation + ring write + doorbell) against other owners
-        // sharing this connector. A no-op in multi-queue mode (exclusive
-        // ownership → `exec_guard` returns `None`). Held for the method body so
-        // the timeline state and ring stay consistent across the back-pressure
-        // and wrap waits.
-        let _dispatch_guard = self.core.exec_guard();
-        // Keep the timeline < 2^32 (drain+reset at the watermark) before
+        // The caller (`execute_on`) holds `pool.dispatch_lock` across the whole
+        // op (kernarg bump + write + this dispatch), so the PM4 counter state
+        // and ring stay consistent across the back-pressure and wrap waits
+        // against co-tenant owners on this shared queue.
+        // Keep the PM4 counter < 2^32 (drain+reset at the watermark) before
         // reserving this dispatch's value.
-        conn.ensure_timeline_headroom()?;
+        pool.ensure_pm4_headroom()?;
         // Ring back-pressure: block if too many dispatches are in flight, so an
-        // async (`wait=false`) burst can't lap the ring. Outside the lock.
-        self.wait_dispatch_headroom(conn)?;
-        let timeline_addr = conn.timeline_signal().value_addr();
-        // The connector is single-owner — its scratch and timeline are not
-        // concurrently mutated, so we read them outside any lock.
-        let scratch_addr = conn.scratch_gpu_va();
-        let tmpring_size = conn.tmpring_size();
+        // async (`wait=false`) burst can't lap the ring. Outside the inner lock.
+        self.wait_dispatch_headroom(pool)?;
+        let counter_addr = pool.pm4_signal().value_addr();
+        let scratch_addr = pool.scratch_gpu_va();
+        let tmpring_size = pool.tmpring_size();
         // Assemble the full USER_DATA prefix here, under the lock, so the scratch
         // SGPR descriptor (words 0-3) is derived from the SAME `scratch_addr` as
         // the `COMPUTE_DISPATCH_SCRATCH_BASE` register below. Building it in
@@ -490,14 +526,13 @@ impl AmdComputeQueue {
             full_user_data.push(0x20c1_4000);
         }
         full_user_data.extend_from_slice(user_data);
-        // SAFETY: single-owner invariant (see struct doc) — exclusive, no lock.
-        let g = unsafe { self.inner_mut() };
-        let prev = conn.timeline_value().saturating_sub(1);
-        let next = conn.next_timeline();
+        let mut g = self.inner.lock();
+        let prev = pool.pm4_value().saturating_sub(1);
+        let next = pool.next_pm4();
 
         let mut q: Vec<u32> = Vec::with_capacity(96);
-        // wait(timeline, prev): no-op on the first dispatch (prev == 0).
-        q.extend_from_slice(&pm4::wait_reg_mem(timeline_addr, prev as u32, 0xFFFF_FFFF));
+        // wait(counter, prev): no-op on the first dispatch (prev == 0).
+        q.extend_from_slice(&pm4::wait_reg_mem(counter_addr, prev as u32, 0xFFFF_FFFF));
         // memory_barrier: HDP flush handshake + a FULL acquire (L2 invalidate),
         // emitted unconditionally per dispatch. It makes host-/SDMA-written inputs
         // visible and invalidates stale L2 regardless of producer. `build_exec_pm4`
@@ -524,9 +559,9 @@ impl AmdComputeQueue {
             wave32,
             target_major,
         );
-        // signal(timeline, next): RELEASE_MEM after a system-scope cache flush.
+        // signal(counter, next): RELEASE_MEM after a system-scope cache flush.
         q.extend_from_slice(&pm4::release_mem(
-            timeline_addr,
+            counter_addr,
             next as u32,
             /*cache_flush=*/ true,
             target_major == 9,
@@ -554,16 +589,10 @@ impl AmdComputeQueue {
         if let Some(err) = self.core.poison_error() {
             return Err(err);
         }
-        // Single-queue serialization (cf. dispatch_pm4); no-op in multi-queue.
-        // The graph factory falls back to per-call dispatch in single-queue
-        // mode, so this guard is defensive — it keeps `submit_dwords` correct
-        // if a shared connector ever drives a captured chain.
-        let _dispatch_guard = self.core.exec_guard();
-        // No `Release` fence here — `ring_doorbell` already issues its own
-        // publication barrier.
-        // SAFETY: exclusive access — single-owner in multi-queue mode, or held
-        // under `exec_guard` in single-queue mode (see struct doc).
-        let g = unsafe { self.inner_mut() };
+        // Ring contiguity is serialized by the inner `Mutex` (one writer
+        // produces a contiguous run + doorbell). No `Release` fence here —
+        // `ring_doorbell` already issues its own publication barrier.
+        let mut g = self.inner.lock();
         g.push_pm4(dwords);
         g.ring_doorbell(/*is_pm4=*/ true);
         Ok(())
@@ -580,11 +609,9 @@ impl AmdComputeQueue {
         if let Some(err) = self.core.poison_error() {
             return Err(err);
         }
-        // Single-queue serialization (cf. submit_dwords); no-op in multi-queue.
-        let _dispatch_guard = self.core.exec_guard();
-        // SAFETY: exclusive access — single-owner in multi-queue mode, or held
-        // under `exec_guard` in single-queue mode (see struct doc).
-        let g = unsafe { self.inner_mut() };
+        // Ring contiguity is serialized by the inner `Mutex` (one writer
+        // produces a contiguous run of packets + one doorbell).
+        let mut g = self.inner.lock();
         for p in packets {
             g.push_aql(dwords_as_bytes(p));
         }
@@ -605,14 +632,13 @@ impl AmdComputeQueue {
         if let Some(err) = self.core.poison_error() {
             return Err(err);
         }
-        // Serialize ring write + doorbell (no-op in multi-queue mode, cf.
-        // `submit_aql`). Held only for the push, not any wait.
-        let _guard = self.core.exec_guard();
+        // Ring write + doorbell are serialized by the inner `Mutex`; the caller
+        // (`execute_on`) additionally holds `pool.dispatch_lock` so the packet's
+        // kernarg slot is the one just bumped.
         // SAFETY: `hsa_kernel_dispatch_packet_t` is `#[repr(C)]` and exactly
         // `AQL_PACKET_BYTES` (debug-asserted above).
         let bytes = unsafe { std::slice::from_raw_parts(packet as *const _ as *const u8, AQL_PACKET_BYTES) };
-        // SAFETY: exclusive under `exec_guard` (single-queue) or single owner.
-        let g = unsafe { self.inner_mut() };
+        let mut g = self.inner.lock();
         g.push_aql(bytes);
         g.ring_doorbell(/*is_pm4=*/ false);
         Ok(())
@@ -665,9 +691,10 @@ impl AmdComputeQueue {
             return;
         }
         use crate::amd::sys::hsa;
-        // SAFETY: single-owner invariant (see struct doc); called only while the
-        // queue is drained.
-        let base = unsafe { self.inner_mut() }.gart_host.as_ptr();
+        // Called only while the queue is drained (the caller holds it idle), so
+        // the descriptor write can't race a dispatch; locking briefly to read the
+        // stable GART base pointer.
+        let base = self.inner.lock().gart_host.as_ptr();
         // SAFETY: `base` is the GART page we mmapped; every offset lands inside
         // the 256-byte AmdQueueT descriptor that occupies the page.
         unsafe {
@@ -703,9 +730,7 @@ impl AmdComputeQueue {
     #[cfg(test)]
     pub(crate) fn read_aql_scratch(&self) -> crate::amd::device::AqlScratchDesc {
         use crate::amd::sys::hsa;
-        // SAFETY: single-owner; GART page is host-visible and the AmdQueueT
-        // occupies it.
-        let base = unsafe { self.inner_mut() }.gart_host.as_ptr();
+        let base = self.inner.lock().gart_host.as_ptr();
         unsafe {
             let rd = base.add(hsa::OFFSET_SCRATCH_RESOURCE_DESCRIPTOR) as *const u32;
             crate::amd::device::AqlScratchDesc {
@@ -729,7 +754,7 @@ impl AmdComputeQueue {
     /// if no exception is recorded (value `0`) / on PM4 queues. Used to turn a
     /// blind dispatch timeout into a diagnosable error.
     pub(crate) fn inactive_exception(&self) -> Option<i64> {
-        let h = unsafe { self.inner_mut() }.qinactive_host?;
+        let h = self.inner.lock().qinactive_host?;
         // SAFETY: host-visible amd_signal_t; `value` is the i64 at +8.
         let code = unsafe { std::ptr::read_volatile(h.as_ptr().add(8) as *const i64) };
         (code != 0).then_some(code)
@@ -746,9 +771,9 @@ impl Drop for AmdComputeQueue {
     /// / GART / EOP / ctx-save buffers free via the underlying
     /// `RawBuffer::Drop` chain when `self.inner` drops next.
     ///
-    /// `AmdConnector::Drop` has already synchronised the timeline before
+    /// `PoolQueue::Drop` has already drained the queue before
     /// reaching this point on the happy path. During panic unwind the
-    /// connector skips `synchronize` to keep teardown bounded — destroying
+    /// pool queue skips its drain to keep teardown bounded — destroying
     /// the KFD queue with in-flight CP work risks a kernel-side fault that
     /// crashes the process before useful diagnostics flush, so we also
     /// skip and accept the queue-id leak (process exit reclaims it).
@@ -1179,8 +1204,8 @@ fn create_queue(
     let doorbell_base = qh.doorbell_base;
 
     // SAFETY: gart_host points to the GART page we just mmapped; the
-    // write/read_dispatch_id fields live at fixed offsets inside the
-    // AmdQueueT descriptor we wrote into the page.
+    // write_dispatch_id field lives at a fixed offset inside the AmdQueueT
+    // descriptor we wrote into the page.
     let write_ptr_host = unsafe { NonNull::new_unchecked(gart_host.as_ptr().add(wptr_offset as usize) as *mut u64) };
 
     Ok(QueueInner {
