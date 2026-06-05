@@ -145,6 +145,43 @@ pub trait JointStep {
     fn reset(&mut self);
 }
 
+/// Per-lane result of [`RnntDecoder::decode_batch`]: decoded text + token
+/// emissions in decode order.
+pub type LaneDecode = (String, Vec<TokenEmission>);
+
+// ─── BatchJointStep trait ─────────────────────────────────────────────────
+
+/// B-lane batched variant of [`JointStep`]: one fused GPU dispatch advances all
+/// lanes at the shared frame index, amortizing the per-step dispatch cost across
+/// the independent items. Per-lane semantics are identical to [`JointStep`]:
+/// each lane keeps its own committed/tentative predictor state, lanes use the
+/// committed prefix on every step, and only [`commit`](Self::commit)-masked
+/// lanes promote tentative → committed.
+///
+/// `prev[i]` is the lane's previous non-blank token (`blank_id` selects the
+/// empty-prefix initial state, matching `prev_token = None` in [`JointStep`]).
+/// `active[i]` masks both the inputs the lane sees and which `out[i]` slots are
+/// trustworthy — inactive lanes carry garbage.
+pub trait BatchJointStep {
+    /// Backend-specific error (typically a JIT execution error).
+    type Error: std::error::Error + Send + Sync + 'static;
+
+    /// Lane capacity (must cover every `decode_batch` call's item count).
+    fn batch(&self) -> usize;
+
+    /// One batched step at frame `t`: write `prev` + committed state for every
+    /// lane, execute once, return the joint argmax token of each ACTIVE lane in
+    /// `out[i]`. Slices all have length [`batch`](Self::batch).
+    fn step(&mut self, t: usize, prev: &[usize], active: &[bool], out: &mut [usize]) -> Result<(), Self::Error>;
+
+    /// Promote tentative → committed for masked lanes. Called exactly once per
+    /// inner step when at least one lane emitted non-blank.
+    fn commit(&mut self, lanes: &[bool]);
+
+    /// Reset all lanes to the empty-prefix initial state.
+    fn reset(&mut self);
+}
+
 // ─── Decoder ──────────────────────────────────────────────────────────────
 
 /// Greedy RNN-T decoder. Owns the vocabulary; the blank token id is implicit
@@ -299,5 +336,69 @@ impl RnntDecoder {
         }
 
         Ok((text, emissions))
+    }
+
+    /// Batched greedy decode: all lanes advance frame-in-lockstep through one
+    /// [`BatchJointStep`] (one fused dispatch per inner step). Lane `i` consumes
+    /// frames `0..valid_frames[i]` and evolves exactly like the B=1
+    /// [`decode`](Self::decode) loop — blank ends the lane's inner loop, a
+    /// non-blank emits, sets `prev[i]`, and commits the lane's state.
+    /// Returns `(text, emissions)` per lane.
+    pub fn decode_batch<S: BatchJointStep>(
+        &self,
+        valid_frames: &[usize],
+        step: &mut S,
+    ) -> Result<Vec<LaneDecode>, RnntDecodeError<S::Error>> {
+        let b = valid_frames.len();
+        let lanes = step.batch();
+        assert!(b <= lanes, "decode_batch: {b} items exceed the backend's {lanes} lanes");
+        let blank_id = self.blank_id();
+        let mut texts = vec![String::new(); b];
+        let mut emissions = vec![Vec::new(); b];
+        if self.vocabulary.is_empty() {
+            return Ok(texts.into_iter().zip(emissions).collect());
+        }
+        let max_t = valid_frames.iter().copied().max().unwrap_or(0);
+
+        step.reset();
+        let mut prev = vec![blank_id; lanes];
+        let mut active = vec![false; lanes];
+        let mut out = vec![blank_id; lanes];
+        let mut commit_lanes = vec![false; lanes];
+
+        for t in 0..max_t {
+            for i in 0..lanes {
+                active[i] = i < b && t < valid_frames[i];
+            }
+            for _ in 0..self.opts.max_symbols_per_step {
+                if !active.iter().any(|&a| a) {
+                    break;
+                }
+                step.step(t, &prev, &active, &mut out).map_err(|e| BackendSnafu { frame: t }.into_error(e))?;
+                let mut any_commit = false;
+                for i in 0..b {
+                    if !active[i] {
+                        commit_lanes[i] = false;
+                        continue;
+                    }
+                    let k = out[i];
+                    if k == blank_id {
+                        active[i] = false;
+                        commit_lanes[i] = false;
+                    } else {
+                        texts[i].push_str(&self.vocabulary[k]);
+                        emissions[i].push(TokenEmission { token_id: k, frame: t });
+                        prev[i] = k;
+                        commit_lanes[i] = true;
+                        any_commit = true;
+                    }
+                }
+                if any_commit {
+                    step.commit(&commit_lanes);
+                }
+            }
+        }
+
+        Ok(texts.into_iter().zip(emissions).collect())
     }
 }

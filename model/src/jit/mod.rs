@@ -12,11 +12,16 @@ pub use recurrent::{JitRecurrent, LstmState, RecurrentJit, StepTiming};
 pub struct InputSpec {
     pub shape: Vec<usize>,
     pub dtype: DType,
+    /// Allocate the input device-local (no host mapping). The host can still
+    /// reach it through `copyin`/`copyout` (staged over the copy engine), and
+    /// on-device `copy_from`/`copy_region_from` stays on-device — for
+    /// recurrent state the host shouldn't observe per step.
+    pub device_local: bool,
 }
 
 impl InputSpec {
     pub fn new(shape: &[usize], dtype: DType) -> Self {
-        Self { shape: shape.to_vec(), dtype }
+        Self { shape: shape.to_vec(), dtype, device_local: false }
     }
 
     pub fn f32(shape: &[usize]) -> Self {
@@ -29,6 +34,11 @@ impl InputSpec {
 
     pub fn i64(shape: &[usize]) -> Self {
         Self::new(shape, DType::Int64)
+    }
+
+    pub fn device_local(mut self) -> Self {
+        self.device_local = true;
+        self
     }
 }
 
@@ -72,6 +82,13 @@ pub enum JitError {
         declared_head + declared_state
     ))]
     OutputLayoutMismatch { declared_head: usize, declared_state: usize, actual: usize },
+
+    /// A multi-output `jit_wrapper!` declared `declared` outputs but the
+    /// compiled plan kept `actual`. Means the scheduler fused or elided an
+    /// output the `build` closure returned — the positional `output_*()`
+    /// accessors would be misaligned, so fail loud at `prepare` instead.
+    #[snafu(display("JIT output count mismatch: declared {declared} outputs, plan kept {actual}"))]
+    OutputCountMismatch { declared: usize, actual: usize },
 
     #[snafu(display("{source}"))]
     Runtime { source: svod_runtime::Error },

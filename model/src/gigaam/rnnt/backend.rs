@@ -1,198 +1,178 @@
-//! Per-utterance RNN-T step backend implementing
-//! [`svod_arch::rnnt::JointStep`]. Wraps the predictor and joint JITs +
-//! committed/tentative LSTM state.
+//! Batched RNN-T step backend implementing
+//! [`svod_arch::rnnt::BatchJointStep`]: one fused predictor+joint JIT advances
+//! all lanes of a chunk batch per dispatch.
 //!
-//! For B=1 the search loop owns one of these and drives it through the
-//! per-frame inner loop. JIT plans (the heavy ones — predictor + joint) are
-//! prepared once at construction and reused; the only per-step overhead is
-//! the buffer-pack / execute / read-out cycle.
+//! The LSTM state lives ON the device: `h_in`/`c_in` are device-local (no host
+//! mapping), and a commit recycles the emitting lanes' `state`-output rows back
+//! into them with SDMA region copies — no host round-trip. The host only writes
+//! `prev` tokens + the lanes' frame-`t` encoder rows and reads back the lane
+//! argmax tokens (one int each); a blank lane's tentative state is simply never
+//! copied, so the committed prefix stays intact. Resets stage zeros through the
+//! copy engine (`copyin` on device-local buffers is SDMA).
 
 use std::time::{Duration, Instant};
 
 use snafu::ResultExt;
-use svod_arch::rnnt::JointStep;
+use svod_arch::rnnt::BatchJointStep;
 
-use crate::jit::{DeviceSnafu, InputSpec, JitError, JitRecurrent, LstmState, RecurrentJit};
+use crate::jit::{DeviceSnafu, InputSpec, JitError};
 
-use super::jit::{RnntJointStepJit, RnntPredictorStepJit};
+use super::jit::RnntBatchStepJit;
 use crate::gigaam::model::GigaAm;
 
-impl RecurrentJit for RnntPredictorStepJit {
-    fn pack_state(&mut self, s: &LstmState) -> crate::jit::Result<()> {
-        {
-            let buf = self.h_in_mut()?;
-            let mut view = buf.as_array_mut::<f32>().context(DeviceSnafu)?;
-            view.as_slice_mut().expect("contiguous h_in").copy_from_slice(&s.h);
-        }
-        {
-            let buf = self.c_in_mut()?;
-            let mut view = buf.as_array_mut::<f32>().context(DeviceSnafu)?;
-            view.as_slice_mut().expect("contiguous c_in").copy_from_slice(&s.c);
-        }
-        Ok(())
-    }
-
-    fn execute_step(&mut self) -> crate::jit::Result<()> {
-        self.execute()
-    }
-
-    fn output_buffer(&self) -> crate::jit::Result<&svod_device::Buffer> {
-        self.output()
-    }
-}
+/// Position of the `state` output in `RnntBatchStepJit`'s `outputs { tokens, state }`.
+const STATE_OUT: usize = 1;
 
 pub struct RnntStepBackend {
-    /// Predictor JIT + active (post-step) LSTM state, flat layout `[L * P]`
-    /// row-major. Active state is overwritten by every step; the search loop
-    /// reads it via [`commit`](JointStep::commit) on non-blank emission.
-    predictor: JitRecurrent<RnntPredictorStepJit>,
-    joint_jit: RnntJointStepJit,
+    /// Fused batched JIT: `prev_tokens [B,1]`, `enc_t [B,1,E]`, `h_in`/`c_in
+    /// [L,B,P]` (device-local) → `tokens [B,1]` (int32 argmax), `state
+    /// [B,1,2*L*P]` (f32, layer-major `[h|c]` per lane, never host-read).
+    jit: RnntBatchStepJit,
 
-    /// Last accepted LSTM state. Copied into the predictor's active state
-    /// before every [`step`](JointStep::step) so the JIT sees the committed
-    /// prefix; [`commit`](JointStep::commit) copies the post-step active state
-    /// back here.
-    committed: LstmState,
-    /// Last predictor `g` output (`[P]`). Stashed here so we can drop the
-    /// predictor's output borrow before mutably accessing the joint JIT's
-    /// input buffer.
-    g_tentative: Vec<f32>,
-
-    blank_id: usize,
+    lanes: usize,
+    layers: usize,
+    pred_hidden: usize,
     enc_hidden: usize,
 
-    /// Per-step timing aggregates. Reset by [`reset_stats`]; printed by the
-    /// example. Cheap (one `Instant::now()` per substage) — kept always-on so
-    /// the example can profile without recompilation.
+    /// Per-lane frame-major encoder output `[valid_frames[i] * enc_hidden]` for
+    /// the current chunk batch, bound by [`bind_batch`](Self::bind_batch).
+    frames: Vec<Vec<f32>>,
+    /// Staging zeros for [`reset`](BatchJointStep::reset) (`copyin` is SDMA).
+    zeros: Vec<u8>,
+
+    /// Per-step timing aggregates (pack / execute / read) + commit time.
     pub stats: StepStats,
 }
 
-/// Aggregate timings for [`RnntStepBackend`]. Six sub-stages per `step` call
-/// + commit/reset counters.
+/// Aggregate timings for [`RnntStepBackend`].
 #[derive(Default, Clone, Debug)]
 pub struct StepStats {
     pub n_steps: u64,
     pub n_commits: u64,
     pub n_resets: u64,
-    pub t_pred_pack: Duration,
-    pub t_pred_exec: Duration,
-    pub t_pred_read: Duration,
-    pub t_joint_pack: Duration,
-    pub t_joint_exec: Duration,
-    pub t_joint_read: Duration,
+    pub t_pack: Duration,
+    pub t_exec: Duration,
+    pub t_read: Duration,
+    pub t_commit: Duration,
 }
 
 impl RnntStepBackend {
-    /// Build the backend from a model. `GigaAm` is cheap to clone (weights
-    /// are `Tensor` handles backed by shared `Arc<Buffer>`s) so the predictor
-    /// and joint JITs each take their own clone. The model must carry an
-    /// RN-T head; CTC models are rejected.
-    pub fn from_model(model: GigaAm) -> crate::jit::Result<Self> {
+    /// Build the backend with `lanes` decode lanes (the transcriber's chunk
+    /// batch width). The model must carry an RN-T head; CTC models are
+    /// rejected.
+    pub fn from_model(model: GigaAm, lanes: usize) -> crate::jit::Result<Self> {
         let (rnnt_head, _) =
             model.head.expect_rnnt("RnntStepBackend").map_err(|e| JitError::Build { source: Box::new(e) })?;
         let pred_hidden = rnnt_head.pred_hidden;
-        let pred_rnn_layers = rnnt_head.pred_rnn_layers;
-        let total_vocab = rnnt_head.num_classes;
-        let blank_id = total_vocab - 1;
+        let layers = rnnt_head.pred_rnn_layers;
         let enc_hidden = model.config.d_model;
-        let lp = pred_rnn_layers * pred_hidden;
 
-        let mut predictor_jit = RnntPredictorStepJit::new(model.clone());
-        predictor_jit.prepare(
-            InputSpec::i64(&[1, 1]),
-            InputSpec::f32(&[pred_rnn_layers, 1, pred_hidden]),
-            InputSpec::f32(&[pred_rnn_layers, 1, pred_hidden]),
+        let mut jit = RnntBatchStepJit::new(model);
+        jit.prepare(
+            InputSpec::i64(&[lanes, 1]),
+            InputSpec::f32(&[lanes, 1, enc_hidden]),
+            InputSpec::f32(&[layers, lanes, pred_hidden]).device_local(),
+            InputSpec::f32(&[layers, lanes, pred_hidden]).device_local(),
         )?;
 
-        let mut joint_jit = RnntJointStepJit::new(model);
-        joint_jit.prepare(InputSpec::f32(&[1, 1, enc_hidden]), InputSpec::f32(&[1, 1, pred_hidden]))?;
-
         Ok(Self {
-            predictor: JitRecurrent::new(predictor_jit, LstmState::zeros(lp), pred_hidden)?,
-            joint_jit,
-            committed: LstmState::zeros(lp),
-            g_tentative: vec![0.0f32; pred_hidden],
-            blank_id,
+            jit,
+            lanes,
+            layers,
+            pred_hidden,
             enc_hidden,
+            frames: Vec::new(),
+            zeros: vec![0u8; layers * lanes * pred_hidden * 4],
             stats: StepStats::default(),
         })
     }
+
+    /// Bind the chunk batch's per-lane encoder output (frame-major
+    /// `[valid_frames[i], enc_hidden]` each). Lanes beyond `frames.len()` stay
+    /// inactive.
+    pub fn bind_batch(&mut self, frames: Vec<Vec<f32>>) {
+        debug_assert!(frames.len() <= self.lanes);
+        self.frames = frames;
+    }
 }
 
-impl JointStep for RnntStepBackend {
+impl BatchJointStep for RnntStepBackend {
     type Error = JitError;
 
-    fn step(&mut self, encoder_frame: &[f32], prev_token: Option<usize>) -> std::result::Result<usize, Self::Error> {
-        debug_assert_eq!(encoder_frame.len(), self.enc_hidden);
+    fn batch(&self) -> usize {
+        self.lanes
+    }
 
-        let tok_value = prev_token.unwrap_or(self.blank_id) as i64;
+    fn step(&mut self, t: usize, prev: &[usize], active: &[bool], out: &mut [usize]) -> Result<(), Self::Error> {
+        let e = self.enc_hidden;
 
-        // ── Predictor phase ──────────────────────────────────────────────
-        // Copy committed state → predictor's active state, run one JIT step,
-        // copy the resulting `g` head into our own buffer (so the JIT output
-        // borrow ends before we mutate the joint JIT).
-        let t_state_copy = Instant::now();
-        self.predictor.state_mut().h.copy_from_slice(&self.committed.h);
-        self.predictor.state_mut().c.copy_from_slice(&self.committed.c);
-        let state_copy = t_state_copy.elapsed();
-
-        let g = self.predictor.step(|jit| {
-            let buf = jit.prev_token_mut()?;
-            let mut view = buf.as_array_mut::<i64>().context(DeviceSnafu)?;
-            view.as_slice_mut().expect("contiguous prev_token")[0] = tok_value;
-            Ok(())
-        })?;
-        let t_g_copy = Instant::now();
-        self.g_tentative.copy_from_slice(g);
-        let g_copy = t_g_copy.elapsed();
-        let pred_timing = self.predictor.last_timing.clone();
-
-        // ── Joint phase ──────────────────────────────────────────────────
         let t0 = Instant::now();
         {
-            let buf = self.joint_jit.enc_t_mut()?;
-            let mut view = buf.as_array_mut::<f32>().context(DeviceSnafu)?;
-            view.as_slice_mut().expect("contiguous enc_t").copy_from_slice(encoder_frame);
+            let buf = self.jit.prev_tokens_mut()?;
+            let mut view = buf.as_array_mut::<i64>().context(DeviceSnafu)?;
+            let flat = view.as_slice_mut().expect("contiguous prev_tokens");
+            for (dst, &tok) in flat.iter_mut().zip(prev) {
+                *dst = tok as i64;
+            }
         }
         {
-            let buf = self.joint_jit.g_mut()?;
+            let buf = self.jit.enc_t_mut()?;
             let mut view = buf.as_array_mut::<f32>().context(DeviceSnafu)?;
-            view.as_slice_mut().expect("contiguous g").copy_from_slice(&self.g_tentative);
+            let flat = view.as_slice_mut().expect("contiguous enc_t");
+            for (i, frames) in self.frames.iter().enumerate() {
+                if active[i] {
+                    flat[i * e..(i + 1) * e].copy_from_slice(&frames[t * e..(t + 1) * e]);
+                }
+            }
         }
         let t1 = Instant::now();
-        self.joint_jit.execute()?;
+
+        self.jit.execute()?;
         let t2 = Instant::now();
-        // The joint JIT ends in a device-side argmax over the vocab, so the
-        // output is a single int32 token index — the host reads back 4 bytes
-        // instead of the full [1, 1, V] logit vector.
-        let token = {
-            let out = self.joint_jit.output()?;
-            let arr = out.as_array::<i32>().context(DeviceSnafu)?;
-            let flat = arr.as_slice().expect("contiguous joint output");
-            flat[0] as usize
-        };
+
+        // The only per-step readback: one int per lane. The new state stays on
+        // the device until a commit recycles it.
+        {
+            let buf = self.jit.tokens()?;
+            let arr = buf.as_array::<i32>().context(DeviceSnafu)?;
+            let flat = arr.as_slice().expect("contiguous tokens");
+            for i in 0..self.lanes {
+                out[i] = flat[i] as usize;
+            }
+        }
         let t3 = Instant::now();
 
         self.stats.n_steps += 1;
-        self.stats.t_pred_pack += pred_timing.pack + state_copy;
-        self.stats.t_pred_exec += pred_timing.exec;
-        self.stats.t_pred_read += pred_timing.read + g_copy;
-        self.stats.t_joint_pack += t1 - t0;
-        self.stats.t_joint_exec += t2 - t1;
-        self.stats.t_joint_read += t3 - t2;
-        Ok(token)
+        self.stats.t_pack += t1 - t0;
+        self.stats.t_exec += t2 - t1;
+        self.stats.t_read += t3 - t2;
+        Ok(())
     }
 
-    fn commit(&mut self) {
+    fn commit(&mut self, lanes: &[bool]) {
+        let t0 = Instant::now();
         self.stats.n_commits += 1;
-        let state = self.predictor.state_mut();
-        self.committed.h.copy_from_slice(&state.h);
-        self.committed.c.copy_from_slice(&state.c);
+        let (l, b, p) = (self.layers, self.lanes, self.pred_hidden);
+        let lp = l * p;
+        for (i, &c) in lanes.iter().enumerate() {
+            if !c {
+                continue;
+            }
+            // `state` row i is layer-major [h | c]; h_in/c_in are [L, B, P].
+            for layer in 0..l {
+                let dst = (layer * b * p + i * p) * 4;
+                let src_h = (i * 2 * lp + layer * p) * 4;
+                let src_c = (i * 2 * lp + lp + layer * p) * 4;
+                self.jit.copy_output_to_h_in(STATE_OUT, dst, src_h, p * 4).expect("on-device h commit");
+                self.jit.copy_output_to_c_in(STATE_OUT, dst, src_c, p * 4).expect("on-device c commit");
+            }
+        }
+        self.stats.t_commit += t0.elapsed();
     }
 
     fn reset(&mut self) {
         self.stats.n_resets += 1;
-        self.committed.reset();
-        self.predictor.reset();
+        self.jit.h_in_mut().and_then(|b| b.copyin(&self.zeros).context(DeviceSnafu)).expect("zero h_in");
+        self.jit.c_in_mut().and_then(|b| b.copyin(&self.zeros).context(DeviceSnafu)).expect("zero c_in");
     }
 }

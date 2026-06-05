@@ -10,6 +10,7 @@ use svod_dtype::ext::HasDType;
 use crate::allocator::{Allocator, BufferSpec, RawBuffer};
 use crate::error::{
     InvalidViewSnafu, NdarrayShapeSnafu, NotCpuAccessibleSnafu, Result, SizeMismatchSnafu, TypeMismatchSnafu,
+    UnsupportedSnafu,
 };
 
 /// Global counter for unique buffer IDs.
@@ -550,6 +551,22 @@ impl Buffer {
             src.data.allocator._copyout(&mut staging, src.data.raw(), src.offset)?;
             self.data.allocator._copyin(self.data.raw(), self.offset, &staging)
         }
+    }
+
+    /// Copy `len` bytes from `src[src_off..]` into `self[dst_off..]`. Both
+    /// buffers must live on the same allocator — this is the on-device
+    /// `_transfer` path (SDMA when either side is device-local), so recurrent
+    /// state rows can be recycled output→input without touching the host.
+    pub fn copy_region_from(&mut self, dst_off: usize, src: &Buffer, src_off: usize, len: usize) -> Result<()> {
+        self.ensure_allocated()?;
+        src.ensure_allocated()?;
+        snafu::ensure!(dst_off + len <= self.size, SizeMismatchSnafu { expected: self.size, actual: dst_off + len });
+        snafu::ensure!(src_off + len <= src.size, SizeMismatchSnafu { expected: src.size, actual: src_off + len });
+        snafu::ensure!(
+            Arc::ptr_eq(&self.data.allocator, &src.data.allocator),
+            UnsupportedSnafu { op: "copy_region_from across allocators" }
+        );
+        self.data.allocator._transfer(self.data.raw(), self.offset + dst_off, src.data.raw(), src.offset + src_off, len)
     }
 
     /// Synchronize the device (wait for all operations to complete).

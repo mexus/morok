@@ -11,6 +11,11 @@ pub(crate) struct JitWrapper {
     model_ty: Type,
     inputs: Vec<Input>,
     vars: Vec<VarDecl>,
+    /// Declared output names. Empty = the classic single-output form (the
+    /// `build` closure returns one `Tensor`). Non-empty = the `build` closure
+    /// returns a tuple of that many `Tensor`s, in this order, each exposed as
+    /// its own `output_buffer_at(i)`-backed accessor.
+    outputs: Vec<Ident>,
     build_args: Vec<Ident>,
     build_body: TokenStream,
 }
@@ -37,6 +42,7 @@ impl Parse for JitWrapper {
 
         let mut inputs = Vec::new();
         let mut vars = Vec::new();
+        let mut outputs = Vec::new();
         let mut build_args = Vec::new();
         let mut build_body = None;
 
@@ -73,6 +79,21 @@ impl Parse for JitWrapper {
                         vars_block.parse::<Comma>()?;
                     }
                 }
+            } else if first == "outputs" {
+                let outs_block;
+                braced!(outs_block in body);
+                while !outs_block.is_empty() {
+                    let out_name: Ident = outs_block.parse()?;
+                    outputs.push(out_name);
+                    if outs_block.peek(Comma) {
+                        outs_block.parse::<Comma>()?;
+                    }
+                }
+                // Tolerate a trailing comma after the `outputs { .. }` block so it
+                // reads like the input declarations it sits beside.
+                if body.peek(Comma) {
+                    body.parse::<Comma>()?;
+                }
             } else {
                 // Accept (and discard) an optional `: Tensor` for DSL clarity;
                 // the macro now allocates placeholder buffers from `InputSpec`
@@ -90,7 +111,7 @@ impl Parse for JitWrapper {
 
         let build_body = build_body.ok_or_else(|| Error::new(name.span(), "missing `build(...) { ... }` block"))?;
 
-        Ok(JitWrapper { name, model_ty, inputs, vars, build_args, build_body })
+        Ok(JitWrapper { name, model_ty, inputs, vars, outputs, build_args, build_body })
     }
 }
 
@@ -122,6 +143,17 @@ pub(crate) fn generate(jit: JitWrapper) -> Result<TokenStream> {
     for var in &jit.vars {
         if input_name_set.contains(&var.name.to_string()) {
             return Err(Error::new(var.name.span(), "variable name conflicts with input name"));
+        }
+    }
+
+    let output_names: Vec<&Ident> = jit.outputs.iter().collect();
+    let multi_output = !output_names.is_empty();
+    let n_outputs = output_names.len();
+
+    for out in &output_names {
+        let out_str = out.to_string();
+        if input_name_set.contains(&out_str) || var_name_set.contains(&out_str) {
+            return Err(Error::new(out.span(), "output name conflicts with an input or variable name"));
         }
     }
 
@@ -242,11 +274,24 @@ pub(crate) fn generate(jit: JitWrapper) -> Result<TokenStream> {
 
     let input_realizations = input_names.iter().zip(input_realized_locals.iter()).map(|(input_name, local)| {
         quote! {
-            let mut #local = svod_tensor::Tensor::zeros(&#input_name.shape, #input_name.dtype.clone())
-                .map_err(|e| svod_model::jit::JitError::Tensor { source: Box::new(e) })?;
-            #local
-                .realize_with(config)
-                .map_err(|e| svod_model::jit::JitError::Tensor { source: Box::new(e) })?;
+            let #local = if #input_name.device_local {
+                // Eager device-local zeros: no host mapping, init staged
+                // through the copy engine. Skips the realize schedule.
+                let numel: usize = #input_name.shape.iter().product();
+                svod_tensor::Tensor::from_bytes_shaped_spec(
+                    &vec![0u8; numel * #input_name.dtype.bytes()],
+                    &#input_name.shape,
+                    #input_name.dtype.clone(),
+                    svod_dtype::default_device::default_device(),
+                    svod_device::BufferSpec { cpu_access: false, ..Default::default() },
+                )
+            } else {
+                let mut t = svod_tensor::Tensor::zeros(&#input_name.shape, #input_name.dtype.clone())
+                    .map_err(|e| svod_model::jit::JitError::Tensor { source: Box::new(e) })?;
+                t.realize_with(config)
+                    .map_err(|e| svod_model::jit::JitError::Tensor { source: Box::new(e) })?;
+                t
+            };
             let #input_name = &#local;
         }
     });
@@ -333,6 +378,86 @@ pub(crate) fn generate(jit: JitWrapper) -> Result<TokenStream> {
             }
         });
 
+    // Per-input on-device copy helpers: copy a region of declared output
+    // `out_pos` into the input's buffer with NO host round-trip (the plan owns
+    // both buffers; the split borrow lives in the runtime). Used to recycle
+    // recurrent state output→input.
+    let copy_helper_impls = input_accessor_names
+        .iter()
+        .zip(input_id_fields.iter())
+        .zip(input_buffer_id_fields.iter())
+        .zip(input_names.iter())
+        .map(|(((_accessor, idx_field), buf_id_field), input_name)| {
+            let helper = format_ident!("copy_output_to_{}", input_name);
+            let name_str = input_name.to_string();
+            quote! {
+                pub fn #helper(
+                    &mut self,
+                    out_pos: usize,
+                    dst_off: usize,
+                    src_off: usize,
+                    len: usize,
+                ) -> svod_model::jit::Result<()> {
+                    let state = self.state.as_mut().ok_or(svod_model::jit::JitError::NotPrepared)?;
+                    let idx = match state.#idx_field {
+                        Some(idx) => idx,
+                        None => {
+                            let idx = state
+                                .plan
+                                .buffers()
+                                .iter()
+                                .position(|b| b.id() == state.#buf_id_field)
+                                .ok_or(svod_model::jit::JitError::InputBufferNotFound { name: #name_str })?;
+                            state.#idx_field = Some(idx);
+                            idx
+                        }
+                    };
+                    state.plan.copy_output_region_to_buffer(out_pos, idx, dst_off, src_off, len)
+                        .map_err(|e| svod_model::jit::JitError::Runtime { source: e })
+                }
+            }
+        });
+
+    // Build the output tensor(s) and compile the plan. The single-output form
+    // (no `outputs` clause) keeps the original `output: Tensor` codegen verbatim;
+    // the multi-output form destructures the build closure's tuple in declared
+    // order and feeds all of them to `prepare_batch_with` (which preserves order),
+    // then asserts the plan kept exactly that many outputs.
+    let build_and_compile = if multi_output {
+        quote! {
+            let (#(#output_names,)*) = #build_closure
+                .map_err(|e| svod_model::jit::JitError::Build { source: Box::new(e) as _ })?;
+            let mut __jit_outputs: [svod_tensor::Tensor; #n_outputs] = [#(#output_names,)*];
+            let plan = svod_tensor::Tensor::prepare_batch_with(__jit_outputs.iter_mut(), config)
+                .map_err(|e| svod_model::jit::JitError::Tensor { source: Box::new(e) })?;
+            if plan.num_outputs() != #n_outputs {
+                return Err(svod_model::jit::JitError::OutputCountMismatch {
+                    declared: #n_outputs,
+                    actual: plan.num_outputs(),
+                });
+            }
+        }
+    } else {
+        quote! {
+            let output: svod_tensor::Tensor = #build_closure
+                .map_err(|e| svod_model::jit::JitError::Build { source: Box::new(e) as _ })?;
+            let mut output = output;
+            let plan = svod_tensor::Tensor::prepare_batch_with(std::iter::once(&mut output), config)
+                .map_err(|e| svod_model::jit::JitError::Tensor { source: Box::new(e) })?;
+        }
+    };
+
+    // One accessor per declared output, backed by positional `output_buffer_at(i)`
+    // (i = declared order = `prepare_batch_with` order). Empty for single-output.
+    let output_named_accessors = output_names.iter().enumerate().map(|(i, out_name)| {
+        quote! {
+            pub fn #out_name(&self) -> svod_model::jit::Result<&svod_device::Buffer> {
+                let state = self.state.as_ref().ok_or(svod_model::jit::JitError::NotPrepared)?;
+                state.plan.output_buffer_at(#i).ok_or(svod_model::jit::JitError::NotPrepared)
+            }
+        }
+    });
+
     let expanded = quote! {
         pub struct #name {
             model: #model_ty,
@@ -374,12 +499,7 @@ pub(crate) fn generate(jit: JitWrapper) -> Result<TokenStream> {
 
                 #(#prepare_var_bindings)*
 
-                let output: svod_tensor::Tensor = #build_closure
-                    .map_err(|e| svod_model::jit::JitError::Build { source: Box::new(e) as _ })?;
-
-                let mut output = output;
-                let plan = svod_tensor::Tensor::prepare_batch_with(std::iter::once(&mut output), config)
-                    .map_err(|e| svod_model::jit::JitError::Tensor { source: Box::new(e) })?;
+                #build_and_compile
 
                 #(#index_resolution)*
 
@@ -393,6 +513,10 @@ pub(crate) fn generate(jit: JitWrapper) -> Result<TokenStream> {
                 let state = self.state.as_ref().ok_or(svod_model::jit::JitError::NotPrepared)?;
                 state.plan.output_buffer().ok_or(svod_model::jit::JitError::NotPrepared)
             }
+
+            #(#output_named_accessors)*
+
+            #(#copy_helper_impls)*
 
             pub fn buffers(&self) -> svod_model::jit::Result<&[svod_device::Buffer]> {
                 let state = self.state.as_ref().ok_or(svod_model::jit::JitError::NotPrepared)?;

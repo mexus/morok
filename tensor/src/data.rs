@@ -57,6 +57,22 @@ impl Tensor {
     /// AMD this means data is mmapped through the host-visible VRAM aperture
     /// and the GPU sees the buffer directly.
     fn from_bytes_shaped(bytes: &[u8], shape: &[usize], dtype: DType, device: DeviceSpec) -> Self {
+        Self::from_bytes_shaped_spec(bytes, shape, dtype, device, Default::default())
+    }
+
+    /// [`from_bytes_shaped`](Self::from_bytes_shaped) with an explicit
+    /// [`svod_device::BufferSpec`]. `cpu_access: false` keeps the buffer
+    /// device-local (no host mapping): the init bytes and any later host
+    /// access stage through the backend's copy engine (`copyin`/`copyout`),
+    /// and device→device `copy_from` stays on-device. For state buffers the
+    /// host shouldn't observe.
+    pub fn from_bytes_shaped_spec(
+        bytes: &[u8],
+        shape: &[usize],
+        dtype: DType,
+        device: DeviceSpec,
+        spec: svod_device::BufferSpec,
+    ) -> Self {
         let numel: usize = shape.iter().product();
         let ir_shape = Shape::from_iter(shape.iter().map(|&d| SInt::Const(d)));
 
@@ -70,7 +86,7 @@ impl Tensor {
             )
         });
 
-        let mut buffer = Buffer::new(allocator, dtype.clone(), shape.to_vec(), Default::default());
+        let mut buffer = Buffer::new(allocator, dtype.clone(), shape.to_vec(), spec);
         buffer.copyin(bytes).expect("Buffer write always successful");
 
         let buffer_arc = Arc::new(buffer);

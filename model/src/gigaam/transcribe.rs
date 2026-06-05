@@ -325,7 +325,7 @@ impl<S: Splitter> Transcriber<S> {
                 let mut enc = GigaAmEncoderJit::new(model.clone()).with_b_bound(max_batch).with_t_bound(max_t_mel);
                 enc.prepare_with_config(mel_spec, lengths_spec, &prepare_config).context(JitSnafu)?;
                 encoder_jit = Some(enc);
-                let backend = RnntStepBackend::from_model(model.clone()).context(JitSnafu)?;
+                let backend = RnntStepBackend::from_model(model.clone(), max_batch).context(JitSnafu)?;
                 let decoder = RnntDecoder::new(
                     runtime.vocabulary.clone(),
                     RnntOpts { max_symbols_per_step: runtime.max_symbols_per_step },
@@ -541,33 +541,29 @@ impl<S: Splitter> Transcriber<S> {
                     // `as_array` drains the async encoder dispatch.
                     t_encoder += t_enc.elapsed();
                     let flat = enc.as_slice().expect("contiguous encoder output");
+                    // Encoder output is [d_model, t_exec_sub] row-major per item;
+                    // the arch decoder wants frame-major [actual_sub, d_model].
+                    let mut frames_batch = Vec::with_capacity(b);
+                    let mut valid_frames = Vec::with_capacity(b);
                     for (bi, mel_len) in chunk_lengths.iter().enumerate() {
                         let actual_sub = subs_output_length(subs_kernel_size, *mel_len);
+                        let item_slice = &flat[bi * item_stride..bi * item_stride + item_stride];
+                        frames_batch.push(transpose_dt_to_td(item_slice, d_model, t_exec_sub, actual_sub));
+                        valid_frames.push(actual_sub);
+                    }
+
+                    // All chunks of the batch decode in lockstep — one fused
+                    // predictor+joint dispatch advances every lane, so this
+                    // stage folds B lanes into each step's `decode_ms`.
+                    let t_dec = Instant::now();
+                    backend.bind_batch(frames_batch);
+                    let lane_results = decoder.decode_batch(&valid_frames, backend).map_err(rnnt_decode_err)?;
+                    t_decode += t_dec.elapsed();
+
+                    for (bi, (raw, emissions)) in lane_results.into_iter().enumerate() {
                         let &(start_sample, end_sample, _, start_sec, end_sec) = &chunks_meta[chunk_batch_start + bi];
                         let chunk_duration_sec = (end_sample - start_sample) as f32 / sample_rate_hz as f32;
-                        let frame_shift = chunk_duration_sec / (actual_sub.max(1) as f32);
-
-                        let item_slice = &flat[bi * item_stride..bi * item_stride + item_stride];
-                        // Encoder output is [d_model, t_exec_sub] row-major;
-                        // the arch decoder wants frame-major [actual_sub, d_model].
-                        let frames = transpose_dt_to_td(item_slice, d_model, t_exec_sub, actual_sub);
-
-                        let backend: &mut RnntStepBackend = backend;
-                        // RN-T decode drives the predictor/joint JITs internally,
-                        // so this stage folds those dispatches into `decode_ms`.
-                        let t_dec = Instant::now();
-                        let (raw, emissions) = if want_words {
-                            let (s, e) = decoder
-                                .decode_with_timestamps(&frames, actual_sub, actual_sub, d_model, backend)
-                                .map_err(rnnt_decode_err)?;
-                            (s, e)
-                        } else {
-                            let s = decoder
-                                .decode(&frames, actual_sub, actual_sub, d_model, backend)
-                                .map_err(rnnt_decode_err)?;
-                            (s, Vec::new())
-                        };
-                        t_decode += t_dec.elapsed();
+                        let frame_shift = chunk_duration_sec / (valid_frames[bi].max(1) as f32);
                         let words = want_words.then(|| decoder.frames_to_words(&emissions, frame_shift));
                         // SP pieces carry `▁` (U+2581) as word-initial markers;
                         // after concatenation we restore them as spaces.

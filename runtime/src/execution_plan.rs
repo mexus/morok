@@ -727,6 +727,38 @@ impl ExecutionPlan {
         self.output_buffer_indices.len()
     }
 
+    /// Copy `len` bytes from output `out_pos` (`src_off`) into the plan buffer
+    /// at `dst_index` (`dst_off`) — both owned by this plan, so the borrow is
+    /// split internally. The transfer stays on-device (SDMA when either side
+    /// is device-local), letting recurrent state recycle output→input without
+    /// a host round-trip.
+    pub fn copy_output_region_to_buffer(
+        &mut self,
+        out_pos: usize,
+        dst_index: usize,
+        dst_off: usize,
+        src_off: usize,
+        len: usize,
+    ) -> Result<()> {
+        let src_index = *self.output_buffer_indices.get(out_pos).ok_or_else(|| crate::error::Error::Execution {
+            reason: format!("copy_output_region_to_buffer: output {out_pos} out of range"),
+        })?;
+        if src_index == dst_index {
+            return Err(crate::error::Error::Execution {
+                reason: "copy_output_region_to_buffer: output aliases destination".into(),
+            });
+        }
+        let (dst, src) = if dst_index < src_index {
+            let (a, b) = self.buffers.split_at_mut(src_index);
+            (&mut a[dst_index], &b[0])
+        } else {
+            let (a, b) = self.buffers.split_at_mut(dst_index);
+            (&mut b[0], &a[src_index])
+        };
+        dst.copy_region_from(dst_off, src, src_off, len)
+            .map_err(|e| crate::error::Error::Execution { reason: format!("on-device state copy: {e}") })
+    }
+
     /// Get a buffer by AST id (for reading intermediate results).
     pub fn buffer(&self, ast_id: u64) -> Option<&Buffer> {
         self.ast_to_buffer.get(&ast_id).map(|&idx| &self.buffers[idx])

@@ -1,39 +1,44 @@
-//! `jit_wrapper!`-generated per-step JITs for the RN-T head: predictor and
-//! joint each compiled as their own plan. The encoder JIT lives in the
+//! `jit_wrapper!`-generated fused per-step JIT for the RN-T head: the predictor
+//! and joint compiled into ONE batched plan. The encoder JIT lives in the
 //! shared [`crate::gigaam::jit`] now.
 //!
-//! All step JITs take a [`GigaAm`] (cheap to clone — weights are shared
-//! via the underlying `Tensor` handle Arcs) and validate that the head is
-//! the RN-T variant in their build closure (returning a typed `Err` via
-//! `JitError::Build` if it isn't).
+//! One execute advances all B lanes at once, amortizing the per-step dispatch
+//! cost across the independent VAD chunks. Fusing keeps the predictor output
+//! `g` on-device (it feeds the joint inside the same plan); the plan returns
+//! two typed outputs: `tokens` (int32 argmax per lane) and the new LSTM `state`
+//! (f32, `[new_h | new_c]` per lane in ONE buffer — each readback carries a
+//! fixed host cost, and the backend reads `state` only when some lane emits).
+//! The build closure validates the head is the RN-T variant (typed `Err` via
+//! `JitError::Build` otherwise).
 
 extern crate self as svod_model;
 
+use snafu::ResultExt;
 use svod_macros::jit_wrapper;
+use svod_tensor::Tensor;
 
+use crate::gigaam::error::TensorSnafu;
 use crate::gigaam::model::GigaAm;
 
 jit_wrapper! {
-    RnntPredictorStepJit(GigaAm) {
-        prev_token: Tensor,
+    RnntBatchStepJit(GigaAm) {
+        prev_tokens: Tensor,
+        enc_t: Tensor,
         h_in: Tensor,
         c_in: Tensor,
 
-        build(prev_token, h_in, c_in) {
-            let (rnnt_head, _) = model.head.expect_rnnt("RnntPredictorStepJit")?;
-            rnnt_head.predictor.forward_concat(prev_token, h_in, c_in)
-        }
-    }
-}
+        outputs { tokens, state },
 
-jit_wrapper! {
-    RnntJointStepJit(GigaAm) {
-        enc_t: Tensor,
-        g: Tensor,
-
-        build(enc_t, g) {
-            let (rnnt_head, _) = model.head.expect_rnnt("RnntJointStepJit")?;
-            rnnt_head.joint.forward_argmax(enc_t, g)
+        build(prev_tokens, enc_t, h_in, c_in) {
+            let (rnnt_head, _) = model.head.expect_rnnt("RnntBatchStepJit")?;
+            let (g, new_h, new_c) = rnnt_head.predictor.forward_parts(prev_tokens, h_in, c_in)?;
+            let tokens = rnnt_head.joint.forward_argmax(enc_t, &g)?;
+            // [B, 1, 2 * L * P]: one readback buffer per step, h then c per lane.
+            let state = Tensor::cat(&[&new_h, &new_c], 2).context(TensorSnafu)?;
+            // Typed tail pins the build closure's error type (the `?`s above
+            // only constrain it via `From`, so a bare `Ok` would be ambiguous).
+            let out: crate::gigaam::error::Result<_> = Ok((tokens, state));
+            out
         }
     }
 }
