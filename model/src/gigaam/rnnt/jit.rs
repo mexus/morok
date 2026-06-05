@@ -33,7 +33,7 @@ jit_wrapper! {
 
         build(enc_t, g) {
             let (rnnt_head, _) = model.head.expect_rnnt("RnntJointStepJit")?;
-            rnnt_head.joint.forward(enc_t, g)
+            rnnt_head.joint.forward_argmax(enc_t, g)
         }
     }
 }

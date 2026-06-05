@@ -39,15 +39,28 @@ impl RnntJoint {
         }
     }
 
-    /// `enc_t [1, 1, enc_hidden]`, `g [1, 1, pred_hidden]` → log-probs
-    /// `[1, 1, num_classes]`.
-    pub fn forward(&self, enc_t: &Tensor, g: &Tensor) -> Result<Tensor> {
+    /// `enc_t [1, 1, enc_hidden]`, `g [1, 1, pred_hidden]` → raw logits
+    /// `[1, 1, num_classes]` (pre-softmax).
+    fn logits(&self, enc_t: &Tensor, g: &Tensor) -> Result<Tensor> {
         let enc_proj = enc_t.linear().weight(&self.enc_w).bias(&self.enc_b).call().context(TensorSnafu)?;
         let pred_proj = g.linear().weight(&self.pred_w).bias(&self.pred_b).call().context(TensorSnafu)?;
         let summed = enc_proj.try_add(&pred_proj).context(TensorSnafu)?;
         let activated = summed.relu().context(TensorSnafu)?;
-        let logits = activated.linear().weight(&self.out_w).bias(&self.out_b).call().context(TensorSnafu)?;
-        logits.log_softmax(-1isize).context(TensorSnafu)
+        activated.linear().weight(&self.out_w).bias(&self.out_b).call().context(TensorSnafu)
+    }
+
+    /// `enc_t [1, 1, enc_hidden]`, `g [1, 1, pred_hidden]` → log-probs
+    /// `[1, 1, num_classes]`.
+    pub fn forward(&self, enc_t: &Tensor, g: &Tensor) -> Result<Tensor> {
+        self.logits(enc_t, g)?.log_softmax(-1isize).context(TensorSnafu)
+    }
+
+    /// Greedy variant: the device-side argmax token index `[1, 1]` (int32)
+    /// over the vocab. `log_softmax` is omitted — argmax is invariant under the
+    /// monotonic log-softmax, so the chosen index is identical while the host
+    /// reads back a single int instead of the full vocab logit vector.
+    pub fn forward_argmax(&self, enc_t: &Tensor, g: &Tensor) -> Result<Tensor> {
+        self.logits(enc_t, g)?.argmax(-1isize).context(TensorSnafu)
     }
 }
 

@@ -12,24 +12,25 @@
 //! for t in 0..valid_frames:
 //!   enc_t = encoder_frames[t * enc_hidden ..][..enc_hidden]
 //!   for _ in 0..max_symbols_per_step:
-//!     step.step(enc_t, prev_token, &mut logits_buf)?
-//!     k = argmax_nan_safe(logits_buf)
+//!     k = step.step(enc_t, prev_token)?   // argmax token, computed by the backend
 //!     if k == blank_id { break }
 //!     emit token k; prev_token = Some(k); step.commit()
 //! ```
 //!
+//! The backend computes the joint argmax itself and returns the chosen token,
+//! so this crate never sees a logit vector — on a GPU backend that keeps the
+//! per-step host readback to a single integer.
+//!
 //! The "tentative / committed" predictor-state semantics on [`JointStep`] keep
 //! the trait stateless from the search loop's perspective: the search loop
-//! only knows about `prev_token` and `logits_out` and never sees the LSTM
-//! hidden state. The implementation owns and rolls its own state.
+//! only knows about `prev_token` and never sees the LSTM hidden state. The
+//! implementation owns and rolls its own state.
 //!
 //! # Layout convention
 //!
 //! `encoder_frames` is row-major `[stride_frames, enc_hidden]` for a single
 //! batch item. `valid_frames` clamps padding from JIT static shapes — only
 //! frames `0..valid_frames` are consumed.
-
-use std::cmp::Ordering;
 
 use snafu::{IntoError, Snafu};
 
@@ -127,17 +128,13 @@ pub trait JointStep {
     /// Backend-specific error (typically a JIT execution error).
     type Error: std::error::Error + Send + Sync + 'static;
 
-    /// Compute joint logits for `(encoder_frame, prev_token)` against the
-    /// LATEST COMMITTED predictor state. `prev_token = None` selects the
-    /// empty-prefix initial state. Writes `total_vocab` logits into
-    /// `logits_out`. The post-step predictor state is stashed internally as
-    /// "tentative" and is only used if [`commit`](Self::commit) is called.
-    fn step(
-        &mut self,
-        encoder_frame: &[f32],
-        prev_token: Option<usize>,
-        logits_out: &mut [f32],
-    ) -> Result<(), Self::Error>;
+    /// Run the predictor + joint for `(encoder_frame, prev_token)` against the
+    /// LATEST COMMITTED predictor state and return the argmax token id over the
+    /// full vocab (`blank_id` is `vocabulary.len()`). `prev_token = None`
+    /// selects the empty-prefix initial state. The post-step predictor state is
+    /// stashed internally as "tentative" and is only used if
+    /// [`commit`](Self::commit) is called.
+    fn step(&mut self, encoder_frame: &[f32], prev_token: Option<usize>) -> Result<usize, Self::Error>;
 
     /// Promote the last `step`'s tentative state to committed. The arch
     /// decoder calls this exactly once per non-blank emission.
@@ -272,14 +269,12 @@ impl RnntDecoder {
             return Ok((String::new(), Vec::new()));
         }
         let blank_id = self.blank_id();
-        let total_vocab = self.total_vocab();
         let n_frames = stride_frames.min(valid_frames);
 
         step.reset();
 
         let mut text = String::new();
         let mut emissions = if keep_emissions { Vec::with_capacity(n_frames) } else { Vec::new() };
-        let mut logits = vec![0.0f32; total_vocab];
         let mut prev_token: Option<usize> = None;
 
         for t in 0..n_frames {
@@ -287,9 +282,7 @@ impl RnntDecoder {
             let enc_t = &encoder_frames[base..base + enc_hidden];
 
             for _ in 0..self.opts.max_symbols_per_step {
-                step.step(enc_t, prev_token, &mut logits).map_err(|e| BackendSnafu { frame: t }.into_error(e))?;
-
-                let k = argmax_nan_safe(&logits);
+                let k = step.step(enc_t, prev_token).map_err(|e| BackendSnafu { frame: t }.into_error(e))?;
                 if k == blank_id {
                     break;
                 }
@@ -307,25 +300,4 @@ impl RnntDecoder {
 
         Ok((text, emissions))
     }
-}
-
-// ─── Helpers ──────────────────────────────────────────────────────────────
-
-fn argmax_nan_safe(frame: &[f32]) -> usize {
-    let mut best = 0usize;
-    for i in 1..frame.len() {
-        if compare_logits(frame[i], frame[best]).is_gt() {
-            best = i;
-        }
-    }
-    best
-}
-
-fn compare_logits(a: f32, b: f32) -> Ordering {
-    a.partial_cmp(&b).unwrap_or_else(|| match (a.is_nan(), b.is_nan()) {
-        (true, true) => Ordering::Equal,
-        (true, false) => Ordering::Less,
-        (false, true) => Ordering::Greater,
-        (false, false) => Ordering::Equal,
-    })
 }

@@ -60,7 +60,6 @@ pub struct RnntStepBackend {
 
     blank_id: usize,
     enc_hidden: usize,
-    total_vocab: usize,
 
     /// Per-step timing aggregates. Reset by [`reset_stats`]; printed by the
     /// example. Cheap (one `Instant::now()` per substage) — kept always-on so
@@ -115,7 +114,6 @@ impl RnntStepBackend {
             g_tentative: vec![0.0f32; pred_hidden],
             blank_id,
             enc_hidden,
-            total_vocab,
             stats: StepStats::default(),
         })
     }
@@ -124,14 +122,8 @@ impl RnntStepBackend {
 impl JointStep for RnntStepBackend {
     type Error = JitError;
 
-    fn step(
-        &mut self,
-        encoder_frame: &[f32],
-        prev_token: Option<usize>,
-        logits_out: &mut [f32],
-    ) -> std::result::Result<(), Self::Error> {
+    fn step(&mut self, encoder_frame: &[f32], prev_token: Option<usize>) -> std::result::Result<usize, Self::Error> {
         debug_assert_eq!(encoder_frame.len(), self.enc_hidden);
-        debug_assert_eq!(logits_out.len(), self.total_vocab);
 
         let tok_value = prev_token.unwrap_or(self.blank_id) as i64;
 
@@ -170,13 +162,15 @@ impl JointStep for RnntStepBackend {
         let t1 = Instant::now();
         self.joint_jit.execute()?;
         let t2 = Instant::now();
-        {
+        // The joint JIT ends in a device-side argmax over the vocab, so the
+        // output is a single int32 token index — the host reads back 4 bytes
+        // instead of the full [1, 1, V] logit vector.
+        let token = {
             let out = self.joint_jit.output()?;
-            let arr = out.as_array::<f32>().context(DeviceSnafu)?;
+            let arr = out.as_array::<i32>().context(DeviceSnafu)?;
             let flat = arr.as_slice().expect("contiguous joint output");
-            // `flat.len() == 1 * 1 * total_vocab` for the [1, 1, V+1] joint output.
-            logits_out.copy_from_slice(&flat[..self.total_vocab]);
-        }
+            flat[0] as usize
+        };
         let t3 = Instant::now();
 
         self.stats.n_steps += 1;
@@ -186,7 +180,7 @@ impl JointStep for RnntStepBackend {
         self.stats.t_joint_pack += t1 - t0;
         self.stats.t_joint_exec += t2 - t1;
         self.stats.t_joint_read += t3 - t2;
-        Ok(())
+        Ok(token)
     }
 
     fn commit(&mut self) {

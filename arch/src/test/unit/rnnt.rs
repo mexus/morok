@@ -1,8 +1,29 @@
+use std::cmp::Ordering;
 use std::convert::Infallible;
 
 use proptest::prelude::*;
 
 use crate::rnnt::{JointStep, RnntDecoder, RnntOpts, TokenEmission, Word};
+
+/// NaN-safe argmax — the device backend computes the joint argmax on-GPU and
+/// returns the index; the mock mirrors that over its scripted logits. NaN is
+/// treated as smaller than any number (first non-NaN wins; all-NaN → 0).
+fn argmax_nan_safe(frame: &[f32]) -> usize {
+    let cmp = |a: f32, b: f32| {
+        a.partial_cmp(&b).unwrap_or_else(|| match (a.is_nan(), b.is_nan()) {
+            (true, false) => Ordering::Less,
+            (false, true) => Ordering::Greater,
+            _ => Ordering::Equal,
+        })
+    };
+    let mut best = 0usize;
+    for i in 1..frame.len() {
+        if cmp(frame[i], frame[best]).is_gt() {
+            best = i;
+        }
+    }
+    best
+}
 
 // ─── Mock backend ─────────────────────────────────────────────────────────
 
@@ -36,20 +57,12 @@ impl MockJointStep {
 impl JointStep for MockJointStep {
     type Error = Infallible;
 
-    fn step(
-        &mut self,
-        encoder_frame: &[f32],
-        prev_token: Option<usize>,
-        logits_out: &mut [f32],
-    ) -> Result<(), Self::Error> {
+    fn step(&mut self, encoder_frame: &[f32], prev_token: Option<usize>) -> Result<usize, Self::Error> {
         let frame_first = *encoder_frame.first().unwrap_or(&0.0);
         self.seen.push((frame_first, prev_token));
         let idx = self.cursor.min(self.script.len() - 1);
         self.cursor += 1;
-        let src = &self.script[idx];
-        assert_eq!(src.len(), logits_out.len(), "logits len mismatch in scripted step");
-        logits_out.copy_from_slice(src);
-        Ok(())
+        Ok(argmax_nan_safe(&self.script[idx]))
     }
 
     fn commit(&mut self) {
@@ -268,7 +281,7 @@ fn test_rnnt_backend_error_surfaces_with_frame_index() {
     struct FailingStep;
     impl JointStep for FailingStep {
         type Error = Boom;
-        fn step(&mut self, _: &[f32], _: Option<usize>, _: &mut [f32]) -> Result<(), Self::Error> {
+        fn step(&mut self, _: &[f32], _: Option<usize>) -> Result<usize, Self::Error> {
             Err(Boom)
         }
         fn commit(&mut self) {}
