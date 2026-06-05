@@ -753,6 +753,7 @@ pub fn instantiate_schedule(
     pre_schedule: &PreSchedule,
     input_buffers: &InputBuffers,
     var_vals: &HashMap<String, i64>,
+    device_local_outputs: bool,
 ) -> Result<ScheduleResult> {
     // Track allocated intermediate buffers locally (no global registry needed)
     let mut allocated_buffers: HashMap<u64, Buffer> = HashMap::new();
@@ -760,8 +761,15 @@ pub fn instantiate_schedule(
     // Final-output buffer ids: these stay host-visible so the host can read the
     // result directly (`array_view`). Every other freshly allocated buffer is an
     // internal intermediate and can live device-local on backends that
-    // distinguish it (AMD). See `collect_callable_buffers`.
-    let output_ids: HashSet<u64> = pre_schedule.output_buffer_uops.iter().map(|u| u.buf_uop().id).collect();
+    // distinguish it (AMD). `device_local_outputs` opts the outputs into the
+    // device-local class too — the host then reads them via `copyout` (SDMA
+    // staging) instead of the uncached host mapping. See
+    // `collect_callable_buffers`.
+    let output_ids: HashSet<u64> = if device_local_outputs {
+        HashSet::new()
+    } else {
+        pre_schedule.output_buffer_uops.iter().map(|u| u.buf_uop().id).collect()
+    };
 
     let mut templates: HashMap<u64, ScheduleItemTemplate> = HashMap::with_capacity(pre_schedule.items.len());
     for item in &pre_schedule.items {
@@ -847,7 +855,7 @@ pub fn create_schedule(
     var_vals: &HashMap<String, i64>,
 ) -> Result<ScheduleResult> {
     let pre = create_pre_schedule(transformed)?;
-    instantiate_schedule(&pre, input_buffers, var_vals)
+    instantiate_schedule(&pre, input_buffers, var_vals, false)
 }
 
 /// Extract device from the first input buffer in callable sources.

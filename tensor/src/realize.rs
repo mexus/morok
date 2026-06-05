@@ -626,7 +626,12 @@ fn schedule_result_from_sink_with_cache(
 
     let restored_pre_schedule = restore_post_schedule_pre_schedule(&entry.pre_schedule, &normalization);
     let schedule_input_buffers = build_schedule_input_buffers(&restored_pre_schedule, &normalization);
-    let result = crate::schedule::instantiate_schedule(&restored_pre_schedule, &schedule_input_buffers, &var_vals)?;
+    let result = crate::schedule::instantiate_schedule(
+        &restored_pre_schedule,
+        &schedule_input_buffers,
+        &var_vals,
+        config.device_local_outputs,
+    )?;
     Ok(result)
 }
 
@@ -639,7 +644,8 @@ fn schedule_result_from_sink_uncached(
     let (kernel_graph, _) = svod_schedule::try_get_kernel_graph(rangeify_result.sink).context(RangeifySnafu)?;
     let pre_schedule = crate::schedule::create_pre_schedule(kernel_graph.clone())?;
     let input_buffers = collect_input_buffers(&kernel_graph);
-    let result = crate::schedule::instantiate_schedule(&pre_schedule, &input_buffers, &var_vals)?;
+    let result =
+        crate::schedule::instantiate_schedule(&pre_schedule, &input_buffers, &var_vals, _config.device_local_outputs)?;
     Ok(result)
 }
 

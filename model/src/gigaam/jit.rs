@@ -26,7 +26,11 @@ jit_wrapper! {
 
         build(mel, lengths, b, t) {
             let out = model.encoder.forward_batch(mel, lengths, &b, &t)?;
-            out.cast(svod_dtype::DType::Float32).context(TensorSnafu)
+            // Permute [B, d_model, T_sub] → [B, T_sub, d_model] on-device: the
+            // RN-T decoder consumes frame-major rows, and doing it here turns
+            // the host-side strided transpose over the slow mapping into one
+            // contiguous copyout.
+            out.cast(svod_dtype::DType::Float32).context(TensorSnafu)?.try_permute(&[0, 2, 1]).context(TensorSnafu)
         }
     }
 }

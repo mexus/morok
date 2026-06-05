@@ -177,19 +177,6 @@ pub(crate) fn ctc_frames_to_words(text: &str, frames: &[usize], frame_shift: f32
     words
 }
 
-/// Transpose `[d_model, t_exec_sub]` row-major → `[actual_sub, d_model]`.
-/// `actual_sub <= t_exec_sub` (the JIT pads frames beyond `actual_sub`); only
-/// the first `actual_sub` frames are read.
-fn transpose_dt_to_td(src: &[f32], d_model: usize, t_exec_sub: usize, actual_sub: usize) -> Vec<f32> {
-    let mut out = vec![0.0_f32; actual_sub * d_model];
-    for t in 0..actual_sub {
-        for d in 0..d_model {
-            out[t * d_model + d] = src[d * t_exec_sub + t];
-        }
-    }
-    out
-}
-
 fn rnnt_decode_err<E: std::error::Error + 'static>(
     e: svod_arch::rnnt::RnntDecodeError<crate::jit::JitError>,
 ) -> TranscribeError<E> {
@@ -323,6 +310,11 @@ impl<S: Splitter> Transcriber<S> {
             }
             Head::Rnnt { runtime, .. } => {
                 let mut enc = GigaAmEncoderJit::new(model.clone()).with_b_bound(max_batch).with_t_bound(max_t_mel);
+                // The output stays host-mapped: copyout is one contiguous
+                // memcpy (vs the old element-wise strided transpose). A
+                // device-local output (SDMA copyout) hangs the first execute —
+                // suspected interaction with per-execute schedule
+                // re-instantiation under runtime vars; revisit separately.
                 enc.prepare_with_config(mel_spec, lengths_spec, &prepare_config).context(JitSnafu)?;
                 encoder_jit = Some(enc);
                 let backend = RnntStepBackend::from_model(model.clone(), max_batch).context(JitSnafu)?;
@@ -535,20 +527,21 @@ impl<S: Splitter> Transcriber<S> {
 
                     let t_enc = Instant::now();
                     enc_jit.execute_with_vars(&[("b", b as i64), ("t", t_exec as i64)]).context(JitSnafu)?;
-                    let item_stride = d_model * t_exec_sub;
+                    let item_stride = t_exec_sub * d_model;
+                    // Output is frame-major [B, t_exec_sub, d_model] (permuted
+                    // on-device) in a device-local buffer: one contiguous
+                    // copyout drains the dispatch and stages over SDMA.
                     let enc_buf = enc_jit.output().context(JitSnafu)?;
-                    let enc = enc_buf.as_array::<f32>().context(DeviceSnafu)?;
-                    // `as_array` drains the async encoder dispatch.
+                    let mut raw = vec![0u8; enc_buf.size()];
+                    enc_buf.copyout(&mut raw).context(DeviceSnafu)?;
                     t_encoder += t_enc.elapsed();
-                    let flat = enc.as_slice().expect("contiguous encoder output");
-                    // Encoder output is [d_model, t_exec_sub] row-major per item;
-                    // the arch decoder wants frame-major [actual_sub, d_model].
+                    let flat: &[f32] = unsafe { std::slice::from_raw_parts(raw.as_ptr() as *const f32, raw.len() / 4) };
                     let mut frames_batch = Vec::with_capacity(b);
                     let mut valid_frames = Vec::with_capacity(b);
                     for (bi, mel_len) in chunk_lengths.iter().enumerate() {
                         let actual_sub = subs_output_length(subs_kernel_size, *mel_len);
-                        let item_slice = &flat[bi * item_stride..bi * item_stride + item_stride];
-                        frames_batch.push(transpose_dt_to_td(item_slice, d_model, t_exec_sub, actual_sub));
+                        let base = bi * item_stride;
+                        frames_batch.push(flat[base..base + actual_sub * d_model].to_vec());
                         valid_frames.push(actual_sub);
                     }
 

@@ -559,7 +559,7 @@ fn test_instantiate_schedule_rejects_invocation_with_unknown_kernel_id() {
     let mut input_buffers = InputBuffers::new();
     input_buffers.insert(buffer_uop.id, cpu_buffer(4));
 
-    let err = match instantiate_schedule(&pre_schedule, &input_buffers, &HashMap::new()) {
+    let err = match instantiate_schedule(&pre_schedule, &input_buffers, &HashMap::new(), false) {
         Ok(_) => panic!("invocation with unknown kernel id should fail"),
         Err(err) => err,
     };

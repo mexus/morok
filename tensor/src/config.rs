@@ -58,6 +58,11 @@ pub struct PrepareConfig {
     /// that need to compare cache-warm vs cache-cold outputs without mutating
     /// process-global env state.
     pub disable_schedule_cache: bool,
+    /// Allocate the plan's OUTPUT buffers device-local (`cpu_access: false`)
+    /// on backends that support it. The host then reads results via `copyout`
+    /// (staged over the copy engine — SDMA on AMD, ~PCIe speed) instead of
+    /// the uncached host mapping. Use for big outputs read back in bulk.
+    pub device_local_outputs: bool,
 }
 
 impl std::fmt::Debug for PrepareConfig {
@@ -65,20 +70,31 @@ impl std::fmt::Debug for PrepareConfig {
         f.debug_struct("PrepareConfig")
             .field("optimizer", &self.optimizer)
             .field("disable_schedule_cache", &self.disable_schedule_cache)
+            .field("device_local_outputs", &self.device_local_outputs)
             .finish_non_exhaustive()
     }
 }
 
 impl Default for PrepareConfig {
     fn default() -> Self {
-        Self { optimizer: OptimizerConfig::default(), resolver: Arc::new(EnvResolver), disable_schedule_cache: false }
+        Self {
+            optimizer: OptimizerConfig::default(),
+            resolver: Arc::new(EnvResolver),
+            disable_schedule_cache: false,
+            device_local_outputs: false,
+        }
     }
 }
 
 impl PrepareConfig {
     /// Read both `SVOD_CPU_BACKEND` and optimizer env vars.
     pub fn from_env() -> Self {
-        Self { optimizer: OptimizerConfig::from_env(), resolver: Arc::new(EnvResolver), disable_schedule_cache: false }
+        Self {
+            optimizer: OptimizerConfig::from_env(),
+            resolver: Arc::new(EnvResolver),
+            disable_schedule_cache: false,
+            device_local_outputs: false,
+        }
     }
 
     /// Convenience constructor: specific CPU backend with optimizer settings
@@ -91,6 +107,7 @@ impl PrepareConfig {
             optimizer: OptimizerConfig::from_env(),
             resolver: Arc::new(CpuBackendResolver(backend)),
             disable_schedule_cache: false,
+            device_local_outputs: false,
         }
     }
 
@@ -146,7 +163,7 @@ impl PrepareConfig {
 
 impl From<OptimizerConfig> for PrepareConfig {
     fn from(optimizer: OptimizerConfig) -> Self {
-        Self { optimizer, resolver: Arc::new(EnvResolver), disable_schedule_cache: false }
+        Self { optimizer, resolver: Arc::new(EnvResolver), disable_schedule_cache: false, device_local_outputs: false }
     }
 }
 
