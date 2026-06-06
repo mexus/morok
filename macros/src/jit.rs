@@ -288,7 +288,12 @@ pub(crate) fn generate(jit: JitWrapper) -> Result<TokenStream> {
             } else {
                 let mut t = svod_tensor::Tensor::zeros(&#input_name.shape, #input_name.dtype.clone())
                     .map_err(|e| svod_model::jit::JitError::Tensor { source: Box::new(e) })?;
-                t.realize_with(config)
+                // Inputs are host-written every execute (`as_array_mut` pack):
+                // the plan-level `device_local_outputs` opt-in must not leak
+                // into this realization or the buffer loses its host mapping.
+                let mut input_config = config.clone();
+                input_config.device_local_outputs = false;
+                t.realize_with(&input_config)
                     .map_err(|e| svod_model::jit::JitError::Tensor { source: Box::new(e) })?;
                 t
             };

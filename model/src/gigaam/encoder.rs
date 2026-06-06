@@ -2,7 +2,7 @@ use ndarray::Array4;
 use snafu::ResultExt;
 use svod_dtype::DType;
 use svod_ir::SInt;
-use svod_tensor::{BoundVariable, Tensor};
+use svod_tensor::Tensor;
 
 use crate::init::{fan_in_uniform, ones, zeros};
 use crate::state::{HasStateDict, StateDict, get_tensor, prefixed};
@@ -691,20 +691,21 @@ impl Encoder {
         x.try_transpose(-1, -2).context(TensorSnafu)
     }
 
-    /// Batched encoder path with dynamic batch and mel-frame length.
+    /// Batched encoder path over the full, constant-shaped mel buffer.
     /// Input: `mel` `[B, n_mels, T_mel]`, `lengths` `[B]` valid lengths in mel frames.
     /// Output: `[B, d_model, T_sub]`.
-    pub fn forward_batch(
-        &self,
-        mel: &Tensor,
-        lengths: &Tensor,
-        batch: &BoundVariable,
-        mel_len: &BoundVariable,
-    ) -> Result<Tensor> {
-        let b = batch.as_sint();
-        let t_mel = mel_len.as_sint();
+    ///
+    /// `B` and `T_mel` are read directly off `mel`'s shape — the JIT realizes the
+    /// input buffers at the bucket's max shape (`max_batch_size × max_t_mel`), so
+    /// every derived dim is `SInt::Const`. That exact divisibility is what lets the
+    /// schedule heuristics fire MFMA tilings instead of the slow symbolic fallback.
+    /// Inactive lanes (`lengths[b] == 0`) subsample to `lengths_sub == 0`, so
+    /// `pad_valid` is all-false for them and the validity masks zero their output;
+    /// the caller never reads those lanes.
+    pub fn forward_batch(&self, mel: &Tensor, lengths: &Tensor) -> Result<Tensor> {
+        let mel_shape = mel.shape().context(TensorSnafu)?;
+        let b = mel_shape[0].clone();
 
-        let lengths = lengths.try_shrink([Some((SInt::Const(0), b.clone()))]).context(TensorSnafu)?;
         let lengths = lengths.cast(DType::Index).context(TensorSnafu)?;
 
         let two_t = Tensor::const_(2i64, DType::Index);
@@ -715,9 +716,6 @@ impl Encoder {
             lengths_sub = lengths_sub.try_add(&one_t).context(TensorSnafu)?.try_div(&two_t).context(TensorSnafu)?;
         }
 
-        let mel = mel
-            .try_shrink([Some((SInt::Const(0), b.clone())), None, Some((SInt::Const(0), t_mel))])
-            .context(TensorSnafu)?;
         let x = mel.try_transpose(-1, -2).context(TensorSnafu)?;
         let x = x.cast(self.input_dtype()).context(TensorSnafu)?;
         let x = self.subsampling.forward(&x)?;

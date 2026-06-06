@@ -42,6 +42,12 @@ pub struct RnntStepBackend {
 
     /// Per-step timing aggregates (pack / execute / read) + commit time.
     pub stats: StepStats,
+
+    /// One-shot: the next [`step`](BatchJointStep::step) executes profiled and
+    /// parks its per-dispatch kernels here. One step is representative — the
+    /// fused plan dispatches the same few kernels every step.
+    profile_next_step: bool,
+    step_profiles: Option<Vec<svod_runtime::KernelProfile>>,
 }
 
 /// Aggregate timings for [`RnntStepBackend`].
@@ -84,7 +90,21 @@ impl RnntStepBackend {
             frames: Vec::new(),
             zeros: vec![0u8; layers * lanes * pred_hidden * 4],
             stats: StepStats::default(),
+            profile_next_step: false,
+            step_profiles: None,
         })
+    }
+
+    /// Arm a one-shot profiled step: the next [`BatchJointStep::step`] runs
+    /// through `execute_profiled` and parks its kernels for
+    /// [`take_step_profiles`](Self::take_step_profiles).
+    pub fn profile_next_step(&mut self) {
+        self.profile_next_step = true;
+    }
+
+    /// Take the parked profiled-step kernels, if a profiled step ran.
+    pub fn take_step_profiles(&mut self) -> Option<Vec<svod_runtime::KernelProfile>> {
+        self.step_profiles.take()
     }
 
     /// Bind the chunk batch's per-lane encoder output (frame-major
@@ -127,7 +147,12 @@ impl BatchJointStep for RnntStepBackend {
         }
         let t1 = Instant::now();
 
-        self.jit.execute()?;
+        if self.profile_next_step {
+            self.profile_next_step = false;
+            self.step_profiles = Some(self.jit.execute_profiled()?);
+        } else {
+            self.jit.execute()?;
+        }
         let t2 = Instant::now();
 
         // The only per-step readback: one int per lane. The new state stays on

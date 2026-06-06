@@ -28,6 +28,7 @@ use crate::gigaam::SubsamplingMode;
 use crate::gigaam::ctc::GigaAmCtcJit;
 use crate::gigaam::jit::GigaAmEncoderJit;
 use crate::gigaam::model::{GigaAm, Head};
+use crate::gigaam::profile::{Stage, StageProfile, TranscribeProfile};
 use crate::gigaam::rnnt::RnntStepBackend;
 use crate::jit::InputSpec;
 
@@ -47,6 +48,8 @@ use crate::jit::InputSpec;
 /// | `beam_decode`     | `SVOD_BEAM_DECODE=1`  | `false`  |
 /// | `max_scores_mib`  | `SVOD_MAX_SCORES_MIB` | `256`    |
 ///
+/// `profile` is builder-only (no env var): set it programmatically.
+///
 /// VAD-specific knobs (`threshold`, `min_duration`, …) live on
 /// [`SileroVadSplitter`](super::SileroVadSplitter), not here.
 #[derive(Clone, Debug)]
@@ -61,6 +64,10 @@ pub struct TranscribeOpts {
     /// so two simultaneously live `[B, H, T_sub², dtype]` scores tensors
     /// stay under `2 × max_scores_mib` MiB.
     pub max_scores_mib: usize,
+    /// Collect a typed per-stage GPU profile ([`TranscribeResult::profile`]):
+    /// one representative profiled execution per GPU stage plus host stage
+    /// walls. Cheap (one extra device drain per profiled stage).
+    pub profile: bool,
 }
 
 impl Default for TranscribeOpts {
@@ -82,8 +89,9 @@ impl TranscribeOpts {
         #[builder(default = std::env::var("SVOD_BEAM_DECODE").as_deref() == Ok("1"))] beam_decode: bool,
         #[builder(default = std::env::var("SVOD_MAX_SCORES_MIB").ok().and_then(|s| s.parse().ok()).unwrap_or(256))]
         max_scores_mib: usize,
+        #[builder(default = false)] profile: bool,
     ) -> Self {
-        Self { word_timestamps, beam_decode, max_scores_mib }
+        Self { word_timestamps, beam_decode, max_scores_mib, profile }
     }
 
     /// Build from `SVOD_*` env vars with the same fallbacks as the
@@ -96,10 +104,12 @@ impl TranscribeOpts {
 /// Aggregated transcription output. `text` is the chunk texts joined by a
 /// single space (empty chunks dropped); [`words`](Self::words) flattens word
 /// timestamps across chunks (shifted by each chunk's `start_sec`).
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct TranscribeResult {
     pub text: String,
     pub chunks: Vec<ChunkResult>,
+    /// Typed per-stage GPU profile, when [`TranscribeOpts::profile`] is set.
+    pub profile: Option<TranscribeProfile>,
 }
 
 impl TranscribeResult {
@@ -304,20 +314,27 @@ impl<S: Splitter> Transcriber<S> {
                 } else {
                     model.config.decoder.clone()
                 };
-                let mut jit = GigaAmCtcJit::new(model.clone()).with_b_bound(max_batch).with_t_bound(max_t_mel);
+                let mut jit = GigaAmCtcJit::new(model.clone());
                 jit.prepare_with_config(mel_spec, lengths_spec, &prepare_config).context(JitSnafu)?;
                 HeadDecoder::Ctc { jit, decoder }
             }
             Head::Rnnt { runtime, .. } => {
-                let mut enc = GigaAmEncoderJit::new(model.clone()).with_b_bound(max_batch).with_t_bound(max_t_mel);
-                // The output stays host-mapped: copyout is one contiguous
-                // memcpy (vs the old element-wise strided transpose). A
-                // device-local output (SDMA copyout) hangs the first execute —
-                // suspected interaction with per-execute schedule
-                // re-instantiation under runtime vars; revisit separately.
-                enc.prepare_with_config(mel_spec, lengths_spec, &prepare_config).context(JitSnafu)?;
+                let mut enc = GigaAmEncoderJit::new(model.clone());
+                // Device-local output: the [B, T_sub, d_model] readback goes
+                // over the SDMA copy queue instead of the ~21 MB/s host-mapped
+                // BAR (the old first-execute hang was tied to per-execute
+                // schedule re-instantiation under runtime vars; the plan is
+                // all-static now).
+                let mut enc_config = prepare_config.clone();
+                enc_config.device_local_outputs = true;
+                enc.prepare_with_config(mel_spec, lengths_spec, &enc_config).context(JitSnafu)?;
                 encoder_jit = Some(enc);
-                let backend = RnntStepBackend::from_model(model.clone(), max_batch).context(JitSnafu)?;
+                // Decode lanes are independent of the encoder batch: wider
+                // waves amortize the per-step launch floor over more chunks
+                // (steps per wave = max frames in the wave, not the sum).
+                // State per lane is tiny; 32 lanes ≈ a chunked long file.
+                const DECODE_LANES: usize = 32;
+                let backend = RnntStepBackend::from_model(model.clone(), DECODE_LANES).context(JitSnafu)?;
                 let decoder = RnntDecoder::new(
                     runtime.vocabulary.clone(),
                     RnntOpts { max_symbols_per_step: runtime.max_symbols_per_step },
@@ -367,13 +384,19 @@ impl<S: Splitter> Transcriber<S> {
         let bounds = self.encoder_bounds(sample_rate)?;
         let t_split = Instant::now();
         let chunks = self.splitter.split(waveform, &bounds).context(SplitterSnafu)?;
+        let vad_wall = t_split.elapsed();
         tracing::info!(
             target: "svod_model::gigaam::transcribe",
-            split_ms = t_split.elapsed().as_secs_f64() * 1e3,
+            split_ms = vad_wall.as_secs_f64() * 1e3,
             n_chunks = chunks.len(),
             "vad split",
         );
-        self.transcribe_chunks(waveform, sample_rate, &chunks)
+        let mut result = self.transcribe_chunks(waveform, sample_rate, &chunks)?;
+        if let Some(profile) = &mut result.profile {
+            profile.vad = vad_wall;
+            tracing::info!("transcribe profile\n{profile}");
+        }
+        Ok(result)
     }
 
     /// Escape hatch: caller-supplied chunks. Validates each chunk against
@@ -406,7 +429,7 @@ impl<S: Splitter> Transcriber<S> {
 
         let n_mels = self.mel.n_mels();
         if chunks.is_empty() {
-            return Ok(TranscribeResult { text: String::new(), chunks: Vec::new() });
+            return Ok(TranscribeResult { text: String::new(), chunks: Vec::new(), profile: None });
         }
 
         let sample_rate_hz = self.model.config.sample_rate;
@@ -418,6 +441,10 @@ impl<S: Splitter> Transcriber<S> {
         let max_t_mel = self.max_t_mel;
         let max_batch = self.max_batch;
         let want_words = self.opts.word_timestamps;
+        // The JIT now runs at constant shape `[max_batch, *, max_t_mel]`, so the
+        // encoder output buffer is always `[max_batch, max_t_sub, *]`: per-lane
+        // rows are strided by this constant max, not the per-batch active max.
+        let max_t_sub = subs_output_length(subs_kernel_size, max_t_mel);
 
         // (start_sample, end_sample, mel_len, start_sec, end_sec) per chunk.
         let chunks_meta: Vec<(usize, usize, usize, f32, f32)> = chunks
@@ -433,21 +460,27 @@ impl<S: Splitter> Transcriber<S> {
             })
             .collect();
         if chunks_meta.is_empty() {
-            return Ok(TranscribeResult { text: String::new(), chunks: Vec::new() });
+            return Ok(TranscribeResult { text: String::new(), chunks: Vec::new(), profile: None });
         }
 
         let num_chunks = chunks_meta.len();
         let mut chunk_results: Vec<ChunkResult> = Vec::with_capacity(num_chunks);
+        // RN-T: encoder frames accumulated across all encode batches, decoded
+        // afterwards in backend-wide lane waves.
+        let mut all_frames: Vec<Vec<f32>> = Vec::new();
+        let mut all_valid: Vec<usize> = Vec::new();
         // Per-stage wall-clock, accumulated across batches. The JITs submit
         // async (wait=false); the GPU drains on the first host `as_array()`
         // read, so each stage timer is bounded by its drain point. `encoder_ms`
         // is the fused encoder+head for CTC, encoder-only for RN-T.
         let (mut t_mel, mut t_encoder, mut t_decode) = (Duration::ZERO, Duration::ZERO, Duration::ZERO);
+        // Per-call profiling: one representative encoder batch (a steady one —
+        // batch 0 pays cold caches ~6x) plus, for RN-T, one decode step.
+        let profile_batch = self.opts.profile.then(|| 3.min(num_chunks.div_ceil(max_batch) - 1) * max_batch);
+        let mut profile = self.opts.profile.then(TranscribeProfile::default);
         for chunk_batch_start in (0..num_chunks).step_by(max_batch) {
             let b = (num_chunks - chunk_batch_start).min(max_batch);
             let chunk_lengths: Vec<usize> = (0..b).map(|bi| chunks_meta[chunk_batch_start + bi].2).collect();
-            let t_exec = chunk_lengths.iter().copied().max().unwrap_or(1).max(1);
-            let t_exec_sub = subs_output_length(subs_kernel_size, t_exec);
 
             let t_stage = Instant::now();
             let batch_mels: Vec<Vec<f32>> = (0..b)
@@ -476,9 +509,16 @@ impl<S: Splitter> Transcriber<S> {
                     t_mel += t_pack.elapsed();
 
                     let t_enc = Instant::now();
-                    jit.execute_with_vars(&[("b", b as i64), ("t", t_exec as i64)]).context(JitSnafu)?;
+                    if profile_batch == Some(chunk_batch_start) {
+                        let kernels = jit.execute_profiled().context(JitSnafu)?;
+                        if let Some(p) = &mut profile {
+                            p.stages.push(StageProfile { stage: Stage::CtcHead, wall: Duration::ZERO, kernels });
+                        }
+                    } else {
+                        jit.execute().context(JitSnafu)?;
+                    }
                     let total_vocab = decoder.total_vocab();
-                    let item_stride = t_exec_sub * total_vocab;
+                    let item_stride = max_t_sub * total_vocab;
                     let logits_buf = jit.output().context(JitSnafu)?;
                     let logits = logits_buf.as_array::<f32>().context(DeviceSnafu)?;
                     // `as_array` drains the async fused encoder+head dispatch.
@@ -495,11 +535,11 @@ impl<S: Splitter> Transcriber<S> {
                         let t_dec = Instant::now();
                         let (text, frames) = if want_words {
                             let (text, frames) = decoder
-                                .decode_with_timestamps(item_slice, t_exec_sub, actual_sub)
+                                .decode_with_timestamps(item_slice, max_t_sub, actual_sub)
                                 .context(CtcDecodeSnafu)?;
                             (text, Some(frames))
                         } else {
-                            let text = decoder.decode(item_slice, t_exec_sub, actual_sub).context(CtcDecodeSnafu)?;
+                            let text = decoder.decode(item_slice, max_t_sub, actual_sub).context(CtcDecodeSnafu)?;
                             (text, None)
                         };
                         t_decode += t_dec.elapsed();
@@ -510,7 +550,7 @@ impl<S: Splitter> Transcriber<S> {
                         chunk_results.push(ChunkResult { start_sec, end_sec, text, words });
                     }
                 }
-                HeadDecoder::Rnnt { backend, decoder, sentencepiece } => {
+                HeadDecoder::Rnnt { .. } => {
                     let enc_jit = self.encoder_jit.as_mut().expect("RN-T path has a standalone encoder JIT");
                     let t_pack = Instant::now();
                     pack_mel_buffer(
@@ -526,43 +566,65 @@ impl<S: Splitter> Transcriber<S> {
                     t_mel += t_pack.elapsed();
 
                     let t_enc = Instant::now();
-                    enc_jit.execute_with_vars(&[("b", b as i64), ("t", t_exec as i64)]).context(JitSnafu)?;
-                    let item_stride = t_exec_sub * d_model;
-                    // Output is frame-major [B, t_exec_sub, d_model] (permuted
-                    // on-device) in a device-local buffer: one contiguous
-                    // copyout drains the dispatch and stages over SDMA.
+                    if profile_batch == Some(chunk_batch_start) {
+                        let kernels = enc_jit.execute_profiled().context(JitSnafu)?;
+                        if let Some(p) = &mut profile {
+                            p.stages.push(StageProfile { stage: Stage::Encoder, wall: Duration::ZERO, kernels });
+                        }
+                    } else {
+                        enc_jit.execute().context(JitSnafu)?;
+                    }
+                    let item_stride = max_t_sub * d_model;
+                    // Output is frame-major [B, max_t_sub, d_model] (permuted
+                    // on-device): one contiguous prefix copyout drains the
+                    // dispatch and skips the inactive lanes of a partial last
+                    // batch (lanes are leading-dim-major, so the active region
+                    // is exactly the first `b` items).
                     let enc_buf = enc_jit.output().context(JitSnafu)?;
-                    let mut raw = vec![0u8; enc_buf.size()];
-                    enc_buf.copyout(&mut raw).context(DeviceSnafu)?;
+                    // f32-typed allocation: guarantees alignment for the cast.
+                    let mut raw = vec![0f32; b * item_stride];
+                    enc_buf.copyout_prefix(bytemuck::cast_slice_mut(&mut raw)).context(DeviceSnafu)?;
                     t_encoder += t_enc.elapsed();
-                    let flat: &[f32] = unsafe { std::slice::from_raw_parts(raw.as_ptr() as *const f32, raw.len() / 4) };
-                    let mut frames_batch = Vec::with_capacity(b);
-                    let mut valid_frames = Vec::with_capacity(b);
+                    let flat: &[f32] = &raw;
+                    // Decode is per-step floor-bound, so lanes decouple from
+                    // the encoder batch: collect every chunk's frames here and
+                    // decode them all in one wide lockstep wave after the
+                    // encode loop.
                     for (bi, mel_len) in chunk_lengths.iter().enumerate() {
                         let actual_sub = subs_output_length(subs_kernel_size, *mel_len);
                         let base = bi * item_stride;
-                        frames_batch.push(flat[base..base + actual_sub * d_model].to_vec());
-                        valid_frames.push(actual_sub);
+                        all_frames.push(flat[base..base + actual_sub * d_model].to_vec());
+                        all_valid.push(actual_sub);
                     }
+                }
+            }
+        }
 
-                    // All chunks of the batch decode in lockstep — one fused
-                    // predictor+joint dispatch advances every lane, so this
-                    // stage folds B lanes into each step's `decode_ms`.
-                    let t_dec = Instant::now();
-                    backend.bind_batch(frames_batch);
-                    let lane_results = decoder.decode_batch(&valid_frames, backend).map_err(rnnt_decode_err)?;
-                    t_decode += t_dec.elapsed();
+        // RN-T: decode every chunk in lane waves as wide as the backend
+        // (steps per wave = the wave's max frames, not the sum over batches).
+        if let HeadDecoder::Rnnt { backend, decoder, sentencepiece } = &mut self.head_decoder {
+            let lanes = svod_arch::rnnt::BatchJointStep::batch(backend);
+            if profile.is_some() {
+                backend.profile_next_step();
+            }
+            for wave_start in (0..all_frames.len()).step_by(lanes) {
+                let wave_end = (wave_start + lanes).min(all_frames.len());
+                let valid = &all_valid[wave_start..wave_end];
 
-                    for (bi, (raw, emissions)) in lane_results.into_iter().enumerate() {
-                        let &(start_sample, end_sample, _, start_sec, end_sec) = &chunks_meta[chunk_batch_start + bi];
-                        let chunk_duration_sec = (end_sample - start_sample) as f32 / sample_rate_hz as f32;
-                        let frame_shift = chunk_duration_sec / (valid_frames[bi].max(1) as f32);
-                        let words = want_words.then(|| decoder.frames_to_words(&emissions, frame_shift));
-                        // SP pieces carry `▁` (U+2581) as word-initial markers;
-                        // after concatenation we restore them as spaces.
-                        let text = if *sentencepiece { raw.replace('\u{2581}', " ").trim().to_string() } else { raw };
-                        chunk_results.push(ChunkResult { start_sec, end_sec, text, words });
-                    }
+                let t_dec = Instant::now();
+                backend.bind_batch(all_frames[wave_start..wave_end].to_vec());
+                let lane_results = decoder.decode_batch(valid, backend).map_err(rnnt_decode_err)?;
+                t_decode += t_dec.elapsed();
+
+                for (li, (raw, emissions)) in lane_results.into_iter().enumerate() {
+                    let &(start_sample, end_sample, _, start_sec, end_sec) = &chunks_meta[wave_start + li];
+                    let chunk_duration_sec = (end_sample - start_sample) as f32 / sample_rate_hz as f32;
+                    let frame_shift = chunk_duration_sec / (valid[li].max(1) as f32);
+                    let words = want_words.then(|| decoder.frames_to_words(&emissions, frame_shift));
+                    // SP pieces carry `▁` (U+2581) as word-initial markers;
+                    // after concatenation we restore them as spaces.
+                    let text = if *sentencepiece { raw.replace('\u{2581}', " ").trim().to_string() } else { raw };
+                    chunk_results.push(ChunkResult { start_sec, end_sec, text, words });
                 }
             }
         }
@@ -577,9 +639,21 @@ impl<S: Splitter> Transcriber<S> {
             "gigaam stage breakdown",
         );
 
+        if let Some(p) = &mut profile {
+            p.mel = t_mel;
+            for s in &mut p.stages {
+                s.wall = t_encoder;
+            }
+            if let HeadDecoder::Rnnt { backend, .. } = &mut self.head_decoder
+                && let Some(kernels) = backend.take_step_profiles()
+            {
+                p.stages.push(StageProfile { stage: Stage::RnntStep, wall: t_decode, kernels });
+            }
+        }
+
         let text =
             chunk_results.iter().map(|c| c.text.as_str()).filter(|s| !s.is_empty()).collect::<Vec<_>>().join(" ");
-        Ok(TranscribeResult { text, chunks: chunk_results })
+        Ok(TranscribeResult { text, chunks: chunk_results, profile })
     }
 }
 

@@ -19,13 +19,8 @@ jit_wrapper! {
         mel: Tensor,
         lengths: Tensor,
 
-        vars {
-            b: (1, model.config.max_batch_size),
-            t: (1, model.config.max_mel_frames),
-        }
-
-        build(mel, lengths, b, t) {
-            let out = model.encoder.forward_batch(mel, lengths, &b, &t)?;
+        build(mel, lengths) {
+            let out = model.encoder.forward_batch(mel, lengths)?;
             // Permute [B, d_model, T_sub] → [B, T_sub, d_model] on-device: the
             // RN-T decoder consumes frame-major rows, and doing it here turns
             // the host-side strided transpose over the slow mapping into one

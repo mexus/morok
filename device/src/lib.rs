@@ -37,7 +37,7 @@ pub use buffer::{Buffer, BufferId};
 pub use device::{Graph, GraphFactory, GraphKernel, Program};
 pub use error::{Error, Result};
 pub use queue::{DynQueue, ExecParams, HardwareQueue, QueueFactory};
-pub use sync::{CpuTimelineSignal, TimelineSignal};
+pub use sync::{CpuTimelineSignal, DispatchTimestamps, TimelineSignal};
 
 #[cfg(test)]
 mod test;

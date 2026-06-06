@@ -41,7 +41,11 @@ pub fn create_amd_device(registry: &DeviceRegistry, device_id: usize, arch: AmdA
     // captured DAG graph reserves one slot per kernel (low hundreds) for its
     // lifetime, across several concurrent owners. 1024 slots (64 KiB GTT) covers
     // that with headroom; the pool rounds up to whole 64-slot pages.
-    let signal_pool = SignalPool::new(&amd_alloc, 1024)?;
+    // Sized for the worst combination: a captured graph reserves a slot per
+    // kernel for its lifetime while a profiled execution holds every
+    // dispatch's signal until harvest. Slots are 64 B each — 4096 is 256 KiB
+    // of GTT, cheap insurance against `SignalPool exhausted`.
+    let signal_pool = SignalPool::new(&amd_alloc, 4096)?;
     // Seed the pool onto the device core so `PoolQueue::new_with_resources`
     // can acquire its PM4 counter signal.
     device_handle.core().install_signal_pool(signal_pool);

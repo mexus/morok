@@ -588,6 +588,11 @@ impl AmdProgram {
     /// Same contract as [`Program::execute`]: `buffers` must point to live GPU
     /// VAs that outlive the dispatch, `vals` must match the kernel's variable
     /// arity, and launch dims must be valid for the kernel descriptor.
+    ///
+    /// Returns the dispatch's AQL completion signal so a profiler can read its
+    /// CP-stamped `start_ts`/`end_ts` after retirement (queues run with
+    /// ENABLE_PROFILING). `None` on the PM4 path (counter-based completion,
+    /// no per-dispatch signal).
     #[allow(clippy::missing_safety_doc)]
     pub unsafe fn execute_on(
         &self,
@@ -597,7 +602,7 @@ impl AmdProgram {
         global_size: Option<[usize; 3]>,
         local_size: Option<[usize; 3]>,
         wait: bool,
-    ) -> Result<()> {
+    ) -> Result<Option<Arc<crate::amd::signal::AmdSignal>>> {
         let pool = owner.pool();
         // Device poisoned by an earlier fault: refuse to dispatch (the GPU
         // state and any cached buffer mappings are no longer trustworthy).
@@ -727,6 +732,7 @@ impl AmdProgram {
             if wait {
                 owner.synchronize()?;
             }
+            Ok(None)
         } else {
             // AQL path: completion via the kernel packet's own native
             // `completion_signal` (the packet processor decrements the countdown
@@ -765,8 +771,8 @@ impl AmdProgram {
                 }
                 return Err(e);
             }
+            Ok(Some(sig))
         }
-        Ok(())
     }
 }
 

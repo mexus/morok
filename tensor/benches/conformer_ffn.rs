@@ -1,7 +1,7 @@
 //! Conformer FFN forward benchmark — measures execution time of the hot
 //! matmul pair that dominates the GigaAM encoder.
 //!
-//! Mirrors the slow kernels we observed in `model/examples/gigaam_rnnt_infer.rs`:
+//! Mirrors the slow kernels we observed in `model/examples/gigaam_infer.rs`:
 //!   - FFN expansion:   `[B*T, D] @ [D, FF]    → [B*T, FF]`     (768→3072)
 //!   - silu activation
 //!   - FFN contraction: `[B*T, FF] @ [FF, D]   → [B*T, D]`     (3072→768)

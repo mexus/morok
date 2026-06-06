@@ -528,6 +528,17 @@ impl Buffer {
         self.data.allocator._copyout(dst, self.data.raw(), self.offset)
     }
 
+    /// Copy the buffer's first `dst.len()` bytes to host memory — a prefix
+    /// read for const-shaped outputs whose active region is shorter than the
+    /// allocation (e.g. a partial last batch in `[max_batch, …]` buffers).
+    pub fn copyout_prefix(&self, dst: &mut [u8]) -> Result<()> {
+        self.ensure_allocated()?;
+
+        snafu::ensure!(dst.len() <= self.size, SizeMismatchSnafu { expected: self.size, actual: dst.len() });
+
+        self.data.allocator._copyout(dst, self.data.raw(), self.offset)
+    }
+
     /// Copy data from another buffer to this buffer.
     ///
     /// Same allocator instance (same device) → on-device `_transfer`.

@@ -36,6 +36,14 @@ const SLOT_BYTES: usize = 64;
 const SLOTS_PER_PAGE: usize = 64;
 /// Byte offset of the `value` counter inside an `amd_signal_t` slot.
 const SIGNAL_VALUE_OFFSET: usize = 8;
+/// Byte offsets of the CP-written dispatch timestamps (`amd_signal_t.start_ts`
+/// / `.end_ts`). Stamped on every dispatch because our queues run with
+/// `AMD_QUEUE_PROPERTIES_ENABLE_PROFILING` set.
+const SIGNAL_START_TS_OFFSET: usize = 32;
+const SIGNAL_END_TS_OFFSET: usize = 40;
+/// The GPU clock counter feeding the timestamps ticks at the architected
+/// 100 MHz on AMD GPUs (10 ns per tick — tinygrad's `timestamp_divider=100`).
+const NS_PER_TICK: u64 = 10;
 
 /// A pool-allocated AMD signal.
 ///
@@ -92,11 +100,18 @@ impl AmdSignal {
 
     /// Arm a native countdown completion signal to `count` (1 for one dispatch).
     /// The AQL packet processor decrements it to 0 on completion; the host then
-    /// observes done via [`wait_done`](Self::wait_done).
+    /// observes done via [`wait_done`](Self::wait_done). Clears any stale
+    /// dispatch timestamps so [`timestamps_ns`](Self::timestamps_ns) never
+    /// reports a previous tenant's stamps after slot reuse.
     #[inline]
     pub fn arm(&self, count: i64) {
-        // SAFETY: same as `load`.
-        unsafe { self.host_ptr.as_ref().store(count as u64, Ordering::Release) };
+        // SAFETY: the full 64-byte slot is mapped; ts fields at +32/+40.
+        unsafe {
+            let base = (self.host_ptr.as_ptr() as *mut u8).sub(SIGNAL_VALUE_OFFSET);
+            std::ptr::write_volatile(base.add(SIGNAL_START_TS_OFFSET) as *mut u64, 0);
+            std::ptr::write_volatile(base.add(SIGNAL_END_TS_OFFSET) as *mut u64, 0);
+            self.host_ptr.as_ref().store(count as u64, Ordering::Release);
+        }
     }
 
     /// Tiered busy-wait until `ready(value)` holds, or `timeout_ms` of *no
@@ -150,6 +165,26 @@ impl AmdSignal {
     #[inline]
     pub fn is_done(&self) -> bool {
         (self.load() as i64) <= 0
+    }
+
+    /// CP-written dispatch timestamps in nanoseconds, valid only after the
+    /// signal retired ([`is_done`](Self::is_done)). `None` until then, or when
+    /// the slot was never the completion signal of a dispatch (both stamps
+    /// zeroed by [`arm`](Self::arm)).
+    pub fn timestamps_ns(&self) -> Option<(u64, u64)> {
+        if !self.is_done() {
+            return None;
+        }
+        // SAFETY: the full 64-byte slot is mapped; value lives at +8, so the
+        // slot base is host_ptr − SIGNAL_VALUE_OFFSET.
+        let (start, end) = unsafe {
+            let base = (self.host_ptr.as_ptr() as *const u8).sub(SIGNAL_VALUE_OFFSET);
+            (
+                std::ptr::read_volatile(base.add(SIGNAL_START_TS_OFFSET) as *const u64),
+                std::ptr::read_volatile(base.add(SIGNAL_END_TS_OFFSET) as *const u64),
+            )
+        };
+        (start != 0 && end >= start).then(|| (start * NS_PER_TICK, end * NS_PER_TICK))
     }
 
     /// Tiered polling backoff: tight spin → `yield_now` → KFD `WAIT_EVENTS`
@@ -272,6 +307,12 @@ impl Timeline {
             self.value.store(1, Ordering::Release);
         }
         Ok(())
+    }
+}
+
+impl crate::sync::DispatchTimestamps for AmdSignal {
+    fn timestamps_ns(&self) -> Option<(u64, u64)> {
+        AmdSignal::timestamps_ns(self)
     }
 }
 

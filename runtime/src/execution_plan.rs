@@ -482,8 +482,11 @@ impl ExecutionPlan {
         Ok(self.amd_owner.get().expect("owner set above"))
     }
 
+    /// Submit one kernel. Returns the dispatch's HW timestamp handle when the
+    /// backend stamps dispatches (AMD AQL completion signal) — `None` on PM4 /
+    /// CPU paths. The non-profiled `execute` path drops it.
     #[inline]
-    fn execute_kernel(&self, kernel: &PreparedKernel) -> Result<()> {
+    fn execute_kernel(&self, kernel: &PreparedKernel) -> Result<Option<Arc<dyn svod_device::DispatchTimestamps>>> {
         let buffer_ptrs: SmallVec<[*mut u8; 8]> = kernel.buffer_ptrs.iter().map(|&ptr| ptr as *mut u8).collect();
         let (global_size, local_size) = Self::kernel_launch_sizes(kernel)?;
         // Fast path for AMD: downcast and dispatch via `execute_on` with the
@@ -498,9 +501,11 @@ impl ExecutionPlan {
                 .ensure_has_local_memory(amd.private_segment_size())
                 .map_err(|e| crate::error::Error::Execution { reason: format!("scratch grow: {e}") })?;
             return unsafe {
-                amd.execute_on(owner, &buffer_ptrs, &kernel.vals, global_size, local_size, /*wait=*/ false).map_err(
-                    |e| crate::error::Error::Execution { reason: format!("Kernel {} failed: {}", kernel.id, e) },
-                )
+                amd.execute_on(owner, &buffer_ptrs, &kernel.vals, global_size, local_size, /*wait=*/ false)
+                    .map(|sig| sig.map(|s| s as Arc<dyn svod_device::DispatchTimestamps>))
+                    .map_err(|e| crate::error::Error::Execution {
+                        reason: format!("Kernel {} failed: {}", kernel.id, e),
+                    })
             };
         }
         unsafe {
@@ -510,6 +515,7 @@ impl ExecutionPlan {
                 // wait=false: async submit. GPU ordering is enforced by the
                 // device timeline; host reads (copyout / as_*) synchronize.
                 .execute(&buffer_ptrs, &kernel.vals, global_size, local_size, /*wait=*/ false)
+                .map(|_| None)
                 .map_err(|e| crate::error::Error::Execution { reason: format!("Kernel {} failed: {}", kernel.id, e) })
         }
     }
@@ -695,7 +701,7 @@ impl ExecutionPlan {
     #[inline]
     fn execute_op(&self, op: &PreparedOp) -> Result<()> {
         match op {
-            PreparedOp::CompiledProgram(kernel) => self.execute_kernel(kernel),
+            PreparedOp::CompiledProgram(kernel) => self.execute_kernel(kernel).map(|_| ()),
             PreparedOp::BufferCopy(copy) => self.execute_copy(copy),
             PreparedOp::BufferView(view) => self.execute_buffer_view(view),
             PreparedOp::CustomFunction(custom) => self.execute_custom_function(custom),
@@ -856,24 +862,50 @@ impl ExecutionPlan {
     ///     println!("{:>8.3}ms  {}", p.elapsed.as_secs_f64() * 1000.0, p.kernel.entry_point);
     /// }
     /// ```
+    /// Always dispatches per-kernel (never the captured graph): a graph replay
+    /// has one signal per batch, so per-dispatch stamps don't exist there.
+    /// Profiled timings reflect per-doorbell execution, not graph replay.
     pub fn execute_profiled(&self) -> Result<Vec<KernelProfile>> {
         let mut profiles = Vec::with_capacity(self.op_order.len());
+        // Per-dispatch HW timestamp handles, harvested after the drain below
+        // (the GPU stamps a dispatch's signal only on retirement).
+        let mut handles: Vec<Option<Arc<dyn svod_device::DispatchTimestamps>>> =
+            Vec::with_capacity(self.op_order.len());
         for level in &self.op_levels {
             for &idx in level {
                 match &self.ops[idx] {
                     PreparedOp::CompiledProgram(kernel) => {
                         let start = Instant::now();
-                        self.execute_kernel(kernel)?;
+                        let handle = self.execute_kernel(kernel)?;
+                        handles.push(handle);
                         profiles.push(KernelProfile {
                             kernel: Arc::clone(&kernel.kernel),
                             device: kernel.device.clone(),
                             num_buffers: kernel.buffer_ptrs.len(),
                             elapsed: start.elapsed(),
+                            gpu_start_ns: None,
+                            gpu_end_ns: None,
                         });
                     }
                     PreparedOp::BufferCopy(copy) => self.execute_copy(copy)?,
                     PreparedOp::BufferView(view) => self.execute_buffer_view(view)?,
                     PreparedOp::CustomFunction(custom) => self.execute_custom_function(custom)?,
+                }
+            }
+        }
+        if handles.iter().any(Option::is_some) {
+            // Handles exist only on the AMD AQL path, where the plan's owner
+            // context tracks the newest in-flight signal.
+            #[cfg(target_os = "linux")]
+            if let Some(owner) = self.amd_owner.get() {
+                owner
+                    .synchronize()
+                    .map_err(|e| crate::error::Error::Execution { reason: format!("profiled drain: {e}") })?;
+            }
+            for (profile, handle) in profiles.iter_mut().zip(&handles) {
+                if let Some((start, end)) = handle.as_ref().and_then(|h| h.timestamps_ns()) {
+                    profile.gpu_start_ns = Some(start);
+                    profile.gpu_end_ns = Some(end);
                 }
             }
         }

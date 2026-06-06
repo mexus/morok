@@ -52,4 +52,4 @@ pub use executor::{
 pub use kernel_cache::*;
 pub use leveling::{compute_topological_levels, compute_topological_order};
 pub use llvm::*;
-pub use profiler::KernelProfile;
+pub use profiler::{KernelAggregate, KernelProfile, aggregate_profiles, render_histogram};
