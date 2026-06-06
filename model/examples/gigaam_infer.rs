@@ -110,7 +110,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("\n--- Transcript ---\n{}", result.text);
     println!(
-        "\nTotal: {:.2}s; transcribe: {:.2}s; loop RTF: {:.3}x",
+        "\nTotal: {:.2}s; transcribe: {:.2}s; loop RTF: {:.4}x",
         t_total.elapsed().as_secs_f32(),
         dt_transcribe.as_secs_f32(),
         if duration_s > 0.0 { dt_transcribe.as_secs_f32() / duration_s } else { 0.0 },

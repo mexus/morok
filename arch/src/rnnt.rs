@@ -215,6 +215,43 @@ pub trait BatchLabelStep {
     fn reset(&mut self);
 }
 
+// ─── BatchBlockStep trait ─────────────────────────────────────────────────
+
+/// One block's tapes, lane-major `[batch * block_steps]`, step-major within a
+/// lane. `emit[i*K+k] != 0` flags a real emission of `tokens[i*K+k]` at
+/// encoder frame `frames[i*K+k]`.
+pub struct BlockTapes<'a> {
+    pub tokens: &'a [i32],
+    pub emit: &'a [i32],
+    pub frames: &'a [i32],
+    /// Any lane still has frames left after this block.
+    pub active_any: bool,
+}
+
+/// Device-resident block decode: every state (per-lane time/prev/symbols +
+/// predictor state) lives on the device; one `run_block` advances all lanes
+/// [`block_steps`](Self::block_steps) label-looping steps and the host only
+/// reads the token tape. Greedy semantics per lane are identical to
+/// [`BatchLabelStep`].
+pub trait BatchBlockStep {
+    /// Backend-specific error (typically a JIT execution error).
+    type Error: std::error::Error + Send + Sync + 'static;
+
+    /// Lane capacity.
+    fn batch(&self) -> usize;
+
+    /// Steps per block (the tape stride).
+    fn block_steps(&self) -> usize;
+
+    /// Advance every lane `block_steps` steps; recycle carried state on
+    /// device; return the tapes.
+    fn run_block(&mut self) -> Result<BlockTapes<'_>, Self::Error>;
+
+    /// Reset all lanes to the empty-prefix initial state (zero time/symbols,
+    /// blank prev, zero LSTM state).
+    fn reset(&mut self) -> Result<(), Self::Error>;
+}
+
 // ─── Decoder ──────────────────────────────────────────────────────────────
 
 /// Greedy RNN-T decoder. Owns the vocabulary; the blank token id is implicit
@@ -509,6 +546,46 @@ impl RnntDecoder {
                 // first re-reads the pre-emission state and drops tokens).
                 step.commit(&commit_lanes);
                 step.predict(&prev).map_err(|e| BackendSnafu { frame: time[0] }.into_error(e))?;
+            }
+        }
+
+        Ok(texts.into_iter().zip(emissions).collect())
+    }
+
+    /// Device-block greedy decode: the entire label-looping loop runs on the
+    /// device in [`BatchBlockStep::block_steps`]-sized blocks; the host only
+    /// appends tape entries flagged by `emit`. Per-lane output is identical to
+    /// [`Self::decode_batch_labels`] / [`Self::decode_batch`].
+    pub fn decode_batch_blocks<S: BatchBlockStep>(
+        &self,
+        valid_frames: &[usize],
+        step: &mut S,
+    ) -> Result<Vec<LaneDecode>, RnntDecodeError<S::Error>> {
+        let b = valid_frames.len();
+        let lanes = step.batch();
+        assert!(b <= lanes, "decode_batch_blocks: {b} items exceed the backend's {lanes} lanes");
+        let k = step.block_steps();
+        let mut texts = vec![String::new(); b];
+        let mut emissions = vec![Vec::new(); b];
+        if self.vocabulary.is_empty() || valid_frames.iter().all(|&v| v == 0) {
+            return Ok(texts.into_iter().zip(emissions).collect());
+        }
+
+        step.reset().map_err(|e| BackendSnafu { frame: 0usize }.into_error(e))?;
+        loop {
+            let tapes = step.run_block().map_err(|e| BackendSnafu { frame: 0usize }.into_error(e))?;
+            for i in 0..b {
+                for s in 0..k {
+                    let j = i * k + s;
+                    if tapes.emit[j] != 0 && (tapes.frames[j] as usize) < valid_frames[i] {
+                        let tok = tapes.tokens[j] as usize;
+                        texts[i].push_str(&self.vocabulary[tok]);
+                        emissions[i].push(TokenEmission { token_id: tok, frame: tapes.frames[j] as usize });
+                    }
+                }
+            }
+            if !tapes.active_any {
+                break;
             }
         }
 

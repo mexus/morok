@@ -62,6 +62,21 @@ impl RnntJoint {
     pub fn forward_argmax(&self, enc_t: &Tensor, g: &Tensor) -> Result<Tensor> {
         self.logits(enc_t, g)?.argmax(-1isize).context(TensorSnafu)
     }
+
+    /// Encoder projection `enc_w · enc + enc_b` over a whole frame axis —
+    /// hoisted out of the decode loop (`[B, T, E] → [B, T, J]`, one MFMA
+    /// matmul per wave instead of a per-step row projection).
+    pub fn project_encoder(&self, enc: &Tensor) -> Result<Tensor> {
+        enc.linear().weight(&self.enc_w).bias(&self.enc_b).call().context(TensorSnafu)
+    }
+
+    /// Greedy argmax over PRE-PROJECTED encoder rows ([`Self::project_encoder`]).
+    pub fn argmax_preproj(&self, enc_proj_t: &Tensor, g: &Tensor) -> Result<Tensor> {
+        let pred_proj = g.linear().weight(&self.pred_w).bias(&self.pred_b).call().context(TensorSnafu)?;
+        let activated = enc_proj_t.try_add(&pred_proj).context(TensorSnafu)?.relu().context(TensorSnafu)?;
+        let logits = activated.linear().weight(&self.out_w).bias(&self.out_b).call().context(TensorSnafu)?;
+        logits.argmax(-1isize).context(TensorSnafu)
+    }
 }
 
 impl HasStateDict for RnntJoint {
