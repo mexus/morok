@@ -22,7 +22,11 @@ pub struct MelConfig {
 /// CPU-based log-mel spectrogram extractor.
 pub struct MelSpectrogram {
     r2c: Arc<dyn RealToComplex<f32>>,
-    mel_fb: Array2<f32>,
+    /// Sparse filterbank rows: `(first_bin, weights)` per mel — each triangular
+    /// filter covers only a handful of contiguous FFT bins, so the dense
+    /// `[n_mels, n_bins]` matvec wastes ~40x. Built dense, sparsified once;
+    /// ascending-bin accumulation keeps the matvec bit-identical to dense.
+    mel_fb: Vec<(usize, Vec<f32>)>,
     window: Vec<f32>,
     n_fft: usize,
     hop_length: usize,
@@ -38,13 +42,22 @@ impl MelSpectrogram {
 
         let window = hann_window(config.n_fft, config.win_length);
 
-        let mel_fb = build_mel_filterbank(config.n_mels, n_fft, config.sample_rate as f32);
+        let dense = build_mel_filterbank(config.n_mels, n_fft, config.sample_rate as f32);
+        let mel_fb = dense
+            .rows()
+            .into_iter()
+            .map(|row| {
+                let first = row.iter().position(|&w| w != 0.0).unwrap_or(0);
+                let last = row.iter().rposition(|&w| w != 0.0).map_or(first, |l| l + 1);
+                (first, row.slice(ndarray::s![first..last]).to_vec())
+            })
+            .collect();
 
         Self { r2c, mel_fb, window, n_fft, hop_length: config.hop_length, center: config.center }
     }
 
     pub fn n_mels(&self) -> usize {
-        self.mel_fb.nrows()
+        self.mel_fb.len()
     }
 
     pub fn num_frames(&self, waveform_len: usize) -> usize {
@@ -67,7 +80,7 @@ impl MelSpectrogram {
 
         let n_frames = if signal.len() >= n_fft { (signal.len() - n_fft) / self.hop_length + 1 } else { 0 };
         let n_bins = n_fft / 2 + 1;
-        let n_mels = self.mel_fb.nrows();
+        let n_mels = self.mel_fb.len();
 
         debug_assert!(
             {
@@ -100,10 +113,10 @@ impl MelSpectrogram {
                 power[i] = c.re * c.re + c.im * c.im;
             }
 
-            for mel_idx in 0..n_mels {
+            for (mel_idx, (first, weights)) in self.mel_fb.iter().enumerate() {
                 let mut sum = 0.0f32;
-                for (bin, &p) in power.iter().enumerate() {
-                    sum += self.mel_fb[[mel_idx, bin]] * p;
+                for (w, &p) in weights.iter().zip(&power[*first..]) {
+                    sum += w * p;
                 }
                 out_slice[mel_idx * n_frames + frame_idx] = sum.clamp(1e-9, 1e9).ln();
             }

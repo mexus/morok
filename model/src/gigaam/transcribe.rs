@@ -483,7 +483,12 @@ impl<S: Splitter> Transcriber<S> {
             let chunk_lengths: Vec<usize> = (0..b).map(|bi| chunks_meta[chunk_batch_start + bi].2).collect();
 
             let t_stage = Instant::now();
+            // Chunks are independent and `forward_into` is `&self` over shared
+            // read-only state (plan, filterbank, window) — parallelize the
+            // batch; per-chunk output is bit-identical to the serial loop.
+            use rayon::prelude::*;
             let batch_mels: Vec<Vec<f32>> = (0..b)
+                .into_par_iter()
                 .map(|bi| {
                     let &(start_sample, end_sample, valid, _, _) = &chunks_meta[chunk_batch_start + bi];
                     let mut chunk_mel = ndarray::Array3::<f32>::zeros((1, n_mels, valid));

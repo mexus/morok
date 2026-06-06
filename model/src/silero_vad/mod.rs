@@ -174,6 +174,22 @@ impl SileroVad {
             .context(TensorSnafu)
     }
 
+    /// Conv front-end + the LSTM's non-recurrent input projection, batched:
+    /// `[B, CHUNK_LEN] -> [B, 4*HIDDEN]` pre-activation gates
+    /// (`W_ih·feat + bias_ih + bias_hh`, PyTorch `[i,f,g,o]` order). Hoisting
+    /// the projection into the JIT leaves the host scan only the recurrent
+    /// `W_hh·h` and activations. Bias order: `(feat·W_ihᵀ + b_ih) + b_hh`.
+    pub fn forward_gates(&self, chunks: &Tensor) -> Result<Tensor> {
+        let feat = self.forward_features(chunks)?;
+        feat.linear()
+            .weight(&self.lstm.weight_ih)
+            .bias(&self.lstm.bias_ih)
+            .call()
+            .context(TensorSnafu)?
+            .try_add(&self.lstm.bias_hh)
+            .context(TensorSnafu)
+    }
+
     pub fn forward_chunk(&self, chunk: &Tensor, state_h: &Tensor, state_c: &Tensor) -> Result<Tensor> {
         let x = self.forward_features(chunk)?;
 
@@ -213,23 +229,24 @@ jit_wrapper! {
         chunks: Tensor,
 
         build(chunks) {
-            // [FEATURE_BATCH, CHUNK_LEN] -> [FEATURE_BATCH, HIDDEN] conv features.
-            // Fixed batch (not a runtime var): the conv front-end is row-
-            // independent, so partial batches just fill fewer rows and ignore the
-            // rest — and a symbolic leading dim trips the reflect-pad lowering.
-            model.forward_features(chunks)
+            // [FEATURE_BATCH, CHUNK_LEN] -> [FEATURE_BATCH, 4*HIDDEN] LSTM gate
+            // pre-activations (conv features + input projection, biases folded).
+            // Fixed batch (not a runtime var): the front-end is row-independent,
+            // so partial batches just fill fewer rows and ignore the rest — and
+            // a symbolic leading dim trips the reflect-pad lowering.
+            model.forward_gates(chunks)
         }
     }
 }
 
-/// Host-resident LSTM cell + sigmoid head weights for the recurrent scan.
-struct VadHead {
-    w_ih: ndarray::Array2<f32>, // [4H, H]
-    w_hh: ndarray::Array2<f32>, // [4H, H]
-    b: ndarray::Array1<f32>,    // [4H] = bias_ih + bias_hh (only the sum is
-    // ever used; PyTorch keeps them split)
-    final_w: ndarray::Array1<f32>, // [H]
-    final_b: f32,
+/// Host-resident recurrent weights for the scan. The input projection
+/// (`W_ih`, biases) lives in the feature JIT ([`SileroVad::forward_gates`]);
+/// only the recurrence stays host-side — per-step work is too small for a
+/// GPU launch and measured 3x slower as a CPU-device JIT than 8-lane SIMD.
+pub(crate) struct VadHead {
+    pub(crate) w_hh: ndarray::Array2<f32>,    // [4H, H]
+    pub(crate) final_w: ndarray::Array1<f32>, // [H]
+    pub(crate) final_b: f32,
 }
 
 #[inline]
@@ -238,35 +255,44 @@ fn sigmoid(x: f32) -> f32 {
 }
 
 impl VadHead {
-    /// Recurrent scan over batched conv features `[n, H]` (row-major). Mirrors
-    /// [`LSTMCell::step`] (PyTorch `[i,f,g,o]` order) + `sigmoid(final_conv ∘
-    /// relu(h))`. The input projection `W_ih·feat` is non-recurrent, so it's
-    /// computed batched up front; only `W_hh·h` stays in the per-step loop.
-    fn scan(&self, features: &[f32], n: usize) -> Vec<f32> {
+    /// Recurrent LSTM + sigmoid head over `[n, 4H]` pre-activation gates from
+    /// the feature JIT (`W_ih·feat + biases`, PyTorch `[i,f,g,o]` order),
+    /// 8-lane SIMD activations.
+    pub(crate) fn scan(&self, gates_x: &[f32], n: usize) -> Vec<f32> {
+        use wide::f32x8;
+        const L: usize = 8;
         let h = self.final_w.len();
-        let feat = ndarray::ArrayView2::from_shape((n, h), features).expect("features shape");
-        let gates_x = feat.dot(&self.w_ih.t()); // [n, 4H]
+        debug_assert_eq!(h % L, 0, "HIDDEN must be a multiple of the SIMD width");
+        debug_assert_eq!(gates_x.len(), n * 4 * h, "gates shape");
+
+        let lanes = |v: &[f32], j: usize| f32x8::from(<[f32; L]>::try_from(&v[j..j + L]).expect("lane"));
+        let sig = |x: f32x8| ((-x).exp() + 1.0).recip();
+        let w = self.final_w.as_slice().expect("final_w");
 
         let mut hs = ndarray::Array1::<f32>::zeros(h);
         let mut cs = vec![0.0f32; h];
         let mut gh = ndarray::Array1::<f32>::zeros(4 * h); // recurrent projection scratch, reused per step
         let mut probs = Vec::with_capacity(n);
         for t in 0..n {
-            let gx = gates_x.row(t);
+            let gx = &gates_x[t * 4 * h..(t + 1) * 4 * h];
             // gh = W_hh · h, written in place to avoid a per-step heap allocation.
             ndarray::linalg::general_mat_vec_mul(1.0, &self.w_hh, &hs, 0.0, &mut gh);
-            let mut p = self.final_b;
-            for j in 0..h {
-                let gate = |k: usize| gx[k] + gh[k] + self.b[k];
-                let i = sigmoid(gate(j));
-                let f = sigmoid(gate(h + j));
+            let ghs = gh.as_slice().expect("contiguous gh");
+            let hss = hs.as_slice_mut().expect("contiguous hs");
+            let mut p = f32x8::ZERO;
+            for j in (0..h).step_by(L) {
+                let gate = |k: usize| lanes(gx, k) + lanes(ghs, k);
+                let i = sig(gate(j));
+                let f = sig(gate(h + j));
                 let g = gate(2 * h + j).tanh();
-                let o = sigmoid(gate(3 * h + j));
-                cs[j] = f * cs[j] + i * g;
-                hs[j] = o * cs[j].tanh();
-                p += self.final_w[j] * hs[j].max(0.0);
+                let o = sig(gate(3 * h + j));
+                let c = f * lanes(&cs, j) + i * g;
+                let hv = o * c.tanh();
+                cs[j..j + L].copy_from_slice(&c.to_array());
+                hss[j..j + L].copy_from_slice(&hv.to_array());
+                p += lanes(w, j) * hv.max(f32x8::ZERO);
             }
-            probs.push(sigmoid(p));
+            probs.push(sigmoid(self.final_b + p.reduce_add()));
         }
         probs
     }
@@ -282,27 +308,26 @@ impl VadInference {
         use crate::jit::{InputSpec, TensorSnafu};
         let h = HIDDEN;
         // Pull the recurrent weights to host before `vad` moves into the JIT.
-        // Clone+realize first: checkpoint weights are already realized, but
-        // random/lazy weights need materialization before `as_vec`.
         let to_vec = |t: &Tensor| -> crate::jit::Result<Vec<f32>> {
             let mut t = t.clone();
             t.realize().context(TensorSnafu)?;
             t.as_vec::<f32>().context(TensorSnafu)
         };
-        let w_ih = ndarray::Array2::from_shape_vec((4 * h, h), to_vec(&vad.lstm.weight_ih)?).expect("w_ih shape");
         let w_hh = ndarray::Array2::from_shape_vec((4 * h, h), to_vec(&vad.lstm.weight_hh)?).expect("w_hh shape");
-        let b_ih = ndarray::Array1::from_vec(to_vec(&vad.lstm.bias_ih)?);
-        let b_hh = ndarray::Array1::from_vec(to_vec(&vad.lstm.bias_hh)?);
-        let b = b_ih + b_hh; // only the sum is used in the gate; fold it once here
         let final_w = ndarray::Array1::from_vec(to_vec(&vad.final_conv.weight)?); // [1,H,1] flat = H
         let final_b = match &vad.final_conv.bias {
             Some(b) => to_vec(b)?[0],
             None => 0.0,
         };
-        let head = VadHead { w_ih, w_hh, b, final_w, final_b };
+        let head = VadHead { w_hh, final_w, final_b };
 
         let mut jit = SileroVadFeatureJit::new(vad);
-        jit.prepare(InputSpec::f32(&[FEATURE_BATCH, CHUNK_LEN]))?;
+        // Device-local output: the [FEATURE_BATCH, 4*HIDDEN] gates readback
+        // (8 MiB per dispatch) goes over the SDMA copy queue instead of the
+        // ~21 MB/s host-mapped BAR — same pattern as the encoder output.
+        let mut config = svod_tensor::PrepareConfig::from_env();
+        config.device_local_outputs = true;
+        jit.prepare_with_config(InputSpec::f32(&[FEATURE_BATCH, CHUNK_LEN]), &config)?;
         Ok(Self { jit, head })
     }
 
@@ -325,9 +350,10 @@ impl VadInference {
         let n_chunks = (total + pad_len) / NUM_SAMPLES;
         let h = HIDDEN;
 
-        // Phase 1: batched conv front-end on the GPU -> features [n_chunks, H].
+        // Phase 1: batched conv front-end + LSTM input projection on the GPU
+        // -> pre-activation gates [n_chunks, 4H].
         let t_feat = std::time::Instant::now();
-        let mut features = vec![0.0f32; n_chunks * h];
+        let mut gates = vec![0.0f32; n_chunks * 4 * h];
         let mut done = 0usize;
         while done < n_chunks {
             let b = (n_chunks - done).min(FEATURE_BATCH);
@@ -341,16 +367,16 @@ impl VadInference {
                 }
             }
             self.jit.execute()?;
-            let out = self.jit.output()?.as_array::<f32>().context(crate::jit::DeviceSnafu)?;
-            let flat = out.as_slice().expect("contiguous features");
-            features[done * h..(done + b) * h].copy_from_slice(&flat[..b * h]);
+            // Device-local output: SDMA-stage only the valid rows out.
+            let dst = &mut gates[done * 4 * h..(done + b) * 4 * h];
+            self.jit.output()?.copyout_prefix(bytemuck::cast_slice_mut(dst)).context(crate::jit::DeviceSnafu)?;
             done += b;
         }
         let feature_ms = t_feat.elapsed().as_secs_f64() * 1e3;
 
-        // Phase 2: recurrent LSTM + sigmoid head on the host.
+        // Phase 2: recurrent LSTM + sigmoid head on the host (SIMD).
         let t_scan = std::time::Instant::now();
-        let probs = self.head.scan(&features, n_chunks);
+        let probs = self.head.scan(&gates, n_chunks);
         let scan_ms = t_scan.elapsed().as_secs_f64() * 1e3;
 
         tracing::info!(
