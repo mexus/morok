@@ -247,7 +247,16 @@ impl HasStateDict for MultiHeadSelfAttention {
 #[derive(Clone)]
 pub enum ConvNorm {
     LayerNorm(LayerNormWeights),
-    BatchNorm { scale: Tensor, bias: Tensor, mean: Tensor, invstd: Tensor },
+    BatchNorm {
+        scale: Tensor,
+        bias: Tensor,
+        mean: Tensor,
+        invstd: Tensor,
+    },
+    /// Inference-time BatchNorm fold: the affine collapsed into the depthwise
+    /// conv at load (`w *= s`, `b = b*s + bias - mean*s` with
+    /// `s = scale*invstd`), so the norm op vanishes from the graph.
+    Folded,
 }
 
 /// Conformer convolution module:
@@ -328,6 +337,7 @@ impl ConvModule {
             ConvNorm::BatchNorm { scale, bias, mean, invstd } => {
                 y.batchnorm().scale(scale).bias(bias).mean(mean).invstd(invstd).call().context(TensorSnafu)?
             }
+            ConvNorm::Folded => y,
         };
         // BN/LN params (scale, bias, mean, invstd) are stored fp32; broadcasting promotes
         // the norm output. Re-cast to the activation dtype so SiLU/pw2 stay in the right
@@ -353,6 +363,8 @@ impl HasStateDict for ConvModule {
                     sd.insert(prefixed(prefix, name), t.clone());
                 }
             }
+            // Folded weights live in dw_weight/dw_bias; the BN params are gone.
+            ConvNorm::Folded => {}
         }
         sd
     }
@@ -362,11 +374,29 @@ impl HasStateDict for ConvModule {
         load_state_field!(self, sd, prefix, [pw1_weight, pw1_bias, dw_weight, dw_bias, pw2_weight, pw2_bias]);
         match &mut self.conv_norm {
             ConvNorm::LayerNorm(ln) => ln.load_state_dict(sd, &prefixed(prefix, "conv_norm"))?,
-            ConvNorm::BatchNorm { scale, bias, mean, invstd } => {
-                *scale = get_tensor(sd, &prefixed(prefix, "bn_scale"))?;
-                *bias = get_tensor(sd, &prefixed(prefix, "bn_bias"))?;
-                *mean = get_tensor(sd, &prefixed(prefix, "bn_mean"))?;
-                *invstd = get_tensor(sd, &prefixed(prefix, "bn_invstd"))?;
+            // Folded round-trips (e.g. `cast_weights`) carry no BN keys — the
+            // affine already lives in dw_weight/dw_bias.
+            ConvNorm::Folded if !sd.contains_key(&prefixed(prefix, "bn_scale")) => {}
+            ConvNorm::BatchNorm { .. } | ConvNorm::Folded => {
+                // Fold BN into the depthwise conv at load: with s = scale*invstd,
+                // y_bn = conv(x)*s + (bias - mean*s) — per-channel scale folds
+                // into the conv weight rows + a corrected bias. Removes the
+                // norm op from the encoder graph.
+                let scale = get_tensor(sd, &prefixed(prefix, "bn_scale"))?;
+                let bias = get_tensor(sd, &prefixed(prefix, "bn_bias"))?;
+                let mean = get_tensor(sd, &prefixed(prefix, "bn_mean"))?;
+                let invstd = get_tensor(sd, &prefixed(prefix, "bn_invstd"))?;
+                let fold = || -> std::result::Result<(Tensor, Tensor), Box<svod_tensor::error::Error>> {
+                    let d = self.d_model as isize;
+                    let s = scale.try_mul(&invstd)?;
+                    let w = self.dw_weight.try_mul(&s.try_reshape([d, 1, 1])?)?;
+                    let b = self.dw_bias.try_mul(&s)?.try_add(&bias)?.try_sub(&mean.try_mul(&s)?)?;
+                    Ok((w, b))
+                };
+                let (w, b) = fold().map_err(|e| crate::state::Error::Tensor { source: e })?;
+                self.dw_weight = w;
+                self.dw_bias = b;
+                self.conv_norm = ConvNorm::Folded;
             }
         }
         Ok(())

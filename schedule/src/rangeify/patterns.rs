@@ -2814,3 +2814,38 @@ pub fn pm_comparison_negations() -> &'static TypedPatternMatcher<()> {
 }
 
 // ============================================================================
+
+// ============================================================================
+// PM_HALF_BF16_CAST - same-width float casts route via f32
+// ============================================================================
+
+/// f16 ↔ bf16 have equal width, so no single LLVM `fptrunc`/`fpext` exists —
+/// and a plain `cast(f32).cast(dst)` chain gets folded back by the cast
+/// simplifier (rewrite ping-pong). Route the f32→bf16 step through bits
+/// (round-to-nearest-even on the high 16, tinygrad `pm_manual_bf16_cast`).
+pub fn pm_half_bf16_cast() -> &'static TypedPatternMatcher<()> {
+    use svod_dtype::{DType, ScalarDType};
+    crate::cached_patterns! {
+        x @ Cast { src, .. } if x.dtype().base().is_float()
+            && src.dtype().base().is_float()
+            && x.dtype().base().bytes() == src.dtype().base().bytes()
+            && x.dtype().base() != src.dtype().base()
+        => {
+            let vc = x.dtype().vcount();
+            let (f32t, u32t) = (DType::Scalar(ScalarDType::Float32).vec(vc), DType::Scalar(ScalarDType::UInt32).vec(vc));
+            let u16t = DType::Scalar(ScalarDType::UInt16).vec(vc);
+            if x.dtype().base() == ScalarDType::BFloat16 {
+                // f16 → f32 (fpext) → RNE-round the low 16 bits → bf16 payload.
+                let bits = src.cast(f32t).bitcast(u32t.clone());
+                let half_bit = bits.shr(&bits.const_like(16)).and_(&bits.const_like(1));
+                let rounded = bits.try_add(&half_bit.try_add(&bits.const_like(0x7fff)).ok()?).ok()?;
+                Some(rounded.shr(&rounded.const_like(16)).cast(u16t).bitcast(x.dtype()))
+            } else {
+                // bf16 → f16: widen through bits (u16 << 16 = exact f32), then fptrunc.
+                let wide = src.bitcast(u16t).cast(u32t.clone());
+                let f = wide.shl(&wide.const_like(16)).bitcast(f32t);
+                Some(f.cast(x.dtype()))
+            }
+        },
+    }
+}
