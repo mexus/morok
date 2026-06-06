@@ -182,6 +182,39 @@ pub trait BatchJointStep {
     fn reset(&mut self);
 }
 
+// ─── BatchLabelStep trait ─────────────────────────────────────────────────
+
+/// Label-looping batched backend: the predictor (the expensive recurrent
+/// network) and the joint (cheap projection + argmax) execute separately, so
+/// blank-advance steps cost only the joint. Lanes carry per-lane frame
+/// indices — there is no shared `t`. Per-lane semantics match
+/// [`BatchJointStep`] exactly (greedy is lane-independent), so transcripts
+/// are identical to lockstep decode.
+pub trait BatchLabelStep {
+    /// Backend-specific error (typically a JIT execution error).
+    type Error: std::error::Error + Send + Sync + 'static;
+
+    /// Lane capacity (must cover every `decode_batch_labels` call's item count).
+    fn batch(&self) -> usize;
+
+    /// Run the predictor for every lane's `prev` token over the committed
+    /// state, producing a tentative state + the joint's predictor input.
+    /// Called once before the loop (all-blank prefix) and once per
+    /// emitted-label round — never per blank advance.
+    fn predict(&mut self, prev: &[usize]) -> Result<(), Self::Error>;
+
+    /// Promote the tentative predictor state for masked lanes.
+    fn commit(&mut self, lanes: &[bool]);
+
+    /// Joint + argmax at per-lane frames `t[i]` against the last `predict`
+    /// output; `out[i]` is valid for ACTIVE lanes. Slices have length
+    /// [`batch`](Self::batch).
+    fn joint(&mut self, t: &[usize], active: &[bool], out: &mut [usize]) -> Result<(), Self::Error>;
+
+    /// Reset all lanes to the empty-prefix initial state.
+    fn reset(&mut self);
+}
+
 // ─── Decoder ──────────────────────────────────────────────────────────────
 
 /// Greedy RNN-T decoder. Owns the vocabulary; the blank token id is implicit
@@ -396,6 +429,86 @@ impl RnntDecoder {
                 if any_commit {
                     step.commit(&commit_lanes);
                 }
+            }
+        }
+
+        Ok(texts.into_iter().zip(emissions).collect())
+    }
+
+    /// Label-looping batched greedy decode (NeMo arXiv 2406.06220 adapted to
+    /// lane waves): the joint runs every step at per-lane frame indices; the
+    /// predictor runs only after a round with at least one non-blank emission.
+    /// Per-lane greedy decisions are byte-identical to [`Self::decode_batch`]
+    /// (greedy is lane-independent and `max_symbols_per_step` is enforced as a
+    /// per-frame run length) — only the call schedule changes: ~equal joint
+    /// count, predictor count drops to the emission rounds.
+    pub fn decode_batch_labels<S: BatchLabelStep>(
+        &self,
+        valid_frames: &[usize],
+        step: &mut S,
+    ) -> Result<Vec<LaneDecode>, RnntDecodeError<S::Error>> {
+        let b = valid_frames.len();
+        let lanes = step.batch();
+        assert!(b <= lanes, "decode_batch_labels: {b} items exceed the backend's {lanes} lanes");
+        let blank_id = self.blank_id();
+        let max_symbols = self.opts.max_symbols_per_step.max(1);
+        let mut texts = vec![String::new(); b];
+        let mut emissions = vec![Vec::new(); b];
+        if self.vocabulary.is_empty() {
+            return Ok(texts.into_iter().zip(emissions).collect());
+        }
+
+        step.reset();
+        let mut prev = vec![blank_id; lanes];
+        let mut time = vec![0usize; lanes];
+        let mut symbols = vec![0usize; lanes]; // run length at the current frame
+        let mut active = vec![false; lanes];
+        let mut out = vec![blank_id; lanes];
+        let mut commit_lanes = vec![false; lanes];
+
+        // Empty-prefix predictor output for the first joint round.
+        step.predict(&prev).map_err(|e| BackendSnafu { frame: 0usize }.into_error(e))?;
+
+        loop {
+            let mut any_active = false;
+            for i in 0..lanes {
+                active[i] = i < b && time[i] < valid_frames[i];
+                any_active |= active[i];
+            }
+            if !any_active {
+                break;
+            }
+            step.joint(&time, &active, &mut out).map_err(|e| BackendSnafu { frame: time[0] }.into_error(e))?;
+            let mut any_commit = false;
+            for i in 0..b {
+                commit_lanes[i] = false;
+                if !active[i] {
+                    continue;
+                }
+                let k = out[i];
+                if k == blank_id {
+                    time[i] += 1;
+                    symbols[i] = 0;
+                } else {
+                    texts[i].push_str(&self.vocabulary[k]);
+                    emissions[i].push(TokenEmission { token_id: k, frame: time[i] });
+                    prev[i] = k;
+                    commit_lanes[i] = true;
+                    any_commit = true;
+                    symbols[i] += 1;
+                    if symbols[i] >= max_symbols {
+                        time[i] += 1;
+                        symbols[i] = 0;
+                    }
+                }
+            }
+            if any_commit {
+                // Promote the emitting lanes' tentative state FIRST — the next
+                // predictor round must consume the post-emission committed
+                // state (mirrors lockstep's step-then-commit order; predicting
+                // first re-reads the pre-emission state and drops tokens).
+                step.commit(&commit_lanes);
+                step.predict(&prev).map_err(|e| BackendSnafu { frame: time[0] }.into_error(e))?;
             }
         }
 

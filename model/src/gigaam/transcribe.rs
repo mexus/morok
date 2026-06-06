@@ -29,7 +29,7 @@ use crate::gigaam::ctc::GigaAmCtcJit;
 use crate::gigaam::jit::GigaAmEncoderJit;
 use crate::gigaam::model::{GigaAm, Head};
 use crate::gigaam::profile::{Stage, StageProfile, TranscribeProfile};
-use crate::gigaam::rnnt::RnntStepBackend;
+use crate::gigaam::rnnt::RnntLabelBackend;
 use crate::jit::InputSpec;
 
 /// User-facing knobs for [`Transcriber::transcribe`].
@@ -140,13 +140,13 @@ pub struct ChunkResult {
 }
 
 /// Per-head decoder + JIT state. CTC needs a bounds-tied head JIT (Conv1d
-/// projection); RN-T's predictor/joint JITs ride with [`RnntStepBackend`].
+/// projection); RN-T's predictor/joint JITs ride with [`RnntLabelBackend`].
 /// One instance per `Transcriber`, so the variant-size disparity is
 /// irrelevant — boxing would just add an allocation.
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum HeadDecoder {
     Ctc { jit: GigaAmCtcJit, decoder: CtcDecoder },
-    Rnnt { backend: RnntStepBackend, decoder: RnntDecoder, sentencepiece: bool },
+    Rnnt { backend: RnntLabelBackend, decoder: RnntDecoder, sentencepiece: bool },
 }
 
 /// CTC equivalent of [`RnntDecoder::frames_to_words`].
@@ -334,7 +334,7 @@ impl<S: Splitter> Transcriber<S> {
                 // (steps per wave = max frames in the wave, not the sum).
                 // State per lane is tiny; 32 lanes ≈ a chunked long file.
                 const DECODE_LANES: usize = 32;
-                let backend = RnntStepBackend::from_model(model.clone(), DECODE_LANES).context(JitSnafu)?;
+                let backend = RnntLabelBackend::from_model(model.clone(), DECODE_LANES).context(JitSnafu)?;
                 let decoder = RnntDecoder::new(
                     runtime.vocabulary.clone(),
                     RnntOpts { max_symbols_per_step: runtime.max_symbols_per_step },
@@ -608,7 +608,7 @@ impl<S: Splitter> Transcriber<S> {
         // RN-T: decode every chunk in lane waves as wide as the backend
         // (steps per wave = the wave's max frames, not the sum over batches).
         if let HeadDecoder::Rnnt { backend, decoder, sentencepiece } = &mut self.head_decoder {
-            let lanes = svod_arch::rnnt::BatchJointStep::batch(backend);
+            let lanes = svod_arch::rnnt::BatchLabelStep::batch(backend);
             if profile.is_some() {
                 backend.profile_next_step();
             }
@@ -618,7 +618,7 @@ impl<S: Splitter> Transcriber<S> {
 
                 let t_dec = Instant::now();
                 backend.bind_batch(all_frames[wave_start..wave_end].to_vec());
-                let lane_results = decoder.decode_batch(valid, backend).map_err(rnnt_decode_err)?;
+                let lane_results = decoder.decode_batch_labels(valid, backend).map_err(rnnt_decode_err)?;
                 t_decode += t_dec.elapsed();
 
                 for (li, (raw, emissions)) in lane_results.into_iter().enumerate() {
@@ -632,6 +632,20 @@ impl<S: Splitter> Transcriber<S> {
                     chunk_results.push(ChunkResult { start_sec, end_sec, text, words });
                 }
             }
+        }
+
+        if let HeadDecoder::Rnnt { backend, .. } = &self.head_decoder {
+            let s = &backend.stats;
+            tracing::info!(
+                target: "svod_model::gigaam::transcribe",
+                n_steps = s.n_steps,
+                n_commits = s.n_commits,
+                pack_ms = s.t_pack.as_secs_f64() * 1e3,
+                exec_ms = s.t_exec.as_secs_f64() * 1e3,
+                read_ms = s.t_read.as_secs_f64() * 1e3,
+                commit_ms = s.t_commit.as_secs_f64() * 1e3,
+                "rnnt step stats",
+            );
         }
 
         // For RN-T the predictor/joint dispatches fold into `decode_ms`.

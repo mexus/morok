@@ -3,7 +3,7 @@ use std::convert::Infallible;
 
 use proptest::prelude::*;
 
-use crate::rnnt::{BatchJointStep, JointStep, RnntDecoder, RnntOpts, TokenEmission, Word};
+use crate::rnnt::{BatchJointStep, BatchLabelStep, JointStep, RnntDecoder, RnntOpts, TokenEmission, Word};
 
 /// NaN-safe argmax — the device backend computes the joint argmax on-GPU and
 /// returns the index; the mock mirrors that over its scripted logits. NaN is
@@ -116,6 +116,63 @@ impl BatchJointStep for MockBatchStep {
                 self.commits[i] += 1;
             }
         }
+    }
+
+    fn reset(&mut self) {
+        self.resets += 1;
+        self.cursors.fill(0);
+    }
+}
+
+/// Label-looping mock: same per-lane scripts as [`MockBatchStep`] (each lane
+/// consumes its script in its own joint-call order), plus counters proving the
+/// predictor only runs on emission rounds.
+struct MockBatchLabelStep {
+    scripts: Vec<Vec<usize>>,
+    cursors: Vec<usize>,
+    pub commits: Vec<usize>,
+    pub predicts: usize,
+    pub joints: usize,
+    pub resets: usize,
+}
+
+impl MockBatchLabelStep {
+    fn new(scripts: Vec<Vec<usize>>) -> Self {
+        let lanes = scripts.len();
+        Self { scripts, cursors: vec![0; lanes], commits: vec![0; lanes], predicts: 0, joints: 0, resets: 0 }
+    }
+}
+
+impl BatchLabelStep for MockBatchLabelStep {
+    type Error = Infallible;
+
+    fn batch(&self) -> usize {
+        self.scripts.len()
+    }
+
+    fn predict(&mut self, _prev: &[usize]) -> Result<(), Self::Error> {
+        self.predicts += 1;
+        Ok(())
+    }
+
+    fn commit(&mut self, lanes: &[bool]) {
+        for (i, &c) in lanes.iter().enumerate() {
+            if c {
+                self.commits[i] += 1;
+            }
+        }
+    }
+
+    fn joint(&mut self, _t: &[usize], active: &[bool], out: &mut [usize]) -> Result<(), Self::Error> {
+        self.joints += 1;
+        for i in 0..self.scripts.len() {
+            if active[i] {
+                let idx = self.cursors[i].min(self.scripts[i].len() - 1);
+                self.cursors[i] += 1;
+                out[i] = self.scripts[i][idx];
+            }
+        }
+        Ok(())
     }
 
     fn reset(&mut self) {
@@ -432,6 +489,47 @@ fn test_rnnt_batch_fewer_items_than_lanes() {
     assert_eq!(out.len(), 2);
     assert_eq!((out[0].0.as_str(), out[1].0.as_str()), ("b", "a"));
     assert_eq!(&batch.commits[2..], &[0, 0], "padding lanes never commit");
+}
+
+// ─── decode_batch_labels ──────────────────────────────────────────────────
+
+/// Label-looping must reproduce lockstep `decode_batch` exactly: same texts,
+/// emissions, and commit counts per lane (greedy is lane-independent).
+fn assert_labels_match_lockstep(scripts: Vec<Vec<usize>>, valid_frames: Vec<usize>, max_symbols: usize) {
+    let decoder = decoder_with(abc_vocab(), max_symbols);
+    let mut lockstep = MockBatchStep::new(scripts.clone());
+    let expected = decoder.decode_batch(&valid_frames, &mut lockstep).unwrap();
+
+    let mut labels = MockBatchLabelStep::new(scripts);
+    let got = decoder.decode_batch_labels(&valid_frames, &mut labels).unwrap();
+
+    assert_eq!(got, expected);
+    assert_eq!(labels.commits, lockstep.commits);
+    assert_eq!(labels.resets, 1);
+}
+
+#[test_case::test_case(vec![vec![0, 3, 1, 3], vec![3; 4], vec![0, 1, 2, 0, 1, 2, 3, 3, 3]], vec![2, 1, 3], 2; "ragged with cap")]
+#[test_case::test_case(vec![vec![3; 8]], vec![8], 10; "blank only")]
+#[test_case::test_case(vec![vec![0, 1, 2, 3], vec![2, 3, 1, 3]], vec![2, 2], 10; "multi emit")]
+#[test_case::test_case(vec![vec![0, 3], vec![0, 3]], vec![1, 0], 10; "zero valid lane")]
+fn test_rnnt_labels_match_lockstep(scripts: Vec<Vec<usize>>, valid: Vec<usize>, max_symbols: usize) {
+    assert_labels_match_lockstep(scripts, valid, max_symbols);
+}
+
+#[test]
+fn test_rnnt_labels_predictor_runs_only_on_emission_rounds() {
+    let blank = abc_vocab().len();
+    let decoder = decoder_with(abc_vocab(), 10);
+    // 4 blank-only frames: predictor must run exactly once (the empty prefix).
+    let mut labels = MockBatchLabelStep::new(vec![vec![blank; 4]]);
+    decoder.decode_batch_labels(&[4], &mut labels).unwrap();
+    assert_eq!(labels.predicts, 1, "blank advances must not invoke the predictor");
+    assert_eq!(labels.joints, 4);
+
+    // 1 frame, 2 emissions + blank: 1 prefix + 2 emission rounds.
+    let mut labels = MockBatchLabelStep::new(vec![vec![0, 1, blank]]);
+    decoder.decode_batch_labels(&[1], &mut labels).unwrap();
+    assert_eq!(labels.predicts, 3);
 }
 
 // ─── frames_to_words ──────────────────────────────────────────────────────
