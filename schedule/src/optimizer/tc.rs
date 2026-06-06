@@ -111,20 +111,6 @@ fn get_range_size(range: &Arc<UOp>) -> Option<i64> {
     None
 }
 
-/// True if the range's extent is provably a multiple of `tile`: const fast
-/// path, then the algebraic `UOp::divides` proof for symbolic ends (a `16*ts`
-/// extent proves, a bare var does not). TC lowering with an unproven extent
-/// reads/writes out of tile, so callers must hard-fail on `false`.
-fn provably_divisible(range: &Arc<UOp>, tile: usize) -> bool {
-    if let Some(size) = get_range_size(range) {
-        return (size as usize).is_multiple_of(tile);
-    }
-    if let Op::Range { end, .. } = range.op() {
-        return end.divides(tile as i64).is_some();
-    }
-    false
-}
-
 // ============================================================================
 // SELECTION
 // ============================================================================
@@ -313,16 +299,13 @@ fn apply_axis_choice_impl(
                         padding_ops.push((i, axis_idx, tc_dim));
                     }
                 }
-                // PADTO can't pad an unknown extent, so a symbolic dim must
-                // carry its own proof of divisibility or the TC is invalid.
-                None if !provably_divisible(axis, tc_dim) => {
-                    return ValidationFailedSnafu {
-                        op: "TC",
-                        reason: "symbolic dimension not provably divisible by tensor core size",
-                    }
-                    .fail();
+                // PADTO can't pad an unknown extent, and even a provably
+                // divisible symbolic axis fires pathological tilings in the
+                // divisibility-keyed heuristics — symbolic axes never TC.
+                None => {
+                    return ValidationFailedSnafu { op: "TC", reason: "symbolic dimension cannot use tensor cores" }
+                        .fail();
                 }
-                None => {}
             }
         }
 
@@ -341,21 +324,21 @@ fn apply_axis_choice_impl(
             axes[axes_idx] = scheduler.rngs()[scheduler_idx].clone();
         }
     } else {
-        // Without tc_opt >= 2, reject non-divisible dimensions (symbolic dims
-        // must prove divisibility — silently skipping them lowers a tile loop
-        // over an extent the tile may not cover).
+        // Without tc_opt >= 2, reject non-divisible dimensions. Symbolic dims
+        // never TC: silently skipping the check lowers a tile loop over an
+        // extent the tile may not cover.
         for (i, axis) in axes.iter().enumerate() {
             let tc_dim = match i {
                 0 => tc.dims.0,
                 1 => tc.dims.1,
                 _ => tc.dims.2,
             };
-            if !provably_divisible(axis, tc_dim) {
-                return ValidationFailedSnafu {
-                    op: "TC",
-                    reason: "dimension not provably divisible by tensor core size",
+            match get_range_size(axis) {
+                Some(size) if (size as usize).is_multiple_of(tc_dim) => {}
+                _ => {
+                    return ValidationFailedSnafu { op: "TC", reason: "dimension not divisible by tensor core size" }
+                        .fail();
                 }
-                .fail();
             }
         }
     }
