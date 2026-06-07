@@ -83,6 +83,11 @@ pub struct MemoryManager<P: PhysMem> {
     reserve_ptable: bool,
     root_pt: u64,
     palloc_ranges: Vec<(u64, u64)>,
+    /// Offset added to VRAM physical addresses when they are written into page-
+    /// table entries (the GPU MC / XGMI base), and subtracted when a child-table
+    /// pointer is read back for CPU walk. 0 unless [`set_mc_base`] is called.
+    /// CPU/BAR access and the TLSF allocators stay in raw-paddr space.
+    mc_base: u64,
 }
 
 impl<P: PhysMem> MemoryManager<P> {
@@ -118,10 +123,18 @@ impl<P: PhysMem> MemoryManager<P> {
             reserve_ptable,
             root_pt: 0,
             palloc_ranges,
+            mc_base: 0,
         };
         // Root page table (zeroed so every slot starts invalid).
         mm.root_pt = mm.palloc(0x1000, 0x1000, true, true).expect("root page table");
         mm
+    }
+
+    /// Set the GPU MC/XGMI base added to VRAM paddrs in page-table entries.
+    /// Call once after construction, before any mapping.
+    #[inline]
+    pub fn set_mc_base(&mut self, mc_base: u64) {
+        self.mc_base = mc_base;
     }
 
     #[inline]
@@ -170,7 +183,9 @@ impl<P: PhysMem> MemoryManager<P> {
     }
     #[inline]
     fn pt_child(&self, table_paddr: u64, idx: usize) -> u64 {
-        pagetable::entry_paddr(self.entry(table_paddr, idx))
+        // Child-table pointers are stored as MC addresses; recover the raw
+        // paddr for CPU/BAR walk.
+        pagetable::entry_paddr(self.entry(table_paddr, idx)) - self.mc_base
     }
     #[inline]
     fn pt_is_page(&self, lv: usize, table_paddr: u64, idx: usize) -> bool {
@@ -191,7 +206,10 @@ impl<P: PhysMem> MemoryManager<P> {
         frag: u32,
         valid: bool,
     ) {
-        let word = pagetable::encode_entry(self.ip_ver, lv, paddr, is_table, uncached, system, snooped, frag, valid);
+        // Page-table entries hold GPU MC addresses for VRAM (table pointers are
+        // always VRAM); host system pages (Sys) are addressed as-is.
+        let stored = if system { paddr } else { paddr + self.mc_base };
+        let word = pagetable::encode_entry(self.ip_ver, lv, stored, is_table, uncached, system, snooped, frag, valid);
         self.phys.write_u64(table_paddr + (idx as u64) * 8, word);
     }
 

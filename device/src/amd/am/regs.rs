@@ -46,12 +46,32 @@ impl RegDef {
         acc
     }
 
+    /// Read-modify-write: clear each named field's bits in `base` and OR in the
+    /// new value (so reserved/ECO bits the PF set are preserved). Panics on an
+    /// unknown field name.
+    pub fn encode_onto(&self, mut base: u64, values: &[(&str, u32)]) -> u64 {
+        for (name, v) in values {
+            let f = self.field(name).unwrap_or_else(|| panic!("register {} has no field {name}", self.name));
+            let width = (f.hi - f.lo + 1) as u32;
+            let mask = if width >= 64 { u64::MAX } else { (1u64 << width) - 1 };
+            base = (base & !(mask << f.lo)) | (((*v as u64) & mask) << f.lo);
+        }
+        base
+    }
+
     /// Extract a field's value from a register word.
     pub fn get(&self, val: u64, name: &str) -> u32 {
         let f = self.field(name).unwrap_or_else(|| panic!("register {} has no field {name}", self.name));
         let width = (f.hi - f.lo + 1) as u32;
         let mask = if width >= 64 { u64::MAX } else { (1u64 << width) - 1 };
         ((val >> f.lo) & mask) as u32
+    }
+}
+
+impl RegDef {
+    /// Absolute MMIO dword index for instance bases from IP discovery.
+    pub fn dword_index(&self, bases: &[u64]) -> usize {
+        bases[self.segment as usize] as usize + self.offset as usize
     }
 }
 

@@ -21,7 +21,7 @@ import os
 import sys
 
 # (rust_static_name, regs.py module attr, prefix, (maj, min, rev))
-# gfx1151 / Strix Halo target set (see memory amd-hw-is-strix-halo-gfx1151-apu).
+# gfx1151 / Strix Halo + gfx942 / MI300X (Aqua Vanjaram) target sets.
 # Widen this list + re-run to add another arch.
 MODULES = [
     ("GC_11_5_0", "gc_11_5_0", "gc", (11, 5, 0)),
@@ -30,6 +30,14 @@ MODULES = [
     ("NBIO_7_11_0", "nbio_7_11_0", "nbio", (7, 11, 0)),
     ("HDP_6_0_0", "hdp_6_0_0", "hdp", (6, 0, 0)),
     ("OSSSYS_6_0_0", "osssys_6_0_0", "osssys", (6, 0, 0)),
+    ("GC_9_4_3", "gc_9_4_3", "gc", (9, 4, 3)),
+    ("MMHUB_1_8_0", "mmhub_1_8_0", "mmhub", (1, 8, 0)),
+    ("MP_13_0_0", "mp_13_0_0", "mp", (13, 0, 0)),
+    ("MP_11_0_0", "mp_11_0_0", "mp", (11, 0, 0)),
+    ("NBIO_7_9_0", "nbio_7_9_0", "nbio", (7, 9, 0)),
+    ("HDP_4_4_2", "hdp_4_4_2", "hdp", (4, 4, 2)),
+    ("OSSSYS_4_4_2", "osssys_4_4_2", "osssys", (4, 4, 2)),
+    ("SDMA_4_4_2", "sdma_4_4_2", "sdma", (4, 4, 2)),
 ]
 
 

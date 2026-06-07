@@ -22,6 +22,43 @@ pub trait PhysMem {
     fn zero(&mut self, paddr: u64, size: u64);
 }
 
+/// [`PhysMem`] backed by the CPU-mapped VRAM BAR (BAR0). Page-table physical
+/// addresses are 0-based VRAM offsets, which map directly into the BAR, so the
+/// page tables are written straight through the aperture.
+pub struct VramPhys {
+    base: *mut u8,
+    len: usize,
+}
+
+// SAFETY: the backing is a fixed MMIO mapping; concurrent table edits are
+// serialized by the owning driver (one MemoryManager behind a mutex).
+unsafe impl Send for VramPhys {}
+unsafe impl Sync for VramPhys {}
+
+impl VramPhys {
+    /// `bar0_ptr`/`bar0_len` come from the mapped VRAM BAR. Safe to use for the
+    /// whole BAR; the manager only ever touches addresses below the reserved
+    /// page-table / data region.
+    pub fn new(bar0_ptr: *mut u8, bar0_len: usize) -> Self {
+        Self { base: bar0_ptr, len: bar0_len }
+    }
+}
+
+impl PhysMem for VramPhys {
+    fn read_u64(&self, paddr: u64) -> u64 {
+        assert!((paddr as usize) + 8 <= self.len, "VRAM read_u64 out of bounds");
+        unsafe { (self.base.add(paddr as usize) as *const u64).read_volatile() }
+    }
+    fn write_u64(&mut self, paddr: u64, val: u64) {
+        assert!((paddr as usize) + 8 <= self.len, "VRAM write_u64 out of bounds");
+        unsafe { (self.base.add(paddr as usize) as *mut u64).write_volatile(val) }
+    }
+    fn zero(&mut self, paddr: u64, size: u64) {
+        assert!((paddr + size) as usize <= self.len, "VRAM zero out of bounds");
+        unsafe { std::ptr::write_bytes(self.base.add(paddr as usize), 0, size as usize) }
+    }
+}
+
 /// Where a mapping's physical pages live. gfx11 cares about `Phys` (device
 /// VRAM) vs `Sys` (host system memory, sets the PTE SYSTEM bit).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

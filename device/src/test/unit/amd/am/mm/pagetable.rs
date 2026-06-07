@@ -107,8 +107,50 @@ fn gfx12_pte_is_gated() {
     let _ = get_pte_flags((12, 0, 0), VM_PTB, false, 0, false, false, false, true);
 }
 
+const GFX942: IpVer = (9, 4, 3);
+
 #[test]
-#[should_panic(expected = "gfx9")]
-fn gfx9_pte_is_gated() {
-    let _ = get_pte_flags((9, 4, 2), VM_PTB, false, 0, false, false, false, true);
+fn gfx9_leaf_4k_pte_cached() {
+    let f = get_pte_flags(GFX942, VM_PTB, false, 0, false, false, false, true);
+    assert_eq!(f & PTE_VALID, PTE_VALID);
+    assert_eq!(f & (PTE_READABLE | PTE_WRITEABLE | PTE_EXECUTABLE), PTE_READABLE | PTE_WRITEABLE | PTE_EXECUTABLE);
+    assert_eq!(f & (PDE_PTE | PTE_TF), 0);
+    assert_eq!((f >> 57) & 0x3, 0, "cached → MTYPE_NC=0 in bits 57..=58");
+}
+
+#[test]
+fn gfx9_leaf_uncached_sets_mtype_uc_vg10() {
+    let f = get_pte_flags(GFX942, VM_PTB, false, 0, true, false, false, true);
+    assert_eq!((f >> 57) & 0x3, 3, "uncached → MTYPE_UC=3 in bits 57..=58 (VG10)");
+    assert_eq!((f >> MTYPE_NV10_SHIFT) & 0x7, 0, "NV10 MTYPE field stays clear on gfx9");
+}
+
+#[test]
+fn gfx9_pde_levels_set_bfs_and_tf() {
+    // PDB2 PDE: plain table pointer.
+    let pdb2 = get_pte_flags(GFX942, VM_PDB2, true, 0, false, false, false, true);
+    assert_eq!(pdb2 & (PTE_TF | PDE_PTE), 0);
+    assert_eq!(pdb2 >> 59, 0);
+    // PDB1 table: BFS(9) at bits 59..=63.
+    let pdb1 = get_pte_flags(GFX942, VM_PDB1, true, 0, false, false, false, true);
+    assert_eq!(pdb1 >> 59, 0x9, "PDB1 PDE carries AMDGPU_PDE_BFS(0x9)");
+    // PDB0 table: translate-further bit.
+    let pdb0 = get_pte_flags(GFX942, VM_PDB0, true, 0, false, false, false, true);
+    assert_ne!(pdb0 & PTE_TF, 0, "PDB0 PDE continuing to a PTB sets TF");
+    assert!(!is_pte_huge_page(GFX942, VM_PDB0, pdb0), "TF set ⇒ not a leaf");
+}
+
+#[test]
+fn gfx9_huge_leaves() {
+    // 2 MiB leaf at PDB0: no PDE_PTE, leaf-ness = absence of TF.
+    let f2m = get_pte_flags(GFX942, VM_PDB0, false, 9, false, false, false, true);
+    assert_eq!(f2m & (PDE_PTE | PTE_TF), 0);
+    assert!(is_pte_huge_page(GFX942, VM_PDB0, f2m));
+    // 1 GiB leaf at PDB1 carries PDE_PTE like gfx11.
+    let f1g = get_pte_flags(GFX942, VM_PDB1, false, 18, false, false, false, true);
+    assert_ne!(f1g & PDE_PTE, 0);
+    assert!(is_pte_huge_page(GFX942, VM_PDB1, f1g));
+    // A 4K PTB leaf is never reported huge.
+    let f4k = get_pte_flags(GFX942, VM_PTB, false, 0, false, false, false, true);
+    assert!(!is_pte_huge_page(GFX942, VM_PTB, f4k));
 }

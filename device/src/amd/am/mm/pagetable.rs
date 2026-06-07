@@ -3,11 +3,11 @@
 //! Pure bit/arithmetic logic — no MMIO, no backing store — so it is fully
 //! unit-tested against the AMD hardware's exact constants.
 //!
-//! **gfx11 / RDNA3 is implemented and tested.** The arch split is by the
-//! `ip_ver` tuple read from IP discovery (the GC IP-block version),
-//! exactly where gfx9 (VG10) and gfx12 differ — those branches are marked and
-//! filled in when their hardware can validate them. The page-table *shape*
-//! (4-level / 48-bit) is shared across gfx9/11/12, so geometry does not branch.
+//! **gfx11 / RDNA3 and gfx9 / CDNA (MI300X) are implemented and tested.** The
+//! arch split is by the `ip_ver` tuple read from IP discovery (the GC IP-block
+//! version); the gfx12 branch is marked and filled in when its hardware can
+//! validate it. The page-table *shape* (4-level / 48-bit) is shared across
+//! gfx9/11/12, so geometry does not branch.
 
 /// `64 - leading_zeros` (Python `int.bit_length`). `bit_length(0) == 0`.
 #[inline]
@@ -23,8 +23,16 @@ pub const PTE_TMZ: u64 = 1 << 3;
 pub const PTE_EXECUTABLE: u64 = 1 << 4;
 pub const PTE_READABLE: u64 = 1 << 5;
 pub const PTE_WRITEABLE: u64 = 1 << 6;
-/// Huge-page / "this PDE slot is actually a PTE" bit (gfx10/11).
+/// Huge-page / "this PDE slot is actually a PTE" bit (gfx9/10/11).
 pub const PDE_PTE: u64 = 1 << 54;
+/// gfx9 "translate further" bit: a PDB0 *table* entry that continues to a PTB.
+pub const PTE_TF: u64 = 1 << 56;
+
+/// gfx9 PDE "block fragment size" field at bits 59..=63 (`AMDGPU_PDE_BFS`).
+#[inline]
+pub fn pde_bfs(frag: u64) -> u64 {
+    frag << 59
+}
 
 /// Fragment field is bits 7..=11 (5 bits): `(frag & 0x1f) << 7`.
 #[inline]
@@ -36,6 +44,10 @@ pub fn pte_frag(frag: u32) -> u64 {
 const MTYPE_NV10_SHIFT: u32 = 48;
 /// gfx11 uncached memory type (`soc_11.MTYPE_UC`).
 const MTYPE_UC_GFX11: u64 = 3;
+/// MTYPE field for gfx9 (VG10) is bits 57..=58.
+const MTYPE_VG10_SHIFT: u32 = 57;
+/// gfx9 uncached memory type (`soc_9.MTYPE_UC`).
+const MTYPE_UC_GFX9: u64 = 3;
 
 /// Physical-address field: bits 12..=47 (page-aligned, 36 bits).
 pub const PADDR_MASK: u64 = 0x0000_FFFF_FFFF_F000;
@@ -139,26 +151,36 @@ pub fn get_pte_flags(
             extra |= PDE_PTE;
         }
     } else {
-        // gfx9 (VG10/CDNA): MTYPE at bit 57 (2-bit); PDB1 tables set BFS(0x9),
-        // PDB0 tables set TF, leaves above PDB0 set PDE_PTE. Captured for the
-        // arch-parametric structure but not validated on hardware.
-        unimplemented!(
-            "gfx9 VG10 PTE encoding — captured for the arch-parametric structure but not yet validated on hardware"
-        );
+        // gfx9 (VG10/CDNA): MTYPE at bits 57..=58; PDB1 tables set BFS(0x9),
+        // PDB0 tables set TF (translate further), leaves above PDB0 set
+        // PDE_PTE — a 2 MiB leaf at PDB0 is implied by the *absence* of TF.
+        let mtype = if uncached { MTYPE_UC_GFX9 } else { 0 };
+        extra |= mtype << MTYPE_VG10_SHIFT;
+        if is_table && pte_lv == VM_PDB1 {
+            extra |= pde_bfs(0x9);
+        }
+        if is_table && pte_lv == VM_PDB0 {
+            extra |= PTE_TF;
+        }
+        if !is_table && pte_lv != VM_PTB && pte_lv != VM_PDB0 {
+            extra |= PDE_PTE;
+        }
     }
     extra
 }
 
 /// Is `pte` (at level `pte_lv`) a leaf page rather than a child-table pointer?
 /// Port of `AM_GMC.is_pte_huge_page` (gfx10/11 path = the `PDE_PTE` bit).
-pub fn is_pte_huge_page(ip_ver: IpVer, _pte_lv: usize, pte: u64) -> bool {
+pub fn is_pte_huge_page(ip_ver: IpVer, pte_lv: usize, pte: u64) -> bool {
     if ip_ge(ip_ver, 12) {
         unimplemented!("gfx12 huge-page bit — bring up with hardware validation");
     }
     if ip_ge(ip_ver, 10) {
         return pte & PDE_PTE != 0;
     }
-    unimplemented!("gfx9 huge-page bit — bring up with hardware validation");
+    // gfx9: leaves above PDB0 carry PDE_PTE; at PDB0 a leaf is the *absence*
+    // of the translate-further bit.
+    if pte_lv == VM_PDB0 { pte & PTE_TF == 0 } else { pte & PDE_PTE != 0 }
 }
 
 /// The full PTE/PDE word: flags `|` page-aligned physical address. Port of

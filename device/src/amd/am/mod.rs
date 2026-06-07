@@ -16,5 +16,12 @@
 //! inline `if ip_ver >= (X,Y,Z)` branches inside shared modules. gfx11 is wired
 //! now; the rest are data adds.
 
+pub mod dev;
+pub mod discovery;
+pub mod ip;
+pub mod mailbox;
 pub mod mm;
+pub mod pci;
+pub mod regaccess;
 pub mod regs;
+pub mod rlcg;
