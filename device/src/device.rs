@@ -66,10 +66,20 @@ pub trait Program: Send + Sync {
     fn name(&self) -> &str;
 
     /// Downcast hook so a backend graph factory can recover its concrete
-    /// program (e.g. AMD rsrc/prog_addr) to pre-build dispatch packets.
-    /// Default returns nothing graphable.
+    /// program type (to read backend-specific fields) when pre-building dispatch
+    /// packets. Default returns nothing graphable.
     fn as_any(&self) -> &dyn std::any::Any {
         &()
+    }
+
+    /// Mint a reusable per-plan execution context, or `None` for per-call
+    /// dispatch. An `ExecutionPlan` calls this once on its first kernel's
+    /// program and reuses the returned context for every dispatch, so all the
+    /// plan's kernels share one queue (distinct plans → distinct queues for
+    /// cross-plan parallelism). Default `None`: the backend's `execute` is
+    /// already self-contained (CPU), so the plan dispatches per-call.
+    fn new_exec_context(&self) -> Result<Option<Box<dyn PlanContext>>> {
+        Ok(None)
     }
 }
 
@@ -93,13 +103,43 @@ pub struct GraphKernel<'a> {
 }
 
 /// A pre-captured kernel chain replayed with one submit. Backends that can
-/// pre-build their dispatch packets (AMD indirect buffer) implement this so
-/// repeated inference pays per-graph, not per-kernel, launch cost. Replay is
-/// equivalent to running every captured kernel in order.
+/// pre-build their dispatch packets implement this so repeated inference pays
+/// per-graph, not per-kernel, launch cost. Replay is equivalent to running every
+/// captured kernel in order.
 pub trait Graph: Send + Sync {
     /// Re-dispatch the captured chain. `vals` are positional updated launch
     /// vars (same order as capture); empty replays the baked-in values.
     fn replay(&self, vals: &[i64]) -> Result<()>;
+}
+
+/// A reusable per-plan execution context: a lease of device-level dispatch
+/// resources (e.g. an AMD queue from the pool) held by an `ExecutionPlan` for
+/// its lifetime so every kernel in the plan dispatches onto the same queue.
+/// Minted by [`Program::new_exec_context`]; backends with no reusable context
+/// (CPU) return `None` and the plan falls back to per-call [`Program::execute`].
+pub trait PlanContext: Send + Sync {
+    /// Dispatch one kernel of the plan onto this context. `program` belongs to
+    /// the same plan and therefore the same backend that minted this context
+    /// (a plan is single-device) — a construction invariant, not a runtime
+    /// check. Returns a per-dispatch timestamp handle when the backend stamps
+    /// dispatches (`None` otherwise). Submits asynchronously like
+    /// [`Program::execute`] with `wait=false`.
+    ///
+    /// # Safety
+    ///
+    /// Same contract as [`Program::execute`]: buffer pointers must be valid and
+    /// correctly sized, and the caller must avoid data races.
+    unsafe fn dispatch(
+        &self,
+        program: &dyn Program,
+        buffers: &[*mut u8],
+        vals: &[i64],
+        global_size: Option<[usize; 3]>,
+        local_size: Option<[usize; 3]>,
+    ) -> Result<Option<Arc<dyn crate::DispatchTimestamps>>>;
+
+    /// Drain this context's in-flight work (profiled-timestamp harvest).
+    fn synchronize(&self) -> Result<()>;
 }
 
 /// Compilation result carrying source (JIT) or bytes (AOT).
@@ -455,10 +495,11 @@ pub trait Renderer: Send + Sync {
     /// This is used for cache key construction and device selection.
     fn device(&self) -> &DeviceSpec;
 
-    /// AMD arch backing this renderer, if any. Arch is a hardware property of
-    /// the opened device (not the `DeviceSpec`), so AMD backends expose it here
-    /// to pick the matching optimizer profile. Non-AMD renderers return `None`.
-    fn amd_arch(&self) -> Option<svod_dtype::AmdArch> {
+    /// The GPU architecture this renderer targets, if any. Arch is a hardware
+    /// property of the opened device (not the `DeviceSpec`), surfaced here so
+    /// the scheduler can pick the matching optimizer profile (wave size, matrix
+    /// cores, …). CPU and backends without an arch distinction return `None`.
+    fn gpu_arch(&self) -> Option<svod_dtype::GpuArch> {
         None
     }
 
@@ -491,7 +532,8 @@ pub type RuntimeFactory = Arc<dyn Fn(&CompiledSpec) -> Result<Box<dyn Program>> 
 
 /// Builds a replayable graph from a captured kernel chain. Returns `Ok(None)`
 /// when this backend can't graph the chain (then callers fall back to per-call
-/// dispatch). AMD pre-builds an indirect buffer; CPU has no factory.
+/// dispatch). A graphing backend pre-builds its dispatch packets; CPU has no
+/// factory.
 pub type GraphFactory = Arc<dyn Fn(&[GraphKernel<'_>]) -> Result<Option<Box<dyn Graph>>> + Send + Sync>;
 
 /// A (Renderer, Compiler) pair for a specific backend.
@@ -541,7 +583,8 @@ pub struct Device {
     pub runtime: RuntimeFactory,
 
     /// Optional graph factory for capture/replay. `None` means per-call
-    /// dispatch only (CPU); AMD installs one to build indirect-buffer graphs.
+    /// dispatch only (CPU); a graphing backend installs one to capture/replay
+    /// kernel chains.
     pub graph: Option<GraphFactory>,
 }
 
@@ -909,7 +952,7 @@ impl ProgramSpec {
         // here causes a dispatch-vs-IR mismatch: the meta-supplied
         // `global_size` is in kernel-name positional order ([g_x_size,
         // g_y_size]) but the SPECIAL UOps (post-gpudims `reverse=true`) may
-        // assign axes to gidx in the opposite order, so the AQL/PM4 dispatch
+        // assign axes to gidx in the opposite order, so the GPU dispatch
         // packet ends up with grid_size_x grid_size_y swapped relative to
         // what the LLVM IR's `workgroup.id.x` / `workgroup.id.y` use —
         // manifests as a 21× OOB on `r_g1375g64...` (`Phase 10/11`).

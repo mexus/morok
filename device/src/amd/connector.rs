@@ -469,3 +469,34 @@ impl std::fmt::Debug for OwnerCtx {
         f.debug_struct("OwnerCtx").finish_non_exhaustive()
     }
 }
+
+/// An `OwnerCtx` IS the per-plan execution context: it holds the leased queue
+/// for the plan's lifetime, so every kernel dispatches onto the same ring.
+impl crate::device::PlanContext for OwnerCtx {
+    unsafe fn dispatch(
+        &self,
+        program: &dyn crate::device::Program,
+        buffers: &[*mut u8],
+        vals: &[i64],
+        global_size: Option<[usize; 3]>,
+        local_size: Option<[usize; 3]>,
+    ) -> Result<Option<Arc<dyn crate::DispatchTimestamps>>> {
+        // A plan is single-backend, and this context was minted by one of its
+        // AmdPrograms, so every kernel it dispatches is an AmdProgram. The
+        // downcast recovers our own concrete type — a construction invariant,
+        // not a runtime check.
+        let amd = program
+            .as_any()
+            .downcast_ref::<crate::amd::AmdProgram>()
+            .expect("AMD PlanContext dispatched a non-AMD program");
+        self.pool().ensure_has_local_memory(amd.private_segment_size())?;
+        let sig = unsafe {
+            amd.execute_on(self, buffers, vals, global_size, local_size, /*wait=*/ false)?
+        };
+        Ok(sig.map(|s| s as Arc<dyn crate::DispatchTimestamps>))
+    }
+
+    fn synchronize(&self) -> Result<()> {
+        OwnerCtx::synchronize(self)
+    }
+}

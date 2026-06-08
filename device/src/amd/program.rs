@@ -818,6 +818,16 @@ impl Program for AmdProgram {
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
+
+    /// Lease a shared `PoolQueue` from the per-core pool and hand it back as the
+    /// plan's reusable execution context. Distinct plans spread onto distinct
+    /// queues (cross-queue parallelism); the lease is held for the plan's
+    /// lifetime. Mirrors the per-call lease in `execute`, but the plan keeps it.
+    fn new_exec_context(&self) -> Result<Option<Box<dyn crate::device::PlanContext>>> {
+        let alloc = crate::amd::AmdAllocator::new(self.device_id)?;
+        let owner = self.dev.core().assign_owner(&alloc)?;
+        Ok(Some(Box::new(owner)))
+    }
 }
 
 #[cfg(test)]

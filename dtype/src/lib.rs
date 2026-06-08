@@ -10,6 +10,26 @@ use std::path::PathBuf;
 
 pub use amd_arch::AmdArch;
 
+/// GPU hardware architecture a renderer/compiler targets — a backend-neutral
+/// wrapper so generic code (e.g. the scheduler's optimizer-profile selection)
+/// can carry "which GPU arch" without naming a specific backend. Extends by
+/// adding a variant per GPU backend (CUDA sm, Metal family, …); CPU has none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum GpuArch {
+    /// AMD GCN/CDNA/RDNA architecture.
+    Amd(AmdArch),
+}
+
+impl GpuArch {
+    /// The AMD arch when this is an AMD target, else `None`.
+    pub fn amd(self) -> Option<AmdArch> {
+        match self {
+            GpuArch::Amd(arch) => Some(arch),
+        }
+    }
+}
+
 /// Device specification parsed from a device string.
 ///
 /// This enum represents different compute devices that can execute kernels.

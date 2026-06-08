@@ -1596,7 +1596,8 @@ fn get_optimizer_renderer(device: &Device) -> svod_schedule::OptimizerRenderer {
         // RDNA3 if the renderer can't report arch.
         DeviceSpec::Amd { .. } => device
             .renderer
-            .amd_arch()
+            .gpu_arch()
+            .and_then(svod_dtype::GpuArch::amd)
             .map(svod_schedule::OptimizerRenderer::for_amd_arch)
             .unwrap_or_else(svod_schedule::OptimizerRenderer::amd_rdna3),
         _ => svod_schedule::OptimizerRenderer::cpu(),

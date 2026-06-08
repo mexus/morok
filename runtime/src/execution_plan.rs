@@ -286,22 +286,16 @@ pub struct ExecutionPlan {
 
     /// Captured replayable graph, built lazily on first `execute()`. `Some(None)`
     /// means the chain isn't graphable (mixed ops / non-graph device) → per-call
-    /// dispatch. Replaces N packet-builds + N doorbells with one submit; see
-    /// `svod_device::Graph` (AMD indirect buffer).
+    /// dispatch. Replaces N per-kernel submits with one; see
+    /// `svod_device::Graph`.
     graph: std::sync::OnceLock<Option<Box<dyn svod_device::Graph>>>,
 
-    /// Per-plan AMD owner context — binds this plan to a shared `PoolQueue`
-    /// from the device pool (queue + kernarg arena + scratch + PM4 counter).
-    /// Lazy-init on the first AMD kernel dispatch via
-    /// `AmdDeviceCore::assign_owner(allocator)`, where the core is shared via
-    /// `DEVICE_CACHE`. Distinct plans spread onto distinct queues for
-    /// cross-queue parallelism (or co-tenant the least-loaded queue past the
-    /// pool cap).
-    ///
-    /// Non-AMD plans never touch this field; CPU programs continue to use
-    /// `Program::execute(...)`.
-    #[cfg(target_os = "linux")]
-    amd_owner: std::sync::OnceLock<svod_device::amd::OwnerCtx>,
+    /// Reusable per-plan execution context, minted lazily from the first
+    /// kernel's program (`Program::new_exec_context`) and held for the plan's
+    /// lifetime so every kernel dispatches onto the same backend queue (distinct
+    /// plans → distinct queues for cross-plan parallelism). `Some(None)` means
+    /// the backend has no reusable context (CPU) → per-call `Program::execute`.
+    plan_ctx: std::sync::OnceLock<Option<Box<dyn svod_device::PlanContext>>>,
 }
 
 // ============================================================================
@@ -335,24 +329,24 @@ impl ExecutionPlan {
         Ok((Some(dims.global_size), dims.local_size))
     }
 
-    /// Lazily capture all kernels into a backend replay graph. Only AMD
-    /// installs a graph factory; everything else (and any non-graphable chain)
-    /// returns `None` → per-call dispatch. Gated to chains that are *all*
-    /// compiled kernels with no runtime vars: copies/views/custom or dynamic
-    /// launch dims keep the host in the loop and aren't graphed.
+    /// Lazily capture all kernels into a backend replay graph. Only backends
+    /// that provide a graph factory install one; everything else (and any
+    /// non-graphable chain) returns `None` → per-call dispatch. Gated to chains
+    /// that are *all* compiled kernels with no runtime vars: copies/views/custom
+    /// or dynamic launch dims keep the host in the loop and aren't graphed.
     fn graph(&self) -> &Option<Box<dyn svod_device::Graph>> {
         self.graph.get_or_init(|| self.build_graph().unwrap_or(None))
     }
 
     fn build_graph(&self) -> Result<Option<Box<dyn svod_device::Graph>>> {
         // Graph capture is on by default: an all-static compiled-kernel plan on a
-        // graphable device replays the whole chain as one native-AQL batch with a
-        // single doorbell, instead of the per-kernel build+doorbell round-trip.
-        // Validated against per-call across the tensor suite (incl. multi-kernel
-        // decompositions). Capture walks `op_levels` execution order, NOT the flat
-        // `op_order` topological sort (below). Non-graphable plans (runtime vars,
-        // non-AMD, PM4 single-XCC, mixed devices) fall back to per-call via the
-        // `Ok(None)` returns below.
+        // graphable device replays the whole chain as one backend submit, instead
+        // of the per-kernel dispatch round-trip. Validated against per-call across
+        // the tensor suite (incl. multi-kernel decompositions). Capture walks
+        // `op_levels` execution order, NOT the flat `op_order` topological sort
+        // (below). Non-graphable plans (runtime vars, no graph factory, chains the
+        // backend declines to capture, mixed devices) fall back to per-call via
+        // the `Ok(None)` returns below.
         let all_static_kernels =
             self.ops.iter().all(|op| matches!(op, PreparedOp::CompiledProgram(k) if k.runtime_vars.is_empty()));
         if !all_static_kernels || self.ops.is_empty() {
@@ -445,78 +439,47 @@ impl ExecutionPlan {
         factory(&kernels).map_err(|e| crate::error::Error::Execution { reason: format!("graph capture: {e}") })
     }
 
-    /// Lazy-init the plan's AMD owner context and return it. Cheap to call
-    /// repeatedly — the owner lives for the plan's lifetime. Built via
-    /// `AmdDeviceCore::assign_owner(allocator)`, which binds the plan to a
-    /// shared `PoolQueue` from the device pool; distinct plans spread onto
-    /// distinct queues for cross-queue parallelism.
-    #[cfg(target_os = "linux")]
-    fn amd_owner_for(&self, prog: &svod_device::amd::AmdProgram) -> Result<&svod_device::amd::OwnerCtx> {
-        if let Some(owner) = self.amd_owner.get() {
-            return Ok(owner);
+    /// Lazily mint (once) the plan's execution context from `program` and cache
+    /// it for the plan's lifetime. `None` ⇒ the backend has no reusable context
+    /// (CPU) and the caller dispatches per-call via `Program::execute`. The
+    /// context binds the plan to a shared queue; distinct plans spread onto
+    /// distinct queues for cross-plan parallelism.
+    fn plan_ctx(&self, program: &dyn svod_device::Program) -> Result<Option<&dyn svod_device::PlanContext>> {
+        if let Some(slot) = self.plan_ctx.get() {
+            return Ok(slot.as_deref());
         }
-        // Assign a shared queue from the per-core pool. The owner is held for
-        // the plan's lifetime (`OnceLock<OwnerCtx>` field destructor). Recover
-        // the AMD device_id from the plan's DeviceSpec; the program was loaded
-        // against the same device_id, so the allocator shares
-        // `Arc<AmdDeviceCore>` via DEVICE_CACHE.
-        let device_id = match &self.device {
-            DeviceSpec::Amd { device_id } => *device_id,
-            _ => {
-                return Err(crate::error::Error::Execution {
-                    reason: format!("amd_owner_for called on non-AMD plan (device={:?})", self.device),
-                });
-            }
-        };
-        let alloc = svod_device::amd::AmdAllocator::new(device_id)
-            .map_err(|e| crate::error::Error::Execution { reason: format!("plan allocator: {e}") })?;
-        let owner = prog
-            .device()
-            .core()
-            .assign_owner(&alloc)
-            .map_err(|e| crate::error::Error::Execution { reason: format!("assign_owner: {e}") })?;
-        // One-shot init race: if two threads see empty, both assign; only one
-        // wins `set()`. The loser's owner drops here harmlessly (its `Arc` over
-        // the shared queue just decrements).
-        let _ = self.amd_owner.set(owner);
-        Ok(self.amd_owner.get().expect("owner set above"))
+        let ctx = program
+            .new_exec_context()
+            .map_err(|e| crate::error::Error::Execution { reason: format!("exec context: {e}") })?;
+        // One-shot init race: if two threads see empty, both mint; only one wins
+        // `set()`. The loser's context drops here harmlessly (its `Arc` over the
+        // shared queue just decrements).
+        let _ = self.plan_ctx.set(ctx);
+        Ok(self.plan_ctx.get().expect("set above").as_deref())
     }
 
     /// Submit one kernel. Returns the dispatch's HW timestamp handle when the
-    /// backend stamps dispatches (AMD AQL completion signal) — `None` on PM4 /
-    /// CPU paths. The non-profiled `execute` path drops it.
+    /// backend stamps dispatches — `None` otherwise (e.g. CPU). The non-profiled
+    /// `execute` path drops it.
     #[inline]
     fn execute_kernel(&self, kernel: &PreparedKernel) -> Result<Option<Arc<dyn svod_device::DispatchTimestamps>>> {
         let buffer_ptrs: SmallVec<[*mut u8; 8]> = kernel.buffer_ptrs.iter().map(|&ptr| ptr as *mut u8).collect();
         let (global_size, local_size) = Self::kernel_launch_sizes(kernel)?;
-        // Fast path for AMD: downcast and dispatch via `execute_on` with the
-        // plan's owner context over a shared `PoolQueue`. Distinct plans spread
-        // onto distinct queues (cross-queue parallelism).
-        #[cfg(target_os = "linux")]
-        if let Some(amd) = kernel.kernel.program.as_any().downcast_ref::<svod_device::amd::AmdProgram>() {
-            let owner = self.amd_owner_for(amd)?;
-            // Grow this queue's scratch to fit the program before dispatch.
-            owner
-                .pool()
-                .ensure_has_local_memory(amd.private_segment_size())
-                .map_err(|e| crate::error::Error::Execution { reason: format!("scratch grow: {e}") })?;
-            return unsafe {
-                amd.execute_on(owner, &buffer_ptrs, &kernel.vals, global_size, local_size, /*wait=*/ false)
-                    .map(|sig| sig.map(|s| s as Arc<dyn svod_device::DispatchTimestamps>))
-                    .map_err(|e| crate::error::Error::Execution {
-                        reason: format!("Kernel {} failed: {}", kernel.id, e),
-                    })
-            };
+        let program = kernel.kernel.program.as_ref();
+        // Backends that expose a reusable context dispatch through it so all the
+        // plan's kernels share one queue. Others (CPU) return `None` and fall
+        // back to per-call `Program::execute`.
+        if let Some(ctx) = self.plan_ctx(program)? {
+            return unsafe { ctx.dispatch(program, &buffer_ptrs, &kernel.vals, global_size, local_size) }
+                .map_err(|e| crate::error::Error::Execution { reason: format!("Kernel {} failed: {e}", kernel.id) });
         }
         unsafe {
-            kernel
-                .kernel
-                .program
+            program
                 // wait=false: async submit. GPU ordering is enforced by the
                 // device timeline; host reads (copyout / as_*) synchronize.
                 .execute(&buffer_ptrs, &kernel.vals, global_size, local_size, /*wait=*/ false)
                 .map(|_| None)
-                .map_err(|e| crate::error::Error::Execution { reason: format!("Kernel {} failed: {}", kernel.id, e) })
+                .map_err(|e| crate::error::Error::Execution { reason: format!("Kernel {} failed: {e}", kernel.id) })
         }
     }
 
@@ -824,14 +787,14 @@ impl ExecutionPlan {
     /// Walks `op_levels` level-by-level and runs each op within a level in
     /// builder-insertion order. Multi-plan concurrency comes from distinct
     /// `ExecutionPlan`s (e.g. BEAM search candidates) spread onto distinct
-    /// shared `PoolQueue`s from the device pool — not from rayon inside one
+    /// backend execution contexts from the device — not from rayon inside one
     /// plan. The level-by-level iteration (vs. a flat `op_order` topological
     /// linearization) is load-bearing for iterative CPU kernels (QR, etc.)
     /// whose codegen is sensitive to within-level scheduling order — see
     /// `test_execute_walks_op_levels_in_level_order`.
     pub fn execute(&self) -> Result<()> {
-        // Fast path: one captured indirect-buffer submit instead of per-kernel
-        // packet build + doorbell. Built once, then every call just replays.
+        // Fast path: one captured graph submit instead of per-kernel dispatch.
+        // Built once, then every call just replays.
         if let Some(graph) = self.graph().as_deref() {
             return graph
                 .replay(&[])
@@ -857,14 +820,14 @@ impl ExecutionPlan {
     ///
     /// // Sort by time descending
     /// let mut sorted = profiles;
-    /// sorted.sort_by(|a, b| b.elapsed.cmp(&a.elapsed));
+    /// sorted.sort_by(|a, b| b.wall.cmp(&a.wall));
     /// for p in &sorted[..10.min(sorted.len())] {
-    ///     println!("{:>8.3}ms  {}", p.elapsed.as_secs_f64() * 1000.0, p.kernel.entry_point);
+    ///     println!("{:>8.3}ms  {}", p.wall.as_secs_f64() * 1000.0, p.kernel.entry_point);
     /// }
     /// ```
     /// Always dispatches per-kernel (never the captured graph): a graph replay
     /// has one signal per batch, so per-dispatch stamps don't exist there.
-    /// Profiled timings reflect per-doorbell execution, not graph replay.
+    /// Profiled timings reflect per-dispatch execution, not graph replay.
     pub fn execute_profiled(&self) -> Result<Vec<KernelProfile>> {
         let mut profiles = Vec::with_capacity(self.op_order.len());
         // Per-dispatch HW timestamp handles, harvested after the drain below
@@ -882,7 +845,7 @@ impl ExecutionPlan {
                             kernel: Arc::clone(&kernel.kernel),
                             device: kernel.device.clone(),
                             num_buffers: kernel.buffer_ptrs.len(),
-                            elapsed: start.elapsed(),
+                            wall: start.elapsed(),
                             gpu_start_ns: None,
                             gpu_end_ns: None,
                         });
@@ -894,12 +857,11 @@ impl ExecutionPlan {
             }
         }
         if handles.iter().any(Option::is_some) {
-            // Handles exist only on the AMD AQL path, where the plan's owner
-            // context tracks the newest in-flight signal.
-            #[cfg(target_os = "linux")]
-            if let Some(owner) = self.amd_owner.get() {
-                owner
-                    .synchronize()
+            // Handles exist only when a backend stamps dispatches, which means a
+            // context was minted; drain it so the GPU has written back the
+            // per-dispatch timestamps before we read them.
+            if let Some(ctx) = self.plan_ctx.get().and_then(|s| s.as_deref()) {
+                ctx.synchronize()
                     .map_err(|e| crate::error::Error::Execution { reason: format!("profiled drain: {e}") })?;
             }
             for (profile, handle) in profiles.iter_mut().zip(&handles) {
@@ -994,10 +956,11 @@ impl ExecutionPlan {
     }
 }
 
-// No explicit `Drop for ExecutionPlan`: the plan's `amd_owner`
-// (`OnceLock<OwnerCtx>`) just holds an `Arc` over a shared `PoolQueue`. On plan
-// drop the `Arc` decrements; the queue itself stays in the per-core pool
-// (freed only at device close), so plan churn never tears down KFD queues.
+// No explicit `Drop for ExecutionPlan`: the plan's `plan_ctx`
+// (`OnceLock<Option<Box<dyn PlanContext>>>`) just holds an `Arc` over a
+// backend-shared queue/context. On plan drop the `Arc` decrements; the
+// underlying queue stays in the backend's pool (freed only at device close), so
+// plan churn never tears down backend queues.
 
 impl std::fmt::Debug for ExecutionPlan {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1184,8 +1147,7 @@ impl ExecutionPlanBuilder {
             runtime_var_vals: HashMap::new(),
             alias_ids: self.alias_ids,
             graph: std::sync::OnceLock::new(),
-            #[cfg(target_os = "linux")]
-            amd_owner: std::sync::OnceLock::new(),
+            plan_ctx: std::sync::OnceLock::new(),
         })
     }
 }

@@ -126,8 +126,8 @@ impl Renderer for AmdRendererWrapper {
         &self.device
     }
 
-    fn amd_arch(&self) -> Option<AmdArch> {
-        Some(self.arch)
+    fn gpu_arch(&self) -> Option<svod_dtype::GpuArch> {
+        Some(svod_dtype::GpuArch::Amd(self.arch))
     }
 
     fn decompositor(&self) -> Option<svod_ir::pattern::TypedPatternMatcher<()>> {

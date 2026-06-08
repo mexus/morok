@@ -19,6 +19,7 @@ use bon::bon;
 use snafu::{ResultExt, Snafu};
 use svod_arch::ctc::CtcDecoder;
 use svod_arch::rnnt::{RnntDecoder, RnntOpts};
+use svod_runtime::{RunProfile, StageProfile};
 use svod_tensor::PrepareConfig;
 
 pub use svod_arch::rnnt::Word;
@@ -28,7 +29,6 @@ use crate::gigaam::SubsamplingMode;
 use crate::gigaam::ctc::GigaAmCtcJit;
 use crate::gigaam::jit::GigaAmEncoderJit;
 use crate::gigaam::model::{GigaAm, Head};
-use crate::gigaam::profile::{Stage, StageProfile, TranscribeProfile};
 use crate::gigaam::rnnt::RnntBlockBackend;
 use crate::jit::InputSpec;
 
@@ -108,8 +108,8 @@ impl TranscribeOpts {
 pub struct TranscribeResult {
     pub text: String,
     pub chunks: Vec<ChunkResult>,
-    /// Typed per-stage GPU profile, when [`TranscribeOpts::profile`] is set.
-    pub profile: Option<TranscribeProfile>,
+    /// Model-agnostic per-stage GPU profile, when [`TranscribeOpts::profile`] is set.
+    pub profile: Option<RunProfile>,
 }
 
 impl TranscribeResult {
@@ -398,7 +398,7 @@ impl<S: Splitter> Transcriber<S> {
         );
         let mut result = self.transcribe_chunks(waveform, sample_rate, &chunks)?;
         if let Some(profile) = &mut result.profile {
-            profile.vad = vad_wall;
+            profile.stages.insert(0, StageProfile::host("vad", vad_wall));
             tracing::info!("transcribe profile\n{profile}");
         }
         Ok(result)
@@ -482,7 +482,7 @@ impl<S: Splitter> Transcriber<S> {
         // Per-call profiling: one representative encoder batch (a steady one —
         // batch 0 pays cold caches ~6x) plus, for RN-T, one decode step.
         let profile_batch = self.opts.profile.then(|| 3.min(num_chunks.div_ceil(max_batch) - 1) * max_batch);
-        let mut profile = self.opts.profile.then(TranscribeProfile::default);
+        let mut profile = self.opts.profile.then(RunProfile::default);
         for chunk_batch_start in (0..num_chunks).step_by(max_batch) {
             let b = (num_chunks - chunk_batch_start).min(max_batch);
             let chunk_lengths: Vec<usize> = (0..b).map(|bi| chunks_meta[chunk_batch_start + bi].2).collect();
@@ -522,7 +522,7 @@ impl<S: Splitter> Transcriber<S> {
                     if profile_batch == Some(chunk_batch_start) {
                         let kernels = jit.execute_profiled().context(JitSnafu)?;
                         if let Some(p) = &mut profile {
-                            p.stages.push(StageProfile { stage: Stage::CtcHead, wall: Duration::ZERO, kernels });
+                            p.push(StageProfile::gpu("ctc_head", Duration::ZERO, kernels));
                         }
                     } else {
                         jit.execute().context(JitSnafu)?;
@@ -579,7 +579,7 @@ impl<S: Splitter> Transcriber<S> {
                     if profile_batch == Some(chunk_batch_start) {
                         let kernels = enc_jit.execute_profiled().context(JitSnafu)?;
                         if let Some(p) = &mut profile {
-                            p.stages.push(StageProfile { stage: Stage::Encoder, wall: Duration::ZERO, kernels });
+                            p.push(StageProfile::gpu("encoder", Duration::ZERO, kernels));
                         }
                     } else {
                         enc_jit.execute().context(JitSnafu)?;
@@ -659,10 +659,13 @@ impl<S: Splitter> Transcriber<S> {
         );
 
         if let Some(p) = &mut profile {
-            p.mel = t_mel;
+            // GPU stages pushed so far (encoder / ctc_head) share the accumulated
+            // encoder wall; prepend the host-only mel stage so display order is
+            // mel → encoder (vad is prepended by the caller).
             for s in &mut p.stages {
                 s.wall = t_encoder;
             }
+            p.stages.insert(0, StageProfile::host("mel", t_mel));
         }
 
         let text =
