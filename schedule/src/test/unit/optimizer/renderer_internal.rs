@@ -22,6 +22,29 @@ fn test_renderer_cuda() {
 }
 
 #[test]
+fn test_for_amd_arch_maps_each_family() {
+    use svod_dtype::AmdArch;
+    assert_eq!(Renderer::for_amd_arch(AmdArch::Gfx942).device, RendererDevice::AmdCdna3);
+    assert_eq!(Renderer::for_amd_arch(AmdArch::Gfx950).device, RendererDevice::AmdCdna4);
+    assert_eq!(Renderer::for_amd_arch(AmdArch::Gfx1100).device, RendererDevice::AmdRdna3);
+    assert_eq!(Renderer::for_amd_arch(AmdArch::Gfx1151).device, RendererDevice::AmdRdna3);
+    assert_eq!(Renderer::for_amd_arch(AmdArch::Gfx1201).device, RendererDevice::AmdRdna4);
+}
+
+#[test]
+fn test_local_max_axes_amd_caps_z_at_64() {
+    use svod_dtype::AmdArch;
+    // AMD/HIP caps the 3rd local axis at 64 below the 1024-thread product limit
+    // (tinygrad parity); other backends rely on the product cap alone.
+    for arch in [AmdArch::Gfx1151, AmdArch::Gfx1100, AmdArch::Gfx1201, AmdArch::Gfx942, AmdArch::Gfx950] {
+        assert_eq!(Renderer::for_amd_arch(arch).local_max_axes(), Some([1024, 1024, 64]), "{arch:?}");
+    }
+    assert_eq!(Renderer::cpu().local_max_axes(), None);
+    assert_eq!(Renderer::cuda().local_max_axes(), None);
+    assert_eq!(Renderer::metal().local_max_axes(), None);
+}
+
+#[test]
 fn test_tensor_core_cuda() {
     let tc = CUDA_81616.build(DType::Float16, DType::Float32);
     assert_eq!(tc.dims, (8, 16, 16));

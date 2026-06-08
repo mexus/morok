@@ -972,10 +972,11 @@ pub fn try_tensor_cores(scheduler: &mut Scheduler, config: &HeuristicsConfig) ->
         return false;
     }
 
-    let axis_choice_count = match tc::detect_matmul(scheduler) {
-        Ok(Some(pattern)) => pattern.axis_choices.len(),
+    let pattern = match tc::detect_matmul(scheduler) {
+        Ok(Some(pattern)) => pattern,
         _ => return false,
     };
+    let axis_choice_count = pattern.axis_choices.len();
 
     let mut rejections = Vec::new();
 
@@ -999,6 +1000,47 @@ pub fn try_tensor_cores(scheduler: &mut Scheduler, config: &HeuristicsConfig) ->
                 continue;
             }
         };
+
+        // Rate-neutral cores (`heuristic_pick=false`, e.g. CDNA3 fp32 MFMA ==
+        // packed-vector FLOP rate) only pay off on big tiles, where the rigid
+        // lane layout buys operand reuse; on small matmuls they pessimize.
+        // Auto-pick them only when every (pre-split) axis is large or symbolic
+        // (symbolic = the unbounded data axis). An explicit tc_select pin
+        // overrides — the caller asked for that core.
+        if config.tc_select.as_i32() < 0
+            && let Some(idx) = trial.selected_tc_index
+            && !trial.renderer().tensor_cores[idx].heuristic_pick
+        {
+            // Total MACs decide: tile reuse needs the working set to dwarf the
+            // caches (FFN-sized 6.5e9 wins ~5x; 512³ = 1.3e8 still loses to
+            // the vector path). Symbolic extents are the unbounded data axes —
+            // treat them as large.
+            const MIN_MACS: i64 = 2_000_000_000;
+            let (n, m, k) = &pattern.axis_choices[axis_choice];
+            let macs = [n, m, k]
+                .iter()
+                .map(|axis| match axis.op() {
+                    Op::Range { end, .. } => match end.op() {
+                        Op::Const(cv) => match cv.0 {
+                            svod_ir::ConstValue::Int(sz) => sz,
+                            _ => 4096,
+                        },
+                        _ => 4096, // symbolic
+                    },
+                    _ => 4096,
+                })
+                .fold(1i64, i64::saturating_mul);
+            if macs < MIN_MACS {
+                tracing::debug!(
+                    axis_choice,
+                    tc_index = idx,
+                    macs,
+                    "try_tensor_cores: rate-neutral core, too little work"
+                );
+                rejections.push((axis_choice, "rate-neutral tensor core: too little work".to_string()));
+                continue;
+            }
+        }
 
         // Record the TC opt with explicit axis choice.
         let opt = Opt::tc(

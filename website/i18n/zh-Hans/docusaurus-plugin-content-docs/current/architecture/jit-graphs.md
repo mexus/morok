@@ -4,7 +4,7 @@ sidebar_label: JIT 图
 
 # JIT 图
 
-一个流式 ASR 流水线会数百次调用同一个 encoder。每次调用都构建张量图、优化它、生成内核源码、用 [clang](./jit-loader.md) 编译，再分配设备缓冲区——这些工作并不依赖输入，纯粹是浪费。
+一个流式 ASR 流水线会数百次调用同一个 encoder。每次调用都构建张量图、优化它、生成内核源码、用 [clang](../backends/jit-loader.md) 编译，再分配设备缓冲区——这些工作并不依赖输入，纯粹是浪费。
 
 `jit_wrapper!` 宏与 `model::jit` 运行时层把这种"构建一次 / 多次运行"的模式变成**一个带类型的 Rust 结构体**。你声明输入和图；宏生成的包装器在 `prepare()` 期间编译图一次，并在每次 `execute()` 时使用就地保存的设备缓冲区重放它。
 
@@ -24,7 +24,7 @@ sidebar_label: JIT 图
 每次调用                              prepare() + 每一步
 ```
 
-该包装器与[模式引擎](./optimizations/pattern-system.md)（在 `prepare()` 时运行）和 [JIT 加载器](./jit-loader.md)（将优化后的内核转换为内存中的机器码）协同工作。本页介绍位于两者之上的包装器层。
+该包装器与[模式引擎](./optimizations/pattern-system.md)（在 `prepare()` 时运行）和 [JIT 加载器](../backends/jit-loader.md)（将优化后的内核转换为内存中的机器码）协同工作。本页介绍位于两者之上的包装器层。
 
 ---
 

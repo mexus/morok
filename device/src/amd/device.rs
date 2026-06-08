@@ -1,0 +1,745 @@
+//! `AmdDevice`: KFD-direct device handle.
+//!
+//! Opens `/dev/kfd` and `/dev/dri/renderD*`, parses topology, calls
+//! `AMDKFD_IOC_ACQUIRE_VM`. Owns an `Arc<AmdDeviceCore>` (the immutable
+//! per-physical-AMD:N identity — KFD/DRM fds, topology, event-page state,
+//! poison latch, shared signal pool, the bounded shared-queue pool). It holds
+//! no owner context of its own: every owner is assigned a shared `PoolQueue`
+//! via `AmdDeviceCore::assign_owner` — `ExecutionPlan` and `AmdGraph` hold an
+//! `OwnerCtx` for their lifetime, the `Program::execute` trait fallback
+//! (`benchmark_kernel`) assigns one per call, and the device-wide synchronize
+//! chain (`AmdAllocator::_copyin`/`_copyout`/`_free`) drains every registered
+//! pool queue via `synchronize_all`.
+
+#![cfg(unix)]
+
+use std::collections::HashMap;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock, Weak};
+
+use nix::fcntl::{OFlag, open};
+use nix::sys::stat::Mode;
+use once_cell::sync::Lazy;
+use parking_lot::Mutex;
+use svod_dtype::AmdArch;
+use tracing::debug;
+
+use crate::amd::sys::{ioctl, kfd};
+use crate::amd::topology::{AmdNode, enumerate};
+use crate::error::{Error, Result};
+
+/// Per-process cache of opened `AmdDevice`s, keyed by `device_id`. KFD only
+/// accepts one `ACQUIRE_VM` per (process, GPU); the cache ensures that
+/// concurrent `AmdAllocator::new(0)` calls — e.g. registry-cached
+/// LRU-wrapped allocator + factory-side queue/arena setup — share the same
+/// `Arc<AmdDevice>` instead of double-opening.
+///
+/// The cached `Arc<AmdDevice>` carries the shared `Arc<AmdDeviceCore>` —
+/// per-plan and per-graph callers reach the core via `AmdDevice::core()` and
+/// are assigned a shared `PoolQueue` against it (no extra KFD opens).
+static DEVICE_CACHE: Lazy<Mutex<HashMap<usize, Arc<AmdDevice>>>> = Lazy::new(Default::default);
+
+/// Process-wide `/dev/kfd` handle. KFD is opened once per process and all
+/// devices share it — events created on a per-device basis are addressed by
+/// `event_id` against this shared fd.
+static GLOBAL_KFD: Lazy<Mutex<Option<Arc<OwnedFd>>>> = Lazy::new(Default::default);
+
+/// Process-wide event-page state. The 0x8000 GTT event page is allocated
+/// exactly once per process; the first device
+/// allocates+binds it via `CREATE_EVENT(event_page_offset=handle)`,
+/// subsequent devices just `MAP_MEMORY_TO_GPU` it to their `gpu_id`.
+static EVENT_PAGE: Lazy<Mutex<Option<EventPageState>>> = Lazy::new(Default::default);
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct EventPageState {
+    pub(crate) handle: u64,
+    pub(crate) va: u64,
+    pub(crate) size: usize,
+}
+
+/// Scratch backing memory + `COMPUTE_TMPRING_SIZE` packing. Held under a
+/// mutex on `PoolQueue` so [`PoolQueue::ensure_has_local_memory`](crate::amd::connector::PoolQueue::ensure_has_local_memory)
+/// can grow the scratch buffer when a freshly-loaded program demands more
+/// bytes per thread than what's currently allocated. `pub(crate)` because the
+/// owning field lives in the sibling `connector` module.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ScratchState {
+    /// GPU VA of the current scratch buffer.
+    pub gpu_va: u64,
+    /// Bytes per thread (rounded up to 4-byte slot stride for wave64).
+    /// Equivalent to the kernel's `max_private_segment_size`.
+    pub size_per_thread: u32,
+    /// Packed `COMPUTE_TMPRING_SIZE` register value.
+    pub tmpring_size: u32,
+    /// KFD handle + total byte size of the backing alloc — needed to free the
+    /// old buffer when scratch grows.
+    pub handle: u64,
+    pub size: usize,
+}
+
+/// The private-segment (scratch) fields the AQL packet processor reads from the
+/// `amd_queue_t` GART descriptor. On the PM4 dispatch path the same information
+/// is pushed via `COMPUTE_TMPRING_SIZE` / `COMPUTE_DISPATCH_SCRATCH_BASE` and
+/// the user-SGPR descriptor instead, so this is only consumed on multi-XCC
+/// CDNA (the lone AQL arch).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct AqlScratchDesc {
+    /// `amd_queue_t.scratch_backing_memory_location` — scratch buffer VA.
+    pub backing_va: u64,
+    /// `amd_queue_t.compute_tmpring_size`.
+    pub tmpring_size: u32,
+    /// `amd_queue_t.scratch_resource_descriptor` — a 4-dword SQ_BUF_RSRC.
+    pub resource_descriptor: [u32; 4],
+    /// `amd_queue_t.scratch_wave64_lane_byte_size` — per-lane byte size (wave64,
+    /// so just the per-thread private segment size).
+    pub wave64_lane_byte_size: u32,
+}
+
+/// gfx9 SQ_BUF_RSRC WORD3 for a scratch buffer: DST_SEL=XYZW (4,5,6,7),
+/// NUM_FORMAT=UINT(4), DATA_FORMAT=32(4), ELEMENT_SIZE=1, INDEX_STRIDE=3,
+/// ADD_TID_ENABLE=1, TYPE=SQ_RSRC_BUF(0).
+const SCRATCH_RSRC_WORD3_GFX9: u32 = 0x00EA_4FAC;
+
+impl AqlScratchDesc {
+    /// Build the gfx9 scratch descriptor. `size_per_xcc` goes in NUM_RECORDS
+    /// (WORD2) — the per-XCC slice of the shared backing buffer — and the
+    /// SWIZZLE_ENABLE bit (WORD1 bit 31) enables the per-thread scratch swizzle.
+    pub(crate) fn gfx9(scratch_va: u64, size_per_xcc: usize, tmpring_size: u32, private_segment_size: u32) -> Self {
+        Self {
+            backing_va: scratch_va,
+            tmpring_size,
+            resource_descriptor: [
+                scratch_va as u32,
+                ((scratch_va >> 32) as u32 & 0xFFFF) | 0x8000_0000,
+                size_per_xcc as u32,
+                SCRATCH_RSRC_WORD3_GFX9,
+            ],
+            wave64_lane_byte_size: private_segment_size,
+        }
+    }
+}
+
+/// Immutable per-physical-AMD:N identity: KFD/DRM fds, topology, event-page
+/// state, fault latch, shared signal pool, the bounded shared-queue pool. One
+/// instance per physical GPU (KFD rejects double `ACQUIRE_VM`); shared as
+/// `Arc<AmdDeviceCore>` by every `PoolQueue` built against the device. The
+/// queue registry and `synchronize_all` live here so the host can drain every
+/// live queue before any destructive operation (`AmdAllocator::_free`, etc.).
+///
+/// The backend seam: all KFD ioctls (memory alloc/free, queue ring setup/
+/// teardown, event waits) route through `iface`. KFD-specific state (the kfd/
+/// drm fds, ABI version, event ids, event page) lives on the [`KfdIface`]
+/// implementor, not the core. `node` + `arch` stay here as the device identity.
+#[derive(Debug)]
+pub struct AmdDeviceCore {
+    pub node: AmdNode,
+    pub arch: AmdArch,
+    /// Backend implementation (KFD today). All ioctls route through this.
+    iface: Arc<dyn crate::amd::iface::AmdIface>,
+    /// Whether an SDMA copy queue is available on this physical device. Set
+    /// by the factory after it tries to create one.
+    /// Today every AMD buffer is host-visible + memcpy'd, so this stays
+    /// `false` and the SDMA queue is dead code — kept on the core for the
+    /// future SDMA revival.
+    has_sdma_queue: AtomicBool,
+    /// Poison latch. Once a GPU fault/timeout is observed, the device is dead:
+    /// every `synchronize`/`execute` against any connector on this device
+    /// fails fast. Per-physical
+    /// device because a memory fault corrupts the whole VM, not just one queue.
+    poisoned: AtomicBool,
+    error_msg: OnceLock<String>,
+    /// Registry of every pool queue built against this core. Weak so dropped
+    /// queues don't stay alive. Used by [`AmdDeviceCore::synchronize_all`] to
+    /// drain ALL in-flight GPU work before destructive host-visible operations
+    /// (`AmdAllocator::_copyin`/`_copyout`/`_free`). The drain
+    /// (`PoolQueue::drain_all`) reads only signal slots — the PM4 counter and
+    /// the per-op completion signals — and NEVER takes the queue's dispatch
+    /// lock, so a concurrent owner can keep dispatching.
+    pub(crate) connectors: parking_lot::Mutex<Vec<Weak<crate::amd::connector::PoolQueue>>>,
+    /// Process-global signal pool, allocated once per physical device. Lazily
+    /// installed by the device factory and shared across every `PoolQueue`
+    /// (PM4 counter signal acquired here at queue construction) — pool access
+    /// is rare (slot alloc on queue build), and one pool covers many
+    /// queues at 4 KiB total VRAM.
+    signal_pool: OnceLock<Arc<crate::amd::signal::SignalPool>>,
+    /// Process-global SDMA copy queue, installed by the factory once the signal
+    /// pool exists. Its presence is what flips `has_sdma_queue` true and so
+    /// enables device-local (non-host-visible) buffers; the allocator's
+    /// device-only copy arms route through it.
+    copy_queue: OnceLock<Arc<crate::amd::queue::AmdCopyQueue>>,
+    /// Bounded pool of SHARED dispatch queues. Owners (plans / graphs / the
+    /// `Program::execute` fallback) are assigned one via [`assign_owner`](Self::assign_owner):
+    /// distinct owners spread onto distinct queues (cross-queue parallelism)
+    /// until the pool reaches [`hw_queues`](Self::hw_queues) queues, after which
+    /// they co-tenant the least-loaded queue. The pool never shrinks — a
+    /// `PoolQueue` is freed only when its last `Arc` drops (device close).
+    queue_pool: parking_lot::Mutex<Vec<Arc<crate::amd::connector::PoolQueue>>>,
+    /// Max distinct KFD compute queues in the pool. Read once at open from
+    /// `SVOD_AMD_HW_QUEUES` (default 4, min 1). The per-process hardware budget
+    /// is small (~24 user compute queues on CDNA; HIP's `GPU_MAX_HW_QUEUES`
+    /// defaults to 4), so we cap the pool and co-tenant beyond it.
+    hw_queues: usize,
+}
+
+/// Open handle to one AMD GPU node.
+///
+/// A thin owner of the immutable `AmdDeviceCore`. There is no per-device
+/// "default" queue: every owner is assigned a shared `PoolQueue` — plans and
+/// graphs hold an `OwnerCtx` for their lifetime, and the `Program::execute`
+/// trait fallback assigns one per call from `core.assign_owner`. The
+/// device-wide synchronize chain (`AmdAllocator::_copyin`/`_copyout`/`_free`)
+/// routes through `dev.synchronize() → core.synchronize_all()`, which drains
+/// EVERY pool queue registered on the core.
+///
+/// Immutable Core fields stay reachable via [`Deref`] — `self.dev.node`,
+/// `self.dev.kfd_fd`, `self.dev.poison_error()`, etc.
+#[derive(Debug)]
+pub struct AmdDevice {
+    /// Immutable identity (cloneable across connectors).
+    core: Arc<AmdDeviceCore>,
+}
+
+impl std::ops::Deref for AmdDevice {
+    type Target = AmdDeviceCore;
+    #[inline]
+    fn deref(&self) -> &AmdDeviceCore {
+        &self.core
+    }
+}
+
+impl AmdDevice {
+    /// Open the `device_id`-th GPU node.
+    ///
+    /// Returns:
+    /// - `Err(NoAmdGpu)` when there is no `/dev/kfd`, no GPU nodes in
+    ///   topology, or `device_id` is out of range. Never panics.
+    /// - `Err(AmdAllocFailed)` when the host has hardware we don't support
+    ///   (hardware outside the supported `AmdArch` set).
+    /// - `Err(AmdIoctl)` for KFD failures (permission denied, no event page).
+    pub fn open(device_id: usize) -> Result<Arc<Self>> {
+        // Fast path: device already opened by another caller (registry +
+        // factory share via DEVICE_CACHE).
+        {
+            let cache = DEVICE_CACHE.lock();
+            if let Some(dev) = cache.get(&device_id) {
+                return Ok(Arc::clone(dev));
+            }
+        }
+        let dev = Self::open_uncached(device_id)?;
+        DEVICE_CACHE.lock().insert(device_id, Arc::clone(&dev));
+        Ok(dev)
+    }
+
+    fn open_uncached(device_id: usize) -> Result<Arc<Self>> {
+        let nodes = enumerate();
+        if nodes.is_empty() {
+            return Err(Error::NoAmdGpu { reason: "no KFD topology nodes (no /dev/kfd?)".into() });
+        }
+        let node = nodes
+            .get(device_id)
+            .ok_or_else(|| Error::NoAmdGpu {
+                reason: format!("device_id {device_id} out of range; {} GPU node(s) present", nodes.len()),
+            })?
+            .clone();
+        let arch = AmdArch::from_gfx_target_version(node.gfx_target_version).ok_or_else(|| Error::AmdAllocFailed {
+            reason: format!(
+                "unsupported gfx target {} (decoded major.minor.step = {}.{}.{}); supported families: \
+                 CDNA gfx942/950, RDNA3 gfx1100/1101/1102/1151, RDNA4 gfx1200/1201",
+                node.gfx_target_version,
+                node.gfx_target_version / 10_000,
+                (node.gfx_target_version / 100) % 100,
+                node.gfx_target_version % 100,
+            ),
+        })?;
+
+        // Backend selection. Today only the KFD-direct backend exists; the
+        // `SVOD_AMD_BACKEND` knob is the seam where the userspace AM driver
+        // will plug in. All KFD bring-up + ioctls live on `KfdIface`.
+        let backend = std::env::var("SVOD_AMD_BACKEND").unwrap_or_else(|_| "kfd".into());
+        if backend != "kfd" {
+            return Err(Error::NoAmdGpu {
+                reason: format!("unknown SVOD_AMD_BACKEND={backend} (only 'kfd' supported)"),
+            });
+        }
+        let iface: Arc<dyn crate::amd::iface::AmdIface> = Arc::new(crate::amd::iface::KfdIface::open(&node)?);
+
+        debug!(node = node.node_id, gpu_id = node.gpu_id, arch = arch.mcpu(), backend = %backend, "AmdDevice opened");
+
+        // Bounded shared-queue pool: `SVOD_AMD_HW_QUEUES` distinct KFD compute
+        // queues (default 4, min 1) that owners spread onto then co-tenant.
+        let hw_queues =
+            std::env::var("SVOD_AMD_HW_QUEUES").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(4).max(1);
+
+        let core = Arc::new(AmdDeviceCore {
+            node,
+            arch,
+            iface,
+            has_sdma_queue: AtomicBool::new(false),
+            poisoned: AtomicBool::new(false),
+            error_msg: OnceLock::new(),
+            copy_queue: OnceLock::new(),
+            connectors: parking_lot::Mutex::new(Vec::new()),
+            signal_pool: OnceLock::new(),
+            queue_pool: parking_lot::Mutex::new(Vec::new()),
+            hw_queues,
+        });
+        Ok(Arc::new(Self { core }))
+    }
+
+    /// Borrow the shared immutable core — used to assign owners onto shared
+    /// `PoolQueue`s against the same physical device without re-acquiring
+    /// KFD.
+    #[inline]
+    pub fn core(&self) -> &Arc<AmdDeviceCore> {
+        &self.core
+    }
+
+    /// Drain all submitted GPU work on every pool queue backed by this device.
+    /// Owners co-tenant a bounded set of shared queues, so a kernel signals on
+    /// its queue's slots; the drain must cover EVERY registered queue, not a
+    /// single one. Skipping a queue would let
+    /// `AmdAllocator::_copyout`/`_copyin`/`_free` observe an unfinished
+    /// kernel's buffer.
+    pub fn synchronize(&self) -> Result<()> {
+        self.core.synchronize_all()
+    }
+}
+
+impl AmdDeviceCore {
+    /// Drain every pool queue backed by this core — the per-VM fence before any
+    /// destructive host-visible op (`AmdAllocator::_copyin`/`_copyout`/`_free`).
+    /// Iterates the queue registry and drains each via `PoolQueue::drain_all`,
+    /// which reads only the PM4 counter atomic + signal slots — it NEVER takes a
+    /// queue's dispatch lock, so a concurrent owner can keep dispatching while
+    /// this runs. A freed/read buffer has no live handle, so owners can't add
+    /// new work referencing it; draining each queue fences all in-flight
+    /// readers. Fast on idle queues.
+    pub fn synchronize_all(&self) -> Result<()> {
+        if let Some(err) = self.poison_error() {
+            return Err(err);
+        }
+        // Snapshot strong refs to release the registry lock before the
+        // potentially multi-second waits, keeping each queue alive across its
+        // drain so a concurrent queue drop can't pull the rug out.
+        let live: Vec<Arc<crate::amd::connector::PoolQueue>> =
+            self.connectors.lock().iter().filter_map(|w| w.upgrade()).collect();
+        // Drain every queue (PM4 counter + per-op signals); collect the first
+        // error but keep going so one stuck queue doesn't strand buffer-frees on
+        // the others.
+        let mut first_err: Option<Error> = None;
+        for q in live {
+            if let Err(e) = q.drain_all() {
+                tracing::warn!(?e, "synchronize_all: queue drain failed; continuing");
+                if first_err.is_none() {
+                    first_err = Some(e);
+                }
+            }
+        }
+        // Opportunistic GC of dropped queue entries. The registry is touched
+        // here on every host read/free, so dead Weaks don't accumulate.
+        self.connectors.lock().retain(|w| w.strong_count() > 0);
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+
+    /// Borrow the backend seam — all KFD ioctls (alloc/free/ring/wait) route
+    /// through it. The allocator, queue, and connector helpers call this.
+    #[inline]
+    pub(crate) fn iface(&self) -> &Arc<dyn crate::amd::iface::AmdIface> {
+        &self.iface
+    }
+
+    /// Borrow the process-global signal pool (lazy-installed by the device
+    /// factory). `None` before the factory has run; once initialized, every
+    /// connector built against this core shares it.
+    pub fn signal_pool(&self) -> Option<&Arc<crate::amd::signal::SignalPool>> {
+        self.signal_pool.get()
+    }
+
+    /// The bounded queue-pool size (`SVOD_AMD_HW_QUEUES`, default 4) — the
+    /// cross-model parallelism ceiling. `assign_owner` spreads owners across up
+    /// to this many distinct queues before co-tenanting.
+    #[inline]
+    pub fn hw_queues(&self) -> usize {
+        self.hw_queues
+    }
+
+    /// Borrow the process-global SDMA copy queue. `None` until the factory
+    /// installs it (and thus `has_sdma_queue` is false). The allocator's
+    /// device-only copy arms require it.
+    pub fn copy_queue(&self) -> Option<&Arc<crate::amd::queue::AmdCopyQueue>> {
+        self.copy_queue.get()
+    }
+
+    /// Install the SDMA copy queue (factory, once). Idempotent: a second call
+    /// is dropped. Caller flips `has_sdma_queue` after this succeeds.
+    pub fn install_copy_queue(&self, queue: Arc<crate::amd::queue::AmdCopyQueue>) {
+        let _ = self.copy_queue.set(queue);
+    }
+
+    /// Assign a SHARED `PoolQueue` to a new owner (plan / graph / the
+    /// `Program::execute` fallback), returning an [`OwnerCtx`](crate::amd::connector::OwnerCtx)
+    /// bound to it. Strategy:
+    ///
+    /// - **fill-empty-first**: while the pool is below [`hw_queues`](Self::hw_queues)
+    ///   AND every existing queue already has at least one owner (no queue with
+    ///   `strong_count == 1`, i.e. held only by the pool vec), build a fresh
+    ///   queue. Spreading owners onto empty queues first maximises cross-queue
+    ///   parallelism — the AQL BARRIER bit serialises co-tenants on one ring, so
+    ///   co-tenanting is only worthwhile once the queue budget is spent.
+    /// - **least-loaded**: otherwise co-tenant the queue with the fewest owners
+    ///   (min `strong_count`), building the first one if the pool is empty.
+    ///
+    /// An owner with no current holder is exactly a `PoolQueue` whose only `Arc`
+    /// is the one in `queue_pool` (`strong_count == 1`); an `OwnerCtx` adds a
+    /// second `Arc`.
+    pub fn assign_owner(
+        self: &Arc<Self>,
+        allocator: &crate::amd::AmdAllocator,
+    ) -> Result<crate::amd::connector::OwnerCtx> {
+        use crate::amd::connector::{OwnerCtx, PoolQueue};
+        let mut queues = self.queue_pool.lock();
+        // Fill-empty-first: grow the pool while under cap and no queue is idle.
+        if queues.len() < self.hw_queues && !queues.iter().any(|q| Arc::strong_count(q) == 1) {
+            let q = PoolQueue::new_with_resources(Arc::clone(self), allocator)?;
+            queues.push(Arc::clone(&q));
+            return Ok(OwnerCtx::new(q));
+        }
+        // Otherwise co-tenant the least-loaded queue (or build the first one).
+        match queues.iter().min_by_key(|q| Arc::strong_count(q)).cloned() {
+            Some(q) => Ok(OwnerCtx::new(q)),
+            None => {
+                let q = PoolQueue::new_with_resources(Arc::clone(self), allocator)?;
+                queues.push(Arc::clone(&q));
+                Ok(OwnerCtx::new(q))
+            }
+        }
+    }
+
+    /// Install the signal pool. Called once per physical device by the
+    /// runtime factory; subsequent calls are a no-op.
+    pub fn install_signal_pool(&self, pool: Arc<crate::amd::signal::SignalPool>) {
+        let _ = self.signal_pool.set(pool);
+    }
+}
+
+impl AmdDeviceCore {
+    /// Record whether an SDMA copy queue was successfully created. Called once
+    /// from the device factory. When `false`, `AmdAllocator::_alloc` forces
+    /// `cpu_access` so every buffer is host-visible and copies use `memmove`.
+    pub fn set_has_sdma_queue(&self, present: bool) {
+        self.has_sdma_queue.store(present, Ordering::Release);
+    }
+
+    /// Whether an SDMA copy queue is available.
+    #[inline]
+    pub fn has_sdma_queue(&self) -> bool {
+        self.has_sdma_queue.load(Ordering::Acquire)
+    }
+
+    /// Block in the kernel for up to `timeout_ms` waiting on **any** of the
+    /// device's three events (queue completion, memory fault, hw exception).
+    /// Signal polling escalates to this after a fixed spin/yield budget so a
+    /// stalled wait doesn't burn CPU.
+    ///
+    /// Returns `Ok(Some(fault))` when a fault event fired (caller should bail
+    /// with that error rather than continue polling the signal value).
+    /// Returns `Ok(None)` for normal wake-ups (queue_event fired, timeout,
+    /// or no event yet).
+    pub fn wait_events(&self, timeout_ms: u32) -> Result<Option<Error>> {
+        let r = self.iface.wait_events(timeout_ms)?;
+        // Poison with the bare fault message (not `Error::Display`, which would
+        // prepend "runtime error: "). The backend already built the rich string.
+        if let Some(Error::Runtime { message }) = &r {
+            self.poison(message);
+        }
+        Ok(r)
+    }
+
+    /// `true` once a fault/timeout has poisoned the device. Hot-path gate.
+    #[inline]
+    pub fn is_poisoned(&self) -> bool {
+        self.poisoned.load(Ordering::Relaxed)
+    }
+
+    /// Latch a fault: device becomes unusable, message recorded once.
+    pub fn poison(&self, msg: &str) {
+        let _ = self.error_msg.set(msg.to_string());
+        self.poisoned.store(true, Ordering::Relaxed);
+    }
+
+    /// Recorded fault if poisoned, else `None`.
+    pub fn poison_error(&self) -> Option<Error> {
+        self.is_poisoned().then(|| Error::Runtime {
+            message: self.error_msg.get().cloned().unwrap_or_else(|| "AMD device poisoned".into()),
+        })
+    }
+
+    /// Non-blocking check: did the memory-fault or hw-exception event fire
+    /// since the last consumption? Issues a `WAIT_EVENTS` with `timeout=0`.
+    /// Returns `Some(Error::*)` if a fault is pending, `None` otherwise.
+    /// Used (a) from `AmdSignal::wait` on a 30 s timeout to attach the real
+    /// error to a stalled dispatch and (b) from the WAIT_EVENTS escalation
+    /// path to break out of polling early on a fault.
+    pub fn poll_faults_nonblocking(&self) -> Option<Error> {
+        // Non-blocking poll = `wait_events` with timeout 0. Preserves the
+        // pre-refactor contract: ioctl error / no fault → `None`; fault →
+        // poison with the bare message + return `Some`.
+        match self.iface.wait_events(0) {
+            Ok(Some(Error::Runtime { message })) => {
+                self.poison(&message);
+                Some(Error::Runtime { message })
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Ensure the process-wide `/dev/kfd` handle is open and return a shared
+/// `Arc<OwnedFd>`. All devices in a process share one KFD fd so events
+/// are visible across all of them.
+pub(crate) fn ensure_global_kfd() -> Result<Arc<OwnedFd>> {
+    let mut g = GLOBAL_KFD.lock();
+    if let Some(fd) = g.as_ref() {
+        return Ok(Arc::clone(fd));
+    }
+    let fd = Arc::new(open_owned("/dev/kfd")?);
+    *g = Some(Arc::clone(&fd));
+    Ok(fd)
+}
+
+/// Ensure the process-wide event page is allocated, bound, and mapped to
+/// `node.gpu_id`:
+/// - first device: allocate 0x8000 GTT|COHERENT|UNCACHED|PUBLIC, bind via
+///   `CREATE_EVENT(event_page_offset=handle)`, map into the first GPU.
+/// - subsequent devices: only `MAP_MEMORY_TO_GPU` the existing page into
+///   their `gpu_id` (no re-alloc, no re-bind).
+pub(crate) fn ensure_event_page(kfd_fd: &OwnedFd, drm_fd: &OwnedFd, node: &AmdNode) -> Result<EventPageState> {
+    let mut g = EVENT_PAGE.lock();
+    if let Some(ep) = g.as_ref() {
+        // Reuse: map the existing page into this device's GPU page table.
+        let mut gpu_id = node.gpu_id;
+        let mut map_args = kfd::kfd_ioctl_map_memory_to_gpu_args {
+            handle: ep.handle,
+            device_ids_array_ptr: &mut gpu_id as *mut _ as u64,
+            n_devices: 1,
+            n_success: 0,
+        };
+        if let Err(e) = unsafe { ioctl::kfd_map_memory_to_gpu(kfd_fd.as_raw_fd(), &mut map_args as *mut _) } {
+            return Err(Error::AmdIoctl { ioctl: "AMDKFD_IOC_MAP_MEMORY_TO_GPU(event page reuse)", errno: e as i32 });
+        }
+        return Ok(*ep);
+    }
+
+    let (va, size, handle) = alloc_event_page(kfd_fd, drm_fd, node)?;
+    // Bind the page to this KFD process — only on first init.
+    let mut bind = kfd::kfd_ioctl_create_event_args { event_page_offset: handle, ..Default::default() };
+    if let Err(e) = unsafe { ioctl::kfd_create_event(kfd_fd.as_raw_fd(), &mut bind as *mut _) } {
+        return Err(Error::AmdIoctl { ioctl: "AMDKFD_IOC_CREATE_EVENT(bind page)", errno: e as i32 });
+    }
+    let ep = EventPageState { handle, va, size };
+    *g = Some(ep);
+    Ok(ep)
+}
+
+/// Allocate the 0x8000-byte event page (GTT-pinned, uncached, host-visible).
+/// Returns `(va, size, kfd_handle)`. The handle goes into the
+/// `event_page_offset` field of the bind `AMDKFD_IOC_CREATE_EVENT` call.
+fn alloc_event_page(kfd_fd: &OwnedFd, drm_fd: &OwnedFd, node: &AmdNode) -> Result<(u64, usize, u64)> {
+    use libc::{
+        MAP_ANONYMOUS, MAP_FIXED, MAP_NORESERVE, MAP_PRIVATE, MAP_SHARED, PROT_NONE, PROT_READ, PROT_WRITE, mmap,
+        munmap,
+    };
+    let size: usize = 0x8000;
+    // SAFETY: standard libc::mmap; PROT_NONE reservation.
+    let va = unsafe { mmap(std::ptr::null_mut(), size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0) };
+    if va == libc::MAP_FAILED {
+        return Err(Error::AmdAllocFailed { reason: "event-page VA reservation failed".into() });
+    }
+    let mut args = kfd::kfd_ioctl_alloc_memory_of_gpu_args {
+        va_addr: va as u64,
+        size: size as u64,
+        gpu_id: node.gpu_id,
+        flags: kfd::KFD_IOC_ALLOC_MEM_FLAGS_GTT
+            | kfd::KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE
+            | kfd::KFD_IOC_ALLOC_MEM_FLAGS_EXECUTABLE
+            | kfd::KFD_IOC_ALLOC_MEM_FLAGS_NO_SUBSTITUTE
+            | kfd::KFD_IOC_ALLOC_MEM_FLAGS_PUBLIC
+            | kfd::KFD_IOC_ALLOC_MEM_FLAGS_COHERENT
+            | kfd::KFD_IOC_ALLOC_MEM_FLAGS_UNCACHED,
+        ..Default::default()
+    };
+    // SAFETY: kfd_fd is alive; args type-correct.
+    if let Err(e) = unsafe { ioctl::kfd_alloc_memory_of_gpu(kfd_fd.as_raw_fd(), &mut args as *mut _) } {
+        unsafe { munmap(va, size) };
+        return Err(Error::AmdIoctl { ioctl: "AMDKFD_IOC_ALLOC_MEMORY_OF_GPU(event page)", errno: e as i32 });
+    }
+    let handle = args.handle;
+    let mmap_offset = args.mmap_offset;
+
+    // Map host-visible via drm_fd at the reserved VA.
+    let host = unsafe {
+        mmap(va, size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, drm_fd.as_raw_fd(), mmap_offset as i64)
+    };
+    if host == libc::MAP_FAILED || !std::ptr::eq(host, va) {
+        unsafe { munmap(va, size) };
+        return Err(Error::AmdAllocFailed { reason: "event-page host mmap failed".into() });
+    }
+
+    // Map into the first GPU's page table.
+    let mut gpu_id = node.gpu_id;
+    let mut map_args = kfd::kfd_ioctl_map_memory_to_gpu_args {
+        handle,
+        device_ids_array_ptr: &mut gpu_id as *mut _ as u64,
+        n_devices: 1,
+        n_success: 0,
+    };
+    if let Err(e) = unsafe { ioctl::kfd_map_memory_to_gpu(kfd_fd.as_raw_fd(), &mut map_args as *mut _) } {
+        unsafe { munmap(va, size) };
+        return Err(Error::AmdIoctl { ioctl: "AMDKFD_IOC_MAP_MEMORY_TO_GPU(event page)", errno: e as i32 });
+    }
+
+    Ok((va as u64, size, handle))
+}
+
+/// Allocate a scratch buffer sized for `private_segment_size` bytes per
+/// thread and compute the packed `COMPUTE_TMPRING_SIZE` value. Returns
+/// `(scratch_gpu_va, scratch_size, tmpring_size, rounded_size_per_thread,
+/// handle, aql_desc)`.
+///
+/// Sizing (gfx11/12):
+/// - `lanes_per_wave = 64` (scratch lane stride is wave64-aligned per AMD)
+/// - `mem_alignment_size = 256`
+/// - `size_per_thread = round_up(private_segment_size, 4)` (= 256/64)
+/// - `cu_cnt = simd_count / simd_per_cu / xccs`
+/// - `size_per_xcc = size_per_thread * lanes_per_wave * max_slots_scratch_cu * cu_cnt`
+/// - `total = size_per_xcc * xccs` (page-aligned for KFD)
+///
+/// `COMPUTE_TMPRING_SIZE` packs `WAVES` (bits 0-11) and `WAVESIZE`
+/// (bits 12-26 on gfx11):
+/// - `wave_scratch = ceildiv(lanes_per_wave * size_per_thread, 256)`
+/// - `num_waves = (size_per_xcc / (wave_scratch * 256)) / se_cnt`
+/// - `max_scratch_waves = cu_cnt * max_slots_scratch_cu * xccs`
+/// - `WAVES = min(num_waves, max_scratch_waves)`, `WAVESIZE = wave_scratch`
+pub(crate) fn alloc_scratch(
+    iface: &Arc<dyn crate::amd::iface::AmdIface>,
+    node: &AmdNode,
+    arch: &AmdArch,
+    private_segment_size: u32,
+) -> Result<(u64, usize, u32, u32, u64, AqlScratchDesc)> {
+    const LANES_PER_WAVE: u32 = 64;
+    const PAGE: usize = 0x1000;
+    // gfx9 (CDNA) scratch is 1024-byte aligned; gfx11/12 (RDNA) use 256.
+    let mem_alignment_size: u32 = if arch.is_cdna() { 1024 } else { 256 };
+
+    let xccs = node.num_xcc.max(1);
+    let simd_per_cu = node.simd_per_cu.max(1);
+    let cu_cnt = ((node.simd_count.max(1) / simd_per_cu) / xccs).max(1);
+    let max_slots = node.max_slots_scratch_cu.max(1);
+    let se_cnt = (node.array_count.max(1) / node.simd_arrays_per_engine.max(1) / xccs).max(1);
+    // ROCr sizes scratch for `AlignUp(cu_count, shader_engines) * MaxSlotsScratchCU`
+    // slots PER XCC (amd_aql_queue.cpp `calc_device_slots`), NOT raw `cu_count`.
+    // The CP rounds its per-dispatch occupancy demand up to the shader-engine
+    // boundary; sizing from raw `cu_cnt` under-provisions on a harvested 8-XCC
+    // part, so a high-occupancy dispatch traps with an insufficient-scratch
+    // exception (0x401) and the CP HALTS the queue waiting on `queue_inactive_
+    // signal` — which we never service, so it hangs forever with no fault.
+    let cu_slots = cu_cnt.next_multiple_of(se_cnt);
+
+    // Round up to the per-lane alignment stride.
+    let size_per_thread = private_segment_size.max(1).next_multiple_of(mem_alignment_size / LANES_PER_WAVE);
+    let size_per_xcc =
+        (size_per_thread as usize) * (LANES_PER_WAVE as usize) * (max_slots as usize) * (cu_slots as usize);
+    let total = (size_per_xcc * xccs as usize).next_multiple_of(PAGE);
+
+    // KFD alloc as plain VRAM (GPU-only; no host access needed — the GPU writes
+    // register spills here and reads them back). Plain VRAM = no EXECUTABLE, no
+    // PUBLIC (`cpu_access=false` keeps PUBLIC off); see `AllocKind::DeviceVram`.
+    let r = iface.alloc_raw(
+        total,
+        crate::amd::iface::AllocKind::DeviceVram { executable: false },
+        crate::amd::va_registry::AllocTag::Scratch,
+        /*cpu_access=*/ false,
+        /*zero=*/ false,
+    )?;
+    let va = r.gpu_va;
+    let total = r.size;
+    let handle = r.handle;
+
+    // gfx9 divides scratch evenly across SEs (1); gfx11/12 divide by se_cnt.
+    let wave_scratch = (LANES_PER_WAVE * size_per_thread).div_ceil(mem_alignment_size);
+    let max_scratch_waves = cu_slots * max_slots * xccs;
+    let se_div = if arch.is_cdna() { 1 } else { se_cnt };
+    let num_waves = ((size_per_xcc as u32) / (wave_scratch * mem_alignment_size)) / se_div;
+    // COMPUTE_TMPRING_SIZE.WAVES must be a multiple of the per-XCC shader-engine
+    // count (amd_aql_queue.cpp asserts `WAVES % (banks/xcc) == 0`); round down to
+    // that boundary (≥ one engine's worth) so the CP accepts the wave count.
+    let waves = (num_waves.min(max_scratch_waves) / se_cnt).max(1) * se_cnt;
+    let tmpring_size = pack_tmpring(waves, wave_scratch, arch);
+
+    // The AQL descriptor is only consumed on multi-XCC CDNA; non-CDNA arches
+    // dispatch via PM4 and never read it, so leave it zero there.
+    let aql_desc = if arch.is_cdna() {
+        AqlScratchDesc::gfx9(va, size_per_xcc, tmpring_size, private_segment_size)
+    } else {
+        AqlScratchDesc::default()
+    };
+
+    Ok((va, total, tmpring_size, size_per_thread, handle, aql_desc))
+}
+
+/// Pack `COMPUTE_TMPRING_SIZE`: WAVES in bits 0..12, WAVESIZE at bit 12 with an
+/// arch-specific field width — gfx9 13b, gfx11 15b, gfx12 18b.
+pub(crate) fn pack_tmpring(waves: u32, wave_scratch: u32, arch: &AmdArch) -> u32 {
+    let wavesize_mask: u32 = if arch.is_cdna() {
+        0x1FFF
+    } else if arch.is_rdna4() {
+        0x3FFFF
+    } else {
+        0x7FFF
+    };
+    (waves & 0xFFF) | ((wave_scratch & wavesize_mask) << 12)
+}
+
+pub(crate) fn open_owned(path: &str) -> Result<OwnedFd> {
+    match open(path, OFlag::O_RDWR | OFlag::O_CLOEXEC, Mode::empty()) {
+        Ok(fd) => {
+            // `nix::fcntl::open` in our pinned version returns a bare `RawFd`;
+            // adopt it as an `OwnedFd` so Drop closes it for us.
+            let raw = fd_to_raw(fd);
+            // SAFETY: nix just opened this fd and transferred ownership to us;
+            // no other code can be observing it.
+            Ok(unsafe { OwnedFd::from_raw_fd(raw) })
+        }
+        Err(nix::errno::Errno::ENOENT) | Err(nix::errno::Errno::EACCES) => {
+            Err(Error::NoAmdGpu { reason: format!("cannot open {path}") })
+        }
+        Err(e) => Err(Error::AmdIoctl { ioctl: "open", errno: e as i32 }),
+    }
+}
+
+/// Extract the raw fd from whatever `nix::fcntl::open` returns. In older nix
+/// versions this is `RawFd`; in 0.30+ it's `OwnedFd`. We use a small trait
+/// dispatch so the call site stays version-agnostic.
+fn fd_to_raw<T: ToRawFdShim>(fd: T) -> RawFd {
+    fd.to_raw()
+}
+
+trait ToRawFdShim {
+    fn to_raw(self) -> RawFd;
+}
+
+impl ToRawFdShim for RawFd {
+    fn to_raw(self) -> RawFd {
+        self
+    }
+}
+
+impl ToRawFdShim for OwnedFd {
+    fn to_raw(self) -> RawFd {
+        std::os::fd::IntoRawFd::into_raw_fd(self)
+    }
+}

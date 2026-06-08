@@ -25,11 +25,10 @@
 //! let output = plan.output_buffer();
 //! ```
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
-use rayon::prelude::*;
 use smallvec::SmallVec;
 use svod_device::device::ProgramSpec;
 use svod_device::{Buffer, BufferId};
@@ -49,7 +48,7 @@ type RuntimeLaunchSizes = (Option<[usize; 3]>, Option<[usize; 3]>);
 /// A pre-compiled kernel ready for execution.
 ///
 /// Variable values are stored as positional `vals: Vec<i64>` rather than a named
-/// HashMap, matching Tinygrad's `vals: tuple[int, ...]` parameter style.
+/// HashMap.
 #[derive(Clone)]
 pub struct PreparedKernel {
     /// Unique identifier (from original AST).
@@ -75,8 +74,8 @@ pub struct PreparedKernel {
 
     /// Fixed variable bindings captured at prepare time.
     ///
-    /// These mirror Tinygrad's `fixedvars` semantics: values fixed by scheduling
-    /// (for example from bound ranges) are not overridden by `execute_with_vars`.
+    /// Values fixed by scheduling (for example from bound ranges) are not
+    /// overridden by `execute_with_vars`.
     pub fixedvars: HashMap<String, i64>,
 
     /// Kernel IDs that must complete before this one (dependencies).
@@ -260,7 +259,11 @@ pub struct ExecutionPlan {
     /// Precomputed dependency-safe operation order.
     op_order: Vec<usize>,
 
-    /// Topological levels of dependency-independent operations.
+    /// Topological levels of dependency-independent operations. Preserved as
+    /// the execution-iteration order (each level flushed before the next) for
+    /// consistency with pre-Step-6 plan semantics — some downstream kernel
+    /// algorithms (e.g. iterative QR) are sensitive to within-level
+    /// scheduling order vs. a single flat topological linearization.
     op_levels: Vec<Vec<usize>>,
 
     /// ALL buffers owned by this plan (inputs, intermediates, outputs).
@@ -280,6 +283,19 @@ pub struct ExecutionPlan {
 
     /// Additional UOp IDs registered as aliases that need cleanup.
     alias_ids: Vec<u64>,
+
+    /// Captured replayable graph, built lazily on first `execute()`. `Some(None)`
+    /// means the chain isn't graphable (mixed ops / non-graph device) → per-call
+    /// dispatch. Replaces N per-kernel submits with one; see
+    /// `svod_device::Graph`.
+    graph: std::sync::OnceLock<Option<Box<dyn svod_device::Graph>>>,
+
+    /// Reusable per-plan execution context, minted lazily from the first
+    /// kernel's program (`Program::new_exec_context`) and held for the plan's
+    /// lifetime so every kernel dispatches onto the same backend queue (distinct
+    /// plans → distinct queues for cross-plan parallelism). `Some(None)` means
+    /// the backend has no reusable context (CPU) → per-call `Program::execute`.
+    plan_ctx: std::sync::OnceLock<Option<Box<dyn svod_device::PlanContext>>>,
 }
 
 // ============================================================================
@@ -313,24 +329,157 @@ impl ExecutionPlan {
         Ok((Some(dims.global_size), dims.local_size))
     }
 
-    fn kernel_uses_cpu_threading(kernel: &PreparedKernel) -> Result<bool> {
-        if !matches!(kernel.device, DeviceSpec::Cpu) {
-            return Ok(false);
-        }
-        let (global_size, _) = Self::kernel_launch_sizes(kernel)?;
-        Ok(global_size.map(|[x, _, _]| x > 1).unwrap_or(false))
+    /// Lazily capture all kernels into a backend replay graph. Only backends
+    /// that provide a graph factory install one; everything else (and any
+    /// non-graphable chain) returns `None` → per-call dispatch. Gated to chains
+    /// that are *all* compiled kernels with no runtime vars: copies/views/custom
+    /// or dynamic launch dims keep the host in the loop and aren't graphed.
+    fn graph(&self) -> &Option<Box<dyn svod_device::Graph>> {
+        self.graph.get_or_init(|| self.build_graph().unwrap_or(None))
     }
 
+    fn build_graph(&self) -> Result<Option<Box<dyn svod_device::Graph>>> {
+        // Graph capture is on by default: an all-static compiled-kernel plan on a
+        // graphable device replays the whole chain as one backend submit, instead
+        // of the per-kernel dispatch round-trip. Validated against per-call across
+        // the tensor suite (incl. multi-kernel decompositions). Capture walks
+        // `op_levels` execution order, NOT the flat `op_order` topological sort
+        // (below). Non-graphable plans (runtime vars, no graph factory, chains the
+        // backend declines to capture, mixed devices) fall back to per-call via
+        // the `Ok(None)` returns below.
+        let all_static_kernels =
+            self.ops.iter().all(|op| matches!(op, PreparedOp::CompiledProgram(k) if k.runtime_vars.is_empty()));
+        if !all_static_kernels || self.ops.is_empty() {
+            return Ok(None);
+        }
+        let dev = crate::device_registry::DEVICE_FACTORIES
+            .device(&self.device, svod_device::registry::registry())
+            .map_err(|e| crate::error::Error::Execution { reason: format!("device lookup: {e}") })?;
+        let Some(factory) = dev.graph.clone() else { return Ok(None) };
+        // Capture in the SAME order `execute` runs the kernels — flatten
+        // `op_levels` (level-by-level, intra-level in index order), NOT the flat
+        // `op_order` topological sort. The two can differ, and a captured graph
+        // replays its packets in strict queue (FIFO) order; using `op_order`
+        // would dispatch a different sequence than the per-call path, corrupting
+        // results whenever a reused buffer's ordering relies on the level walk
+        // (e.g. multi-kernel decompositions like QR).
+        // Walk the emission order (level-by-level, intra-level index order) once,
+        // building the GraphKernel list AND a parallel hazard-dependency list in
+        // lock-step. Hazards are keyed on the RESOLVED buffer GVA (`buffer_ptrs`),
+        // not buffer ids: the memory planner aliases distinct logical buffers onto
+        // one GVA, so a GVA-keyed walk catches the WAR/WAW the logical
+        // `dependencies` field misses. For each emitted kernel `e`:
+        //   reads  = buffer_ptrs[j] for j NOT in output_indices
+        //   writes = buffer_ptrs[j] for j     in output_indices
+        //   deps   = last_writer[read]  (RAW)
+        //          ∪ last_writer[write] (WAW) ∪ readers[write] (WAR)
+        // then update: readers[read].push(e); for each write set last_writer=e and
+        // clear readers (a fresh writer; future readers depend on it via RAW).
+        //
+        // Soundness rests on `output_indices` being the COMPLETE write-set: a
+        // missed write would leave no last_writer and (BARRIER stripped) race a
+        // later reader. That holds here by construction — `output_indices` is
+        // derived from the kernel's STORE targets (`ProgramSpec.outs`) and a
+        // compiled kernel writes only via STOREs, and this walk only processes
+        // `CompiledProgram` ops (the `else { return Ok(None) }` below). Custom
+        // functions / copies are not graphed, so the invariant is not relied on
+        // for them.
+        let mut kernels = Vec::with_capacity(self.ops.len());
+        let mut last_writer: HashMap<usize, usize> = HashMap::new();
+        let mut readers: HashMap<usize, Vec<usize>> = HashMap::new();
+        for level in &self.op_levels {
+            for &idx in level {
+                let PreparedOp::CompiledProgram(k) = &self.ops[idx] else { return Ok(None) };
+                let (global_size, local_size) = Self::kernel_launch_sizes(k)?;
+                let e = kernels.len();
+
+                let write_pos: std::collections::HashSet<usize> = k.output_indices.iter().copied().collect();
+                let writes: Vec<usize> =
+                    k.output_indices.iter().filter_map(|&j| k.buffer_ptrs.get(j).copied()).collect();
+                let reads: Vec<usize> =
+                    (0..k.buffer_ptrs.len()).filter(|j| !write_pos.contains(j)).map(|j| k.buffer_ptrs[j]).collect();
+
+                let mut deps: std::collections::HashSet<usize> = std::collections::HashSet::new();
+                for &b in &reads {
+                    if let Some(&w) = last_writer.get(&b) {
+                        deps.insert(w); // RAW
+                    }
+                }
+                for &b in &writes {
+                    if let Some(&w) = last_writer.get(&b) {
+                        deps.insert(w); // WAW
+                    }
+                    if let Some(rs) = readers.get(&b) {
+                        deps.extend(rs.iter().copied()); // WAR
+                    }
+                }
+                deps.remove(&e);
+                let mut deps: Vec<usize> = deps.into_iter().collect();
+                deps.sort_unstable();
+
+                // Commit this kernel's effect on the hazard state.
+                for &b in &reads {
+                    readers.entry(b).or_default().push(e);
+                }
+                for &b in &writes {
+                    last_writer.insert(b, e);
+                    readers.insert(b, Vec::new());
+                }
+
+                kernels.push(svod_device::GraphKernel {
+                    program: k.kernel.program.as_ref(),
+                    buffers: k.buffer_ptrs.iter().map(|&p| p as *mut u8).collect(),
+                    vals: k.vals.clone(),
+                    global_size,
+                    local_size,
+                    deps,
+                });
+            }
+        }
+        factory(&kernels).map_err(|e| crate::error::Error::Execution { reason: format!("graph capture: {e}") })
+    }
+
+    /// Lazily mint (once) the plan's execution context from `program` and cache
+    /// it for the plan's lifetime. `None` ⇒ the backend has no reusable context
+    /// (CPU) and the caller dispatches per-call via `Program::execute`. The
+    /// context binds the plan to a shared queue; distinct plans spread onto
+    /// distinct queues for cross-plan parallelism.
+    fn plan_ctx(&self, program: &dyn svod_device::Program) -> Result<Option<&dyn svod_device::PlanContext>> {
+        if let Some(slot) = self.plan_ctx.get() {
+            return Ok(slot.as_deref());
+        }
+        let ctx = program
+            .new_exec_context()
+            .map_err(|e| crate::error::Error::Execution { reason: format!("exec context: {e}") })?;
+        // One-shot init race: if two threads see empty, both mint; only one wins
+        // `set()`. The loser's context drops here harmlessly (its `Arc` over the
+        // shared queue just decrements).
+        let _ = self.plan_ctx.set(ctx);
+        Ok(self.plan_ctx.get().expect("set above").as_deref())
+    }
+
+    /// Submit one kernel. Returns the dispatch's HW timestamp handle when the
+    /// backend stamps dispatches — `None` otherwise (e.g. CPU). The non-profiled
+    /// `execute` path drops it.
     #[inline]
-    fn execute_kernel(kernel: &PreparedKernel) -> Result<()> {
+    fn execute_kernel(&self, kernel: &PreparedKernel) -> Result<Option<Arc<dyn svod_device::DispatchTimestamps>>> {
         let buffer_ptrs: SmallVec<[*mut u8; 8]> = kernel.buffer_ptrs.iter().map(|&ptr| ptr as *mut u8).collect();
         let (global_size, local_size) = Self::kernel_launch_sizes(kernel)?;
+        let program = kernel.kernel.program.as_ref();
+        // Backends that expose a reusable context dispatch through it so all the
+        // plan's kernels share one queue. Others (CPU) return `None` and fall
+        // back to per-call `Program::execute`.
+        if let Some(ctx) = self.plan_ctx(program)? {
+            return unsafe { ctx.dispatch(program, &buffer_ptrs, &kernel.vals, global_size, local_size) }
+                .map_err(|e| crate::error::Error::Execution { reason: format!("Kernel {} failed: {e}", kernel.id) });
+        }
         unsafe {
-            kernel
-                .kernel
-                .program
-                .execute(&buffer_ptrs, &kernel.vals, global_size, local_size)
-                .map_err(|e| crate::error::Error::Execution { reason: format!("Kernel {} failed: {}", kernel.id, e) })
+            program
+                // wait=false: async submit. GPU ordering is enforced by the
+                // device timeline; host reads (copyout / as_*) synchronize.
+                .execute(&buffer_ptrs, &kernel.vals, global_size, local_size, /*wait=*/ false)
+                .map(|_| None)
+                .map_err(|e| crate::error::Error::Execution { reason: format!("Kernel {} failed: {e}", kernel.id) })
         }
     }
 
@@ -515,211 +664,11 @@ impl ExecutionPlan {
     #[inline]
     fn execute_op(&self, op: &PreparedOp) -> Result<()> {
         match op {
-            PreparedOp::CompiledProgram(kernel) => Self::execute_kernel(kernel),
+            PreparedOp::CompiledProgram(kernel) => self.execute_kernel(kernel).map(|_| ()),
             PreparedOp::BufferCopy(copy) => self.execute_copy(copy),
             PreparedOp::BufferView(view) => self.execute_buffer_view(view),
             PreparedOp::CustomFunction(custom) => self.execute_custom_function(custom),
         }
-    }
-
-    #[inline]
-    fn op_requires_serial(op: &PreparedOp) -> bool {
-        match op {
-            PreparedOp::CompiledProgram(kernel) => !kernel.kernel.host_parallel_safe,
-            PreparedOp::BufferCopy(_) | PreparedOp::BufferView(_) | PreparedOp::CustomFunction(_) => true,
-        }
-    }
-
-    #[inline]
-    fn compiled_kernel_at(&self, idx: usize) -> Option<&PreparedKernel> {
-        match &self.ops[idx] {
-            PreparedOp::CompiledProgram(kernel) => Some(kernel),
-            _ => None,
-        }
-    }
-
-    fn kernels_conflict(lhs: &PreparedKernel, rhs: &PreparedKernel) -> bool {
-        let lhs_outputs: HashSet<BufferId> =
-            lhs.output_indices.iter().filter_map(|&out_idx| lhs.buffer_ids.get(out_idx).copied()).collect();
-        let rhs_outputs: HashSet<BufferId> =
-            rhs.output_indices.iter().filter_map(|&out_idx| rhs.buffer_ids.get(out_idx).copied()).collect();
-
-        if !lhs_outputs.is_disjoint(&rhs_outputs) {
-            return true;
-        }
-
-        let lhs_reads: HashSet<BufferId> = lhs
-            .buffer_ids
-            .iter()
-            .enumerate()
-            .filter_map(|(idx, &buf)| (!lhs.output_indices.contains(&idx)).then_some(buf))
-            .collect();
-        let rhs_reads: HashSet<BufferId> = rhs
-            .buffer_ids
-            .iter()
-            .enumerate()
-            .filter_map(|(idx, &buf)| (!rhs.output_indices.contains(&idx)).then_some(buf))
-            .collect();
-
-        !lhs_outputs.is_disjoint(&rhs_reads) || !rhs_outputs.is_disjoint(&lhs_reads)
-    }
-
-    fn partition_parallel_safe_group(&self, indices: &[usize]) -> Result<Vec<Vec<usize>>> {
-        let mut groups: Vec<Vec<usize>> = Vec::new();
-
-        for &idx in indices {
-            let Some(kernel) = self.compiled_kernel_at(idx) else {
-                return Err(crate::error::Error::Execution {
-                    reason: format!("parallel partition expected compiled kernel at op index {idx}"),
-                });
-            };
-
-            let mut placed = false;
-            for group in &mut groups {
-                let has_conflict = group.iter().any(|&existing_idx| {
-                    self.compiled_kernel_at(existing_idx)
-                        .map(|existing| Self::kernels_conflict(existing, kernel))
-                        .unwrap_or(true)
-                });
-                if !has_conflict {
-                    group.push(idx);
-                    placed = true;
-                    break;
-                }
-            }
-
-            if !placed {
-                groups.push(vec![idx]);
-            }
-        }
-
-        Ok(groups)
-    }
-
-    fn execute_parallel_group(&self, indices: &[usize]) -> Result<()> {
-        if indices.len() <= 1 {
-            if let Some(&idx) = indices.first() {
-                self.execute_op(&self.ops[idx])?;
-            }
-            return Ok(());
-        }
-
-        let has_threaded_cpu_kernel = indices.iter().try_fold(false, |acc, &idx| {
-            let Some(kernel) = self.compiled_kernel_at(idx) else {
-                return Err(crate::error::Error::Execution {
-                    reason: format!("parallel execution expected compiled kernel at op index {idx}"),
-                });
-            };
-            Ok(acc || Self::kernel_uses_cpu_threading(kernel)?)
-        })?;
-
-        if has_threaded_cpu_kernel {
-            for &idx in indices {
-                let Some(kernel) = self.compiled_kernel_at(idx) else {
-                    return Err(crate::error::Error::Execution {
-                        reason: format!("parallel execution expected compiled kernel at op index {idx}"),
-                    });
-                };
-                Self::execute_kernel(kernel)?;
-            }
-            return Ok(());
-        }
-
-        indices
-            .par_iter()
-            .map(|&idx| {
-                let Some(kernel) = self.compiled_kernel_at(idx) else {
-                    return Err(crate::error::Error::Execution {
-                        reason: format!("parallel execution expected compiled kernel at op index {idx}"),
-                    });
-                };
-                Self::execute_kernel(kernel)
-            })
-            .collect::<Result<Vec<_>>>()?;
-
-        Ok(())
-    }
-
-    fn execute_parallel_group_profiled(&self, indices: &[usize]) -> Result<Vec<(usize, KernelProfile)>> {
-        if indices.len() <= 1 {
-            let mut profiles = Vec::new();
-            if let Some(&idx) = indices.first() {
-                let Some(kernel) = self.compiled_kernel_at(idx) else {
-                    return Err(crate::error::Error::Execution {
-                        reason: format!("profiled execution expected compiled kernel at op index {idx}"),
-                    });
-                };
-                let start = Instant::now();
-                Self::execute_kernel(kernel)?;
-                profiles.push((
-                    idx,
-                    KernelProfile {
-                        kernel: Arc::clone(&kernel.kernel),
-                        device: kernel.device.clone(),
-                        num_buffers: kernel.buffer_ptrs.len(),
-                        elapsed: start.elapsed(),
-                    },
-                ));
-            }
-            return Ok(profiles);
-        }
-
-        let has_threaded_cpu_kernel = indices.iter().try_fold(false, |acc, &idx| {
-            let Some(kernel) = self.compiled_kernel_at(idx) else {
-                return Err(crate::error::Error::Execution {
-                    reason: format!("profiled execution expected compiled kernel at op index {idx}"),
-                });
-            };
-            Ok(acc || Self::kernel_uses_cpu_threading(kernel)?)
-        })?;
-
-        if has_threaded_cpu_kernel {
-            let mut profiles = Vec::with_capacity(indices.len());
-            for &idx in indices {
-                let Some(kernel) = self.compiled_kernel_at(idx) else {
-                    return Err(crate::error::Error::Execution {
-                        reason: format!("profiled execution expected compiled kernel at op index {idx}"),
-                    });
-                };
-                let start = Instant::now();
-                Self::execute_kernel(kernel)?;
-                profiles.push((
-                    idx,
-                    KernelProfile {
-                        kernel: Arc::clone(&kernel.kernel),
-                        device: kernel.device.clone(),
-                        num_buffers: kernel.buffer_ptrs.len(),
-                        elapsed: start.elapsed(),
-                    },
-                ));
-            }
-            return Ok(profiles);
-        }
-
-        let mut profiles = indices
-            .par_iter()
-            .map(|&idx| {
-                let Some(kernel) = self.compiled_kernel_at(idx) else {
-                    return Err(crate::error::Error::Execution {
-                        reason: format!("profiled execution expected compiled kernel at op index {idx}"),
-                    });
-                };
-                let start = Instant::now();
-                Self::execute_kernel(kernel)?;
-                Ok((
-                    idx,
-                    KernelProfile {
-                        kernel: Arc::clone(&kernel.kernel),
-                        device: kernel.device.clone(),
-                        num_buffers: kernel.buffer_ptrs.len(),
-                        elapsed: start.elapsed(),
-                    },
-                ))
-            })
-            .collect::<Result<Vec<_>>>()?;
-
-        profiles.sort_by_key(|(idx, _)| *idx);
-        Ok(profiles)
     }
 
     /// Get the first (or only) output buffer after execution.
@@ -745,6 +694,38 @@ impl ExecutionPlan {
     /// Number of outputs in this plan.
     pub fn num_outputs(&self) -> usize {
         self.output_buffer_indices.len()
+    }
+
+    /// Copy `len` bytes from output `out_pos` (`src_off`) into the plan buffer
+    /// at `dst_index` (`dst_off`) — both owned by this plan, so the borrow is
+    /// split internally. The transfer stays on-device (SDMA when either side
+    /// is device-local), letting recurrent state recycle output→input without
+    /// a host round-trip.
+    pub fn copy_output_region_to_buffer(
+        &mut self,
+        out_pos: usize,
+        dst_index: usize,
+        dst_off: usize,
+        src_off: usize,
+        len: usize,
+    ) -> Result<()> {
+        let src_index = *self.output_buffer_indices.get(out_pos).ok_or_else(|| crate::error::Error::Execution {
+            reason: format!("copy_output_region_to_buffer: output {out_pos} out of range"),
+        })?;
+        if src_index == dst_index {
+            return Err(crate::error::Error::Execution {
+                reason: "copy_output_region_to_buffer: output aliases destination".into(),
+            });
+        }
+        let (dst, src) = if dst_index < src_index {
+            let (a, b) = self.buffers.split_at_mut(src_index);
+            (&mut a[dst_index], &b[0])
+        } else {
+            let (a, b) = self.buffers.split_at_mut(dst_index);
+            (&mut b[0], &a[src_index])
+        };
+        dst.copy_region_from(dst_off, src, src_off, len)
+            .map_err(|e| crate::error::Error::Execution { reason: format!("on-device state copy: {e}") })
     }
 
     /// Get a buffer by AST id (for reading intermediate results).
@@ -803,32 +784,25 @@ impl ExecutionPlan {
 
     /// Execute the plan.
     ///
-    /// Uses dependency-aware operation ordering for all prepared op types.
+    /// Walks `op_levels` level-by-level and runs each op within a level in
+    /// builder-insertion order. Multi-plan concurrency comes from distinct
+    /// `ExecutionPlan`s (e.g. BEAM search candidates) spread onto distinct
+    /// backend execution contexts from the device — not from rayon inside one
+    /// plan. The level-by-level iteration (vs. a flat `op_order` topological
+    /// linearization) is load-bearing for iterative CPU kernels (QR, etc.)
+    /// whose codegen is sensitive to within-level scheduling order — see
+    /// `test_execute_walks_op_levels_in_level_order`.
     pub fn execute(&self) -> Result<()> {
+        // Fast path: one captured graph submit instead of per-kernel dispatch.
+        // Built once, then every call just replays.
+        if let Some(graph) = self.graph().as_deref() {
+            return graph
+                .replay(&[])
+                .map_err(|e| crate::error::Error::Execution { reason: format!("graph replay failed: {e}") });
+        }
         for level in &self.op_levels {
-            let mut pending_parallel: Vec<usize> = Vec::new();
-
             for &idx in level {
-                let op = &self.ops[idx];
-                if Self::op_requires_serial(op) {
-                    if !pending_parallel.is_empty() {
-                        let groups = self.partition_parallel_safe_group(&pending_parallel)?;
-                        for group in groups {
-                            self.execute_parallel_group(&group)?;
-                        }
-                        pending_parallel.clear();
-                    }
-                    self.execute_op(op)?;
-                } else {
-                    pending_parallel.push(idx);
-                }
-            }
-
-            if !pending_parallel.is_empty() {
-                let groups = self.partition_parallel_safe_group(&pending_parallel)?;
-                for group in groups {
-                    self.execute_parallel_group(&group)?;
-                }
+                self.execute_op(&self.ops[idx])?;
             }
         }
         Ok(())
@@ -846,81 +820,54 @@ impl ExecutionPlan {
     ///
     /// // Sort by time descending
     /// let mut sorted = profiles;
-    /// sorted.sort_by(|a, b| b.elapsed.cmp(&a.elapsed));
+    /// sorted.sort_by(|a, b| b.wall.cmp(&a.wall));
     /// for p in &sorted[..10.min(sorted.len())] {
-    ///     println!("{:>8.3}ms  {}", p.elapsed.as_secs_f64() * 1000.0, p.kernel.entry_point);
+    ///     println!("{:>8.3}ms  {}", p.wall.as_secs_f64() * 1000.0, p.kernel.entry_point);
     /// }
     /// ```
+    /// Always dispatches per-kernel (never the captured graph): a graph replay
+    /// has one signal per batch, so per-dispatch stamps don't exist there.
+    /// Profiled timings reflect per-dispatch execution, not graph replay.
     pub fn execute_profiled(&self) -> Result<Vec<KernelProfile>> {
-        let mut profiles = Vec::new();
+        let mut profiles = Vec::with_capacity(self.op_order.len());
+        // Per-dispatch HW timestamp handles, harvested after the drain below
+        // (the GPU stamps a dispatch's signal only on retirement).
+        let mut handles: Vec<Option<Arc<dyn svod_device::DispatchTimestamps>>> =
+            Vec::with_capacity(self.op_order.len());
         for level in &self.op_levels {
-            let mut pending_parallel: Vec<usize> = Vec::new();
-
             for &idx in level {
                 match &self.ops[idx] {
-                    PreparedOp::CompiledProgram(kernel) if kernel.kernel.host_parallel_safe => {
-                        pending_parallel.push(idx);
-                    }
                     PreparedOp::CompiledProgram(kernel) => {
-                        if !pending_parallel.is_empty() {
-                            let groups = self.partition_parallel_safe_group(&pending_parallel)?;
-                            for group in groups {
-                                let mut prof = self.execute_parallel_group_profiled(&group)?;
-                                profiles.extend(prof.drain(..).map(|(_, p)| p));
-                            }
-                            pending_parallel.clear();
-                        }
-
                         let start = Instant::now();
-                        Self::execute_kernel(kernel)?;
+                        let handle = self.execute_kernel(kernel)?;
+                        handles.push(handle);
                         profiles.push(KernelProfile {
                             kernel: Arc::clone(&kernel.kernel),
                             device: kernel.device.clone(),
                             num_buffers: kernel.buffer_ptrs.len(),
-                            elapsed: start.elapsed(),
+                            wall: start.elapsed(),
+                            gpu_start_ns: None,
+                            gpu_end_ns: None,
                         });
                     }
-                    PreparedOp::BufferCopy(copy) => {
-                        if !pending_parallel.is_empty() {
-                            let groups = self.partition_parallel_safe_group(&pending_parallel)?;
-                            for group in groups {
-                                let mut prof = self.execute_parallel_group_profiled(&group)?;
-                                profiles.extend(prof.drain(..).map(|(_, p)| p));
-                            }
-                            pending_parallel.clear();
-                        }
-                        self.execute_copy(copy)?;
-                    }
-                    PreparedOp::BufferView(view) => {
-                        if !pending_parallel.is_empty() {
-                            let groups = self.partition_parallel_safe_group(&pending_parallel)?;
-                            for group in groups {
-                                let mut prof = self.execute_parallel_group_profiled(&group)?;
-                                profiles.extend(prof.drain(..).map(|(_, p)| p));
-                            }
-                            pending_parallel.clear();
-                        }
-                        self.execute_buffer_view(view)?;
-                    }
-                    PreparedOp::CustomFunction(custom) => {
-                        if !pending_parallel.is_empty() {
-                            let groups = self.partition_parallel_safe_group(&pending_parallel)?;
-                            for group in groups {
-                                let mut prof = self.execute_parallel_group_profiled(&group)?;
-                                profiles.extend(prof.drain(..).map(|(_, p)| p));
-                            }
-                            pending_parallel.clear();
-                        }
-                        self.execute_custom_function(custom)?;
-                    }
+                    PreparedOp::BufferCopy(copy) => self.execute_copy(copy)?,
+                    PreparedOp::BufferView(view) => self.execute_buffer_view(view)?,
+                    PreparedOp::CustomFunction(custom) => self.execute_custom_function(custom)?,
                 }
             }
-
-            if !pending_parallel.is_empty() {
-                let groups = self.partition_parallel_safe_group(&pending_parallel)?;
-                for group in groups {
-                    let mut prof = self.execute_parallel_group_profiled(&group)?;
-                    profiles.extend(prof.drain(..).map(|(_, p)| p));
+        }
+        if handles.iter().any(Option::is_some) {
+            // Handles exist only when a backend stamps dispatches, which means a
+            // context was minted; drain it so the GPU has written back the
+            // per-dispatch timestamps before we read them.
+            if let Some(ctx) = self.plan_ctx.get().and_then(|s| s.as_deref()) {
+                ctx.synchronize()
+                    .map_err(|e| crate::error::Error::Execution { reason: format!("profiled drain: {e}") })?;
+            }
+            for (profile, handle) in profiles.iter_mut().zip(&handles) {
+                if let Some((start, end)) = handle.as_ref().and_then(|h| h.timestamps_ns()) {
+                    profile.gpu_start_ns = Some(start);
+                    profile.gpu_end_ns = Some(end);
                 }
             }
         }
@@ -1008,6 +955,12 @@ impl ExecutionPlan {
         }
     }
 }
+
+// No explicit `Drop for ExecutionPlan`: the plan's `plan_ctx`
+// (`OnceLock<Option<Box<dyn PlanContext>>>`) just holds an `Arc` over a
+// backend-shared queue/context. On plan drop the `Arc` decrements; the
+// underlying queue stays in the backend's pool (freed only at device close), so
+// plan churn never tears down backend queues.
 
 impl std::fmt::Debug for ExecutionPlan {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1193,6 +1146,8 @@ impl ExecutionPlanBuilder {
             device: self.device,
             runtime_var_vals: HashMap::new(),
             alias_ids: self.alias_ids,
+            graph: std::sync::OnceLock::new(),
+            plan_ctx: std::sync::OnceLock::new(),
         })
     }
 }

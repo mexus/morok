@@ -1,9 +1,10 @@
-//! GigaAM CTC inference demo.
+//! GigaAM inference demo (CTC + RN-T).
 //!
-//! Loads a WAV, hands it to a [`Transcriber`] over a CTC-head [`GigaAm`] with
-//! an explicit [`SileroVadSplitter`], and prints the transcript. The pipeline
-//! (mel features, splitter-driven chunking, batched encoder JIT, head decode)
-//! lives inside `Transcriber`; this example is just a thin CLI on top.
+//! Loads a WAV, hands it to a [`Transcriber`] over a [`GigaAm`] with an
+//! explicit [`SileroVadSplitter`], and prints the transcript. The head is
+//! dispatched from the loaded weights: a CTC revision drives the fused
+//! encoder+head JIT, an RN-T revision the encoder + per-step predictor/joint
+//! backend (SentencePiece `▁ → space` post-processing inside the transcriber).
 //!
 //! Substitute `FixedLengthSplitter::new()` for the VAD splitter to skip the
 //! Silero hub download — useful for tests, short utterances, or pipelines
@@ -11,37 +12,79 @@
 //!
 //! Usage:
 //!   cargo run -p svod-model --release --example gigaam_infer -- audio.wav
+//!   cargo run -p svod-model --release --example gigaam_infer -- audio.wav --rnnt --profile
 //!
 //! Env knobs (all optional):
 //!   SVOD_AMX=1                 Enable AMX renderer (Apple Silicon).
-//!   SVOD_BEAM_DECODE=1         Promote greedy CTC to beam search.
-//!   SVOD_TIMESTAMPS=1          Emit per-word `[start - end] word` lines.
-//!   SVOD_GIGAAM_REVISION=name  HF Hub revision (default `ctc`).
-//!   SVOD_MAX_SCORES_MIB=N      SDPA scores buffer budget (default 256).
 //!   SVOD_VAD_THRESHOLD=f       Silero VAD threshold (default 0.5).
-//!
-//! See `gigaam_rnnt_infer.rs` for the RN-T variant (same pattern, RN-T-default
-//! revision).
 
-use std::env;
+use std::path::PathBuf;
 use std::time::Instant;
+
+use clap::Parser;
 
 use svod_model::gigaam::{GigaAm, TranscribeOpts, Transcriber};
 use svod_model::silero_vad::SileroVadSplitter;
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let t_total = Instant::now();
-    let wav_path = env::args().nth(1).ok_or("usage: gigaam_infer <audio.wav>")?;
-    let revision = env::var("SVOD_GIGAAM_REVISION").unwrap_or_else(|_| "ctc".to_string());
-    let opts = TranscribeOpts::from_env();
+#[derive(Parser, Debug)]
+#[command(about = "GigaAM transcription demo (CTC + RN-T)", long_about = None)]
+struct Args {
+    /// Input WAV (16 kHz mono; ints or floats).
+    wav: PathBuf,
 
-    println!("Loading audio: {wav_path}");
-    let (waveform, sample_rate) = load_wav(&wav_path)?;
+    /// HF Hub repo with the model weights.
+    #[arg(long, default_value = "vpermilp/GigaAM-v3")]
+    repo: String,
+
+    /// HF Hub revision; the head (CTC vs RN-T) follows the weights.
+    /// Defaults to `ctc`, or `e2e_rnnt` under `--rnnt`.
+    #[arg(long)]
+    revision: Option<String>,
+
+    /// Shorthand for the default RN-T revision.
+    #[arg(long)]
+    rnnt: bool,
+
+    /// Emit per-word `[start - end] word` lines.
+    #[arg(long)]
+    timestamps: bool,
+
+    /// Promote greedy CTC to beam search (no-op for RN-T).
+    #[arg(long)]
+    beam_decode: bool,
+
+    /// Collect and print the typed per-stage GPU profile.
+    #[arg(long)]
+    profile: bool,
+
+    /// SDPA scores buffer budget (MiB).
+    #[arg(long, default_value_t = 256)]
+    max_scores_mib: usize,
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    tracing_subscriber::fmt::init();
+
+    let t_total = Instant::now();
+    let args = Args::parse();
+    let revision = args.revision.clone().unwrap_or_else(|| if args.rnnt { "e2e_rnnt" } else { "ctc" }.to_string());
+    let opts = TranscribeOpts::builder()
+        .word_timestamps(args.timestamps)
+        .beam_decode(args.beam_decode)
+        .profile(args.profile)
+        .max_scores_mib(args.max_scores_mib)
+        .build();
+
+    println!("Loading audio: {}", args.wav.display());
+    let (waveform, sample_rate) = load_wav(&args.wav)?;
     let duration_s = waveform.len() as f32 / sample_rate as f32;
     println!("Samples: {} ({:.1}s @ {} Hz)", waveform.len(), duration_s, sample_rate);
 
-    println!("\nLoading GigaAM ({revision})...");
-    let model = GigaAm::from_hub_with_revision("vpermilp/GigaAM-v3", &revision)?;
+    println!("\nLoading GigaAM from {} ({revision})...", args.repo);
+    let model = GigaAm::from_hub_with_revision(&args.repo, &revision)?;
+    if args.rnnt && model.head.as_rnnt().is_none() {
+        return Err(format!("{}@{revision} has a CTC head, not RN-T.", args.repo).into());
+    }
     let splitter = SileroVadSplitter::from_hub()?;
     let mut transcriber = Transcriber::new(model, splitter, opts.clone())?;
 
@@ -61,10 +104,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
+    if let Some(profile) = &result.profile {
+        println!("\n--- Profile ---\n{profile}");
+    }
 
     println!("\n--- Transcript ---\n{}", result.text);
     println!(
-        "\nTotal: {:.2}s; transcribe: {:.2}s; loop RTF: {:.2}x",
+        "\nTotal: {:.2}s; transcribe: {:.2}s; loop RTF: {:.4}x",
         t_total.elapsed().as_secs_f32(),
         dt_transcribe.as_secs_f32(),
         if duration_s > 0.0 { dt_transcribe.as_secs_f32() / duration_s } else { 0.0 },
@@ -72,7 +118,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn load_wav(path: &str) -> Result<(Vec<f32>, u32), Box<dyn std::error::Error>> {
+fn load_wav(path: &PathBuf) -> Result<(Vec<f32>, u32), Box<dyn std::error::Error>> {
     let mut reader = hound::WavReader::open(path)?;
     let spec = reader.spec();
     let samples: Vec<f32> = match spec.sample_format {

@@ -354,16 +354,17 @@ fn test_realize_sum() {
 
 #[test]
 fn test_tensor_device_default_cpu() {
-    // Tensors created with from_slice default to CPU
+    // Tensors created with from_slice land on the active default device
+    // (CPU, or AMD under SVOD_DEVICE=AMD:0).
     let a = Tensor::from_slice([1.0f32, 2.0, 3.0]);
-    assert_eq!(a.device(), svod_ir::DeviceSpec::Cpu);
+    assert_eq!(a.device(), svod_dtype::default_device::default_device());
 }
 
 #[test]
 fn test_tensor_to_same_device_is_noop() {
     // Moving to the same device should return a clone
     let a = Tensor::from_slice([1.0f32, 2.0, 3.0]);
-    let b = a.to(svod_ir::DeviceSpec::Cpu);
+    let b = a.to(a.device());
     // Both should point to the same UOp (clone shares Rc)
     assert_eq!(a.device(), b.device());
 }
@@ -373,11 +374,13 @@ fn test_tensor_to_different_device_creates_copy() {
     use svod_ir::DeviceSpec;
     // Moving to a different device should create a COPY UOp
     let a = Tensor::from_slice([1.0f32, 2.0, 3.0]);
+    let orig = a.device();
+    // Cuda is never the active default here, so it is always a different device.
     let b = a.to(DeviceSpec::Cuda { device_id: 0 });
     // b should report the new device
     assert_eq!(b.device(), DeviceSpec::Cuda { device_id: 0 });
-    // a should still be on CPU
-    assert_eq!(a.device(), DeviceSpec::Cpu);
+    // a should be unchanged
+    assert_eq!(a.device(), orig);
 }
 
 // More comprehensive tests will be added in Phase 1.5
@@ -404,31 +407,6 @@ fn test_prepare_simple_add() {
     // Verify plan has kernels and buffers
     assert!(plan.kernels().next().is_some(), "Plan should have at least one kernel");
     assert!(!plan.buffers().is_empty(), "Plan should have buffers");
-}
-
-#[test]
-fn test_prepare_execution_plan_marks_cpu_kernels_host_parallel_safe() {
-    crate::test::helpers::test_setup();
-
-    let a = Tensor::from_slice([1.0f32, 2.0, 3.0]);
-    let b = Tensor::from_slice([4.0f32, 5.0, 6.0]);
-    let mut c = &a + &b;
-    let plan = c.prepare().expect("prepare should succeed");
-
-    let compiled: Vec<_> = plan
-        .prepared_ops()
-        .iter()
-        .filter_map(|op| match op {
-            svod_runtime::PreparedOp::CompiledProgram(kernel) => Some(kernel),
-            _ => None,
-        })
-        .collect();
-
-    assert!(!compiled.is_empty(), "prepare should produce compiled kernels");
-    assert!(
-        compiled.iter().all(|kernel| kernel.kernel.host_parallel_safe),
-        "CPU kernels should propagate host_parallel_safe metadata"
-    );
 }
 
 #[test]

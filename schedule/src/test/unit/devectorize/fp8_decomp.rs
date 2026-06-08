@@ -21,7 +21,11 @@ fn test_fp8_decomp_preserves_alt_on_gated_load() {
     let rendered = apply_pm_render(&load);
     assert_eq!(count_gated_loads_without_alt(&rendered), 0, "pm_render must attach alt values for gated FP8 loads");
 
-    let mut ctx = crate::devectorize::Fp8DecompCtx { from: ScalarDType::FP8E5M2, to: ScalarDType::Float16 };
+    let mut ctx = crate::devectorize::Fp8DecompCtx {
+        from: ScalarDType::FP8E5M2,
+        to: ScalarDType::Float16,
+        tc_operand_ids: std::collections::HashSet::new(),
+    };
     let decomposed = svod_ir::rewrite::graph_rewrite_with_bpm(
         &crate::devectorize::pm_float_decomp(),
         &crate::devectorize::pm_float_decomp_store(),

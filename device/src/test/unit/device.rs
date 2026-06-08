@@ -16,12 +16,39 @@ fn test_device_spec_parse() {
 }
 
 #[test]
+fn test_device_spec_parse_amd() {
+    assert_eq!(DeviceSpec::parse("AMD").unwrap(), DeviceSpec::Amd { device_id: 0 });
+    assert_eq!(DeviceSpec::parse("AMD:1").unwrap(), DeviceSpec::Amd { device_id: 1 });
+    assert_eq!(DeviceSpec::parse("hip:2").unwrap(), DeviceSpec::Amd { device_id: 2 });
+}
+
+#[test]
 fn test_device_spec_canonicalize() {
     assert_eq!(DeviceSpec::Cpu.canonicalize(), "CPU");
 
     #[cfg(feature = "cuda")]
     {
         assert_eq!(DeviceSpec::Cuda { device_id: 1 }.canonicalize(), "CUDA:1");
+    }
+
+    assert_eq!(DeviceSpec::Amd { device_id: 0 }.canonicalize(), "AMD:0");
+    assert_eq!(DeviceSpec::Amd { device_id: 2 }.canonicalize(), "AMD:2");
+}
+
+#[test]
+fn test_amd_device_open_returns_clean_result() {
+    // On hosts without AMD GPU: NoAmdGpu.
+    // On hosts with an unsupported arch (e.g. RDNA2/gfx1036): AmdAllocFailed.
+    // On hosts with a supported gfx target: Ok. Never panics; that's the
+    // load-bearing assertion.
+    use crate::error::Error;
+    match crate::registry::get_device("AMD:0") {
+        Ok(_)
+        | Err(Error::NoAmdGpu { .. })
+        | Err(Error::AmdAllocFailed { .. })
+        | Err(Error::AmdIoctl { .. })
+        | Err(Error::DeviceUnavailable { .. }) => {}
+        Err(other) => panic!("unexpected error variant: {other:?}"),
     }
 }
 
@@ -100,6 +127,27 @@ fn test_program_spec_derives_launch_dims_from_specials() {
     let launch = spec.launch_dims(&vars).expect("resolve launch dims");
     assert_eq!(launch.global_size, [8, 1, 1]);
     assert_eq!(launch.local_size, Some([4, 1, 1]));
+}
+
+#[test]
+fn test_program_spec_launch_dims_resolves_mulacc_extent() {
+    // The symbolic simplifier fuses `16*ts − 1` (from a reshaped `16·ts`
+    // sequence axis) into a single MulAcc launch extent. The launch-size
+    // evaluator must compute `ts*16 − 1` rather than reject the op.
+    let ts = UOp::define_var("ts".to_string(), 1, 8);
+    let sixteen = UOp::index_const(16);
+    let minus_one = UOp::index_const(-1);
+    let extent = UOp::try_mulacc(ts, sixteen, minus_one).expect("build MulAcc extent");
+    let g = UOp::special(extent, "gidx0".to_string());
+    let sink = UOp::sink(vec![g]);
+    let linear = UOp::linear(sink.toposort().into());
+    let source = UOp::source("void mulacc_kernel() {}".to_string());
+    let program = UOp::program(sink, UOp::device(DeviceSpec::Cpu), Some(linear), Some(source), None);
+
+    let spec = crate::device::ProgramSpec::from_uop(&program).expect("program spec from mulacc special");
+    let vars = std::collections::HashMap::from([("ts", 8i64)]);
+    let launch = spec.launch_dims(&vars).expect("resolve launch dims with MulAcc extent");
+    assert_eq!(launch.global_size, [127, 1, 1], "ts*16 - 1 = 8*16 - 1 = 127");
 }
 
 #[test]

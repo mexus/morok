@@ -21,6 +21,7 @@ use std::path::Path;
 
 use snafu::{ResultExt, Snafu};
 use svod_dtype::DType;
+use svod_ir::SInt;
 use svod_macros::jit_wrapper;
 use svod_tensor::Tensor;
 use svod_tensor::nn::{Conv1d, LSTMCell, Layer, PadMode};
@@ -127,8 +128,14 @@ impl SileroVad {
         }
     }
 
-    pub fn forward_chunk(&self, chunk: &Tensor, state_h: &Tensor, state_c: &Tensor) -> Result<Tensor> {
-        let x = chunk
+    /// Per-window convolutional front-end (STFT filterbank + four conv blocks),
+    /// **batched** over the leading axis. Input `chunks: [B, CHUNK_LEN]`, output
+    /// `[B, HIDDEN]` — the LSTM input feature for each window. This part of the
+    /// forward pass is **not** recurrent, so all `B` windows run in one batched
+    /// dispatch; the recurrent LSTM + head runs separately (on the host) over
+    /// these features. See [`VadInference::probs`].
+    pub fn forward_features(&self, chunks: &Tensor) -> Result<Tensor> {
+        let x = chunks
             .pad_with()
             .padding(&[(0, 0), (0, STFT_PAD as isize)])
             .mode(PadMode::Reflect)
@@ -139,8 +146,14 @@ impl SileroVad {
 
         let x = self.stft_conv.forward(&x).context(TensorSnafu)?;
 
-        let real = x.try_shrink([(0, 1), (0, CUTOFF), (0, 4)]).context(TensorSnafu)?;
-        let imag = x.try_shrink([(0, 1), (CUTOFF, 258), (0, 4)]).context(TensorSnafu)?;
+        // Keep the full (symbolic) batch dim (`None`); split STFT real/imag
+        // channels and the fixed 4 time frames.
+        let real = x
+            .try_shrink([None, Some((SInt::Const(0), SInt::Const(CUTOFF))), Some((SInt::Const(0), SInt::Const(4)))])
+            .context(TensorSnafu)?;
+        let imag = x
+            .try_shrink([None, Some((SInt::Const(CUTOFF), SInt::Const(258))), Some((SInt::Const(0), SInt::Const(4)))])
+            .context(TensorSnafu)?;
         let x = real
             .square()
             .context(TensorSnafu)?
@@ -152,14 +165,33 @@ impl SileroVad {
         let x = self.conv1.forward(&x).context(TensorSnafu)?.relu().context(TensorSnafu)?;
         let x = self.conv2.forward(&x).context(TensorSnafu)?.relu().context(TensorSnafu)?;
         let x = self.conv3.forward(&x).context(TensorSnafu)?.relu().context(TensorSnafu)?;
-        let x = self
-            .conv4
+        self.conv4
             .forward(&x)
             .context(TensorSnafu)?
             .relu()
             .context(TensorSnafu)?
             .try_squeeze(Some(-1))
-            .context(TensorSnafu)?;
+            .context(TensorSnafu)
+    }
+
+    /// Conv front-end + the LSTM's non-recurrent input projection, batched:
+    /// `[B, CHUNK_LEN] -> [B, 4*HIDDEN]` pre-activation gates
+    /// (`W_ih·feat + bias_ih + bias_hh`, PyTorch `[i,f,g,o]` order). Hoisting
+    /// the projection into the JIT leaves the host scan only the recurrent
+    /// `W_hh·h` and activations. Bias order: `(feat·W_ihᵀ + b_ih) + b_hh`.
+    pub fn forward_gates(&self, chunks: &Tensor) -> Result<Tensor> {
+        let feat = self.forward_features(chunks)?;
+        feat.linear()
+            .weight(&self.lstm.weight_ih)
+            .bias(&self.lstm.bias_ih)
+            .call()
+            .context(TensorSnafu)?
+            .try_add(&self.lstm.bias_hh)
+            .context(TensorSnafu)
+    }
+
+    pub fn forward_chunk(&self, chunk: &Tensor, state_h: &Tensor, state_c: &Tensor) -> Result<Tensor> {
+        let x = self.forward_features(chunk)?;
 
         let (new_h, new_c) = self.lstm.step(&x, state_h, state_c).context(TensorSnafu)?;
 
@@ -188,87 +220,172 @@ fn get(sd: &state::StateDict, key: &str) -> Result<Tensor> {
         .ok_or_else(|| Error::State { source: Box::new(state::Error::MissingKey { key: key.to_string() }) })
 }
 
-jit_wrapper! {
-    SileroVadJit(SileroVad) {
-        chunk: Tensor,
-        state_h: Tensor,
-        state_c: Tensor,
+/// Max windows per batched conv-front-end dispatch. Larger = fewer dispatches
+/// (less per-dispatch round-trip latency) but more VRAM + a longer compile.
+const FEATURE_BATCH: usize = 4096;
 
-        build(chunk, state_h, state_c) {
-            model.forward_chunk(chunk, state_h, state_c)
+jit_wrapper! {
+    SileroVadFeatureJit(SileroVad) {
+        chunks: Tensor,
+
+        build(chunks) {
+            // [FEATURE_BATCH, CHUNK_LEN] -> [FEATURE_BATCH, 4*HIDDEN] LSTM gate
+            // pre-activations (conv features + input projection, biases folded).
+            // Fixed batch (not a runtime var): the front-end is row-independent,
+            // so partial batches just fill fewer rows and ignore the rest — and
+            // a symbolic leading dim trips the reflect-pad lowering.
+            model.forward_gates(chunks)
         }
     }
 }
 
-impl crate::jit::RecurrentJit for SileroVadJit {
-    fn pack_state(&mut self, s: &crate::jit::LstmState) -> crate::jit::Result<()> {
-        {
-            let buf = self.state_h_mut()?;
-            let mut view = buf.as_array_mut::<f32>().context(crate::jit::DeviceSnafu)?;
-            view.as_slice_mut().expect("contiguous state_h").copy_from_slice(&s.h);
-        }
-        {
-            let buf = self.state_c_mut()?;
-            let mut view = buf.as_array_mut::<f32>().context(crate::jit::DeviceSnafu)?;
-            view.as_slice_mut().expect("contiguous state_c").copy_from_slice(&s.c);
-        }
-        Ok(())
-    }
+/// Host-resident recurrent weights for the scan. The input projection
+/// (`W_ih`, biases) lives in the feature JIT ([`SileroVad::forward_gates`]);
+/// only the recurrence stays host-side — per-step work is too small for a
+/// GPU launch and measured 3x slower as a CPU-device JIT than 8-lane SIMD.
+pub(crate) struct VadHead {
+    pub(crate) w_hh: ndarray::Array2<f32>,    // [4H, H]
+    pub(crate) final_w: ndarray::Array1<f32>, // [H]
+    pub(crate) final_b: f32,
+}
 
-    fn execute_step(&mut self) -> crate::jit::Result<()> {
-        self.execute()
-    }
+#[inline]
+fn sigmoid(x: f32) -> f32 {
+    1.0 / (1.0 + (-x).exp())
+}
 
-    fn output_buffer(&self) -> crate::jit::Result<&svod_device::Buffer> {
-        self.output()
+impl VadHead {
+    /// Recurrent LSTM + sigmoid head over `[n, 4H]` pre-activation gates from
+    /// the feature JIT (`W_ih·feat + biases`, PyTorch `[i,f,g,o]` order),
+    /// 8-lane SIMD activations.
+    pub(crate) fn scan(&self, gates_x: &[f32], n: usize) -> Vec<f32> {
+        use wide::f32x8;
+        const L: usize = 8;
+        let h = self.final_w.len();
+        debug_assert_eq!(h % L, 0, "HIDDEN must be a multiple of the SIMD width");
+        debug_assert_eq!(gates_x.len(), n * 4 * h, "gates shape");
+
+        let lanes = |v: &[f32], j: usize| f32x8::from(<[f32; L]>::try_from(&v[j..j + L]).expect("lane"));
+        let sig = |x: f32x8| ((-x).exp() + 1.0).recip();
+        let w = self.final_w.as_slice().expect("final_w");
+
+        let mut hs = ndarray::Array1::<f32>::zeros(h);
+        let mut cs = vec![0.0f32; h];
+        let mut gh = ndarray::Array1::<f32>::zeros(4 * h); // recurrent projection scratch, reused per step
+        let mut probs = Vec::with_capacity(n);
+        for t in 0..n {
+            let gx = &gates_x[t * 4 * h..(t + 1) * 4 * h];
+            // gh = W_hh · h, written in place to avoid a per-step heap allocation.
+            ndarray::linalg::general_mat_vec_mul(1.0, &self.w_hh, &hs, 0.0, &mut gh);
+            let ghs = gh.as_slice().expect("contiguous gh");
+            let hss = hs.as_slice_mut().expect("contiguous hs");
+            let mut p = f32x8::ZERO;
+            for j in (0..h).step_by(L) {
+                let gate = |k: usize| lanes(gx, k) + lanes(ghs, k);
+                let i = sig(gate(j));
+                let f = sig(gate(h + j));
+                let g = gate(2 * h + j).tanh();
+                let o = sig(gate(3 * h + j));
+                let c = f * lanes(&cs, j) + i * g;
+                let hv = o * c.tanh();
+                cs[j..j + L].copy_from_slice(&c.to_array());
+                hss[j..j + L].copy_from_slice(&hv.to_array());
+                p += lanes(w, j) * hv.max(f32x8::ZERO);
+            }
+            probs.push(sigmoid(self.final_b + p.reduce_add()));
+        }
+        probs
     }
 }
 
 pub struct VadInference {
-    inner: crate::jit::JitRecurrent<SileroVadJit>,
+    jit: SileroVadFeatureJit,
+    head: VadHead,
 }
 
 impl VadInference {
     pub fn new(vad: SileroVad) -> crate::jit::Result<Self> {
-        use crate::jit::InputSpec;
-        let mut jit = SileroVadJit::new(vad);
-        jit.prepare(InputSpec::f32(&[1, CHUNK_LEN]), InputSpec::f32(&[1, HIDDEN]), InputSpec::f32(&[1, HIDDEN]))?;
-        Ok(Self { inner: crate::jit::JitRecurrent::new(jit, crate::jit::LstmState::zeros(HIDDEN), 1)? })
+        use crate::jit::{InputSpec, TensorSnafu};
+        let h = HIDDEN;
+        // Pull the recurrent weights to host before `vad` moves into the JIT.
+        let to_vec = |t: &Tensor| -> crate::jit::Result<Vec<f32>> {
+            let mut t = t.clone();
+            t.realize().context(TensorSnafu)?;
+            t.as_vec::<f32>().context(TensorSnafu)
+        };
+        let w_hh = ndarray::Array2::from_shape_vec((4 * h, h), to_vec(&vad.lstm.weight_hh)?).expect("w_hh shape");
+        let final_w = ndarray::Array1::from_vec(to_vec(&vad.final_conv.weight)?); // [1,H,1] flat = H
+        let final_b = match &vad.final_conv.bias {
+            Some(b) => to_vec(b)?[0],
+            None => 0.0,
+        };
+        let head = VadHead { w_hh, final_w, final_b };
+
+        let mut jit = SileroVadFeatureJit::new(vad);
+        // Device-local output: the [FEATURE_BATCH, 4*HIDDEN] gates readback
+        // (8 MiB per dispatch) goes over the SDMA copy queue instead of the
+        // ~21 MB/s host-mapped BAR — same pattern as the encoder output.
+        let mut config = svod_tensor::PrepareConfig::from_env();
+        config.device_local_outputs = true;
+        jit.prepare_with_config(InputSpec::f32(&[FEATURE_BATCH, CHUNK_LEN]), &config)?;
+        Ok(Self { jit, head })
     }
 
-    pub fn process_chunk(&mut self, chunk: &[f32]) -> crate::jit::Result<f32> {
-        let head = self.inner.step(|jit| {
-            let buf = jit.chunk_mut()?;
-            let mut view = buf.as_array_mut::<f32>().context(crate::jit::DeviceSnafu)?;
-            view.as_slice_mut().expect("contiguous chunk")[..chunk.len()].copy_from_slice(chunk);
-            Ok(())
-        })?;
-        Ok(head[0])
-    }
-
-    /// Run Silero V5 across the waveform and collect one speech probability
-    /// per [`NUM_SAMPLES`]-sample window. The output length is
-    /// `ceil(waveform.len() / NUM_SAMPLES)`; trailing entries cover the
-    /// zero-padding past the waveform end.
+    /// Run Silero V5 across the waveform and collect one speech probability per
+    /// [`NUM_SAMPLES`]-sample window. Output length is
+    /// `ceil(waveform.len() / NUM_SAMPLES)`. The conv front-end runs **batched**
+    /// on the GPU (a handful of dispatches); the recurrent LSTM + sigmoid head
+    /// scan runs on the host — eliminating the old one-tiny-dispatch-per-window
+    /// path whose per-dispatch round-trip latency dominated.
     pub fn probs(&mut self, waveform: &[f32]) -> crate::jit::Result<Vec<f32>> {
-        self.inner.reset();
         let total = waveform.len();
         if total == 0 {
             return Ok(Vec::new());
         }
-
         let pad_len = (NUM_SAMPLES - total % NUM_SAMPLES) % NUM_SAMPLES;
         let padded_len = CONTEXT_SIZE + total + pad_len;
         let mut padded = vec![0.0f32; padded_len];
         padded[CONTEXT_SIZE..CONTEXT_SIZE + total].copy_from_slice(waveform);
 
         let n_chunks = (total + pad_len) / NUM_SAMPLES;
-        let mut probs: Vec<f32> = Vec::with_capacity(n_chunks);
-        for i in 0..n_chunks {
-            let start = i * NUM_SAMPLES;
-            let chunk = &padded[start..start + CHUNK_LEN];
-            probs.push(self.process_chunk(chunk)?);
+        let h = HIDDEN;
+
+        // Phase 1: batched conv front-end + LSTM input projection on the GPU
+        // -> pre-activation gates [n_chunks, 4H].
+        let t_feat = std::time::Instant::now();
+        let mut gates = vec![0.0f32; n_chunks * 4 * h];
+        let mut done = 0usize;
+        while done < n_chunks {
+            let b = (n_chunks - done).min(FEATURE_BATCH);
+            {
+                let buf = self.jit.chunks_mut()?;
+                let mut view = buf.as_array_mut::<f32>().context(crate::jit::DeviceSnafu)?;
+                let slice = view.as_slice_mut().expect("contiguous chunks");
+                for i in 0..b {
+                    let start = (done + i) * NUM_SAMPLES;
+                    slice[i * CHUNK_LEN..(i + 1) * CHUNK_LEN].copy_from_slice(&padded[start..start + CHUNK_LEN]);
+                }
+            }
+            self.jit.execute()?;
+            // Device-local output: SDMA-stage only the valid rows out.
+            let dst = &mut gates[done * 4 * h..(done + b) * 4 * h];
+            self.jit.output()?.copyout_prefix(bytemuck::cast_slice_mut(dst)).context(crate::jit::DeviceSnafu)?;
+            done += b;
         }
+        let feature_ms = t_feat.elapsed().as_secs_f64() * 1e3;
+
+        // Phase 2: recurrent LSTM + sigmoid head on the host (SIMD).
+        let t_scan = std::time::Instant::now();
+        let probs = self.head.scan(&gates, n_chunks);
+        let scan_ms = t_scan.elapsed().as_secs_f64() * 1e3;
+
+        tracing::info!(
+            target: "svod_model::silero_vad",
+            n_chunks,
+            feature_ms,
+            scan_ms,
+            "silero vad probs breakdown (batched conv + host LSTM scan)",
+        );
         Ok(probs)
     }
 
@@ -277,11 +394,17 @@ impl VadInference {
     /// the given `threshold`. Errors from the JIT or chunker are swallowed —
     /// callers that need fault-visibility should drive `probs()` and
     /// `chunks_from_probs` directly.
+    ///
+    /// Chunk ends are clamped to `waveform.len()` via `ChunkerOpts::
+    /// max_total_samples`: the prob→sample mapping rounds the final window up
+    /// past the audio (the trailing zero-pad), and a speech region can't extend
+    /// beyond the waveform.
     pub fn segment(&mut self, waveform: &[f32], threshold: f32) -> Vec<(usize, usize)> {
         let Ok(probs) = self.probs(waveform) else { return Vec::new() };
         let opts = svod_arch::vad::ChunkerOpts {
             threshold,
             samples_per_prob: NUM_SAMPLES,
+            max_total_samples: Some(waveform.len()),
             ..svod_arch::vad::ChunkerOpts::default()
         };
         svod_arch::vad::chunks_from_probs(&probs, &opts)

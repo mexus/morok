@@ -34,6 +34,15 @@ use parking_lot::{Condvar, Mutex};
 use crate::error::{Result, RuntimeSnafu};
 use snafu::ensure;
 
+/// Hardware-stamped GPU dispatch timestamps, readable once the dispatch
+/// retired. Backend-agnostic: AMD reads the completion signal's CP stamps;
+/// CUDA/Metal can wrap event pairs / command-buffer GPU times later. `None`
+/// until retirement or when the backend can't stamp.
+pub trait DispatchTimestamps: Send + Sync {
+    /// `(start_ns, end_ns)` on the GPU clock.
+    fn timestamps_ns(&self) -> Option<(u64, u64)>;
+}
+
 /// Monotonic timeline signal for synchronization.
 ///
 /// Timeline signals provide a way to order operations across different execution

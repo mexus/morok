@@ -66,7 +66,7 @@ entry:
     let pointers: Vec<*mut u8> = vec![];
 
     unsafe {
-        program.execute(&pointers, &[], None, None).expect("Execution should succeed");
+        program.execute(&pointers, &[], None, None, /*wait=*/ true).expect("Execution should succeed");
     }
 }
 

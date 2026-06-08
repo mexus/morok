@@ -9,7 +9,7 @@
 use bon::bon;
 use snafu::{ResultExt, Snafu};
 
-use crate::audio::{AudioChunk, EncoderBounds, Splitter, trim_chunks_to_waveform};
+use crate::audio::{AudioChunk, EncoderBounds, Splitter};
 use crate::silero_vad::{NUM_SAMPLES, SileroVad, VadInference};
 
 /// VAD-driven splitter. Construction: [`from_hub`](Self::from_hub) loads the
@@ -101,12 +101,12 @@ impl Splitter for SileroVadSplitter {
             trough_threshold: Some(self.threshold * 0.5),
             pad_samples: self.pad_samples,
             align_to: bounds.align_to_samples().max(1),
+            // `align_to` rounds chunk ends up to a stride multiple, which can
+            // push the trailing chunk past the audio; the chunker clamps every
+            // end to this so the `Splitter` in-range contract holds.
+            max_total_samples: Some(waveform.len()),
         };
-        let mut chunks = svod_arch::vad::chunks_from_probs(&probs, &chunker_opts).context(ChunkSnafu)?;
-        // `align_to` rounds chunk ends up to a stride multiple, which can push
-        // the trailing chunk past `waveform.len()`. The `Splitter` contract
-        // forbids that, so clamp the tail before returning.
-        trim_chunks_to_waveform(&mut chunks, waveform.len());
+        let chunks = svod_arch::vad::chunks_from_probs(&probs, &chunker_opts).context(ChunkSnafu)?;
         Ok(chunks)
     }
 

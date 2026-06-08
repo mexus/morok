@@ -56,33 +56,34 @@ impl RnntPredictor {
         }
     }
 
-    /// Run one predictor step. Returns a single tensor of shape
-    /// `[1, 1, pred_hidden + 2 * num_layers * pred_hidden]` containing
-    /// `[g | h_out_flat | c_out_flat]` concatenated along the last axis.
-    ///
-    /// The flat layout is so the result fits one output tensor (the JIT
-    /// macro is single-output). Caller splits by known offsets after copyout.
-    pub fn forward_concat(&self, prev_token: &Tensor, h_in: &Tensor, c_in: &Tensor) -> Result<Tensor> {
+    /// Run one batched predictor step. `prev_token [B, 1]`, `h_in`/`c_in
+    /// [L, B, P]` → `(g [B, 1, P], new_h_flat [B, 1, L*P], new_c_flat
+    /// [B, 1, L*P])`, batch taken from the state shape. Kept as separate
+    /// tensors so the fused step JIT can feed `g` straight into the joint
+    /// on-device and expose the state as its own output.
+    pub fn forward_parts(&self, prev_token: &Tensor, h_in: &Tensor, c_in: &Tensor) -> Result<(Tensor, Tensor, Tensor)> {
         let p = self.pred_hidden as isize;
         let l = self.layers.len() as isize;
+        let b =
+            h_in.shape().context(TensorSnafu)?[1].as_const().expect("predictor batch dim must be concrete") as isize;
 
-        // Embed lookup: prev_token [1, 1] -> emb [1, 1, P].
+        // Embed lookup: prev_token [B, 1] -> emb [B, 1, P].
         // Squeeze the seq-len axis to feed the LSTM cell shape [B, P].
         let emb = self.embed.embedding(prev_token).context(TensorSnafu)?;
-        let mut layer_in = emb.try_squeeze(Some(1)).context(TensorSnafu)?; // [1, P]
+        let mut layer_in = emb.try_squeeze(Some(1)).context(TensorSnafu)?; // [B, P]
 
         let mut new_hs: Vec<Tensor> = Vec::with_capacity(self.layers.len());
         let mut new_cs: Vec<Tensor> = Vec::with_capacity(self.layers.len());
         for (i, cell) in self.layers.iter().enumerate() {
             let i_i = i as isize;
-            // Slice layer i's h, c → [1, 1, P], squeeze leading axis → [1, P].
+            // Slice layer i's h, c → [1, B, P], squeeze leading axis → [B, P].
             let h_i = h_in
-                .try_shrink([(i_i, i_i + 1), (0, 1), (0, p)])
+                .try_shrink([(i_i, i_i + 1), (0, b), (0, p)])
                 .context(TensorSnafu)?
                 .try_squeeze(Some(0))
                 .context(TensorSnafu)?;
             let c_i = c_in
-                .try_shrink([(i_i, i_i + 1), (0, 1), (0, p)])
+                .try_shrink([(i_i, i_i + 1), (0, b), (0, p)])
                 .context(TensorSnafu)?
                 .try_squeeze(Some(0))
                 .context(TensorSnafu)?;
@@ -92,17 +93,24 @@ impl RnntPredictor {
             layer_in = new_h;
         }
 
-        // g = last layer output [1, P] → [1, 1, P].
+        // g = last layer output [B, P] → [B, 1, P].
         let g = layer_in.try_unsqueeze(1).context(TensorSnafu)?;
 
-        // Stack per-layer h, c → [L, 1, P]. Reshape to [1, 1, L * P] for concat.
+        // Stack per-layer h, c → [L, B, P]; batch-major → [B, 1, L * P].
         let new_h_stacked = Tensor::stack(&new_hs.iter().collect::<Vec<_>>(), 0).context(TensorSnafu)?;
         let new_c_stacked = Tensor::stack(&new_cs.iter().collect::<Vec<_>>(), 0).context(TensorSnafu)?;
-        let new_h_flat = new_h_stacked.try_reshape([1, 1, l * p]).context(TensorSnafu)?;
-        let new_c_flat = new_c_stacked.try_reshape([1, 1, l * p]).context(TensorSnafu)?;
+        let new_h_flat = new_h_stacked
+            .try_permute(&[1, 0, 2])
+            .context(TensorSnafu)?
+            .try_reshape([b, 1, l * p])
+            .context(TensorSnafu)?;
+        let new_c_flat = new_c_stacked
+            .try_permute(&[1, 0, 2])
+            .context(TensorSnafu)?
+            .try_reshape([b, 1, l * p])
+            .context(TensorSnafu)?;
 
-        // Concat along the last axis: [1, 1, P + L*P + L*P].
-        Tensor::cat(&[&g, &new_h_flat, &new_c_flat], 2).context(TensorSnafu)
+        Ok((g, new_h_flat, new_c_flat))
     }
 
     /// Zero the blank-id embedding row in place — matches Python's

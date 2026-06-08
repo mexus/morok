@@ -110,7 +110,10 @@ impl Tensor {
             .try_add(&Tensor::new(UOp::const_(DType::Float32, ConstValue::Float(eps))))?
             .try_rsqrt()?;
 
-        self.try_mul(&norm)
+        // The f32 `norm` promotes the product to f32; cast back to the input dtype
+        // so an fp16 input returns fp16 rather than silently widening to f32.
+        let normalized = self.try_mul(&norm)?;
+        if original_dtype != DType::Float32 { normalized.cast(original_dtype) } else { Ok(normalized) }
     }
 
     /// Lp normalization along an axis.

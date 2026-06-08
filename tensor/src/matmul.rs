@@ -106,7 +106,16 @@ impl Tensor {
         // Step 4: Transpose, multiply, and sum
         let product = x_reshaped.try_mul(&w_reshaped.try_transpose(-1, axis_w)?)?;
 
-        if let Some(dt) = dtype { product.sum_with().axes(-1).dtype(dt).call() } else { product.sum(-1) }
+        // Cast the contraction result back to `product`'s dtype (the promoted
+        // operand dtype), so an int8·int8 dot returns int8 rather than the widened
+        // int32 sum accumulator. No-op for float dtypes.
+        if let Some(dt) = dtype {
+            product.sum_with().axes(-1).dtype(dt).call()
+        } else {
+            let out_dtype = product.uop().dtype();
+            let summed = product.sum(-1)?;
+            if summed.uop().dtype() != out_dtype { summed.cast(out_dtype) } else { Ok(summed) }
+        }
     }
 
     /// General Matrix Multiplication: alpha * A @ B + beta * C

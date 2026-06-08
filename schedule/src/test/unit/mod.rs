@@ -7,6 +7,7 @@ pub mod passes;
 pub mod pattern;
 pub mod rangeify;
 pub mod rewrite;
+pub mod spec;
 pub mod symbolic;
 
 #[cfg(feature = "z3")]

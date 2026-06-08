@@ -75,8 +75,8 @@ use crate::devectorize::{
 use crate::gpudims::pm_add_gpudims;
 use crate::rangeify::patterns::{
     pm_add_loads, pm_comparison_negations, pm_demorgan, pm_div_to_shr, pm_erf_decomposition, pm_fdiv_to_mul,
-    pm_fma_decomposition, pm_load_collapse, pm_mod_to_and, pm_mul_to_shl, pm_neg_from_mul, pm_shl_add_to_mulacc,
-    pm_threefry_decomp, rangeify_codegen_with_kernel_ctx,
+    pm_fma_decomposition, pm_half_bf16_cast, pm_load_collapse, pm_mod_to_and, pm_mul_to_shl, pm_neg_from_mul,
+    pm_shl_add_to_mulacc, pm_threefry_decomp, rangeify_codegen_with_kernel_ctx,
 };
 use crate::rangeify::pm_add_buffers_local_patterns;
 use crate::rangeify::transforms::{pm_flatten_range, pm_simplify_ranges, pm_split_ranges};
@@ -406,11 +406,14 @@ pub fn apply_post_optimization_with_renderer(ast: Arc<svod_ir::UOp>, renderer: O
     let fp8_pm = pm_float_decomp();
     let fp8_bpm = pm_float_decomp_store();
     let mut fp8_decomposed = rendered;
+    // WMMA consumes fp8 operands natively (the renderer packs fp8 lanes into the
+    // MFMA), so exempt their backward slice from software fp8→f16 decomposition.
+    let tc_operand_ids = crate::devectorize::tc_operand_slice_ids(&fp8_decomposed);
     for (fr, to) in [
         (svod_dtype::ScalarDType::FP8E5M2, svod_dtype::ScalarDType::Float16),
         (svod_dtype::ScalarDType::FP8E4M3, svod_dtype::ScalarDType::Float16),
     ] {
-        let mut ctx = Fp8DecompCtx { from: fr, to };
+        let mut ctx = Fp8DecompCtx { from: fr, to, tc_operand_ids: tc_operand_ids.clone() };
         fp8_decomposed = svod_ir::rewrite::graph_rewrite_with_bpm(&fp8_pm, &fp8_bpm, fp8_decomposed, &mut ctx);
     }
     tracing::debug!(
@@ -485,6 +488,7 @@ fn get_late_rewrite_patterns() -> &'static crate::TypedPatternMatcher {
             + pm_comparison_negations()
             + crate::symbolic::fast_division_patterns()
             + pm_mod_to_idiv()
+            + pm_half_bf16_cast()
     });
     &CACHED
 }

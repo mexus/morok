@@ -17,7 +17,7 @@ use std::sync::Arc;
 use svod_device::Buffer;
 use svod_device::device::Device;
 use svod_device::registry;
-use svod_dtype::{DType, DeviceSpec};
+use svod_dtype::DType;
 use svod_ir::{Op, UOp};
 use tracing::{debug, trace};
 
@@ -753,16 +753,31 @@ pub fn instantiate_schedule(
     pre_schedule: &PreSchedule,
     input_buffers: &InputBuffers,
     var_vals: &HashMap<String, i64>,
+    device_local_outputs: bool,
 ) -> Result<ScheduleResult> {
     // Track allocated intermediate buffers locally (no global registry needed)
     let mut allocated_buffers: HashMap<u64, Buffer> = HashMap::new();
+
+    // Final-output buffer ids: these stay host-visible so the host can read the
+    // result directly (`array_view`). Every other freshly allocated buffer is an
+    // internal intermediate and can live device-local on backends that
+    // distinguish it (AMD). `device_local_outputs` opts the outputs into the
+    // device-local class too — the host then reads them via `copyout` (SDMA
+    // staging) instead of the uncached host mapping. See
+    // `collect_callable_buffers`.
+    let output_ids: HashSet<u64> = if device_local_outputs {
+        HashSet::new()
+    } else {
+        pre_schedule.output_buffer_uops.iter().map(|u| u.buf_uop().id).collect()
+    };
 
     let mut templates: HashMap<u64, ScheduleItemTemplate> = HashMap::with_capacity(pre_schedule.items.len());
     for item in &pre_schedule.items {
         let nodes = item.ast.toposort();
 
         // Map sources to actual Buffers.
-        let kb = collect_callable_buffers(&item.sources, &item.ast, input_buffers, &mut allocated_buffers)?;
+        let kb =
+            collect_callable_buffers(&item.sources, &item.ast, input_buffers, &mut allocated_buffers, &output_ids)?;
 
         debug!(callable.id = item.kernel.id, num_sources = item.sources.len(), "Schedule item created");
 
@@ -840,7 +855,7 @@ pub fn create_schedule(
     var_vals: &HashMap<String, i64>,
 ) -> Result<ScheduleResult> {
     let pre = create_pre_schedule(transformed)?;
-    instantiate_schedule(&pre, input_buffers, var_vals)
+    instantiate_schedule(&pre, input_buffers, var_vals, false)
 }
 
 /// Extract device from the first input buffer in callable sources.
@@ -874,8 +889,15 @@ fn find_first_input_buffer_device(
         }
     }
 
-    // Fallback to CPU if no input buffers found
-    svod_runtime::DEVICE_FACTORIES.device(&DeviceSpec::Cpu, alloc_registry).context(DeviceFactorySnafu)
+    // Fallback to the active default device if no input buffers found. Routes
+    // to `SVOD_DEVICE` / `set_default_device` instead of always picking CPU,
+    // so JIT placeholders (`Tensor::zeros` + `realize`) materialize on the
+    // current target. Critical for ending up with a uniform device per
+    // kernel (otherwise `KernelSplitMixedDevices` fires when AMD weights meet
+    // a CPU-allocated placeholder).
+    svod_runtime::DEVICE_FACTORIES
+        .device(&svod_dtype::default_device::default_device(), alloc_registry)
+        .context(DeviceFactorySnafu)
 }
 
 /// Collect buffers for a callable from its sources.
@@ -898,9 +920,16 @@ fn collect_callable_buffers(
     ast: &Arc<UOp>,
     input_buffers: &InputBuffers,
     allocated_buffers: &mut HashMap<u64, Buffer>,
+    output_ids: &HashSet<u64>,
 ) -> Result<CallableBuffers> {
     // Get target device from the first input buffer.
     let target_device = find_first_input_buffer_device(sources, input_buffers, allocated_buffers)?;
+    // Device-local intermediates are only meaningful where the backend has a
+    // host-visible/device-local split (queried as an allocator capability).
+    // Elsewhere keep the default spec — e.g. the CPU allocator turns
+    // `cpu_access: false` into a non-host-readable buffer, which would break
+    // kernels that access it directly.
+    let device_local_backend = target_device.allocator.supports_device_local();
 
     let mut buffers = Vec::new();
     let mut uop_ids = Vec::new();
@@ -1013,16 +1042,17 @@ fn collect_callable_buffers(
                     buffers.push(buffer);
                     uop_ids.push(canonical_id);
                 } else {
-                    // Output buffer - allocate new buffer
+                    // Fresh buffer: a final output (host reads it → host-visible)
+                    // or an internal intermediate (device-local on AMD).
                     trace!(src.id = canonical_src.id, canonical_id, size, "Allocating output BUFFER/PARAM");
                     let scalar_dtype = canonical_src.dtype();
 
-                    let buffer = Buffer::new(
-                        target_device.allocator.clone(),
-                        scalar_dtype.clone(),
-                        vec![*size],
-                        Default::default(),
-                    );
+                    let spec = if device_local_backend && !output_ids.contains(&canonical_id) {
+                        svod_device::BufferSpec { cpu_access: false, ..Default::default() }
+                    } else {
+                        Default::default()
+                    };
+                    let buffer = Buffer::new(target_device.allocator.clone(), scalar_dtype.clone(), vec![*size], spec);
 
                     // Track in allocated_buffers
                     allocated_buffers.insert(canonical_id, buffer.clone());

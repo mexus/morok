@@ -82,8 +82,7 @@ impl Drop for AlignedBuffer {
 /// 3. **Kernel Execution**: Raw pointers passed to JIT code; Rust doesn't access
 ///    buffer data during execution
 ///
-/// This design follows Tinygrad's approach where buffer synchronization is the
-/// scheduler's responsibility, not the buffer's.
+/// Buffer synchronization is the scheduler's responsibility, not the buffer's.
 pub enum RawBuffer {
     Cpu {
         data: UnsafeCell<AlignedBuffer>,
@@ -104,12 +103,42 @@ pub enum RawBuffer {
         data: UnsafeCell<UnifiedSlice<u8>>,
         device: Arc<CudaContext>,
     },
+    /// AMD GPU VRAM/GTT buffer allocated via KFD ioctls.
+    ///
+    /// `gpu_addr` is the GPU virtual address that kernels see in their
+    /// kernarg slot. `host_ptr` is `Some(_)` only when `cpu_accessible`; the
+    /// pointer is a host-side mmap of the same buffer, suitable for memcpy.
+    /// `handle` is KFD's opaque allocation handle, used for the matching
+    /// free/unmap ioctls. `device` keeps the underlying KFD/DRM fds alive
+    /// for the lifetime of the buffer.
+    AmdDevice {
+        gpu_addr: u64,
+        host_ptr: Option<std::ptr::NonNull<u8>>,
+        size: usize,
+        handle: u64,
+        device: std::sync::Arc<crate::amd::AmdDevice>,
+    },
 }
 
 // SAFETY: RawBuffer access is synchronized by the scheduler at a higher level.
 // See RawBuffer documentation for detailed safety invariants.
 unsafe impl Send for RawBuffer {}
 unsafe impl Sync for RawBuffer {}
+
+impl RawBuffer {
+    /// Free this buffer's GPU-side backing if it's an AMD device buffer.
+    ///
+    /// `AmdAllocator::_free` consumes the buffer via destructure; for
+    /// containers that hold `RawBuffer` directly without going through the
+    /// allocator (queue rings / GART / EOP / ctx-save / pm4_ibs and kernarg
+    /// arenas), this method is the cleanup hook. Internal to the crate so
+    /// only owners that know their resource is AMD-device-backed call it.
+    pub(crate) fn free_amd_device_in_place(&self) {
+        if let RawBuffer::AmdDevice { gpu_addr, size, handle, device, .. } = self {
+            device.core().iface().free_raw(*gpu_addr, *size, *handle);
+        }
+    }
+}
 
 // UnsafeCell doesn't implement Debug, so we implement it manually
 impl std::fmt::Debug for RawBuffer {
@@ -127,6 +156,12 @@ impl std::fmt::Debug for RawBuffer {
             RawBuffer::CudaUnified { device, .. } => {
                 f.debug_struct("CudaUnified").field("device", device).finish_non_exhaustive()
             }
+            RawBuffer::AmdDevice { gpu_addr, size, host_ptr, .. } => f
+                .debug_struct("AmdDevice")
+                .field("gpu_addr", gpu_addr)
+                .field("size", size)
+                .field("cpu_accessible", &host_ptr.is_some())
+                .finish_non_exhaustive(),
         }
     }
 }
@@ -142,6 +177,7 @@ impl RawBuffer {
             RawBuffer::CudaDevice { data, .. } => unsafe { (&*data.get()).len() },
             #[cfg(feature = "cuda")]
             RawBuffer::CudaUnified { data, .. } => unsafe { (&*data.get()).len() },
+            RawBuffer::AmdDevice { size, .. } => *size,
         }
     }
 
@@ -154,32 +190,107 @@ impl RawBuffer {
             RawBuffer::CudaDevice { .. } => false,
             #[cfg(feature = "cuda")]
             RawBuffer::CudaUnified { .. } => true,
+            RawBuffer::AmdDevice { host_ptr, .. } => host_ptr.is_some(),
         }
     }
 }
 
-/// Options for buffer allocation.
-#[derive(Debug, Clone)]
+/// Buffer allocation spec. It is the *whole* LRU cache key `(size, spec)`,
+/// hence `Hash + Eq + Copy`.
+///
+/// `zero_init` is intentionally NOT a field — the backend allocator never
+/// zeroes (`_alloc` returns raw memory); Svod threads it as a separate `alloc`
+/// argument so it does not split the cache. A zeroed and a non-zeroed buffer of
+/// the same spec are interchangeable, because a cache hit re-zeroes on demand.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "proptest", derive(proptest_derive::Arbitrary))]
-pub struct BufferOptions {
-    /// Whether to zero-initialize the buffer.
-    pub zero_init: bool,
-    /// Whether this buffer is CPU-accessible.
+pub struct BufferSpec {
+    /// GTT-coherent uncached memory (signal/ring/kernarg). Distinct cache type
+    /// from VRAM — can't be reused as cached.
+    pub uncached: bool,
+    /// CPU-accessible mapping.
     ///
-    /// CPU allocator: always true (host memory is always accessible).
+    /// CPU allocator: always honored (host memory is always accessible).
     /// CUDA allocator: false = device-only (cuMemAlloc), true = unified (cuMemAllocManaged).
-    pub cpu_accessible: bool,
+    /// AMD allocator: adds a host BAR mmap (`host_ptr: Some`).
+    pub cpu_access: bool,
+    /// Host (GTT/userptr) memory rather than device VRAM.
+    pub host: bool,
+    /// Never cache this buffer in the LRU pool: free goes straight to teardown.
+    /// For lifetime-bound buffers (code object, scratch, queue/signal infra).
+    pub nolru: bool,
 }
 
-impl Default for BufferOptions {
+impl Default for BufferSpec {
     fn default() -> Self {
-        Self { zero_init: false, cpu_accessible: true }
+        Self { uncached: false, cpu_access: true, host: false, nolru: false }
     }
 }
 
+/// Device memory allocator: the public `alloc`/`free` are thin wrappers over
+/// the runtime-implemented `_alloc`/`_free`; copy/transfer/offset/map are
+/// overridable hooks that default to "unsupported".
+///
+/// Object-safe (used as `Arc<dyn Allocator>`): the opaque is the single
+/// [`RawBuffer`] enum, so copy hooks take `&RawBuffer` + an explicit byte
+/// offset (the view offset lives on [`crate::Buffer`], not on `RawBuffer`).
 pub trait Allocator: Send + Sync + std::fmt::Debug {
-    fn alloc(&self, size: usize, options: &BufferOptions) -> Result<RawBuffer>;
-    fn free(&self, _buffer: RawBuffer, _options: &BufferOptions) {}
+    /// Allocate `size` bytes. `zero` requests zero-initialized memory (a Svod
+    /// extension applied on top of `_alloc`, not part of the cache key).
+    fn alloc(&self, size: usize, options: &BufferSpec, zero: bool) -> Result<RawBuffer> {
+        self._alloc(size, options, zero)
+    }
+
+    /// Free a buffer. `size` is the originally-requested allocation size (the
+    /// LRU cache key); the base allocator ignores it and just releases the
+    /// handle. The `RawBuffer` is consumed (and dropped) here.
+    fn free(&self, buffer: RawBuffer, size: usize, options: &BufferSpec) {
+        let _ = size;
+        self._free(buffer, options);
+    }
+
+    /// Backend allocation.
+    fn _alloc(&self, size: usize, options: &BufferSpec, zero: bool) -> Result<RawBuffer>;
+
+    /// Backend free. Default drops the `RawBuffer` (CPU/host memory frees via
+    /// `Drop`); device backends override to release driver handles.
+    fn _free(&self, _buffer: RawBuffer, _options: &BufferSpec) {}
+
+    /// Copy host bytes into `dest[dest_off..dest_off+src.len()]`.
+    fn _copyin(&self, _dest: &RawBuffer, _dest_off: usize, _src: &[u8]) -> Result<()> {
+        UnsupportedSnafu { op: "copyin" }.fail()
+    }
+
+    /// Copy `src[src_off..src_off+dest.len()]` out into host bytes.
+    fn _copyout(&self, _dest: &mut [u8], _src: &RawBuffer, _src_off: usize) -> Result<()> {
+        UnsupportedSnafu { op: "copyout" }.fail()
+    }
+
+    /// Same-device copy of `sz` bytes.
+    fn _transfer(
+        &self,
+        _dest: &RawBuffer,
+        _dest_off: usize,
+        _src: &RawBuffer,
+        _src_off: usize,
+        _sz: usize,
+    ) -> Result<()> {
+        UnsupportedSnafu { op: "transfer" }.fail()
+    }
+
+    /// Mint a sub-buffer view (for cross-device base views).
+    fn _offset(&self, _buf: &RawBuffer, _size: usize, _offset: usize) -> Result<RawBuffer> {
+        UnsupportedSnafu { op: "offset" }.fail()
+    }
+
+    /// Map a foreign buffer into this device's address space.
+    fn _map(&self, _buf: &RawBuffer) -> Result<RawBuffer> {
+        UnsupportedSnafu { op: "map" }.fail()
+    }
+
+    /// Unmap a previously mapped buffer.
+    fn _unmap(&self, _mb: &RawBuffer) {}
+
     fn synchronize(&self) -> Result<()> {
         Ok(())
     }
@@ -187,6 +298,15 @@ pub trait Allocator: Send + Sync + std::fmt::Debug {
 
     /// Get the device specification for this allocator.
     fn device_spec(&self) -> svod_dtype::DeviceSpec;
+
+    /// Whether this allocator can keep intermediate buffers device-local (no
+    /// host mapping), so the scheduler should allocate non-output intermediates
+    /// with `cpu_access: false`. Defaults to `false` (host-visible everywhere);
+    /// backends with a device→device + host↔device copy path (e.g. AMD via the
+    /// SDMA copy queue) override it. Decorators forward to their inner allocator.
+    fn supports_device_local(&self) -> bool {
+        false
+    }
 }
 
 /// CPU allocator using system memory.
@@ -194,9 +314,48 @@ pub trait Allocator: Send + Sync + std::fmt::Debug {
 pub struct CpuAllocator;
 
 impl Allocator for CpuAllocator {
-    fn alloc(&self, size: usize, options: &BufferOptions) -> Result<RawBuffer> {
+    fn _alloc(&self, size: usize, options: &BufferSpec, _zero: bool) -> Result<RawBuffer> {
+        // `AlignedBuffer::new_zeroed` always zeroes, so `_zero` is implicitly
+        // satisfied on CPU regardless of the flag.
         let data = AlignedBuffer::new_zeroed(size);
-        Ok(RawBuffer::Cpu { data: UnsafeCell::new(data), cpu_accessible: options.cpu_accessible })
+        Ok(RawBuffer::Cpu { data: UnsafeCell::new(data), cpu_accessible: options.cpu_access })
+    }
+
+    fn _copyin(&self, dest: &RawBuffer, dest_off: usize, src: &[u8]) -> Result<()> {
+        match dest {
+            RawBuffer::Cpu { data, .. } => {
+                // SAFETY: scheduler guarantees exclusive access during buffer ops.
+                let buf = unsafe { &mut *data.get() };
+                buf[dest_off..dest_off + src.len()].copy_from_slice(src);
+                Ok(())
+            }
+            other => unreachable!("CpuAllocator::_copyin on non-CPU buffer: {other:?}"),
+        }
+    }
+
+    fn _copyout(&self, dest: &mut [u8], src: &RawBuffer, src_off: usize) -> Result<()> {
+        match src {
+            RawBuffer::Cpu { data, .. } => {
+                // SAFETY: scheduler guarantees no concurrent writes during buffer ops.
+                let buf = unsafe { &*data.get() };
+                dest.copy_from_slice(&buf[src_off..src_off + dest.len()]);
+                Ok(())
+            }
+            other => unreachable!("CpuAllocator::_copyout on non-CPU buffer: {other:?}"),
+        }
+    }
+
+    fn _transfer(&self, dest: &RawBuffer, dest_off: usize, src: &RawBuffer, src_off: usize, sz: usize) -> Result<()> {
+        match (dest, src) {
+            (RawBuffer::Cpu { data: dst, .. }, RawBuffer::Cpu { data: src, .. }) => {
+                // SAFETY: distinct allocations (no aliasing); scheduler exclusivity.
+                let dst_buf = unsafe { &mut *dst.get() };
+                let src_buf = unsafe { &*src.get() };
+                dst_buf[dest_off..dest_off + sz].copy_from_slice(&src_buf[src_off..src_off + sz]);
+                Ok(())
+            }
+            _ => UnsupportedSnafu { op: "transfer" }.fail(),
+        }
     }
 
     fn name(&self) -> &str {
@@ -208,7 +367,7 @@ impl Allocator for CpuAllocator {
     }
 }
 
-/// DISK allocator using memory-mapped files (Tinygrad: ops_disk.py).
+/// DISK allocator using memory-mapped files.
 /// Read-only — cannot execute kernels. Data is transferred via COPY.
 #[derive(Debug, Clone)]
 pub struct DiskAllocator {
@@ -222,7 +381,7 @@ impl DiskAllocator {
 }
 
 impl Allocator for DiskAllocator {
-    fn alloc(&self, size: usize, _options: &BufferOptions) -> Result<RawBuffer> {
+    fn _alloc(&self, size: usize, _options: &BufferSpec, _zero: bool) -> Result<RawBuffer> {
         let file = std::fs::File::open(&self.path).map_err(|e| crate::Error::CopyFailed {
             reason: format!("DISK: failed to open {}: {e}", self.path.display()),
         })?;
@@ -241,6 +400,21 @@ impl Allocator for DiskAllocator {
             reason: format!("DISK: mmap failed for {}: {e}", self.path.display()),
         })?;
         Ok(RawBuffer::Mmap { data: mmap, size })
+    }
+
+    fn _copyout(&self, dest: &mut [u8], src: &RawBuffer, src_off: usize) -> Result<()> {
+        match src {
+            RawBuffer::Mmap { data, .. } => {
+                dest.copy_from_slice(&data[src_off..src_off + dest.len()]);
+                Ok(())
+            }
+            other => unreachable!("DiskAllocator::_copyout on non-Mmap buffer: {other:?}"),
+        }
+    }
+
+    fn _copyin(&self, _dest: &RawBuffer, _dest_off: usize, _src: &[u8]) -> Result<()> {
+        // DISK is read-only: never write through the mmap.
+        Err(crate::Error::CopyFailed { reason: "DISK device is read-only: copyin not supported".into() })
     }
 
     fn name(&self) -> &str {
@@ -274,12 +448,12 @@ impl CudaAllocator {
 
 #[cfg(feature = "cuda")]
 impl Allocator for CudaAllocator {
-    fn alloc(&self, size: usize, options: &BufferOptions) -> Result<RawBuffer> {
-        if options.cpu_accessible {
+    fn _alloc(&self, size: usize, options: &BufferSpec, zero: bool) -> Result<RawBuffer> {
+        if options.cpu_access {
             // Allocate unified memory (CPU-accessible)
             let mut data = unsafe { self.device.alloc_unified::<u8>(size, true) }.context(CudaSnafu)?;
 
-            if options.zero_init {
+            if zero {
                 self.device.default_stream().memset_zeros(&mut data).context(CudaSnafu)?;
             }
 
@@ -287,11 +461,81 @@ impl Allocator for CudaAllocator {
         } else {
             // Allocate device-only memory (faster GPU access)
             let stream = self.device.default_stream();
-            let data =
-                if options.zero_init { stream.alloc_zeros::<u8>(size) } else { unsafe { stream.alloc::<u8>(size) } }
-                    .context(CudaSnafu)?;
+            let data = if zero { stream.alloc_zeros::<u8>(size) } else { unsafe { stream.alloc::<u8>(size) } }
+                .context(CudaSnafu)?;
 
             Ok(RawBuffer::CudaDevice { data: UnsafeCell::new(data), device: Arc::clone(&self.device) })
+        }
+    }
+
+    fn _copyin(&self, dest: &RawBuffer, dest_off: usize, src: &[u8]) -> Result<()> {
+        match dest {
+            RawBuffer::CudaDevice { data, device } => {
+                let cuda_data = unsafe { &mut *data.get() };
+                let mut view = cuda_data.slice_mut(dest_off..dest_off + src.len());
+                device.default_stream().memcpy_htod(src, &mut view).context(CudaSnafu)
+            }
+            RawBuffer::CudaUnified { data, .. } => {
+                let unified_data = unsafe { &mut *data.get() };
+                let slice = unified_data.as_mut_slice().context(CudaSnafu)?;
+                slice[dest_off..dest_off + src.len()].copy_from_slice(src);
+                Ok(())
+            }
+            other => unreachable!("CudaAllocator::_copyin on non-CUDA buffer: {other:?}"),
+        }
+    }
+
+    fn _copyout(&self, dest: &mut [u8], src: &RawBuffer, src_off: usize) -> Result<()> {
+        match src {
+            RawBuffer::CudaDevice { data, device } => {
+                device.synchronize().context(CudaSnafu)?;
+                let cuda_data = unsafe { &*data.get() };
+                let view = cuda_data.slice(src_off..src_off + dest.len());
+                device.default_stream().memcpy_dtoh(&view, dest).context(CudaSnafu)
+            }
+            RawBuffer::CudaUnified { data, .. } => {
+                let unified_data = unsafe { &*data.get() };
+                let slice = unified_data.as_slice().context(CudaSnafu)?;
+                dest.copy_from_slice(&slice[src_off..src_off + dest.len()]);
+                Ok(())
+            }
+            other => unreachable!("CudaAllocator::_copyout on non-CUDA buffer: {other:?}"),
+        }
+    }
+
+    fn _transfer(&self, dest: &RawBuffer, dest_off: usize, src: &RawBuffer, src_off: usize, sz: usize) -> Result<()> {
+        let stream = self.device.default_stream();
+        match (dest, src) {
+            (RawBuffer::CudaDevice { data: dst_data, .. }, RawBuffer::CudaDevice { data: src_data, .. }) => {
+                let dst_cuda = unsafe { &mut *dst_data.get() };
+                let src_cuda = unsafe { &*src_data.get() };
+                let mut dst_view = dst_cuda.slice_mut(dest_off..dest_off + sz);
+                let src_view = src_cuda.slice(src_off..src_off + sz);
+                stream.memcpy_dtod(&src_view, &mut dst_view).context(CudaSnafu)
+            }
+            (RawBuffer::CudaUnified { data: dst_data, .. }, RawBuffer::CudaUnified { data: src_data, .. }) => {
+                let dst_unified = unsafe { &mut *dst_data.get() };
+                let src_unified = unsafe { &*src_data.get() };
+                let dst_slice = dst_unified.as_mut_slice().context(CudaSnafu)?;
+                let src_slice = src_unified.as_slice().context(CudaSnafu)?;
+                dst_slice[dest_off..dest_off + sz].copy_from_slice(&src_slice[src_off..src_off + sz]);
+                Ok(())
+            }
+            (RawBuffer::CudaUnified { data: dst_data, .. }, RawBuffer::CudaDevice { data: src_data, .. }) => {
+                let src_cuda = unsafe { &*src_data.get() };
+                let src_view = src_cuda.slice(src_off..src_off + sz);
+                let dst_unified = unsafe { &mut *dst_data.get() };
+                let mut dst_target = dst_unified.slice_mut(dest_off..dest_off + sz);
+                stream.memcpy_dtod(&src_view, &mut dst_target).context(CudaSnafu)
+            }
+            (RawBuffer::CudaDevice { data: dst_data, .. }, RawBuffer::CudaUnified { data: src_data, .. }) => {
+                let dst_cuda = unsafe { &mut *dst_data.get() };
+                let mut dst_view = dst_cuda.slice_mut(dest_off..dest_off + sz);
+                let src_unified = unsafe { &*src_data.get() };
+                let src_source = src_unified.slice(src_off..src_off + sz);
+                stream.memcpy_htod(&src_source, &mut dst_view).context(CudaSnafu)
+            }
+            _ => UnsupportedSnafu { op: "transfer" }.fail(),
         }
     }
 
@@ -308,28 +552,24 @@ impl Allocator for CudaAllocator {
     }
 }
 
-/// Cache key for buffer reuse in LRU allocator.
+/// LRU allocator that caches freed buffers for reuse:
 ///
-/// Includes size and cpu_accessible (hardware property that affects allocation).
-/// zero_init is NOT included - it's a software operation handled after cache retrieval.
+/// - the cache is keyed on the whole `(size, BufferSpec)`;
+/// - `free` recycles into the pool *without synchronizing* — the
+///   timeline-drain-before-teardown lives in the backend `_free` (e.g.
+///   `AmdAllocator::_free`), reached only on real release (overflow, `nolru`,
+///   or `free_cache`);
+/// - on allocation failure `free_cache` releases every pooled buffer through
+///   the backend `_free` and the alloc is retried.
 ///
-/// Design rationale (following Tinygrad):
-/// - cpu_accessible is included because it represents different memory types:
-///   - false: Device-only memory (cuMemAlloc) - faster GPU access
-///   - true: Unified memory (cuMemAllocManaged) - CPU-accessible, not yet implemented
-/// - These are immutable hardware properties that cannot be changed post-allocation
-/// - Buffers allocated with different cpu_accessible values cannot be safely reused
-#[derive(Debug, Clone, Hash, Eq, PartialEq)]
-struct CacheKey {
-    size: usize,
-    cpu_accessible: bool,
-}
-
-/// LRU allocator that caches freed buffers for reuse.
+/// The cache key uses the *requested* `size` for both `alloc` and `free` (the
+/// `size` arg to `free`), so a backend that rounds up its actual allocation
+/// (e.g. AMD page-rounding) still reuses buffers — unlike keying on the
+/// buffer's rounded size, which would never match the request.
 #[derive(Debug)]
 pub(crate) struct LruAllocator {
     inner: Box<dyn Allocator>,
-    cache: Mutex<HashMap<CacheKey, Vec<RawBuffer>>>,
+    cache: Mutex<HashMap<(usize, BufferSpec), Vec<RawBuffer>>>,
     max_buffers_per_size: usize,
     name: String,
 }
@@ -344,11 +584,26 @@ impl LruAllocator {
         Self { inner, cache: Mutex::new(HashMap::new()), max_buffers_per_size, name }
     }
 
-    /// Get the number of cached buffers for a specific size and cpu_accessible flag.
+    /// Release every pooled buffer through the backend `_free`.
+    /// Routing through `inner.free` is essential: `RawBuffer` has no `Drop`, so
+    /// merely clearing the map would leak GPU mappings.
+    fn free_cache(&self) {
+        let drained: Vec<((usize, BufferSpec), Vec<RawBuffer>)> = {
+            let mut cache = self.cache.lock().unwrap();
+            cache.drain().collect()
+        };
+        for ((size, options), buffers) in drained {
+            for buf in buffers {
+                self.inner.free(buf, size, &options);
+            }
+        }
+    }
+
+    /// Get the number of cached buffers for a specific size and cpu_access flag.
     /// Only available in tests for cache introspection.
     #[cfg(test)]
-    pub(crate) fn cache_count(&self, size: usize, cpu_accessible: bool) -> usize {
-        let key = CacheKey { size, cpu_accessible };
+    pub(crate) fn cache_count(&self, size: usize, cpu_access: bool) -> usize {
+        let key = (size, BufferSpec { cpu_access, ..Default::default() });
         let cache = self.cache.lock().unwrap();
         cache.get(&key).map(|v| v.len()).unwrap_or(0)
     }
@@ -361,13 +616,52 @@ impl LruAllocator {
         let cache = self.cache.lock().unwrap();
         cache.values().map(|v| v.len()).sum()
     }
+
+    /// Re-zero a buffer popped from the cache. Returns `Err` to signal "drop
+    /// this buffer and allocate fresh instead" (device-only AMD VRAM, where a
+    /// host memset is impossible until SDMA lands).
+    fn zero_cached(&self, buffer: &RawBuffer) -> Result<bool> {
+        // SAFETY: buffer just popped from cache — no other references exist.
+        match buffer {
+            RawBuffer::Cpu { data, .. } => {
+                unsafe { (*data.get()).fill(0) };
+                Ok(true)
+            }
+            RawBuffer::Mmap { .. } => panic!("DISK device is read-only: cannot zero-init mmap buffer"),
+            RawBuffer::AmdDevice { host_ptr: Some(ptr), size, device, .. } => {
+                // Drain first: this VA was just recycled from the pool and its
+                // previous owner's async kernel may still be writing it. A host
+                // memset isn't ordered on the GPU timeline, so synchronize.
+                device.synchronize()?;
+                unsafe { std::ptr::write_bytes(ptr.as_ptr(), 0, *size) };
+                Ok(true)
+            }
+            RawBuffer::AmdDevice { host_ptr: None, .. } => Ok(false),
+            #[cfg(feature = "cuda")]
+            RawBuffer::CudaDevice { data, device } => {
+                let cuda_data = unsafe { &mut *data.get() };
+                device.default_stream().memset_zeros(cuda_data).context(CudaSnafu)?;
+                Ok(true)
+            }
+            #[cfg(feature = "cuda")]
+            RawBuffer::CudaUnified { data, device } => {
+                let unified_data = unsafe { &mut *data.get() };
+                device.default_stream().memset_zeros(unified_data).context(CudaSnafu)?;
+                Ok(true)
+            }
+        }
+    }
 }
 
 impl Allocator for LruAllocator {
-    fn alloc(&self, size: usize, options: &BufferOptions) -> Result<RawBuffer> {
-        let key = CacheKey { size, cpu_accessible: options.cpu_accessible };
+    fn alloc(&self, size: usize, options: &BufferSpec, zero: bool) -> Result<RawBuffer> {
+        // nolru never pools: deterministic free.
+        if options.nolru {
+            return self.inner.alloc(size, options, zero);
+        }
+        let key = (size, *options);
 
-        // Try cache first
+        // Pop from the per-key pool if present.
         let buffer = {
             let mut cache = self.cache.lock().unwrap();
             if let Some(buffers) = cache.get_mut(&key)
@@ -380,52 +674,80 @@ impl Allocator for LruAllocator {
             } else {
                 None
             }
-        }; // Drop lock before expensive allocation
+        }; // Drop lock before any (re)allocation.
 
-        // If found in cache, optionally zero and return
         if let Some(buffer) = buffer {
-            if options.zero_init {
-                // Zero the cached buffer if requested
-                // SAFETY: Buffer just retrieved from cache, not yet returned - no other references exist
-                match &buffer {
-                    RawBuffer::Cpu { data, .. } => {
-                        unsafe { (*data.get()).fill(0) };
-                    }
-                    RawBuffer::Mmap { .. } => panic!("DISK device is read-only: cannot zero-init mmap buffer"),
-                    #[cfg(feature = "cuda")]
-                    RawBuffer::CudaDevice { data, device } => {
-                        let cuda_data = unsafe { &mut *data.get() };
-                        device.default_stream().memset_zeros(cuda_data).context(CudaSnafu)?;
-                    }
-                    #[cfg(feature = "cuda")]
-                    RawBuffer::CudaUnified { data, device } => {
-                        let unified_data = unsafe { &mut *data.get() };
-                        device.default_stream().memset_zeros(unified_data).context(CudaSnafu)?;
-                    }
-                }
+            if zero && !self.zero_cached(&buffer)? {
+                // Device-only buffer we can't memset on the host: free it (a
+                // bare `drop` leaks — RawBuffer has no Drop) and allocate fresh
+                // so we never hand back un-zeroed data.
+                self.inner.free(buffer, size, options);
+                return self.inner.alloc(size, options, zero);
             }
             return Ok(buffer);
         }
 
-        // Cache miss - allocate from inner
-        match self.inner.alloc(size, options) {
+        // Cache miss → backend alloc; on failure drain the pool and retry once.
+        match self.inner.alloc(size, options, zero) {
             Ok(buffer) => Ok(buffer),
             Err(e) => {
-                // On allocation failure, clear cache and retry
-                self.cache.lock().unwrap().clear();
-                self.inner.alloc(size, options).map_err(|_| e)
+                self.free_cache();
+                self.inner.alloc(size, options, zero).map_err(|_| e)
             }
         }
     }
 
-    fn free(&self, buffer: RawBuffer, options: &BufferOptions) {
-        let key = CacheKey { size: buffer.size(), cpu_accessible: options.cpu_accessible };
-
-        let mut cache = self.cache.lock().unwrap();
-        let buffers = cache.entry(key).or_default();
-        if buffers.len() < self.max_buffers_per_size {
-            buffers.push(buffer);
+    fn free(&self, buffer: RawBuffer, size: usize, options: &BufferSpec) {
+        // nolru bypasses the pool — real free now.
+        if options.nolru {
+            self.inner.free(buffer, size, options);
+            return;
         }
+
+        // Recycle into the pool. NOTE: no synchronize here — the LRU recycle is
+        // intentionally undrained; the timeline drain happens in the backend
+        // `_free` on real teardown (`AmdAllocator::_free`). On overflow route
+        // through `inner.free` so the handle is actually released (RawBuffer
+        // has no Drop).
+        let overflow = {
+            let mut cache = self.cache.lock().unwrap();
+            let buffers = cache.entry((size, *options)).or_default();
+            if buffers.len() < self.max_buffers_per_size {
+                buffers.push(buffer);
+                None
+            } else {
+                Some(buffer)
+            }
+        };
+        if let Some(buf) = overflow {
+            self.inner.free(buf, size, options);
+        }
+    }
+
+    // The decorator forwards the backend hooks to the wrapped allocator.
+    fn _alloc(&self, size: usize, options: &BufferSpec, zero: bool) -> Result<RawBuffer> {
+        self.inner._alloc(size, options, zero)
+    }
+    fn _free(&self, buffer: RawBuffer, options: &BufferSpec) {
+        self.inner._free(buffer, options);
+    }
+    fn _copyin(&self, dest: &RawBuffer, dest_off: usize, src: &[u8]) -> Result<()> {
+        self.inner._copyin(dest, dest_off, src)
+    }
+    fn _copyout(&self, dest: &mut [u8], src: &RawBuffer, src_off: usize) -> Result<()> {
+        self.inner._copyout(dest, src, src_off)
+    }
+    fn _transfer(&self, dest: &RawBuffer, dest_off: usize, src: &RawBuffer, src_off: usize, sz: usize) -> Result<()> {
+        self.inner._transfer(dest, dest_off, src, src_off, sz)
+    }
+    fn _offset(&self, buf: &RawBuffer, size: usize, offset: usize) -> Result<RawBuffer> {
+        self.inner._offset(buf, size, offset)
+    }
+    fn _map(&self, buf: &RawBuffer) -> Result<RawBuffer> {
+        self.inner._map(buf)
+    }
+    fn _unmap(&self, mb: &RawBuffer) {
+        self.inner._unmap(mb);
     }
 
     fn synchronize(&self) -> Result<()> {
@@ -438,5 +760,9 @@ impl Allocator for LruAllocator {
 
     fn device_spec(&self) -> svod_dtype::DeviceSpec {
         self.inner.device_spec()
+    }
+
+    fn supports_device_local(&self) -> bool {
+        self.inner.supports_device_local()
     }
 }

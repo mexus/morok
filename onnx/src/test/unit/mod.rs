@@ -1,7 +1,6 @@
 mod activation;
 mod arithmetic;
 mod constant;
-mod fusion;
 #[allow(clippy::field_reassign_with_default)]
 mod importer;
 mod indexing;

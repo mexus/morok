@@ -1,8 +1,29 @@
+use std::cmp::Ordering;
 use std::convert::Infallible;
 
 use proptest::prelude::*;
 
-use crate::rnnt::{JointStep, RnntDecoder, RnntOpts, TokenEmission, Word};
+use crate::rnnt::{BatchJointStep, BatchLabelStep, JointStep, RnntDecoder, RnntOpts, TokenEmission, Word};
+
+/// NaN-safe argmax — the device backend computes the joint argmax on-GPU and
+/// returns the index; the mock mirrors that over its scripted logits. NaN is
+/// treated as smaller than any number (first non-NaN wins; all-NaN → 0).
+fn argmax_nan_safe(frame: &[f32]) -> usize {
+    let cmp = |a: f32, b: f32| {
+        a.partial_cmp(&b).unwrap_or_else(|| match (a.is_nan(), b.is_nan()) {
+            (true, false) => Ordering::Less,
+            (false, true) => Ordering::Greater,
+            _ => Ordering::Equal,
+        })
+    };
+    let mut best = 0usize;
+    for i in 1..frame.len() {
+        if cmp(frame[i], frame[best]).is_gt() {
+            best = i;
+        }
+    }
+    best
+}
 
 // ─── Mock backend ─────────────────────────────────────────────────────────
 
@@ -36,20 +57,12 @@ impl MockJointStep {
 impl JointStep for MockJointStep {
     type Error = Infallible;
 
-    fn step(
-        &mut self,
-        encoder_frame: &[f32],
-        prev_token: Option<usize>,
-        logits_out: &mut [f32],
-    ) -> Result<(), Self::Error> {
+    fn step(&mut self, encoder_frame: &[f32], prev_token: Option<usize>) -> Result<usize, Self::Error> {
         let frame_first = *encoder_frame.first().unwrap_or(&0.0);
         self.seen.push((frame_first, prev_token));
         let idx = self.cursor.min(self.script.len() - 1);
         self.cursor += 1;
-        let src = &self.script[idx];
-        assert_eq!(src.len(), logits_out.len(), "logits len mismatch in scripted step");
-        logits_out.copy_from_slice(src);
-        Ok(())
+        Ok(argmax_nan_safe(&self.script[idx]))
     }
 
     fn commit(&mut self) {
@@ -59,6 +72,137 @@ impl JointStep for MockJointStep {
     fn reset(&mut self) {
         self.resets += 1;
     }
+}
+
+/// Batched mock: each lane consumes its own token-id script in step order;
+/// inactive lanes don't advance their cursor (mirrors a real backend whose
+/// inactive-lane outputs are ignored). Tracks per-lane commits and asserts the
+/// `commit` masks only ever cover lanes the loop just stepped.
+struct MockBatchStep {
+    scripts: Vec<Vec<usize>>,
+    cursors: Vec<usize>,
+    pub commits: Vec<usize>,
+    pub resets: usize,
+}
+
+impl MockBatchStep {
+    fn new(scripts: Vec<Vec<usize>>) -> Self {
+        let lanes = scripts.len();
+        Self { scripts, cursors: vec![0; lanes], commits: vec![0; lanes], resets: 0 }
+    }
+}
+
+impl BatchJointStep for MockBatchStep {
+    type Error = Infallible;
+
+    fn batch(&self) -> usize {
+        self.scripts.len()
+    }
+
+    fn step(&mut self, _t: usize, _prev: &[usize], active: &[bool], out: &mut [usize]) -> Result<(), Self::Error> {
+        for i in 0..self.scripts.len() {
+            if active[i] {
+                let idx = self.cursors[i].min(self.scripts[i].len() - 1);
+                self.cursors[i] += 1;
+                out[i] = self.scripts[i][idx];
+            }
+        }
+        Ok(())
+    }
+
+    fn commit(&mut self, lanes: &[bool]) {
+        for (i, &c) in lanes.iter().enumerate() {
+            if c {
+                self.commits[i] += 1;
+            }
+        }
+    }
+
+    fn reset(&mut self) {
+        self.resets += 1;
+        self.cursors.fill(0);
+    }
+}
+
+/// Label-looping mock: same per-lane scripts as [`MockBatchStep`] (each lane
+/// consumes its script in its own joint-call order), plus counters proving the
+/// predictor only runs on emission rounds.
+struct MockBatchLabelStep {
+    scripts: Vec<Vec<usize>>,
+    cursors: Vec<usize>,
+    pub commits: Vec<usize>,
+    pub predicts: usize,
+    pub joints: usize,
+    pub resets: usize,
+}
+
+impl MockBatchLabelStep {
+    fn new(scripts: Vec<Vec<usize>>) -> Self {
+        let lanes = scripts.len();
+        Self { scripts, cursors: vec![0; lanes], commits: vec![0; lanes], predicts: 0, joints: 0, resets: 0 }
+    }
+}
+
+impl BatchLabelStep for MockBatchLabelStep {
+    type Error = Infallible;
+
+    fn batch(&self) -> usize {
+        self.scripts.len()
+    }
+
+    fn predict(&mut self, _prev: &[usize]) -> Result<(), Self::Error> {
+        self.predicts += 1;
+        Ok(())
+    }
+
+    fn commit(&mut self, lanes: &[bool]) {
+        for (i, &c) in lanes.iter().enumerate() {
+            if c {
+                self.commits[i] += 1;
+            }
+        }
+    }
+
+    fn joint(&mut self, _t: &[usize], active: &[bool], out: &mut [usize]) -> Result<(), Self::Error> {
+        self.joints += 1;
+        for i in 0..self.scripts.len() {
+            if active[i] {
+                let idx = self.cursors[i].min(self.scripts[i].len() - 1);
+                self.cursors[i] += 1;
+                out[i] = self.scripts[i][idx];
+            }
+        }
+        Ok(())
+    }
+
+    fn reset(&mut self) {
+        self.resets += 1;
+        self.cursors.fill(0);
+    }
+}
+
+/// B=1 mock over a token-id script (the argmax already applied), for per-lane
+/// equivalence checks against the batched loop.
+struct MockTokenStep {
+    script: Vec<usize>,
+    cursor: usize,
+    pub commits: usize,
+}
+
+impl JointStep for MockTokenStep {
+    type Error = Infallible;
+
+    fn step(&mut self, _enc: &[f32], _prev: Option<usize>) -> Result<usize, Self::Error> {
+        let idx = self.cursor.min(self.script.len() - 1);
+        self.cursor += 1;
+        Ok(self.script[idx])
+    }
+
+    fn commit(&mut self) {
+        self.commits += 1;
+    }
+
+    fn reset(&mut self) {}
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────
@@ -268,7 +412,7 @@ fn test_rnnt_backend_error_surfaces_with_frame_index() {
     struct FailingStep;
     impl JointStep for FailingStep {
         type Error = Boom;
-        fn step(&mut self, _: &[f32], _: Option<usize>, _: &mut [f32]) -> Result<(), Self::Error> {
+        fn step(&mut self, _: &[f32], _: Option<usize>) -> Result<usize, Self::Error> {
             Err(Boom)
         }
         fn commit(&mut self) {}
@@ -291,6 +435,101 @@ fn test_rnnt_opts_serde_default_roundtrip() {
 
     let opts: RnntOpts = serde_json::from_str(r#"{"max_symbols_per_step": 5}"#).unwrap();
     assert_eq!(opts.max_symbols_per_step, 5);
+}
+
+// ─── decode_batch ─────────────────────────────────────────────────────────
+
+/// Batched lockstep decode must reproduce the B=1 loop per lane, lane scripts
+/// consumed in each lane's own step order, regardless of frame raggedness.
+fn assert_batch_matches_b1(scripts: Vec<Vec<usize>>, valid_frames: Vec<usize>, max_symbols: usize) {
+    let decoder = decoder_with(abc_vocab(), max_symbols);
+    let mut batch = MockBatchStep::new(scripts.clone());
+    let batched = decoder.decode_batch(&valid_frames, &mut batch).unwrap();
+    assert_eq!(batch.resets, 1);
+
+    for (i, (script, &valid)) in scripts.iter().zip(&valid_frames).enumerate() {
+        let mut single = MockTokenStep { script: script.clone(), cursor: 0, commits: 0 };
+        let (text, emissions) =
+            decoder.decode_with_timestamps(&linspace_encoder(valid.max(1)), valid, valid, 1, &mut single).unwrap();
+        assert_eq!(batched[i].0, text, "lane {i} text");
+        assert_eq!(batched[i].1, emissions, "lane {i} emissions");
+        assert_eq!(batch.commits[i], single.commits, "lane {i} commits");
+    }
+}
+
+#[test]
+fn test_rnnt_batch_matches_b1_ragged() {
+    let blank = abc_vocab().len();
+    // Lane 0: emit a, blank, emit b, blank (2 frames). Lane 1: blanks only
+    // (1 frame). Lane 2: multi-emit then cap (3 frames).
+    assert_batch_matches_b1(
+        vec![vec![0, blank, 1, blank], vec![blank; 4], vec![0, 1, 2, 0, 1, 2, blank, blank, blank]],
+        vec![2, 1, 3],
+        2,
+    );
+}
+
+#[test]
+fn test_rnnt_batch_zero_valid_lane_emits_nothing() {
+    let blank = abc_vocab().len();
+    let decoder = decoder_with(abc_vocab(), 10);
+    let mut batch = MockBatchStep::new(vec![vec![0, blank], vec![0, blank]]);
+    let out = decoder.decode_batch(&[1, 0], &mut batch).unwrap();
+    assert_eq!(out[0].0, "a");
+    assert_eq!(out[1].0, "", "zero-valid lane must stay silent");
+    assert_eq!(batch.commits[1], 0);
+}
+
+#[test]
+fn test_rnnt_batch_fewer_items_than_lanes() {
+    let blank = abc_vocab().len();
+    let decoder = decoder_with(abc_vocab(), 10);
+    let mut batch = MockBatchStep::new(vec![vec![1, blank], vec![0, blank], vec![2, blank], vec![2, blank]]);
+    let out = decoder.decode_batch(&[1, 1], &mut batch).unwrap();
+    assert_eq!(out.len(), 2);
+    assert_eq!((out[0].0.as_str(), out[1].0.as_str()), ("b", "a"));
+    assert_eq!(&batch.commits[2..], &[0, 0], "padding lanes never commit");
+}
+
+// ─── decode_batch_labels ──────────────────────────────────────────────────
+
+/// Label-looping must reproduce lockstep `decode_batch` exactly: same texts,
+/// emissions, and commit counts per lane (greedy is lane-independent).
+fn assert_labels_match_lockstep(scripts: Vec<Vec<usize>>, valid_frames: Vec<usize>, max_symbols: usize) {
+    let decoder = decoder_with(abc_vocab(), max_symbols);
+    let mut lockstep = MockBatchStep::new(scripts.clone());
+    let expected = decoder.decode_batch(&valid_frames, &mut lockstep).unwrap();
+
+    let mut labels = MockBatchLabelStep::new(scripts);
+    let got = decoder.decode_batch_labels(&valid_frames, &mut labels).unwrap();
+
+    assert_eq!(got, expected);
+    assert_eq!(labels.commits, lockstep.commits);
+    assert_eq!(labels.resets, 1);
+}
+
+#[test_case::test_case(vec![vec![0, 3, 1, 3], vec![3; 4], vec![0, 1, 2, 0, 1, 2, 3, 3, 3]], vec![2, 1, 3], 2; "ragged with cap")]
+#[test_case::test_case(vec![vec![3; 8]], vec![8], 10; "blank only")]
+#[test_case::test_case(vec![vec![0, 1, 2, 3], vec![2, 3, 1, 3]], vec![2, 2], 10; "multi emit")]
+#[test_case::test_case(vec![vec![0, 3], vec![0, 3]], vec![1, 0], 10; "zero valid lane")]
+fn test_rnnt_labels_match_lockstep(scripts: Vec<Vec<usize>>, valid: Vec<usize>, max_symbols: usize) {
+    assert_labels_match_lockstep(scripts, valid, max_symbols);
+}
+
+#[test]
+fn test_rnnt_labels_predictor_runs_only_on_emission_rounds() {
+    let blank = abc_vocab().len();
+    let decoder = decoder_with(abc_vocab(), 10);
+    // 4 blank-only frames: predictor must run exactly once (the empty prefix).
+    let mut labels = MockBatchLabelStep::new(vec![vec![blank; 4]]);
+    decoder.decode_batch_labels(&[4], &mut labels).unwrap();
+    assert_eq!(labels.predicts, 1, "blank advances must not invoke the predictor");
+    assert_eq!(labels.joints, 4);
+
+    // 1 frame, 2 emissions + blank: 1 prefix + 2 emission rounds.
+    let mut labels = MockBatchLabelStep::new(vec![vec![0, 1, blank]]);
+    decoder.decode_batch_labels(&[1], &mut labels).unwrap();
+    assert_eq!(labels.predicts, 3);
 }
 
 // ─── frames_to_words ──────────────────────────────────────────────────────
@@ -385,6 +624,33 @@ proptest! {
         let enc = linspace_encoder(n_frames);
         let text = decoder.decode(&enc, n_frames, n_frames, 1, &mut mock).unwrap();
         prop_assert_eq!(text.chars().count(), mock.commits);
+    }
+
+    /// Batched lockstep decode ≡ per-lane B=1 decode for random scripts and
+    /// ragged frame counts.
+    #[test]
+    fn prop_rnnt_batch_matches_b1(
+        n_lanes in 1usize..6,
+        max_symbols in 1usize..4,
+        seed in any::<u64>(),
+    ) {
+        let blank = abc_vocab().len();
+        let mut state = seed;
+        let mut scripts = Vec::with_capacity(n_lanes);
+        let mut valid = Vec::with_capacity(n_lanes);
+        for _ in 0..n_lanes {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let frames = ((state >> 32) % 8) as usize; // 0..8 frames per lane
+            valid.push(frames);
+            let mut script = Vec::with_capacity(frames * max_symbols + 1);
+            for _ in 0..(frames * max_symbols + 1) {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                let pick = if (state >> 32) % 5 < 3 { blank } else { ((state >> 32) % 3) as usize };
+                script.push(pick);
+            }
+            scripts.push(script);
+        }
+        assert_batch_matches_b1(scripts, valid, max_symbols);
     }
 
     /// Timestamps are non-decreasing and each frame index is in `[0, valid_frames)`.

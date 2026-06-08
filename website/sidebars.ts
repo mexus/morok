@@ -17,7 +17,6 @@ const sidebars: SidebarsConfig = {
       label: 'Architecture',
       items: [
         'architecture/pipeline',
-        'architecture/jit-loader',
         'architecture/jit-graphs',
         {
           type: 'category',
@@ -45,6 +44,25 @@ const sidebars: SidebarsConfig = {
           ],
         },
         'architecture/op-bestiary',
+      ],
+    },
+    {
+      type: 'category',
+      label: 'Backends',
+      items: [
+        'backends/jit-loader',
+        {
+          type: 'category',
+          label: 'AMD Backend',
+          items: [
+            'backends/amd/overview',
+            'backends/amd/kfd-bindings',
+            'backends/amd/queues-and-dispatch',
+            'backends/amd/compile-and-graph',
+            'backends/amd/am-driver',
+            'backends/amd/debugging',
+          ],
+        },
       ],
     },
   ],

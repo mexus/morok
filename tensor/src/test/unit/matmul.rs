@@ -1,7 +1,9 @@
 use crate::*;
 use ndarray::{Array2, array};
 use svod_dtype::DType;
-use svod_schedule::{BeamConfig, OptStrategy, OptimizerConfig, testing::setup_test_tracing};
+use svod_schedule::{
+    BeamConfig, HeuristicsConfig, OptStrategy, OptimizerConfig, TcSelect, testing::setup_test_tracing,
+};
 
 fn prep_config(optimizer: OptimizerConfig) -> PrepareConfig {
     optimizer.into()
@@ -84,6 +86,21 @@ crate::codegen_tests! {
 
         // Expected: [[1*5+2*7, 1*6+2*8], [3*5+4*7, 3*6+4*8]] = [[19, 22], [43, 50]]
         assert_matmul_close(&c.as_vec::<f32>().unwrap(), &expected, 1e-5);
+    }
+
+    fn test_matmul_int8_returns_narrow_dtype(config) {
+        // int8·int8 must return int8 (the promoted operand dtype), not the widened
+        // int32 sum accumulator. [[1,2],[3,4]]·[[5,6],[7,8]] = [[19,22],[43,50]] (fit i8).
+        let a = Tensor::from_ndarray(&Array2::from_shape_vec((2, 2), vec![1.0f32, 2.0, 3.0, 4.0]).unwrap())
+            .cast(DType::Int8)
+            .unwrap();
+        let b = Tensor::from_ndarray(&Array2::from_shape_vec((2, 2), vec![5.0f32, 6.0, 7.0, 8.0]).unwrap())
+            .cast(DType::Int8)
+            .unwrap();
+        let mut c = a.matmul(&b).unwrap();
+        assert_eq!(c.uop().dtype(), DType::Int8, "int8 matmul must return int8, not the int32 accumulator");
+        c.realize_with(&config).unwrap();
+        assert_eq!(c.as_vec::<i8>().unwrap(), vec![19i8, 22, 43, 50]);
     }
 
     fn test_matmul_validated_3x3(config) {
@@ -635,6 +652,112 @@ fn test_print_matmul_64x64_ir() {
         println!("{}", kernel.kernel.code);
         println!();
     }
+}
+
+/// gfx942 (CDNA3) MFMA tensor-core matmul: end-to-end proof + numerical
+/// validation, parameterized over the low-precision input dtype. A
+/// `in_dtype·in_dtype` matmul accumulating in f32 matches a cdna3 tensor core,
+/// so BEAM must lower it to `intrinsic`. Inputs are small integers (−3..3 /
+/// −2..2, all exact in bf16/f16/fp8e4m3), so the MFMA result — accumulated
+/// across the residual K-tile loop and fanned out across the M/N output tiles —
+/// must equal the f32 reference exactly. Guards both the reduce-loop lowering
+/// and the per-tile expansion. `tol` stays small because the inputs round-trip
+/// losslessly and the accumulation is in f32.
+fn validate_mfma_square(size: usize, in_dtype: DType, intrinsic: &str, tol: f32) {
+    let beam = OptimizerConfig::builder()
+        .strategy(OptStrategy::Beam { width: 2 })
+        .beam(BeamConfig::builder().disable_cache(true).build())
+        .build();
+    validate_mfma_square_with(beam, size, in_dtype, intrinsic, tol);
+}
+
+fn validate_mfma_square_with(opt: OptimizerConfig, size: usize, in_dtype: DType, intrinsic: &str, tol: f32) {
+    let a_data: Vec<f32> = (0..size * size).map(|x| ((x % 7) as f32) - 3.0).collect();
+    let b_data: Vec<f32> = (0..size * size).map(|x| ((x % 5) as f32) - 2.0).collect();
+    let a_nd = Array2::from_shape_vec((size, size), a_data).unwrap();
+    let b_nd = Array2::from_shape_vec((size, size), b_data).unwrap();
+
+    let beam = prep_config(opt);
+    let build = || {
+        let a = Tensor::from_ndarray(&a_nd).cast(in_dtype.clone()).unwrap();
+        let b = Tensor::from_ndarray(&b_nd).cast(in_dtype.clone()).unwrap();
+        a.matmul_with().other(&b).dtype(DType::Float32).call().unwrap()
+    };
+
+    // 1) The selected kernel must actually use the expected MFMA (not a fallback).
+    let mut probe = build();
+    let plan = probe.prepare_with(&beam).expect("prepare should succeed");
+    let saw_mfma = plan.prepared_kernels().iter().any(|k| k.kernel.code.contains(intrinsic));
+    assert!(saw_mfma, "BEAM did not select {intrinsic} for a {in_dtype:?} {size}x{size} matmul on gfx942");
+
+    // 2) The MFMA result must match the f32 reference (exact for integer inputs).
+    let mut c = build();
+    c.realize_with(&beam).unwrap();
+    let expected = a_nd.dot(&b_nd);
+    assert_matmul_close(&c.as_vec::<f32>().unwrap(), &expected, tol);
+}
+
+/// Hardware-gated: `SVOD_DEVICE=AMD:0 cargo test -p svod-tensor test_matmul_bf16_mfma_validated -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn test_matmul_bf16_mfma_validated() {
+    validate_mfma_square(512, DType::BFloat16, "llvm.amdgcn.mfma.f32.16x16x16bf16.1k", 1.0);
+}
+
+/// gfx942 f16 16×16×16 MFMA (the `f16` plain form).
+#[test]
+#[ignore]
+fn test_matmul_f16_mfma_validated() {
+    validate_mfma_square(512, DType::Float16, "llvm.amdgcn.mfma.f32.16x16x16f16", 1.0);
+}
+
+/// Heuristic config pinned to the cdna3 fp32 tensor core. The core is
+/// BEAM-only (`heuristic_pick=false` — `v_mfma_f32_16x16x4_f32` matches the
+/// packed-vector fp32 rate, so an unconditional heuristic pick pessimizes), so
+/// these correctness tests force it via an explicit `tc_select` pin.
+fn f32_mfma_config() -> OptimizerConfig {
+    let renderer = svod_schedule::OptimizerRenderer::amd_cdna3();
+    let idx = renderer
+        .tensor_cores
+        .iter()
+        .position(|tc| tc.dtype_in == DType::Float32 && tc.dims == (16, 16, 4))
+        .expect("cdna3 fp32 16x16x4 tensor core");
+    OptimizerConfig::builder()
+        .strategy(OptStrategy::Heuristic)
+        .heuristics(HeuristicsConfig::builder().tc_select(TcSelect::Index(idx)).build())
+        .build()
+}
+
+/// gfx942 fp32 16×16×4 MFMA (`v_mfma_f32_16x16x4_f32`): scalar f32 A/B
+/// operands (ept 1/1), the smallest reduce tile (K=4 → 2 unroll bits), and a
+/// raw-fp32 input path with no cast prelude. Even size — every dim divides 16,
+/// so this proves the layout/swizzle and the K-tile loop; MFMA reorders the
+/// f32 accumulation but the integer inputs keep it exact.
+#[test]
+#[ignore]
+fn test_matmul_f32_mfma_validated() {
+    validate_mfma_square_with(f32_mfma_config(), 512, DType::Float32, "llvm.amdgcn.mfma.f32.16x16x4f32", 1.0);
+}
+
+/// fp32 MFMA multi-tile: 64×64 forces the 4×4 post-TC M/N tile upcasts on top
+/// of the residual K loop, the layer where the broadcast-collapse and
+/// scalar-accumulator bugs lived. (Odd non-divisible sizes don't get the fp32
+/// TC — PADTO selection is a follow-up.)
+#[test]
+#[ignore]
+fn test_matmul_f32_mfma_multitile_validated() {
+    validate_mfma_square_with(f32_mfma_config(), 64, DType::Float32, "llvm.amdgcn.mfma.f32.16x16x4f32", 1.0);
+}
+
+/// gfx942 fp8 (e4m3) 16×16×32 MFMA. The cdna3 fp8 tensor core is K=32, so this
+/// also exercises the K=32 reduce-tile lowering and i64 operand packing. Uses a
+/// smaller matrix: the fp8 path compiles many BEAM candidates (each with the
+/// fp8-conversion prelude), so 512² BEAM is ~8min; 128² keeps it tractable while
+/// still tiling into the 16×16×32 core.
+#[test]
+#[ignore]
+fn test_matmul_fp8_mfma_validated() {
+    validate_mfma_square(128, DType::FP8E4M3, "llvm.amdgcn.mfma.f32.16x16x32.fp8.fp8", 1.0);
 }
 
 // ========== Validated Matmul Tests (64x64 with env_config) ==========

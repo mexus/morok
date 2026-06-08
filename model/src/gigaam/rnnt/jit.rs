@@ -1,11 +1,6 @@
-//! `jit_wrapper!`-generated per-step JITs for the RN-T head: predictor and
-//! joint each compiled as their own plan. The encoder JIT lives in the
-//! shared [`crate::gigaam::jit`] now.
-//!
-//! All step JITs take a [`GigaAm`] (cheap to clone — weights are shared
-//! via the underlying `Tensor` handle Arcs) and validate that the head is
-//! the RN-T variant in their build closure (returning a typed `Err` via
-//! `JitError::Build` if it isn't).
+//! `jit_wrapper!`-generated K-step block JIT for RN-T device-resident decode
+//! (`super::block::forward_block`): all loop state device-local; the host
+//! reads three tapes + one flag per block.
 
 extern crate self as svod_model;
 
@@ -13,27 +8,40 @@ use svod_macros::jit_wrapper;
 
 use crate::gigaam::model::GigaAm;
 
-jit_wrapper! {
-    RnntPredictorStepJit(GigaAm) {
-        prev_token: Tensor,
-        h_in: Tensor,
-        c_in: Tensor,
+#[allow(clippy::too_many_arguments)]
+mod block_jit {
+    use super::*;
+    jit_wrapper! {
+        RnntBlockJit(GigaAm) {
+            enc: Tensor,
+            time: Tensor,
+            prev: Tensor,
+            symbols: Tensor,
+            valid: Tensor,
+            h_in: Tensor,
+            c_in: Tensor,
 
-        build(prev_token, h_in, c_in) {
-            let (rnnt_head, _) = model.head.expect_rnnt("RnntPredictorStepJit")?;
-            rnnt_head.predictor.forward_concat(prev_token, h_in, c_in)
+            outputs { tape, emit, frame, active_any, time_out, prev_out, symbols_out, h_out, c_out },
+
+            build(enc, time, prev, symbols, valid, h_in, c_in) {
+                let out: crate::gigaam::error::Result<_> =
+                    crate::gigaam::rnnt::block::forward_block(model, enc, time, prev, symbols, valid, h_in, c_in);
+                out
+            }
         }
     }
 }
+pub(crate) use block_jit::RnntBlockJit;
 
 jit_wrapper! {
-    RnntJointStepJit(GigaAm) {
-        enc_t: Tensor,
-        g: Tensor,
+    RnntEncProjJit(GigaAm) {
+        enc: Tensor,
 
-        build(enc_t, g) {
-            let (rnnt_head, _) = model.head.expect_rnnt("RnntJointStepJit")?;
-            rnnt_head.joint.forward(enc_t, g)
+        build(enc) {
+            // [B, T, E] -> [B, T, J] joint encoder projection, once per wave.
+            let (rnnt_head, _) = model.head.expect_rnnt("RnntEncProjJit")?;
+            let out: crate::gigaam::error::Result<_> = rnnt_head.joint.project_encoder(enc);
+            out
         }
     }
 }

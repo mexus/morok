@@ -48,4 +48,31 @@ pub enum Error {
     /// CUDA-specific errors.
     #[snafu(display("CUDA error: {source}"))]
     CudaError { source: cudarc::driver::DriverError },
+
+    /// AMD GPU not present (no `/dev/kfd`, empty topology, permission denied,
+    /// or selected device index out of range).
+    #[snafu(display("no AMD GPU available: {reason}"))]
+    NoAmdGpu { reason: String },
+
+    /// AMD KFD ioctl failure.
+    #[snafu(display("AMD ioctl {ioctl} failed (errno {errno})"))]
+    AmdIoctl { ioctl: &'static str, errno: i32 },
+
+    /// AMD allocation failure (VRAM exhaustion, BAR-resize required, etc.).
+    #[snafu(display("AMD allocation failed: {reason}"))]
+    AmdAllocFailed { reason: String },
+
+    /// Kernel requests more LDS/group-segment than the device exposes.
+    #[snafu(display("group_segment too large: {requested} > device limit {limit} (lds_size_in_kb {lds_kb})"))]
+    GroupSegmentTooLarge { requested: u32, limit: u32, lds_kb: u32 },
+
+    /// Device requested but unavailable on this host (wrong OS, missing libs).
+    #[snafu(display("device unavailable: {reason}"))]
+    DeviceUnavailable { reason: String },
+
+    /// Allocator does not implement an optional operation (e.g. `_transfer`,
+    /// `_offset`, `_map`); the `Allocator` base defaults these to unsupported.
+    /// Reachable only via cross-backend misuse, never on the CPU path.
+    #[snafu(display("allocator does not support operation: {op}"))]
+    Unsupported { op: &'static str },
 }

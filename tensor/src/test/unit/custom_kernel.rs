@@ -130,33 +130,37 @@ crate::codegen_tests! {
 fn run_custom_op_numerical_test(backend: CpuBackend, mul_tpl: &str, add_tpl: &str) {
     test_setup();
 
-    let src = Tensor::from_slice([3.5f32]);
-    let dst = Tensor::empty(&[1], DType::Float32);
+    // CUSTOM C templates only render on the C/CPU backend (the AMD/LLVM backend
+    // rejects them), so pin all tensors to CPU regardless of SVOD_DEVICE.
+    svod_dtype::default_device::with_default_device(svod_dtype::DeviceSpec::Cpu, || {
+        let src = Tensor::from_slice([3.5f32]);
+        let dst = Tensor::empty(&[1], DType::Float32);
 
-    let mut outputs = dst
-        .custom_kernel(&[&src], |placeholders| {
-            assert_eq!(placeholders.len(), 2);
-            let out_buf = placeholders[0].clone();
-            let in_buf = placeholders[1].clone();
+        let mut outputs = dst
+            .custom_kernel(&[&src], |placeholders| {
+                assert_eq!(placeholders.len(), 2);
+                let out_buf = placeholders[0].clone();
+                let in_buf = placeholders[1].clone();
 
-            let idx = UOp::index_const(0);
-            let load_idx = UOp::index().buffer(in_buf.clone()).indices(vec![idx.clone()]).ptr(true).call().unwrap();
-            let store_idx = UOp::index().buffer(out_buf.clone()).indices(vec![idx]).ptr(true).call().unwrap();
+                let idx = UOp::index_const(0);
+                let load_idx = UOp::index().buffer(in_buf.clone()).indices(vec![idx.clone()]).ptr(true).call().unwrap();
+                let store_idx = UOp::index().buffer(out_buf.clone()).indices(vec![idx]).ptr(true).call().unwrap();
 
-            let loaded = UOp::load().buffer(in_buf).index(load_idx).call();
-            let scaled = UOp::custom(smallvec![loaded], mul_tpl.to_string(), DType::Float32);
-            let shifted = UOp::custom(smallvec![scaled], add_tpl.to_string(), DType::Float32);
-            let store = store_idx.store(shifted);
-            UOp::sink(vec![store])
-        })
-        .expect("custom kernel should build");
+                let loaded = UOp::load().buffer(in_buf).index(load_idx).call();
+                let scaled = UOp::custom(smallvec![loaded], mul_tpl.to_string(), DType::Float32);
+                let shifted = UOp::custom(smallvec![scaled], add_tpl.to_string(), DType::Float32);
+                let store = store_idx.store(shifted);
+                UOp::sink(vec![store])
+            })
+            .expect("custom kernel should build");
 
-    let mut out = outputs.remove(0);
-    let config = PrepareConfig::for_cpu_backend(backend);
-    out.realize_with(&config).unwrap();
+        let mut out = outputs.remove(0);
+        let config = PrepareConfig::for_cpu_backend(backend);
+        out.realize_with(&config).unwrap();
 
-    let result = out.as_vec::<f32>().unwrap();
-    assert_close_f32(&result, &[8.0], 1e-6);
+        let result = out.as_vec::<f32>().unwrap();
+        assert_close_f32(&result, &[8.0], 1e-6);
+    });
 }
 
 #[test]

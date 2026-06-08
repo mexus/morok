@@ -122,6 +122,15 @@ pub fn do_render(program: &Arc<UOp>, renderer: &dyn Renderer, name: Option<&str>
 
     let linear_uop = linear.clone().ok_or_else(|| invalid_program_state("PROGRAM has no LINEAR stage"))?;
 
+    // Verify kernel invariants (integer indices, no surviving PtrCat) before
+    // the renderer turns a malformed kernel into a panic / malformed IR / GPU
+    // fault. Recoverable: beam search maps this to a skipped candidate.
+    // Port of tinygrad `type_verify(lst, spec_program)` (codegen/__init__.py:135).
+    if svod_schedule::spec::spec_enabled() {
+        svod_schedule::spec::type_verify(&linear_uop, &svod_schedule::spec::spec_program())
+            .map_err(|e| invalid_program_state(e.to_string()))?;
+    }
+
     let spec = renderer.render(&linear_uop, name)?;
     let source_uop = UOp::source(spec.src.clone());
     let mut rendered = rebuild_program(&linearized, linear, Some(source_uop), None)?;

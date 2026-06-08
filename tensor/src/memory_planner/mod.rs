@@ -554,7 +554,7 @@ fn memory_plan_arena(
             prototype.allocator_arc(),
             svod_dtype::DType::UInt8,
             vec![arena_size],
-            svod_device::allocator::BufferOptions::default(),
+            svod_device::allocator::BufferSpec::default(),
         );
         arenas.insert(lane.clone(), arena);
     }

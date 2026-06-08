@@ -145,6 +145,7 @@ impl Program for ClangProgram {
         vals: &[i64],
         global_size: Option<[usize; 3]>,
         _local_size: Option<[usize; 3]>,
+        _wait: bool,
     ) -> Result<()> {
         unsafe {
             execute_kernel(self.kernel.cif(), self.kernel.fn_ptr(), buffers, vals, self.kernel.var_names(), global_size)
@@ -232,6 +233,7 @@ impl Program for LlvmProgram {
         vals: &[i64],
         global_size: Option<[usize; 3]>,
         _local_size: Option<[usize; 3]>,
+        _wait: bool,
     ) -> Result<()> {
         unsafe {
             execute_kernel(self.kernel.cif(), self.kernel.fn_ptr(), buffers, vals, self.kernel.var_names(), global_size)
@@ -376,6 +378,7 @@ mod mlir_backend {
             vals: &[i64],
             global_size: Option<[usize; 3]>,
             _local_size: Option<[usize; 3]>,
+            _wait: bool,
         ) -> Result<()> {
             let core_count = global_size.map(|[tc, _, _]| tc).filter(|&tc| tc > 1);
             let fn_ptr = self.kernel.fn_ptr();

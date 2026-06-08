@@ -2,7 +2,7 @@ use ndarray::Array4;
 use snafu::ResultExt;
 use svod_dtype::DType;
 use svod_ir::SInt;
-use svod_tensor::{BoundVariable, Tensor};
+use svod_tensor::Tensor;
 
 use crate::init::{fan_in_uniform, ones, zeros};
 use crate::state::{HasStateDict, StateDict, get_tensor, prefixed};
@@ -247,7 +247,16 @@ impl HasStateDict for MultiHeadSelfAttention {
 #[derive(Clone)]
 pub enum ConvNorm {
     LayerNorm(LayerNormWeights),
-    BatchNorm { scale: Tensor, bias: Tensor, mean: Tensor, invstd: Tensor },
+    BatchNorm {
+        scale: Tensor,
+        bias: Tensor,
+        mean: Tensor,
+        invstd: Tensor,
+    },
+    /// Inference-time BatchNorm fold: the affine collapsed into the depthwise
+    /// conv at load (`w *= s`, `b = b*s + bias - mean*s` with
+    /// `s = scale*invstd`), so the norm op vanishes from the graph.
+    Folded,
 }
 
 /// Conformer convolution module:
@@ -328,6 +337,7 @@ impl ConvModule {
             ConvNorm::BatchNorm { scale, bias, mean, invstd } => {
                 y.batchnorm().scale(scale).bias(bias).mean(mean).invstd(invstd).call().context(TensorSnafu)?
             }
+            ConvNorm::Folded => y,
         };
         // BN/LN params (scale, bias, mean, invstd) are stored fp32; broadcasting promotes
         // the norm output. Re-cast to the activation dtype so SiLU/pw2 stay in the right
@@ -353,6 +363,8 @@ impl HasStateDict for ConvModule {
                     sd.insert(prefixed(prefix, name), t.clone());
                 }
             }
+            // Folded weights live in dw_weight/dw_bias; the BN params are gone.
+            ConvNorm::Folded => {}
         }
         sd
     }
@@ -362,11 +374,29 @@ impl HasStateDict for ConvModule {
         load_state_field!(self, sd, prefix, [pw1_weight, pw1_bias, dw_weight, dw_bias, pw2_weight, pw2_bias]);
         match &mut self.conv_norm {
             ConvNorm::LayerNorm(ln) => ln.load_state_dict(sd, &prefixed(prefix, "conv_norm"))?,
-            ConvNorm::BatchNorm { scale, bias, mean, invstd } => {
-                *scale = get_tensor(sd, &prefixed(prefix, "bn_scale"))?;
-                *bias = get_tensor(sd, &prefixed(prefix, "bn_bias"))?;
-                *mean = get_tensor(sd, &prefixed(prefix, "bn_mean"))?;
-                *invstd = get_tensor(sd, &prefixed(prefix, "bn_invstd"))?;
+            // Folded round-trips (e.g. `cast_weights`) carry no BN keys — the
+            // affine already lives in dw_weight/dw_bias.
+            ConvNorm::Folded if !sd.contains_key(&prefixed(prefix, "bn_scale")) => {}
+            ConvNorm::BatchNorm { .. } | ConvNorm::Folded => {
+                // Fold BN into the depthwise conv at load: with s = scale*invstd,
+                // y_bn = conv(x)*s + (bias - mean*s) — per-channel scale folds
+                // into the conv weight rows + a corrected bias. Removes the
+                // norm op from the encoder graph.
+                let scale = get_tensor(sd, &prefixed(prefix, "bn_scale"))?;
+                let bias = get_tensor(sd, &prefixed(prefix, "bn_bias"))?;
+                let mean = get_tensor(sd, &prefixed(prefix, "bn_mean"))?;
+                let invstd = get_tensor(sd, &prefixed(prefix, "bn_invstd"))?;
+                let fold = || -> std::result::Result<(Tensor, Tensor), Box<svod_tensor::error::Error>> {
+                    let d = self.d_model as isize;
+                    let s = scale.try_mul(&invstd)?;
+                    let w = self.dw_weight.try_mul(&s.try_reshape([d, 1, 1])?)?;
+                    let b = self.dw_bias.try_mul(&s)?.try_add(&bias)?.try_sub(&mean.try_mul(&s)?)?;
+                    Ok((w, b))
+                };
+                let (w, b) = fold().map_err(|e| crate::state::Error::Tensor { source: e })?;
+                self.dw_weight = w;
+                self.dw_bias = b;
+                self.conv_norm = ConvNorm::Folded;
             }
         }
         Ok(())
@@ -691,20 +721,21 @@ impl Encoder {
         x.try_transpose(-1, -2).context(TensorSnafu)
     }
 
-    /// Batched encoder path with dynamic batch and mel-frame length.
+    /// Batched encoder path over the full, constant-shaped mel buffer.
     /// Input: `mel` `[B, n_mels, T_mel]`, `lengths` `[B]` valid lengths in mel frames.
     /// Output: `[B, d_model, T_sub]`.
-    pub fn forward_batch(
-        &self,
-        mel: &Tensor,
-        lengths: &Tensor,
-        batch: &BoundVariable,
-        mel_len: &BoundVariable,
-    ) -> Result<Tensor> {
-        let b = batch.as_sint();
-        let t_mel = mel_len.as_sint();
+    ///
+    /// `B` and `T_mel` are read directly off `mel`'s shape — the JIT realizes the
+    /// input buffers at the bucket's max shape (`max_batch_size × max_t_mel`), so
+    /// every derived dim is `SInt::Const`. That exact divisibility is what lets the
+    /// schedule heuristics fire MFMA tilings instead of the slow symbolic fallback.
+    /// Inactive lanes (`lengths[b] == 0`) subsample to `lengths_sub == 0`, so
+    /// `pad_valid` is all-false for them and the validity masks zero their output;
+    /// the caller never reads those lanes.
+    pub fn forward_batch(&self, mel: &Tensor, lengths: &Tensor) -> Result<Tensor> {
+        let mel_shape = mel.shape().context(TensorSnafu)?;
+        let b = mel_shape[0].clone();
 
-        let lengths = lengths.try_shrink([Some((SInt::Const(0), b.clone()))]).context(TensorSnafu)?;
         let lengths = lengths.cast(DType::Index).context(TensorSnafu)?;
 
         let two_t = Tensor::const_(2i64, DType::Index);
@@ -715,9 +746,6 @@ impl Encoder {
             lengths_sub = lengths_sub.try_add(&one_t).context(TensorSnafu)?.try_div(&two_t).context(TensorSnafu)?;
         }
 
-        let mel = mel
-            .try_shrink([Some((SInt::Const(0), b.clone())), None, Some((SInt::Const(0), t_mel))])
-            .context(TensorSnafu)?;
         let x = mel.try_transpose(-1, -2).context(TensorSnafu)?;
         let x = x.cast(self.input_dtype()).context(TensorSnafu)?;
         let x = self.subsampling.forward(&x)?;

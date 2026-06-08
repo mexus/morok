@@ -290,14 +290,22 @@ fn apply_axis_choice_impl(
         let mut padding_ops: Vec<(usize, usize, usize)> = Vec::new(); // (axes_idx, scheduler_idx, tc_dim)
 
         for (i, (axis, &tc_dim)) in axes.iter().zip(&tc_dims).enumerate() {
-            let dim_size = get_range_size(axis);
-            if let Some(size) = dim_size
-                && !(size as usize).is_multiple_of(tc_dim)
-            {
-                let axis_idx = scheduler.rngs().iter().position(|r| Arc::ptr_eq(r, axis)).ok_or_else(|| {
-                    ValidationFailedSnafu { op: "TC", reason: "axis not found in scheduler ranges" }.build()
-                })?;
-                padding_ops.push((i, axis_idx, tc_dim));
+            match get_range_size(axis) {
+                Some(size) => {
+                    if !(size as usize).is_multiple_of(tc_dim) {
+                        let axis_idx = scheduler.rngs().iter().position(|r| Arc::ptr_eq(r, axis)).ok_or_else(|| {
+                            ValidationFailedSnafu { op: "TC", reason: "axis not found in scheduler ranges" }.build()
+                        })?;
+                        padding_ops.push((i, axis_idx, tc_dim));
+                    }
+                }
+                // PADTO can't pad an unknown extent, and even a provably
+                // divisible symbolic axis fires pathological tilings in the
+                // divisibility-keyed heuristics — symbolic axes never TC.
+                None => {
+                    return ValidationFailedSnafu { op: "TC", reason: "symbolic dimension cannot use tensor cores" }
+                        .fail();
+                }
             }
         }
 
@@ -316,19 +324,21 @@ fn apply_axis_choice_impl(
             axes[axes_idx] = scheduler.rngs()[scheduler_idx].clone();
         }
     } else {
-        // Without tc_opt >= 2, reject non-divisible dimensions
+        // Without tc_opt >= 2, reject non-divisible dimensions. Symbolic dims
+        // never TC: silently skipping the check lowers a tile loop over an
+        // extent the tile may not cover.
         for (i, axis) in axes.iter().enumerate() {
-            let dim_size = get_range_size(axis);
             let tc_dim = match i {
                 0 => tc.dims.0,
                 1 => tc.dims.1,
                 _ => tc.dims.2,
             };
-            if let Some(size) = dim_size
-                && !(size as usize).is_multiple_of(tc_dim)
-            {
-                return ValidationFailedSnafu { op: "TC", reason: "dimension not divisible by tensor core size" }
-                    .fail();
+            match get_range_size(axis) {
+                Some(size) if (size as usize).is_multiple_of(tc_dim) => {}
+                _ => {
+                    return ValidationFailedSnafu { op: "TC", reason: "dimension not divisible by tensor core size" }
+                        .fail();
+                }
             }
         }
     }
@@ -502,29 +512,51 @@ fn apply_axis_choice_impl(
             tile_grid: tc.tile_grid,
         };
 
-        let a_contract = src_a.contract(a_axes);
-        let b_contract = src_b.contract(b_axes);
-        let zero_acc = if tc.dtype_out.is_float() {
+        // Tag the WMMA structure finalized (see `TAG_TC_FINAL`) so the expander
+        // keeps the operand CONTRACTs / WMMA / output UNROLL distinct from the
+        // raw operand subtrees and expands the WMMA per output tile.
+        let tc_tag = smallvec::smallvec![crate::devectorize::TAG_TC_FINAL];
+        let a_contract = src_a.contract(a_axes).with_tag(tc_tag.clone());
+        let b_contract = src_b.contract(b_axes).with_tag(tc_tag.clone());
+        // The WMMA C/accumulator operand carries the full per-thread D-register
+        // width (`elements_per_thread.2`, == prod(c_axes)), NOT a scalar — see
+        // tinygrad postrange.py:300-303 which builds the zero accumulator as
+        // `dtype_out.vec(elements_per_thread[2])`. A scalar-0 here desyncs the
+        // C operand from A/B/D when the expander replicates the WMMA over the
+        // M/N output tiles: do_expand broadcasts a scalar C by `expand_sz`
+        // (e.g. 16) giving a count-16 operand, while A/B/D become count-64,
+        // and `devectorize_wmma` then can't group C into per-tile slices.
+        let c_count = tc.elements_per_thread.2;
+        let zero_scalar = if tc.dtype_out.is_float() {
             UOp::const_(tc.dtype_out.clone(), ConstValue::Float(0.0))
         } else {
             UOp::const_(tc.dtype_out.clone(), ConstValue::Int(0))
         };
-        let wmma = UOp::wmma(a_contract, b_contract, zero_acc, metadata);
-        let mut tc_uop = wmma.unroll_with_dtype(c_axes, tc.dtype_out.clone());
+        let zero_acc = zero_scalar.broadcast(c_count);
+        let wmma = UOp::wmma(a_contract, b_contract, zero_acc, metadata).with_tag(tc_tag.clone());
+        let mut tc_uop = wmma.unroll_with_dtype(c_axes, tc.dtype_out.clone()).with_tag(tc_tag.clone());
 
-        // Preserve extra reduce ranges (exclude TC reduce axis_ids)
-        if let Op::Reduce { ranges, .. } = updated_reduce.op() {
-            let extra: SmallVec<[Arc<UOp>; 4]> = ranges
-                .iter()
-                .filter(|r| match r.op() {
-                    Op::Range { axis_id, .. } => !tc_reduce_aids.contains(&axis_id.value()),
-                    _ => false,
-                })
-                .cloned()
-                .collect();
-            if !extra.is_empty() {
-                tc_uop = tc_uop.reduce(extra, ReduceOp::Add);
-            }
+        // Re-wrap the WMMA in a REDUCE over the residual reduction ranges — the
+        // K-tile loop left once the matrix core folds the contraction axes
+        // (`tc_reduce_aids`). `shift_to` splits K and substitutes the composite
+        // index back into the operand expressions, so the residual range no
+        // longer lives in `updated_reduce.ranges` (which collapses to empty) but
+        // in the WMMA's backward slice. Collect it from the slice, keeping only
+        // `Reduce`-typed ranges the core did not consume — the slice also carries
+        // Global/Warp/Upcast ranges, which must NOT be wrapped. Without this
+        // REDUCE, pm_reduce
+        // never builds the carried accumulator + loop-close `End`, so codegen
+        // emits a bare WMMA with a const-0 C operand and an unterminated loop.
+        let mut extra: SmallVec<[Arc<UOp>; 4]> = tc_uop
+            .backward_slice()
+            .into_iter()
+            .filter(|r| matches!(r.op(), Op::Range { axis_id, axis_type: AxisType::Reduce, .. } if !tc_reduce_aids.contains(&axis_id.value())))
+            .collect();
+        // Deterministic nesting (outer = lowest axis_id); slice may list a range once.
+        extra.sort_by_key(get_axis_id);
+        extra.dedup_by_key(|r| get_axis_id(r));
+        if !extra.is_empty() {
+            tc_uop = tc_uop.reduce(extra, ReduceOp::Add);
         }
 
         // Substitute REDUCE → WMMA chain in the AST

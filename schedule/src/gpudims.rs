@@ -177,16 +177,24 @@ fn add_gpudims(ctx: &Renderer, sink: &Arc<UOp>) -> Option<Arc<UOp>> {
     } else {
         // Generate GPU indices
         let global_max = ctx.global_max.as_deref();
-        let local_max_product = ctx.local_max;
+        let n = local_shape.len().max(1);
 
-        // For locals, we use product limit rather than per-dimension
-        // Convert to per-dimension limits if needed
-        let local_max: Option<Vec<usize>> = local_max_product.map(|max| {
-            // Simple heuristic: distribute limit evenly if multiple dimensions
-            let n = local_shape.len().max(1);
-            let per_dim = (max as f64).powf(1.0 / n as f64).floor() as usize;
-            vec![per_dim.max(1); n]
-        });
+        // Per-axis local-size caps. Some backends (AMD/HIP) cap the 3rd local
+        // axis below the workgroup product limit — e.g. (1024, 1024, 64) — so a
+        // beam candidate with product ≤ 1024 but z > 64 would otherwise pass
+        // `validate_limits` and only fault at dispatch. When the renderer
+        // exposes per-axis limits, apply them positionally (axes past the tuple
+        // fall back to the product cap). Otherwise cap every axis at the product
+        // limit — the workgroup-size product is enforced separately by the
+        // optimizer, so this is NOT a cube-root split (that made non-cubic
+        // shapes like [32,2,2] unfittable: 32 > 1024^(1/3) ≈ 10).
+        let local_max: Option<Vec<usize>> = match ctx.local_max_axes() {
+            Some(axes) => {
+                let product = ctx.local_max.unwrap_or(usize::MAX);
+                Some((0..n).map(|i| axes.get(i).copied().unwrap_or(product).max(1)).collect())
+            }
+            None => ctx.local_max.map(|max| vec![max.max(1); n]),
+        };
         let local_max_slice = local_max.as_deref();
 
         // Create global indices (gidx0, gidx1, ...)
@@ -325,9 +333,31 @@ fn const_to_i64(cv: &ConstValue) -> Option<i64> {
     }
 }
 
+/// Tinygrad's `_dim_max(d: sint) -> int` (gpudims.py:7): concrete int passes
+/// through, symbolic UOp returns its `vmax` upper bound. Used uniformly across
+/// grouping/splitting so concrete and symbolic dims go through one code path.
+fn dim_max(d: &Arc<UOp>) -> usize {
+    const_to_i64(d.vmax()).map(|v| v.max(0) as usize).unwrap_or(usize::MAX)
+}
+
+/// True when `a` and `b` are structurally identical (hash-cons identity).
+fn dims_eq(a: &[Arc<UOp>], b: &[Arc<UOp>]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| Arc::ptr_eq(x, y))
+}
+
+/// True when `u` is the concrete CONST integer 1 (for matching tinygrad's
+/// `acc != 1` leading-1 special case in `get_contraction`).
+fn is_one(u: &Arc<UOp>) -> bool {
+    matches!(u.op(), Op::Const(c) if matches!(c.0, ConstValue::Int(1)))
+}
+
 /// Create GPU thread indices with dimension limiting.
 ///
-/// Based on Tinygrad's `get_grouped_dims` (gpudims.py:28-57).
+/// Mirrors Tinygrad's `get_grouped_dims` (gpudims.py:28-56). Operates on
+/// `sint` dims (concrete `Int` const or symbolic `UOp`) end-to-end via
+/// [`dim_max`]; grouping/splitting always returns a fresh `Vec<Arc<UOp>>` so
+/// downstream `decompose`/`combine`/`flatten_unflatten` can index into it
+/// regardless of whether the input was numeric or symbolic.
 ///
 /// # Arguments
 ///
@@ -338,139 +368,148 @@ fn const_to_i64(cv: &ConstValue) -> Option<i64> {
 ///
 /// # Returns
 ///
-/// Vector of SPECIAL UOps representing thread indices.
+/// Vector of SPECIAL UOps (plus mod/idiv decomposition where contraction was
+/// applied) representing thread indices, one per original `dims` entry.
 fn get_grouped_dims(prefix: &str, dims: &[Arc<UOp>], max_sizes: Option<&[usize]>, reverse: bool) -> Vec<Arc<UOp>> {
+    // Tinygrad-equivalent (`codegen/gpudims.py:29`): when `reverse=True`,
+    // recursively call with reversed dims, then reverse the result. Reversing
+    // only the OUTPUT array leaves the SPECIAL UOps named in iteration order
+    // while the indices land at swapped positions — manifests as a 21× OOB on
+    // matmul+reduce kernels where g_x and g_y are picked for different range
+    // axes.
+    if reverse {
+        let reversed: Vec<Arc<UOp>> = dims.iter().cloned().rev().collect();
+        let result = get_grouped_dims(prefix, &reversed, max_sizes, false);
+        return result.into_iter().rev().collect();
+    }
     if dims.is_empty() {
         return vec![];
     }
 
-    // Try to get concrete dimension values for grouping/splitting
-    let concrete_dims: Option<Vec<usize>> = dims
-        .iter()
-        .map(|d| match d.op() {
-            Op::Const(c) => const_to_i64(&c.0).map(|v| v as usize),
-            _ => None,
-        })
-        .collect();
-
-    // Apply dimension limiting if we have concrete values and max_sizes
-    let limited_dims: Vec<usize> = match (&concrete_dims, max_sizes) {
-        (Some(dims_vec), Some(max)) => limit_dims(dims_vec, max),
-        (Some(dims_vec), None) => dims_vec.clone(),
-        (None, _) => {
-            // Symbolic dimensions: can't limit, just create SPECIAL for each
-            return dims.iter().enumerate().map(|(i, d)| UOp::special(d.clone(), format!("{}{}", prefix, i))).collect();
+    let limited: Vec<Arc<UOp>> = match max_sizes {
+        None => dims.to_vec(),
+        Some(max) => {
+            // First try grouping: (a, b, c, d) → (a*b, c, d). Match tinygrad's
+            // fail-fast behaviour (gpudims.py:33-37): if neither grouping nor
+            // splitting can fit the dims into the backend's axis cap, panic
+            // immediately. Returning unchanged dims and warning is what we
+            // used to do, but it produced SPECIAL UOps with `gidx3`/`lidx3+`
+            // that the AMD renderer rejects at codegen/src/llvm/amd/ops.rs;
+            // the error surfaced at codegen time rather than at scheduling
+            // time, which buries the actual problem (a bad scheduler/BEAM
+            // candidate). Failing here makes the offending candidate visible.
+            let grouped = group_dims(dims, max);
+            let after_group = grouped.unwrap_or_else(|| dims.to_vec());
+            if after_group.len() > max.len() {
+                panic!(
+                    "get_grouped_dims: cannot limit dims to {} axes (dims={:?}, max_sizes={:?}); \
+                     scheduler emitted more SPECIAL axes than the backend supports",
+                    max.len(),
+                    dims.iter().map(dim_max).collect::<Vec<_>>(),
+                    max,
+                );
+            }
+            if dims_eq(&after_group, dims) {
+                // No grouping happened (or every group attempt was a no-op):
+                // try splitting up dims (a,) → (b, c).
+                split_dims(dims, max).unwrap_or_else(|| {
+                    panic!(
+                        "get_grouped_dims: split_dims failed (likely non-factorable symbolic dim); \
+                         dims={:?}, max_sizes={:?}",
+                        dims.iter().map(dim_max).collect::<Vec<_>>(),
+                        max,
+                    )
+                })
+            } else {
+                after_group
+            }
         }
     };
 
-    // Create raw indices as SPECIAL UOps
-    let raw_idxs: Vec<Arc<UOp>> = limited_dims
-        .iter()
-        .enumerate()
-        .map(|(i, &size)| UOp::special(UOp::index_const(size as i64), format!("{}{}", prefix, i)))
-        .collect();
+    let raw_idxs: Vec<Arc<UOp>> =
+        limited.iter().enumerate().map(|(i, s)| UOp::special(s.clone(), format!("{prefix}{i}"))).collect();
 
-    // Handle dimension count mismatch
-    let original_len = dims.len();
-    let limited_len = limited_dims.len();
-
-    let result = if limited_len < original_len {
-        // Contraction: more original dims than limited dims
-        // Need to decompose indices back to original dimension count
-        decompose_contracted_dims(&raw_idxs, &limited_dims, concrete_dims.as_ref().unwrap())
-    } else if limited_len > original_len {
-        // Expansion: fewer original dims than limited dims
-        // Need to combine indices to match original dimension count
-        combine_expanded_dims(&raw_idxs, &limited_dims, concrete_dims.as_ref().unwrap())
-    } else if limited_dims != *concrete_dims.as_ref().unwrap() {
-        // Same count but different values: flatten and unflatten
-        flatten_unflatten_dims(&raw_idxs, &limited_dims, concrete_dims.as_ref().unwrap())
+    if limited.len() < dims.len() {
+        // Contraction: more original dims than limited dims — decompose via
+        // divmod (mirrors gpudims.py:39-47).
+        decompose_contracted_dims(&raw_idxs, dims, &limited)
+    } else if limited.len() > dims.len() {
+        // Expansion: more limited dims than original — combine via add/mul
+        // (gpudims.py:48-50).
+        combine_expanded_dims(&raw_idxs, &limited, dims)
+    } else if !dims_eq(&limited, dims) {
+        // Same count but different values: flatten then unflatten with new
+        // strides (gpudims.py:51-55).
+        flatten_unflatten_dims(&raw_idxs, &limited, dims)
     } else {
         raw_idxs
-    };
-
-    if reverse { result.into_iter().rev().collect() } else { result }
-}
-
-/// Limit dimensions to fit within hardware constraints.
-///
-/// Tries grouping first, then splitting if needed.
-fn limit_dims(dims: &[usize], max_sizes: &[usize]) -> Vec<usize> {
-    // First try grouping
-    if let Some(grouped) = group_dims(dims, max_sizes) {
-        return grouped;
     }
-
-    // If grouping fails, try splitting
-    split_dims(dims, max_sizes)
 }
 
 /// Group adjacent dimensions to fit within hardware limits.
 ///
-/// Based on Tinygrad's `_group_dims` (gpudims.py:7-16).
-fn group_dims(dims: &[usize], max_sizes: &[usize]) -> Option<Vec<usize>> {
-    let mut result = dims.to_vec();
-
-    // Keep trying to group until we fit or can't group anymore
-    while result.len() > max_sizes.len() || result.iter().zip(max_sizes).any(|(d, m)| *d > *m) {
+/// Mirrors Tinygrad's `_group_dims` (gpudims.py:9-16).
+fn group_dims(dims: &[Arc<UOp>], max_sizes: &[usize]) -> Option<Vec<Arc<UOp>>> {
+    let mut result: Vec<Arc<UOp>> = dims.to_vec();
+    while result.len() > max_sizes.len() || result.iter().zip(max_sizes).any(|(d, m)| dim_max(d) > *m) {
         let mut grouped = false;
-        for i in 0..max_sizes.len().min(result.len().saturating_sub(1)) {
-            if i + 1 < result.len() {
-                let product = result[i].saturating_mul(result[i + 1]);
-                if product <= max_sizes[i] {
-                    // Merge dims[i] and dims[i+1]
-                    result = result[..i]
-                        .iter()
-                        .chain(std::iter::once(&product))
-                        .chain(result[i + 2..].iter())
-                        .cloned()
-                        .collect();
-                    grouped = true;
-                    break;
-                }
+        for (i, &m) in max_sizes.iter().enumerate() {
+            if i + 1 < result.len() && dim_max(&result[i]).saturating_mul(dim_max(&result[i + 1])) <= m {
+                let merged = result[i].mul(&result[i + 1]);
+                result = result[..i]
+                    .iter()
+                    .cloned()
+                    .chain(std::iter::once(merged))
+                    .chain(result[i + 2..].iter().cloned())
+                    .collect();
+                grouped = true;
+                break;
             }
         }
         if !grouped {
             return None;
         }
     }
-
     Some(result)
 }
 
 /// Split dimensions that exceed hardware limits.
 ///
-/// Based on Tinygrad's `_split_dims` (gpudims.py:18-26).
-fn split_dims(dims: &[usize], max_sizes: &[usize]) -> Vec<usize> {
-    // Pad to 3 dimensions (typical GPU max)
-    let mut result: Vec<usize> = dims.to_vec();
-    while result.len() < 3 {
-        result.push(1);
+/// Mirrors Tinygrad's `_split_dims` (gpudims.py:18-26). Splitting requires a
+/// concrete factor; if any dim that exceeds its limit is symbolic (no
+/// `Op::Const` peer to read), the operation is unrepresentable and `None` is
+/// returned (tinygrad raises in the same situation).
+fn split_dims(dims: &[Arc<UOp>], max_sizes: &[usize]) -> Option<Vec<Arc<UOp>>> {
+    if dims.iter().zip(max_sizes).all(|(d, m)| dim_max(d) <= *m) {
+        return Some(dims.to_vec());
     }
-
-    // Split dimensions that exceed limits
-    for i in 0..result.len() {
-        let max = if i < max_sizes.len() { max_sizes[i] } else { usize::MAX };
-        while result[i] > max {
-            // Find smallest divisor
-            let div = find_smallest_divisor(result[i]);
+    let mut working: Vec<Arc<UOp>> = dims.to_vec();
+    while working.len() < 3 {
+        working.push(UOp::index_const(1));
+    }
+    for i in 0..3 {
+        let m = max_sizes.get(i).copied().unwrap_or(usize::MAX);
+        while dim_max(&working[i]) > m {
+            let Op::Const(c) = working[i].op() else {
+                return None;
+            };
+            let val = const_to_i64(&c.0)? as usize;
+            let div = find_smallest_divisor(val);
             if div == 1 {
-                // Prime number that can't be split - give up
-                break;
+                return None;
             }
-            // Split: move factor to next dimension
-            let next = (i + 1) % result.len();
-            result[i] /= div;
-            result[next] *= div;
+            let div_uop = UOp::index_const(div as i64);
+            let next = (i + 1) % 3;
+            working[i] = working[i].idiv(&div_uop);
+            working[next] = working[next].mul(&div_uop);
         }
     }
-
-    // Trim trailing 1s
-    while result.len() > 1 && result.last() == Some(&1) {
-        result.pop();
-    }
-
-    result
+    let result = if is_one(&working[2]) {
+        if is_one(&working[1]) { vec![working[0].clone()] } else { vec![working[0].clone(), working[1].clone()] }
+    } else {
+        working
+    };
+    Some(result)
 }
 
 /// Find the smallest divisor of n (excluding 1).
@@ -489,160 +528,140 @@ fn find_smallest_divisor(n: usize) -> usize {
 
 /// Decompose contracted dimensions back to original count.
 ///
-/// When we grouped dimensions (limited_len < original_len), we need
-/// to decompose the indices using divmod.
-fn decompose_contracted_dims(raw_idxs: &[Arc<UOp>], limited_dims: &[usize], original_dims: &[usize]) -> Vec<Arc<UOp>> {
-    // Get contraction mapping
-    let contraction = get_contraction(original_dims, limited_dims);
-    let Some(contraction) = contraction else {
-        // Fallback: return raw indices
-        return raw_idxs.to_vec();
+/// Mirrors Tinygrad's gpudims.py:39-47. For each SPECIAL index whose limited
+/// dim grouped several original dims together, peel them back via repeated
+/// `current % dims[c]; current //= dims[c]`.
+fn decompose_contracted_dims(
+    raw_idxs: &[Arc<UOp>],
+    original_dims: &[Arc<UOp>],
+    limited_dims: &[Arc<UOp>],
+) -> Vec<Arc<UOp>> {
+    let contraction = match get_contraction(original_dims, limited_dims) {
+        Some(c) => c,
+        None => return raw_idxs.to_vec(),
     };
-
     let mut result: Vec<Arc<UOp>> = Vec::new();
-
     for (idx, group) in raw_idxs.iter().zip(&contraction) {
+        if group.is_empty() {
+            // Leading-1 contraction group (`acc != 1` branch in get_contraction
+            // produced an empty span); the SPECIAL has no original dim to
+            // emit, so it contributes nothing — skip.
+            continue;
+        }
         let mut current = idx.clone();
-        for &dim_idx in group.iter().rev().skip(1).collect::<Vec<_>>().into_iter().rev() {
-            let dim_size = original_dims[dim_idx];
-            let dim_uop = UOp::index_const(dim_size as i64);
-            // Extract: result[dim_idx] = current % dim_size
-            result.push(current.mod_(&dim_uop));
-            // Shift: current = current / dim_size (integer division)
-            current = current.idiv(&dim_uop);
+        for &c in &group[..group.len() - 1] {
+            let d = &original_dims[c];
+            result.push(current.mod_(d));
+            current = current.idiv(d);
         }
         result.push(current);
     }
-
     result
 }
 
 /// Get contraction mapping: which original dims map to each limited dim.
 ///
-/// Uses accumulated product matching instead of greedy grouping.
-/// This handles non-consecutive dimension groups like [2,5,2] → [10,2].
-///
-/// # Algorithm
-///
-/// 1. Compute accumulated products for both original and limited dims
-/// 2. Find split points where accumulated products match
-/// 3. Build index ranges from split points
+/// Mirrors Tinygrad's `get_contraction` (helpers.py:121-125) with `T = sint`.
+/// Accumulated products are built via `UOp::mul`; hash-consing makes equal
+/// UOp expressions share an `Arc`, so [`Arc::ptr_eq`] is the correct equality
+/// for matching positions — same shape contract as the python implementation
+/// where sint `__eq__` collapses to identity for symbolic and value for int.
 ///
 /// # Example
 ///
 /// ```text
-/// original_dims = [2, 5, 2], limited_dims = [10, 2]
+/// original = [2, 5, 2], limited = [10, 2]
 /// acc_old = [2, 10, 20]
 /// acc_new = [10, 20]
-/// split = [2, 3]  (indices where acc_old matches acc_new)
-/// result = [[0, 1], [2]]  (dims 0,1 → limited 0; dim 2 → limited 1)
+/// split = [2, 3]
+/// result = [[0, 1], [2]]
 /// ```
-fn get_contraction(original_dims: &[usize], limited_dims: &[usize]) -> Option<Vec<Vec<usize>>> {
+fn get_contraction(original_dims: &[Arc<UOp>], limited_dims: &[Arc<UOp>]) -> Option<Vec<Vec<usize>>> {
     if original_dims.is_empty() && limited_dims.is_empty() {
         return Some(vec![]);
     }
     if limited_dims.is_empty() {
         return None;
     }
-
-    // Accumulated products for original dims
-    let acc_old: Vec<usize> = original_dims
-        .iter()
-        .scan(1usize, |s, &x| {
-            *s = s.saturating_mul(x);
-            Some(*s)
-        })
-        .collect();
-
-    // Accumulated products for limited dims
-    let acc_new: Vec<usize> = limited_dims
-        .iter()
-        .scan(1usize, |s, &x| {
-            *s = s.saturating_mul(x);
-            Some(*s)
-        })
-        .collect();
-
-    // Find split points: for each accumulated product in acc_new,
-    // find the index in acc_old that matches
+    // Skip the synthetic leading `1` from `itertools.accumulate`'s initial: hash
+    // consing only collapses identical sub-trees, and `Mul(1, x)` is not folded
+    // at construction time. Seeding with the first dim instead makes the
+    // accumulated products from grouping (`result[i].mul(&result[i+1])`) share
+    // an Arc with the matching slice of `acc_old`.
+    let scan_mul = |dims: &[Arc<UOp>]| -> Vec<Arc<UOp>> {
+        let mut out: Vec<Arc<UOp>> = Vec::with_capacity(dims.len());
+        for (i, d) in dims.iter().enumerate() {
+            let acc = if i == 0 { d.clone() } else { out[i - 1].mul(d) };
+            out.push(acc);
+        }
+        out
+    };
+    let acc_old = scan_mul(original_dims);
+    let acc_new = scan_mul(limited_dims);
     let mut split = Vec::with_capacity(acc_new.len());
-    for &acc in &acc_new {
-        if acc == 1 {
-            // Special case: leading 1s don't consume any original dims
+    for acc in &acc_new {
+        if is_one(acc) {
             split.push(0);
         } else {
-            match acc_old.iter().position(|&x| x == acc) {
-                Some(idx) => split.push(idx + 1), // +1 because we want the index AFTER the match
-                None => return None,              // No valid contraction
+            match acc_old.iter().position(|o| Arc::ptr_eq(o, acc)) {
+                Some(idx) => split.push(idx + 1),
+                None => return None,
             }
         }
     }
-
-    // Build index ranges from split points
     let mut result = Vec::with_capacity(split.len());
     let mut prev = 0;
     for (i, &s) in split.iter().enumerate() {
         if i == split.len() - 1 {
-            // Last group: take remaining indices
             result.push((prev..original_dims.len()).collect());
         } else {
             result.push((prev..s).collect());
             prev = s;
         }
     }
-
     Some(result)
 }
 
-/// Combine expanded dimensions to match original count.
-fn combine_expanded_dims(raw_idxs: &[Arc<UOp>], limited_dims: &[usize], original_dims: &[usize]) -> Vec<Arc<UOp>> {
-    let a = limited_dims.len();
-    let b = original_dims.len();
-
-    match (a, b) {
-        (2, 1) => {
-            // idx = raw_idxs[0] * limited_dims[1] + raw_idxs[1]
-            let mul = raw_idxs[0].mul(&UOp::index_const(limited_dims[1] as i64));
-            vec![mul.add(&raw_idxs[1])]
-        }
+/// Combine expanded dimensions to match original count (gpudims.py:48-50).
+fn combine_expanded_dims(
+    raw_idxs: &[Arc<UOp>],
+    limited_dims: &[Arc<UOp>],
+    original_dims: &[Arc<UOp>],
+) -> Vec<Arc<UOp>> {
+    match (limited_dims.len(), original_dims.len()) {
+        (2, 1) => vec![raw_idxs[0].mul(&limited_dims[1]).add(&raw_idxs[1])],
         (3, 1) => {
-            // idx = (raw_idxs[0] * limited_dims[1] + raw_idxs[1]) * limited_dims[2] + raw_idxs[2]
-            let mul1 = raw_idxs[0].mul(&UOp::index_const(limited_dims[1] as i64));
-            let add1 = mul1.add(&raw_idxs[1]);
-            let mul2 = add1.mul(&UOp::index_const(limited_dims[2] as i64));
-            vec![mul2.add(&raw_idxs[2])]
+            let inner = raw_idxs[0].mul(&limited_dims[1]).add(&raw_idxs[1]);
+            vec![inner.mul(&limited_dims[2]).add(&raw_idxs[2])]
         }
         _ => flatten_unflatten_dims(raw_idxs, limited_dims, original_dims),
     }
 }
 
-/// Flatten and unflatten when dimensions are same count but different values.
-fn flatten_unflatten_dims(raw_idxs: &[Arc<UOp>], limited_dims: &[usize], original_dims: &[usize]) -> Vec<Arc<UOp>> {
-    let n = limited_dims.len();
-    if n == 2 {
-        // flat = raw_idxs[0] * limited_dims[1] + raw_idxs[1]
-        let mul = raw_idxs[0].mul(&UOp::index_const(limited_dims[1] as i64));
-        let flat = mul.add(&raw_idxs[1]);
-        // unflatten
-        let dim1_uop = UOp::index_const(original_dims[1] as i64);
-        vec![flat.idiv(&dim1_uop), flat.mod_(&dim1_uop)]
-    } else if n == 3 {
-        // flat = raw_idxs[0] * (limited_dims[1] * limited_dims[2]) + raw_idxs[1] * limited_dims[2] + raw_idxs[2]
-        let l12 = UOp::index_const((limited_dims[1] * limited_dims[2]) as i64);
-        let l2 = UOp::index_const(limited_dims[2] as i64);
-        let mul0 = raw_idxs[0].mul(&l12);
-        let mul1 = raw_idxs[1].mul(&l2);
-        let add0 = mul0.add(&mul1);
-        let flat = add0.add(&raw_idxs[2]);
-        // unflatten
-        let d1 = original_dims[1];
-        let d2 = original_dims[2];
-        let d12 = UOp::index_const((d1 * d2) as i64);
-        let d1_uop = UOp::index_const(d1 as i64);
-        let d2_uop = UOp::index_const(d2 as i64);
-        vec![flat.idiv(&d12), flat.idiv(&d2_uop).mod_(&d1_uop), flat.mod_(&d2_uop)]
-    } else {
-        raw_idxs.to_vec()
+/// Flatten and unflatten when dims have same count but different values
+/// (gpudims.py:51-55).
+fn flatten_unflatten_dims(
+    raw_idxs: &[Arc<UOp>],
+    limited_dims: &[Arc<UOp>],
+    original_dims: &[Arc<UOp>],
+) -> Vec<Arc<UOp>> {
+    let flat = match limited_dims.len() {
+        2 => raw_idxs[0].mul(&limited_dims[1]).add(&raw_idxs[1]),
+        3 => {
+            let l12 = limited_dims[1].mul(&limited_dims[2]);
+            let t0 = raw_idxs[0].mul(&l12);
+            let t1 = raw_idxs[1].mul(&limited_dims[2]);
+            t0.add(&t1).add(&raw_idxs[2])
+        }
+        _ => return raw_idxs.to_vec(),
+    };
+    match original_dims.len() {
+        2 => vec![flat.idiv(&original_dims[1]), flat.mod_(&original_dims[1])],
+        3 => {
+            let d12 = original_dims[2].mul(&original_dims[1]);
+            vec![flat.idiv(&d12), flat.idiv(&original_dims[2]).mod_(&original_dims[1]), flat.mod_(&original_dims[2])]
+        }
+        _ => raw_idxs.to_vec(),
     }
 }
 

@@ -60,7 +60,7 @@ fn bench_matmul(c: &mut Criterion) {
         .build()
         .into();
 
-    const BEAM_WIDTH: usize = 4;
+    const BEAM_WIDTH: usize = 2;
     let beam_config: PrepareConfig =
         OptimizerConfig::builder().strategy(OptStrategy::Beam { width: BEAM_WIDTH }).build().into();
 

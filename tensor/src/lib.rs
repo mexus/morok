@@ -51,6 +51,8 @@ pub mod broadcast;
 pub mod conditional;
 pub mod config;
 pub mod data;
+/// Re-export from `svod-dtype` so callers can keep using `svod_tensor::default_device`.
+pub use svod_dtype::default_device;
 pub mod einsum;
 pub mod index;
 pub mod indexing;
@@ -72,6 +74,7 @@ pub mod variable;
 // Re-export for public API
 pub use config::PrepareConfig;
 pub use index::{Idx, IndexSpec};
+pub use svod_dtype::default_device::{clear_default_device, default_device, set_default_device, with_default_device};
 pub use svod_runtime::CpuBackend;
 pub use tensor_registry::apply_map_to_tensors;
 pub use variable::{BoundVariable, Variable};
@@ -239,7 +242,7 @@ impl Tensor {
     /// Matches Tinygrad's `Tensor.empty(*shape)`.
     pub fn empty(shape: &[usize], dtype: DType) -> Self {
         let numel: usize = shape.iter().product();
-        let buffer_uop = UOp::new_buffer(DeviceSpec::Cpu, numel, dtype);
+        let buffer_uop = UOp::new_buffer(svod_dtype::default_device::default_device(), numel, dtype);
         let ir_shape = Shape::from_iter(shape.iter().map(|&d| SInt::Const(d)));
         let uop = buffer_uop.try_reshape(&ir_shape).expect("shape matches element count");
         Self::new(uop)
@@ -253,7 +256,7 @@ impl Tensor {
     /// `prod([x.vmax if isinstance(x, UOp) else x for x in shape])`.
     pub fn empty_dynamic(shape: &[SInt], dtype: DType) -> Self {
         let numel: usize = shape.iter().map(sint_vmax).product();
-        let buffer_uop = UOp::new_buffer(DeviceSpec::Cpu, numel, dtype);
+        let buffer_uop = UOp::new_buffer(svod_dtype::default_device::default_device(), numel, dtype);
         let ir_shape = Shape::from_iter(shape.iter().cloned());
         let uop = buffer_uop.try_reshape(&ir_shape).expect("shape valid for reshape");
         Self::new(uop)

@@ -6,7 +6,7 @@ sidebar_label: JIT Graphs
 
 A streaming ASR pipeline calls the same encoder hundreds of times. Building
 the tensor graph, optimizing it, generating kernel source, compiling it with
-[clang](./jit-loader.md), and allocating device buffers on every call wastes
+[clang](../backends/jit-loader.md), and allocating device buffers on every call wastes
 work that does not depend on the input.
 
 The `jit_wrapper!` macro and the `model::jit` runtime layer turn that
@@ -32,7 +32,7 @@ every call                           prepare() + every step
 ```
 
 The wrapper composes with the [pattern engine](./optimizations/pattern-system.md)
-(which runs at `prepare()` time) and the [JIT loader](./jit-loader.md) (which
+(which runs at `prepare()` time) and the [JIT loader](../backends/jit-loader.md) (which
 turns the optimized kernels into in-memory machine code). This page covers the
 wrapper layer that sits above both.
 

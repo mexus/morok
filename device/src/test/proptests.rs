@@ -1,5 +1,5 @@
 use crate::Buffer;
-use crate::allocator::{Allocator, BufferOptions, CpuAllocator, LruAllocator};
+use crate::allocator::{Allocator, BufferSpec, CpuAllocator, LruAllocator};
 use proptest::prelude::*;
 use std::sync::Arc;
 use strum::VariantArray;
@@ -12,27 +12,33 @@ fn allocator() -> Arc<LruAllocator> {
     Arc::new(LruAllocator::new(Box::new(CpuAllocator)))
 }
 
-/// A buffer specification for property-based testing.
+/// A buffer allocation case for property-based testing. (Named `AllocCase` to
+/// avoid colliding with the allocator's [`BufferSpec`].)
 #[derive(Debug, Clone)]
-struct BufferSpec {
+struct AllocCase {
     dtype: DType,
     shape: ArrayVec<[usize; 4]>,
     zero_init: bool,
 }
 
-impl BufferSpec {
+impl AllocCase {
     /// Calculate the total size in bytes.
     fn size(&self) -> usize {
         self.dtype.bytes() * self.shape.iter().product::<usize>()
     }
 
     fn alloc<A: Allocator + 'static>(&self, allocator: Arc<A>) -> Result<Buffer, crate::Error> {
-        let options = BufferOptions { zero_init: self.zero_init, ..Default::default() };
-        Buffer::allocate(allocator, self.dtype.clone(), self.shape.to_vec(), options)
+        Buffer::allocate_with_zero_init(
+            allocator,
+            self.dtype.clone(),
+            self.shape.to_vec(),
+            BufferSpec::default(),
+            self.zero_init,
+        )
     }
 }
 
-impl Arbitrary for BufferSpec {
+impl Arbitrary for AllocCase {
     type Parameters = ();
     type Strategy = BoxedStrategy<Self>;
 
@@ -42,7 +48,7 @@ impl Arbitrary for BufferSpec {
             prop::collection::vec(1usize..50, 1..=4),
             any::<bool>(),
         )
-            .prop_map(|(dtype, shape, zero_init)| BufferSpec { dtype, shape: ArrayVec::from_iter(shape), zero_init })
+            .prop_map(|(dtype, shape, zero_init)| AllocCase { dtype, shape: ArrayVec::from_iter(shape), zero_init })
             .prop_filter("total size must be reasonable", |spec| (1..=10 * 1024 * 1024).contains(&spec.size()))
             .boxed()
     }
@@ -59,18 +65,18 @@ fn same_size_dtypes(dtype: DType) -> impl Strategy<Value = DType> {
     proptest::sample::select(dtypes)
 }
 
-/// Strategy to generate two BufferSpecs with the same total size.
+/// Strategy to generate two AllocCases with the same total size.
 ///
 /// Generates two specs with same byte size but different dtypes (and possibly different shapes).
 /// Since dtypes with same byte size are used, the total size in bytes remains the same.
-fn same_size_specs() -> impl Strategy<Value = (BufferSpec, BufferSpec)> {
-    any::<BufferSpec>().prop_flat_map(|spec| {
+fn same_size_specs() -> impl Strategy<Value = (AllocCase, AllocCase)> {
+    any::<AllocCase>().prop_flat_map(|spec| {
         let total_bytes = spec.size();
         let dtype = spec.dtype.clone();
         same_size_dtypes(dtype).prop_map(move |dtype| {
             let num_elements = total_bytes / dtype.bytes();
             let shape = ArrayVec::from_iter(vec![num_elements]);
-            let spec2 = BufferSpec { dtype, shape, zero_init: spec.zero_init };
+            let spec2 = AllocCase { dtype, shape, zero_init: spec.zero_init };
             (spec.clone(), spec2)
         })
     })
@@ -103,7 +109,7 @@ proptest! {
     /// The LRU cache has a per-key capacity of 32 buffers. Allocating more than this
     /// should evict older buffers without panicking or causing OOM.
     #[test]
-    fn cache_respects_capacity(specs in prop::collection::vec(any::<BufferSpec>(), 1..=4)) {
+    fn cache_respects_capacity(specs in prop::collection::vec(any::<AllocCase>(), 1..=4)) {
         let alloc = allocator();
 
         // Allocate and free many buffers with same size
@@ -117,7 +123,7 @@ proptest! {
     /// When a Buffer and its view are both dropped, only one RawBuffer should be
     /// cached (since they share the same underlying allocation via Rc).
     #[test]
-    fn views_share_backing_buffer(spec: BufferSpec) {
+    fn views_share_backing_buffer(spec: AllocCase) {
         // Need at least 20 bytes for a meaningful view
         prop_assume!(spec.size() >= 20);
 
@@ -144,21 +150,22 @@ proptest! {
 
     /// Property: zero_init works correctly with cache reuse.
     ///
-    /// Buffers with different zero_init values share the same cache entry (same size/cpu_accessible).
+    /// Buffers with different zero_init values share the same cache entry (same size/cpu_access).
     /// When retrieving from cache with zero_init=true, the allocator must zero the buffer.
     /// This test verifies that buffers can be allocated with different zero_init settings
     /// without conflicts.
     #[test]
-    fn zero_init_with_cache_reuse(spec: BufferSpec) {
+    fn zero_init_with_cache_reuse(spec: AllocCase) {
         let alloc = allocator();
 
         // Allocate buffer with zero_init=false, then drop to cache
         {
-            let _buffer1 = Buffer::allocate(
+            let _buffer1 = Buffer::allocate_with_zero_init(
                 alloc.clone() as Arc<dyn Allocator>,
                 spec.dtype.clone(),
                 spec.shape.to_vec(),
-                BufferOptions { zero_init: false, cpu_accessible: false },
+                BufferSpec { cpu_access: false, ..Default::default() },
+                /*zero_init=*/ false,
             )?;
         }
 
@@ -166,11 +173,12 @@ proptest! {
         prop_assert_eq!(alloc.cache_count(spec.size(), false), 1, "Buffer should be cached");
 
         // Allocate with zero_init=true - should reuse from cache and zero it
-        let _buffer2 = Buffer::allocate(
+        let _buffer2 = Buffer::allocate_with_zero_init(
             alloc.clone() as Arc<dyn Allocator>,
             spec.dtype.clone(),
             spec.shape.to_vec(),
-            BufferOptions { zero_init: true, cpu_accessible: false },
+            BufferSpec { cpu_access: false, ..Default::default() },
+            /*zero_init=*/ true,
         )?;
 
         // Cache should be empty (buffer was reused)

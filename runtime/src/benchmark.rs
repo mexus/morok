@@ -84,7 +84,11 @@ pub unsafe fn benchmark_kernel(
 ) -> Result<BenchmarkResult> {
     // Warmup runs (discard timing)
     for _ in 0..config.warmup_runs {
-        unsafe { kernel.execute(buffers, vals, global_size, local_size)? };
+        // wait=true: benchmark needs each dispatch to complete before the next
+        // (async submit would measure queue time, not kernel time).
+        unsafe {
+            kernel.execute(buffers, vals, global_size, local_size, /*wait=*/ true)?
+        };
     }
 
     // Timing runs
@@ -94,7 +98,9 @@ pub unsafe fn benchmark_kernel(
             invalidate_l2();
         }
         let start = Instant::now();
-        unsafe { kernel.execute(buffers, vals, global_size, local_size)? };
+        unsafe {
+            kernel.execute(buffers, vals, global_size, local_size, /*wait=*/ true)?
+        };
         runs.push(start.elapsed());
 
         // Min-of-runs early stop: abort only when the best run so far still

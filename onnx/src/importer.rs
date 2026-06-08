@@ -297,8 +297,13 @@ impl OnnxImporter {
                 let byte_len = init.raw_data.len();
                 let disk_uop = disk_tensor.as_ref().unwrap().uop();
 
-                // SHRINK(uint8 byte range) → BITCAST(target dtype) → RESHAPE(dims) → COPY(CPU)
+                // SHRINK(uint8 byte range) → BITCAST(target dtype) → RESHAPE(dims) → COPY(DEFAULT)
                 // Matches Tinygrad: data.bitcast(true_dtype).reshape(shape).to(Device.DEFAULT)
+                // Previously hard-coded `DeviceSpec::Cpu` — that forced every
+                // ONNX initializer onto CPU regardless of `SVOD_DEVICE`, so
+                // any non-CPU runtime got cross-device kernels (inputs on
+                // e.g. AMD, weights on CPU) and rangeify failed with
+                // "normal kernel buffers must be on the same device".
                 let view = disk_uop
                     .try_shrink(&[(SInt::from(byte_offset), SInt::from(byte_offset + byte_len))])
                     .map_err(|e| crate::error::Error::IrConstruction {
@@ -309,7 +314,7 @@ impl OnnxImporter {
                 let reshaped = bitcasted.try_reshape(&ir_dims).map_err(|e| crate::error::Error::IrConstruction {
                     details: format!("DISK reshape '{}': {e}", init.name),
                 })?;
-                let copied = reshaped.copy_to_device(svod_dtype::DeviceSpec::Cpu);
+                let copied = reshaped.copy_to_device(svod_dtype::default_device::default_device());
                 let tensor = Tensor::from_lazy(copied);
                 initializers.insert(init.name.clone(), tensor);
             } else {

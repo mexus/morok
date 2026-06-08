@@ -30,6 +30,10 @@ pub struct RenderContext {
     /// violation. The render loop drains this after each call and propagates as
     /// a typed [`crate::Error`].
     pending_error: Option<crate::Error>,
+    /// Module-level LLVM IR lines that must be emitted *before* `define`. Used
+    /// by AMD's `Op::DefineLocal` to emit `@local_N = addrspace(3) global ...`
+    /// declarations, which cannot be expressed inline in the function body.
+    module_prefix: Vec<String>,
 }
 
 impl RenderContext {
@@ -41,7 +45,19 @@ impl RenderContext {
             pending_reduces: HashMap::new(),
             range_stack: Vec::new(),
             pending_error: None,
+            module_prefix: Vec::new(),
         }
+    }
+
+    /// Append a line to the module-level prefix block. Used by AMD's
+    /// `Op::DefineLocal` to emit `@local_N = ... addrspace(3) global ...`.
+    pub fn push_module_prefix(&mut self, line: impl Into<String>) {
+        self.module_prefix.push(line.into());
+    }
+
+    /// Borrow the accumulated module-level prefix lines.
+    pub fn module_prefix(&self) -> &[String] {
+        &self.module_prefix
     }
 
     /// Record an `InvalidGraph` error from a renderer op handler.

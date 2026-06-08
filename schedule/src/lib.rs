@@ -25,6 +25,7 @@ pub mod linearize;
 pub mod optimizer;
 pub mod passes;
 pub mod rangeify;
+pub mod spec;
 pub mod symbolic;
 #[cfg(feature = "testing")]
 pub mod testing;

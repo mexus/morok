@@ -1,4 +1,4 @@
-//! Device abstraction following Tinygrad's architecture.
+//! Device abstraction.
 //!
 //! This module provides a unified Device abstraction that owns:
 //! - **Renderer**: Transforms UOp graphs into source code (ProgramSpec)
@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use svod_dtype::DeviceSpec;
-use svod_ir::{BinaryOp, ConstValue, Op, UOp, UnaryOp};
+use svod_ir::{BinaryOp, ConstValue, Op, TernaryOp, UOp, UnaryOp};
 
 use crate::allocator::Allocator;
 use crate::error::{Error, Result};
@@ -28,11 +28,10 @@ use crate::error::{Error, Result};
 /// the same program from multiple host threads when dependency analysis proves
 /// the buffer accesses are independent.
 ///
-/// # Tinygrad Alignment
+/// # Calling convention
 ///
-/// This trait follows Tinygrad's `Program` interface where variable values are
-/// passed as a positional tuple/array (`vals`) rather than a named HashMap.
-/// The order matches `var_names` in `CompiledSpec`.
+/// Variable values are passed as a positional array (`vals`) rather than a
+/// named HashMap. The order matches `var_names` in `CompiledSpec`.
 pub trait Program: Send + Sync {
     /// Execute the kernel with given buffers and variable values.
     ///
@@ -42,6 +41,11 @@ pub trait Program: Send + Sync {
     /// * `vals` - Variable values in positional order (matches `var_names` in CompiledSpec)
     /// * `global_size` - Global work size (for GPU backends, None for CPU)
     /// * `local_size` - Local work size (for GPU backends, None for CPU)
+    /// * `wait` - Block until this dispatch completes before returning. GPU
+    ///   backends submit asynchronously and rely on the device timeline for
+    ///   ordering, so `wait=false` returns right after submit. Pass `true`
+    ///   only when the caller needs completion *without* a subsequent synchronizing read
+    ///   (e.g. benchmark timing). Synchronous backends (CPU) ignore it.
     ///
     /// # Safety
     ///
@@ -55,10 +59,87 @@ pub trait Program: Send + Sync {
         vals: &[i64],
         global_size: Option<[usize; 3]>,
         local_size: Option<[usize; 3]>,
+        wait: bool,
     ) -> Result<()>;
 
     /// Get the kernel name (for debugging/profiling).
     fn name(&self) -> &str;
+
+    /// Downcast hook so a backend graph factory can recover its concrete
+    /// program type (to read backend-specific fields) when pre-building dispatch
+    /// packets. Default returns nothing graphable.
+    fn as_any(&self) -> &dyn std::any::Any {
+        &()
+    }
+
+    /// Mint a reusable per-plan execution context, or `None` for per-call
+    /// dispatch. An `ExecutionPlan` calls this once on its first kernel's
+    /// program and reuses the returned context for every dispatch, so all the
+    /// plan's kernels share one queue (distinct plans → distinct queues for
+    /// cross-plan parallelism). Default `None`: the backend's `execute` is
+    /// already self-contained (CPU), so the plan dispatches per-call.
+    fn new_exec_context(&self) -> Result<Option<Box<dyn PlanContext>>> {
+        Ok(None)
+    }
+}
+
+/// One graphable kernel: a program plus its fixed buffer pointers and launch
+/// dims, captured once. Buffer pointers are plan-owned and stable across calls
+/// (`ExecutionPlan::buffers`), so a graph can bake them in and only re-patch
+/// variable-derived launch dims + `vals` on replay. Bundles the device,
+/// program, buffers, and launch vars of a single graph call.
+pub struct GraphKernel<'a> {
+    pub program: &'a dyn Program,
+    pub buffers: Vec<*mut u8>,
+    pub vals: Vec<i64>,
+    pub global_size: Option<[usize; 3]>,
+    pub local_size: Option<[usize; 3]>,
+    /// Emission-order indices of the producer kernels this kernel must wait on
+    /// (RAW/WAR/WAW hazards over resolved buffer GVAs). Computed by the host
+    /// hazard analysis in the same flatten order the kernels are emitted, so a
+    /// DAG-aware backend can strip the per-dispatch BARRIER bit and gate only on
+    /// these producers' completion signals. Empty = no producer in this graph.
+    pub deps: Vec<usize>,
+}
+
+/// A pre-captured kernel chain replayed with one submit. Backends that can
+/// pre-build their dispatch packets implement this so repeated inference pays
+/// per-graph, not per-kernel, launch cost. Replay is equivalent to running every
+/// captured kernel in order.
+pub trait Graph: Send + Sync {
+    /// Re-dispatch the captured chain. `vals` are positional updated launch
+    /// vars (same order as capture); empty replays the baked-in values.
+    fn replay(&self, vals: &[i64]) -> Result<()>;
+}
+
+/// A reusable per-plan execution context: a lease of device-level dispatch
+/// resources (e.g. an AMD queue from the pool) held by an `ExecutionPlan` for
+/// its lifetime so every kernel in the plan dispatches onto the same queue.
+/// Minted by [`Program::new_exec_context`]; backends with no reusable context
+/// (CPU) return `None` and the plan falls back to per-call [`Program::execute`].
+pub trait PlanContext: Send + Sync {
+    /// Dispatch one kernel of the plan onto this context. `program` belongs to
+    /// the same plan and therefore the same backend that minted this context
+    /// (a plan is single-device) — a construction invariant, not a runtime
+    /// check. Returns a per-dispatch timestamp handle when the backend stamps
+    /// dispatches (`None` otherwise). Submits asynchronously like
+    /// [`Program::execute`] with `wait=false`.
+    ///
+    /// # Safety
+    ///
+    /// Same contract as [`Program::execute`]: buffer pointers must be valid and
+    /// correctly sized, and the caller must avoid data races.
+    unsafe fn dispatch(
+        &self,
+        program: &dyn Program,
+        buffers: &[*mut u8],
+        vals: &[i64],
+        global_size: Option<[usize; 3]>,
+        local_size: Option<[usize; 3]>,
+    ) -> Result<Option<Arc<dyn crate::DispatchTimestamps>>>;
+
+    /// Drain this context's in-flight work (profiled-timestamp harvest).
+    fn synchronize(&self) -> Result<()>;
 }
 
 /// Compilation result carrying source (JIT) or bytes (AOT).
@@ -188,19 +269,64 @@ fn validate_var_bound(name: &str, value: i64, min_val: i64, max_val: i64) -> Res
 }
 
 fn checked_launch_binary(op: BinaryOp, lhs: i64, rhs: i64) -> Result<i64> {
-    let value = match op {
+    // EXHAUSTIVE match — no `_` catch-all. When a new `BinaryOp` variant is
+    // added to `svod_ir::types::BinaryOp`, the compiler will fail this match
+    // and force an explicit decision, instead of silently producing wrong
+    // launch dims at runtime. A symbolic evaluator codegen'd from the renderer
+    // pipeline would inherit every operator automatically; until svod unifies
+    // the two evaluators, this exhaustive match is the belt-and-suspenders
+    // that approximates the same guarantee.
+    let value: Option<i64> = match op {
+        // Integer arithmetic — checked for overflow.
         BinaryOp::Add => lhs.checked_add(rhs),
         BinaryOp::Sub => lhs.checked_sub(rhs),
         BinaryOp::Mul => lhs.checked_mul(rhs),
         BinaryOp::Idiv => (rhs != 0).then(|| lhs.checked_div(rhs)).flatten(),
         BinaryOp::Mod => (rhs != 0).then(|| lhs.checked_rem(rhs)).flatten(),
         BinaryOp::Max => Some(lhs.max(rhs)),
-        _ => {
-            return Err(Error::Runtime { message: format!("unsupported binary op in launch-size expression: {op:?}") });
+        // Integer power: only support non-negative exponents that fit in u32.
+        BinaryOp::Pow => u32::try_from(rhs).ok().and_then(|e| lhs.checked_pow(e)),
+        // Bitwise / shift. Negative shifts and shifts ≥ 64 are rejected.
+        BinaryOp::Shl => u32::try_from(rhs).ok().filter(|&r| r < 64).and_then(|r| lhs.checked_shl(r)),
+        BinaryOp::Shr => u32::try_from(rhs).ok().filter(|&r| r < 64).and_then(|r| lhs.checked_shr(r)),
+        BinaryOp::And => Some(lhs & rhs),
+        BinaryOp::Or => Some(lhs | rhs),
+        BinaryOp::Xor => Some(lhs ^ rhs),
+        // Comparisons — fold to 0/1 (consistent with IR's symbolic rewrite
+        // pipeline where Bool is i1 and may participate in arithmetic via
+        // CAST).
+        BinaryOp::Lt => Some(i64::from(lhs < rhs)),
+        BinaryOp::Le => Some(i64::from(lhs <= rhs)),
+        BinaryOp::Eq => Some(i64::from(lhs == rhs)),
+        BinaryOp::Ne => Some(i64::from(lhs != rhs)),
+        BinaryOp::Gt => Some(i64::from(lhs > rhs)),
+        BinaryOp::Ge => Some(i64::from(lhs >= rhs)),
+        // Float-only / nonsense for launch dims.
+        BinaryOp::Fdiv => {
+            return Err(Error::Runtime {
+                message: "Fdiv (float division) in launch-size expression — launch dims must be integer".into(),
+            });
+        }
+        BinaryOp::Threefry => {
+            return Err(Error::Runtime {
+                message: "Threefry (PRNG) in launch-size expression — this is almost certainly a scheduler bug".into(),
+            });
         }
     };
 
     value.ok_or_else(|| Error::Runtime { message: format!("invalid launch-size arithmetic: {lhs} {op:?} {rhs}") })
+}
+
+/// Evaluate a ternary op in a launch-size expression. `MulAcc(a, b, c) = a*b+c`
+/// (overflow-checked); `Where(cond, t, f)` selects on a nonzero predicate.
+/// EXHAUSTIVE match so a new `TernaryOp` variant fails the compile, not silently
+/// at runtime.
+fn checked_launch_ternary(op: TernaryOp, a: i64, b: i64, c: i64) -> Result<i64> {
+    let value = match op {
+        TernaryOp::MulAcc => a.checked_mul(b).and_then(|ab| ab.checked_add(c)),
+        TernaryOp::Where => Some(if a != 0 { b } else { c }),
+    };
+    value.ok_or_else(|| Error::Runtime { message: format!("invalid launch-size ternary: {op:?}({a}, {b}, {c})") })
 }
 
 fn eval_launch_expr(expr: &Arc<UOp>, vars: &HashMap<&str, i64>) -> Result<i64> {
@@ -223,17 +349,60 @@ fn eval_launch_expr(expr: &Arc<UOp>, vars: &HashMap<&str, i64>) -> Result<i64> {
         Op::Binary(op, lhs, rhs) => {
             checked_launch_binary(*op, eval_launch_expr(lhs, vars)?, eval_launch_expr(rhs, vars)?)
         }
-        Op::Unary(UnaryOp::Neg, src) => eval_launch_expr(src, vars)?
-            .checked_neg()
-            .ok_or_else(|| Error::Runtime { message: "invalid launch-size negation overflow".to_string() }),
-        Op::Unary(UnaryOp::Abs, src) => eval_launch_expr(src, vars)?
-            .checked_abs()
-            .ok_or_else(|| Error::Runtime { message: "invalid launch-size abs overflow".to_string() }),
+        // The symbolic simplifier fuses `a*b + c` (e.g. `16*ts − 1` from a
+        // reshaped symbolic sequence axis) into a single MulAcc; `Where` can
+        // appear when a launch dim is gated on a symbolic predicate. Evaluate
+        // both rather than rejecting — the alternative is the scheduler
+        // silently never fusing, which it does.
+        Op::Ternary(op, a, b, c) => checked_launch_ternary(
+            *op,
+            eval_launch_expr(a, vars)?,
+            eval_launch_expr(b, vars)?,
+            eval_launch_expr(c, vars)?,
+        ),
+        Op::Unary(op, src) => checked_launch_unary(*op, eval_launch_expr(src, vars)?),
         Op::Cast { src, .. } | Op::BitCast { src, .. } | Op::After { passthrough: src, .. } => {
             eval_launch_expr(src, vars)
         }
         other => Err(Error::Runtime { message: format!("unsupported launch-size expression op: {other:?}") }),
     }
+}
+
+fn checked_launch_unary(op: UnaryOp, src: i64) -> Result<i64> {
+    // EXHAUSTIVE match (no `_` catch-all) so a new `UnaryOp` variant fails the
+    // build instead of silently corrupting launch dims. See the analogous
+    // comment on `checked_launch_binary` for the longer rationale.
+    let value: Option<i64> = match op {
+        UnaryOp::Neg => src.checked_neg(),
+        UnaryOp::Abs => src.checked_abs(),
+        UnaryOp::Not => Some(!src),
+        UnaryOp::Sign => Some(src.signum()),
+        UnaryOp::Square => src.checked_mul(src),
+        // For integer launch dims `trunc/floor/ceil/round` are identity since
+        // the input is already an integer. A symbolic evaluator would collapse
+        // these via the rewrite engine; the explicit arms here are the same
+        // outcome.
+        UnaryOp::Trunc | UnaryOp::Floor | UnaryOp::Ceil | UnaryOp::Round => Some(src),
+        // Float-only — these have no meaning on integer launch dims and would
+        // never reach here from a correct schedule.
+        UnaryOp::Sqrt
+        | UnaryOp::Rsqrt
+        | UnaryOp::Exp
+        | UnaryOp::Exp2
+        | UnaryOp::Log
+        | UnaryOp::Log2
+        | UnaryOp::Sin
+        | UnaryOp::Cos
+        | UnaryOp::Tan
+        | UnaryOp::Reciprocal
+        | UnaryOp::Erf => {
+            return Err(Error::Runtime {
+                message: format!("float-only unary op {op:?} in launch-size expression — schedule bug"),
+            });
+        }
+    };
+
+    value.ok_or_else(|| Error::Runtime { message: format!("invalid launch-size unary arithmetic: {op:?} {src}") })
 }
 
 fn eval_launch_size(size: &[Arc<UOp>; 3], vars: &HashMap<&str, i64>) -> Result<[usize; 3]> {
@@ -326,6 +495,14 @@ pub trait Renderer: Send + Sync {
     /// This is used for cache key construction and device selection.
     fn device(&self) -> &DeviceSpec;
 
+    /// The GPU architecture this renderer targets, if any. Arch is a hardware
+    /// property of the opened device (not the `DeviceSpec`), surfaced here so
+    /// the scheduler can pick the matching optimizer profile (wave size, matrix
+    /// cores, …). CPU and backends without an arch distinction return `None`.
+    fn gpu_arch(&self) -> Option<svod_dtype::GpuArch> {
+        None
+    }
+
     /// Returns decomposition patterns for operations this backend doesn't support.
     ///
     /// This is used by the realization pass to decompose complex operations
@@ -353,6 +530,12 @@ pub trait Renderer: Send + Sync {
 /// allowing each backend to access what it needs.
 pub type RuntimeFactory = Arc<dyn Fn(&CompiledSpec) -> Result<Box<dyn Program>> + Send + Sync>;
 
+/// Builds a replayable graph from a captured kernel chain. Returns `Ok(None)`
+/// when this backend can't graph the chain (then callers fall back to per-call
+/// dispatch). A graphing backend pre-builds its dispatch packets; CPU has no
+/// factory.
+pub type GraphFactory = Arc<dyn Fn(&[GraphKernel<'_>]) -> Result<Option<Box<dyn Graph>>> + Send + Sync>;
+
 /// A (Renderer, Compiler) pair for a specific backend.
 ///
 /// Devices can have multiple compiler pairs (e.g., different optimization levels).
@@ -360,8 +543,7 @@ pub type CompilerPair = (Arc<dyn Renderer>, Arc<dyn Compiler>);
 
 /// A device that owns renderer, compiler, runtime, and allocator.
 ///
-/// This follows Tinygrad's architecture where a Device is a complete
-/// compilation + execution unit for a specific backend.
+/// A Device is a complete compilation + execution unit for a specific backend.
 ///
 /// # Example
 ///
@@ -370,7 +552,7 @@ pub type CompilerPair = (Arc<dyn Renderer>, Arc<dyn Compiler>);
 /// let spec = cpu_device.renderer.render(&kernel_ast, Some("E_L3"))?;
 /// let compiled = cpu_device.compiler.compile(&spec)?;
 /// let program = (cpu_device.runtime)(&compiled)?;
-/// unsafe { program.execute(&buffers, &vals, None, None)?; }
+/// unsafe { program.execute(&buffers, &vals, None, None, /*wait=*/ true)?; }
 /// ```
 pub struct Device {
     /// Device specification
@@ -399,6 +581,11 @@ pub struct Device {
     ///
     /// Takes (entry_point, compiled_bytes) and returns a Program.
     pub runtime: RuntimeFactory,
+
+    /// Optional graph factory for capture/replay. `None` means per-call
+    /// dispatch only (CPU); a graphing backend installs one to capture/replay
+    /// kernel chains.
+    pub graph: Option<GraphFactory>,
 }
 
 impl Device {
@@ -414,7 +601,14 @@ impl Device {
         runtime: RuntimeFactory,
     ) -> Self {
         let compilers = vec![(renderer.clone(), compiler.clone())];
-        Self { device, allocator, compilers, renderer, compiler, runtime }
+        Self { device, allocator, compilers, renderer, compiler, runtime, graph: None }
+    }
+
+    /// Install a graph factory (capture/replay). Builder-style for backends
+    /// that can pre-build dispatch packets.
+    pub fn with_graph(mut self, factory: GraphFactory) -> Self {
+        self.graph = Some(factory);
+        self
     }
 
     /// Get the base device key (strips device ID).
@@ -437,9 +631,8 @@ impl Device {
 /// This is returned by Renderer::render() and consumed by Compiler::compile().
 /// It bridges the gap between UOp graphs and compiled executables.
 ///
-/// # Tinygrad Alignment
+/// # Buffer metadata
 ///
-/// Buffer metadata (`globals`, `outs`, `ins`) matches Tinygrad's Program class:
 /// - `globals`: Buffer indices from PARAM ops
 /// - `outs`: Output buffer indices (written by STORE ops)
 /// - `ins`: Input buffer indices (read by LOAD ops)
@@ -471,15 +664,12 @@ pub struct ProgramSpec {
     pub var_names: Vec<String>,
 
     /// Global buffer indices (from PARAM slot values).
-    /// Matches Tinygrad's `globals` field.
     pub globals: Vec<usize>,
 
     /// Output buffer indices (written by STORE ops).
-    /// Matches Tinygrad's `outs` field.
     pub outs: Vec<usize>,
 
     /// Input buffer indices (read by LOAD ops, excluding outputs).
-    /// Matches Tinygrad's `ins` field.
     pub ins: Vec<usize>,
 
     /// Number of buffer arguments (for CIF construction at compile time).
@@ -571,8 +761,8 @@ impl ProgramSpec {
 
     /// Derive and apply metadata from `self.ast`.
     ///
-    /// This mirrors Tinygrad-style program metadata extraction from the kernel
-    /// graph and keeps renderer wrappers aligned on one metadata path.
+    /// Extracts program metadata from the kernel graph and keeps renderer
+    /// wrappers aligned on one metadata path.
     pub fn apply_derived_metadata_from_ast(&mut self) {
         let derived = Self::derive_metadata_from_sink(&self.ast);
         self.globals = derived.globals;
@@ -606,28 +796,29 @@ impl ProgramSpec {
         (axis < 3).then_some((kind, axis))
     }
 
-    fn is_const_one(uop: &Arc<UOp>) -> bool {
-        matches!(uop.op(), Op::Const(value) if matches!(value.0, ConstValue::Int(1) | ConstValue::UInt(1)))
-    }
-
-    fn has_non_default_launch_dims(&self) -> bool {
-        !self.global_size.iter().all(Self::is_const_one)
-            || !matches!(&self.local_size, Some(local) if local.iter().all(Self::is_const_one))
-    }
-
     fn extract_param_slot_from_index(index: &Arc<UOp>) -> Option<usize> {
-        fn slot_from_buffer(buffer: &Arc<UOp>) -> Option<usize> {
-            if let Op::Param { slot, device: None, .. } = buffer.op() { Some(*slot) } else { None }
-        }
-
-        match index.op() {
-            Op::Index { buffer, .. } => slot_from_buffer(buffer),
-            Op::Cast { src, .. } => match src.op() {
-                Op::Index { buffer, .. } => slot_from_buffer(buffer),
+        /// Walk an arbitrary UOp expression chasing the underlying `Op::Param` slot.
+        /// Handles passthroughs (`Cast`, `Bitcast`), and vector wrappers
+        /// (`Vectorize` with all-identical `Param` elements, `Gep` into such a
+        /// vector). Devectorize doesn't always eliminate vectorized PARAM
+        /// pointers (e.g. scatter stores at `cpu/ops.rs:15-18`), so a kernel's
+        /// output `Op::Store` may have an `index` whose `buffer` is a
+        /// `Vectorize` of N copies of the same `Op::Param`, so the metadata
+        /// derivation looks through these wrappers too.
+        fn walk(uop: &Arc<UOp>) -> Option<usize> {
+            match uop.op() {
+                Op::Param { slot, device: None, .. } => Some(*slot),
+                Op::Index { buffer, .. } => walk(buffer),
+                Op::Cast { src, .. } | Op::BitCast { src, .. } => walk(src),
+                Op::Gep { vector, .. } => walk(vector),
+                Op::Vectorize { elements } => {
+                    let first = walk(elements.first()?)?;
+                    elements.iter().skip(1).all(|e| walk(e) == Some(first)).then_some(first)
+                }
                 _ => None,
-            },
-            _ => None,
+            }
         }
+        walk(index)
     }
 
     fn derive_metadata_from_sink(sink: &Arc<UOp>) -> DerivedProgramMetadata {
@@ -755,9 +946,18 @@ impl ProgramSpec {
         spec.outs = meta.as_ref().map(|m| m.outs.clone()).filter(|outs| !outs.is_empty()).unwrap_or(derived.outs);
         spec.ins = meta.as_ref().map(|m| m.ins.clone()).filter(|ins| !ins.is_empty()).unwrap_or(derived.ins);
         spec.buf_count = meta.as_ref().map(|m| m.buf_count).filter(|count| *count > 0).unwrap_or(spec.globals.len());
-        let meta_launch = meta.as_ref().filter(|m| m.has_non_default_launch_dims());
-        spec.global_size = meta_launch.map(|m| m.global_size.clone()).unwrap_or(derived.global_size);
-        spec.local_size = meta_launch.map(|m| m.local_size.clone()).unwrap_or(derived.local_size);
+        // Launch dims: always derive from the SPECIAL UOps in the SINK,
+        // ignoring any upstream `meta` value (iterate SPECIAL and set
+        // `special_size[name_suffix] = end`). Keeping a meta override
+        // here causes a dispatch-vs-IR mismatch: the meta-supplied
+        // `global_size` is in kernel-name positional order ([g_x_size,
+        // g_y_size]) but the SPECIAL UOps (post-gpudims `reverse=true`) may
+        // assign axes to gidx in the opposite order, so the GPU dispatch
+        // packet ends up with grid_size_x grid_size_y swapped relative to
+        // what the LLVM IR's `workgroup.id.x` / `workgroup.id.y` use —
+        // manifests as a 21× OOB on `r_g1375g64...` (`Phase 10/11`).
+        spec.global_size = derived.global_size;
+        spec.local_size = derived.local_size;
 
         Ok(spec)
     }

@@ -128,10 +128,10 @@ pub struct ExecutionNode {
     pub buffer_access: Option<KernelBufferAccess>,
 }
 
-/// Buffer access information for parallel kernel execution.
+/// Buffer access information for kernel scheduling.
 ///
-/// This struct captures which buffers a kernel accesses and which are outputs,
-/// enabling precise dependency tracking in `execute_parallel_group`.
+/// Captures which buffers a kernel reads/writes; used by the executor and
+/// memory planner to compute dependencies between operations.
 #[derive(Debug, Clone)]
 pub struct KernelBufferAccess {
     /// All buffer IDs accessed by this kernel (inputs and outputs).

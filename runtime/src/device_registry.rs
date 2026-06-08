@@ -63,6 +63,32 @@ impl DeviceFactoryRegistry {
         registry
             .register_factory("CPU", Arc::new(|_spec, alloc_reg| crate::devices::cpu::create_cpu_device(alloc_reg)));
 
+        // AMD factory (KFD-direct). Always compiled; registered as an execution
+        // provider only when a supported GPU is actually present, so a host with
+        // no /dev/kfd (or no AMD hardware) cleanly has no "AMD" device type. The
+        // closure constructs the device end-to-end, including the RuntimeFactory
+        // that produces `AmdProgram` from a `CompiledSpec`.
+        if svod_device::amd::has_devices() {
+            registry.register_factory(
+                "AMD",
+                Arc::new(|spec, alloc_reg| {
+                    use svod_ir::DeviceSpec;
+                    let device_id = match spec {
+                        DeviceSpec::Amd { device_id } => *device_id,
+                        _ => {
+                            return Err(svod_device::Error::DeviceUnavailable {
+                                reason: format!("AMD factory called with non-AMD spec: {spec:?}"),
+                            });
+                        }
+                    };
+                    // Resolve arch from KFD topology — it lives on the opened
+                    // device, not the spec.
+                    let arch = svod_device::registry::resolve_amd_arch_from_topology(device_id)?;
+                    crate::devices::amd::create_amd_device(alloc_reg, device_id, arch)
+                }),
+            );
+        }
+
         // Future: Register CUDA, Metal, WebGPU factories when implemented
         // registry.register_factory("CUDA", Arc::new(|spec, reg| create_cuda_device(spec, reg)));
 

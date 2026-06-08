@@ -5,7 +5,7 @@
 //! and provides tensor core configurations for hardware-accelerated matrix multiplication.
 
 use smallvec::SmallVec;
-use svod_dtype::DType;
+use svod_dtype::{AmdArch, DType};
 use svod_ir::RendererDevice;
 
 /// Tensor core optimization operation.
@@ -318,6 +318,33 @@ impl Renderer {
         }
     }
 
+    /// Per-axis local work-group size limits `(x, y, z)`, or `None` when only
+    /// the product cap ([`local_max`](Self::local_max)) applies.
+    ///
+    /// AMD/HIP caps the 3rd local axis at 64 below the 1024-thread product limit
+    /// (tinygrad's `local_max = (1024, 1024, 64)`), so a candidate with product
+    /// ≤ 1024 but z > 64 is still invalid and must be bounded at gpudims time.
+    pub fn local_max_axes(&self) -> Option<[usize; 3]> {
+        match self.device {
+            RendererDevice::AmdRdna3
+            | RendererDevice::AmdRdna4
+            | RendererDevice::AmdCdna3
+            | RendererDevice::AmdCdna4 => Some([1024, 1024, 64]),
+            _ => None,
+        }
+    }
+
+    /// Select the AMD optimizer profile matching a gfx arch. CDNA gfx942 maps
+    /// to CDNA3 and gfx950 to CDNA4; RDNA3/RDNA4 families map to their profiles.
+    pub fn for_amd_arch(arch: AmdArch) -> Self {
+        match arch {
+            AmdArch::Gfx942 => Self::amd_cdna3(),
+            AmdArch::Gfx950 => Self::amd_cdna4(),
+            _ if arch.is_rdna4() => Self::amd_rdna4(),
+            _ => Self::amd_rdna3(),
+        }
+    }
+
     /// Create an Intel Xe GPU renderer.
     pub fn intel_xe() -> Self {
         Self {
@@ -428,6 +455,14 @@ pub struct TensorCore {
     /// per K iteration to compute a grid of output tiles simultaneously.
     /// Default is (1, 1) for single-tile operation.
     pub tile_grid: (usize, usize),
+
+    /// Whether the hand-coded heuristics may auto-pick this core.
+    ///
+    /// `false` keeps it BEAM-only: candidates whose matrix-op rate does not
+    /// beat the packed-vector rate (CDNA3 fp32 MFMA = 256 FLOP/CU/cycle ==
+    /// `v_pk_fma_f32`) only win when measured against a vector kernel, so the
+    /// unconditional heuristic pick must skip them.
+    pub heuristic_pick: bool,
 }
 
 // ============================================================================
@@ -471,7 +506,13 @@ impl TcConfig {
                 ),
             ),
             tile_grid: self.tile_grid,
+            heuristic_pick: true,
         }
+    }
+
+    /// Build a BEAM-only TensorCore: never auto-picked by the heuristics.
+    pub fn build_beam_only(&self, dtype_in: DType, dtype_out: DType) -> TensorCore {
+        TensorCore { heuristic_pick: false, ..self.build(dtype_in, dtype_out) }
     }
 }
 
@@ -548,6 +589,20 @@ pub const AMD_CDNA_161616: TcConfig = TcConfig {
     opts: &[L(0), L(0), L(0), L(0), U(1), U(1), L(1), L(1)],
     swizzle_a: (&[SU(0), SU(1), SL(4), SL(5), R(2), R(3)], &[R(0), R(1)], &[SL(0), SL(1), SL(2), SL(3)]),
     swizzle_b: (&[SL(0), SL(1), SL(2), SL(3), R(2), R(3)], &[R(0), R(1)], &[SL(4), SL(5), SU(0), SU(1)]),
+    tile_grid: (1, 1),
+};
+
+// fp32 MFMA (`v_mfma_f32_16x16x4_f32`): K=4 leaves only 2 reduce bits and one
+// f32 of A and B per lane (ept A=B=1 — scalar operands, no contract), with the
+// usual 4 f32 of D. Same N/M opt structure as `AMD_CDNA_161616`; the K-upcast
+// bits disappear, so the freed swizzle slots fold into the broadcast tuples.
+pub const AMD_CDNA_16164: TcConfig = TcConfig {
+    dims: (16, 16, 4),
+    threads: 64,
+    ept: (1, 1, 4),
+    opts: &[L(0), L(0), L(0), L(0), U(1), U(1), L(1), L(1)],
+    swizzle_a: (&[SU(0), SU(1), SL(4), SL(5), R(0), R(1)], &[], &[SL(0), SL(1), SL(2), SL(3)]),
+    swizzle_b: (&[SL(0), SL(1), SL(2), SL(3), R(0), R(1)], &[], &[SL(4), SL(5), SU(0), SU(1)]),
     tile_grid: (1, 1),
 };
 
@@ -714,6 +769,10 @@ impl TensorCore {
             AMD_CDNA_161632.build(DType::FP8E4M3, DType::Float32),
             AMD_CDNA_161616.build(DType::Float16, DType::Float32),
             AMD_CDNA_161616.build(DType::BFloat16, DType::Float32),
+            // CDNA3 fp32 MFMA runs at the packed-vector fp32 rate — only a
+            // measured (BEAM) selection can know whether the rigid lane
+            // layout beats a tiled vector kernel, so the heuristics skip it.
+            AMD_CDNA_16164.build_beam_only(DType::Float32, DType::Float32),
         ]
     }
 

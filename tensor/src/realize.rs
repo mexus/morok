@@ -626,7 +626,12 @@ fn schedule_result_from_sink_with_cache(
 
     let restored_pre_schedule = restore_post_schedule_pre_schedule(&entry.pre_schedule, &normalization);
     let schedule_input_buffers = build_schedule_input_buffers(&restored_pre_schedule, &normalization);
-    let result = crate::schedule::instantiate_schedule(&restored_pre_schedule, &schedule_input_buffers, &var_vals)?;
+    let result = crate::schedule::instantiate_schedule(
+        &restored_pre_schedule,
+        &schedule_input_buffers,
+        &var_vals,
+        config.device_local_outputs,
+    )?;
     Ok(result)
 }
 
@@ -639,7 +644,8 @@ fn schedule_result_from_sink_uncached(
     let (kernel_graph, _) = svod_schedule::try_get_kernel_graph(rangeify_result.sink).context(RangeifySnafu)?;
     let pre_schedule = crate::schedule::create_pre_schedule(kernel_graph.clone())?;
     let input_buffers = collect_input_buffers(&kernel_graph);
-    let result = crate::schedule::instantiate_schedule(&pre_schedule, &input_buffers, &var_vals)?;
+    let result =
+        crate::schedule::instantiate_schedule(&pre_schedule, &input_buffers, &var_vals, _config.device_local_outputs)?;
     Ok(result)
 }
 
@@ -1164,7 +1170,7 @@ fn prepare_execution_plan(
             .iter()
             .flat_map(|item| item.buffers.iter().map(|b| b.allocator().device_spec()))
             .find(|spec| !spec.is_disk())
-            .unwrap_or(DeviceSpec::Cpu);
+            .unwrap_or_else(svod_dtype::default_device::default_device);
         config.resolve_device(&device_spec, alloc_registry)?
     } else {
         return EmptyScheduleSnafu.fail();
@@ -1340,7 +1346,7 @@ fn prepare_execution_plan(
             .iter()
             .map(|b| b.allocator().device_spec())
             .find(|spec| !spec.is_disk())
-            .unwrap_or(DeviceSpec::Cpu);
+            .unwrap_or_else(svod_dtype::default_device::default_device);
         let item_device = config.resolve_device(&item_device_spec, alloc_registry)?;
         let item_codegen: &'static str = item_device.compiler.cache_key();
 
@@ -1396,7 +1402,6 @@ fn prepare_execution_plan(
                         globals: spec.globals.clone(),
                         outs: spec.outs.clone(),
                         ins: spec.ins.clone(),
-                        host_parallel_safe: matches!(item_device.device, DeviceSpec::Cpu),
                         global_size: spec.global_size.clone(),
                         local_size: spec.local_size.clone(),
                     })
@@ -1569,7 +1574,7 @@ pub(crate) fn resolve_codegen(param_buffers: &[(u64, Arc<UOp>)], config: &Prepar
                 (!spec.is_disk()).then_some(spec.clone())
             })
         })
-        .unwrap_or(DeviceSpec::Cpu);
+        .unwrap_or_else(svod_dtype::default_device::default_device);
     let device = config.resolve_device(&spec, alloc_registry)?;
     Ok(device.compiler.cache_key())
 }
@@ -1586,6 +1591,15 @@ fn get_optimizer_renderer(device: &Device) -> svod_schedule::OptimizerRenderer {
         }
         DeviceSpec::Cuda { .. } => svod_schedule::OptimizerRenderer::cuda(),
         DeviceSpec::Metal { .. } => svod_schedule::OptimizerRenderer::metal(),
+        // AMD picks the profile (wave size, LDS, WMMA/MFMA tensor cores) from
+        // the opened device's arch, exposed via the renderer. Falls back to
+        // RDNA3 if the renderer can't report arch.
+        DeviceSpec::Amd { .. } => device
+            .renderer
+            .gpu_arch()
+            .and_then(svod_dtype::GpuArch::amd)
+            .map(svod_schedule::OptimizerRenderer::for_amd_arch)
+            .unwrap_or_else(svod_schedule::OptimizerRenderer::amd_rdna3),
         _ => svod_schedule::OptimizerRenderer::cpu(),
     }
 }

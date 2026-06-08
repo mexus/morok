@@ -1146,6 +1146,50 @@ fn test_swap_non_global_axis() {
 }
 
 #[test]
+fn test_swap_square_axes() {
+    // Equal extents (16×16) is the case that made a naive fixed-point `substitute`
+    // cyclic: the replacement `range(16, axis_id 1)` hash-conses to the *other*
+    // original range, so the map degenerates into `{r0->r1, r1->r0}`. `apply_swap`
+    // applies the map with a single-pass `substitute_walk` (each node rewritten once,
+    // no re-traversal), so the simultaneous swap lands without cycling — and without
+    // tags, since the walk never re-feeds a replacement back into the map.
+    let r0 = UOp::range_axis(UOp::index_const(16), AxisId::Renumbered(0), AxisType::Global);
+    let r1 = UOp::range_axis(UOp::index_const(16), AxisId::Renumbered(1), AxisType::Global);
+
+    // Reference the axes asymmetrically (r0 is the high digit) so the relabel is
+    // observable even though both extents are equal.
+    let idx = r0.mul(&UOp::index_const(16)).add(&r1);
+    let sink = UOp::sink(vec![idx]);
+
+    let ren = Renderer::cpu();
+    let mut scheduler = Scheduler::new(sink, ren);
+
+    let opt = Opt::swap(0, 1);
+    assert!(apply_opt(&mut scheduler, &opt, true).is_ok(), "square swap must terminate without cycling");
+
+    // The single-pass swap introduces no tags (unlike tinygrad's tag+remove_all_tags
+    // dance); guard against any future tag leakage from the rewrite.
+    for node in scheduler.ast().toposort() {
+        assert!(node.tag().is_none(), "swap rewrite leaked a tag on {:?}", node.op());
+    }
+
+    // The high digit (the range multiplied by the stride) must now carry axis_id 1.
+    let high_digit_axis = scheduler
+        .ast()
+        .toposort()
+        .into_iter()
+        .find_map(|n| match n.op() {
+            Op::Binary(svod_ir::types::BinaryOp::Mul, a, b) => [a, b].into_iter().find_map(|s| match s.op() {
+                Op::Range { axis_id, .. } => Some(*axis_id),
+                _ => None,
+            }),
+            _ => None,
+        })
+        .expect("expected a MUL with a RANGE operand after swap");
+    assert_eq!(high_digit_axis, AxisId::Renumbered(1), "swap should relabel the high-digit axis 0 → 1");
+}
+
+#[test]
 fn test_group_basic() {
     // Create a reduction kernel for GPU
     let end_64 = UOp::index_const(64);

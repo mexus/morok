@@ -1,0 +1,94 @@
+//! Thread-local default `DeviceSpec` for tensor construction and rangeify.
+//!
+//! Lives in `svod-dtype` (the lowest dep) so any crate — `svod-tensor`
+//! constructors, `svod-schedule` rangeify intermediates, etc. — can read the
+//! same default without forming a dependency cycle.
+//!
+//! Precedence:
+//!   1. `with_default_device(spec, fn)` scope (thread-local).
+//!   2. `set_default_device(spec)` thread-local override.
+//!   3. `SVOD_DEVICE` env var (parsed once at first access).
+//!   4. `DeviceSpec::Cpu` (final fallback).
+//!
+//! Note: parsing is intentionally restricted to "CPU" and "AMD[:N]". Devices
+//! that need richer specs (CUDA, Metal, WebGPU) can opt in by extending
+//! `parse_simple` here.
+
+use std::cell::RefCell;
+
+use once_cell::sync::OnceCell;
+
+use crate::DeviceSpec;
+
+thread_local! {
+    static THREAD_DEFAULT: RefCell<Option<DeviceSpec>> = const { RefCell::new(None) };
+}
+
+static PROCESS_DEFAULT: OnceCell<DeviceSpec> = OnceCell::new();
+
+/// Set the current thread's default device.
+pub fn set_default_device(spec: DeviceSpec) {
+    THREAD_DEFAULT.with(|t| *t.borrow_mut() = Some(spec));
+}
+
+/// Clear the thread-local override; subsequent calls fall back to env / Cpu.
+pub fn clear_default_device() {
+    THREAD_DEFAULT.with(|t| *t.borrow_mut() = None);
+}
+
+/// Resolve the active default device.
+pub fn default_device() -> DeviceSpec {
+    if let Some(d) = THREAD_DEFAULT.with(|t| t.borrow().clone()) {
+        return d;
+    }
+    PROCESS_DEFAULT
+        .get_or_init(|| {
+            std::env::var("SVOD_DEVICE").ok().and_then(|s| parse_simple(s.trim())).unwrap_or(DeviceSpec::Cpu)
+        })
+        .clone()
+}
+
+/// Scoped override: runs `f` with `spec` as the default device, restoring
+/// the previous value when the scope ends — including if `f` panics. The
+/// restore is RAII so a caught unwind can't leak the override onto the thread.
+pub fn with_default_device<R>(spec: DeviceSpec, f: impl FnOnce() -> R) -> R {
+    let _guard = DefaultDeviceGuard { prev: THREAD_DEFAULT.with(|t| t.borrow().clone()) };
+    set_default_device(spec);
+    f()
+}
+
+/// Restores the captured thread-local default on drop.
+struct DefaultDeviceGuard {
+    prev: Option<DeviceSpec>,
+}
+
+impl Drop for DefaultDeviceGuard {
+    fn drop(&mut self) {
+        THREAD_DEFAULT.with(|t| *t.borrow_mut() = self.prev.take());
+    }
+}
+
+/// Minimal `DeviceSpec` parser for the `SVOD_DEVICE` env var. We intentionally
+/// do NOT pull `svod_device::DeviceSpecExt` here — that crate depends on
+/// `svod-dtype`, not the other way around. Supports:
+///   - `CPU`
+///   - `AMD` / `AMD:N` — arch field defaults to `Gfx1100`, but the real arch
+///     comes from KFD topology when the registry/device-factory opens the
+///     allocator. The default-device value is only used as a *spec hint*;
+///     downstream consumers re-resolve through the registry.
+fn parse_simple(s: &str) -> Option<DeviceSpec> {
+    let upper = s.to_uppercase();
+    let parts: Vec<&str> = upper.split(':').collect();
+    match parts[0] {
+        "CPU" => Some(DeviceSpec::Cpu),
+        "AMD" | "HIP" => {
+            let device_id: usize = if parts.len() > 1 { parts[1].parse().ok()? } else { 0 };
+            Some(DeviceSpec::Amd { device_id })
+        }
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+#[path = "test/unit/default_device.rs"]
+mod tests;

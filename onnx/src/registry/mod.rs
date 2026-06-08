@@ -98,7 +98,13 @@ impl OpRegistry {
                 let y = inp(inputs, 1);
                 vec![if fmod == 1 {
                     // fmod=1: C-style remainder (sign of dividend)
-                    x.try_mod(y)?
+                    if x.uop().dtype().is_int() {
+                        x.try_mod(y)?
+                    } else {
+                        // floats: x - trunc(x/y) * y (primitive MOD is integer-only)
+                        let div = x.try_div(y)?;
+                        x.try_sub(&div.trunc()?.try_mul(y)?)?
+                    }
                 } else if x.uop().dtype().is_int() {
                     // fmod=0 integers: Python-style modulo (sign of divisor)
                     let trunc_mod = x.try_mod(y)?;

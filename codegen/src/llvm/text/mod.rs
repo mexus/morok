@@ -13,23 +13,44 @@
 
 use std::sync::Arc;
 
+use svod_dtype::AmdArch;
 use svod_ir::pattern::TypedPatternMatcher;
 use svod_ir::{Op, prelude::*};
 
 use crate::common::is_output_buffer;
-use crate::llvm::common::{RenderContext, ldt};
-use crate::llvm::cpu::{reduce_identity, render_uop};
+use crate::llvm::amd;
+use crate::llvm::common::{LlvmTarget, RenderContext, ldt};
+use crate::llvm::cpu::{self, reduce_identity};
 use crate::{BufferArg, Error, RenderedKernel, Renderer, Result};
 
 /// Text-based LLVM IR renderer.
 ///
 /// Generates LLVM IR as strings, suitable for compilation via external clang.
-/// Produces a single function with direct typed parameters.
-pub struct LlvmTextRenderer;
+/// Produces a single function with direct typed parameters. The active
+/// [`LlvmTarget`] selects between the CPU emitter and the AMDGPU emitter
+/// (`amdgpu_kernel` ABI, addrspace(3) LDS, amdgcn intrinsics).
+pub struct LlvmTextRenderer {
+    target: LlvmTarget,
+}
 
 impl LlvmTextRenderer {
+    /// Renderer for the host CPU target (default for backwards compatibility).
     pub fn new() -> Self {
-        Self
+        Self { target: LlvmTarget::Cpu }
+    }
+
+    /// Renderer for an AMD GPU at the named `gfx{family}` target.
+    pub fn amd(arch: AmdArch) -> Self {
+        Self { target: LlvmTarget::Amd(arch) }
+    }
+
+    /// Construct with an explicit target.
+    pub fn with_target(target: LlvmTarget) -> Self {
+        Self { target }
+    }
+
+    pub fn target(&self) -> LlvmTarget {
+        self.target
     }
 }
 
@@ -124,7 +145,18 @@ impl Renderer for LlvmTextRenderer {
                 let dtype = ldt(&node.dtype());
                 let identity = reduce_identity(*reduce_op, &node.dtype());
                 let acc_name = format!("%reduce_{}", node.id);
-                kernel.push(format!("  {acc_name} = alloca {dtype}"));
+                match self.target {
+                    // AMDGPU rejects addrspace(0) allocas (`alloca on amdgpu must
+                    // be in addrspace(5)`); allocate in private/scratch and
+                    // addrspacecast to a generic `ptr` for the downstream
+                    // loads/stores, mirroring `render_define_reg`.
+                    LlvmTarget::Amd(_) => {
+                        let raw = format!("{acc_name}.raw");
+                        kernel.push(format!("  {raw} = alloca {dtype}, addrspace(5)"));
+                        kernel.push(format!("  {acc_name} = addrspacecast ptr addrspace(5) {raw} to ptr"));
+                    }
+                    LlvmTarget::Cpu => kernel.push(format!("  {acc_name} = alloca {dtype}")),
+                }
                 kernel.push(format!("  store {dtype} {identity}, ptr {acc_name}"));
                 ctx.register(node.id, acc_name);
             }
@@ -134,8 +166,14 @@ impl Renderer for LlvmTextRenderer {
         // Allocas placed in the entry block so LLVM's mem2reg can promote them
         // to vector registers across loop iterations. Without this, the WMMA
         // accumulator is materialized to memory every K iteration.
+        //
+        // CPU/AMX only: the AMX tensor cores can only load operands from memory,
+        // so they need these scratch slots. The AMDGPU path lowers WMMA straight
+        // to `llvm.amdgcn.wmma.*` intrinsics over SSA vectors (see `amd::wmma`),
+        // so emitting these allocas there is dead IR. Matches tinygrad's
+        // `AMDLLVMRenderer`, which only preallocates on the `tc.amx` path.
         let wmma_count = nodes.iter().filter(|n| matches!(n.op(), Op::Wmma { .. })).count();
-        if wmma_count > 0 {
+        if wmma_count > 0 && matches!(self.target, LlvmTarget::Cpu) {
             kernel.push("  ; WMMA AMX scratch buffers".to_string());
             for node in &nodes {
                 if let Op::Wmma { a, b, c, .. } = node.op() {
@@ -213,7 +251,14 @@ impl Renderer for LlvmTextRenderer {
                 ctx.register(node.id, String::new());
                 continue;
             }
-            render_uop(node, &mut ctx, &mut kernel);
+            match self.target {
+                LlvmTarget::Cpu => {
+                    cpu::render_uop(node, &mut ctx, &mut kernel);
+                }
+                LlvmTarget::Amd(_) => {
+                    amd::render_uop(node, &mut ctx, &mut kernel, self.target);
+                }
+            }
             if let Some(err) = ctx.take_error() {
                 return Err(err);
             }
@@ -221,20 +266,47 @@ impl Renderer for LlvmTextRenderer {
 
         kernel.push("  ret void".to_string());
 
+        let abi = match self.target {
+            LlvmTarget::Cpu => "void",
+            LlvmTarget::Amd(_) => "amdgpu_kernel void",
+        };
+
+        let attrs = build_function_attributes(&self.target, &nodes);
+
+        // Module-level prefix:
+        //   1. amdgcn intrinsic declarations + CPU intrinsic declarations
+        //   2. fp8 helper (AMD-only, only when the kernel uses fp8)
+        //   3. addrspace(3) LDS globals from `Op::DefineLocal` (AMD-only)
+        let mut module_blocks: Vec<String> = Vec::new();
+        module_blocks.push(generate_intrinsic_declarations(&kernel, &self.target));
+        if self.target.is_amd()
+            && let Some(helper) = amd::ops::fp8_helper_prefix(&nodes)
+        {
+            module_blocks.push(helper.to_string());
+        }
+        if !ctx.module_prefix().is_empty() {
+            module_blocks.push(ctx.module_prefix().join("\n"));
+        }
+
+        let target_triple_line = match self.target {
+            LlvmTarget::Cpu => String::new(),
+            LlvmTarget::Amd(_) => "target triple = \"amdgcn-amd-amdhsa\"\n".to_string(),
+        };
+
         let ir = format!(
             r#"; ModuleID = '{kernel_name}'
 source_filename = "{kernel_name}"
+{target_triple_line}
+{module_prefix}
 
-{intrinsics}
-
-define void @{kernel_name}({inner_params}) #0 {{
+define {abi} @{kernel_name}({inner_params}) #0 {{
 entry:
 {inner_body}
 }}
 
-attributes #0 = {{ nounwind "no-builtins" "no-trapping-math"="true" }}
+attributes #0 = {{ {attrs} }}
 "#,
-            intrinsics = generate_intrinsic_declarations(&kernel),
+            module_prefix = module_blocks.join("\n\n"),
             inner_params = inner_params.join(", "),
             inner_body = kernel.join("\n"),
         );
@@ -281,7 +353,7 @@ fn mangle_type(llvm_type: &str) -> String {
     }
 }
 
-fn generate_intrinsic_declarations(kernel: &[String]) -> String {
+fn generate_intrinsic_declarations(kernel: &[String], target: &LlvmTarget) -> String {
     let mut decls = Vec::new();
     let kernel_str = kernel.join("\n");
 
@@ -316,7 +388,156 @@ fn generate_intrinsic_declarations(kernel: &[String]) -> String {
         }
     }
 
+    if target.is_amd() {
+        // Scalar (non-mangled) amdgcn intrinsics; declared whenever referenced
+        // in the kernel body. Source: AMDGPU LLVM intrinsic reference.
+        for (pattern, decl) in [
+            ("@llvm.amdgcn.s.barrier", "declare void @llvm.amdgcn.s.barrier()"),
+            ("@llvm.amdgcn.workgroup.id.x", "declare i32 @llvm.amdgcn.workgroup.id.x()"),
+            ("@llvm.amdgcn.workgroup.id.y", "declare i32 @llvm.amdgcn.workgroup.id.y()"),
+            ("@llvm.amdgcn.workgroup.id.z", "declare i32 @llvm.amdgcn.workgroup.id.z()"),
+            ("@llvm.amdgcn.workitem.id.x", "declare i32 @llvm.amdgcn.workitem.id.x()"),
+            ("@llvm.amdgcn.workitem.id.y", "declare i32 @llvm.amdgcn.workitem.id.y()"),
+            ("@llvm.amdgcn.workitem.id.z", "declare i32 @llvm.amdgcn.workitem.id.z()"),
+            ("@llvm.amdgcn.cvt.f32.fp8", "declare float @llvm.amdgcn.cvt.f32.fp8(i32, i32)"),
+            ("@llvm.amdgcn.cvt.f32.bf8", "declare float @llvm.amdgcn.cvt.f32.bf8(i32, i32)"),
+            ("@llvm.amdgcn.cvt.pk.fp8.f32", "declare i32 @llvm.amdgcn.cvt.pk.fp8.f32(float, float, i32, i1)"),
+            ("@llvm.amdgcn.cvt.pk.bf8.f32", "declare i32 @llvm.amdgcn.cvt.pk.bf8.f32(float, float, i32, i1)"),
+            ("@llvm.amdgcn.fmed3.f32", "declare float @llvm.amdgcn.fmed3.f32(float, float, float)"),
+        ] {
+            if kernel_str.contains(pattern) {
+                decls.push(decl.to_string());
+            }
+        }
+        // WMMA / MFMA intrinsics: the signature varies by family and dtype, so
+        // we synthesize each `declare` from its call site's operand types. The
+        // operands already carry the intrinsic-required wire types (bf16 as
+        // i16, fp8 as a packed integer — bitcast in `render_wmma_amd`), so the
+        // declaration matches the call by construction. Dedup identical lines
+        // (a tiled matmul emits many calls to the same intrinsic).
+        for line in kernel.iter() {
+            if let Some(decl) = wmma_declaration_from_call(line)
+                && !decls.contains(&decl)
+            {
+                decls.push(decl);
+            }
+        }
+    }
+
     decls.join("\n")
+}
+
+/// Synthesize a `declare` line for a `@llvm.amdgcn.{wmma,mfma}.*` call by
+/// echoing the call's argument types. Returns `None` if the line isn't a
+/// WMMA/MFMA call site.
+fn wmma_declaration_from_call(line: &str) -> Option<String> {
+    let needle_wmma = "@llvm.amdgcn.wmma.";
+    let needle_mfma = "@llvm.amdgcn.mfma.";
+    let needle = if line.contains(needle_wmma) {
+        needle_wmma
+    } else if line.contains(needle_mfma) {
+        needle_mfma
+    } else {
+        return None;
+    };
+    // `  %vN = call <ret_ty> @llvm.amdgcn.wmma.<rest>(<args>)`
+    let call_start = line.find("call ")?;
+    let after_call = &line[call_start + "call ".len()..];
+    let ret_end = after_call.find(" @")?;
+    let ret_ty = &after_call[..ret_end];
+    let name_start = call_start + "call ".len() + ret_end + 2; // skip " @"
+    let paren = line[name_start..].find('(')?;
+    let intrinsic_name = &line[name_start..name_start + paren];
+    if !intrinsic_name.starts_with(&needle[1..]) {
+        return None;
+    }
+    // Extract the argument list (between the matching parens).
+    let args_start = name_start + paren + 1;
+    let args_end = line[args_start..].rfind(')')?;
+    let args_chunk = &line[args_start..args_start + args_end];
+    // Pull out types — entries are `<ty> %name` or `<ty> <const>`.
+    let mut param_types: Vec<String> = Vec::new();
+    let mut depth = 0;
+    let mut current = String::new();
+    let mut parts: Vec<String> = Vec::new();
+    for ch in args_chunk.chars() {
+        match ch {
+            '<' => {
+                depth += 1;
+                current.push(ch);
+            }
+            '>' => {
+                depth -= 1;
+                current.push(ch);
+            }
+            ',' if depth == 0 => {
+                parts.push(current.trim().to_string());
+                current.clear();
+            }
+            _ => current.push(ch),
+        }
+    }
+    if !current.trim().is_empty() {
+        parts.push(current.trim().to_string());
+    }
+    for part in parts {
+        let trimmed = part.trim();
+        // The leading *type* token. A `<…>` vector/aggregate type runs to its
+        // matching `>` (the value or name follows it); a scalar type is the
+        // token before the first space (`i32 0`, `i1 false`). Splitting on the
+        // first space would truncate `<16 x half>` to `<16` — the bug this
+        // replaces — since the type itself contains spaces.
+        let ty = if trimmed.starts_with('<') {
+            let mut depth = 0usize;
+            let mut end = trimmed.len();
+            for (i, ch) in trimmed.char_indices() {
+                match ch {
+                    '<' => depth += 1,
+                    '>' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = i + 1;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            &trimmed[..end]
+        } else {
+            trimmed.split_whitespace().next().unwrap_or(trimmed)
+        };
+        param_types.push(ty.to_string());
+    }
+    Some(format!("declare {ret_ty} @{intrinsic_name}({})", param_types.join(", ")))
+}
+
+/// Build the per-target `attributes #0` body.
+fn build_function_attributes(target: &LlvmTarget, nodes: &[Arc<UOp>]) -> String {
+    match target {
+        LlvmTarget::Cpu => "nounwind \"no-builtins\" \"no-trapping-math\"=\"true\"".to_string(),
+        LlvmTarget::Amd(_) => {
+            // Tinygrad `llvmir.py:259-263`: include the upper bound on the
+            // local workgroup size so the AMDGPU backend can size scratch
+            // allocations / waves correctly.
+            let max_l = nodes
+                .iter()
+                .filter_map(|n| match n.op() {
+                    Op::Special { name, end } if name.starts_with('l') => match end.vmax() {
+                        svod_ir::ConstValue::Int(v) => Some(*v as u64),
+                        svod_ir::ConstValue::UInt(v) => Some(*v),
+                        _ => None,
+                    },
+                    _ => None,
+                })
+                .product::<u64>()
+                .max(1);
+            format!(
+                "alwaysinline nounwind \"no-builtins\" \"amdgpu-flat-work-group-size\"=\"1,{max_l}\" \
+                 \"no-trapping-math\"=\"true\""
+            )
+        }
+    }
 }
 
 pub fn render(uop: &Arc<UOp>, name: Option<&str>) -> Result<RenderedKernel> {

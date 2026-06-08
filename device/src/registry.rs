@@ -75,6 +75,18 @@ impl DeviceSpecExt for DeviceSpec {
             "WEBGPU" => Ok(DeviceSpec::WebGpu),
             #[cfg(not(feature = "webgpu"))]
             "WEBGPU" => Ok(DeviceSpec::WebGpu),
+            "AMD" | "HIP" => {
+                // Format: AMD | AMD:N. The arch lives on the opened
+                // `AmdDevice` (resolved from KFD topology); it's intentionally
+                // not part of the DeviceSpec to avoid identity ambiguity
+                // (two specs for one physical device).
+                let device_id = if parts.len() > 1 {
+                    parts[1].parse().map_err(|_| crate::error::Error::InvalidDevice { device: s.to_string() })?
+                } else {
+                    0
+                };
+                Ok(DeviceSpec::Amd { device_id })
+            }
             _ => InvalidDeviceSnafu { device: s }.fail(),
         }
     }
@@ -117,7 +129,7 @@ impl DeviceRegistry {
     }
 
     fn create_allocator(&self, spec: &DeviceSpec) -> Result<Arc<dyn Allocator>> {
-        // DISK: no LRU caching (Tinygrad: DiskAllocator extends Allocator, not LRUAllocator)
+        // DISK: no LRU caching — DiskAllocator is used directly, not wrapped in LruAllocator.
         if let DeviceSpec::Disk { path } = spec {
             return Ok(Arc::new(crate::allocator::DiskAllocator::new(path.clone())));
         }
@@ -128,6 +140,7 @@ impl DeviceRegistry {
             DeviceSpec::Cuda { device_id } => Box::new(crate::allocator::CudaAllocator::new(*device_id)?),
             #[cfg(not(feature = "cuda"))]
             DeviceSpec::Cuda { .. } => unimplemented!("Cuda allocator - to be implemented"),
+            DeviceSpec::Amd { device_id, .. } => Box::new(crate::amd::AmdAllocator::new(*device_id)?),
             DeviceSpec::Metal { .. } => unimplemented!("Metal allocator - to be implemented"),
             DeviceSpec::WebGpu => unimplemented!("WebGPU allocator - to be implemented"),
             DeviceSpec::Disk { .. } => unreachable!(),
@@ -156,6 +169,21 @@ pub fn get_device(device: &str) -> Result<Arc<dyn Allocator>> {
 /// Convenience function to get CPU allocator.
 pub fn cpu() -> Result<Arc<dyn Allocator>> {
     registry().get(&DeviceSpec::Cpu)
+}
+
+/// Read the gfx arch of AMD device `device_id` from KFD topology. Used by
+/// `DeviceSpec::parse("AMD:N")` so the resulting spec encodes the real arch
+/// (not a hard-coded default that would break the kernel cache).
+pub fn resolve_amd_arch_from_topology(device_id: usize) -> Result<svod_dtype::AmdArch> {
+    let nodes = crate::amd::topology::enumerate();
+    let node = nodes.get(device_id).ok_or_else(|| crate::error::Error::NoAmdGpu {
+        reason: format!("device_id {device_id} out of range; {} GPU node(s) present", nodes.len()),
+    })?;
+    svod_dtype::AmdArch::from_gfx_target_version(node.gfx_target_version).ok_or_else(|| {
+        crate::error::Error::AmdAllocFailed {
+            reason: format!("unsupported gfx_target_version {} on AMD device {device_id}", node.gfx_target_version),
+        }
+    })
 }
 
 /// Convenience function to get CUDA allocator.

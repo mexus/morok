@@ -46,11 +46,6 @@ pub struct CachedKernel {
     /// Input buffer slots read by LOAD operations.
     /// Matches Tinygrad's ProgramSpec.ins semantics.
     pub ins: Vec<usize>,
-    /// Whether host-level scheduling may overlap this program with other kernels.
-    ///
-    /// Thread-safety is required by the `Program` trait. This flag is about
-    /// backend/kernel semantics, not Rust synchronization safety.
-    pub host_parallel_safe: bool,
     /// Symbolic global work size evaluated with runtime vars before dispatch.
     pub global_size: [Arc<UOp>; 3],
     /// Symbolic local work size. None means direct global-id execution.
@@ -66,7 +61,7 @@ type KernelKey = (u64, String);
 // Global kernel dedup cache using lock-free concurrent HashMap.
 //
 // Maps (UOp ID, device) -> Arc<CachedKernel>.
-// Kernels live until explicitly cleared via clear_all().
+// Kernels live for the process lifetime — the cache is never torn down.
 static KERNELS: OnceLock<HashMap<KernelKey, Arc<CachedKernel>>> = OnceLock::new();
 
 fn kernels() -> &'static HashMap<KernelKey, Arc<CachedKernel>> {
@@ -125,42 +120,10 @@ where
     }
 }
 
-/// Clear all cached kernels.
-///
-/// This is primarily useful for testing to ensure test isolation.
-/// Thread-safe.
-pub fn clear_all() {
-    let guard = kernels().guard();
-    kernels().clear(&guard);
-}
-
-/// Remove kernels whose AST IDs are no longer in the live UOp set.
-///
-/// Call this after `gc_dead_refs()` to clean up compiled kernels for
-/// discarded UOps. This prevents kernel cache memory accumulation during
-/// beam search and other optimization passes.
-///
-/// # Arguments
-///
-/// * `live_ids` - Set of UOp IDs that are still alive in the UOp cache
-///
-/// # Example
-///
-/// ```ignore
-/// svod_ir::uop::gc_dead_refs();
-/// let live_ids = svod_ir::uop::live_uop_ids();
-/// svod_runtime::kernel_cache::gc_unused_kernels(&live_ids);
-/// ```
-pub fn gc_unused_kernels(live_ids: &std::collections::HashSet<u64>) {
-    let map = kernels();
-    let guard = map.guard();
-
-    // Collect keys to remove (can't mutate while iterating)
-    let to_remove: Vec<KernelKey> =
-        map.iter(&guard).filter(|((ast_id, _), _)| !live_ids.contains(ast_id)).map(|(k, _)| k.clone()).collect();
-
-    // Remove dead entries
-    for key in to_remove {
-        map.remove(&key, &guard);
-    }
-}
+// No `clear_all` / `gc_unused_kernels`: the cache is intentionally
+// process-static and deduped by `(ast_id, device)`. Identical ASTs share an
+// `Arc<CachedKernel>` so cross-test interference is moot; a public bulk
+// drop would burst `AmdProgram::Drop` (and equivalents) through the cache
+// while in-flight dispatches still resolve through it — exactly the
+// unmap-while-busy hazard the per-connector cleanup paths already create.
+// Programs amortise across the process and the OS reclaims at exit.

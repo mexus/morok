@@ -10,7 +10,7 @@
 //! # Examples
 //!
 //! ```no_run
-//! use svod_device::allocator::BufferOptions;
+//! use svod_device::allocator::BufferSpec;
 //! use svod_device::{Buffer, registry};
 //! use svod_dtype::DType;
 //!
@@ -18,13 +18,14 @@
 //! let cpu = registry::cpu().unwrap();
 //!
 //! // Create a buffer with lazy allocation
-//! let buffer = Buffer::new(cpu, DType::Float32, vec![10, 10], BufferOptions::default());
+//! let buffer = Buffer::new(cpu, DType::Float32, vec![10, 10], BufferSpec::default());
 //!
 //! // Allocation happens on first use
 //! buffer.ensure_allocated().unwrap();
 //! ```
 
 pub mod allocator;
+pub mod amd;
 pub mod buffer;
 pub mod device;
 pub mod error;
@@ -33,10 +34,10 @@ pub mod registry;
 pub mod sync;
 
 pub use buffer::{Buffer, BufferId};
-pub use device::Program;
+pub use device::{Graph, GraphFactory, GraphKernel, PlanContext, Program};
 pub use error::{Error, Result};
 pub use queue::{DynQueue, ExecParams, HardwareQueue, QueueFactory};
-pub use sync::{CpuTimelineSignal, TimelineSignal};
+pub use sync::{CpuTimelineSignal, DispatchTimestamps, TimelineSignal};
 
 #[cfg(test)]
 mod test;
@@ -44,7 +45,7 @@ mod test;
 // Re-export commonly used types
 #[cfg(feature = "cuda")]
 pub use allocator::CudaAllocator;
-pub use allocator::{Allocator, BufferOptions, CpuAllocator};
+pub use allocator::{Allocator, BufferSpec, CpuAllocator};
 #[cfg(feature = "cuda")]
 pub use registry::cuda;
 pub use registry::{DeviceSpec, cpu, get_device};

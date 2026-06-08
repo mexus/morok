@@ -119,14 +119,16 @@ fn test_do_compile_requires_source_stage() {
 
 #[test]
 fn test_do_compile_reuses_existing_binary_stage() {
-    let sink = UOp::sink(vec![UOp::native_const(2.0f32)]);
+    // Launch dims come from the SPECIAL UOps in the SINK (ProgramSpec::from_uop
+    // ignores meta work sizes by design), so seed a `gidx0` with bound 4 to get
+    // global_size == [4, 1, 1].
+    let sink = UOp::sink(vec![UOp::native_const(2.0f32), UOp::special(UOp::index_const(4), "gidx0".to_string())]);
     let linear = UOp::linear(svod_schedule::linearize_with_cfg(sink.clone()).into());
     let source = UOp::source("// binary source".to_string());
     let mut spec =
         ProgramSpec::new("precompiled".to_string(), "// precompiled source".to_string(), DeviceSpec::Cpu, sink.clone());
     spec.set_var_names(vec!["N".to_string()]);
     spec.buf_count = 3;
-    spec.set_work_sizes([4, 1, 1], [1, 1, 1]);
 
     let program =
         UOp::program(sink, UOp::device(DeviceSpec::Cpu), Some(linear), Some(source), Some(UOp::binary(vec![9, 8, 7])))

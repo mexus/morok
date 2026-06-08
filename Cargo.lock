@@ -184,6 +184,26 @@ dependencies = [
 
 [[package]]
 name = "bindgen"
+version = "0.71.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5f58bf3d7db68cfbac37cfc485a8d711e87e064c3d0fe0435b92f7a407f9d6b3"
+dependencies = [
+ "bitflags 2.11.1",
+ "cexpr",
+ "clang-sys",
+ "itertools 0.13.0",
+ "log",
+ "prettyplease",
+ "proc-macro2",
+ "quote",
+ "regex",
+ "rustc-hash",
+ "shlex",
+ "syn 2.0.117",
+]
+
+[[package]]
+name = "bindgen"
 version = "0.72.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "993776b509cfb49c750f11b8f07a46fa23e0a1386ffc01fb1e7d343efc387895"
@@ -1932,7 +1952,7 @@ version = "210.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f376ddc92bf2bad0eba47e20f75923f76306e429273379cedb70eb7e664aab90"
 dependencies = [
- "bindgen",
+ "bindgen 0.72.1",
 ]
 
 [[package]]
@@ -1985,6 +2005,18 @@ dependencies = [
  "num-traits",
  "py_literal",
  "zip 6.0.0",
+]
+
+[[package]]
+name = "nix"
+version = "0.29.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "71e2746dc3a24dd78b3cfcb7be93368c6de9963d30f43a6a73998a9cf4b17b46"
+dependencies = [
+ "bitflags 2.11.1",
+ "cfg-if",
+ "cfg_aliases",
+ "libc",
 ]
 
 [[package]]
@@ -3081,6 +3113,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 
 [[package]]
+name = "safe_arch"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1f7caad094bd561859bcd467734a720c3c1f5d1f338995351fefe2190c45efed"
+dependencies = [
+ "bytemuck",
+]
+
+[[package]]
 name = "safetensors"
 version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3468,10 +3509,14 @@ dependencies = [
 name = "svod-device"
 version = "0.1.0-alpha.3"
 dependencies = [
+ "bindgen 0.71.1",
  "cudarc",
  "enum_delegate",
+ "libc",
  "memmap2",
  "ndarray",
+ "nix",
+ "object",
  "once_cell",
  "parking_lot 0.12.5",
  "proptest",
@@ -3490,6 +3535,7 @@ name = "svod-dtype"
 version = "0.1.0-alpha.3"
 dependencies = [
  "enumset",
+ "once_cell",
  "proptest",
  "proptest-derive",
  "serde",
@@ -3544,6 +3590,7 @@ dependencies = [
  "ndarray-npy",
  "nom",
  "prost",
+ "rayon",
  "realfft",
  "repugnant-pickle",
  "safetensors",
@@ -3560,7 +3607,9 @@ dependencies = [
  "svod-tensor",
  "tempfile",
  "test-case",
+ "tracing",
  "tracing-subscriber",
+ "wide",
  "zip 0.6.6",
 ]
 
@@ -3730,7 +3779,7 @@ version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0c4e3abe8582a0bb8708d11142c45e8c622f013bc4936d918da42c2aade60e98"
 dependencies = [
- "bindgen",
+ "bindgen 0.72.1",
  "cc",
  "paste",
  "thiserror 2.0.18",
@@ -4502,6 +4551,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "wide"
+version = "1.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dfdfe6a32973f2d1b268b8895845a8a96cac2f0191e72c27cc929036060dbf89"
+dependencies = [
+ "bytemuck",
+ "safe_arch",
+]
+
+[[package]]
 name = "winapi"
 version = "0.3.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4955,7 +5014,7 @@ version = "0.10.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c82b97329d02d87da6802ed9fda083f1b255d822ab13d5b1fb961196b58a69a1"
 dependencies = [
- "bindgen",
+ "bindgen 0.72.1",
  "pkg-config",
  "reqwest",
 ]
