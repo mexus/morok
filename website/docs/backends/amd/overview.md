@@ -79,21 +79,21 @@ The backend is split into two halves by the **`AmdIface`** trait
 
 ```text
         ┌─────────────────────────────────────────────────────────┐
-        │  ABOVE THE SEAM — backend-agnostic (no ioctls)           │
-        │                                                          │
-        │  AmdProgram   AmdComputeQueue   KernargArena   Timeline  │
-        │  AmdConnector   AmdGraph   SignalPool   AmdAllocator     │
-        │  PM4 / AQL packet builders   ring back-pressure          │
-        └─────────────────────────────┬───────────────────────────┘
+        │  ABOVE THE SEAM — backend-agnostic (no ioctls)          │
+        │                                                         │
+        │  AmdProgram   AmdComputeQueue   KernargArena   Timeline │
+        │  AmdConnector   AmdGraph   SignalPool   AmdAllocator    │
+        │  PM4 / AQL packet builders   ring back-pressure         │
+        └──────────────────────────────┬──────────────────────────┘
                                        │  Arc<dyn AmdIface>
                                        │  alloc_raw · free_raw
                                        │  setup_ring · teardown_ring
                                        │  wait_events
         ┌──────────────────────────────┴──────────────────────────┐
-        │  BELOW THE SEAM — the actual driver                      │
-        │                                                          │
-        │   KfdIface  (today: KFD ioctls on /dev/kfd)              │
-        │   AmIface   (future: userspace PCI-BAR driver — WIP)     │
+        │  BELOW THE SEAM — the actual driver                     │
+        │                                                         │
+        │   KfdIface  (today: KFD ioctls on /dev/kfd)             │
+        │   AmIface   (future: userspace PCI-BAR driver — WIP)    │
         └─────────────────────────────────────────────────────────┘
 ```
 
