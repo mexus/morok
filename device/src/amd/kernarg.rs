@@ -134,7 +134,3 @@ impl std::fmt::Debug for KernargArena {
             .finish_non_exhaustive()
     }
 }
-
-#[cfg(test)]
-#[path = "../test/unit/amd/kernarg.rs"]
-mod tests;

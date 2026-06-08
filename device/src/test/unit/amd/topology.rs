@@ -1,5 +1,6 @@
-use super::*;
+use crate::amd::topology::*;
 use std::io::Write;
+use std::path::PathBuf;
 
 #[test]
 fn parse_properties_handles_real_kfd_format() {

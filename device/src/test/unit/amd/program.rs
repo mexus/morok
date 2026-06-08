@@ -1,4 +1,6 @@
-use super::*;
+use super::test_support::{amd_alloc_or_skip, require_multi_xcc};
+use crate::amd::program::*;
+use crate::amd::queue::build_dispatch_packet;
 
 /// Compile a trivial amdgcn kernel via Phase 2, then parse it back and
 /// verify the kernel descriptor round-trips. Skipped when host clang
@@ -111,14 +113,10 @@ fn aql_native_kernel_dispatch_probe() {
     use crate::allocator::RawBuffer;
     use crate::amd::sys::hsa::{amd_signal_kind_t_AMD_SIGNAL_KIND_USER, amd_signal_t};
 
-    let alloc = match AmdAllocator::new(0) {
-        Ok(a) => a,
-        Err(_) => return,
-    };
+    let Some(alloc) = amd_alloc_or_skip() else { return };
     let core = alloc.dev.core();
     let xccs = alloc.dev.node.num_xcc.max(1);
-    if xccs <= 1 {
-        eprintln!("PROBE skipped: single-XCC device (this probe targets multi-XCC AQL).");
+    if !require_multi_xcc(&alloc) {
         return;
     }
     if core.signal_pool().is_none() {
@@ -252,13 +250,9 @@ fn aql_graph_capture_replay() {
     use crate::amd::AmdGraph;
     use crate::device::{GraphKernel, Program};
 
-    let alloc = match AmdAllocator::new(0) {
-        Ok(a) => a,
-        Err(_) => return,
-    };
+    let Some(alloc) = amd_alloc_or_skip() else { return };
     let core = alloc.dev.core();
-    if alloc.dev.node.num_xcc.max(1) <= 1 {
-        eprintln!("PROBE skipped: single-XCC (graph capture is AQL/multi-XCC only).");
+    if !require_multi_xcc(&alloc) {
         return;
     }
     if core.signal_pool().is_none() {
@@ -342,13 +336,9 @@ fn aql_graph_two_kernel_raw_dependency() {
     use crate::amd::AmdGraph;
     use crate::device::{GraphKernel, Program};
 
-    let alloc = match AmdAllocator::new(0) {
-        Ok(a) => a,
-        Err(_) => return,
-    };
+    let Some(alloc) = amd_alloc_or_skip() else { return };
     let core = alloc.dev.core();
-    if alloc.dev.node.num_xcc.max(1) <= 1 {
-        eprintln!("PROBE skipped: single-XCC.");
+    if !require_multi_xcc(&alloc) {
         return;
     }
     if core.signal_pool().is_none() {

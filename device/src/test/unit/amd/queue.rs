@@ -1,4 +1,8 @@
-use super::*;
+use super::test_support::amd_alloc_or_skip;
+use crate::amd::queue::*;
+use crate::amd::sys::hsa::{
+    hsa_fence_scope_t_HSA_FENCE_SCOPE_SYSTEM, hsa_kernel_dispatch_packet_t, kernel_dispatch_header,
+};
 
 #[test]
 fn aql_packet_header_layout() {
@@ -44,10 +48,7 @@ fn sdma_linear_copy_dwords_layout() {
 #[test]
 fn sdma_device_local_roundtrip() {
     use crate::allocator::{Allocator, BufferSpec, RawBuffer};
-    let alloc = match AmdAllocator::new(0) {
-        Ok(a) => a,
-        Err(_) => return,
-    };
+    let Some(alloc) = amd_alloc_or_skip() else { return };
     let core = alloc.dev.core();
     // Bring up signal pool + copy queue (the device factory normally does this);
     // both installers are idempotent, so this is safe if a factory already ran.
@@ -87,10 +88,7 @@ fn sdma_device_local_roundtrip() {
 /// timeline wired up by the factory, so we only assert creation here.
 #[test]
 fn compute_queue_create_if_hw_supports() {
-    let alloc = match AmdAllocator::new(0) {
-        Ok(a) => a,
-        Err(_) => return,
-    };
+    let Some(alloc) = amd_alloc_or_skip() else { return };
     let _q = AmdComputeQueue::create(&alloc).expect("create compute queue");
 }
 
@@ -101,10 +99,7 @@ fn compute_queue_create_if_hw_supports() {
 /// no-op (we skip the assertion there).
 #[test]
 fn set_aql_scratch_round_trips_through_gart() {
-    let alloc = match AmdAllocator::new(0) {
-        Ok(a) => a,
-        Err(_) => return,
-    };
+    let Some(alloc) = amd_alloc_or_skip() else { return };
     let q = AmdComputeQueue::create(&alloc).expect("create compute queue");
     if q.is_pm4() {
         return; // PM4 queues program scratch via registers; no GART descriptor.
@@ -161,10 +156,7 @@ fn aql_native_completion_signal_probe() {
         hsa_packet_header_t_HSA_PACKET_HEADER_SCRELEASE_FENCE_SCOPE, hsa_packet_type_t_HSA_PACKET_TYPE_BARRIER_AND,
     };
 
-    let alloc = match AmdAllocator::new(0) {
-        Ok(a) => a,
-        Err(_) => return,
-    };
+    let Some(alloc) = amd_alloc_or_skip() else { return };
     let xccs = alloc.dev.node.num_xcc.max(1);
     let q = AmdComputeQueue::create(&alloc).expect("create compute queue");
     if q.is_pm4() {

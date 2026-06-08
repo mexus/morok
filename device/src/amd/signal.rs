@@ -440,7 +440,3 @@ impl std::fmt::Debug for SignalPool {
             .finish()
     }
 }
-
-#[cfg(test)]
-#[path = "../test/unit/amd/signal.rs"]
-mod tests;

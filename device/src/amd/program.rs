@@ -244,7 +244,7 @@ pub struct AmdProgram {
     device_id: usize,
     /// AQL `kernel_object` field: GPU VA of the kernel descriptor inside the
     /// loaded code object. Used by the AQL kernel-dispatch packet only.
-    aql_prog_addr: u64,
+    pub(crate) aql_prog_addr: u64,
     /// PM4 shader entry point: `code_gpu + kd_offset + kernel_code_entry_byte_offset`.
     /// Used by `build_exec_pm4` (the COMPUTE_PGM_LO/HI register
     /// pair carries `prog_addr >> 8`).
@@ -266,7 +266,7 @@ pub struct AmdProgram {
     /// USER_DATA registers when set.
     enable_private_segment_sgpr: bool,
     /// Decoded kernel descriptor (size of kernarg, LDS, scratch, etc.).
-    kd: AmdHsaKernelDescriptor,
+    pub(crate) kd: AmdHsaKernelDescriptor,
     /// Number of buffer arguments the kernel expects.
     buf_count: usize,
     /// Number of scalar (i64) variable arguments.
@@ -456,7 +456,7 @@ impl AmdProgram {
         })
     }
 
-    fn kernarg_size(&self) -> usize {
+    pub(crate) fn kernarg_size(&self) -> usize {
         // KFD-side kernarg_size is the byte count for the entire kernarg
         // record (already includes alignment padding).
         self.kd.kernarg_size as usize
@@ -829,7 +829,3 @@ impl Program for AmdProgram {
         Ok(Some(Box::new(owner)))
     }
 }
-
-#[cfg(test)]
-#[path = "../test/unit/amd/program.rs"]
-mod tests;

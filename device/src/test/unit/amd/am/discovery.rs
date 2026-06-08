@@ -1,4 +1,4 @@
-use super::*;
+use crate::amd::am::discovery::*;
 
 fn wr16(b: &mut [u8], off: usize, v: u16) {
     b[off..off + 2].copy_from_slice(&v.to_le_bytes());

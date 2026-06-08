@@ -1,4 +1,4 @@
-use super::*;
+use crate::amd::sys::pm4::*;
 
 #[test]
 fn packet3_header_layout() {

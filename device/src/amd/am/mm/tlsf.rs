@@ -29,7 +29,7 @@ struct Block {
 /// `64 - leading_zeros` — the 1-based position of the most-significant set bit
 /// (Python's `int.bit_length`). `bit_length(0) == 0`, `bit_length(16) == 5`.
 #[inline]
-fn bit_length(x: u64) -> u32 {
+pub(crate) fn bit_length(x: u64) -> u32 {
     u64::BITS - x.leading_zeros()
 }
 
@@ -47,7 +47,7 @@ pub struct TlsfAllocator {
     /// `bit_length(lv2_cnt)` — the second-level index width. With the default
     /// `lv2_cnt = 16` this is **5**, not 16 and not 4. Iteration over level-2
     /// buckets runs `0..(1 << l2_cnt)`.
-    l2_cnt: u32,
+    pub(crate) l2_cnt: u32,
     /// `storage[fl][sl]` → list of free-block start offsets in that bucket.
     storage: Vec<Vec<Vec<u64>>>,
     /// Count of free blocks per level-1 bucket (fast "is this `fl` empty").
@@ -97,7 +97,7 @@ impl TlsfAllocator {
     }
 
     #[inline]
-    fn lv2(&self, size: u64) -> usize {
+    pub(crate) fn lv2(&self, size: u64) -> usize {
         let bl = bit_length(size);
         ((size - (1u64 << (bl - 1))) >> bl.saturating_sub(self.l2_cnt)) as usize
     }
@@ -228,7 +228,3 @@ impl TlsfAllocator {
         self.merge_block(start);
     }
 }
-
-#[cfg(test)]
-#[path = "../../../test/unit/amd/am/mm/tlsf.rs"]
-mod tests;

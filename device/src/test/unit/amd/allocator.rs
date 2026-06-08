@@ -1,4 +1,7 @@
-use super::*;
+use super::test_support::amd_alloc_or_skip;
+use crate::allocator::Allocator;
+use crate::allocator::BufferSpec;
+use crate::amd::allocator::*;
 use crate::error::Error;
 
 /// Construction either succeeds (real hardware + supported arch) or
@@ -16,13 +19,7 @@ fn allocator_construction_is_clean() {
 /// AmdDevice (no GPU, unsupported arch, missing perms).
 #[test]
 fn alloc_free_roundtrip_if_hw_supports() {
-    let alloc = match AmdAllocator::new(0) {
-        Ok(a) => a,
-        Err(_) => {
-            eprintln!("skipping: AmdAllocator::new failed (no supported AMD GPU on this host)");
-            return;
-        }
-    };
+    let Some(alloc) = amd_alloc_or_skip() else { return };
     let opts = BufferSpec { cpu_access: true, ..Default::default() };
     let buf = alloc.alloc(4096, &opts, /*zero=*/ true).expect("alloc 4 KiB");
     assert_eq!(buf.size(), 4096);

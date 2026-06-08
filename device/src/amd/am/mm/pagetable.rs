@@ -41,9 +41,9 @@ pub fn pte_frag(frag: u32) -> u64 {
 }
 
 /// MTYPE field for gfx10/11 (NV10) is bits 48..=50.
-const MTYPE_NV10_SHIFT: u32 = 48;
+pub(crate) const MTYPE_NV10_SHIFT: u32 = 48;
 /// gfx11 uncached memory type (`soc_11.MTYPE_UC`).
-const MTYPE_UC_GFX11: u64 = 3;
+pub(crate) const MTYPE_UC_GFX11: u64 = 3;
 /// MTYPE field for gfx9 (VG10) is bits 57..=58.
 const MTYPE_VG10_SHIFT: u32 = 57;
 /// gfx9 uncached memory type (`soc_9.MTYPE_UC`).
@@ -221,7 +221,3 @@ pub fn frag_size(va: u64, sz: u64) -> u32 {
     let sz_pwr2 = sz & sz.wrapping_neg();
     bit_length(va_pwr2.min(sz_pwr2)).saturating_sub(13)
 }
-
-#[cfg(test)]
-#[path = "../../../test/unit/amd/am/mm/pagetable.rs"]
-mod tests;

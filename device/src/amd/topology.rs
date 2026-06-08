@@ -139,7 +139,7 @@ pub fn has_devices() -> bool {
     enumerate().iter().any(|n| svod_dtype::AmdArch::from_gfx_target_version(n.gfx_target_version).is_some())
 }
 
-fn parse_properties(s: &str) -> HashMap<String, u64> {
+pub(crate) fn parse_properties(s: &str) -> HashMap<String, u64> {
     let mut map = HashMap::new();
     for line in s.lines() {
         let line = line.trim();
@@ -159,7 +159,3 @@ fn parse_properties(s: &str) -> HashMap<String, u64> {
     }
     map
 }
-
-#[cfg(test)]
-#[path = "../test/unit/amd/topology.rs"]
-mod tests;

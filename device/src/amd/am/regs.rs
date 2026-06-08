@@ -91,7 +91,3 @@ pub fn select(prefix: &str, ip_ver: (u8, u8, u8)) -> Option<&'static [RegDef]> {
         .max_by_key(|(_, v, _)| *v)
         .map(|(_, _, regs)| *regs)
 }
-
-#[cfg(test)]
-#[path = "../../test/unit/amd/am/regs.rs"]
-mod tests;

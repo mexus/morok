@@ -1,16 +1,13 @@
-use super::*;
+use super::test_support::amd_alloc_or_skip;
+use crate::amd::signal::*;
+use crate::error::Error;
+use crate::sync::TimelineSignal;
 
 /// Live pool round-trip on real hardware (skipped when no supported AMD
 /// GPU is present).
 #[test]
 fn signal_pool_acquire_release_roundtrip() {
-    let alloc = match AmdAllocator::new(0) {
-        Ok(a) => a,
-        Err(_) => {
-            eprintln!("skipping: no supported AMD GPU");
-            return;
-        }
-    };
+    let Some(alloc) = amd_alloc_or_skip() else { return };
     let pool = SignalPool::new(&alloc, 64).expect("create pool");
     let s1 = pool.acquire().expect("acquire 1");
     let s2 = pool.acquire().expect("acquire 2");
@@ -28,13 +25,7 @@ fn signal_pool_acquire_release_roundtrip() {
 
 #[test]
 fn signal_pool_exhaustion_is_clean_err() {
-    let alloc = match AmdAllocator::new(0) {
-        Ok(a) => a,
-        Err(_) => {
-            eprintln!("skipping: no supported AMD GPU");
-            return;
-        }
-    };
+    let Some(alloc) = amd_alloc_or_skip() else { return };
     const N: usize = 64;
     let pool = SignalPool::new(&alloc, N).expect("create pool");
     let mut sigs = Vec::new();

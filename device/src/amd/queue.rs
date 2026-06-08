@@ -1273,7 +1273,3 @@ fn compute_ctx_sizes(dev: &AmdDeviceCore) -> (usize, usize, usize) {
 
     (wg_data_size, ctl_stack_size, debug_memory_size)
 }
-
-#[cfg(test)]
-#[path = "../test/unit/amd/queue.rs"]
-mod tests;

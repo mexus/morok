@@ -1,4 +1,4 @@
-use super::*;
+use crate::amd::am::regs::*;
 
 #[test]
 fn selects_gfx1151_gc_module() {

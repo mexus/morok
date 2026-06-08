@@ -1,4 +1,6 @@
-use super::*;
+use crate::amd::device::*;
+use crate::error::Error;
+use svod_dtype::AmdArch;
 
 /// On hosts without `/dev/kfd` (or without a supported GPU), `open` must
 /// surface a clean `Err` — never panic.
@@ -45,13 +47,7 @@ fn aql_scratch_descriptor_gfx9_encoding() {
 #[ignore = "manual hardware probe; needs a real AMD GPU"]
 fn assign_owner_spreads_then_cotenants() {
     use std::collections::HashSet;
-    let alloc = match crate::amd::AmdAllocator::new(0) {
-        Ok(a) => a,
-        Err(_) => {
-            eprintln!("skipping: no supported AMD GPU");
-            return;
-        }
-    };
+    let Some(alloc) = super::test_support::amd_alloc_or_skip() else { return };
     let core = alloc.dev.core();
     if core.signal_pool().is_none() {
         core.install_signal_pool(crate::amd::signal::SignalPool::new(&alloc, 256).expect("signal pool"));

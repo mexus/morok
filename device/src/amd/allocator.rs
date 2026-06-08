@@ -252,7 +252,3 @@ fn do_alloc(
         device: Arc::clone(dev),
     })
 }
-
-#[cfg(test)]
-#[path = "../test/unit/amd/allocator.rs"]
-mod tests;

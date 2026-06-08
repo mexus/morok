@@ -1,4 +1,4 @@
-use super::*;
+use crate::amd::am::mm::tlsf::*;
 use proptest::prelude::*;
 use std::collections::BTreeMap;
 

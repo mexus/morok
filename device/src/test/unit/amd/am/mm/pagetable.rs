@@ -1,4 +1,4 @@
-use super::*;
+use crate::amd::am::mm::pagetable::*;
 
 const GFX11: IpVer = (11, 0, 0);
 

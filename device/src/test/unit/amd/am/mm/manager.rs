@@ -1,4 +1,6 @@
-use super::*;
+use crate::amd::am::mm::manager::*;
+use crate::amd::am::mm::pagetable::Geometry;
+use crate::amd::am::mm::{AddrSpace, PhysMem};
 use std::collections::HashMap;
 
 /// Sparse in-process VRAM for tests: unwritten reads return 0.

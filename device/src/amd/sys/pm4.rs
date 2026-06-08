@@ -424,7 +424,3 @@ pub fn dispatch_direct(grid: [u32; 3], dispatch_initiator: u32) -> [u32; 5] {
 pub fn event_write(event_type: u32, event_index: u32) -> [u32; 2] {
     [packet3(PACKET3_EVENT_WRITE, 0), (event_type & 0x3f) | ((event_index & 0xf) << 8)]
 }
-
-#[cfg(test)]
-#[path = "../../test/unit/amd/sys/pm4.rs"]
-mod tests;

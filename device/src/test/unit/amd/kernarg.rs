@@ -1,14 +1,10 @@
-use super::*;
+use super::test_support::amd_alloc_or_skip;
+use crate::amd::kernarg::*;
+use std::sync::Arc;
 
 #[test]
 fn kernarg_bump_wraps_when_full() {
-    let alloc = match AmdAllocator::new(0) {
-        Ok(a) => a,
-        Err(_) => {
-            eprintln!("skipping: no supported AMD GPU");
-            return;
-        }
-    };
+    let Some(alloc) = amd_alloc_or_skip() else { return };
     let core = Arc::clone(alloc.dev.core());
     let arena = KernargArena::new(&alloc, &core).expect("arena");
     let half = arena.size / 2;

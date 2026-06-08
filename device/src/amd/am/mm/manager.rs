@@ -74,7 +74,7 @@ struct Step {
 pub struct MemoryManager<P: PhysMem> {
     phys: P,
     ip_ver: IpVer,
-    geom: Geometry,
+    pub(crate) geom: Geometry,
     va_base: u64,
     first_lv: usize,
     va_alloc: TlsfAllocator,
@@ -174,7 +174,7 @@ impl<P: PhysMem> MemoryManager<P> {
         self.geom.pte_cnt[lv]
     }
     #[inline]
-    fn entry(&self, table_paddr: u64, idx: usize) -> u64 {
+    pub(crate) fn entry(&self, table_paddr: u64, idx: usize) -> u64 {
         self.phys.read_u64(table_paddr + (idx as u64) * 8)
     }
     #[inline]
@@ -182,13 +182,13 @@ impl<P: PhysMem> MemoryManager<P> {
         pagetable::entry_valid(self.entry(table_paddr, idx))
     }
     #[inline]
-    fn pt_child(&self, table_paddr: u64, idx: usize) -> u64 {
+    pub(crate) fn pt_child(&self, table_paddr: u64, idx: usize) -> u64 {
         // Child-table pointers are stored as MC addresses; recover the raw
         // paddr for CPU/BAR walk.
         pagetable::entry_paddr(self.entry(table_paddr, idx)) - self.mc_base
     }
     #[inline]
-    fn pt_is_page(&self, lv: usize, table_paddr: u64, idx: usize) -> bool {
+    pub(crate) fn pt_is_page(&self, lv: usize, table_paddr: u64, idx: usize) -> bool {
         lv == self.geom.level_cnt - 1 || pagetable::is_pte_huge_page(self.ip_ver, lv, self.entry(table_paddr, idx))
     }
 
@@ -313,8 +313,11 @@ impl<P: PhysMem> MemoryManager<P> {
         // stops at the first leaf, so a sub-leaf / misaligned unmap (size < a huge
         // leaf's pte_covers) yields entries == 0 — which advances nothing and spins
         // the walk forever. Fail loudly: unmap_range must cover whole leaves (it is
-        // only ever called with a full mapping's size).
-        debug_assert!(
+        // only ever called with a full mapping's size). This is `assert!`, not
+        // `debug_assert!`: in a release build the latter compiles out and the walk
+        // hangs instead of panicking — the exact failure mode this guard exists to
+        // prevent.
+        assert!(
             entries > 0,
             "page-table walk made no progress: size={:#x} pte_covers={:#x} lv={} mode={:?} \
              (unmap_range must cover whole huge-page leaves)",
@@ -390,9 +393,9 @@ impl<P: PhysMem> MemoryManager<P> {
     /// Invalidate every PTE in `[vaddr, vaddr+size)` and reclaim emptied tables.
     ///
     /// `[vaddr, vaddr+size)` must cover whole leaves: a partial unmap of a huge
-    /// (2 MiB / 1 GiB) leaf debug-asserts, since the walker cannot split a huge
-    /// page (neither does tinygrad). In practice this holds — `vfree` always
-    /// passes a full mapping's `size`.
+    /// (2 MiB / 1 GiB) leaf panics, since the walker cannot split a huge page
+    /// (neither does tinygrad). In practice this holds — `vfree` always passes a
+    /// full mapping's `size`.
     pub fn unmap_range(&mut self, vaddr: u64, size: u64) {
         let mut w = self.new_walk(vaddr, WalkMode::Free);
         w.size = size;
@@ -475,7 +478,3 @@ impl<P: PhysMem> MemoryManager<P> {
         }
     }
 }
-
-#[cfg(test)]
-#[path = "../../../test/unit/amd/am/mm/manager.rs"]
-mod tests;

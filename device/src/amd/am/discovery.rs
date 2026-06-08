@@ -187,7 +187,3 @@ fn rd32(b: &[u8], off: usize) -> Result<u32> {
 fn rd64(b: &[u8], off: usize) -> Result<u64> {
     Ok(u64::from_le_bytes(chunk(b, off, 8)?.try_into().unwrap()))
 }
-
-#[cfg(test)]
-#[path = "../../test/unit/amd/am/discovery.rs"]
-mod tests;

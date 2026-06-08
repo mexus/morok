@@ -693,7 +693,7 @@ pub(crate) fn alloc_scratch(
 
 /// Pack `COMPUTE_TMPRING_SIZE`: WAVES in bits 0..12, WAVESIZE at bit 12 with an
 /// arch-specific field width — gfx9 13b, gfx11 15b, gfx12 18b.
-fn pack_tmpring(waves: u32, wave_scratch: u32, arch: &AmdArch) -> u32 {
+pub(crate) fn pack_tmpring(waves: u32, wave_scratch: u32, arch: &AmdArch) -> u32 {
     let wavesize_mask: u32 = if arch.is_cdna() {
         0x1FFF
     } else if arch.is_rdna4() {
@@ -743,7 +743,3 @@ impl ToRawFdShim for OwnedFd {
         std::os::fd::IntoRawFd::into_raw_fd(self)
     }
 }
-
-#[cfg(test)]
-#[path = "../test/unit/amd/device.rs"]
-mod tests;
