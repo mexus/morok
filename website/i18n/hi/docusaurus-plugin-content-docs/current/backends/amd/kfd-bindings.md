@@ -18,23 +18,41 @@ KFD का ABI एक C header है, `kfd_ioctl.h`, जिसे kernel से
 `device/include/kfd_ioctl.h` में vendor किया गया है (upstream AMD फ़ाइल, अपने ABI version
 history के साथ पूरी)। उससे build time पर `bindgen` द्वारा Rust bindings जनरेट होती हैं:
 
-- `device/build.rs` `bindgen` को **केवल Linux पर** चलाता है, ठीक-ठीक उन KFD types और
-  constants को allow-list करते हुए जिनकी बैकएंड को ज़रूरत है:
+- `device/build.rs` `bindgen` को **हर Unix host पर unconditionally** चलाता है — कोई Linux
+  gate नहीं और कोई empty-stub branch नहीं। यह **hermetic** है: इसे किसी system kernel headers
+  की ज़रूरत नहीं। वे दो headers जिन्हें `kfd_ioctl.h` transitively खींचता है
+  (`_IOC`/`_IO*` macros के लिए `<linux/ioctl.h>`, `__uNN`/`__sNN` aliases के लिए
+  `<linux/types.h>`) plus एक stub `<drm/drm.h>` (vestigial — body केवल `__u32 drm_fd` fields
+  का उपयोग करता है) — ये ख़ुद `device/include/` के अंतर्गत vendored हैं, और `build.rs`
+  `-Iinclude` pass करता है ताकि bindgen इन्हें `/usr/include` के बजाय resolve करे। vendored
+  headers की ओर इस switch को byte-equivalent रूप में verify किया गया: regenerated bindings system-header
+  baseline से केवल 8 fixed-width type-alias spellings में भिन्न हैं (`__u32 = u32` बनाम
+  `c_uint`, identically sized) — सभी 60 structs और 35 constants identical हैं। (bindgen को
+  `libclang` चाहिए, जो macOS पर Xcode CLT के साथ आता है।)
+
+  यह ठीक-ठीक उन KFD types और constants को allow-list करता है जिनकी बैकएंड को ज़रूरत है:
 
   ```text
   allowlist_type:  kfd_ioctl_.*_args, kfd_event_data,
                    kfd_hsa_memory_exception_data, kfd_hsa_hw_exception_data,
                    kfd_memory_exception_failure, __u\d+, __s\d+, …
-  allowlist_var:   KFD_IOC_.*, AMDKFD_IOC_.*, KFD_MAX_QUEUE_PERCENTAGE, …
+  allowlist_var:   KFD_IOC_.*, KFD_MMAP_TYPE.*, KFD_MAX_QUEUE_PERCENTAGE,
+                   AMDKFD_IOC_.*, …
   ```
+
+  (`AMDKFD_IOC_*` request codes allow-listed हैं पर कभी materialize नहीं होते: bindgen उनके
+  `_IOWR(...)` macro expansions को const-fold नहीं कर सकता, जो ठीक वही वजह है कि ioctl
+  numbers Rust-side compute किए जाते हैं — नीचे का note देखें।)
 
   `.derive_default(true).layout_tests(false).generate_comments(false)` के साथ। output
   `$OUT_DIR/kfd_sys.rs` में लिखा जाता है।
 
-- **non-Linux** hosts पर `build.rs` इसके बजाय एक empty stub लिखता है, ताकि module हमेशा
-  compile हो (तब AMD path runtime पर `Err(NoAmdGpu)` return करता है)।
-
 - `device/src/amd/sys/kfd.rs` एक one-liner है जो जनरेट की गई फ़ाइल को `include!` करता है।
+
+bindings को हर जगह compile करना ही वह चीज़ है जो AMD बैकएंड को एक compile-time feature के
+बजाय एक [runtime-detected execution provider](./overview.md) बनाती है: हर Unix `cargo check`
+KFD call sites को type-check करता है, और बिना GPU वाला host बस कभी factory register नहीं
+करता।
 
 :::note hand-written ioctl macros क्यों
 `bindgen` argument *structs* emit करता है लेकिन `_IOWR` ioctl-number macros नहीं। वे
@@ -97,8 +115,15 @@ GPU nodes को sysfs से enumerate किया जाता है, कि
 `device/src/amd/topology.rs`
 `/sys/devices/virtual/kfd/kfd/topology/nodes/<N>/properties` पढ़ता है — प्रति line एक
 `key value` pair — और एक `Vec<AmdNode>` return करता है, CPU nodes (`gpu_id == 0`) को
-छोड़ते हुए। यह कभी panic नहीं करता: बिना `/dev/kfd` वाला host एक empty vector देता है, जिसे
-device factory एक साफ़ `Err(NoAmdGpu)` में बदल देता है।
+छोड़ते हुए। यह कभी panic नहीं करता: बिना `/dev/kfd` वाला host एक empty vector देता है।
+
+यही enumeration वह चीज़ है जो runtime पर पूरे बैकएंड को gate करती है।
+`topology::has_devices()` — "कोई भी ऐसा node जिसका `gfx_target_version` एक supported
+`AmdArch` में resolve होता है" — वह side-effect-free probe है जिसे runtime यह तय करने के लिए
+call करता है कि `"AMD"` device factory को register करना है या नहीं
+([provider model](./overview.md))। कोई supported node नहीं ⇒ कोई `"AMD"` device type नहीं;
+और यदि किसी ऐसे node के लिए factory माँगी जाए जो वहाँ नहीं है, तो वह एक स्पष्ट `Err(NoAmdGpu)`
+return करती है।
 
 हर `AmdNode` वे fields रखता है जिनकी बाक़ी बैकएंड को ज़रूरत होती है:
 `gpu_id`, `drm_render_minor`, `gfx_target_version` (जैसे `110000` → gfx1100),
@@ -108,7 +133,7 @@ feed करते हैं।
 
 :::tip बिना hardware के testing
 sysfs root को **`SVOD_KFD_TOPOLOGY`** से override किया जा सकता है, इसलिए parser को बिना
-किसी GPU की मौजूदगी के एक fabricated nodes directory के विरुद्ध unit-test किया जाता है।
+किसी GPU की मौजूदगी के एक fabricated nodes directory का उपयोग करके unit-test किया जाता है।
 :::
 
 ---
@@ -144,14 +169,18 @@ compose होते हैं:
 रहता है जो GPU L2 में अटका रह जाता है। KFD एक plain-VRAM ring पर `CREATE_QUEUE` को `EINVAL`
 के साथ reject कर देता है।
 
-### हर जगह host-visible
+### `cpu_access` copy queue का अनुसरण करता है
 
-चूँकि कोई SDMA queue नहीं है, allocator (`device/src/amd/allocator.rs`) हर buffer पर
-`cpu_access = true` force करता है: `has_sdma_queue()` हमेशा `false` होता है, इसलिए `_alloc`
-इसे OR कर देता है। इसलिए copies (`_copyin`/`_copyout`/`_transfer`) एक `synchronize()` के बाद
-सादे host `memmove` होती हैं। generic `LruAllocator` (`device/src/allocator.rs`) freed
-buffers को `(size, BufferSpec)` के अनुसार pool करता है; `nolru` spec code objects, scratch,
-और queue infrastructure के लिए pool को bypass करता है।
+allocator (`device/src/amd/allocator.rs`)
+`cpu_access = options.cpu_access || !self.dev.has_sdma_queue()` compute करता है। जब एक SDMA
+copy queue install होती है (default — देखें [अवलोकन](./overview.md)), एक intermediate
+**device-only** VRAM हो सकता है और copies DMA के माध्यम से जाती हैं: `_copyin`/`_copyout`
+copy queue के माध्यम से stage होती हैं, `_transfer` एक direct device→device copy है। जब कोई
+copy queue मौजूद न हो, `has_sdma_queue()` `false` होता है, इसलिए हर buffer को ज़बरन
+host-visible बना दिया जाता है और copies एक `synchronize()` के बाद एक सादे host `memmove` पर वापस आ जाती
+हैं। generic `LruAllocator` (`device/src/allocator.rs`) freed buffers को `(size,
+BufferSpec)` के अनुसार pool करता है; `nolru` spec code objects, scratch, और queue
+infrastructure के लिए pool को bypass करता है।
 
 :::note Process-shared state
 `/dev/kfd` प्रति process एक बार खोला जाता है और सभी devices द्वारा साझा होता है (events को

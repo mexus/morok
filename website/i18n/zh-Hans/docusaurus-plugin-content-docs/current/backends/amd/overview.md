@@ -20,6 +20,24 @@ Svod 通过直接与内核驱动对话在 AMD GPU 上运行。这里没有 HIP�
 
 ---
 
+## 一个运行时检测的执行提供者
+
+AMD 后端**始终编译**（在每一台 Unix 宿主上——`cfg(unix)`，因为
+`nix` 是仅 Unix 的），绝不藏在某个 cargo feature 之后。可用性是
+**在运行时而非编译时**决定的，采取 ORT 风格：设备注册表用
+`svod_device::amd::has_devices()` 探测硬件——一次仅 sysfs、无副作用的
+KFD 拓扑读取——并*仅在*存在受支持的 GPU 时才注册 `"AMD"` 设备工厂。
+一台没有 `/dev/kfd` 的宿主自然就没有 `"AMD"` 设备类型。
+
+要点在于健壮性：因为后端处于每一次构建的类型检查中，通用 core
+中的一次 API 改动（比如某个 `Program` 或 `PlanContext` trait）会在
+每一台开发机上于 `cargo check` 时被捕获，而不只是在 GPU 宿主上。代价
+是编译时间，我们接受这一点。相应地，bindgen 步骤是**封闭自洽的**——
+它在所有平台上针对 vendored 头文件运行，不需要系统内核头文件
+（见 [KFD 绑定](./kfd-bindings.md)）。
+
+---
+
 ## 为什么用 KFD 直连而非 HIP
 
 一个"正常人"在编写 AMD 后端时会去用 HIP（类 CUDA 的运行时）
@@ -96,20 +114,26 @@ KFD 环调度出去。
 
 :::caution AM 尚不可运行
 设置 `SVOD_AMD_BACKEND=am` 目前会返回错误（`device.rs` 只接受
-`kfd`）。用户态 **AM** 驱动仍在开发中：纯逻辑
-部分（分配器、页表、寄存器表）已实现并测试，但
-特权硬件启动尚未完成。关于当下确切存在哪些东西，见 [AM 驱动](./am-driver.md)。
+`kfd`）——尚无 AM 类型实现接缝。用户态 **AM** 驱动的目标是
+**MI300X SR-IOV VF**（gfx9.4.3 / CDNA3），仍在开发中：
+discovery、VF↔GIM mailbox、间接寄存器访问、GMMU 与 GMC
+启动均已实现并**在活动的 VF 上验证**，但尚无 GPU 引擎
+消费工作（doorbell aperture 由宿主拥有）。关于当下确切存在什么、
+边界又在何处，见 [AM 驱动](./am-driver.md)。
 :::
 
 ---
 
-## 所有缓冲区都是宿主可见的
+## 设备本地内存与 SDMA 复制队列
 
-如今后端**没有 SDMA 复制队列**。每个 AMD 缓冲区都被分配为
-宿主可见（CPU 可映射的 VRAM 或 GTT），而宿主↔设备的复制在设备
-`synchronize()` 之后只是普通的 `memmove`。SDMA 的 `AmdCopyQueue` 存在于
-源码中但属于死代码，保留以备将来复活。这大大简化了内存
-模型——没有暂存缓冲区，也没有需要与调度排序的异步 DMA。分配与复制在
+后端在设备打开时——只要能够创建——就会安装一个 **SDMA 复制队列**
+（`AmdCopyQueue`），这会把 `has_sdma_queue` 置为 true。有了它，中间结果就可以
+存在于**仅设备的 VRAM** 中（`cpu_access = false`），而宿主↔设备的复制
+走异步 DMA：`_copyin`/`_copyout` 经由 SDMA 队列暂存，
+`_transfer` 做一次直接的 设备→设备 复制。当没有复制队列存在时，
+分配器回落到更简单的模型——每个缓冲区都被强制为宿主可见
+（CPU 可映射的 VRAM 或 GTT），而复制是一次 `synchronize()` 之后的
+普通 `memmove`。分配与复制在
 [KFD 绑定](./kfd-bindings.md) 中介绍。
 
 ---

@@ -20,6 +20,23 @@ citation रखता है ताकि design को उसके reference �
 
 ---
 
+## एक runtime-detected execution provider
+
+AMD बैकएंड **हमेशा compile होता है** (हर Unix host पर — `cfg(unix)`, चूँकि `nix` केवल Unix
+है), कभी किसी cargo feature के पीछे gated नहीं। उपलब्धता **runtime पर तय होती है, compile
+time पर नहीं**, ORT-शैली में: device registry `svod_device::amd::has_devices()` से hardware
+को probe करती है — KFD topology का एक sysfs-only, side-effect-free read — और `"AMD"` device
+factory को *केवल* तब register करती है जब एक supported GPU मौजूद हो। बिना `/dev/kfd` वाले host
+पर स्वाभाविक रूप से कोई `"AMD"` device type नहीं होता।
+
+मुद्दा robustness है: चूँकि बैकएंड हर build के type-check में है, generic core में एक API
+change (मान लें एक `Program` या `PlanContext` trait) हर dev box पर `cargo check` पर पकड़ा
+जाता है, केवल GPU host पर नहीं। लागत compile time है, जिसे स्वीकार किया जाता है। bindgen step
+तदनुसार **hermetic** है — यह सभी platforms पर vendored headers पर चलता है, बिना किसी
+system kernel headers की ज़रूरत के (देखें [KFD Bindings](./kfd-bindings.md))।
+
+---
+
 ## HIP के बजाय KFD-direct क्यों
 
 AMD बैकएंड लिखने वाला कोई "समझदार व्यक्ति" HIP (CUDA जैसा runtime) या उसके नीचे के HSA
@@ -93,22 +110,26 @@ Implementor को device-open समय पर `SVOD_AMD_BACKEND` environment v
 
 :::caution AM अभी चलने योग्य नहीं है
 `SVOD_AMD_BACKEND=am` सेट करना फ़िलहाल एक error देता है (`device.rs` केवल `kfd` स्वीकार
-करता है)। userspace **AM** driver एक work in progress है: pure-logic टुकड़े (allocator,
-page tables, register tables) implement और test किए जा चुके हैं, लेकिन privileged hardware
-bring-up नहीं हुआ है। आज ठीक-ठीक क्या मौजूद है इसके लिए [AM Driver](./am-driver.md) देखें।
+करता है) — अभी तक कोई AM type seam को implement नहीं करता। userspace **AM** driver का target
+है **MI300X SR-IOV VF** (gfx9.4.3 / CDNA3) और यह एक work in progress है: discovery, VF↔GIM
+mailbox, indirect register access, GMMU, और GMC bring-up implement किए जा चुके हैं और **live
+VF पर validated** हैं, लेकिन अभी तक कोई GPU engine work consume नहीं करता (doorbell aperture
+host-owned है)। आज ठीक-ठीक क्या मौजूद है और boundary कहाँ है इसके लिए
+[AM Driver](./am-driver.md) देखें।
 :::
 
 ---
 
-## सभी buffers host-visible हैं
+## Device-local memory और SDMA copy queue
 
-आज बैकएंड के पास **कोई SDMA copy queue नहीं** है। हर AMD buffer host-visible
-(CPU-mappable VRAM या GTT) allocate होता है, और host↔device copies एक device
-`synchronize()` के बाद सादे `memmove` होती हैं। SDMA `AmdCopyQueue` source में मौजूद है
-लेकिन dead code है, किसी भविष्य के पुनरुद्धार के लिए रखा गया है। यह memory model को काफ़ी
-सरल बनाता है — कोई staging buffers नहीं और dispatch के विरुद्ध order करने के लिए कोई
-asynchronous DMA नहीं। Allocation और copies को [KFD Bindings](./kfd-bindings.md) में कवर
-किया गया है।
+बैकएंड device-open पर एक **SDMA copy queue** (`AmdCopyQueue`) install करता है जब एक बनाई जा
+सकती हो, जो `has_sdma_queue` को true कर देता है। इसके साथ, intermediates **device-only VRAM**
+(`cpu_access = false`) में रह सकते हैं और host↔device copies asynchronous DMA के माध्यम से
+जाती हैं: `_copyin`/`_copyout` SDMA queue के माध्यम से stage होती हैं, `_transfer` एक direct
+device→device copy करता है। जब कोई copy queue मौजूद न हो तो allocator सरल model पर वापस आ जाता
+है — हर buffer को ज़बरन host-visible (CPU-mappable VRAM या GTT) बना दिया जाता है और copies एक
+`synchronize()` के बाद सादे `memmove` होती हैं। Allocation और copies को
+[KFD Bindings](./kfd-bindings.md) में कवर किया गया है।
 
 ---
 

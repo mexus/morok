@@ -17,23 +17,42 @@ KFD 的 ABI 是一个 C 头文件 `kfd_ioctl.h`，从内核原样 vendored 进
 `device/include/kfd_ioctl.h`（即上游 AMD 文件，连同其完整的 ABI
 版本历史）。Rust 绑定由 `bindgen` 在构建时从它生成：
 
-- `device/build.rs` **仅在 Linux 上**运行 `bindgen`，精确地 allow-list
-  后端所需的 KFD 类型与常量：
+- `device/build.rs` **在每一台 Unix 宿主上无条件**运行 `bindgen`——
+  没有 Linux 门控，也没有空桩分支。它是**封闭自洽的**：它不需要
+  任何系统内核头文件。`kfd_ioctl.h` 传递性拉入的两个头文件
+  （`<linux/ioctl.h>` 提供 `_IOC`/`_IO*` 宏，`<linux/types.h>` 提供
+  `__uNN`/`__sNN` 别名）再加一个桩 `<drm/drm.h>`（残留——主体只用到
+  `__u32 drm_fd` 字段）本身都被 vendored 在 `device/include/` 之下，
+  而 `build.rs` 传入 `-Iinclude`，使 bindgen 解析它们而非
+  `/usr/include`。切换到 vendored 头文件经验证为逐字节等价：
+  重新生成的绑定与系统头文件基线的差异仅在于 8 处定宽
+  类型别名的拼写（`__u32 = u32` 对 `c_uint`，尺寸相同）——全部
+  60 个结构体和 35 个常量都相同。（bindgen 需要 `libclang`，
+  在 macOS 上它随 Xcode CLT 一同发布。）
+
+  它用 allow-list 精确圈定后端所需的 KFD 类型与常量：
 
   ```text
   allowlist_type:  kfd_ioctl_.*_args, kfd_event_data,
                    kfd_hsa_memory_exception_data, kfd_hsa_hw_exception_data,
                    kfd_memory_exception_failure, __u\d+, __s\d+, …
-  allowlist_var:   KFD_IOC_.*, AMDKFD_IOC_.*, KFD_MAX_QUEUE_PERCENTAGE, …
+  allowlist_var:   KFD_IOC_.*, KFD_MMAP_TYPE.*, KFD_MAX_QUEUE_PERCENTAGE,
+                   AMDKFD_IOC_.*, …
   ```
+
+  （`AMDKFD_IOC_*` 请求码虽已列入 allow-list 却从不实体化：
+  bindgen 无法常量折叠它们的 `_IOWR(...)` 宏展开，这正是
+  ioctl 号在 Rust 一侧计算的原因——见下面的注记。）
 
   并带有 `.derive_default(true).layout_tests(false).generate_comments(false)`。
   输出被写入 `$OUT_DIR/kfd_sys.rs`。
 
-- 在**非 Linux** 宿主上，`build.rs` 改为写入一个空桩，使该模块
-  始终能编译（届时 AMD 路径在运行时返回 `Err(NoAmdGpu)`）。
-
 - `device/src/amd/sys/kfd.rs` 是一行 `include!` 生成文件的代码。
+
+在每个平台上都编译这些绑定，正是使 AMD 后端成为一个
+[运行时检测的执行提供者](./overview.md) 而非编译期 feature 的原因：
+每一次 Unix 上的 `cargo check` 都对 KFD 调用点做类型检查，而一台
+没有 GPU 的宿主则根本不会注册那个工厂。
 
 :::note 为什么手写 ioctl 宏
 `bindgen` 发出参数*结构体*但不发出 `_IOWR` ioctl 号宏。
@@ -97,7 +116,15 @@ GPU 节点是从 sysfs 枚举的，而不是通过 ioctl。
 `/sys/devices/virtual/kfd/kfd/topology/nodes/<N>/properties`——每行一个
 `key value` 对——并返回一个 `Vec<AmdNode>`，跳过 CPU 节点
 （`gpu_id == 0`）。它从不 panic：没有 `/dev/kfd` 的宿主会产生一个空
-向量，设备工厂将其转化为干净的 `Err(NoAmdGpu)`。
+向量。
+
+正是这同一套枚举在运行时门控了整个后端。
+`topology::has_devices()`——「任何 `gfx_target_version` 能解析为
+受支持的 `AmdArch` 的节点」——就是运行时调用、用于决定是否
+压根注册 `"AMD"` 设备工厂的那个无副作用探测（即
+[提供者模型](./overview.md)）。没有受支持的节点 ⇒ 没有 `"AMD"` 设备类型；
+而如果向工厂请求一个并不存在的节点，它会返回一个明确的
+`Err(NoAmdGpu)`。
 
 每个 `AmdNode` 携带后端其余部分所需的字段：
 `gpu_id`、`drm_render_minor`、`gfx_target_version`（如 `110000` → gfx1100）、
@@ -143,13 +170,16 @@ sysfs 根目录可用 **`SVOD_KFD_TOPOLOGY`** 覆盖，因此解析器可针对�
 等待一个卡在 GPU L2 中的完成值。KFD 会以 `EINVAL`
 拒绝对一个纯 VRAM 环执行 `CREATE_QUEUE`。
 
-### 处处宿主可见
+### `cpu_access` 跟随复制队列
 
-由于没有 SDMA 队列，分配器（`device/src/amd/allocator.rs`）
-对每个缓冲区强制 `cpu_access = true`：`has_sdma_queue()` 始终为
-`false`，因此 `_alloc` 会把它 OR 进去。于是复制（`_copyin`/`_copyout`/`_transfer`）
-就是在一次 `synchronize()` 之后的普通宿主 `memmove`。通用的
-`LruAllocator`（`device/src/allocator.rs`）按
+分配器（`device/src/amd/allocator.rs`）计算
+`cpu_access = options.cpu_access || !self.dev.has_sdma_queue()`。当安装了一个
+SDMA 复制队列时（即默认情形——见 [概览](./overview.md)），一个中间结果
+可以是**仅设备的** VRAM，而复制走 DMA：`_copyin`/`_copyout` 经由复制
+队列暂存，`_transfer` 是一次直接的 设备→设备 复制。当没有复制
+队列存在时，`has_sdma_queue()` 为 `false`，因此每个缓冲区都被强制为
+宿主可见，而复制回落到一次 `synchronize()` 之后的普通宿主 `memmove`。
+通用的 `LruAllocator`（`device/src/allocator.rs`）按
 `(size, BufferSpec)` 池化已释放的缓冲区；`nolru` spec 对 code object、
 scratch 和队列基础设施绕过该池。
 

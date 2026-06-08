@@ -15,57 +15,82 @@ GPU——页表、固件、调度——内核就永不处于调度路径中，
 :::caution 开发中——尚不可选
 本页同时记录当下存在什么，以及其余部分的路线图。
 **`SVOD_AMD_BACKEND=am` 目前会返回错误**（`device.rs` 只接受
-`kfd`）。已实现的是不需特权、不需 GPU 的*逻辑*；
-特权硬件启动被推迟。下面各节明确标注每个部件的
-状态。
+`kfd`）：尚无 AM 类型实现 [`AmdIface`](./overview.md) 接缝，因此
+今天能够触及的启动只能通过 `am_*` 示例驱动，而非通过
+`AmdDevice`。已存在的部分验证**到引擎交接为止**；尚无 GPU 引擎
+被确认在目标上消费工作（见 [VF 边界](#the-vf-boundary)）。下面各节
+明确标注每个部件的状态。
 :::
 
-代码位于 `device/src/amd/am/` 之下。它在 Linux 上无条件编译
-（纯逻辑，无额外依赖），因此始终被类型检查、lint
-和单元测试——后端在*运行时*选择，绝不藏在一个
-可能腐烂的 cargo feature 之后。
+代码位于 `device/src/amd/am/` 之下。它在**每一台 Unix 宿主上**编译
+（`cfg(unix)`，与后端其余部分一样——见 [运行时检测的提供者
+模型](./overview.md)），因此始终被类型检查、lint 和单元测试——
+后端在*运行时*选择，绝不藏在一个可能腐烂的 cargo feature 之后。
 
 ---
 
-## 内核曾为我们做的事
+## 目标硬件：MI300X SR-IOV VF
 
-KFD 给了后端三样东西。AM 必须各自自己提供：
+该驱动的目标是 **AMD Instinct MI300X**——**gfx9.4.3 / CDNA3**，SPX 模式下的
+8 个 XCC——并且特指其 **SR-IOV 虚拟功能（Virtual Function，VF）**形态
+（该 GPU 是一个被透传进 KVM 客户机的 VF）。`AmDev::open` 会直接拒绝
+其他一切：非 VF 的功能，或 major.minor 不是 `(9, 4)` 的 GC 版本，
+都会快速失败（`device/src/amd/am/dev.rs`）。早先的 gfx1151「Strix Halo」APU
+如今只剩下一份 vendored 寄存器表和一个残留的单元测试；它
+不再是目标。
 
-| KFD 提供 | AM 必须做 |
-|---|---|
-| VRAM 分配 + GPU 页表映射 | 一个 GMMU：VA 分配器 + 4 级页表 walker + PTE 编码 |
-| 队列创建（MES/HQD 设置） | 写 MQD、使能 MEC、映射 doorbell |
-| 内存 + 固件启动 | PCI BAR 映射、IP discovery、PSP 固件加载 |
+**VF**（而非裸金属）这一身份是决定性的约束，它决定了
+整个驱动的形态：
 
-关键在于，接缝*之上*的一切——PM4/AQL 数据包构建器、
-环、信号、kernarg arena、timeline 和反压——都**原封不动**
-沿用过来。AM 只替换那五个 `AmdIface` 方法。
+- **GC MMIO 是宿主门控的。** 每一次对 GC 寄存器的*直接*读取都返回
+  `0xffffffff`。所有 GC / GCVM 寄存器访问都必须**经由 RLC 间接进行**
+  （RLCG 路径）——把值暂存进 RLC scratch，触发 `RLC_SPARE_INT`，
+  轮询完成。
+- **VRAM/discovery 在被授予前是门控的。** 帧缓冲区（以及由此而来的
+  IP-discovery 表）在宿主 **GIM**（SR-IOV 宿主驱动）通过一次
+  **mailbox 握手**授予访问权之前都不可读，因此该握手会运行在
+  discovery *之前*。
+- **宿主 PF 拥有那些特权子系统：** PSP、SMU、时钟、固件 /
+  world-switch、L2 缓存配置、系统 aperture，以及——关键地——
+  **doorbell aperture 路由**。AM 只编程客户机被允许触碰的那些每 VF 状态
+  （页表 context0、每引擎失效范围、TLB 刷新、ring/queue MQD），
+  这恰如内核的 `*_v*` IP 代码在 `amdgpu_sriov_vf` 下跳过这些块一样。
+
+这与 tinygrad 的 AM 相反，后者是**仅裸金属**的（它 unbind
+`amdgpu` 并拥有整张设备）。VF 形态是一个不同的驱动：mailbox
++ RLCG 间接寄存器访问 + 仅每 VF 的 hub 编程。
 
 ---
 
-## 当下存在什么（已构建并测试）
+## 当下存在什么
 
-纯逻辑那一半已实现并在无 GPU 的情况下单元测试，页表由一个
-可注入的 `PhysMem` trait 后备（测试中是一个普通缓冲区，
+凡是纯逻辑之处，一切都**在没有 GPU 的情况下编译并单元测试**；
+面向硬件的部分还额外通过 `device/examples/am_*.rs` 程序在活动的 VF 上
+验证。页表以一个可注入的 `PhysMem` trait 作为后备存储（测试中是一个普通缓冲区，
 真实驱动中是 BAR 映射的 VRAM）。
 
-| 模块 | 它实现什么 | 状态 |
-|---|---|---|
-| `am/mm/tlsf.rs` | TLSF（Two-Level Segregated Fit）分配器——tinygrad 的 `TLSFAllocator` 的移植 | **完成** + 单元测试 + 一个 proptest |
-| `am/mm/pagetable.rs` | GMMU 几何 + PTE/PDE 位编码 | **gfx11 完成** + 测试 |
-| `am/mm/manager.rs` | `MemoryManager`：VA 分配、4 级页表遍历、大页选择、表回收、`valloc`/`vfree` | **完成** + 针对伪造 VRAM 的测试 |
-| `am/regs.rs` | `RegDef`/`RegField` 类型 + `select(prefix, ip_ver)` 解析器 | **完成** + 测试 |
-| `am/regs_gen.rs` | Vendored 寄存器表（`GC_11_5_0`、`MMHUB_3_3_0`、`MP_14_0_2`、…） | **已生成并提交** |
+| 分组 | 模块 | 它实现什么 | 状态 |
+|---|---|---|---|
+| **Discovery** | `pci.rs`, `discovery.rs` | sysfs BAR mmap（BAR0 VRAM / BAR2 doorbell / BAR5 MMIO）、配置空间读写、带边界检查的 IP-discovery 解析器（每 XCC 段基址，`gc_info` v1/v2） | **HW 验证** + 单元测试 |
+| **寄存器访问** | `regaccess.rs`, `rlcg.rs`, `mailbox.rs`, `regs.rs`, `regs_gen.rs` | mxgpu VF↔GIM mailbox 握手、RLCG 间接 GC/GCVM 读写（每 XCC）、MMIO/RLCG 路由器、vendored 寄存器表 | **HW 验证** + 单元测试 |
+| **内存（GMMU）** | `mm/{tlsf,pagetable,manager,mod}.rs` | TLSF VA/PA/页表分配器、4 级/48 位遍历、gfx9 **与** gfx11 的 PTE/PDE 编码、大页选择、表回收、`valloc`/`vfree` | **完成** + 测试（PTE 写路径已硬件演练） |
+| **GMC 启动** | `ip/gmc.rs` | 编程两个 hub 的 context0（start/end/base + CNTL）、MX_L1_TLB 使能、每引擎失效范围、ENG17 TLB 刷新、HDP 刷新、故障状态解码 | **HW 验证**到 context 编程级别 |
+| **GFX 启动** | `ip/gfx.rs` | 使能 MEC（icache 失效、golden `GB_ADDR_CONFIG`、doorbell 范围、unhalt）、构建一个 v9 compute MQD、激活 HQD（`CP_HQD_ACTIVE=1`）、`WRITE_DATA` PM4 | **MEC HQD 激活**；队列尚不运行 |
+| **SDMA 启动** | `ip/sdma.rs` | unhalt F32、编程 RB base/rptr/wptr + doorbell、提交 + `wait_idle` | **ring 已编程**；引擎尚不消费 |
+| **编排器** | `dev.rs` | `AmDev::open` = mailbox → discovery → GMMU → GMC context0 → flush；`valloc`、`vram_read/write`、`release` | **HW 验证**至 GMC |
 
-### GMMU
+### GMMU 与 gfx9
 
 页表几何是 **4 级 / 48 位**（`va_shifts = [12, 21, 30, 39]`），
-一种**跨 gfx9/11/12 共享**的形状——因此几何本身不针对 arch 分支。
-只有叶 PTE 编码（尤其是 MTYPE 内存类型字段）才是
-arch 特定的。`MemoryManager` 运行三个 TLSF 子分配器（VA 空间、
-物理 VRAM、页表池），并以 `Inspect` / `Create` /
-`Free` 模式遍历表，在对齐允许处选择大页，并在 unmap 时回收空
-表。
+一种**跨 gfx9/11/12 共享**的形状——因此几何本身不随 arch 分支。
+只有叶 PTE 编码（尤其是 MTYPE 内存类型字段）才是 arch 特定的，而
+**gfx9（CDNA/MI300X）与 gfx11（RDNA3）现已实现并单元测试**——
+gfx9 叶标志把 MTYPE 放在第 57–58 位、置 PDB1 `bfs`、置 PDB0 的
+translate-further 位，以及更高叶上的 `PDE_PTE` 位。**gfx12 是唯一
+剩下的 `unimplemented!`**（常量已捕获，尚未经过硬件验证；
+有一个测试断言它 panic）。`MemoryManager` 运行三个 TLSF 子分配器
+（VA 空间、物理 VRAM、页表池），并以 `Inspect` / `Create` /
+`Free` 模式遍历表，在 unmap 时回收空表。
 
 ### 寄存器表是生成一次，然后 vendored
 
@@ -74,72 +99,85 @@ tinygrad 是一个有时缺席的子模块，因此构建绝不能依赖它。
 被**手动**运行：它解析 tinygrad 的 `autogen/am/regs.py` 并发出已提交的
 `am/regs_gen.rs`。`regs.rs` 只是 `include!` 它。在启动时，正确的表由
 发现到的 `ip_ver` 选定（`select` 挑选共享同一 major 的最大版本 `≤ ip_ver`
-——tinygrad 的 `import_module` 规则）。添加一个 arch 就是
-拓宽生成器的模块列表并重新运行它——没有构建或运行时
-逻辑改动。
+——tinygrad 的 `import_module` 规则）。已提交的表如今同时覆盖
+gfx9.4.3/CDNA3 集（`gc 9.4.3`、`mmhub 1.8.0`、`osssys 4.4.2`、
+`sdma 4.4.2`、`nbio 7.9.0`、`hdp 4.4.2`、`mp 11.0.0`/`13.0.0`）与 gfx11.5.0
+集。添加一个 arch 就是拓宽生成器的模块列表并重新运行它——没有
+构建或运行时逻辑改动。
 
 ---
 
-## 推迟了什么（尚不在代码树中）
+## VF 边界 {#the-vf-boundary}
 
-特权启动需要 root/caps（unbind `amdgpu`、`mmap` PCI BAR、
-mode-1 reset），尚未出现在源码中：
+这就是当前启动止步的那道墙。客户机能**编程**引擎，
+但无法**驱动**它们，因为把 ring 写指针送达命令处理器的那个
+doorbell aperture 归 **PF 所有**。从 VF 启用它（写那些 `_PF`
+BIF doorbell-access 寄存器）会卡住 VF↔GIM mailbox，并需要一次完整的
+VM 重启——因此 `enable_doorbell_aperture` 在 `ip/gfx.rs` 中存在，
+但被明确标注为**在 VF 上不可调用**。
 
-- **AMDev 编排器**（BAR 映射、boot 序列）；
-- **PCI/BAR** 访问与 **IP discovery** 解析；
-- **PSP 固件加载**（风险最高的子系统——一次版本特定的
-  握手）；
-- **IP-block** 模块（SOC / GMC / IH / PSP / SMU / GFX / SDMA）；
-- 把这一切系到接缝上的 **`AmIface`** 实现者。
+具体后果，二者都由示例复现：
 
-在*已实现*的页表模块内，只有 **gfx11/RDNA3** 是活跃的：
-gfx9（VG10）和 gfx12 的 PTE 编码路径是刻意的 `unimplemented!` panic，
-各由一个断言其 panic 的测试守护——常量已捕获但
-尚未经过硬件验证。
+- **MEC compute 队列激活但不执行**（`am_compute`）：HQD
+  报告 `CP_HQD_ACTIVE = 1`，但 `WRITE_DATA` 数据包始终没有把它的哨兵值
+  写入 VRAM——CP 从未看到 doorbell。
+- **SDMA ring 已编程但不消费**（`am_sdma`）：读指针保持
+  卡住；MM-hub 页表遍历故障仍被门控。
+
+所以今天的 AM **HW 验证到引擎交接为止**——discovery、所有权、
+GMMU 和 GMC 都已在活动的 VF 上得到证实——而 KFD 仍是那个可工作的 VF
+后端。跨越这条边界正是其余里程碑的主题。
 
 ---
 
-## 目标硬件与 arch 参数化
+## 今天什么在硬件上运行
 
-寄存器与页表的目标是 **gfx1151——「Strix Halo」APU**（它
-报告 GC 11.5.1 → `gc_11_5_0` 表）。该驱动按 tinygrad 的方式参数化：
-通过 **启动时从 IP discovery 读取的 `ip_ver` 元组**，而非一个
-手工维护的 arch 枚举。arch 差异本应是共享模块内部小而内联的
-`if ip_ver >= (X, Y, Z)` 分支，加上版本键控的
-寄存器表——这样 gfx12 大致就成了一次数据添加，而 gfx9 虽已
-纳入考虑但被推迟。
+每个 `am_*` 示例都是一个独立的启动检验器，在活动的 VF 上运行：
 
-:::note 为什么在这台机器上推迟启动
-实际硬件是一块 Strix Halo APU，它同时也是**主显示 GPU**。
-AM 必须 unbind `amdgpu` 并取得独占所有权，这会让显示熄灭；
-而 tinygrad 的 AM 白名单的是独立 RDNA3/4 的设备 ID，不是这块 APU。所以在
-这台机器上没有可对照验证的可工作 AM 参照物。特权
-启动（下面的各阶段）被推迟到一块外置/独立 GPU 上，在那里 tinygrad
-AM 是一个经过验证的参考。与此同时，[单队列 KFD 模式](./queues-and-dispatch.md)
-已经修复了催生 AM 的那次内核崩溃，因此在此期间没有什么被阻塞。
-:::
+| 示例 | 它证明了什么 | 状态 |
+|---|---|---|
+| `am_discovery` | BAR map + IP discovery（8× GC 9.4.3、SDMA、AID），只读——与一个已绑定的 `amdgpu` 共存 | **可工作** |
+| `am_own` | mailbox 授予 + RLCG scratch 回声 + 全部 8 个 XCC 上非门控的 `GRBM_STATUS` | **可工作** |
+| `am_gmc` | GC + MM context0 已编程；全部 8 个 XCC 上 ENG17 TLB 刷新 ACK；无保护故障被锁存 | **可工作** |
+| `am_sdma` | SDMA ring 设置 + 提交 | ring 已编程，**引擎不消费** |
+| `am_compute` | MEC 使能 + MQD 激活 + `WRITE_DATA` | **HQD 激活**，队列不执行 |
+
+---
+
+## 还推迟了什么
+
+那些特权、PF 拥有的子系统**不在代码树中**——在 VF 上它们
+由 GIM 拥有，客户机无事可做；在裸金属上它们则是最后、风险最高的
+移植：
+
+- **PSP 固件加载**——sOS bootloader 握手 / TMR / 每 IP 固件
+  加载。在 VF 上由 GIM 拥有。
+- **SMU / 时钟**——电源与时钟管理。在 VF 上由 GIM 拥有。
+- **中断处理器（IH）**——不存在 `ip/ih.rs`；OSSSYS 寄存器表
+  已 vendored 但未使用。启动改为轮询，而非接收中断。
+- **`AmIface` 接缝实现者**——尚无 AM 类型实现
+  [`AmdIface`](./overview.md)，因此 AM 无法被选为设备后端；
+  `AmDev` 仅可通过示例触及。
 
 ---
 
 ## 路线图
 
-每个阶段都可独立测试，在同一张卡上用 tinygrad AM 作为
-每阶段的参照物：
+工作被分阶段为里程碑，每个都可在活动的 VF 上独立测试
+（并且，对于那些 PF 拥有的块，以裸金属 tinygrad AM 作为检验器）：
 
-| 阶段 | 里程碑 |
-|---|---|
-| **A** | PCI + discovery（只读）：unbind `amdgpu`、映射 BAR、解析 IP discovery、把每个值与 tinygrad 比对 |
-| **B** | regs + GMC 页表：`valloc` + 映射一个缓冲区、读回 PTE、让数据经由 BAR 往返 |
-| **C** | PSP 固件加载（风险关卡）：sOS bootloader 握手、TMR、每 IP 的固件加载——与一份 tinygrad 抄本逐 dword 比对 |
-| **D** | GFX MEC + `setup_ring`：写 v11 compute MQD、使能 MEC、映射 doorbell（`CP_HQD_ACTIVE == 1`） |
-| **E** | 调度一个内核：在 AM 后备的 core 上复用整个现有的上半部 |
-| **F** | 并发 + 去桩：真实中断处理器、最高时钟、跑那个让 KFD 崩溃的工作负载——它现在不会崩溃，因为内核被绕过了 |
+| 里程碑 | 范围 | 状态 |
+|---|---|---|
+| **M0** | gfx9 寄存器 + 页表表；只读 PCI/discovery；`am_discovery` HW 测试 | **完成** |
+| **M1** | mailbox 握手 + RLCG + GMC context0（`am_own`、`am_gmc`） | **完成** |
+| **M2** | SDMA ring 驱动引擎——解决 MM-hub 遍历故障 / 卡住的 rptr | **进行中** |
+| **M3** | 一个 XCC 上的单个 MEC 队列执行对一个已映射 VA 的 `WRITE_DATA`，随后是完整的每 XCC MQD/AQL | **进行中** |
+| **M4** | `AmIface` 实现者 + 在 AM core 上端到端跑 GigaAM | **待办** |
+| **M5** | 裸金属 PSP / SMU / 固件移植（在 VF 上无法测试） | **待办** |
 
-一旦阶段 F 能干净地跑那个诱发崩溃的并发，AM 就成为
-多队列/流式工作负载的推荐模式，而 KFD（单队列）
-仍作为可移植的回退。gfx12/RDNA4 随后就是一次廉价的后续工作（拓宽
-寄存器表 + 添加 `gc >= (12,0,0)` 分支）；gfx9/CDNA 则是一项更大、
-更晚的工程。
+一旦某个引擎消费工作（M2/M3）且接缝接好（M4），AM 便可
+经由 `SVOD_AMD_BACKEND=am` 选择，并原封不动地运行整个现有的上半部。
+催生 AM 的那种诱发崩溃的并发那时就无法崩溃了——内核被绕过了。
 
 ---
 
@@ -147,8 +185,9 @@ AM 是一个经过验证的参考。与此同时，[单队列 KFD 模式](./queu
 
 AM 驱动是对那个内核过载问题的真正答案，而
 [单队列模式](./queues-and-dispatch.md) 只是绕开了它。那些昂贵、
-不需 GPU 的部分——GMMU 和寄存器表——已经构建并测试，
-因此剩下的工作就是特权启动，它被卡在硬件上而非
-卡在设计上。而且因为它接在同样的五方法
+不需 GPU 的部分——GMMU、寄存器表、mailbox/RLCG 间接访问
+机制——已经在活动的 VF 上构建并验证，而页表、GMC 与
+所有权握手全都可工作。剩下的差距是一道硬件边界（PF 拥有的
+doorbell aperture），而非设计上的。而且因为它接在同样的五方法
 [接缝](./overview.md) 之后，当它落地时，调度、编译或图机制
 没有一样需要改动。

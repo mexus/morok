@@ -21,6 +21,25 @@ The code lives in the `svod-device` crate under `device/src/amd/`.
 
 ---
 
+## A runtime-detected execution provider
+
+The AMD backend is **always compiled** (on every Unix host — `cfg(unix)`, since
+`nix` is Unix-only), never gated behind a cargo feature. Availability is decided
+**at runtime, not at compile time**, ORT-style: the device registry probes for
+hardware with `svod_device::amd::has_devices()` — a sysfs-only, side-effect-free
+read of the KFD topology — and registers the `"AMD"` device factory *only* when a
+supported GPU is present. A host with no `/dev/kfd` cleanly has no `"AMD"` device
+type.
+
+The point is robustness: because the backend is in every build's type-check, an
+API change in the generic core (a `Program` or `PlanContext` trait, say) is caught
+on every dev box at `cargo check`, not only on the GPU host. The cost is compile
+time, which is accepted. The bindgen step is correspondingly **hermetic** — it
+runs on all platforms against vendored headers, with no system kernel headers
+required (see [KFD Bindings](./kfd-bindings.md)).
+
+---
+
 ## Why KFD-direct instead of HIP
 
 A "sane person" writing an AMD backend reaches for HIP (the CUDA-alike runtime)
@@ -98,22 +117,27 @@ environment variable:
 
 :::caution AM is not runnable yet
 Setting `SVOD_AMD_BACKEND=am` currently returns an error (`device.rs` accepts
-only `kfd`). The userspace **AM** driver is a work in progress: the pure-logic
-pieces (allocator, page tables, register tables) are implemented and tested, but
-the privileged hardware bring-up is not. See [The AM Driver](./am-driver.md) for
-exactly what exists today.
+only `kfd`) — no AM type implements the seam yet. The userspace **AM** driver
+targets the **MI300X SR-IOV VF** (gfx9.4.3 / CDNA3) and is a work in progress:
+discovery, the VF↔GIM mailbox, indirect register access, the GMMU, and GMC
+bring-up are implemented and **validated on the live VF**, but no GPU engine yet
+consumes work (the doorbell aperture is host-owned). See
+[The AM Driver](./am-driver.md) for exactly what exists today and where the
+boundary is.
 :::
 
 ---
 
-## All buffers are host-visible
+## Device-local memory and the SDMA copy queue
 
-Today the backend has **no SDMA copy queue**. Every AMD buffer is allocated
-host-visible (CPU-mappable VRAM or GTT), and host↔device copies are plain
-`memmove` after a device `synchronize()`. The SDMA `AmdCopyQueue` exists in the
-source but is dead code, kept for a future revival. This simplifies the memory
-model considerably — there are no staging buffers and no asynchronous DMA to
-order against dispatch. Allocation and copies are covered in
+The backend installs an **SDMA copy queue** (`AmdCopyQueue`) at device-open when
+one can be created, which flips `has_sdma_queue` true. With it, intermediates can
+live in **device-only VRAM** (`cpu_access = false`) and host↔device copies go
+through asynchronous DMA: `_copyin`/`_copyout` stage through the SDMA queue,
+`_transfer` does a direct device→device copy. When no copy queue is present the
+allocator falls back to the simpler model — every buffer is forced host-visible
+(CPU-mappable VRAM or GTT) and copies are plain `memmove` after a
+`synchronize()`. Allocation and copies are covered in
 [KFD Bindings](./kfd-bindings.md).
 
 ---

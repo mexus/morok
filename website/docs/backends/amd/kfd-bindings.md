@@ -19,24 +19,43 @@ KFD's ABI is a C header, `kfd_ioctl.h`, vendored verbatim from the kernel into
 version history). Rust bindings are generated from it at build time by
 `bindgen`:
 
-- `device/build.rs` runs `bindgen` **only on Linux**, allow-listing exactly the
-  KFD types and constants the backend needs:
+- `device/build.rs` runs `bindgen` **unconditionally on every Unix host** —
+  there is no Linux gate and no empty-stub branch. It is **hermetic**: it needs
+  no system kernel headers. The two headers `kfd_ioctl.h` transitively pulls
+  (`<linux/ioctl.h>` for the `_IOC`/`_IO*` macros, `<linux/types.h>` for the
+  `__uNN`/`__sNN` aliases) plus a stub `<drm/drm.h>` (vestigial — the body uses
+  only `__u32 drm_fd` fields) are themselves vendored under `device/include/`,
+  and `build.rs` passes `-Iinclude` so bindgen resolves them instead of
+  `/usr/include`. The switch to vendored headers was verified byte-equivalent:
+  the regenerated bindings differ from the system-header baseline only in 8
+  fixed-width type-alias spellings (`__u32 = u32` vs `c_uint`, identically
+  sized) — all 60 structs and 35 constants are identical. (bindgen needs
+  `libclang`, which ships with the Xcode CLT on macOS.)
+
+  It allow-lists exactly the KFD types and constants the backend needs:
 
   ```text
   allowlist_type:  kfd_ioctl_.*_args, kfd_event_data,
                    kfd_hsa_memory_exception_data, kfd_hsa_hw_exception_data,
                    kfd_memory_exception_failure, __u\d+, __s\d+, …
-  allowlist_var:   KFD_IOC_.*, AMDKFD_IOC_.*, KFD_MAX_QUEUE_PERCENTAGE, …
+  allowlist_var:   KFD_IOC_.*, KFD_MMAP_TYPE.*, KFD_MAX_QUEUE_PERCENTAGE,
+                   AMDKFD_IOC_.*, …
   ```
+
+  (The `AMDKFD_IOC_*` request codes are allow-listed but never materialize:
+  bindgen can't const-fold their `_IOWR(...)` macro expansions, which is exactly
+  why the ioctl numbers are computed Rust-side — see the note below.)
 
   with `.derive_default(true).layout_tests(false).generate_comments(false)`. The
   output is written to `$OUT_DIR/kfd_sys.rs`.
 
-- On **non-Linux** hosts `build.rs` writes an empty stub instead, so the module
-  always compiles (the AMD path then returns `Err(NoAmdGpu)` at runtime).
-
 - `device/src/amd/sys/kfd.rs` is a one-liner that `include!`s the generated
   file.
+
+Compiling the bindings everywhere is what makes the AMD backend a
+[runtime-detected execution provider](./overview.md) rather than a compile-time
+feature: every Unix `cargo check` type-checks the KFD call sites, and a host with
+no GPU simply never registers the factory.
 
 :::note Why hand-written ioctl macros
 `bindgen` emits the argument *structs* but not the `_IOWR` ioctl-number macros.
@@ -101,7 +120,15 @@ GPU nodes are enumerated from sysfs, not via an ioctl.
 `/sys/devices/virtual/kfd/kfd/topology/nodes/<N>/properties` — one
 `key value` pair per line — and returns a `Vec<AmdNode>`, skipping CPU nodes
 (`gpu_id == 0`). It never panics: a host with no `/dev/kfd` yields an empty
-vector, which the device factory turns into a clean `Err(NoAmdGpu)`.
+vector.
+
+This same enumeration is what gates the whole backend at runtime.
+`topology::has_devices()` — "any node whose `gfx_target_version` resolves to a
+supported `AmdArch`" — is the side-effect-free probe the runtime calls to decide
+whether to register the `"AMD"` device factory at all (the
+[provider model](./overview.md)). No supported node ⇒ no `"AMD"` device type; and
+if a factory is asked for a node that isn't there, it returns a clean
+`Err(NoAmdGpu)`.
 
 Each `AmdNode` carries the fields the rest of the backend needs:
 `gpu_id`, `drm_render_minor`, `gfx_target_version` (e.g. `110000` → gfx1100),
@@ -147,15 +174,18 @@ slots must be immediately visible between CPU and GPU, or the host spins forever
 waiting on a completion value stuck in GPU L2. KFD rejects `CREATE_QUEUE` on a
 plain-VRAM ring with `EINVAL`.
 
-### Host-visible everywhere
+### `cpu_access` follows the copy queue
 
-Because there is no SDMA queue, the allocator (`device/src/amd/allocator.rs`)
-forces `cpu_access = true` on every buffer: `has_sdma_queue()` is always
-`false`, so `_alloc` ORs it in. Copies (`_copyin`/`_copyout`/`_transfer`) are
-therefore plain host `memmove` after a `synchronize()`. The generic
-`LruAllocator` (`device/src/allocator.rs`) pools freed buffers by
-`(size, BufferSpec)`; the `nolru` spec bypasses the pool for code objects,
-scratch, and queue infrastructure.
+The allocator (`device/src/amd/allocator.rs`) computes
+`cpu_access = options.cpu_access || !self.dev.has_sdma_queue()`. When an SDMA copy
+queue is installed (the default — see [Overview](./overview.md)), an intermediate
+can be **device-only** VRAM and copies go through DMA: `_copyin`/`_copyout` stage
+through the copy queue, `_transfer` is a direct device→device copy. When no copy
+queue is present, `has_sdma_queue()` is `false`, so every buffer is forced
+host-visible and copies fall back to a plain host `memmove` after a
+`synchronize()`. The generic `LruAllocator` (`device/src/allocator.rs`) pools
+freed buffers by `(size, BufferSpec)`; the `nolru` spec bypasses the pool for code
+objects, scratch, and queue infrastructure.
 
 :::note Process-shared state
 `/dev/kfd` is opened once per process and shared by all devices (events are
