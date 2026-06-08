@@ -121,7 +121,6 @@ impl PrepareConfig {
     /// function returns `None` even on supported hardware. The macro
     /// scaffold is in place so that flipping the pipeline integration is a
     /// one-line change here.
-    #[cfg(target_os = "linux")]
     pub fn for_amd_if_available() -> Option<Self> {
         // Detect supported AMD device. Returns None when the host has no
         // /dev/kfd, no GPU nodes, or only unsupported gfx targets.
@@ -132,26 +131,15 @@ impl PrepareConfig {
         // design, not a bug.
         None
     }
-
-    #[cfg(not(target_os = "linux"))]
-    pub fn for_amd_if_available() -> Option<Self> {
-        None
-    }
 }
 
 /// Detect a supported AMD GPU on this host. Returns the gfx-family arch of
 /// device 0 when (a) `/dev/kfd` exists, (b) KFD topology has a GPU node, and
 /// (c) the gfx target maps to one of `AmdArch`'s supported families
 /// (RDNA3 + CDNA).
-#[cfg(target_os = "linux")]
 pub fn amd_test_arch() -> Option<svod_dtype::AmdArch> {
     let nodes = svod_device::amd::topology::enumerate();
     nodes.into_iter().find_map(|n| svod_dtype::AmdArch::from_gfx_target_version(n.gfx_target_version))
-}
-
-#[cfg(not(target_os = "linux"))]
-pub fn amd_test_arch() -> Option<svod_dtype::AmdArch> {
-    None
 }
 
 impl PrepareConfig {

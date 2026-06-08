@@ -18,7 +18,7 @@
 //! (`PoolQueue::drain_all`, reached via `AmdDeviceCore::synchronize_all`) is the
 //! host-visibility/free fence used by `AmdAllocator::_copyin`/`_copyout`/`_free`.
 
-#![cfg(target_os = "linux")]
+#![cfg(unix)]
 
 use std::collections::VecDeque;
 use std::sync::Arc;

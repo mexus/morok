@@ -139,7 +139,13 @@ impl PciDevice {
                 ptr != libc::MAP_FAILED,
                 RuntimeSnafu { message: format!("mmap BAR{n} ({len} bytes): {}", std::io::Error::last_os_error()) }
             );
-            unsafe { libc::madvise(ptr, len, libc::MADV_DONTFORK) };
+            // Keep the BAR mapping out of forked children. `MADV_DONTFORK` is
+            // Linux-only in `libc`; elsewhere this path is dead at runtime (no
+            // sysfs PCI), so skipping it only affects an unreachable code path.
+            #[cfg(target_os = "linux")]
+            unsafe {
+                libc::madvise(ptr, len, libc::MADV_DONTFORK);
+            }
             Ok(Bar { ptr: ptr as *mut u8, len })
         };
 

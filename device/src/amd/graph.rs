@@ -18,7 +18,7 @@
 //! (AQL). Single-XCC PM4 (RDNA) chains and non-AMD / mixed-device chains return
 //! `Ok(None)` → per-call dispatch.
 
-#![cfg(target_os = "linux")]
+#![cfg(unix)]
 
 use std::sync::Arc;
 

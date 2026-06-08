@@ -12,7 +12,7 @@
 //! completion via per-op signals). `AmdCopyQueue::copy_fenced` stages
 //! host↔device / device↔device copies via SDMA, fenced on its own timeline.
 
-#![cfg(target_os = "linux")]
+#![cfg(unix)]
 
 use std::mem::size_of;
 use std::ptr::NonNull;

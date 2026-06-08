@@ -140,14 +140,7 @@ impl DeviceRegistry {
             DeviceSpec::Cuda { device_id } => Box::new(crate::allocator::CudaAllocator::new(*device_id)?),
             #[cfg(not(feature = "cuda"))]
             DeviceSpec::Cuda { .. } => unimplemented!("Cuda allocator - to be implemented"),
-            #[cfg(target_os = "linux")]
             DeviceSpec::Amd { device_id, .. } => Box::new(crate::amd::AmdAllocator::new(*device_id)?),
-            #[cfg(not(target_os = "linux"))]
-            DeviceSpec::Amd { .. } => {
-                return Err(crate::error::Error::DeviceUnavailable {
-                    reason: "AMD GPU support requires Linux (KFD-direct runtime)".into(),
-                });
-            }
             DeviceSpec::Metal { .. } => unimplemented!("Metal allocator - to be implemented"),
             DeviceSpec::WebGpu => unimplemented!("WebGPU allocator - to be implemented"),
             DeviceSpec::Disk { .. } => unreachable!(),
@@ -181,7 +174,6 @@ pub fn cpu() -> Result<Arc<dyn Allocator>> {
 /// Read the gfx arch of AMD device `device_id` from KFD topology. Used by
 /// `DeviceSpec::parse("AMD:N")` so the resulting spec encodes the real arch
 /// (not a hard-coded default that would break the kernel cache).
-#[cfg(target_os = "linux")]
 pub fn resolve_amd_arch_from_topology(device_id: usize) -> Result<svod_dtype::AmdArch> {
     let nodes = crate::amd::topology::enumerate();
     let node = nodes.get(device_id).ok_or_else(|| crate::error::Error::NoAmdGpu {
@@ -192,11 +184,6 @@ pub fn resolve_amd_arch_from_topology(device_id: usize) -> Result<svod_dtype::Am
             reason: format!("unsupported gfx_target_version {} on AMD device {device_id}", node.gfx_target_version),
         }
     })
-}
-
-#[cfg(not(target_os = "linux"))]
-pub fn resolve_amd_arch_from_topology(_device_id: usize) -> Result<svod_dtype::AmdArch> {
-    Err(crate::error::Error::DeviceUnavailable { reason: "AMD support requires Linux".into() })
 }
 
 /// Convenience function to get CUDA allocator.

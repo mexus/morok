@@ -111,7 +111,6 @@ pub enum RawBuffer {
     /// `handle` is KFD's opaque allocation handle, used for the matching
     /// free/unmap ioctls. `device` keeps the underlying KFD/DRM fds alive
     /// for the lifetime of the buffer.
-    #[cfg(target_os = "linux")]
     AmdDevice {
         gpu_addr: u64,
         host_ptr: Option<std::ptr::NonNull<u8>>,
@@ -126,7 +125,6 @@ pub enum RawBuffer {
 unsafe impl Send for RawBuffer {}
 unsafe impl Sync for RawBuffer {}
 
-#[cfg(target_os = "linux")]
 impl RawBuffer {
     /// Free this buffer's GPU-side backing if it's an AMD device buffer.
     ///
@@ -158,7 +156,6 @@ impl std::fmt::Debug for RawBuffer {
             RawBuffer::CudaUnified { device, .. } => {
                 f.debug_struct("CudaUnified").field("device", device).finish_non_exhaustive()
             }
-            #[cfg(target_os = "linux")]
             RawBuffer::AmdDevice { gpu_addr, size, host_ptr, .. } => f
                 .debug_struct("AmdDevice")
                 .field("gpu_addr", gpu_addr)
@@ -180,7 +177,6 @@ impl RawBuffer {
             RawBuffer::CudaDevice { data, .. } => unsafe { (&*data.get()).len() },
             #[cfg(feature = "cuda")]
             RawBuffer::CudaUnified { data, .. } => unsafe { (&*data.get()).len() },
-            #[cfg(target_os = "linux")]
             RawBuffer::AmdDevice { size, .. } => *size,
         }
     }
@@ -194,7 +190,6 @@ impl RawBuffer {
             RawBuffer::CudaDevice { .. } => false,
             #[cfg(feature = "cuda")]
             RawBuffer::CudaUnified { .. } => true,
-            #[cfg(target_os = "linux")]
             RawBuffer::AmdDevice { host_ptr, .. } => host_ptr.is_some(),
         }
     }
@@ -633,7 +628,6 @@ impl LruAllocator {
                 Ok(true)
             }
             RawBuffer::Mmap { .. } => panic!("DISK device is read-only: cannot zero-init mmap buffer"),
-            #[cfg(target_os = "linux")]
             RawBuffer::AmdDevice { host_ptr: Some(ptr), size, device, .. } => {
                 // Drain first: this VA was just recycled from the pool and its
                 // previous owner's async kernel may still be writing it. A host
@@ -642,7 +636,6 @@ impl LruAllocator {
                 unsafe { std::ptr::write_bytes(ptr.as_ptr(), 0, *size) };
                 Ok(true)
             }
-            #[cfg(target_os = "linux")]
             RawBuffer::AmdDevice { host_ptr: None, .. } => Ok(false),
             #[cfg(feature = "cuda")]
             RawBuffer::CudaDevice { data, device } => {

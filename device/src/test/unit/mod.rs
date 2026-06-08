@@ -1,5 +1,5 @@
 mod buffer;
 mod device;
 mod registry;
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 mod va_registry;

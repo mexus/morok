@@ -9,7 +9,7 @@
 //! without that drain a wrap can clobber kernargs the GPU is still consuming
 //! (the host can sprint ahead of the GPU on a `wait=false` burst).
 
-#![cfg(target_os = "linux")]
+#![cfg(unix)]
 
 use std::ptr::NonNull;
 use std::sync::{Arc, Weak};

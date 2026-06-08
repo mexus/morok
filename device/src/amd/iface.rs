@@ -12,7 +12,7 @@
 //! This is a pure refactor: flag composition, ioctl argument layout, error
 //! mapping, and the fault-message strings are reproduced bit-for-bit.
 
-#![cfg(target_os = "linux")]
+#![cfg(unix)]
 
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::ptr::NonNull;

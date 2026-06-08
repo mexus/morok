@@ -9,7 +9,7 @@
 //! hosts without `/dev/kfd`, so the existence of `AmdAllocator` doesn't gate
 //! anything; the runtime AMD path simply isn't reachable.
 
-#![cfg(target_os = "linux")]
+#![cfg(unix)]
 
 use std::sync::Arc;
 

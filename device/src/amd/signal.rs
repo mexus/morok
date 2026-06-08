@@ -5,7 +5,7 @@
 //! address so kernels / AQL barrier packets can write completion values.
 //! CPU polling reads the same memory through the slot's `host_ptr`.
 
-#![cfg(target_os = "linux")]
+#![cfg(unix)]
 
 use std::any::Any;
 use std::ptr::NonNull;

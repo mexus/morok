@@ -128,6 +128,17 @@ pub fn enumerate() -> Vec<AmdNode> {
     nodes
 }
 
+/// True iff this host has a *supported* AMD GPU — a KFD node whose
+/// `gfx_target_version` maps to a known [`AmdArch`](svod_dtype::AmdArch).
+///
+/// Sysfs-only and side-effect-free (no `/dev/kfd` open, no ioctl), so it's
+/// cheap enough to call at device-registry construction to decide whether to
+/// register the AMD factory. Mirrors the predicate `DeviceSpec::Amd` resolution
+/// uses, so registration and device-open agree on "supported".
+pub fn has_devices() -> bool {
+    enumerate().iter().any(|n| svod_dtype::AmdArch::from_gfx_target_version(n.gfx_target_version).is_some())
+}
+
 fn parse_properties(s: &str) -> HashMap<String, u64> {
     let mut map = HashMap::new();
     for line in s.lines() {

@@ -11,7 +11,7 @@
 //! chain (`AmdAllocator::_copyin`/`_copyout`/`_free`) drains every registered
 //! pool queue via `synchronize_all`.
 
-#![cfg(target_os = "linux")]
+#![cfg(unix)]
 
 use std::collections::HashMap;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};

@@ -254,7 +254,6 @@ impl Buffer {
                 Ok(bytes)
             }
             RawBuffer::Mmap { data, .. } => Ok(&data[self.offset..self.offset + self.size]),
-            #[cfg(target_os = "linux")]
             RawBuffer::AmdDevice { host_ptr: Some(ptr), device, .. } => {
                 // Async dispatch: drain before raw host access — host-pointer
                 // reads/writes aren't ordered on the GPU timeline.
@@ -265,7 +264,6 @@ impl Buffer {
                 let base = unsafe { ptr.as_ptr().add(self.offset) };
                 Ok(unsafe { std::slice::from_raw_parts(base, self.size) })
             }
-            #[cfg(target_os = "linux")]
             RawBuffer::AmdDevice { host_ptr: None, gpu_addr, size, .. } => {
                 // Diagnostic: this is the path that fires when a buffer was
                 // alloc'd with `cpu_access: false` (no host mmap). The
@@ -311,7 +309,6 @@ impl Buffer {
             }
             // Mmap is read-only — no mutable access
             RawBuffer::Mmap { .. } => NotCpuAccessibleSnafu.fail(),
-            #[cfg(target_os = "linux")]
             RawBuffer::AmdDevice { host_ptr: Some(ptr), device, .. } => {
                 // Async dispatch: drain before raw host access — host-pointer
                 // reads/writes aren't ordered on the GPU timeline.
@@ -319,7 +316,6 @@ impl Buffer {
                 let base = unsafe { ptr.as_ptr().add(self.offset) };
                 Ok(unsafe { std::slice::from_raw_parts_mut(base, self.size) })
             }
-            #[cfg(target_os = "linux")]
             RawBuffer::AmdDevice { host_ptr: None, .. } => NotCpuAccessibleSnafu.fail(),
             #[cfg(feature = "cuda")]
             _ => NotCpuAccessibleSnafu.fail(),
@@ -354,7 +350,6 @@ impl Buffer {
                 let typed = unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const T, count) };
                 ndarray::ArrayViewD::from_shape(ndarray::IxDyn(&self.shape), typed).context(NdarrayShapeSnafu)
             }
-            #[cfg(target_os = "linux")]
             RawBuffer::AmdDevice { host_ptr: Some(ptr), device, .. } => {
                 // Async dispatch: drain before raw host access — host-pointer
                 // reads/writes aren't ordered on the GPU timeline.
@@ -364,7 +359,6 @@ impl Buffer {
                 let typed = unsafe { std::slice::from_raw_parts(bytes_ptr, count) };
                 ndarray::ArrayViewD::from_shape(ndarray::IxDyn(&self.shape), typed).context(NdarrayShapeSnafu)
             }
-            #[cfg(target_os = "linux")]
             RawBuffer::AmdDevice { host_ptr: None, gpu_addr, size, .. } => {
                 tracing::warn!(
                     buffer_id = self.id.0,
@@ -406,7 +400,6 @@ impl Buffer {
                 let typed = unsafe { std::slice::from_raw_parts_mut(bytes.as_mut_ptr() as *mut T, count) };
                 ndarray::ArrayViewMutD::from_shape(ndarray::IxDyn(&self.shape), typed).context(NdarrayShapeSnafu)
             }
-            #[cfg(target_os = "linux")]
             RawBuffer::AmdDevice { host_ptr: Some(ptr), device, .. } => {
                 // Async dispatch: drain before raw host access — host-pointer
                 // reads/writes aren't ordered on the GPU timeline.
@@ -435,7 +428,6 @@ impl Buffer {
                 let count = bytes.len() / T::DTYPE.bytes();
                 Ok(unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const T, count) })
             }
-            #[cfg(target_os = "linux")]
             RawBuffer::AmdDevice { host_ptr: Some(ptr), device, .. } => {
                 // Async dispatch: drain before raw host access — host-pointer
                 // reads/writes aren't ordered on the GPU timeline.
@@ -610,7 +602,6 @@ impl Buffer {
                 // Read-only mmap: writing through this pointer is UB.
                 unsafe { data.as_ptr().add(self.offset) as *mut u8 }
             }
-            #[cfg(target_os = "linux")]
             RawBuffer::AmdDevice { gpu_addr, .. } => {
                 // GPU virtual address — what AMD kernels see in their kernarg
                 // buffer for buffer parameters. The CPU never dereferences
@@ -640,7 +631,6 @@ impl Buffer {
                 unsafe { (*data.get()).as_ptr() as usize }
             }
             RawBuffer::Mmap { data, .. } => data.as_ptr() as usize,
-            #[cfg(target_os = "linux")]
             RawBuffer::AmdDevice { gpu_addr, .. } => *gpu_addr as usize,
             #[cfg(feature = "cuda")]
             RawBuffer::CudaDevice { data, .. } => {

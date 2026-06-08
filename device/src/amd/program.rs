@@ -6,7 +6,7 @@
 //! vals, builds an AQL dispatch packet, and waits on the device timeline
 //! signal.
 
-#![cfg(target_os = "linux")]
+#![cfg(unix)]
 
 use std::sync::Arc;
 
