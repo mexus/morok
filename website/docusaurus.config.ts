@@ -19,6 +19,14 @@ const config: Config = {
 
   onBrokenLinks: "throw",
 
+  // The docs are plain CommonMark (no imports/JSX) — parse `.md` as Markdown,
+  // not MDX, so explicit heading IDs (`{#id}`, used by translations to keep
+  // anchors stable) and stray `{`/`<` in prose don't trip MDX expression
+  // parsing. `.mdx` (if added later) still gets full MDX.
+  markdown: {
+    format: "detect",
+  },
+
   i18n: {
     defaultLocale: "en",
     locales: ["en", "zh-Hans", "ru", "hi"],
