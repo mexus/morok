@@ -230,9 +230,17 @@ pub struct BlockTapes<'a> {
 
 /// Device-resident block decode: every state (per-lane time/prev/symbols +
 /// predictor state) lives on the device; one `run_block` advances all lanes
-/// [`block_steps`](Self::block_steps) label-looping steps and the host only
-/// reads the token tape. Greedy semantics per lane are identical to
-/// [`BatchLabelStep`].
+/// [`block_steps`](Self::block_steps) decode steps and the host only reads the
+/// token tape. Greedy semantics per lane are identical to [`BatchLabelStep`].
+///
+/// The device implementation (`svod_model::gigaam::rnnt::block::forward_block`)
+/// uses WIND windowed non-blank detection: each step evaluates the joint over a
+/// window of frames against the fixed predictor state and jumps to the first
+/// non-blank. On this static-shape, masked-execution runtime WIND subsumes
+/// label-looping — collapsing a blank run into one step cuts the predictor/joint
+/// evaluations and host syncs a per-frame loop spends on blanks — at
+/// byte-identical output. The trait contract is unchanged: one tape entry per
+/// lane per step, `emit`-flagged emissions at `frames`.
 pub trait BatchBlockStep {
     /// Backend-specific error (typically a JIT execution error).
     type Error: std::error::Error + Send + Sync + 'static;

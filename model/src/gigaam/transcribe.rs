@@ -638,11 +638,23 @@ impl<S: Splitter> Transcriber<S> {
 
         if let HeadDecoder::Rnnt { backend, .. } = &self.head_decoder {
             let s = &backend.stats;
+            // Two scales, kept distinct: `steps_per_lane` (= n_blocks ×
+            // block_steps) is the lockstep step count one lane drives — the WIND
+            // lever, which drops as the window widens. `tokens_emitted` and
+            // `tape_slots` are over the full lanes × steps tape, so
+            // tokens_emitted / tape_slots is the useful fraction; `n_blocks` is
+            // the host-sync count.
+            let block_steps = svod_arch::rnnt::BatchBlockStep::block_steps(backend) as u64;
+            let lanes = svod_arch::rnnt::BatchBlockStep::batch(backend) as u64;
+            let frames_total: usize = all_valid.iter().sum();
             tracing::info!(
                 target: "svod_model::gigaam::transcribe",
                 n_blocks = s.n_blocks,
+                steps_per_lane = s.n_blocks * block_steps,
+                tokens_emitted = s.steps_emitted,
+                tape_slots = s.n_blocks * lanes * block_steps,
+                frames_total,
                 exec_ms = s.t_exec.as_secs_f64() * 1e3,
-                recycle_ms = s.t_recycle.as_secs_f64() * 1e3,
                 read_ms = s.t_read.as_secs_f64() * 1e3,
                 "rnnt block stats",
             );

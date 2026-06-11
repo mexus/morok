@@ -481,6 +481,18 @@ crate::codegen_tests! {
         assert_eq!(t.argmax(Some(0)).unwrap().realize_with_and(&config).as_vec::<i32>().unwrap(), [0]);
     }
 
+    // The WIND first-non-blank reduction relies on `argmax` over a {0,1} row
+    // returning the FIRST index that holds 1 (and index 0 when the row is all
+    // zero, which the caller masks out). Verify on the exact int32 / axis=1 /
+    // keepdim form the RN-T block uses.
+    fn test_argmax_first_true_in_binary_row(config) {
+        test_setup();
+        let t = Tensor::from_ndarray(&array![[0i32, 0, 1, 1], [0, 0, 0, 0], [1, 0, 0, 0]]);
+        let got = t.argmax_with().axis(Some(1)).keepdim(true).call().unwrap().realize_with_and(&config).as_vec::<i32>().unwrap();
+        // Row 0: first 1 at idx 2; row 1: all zero -> 0; row 2: first 1 at idx 0.
+        assert_eq!(got, [2, 0, 0]);
+    }
+
     fn test_argmax_2d_axis0_value(config) {
         test_setup();
         let t = Tensor::from_ndarray(&array![[1.0f32, 3.0, 2.0], [4.0, 2.0, 5.0]]);
