@@ -655,7 +655,6 @@ impl<S: Splitter> Transcriber<S> {
                 tape_slots = s.n_blocks * lanes * block_steps,
                 frames_total,
                 exec_ms = s.t_exec.as_secs_f64() * 1e3,
-                recycle_ms = s.t_recycle.as_secs_f64() * 1e3,
                 read_ms = s.t_read.as_secs_f64() * 1e3,
                 "rnnt block stats",
             );

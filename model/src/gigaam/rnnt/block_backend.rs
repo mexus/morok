@@ -1,7 +1,8 @@
 //! Device-block RNN-T backend ([`svod_arch::rnnt::BatchBlockStep`]):
-//! [`super::block::forward_block`] unrolled to a single graph-captured plan;
-//! per block the host recycles the five carried states with on-device copies
-//! and reads back three small tapes + one flag.
+//! [`super::block::forward_block`] unrolled to a single graph-captured plan. The
+//! five carried states recycle in place inside `execute()` (the plan stores them
+//! back into its own input buffers); per block the host only reads back three
+//! small tapes + one flag.
 
 use snafu::ResultExt;
 use svod_arch::rnnt::{BatchBlockStep, BlockTapes};
@@ -50,12 +51,10 @@ pub struct BlockStats {
     /// useful fraction; the per-lane step count `n_blocks * BLOCK_STEPS` is the
     /// separate lever a wider window cuts.
     pub steps_emitted: u64,
+    /// Time inside `execute()` (graph submit; the block runs async).
     pub t_exec: std::time::Duration,
-    /// Always ~0 now: carried state recycles in place inside `execute()` (the
-    /// plan stores `time/prev/symbols/h/c` back into its own input buffers), so
-    /// there is no host-issued output→input copy. Kept as a log signal that the
-    /// in-place recycle is active.
-    pub t_recycle: std::time::Duration,
+    /// Time reading back the tapes — includes the wait for the block's compute,
+    /// since `execute()` does not block.
     pub t_read: std::time::Duration,
 }
 

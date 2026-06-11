@@ -7,15 +7,17 @@
 //! per block. No runtime vars — everything concrete, so the plan graph-captures
 //! into one submit.
 //!
-//! Each step evaluates the joint over a window of [`WIND_W`] frames against the
-//! FIXED predictor state and jumps to the first non-blank (WIND, arXiv
-//! 2505.13765). This is an exact reformulation of greedy decoding — for a fixed
-//! predictor state every frame before the first non-blank is provably blank, so
-//! skipping them matches frame-by-frame decoding — and it subsumes label-looping
-//! for this architecture: by collapsing a blank run into one step it cuts the
+//! Each step evaluates the joint over a window of `W` frames (the
+//! [`forward_block`] const generic) against the FIXED predictor state and jumps
+//! to the first non-blank (WIND, arXiv 2505.13765). This is an exact
+//! reformulation of greedy decoding — for a fixed predictor state every frame
+//! before the first non-blank is provably blank, so skipping them matches
+//! frame-by-frame decoding — and it subsumes label-looping for this
+//! architecture: by collapsing a blank run into one step it cuts the
 //! predictor/joint evaluations and host syncs that a per-frame loop spends on
-//! blanks. `WIND_W == 1` is the per-frame baseline; the output is byte-identical
-//! across windows (verified against `decode_batch_labels` in the arch tests).
+//! blanks. `W == 1` is the per-frame baseline; the output is byte-identical
+//! across windows (verified against `decode_batch_labels` in the arch tests),
+//! so `W` is a pure performance knob whose optimum shifts with the GPU.
 //!
 //! Per step (identical greedy semantics to `decode_batch_labels` for any window):
 //! toks = joint(enc[time .. time+W], g) → first usable (in-bounds, non-blank)
@@ -40,14 +42,8 @@ use crate::gigaam::model::GigaAm;
 /// the unrolled plan (~40 kernels/step).
 pub(crate) const BLOCK_STEPS: usize = 16;
 
-/// WIND window: frames the joint evaluates per step against the fixed predictor
-/// state, jumping `time` to the first non-blank (or by `WIND_W` if all blank).
-/// `1` is the per-frame baseline (byte-identical to the pre-WIND block); larger
-/// windows skip blank runs in one step. See [`forward_block`].
-pub(crate) const WIND_W: usize = 1;
-
 /// Tapes + carried state from one block trace; flat tuple keyed by
-/// `RnntBlockJit`'s output order. Outputs 5-8 (`time/prev/symbols/h/c`) are
+/// `RnntBlockJit`'s output order. Outputs 4-8 (`time/prev/symbols/h/c`) are
 /// in-place `assign`s back into the matching input buffers, so `execute()`
 /// recycles state on-device with no copy; only the 4 tape/flag outputs are read.
 pub(crate) type BlockOutputs = (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor);
@@ -57,7 +53,7 @@ pub(crate) type BlockOutputs = (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, 
 /// time, prev, symbols, h, c)` where the last five are in-place writes into the
 /// input buffers (the carried state recycles without a device→device copy).
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn forward_block(
+pub(crate) fn forward_block<const W: usize>(
     model: &GigaAm,
     enc_proj: &Tensor,
     time: &Tensor,
@@ -66,8 +62,8 @@ pub(crate) fn forward_block(
     valid: &Tensor,
     h: &Tensor,
     c: &Tensor,
-    window: usize,
 ) -> Result<BlockOutputs> {
+    const { assert!(W >= 1, "WIND window W must be >= 1") };
     let t = |r: std::result::Result<Tensor, svod_tensor::error::Error>| r.context(TensorSnafu);
     let (head, runtime) = model.head.expect_rnnt("RnntBlockJit")?;
     let max_symbols = runtime.max_symbols_per_step.max(1);
@@ -78,15 +74,14 @@ pub(crate) fn forward_block(
     let valid64 = t(valid.cast(DType::Int64))?;
     let last = t(valid64.try_sub(&Tensor::from_slice([1i64])))?;
     // Window offsets `[0, W)` as a row vector, broadcast onto each lane's frame
-    // cursor. At `window == 1` the window collapses to the single current frame
-    // and every step below reduces to the per-frame greedy update.
-    let window = window.max(1);
-    let w = window as isize;
+    // cursor. At `W == 1` the window collapses to the single current frame and
+    // every step below reduces to the per-frame greedy update.
+    let w = W as isize;
     let arange_w = {
-        let a = Tensor::arange(0, Some(window as i64), Some(1)).context(TensorSnafu)?;
+        let a = Tensor::arange(0, Some(W as i64), Some(1)).context(TensorSnafu)?;
         t(t(a.cast(DType::Int64))?.try_reshape([1, w]))?
     };
-    let w_const = Tensor::from_slice([window as i64]);
+    let w_const = Tensor::from_slice([W as i64]);
     let zeros_i32 = Tensor::from_slice([0i32]);
     let zeros_i64 = Tensor::from_slice([0i64]);
 

@@ -236,11 +236,11 @@ pub struct BlockTapes<'a> {
 /// The device implementation (`svod_model::gigaam::rnnt::block::forward_block`)
 /// uses WIND windowed non-blank detection: each step evaluates the joint over a
 /// window of frames against the fixed predictor state and jumps to the first
-/// non-blank. For this static-shape, masked-execution runtime that subsumes
-/// label-looping — collapsing blank runs into a single step cuts the wasted
-/// predictor/joint evaluations a per-frame loop spends on blanks, plus host
-/// syncs — at byte-identical output (this trait's contract is unchanged: one
-/// tape entry per lane per step, `emit`-flagged emissions at `frames`).
+/// non-blank. On this static-shape, masked-execution runtime WIND subsumes
+/// label-looping — collapsing a blank run into one step cuts the predictor/joint
+/// evaluations and host syncs a per-frame loop spends on blanks — at
+/// byte-identical output. The trait contract is unchanged: one tape entry per
+/// lane per step, `emit`-flagged emissions at `frames`.
 pub trait BatchBlockStep {
     /// Backend-specific error (typically a JIT execution error).
     type Error: std::error::Error + Send + Sync + 'static;
