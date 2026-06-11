@@ -47,12 +47,15 @@ pub(crate) const BLOCK_STEPS: usize = 16;
 pub(crate) const WIND_W: usize = 1;
 
 /// Tapes + carried state from one block trace; flat tuple keyed by
-/// `RnntBlockJit`'s output order.
+/// `RnntBlockJit`'s output order. Outputs 5-8 (`time/prev/symbols/h/c`) are
+/// in-place `assign`s back into the matching input buffers, so `execute()`
+/// recycles state on-device with no copy; only the 4 tape/flag outputs are read.
 pub(crate) type BlockOutputs = (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor);
 
 /// `enc_proj [B, T, J]` (pre-projected encoder, [`super::joint::RnntJoint::project_encoder`]), `time/prev [B,1] i64`, `symbols/valid [B,1] i32`,
 /// `h/c [L, B, P]` → `(tape, emit, frame [B,K] i32, active_any [1,1] i32,
-/// time, prev, symbols, h, c)`.
+/// time, prev, symbols, h, c)` where the last five are in-place writes into the
+/// input buffers (the carried state recycles without a device→device copy).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn forward_block(
     model: &GigaAm,
@@ -87,8 +90,12 @@ pub(crate) fn forward_block(
     let zeros_i32 = Tensor::from_slice([0i32]);
     let zeros_i64 = Tensor::from_slice([0i64]);
 
+    // Keep handles to the input-buffer tensors: the final carried state is
+    // written back into them in place (`assign`) at block end, so the next
+    // block reads updated state with no device→device recycle copy.
+    let (in_time, in_prev, in_symbols, in_h, in_c) = (time, prev, symbols, h, c);
     let (mut time, mut prev, mut symbols, mut h, mut c) =
-        (time.clone(), prev.clone(), symbols.clone(), h.clone(), c.clone());
+        (in_time.clone(), in_prev.clone(), in_symbols.clone(), in_h.clone(), in_c.clone());
     let (mut tapes, mut emits, mut frames) = (Vec::new(), Vec::new(), Vec::new());
 
     for _ in 0..BLOCK_STEPS {
@@ -161,5 +168,26 @@ pub(crate) fn forward_block(
     let active_any =
         t(t(t(active.cast(DType::Int32))?.sum_with().axes(0isize).keepdim(true).call())?.try_reshape([1, 1]))?;
 
-    Ok((cat(&tapes)?, cat(&emits)?, cat(&frames)?, active_any, time, prev, symbols, h, c))
+    // Carried-state outputs are in-place writes into the input buffers:
+    // `AFTER(in_buf, STORE(in_buf, final))`. The captured plan stores the final
+    // state where step 0 read it (read-before-write is safe — the inputs are
+    // read only at step 0), so `execute()` recycles state in place and the host
+    // never copies output→input between blocks. A fresh tensor on the input's
+    // buffer UOp carries the store, leaving the JIT's input handle untouched.
+    let assign_back = |input: &Tensor, value: Tensor| -> Result<Tensor> {
+        let out = Tensor::from_lazy(input.uop());
+        out.try_assign(&value).context(TensorSnafu)?;
+        Ok(out)
+    };
+    Ok((
+        cat(&tapes)?,
+        cat(&emits)?,
+        cat(&frames)?,
+        active_any,
+        assign_back(in_time, time)?,
+        assign_back(in_prev, prev)?,
+        assign_back(in_symbols, symbols)?,
+        assign_back(in_h, h)?,
+        assign_back(in_c, c)?,
+    ))
 }

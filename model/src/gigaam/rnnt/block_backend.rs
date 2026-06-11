@@ -12,16 +12,15 @@ use super::block::BLOCK_STEPS;
 use super::jit::{RnntBlockJit, RnntEncProjJit};
 use crate::gigaam::model::GigaAm;
 
-/// Output order of `RnntBlockJit`.
+/// Read-back output positions of `RnntBlockJit`. The remaining outputs
+/// (`time/prev/symbols/h/c`, positions 4-8) are in-place writes back into the
+/// JIT's own input buffers (`forward_block` ends each carried state with
+/// `assign`), so the block recycles state on-device with no copy — those
+/// positions are never read out here.
 const TAPE_OUT: usize = 0;
 const EMIT_OUT: usize = 1;
 const FRAME_OUT: usize = 2;
 const ANY_OUT: usize = 3;
-const TIME_OUT: usize = 4;
-const PREV_OUT: usize = 5;
-const SYMBOLS_OUT: usize = 6;
-const H_OUT: usize = 7;
-const C_OUT: usize = 8;
 
 pub struct RnntBlockBackend {
     jit: RnntBlockJit,
@@ -45,11 +44,17 @@ pub struct RnntBlockBackend {
 #[derive(Default, Clone, Debug)]
 pub struct BlockStats {
     pub n_blocks: u64,
-    /// Real (non-blank) emissions across all blocks. Total executed steps are
-    /// `n_blocks * BLOCK_STEPS`; the gap to `steps_emitted` is the blank-advance
-    /// + finished-lane overhead a wider window cuts down.
+    /// Real (non-blank) emissions counted over the full `lanes * BLOCK_STEPS`
+    /// tape, across all blocks — i.e. total emitted tokens (window-invariant).
+    /// Compare against `n_blocks * lanes * BLOCK_STEPS` (tape slots) for the
+    /// useful fraction; the per-lane step count `n_blocks * BLOCK_STEPS` is the
+    /// separate lever a wider window cuts.
     pub steps_emitted: u64,
     pub t_exec: std::time::Duration,
+    /// Always ~0 now: carried state recycles in place inside `execute()` (the
+    /// plan stores `time/prev/symbols/h/c` back into its own input buffers), so
+    /// there is no host-issued output→input copy. Kept as a log signal that the
+    /// in-place recycle is active.
     pub t_recycle: std::time::Duration,
     pub t_read: std::time::Duration,
 }
@@ -139,16 +144,11 @@ impl BatchBlockStep for RnntBlockBackend {
 
     fn run_block(&mut self) -> Result<BlockTapes<'_>, Self::Error> {
         let t0 = std::time::Instant::now();
+        // `execute()` recycles carried state in place: the plan's `time/prev/
+        // symbols/h/c` outputs `assign` back into its own input buffers, so the
+        // next block reads updated state with no host-issued copy.
         self.jit.execute()?;
         let t1 = std::time::Instant::now();
-
-        // Recycle carried state on-device for the next block.
-        self.jit.copy_output_to_time(TIME_OUT, 0, 0, self.lanes * 8)?;
-        self.jit.copy_output_to_prev(PREV_OUT, 0, 0, self.lanes * 8)?;
-        self.jit.copy_output_to_symbols(SYMBOLS_OUT, 0, 0, self.lanes * 4)?;
-        self.jit.copy_output_to_h_in(H_OUT, 0, 0, self.state_bytes)?;
-        self.jit.copy_output_to_c_in(C_OUT, 0, 0, self.state_bytes)?;
-        let t2 = std::time::Instant::now();
 
         let outs = self.jit.output_buffers()?;
         let mut any = [0i32; 1];
@@ -156,13 +156,12 @@ impl BatchBlockStep for RnntBlockBackend {
         outs[EMIT_OUT].copyout_prefix(bytemuck::cast_slice_mut(&mut self.emit)).context(DeviceSnafu)?;
         outs[FRAME_OUT].copyout_prefix(bytemuck::cast_slice_mut(&mut self.frames_tape)).context(DeviceSnafu)?;
         outs[ANY_OUT].copyout_prefix(bytemuck::cast_slice_mut(&mut any)).context(DeviceSnafu)?;
-        let t3 = std::time::Instant::now();
+        let t2 = std::time::Instant::now();
 
         self.stats.n_blocks += 1;
         self.stats.steps_emitted += self.emit.iter().filter(|&&e| e != 0).count() as u64;
         self.stats.t_exec += t1 - t0;
-        self.stats.t_recycle += t2 - t1;
-        self.stats.t_read += t3 - t2;
+        self.stats.t_read += t2 - t1;
         Ok(BlockTapes { tokens: &self.tokens, emit: &self.emit, frames: &self.frames_tape, active_any: any[0] != 0 })
     }
 
