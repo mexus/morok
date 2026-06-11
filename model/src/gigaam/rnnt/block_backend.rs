@@ -45,6 +45,10 @@ pub struct RnntBlockBackend {
 #[derive(Default, Clone, Debug)]
 pub struct BlockStats {
     pub n_blocks: u64,
+    /// Real (non-blank) emissions across all blocks. Total executed steps are
+    /// `n_blocks * BLOCK_STEPS`; the gap to `steps_emitted` is the blank-advance
+    /// + finished-lane overhead a wider window cuts down.
+    pub steps_emitted: u64,
     pub t_exec: std::time::Duration,
     pub t_recycle: std::time::Duration,
     pub t_read: std::time::Duration,
@@ -155,6 +159,7 @@ impl BatchBlockStep for RnntBlockBackend {
         let t3 = std::time::Instant::now();
 
         self.stats.n_blocks += 1;
+        self.stats.steps_emitted += self.emit.iter().filter(|&&e| e != 0).count() as u64;
         self.stats.t_exec += t1 - t0;
         self.stats.t_recycle += t2 - t1;
         self.stats.t_read += t3 - t2;

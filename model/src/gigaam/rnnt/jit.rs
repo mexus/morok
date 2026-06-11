@@ -24,8 +24,9 @@ mod block_jit {
             outputs { tape, emit, frame, active_any, time_out, prev_out, symbols_out, h_out, c_out },
 
             build(enc, time, prev, symbols, valid, h_in, c_in) {
+                use crate::gigaam::rnnt::block::{WIND_W, forward_block};
                 let out: crate::gigaam::error::Result<_> =
-                    crate::gigaam::rnnt::block::forward_block(model, enc, time, prev, symbols, valid, h_in, c_in);
+                    forward_block(model, enc, time, prev, symbols, valid, h_in, c_in, WIND_W);
                 out
             }
         }

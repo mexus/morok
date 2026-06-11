@@ -3,7 +3,9 @@ use std::convert::Infallible;
 
 use proptest::prelude::*;
 
-use crate::rnnt::{BatchJointStep, BatchLabelStep, JointStep, RnntDecoder, RnntOpts, TokenEmission, Word};
+use crate::rnnt::{
+    BatchBlockStep, BatchJointStep, BatchLabelStep, BlockTapes, JointStep, RnntDecoder, RnntOpts, TokenEmission, Word,
+};
 
 /// NaN-safe argmax — the device backend computes the joint argmax on-GPU and
 /// returns the index; the mock mirrors that over its scripted logits. NaN is
@@ -178,6 +180,168 @@ impl BatchLabelStep for MockBatchLabelStep {
     fn reset(&mut self) {
         self.resets += 1;
         self.cursors.fill(0);
+    }
+}
+
+/// Device-block mock: a plain-Rust transcription of the WIND device
+/// `forward_block` per-step greedy logic (`model/src/gigaam/rnnt/block.rs`),
+/// driven by the same per-lane token-id scripts as [`MockBatchLabelStep`]. Each
+/// `run_block` advances every lane `block_steps` window steps and fills the
+/// lane-major `[lanes * block_steps]` tapes the host consumer reads.
+///
+/// Per step, an in-bounds lane evaluates the joint over a window of `window`
+/// frames against the FIXED predictor state and jumps to the first non-blank:
+/// it scans the leading blanks (advancing `time`), and on the first non-blank
+/// emits one token at that frame (a jump to a fresh frame resets the same-frame
+/// run length; the `max_symbols` cap then forces a single-frame advance). An
+/// all-blank window advances `time` by the in-bounds run length. Each step
+/// produces exactly one tape entry per lane (the device's single windowed op),
+/// so the blank frames skipped within a step never cost a tape slot — the WIND
+/// win. `window == 1` reduces to the per-frame baseline.
+///
+/// The script is consumed along the greedy path: `first_nb + 1` tokens on an
+/// emit step (leading blanks + the emit) and the in-bounds blank count on an
+/// all-blank step — identical total consumption to [`MockBatchLabelStep`], so
+/// transcripts match regardless of `window` or `block_steps`.
+struct MockBatchBlockStep {
+    scripts: Vec<Vec<usize>>,
+    cursors: Vec<usize>,
+    valid: Vec<usize>,
+    blank: usize,
+    max_symbols: usize,
+    block_steps: usize,
+    window: usize,
+    // Carried per-lane state (device-resident on a real backend).
+    time: Vec<usize>,
+    prev: Vec<usize>,
+    symbols: Vec<usize>,
+    // Tape buffers, reused each block; lane-major `[lanes * block_steps]`.
+    tokens: Vec<i32>,
+    emit: Vec<i32>,
+    frames: Vec<i32>,
+    pub resets: usize,
+}
+
+impl MockBatchBlockStep {
+    fn new(
+        scripts: Vec<Vec<usize>>,
+        valid: Vec<usize>,
+        blank: usize,
+        max_symbols: usize,
+        block_steps: usize,
+        window: usize,
+    ) -> Self {
+        let lanes = scripts.len();
+        assert_eq!(valid.len(), lanes, "MockBatchBlockStep: one valid length per lane");
+        let cap = lanes * block_steps;
+        Self {
+            scripts,
+            cursors: vec![0; lanes],
+            valid,
+            blank,
+            max_symbols: max_symbols.max(1),
+            block_steps,
+            window: window.max(1),
+            time: vec![0; lanes],
+            prev: vec![blank; lanes],
+            symbols: vec![0; lanes],
+            tokens: vec![0; cap],
+            emit: vec![0; cap],
+            frames: vec![0; cap],
+            resets: 0,
+        }
+    }
+
+    /// Peek the scripted argmax `ahead` frames into lane `i`'s window without
+    /// advancing the cursor (clamps at the script end like the other mocks).
+    fn peek(&self, lane: usize, ahead: usize) -> usize {
+        let sc = &self.scripts[lane];
+        sc[(self.cursors[lane] + ahead).min(sc.len() - 1)]
+    }
+}
+
+impl BatchBlockStep for MockBatchBlockStep {
+    type Error = Infallible;
+
+    fn batch(&self) -> usize {
+        self.scripts.len()
+    }
+
+    fn block_steps(&self) -> usize {
+        self.block_steps
+    }
+
+    fn run_block(&mut self) -> Result<BlockTapes<'_>, Self::Error> {
+        let lanes = self.scripts.len();
+        let k = self.block_steps;
+        let w = self.window;
+        for s in 0..k {
+            for i in 0..lanes {
+                let j = i * k + s;
+                let in_bounds = self.time[i] < self.valid[i];
+                // safe_t = time when in bounds, else last (valid - 1); recorded
+                // on the frame tape (filtered by emit == 0 when out of bounds).
+                let safe_t = if in_bounds { self.time[i] as i64 } else { self.valid[i] as i64 - 1 };
+                if !in_bounds {
+                    self.tokens[j] = 0;
+                    self.emit[j] = 0;
+                    self.frames[j] = safe_t as i32;
+                    continue;
+                }
+                // Scan the window against the fixed state: leading blanks, then
+                // the first non-blank. `consumed` counts script tokens on the
+                // greedy path (the off-path window tail is never consumed).
+                let mut consumed = 0usize;
+                let mut emit_off: Option<usize> = None;
+                while consumed < w && self.time[i] + consumed < self.valid[i] {
+                    let tok = self.peek(i, consumed);
+                    consumed += 1;
+                    if tok != self.blank {
+                        emit_off = Some(consumed - 1);
+                        break;
+                    }
+                }
+                self.cursors[i] += consumed;
+                if let Some(off) = emit_off {
+                    let tok = self.scripts[i][(self.cursors[i] - 1).min(self.scripts[i].len() - 1)];
+                    let frame = self.time[i] + off;
+                    self.tokens[j] = tok as i32;
+                    self.emit[j] = 1;
+                    self.frames[j] = frame as i32;
+                    self.prev[i] = tok;
+                    // A jump to a fresh frame (off >= 1) resets the same-frame
+                    // counter before counting this emission.
+                    let sym_base = if off >= 1 { 0 } else { self.symbols[i] };
+                    let symbols1 = sym_base + 1;
+                    self.time[i] += off;
+                    if symbols1 >= self.max_symbols {
+                        self.time[i] += 1; // cap forces a single-frame advance
+                        self.symbols[i] = 0;
+                    } else {
+                        self.symbols[i] = symbols1;
+                    }
+                } else {
+                    // All in-bounds window frames blank: advance by the run length
+                    // (= min(window, valid - time)); one inert tape entry.
+                    self.tokens[j] = 0;
+                    self.emit[j] = 0;
+                    self.frames[j] = safe_t as i32;
+                    self.time[i] += consumed;
+                    self.symbols[i] = 0;
+                }
+            }
+        }
+        let active_any = (0..lanes).any(|i| self.time[i] < self.valid[i]);
+        Ok(BlockTapes { tokens: &self.tokens, emit: &self.emit, frames: &self.frames, active_any })
+    }
+
+    fn reset(&mut self) -> Result<(), Self::Error> {
+        self.resets += 1;
+        self.cursors.fill(0);
+        self.time.fill(0);
+        self.symbols.fill(0);
+        self.prev.fill(self.blank);
+        Ok(())
     }
 }
 
@@ -532,6 +696,54 @@ fn test_rnnt_labels_predictor_runs_only_on_emission_rounds() {
     assert_eq!(labels.predicts, 3);
 }
 
+// ─── decode_batch_blocks ──────────────────────────────────────────────────
+
+/// The WIND device-block loop must reproduce label-looping (and hence lockstep)
+/// exactly: identical texts and `(token_id, frame)` emissions per lane,
+/// independent of the block stride OR the decode window. Pins the device
+/// `forward_block` behavior, which had no isolated test.
+fn assert_blocks_match_labels(
+    scripts: Vec<Vec<usize>>,
+    valid_frames: Vec<usize>,
+    max_symbols: usize,
+    block_steps: usize,
+    window: usize,
+) {
+    let decoder = decoder_with(abc_vocab(), max_symbols);
+
+    let mut labels = MockBatchLabelStep::new(scripts.clone());
+    let expected = decoder.decode_batch_labels(&valid_frames, &mut labels).unwrap();
+
+    let mut blocks =
+        MockBatchBlockStep::new(scripts, valid_frames.clone(), decoder.blank_id(), max_symbols, block_steps, window);
+    let got = decoder.decode_batch_blocks(&valid_frames, &mut blocks).unwrap();
+    assert_eq!(blocks.resets, 1, "exactly one reset per decode");
+
+    assert_eq!(got, expected, "block stride {block_steps}, window {window}");
+}
+
+#[test_case::test_case(vec![vec![0, 3, 1, 3], vec![3; 4], vec![0, 1, 2, 0, 1, 2, 3, 3, 3]], vec![2, 1, 3], 2; "ragged with cap")]
+#[test_case::test_case(vec![vec![3; 8]], vec![8], 10; "blank only")]
+#[test_case::test_case(vec![vec![0, 1, 2, 3], vec![2, 3, 1, 3]], vec![2, 2], 10; "multi emit")]
+#[test_case::test_case(vec![vec![0, 3], vec![0, 3]], vec![1, 0], 10; "zero valid lane")]
+// WIND-specific subtleties the window scan must get right at W in {2,4,8}:
+#[test_case::test_case(vec![vec![3; 10]], vec![10], 10; "blank run longer than window")]
+#[test_case::test_case(vec![vec![3, 3, 3, 0, 3]], vec![5], 10; "first nonblank at last window offset")]
+#[test_case::test_case(vec![vec![3, 3, 0]], vec![3], 10; "emit at valid-1 window spills past valid")]
+#[test_case::test_case(vec![vec![3, 3, 0]], vec![4], 1; "jumped then cap")]
+#[test_case::test_case(vec![vec![0, 0, 0, 3]], vec![1], 2; "same-frame multi emit cap inside window")]
+fn test_rnnt_blocks_match_labels(scripts: Vec<Vec<usize>>, valid: Vec<usize>, max_symbols: usize) {
+    // The stride is a host-readback knob and the window is the WIND blank-skip
+    // width; equivalence must hold for every combination, including strides that
+    // split a frame's multi-emit run across block boundaries and windows that
+    // span more than a full blank run.
+    for block_steps in [1, 3, 16] {
+        for window in [1, 2, 4, 8] {
+            assert_blocks_match_labels(scripts.clone(), valid.clone(), max_symbols, block_steps, window);
+        }
+    }
+}
+
 // ─── frames_to_words ──────────────────────────────────────────────────────
 
 fn em(token_id: usize, frame: usize) -> TokenEmission {
@@ -651,6 +863,42 @@ proptest! {
             scripts.push(script);
         }
         assert_batch_matches_b1(scripts, valid, max_symbols);
+    }
+
+    /// WIND device-block decode ≡ label-looping decode for random scripts,
+    /// ragged frame counts, block strides, and decode windows. Pins
+    /// `forward_block` against the reference greedy loop without a GPU.
+    #[test]
+    fn prop_rnnt_blocks_match_labels(
+        n_lanes in 1usize..6,
+        max_symbols in 1usize..4,
+        block_steps in 1usize..6,
+        window in 1usize..9,
+        seed in any::<u64>(),
+    ) {
+        let blank = abc_vocab().len();
+        let mut state = seed;
+        let mut scripts = Vec::with_capacity(n_lanes);
+        let mut valid = Vec::with_capacity(n_lanes);
+        for _ in 0..n_lanes {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let frames = ((state >> 32) % 8) as usize; // 0..8 frames per lane
+            valid.push(frames);
+            // Enough tokens to cover the worst case (every frame caps): the
+            // mock clamps the cursor at the end regardless.
+            let mut script = Vec::with_capacity(frames * max_symbols + 1);
+            for _ in 0..(frames * max_symbols + 1) {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                let pick = if (state >> 32) % 5 < 3 { blank } else { ((state >> 32) % 3) as usize };
+                script.push(pick);
+            }
+            scripts.push(script);
+        }
+        // All-zero-valid is handled by an early return in the driver; skip it so
+        // the reset-count assertion stays meaningful.
+        if valid.iter().any(|&v| v > 0) {
+            assert_blocks_match_labels(scripts, valid, max_symbols, block_steps, window);
+        }
     }
 
     /// Timestamps are non-decreasing and each frame index is in `[0, valid_frames)`.

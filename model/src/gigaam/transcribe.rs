@@ -638,9 +638,17 @@ impl<S: Splitter> Transcriber<S> {
 
         if let HeadDecoder::Rnnt { backend, .. } = &self.head_decoder {
             let s = &backend.stats;
+            // `total_steps` is the device-step budget; `steps_emitted` is the
+            // useful fraction. The gap (blank-advance + finished-lane steps) and
+            // `n_blocks` (host syncs) are the levers a wider decode window cuts.
+            let block_steps = svod_arch::rnnt::BatchBlockStep::block_steps(backend) as u64;
+            let frames_total: usize = all_valid.iter().sum();
             tracing::info!(
                 target: "svod_model::gigaam::transcribe",
                 n_blocks = s.n_blocks,
+                total_steps = s.n_blocks * block_steps,
+                steps_emitted = s.steps_emitted,
+                frames_total,
                 exec_ms = s.t_exec.as_secs_f64() * 1e3,
                 recycle_ms = s.t_recycle.as_secs_f64() * 1e3,
                 read_ms = s.t_read.as_secs_f64() * 1e3,
