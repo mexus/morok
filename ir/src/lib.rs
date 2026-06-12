@@ -23,6 +23,7 @@ pub mod error;
 pub mod indexing;
 pub mod kernel_info;
 pub mod op;
+pub mod opt;
 pub mod prelude;
 pub mod shape;
 pub mod sint;
@@ -42,6 +43,7 @@ pub mod test;
 pub use error::{Error, IndexTypeMismatchSnafu, Result};
 pub use indexing::IndexSpec;
 pub use op::Op;
+pub use opt::{Opt, OptArg, OptOps};
 pub use sint::{IntoShrinkRange, SInt, ShrinkRange, sint_max, sint_min, sint_prod};
 pub use types::{
     AddrSpace, AxisId, AxisType, BinaryOp, BufferizeOpts, CallInfo, ConstValue, ConstValueHash, ContiguousHint,

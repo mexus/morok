@@ -210,7 +210,150 @@ pub fn linearize(sink: Arc<UOp>) -> Vec<Arc<UOp>> {
 
     // Step 5: Reverse result (we built backwards from sink)
     result.reverse();
-    result
+
+    // Step 6: Hoist loop-invariant pure scalar computations to the entry block.
+    //
+    // A range-independent value (e.g. `threadIdx % 64`, `(laneid // 16) * stride`)
+    // can be consumed by several sibling loops. The heap-based pass places it at
+    // its earliest-program consumer's scope, which for a multi-loop kernel may be
+    // *inside* one loop while a sibling loop also references it — the value then
+    // fails to dominate those uses (LLVM "does not dominate all uses"). Pulling
+    // every pure range-independent node ahead of the first RANGE puts it in the
+    // entry block, where it dominates the whole function. Safe because such a
+    // node's sources are themselves range-independent (a non-loop-ending op only
+    // grows its in-scope set), so the relative topo order is preserved.
+    hoist_to_home_scope(hoist_loop_invariant(result))
+}
+
+/// Float pure scalar value nodes out of any enclosing loop they do **not**
+/// depend on, into the body of their innermost in-scope range — the nested
+/// generalization of [`hoist_loop_invariant`]'s entry-block hoist.
+///
+/// The heap places a value at its *first forward consumer's* scope. When that
+/// consumer sits inside a sibling sub-loop, the value is trapped there and fails
+/// to dominate uses in the parent loop's *other* sibling sub-loops (LLVM "does
+/// not dominate all uses"). This bites whenever a loop-invariant index
+/// subexpression (e.g. `kv_idx * 16`) is shared between, say, a collaborative
+/// LDS-fill loop and a later masking loop — especially when the fill loop trips
+/// once, collapsing the run-count that would otherwise separate them.
+///
+/// A node whose in-scope ranges are `S` is lifted to just before the shallowest
+/// enclosing RANGE not in `S`; that lands it in the body of the deepest range it
+/// *does* depend on, before every sibling sub-loop, so it dominates them all.
+/// Safe: it is loop-invariant code motion in the move-up direction, and a node's
+/// sources have in-scope ⊆ `S` (so they are already before that point).
+fn hoist_to_home_scope(list: Vec<Arc<UOp>>) -> Vec<Arc<UOp>> {
+    use svod_ir::uop::cached_property::CachedProperty;
+    use svod_ir::uop::properties::InScopeRangesProperty;
+
+    let pure = |u: &Arc<UOp>| {
+        matches!(u.op(), Op::Special { .. } | Op::Binary(..) | Op::Unary(..) | Op::Cast { .. } | Op::BitCast { .. })
+    };
+
+    let n = list.len();
+    // Open ranges as (range id, input index of its RANGE marker), outer → inner.
+    let mut open: Vec<(u64, usize)> = Vec::new();
+    let mut target: Vec<Option<usize>> = vec![None; n];
+
+    for (i, u) in list.iter().enumerate() {
+        if pure(u) && !open.is_empty() {
+            #[allow(clippy::mutable_key_type)]
+            let s = InScopeRangesProperty::get(u);
+            // The shallowest enclosing range this node does not depend on: hoist
+            // before it (into the body of the deepest range it does depend on).
+            if let Some(&(_, marker)) = open.iter().find(|(rid, _)| !s.iter().any(|k| k.0.id == *rid)) {
+                target[i] = Some(marker);
+            }
+        }
+        for ended in u.op().ended_ranges() {
+            if matches!(ended.op(), Op::Range { .. })
+                && let Some(p) = open.iter().rposition(|(rid, _)| *rid == ended.id)
+            {
+                open.remove(p);
+            }
+        }
+        if matches!(u.op(), Op::Range { .. }) {
+            open.push((u.id, i));
+        }
+    }
+
+    if target.iter().all(Option::is_none) {
+        return list;
+    }
+
+    // Re-emit each hoisted node just before its target RANGE marker, preserving
+    // the topo order among nodes hoisted to the same marker.
+    let mut hoisted_before: HashMap<usize, Vec<usize>> = HashMap::new();
+    for (i, t) in target.iter().enumerate() {
+        if let Some(m) = t {
+            hoisted_before.entry(*m).or_default().push(i);
+        }
+    }
+    let mut out = Vec::with_capacity(n);
+    for (i, u) in list.iter().enumerate() {
+        if let Some(idxs) = hoisted_before.get(&i) {
+            for &j in idxs {
+                out.push(list[j].clone());
+            }
+        }
+        if target[i].is_none() {
+            out.push(u.clone());
+        }
+    }
+    out
+}
+
+/// Move pure, range-independent value nodes ahead of the first RANGE so they
+/// land in the entry block and dominate every (sibling-loop) use.
+fn hoist_loop_invariant(list: Vec<Arc<UOp>>) -> Vec<Arc<UOp>> {
+    use svod_ir::uop::cached_property::CachedProperty;
+    use svod_ir::uop::properties::InScopeRangesProperty;
+
+    let Some(first_range) = list.iter().position(|u| matches!(u.op(), Op::Range { .. })) else {
+        return list;
+    };
+
+    // A node is hoistable iff it is a pure scalar value op, is range-independent,
+    // and all of its sources are already available before the first RANGE (either
+    // in the original prefix or themselves hoisted earlier in this pass). The
+    // input is topo-ordered, so a single forward scan resolves the dependency
+    // condition.
+    let pure = |u: &Arc<UOp>| {
+        matches!(u.op(), Op::Special { .. } | Op::Binary(..) | Op::Unary(..) | Op::Cast { .. } | Op::BitCast { .. })
+    };
+    // Leaf ops that are always available in any block: literals (inlined by the
+    // renderer) and entry-block definitions (PARAM/DEFINE_*).
+    let always = |u: &Arc<UOp>| {
+        matches!(
+            u.op(),
+            Op::Const(_)
+                | Op::VConst { .. }
+                | Op::Param { .. }
+                | Op::DefineVar { .. }
+                | Op::DefineLocal(_)
+                | Op::DefineReg { .. }
+                | Op::Buffer { .. }
+        )
+    };
+    let mut available: std::collections::HashSet<u64> = list[..first_range].iter().map(|u| u.id).collect();
+    let mut hoist_ids: std::collections::HashSet<u64> = std::collections::HashSet::new();
+
+    for u in &list[first_range..] {
+        let sources_ready = u.op().sources().iter().all(|s| available.contains(&s.id) || always(s));
+        if pure(u) && sources_ready && InScopeRangesProperty::get(u).is_empty() {
+            hoist_ids.insert(u.id);
+            available.insert(u.id);
+        }
+    }
+    if hoist_ids.is_empty() {
+        return list;
+    }
+
+    let mut out = Vec::with_capacity(list.len());
+    out.extend(list[..first_range].iter().cloned());
+    out.extend(list[first_range..].iter().filter(|u| hoist_ids.contains(&u.id)).cloned());
+    out.extend(list[first_range..].iter().filter(|u| !hoist_ids.contains(&u.id)).cloned());
+    out
 }
 
 /// Compute the "run count" for a UOp based on its IN-SCOPE ranges.

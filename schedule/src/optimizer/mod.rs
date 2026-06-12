@@ -66,7 +66,7 @@ pub use renderer::{Renderer, TcOpt, TensorCore};
 pub use scheduler::Scheduler;
 #[cfg(test)]
 pub use scheduler::clear_kernel_name_counts;
-pub use types::{AxisType, Opt, OptArg, OptOps};
+pub use types::{AxisType, Opt, OptArg, OptArgExt, OptOps};
 
 use crate::devectorize::{
     Fp8DecompCtx, bool_storage_patterns, pm_float_decomp, pm_float_decomp_store, pm_reduce, pm_render,
@@ -601,17 +601,27 @@ pub fn optimize_kernel_with_config(
     renderer: &Renderer,
     config: &OptimizerConfig,
 ) -> Arc<svod_ir::UOp> {
-    // Pre-optimization: per-kernel stages.
+    // Author-supplied `opts_to_apply` (tinygrad parity) is read from the kernel
+    // SINK marker BEFORE pre-optimization. When set, it overrides the strategy:
+    // apply exactly those opts (an empty list applies none), never heuristics.
+    let explicit_opts = kernel_opts_to_apply(&ast);
+
+    // Pre-optimization: per-kernel stages. Kept ON for the explicit-opts path
+    // for parity with `OptStrategy::None` (which also keeps it).
     let pre_optimized = apply_pre_optimization(ast);
 
-    let optimized = match config.strategy {
-        OptStrategy::None => pre_optimized, // No heuristic optimization, but post-optimization still needed
-        OptStrategy::Heuristic => optimize_heuristic(pre_optimized, renderer, &config.heuristics),
-        OptStrategy::Beam { .. } => {
-            // Beam search requires a compile_and_time function.
-            // Use optimize_kernel_beam() for actual beam search.
-            // Fall back to heuristics for the simple API.
-            optimize_heuristic(pre_optimized, renderer, &config.heuristics)
+    let optimized = if let Some(opts) = explicit_opts {
+        apply_explicit_opts(pre_optimized, renderer, &opts)
+    } else {
+        match config.strategy {
+            OptStrategy::None => pre_optimized, // No heuristic optimization, but post-optimization still needed
+            OptStrategy::Heuristic => optimize_heuristic(pre_optimized, renderer, &config.heuristics),
+            OptStrategy::Beam { .. } => {
+                // Beam search requires a compile_and_time function.
+                // Use optimize_kernel_beam() for actual beam search.
+                // Fall back to heuristics for the simple API.
+                optimize_heuristic(pre_optimized, renderer, &config.heuristics)
+            }
         }
     };
 
@@ -620,6 +630,36 @@ pub fn optimize_kernel_with_config(
     // Pass the renderer to enable GPU dimension injection for GPU backends.
 
     apply_post_optimization_with_renderer(optimized, Some(renderer))
+}
+
+/// Read an author-supplied `opts_to_apply` list off a kernel SINK marker.
+///
+/// Mirrors tinygrad's `apply_opts` reading `ast.arg.opts_to_apply`. Returns
+/// `None` (optimizer chooses) unless the AST is a `Sink` whose `KernelInfo`
+/// carries an explicit list.
+fn kernel_opts_to_apply(ast: &Arc<svod_ir::UOp>) -> Option<Vec<Opt>> {
+    match ast.op() {
+        svod_ir::Op::Sink { info: Some(ki), .. } => ki.opts_to_apply.clone(),
+        _ => None,
+    }
+}
+
+/// Apply exactly the author-supplied opts (tinygrad's `apply_opts` inner loop).
+///
+/// `convert_loop_to_global` runs first (as tinygrad does), then each opt is
+/// applied in order. An empty list applies zero opts — the pass-through case
+/// for an already-lowered hand-built kernel. A failed opt is logged and skipped
+/// (this entry point is infallible); use a fallible wrapper if loud failure is
+/// needed.
+fn apply_explicit_opts(ast: Arc<svod_ir::UOp>, renderer: &Renderer, opts: &[Opt]) -> Arc<svod_ir::UOp> {
+    let mut scheduler = Scheduler::new(ast, renderer.clone());
+    let _ = scheduler.convert_loop_to_global();
+    for opt in opts {
+        if let Err(e) = apply_opt(&mut scheduler, opt, true) {
+            tracing::error!(opt = %opt, error = %e, "explicit opts_to_apply: apply_opt failed; skipping");
+        }
+    }
+    scheduler.get_optimized_ast(None)
 }
 
 /// Apply optimizations with explicit strategy selection (legacy API).

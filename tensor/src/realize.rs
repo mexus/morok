@@ -1361,17 +1361,23 @@ fn prepare_execution_plan(
             Arc::clone(cached)
         } else {
             let optimizer_renderer = get_optimizer_renderer(&item_device);
-            let optimized_ast = if let svod_schedule::OptStrategy::Beam { .. } = config.optimizer.strategy {
-                beam_search_optimize(
-                    item.ast.clone(),
-                    &optimizer_renderer,
-                    &item_device,
-                    &item.buffers,
-                    &config.optimizer,
-                )?
-            } else {
-                svod_schedule::optimize_kernel_with_config(item.ast.clone(), &optimizer_renderer, &config.optimizer)
-            };
+            // Author-supplied `opts_to_apply` (tinygrad parity) short-circuits
+            // before beam: such kernels must go through the heuristic entry so
+            // `apply_explicit_opts` honors the exact opt list (empty = none).
+            let has_explicit_opts =
+                matches!(item.ast.op(), Op::Sink { info: Some(ki), .. } if ki.opts_to_apply.is_some());
+            let optimized_ast =
+                if !has_explicit_opts && matches!(config.optimizer.strategy, svod_schedule::OptStrategy::Beam { .. }) {
+                    beam_search_optimize(
+                        item.ast.clone(),
+                        &optimizer_renderer,
+                        &item_device,
+                        &item.buffers,
+                        &config.optimizer,
+                    )?
+                } else {
+                    svod_schedule::optimize_kernel_with_config(item.ast.clone(), &optimizer_renderer, &config.optimizer)
+                };
 
             let kernel_name =
                 optimized_ast.metadata::<svod_schedule::optimizer::KernelInfo>().map(|info| info.function_name());

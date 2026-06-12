@@ -424,7 +424,17 @@ pub enum CustomFunctionKind {
 /// sources are distinct UOps.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 #[derive(serde::Serialize, serde::Deserialize)]
-pub struct KernelInfo {}
+#[serde(default)]
+pub struct KernelInfo {
+    /// Author-supplied optimization control, mirroring tinygrad's
+    /// `KernelInfo.opts_to_apply`:
+    /// - `None` — the optimizer chooses opts (heuristics or beam).
+    /// - `Some(vec![])` — apply *zero* opts; the AST is already in finished,
+    ///   hand-lowered form and must pass through untouched (e.g. a tile-DSL
+    ///   kernel).
+    /// - `Some(non-empty)` — apply exactly these opts, in order.
+    pub opts_to_apply: Option<Vec<crate::opt::Opt>>,
+}
 
 /// Axis type for loop ranges and reductions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

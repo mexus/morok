@@ -75,14 +75,6 @@ impl Renderer for LlvmTextRenderer {
 
         for (i, node) in nodes.iter().enumerate() {
             tracing::debug!(position = i, op = node.op().as_ref(), id = node.id, "linearized node");
-            if matches!(node.op(), Op::Custom { .. } | Op::CustomI { .. }) {
-                return Err(Error::InvalidGraph {
-                    reason: format!(
-                        "LLVM backend does not support CUSTOM/CUSTOMI templates (op id {}); use C backend for custom templates",
-                        node.id
-                    ),
-                });
-            }
         }
 
         let mut ctx = RenderContext::new();
@@ -288,6 +280,11 @@ impl Renderer for LlvmTextRenderer {
             module_blocks.push(ctx.module_prefix().join("\n"));
         }
 
+        // A `declare` can originate from both the auto-scan and a hoisted
+        // CUSTOM body line; LLVM forbids redefining a function, so keep only
+        // the first occurrence of each identical declaration.
+        let module_prefix = dedup_declares(module_blocks.join("\n\n"));
+
         let target_triple_line = match self.target {
             LlvmTarget::Cpu => String::new(),
             LlvmTarget::Amd(_) => "target triple = \"amdgcn-amd-amdhsa\"\n".to_string(),
@@ -306,7 +303,7 @@ entry:
 
 attributes #0 = {{ {attrs} }}
 "#,
-            module_prefix = module_blocks.join("\n\n"),
+            module_prefix = module_prefix,
             inner_params = inner_params.join(", "),
             inner_body = kernel.join("\n"),
         );
@@ -351,6 +348,21 @@ fn mangle_type(llvm_type: &str) -> String {
         }
         _ => llvm_type.to_string(),
     }
+}
+
+/// Remove duplicate `declare ...` lines from an assembled module prefix,
+/// keeping the first occurrence. Non-`declare` lines pass through unchanged.
+fn dedup_declares(prefix: String) -> String {
+    let mut seen = std::collections::HashSet::new();
+    let mut out: Vec<&str> = Vec::new();
+    for line in prefix.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("declare ") && !seen.insert(trimmed.to_string()) {
+            continue;
+        }
+        out.push(line);
+    }
+    out.join("\n")
 }
 
 fn generate_intrinsic_declarations(kernel: &[String], target: &LlvmTarget) -> String {

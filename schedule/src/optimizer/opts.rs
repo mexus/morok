@@ -11,7 +11,7 @@ use svod_ir::uop::cached_property::CachedProperty;
 use svod_ir::uop::properties::VminVmaxProperty;
 use svod_ir::{AxisType, ConstValue, Op, UOp, UOpKey};
 
-use crate::optimizer::{Opt, OptOps, Scheduler, error::*, tc};
+use crate::optimizer::{Opt, OptArgExt, OptOps, Scheduler, error::*, tc};
 
 // ============================================================================
 // DISPATCHER

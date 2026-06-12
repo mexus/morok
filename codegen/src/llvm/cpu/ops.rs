@@ -599,9 +599,78 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec<Stri
             Some(())
         }
 
-        // CUSTOM / CUSTOMI are intentionally absent: the LLVM text renderer
-        // rejects them at the entry point with a typed error before reaching
-        // here (see `llvm/text/mod.rs`).
+        // CUSTOMI is always inline: register the formatted template as this
+        // uop's operand string so consumers substitute it directly. Unlike C,
+        // LLVM SSA cannot inline a multi-instruction fragment, so the template
+        // must format to a single valid operand (a constant, a constexpr like
+        // `bitcast`/`getelementptr`, or an existing SSA value). For anything
+        // that needs its own instruction, use a typed `Custom` statement.
+        Op::CustomI { deps, code } => {
+            let args: Vec<String> = deps.iter().map(|dep| ctx.get(dep).to_string()).collect();
+            let expr = match crate::common::format_custom_template_strict(code, &args) {
+                Ok(s) => s,
+                Err(e) => {
+                    ctx.set_invalid_graph(format!("CUSTOMI template error on uop {}: {e}", uop.id));
+                    return None;
+                }
+            };
+            ctx.register(uop.id, expr);
+            Some(())
+        }
+
+        // CUSTOM emits raw LLVM IR. Any `declare ...` lines are hoisted to the
+        // module prefix (deduplicated) so custom bodies may reference intrinsics
+        // not in the renderer's built-in declaration set; remaining lines form
+        // the body. A `Void` custom is a bare statement block; a typed custom is
+        // a single instruction whose rendered text is the assignment RHS
+        // (e.g. `fmul float {0}, 2.0` → `%vN = fmul float %op, 2.0`) — the LLVM
+        // type lives in the RHS, so unlike C there is no separate declaration.
+        Op::Custom { deps, code } => {
+            let args: Vec<String> = deps.iter().map(|dep| ctx.get(dep).to_string()).collect();
+            let rendered = match crate::common::format_custom_template_strict(code, &args) {
+                Ok(s) => s,
+                Err(e) => {
+                    ctx.set_invalid_graph(format!("CUSTOM template error on uop {}: {e}", uop.id));
+                    return None;
+                }
+            };
+
+            let mut body_lines: Vec<String> = Vec::new();
+            for line in rendered.lines() {
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                if trimmed.starts_with("declare ") {
+                    let decl = trimmed.to_string();
+                    if !ctx.module_prefix().iter().any(|l| l == &decl) {
+                        ctx.push_module_prefix(decl);
+                    }
+                } else {
+                    body_lines.push(trimmed.to_string());
+                }
+            }
+
+            if uop.dtype() == DType::Void {
+                for line in &body_lines {
+                    kernel.push(format!("  {line}"));
+                }
+                ctx.register(uop.id, String::new());
+            } else {
+                if body_lines.len() != 1 {
+                    ctx.set_invalid_graph(format!(
+                        "typed CUSTOM on uop {} must render exactly one LLVM instruction RHS, got {} body line(s)",
+                        uop.id,
+                        body_lines.len()
+                    ));
+                    return None;
+                }
+                kernel.push(format!("  {dst} = {}", body_lines[0]));
+                ctx.register(uop.id, dst.clone());
+            }
+            Some(())
+        }
+
         op if op.is_movement() => {
             panic!(
                 "movement op {:?} (id={}) reached LLVM codegen — \
@@ -995,9 +1064,10 @@ fn render_multi_gep(
     if indices.len() == 1 {
         kernel.push(format!("  {dst} = bitcast {elem_type} {dst}.e0 to {out_type}"));
     } else {
+        // Start the insertelement chain from the `undef` constant — `%x = undef T`
+        // is NOT a valid instruction (matches `render_vectorize`).
         let count = indices.len();
-        kernel.push(format!("  {dst}.undef = undef <{count} x {elem_type}>"));
-        let mut prev = format!("{dst}.undef");
+        let mut prev = "undef".to_string();
         for i in 0..count {
             let next = if i == count - 1 { dst.to_string() } else { format!("{dst}.v{i}") };
             kernel.push(format!(

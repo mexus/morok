@@ -456,3 +456,78 @@ fn assert_llvm_ir_assembles(ir: &str) {
     let (ok, stderr) = run(ir);
     assert!(ok, "llvm-as rejected the emitted AMD IR:\n{ir}\n--- llvm-as stderr ---\n{stderr}");
 }
+
+#[test]
+fn test_custom_typed_statement_emits_ssa_assignment() {
+    // A typed CUSTOM renders the RHS of an SSA assignment (`%v = <rhs>`); the
+    // LLVM type lives in the RHS, so the template is a full instruction RHS.
+    let a = UOp::param(0, 1, DType::Float32.ptr(Some(1), AddrSpace::Global), None);
+    let out = UOp::param(1, 1, DType::Float32.ptr(Some(1), AddrSpace::Global), None);
+    let idx = UOp::index_const(0);
+    let a_idx = UOp::index().buffer(a.clone()).indices(vec![idx.clone()]).call().unwrap();
+    let out_idx = UOp::index().buffer(out.clone()).indices(vec![idx.clone()]).call().unwrap();
+    let a_load = UOp::load().buffer(a.clone()).index(a_idx).call();
+    let custom = UOp::custom(smallvec::smallvec![a_load], "fmul float {0}, 2.0".to_string(), DType::Float32);
+    let store = out_idx.store(custom);
+    let sink = UOp::sink(vec![store]);
+    let linear = UOp::linear(svod_schedule::linearize_with_cfg(sink).into());
+
+    let result = render(&linear, Some("custom_typed")).unwrap();
+    println!("{}", result.code);
+    assert!(result.code.contains("= fmul float"), "typed CUSTOM should emit an fmul assignment:\n{}", result.code);
+    assert!(result.code.contains(", 2.0"), "template literal should survive:\n{}", result.code);
+}
+
+#[test]
+fn test_customi_inline_is_substituted_into_consumer() {
+    // CUSTOMI registers its formatted text as an operand and is inlined into
+    // consumers rather than emitted as its own instruction.
+    let out = UOp::param(0, 1, DType::Float32.ptr(Some(1), AddrSpace::Global), None);
+    let idx = UOp::index_const(0);
+    let out_idx = UOp::index().buffer(out.clone()).indices(vec![idx.clone()]).call().unwrap();
+    let inline = UOp::customi(smallvec::SmallVec::new(), "4.0".to_string(), DType::Float32);
+    let store = out_idx.store(inline);
+    let sink = UOp::sink(vec![store]);
+    let linear = UOp::linear(svod_schedule::linearize_with_cfg(sink).into());
+
+    let result = render(&linear, Some("customi_inline")).unwrap();
+    println!("{}", result.code);
+    assert!(result.code.contains("store float 4.0"), "CUSTOMI text should be inlined into the store:\n{}", result.code);
+}
+
+#[test]
+fn test_custom_void_hoists_declare_to_module_prefix_amd() {
+    // A Void CUSTOM emits raw IR lines; any `declare` is hoisted (deduplicated)
+    // to the module prefix so custom bodies can reference arbitrary intrinsics.
+    let out = UOp::param(0, 1, DType::Float32.ptr(Some(1), AddrSpace::Global), None);
+    let idx = UOp::index_const(0);
+    let out_idx = UOp::index().buffer(out.clone()).indices(vec![idx.clone()]).call().unwrap();
+    let one = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+    let store = out_idx.store(one);
+    let custom = UOp::custom(
+        smallvec::SmallVec::new(),
+        "declare void @llvm.amdgcn.s.barrier()\ncall void @llvm.amdgcn.s.barrier()".to_string(),
+        DType::Void,
+    );
+    let sink = UOp::sink(vec![store, custom]);
+    let result = render_amd_linearized(&sink, AmdArch::Gfx942, "custom_void");
+    println!("{}", result.code);
+
+    assert!(
+        result.code.contains("declare void @llvm.amdgcn.s.barrier()"),
+        "declare should be hoisted to the module prefix:\n{}",
+        result.code
+    );
+    assert!(
+        result.code.contains("call void @llvm.amdgcn.s.barrier()"),
+        "the call body line should be emitted:\n{}",
+        result.code
+    );
+    // The declare must appear exactly once even though it was inside the body.
+    assert_eq!(
+        result.code.matches("declare void @llvm.amdgcn.s.barrier()").count(),
+        1,
+        "declare should be deduplicated:\n{}",
+        result.code
+    );
+}
