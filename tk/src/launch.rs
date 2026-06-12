@@ -1,0 +1,374 @@
+//! Direct kernel launch — the svod analog of tinygrad's `run_linear`.
+//!
+//! Tinygrad runs a hand-built tile kernel by compiling its SINK straight through
+//! the program pipeline and dispatching it against concrete buffers, *bypassing*
+//! the tensor scheduler entirely (`test/testextra/test_tk.py`):
+//!
+//! ```python
+//! linear = UOp(Ops.LINEAR, src=(sink.call(*buffer_uops),))
+//! run_linear(linear)   # compile + dispatch, writes outputs in place
+//! ```
+//!
+//! [`launch`] is that path: `program_from_sink` → render → compile → runtime →
+//! [`Program::execute`], with the concrete buffers ordered by the compiled ABI
+//! (`ProgramSpec.globals`, the sorted PARAM slot list). The kernel body's PARAM
+//! placeholders (minted by [`Kernel`](crate::Kernel)) bind positionally to the
+//! buffers exactly as tinygrad's `sink.call(bufs)` binds them — there is no
+//! scheduler, no `After`-wrapping, no buffer reallocation.
+
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use snafu::{IntoError, ResultExt, Snafu};
+use svod_codegen::program_pipeline::{self, ProgramTarget};
+use svod_device::Buffer;
+use svod_device::device::{Device, Program, ProgramSpec};
+use svod_ir::UOp;
+use svod_tensor::Tensor;
+
+/// Result type for the launch path.
+pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+/// Errors raised while compiling or dispatching a hand-built kernel.
+///
+/// Nested backend errors are boxed (`svod_runtime::Error` alone is ~144 B), so
+/// the enum — and any `Result<(), Error>` returned from the hot dispatch path —
+/// stays small (`clippy::result_large_err`).
+#[derive(Debug, Snafu)]
+#[snafu(visibility(pub))]
+pub enum Error {
+    /// The SINK could not be rendered/compiled through the program pipeline.
+    #[snafu(display("compile kernel {name:?}: {source}"))]
+    Compile {
+        name: String,
+        #[snafu(source(from(svod_device::Error, Box::new)))]
+        source: Box<svod_device::Error>,
+    },
+
+    /// The runtime factory rejected the compiled spec.
+    #[snafu(display("instantiate runtime for {name:?}: {source}"))]
+    Runtime {
+        name: String,
+        #[snafu(source(from(svod_device::Error, Box::new)))]
+        source: Box<svod_device::Error>,
+    },
+
+    /// Resolving the concrete `Device` (renderer/compiler/runtime) failed.
+    #[snafu(display("resolve device for spec {spec}: {source}"))]
+    DeviceFactory {
+        spec: String,
+        #[snafu(source(from(svod_runtime::Error, Box::new)))]
+        source: Box<svod_runtime::Error>,
+    },
+
+    /// Obtaining an allocator for the buffer's device failed.
+    #[snafu(display("allocator for spec {spec}: {source}"))]
+    Allocator {
+        spec: String,
+        #[snafu(source(from(svod_device::Error, Box::new)))]
+        source: Box<svod_device::Error>,
+    },
+
+    /// Deriving the dispatch ABI / launch dimensions failed.
+    #[snafu(display("program spec for {name:?}: {source}"))]
+    Spec {
+        name: String,
+        #[snafu(source(from(svod_device::Error, Box::new)))]
+        source: Box<svod_device::Error>,
+    },
+
+    /// A buffer referenced by the ABI was not supplied or could not allocate.
+    #[snafu(display("buffer slot {slot} (of {supplied} supplied): {reason}"))]
+    Buffer { slot: usize, supplied: usize, reason: String },
+
+    /// Realizing or allocating a tensor argument failed.
+    #[snafu(display("realize tensor argument: {source}"))]
+    Realize {
+        #[snafu(source(from(svod_tensor::error::Error, Box::new)))]
+        source: Box<svod_tensor::error::Error>,
+    },
+
+    /// The kernel dispatch itself failed.
+    #[snafu(display("dispatch kernel {name:?}: {source}"))]
+    Dispatch {
+        name: String,
+        #[snafu(source(from(svod_device::Error, Box::new)))]
+        source: Box<svod_device::Error>,
+    },
+}
+
+/// Compile `sink` for `device` and dispatch it against `buffers`, populating the
+/// output buffer(s) in place. `buffers` are ordered output(s)-first then inputs,
+/// matching the `gl()` declaration order in the kernel body (PARAM slots 0,1,…).
+///
+/// The compiled ABI (`ProgramSpec.globals`) is a *sorted* slot list, so the
+/// concrete pointer for ABI position `i` is `buffers[globals[i]]`. With the
+/// canonical declaration order `globals[i] == i`, but we index through `globals`
+/// so a kernel that declares slots out of order still binds correctly.
+pub fn launch(device: &Device, sink: Arc<UOp>, buffers: &[Buffer]) -> Result<()> {
+    let compiled = compile(device, sink, buffers)?;
+    // SAFETY: `compile` resolved + allocated every ABI buffer pointer, and the
+    // synchronous dispatch (`wait=true`) holds them for the call's duration.
+    unsafe { compiled.dispatch(true) }
+}
+
+/// A compiled kernel bound to concrete buffers, ready for repeated dispatch —
+/// the compile-once analog of [`launch`]. Render + compile happen exactly once
+/// (in [`compile`]); [`CompiledLaunch::dispatch`] only re-issues the kernel, so
+/// a benchmark (or any hot loop) pays the pipeline cost once and times pure
+/// dispatch. The bound buffers are held (`Buffer` is `Arc`-backed) so their
+/// allocations outlive every replay.
+pub struct CompiledLaunch {
+    prog: Box<dyn Program>,
+    ptrs: Vec<*mut u8>,
+    global_size: [usize; 3],
+    local_size: Option<[usize; 3]>,
+    vals: Vec<i64>,
+    name: String,
+    /// Keeps the bound allocations alive for the lifetime of the raw `ptrs`.
+    _buffers: Vec<Buffer>,
+}
+
+impl CompiledLaunch {
+    /// Re-dispatch the compiled kernel against its bound buffers. `wait=true`
+    /// blocks to completion (so wall-clock timing around it is valid);
+    /// `wait=false` submits asynchronously (pair with a trailing `wait=true`
+    /// dispatch, or the backend's own sync, to drain the timeline).
+    ///
+    /// # Safety
+    ///
+    /// The bound buffers must still be allocated (they are, while `self` lives)
+    /// and the caller must avoid concurrent races on them.
+    pub unsafe fn dispatch(&self, wait: bool) -> Result<()> {
+        // SAFETY: pointers are allocated + sized to the kernel's expectations and
+        // held alive by `self._buffers`; the caller upholds the race contract.
+        unsafe {
+            self.prog
+                .execute(&self.ptrs, &self.vals, Some(self.global_size), self.local_size, wait)
+                .context(DispatchSnafu { name: self.name.clone() })
+        }
+    }
+
+    /// Dispatch once through a profiling execution context and return the
+    /// **GPU device time** in nanoseconds (`end_ns − start_ns`) from the
+    /// HW-stamped dispatch timestamps, or `Ok(None)` when the backend does not
+    /// stamp dispatches (CPU: `new_exec_context` yields `None`, or the context
+    /// returns no timestamp handle). Wall-clock around this call is *not* the
+    /// device time — it includes the context mint + the `synchronize` drain.
+    ///
+    /// Mirrors [`svod_runtime::ExecutionPlan::execute_profiled`]: mint a
+    /// per-program `PlanContext`, submit the dispatch (async), drain with
+    /// `synchronize` so the GPU has written back the per-dispatch stamps, then
+    /// read `timestamps_ns()`. The 10 ns/tick CP stamp gives true on-device
+    /// kernel time, free of host launch/submit overhead.
+    ///
+    /// # Safety
+    ///
+    /// Identical contract to [`CompiledLaunch::dispatch`]: the bound buffers
+    /// stay allocated while `self` lives and the caller avoids data races.
+    pub fn dispatch_gpu_ns(&self) -> Result<Option<u64>> {
+        let Some(ctx) = self.prog.new_exec_context().context(DispatchSnafu { name: self.name.clone() })? else {
+            return Ok(None);
+        };
+        // SAFETY: pointers are allocated + sized to the kernel's expectations and
+        // held alive by `self._buffers`; same contract as `dispatch`.
+        let handle = unsafe {
+            ctx.dispatch(&*self.prog, &self.ptrs, &self.vals, Some(self.global_size), self.local_size)
+                .context(DispatchSnafu { name: self.name.clone() })?
+        };
+        ctx.synchronize().context(DispatchSnafu { name: self.name.clone() })?;
+        Ok(handle.and_then(|h| h.timestamps_ns()).map(|(s, e)| e - s))
+    }
+
+    /// The compiled kernel's entry-point name.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// The resolved launch dimensions (`global`, `local`) baked at compile time.
+    pub fn launch_dims(&self) -> ([usize; 3], Option<[usize; 3]>) {
+        (self.global_size, self.local_size)
+    }
+}
+
+/// Compile `sink` for `device` against `buffers` and return a [`CompiledLaunch`]
+/// for repeated dispatch. [`launch`] is exactly `compile(..)?.dispatch(true)`;
+/// factoring the render+compile out lets a benchmark loop only the dispatch.
+///
+/// `buffers` are ordered output(s)-first then inputs, matching the `gl()`
+/// declaration order in the kernel body (PARAM slots 0,1,…). The compiled ABI
+/// (`ProgramSpec.globals`) is a *sorted* slot list, so position `i` binds
+/// `buffers[globals[i]]` (identity for canonical declaration order).
+pub fn compile(device: &Device, sink: Arc<UOp>, buffers: &[Buffer]) -> Result<CompiledLaunch> {
+    // Lower `Index`-typed addressing arithmetic to a concrete int width. The
+    // normal tensor pipeline does this in the optimizer (stage 15), which the
+    // direct-launch path bypasses (`opts_to_apply = Some(vec![])` skips opts) —
+    // so a hand-built kernel's offset MULs/DIVs would otherwise reach codegen as
+    // `Scalar(Index)` and panic. Idempotent on already-lowered graphs.
+    let sink = svod_schedule::graph_rewrite(&svod_schedule::symbolic::pm_lower_index_dtype(), sink, &mut ());
+
+    // PROGRAM(sink, device) → SOURCE → BINARY (render + compile, cached nowhere
+    // here; repeated launches recompile — the JIT cache lives a layer up).
+    let program = program_pipeline::program_from_sink(sink, device.device.clone());
+    let kernel_name = ProgramSpec::from_uop(&program).ok().map(|s| s.name).unwrap_or_else(|| "tk_kernel".into());
+
+    let rendered = program_pipeline::get_program(
+        &program,
+        device.renderer.as_ref(),
+        device.compiler.as_ref(),
+        Some(&kernel_name),
+        ProgramTarget::Source,
+    )
+    .context(CompileSnafu { name: kernel_name.clone() })?;
+
+    let (compiled_program, compiled) = program_pipeline::do_compile(&rendered, device.compiler.as_ref())
+        .context(CompileSnafu { name: kernel_name.clone() })?;
+
+    let spec = ProgramSpec::from_uop(&compiled_program).context(SpecSnafu { name: kernel_name.clone() })?;
+    let prog = (device.runtime)(&compiled).context(RuntimeSnafu { name: kernel_name.clone() })?;
+
+    // Resolve buffer pointers in the compiled ABI order (sorted PARAM slots).
+    let mut ptrs: Vec<*mut u8> = Vec::with_capacity(spec.globals.len());
+    for &slot in &spec.globals {
+        let buf = buffers.get(slot).ok_or_else(|| {
+            BufferSnafu { slot, supplied: buffers.len(), reason: "no buffer supplied for this ABI slot".to_string() }
+                .build()
+        })?;
+        buf.ensure_allocated()
+            .map_err(|e| BufferSnafu { slot, supplied: buffers.len(), reason: e.to_string() }.build())?;
+        // SAFETY: the buffer is allocated and held alive by `_buffers` below for
+        // the lifetime of the `CompiledLaunch` (and thus of these raw pointers).
+        ptrs.push(unsafe { buf.as_raw_ptr() });
+    }
+
+    // No symbolic vars in a hand-built kernel: empty var map yields the concrete
+    // grid/block dims baked into the SPECIAL ops (or the [1,1,1] defaults).
+    let var_vals: HashMap<&str, i64> = HashMap::new();
+    let dims = spec.launch_dims(&var_vals).context(SpecSnafu { name: kernel_name.clone() })?;
+    let vals: Vec<i64> = spec.var_names.iter().map(|n| var_vals.get(n.as_str()).copied().unwrap_or(0)).collect();
+
+    Ok(CompiledLaunch {
+        prog,
+        ptrs,
+        global_size: dims.global_size,
+        local_size: dims.local_size,
+        vals,
+        name: kernel_name,
+        _buffers: buffers.to_vec(),
+    })
+}
+
+/// Realize `ins`, allocate/realize `outs`, then build and launch a hand-written
+/// kernel against their concrete buffers — the high-level [`launch`] wrapper that
+/// mirrors the `Tensor.realize(...) → sink.call(...) → run_linear` dance.
+///
+/// `build` receives a [`Kernel`](crate::Kernel) already bound to the realized
+/// buffers (outputs first, then inputs, matching `gl()` order) and returns the
+/// finished SINK (`ker.finish(..)`). Outputs are written in place.
+pub fn run_kernel<F>(
+    name: impl Into<String>,
+    grid: [i64; 3],
+    block: i64,
+    outs: &mut [&mut Tensor],
+    ins: &[&Tensor],
+    build: F,
+) -> Result<()>
+where
+    F: FnOnce(&crate::Kernel) -> Arc<UOp>,
+{
+    let compiled = compile_kernel(name, grid, block, outs, ins, build)?;
+    // SAFETY: `compile_kernel` realized + allocated every bound buffer, which the
+    // `CompiledLaunch` keeps alive; the synchronous dispatch holds them.
+    unsafe { compiled.dispatch(true) }
+}
+
+/// Realize `ins`, allocate/realize `outs`, build a hand-written kernel against
+/// their concrete buffers, and **compile it once** into a [`CompiledLaunch`] for
+/// repeated dispatch — the compile-once analog of [`run_kernel`].
+///
+/// [`run_kernel`] is exactly `compile_kernel(..)?.dispatch(true)`. Splitting the
+/// compile out lets a benchmark build + compile a kernel once and then loop only
+/// [`CompiledLaunch::dispatch`], excluding render/compile from the timed region.
+/// Outputs are written in place on each dispatch (the bound output buffer is
+/// registered to its tensor, so `out.as_vec()` reads the kernel's last write).
+pub fn compile_kernel<F>(
+    name: impl Into<String>,
+    grid: [i64; 3],
+    block: i64,
+    outs: &mut [&mut Tensor],
+    ins: &[&Tensor],
+    build: F,
+) -> Result<CompiledLaunch>
+where
+    F: FnOnce(&crate::Kernel) -> Arc<UOp>,
+{
+    // Inputs must hold concrete DATA: realize (compute) any lazy graph first.
+    // Outputs are allocated fresh by `realize_buffer` below.
+    for t in ins.iter() {
+        // Inputs are immutable refs; realize via a clone that shares the entry/buffer.
+        let mut t = (*t).clone();
+        t.realize().context(RealizeSnafu)?;
+    }
+
+    // Gather concrete buffers + their BUFFER UOps in ABI declaration order.
+    let mut buffers: Vec<Buffer> = Vec::with_capacity(outs.len() + ins.len());
+    let mut buf_uops: Vec<Arc<UOp>> = Vec::with_capacity(outs.len() + ins.len());
+    for t in outs.iter() {
+        buffers.push(realize_buffer(t)?);
+        buf_uops.push(t.uop().base());
+    }
+    for t in ins.iter() {
+        buffers.push(realize_buffer(t)?);
+        buf_uops.push(t.uop().base());
+    }
+
+    // Resolve the concrete Device (renderer/compiler/runtime) for the buffers'
+    // device, honoring the env-selected CPU backend like the realize path does.
+    let device_spec = buffers[0].allocator().device_spec();
+    let device = svod_runtime::DEVICE_FACTORIES
+        .device(&device_spec, svod_device::registry::registry())
+        .context(DeviceFactorySnafu { spec: format!("{device_spec:?}") })?;
+
+    let ker = crate::Kernel::new(name, grid, block, buf_uops);
+    let sink = build(&ker);
+    compile(&device, sink, &buffers)
+}
+
+/// Fetch a tensor's concrete buffer, allocating + registering one on demand.
+///
+/// `Tensor::empty(..)` mints a BUFFER UOp but no backing allocation (svod's
+/// `realize` short-circuits for buffer-identity tensors without allocating), so
+/// the direct-launch path must materialize output buffers itself — the svod
+/// analog of tinygrad's `b.allocate()` inside `run_linear`. Inputs already carry
+/// a buffer (`from_slice`), so this only allocates for fresh outputs.
+pub fn realize_buffer(t: &Tensor) -> Result<Buffer> {
+    if let Some(buf) = t.buffer() {
+        buf.ensure_allocated()
+            .map_err(|e| BufferSnafu { slot: 0usize, supplied: 0usize, reason: e.to_string() }.build())?;
+        return Ok(buf);
+    }
+
+    // No backing buffer: allocate one sized to the tensor's logical shape on its
+    // BUFFER UOp's device, then register it so `t.buffer()` resolves it.
+    let base = t.uop().base();
+    let svod_ir::Op::Buffer { device, size, .. } = base.op() else {
+        return Err(RealizeSnafu.into_error(svod_tensor::error::Error::NoBuffer));
+    };
+    let svod_ir::Op::Device(spec) = device.op() else {
+        return Err(RealizeSnafu.into_error(svod_tensor::error::Error::NoBuffer));
+    };
+    let dtype = base.dtype();
+    let shape: Vec<usize> = t
+        .shape()
+        .ok()
+        .and_then(|s| s.iter().map(|d| d.as_const()).collect::<Option<Vec<_>>>())
+        .unwrap_or_else(|| vec![*size]);
+
+    let allocator =
+        svod_device::registry::registry().get(spec).context(AllocatorSnafu { spec: format!("{spec:?}") })?;
+    let buffer = Buffer::allocate(allocator, dtype, shape, Default::default())
+        .map_err(|e| BufferSnafu { slot: 0usize, supplied: 0usize, reason: e.to_string() }.build())?;
+    let buffer = Arc::new(buffer);
+    svod_tensor::tensor_registry::register_buffer_by_uop_id(base.id, buffer.clone());
+    Ok((*buffer).clone())
+}

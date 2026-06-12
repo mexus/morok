@@ -1,0 +1,1014 @@
+//! The [`Group`] — a cooperating set of warps that owns the movement, load,
+//! store, and WMMA ops, ported from tinygrad `extra/thunder/tiny/tk/group.py`.
+//!
+//! Each op opens its own *untracked* loops ([`Kernel::raw_range`]), builds the
+//! terminal store closing those loops (`store.end(ranges)`, with a workgroup
+//! `barrier` for the coalesced GLOBAL→LOCAL fill), records it via
+//! [`Kernel::push_store`], and returns the destination tile *rewrapped* with an
+//! `After([END(STORE)])` dependency — so a later read of the tile is ordered
+//! after the write (tinygrad's `dst.after(dst_store)`).
+
+use std::sync::Arc;
+
+use smallvec::{SmallVec, smallvec};
+use svod_dtype::DType;
+use svod_ir::{AxisType, ConstValue, RendererDevice, UOp, WmmaMetadata, WmmaUpcastAxes};
+
+use crate::WARP_THREADS;
+use crate::index::{Idx, cidx, flat_index, flat_offset, index_off, load_at, load_off, load_vec};
+use crate::kernel::Kernel;
+use crate::tile::{GL, RT, RV, RegTile, ST, Tile};
+use crate::tiles::TileLayout;
+
+// ── Index (i64-typed) arithmetic helpers ───────────────────────────────────
+
+fn idiv(a: &Arc<UOp>, k: i64) -> Arc<UOp> {
+    a.try_div(&cidx(k)).expect("idiv")
+}
+fn imod(a: &Arc<UOp>, k: i64) -> Arc<UOp> {
+    a.try_mod(&cidx(k)).expect("imod")
+}
+fn imul(a: &Arc<UOp>, k: i64) -> Arc<UOp> {
+    if k == 1 { a.clone() } else { a.try_mul(&cidx(k)).expect("imul") }
+}
+fn iadd(a: &Arc<UOp>, b: &Arc<UOp>) -> Arc<UOp> {
+    a.try_add(b).expect("iadd")
+}
+fn idx_mul(idx: &Idx, k: i64) -> Idx {
+    match idx {
+        Idx::Const(c) => Idx::Const(c * k),
+        Idx::Uop(u) => Idx::Uop(imul(u, k)),
+    }
+}
+
+/// The wave sub-tile fragment index for a shared-tile axis (SI-1):
+/// `block * frags + local`, where `block` (a wave's row/col in the wave grid,
+/// already including `warp_row`/`warp_col`) selects which `frags`-tall slice of
+/// the shared tile this wave reads/writes. `None` ⇒ no offset (single-warp).
+fn wave_offset(block: Option<&Idx>, frags: i64, local: &Arc<UOp>) -> Idx {
+    match block {
+        None => Idx::from(local),
+        Some(b) => Idx::Uop(iadd(&imul(&b.to_uop(), frags), local)),
+    }
+}
+
+/// The per-lane (row, col) within a base fragment. `transpose` selects the
+/// "fragment is laid out column-major in registers" branch (group.py: either
+/// `rt.layout != st.layout` for the LDS hops, or `rt.layout == COL` for the
+/// global hops); `inner` is the upcast element index.
+fn lane_rc(
+    transpose: bool,
+    laneid: &Arc<UOp>,
+    rows: i64,
+    cols: i64,
+    stride: i64,
+    inner: &Arc<UOp>,
+) -> (Arc<UOp>, Arc<UOp>) {
+    if transpose {
+        (iadd(&imul(&idiv(laneid, cols), stride), inner), imod(laneid, cols))
+    } else {
+        (imod(laneid, rows), iadd(&imul(&idiv(laneid, rows), stride), inner))
+    }
+}
+
+/// The verified gfx942 K=16 bf16→f32 wave64 WMMA descriptor
+/// (`mfma.f32.16x16x16bf16.1k`). Only the `upcast_axes` *products* matter for a
+/// pre-built WMMA: a/b/c each = 4, so operands are `bf16.vec(4)`/`bf16.vec(4)`
+/// and the accumulator/result `f32.vec(4)`.
+fn wmma_16_16_16_bf16_f32() -> WmmaMetadata {
+    WmmaMetadata {
+        name: "WMMA_16_16_16_bfloat_float".into(),
+        dims: (16, 16, 16),
+        dtype_in: DType::BFloat16,
+        dtype_out: DType::Float32,
+        device: RendererDevice::AmdCdna3,
+        threads: 64,
+        upcast_axes: WmmaUpcastAxes { a: vec![(4, 2), (3, 2)], b: vec![(4, 2), (3, 2)], c: vec![(4, 2), (3, 2)] },
+        reduce_axes: vec![],
+        tile_grid: (1, 1),
+    }
+}
+
+/// Scalar geometry of the coalesced GLOBAL↔LDS fill for one ST tile (the part
+/// independent of the global source / tile position). Shared by the direct fill
+/// and the M2 register-staged prefetch so both address LDS identically.
+struct LdsGeom {
+    ept: i64,
+    st_cols: i64,
+    memcpy_per_row: i64,
+    base_rows: i64,
+    base_cols: i64,
+    total_calls: i64,
+    num_valid: i64,
+    clamp: bool,
+}
+
+/// A cooperating set of `warps` waves laid out in a `rows_waves × cols_waves`
+/// grid (tinygrad `Group` / HK `group<NUM_WARPS>`). Each wave owns a sub-tile of
+/// the shared tiles; the GLOBAL→LDS fill is collaborative over all
+/// `group_threads`.
+pub struct Group<'k> {
+    pub warps: usize,
+    pub rows_waves: usize,
+    pub cols_waves: usize,
+    group_threads: usize,
+    ker: &'k Kernel,
+}
+
+impl Kernel {
+    /// A single-warp group (tinygrad `ker.warp`).
+    pub fn warp(&self) -> Group<'_> {
+        self.group_2d(1, 1)
+    }
+    /// An `n`-warp group laid out `1×n` (tinygrad `ker.group`).
+    pub fn group(&self, n: usize) -> Group<'_> {
+        self.group_2d(1, n)
+    }
+    /// An `R×C`-wave group: one workgroup runs `rows_waves * cols_waves` waves
+    /// (`group_threads = warps * 64`), each owning a sub-tile of the shared
+    /// tiles (HK 2×4 wave grid, `GEMM:67-68`).
+    pub fn group_2d(&self, rows_waves: usize, cols_waves: usize) -> Group<'_> {
+        let warps = rows_waves * cols_waves;
+        Group { warps, rows_waves, cols_waves, group_threads: warps * WARP_THREADS, ker: self }
+    }
+}
+
+impl<'k> Group<'k> {
+    /// The group lane id (`threadIdx % group_threads`).
+    fn laneid(&self) -> Arc<UOp> {
+        imod(&self.ker.thread_idx, self.group_threads as i64)
+    }
+
+    /// Total threads in the workgroup (`warps * 64`) — the launch block size.
+    pub fn group_threads(&self) -> usize {
+        self.group_threads
+    }
+
+    /// The wave's flat index within the group (`(threadIdx % group_threads)/64`).
+    pub fn warpid_in_group(&self) -> Arc<UOp> {
+        idiv(&imod(&self.ker.thread_idx, self.group_threads as i64), WARP_THREADS as i64)
+    }
+    /// The wave's row in the `rows_waves × cols_waves` wave grid (`GEMM:67`).
+    pub fn warp_row(&self) -> Arc<UOp> {
+        idiv(&self.warpid_in_group(), self.cols_waves as i64)
+    }
+    /// The wave's column in the wave grid (`GEMM:68`).
+    pub fn warp_col(&self) -> Arc<UOp> {
+        imod(&self.warpid_in_group(), self.cols_waves as i64)
+    }
+
+    // ── single-warp register ops ────────────────────────────────────────────
+
+    /// Fill a register tile with `value` (tinygrad `clear`).
+    fn clear(&self, reg: RT<'k>, value: f64) -> RT<'k> {
+        // Per-lane register fill: identical on every wave (each clears its own RT).
+        let rngs: Vec<Arc<UOp>> = reg.shape().iter().map(|&d| self.ker.raw_range(d as i64, AxisType::Loop)).collect();
+        let idxs: Vec<Idx> = rngs.iter().map(Idx::from).collect();
+        let cv = if reg.elem().is_float() { ConstValue::Float(value) } else { ConstValue::Int(value as i64) };
+        let val = UOp::const_(reg.elem().clone(), cv);
+        let store = flat_index(reg.uop(), reg.shape(), &idxs).store(val);
+        let ended = store.end(SmallVec::from_vec(rngs));
+        self.finalize_reg(reg, ended)
+    }
+
+    /// Zero a register tile.
+    pub fn zero(&self, reg: RT<'k>) -> RT<'k> {
+        self.clear(reg, 0.0)
+    }
+    /// Fill a register tile with `1` (tinygrad `ones`).
+    pub fn ones(&self, reg: RT<'k>) -> RT<'k> {
+        self.clear(reg, 1.0)
+    }
+    /// Fill a register tile with `-∞` (tinygrad `neg_inf`).
+    pub fn neg_inf(&self, reg: RT<'k>) -> RT<'k> {
+        self.clear(reg, f64::NEG_INFINITY)
+    }
+    /// Fill a register *vector* with `value` (the [`RV`] analog of [`clear`]).
+    pub fn clear_rv(&self, rv: RV<'k>, value: f64) -> RV<'k> {
+        assert_eq!(self.warps, 1, "clear_rv is a single-warp op");
+        let rngs: Vec<Arc<UOp>> = rv.shape().iter().map(|&d| self.ker.raw_range(d as i64, AxisType::Loop)).collect();
+        let idxs: Vec<Idx> = rngs.iter().map(Idx::from).collect();
+        let cv = if rv.elem().is_float() { ConstValue::Float(value) } else { ConstValue::Int(value as i64) };
+        let val = UOp::const_(rv.elem().clone(), cv);
+        let ended = flat_index(rv.uop(), rv.shape(), &idxs).store(val).end(SmallVec::from_vec(rngs));
+        self.finalize_tile(rv, ended)
+    }
+    /// Zero a register vector.
+    pub fn zero_rv(&self, rv: RV<'k>) -> RV<'k> {
+        self.clear_rv(rv, 0.0)
+    }
+    /// Fill a register vector with `1`.
+    pub fn ones_rv(&self, rv: RV<'k>) -> RV<'k> {
+        self.clear_rv(rv, 1.0)
+    }
+    /// Fill a register vector with `-∞`.
+    pub fn neg_inf_rv(&self, rv: RV<'k>) -> RV<'k> {
+        self.clear_rv(rv, f64::NEG_INFINITY)
+    }
+
+    /// Copy `src` into `dst` element-wise (tinygrad `copy`), casting on a dtype
+    /// mismatch. Generic over [`RT`]/[`RV`] (softmax copies a register vector).
+    pub fn copy<T: RegTile<'k>>(&self, dst: T, src: &T) -> T {
+        // Per-lane register op: wave-safe (each wave copies its own RT).
+        assert_eq!(dst.shape(), src.shape(), "copy: shape mismatch");
+        let rngs: Vec<Arc<UOp>> = dst.shape().iter().map(|&d| self.ker.raw_range(d as i64, AxisType::Loop)).collect();
+        let idxs: Vec<Idx> = rngs.iter().map(Idx::from).collect();
+        let mut load = load_at(src.uop(), src.shape(), &idxs);
+        if src.elem() != dst.elem() {
+            load = load.cast(dst.elem().clone());
+        }
+        let store = flat_index(dst.uop(), dst.shape(), &idxs).store(load);
+        let ended = store.end(SmallVec::from_vec(rngs));
+        self.finalize_tile(dst, ended)
+    }
+
+    /// Transpose `src` into `dst` element-wise (tinygrad `transpose`): write
+    /// `src[h, w, inner]` to `dst[w, h, inner]`, casting on a dtype mismatch.
+    /// Used by FA to swap a register fragment's height/width before a WMMA.
+    pub fn transpose(&self, dst: RT<'k>, src: &RT<'k>) -> RT<'k> {
+        // Per-lane register op: wave-safe (each wave transposes its own RT).
+        let n = src.shape().len();
+        let height = self.ker.raw_range(src.shape()[n - 3] as i64, AxisType::Loop);
+        let width = self.ker.raw_range(src.shape()[n - 2] as i64, AxisType::Loop);
+        let inner = self.ker.raw_range(src.shape()[n - 1] as i64, AxisType::Loop);
+        let mut load = load_at(src.uop(), src.shape(), &[Idx::from(&height), Idx::from(&width), Idx::from(&inner)]);
+        if src.elem() != dst.elem() {
+            load = load.cast(dst.elem().clone());
+        }
+        let store = flat_index(dst.uop(), dst.shape(), &[Idx::from(&width), Idx::from(&height), Idx::from(&inner)])
+            .store(load)
+            .end(smallvec![height, width, inner]);
+        self.finalize_reg(dst, store)
+    }
+
+    // ── elementwise map (tinygrad `Group.map`) ───────────────────────────────
+
+    /// Apply `op` to every element of a register tile (tinygrad `Group.map`):
+    /// open a loop per logical dim, load the element, store `op(value, idx)`
+    /// back, and rewrap the tile after the store. `idx` lets `op` index *other*
+    /// tiles at the same position (the RV-broadcast and FA causal-mask path).
+    pub fn map<T, F>(&self, a: T, op: F) -> T
+    where
+        T: RegTile<'k>,
+        F: Fn(&Arc<UOp>, &[Idx]) -> Arc<UOp>,
+    {
+        // Per-lane register op: wave-safe (each wave maps its own RT).
+        let rngs: Vec<Arc<UOp>> = a.shape().iter().map(|&d| self.ker.raw_range(d as i64, AxisType::Loop)).collect();
+        let idxs: Vec<Idx> = rngs.iter().map(Idx::from).collect();
+        let val = load_at(a.uop(), a.shape(), &idxs);
+        let to_store = op(&val, &idxs);
+        let ended = flat_index(a.uop(), a.shape(), &idxs).store(to_store).end(SmallVec::from_vec(rngs));
+        self.finalize_tile(a, ended)
+    }
+
+    // ── cross-lane reductions (tinygrad `row_reduce` / `col_reduce`) ──────────
+
+    /// Reduce each row of `src` into `vec` (tinygrad `row_reduce`): per
+    /// row-tile `height`, fold `op` over the `(width, inner)` lane-local
+    /// elements into a 1-element REG accumulator, publish it to an LDS scratch
+    /// slot at this lane, `barrier`, then fold the three sibling 16-lane slots
+    /// (`(laneid + (1+i)*16) % group_threads`) to complete the warp-wide reduce,
+    /// and fold the result into `vec[height]`.
+    pub fn row_reduce<F>(&self, vec: RV<'k>, src: &RT<'k>, op: F, init_value: f64) -> RV<'k>
+    where
+        F: Fn(&Arc<UOp>, &Arc<UOp>) -> Arc<UOp>,
+    {
+        let n = src.shape().len();
+        self.reduce(vec, src, op, init_value, src.shape()[n - 3] as i64, src.shape()[n - 2] as i64, true)
+    }
+
+    /// Reduce each column of `src` into `vec` (tinygrad `col_reduce`): the
+    /// transpose of [`row_reduce`] — outer loop over column-tiles, accumulate
+    /// over the `(height, inner)` elements.
+    pub fn col_reduce<F>(&self, vec: RV<'k>, src: &RT<'k>, op: F, init_value: f64) -> RV<'k>
+    where
+        F: Fn(&Arc<UOp>, &Arc<UOp>) -> Arc<UOp>,
+    {
+        let n = src.shape().len();
+        self.reduce(vec, src, op, init_value, src.shape()[n - 2] as i64, src.shape()[n - 3] as i64, false)
+    }
+
+    /// Read this lane's `value` from lane `src_lane` within the wave (gfx9
+    /// wave64) via `llvm.amdgcn.ds.bpermute` — an in-register cross-lane gather
+    /// with no LDS and no barrier. The intrinsic is i32-typed (lane `L` receives
+    /// `data` from lane `byte_addr(L) >> 2`), so f32 is bitcast through i32 and
+    /// the byte address is `src_lane * 4`. Emitted via the typed `Op::Custom`
+    /// path (the `declare` is auto-hoisted+deduped to the module prefix).
+    fn shuffle_lane(&self, value: &Arc<UOp>, src_lane: &Arc<UOp>) -> Arc<UOp> {
+        let is_f32 = value.dtype() == DType::Float32;
+        let data_i = if is_f32 { value.bitcast(DType::Int32) } else { value.clone() };
+        let addr = imul(src_lane, 4).cast(DType::Int32);
+        let sh = UOp::custom(
+            smallvec![addr, data_i],
+            "declare i32 @llvm.amdgcn.ds.bpermute(i32, i32)\n\
+             call i32 @llvm.amdgcn.ds.bpermute(i32 {0}, i32 {1})"
+                .to_string(),
+            DType::Int32,
+        );
+        if is_f32 { sh.bitcast(DType::Float32) } else { sh }
+    }
+
+    /// Shared reduction body. `outer_end` is the tile dim mapped to `vec`
+    /// (row-tiles for `row_reduce`, col-tiles for `col_reduce`); `acc_end` is the
+    /// in-lane reduce dim; `row` selects the `src[outer, acc, inner]` vs
+    /// `src[acc, outer, inner]` element order.
+    #[allow(clippy::too_many_arguments)]
+    fn reduce<F>(
+        &self,
+        vec: RV<'k>,
+        src: &RT<'k>,
+        op: F,
+        init_value: f64,
+        outer_end: i64,
+        acc_end: i64,
+        row: bool,
+    ) -> RV<'k>
+    where
+        F: Fn(&Arc<UOp>, &Arc<UOp>) -> Arc<UOp>,
+    {
+        assert_eq!(self.warps, 1, "reduce is a single-warp op");
+        let elem = src.elem().clone();
+        let ept = src.shape()[src.shape().len() - 1] as i64;
+        let red_reg = self.ker.alloc_reg(1, elem.clone());
+        let laneid = self.laneid();
+
+        let read0 = |buf: &Arc<UOp>| load_at(buf, &[1], &[Idx::Const(0)]);
+        let init_val = UOp::const_(elem.clone(), ConstValue::Float(init_value));
+
+        let outer = self.ker.raw_range(outer_end, AxisType::Loop);
+
+        // Re-init the REG accumulator each outer iteration: the init store must
+        // depend on `outer` (and the enclosing tracked loops), or it hoists above
+        // them and the accumulator carries stale state across iterations.
+        let mut init_deps: SmallVec<[Arc<UOp>; 4]> = smallvec![outer.clone()];
+        init_deps.extend(self.ker.tracked_ranges());
+        let init_buf = red_reg.after(init_deps);
+        let i = self.ker.raw_range(1, AxisType::Loop);
+        let mut latest = flat_index(&init_buf, &[1], &[Idx::from(&i)]).store(init_val).end(smallvec![i]);
+
+        // In-lane fold over (acc, inner). The accumulator read must observe both
+        // the prior store (`latest`) and the live reduce ranges, else it hoists.
+        let acc = self.ker.raw_range(acc_end, AxisType::Reduce);
+        let inner = self.ker.raw_range(ept, AxisType::Reduce);
+        let acc_read = read0(&red_reg.after(smallvec![latest.clone(), acc.clone(), inner.clone()]));
+        let src_idx = if row {
+            [Idx::from(&outer), Idx::from(&acc), Idx::from(&inner)]
+        } else {
+            [Idx::from(&acc), Idx::from(&outer), Idx::from(&inner)]
+        };
+        let src_v = load_at(src.uop(), src.shape(), &src_idx);
+        latest = flat_index(&red_reg, &[1], &[Idx::Const(0)]).store(op(&acc_read, &src_v)).end(smallvec![acc, inner]);
+
+        // Cross-lane fold via `ds_bpermute`: read this lane's in-lane `partial`
+        // once, then gather the three sibling 16-lane slots' *original* partials
+        // (lanes L+16, L+32, L+48 mod warp) straight from registers — no LDS and
+        // no barrier. The wave executes the gather in lockstep, so every lane's
+        // `partial` is live before any lane reads it (the LDS barrier's old job).
+        // Lane L thus folds the partials of {L, L+16, L+32, L+48} — bit-for-bit
+        // the prior LDS sibling tree.
+        let partial = read0(&red_reg.after(smallvec![latest]));
+        let mut acc = partial.clone();
+        for d in [16i64, 32, 48] {
+            let src_lane = imod(&iadd(&laneid, &cidx(d)), self.group_threads as i64);
+            acc = op(&acc, &self.shuffle_lane(&partial, &src_lane));
+        }
+
+        // Fold the lane result into vec[outer]: the vec read carries the incoming
+        // vec state plus `outer` so it accumulates across outer iterations.
+        let vec_acc =
+            load_at(&vec.uop().after(smallvec![outer.clone()]), vec.shape(), &[Idx::from(&outer), Idx::Const(0)]);
+        let vec_store = flat_index(vec.uop(), vec.shape(), &[Idx::from(&outer), Idx::Const(0)])
+            .store(op(&vec_acc, &acc))
+            .end(smallvec![outer]);
+        self.finalize_tile(vec, vec_store)
+    }
+
+    /// `C += A·B` over a tile (tinygrad `mma_AB`): for every output fragment
+    /// `(height, width)` accumulate `WMMA(A[height,inner], B[inner,width])`
+    /// across the reduce axis `inner`. One [`Op::Wmma`](svod_ir::Op::Wmma) per
+    /// K-iteration → one `mfma.f32.16x16x16bf16.1k`.
+    pub fn mma_ab(&self, c: RT<'k>, a: &RT<'k>, b: &RT<'k>) -> RT<'k> {
+        self.mma(c, a, b, false, false)
+    }
+
+    /// `C += A·Bᵀ` (tinygrad `mma_ABt`): B fragment is read transposed
+    /// (`b[width, inner]`); reduce axis stays `a.shape[-2]`.
+    pub fn mma_abt(&self, c: RT<'k>, a: &RT<'k>, b: &RT<'k>) -> RT<'k> {
+        self.mma(c, a, b, false, true)
+    }
+
+    /// `C += Aᵀ·B` (tinygrad `mma_AtB`): A fragment is read transposed
+    /// (`a[inner, height]`) and the reduce axis is `a.shape[-3]`.
+    pub fn mma_atb(&self, c: RT<'k>, a: &RT<'k>, b: &RT<'k>) -> RT<'k> {
+        self.mma(c, a, b, true, false)
+    }
+
+    /// `C += Aᵀ·Bᵀ` (tinygrad `mma_AtBt`): both fragments read transposed.
+    pub fn mma_atbt(&self, c: RT<'k>, a: &RT<'k>, b: &RT<'k>) -> RT<'k> {
+        self.mma(c, a, b, true, true)
+    }
+
+    /// The shared WMMA body. The four `mma_{AB,ABt,AtB,AtBt}` variants differ
+    /// only in the operand index permutation and the reduce-axis selection:
+    /// - `a_t` (Aᵀ): A is read `a[inner, height]` and the reduce axis is
+    ///   `a.shape[-3]`; otherwise `a[height, inner]`, reduce axis `a.shape[-2]`.
+    /// - `b_t` (Bᵀ): B is read `b[width, inner]`; otherwise `b[inner, width]`.
+    fn mma(&self, c: RT<'k>, a: &RT<'k>, b: &RT<'k>, a_t: bool, b_t: bool) -> RT<'k> {
+        // Wave-agnostic: each wave runs the WMMA on its own per-lane RT operands
+        // (the wave sub-tile selection happens in the LDS→REG load, not here).
+        let lanes: i64 = match a.base.base.cols {
+            16 => 4,
+            other => unimplemented!("mma: base cols {other} not ported (gfx942 K=16 → 4 lanes)"),
+        };
+        let meta = wmma_16_16_16_bf16_f32();
+
+        let h_end = c.shape()[c.shape().len() - 3] as i64;
+        let w_end = c.shape()[c.shape().len() - 2] as i64;
+        let k_end = if a_t { a.shape()[a.shape().len() - 3] } else { a.shape()[a.shape().len() - 2] } as i64;
+        let height = self.ker.raw_range(h_end, AxisType::Loop);
+        let width = self.ker.raw_range(w_end, AxisType::Loop);
+        let inner = self.ker.raw_range(k_end, AxisType::Reduce);
+
+        let a_in = UOp::vectorize(
+            (0..lanes)
+                .map(|i| {
+                    let idx = if a_t {
+                        [Idx::from(&inner), Idx::from(&height), Idx::Const(i)]
+                    } else {
+                        [Idx::from(&height), Idx::from(&inner), Idx::Const(i)]
+                    };
+                    load_at(a.uop(), a.shape(), &idx)
+                })
+                .collect(),
+        );
+        let b_in = UOp::vectorize(
+            (0..lanes)
+                .map(|i| {
+                    let idx = if b_t {
+                        [Idx::from(&width), Idx::from(&inner), Idx::Const(i)]
+                    } else {
+                        [Idx::from(&inner), Idx::from(&width), Idx::Const(i)]
+                    };
+                    load_at(b.uop(), b.shape(), &idx)
+                })
+                .collect(),
+        );
+        // The accumulator read must depend on the reduce range `inner`, or it is
+        // loop-invariant w.r.t. the K loop and gets hoisted *out* of it — every
+        // K-iteration would then re-read the pre-loop C and the WMMA's
+        // accumulation chain breaks. Mirrors svod's `reduce_to_acc`
+        // (`acc.after([..reduce_range]).index(..)`): the `After([inner])` keeps
+        // the read inside the K loop so it observes the prior iteration's store.
+        let c_acc = c.uop().after(smallvec![inner.clone()]);
+        let d_in = UOp::vectorize(
+            (0..4)
+                .map(|i| load_at(&c_acc, c.shape(), &[Idx::from(&height), Idx::from(&width), Idx::Const(i)]))
+                .collect(),
+        );
+
+        let out = UOp::wmma(a_in, b_in, d_in, meta);
+        let c_i: Vec<Arc<UOp>> = (0..4)
+            .map(|i| {
+                flat_index(c.uop(), c.shape(), &[Idx::from(&height), Idx::from(&width), Idx::Const(i)])
+                    .store(out.gep(vec![i as usize]))
+            })
+            .collect();
+        let c_store = UOp::group(c_i).end(smallvec![height, width, inner]);
+        self.finalize_reg(c, c_store)
+    }
+
+    // ── load (tinygrad `Group.load`) ────────────────────────────────────────
+
+    /// Move data into `dst` (tinygrad `Group.load`), dispatching on the
+    /// (dst, src) address spaces: GLOBAL→LOCAL (coalesced fill + barrier) and
+    /// LOCAL→REG (fragment gather).
+    pub fn load(&self, dst: Tile<'k>, src: Tile<'k>, dst_idxs: &[Idx], idxs: &[Idx], axis: usize) -> Tile<'k> {
+        match (dst, src) {
+            (Tile::St(dst), Tile::Gl(src)) => Tile::St(self.load_global_to_local(dst, &src, idxs, axis, true)),
+            (Tile::Rt(dst), Tile::St(src)) => Tile::Rt(self.load_local_to_reg(dst, &src, dst_idxs, idxs)),
+            (Tile::Rt(dst), Tile::Gl(src)) => Tile::Rt(self.load_global_to_reg(dst, &src, dst_idxs, idxs, axis)),
+            (dst, src) => {
+                unimplemented!("load {} ← {} not ported (supported: ST←GL, RT←ST, RT←GL)", tag(&dst), tag(&src))
+            }
+        }
+    }
+
+    /// Coalesced GLOBAL→LOCAL fill **without** the trailing workgroup barrier —
+    /// the software-pipeline primitive (FA-5 stage ii). The caller is responsible
+    /// for inserting one barrier per buffer before the LDS→REG gather (so the
+    /// fill is visible) and before the next overwrite (the WAR edge); decoupling
+    /// the fill from its sync lets the next block's GLOBAL loads issue *ahead* of
+    /// the current block's compute, overlapping memory latency with the MFMA.
+    pub fn fill_local_nobar(&self, dst: ST<'k>, src: GL<'k>, idxs: &[Idx], axis: usize) -> ST<'k> {
+        self.load_global_to_local(dst, &src, idxs, axis, false)
+    }
+
+    /// Stage one tile of `src` (GLOBAL) into a fresh per-lane register buffer —
+    /// the GLOBAL→VGPR half of the M2 register prefetch. Uses the *same*
+    /// coalesced per-lane addressing as [`Self::load_global_to_local`], but lands
+    /// the loaded (unswizzled) values in a flat `[total_calls, ept]` DEFINE_REG
+    /// instead of LDS, so the load can be issued ahead of the consuming MFMAs.
+    /// Commit it with [`Self::commit_reg_to_local`] (same `st`/`idxs`/`axis`).
+    pub fn stage_global_to_reg(&self, st: &ST<'k>, src: &GL<'k>, idxs: &[Idx], axis: usize) -> Arc<UOp> {
+        let geom = self.lds_fill_geom(st);
+        let row_stride: i64 = src.shape()[axis + 1..].iter().product::<usize>() as i64;
+        let idxs_t: Vec<Idx> = idxs
+            .iter()
+            .enumerate()
+            .map(|(i, idx)| {
+                let mut e = idx.clone();
+                if i == axis {
+                    e = idx_mul(&e, st.rows as i64);
+                }
+                if i == 3 {
+                    e = idx_mul(&e, st.cols as i64);
+                }
+                e
+            })
+            .collect();
+        let src_i_base = flat_offset(src.shape(), &idxs_t);
+
+        let stage = self.ker.alloc_reg((geom.total_calls * geom.ept) as usize, st.elem().clone());
+        let outer = self.ker.raw_range(geom.total_calls, AxisType::Loop);
+        let inner = self.ker.raw_range(geom.ept, AxisType::Upcast);
+        let (height, width, row, col) = self.fill_lane_rc(&geom, &outer, &inner);
+
+        let off = iadd(
+            &src_i_base,
+            &iadd(
+                &iadd(&imul(&height, geom.base_rows * row_stride), &imul(&width, geom.base_cols)),
+                &iadd(&imul(&row, row_stride), &col),
+            ),
+        );
+        let mut load = load_off(src.uop(), off);
+        if src.elem() != st.elem() {
+            load = load.cast(st.elem().clone());
+        }
+        let stage_shape = [geom.total_calls as usize, geom.ept as usize];
+        let stored = flat_index(&stage, &stage_shape, &[Idx::from(&outer), Idx::from(&inner)])
+            .store(load)
+            .end(smallvec![outer, inner]);
+        self.ker.push_store(stored.clone(), stage.clone());
+        stage.after(smallvec![stored])
+    }
+
+    /// Commit a staged register buffer (from [`Self::stage_global_to_reg`]) into
+    /// the swizzled LDS tile — the VGPR→LDS `ds_write` half of the prefetch.
+    /// Recomputes the identical per-lane addressing and ends in a workgroup
+    /// barrier so the subsequent LDS→REG gather observes the committed fill.
+    pub fn commit_reg_to_local(&self, st: ST<'k>, stage: &Arc<UOp>) -> ST<'k> {
+        // The LDS destination geometry is fully determined by the tile shape (the
+        // global tile position only mattered when *staging* into the registers).
+        let geom = self.lds_fill_geom(&st);
+        let outer = self.ker.raw_range(geom.total_calls, AxisType::Loop);
+        let inner = self.ker.raw_range(geom.ept, AxisType::Upcast);
+        let (height, width, row, col) = self.fill_lane_rc(&geom, &outer, &inner);
+        let (srow, scol) = st.base.swizzle.swizzle_rc(row, col, st.base.base.cols, st.elem().base());
+
+        let stage_shape = [geom.total_calls as usize, geom.ept as usize];
+        let load = load_at(stage, &stage_shape, &[Idx::from(&outer), Idx::from(&inner)]);
+        let stored =
+            flat_index(st.uop(), st.shape(), &[Idx::Uop(height), Idx::Uop(width), Idx::Uop(srow), Idx::Uop(scol)])
+                .store(load)
+                .end(smallvec![outer, inner])
+                .barrier(SmallVec::new());
+        self.finalize_st(st, stored)
+    }
+
+    /// Move data out of `src` (tinygrad `Group.store`): REG→LOCAL (fragment
+    /// scatter) and REG→GLOBAL (coalesced write-back).
+    pub fn store(&self, dst: Tile<'k>, src: Tile<'k>, idxs: &[Idx], src_idxs: &[Idx], axis: usize) -> Tile<'k> {
+        match (dst, src) {
+            (Tile::St(dst), Tile::Rt(src)) => Tile::St(self.store_reg_to_local(dst, &src, idxs, src_idxs)),
+            (Tile::Gl(dst), Tile::Rt(src)) => Tile::Gl(self.store_reg_to_global(dst, &src, idxs, src_idxs, axis)),
+            (dst, src) => {
+                unimplemented!("store {} ← {} not ported (matmul MVP = LOCAL←REG, GLOBAL←REG)", tag(&dst), tag(&src))
+            }
+        }
+    }
+
+    /// The [`LdsGeom`] for filling `st` collaboratively across all group
+    /// threads (`elements_per_thread`, pass count, last-pass clamp).
+    fn lds_fill_geom(&self, st: &ST<'k>) -> LdsGeom {
+        let ept = st.base.base.elements_per_thread() as i64;
+        let st_cols = st.cols as i64;
+        let base_rows = st.base.base.rows as i64;
+        let base_cols = st.base.base.cols as i64;
+        let num_elements = st.base.base.num_elements() as i64;
+        let n = st.shape().len();
+        let total_elems = st.shape()[n - 4] as i64 * st.shape()[n - 3] as i64 * num_elements;
+        let slots = self.group_threads as i64 * ept;
+        let total_calls = (total_elems + slots - 1) / slots;
+        LdsGeom {
+            ept,
+            st_cols,
+            memcpy_per_row: st_cols / ept,
+            base_rows,
+            base_cols,
+            total_calls,
+            num_valid: total_elems / ept,
+            clamp: total_calls * slots != total_elems,
+        }
+    }
+
+    /// The `(height, width, row, col)` LDS fragment coordinate this lane fills at
+    /// collaborative pass `(outer, inner)` — the shared per-lane addressing of
+    /// the direct fill and the register-staged prefetch (over-subscribed last
+    /// pass clamps to the final valid fragment, idempotent).
+    fn fill_lane_rc(
+        &self,
+        geom: &LdsGeom,
+        outer: &Arc<UOp>,
+        inner: &Arc<UOp>,
+    ) -> (Arc<UOp>, Arc<UOp>, Arc<UOp>, Arc<UOp>) {
+        let mut load_idx = iadd(&imul(outer, self.group_threads as i64), &self.laneid());
+        if geom.clamp {
+            let cond = load_idx.try_cmplt(&cidx(geom.num_valid)).expect("load_idx < num_valid");
+            load_idx = UOp::try_where(cond, load_idx.clone(), cidx(geom.num_valid - 1)).expect("clamp load_idx");
+        }
+        let row0 = idiv(&load_idx, geom.memcpy_per_row);
+        let col0 = iadd(&imod(&imul(&load_idx, geom.ept), geom.st_cols), inner);
+        (
+            idiv(&row0, geom.base_rows),
+            idiv(&col0, geom.base_cols),
+            imod(&row0, geom.base_rows),
+            imod(&col0, geom.base_cols),
+        )
+    }
+
+    /// Coalesced GLOBAL→LOCAL fill: every group thread streams
+    /// `elements_per_thread` contiguous global elements into the swizzled LDS
+    /// tile. When `barrier`, it is closed with a workgroup barrier so the
+    /// subsequent gather sees it (the default); the software-pipeline path passes
+    /// `false` and inserts the barrier itself (see [`Self::fill_local_nobar`]).
+    fn load_global_to_local(&self, st: ST<'k>, src: &GL<'k>, idxs: &[Idx], axis: usize, barrier: bool) -> ST<'k> {
+        let row_stride: i64 = src.shape()[axis + 1..].iter().product::<usize>() as i64;
+        let idxs_t: Vec<Idx> = idxs
+            .iter()
+            .enumerate()
+            .map(|(i, idx)| {
+                let mut e = idx.clone();
+                if i == axis {
+                    e = idx_mul(&e, st.rows as i64);
+                }
+                if i == 3 {
+                    e = idx_mul(&e, st.cols as i64);
+                }
+                e
+            })
+            .collect();
+        let src_i_base = flat_offset(src.shape(), &idxs_t);
+
+        let ept = st.base.base.elements_per_thread() as i64;
+        let st_cols = st.cols as i64;
+        let memcpy_per_row = st_cols / ept;
+        let base_rows = st.base.base.rows as i64;
+        let base_cols = st.base.base.cols as i64;
+        let num_elements = st.base.base.num_elements() as i64;
+        let n = st.shape().len();
+        let height_dim = st.shape()[n - 4] as i64;
+        let width_dim = st.shape()[n - 3] as i64;
+        let total_elems = height_dim * width_dim * num_elements;
+        let slots = self.group_threads as i64 * ept;
+        // Round the pass count *up*: a tile smaller than one full group-pass (the
+        // multi-wave FA 16×64 K/V block streamed by 512 threads) would otherwise
+        // floor to zero passes and load nothing.
+        let total_calls = (total_elems + slots - 1) / slots;
+        // Over-subscribed last pass (more lane-loads than fragment-loads): clamp
+        // the load index to the last valid fragment so the excess lanes redo it
+        // (idempotent — same source, same swizzled slot) instead of writing past
+        // the tile. A no-op when the tile divides the group evenly (matmul,
+        // single-warp FA): `clamp` is false and the index passes through.
+        let num_valid = total_elems / ept;
+        let clamp = total_calls * slots != total_elems;
+
+        let outer = self.ker.raw_range(total_calls, AxisType::Loop);
+        let inner = self.ker.raw_range(ept, AxisType::Upcast);
+        let laneid = self.laneid();
+
+        let mut load_idx = iadd(&imul(&outer, self.group_threads as i64), &laneid);
+        if clamp {
+            let cond = load_idx.try_cmplt(&cidx(num_valid)).expect("load_idx < num_valid");
+            load_idx = UOp::try_where(cond, load_idx.clone(), cidx(num_valid - 1)).expect("clamp load_idx");
+        }
+        let row0 = idiv(&load_idx, memcpy_per_row);
+        let col0 = iadd(&imod(&imul(&load_idx, ept), st_cols), &inner);
+        let height = idiv(&row0, base_rows);
+        let width = idiv(&col0, base_cols);
+        let row = imod(&row0, base_rows);
+        let col = imod(&col0, base_cols);
+        let (srow, scol) = st.base.swizzle.swizzle_rc(row.clone(), col.clone(), st.base.base.cols, st.elem().base());
+
+        let off = iadd(
+            &src_i_base,
+            &iadd(
+                &iadd(&imul(&height, base_rows * row_stride), &imul(&width, base_cols)),
+                &iadd(&imul(&row, row_stride), &col),
+            ),
+        );
+        let mut load = load_off(src.uop(), off);
+        if src.elem() != st.elem() {
+            load = load.cast(st.elem().clone());
+        }
+        let dst_idx =
+            flat_index(st.uop(), st.shape(), &[Idx::Uop(height), Idx::Uop(width), Idx::Uop(srow), Idx::Uop(scol)]);
+        let stored = dst_idx.store(load).end(smallvec![outer, inner]);
+        let ended = if barrier { stored.barrier(SmallVec::new()) } else { stored };
+        self.finalize_st(st, ended)
+    }
+
+    /// M3 vectorized GLOBAL→LOCAL fill: the [`Self::load_global_to_local`]
+    /// counterpart that issues **128-bit** (`vec8` bf16) coalesced global loads
+    /// (one `global_load_dwordx4`/lane) and commits each into the XOR-swizzled
+    /// LDS as `vec8/sw` contiguous `vec_sw` stores. The swizzle's XOR delta is
+    /// always a multiple of 8 bytes (`st.cuh:96` `<<3`), so a `sw = 8/itemsize`
+    /// element group is never re-ordered (the `vec4` halves stay contiguous);
+    /// a single `vec8` LDS store would split on the odd deltas, so we keep the
+    /// wide *global* load but narrow the swizzled *LDS* store. Ends in a
+    /// workgroup barrier (the matmul fill). bf16-only.
+    pub fn fill_local_vec(&self, dst: ST<'k>, src: GL<'k>, idxs: &[Idx], axis: usize) -> ST<'k> {
+        self.load_global_to_local_vec(dst, &src, idxs, axis, true)
+    }
+
+    fn load_global_to_local_vec(&self, st: ST<'k>, src: &GL<'k>, idxs: &[Idx], axis: usize, barrier: bool) -> ST<'k> {
+        let itemsize = st.elem().base().bytes() as i64;
+        assert_eq!(itemsize, 2, "vec fill: bf16-only (128-bit = vec8)");
+        assert_eq!(src.elem(), st.elem(), "vec fill: cast unsupported (use the scalar fill)");
+        let vw: i64 = 16 / itemsize; // 8 bf16 — the 128-bit global load width
+        let sw: i64 = 8 / itemsize; // 4 bf16 — the swizzle-order-safe LDS store width
+
+        let base_rows = st.base.base.rows as i64;
+        let base_cols = st.base.base.cols as i64;
+        let st_cols = st.cols as i64;
+        // Alignment invariants (M3 risk mitigation): the swizzle period and the
+        // tile/fragment widths must admit `vw`-aligned 16-byte groups.
+        if let Some(period) = st.base.swizzle.period_bytes(st.base.base.cols, itemsize) {
+            assert_eq!(period % 16, 0, "vec fill: swizzle period {period}B not 16B-aligned");
+        }
+        assert_eq!(base_cols % vw, 0, "vec fill: base cols {base_cols} not a multiple of vec width {vw}");
+        assert_eq!(st_cols % vw, 0, "vec fill: st cols {st_cols} not a multiple of vec width {vw}");
+
+        let row_stride: i64 = src.shape()[axis + 1..].iter().product::<usize>() as i64;
+        assert_eq!(row_stride % vw, 0, "vec fill: row stride {row_stride} not {vw}-aligned (need N % 8 == 0)");
+
+        let idxs_t: Vec<Idx> = idxs
+            .iter()
+            .enumerate()
+            .map(|(i, idx)| {
+                let mut e = idx.clone();
+                if i == axis {
+                    e = idx_mul(&e, st.rows as i64);
+                }
+                if i == 3 {
+                    e = idx_mul(&e, st.cols as i64);
+                }
+                e
+            })
+            .collect();
+        let src_i_base = flat_offset(src.shape(), &idxs_t);
+
+        let num_elements = st.base.base.num_elements() as i64;
+        let n = st.shape().len();
+        let total_elems = st.shape()[n - 4] as i64 * st.shape()[n - 3] as i64 * num_elements;
+        let memcpy_per_row = st_cols / vw;
+        let slots = self.group_threads as i64 * vw;
+        let total_calls = (total_elems + slots - 1) / slots;
+        let num_valid = total_elems / vw;
+        let clamp = total_calls * slots != total_elems;
+
+        let outer = self.ker.raw_range(total_calls, AxisType::Loop);
+        let mut load_idx = iadd(&imul(&outer, self.group_threads as i64), &self.laneid());
+        if clamp {
+            let cond = load_idx.try_cmplt(&cidx(num_valid)).expect("load_idx < num_valid");
+            load_idx = UOp::try_where(cond, load_idx.clone(), cidx(num_valid - 1)).expect("clamp load_idx");
+        }
+        // The thread's `vw`-wide run: row `row0`, columns `[col0, col0+vw)` (a
+        // `vw`-aligned slice within one base fragment, since `vw | base_cols`).
+        let row0 = idiv(&load_idx, memcpy_per_row);
+        let col0 = imod(&imul(&load_idx, vw), st_cols);
+        let height = idiv(&row0, base_rows);
+        let row = imod(&row0, base_rows);
+        let width = idiv(&col0, base_cols);
+
+        // One 128-bit coalesced global load of the contiguous `vw`-run.
+        let off = iadd(&src_i_base, &iadd(&imul(&row0, row_stride), &col0));
+        let loaded = load_vec(src.uop(), off, vw as usize);
+
+        // Commit as `vw/sw` swizzle-safe `vec_sw` LDS stores (delta is constant
+        // across the fragment row, so each `sw`-group maps contiguously).
+        let stores: Vec<Arc<UOp>> = (0..vw / sw)
+            .map(|j| {
+                let col = imod(&iadd(&col0, &cidx(j * sw)), base_cols);
+                let (srow, scol) = st.base.swizzle.swizzle_rc(row.clone(), col, st.base.base.cols, st.elem().base());
+                let val = loaded.gep(((j * sw) as usize..(j * sw + sw) as usize).collect());
+                let didx = [Idx::Uop(height.clone()), Idx::Uop(width.clone()), Idx::Uop(srow), Idx::Uop(scol)];
+                flat_index(st.uop(), st.shape(), &didx).store(val)
+            })
+            .collect();
+        let grouped = if stores.len() == 1 { stores.into_iter().next().unwrap() } else { UOp::group(stores) };
+        let stored = grouped.end(smallvec![outer]);
+        let ended = if barrier { stored.barrier(SmallVec::new()) } else { stored };
+        self.finalize_st(st, ended)
+    }
+
+    /// LOCAL→REG fragment gather: each lane reads its WMMA fragment lanes from
+    /// the (swizzled) LDS tile.
+    fn load_local_to_reg(&self, rt: RT<'k>, st: &ST<'k>, dst_idxs: &[Idx], idxs: &[Idx]) -> RT<'k> {
+        let laneid = self.ker.laneid();
+        let ept = rt.base.base.elements_per_thread() as i64;
+        let base_rows = rt.base.base.rows as i64;
+        let base_cols = rt.base.base.cols as i64;
+        let stride = rt.base.stride as i64;
+        let n = rt.shape().len();
+        let (rt_h, rt_w) = (rt.shape()[n - 3] as i64, rt.shape()[n - 2] as i64);
+        // SI-1 off-by-one guard: the wave's RT sub-tile must fit inside the ST.
+        let sn = st.shape().len();
+        let (st_h, st_w) = (st.shape()[sn - 4] as i64, st.shape()[sn - 3] as i64);
+        assert!(rt_h <= st_h && rt_w <= st_w, "load LOCAL→REG: RT {rt_h}×{rt_w} exceeds ST {st_h}×{st_w}");
+        let height = self.ker.raw_range(rt_h, AxisType::Loop);
+        let width = self.ker.raw_range(rt_w, AxisType::Loop);
+        let inner = self.ker.raw_range(ept, AxisType::Loop);
+
+        let (row, col) = lane_rc(rt.layout != st.layout, &laneid, base_rows, base_cols, stride, &inner);
+        let (srow, scol) = st.base.swizzle.swizzle_rc(row, col, st.base.base.cols, st.elem().base());
+
+        // Wave sub-tile fragment offset (SI-1): the caller passes the wave's
+        // `(row_block, col_block)` via `idxs` (already including warp_row/col);
+        // empty ⇒ no offset (single-warp).
+        let h_idx = wave_offset(idxs.first(), rt_h, &height);
+        let w_idx = wave_offset(idxs.get(1), rt_w, &width);
+        let src_idx = [h_idx, w_idx, Idx::Uop(srow), Idx::Uop(scol)];
+        let mut load = load_at(st.uop(), st.shape(), &src_idx);
+        if st.elem() != rt.elem() {
+            load = load.cast(rt.elem().clone());
+        }
+        let mut didx: Vec<Idx> = dst_idxs.to_vec();
+        didx.extend([Idx::from(&height), Idx::from(&width), Idx::from(&inner)]);
+        let ended = flat_index(rt.uop(), rt.shape(), &didx).store(load).end(smallvec![height, width, inner]);
+        self.finalize_reg(rt, ended)
+    }
+
+    /// GLOBAL→REG fragment gather: each lane reads its register fragment
+    /// straight from global memory (the FA Q-tile load). The mirror of
+    /// [`Self::store_reg_to_global`].
+    fn load_global_to_reg(&self, rt: RT<'k>, src: &GL<'k>, dst_idxs: &[Idx], idxs: &[Idx], axis: usize) -> RT<'k> {
+        let row_stride: i64 = src.shape()[axis + 1..].iter().product::<usize>() as i64;
+        let base_rows = rt.base.base.rows as i64;
+        let base_cols = rt.base.base.cols as i64;
+        let stride = rt.base.stride as i64;
+        let ept = rt.base.base.elements_per_thread() as i64;
+        let n = rt.shape().len();
+        let s3 = rt.shape()[n - 3] as i64;
+        let s2 = rt.shape()[n - 2] as i64;
+
+        let idxs_t: Vec<Idx> = idxs
+            .iter()
+            .enumerate()
+            .map(|(i, idx)| {
+                let mut e = idx.clone();
+                if i == axis {
+                    e = idx_mul(&e, s3 * base_rows);
+                }
+                if i == 3 {
+                    e = idx_mul(&e, s2 * base_cols);
+                }
+                e
+            })
+            .collect();
+        let src_i_base = flat_offset(src.shape(), &idxs_t);
+
+        let laneid = self.ker.laneid();
+        let height = self.ker.raw_range(s3, AxisType::Loop);
+        let width = self.ker.raw_range(s2, AxisType::Loop);
+        let inner = self.ker.raw_range(ept, AxisType::Loop);
+
+        let base_row = imul(&height, base_rows);
+        let base_col = imul(&width, base_cols);
+        let (row, col) = lane_rc(rt.layout == TileLayout::Col, &laneid, base_rows, base_cols, stride, &inner);
+        let srow = iadd(&base_row, &row);
+        let scol = iadd(&base_col, &col);
+        let off = iadd(&src_i_base, &iadd(&imul(&srow, row_stride), &scol));
+
+        let mut load = load_off(src.uop(), off);
+        if src.elem() != rt.elem() {
+            load = load.cast(rt.elem().clone());
+        }
+        let mut didx: Vec<Idx> = dst_idxs.to_vec();
+        didx.extend([Idx::from(&height), Idx::from(&width), Idx::from(&inner)]);
+        let ended = flat_index(rt.uop(), rt.shape(), &didx).store(load).end(smallvec![height, width, inner]);
+        self.finalize_reg(rt, ended)
+    }
+
+    /// REG→LOCAL fragment scatter: each lane writes its register fragment into
+    /// the (swizzled) LDS tile (the layout-transpose hop before write-back).
+    fn store_reg_to_local(&self, st: ST<'k>, rt: &RT<'k>, idxs: &[Idx], src_idxs: &[Idx]) -> ST<'k> {
+        let laneid = self.ker.laneid();
+        let ept = rt.base.base.elements_per_thread() as i64;
+        let base_rows = rt.base.base.rows as i64;
+        let base_cols = rt.base.base.cols as i64;
+        let stride = rt.base.stride as i64;
+        let n = rt.shape().len();
+        let (rt_h, rt_w) = (rt.shape()[n - 3] as i64, rt.shape()[n - 2] as i64);
+        let height = self.ker.raw_range(rt_h, AxisType::Loop);
+        let width = self.ker.raw_range(rt_w, AxisType::Loop);
+        let inner = self.ker.raw_range(ept, AxisType::Loop);
+
+        let (row, col) = lane_rc(rt.layout != st.layout, &laneid, base_rows, base_cols, stride, &inner);
+        let (srow, scol) = st.base.swizzle.swizzle_rc(row, col, st.base.base.cols, st.elem().base());
+
+        let mut sidx: Vec<Idx> = src_idxs.to_vec();
+        sidx.extend([Idx::from(&height), Idx::from(&width), Idx::from(&inner)]);
+        let mut load = load_at(rt.uop(), rt.shape(), &sidx);
+        if rt.elem() != st.elem() {
+            load = load.cast(st.elem().clone());
+        }
+        // Wave sub-tile fragment offset (SI-1), symmetric with `load_local_to_reg`.
+        let h_idx = wave_offset(idxs.first(), rt_h, &height);
+        let w_idx = wave_offset(idxs.get(1), rt_w, &width);
+        let didx = [h_idx, w_idx, Idx::Uop(srow), Idx::Uop(scol)];
+        let ended = flat_index(st.uop(), st.shape(), &didx).store(load).end(smallvec![height, width, inner]);
+        self.finalize_st(st, ended)
+    }
+
+    /// REG→GLOBAL write-back: each lane writes its register fragment to the
+    /// correct global position.
+    fn store_reg_to_global(&self, dst: GL<'k>, rt: &RT<'k>, idxs: &[Idx], src_idxs: &[Idx], axis: usize) -> GL<'k> {
+        let row_stride: i64 = dst.shape()[axis + 1..].iter().product::<usize>() as i64;
+        let base_rows = rt.base.base.rows as i64;
+        let base_cols = rt.base.base.cols as i64;
+        let stride = rt.base.stride as i64;
+        let ept = rt.base.base.elements_per_thread() as i64;
+        let n = rt.shape().len();
+        let s3 = rt.shape()[n - 3] as i64;
+        let s2 = rt.shape()[n - 2] as i64;
+
+        let idxs_t: Vec<Idx> = idxs
+            .iter()
+            .enumerate()
+            .map(|(i, idx)| {
+                let mut e = idx.clone();
+                if i == axis {
+                    e = idx_mul(&e, s3 * base_rows);
+                }
+                if i == 3 {
+                    e = idx_mul(&e, s2 * base_cols);
+                }
+                e
+            })
+            .collect();
+        let dst_i_base = flat_offset(dst.shape(), &idxs_t);
+
+        let laneid = self.ker.laneid();
+        let height = self.ker.raw_range(s3, AxisType::Loop);
+        let width = self.ker.raw_range(s2, AxisType::Loop);
+        let inner = self.ker.raw_range(ept, AxisType::Loop);
+
+        let base_row = imul(&height, base_rows);
+        let base_col = imul(&width, base_cols);
+        let (row, col) = lane_rc(rt.layout == TileLayout::Col, &laneid, base_rows, base_cols, stride, &inner);
+        let srow = iadd(&base_row, &row);
+        let scol = iadd(&base_col, &col);
+        let off = iadd(&dst_i_base, &iadd(&imul(&srow, row_stride), &scol));
+
+        let mut sidx: Vec<Idx> = src_idxs.to_vec();
+        sidx.extend([Idx::from(&height), Idx::from(&width), Idx::from(&inner)]);
+        let mut load = load_at(rt.uop(), rt.shape(), &sidx);
+        if rt.elem() != dst.elem() {
+            load = load.cast(dst.elem().clone());
+        }
+        let ended = index_off(dst.uop(), off).store(load).end(smallvec![height, width, inner]);
+        self.finalize_gl(dst, ended)
+    }
+
+    // ── store bookkeeping helpers ───────────────────────────────────────────
+
+    fn finalize_reg(&self, t: RT<'k>, ended: Arc<UOp>) -> RT<'k> {
+        self.finalize_tile(t, ended)
+    }
+    /// Record `ended` as a terminal store and rewrap the register tile so later
+    /// reads order after it (tinygrad `dst.after(dst_store)`).
+    fn finalize_tile<T: RegTile<'k>>(&self, t: T, ended: Arc<UOp>) -> T {
+        self.ker.push_store(ended.clone(), t.uop().clone());
+        let after = t.uop().after(smallvec![ended]);
+        t.rewrap(after)
+    }
+    fn finalize_st(&self, t: ST<'k>, ended: Arc<UOp>) -> ST<'k> {
+        self.ker.push_store(ended.clone(), t.uop().clone());
+        let after = t.uop().after(smallvec![ended]);
+        t.rewrap(after)
+    }
+    fn finalize_gl(&self, t: GL<'k>, ended: Arc<UOp>) -> GL<'k> {
+        self.ker.push_store(ended.clone(), t.uop().clone());
+        let after = t.uop().after(smallvec![ended]);
+        t.rewrap(after)
+    }
+}
+
+fn tag(t: &Tile<'_>) -> &'static str {
+    match t {
+        Tile::Gl(_) => "GL",
+        Tile::St(_) => "ST",
+        Tile::Rt(_) => "RT",
+        Tile::Rv(_) => "RV",
+    }
+}
