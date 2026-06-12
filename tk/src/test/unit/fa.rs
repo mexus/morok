@@ -202,7 +202,12 @@ fn test_fa_mw_rdb_renders_bounded() {
         .expect("LINEAR present");
     let renderer = svod_codegen::llvm::LlvmTextRenderer::amd(svod_dtype::AmdArch::Gfx942);
     // Returns (no OOM/hang) ⇒ the Mod-clamped prefetch index renders.
-    let _ = svod_codegen::traits::Renderer::render(&renderer, &linear_uop, Some("fa_rdb")).expect("render");
+    let code = svod_codegen::traits::Renderer::render(&renderer, &linear_uop, Some("fa_rdb")).expect("render").code;
+
+    // The attention marker lowers (Stage 1) to a single backend-delegated interleave
+    // at the loop top (Stage 2 will swap this for the softmax/MFMA comb).
+    let count = |needle: &str| code.matches(needle).count();
+    assert_eq!(count("call void @llvm.amdgcn.iglp.opt(i32 0)"), 1, "marker lowered to one iglp delegation");
 }
 
 // =============================================================================

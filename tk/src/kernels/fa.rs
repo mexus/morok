@@ -842,13 +842,15 @@ pub(crate) fn build_fa_mw_rdb(
     let k_nxt = k_smem.with_base_offset(par_nxt.mul(&iconst(half_k)));
     let v_nxt = v_smem.with_base_offset(par_nxt.mul(&iconst(half_v)));
 
-    // `iglp_opt(0)` at the KV-loop top (MFMA/memory interleave), threaded through
-    // the in-loop K/V buffers so it precedes the first prefetch load and stays
-    // loop-scoped (dep = `kv_idx`). The prologue keeps the un-rewrapped `k`/`v`.
+    // Mark the KV-loop as an attention compute pipeline (MFMA + online softmax),
+    // threaded through the in-loop K/V buffers so the marker precedes the first
+    // prefetch load and stays loop-scoped (dep = `kv_idx`). The prologue keeps the
+    // un-rewrapped `k`/`v`. The post-linearization scheduling pass brackets the MFMAs
+    // and (Stage 2) weaves the softmax under them (supersedes the prior `iglp_opt(0)`).
     let pf_kidx = [Idx::from(&batch), Idx::from(&pf), Idx::from(&head_kv), Idx::Const(0)];
-    let iglp = crate::asm::iglp_opt(0, kv_idx.clone());
-    let k_l = k.rewrap(k.uop().after(smallvec![iglp.clone()]));
-    let v_l = v.rewrap(v.uop().after(smallvec![iglp]));
+    let mark = crate::sched::pipeline(crate::sched::SchedKind::Attention, kv_idx.clone());
+    let k_l = k.rewrap(k.uop().after(smallvec![mark.clone()]));
+    let v_l = v.rewrap(v.uop().after(smallvec![mark]));
     let s_k = g.stage_global_to_reg(&k_smem, &k_l, &pf_kidx, 1);
     let s_v = g.stage_global_to_reg(&v_smem, &v_l, &pf_kidx, 1);
 

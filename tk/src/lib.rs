@@ -26,6 +26,7 @@ pub mod kernels;
 pub mod launch;
 pub mod math;
 pub mod ops;
+pub mod sched;
 pub mod swizzle;
 pub mod tile;
 pub mod tiles;

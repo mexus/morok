@@ -493,13 +493,14 @@ pub fn build_matmul_db(ker: &Kernel, n: usize) {
     let a_nxt = a_smem.with_base_offset(par_nxt.mul(&cidx(half_a)));
     let b_nxt = b_smem.with_base_offset(par_nxt.mul(&cidx(half_b)));
 
-    // `iglp_opt(0)` at the K-loop top, threaded through the GLOBAL buffers the
-    // in-loop stage reads so it precedes the first prefetch load and stays
+    // Mark the K-loop as a GEMM compute pipeline, threaded through the GLOBAL buffers
+    // the in-loop stage reads so the marker precedes the first prefetch load and stays
     // loop-scoped (dep = the counter `tile`). The prologue keeps the un-rewrapped
-    // `a_gl`/`b_gl`.
-    let iglp = crate::asm::iglp_opt(0, tile.clone());
-    let a_gl_l = a_gl.rewrap(a_gl.uop().after(smallvec![iglp.clone()]));
-    let b_gl_l = b_gl.rewrap(b_gl.uop().after(smallvec![iglp]));
+    // `a_gl`/`b_gl`. The post-linearization scheduling pass brackets each MFMA with
+    // `s_setprio` and a `sched.barrier` fence (supersedes the prior `iglp_opt(0)`).
+    let mark = crate::sched::pipeline(crate::sched::SchedKind::Gemm, tile.clone());
+    let a_gl_l = a_gl.rewrap(a_gl.uop().after(smallvec![mark.clone()]));
+    let b_gl_l = b_gl.rewrap(b_gl.uop().after(smallvec![mark]));
 
     // Stage the next tile's GLOBAL→VGPR load (overlaps this tile's MFMAs).
     let pf_a_idx = [Idx::Const(0), Idx::Const(0), Idx::from(&row), Idx::from(&pf)];

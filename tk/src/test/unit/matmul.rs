@@ -169,6 +169,34 @@ fn test_matmul_db_builds() {
     assert_eq!(lds, 2, "two LDS double buffers (A, B), got {lds}");
 }
 
+/// Scheduling pass (host render, no GPU): marking the K-loop a GEMM pipeline makes
+/// the post-linearization pass splice one backend-delegated interleave
+/// (`@llvm.amdgcn.iglp.opt(0)`) at the loop top — the dataflow model's lever, since
+/// hand-placed `s_setprio`/`sched.barrier` measured *slower* for GEMM (they pin the
+/// load/MFMA overlap the double buffer exists to create). Renders `build_matmul_db`
+/// to gfx942 LLVM IR and asserts the marker lowered to exactly that.
+#[test]
+fn test_matmul_db_sched_pass_amd_text() {
+    let n = 512usize;
+    let ker = Kernel::new("matmul_db", M1_CFG.grid_dims(n), M1_CFG.threads(), dummy_buffers(n));
+    build_matmul_db(&ker, n);
+    let sink = ker.finish(M1_CFG.n_accum);
+    let lowered = svod_schedule::graph_rewrite(&svod_schedule::symbolic::pm_lower_index_dtype(), sink, &mut ());
+    let program = svod_codegen::program_pipeline::program_from_sink(lowered, DeviceSpec::Cpu);
+    let linearized = svod_codegen::program_pipeline::do_linearize(&program).expect("do_linearize");
+    let linear_uop =
+        linearized.toposort().into_iter().find(|u| matches!(u.op(), Op::Linear { .. })).expect("LINEAR present");
+    let renderer = svod_codegen::llvm::LlvmTextRenderer::amd(svod_dtype::AmdArch::Gfx942);
+    let code = svod_codegen::traits::Renderer::render(&renderer, &linear_uop, Some("matmul_db")).expect("render").code;
+
+    let count = |needle: &str| code.matches(needle).count();
+    // The GEMM marker lowers to a single backend-delegated interleave at the loop
+    // top — hand-placed s_setprio/sched.barrier measured slower for GEMM (they pin
+    // the load/MFMA overlap), so the dataflow path delegates to iglp.
+    assert_eq!(count("call void @llvm.amdgcn.iglp.opt(i32 0)"), 1, "marker lowered to one iglp delegation");
+    assert!(!code.contains("s_setprio"), "GEMM delegates to iglp — no manual priority brackets");
+}
+
 /// A `group_2d(2,4)` is 8 waves / 512 threads, with `warp_row`/`warp_col`
 /// derived as `div`/`mod` of the wave id by `cols_waves`.
 #[test]

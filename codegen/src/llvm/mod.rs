@@ -12,6 +12,7 @@
 pub mod amd;
 pub mod common;
 pub mod cpu;
+pub mod sched;
 pub mod text;
 
 pub use common::LlvmTarget;

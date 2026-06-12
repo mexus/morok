@@ -73,6 +73,11 @@ impl Renderer for LlvmTextRenderer {
             }
         };
 
+        // Instruction-scheduling pass: lower any `sched::pipeline` markers into the
+        // gfx9 machine scheduling controls (s_setprio brackets, sched.barrier fences,
+        // the attention interleave comb). No-op on non-CDNA targets / unmarked kernels.
+        let nodes = crate::llvm::sched::apply_pipeline_scheduling(nodes, self.target);
+
         for (i, node) in nodes.iter().enumerate() {
             tracing::debug!(position = i, op = node.op().as_ref(), id = node.id, "linearized node");
         }
