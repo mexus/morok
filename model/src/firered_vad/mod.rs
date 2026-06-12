@@ -1,4 +1,4 @@
-//! FireRedVAD non-streaming voice-activity detection (DFSMN, arXiv:2603.10420).
+//! FireRedVAD voice-activity detection (DFSMN, arXiv:2603.10420).
 //!
 //! The DFSMN is purely feed-forward — the "memory" layers are depthwise
 //! convolutions over time, not recurrent state — so the **entire** model runs
@@ -6,6 +6,11 @@
 //! stitches window probabilities. The FSMN lookback/lookahead use asymmetric
 //! conv padding instead of the reference's symmetric-pad-then-slice (verified
 //! bit-identical by `scripts/convert_firered_vad.py --selfcheck`).
+//!
+//! Two variants ship: the non-streaming model below (lookback + lookahead,
+//! whole-utterance windowed inference behind [`FireRedVadSplitter`]) and the
+//! causal streaming `Stream-VAD` checkpoint (per-chunk JIT with on-device
+//! conv caches, incremental [`FireRedVadStreamer`] API).
 //!
 //! [`FireRedVadInference::probs`] yields one speech probability per
 //! [`FRAME_SHIFT`]-sample fbank frame. Long inputs run as overlapping
@@ -18,11 +23,16 @@ extern crate self as svod_model;
 
 mod fbank;
 mod splitter;
+mod stream;
 
 pub use fbank::FireRedFbank;
 #[cfg(test)]
 pub(crate) use splitter::smooth_trailing;
 pub use splitter::{FireRedVadSplitter, FireRedVadSplitterError};
+pub use stream::{
+    FireRedVadStream, FireRedVadStreamError, FireRedVadStreamer, StreamFlush, StreamVadConfig, StreamVadPostprocessor,
+    VadEvent,
+};
 
 use std::path::Path;
 

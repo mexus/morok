@@ -3,6 +3,7 @@ mod batch;
 mod config;
 mod diarizen;
 mod firered_vad;
+mod firered_vad_stream;
 mod jit;
 mod jit_recurrent;
 mod mel;

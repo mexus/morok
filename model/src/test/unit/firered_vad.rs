@@ -36,7 +36,7 @@ fn forward_zero_input_shape() {
 
 /// Deterministic ~U(-1,1) stream (LCG); the test needs reproducibility, not
 /// statistical quality.
-fn lcg(seed: &mut u64) -> f32 {
+pub(super) fn lcg(seed: &mut u64) -> f32 {
     *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
     ((*seed >> 33) as f32 / (1u64 << 31) as f32) - 1.0
 }
@@ -44,7 +44,7 @@ fn lcg(seed: &mut u64) -> f32 {
 /// Two-tone synthetic signal in int16-scale integers (exactly representable
 /// in f32), divided down to the `[-1, 1]` waveform scale the pipeline uses.
 /// Must match the generator in the golden block below.
-fn synthetic_waveform(n: usize) -> Vec<f32> {
+pub(super) fn synthetic_waveform(n: usize) -> Vec<f32> {
     (0..n)
         .map(|i| {
             let t = i as f64 / 16_000.0;
@@ -165,7 +165,7 @@ fn stitched_windows_match_full_forward() {
 /// real-checkpoint tests: `SVOD_FIRERED_VAD` dir override → local
 /// `data/firered_vad/` (output of `scripts/convert_firered_vad.py`) → HF Hub
 /// download from [`crate::firered_vad::HUB_REPO`].
-fn real_file(name: &str) -> PathBuf {
+pub(super) fn real_file(name: &str) -> PathBuf {
     let dir = std::env::var_os("SVOD_FIRERED_VAD")
         .map(PathBuf::from)
         .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("../data/firered_vad"));
@@ -173,7 +173,7 @@ fn real_file(name: &str) -> PathBuf {
     if local.exists() { local } else { crate::firered_vad::hub_file(name).expect("download from HF Hub") }
 }
 
-fn load_golden_vec(sd: &crate::state::StateDict, key: &str) -> Vec<f32> {
+pub(super) fn load_golden_vec(sd: &crate::state::StateDict, key: &str) -> Vec<f32> {
     let mut t = sd.get(key).unwrap_or_else(|| panic!("golden key {key}")).clone();
     t.realize().expect("realize golden");
     t.as_vec::<f32>().expect("golden readout")

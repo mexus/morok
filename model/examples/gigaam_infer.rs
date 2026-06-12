@@ -1,13 +1,13 @@
 //! GigaAM inference demo (CTC + RN-T).
 //!
 //! Loads a WAV, hands it to a [`Transcriber`] over a [`GigaAm`] with an
-//! explicit [`SileroVadSplitter`], and prints the transcript. The head is
+//! explicit [`FireRedVadSplitter`], and prints the transcript. The head is
 //! dispatched from the loaded weights: a CTC revision drives the fused
 //! encoder+head JIT, an RN-T revision the encoder + per-step predictor/joint
 //! backend (SentencePiece `▁ → space` post-processing inside the transcriber).
 //!
 //! Substitute `FixedLengthSplitter::new()` for the VAD splitter to skip the
-//! Silero hub download — useful for tests, short utterances, or pipelines
+//! FireRedVAD hub download — useful for tests, short utterances, or pipelines
 //! that already segmented the input.
 //!
 //! Usage:
@@ -16,15 +16,15 @@
 //!
 //! Env knobs (all optional):
 //!   SVOD_AMX=1                 Enable AMX renderer (Apple Silicon).
-//!   SVOD_VAD_THRESHOLD=f       Silero VAD threshold (default 0.5).
+//!   SVOD_VAD_THRESHOLD=f       FireRedVAD speech threshold (default 0.4).
 
 use std::path::PathBuf;
 use std::time::Instant;
 
 use clap::Parser;
 
+use svod_model::firered_vad::FireRedVadSplitter;
 use svod_model::gigaam::{GigaAm, TranscribeOpts, Transcriber};
-use svod_model::silero_vad::SileroVadSplitter;
 
 #[derive(Parser, Debug)]
 #[command(about = "GigaAM transcription demo (CTC + RN-T)", long_about = None)]
@@ -85,7 +85,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if args.rnnt && model.head.as_rnnt().is_none() {
         return Err(format!("{}@{revision} has a CTC head, not RN-T.", args.repo).into());
     }
-    let splitter = SileroVadSplitter::from_hub()?;
+    let splitter = FireRedVadSplitter::from_hub()?;
     let mut transcriber = Transcriber::new(model, splitter, opts.clone())?;
 
     println!("Transcribing...");
