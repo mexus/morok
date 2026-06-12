@@ -121,35 +121,24 @@ fn get_or_init_state(device: &DeviceSpec) -> Arc<DeviceRngState> {
         return state.clone();
     }
 
-    // Slow path: claim a device index only when we're actually going to insert.
-    // Doing the `fetch_add` eagerly before `compute()` would burn an index on
-    // every concurrent caller that loses the race, drifting the sequence and
-    // eventually overflowing the SHA256 table.
-    //
-    // The closure is `FnMut` and papaya may retry it on contention — cache the
-    // freshly-built state in a local `Option` so retries reuse one
-    // `fetch_add`/`build_fresh_state` rather than burning a new index per retry.
-    use papaya::Operation;
-    let mut prepared: Option<Arc<DeviceRngState>> = None;
-    let result = pinned.compute(device.clone(), |entry| match entry {
-        Some((_, state)) if state.seed_epoch == current_epoch => Operation::Abort::<Arc<DeviceRngState>, ()>(()),
-        _ => {
-            let fresh = prepared
-                .get_or_insert_with(|| {
-                    let device_index = DEVICE_INDEX_COUNTER.fetch_add(1, Ordering::AcqRel) as usize;
-                    Arc::new(build_fresh_state(device_index, current_epoch))
-                })
-                .clone();
-            Operation::Insert(fresh)
-        }
-    });
-
-    match result {
-        papaya::Compute::Aborted(()) => pinned.get(device).expect("entry must exist after abort").clone(),
-        papaya::Compute::Inserted(_, state) => state.clone(),
-        papaya::Compute::Updated { new: (_, state), .. } => state.clone(),
-        papaya::Compute::Removed(_, _) => unreachable!("compute closure never returns Remove"),
+    // Slow path: serialize index allocation. A lock-free insert race burns
+    // one index per losing caller (each builds its candidate state before the
+    // CAS resolves), so a thundering herd of first `rand` calls — e.g. a
+    // 32-thread test binary — overflows the 16-entry SHA256 table even with a
+    // single device. The lock makes index claiming once-per-(device, epoch);
+    // this path runs once per device per epoch, so contention is irrelevant.
+    static INIT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = INIT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    // Re-check under the lock: a racer may have inserted while we waited.
+    if let Some(state) = pinned.get(device)
+        && state.seed_epoch == current_epoch
+    {
+        return state.clone();
     }
+    let device_index = DEVICE_INDEX_COUNTER.fetch_add(1, Ordering::AcqRel) as usize;
+    let fresh = Arc::new(build_fresh_state(device_index, current_epoch));
+    pinned.insert(device.clone(), fresh.clone());
+    fresh
 }
 
 /// Returns `(seed_tensor, counter_value)` for an upcoming draw of `num`
