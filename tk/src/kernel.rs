@@ -203,6 +203,31 @@ impl Kernel {
         }
         store.end(SmallVec::from_vec(rngs))
     }
+
+    /// Like [`Self::endrange_to`] but wraps the popped terminal store in a
+    /// workgroup `BARRIER` carrying `deps`, then closes the loop around the
+    /// barrier. The barrier becomes the loop-closing `END`'s computation, so it
+    /// is kept live and loop-scoped **with no value consumer** — exactly what a
+    /// software-pipelined K-loop's per-iteration fence needs: the barrier's
+    /// passthrough (the store, which transitively reads the gathers/MFMAs)
+    /// orders it *after* the loop body's compute, while `deps` (the prefetch
+    /// commits) order it after the cross-iteration writes.
+    ///
+    /// This is the tinygrad `STORE.barrier(...)` idiom (and what
+    /// [`crate::Group::commit_reg_to_local`] already does). It is legal where the
+    /// analogous `.after()` is not: `barrier` accepts an `End` passthrough, but
+    /// `after` rejects it (its passthrough must be data-producing); and only a
+    /// `Barrier` actually emits the `s.barrier` fence. Anchoring a consumer-less
+    /// barrier *post*-loop instead trips the CFG-builder cycle check.
+    pub fn endrange_barrier_to(&self, ranges: usize, deps: SmallVec<[Arc<UOp>; 4]>) -> Arc<UOp> {
+        let (store, _buf) = self.store_stack.borrow_mut().pop().expect("endrange_barrier_to: store stack underflow");
+        let wrapped = if deps.is_empty() { store } else { store.barrier(deps) };
+        let mut rngs: Vec<Arc<UOp>> = Vec::with_capacity(ranges);
+        for _ in 0..ranges {
+            rngs.push(self.range_stack.borrow_mut().pop().expect("endrange_barrier_to: range stack underflow"));
+        }
+        wrapped.end(SmallVec::from_vec(rngs))
+    }
 }
 
 /// Mint a flat 1-D `Param` placeholder for a concrete `BUFFER` UOp at `slot`.

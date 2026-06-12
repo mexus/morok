@@ -433,6 +433,7 @@ fn fa_kv_slice<'k>(
     kv_blk_rows: usize,
     reinit_dep: &Arc<UOp>,
     war_barrier: bool,
+    extra_war: &[Arc<UOp>],
 ) -> FaAcc<'k> {
     let FaAcc { mut max_vec, mut norm_vec, mut o_reg } = acc;
     let FaScratch { k_reg, k_reg_t, v_reg, att, att_mma, scale_vec, max_vec_last } = sc;
@@ -440,10 +441,14 @@ fn fa_kv_slice<'k>(
     // Per-warp LDS→REG gather: every warp reads the shared K/V block.
     let k_reg = warp.load(k_reg.into(), k_smem.into(), &[], &[], 0).rt();
     let v_reg = warp.load(v_reg.into(), v_smem.into(), &[], &[], 0).rt();
-    // Cross-wave WAR sync (stage-1 only): all 8 warps must finish reading this
-    // buffer before the next fill overwrites it.
+    // Cross-wave WAR sync: all 8 warps must finish reading this buffer before the
+    // next fill overwrites it. `extra_war` folds in the rolled double-buffer's
+    // prefetch commits, so this single in-loop barrier (consumed by the gathers)
+    // also gates the cross-iteration RAW/WAR.
     let (k_reg, v_reg) = if war_barrier {
-        let sync = k_reg.uop().barrier(smallvec![v_reg.uop().clone()]);
+        let mut deps: smallvec::SmallVec<[Arc<UOp>; 4]> = smallvec![v_reg.uop().clone()];
+        deps.extend(extra_war.iter().cloned());
+        let sync = k_reg.uop().barrier(deps);
         (k_reg.after(smallvec![sync.clone()]), v_reg.after(smallvec![sync]))
     } else {
         (k_reg, v_reg)
@@ -668,6 +673,7 @@ pub(crate) fn build_fa_mw_db(
         kv_blk_rows,
         &t,
         war,
+        &[],
     );
 
     // Slice 1 → buf1.
@@ -687,9 +693,196 @@ pub(crate) fn build_fa_mw_db(
         kv_blk_rows,
         &t,
         war,
+        &[],
     );
 
     let FaAcc { norm_vec, o_reg, .. } = acc;
+    let o_reg = o_reg.rewrap(ker.endrange(1));
+    let norm_vec = norm_vec.after(smallvec![o_reg.uop().clone()]);
+
+    let o_reg = o_reg / &norm_vec;
+    let o_reg_t = warp.transpose(o_reg_t, &o_reg);
+    let o_idx = [Idx::from(&batch), Idx::from(&q_blk), Idx::from(&head), Idx::Const(0)];
+    let _ = warp.store(o.into(), o_reg_t.into(), &o_idx, &[], 1);
+}
+
+// =============================================================================
+// Software-pipelined double-buffered KV loop.
+// =============================================================================
+
+/// Software-pipelined double-buffered multi-wave flash-attention. Same
+/// grid/semantics as [`build_fa_mw_db`], but the KV loop is a rolled `Range` over a
+/// **2×-size LDS** K/V double buffer indexed by `kv_idx % 2`: each iteration
+/// register-stages the next KV block's GLOBAL→VGPR load, gathers the current buffer
+/// half into the WMMA fragments, runs the online-softmax body, then `ds_write`-
+/// commits the staged registers into the other half, under one workgroup barrier
+/// per iteration.
+///
+/// Unlike the unroll-by-2 [`build_fa_mw_db`] (two static buffers, two slices and
+/// two [`FaScratch`] sets per body), this keeps one scratch set and one loop body.
+/// LDS is the same (one `st_db` = two halves); FA's K/V are small so 2× fits the
+/// 64 KB budget. The online-softmax [`FaAcc`] carries across the back-edge via the
+/// memory-accumulator (`kv_idx` re-init) pattern, as in [`build_fa_mw`]. The
+/// `kv_idx % 2` parity makes the gather/commit counter-dependent so they stay
+/// loop-scoped; the per-iteration WAR barrier (consumed by the gathers, with the
+/// prefetch commits folded into its deps) provides the cross-iteration RAW/WAR
+/// ordering, closed with plain [`Kernel::endrange`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_fa_mw_rdb(
+    ker: &Kernel,
+    b: usize,
+    n: usize,
+    h: usize,
+    h_kv: usize,
+    d: usize,
+    q_blk_rows: usize,
+    kv_blk_rows: usize,
+) {
+    assert_eq!(d % BLK, 0, "D must be a multiple of {BLK}");
+    assert_eq!(q_blk_rows % BLK, 0, "Q_BLK must be a multiple of the WMMA edge {BLK}");
+    assert_eq!(kv_blk_rows % BLK, 0, "KV_BLK must be a multiple of the WMMA edge {BLK}");
+    assert_eq!(h % h_kv, 0, "H must be a multiple of H_KV");
+    assert_eq!(
+        n % (q_blk_rows * NUM_WARPS),
+        0,
+        "multi-wave FA needs N a multiple of Q_BLK*{NUM_WARPS} ({} here)",
+        q_blk_rows * NUM_WARPS
+    );
+    // Rolled (no unroll halving): the group-max causal bound is
+    // `(block_q_base+1)*NUM_WARPS*Q_BLK/KV_BLK` super-blocks (exact for these tiles).
+    assert_eq!(
+        (NUM_WARPS * q_blk_rows) % kv_blk_rows,
+        0,
+        "FA rolled db needs KV_BLK to divide NUM_WARPS*Q_BLK ({NUM_WARPS}*{q_blk_rows} / {kv_blk_rows})"
+    );
+    let group_size = (h / h_kv) as i64;
+    let g = ker.group(NUM_WARPS); // 512 threads — collaborative K/V GLOBAL→LDS fill
+    let warp = ker.warp();
+
+    let o = ker.gl(&[b, n, h, d], DType::BFloat16);
+    let q = ker.gl(&[b, n, h, d], DType::BFloat16);
+    let k = ker.gl(&[b, n, h_kv, d], DType::BFloat16);
+    let v = ker.gl(&[b, n, h_kv, d], DType::BFloat16);
+
+    let head = ker.block_idx[0].clone();
+    let head_kv = head.idiv(&iconst(group_size));
+    let batch = ker.block_idx[2].clone();
+    let block_q_base = ker.block_idx[1].clone();
+    let warpid = g.warpid_in_group();
+    let q_blk = block_q_base.mul(&iconst(NUM_WARPS as i64)).add(&warpid);
+
+    let bf16 = DType::BFloat16;
+    let f32 = DType::Float32;
+    let (row, col) = (TileLayout::Row, TileLayout::Col);
+
+    // 2×-size shared K/V LDS double buffers (one `kv_blk_rows × d` block per half).
+    let k_smem = ker.st_db((kv_blk_rows, d), bf16.clone(), row, ST_16X16);
+    let v_smem = ker.st_db((kv_blk_rows, d), bf16.clone(), row, ST_16X16);
+    let half_k = k_smem.half_elems() as i64;
+    let half_v = v_smem.half_elems() as i64;
+
+    // Q tile + transpose (shared, read-only across the loop).
+    let q_reg_fl = ker.rt((q_blk_rows, d), f32.clone(), row, RT_16X16);
+    let q_reg = ker.rt((q_blk_rows, d), bf16.clone(), row, RT_16X16);
+    let q_reg_t = ker.rt((d, q_blk_rows), bf16.clone(), col, RT_16X16);
+    let o_reg_t = ker.rt((q_blk_rows, d), f32.clone(), row, RT_16X16);
+
+    // One scratch set (vs the unroll's two): the rolled body has a back-edge, so
+    // the carried FaAcc + a single scratch suffice.
+    let sc = FaScratch {
+        k_reg: ker.rt((kv_blk_rows, d), bf16.clone(), row, RT_16X16),
+        k_reg_t: ker.rt((d, kv_blk_rows), bf16.clone(), col, RT_16X16),
+        v_reg: ker.rt((kv_blk_rows, d), bf16.clone(), col, RT_16X16),
+        att: ker.rt((kv_blk_rows, q_blk_rows), f32.clone(), col, RT_16X16),
+        att_mma: ker.rt((kv_blk_rows, q_blk_rows), bf16.clone(), col, RT_16X16),
+        scale_vec: ker.rv(q_blk_rows, f32.clone(), VecLayout::Ortho, RT_16X16),
+        max_vec_last: ker.rv(q_blk_rows, f32.clone(), VecLayout::Ortho, RT_16X16),
+    };
+
+    // Carried online-softmax accumulators.
+    let o_reg = ker.rt((d, q_blk_rows), f32.clone(), col, RT_16X16);
+    let max_vec = ker.rv(q_blk_rows, f32.clone(), VecLayout::Ortho, RT_16X16);
+    let norm_vec = ker.rv(q_blk_rows, f32, VecLayout::Ortho, RT_16X16);
+    let acc = FaAcc { max_vec: warp.neg_inf_rv(max_vec), norm_vec: warp.zero_rv(norm_vec), o_reg: warp.zero(o_reg) };
+
+    // Load + scale this warp's Q tile, then transpose for the QKᵀ contraction.
+    let q_idx = [Idx::from(&batch), Idx::from(&q_blk), Idx::from(&head), Idx::Const(0)];
+    let q_reg_fl = warp.load(q_reg_fl.into(), q.into(), &[], &q_idx, 1).rt();
+    let q_reg_fl = q_reg_fl * ((1.0 / (d as f64).sqrt()) * std::f64::consts::LOG2_E);
+    let q_reg = warp.copy(q_reg, &q_reg_fl);
+    let q_reg_t = warp.transpose(q_reg_t, &q_reg);
+
+    // Full (rolled) KV super-block trip count.
+    let blocks_mult = (NUM_WARPS * q_blk_rows / kv_blk_rows) as i64;
+    let kv_bound = block_q_base.add(&iconst(1)).mul(&iconst(blocks_mult));
+
+    // Prologue: stage KV block 0 → VGPR, commit → buf[0], barrier.
+    let p_kidx = [Idx::from(&batch), Idx::Const(0), Idx::from(&head_kv), Idx::Const(0)];
+    let s0_k = g.stage_global_to_reg(&k_smem, &k, &p_kidx, 1);
+    let s0_v = g.stage_global_to_reg(&v_smem, &v, &p_kidx, 1);
+    let k_smem = g.commit_reg_to_local(k_smem, &s0_k, true);
+    let v_smem = g.commit_reg_to_local(v_smem, &s0_v, true);
+
+    // Rolled KV loop. `kv_bound` (the dynamic per-q-block causal trip count) is the
+    // Range end. The prefetch-block index is `(kv+1) % total_kv_blocks` (a Mod): the
+    // final trip's prefetch (`kv+1 == total`) wraps to block 0, which is never
+    // gathered, keeping the GLOBAL read in bounds. A `min`/`where` clamp is avoided
+    // — a `WHERE` in the prefetch-address path is mis-ordered past its address-MUL
+    // consumer in this kernel's linearization, leaving the renderer without its SSA
+    // value; Mod (like the parity) lowers and orders cleanly.
+    let total_kv_blocks = (n / kv_blk_rows) as i64;
+    let kv_idx = ker.range_uop(kv_bound);
+    let kvp1 = kv_idx.add(&iconst(1));
+    let pf = kvp1.try_mod(&iconst(total_kv_blocks)).expect("(kv+1) % total blocks");
+    let par_cur = kv_idx.try_mod(&iconst(2)).expect("kv % 2");
+    let par_nxt = kvp1.try_mod(&iconst(2)).expect("(kv+1) % 2");
+
+    let k_cur = k_smem.with_base_offset(par_cur.mul(&iconst(half_k)));
+    let v_cur = v_smem.with_base_offset(par_cur.mul(&iconst(half_v)));
+    let k_nxt = k_smem.with_base_offset(par_nxt.mul(&iconst(half_k)));
+    let v_nxt = v_smem.with_base_offset(par_nxt.mul(&iconst(half_v)));
+
+    // `iglp_opt(0)` at the KV-loop top (MFMA/memory interleave), threaded through
+    // the in-loop K/V buffers so it precedes the first prefetch load and stays
+    // loop-scoped (dep = `kv_idx`). The prologue keeps the un-rewrapped `k`/`v`.
+    let pf_kidx = [Idx::from(&batch), Idx::from(&pf), Idx::from(&head_kv), Idx::Const(0)];
+    let iglp = crate::asm::iglp_opt(0, kv_idx.clone());
+    let k_l = k.rewrap(k.uop().after(smallvec![iglp.clone()]));
+    let v_l = v.rewrap(v.uop().after(smallvec![iglp]));
+    let s_k = g.stage_global_to_reg(&k_smem, &k_l, &pf_kidx, 1);
+    let s_v = g.stage_global_to_reg(&v_smem, &v_l, &pf_kidx, 1);
+
+    // Commit the staged registers into the *other* half (no per-commit barrier — the
+    // single in-loop WAR barrier below covers both RAW and WAR). Emitted before the
+    // slice so the slice's `o_reg` A·V store stays the last terminal store on the stack.
+    let commit_k = g.commit_reg_to_local(k_nxt, &s_k, false);
+    let commit_v = g.commit_reg_to_local(v_nxt, &s_v, false);
+
+    // Gather buf[cur] (counter-dependent ⇒ loop-scoped; reads the block committed
+    // last iteration, or the prologue for block 0) and run QKᵀ → causal mask →
+    // online softmax → A·V. The WAR barrier (consumed by the gathers, an in-loop
+    // anchor) folds in the prefetch commits via `extra_war`, so one barrier gates
+    // the cross-iteration RAW/WAR. The barrier-wrapped END (`endrange_barrier_to`)
+    // is NOT used here: it reorders the causal-mask WHERE past its consumer, leaving
+    // the renderer without its SSA value — plain `endrange` keeps the render order.
+    let extra_war = [commit_k.uop().clone(), commit_v.uop().clone()];
+    let FaAcc { norm_vec, o_reg, .. } = fa_kv_slice(
+        &warp,
+        ker,
+        acc,
+        sc,
+        k_cur,
+        v_cur,
+        &q_reg_t,
+        &q_blk,
+        &kv_idx,
+        q_blk_rows,
+        kv_blk_rows,
+        &kv_idx,
+        true,
+        &extra_war,
+    );
+
     let o_reg = o_reg.rewrap(ker.endrange(1));
     let norm_vec = norm_vec.after(smallvec![o_reg.uop().clone()]);
 
@@ -757,6 +950,39 @@ pub fn flash_attention_forward_mw_db(
 
     crate::run_kernel("fa_mw_db", grid, (NUM_WARPS * 64) as i64, &mut [o], &[q, k, v], |ker| {
         build_fa_mw_db(ker, b, n, h, h_kv, d, pipelined, Q_BLK, KV_BLK);
+        ker.finish(1)
+    })
+}
+
+/// Per-warp tile for [`build_fa_mw_rdb`]: the bigger `{32,32}` (which amortizes the
+/// softmax over more MFMA) once its grid `b·h·n/(32·NUM_WARPS)` covers the ~304-CU
+/// machine and `N` divides `32·NUM_WARPS`; otherwise the baseline `{16,16}` (the
+/// bigger tile halves the grid, so it loses at low occupancy). The 304 crossover is
+/// a first cut from the gfx942 bench.
+fn adaptive_fa_tile(b: usize, n: usize, h: usize) -> (usize, usize) {
+    const NUM_CU: usize = 304;
+    const BIG: usize = 32;
+    if n.is_multiple_of(BIG * NUM_WARPS) && b * h * (n / (BIG * NUM_WARPS)) >= NUM_CU {
+        (BIG, BIG)
+    } else {
+        (Q_BLK, KV_BLK)
+    }
+}
+
+/// Run the rolled double-buffered multi-wave flash-attention forward into `o`
+/// ([`build_fa_mw_rdb`]). One rolled KV loop over a parity-indexed 2× LDS double
+/// buffer (one [`FaScratch`]); the per-warp tile is [`adaptive_fa_tile`].
+pub fn flash_attention_forward_mw_rdb(o: &mut Tensor, q: &Tensor, k: &Tensor, v: &Tensor) -> crate::LaunchResult<()> {
+    let qs = q.shape().expect("q shape");
+    let ks = k.shape().expect("k shape");
+    let dim = |s: &svod_ir::shape::Shape, i: usize| s[i].as_const().expect("concrete dim");
+    let (b, n, h, d) = (dim(&qs, 0), dim(&qs, 1), dim(&qs, 2), dim(&qs, 3));
+    let h_kv = dim(&ks, 2);
+    let (q_blk, kv_blk) = adaptive_fa_tile(b, n, h);
+    let grid = [h as i64, (n / q_blk / NUM_WARPS) as i64, b as i64];
+
+    crate::run_kernel("fa_mw_rdb", grid, (NUM_WARPS * 64) as i64, &mut [o], &[q, k, v], |ker| {
+        build_fa_mw_rdb(ker, b, n, h, h_kv, d, q_blk, kv_blk);
         ker.finish(1)
     })
 }

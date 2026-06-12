@@ -21,7 +21,7 @@ fn dummy_buffers(n: usize) -> Vec<Arc<UOp>> {
     ]
 }
 
-/// M2 graph-shape check (no GPU): the `Hints` stage injects the
+/// Graph-shape check (no GPU): the `Hints` stage injects the
 /// `s_setprio`/`s_waitcnt`/`sched.barrier` `Op::Custom` scheduling nodes into
 /// the SINK (one cluster per unrolled tile), and the `Unroll` stage injects
 /// none — so a refactor cannot silently drop them or leave them in the baseline.
@@ -114,7 +114,7 @@ fn test_matmul_kernel_builds() {
     assert!(topo.iter().any(|u| matches!(u.op(), Op::Barrier { .. })), "workgroup barrier present");
 }
 
-/// M3: the GLOBAL→LDS strip fills issue 128-bit `bf16.vec(8)` coalesced loads
+/// The GLOBAL→LDS strip fills issue 128-bit `bf16.vec(8)` coalesced loads
 /// (one per strip's collaborative pass), and only those — the LDS→REG gather
 /// stays scalar-into-WMMA (`bf16.vec(4)` operands).
 #[test]
@@ -131,7 +131,45 @@ fn test_matmul_vec_fill_graph_shape() {
     assert_eq!(wide, 2, "two bf16.vec(8) GLOBAL→LDS loads (A and B strips), got {wide}");
 }
 
-/// SI-1: a `group_2d(2,4)` is 8 waves / 512 threads, with `warp_row`/`warp_col`
+/// Graph-shape (no GPU): the double-buffered matmul builds a well-formed
+/// **acyclic** SINK with the 2× LDS double buffer, a `tile % 2` parity select
+/// (the buffer-half index that also keeps the gather/commit loop-scoped), two
+/// WMMA accumulators, a workgroup barrier, and two terminal C stores. Catches a
+/// dropped/cyclic anchoring edge before any GPU run.
+#[test]
+fn test_matmul_db_builds() {
+    use svod_ir::BinaryOp;
+
+    let n = 512usize;
+    let ker = Kernel::new("matmul_db", M1_CFG.grid_dims(n), M1_CFG.threads(), dummy_buffers(n));
+    build_matmul_db(&ker, n);
+    let sink = ker.finish(M1_CFG.n_accum);
+
+    assert!(matches!(sink.op(), Op::Sink { .. }), "kernel finishes in a SINK");
+    let topo = sink.toposort(); // would diverge on a cyclic graph
+
+    let wmmas = topo.iter().filter(|u| matches!(u.op(), Op::Wmma { .. })).count();
+    assert_eq!(wmmas, 2, "two symbolic WMMA nodes (two per-wave accumulators)");
+
+    let Op::Sink { sources, .. } = sink.op() else { unreachable!() };
+    assert_eq!(sources.len(), 2, "two terminal C stores");
+
+    assert!(topo.iter().any(|u| matches!(u.op(), Op::Barrier { .. })), "workgroup barrier present");
+
+    // The `tile % 2` parity select lowers to a Mod-by-2 binary.
+    let has_parity = topo.iter().any(|u| {
+        matches!(u.op(), Op::Binary(BinaryOp::Mod, _, d)
+            if matches!(d.op(), Op::Const(c) if matches!(c.0, svod_ir::ConstValue::Int(2))))
+    });
+    assert!(has_parity, "the tile % 2 double-buffer parity select is present");
+
+    // Two double-buffered LDS allocations (A and B strips); accumulators/stages
+    // are DefineReg, not DefineLocal.
+    let lds = topo.iter().filter(|u| matches!(u.op(), Op::DefineLocal { .. })).count();
+    assert_eq!(lds, 2, "two LDS double buffers (A, B), got {lds}");
+}
+
+/// A `group_2d(2,4)` is 8 waves / 512 threads, with `warp_row`/`warp_col`
 /// derived as `div`/`mod` of the wave id by `cols_waves`.
 #[test]
 fn test_group_2d_wave_index_shape() {
@@ -154,9 +192,35 @@ fn test_group_2d_wave_index_shape() {
     assert!(by_four(&g.warp_row(), BinaryOp::Idiv), "warp_row divides the wave id by cols_waves=4");
     assert!(by_four(&g.warp_col(), BinaryOp::Mod), "warp_col mods the wave id by cols_waves=4");
 
-    // Single-warp group keeps the 1×1 grid (matmul Step-B invariant).
+    // Single-warp group keeps the 1×1 grid.
     let w = ker.warp();
     assert_eq!((w.warps, w.rows_waves, w.cols_waves, w.group_threads()), (1, 1, 1, 64));
+}
+
+/// `st_db` allocates a 2×-size LDS buffer, and a parity `with_base_offset` view
+/// threads a runtime offset into the LDS flat address (so a double-buffer
+/// gather/fill is counter-dependent and stays loop-scoped), while an ordinary
+/// `st` tile's addresses carry no such offset.
+#[test]
+fn test_st_db_base_offset_infra() {
+    use crate::tiles::ST_16X16_SWIZZLED;
+
+    let ker = Kernel::new("db_infra", [1, 1, 1], 512, vec![]);
+    // Single-half flat element count for a 256×32 bf16 tile (base 16×16):
+    // (256/16)*(32/16)*16*16 = 16*2*256 = 8192.
+    let db = ker.st_db((256, 32), DType::BFloat16, TileLayout::Row, ST_16X16_SWIZZLED);
+    assert_eq!(db.half_elems(), 8192, "half_elems = height*width*base.rows*base.cols");
+    assert!(db.base_offset().is_none(), "fresh st_db addresses half 0 (no base_offset)");
+
+    // A parity view adds `parity * half_elems` to the flat address.
+    let tile = ker.range(4); // a Loop range counter
+    let parity = tile.try_mod(&crate::index::cidx(2)).expect("tile % 2");
+    let off = parity.try_mul(&crate::index::cidx(db.half_elems() as i64)).expect("parity*half");
+    let view = db.with_base_offset(off.clone());
+    assert!(view.base_offset().is_some(), "with_base_offset sets the parity select");
+
+    // Sanity: the underlying buffer is shared (same DefineLocal), only the view differs.
+    assert!(std::sync::Arc::ptr_eq(db.uop(), view.uop()), "with_base_offset shares the backing buffer");
 }
 
 // =============================================================================
@@ -185,7 +249,7 @@ fn run_matmul_check(n: usize) {
     assert!(max_abs < 5e-2, "N={n}: max abs error {max_abs} exceeds bf16 tolerance 5e-2");
 }
 
-/// M4: the chiplet/L2 grid swizzle in **isolation** (1-D grid + [`l2_swizzle`],
+/// The chiplet/L2 grid swizzle in **isolation** (1-D grid + [`l2_swizzle`],
 /// scalar fill). It permutes which workgroup computes which 256-block, so the
 /// full C must be bit-identical-up-to-bf16-tolerance to `a.matmul(b)`.
 ///
@@ -249,8 +313,9 @@ where
     c.as_vec::<f32>().expect("read c")
 }
 
-/// M7: the size-adaptive matmul is correct at every N, picking [`SMALL_CFG`] for
-/// small N (the under-occupied 256×256 collapse) and [`M1_CFG`] otherwise.
+/// The size-adaptive matmul is correct at every N, picking [`SMALL_CFG`] for
+/// small N (where the 256×256 block under-occupies the machine) and [`M1_CFG`]
+/// otherwise.
 ///
 /// `SVOD_DEVICE=AMD:0 cargo test -p svod-tk --lib matmul::test_matmul_adaptive_amd -- --ignored --nocapture`.
 #[test]
@@ -267,21 +332,42 @@ fn test_matmul_adaptive_amd() {
     }
 }
 
-/// M2: the K-loop pipeline is correct against the reference AND numerically
-/// identical (bit-for-bit) to the M1 baseline — the pipeline only reorders
-/// memory/compute, it must not change the result.
+/// gfx942: the double-buffered matmul ([`build_matmul_db`]) is correct vs the
+/// reference and bit-identical to the single-buffered baseline — the rolled
+/// pipeline only reorders memory/compute, the per-fragment WMMA accumulation
+/// order is unchanged, so it must not change the result.
 ///
-/// Validated scope (per the M2 bring-up findings, see the module note on
-/// [`build_matmul_pipelined`]): the `Unroll` stage at N ≤ 1024 (full-unroll IR
-/// compile time grows steeply past that), and the register-staged `Prefetch` /
-/// `Hints` stages at N ≤ 512 (their single-LDS commit hazards beyond ~8 unrolled
-/// tiles, so they stay opt-in and small-N only).
+/// `SVOD_DEVICE=AMD:0 cargo test -p svod-tk --lib matmul::test_matmul_db_amd -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn test_matmul_db_amd() {
+    for n in [256usize, 512, 1024, 2048] {
+        let (a, b) = matmul_inputs(n);
+        let expected = matmul_reference(&a, &b);
+        let m1 = launch_matmul("simple_matmul", n, M1_CFG, |ker| build_matmul(ker, n), &a, &b);
+        let got = launch_matmul("matmul_db", n, M1_CFG, |ker| build_matmul_db(ker, n), &a, &b);
+        let max_abs = max_abs_err(&got, &expected);
+        let vs_m1 = max_abs_err(&got, &m1);
+        println!("matmul_db N={n}: max abs error = {max_abs:e}, max |Δ vs M1| = {vs_m1:e}");
+        assert!(max_abs < 5e-2, "matmul_db N={n}: max abs error {max_abs} exceeds bf16 tolerance 5e-2");
+        assert!(vs_m1 < 1e-3, "matmul_db N={n}: differs from M1 by {vs_m1} (must be ~identical)");
+    }
+}
+
+/// The K-loop pipeline is correct against the reference AND numerically
+/// identical (bit-for-bit) to the single-buffered baseline — the pipeline only
+/// reorders memory/compute, it must not change the result.
+///
+/// Scope (see the module note on [`build_matmul_pipelined`]): the `Unroll` stage
+/// at N ≤ 1024 (full-unroll IR compile time grows steeply past that), and the
+/// register-staged `Prefetch` / `Hints` stages at N ≤ 512 (their single-LDS
+/// commit hazards beyond ~8 unrolled tiles, so they stay opt-in and small-N only).
 ///
 /// `SVOD_DEVICE=AMD:0 cargo test -p svod-tk --lib matmul::test_matmul_pipelined_amd -- --ignored --nocapture`.
 #[test]
 #[ignore]
 fn test_matmul_pipelined_amd() {
-    // (stage, max N the stage is validated at).
+    // (stage, max N the stage is exercised at).
     let cases = [(PipeStage::Unroll, 1024usize), (PipeStage::Prefetch, 512), (PipeStage::Hints, 512)];
     for n in [256usize, 512, 1024] {
         let (a, b) = matmul_inputs(n);

@@ -15,6 +15,11 @@ use crate::{Kernel, RT, RegTile, WARP_THREADS};
 /// K-reduction step (the LDS strip depth, shared by every config). HK `GEMM:6`.
 pub const K_STEP: usize = 64;
 
+/// K-reduction step for [`build_matmul_db`]. Halved vs [`K_STEP`] so the 2×-size
+/// LDS double buffer fits the 64 KB budget at the 256×256/8-wave geometry
+/// (A `256×32`×2 + B `32×256`×2 = 64 KB).
+pub const K_STEP_DB: usize = 32;
+
 /// Block / wave geometry of a multi-wave matmul (HK `GEMM:5-8,67-68`): a
 /// `wave_rows × wave_cols`-wave workgroup computes a `block × block` C tile,
 /// each wave owning `n_accum` col-major `reg × reg` f32 accumulators
@@ -303,8 +308,8 @@ pub fn build_matmul_pipelined(ker: &Kernel, n: usize, stage: PipeStage) {
             match staged.take() {
                 // Tiles ≥1: ds_write-commit the registers staged during tile-1.
                 Some((sa, sb)) => {
-                    let af = g.commit_reg_to_local(a_smem.clone(), &sa);
-                    let bf = g.commit_reg_to_local(b_smem.clone(), &sb);
+                    let af = g.commit_reg_to_local(a_smem.clone(), &sa, true);
+                    let bf = g.commit_reg_to_local(b_smem.clone(), &sb, true);
                     (af, bf)
                 }
                 // Tile 0 prologue: no prefetch yet — fill straight from global.
@@ -410,4 +415,157 @@ fn tile_a_idx(tile: usize, row: &Arc<UOp>) -> [Idx; 4] {
 /// B-strip tile index `[0, 0, K-tile, col-block]` for the unrolled K-loop.
 fn tile_b_idx(tile: usize, col: &Arc<UOp>) -> [Idx; 4] {
     [Idx::Const(0), Idx::Const(0), Idx::Const(tile as i64), Idx::from(col)]
+}
+
+// =============================================================================
+// Software-pipelined double-buffered K-loop.
+// =============================================================================
+
+/// Software-pipelined double-buffered matmul ([`M1_CFG`] geometry). The K-loop is
+/// a rolled `Range` over a **2×-size XOR-swizzled LDS** double buffer indexed by
+/// `tile % 2` ([`K_STEP_DB`] keeps the doubled buffer within the 64 KB LDS
+/// budget). Each iteration register-stages the next K-tile's GLOBAL→VGPR load,
+/// gathers the current buffer half into the WMMA fragments, MFMA-accumulates, then
+/// `ds_write`-commits the staged registers into the other half, under one
+/// workgroup barrier per iteration.
+///
+/// The `tile % 2` parity both selects the buffer half and makes the gather/commit
+/// addresses counter-dependent, which keeps them inside the K-loop (a single-LDS
+/// variant would let LICM hoist the gather out and read tile 0 every iteration).
+/// The per-iteration barrier has no in-iteration value consumer; it is kept live
+/// by wrapping the loop-closing MFMA store ([`Kernel::endrange_barrier_to`]) so it
+/// becomes the closing `END`'s computation — emitted after the MFMAs, which read
+/// the raw gathers and so do not wait on it. Cross-iteration RAW (commit `i`
+/// visible to gather `i+1`) and WAR (gather `i` done before commit `i+1`
+/// overwrites the half) ordering comes from that barrier plus rolled-loop program
+/// order. `iglp_opt(0)` at the K-loop top hands the AMDGPU machine scheduler the
+/// GEMM (MFMA/memory interleave) pipeline.
+///
+/// Launch with [`M1_CFG`] grid/threads and `finish(n_accum)`.
+pub fn build_matmul_db(ker: &Kernel, n: usize) {
+    let cfg = M1_CFG;
+    assert_eq!(n % cfg.block, 0, "matmul N={n} must be a multiple of the {} block", cfg.block);
+    assert_eq!(n % K_STEP_DB, 0, "matmul N={n} must be a multiple of K_STEP_DB={K_STEP_DB}");
+    let reg = cfg.reg();
+    let g = ker.group_2d(cfg.wave_rows, cfg.wave_cols);
+
+    let c_gl = ker.gl(&[1, 1, n, n], DType::Float32);
+    let a_gl = ker.gl(&[1, 1, n, n], DType::BFloat16);
+    let b_gl = ker.gl(&[1, 1, n, n], DType::BFloat16);
+    let (row, col) = block_coords(ker, n, &cfg);
+    let warp_row = g.warp_row();
+    let warp_col = g.warp_col();
+
+    let accs: Vec<RT> =
+        (0..cfg.n_accum).map(|_| g.zero(ker.rt((reg, reg), DType::Float32, TileLayout::Col, RT_16X16))).collect();
+
+    // 2×-size XOR-swizzled LDS strips; the loop selects a half by `parity*half`.
+    let a_smem = ker.st_db((cfg.block, K_STEP_DB), DType::BFloat16, TileLayout::Row, ST_16X16_SWIZZLED);
+    let b_smem = ker.st_db((K_STEP_DB, cfg.block), DType::BFloat16, TileLayout::Row, ST_16X16_SWIZZLED);
+    let half_a = a_smem.half_elems() as i64;
+    let half_b = b_smem.half_elems() as i64;
+    let num_tiles = n / K_STEP_DB;
+
+    // ── Prologue: stage global tile 0 → VGPR, commit → buf[0], barrier ────────
+    let p_a_idx = [Idx::Const(0), Idx::Const(0), Idx::from(&row), Idx::Const(0)];
+    let p_b_idx = [Idx::Const(0), Idx::Const(0), Idx::Const(0), Idx::from(&col)];
+    let s0_a = g.stage_global_to_reg(&a_smem, &a_gl, &p_a_idx, 2);
+    let s0_b = g.stage_global_to_reg(&b_smem, &b_gl, &p_b_idx, 2);
+    let a_smem = g.commit_reg_to_local(a_smem, &s0_a, true); // buf[0], with barrier
+    let b_smem = g.commit_reg_to_local(b_smem, &s0_b, true);
+
+    // ── Rolled, software-pipelined K-loop over the double buffer ──────────────
+    let tile = ker.range(num_tiles as i64);
+    let tp1 = tile.add(&cidx(1));
+    // Clamp the prefetch tile to the last valid one (the final iteration's
+    // prefetch is never consumed; clamping keeps the GLOBAL read in bounds).
+    let pf = UOp::try_where(
+        tp1.try_cmplt(&cidx(num_tiles as i64)).expect("tile+1 < num_tiles"),
+        tp1.clone(),
+        cidx(num_tiles as i64 - 1),
+    )
+    .expect("clamp prefetch tile");
+    let par_cur = tile.try_mod(&cidx(2)).expect("tile % 2");
+    let par_nxt = tp1.try_mod(&cidx(2)).expect("(tile+1) % 2");
+
+    let a_cur = a_smem.with_base_offset(par_cur.mul(&cidx(half_a)));
+    let b_cur = b_smem.with_base_offset(par_cur.mul(&cidx(half_b)));
+    let a_nxt = a_smem.with_base_offset(par_nxt.mul(&cidx(half_a)));
+    let b_nxt = b_smem.with_base_offset(par_nxt.mul(&cidx(half_b)));
+
+    // `iglp_opt(0)` at the K-loop top, threaded through the GLOBAL buffers the
+    // in-loop stage reads so it precedes the first prefetch load and stays
+    // loop-scoped (dep = the counter `tile`). The prologue keeps the un-rewrapped
+    // `a_gl`/`b_gl`.
+    let iglp = crate::asm::iglp_opt(0, tile.clone());
+    let a_gl_l = a_gl.rewrap(a_gl.uop().after(smallvec![iglp.clone()]));
+    let b_gl_l = b_gl.rewrap(b_gl.uop().after(smallvec![iglp]));
+
+    // Stage the next tile's GLOBAL→VGPR load (overlaps this tile's MFMAs).
+    let pf_a_idx = [Idx::Const(0), Idx::Const(0), Idx::from(&row), Idx::from(&pf)];
+    let pf_b_idx = [Idx::Const(0), Idx::Const(0), Idx::from(&pf), Idx::from(&col)];
+    let s_a = g.stage_global_to_reg(&a_smem, &a_gl_l, &pf_a_idx, 2);
+    let s_b = g.stage_global_to_reg(&b_smem, &b_gl_l, &pf_b_idx, 2);
+
+    // Gather the current buffer half → WMMA fragments. The counter-dependent
+    // address keeps these loop-scoped; they read the tile committed last
+    // iteration (or the prologue for tile 0), made visible by the prior barrier.
+    let bb = g
+        .load(
+            ker.rt((K_STEP_DB, reg), DType::BFloat16, TileLayout::Col, RT_16X16).into(),
+            b_cur.into(),
+            &[],
+            &[Idx::Const(0), Idx::from(&warp_col)],
+            0,
+        )
+        .rt();
+    let a_subs: Vec<RT> = (0..cfg.n_accum)
+        .map(|a| {
+            g.load(
+                ker.rt((reg, K_STEP_DB), DType::BFloat16, TileLayout::Row, RT_16X16).into(),
+                a_cur.clone().into(),
+                &[],
+                &[Idx::Uop(acc_row(&warp_row, a, &cfg))],
+                0,
+            )
+            .rt()
+        })
+        .collect();
+
+    // Commit the staged registers into the *other* half (no per-commit barrier —
+    // the single loop-tail barrier below covers both the RAW and the WAR edge).
+    let commit_a = g.commit_reg_to_local(a_nxt, &s_a, false);
+    let commit_b = g.commit_reg_to_local(b_nxt, &s_b, false);
+
+    // MFMA-accumulate on the gathers — the MFMA does not depend on the tail
+    // barrier, so it stays independent of the prefetch's commit/global-load and the
+    // two can overlap. Chain accumulator `a`'s A-input through `a-1`'s MFMA so a
+    // single `END` scopes them all in the K-loop (as [`build_matmul_cfg`]).
+    let mut prev_out: Option<Arc<UOp>> = None;
+    for (a, a_sub) in a_subs.iter().enumerate() {
+        let a_sub = match &prev_out {
+            Some(p) => a_sub.after(smallvec![p.clone()]),
+            None => a_sub.clone(),
+        };
+        prev_out = Some(g.mma_ab(accs[a].clone(), &a_sub, &bb).uop().clone());
+    }
+
+    // Close the K-loop by wrapping the last accumulator's MFMA store in a workgroup
+    // barrier (the cross-iteration RAW/WAR fence): the barrier becomes the
+    // loop-closing `END`'s computation — kept live + tile-scoped with no value
+    // consumer, and (its passthrough being the MFMA store) emitted after the MFMAs.
+    // Its deps are the prefetch commits.
+    let bar_deps: smallvec::SmallVec<[Arc<UOp>; 4]> = smallvec![commit_a.uop().clone(), commit_b.uop().clone()];
+    let ended = ker.endrange_barrier_to(1, bar_deps);
+    let final_accs: Vec<RT> = accs.iter().map(|c| c.after(smallvec![ended.clone()])).collect();
+
+    // Epilogue: store each accumulator to global C at its reg-block.
+    let bps = cfg.blocks_per_side() as i64;
+    let nidx = col.mul(&cidx(bps)).add(&warp_col);
+    let mut c_t = c_gl;
+    for (a, c) in final_accs.into_iter().enumerate() {
+        let m = row.mul(&cidx(bps)).add(&acc_row(&warp_row, a, &cfg));
+        c_t =
+            g.store(c_t.into(), c.into(), &[Idx::Const(0), Idx::Const(0), Idx::Uop(m), Idx::from(&nidx)], &[], 2).gl();
+    }
 }

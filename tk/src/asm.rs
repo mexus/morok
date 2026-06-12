@@ -46,3 +46,21 @@ pub fn sched_barrier(mask: i64, dep: Arc<UOp>) -> Arc<UOp> {
         DType::Void,
     )
 }
+
+/// `@llvm.amdgcn.iglp.opt(mode)`: invoke the AMDGPU machine scheduler's canned
+/// "initiate-and-group-level-parallelism" pipeline over the loop region
+/// *following* this intrinsic. `mode = 0` is the MFMA/memory interleave (overlaps
+/// the next tile's global load under the current tile's MFMAs); `mode = 1/2` are
+/// attention variants. Place once at the K-loop top. It must NOT share a loop
+/// region with [`sched_barrier`] (the two scheduling mutators fight). `dep` orders
+/// it after the loop counter so it lands at the top of the loop body.
+pub fn iglp_opt(mode: i64, dep: Arc<UOp>) -> Arc<UOp> {
+    UOp::custom(
+        smallvec![dep],
+        format!(
+            "declare void @llvm.amdgcn.iglp.opt(i32)\n\
+             call void @llvm.amdgcn.iglp.opt(i32 {mode})"
+        ),
+        DType::Void,
+    )
+}

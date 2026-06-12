@@ -135,6 +135,12 @@ pub struct ST<'k> {
     pub base: STBaseShape,
     elem: DType,
     ker: &'k Kernel,
+    /// Optional additive flat-element offset into the backing buffer — the
+    /// software double-buffer parity select (`tile % 2 * half_elems`). `None`
+    /// for an ordinary single-buffered tile (the common case). When `Some`, every
+    /// LDS access adds it to the computed flat offset, selecting one half of a
+    /// `st_db` (2×-size) buffer at runtime.
+    base_offset: Option<Arc<UOp>>,
 }
 
 impl<'k> ST<'k> {
@@ -149,7 +155,26 @@ impl<'k> ST<'k> {
             base: self.base,
             elem: self.elem.clone(),
             ker: self.ker,
+            base_offset: self.base_offset.clone(),
         }
+    }
+
+    /// The per-half flat element count (the full single-half tile size); a
+    /// [`Kernel::st_db`] buffer holds two of these. Used to form parity offsets.
+    pub fn half_elems(&self) -> usize {
+        self.shape.iter().product()
+    }
+    /// This tile viewing one half of a double buffer: every LDS access adds
+    /// `off` (an `Index`-typed element offset, typically `parity * half_elems()`)
+    /// to its flat address. Clones the wrapper (shares the backing buffer).
+    pub fn with_base_offset(&self, off: Arc<UOp>) -> ST<'k> {
+        let mut t = self.rewrap(self.buf.clone());
+        t.base_offset = Some(off);
+        t
+    }
+    /// The parity base offset, if this is a double-buffer half view.
+    pub fn base_offset(&self) -> Option<&Arc<UOp>> {
+        self.base_offset.as_ref()
     }
 }
 
@@ -285,7 +310,26 @@ impl Kernel {
         let shape = vec![height, width, base.base.rows, base.base.cols];
         let flat = shape.iter().product();
         let buf = self.alloc_local(flat, dtype.clone());
-        ST { buf, shape, rows, cols, layout, base, elem: dtype, ker: self }
+        ST { buf, shape, rows, cols, layout, base, elem: dtype, ker: self, base_offset: None }
+    }
+
+    /// Allocate a **double-buffered** shared-memory [`ST`] tile: identical logical
+    /// shape and addressing to [`Kernel::st`], but the backing LDS buffer is
+    /// **2× the flat size** so the two halves can hold consecutive K-tiles for a
+    /// software-pipelined K-loop. The returned tile has `base_offset = None`
+    /// (it addresses half 0); the caller forms the two half-views with
+    /// [`ST::with_base_offset`]`(parity * `[`ST::half_elems`]`())`.
+    pub fn st_db(&self, dims: (usize, usize), dtype: DType, layout: TileLayout, base: STBaseShape) -> ST<'_> {
+        let (rows, cols) = dims;
+        assert_eq!(rows % base.base.rows, 0, "ST rows {rows} not a multiple of base {}", base.base.rows);
+        assert_eq!(cols % base.base.cols, 0, "ST cols {cols} not a multiple of base {}", base.base.cols);
+        assert_eq!(cols % base.base.elements_per_thread(), 0, "ST cols {cols} not a multiple of elements_per_thread");
+        let height = rows / base.base.rows;
+        let width = cols / base.base.cols;
+        let shape = vec![height, width, base.base.rows, base.base.cols];
+        let half: usize = shape.iter().product();
+        let buf = self.alloc_local(2 * half, dtype.clone());
+        ST { buf, shape, rows, cols, layout, base, elem: dtype, ker: self, base_offset: None }
     }
 
     /// Allocate a register [`RT`] tile (tinygrad `ker.rt`). `dims` is the

@@ -126,10 +126,14 @@ impl RenderContext {
 
     /// Get existing name (panics if not found).
     pub fn get(&self, uop: &Arc<UOp>) -> &str {
-        self.names
-            .get(&uop.id)
-            .map(|s| s.as_str())
-            .unwrap_or_else(|| panic!("UOp {} ({:?}) not in context", uop.id, uop.op()))
+        self.names.get(&uop.id).map(|s| s.as_str()).unwrap_or_else(|| {
+            // NB: print only the op *kind* (`as_ref`), never `{:?}` the op — a
+            // valueless node (e.g. a BARRIER consumed as a value) is typically deep
+            // in a heavily-shared graph, and `Op`'s recursive `Debug` expands that
+            // DAG into an exponential (multi-GB) tree, OOM-ing before the panic can
+            // even print. The kind + ids are enough to locate the offending edge.
+            panic!("UOp {} (op {}) not in render context", uop.id, uop.op().as_ref())
+        })
     }
 
     /// Try to get existing name.

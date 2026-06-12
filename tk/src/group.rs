@@ -554,9 +554,10 @@ impl<'k> Group<'k> {
 
     /// Commit a staged register buffer (from [`Self::stage_global_to_reg`]) into
     /// the swizzled LDS tile — the VGPR→LDS `ds_write` half of the prefetch.
-    /// Recomputes the identical per-lane addressing and ends in a workgroup
-    /// barrier so the subsequent LDS→REG gather observes the committed fill.
-    pub fn commit_reg_to_local(&self, st: ST<'k>, stage: &Arc<UOp>) -> ST<'k> {
+    /// Recomputes the identical per-lane addressing. Ends in a workgroup barrier
+    /// when `barrier` (the single-buffer commit); the double-buffered pipeline
+    /// passes `false` and shares one barrier per iteration.
+    pub fn commit_reg_to_local(&self, st: ST<'k>, stage: &Arc<UOp>, barrier: bool) -> ST<'k> {
         // The LDS destination geometry is fully determined by the tile shape (the
         // global tile position only mattered when *staging* into the registers).
         let geom = self.lds_fill_geom(&st);
@@ -567,11 +568,10 @@ impl<'k> Group<'k> {
 
         let stage_shape = [geom.total_calls as usize, geom.ept as usize];
         let load = load_at(stage, &stage_shape, &[Idx::from(&outer), Idx::from(&inner)]);
-        let stored =
-            flat_index(st.uop(), st.shape(), &[Idx::Uop(height), Idx::Uop(width), Idx::Uop(srow), Idx::Uop(scol)])
-                .store(load)
-                .end(smallvec![outer, inner])
-                .barrier(SmallVec::new());
+        let stored = st_index(&st, &[Idx::Uop(height), Idx::Uop(width), Idx::Uop(srow), Idx::Uop(scol)])
+            .store(load)
+            .end(smallvec![outer, inner]);
+        let stored = if barrier { stored.barrier(SmallVec::new()) } else { stored };
         self.finalize_st(st, stored)
     }
 
@@ -710,8 +710,7 @@ impl<'k> Group<'k> {
         if src.elem() != st.elem() {
             load = load.cast(st.elem().clone());
         }
-        let dst_idx =
-            flat_index(st.uop(), st.shape(), &[Idx::Uop(height), Idx::Uop(width), Idx::Uop(srow), Idx::Uop(scol)]);
+        let dst_idx = st_index(&st, &[Idx::Uop(height), Idx::Uop(width), Idx::Uop(srow), Idx::Uop(scol)]);
         let stored = dst_idx.store(load).end(smallvec![outer, inner]);
         let ended = if barrier { stored.barrier(SmallVec::new()) } else { stored };
         self.finalize_st(st, ended)
@@ -802,7 +801,7 @@ impl<'k> Group<'k> {
                 let (srow, scol) = st.base.swizzle.swizzle_rc(row.clone(), col, st.base.base.cols, st.elem().base());
                 let val = loaded.gep(((j * sw) as usize..(j * sw + sw) as usize).collect());
                 let didx = [Idx::Uop(height.clone()), Idx::Uop(width.clone()), Idx::Uop(srow), Idx::Uop(scol)];
-                flat_index(st.uop(), st.shape(), &didx).store(val)
+                st_index(&st, &didx).store(val)
             })
             .collect();
         let grouped = if stores.len() == 1 { stores.into_iter().next().unwrap() } else { UOp::group(stores) };
@@ -838,7 +837,7 @@ impl<'k> Group<'k> {
         let h_idx = wave_offset(idxs.first(), rt_h, &height);
         let w_idx = wave_offset(idxs.get(1), rt_w, &width);
         let src_idx = [h_idx, w_idx, Idx::Uop(srow), Idx::Uop(scol)];
-        let mut load = load_at(st.uop(), st.shape(), &src_idx);
+        let mut load = st_load(st, &src_idx);
         if st.elem() != rt.elem() {
             load = load.cast(rt.elem().clone());
         }
@@ -926,7 +925,7 @@ impl<'k> Group<'k> {
         let h_idx = wave_offset(idxs.first(), rt_h, &height);
         let w_idx = wave_offset(idxs.get(1), rt_w, &width);
         let didx = [h_idx, w_idx, Idx::Uop(srow), Idx::Uop(scol)];
-        let ended = flat_index(st.uop(), st.shape(), &didx).store(load).end(smallvec![height, width, inner]);
+        let ended = st_index(&st, &didx).store(load).end(smallvec![height, width, inner]);
         self.finalize_st(st, ended)
     }
 
@@ -1002,6 +1001,22 @@ impl<'k> Group<'k> {
         let after = t.uop().after(smallvec![ended]);
         t.rewrap(after)
     }
+}
+
+/// ST flat INDEX honoring the optional double-buffer parity [`ST::base_offset`].
+/// Identical to [`crate::index::flat_index`] for an ordinary (`base_offset:None`)
+/// tile; adds the parity offset for a [`Kernel::st_db`] half-view.
+fn st_index(st: &ST, idxs: &[Idx]) -> Arc<UOp> {
+    let mut off = flat_offset(st.shape(), idxs);
+    if let Some(bo) = st.base_offset() {
+        off = off.try_add(bo).expect("st_index: parity base offset add");
+    }
+    index_off(st.uop(), off)
+}
+/// ST flat LOAD honoring [`ST::base_offset`] — the [`crate::index::load_at`] analog.
+fn st_load(st: &ST, idxs: &[Idx]) -> Arc<UOp> {
+    let idx = st_index(st, idxs);
+    UOp::load().buffer(st.uop().clone()).index(idx).call()
 }
 
 fn tag(t: &Tile<'_>) -> &'static str {
