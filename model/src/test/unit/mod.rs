@@ -2,6 +2,7 @@ mod audio;
 mod batch;
 mod config;
 mod diarizen;
+mod firered_vad;
 mod jit;
 mod jit_recurrent;
 mod mel;
