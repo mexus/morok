@@ -3714,6 +3714,7 @@ dependencies = [
 name = "svod-tk"
 version = "0.1.0-alpha.3"
 dependencies = [
+ "criterion",
  "proptest",
  "smallvec",
  "snafu 0.8.9",

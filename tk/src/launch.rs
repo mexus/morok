@@ -95,6 +95,19 @@ pub enum Error {
         #[snafu(source(from(svod_device::Error, Box::new)))]
         source: Box<svod_device::Error>,
     },
+
+    /// Wrapping the kernel SINK as a graph `custom_kernel` (`Op::Call`) node failed.
+    #[snafu(display("graph custom_kernel {name:?}: {source}"))]
+    CustomKernel {
+        name: String,
+        #[snafu(source(from(svod_tensor::error::Error, Box::new)))]
+        source: Box<svod_tensor::error::Error>,
+    },
+
+    /// The resolved device cannot run svod-tk tile kernels — wrong GPU arch (they
+    /// are gfx942/CDNA3-only) or the AMD LLVM/clang toolchain is unavailable.
+    #[snafu(display("unsupported target for svod-tk kernel: {reason}"))]
+    UnsupportedTarget { reason: String },
 }
 
 /// Compile `sink` for `device` and dispatch it against `buffers`, populating the
@@ -280,6 +293,41 @@ where
     // SAFETY: `compile_kernel` realized + allocated every bound buffer, which the
     // `CompiledLaunch` keeps alive; the synchronous dispatch holds them.
     unsafe { compiled.dispatch(true) }
+}
+
+/// Wrap a hand-built kernel SINK as a **graph node** — the `custom_kernel`
+/// (`Op::Call`) analog of [`run_kernel`]. Unlike the direct path, this does NOT
+/// dispatch: it returns a lazy output [`Tensor`] that the tensor scheduler
+/// realizes (and the JIT graph captures) like any other op, so the kernel
+/// composes into a model and benchmarks through the normal `prepare()` →
+/// `execute_profiled` path.
+///
+/// `out` is the output template (`Tensor::empty(shape, dtype)`); `ins` are the
+/// inputs. The placeholder/buffer order `custom_kernel` hands the closure is
+/// `[out, ins...]`, matching the kernel's `gl()` declaration order (outputs
+/// first), so `build` sees the same PARAM slots as the direct path. Launch
+/// geometry rides on the `Op::Special` ops [`Kernel::new`](crate::Kernel::new)
+/// mints from `grid`/`block` (no launch dims are passed through `CallInfo`); the
+/// `finish()`-stamped `opts_to_apply = Some(vec![])` keeps the optimizer off the
+/// hand-lowered body.
+pub fn graph_launch<F>(
+    name: impl Into<String>,
+    grid: [i64; 3],
+    block: i64,
+    out: Tensor,
+    ins: &[&Tensor],
+    build: F,
+) -> Result<Tensor>
+where
+    F: FnOnce(&crate::Kernel) -> Arc<UOp>,
+{
+    // The grid/block → `Op::Special` launch dims + the PARAM globals are minted by
+    // the tk `Kernel`; the generic graph-node wrapping (custom_kernel → Op::Call,
+    // `[out, ins...]` placeholder order) lives in `Tensor::graph_kernel`.
+    let name = name.into();
+    let kname = name.clone();
+    Tensor::graph_kernel(&name, out, ins, move |ph| build(&crate::Kernel::new(kname, grid, block, ph)))
+        .context(CustomKernelSnafu { name })
 }
 
 /// Realize `ins`, allocate/realize `outs`, build a hand-written kernel against

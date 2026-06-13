@@ -43,6 +43,44 @@ fn iconst(v: i64) -> Arc<UOp> {
     UOp::const_(DType::Index, ConstValue::Int(v))
 }
 
+/// The GPU arch(es) the flash-attention kernels are built for. They use the gfx942
+/// WMMA descriptor (`mfma.f32.16x16x16bf16.1k`) + 64-lane `ds.bpermute`, so only
+/// gfx942 today. Adding another GPU (e.g. gfx1151) means adding its arch here once
+/// its arch-specific kernel bits exist — the launchers gate against this list, the
+/// generic launch infra stays arch-agnostic.
+pub const FA_SUPPORTED_ARCHS: &[svod_dtype::AmdArch] = &[svod_dtype::AmdArch::Gfx942];
+
+/// Validate the kernel inputs' device against [`FA_SUPPORTED_ARCHS`] + LLVM toolchain.
+fn fa_check_target(t: &Tensor) -> crate::LaunchResult<()> {
+    crate::target::check_target(&t.device(), FA_SUPPORTED_ARCHS)
+}
+
+/// Tuning knobs for the multi-wave flash-attention builders ([`build_fa_mw_db`],
+/// [`build_fa_mw_rdb`]) — the structured replacement for their former positional
+/// `bool`/tile args (mirrors [`crate::kernels::matmul::MatmulCfg`]). [`Default`] is
+/// the production baseline: `{16,16}` per-warp tile, rolled (looped) compute.
+///
+/// `unroll` is read only by [`build_fa_mw_rdb`]; `pipelined` only by
+/// [`build_fa_mw_db`] — the shape (`b,n,h,h_kv,d`) stays a positional arg since it's
+/// derived from the input tensors, not a tuning choice.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FaConfig {
+    /// Per-warp Q-tile height (a multiple of the WMMA edge `16`).
+    pub q_blk: usize,
+    /// Per-warp KV super-block height (a multiple of `16`).
+    pub kv_blk: usize,
+    /// [`build_fa_mw_rdb`] only: emit the fully-unrolled (flat) QKᵀ/softmax/A·V body.
+    pub unroll: bool,
+    /// [`build_fa_mw_db`] only: barrier-reduced pipelined fills (stage 2) vs naive (stage 1).
+    pub pipelined: bool,
+}
+
+impl Default for FaConfig {
+    fn default() -> Self {
+        Self { q_blk: Q_BLK, kv_blk: KV_BLK, unroll: false, pipelined: false }
+    }
+}
+
 /// Build the flash-attention forward SINK for `[B, N, H, D]` Q/O and
 /// `[B, N, H_KV, D]` K/V (`H` a multiple of `H_KV` for GQA). `D` and the
 /// sequence length `N` must be multiples of [`BLK`].
@@ -603,17 +641,8 @@ fn fa_softmax_pv<'k>(
 /// compute / multi-pass KV fill shifts the hazard window so the drop races — see
 /// the inline note).
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn build_fa_mw_db(
-    ker: &Kernel,
-    b: usize,
-    n: usize,
-    h: usize,
-    h_kv: usize,
-    d: usize,
-    pipelined: bool,
-    q_blk_rows: usize,
-    kv_blk_rows: usize,
-) {
+pub(crate) fn build_fa_mw_db(ker: &Kernel, b: usize, n: usize, h: usize, h_kv: usize, d: usize, cfg: FaConfig) {
+    let FaConfig { q_blk: q_blk_rows, kv_blk: kv_blk_rows, pipelined, .. } = cfg;
     assert_eq!(d % BLK, 0, "D must be a multiple of {BLK}");
     assert_eq!(q_blk_rows % BLK, 0, "Q_BLK must be a multiple of the WMMA edge {BLK}");
     assert_eq!(kv_blk_rows % BLK, 0, "KV_BLK must be a multiple of the WMMA edge {BLK}");
@@ -791,17 +820,8 @@ pub(crate) fn build_fa_mw_db(
 /// prefetch commits folded into its deps) provides the cross-iteration RAW/WAR
 /// ordering, closed with plain [`Kernel::endrange`].
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn build_fa_mw_rdb(
-    ker: &Kernel,
-    b: usize,
-    n: usize,
-    h: usize,
-    h_kv: usize,
-    d: usize,
-    q_blk_rows: usize,
-    kv_blk_rows: usize,
-    unroll: bool,
-) {
+pub(crate) fn build_fa_mw_rdb(ker: &Kernel, b: usize, n: usize, h: usize, h_kv: usize, d: usize, cfg: FaConfig) {
+    let FaConfig { q_blk: q_blk_rows, kv_blk: kv_blk_rows, unroll, .. } = cfg;
     // Flat compute (unrolled QKᵀ/softmax/A·V) is the prerequisite for the Stage-2
     // attention scheduling comb; the rolled (`unroll = false`) form is the iglp
     // baseline. Same numerics either way (the unroll only changes the loop
@@ -969,6 +989,7 @@ pub(crate) fn build_fa_mw_rdb(
 /// multiple of `H_KV` (grouped-query attention) and `N`/`D` multiples of 16.
 /// Causal forward attention; writes `o` in place.
 pub fn flash_attention_forward(o: &mut Tensor, q: &Tensor, k: &Tensor, v: &Tensor) -> crate::LaunchResult<()> {
+    fa_check_target(q)?;
     let qs = q.shape().expect("q shape");
     let ks = k.shape().expect("k shape");
     let dim = |s: &svod_ir::shape::Shape, i: usize| s[i].as_const().expect("concrete dim");
@@ -988,6 +1009,7 @@ pub fn flash_attention_forward(o: &mut Tensor, q: &Tensor, k: &Tensor, v: &Tenso
 /// to be a multiple of [`NUM_WARPS`] (the 512-thread block owns `NUM_WARPS`
 /// Q-tiles). Grid dim1 is `n / BLK / NUM_WARPS`, block `NUM_WARPS * 64`.
 pub fn flash_attention_forward_mw(o: &mut Tensor, q: &Tensor, k: &Tensor, v: &Tensor) -> crate::LaunchResult<()> {
+    fa_check_target(q)?;
     let qs = q.shape().expect("q shape");
     let ks = k.shape().expect("k shape");
     let dim = |s: &svod_ir::shape::Shape, i: usize| s[i].as_const().expect("concrete dim");
@@ -1012,6 +1034,7 @@ pub fn flash_attention_forward_mw_db(
     v: &Tensor,
     pipelined: bool,
 ) -> crate::LaunchResult<()> {
+    fa_check_target(q)?;
     let qs = q.shape().expect("q shape");
     let ks = k.shape().expect("k shape");
     let dim = |s: &svod_ir::shape::Shape, i: usize| s[i].as_const().expect("concrete dim");
@@ -1020,7 +1043,15 @@ pub fn flash_attention_forward_mw_db(
     let grid = [h as i64, (n / Q_BLK / NUM_WARPS) as i64, b as i64];
 
     crate::run_kernel("fa_mw_db", grid, (NUM_WARPS * 64) as i64, &mut [o], &[q, k, v], |ker| {
-        build_fa_mw_db(ker, b, n, h, h_kv, d, pipelined, Q_BLK, KV_BLK);
+        build_fa_mw_db(
+            ker,
+            b,
+            n,
+            h,
+            h_kv,
+            d,
+            FaConfig { q_blk: Q_BLK, kv_blk: KV_BLK, pipelined, ..Default::default() },
+        );
         ker.finish(1)
     })
 }
@@ -1044,6 +1075,7 @@ fn adaptive_fa_tile(b: usize, n: usize, h: usize) -> (usize, usize) {
 /// ([`build_fa_mw_rdb`]). One rolled KV loop over a parity-indexed 2× LDS double
 /// buffer (one [`FaScratch`]); the per-warp tile is [`adaptive_fa_tile`].
 pub fn flash_attention_forward_mw_rdb(o: &mut Tensor, q: &Tensor, k: &Tensor, v: &Tensor) -> crate::LaunchResult<()> {
+    fa_check_target(q)?;
     let qs = q.shape().expect("q shape");
     let ks = k.shape().expect("k shape");
     let dim = |s: &svod_ir::shape::Shape, i: usize| s[i].as_const().expect("concrete dim");
@@ -1053,7 +1085,30 @@ pub fn flash_attention_forward_mw_rdb(o: &mut Tensor, q: &Tensor, k: &Tensor, v:
     let grid = [h as i64, (n / q_blk / NUM_WARPS) as i64, b as i64];
 
     crate::run_kernel("fa_mw_rdb", grid, (NUM_WARPS * 64) as i64, &mut [o], &[q, k, v], |ker| {
-        build_fa_mw_rdb(ker, b, n, h, h_kv, d, q_blk, kv_blk, false);
+        build_fa_mw_rdb(ker, b, n, h, h_kv, d, FaConfig { q_blk, kv_blk, ..Default::default() });
+        ker.finish(1)
+    })
+}
+
+/// **Graph-native** causal flash-attention forward: returns a lazy output
+/// [`Tensor`] (a `custom_kernel` / `Op::Call` graph node) instead of writing in
+/// place, so it composes into a model's UOp graph and benchmarks through the
+/// normal `prepare()` → `execute_profiled` path like any other op. Same kernel as
+/// [`flash_attention_forward_mw_rdb`] (rolled double-buffer, [`adaptive_fa_tile`]),
+/// just launched via [`crate::graph_launch`] rather than direct dispatch.
+pub fn flash_attention(q: &Tensor, k: &Tensor, v: &Tensor) -> crate::LaunchResult<Tensor> {
+    fa_check_target(q)?;
+    let qs = q.shape().expect("q shape");
+    let ks = k.shape().expect("k shape");
+    let dim = |s: &svod_ir::shape::Shape, i: usize| s[i].as_const().expect("concrete dim");
+    let (b, n, h, d) = (dim(&qs, 0), dim(&qs, 1), dim(&qs, 2), dim(&qs, 3));
+    let h_kv = dim(&ks, 2);
+    let (q_blk, kv_blk) = adaptive_fa_tile(b, n, h);
+    let grid = [h as i64, (n / q_blk / NUM_WARPS) as i64, b as i64];
+    let out = Tensor::empty(&[b, n, h, d], DType::BFloat16);
+
+    crate::graph_launch("fa_mw_rdb", grid, (NUM_WARPS * 64) as i64, out, &[q, k, v], |ker| {
+        build_fa_mw_rdb(ker, b, n, h, h_kv, d, FaConfig { q_blk, kv_blk, ..Default::default() });
         ker.finish(1)
     })
 }

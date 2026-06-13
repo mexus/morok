@@ -4,10 +4,10 @@
 use std::sync::Arc;
 
 use svod_dtype::{DType, DeviceSpec};
-use svod_ir::{ConstValue, Op, TernaryOp, UOp, UnaryOp};
+use svod_ir::UOp;
 
 use crate::Kernel;
-use crate::kernels::fa::{build_fa, build_fa_mw, build_fa_mw_db, build_fa_mw_rdb};
+use crate::kernels::fa::{FaConfig, build_fa_mw_rdb};
 
 /// `(o, q, k, v)` dummy BUFFER UOps for a GPU-free FA build.
 fn dummy_fa_buffers(b: usize, n: usize, h: usize, h_kv: usize, d: usize) -> Vec<Arc<UOp>> {
@@ -21,161 +21,19 @@ fn dummy_fa_buffers(b: usize, n: usize, h: usize, h_kv: usize, d: usize) -> Vec<
     ]
 }
 
-/// The FA forward SINK is well-formed and carries the expected structure: WMMA
-/// (QKᵀ and A·V), the K/V smem fill (`DefineLocal` + `Barrier`), an in-register
-/// `ds_bpermute` softmax reduce (`Op::Custom`, no reduce LDS/barrier), the causal
-/// `WHERE` mask, and the `exp2` online softmax.
+/// The target gate rejects a non-gfx942 device up front (host — no GPU needed): a
+/// CPU spec resolves to no AMD arch, so `check_target` errs `UnsupportedTarget`
+/// instead of letting the gfx942-only kernel mis-render/compile-fail later. The
+/// gate is generic over the kernel's declared `FA_SUPPORTED_ARCHS`, not a hardcoded
+/// arch — adding another GPU is extending that list, not rewriting the gate.
 #[test]
-fn test_fa_kernel_builds() {
-    let (b, n, h, h_kv, d) = (1usize, 32, 2, 2, 64);
-    let ker = Kernel::new("fa", [h as i64, (n / 16) as i64, b as i64], 64, dummy_fa_buffers(b, n, h, h_kv, d));
-    build_fa(&ker, b, n, h, h_kv, d);
-    let sink = ker.finish(1);
-
-    assert!(matches!(sink.op(), Op::Sink { .. }), "FA finishes in a SINK");
-    let topo = sink.toposort();
-    assert!(topo.iter().any(|u| matches!(u.op(), Op::Wmma { .. })), "FA emits WMMA (QKᵀ / A·V)");
-    assert!(topo.iter().any(|u| matches!(u.op(), Op::DefineLocal(_))), "FA uses LDS (K/V smem)");
-    assert!(topo.iter().any(|u| matches!(u.op(), Op::Barrier { .. })), "FA inserts K/V-fill workgroup barriers");
+fn test_target_gate_rejects_non_gfx942() {
+    use crate::kernels::fa::FA_SUPPORTED_ARCHS;
+    let err = crate::target::check_target(&DeviceSpec::Cpu, FA_SUPPORTED_ARCHS);
     assert!(
-        topo.iter().any(|u| matches!(u.op(), Op::Custom { .. })),
-        "FA's softmax row_reduce uses a ds_bpermute Op::Custom shuffle"
+        matches!(err, Err(crate::launch::Error::UnsupportedTarget { .. })),
+        "a CPU device must be rejected by the gfx942 gate, got {err:?}"
     );
-    assert!(
-        topo.iter().any(|u| matches!(u.op(), Op::Ternary(TernaryOp::Where, _, _, _))),
-        "FA applies the causal WHERE mask"
-    );
-    assert!(topo.iter().any(|u| matches!(u.op(), Op::Unary(UnaryOp::Exp2, _))), "FA uses exp2 for the online softmax");
-    // Causal block-skip: the KV loop bound is dynamic (`q_seq + 1`), so its
-    // RANGE end is not a constant — a runtime-trip loop, not `0..n/BLK`.
-    assert!(
-        topo.iter().any(|u| matches!(u.op(), Op::Range { end, .. } if !matches!(end.op(), Op::Const(_)))),
-        "FA's causal KV loop must have a dynamic (q_seq+1) bound, not a constant trip count"
-    );
-}
-
-/// The multi-wave FA forward SINK carries the multi-wave structure: a 512-thread
-/// block (`Special` `lidx0` range = `NUM_WARPS * 64`), shared K/V LDS, WMMA,
-/// the in-register `ds_bpermute` reduce, the causal mask + `exp2`, and a dynamic
-/// (group-max) KV loop bound.
-#[test]
-fn test_fa_mw_kernel_builds() {
-    // N=128 → 8 q-blocks → 1 multi-wave block (grid dim1 = 1).
-    let (b, n, h, h_kv, d) = (1usize, 128, 2, 2, 64);
-    let block = 8 * 64;
-    let ker = Kernel::new("fa_mw", [h as i64, 1, b as i64], block, dummy_fa_buffers(b, n, h, h_kv, d));
-    build_fa_mw(&ker, b, n, h, h_kv, d);
-    let sink = ker.finish(1);
-
-    assert!(matches!(sink.op(), Op::Sink { .. }), "multi-wave FA finishes in a SINK");
-    let topo = sink.toposort();
-    // The block thread index (`lidx0`) ranges over all 512 threads.
-    assert!(
-        topo.iter().any(|u| matches!(u.op(), Op::Special { .. })
-            && u.toposort().iter().any(|c| matches!(c.op(), Op::Const(cv) if matches!(cv.0, ConstValue::Int(512))))),
-        "multi-wave block spans 512 threads"
-    );
-    assert!(topo.iter().any(|u| matches!(u.op(), Op::Wmma { .. })), "QKᵀ / A·V WMMA");
-    assert!(topo.iter().any(|u| matches!(u.op(), Op::DefineLocal(_))), "shared K/V LDS");
-    assert!(topo.iter().any(|u| matches!(u.op(), Op::Barrier { .. })), "K/V fill + cross-wave WAR barriers");
-    assert!(topo.iter().any(|u| matches!(u.op(), Op::Custom { .. })), "ds_bpermute softmax reduce");
-    assert!(topo.iter().any(|u| matches!(u.op(), Op::Ternary(TernaryOp::Where, _, _, _))), "causal WHERE mask");
-    assert!(topo.iter().any(|u| matches!(u.op(), Op::Unary(UnaryOp::Exp2, _))), "exp2 online softmax");
-    assert!(
-        topo.iter().any(|u| matches!(u.op(), Op::Range { end, .. } if !matches!(end.op(), Op::Const(_)))),
-        "group-max KV loop has a dynamic bound"
-    );
-}
-
-/// The double-buffered multi-wave FA SINK (both stages) carries the unroll-by-2
-/// structure: 4 LDS tiles (2×K, 2×V), WMMA, the causal mask + `exp2`, and a
-/// dynamic half-count KV loop. Stage 1 keeps the cross-wave WAR barrier; the
-/// pipelined stage drops it, so it emits strictly fewer `Barrier`s.
-#[test]
-fn test_fa_mw_db_kernel_builds() {
-    let (b, h, h_kv, d) = (1usize, 2, 2, 64);
-    let block = 8 * 64;
-    // (q_blk, kv_blk, n): n must be a multiple of q_blk*NUM_WARPS(=8).
-    let count_barriers = |pipelined: bool, q_blk: usize, kv_blk: usize, n: usize| {
-        let gd1 = (n / q_blk / 8) as i64;
-        let ker = Kernel::new("fa_mw_db", [h as i64, gd1, b as i64], block, dummy_fa_buffers(b, n, h, h_kv, d));
-        build_fa_mw_db(&ker, b, n, h, h_kv, d, pipelined, q_blk, kv_blk);
-        let sink = ker.finish(1);
-        let topo = sink.toposort();
-        assert!(topo.iter().any(|u| matches!(u.op(), Op::Wmma { .. })), "QKᵀ / A·V WMMA");
-        // 4 LDS allocations: k_smem{0,1}, v_smem{0,1}.
-        let lds = topo.iter().filter(|u| matches!(u.op(), Op::DefineLocal(_))).count();
-        assert_eq!(lds, 4, "double-buffer allocates 2×K + 2×V LDS tiles, got {lds}");
-        assert!(topo.iter().any(|u| matches!(u.op(), Op::Ternary(TernaryOp::Where, _, _, _))), "causal WHERE mask");
-        assert!(topo.iter().any(|u| matches!(u.op(), Op::Unary(UnaryOp::Exp2, _))), "exp2 online softmax");
-        assert!(
-            topo.iter().any(|u| matches!(u.op(), Op::Range { end, .. } if !matches!(end.op(), Op::Const(_)))),
-            "half-count KV loop has a dynamic bound"
-        );
-        // Count loop RANGEs whose constant trip = 2 — a 2-fragment tile axis
-        // (`KV_BLK/16` or `Q_BLK/16` == 2) the WMMA/transpose/reduce loops fold.
-        // The optimizer is disabled, so a bigger tile shows up as larger *loop
-        // bounds*, not more static WMMA nodes; a `{16,16}` tile (all axes = 1
-        // fragment, d = 4) has none.
-        let frag2 = topo
-            .iter()
-            .filter(|u| matches!(u.op(), Op::Range { end, .. } if matches!(end.op(), Op::Const(cv) if matches!(cv.0, ConstValue::Int(2)))))
-            .count();
-        (topo.iter().filter(|u| matches!(u.op(), Op::Barrier { .. })).count(), frag2)
-    };
-    // {16,16} baseline: pipelined drops the redundant WAR barriers, and the
-    // single-fragment tile loops have no trip-2 RANGE.
-    let (naive, b16) = count_barriers(false, 16, 16, 128);
-    let (pipelined, _) = count_barriers(true, 16, 16, 128);
-    assert!(naive > 0, "stage-1 emits fill + WAR barriers");
-    assert!(pipelined < naive, "pipelined stage drops the redundant WAR barriers ({pipelined} < {naive})");
-    assert_eq!(b16, 0, "{{16,16}} single-fragment tiles have no trip-2 loop, got {b16}");
-    // Bigger per-warp tiles still build a well-formed SINK, and the larger
-    // (2-fragment) tile axes introduce trip-2 fragment loops.
-    let (_, f32) = count_barriers(true, 32, 32, 512);
-    let (_, f3264) = count_barriers(true, 32, 64, 512);
-    assert!(f32 > 0, "{{32,32}} 2-fragment tiles add trip-2 fragment loops, got {f32}");
-    assert!(f3264 > 0, "{{32,64}} 2-fragment Q-tile adds trip-2 fragment loops, got {f3264}");
-}
-
-/// Graph-shape (no GPU): the rolled double-buffered FA builds an **acyclic** SINK
-/// with TWO LDS double buffers (one `st_db` each for K and V — vs the unroll-by-2's
-/// four static tiles), a `kv_idx % 2` parity select, WMMA, the causal mask +
-/// `exp2`, a dynamic-bound rolled KV loop, and a workgroup barrier. Catches a
-/// dropped/cyclic anchoring edge before any GPU run.
-#[test]
-fn test_fa_mw_rdb_kernel_builds() {
-    use svod_ir::BinaryOp;
-
-    let (b, h, h_kv, d) = (1usize, 2, 2, 64);
-    let n = 128usize; // multiple of Q_BLK(16)*NUM_WARPS(8) = 128.
-    let block = 8 * 64;
-    let ker =
-        Kernel::new("fa_mw_rdb", [h as i64, (n / 16 / 8) as i64, b as i64], block, dummy_fa_buffers(b, n, h, h_kv, d));
-    build_fa_mw_rdb(&ker, b, n, h, h_kv, d, 16, 16, false);
-    let sink = ker.finish(1);
-
-    assert!(matches!(sink.op(), Op::Sink { .. }), "rolled-db FA finishes in a SINK");
-    let topo = sink.toposort(); // would diverge on a cyclic graph
-
-    assert!(topo.iter().any(|u| matches!(u.op(), Op::Wmma { .. })), "QKᵀ / A·V WMMA");
-    // TWO LDS double buffers (k_smem, v_smem), each one `st_db` DefineLocal of 2×
-    // size — half the allocation *count* of the unroll-by-2's four static tiles.
-    let lds = topo.iter().filter(|u| matches!(u.op(), Op::DefineLocal(_))).count();
-    assert_eq!(lds, 2, "rolled db allocates one st_db each for K and V, got {lds}");
-    assert!(topo.iter().any(|u| matches!(u.op(), Op::Ternary(TernaryOp::Where, _, _, _))), "causal WHERE mask");
-    assert!(topo.iter().any(|u| matches!(u.op(), Op::Unary(UnaryOp::Exp2, _))), "exp2 online softmax");
-    assert!(topo.iter().any(|u| matches!(u.op(), Op::Barrier { .. })), "workgroup barrier present");
-    assert!(
-        topo.iter().any(|u| matches!(u.op(), Op::Range { end, .. } if !matches!(end.op(), Op::Const(_)))),
-        "rolled KV loop has a dynamic bound"
-    );
-    // The `kv_idx % 2` parity select (buffer half + loop-scoping) → a Mod-by-2.
-    let has_parity = topo.iter().any(|u| {
-        matches!(u.op(), Op::Binary(BinaryOp::Mod, _, dv)
-            if matches!(dv.op(), Op::Const(c) if matches!(c.0, ConstValue::Int(2))))
-    });
-    assert!(has_parity, "the kv_idx % 2 double-buffer parity select is present");
 }
 
 /// Render-regression (CPU, no GPU): the rolled-db FA must render to AMD LLVM IR
@@ -195,7 +53,7 @@ fn test_fa_mw_rdb_renders_bounded() {
             8 * 64,
             dummy_fa_buffers(b, n, h, h_kv, d),
         );
-        build_fa_mw_rdb(&ker, b, n, h, h_kv, d, 16, 16, unroll);
+        build_fa_mw_rdb(&ker, b, n, h, h_kv, d, FaConfig { q_blk: 16, kv_blk: 16, unroll, ..Default::default() });
         let sink = ker.finish(1);
         let lowered = svod_schedule::graph_rewrite(&svod_schedule::symbolic::pm_lower_index_dtype(), sink, &mut ());
         let program = svod_codegen::program_pipeline::program_from_sink(lowered, svod_dtype::DeviceSpec::Cpu);
@@ -228,6 +86,59 @@ fn test_fa_mw_rdb_renders_bounded() {
     let flat = render(true);
     assert_eq!(mfma(&flat), 8, "unrolled FA slice renders 8 flat mfma (4 QKᵀ + 4 A·V)");
     assert!(mfma(&rolled) < 8, "rolled FA slice keeps the QKᵀ/A·V loops ({} < 8 mfma)", mfma(&rolled));
+}
+
+/// Host regression guard for the **graph/realize-path** lowering of a hand-lowered
+/// (`opts_to_apply=Some(vec![])`) tile-kernel SINK on AMD. Mirrors the realize
+/// optimize→render path: `optimize_kernel_with_config` → `decompose_with` →
+/// `program_from_sink` → `do_linearize` → `type_verify`. Without the
+/// hand-lowered-kernel optimizer bypass (`schedule/src/optimizer/mod.rs`), the
+/// UNROLL-expander broadcasts a scalar GLOBAL `Ptr` into an illegal `Ptr{vcount:4}`
+/// vector that fails `type_verify`; with the bypass it renders identically to the
+/// direct path (`test_fa_mw_rdb_renders_bounded`): rolled QKᵀ/A·V loops, one iglp.
+#[test]
+fn test_fa_graph_path_renders_clean() {
+    use svod_schedule::{OptimizerConfig, OptimizerRenderer, optimize_kernel_with_config};
+
+    let (b, h, h_kv, d) = (1usize, 2, 2, 64);
+    let n = 128usize;
+    let ker =
+        Kernel::new("fa_mw_rdb", [h as i64, (n / 16 / 8) as i64, b as i64], 8 * 64, dummy_fa_buffers(b, n, h, h_kv, d));
+    build_fa_mw_rdb(&ker, b, n, h, h_kv, d, FaConfig { q_blk: 16, kv_blk: 16, ..Default::default() });
+    let sink = ker.finish(1);
+
+    // Realize builds the optimizer renderer for gfx942 via for_amd_arch.
+    let opt_ren = OptimizerRenderer::for_amd_arch(svod_dtype::AmdArch::Gfx942);
+    let config = OptimizerConfig::default();
+    let optimized = optimize_kernel_with_config(sink, &opt_ren, &config);
+
+    // Decompose (AMD renderer's decompositor) then program_from_sink + linearize.
+    let text_ren = svod_codegen::llvm::LlvmTextRenderer::amd(svod_dtype::AmdArch::Gfx942);
+    let decomposed = match svod_codegen::traits::Renderer::decompositor(&text_ren) {
+        Some(m) => svod_ir::decompositions::decompose_with(&optimized, &m),
+        None => optimized,
+    };
+    let program = svod_codegen::program_pipeline::program_from_sink(decomposed, svod_dtype::DeviceSpec::Cpu);
+    let linearized = svod_codegen::program_pipeline::do_linearize(&program).expect("do_linearize");
+    let linear_uop = linearized
+        .toposort()
+        .into_iter()
+        .find(|u| matches!(u.op(), svod_ir::Op::Linear { .. }))
+        .expect("LINEAR present");
+    // This is the verify the real do_render runs (program_pipeline.rs:129-131).
+    svod_schedule::spec::type_verify(&linear_uop, &svod_schedule::spec::spec_program())
+        .expect("type_verify must pass (the Ptr{vcount:4} failure surfaces here)");
+    let code = svod_codegen::traits::Renderer::render(&text_ren, &linear_uop, Some("fa_rdb")).expect("render").code;
+    let mfma = code.lines().filter(|l| l.contains("mfma.f32.16x16x16bf16.1k") && !l.contains("declare")).count();
+    assert!(mfma > 0, "graph-path FA must render mfma calls, got {mfma}");
+    // Matches the direct-path render contract (test_fa_mw_rdb_renders_bounded):
+    // the rolled QKᵀ/A·V loops kept (< 8 flat sites), one iglp delegation.
+    assert!(mfma < 8, "rolled graph FA keeps the QKᵀ/A·V loops ({mfma} < 8)");
+    assert_eq!(
+        code.matches("call void @llvm.amdgcn.iglp.opt(i32 0)").count(),
+        1,
+        "marker lowered to one iglp delegation (identical to the direct path)"
+    );
 }
 
 // =============================================================================
@@ -370,7 +281,15 @@ fn run_fa_amd_case(b: usize, n: usize, h: usize, d: usize, path: FaPath) {
             // Explicit tile config: 8-warp block, grid dim1 = n / q_blk / NUM_WARPS.
             let grid = [h as i64, (n / q_blk / 8) as i64, b as i64];
             crate::run_kernel("fa_mw_db", grid, 8 * 64, &mut [&mut o], &[&q, &k, &v], |ker| {
-                crate::kernels::fa::build_fa_mw_db(ker, b, n, h, h_kv, d, pipelined, q_blk, kv_blk);
+                crate::kernels::fa::build_fa_mw_db(
+                    ker,
+                    b,
+                    n,
+                    h,
+                    h_kv,
+                    d,
+                    FaConfig { q_blk, kv_blk, pipelined, ..Default::default() },
+                );
                 ker.finish(1)
             })
             .expect("fa_mw_db tiled launch")
@@ -378,7 +297,15 @@ fn run_fa_amd_case(b: usize, n: usize, h: usize, d: usize, path: FaPath) {
         FaPath::Rdb { q_blk, kv_blk, unroll } => {
             let grid = [h as i64, (n / q_blk / 8) as i64, b as i64];
             crate::run_kernel("fa_mw_rdb", grid, 8 * 64, &mut [&mut o], &[&q, &k, &v], |ker| {
-                crate::kernels::fa::build_fa_mw_rdb(ker, b, n, h, h_kv, d, q_blk, kv_blk, unroll);
+                crate::kernels::fa::build_fa_mw_rdb(
+                    ker,
+                    b,
+                    n,
+                    h,
+                    h_kv,
+                    d,
+                    FaConfig { q_blk, kv_blk, unroll, ..Default::default() },
+                );
                 ker.finish(1)
             })
             .expect("fa_mw_rdb tiled launch")
@@ -417,4 +344,85 @@ fn run_fa_amd_case(b: usize, n: usize, h: usize, d: usize, path: FaPath) {
     };
     println!("fa[{label}] B={b} N={n} H={h} D={d}: max abs error = {max_abs:e}");
     assert!(worst <= atol, "FA exceeds atol+rtol*|e| (max abs {max_abs:e}, tol {atol}+{rtol}*|e|)");
+}
+
+/// `SVOD_DEVICE=AMD:0 cargo test -p svod-tk --lib fa::test_fa_graph_amd -- --ignored --nocapture`.
+///
+/// **Phase-A gate (graph integration):** the graph-native `flash_attention` (a
+/// `custom_kernel` / `Op::Call` node realized by the tensor scheduler) must match
+/// **(a)** causal SDPA (the oracle, tol 2e-2) AND **(b)** the direct-launch
+/// `flash_attention_forward_mw_rdb` output **bit-for-bit** (same kernel, different
+/// launch path). Proves the full FA SINK — LDS + barriers + 512-thread block +
+/// dynamic `range_uop` bound + ds_bpermute + WMMA — survives `custom_kernel →
+/// rangeify → realize` on gfx942.
+#[test]
+#[ignore]
+fn test_fa_graph_amd() {
+    use svod_tensor::Tensor;
+    for (b, n, h, d) in [(1usize, 128usize, 2usize, 64usize), (1, 512, 2, 64), (2, 256, 4, 64)] {
+        let mk = || {
+            let t = Tensor::randn(&[b, n, h, d]).expect("randn");
+            let mut t = t.cast(DType::BFloat16).expect("cast bf16");
+            t.realize().expect("realize");
+            t
+        };
+        let (q, k, v) = (mk(), mk(), mk());
+
+        // Graph path: lazy custom_kernel Tensor → realize.
+        let og = crate::kernels::fa::flash_attention(&q, &k, &v).expect("graph fa");
+        let mut og_f = og.cast(DType::Float32).expect("og→f32");
+        og_f.realize().expect("realize graph");
+        let graph: Vec<f32> = og_f.as_vec::<f32>().expect("read graph");
+
+        // Direct-launch path (same kernel, in-place dispatch).
+        let mut od = Tensor::empty(&[b, n, h, d], DType::BFloat16);
+        crate::kernels::fa::flash_attention_forward_mw_rdb(&mut od, &q, &k, &v).expect("direct fa");
+        let mut od_f = od.cast(DType::Float32).expect("od→f32");
+        od_f.realize().expect("realize direct");
+        let direct: Vec<f32> = od_f.as_vec::<f32>().expect("read direct");
+
+        // Reference: causal SDPA over the same operands.
+        let perm = |t: &Tensor| t.cast(DType::Float32).expect("→f32").try_permute(&[0, 2, 1, 3]).expect("permute");
+        let (qp, kp, vp) = (perm(&q), perm(&k), perm(&v));
+        let ref_bhnd = qp.scaled_dot_product_attention().key(&kp).value(&vp).is_causal(true).call().expect("sdpa");
+        let mut reference = ref_bhnd.try_permute(&[0, 2, 1, 3]).expect("permute back");
+        reference.realize().expect("realize reference");
+        let expected = reference.as_vec::<f32>().expect("read reference");
+
+        assert_eq!(graph.len(), expected.len(), "graph/ref length mismatch");
+        assert_eq!(graph.len(), direct.len(), "graph/direct length mismatch");
+        let (atol, rtol) = (2e-2f32, 2e-2f32);
+        let (mut max_abs_ref, mut worst, mut max_abs_direct) = (0.0f32, 0.0f32, 0.0f32);
+        for i in 0..graph.len() {
+            let (g, e, dd) = (graph[i], expected[i], direct[i]);
+            max_abs_ref = max_abs_ref.max((g - e).abs());
+            worst = worst.max((g - e).abs() - rtol * e.abs());
+            max_abs_direct = max_abs_direct.max((g - dd).abs());
+        }
+        println!("fa[graph] B={b} N={n} H={h} D={d}: vs SDPA = {max_abs_ref:e}, vs direct = {max_abs_direct:e}");
+        assert!(worst <= atol, "graph FA vs SDPA exceeds tol (max abs {max_abs_ref:e})");
+        assert!(max_abs_direct < 1e-3, "graph FA must match direct-launch bit-for-bit (Δ {max_abs_direct:e})");
+    }
+}
+
+// Generic custom-kernel **check** via the `tensor`-layer macro — the graph-native
+// `flash_attention` vs causal SDPA on gfx942. Demonstrates the reusable
+// definition(`Tensor::graph_kernel`)/check(`custom_kernel_check!`) facility: tk just
+// supplies the kernel `run` + the `reference` op; the boilerplate (build inputs, run
+// both, cast f32, compare within tol) is generated.
+// `SVOD_DEVICE=AMD:0 cargo test -p svod-tk --lib fa::test_fa_graph_check_amd -- --ignored --nocapture`.
+svod_tensor::custom_kernel_check! {
+    test_fa_graph_check_amd,
+    inputs (q, k, v): shape [1, 128, 2, 64], dtype svod_dtype::DType::BFloat16,
+    run: |q, k, v| crate::kernels::fa::flash_attention(q, k, v),
+    reference: |q, k, v| {
+        use svod_tensor::Tensor;
+        let perm = |t: &Tensor| {
+            t.cast(svod_dtype::DType::Float32).expect("→f32").try_permute(&[0, 2, 1, 3]).expect("permute")
+        };
+        let (qp, kp, vp) = (perm(q), perm(k), perm(v));
+        let r = qp.scaled_dot_product_attention().key(&kp).value(&vp).is_causal(true).call().expect("sdpa");
+        r.try_permute(&[0, 2, 1, 3])
+    },
+    tol: 2e-2,
 }

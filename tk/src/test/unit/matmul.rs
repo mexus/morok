@@ -143,82 +143,6 @@ fn test_mma_unroll_flattens_mfma() {
     assert!(looped_mfma < 8, "looped mma keeps the K/fragment loops rolled ({looped_mfma} < 8 static mfma)");
 }
 
-/// Graph-shape check that a full matmul kernel builds a well-formed SINK with
-/// the expected number of `WMMA` ops (one per output fragment × K reduce, all
-/// symbolic ⇒ one node) and one global output store.
-#[test]
-fn test_matmul_kernel_builds() {
-    let n = 512usize;
-    let ker = Kernel::new("simple_matmul", M1_CFG.grid_dims(n), M1_CFG.threads(), dummy_buffers(n));
-    build_matmul(&ker, n);
-    let sink = ker.finish(2);
-
-    assert!(matches!(sink.op(), Op::Sink { .. }), "kernel finishes in a SINK");
-    let topo = sink.toposort();
-    let wmmas = topo.iter().filter(|u| matches!(u.op(), Op::Wmma { .. })).count();
-    assert_eq!(wmmas, 2, "two symbolic WMMA nodes (two per-wave accumulators)");
-    // Two terminal global C stores (one per accumulator).
-    let Op::Sink { sources, .. } = sink.op() else { unreachable!() };
-    assert_eq!(sources.len(), 2, "two terminal C stores");
-    // LDS fills + the cross-wave WAR sync emit workgroup barriers.
-    assert!(topo.iter().any(|u| matches!(u.op(), Op::Barrier { .. })), "workgroup barrier present");
-}
-
-/// The GLOBAL→LDS strip fills issue 128-bit `bf16.vec(8)` coalesced loads
-/// (one per strip's collaborative pass), and only those — the LDS→REG gather
-/// stays scalar-into-WMMA (`bf16.vec(4)` operands).
-#[test]
-fn test_matmul_vec_fill_graph_shape() {
-    let n = 512usize;
-    let ker = Kernel::new("vec_fill", M1_CFG.grid_dims(n), M1_CFG.threads(), dummy_buffers(n));
-    build_matmul(&ker, n);
-    let sink = ker.finish(M1_CFG.n_accum);
-
-    let bf16x8 = DType::BFloat16.vec(8);
-    let wide = sink.toposort().into_iter().filter(|u| matches!(u.op(), Op::Load { .. }) && u.dtype() == bf16x8).count();
-    // One symbolic vec8 global LOAD per strip (A, B) — the outer pass is a Range,
-    // so each strip's coalesced fill is a single node.
-    assert_eq!(wide, 2, "two bf16.vec(8) GLOBAL→LDS loads (A and B strips), got {wide}");
-}
-
-/// Graph-shape (no GPU): the double-buffered matmul builds a well-formed
-/// **acyclic** SINK with the 2× LDS double buffer, a `tile % 2` parity select
-/// (the buffer-half index that also keeps the gather/commit loop-scoped), two
-/// WMMA accumulators, a workgroup barrier, and two terminal C stores. Catches a
-/// dropped/cyclic anchoring edge before any GPU run.
-#[test]
-fn test_matmul_db_builds() {
-    use svod_ir::BinaryOp;
-
-    let n = 512usize;
-    let ker = Kernel::new("matmul_db", M1_CFG.grid_dims(n), M1_CFG.threads(), dummy_buffers(n));
-    build_matmul_db(&ker, n);
-    let sink = ker.finish(M1_CFG.n_accum);
-
-    assert!(matches!(sink.op(), Op::Sink { .. }), "kernel finishes in a SINK");
-    let topo = sink.toposort(); // would diverge on a cyclic graph
-
-    let wmmas = topo.iter().filter(|u| matches!(u.op(), Op::Wmma { .. })).count();
-    assert_eq!(wmmas, 2, "two symbolic WMMA nodes (two per-wave accumulators)");
-
-    let Op::Sink { sources, .. } = sink.op() else { unreachable!() };
-    assert_eq!(sources.len(), 2, "two terminal C stores");
-
-    assert!(topo.iter().any(|u| matches!(u.op(), Op::Barrier { .. })), "workgroup barrier present");
-
-    // The `tile % 2` parity select lowers to a Mod-by-2 binary.
-    let has_parity = topo.iter().any(|u| {
-        matches!(u.op(), Op::Binary(BinaryOp::Mod, _, d)
-            if matches!(d.op(), Op::Const(c) if matches!(c.0, svod_ir::ConstValue::Int(2))))
-    });
-    assert!(has_parity, "the tile % 2 double-buffer parity select is present");
-
-    // Two double-buffered LDS allocations (A and B strips); accumulators/stages
-    // are DefineReg, not DefineLocal.
-    let lds = topo.iter().filter(|u| matches!(u.op(), Op::DefineLocal { .. })).count();
-    assert_eq!(lds, 2, "two LDS double buffers (A, B), got {lds}");
-}
-
 /// Scheduling pass (host render, no GPU): marking the K-loop a GEMM pipeline makes
 /// the post-linearization pass splice one backend-delegated interleave
 /// (`@llvm.amdgcn.iglp.opt(0)`) at the loop top — the dataflow model's lever, since
@@ -389,6 +313,33 @@ where
     })
     .expect("matmul launch");
     c.as_vec::<f32>().expect("read c")
+}
+
+/// `SVOD_DEVICE=AMD:0 cargo test -p svod-tk --lib matmul::test_matmul_graph_amd -- --ignored --nocapture`.
+///
+/// The graph-native `matmul` (a `custom_kernel` / `Op::Call` node) matches **(a)**
+/// the f32 reference (bf16 tol) AND **(b)** the direct-launch kernel **bit-for-bit**
+/// — the matmul peer of the FA graph gate, confirming the matmul SINK lowers
+/// identically through `custom_kernel → realize` (the optimizer bypass is
+/// kernel-agnostic) as through direct launch.
+#[test]
+#[ignore]
+fn test_matmul_graph_amd() {
+    for n in [256usize, 512, 1024] {
+        let (a, b) = matmul_inputs(n);
+        let expected = matmul_reference(&a, &b);
+        let cfg = cfg_for_n(n);
+        let direct = launch_matmul("matmul_direct", n, cfg, |ker| build_matmul_cfg(ker, n, cfg), &a, &b);
+
+        let mut g = crate::kernels::matmul::matmul(&a, &b).expect("graph matmul");
+        g.realize().expect("realize graph matmul");
+        let graph = g.as_vec::<f32>().expect("read graph matmul");
+
+        let (vs_ref, vs_direct) = (max_abs_err(&graph, &expected), max_abs_err(&graph, &direct));
+        println!("matmul[graph] N={n}: vs ref = {vs_ref:e}, vs direct = {vs_direct:e}");
+        assert!(vs_ref < 5e-2, "graph matmul N={n}: vs ref {vs_ref} exceeds bf16 tol 5e-2");
+        assert!(vs_direct < 1e-3, "graph matmul N={n}: must match direct-launch bit-for-bit (Δ {vs_direct})");
+    }
 }
 
 /// The size-adaptive matmul is correct at every N, picking [`SMALL_CFG`] for

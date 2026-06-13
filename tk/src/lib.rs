@@ -28,6 +28,7 @@ pub mod math;
 pub mod ops;
 pub mod sched;
 pub mod swizzle;
+pub mod target;
 pub mod tile;
 pub mod tiles;
 
@@ -36,9 +37,13 @@ pub const WARP_THREADS: usize = 64;
 
 pub use group::Group;
 pub use kernel::Kernel;
-pub use kernels::fa::{flash_attention_forward, flash_attention_forward_mw, flash_attention_forward_mw_db};
+pub use kernels::fa::{
+    flash_attention, flash_attention_forward, flash_attention_forward_mw, flash_attention_forward_mw_db,
+};
+pub use kernels::matmul::matmul;
 pub use launch::{
-    CompiledLaunch, Error as LaunchError, Result as LaunchResult, compile, compile_kernel, launch, run_kernel,
+    CompiledLaunch, Error as LaunchError, Result as LaunchResult, compile, compile_kernel, graph_launch, launch,
+    run_kernel,
 };
 pub use swizzle::Swizzle;
 pub use tile::{GL, RT, RV, RegTile, ST, Tile};

@@ -21,3 +21,10 @@ svod-schedule = { version = "0.1.0-alpha.3", path = "../schedule" }
 [dev-dependencies]
 proptest = "1.9"
 test-case = "3.3.1"
+criterion = { version = "0.8", features = ["html_reports"] }
+
+# GPU device-time benches (criterion). Self-skip when no AMD GPU; run with
+# `SVOD_DEVICE=AMD:0 cargo bench -p svod-tk --bench kernels`.
+[[bench]]
+name = "kernels"
+harness = false

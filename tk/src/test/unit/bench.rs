@@ -29,7 +29,7 @@ use svod_dtype::DType;
 use svod_tensor::Tensor;
 
 use crate::CompiledLaunch;
-use crate::kernels::fa::{build_fa, build_fa_kv, build_fa_mw, build_fa_mw_db, build_fa_mw_rdb};
+use crate::kernels::fa::{FaConfig, build_fa, build_fa_kv, build_fa_mw, build_fa_mw_db, build_fa_mw_rdb};
 use crate::kernels::matmul::build_matmul;
 
 /// MI300X dense bf16 matrix-engine peak throughput (TFLOP/s). AMD's CDNA3 spec
@@ -156,210 +156,6 @@ fn bench_matmul_amd() {
         }
     }
     print_matmul_table(&rows);
-}
-
-/// `SVOD_DEVICE=AMD:0 cargo test -p svod-tk --lib bench_matmul_variants_amd -- --ignored --nocapture`
-///
-/// M1 (fixed 256×256/8-wave) vs **M7** size-adaptive ([`cfg_for_n`]) vs **M2**
-/// pipeline (`Unroll`) on GPU device time. At small N the fixed 256-block starves
-/// the 304-CU machine (few workgroups), and the adaptive 64×64 single-warp block
-/// restores occupancy. M2 (opt-in) is shown at small N for completeness (see
-/// [`build_matmul_pipelined`]).
-#[test]
-#[ignore]
-fn bench_matmul_variants_amd() {
-    use crate::kernels::matmul::{M1_CFG, PipeStage, build_matmul_adaptive, build_matmul_pipelined, cfg_for_n};
-
-    // `SVOD_TK_PIPELINE` (1=Unroll, 2=Prefetch, 3=Hints) selects the M2 stage and
-    // forces its column at every N; otherwise the (Unroll) column runs only at
-    // small N (the full-unroll IR compile grows steeply past ~16 tiles).
-    let force_pipe = std::env::var("SVOD_TK_PIPELINE").is_ok();
-    let stage = PipeStage::from_env();
-    let sizes: &[(usize, usize)] = &[(256, 50), (512, 50), (768, 40), (1024, 40), (2048, 20), (4096, 10)];
-
-    println!("\n=== svod-tk MATMUL variants on gfx942 / MI300X — GPU device time (TFLOPS) ===");
-    println!("M1 = fixed 256×256/8-wave;  M7 = size-adaptive block;  M2u = K-loop pipeline (Unroll, opt-in)");
-    println!(
-        "{:>6} | {:>8} {:>8} | {:>8} {:>7} {:>6} | {:>8} {:>7}",
-        "N", "M1 µs", "M1 TF", "M7 µs", "M7 TF", "M7/M1", "M2u TF", "M2u/M1"
-    );
-    for &(n, iters) in sizes {
-        let flops = 2.0 * (n as f64).powi(3);
-        let tf = |us: f64| if us > 0.0 { flops / (us / 1e6) / 1e12 } else { 0.0 };
-
-        let m1u = time_variant(n, M1_CFG, iters, |ker| build_matmul(ker, n));
-        let m7u = time_variant(n, cfg_for_n(n), iters, |ker| build_matmul_adaptive(ker, n));
-        // M2u (full-unroll) only at small N unless forced: its compile cost grows
-        // steeply.
-        let m2u = if force_pipe || n <= 512 {
-            time_variant(n, M1_CFG, iters, |ker| build_matmul_pipelined(ker, n, stage))
-        } else {
-            0.0
-        };
-        {
-            let (m1, m7, m2) = (tf(m1u), tf(m7u), tf(m2u));
-            let m7s = if m7u > 0.0 && m1u > 0.0 { m1u / m7u } else { 0.0 };
-            let (m2c, m2sc) = if m2u > 0.0 && m1u > 0.0 {
-                (format!("{m2:8.2}"), format!("{:6.2}x", m1u / m2u))
-            } else {
-                ("      — ".to_string(), "    — ".to_string())
-            };
-            println!("{n:>6} | {m1u:8.2} {m1:8.2} | {m7u:8.2} {m7:7.2} {m7s:5.2}x | {m2c} {m2sc}");
-        }
-    }
-}
-
-/// `SVOD_DEVICE=AMD:0 cargo test -p svod-tk --lib bench_matmul_db_amd -- --ignored --nocapture`
-///
-/// M1 (single-buffered, `K_STEP`=64, two barriers/iter) vs **db** (the rolled
-/// software-pipelined double buffer, `K_STEP`=32, one barrier/iter) on GPU device
-/// time. Both use the same 256×256/8-wave geometry and the **same 64 KB LDS
-/// footprint**, so the delta isolates the double-buffer pipeline.
-/// (Correctness/bit-parity is gated separately by `test_matmul_db_amd`.)
-#[test]
-#[ignore]
-fn bench_matmul_db_amd() {
-    use crate::kernels::matmul::{M1_CFG, build_matmul_db};
-
-    let sizes: &[(usize, usize)] = &[(512, 80), (1024, 60), (2048, 40), (4096, 20)];
-    println!("\n=== svod-tk MATMUL M1 vs double-buffer (Option-C) on gfx942 — GPU device time (TFLOPS) ===");
-    println!("M1 = single-buf K=64, 2 barriers/iter;  db = rolled double-buf K=32, 1 barrier/iter (same 64 KB LDS)");
-    println!("dispatches are INTERLEAVED (M1,db,M1,db,…) so each sample-pair shares the GPU clock state (VF variance)");
-    println!("{:>6} | {:>8} {:>8} | {:>8} {:>8} {:>7}", "N", "M1 µs", "M1 TF", "db µs", "db TF", "db/M1");
-    for &(n, iters) in sizes {
-        let flops = 2.0 * (n as f64).powi(3);
-        let tf = |us: f64| if us > 0.0 { flops / (us / 1e6) / 1e12 } else { 0.0 };
-        let (m1u, dbu) = interleaved_ab(
-            n,
-            iters,
-            (M1_CFG, |ker: &crate::Kernel| build_matmul(ker, n)),
-            (M1_CFG, |ker: &crate::Kernel| build_matmul_db(ker, n)),
-        );
-        let sp = if dbu > 0.0 && m1u > 0.0 { m1u / dbu } else { 0.0 };
-        println!("{n:>6} | {m1u:8.2} {:8.2} | {dbu:8.2} {:8.2} {sp:6.2}x", tf(m1u), tf(dbu));
-    }
-}
-
-/// Tightly interleaved GPU-device-time A/B of two matmul variants: compile both,
-/// warm both, then alternate `A,B,A,B,…` dispatches so each pair sees the same
-/// (drifting) VF clock state. Returns `(median A µs, median B µs)`. A compile/
-/// dispatch failure on either side returns `(0,0)` (skips the row).
-fn interleaved_ab(
-    n: usize,
-    iters: usize,
-    a_variant: (crate::kernels::matmul::MatmulCfg, impl FnOnce(&crate::Kernel)),
-    b_variant: (crate::kernels::matmul::MatmulCfg, impl FnOnce(&crate::Kernel)),
-) -> (f64, f64) {
-    std::panic::catch_unwind(AssertUnwindSafe(|| {
-        let (a, b) = mk_ab(n);
-        let ka = compile_variant(n, a_variant.0, &a, &b, a_variant.1);
-        let kb = compile_variant(n, b_variant.0, &a, &b, b_variant.1);
-        for _ in 0..5 {
-            // SAFETY: bound buffers live for the compiled launches' lifetime.
-            unsafe {
-                ka.dispatch(true).expect("warm A");
-                kb.dispatch(true).expect("warm B");
-            }
-        }
-        let (mut ga, mut gb) = (Vec::with_capacity(iters), Vec::with_capacity(iters));
-        for _ in 0..iters {
-            if let Some(ns) = ka.dispatch_gpu_ns().expect("A gpu dispatch") {
-                ga.push(ns as f64 / 1e3);
-            }
-            if let Some(ns) = kb.dispatch_gpu_ns().expect("B gpu dispatch") {
-                gb.push(ns as f64 / 1e3);
-            }
-        }
-        (median(&ga), median(&gb))
-    }))
-    .unwrap_or((0.0, 0.0))
-}
-
-/// `SVOD_DEVICE=AMD:0 cargo test -p svod-tk --lib bench_matmul_m4_m3_amd -- --ignored --nocapture`
-///
-/// The full four-corner M4/M3 ablation on **GPU device time** at the large-N
-/// sizes where the optimizations matter: `base` (8-wave 256×256, plain 2-D grid, scalar
-/// fill), `+M4` (chiplet/L2 1-D grid swizzle), `+M3` (128-bit vec fill), and
-/// `+M4+M3` (= [`M1_CFG`]). All four share the M1 geometry, so each delta
-/// isolates one optimization (and the cross terms expose their interaction).
-#[test]
-#[ignore]
-fn bench_matmul_m4_m3_amd() {
-    use crate::kernels::matmul::{M1_CFG, MatmulCfg, build_matmul_cfg};
-
-    let base = MatmulCfg { l2_swizzle: false, vec_load: false, ..M1_CFG };
-    let m4 = MatmulCfg { l2_swizzle: true, vec_load: false, ..M1_CFG };
-    let m3 = MatmulCfg { l2_swizzle: false, vec_load: true, ..M1_CFG };
-    let both = M1_CFG; // l2_swizzle + vec_load
-    let sizes: &[(usize, usize)] = &[(2048, 30), (4096, 12)];
-
-    println!("\n=== svod-tk MATMUL M4/M3 ablation on gfx942 / MI300X — GPU device time (TFLOPS) ===");
-    println!("base = 8-wave 256² + 2-D grid + scalar fill;  M4 = chiplet/L2 grid;  M3 = 128-bit vec fill");
-    println!(
-        "{:>6} | {:>8} | {:>8} {:>7} | {:>8} {:>7} | {:>9} {:>7}",
-        "N", "base TF", "+M4 TF", "M4/b", "+M3 TF", "M3/b", "M4+M3 TF", "both/b"
-    );
-    for &(n, iters) in sizes {
-        let flops = 2.0 * (n as f64).powi(3);
-        let tf = |us: f64| if us > 0.0 { flops / (us / 1e6) / 1e12 } else { 0.0 };
-        let bu = time_variant(n, base, iters, |ker| build_matmul_cfg(ker, n, base));
-        let m4u = time_variant(n, m4, iters, |ker| build_matmul_cfg(ker, n, m4));
-        let m3u = time_variant(n, m3, iters, |ker| build_matmul_cfg(ker, n, m3));
-        let bothu = time_variant(n, both, iters, |ker| build_matmul_cfg(ker, n, both));
-        let sp = |u: f64| if u > 0.0 && bu > 0.0 { bu / u } else { 0.0 };
-        println!(
-            "{n:>6} | {:>8.2} | {:>8.2} {:>6.2}x | {:>8.2} {:>6.2}x | {:>9.2} {:>6.2}x",
-            tf(bu),
-            tf(m4u),
-            sp(m4u),
-            tf(m3u),
-            sp(m3u),
-            tf(bothu),
-            sp(bothu),
-        );
-    }
-}
-
-/// Compile + GPU-time one matmul variant in isolation: a failure (slow compile,
-/// dispatch wedge) is caught and reported as `0.0` so it never skips the whole
-/// row of the comparison table.
-fn time_variant(
-    n: usize,
-    cfg: crate::kernels::matmul::MatmulCfg,
-    iters: usize,
-    build: impl FnOnce(&crate::Kernel),
-) -> f64 {
-    std::panic::catch_unwind(AssertUnwindSafe(|| {
-        let (a, b) = mk_ab(n);
-        time_launch(&compile_variant(n, cfg, &a, &b, build), 5, iters).gpu_med()
-    }))
-    .unwrap_or(0.0)
-}
-
-/// Realized bf16 `(a, b)` for a variant bench.
-fn mk_ab(n: usize) -> (Tensor, Tensor) {
-    let mut a = Tensor::rand(&[n, n]).expect("rand a").cast(DType::BFloat16).expect("a→bf16");
-    let mut b = Tensor::rand(&[n, n]).expect("rand b").cast(DType::BFloat16).expect("b→bf16");
-    a.realize().expect("realize a");
-    b.realize().expect("realize b");
-    (a, b)
-}
-
-/// Compile a matmul variant `cfg` over `(a,b)` into a [`CompiledLaunch`] (its
-/// output tensor leaks so the bound buffer outlives the launch through the bench).
-fn compile_variant(
-    n: usize,
-    cfg: crate::kernels::matmul::MatmulCfg,
-    a: &Tensor,
-    b: &Tensor,
-    build: impl FnOnce(&crate::Kernel),
-) -> CompiledLaunch {
-    let c = Box::leak(Box::new(Tensor::empty(&[n, n], DType::Float32)));
-    crate::compile_kernel("mm_variant", cfg.grid_dims(n), cfg.threads(), &mut [c], &[a, b], |ker| {
-        build(ker);
-        ker.finish(cfg.n_accum)
-    })
-    .expect("compile variant")
 }
 
 fn run_matmul(n: usize, iters: usize) -> Row {
@@ -537,6 +333,58 @@ fn run_fa(b: usize, n: usize, h: usize, d: usize, iters: usize) -> Row {
     }
 }
 
+/// `SVOD_DEVICE=AMD:0 cargo test -p svod-tk --release --lib bench_fa_graph_amd -- --ignored --nocapture`
+///
+/// **Benchmark-as-normal-code:** the graph-native `flash_attention` (a `custom_kernel`
+/// / `Op::Call` node) timed through the SAME `prepare()` → `time_plan` path as the
+/// SDPA reference — no bespoke `CompiledLaunch` harness. Confirms a graph-node tk
+/// kernel composes + profiles like any tensor op, and reports it vs SDPA on GPU
+/// device time. `sdpa/fa = sdpa_gpu / fa_gpu` (>1 ⇒ tk faster).
+#[test]
+#[ignore]
+fn bench_fa_graph_amd() {
+    let d = 64usize;
+    let shapes: &[(&str, usize, usize)] = &[("B=1 H=2", 1, 2), ("B=1 H=16 (inference)", 1, 16), ("B=8 H=16", 8, 16)];
+    let ns: &[(usize, usize)] = &[(512, 40), (1024, 25), (2048, 15)];
+    println!("\n=== svod-tk GRAPH FA (custom_kernel node, prepare+time_plan) vs SDPA — GPU device time, D={d} ===");
+    println!("causal useful FLOPs = 2·B·H·N²·D;  prepared like any tensor op.  sdpa/fa = sdpa_gpu / fa_gpu");
+    for &(label, b, h) in shapes {
+        println!("\n-- {label} --");
+        println!("{:>6} | {:>9} {:>9} | {:>9} {:>8}", "N", "fa µs", "fa TF", "sdpa µs", "sdpa/fa");
+        for &(n, iters) in ns {
+            let r = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                let flops = 2.0 * (b * h * d) as f64 * (n as f64).powi(2);
+                let mk = || {
+                    let mut t = Tensor::randn(&[b, n, h, d]).expect("randn").cast(DType::BFloat16).expect("→bf16");
+                    t.realize().expect("realize");
+                    t
+                };
+                let (q, k, v) = (mk(), mk(), mk());
+                // Graph FA: lazy custom_kernel Tensor → prepare → ExecutionPlan.
+                let mut fa = crate::kernels::fa::flash_attention(&q, &k, &v).expect("graph fa");
+                let fa_plan = fa.prepare().expect("prepare fa");
+                let fa_t = time_plan(&fa_plan, 5, iters);
+                // SDPA reference plan (same prepare/time_plan path).
+                let perm = |t: &Tensor| t.cast(DType::Float32).expect("→f32").try_permute(&[0, 2, 1, 3]).expect("perm");
+                let (qp, kp, vp) = (perm(&q), perm(&k), perm(&v));
+                let refb = qp.scaled_dot_product_attention().key(&kp).value(&vp).is_causal(true).call().expect("sdpa");
+                let mut refp = refb.try_permute(&[0, 2, 1, 3]).expect("perm back");
+                let ref_plan = refp.prepare().expect("prepare ref");
+                let ref_t = time_plan(&ref_plan, 5, iters);
+                (flops, fa_t.gpu_med(), ref_t.gpu_med())
+            }));
+            match r {
+                Ok((flops, fau, refu)) => {
+                    let tf = |us: f64| if us > 0.0 { flops / (us / 1e6) / 1e12 } else { 0.0 };
+                    let sp = if fau > 0.0 && refu > 0.0 { refu / fau } else { 0.0 };
+                    println!("{n:>6} | {fau:9.2} {:9.2} | {refu:9.2} {sp:7.2}x", tf(fau));
+                }
+                Err(_) => println!("{n:>6} | SKIPPED (compile/dispatch failure)"),
+            }
+        }
+    }
+}
+
 fn print_fa_table(rows: &[Row], b: usize, h: usize, d: usize) {
     println!("\n=== svod-tk FLASH-ATTENTION fwd (causal, bf16) on gfx942 / MI300X — GPU device time ===");
     println!(
@@ -613,9 +461,11 @@ fn compile_fa_launch(b: usize, n: usize, h: usize, d: usize, kind: FaKind) -> (C
             FaKind::Single => build_fa(ker, b, n, h, h_kv, d),
             FaKind::Mw => build_fa_mw(ker, b, n, h, h_kv, d),
             FaKind::MwDb { pipelined, q_blk, kv_blk } => {
-                build_fa_mw_db(ker, b, n, h, h_kv, d, pipelined, q_blk, kv_blk)
+                build_fa_mw_db(ker, b, n, h, h_kv, d, FaConfig { q_blk, kv_blk, pipelined, ..Default::default() })
             }
-            FaKind::Rdb { q_blk, kv_blk, unroll } => build_fa_mw_rdb(ker, b, n, h, h_kv, d, q_blk, kv_blk, unroll),
+            FaKind::Rdb { q_blk, kv_blk, unroll } => {
+                build_fa_mw_rdb(ker, b, n, h, h_kv, d, FaConfig { q_blk, kv_blk, unroll, ..Default::default() })
+            }
         }
         ker.finish(1)
     })
@@ -670,119 +520,6 @@ fn bench_fa_rdb_amd() {
                     let tf = |us: f64| if us > 0.0 { flops / (us / 1e6) / 1e12 } else { 0.0 };
                     let sp = if rdbu > 0.0 && dbu > 0.0 { dbu / rdbu } else { 0.0 };
                     println!("{n:>6} | {dbu:9.2} {:9.2} | {rdbu:9.2} {:9.2} {sp:6.2}x", tf(dbu), tf(rdbu));
-                }
-                Err(_) => println!("{n:>6} | SKIPPED (compile/dispatch failure)"),
-            }
-        }
-    }
-}
-
-/// `SVOD_DEVICE=AMD:0 cargo test -p svod-tk --lib bench_fa_rdb_flat_amd -- --ignored --nocapture`
-///
-/// **P3 entry-gate measurement:** the rolled double-buffer FA with the
-/// *fully-unrolled* (flat) compute body vs the *rolled* (looped) compute body —
-/// both under the iglp delegation, same structure otherwise. Isolates the effect
-/// of flattening the QKᵀ/softmax/A·V into one schedulable region (more ILP for the
-/// backend) BEFORE adding the cross-tile pipeline. Interleaved per sample-pair.
-/// `flat/rolled = rolled_gpu / flat_gpu` (>1 ⇒ flat faster).
-#[test]
-#[ignore]
-fn bench_fa_rdb_flat_amd() {
-    let d = 64usize;
-    let shapes: &[(&str, usize, usize)] =
-        &[("B=1 H=2  (tiny)", 1, 2), ("B=1 H=16 (inference)", 1, 16), ("B=8 H=16 (occ-bound)", 8, 16)];
-    let ns: &[(usize, usize)] = &[(512, 60), (1024, 40), (2048, 25)];
-    println!("\n=== svod-tk FA rolled-db: FLAT (unrolled) vs ROLLED compute, both iglp — GPU device time, D={d} ===");
-    println!(
-        "causal useful FLOPs = 2·B·H·N²·D;  interleaved flat,rolled per sample.  flat/rolled = rolled_gpu/flat_gpu"
-    );
-    for &(label, b, h) in shapes {
-        println!("\n-- {label} --");
-        println!(
-            "{:>6} | {:>9} {:>9} | {:>9} {:>9} {:>8}",
-            "N", "flat µs", "flat TF", "roll µs", "roll TF", "flat/roll"
-        );
-        for &(n, iters) in ns {
-            let r = std::panic::catch_unwind(AssertUnwindSafe(|| {
-                let flops = 2.0 * b as f64 * h as f64 * (n as f64).powi(2) * d as f64;
-                let (flat, _of) = compile_fa_launch(b, n, h, d, FaKind::Rdb { q_blk: 16, kv_blk: 16, unroll: true });
-                let (roll, _or) = compile_fa_launch(b, n, h, d, FaKind::Rdb { q_blk: 16, kv_blk: 16, unroll: false });
-                for _ in 0..5 {
-                    // SAFETY: output buffers held by `_of`/`_or` for the launches' lifetime.
-                    unsafe {
-                        flat.dispatch(true).expect("warm flat");
-                        roll.dispatch(true).expect("warm roll");
-                    }
-                }
-                let (mut gf, mut gr) = (Vec::with_capacity(iters), Vec::with_capacity(iters));
-                for _ in 0..iters {
-                    if let Some(ns) = flat.dispatch_gpu_ns().expect("flat gpu") {
-                        gf.push(ns as f64 / 1e3);
-                    }
-                    if let Some(ns) = roll.dispatch_gpu_ns().expect("roll gpu") {
-                        gr.push(ns as f64 / 1e3);
-                    }
-                }
-                (flops, median(&gf), median(&gr))
-            }));
-            match r {
-                Ok((flops, fu, ru)) => {
-                    let tf = |us: f64| if us > 0.0 { flops / (us / 1e6) / 1e12 } else { 0.0 };
-                    let sp = if fu > 0.0 && ru > 0.0 { ru / fu } else { 0.0 };
-                    println!("{n:>6} | {fu:9.2} {:9.2} | {ru:9.2} {:9.2} {sp:7.2}x", tf(fu), tf(ru));
-                }
-                Err(_) => println!("{n:>6} | SKIPPED (compile/dispatch failure)"),
-            }
-        }
-    }
-}
-
-/// `SVOD_DEVICE=AMD:0 cargo test -p svod-tk --lib bench_fa_rdb_tiles_amd -- --ignored --nocapture`
-///
-/// Rolled double-buffer FA at the baseline `{16,16}` per-warp tile vs the bigger
-/// `{32,32}` (which amortizes the softmax over more MFMA). The rolled buffer uses
-/// one `FaScratch` set, so `{32,32}` costs less VGPR than on the unroll-by-2.
-/// Interleaved per sample-pair. `t32/t16 = t16_gpu / t32_gpu` (>1 ⇒ `{32,32}` faster).
-/// N must be a multiple of `32 * NUM_WARPS = 256`.
-#[test]
-#[ignore]
-fn bench_fa_rdb_tiles_amd() {
-    let d = 64usize;
-    let shapes: &[(&str, usize, usize)] =
-        &[("B=1 H=2  (tiny)", 1, 2), ("B=1 H=16 (inference)", 1, 16), ("B=8 H=16 (occ-bound)", 8, 16)];
-    let ns: &[(usize, usize)] = &[(512, 60), (1024, 40), (2048, 25)];
-    println!("\n=== svod-tk FA rolled db: {{16,16}} vs {{32,32}} per-warp tile — GPU device time (TFLOPS), D={d} ===");
-    for &(label, b, h) in shapes {
-        println!("\n-- {label} --");
-        println!("{:>6} | {:>9} {:>9} | {:>9} {:>9} {:>7}", "N", "t16 µs", "t16 TF", "t32 µs", "t32 TF", "t32/t16");
-        for &(n, iters) in ns {
-            let r = std::panic::catch_unwind(AssertUnwindSafe(|| {
-                let flops = 2.0 * b as f64 * h as f64 * (n as f64).powi(2) * d as f64;
-                let (t16, _o16) = compile_fa_launch(b, n, h, d, FaKind::Rdb { q_blk: 16, kv_blk: 16, unroll: false });
-                let (t32, _o32) = compile_fa_launch(b, n, h, d, FaKind::Rdb { q_blk: 32, kv_blk: 32, unroll: false });
-                for _ in 0..5 {
-                    // SAFETY: output buffers held by `_o16`/`_o32` for the launches' lifetime.
-                    unsafe {
-                        t16.dispatch(true).expect("warm t16");
-                        t32.dispatch(true).expect("warm t32");
-                    }
-                }
-                let (mut g16, mut g32) = (Vec::with_capacity(iters), Vec::with_capacity(iters));
-                for _ in 0..iters {
-                    if let Some(ns) = t16.dispatch_gpu_ns().expect("t16 gpu") {
-                        g16.push(ns as f64 / 1e3);
-                    }
-                    if let Some(ns) = t32.dispatch_gpu_ns().expect("t32 gpu") {
-                        g32.push(ns as f64 / 1e3);
-                    }
-                }
-                (flops, median(&g16), median(&g32))
-            }));
-            match r {
-                Ok((flops, u16, u32)) => {
-                    let tf = |us: f64| if us > 0.0 { flops / (us / 1e6) / 1e12 } else { 0.0 };
-                    let sp = if u32 > 0.0 && u16 > 0.0 { u16 / u32 } else { 0.0 };
-                    println!("{n:>6} | {u16:9.2} {:9.2} | {u32:9.2} {:9.2} {sp:6.2}x", tf(u16), tf(u32));
                 }
                 Err(_) => println!("{n:>6} | SKIPPED (compile/dispatch failure)"),
             }
@@ -845,61 +582,6 @@ fn bench_fa_mw_amd() {
                         ratio(dbn_gpu),
                         ratio(dbp_gpu),
                         dbp_vs_mw,
-                    );
-                }
-                Err(_) => println!("{n:>6}  SKIPPED (panic — likely OOM or dispatch failure)"),
-            }
-        }
-    }
-}
-
-// ── FA-4 bigger-per-warp-tile sweep (GPU device time) ────────────────────────
-
-/// `SVOD_DEVICE=AMD:0 cargo test -p svod-tk --lib bench_fa_mw_db_tiles_amd -- --ignored --nocapture`
-///
-/// The production pipelined double-buffer FA at three per-warp tile configs —
-/// `{16,16}` (baseline, WMMA edge), `{32,32}` (2 row-fragments) and `{32,64}`
-/// (asymmetric, HK-like) — on **GPU device time** at the inference (B=1,H=16)
-/// and occupancy-bound (B=8,H=16) shapes. Bigger register tiles amortize the
-/// online-softmax reduce over more MFMA but raise VGPR pressure (occupancy is
-/// the bottleneck). `tf32/tf16` etc. are the ratios vs the `{16,16}` baseline
-/// (>1 ⇒ the bigger tile is faster).
-#[test]
-#[ignore]
-fn bench_fa_mw_db_tiles_amd() {
-    let d = 64usize;
-    let shapes: &[(&str, usize, usize)] = &[("B=1 H=16 (inference)", 1, 16), ("B=8 H=16 (occ-bound)", 8, 16)];
-    // N a multiple of 32*8=256 so all three configs tile evenly.
-    let ns: &[(usize, usize)] = &[(512, 30), (1024, 20), (2048, 12)];
-    let cfgs: &[(usize, usize)] = &[(16, 16), (32, 32), (32, 64)];
-
-    println!("\n=== svod-tk FA-4 per-warp tile sweep (pipelined double-buffer) — GPU device time (TFLOPS), D={d} ===");
-    println!("causal useful FLOPs = 2·B·H·N²·D;  tfXX = config TF, rXX = config_gpu vs {{16,16}} (>1 ⇒ bigger wins)");
-    for &(label, b, h) in shapes {
-        println!("\n-- {label} --");
-        println!("{:>6} | {:>9} {:>9} {:>9} | {:>7} {:>7}", "N", "tf16x16", "tf32x32", "tf32x64", "32x32/b", "32x64/b");
-        for &(n, iters) in ns {
-            let r = std::panic::catch_unwind(AssertUnwindSafe(|| {
-                cfgs.iter()
-                    .map(|&(qb, kb)| {
-                        let (l, _o) =
-                            compile_fa_launch(b, n, h, d, FaKind::MwDb { pipelined: true, q_blk: qb, kv_blk: kb });
-                        time_launch(&l, 5, iters).gpu_med()
-                    })
-                    .collect::<Vec<f64>>()
-            }));
-            match r {
-                Ok(us) => {
-                    let flops = 2.0 * (b * h * d) as f64 * (n as f64).powi(2);
-                    let tf = |u: f64| if u > 0.0 { flops / (u / 1e6) / 1e12 } else { 0.0 };
-                    let rel = |u: f64| if u > 0.0 && us[0] > 0.0 { us[0] / u } else { 0.0 };
-                    println!(
-                        "{n:>6} | {:>9.2} {:>9.2} {:>9.2} | {:>6.2}x {:>6.2}x",
-                        tf(us[0]),
-                        tf(us[1]),
-                        tf(us[2]),
-                        rel(us[1]),
-                        rel(us[2]),
                     );
                 }
                 Err(_) => println!("{n:>6}  SKIPPED (panic — likely OOM or dispatch failure)"),

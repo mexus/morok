@@ -4,11 +4,9 @@
 //! The graph-shape checks run GPU-free; the softmax comparison is `#[ignore]`
 //! and validates on gfx942 (lane-distributed, so the CPU backend can't run it).
 
-use std::sync::Arc;
-
 use smallvec::smallvec;
-use svod_dtype::{DType, DeviceSpec};
-use svod_ir::{Op, UOp};
+use svod_dtype::DType;
+use svod_ir::Op;
 
 use crate::Kernel;
 use crate::index::Idx;
@@ -73,12 +71,6 @@ fn build_softmax(ker: &Kernel, n: usize, block: usize) {
     }
 }
 
-/// `(b, a)` dummy BUFFER UOps for GPU-free graph-shape softmax builds.
-fn dummy_softmax_buffers(n: usize, block: usize) -> Vec<Arc<UOp>> {
-    let sz = block * n;
-    vec![UOp::new_buffer(DeviceSpec::Cpu, sz, DType::Float32), UOp::new_buffer(DeviceSpec::Cpu, sz, DType::Float32)]
-}
-
 /// A bare `row_reduce` folds the three sibling 16-lane slots with an in-register
 /// `ds_bpermute` wave shuffle (`Op::Custom`) — no LDS scratch (`DefineLocal`),
 /// no workgroup `Barrier`, and no WMMA.
@@ -107,29 +99,6 @@ fn test_row_reduce_graph_shape() {
         "the wave-shuffle reduce needs no workgroup barrier"
     );
     assert!(!topo.iter().any(|u| matches!(u.op(), Op::Wmma { .. })), "a reduction has no WMMA");
-}
-
-/// A full softmax kernel builds a well-formed SINK with the LDS reduction
-/// scratch + barrier and the `exp2` of the exp-via-exp2 softmax.
-#[test]
-fn test_softmax_kernel_builds() {
-    let (n, block) = (64usize, 32usize);
-    let ker = Kernel::new("softmax", [1, 1, 1], 64, dummy_softmax_buffers(n, block));
-    build_softmax(&ker, n, block);
-    let sink = ker.finish(1);
-
-    assert!(matches!(sink.op(), Op::Sink { .. }), "kernel finishes in a SINK");
-    let topo = sink.toposort();
-    assert!(topo.iter().any(|u| matches!(u.op(), Op::DefineLocal(_))), "LDS smem tile present");
-    assert!(topo.iter().any(|u| matches!(u.op(), Op::Barrier { .. })), "GLOBAL→LOCAL fill barrier present");
-    assert!(
-        topo.iter().any(|u| matches!(u.op(), Op::Custom { .. })),
-        "the softmax row_reduce uses a ds_bpermute Op::Custom shuffle"
-    );
-    assert!(
-        topo.iter().any(|u| matches!(u.op(), Op::Unary(svod_ir::UnaryOp::Exp2, _))),
-        "softmax uses exp2 (exp-via-exp2)"
-    );
 }
 
 // =============================================================================

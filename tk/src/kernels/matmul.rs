@@ -7,6 +7,7 @@ use std::sync::Arc;
 use smallvec::smallvec;
 use svod_dtype::DType;
 use svod_ir::UOp;
+use svod_tensor::Tensor;
 
 use crate::index::{Idx, cidx};
 use crate::tiles::{RT_16X16, ST_16X16_SWIZZLED, TileLayout};
@@ -115,6 +116,36 @@ pub fn build_matmul(ker: &Kernel, n: usize) {
 /// [`MatmulCfg::threads`]) and `finish(cfg.n_accum)`.
 pub fn build_matmul_adaptive(ker: &Kernel, n: usize) {
     build_matmul_cfg(ker, n, cfg_for_n(n));
+}
+
+/// The GPU arch(es) the tile matmul is built for (gfx942 WMMA, like FA). Adding a
+/// GPU means extending this list once its arch-specific bits exist — the launcher
+/// gates against it; see [`crate::target::check_target`].
+pub const MATMUL_SUPPORTED_ARCHS: &[svod_dtype::AmdArch] = &[svod_dtype::AmdArch::Gfx942];
+
+/// **Graph-native** `n×n` bf16→f32 tile matmul: returns a lazy output [`Tensor`]
+/// (a `custom_kernel` / `Op::Call` node) — the matmul peer of
+/// [`crate::flash_attention`]. Composes into a model graph and benchmarks through
+/// the normal `prepare()` → `execute_profiled` path. `a`/`b` are square `[n, n]`
+/// bf16; uses the size-adaptive config ([`cfg_for_n`]).
+pub fn matmul(a: &svod_tensor::Tensor, b: &svod_tensor::Tensor) -> crate::LaunchResult<Tensor> {
+    crate::target::check_target(&a.device(), MATMUL_SUPPORTED_ARCHS)?;
+    let dim = |t: &Tensor, i: usize| t.shape().expect("shape")[i].as_const().expect("concrete dim");
+    let (am, an) = (dim(a, 0), dim(a, 1));
+    let (bm, bn) = (dim(b, 0), dim(b, 1));
+    assert_eq!(
+        (am, an, bm, bn),
+        (am, am, am, am),
+        "tk matmul requires square, equal-size a/b ([n,n]); got a={am}x{an} b={bm}x{bn}"
+    );
+    let n = am;
+
+    let cfg = cfg_for_n(n);
+    let out = Tensor::empty(&[n, n], DType::Float32);
+    crate::graph_launch("matmul", cfg.grid_dims(n), cfg.threads(), out, &[a, b], move |ker| {
+        build_matmul_cfg(ker, n, cfg);
+        ker.finish(cfg.n_accum)
+    })
 }
 
 /// The parametrized multi-wave matmul (M1 + M7). One `cfg.block × cfg.block` C
