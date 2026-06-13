@@ -11,8 +11,9 @@
 use std::sync::Arc;
 
 use smallvec::{SmallVec, smallvec};
-use svod_dtype::DType;
+use svod_dtype::{AmdArch, DType};
 use svod_ir::{AxisType, ConstValue, RendererDevice, UOp, WmmaMetadata, WmmaUpcastAxes};
+use svod_schedule::optimizer::{Renderer, TensorCore};
 
 use crate::WARP_THREADS;
 use crate::index::{Idx, cidx, flat_index, flat_offset, index_off, load_at, load_off, load_vec};
@@ -71,22 +72,49 @@ fn lane_rc(
     }
 }
 
-/// The verified gfx942 K=16 bf16→f32 wave64 WMMA descriptor
-/// (`mfma.f32.16x16x16bf16.1k`). Only the `upcast_axes` *products* matter for a
-/// pre-built WMMA: a/b/c each = 4, so operands are `bf16.vec(4)`/`bf16.vec(4)`
-/// and the accumulator/result `f32.vec(4)`.
-fn wmma_16_16_16_bf16_f32() -> WmmaMetadata {
+/// Bridge a scheduler [`TensorCore`] (the per-arch×dtype matrix-op table, the
+/// single source of truth — `schedule::optimizer::renderer`) into the IR
+/// [`WmmaMetadata`] that a hand-built [`Op::Wmma`](svod_ir::Op::Wmma) consumes.
+///
+/// `dims`/`dtype_in`/`dtype_out`/`threads`/`tile_grid` copy straight across. The
+/// `upcast_axes` are `log2(elements_per_thread)` size-2 entries per operand
+/// (mirrors the optimizer's `tc.rs` construction, where every upcast/reduce split
+/// is by 2); the axis-id *values* are cosmetic on tk's expander-free direct path —
+/// codegen/devectorize read only the sizes — so we descend from 4, which
+/// reproduces the prior hand layout `[(4,2),(3,2)]` for the gfx942 16×16×16 case.
+/// `reduce_axes` is empty: tk's `mma` carries the K reduce as its own `inner`
+/// range, not inside the WMMA metadata.
+fn wmma_from_tc(tc: &TensorCore, device: RendererDevice) -> WmmaMetadata {
+    let axes = |ept: usize| -> Vec<(usize, usize)> { (0..(ept as f64).log2() as usize).map(|i| (4 - i, 2)).collect() };
     WmmaMetadata {
-        name: "WMMA_16_16_16_bfloat_float".into(),
-        dims: (16, 16, 16),
-        dtype_in: DType::BFloat16,
-        dtype_out: DType::Float32,
-        device: RendererDevice::AmdCdna3,
-        threads: 64,
-        upcast_axes: WmmaUpcastAxes { a: vec![(4, 2), (3, 2)], b: vec![(4, 2), (3, 2)], c: vec![(4, 2), (3, 2)] },
+        name: format!("WMMA_{}_{}_{}_{:?}_{:?}", tc.dims.0, tc.dims.1, tc.dims.2, tc.dtype_in, tc.dtype_out),
+        dims: tc.dims,
+        dtype_in: tc.dtype_in.clone(),
+        dtype_out: tc.dtype_out.clone(),
+        device,
+        threads: tc.threads,
+        upcast_axes: WmmaUpcastAxes {
+            a: axes(tc.elements_per_thread.0),
+            b: axes(tc.elements_per_thread.1),
+            c: axes(tc.elements_per_thread.2),
+        },
         reduce_axes: vec![],
-        tile_grid: (1, 1),
+        tile_grid: tc.tile_grid,
     }
+}
+
+/// The K=16 WMMA descriptor for input dtype `dtype_in`, looked up from the shared
+/// gfx942 (CDNA3) tensor-core table rather than re-encoded here — so bf16/f16 (and,
+/// once [`ArchCaps`] threads the real arch, the RDNA wave32 cores) come from one
+/// source. Both accumulate in f32. Arch is gfx942 today; Unit 5 parameterizes it.
+fn wmma_desc(dtype_in: &DType) -> WmmaMetadata {
+    let ren = Renderer::for_amd_arch(AmdArch::Gfx942);
+    let tc = ren
+        .tensor_cores
+        .iter()
+        .find(|tc| &tc.dtype_in == dtype_in && tc.dims == (16, 16, 16))
+        .unwrap_or_else(|| unimplemented!("no 16×16×16 WMMA for input dtype {dtype_in:?} on gfx942 (bf16 | f16)"));
+    wmma_from_tc(tc, ren.device)
 }
 
 /// Scalar geometry of the coalesced GLOBAL↔LDS fill for one ST tile (the part
@@ -544,7 +572,7 @@ impl<'k> Group<'k> {
             16 => 4,
             other => unimplemented!("mma: base cols {other} not ported (gfx942 K=16 → 4 lanes)"),
         };
-        let meta = wmma_16_16_16_bf16_f32();
+        let meta = wmma_desc(a.elem());
 
         let h_end = c.shape()[c.shape().len() - 3] as i64;
         let w_end = c.shape()[c.shape().len() - 2] as i64;
@@ -619,7 +647,7 @@ impl<'k> Group<'k> {
             16 => 4,
             other => unimplemented!("mma_u: base cols {other} not ported (gfx942 K=16 → 4 lanes)"),
         };
-        let meta = wmma_16_16_16_bf16_f32();
+        let meta = wmma_desc(a.elem());
 
         let h_end = c.shape()[c.shape().len() - 3] as i64;
         let w_end = c.shape()[c.shape().len() - 2] as i64;

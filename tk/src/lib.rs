@@ -38,7 +38,8 @@ pub const WARP_THREADS: usize = 64;
 pub use group::Group;
 pub use kernel::Kernel;
 pub use kernels::fa::{
-    flash_attention, flash_attention_forward, flash_attention_forward_mw, flash_attention_forward_mw_db,
+    FaOpts, flash_attention, flash_attention_forward, flash_attention_forward_mw, flash_attention_forward_mw_db,
+    flash_attention_with,
 };
 pub use kernels::matmul::matmul;
 pub use launch::{

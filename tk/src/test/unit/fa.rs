@@ -53,7 +53,17 @@ fn test_fa_mw_rdb_renders_bounded() {
             8 * 64,
             dummy_fa_buffers(b, n, h, h_kv, d),
         );
-        build_fa_mw_rdb(&ker, b, n, h, h_kv, d, FaConfig { q_blk: 16, kv_blk: 16, unroll, ..Default::default() });
+        build_fa_mw_rdb(
+            &ker,
+            b,
+            n,
+            h,
+            h_kv,
+            d,
+            FaConfig { q_blk: 16, kv_blk: 16, unroll, ..Default::default() },
+            svod_dtype::DType::BFloat16,
+            false,
+        );
         let sink = ker.finish(1);
         let lowered = svod_schedule::graph_rewrite(&svod_schedule::symbolic::pm_lower_index_dtype(), sink, &mut ());
         let program = svod_codegen::program_pipeline::program_from_sink(lowered, svod_dtype::DeviceSpec::Cpu);
@@ -104,7 +114,17 @@ fn test_fa_graph_path_renders_clean() {
     let n = 128usize;
     let ker =
         Kernel::new("fa_mw_rdb", [h as i64, (n / 16 / 8) as i64, b as i64], 8 * 64, dummy_fa_buffers(b, n, h, h_kv, d));
-    build_fa_mw_rdb(&ker, b, n, h, h_kv, d, FaConfig { q_blk: 16, kv_blk: 16, ..Default::default() });
+    build_fa_mw_rdb(
+        &ker,
+        b,
+        n,
+        h,
+        h_kv,
+        d,
+        FaConfig { q_blk: 16, kv_blk: 16, ..Default::default() },
+        svod_dtype::DType::BFloat16,
+        false,
+    );
     let sink = ker.finish(1);
 
     // Realize builds the optimizer renderer for gfx942 via for_amd_arch.
@@ -305,6 +325,8 @@ fn run_fa_amd_case(b: usize, n: usize, h: usize, d: usize, path: FaPath) {
                     h_kv,
                     d,
                     FaConfig { q_blk, kv_blk, unroll, ..Default::default() },
+                    q.uop().dtype(),
+                    false,
                 );
                 ker.finish(1)
             })
@@ -425,4 +447,99 @@ svod_tensor::custom_kernel_check! {
         r.try_permute(&[0, 2, 1, 3])
     },
     tol: 2e-2,
+}
+
+/// `SVOD_DEVICE=AMD:0 cargo test -p svod-tk --lib fa::test_fa_noncausal_f16_amd -- --ignored --nocapture`.
+///
+/// The unified [`crate::kernels::fa::flash_attention_with`] **non-causal, f16,
+/// unmasked** path vs full-bidirectional SDPA over the same f16 operands. Exercises
+/// the `causal: false` KV sweep and the f16 WMMA-operand globals end-to-end on
+/// gfx942. Tol 2e-2 (f16 accumulation slack).
+#[test]
+#[ignore]
+fn test_fa_noncausal_f16_amd() {
+    use crate::kernels::fa::{FaOpts, flash_attention_with};
+    use svod_tensor::Tensor;
+
+    let (b, n, h, d) = (1usize, 256usize, 8usize, 64usize);
+    let mk = || {
+        let mut t = Tensor::randn(&[b, n, h, d]).expect("randn").cast(DType::Float16).expect("cast f16");
+        t.realize().expect("realize");
+        t
+    };
+    let (q, k, v) = (mk(), mk(), mk());
+
+    let og = flash_attention_with(&q, &k, &v, FaOpts { causal: false, key_lens: None }).expect("fa noncausal");
+    let mut og_f = og.cast(DType::Float32).expect("og→f32");
+    og_f.realize().expect("realize og");
+    let got: Vec<f32> = og_f.as_vec::<f32>().expect("read og");
+
+    // Reference: full (non-causal) SDPA over the same f32-permuted operands.
+    let perm = |t: &Tensor| t.cast(DType::Float32).expect("→f32").try_permute(&[0, 2, 1, 3]).expect("permute");
+    let (qp, kp, vp) = (perm(&q), perm(&k), perm(&v));
+    let ref_bhnd = qp.scaled_dot_product_attention().key(&kp).value(&vp).is_causal(false).call().expect("sdpa");
+    let mut reference = ref_bhnd.try_permute(&[0, 2, 1, 3]).expect("permute back");
+    reference.realize().expect("realize reference");
+    let expected = reference.as_vec::<f32>().expect("read reference");
+
+    assert_eq!(got.len(), expected.len(), "length mismatch");
+    let max_abs = got.iter().zip(&expected).map(|(g, e)| (g - e).abs()).fold(0.0f32, f32::max);
+    println!("fa[noncausal,f16] B={b} N={n} H={h} D={d}: max abs error = {max_abs:e}");
+    assert!(max_abs <= 2e-2, "non-causal f16 FA exceeds tol (max abs {max_abs:e})");
+}
+
+/// `SVOD_DEVICE=AMD:0 cargo test -p svod-tk --lib fa::test_fa_noncausal_f16_masked_amd -- --ignored --nocapture`.
+///
+/// The unified [`crate::kernels::fa::flash_attention_with`] **non-causal, f16,
+/// key-masked** path vs full SDPA with the SAME `[B,1,1,N]` key mask. `key_lens =
+/// [200]` (valid keys) ⇒ keys `200..256` are masked. Both the kernel and the
+/// reference use KEY-only masking, so they agree on EVERY row (the full output is
+/// compared, including the padded query rows `200..256`). Tol 2e-2.
+#[test]
+#[ignore]
+fn test_fa_noncausal_f16_masked_amd() {
+    use crate::kernels::fa::{FaOpts, flash_attention_with};
+    use svod_tensor::Tensor;
+
+    let (b, n, h, d) = (1usize, 256usize, 8usize, 64usize);
+    let valid: i32 = 200;
+    let mk = || {
+        let mut t = Tensor::randn(&[b, n, h, d]).expect("randn").cast(DType::Float16).expect("cast f16");
+        t.realize().expect("realize");
+        t
+    };
+    let (q, k, v) = (mk(), mk(), mk());
+
+    // Per-batch valid-key-count tensor [B] i32 (on the default/AMD device).
+    let mut lens = Tensor::from_slice([valid; 1]);
+    lens.realize().expect("realize lens");
+
+    let og = flash_attention_with(&q, &k, &v, FaOpts { causal: false, key_lens: Some(&lens) }).expect("fa masked");
+    let mut og_f = og.cast(DType::Float32).expect("og→f32");
+    og_f.realize().expect("realize og");
+    let got: Vec<f32> = og_f.as_vec::<f32>().expect("read og");
+
+    // Reference: full SDPA with the same [B,1,1,N] bool key mask (true = masked,
+    // where arange(N) >= valid), mirroring the kernel's `kv_pos >= lens[batch]`.
+    let perm = |t: &Tensor| t.cast(DType::Float32).expect("→f32").try_permute(&[0, 2, 1, 3]).expect("permute");
+    let (qp, kp, vp) = (perm(&q), perm(&k), perm(&v));
+    let range = Tensor::arange(n as i64, None, None).expect("arange").try_reshape([1usize, 1, 1, n]).expect("reshape");
+    let lref = Tensor::from_slice([valid; 1]).try_reshape([b, 1, 1, 1]).expect("reshape lens");
+    let mask = range.try_ge(&lref).expect("ge mask");
+    let ref_bhnd = qp
+        .scaled_dot_product_attention()
+        .key(&kp)
+        .value(&vp)
+        .is_causal(false)
+        .attn_mask(&mask)
+        .call()
+        .expect("sdpa masked");
+    let mut reference = ref_bhnd.try_permute(&[0, 2, 1, 3]).expect("permute back");
+    reference.realize().expect("realize reference");
+    let expected = reference.as_vec::<f32>().expect("read reference");
+
+    assert_eq!(got.len(), expected.len(), "length mismatch");
+    let max_abs = got.iter().zip(&expected).map(|(g, e)| (g - e).abs()).fold(0.0f32, f32::max);
+    println!("fa[noncausal,f16,masked lens={valid}] B={b} N={n} H={h} D={d}: max abs error = {max_abs:e}");
+    assert!(max_abs <= 2e-2, "non-causal masked f16 FA exceeds tol (max abs {max_abs:e})");
 }

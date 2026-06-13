@@ -463,9 +463,17 @@ fn compile_fa_launch(b: usize, n: usize, h: usize, d: usize, kind: FaKind) -> (C
             FaKind::MwDb { pipelined, q_blk, kv_blk } => {
                 build_fa_mw_db(ker, b, n, h, h_kv, d, FaConfig { q_blk, kv_blk, pipelined, ..Default::default() })
             }
-            FaKind::Rdb { q_blk, kv_blk, unroll } => {
-                build_fa_mw_rdb(ker, b, n, h, h_kv, d, FaConfig { q_blk, kv_blk, unroll, ..Default::default() })
-            }
+            FaKind::Rdb { q_blk, kv_blk, unroll } => build_fa_mw_rdb(
+                ker,
+                b,
+                n,
+                h,
+                h_kv,
+                d,
+                FaConfig { q_blk, kv_blk, unroll, ..Default::default() },
+                q.uop().dtype(),
+                false,
+            ),
         }
         ker.finish(1)
     })

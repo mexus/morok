@@ -108,6 +108,14 @@ pub enum Error {
     /// are gfx942/CDNA3-only) or the AMD LLVM/clang toolchain is unavailable.
     #[snafu(display("unsupported target for svod-tk kernel: {reason}"))]
     UnsupportedTarget { reason: String },
+
+    /// The scheduler fallback (`Tensor::scaled_dot_product_attention` on a device
+    /// the hand-built kernel does not support) failed to build.
+    #[snafu(display("scheduler fallback: {source}"))]
+    Fallback {
+        #[snafu(source(from(svod_tensor::error::Error, Box::new)))]
+        source: Box<svod_tensor::error::Error>,
+    },
 }
 
 /// Compile `sink` for `device` and dispatch it against `buffers`, populating the

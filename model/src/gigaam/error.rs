@@ -21,6 +21,11 @@ pub enum Error {
     DecoderConfig { message: String },
     #[snafu(display("hub error: {source}"))]
     Hub { source: hf_hub::api::sync::ApiError },
+    #[snafu(display("flash-attention kernel: {source}"))]
+    Tk {
+        #[snafu(source(from(svod_tk::LaunchError, Box::new)))]
+        source: Box<svod_tk::LaunchError>,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

@@ -3605,6 +3605,7 @@ dependencies = [
  "svod-runtime",
  "svod-schedule",
  "svod-tensor",
+ "svod-tk",
  "tempfile",
  "test-case",
  "tracing",
