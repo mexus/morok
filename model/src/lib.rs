@@ -1,6 +1,7 @@
 pub mod audio;
 pub mod blocks;
 pub mod diarizen;
+pub mod firered_vad;
 pub mod gigaam;
 pub(crate) mod init;
 pub mod jit;
