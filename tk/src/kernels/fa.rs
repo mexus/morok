@@ -435,9 +435,54 @@ fn fa_kv_slice<'k>(
     war_barrier: bool,
     extra_war: &[Arc<UOp>],
 ) -> FaAcc<'k> {
-    let FaAcc { mut max_vec, mut norm_vec, mut o_reg } = acc;
     let FaScratch { k_reg, k_reg_t, v_reg, att, att_mma, scale_vec, max_vec_last } = sc;
+    let (att, v_reg) = fa_qk(
+        warp,
+        ker,
+        k_reg,
+        k_reg_t,
+        v_reg,
+        att,
+        k_smem,
+        v_smem,
+        q_reg_t,
+        q_blk,
+        slice_idx,
+        q_blk_rows,
+        kv_blk_rows,
+        reinit_dep,
+        war_barrier,
+        extra_war,
+    );
+    fa_softmax_pv(warp, acc, att_mma, scale_vec, max_vec_last, att, &v_reg, reinit_dep)
+}
 
+/// Stage 1 of a KV slice — `QKᵀ`: gather this warp's K/V fragments from the
+/// already-filled shared `(k_smem, v_smem)` LDS, compute `QKᵀ` into a
+/// freshly-zeroed `att`, and apply the causal mask. Returns the masked raw scores
+/// `att` and the gathered `v_reg` (carried to [`fa_softmax_pv`]). Splitting QK off
+/// the softmax/PV lets the cross-tile pipeline emit `qk(cur)` out of phase with
+/// `softmax_pv(prev)`. `war_barrier`/`extra_war` gate the LDS→REG read behind a
+/// cross-wave WAR barrier (with the double-buffer prefetch commits folded in).
+#[allow(clippy::too_many_arguments)]
+fn fa_qk<'k>(
+    warp: &Group<'k>,
+    ker: &Kernel,
+    k_reg: RT<'k>,
+    k_reg_t: RT<'k>,
+    v_reg: RT<'k>,
+    att: RT<'k>,
+    k_smem: ST<'k>,
+    v_smem: ST<'k>,
+    q_reg_t: &RT<'k>,
+    q_blk: &Arc<UOp>,
+    slice_idx: &Arc<UOp>,
+    q_blk_rows: usize,
+    kv_blk_rows: usize,
+    reinit_dep: &Arc<UOp>,
+    war_barrier: bool,
+    extra_war: &[Arc<UOp>],
+) -> (RT<'k>, RT<'k>) {
     // Per-warp LDS→REG gather: every warp reads the shared K/V block.
     let k_reg = warp.load(k_reg.into(), k_smem.into(), &[], &[], 0).rt();
     let v_reg = warp.load(v_reg.into(), v_smem.into(), &[], &[], 0).rt();
@@ -474,13 +519,31 @@ fn fa_kv_slice<'k>(
         let neg_inf = UOp::const_(x.dtype(), ConstValue::Float(f64::NEG_INFINITY));
         UOp::try_where(cond, neg_inf, x.clone()).expect("causal where")
     });
+    (att, v_reg)
+}
 
-    // Online softmax: update the running max, rescale by exp2(prev_max-new_max).
-    // `att` is col-layout `(KV=height, Q=width)`; softmax reduces over KV and is
-    // broadcast per Q, so the reduce is over the *height* (KV) producing a
-    // per-*width* (Q) vector — i.e. `col_reduce`. At a single fragment per axis
-    // (`{16,16}`) this is bit-identical to `row_reduce`; for multi-fragment tiles
-    // (`{32,32}`/`{32,64}`) it is the only orientation that folds the right axis.
+/// Stage 2 of a KV slice — online softmax + `A·V`: given the masked raw scores
+/// `att` (from [`fa_qk`]) and the gathered `v_reg`, update the running max,
+/// rescale the running stats by `exp2(prev_max - new_max)`, exponentiate, fold the
+/// norm, and accumulate `A·V` into `o_reg`. Threads the updated [`FaAcc`] out.
+///
+/// `att` is col-layout `(KV=height, Q=width)`; softmax reduces over KV and
+/// broadcasts per Q, so the reduce folds the *height* (KV) via [`Group::col_reduce`]
+/// → a per-*width* (Q) vector. At `{16,16}` this is bit-identical to `row_reduce`;
+/// for multi-fragment tiles it is the only orientation that folds the right axis.
+#[allow(clippy::too_many_arguments)]
+fn fa_softmax_pv<'k>(
+    warp: &Group<'k>,
+    acc: FaAcc<'k>,
+    att_mma: RT<'k>,
+    scale_vec: RV<'k>,
+    max_vec_last: RV<'k>,
+    att: RT<'k>,
+    v_reg: &RT<'k>,
+    reinit_dep: &Arc<UOp>,
+) -> FaAcc<'k> {
+    let FaAcc { mut max_vec, mut norm_vec, mut o_reg } = acc;
+
     let max_vec_last = warp.copy(max_vec_last.after(smallvec![reinit_dep.clone()]), &max_vec);
     max_vec =
         warp.col_reduce(max_vec.after(smallvec![max_vec_last.uop().clone()]), &att, |a, b| a.max(b), f64::NEG_INFINITY);
@@ -503,7 +566,7 @@ fn fa_kv_slice<'k>(
 
     // A·V accumulation.
     let att_mma = warp.copy(att_mma.after(smallvec![reinit_dep.clone(), norm_vec.uop().clone()]), &att);
-    o_reg = warp.mma_atb(o_reg, &v_reg, &att_mma);
+    o_reg = warp.mma_atb(o_reg, v_reg, &att_mma);
 
     FaAcc { max_vec, norm_vec, o_reg }
 }
@@ -737,7 +800,13 @@ pub(crate) fn build_fa_mw_rdb(
     d: usize,
     q_blk_rows: usize,
     kv_blk_rows: usize,
+    unroll: bool,
 ) {
+    // Flat compute (unrolled QKᵀ/softmax/A·V) is the prerequisite for the Stage-2
+    // attention scheduling comb; the rolled (`unroll = false`) form is the iglp
+    // baseline. Same numerics either way (the unroll only changes the loop
+    // mechanism, not the fold order).
+    ker.set_unroll(unroll);
     assert_eq!(d % BLK, 0, "D must be a multiple of {BLK}");
     assert_eq!(q_blk_rows % BLK, 0, "Q_BLK must be a multiple of the WMMA edge {BLK}");
     assert_eq!(kv_blk_rows % BLK, 0, "KV_BLK must be a multiple of the WMMA edge {BLK}");
@@ -984,7 +1053,7 @@ pub fn flash_attention_forward_mw_rdb(o: &mut Tensor, q: &Tensor, k: &Tensor, v:
     let grid = [h as i64, (n / q_blk / NUM_WARPS) as i64, b as i64];
 
     crate::run_kernel("fa_mw_rdb", grid, (NUM_WARPS * 64) as i64, &mut [o], &[q, k, v], |ker| {
-        build_fa_mw_rdb(ker, b, n, h, h_kv, d, q_blk, kv_blk);
+        build_fa_mw_rdb(ker, b, n, h, h_kv, d, q_blk, kv_blk, false);
         ker.finish(1)
     })
 }

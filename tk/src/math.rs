@@ -71,7 +71,10 @@ impl<'k> Group<'k> {
     // ── same-shape tile RHS ───────────────────────────────────────────────────
     fn combine_tile<T: RegTile<'k>>(&self, a: T, b: &T, f: Combine) -> T {
         assert_eq!(a.shape(), b.shape(), "tile op: shape mismatch");
-        let (bbuf, bshape, belem, aelem) = (b.uop().clone(), b.shape().to_vec(), b.elem().clone(), a.elem().clone());
+        // Anchor the RHS read so an unrolled constant-address read of a carried
+        // tile is not hoisted out of the enclosing rolled loop (`Group::anchor`).
+        let (bbuf, bshape, belem, aelem) =
+            (self.anchor(b.uop()), b.shape().to_vec(), b.elem().clone(), a.elem().clone());
         self.map(a, move |x, idx| {
             let mut y = load_at(&bbuf, &bshape, idx);
             if belem != aelem {
@@ -105,7 +108,7 @@ impl<'k> Group<'k> {
     // ── register-vector broadcast into an RT ──────────────────────────────────
     fn combine_rv(&self, a: RT<'k>, v: &RV<'k>, f: Combine) -> RT<'k> {
         let (vbuf, vshape, velem, aelem, layout) =
-            (v.uop().clone(), v.shape().to_vec(), v.elem().clone(), a.elem().clone(), a.layout);
+            (self.anchor(v.uop()), v.shape().to_vec(), v.elem().clone(), a.elem().clone(), a.layout);
         self.map(a, move |x, idx| {
             let sel = match layout {
                 TileLayout::Row => idx[0].clone(),

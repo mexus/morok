@@ -34,6 +34,14 @@ pub struct Kernel {
     range_stack: RefCell<Vec<Arc<UOp>>>,
     /// Terminal `(store, buffer)` pairs, consumed by `finish`/`endrange`.
     store_stack: RefCell<Vec<(Arc<UOp>, Arc<UOp>)>>,
+
+    /// When set, the register compute primitives ([`crate::Group`]'s
+    /// `mma`/`map`/`copy`/`clear`/`transpose`/`reduce`) emit **fully unrolled**
+    /// (Rust-`for`, no inner `RANGE`) bodies instead of looped ones, so the FA
+    /// QKᵀ/softmax/A·V render as one flat schedulable LLVM region the attention
+    /// scheduling comb can weave. Off by default (the looped form keeps the matmul
+    /// + rolled-FA IR compact); the cross-tile-pipeline FA builder opts in.
+    unroll: Cell<bool>,
 }
 
 impl Kernel {
@@ -61,7 +69,20 @@ impl Kernel {
             range_id: Cell::new(0),
             range_stack: RefCell::new(Vec::new()),
             store_stack: RefCell::new(Vec::new()),
+            unroll: Cell::new(false),
         }
+    }
+
+    /// Opt into fully-unrolled register compute (see [`Self::unrolled`]). The
+    /// cross-tile-pipeline FA builder sets this so the QKᵀ/softmax/A·V render as a
+    /// flat schedulable region.
+    pub fn set_unroll(&self, on: bool) {
+        self.unroll.set(on);
+    }
+
+    /// Whether the register compute primitives should emit fully-unrolled bodies.
+    pub fn unrolled(&self) -> bool {
+        self.unroll.get()
     }
 
     // ── lane / warp helpers ────────────────────────────────────────────────

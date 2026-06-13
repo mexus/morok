@@ -93,6 +93,56 @@ fn test_mma_ab_wmma_graph_shape() {
     assert_eq!(prod(&metadata.upcast_axes.c), 4, "C upcast product");
 }
 
+/// The fully-unrolled MMA ([`Kernel::set_unroll`]) emits one symbolic `WMMA` per
+/// `(height, width, k)` fragment — a 32×32 = 2×2 output over a 32-wide K (2
+/// reduce steps) is 8 flat nodes — vs the looped form's single symbolic node, and
+/// renders to gfx942 with 8 distinct `mfma` instructions (no enclosing
+/// `loop_body`), which the looped form cannot (it renders one mfma inside loops).
+/// This is the P1 flatness de-risk: explicit Rust-`for` unroll *does* flatten the
+/// MFMAs on tk's optimizer-skipping direct-launch path (route b).
+#[test]
+fn test_mma_unroll_flattens_mfma() {
+    let build = |unroll: bool| {
+        let n = 32usize;
+        let ker = Kernel::new("mma_unroll_probe", [1, 1, 1], 64, dummy_buffers(n));
+        ker.set_unroll(unroll);
+        let c_gl = ker.gl(&[1, 1, n, n], DType::Float32);
+        let _a_gl = ker.gl(&[1, 1, n, n], DType::BFloat16);
+        let _b_gl = ker.gl(&[1, 1, n, n], DType::BFloat16);
+        let warp = ker.warp();
+        let a = warp.zero(ker.rt((n, n), DType::BFloat16, TileLayout::Row, RT_16X16));
+        // `mma_ab` reads `a[h,k] b[k,w]`; a 32×32 col `b` is a 2×2 K-tiled operand.
+        let b = warp.zero(ker.rt((n, n), DType::BFloat16, TileLayout::Col, RT_16X16));
+        let c = warp.zero(ker.rt((n, n), DType::Float32, TileLayout::Col, RT_16X16));
+        let c = warp.mma_ab(c, &a, &b);
+        let z = || crate::index::Idx::Const(0);
+        let _ = warp.store(c_gl.into(), c.into(), &[z(), z(), z(), z()], &[], 2);
+        ker.finish(1)
+    };
+
+    let wmma_count = |sink: &Arc<UOp>| sink.toposort().iter().filter(|u| matches!(u.op(), Op::Wmma { .. })).count();
+    assert_eq!(wmma_count(&build(false)), 1, "looped mma → one symbolic WMMA node");
+    assert_eq!(wmma_count(&build(true)), 8, "unrolled mma → 8 flat WMMA nodes (2×2 output × 2 K-steps)");
+
+    let render = |sink: Arc<UOp>| {
+        let lowered = svod_schedule::graph_rewrite(&svod_schedule::symbolic::pm_lower_index_dtype(), sink, &mut ());
+        let program = svod_codegen::program_pipeline::program_from_sink(lowered, DeviceSpec::Cpu);
+        let linearized = svod_codegen::program_pipeline::do_linearize(&program).expect("do_linearize");
+        let linear_uop =
+            linearized.toposort().into_iter().find(|u| matches!(u.op(), Op::Linear { .. })).expect("LINEAR present");
+        let renderer = svod_codegen::llvm::LlvmTextRenderer::amd(svod_dtype::AmdArch::Gfx942);
+        svod_codegen::traits::Renderer::render(&renderer, &linear_uop, Some("mma_unroll_probe")).expect("render").code
+    };
+    // Count mfma *call sites* — exclude the single (deduped) `declare` line.
+    let mfma =
+        |code: &str| code.lines().filter(|l| l.contains("mfma.f32.16x16x16bf16.1k") && !l.contains("declare")).count();
+    let (looped_mfma, unrolled_mfma) = (mfma(&render(build(false))), mfma(&render(build(true))));
+    // The flatness proof: unrolling renders all 8 MFMAs as distinct flat
+    // instructions (a rolled K/fragment loop cannot — it renders strictly fewer).
+    assert_eq!(unrolled_mfma, 8, "unrolled mma renders 8 flat mfma — no rolled K/fragment loop");
+    assert!(looped_mfma < 8, "looped mma keeps the K/fragment loops rolled ({looped_mfma} < 8 static mfma)");
+}
+
 /// Graph-shape check that a full matmul kernel builds a well-formed SINK with
 /// the expected number of `WMMA` ops (one per output fragment × K reduce, all
 /// symbolic ⇒ one node) and one global output store.

@@ -576,8 +576,8 @@ enum FaKind {
     /// FA-4 per-warp tile heights `(q_blk, kv_blk)` (grid dim1 `n/q_blk/8`).
     MwDb { pipelined: bool, q_blk: usize, kv_blk: usize },
     /// Rolled double-buffered multi-wave (one FaScratch set), per-warp tiles
-    /// `(q_blk, kv_blk)`.
-    Rdb { q_blk: usize, kv_blk: usize },
+    /// `(q_blk, kv_blk)`; `unroll` = fully-flat (unrolled) compute body.
+    Rdb { q_blk: usize, kv_blk: usize, unroll: bool },
 }
 
 /// Compile an FA launch of the requested [`FaKind`] over fresh random bf16
@@ -615,7 +615,7 @@ fn compile_fa_launch(b: usize, n: usize, h: usize, d: usize, kind: FaKind) -> (C
             FaKind::MwDb { pipelined, q_blk, kv_blk } => {
                 build_fa_mw_db(ker, b, n, h, h_kv, d, pipelined, q_blk, kv_blk)
             }
-            FaKind::Rdb { q_blk, kv_blk } => build_fa_mw_rdb(ker, b, n, h, h_kv, d, q_blk, kv_blk),
+            FaKind::Rdb { q_blk, kv_blk, unroll } => build_fa_mw_rdb(ker, b, n, h, h_kv, d, q_blk, kv_blk, unroll),
         }
         ker.finish(1)
     })
@@ -646,7 +646,7 @@ fn bench_fa_rdb_amd() {
             let r = std::panic::catch_unwind(AssertUnwindSafe(|| {
                 let flops = 2.0 * b as f64 * h as f64 * (n as f64).powi(2) * d as f64;
                 let (db, _od) = compile_fa_launch(b, n, h, d, FaKind::MwDb { pipelined: true, q_blk: 16, kv_blk: 16 });
-                let (rdb, _or) = compile_fa_launch(b, n, h, d, FaKind::Rdb { q_blk: 16, kv_blk: 16 });
+                let (rdb, _or) = compile_fa_launch(b, n, h, d, FaKind::Rdb { q_blk: 16, kv_blk: 16, unroll: false });
                 for _ in 0..5 {
                     // SAFETY: output buffers held by `_od`/`_or` for the launches' lifetime.
                     unsafe {
@@ -677,6 +677,66 @@ fn bench_fa_rdb_amd() {
     }
 }
 
+/// `SVOD_DEVICE=AMD:0 cargo test -p svod-tk --lib bench_fa_rdb_flat_amd -- --ignored --nocapture`
+///
+/// **P3 entry-gate measurement:** the rolled double-buffer FA with the
+/// *fully-unrolled* (flat) compute body vs the *rolled* (looped) compute body —
+/// both under the iglp delegation, same structure otherwise. Isolates the effect
+/// of flattening the QKᵀ/softmax/A·V into one schedulable region (more ILP for the
+/// backend) BEFORE adding the cross-tile pipeline. Interleaved per sample-pair.
+/// `flat/rolled = rolled_gpu / flat_gpu` (>1 ⇒ flat faster).
+#[test]
+#[ignore]
+fn bench_fa_rdb_flat_amd() {
+    let d = 64usize;
+    let shapes: &[(&str, usize, usize)] =
+        &[("B=1 H=2  (tiny)", 1, 2), ("B=1 H=16 (inference)", 1, 16), ("B=8 H=16 (occ-bound)", 8, 16)];
+    let ns: &[(usize, usize)] = &[(512, 60), (1024, 40), (2048, 25)];
+    println!("\n=== svod-tk FA rolled-db: FLAT (unrolled) vs ROLLED compute, both iglp — GPU device time, D={d} ===");
+    println!(
+        "causal useful FLOPs = 2·B·H·N²·D;  interleaved flat,rolled per sample.  flat/rolled = rolled_gpu/flat_gpu"
+    );
+    for &(label, b, h) in shapes {
+        println!("\n-- {label} --");
+        println!(
+            "{:>6} | {:>9} {:>9} | {:>9} {:>9} {:>8}",
+            "N", "flat µs", "flat TF", "roll µs", "roll TF", "flat/roll"
+        );
+        for &(n, iters) in ns {
+            let r = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                let flops = 2.0 * b as f64 * h as f64 * (n as f64).powi(2) * d as f64;
+                let (flat, _of) = compile_fa_launch(b, n, h, d, FaKind::Rdb { q_blk: 16, kv_blk: 16, unroll: true });
+                let (roll, _or) = compile_fa_launch(b, n, h, d, FaKind::Rdb { q_blk: 16, kv_blk: 16, unroll: false });
+                for _ in 0..5 {
+                    // SAFETY: output buffers held by `_of`/`_or` for the launches' lifetime.
+                    unsafe {
+                        flat.dispatch(true).expect("warm flat");
+                        roll.dispatch(true).expect("warm roll");
+                    }
+                }
+                let (mut gf, mut gr) = (Vec::with_capacity(iters), Vec::with_capacity(iters));
+                for _ in 0..iters {
+                    if let Some(ns) = flat.dispatch_gpu_ns().expect("flat gpu") {
+                        gf.push(ns as f64 / 1e3);
+                    }
+                    if let Some(ns) = roll.dispatch_gpu_ns().expect("roll gpu") {
+                        gr.push(ns as f64 / 1e3);
+                    }
+                }
+                (flops, median(&gf), median(&gr))
+            }));
+            match r {
+                Ok((flops, fu, ru)) => {
+                    let tf = |us: f64| if us > 0.0 { flops / (us / 1e6) / 1e12 } else { 0.0 };
+                    let sp = if fu > 0.0 && ru > 0.0 { ru / fu } else { 0.0 };
+                    println!("{n:>6} | {fu:9.2} {:9.2} | {ru:9.2} {:9.2} {sp:7.2}x", tf(fu), tf(ru));
+                }
+                Err(_) => println!("{n:>6} | SKIPPED (compile/dispatch failure)"),
+            }
+        }
+    }
+}
+
 /// `SVOD_DEVICE=AMD:0 cargo test -p svod-tk --lib bench_fa_rdb_tiles_amd -- --ignored --nocapture`
 ///
 /// Rolled double-buffer FA at the baseline `{16,16}` per-warp tile vs the bigger
@@ -698,8 +758,8 @@ fn bench_fa_rdb_tiles_amd() {
         for &(n, iters) in ns {
             let r = std::panic::catch_unwind(AssertUnwindSafe(|| {
                 let flops = 2.0 * b as f64 * h as f64 * (n as f64).powi(2) * d as f64;
-                let (t16, _o16) = compile_fa_launch(b, n, h, d, FaKind::Rdb { q_blk: 16, kv_blk: 16 });
-                let (t32, _o32) = compile_fa_launch(b, n, h, d, FaKind::Rdb { q_blk: 32, kv_blk: 32 });
+                let (t16, _o16) = compile_fa_launch(b, n, h, d, FaKind::Rdb { q_blk: 16, kv_blk: 16, unroll: false });
+                let (t32, _o32) = compile_fa_launch(b, n, h, d, FaKind::Rdb { q_blk: 32, kv_blk: 32, unroll: false });
                 for _ in 0..5 {
                     // SAFETY: output buffers held by `_o16`/`_o32` for the launches' lifetime.
                     unsafe {

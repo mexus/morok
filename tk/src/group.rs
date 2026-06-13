@@ -159,15 +159,49 @@ impl<'k> Group<'k> {
 
     // ── single-warp register ops ────────────────────────────────────────────
 
+    /// Anchor a constant-address unrolled **read** to the enclosing rolled
+    /// (tracked) loops, so loop-invariant code motion cannot hoist a read of a
+    /// loop-*carried* register out of the loop. The looped primitives dodge this
+    /// incidentally (their loop-variable index makes the read non-hoistable); the
+    /// unrolled bodies use constant indices, so a read of a carried accumulator
+    /// (`max_vec`, `o_reg`, …) would otherwise be lifted to the entry block and
+    /// see the *initial* value every iteration. A no-op when looped or when there
+    /// is no enclosing tracked loop. (Over-anchors genuinely loop-invariant
+    /// read-only tiles — harmless: a redundant ordering edge.)
+    pub(crate) fn anchor(&self, buf: &Arc<UOp>) -> Arc<UOp> {
+        let tracked = self.ker.tracked_ranges();
+        if self.ker.unrolled() && !tracked.is_empty() { buf.after(tracked) } else { buf.clone() }
+    }
+
+    /// Build a per-element register op body — one bare `STORE` per logical
+    /// element. Looped (the default): open a `Loop` `RANGE` per dim and close one
+    /// store around them. Fully **unrolled** (the kernel's [`Kernel::unrolled`]
+    /// flag): emit a bare store per element position, grouped into one node (no
+    /// `RANGE`), so the body renders flat for the FA scheduling comb. `store_at`
+    /// builds one element's `STORE` from its index tuple.
+    fn elementwise<F>(&self, shape: &[usize], store_at: F) -> Arc<UOp>
+    where
+        F: Fn(&[Idx]) -> Arc<UOp>,
+    {
+        if self.ker.unrolled() {
+            let stores: Vec<Arc<UOp>> = cartesian(shape).iter().map(|idxs| store_at(idxs)).collect();
+            if stores.len() == 1 { stores.into_iter().next().unwrap() } else { UOp::group(stores) }
+        } else {
+            let rngs: Vec<Arc<UOp>> = shape.iter().map(|&d| self.ker.raw_range(d as i64, AxisType::Loop)).collect();
+            let idxs: Vec<Idx> = rngs.iter().map(Idx::from).collect();
+            store_at(&idxs).end(SmallVec::from_vec(rngs))
+        }
+    }
+
     /// Fill a register tile with `value` (tinygrad `clear`).
     fn clear(&self, reg: RT<'k>, value: f64) -> RT<'k> {
         // Per-lane register fill: identical on every wave (each clears its own RT).
-        let rngs: Vec<Arc<UOp>> = reg.shape().iter().map(|&d| self.ker.raw_range(d as i64, AxisType::Loop)).collect();
-        let idxs: Vec<Idx> = rngs.iter().map(Idx::from).collect();
-        let cv = if reg.elem().is_float() { ConstValue::Float(value) } else { ConstValue::Int(value as i64) };
-        let val = UOp::const_(reg.elem().clone(), cv);
-        let store = flat_index(reg.uop(), reg.shape(), &idxs).store(val);
-        let ended = store.end(SmallVec::from_vec(rngs));
+        let (buf, shape, is_float, elem) =
+            (reg.uop().clone(), reg.shape().to_vec(), reg.elem().is_float(), reg.elem().clone());
+        let ended = self.elementwise(&shape.clone(), move |idxs| {
+            let cv = if is_float { ConstValue::Float(value) } else { ConstValue::Int(value as i64) };
+            flat_index(&buf, &shape, idxs).store(UOp::const_(elem.clone(), cv))
+        });
         self.finalize_reg(reg, ended)
     }
 
@@ -186,11 +220,12 @@ impl<'k> Group<'k> {
     /// Fill a register *vector* with `value` (the [`RV`] analog of [`clear`]).
     pub fn clear_rv(&self, rv: RV<'k>, value: f64) -> RV<'k> {
         assert_eq!(self.warps, 1, "clear_rv is a single-warp op");
-        let rngs: Vec<Arc<UOp>> = rv.shape().iter().map(|&d| self.ker.raw_range(d as i64, AxisType::Loop)).collect();
-        let idxs: Vec<Idx> = rngs.iter().map(Idx::from).collect();
-        let cv = if rv.elem().is_float() { ConstValue::Float(value) } else { ConstValue::Int(value as i64) };
-        let val = UOp::const_(rv.elem().clone(), cv);
-        let ended = flat_index(rv.uop(), rv.shape(), &idxs).store(val).end(SmallVec::from_vec(rngs));
+        let (buf, shape, is_float, elem) =
+            (rv.uop().clone(), rv.shape().to_vec(), rv.elem().is_float(), rv.elem().clone());
+        let ended = self.elementwise(&shape.clone(), move |idxs| {
+            let cv = if is_float { ConstValue::Float(value) } else { ConstValue::Int(value as i64) };
+            flat_index(&buf, &shape, idxs).store(UOp::const_(elem.clone(), cv))
+        });
         self.finalize_tile(rv, ended)
     }
     /// Zero a register vector.
@@ -211,14 +246,15 @@ impl<'k> Group<'k> {
     pub fn copy<T: RegTile<'k>>(&self, dst: T, src: &T) -> T {
         // Per-lane register op: wave-safe (each wave copies its own RT).
         assert_eq!(dst.shape(), src.shape(), "copy: shape mismatch");
-        let rngs: Vec<Arc<UOp>> = dst.shape().iter().map(|&d| self.ker.raw_range(d as i64, AxisType::Loop)).collect();
-        let idxs: Vec<Idx> = rngs.iter().map(Idx::from).collect();
-        let mut load = load_at(src.uop(), src.shape(), &idxs);
-        if src.elem() != dst.elem() {
-            load = load.cast(dst.elem().clone());
-        }
-        let store = flat_index(dst.uop(), dst.shape(), &idxs).store(load);
-        let ended = store.end(SmallVec::from_vec(rngs));
+        let (sbuf, sshape, selem) = (self.anchor(src.uop()), src.shape().to_vec(), src.elem().clone());
+        let (dbuf, dshape, delem) = (dst.uop().clone(), dst.shape().to_vec(), dst.elem().clone());
+        let ended = self.elementwise(&dshape.clone(), move |idxs| {
+            let mut load = load_at(&sbuf, &sshape, idxs);
+            if selem != delem {
+                load = load.cast(delem.clone());
+            }
+            flat_index(&dbuf, &dshape, idxs).store(load)
+        });
         self.finalize_tile(dst, ended)
     }
 
@@ -227,18 +263,17 @@ impl<'k> Group<'k> {
     /// Used by FA to swap a register fragment's height/width before a WMMA.
     pub fn transpose(&self, dst: RT<'k>, src: &RT<'k>) -> RT<'k> {
         // Per-lane register op: wave-safe (each wave transposes its own RT).
-        let n = src.shape().len();
-        let height = self.ker.raw_range(src.shape()[n - 3] as i64, AxisType::Loop);
-        let width = self.ker.raw_range(src.shape()[n - 2] as i64, AxisType::Loop);
-        let inner = self.ker.raw_range(src.shape()[n - 1] as i64, AxisType::Loop);
-        let mut load = load_at(src.uop(), src.shape(), &[Idx::from(&height), Idx::from(&width), Idx::from(&inner)]);
-        if src.elem() != dst.elem() {
-            load = load.cast(dst.elem().clone());
-        }
-        let store = flat_index(dst.uop(), dst.shape(), &[Idx::from(&width), Idx::from(&height), Idx::from(&inner)])
-            .store(load)
-            .end(smallvec![height, width, inner]);
-        self.finalize_reg(dst, store)
+        let (sbuf, sshape, selem) = (self.anchor(src.uop()), src.shape().to_vec(), src.elem().clone());
+        let (dbuf, dshape, delem) = (dst.uop().clone(), dst.shape().to_vec(), dst.elem().clone());
+        // Iterate the source `[height, width, inner]`; write `dst[width, height, inner]`.
+        let ended = self.elementwise(&sshape.clone(), move |idxs| {
+            let mut load = load_at(&sbuf, &sshape, idxs);
+            if selem != delem {
+                load = load.cast(delem.clone());
+            }
+            flat_index(&dbuf, &dshape, &[idxs[1].clone(), idxs[0].clone(), idxs[2].clone()]).store(load)
+        });
+        self.finalize_reg(dst, ended)
     }
 
     // ── elementwise map (tinygrad `Group.map`) ───────────────────────────────
@@ -253,11 +288,12 @@ impl<'k> Group<'k> {
         F: Fn(&Arc<UOp>, &[Idx]) -> Arc<UOp>,
     {
         // Per-lane register op: wave-safe (each wave maps its own RT).
-        let rngs: Vec<Arc<UOp>> = a.shape().iter().map(|&d| self.ker.raw_range(d as i64, AxisType::Loop)).collect();
-        let idxs: Vec<Idx> = rngs.iter().map(Idx::from).collect();
-        let val = load_at(a.uop(), a.shape(), &idxs);
-        let to_store = op(&val, &idxs);
-        let ended = flat_index(a.uop(), a.shape(), &idxs).store(to_store).end(SmallVec::from_vec(rngs));
+        let (buf, shape) = (a.uop().clone(), a.shape().to_vec());
+        let rbuf = self.anchor(&buf); // anchored read; store to the raw buffer
+        let ended = self.elementwise(&shape.clone(), move |idxs| {
+            let val = load_at(&rbuf, &shape, idxs);
+            flat_index(&buf, &shape, idxs).store(op(&val, idxs))
+        });
         self.finalize_tile(a, ended)
     }
 
@@ -327,6 +363,9 @@ impl<'k> Group<'k> {
         F: Fn(&Arc<UOp>, &Arc<UOp>) -> Arc<UOp>,
     {
         assert_eq!(self.warps, 1, "reduce is a single-warp op");
+        if self.ker.unrolled() {
+            return self.reduce_u(vec, src, op, init_value, outer_end, acc_end, row);
+        }
         let elem = src.elem().clone();
         let ept = src.shape()[src.shape().len() - 1] as i64;
         let red_reg = self.ker.alloc_reg(1, elem.clone());
@@ -383,6 +422,86 @@ impl<'k> Group<'k> {
         self.finalize_tile(vec, vec_store)
     }
 
+    /// Fully **unrolled** [`Self::reduce`]: the `outer`/`acc`/`inner` `RANGE`s
+    /// become Rust `for`s, so the in-lane fold and the cross-lane `ds_bpermute`
+    /// gather render loop-free (the softmax max/sum reduce must sit in the flat
+    /// region with the MFMAs for the attention comb). Bit-identical fold order to
+    /// the looped form.
+    #[allow(clippy::too_many_arguments)]
+    fn reduce_u<F>(
+        &self,
+        vec: RV<'k>,
+        src: &RT<'k>,
+        op: F,
+        init_value: f64,
+        outer_end: i64,
+        acc_end: i64,
+        row: bool,
+    ) -> RV<'k>
+    where
+        F: Fn(&Arc<UOp>, &Arc<UOp>) -> Arc<UOp>,
+    {
+        let elem = src.elem().clone();
+        let ept = src.shape()[src.shape().len() - 1] as i64;
+        let laneid = self.laneid();
+        let read0 = |buf: &Arc<UOp>| load_at(buf, &[1], &[Idx::Const(0)]);
+        // Anchor the `src` read so a constant-address read of a carried tile is
+        // not hoisted out of the enclosing rolled loop (see `Group::anchor`).
+        let src_buf = self.anchor(src.uop());
+
+        // Chain the per-`outer` vec stores so the LAST scopes them all under the
+        // enclosing (rolled KV) loop's `END`.
+        let mut vec_prev: Option<Arc<UOp>> = None;
+        for o in 0..outer_end {
+            // Fresh 1-element accumulator per `outer` (no cross-`outer` reuse, so
+            // the unrolled folds stay independent).
+            let red_reg = self.ker.alloc_reg(1, elem.clone());
+
+            // Re-init: anchor the init store inside the enclosing tracked (KV)
+            // loop, or — having only a constant input — it hoists above the rolled
+            // loop and the accumulator carries stale state across KV iterations
+            // (the looped form's `init_deps` invariant).
+            let init_buf = red_reg.after(self.ker.tracked_ranges());
+            let init_val = UOp::const_(elem.clone(), ConstValue::Float(init_value));
+            let mut latest = flat_index(&init_buf, &[1], &[Idx::Const(0)]).store(init_val);
+
+            // In-lane fold over (acc, inner): each step observes the prior store.
+            for a in 0..acc_end {
+                for i in 0..ept {
+                    let acc_read = read0(&red_reg.after(smallvec![latest.clone()]));
+                    let src_idx = if row {
+                        [Idx::Const(o), Idx::Const(a), Idx::Const(i)]
+                    } else {
+                        [Idx::Const(a), Idx::Const(o), Idx::Const(i)]
+                    };
+                    let src_v = load_at(&src_buf, src.shape(), &src_idx);
+                    latest = flat_index(&red_reg, &[1], &[Idx::Const(0)]).store(op(&acc_read, &src_v));
+                }
+            }
+
+            // Cross-lane fold via `ds_bpermute` (the same sibling 16-lane tree as
+            // the looped form): read this lane's partial once, gather L+{16,32,48}.
+            let partial = read0(&red_reg.after(smallvec![latest]));
+            let mut acc = partial.clone();
+            for d in [16i64, 32, 48] {
+                let src_lane = imod(&iadd(&laneid, &cidx(d)), self.group_threads as i64);
+                acc = op(&acc, &self.shuffle_lane(&partial, &src_lane));
+            }
+
+            // Fold into vec[o], carrying the incoming (running) vec state; chain
+            // across `outer` for loop scoping.
+            let vbuf = match &vec_prev {
+                Some(p) => vec.uop().after(smallvec![p.clone()]),
+                None => self.anchor(vec.uop()),
+            };
+            let vec_acc = load_at(&vbuf, vec.shape(), &[Idx::Const(o), Idx::Const(0)]);
+            let vstore = flat_index(vec.uop(), vec.shape(), &[Idx::Const(o), Idx::Const(0)]).store(op(&vec_acc, &acc));
+            vec_prev = Some(vstore);
+        }
+        let terminal = vec_prev.expect("reduce_u: at least one outer tile");
+        self.finalize_tile(vec, terminal)
+    }
+
     /// `C += A·B` over a tile (tinygrad `mma_AB`): for every output fragment
     /// `(height, width)` accumulate `WMMA(A[height,inner], B[inner,width])`
     /// across the reduce axis `inner`. One [`Op::Wmma`](svod_ir::Op::Wmma) per
@@ -414,6 +533,11 @@ impl<'k> Group<'k> {
     ///   `a.shape[-3]`; otherwise `a[height, inner]`, reduce axis `a.shape[-2]`.
     /// - `b_t` (Bᵀ): B is read `b[width, inner]`; otherwise `b[inner, width]`.
     fn mma(&self, c: RT<'k>, a: &RT<'k>, b: &RT<'k>, a_t: bool, b_t: bool) -> RT<'k> {
+        // Flat (cross-tile-pipeline) FA opts into the fully-unrolled body so the
+        // QKᵀ / A·V MFMAs render loop-free for the attention scheduling comb.
+        if self.ker.unrolled() {
+            return self.mma_u(c, a, b, a_t, b_t);
+        }
         // Wave-agnostic: each wave runs the WMMA on its own per-lane RT operands
         // (the wave sub-tile selection happens in the LDS→REG load, not here).
         let lanes: i64 = match a.base.base.cols {
@@ -475,6 +599,103 @@ impl<'k> Group<'k> {
             .collect();
         let c_store = UOp::group(c_i).end(smallvec![height, width, inner]);
         self.finalize_reg(c, c_store)
+    }
+
+    /// Fully **unrolled** [`Self::mma`]: emit one [`Op::Wmma`](svod_ir::Op::Wmma)
+    /// per `(height, width, k)` fragment via Rust `for` loops — **no inner
+    /// `RANGE`** — so the MFMAs render as a *flat* schedulable LLVM region the
+    /// attention scheduling comb can weave the online softmax through. tk's
+    /// direct-launch path skips the optimizer's `pre_expand`, so the looped
+    /// [`Self::mma`] stays rolled (three `loop_body_*` around the mfma); explicit
+    /// unroll is the only way to flatten it (route b — the cheap axis-flip is dead
+    /// on the direct path).
+    ///
+    /// Each fragment's K-accumulation chains (`c[h,w]`'s k-step read observes the
+    /// k−1 store); fragments chain into one terminal store so the enclosing rolled
+    /// KV loop's `END` scopes them all (cf. the matmul accumulator chain,
+    /// `kernels/matmul.rs:201`). Bit-identical accumulation order to [`Self::mma`].
+    fn mma_u(&self, c: RT<'k>, a: &RT<'k>, b: &RT<'k>, a_t: bool, b_t: bool) -> RT<'k> {
+        let lanes: i64 = match a.base.base.cols {
+            16 => 4,
+            other => unimplemented!("mma_u: base cols {other} not ported (gfx942 K=16 → 4 lanes)"),
+        };
+        let meta = wmma_16_16_16_bf16_f32();
+
+        let h_end = c.shape()[c.shape().len() - 3] as i64;
+        let w_end = c.shape()[c.shape().len() - 2] as i64;
+        let k_end = if a_t { a.shape()[a.shape().len() - 3] } else { a.shape()[a.shape().len() - 2] } as i64;
+
+        // Fragment-scoping chain: each fragment's first (k=0) accumulator read
+        // orders after the previous fragment's terminal store, so the LAST
+        // fragment's store transitively scopes them all under one loop `END`.
+        let mut prev_frag: Option<Arc<UOp>> = None;
+        for h in 0..h_end {
+            for w in 0..w_end {
+                // Per-fragment K accumulation: the k-step read observes the k−1
+                // store to this same fragment (the unrolled analog of the looped
+                // `c.after([inner])` loop-carry).
+                let mut frag_prev: Option<Arc<UOp>> = None;
+                for k in 0..k_end {
+                    let a_in = UOp::vectorize(
+                        (0..lanes)
+                            .map(|i| {
+                                let idx = if a_t {
+                                    [Idx::Const(k), Idx::Const(h), Idx::Const(i)]
+                                } else {
+                                    [Idx::Const(h), Idx::Const(k), Idx::Const(i)]
+                                };
+                                load_at(a.uop(), a.shape(), &idx)
+                            })
+                            .collect(),
+                    );
+                    let b_in = UOp::vectorize(
+                        (0..lanes)
+                            .map(|i| {
+                                let idx = if b_t {
+                                    [Idx::Const(w), Idx::Const(k), Idx::Const(i)]
+                                } else {
+                                    [Idx::Const(k), Idx::Const(w), Idx::Const(i)]
+                                };
+                                load_at(b.uop(), b.shape(), &idx)
+                            })
+                            .collect(),
+                    );
+                    // Accumulator source: the prior k-step's store for this
+                    // fragment; on k==0 the incoming `c` carrying the
+                    // fragment-scoping dep on the previous fragment's store.
+                    let mut deps: SmallVec<[Arc<UOp>; 4]> = SmallVec::new();
+                    match &frag_prev {
+                        Some(fp) => deps.push(fp.clone()),
+                        None => {
+                            if let Some(pf) = &prev_frag {
+                                deps.push(pf.clone());
+                            }
+                        }
+                    }
+                    // Anchor the incoming accumulator read (no chain dep yet) to the
+                    // enclosing rolled loop so a carried accumulator (`o_reg`) is not
+                    // hoisted out (see `Group::anchor`); subsequent k/fragment reads
+                    // chain through their stores, which are already loop-scoped.
+                    let c_src = if deps.is_empty() { self.anchor(c.uop()) } else { c.uop().after(deps) };
+                    let d_in = UOp::vectorize(
+                        (0..4)
+                            .map(|i| load_at(&c_src, c.shape(), &[Idx::Const(h), Idx::Const(w), Idx::Const(i)]))
+                            .collect(),
+                    );
+                    let out = UOp::wmma(a_in, b_in, d_in, meta.clone());
+                    let c_i: Vec<Arc<UOp>> = (0..4)
+                        .map(|i| {
+                            flat_index(c.uop(), c.shape(), &[Idx::Const(h), Idx::Const(w), Idx::Const(i)])
+                                .store(out.gep(vec![i as usize]))
+                        })
+                        .collect();
+                    frag_prev = Some(UOp::group(c_i));
+                }
+                prev_frag = frag_prev;
+            }
+        }
+        let terminal = prev_frag.expect("mma_u: at least one (height, width) fragment");
+        self.finalize_reg(c, terminal)
     }
 
     // ── load (tinygrad `Group.load`) ────────────────────────────────────────
@@ -1017,6 +1238,26 @@ fn st_index(st: &ST, idxs: &[Idx]) -> Arc<UOp> {
 fn st_load(st: &ST, idxs: &[Idx]) -> Arc<UOp> {
     let idx = st_index(st, idxs);
     UOp::load().buffer(st.uop().clone()).index(idx).call()
+}
+
+/// The row-major cartesian product of `0..d` for each `d` in `shape` — the
+/// constant index tuples an unrolled register op iterates (the analog of the
+/// nested `Loop` `RANGE`s it replaces).
+fn cartesian(shape: &[usize]) -> Vec<Vec<Idx>> {
+    let mut acc = vec![Vec::new()];
+    for &d in shape {
+        acc = acc
+            .into_iter()
+            .flat_map(|prefix| {
+                (0..d as i64).map(move |i| {
+                    let mut next = prefix.clone();
+                    next.push(Idx::Const(i));
+                    next
+                })
+            })
+            .collect();
+    }
+    acc
 }
 
 fn tag(t: &Tile<'_>) -> &'static str {

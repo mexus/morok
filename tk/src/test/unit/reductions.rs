@@ -166,3 +166,37 @@ fn test_softmax_amd() {
     println!("softmax N={n} block={block}: max abs error = {max_abs:e}");
     assert!(max_abs < 1e-4, "max abs error {max_abs} exceeds f32 softmax tolerance 1e-4");
 }
+
+/// P1 isolation (`SVOD_DEVICE=AMD:0 cargo test -p svod-tk --lib reductions::test_softmax_unroll_amd -- --ignored --nocapture`):
+/// the **fully-unrolled** softmax (reduce_u + unrolled map/copy, no mma/db) must
+/// match the reference — isolates the unrolled reduce/elementwise from the FA
+/// double-buffer + mma context. Swept across block sizes so `outer_end` varies
+/// (16 → 1 fragment, 32 → 2).
+#[test]
+#[ignore]
+fn test_softmax_unroll_amd() {
+    use svod_tensor::Tensor;
+
+    for (n, block) in [(64usize, 16usize), (64, 32)] {
+        let a = Tensor::rand(&[1, 1, block, n]).expect("rand a");
+        let mut a = a.cast(DType::Float32).expect("cast a");
+        a.realize().expect("realize a");
+        let mut out = Tensor::empty(&[1, 1, block, n], DType::Float32);
+
+        crate::run_kernel("softmax_u", [1, 1, 1], 64, &mut [&mut out], &[&a], |ker| {
+            ker.set_unroll(true);
+            build_softmax(ker, n, block);
+            ker.finish(1)
+        })
+        .expect("softmax_u launch");
+
+        let got = out.as_vec::<f32>().expect("read out");
+        let mut reference = a.softmax(3isize).expect("ref softmax");
+        reference.realize().expect("realize reference");
+        let expected = reference.as_vec::<f32>().expect("read reference");
+
+        let max_abs = got.iter().zip(&expected).map(|(g, e)| (g - e).abs()).fold(0.0f32, f32::max);
+        println!("softmax_u N={n} block={block}: max abs error = {max_abs:e}");
+        assert!(max_abs < 1e-4, "softmax_u N={n} block={block}: max abs error {max_abs} exceeds 1e-4");
+    }
+}

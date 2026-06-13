@@ -152,7 +152,7 @@ fn test_fa_mw_rdb_kernel_builds() {
     let block = 8 * 64;
     let ker =
         Kernel::new("fa_mw_rdb", [h as i64, (n / 16 / 8) as i64, b as i64], block, dummy_fa_buffers(b, n, h, h_kv, d));
-    build_fa_mw_rdb(&ker, b, n, h, h_kv, d, 16, 16);
+    build_fa_mw_rdb(&ker, b, n, h, h_kv, d, 16, 16, false);
     let sink = ker.finish(1);
 
     assert!(matches!(sink.op(), Op::Sink { .. }), "rolled-db FA finishes in a SINK");
@@ -188,26 +188,46 @@ fn test_fa_mw_rdb_kernel_builds() {
 fn test_fa_mw_rdb_renders_bounded() {
     let (b, h, h_kv, d) = (1usize, 2, 2, 64);
     let n = 128usize;
-    let ker =
-        Kernel::new("fa_mw_rdb", [h as i64, (n / 16 / 8) as i64, b as i64], 8 * 64, dummy_fa_buffers(b, n, h, h_kv, d));
-    build_fa_mw_rdb(&ker, b, n, h, h_kv, d, 16, 16);
-    let sink = ker.finish(1);
-    let lowered = svod_schedule::graph_rewrite(&svod_schedule::symbolic::pm_lower_index_dtype(), sink, &mut ());
-    let program = svod_codegen::program_pipeline::program_from_sink(lowered, svod_dtype::DeviceSpec::Cpu);
-    let linearized = svod_codegen::program_pipeline::do_linearize(&program).expect("do_linearize");
-    let linear_uop = linearized
-        .toposort()
-        .into_iter()
-        .find(|u| matches!(u.op(), svod_ir::Op::Linear { .. }))
-        .expect("LINEAR present");
-    let renderer = svod_codegen::llvm::LlvmTextRenderer::amd(svod_dtype::AmdArch::Gfx942);
-    // Returns (no OOM/hang) ⇒ the Mod-clamped prefetch index renders.
-    let code = svod_codegen::traits::Renderer::render(&renderer, &linear_uop, Some("fa_rdb")).expect("render").code;
+    let render = |unroll: bool| {
+        let ker = Kernel::new(
+            "fa_mw_rdb",
+            [h as i64, (n / 16 / 8) as i64, b as i64],
+            8 * 64,
+            dummy_fa_buffers(b, n, h, h_kv, d),
+        );
+        build_fa_mw_rdb(&ker, b, n, h, h_kv, d, 16, 16, unroll);
+        let sink = ker.finish(1);
+        let lowered = svod_schedule::graph_rewrite(&svod_schedule::symbolic::pm_lower_index_dtype(), sink, &mut ());
+        let program = svod_codegen::program_pipeline::program_from_sink(lowered, svod_dtype::DeviceSpec::Cpu);
+        let linearized = svod_codegen::program_pipeline::do_linearize(&program).expect("do_linearize");
+        let linear_uop = linearized
+            .toposort()
+            .into_iter()
+            .find(|u| matches!(u.op(), svod_ir::Op::Linear { .. }))
+            .expect("LINEAR present");
+        let renderer = svod_codegen::llvm::LlvmTextRenderer::amd(svod_dtype::AmdArch::Gfx942);
+        // Returns (no OOM/hang) ⇒ the Mod-clamped prefetch index renders.
+        svod_codegen::traits::Renderer::render(&renderer, &linear_uop, Some("fa_rdb")).expect("render").code
+    };
 
     // The attention marker lowers (Stage 1) to a single backend-delegated interleave
     // at the loop top (Stage 2 will swap this for the softmax/MFMA comb).
-    let count = |needle: &str| code.matches(needle).count();
-    assert_eq!(count("call void @llvm.amdgcn.iglp.opt(i32 0)"), 1, "marker lowered to one iglp delegation");
+    let rolled = render(false);
+    assert_eq!(
+        rolled.matches("call void @llvm.amdgcn.iglp.opt(i32 0)").count(),
+        1,
+        "marker lowered to one iglp delegation"
+    );
+
+    // Flatness (P1): with the unroll flag the QKᵀ (4 K-steps) and A·V (4 output
+    // fragments) MFMAs render as 8 distinct flat `mfma` call sites — the rolled
+    // form keeps them looped (strictly fewer). The exp2 online softmax likewise
+    // leaves the rolled loop bodies. This is the comb's prerequisite.
+    let mfma =
+        |code: &str| code.lines().filter(|l| l.contains("mfma.f32.16x16x16bf16.1k") && !l.contains("declare")).count();
+    let flat = render(true);
+    assert_eq!(mfma(&flat), 8, "unrolled FA slice renders 8 flat mfma (4 QKᵀ + 4 A·V)");
+    assert!(mfma(&rolled) < 8, "rolled FA slice keeps the QKᵀ/A·V loops ({} < 8 mfma)", mfma(&rolled));
 }
 
 // =============================================================================
@@ -255,8 +275,9 @@ enum FaPath {
     /// per-warp tile heights `(q_blk, kv_blk)`.
     MwDb { pipelined: bool, q_blk: usize, kv_blk: usize },
     /// Rolled double-buffered multi-wave ([`crate::kernels::fa::build_fa_mw_rdb`]),
-    /// with the per-warp tile heights `(q_blk, kv_blk)`.
-    Rdb { q_blk: usize, kv_blk: usize },
+    /// with the per-warp tile heights `(q_blk, kv_blk)`; `unroll` toggles the
+    /// fully-unrolled (flat) compute body.
+    Rdb { q_blk: usize, kv_blk: usize, unroll: bool },
 }
 
 /// `SVOD_DEVICE=AMD:0 cargo test -p svod-tk --lib fa::test_fa_mw_db_amd -- --ignored --nocapture`.
@@ -303,11 +324,29 @@ fn test_fa_mw_db_tiled_amd() {
 #[ignore]
 fn test_fa_mw_rdb_amd() {
     for n in [128usize, 512, 1024, 2048] {
-        run_fa_amd_case(1, n, 2, 64, FaPath::Rdb { q_blk: 16, kv_blk: 16 });
+        run_fa_amd_case(1, n, 2, 64, FaPath::Rdb { q_blk: 16, kv_blk: 16, unroll: false });
     }
-    run_fa_amd_case(2, 256, 4, 64, FaPath::Rdb { q_blk: 16, kv_blk: 16 });
+    run_fa_amd_case(2, 256, 4, 64, FaPath::Rdb { q_blk: 16, kv_blk: 16, unroll: false });
     for n in [512usize, 1024, 2048] {
-        run_fa_amd_case(1, n, 2, 64, FaPath::Rdb { q_blk: 32, kv_blk: 32 });
+        run_fa_amd_case(1, n, 2, 64, FaPath::Rdb { q_blk: 32, kv_blk: 32, unroll: false });
+    }
+}
+
+/// `SVOD_DEVICE=AMD:0 cargo test -p svod-tk --lib fa::test_fa_mw_rdb_unroll_amd -- --ignored --nocapture`.
+///
+/// P1 in-situ bit-exactness: the **fully-unrolled** rolled-db FA (same structure,
+/// flat QKᵀ/softmax/A·V compute) must match causal SDPA — validating `mma_u` /
+/// `reduce_u` / the unrolled `map`/`copy`/`transpose` against the looped forms
+/// before the cross-tile-pipeline restructure builds on them.
+#[test]
+#[ignore]
+fn test_fa_mw_rdb_unroll_amd() {
+    for n in [128usize, 512, 1024, 2048] {
+        run_fa_amd_case(1, n, 2, 64, FaPath::Rdb { q_blk: 16, kv_blk: 16, unroll: true });
+    }
+    run_fa_amd_case(2, 256, 4, 64, FaPath::Rdb { q_blk: 16, kv_blk: 16, unroll: true });
+    for n in [512usize, 1024, 2048] {
+        run_fa_amd_case(1, n, 2, 64, FaPath::Rdb { q_blk: 32, kv_blk: 32, unroll: true });
     }
 }
 
@@ -336,10 +375,10 @@ fn run_fa_amd_case(b: usize, n: usize, h: usize, d: usize, path: FaPath) {
             })
             .expect("fa_mw_db tiled launch")
         }
-        FaPath::Rdb { q_blk, kv_blk } => {
+        FaPath::Rdb { q_blk, kv_blk, unroll } => {
             let grid = [h as i64, (n / q_blk / 8) as i64, b as i64];
             crate::run_kernel("fa_mw_rdb", grid, 8 * 64, &mut [&mut o], &[&q, &k, &v], |ker| {
-                crate::kernels::fa::build_fa_mw_rdb(ker, b, n, h, h_kv, d, q_blk, kv_blk);
+                crate::kernels::fa::build_fa_mw_rdb(ker, b, n, h, h_kv, d, q_blk, kv_blk, unroll);
                 ker.finish(1)
             })
             .expect("fa_mw_rdb tiled launch")
@@ -372,7 +411,9 @@ fn run_fa_amd_case(b: usize, n: usize, h: usize, d: usize, path: FaPath) {
         FaPath::MwDb { pipelined, q_blk, kv_blk } => {
             format!("mw_db[{},{}x{}]", if pipelined { "pipe" } else { "naive" }, q_blk, kv_blk)
         }
-        FaPath::Rdb { q_blk, kv_blk } => format!("mw_rdb[{q_blk}x{kv_blk}]"),
+        FaPath::Rdb { q_blk, kv_blk, unroll } => {
+            format!("mw_rdb[{}{q_blk}x{kv_blk}]", if unroll { "u," } else { "" })
+        }
     };
     println!("fa[{label}] B={b} N={n} H={h} D={d}: max abs error = {max_abs:e}");
     assert!(worst <= atol, "FA exceeds atol+rtol*|e| (max abs {max_abs:e}, tol {atol}+{rtol}*|e|)");
