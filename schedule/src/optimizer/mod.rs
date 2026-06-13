@@ -606,6 +606,31 @@ pub fn optimize_kernel_with_config(
     // apply exactly those opts (an empty list applies none), never heuristics.
     let explicit_opts = kernel_opts_to_apply(&ast);
 
+    // A SINK that carries an *empty* explicit opt list AND already contains
+    // `Op::Special` (gidx/lidx) ops is a *fully hand-lowered* GPU kernel — a
+    // svod-tk tile kernel routed through `custom_kernel` (the direct-launch
+    // `tk/src/launch.rs::compile` analog). It already has its global/local dims,
+    // manual ranges, explicit `VECTORIZE`d WMMA operands, LDS + barriers, and is
+    // lane-distributed. Running the kernel optimizer over it is not a no-op: the
+    // UNROLL-expander (`pre_expand`) broadcasts a scalar GLOBAL `Ptr` operand of
+    // a hand-built wide LOAD into an illegal vector-of-pointers (`do_expand`
+    // Case 4, `expand.rs`), which the devectorizer cannot fully fold, tripping
+    // the VECTORIZE spec check. Mirror the direct path exactly: lower only the
+    // `Index`-typed addressing to a concrete int width and skip every optimizer
+    // stage. Mirrors `gpudims.rs`'s existing "Specials present ⇒ skip" guard.
+    let hand_lowered = matches!(explicit_opts.as_deref(), Some([]))
+        && ast.toposort().iter().any(|u| matches!(u.op(), svod_ir::Op::Special { .. }));
+    if hand_lowered {
+        // `graph_rewrite` drops node metadata; re-attach the SINK's `KernelInfo`
+        // (kernel name / opts) so downstream caching + naming still resolve it.
+        let saved_metadata = ast.metadata_raw();
+        let lowered = graph_rewrite(&crate::symbolic::pm_lower_index_dtype(), ast, &mut ());
+        return match saved_metadata {
+            Some(meta) => lowered.with_metadata_raw(meta),
+            None => lowered,
+        };
+    }
+
     // Pre-optimization: per-kernel stages. Kept ON for the explicit-opts path
     // for parity with `OptStrategy::None` (which also keeps it).
     let pre_optimized = apply_pre_optimization(ast);
