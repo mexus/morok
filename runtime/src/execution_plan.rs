@@ -350,6 +350,16 @@ impl ExecutionPlan {
         let all_static_kernels =
             self.ops.iter().all(|op| matches!(op, PreparedOp::CompiledProgram(k) if k.runtime_vars.is_empty()));
         if !all_static_kernels || self.ops.is_empty() {
+            tracing::debug!(
+                target: "svod_runtime::graph",
+                ops = self.ops.len(),
+                compiled = self.ops.iter().filter(|o| matches!(o, PreparedOp::CompiledProgram(_))).count(),
+                with_runtime_vars =
+                    self.ops.iter().filter(|o| matches!(o, PreparedOp::CompiledProgram(k) if !k.runtime_vars.is_empty())).count(),
+                custom = self.ops.iter().filter(|o| matches!(o, PreparedOp::CustomFunction(_))).count(),
+                copies = self.ops.iter().filter(|o| matches!(o, PreparedOp::BufferCopy(_) | PreparedOp::BufferView(_))).count(),
+                "graph: per-call fallback (not all-static-compiled)"
+            );
             return Ok(None);
         }
         let dev = crate::device_registry::DEVICE_FACTORIES
@@ -436,7 +446,10 @@ impl ExecutionPlan {
                 });
             }
         }
-        factory(&kernels).map_err(|e| crate::error::Error::Execution { reason: format!("graph capture: {e}") })
+        let result =
+            factory(&kernels).map_err(|e| crate::error::Error::Execution { reason: format!("graph capture: {e}") })?;
+        tracing::debug!(target: "svod_runtime::graph", kernels = kernels.len(), captured = result.is_some(), "graph: capture result");
+        Ok(result)
     }
 
     /// Lazily mint (once) the plan's execution context from `program` and cache

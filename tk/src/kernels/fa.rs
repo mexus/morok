@@ -1238,14 +1238,13 @@ pub fn flash_attention_with(q: &Tensor, k: &Tensor, v: &Tensor, opts: FaOpts) ->
         });
     }
 
-    // Fallback: scheduler SDPA on f32, mirroring the kernel's key-only masking.
-    // Each fallible step `?`s through `.context(FallbackSnafu)` (which boxes the
-    // large `svod_tensor` error) so no closure ever carries the un-boxed error.
+    // Fallback: scheduler SDPA in the inputs' NATIVE dtype (f16/bf16), mirroring the
+    // kernel's key-only masking — matching what the model's native attention runs, so
+    // the QKᵀ/PV use the fast WMMA path (a prior f32 cast forced slow `v_mfma_f32` +
+    // extra copies). Each fallible step `?`s through `.context(FallbackSnafu)` (which
+    // boxes the large `svod_tensor` error) so no closure ever carries the un-boxed error.
     let fb = crate::launch::FallbackSnafu;
-    let perm = |t: &Tensor| -> crate::LaunchResult<Tensor> {
-        let f = t.cast(DType::Float32).context(fb)?;
-        f.try_permute(&[0, 2, 1, 3]).context(fb)
-    };
+    let perm = |t: &Tensor| -> crate::LaunchResult<Tensor> { t.try_permute(&[0, 2, 1, 3]).context(fb) };
     let (qp, kp, vp) = (perm(q)?, perm(k)?, perm(v)?);
     // [B,1,1,N] bool key mask: true (masked) where arange(N) >= key_lens[batch],
     // matching the kernel's `kv_pos >= lens[batch]`.
