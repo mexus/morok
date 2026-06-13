@@ -42,6 +42,8 @@ fn find_assign_identity(target: &Arc<UOp>, base: &Arc<UOp>) -> Arc<UOp> {
 }
 
 pub mod error;
+#[macro_use]
+mod macros;
 use error::*;
 
 pub mod activation;
@@ -570,6 +572,29 @@ impl Tensor {
 
         let outputs = UOp::custom_kernel(srcs, fxn, info).context(UOpSnafu)?;
         Ok(outputs.into_iter().map(Self::from_lazy).collect())
+    }
+
+    /// Build a hand-written kernel as a **graph node** — the generic
+    /// `custom_kernel` → `Op::Call` wrapper for any author-supplied SINK builder
+    /// (the svod-tk tile DSL is one client; a raw UOp builder is another). Unlike a
+    /// direct launch it returns a *lazy* output [`Tensor`] the scheduler realizes
+    /// (and the JIT graph captures) like any other op, so a hand kernel composes
+    /// into a model and benchmarks through the normal `prepare()` path.
+    ///
+    /// `out` is the output template (e.g. [`Tensor::empty`]); `ins` are the inputs.
+    /// `build` receives the PARAM placeholders in `[out, ins...]` order and returns
+    /// the kernel body SINK — it must emit its own `Op::Special` launch dims and a
+    /// finished-kernel marker (`KernelInfo.opts_to_apply = Some(_)`) so the
+    /// optimizer leaves the hand-lowered body alone. Returns the single lazy output.
+    pub fn graph_kernel<F>(name: &str, out: Tensor, ins: &[&Tensor], build: F) -> Result<Tensor>
+    where
+        F: FnOnce(Vec<Arc<UOp>>) -> Arc<UOp>,
+    {
+        let info = CallInfo { name: Some(name.to_string()), ..CallInfo::default() };
+        let outputs = out.custom_kernel_with(ins, info, build)?;
+        // `custom_kernel` returns one output per source in `[out, ins...]` order;
+        // slot 0 is the kernel's output (`custom_kernel_with` always pushes `out`).
+        Ok(outputs.into_iter().next().expect("custom_kernel returns the output tensor"))
     }
 
     /// Bitcast tensor to a different dtype, reinterpreting bits.
