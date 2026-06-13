@@ -28,6 +28,7 @@ pub struct Kernel {
     globals: Vec<Arc<UOp>>,
     global_slot: Cell<usize>,
     shared_slot: Cell<usize>,
+    reg_slot: Cell<usize>,
     range_id: Cell<usize>,
 
     /// Tracked ranges, closed together by [`Kernel::finish`] / [`Kernel::endrange`].
@@ -66,6 +67,7 @@ impl Kernel {
             globals,
             global_slot: Cell::new(0),
             shared_slot: Cell::new(0),
+            reg_slot: Cell::new(0),
             range_id: Cell::new(0),
             range_stack: RefCell::new(Vec::new()),
             store_stack: RefCell::new(Vec::new()),
@@ -153,9 +155,16 @@ impl Kernel {
         UOp::define_local(slot, elem.ptr(Some(flat_size), AddrSpace::Local))
     }
 
-    /// Allocate register (per-lane) memory (auto-unique id).
+    /// Allocate register (per-lane) memory. The id is a per-kernel monotonic slot
+    /// (NOT a global counter): structurally-identical kernels (e.g. the same FA
+    /// kernel built once per transformer layer) allocate regs in the same order →
+    /// identical `DefineReg` ids → one content hash → a single compile, instead of
+    /// recompiling per instance (tinygrad parity: `DEFINE_REG` arg is a per-kernel
+    /// slot). The renderer renumbers regs locally, so the id is identity-only.
     pub fn alloc_reg(&self, flat_size: usize, elem: DType) -> Arc<UOp> {
-        UOp::define_reg_typed(flat_size, elem)
+        let id = self.reg_slot.get();
+        self.reg_slot.set(id + 1);
+        UOp::define_reg_typed_with_id(flat_size, elem, id)
     }
 
     /// Hand out the next global buffer placeholder (a flat 1-D `Param`) as a GL

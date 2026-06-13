@@ -298,8 +298,18 @@ impl UOp {
     /// Creates a typed register accumulator for use in reductions.
     /// The element_dtype specifies the type of each element (e.g., Float32 for a float accumulator).
     pub fn define_reg_typed(size: usize, element_dtype: DType) -> Arc<Self> {
-        use svod_dtype::AddrSpace;
         let id = crate::uop::hash_consing::next_unique_id();
+        Self::define_reg_typed_with_id(size, element_dtype, id)
+    }
+
+    /// Like [`Self::define_reg_typed`] but with a caller-supplied `id`. Hand-built
+    /// kernels pass a **per-kernel-deterministic** slot (not the global
+    /// `next_unique_id()`), so structurally-identical kernels produce identical
+    /// `DefineReg` content hashes and dedup to a single compile (tinygrad parity:
+    /// `DEFINE_REG` arg is a per-kernel slot). The id is identity-only — the
+    /// renderer renumbers registers locally.
+    pub fn define_reg_typed_with_id(size: usize, element_dtype: DType, id: usize) -> Arc<Self> {
+        use svod_dtype::AddrSpace;
         let ptr_dtype =
             DType::Ptr { base: Box::new(element_dtype), addrspace: AddrSpace::Reg, size: Some(size), vcount: 1 };
         Self::new(Op::DefineReg { size, id }, ptr_dtype)
