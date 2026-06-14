@@ -56,16 +56,21 @@ pub struct STBaseShape {
 }
 
 /// Register-tile base fragment: a [`BaseShape`] plus the per-lane fragment
-/// `stride` (the lane-group step in `lane_rc`) and an `interleave` flag. gfx942
-/// spreads K across lane-groups (stride = ept); RDNA holds all K in one lane
-/// (`stride = 0` for the replicated inputs). `interleave` selects the RDNA WMMA
-/// f32 accumulator's even/odd row map (`m = 2·j + lane/16`), which no `stride`
-/// can express (see `lane_rc`).
+/// `stride` (the lane-group step in `lane_rc`) and the `interleave`/`interleave_t`
+/// flags. gfx942 spreads K across lane-groups (stride = ept); RDNA holds all K in
+/// one lane (`stride = 0` for the replicated inputs). `interleave` selects the
+/// RDNA WMMA f32 accumulator's even/odd row map (`m = 2·j + lane/16, n = lane%16`),
+/// which no `stride` can express; `interleave_t` is its **transpose**
+/// (`row = lane%16, col = 2·j + lane/16`) — the layout for storing an RDNA
+/// accumulator to memory along the transposed (N-major) axis, e.g. the FA output
+/// tile `O[q,d]` from the `[d,q]` PV accumulator (see `lane_rc`). At most one of
+/// the two is set.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct RTBaseShape {
     pub base: BaseShape,
     pub stride: usize,
     pub interleave: bool,
+    pub interleave_t: bool,
 }
 
 impl RTBaseShape {
@@ -97,13 +102,13 @@ pub const ST_32X16: STBaseShape =
 
 // Predefined register-tile base shapes.
 pub const RT_16X16: RTBaseShape =
-    RTBaseShape { base: BaseShape { rows: 16, cols: 16, ept: 4 }, stride: 4, interleave: false };
+    RTBaseShape { base: BaseShape { rows: 16, cols: 16, ept: 4 }, stride: 4, interleave: false, interleave_t: false };
 pub const RT_32X32: RTBaseShape =
-    RTBaseShape { base: BaseShape { rows: 32, cols: 32, ept: 16 }, stride: 4, interleave: false };
+    RTBaseShape { base: BaseShape { rows: 32, cols: 32, ept: 16 }, stride: 4, interleave: false, interleave_t: false };
 pub const RT_16X32: RTBaseShape =
-    RTBaseShape { base: BaseShape { rows: 16, cols: 32, ept: 8 }, stride: 8, interleave: false };
+    RTBaseShape { base: BaseShape { rows: 16, cols: 32, ept: 8 }, stride: 8, interleave: false, interleave_t: false };
 pub const RT_32X16: RTBaseShape =
-    RTBaseShape { base: BaseShape { rows: 32, cols: 16, ept: 8 }, stride: 8, interleave: false };
+    RTBaseShape { base: BaseShape { rows: 32, cols: 16, ept: 8 }, stride: 8, interleave: false, interleave_t: false };
 
 // ── RDNA (gfx11, wave32) base shapes — for the gfx1151 WMMA matmul ────────────
 //
@@ -119,7 +124,14 @@ pub const ST_16X16_SWIZZLED_W32: STBaseShape =
 /// wave32 WMMA f32 accumulator fragment: even/odd row interleave (`interleave`).
 /// `stride` is unused (the interleave map ignores it).
 pub const RT_16X16_W32_ACC: RTBaseShape =
-    RTBaseShape { base: BaseShape { rows: 16, cols: 16, ept: 8 }, stride: 1, interleave: true };
+    RTBaseShape { base: BaseShape { rows: 16, cols: 16, ept: 8 }, stride: 1, interleave: true, interleave_t: false };
 /// wave32 WMMA input fragment: 16 K/lane, replicated across the two wave-halves.
 pub const RT_16X16_W32_IN: RTBaseShape =
-    RTBaseShape { base: BaseShape { rows: 16, cols: 16, ept: 16 }, stride: 0, interleave: false };
+    RTBaseShape { base: BaseShape { rows: 16, cols: 16, ept: 16 }, stride: 0, interleave: false, interleave_t: false };
+/// wave32 WMMA f32 accumulator, **transposed** for an N-major memory store
+/// (`interleave_t`): `row = lane%16, col = 2·j + lane/16`. Used for the FA output
+/// tile (`o_reg_t`, `O[q,d]`) — the transpose of the `[d,q]` PV accumulator
+/// ([`RT_16X16_W32_ACC`]). gfx942 reaches the same transposed store through the
+/// plain stride map, so this is RDNA-only.
+pub const RT_16X16_W32_ACC_T: RTBaseShape =
+    RTBaseShape { base: BaseShape { rows: 16, cols: 16, ept: 8 }, stride: 1, interleave: false, interleave_t: true };

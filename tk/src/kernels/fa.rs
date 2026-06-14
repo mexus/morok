@@ -16,10 +16,14 @@ use svod_ir::{ConstValue, UOp};
 use svod_tensor::Tensor;
 
 use crate::Group;
+use crate::group::lane_rc;
 use crate::index::{Idx, load_at};
 use crate::kernel::Kernel;
 use crate::tile::{RT, RV, RegTile, ST};
-use crate::tiles::{RT_16X16, ST_16X16, TileLayout, VecLayout};
+use crate::tiles::{
+    RT_16X16, RT_16X16_W32_ACC, RT_16X16_W32_ACC_T, RT_16X16_W32_IN, RTBaseShape, ST_16X16, ST_16X16_SWIZZLED_W32,
+    STBaseShape, TileLayout, VecLayout,
+};
 
 /// The WMMA tile edge (gfx942 K=16). The QKᵀ / A·V WMMAs always operate on
 /// 16×16 fragments; Q/KV per-warp *tiles* are grids of `BLK`-edged fragments
@@ -44,16 +48,25 @@ fn iconst(v: i64) -> Arc<UOp> {
     UOp::const_(DType::Index, ConstValue::Int(v))
 }
 
-/// The GPU arch(es) the flash-attention kernels are built for. They use the gfx942
-/// WMMA descriptor (`mfma.f32.16x16x16bf16.1k`) + 64-lane `ds.bpermute`, so only
-/// gfx942 today. Adding another GPU (e.g. gfx1151) means adding its arch here once
-/// its arch-specific kernel bits exist — the launchers gate against this list, the
-/// generic launch infra stays arch-agnostic.
-pub const FA_SUPPORTED_ARCHS: &[svod_dtype::AmdArch] = &[svod_dtype::AmdArch::Gfx942];
+/// The GPU arch(es) the **production graph** flash-attention ([`flash_attention_with`]
+/// → [`build_fa_mw_rdb`]) is built for: gfx942 (CDNA MFMA, wave64) and gfx1151
+/// (RDNA3.5 WMMA, wave32). The rolled double-buffer builder arch-selects the WMMA
+/// fragment shapes (`_W32_*`), the accumulator→input relayout (an LDS round-trip on
+/// RDNA, a register copy on CDNA), and the even/odd-aware mask geometry; the launch
+/// block tracks the real wave width. The launcher gates against this list, the
+/// generic launch infra stays arch-agnostic. (gfx1151 is pending hardware
+/// validation — a wrong fragment map shows as a permuted/garbage output.)
+pub const FA_SUPPORTED_ARCHS: &[svod_dtype::AmdArch] = &[svod_dtype::AmdArch::Gfx942, svod_dtype::AmdArch::Gfx1151];
 
-/// Validate the kernel inputs' device against [`FA_SUPPORTED_ARCHS`] + LLVM toolchain.
+/// The **direct-launch** FA wrappers ([`flash_attention_forward`], `_mw`, `_mw_db`,
+/// `_mw_rdb`) hardcode the wave64 block size and the CDNA fragment tiles, so they
+/// stay gfx942-only — gfx1151 reaches the wave32 kernel only through the
+/// wave-width-aware [`flash_attention_with`] graph entry.
+const FA_DIRECT_SUPPORTED_ARCHS: &[svod_dtype::AmdArch] = &[svod_dtype::AmdArch::Gfx942];
+
+/// Validate a direct-launch wrapper's device against [`FA_DIRECT_SUPPORTED_ARCHS`].
 fn fa_check_target(t: &Tensor) -> crate::LaunchResult<()> {
-    crate::target::check_target(&t.device(), FA_SUPPORTED_ARCHS)
+    crate::target::check_target(&t.device(), FA_DIRECT_SUPPORTED_ARCHS)
 }
 
 /// Tuning knobs for the multi-wave flash-attention builders ([`build_fa_mw_db`],
@@ -421,6 +434,12 @@ struct FaScratch<'k> {
     att_mma: RT<'k>,
     scale_vec: RV<'k>,
     max_vec_last: RV<'k>,
+    /// RDNA-only per-warp LDS scratch (`[NUM_WARPS·kv_blk, q_blk]`) for the
+    /// `att → att_mma` accumulator→input relayout. `None` on gfx942, where the
+    /// accumulator and WMMA-input fragment layouts coincide so a register `copy`
+    /// suffices; `Some` on gfx11, where they differ and the relayout must round-trip
+    /// through LDS (store the even/odd accumulator, reload as the replicated input).
+    att_smem: Option<ST<'k>>,
 }
 
 /// Fill one slice's K/V LDS buffers. `pipelined = false` (stage 1) uses the
@@ -473,6 +492,7 @@ fn fa_kv_slice<'k>(
     v_smem: ST<'k>,
     q_reg_t: &RT<'k>,
     q_blk: &Arc<UOp>,
+    warpid: &Arc<UOp>,
     slice_idx: &Arc<UOp>,
     q_blk_rows: usize,
     kv_blk_rows: usize,
@@ -482,7 +502,7 @@ fn fa_kv_slice<'k>(
     causal: bool,
     valid_len: Option<Arc<UOp>>,
 ) -> FaAcc<'k> {
-    let FaScratch { k_reg, k_reg_t, v_reg, att, att_mma, scale_vec, max_vec_last } = sc;
+    let FaScratch { k_reg, k_reg_t, v_reg, att, att_mma, scale_vec, max_vec_last, att_smem } = sc;
     let (att, v_reg) = fa_qk(
         warp,
         ker,
@@ -503,7 +523,7 @@ fn fa_kv_slice<'k>(
         causal,
         valid_len,
     );
-    fa_softmax_pv(warp, acc, att_mma, scale_vec, max_vec_last, att, &v_reg, reinit_dep)
+    fa_softmax_pv(warp, acc, att_mma, att_smem, warpid, scale_vec, max_vec_last, att, &v_reg, reinit_dep)
 }
 
 /// Stage 1 of a KV slice — `QKᵀ`: gather this warp's K/V fragments from the
@@ -557,22 +577,24 @@ fn fa_qk<'k>(
 
     // Score masking: drop keys ahead of this warp's own query rows (causal → -∞)
     // and/or keys at/after the per-batch valid length (padding mask → -∞). The
-    // per-fragment offsets stay at the WMMA edge (`*16`/`/16`) with the per-lane
-    // row stride from `caps.frag_row_stride()` (= 256/wave_size: 4 on wave64);
-    // only the tile *base* scales with the per-warp Q/KV tile heights
-    // (`q_blk_rows`, `kv_blk_rows`), so the mask generalizes from 16×16 to T×T
-    // (and asymmetric) with no change to the within-fragment derivation. With
-    // neither knob set, the map is skipped entirely (full bidirectional attention).
+    // within-fragment `(kv, q)` per `(lane, element)` is read straight off the att
+    // accumulator's OWN fragment map via `lane_rc` — arch-correct for both the
+    // gfx942 contiguous stride (`kv = (lane/16)*4 + i`) and the gfx11 even/odd
+    // interleave (`kv = 2i + lane/16`), so there is no hardcoded `frag_row_stride`
+    // (its `(lane/16)*8` form is wrong for the interleave). att is `(kv = row = M,
+    // q = col = N)`; the Col tile's store map is the transpose of its load map, so
+    // `transpose = (layout == Col)` yields the accumulator `(M, N)` coords. The
+    // per-fragment `*16` and per-tile `*{q,kv}_blk_rows` offsets scale 16×16 → T×T
+    // (and asymmetric) unchanged. With neither knob set the map is skipped entirely.
     let att = if causal || valid_len.is_some() {
         let laneid = ker.laneid();
-        let q_base = laneid.mod_(&iconst(16)).add(&q_blk.mul(&iconst(q_blk_rows as i64)));
-        let kv_base = laneid
-            .idiv(&iconst(16))
-            .mul(&iconst(ker.caps.frag_row_stride()))
-            .add(&slice_idx.mul(&iconst(kv_blk_rows as i64)));
+        let (interleave, interleave_t, stride) = (att.base.interleave, att.base.interleave_t, att.base.stride as i64);
+        let transpose = att.layout == TileLayout::Col;
+        let (q_blk, slice_idx) = (q_blk.clone(), slice_idx.clone());
         warp.map(att, move |x, idx| {
-            let kv_pos = kv_base.add(&idx[0].to_uop().mul(&iconst(16))).add(&idx[2].to_uop());
-            let q_pos = q_base.add(&idx[1].to_uop().mul(&iconst(16)));
+            let (kv_if, q_if) = lane_rc(transpose, interleave, interleave_t, &laneid, 16, 16, stride, &idx[2].to_uop());
+            let kv_pos = slice_idx.mul(&iconst(kv_blk_rows as i64)).add(&idx[0].to_uop().mul(&iconst(16))).add(&kv_if);
+            let q_pos = q_blk.mul(&iconst(q_blk_rows as i64)).add(&idx[1].to_uop().mul(&iconst(16))).add(&q_if);
             let neg_inf = UOp::const_(x.dtype(), ConstValue::Float(f64::NEG_INFINITY));
             let mut out = x.clone();
             if causal {
@@ -605,6 +627,8 @@ fn fa_softmax_pv<'k>(
     warp: &Group<'k>,
     acc: FaAcc<'k>,
     att_mma: RT<'k>,
+    att_smem: Option<ST<'k>>,
+    warpid: &Arc<UOp>,
     scale_vec: RV<'k>,
     max_vec_last: RV<'k>,
     att: RT<'k>,
@@ -633,8 +657,28 @@ fn fa_softmax_pv<'k>(
 
     norm_vec = warp.col_reduce(norm_vec.after(smallvec![scale_vec.uop().clone()]), &att, |a, b| a.add(b), 0.0);
 
-    // A·V accumulation.
-    let att_mma = warp.copy(att_mma.after(smallvec![reinit_dep.clone(), norm_vec.uop().clone()]), &att);
+    // Relayout the softmax weights `att` (the QKᵀ f32 accumulator) into the WMMA
+    // input `att_mma` for the A·V matmul. On gfx942 the MFMA accumulator and input
+    // fragments share a layout, so a register `copy` (with the f32→in-dtype cast)
+    // suffices. On gfx11 they differ (even/odd `<8×f32>` acc vs replicated `<16×in>`
+    // input), so a register copy is wrong — round-trip through this warp's LDS band:
+    // store the even/odd accumulator (matrix `(kv,q)` order), barrier, reload with
+    // the replicated-input map (`K=kv=element`, `N=q=lane%16`). Both lane maps are
+    // the matmul-validated ones, so the relayout is correct by construction.
+    let att_mma = match att_smem {
+        None => warp.copy(att_mma.after(smallvec![reinit_dep.clone(), norm_vec.uop().clone()]), &att),
+        Some(att_smem) => {
+            // `widx` is the per-warp LDS *sub-tile* offset (the `idxs` slot consumed
+            // by `wave_offset`), NOT a destination/source RT index — so it is the
+            // 3rd arg of `store` and the 4th arg of `load` (mirroring the matmul LDS
+            // gather), with empty src/dst RT indices.
+            let widx = [Idx::from(warpid)];
+            let stored = warp.store(att_smem.into(), att.into(), &widx, &[], 0).st();
+            let bar = stored.uop().barrier(smallvec![reinit_dep.clone(), norm_vec.uop().clone()]);
+            let stored = stored.rewrap(stored.uop().after(smallvec![bar]));
+            warp.load(att_mma.into(), stored.into(), &[], &widx, 0).rt()
+        }
+    };
     o_reg = warp.mma_atb(o_reg, v_reg, &att_mma);
 
     FaAcc { max_vec, norm_vec, o_reg }
@@ -740,6 +784,9 @@ pub(crate) fn build_fa_mw_db(ker: &Kernel, b: usize, n: usize, h: usize, h_kv: u
         att_mma: ker.rt((kv_blk_rows, q_blk_rows), bf16.clone(), col, RT_16X16),
         scale_vec: ker.rv(q_blk_rows, f32.clone(), VecLayout::Ortho, RT_16X16),
         max_vec_last: ker.rv(q_blk_rows, f32.clone(), VecLayout::Ortho, RT_16X16),
+        // gfx942-only builder: the MFMA accumulator/input fragments coincide, so the
+        // `att → att_mma` relayout is a register copy (no LDS round-trip needed).
+        att_smem: None,
     };
     let sc0 = mk_scratch();
     let sc1 = mk_scratch();
@@ -791,6 +838,7 @@ pub(crate) fn build_fa_mw_db(ker: &Kernel, b: usize, n: usize, h: usize, h_kv: u
         v_smem0,
         &q_reg_t,
         &q_blk,
+        &warpid,
         &slice0,
         q_blk_rows,
         kv_blk_rows,
@@ -813,6 +861,7 @@ pub(crate) fn build_fa_mw_db(ker: &Kernel, b: usize, n: usize, h: usize, h_kv: u
         v_smem1,
         &q_reg_t,
         &q_blk,
+        &warpid,
         &slice1,
         q_blk_rows,
         kv_blk_rows,
@@ -917,32 +966,50 @@ pub(crate) fn build_fa_mw_rdb(
     let f32 = DType::Float32;
     let (row, col) = (TileLayout::Row, TileLayout::Col);
 
+    // Arch-specific WMMA fragment shapes (mirrors the validated matmul select,
+    // `kernels/matmul.rs`): gfx942 (CDNA MFMA, wave64) keeps the single `RT_16X16`
+    // for every role; gfx11 (RDNA WMMA, wave32) splits into the even/odd `_ACC`
+    // accumulator, the replicated `_IN` input, the transposed `_ACC_T` for the
+    // N-major output store, and the ept-8 swizzled LDS strip. `att_lds` is the
+    // per-warp LDS band for the `att → att_mma` relayout — only RDNA needs it (the
+    // CDNA acc/input fragments coincide, so its relayout is a register copy).
+    let cdna = ker.caps.arch.is_cdna();
+    let (st_frag, rt_acc, rt_in, rt_acc_t): (STBaseShape, RTBaseShape, RTBaseShape, RTBaseShape) = if cdna {
+        (ST_16X16, RT_16X16, RT_16X16, RT_16X16)
+    } else {
+        (ST_16X16_SWIZZLED_W32, RT_16X16_W32_ACC, RT_16X16_W32_IN, RT_16X16_W32_ACC_T)
+    };
+
     // 2×-size shared K/V LDS double buffers (one `kv_blk_rows × d` block per half).
-    let k_smem = ker.st_db((kv_blk_rows, d), in_dt.clone(), row, ST_16X16);
-    let v_smem = ker.st_db((kv_blk_rows, d), in_dt.clone(), row, ST_16X16);
+    let k_smem = ker.st_db((kv_blk_rows, d), in_dt.clone(), row, st_frag);
+    let v_smem = ker.st_db((kv_blk_rows, d), in_dt.clone(), row, st_frag);
     let half_k = k_smem.half_elems() as i64;
     let half_v = v_smem.half_elems() as i64;
 
-    // Q tile + transpose (shared, read-only across the loop).
-    let q_reg_fl = ker.rt((q_blk_rows, d), f32.clone(), row, RT_16X16);
-    let q_reg = ker.rt((q_blk_rows, d), in_dt.clone(), row, RT_16X16);
-    let q_reg_t = ker.rt((d, q_blk_rows), in_dt.clone(), col, RT_16X16);
-    let o_reg_t = ker.rt((q_blk_rows, d), f32.clone(), row, RT_16X16);
+    // Q tile + transpose (shared, read-only across the loop). `o_reg_t` is the
+    // transpose of the `[d,q]` PV accumulator for the `O[q,d]` store (N-major ⇒
+    // `rt_acc_t` on RDNA).
+    let q_reg_fl = ker.rt((q_blk_rows, d), f32.clone(), row, rt_in);
+    let q_reg = ker.rt((q_blk_rows, d), in_dt.clone(), row, rt_in);
+    let q_reg_t = ker.rt((d, q_blk_rows), in_dt.clone(), col, rt_in);
+    let o_reg_t = ker.rt((q_blk_rows, d), f32.clone(), row, rt_acc_t);
 
     // One scratch set (vs the unroll's two): the rolled body has a back-edge, so
-    // the carried FaAcc + a single scratch suffice.
+    // the carried FaAcc + a single scratch suffice. `att_smem` (RDNA only) holds
+    // `NUM_WARPS` per-warp `kv_blk × q_blk` bands for the accumulator→input relayout.
     let sc = FaScratch {
-        k_reg: ker.rt((kv_blk_rows, d), in_dt.clone(), row, RT_16X16),
-        k_reg_t: ker.rt((d, kv_blk_rows), in_dt.clone(), col, RT_16X16),
-        v_reg: ker.rt((kv_blk_rows, d), in_dt.clone(), col, RT_16X16),
-        att: ker.rt((kv_blk_rows, q_blk_rows), f32.clone(), col, RT_16X16),
-        att_mma: ker.rt((kv_blk_rows, q_blk_rows), in_dt.clone(), col, RT_16X16),
+        k_reg: ker.rt((kv_blk_rows, d), in_dt.clone(), row, rt_in),
+        k_reg_t: ker.rt((d, kv_blk_rows), in_dt.clone(), col, rt_in),
+        v_reg: ker.rt((kv_blk_rows, d), in_dt.clone(), col, rt_in),
+        att: ker.rt((kv_blk_rows, q_blk_rows), f32.clone(), col, rt_acc),
+        att_mma: ker.rt((kv_blk_rows, q_blk_rows), in_dt.clone(), col, rt_in),
         scale_vec: ker.rv(q_blk_rows, f32.clone(), VecLayout::Ortho, RT_16X16),
         max_vec_last: ker.rv(q_blk_rows, f32.clone(), VecLayout::Ortho, RT_16X16),
+        att_smem: (!cdna).then(|| ker.st((NUM_WARPS * kv_blk_rows, q_blk_rows), in_dt.clone(), row, st_frag)),
     };
 
     // Carried online-softmax accumulators.
-    let o_reg = ker.rt((d, q_blk_rows), f32.clone(), col, RT_16X16);
+    let o_reg = ker.rt((d, q_blk_rows), f32.clone(), col, rt_acc);
     let max_vec = ker.rv(q_blk_rows, f32.clone(), VecLayout::Ortho, RT_16X16);
     let norm_vec = ker.rv(q_blk_rows, f32, VecLayout::Ortho, RT_16X16);
     let acc = FaAcc { max_vec: warp.neg_inf_rv(max_vec), norm_vec: warp.zero_rv(norm_vec), o_reg: warp.zero(o_reg) };
@@ -1025,6 +1092,7 @@ pub(crate) fn build_fa_mw_rdb(
         v_cur,
         &q_reg_t,
         &q_blk,
+        &warpid,
         &kv_idx,
         q_blk_rows,
         kv_blk_rows,

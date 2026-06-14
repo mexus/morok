@@ -167,6 +167,52 @@ fn test_fa_graph_path_renders_clean() {
     );
 }
 
+/// Render-regression (CPU, no GPU) for the **RDNA3.5 (gfx1151, wave32)** FA path:
+/// `build_fa_mw_rdb` with the wave32 caps must render to gfx11 LLVM IR in bounded
+/// memory/time, exercising the arch tile-select (`_W32_*` fragments), the
+/// accumulator→input LDS relayout (`att → att_mma`), and the even/odd-aware mask.
+/// Asserts the RDNA **WMMA** intrinsic is emitted (not the CDNA MFMA), which is the
+/// host-side proof the wave32 build path is wired before HW validation on the 395.
+#[test]
+fn test_fa_mw_rdb_renders_wave32() {
+    let (b, h, h_kv, d) = (1usize, 2, 2, 64);
+    let n = 128usize;
+    let ker = Kernel::new(
+        "fa_mw_rdb_w32",
+        [h as i64, (n / 16 / 8) as i64, b as i64],
+        8 * 32, // NUM_WARPS * wave32
+        dummy_fa_buffers(b, n, h, h_kv, d),
+        crate::ArchCaps::for_arch(svod_dtype::AmdArch::Gfx1151),
+    );
+    build_fa_mw_rdb(
+        &ker,
+        b,
+        n,
+        h,
+        h_kv,
+        d,
+        FaConfig { q_blk: 16, kv_blk: 16, ..Default::default() },
+        svod_dtype::DType::Float16,
+        false,
+    );
+    let sink = ker.finish(1);
+    let lowered = svod_schedule::graph_rewrite(&svod_schedule::symbolic::pm_lower_index_dtype(), sink, &mut ());
+    let program = svod_codegen::program_pipeline::program_from_sink(lowered, svod_dtype::DeviceSpec::Cpu);
+    let linearized = svod_codegen::program_pipeline::do_linearize(&program).expect("do_linearize");
+    let linear_uop = linearized
+        .toposort()
+        .into_iter()
+        .find(|u| matches!(u.op(), svod_ir::Op::Linear { .. }))
+        .expect("LINEAR present");
+    let renderer = svod_codegen::llvm::LlvmTextRenderer::amd(svod_dtype::AmdArch::Gfx1151);
+    let code = svod_codegen::traits::Renderer::render(&renderer, &linear_uop, Some("fa_rdb_w32")).expect("render").code;
+
+    // RDNA WMMA, not CDNA MFMA — confirms the wave32 fragment path is taken.
+    let wmma = code.lines().filter(|l| l.contains("wmma.f32.16x16x16") && !l.contains("declare")).count();
+    assert!(wmma > 0, "wave32 FA must render gfx11 WMMA calls, got {wmma}");
+    assert_eq!(code.matches("mfma.f32.16x16x16").count(), 0, "wave32 FA must NOT emit CDNA MFMA");
+}
+
 // =============================================================================
 // Hardware-gated end-to-end flash-attention on gfx942.
 // =============================================================================
@@ -287,8 +333,23 @@ fn test_fa_mw_rdb_unroll_amd() {
     }
 }
 
+/// Whether the target device is a CDNA (gfx942) GPU. The direct-launch FA wrappers
+/// (`flash_attention_forward*`) hardcode the wave64 block + CDNA fragment tiles, so
+/// their HW tests skip on a non-CDNA target (gfx1151 reaches FA only through the
+/// wave-width-aware `flash_attention_with` graph entry, exercised by the
+/// `*_noncausal_*`/`*_graph_check_*` tests).
+fn is_cdna_device() -> bool {
+    let dev = svod_tensor::Tensor::rand(&[16, 16]).expect("probe tensor").device();
+    crate::target::resolve_arch(&dev).is_some_and(|a| a.is_cdna())
+}
+
 fn run_fa_amd_case(b: usize, n: usize, h: usize, d: usize, path: FaPath) {
     use svod_tensor::Tensor;
+
+    if !is_cdna_device() {
+        eprintln!("run_fa_amd_case: skipped — gfx942-only direct-launch FA on a non-CDNA device");
+        return;
+    }
 
     let mk = || {
         let t = Tensor::randn(&[b, n, h, d]).expect("randn");
@@ -387,6 +448,13 @@ fn run_fa_amd_case(b: usize, n: usize, h: usize, d: usize, path: FaPath) {
 #[ignore]
 fn test_fa_graph_amd() {
     use svod_tensor::Tensor;
+    // Compares the graph kernel against the gfx942-only direct `flash_attention_forward_mw_rdb`,
+    // so it skips on a non-CDNA target (the graph path itself is covered on gfx1151 by
+    // `test_fa_graph_check_amd` / `test_fa_noncausal_f16*` against SDPA).
+    if !is_cdna_device() {
+        eprintln!("test_fa_graph_amd: skipped — graph-vs-direct compare uses the gfx942-only direct launcher");
+        return;
+    }
     for (b, n, h, d) in [(1usize, 128usize, 2usize, 64usize), (1, 512, 2, 64), (2, 256, 4, 64)] {
         let mk = || {
             let t = Tensor::randn(&[b, n, h, d]).expect("randn");

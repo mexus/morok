@@ -56,15 +56,25 @@ fn wave_offset(block: Option<&Idx>, frags: i64, local: &Arc<UOp>) -> Idx {
 /// "fragment is laid out column-major in registers" branch (group.py: either
 /// `rt.layout != st.layout` for the LDS hops, or `rt.layout == COL` for the
 /// global hops); `inner` is the upcast element index.
-fn lane_rc(
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn lane_rc(
     transpose: bool,
     interleave: bool,
+    interleave_t: bool,
     laneid: &Arc<UOp>,
     rows: i64,
     cols: i64,
     stride: i64,
     inner: &Arc<UOp>,
 ) -> (Arc<UOp>, Arc<UOp>) {
+    if interleave_t {
+        // The transpose of the RDNA accumulator interleave: `row = lane%16,
+        // col = 2·j + lane/16`. Stores an even/odd-interleaved accumulator to memory
+        // along the transposed (N-major) axis — the FA output tile `O[q,d]` from the
+        // `[d,q]` PV accumulator. Checked before `interleave` (and ignores
+        // `transpose`) so it never perturbs the matmul accumulator store.
+        return (imod(laneid, cols), iadd(&imul(inner, 2), &idiv(laneid, cols)));
+    }
     if interleave {
         // RDNA wave32 WMMA f32 accumulator: even/odd row interleave across the two
         // wave-halves — `m = 2·j + lane/16, n = lane%16` (j = `inner`; the ×2 is the
@@ -1094,8 +1104,16 @@ impl<'k> Group<'k> {
         let width = self.ker.raw_range(rt_w, AxisType::Loop);
         let inner = self.ker.raw_range(ept, AxisType::Loop);
 
-        let (row, col) =
-            lane_rc(rt.layout != st.layout, rt.base.interleave, &laneid, base_rows, base_cols, stride, &inner);
+        let (row, col) = lane_rc(
+            rt.layout != st.layout,
+            rt.base.interleave,
+            rt.base.interleave_t,
+            &laneid,
+            base_rows,
+            base_cols,
+            stride,
+            &inner,
+        );
         let (srow, scol) = st.base.swizzle.swizzle_rc(row, col, st.base.base.cols, st.elem().base());
 
         // Wave sub-tile fragment offset (SI-1): the caller passes the wave's
@@ -1150,8 +1168,16 @@ impl<'k> Group<'k> {
 
         let base_row = imul(&height, base_rows);
         let base_col = imul(&width, base_cols);
-        let (row, col) =
-            lane_rc(rt.layout == TileLayout::Col, rt.base.interleave, &laneid, base_rows, base_cols, stride, &inner);
+        let (row, col) = lane_rc(
+            rt.layout == TileLayout::Col,
+            rt.base.interleave,
+            rt.base.interleave_t,
+            &laneid,
+            base_rows,
+            base_cols,
+            stride,
+            &inner,
+        );
         let srow = iadd(&base_row, &row);
         let scol = iadd(&base_col, &col);
         let off = iadd(&src_i_base, &iadd(&imul(&srow, row_stride), &scol));
@@ -1180,8 +1206,16 @@ impl<'k> Group<'k> {
         let width = self.ker.raw_range(rt_w, AxisType::Loop);
         let inner = self.ker.raw_range(ept, AxisType::Loop);
 
-        let (row, col) =
-            lane_rc(rt.layout != st.layout, rt.base.interleave, &laneid, base_rows, base_cols, stride, &inner);
+        let (row, col) = lane_rc(
+            rt.layout != st.layout,
+            rt.base.interleave,
+            rt.base.interleave_t,
+            &laneid,
+            base_rows,
+            base_cols,
+            stride,
+            &inner,
+        );
         let (srow, scol) = st.base.swizzle.swizzle_rc(row, col, st.base.base.cols, st.elem().base());
 
         let mut sidx: Vec<Idx> = src_idxs.to_vec();
@@ -1233,8 +1267,16 @@ impl<'k> Group<'k> {
 
         let base_row = imul(&height, base_rows);
         let base_col = imul(&width, base_cols);
-        let (row, col) =
-            lane_rc(rt.layout == TileLayout::Col, rt.base.interleave, &laneid, base_rows, base_cols, stride, &inner);
+        let (row, col) = lane_rc(
+            rt.layout == TileLayout::Col,
+            rt.base.interleave,
+            rt.base.interleave_t,
+            &laneid,
+            base_rows,
+            base_cols,
+            stride,
+            &inner,
+        );
         let srow = iadd(&base_row, &row);
         let scol = iadd(&base_col, &col);
         let off = iadd(&dst_i_base, &iadd(&imul(&srow, row_stride), &scol));

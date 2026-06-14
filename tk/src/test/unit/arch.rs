@@ -2,9 +2,9 @@
 //! WMMA-fragment row stride are *derived from the detected `AmdArch`*, not
 //! hand-set per call. gfx942 must reproduce the prior wave64 literals
 //! bit-for-bit (the builders now thread these instead of the old constants);
-//! gfx1151 (RDNA3.5, wave32) gets the correct control-path caps even though it
-//! stays out of `FA_/MATMUL_SUPPORTED_ARCHS` (falls back) until its
-//! fragment-layout table is validated on hardware.
+//! gfx1151 (RDNA3.5, wave32) gets the correct control-path caps and is built for
+//! by both matmul and FA (in `MATMUL_/FA_SUPPORTED_ARCHS`); its RDNA WMMA fragment
+//! layout is carried by the `RT_16X16_W32_*` tile shapes selected in the kernels.
 
 use svod_dtype::{AmdArch, DType};
 use svod_schedule::optimizer::Renderer;
@@ -24,17 +24,18 @@ fn gfx942_caps_reproduce_wave64_literals() {
     assert_eq!(c.frag_row_stride(), 4, "prior FA `*4` lane→KV-row stride (256/64)");
 }
 
-/// RDNA3.5 (gfx1151) control-path caps that genuinely generalize: wave32 (the
-/// warp/lane math + launch block) and the RDNA3.5 classification. The WMMA
-/// descriptor resolution is covered by [`wmma_descriptor_resolves_per_detected_arch`].
-/// NOTE: `reduce_tree`/`frag_row_stride` are the CDNA-MFMA formulas evaluated at 32
-/// lanes — **not** the RDNA WMMA fragment layout (replicated inputs, even/odd
-/// accumulator), which is a separate deferred implementation — so they are
-/// deliberately not asserted as RDNA-correct here.
+/// RDNA3.5 (gfx1151) control-path caps: wave32 (the warp/lane math + launch block),
+/// the RDNA3.5 classification, and the `[16]` cross-lane reduce tree — correct for
+/// the wave32 even/odd accumulator (a softmax row is the lane's 8 in-register
+/// elements + its `L+16` sibling, so one `[16]` fold completes it). The RDNA WMMA
+/// *fragment* layout (replicated inputs, even/odd accumulator) lives in the
+/// `RT_16X16_W32_*` tile shapes, not in these scalar caps; the descriptor resolution
+/// is covered by [`wmma_descriptor_resolves_per_detected_arch`].
 #[test]
 fn gfx1151_caps_are_wave32() {
     let c = ArchCaps::for_arch(AmdArch::Gfx1151);
     assert_eq!(c.wave_size, 32);
+    assert_eq!(c.reduce_tree().as_slice(), &[16], "wave32 even/odd accumulator folds one sibling at L+16");
     assert!(c.arch.is_rdna3_5() && !c.arch.is_rdna3(), "gfx1151 is RDNA3.5, distinct from RDNA3");
 }
 

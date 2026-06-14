@@ -13,16 +13,18 @@
 //! [`crate::WARP_THREADS`]).
 //!
 //! What generalizes cleanly to RDNA3.5 (gfx1151, wave32): [`ArchCaps::wave_size`]
-//! (the control path — warp/lane math, launch block) and the WMMA descriptor
-//! (sourced by arch from the shared `TensorCore` table — RDNA routes to the
-//! 32-thread WMMA core). What does **NOT**: [`ArchCaps::reduce_tree`] and
-//! [`ArchCaps::frag_row_stride`] encode the **CDNA MFMA** fragment geometry, and
-//! RDNA WMMA is a *different* layout (`ept=(16,16,8)`, inputs replicated across the
-//! two wave-halves, an even/odd-interleaved `<8×float>` accumulator) — so the
-//! RDNA3.5 fragment path is a separate implementation, not a wave-size reparam.
-//! gfx1151 therefore stays out of `FA_/MATMUL_SUPPORTED_ARCHS` (it falls back) and
-//! [`Kernel::new`](crate::Kernel::new)'s `debug_assert` blocks building it until
-//! that layout lands and is validated on hardware.
+//! (the control path — warp/lane math, launch block), the WMMA descriptor (sourced
+//! by arch from the shared `TensorCore` table — RDNA routes to the 32-thread WMMA
+//! core), and [`ArchCaps::reduce_tree`] (the `wave_size/16 − 1` sibling-fold formula
+//! yields the correct `[16]` for the wave32 even/odd accumulator — see below). The
+//! RDNA WMMA *fragment* layout is otherwise different (`ept=(16,16,8)`, inputs
+//! replicated across the two wave-halves, an even/odd-interleaved `<8×float>`
+//! accumulator), so it is carried by dedicated tile shapes (`RT_16X16_W32_*` in
+//! [`crate::tiles`]) selected per arch in the kernels, not by reparameterizing the
+//! CDNA shapes. Both matmul and FA are now built for gfx1151 (in
+//! `MATMUL_/FA_SUPPORTED_ARCHS`); [`ArchCaps::frag_row_stride`] is the one remaining
+//! CDNA-only datum (the legacy direct-launch FA mask — the production rolled-db
+//! kernel derives its mask from the accumulator's own `lane_rc` instead).
 
 use smallvec::SmallVec;
 use svod_dtype::AmdArch;
@@ -49,21 +51,23 @@ impl ArchCaps {
     /// The validated default target: gfx942 (CDNA3, wave64).
     pub const GFX942: ArchCaps = ArchCaps::for_arch(AmdArch::Gfx942);
 
-    /// Cross-lane (`ds_bpermute`) reduce-tree offsets **for the CDNA MFMA fragment
-    /// layout**: a lane folds the partials of the `wave_size / 16` sibling
-    /// row-groups, each one WMMA-column span (16 lanes) apart → wave64
-    /// `[16, 32, 48]` (reproduces the prior literal). At wave32 this formula yields
-    /// `[16]`, which is **not** the RDNA WMMA reduce — RDNA's accumulator lane
-    /// layout differs, so RDNA3.5 needs its own tree (deferred; see module docs).
+    /// Cross-lane (`ds_bpermute`) reduce-tree offsets: a lane folds the partials of
+    /// the `wave_size / 16` sibling row-groups, each one WMMA-column span (16 lanes)
+    /// apart → wave64 `[16, 32, 48]`, wave32 `[16]`. This is correct for **both** the
+    /// CDNA MFMA layout *and* the RDNA even/odd accumulator: at wave32 a softmax row
+    /// (16 KV) is split across a lane's 8 in-register elements (the even/odd half)
+    /// and its sibling lane `L+16` (the other half), so the single `[16]` fold plus
+    /// the in-register reduce covers the whole row (HW-validated reduce structure).
     pub fn reduce_tree(&self) -> SmallVec<[i64; 3]> {
         (1..self.wave_size as i64 / 16).map(|i| i * 16).collect()
     }
 
     /// Per-lane row stride of a 16×16 **CDNA MFMA** accumulator fragment
-    /// (`256 / wave_size`): wave64 → 4. The FA causal/padding mask maps each
-    /// `laneid / 16` row-group to KV rows with this stride. (RDNA's `<8×float>`
-    /// accumulator is also 8/lane at wave32, but its rows are even/odd interleaved
-    /// across the wave-halves, not this contiguous stride — deferred.)
+    /// (`256 / wave_size`): wave64 → 4. Used only by the legacy direct-launch FA
+    /// builders' causal/padding mask (which map each `laneid / 16` row-group to KV
+    /// rows with this contiguous stride). The production rolled-db FA derives its
+    /// mask from the att accumulator's own `lane_rc` instead — arch-correct for both
+    /// the CDNA stride and the RDNA even/odd interleave — so it does not call this.
     pub const fn frag_row_stride(&self) -> i64 {
         (16 * 16 / self.wave_size) as i64
     }
