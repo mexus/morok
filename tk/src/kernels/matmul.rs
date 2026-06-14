@@ -223,8 +223,8 @@ pub fn build_matmul_cfg(ker: &Kernel, n: usize, cfg: MatmulCfg) {
     let mut bar_deps: smallvec::SmallVec<[Arc<UOp>; 4]> = smallvec![bb.uop().clone()];
     bar_deps.extend(a_subs.iter().skip(1).map(|t| t.uop().clone()));
     let sync = a_subs[0].uop().barrier(bar_deps);
-    let bb = bb.after(smallvec![sync.clone()]);
-    let a_subs: Vec<RT> = a_subs.into_iter().map(|t| t.after(smallvec![sync.clone()])).collect();
+    let bb = bb.after(&sync);
+    let a_subs: Vec<RT> = a_subs.into_iter().map(|t| t.after(&sync)).collect();
 
     // MFMA-accumulate each accumulator over the K sub-steps; chain accumulator
     // `a`'s A-input through accumulator `a-1`'s MFMA so a single `END` scopes
@@ -232,14 +232,14 @@ pub fn build_matmul_cfg(ker: &Kernel, n: usize, cfg: MatmulCfg) {
     let mut prev_out: Option<Arc<UOp>> = None;
     for (a, a_sub) in a_subs.iter().enumerate() {
         let a_sub = match &prev_out {
-            Some(p) => a_sub.after(smallvec![p.clone()]),
+            Some(p) => a_sub.after(p),
             None => a_sub.clone(),
         };
         prev_out = Some(g.mma_ab(accs[a].clone(), &a_sub, &bb).uop().clone());
     }
     let ended = lp.close();
     // Each accumulator reads its fully-reduced register value *outside* the loop.
-    let final_accs: Vec<RT> = accs.iter().map(|c| c.after(smallvec![ended.clone()])).collect();
+    let final_accs: Vec<RT> = accs.iter().map(|c| c.after(&ended)).collect();
 
     // Epilogue: store each col-major accumulator to global C at its reg-block
     // coords {row*bps + warp_row + a*wave_rows, col*bps + warp_col} (GEMM:222-223).
@@ -385,8 +385,8 @@ pub fn build_matmul_pipelined(ker: &Kernel, n: usize, stage: PipeStage) {
         let mut reads: smallvec::SmallVec<[Arc<UOp>; 4]> = smallvec![bb.uop().clone()];
         reads.extend(a_subs.iter().map(|t| t.uop().clone()));
         let sync = a_subs[0].uop().barrier(reads);
-        let bb = bb.after(smallvec![sync.clone()]);
-        let a_subs: Vec<RT> = a_subs.into_iter().map(|t| t.after(smallvec![sync.clone()])).collect();
+        let bb = bb.after(&sync);
+        let a_subs: Vec<RT> = a_subs.into_iter().map(|t| t.after(&sync)).collect();
 
         // ── MFMA burst: `s_waitcnt lgkmcnt(0)` to drain the deferred LDS reads,
         // then `s_setprio(1)` around the burst — chained off a post-sync value
@@ -395,7 +395,7 @@ pub fn build_matmul_pipelined(ker: &Kernel, n: usize, stage: PipeStage) {
         let prio_in: Vec<RT> = if stage.hints() {
             let wait = crate::asm::s_waitcnt_lgkmcnt(0, a_subs[0].uop().clone());
             let hi = crate::asm::s_setprio(1, wait);
-            a_subs.iter().map(|t| t.after(smallvec![hi.clone()])).collect()
+            a_subs.iter().map(|t| t.after(&hi)).collect()
         } else {
             a_subs
         };
@@ -561,7 +561,7 @@ pub fn build_matmul_db(ker: &Kernel, n: usize) {
     let mut prev_out: Option<Arc<UOp>> = None;
     for (a, a_sub) in a_subs.iter().enumerate() {
         let a_sub = match &prev_out {
-            Some(p) => a_sub.after(smallvec![p.clone()]),
+            Some(p) => a_sub.after(p),
             None => a_sub.clone(),
         };
         prev_out = Some(g.mma_ab(accs[a].clone(), &a_sub, &bb).uop().clone());
@@ -574,7 +574,7 @@ pub fn build_matmul_db(ker: &Kernel, n: usize) {
     // Its deps are the prefetch commits.
     let bar_deps: smallvec::SmallVec<[Arc<UOp>; 4]> = smallvec![commit_a.uop().clone(), commit_b.uop().clone()];
     let ended = lp.close_barrier(bar_deps);
-    let final_accs: Vec<RT> = accs.iter().map(|c| c.after(smallvec![ended.clone()])).collect();
+    let final_accs: Vec<RT> = accs.iter().map(|c| c.after(&ended)).collect();
 
     // Epilogue: store each accumulator to global C at its reg-block.
     let bps = cfg.blocks_per_side() as i64;

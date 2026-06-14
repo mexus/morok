@@ -69,8 +69,12 @@ fn fa_sink() -> Arc<UOp> {
 // numerically on gfx942 (matmul *_amd) + gfx1151/395.
 const MATMUL_DIGEST: u128 = 0x99eb_67e7_9598_ec54_0000_0000_0000_0000;
 const MATMUL_NODES: usize = 483;
-const FA_DIGEST: u128 = 0x0e3b_fb1f_ff98_dc83_0000_0000_0000_0000;
-const FA_NODES: usize = 881;
+// Re-baked for the online-softmax rescale rewrite: `scale_vec` dropped its scratch
+// buffer and is now the `(max_vec_last - &max_vec).exp2()` same-shape vec−vec op
+// (reusing `max_vec_last`'s dead buffer) instead of a hand-rolled `load_at` merge —
+// 3 fewer nodes, same numerics. Validated on gfx942 (fa *_amd) + gfx1151/395.
+const FA_DIGEST: u128 = 0x97cf_434e_4785_1a9f_0000_0000_0000_0000;
+const FA_NODES: usize = 878;
 const MATMUL_DB_DIGEST: u128 = 0x1bde_e499_c405_69fb_0000_0000_0000_0000;
 const MATMUL_DB_NODES: usize = 643;
 

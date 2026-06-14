@@ -217,86 +217,14 @@ fn test_fa_mw_rdb_renders_wave32() {
 // Hardware-gated end-to-end flash-attention on gfx942.
 // =============================================================================
 
-/// `SVOD_DEVICE=AMD:0 cargo test -p svod-tk --lib fa::test_fa_amd -- --ignored --nocapture`.
-///
-/// Compares the FA forward to `q.scaled_dot_product_attention(k, v, is_causal)`
-/// over identical bf16 operands (svod has no `enable_gqa`, so `H == H_KV`).
-/// Sweeps several sequence lengths so the causal block-skip is exercised across
-/// distinct trip counts — causal SDPA *is* the full-mask oracle, so each pass
-/// checks the truncated `0..=q_seq` loop equals the full loop + triangular mask.
-#[test]
-#[ignore]
-fn test_fa_amd() {
-    for n in [32usize, 64, 128] {
-        run_fa_amd_case(1, n, 2, 64, FaPath::Single);
-    }
-}
-
-/// `SVOD_DEVICE=AMD:0 cargo test -p svod-tk --lib fa::test_fa_mw_amd -- --ignored --nocapture`.
-///
-/// The multi-wave (8-warp) FA correctness gate vs causal SDPA, at sequence
-/// lengths where `n/16` is a multiple of `NUM_WARPS` (so the 512-thread block
-/// tiles evenly): N=128 (1 block) through 2048. Also sweeps an occupancy-bound
-/// batched shape (B=2, H=4) so the grid spans many blocks.
-#[test]
-#[ignore]
-fn test_fa_mw_amd() {
-    for n in [128usize, 512, 1024, 2048] {
-        run_fa_amd_case(1, n, 2, 64, FaPath::Mw);
-    }
-    run_fa_amd_case(2, 256, 4, 64, FaPath::Mw);
-}
-
-/// Which FA kernel a hardware case runs.
+/// Per-warp tile config a hardware case runs through the rolled double-buffered
+/// builder ([`crate::kernels::fa::build_fa_mw_rdb`]): the Q/KV tile heights and
+/// whether to emit the fully-unrolled (flat) compute body.
 #[derive(Clone, Copy)]
-enum FaPath {
-    /// Single-warp [`crate::kernels::fa::flash_attention_forward`].
-    Single,
-    /// Multi-wave [`crate::kernels::fa::flash_attention_forward_mw`].
-    Mw,
-    /// Double-buffered multi-wave (`pipelined` toggles stage 1 vs 2), with the
-    /// per-warp tile heights `(q_blk, kv_blk)`.
-    MwDb { pipelined: bool, q_blk: usize, kv_blk: usize },
-    /// Rolled double-buffered multi-wave ([`crate::kernels::fa::build_fa_mw_rdb`]),
-    /// with the per-warp tile heights `(q_blk, kv_blk)`; `unroll` toggles the
-    /// fully-unrolled (flat) compute body.
-    Rdb { q_blk: usize, kv_blk: usize, unroll: bool },
-}
-
-/// `SVOD_DEVICE=AMD:0 cargo test -p svod-tk --lib fa::test_fa_mw_db_amd -- --ignored --nocapture`.
-///
-/// The double-buffered (unroll-by-2) FA correctness gate vs causal SDPA, at the
-/// same shapes as [`test_fa_mw_amd`], for BOTH stages (naive unroll + pipelined
-/// barrier-reduced). The unrolled path must stay bit-compatible with multi-wave.
-#[test]
-#[ignore]
-fn test_fa_mw_db_amd() {
-    for &pipelined in &[false, true] {
-        // Baseline {16,16}: N a multiple of 16*8=128.
-        for n in [128usize, 512, 1024, 2048] {
-            run_fa_amd_case(1, n, 2, 64, FaPath::MwDb { pipelined, q_blk: 16, kv_blk: 16 });
-        }
-        run_fa_amd_case(2, 256, 4, 64, FaPath::MwDb { pipelined, q_blk: 16, kv_blk: 16 });
-    }
-}
-
-/// `SVOD_DEVICE=AMD:0 cargo test -p svod-tk --lib fa::test_fa_mw_db_tiled_amd -- --ignored --nocapture`.
-///
-/// Bigger-per-warp-tile correctness gate: the symmetric `{32,32}` (2 row
-/// fragments) and asymmetric `{32,64}` (HK-like, opt-in) configs vs causal SDPA,
-/// for both the naive and pipelined double-buffer stages. N must be a multiple
-/// of `Q_BLK * NUM_WARPS = 32*8 = 256`.
-#[test]
-#[ignore]
-fn test_fa_mw_db_tiled_amd() {
-    for &pipelined in &[false, true] {
-        for &(q_blk, kv_blk) in &[(32usize, 32usize), (32, 64)] {
-            for n in [512usize, 1024, 2048] {
-                run_fa_amd_case(1, n, 2, 64, FaPath::MwDb { pipelined, q_blk, kv_blk });
-            }
-            run_fa_amd_case(2, 256, 4, 64, FaPath::MwDb { pipelined, q_blk, kv_blk });
-        }
-    }
+struct FaPath {
+    q_blk: usize,
+    kv_blk: usize,
+    unroll: bool,
 }
 
 /// `SVOD_DEVICE=AMD:0 cargo test -p svod-tk --lib fa::test_fa_mw_rdb_amd -- --ignored --nocapture`.
@@ -307,11 +235,11 @@ fn test_fa_mw_db_tiled_amd() {
 #[ignore]
 fn test_fa_mw_rdb_amd() {
     for n in [128usize, 512, 1024, 2048] {
-        run_fa_amd_case(1, n, 2, 64, FaPath::Rdb { q_blk: 16, kv_blk: 16, unroll: false });
+        run_fa_amd_case(1, n, 2, 64, FaPath { q_blk: 16, kv_blk: 16, unroll: false });
     }
-    run_fa_amd_case(2, 256, 4, 64, FaPath::Rdb { q_blk: 16, kv_blk: 16, unroll: false });
+    run_fa_amd_case(2, 256, 4, 64, FaPath { q_blk: 16, kv_blk: 16, unroll: false });
     for n in [512usize, 1024, 2048] {
-        run_fa_amd_case(1, n, 2, 64, FaPath::Rdb { q_blk: 32, kv_blk: 32, unroll: false });
+        run_fa_amd_case(1, n, 2, 64, FaPath { q_blk: 32, kv_blk: 32, unroll: false });
     }
 }
 
@@ -325,11 +253,11 @@ fn test_fa_mw_rdb_amd() {
 #[ignore]
 fn test_fa_mw_rdb_unroll_amd() {
     for n in [128usize, 512, 1024, 2048] {
-        run_fa_amd_case(1, n, 2, 64, FaPath::Rdb { q_blk: 16, kv_blk: 16, unroll: true });
+        run_fa_amd_case(1, n, 2, 64, FaPath { q_blk: 16, kv_blk: 16, unroll: true });
     }
-    run_fa_amd_case(2, 256, 4, 64, FaPath::Rdb { q_blk: 16, kv_blk: 16, unroll: true });
+    run_fa_amd_case(2, 256, 4, 64, FaPath { q_blk: 16, kv_blk: 16, unroll: true });
     for n in [512usize, 1024, 2048] {
-        run_fa_amd_case(1, n, 2, 64, FaPath::Rdb { q_blk: 32, kv_blk: 32, unroll: true });
+        run_fa_amd_case(1, n, 2, 64, FaPath { q_blk: 32, kv_blk: 32, unroll: true });
     }
 }
 
@@ -361,45 +289,23 @@ fn run_fa_amd_case(b: usize, n: usize, h: usize, d: usize, path: FaPath) {
     let mut o = Tensor::empty(&[b, n, h, d], DType::BFloat16);
 
     let h_kv = h;
-    match path {
-        FaPath::Single => crate::kernels::fa::flash_attention_forward(&mut o, &q, &k, &v).expect("fa launch"),
-        FaPath::Mw => crate::kernels::fa::flash_attention_forward_mw(&mut o, &q, &k, &v).expect("fa_mw launch"),
-        FaPath::MwDb { pipelined, q_blk, kv_blk } => {
-            // Explicit tile config: 8-warp block, grid dim1 = n / q_blk / NUM_WARPS.
-            let grid = [h as i64, (n / q_blk / 8) as i64, b as i64];
-            crate::run_kernel("fa_mw_db", grid, 8 * 64, &mut [&mut o], &[&q, &k, &v], |ker| {
-                crate::kernels::fa::build_fa_mw_db(
-                    ker,
-                    b,
-                    n,
-                    h,
-                    h_kv,
-                    d,
-                    FaConfig { q_blk, kv_blk, pipelined, ..Default::default() },
-                );
-                ker.finish(1)
-            })
-            .expect("fa_mw_db tiled launch")
-        }
-        FaPath::Rdb { q_blk, kv_blk, unroll } => {
-            let grid = [h as i64, (n / q_blk / 8) as i64, b as i64];
-            crate::run_kernel("fa_mw_rdb", grid, 8 * 64, &mut [&mut o], &[&q, &k, &v], |ker| {
-                crate::kernels::fa::build_fa_mw_rdb(
-                    ker,
-                    b,
-                    n,
-                    h,
-                    h_kv,
-                    d,
-                    FaConfig { q_blk, kv_blk, unroll, ..Default::default() },
-                    q.uop().dtype(),
-                    false,
-                );
-                ker.finish(1)
-            })
-            .expect("fa_mw_rdb tiled launch")
-        }
-    }
+    let FaPath { q_blk, kv_blk, unroll } = path;
+    let grid = [h as i64, (n / q_blk / 8) as i64, b as i64];
+    crate::run_kernel("fa_mw_rdb", grid, 8 * 64, &mut [&mut o], &[&q, &k, &v], |ker| {
+        crate::kernels::fa::build_fa_mw_rdb(
+            ker,
+            b,
+            n,
+            h,
+            h_kv,
+            d,
+            FaConfig { q_blk, kv_blk, unroll, ..Default::default() },
+            q.uop().dtype(),
+            false,
+        );
+        ker.finish(1)
+    })
+    .expect("fa_mw_rdb tiled launch");
     let mut of = o.cast(DType::Float32).expect("o→f32");
     of.realize().expect("realize o→f32");
     let got: Vec<f32> = of.as_vec::<f32>().expect("read o");
@@ -421,16 +327,7 @@ fn run_fa_amd_case(b: usize, n: usize, h: usize, d: usize, path: FaPath) {
         max_abs = max_abs.max(abs);
         worst = worst.max(abs - rtol * e.abs());
     }
-    let label = match path {
-        FaPath::Single => "sw".to_string(),
-        FaPath::Mw => "mw".to_string(),
-        FaPath::MwDb { pipelined, q_blk, kv_blk } => {
-            format!("mw_db[{},{}x{}]", if pipelined { "pipe" } else { "naive" }, q_blk, kv_blk)
-        }
-        FaPath::Rdb { q_blk, kv_blk, unroll } => {
-            format!("mw_rdb[{}{q_blk}x{kv_blk}]", if unroll { "u," } else { "" })
-        }
-    };
+    let label = format!("mw_rdb[{}{q_blk}x{kv_blk}]", if unroll { "u," } else { "" });
     println!("fa[{label}] B={b} N={n} H={h} D={d}: max abs error = {max_abs:e}");
     assert!(worst <= atol, "FA exceeds atol+rtol*|e| (max abs {max_abs:e}, tol {atol}+{rtol}*|e|)");
 }

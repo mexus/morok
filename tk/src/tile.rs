@@ -12,7 +12,7 @@
 
 use std::sync::Arc;
 
-use smallvec::SmallVec;
+use smallvec::{SmallVec, smallvec};
 use svod_dtype::DType;
 use svod_ir::UOp;
 
@@ -29,11 +29,91 @@ pub trait RegTile<'k>: Clone {
     fn layout(&self) -> TileLayout;
     fn rewrap(&self, new_uop: Arc<UOp>) -> Self;
 
-    /// Rewrap with an extra ordering dependency (tinygrad `tile.after(dep)`),
+    /// Rewrap with extra ordering dependencies (tinygrad `tile.after(dep)`),
     /// e.g. a write-after-read edge that forces this tile's next read to observe
-    /// `deps` first.
-    fn after(&self, deps: SmallVec<[Arc<UOp>; 4]>) -> Self {
-        self.rewrap(self.uop().after(deps))
+    /// `deps` first. Accepts a single dep, an array, a 2-/3-tuple of mixed deps,
+    /// or a raw `SmallVec` (see [`AfterDeps`]) — so a kernel writes `.after(&tile)`
+    /// or `.after((range, &vec))` instead of `.after(smallvec![tile.uop().clone()])`.
+    fn after(&self, deps: impl AfterDeps) -> Self {
+        self.rewrap(self.uop().after(deps.into_afters()))
+    }
+}
+
+/// A single ordering dependency for [`RegTile::after`] — a raw `Arc<UOp>` (a range
+/// counter, a barrier, an asm node) or a register tile (its backing buffer). The
+/// `&RT`/`&RV` impls let callers pass a tile directly instead of spelling out
+/// `tile.uop().clone()`.
+pub trait AfterDep {
+    fn into_after(self) -> Arc<UOp>;
+}
+
+impl AfterDep for Arc<UOp> {
+    fn into_after(self) -> Arc<UOp> {
+        self
+    }
+}
+impl AfterDep for &Arc<UOp> {
+    fn into_after(self) -> Arc<UOp> {
+        self.clone()
+    }
+}
+impl<'k> AfterDep for &RT<'k> {
+    fn into_after(self) -> Arc<UOp> {
+        self.uop().clone()
+    }
+}
+impl<'k> AfterDep for &RV<'k> {
+    fn into_after(self) -> Arc<UOp> {
+        self.uop().clone()
+    }
+}
+
+/// One or more ordering dependencies for [`RegTile::after`]: a single [`AfterDep`],
+/// an array `[d; N]`, a heterogeneous 2-/3-tuple (e.g. a loop counter plus a carried
+/// vector), or a raw `SmallVec` (the legacy form, kept so existing call sites keep
+/// compiling). Every form lowers to the same `SmallVec<[Arc<UOp>; 4]>`.
+pub trait AfterDeps {
+    fn into_afters(self) -> SmallVec<[Arc<UOp>; 4]>;
+}
+
+impl AfterDeps for Arc<UOp> {
+    fn into_afters(self) -> SmallVec<[Arc<UOp>; 4]> {
+        smallvec![self]
+    }
+}
+impl AfterDeps for &Arc<UOp> {
+    fn into_afters(self) -> SmallVec<[Arc<UOp>; 4]> {
+        smallvec![self.clone()]
+    }
+}
+impl<'k> AfterDeps for &RT<'k> {
+    fn into_afters(self) -> SmallVec<[Arc<UOp>; 4]> {
+        smallvec![self.uop().clone()]
+    }
+}
+impl<'k> AfterDeps for &RV<'k> {
+    fn into_afters(self) -> SmallVec<[Arc<UOp>; 4]> {
+        smallvec![self.uop().clone()]
+    }
+}
+impl<D: AfterDep, const N: usize> AfterDeps for [D; N] {
+    fn into_afters(self) -> SmallVec<[Arc<UOp>; 4]> {
+        self.into_iter().map(AfterDep::into_after).collect()
+    }
+}
+impl<A: AfterDep, B: AfterDep> AfterDeps for (A, B) {
+    fn into_afters(self) -> SmallVec<[Arc<UOp>; 4]> {
+        smallvec![self.0.into_after(), self.1.into_after()]
+    }
+}
+impl<A: AfterDep, B: AfterDep, C: AfterDep> AfterDeps for (A, B, C) {
+    fn into_afters(self) -> SmallVec<[Arc<UOp>; 4]> {
+        smallvec![self.0.into_after(), self.1.into_after(), self.2.into_after()]
+    }
+}
+impl AfterDeps for SmallVec<[Arc<UOp>; 4]> {
+    fn into_afters(self) -> SmallVec<[Arc<UOp>; 4]> {
+        self
     }
 }
 

@@ -20,7 +20,6 @@
 
 use std::sync::Arc;
 
-use smallvec::smallvec;
 use svod_ir::UOp;
 
 use crate::kernel::Kernel;
@@ -48,7 +47,7 @@ impl<'k> Loop<'k> {
     /// Declarative and impossible to omit — the footgun the hand-threaded
     /// `t.after([loop_range])` edges guard against.
     pub fn reinit<T: RegTile<'k>>(&self, t: T) -> T {
-        t.after(smallvec![self.range.clone()])
+        t.after(&self.range)
     }
 
     /// Close the loop: end the last terminal store around this range and return the
