@@ -324,6 +324,7 @@ pub fn graph_launch<F>(
     block: i64,
     out: Tensor,
     ins: &[&Tensor],
+    caps: crate::ArchCaps,
     build: F,
 ) -> Result<Tensor>
 where
@@ -331,10 +332,12 @@ where
 {
     // The grid/block → `Op::Special` launch dims + the PARAM globals are minted by
     // the tk `Kernel`; the generic graph-node wrapping (custom_kernel → Op::Call,
-    // `[out, ins...]` placeholder order) lives in `Tensor::graph_kernel`.
+    // `[out, ins...]` placeholder order) lives in `Tensor::graph_kernel`. `caps`
+    // (resolved by the launcher from the inputs' arch) carries the wave size /
+    // WMMA descriptor the build closure threads.
     let name = name.into();
     let kname = name.clone();
-    Tensor::graph_kernel(&name, out, ins, move |ph| build(&crate::Kernel::new(kname, grid, block, ph)))
+    Tensor::graph_kernel(&name, out, ins, move |ph| build(&crate::Kernel::new(kname, grid, block, ph, caps)))
         .context(CustomKernelSnafu { name })
 }
 
@@ -385,7 +388,11 @@ where
         .device(&device_spec, svod_device::registry::registry())
         .context(DeviceFactorySnafu { spec: format!("{device_spec:?}") })?;
 
-    let ker = crate::Kernel::new(name, grid, block, buf_uops);
+    // Caps from the realized buffers' arch (gfx942 in practice); a non-AMD/host
+    // render target falls back to gfx942 so the WMMA descriptor still resolves.
+    let caps =
+        crate::target::resolve_arch(&device_spec).map(crate::ArchCaps::for_arch).unwrap_or(crate::ArchCaps::GFX942);
+    let ker = crate::Kernel::new(name, grid, block, buf_uops, caps);
     let sink = build(&ker);
     compile(&device, sink, &buffers)
 }

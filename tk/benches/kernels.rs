@@ -112,7 +112,7 @@ fn bench_matmul(c: &mut Criterion) {
         let launch = svod_tk::compile_kernel(
             "matmul",
             M1_CFG.grid_dims(n),
-            M1_CFG.threads(),
+            M1_CFG.threads(svod_tk::WARP_THREADS),
             &mut [&mut out],
             &[&a, &b],
             |ker| {

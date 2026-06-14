@@ -12,11 +12,14 @@ use smallvec::{SmallVec, smallvec};
 use svod_dtype::{AddrSpace, DType};
 use svod_ir::{AxisId, AxisType, KernelInfo, Op, UOp};
 
-use crate::WARP_THREADS;
+use crate::ArchCaps;
 use crate::index::cidx;
 
 pub struct Kernel {
     pub name: String,
+    /// The arch-derived caps (wave size, reduce tree, WMMA arch) the builder
+    /// threads instead of the wave64 literals.
+    pub caps: ArchCaps,
     /// `blockIdx.{x,y,z}` as `Special` ops (only rendered if referenced).
     pub block_idx: [Arc<UOp>; 3],
     /// `threadIdx.x` as a `Special` op.
@@ -52,7 +55,16 @@ impl Kernel {
     /// (slot = declaration index); [`Kernel::next_global`] hands those out as GL
     /// tiles bind them, and [`crate::launch`] binds the concrete buffers
     /// positionally at dispatch — the svod analog of tinygrad `sink.call(bufs)`.
-    pub fn new(name: impl Into<String>, grid: [i64; 3], block: i64, buffers: Vec<Arc<UOp>>) -> Self {
+    pub fn new(name: impl Into<String>, grid: [i64; 3], block: i64, buffers: Vec<Arc<UOp>>, caps: ArchCaps) -> Self {
+        // tk has fragment-layout tables for wave64 (gfx942 CDNA, all kernels) and
+        // wave32 (gfx11 RDNA — matmul; FA stays wave64-only until Stage 2). Any
+        // other wave size has no tables: gate it loudly (such an arch is also
+        // absent from FA_/MATMUL_SUPPORTED_ARCHS and falls back before here).
+        debug_assert!(
+            matches!(caps.wave_size, 32 | 64),
+            "tk supports wave32/wave64 fragment layouts; got wave{}",
+            caps.wave_size
+        );
         let globals = buffers.iter().enumerate().map(|(slot, buf)| flat_param(slot, buf)).collect();
         let block_idx = [
             UOp::special(cidx(grid[0]), "gidx0".to_string()),
@@ -62,6 +74,7 @@ impl Kernel {
         let thread_idx = UOp::special(cidx(block), "lidx0".to_string());
         Kernel {
             name: name.into(),
+            caps,
             block_idx,
             thread_idx,
             globals,
@@ -90,10 +103,10 @@ impl Kernel {
     // ── lane / warp helpers ────────────────────────────────────────────────
 
     pub fn warpid(&self) -> Arc<UOp> {
-        self.thread_idx.try_div(&cidx(WARP_THREADS as i64)).expect("warpid: index div")
+        self.thread_idx.try_div(&cidx(self.caps.wave_size as i64)).expect("warpid: index div")
     }
     pub fn laneid(&self) -> Arc<UOp> {
-        self.thread_idx.try_mod(&cidx(WARP_THREADS as i64)).expect("laneid: index mod")
+        self.thread_idx.try_mod(&cidx(self.caps.wave_size as i64)).expect("laneid: index mod")
     }
 
     // ── ranges ─────────────────────────────────────────────────────────────

@@ -15,7 +15,6 @@ use svod_dtype::{AmdArch, DType};
 use svod_ir::{AxisType, ConstValue, RendererDevice, UOp, WmmaMetadata, WmmaUpcastAxes};
 use svod_schedule::optimizer::{Renderer, TensorCore};
 
-use crate::WARP_THREADS;
 use crate::index::{Idx, cidx, flat_index, flat_offset, index_off, load_at, load_off, load_vec};
 use crate::kernel::Kernel;
 use crate::tile::{GL, RT, RV, RegTile, ST, Tile};
@@ -59,12 +58,21 @@ fn wave_offset(block: Option<&Idx>, frags: i64, local: &Arc<UOp>) -> Idx {
 /// global hops); `inner` is the upcast element index.
 fn lane_rc(
     transpose: bool,
+    interleave: bool,
     laneid: &Arc<UOp>,
     rows: i64,
     cols: i64,
     stride: i64,
     inner: &Arc<UOp>,
 ) -> (Arc<UOp>, Arc<UOp>) {
+    if interleave {
+        // RDNA wave32 WMMA f32 accumulator: even/odd row interleave across the two
+        // wave-halves — `m = 2·j + lane/16, n = lane%16` (j = `inner`; the ×2 is the
+        // wave32 subgroup count `wave_size/16`). The lane-half is the +1 unit and
+        // the register the ×2 — the opposite weighting from the stride branches, so
+        // it can't be expressed as a stride (tinygrad `ops_python` RDNA3 `c_map`).
+        return (iadd(&imul(inner, 2), &idiv(laneid, cols)), imod(laneid, cols));
+    }
     if transpose {
         (iadd(&imul(&idiv(laneid, cols), stride), inner), imod(laneid, cols))
     } else {
@@ -103,18 +111,27 @@ fn wmma_from_tc(tc: &TensorCore, device: RendererDevice) -> WmmaMetadata {
     }
 }
 
-/// The K=16 WMMA descriptor for input dtype `dtype_in`, looked up from the shared
-/// gfx942 (CDNA3) tensor-core table rather than re-encoded here — so bf16/f16 (and,
-/// once [`ArchCaps`] threads the real arch, the RDNA wave32 cores) come from one
-/// source. Both accumulate in f32. Arch is gfx942 today; Unit 5 parameterizes it.
-fn wmma_desc(dtype_in: &DType) -> WmmaMetadata {
-    let ren = Renderer::for_amd_arch(AmdArch::Gfx942);
-    let tc = ren
-        .tensor_cores
-        .iter()
-        .find(|tc| &tc.dtype_in == dtype_in && tc.dims == (16, 16, 16))
-        .unwrap_or_else(|| unimplemented!("no 16×16×16 WMMA for input dtype {dtype_in:?} on gfx942 (bf16 | f16)"));
+/// The K=16 WMMA descriptor for input dtype `dtype_in` on `arch`, looked up from
+/// the shared per-arch tensor-core table (`Renderer::for_amd_arch`) rather than
+/// re-encoded here — so bf16/f16 on CDNA's MFMA cores and the RDNA wave32 cores
+/// come from one source. Both accumulate in f32. `arch` is threaded from
+/// [`crate::ArchCaps::arch`] (gfx942 in practice; the table already carries the
+/// RDNA cores for when a wave32 arch is enabled).
+fn wmma_desc(arch: AmdArch, dtype_in: &DType) -> WmmaMetadata {
+    let ren = Renderer::for_amd_arch(arch);
+    let tc =
+        ren.tensor_cores.iter().find(|tc| &tc.dtype_in == dtype_in && tc.dims == (16, 16, 16)).unwrap_or_else(|| {
+            unimplemented!("no 16×16×16 WMMA for input dtype {dtype_in:?} on {arch:?} (bf16 | f16)")
+        });
     wmma_from_tc(tc, ren.device)
+}
+
+/// Per-lane element count for a WMMA operand = product of its upcast-axis sizes
+/// (`wmma_from_tc` builds these as `log2(elements_per_thread)` size-2 entries, so
+/// the product is the elements-per-thread). gfx942 16×16×16 → A/B/C = 4/4/4; RDNA
+/// → 16/16/8 (replicated 16-wide inputs, 8-wide accumulator). Empty axes ⇒ 1.
+fn upcast_count(axes: &[(usize, usize)]) -> i64 {
+    axes.iter().map(|(_, sz)| *sz as i64).product()
 }
 
 /// Scalar geometry of the coalesced GLOBAL↔LDS fill for one ST tile (the part
@@ -157,7 +174,7 @@ impl Kernel {
     /// tiles (HK 2×4 wave grid, `GEMM:67-68`).
     pub fn group_2d(&self, rows_waves: usize, cols_waves: usize) -> Group<'_> {
         let warps = rows_waves * cols_waves;
-        Group { warps, rows_waves, cols_waves, group_threads: warps * WARP_THREADS, ker: self }
+        Group { warps, rows_waves, cols_waves, group_threads: warps * self.caps.wave_size, ker: self }
     }
 }
 
@@ -174,7 +191,7 @@ impl<'k> Group<'k> {
 
     /// The wave's flat index within the group (`(threadIdx % group_threads)/64`).
     pub fn warpid_in_group(&self) -> Arc<UOp> {
-        idiv(&imod(&self.ker.thread_idx, self.group_threads as i64), WARP_THREADS as i64)
+        idiv(&imod(&self.ker.thread_idx, self.group_threads as i64), self.ker.caps.wave_size as i64)
     }
     /// The wave's row in the `rows_waves × cols_waves` wave grid (`GEMM:67`).
     pub fn warp_row(&self) -> Arc<UOp> {
@@ -435,7 +452,7 @@ impl<'k> Group<'k> {
         // the prior LDS sibling tree.
         let partial = read0(&red_reg.after(smallvec![latest]));
         let mut acc = partial.clone();
-        for d in [16i64, 32, 48] {
+        for d in self.ker.caps.reduce_tree() {
             let src_lane = imod(&iadd(&laneid, &cidx(d)), self.group_threads as i64);
             acc = op(&acc, &self.shuffle_lane(&partial, &src_lane));
         }
@@ -511,7 +528,7 @@ impl<'k> Group<'k> {
             // the looped form): read this lane's partial once, gather L+{16,32,48}.
             let partial = read0(&red_reg.after(smallvec![latest]));
             let mut acc = partial.clone();
-            for d in [16i64, 32, 48] {
+            for d in self.ker.caps.reduce_tree() {
                 let src_lane = imod(&iadd(&laneid, &cidx(d)), self.group_threads as i64);
                 acc = op(&acc, &self.shuffle_lane(&partial, &src_lane));
             }
@@ -567,12 +584,13 @@ impl<'k> Group<'k> {
             return self.mma_u(c, a, b, a_t, b_t);
         }
         // Wave-agnostic: each wave runs the WMMA on its own per-lane RT operands
-        // (the wave sub-tile selection happens in the LDS→REG load, not here).
-        let lanes: i64 = match a.base.base.cols {
-            16 => 4,
-            other => unimplemented!("mma: base cols {other} not ported (gfx942 K=16 → 4 lanes)"),
-        };
-        let meta = wmma_desc(a.elem());
+        // (the wave sub-tile selection happens in the LDS→REG load, not here). The
+        // per-lane operand widths come from the descriptor (gfx942 4/4/4; RDNA
+        // 16/16/8), not a hardcoded 4.
+        assert_eq!(a.base.base.cols, 16, "mma: only the 16-col WMMA base is supported");
+        let meta = wmma_desc(self.ker.caps.arch, a.elem());
+        let (a_w, b_w, c_w) =
+            (upcast_count(&meta.upcast_axes.a), upcast_count(&meta.upcast_axes.b), upcast_count(&meta.upcast_axes.c));
 
         let h_end = c.shape()[c.shape().len() - 3] as i64;
         let w_end = c.shape()[c.shape().len() - 2] as i64;
@@ -582,7 +600,7 @@ impl<'k> Group<'k> {
         let inner = self.ker.raw_range(k_end, AxisType::Reduce);
 
         let a_in = UOp::vectorize(
-            (0..lanes)
+            (0..a_w)
                 .map(|i| {
                     let idx = if a_t {
                         [Idx::from(&inner), Idx::from(&height), Idx::Const(i)]
@@ -594,7 +612,7 @@ impl<'k> Group<'k> {
                 .collect(),
         );
         let b_in = UOp::vectorize(
-            (0..lanes)
+            (0..b_w)
                 .map(|i| {
                     let idx = if b_t {
                         [Idx::from(&width), Idx::from(&inner), Idx::Const(i)]
@@ -613,13 +631,13 @@ impl<'k> Group<'k> {
         // the read inside the K loop so it observes the prior iteration's store.
         let c_acc = c.uop().after(smallvec![inner.clone()]);
         let d_in = UOp::vectorize(
-            (0..4)
+            (0..c_w)
                 .map(|i| load_at(&c_acc, c.shape(), &[Idx::from(&height), Idx::from(&width), Idx::Const(i)]))
                 .collect(),
         );
 
         let out = UOp::wmma(a_in, b_in, d_in, meta);
-        let c_i: Vec<Arc<UOp>> = (0..4)
+        let c_i: Vec<Arc<UOp>> = (0..c_w)
             .map(|i| {
                 flat_index(c.uop(), c.shape(), &[Idx::from(&height), Idx::from(&width), Idx::Const(i)])
                     .store(out.gep(vec![i as usize]))
@@ -643,11 +661,10 @@ impl<'k> Group<'k> {
     /// KV loop's `END` scopes them all (cf. the matmul accumulator chain,
     /// `kernels/matmul.rs:201`). Bit-identical accumulation order to [`Self::mma`].
     fn mma_u(&self, c: RT<'k>, a: &RT<'k>, b: &RT<'k>, a_t: bool, b_t: bool) -> RT<'k> {
-        let lanes: i64 = match a.base.base.cols {
-            16 => 4,
-            other => unimplemented!("mma_u: base cols {other} not ported (gfx942 K=16 → 4 lanes)"),
-        };
-        let meta = wmma_desc(a.elem());
+        assert_eq!(a.base.base.cols, 16, "mma_u: only the 16-col WMMA base is supported");
+        let meta = wmma_desc(self.ker.caps.arch, a.elem());
+        let (a_w, b_w, c_w) =
+            (upcast_count(&meta.upcast_axes.a), upcast_count(&meta.upcast_axes.b), upcast_count(&meta.upcast_axes.c));
 
         let h_end = c.shape()[c.shape().len() - 3] as i64;
         let w_end = c.shape()[c.shape().len() - 2] as i64;
@@ -665,7 +682,7 @@ impl<'k> Group<'k> {
                 let mut frag_prev: Option<Arc<UOp>> = None;
                 for k in 0..k_end {
                     let a_in = UOp::vectorize(
-                        (0..lanes)
+                        (0..a_w)
                             .map(|i| {
                                 let idx = if a_t {
                                     [Idx::Const(k), Idx::Const(h), Idx::Const(i)]
@@ -677,7 +694,7 @@ impl<'k> Group<'k> {
                             .collect(),
                     );
                     let b_in = UOp::vectorize(
-                        (0..lanes)
+                        (0..b_w)
                             .map(|i| {
                                 let idx = if b_t {
                                     [Idx::Const(w), Idx::Const(k), Idx::Const(i)]
@@ -706,12 +723,12 @@ impl<'k> Group<'k> {
                     // chain through their stores, which are already loop-scoped.
                     let c_src = if deps.is_empty() { self.anchor(c.uop()) } else { c.uop().after(deps) };
                     let d_in = UOp::vectorize(
-                        (0..4)
+                        (0..c_w)
                             .map(|i| load_at(&c_src, c.shape(), &[Idx::Const(h), Idx::Const(w), Idx::Const(i)]))
                             .collect(),
                     );
                     let out = UOp::wmma(a_in, b_in, d_in, meta.clone());
-                    let c_i: Vec<Arc<UOp>> = (0..4)
+                    let c_i: Vec<Arc<UOp>> = (0..c_w)
                         .map(|i| {
                             flat_index(c.uop(), c.shape(), &[Idx::Const(h), Idx::Const(w), Idx::Const(i)])
                                 .store(out.gep(vec![i as usize]))
@@ -1077,7 +1094,8 @@ impl<'k> Group<'k> {
         let width = self.ker.raw_range(rt_w, AxisType::Loop);
         let inner = self.ker.raw_range(ept, AxisType::Loop);
 
-        let (row, col) = lane_rc(rt.layout != st.layout, &laneid, base_rows, base_cols, stride, &inner);
+        let (row, col) =
+            lane_rc(rt.layout != st.layout, rt.base.interleave, &laneid, base_rows, base_cols, stride, &inner);
         let (srow, scol) = st.base.swizzle.swizzle_rc(row, col, st.base.base.cols, st.elem().base());
 
         // Wave sub-tile fragment offset (SI-1): the caller passes the wave's
@@ -1132,7 +1150,8 @@ impl<'k> Group<'k> {
 
         let base_row = imul(&height, base_rows);
         let base_col = imul(&width, base_cols);
-        let (row, col) = lane_rc(rt.layout == TileLayout::Col, &laneid, base_rows, base_cols, stride, &inner);
+        let (row, col) =
+            lane_rc(rt.layout == TileLayout::Col, rt.base.interleave, &laneid, base_rows, base_cols, stride, &inner);
         let srow = iadd(&base_row, &row);
         let scol = iadd(&base_col, &col);
         let off = iadd(&src_i_base, &iadd(&imul(&srow, row_stride), &scol));
@@ -1161,7 +1180,8 @@ impl<'k> Group<'k> {
         let width = self.ker.raw_range(rt_w, AxisType::Loop);
         let inner = self.ker.raw_range(ept, AxisType::Loop);
 
-        let (row, col) = lane_rc(rt.layout != st.layout, &laneid, base_rows, base_cols, stride, &inner);
+        let (row, col) =
+            lane_rc(rt.layout != st.layout, rt.base.interleave, &laneid, base_rows, base_cols, stride, &inner);
         let (srow, scol) = st.base.swizzle.swizzle_rc(row, col, st.base.base.cols, st.elem().base());
 
         let mut sidx: Vec<Idx> = src_idxs.to_vec();
@@ -1213,7 +1233,8 @@ impl<'k> Group<'k> {
 
         let base_row = imul(&height, base_rows);
         let base_col = imul(&width, base_cols);
-        let (row, col) = lane_rc(rt.layout == TileLayout::Col, &laneid, base_rows, base_cols, stride, &inner);
+        let (row, col) =
+            lane_rc(rt.layout == TileLayout::Col, rt.base.interleave, &laneid, base_rows, base_cols, stride, &inner);
         let srow = iadd(&base_row, &row);
         let scol = iadd(&base_col, &col);
         let off = iadd(&dst_i_base, &iadd(&imul(&srow, row_stride), &scol));

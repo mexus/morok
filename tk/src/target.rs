@@ -22,24 +22,34 @@ use svod_dtype::{AmdArch, DeviceSpec};
 
 use crate::launch::{Result, UnsupportedTargetSnafu};
 
-/// Verify the kernel inputs' device `spec` is one of the kernel's `supported` AMD
-/// arches **and** the AMD LLVM (`clang` amdgcn) toolchain is available. Resolves the
-/// arch from `spec`'s `device_id` via the topology (no `Device` open); a non-AMD
-/// spec (or an unreadable/unsupported device) fails the supported-arch check. Call
-/// from a kernel launcher with `Tensor::device()`.
-pub fn check_target(spec: &DeviceSpec, supported: &[AmdArch]) -> Result<()> {
-    let arch = match spec {
+/// Resolve the concrete AMD [`AmdArch`] backing a [`DeviceSpec`] from the KFD
+/// topology (a non-AMD or unreadable device → `None`). The arch is deliberately
+/// not in the spec (a hardware property), so it is looked up by `device_id`.
+/// [`resolve_supported_arch`] gates on it and returns it; [`check_target`] is the
+/// `()`-returning wrapper for callers that only need the gate.
+pub fn resolve_arch(spec: &DeviceSpec) -> Option<AmdArch> {
+    match spec {
         DeviceSpec::Amd { device_id } => svod_device::registry::resolve_amd_arch_from_topology(*device_id).ok(),
         _ => None,
-    };
-    if !arch.is_some_and(|a| supported.contains(&a)) {
+    }
+}
+
+/// Gate the kernel inputs' device `spec` to one of the kernel's `supported` AMD
+/// arches **and** verify the AMD LLVM (`clang` amdgcn) toolchain — returning the
+/// resolved arch so the launcher can build [`crate::ArchCaps::for_arch`] from it
+/// **without a second topology probe**. A non-AMD spec, an unsupported/unreadable
+/// device, or a missing toolchain fails. This is the single arch resolution per
+/// launch; call it from a kernel launcher with `Tensor::device()`.
+pub fn resolve_supported_arch(spec: &DeviceSpec, supported: &[AmdArch]) -> Result<AmdArch> {
+    let resolved = resolve_arch(spec);
+    let Some(arch) = resolved.filter(|a| supported.contains(a)) else {
         return UnsupportedTargetSnafu {
             reason: format!(
-                "kernel supports AMD arch(es) {supported:?}, but device {spec:?} resolved to arch {arch:?}"
+                "kernel supports AMD arch(es) {supported:?}, but device {spec:?} resolved to arch {resolved:?}"
             ),
         }
         .fail();
-    }
+    };
     if !svod_runtime::amd::has_amdgpu_target() {
         return UnsupportedTargetSnafu {
             reason: "AMD LLVM target unavailable — `clang` with the amdgcn backend is required to compile \
@@ -48,5 +58,12 @@ pub fn check_target(spec: &DeviceSpec, supported: &[AmdArch]) -> Result<()> {
         }
         .fail();
     }
-    Ok(())
+    Ok(arch)
+}
+
+/// [`resolve_supported_arch`] discarding the arch — the gate-only wrapper for
+/// launchers that don't need the resolved arch (the SDPA-fallback eligibility
+/// check folds this into [`resolve_supported_arch`] directly instead).
+pub fn check_target(spec: &DeviceSpec, supported: &[AmdArch]) -> Result<()> {
+    resolve_supported_arch(spec, supported).map(|_| ())
 }

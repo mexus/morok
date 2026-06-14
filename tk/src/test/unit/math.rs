@@ -7,7 +7,7 @@ use crate::Kernel;
 use crate::tiles::{RT_16X16, TileLayout, VecLayout};
 
 fn probe() -> Kernel {
-    Kernel::new("math_probe", [1, 1, 1], 64, vec![])
+    Kernel::new("math_probe", [1, 1, 1], 64, vec![], crate::ArchCaps::GFX942)
 }
 
 /// `exp2` maps an `Exp2` unary over the tile and stores it back.

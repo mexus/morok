@@ -1,3 +1,4 @@
+mod arch;
 mod bench;
 mod fa;
 mod grid;

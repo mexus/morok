@@ -74,7 +74,8 @@ fn test_accumulator_after_bare_store_cpu() {
 
         // Bind the Kernel to the concrete BUFFER UOps (output first, then input);
         // `gl()` hands them out as flat 1-D Params — no `flat_ptr` unwrap needed.
-        let ker = crate::Kernel::new("acc", [1, 1, 1], 1, vec![dst.uop().base(), src.uop().base()]);
+        let ker =
+            crate::Kernel::new("acc", [1, 1, 1], 1, vec![dst.uop().base(), src.uop().base()], crate::ArchCaps::GFX942);
         let out_buf = ker.next_global();
         let in_buf = ker.next_global();
 

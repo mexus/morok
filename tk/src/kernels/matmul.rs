@@ -10,8 +10,8 @@ use svod_ir::UOp;
 use svod_tensor::Tensor;
 
 use crate::index::{Idx, cidx};
-use crate::tiles::{RT_16X16, ST_16X16_SWIZZLED, TileLayout};
-use crate::{Kernel, RT, RegTile, WARP_THREADS};
+use crate::tiles::{RT_16X16, RT_16X16_W32_ACC, RT_16X16_W32_IN, ST_16X16_SWIZZLED, ST_16X16_SWIZZLED_W32, TileLayout};
+use crate::{Kernel, RT, RegTile};
 
 /// K-reduction step (the LDS strip depth, shared by every config). HK `GEMM:6`.
 pub const K_STEP: usize = 64;
@@ -52,9 +52,9 @@ impl MatmulCfg {
     pub const fn blocks_per_side(&self) -> usize {
         self.block / self.reg()
     }
-    /// Launch block size (threads) = `wave_rows * wave_cols * 64`.
-    pub const fn threads(&self) -> i64 {
-        (self.wave_rows * self.wave_cols * WARP_THREADS) as i64
+    /// Launch block size (threads) = `wave_rows * wave_cols * wave_size`.
+    pub const fn threads(&self, wave_size: usize) -> i64 {
+        (self.wave_rows * self.wave_cols * wave_size) as i64
     }
     /// Grid edge (`n / block`).
     pub const fn grid(&self, n: usize) -> i64 {
@@ -118,10 +118,11 @@ pub fn build_matmul_adaptive(ker: &Kernel, n: usize) {
     build_matmul_cfg(ker, n, cfg_for_n(n));
 }
 
-/// The GPU arch(es) the tile matmul is built for (gfx942 WMMA, like FA). Adding a
-/// GPU means extending this list once its arch-specific bits exist — the launcher
-/// gates against it; see [`crate::target::check_target`].
-pub const MATMUL_SUPPORTED_ARCHS: &[svod_dtype::AmdArch] = &[svod_dtype::AmdArch::Gfx942];
+/// The GPU arch(es) the tile matmul is built for: gfx942 (CDNA MFMA, wave64) and
+/// gfx1151 (RDNA3.5 WMMA, wave32 — the `_W32_*` fragment shapes). The launcher
+/// gates against this; see [`crate::target::check_target`]. (gfx1151 is pending
+/// hardware validation — a wrong fragment map shows as a permuted output.)
+pub const MATMUL_SUPPORTED_ARCHS: &[svod_dtype::AmdArch] = &[svod_dtype::AmdArch::Gfx942, svod_dtype::AmdArch::Gfx1151];
 
 /// **Graph-native** `n×n` bf16→f32 tile matmul: returns a lazy output [`Tensor`]
 /// (a `custom_kernel` / `Op::Call` node) — the matmul peer of
@@ -129,7 +130,10 @@ pub const MATMUL_SUPPORTED_ARCHS: &[svod_dtype::AmdArch] = &[svod_dtype::AmdArch
 /// the normal `prepare()` → `execute_profiled` path. `a`/`b` are square `[n, n]`
 /// bf16; uses the size-adaptive config ([`cfg_for_n`]).
 pub fn matmul(a: &svod_tensor::Tensor, b: &svod_tensor::Tensor) -> crate::LaunchResult<Tensor> {
-    crate::target::check_target(&a.device(), MATMUL_SUPPORTED_ARCHS)?;
+    // Single resolve: gate to a supported arch (+ toolchain) and reuse the arch to
+    // build caps so the launch block (`waves * wave_size`) and the kernel's wave
+    // math track the real wave width.
+    let caps = crate::ArchCaps::for_arch(crate::target::resolve_supported_arch(&a.device(), MATMUL_SUPPORTED_ARCHS)?);
     let dim = |t: &Tensor, i: usize| t.shape().expect("shape")[i].as_const().expect("concrete dim");
     let (am, an) = (dim(a, 0), dim(a, 1));
     let (bm, bn) = (dim(b, 0), dim(b, 1));
@@ -142,7 +146,7 @@ pub fn matmul(a: &svod_tensor::Tensor, b: &svod_tensor::Tensor) -> crate::Launch
 
     let cfg = cfg_for_n(n);
     let out = Tensor::empty(&[n, n], DType::Float32);
-    crate::graph_launch("matmul", cfg.grid_dims(n), cfg.threads(), out, &[a, b], move |ker| {
+    crate::graph_launch("matmul", cfg.grid_dims(n), cfg.threads(caps.wave_size), out, &[a, b], caps, move |ker| {
         build_matmul_cfg(ker, n, cfg);
         ker.finish(cfg.n_accum)
     })
@@ -161,6 +165,18 @@ pub fn build_matmul_cfg(ker: &Kernel, n: usize, cfg: MatmulCfg) {
     let reg = cfg.reg();
     let g = ker.group_2d(cfg.wave_rows, cfg.wave_cols);
 
+    // WMMA fragment layout is arch-specific: gfx942 (CDNA MFMA, wave64) vs gfx11
+    // (RDNA WMMA, wave32). The A/B input *orientation* is the SAME on both — lane =
+    // M (A) / N (B), element = K (tinygrad `a_elem(x,k,row)=x[k][row]`) — only the
+    // packing differs: CDNA spreads K across lane-groups (`ept=4, stride=4`); RDNA
+    // holds all 16 K per lane, replicated across wave-halves (`ept=16, stride=0`).
+    // The accumulator differs more (even/odd row interleave — see `RT_16X16_W32_ACC`).
+    let (st_sw, rt_acc, rt_in) = if ker.caps.arch.is_cdna() {
+        (ST_16X16_SWIZZLED, RT_16X16, RT_16X16)
+    } else {
+        (ST_16X16_SWIZZLED_W32, RT_16X16_W32_ACC, RT_16X16_W32_IN)
+    };
+
     // GL params bind in declaration order: out (c, f32), then ins (a, b — bf16).
     let c_gl = ker.gl(&[1, 1, n, n], DType::Float32);
     let a_gl = ker.gl(&[1, 1, n, n], DType::BFloat16);
@@ -168,8 +184,8 @@ pub fn build_matmul_cfg(ker: &Kernel, n: usize, cfg: MatmulCfg) {
 
     // A strip [block×K_STEP] = [M,K]; B strip [K_STEP×block] = [K,N]; both
     // XOR-swizzled, single-buffered.
-    let a_smem = ker.st((cfg.block, K_STEP), DType::BFloat16, TileLayout::Row, ST_16X16_SWIZZLED);
-    let b_smem = ker.st((K_STEP, cfg.block), DType::BFloat16, TileLayout::Row, ST_16X16_SWIZZLED);
+    let a_smem = ker.st((cfg.block, K_STEP), DType::BFloat16, TileLayout::Row, st_sw);
+    let b_smem = ker.st((K_STEP, cfg.block), DType::BFloat16, TileLayout::Row, st_sw);
 
     let (row, col) = block_coords(ker, n, &cfg); // (pid_m, pid_n) in block units
     let warp_row = g.warp_row();
@@ -177,7 +193,7 @@ pub fn build_matmul_cfg(ker: &Kernel, n: usize, cfg: MatmulCfg) {
 
     // `n_accum` col-major reg×reg f32 accumulators per wave.
     let accs: Vec<RT> =
-        (0..cfg.n_accum).map(|_| g.zero(ker.rt((reg, reg), DType::Float32, TileLayout::Col, RT_16X16))).collect();
+        (0..cfg.n_accum).map(|_| g.zero(ker.rt((reg, reg), DType::Float32, TileLayout::Col, rt_acc))).collect();
 
     let tile = ker.range((n / K_STEP) as i64);
 
@@ -198,7 +214,7 @@ pub fn build_matmul_cfg(ker: &Kernel, n: usize, cfg: MatmulCfg) {
     // per-accumulator A sub-tiles (M row-block {warp_row + a*wave_rows}).
     let bb = g
         .load(
-            ker.rt((K_STEP, reg), DType::BFloat16, TileLayout::Col, RT_16X16).into(),
+            ker.rt((K_STEP, reg), DType::BFloat16, TileLayout::Col, rt_in).into(),
             b_smem.into(),
             &[],
             &[Idx::Const(0), Idx::from(&warp_col)],
@@ -208,7 +224,7 @@ pub fn build_matmul_cfg(ker: &Kernel, n: usize, cfg: MatmulCfg) {
     let a_subs: Vec<RT> = (0..cfg.n_accum)
         .map(|a| {
             g.load(
-                ker.rt((reg, K_STEP), DType::BFloat16, TileLayout::Row, RT_16X16).into(),
+                ker.rt((reg, K_STEP), DType::BFloat16, TileLayout::Row, rt_in).into(),
                 a_smem.clone().into(),
                 &[],
                 &[Idx::Uop(acc_row(&warp_row, a, &cfg))],

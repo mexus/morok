@@ -17,6 +17,7 @@
 //!
 //! Other arches / dtypes / K values are intentionally out of scope.
 
+pub mod arch;
 pub mod asm;
 pub mod grid;
 pub mod group;
@@ -32,9 +33,15 @@ pub mod target;
 pub mod tile;
 pub mod tiles;
 
-/// Threads per warp/wave on the supported target (gfx942 = wave64).
+/// Threads per warp/wave the **register-tile fragment-layout tables**
+/// ([`tiles`] strides, [`group`]'s per-lane WMMA upcast counts) are calibrated
+/// for — gfx942 wave64. The *runtime* lane count flows through
+/// [`ArchCaps::wave_size`](arch::ArchCaps::wave_size); this constant is only the
+/// layout-table calibration, pinned to the canonical arch by the assert below.
 pub const WARP_THREADS: usize = 64;
+const _: () = assert!(WARP_THREADS == svod_dtype::AmdArch::Gfx942.wave_size() as usize);
 
+pub use arch::ArchCaps;
 pub use group::Group;
 pub use kernel::Kernel;
 pub use kernels::fa::{

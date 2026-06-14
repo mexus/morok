@@ -31,7 +31,13 @@ fn test_pipeline_hints_emit_asm() {
     let tiles = n / K_STEP;
 
     let custom_codes = |stage| {
-        let ker = Kernel::new("pipe", M1_CFG.grid_dims(n), M1_CFG.threads(), dummy_buffers(n));
+        let ker = Kernel::new(
+            "pipe",
+            M1_CFG.grid_dims(n),
+            M1_CFG.threads(crate::WARP_THREADS),
+            dummy_buffers(n),
+            crate::ArchCaps::GFX942,
+        );
         build_matmul_pipelined(&ker, n, stage);
         ker.finish(M1_CFG.n_accum)
             .toposort()
@@ -63,7 +69,7 @@ fn test_pipeline_hints_emit_asm() {
 /// 16×16×16 / 4-4-4 descriptor.
 #[test]
 fn test_mma_ab_wmma_graph_shape() {
-    let ker = Kernel::new("mma_probe", [1, 1, 1], 64, vec![]);
+    let ker = Kernel::new("mma_probe", [1, 1, 1], 64, vec![], crate::ArchCaps::GFX942);
     let warp = ker.warp();
 
     let a = ker.rt((64, 64), DType::BFloat16, TileLayout::Row, RT_16X16);
@@ -104,7 +110,7 @@ fn test_mma_ab_wmma_graph_shape() {
 fn test_mma_unroll_flattens_mfma() {
     let build = |unroll: bool| {
         let n = 32usize;
-        let ker = Kernel::new("mma_unroll_probe", [1, 1, 1], 64, dummy_buffers(n));
+        let ker = Kernel::new("mma_unroll_probe", [1, 1, 1], 64, dummy_buffers(n), crate::ArchCaps::GFX942);
         ker.set_unroll(unroll);
         let c_gl = ker.gl(&[1, 1, n, n], DType::Float32);
         let _a_gl = ker.gl(&[1, 1, n, n], DType::BFloat16);
@@ -152,7 +158,13 @@ fn test_mma_unroll_flattens_mfma() {
 #[test]
 fn test_matmul_db_sched_pass_amd_text() {
     let n = 512usize;
-    let ker = Kernel::new("matmul_db", M1_CFG.grid_dims(n), M1_CFG.threads(), dummy_buffers(n));
+    let ker = Kernel::new(
+        "matmul_db",
+        M1_CFG.grid_dims(n),
+        M1_CFG.threads(crate::WARP_THREADS),
+        dummy_buffers(n),
+        crate::ArchCaps::GFX942,
+    );
     build_matmul_db(&ker, n);
     let sink = ker.finish(M1_CFG.n_accum);
     let lowered = svod_schedule::graph_rewrite(&svod_schedule::symbolic::pm_lower_index_dtype(), sink, &mut ());
@@ -171,13 +183,45 @@ fn test_matmul_db_sched_pass_amd_text() {
     assert!(!code.contains("s_setprio"), "GEMM delegates to iglp — no manual priority brackets");
 }
 
+/// gfx1151 (RDNA3.5) matmul renders to **WMMA**, not MFMA (host, no GPU). Built
+/// with wave32 [`crate::ArchCaps`], the kernel must select the `_W32_*` fragment
+/// shapes and lower to `llvm.amdgcn.wmma.f32.16x16x16.bf16` (with bf16 inputs
+/// bitcast to `<16 x i16>` and an `<8 x float>` accumulator) — never an `mfma`
+/// (CDNA-only). This proves the arch-select + wave32 layout build & emit the
+/// right intrinsic; numerical correctness is gated on gfx1151 hardware.
+#[test]
+fn test_matmul_rdna_renders_wmma() {
+    let n = 64usize; // SMALL_CFG: block=64, 1 wave, 32 threads (wave32).
+    let ker = Kernel::new(
+        "matmul_rdna",
+        SMALL_CFG.grid_dims(n),
+        SMALL_CFG.threads(32),
+        dummy_buffers(n),
+        crate::ArchCaps::for_arch(svod_dtype::AmdArch::Gfx1151),
+    );
+    build_matmul_cfg(&ker, n, SMALL_CFG);
+    let sink = ker.finish(SMALL_CFG.n_accum);
+    let lowered = svod_schedule::graph_rewrite(&svod_schedule::symbolic::pm_lower_index_dtype(), sink, &mut ());
+    let program = svod_codegen::program_pipeline::program_from_sink(lowered, DeviceSpec::Cpu);
+    let linearized = svod_codegen::program_pipeline::do_linearize(&program).expect("do_linearize");
+    let linear_uop =
+        linearized.toposort().into_iter().find(|u| matches!(u.op(), Op::Linear { .. })).expect("LINEAR present");
+    let renderer = svod_codegen::llvm::LlvmTextRenderer::amd(svod_dtype::AmdArch::Gfx1151);
+    // Renders (no OOM/panic) ⇒ the wave32 fragment shapes lower cleanly.
+    let code =
+        svod_codegen::traits::Renderer::render(&renderer, &linear_uop, Some("matmul_rdna")).expect("render").code;
+
+    assert!(code.contains("llvm.amdgcn.wmma.f32.16x16x16.bf16"), "gfx1151 matmul must emit the RDNA WMMA intrinsic");
+    assert!(!code.contains("mfma"), "gfx1151 is WMMA, not CDNA MFMA");
+}
+
 /// A `group_2d(2,4)` is 8 waves / 512 threads, with `warp_row`/`warp_col`
 /// derived as `div`/`mod` of the wave id by `cols_waves`.
 #[test]
 fn test_group_2d_wave_index_shape() {
     use svod_ir::{BinaryOp, Op};
 
-    let ker = Kernel::new("wave_probe", [1, 1, 1], 512, vec![]);
+    let ker = Kernel::new("wave_probe", [1, 1, 1], 512, vec![], crate::ArchCaps::GFX942);
     let g = ker.group_2d(2, 4);
     assert_eq!(g.warps, 8, "2×4 wave grid = 8 waves");
     assert_eq!(g.rows_waves, 2);
@@ -207,7 +251,7 @@ fn test_group_2d_wave_index_shape() {
 fn test_st_db_base_offset_infra() {
     use crate::tiles::ST_16X16_SWIZZLED;
 
-    let ker = Kernel::new("db_infra", [1, 1, 1], 512, vec![]);
+    let ker = Kernel::new("db_infra", [1, 1, 1], 512, vec![], crate::ArchCaps::GFX942);
     // Single-half flat element count for a 256×32 bf16 tile (base 16×16):
     // (256/16)*(32/16)*16*16 = 16*2*256 = 8192.
     let db = ker.st_db((256, 32), DType::BFloat16, TileLayout::Row, ST_16X16_SWIZZLED);
@@ -293,6 +337,83 @@ fn max_abs_err(got: &[f32], expected: &[f32]) -> f32 {
     got.iter().zip(expected).map(|(g, e)| (g - e).abs()).fold(0.0f32, f32::max)
 }
 
+/// Diagnostic (run on gfx1151): the wave32 matmul is deterministic-but-wrong, and
+/// garbage-scale error can't tell *which* layout transform it computes. This
+/// compares `got` against every transpose/permutation candidate — the one that
+/// reads ≈0 names the bug exactly (output transpose, A/B operand transpose, A↔B
+/// swap, …); if none match, the GLOBAL→LDS fill or replication is misplacing data.
+/// `SVOD_DEVICE=AMD:0 cargo test -p svod-tk --lib matmul::test_matmul_rdna_diagnose -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn test_matmul_rdna_diagnose() {
+    use svod_tensor::Tensor;
+    let n = 64usize;
+    let (a, b) = matmul_inputs(n);
+    let got = launch_matmul("matmul_diag", n, SMALL_CFG, |ker| build_matmul_cfg(ker, n, SMALL_CFG), &a, &b);
+
+    let f = |t: &Tensor| t.cast(DType::Float32).expect("→f32");
+    let (af, bf) = (f(&a), f(&b));
+    let tr = |x: &Tensor| x.try_permute(&[1, 0]).expect("transpose");
+    let mm = |x: &Tensor, y: &Tensor| x.matmul(y).expect("matmul");
+    let vec = |mut x: Tensor| {
+        x.realize().expect("realize");
+        x.as_vec::<f32>().expect("read")
+    };
+
+    let candidates: Vec<(&str, Tensor)> = vec![
+        ("A·B (expected)", mm(&af, &bf)),
+        ("(A·B)^T", tr(&mm(&af, &bf))),
+        ("A^T·B", mm(&tr(&af), &bf)),
+        ("A·B^T", mm(&af, &tr(&bf))),
+        ("A^T·B^T", mm(&tr(&af), &tr(&bf))),
+        ("B·A", mm(&bf, &af)),
+        ("(B·A)^T", tr(&mm(&bf, &af))),
+    ];
+    println!("RDNA matmul diagnosis (N={n}, SMALL_CFG):");
+    for (name, cand) in candidates {
+        println!("  got vs {name:16}: max abs err = {:e}", max_abs_err(&got, &vec(cand)));
+    }
+}
+
+/// Element-level diagnostic: `A = I`, `B[k][j] = (k%16)*16 + (j%16)` ⇒ `C = B`, so
+/// the first 16×16 output fragment should read `got[i][j] = i*16 + j` (row i = `[16i,
+/// 16i+1, …, 16i+15]`). Any within-fragment permutation (the suspected wave32 bug)
+/// shows directly in the printed grid: at dest `(i,j)` a value `V` means the kernel
+/// placed source element `(V/16, V%16)` there. Validated on gfx942 (prints the clean
+/// grid); run on gfx1151 and paste the grid back to decode the lane/reg→(m,n) map.
+/// `SVOD_DEVICE=AMD:0 cargo test -p svod-tk --lib matmul::test_matmul_rdna_grid -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn test_matmul_rdna_grid() {
+    use svod_tensor::Tensor;
+    let n = 64usize;
+    let mut a_data = vec![0f32; n * n];
+    for i in 0..n {
+        a_data[i * n + i] = 1.0; // identity
+    }
+    let b_data: Vec<f32> = (0..n * n).map(|p| (((p / n) % 16) * 16 + (p % n) % 16) as f32).collect();
+    let mk =
+        |d: &[f32]| Tensor::from_slice(d).try_reshape([n, n]).expect("reshape").cast(DType::BFloat16).expect("→bf16");
+    let (mut a, mut b) = (mk(&a_data), mk(&b_data));
+    a.realize().expect("realize a");
+    b.realize().expect("realize b");
+    let got = launch_matmul("matmul_grid", n, SMALL_CFG, |ker| build_matmul_cfg(ker, n, SMALL_CFG), &a, &b);
+
+    println!("got fragment(0,0) — correct row i = [16i .. 16i+15]:");
+    for i in 0..16 {
+        let row: Vec<i32> = (0..16).map(|j| got[i * n + j].round() as i32).collect();
+        println!("  i={i:2}: {row:?}");
+    }
+}
+
+/// True on a CDNA (gfx942) device. The M2 perf builders (`build_matmul_db`,
+/// `build_matmul_pipelined`) are gfx942-only — not ported to the RDNA wave32
+/// fragment layout — so their HW tests skip on a non-CDNA target.
+fn is_cdna_device() -> bool {
+    let dev = svod_tensor::Tensor::rand(&[16, 16]).expect("probe tensor").device();
+    crate::target::resolve_arch(&dev).is_some_and(|a| a.is_cdna())
+}
+
 /// Build + dispatch a matmul `cfg` over `(a, b)` once, returning the f32 C.
 fn launch_matmul<F>(
     name: &str,
@@ -306,8 +427,11 @@ where
     F: FnOnce(&Kernel),
 {
     use svod_tensor::Tensor;
+    // Launch block must match the device wave size (gfx942 wave64, gfx11 wave32),
+    // matching the `matmul()` entry's `cfg.threads(caps.wave_size)`.
+    let ws = crate::target::resolve_arch(&a.device()).map(|ar| ar.wave_size() as usize).unwrap_or(64);
     let mut c = Tensor::empty(&[n, n], DType::Float32);
-    crate::run_kernel(name, cfg.grid_dims(n), cfg.threads(), &mut [&mut c], &[a, b], |ker| {
+    crate::run_kernel(name, cfg.grid_dims(n), cfg.threads(ws), &mut [&mut c], &[a, b], |ker| {
         build(ker);
         ker.finish(cfg.n_accum)
     })
@@ -370,6 +494,10 @@ fn test_matmul_adaptive_amd() {
 #[test]
 #[ignore]
 fn test_matmul_db_amd() {
+    if !is_cdna_device() {
+        eprintln!("test_matmul_db_amd: skipped — gfx942-only M2 perf variant on a non-CDNA device");
+        return;
+    }
     for n in [256usize, 512, 1024, 2048] {
         let (a, b) = matmul_inputs(n);
         let expected = matmul_reference(&a, &b);
@@ -396,6 +524,10 @@ fn test_matmul_db_amd() {
 #[test]
 #[ignore]
 fn test_matmul_pipelined_amd() {
+    if !is_cdna_device() {
+        eprintln!("test_matmul_pipelined_amd: skipped — gfx942-only M2 perf variant on a non-CDNA device");
+        return;
+    }
     // (stage, max N the stage is exercised at).
     let cases = [(PipeStage::Unroll, 1024usize), (PipeStage::Prefetch, 512), (PipeStage::Hints, 512)];
     for n in [256usize, 512, 1024] {

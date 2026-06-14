@@ -52,6 +52,7 @@ fn test_fa_mw_rdb_renders_bounded() {
             [h as i64, (n / 16 / 8) as i64, b as i64],
             8 * 64,
             dummy_fa_buffers(b, n, h, h_kv, d),
+            crate::ArchCaps::GFX942,
         );
         build_fa_mw_rdb(
             &ker,
@@ -112,8 +113,13 @@ fn test_fa_graph_path_renders_clean() {
 
     let (b, h, h_kv, d) = (1usize, 2, 2, 64);
     let n = 128usize;
-    let ker =
-        Kernel::new("fa_mw_rdb", [h as i64, (n / 16 / 8) as i64, b as i64], 8 * 64, dummy_fa_buffers(b, n, h, h_kv, d));
+    let ker = Kernel::new(
+        "fa_mw_rdb",
+        [h as i64, (n / 16 / 8) as i64, b as i64],
+        8 * 64,
+        dummy_fa_buffers(b, n, h, h_kv, d),
+        crate::ArchCaps::GFX942,
+    );
     build_fa_mw_rdb(
         &ker,
         b,

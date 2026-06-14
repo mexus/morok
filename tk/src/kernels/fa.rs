@@ -185,7 +185,8 @@ pub(crate) fn build_fa_kv(ker: &Kernel, b: usize, n: usize, h: usize, h_kv: usiz
         // Causal mask: drop keys ahead of this query (set the score to -∞).
         let laneid = ker.laneid();
         let q_base = laneid.mod_(&iconst(16)).add(&q_seq.mul(&iconst(BLK as i64)));
-        let kv_base = laneid.idiv(&iconst(16)).mul(&iconst(4)).add(&kv_idx.mul(&iconst(BLK as i64)));
+        let kv_base =
+            laneid.idiv(&iconst(16)).mul(&iconst(ker.caps.frag_row_stride())).add(&kv_idx.mul(&iconst(BLK as i64)));
         let att = warp.map(att, move |x, idx| {
             let kv_pos = kv_base.add(&idx[0].to_uop().mul(&iconst(16))).add(&idx[2].to_uop());
             let q_pos = q_base.add(&idx[1].to_uop().mul(&iconst(16)));
@@ -342,7 +343,8 @@ pub(crate) fn build_fa_mw(ker: &Kernel, b: usize, n: usize, h: usize, h_kv: usiz
         // Causal mask: drop keys ahead of this warp's own query rows (→ -∞).
         let laneid = ker.laneid();
         let q_base = laneid.mod_(&iconst(16)).add(&q_blk.mul(&iconst(BLK as i64)));
-        let kv_base = laneid.idiv(&iconst(16)).mul(&iconst(4)).add(&kv_idx.mul(&iconst(BLK as i64)));
+        let kv_base =
+            laneid.idiv(&iconst(16)).mul(&iconst(ker.caps.frag_row_stride())).add(&kv_idx.mul(&iconst(BLK as i64)));
         let att = warp.map(att, move |x, idx| {
             let kv_pos = kv_base.add(&idx[0].to_uop().mul(&iconst(16))).add(&idx[2].to_uop());
             let q_pos = q_base.add(&idx[1].to_uop().mul(&iconst(16)));
@@ -555,15 +557,19 @@ fn fa_qk<'k>(
 
     // Score masking: drop keys ahead of this warp's own query rows (causal → -∞)
     // and/or keys at/after the per-batch valid length (padding mask → -∞). The
-    // per-fragment offsets stay at the WMMA edge (`*16`/`/16`/`*4`); only the
-    // tile *base* scales with the per-warp Q/KV tile heights (`q_blk_rows`,
-    // `kv_blk_rows`), so the mask generalizes from 16×16 to T×T (and asymmetric)
-    // with no change to the within-fragment derivation. With neither knob set,
-    // the map is skipped entirely (full bidirectional attention).
+    // per-fragment offsets stay at the WMMA edge (`*16`/`/16`) with the per-lane
+    // row stride from `caps.frag_row_stride()` (= 256/wave_size: 4 on wave64);
+    // only the tile *base* scales with the per-warp Q/KV tile heights
+    // (`q_blk_rows`, `kv_blk_rows`), so the mask generalizes from 16×16 to T×T
+    // (and asymmetric) with no change to the within-fragment derivation. With
+    // neither knob set, the map is skipped entirely (full bidirectional attention).
     let att = if causal || valid_len.is_some() {
         let laneid = ker.laneid();
         let q_base = laneid.mod_(&iconst(16)).add(&q_blk.mul(&iconst(q_blk_rows as i64)));
-        let kv_base = laneid.idiv(&iconst(16)).mul(&iconst(4)).add(&slice_idx.mul(&iconst(kv_blk_rows as i64)));
+        let kv_base = laneid
+            .idiv(&iconst(16))
+            .mul(&iconst(ker.caps.frag_row_stride()))
+            .add(&slice_idx.mul(&iconst(kv_blk_rows as i64)));
         warp.map(att, move |x, idx| {
             let kv_pos = kv_base.add(&idx[0].to_uop().mul(&iconst(16))).add(&idx[2].to_uop());
             let q_pos = q_base.add(&idx[1].to_uop().mul(&iconst(16)));
@@ -1205,11 +1211,16 @@ pub fn flash_attention_with(q: &Tensor, k: &Tensor, v: &Tensor, opts: FaOpts) ->
     let (q_blk, _kv_blk) = adaptive_fa_tile(b, n, h);
     let dtype = q.uop().dtype();
 
-    let arch_ok = crate::target::check_target(&q.device(), FA_SUPPORTED_ARCHS).is_ok();
+    // Single arch resolution: `Some(arch)` iff the device is a supported arch with
+    // the AMD toolchain present (one topology probe, no second resolve for caps).
+    let arch = crate::target::resolve_supported_arch(&q.device(), FA_SUPPORTED_ARCHS).ok();
     let dtype_ok = dtype == DType::BFloat16 || dtype == DType::Float16;
     let shape_ok = d % BLK == 0 && n % (q_blk * NUM_WARPS) == 0 && h % h_kv == 0;
 
-    if arch_ok && dtype_ok && shape_ok {
+    if let (Some(arch), true) = (arch, dtype_ok && shape_ok) {
+        // Caps from the resolved arch so the launch block (`warps * wave_size`) and
+        // the kernel's wave math track the real wave width instead of a hardcoded 64.
+        let caps = crate::ArchCaps::for_arch(arch);
         let (q_blk, kv_blk) = adaptive_fa_tile(b, n, h);
         let grid = [h as i64, (n / q_blk / NUM_WARPS) as i64, b as i64];
         let out = Tensor::empty(&[b, n, h, d], dtype.clone());
@@ -1222,7 +1233,8 @@ pub fn flash_attention_with(q: &Tensor, k: &Tensor, v: &Tensor, opts: FaOpts) ->
         if let Some(lens) = opts.key_lens {
             ins.push(lens);
         }
-        return crate::graph_launch("flash_attention", grid, (NUM_WARPS * 64) as i64, out, &ins, move |ker| {
+        let block = (NUM_WARPS * caps.wave_size) as i64;
+        return crate::graph_launch("flash_attention", grid, block, out, &ins, caps, move |ker| {
             build_fa_mw_rdb(
                 ker,
                 b,

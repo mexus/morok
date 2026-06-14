@@ -173,7 +173,7 @@ fn run_matmul(n: usize, iters: usize) -> Row {
     let launch = crate::compile_kernel(
         "simple_matmul",
         M1_CFG.grid_dims(n),
-        M1_CFG.threads(),
+        M1_CFG.threads(crate::WARP_THREADS),
         &mut [&mut c],
         &[&a, &b],
         |ker| {

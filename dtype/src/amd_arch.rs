@@ -15,6 +15,7 @@ pub enum AmdArch {
     Gfx1100,
     Gfx1101,
     Gfx1102,
+    // RDNA3.5 — Strix Halo / Strix Point APU (gfx11.5); shares RDNA3's WMMA ISA, wave32.
     Gfx1151,
     // RDNA4 — next-gen Radeon; WMMA with bf16/fp8 packing, wave32.
     Gfx1200,
@@ -37,9 +38,19 @@ impl AmdArch {
         }
     }
 
-    /// RDNA3 family (Radeon 7000; WMMA intrinsics, wave32).
+    /// RDNA3 family (Radeon 7000; WMMA intrinsics, wave32). Excludes RDNA3.5
+    /// ([`Self::is_rdna3_5`]); for "any gfx11 WMMA part" use [`Self::has_matrix_cores`]
+    /// or `is_rdna3() || is_rdna3_5()`.
     pub const fn is_rdna3(self) -> bool {
-        matches!(self, Self::Gfx1100 | Self::Gfx1101 | Self::Gfx1102 | Self::Gfx1151)
+        matches!(self, Self::Gfx1100 | Self::Gfx1101 | Self::Gfx1102)
+    }
+
+    /// RDNA3.5 (Strix Halo / Strix Point APU, gfx11.5; wave32). Architecturally
+    /// distinct from RDNA3 but shares its 16×16×16 WMMA ISA, so it routes to the
+    /// RDNA3 tensor-core table; consumers gate matrix-core support via
+    /// [`Self::has_matrix_cores`].
+    pub const fn is_rdna3_5(self) -> bool {
+        matches!(self, Self::Gfx1151)
     }
 
     /// RDNA4 family (next-gen Radeon; WMMA with bf16/fp8 packing, wave32).
@@ -52,7 +63,7 @@ impl AmdArch {
     /// since RDNA2 was dropped; only `(11, *)`, `(12, *)`, `(9,4,2)` and
     /// `(9,5,0)` targets are accepted.
     pub const fn has_matrix_cores(self) -> bool {
-        self.is_cdna() || self.is_rdna3() || self.is_rdna4()
+        self.is_cdna() || self.is_rdna3() || self.is_rdna3_5() || self.is_rdna4()
     }
 
     /// Default wave size for this arch (clang `-mcpu` selects this; the kernel

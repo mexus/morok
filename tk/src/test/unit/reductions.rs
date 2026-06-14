@@ -76,7 +76,7 @@ fn build_softmax(ker: &Kernel, n: usize, block: usize) {
 /// no workgroup `Barrier`, and no WMMA.
 #[test]
 fn test_row_reduce_graph_shape() {
-    let ker = Kernel::new("row_reduce_probe", [1, 1, 1], 64, vec![]);
+    let ker = Kernel::new("row_reduce_probe", [1, 1, 1], 64, vec![], crate::ArchCaps::GFX942);
     let warp = ker.warp();
 
     let src = ker.rt((32, 32), DType::Float32, TileLayout::Row, RT_16X16);
