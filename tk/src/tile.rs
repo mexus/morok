@@ -232,62 +232,6 @@ impl<'k> RV<'k> {
     }
 }
 
-/// A type-erased tile, used by the addrspace-dispatching `Group::load`/`store`
-/// (the svod analog of tinygrad's `isinstance` + `addrspace` checks). Concrete
-/// tiles convert in via `From`; results extract out via [`Tile::st`] etc.
-#[derive(Clone)]
-pub enum Tile<'k> {
-    Gl(GL<'k>),
-    St(ST<'k>),
-    Rt(RT<'k>),
-    Rv(RV<'k>),
-}
-
-impl<'k> From<GL<'k>> for Tile<'k> {
-    fn from(t: GL<'k>) -> Self {
-        Tile::Gl(t)
-    }
-}
-impl<'k> From<ST<'k>> for Tile<'k> {
-    fn from(t: ST<'k>) -> Self {
-        Tile::St(t)
-    }
-}
-impl<'k> From<RT<'k>> for Tile<'k> {
-    fn from(t: RT<'k>) -> Self {
-        Tile::Rt(t)
-    }
-}
-impl<'k> From<RV<'k>> for Tile<'k> {
-    fn from(t: RV<'k>) -> Self {
-        Tile::Rv(t)
-    }
-}
-
-impl<'k> Tile<'k> {
-    /// Extract a [`GL`] (panics on mismatch).
-    pub fn gl(self) -> GL<'k> {
-        match self {
-            Tile::Gl(t) => t,
-            _ => panic!("Tile::gl: not a GL tile"),
-        }
-    }
-    /// Extract an [`ST`] (panics on mismatch).
-    pub fn st(self) -> ST<'k> {
-        match self {
-            Tile::St(t) => t,
-            _ => panic!("Tile::st: not an ST tile"),
-        }
-    }
-    /// Extract an [`RT`] (panics on mismatch).
-    pub fn rt(self) -> RT<'k> {
-        match self {
-            Tile::Rt(t) => t,
-            _ => panic!("Tile::rt: not an RT tile"),
-        }
-    }
-}
-
 impl Kernel {
     /// Bind the next declared buffer as a [`GL`] tile (tinygrad `ker.gl`). The
     /// element dtype is taken from the bound buffer; `dtype` is accepted for API

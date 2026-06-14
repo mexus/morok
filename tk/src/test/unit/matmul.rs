@@ -7,9 +7,9 @@ use std::sync::Arc;
 use svod_dtype::{DType, DeviceSpec};
 use svod_ir::{Op, UOp};
 
-use crate::Kernel;
 use crate::kernels::matmul::*;
 use crate::tiles::{RT_16X16, TileLayout};
+use crate::{Kernel, MoveIdx};
 
 /// Dummy `(c, a, b)` BUFFER UOps for GPU-free graph-shape kernel builds.
 fn dummy_buffers(n: usize) -> Vec<Arc<UOp>> {
@@ -122,7 +122,7 @@ fn test_mma_unroll_flattens_mfma() {
         let c = warp.zero(ker.rt((n, n), DType::Float32, TileLayout::Col, RT_16X16));
         let c = warp.mma_ab(c, &a, &b);
         let z = || crate::index::Idx::Const(0);
-        let _ = warp.store(c_gl.into(), c.into(), &[z(), z(), z(), z()], &[], 2);
+        let _ = warp.store(c_gl, c, MoveIdx::block(&[z(), z(), z(), z()], 2));
         ker.finish(1)
     };
 

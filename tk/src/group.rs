@@ -17,8 +17,81 @@ use svod_schedule::optimizer::{Renderer, TensorCore};
 
 use crate::index::{Idx, cidx, flat_index, flat_offset, index_off, load_at, load_off, load_vec};
 use crate::kernel::Kernel;
-use crate::tile::{GL, RT, RV, RegTile, ST, Tile};
+use crate::tile::{GL, RT, RV, RegTile, ST};
 use crate::tiles::TileLayout;
+
+/// The index inputs to a [`Group::load`]/[`Group::store`], named by ROLE so the two
+/// ops no longer disagree on positional slots. `block` is the wave sub-tile / global
+/// block offset (the old `idxs`); `frag` is the REG-side fragment offset (the old
+/// `dst_idxs` on load / `src_idxs` on store). `axis` is the global-tile row-stride
+/// split (ignored by the LOCAL↔REG hops). Borrows the slices for the call.
+#[derive(Clone, Copy, Default)]
+pub struct MoveIdx<'a> {
+    pub block: &'a [Idx],
+    pub frag: &'a [Idx],
+    pub axis: usize,
+}
+
+impl<'a> MoveIdx<'a> {
+    /// A wave/global `block` offset at `axis` (the common fill/gather/store case).
+    pub fn block(block: &'a [Idx], axis: usize) -> Self {
+        Self { block, frag: &[], axis }
+    }
+    /// A REG-side `frag` offset only.
+    pub fn frag(frag: &'a [Idx]) -> Self {
+        Self { frag, block: &[], axis: 0 }
+    }
+    /// Both a `block` and a `frag` offset at `axis`.
+    pub fn at(block: &'a [Idx], frag: &'a [Idx], axis: usize) -> Self {
+        Self { block, frag, axis }
+    }
+}
+
+/// A source tile that can be loaded INTO `Dst` by a [`Group`]. The legal
+/// address-space pairs each have an impl (ST←GL, RT←ST, RT←GL); an illegal pair is a
+/// *compile* error (no impl), not a runtime panic. `Output` is the rewrapped dst.
+pub trait LoadInto<'k, Dst> {
+    type Output;
+    fn load_into(self, g: &Group<'k>, dst: Dst, ix: MoveIdx<'_>) -> Self::Output;
+}
+
+/// A source REG tile that can be stored INTO `Dst` (`ST` or `GL`); illegal pairs are
+/// a compile error.
+pub trait StoreInto<'k, Dst> {
+    type Output;
+    fn store_into(self, g: &Group<'k>, dst: Dst, ix: MoveIdx<'_>) -> Self::Output;
+}
+
+impl<'k> LoadInto<'k, ST<'k>> for GL<'k> {
+    type Output = ST<'k>;
+    fn load_into(self, g: &Group<'k>, dst: ST<'k>, ix: MoveIdx<'_>) -> ST<'k> {
+        g.load_global_to_local(dst, &self, ix.block, ix.axis, true)
+    }
+}
+impl<'k> LoadInto<'k, RT<'k>> for ST<'k> {
+    type Output = RT<'k>;
+    fn load_into(self, g: &Group<'k>, dst: RT<'k>, ix: MoveIdx<'_>) -> RT<'k> {
+        g.load_local_to_reg(dst, &self, ix.frag, ix.block)
+    }
+}
+impl<'k> LoadInto<'k, RT<'k>> for GL<'k> {
+    type Output = RT<'k>;
+    fn load_into(self, g: &Group<'k>, dst: RT<'k>, ix: MoveIdx<'_>) -> RT<'k> {
+        g.load_global_to_reg(dst, &self, ix.frag, ix.block, ix.axis)
+    }
+}
+impl<'k> StoreInto<'k, ST<'k>> for RT<'k> {
+    type Output = ST<'k>;
+    fn store_into(self, g: &Group<'k>, dst: ST<'k>, ix: MoveIdx<'_>) -> ST<'k> {
+        g.store_reg_to_local(dst, &self, ix.block, ix.frag)
+    }
+}
+impl<'k> StoreInto<'k, GL<'k>> for RT<'k> {
+    type Output = GL<'k>;
+    fn store_into(self, g: &Group<'k>, dst: GL<'k>, ix: MoveIdx<'_>) -> GL<'k> {
+        g.store_reg_to_global(dst, &self, ix.block, ix.frag, ix.axis)
+    }
+}
 
 // ── Index (i64-typed) arithmetic helpers ───────────────────────────────────
 
@@ -33,6 +106,23 @@ fn imul(a: &Arc<UOp>, k: i64) -> Arc<UOp> {
 }
 fn iadd(a: &Arc<UOp>, b: &Arc<UOp>) -> Arc<UOp> {
     a.try_add(b).expect("iadd")
+}
+fn ixor(a: &Arc<UOp>, k: i64) -> Arc<UOp> {
+    a.try_xor_op(&cidx(k)).expect("ixor")
+}
+fn iand(a: &Arc<UOp>, k: i64) -> Arc<UOp> {
+    a.try_and_op(&cidx(k)).expect("iand")
+}
+
+/// Compare-exchange direction for [`Group::compare_exchange`] (sorting networks).
+#[derive(Clone, Copy, Debug)]
+pub enum SwapDir {
+    /// The lower-index lane of each pair keeps the min (the larger goes high).
+    Ascending,
+    /// The lower-index lane keeps the max.
+    Descending,
+    /// Bitonic merge: ascending where `(laneid & bit) == 0`, else descending.
+    ByLaneBit(i64),
 }
 fn idx_mul(idx: &Idx, k: i64) -> Idx {
     match idx {
@@ -399,6 +489,89 @@ impl<'k> Group<'k> {
         if is_f32 { sh.bitcast(DType::Float32) } else { sh }
     }
 
+    /// Per-element cross-lane gather (the public face of [`Self::shuffle_lane`]): for
+    /// each logical element, `dst` receives `src`'s value at the SAME position but
+    /// from lane `src_lane(laneid)`. Single-warp; one `ds_bpermute` per element (no
+    /// LDS, no barrier). The shared foundation for `shuffle_xor`/`compare_exchange`
+    /// (and, later, scan / arg-reduce). f32 (bitcast) and i32 transports are
+    /// supported today; f16/bf16/i64 are a follow-up.
+    pub fn shuffle<F>(&self, dst: RT<'k>, src: &RT<'k>, src_lane: F) -> RT<'k>
+    where
+        F: Fn(&Arc<UOp>) -> Arc<UOp>,
+    {
+        assert_eq!(self.warps, 1, "shuffle is a single-warp op");
+        assert_eq!(dst.shape(), src.shape(), "shuffle: shape mismatch");
+        let sl = src_lane(&self.laneid());
+        let (sbuf, sshape) = (self.anchor(src.uop()), src.shape().to_vec());
+        let (dbuf, dshape) = (dst.uop().clone(), dst.shape().to_vec());
+        let ended = self.elementwise(&dshape.clone(), move |idxs| {
+            let v = load_at(&sbuf, &sshape, idxs);
+            flat_index(&dbuf, &dshape, idxs).store(self.shuffle_lane(&v, &sl))
+        });
+        self.finalize_reg(dst, ended)
+    }
+
+    /// Butterfly exchange: `dst[pos] = src[pos]` from lane `laneid ^ mask`. Arch-blind
+    /// — for any `mask < wave_size` the XOR partner stays in `[0, wave_size)`, so no
+    /// modulus is needed (cheaper than [`Self::shuffle_down`]). The sort/reduce primitive.
+    pub fn shuffle_xor(&self, dst: RT<'k>, src: &RT<'k>, mask: i64) -> RT<'k> {
+        let w = self.ker.caps.wave_size as i64;
+        assert!(mask > 0 && mask < w, "shuffle_xor mask {mask} must be in 1..{w}");
+        self.shuffle(dst, src, |laneid| ixor(laneid, mask))
+    }
+
+    /// Shift down: `dst[L] = src[(L + delta) mod wave_size]`.
+    pub fn shuffle_down(&self, dst: RT<'k>, src: &RT<'k>, delta: i64) -> RT<'k> {
+        let w = self.ker.caps.wave_size as i64;
+        assert!(delta > 0 && delta < w, "shuffle_down delta {delta} must be in 1..{w}");
+        self.shuffle(dst, src, move |laneid| imod(&iadd(laneid, &cidx(delta)), w))
+    }
+
+    /// Shift up: `dst[L] = src[(L - delta) mod wave_size]` (the scan primitive).
+    pub fn shuffle_up(&self, dst: RT<'k>, src: &RT<'k>, delta: i64) -> RT<'k> {
+        let w = self.ker.caps.wave_size as i64;
+        assert!(delta > 0 && delta < w, "shuffle_up delta {delta} must be in 1..{w}");
+        self.shuffle(dst, src, move |laneid| imod(&iadd(laneid, &cidx(w - delta)), w))
+    }
+
+    /// One bitonic compare-exchange stage across the butterfly partner `laneid ^
+    /// mask`: each lane keeps the min or max of its element and the partner's, per
+    /// `dir` — the building block of sorting networks. Per element: one `ds_bpermute`
+    /// gather + an ALU min/max select (no LDS, no barrier).
+    pub fn compare_exchange(&self, dst: RT<'k>, src: &RT<'k>, mask: i64, dir: SwapDir) -> RT<'k> {
+        assert_eq!(self.warps, 1, "compare_exchange is a single-warp op");
+        assert_eq!(dst.shape(), src.shape(), "compare_exchange: shape mismatch");
+        let w = self.ker.caps.wave_size as i64;
+        assert!(mask > 0 && mask < w, "compare_exchange mask {mask} must be in 1..{w}");
+        let laneid = self.laneid();
+        let partner = ixor(&laneid, mask);
+        // `keep_min`: this lane keeps the smaller of the pair (else the larger). The
+        // lower-index lane of a pair is `(laneid & mask) == 0`.
+        let is_low = iand(&laneid, mask).try_cmpeq(&cidx(0)).expect("ce is_low");
+        let keep_min = match dir {
+            SwapDir::Ascending => is_low,
+            SwapDir::Descending => iand(&laneid, mask).try_cmpne(&cidx(0)).expect("ce desc"),
+            // Bitonic merge: ascending where `(laneid & bit) == 0`. Keep min iff the
+            // low-lane flag equals the ascending flag.
+            SwapDir::ByLaneBit(bit) => {
+                let asc = iand(&laneid, bit).try_cmpeq(&cidx(0)).expect("ce dir bit");
+                is_low.try_cmpeq(&asc).expect("ce keep_min")
+            }
+        };
+        let (sbuf, sshape) = (self.anchor(src.uop()), src.shape().to_vec());
+        let (dbuf, dshape) = (dst.uop().clone(), dst.shape().to_vec());
+        let ended = self.elementwise(&dshape.clone(), move |idxs| {
+            let v = load_at(&sbuf, &sshape, idxs);
+            let p = self.shuffle_lane(&v, &partner);
+            let lt = v.try_cmplt(&p).expect("ce lt");
+            let mn = UOp::try_where(lt, v.clone(), p.clone()).expect("ce min");
+            let mx = v.try_max(&p).expect("ce max");
+            let out = UOp::try_where(keep_min.clone(), mn, mx).expect("ce select");
+            flat_index(&dbuf, &dshape, idxs).store(out)
+        });
+        self.finalize_reg(dst, ended)
+    }
+
     /// Shared reduction body. `outer_end` is the tile dim mapped to `vec`
     /// (row-tiles for `row_reduce`, col-tiles for `col_reduce`); `acc_end` is the
     /// in-lane reduce dim; `row` selects the `src[outer, acc, inner]` vs
@@ -755,18 +928,26 @@ impl<'k> Group<'k> {
 
     // ── load (tinygrad `Group.load`) ────────────────────────────────────────
 
-    /// Move data into `dst` (tinygrad `Group.load`), dispatching on the
-    /// (dst, src) address spaces: GLOBAL→LOCAL (coalesced fill + barrier) and
-    /// LOCAL→REG (fragment gather).
-    pub fn load(&self, dst: Tile<'k>, src: Tile<'k>, dst_idxs: &[Idx], idxs: &[Idx], axis: usize) -> Tile<'k> {
-        match (dst, src) {
-            (Tile::St(dst), Tile::Gl(src)) => Tile::St(self.load_global_to_local(dst, &src, idxs, axis, true)),
-            (Tile::Rt(dst), Tile::St(src)) => Tile::Rt(self.load_local_to_reg(dst, &src, dst_idxs, idxs)),
-            (Tile::Rt(dst), Tile::Gl(src)) => Tile::Rt(self.load_global_to_reg(dst, &src, dst_idxs, idxs, axis)),
-            (dst, src) => {
-                unimplemented!("load {} ← {} not ported (supported: ST←GL, RT←ST, RT←GL)", tag(&dst), tag(&src))
-            }
-        }
+    /// Move data into `dst` (tinygrad `Group.load`), with the legal (dst, src)
+    /// address-space pair resolved at **compile time** via [`LoadInto`]: ST←GL
+    /// (coalesced fill + barrier), RT←ST / RT←GL (fragment gather). An illegal pair
+    /// (e.g. RT←RT) has no impl, so it is a compile error — not a runtime panic:
+    ///
+    /// ```compile_fail
+    /// # use svod_tk::{ArchCaps, Kernel, MoveIdx};
+    /// # use svod_tk::tiles::{RT_16X16, TileLayout};
+    /// # use svod_dtype::DType;
+    /// let ker = Kernel::new("x", [1, 1, 1], 64, vec![], ArchCaps::GFX942);
+    /// let g = ker.warp();
+    /// let a = ker.rt((16, 16), DType::Float32, TileLayout::Row, RT_16X16);
+    /// let b = ker.rt((16, 16), DType::Float32, TileLayout::Row, RT_16X16);
+    /// let _ = g.load(a, b, MoveIdx::default()); // RT ← RT: no LoadInto impl ⇒ won't compile
+    /// ```
+    pub fn load<Dst, Src>(&self, dst: Dst, src: Src, ix: MoveIdx<'_>) -> Src::Output
+    where
+        Src: LoadInto<'k, Dst>,
+    {
+        src.load_into(self, dst, ix)
     }
 
     /// Coalesced GLOBAL→LOCAL fill **without** the trailing workgroup barrier —
@@ -853,14 +1034,26 @@ impl<'k> Group<'k> {
 
     /// Move data out of `src` (tinygrad `Group.store`): REG→LOCAL (fragment
     /// scatter) and REG→GLOBAL (coalesced write-back).
-    pub fn store(&self, dst: Tile<'k>, src: Tile<'k>, idxs: &[Idx], src_idxs: &[Idx], axis: usize) -> Tile<'k> {
-        match (dst, src) {
-            (Tile::St(dst), Tile::Rt(src)) => Tile::St(self.store_reg_to_local(dst, &src, idxs, src_idxs)),
-            (Tile::Gl(dst), Tile::Rt(src)) => Tile::Gl(self.store_reg_to_global(dst, &src, idxs, src_idxs, axis)),
-            (dst, src) => {
-                unimplemented!("store {} ← {} not ported (matmul MVP = LOCAL←REG, GLOBAL←REG)", tag(&dst), tag(&src))
-            }
-        }
+    pub fn store<Dst, Src>(&self, dst: Dst, src: Src, ix: MoveIdx<'_>) -> Src::Output
+    where
+        Src: StoreInto<'k, Dst>,
+    {
+        src.store_into(self, dst, ix)
+    }
+
+    /// Cross-wave WAR fence over two just-loaded register reads `a`/`b`: builds ONE
+    /// workgroup `Barrier` (passthrough `a`, deps = `b` + `extra` — the cross-iteration
+    /// prefetch commits the double-buffer pipeline folds in) and returns BOTH reads
+    /// re-threaded `.after([sync])`. The barrier is internal (never returned), so a
+    /// read cannot be left un-fenced (you get the fenced tiles back) and nothing can
+    /// depend on the barrier as a value (the AMD renderer emits the `s.barrier` fence
+    /// but registers no SSA value for it). Emits the identical graph as the hand-built
+    /// `a.uop().barrier([b] + extra)` + per-read `.after([sync])`.
+    pub fn war_fence2<T: RegTile<'k>>(&self, a: T, b: T, extra: &[Arc<UOp>]) -> (T, T) {
+        let mut deps: SmallVec<[Arc<UOp>; 4]> = smallvec![b.uop().clone()];
+        deps.extend(extra.iter().cloned());
+        let sync = a.uop().barrier(deps);
+        (a.after(smallvec![sync.clone()]), b.after(smallvec![sync]))
     }
 
     /// The [`LdsGeom`] for filling `st` collaboratively across all group
@@ -1315,6 +1508,33 @@ impl<'k> Group<'k> {
     }
 }
 
+impl<'k> ST<'k> {
+    /// A zero-copy view of the `(row_blk, col_blk)`-th sub-rectangle of warp-tile
+    /// element size `dims` — folds the per-warp band into the tile's additive base
+    /// offset (composing with any existing double-buffer parity offset), so a
+    /// subsequent [`Group::load`]/[`Group::store`] needs **no** wave-block index
+    /// (pass [`MoveIdx::default`]). `dims` is the consuming register tile's element
+    /// shape (the warp-tile size). Addresses the SAME element as the equivalent
+    /// `wave_offset` block — the band is whole-fragment-granular (so the LDS swizzle,
+    /// applied within a fragment, is unaffected); only the offset op-tree differs
+    /// from the folded form (`imul(a·k + local, stride)` → `imul(local, stride) +
+    /// imul(a·k, stride)`), so it is correct-by-construction but changes the kernel's
+    /// content hash.
+    pub fn subtile(&self, dims: (usize, usize), blk: (Idx, Idx)) -> ST<'k> {
+        let frag_h = (dims.0 / self.base.base.rows) as i64;
+        let frag_w = (dims.1 / self.base.base.cols) as i64;
+        let band = flat_offset(
+            self.shape(),
+            &[idx_mul(&blk.0, frag_h), idx_mul(&blk.1, frag_w), Idx::Const(0), Idx::Const(0)],
+        );
+        let off = match self.base_offset() {
+            Some(bo) => band.try_add(bo).expect("subtile band + base offset"),
+            None => band,
+        };
+        self.with_base_offset(off)
+    }
+}
+
 /// ST flat INDEX honoring the optional double-buffer parity [`ST::base_offset`].
 /// Identical to [`crate::index::flat_index`] for an ordinary (`base_offset:None`)
 /// tile; adds the parity offset for a [`Kernel::st_db`] half-view.
@@ -1349,13 +1569,4 @@ fn cartesian(shape: &[usize]) -> Vec<Vec<Idx>> {
             .collect();
     }
     acc
-}
-
-fn tag(t: &Tile<'_>) -> &'static str {
-    match t {
-        Tile::Gl(_) => "GL",
-        Tile::St(_) => "ST",
-        Tile::Rt(_) => "RT",
-        Tile::Rv(_) => "RV",
-    }
 }

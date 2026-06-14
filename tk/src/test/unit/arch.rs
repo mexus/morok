@@ -56,3 +56,36 @@ fn wmma_descriptor_resolves_per_detected_arch() {
     assert_eq!(core_threads(AmdArch::Gfx942), Some(64), "gfx942 f16 WMMA = wave64 MFMA core");
     assert_eq!(core_threads(AmdArch::Gfx1151), Some(32), "gfx1151 f16 WMMA = wave32 RDNA core");
 }
+
+/// Behavior-preserving guard for the fragment-role resolver (Gap 2): the logical
+/// [`FragRole`]s resolve to the *exact* physical fragment constants the kernels
+/// previously selected by hand, on both arches — so the refactor is bit-identical on
+/// gfx942 and render-identical on gfx1151. If a mapping drifts, the kernels' generated
+/// IR changes silently; fail loudly here instead.
+#[test]
+fn frag_roles_resolve_to_canonical_constants() {
+    use crate::arch::FragRole::{Accumulator, AccumulatorT, Operand};
+    use crate::tiles::{
+        RT_16X16, RT_16X16_W32_ACC, RT_16X16_W32_ACC_T, RT_16X16_W32_IN, ST_16X16, ST_16X16_SWIZZLED,
+        ST_16X16_SWIZZLED_W32,
+    };
+
+    // gfx942 (CDNA MFMA, wave64): acc == input fragment ⇒ every role is RT_16X16.
+    let c = ArchCaps::for_arch(AmdArch::Gfx942);
+    assert_eq!(c.frag(Accumulator), RT_16X16);
+    assert_eq!(c.frag(Operand), RT_16X16);
+    assert_eq!(c.frag(AccumulatorT), RT_16X16);
+    assert_eq!(c.shared_default(), ST_16X16);
+    assert_eq!(c.shared_swizzled(), ST_16X16_SWIZZLED);
+    assert!(c.acc_reusable_as_input(), "CDNA acc fragment is reusable as a WMMA input");
+
+    // gfx1151 (RDNA3.5 WMMA, wave32): distinct even/odd-acc / replicated-input /
+    // transposed-acc fragments; the acc→input handoff must round-trip through LDS.
+    let r = ArchCaps::for_arch(AmdArch::Gfx1151);
+    assert_eq!(r.frag(Accumulator), RT_16X16_W32_ACC);
+    assert_eq!(r.frag(Operand), RT_16X16_W32_IN);
+    assert_eq!(r.frag(AccumulatorT), RT_16X16_W32_ACC_T);
+    assert_eq!(r.shared_default(), ST_16X16_SWIZZLED_W32);
+    assert_eq!(r.shared_swizzled(), ST_16X16_SWIZZLED_W32);
+    assert!(!r.acc_reusable_as_input(), "RDNA acc/input fragments differ ⇒ LDS relayout");
+}

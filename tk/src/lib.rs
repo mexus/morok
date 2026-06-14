@@ -19,14 +19,17 @@
 
 pub mod arch;
 pub mod asm;
+pub mod fingerprint;
 pub mod grid;
 pub mod group;
 pub mod index;
 pub mod kernel;
 pub mod kernels;
 pub mod launch;
+pub mod loop_scope;
 pub mod math;
 pub mod ops;
+pub mod scaffold;
 pub mod sched;
 pub mod swizzle;
 pub mod target;
@@ -42,7 +45,8 @@ pub const WARP_THREADS: usize = 64;
 const _: () = assert!(WARP_THREADS == svod_dtype::AmdArch::Gfx942.wave_size() as usize);
 
 pub use arch::ArchCaps;
-pub use group::Group;
+pub use fingerprint::{KernelFingerprint, kernel_fingerprint};
+pub use group::{Group, LoadInto, MoveIdx, StoreInto, SwapDir};
 pub use kernel::Kernel;
 pub use kernels::fa::{
     FaOpts, flash_attention, flash_attention_forward, flash_attention_forward_mw, flash_attention_forward_mw_db,
@@ -53,8 +57,10 @@ pub use launch::{
     CompiledLaunch, Error as LaunchError, Result as LaunchResult, compile, compile_kernel, graph_launch, launch,
     run_kernel,
 };
+pub use loop_scope::Loop;
+pub use scaffold::GlSpec;
 pub use swizzle::Swizzle;
-pub use tile::{GL, RT, RV, RegTile, ST, Tile};
+pub use tile::{GL, RT, RV, RegTile, ST};
 pub use tiles::{
     BaseShape, RT_16X16, RT_16X32, RT_32X16, RT_32X32, RTBaseShape, ST_16X16, ST_16X16_SWIZZLED, ST_16X32, ST_32X16,
     ST_32X32, STBaseShape, TileLayout, VecLayout,

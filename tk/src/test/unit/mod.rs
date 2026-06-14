@@ -1,10 +1,14 @@
 mod arch;
 mod bench;
 mod fa;
+mod golden;
 mod grid;
 mod index;
 mod kernel_probe;
+mod loop_scope;
 mod math;
 mod matmul;
 mod reductions;
+mod scaffold;
+mod shuffle;
 mod swizzle;

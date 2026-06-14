@@ -20,14 +20,34 @@
 //! RDNA WMMA *fragment* layout is otherwise different (`ept=(16,16,8)`, inputs
 //! replicated across the two wave-halves, an even/odd-interleaved `<8×float>`
 //! accumulator), so it is carried by dedicated tile shapes (`RT_16X16_W32_*` in
-//! [`crate::tiles`]) selected per arch in the kernels, not by reparameterizing the
-//! CDNA shapes. Both matmul and FA are now built for gfx1151 (in
+//! [`crate::tiles`]) resolved per arch by [`ArchCaps::frag`] / [`ArchCaps::shared_default`]
+//! / [`ArchCaps::shared_swizzled`] — the single arch→fragment table, so kernels stay
+//! arch-blind (no `is_cdna()` shape branches). Both matmul and FA are now built for gfx1151 (in
 //! `MATMUL_/FA_SUPPORTED_ARCHS`); [`ArchCaps::frag_row_stride`] is the one remaining
 //! CDNA-only datum (the legacy direct-launch FA mask — the production rolled-db
 //! kernel derives its mask from the accumulator's own `lane_rc` instead).
 
 use smallvec::SmallVec;
 use svod_dtype::AmdArch;
+
+use crate::tiles::{
+    RT_16X16, RT_16X16_W32_ACC, RT_16X16_W32_ACC_T, RT_16X16_W32_IN, RTBaseShape, ST_16X16, ST_16X16_SWIZZLED,
+    ST_16X16_SWIZZLED_W32, STBaseShape,
+};
+
+/// Logical role of a 16×16 matrix-core fragment, independent of arch packing.
+/// Resolved to a physical [`RTBaseShape`] by [`ArchCaps::frag`] — kernels select a
+/// fragment by *role*, never by naming a per-arch constant.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FragRole {
+    /// f32 MMA output / online-softmax accumulator.
+    Accumulator,
+    /// f16/bf16 WMMA input operand (A or B).
+    Operand,
+    /// Accumulator transposed for an N-major store (e.g. the FA output `O[q,d]`
+    /// from the `[d,q]` PV accumulator).
+    AccumulatorT,
+}
 
 /// The arch-derived constants the tile builders thread instead of the wave64
 /// literals. `Copy`; [`Self::for_arch`] is `const`.
@@ -70,5 +90,43 @@ impl ArchCaps {
     /// the CDNA stride and the RDNA even/odd interleave — so it does not call this.
     pub const fn frag_row_stride(&self) -> i64 {
         (16 * 16 / self.wave_size) as i64
+    }
+
+    /// Physical register fragment for a logical [`FragRole`] on this arch — the
+    /// single arch→fragment table the kernels resolve through. CDNA's MFMA
+    /// accumulator and input fragments share a layout, so every role resolves to
+    /// [`RT_16X16`]; RDNA (gfx11 WMMA) splits into the even/odd-interleaved
+    /// accumulator, the replicated input, and the transposed accumulator.
+    pub fn frag(&self, role: FragRole) -> RTBaseShape {
+        if self.arch.is_cdna() {
+            RT_16X16
+        } else {
+            match role {
+                FragRole::Accumulator => RT_16X16_W32_ACC,
+                FragRole::Operand => RT_16X16_W32_IN,
+                FragRole::AccumulatorT => RT_16X16_W32_ACC_T,
+            }
+        }
+    }
+
+    /// The canonical LDS strip fragment: plain on CDNA. On RDNA the only ept-8 strip
+    /// defined is swizzled, so it coincides with [`Self::shared_swizzled`]. Used by
+    /// kernels whose LDS access does not itself need the XOR swizzle (flash-attention).
+    pub fn shared_default(&self) -> STBaseShape {
+        if self.arch.is_cdna() { ST_16X16 } else { ST_16X16_SWIZZLED_W32 }
+    }
+
+    /// The XOR-swizzled LDS strip fragment, for kernels that swizzle to avoid LDS
+    /// bank conflicts (the matmul A/B strips).
+    pub fn shared_swizzled(&self) -> STBaseShape {
+        if self.arch.is_cdna() { ST_16X16_SWIZZLED } else { ST_16X16_SWIZZLED_W32 }
+    }
+
+    /// Whether an MMA accumulator fragment can be reused directly as a WMMA input via
+    /// a register copy. True on CDNA (MFMA acc == input fragment); false on RDNA (the
+    /// even/odd `<8×f32>` accumulator and the replicated `<16×in>` input differ), where
+    /// the acc→input handoff must round-trip through LDS instead.
+    pub fn acc_reusable_as_input(&self) -> bool {
+        self.arch.is_cdna()
     }
 }

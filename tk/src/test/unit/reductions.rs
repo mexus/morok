@@ -8,10 +8,10 @@ use smallvec::smallvec;
 use svod_dtype::DType;
 use svod_ir::Op;
 
-use crate::Kernel;
 use crate::index::Idx;
 use crate::tile::RegTile;
 use crate::tiles::{RT_16X16, ST_16X16, TileLayout, VecLayout};
+use crate::{Kernel, MoveIdx};
 
 const INV_LN2: f64 = std::f64::consts::LOG2_E; // 1 / ln(2) == log2(e)
 
@@ -38,8 +38,8 @@ fn build_softmax(ker: &Kernel, n: usize, block: usize) {
         let a_smem = ker.st((block, block), DType::Float32, TileLayout::Row, ST_16X16);
         let a_reg = ker.rt((block, block), DType::Float32, TileLayout::Row, RT_16X16);
         let idxs = [Idx::Const(0), Idx::Const(0), Idx::Const(0), Idx::from(&tile_col)];
-        let a_smem = warp.load(a_smem.into(), a.clone().into(), &[], &idxs, 2).st();
-        let a_reg = warp.load(a_reg.into(), a_smem.into(), &[], &[], 0).rt();
+        let a_smem = warp.load(a_smem, a.clone(), MoveIdx::block(&idxs, 2));
+        let a_reg = warp.load(a_reg, a_smem, MoveIdx::default());
         let a_reg = warp.mul_scalar(a_reg, INV_LN2);
 
         max_vec_last = warp.copy(max_vec_last.after(smallvec![tile_col.clone()]), &max_vec);
@@ -61,13 +61,13 @@ fn build_softmax(ker: &Kernel, n: usize, block: usize) {
         let a_smem = ker.st((block, block), DType::Float32, TileLayout::Row, ST_16X16);
         let a_reg = ker.rt((block, block), DType::Float32, TileLayout::Row, RT_16X16);
         let idxs = [Idx::Const(0), Idx::Const(0), Idx::Const(0), Idx::from(&tile_col)];
-        let a_smem = warp.load(a_smem.into(), a.clone().into(), &[], &idxs, 2).st();
-        let a_reg = warp.load(a_reg.into(), a_smem.into(), &[], &[], 0).rt();
+        let a_smem = warp.load(a_smem, a.clone(), MoveIdx::block(&idxs, 2));
+        let a_reg = warp.load(a_reg, a_smem, MoveIdx::default());
         let a_reg = warp.mul_scalar(a_reg, INV_LN2);
         let a_reg = warp.sub_rv(a_reg, &max_vec);
         let a_reg = warp.exp2(a_reg);
         let a_reg = warp.div_rv(a_reg, &norm_vec);
-        let _ = warp.store(b.into(), a_reg.into(), &idxs, &[], 2);
+        let _ = warp.store(b, a_reg, MoveIdx::block(&idxs, 2));
     }
 }
 

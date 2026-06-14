@@ -16,14 +16,13 @@ use svod_ir::{ConstValue, UOp};
 use svod_tensor::Tensor;
 
 use crate::Group;
-use crate::group::lane_rc;
+use crate::group::{MoveIdx, lane_rc};
 use crate::index::{Idx, load_at};
 use crate::kernel::Kernel;
+use crate::loop_scope::Loop;
+use crate::scaffold::GlSpec;
 use crate::tile::{RT, RV, RegTile, ST};
-use crate::tiles::{
-    RT_16X16, RT_16X16_W32_ACC, RT_16X16_W32_ACC_T, RT_16X16_W32_IN, RTBaseShape, ST_16X16, ST_16X16_SWIZZLED_W32,
-    STBaseShape, TileLayout, VecLayout,
-};
+use crate::tiles::{RT_16X16, ST_16X16, TileLayout, VecLayout};
 
 /// The WMMA tile edge (gfx942 K=16). The QKᵀ / A·V WMMAs always operate on
 /// 16×16 fragments; Q/KV per-warp *tiles* are grids of `BLK`-edged fragments
@@ -165,7 +164,7 @@ pub(crate) fn build_fa_kv(ker: &Kernel, b: usize, n: usize, h: usize, h_kv: usiz
 
     // Load + scale the Q tile, then transpose it for the QKᵀ contraction.
     let q_idx = [Idx::from(&batch), Idx::from(&q_seq), Idx::from(&head), Idx::Const(0)];
-    let q_reg_fl = warp.load(q_reg_fl.into(), q.into(), &[], &q_idx, 1).rt();
+    let q_reg_fl = warp.load(q_reg_fl, q, MoveIdx::block(&q_idx, 1));
     let q_reg_fl = q_reg_fl * ((1.0 / (d as f64).sqrt()) * std::f64::consts::LOG2_E);
     let q_reg = warp.copy(q_reg, &q_reg_fl);
     let q_reg_t = warp.transpose(q_reg_t, &q_reg);
@@ -185,10 +184,10 @@ pub(crate) fn build_fa_kv(ker: &Kernel, b: usize, n: usize, h: usize, h_kv: usiz
     };
     {
         let kidx = [Idx::from(&batch), Idx::from(&kv_idx), Idx::from(&head_kv), Idx::Const(0)];
-        let k_smem = warp.load(k_smem.into(), k.into(), &[], &kidx, 1).st();
-        let v_smem = warp.load(v_smem.into(), v.into(), &[], &kidx, 1).st();
-        let k_reg = warp.load(k_reg.into(), k_smem.into(), &[], &[], 0).rt();
-        let v_reg = warp.load(v_reg.into(), v_smem.into(), &[], &[], 0).rt();
+        let k_smem = warp.load(k_smem, k, MoveIdx::block(&kidx, 1));
+        let v_smem = warp.load(v_smem, v, MoveIdx::block(&kidx, 1));
+        let k_reg = warp.load(k_reg, k_smem, MoveIdx::default());
+        let v_reg = warp.load(v_reg, v_smem, MoveIdx::default());
 
         // QKᵀ into a freshly-zeroed att tile.
         let att = warp.zero(att.after(smallvec![kv_idx.clone()]));
@@ -244,7 +243,7 @@ pub(crate) fn build_fa_kv(ker: &Kernel, b: usize, n: usize, h: usize, h_kv: usiz
     let o_reg = o_reg / &norm_vec;
     let o_reg_t = warp.transpose(o_reg_t, &o_reg);
     let o_idx = [Idx::from(&batch), Idx::from(&q_seq), Idx::from(&head), Idx::Const(0)];
-    let _ = warp.store(o.into(), o_reg_t.into(), &o_idx, &[], 1);
+    let _ = warp.store(o, o_reg_t, MoveIdx::block(&o_idx, 1));
 }
 
 /// Multi-wave flash-attention forward (FA-5 stage i): [`NUM_WARPS`] warps per
@@ -319,7 +318,7 @@ pub(crate) fn build_fa_mw(ker: &Kernel, b: usize, n: usize, h: usize, h_kv: usiz
 
     // Load + scale this warp's Q tile, then transpose it for the QKᵀ contraction.
     let q_idx = [Idx::from(&batch), Idx::from(&q_blk), Idx::from(&head), Idx::Const(0)];
-    let q_reg_fl = warp.load(q_reg_fl.into(), q.into(), &[], &q_idx, 1).rt();
+    let q_reg_fl = warp.load(q_reg_fl, q, MoveIdx::block(&q_idx, 1));
     let q_reg_fl = q_reg_fl * ((1.0 / (d as f64).sqrt()) * std::f64::consts::LOG2_E);
     let q_reg = warp.copy(q_reg, &q_reg_fl);
     let q_reg_t = warp.transpose(q_reg_t, &q_reg);
@@ -334,11 +333,11 @@ pub(crate) fn build_fa_mw(ker: &Kernel, b: usize, n: usize, h: usize, h_kv: usiz
         let kidx = [Idx::from(&batch), Idx::from(&kv_idx), Idx::from(&head_kv), Idx::Const(0)];
         // Collaborative GLOBAL→LDS fill across all 512 threads (each ends in a
         // workgroup barrier so every warp sees the full K/V block).
-        let k_smem = g.load(k_smem.into(), k.into(), &[], &kidx, 1).st();
-        let v_smem = g.load(v_smem.into(), v.into(), &[], &kidx, 1).st();
+        let k_smem = g.load(k_smem, k, MoveIdx::block(&kidx, 1));
+        let v_smem = g.load(v_smem, v, MoveIdx::block(&kidx, 1));
         // Per-warp LDS→REG gather: every warp reads the *same* shared K/V block.
-        let k_reg = warp.load(k_reg.into(), k_smem.into(), &[], &[], 0).rt();
-        let v_reg = warp.load(v_reg.into(), v_smem.into(), &[], &[], 0).rt();
+        let k_reg = warp.load(k_reg, k_smem, MoveIdx::default());
+        let v_reg = warp.load(v_reg, v_smem, MoveIdx::default());
 
         // Cross-wave WAR sync: all 8 warps must finish reading the shared K/V LDS
         // before the next iteration's collaborative fill overwrites it. Emitted in
@@ -404,7 +403,7 @@ pub(crate) fn build_fa_mw(ker: &Kernel, b: usize, n: usize, h: usize, h_kv: usiz
     let o_reg = o_reg / &norm_vec;
     let o_reg_t = warp.transpose(o_reg_t, &o_reg);
     let o_idx = [Idx::from(&batch), Idx::from(&q_blk), Idx::from(&head), Idx::Const(0)];
-    let _ = warp.store(o.into(), o_reg_t.into(), &o_idx, &[], 1);
+    let _ = warp.store(o, o_reg_t, MoveIdx::block(&o_idx, 1));
 }
 
 // =============================================================================
@@ -467,8 +466,8 @@ fn fill_kv_pair<'k>(
         let vsf = vsf.rewrap(vsf.uop().after(smallvec![bar]));
         (ksf, vsf)
     } else {
-        let ksf = g.load(k_smem.into(), k.clone().into(), &[], kidx, 1).st();
-        let vsf = g.load(v_smem.into(), v.clone().into(), &[], kidx, 1).st();
+        let ksf = g.load(k_smem, k.clone(), MoveIdx::block(kidx, 1));
+        let vsf = g.load(v_smem, v.clone(), MoveIdx::block(kidx, 1));
         (ksf, vsf)
     }
 }
@@ -496,7 +495,7 @@ fn fa_kv_slice<'k>(
     slice_idx: &Arc<UOp>,
     q_blk_rows: usize,
     kv_blk_rows: usize,
-    reinit_dep: &Arc<UOp>,
+    lp: &Loop<'k>,
     war_barrier: bool,
     extra_war: &[Arc<UOp>],
     causal: bool,
@@ -517,13 +516,13 @@ fn fa_kv_slice<'k>(
         slice_idx,
         q_blk_rows,
         kv_blk_rows,
-        reinit_dep,
+        lp,
         war_barrier,
         extra_war,
         causal,
         valid_len,
     );
-    fa_softmax_pv(warp, acc, att_mma, att_smem, warpid, scale_vec, max_vec_last, att, &v_reg, reinit_dep)
+    fa_softmax_pv(warp, acc, att_mma, att_smem, warpid, scale_vec, max_vec_last, att, &v_reg, lp)
 }
 
 /// Stage 1 of a KV slice — `QKᵀ`: gather this warp's K/V fragments from the
@@ -548,30 +547,23 @@ fn fa_qk<'k>(
     slice_idx: &Arc<UOp>,
     q_blk_rows: usize,
     kv_blk_rows: usize,
-    reinit_dep: &Arc<UOp>,
+    lp: &Loop<'k>,
     war_barrier: bool,
     extra_war: &[Arc<UOp>],
     causal: bool,
     valid_len: Option<Arc<UOp>>,
 ) -> (RT<'k>, RT<'k>) {
     // Per-warp LDS→REG gather: every warp reads the shared K/V block.
-    let k_reg = warp.load(k_reg.into(), k_smem.into(), &[], &[], 0).rt();
-    let v_reg = warp.load(v_reg.into(), v_smem.into(), &[], &[], 0).rt();
+    let k_reg = warp.load(k_reg, k_smem, MoveIdx::default());
+    let v_reg = warp.load(v_reg, v_smem, MoveIdx::default());
     // Cross-wave WAR sync: all 8 warps must finish reading this buffer before the
     // next fill overwrites it. `extra_war` folds in the rolled double-buffer's
     // prefetch commits, so this single in-loop barrier (consumed by the gathers)
     // also gates the cross-iteration RAW/WAR.
-    let (k_reg, v_reg) = if war_barrier {
-        let mut deps: smallvec::SmallVec<[Arc<UOp>; 4]> = smallvec![v_reg.uop().clone()];
-        deps.extend(extra_war.iter().cloned());
-        let sync = k_reg.uop().barrier(deps);
-        (k_reg.after(smallvec![sync.clone()]), v_reg.after(smallvec![sync]))
-    } else {
-        (k_reg, v_reg)
-    };
+    let (k_reg, v_reg) = if war_barrier { warp.war_fence2(k_reg, v_reg, extra_war) } else { (k_reg, v_reg) };
 
-    // QKᵀ into a freshly-zeroed att tile.
-    let att = warp.zero(att.after(smallvec![reinit_dep.clone()]));
+    // QKᵀ into a freshly-zeroed att tile (re-zeroed each trip via the loop scope).
+    let att = warp.zero(lp.reinit(att));
     let k_reg_t = warp.transpose(k_reg_t, &k_reg);
     let att = warp.mma_atb(att, &k_reg_t, q_reg_t);
 
@@ -633,11 +625,11 @@ fn fa_softmax_pv<'k>(
     max_vec_last: RV<'k>,
     att: RT<'k>,
     v_reg: &RT<'k>,
-    reinit_dep: &Arc<UOp>,
+    lp: &Loop<'k>,
 ) -> FaAcc<'k> {
     let FaAcc { mut max_vec, mut norm_vec, mut o_reg } = acc;
 
-    let max_vec_last = warp.copy(max_vec_last.after(smallvec![reinit_dep.clone()]), &max_vec);
+    let max_vec_last = warp.copy(lp.reinit(max_vec_last), &max_vec);
     max_vec =
         warp.col_reduce(max_vec.after(smallvec![max_vec_last.uop().clone()]), &att, |a, b| a.max(b), f64::NEG_INFINITY);
 
@@ -666,17 +658,19 @@ fn fa_softmax_pv<'k>(
     // the replicated-input map (`K=kv=element`, `N=q=lane%16`). Both lane maps are
     // the matmul-validated ones, so the relayout is correct by construction.
     let att_mma = match att_smem {
-        None => warp.copy(att_mma.after(smallvec![reinit_dep.clone(), norm_vec.uop().clone()]), &att),
+        None => warp.copy(att_mma.after(smallvec![lp.index().clone(), norm_vec.uop().clone()]), &att),
         Some(att_smem) => {
-            // `widx` is the per-warp LDS *sub-tile* offset (the `idxs` slot consumed
-            // by `wave_offset`), NOT a destination/source RT index — so it is the
-            // 3rd arg of `store` and the 4th arg of `load` (mirroring the matmul LDS
-            // gather), with empty src/dst RT indices.
-            let widx = [Idx::from(warpid)];
-            let stored = warp.store(att_smem.into(), att.into(), &widx, &[], 0).st();
-            let bar = stored.uop().barrier(smallvec![reinit_dep.clone(), norm_vec.uop().clone()]);
+            // This warp's `(kv_blk × q_blk)` band of the shared relayout buffer, as a
+            // zero-copy subtile — so the store and the reload address the warp's band
+            // with no repeated wave-block index (mirrors the matmul LDS gather). The
+            // band size is `att`'s element shape (its fragment grid × the base edge).
+            let an = att.shape().len();
+            let dims = (att.shape()[an - 3] * att.base.base.rows, att.shape()[an - 2] * att.base.base.cols);
+            let band = att_smem.subtile(dims, (Idx::from(warpid), Idx::Const(0)));
+            let stored = warp.store(band, att, MoveIdx::default());
+            let bar = stored.uop().barrier(smallvec![lp.index().clone(), norm_vec.uop().clone()]);
             let stored = stored.rewrap(stored.uop().after(smallvec![bar]));
-            warp.load(att_mma.into(), stored.into(), &[], &widx, 0).rt()
+            warp.load(att_mma, stored, MoveIdx::default())
         }
     };
     o_reg = warp.mma_atb(o_reg, v_reg, &att_mma);
@@ -799,7 +793,7 @@ pub(crate) fn build_fa_mw_db(ker: &Kernel, b: usize, n: usize, h: usize, h_kv: u
 
     // Load + scale this warp's Q tile, then transpose for the QKᵀ contraction.
     let q_idx = [Idx::from(&batch), Idx::from(&q_blk), Idx::from(&head), Idx::Const(0)];
-    let q_reg_fl = warp.load(q_reg_fl.into(), q.into(), &[], &q_idx, 1).rt();
+    let q_reg_fl = warp.load(q_reg_fl, q, MoveIdx::block(&q_idx, 1));
     let q_reg_fl = q_reg_fl * ((1.0 / (d as f64).sqrt()) * std::f64::consts::LOG2_E);
     let q_reg = warp.copy(q_reg, &q_reg_fl);
     let q_reg_t = warp.transpose(q_reg_t, &q_reg);
@@ -809,7 +803,8 @@ pub(crate) fn build_fa_mw_db(ker: &Kernel, b: usize, n: usize, h: usize, h_kv: u
     // so the half-count `(block_q_base+1)*NUM_WARPS*Q_BLK/(2*KV_BLK)` skips none.
     let half_mult = (NUM_WARPS * q_blk_rows / (2 * kv_blk_rows)) as i64;
     let kv_half = block_q_base.add(&iconst(1)).mul(&iconst(half_mult));
-    let t = ker.range_uop(kv_half);
+    let lp = ker.loop_dynamic(kv_half);
+    let t = lp.index().clone();
     let slice0 = t.mul(&iconst(2));
     let slice1 = slice0.add(&iconst(1));
 
@@ -842,7 +837,7 @@ pub(crate) fn build_fa_mw_db(ker: &Kernel, b: usize, n: usize, h: usize, h_kv: u
         &slice0,
         q_blk_rows,
         kv_blk_rows,
-        &t,
+        &lp,
         war,
         &[],
         true,
@@ -865,7 +860,7 @@ pub(crate) fn build_fa_mw_db(ker: &Kernel, b: usize, n: usize, h: usize, h_kv: u
         &slice1,
         q_blk_rows,
         kv_blk_rows,
-        &t,
+        &lp,
         war,
         &[],
         true,
@@ -879,7 +874,7 @@ pub(crate) fn build_fa_mw_db(ker: &Kernel, b: usize, n: usize, h: usize, h_kv: u
     let o_reg = o_reg / &norm_vec;
     let o_reg_t = warp.transpose(o_reg_t, &o_reg);
     let o_idx = [Idx::from(&batch), Idx::from(&q_blk), Idx::from(&head), Idx::Const(0)];
-    let _ = warp.store(o.into(), o_reg_t.into(), &o_idx, &[], 1);
+    let _ = warp.store(o, o_reg_t, MoveIdx::block(&o_idx, 1));
 }
 
 // =============================================================================
@@ -921,33 +916,31 @@ pub(crate) fn build_fa_mw_rdb(
     // baseline. Same numerics either way (the unroll only changes the loop
     // mechanism, not the fold order).
     ker.set_unroll(unroll);
-    assert_eq!(d % BLK, 0, "D must be a multiple of {BLK}");
-    assert_eq!(q_blk_rows % BLK, 0, "Q_BLK must be a multiple of the WMMA edge {BLK}");
-    assert_eq!(kv_blk_rows % BLK, 0, "KV_BLK must be a multiple of the WMMA edge {BLK}");
-    assert_eq!(h % h_kv, 0, "H must be a multiple of H_KV");
-    assert_eq!(
-        n % (q_blk_rows * NUM_WARPS),
-        0,
-        "multi-wave FA needs N a multiple of Q_BLK*{NUM_WARPS} ({} here)",
-        q_blk_rows * NUM_WARPS
-    );
+    Kernel::assert_divisible(d, BLK, "FA D");
+    Kernel::assert_divisible(q_blk_rows, BLK, "FA Q_BLK");
+    Kernel::assert_divisible(kv_blk_rows, BLK, "FA KV_BLK");
+    Kernel::assert_divisible(h, h_kv, "FA H / H_KV");
+    Kernel::assert_divisible(n, q_blk_rows * NUM_WARPS, "multi-wave FA N");
     // Rolled (no unroll halving): the group-max causal bound is
     // `(block_q_base+1)*NUM_WARPS*Q_BLK/KV_BLK` super-blocks (exact for these tiles).
-    assert_eq!(
-        (NUM_WARPS * q_blk_rows) % kv_blk_rows,
-        0,
-        "FA rolled db needs KV_BLK to divide NUM_WARPS*Q_BLK ({NUM_WARPS}*{q_blk_rows} / {kv_blk_rows})"
-    );
+    Kernel::assert_divisible(NUM_WARPS * q_blk_rows, kv_blk_rows, "FA rolled-db KV_BLK");
     let group_size = (h / h_kv) as i64;
     let g = ker.group(NUM_WARPS); // 512 threads — collaborative K/V GLOBAL→LDS fill
     let warp = ker.warp();
 
-    let o = ker.gl(&[b, n, h, d], in_dtype.clone());
-    let q = ker.gl(&[b, n, h, d], in_dtype.clone());
-    let k = ker.gl(&[b, n, h_kv, d], in_dtype.clone());
-    let v = ker.gl(&[b, n, h_kv, d], in_dtype.clone());
-    // Per-batch valid key-length buffer (padding mask), declared AFTER o,q,k,v so the
-    // ABI slot order stays stable; only bound when `masked`. The scalar `lens[batch]`
+    // ABI: outputs (o) then inputs (q, k, v), fixed by construction.
+    let (outs, ins) = ker.bind_abi(
+        &[GlSpec::new(&[b, n, h, d], in_dtype.clone())],
+        &[
+            GlSpec::new(&[b, n, h, d], in_dtype.clone()),
+            GlSpec::new(&[b, n, h_kv, d], in_dtype.clone()),
+            GlSpec::new(&[b, n, h_kv, d], in_dtype.clone()),
+        ],
+    );
+    let (o, q, k, v) = (outs[0].clone(), ins[0].clone(), ins[1].clone(), ins[2].clone());
+    // Per-batch valid key-length buffer (padding mask), bound AFTER o,q,k,v (trailing —
+    // never interleaved) so the ABI slot order stays stable; only bound when `masked`.
+    // The scalar `lens[batch]`
     // is read and cast to `Index` so the score-mask compare (`kv_pos >= vl`) matches
     // the causal path's Index-typed position arithmetic exactly.
     let valid_len = masked.then(|| {
@@ -955,10 +948,10 @@ pub(crate) fn build_fa_mw_rdb(
         load_at(lens.uop(), lens.shape(), &[Idx::from(&ker.block_idx[2])]).cast(DType::Index)
     });
 
-    let head = ker.block_idx[0].clone();
+    let head = ker.grid_x();
     let head_kv = head.idiv(&iconst(group_size));
-    let batch = ker.block_idx[2].clone();
-    let block_q_base = ker.block_idx[1].clone();
+    let batch = ker.grid_z();
+    let block_q_base = ker.grid_y();
     let warpid = g.warpid_in_group();
     let q_blk = block_q_base.mul(&iconst(NUM_WARPS as i64)).add(&warpid);
 
@@ -966,57 +959,50 @@ pub(crate) fn build_fa_mw_rdb(
     let f32 = DType::Float32;
     let (row, col) = (TileLayout::Row, TileLayout::Col);
 
-    // Arch-specific WMMA fragment shapes (mirrors the validated matmul select,
-    // `kernels/matmul.rs`): gfx942 (CDNA MFMA, wave64) keeps the single `RT_16X16`
-    // for every role; gfx11 (RDNA WMMA, wave32) splits into the even/odd `_ACC`
-    // accumulator, the replicated `_IN` input, the transposed `_ACC_T` for the
-    // N-major output store, and the ept-8 swizzled LDS strip. `att_lds` is the
-    // per-warp LDS band for the `att → att_mma` relayout — only RDNA needs it (the
-    // CDNA acc/input fragments coincide, so its relayout is a register copy).
-    let cdna = ker.caps.arch.is_cdna();
-    let (st_frag, rt_acc, rt_in, rt_acc_t): (STBaseShape, RTBaseShape, RTBaseShape, RTBaseShape) = if cdna {
-        (ST_16X16, RT_16X16, RT_16X16, RT_16X16)
-    } else {
-        (ST_16X16_SWIZZLED_W32, RT_16X16_W32_ACC, RT_16X16_W32_IN, RT_16X16_W32_ACC_T)
-    };
+    // Tiles below are declared by ROLE via the scaffold shortcuts (`ker.acc`/`operand`/
+    // `acc_t`/`shared_db`/`shared`), which resolve the arch fragment through `caps.frag`
+    // — so the kernel never names a physical fragment constant. `att_smem` (below) is the
+    // per-warp LDS relayout band, needed only where the accumulator cannot be reused as a
+    // WMMA input (RDNA); on CDNA the fragments coincide and the relayout is a register copy.
 
     // 2×-size shared K/V LDS double buffers (one `kv_blk_rows × d` block per half).
-    let k_smem = ker.st_db((kv_blk_rows, d), in_dt.clone(), row, st_frag);
-    let v_smem = ker.st_db((kv_blk_rows, d), in_dt.clone(), row, st_frag);
+    let k_smem = ker.shared_db((kv_blk_rows, d), in_dt.clone(), row);
+    let v_smem = ker.shared_db((kv_blk_rows, d), in_dt.clone(), row);
     let half_k = k_smem.half_elems() as i64;
     let half_v = v_smem.half_elems() as i64;
 
     // Q tile + transpose (shared, read-only across the loop). `o_reg_t` is the
     // transpose of the `[d,q]` PV accumulator for the `O[q,d]` store (N-major ⇒
     // `rt_acc_t` on RDNA).
-    let q_reg_fl = ker.rt((q_blk_rows, d), f32.clone(), row, rt_in);
-    let q_reg = ker.rt((q_blk_rows, d), in_dt.clone(), row, rt_in);
-    let q_reg_t = ker.rt((d, q_blk_rows), in_dt.clone(), col, rt_in);
-    let o_reg_t = ker.rt((q_blk_rows, d), f32.clone(), row, rt_acc_t);
+    let q_reg_fl = ker.operand((q_blk_rows, d), f32.clone(), row);
+    let q_reg = ker.operand((q_blk_rows, d), in_dt.clone(), row);
+    let q_reg_t = ker.operand((d, q_blk_rows), in_dt.clone(), col);
+    let o_reg_t = ker.acc_t((q_blk_rows, d), row);
 
     // One scratch set (vs the unroll's two): the rolled body has a back-edge, so
     // the carried FaAcc + a single scratch suffice. `att_smem` (RDNA only) holds
     // `NUM_WARPS` per-warp `kv_blk × q_blk` bands for the accumulator→input relayout.
     let sc = FaScratch {
-        k_reg: ker.rt((kv_blk_rows, d), in_dt.clone(), row, rt_in),
-        k_reg_t: ker.rt((d, kv_blk_rows), in_dt.clone(), col, rt_in),
-        v_reg: ker.rt((kv_blk_rows, d), in_dt.clone(), col, rt_in),
-        att: ker.rt((kv_blk_rows, q_blk_rows), f32.clone(), col, rt_acc),
-        att_mma: ker.rt((kv_blk_rows, q_blk_rows), in_dt.clone(), col, rt_in),
-        scale_vec: ker.rv(q_blk_rows, f32.clone(), VecLayout::Ortho, RT_16X16),
-        max_vec_last: ker.rv(q_blk_rows, f32.clone(), VecLayout::Ortho, RT_16X16),
-        att_smem: (!cdna).then(|| ker.st((NUM_WARPS * kv_blk_rows, q_blk_rows), in_dt.clone(), row, st_frag)),
+        k_reg: ker.operand((kv_blk_rows, d), in_dt.clone(), row),
+        k_reg_t: ker.operand((d, kv_blk_rows), in_dt.clone(), col),
+        v_reg: ker.operand((kv_blk_rows, d), in_dt.clone(), col),
+        att: ker.acc((kv_blk_rows, q_blk_rows), col),
+        att_mma: ker.operand((kv_blk_rows, q_blk_rows), in_dt.clone(), col),
+        scale_vec: ker.acc_vec(q_blk_rows),
+        max_vec_last: ker.acc_vec(q_blk_rows),
+        att_smem: (!ker.caps.acc_reusable_as_input())
+            .then(|| ker.shared((NUM_WARPS * kv_blk_rows, q_blk_rows), in_dt.clone(), row)),
     };
 
     // Carried online-softmax accumulators.
-    let o_reg = ker.rt((d, q_blk_rows), f32.clone(), col, rt_acc);
-    let max_vec = ker.rv(q_blk_rows, f32.clone(), VecLayout::Ortho, RT_16X16);
-    let norm_vec = ker.rv(q_blk_rows, f32, VecLayout::Ortho, RT_16X16);
+    let o_reg = ker.acc((d, q_blk_rows), col);
+    let max_vec = ker.acc_vec(q_blk_rows);
+    let norm_vec = ker.acc_vec(q_blk_rows);
     let acc = FaAcc { max_vec: warp.neg_inf_rv(max_vec), norm_vec: warp.zero_rv(norm_vec), o_reg: warp.zero(o_reg) };
 
     // Load + scale this warp's Q tile, then transpose for the QKᵀ contraction.
     let q_idx = [Idx::from(&batch), Idx::from(&q_blk), Idx::from(&head), Idx::Const(0)];
-    let q_reg_fl = warp.load(q_reg_fl.into(), q.into(), &[], &q_idx, 1).rt();
+    let q_reg_fl = warp.load(q_reg_fl, q, MoveIdx::block(&q_idx, 1));
     let q_reg_fl = q_reg_fl * ((1.0 / (d as f64).sqrt()) * std::f64::consts::LOG2_E);
     let q_reg = warp.copy(q_reg, &q_reg_fl);
     let q_reg_t = warp.transpose(q_reg_t, &q_reg);
@@ -1046,7 +1032,8 @@ pub(crate) fn build_fa_mw_rdb(
     // — a `WHERE` in the prefetch-address path is mis-ordered past its address-MUL
     // consumer in this kernel's linearization, leaving the renderer without its SSA
     // value; Mod (like the parity) lowers and orders cleanly.
-    let kv_idx = ker.range_uop(kv_bound);
+    let lp = ker.loop_dynamic(kv_bound);
+    let kv_idx = lp.index().clone();
     let kvp1 = kv_idx.add(&iconst(1));
     let pf = kvp1.try_mod(&iconst(total_kv_blocks)).expect("(kv+1) % total blocks");
     let par_cur = kv_idx.try_mod(&iconst(2)).expect("kv % 2");
@@ -1096,20 +1083,20 @@ pub(crate) fn build_fa_mw_rdb(
         &kv_idx,
         q_blk_rows,
         kv_blk_rows,
-        &kv_idx,
+        &lp,
         true,
         &extra_war,
         causal,
         valid_len,
     );
 
-    let o_reg = o_reg.rewrap(ker.endrange(1));
+    let o_reg = lp.close_carry(o_reg);
     let norm_vec = norm_vec.after(smallvec![o_reg.uop().clone()]);
 
     let o_reg = o_reg / &norm_vec;
     let o_reg_t = warp.transpose(o_reg_t, &o_reg);
     let o_idx = [Idx::from(&batch), Idx::from(&q_blk), Idx::from(&head), Idx::Const(0)];
-    let _ = warp.store(o.into(), o_reg_t.into(), &o_idx, &[], 1);
+    let _ = warp.store(o, o_reg_t, MoveIdx::block(&o_idx, 1));
 }
 
 /// Run flash-attention forward into `o` against realized `q`/`k`/`v`.

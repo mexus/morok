@@ -10,8 +10,8 @@ use svod_ir::UOp;
 use svod_tensor::Tensor;
 
 use crate::index::{Idx, cidx};
-use crate::tiles::{RT_16X16, RT_16X16_W32_ACC, RT_16X16_W32_IN, ST_16X16_SWIZZLED, ST_16X16_SWIZZLED_W32, TileLayout};
-use crate::{Kernel, RT, RegTile};
+use crate::tiles::{RT_16X16, ST_16X16_SWIZZLED, TileLayout};
+use crate::{GlSpec, Kernel, MoveIdx, RT, RegTile};
 
 /// K-reduction step (the LDS strip depth, shared by every config). HK `GEMM:6`.
 pub const K_STEP: usize = 64;
@@ -165,37 +165,31 @@ pub fn build_matmul_cfg(ker: &Kernel, n: usize, cfg: MatmulCfg) {
     let reg = cfg.reg();
     let g = ker.group_2d(cfg.wave_rows, cfg.wave_cols);
 
-    // WMMA fragment layout is arch-specific: gfx942 (CDNA MFMA, wave64) vs gfx11
-    // (RDNA WMMA, wave32). The A/B input *orientation* is the SAME on both — lane =
-    // M (A) / N (B), element = K (tinygrad `a_elem(x,k,row)=x[k][row]`) — only the
-    // packing differs: CDNA spreads K across lane-groups (`ept=4, stride=4`); RDNA
-    // holds all 16 K per lane, replicated across wave-halves (`ept=16, stride=0`).
-    // The accumulator differs more (even/odd row interleave — see `RT_16X16_W32_ACC`).
-    let (st_sw, rt_acc, rt_in) = if ker.caps.arch.is_cdna() {
-        (ST_16X16_SWIZZLED, RT_16X16, RT_16X16)
-    } else {
-        (ST_16X16_SWIZZLED_W32, RT_16X16_W32_ACC, RT_16X16_W32_IN)
-    };
-
-    // GL params bind in declaration order: out (c, f32), then ins (a, b — bf16).
-    let c_gl = ker.gl(&[1, 1, n, n], DType::Float32);
-    let a_gl = ker.gl(&[1, 1, n, n], DType::BFloat16);
-    let b_gl = ker.gl(&[1, 1, n, n], DType::BFloat16);
+    // ABI: output (c, f32) then inputs (a, b — bf16), fixed by construction. Tiles
+    // below are declared by ROLE via the scaffold shortcuts (`ker.acc`/`operand`/
+    // `shared_sw`), which resolve the arch fragment through `caps.frag` (gfx942 CDNA
+    // MFMA vs gfx11 RDNA WMMA — same A/B orientation, only packing + the even/odd
+    // accumulator differ) — so the kernel names no physical fragment constant.
+    let (outs, ins) = ker.bind_abi(
+        &[GlSpec::new(&[1, 1, n, n], DType::Float32)],
+        &[GlSpec::new(&[1, 1, n, n], DType::BFloat16), GlSpec::new(&[1, 1, n, n], DType::BFloat16)],
+    );
+    let (c_gl, a_gl, b_gl) = (outs[0].clone(), ins[0].clone(), ins[1].clone());
 
     // A strip [block×K_STEP] = [M,K]; B strip [K_STEP×block] = [K,N]; both
     // XOR-swizzled, single-buffered.
-    let a_smem = ker.st((cfg.block, K_STEP), DType::BFloat16, TileLayout::Row, st_sw);
-    let b_smem = ker.st((K_STEP, cfg.block), DType::BFloat16, TileLayout::Row, st_sw);
+    let a_smem = ker.shared_sw((cfg.block, K_STEP), DType::BFloat16, TileLayout::Row);
+    let b_smem = ker.shared_sw((K_STEP, cfg.block), DType::BFloat16, TileLayout::Row);
 
     let (row, col) = block_coords(ker, n, &cfg); // (pid_m, pid_n) in block units
     let warp_row = g.warp_row();
     let warp_col = g.warp_col();
 
     // `n_accum` col-major reg×reg f32 accumulators per wave.
-    let accs: Vec<RT> =
-        (0..cfg.n_accum).map(|_| g.zero(ker.rt((reg, reg), DType::Float32, TileLayout::Col, rt_acc))).collect();
+    let accs: Vec<RT> = (0..cfg.n_accum).map(|_| g.zero(ker.acc((reg, reg), TileLayout::Col))).collect();
 
-    let tile = ker.range((n / K_STEP) as i64);
+    let lp = ker.loop_static((n / K_STEP) as i64);
+    let tile = lp.index().clone();
 
     // Collaborative GLOBAL→LDS fill over all threads (each ends in a barrier);
     // M3 uses 128-bit vectorized loads for the large-N strips.
@@ -204,33 +198,23 @@ pub fn build_matmul_cfg(ker: &Kernel, n: usize, cfg: MatmulCfg) {
     let (a_smem, b_smem) = if cfg.vec_load {
         (g.fill_local_vec(a_smem, a_gl, &a_idx, 2), g.fill_local_vec(b_smem, b_gl, &b_idx, 2))
     } else {
-        (
-            g.load(a_smem.into(), a_gl.into(), &[], &a_idx, 2).st(),
-            g.load(b_smem.into(), b_gl.into(), &[], &b_idx, 2).st(),
-        )
+        (g.load(a_smem, a_gl, MoveIdx::block(&a_idx, 2)), g.load(b_smem, b_gl, MoveIdx::block(&b_idx, 2)))
     };
 
     // Shared B sub-tile (N col-block {warp_col}, same for every accumulator) and
     // per-accumulator A sub-tiles (M row-block {warp_row + a*wave_rows}).
-    let bb = g
-        .load(
-            ker.rt((K_STEP, reg), DType::BFloat16, TileLayout::Col, rt_in).into(),
-            b_smem.into(),
-            &[],
-            &[Idx::Const(0), Idx::from(&warp_col)],
-            0,
-        )
-        .rt();
+    let bb = g.load(
+        ker.operand((K_STEP, reg), DType::BFloat16, TileLayout::Col),
+        b_smem.subtile((K_STEP, reg), (Idx::Const(0), Idx::from(&warp_col))),
+        MoveIdx::default(),
+    );
     let a_subs: Vec<RT> = (0..cfg.n_accum)
         .map(|a| {
             g.load(
-                ker.rt((reg, K_STEP), DType::BFloat16, TileLayout::Row, rt_in).into(),
-                a_smem.clone().into(),
-                &[],
-                &[Idx::Uop(acc_row(&warp_row, a, &cfg))],
-                0,
+                ker.operand((reg, K_STEP), DType::BFloat16, TileLayout::Row),
+                a_smem.subtile((reg, K_STEP), (Idx::Uop(acc_row(&warp_row, a, &cfg)), Idx::Const(0))),
+                MoveIdx::default(),
             )
-            .rt()
         })
         .collect();
 
@@ -253,7 +237,7 @@ pub fn build_matmul_cfg(ker: &Kernel, n: usize, cfg: MatmulCfg) {
         };
         prev_out = Some(g.mma_ab(accs[a].clone(), &a_sub, &bb).uop().clone());
     }
-    let ended = ker.endrange_to(1);
+    let ended = lp.close();
     // Each accumulator reads its fully-reduced register value *outside* the loop.
     let final_accs: Vec<RT> = accs.iter().map(|c| c.after(smallvec![ended.clone()])).collect();
 
@@ -264,8 +248,7 @@ pub fn build_matmul_cfg(ker: &Kernel, n: usize, cfg: MatmulCfg) {
     let mut c_t = c_gl;
     for (a, c) in final_accs.into_iter().enumerate() {
         let m = row.mul(&cidx(bps)).add(&acc_row(&warp_row, a, &cfg));
-        c_t =
-            g.store(c_t.into(), c.into(), &[Idx::Const(0), Idx::Const(0), Idx::Uop(m), Idx::from(&nidx)], &[], 2).gl();
+        c_t = g.store(c_t, c, MoveIdx::block(&[Idx::Const(0), Idx::Const(0), Idx::Uop(m), Idx::from(&nidx)], 2));
     }
 }
 
@@ -361,14 +344,14 @@ pub fn build_matmul_pipelined(ker: &Kernel, n: usize, stage: PipeStage) {
                 }
                 // Tile 0 prologue: no prefetch yet — fill straight from global.
                 None => (
-                    g.load(a_smem.clone().into(), a_gl.clone().into(), &[], &tile_a_idx(tile, &row), 2).st(),
-                    g.load(b_smem.clone().into(), b_gl.clone().into(), &[], &tile_b_idx(tile, &col), 2).st(),
+                    g.load(a_smem.clone(), a_gl.clone(), MoveIdx::block(&tile_a_idx(tile, &row), 2)),
+                    g.load(b_smem.clone(), b_gl.clone(), MoveIdx::block(&tile_b_idx(tile, &col), 2)),
                 ),
             }
         } else {
             (
-                g.load(a_smem.clone().into(), a_gl.clone().into(), &[], &tile_a_idx(tile, &row), 2).st(),
-                g.load(b_smem.clone().into(), b_gl.clone().into(), &[], &tile_b_idx(tile, &col), 2).st(),
+                g.load(a_smem.clone(), a_gl.clone(), MoveIdx::block(&tile_a_idx(tile, &row), 2)),
+                g.load(b_smem.clone(), b_gl.clone(), MoveIdx::block(&tile_b_idx(tile, &col), 2)),
             )
         };
 
@@ -380,25 +363,18 @@ pub fn build_matmul_pipelined(ker: &Kernel, n: usize, stage: PipeStage) {
         }
 
         // ── LDS→REG gather ────────────────────────────────────────────────────
-        let bb = g
-            .load(
-                ker.rt((K_STEP, reg), DType::BFloat16, TileLayout::Col, RT_16X16).into(),
-                bf.clone().into(),
-                &[],
-                &[Idx::Const(0), Idx::from(&warp_col)],
-                0,
-            )
-            .rt();
+        let bb = g.load(
+            ker.rt((K_STEP, reg), DType::BFloat16, TileLayout::Col, RT_16X16),
+            bf.clone(),
+            MoveIdx::block(&[Idx::Const(0), Idx::from(&warp_col)], 0),
+        );
         let a_subs: Vec<RT> = (0..cfg.n_accum)
             .map(|a| {
                 g.load(
-                    ker.rt((reg, K_STEP), DType::BFloat16, TileLayout::Row, RT_16X16).into(),
-                    af.clone().into(),
-                    &[],
-                    &[Idx::Uop(acc_row(&warp_row, a, &cfg))],
-                    0,
+                    ker.rt((reg, K_STEP), DType::BFloat16, TileLayout::Row, RT_16X16),
+                    af.clone(),
+                    MoveIdx::block(&[Idx::Uop(acc_row(&warp_row, a, &cfg))], 0),
                 )
-                .rt()
             })
             .collect();
 
@@ -450,8 +426,7 @@ pub fn build_matmul_pipelined(ker: &Kernel, n: usize, stage: PipeStage) {
     let mut c_t = c_gl;
     for (a, c) in accs.into_iter().enumerate() {
         let m = row.mul(&cidx(bps)).add(&acc_row(&warp_row, a, &cfg));
-        c_t =
-            g.store(c_t.into(), c.into(), &[Idx::Const(0), Idx::Const(0), Idx::Uop(m), Idx::from(&nidx)], &[], 2).gl();
+        c_t = g.store(c_t, c, MoveIdx::block(&[Idx::Const(0), Idx::Const(0), Idx::Uop(m), Idx::from(&nidx)], 2));
     }
 }
 
@@ -522,7 +497,8 @@ pub fn build_matmul_db(ker: &Kernel, n: usize) {
     let b_smem = g.commit_reg_to_local(b_smem, &s0_b, true);
 
     // ── Rolled, software-pipelined K-loop over the double buffer ──────────────
-    let tile = ker.range(num_tiles as i64);
+    let lp = ker.loop_static(num_tiles as i64);
+    let tile = lp.index().clone();
     let tp1 = tile.add(&cidx(1));
     // Clamp the prefetch tile to the last valid one (the final iteration's
     // prefetch is never consumed; clamping keeps the GLOBAL read in bounds).
@@ -558,25 +534,18 @@ pub fn build_matmul_db(ker: &Kernel, n: usize) {
     // Gather the current buffer half → WMMA fragments. The counter-dependent
     // address keeps these loop-scoped; they read the tile committed last
     // iteration (or the prologue for tile 0), made visible by the prior barrier.
-    let bb = g
-        .load(
-            ker.rt((K_STEP_DB, reg), DType::BFloat16, TileLayout::Col, RT_16X16).into(),
-            b_cur.into(),
-            &[],
-            &[Idx::Const(0), Idx::from(&warp_col)],
-            0,
-        )
-        .rt();
+    let bb = g.load(
+        ker.rt((K_STEP_DB, reg), DType::BFloat16, TileLayout::Col, RT_16X16),
+        b_cur,
+        MoveIdx::block(&[Idx::Const(0), Idx::from(&warp_col)], 0),
+    );
     let a_subs: Vec<RT> = (0..cfg.n_accum)
         .map(|a| {
             g.load(
-                ker.rt((reg, K_STEP_DB), DType::BFloat16, TileLayout::Row, RT_16X16).into(),
-                a_cur.clone().into(),
-                &[],
-                &[Idx::Uop(acc_row(&warp_row, a, &cfg))],
-                0,
+                ker.rt((reg, K_STEP_DB), DType::BFloat16, TileLayout::Row, RT_16X16),
+                a_cur.clone(),
+                MoveIdx::block(&[Idx::Uop(acc_row(&warp_row, a, &cfg))], 0),
             )
-            .rt()
         })
         .collect();
 
@@ -604,7 +573,7 @@ pub fn build_matmul_db(ker: &Kernel, n: usize) {
     // consumer, and (its passthrough being the MFMA store) emitted after the MFMAs.
     // Its deps are the prefetch commits.
     let bar_deps: smallvec::SmallVec<[Arc<UOp>; 4]> = smallvec![commit_a.uop().clone(), commit_b.uop().clone()];
-    let ended = ker.endrange_barrier_to(1, bar_deps);
+    let ended = lp.close_barrier(bar_deps);
     let final_accs: Vec<RT> = accs.iter().map(|c| c.after(smallvec![ended.clone()])).collect();
 
     // Epilogue: store each accumulator to global C at its reg-block.
@@ -613,7 +582,6 @@ pub fn build_matmul_db(ker: &Kernel, n: usize) {
     let mut c_t = c_gl;
     for (a, c) in final_accs.into_iter().enumerate() {
         let m = row.mul(&cidx(bps)).add(&acc_row(&warp_row, a, &cfg));
-        c_t =
-            g.store(c_t.into(), c.into(), &[Idx::Const(0), Idx::Const(0), Idx::Uop(m), Idx::from(&nidx)], &[], 2).gl();
+        c_t = g.store(c_t, c, MoveIdx::block(&[Idx::Const(0), Idx::Const(0), Idx::Uop(m), Idx::from(&nidx)], 2));
     }
 }
