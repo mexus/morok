@@ -62,12 +62,22 @@ fn test_compare_exchange_graph_shape() {
 fn test_shuffle_xor_allreduce_amd() {
     use svod_tensor::Tensor;
 
+    // Arch-aware: derive the wave width (64 on CDNA, 32 on RDNA) so the butterfly
+    // mask sequence, launch block, and expected sum all match the device.
+    let dev = Tensor::rand(&[16, 16]).expect("probe").device();
+    let Some(arch) = crate::target::resolve_arch(&dev) else {
+        eprintln!("skip test_shuffle_xor_allreduce_amd: no AMD device");
+        return;
+    };
+    let w = arch.wave_size() as i64;
+    let masks: Vec<i64> = (0..).map(|i| 1i64 << i).take_while(|&m| m < w).collect();
+
     let mut out = Tensor::empty(&[1, 1, 16, 16], DType::Float32);
-    crate::run_kernel("allreduce", [1, 1, 1], 64, &mut [&mut out], &[], |ker| {
+    crate::run_kernel("allreduce", [1, 1, 1], w, &mut [&mut out], &[], |ker| {
         let warp = ker.warp();
         let o = ker.gl(&[1, 1, 16, 16], DType::Float32);
         let mut x = warp.ones(ker.rt((16, 16), DType::Float32, ROW, RT_16X16));
-        for mask in [1i64, 2, 4, 8, 16, 32] {
+        for &mask in &masks {
             let tmp = warp.shuffle_xor(ker.rt((16, 16), DType::Float32, ROW, RT_16X16), &x, mask);
             x = warp.add(x, &tmp);
         }
@@ -79,6 +89,7 @@ fn test_shuffle_xor_allreduce_amd() {
 
     let got = out.as_vec::<f32>().expect("read out");
     assert_eq!(got.len(), 256, "16x16 tile");
-    let bad = got.iter().filter(|&&v| (v - 64.0).abs() > 1e-3).count();
-    assert_eq!(bad, 0, "every element must be the 64-lane sum of 1.0 = 64.0; got e.g. {:?}", &got[..8]);
+    let expected = w as f32;
+    let bad = got.iter().filter(|&&v| (v - expected).abs() > 1e-3).count();
+    assert_eq!(bad, 0, "every element must be the {w}-lane sum of 1.0 = {expected}; got e.g. {:?}", &got[..8]);
 }

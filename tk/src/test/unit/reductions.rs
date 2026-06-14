@@ -105,12 +105,26 @@ fn test_row_reduce_graph_shape() {
 // Hardware-gated end-to-end softmax on gfx942.
 // =============================================================================
 
+/// Whether the active device is CDNA (wave64). These softmax tests hardcode a
+/// 64-thread launch block + single-warp geometry tuned for wave64, so they skip on
+/// a wave32 (RDNA) device — the reduce itself is arch-blind; only the test's launch
+/// geometry is wave64-specific (a 64-thread block is 2 waves on wave32, racing the
+/// shared output). A wave32 softmax would need an arch-derived block.
+fn is_cdna_device() -> bool {
+    let dev = svod_tensor::Tensor::rand(&[16, 16]).expect("probe tensor").device();
+    crate::target::resolve_arch(&dev).is_some_and(|a| a.is_cdna())
+}
+
 /// `SVOD_DEVICE=AMD:0 cargo test -p svod-tk --lib reductions::test_softmax_amd -- --ignored --nocapture`.
 #[test]
 #[ignore]
 fn test_softmax_amd() {
     use svod_tensor::Tensor;
 
+    if !is_cdna_device() {
+        eprintln!("skip test_softmax_amd: wave64 launch geometry (CDNA-only)");
+        return;
+    }
     let (n, block) = (64usize, 32usize);
 
     let a = Tensor::rand(&[1, 1, block, n]).expect("rand a");
@@ -146,6 +160,10 @@ fn test_softmax_amd() {
 fn test_softmax_unroll_amd() {
     use svod_tensor::Tensor;
 
+    if !is_cdna_device() {
+        eprintln!("skip test_softmax_unroll_amd: wave64 launch geometry (CDNA-only)");
+        return;
+    }
     for (n, block) in [(64usize, 16usize), (64, 32)] {
         let a = Tensor::rand(&[1, 1, block, n]).expect("rand a");
         let mut a = a.cast(DType::Float32).expect("cast a");
