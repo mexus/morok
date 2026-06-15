@@ -93,7 +93,7 @@ fn test_accumulator_after_bare_store_cpu() {
         let result = load0(&acc.after(smallvec![store_end]));
 
         let out_store = index0(&out_buf).store(result);
-        let sink = UOp::sink_with_info(vec![out_store], KernelInfo { opts_to_apply: Some(vec![]) });
+        let sink = UOp::sink_with_info(vec![out_store], KernelInfo { opts_to_apply: Some(vec![]), name: None });
 
         // Compile + dispatch directly against the concrete buffers (outputs first).
         let device = svod_runtime::create_cpu_device_with_backend(svod_device::registry::registry(), CpuBackend::Clang)

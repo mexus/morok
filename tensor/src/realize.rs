@@ -1379,8 +1379,17 @@ fn prepare_execution_plan(
                     svod_schedule::optimize_kernel_with_config(item.ast.clone(), &optimizer_renderer, &config.optimizer)
                 };
 
-            let kernel_name =
-                optimized_ast.metadata::<svod_schedule::optimizer::KernelInfo>().map(|info| info.function_name());
+            // Optimizer-scheduled kernels carry their name in the schedule metadata;
+            // hand-lowered custom kernels (tk graph_launch) carry it on the SINK's
+            // KernelInfo instead, so fall back to that — otherwise they render as the
+            // generic "kernel" default and collapse together in the profile.
+            let kernel_name = optimized_ast
+                .metadata::<svod_schedule::optimizer::KernelInfo>()
+                .map(|info| info.function_name())
+                .or_else(|| match optimized_ast.op() {
+                    svod_ir::Op::Sink { info: Some(ki), .. } => ki.name.clone(),
+                    _ => None,
+                });
 
             let ast_decomposed = match item_device.renderer.decompositor() {
                 Some(matcher) => svod_ir::decompositions::decompose_with(&optimized_ast, &matcher),
@@ -1756,9 +1765,16 @@ fn beam_search_optimize(
                     opt
                 };
 
-                // Extract kernel name before decomposition (which loses metadata)
-                let kernel_name =
-                    optimized.metadata::<svod_schedule::optimizer::KernelInfo>().map(|info| info.function_name());
+                // Extract kernel name before decomposition (which loses metadata).
+                // Hand-lowered custom kernels carry it on the SINK instead (see the
+                // non-BEAM path above), so fall back to that.
+                let kernel_name = optimized
+                    .metadata::<svod_schedule::optimizer::KernelInfo>()
+                    .map(|info| info.function_name())
+                    .or_else(|| match optimized.op() {
+                        svod_ir::Op::Sink { info: Some(ki), .. } => ki.name.clone(),
+                        _ => None,
+                    });
 
                 // Pre-codegen metrics: structural hash for `seen_libs`, ALU node
                 // count for `least_compute_ops`. Computed before compile so even

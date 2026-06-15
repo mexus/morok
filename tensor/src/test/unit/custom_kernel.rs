@@ -200,7 +200,7 @@ fn hand_ranged_add1_body(n: usize) -> impl FnOnce(Vec<Arc<UOp>>) -> Arc<UOp> {
         // opts_to_apply = Some(vec![]) — the tinygrad `()` analog: this SINK is
         // already in finished, hand-lowered form; the optimizer must apply zero
         // opts (no heuristic upcast/vectorize of the manual loop).
-        UOp::sink_with_info(vec![store], KernelInfo { opts_to_apply: Some(vec![]) })
+        UOp::sink_with_info(vec![store], KernelInfo { opts_to_apply: Some(vec![]), name: None })
     }
 }
 

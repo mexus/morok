@@ -20,7 +20,7 @@ fn hand_ranged_sink(n: i64, opts_to_apply: Option<Vec<Opt>>) -> std::sync::Arc<U
     let val = loaded.try_add(&one).unwrap();
     let out_idx = UOp::index().buffer(out_buf).indices(vec![i.clone()]).ptr(true).call().unwrap();
     let store = out_idx.store(val).end(smallvec![i]);
-    UOp::sink_with_info(vec![store], KernelInfo { opts_to_apply })
+    UOp::sink_with_info(vec![store], KernelInfo { opts_to_apply, name: None })
 }
 
 fn count_axis_type(ast: &std::sync::Arc<UOp>, axis_type: AxisType) -> usize {

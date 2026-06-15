@@ -216,7 +216,7 @@ impl Kernel {
         // (the matmul, whose tile loop `endrange` already consumed) — and SINK
         // them directly (the native `SINK(END(STORE, ..))` kernel shape).
         let sources: Vec<Arc<UOp>> = store_uops.into_iter().map(|s| s.end(rngs.clone())).collect();
-        UOp::sink_with_info(sources, KernelInfo { opts_to_apply: Some(vec![]) })
+        UOp::sink_with_info(sources, KernelInfo { opts_to_apply: Some(vec![]), name: Some(self.name.clone()) })
     }
 
     /// Close `ranges` inner (accumulation) loops around the last store and

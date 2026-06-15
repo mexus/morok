@@ -318,7 +318,7 @@ fn test_create_schedule_opaque_body_intra_kernel_after_end_store() {
     let out_store = idx(buffer_uop.clone()).store(result);
 
     // Marked SINK → opaque CALL body.
-    let body = UOp::sink_with_info(vec![out_store], svod_ir::KernelInfo { opts_to_apply: Some(vec![]) });
+    let body = UOp::sink_with_info(vec![out_store], svod_ir::KernelInfo { opts_to_apply: Some(vec![]), name: None });
     let call = body.call(SmallVec::from_vec(vec![buffer_uop.clone()]), CallInfo::default());
     let transformed = UOp::sink(vec![call.clone()]);
 
