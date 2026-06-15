@@ -489,6 +489,7 @@ impl AmdComputeQueue {
         grid: [u32; 3],
         wave32: bool,
         target_major: u32,
+        ts_addrs: Option<(u64, u64)>,
     ) -> Result<u64> {
         debug_assert!(self.is_pm4, "dispatch_pm4 called on AQL queue");
         debug_assert!(
@@ -544,6 +545,12 @@ impl AmdComputeQueue {
         } else {
             q.extend_from_slice(&pm4::acquire_mem());
         }
+        // Profiling: GPU-clock timestamp at end-of-pipe just before the CS
+        // launches (after the submit barriers drain). Paired with the `end`
+        // probe below, `end - start` is on-device kernel time on the PM4 path.
+        if let Some((start_addr, _)) = ts_addrs {
+            q.extend_from_slice(&pm4::release_mem_timestamp(start_addr, target_major == 9));
+        }
         // exec: SET_SH_REG stream + DISPATCH_DIRECT.
         build_exec_pm4(
             &mut q,
@@ -559,6 +566,13 @@ impl AmdComputeQueue {
             wave32,
             target_major,
         );
+        // Profiling: GPU-clock timestamp at the dispatch's end-of-pipe. Emitted
+        // before the completion `release_mem` so it captures CS completion just
+        // ahead of the output cache flush (consistent with the `start` probe's
+        // EOP point, so the delta is kernel time).
+        if let Some((_, end_addr)) = ts_addrs {
+            q.extend_from_slice(&pm4::release_mem_timestamp(end_addr, target_major == 9));
+        }
         // signal(counter, next): RELEASE_MEM after a system-scope cache flush.
         q.extend_from_slice(&pm4::release_mem(
             counter_addr,

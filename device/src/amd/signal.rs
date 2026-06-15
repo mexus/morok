@@ -86,6 +86,22 @@ impl AmdSignal {
         self.base_gpu
     }
 
+    /// GPU VA of the dispatch `start_ts` field (`base_gpu + 32`). On the
+    /// single-XCC PM4 path the CP does not auto-stamp dispatches (the AQL path's
+    /// `ENABLE_PROFILING` does), so a profiling dispatch targets this address
+    /// with a `release_mem_timestamp` GPU-clock probe before the kernel launches.
+    #[inline]
+    pub fn start_ts_addr(&self) -> u64 {
+        self.base_gpu + SIGNAL_START_TS_OFFSET as u64
+    }
+
+    /// GPU VA of the dispatch `end_ts` field (`base_gpu + 40`). See
+    /// [`start_ts_addr`](Self::start_ts_addr).
+    #[inline]
+    pub fn end_ts_addr(&self) -> u64 {
+        self.base_gpu + SIGNAL_END_TS_OFFSET as u64
+    }
+
     /// Slot index inside the pool. Useful for debugging.
     pub fn slot(&self) -> u32 {
         self.slot

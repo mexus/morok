@@ -491,7 +491,7 @@ impl crate::device::PlanContext for OwnerCtx {
             .expect("AMD PlanContext dispatched a non-AMD program");
         self.pool().ensure_has_local_memory(amd.private_segment_size())?;
         let sig = unsafe {
-            amd.execute_on(self, buffers, vals, global_size, local_size, /*wait=*/ false)?
+            amd.execute_on(self, buffers, vals, global_size, local_size, /*wait=*/ false, /*profile=*/ true)?
         };
         Ok(sig.map(|s| s as Arc<dyn crate::DispatchTimestamps>))
     }
