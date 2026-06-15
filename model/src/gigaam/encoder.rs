@@ -103,6 +103,9 @@ impl FeedForward {
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        // The two-linear FFN lowers to GEMM1+silu → h → GEMM2 (two reduces force `h`
+        // to realize between them), which the generic optimizer fuses + (with BEAM)
+        // tunes as well as a hand kernel — so the FFN stays plain graph ops.
         let y = self.norm.apply(x)?;
         let y = y.linear().weight(&self.linear1_weight).bias(&self.linear1_bias).call().context(TensorSnafu)?;
         let y = y.silu().context(TensorSnafu)?;
