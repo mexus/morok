@@ -1,4 +1,4 @@
-use super::test_support::{amd_alloc_or_skip, require_multi_xcc};
+use super::test_support::{amd_alloc_or_skip, require_multi_xcc, require_single_xcc};
 use crate::amd::program::*;
 use crate::amd::queue::build_dispatch_packet;
 
@@ -414,6 +414,192 @@ attributes #0 = { alwaysinline nounwind "amdgpu-flat-work-group-size"="1,64" }
         "PROBE 2-kernel RAW: buf -99 -> {v} (A=5.0 then B=+1.0; expect 6.0; 5.0 ⇒ B ran before A's write was visible)"
     );
     assert_eq!(v, 6.0, "kernel B must observe kernel A's write in the batch");
+
+    drop(graph);
+    out_buf.free_amd_device_in_place();
+}
+
+/// PM4 GRAPH PROBE (manual hardware probe; `#[ignore]`). Single-XCC (RDNA, e.g.
+/// gfx1151) analogue of `aql_graph_capture_replay_probe`: capture a ONE-kernel
+/// static chain into a PM4 indirect buffer and replay it twice via
+/// [`AmdGraphPm4`] (the `will_use_pm4` branch of `AmdGraph::capture`). The
+/// kernel's `store f32 0.0` must reach the host-visible buffer on each replay,
+/// and `synchronize_all` must drain the wrapping PM4 counter.
+///
+/// Run: SVOD_DEVICE=AMD:0 cargo test -p svod-device --lib pm4_graph_capture_replay_probe -- --ignored --nocapture --test-threads=1
+/// (the probe forces `SVOD_PM4_GRAPH=1` internally — capture is opt-in by default).
+#[test]
+#[ignore = "manual hardware probe; needs a real single-XCC AMD GPU + clang"]
+fn pm4_graph_capture_replay_probe() {
+    use crate::allocator::RawBuffer;
+    use crate::amd::AmdGraph;
+    use crate::device::{GraphKernel, Program};
+
+    let Some(alloc) = amd_alloc_or_skip() else { return };
+    let core = alloc.dev.core();
+    if !require_single_xcc(&alloc) {
+        return;
+    }
+    // PM4 graph capture is opt-in (default per-call — it regresses on gfx1151);
+    // force it on so this probe exercises the capture path. Single-threaded tests.
+    // SAFETY: process is single-threaded under `--test-threads=1`.
+    unsafe { std::env::set_var("SVOD_PM4_GRAPH", "1") };
+    if core.signal_pool().is_none() {
+        core.install_signal_pool(crate::amd::signal::SignalPool::new(&alloc, 64).expect("signal pool"));
+    }
+    let mcpu = alloc.dev.arch.mcpu();
+
+    let ir = r#"target triple = "amdgcn-amd-amdhsa"
+declare i32 @llvm.amdgcn.workitem.id.x()
+define amdgpu_kernel void @pm4_graph_probe(ptr noalias %buf0) #0 {
+  %tid = tail call i32 @llvm.amdgcn.workitem.id.x()
+  %tid_ext = zext i32 %tid to i64
+  %p = getelementptr inbounds float, ptr %buf0, i64 %tid_ext
+  store float 0.0, ptr %p
+  ret void
+}
+attributes #0 = { alwaysinline nounwind "amdgpu-flat-work-group-size"="1,64" }
+"#;
+    let bytes = match clang_amdgcn(ir, mcpu) {
+        Some(b) => b,
+        None => {
+            eprintln!("PROBE skipped: clang amdgcn ({mcpu}) unavailable.");
+            return;
+        }
+    };
+    let prog = AmdProgram::load(alloc.dev.clone(), &alloc, &bytes, "pm4_graph_probe", 1, 0).expect("load program");
+
+    let out_buf = alloc.alloc_uncached(64).expect("output buffer");
+    let (out_gpu, out_host) = match &out_buf {
+        RawBuffer::AmdDevice { gpu_addr, host_ptr: Some(h), .. } => (*gpu_addr, *h),
+        _ => panic!("output buffer must be host-visible"),
+    };
+
+    let kernels = vec![GraphKernel {
+        program: &prog as &dyn Program,
+        buffers: vec![out_gpu as *mut u8],
+        vals: vec![],
+        global_size: Some([1, 1, 1]),
+        local_size: Some([1, 1, 1]),
+        deps: vec![],
+    }];
+    let graph = match AmdGraph::capture(&alloc, &kernels).expect("capture") {
+        Some(g) => g,
+        None => {
+            eprintln!("PROBE skipped: chain not graphable on this device.");
+            return;
+        }
+    };
+
+    for trial in 0..2 {
+        let sentinel: f32 = -7.5 * (trial as f32 + 1.0);
+        // SAFETY: out_host is the host-visible output buffer.
+        unsafe { std::ptr::write_volatile(out_host.as_ptr() as *mut f32, sentinel) };
+        graph.replay(&[]).expect("graph replay");
+        core.synchronize_all().expect("synchronize_all");
+        let v = unsafe { std::ptr::read_volatile(out_host.as_ptr() as *const f32) };
+        assert_eq!(v, 0.0, "PM4 graph replay #{trial}: kernel store must land ({sentinel} -> {v})");
+    }
+    eprintln!("PROBE PM4 graph capture+replay: 2 replays via one indirect buffer ran the kernel correctly.");
+
+    drop(graph);
+    out_buf.free_amd_device_in_place();
+}
+
+/// PM4 GRAPH RAW PROBE (manual hardware probe; `#[ignore]`). Single-XCC analogue
+/// of `aql_graph_two_kernel_raw_dependency`: a 2-kernel RAW chain in one PM4
+/// indirect buffer. Kernel A stores 5.0; kernel B loads, adds 1.0, stores back →
+/// expect 6.0. Validates the per-kernel `hdp_flush + acquire_mem` hazard barrier
+/// makes A's write visible to B inside the single captured IB (a `5.0` result
+/// means B ran before A's store was visible — barrier missing).
+///
+/// Run: SVOD_DEVICE=AMD:0 cargo test -p svod-device --lib pm4_graph_two_kernel_raw_dependency -- --ignored --nocapture --test-threads=1
+#[test]
+#[ignore = "manual hardware probe; needs a real single-XCC AMD GPU + clang"]
+fn pm4_graph_two_kernel_raw_dependency() {
+    use crate::allocator::RawBuffer;
+    use crate::amd::AmdGraph;
+    use crate::device::{GraphKernel, Program};
+
+    let Some(alloc) = amd_alloc_or_skip() else { return };
+    let core = alloc.dev.core();
+    if !require_single_xcc(&alloc) {
+        return;
+    }
+    // PM4 graph capture is opt-in (default per-call); force it on for this probe.
+    // SAFETY: process is single-threaded under `--test-threads=1`.
+    unsafe { std::env::set_var("SVOD_PM4_GRAPH", "1") };
+    if core.signal_pool().is_none() {
+        core.install_signal_pool(crate::amd::signal::SignalPool::new(&alloc, 64).expect("signal pool"));
+    }
+    let mcpu = alloc.dev.arch.mcpu();
+
+    let ir_set = r#"target triple = "amdgcn-amd-amdhsa"
+define amdgpu_kernel void @k_set(ptr noalias %buf0) #0 {
+  store float 5.0, ptr %buf0
+  ret void
+}
+attributes #0 = { alwaysinline nounwind "amdgpu-flat-work-group-size"="1,64" }
+"#;
+    let ir_inc = r#"target triple = "amdgcn-amd-amdhsa"
+define amdgpu_kernel void @k_inc(ptr noalias %buf0) #0 {
+  %v = load float, ptr %buf0
+  %r = fadd float %v, 1.0
+  store float %r, ptr %buf0
+  ret void
+}
+attributes #0 = { alwaysinline nounwind "amdgpu-flat-work-group-size"="1,64" }
+"#;
+    let (bytes_set, bytes_inc) = match (clang_amdgcn(ir_set, mcpu), clang_amdgcn(ir_inc, mcpu)) {
+        (Some(a), Some(b)) => (a, b),
+        _ => {
+            eprintln!("PROBE skipped: clang unavailable.");
+            return;
+        }
+    };
+    let prog_set = AmdProgram::load(alloc.dev.clone(), &alloc, &bytes_set, "k_set", 1, 0).expect("load k_set");
+    let prog_inc = AmdProgram::load(alloc.dev.clone(), &alloc, &bytes_inc, "k_inc", 1, 0).expect("load k_inc");
+
+    let out_buf = alloc.alloc_uncached(64).expect("output buffer");
+    let (out_gpu, out_host) = match &out_buf {
+        RawBuffer::AmdDevice { gpu_addr, host_ptr: Some(h), .. } => (*gpu_addr, *h),
+        _ => panic!("host-visible"),
+    };
+    // SAFETY: seed a sentinel.
+    unsafe { std::ptr::write_volatile(out_host.as_ptr() as *mut f32, -99.0) };
+
+    let kernels = vec![
+        GraphKernel {
+            program: &prog_set as &dyn Program,
+            buffers: vec![out_gpu as *mut u8],
+            vals: vec![],
+            global_size: Some([1, 1, 1]),
+            local_size: Some([1, 1, 1]),
+            deps: vec![],
+        },
+        GraphKernel {
+            program: &prog_inc as &dyn Program,
+            buffers: vec![out_gpu as *mut u8],
+            vals: vec![],
+            global_size: Some([1, 1, 1]),
+            local_size: Some([1, 1, 1]),
+            deps: vec![0],
+        },
+    ];
+    let graph = match AmdGraph::capture(&alloc, &kernels).expect("capture") {
+        Some(g) => g,
+        None => {
+            eprintln!("PROBE skipped: not graphable.");
+            return;
+        }
+    };
+    graph.replay(&[]).expect("replay");
+    core.synchronize_all().expect("sync");
+    let v = unsafe { std::ptr::read_volatile(out_host.as_ptr() as *const f32) };
+    eprintln!(
+        "PROBE PM4 2-kernel RAW: buf -99 -> {v} (A=5.0 then B=+1.0; expect 6.0; 5.0 ⇒ B ran before A's write was visible)"
+    );
+    assert_eq!(v, 6.0, "kernel B must observe kernel A's write in the captured IB");
 
     drop(graph);
     out_buf.free_amd_device_in_place();

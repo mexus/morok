@@ -612,6 +612,52 @@ impl AmdComputeQueue {
         Ok(())
     }
 
+    /// Replay a captured PM4 graph (single-XCC): submit ONE
+    /// `PACKET3_INDIRECT_BUFFER` referencing the graph's resident IB, wrapped in
+    /// the SAME monotonic-counter discipline `dispatch_pm4` uses per kernel —
+    /// `wait(counter, prev) → INDIRECT_BUFFER(ib) → release_mem(counter, next)` —
+    /// with ONE doorbell. The CP runs the whole baked kernel chain inline (per-
+    /// kernel hazard barriers + execs live in the IB); the wrapping `wait`/
+    /// `release_mem` serialise this replay against the previous one and fire the
+    /// pool counter so the owner's `synchronize` drains it, exactly like a
+    /// per-call dispatch but for the whole chain at once. `ib_size` is the IB's
+    /// dword count. Returns the counter value this replay signals.
+    ///
+    /// The caller (`AmdGraphPm4::replay`) holds `pool.dispatch_lock` across the
+    /// whole op so the counter reservation, the (re)built IB's baked scratch VA,
+    /// and the ring submission stay ordered against co-tenant owners.
+    pub fn replay_indirect_buffer(&self, pool: &PoolQueue, ib_gpu: u64, ib_size: u32) -> Result<u64> {
+        debug_assert!(self.is_pm4, "replay_indirect_buffer on AQL queue");
+        if let Some(err) = self.core.poison_error() {
+            return Err(err);
+        }
+        // Same counter housekeeping as `dispatch_pm4`: keep the counter < 2^32
+        // and bound in-flight replays so the host can't lap the ring.
+        pool.ensure_pm4_headroom()?;
+        self.wait_dispatch_headroom(pool)?;
+        let counter_addr = pool.pm4_signal().value_addr();
+        let is_gfx9 = self.core.arch.gfx_major() == 9;
+        let mut g = self.inner.lock();
+        let prev = pool.pm4_value().saturating_sub(1);
+        let next = pool.next_pm4();
+
+        let mut q: Vec<u32> = Vec::with_capacity(20);
+        // wait(counter, prev): serialise this replay behind the previous one
+        // (no-op on the first; prev == 0).
+        q.extend_from_slice(&pm4::wait_reg_mem(counter_addr, prev as u32, 0xFFFF_FFFF));
+        // Run the baked chain inline.
+        q.push(pm4::packet3(pm4::PACKET3_INDIRECT_BUFFER, 2));
+        q.push(ib_gpu as u32);
+        q.push((ib_gpu >> 32) as u32);
+        q.push(ib_size | pm4::INDIRECT_BUFFER_VALID);
+        // signal(counter, next) after a system-scope cache flush — makes the
+        // chain's outputs host-visible and fires the counter the owner waits on.
+        q.extend_from_slice(&pm4::release_mem(counter_addr, next as u32, /*cache_flush=*/ true, is_gfx9));
+        g.push_pm4(&q);
+        g.ring_doorbell(/*is_pm4=*/ true);
+        Ok(next)
+    }
+
     /// Re-blit a captured sequence of 64-byte AQL packets into the ring with ONE
     /// doorbell — the AQL (multi-XCC) analogue of [`submit_dwords`], used by the
     /// graph replay. Each packet is either a vendor IB (pointing at a captured
@@ -885,6 +931,98 @@ pub(crate) fn build_exec_pm4(
 
     // 10. CS_PARTIAL_FLUSH so the next dispatch sees clean state.
     q.extend_from_slice(&pm4::event_write(pm4::CS_PARTIAL_FLUSH, pm4::EVENT_INDEX_PARTIAL_FLUSH));
+}
+
+/// Geometry + program identity for one kernel of a captured PM4 graph, baked at
+/// capture so the IB builder doesn't re-derive it per replay. Mirrors the fields
+/// `dispatch_pm4` reads off the `AmdProgram` + the per-call USER_DATA prefix.
+pub(crate) struct GraphKernelPm4 {
+    pub rsrc1: u32,
+    pub rsrc2: u32,
+    pub rsrc3: u32,
+    pub prog_addr: u64,
+    pub enable_private_segment_sgpr: bool,
+    /// Kernarg pointer SGPRs (`[lo, hi]`); the scratch-descriptor SGPRs are
+    /// prepended from the live scratch VA in `append_graph_kernel_pm4`.
+    pub kernarg_user_data: [u32; 2],
+    pub local: [u32; 3],
+    pub grid: [u32; 3],
+    pub wave32: bool,
+    pub target_major: u32,
+}
+
+/// Per-kernel hazard barrier strength for a captured PM4 graph IB. Selected by
+/// `AmdGraphPm4::capture` from each kernel's `deps`, narrowing the per-call
+/// `full acquire_mem` prologue to only what each kernel needs. Back-to-back
+/// inline in the IB, 515 redundant full L2 invalidates dominate, so this is the
+/// load-bearing perf lever. (The HDP flush for host-written inputs is emitted
+/// ONCE at the IB head — it is a global host-data-path flush, not per-buffer — so
+/// it is not part of the per-kernel barrier.)
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GraphBarrier {
+    /// Full L2 invalidate + write-back. For a kernel that depends on an earlier
+    /// kernel's GPU output (RAW/WAW/WAR): the producer's stores reached L2; this
+    /// consumer invalidates + write-backs every cache level so it observes them.
+    Full,
+    /// Per-CU narrow invalidate (skip L2). For a kernel with NO in-graph producer
+    /// (reads only resident/host-stable inputs, covered by the IB-head HDP
+    /// flush): the prior kernel's trailing `CS_PARTIAL_FLUSH` drained the CS, so
+    /// only the per-CU caches need invalidating — and `build_exec_pm4` already
+    /// issues exactly that narrow acquire, so the prologue here is empty.
+    Narrow,
+}
+
+/// Append one kernel's PM4 exec stream to a captured graph IB — the per-kernel
+/// `dispatch_pm4` sequence WITHOUT the per-call counter `wait`/`release_mem` and
+/// HDP flush: `[acquire_mem(full)]? → build_exec_pm4`. The IB runs in FIFO order
+/// on replay, so inter-kernel ordering is implicit; the `barrier` (selected per
+/// `GraphBarrier`, paired with the prior kernel's `CS_PARTIAL_FLUSH` inside
+/// `build_exec_pm4`) is the hazard fence that makes a producer's stores visible
+/// to a dependent consumer (RAW/WAW/WAR). Host inputs are covered by the IB-head
+/// HDP flush the caller emits once. `scratch_addr`/`tmpring_size` are read from
+/// the queue's live scratch at (re)build time so the descriptor SGPRs (words 0-3)
+/// and `COMPUTE_DISPATCH_SCRATCH_BASE` are derived from the SAME VA.
+pub(crate) fn append_graph_kernel_pm4(
+    q: &mut Vec<u32>,
+    k: &GraphKernelPm4,
+    barrier: GraphBarrier,
+    scratch_addr: u64,
+    tmpring_size: u32,
+) {
+    // Hazard barrier, narrowed to what this kernel needs (see `GraphBarrier`).
+    // A `Full` kernel invalidates L2 to see its in-graph producer; a `Narrow`
+    // kernel relies on `build_exec_pm4`'s own per-CU narrow acquire.
+    if barrier == GraphBarrier::Full {
+        if k.target_major == 9 {
+            q.extend_from_slice(&pm4::acquire_mem_gfx9());
+        } else {
+            q.extend_from_slice(&pm4::acquire_mem());
+        }
+    }
+    // Assemble USER_DATA exactly as `dispatch_pm4`: optional 4-dword scratch
+    // descriptor (derived from the SAME `scratch_addr`) then the kernarg ptr.
+    let mut full_user_data: Vec<u32> = Vec::with_capacity(6);
+    if k.enable_private_segment_sgpr {
+        full_user_data.push(scratch_addr as u32);
+        full_user_data.push((scratch_addr >> 32) as u32 | (1u32 << 31));
+        full_user_data.push(0xFFFF_FFFF);
+        full_user_data.push(0x20c1_4000);
+    }
+    full_user_data.extend_from_slice(&k.kernarg_user_data);
+    build_exec_pm4(
+        q,
+        k.rsrc1,
+        k.rsrc2,
+        k.rsrc3,
+        k.prog_addr,
+        &full_user_data,
+        scratch_addr,
+        tmpring_size,
+        k.local,
+        k.grid,
+        k.wave32,
+        k.target_major,
+    );
 }
 
 /// Per-copy completion-wait timeout. A staging copy that never signals means

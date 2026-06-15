@@ -34,3 +34,14 @@ pub(crate) fn require_multi_xcc(alloc: &AmdAllocator) -> bool {
     eprintln!("PROBE skipped: single-XCC device (multi-XCC AQL only)");
     false
 }
+
+/// `true` if `alloc` drives a single-XCC (RDNA / gfx11/12) PM4 device. The PM4
+/// graph-capture probes only exercise the PM4 indirect-buffer path, so they gate
+/// on this and skip (with a note) on multi-XCC AQL parts.
+pub(crate) fn require_single_xcc(alloc: &AmdAllocator) -> bool {
+    if alloc.dev.node.num_xcc.max(1) == 1 {
+        return true;
+    }
+    eprintln!("PROBE skipped: multi-XCC device (single-XCC PM4 only)");
+    false
+}
