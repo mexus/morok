@@ -1,6 +1,17 @@
-//! The bf16→f32 tile matmul builders: the parametrized multi-wave kernel (M1 +
-//! M7 size-adaptive) and the M2 K-loop register-prefetch pipeline. A port of
-//! tinygrad `test_tk.py::test_simple_matmul` lifted to a reusable kernel builder.
+//! The bf16→f32 tile matmul: a single arch-generic, single-buffered builder
+//! ([`build_matmul_cfg`] / [`build_matmul_cfg_k`]) driven by a per-arch
+//! [`MatmulCfg`]. One `cfg.block × cfg.block` C tile per workgroup, `cfg.n_accum`
+//! `reg × reg` accumulators/wave reduced over a tracked K-loop in `cfg.k_step()`-wide
+//! strips out of XOR-swizzled LDS. The tile shortcuts ([`Kernel::acc`] /
+//! [`Kernel::operand`] / [`Kernel::shared_sw`]) resolve the right WMMA fragment per
+//! arch (gfx942 CDNA MFMA vs gfx1151 RDNA WMMA), so one builder serves both.
+//!
+//! Per-arch tuning lives in the configs ([`M1_CFG`] / [`SMALL_CFG`] for gfx942's
+//! size-adaptive [`cfg_for_n`]; [`GFX1151_CFG`] for the occupancy-tuned RDNA3.5 path),
+//! selected by [`cfg_for_arch`]. The strongest gfx1151 lever is `k_step`: a smaller
+//! strip shrinks the live WMMA-input fragment VGPR/lane (each input replicates all
+//! `k_step`/16 K-sub-steps), raising occupancy. A port of tinygrad
+//! `test_tk.py::test_simple_matmul` lifted to a reusable kernel builder.
 
 use std::sync::Arc;
 
@@ -10,16 +21,11 @@ use svod_ir::UOp;
 use svod_tensor::Tensor;
 
 use crate::index::{Idx, cidx};
-use crate::tiles::{RT_16X16, ST_16X16_SWIZZLED, TileLayout};
-use crate::{GlSpec, Kernel, MoveIdx, RT, RegTile};
+use crate::tiles::TileLayout;
+use crate::{GL, GlSpec, Kernel, MoveIdx, RT, RegTile};
 
 /// K-reduction step (the LDS strip depth, shared by every config). HK `GEMM:6`.
 pub const K_STEP: usize = 64;
-
-/// K-reduction step for [`build_matmul_db`]. Halved vs [`K_STEP`] so the 2×-size
-/// LDS double buffer fits the 64 KB budget at the 256×256/8-wave geometry
-/// (A `256×32`×2 + B `32×256`×2 = 64 KB).
-pub const K_STEP_DB: usize = 32;
 
 /// Block / wave geometry of a multi-wave matmul (HK `GEMM:5-8,67-68`): a
 /// `wave_rows × wave_cols`-wave workgroup computes a `block × block` C tile,
@@ -40,12 +46,25 @@ pub struct MatmulCfg {
     /// M3: fill the GLOBAL→LDS strips with 128-bit (`vec8` bf16) coalesced loads
     /// instead of the scalar/`vec4`-folded path.
     pub vec_load: bool,
+    /// K-reduction step (LDS strip depth) for the single-buffered K-loop. Must be a
+    /// multiple of 16 (the WMMA K-edge) and divide N. Lowering it cuts the live
+    /// operand VGPR/lane (each WMMA input replicates all `k_step`/16 K-sub-steps),
+    /// raising occupancy — the dominant gfx1151 lever ([`GFX1151_CFG`] uses 32:
+    /// ~143 VGPR/lane → ~10 waves/SIMD vs k64's 242 → 6). gfx942 keeps [`K_STEP`]
+    /// (64). `0` means "use [`K_STEP`]" so older literal/`..M1_CFG` builders that
+    /// predate the field still get the default — see [`MatmulCfg::k_step`].
+    pub k_step: usize,
 }
 
 impl MatmulCfg {
     /// The per-accumulator square edge (`block / wave_cols`).
     pub const fn reg(&self) -> usize {
         self.block / self.wave_cols
+    }
+    /// The K-reduction step, resolving the `0` sentinel (older literal builders) to
+    /// the default [`K_STEP`].
+    pub const fn k_step(&self) -> usize {
+        if self.k_step == 0 { K_STEP } else { self.k_step }
     }
     /// `reg`-blocks per C-tile side (= `wave_cols` = `wave_rows * n_accum`); the
     /// grid→C-block coordinate multiplier.
@@ -60,31 +79,65 @@ impl MatmulCfg {
     pub const fn grid(&self, n: usize) -> i64 {
         (n / self.block) as i64
     }
-    /// Launch grid dims: a flattened 1-D `[grid², 1, 1]` when M4 ([`l2_swizzle`])
-    /// is on (the chiplet swizzle re-derives `(pid_m, pid_n)`), else the plain
-    /// 2-D `[grid, grid, 1]`.
+    /// Launch grid for a general `m × n` C: a flattened 1-D `[gm·gn, 1, 1]` when M4
+    /// ([`l2_swizzle`]) is on (the chiplet swizzle re-derives `(pid_m, pid_n)`), else
+    /// the plain 2-D `[gn, gm, 1]` (x = n-blocks → `block_idx[0]` = pid_n, y = m-blocks
+    /// → `block_idx[1]` = pid_m — matching [`block_coords`]).
+    pub const fn grid_dims_mn(&self, m: usize, n: usize) -> [i64; 3] {
+        let (gm, gn) = ((m / self.block) as i64, (n / self.block) as i64);
+        if self.l2_swizzle { [gm * gn, 1, 1] } else { [gn, gm, 1] }
+    }
+    /// Square convenience: [`grid_dims_mn`] with `m = n` (the `[grid², 1, 1]` /
+    /// `[grid, grid, 1]` the square matmul launches with).
     pub const fn grid_dims(&self, n: usize) -> [i64; 3] {
-        let g = self.grid(n);
-        if self.l2_swizzle { [g * g, 1, 1] } else { [g, g, 1] }
+        self.grid_dims_mn(n, n)
     }
 }
 
 /// M1+M3+M4: 8-wave (2×4) 256×256 block, two 64×64 accumulators/wave, 512
 /// threads, the chiplet/L2 grid swizzle, and 128-bit vectorized LDS fills.
 pub const M1_CFG: MatmulCfg =
-    MatmulCfg { block: 256, wave_rows: 2, wave_cols: 4, n_accum: 2, l2_swizzle: true, vec_load: true };
+    MatmulCfg { block: 256, wave_rows: 2, wave_cols: 4, n_accum: 2, l2_swizzle: true, vec_load: true, k_step: K_STEP };
 /// M7 small-N: single-warp 64×64 block, one 64×64 accumulator, 64 threads — the
 /// grid is `(n/64)²` workgroups, ~16× M1's at a given N, so a small N keeps the
 /// 304-CU machine fed instead of collapsing to a handful of 256×256 blocks.
 /// Keeps the plain 2-D grid + scalar fill (the swizzle/vec wins are large-N).
 pub const SMALL_CFG: MatmulCfg =
-    MatmulCfg { block: 64, wave_rows: 1, wave_cols: 1, n_accum: 1, l2_swizzle: false, vec_load: false };
+    MatmulCfg { block: 64, wave_rows: 1, wave_cols: 1, n_accum: 1, l2_swizzle: false, vec_load: false, k_step: K_STEP };
+
+/// gfx1151 (RDNA3.5, wave32) config — empirically swept on-GPU: 64×64 block, 2×2
+/// waves (4 waves / 128 threads), ONE
+/// 32×32 accumulator/wave, 128-bit vec fills, no L2 swizzle (single-XCD APU), and
+/// **`k_step = 32`**. The `reg=32` tile keeps accumulator VGPR ≈ 32/lane; the
+/// `k_step=32` halves the live WMMA-input fragment VGPR vs the default 64 (the input
+/// replicates all `k_step`/16 K-sub-steps per lane), dropping the kernel from ~242
+/// VGPR/lane → ~143 → **~10 waves/SIMD vs 6** (RDNA3.5 = 1536 VGPR/SIMD). Occupancy,
+/// not `n_accum` ILP, is the dominant gfx1151 lever; `k_step` is the strongest knob
+/// on it (the single-buffered path has no memory stall a double buffer could hide,
+/// and bigger tiles / `n_accum=2` / `reg=16` all measured *slower*). ~22.7 TFLOPS at
+/// N=2048 — 1.17× the prior k64 config, ~90% of hipBLASLt (~25). gfx942 keeps
+/// `k_step = K_STEP` (64). (`k_step=16` maxes occupancy at 16 waves/SIMD but its
+/// extra barriers + halved WMMA/iter make it *slower* than 32: the kernel saturates
+/// around 10 waves.)
+pub const GFX1151_CFG: MatmulCfg =
+    MatmulCfg { block: 64, wave_rows: 2, wave_cols: 2, n_accum: 1, l2_swizzle: false, vec_load: true, k_step: 32 };
 
 /// M7 size-adaptive config selection: small N (where the 256×256/8-wave grid
 /// starves the machine) uses [`SMALL_CFG`]; everything else keeps [`M1_CFG`].
 /// The 768 threshold is the empirical crossover from the GPU-time bench.
 pub fn cfg_for_n(n: usize) -> MatmulCfg {
     if n <= 768 && n.is_multiple_of(SMALL_CFG.block) { SMALL_CFG } else { M1_CFG }
+}
+
+/// Per-arch config: gfx1151 (RDNA3.5 wave32) uses the occupancy-tuned
+/// [`GFX1151_CFG`]; gfx942 (CDNA wave64) keeps the size-adaptive [`cfg_for_n`].
+/// Arch-specific peak tuning lives here (the generic optimizer stays generic);
+/// this is the tk peer of HK shipping separate gfx942/gfx950/gfx1250 kernels.
+pub fn cfg_for_arch(arch: svod_dtype::AmdArch, n: usize) -> MatmulCfg {
+    match arch {
+        svod_dtype::AmdArch::Gfx1151 if n.is_multiple_of(GFX1151_CFG.block) => GFX1151_CFG,
+        _ => cfg_for_n(n),
+    }
 }
 
 /// The M-row C-block coordinate of accumulator `a` (`warp_row + a*wave_rows`,
@@ -95,11 +148,13 @@ fn acc_row(warp_row: &Arc<UOp>, a: usize, cfg: &MatmulCfg) -> Arc<UOp> {
 
 /// The `(pid_m, pid_n)` C-block coordinate (in `block` units) for this workgroup
 /// — M4's chiplet/L2 [`l2_swizzle`](crate::grid::l2_swizzle) off a flattened 1-D
-/// grid (`block_idx[0]`) when enabled, else the plain 2-D `block_idx`.
-fn block_coords(ker: &Kernel, n: usize, cfg: &MatmulCfg) -> (Arc<UOp>, Arc<UOp>) {
+/// grid (`block_idx[0]`) when enabled, else the plain 2-D `block_idx`. Generalized
+/// to a non-square `m × n` C (the swizzle takes the `gm × gn` block grid; the plain
+/// path reads `block_idx[1]` = pid_m, `block_idx[0]` = pid_n per [`grid_dims_mn`]).
+fn block_coords(ker: &Kernel, m: usize, n: usize, cfg: &MatmulCfg) -> (Arc<UOp>, Arc<UOp>) {
     if cfg.l2_swizzle {
-        let g = cfg.grid(n);
-        crate::grid::l2_swizzle(ker.block_idx[0].clone(), g * g, g, g)
+        let (gm, gn) = ((m / cfg.block) as i64, (n / cfg.block) as i64);
+        crate::grid::l2_swizzle(ker.block_idx[0].clone(), gm * gn, gm, gn)
     } else {
         (ker.block_idx[1].clone(), ker.block_idx[0].clone())
     }
@@ -133,7 +188,8 @@ pub fn matmul(a: &svod_tensor::Tensor, b: &svod_tensor::Tensor) -> crate::Launch
     // Single resolve: gate to a supported arch (+ toolchain) and reuse the arch to
     // build caps so the launch block (`waves * wave_size`) and the kernel's wave
     // math track the real wave width.
-    let caps = crate::ArchCaps::for_arch(crate::target::resolve_supported_arch(&a.device(), MATMUL_SUPPORTED_ARCHS)?);
+    let arch = crate::target::resolve_supported_arch(&a.device(), MATMUL_SUPPORTED_ARCHS)?;
+    let caps = crate::ArchCaps::for_arch(arch);
     let dim = |t: &Tensor, i: usize| t.shape().expect("shape")[i].as_const().expect("concrete dim");
     let (am, an) = (dim(a, 0), dim(a, 1));
     let (bm, bn) = (dim(b, 0), dim(b, 1));
@@ -144,7 +200,7 @@ pub fn matmul(a: &svod_tensor::Tensor, b: &svod_tensor::Tensor) -> crate::Launch
     );
     let n = am;
 
-    let cfg = cfg_for_n(n);
+    let cfg = cfg_for_arch(arch, n);
     let out = Tensor::empty(&[n, n], DType::Float32);
     crate::graph_launch("matmul", cfg.grid_dims(n), cfg.threads(caps.wave_size), out, &[a, b], caps, move |ker| {
         build_matmul_cfg(ker, n, cfg);
@@ -160,39 +216,69 @@ pub fn matmul(a: &svod_tensor::Tensor, b: &svod_tensor::Tensor) -> crate::Launch
 /// their A-inputs through the prior accumulator's MFMA (a `RANGE` admits one
 /// `END`). The epilogue stores each accumulator to global C at its `reg`-block.
 pub fn build_matmul_cfg(ker: &Kernel, n: usize, cfg: MatmulCfg) {
-    assert_eq!(n % cfg.block, 0, "matmul N={n} must be a multiple of the {} block", cfg.block);
-    assert_eq!(cfg.wave_cols, cfg.wave_rows * cfg.n_accum, "config invariant wave_cols == wave_rows*n_accum");
-    let reg = cfg.reg();
-    let g = ker.group_2d(cfg.wave_rows, cfg.wave_cols);
+    build_matmul_cfg_k(ker, n, cfg, cfg.k_step());
+}
 
-    // ABI: output (c, f32) then inputs (a, b — bf16), fixed by construction. Tiles
-    // below are declared by ROLE via the scaffold shortcuts (`ker.acc`/`operand`/
+/// [`build_matmul_cfg`] with an explicit `k_step` (the LDS strip depth / K-loop
+/// reduction step, replacing the hardcoded [`K_STEP`]). A thin wrapper that binds
+/// the square `n×n` bf16→f32 ABI and runs [`gemm_core`].
+pub fn build_matmul_cfg_k(ker: &Kernel, n: usize, cfg: MatmulCfg, k_step: usize) {
+    // ABI: output (c, f32) then inputs (a, b — bf16), fixed by construction. Tiles in
+    // `gemm_core` are declared by ROLE via the scaffold shortcuts (`ker.acc`/`operand`/
     // `shared_sw`), which resolve the arch fragment through `caps.frag` (gfx942 CDNA
-    // MFMA vs gfx11 RDNA WMMA — same A/B orientation, only packing + the even/odd
-    // accumulator differ) — so the kernel names no physical fragment constant.
+    // MFMA vs gfx11 RDNA WMMA) — so the kernel names no physical fragment constant.
     let (outs, ins) = ker.bind_abi(
         &[GlSpec::new(&[1, 1, n, n], DType::Float32)],
         &[GlSpec::new(&[1, 1, n, n], DType::BFloat16), GlSpec::new(&[1, 1, n, n], DType::BFloat16)],
     );
-    let (c_gl, a_gl, b_gl) = (outs[0].clone(), ins[0].clone(), ins[1].clone());
+    gemm_core(ker, n, n, n, cfg, k_step, outs[0].clone(), ins[0].clone(), ins[1].clone());
+}
 
-    // A strip [block×K_STEP] = [M,K]; B strip [K_STEP×block] = [K,N]; both
-    // XOR-swizzled, single-buffered.
-    let a_smem = ker.shared_sw((cfg.block, K_STEP), DType::BFloat16, TileLayout::Row);
-    let b_smem = ker.shared_sw((K_STEP, cfg.block), DType::BFloat16, TileLayout::Row);
+/// The parametrized `C[m,n] = A[m,k] · B[k,n]` (`mma_ab`) GEMM core for the square
+/// matmul, into the already-bound `c_gl`. One `cfg.block × cfg.block` C tile per
+/// workgroup, `cfg.n_accum` col-major `reg × reg` accumulators/wave reduced over a
+/// tracked `k_step`-strip K-loop out of XOR-swizzled LDS; a single `END` closes the
+/// loop around the last accumulator's store, the rest scoped inside by chaining their
+/// A-inputs through the prior accumulator's MMA.
+#[allow(clippy::too_many_arguments)]
+pub fn gemm_core<'k>(
+    ker: &'k Kernel,
+    m: usize,
+    k: usize,
+    n: usize,
+    cfg: MatmulCfg,
+    k_step: usize,
+    c_gl: GL<'k>,
+    a_gl: GL<'k>,
+    b_gl: GL<'k>,
+) {
+    assert_eq!(m % cfg.block, 0, "gemm M={m} must be a multiple of the {} block", cfg.block);
+    assert_eq!(n % cfg.block, 0, "gemm N={n} must be a multiple of the {} block", cfg.block);
+    assert_eq!(k_step % 16, 0, "k_step={k_step} must be a multiple of 16 (the WMMA K-edge)");
+    assert_eq!(k % k_step, 0, "gemm K={k} must be a multiple of k_step={k_step}");
+    assert_eq!(cfg.wave_cols, cfg.wave_rows * cfg.n_accum, "config invariant wave_cols == wave_rows*n_accum");
+    let reg = cfg.reg();
+    let g = ker.group_2d(cfg.wave_rows, cfg.wave_cols);
+    let bf16 = DType::BFloat16;
 
-    let (row, col) = block_coords(ker, n, &cfg); // (pid_m, pid_n) in block units
+    // A strip [block×k_step] = [M-block, K-strip]; B strip [k_step×block] = [K-strip,
+    // N-block]; both XOR-swizzled, single-buffered.
+    let a_smem = ker.shared_sw((cfg.block, k_step), bf16.clone(), TileLayout::Row);
+    let b_smem = ker.shared_sw((k_step, cfg.block), bf16.clone(), TileLayout::Row);
+
+    let (row, col) = block_coords(ker, m, n, &cfg); // (pid_m, pid_n) in block units
     let warp_row = g.warp_row();
     let warp_col = g.warp_col();
 
     // `n_accum` col-major reg×reg f32 accumulators per wave.
     let accs: Vec<RT> = (0..cfg.n_accum).map(|_| g.zero(ker.acc((reg, reg), TileLayout::Col))).collect();
 
-    let lp = ker.loop_static((n / K_STEP) as i64);
+    let lp = ker.loop_static((k / k_step) as i64);
     let tile = lp.index().clone();
 
     // Collaborative GLOBAL→LDS fill over all threads (each ends in a barrier);
-    // M3 uses 128-bit vectorized loads for the large-N strips.
+    // M3 uses 128-bit vectorized loads for the large-N strips. B is indexed as
+    // [K-strip, N-block] at (tile, col).
     let a_idx = [Idx::Const(0), Idx::Const(0), Idx::from(&row), Idx::from(&tile)];
     let b_idx = [Idx::Const(0), Idx::Const(0), Idx::from(&tile), Idx::from(&col)];
     let (a_smem, b_smem) = if cfg.vec_load {
@@ -201,18 +287,19 @@ pub fn build_matmul_cfg(ker: &Kernel, n: usize, cfg: MatmulCfg) {
         (g.load(a_smem, a_gl, MoveIdx::block(&a_idx, 2)), g.load(b_smem, b_gl, MoveIdx::block(&b_idx, 2)))
     };
 
-    // Shared B sub-tile (N col-block {warp_col}, same for every accumulator) and
-    // per-accumulator A sub-tiles (M row-block {warp_row + a*wave_rows}).
+    // Shared B sub-tile (N col-block {warp_col}, same for every accumulator) read as a
+    // [k_step, reg] Col fragment, and per-accumulator A sub-tiles (M row-block
+    // {warp_row + a*wave_rows}).
     let bb = g.load(
-        ker.operand((K_STEP, reg), DType::BFloat16, TileLayout::Col),
-        b_smem.subtile((K_STEP, reg), (Idx::Const(0), Idx::from(&warp_col))),
+        ker.operand((k_step, reg), bf16.clone(), TileLayout::Col),
+        b_smem.subtile((k_step, reg), (Idx::Const(0), Idx::from(&warp_col))),
         MoveIdx::default(),
     );
     let a_subs: Vec<RT> = (0..cfg.n_accum)
         .map(|a| {
             g.load(
-                ker.operand((reg, K_STEP), DType::BFloat16, TileLayout::Row),
-                a_smem.subtile((reg, K_STEP), (Idx::Uop(acc_row(&warp_row, a, &cfg)), Idx::Const(0))),
+                ker.operand((reg, k_step), bf16.clone(), TileLayout::Row),
+                a_smem.subtile((reg, k_step), (Idx::Uop(acc_row(&warp_row, a, &cfg)), Idx::Const(0))),
                 MoveIdx::default(),
             )
         })
@@ -223,365 +310,31 @@ pub fn build_matmul_cfg(ker: &Kernel, n: usize, cfg: MatmulCfg) {
     let mut bar_deps: smallvec::SmallVec<[Arc<UOp>; 4]> = smallvec![bb.uop().clone()];
     bar_deps.extend(a_subs.iter().skip(1).map(|t| t.uop().clone()));
     let sync = a_subs[0].uop().barrier(bar_deps);
-    let bb = bb.after(&sync);
-    let a_subs: Vec<RT> = a_subs.into_iter().map(|t| t.after(&sync)).collect();
+    let bb = bb.after(smallvec![sync.clone()]);
+    let a_subs: Vec<RT> = a_subs.into_iter().map(|t| t.after(smallvec![sync.clone()])).collect();
 
-    // MFMA-accumulate each accumulator over the K sub-steps; chain accumulator
-    // `a`'s A-input through accumulator `a-1`'s MFMA so a single `END` scopes
-    // them all inside the K-loop.
+    // MMA-accumulate each accumulator over the K sub-steps; chain accumulator `a`'s
+    // A-input through accumulator `a-1`'s MMA so a single `END` scopes them all inside
+    // the K-loop.
     let mut prev_out: Option<Arc<UOp>> = None;
     for (a, a_sub) in a_subs.iter().enumerate() {
         let a_sub = match &prev_out {
-            Some(p) => a_sub.after(p),
+            Some(p) => a_sub.after(smallvec![p.clone()]),
             None => a_sub.clone(),
         };
         prev_out = Some(g.mma_ab(accs[a].clone(), &a_sub, &bb).uop().clone());
     }
     let ended = lp.close();
     // Each accumulator reads its fully-reduced register value *outside* the loop.
-    let final_accs: Vec<RT> = accs.iter().map(|c| c.after(&ended)).collect();
+    let final_accs: Vec<RT> = accs.iter().map(|c| c.after(smallvec![ended.clone()])).collect();
 
-    // Epilogue: store each col-major accumulator to global C at its reg-block
-    // coords {row*bps + warp_row + a*wave_rows, col*bps + warp_col} (GEMM:222-223).
+    // Epilogue: store each col-major accumulator to global C at its reg-block coords
+    // {row*bps + warp_row + a*wave_rows, col*bps + warp_col}.
     let bps = cfg.blocks_per_side() as i64;
     let nidx = col.mul(&cidx(bps)).add(&warp_col);
     let mut c_t = c_gl;
     for (a, c) in final_accs.into_iter().enumerate() {
-        let m = row.mul(&cidx(bps)).add(&acc_row(&warp_row, a, &cfg));
-        c_t = g.store(c_t, c, MoveIdx::block(&[Idx::Const(0), Idx::Const(0), Idx::Uop(m), Idx::from(&nidx)], 2));
-    }
-}
-
-// =============================================================================
-// M2 — K-loop register-prefetch pipeline (single-LDS, manually unrolled).
-// =============================================================================
-
-/// Which M2 pipeline stage to emit (staged bring-up, each gated on gfx942
-/// correctness before the next). `Unroll` is the numerically-transparent
-/// baseline; `Prefetch` stages the next tile's GLOBAL→VGPR load under the
-/// current tile's MFMAs (committed to LDS at the cluster tail); `Hints` adds the
-/// `s_setprio`/`s_waitcnt`/`sched_barrier` scheduling fences.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum PipeStage {
-    Unroll,
-    Prefetch,
-    Hints,
-}
-
-impl PipeStage {
-    fn prefetch(self) -> bool {
-        matches!(self, PipeStage::Prefetch | PipeStage::Hints)
-    }
-    fn hints(self) -> bool {
-        matches!(self, PipeStage::Hints)
-    }
-    /// `SVOD_TK_PIPELINE` = 1→Unroll, 2→Prefetch, 3(or other)→Hints.
-    pub fn from_env() -> Self {
-        match std::env::var("SVOD_TK_PIPELINE").ok().as_deref() {
-            Some("1") => PipeStage::Unroll,
-            Some("2") => PipeStage::Prefetch,
-            _ => PipeStage::Hints,
-        }
-    }
-}
-
-/// M2: the register-prefetch K-loop pipeline. Same [`M1_CFG`] geometry as
-/// [`build_matmul`], but the K-loop is **manually unrolled** in Rust (HK
-/// `#pragma unroll`, `GEMM:84`) over a **single** XOR-swizzled LDS buffer, and
-/// the next tile's GLOBAL→VGPR load is staged under the current tile's MFMAs
-/// (`PipeStage::Prefetch`), then `ds_write`-committed into the same LDS at the
-/// cluster tail. Accumulators chain across tiles by register reassignment (each
-/// `mma_ab` is self-contained — no `RANGE`/`END`), so the result is numerically
-/// identical to M1. Launch with [`M1_CFG`] grid/threads and `finish(n_accum)`.
-///
-/// **M2 bring-up verdict (opt-in only — does not beat M1).** The `Unroll` stage
-/// is numerically transparent at every N but the fully-unrolled IR regresses on
-/// GPU time at N ≥ 1024 (looser register allocation than M1's tight K-loop) and
-/// its compile time grows steeply (~30 s at N=2048 / 32 tiles). The register
-/// staging (`Prefetch`/`Hints`) is correct only up to ~8 unrolled tiles (≤ 512):
-/// beyond that the single-LDS commit hazards corrupt/wedge. A *looped* single-
-/// LDS prefetch — the small-IR fix — is not expressible here: carrying the
-/// committed LDS across an `Op::Range` back-edge needs a loop-carried phi the
-/// UOp model lacks (the plan's KEY DESIGN NOTE). So M2 ships as validated
-/// infrastructure ([`crate::asm`] + the staging primitives), gated behind
-/// `SVOD_TK_PIPELINE`, with M1 as the perf baseline. The size-adaptive **M7**
-/// ([`build_matmul_adaptive`]) is the matmul lever that *did* land.
-pub fn build_matmul_pipelined(ker: &Kernel, n: usize, stage: PipeStage) {
-    let cfg = M1_CFG;
-    assert_eq!(n % cfg.block, 0, "matmul N={n} must be a multiple of the {} block", cfg.block);
-    let reg = cfg.reg();
-    let g = ker.group_2d(cfg.wave_rows, cfg.wave_cols);
-
-    let c_gl = ker.gl(&[1, 1, n, n], DType::Float32);
-    let a_gl = ker.gl(&[1, 1, n, n], DType::BFloat16);
-    let b_gl = ker.gl(&[1, 1, n, n], DType::BFloat16);
-    let (row, col) = block_coords(ker, n, &cfg);
-    let warp_row = g.warp_row();
-    let warp_col = g.warp_col();
-
-    let mut accs: Vec<RT> =
-        (0..cfg.n_accum).map(|_| g.zero(ker.rt((reg, reg), DType::Float32, TileLayout::Col, RT_16X16))).collect();
-
-    // A single XOR-swizzled LDS pair, threaded across the unrolled tiles (the
-    // WAR back-edge is the explicit barrier, since there is no loop RANGE).
-    let mut a_smem = ker.st((cfg.block, K_STEP), DType::BFloat16, TileLayout::Row, ST_16X16_SWIZZLED);
-    let mut b_smem = ker.st((K_STEP, cfg.block), DType::BFloat16, TileLayout::Row, ST_16X16_SWIZZLED);
-
-    let num_tiles = n / K_STEP;
-    // Prefetch staging buffers carried one tile ahead (filled at tile-1's tail,
-    // committed at tile's head). `None` until the first tile primes them.
-    let mut staged: Option<(Arc<UOp>, Arc<UOp>)> = None;
-
-    for tile in 0..num_tiles {
-        // ── Commit / fill the current tile's LDS ──────────────────────────────
-        let (af, bf) = if stage.prefetch() {
-            match staged.take() {
-                // Tiles ≥1: ds_write-commit the registers staged during tile-1.
-                Some((sa, sb)) => {
-                    let af = g.commit_reg_to_local(a_smem.clone(), &sa, true);
-                    let bf = g.commit_reg_to_local(b_smem.clone(), &sb, true);
-                    (af, bf)
-                }
-                // Tile 0 prologue: no prefetch yet — fill straight from global.
-                None => (
-                    g.load(a_smem.clone(), a_gl.clone(), MoveIdx::block(&tile_a_idx(tile, &row), 2)),
-                    g.load(b_smem.clone(), b_gl.clone(), MoveIdx::block(&tile_b_idx(tile, &col), 2)),
-                ),
-            }
-        } else {
-            (
-                g.load(a_smem.clone(), a_gl.clone(), MoveIdx::block(&tile_a_idx(tile, &row), 2)),
-                g.load(b_smem.clone(), b_gl.clone(), MoveIdx::block(&tile_b_idx(tile, &col), 2)),
-            )
-        };
-
-        // ── Stage the next tile's GLOBAL→VGPR load (overlaps this tile's MFMAs) ─
-        if stage.prefetch() && tile + 1 < num_tiles {
-            let sa = g.stage_global_to_reg(&a_smem, &a_gl, &tile_a_idx(tile + 1, &row), 2);
-            let sb = g.stage_global_to_reg(&b_smem, &b_gl, &tile_b_idx(tile + 1, &col), 2);
-            staged = Some((sa, sb));
-        }
-
-        // ── LDS→REG gather ────────────────────────────────────────────────────
-        let bb = g.load(
-            ker.rt((K_STEP, reg), DType::BFloat16, TileLayout::Col, RT_16X16),
-            bf.clone(),
-            MoveIdx::block(&[Idx::Const(0), Idx::from(&warp_col)], 0),
-        );
-        let a_subs: Vec<RT> = (0..cfg.n_accum)
-            .map(|a| {
-                g.load(
-                    ker.rt((reg, K_STEP), DType::BFloat16, TileLayout::Row, RT_16X16),
-                    af.clone(),
-                    MoveIdx::block(&[Idx::Uop(acc_row(&warp_row, a, &cfg))], 0),
-                )
-            })
-            .collect();
-
-        // Cross-wave WAR barrier (its src is a value node, as M1 — the asm
-        // scheduling nodes must NOT depend on a Barrier: the AMD renderer emits
-        // the fence/`s.barrier` but registers no value for it, so a `ctx.get`
-        // on a barrier-dep is undefined).
-        let mut reads: smallvec::SmallVec<[Arc<UOp>; 4]> = smallvec![bb.uop().clone()];
-        reads.extend(a_subs.iter().map(|t| t.uop().clone()));
-        let sync = a_subs[0].uop().barrier(reads);
-        let bb = bb.after(&sync);
-        let a_subs: Vec<RT> = a_subs.into_iter().map(|t| t.after(&sync)).collect();
-
-        // ── MFMA burst: `s_waitcnt lgkmcnt(0)` to drain the deferred LDS reads,
-        // then `s_setprio(1)` around the burst — chained off a post-sync value
-        // node (not the barrier) so the asm nodes order between the barrier and
-        // the MFMAs without taking the Barrier as a dep.
-        let prio_in: Vec<RT> = if stage.hints() {
-            let wait = crate::asm::s_waitcnt_lgkmcnt(0, a_subs[0].uop().clone());
-            let hi = crate::asm::s_setprio(1, wait);
-            a_subs.iter().map(|t| t.after(&hi)).collect()
-        } else {
-            a_subs
-        };
-        let mut last_out: Option<Arc<UOp>> = None;
-        for (a, a_sub) in prio_in.iter().enumerate() {
-            accs[a] = g.mma_ab(accs[a].clone(), a_sub, &bb);
-            last_out = Some(accs[a].uop().clone());
-        }
-        // Lower priority + pin the cluster with a scheduling barrier (so the
-        // staged loads / commits cannot float across the MFMA region). Both hang
-        // off the last MFMA output (a value node).
-        let cluster_tail = if stage.hints() {
-            let lo = crate::asm::s_setprio(0, last_out.clone().unwrap());
-            crate::asm::sched_barrier(0, lo)
-        } else {
-            sync.clone()
-        };
-
-        // Thread the LDS handles to the next tile, ordered after this tile's
-        // reads (WAR) and the cluster tail (so the next commit lands after).
-        a_smem = af.rewrap(af.uop().after(smallvec![cluster_tail.clone()]));
-        b_smem = bf.rewrap(bf.uop().after(smallvec![cluster_tail]));
-    }
-
-    // Epilogue: store each accumulator to global C at its reg-block.
-    let bps = cfg.blocks_per_side() as i64;
-    let nidx = col.mul(&cidx(bps)).add(&warp_col);
-    let mut c_t = c_gl;
-    for (a, c) in accs.into_iter().enumerate() {
-        let m = row.mul(&cidx(bps)).add(&acc_row(&warp_row, a, &cfg));
-        c_t = g.store(c_t, c, MoveIdx::block(&[Idx::Const(0), Idx::Const(0), Idx::Uop(m), Idx::from(&nidx)], 2));
-    }
-}
-
-/// A-strip tile index `[0, 0, row-block, K-tile]` for the unrolled K-loop.
-fn tile_a_idx(tile: usize, row: &Arc<UOp>) -> [Idx; 4] {
-    [Idx::Const(0), Idx::Const(0), Idx::from(row), Idx::Const(tile as i64)]
-}
-/// B-strip tile index `[0, 0, K-tile, col-block]` for the unrolled K-loop.
-fn tile_b_idx(tile: usize, col: &Arc<UOp>) -> [Idx; 4] {
-    [Idx::Const(0), Idx::Const(0), Idx::Const(tile as i64), Idx::from(col)]
-}
-
-// =============================================================================
-// Software-pipelined double-buffered K-loop.
-// =============================================================================
-
-/// Software-pipelined double-buffered matmul ([`M1_CFG`] geometry). The K-loop is
-/// a rolled `Range` over a **2×-size XOR-swizzled LDS** double buffer indexed by
-/// `tile % 2` ([`K_STEP_DB`] keeps the doubled buffer within the 64 KB LDS
-/// budget). Each iteration register-stages the next K-tile's GLOBAL→VGPR load,
-/// gathers the current buffer half into the WMMA fragments, MFMA-accumulates, then
-/// `ds_write`-commits the staged registers into the other half, under one
-/// workgroup barrier per iteration.
-///
-/// The `tile % 2` parity both selects the buffer half and makes the gather/commit
-/// addresses counter-dependent, which keeps them inside the K-loop (a single-LDS
-/// variant would let LICM hoist the gather out and read tile 0 every iteration).
-/// The per-iteration barrier has no in-iteration value consumer; it is kept live
-/// by wrapping the loop-closing MFMA store ([`Kernel::endrange_barrier_to`]) so it
-/// becomes the closing `END`'s computation — emitted after the MFMAs, which read
-/// the raw gathers and so do not wait on it. Cross-iteration RAW (commit `i`
-/// visible to gather `i+1`) and WAR (gather `i` done before commit `i+1`
-/// overwrites the half) ordering comes from that barrier plus rolled-loop program
-/// order. `iglp_opt(0)` at the K-loop top hands the AMDGPU machine scheduler the
-/// GEMM (MFMA/memory interleave) pipeline.
-///
-/// Launch with [`M1_CFG`] grid/threads and `finish(n_accum)`.
-pub fn build_matmul_db(ker: &Kernel, n: usize) {
-    let cfg = M1_CFG;
-    assert_eq!(n % cfg.block, 0, "matmul N={n} must be a multiple of the {} block", cfg.block);
-    assert_eq!(n % K_STEP_DB, 0, "matmul N={n} must be a multiple of K_STEP_DB={K_STEP_DB}");
-    let reg = cfg.reg();
-    let g = ker.group_2d(cfg.wave_rows, cfg.wave_cols);
-
-    let c_gl = ker.gl(&[1, 1, n, n], DType::Float32);
-    let a_gl = ker.gl(&[1, 1, n, n], DType::BFloat16);
-    let b_gl = ker.gl(&[1, 1, n, n], DType::BFloat16);
-    let (row, col) = block_coords(ker, n, &cfg);
-    let warp_row = g.warp_row();
-    let warp_col = g.warp_col();
-
-    let accs: Vec<RT> =
-        (0..cfg.n_accum).map(|_| g.zero(ker.rt((reg, reg), DType::Float32, TileLayout::Col, RT_16X16))).collect();
-
-    // 2×-size XOR-swizzled LDS strips; the loop selects a half by `parity*half`.
-    let a_smem = ker.st_db((cfg.block, K_STEP_DB), DType::BFloat16, TileLayout::Row, ST_16X16_SWIZZLED);
-    let b_smem = ker.st_db((K_STEP_DB, cfg.block), DType::BFloat16, TileLayout::Row, ST_16X16_SWIZZLED);
-    let half_a = a_smem.half_elems() as i64;
-    let half_b = b_smem.half_elems() as i64;
-    let num_tiles = n / K_STEP_DB;
-
-    // ── Prologue: stage global tile 0 → VGPR, commit → buf[0], barrier ────────
-    let p_a_idx = [Idx::Const(0), Idx::Const(0), Idx::from(&row), Idx::Const(0)];
-    let p_b_idx = [Idx::Const(0), Idx::Const(0), Idx::Const(0), Idx::from(&col)];
-    let s0_a = g.stage_global_to_reg(&a_smem, &a_gl, &p_a_idx, 2);
-    let s0_b = g.stage_global_to_reg(&b_smem, &b_gl, &p_b_idx, 2);
-    let a_smem = g.commit_reg_to_local(a_smem, &s0_a, true); // buf[0], with barrier
-    let b_smem = g.commit_reg_to_local(b_smem, &s0_b, true);
-
-    // ── Rolled, software-pipelined K-loop over the double buffer ──────────────
-    let lp = ker.loop_static(num_tiles as i64);
-    let tile = lp.index().clone();
-    let tp1 = tile.add(&cidx(1));
-    // Clamp the prefetch tile to the last valid one (the final iteration's
-    // prefetch is never consumed; clamping keeps the GLOBAL read in bounds).
-    let pf = UOp::try_where(
-        tp1.try_cmplt(&cidx(num_tiles as i64)).expect("tile+1 < num_tiles"),
-        tp1.clone(),
-        cidx(num_tiles as i64 - 1),
-    )
-    .expect("clamp prefetch tile");
-    let par_cur = tile.try_mod(&cidx(2)).expect("tile % 2");
-    let par_nxt = tp1.try_mod(&cidx(2)).expect("(tile+1) % 2");
-
-    let a_cur = a_smem.with_base_offset(par_cur.mul(&cidx(half_a)));
-    let b_cur = b_smem.with_base_offset(par_cur.mul(&cidx(half_b)));
-    let a_nxt = a_smem.with_base_offset(par_nxt.mul(&cidx(half_a)));
-    let b_nxt = b_smem.with_base_offset(par_nxt.mul(&cidx(half_b)));
-
-    // Mark the K-loop as a GEMM compute pipeline, threaded through the GLOBAL buffers
-    // the in-loop stage reads so the marker precedes the first prefetch load and stays
-    // loop-scoped (dep = the counter `tile`). The prologue keeps the un-rewrapped
-    // `a_gl`/`b_gl`. The post-linearization scheduling pass brackets each MFMA with
-    // `s_setprio` and a `sched.barrier` fence (supersedes the prior `iglp_opt(0)`).
-    let mark = crate::sched::pipeline(crate::sched::SchedKind::Gemm, tile.clone());
-    let a_gl_l = a_gl.rewrap(a_gl.uop().after(smallvec![mark.clone()]));
-    let b_gl_l = b_gl.rewrap(b_gl.uop().after(smallvec![mark]));
-
-    // Stage the next tile's GLOBAL→VGPR load (overlaps this tile's MFMAs).
-    let pf_a_idx = [Idx::Const(0), Idx::Const(0), Idx::from(&row), Idx::from(&pf)];
-    let pf_b_idx = [Idx::Const(0), Idx::Const(0), Idx::from(&pf), Idx::from(&col)];
-    let s_a = g.stage_global_to_reg(&a_smem, &a_gl_l, &pf_a_idx, 2);
-    let s_b = g.stage_global_to_reg(&b_smem, &b_gl_l, &pf_b_idx, 2);
-
-    // Gather the current buffer half → WMMA fragments. The counter-dependent
-    // address keeps these loop-scoped; they read the tile committed last
-    // iteration (or the prologue for tile 0), made visible by the prior barrier.
-    let bb = g.load(
-        ker.rt((K_STEP_DB, reg), DType::BFloat16, TileLayout::Col, RT_16X16),
-        b_cur,
-        MoveIdx::block(&[Idx::Const(0), Idx::from(&warp_col)], 0),
-    );
-    let a_subs: Vec<RT> = (0..cfg.n_accum)
-        .map(|a| {
-            g.load(
-                ker.rt((reg, K_STEP_DB), DType::BFloat16, TileLayout::Row, RT_16X16),
-                a_cur.clone(),
-                MoveIdx::block(&[Idx::Uop(acc_row(&warp_row, a, &cfg))], 0),
-            )
-        })
-        .collect();
-
-    // Commit the staged registers into the *other* half (no per-commit barrier —
-    // the single loop-tail barrier below covers both the RAW and the WAR edge).
-    let commit_a = g.commit_reg_to_local(a_nxt, &s_a, false);
-    let commit_b = g.commit_reg_to_local(b_nxt, &s_b, false);
-
-    // MFMA-accumulate on the gathers — the MFMA does not depend on the tail
-    // barrier, so it stays independent of the prefetch's commit/global-load and the
-    // two can overlap. Chain accumulator `a`'s A-input through `a-1`'s MFMA so a
-    // single `END` scopes them all in the K-loop (as [`build_matmul_cfg`]).
-    let mut prev_out: Option<Arc<UOp>> = None;
-    for (a, a_sub) in a_subs.iter().enumerate() {
-        let a_sub = match &prev_out {
-            Some(p) => a_sub.after(p),
-            None => a_sub.clone(),
-        };
-        prev_out = Some(g.mma_ab(accs[a].clone(), &a_sub, &bb).uop().clone());
-    }
-
-    // Close the K-loop by wrapping the last accumulator's MFMA store in a workgroup
-    // barrier (the cross-iteration RAW/WAR fence): the barrier becomes the
-    // loop-closing `END`'s computation — kept live + tile-scoped with no value
-    // consumer, and (its passthrough being the MFMA store) emitted after the MFMAs.
-    // Its deps are the prefetch commits.
-    let bar_deps: smallvec::SmallVec<[Arc<UOp>; 4]> = smallvec![commit_a.uop().clone(), commit_b.uop().clone()];
-    let ended = lp.close_barrier(bar_deps);
-    let final_accs: Vec<RT> = accs.iter().map(|c| c.after(&ended)).collect();
-
-    // Epilogue: store each accumulator to global C at its reg-block.
-    let bps = cfg.blocks_per_side() as i64;
-    let nidx = col.mul(&cidx(bps)).add(&warp_col);
-    let mut c_t = c_gl;
-    for (a, c) in final_accs.into_iter().enumerate() {
-        let m = row.mul(&cidx(bps)).add(&acc_row(&warp_row, a, &cfg));
-        c_t = g.store(c_t, c, MoveIdx::block(&[Idx::Const(0), Idx::Const(0), Idx::Uop(m), Idx::from(&nidx)], 2));
+        let mrow = row.mul(&cidx(bps)).add(&acc_row(&warp_row, a, &cfg));
+        c_t = g.store(c_t, c, MoveIdx::block(&[Idx::Const(0), Idx::Const(0), Idx::Uop(mrow), Idx::from(&nidx)], 2));
     }
 }

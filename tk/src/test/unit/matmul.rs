@@ -21,49 +21,6 @@ fn dummy_buffers(n: usize) -> Vec<Arc<UOp>> {
     ]
 }
 
-/// Graph-shape check (no GPU): the `Hints` stage injects the
-/// `s_setprio`/`s_waitcnt`/`sched.barrier` `Op::Custom` scheduling nodes into
-/// the SINK (one cluster per unrolled tile), and the `Unroll` stage injects
-/// none — so a refactor cannot silently drop them or leave them in the baseline.
-#[test]
-fn test_pipeline_hints_emit_asm() {
-    let n = 256usize; // n / K_STEP = 4 unrolled tiles.
-    let tiles = n / K_STEP;
-
-    let custom_codes = |stage| {
-        let ker = Kernel::new(
-            "pipe",
-            M1_CFG.grid_dims(n),
-            M1_CFG.threads(crate::WARP_THREADS),
-            dummy_buffers(n),
-            crate::ArchCaps::GFX942,
-        );
-        build_matmul_pipelined(&ker, n, stage);
-        ker.finish(M1_CFG.n_accum)
-            .toposort()
-            .into_iter()
-            .filter_map(|u| match u.op() {
-                Op::Custom { code, .. } => Some(code.clone()),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-    };
-
-    let unroll = custom_codes(PipeStage::Unroll);
-    assert!(unroll.is_empty(), "Unroll stage emits no asm scheduling nodes, got {}", unroll.len());
-
-    let hints = custom_codes(PipeStage::Hints);
-    let count = |needle: &str| hints.iter().filter(|c| c.contains(needle)).count();
-    // The pre-MFMA fences (`s_waitcnt`, `s_setprio(1)`) are consumed by every
-    // tile's MFMAs, so all `tiles` survive. The cluster-tail fences
-    // (`s_setprio(0)`, `sched.barrier`) are consumed only by the *next* tile's
-    // LDS commit, so the final tile's pair is dead-code-eliminated (`tiles - 1`).
-    assert_eq!(count("s_waitcnt lgkmcnt(0)"), tiles, "one waitcnt per tile");
-    assert_eq!(count("s_setprio 1"), tiles, "one setprio(1) per tile");
-    assert_eq!(count("s_setprio 0"), tiles - 1, "one setprio(0) per tile but the last (cluster-tail, unconsumed)");
-    assert_eq!(count("llvm.amdgcn.sched.barrier"), tiles - 1, "one sched.barrier per tile but the last");
-}
-
 /// Pure graph-shape check (no GPU): `mma_AB` emits exactly one `WMMA` per
 /// K-iteration with `bf16.vec(4)` × `bf16.vec(4)` → `f32.vec(4)` operands and a
 /// 16×16×16 / 4-4-4 descriptor.
@@ -147,40 +104,6 @@ fn test_mma_unroll_flattens_mfma() {
     // instructions (a rolled K/fragment loop cannot — it renders strictly fewer).
     assert_eq!(unrolled_mfma, 8, "unrolled mma renders 8 flat mfma — no rolled K/fragment loop");
     assert!(looped_mfma < 8, "looped mma keeps the K/fragment loops rolled ({looped_mfma} < 8 static mfma)");
-}
-
-/// Scheduling pass (host render, no GPU): marking the K-loop a GEMM pipeline makes
-/// the post-linearization pass splice one backend-delegated interleave
-/// (`@llvm.amdgcn.iglp.opt(0)`) at the loop top — the dataflow model's lever, since
-/// hand-placed `s_setprio`/`sched.barrier` measured *slower* for GEMM (they pin the
-/// load/MFMA overlap the double buffer exists to create). Renders `build_matmul_db`
-/// to gfx942 LLVM IR and asserts the marker lowered to exactly that.
-#[test]
-fn test_matmul_db_sched_pass_amd_text() {
-    let n = 512usize;
-    let ker = Kernel::new(
-        "matmul_db",
-        M1_CFG.grid_dims(n),
-        M1_CFG.threads(crate::WARP_THREADS),
-        dummy_buffers(n),
-        crate::ArchCaps::GFX942,
-    );
-    build_matmul_db(&ker, n);
-    let sink = ker.finish(M1_CFG.n_accum);
-    let lowered = svod_schedule::graph_rewrite(&svod_schedule::symbolic::pm_lower_index_dtype(), sink, &mut ());
-    let program = svod_codegen::program_pipeline::program_from_sink(lowered, DeviceSpec::Cpu);
-    let linearized = svod_codegen::program_pipeline::do_linearize(&program).expect("do_linearize");
-    let linear_uop =
-        linearized.toposort().into_iter().find(|u| matches!(u.op(), Op::Linear { .. })).expect("LINEAR present");
-    let renderer = svod_codegen::llvm::LlvmTextRenderer::amd(svod_dtype::AmdArch::Gfx942);
-    let code = svod_codegen::traits::Renderer::render(&renderer, &linear_uop, Some("matmul_db")).expect("render").code;
-
-    let count = |needle: &str| code.matches(needle).count();
-    // The GEMM marker lowers to a single backend-delegated interleave at the loop
-    // top — hand-placed s_setprio/sched.barrier measured slower for GEMM (they pin
-    // the load/MFMA overlap), so the dataflow path delegates to iglp.
-    assert_eq!(count("call void @llvm.amdgcn.iglp.opt(i32 0)"), 1, "marker lowered to one iglp delegation");
-    assert!(!code.contains("s_setprio"), "GEMM delegates to iglp — no manual priority brackets");
 }
 
 /// gfx1151 (RDNA3.5) matmul renders to **WMMA**, not MFMA (host, no GPU). Built
@@ -406,14 +329,6 @@ fn test_matmul_rdna_grid() {
     }
 }
 
-/// True on a CDNA (gfx942) device. The M2 perf builders (`build_matmul_db`,
-/// `build_matmul_pipelined`) are gfx942-only — not ported to the RDNA wave32
-/// fragment layout — so their HW tests skip on a non-CDNA target.
-fn is_cdna_device() -> bool {
-    let dev = svod_tensor::Tensor::rand(&[16, 16]).expect("probe tensor").device();
-    crate::target::resolve_arch(&dev).is_some_and(|a| a.is_cdna())
-}
-
 /// Build + dispatch a matmul `cfg` over `(a, b)` once, returning the f32 C.
 fn launch_matmul<F>(
     name: &str,
@@ -482,68 +397,5 @@ fn test_matmul_adaptive_amd() {
         let max_abs = max_abs_err(&got, &expected);
         println!("adaptive N={n} (block={}): max abs error = {max_abs:e}", cfg.block);
         assert!(max_abs < 5e-2, "adaptive N={n}: max abs error {max_abs} exceeds 5e-2");
-    }
-}
-
-/// gfx942: the double-buffered matmul ([`build_matmul_db`]) is correct vs the
-/// reference and bit-identical to the single-buffered baseline — the rolled
-/// pipeline only reorders memory/compute, the per-fragment WMMA accumulation
-/// order is unchanged, so it must not change the result.
-///
-/// `SVOD_DEVICE=AMD:0 cargo test -p svod-tk --lib matmul::test_matmul_db_amd -- --ignored --nocapture`.
-#[test]
-#[ignore]
-fn test_matmul_db_amd() {
-    if !is_cdna_device() {
-        eprintln!("test_matmul_db_amd: skipped — gfx942-only M2 perf variant on a non-CDNA device");
-        return;
-    }
-    for n in [256usize, 512, 1024, 2048] {
-        let (a, b) = matmul_inputs(n);
-        let expected = matmul_reference(&a, &b);
-        let m1 = launch_matmul("simple_matmul", n, M1_CFG, |ker| build_matmul(ker, n), &a, &b);
-        let got = launch_matmul("matmul_db", n, M1_CFG, |ker| build_matmul_db(ker, n), &a, &b);
-        let max_abs = max_abs_err(&got, &expected);
-        let vs_m1 = max_abs_err(&got, &m1);
-        println!("matmul_db N={n}: max abs error = {max_abs:e}, max |Δ vs M1| = {vs_m1:e}");
-        assert!(max_abs < 5e-2, "matmul_db N={n}: max abs error {max_abs} exceeds bf16 tolerance 5e-2");
-        assert!(vs_m1 < 1e-3, "matmul_db N={n}: differs from M1 by {vs_m1} (must be ~identical)");
-    }
-}
-
-/// The K-loop pipeline is correct against the reference AND numerically
-/// identical (bit-for-bit) to the single-buffered baseline — the pipeline only
-/// reorders memory/compute, it must not change the result.
-///
-/// Scope (see the module note on [`build_matmul_pipelined`]): the `Unroll` stage
-/// at N ≤ 1024 (full-unroll IR compile time grows steeply past that), and the
-/// register-staged `Prefetch` / `Hints` stages at N ≤ 512 (their single-LDS
-/// commit hazards beyond ~8 unrolled tiles, so they stay opt-in and small-N only).
-///
-/// `SVOD_DEVICE=AMD:0 cargo test -p svod-tk --lib matmul::test_matmul_pipelined_amd -- --ignored --nocapture`.
-#[test]
-#[ignore]
-fn test_matmul_pipelined_amd() {
-    if !is_cdna_device() {
-        eprintln!("test_matmul_pipelined_amd: skipped — gfx942-only M2 perf variant on a non-CDNA device");
-        return;
-    }
-    // (stage, max N the stage is exercised at).
-    let cases = [(PipeStage::Unroll, 1024usize), (PipeStage::Prefetch, 512), (PipeStage::Hints, 512)];
-    for n in [256usize, 512, 1024] {
-        let (a, b) = matmul_inputs(n);
-        let expected = matmul_reference(&a, &b);
-        let m1 = launch_matmul("simple_matmul", n, M1_CFG, |ker| build_matmul(ker, n), &a, &b);
-        for (stage, max_n) in cases {
-            if n > max_n {
-                continue;
-            }
-            let got = launch_matmul("matmul_pipe", n, M1_CFG, |ker| build_matmul_pipelined(ker, n, stage), &a, &b);
-            let max_abs = max_abs_err(&got, &expected);
-            let vs_m1 = max_abs_err(&got, &m1);
-            println!("pipeline[{stage:?}] N={n}: max abs error = {max_abs:e}, max |Δ vs M1| = {vs_m1:e}");
-            assert!(max_abs < 5e-2, "pipeline[{stage:?}] N={n}: max abs error {max_abs} exceeds 5e-2");
-            assert!(vs_m1 < 1e-3, "pipeline[{stage:?}] N={n}: differs from M1 by {vs_m1} (must be identical)");
-        }
     }
 }

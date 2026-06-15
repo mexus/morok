@@ -74,8 +74,8 @@ impl<'k> Loop<'k> {
     /// the fence emits *after* the body's compute) and `commits` (the cross-iteration
     /// prefetch writes) are its deps. Returns the `END` node, consumed only as an
     /// ordering edge by carried accumulators (`tile.after([end])`). Use for a
-    /// software-pipelined loop whose tail fence covers both RAW and WAR (e.g.
-    /// `build_matmul_db`). Identical to [`Kernel::endrange_barrier_to`] with one range.
+    /// software-pipelined loop whose tail fence covers both RAW and WAR.
+    /// Identical to [`Kernel::endrange_barrier_to`] with one range.
     ///
     /// NOTE: do not use where the barrier-wrapped END would reorder a `WHERE` past its
     /// consumer (the FA causal mask) — there the in-loop [`crate::Group::war_fence2`]

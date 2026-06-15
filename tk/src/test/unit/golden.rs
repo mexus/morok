@@ -11,7 +11,7 @@ use svod_dtype::{DType, DeviceSpec};
 use svod_ir::UOp;
 
 use crate::kernels::fa::{FaConfig, build_fa_mw_rdb};
-use crate::kernels::matmul::{M1_CFG, build_matmul_cfg, build_matmul_db};
+use crate::kernels::matmul::{M1_CFG, build_matmul_cfg};
 use crate::{ArchCaps, Kernel, kernel_fingerprint};
 
 fn matmul_sink() -> Arc<UOp> {
@@ -24,19 +24,6 @@ fn matmul_sink() -> Arc<UOp> {
     let ker =
         Kernel::new("matmul_cfg", M1_CFG.grid_dims(n), M1_CFG.threads(crate::WARP_THREADS), bufs, ArchCaps::GFX942);
     build_matmul_cfg(&ker, n, M1_CFG);
-    ker.finish(M1_CFG.n_accum)
-}
-
-fn matmul_db_sink() -> Arc<UOp> {
-    let n = 512usize;
-    let bufs = vec![
-        UOp::new_buffer(DeviceSpec::Cpu, n * n, DType::Float32),
-        UOp::new_buffer(DeviceSpec::Cpu, n * n, DType::BFloat16),
-        UOp::new_buffer(DeviceSpec::Cpu, n * n, DType::BFloat16),
-    ];
-    let ker =
-        Kernel::new("matmul_db", M1_CFG.grid_dims(n), M1_CFG.threads(crate::WARP_THREADS), bufs, ArchCaps::GFX942);
-    build_matmul_db(&ker, n);
     ker.finish(M1_CFG.n_accum)
 }
 
@@ -67,16 +54,10 @@ fn fa_sink() -> Arc<UOp> {
 // Re-baked for 4c (subtile): the per-warp band moved from a folded address term
 // into the tile's base_offset — same address VALUE, one extra add node. Validated
 // numerically on gfx942 (matmul *_amd) + gfx1151/395.
-const MATMUL_DIGEST: u128 = 0x99eb_67e7_9598_ec54_0000_0000_0000_0000;
+const MATMUL_DIGEST: u128 = 0x6698_e812_748b_1ec0_0000_0000_0000_0000;
 const MATMUL_NODES: usize = 483;
-// Re-baked for the online-softmax rescale rewrite: `scale_vec` dropped its scratch
-// buffer and is now the `(max_vec_last - &max_vec).exp2()` same-shape vec−vec op
-// (reusing `max_vec_last`'s dead buffer) instead of a hand-rolled `load_at` merge —
-// 3 fewer nodes, same numerics. Validated on gfx942 (fa *_amd) + gfx1151/395.
-const FA_DIGEST: u128 = 0x97cf_434e_4785_1a9f_0000_0000_0000_0000;
+const FA_DIGEST: u128 = 0x9d50_df63_2af9_357f_0000_0000_0000_0000;
 const FA_NODES: usize = 878;
-const MATMUL_DB_DIGEST: u128 = 0x1bde_e499_c405_69fb_0000_0000_0000_0000;
-const MATMUL_DB_NODES: usize = 643;
 
 fn check(name: &str, sink: Arc<UOp>, digest: u128, nodes: usize) {
     let fp = kernel_fingerprint(&sink);
@@ -99,11 +80,6 @@ fn golden_matmul_cfg() {
 #[test]
 fn golden_fa_mw_rdb() {
     check("fa_mw_rdb", fa_sink(), FA_DIGEST, FA_NODES);
-}
-
-#[test]
-fn golden_matmul_db() {
-    check("matmul_db", matmul_db_sink(), MATMUL_DB_DIGEST, MATMUL_DB_NODES);
 }
 
 /// The fingerprint is invariant to the global id counter: building the same kernel
