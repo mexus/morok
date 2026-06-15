@@ -29,7 +29,6 @@ use svod_dtype::DType;
 use svod_tensor::Tensor;
 
 use crate::CompiledLaunch;
-use crate::kernels::matmul::build_matmul;
 
 /// MI300X dense bf16 matrix-engine peak throughput (TFLOP/s). AMD's CDNA3 spec
 /// sheet lists ~1307.4 TFLOP/s peak bf16 matrix (non-sparse) for the MI300X.
@@ -158,7 +157,7 @@ fn bench_matmul_amd() {
 }
 
 fn run_matmul(n: usize, iters: usize) -> Row {
-    use crate::kernels::matmul::M1_CFG;
+    use crate::kernels::matmul::{build_matmul_cfg, cfg_for_arch};
 
     // bf16 inputs realized once so kernel + reference see identical rounded
     // values; f32 output (the kernel accumulates in f32 like MFMA).
@@ -168,19 +167,21 @@ fn run_matmul(n: usize, iters: usize) -> Row {
     b.realize().expect("realize b");
     let mut c = Tensor::empty(&[n, n], DType::Float32);
 
+    // Per-arch config + the device's REAL wave width (gfx1151 = the swept
+    // occupancy-tuned GFX1151_CFG; gfx942 = M1). `WARP_THREADS`=64 is the layout
+    // pin, not the live lane count, and would over-launch 2× on wave32.
+    let arch = crate::target::resolve_supported_arch(&a.device(), crate::kernels::matmul::MATMUL_SUPPORTED_ARCHS)
+        .expect("resolve matmul arch");
+    let wave = crate::ArchCaps::for_arch(arch).wave_size;
+    let cfg = cfg_for_arch(arch, n);
+
     // Compile the svod-tk kernel ONCE (render+compile excluded from timing).
-    let launch = crate::compile_kernel(
-        "simple_matmul",
-        M1_CFG.grid_dims(n),
-        M1_CFG.threads(crate::WARP_THREADS),
-        &mut [&mut c],
-        &[&a, &b],
-        |ker| {
-            build_matmul(ker, n);
-            ker.finish(M1_CFG.n_accum)
-        },
-    )
-    .expect("compile matmul");
+    let launch =
+        crate::compile_kernel("simple_matmul", cfg.grid_dims(n), cfg.threads(wave), &mut [&mut c], &[&a, &b], |ker| {
+            build_matmul_cfg(ker, n, cfg);
+            ker.finish(cfg.n_accum)
+        })
+        .expect("compile matmul");
 
     // Correctness: dispatch once, compare against the f32 ground-truth matmul of
     // the same bf16-rounded operands (max abs err < 5e-2 for bf16 inputs).
