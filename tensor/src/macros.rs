@@ -6,6 +6,8 @@
 //! half: [`custom_kernel_check!`], which generates a hardware-gated numerical
 //! correctness test against a reference op, removing the per-kernel boilerplate of
 //! building inputs, running both, casting to f32, and comparing within tolerance.
+//! The comparison itself is [`crate::testing::allclose_f32`] — shared with any
+//! property-based harness so both inherit its finite/NaN and empty-input guards.
 
 /// Generate a hardware-gated (`#[ignore]`) numerical correctness test for a custom
 /// kernel against a reference op.
@@ -13,8 +15,9 @@
 /// Builds one random input tensor per `inputs` name (all of `shape`/`dtype`),
 /// runs `run` (the kernel under test) and `reference` (the oracle) — both
 /// `FnOnce(&Tensor, …) -> Result<Tensor, _>` for *any* error type — casts both
-/// outputs to f32 and asserts elementwise `|got − ref| ≤ tol + tol·|ref|`. The
-/// test is `#[ignore]` (run with `SVOD_DEVICE=<dev> … -- --ignored`), so the
+/// outputs to f32 and asserts [`allclose`](crate::testing::allclose_f32) at
+/// `atol = rtol = tol` (so any length/empty or `NaN`/`inf` mismatch also fails).
+/// The test is `#[ignore]` (run with `SVOD_DEVICE=<dev> … -- --ignored`), so the
 /// inputs land on the env-selected device.
 ///
 /// ```ignore
@@ -64,17 +67,12 @@ macro_rules! custom_kernel_check {
             let reference = $reference;
             let expected = to_f32_vec(reference($(&$arg),+).expect("custom_kernel_check: reference run"));
 
-            assert_eq!(got.len(), expected.len(), "custom_kernel_check[{}]: length mismatch", stringify!($name));
-            let (atol, rtol) = ($tol, $tol);
-            let (mut max_abs, mut worst) = (0.0f32, 0.0f32);
-            for (g, e) in got.iter().zip(&expected) {
-                max_abs = max_abs.max((g - e).abs());
-                worst = worst.max((g - e).abs() - rtol * e.abs());
-            }
-            println!("custom_kernel_check[{}]: max abs error = {:e} (tol {:e}+{:e}·|e|)",
-                stringify!($name), max_abs, atol as f32, rtol as f32);
-            assert!(worst <= atol as f32, "custom_kernel_check[{}]: exceeds tolerance (max abs {:e})",
-                stringify!($name), max_abs);
+            // Combined absolute+relative tolerance via the shared comparator, which
+            // also catches finite/non-finite (NaN/inf) and length/empty mismatches.
+            let (atol, rtol) = ($tol as f32, $tol as f32);
+            let report = $crate::testing::allclose_f32(&got, &expected, atol, rtol);
+            println!("custom_kernel_check[{}]: {}", stringify!($name), report.message);
+            assert!(report.ok, "custom_kernel_check[{}]: {}", stringify!($name), report.message);
         }
     };
 }

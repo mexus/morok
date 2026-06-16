@@ -1,10 +1,12 @@
 //! Cross-lane primitives ([`crate::Group::shuffle`]/`shuffle_xor`/`compare_exchange`)
 //! — the `ds_bpermute`-based foundation for sorting networks, arg-reduce, and scan.
-//! Graph-shape checks run GPU-free; the butterfly all-reduce is `#[ignore]` (gfx942).
+//! Graph-shape checks run GPU-free; the butterfly all-reduce is `#[ignore]`
+//! (gfx942 wave64 + gfx1151 wave32 — the f32 fragment is arch-selected by role).
 
 use svod_dtype::{AmdArch, DType};
 use svod_ir::Op;
 
+use crate::arch::FragRole;
 use crate::index::Idx;
 use crate::tiles::{RT_16X16, TileLayout};
 use crate::{ArchCaps, Kernel, MoveIdx, SwapDir};
@@ -76,9 +78,13 @@ fn test_shuffle_xor_allreduce_amd() {
     crate::run_kernel("allreduce", [1, 1, 1], w, &mut [&mut out], &[], |ker| {
         let warp = ker.warp();
         let o = ker.gl(&[1, 1, 16, 16], DType::Float32);
-        let mut x = warp.ones(ker.rt((16, 16), DType::Float32, ROW, RT_16X16));
+        // The arch-correct f32 16×16 fragment: RT_16X16 (ept=4) on CDNA wave64,
+        // RT_16X16_W32_ACC (ept=8, even/odd interleave) on RDNA wave32 — so the store
+        // covers all 256 elements, not just the wave64 half.
+        let frag = ker.caps.frag(FragRole::Accumulator);
+        let mut x = warp.ones(ker.rt((16, 16), DType::Float32, ROW, frag));
         for &mask in &masks {
-            let tmp = warp.shuffle_xor(ker.rt((16, 16), DType::Float32, ROW, RT_16X16), &x, mask);
+            let tmp = warp.shuffle_xor(ker.rt((16, 16), DType::Float32, ROW, frag), &x, mask);
             x = warp.add(x, &tmp);
         }
         let o_idx = [Idx::Const(0), Idx::Const(0), Idx::Const(0), Idx::Const(0)];

@@ -160,52 +160,83 @@ fn block_coords(ker: &Kernel, m: usize, n: usize, cfg: &MatmulCfg) -> (Arc<UOp>,
     }
 }
 
-/// Build the `simple_matmul` SINK for an `n×n` bf16→f32 matmul with [`M1_CFG`]
-/// (the default large-N path: 256×256 block, M4 chiplet grid, M3 vec fills).
-pub fn build_matmul(ker: &Kernel, n: usize) {
-    build_matmul_cfg(ker, n, M1_CFG);
-}
-
-/// M7: build the matmul with the size-adaptive config ([`cfg_for_n`]). The
-/// caller must launch with the matching grid/threads ([`MatmulCfg::grid`] /
-/// [`MatmulCfg::threads`]) and `finish(cfg.n_accum)`.
-pub fn build_matmul_adaptive(ker: &Kernel, n: usize) {
-    build_matmul_cfg(ker, n, cfg_for_n(n));
-}
-
 /// The GPU arch(es) the tile matmul is built for: gfx942 (CDNA MFMA, wave64) and
-/// gfx1151 (RDNA3.5 WMMA, wave32 — the `_W32_*` fragment shapes). The launcher
-/// gates against this; see [`crate::target::check_target`]. (gfx1151 is pending
-/// hardware validation — a wrong fragment map shows as a permuted output.)
+/// gfx1151 (RDNA3.5 WMMA, wave32 — the `_W32_*` fragment shapes), both HW-validated
+/// (gfx1151 on Strix Halo). The launcher gates against this; see
+/// [`crate::target::check_target`].
 pub const MATMUL_SUPPORTED_ARCHS: &[svod_dtype::AmdArch] = &[svod_dtype::AmdArch::Gfx942, svod_dtype::AmdArch::Gfx1151];
 
-/// **Graph-native** `n×n` bf16→f32 tile matmul: returns a lazy output [`Tensor`]
-/// (a `custom_kernel` / `Op::Call` node) — the matmul peer of
-/// [`crate::flash_attention`]. Composes into a model graph and benchmarks through
-/// the normal `prepare()` → `execute_profiled` path. `a`/`b` are square `[n, n]`
-/// bf16; uses the size-adaptive config ([`cfg_for_n`]).
-pub fn matmul(a: &svod_tensor::Tensor, b: &svod_tensor::Tensor) -> crate::LaunchResult<Tensor> {
-    // Single resolve: gate to a supported arch (+ toolchain) and reuse the arch to
-    // build caps so the launch block (`waves * wave_size`) and the kernel's wave
-    // math track the real wave width.
-    let arch = crate::target::resolve_supported_arch(&a.device(), MATMUL_SUPPORTED_ARCHS)?;
-    let caps = crate::ArchCaps::for_arch(arch);
+/// **Graph-native** `n×n` matrix multiply — returns a lazy output [`Tensor`] (a
+/// `custom_kernel` / `Op::Call` node), the matmul peer of [`crate::flash_attention`].
+/// Composes into a model graph and realizes / benchmarks through the normal
+/// `prepare()` → `execute_profiled` path like any other tensor op.
+///
+/// `a`/`b` are square `[n, n]` of **any float dtype**: they are cast to bf16
+/// internally (the kernel is a bf16-input matrix-engine GEMM), and the result is
+/// the f32 WMMA/MFMA accumulator. So a caller needs no kernel knowledge — pass
+/// plain tensors, get a tensor back. The per-arch occupancy config is picked by
+/// [`cfg_for_arch`].
+///
+/// Like [`crate::flash_attention_with`], the outcome is three-way (via
+/// [`crate::launch_custom`]): `Ok(None)` when the device can't run the kernel,
+/// `Err` when the request is malformed (non-square operands, or a size that isn't a
+/// multiple of the arch's block), `Ok(Some)` when it ran.
+///
+/// ```no_run
+/// use svod_tensor::Tensor;
+/// let a = Tensor::randn(&[256, 256]).unwrap();
+/// let b = Tensor::randn(&[256, 256]).unwrap();
+/// if let Some(mut c) = svod_tk::matmul(&a, &b).unwrap() { // lazy bf16→f32 GEMM node
+///     c.prepare().unwrap();                                // realize through the scheduler
+/// }
+/// ```
+pub fn matmul(a: &Tensor, b: &Tensor) -> crate::LaunchResult<Option<Tensor>> {
+    use snafu::{ResultExt, ensure};
+
     let dim = |t: &Tensor, i: usize| t.shape().expect("shape")[i].as_const().expect("concrete dim");
     let (am, an) = (dim(a, 0), dim(a, 1));
     let (bm, bn) = (dim(b, 0), dim(b, 1));
-    assert_eq!(
-        (am, an, bm, bn),
-        (am, am, am, am),
-        "tk matmul requires square, equal-size a/b ([n,n]); got a={am}x{an} b={bm}x{bn}"
-    );
     let n = am;
 
-    let cfg = cfg_for_arch(arch, n);
-    let out = Tensor::empty(&[n, n], DType::Float32);
-    crate::graph_launch("matmul", cfg.grid_dims(n), cfg.threads(caps.wave_size), out, &[a, b], caps, move |ker| {
-        build_matmul_cfg(ker, n, cfg);
-        ker.finish(cfg.n_accum)
-    })
+    crate::launch_custom(
+        &a.device(),
+        MATMUL_SUPPORTED_ARCHS,
+        // Operands must be square + equal-sized; `n % block` (arch-dependent) is checked
+        // in `build`. Both are structural request errors (`Err`), not fallback triggers.
+        move |_arch| {
+            ensure!(
+                an == am && bm == am && bn == am,
+                crate::launch::NotSquareSnafu { kernel: "matmul", a: [am, an], b: [bm, bn] }
+            );
+            Ok(())
+        },
+        true, // no runtime-applicability fallback — a bad size is an error, not `None`.
+        move |arch| {
+            let caps = crate::ArchCaps::for_arch(arch);
+            let cfg = cfg_for_arch(arch, n);
+            ensure!(
+                n % cfg.block == 0,
+                crate::launch::DimMultipleSnafu { kernel: "matmul", dim: "n", value: n, multiple: cfg.block }
+            );
+            // Operands → bf16 (the matrix-engine operand dtype); a no-op when already
+            // bf16, so the ABI's bf16 globals bind directly. Output stays f32 (accumulator).
+            let a_bf = a.cast(DType::BFloat16).context(crate::launch::OperandSnafu)?;
+            let b_bf = b.cast(DType::BFloat16).context(crate::launch::OperandSnafu)?;
+            let out = Tensor::empty(&[n, n], DType::Float32);
+            crate::graph_launch(
+                "matmul",
+                cfg.grid_dims(n),
+                cfg.threads(caps.wave_size),
+                out,
+                &[&a_bf, &b_bf],
+                caps,
+                move |ker| {
+                    build_matmul_cfg(ker, n, cfg);
+                    ker.finish(cfg.n_accum)
+                },
+            )
+        },
+    )
 }
 
 /// The parametrized multi-wave matmul (M1 + M7). One `cfg.block × cfg.block` C

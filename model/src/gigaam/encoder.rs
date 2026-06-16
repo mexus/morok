@@ -173,9 +173,9 @@ impl MultiHeadSelfAttention {
 
     /// `key_lens`, when present, is a realized `[B]` `i32` tensor of valid
     /// (unpadded) key positions per batch — keys at index `>= key_lens[b]` are
-    /// masked. Threaded straight into [`svod_tk::flash_attention_with`] as a
-    /// key-only padding mask; the hand kernel and its SDPA fallback both honor
-    /// it, so the result is correct whether or not the gfx942 kernel fires.
+    /// masked. Passed to [`svod_tk::flash_attention_with`] as a key-only padding
+    /// mask; when the hand kernel doesn't apply it returns `None` and [`sdpa_attention`]
+    /// runs the same masked attention, so the result is correct on any device.
     pub fn forward(&self, x: &Tensor, cos: &Tensor, sin: &Tensor, key_lens: Option<&Tensor>) -> Result<Tensor> {
         let shape = x.shape().context(TensorSnafu)?;
         let b = shape[0].clone();
@@ -218,11 +218,51 @@ impl MultiHeadSelfAttention {
         let k = split_heads(&k, b.clone(), t.clone(), h, d_k)?;
         let v = split_heads(&v, b.clone(), t.clone(), h, d_k)?;
 
-        let attn =
-            svod_tk::flash_attention_with(&q, &k, &v, svod_tk::FaOpts { causal: false, key_lens }).context(TkSnafu)?;
+        // The hand FA kernel when it applies (AMD + tiling shape), else this model's
+        // own SDPA — tk no longer falls back silently; the policy lives here.
+        let attn = match svod_tk::flash_attention_with(&q, &k, &v, svod_tk::FaOpts { causal: false, key_lens })
+            .context(TkSnafu)?
+        {
+            Some(out) => out,
+            None => sdpa_attention(&q, &k, &v, key_lens)?,
+        };
         let out = merge_heads(&attn, b, t, d_model)?;
         out.linear().weight(&self.out_proj).bias(&self.out_bias).call().context(TensorSnafu)
     }
+}
+
+/// SDPA fallback for when `svod_tk::flash_attention_with` returns `None` (non-AMD
+/// device or a non-tiling sequence length). Mirrors the kernel's contract: input
+/// and output stay `[B, T, H, d_k]`, attention is non-causal, and `key_lens` masks
+/// padded KEY positions only (`kv_pos ≥ key_lens[b]`). Permutes to the
+/// `[B, H, T, d_k]` SDPA wants and back.
+fn sdpa_attention(q: &Tensor, k: &Tensor, v: &Tensor, key_lens: Option<&Tensor>) -> Result<Tensor> {
+    let perm = |t: &Tensor| t.try_permute(&[0, 2, 1, 3]).context(TensorSnafu);
+    let (qp, kp, vp) = (perm(q)?, perm(k)?, perm(v)?);
+    let mask = match key_lens {
+        Some(lens) => {
+            let qs = q.shape().expect("q shape");
+            let dim = |i: usize| qs[i].as_const().expect("concrete dim");
+            let (b, n) = (dim(0), dim(1));
+            // [B, 1, 1, N] bool key mask: true (masked) where arange(N) ≥ key_lens[b].
+            let range = Tensor::arange(n as i64, None, None)
+                .context(TensorSnafu)?
+                .try_reshape([1usize, 1, 1, n])
+                .context(TensorSnafu)?;
+            let lens = lens.cast(DType::Int32).context(TensorSnafu)?.try_reshape([b, 1, 1, 1]).context(TensorSnafu)?;
+            Some(range.try_ge(&lens).context(TensorSnafu)?)
+        }
+        None => None,
+    };
+    let out = qp
+        .scaled_dot_product_attention()
+        .key(&kp)
+        .value(&vp)
+        .is_causal(false)
+        .maybe_attn_mask(mask.as_ref())
+        .call()
+        .context(TensorSnafu)?;
+    out.try_permute(&[0, 2, 1, 3]).context(TensorSnafu)
 }
 
 /// `[B, T, H*d_k] → [B, T, H, d_k]`. Leaves the seq-major layout that

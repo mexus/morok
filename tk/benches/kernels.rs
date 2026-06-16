@@ -1,14 +1,13 @@
-//! Criterion GPU-device-time benches for the svod-tk model hot path.
+//! Criterion GPU-device-time benches for svod-tk's kernels.
 //!
-//! These bench the **same public interfaces the GigaAM encoder calls** — matmul
-//! via [`Tensor::linear`] (the generic optimizer path the projections/FFN run)
-//! and attention via `svod_tk::flash_attention_with` (the hand kernel, non-causal
-//! with optional key padding) — so the numbers reflect what the model actually
-//! executes, not a low-level direct-launch path. GPU device time comes from
-//! `execute_profiled`'s per-kernel HW stamps (the criterion `iter_custom` source),
-//! so outlier rejection / CIs operate on real on-device time, not host wall-clock.
-//! They complement the in-tree interleaved A/B harness (`src/test/unit/bench.rs`),
-//! which keeps the low-level per-config sweeps and tk-vs-reference comparisons.
+//! These bench svod-tk's two kernels through their public `Tensor` interface,
+//! timed the way the model runs them (`prepare()` → `execute_profiled`):
+//! `svod_tk::flash_attention_with` — the production attention kernel (non-causal,
+//! optional key padding) vs the SDPA fallback — and `svod_tk::matmul` — the hand
+//! kernel (a DSL perf-canary; the model itself uses the generic optimizer) vs a
+//! generic-GEMM reference. GPU device time comes from `execute_profiled`'s
+//! per-kernel HW stamps (the criterion `iter_custom` source), so outlier rejection
+//! / CIs operate on real on-device time, not host wall-clock.
 //!
 //! Run: `SVOD_DEVICE=AMD:0 cargo bench -p svod-tk --bench kernels`
 //! Self-skips (records no samples) when no supported AMD GPU is present.
@@ -53,26 +52,33 @@ fn plan_gpu_ns(plan: &svod_runtime::ExecutionPlan, iters: u64) -> u64 {
     total
 }
 
-/// Matmul as the model runs it: [`Tensor::linear`] (`x @ Wᵀ + b`) — the public
-/// op every GigaAM projection / feed-forward layer calls, lowered by the generic
-/// optimizer (NOT the `svod_tk::matmul` hand kernel, which the model never uses).
-/// Square `M = N = K`; bf16 in/out, f32 accumulate.
-fn bench_linear(c: &mut Criterion) {
+/// The svod-tk hand matmul (`svod_tk::matmul`, a graph-native `custom_kernel`
+/// node) vs svod's generic `Tensor::matmul` reference — both timed through
+/// `prepare()` → `execute_profiled`. The hand kernel carries no production load
+/// (the model uses the generic optimizer via `Tensor::linear`); this is its DSL
+/// perf-canary. Square `M = N = K`, bf16 in, f32 accumulate.
+fn bench_matmul(c: &mut Criterion) {
     if !requirements_met(svod_tk::kernels::matmul::MATMUL_SUPPORTED_ARCHS) {
-        eprintln!("svod-tk linear bench: skipped (no supported AMD GPU / toolchain)");
+        eprintln!("svod-tk matmul bench: skipped (no supported AMD GPU / toolchain)");
         return;
     }
-    let mut group = c.benchmark_group("linear");
+    let mut group = c.benchmark_group("matmul");
     for &n in &[1024usize, 2048] {
         group.throughput(Throughput::Elements((2.0 * (n as f64).powi(3)) as u64)); // 2·M·N·K
-        let x = randn_bf16(&[n, n]);
-        let w = randn_bf16(&[n, n]); // linear weight is [out, in]
-        let bias = randn_bf16(&[n]);
+        let a = randn_bf16(&[n, n]);
+        let b = randn_bf16(&[n, n]);
 
-        let mut y = x.linear().weight(&w).bias(&bias).call().expect("linear");
-        let plan = y.prepare().expect("prepare linear");
+        let mut y = svod_tk::matmul(&a, &b).expect("tk matmul").expect("matmul kernel applies");
+        let plan = y.prepare().expect("prepare matmul");
         group.bench_with_input(BenchmarkId::new("tk", n), &n, |bencher, _| {
             bencher.iter_custom(|iters| Duration::from_nanos(black_box(plan_gpu_ns(&plan, iters))));
+        });
+
+        // Reference: svod's generic bf16→f32 GEMM (the matmul a user would write).
+        let mut reft = a.matmul_with().other(&b).dtype(DType::Float32).call().expect("ref matmul");
+        let ref_plan = reft.prepare().expect("prepare ref");
+        group.bench_with_input(BenchmarkId::new("generic", n), &n, |bencher, _| {
+            bencher.iter_custom(|iters| Duration::from_nanos(black_box(plan_gpu_ns(&ref_plan, iters))));
         });
     }
     group.finish();
@@ -96,7 +102,8 @@ fn bench_fa(c: &mut Criterion) {
 
         // The model's exact call: non-causal, no key padding.
         let mut fa = svod_tk::flash_attention_with(&q, &k, &v, svod_tk::FaOpts { causal: false, key_lens: None })
-            .expect("flash_attention_with");
+            .expect("flash_attention_with")
+            .expect("FA kernel applies for bench shape");
         let fa_plan = fa.prepare().expect("prepare fa");
         group.bench_with_input(BenchmarkId::new("tk", n), &n, |bencher, _| {
             bencher.iter_custom(|iters| Duration::from_nanos(black_box(plan_gpu_ns(&fa_plan, iters))));
@@ -115,5 +122,5 @@ fn bench_fa(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_fa, bench_linear);
+criterion_group!(benches, bench_fa, bench_matmul);
 criterion_main!(benches);

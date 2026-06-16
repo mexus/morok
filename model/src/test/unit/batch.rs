@@ -276,7 +276,8 @@ fn fa_layout_parity_vs_sdpa_key_masked() {
     key_lens.realize().unwrap();
 
     let fa = svod_tk::flash_attention_with(&q, &k, &v, svod_tk::FaOpts { causal: false, key_lens: Some(&key_lens) })
-        .expect("flash_attention_with");
+        .expect("flash_attention_with")
+        .expect("FA kernel applies");
     let mut fa_f = fa.cast(DType::Float32).unwrap();
     fa_f.realize().unwrap();
     let got = fa_f.as_vec::<f32>().unwrap();

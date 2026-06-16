@@ -362,7 +362,7 @@ fn test_fa_graph_amd() {
         let (q, k, v) = (mk(), mk(), mk());
 
         // Graph path: lazy custom_kernel Tensor → realize.
-        let og = crate::kernels::fa::flash_attention(&q, &k, &v).expect("graph fa");
+        let og = crate::kernels::fa::flash_attention(&q, &k, &v).expect("graph fa").expect("FA kernel applies");
         let mut og_f = og.cast(DType::Float32).expect("og→f32");
         og_f.realize().expect("realize graph");
         let graph: Vec<f32> = og_f.as_vec::<f32>().expect("read graph");
@@ -407,7 +407,7 @@ fn test_fa_graph_amd() {
 svod_tensor::custom_kernel_check! {
     test_fa_graph_check_amd,
     inputs (q, k, v): shape [1, 128, 2, 64], dtype svod_dtype::DType::BFloat16,
-    run: |q, k, v| crate::kernels::fa::flash_attention(q, k, v),
+    run: |q, k, v| crate::kernels::fa::flash_attention(q, k, v).map(|o| o.expect("FA kernel applies to this shape")),
     reference: |q, k, v| {
         use svod_tensor::Tensor;
         let perm = |t: &Tensor| {
@@ -440,7 +440,9 @@ fn test_fa_noncausal_f16_amd() {
     };
     let (q, k, v) = (mk(), mk(), mk());
 
-    let og = flash_attention_with(&q, &k, &v, FaOpts { causal: false, key_lens: None }).expect("fa noncausal");
+    let og = flash_attention_with(&q, &k, &v, FaOpts { causal: false, key_lens: None })
+        .expect("fa noncausal")
+        .expect("FA kernel applies");
     let mut og_f = og.cast(DType::Float32).expect("og→f32");
     og_f.realize().expect("realize og");
     let got: Vec<f32> = og_f.as_vec::<f32>().expect("read og");
@@ -485,7 +487,9 @@ fn test_fa_noncausal_f16_masked_amd() {
     let mut lens = Tensor::from_slice([valid; 1]);
     lens.realize().expect("realize lens");
 
-    let og = flash_attention_with(&q, &k, &v, FaOpts { causal: false, key_lens: Some(&lens) }).expect("fa masked");
+    let og = flash_attention_with(&q, &k, &v, FaOpts { causal: false, key_lens: Some(&lens) })
+        .expect("fa masked")
+        .expect("FA kernel applies");
     let mut og_f = og.cast(DType::Float32).expect("og→f32");
     og_f.realize().expect("realize og");
     let got: Vec<f32> = og_f.as_vec::<f32>().expect("read og");

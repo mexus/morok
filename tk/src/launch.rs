@@ -23,6 +23,7 @@ use snafu::{IntoError, ResultExt, Snafu};
 use svod_codegen::program_pipeline::{self, ProgramTarget};
 use svod_device::Buffer;
 use svod_device::device::{Device, Program, ProgramSpec};
+use svod_dtype::{AmdArch, DType, DeviceSpec};
 use svod_ir::UOp;
 use svod_tensor::Tensor;
 
@@ -105,17 +106,39 @@ pub enum Error {
     },
 
     /// The resolved device cannot run svod-tk tile kernels — wrong GPU arch (they
-    /// are gfx942/CDNA3-only) or the AMD LLVM/clang toolchain is unavailable.
+    /// target gfx942/CDNA3 and gfx1151/RDNA3.5) or the AMD LLVM/clang toolchain is
+    /// unavailable.
     #[snafu(display("unsupported target for svod-tk kernel: {reason}"))]
     UnsupportedTarget { reason: String },
 
-    /// The scheduler fallback (`Tensor::scaled_dot_product_attention` on a device
-    /// the hand-built kernel does not support) failed to build.
-    #[snafu(display("scheduler fallback: {source}"))]
-    Fallback {
+    /// Casting an input to the kernel's bf16 operand dtype failed.
+    #[snafu(display("cast matmul operand: {source}"))]
+    Operand {
         #[snafu(source(from(svod_tensor::error::Error, Box::new)))]
         source: Box<svod_tensor::error::Error>,
     },
+
+    // ── Structured "malformed request" errors ───────────────────────────────────
+    // A FIXED shape/dtype property is wrong on an otherwise-runnable kernel (a caller
+    // bug). Distinct from a runtime length that merely doesn't tile (`Ok(None)`) and
+    // from an unsupported device ([`Error::UnsupportedTarget`]). Carry the offending
+    // values structurally instead of a pre-formatted string.
+    /// An operand dtype is unsupported by the kernel.
+    #[snafu(display("{kernel}: operand dtype {got:?} unsupported (expected {expected})"))]
+    Dtype { kernel: &'static str, got: DType, expected: &'static str },
+
+    /// A dimension must be a whole multiple of `multiple` (e.g. the WMMA edge or the
+    /// matmul block).
+    #[snafu(display("{kernel}: {dim} = {value} must be a multiple of {multiple}"))]
+    DimMultiple { kernel: &'static str, dim: &'static str, value: usize, multiple: usize },
+
+    /// One dimension must be divisible by another (e.g. GQA `H % H_kv == 0`).
+    #[snafu(display("{kernel}: {dim} = {value} must be divisible by {divisor} = {divisor_value}"))]
+    DimDivisible { kernel: &'static str, dim: &'static str, value: usize, divisor: &'static str, divisor_value: usize },
+
+    /// Operands must be square and equal-sized (`[n,n] · [n,n]`).
+    #[snafu(display("{kernel}: operands must be square and equal-sized, got {a:?} · {b:?}"))]
+    NotSquare { kernel: &'static str, a: [usize; 2], b: [usize; 2] },
 }
 
 /// Compile `sink` for `device` and dispatch it against `buffers`, populating the
@@ -285,7 +308,24 @@ pub fn compile(device: &Device, sink: Arc<UOp>, buffers: &[Buffer]) -> Result<Co
 ///
 /// `build` receives a [`Kernel`](crate::Kernel) already bound to the realized
 /// buffers (outputs first, then inputs, matching `gl()` order) and returns the
-/// finished SINK (`ker.finish(..)`). Outputs are written in place.
+/// finished SINK (`ker.finish(..)`). Outputs are written in place — the isolation
+/// path for **debugging** a kernel (read the output back with `out.as_vec()`).
+///
+/// ```no_run
+/// use svod_tensor::Tensor;
+/// use svod_dtype::{AmdArch, DType};
+/// use svod_tk::{ArchCaps, run_kernel};
+/// use svod_tk::kernels::matmul::{GFX1151_CFG, build_matmul_cfg};
+/// let n = 256usize;
+/// let a = Tensor::randn(&[n, n]).unwrap().cast(DType::BFloat16).unwrap();
+/// let b = Tensor::randn(&[n, n]).unwrap().cast(DType::BFloat16).unwrap();
+/// let mut c = Tensor::empty(&[n, n], DType::Float32);
+/// let cfg = GFX1151_CFG;
+/// let block = cfg.threads(ArchCaps::for_arch(AmdArch::Gfx1151).wave_size);
+/// run_kernel("matmul", cfg.grid_dims(n), block, &mut [&mut c], &[&a, &b],
+///     move |ker| { build_matmul_cfg(ker, n, cfg); ker.finish(cfg.n_accum) }).unwrap();
+/// // `c` now holds A·B; inspect it with `c.as_vec::<f32>()`.
+/// ```
 pub fn run_kernel<F>(
     name: impl Into<String>,
     grid: [i64; 3],
@@ -318,6 +358,24 @@ where
 /// mints from `grid`/`block` (no launch dims are passed through `CallInfo`); the
 /// `finish()`-stamped `opts_to_apply = Some(vec![])` keeps the optimizer off the
 /// hand-lowered body.
+///
+/// ```no_run
+/// use svod_tensor::Tensor;
+/// use svod_dtype::{AmdArch, DType};
+/// use svod_tk::{ArchCaps, graph_launch};
+/// use svod_tk::kernels::matmul::{GFX1151_CFG, build_matmul_cfg};
+/// let n = 256usize;
+/// let a = Tensor::randn(&[n, n]).unwrap().cast(DType::BFloat16).unwrap();
+/// let b = Tensor::randn(&[n, n]).unwrap().cast(DType::BFloat16).unwrap();
+/// let out = Tensor::empty(&[n, n], DType::Float32);
+/// let cfg = GFX1151_CFG;
+/// let caps = ArchCaps::for_arch(AmdArch::Gfx1151);
+/// // Wrap the hand-built SINK as a lazy graph node — composes + `prepare()`s like
+/// // any tensor op (`build_matmul_cfg` is the worked kernel body).
+/// let mut c = graph_launch("matmul", cfg.grid_dims(n), cfg.threads(caps.wave_size),
+///     out, &[&a, &b], caps, move |ker| { build_matmul_cfg(ker, n, cfg); ker.finish(cfg.n_accum) }).unwrap();
+/// c.prepare().unwrap();
+/// ```
 pub fn graph_launch<F>(
     name: impl Into<String>,
     grid: [i64; 3],
@@ -339,6 +397,42 @@ where
     let kname = name.clone();
     Tensor::graph_kernel(&name, out, ins, move |ph| build(&crate::Kernel::new(kname, grid, block, ph, caps)))
         .context(CustomKernelSnafu { name })
+}
+
+/// The shared **three-way launch policy** every graph-native custom kernel follows,
+/// so the arch / `None` / `Err` / `Some` decision lives in one place instead of
+/// being re-threaded per kernel:
+///
+/// - `Ok(None)` — *doesn't apply here:* `device` isn't one of `archs` (with the AMD
+///   toolchain), **or** `applies` is false (a runtime property — e.g. a sequence
+///   length that doesn't tile). The caller substitutes its own path.
+/// - `Err` — `validate` rejected the request (a FIXED shape/dtype property is wrong —
+///   a caller bug), or `build` failed.
+/// - `Ok(Some(out))` — the kernel ran, yielding the lazy output [`Tensor`].
+///
+/// `validate` and `build` receive the resolved [`AmdArch`] for arch-specific
+/// constraints / configs; `applies` is a precomputed predicate (kept out of
+/// `validate` because failing it is a fallback trigger, not an error). Shared by
+/// [`crate::matmul`] and [`crate::flash_attention_with`].
+pub fn launch_custom(
+    device: &DeviceSpec,
+    archs: &[AmdArch],
+    validate: impl FnOnce(AmdArch) -> Result<()>,
+    applies: bool,
+    build: impl FnOnce(AmdArch) -> Result<Tensor>,
+) -> Result<Option<Tensor>> {
+    // "Can this device run the kernel at all?" — wrong arch / missing toolchain is
+    // environmental, so `None` (the caller's fallback), never an error.
+    let Some(arch) = crate::target::resolve_supported_arch(device, archs).ok() else {
+        return Ok(None);
+    };
+    // "Is the request structurally valid?" — a fixed-property violation is a caller bug.
+    validate(arch)?;
+    // "Does this runtime instance fit?" — if not, a fallback trigger, not an error.
+    if !applies {
+        return Ok(None);
+    }
+    build(arch).map(Some)
 }
 
 /// Realize `ins`, allocate/realize `outs`, build a hand-written kernel against

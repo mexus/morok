@@ -1,21 +1,41 @@
-//! `svod-tk` — a ThunderKittens-style tile DSL for authoring hand-tuned GPU
-//! kernels (matmul, flash-attention) as raw UOp graphs.
+//! `svod-tk` — a ThunderKittens-style tile DSL for AMD GPUs. It serves two
+//! audiences, and the public API below is grouped to match.
 //!
-//! This is a thin eager builder, not a backend: tiles wrap UOp buffers and emit
-//! the same lowered-kernel IR (`Range` + `index().store(..).end(..)`) that the
-//! normal renderer consumes. It is a port of tinygrad's `extra/thunder/tiny/tk`.
+//! **1. Use the built-in kernels** through the [`Tensor`](svod_tensor::Tensor)
+//! interface. [`matmul`] and [`flash_attention`] / [`flash_attention_with`] take
+//! and return *lazy* tensors (`custom_kernel` / `Op::Call` graph nodes), so they
+//! compose into a model graph and realize through the normal `prepare()` path like
+//! any other op — no kernel knowledge required:
 //!
-//! Kernels execute through the *direct* program-pipeline path ([`launch`] /
-//! [`run_kernel`]) — build a SINK, compile it, and dispatch against concrete
-//! buffers — mirroring tinygrad's `sink.call(bufs)` + `run_linear`, bypassing the
-//! tensor scheduler entirely.
+//! ```no_run
+//! use svod_tensor::Tensor;
+//! let a = Tensor::randn(&[256, 256]).unwrap();
+//! let b = Tensor::randn(&[256, 256]).unwrap();
+//! if let Some(mut c) = svod_tk::matmul(&a, &b).unwrap() { // `None` if the device can't run it
+//!     c.prepare().unwrap();
+//! }
+//! ```
 //!
-//! # Supported configuration (the only validated target)
-//! - GPU: **gfx942** (AMD MI300, CDNA3)
-//! - Wave width: **64** ([`WARP_THREADS`])
-//! - WMMA: **bf16 inputs, f32 accumulation, K=16** → `mfma.f32.16x16x16bf16.1k`
+//! **2. Author and debug your own kernel** with the tile DSL: build a [`Kernel`]
+//! out of [`Group`] tile ops, [`Loop`]s, and register/shared [tiles](tile), then
+//! either wrap its SINK as a lazy graph node ([`graph_launch`], production wiring)
+//! or dispatch it directly against concrete buffers for isolation/debug
+//! ([`run_kernel`] / [`compile_kernel`] / [`CompiledLaunch`]). The built-in
+//! [`matmul`](kernels::matmul) is the worked reference kernel.
 //!
-//! Other arches / dtypes / K values are intentionally out of scope.
+//! It is a thin eager builder, not a backend: tiles wrap UOp buffers and emit the
+//! same lowered-kernel IR (`Range` + `index().store(..).end(..)`) the normal
+//! renderer consumes. Port of tinygrad's `extra/thunder/tiny/tk`.
+//!
+//! # Supported targets
+//! - **gfx942** (CDNA3, AMD MI300) — wave64, MFMA.
+//! - **gfx1151** (RDNA3.5, Strix Halo) — wave32, WMMA.
+//!
+//! Inputs are bf16/f16, accumulation is f32, the WMMA/MFMA K-edge is 16; the
+//! per-arch fragment shapes resolve through [`ArchCaps`]. The layout-table
+//! calibration is pinned to gfx942 wave64 ([`WARP_THREADS`]); the live lane count
+//! flows through [`ArchCaps::wave_size`](arch::ArchCaps::wave_size). On any other
+//! target [`flash_attention`] transparently falls back to the tensor scheduler.
 
 pub mod arch;
 pub mod asm;
@@ -44,16 +64,16 @@ pub mod tiles;
 pub const WARP_THREADS: usize = 64;
 const _: () = assert!(WARP_THREADS == svod_dtype::AmdArch::Gfx942.wave_size() as usize);
 
-pub use arch::ArchCaps;
-pub use fingerprint::{KernelFingerprint, kernel_fingerprint};
-pub use group::{Group, LoadInto, MoveIdx, StoreInto, SwapDir};
-pub use kernel::Kernel;
+// ── Use the built-in kernels (Tensor in → Tensor out) ───────────────────────
 pub use kernels::fa::{FaOpts, flash_attention, flash_attention_with};
 pub use kernels::matmul::matmul;
-pub use launch::{
-    CompiledLaunch, Error as LaunchError, Result as LaunchResult, compile, compile_kernel, graph_launch, launch,
-    run_kernel,
-};
+pub use launch::{Error as LaunchError, Result as LaunchResult};
+
+// ── Author your own kernel (the tile DSL) ───────────────────────────────────
+pub use arch::ArchCaps;
+pub use group::{Group, LoadInto, MoveIdx, StoreInto, SwapDir};
+pub use kernel::Kernel;
+pub use launch::{graph_launch, launch_custom}; // wrap a hand kernel as a lazy Tensor graph node / kernel entry
 pub use loop_scope::Loop;
 pub use scaffold::GlSpec;
 pub use swizzle::Swizzle;
@@ -62,6 +82,10 @@ pub use tiles::{
     BaseShape, RT_16X16, RT_16X32, RT_32X16, RT_32X32, RTBaseShape, ST_16X16, ST_16X16_SWIZZLED, ST_16X32, ST_32X16,
     ST_32X32, STBaseShape, TileLayout, VecLayout,
 };
+
+// ── Debug your kernel (direct dispatch against concrete buffers) ─────────────
+pub use fingerprint::{KernelFingerprint, kernel_fingerprint};
+pub use launch::{CompiledLaunch, compile, compile_kernel, launch, run_kernel};
 
 #[cfg(test)]
 mod test;

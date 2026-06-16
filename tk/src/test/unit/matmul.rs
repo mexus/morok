@@ -211,7 +211,7 @@ fn test_simple_matmul_amd() {
 
 fn run_matmul_check(n: usize) {
     let (a, b) = matmul_inputs(n);
-    let got = launch_matmul("simple_matmul", n, M1_CFG, |ker| build_matmul(ker, n), &a, &b);
+    let got = launch_matmul("simple_matmul", n, M1_CFG, |ker| build_matmul_cfg(ker, n, M1_CFG), &a, &b);
     let expected = matmul_reference(&a, &b);
     let max_abs = max_abs_err(&got, &expected);
     println!("matmul N={n}: max abs error = {max_abs:e}");
@@ -370,7 +370,7 @@ fn test_matmul_graph_amd() {
         let cfg = cfg_for_n(n);
         let direct = launch_matmul("matmul_direct", n, cfg, |ker| build_matmul_cfg(ker, n, cfg), &a, &b);
 
-        let mut g = crate::kernels::matmul::matmul(&a, &b).expect("graph matmul");
+        let mut g = crate::kernels::matmul::matmul(&a, &b).expect("graph matmul").expect("matmul kernel applies");
         g.realize().expect("realize graph matmul");
         let graph = g.as_vec::<f32>().expect("read graph matmul");
 
@@ -392,7 +392,7 @@ fn test_matmul_adaptive_amd() {
     for n in [256usize, 512, 768, 1024, 2048] {
         let (a, b) = matmul_inputs(n);
         let cfg = cfg_for_n(n);
-        let got = launch_matmul("matmul_adaptive", n, cfg, |ker| build_matmul_adaptive(ker, n), &a, &b);
+        let got = launch_matmul("matmul_adaptive", n, cfg, |ker| build_matmul_cfg(ker, n, cfg), &a, &b);
         let expected = matmul_reference(&a, &b);
         let max_abs = max_abs_err(&got, &expected);
         println!("adaptive N={n} (block={}): max abs error = {max_abs:e}", cfg.block);

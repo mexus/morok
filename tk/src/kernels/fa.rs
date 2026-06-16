@@ -10,7 +10,7 @@
 use std::sync::Arc;
 
 use smallvec::smallvec;
-use snafu::ResultExt;
+use snafu::ensure;
 use svod_dtype::DType;
 use svod_ir::{ConstValue, UOp};
 use svod_tensor::Tensor;
@@ -53,8 +53,8 @@ fn iconst(v: i64) -> Arc<UOp> {
 /// fragment shapes (`_W32_*`), the accumulator→input relayout (an LDS round-trip on
 /// RDNA, a register copy on CDNA), and the even/odd-aware mask geometry; the launch
 /// block tracks the real wave width. The launcher gates against this list, the
-/// generic launch infra stays arch-agnostic. (gfx1151 is pending hardware
-/// validation — a wrong fragment map shows as a permuted/garbage output.)
+/// generic launch infra stays arch-agnostic. Both are HW-validated (gfx1151 on
+/// Strix Halo / wave32).
 pub const FA_SUPPORTED_ARCHS: &[svod_dtype::AmdArch] = &[svod_dtype::AmdArch::Gfx942, svod_dtype::AmdArch::Gfx1151];
 
 /// The **direct-launch** FA wrappers ([`flash_attention_forward`], `_mw`, `_mw_db`,
@@ -561,111 +561,130 @@ impl Default for FaOpts<'_> {
     }
 }
 
-/// **Unified** graph-native flash-attention forward with a scheduler fallback.
+/// **Graph-native** flash-attention forward — runs the hand kernel, or reports
+/// that it doesn't apply. **No silent fallback:** the caller owns that policy.
 ///
-/// Q is `[B,N,H,D]`, K/V are `[B,N,H_KV,D]`. When the device + shapes are eligible
-/// for the hand-built gfx942 kernel — target in [`FA_SUPPORTED_ARCHS`], dtype ∈
-/// {bf16, f16}, `D % 16 == 0`, `N % (q_blk·NUM_WARPS) == 0`, and `H % H_KV == 0`
-/// (GQA) — this builds the rolled double-buffered kernel ([`build_fa_mw_rdb`]) via
-/// [`crate::graph_launch`], honoring `opts.causal` and the optional `opts.key_lens`
-/// **key-only** padding mask (a 5th `[B]` `i32` global bound after `o,q,k,v`).
+/// Q is `[B,N,H,D]`, K/V are `[B,N,H_KV,D]`. The outcome is three-way, splitting
+/// "this device/length can't use the kernel" (`None`, a fallback trigger) from
+/// "this request is malformed" (`Err`, a caller bug):
 ///
-/// Otherwise (wrong arch / unsupported dtype / non-tiling shape — including
-/// gfx1151 and CPU) it FALLS BACK to [`Tensor::scaled_dot_product_attention`] so
-/// the call is correct on every backend: permute `[B,N,H,D] → [B,H,N,D]`, cast to
-/// f32, run SDPA with `is_causal = opts.causal` plus (when `key_lens` is set) a
-/// `[B,1,1,N]` boolean key mask (`true = masked` where `arange(N) >= key_lens`,
-/// matching the kernel's `kv_pos >= lens[batch]`), then permute back and cast to
-/// the original dtype. Both paths use key-only masking, so they AGREE on all rows.
-pub fn flash_attention_with(q: &Tensor, k: &Tensor, v: &Tensor, opts: FaOpts) -> crate::LaunchResult<Tensor> {
+/// - `Ok(Some(out))` — ran: a lazy output [`Tensor`] (`custom_kernel` / `Op::Call`
+///   node) from the rolled double-buffered kernel ([`build_fa_mw_rdb`]) via
+///   [`crate::graph_launch`], honoring `opts.causal` and the optional
+///   `opts.key_lens` **key-only** mask (a 5th `[B]` `i32` global after `o,q,k,v`).
+/// - `Ok(None)` — *doesn't apply here:* the device isn't a supported arch
+///   ([`FA_SUPPORTED_ARCHS`] — gfx942 / gfx1151 with the AMD toolchain), **or** the
+///   runtime sequence length doesn't tile (`N % (q_blk·NUM_WARPS) != 0`). The caller
+///   substitutes its own attention (e.g. [`Tensor::scaled_dot_product_attention`]).
+/// - `Err` — *malformed request* on a supported device: a FIXED property is wrong —
+///   operand dtype ∉ {bf16, f16}, `D % 16 != 0`, or `H % H_KV != 0` (GQA). These are
+///   caller bugs, raised loudly instead of silently routed to the slow path. (A
+///   genuine kernel build/dispatch failure also returns `Err`.)
+///
+/// ```no_run
+/// use svod_tensor::Tensor;
+/// use svod_dtype::DType;
+/// use svod_tk::FaOpts;
+/// let q = Tensor::randn(&[1, 128, 16, 64]).unwrap().cast(DType::BFloat16).unwrap();
+/// let (k, v) = (q.clone(), q.clone());
+/// // `None` ⇒ the kernel doesn't apply here; the caller picks the fallback.
+/// if let Some(mut o) = svod_tk::flash_attention_with(&q, &k, &v, FaOpts { causal: false, key_lens: None }).unwrap() {
+///     o.prepare().unwrap();
+/// }
+/// ```
+pub fn flash_attention_with(q: &Tensor, k: &Tensor, v: &Tensor, opts: FaOpts) -> crate::LaunchResult<Option<Tensor>> {
     let qs = q.shape().expect("q shape");
     let ks = k.shape().expect("k shape");
     let dim = |s: &svod_ir::shape::Shape, i: usize| s[i].as_const().expect("concrete dim");
     let (b, n, h, d) = (dim(&qs, 0), dim(&qs, 1), dim(&qs, 2), dim(&qs, 3));
     let h_kv = dim(&ks, 2);
-    let (q_blk, _kv_blk) = adaptive_fa_tile(b, n, h);
+    let (q_blk, kv_blk) = adaptive_fa_tile(b, n, h);
     let dtype = q.uop().dtype();
-
-    // Single arch resolution: `Some(arch)` iff the device is a supported arch with
-    // the AMD toolchain present (one topology probe, no second resolve for caps).
-    let arch = crate::target::resolve_supported_arch(&q.device(), FA_SUPPORTED_ARCHS).ok();
     let dtype_ok = dtype == DType::BFloat16 || dtype == DType::Float16;
-    let shape_ok = d % BLK == 0 && n % (q_blk * NUM_WARPS) == 0 && h % h_kv == 0;
+    let err_dtype = dtype.clone();
 
-    if let (Some(arch), true) = (arch, dtype_ok && shape_ok) {
-        // Caps from the resolved arch so the launch block (`warps * wave_size`) and
-        // the kernel's wave math track the real wave width instead of a hardcoded 64.
-        let caps = crate::ArchCaps::for_arch(arch);
-        let (q_blk, kv_blk) = adaptive_fa_tile(b, n, h);
-        let grid = [h as i64, (n / q_blk / NUM_WARPS) as i64, b as i64];
-        let out = Tensor::empty(&[b, n, h, d], dtype.clone());
-        let masked = opts.key_lens.is_some();
-        let causal = opts.causal;
-        let build_dtype = dtype.clone();
-        // ABI/global order is o, q, k, v, (lens) — `out` is global[0], `ins` map to
-        // global[1..] in order, so `key_lens` (the 5th global) goes last.
-        let mut ins: Vec<&Tensor> = vec![q, k, v];
-        if let Some(lens) = opts.key_lens {
-            ins.push(lens);
-        }
-        let block = (NUM_WARPS * caps.wave_size) as i64;
-        return crate::graph_launch("flash_attention", grid, block, out, &ins, caps, move |ker| {
-            build_fa_mw_rdb(
-                ker,
-                b,
-                n,
-                h,
-                h_kv,
-                d,
-                FaConfig { q_blk, kv_blk, causal, ..Default::default() },
-                build_dtype.clone(),
-                masked,
+    crate::launch_custom(
+        &q.device(),
+        FA_SUPPORTED_ARCHS,
+        // Structural validity (`Err`) — operand dtype, head dim, and GQA divisibility
+        // are FIXED model properties; a violation on a supported device is a caller bug.
+        move |_arch| {
+            ensure!(
+                dtype_ok,
+                crate::launch::DtypeSnafu { kernel: "flash-attention", got: err_dtype, expected: "bf16 or f16" }
             );
-            ker.finish(1)
-        });
-    }
-
-    // Fallback: scheduler SDPA in the inputs' NATIVE dtype (f16/bf16), mirroring the
-    // kernel's key-only masking — matching what the model's native attention runs, so
-    // the QKᵀ/PV use the fast WMMA path (a prior f32 cast forced slow `v_mfma_f32` +
-    // extra copies). Each fallible step `?`s through `.context(FallbackSnafu)` (which
-    // boxes the large `svod_tensor` error) so no closure ever carries the un-boxed error.
-    let fb = crate::launch::FallbackSnafu;
-    let perm = |t: &Tensor| -> crate::LaunchResult<Tensor> { t.try_permute(&[0, 2, 1, 3]).context(fb) };
-    let (qp, kp, vp) = (perm(q)?, perm(k)?, perm(v)?);
-    // [B,1,1,N] bool key mask: true (masked) where arange(N) >= key_lens[batch],
-    // matching the kernel's `kv_pos >= lens[batch]`.
-    let mask = match opts.key_lens {
-        Some(lens) => {
-            let range = Tensor::arange(n as i64, None, None).context(fb)?;
-            let range = range.try_reshape([1usize, 1, 1, n]).context(fb)?;
-            let lens = lens.cast(DType::Int32).context(fb)?;
-            let lens = lens.try_reshape([b, 1, 1, 1]).context(fb)?;
-            Some(range.try_ge(&lens).context(fb)?)
-        }
-        None => None,
-    };
-    let out_bhnd = qp
-        .scaled_dot_product_attention()
-        .key(&kp)
-        .value(&vp)
-        .is_causal(opts.causal)
-        .maybe_attn_mask(mask.as_ref())
-        .call()
-        .context(fb)?;
-    out_bhnd.try_permute(&[0, 2, 1, 3]).context(fb)?.cast(dtype).context(fb)
+            ensure!(
+                d % BLK == 0,
+                crate::launch::DimMultipleSnafu {
+                    kernel: "flash-attention",
+                    dim: "head dim D",
+                    value: d,
+                    multiple: BLK
+                }
+            );
+            ensure!(
+                h % h_kv == 0,
+                crate::launch::DimDivisibleSnafu {
+                    kernel: "flash-attention",
+                    dim: "H",
+                    value: h,
+                    divisor: "H_kv",
+                    divisor_value: h_kv,
+                }
+            );
+            Ok(())
+        },
+        // Runtime tiling (`None`) — `N` is the (audio) sequence length and may
+        // legitimately not tile, so the caller falls back per-clip instead of padding.
+        n % (q_blk * NUM_WARPS) == 0,
+        // Build for the resolved arch — caps track the real wave width.
+        move |arch| {
+            let caps = crate::ArchCaps::for_arch(arch);
+            let grid = [h as i64, (n / q_blk / NUM_WARPS) as i64, b as i64];
+            let out = Tensor::empty(&[b, n, h, d], dtype.clone());
+            let masked = opts.key_lens.is_some();
+            let causal = opts.causal;
+            let build_dtype = dtype.clone();
+            // ABI/global order is o, q, k, v, (lens) — `out` is global[0], inputs map to
+            // global[1..] in order, so `key_lens` (the 5th global) goes last.
+            let mut ins: Vec<&Tensor> = vec![q, k, v];
+            if let Some(lens) = opts.key_lens {
+                ins.push(lens);
+            }
+            let block = (NUM_WARPS * caps.wave_size) as i64;
+            crate::graph_launch("flash_attention", grid, block, out, &ins, caps, move |ker| {
+                build_fa_mw_rdb(
+                    ker,
+                    b,
+                    n,
+                    h,
+                    h_kv,
+                    d,
+                    FaConfig { q_blk, kv_blk, causal, ..Default::default() },
+                    build_dtype.clone(),
+                    masked,
+                );
+                ker.finish(1)
+            })
+        },
+    )
 }
 
-/// **Graph-native** causal flash-attention forward: returns a lazy output
-/// [`Tensor`] (a `custom_kernel` / `Op::Call` graph node) instead of writing in
-/// place, so it composes into a model's UOp graph and benchmarks through the
-/// normal `prepare()` → `execute_profiled` path like any other op. Same kernel as
-/// [`flash_attention_forward_mw_rdb`] (rolled double-buffer, [`adaptive_fa_tile`]),
-/// just launched via [`crate::graph_launch`] rather than direct dispatch.
+/// **Graph-native** causal flash-attention forward — thin wrapper over
+/// [`flash_attention_with`] with [`FaOpts::default`] (causal, unmasked). Returns
+/// `Ok(Some(out))` (a lazy `custom_kernel` / `Op::Call` [`Tensor`]) when the kernel
+/// applies, `Ok(None)` otherwise; see [`flash_attention_with`] for the eligibility
+/// rules and the no-silent-fallback contract.
 ///
-/// Thin wrapper over [`flash_attention_with`] with [`FaOpts::default`] (causal,
-/// unmasked) — unchanged behavior. On a non-gfx942 / unsupported-shape device this
-/// transparently falls back to the scheduler SDPA path.
-pub fn flash_attention(q: &Tensor, k: &Tensor, v: &Tensor) -> crate::LaunchResult<Tensor> {
+/// ```no_run
+/// use svod_tensor::Tensor;
+/// use svod_dtype::DType;
+/// let q = Tensor::randn(&[1, 128, 16, 64]).unwrap().cast(DType::BFloat16).unwrap();
+/// let (k, v) = (q.clone(), q.clone());
+/// if let Some(mut o) = svod_tk::flash_attention(&q, &k, &v).unwrap() {
+///     o.prepare().unwrap();
+/// }
+/// ```
+pub fn flash_attention(q: &Tensor, k: &Tensor, v: &Tensor) -> crate::LaunchResult<Option<Tensor>> {
     flash_attention_with(q, k, v, FaOpts::default())
 }
