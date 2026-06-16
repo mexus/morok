@@ -146,7 +146,7 @@ pub struct ChunkResult {
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum HeadDecoder {
     Ctc { jit: GigaAmCtcJit, decoder: CtcDecoder },
-    Rnnt { backend: RnntBlockBackend, decoder: RnntDecoder, sentencepiece: bool },
+    Rnnt { backend: RnntBlockBackend, decoder: RnntDecoder },
 }
 
 /// CTC equivalent of [`RnntDecoder::frames_to_words`].
@@ -187,10 +187,62 @@ pub(crate) fn ctc_frames_to_words(text: &str, frames: &[usize], frame_shift: f32
     words
 }
 
+/// Crop decoded words back to a chunk's core and drop the rest.
+///
+/// Decoded word times are relative to the **decode window** start; the core
+/// begins `core_offset_sec` into the window and spans `core_duration` seconds.
+/// A word is kept iff its midpoint falls inside the core — so a word produced
+/// in the pad/pre-roll context (or duplicated in two adjacent decode windows)
+/// survives in at most one chunk. Survivors are re-based to core-relative time
+/// (`0 == core start`) so the chunk's own `start_sec` offsets them correctly.
+pub(crate) fn crop_words_to_core(words: Vec<Word>, core_offset_sec: f32, core_duration: f32) -> Vec<Word> {
+    words
+        .into_iter()
+        .filter_map(|mut w| {
+            let rel_start = w.start - core_offset_sec;
+            let rel_end = w.end - core_offset_sec;
+            let mid = 0.5 * (rel_start + rel_end);
+            if !(0.0..core_duration).contains(&mid) {
+                return None;
+            }
+            w.start = rel_start.clamp(0.0, core_duration);
+            w.end = rel_end.clamp(w.start, core_duration);
+            Some(w)
+        })
+        .collect()
+}
+
+/// Join word texts with single spaces (empties dropped). Reconstructs a
+/// chunk's transcript from its (possibly cropped) words; equivalent to the
+/// raw head decode when no word is cropped.
+pub(crate) fn words_to_text(words: &[Word]) -> String {
+    words.iter().map(|w| w.text.as_str()).filter(|s| !s.is_empty()).collect::<Vec<_>>().join(" ")
+}
+
 fn rnnt_decode_err<E: std::error::Error + 'static>(
     e: svod_arch::rnnt::RnntDecodeError<crate::jit::JitError>,
 ) -> TranscribeError<E> {
     TranscribeError::RnntDecode { source: Box::new(e) }
+}
+
+/// Per-chunk decode geometry. The encoder runs over the **decode window**
+/// `[decode_start, decode_end)`; decoded word times are relative to it. The
+/// text-owning **core** starts `core_offset_sec` into the window, spans
+/// `end_sec - start_sec` seconds, and offsets the chunk's output by `start_sec`.
+#[derive(Clone, Copy)]
+struct ChunkMeta {
+    decode_start: usize,
+    decode_end: usize,
+    mel_len: usize,
+    start_sec: f32,
+    end_sec: f32,
+    core_offset_sec: f32,
+}
+
+impl ChunkMeta {
+    fn core_duration(&self) -> f32 {
+        self.end_sec - self.start_sec
+    }
 }
 
 // ─── Errors ───────────────────────────────────────────────────────────────
@@ -344,7 +396,7 @@ impl<S: Splitter> Transcriber<S> {
                     runtime.vocabulary.clone(),
                     RnntOpts { max_symbols_per_step: runtime.max_symbols_per_step },
                 );
-                HeadDecoder::Rnnt { backend, decoder, sentencepiece: runtime.sentencepiece }
+                HeadDecoder::Rnnt { backend, decoder }
             }
         };
 
@@ -419,14 +471,16 @@ impl<S: Splitter> Transcriber<S> {
         // worst case — oversized chunks must error here, not inside the JIT.
         let max_samples = self.prepared_bounds(sample_rate)?.max_samples();
         for (idx, chunk) in chunks.iter().enumerate() {
-            if chunk.end_sample > waveform.len() {
+            // The decode window is what's sliced + fed to the encoder, so it —
+            // not the core — must fit the waveform and the JIT capacity.
+            if chunk.decode_end_sample > waveform.len() {
                 return Err(TranscribeError::ChunkOutOfRange {
                     idx,
-                    end_sample: chunk.end_sample,
+                    end_sample: chunk.decode_end_sample,
                     waveform_len: waveform.len(),
                 });
             }
-            let samples = chunk.end_sample.saturating_sub(chunk.start_sample);
+            let samples = chunk.decode_end_sample.saturating_sub(chunk.decode_start_sample);
             if samples > max_samples {
                 return Err(TranscribeError::ChunkExceedsCapacity { idx, samples, max_samples });
             }
@@ -451,17 +505,24 @@ impl<S: Splitter> Transcriber<S> {
         // rows are strided by this constant max, not the per-batch active max.
         let max_t_sub = subs_output_length(subs_kernel_size, max_t_mel);
 
-        // (start_sample, end_sample, mel_len, start_sec, end_sec) per chunk.
-        let chunks_meta: Vec<(usize, usize, usize, f32, f32)> = chunks
+        // Decode geometry per chunk. Mel is computed over the decode window;
+        // start_sec/end_sec (and the crop) reference the text-owning core.
+        let chunks_meta: Vec<ChunkMeta> = chunks
             .iter()
             .filter_map(|c| {
-                let mel_len = self.mel.num_frames(c.end_sample.saturating_sub(c.start_sample));
+                let mel_len = self.mel.num_frames(c.decode_end_sample.saturating_sub(c.decode_start_sample));
                 if mel_len == 0 {
                     return None;
                 }
-                let start_sec = c.start_sample as f32 / sample_rate_hz as f32;
-                let end_sec = c.end_sample as f32 / sample_rate_hz as f32;
-                Some((c.start_sample, c.end_sample, mel_len, start_sec, end_sec))
+                Some(ChunkMeta {
+                    decode_start: c.decode_start_sample,
+                    decode_end: c.decode_end_sample,
+                    mel_len,
+                    start_sec: c.start_sample as f32 / sample_rate_hz as f32,
+                    end_sec: c.end_sample as f32 / sample_rate_hz as f32,
+                    core_offset_sec: c.start_sample.saturating_sub(c.decode_start_sample) as f32
+                        / sample_rate_hz as f32,
+                })
             })
             .collect();
         if chunks_meta.is_empty() {
@@ -485,7 +546,7 @@ impl<S: Splitter> Transcriber<S> {
         let mut profile = self.opts.profile.then(RunProfile::default);
         for chunk_batch_start in (0..num_chunks).step_by(max_batch) {
             let b = (num_chunks - chunk_batch_start).min(max_batch);
-            let chunk_lengths: Vec<usize> = (0..b).map(|bi| chunks_meta[chunk_batch_start + bi].2).collect();
+            let chunk_lengths: Vec<usize> = (0..b).map(|bi| chunks_meta[chunk_batch_start + bi].mel_len).collect();
 
             let t_stage = Instant::now();
             // Chunks are independent and `forward_into` is `&self` over shared
@@ -495,11 +556,11 @@ impl<S: Splitter> Transcriber<S> {
             let batch_mels: Vec<Vec<f32>> = (0..b)
                 .into_par_iter()
                 .map(|bi| {
-                    let &(start_sample, end_sample, valid, _, _) = &chunks_meta[chunk_batch_start + bi];
-                    let mut chunk_mel = ndarray::Array3::<f32>::zeros((1, n_mels, valid));
+                    let m = &chunks_meta[chunk_batch_start + bi];
+                    let mut chunk_mel = ndarray::Array3::<f32>::zeros((1, n_mels, m.mel_len));
                     {
                         let mut view = chunk_mel.view_mut().into_dyn();
-                        self.mel.forward_into(&waveform[start_sample..end_sample], &mut view);
+                        self.mel.forward_into(&waveform[m.decode_start..m.decode_end], &mut view);
                     }
                     chunk_mel.as_slice().expect("contiguous chunk mel").to_vec()
                 })
@@ -536,28 +597,33 @@ impl<S: Splitter> Transcriber<S> {
                     let flat = logits.as_slice().expect("contiguous logits");
                     for (bi, mel_len) in chunk_lengths.iter().enumerate() {
                         let actual_sub = subs_output_length(subs_kernel_size, *mel_len);
-                        let &(start_sample, end_sample, _, start_sec, end_sec) = &chunks_meta[chunk_batch_start + bi];
-                        let chunk_duration_sec = (end_sample - start_sample) as f32 / sample_rate_hz as f32;
-                        let frame_shift = chunk_duration_sec / (actual_sub.max(1) as f32);
+                        let m = chunks_meta[chunk_batch_start + bi];
+                        // Frames span the DECODE window; frame_shift maps a frame
+                        // index to decode-window-relative seconds.
+                        let decode_dur = (m.decode_end - m.decode_start) as f32 / sample_rate_hz as f32;
+                        let frame_shift = decode_dur / (actual_sub.max(1) as f32);
 
                         let item_slice = &flat[bi * item_stride..bi * item_stride + item_stride];
 
+                        // Always timestamp: the words drive the core crop even
+                        // when the caller didn't ask for word output.
                         let t_dec = Instant::now();
-                        let (text, frames) = if want_words {
-                            let (text, frames) = decoder
-                                .decode_with_timestamps(item_slice, max_t_sub, actual_sub)
-                                .context(CtcDecodeSnafu)?;
-                            (text, Some(frames))
-                        } else {
-                            let text = decoder.decode(item_slice, max_t_sub, actual_sub).context(CtcDecodeSnafu)?;
-                            (text, None)
-                        };
+                        let (text, frames) = decoder
+                            .decode_with_timestamps(item_slice, max_t_sub, actual_sub)
+                            .context(CtcDecodeSnafu)?;
                         t_decode += t_dec.elapsed();
-                        let words = want_words.then(|| {
-                            let frames = frames.as_deref().unwrap_or(&[]);
-                            ctc_frames_to_words(&text, frames, frame_shift)
+
+                        let cropped = crop_words_to_core(
+                            ctc_frames_to_words(&text, &frames, frame_shift),
+                            m.core_offset_sec,
+                            m.core_duration(),
+                        );
+                        chunk_results.push(ChunkResult {
+                            start_sec: m.start_sec,
+                            end_sec: m.end_sec,
+                            text: words_to_text(&cropped),
+                            words: want_words.then_some(cropped),
                         });
-                        chunk_results.push(ChunkResult { start_sec, end_sec, text, words });
                     }
                 }
                 HeadDecoder::Rnnt { .. } => {
@@ -612,7 +678,7 @@ impl<S: Splitter> Transcriber<S> {
 
         // RN-T: decode every chunk in lane waves as wide as the backend
         // (steps per wave = the wave's max frames, not the sum over batches).
-        if let HeadDecoder::Rnnt { backend, decoder, sentencepiece } = &mut self.head_decoder {
+        if let HeadDecoder::Rnnt { backend, decoder } = &mut self.head_decoder {
             let lanes = svod_arch::rnnt::BatchBlockStep::batch(backend);
             for wave_start in (0..all_frames.len()).step_by(lanes) {
                 let wave_end = (wave_start + lanes).min(all_frames.len());
@@ -623,15 +689,25 @@ impl<S: Splitter> Transcriber<S> {
                 let lane_results = decoder.decode_batch_blocks(valid, backend).map_err(rnnt_decode_err)?;
                 t_decode += t_dec.elapsed();
 
-                for (li, (raw, emissions)) in lane_results.into_iter().enumerate() {
-                    let &(start_sample, end_sample, _, start_sec, end_sec) = &chunks_meta[wave_start + li];
-                    let chunk_duration_sec = (end_sample - start_sample) as f32 / sample_rate_hz as f32;
-                    let frame_shift = chunk_duration_sec / (valid[li].max(1) as f32);
-                    let words = want_words.then(|| decoder.frames_to_words(&emissions, frame_shift));
-                    // SP pieces carry `▁` (U+2581) as word-initial markers;
-                    // after concatenation we restore them as spaces.
-                    let text = if *sentencepiece { raw.replace('\u{2581}', " ").trim().to_string() } else { raw };
-                    chunk_results.push(ChunkResult { start_sec, end_sec, text, words });
+                for (li, (_raw, emissions)) in lane_results.into_iter().enumerate() {
+                    let m = chunks_meta[wave_start + li];
+                    // Frames span the DECODE window; frame_shift maps to
+                    // decode-window-relative seconds before the core crop.
+                    let decode_dur = (m.decode_end - m.decode_start) as f32 / sample_rate_hz as f32;
+                    let frame_shift = decode_dur / (valid[li].max(1) as f32);
+                    // `frames_to_words` strips the SentencePiece `▁` markers, so
+                    // `words_to_text` rebuilds the (cropped) chunk transcript.
+                    let cropped = crop_words_to_core(
+                        decoder.frames_to_words(&emissions, frame_shift),
+                        m.core_offset_sec,
+                        m.core_duration(),
+                    );
+                    chunk_results.push(ChunkResult {
+                        start_sec: m.start_sec,
+                        end_sec: m.end_sec,
+                        text: words_to_text(&cropped),
+                        words: want_words.then_some(cropped),
+                    });
                 }
             }
         }

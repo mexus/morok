@@ -27,6 +27,7 @@ pub struct SileroVadSplitter {
     merge_gap_probs: usize,
     trough_search_probs: Option<usize>,
     pad_samples: usize,
+    preroll_secs: f32,
 }
 
 #[bon]
@@ -54,6 +55,12 @@ impl SileroVadSplitter {
         /// many extra samples of context on each side.
         #[builder(default = 1600)]
         pad_samples: usize,
+        /// Max pre-roll (seconds) pulled into a chunk's core from the preceding
+        /// silence, capped at half the gap. Moves the core-ownership boundary
+        /// left so VAD onset lag doesn't clip the first word after a pause.
+        /// Tune via `SVOD_VAD_PREROLL_SECS`.
+        #[builder(default = std::env::var("SVOD_VAD_PREROLL_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(0.5))]
+        preroll_secs: f32,
     ) -> Self {
         Self {
             vad,
@@ -66,6 +73,7 @@ impl SileroVadSplitter {
             merge_gap_probs,
             trough_search_probs,
             pad_samples,
+            preroll_secs,
         }
     }
 
@@ -100,6 +108,7 @@ impl Splitter for SileroVadSplitter {
             trough_search_probs: self.trough_search_probs,
             trough_threshold: Some(self.threshold * 0.5),
             pad_samples: self.pad_samples,
+            preroll_samples: (self.preroll_secs.max(0.0) * bounds.sample_rate as f32).round() as usize,
             align_to: bounds.align_to_samples().max(1),
             // `align_to` rounds chunk ends up to a stride multiple, which can
             // push the trailing chunk past the audio; the chunker clamps every

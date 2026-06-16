@@ -14,11 +14,19 @@
 //!
 //! ```text
 //! 1. threshold + smoothing  → speech runs (prob-grid indices)
-//! 2. split runs ≥ strict_limit at internal prob troughs
+//! 2. split runs ≥ strict_limit at internal prob troughs (balanced toward
+//!    geometric targets, preferring real silence via trough_threshold)
 //! 3. greedy-pack runs into chunks of ~[min_duration, max_duration]
 //!    (closing at inter-segment silence rather than mid-speech)
-//! 4. convert prob indices → samples, apply pad, align to align_to
+//! 4. prob indices → samples: the speech run is the text-owning core, with an
+//!    optional gap pre-roll into the preceding silence; the decode window is
+//!    the core padded for acoustic context and aligned to align_to
 //! ```
+//!
+//! Each [`AudioChunk`] carries a non-overlapping **core** (`start..end`) and a
+//! possibly-wider **decode window** (`decode_start..decode_end`). The core owns
+//! output text; words decoded in the pad/pre-roll region are cropped back to
+//! the core downstream, so extra context never duplicates text at a seam.
 //!
 //! All knobs live in [`ChunkerOpts`]; nothing inside the algorithm hardcodes
 //! sample rates, prob granularity, or alignment.
@@ -81,10 +89,18 @@ pub struct ChunkerOpts {
     /// `< t`; fall back to the narrow argmin around the target when no
     /// frame qualifies. `None` always uses narrow argmin.
     pub trough_threshold: Option<f32>,
-    /// Symmetric pad in samples added to each chunk's start/end (clamped at
-    /// 0 and the implicit waveform end). Gives the encoder context at chunk
-    /// boundaries.
+    /// Symmetric pad in samples added to each chunk's **decode window** start/
+    /// end (clamped at 0 and the implicit waveform end). Gives the encoder
+    /// acoustic context at chunk boundaries; words decoded in the pad are
+    /// cropped back to the core downstream so they never duplicate at a seam.
     pub pad_samples: usize,
+    /// Max pre-roll (in samples) pulled into a chunk's **core** from the
+    /// preceding silence gap. Capped at half the gap (cores stay disjoint) and
+    /// at the remaining `strict_limit` headroom (a pre-rolled core never
+    /// exceeds the hard cap or the decode-buffer bound). Moves the core-
+    /// ownership boundary left so a boundary word ahead of the VAD-detected
+    /// onset stays owned by this chunk instead of cropped away. `0` disables it.
+    pub preroll_samples: usize,
     /// Snap chunk boundaries to integer multiples of this many samples.
     /// `1` = sample-precise. Set to the encoder's effective frame stride
     /// (e.g. `mel_hop * subsample_factor`) so chunks land on encoder-frame
@@ -116,6 +132,7 @@ impl Default for ChunkerOpts {
             trough_search_probs: None,
             trough_threshold: None,
             pad_samples: 0,
+            preroll_samples: 0,
             align_to: 1,
             max_total_samples: None,
         }
@@ -124,20 +141,49 @@ impl Default for ChunkerOpts {
 
 // ─── Output ───────────────────────────────────────────────────────────────
 
-/// A speech-bearing region of the source waveform.
+/// A speech-bearing region plus the waveform window used to decode it.
 ///
-/// Sample indices reference the *original* waveform passed to the VAD.
-/// `start_sample` is `chunk_index * samples_per_prob` (after pad + align);
-/// callers can derive `start_sec = start_sample as f32 / sample_rate as f32`
-/// to offset per-chunk transcripts.
+/// `start_sample..end_sample` is the non-overlapping **core** that owns output
+/// text — derive `start_sec`/`end_sec` from it to offset per-chunk transcripts.
+/// `decode_start_sample..decode_end_sample` is the possibly-wider **decode
+/// window** fed to the encoder for acoustic context; decoded words whose
+/// midpoint falls outside the core are cropped downstream, so the extra
+/// context never duplicates text at a seam. Sample indices reference the
+/// *original* waveform; an end may exceed the waveform length (the final VAD
+/// window is zero-padded) — callers clamp at slice time.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AudioChunk {
-    /// Inclusive start sample index in the original waveform.
     pub start_sample: usize,
-    /// Exclusive end sample index. May exceed the waveform length if the
-    /// last prob entry covered samples past the waveform end; callers
-    /// should clamp at slice time.
     pub end_sample: usize,
+    pub decode_start_sample: usize,
+    pub decode_end_sample: usize,
+}
+
+impl AudioChunk {
+    /// Core-only chunk: the decode window equals the core (no extra context).
+    pub fn new(start_sample: usize, end_sample: usize) -> Self {
+        Self { start_sample, end_sample, decode_start_sample: start_sample, decode_end_sample: end_sample }
+    }
+
+    /// Chunk with an explicit decode window around the core.
+    pub fn with_decode(
+        start_sample: usize,
+        end_sample: usize,
+        decode_start_sample: usize,
+        decode_end_sample: usize,
+    ) -> Self {
+        Self { start_sample, end_sample, decode_start_sample, decode_end_sample }
+    }
+
+    /// Length of the text-owning core, in samples.
+    pub fn core_len(&self) -> usize {
+        self.end_sample.saturating_sub(self.start_sample)
+    }
+
+    /// Length of the decode window (model input), in samples.
+    pub fn decode_len(&self) -> usize {
+        self.decode_end_sample.saturating_sub(self.decode_start_sample)
+    }
 }
 
 // ─── Errors ───────────────────────────────────────────────────────────────
@@ -358,10 +404,14 @@ fn pack_segments(
     chunks
 }
 
-/// Convert prob-index ranges to sample ranges. Padding is adaptive: each
-/// side is capped at half the silence gap to the neighbour, so chunks
-/// never overlap their neighbours' speech. Alignment-induced overlap
-/// (floor-start / ceil-end rounding) is clipped to preserve splits.
+/// Convert prob-index core ranges to sample ranges and derive decode windows.
+/// The core `[start, end]` owns output text; the decode window is the core
+/// padded for acoustic context. Pre-roll pulls each post-silence core start
+/// back into the preceding gap (bounded by half the gap and the strict-limit
+/// headroom) so the first word after a pause isn't clipped. Pre-roll and pad
+/// are both capped at half the gap to the neighbour, so cores stay disjoint
+/// and adjacent decode windows overlap by at most `align_to - 1` samples
+/// (filtered downstream by the core-crop, never duplicating text).
 fn post_process(chunks: &[(usize, usize)], probs_len: usize, opts: &ChunkerOpts) -> Vec<AudioChunk> {
     // The prob grid overshoots the real audio (final window zero-padded). Clamp
     // to the true waveform length when the caller provided it.
@@ -369,51 +419,63 @@ fn post_process(chunks: &[(usize, usize)], probs_len: usize, opts: &ChunkerOpts)
     let max_sample = opts.max_total_samples.unwrap_or(grid).min(grid);
     let pad = opts.pad_samples;
     let align = opts.align_to;
+    let spp = opts.samples_per_prob;
+
+    // Hard cap on core length (incl. pre-roll): the strict-limit budget the
+    // chunker packed to, so pre-roll never pushes a core past the
+    // decode-buffer bound.
+    let probs_per_sec = opts.sample_rate as f32 / spp as f32;
+    let strict_limit_samples = (opts.strict_limit_duration * probs_per_sec).ceil() as usize * spp;
+
+    // Pre-rolled core start for chunk `i`. Core ends are never moved, so each
+    // adjusted start depends only on its own raw core and the previous core's
+    // (clamped) end — independent of other chunks' pre-roll.
+    let core_start_adj = |i: usize| -> usize {
+        let (s, e) = chunks[i];
+        let raw_start = s * spp;
+        let core_end = (e * spp).min(max_sample);
+        let gap_room = if i == 0 {
+            raw_start
+        } else {
+            let prev_core_end = (chunks[i - 1].1 * spp).min(max_sample);
+            raw_start.saturating_sub(prev_core_end) / 2
+        };
+        let headroom = strict_limit_samples.saturating_sub(core_end.saturating_sub(raw_start));
+        raw_start - opts.preroll_samples.min(gap_room).min(headroom)
+    };
 
     let mut out: Vec<AudioChunk> = Vec::with_capacity(chunks.len());
-    for (i, &(s, e)) in chunks.iter().enumerate() {
-        let raw_start = s * opts.samples_per_prob;
-        let raw_end = e * opts.samples_per_prob;
+    for (i, &(_s, e)) in chunks.iter().enumerate() {
+        let core_start = core_start_adj(i);
+        let core_end = (e * spp).min(max_sample);
+        if core_end <= core_start {
+            continue;
+        }
 
-        // Cap each side's padding at half the silence gap to the neighbour
-        // (or the full margin at the waveform edges). Floor division: total
-        // pad consumed by adjacent chunks ≤ gap, so they never overlap.
+        // Decode-window pad capped at half the gap to the neighbouring
+        // (pre-rolled) core — full margin at the waveform edges. Floor
+        // division keeps adjacent raw decode windows from crossing a core.
         let pad_left = if i == 0 {
-            pad.min(raw_start)
+            pad.min(core_start)
         } else {
-            let prev_raw_end = chunks[i - 1].1 * opts.samples_per_prob;
-            pad.min(raw_start.saturating_sub(prev_raw_end) / 2)
+            let prev_core_end = (chunks[i - 1].1 * spp).min(max_sample);
+            pad.min(core_start.saturating_sub(prev_core_end) / 2)
         };
         let pad_right = if i + 1 == chunks.len() {
-            pad.min(max_sample.saturating_sub(raw_end))
+            pad.min(max_sample.saturating_sub(core_end))
         } else {
-            let next_raw_start = chunks[i + 1].0 * opts.samples_per_prob;
-            pad.min(next_raw_start.saturating_sub(raw_end) / 2)
+            pad.min(core_start_adj(i + 1).saturating_sub(core_end) / 2)
         };
 
-        let padded_start = raw_start - pad_left;
-        let padded_end = (raw_end + pad_right).min(max_sample);
-        let aligned_start = (padded_start / align) * align;
-        let mut aligned_end = padded_end.div_ceil(align) * align;
-        if aligned_end > max_sample {
-            aligned_end = max_sample;
+        let decode_start = ((core_start - pad_left) / align) * align;
+        let mut decode_end = (core_end + pad_right).min(max_sample).div_ceil(align) * align;
+        if decode_end > max_sample {
+            decode_end = max_sample;
         }
-        if aligned_end <= aligned_start {
+        if decode_end <= decode_start {
             continue;
         }
-        if let Some(last) = out.last_mut()
-            && aligned_start < last.end_sample
-        {
-            // Alignment-only overlap (asymmetric floor/ceil rounding put us
-            // inside the previous chunk). Clip our start up to preserve the
-            // split. Drop if it collapses to empty.
-            let bumped_start = last.end_sample;
-            if aligned_end > bumped_start {
-                out.push(AudioChunk { start_sample: bumped_start, end_sample: aligned_end });
-            }
-            continue;
-        }
-        out.push(AudioChunk { start_sample: aligned_start, end_sample: aligned_end });
+        out.push(AudioChunk::with_decode(core_start, core_end, decode_start, decode_end));
     }
     out
 }

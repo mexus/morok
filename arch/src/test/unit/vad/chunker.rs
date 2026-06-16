@@ -19,6 +19,7 @@ fn fast_opts() -> ChunkerOpts {
         trough_search_probs: None,
         trough_threshold: None,
         pad_samples: 0,
+        preroll_samples: 0,
         align_to: 1,
         max_total_samples: None,
     }
@@ -36,12 +37,15 @@ fn cat(parts: &[Vec<f32>]) -> Vec<f32> {
     parts.iter().flatten().copied().collect()
 }
 
+// With `pad = 0` and `preroll = 0` the decode window equals the core, so
+// `AudioChunk::new(core_start, core_end)` is the expected emission.
+
 #[test]
 fn test_chunker_single_segment_under_max() {
     // 7 probs of speech (= 7s, < max=10) bracketed by 3-prob silences.
     let probs = cat(&[silence(3), speech(7), silence(3)]);
     let chunks = chunks_from_probs(&probs, &fast_opts()).unwrap();
-    assert_eq!(chunks, vec![AudioChunk { start_sample: 3, end_sample: 10 }]);
+    assert_eq!(chunks, vec![AudioChunk::new(3, 10)]);
 }
 
 #[test]
@@ -49,7 +53,7 @@ fn test_chunker_pack_two_segments_under_max() {
     // 4s + 4s with 2s silence gap = 10s total → fits one chunk (max=10).
     let probs = cat(&[speech(4), silence(2), speech(4)]);
     let chunks = chunks_from_probs(&probs, &fast_opts()).unwrap();
-    assert_eq!(chunks, vec![AudioChunk { start_sample: 0, end_sample: 10 }]);
+    assert_eq!(chunks, vec![AudioChunk::new(0, 10)]);
 }
 
 #[test]
@@ -60,10 +64,7 @@ fn test_chunker_close_at_inter_segment_silence() {
     //   Close → chunk[0]=[0,10], chunk[1]=[12,16]. Silence [10,12) dropped.
     let probs = cat(&[speech(4), silence(2), speech(4), silence(2), speech(4)]);
     let chunks = chunks_from_probs(&probs, &fast_opts()).unwrap();
-    assert_eq!(
-        chunks,
-        vec![AudioChunk { start_sample: 0, end_sample: 10 }, AudioChunk { start_sample: 12, end_sample: 16 }]
-    );
+    assert_eq!(chunks, vec![AudioChunk::new(0, 10), AudioChunk::new(12, 16)]);
 }
 
 #[test]
@@ -76,10 +77,7 @@ fn test_chunker_strict_limit_splits_long_run() {
     let mut probs = vec![1.0f32; 30];
     probs[14] = 0.4;
     let chunks = chunks_from_probs(&probs, &fast_opts()).unwrap();
-    assert_eq!(
-        chunks,
-        vec![AudioChunk { start_sample: 0, end_sample: 14 }, AudioChunk { start_sample: 14, end_sample: 30 }]
-    );
+    assert_eq!(chunks, vec![AudioChunk::new(0, 14), AudioChunk::new(14, 30)]);
 }
 
 #[test]
@@ -88,10 +86,7 @@ fn test_chunker_drops_silence_between_chunks() {
     // silence gap between them is gone from the output.
     let probs = cat(&[speech(4), silence(8), speech(4)]);
     let chunks = chunks_from_probs(&probs, &fast_opts()).unwrap();
-    assert_eq!(
-        chunks,
-        vec![AudioChunk { start_sample: 0, end_sample: 4 }, AudioChunk { start_sample: 12, end_sample: 16 }]
-    );
+    assert_eq!(chunks, vec![AudioChunk::new(0, 4), AudioChunk::new(12, 16)]);
 }
 
 #[test]
@@ -109,44 +104,78 @@ fn test_chunker_all_silence() {
 
 #[test]
 fn test_chunker_all_speech_no_breaks() {
-    // 50-prob unbroken speech, strict=15. Every chunk ≤ strict_limit; total
+    // 50-prob unbroken speech, strict=15. Every core ≤ strict_limit; total
     // coverage equals input length.
     let probs = vec![1.0f32; 50];
     let opts = fast_opts();
     let chunks = chunks_from_probs(&probs, &opts).unwrap();
     assert!(!chunks.is_empty());
     for c in &chunks {
-        assert!(c.end_sample - c.start_sample <= 15, "chunk {c:?} exceeds strict_limit");
+        assert!(c.core_len() <= 15, "chunk {c:?} exceeds strict_limit");
     }
     assert_eq!(chunks.first().unwrap().start_sample, 0);
     assert_eq!(chunks.last().unwrap().end_sample, 50);
 }
 
 #[test]
-fn test_chunker_pad_samples() {
+fn test_chunker_pad_extends_decode_window_not_core() {
+    // Run [10, 20], pad=5. The core stays the speech run; only the decode
+    // window grows by the pad (cropped back to the core downstream).
     let probs = cat(&[silence(10), speech(10), silence(10)]);
     let opts = ChunkerOpts { pad_samples: 5, ..fast_opts() };
     let chunks = chunks_from_probs(&probs, &opts).unwrap();
-    // Raw chunk would be (10, 20). With pad=5: (5, 25).
-    assert_eq!(chunks, vec![AudioChunk { start_sample: 5, end_sample: 25 }]);
+    assert_eq!(chunks, vec![AudioChunk::with_decode(10, 20, 5, 25)]);
 }
 
 #[test]
 fn test_chunker_pad_clamps_at_edges() {
-    // Speech right at the start; padding past 0 saturates.
+    // Speech at the start; the decode pad past 0 saturates and past the end
+    // clamps. Core is the unpadded speech run.
     let probs = cat(&[speech(8), silence(10)]);
     let opts = ChunkerOpts { pad_samples: 100, ..fast_opts() };
     let chunks = chunks_from_probs(&probs, &opts).unwrap();
     let max_sample = probs.len(); // samples_per_prob = 1
-    assert_eq!(chunks.len(), 1);
-    assert_eq!(chunks[0].start_sample, 0);
-    assert_eq!(chunks[0].end_sample, max_sample);
+    assert_eq!(chunks, vec![AudioChunk::with_decode(0, 8, 0, max_sample)]);
+}
+
+#[test]
+fn test_chunker_preroll_extends_core_into_gap() {
+    // 10s silence, 6s speech, 10s silence. preroll=4 pulls the core start back
+    // into the leading silence (room to spare under strict_limit), so a word
+    // ahead of the VAD onset stays owned by this chunk.
+    let probs = cat(&[silence(10), speech(6), silence(10)]);
+    let opts = ChunkerOpts { preroll_samples: 4, ..fast_opts() };
+    let chunks = chunks_from_probs(&probs, &opts).unwrap();
+    assert_eq!(chunks, vec![AudioChunk::new(6, 16)]);
+}
+
+#[test]
+fn test_chunker_preroll_capped_at_half_gap() {
+    // Two 6s runs split by a 4s gap (max=10 keeps them separate). The second
+    // core pre-rolls back by only half the gap (= 2s), never into the first —
+    // cores stay disjoint despite an over-large preroll budget.
+    let probs = cat(&[speech(6), silence(4), speech(6)]);
+    let opts = ChunkerOpts { preroll_samples: 10, ..fast_opts() };
+    let chunks = chunks_from_probs(&probs, &opts).unwrap();
+    assert_eq!(chunks, vec![AudioChunk::new(0, 6), AudioChunk::new(8, 16)]);
+}
+
+#[test]
+fn test_chunker_preroll_bounded_by_strict_limit_headroom() {
+    // 15s speech already fills strict_limit=15, so there's no headroom: preroll
+    // is suppressed even with 8s of leading silence available, keeping the core
+    // (and decode buffer) within the hard cap.
+    let probs = cat(&[silence(8), speech(15)]);
+    let opts = ChunkerOpts { preroll_samples: 8, ..fast_opts() };
+    let chunks = chunks_from_probs(&probs, &opts).unwrap();
+    assert_eq!(chunks, vec![AudioChunk::new(8, 23)]);
+    assert!(chunks[0].core_len() <= 15);
 }
 
 #[test]
 fn test_chunker_align_to_640() {
     // 10 probs, samples_per_prob=512, one speech segment at probs [3..7).
-    // Raw samples: (1536, 3584). With align_to=640:
+    // Core = raw samples (1536, 3584); the decode window is aligned to 640:
     //   start floor: 1536 / 640 = 2.4 → 2 * 640 = 1280.
     //   end ceil:    3584 / 640 = 5.6 → 6 * 640 = 3840.
     let probs = cat(&[silence(3), speech(4), silence(3)]);
@@ -163,27 +192,26 @@ fn test_chunker_align_to_640() {
         trough_search_probs: None,
         trough_threshold: None,
         pad_samples: 0,
+        preroll_samples: 0,
         align_to: 640,
         max_total_samples: None,
     };
     let chunks = chunks_from_probs(&probs, &opts).unwrap();
-    assert_eq!(chunks, vec![AudioChunk { start_sample: 1280, end_sample: 3840 }]);
+    assert_eq!(chunks, vec![AudioChunk::with_decode(1536, 3584, 1280, 3840)]);
     for c in &chunks {
-        assert_eq!(c.start_sample % 640, 0);
-        assert_eq!(c.end_sample % 640, 0);
+        assert_eq!(c.decode_start_sample % 640, 0);
+        assert_eq!(c.decode_end_sample % 640, 0);
     }
 }
 
 #[test]
-fn test_chunker_end_sample_can_exceed_waveform_len() {
+fn test_chunker_decode_end_can_exceed_waveform_len() {
     // `chunks_from_probs` sees only `probs`, not the raw `waveform`. When the
     // waveform's actual length isn't a multiple of `samples_per_prob`, the
     // last prob's window straddles the waveform end and the emitted chunk's
-    // `end_sample` reflects the full window — overshooting the waveform by
-    // up to `samples_per_prob - 1` samples. This is the contract documented
-    // at `AudioChunk::end_sample`: callers owning the waveform must clamp at
-    // slice time. Pinned here so the documented overshoot is exercised by a
-    // test, not just a comment.
+    // decode/core end reflects the full window — overshooting the waveform by
+    // up to `samples_per_prob - 1` samples (callers owning the waveform clamp
+    // at slice time, e.g. via `max_total_samples` or `trim_chunks_to_waveform`).
     let probs = vec![1.0_f32; 4]; // 4 windows × 512 = 2048 samples of coverage
     let waveform_len = 1800; // real waveform ended mid-window
     let opts = ChunkerOpts {
@@ -199,12 +227,39 @@ fn test_chunker_end_sample_can_exceed_waveform_len() {
         trough_search_probs: None,
         trough_threshold: None,
         pad_samples: 0,
+        preroll_samples: 0,
         align_to: 640, // GigaAM: hop_length * subsampling_factor
         max_total_samples: None,
     };
     let chunks = chunks_from_probs(&probs, &opts).unwrap();
-    assert_eq!(chunks, vec![AudioChunk { start_sample: 0, end_sample: 2048 }]);
+    assert_eq!(chunks, vec![AudioChunk::new(0, 2048)]);
     assert!(chunks[0].end_sample > waveform_len);
+}
+
+#[test]
+fn test_chunker_max_total_samples_clamps_core_and_decode() {
+    // `max_total_samples` clamps both the core end and the decode-window end to
+    // the true waveform length, even when the prob grid overshoots.
+    let probs = vec![1.0_f32; 4];
+    let opts = ChunkerOpts {
+        sample_rate: 16_000,
+        samples_per_prob: 512,
+        threshold: 0.5,
+        min_duration: 0.0,
+        max_duration: 1.0,
+        strict_limit_duration: 1.0,
+        min_speech_probs: 1,
+        min_silence_probs: 1,
+        merge_gap_probs: 1,
+        trough_search_probs: None,
+        trough_threshold: None,
+        pad_samples: 0,
+        preroll_samples: 0,
+        align_to: 1,
+        max_total_samples: Some(1800),
+    };
+    let chunks = chunks_from_probs(&probs, &opts).unwrap();
+    assert_eq!(chunks, vec![AudioChunk::new(0, 1800)]);
 }
 
 #[test]
@@ -254,17 +309,15 @@ fn test_chunker_validates_zero_align_to() {
 // These exercise the algorithm across a broad parameter sweep and check
 // invariants that hand-rolled unit tests can't easily cover:
 //
-// 1. Structural — sorted, non-overlapping, in-bounds, alignment-aligned, and
-//    deterministic across re-runs of the same input/opts.
-// 2. Strict-limit — with `pad=0, align=1`, every output chunk's sample length
-//    is bounded by `(strict_limit_probs + 2 * trough_radius) * samples_per_prob`.
-//    The `2 * radius` slack accounts for split_long_runs pieces that can
-//    exceed strict_limit by up to `radius` on each side; pack_segments's
-//    strict-limit guard caps any further growth.
-// 3. Coverage — with all smoothing knobs set to 1 (no smoothing) and
-//    `pad=0, align=1`, every above-threshold prob in the input falls inside
-//    some output chunk's sample range. Catches phantom-coverage regressions
-//    where speech regions are silently dropped.
+// 1. Structural — sorted, non-overlapping cores; decode windows that bracket
+//    their core, stay in bounds, are alignment-aligned, and overlap a
+//    neighbour by < 2·align_to (rounding slack the downstream crop filters);
+//    deterministic across re-runs.
+// 2. Strict-limit — with `pad=0, align=1`, every decode window's sample length
+//    is bounded by `strict_chunk_sample_bound` even with pre-roll on.
+// 3. Coverage — with all smoothing knobs at 1 (no smoothing) and
+//    `pad=0, preroll=0, align=1`, every above-threshold prob falls inside some
+//    output chunk's core.
 
 proptest! {
     #![proptest_config(ProptestConfig { cases: 200, ..ProptestConfig::default() })]
@@ -283,6 +336,7 @@ proptest! {
         merge_gap in 0usize..=8,
         align_to in prop::sample::select(vec![1usize, 64, 256, 512, 640, 1024, 2048]),
         pad_samples in 0usize..=2048,
+        preroll_samples in 0usize..=4096,
     ) {
         let max_dur = min_dur + max_extra;
         let strict_dur = max_dur + strict_extra;
@@ -297,39 +351,45 @@ proptest! {
             min_silence_probs: min_silence,
             merge_gap_probs: merge_gap,
             trough_search_probs: None,
-        trough_threshold: None,
+            trough_threshold: None,
             pad_samples,
+            preroll_samples,
             align_to,
             max_total_samples: None,
         };
         let chunks = chunks_from_probs(&probs, &opts).unwrap();
         let max_sample = probs.len() * samples_per_prob;
 
-        // Sorted + non-overlapping (touching allowed). Adaptive padding
-        // caps each chunk's pad at half the silence gap to the neighbour,
-        // so padding can never bump adjacent chunks into one another.
         for w in chunks.windows(2) {
+            // Cores are disjoint (pre-roll/pad capped at half the gap).
             prop_assert!(
                 w[0].end_sample <= w[1].start_sample,
-                "overlapping chunks: {:?} and {:?}", w[0], w[1]
+                "overlapping cores: {:?} and {:?}", w[0], w[1]
+            );
+            // Decode windows overlap by at most rounding slack on both sides.
+            let overlap = w[0].decode_end_sample.saturating_sub(w[1].decode_start_sample);
+            prop_assert!(
+                overlap < 2 * align_to,
+                "decode overlap {overlap} ≥ 2·align_to {}: {:?} and {:?}",
+                2 * align_to, w[0], w[1]
             );
         }
-        // Each chunk is non-empty and inside the input extent.
         for c in &chunks {
-            prop_assert!(c.start_sample < c.end_sample, "empty chunk: {c:?}");
-            prop_assert!(c.end_sample <= max_sample,
-                "chunk {c:?} exceeds max_sample {max_sample}");
-        }
-        // Alignment: start always aligned, end aligned OR clamped to max_sample
-        // (which is the only legitimate way an end can be non-aligned).
-        for c in &chunks {
-            prop_assert_eq!(c.start_sample % align_to, 0,
-                "start {} not aligned to {}", c.start_sample, align_to);
-            let end_aligned = c.end_sample % align_to == 0;
-            let end_at_max = c.end_sample == max_sample;
+            prop_assert!(c.start_sample < c.end_sample, "empty core: {c:?}");
+            prop_assert!(c.end_sample <= max_sample, "core {c:?} exceeds max_sample {max_sample}");
+            prop_assert!(c.decode_start_sample <= c.start_sample, "decode starts after core: {c:?}");
+            prop_assert!(c.end_sample <= c.decode_end_sample, "decode ends before core: {c:?}");
+            prop_assert!(c.decode_start_sample < c.decode_end_sample, "empty decode window: {c:?}");
+            prop_assert!(c.decode_end_sample <= max_sample, "decode {c:?} exceeds max_sample {max_sample}");
+
+            // The decode window is alignment-aligned (end may clamp to max).
+            prop_assert_eq!(c.decode_start_sample % align_to, 0,
+                "decode start {} not aligned to {}", c.decode_start_sample, align_to);
+            let end_aligned = c.decode_end_sample % align_to == 0;
+            let end_at_max = c.decode_end_sample == max_sample;
             prop_assert!(end_aligned || end_at_max,
-                "end {} not aligned to {} and not at max_sample {}",
-                c.end_sample, align_to, max_sample);
+                "decode end {} not aligned to {} and not at max_sample {}",
+                c.decode_end_sample, align_to, max_sample);
         }
         // Same input, same output.
         let chunks2 = chunks_from_probs(&probs, &opts).unwrap();
@@ -348,6 +408,7 @@ proptest! {
         min_speech in 1usize..=8,
         min_silence in 1usize..=8,
         merge_gap in 0usize..=8,
+        preroll_samples in 0usize..=4096,
     ) {
         let max_dur = min_dur + max_extra;
         let strict_dur = max_dur + strict_extra;
@@ -362,8 +423,9 @@ proptest! {
             min_silence_probs: min_silence,
             merge_gap_probs: merge_gap,
             trough_search_probs: None,
-        trough_threshold: None,
+            trough_threshold: None,
             pad_samples: 0,
+            preroll_samples,
             align_to: 1,
             max_total_samples: None,
         };
@@ -380,11 +442,12 @@ proptest! {
             opts.align_to,
         );
         for c in &chunks {
-            let len = c.end_sample - c.start_sample;
+            // Pre-roll grows the core but never past the decode-buffer bound.
             prop_assert!(
-                len <= bound_samples,
-                "chunk {c:?} length {len} exceeds bound {bound_samples} \
-                 (strict_probs={strict_limit_probs}, radius={radius}, spp={samples_per_prob})"
+                c.decode_len() <= bound_samples,
+                "chunk {c:?} decode_len {} exceeds bound {bound_samples} \
+                 (strict_probs={strict_limit_probs}, radius={radius}, spp={samples_per_prob})",
+                c.decode_len()
             );
         }
     }
@@ -394,10 +457,10 @@ proptest! {
         probs in prop::collection::vec(0.0f32..=1.0f32, 1..400),
         threshold in 0.3f32..=0.7,
     ) {
-        // With min_speech=min_silence=1, merge_gap=0, pad=0, align=1, every
-        // above-threshold prob is its own speech run and must be inside
-        // some output chunk's sample range. If this ever fires, the
-        // chunker is dropping speech.
+        // With min_speech=min_silence=1, merge_gap=0, pad=0, preroll=0,
+        // align=1, every above-threshold prob is its own speech run and must
+        // be inside some output chunk's core. If this ever fires, the chunker
+        // is dropping speech.
         let samples_per_prob = 512usize;
         let opts = ChunkerOpts {
             sample_rate: 16_000,
@@ -410,8 +473,9 @@ proptest! {
             min_silence_probs: 1,
             merge_gap_probs: 0,
             trough_search_probs: None,
-        trough_threshold: None,
+            trough_threshold: None,
             pad_samples: 0,
+            preroll_samples: 0,
             align_to: 1,
             max_total_samples: None,
         };
@@ -424,7 +488,7 @@ proptest! {
                 prop_assert!(
                     covered,
                     "above-threshold prob {p:.3} at index {i} (samples {lo}..{hi}) \
-                     not covered by any chunk: {chunks:?}"
+                     not covered by any chunk core: {chunks:?}"
                 );
             }
         }
@@ -446,6 +510,7 @@ fn test_chunker_serde_default_roundtrip() {
     assert_eq!(opts.min_silence_probs, default.min_silence_probs);
     assert_eq!(opts.merge_gap_probs, default.merge_gap_probs);
     assert_eq!(opts.pad_samples, default.pad_samples);
+    assert_eq!(opts.preroll_samples, default.preroll_samples);
     assert_eq!(opts.align_to, default.align_to);
 }
 
@@ -470,12 +535,13 @@ fn test_chunker_split_long_runs_respects_min_piece_floor() {
         trough_search_probs: Some(10),
         trough_threshold: None,
         pad_samples: 0,
+        preroll_samples: 0,
         align_to: 1,
         max_total_samples: None,
     };
     let chunks = chunks_from_probs(&probs, &opts).unwrap();
     assert!(!chunks.is_empty());
-    let first_len = chunks[0].end_sample - chunks[0].start_sample;
+    let first_len = chunks[0].core_len();
     assert!(first_len >= 4, "first chunk too small ({first_len} samples): {chunks:?}");
 }
 
@@ -501,14 +567,12 @@ fn test_chunker_decoupled_trough_search_radius() {
         trough_search_probs: Some(8),
         trough_threshold: None,
         pad_samples: 0,
+        preroll_samples: 0,
         align_to: 1,
         max_total_samples: None,
     };
     let chunks = chunks_from_probs(&probs, &opts).unwrap();
-    assert_eq!(
-        chunks,
-        vec![AudioChunk { start_sample: 0, end_sample: 14 }, AudioChunk { start_sample: 14, end_sample: 30 }]
-    );
+    assert_eq!(chunks, vec![AudioChunk::new(0, 14), AudioChunk::new(14, 30)]);
 }
 
 #[cfg(feature = "serde")]

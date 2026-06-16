@@ -129,6 +129,7 @@ impl Splitter for FireRedVadSplitter {
             trough_search_probs: self.trough_search_probs,
             trough_threshold: Some(self.threshold * 0.5),
             pad_samples: self.pad_samples,
+            preroll_samples: 0,
             align_to: bounds.align_to_samples().max(1),
             max_total_samples: Some(waveform.len()),
         };

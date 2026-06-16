@@ -98,7 +98,7 @@ fn bench<S: Splitter>(
     );
 
     println!("chunks ({}):", chunks.len());
-    for (i, AudioChunk { start_sample, end_sample }) in chunks.iter().enumerate() {
+    for (i, AudioChunk { start_sample, end_sample, .. }) in chunks.iter().enumerate() {
         let (s, e) = (*start_sample as f32 / 16_000.0, *end_sample as f32 / 16_000.0);
         println!("  {i}: {s:.2}s - {e:.2}s ({:.2}s)", e - s);
     }
