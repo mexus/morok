@@ -353,6 +353,11 @@ impl RunProfile {
     /// runs), and merge metadata; new stage names are appended in order. Used
     /// to combine per-window profiles when transcribing a batch one window at
     /// a time.
+    ///
+    /// Same-named stages SUM their `wall`. A model that pre-accumulates a
+    /// stage's `wall` to a whole-run total (rather than this window's slice)
+    /// must therefore emit one profile for the run and not also rely on this
+    /// per-window merge, or the total double-counts.
     pub fn merge(&mut self, other: RunProfile) {
         for stage in other.stages {
             match self.stages.iter_mut().find(|s| s.name == stage.name) {

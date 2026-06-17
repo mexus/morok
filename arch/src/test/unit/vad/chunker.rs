@@ -409,6 +409,8 @@ proptest! {
         min_silence in 1usize..=8,
         merge_gap in 0usize..=8,
         preroll_samples in 0usize..=4096,
+        pad_samples in 0usize..=4096,
+        align_to in prop::sample::select(vec![1usize, 64, 256, 640, 1024]),
     ) {
         let max_dur = min_dur + max_extra;
         let strict_dur = max_dur + strict_extra;
@@ -424,9 +426,11 @@ proptest! {
             merge_gap_probs: merge_gap,
             trough_search_probs: None,
             trough_threshold: None,
-            pad_samples: 0,
+            // pad + alignment snaps (floor start, ceil end) stress the
+            // `+ 2 * align_to` term of strict_chunk_sample_bound.
+            pad_samples,
             preroll_samples,
-            align_to: 1,
+            align_to,
             max_total_samples: None,
         };
         let chunks = chunks_from_probs(&probs, &opts).unwrap();

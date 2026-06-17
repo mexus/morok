@@ -24,7 +24,7 @@ use std::time::Instant;
 
 use clap::Parser;
 
-use svod_arch::pipelines::audio::Asr;
+use svod_arch::pipelines::audio::{Asr, RunOptions};
 use svod_model::audio::EncoderBounds;
 use svod_model::firered_vad::FireRedVadSplitter;
 use svod_model::gigaam::{GigaAm, GigaAmTranscriber, TranscribeOpts};
@@ -71,12 +71,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let t_total = Instant::now();
     let args = Args::parse();
     let revision = args.revision.clone().unwrap_or_else(|| if args.rnnt { "e2e_rnnt" } else { "ctc" }.to_string());
-    let opts = TranscribeOpts::builder()
-        .word_timestamps(args.timestamps)
-        .beam_decode(args.beam_decode)
-        .profile(args.profile)
-        .max_scores_mib(args.max_scores_mib)
-        .build();
+    let opts = TranscribeOpts::builder().beam_decode(args.beam_decode).max_scores_mib(args.max_scores_mib).build();
 
     println!("Loading audio: {}", args.wav.display());
     let (waveform, sample_rate) = load_wav(&args.wav)?;
@@ -99,19 +94,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         subsampling_factor: model.config.subsampling_factor,
         max_mel_frames: model.config.max_mel_frames,
     };
+    // `assemble` sizes the (eagerly JIT-prepared) transcriber from the
+    // splitter's chunk ceiling — no hand-threaded buffer size.
     let splitter = FireRedVadSplitter::from_hub(&bounds)?;
-    let max_chunk = splitter.max_chunk_samples();
-    let transcriber = GigaAmTranscriber::new(model, opts.clone(), max_chunk)?;
-    let mut asr = Asr::new(splitter, transcriber);
+    let mut asr = Asr::assemble(splitter, |max_chunk| GigaAmTranscriber::new(model, opts.clone(), max_chunk))?;
 
     println!("Transcribing...");
     let t_transcribe = Instant::now();
     // VAD split → arch pipeline machinery (decode windows → crop → stitch),
     // with the VAD stage folded into the profile.
-    let result = asr.transcribe(&waveform)?;
+    let result = asr.transcribe(&waveform, RunOptions { words: args.timestamps, profile: args.profile })?;
     let dt_transcribe = t_transcribe.elapsed();
 
-    if opts.word_timestamps {
+    if args.timestamps {
         for chunk in &result.chunks {
             let off = chunk.start_sec;
             for w in chunk.words.iter().flatten() {

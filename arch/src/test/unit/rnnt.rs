@@ -789,6 +789,20 @@ fn test_frames_to_words_literal_space_separator() {
     assert_words(&words, &[("hello", 0.0, 0.1), ("world", 0.3, 0.4)]);
 }
 
+#[test]
+fn test_frames_to_words_bare_marker_collapses_to_single_space() {
+    // A bare `▁` between two word-initial pieces yields an empty pending word
+    // that flush_pending drops, so the joined transcript single-spaces. The old
+    // raw-replace path produced a double space ("hi  mom"); the word-join is the
+    // canonical text now — pin it so the whitespace normalization can't silently
+    // regress.
+    let decoder = decoder_with(vec!["\u{2581}hi".into(), "\u{2581}".into(), "\u{2581}mom".into()], 10);
+    let emissions = vec![em(0, 0), em(1, 1), em(2, 2)];
+    let words = decoder.frames_to_words(&emissions, 0.04);
+    assert_words(&words, &[("hi", 0.0, 0.04), ("mom", 0.08, 0.12)]);
+    assert_eq!(crate::pipelines::audio::words_to_text(&words), "hi mom");
+}
+
 // ─── Property tests ───────────────────────────────────────────────────────
 
 proptest! {

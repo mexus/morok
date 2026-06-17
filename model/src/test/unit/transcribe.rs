@@ -10,7 +10,7 @@
 use svod_arch::rnnt::Word;
 
 use crate::gigaam::TranscribeOpts;
-use crate::gigaam::transcribe::{ctc_frames_to_words, words_to_text};
+use crate::gigaam::transcribe::ctc_frames_to_words;
 
 #[test]
 fn ctc_frames_to_words_empty() {
@@ -70,19 +70,6 @@ fn ctc_frames_to_words_frame_shift_scales_linearly() {
     assert!((a[0].end - 2.0 * b[0].end).abs() < 1e-6);
 }
 
-// ─── words_to_text (crop_words_to_core now lives in svod_arch::pipelines) ──────
-
-#[test]
-fn words_to_text_joins_with_spaces_and_drops_empties() {
-    let words = vec![
-        Word { text: "hello".into(), start: 0.0, end: 0.1 },
-        Word { text: String::new(), start: 0.1, end: 0.1 },
-        Word { text: "world".into(), start: 0.2, end: 0.3 },
-    ];
-    assert_eq!(words_to_text(&words), "hello world");
-    assert_eq!(words_to_text(&[]), "");
-}
-
 // ─── TranscribeOpts builder ──────────────────────────────────────────────
 //
 // We don't test `from_env()` directly — env-var manipulation isn't safe
@@ -91,9 +78,8 @@ fn words_to_text_joins_with_spaces_and_drops_empties() {
 // field flows through to the struct correctly.
 
 #[test]
-fn transcribe_opts_builder_overrides_all_fields() {
-    let opts = TranscribeOpts::builder().word_timestamps(true).beam_decode(true).max_scores_mib(512).build();
-    assert!(opts.word_timestamps);
+fn transcribe_opts_builder_overrides_fields() {
+    let opts = TranscribeOpts::builder().beam_decode(true).max_scores_mib(512).build();
     assert!(opts.beam_decode);
     assert_eq!(opts.max_scores_mib, 512);
 }

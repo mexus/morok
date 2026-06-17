@@ -13,9 +13,8 @@ use std::path::Path;
 use bon::bon;
 use snafu::{ResultExt, Snafu};
 use svod_arch::pipelines::audio::{Vad, VadSplitter};
-use svod_arch::vad::ChunkerOpts;
 
-use crate::audio::EncoderBounds;
+use crate::audio::{ChunkerKnobs, EncoderBounds};
 use crate::firered_vad::{DEFAULT_SMOOTH_WINDOW, FireRedVad, FireRedVadProbs};
 
 /// Builder namespace for a configured `VadSplitter<FireRedVadProbs>`.
@@ -48,26 +47,28 @@ impl FireRedVadSplitter {
         /// this many extra samples of context on each side.
         #[builder(default = 1600)]
         pad_samples: usize,
+        /// Max pre-roll (seconds) pulled into a chunk's core from the preceding
+        /// silence, capped at half the gap. Default `0` (off) — FireRedVAD
+        /// onsets are tight; set `SVOD_VAD_PREROLL_SECS` to enable. Mirrors the
+        /// Silero splitter's knob for symmetry.
+        #[builder(default = std::env::var("SVOD_VAD_PREROLL_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(0.0))]
+        preroll_secs: f32,
     ) -> VadSplitter<FireRedVadProbs> {
-        let cap = bounds.encoder_capacity_secs();
-        let opts = ChunkerOpts {
-            sample_rate: bounds.sample_rate,
-            samples_per_prob: vad.samples_per_prob(),
-            threshold,
-            min_duration: min_duration.min(cap),
-            max_duration: max_duration.min(cap),
-            strict_limit_duration: strict_limit_duration.min(cap),
-            min_speech_probs,
-            min_silence_probs,
-            merge_gap_probs,
-            trough_search_probs,
-            trough_threshold: Some(threshold * 0.5),
-            pad_samples,
-            preroll_samples: 0,
-            align_to: bounds.align_to_samples().max(1),
-            // VadSplitter::split clamps to the actual waveform length per call.
-            max_total_samples: None,
-        };
+        let opts = bounds.chunker_opts(
+            vad.samples_per_prob(),
+            ChunkerKnobs {
+                threshold,
+                min_duration,
+                max_duration,
+                strict_limit_duration,
+                min_speech_probs,
+                min_silence_probs,
+                merge_gap_probs,
+                trough_search_probs,
+                pad_samples,
+                preroll_samples: (preroll_secs.max(0.0) * bounds.sample_rate as f32).round() as usize,
+            },
+        );
         VadSplitter::new(vad, opts)
     }
 

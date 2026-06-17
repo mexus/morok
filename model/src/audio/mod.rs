@@ -9,5 +9,6 @@
 pub(crate) mod bounds;
 pub(crate) mod mel;
 
+pub(crate) use bounds::ChunkerKnobs;
 pub use bounds::{AudioChunk, EncoderBounds};
 pub use mel::{MelConfig, MelSpectrogram};

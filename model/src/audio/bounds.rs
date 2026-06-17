@@ -7,6 +7,7 @@
 //! `FixedLengthSplitter`).
 
 pub use svod_arch::vad::AudioChunk;
+use svod_arch::vad::ChunkerOpts;
 
 /// Encoder-derived bounds for sizing chunks and JIT buffers.
 ///
@@ -48,4 +49,48 @@ impl EncoderBounds {
     pub fn encoder_capacity_secs(&self) -> f32 {
         self.max_samples() as f32 / self.sample_rate as f32
     }
+
+    /// Assemble a [`ChunkerOpts`] for a VAD producing one prob per
+    /// `samples_per_prob` input samples. The bounds-derived policy — sample
+    /// rate, `align_to`, the `trough_threshold = threshold/2` heuristic, the
+    /// `max_total_samples` sentinel (set per call in `VadSplitter::split`), and
+    /// capacity-clamping the three duration knobs — lives here, so each splitter
+    /// only supplies its model-tuned [`ChunkerKnobs`].
+    pub(crate) fn chunker_opts(&self, samples_per_prob: usize, k: ChunkerKnobs) -> ChunkerOpts {
+        let cap = self.encoder_capacity_secs();
+        ChunkerOpts {
+            sample_rate: self.sample_rate,
+            samples_per_prob,
+            threshold: k.threshold,
+            // Clamp to encoder capacity: without it the chunker's MinExceedsMax
+            // validator fires when capacity < the target min duration.
+            min_duration: k.min_duration.min(cap),
+            max_duration: k.max_duration.min(cap),
+            strict_limit_duration: k.strict_limit_duration.min(cap),
+            min_speech_probs: k.min_speech_probs,
+            min_silence_probs: k.min_silence_probs,
+            merge_gap_probs: k.merge_gap_probs,
+            trough_search_probs: k.trough_search_probs,
+            trough_threshold: Some(k.threshold * 0.5),
+            pad_samples: k.pad_samples,
+            preroll_samples: k.preroll_samples,
+            align_to: self.align_to_samples().max(1),
+            max_total_samples: None,
+        }
+    }
+}
+
+/// Model-tuned chunker knobs a VAD splitter supplies to
+/// [`EncoderBounds::chunker_opts`]; the bounds-derived fields are filled there.
+pub(crate) struct ChunkerKnobs {
+    pub threshold: f32,
+    pub min_duration: f32,
+    pub max_duration: f32,
+    pub strict_limit_duration: f32,
+    pub min_speech_probs: usize,
+    pub min_silence_probs: usize,
+    pub merge_gap_probs: usize,
+    pub trough_search_probs: Option<usize>,
+    pub pad_samples: usize,
+    pub preroll_samples: usize,
 }

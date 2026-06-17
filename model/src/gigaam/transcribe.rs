@@ -38,27 +38,26 @@ use crate::jit::InputSpec;
 /// Construct with [`TranscribeOpts::builder`] (per-field overrides) or
 /// [`TranscribeOpts::from_env`] (read `SVOD_*` env vars with sensible
 /// fallbacks). The two agree — `from_env()` is just `builder().build()` —
-/// so `builder().word_timestamps(true).build()` still consults env for the
-/// rest of the fields.
+/// so `builder().beam_decode(true).build()` still consults env for the rest
+/// of the fields.
 ///
 /// Field defaults consult these env vars:
 ///
 /// | Field             | Env var                | Fallback |
 /// |-------------------|------------------------|----------|
-/// | `word_timestamps` | `SVOD_TIMESTAMPS=1`   | `false`  |
 /// | `beam_decode`     | `SVOD_BEAM_DECODE=1`  | `false`  |
 /// | `max_scores_mib`  | `SVOD_MAX_SCORES_MIB` | `256`    |
 ///
-/// `profile` is builder-only (no env var): set it programmatically.
+/// These are **structural** (they shape the eagerly-built JIT/decoder). Per-run
+/// behaviour — word timestamps and profiling — is not here: it's passed per call
+/// as [`RunOptions`](svod_arch::pipelines::audio::RunOptions) to
+/// [`Asr::transcribe`](svod_arch::pipelines::audio::Asr::transcribe), so one
+/// transcriber serves words-on/off and profiled/unprofiled runs.
 ///
 /// VAD-specific knobs (`threshold`, `min_duration`, …) live on the splitter
 /// (e.g. `FireRedVadSplitter`), not here.
 #[derive(Clone, Debug)]
 pub struct TranscribeOpts {
-    /// Emit per-word `Word { text, start, end }` entries on the pipeline's
-    /// [`ChunkResult`](svod_arch::pipelines::audio::ChunkResult)`::words`. Both
-    /// heads support this.
-    pub word_timestamps: bool,
     /// Promote the model's config-default CTC decoder to a beam decoder
     /// (no-op for RN-T).
     pub beam_decode: bool,
@@ -66,11 +65,6 @@ pub struct TranscribeOpts {
     /// so two simultaneously live `[B, H, T_sub², dtype]` scores tensors
     /// stay under `2 × max_scores_mib` MiB.
     pub max_scores_mib: usize,
-    /// Collect a typed per-stage GPU profile on the pipeline's
-    /// [`Transcription`](svod_arch::pipelines::audio::Transcription)`::profile`:
-    /// one representative profiled execution per GPU stage plus host stage
-    /// walls. Cheap (one extra device drain per profiled stage).
-    pub profile: bool,
 }
 
 impl Default for TranscribeOpts {
@@ -85,16 +79,14 @@ impl TranscribeOpts {
     /// `SVOD_*` env var (see the struct docs for the full table) before
     /// falling back to a literal — so `builder().build()` produces the same
     /// values as [`from_env`](Self::from_env), and partial overrides
-    /// (`.word_timestamps(true).build()`) still env-read the rest.
+    /// (`.beam_decode(true).build()`) still env-read the rest.
     #[builder]
     pub fn builder(
-        #[builder(default = std::env::var("SVOD_TIMESTAMPS").as_deref() == Ok("1"))] word_timestamps: bool,
         #[builder(default = std::env::var("SVOD_BEAM_DECODE").as_deref() == Ok("1"))] beam_decode: bool,
         #[builder(default = std::env::var("SVOD_MAX_SCORES_MIB").ok().and_then(|s| s.parse().ok()).unwrap_or(256))]
         max_scores_mib: usize,
-        #[builder(default = false)] profile: bool,
     ) -> Self {
-        Self { word_timestamps, beam_decode, max_scores_mib, profile }
+        Self { beam_decode, max_scores_mib }
     }
 
     /// Build from `SVOD_*` env vars with the same fallbacks as the
@@ -152,13 +144,6 @@ pub(crate) fn ctc_frames_to_words(text: &str, frames: &[usize], frame_shift: f32
     words
 }
 
-/// Join word texts with single spaces (empties dropped). Reconstructs a
-/// chunk's transcript from its (possibly cropped) words; equivalent to the
-/// raw head decode when no word is cropped.
-pub(crate) fn words_to_text(words: &[Word]) -> String {
-    words.iter().map(|w| w.text.as_str()).filter(|s| !s.is_empty()).collect::<Vec<_>>().join(" ")
-}
-
 fn rnnt_decode_err(e: svod_arch::rnnt::RnntDecodeError<crate::jit::JitError>) -> TranscribeError {
     TranscribeError::RnntDecode { source: Box::new(e) }
 }
@@ -198,6 +183,11 @@ pub enum TranscribeError {
         #[snafu(source(from(svod_device::error::Error, Box::new)))]
         source: Box<svod_device::error::Error>,
     },
+    #[snafu(display(
+        "chunk mel length {mel_frames} exceeds transcriber capacity {max_t_mel}; \
+         size the transcriber from Splitter::max_chunk_samples (e.g. via Asr::assemble)"
+    ))]
+    CapacityExceeded { mel_frames: usize, max_t_mel: usize },
 }
 
 // ─── Transcriber ──────────────────────────────────────────────────────────
@@ -210,7 +200,6 @@ pub enum TranscribeError {
 /// (clamped to the encoder's hard ceiling).
 pub struct GigaAmTranscriber {
     model: GigaAm,
-    opts: TranscribeOpts,
     mel: MelSpectrogram,
     head_decoder: HeadDecoder,
     encoder_jit: Option<GigaAmEncoderJit>,
@@ -314,7 +303,7 @@ impl GigaAmTranscriber {
             }
         };
 
-        Ok(Self { model, opts, mel, head_decoder, encoder_jit, max_batch, max_t_mel })
+        Ok(Self { model, mel, head_decoder, encoder_jit, max_batch, max_t_mel })
     }
 }
 
@@ -325,17 +314,19 @@ impl svod_arch::pipelines::audio::Transcriber for GigaAmTranscriber {
         self.model.config.sample_rate as u32
     }
 
-    fn wants_words(&self) -> bool {
-        self.opts.word_timestamps
-    }
-
     /// Encode + decode each decode-window's audio into uncropped per-window
     /// transcripts (word times relative to the window start). Owns the full
     /// batched encoder + per-head decode (CTC fused; RN-T deferred lane-wave)
     /// and the per-stage profile; the trait's `transcribe_chunks` default does
     /// the core-crop and stitch.
-    fn transcribe_windows(&mut self, windows: &[&[f32]]) -> WindowDecode {
-        use svod_arch::pipelines::audio::Transcript;
+    fn transcribe_windows(&mut self, windows: &[&[f32]], profile: bool) -> WindowDecode {
+        use svod_arch::pipelines::audio::{Transcript, words_to_text};
+
+        // No windows (silence-only audio): nothing to encode. Guards the
+        // `num_chunks.div_ceil(max_batch) - 1` batch-index math below.
+        if windows.is_empty() {
+            return Ok((Vec::new(), profile.then(RunProfile::default)));
+        }
 
         let n_mels = self.mel.n_mels();
         let sample_rate_hz = self.model.config.sample_rate;
@@ -351,6 +342,13 @@ impl svod_arch::pipelines::audio::Transcriber for GigaAmTranscriber {
         let max_t_sub = subs_output_length(subs_kernel_size, max_t_mel);
 
         let mel_lens: Vec<usize> = windows.iter().map(|w| self.mel.num_frames(w.len())).collect();
+        // A window longer than the JIT was sized for would overrun the mel
+        // buffer in `pack_mel_buffer`; fail cleanly instead. `Asr::assemble`
+        // sizes the transcriber from the splitter, so this never fires there —
+        // it guards a hand-mismatched splitter/transcriber pair.
+        if let Some(&mel_frames) = mel_lens.iter().find(|&&m| m > max_t_mel) {
+            return CapacityExceededSnafu { mel_frames, max_t_mel }.fail();
+        }
         let num_chunks = windows.len();
         let mut transcripts: Vec<Transcript> = Vec::with_capacity(num_chunks);
         // RN-T: encoder frames accumulated across all encode batches, decoded
@@ -361,8 +359,8 @@ impl svod_arch::pipelines::audio::Transcriber for GigaAmTranscriber {
         // async; the GPU drains on the first host read, so each stage timer is
         // bounded by its drain point.
         let (mut t_mel, mut t_encoder, mut t_decode) = (Duration::ZERO, Duration::ZERO, Duration::ZERO);
-        let profile_batch = self.opts.profile.then(|| 3.min(num_chunks.div_ceil(max_batch) - 1) * max_batch);
-        let mut profile = self.opts.profile.then(RunProfile::default);
+        let profile_batch = profile.then(|| 3.min(num_chunks.div_ceil(max_batch).saturating_sub(1)) * max_batch);
+        let mut prof = profile.then(RunProfile::default);
         for chunk_batch_start in (0..num_chunks).step_by(max_batch) {
             let b = (num_chunks - chunk_batch_start).min(max_batch);
             let chunk_lengths: Vec<usize> = (0..b).map(|bi| mel_lens[chunk_batch_start + bi]).collect();
@@ -399,7 +397,7 @@ impl svod_arch::pipelines::audio::Transcriber for GigaAmTranscriber {
                     let t_enc = Instant::now();
                     if profile_batch == Some(chunk_batch_start) {
                         let kernels = jit.execute_profiled().context(JitSnafu)?;
-                        if let Some(p) = &mut profile {
+                        if let Some(p) = &mut prof {
                             p.push(StageProfile::gpu("ctc_head", Duration::ZERO, kernels));
                         }
                     } else {
@@ -448,7 +446,7 @@ impl svod_arch::pipelines::audio::Transcriber for GigaAmTranscriber {
                     let t_enc = Instant::now();
                     if profile_batch == Some(chunk_batch_start) {
                         let kernels = enc_jit.execute_profiled().context(JitSnafu)?;
-                        if let Some(p) = &mut profile {
+                        if let Some(p) = &mut prof {
                             p.push(StageProfile::gpu("encoder", Duration::ZERO, kernels));
                         }
                     } else {
@@ -525,7 +523,7 @@ impl svod_arch::pipelines::audio::Transcriber for GigaAmTranscriber {
             "gigaam stage breakdown",
         );
 
-        if let Some(p) = &mut profile {
+        if let Some(p) = &mut prof {
             // GPU stages share the accumulated encoder wall; prepend the
             // host-only mel stage so display order is mel → encoder.
             for s in &mut p.stages {
@@ -534,7 +532,7 @@ impl svod_arch::pipelines::audio::Transcriber for GigaAmTranscriber {
             p.stages.insert(0, StageProfile::host("mel", t_mel));
         }
 
-        Ok((transcripts, profile))
+        Ok((transcripts, prof))
     }
 }
 
@@ -584,7 +582,9 @@ fn subs_output_length(kernel_size: usize, mel_frames: usize) -> usize {
     let pad = (kernel_size - 1) / 2;
     let mut len = mel_frames;
     for _ in 0..2 {
-        len = (len + 2 * pad - kernel_size) / 2 + 1;
+        // saturating: a degenerate `mel_frames < kernel_size - 2*pad` (only
+        // reachable for an empty/sub-frame window) must clamp to 0, not wrap.
+        len = (len + 2 * pad).saturating_sub(kernel_size) / 2 + 1;
     }
     len
 }
