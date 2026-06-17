@@ -21,17 +21,22 @@
 //! free of the Tensor/device stack. The model owns audio → mel → device tensor
 //! internally.
 
+use std::time::Instant;
+
 use snafu::{ResultExt, Snafu};
 
+pub use svod_runtime::RunProfile;
+use svod_runtime::StageProfile;
+
 pub use crate::rnnt::Word;
-use crate::vad::{AudioChunk, ChunkerOpts, chunks_from_probs};
+use crate::vad::{AudioChunk, ChunkerOpts, chunks_from_probs, strict_chunk_sample_bound};
 
 // ─── Results ────────────────────────────────────────────────────────────────
 
 /// One decode-window's transcription, with word times **relative to the window
 /// start** (`0.0` == `decode_start`). Returned by a [`Transcriber`]; the
 /// pipeline crops these to the chunk's core before emitting.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Transcript {
     pub text: String,
     pub words: Vec<Word>,
@@ -49,12 +54,14 @@ pub struct ChunkResult {
 }
 
 /// Aggregated pipeline output: chunk texts joined by single spaces (empties
-/// dropped), plus the per-chunk results. Deliberately profile-free — GPU
-/// profiling lives above this crate and is attached by the model layer.
-#[derive(Clone, Debug, PartialEq)]
+/// dropped), the per-chunk results, and the optional per-stage [`RunProfile`]
+/// the transcriber collected. Profile stages are free-form and extensible, so
+/// any model or caller can add custom ones.
+#[derive(Debug, Default)]
 pub struct Transcription {
     pub text: String,
     pub chunks: Vec<ChunkResult>,
+    pub profile: Option<RunProfile>,
 }
 
 // ─── Word crop / stitch (pure host machinery) ────────────────────────────────
@@ -121,6 +128,13 @@ pub trait Splitter {
     type Error: std::error::Error + 'static;
 
     fn split(&mut self, waveform: &[f32]) -> Result<Vec<AudioChunk>, Self::Error>;
+
+    /// The profile of the most recent [`split`](Splitter::split) — e.g. a `vad`
+    /// stage timing the probability pass — consumed and cleared by [`Asr`].
+    /// Defaults to `None` (split is host-cheap / unprofiled).
+    fn take_profile(&mut self) -> Option<RunProfile> {
+        None
+    }
 }
 
 /// VAD-driven splitter: `vad.probs(wav)` → [`chunks_from_probs`] with `opts`.
@@ -129,11 +143,24 @@ pub trait Splitter {
 pub struct VadSplitter<V: Vad> {
     vad: V,
     opts: ChunkerOpts,
+    last_profile: Option<RunProfile>,
 }
 
 impl<V: Vad> VadSplitter<V> {
     pub fn new(vad: V, opts: ChunkerOpts) -> Self {
-        Self { vad, opts }
+        Self { vad, opts, last_profile: None }
+    }
+
+    /// Upper bound (in samples) on the longest chunk this splitter can emit
+    /// under its baked [`ChunkerOpts`]; sizes a downstream [`Transcriber`]'s JIT
+    /// buffers. Derived purely from the chunker config — same math the chunker
+    /// uses internally (see [`strict_chunk_sample_bound`]).
+    pub fn max_chunk_samples(&self) -> usize {
+        let o = &self.opts;
+        let probs_per_sec = o.sample_rate as f32 / o.samples_per_prob.max(1) as f32;
+        let strict_limit_probs = (o.strict_limit_duration * probs_per_sec).ceil() as usize;
+        let radius = o.trough_search_probs.unwrap_or(o.min_silence_probs);
+        strict_chunk_sample_bound(strict_limit_probs, radius, o.samples_per_prob, o.pad_samples, o.align_to)
     }
 }
 
@@ -149,8 +176,22 @@ impl<V: Vad> Splitter for VadSplitter<V> {
     type Error = VadSplitError<V::Error>;
 
     fn split(&mut self, waveform: &[f32]) -> Result<Vec<AudioChunk>, Self::Error> {
+        let t = Instant::now();
         let probs = self.vad.probs(waveform).context(ProbsSnafu)?;
-        chunks_from_probs(&probs, &self.opts).context(ChunkSnafu)
+        // The chunker clamps chunk ends to the real audio (the final VAD window
+        // is zero-padded, so the prob grid overshoots the waveform). The length
+        // is only known here, so set it per call over the baked sentinel.
+        let mut opts = self.opts.clone();
+        opts.max_total_samples = Some(waveform.len());
+        let chunks = chunks_from_probs(&probs, &opts).context(ChunkSnafu)?;
+        let mut profile = RunProfile::default();
+        profile.push(StageProfile::host("vad", t.elapsed()));
+        self.last_profile = Some(profile);
+        Ok(chunks)
+    }
+
+    fn take_profile(&mut self) -> Option<RunProfile> {
+        self.last_profile.take()
     }
 }
 
@@ -204,19 +245,34 @@ pub trait Transcriber {
     /// crop always runs internally regardless.
     fn wants_words(&self) -> bool;
 
-    /// Transcribe every decode window (the model owns internal batching).
-    fn transcribe_windows(&mut self, windows: &[&[f32]]) -> Result<Vec<Transcript>, Self::Error>;
-
-    /// Transcribe one window (sequential fallback).
-    fn transcribe_window(&mut self, window: &[f32]) -> Result<Transcript, Self::Error> {
-        Ok(self
-            .transcribe_windows(&[window])?
-            .pop()
-            .unwrap_or_else(|| Transcript { text: String::new(), words: Vec::new() }))
+    /// Transcribe every decode window (the model owns internal batching),
+    /// returning uncropped per-window transcripts plus the optional per-stage
+    /// [`RunProfile`]. Defaults to looping [`transcribe_window`] and **merging**
+    /// its per-window profiles (via [`RunProfile::merge`]); override for a model
+    /// that batches the encoder and profiles the batch as a whole.
+    fn transcribe_windows(&mut self, windows: &[&[f32]]) -> Result<(Vec<Transcript>, Option<RunProfile>), Self::Error> {
+        let mut transcripts = Vec::with_capacity(windows.len());
+        let mut profile: Option<RunProfile> = None;
+        for w in windows {
+            let (transcript, stage) = self.transcribe_window(w)?;
+            transcripts.push(transcript);
+            if let Some(stage) = stage {
+                profile.get_or_insert_with(RunProfile::default).merge(stage);
+            }
+        }
+        Ok((transcripts, profile))
     }
 
-    /// Decode each chunk's window, crop its words back to the core, and stitch.
-    /// Pure host machinery over [`transcribe_windows`]; models don't override.
+    /// Transcribe one window + its optional profile (sequential fallback).
+    /// Implement this OR [`transcribe_windows`].
+    fn transcribe_window(&mut self, window: &[f32]) -> Result<(Transcript, Option<RunProfile>), Self::Error> {
+        let (mut transcripts, profile) = self.transcribe_windows(&[window])?;
+        Ok((transcripts.pop().unwrap_or_default(), profile))
+    }
+
+    /// Decode each chunk's window, crop its words back to the core, stitch, and
+    /// carry the profile. Pure host machinery over [`transcribe_windows`];
+    /// models don't override.
     fn transcribe_chunks(&mut self, waveform: &[f32], chunks: &[AudioChunk]) -> Result<Transcription, Self::Error> {
         let sr = self.sample_rate() as f32;
         let metas: Vec<ChunkGeom> = chunks
@@ -234,7 +290,7 @@ pub trait Transcriber {
             .collect();
 
         let windows: Vec<&[f32]> = metas.iter().map(|m| &waveform[m.decode_start..m.decode_end]).collect();
-        let transcripts = self.transcribe_windows(&windows)?;
+        let (transcripts, profile) = self.transcribe_windows(&windows)?;
 
         let want_words = self.wants_words();
         let chunk_results: Vec<ChunkResult> = transcripts
@@ -253,7 +309,7 @@ pub trait Transcriber {
 
         let text =
             chunk_results.iter().map(|c| c.text.as_str()).filter(|s| !s.is_empty()).collect::<Vec<_>>().join(" ");
-        Ok(Transcription { text, chunks: chunk_results })
+        Ok(Transcription { text, chunks: chunk_results, profile })
     }
 }
 
@@ -291,7 +347,17 @@ impl<S: Splitter, T: Transcriber> Asr<S, T> {
 
     pub fn transcribe(&mut self, waveform: &[f32]) -> Result<Transcription, AsrError<S::Error, T::Error>> {
         let chunks = self.splitter.split(waveform).context(SplitSnafu)?;
-        self.transcriber.transcribe_chunks(waveform, &chunks).context(TranscribeSnafu)
+        let split_profile = self.splitter.take_profile();
+        let mut transcription = self.transcriber.transcribe_chunks(waveform, &chunks).context(TranscribeSnafu)?;
+        // Surface the splitter's profile only when the transcriber is profiling
+        // too (all-or-nothing), and merge it in *front* so the VAD stage leads.
+        if let Some(mut vad) = split_profile
+            && let Some(rest) = transcription.profile.take()
+        {
+            vad.merge(rest);
+            transcription.profile = Some(vad);
+        }
+        Ok(transcription)
     }
 
     pub fn splitter_mut(&mut self) -> &mut S {

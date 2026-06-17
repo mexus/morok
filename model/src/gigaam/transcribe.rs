@@ -1,17 +1,18 @@
-//! High-level `Transcriber` over a unified [`GigaAm`].
+//! GigaAM's [`Transcriber`](svod_arch::pipelines::audio::Transcriber): the
+//! per-window half of the long-form ASR pipeline.
 //!
-//! Replaces the per-example pipeline (mel extract → Silero VAD → chunker →
-//! sized JIT prepare → batched pack → encoder execute → per-head decode) with
-//! one stateful wrapper. Construction builds the front-ends but does NOT
-//! prepare the encoder JIT — bounds depend on the audio. The first
-//! [`Transcriber::transcribe`] call sizes and prepares; subsequent calls reuse
-//! the cached `(b, t_mel)` plan if the new audio's chunks fit underneath.
+//! [`GigaAmTranscriber`] turns each decode-window of audio into a
+//! [`Transcript`](svod_arch::pipelines::audio::Transcript) (text + window-
+//! relative word times); the arch pipeline owns the splitting, decode-window
+//! geometry, core-crop, and stitching. Every JIT is prepared eagerly at
+//! construction, sized to the splitter's `max_chunk_samples`. Pair it with a
+//! [`Splitter`](svod_arch::pipelines::audio::Splitter) in an
+//! [`Asr`](svod_arch::pipelines::audio::Asr).
 //!
-//! Hides the CTC vs RN-T asymmetry behind one return type:
-//! [`TranscribeResult`] with optional per-word timestamps for both heads.
-//! SentencePiece `▁ → space` post-processing, the encoder-output transpose
-//! that RN-T needs (`[d_model, T_sub] → [T_sub, d_model]`), and the CTC
-//! `frames_to_words` grouping all live inside [`HeadDecoder`].
+//! It hides the CTC vs RN-T asymmetry: the fused encoder+head JIT (CTC) vs the
+//! standalone encoder + deferred lane-wave block decode (RN-T), SentencePiece
+//! `▁ → space` post-processing, the encoder-output transpose RN-T needs, and
+//! the CTC `frames_to_words` grouping all live inside [`HeadDecoder`].
 
 use std::time::{Duration, Instant};
 
@@ -24,7 +25,7 @@ use svod_tensor::PrepareConfig;
 
 pub use svod_arch::rnnt::Word;
 
-use crate::audio::{AudioChunk, EncoderBounds, MelConfig, MelSpectrogram, Splitter};
+use crate::audio::{EncoderBounds, MelConfig, MelSpectrogram};
 use crate::gigaam::SubsamplingMode;
 use crate::gigaam::ctc::GigaAmCtcJit;
 use crate::gigaam::jit::GigaAmEncoderJit;
@@ -32,7 +33,7 @@ use crate::gigaam::model::{GigaAm, Head};
 use crate::gigaam::rnnt::RnntBlockBackend;
 use crate::jit::InputSpec;
 
-/// User-facing knobs for [`Transcriber::transcribe`].
+/// User-facing knobs for [`GigaAmTranscriber`].
 ///
 /// Construct with [`TranscribeOpts::builder`] (per-field overrides) or
 /// [`TranscribeOpts::from_env`] (read `SVOD_*` env vars with sensible
@@ -50,12 +51,13 @@ use crate::jit::InputSpec;
 ///
 /// `profile` is builder-only (no env var): set it programmatically.
 ///
-/// VAD-specific knobs (`threshold`, `min_duration`, …) live on
-/// [`SileroVadSplitter`](super::SileroVadSplitter), not here.
+/// VAD-specific knobs (`threshold`, `min_duration`, …) live on the splitter
+/// (e.g. `FireRedVadSplitter`), not here.
 #[derive(Clone, Debug)]
 pub struct TranscribeOpts {
-    /// Emit per-word `Word { text, start, end }` entries on
-    /// [`ChunkResult::words`]. Both heads support this.
+    /// Emit per-word `Word { text, start, end }` entries on the pipeline's
+    /// [`ChunkResult`](svod_arch::pipelines::audio::ChunkResult)`::words`. Both
+    /// heads support this.
     pub word_timestamps: bool,
     /// Promote the model's config-default CTC decoder to a beam decoder
     /// (no-op for RN-T).
@@ -64,7 +66,8 @@ pub struct TranscribeOpts {
     /// so two simultaneously live `[B, H, T_sub², dtype]` scores tensors
     /// stay under `2 × max_scores_mib` MiB.
     pub max_scores_mib: usize,
-    /// Collect a typed per-stage GPU profile ([`TranscribeResult::profile`]):
+    /// Collect a typed per-stage GPU profile on the pipeline's
+    /// [`Transcription`](svod_arch::pipelines::audio::Transcription)`::profile`:
     /// one representative profiled execution per GPU stage plus host stage
     /// walls. Cheap (one extra device drain per profiled stage).
     pub profile: bool,
@@ -99,44 +102,6 @@ impl TranscribeOpts {
     pub fn from_env() -> Self {
         Self::builder().build()
     }
-}
-
-/// Aggregated transcription output. `text` is the chunk texts joined by a
-/// single space (empty chunks dropped); [`words`](Self::words) flattens word
-/// timestamps across chunks (shifted by each chunk's `start_sec`).
-#[derive(Debug)]
-pub struct TranscribeResult {
-    pub text: String,
-    pub chunks: Vec<ChunkResult>,
-    /// Model-agnostic per-stage GPU profile, when [`TranscribeOpts::profile`] is set.
-    pub profile: Option<RunProfile>,
-}
-
-impl TranscribeResult {
-    /// Iterate per-word timestamps across all chunks, shifted into the
-    /// original audio's timeline. Empty if `opts.word_timestamps` was false.
-    pub fn words(&self) -> impl Iterator<Item = Word> + '_ {
-        self.chunks.iter().flat_map(|c| {
-            let offset = c.start_sec;
-            c.words.iter().flatten().map(move |w| Word {
-                text: w.text.clone(),
-                start: w.start + offset,
-                end: w.end + offset,
-            })
-        })
-    }
-}
-
-/// One VAD-bound speech region's transcript. `start_sec`/`end_sec` reference
-/// the original audio. `words` is `Some` iff [`TranscribeOpts::word_timestamps`]
-/// was set; each entry's `start`/`end` is **chunk-relative** (add `start_sec`
-/// to get audio-absolute, or use [`TranscribeResult::words`]).
-#[derive(Clone, Debug)]
-pub struct ChunkResult {
-    pub start_sec: f32,
-    pub end_sec: f32,
-    pub text: String,
-    pub words: Option<Vec<Word>>,
 }
 
 /// Per-head decoder + JIT state. CTC needs a bounds-tied head JIT (Conv1d
@@ -187,31 +152,6 @@ pub(crate) fn ctc_frames_to_words(text: &str, frames: &[usize], frame_shift: f32
     words
 }
 
-/// Crop decoded words back to a chunk's core and drop the rest.
-///
-/// Decoded word times are relative to the **decode window** start; the core
-/// begins `core_offset_sec` into the window and spans `core_duration` seconds.
-/// A word is kept iff its midpoint falls inside the core — so a word produced
-/// in the pad/pre-roll context (or duplicated in two adjacent decode windows)
-/// survives in at most one chunk. Survivors are re-based to core-relative time
-/// (`0 == core start`) so the chunk's own `start_sec` offsets them correctly.
-pub(crate) fn crop_words_to_core(words: Vec<Word>, core_offset_sec: f32, core_duration: f32) -> Vec<Word> {
-    words
-        .into_iter()
-        .filter_map(|mut w| {
-            let rel_start = w.start - core_offset_sec;
-            let rel_end = w.end - core_offset_sec;
-            let mid = 0.5 * (rel_start + rel_end);
-            if !(0.0..core_duration).contains(&mid) {
-                return None;
-            }
-            w.start = rel_start.clamp(0.0, core_duration);
-            w.end = rel_end.clamp(w.start, core_duration);
-            Some(w)
-        })
-        .collect()
-}
-
 /// Join word texts with single spaces (empties dropped). Reconstructs a
 /// chunk's transcript from its (possibly cropped) words; equivalent to the
 /// raw head decode when no word is cropped.
@@ -219,42 +159,21 @@ pub(crate) fn words_to_text(words: &[Word]) -> String {
     words.iter().map(|w| w.text.as_str()).filter(|s| !s.is_empty()).collect::<Vec<_>>().join(" ")
 }
 
-fn rnnt_decode_err<E: std::error::Error + 'static>(
-    e: svod_arch::rnnt::RnntDecodeError<crate::jit::JitError>,
-) -> TranscribeError<E> {
+fn rnnt_decode_err(e: svod_arch::rnnt::RnntDecodeError<crate::jit::JitError>) -> TranscribeError {
     TranscribeError::RnntDecode { source: Box::new(e) }
 }
 
-/// Per-chunk decode geometry. The encoder runs over the **decode window**
-/// `[decode_start, decode_end)`; decoded word times are relative to it. The
-/// text-owning **core** starts `core_offset_sec` into the window, spans
-/// `end_sec - start_sec` seconds, and offsets the chunk's output by `start_sec`.
-#[derive(Clone, Copy)]
-struct ChunkMeta {
-    decode_start: usize,
-    decode_end: usize,
-    mel_len: usize,
-    start_sec: f32,
-    end_sec: f32,
-    core_offset_sec: f32,
-}
-
-impl ChunkMeta {
-    fn core_duration(&self) -> f32 {
-        self.end_sec - self.start_sec
-    }
-}
+/// [`Transcriber::transcribe_windows`] output: uncropped per-window transcripts
+/// (words relative to each window) plus the optional per-stage GPU profile.
+type WindowDecode = Result<(Vec<svod_arch::pipelines::audio::Transcript>, Option<RunProfile>), TranscribeError>;
 
 // ─── Errors ───────────────────────────────────────────────────────────────
 
-/// Generic over the splitter error type so per-impl errors stay
-/// pattern-matchable rather than being type-erased into `Box<dyn Error>`.
-/// Mirrors the `svod_arch::rnnt::RnntDecodeError<JitError>` shape.
+/// Per-window decode failures. Variants stay pattern-matchable rather than
+/// type-erased into `Box<dyn Error>`, mirroring `RnntDecodeError<JitError>`.
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub(crate)))]
-pub enum TranscribeError<E: std::error::Error + 'static> {
-    #[snafu(display("splitter: {source}"))]
-    Splitter { source: E },
+pub enum TranscribeError {
     #[snafu(display("{source}"))]
     Jit {
         #[snafu(source(from(crate::jit::JitError, Box::new)))]
@@ -279,25 +198,19 @@ pub enum TranscribeError<E: std::error::Error + 'static> {
         #[snafu(source(from(svod_device::error::Error, Box::new)))]
         source: Box<svod_device::error::Error>,
     },
-    #[snafu(display("WAV is {wav_sr} Hz, model expects {model_sr} Hz (resample first)"))]
-    SampleRateMismatch { wav_sr: u32, model_sr: u32 },
-    #[snafu(display("chunk {idx} length {samples} samples exceeds encoder capacity {max_samples} samples"))]
-    ChunkExceedsCapacity { idx: usize, samples: usize, max_samples: usize },
-    #[snafu(display("chunk {idx} end {end_sample} exceeds waveform length {waveform_len}"))]
-    ChunkOutOfRange { idx: usize, end_sample: usize, waveform_len: usize },
 }
 
 // ─── Transcriber ──────────────────────────────────────────────────────────
 
-/// High-level transcription wrapper, generic over the chunking strategy.
-/// JITs are prepared eagerly at construction; the splitter advertises its
-/// max chunk length so JIT buffers can be sized tighter than the encoder's
-/// hard ceiling. Use [`transcribe_chunks`](Self::transcribe_chunks) to
-/// bypass the splitter for pre-segmented audio.
-pub struct Transcriber<S: Splitter> {
+/// Per-window GigaAM transcriber: the prepared encoder/head JITs + mel
+/// front-end. Implements [`svod_arch::pipelines::audio::Transcriber`]; pair it
+/// with a [`Splitter`](svod_arch::pipelines::audio::Splitter) in an
+/// [`Asr`](svod_arch::pipelines::audio::Asr). Every JIT is prepared eagerly at
+/// construction, sized to the `max_chunk_samples` the splitter will emit
+/// (clamped to the encoder's hard ceiling).
+pub struct GigaAmTranscriber {
     model: GigaAm,
     opts: TranscribeOpts,
-    splitter: S,
     mel: MelSpectrogram,
     head_decoder: HeadDecoder,
     encoder_jit: Option<GigaAmEncoderJit>,
@@ -305,11 +218,12 @@ pub struct Transcriber<S: Splitter> {
     max_t_mel: usize,
 }
 
-impl<S: Splitter> Transcriber<S> {
-    /// Build the transcriber and prepare every JIT eagerly — subsequent
-    /// `transcribe` calls just execute. `model` is cloned into each JIT
-    /// (cheap: weights are shared via `Tensor` handle Arcs).
-    pub fn new(model: GigaAm, splitter: S, opts: TranscribeOpts) -> Result<Self, TranscribeError<S::Error>> {
+impl GigaAmTranscriber {
+    /// Build the transcriber and prepare every JIT eagerly, sized to
+    /// `max_chunk_samples` (the splitter's emission ceiling) clamped to the
+    /// encoder's capacity. `model` is cloned into each JIT (cheap: weights are
+    /// shared via `Tensor` handle Arcs).
+    pub fn new(model: GigaAm, opts: TranscribeOpts, max_chunk_samples: usize) -> Result<Self, TranscribeError> {
         let mel = MelSpectrogram::new(&MelConfig {
             sample_rate: model.config.sample_rate,
             n_fft: model.config.n_fft,
@@ -327,10 +241,10 @@ impl<S: Splitter> Transcriber<S> {
             subsampling_factor,
             max_mel_frames: model.config.max_mel_frames,
         };
-        // Splitter advertises its emission ceiling; clamp to encoder
-        // capacity, then round up to the next power of two so the JIT
-        // codegen sees a clean factorisation.
-        let chunk_samples_cap = splitter.max_chunk_samples(&model_bounds).min(model_bounds.max_samples());
+        // Clamp the splitter's emission ceiling to encoder capacity, then round
+        // up to the next power of two so the JIT codegen sees a clean
+        // factorisation.
+        let chunk_samples_cap = max_chunk_samples.min(model_bounds.max_samples());
         let chunk_mel = (chunk_samples_cap / hop_length).saturating_add(2 * subsampling_factor);
         let max_t_mel = chunk_mel.max(1).next_power_of_two().min(model.config.max_mel_frames).max(subsampling_factor);
 
@@ -400,97 +314,30 @@ impl<S: Splitter> Transcriber<S> {
             }
         };
 
-        Ok(Self { model, opts, splitter, mel, head_decoder, encoder_jit, max_batch, max_t_mel })
+        Ok(Self { model, opts, mel, head_decoder, encoder_jit, max_batch, max_t_mel })
+    }
+}
+
+impl svod_arch::pipelines::audio::Transcriber for GigaAmTranscriber {
+    type Error = TranscribeError;
+
+    fn sample_rate(&self) -> u32 {
+        self.model.config.sample_rate as u32
     }
 
-    /// Encoder bounds at the model's full capacity. Passed to splitters
-    /// at split time so they can clamp chunks to the encoder's ceiling.
-    pub fn encoder_bounds(&self, sample_rate: u32) -> Result<EncoderBounds, TranscribeError<S::Error>> {
-        self.bounds_with(sample_rate, self.model.config.max_mel_frames)
+    fn wants_words(&self) -> bool {
+        self.opts.word_timestamps
     }
 
-    /// Encoder bounds tightened to this transcriber's prepared JIT capacity.
-    fn prepared_bounds(&self, sample_rate: u32) -> Result<EncoderBounds, TranscribeError<S::Error>> {
-        self.bounds_with(sample_rate, self.max_t_mel)
-    }
-
-    fn bounds_with(&self, sample_rate: u32, max_mel_frames: usize) -> Result<EncoderBounds, TranscribeError<S::Error>> {
-        if sample_rate as usize != self.model.config.sample_rate {
-            return Err(TranscribeError::SampleRateMismatch {
-                wav_sr: sample_rate,
-                model_sr: self.model.config.sample_rate as u32,
-            });
-        }
-        Ok(EncoderBounds {
-            sample_rate,
-            hop_length: self.model.config.hop_length,
-            subsampling_factor: self.model.config.subsampling_factor,
-            max_mel_frames,
-        })
-    }
-
-    /// Transcribe a waveform end-to-end: bounds → splitter → mel → batched
-    /// encoder → per-chunk head decode. `waveform` is fp32 PCM in `[-1, 1]`;
-    /// the model expects `model.config.sample_rate` (returns
-    /// [`TranscribeError::SampleRateMismatch`] otherwise).
-    pub fn transcribe(
-        &mut self,
-        waveform: &[f32],
-        sample_rate: u32,
-    ) -> Result<TranscribeResult, TranscribeError<S::Error>> {
-        let bounds = self.encoder_bounds(sample_rate)?;
-        let t_split = Instant::now();
-        let chunks = self.splitter.split(waveform, &bounds).context(SplitterSnafu)?;
-        let vad_wall = t_split.elapsed();
-        tracing::info!(
-            target: "svod_model::gigaam::transcribe",
-            split_ms = vad_wall.as_secs_f64() * 1e3,
-            n_chunks = chunks.len(),
-            "vad split",
-        );
-        let mut result = self.transcribe_chunks(waveform, sample_rate, &chunks)?;
-        if let Some(profile) = &mut result.profile {
-            profile.stages.insert(0, StageProfile::host("vad", vad_wall));
-            tracing::info!("transcribe profile\n{profile}");
-        }
-        Ok(result)
-    }
-
-    /// Escape hatch: caller-supplied chunks. Validates each chunk against
-    /// encoder capacity (`ChunkExceedsCapacity`) and the waveform's bounds
-    /// (`ChunkOutOfRange`) rather than silently truncating. Misaligned
-    /// boundaries are accepted — the mel/JIT pipeline pads the trailing
-    /// fractional frame.
-    pub fn transcribe_chunks(
-        &mut self,
-        waveform: &[f32],
-        sample_rate: u32,
-        chunks: &[AudioChunk],
-    ) -> Result<TranscribeResult, TranscribeError<S::Error>> {
-        // Validate against the prepared JIT capacity, not the model's
-        // worst case — oversized chunks must error here, not inside the JIT.
-        let max_samples = self.prepared_bounds(sample_rate)?.max_samples();
-        for (idx, chunk) in chunks.iter().enumerate() {
-            // The decode window is what's sliced + fed to the encoder, so it —
-            // not the core — must fit the waveform and the JIT capacity.
-            if chunk.decode_end_sample > waveform.len() {
-                return Err(TranscribeError::ChunkOutOfRange {
-                    idx,
-                    end_sample: chunk.decode_end_sample,
-                    waveform_len: waveform.len(),
-                });
-            }
-            let samples = chunk.decode_end_sample.saturating_sub(chunk.decode_start_sample);
-            if samples > max_samples {
-                return Err(TranscribeError::ChunkExceedsCapacity { idx, samples, max_samples });
-            }
-        }
+    /// Encode + decode each decode-window's audio into uncropped per-window
+    /// transcripts (word times relative to the window start). Owns the full
+    /// batched encoder + per-head decode (CTC fused; RN-T deferred lane-wave)
+    /// and the per-stage profile; the trait's `transcribe_chunks` default does
+    /// the core-crop and stitch.
+    fn transcribe_windows(&mut self, windows: &[&[f32]]) -> WindowDecode {
+        use svod_arch::pipelines::audio::Transcript;
 
         let n_mels = self.mel.n_mels();
-        if chunks.is_empty() {
-            return Ok(TranscribeResult { text: String::new(), chunks: Vec::new(), profile: None });
-        }
-
         let sample_rate_hz = self.model.config.sample_rate;
         let d_model = self.model.config.d_model;
         let subs_kernel_size = match self.model.config.subsampling_mode {
@@ -499,78 +346,48 @@ impl<S: Splitter> Transcriber<S> {
         };
         let max_t_mel = self.max_t_mel;
         let max_batch = self.max_batch;
-        let want_words = self.opts.word_timestamps;
-        // The JIT now runs at constant shape `[max_batch, *, max_t_mel]`, so the
-        // encoder output buffer is always `[max_batch, max_t_sub, *]`: per-lane
-        // rows are strided by this constant max, not the per-batch active max.
+        // The JIT runs at constant shape `[max_batch, *, max_t_mel]`, so the
+        // encoder output buffer is always `[max_batch, max_t_sub, *]`.
         let max_t_sub = subs_output_length(subs_kernel_size, max_t_mel);
 
-        // Decode geometry per chunk. Mel is computed over the decode window;
-        // start_sec/end_sec (and the crop) reference the text-owning core.
-        let chunks_meta: Vec<ChunkMeta> = chunks
-            .iter()
-            .filter_map(|c| {
-                let mel_len = self.mel.num_frames(c.decode_end_sample.saturating_sub(c.decode_start_sample));
-                if mel_len == 0 {
-                    return None;
-                }
-                Some(ChunkMeta {
-                    decode_start: c.decode_start_sample,
-                    decode_end: c.decode_end_sample,
-                    mel_len,
-                    start_sec: c.start_sample as f32 / sample_rate_hz as f32,
-                    end_sec: c.end_sample as f32 / sample_rate_hz as f32,
-                    core_offset_sec: c.start_sample.saturating_sub(c.decode_start_sample) as f32
-                        / sample_rate_hz as f32,
-                })
-            })
-            .collect();
-        if chunks_meta.is_empty() {
-            return Ok(TranscribeResult { text: String::new(), chunks: Vec::new(), profile: None });
-        }
-
-        let num_chunks = chunks_meta.len();
-        let mut chunk_results: Vec<ChunkResult> = Vec::with_capacity(num_chunks);
+        let mel_lens: Vec<usize> = windows.iter().map(|w| self.mel.num_frames(w.len())).collect();
+        let num_chunks = windows.len();
+        let mut transcripts: Vec<Transcript> = Vec::with_capacity(num_chunks);
         // RN-T: encoder frames accumulated across all encode batches, decoded
-        // afterwards in backend-wide lane waves.
+        // afterwards in backend-wide lane waves (fills `transcripts` in order).
         let mut all_frames: Vec<Vec<f32>> = Vec::new();
         let mut all_valid: Vec<usize> = Vec::new();
         // Per-stage wall-clock, accumulated across batches. The JITs submit
-        // async (wait=false); the GPU drains on the first host `as_array()`
-        // read, so each stage timer is bounded by its drain point. `encoder_ms`
-        // is the fused encoder+head for CTC, encoder-only for RN-T.
+        // async; the GPU drains on the first host read, so each stage timer is
+        // bounded by its drain point.
         let (mut t_mel, mut t_encoder, mut t_decode) = (Duration::ZERO, Duration::ZERO, Duration::ZERO);
-        // Per-call profiling: one representative encoder batch (a steady one —
-        // batch 0 pays cold caches ~6x) plus, for RN-T, one decode step.
         let profile_batch = self.opts.profile.then(|| 3.min(num_chunks.div_ceil(max_batch) - 1) * max_batch);
         let mut profile = self.opts.profile.then(RunProfile::default);
         for chunk_batch_start in (0..num_chunks).step_by(max_batch) {
             let b = (num_chunks - chunk_batch_start).min(max_batch);
-            let chunk_lengths: Vec<usize> = (0..b).map(|bi| chunks_meta[chunk_batch_start + bi].mel_len).collect();
+            let chunk_lengths: Vec<usize> = (0..b).map(|bi| mel_lens[chunk_batch_start + bi]).collect();
 
             let t_stage = Instant::now();
             // Chunks are independent and `forward_into` is `&self` over shared
-            // read-only state (plan, filterbank, window) — parallelize the
-            // batch; per-chunk output is bit-identical to the serial loop.
+            // read-only state — parallelize the batch; output is bit-identical
+            // to the serial loop.
             use rayon::prelude::*;
             let batch_mels: Vec<Vec<f32>> = (0..b)
                 .into_par_iter()
                 .map(|bi| {
-                    let m = &chunks_meta[chunk_batch_start + bi];
-                    let mut chunk_mel = ndarray::Array3::<f32>::zeros((1, n_mels, m.mel_len));
+                    let valid = mel_lens[chunk_batch_start + bi];
+                    let mut chunk_mel = ndarray::Array3::<f32>::zeros((1, n_mels, valid));
                     {
                         let mut view = chunk_mel.view_mut().into_dyn();
-                        self.mel.forward_into(&waveform[m.decode_start..m.decode_end], &mut view);
+                        self.mel.forward_into(windows[chunk_batch_start + bi], &mut view);
                     }
                     chunk_mel.as_slice().expect("contiguous chunk mel").to_vec()
                 })
                 .collect();
             t_mel += t_stage.elapsed();
 
-            // Each head packs mel/lengths into ITS OWN JIT and executes. CTC's
-            // `GigaAmCtcJit` is the fused encoder+head (output = log-probs, no
-            // host round-trip); RN-T runs the standalone encoder JIT and decodes
-            // its output per item (its predictor/joint JITs ride with the backend).
+            // CTC's `GigaAmCtcJit` is the fused encoder+head (log-probs, no host
+            // round-trip); RN-T runs the standalone encoder JIT, decoded later.
             match &mut self.head_decoder {
                 HeadDecoder::Ctc { jit, decoder } => {
                     let t_pack = Instant::now();
@@ -597,33 +414,20 @@ impl<S: Splitter> Transcriber<S> {
                     let flat = logits.as_slice().expect("contiguous logits");
                     for (bi, mel_len) in chunk_lengths.iter().enumerate() {
                         let actual_sub = subs_output_length(subs_kernel_size, *mel_len);
-                        let m = chunks_meta[chunk_batch_start + bi];
-                        // Frames span the DECODE window; frame_shift maps a frame
-                        // index to decode-window-relative seconds.
-                        let decode_dur = (m.decode_end - m.decode_start) as f32 / sample_rate_hz as f32;
-                        let frame_shift = decode_dur / (actual_sub.max(1) as f32);
-
+                        // Frames span the decode window; frame_shift maps a frame
+                        // index to window-relative seconds.
+                        let window_len = windows[chunk_batch_start + bi].len();
+                        let frame_shift = (window_len as f32 / sample_rate_hz as f32) / (actual_sub.max(1) as f32);
                         let item_slice = &flat[bi * item_stride..bi * item_stride + item_stride];
 
-                        // Always timestamp: the words drive the core crop even
-                        // when the caller didn't ask for word output.
                         let t_dec = Instant::now();
                         let (text, frames) = decoder
                             .decode_with_timestamps(item_slice, max_t_sub, actual_sub)
                             .context(CtcDecodeSnafu)?;
                         t_decode += t_dec.elapsed();
 
-                        let cropped = crop_words_to_core(
-                            ctc_frames_to_words(&text, &frames, frame_shift),
-                            m.core_offset_sec,
-                            m.core_duration(),
-                        );
-                        chunk_results.push(ChunkResult {
-                            start_sec: m.start_sec,
-                            end_sec: m.end_sec,
-                            text: words_to_text(&cropped),
-                            words: want_words.then_some(cropped),
-                        });
+                        let words = ctc_frames_to_words(&text, &frames, frame_shift);
+                        transcripts.push(Transcript { text, words });
                     }
                 }
                 HeadDecoder::Rnnt { .. } => {
@@ -651,21 +455,15 @@ impl<S: Splitter> Transcriber<S> {
                         enc_jit.execute().context(JitSnafu)?;
                     }
                     let item_stride = max_t_sub * d_model;
-                    // Output is frame-major [B, max_t_sub, d_model] (permuted
-                    // on-device): one contiguous prefix copyout drains the
-                    // dispatch and skips the inactive lanes of a partial last
-                    // batch (lanes are leading-dim-major, so the active region
-                    // is exactly the first `b` items).
+                    // Frame-major [B, max_t_sub, d_model]: one contiguous prefix
+                    // copyout drains the dispatch and skips inactive lanes.
                     let enc_buf = enc_jit.output().context(JitSnafu)?;
-                    // f32-typed allocation: guarantees alignment for the cast.
                     let mut raw = vec![0f32; b * item_stride];
                     enc_buf.copyout_prefix(bytemuck::cast_slice_mut(&mut raw)).context(DeviceSnafu)?;
                     t_encoder += t_enc.elapsed();
                     let flat: &[f32] = &raw;
-                    // Decode is per-step floor-bound, so lanes decouple from
-                    // the encoder batch: collect every chunk's frames here and
-                    // decode them all in one wide lockstep wave after the
-                    // encode loop.
+                    // Lanes decouple from the encoder batch: collect every
+                    // chunk's frames, decode them in one wide wave after the loop.
                     for (bi, mel_len) in chunk_lengths.iter().enumerate() {
                         let actual_sub = subs_output_length(subs_kernel_size, *mel_len);
                         let base = bi * item_stride;
@@ -690,36 +488,18 @@ impl<S: Splitter> Transcriber<S> {
                 t_decode += t_dec.elapsed();
 
                 for (li, (_raw, emissions)) in lane_results.into_iter().enumerate() {
-                    let m = chunks_meta[wave_start + li];
-                    // Frames span the DECODE window; frame_shift maps to
-                    // decode-window-relative seconds before the core crop.
-                    let decode_dur = (m.decode_end - m.decode_start) as f32 / sample_rate_hz as f32;
-                    let frame_shift = decode_dur / (valid[li].max(1) as f32);
+                    let window_len = windows[wave_start + li].len();
+                    let frame_shift = (window_len as f32 / sample_rate_hz as f32) / (valid[li].max(1) as f32);
                     // `frames_to_words` strips the SentencePiece `▁` markers, so
-                    // `words_to_text` rebuilds the (cropped) chunk transcript.
-                    let cropped = crop_words_to_core(
-                        decoder.frames_to_words(&emissions, frame_shift),
-                        m.core_offset_sec,
-                        m.core_duration(),
-                    );
-                    chunk_results.push(ChunkResult {
-                        start_sec: m.start_sec,
-                        end_sec: m.end_sec,
-                        text: words_to_text(&cropped),
-                        words: want_words.then_some(cropped),
-                    });
+                    // `words_to_text` reconstructs the window transcript.
+                    let words = decoder.frames_to_words(&emissions, frame_shift);
+                    transcripts.push(Transcript { text: words_to_text(&words), words });
                 }
             }
         }
 
         if let HeadDecoder::Rnnt { backend, .. } = &self.head_decoder {
             let s = &backend.stats;
-            // Two scales, kept distinct: `steps_per_lane` (= n_blocks ×
-            // block_steps) is the lockstep step count one lane drives — the WIND
-            // lever, which drops as the window widens. `tokens_emitted` and
-            // `tape_slots` are over the full lanes × steps tape, so
-            // tokens_emitted / tape_slots is the useful fraction; `n_blocks` is
-            // the host-sync count.
             let block_steps = svod_arch::rnnt::BatchBlockStep::block_steps(backend) as u64;
             let lanes = svod_arch::rnnt::BatchBlockStep::batch(backend) as u64;
             let frames_total: usize = all_valid.iter().sum();
@@ -736,7 +516,6 @@ impl<S: Splitter> Transcriber<S> {
             );
         }
 
-        // For RN-T the predictor/joint dispatches fold into `decode_ms`.
         tracing::info!(
             target: "svod_model::gigaam::transcribe",
             num_chunks,
@@ -747,18 +526,15 @@ impl<S: Splitter> Transcriber<S> {
         );
 
         if let Some(p) = &mut profile {
-            // GPU stages pushed so far (encoder / ctc_head) share the accumulated
-            // encoder wall; prepend the host-only mel stage so display order is
-            // mel → encoder (vad is prepended by the caller).
+            // GPU stages share the accumulated encoder wall; prepend the
+            // host-only mel stage so display order is mel → encoder.
             for s in &mut p.stages {
                 s.wall = t_encoder;
             }
             p.stages.insert(0, StageProfile::host("mel", t_mel));
         }
 
-        let text =
-            chunk_results.iter().map(|c| c.text.as_str()).filter(|s| !s.is_empty()).collect::<Vec<_>>().join(" ");
-        Ok(TranscribeResult { text, chunks: chunk_results, profile })
+        Ok((transcripts, profile))
     }
 }
 

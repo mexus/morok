@@ -1,14 +1,15 @@
 //! GigaAM inference demo (CTC + RN-T).
 //!
-//! Loads a WAV, hands it to a [`Transcriber`] over a [`GigaAm`] with an
-//! explicit [`FireRedVadSplitter`], and prints the transcript. The head is
-//! dispatched from the loaded weights: a CTC revision drives the fused
-//! encoder+head JIT, an RN-T revision the encoder + per-step predictor/joint
-//! backend (SentencePiece `▁ → space` post-processing inside the transcriber).
+//! Loads a WAV and runs it through an [`Asr`]: a [`FireRedVadSplitter`]-built
+//! `VadSplitter` feeds a [`GigaAmTranscriber`]. The head is dispatched from the
+//! loaded weights — a CTC revision drives the fused encoder+head JIT, an RN-T
+//! revision the encoder + per-step predictor/joint backend (SentencePiece
+//! `▁ → space` post-processing inside the transcriber).
 //!
-//! Substitute `FixedLengthSplitter::new()` for the VAD splitter to skip the
-//! FireRedVAD hub download — useful for tests, short utterances, or pipelines
-//! that already segmented the input.
+//! Substitute a `FixedLengthSplitter` (in `svod_arch::pipelines::audio`,
+//! sized from `bounds.max_samples()` / `bounds.align_to_samples()`) for the
+//! VAD splitter to skip the FireRedVAD hub download — useful for tests, short
+//! utterances, or pipelines that already segmented the input.
 //!
 //! Usage:
 //!   cargo run -p svod-model --release --example gigaam_infer -- audio.wav
@@ -23,8 +24,10 @@ use std::time::Instant;
 
 use clap::Parser;
 
+use svod_arch::pipelines::audio::Asr;
+use svod_model::audio::EncoderBounds;
 use svod_model::firered_vad::FireRedVadSplitter;
-use svod_model::gigaam::{GigaAm, TranscribeOpts, Transcriber};
+use svod_model::gigaam::{GigaAm, GigaAmTranscriber, TranscribeOpts};
 
 #[derive(Parser, Debug)]
 #[command(about = "GigaAM transcription demo (CTC + RN-T)", long_about = None)]
@@ -85,17 +88,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if args.rnnt && model.head.as_rnnt().is_none() {
         return Err(format!("{}@{revision} has a CTC head, not RN-T.", args.repo).into());
     }
-    let splitter = FireRedVadSplitter::from_hub()?;
-    let mut transcriber = Transcriber::new(model, splitter, opts.clone())?;
+    if sample_rate as usize != model.config.sample_rate {
+        return Err(format!("WAV is {sample_rate} Hz; model expects {} Hz", model.config.sample_rate).into());
+    }
+    // Encoder bounds (capacity / frame stride) drive both the splitter's chunk
+    // sizing and the transcriber's eager JIT prepare.
+    let bounds = EncoderBounds {
+        sample_rate: model.config.sample_rate as u32,
+        hop_length: model.config.hop_length,
+        subsampling_factor: model.config.subsampling_factor,
+        max_mel_frames: model.config.max_mel_frames,
+    };
+    let splitter = FireRedVadSplitter::from_hub(&bounds)?;
+    let max_chunk = splitter.max_chunk_samples();
+    let transcriber = GigaAmTranscriber::new(model, opts.clone(), max_chunk)?;
+    let mut asr = Asr::new(splitter, transcriber);
 
     println!("Transcribing...");
     let t_transcribe = Instant::now();
-    let result = transcriber.transcribe(&waveform, sample_rate)?;
+    // VAD split → arch pipeline machinery (decode windows → crop → stitch),
+    // with the VAD stage folded into the profile.
+    let result = asr.transcribe(&waveform)?;
     let dt_transcribe = t_transcribe.elapsed();
 
     if opts.word_timestamps {
-        for word in result.words() {
-            println!("  [{:>6.2} - {:>6.2}] {}", word.start, word.end, word.text);
+        for chunk in &result.chunks {
+            let off = chunk.start_sec;
+            for w in chunk.words.iter().flatten() {
+                println!("  [{:>6.2} - {:>6.2}] {}", w.start + off, w.end + off, w.text);
+            }
         }
     } else {
         for chunk in &result.chunks {

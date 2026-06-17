@@ -3486,6 +3486,7 @@ dependencies = [
  "serde",
  "serde_json",
  "snafu 0.9.0",
+ "svod-runtime",
  "test-case",
 ]
 

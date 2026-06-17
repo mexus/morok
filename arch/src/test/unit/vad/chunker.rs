@@ -211,7 +211,7 @@ fn test_chunker_decode_end_can_exceed_waveform_len() {
     // last prob's window straddles the waveform end and the emitted chunk's
     // decode/core end reflects the full window — overshooting the waveform by
     // up to `samples_per_prob - 1` samples (callers owning the waveform clamp
-    // at slice time, e.g. via `max_total_samples` or `trim_chunks_to_waveform`).
+    // at slice time, e.g. via `max_total_samples` or when slicing the window).
     let probs = vec![1.0_f32; 4]; // 4 windows × 512 = 2048 samples of coverage
     let waveform_len = 1800; // real waveform ended mid-window
     let opts = ChunkerOpts {
