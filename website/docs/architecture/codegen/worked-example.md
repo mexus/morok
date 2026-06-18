@@ -248,7 +248,7 @@ Svod has some patterns/enhancements not in Tinygrad:
 | **Reduction** | Combine many values into one | Sum, max, min |
 | **Store** | Write to memory | `arr[i] = value` |
 | **Symbolic** | Simplify using algebra rules | `(x/4)*4 → x` (when `x%4=0`) |
-| **Tensor core** | Hardware for fast matrix multiply | NVIDIA GPUs only |
+| **Tensor core** | Hardware for fast matrix multiply | NVIDIA tensor cores & AMD matrix cores |
 | **Topological sort** | Order nodes respecting dependencies | A before B if B uses A's result |
 | **UNROLL** | Expand one op into multiple positions | `x → [x_0, x_1, x_2, x_3]` |
 | **UPCAST** | Mark intent to vectorize | `RANGE(0..4, UPCAST)` |

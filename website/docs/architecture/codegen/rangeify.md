@@ -227,7 +227,7 @@ After the pre-pass, `split_all_stores` splits at STORE boundaries, then `fix_ass
 
 | Action | Effect | Hardware Target |
 |--------|--------|-----------------|
-| TC | Enable tensor core usage | NVIDIA GPUs |
+| TC | Enable tensor core usage | NVIDIA & AMD GPUs (WMMA/MFMA) |
 | UPCAST | Vectorize a dimension | All (SIMD) |
 | LOCAL | Use local/shared memory | GPU (LDS) / CPU (L1) |
 | UNROLL | Unroll a loop dimension | All (avoid loop overhead) |

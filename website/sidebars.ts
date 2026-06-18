@@ -48,6 +48,20 @@ const sidebars: SidebarsConfig = {
     },
     {
       type: 'category',
+      label: 'Tile Kernels (tk)',
+      items: [
+        'tile-kernels/overview',
+        'tile-kernels/where-flops-hide',
+        'tile-kernels/tiling',
+        'tile-kernels/lowering',
+        'tile-kernels/wave-portability',
+        'tile-kernels/flash-attention',
+        'tile-kernels/debugging',
+        'tile-kernels/comparison',
+      ],
+    },
+    {
+      type: 'category',
       label: 'Backends',
       items: [
         'backends/jit-loader',
