@@ -4,11 +4,11 @@ sidebar_label: Flash Attention
 
 # Worked Example: Flash Attention
 
-Every chapter so far has pointed here. Flash Attention is the kernel that justifies `tk`'s
-existence — the one the [overview](./overview) named as *not* expressible as a single
-schedulable reduction, the reason a hand-authoring surface exists at all. This chapter walks
-through it: what makes it hard, how the tile abstractions answer that, and where the
-[wave-size split](./wave-portability) shows up in anger.
+Flash Attention is the kernel that justifies `tk`'s existence — the one the
+[Overview](./overview) named as *not* expressible as a single schedulable reduction, the reason
+a hand-authoring surface exists at all. This chapter walks through it: what makes it hard, how
+the tile abstractions answer that, and where the [Wave32 vs Wave64](./wave-portability) split
+shows up in anger.
 
 We're describing the forward kernel in `tk/src/kernels/fa.rs`, reached through the USE-face
 `flash_attention(q, k, v)`.
@@ -63,28 +63,28 @@ rescale. No lane arithmetic in sight.
 
 ## Streaming: double-buffered KV
 
-This is gap #2 from [Where the FLOPS Hide](./where-flops-hide) in action. While the matrix
+This is gap 2 from [Where the FLOPS Hide](./where-flops-hide) in action. While the matrix
 core works on the current KV block, the next block should already be on its way into shared
 memory. The kernel keeps **two** LDS buffers and alternates ("double-buffering" / software
 pipelining): compute on buffer A while loading buffer B, then swap.
 
 ```text
-   load K/V block 0 ──▶ LDS[A]
-   ┌──────────────────────────────────────────────────┐
-   │ compute on LDS[A]   ║   load block 1 ──▶ LDS[B] │   ← overlap
-   │ compute on LDS[B]   ║   load block 2 ──▶ LDS[A] │
-   │ ...                                              │
-   └──────────────────────────────────────────────────┘
+   load K/V block 0 --> LDS[A]
+   ┌─────────────────────────────────────────────────┐
+   │ compute on LDS[A]   ║   load block 1 --> LDS[B] │   <- overlap
+   │ compute on LDS[B]   ║   load block 2 --> LDS[A] │
+   │ ...                                             │
+   └─────────────────────────────────────────────────┘
 ```
 
-The shared tiles carry their XOR swizzle (gap #3), so the cooperative fill and the per-lane read
+The shared tiles carry their XOR swizzle (gap 3), so the cooperative fill and the per-lane read
 are bank-conflict-free.
 
 ---
 
 ## The wave-size wrinkle: relayout between the two matmuls
 
-Here's where [wave portability](./wave-portability) stops being abstract. The kernel does two
+Here's where [Wave32 vs Wave64](./wave-portability) stops being abstract. The kernel does two
 matrix multiplies, and the output of the first (`S = Q·Kᵀ`, after softmax becomes `P`) is the
 *input* of the second (`P·V`). Can the score accumulator be fed straight back in as an operand?
 
@@ -119,18 +119,18 @@ threading raw scheduling intrinsics through the algorithm by hand.
 
 ---
 
-## What this kernel demonstrates
+## Why this matters
 
 Flash Attention is the whole section condensed into one file:
 
 - it exists because **online softmax is a recurrence**, not a tileable reduction
-  ([overview](./overview));
-- it lives or dies on **streaming and overlap** ([where the FLOPS hide](./where-flops-hide));
-- it's expressed entirely in **tiles and roles**, never lane indices ([tiling](./tiling));
+  ([Overview](./overview));
+- it lives or dies on **streaming and overlap** ([Where the FLOPS Hide](./where-flops-hide));
+- it's expressed entirely in **tiles and roles**, never lane indices ([What Tiling Is](./tiling));
 - it compiles to **the same UOp IR** as everything else and joins the lazy graph as an
-  `Op::Call` ([authoring into the IR](./lowering));
+  `Op::Call` ([Authoring into the IR](./lowering));
 - and it carries an explicit **wave32/wave64 branch** in its hot loop
-  ([wave portability](./wave-portability)).
+  ([Wave32 vs Wave64](./wave-portability)).
 
 That's why it's hand-written, and why `tk` exists to write it. To run it in isolation and check
-its numbers, see [Debugging tk kernels](./debugging).
+its numbers, see [Debugging](./debugging).

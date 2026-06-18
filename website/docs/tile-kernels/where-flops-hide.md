@@ -9,7 +9,7 @@ A modern AMD matrix core advertises a number that sounds like a promise. The dat
 an add — and measure. You get a few percent of the number on the box.
 
 The FLOPS didn't vanish. They're hiding — and finding them is what *any* fast matrix kernel has
-to do, whether the compiler generates it (see the [overview](./overview)) or you write it by hand
+to do, whether the compiler generates it (see the [Overview](./overview)) or you write it by hand
 with a tile library like `tk` (inspired by [HipKittens](https://github.com/HazyResearch/HipKittens)).
 
 This chapter is the "why" behind everything else in this section: it explains what a matrix
@@ -112,26 +112,27 @@ without accounting for this — is silently wrong. Keeping a single kernel corre
 own chapter: [Wave32 vs Wave64](./wave-portability).
 
 :::tip For GPU experts
-HipKittens' `analysis/paper_experiments/` micro-benchmarks quantify the gaps above, and they're
-worth internalizing because they justify the design:
+HipKittens' `analysis/paper_experiments/` micro-benchmarks quantify the gaps above. They justify
+the design:
 
-- **Bank structure (gap 3):** the LDS micro-benchmark confirms **64 banks** accessed in **two
-  phases of 32 lanes** on CDNA — exactly the structure the XOR swizzles are tuned against.
-- **Overlap pattern is not universal (gap 4):** on the same hardware, a BF16 GEMM peaks with
-  8-wave ping-pong (~1580 TFLOPS) while an FP8 GEMM peaks with 4-wave interleave
-  (~3303 vs ~3066 TFLOPS for ping-pong). The right schedule depends on the dtype.
-- **Chiplet swizzle (gap 5):** remapping workgroup IDs for XCD locality is worth on the order
-  of ~10% on a large GEMM.
+| Gap | Finding |
+|-----|---------|
+| gap 3 (bank structure) | The LDS micro-benchmark confirms 64 banks accessed in two phases of 32 lanes on CDNA — the structure the XOR swizzles are tuned against. |
+| gap 4 (overlap not universal) | A BF16 GEMM peaks with 8-wave ping-pong (~1580 TFLOPS); an FP8 GEMM peaks with 4-wave interleave (~3303 vs ~3066 TFLOPS for ping-pong). The right schedule depends on the dtype. |
+| gap 5 (chiplet swizzle) | Remapping workgroup IDs for XCD locality is worth on the order of 10% on a large GEMM. |
 
 `tk` implements these levers directly: the XOR swizzles live in `tk/src/swizzle.rs` (ported from
 HipKittens' shared-tile layouts), the L2/chiplet remap in `tk/src/grid.rs` (`l2_swizzle`), and
 the compute/memory overlap is expressed as a `sched::pipeline(SchedKind::Attention, …)` marker
-on the Flash-Attention KV loop that a post-linearization scheduling pass consumes.
+on the Flash Attention KV loop that a post-linearization scheduling pass consumes.
 
 When that high-level marker isn't enough, the AUTHOR face also exposes the raw machine-scheduler
-intrinsics directly (as `Op::Custom`) for squeezing the last few percent out of gap #4 —
-controlling wave issue priority around MFMA bursts, deferring LDS waits for register-staged
-prefetch, and pinning a cluster's loads, MFMAs, and stores against the machine scheduler.
+intrinsics directly (as `Op::Custom`) for squeezing the last few percent out of gap 4:
+
+- control wave issue priority around MFMA bursts,
+- defer LDS waits for register-staged prefetch,
+- pin a cluster's loads, MFMAs, and stores against the machine scheduler.
+
 `sched::pipeline` is the default; these are the manual override for placing the schedule by hand.
 :::
 
@@ -141,11 +142,12 @@ prefetch, and pinning a cluster's loads, MFMAs, and stores against the machine s
 
 Everything in the rest of this section is a response to one of these five gaps:
 
-- **Tiling** (next chapter) answers gaps 1–3: it puts data in the right layout, in the right
-  memory, conflict-free.
-- **The Flash Attention walkthrough** shows gaps 2 and 4 in action: double-buffered streaming
+- [What Tiling Is](./tiling), the next chapter, answers gaps 1–3: it puts data in the right
+  layout, in the right memory, conflict-free.
+- [Flash Attention](./flash-attention) shows gaps 2 and 4 in action: double-buffered streaming
   and an explicit pipeline.
-- **Wave portability** is the AMD-specific tax that gaps 1 and the lane-count difference impose.
+- [Wave32 vs Wave64](./wave-portability) is the AMD-specific tax that gap 1 and the lane-count
+  difference impose.
 
 The headline: a fast GPU kernel is not "the math, written down." It is *the math, plus an
 answer to where every cycle between two matrix instructions goes.* That's where the FLOPS hide.
@@ -157,7 +159,7 @@ driving the matrix cores. The five gaps are the *hardware reality* every fast ke
 compiler-generated and hand-written alike — not a hole in the compiler.
 
 So `tk` is not a competing code path. It is the **instrument for the kernels BEAM can't express**
-([When to hand-write](./overview)), and it earns its place by adding *no extra complexity*: a `tk`
+([Overview](./overview)), and it earns its place by adding *no extra complexity*: a `tk`
 kernel emits the same UOp IR the compiler already produces — no second backend, no separate
 toolchain, no new debugger. You reach for it only to write an implementation yourself, and even
 then you stay inside the one compiler.

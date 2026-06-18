@@ -8,8 +8,9 @@ Here is a bug that doesn't exist on NVIDIA. You write a tile kernel, test it on 
 datacenter GPU, and it's perfect. You run the *same* kernel on an RDNA laptop APU and the
 numbers are garbage — no crash, no error, just wrong. Nothing in the code looks different.
 
-The culprit is the **wavefront size**, and dealing with it cleanly is what separates a tile
-library that works on one chip from one that's actually portable.
+[What Tiling Is](./tiling) introduced fragments and role-based selection; this chapter explains
+why that indirection has to exist. The culprit is the **wavefront size**, and dealing with it
+cleanly is what separates a tile library that works on one chip from one that's actually portable.
 
 ---
 
@@ -57,9 +58,10 @@ The roles are `FragRole::{Accumulator, Operand, AccumulatorT}` and the resolver 
 the *physical* layout — element count per lane, the interleave map, replication — is filled in
 for the target wave size. Write once, run on both.
 
-This is the same lesson [HipKittens](./comparison) learned: it ships two parallel backends,
-`cdna4` (wave64) and `udna1` (wave32), keyed off a single `WARP_THREADS` constant so the tile
-types recompile correctly for each. `tk` collapses that into one runtime-resolved `ArchCaps`.
+This is the same lesson HipKittens learned (see [tk vs HipKittens vs CuTile](./comparison)): it
+ships two parallel backends, `cdna4` (wave64) and `udna1` (wave32), keyed off a single
+`WARP_THREADS` constant so the tile types recompile correctly for each. `tk` collapses that into
+one runtime-resolved `ArchCaps`.
 
 ---
 
@@ -79,14 +81,13 @@ Two capability methods on `ArchCaps` (`tk/src/arch.rs`) carry most of the wave-s
 - **`reduce_tree()`** returns the cross-lane sibling-fold offsets. On wave64 that's
   `[16, 32, 48]` (three xor steps to fold 4 sub-fragments); on wave32 it's `[16]` (one step).
   Cross-lane reductions iterate over this list — get it from `caps`, never hardcode it.
-- **`acc_reusable_as_input()`** is `true` on CDNA and `false` on RDNA. It answers: "can a matrix
-  accumulator be fed straight back in as an operand to the next multiply?" On CDNA the layouts
-  match, so it's a free register copy. On RDNA the accumulator and operand layouts differ, so
-  the value has to make a **round-trip through LDS** to be relaid out. This is exactly the split
-  the [Flash Attention kernel](./flash-attention) has to handle between its two matmuls — on
-  RDNA the scores can't go directly from the QKᵀ accumulator into the A·V multiply.
+- **`acc_reusable_as_input()`** answers: "can a matrix accumulator be fed straight back in as an
+  operand to the next multiply?" On CDNA it's `true` — the layouts match, so it's a free register
+  copy. On RDNA it's `false` — the accumulator and operand layouts differ, so the value makes a
+  round-trip through LDS to be relaid out. [Flash Attention](./flash-attention) handles this split
+  between its two matmuls.
 
-The `ept` field on `BaseShape` (from the [tiling chapter](./tiling)) exists for the same
+The `ept` field on `BaseShape` (from [What Tiling Is](./tiling)) exists for the same
 reason: on RDNA, operands are replicated across lanes, so elements-per-thread isn't
 `element_count / wave_size` and must be stored explicitly.
 :::
@@ -98,5 +99,5 @@ reason: on RDNA, operands are replicated across lanes, so elements-per-thread is
 Portability across wave sizes is the AMD-specific tax on hand-written kernels, and it's why a
 naive port of an NVIDIA tile library doesn't just work. `tk` pays the tax once, in the
 `ArchCaps` abstraction, so individual kernels stay readable: they speak in *roles* and let the
-hardware table sort out the lanes. The [Flash Attention walkthrough](./flash-attention) is
-where you see this pay off in a real kernel.
+hardware table sort out the lanes. [Flash Attention](./flash-attention) is where you see this
+pay off in a real kernel.

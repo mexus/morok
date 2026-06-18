@@ -4,16 +4,13 @@ sidebar_label: What Tiling Is
 
 # What Tiling Is
 
-The [previous chapter](./where-flops-hide) ended on a problem: between every two matrix
+[Where the FLOPS Hide](./where-flops-hide) ended on a problem: between every two matrix
 instructions, the hardware burns cycles on addresses, memory, and layout. Tiling is the
-abstraction that makes those cycles disappear. It is the single most important idea in `tk`,
-and — happily — it's also one of the easiest to picture.
+abstraction that makes those cycles disappear. It is the single most important idea in `tk`.
 
 ---
 
 ## Tensors live in memory; tiles live in registers
-
-Start with two words that sound similar and mean very different things.
 
 A **tensor** is the big array you think about at the model level — the `[4096, 4096]` weight
 matrix. It lives in global memory (HBM), it's far away and slow to reach, and it persists for
@@ -62,7 +59,7 @@ block-beta
 *A `64×32` register tile is a 4×2 grid of `16×16` matrix-core fragments — the moment its data lands in registers it is already in MMA layout.*
 
 Because the tile is built from fragments, the moment its data is in registers it's *already*
-in the layout the matrix instruction wants. No shuffle before the multiply — that's gap #1
+in the layout the matrix instruction wants. No shuffle before the multiply — that's gap 1
 from the last chapter, gone.
 
 ---
@@ -104,9 +101,9 @@ index calculation.
 
 The pure shape descriptors live in `tk/src/tiles.rs`. The base fragment is
 `BaseShape { rows, cols, ept }`, where `ept` (elements-per-thread) is carried **explicitly**
-rather than computed as `rows*cols / wave_size`. That's deliberate: on RDNA the matrix
-instruction *replicates* operands across lanes, so the elements-per-thread for an operand tile
-isn't simply the element count divided by the wave size. Register tiles add
+rather than computed as `rows*cols / wave_size`, because on RDNA the matrix instruction
+*replicates* operands across lanes — so an operand tile's element count divided by the wave
+size is the wrong answer. Register tiles add
 `stride`/`interleave` fields (`RTBaseShape`) to encode the RDNA accumulator's even/odd row map,
 which no plain stride can express.
 
@@ -127,6 +124,6 @@ documented in the [Op Bestiary](../architecture/op-bestiary).
 ## Where this goes
 
 You now have the vocabulary: tensors in memory, tiles in registers, fragments in the matrix
-core. The [next chapter](./lowering) shows what happens when you actually *write* a kernel
+core. [Authoring into the IR](./lowering) shows what happens when you actually *write* a kernel
 out of these pieces — how the `Kernel`/`Group` builder turns tile operations into the very same
 UOp IR the rest of Svod compiles.

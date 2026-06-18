@@ -4,9 +4,9 @@ sidebar_label: Authoring into the IR
 
 # Authoring into the One IR
 
-Most tile frameworks answer "how do I let users hand-write a kernel?" by adding a *layer* — a
-new DSL with its own compiler, its own debugger, and its own profiler bolted onto the side of
-the framework. `tk`'s defining choice is to add **no layer at all**. A hand-written kernel
+Most tile frameworks answer "how do I let users hand-write a kernel?" by adding a *layer*. That
+layer is a new DSL with its own compiler, its own debugger, and its own profiler bolted onto the
+side of the framework. `tk`'s defining choice is to add **no layer at all**. A hand-written kernel
 lowers into the *same* UOp IR as everything else, so it shares one rendering path, one debugger,
 and one profiler — and a developer building an ML application has exactly **one IR to learn**,
 from a `Tensor` add all the way down to a hand-tuned attention kernel.
@@ -21,7 +21,7 @@ hand-written kernel slots *into* it.
 
 ## No new layer: a kernel is just a subgraph
 
-Recall the claim from the [overview](./overview): `tk` is a builder, not a backend. It does not
+Recall the claim from the [Overview](./overview): `tk` is a builder, not a backend. It does not
 emit assembly, and it does not define an IR of its own. It emits the *exact same* lowered IR the
 normal codegen path already consumes — `RANGE` loops, `INDEX`/`LOAD`/`STORE` memory ops, `WMMA`
 matrix instructions (and, where you need it, raw LLVM/ASM as `Op::Custom`).
@@ -128,12 +128,16 @@ alone.
 
 There are two routes from a finished `Kernel` to running code, for the two different audiences.
 
+:::tip For GPU experts
+The scheduler treats the kernel's `Op::Call` like any other graph node — it walks the `AFTER`/`Call` dependency chains to find kernel boundaries and emits it as one scheduled kernel, while the rewrite passes run in a *calls-preserving* traversal that doesn't descend into the body. So your hand-lowered `SINK` is scheduled and dependency-tracked exactly like an autotuned kernel, but its interior is never rewritten.
+:::
+
 ### Direct launch (the DEBUG face)
 
 `compile` / `launch` / `run_kernel` (`tk/src/launch.rs`) take a finished `SINK`, bind it to
 concrete device buffers, render, compile, and dispatch — bypassing the tensor scheduler
-entirely. This is how you test and benchmark a kernel in isolation; see the
-[debugging chapter](./debugging).
+entirely. This is how you test and benchmark a kernel in isolation; see
+[Debugging](./debugging).
 
 ### Graph node (the USE face)
 
@@ -204,14 +208,12 @@ shape is the same: a SINK over a STORE, scoped by ranges.
 
 ---
 
-## The deeper insight
+## Why this matters
 
 The reason Svod can offer *both* "let the compiler find the schedule" and "I'll write the
 schedule myself" — without two compilers — is that both produce the same artifact: a `SINK` of
 UOps. The optimizer's `opts_to_apply` field is the seam between them, and it's one enum away
-from `None`. Autotuned matmul and hand-written Flash Attention compile through one renderer, run
-on one runtime, and print with one debugger. The [comparison chapter](./comparison) returns
-to why that's unusual.
+from `None`. [tk vs HipKittens vs CuTile](./comparison) returns to why that's unusual.
 
-Next, the wrinkle that makes hand-authoring genuinely hard on AMD:
-[keeping a kernel correct across wave32 and wave64](./wave-portability).
+Next, the wrinkle that makes hand-authoring genuinely hard on AMD — keeping a kernel correct
+across wave sizes: [Wave32 vs Wave64](./wave-portability).

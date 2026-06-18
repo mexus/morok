@@ -4,11 +4,12 @@ sidebar_label: Debugging
 
 # Debugging and Verifying Kernels
 
-A hand-written kernel is only as trustworthy as your ability to check it. The USE face hands
-you a lazy `Tensor` that fuses into a big graph — convenient, but a bad place to ask "is this
-one kernel correct, and how fast is it?" `tk`'s **DEBUG face** exists for exactly that: run a
-single kernel against concrete buffers, read the result back, time it, and prove that a
-refactor didn't change its behavior.
+A hand-written kernel is only as trustworthy as your ability to check it. The
+[Flash Attention](./flash-attention) walkthrough showed the kind of kernel worth writing by
+hand; this chapter is how you come to trust it. The USE face hands you a lazy `Tensor` that
+fuses into a big graph — convenient, but a bad place to ask "is this one kernel correct, and how
+fast is it?" `tk`'s **DEBUG face** exists for exactly that: run a single kernel against concrete
+buffers, read the result back, time it, and prove that a refactor didn't change its behavior.
 
 ---
 
@@ -51,6 +52,10 @@ measuring time on the device, not the round-trip latency of launching it. This i
 criterion benches in `tk/benches/kernels.rs` use to compare a `tk` kernel against the
 graph-native baseline.
 
+:::tip For GPU experts
+`KernelFingerprint` is a *structural* hash of the `SINK`'s UOp graph — it captures the shape (ops, dtypes, edges) independent of instance IDs, so it is stable across runs and processes. That is what makes it a golden-test key: a behavior-preserving refactor reproduces the fingerprint, while any change to the emitted IR moves it. `dispatch_gpu_ns` reads the device's own timestamp counters around the dispatch, so it measures on-device time, not launch latency.
+:::
+
 ---
 
 ## Fingerprints: proving a refactor is behavior-preserving
@@ -71,7 +76,7 @@ assert_eq!(fp, GOLDEN_MATMUL_FINGERPRINT);  // structure unchanged ⇒ behavior 
 
 If the fingerprint moves, you changed the emitted IR — intentionally or not — and the golden
 test makes you look. The unit tests under `tk/src/test/unit/golden` use exactly this to lock
-the matmul and Flash-Attention graphs.
+the matmul and Flash Attention graphs.
 
 ---
 
@@ -82,7 +87,7 @@ the matmul and Flash-Attention graphs.
 | "Does this kernel produce the right numbers?" | `run_kernel` + `as_vec`, compare against a reference |
 | "How fast is it on this GPU?" | `compile_kernel` + `dispatch_gpu_ns` |
 | "Did my refactor change the emitted IR?" | `KernelFingerprint` golden test |
-| "Is the *device/driver layer* misbehaving?" | the [AMD backend debugging guide](../backends/amd/debugging) |
+| "Is the *device/driver layer* misbehaving?" | [AMD Backend → Debugging](../backends/amd/debugging) |
 
 That last row matters: this chapter is about debugging *kernels* — the IR you authored and the
 numbers it produces. When the problem is below that — queue dispatch, memory faults, the driver —

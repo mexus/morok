@@ -21,20 +21,11 @@ mapping* — and that difference is a spectrum.
 
 ## The spectrum: explicit control ↔ managed abstraction
 
-```text
-  explicit hardware control                              compiler-managed abstraction
-  ◀──────────────────────────────────────────────────────────────────────────────▶
-   HipKittens                    tk                                        CuTile
-   "do what the                  hardware-up, but                          one tile type;
-    silicon tells us"            emits into the one IR                     the compiler owns
-                                                                           the memory hierarchy
-```
-
-At the left, you manage registers, shared memory, and instruction scheduling yourself. At the
-right, you write tile-level code and a downstream compiler decides how it maps to threads,
-shared memory, and matrix instructions. `tk` sits left-of-center: it gives you explicit register
-and shared tiles like HipKittens, but instead of being a standalone backend it lowers into
-Svod's single UOp IR.
+The three systems sit on an axis. At one end you manage registers, shared memory, and instruction
+scheduling yourself; at the other you write tile-level code and a downstream compiler decides how
+it maps to threads, shared memory, and matrix instructions. HipKittens sits at the explicit end and
+CuTile at the managed end. `tk` sits left-of-center: it gives you explicit register and shared tiles
+like HipKittens, but instead of being a standalone backend it lowers into Svod's single UOp IR.
 
 ---
 
@@ -46,10 +37,10 @@ Svod's single UOp IR.
 | **IR target** | Svod's **one UOp IR** — same as the whole compiler | none (templates → clang amdgcn) | a *separate* MLIR `cuda_tile` dialect, serialized to Tile IR bytecode |
 | **Lowering** | Svod render → LLVM → AMD binary | clang | bytecode → external `tileiras` assembler → cubin (JIT at first launch) |
 | **Memory model** | **explicit** register *and* shared tiles | explicit register *and* shared tiles | **one** tile type (register-resident); shared-mem staging is implicit, chosen by the compiler |
-| **Tensor-core API** | explicit `WMMA` op + role-based fragments | typed tiles → `__builtin_amdgcn_mfma_*` | a single functional `mma()` intrinsic |
+| **Matrix-core API** | explicit `WMMA` op + role-based fragments | typed tiles → `__builtin_amdgcn_mfma_*` | a single functional `mma()` intrinsic |
 | **Compute/memory overlap** | a `sched::pipeline` marker + a codegen pass | hand-written per kernel (raw scheduling intrinsics) | delegated to `tileiras` |
 | **Headline differentiator** | one IR ⇒ hand kernels and autotuned kernels are peers | "built from the hardware up" | memory safety across the launch boundary |
-| **Target** | AMD gfx942 / gfx1151 | AMD CDNA / RDNA | NVIDIA `sm_80+` only |
+| **Target** | AMD CDNA / RDNA | AMD CDNA / RDNA | NVIDIA `sm_80+` only |
 
 ---
 
@@ -126,19 +117,26 @@ its own toolchain consumes. `tk` lowers into the **same UOp IR the rest of Svod 
 A `tk` kernel isn't an artifact handed to a different compiler — it's a subgraph in the one IR,
 next to every autotuned kernel.
 
+:::tip For GPU experts
+The IR-target difference is concrete at the toolchain level. `tk` renders its `SINK` through
+`svod-codegen` to LLVM IR and then an AMD binary — the same path graph kernels take. CuTile instead
+serializes its tile dialect to bytecode that an *external* `tileiras` assembler turns into a cubin,
+JIT-compiled at first launch; HipKittens is C++ templates compiled by clang. So "one IR" for `tk`
+literally means one render-and-compile pipeline, where the others bridge into a separate compiler.
+:::
+
 ---
 
-## The deeper insight
+## Why this matters
 
-Why does that matter? Because it's what lets Svod offer two things that are usually mutually
-exclusive: *"let the compiler find the schedule"* and *"I'll write the schedule myself"* — with
-**no second compiler**.
+This is what lets Svod offer two things that are usually mutually exclusive: letting the compiler
+find the schedule, and writing the schedule yourself, with no second compiler.
 
 A BEAM-autotuned matmul and a hand-written Flash Attention are both just `SINK` UOps in one DAG.
 They render through one renderer, run on one runtime, and print with one debugger. The only thing
-that distinguishes them is the `opts_to_apply` marker from the
-[authoring chapter](./lowering) — `None` means "optimizer, you drive," `Some(vec![])` means
-"hands off, I drove." One enum, one IR, two modes.
+that distinguishes them is the `opts_to_apply` marker, whose home is
+[Authoring into the IR](./lowering): the same IR carries both an optimizer-driven and a
+hand-driven kernel.
 
 HipKittens proves you can match vendor libraries by going hardware-up. CuTile proves you can make
 GPU kernels safe and high-level. `tk`'s bet is narrower and, for Svod, more useful: take the

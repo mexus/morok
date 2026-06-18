@@ -4,13 +4,11 @@ sidebar_label: Overview
 
 # Why Hand-Written Kernels?
 
-Svod's whole personality is automation. You build a lazy graph, call `realize()`, and the
-optimizer decides how to tile, vectorize, and parallelize every loop — and if you turn on
-[beam search](../architecture/optimizations/kernel-search), it will compile and *time*
-hundreds of candidate schedules to find a fast one. You never write a loop.
+Svod is built around automation. You build a lazy graph, call `realize()`, and the optimizer
+decides how to tile, vectorize, and parallelize every loop — with [beam search](../architecture/optimizations/kernel-search)
+it will even compile and time hundreds of candidate schedules to find a fast one. You never write a loop.
 
-So why does Svod ship a crate — `tk` — whose entire job is letting you write GPU kernels
-*by hand*?
+So why does Svod ship a crate — `tk` — whose entire job is letting you write GPU kernels by hand?
 
 Because some kernels can't be discovered by searching over loop transformations. The
 optimizer's action space is "take this reduction and tile it, unroll it, put it in shared
@@ -34,12 +32,12 @@ Now you have two compilers, two debuggers, two mental models.
 `tk` refuses that. It is, in its own words, *"a thin eager builder, not a backend."* When you
 author a kernel with `tk`, it doesn't emit machine code — it emits the **same UOp IR** that
 the rest of Svod already speaks: explicit `RANGE` loops, `INDEX`/`STORE` memory ops, `WMMA`
-matrix-core ops. The exact intermediate representation described in the
-[IR Design chapter](../architecture/ir-design).
+matrix-core ops. The exact intermediate representation described in
+[One IR to Rule Them All](../architecture/ir-design).
 
 That means a hand-written `tk` kernel and an autotuned graph kernel are the *same kind of
-object* — two subgraphs in one UOp DAG, rendered by one renderer, run by one runtime. The
-[next chapters](./lowering) show exactly how that works.
+object* — two subgraphs in one UOp DAG, rendered by one renderer, run by one runtime.
+[Authoring into the IR](./lowering) shows exactly how that works.
 
 ---
 
@@ -56,8 +54,7 @@ re-exported from `tk/src/lib.rs`):
 
 The USE face is the important one for most readers: `flash_attention(q, k, v)` gives you back
 an ordinary `Tensor` that participates in the lazy graph like any other. You never see a tile.
-The [tiling chapter](./tiling) opens up the AUTHOR face; the
-[debugging chapter](./debugging) covers DEBUG.
+[What Tiling Is](./tiling) opens up the AUTHOR face; [Debugging](./debugging) covers DEBUG.
 
 ---
 
@@ -83,31 +80,27 @@ So:
 | **Fixed dataflow** — elementwise ops and reductions over a rectangular iteration space; only the *schedule* (tiling, vectorization, data placement, matrix-core mapping) is open | graph ops + **BEAM** | matmul / GEMM, feed-forward, layernorm, softmax |
 | **Needs a reformulated algorithm** — a loop-carried recurrence, or restructured numerics, that no reschedule of the naive ops can produce | **hand-authored in `tk`** | Flash Attention (online softmax) |
 
-### What, exactly, BEAM can't reach
+### What BEAM can't reach
 
 Naive attention forms the entire `N×N` score matrix, takes a global softmax over it, then
-multiplies by `V`. BEAM could happily tile and vectorize *that* — but it would still materialize
-the full score matrix, which is the very thing Flash Attention exists to avoid.
+multiplies by `V`. BEAM could tile and vectorize that, but it would still materialize the full
+score matrix — the cost Flash Attention exists to avoid.
 
-The fast version never forms that matrix: it streams over blocks of keys, keeping a **running**
-max and sum and **rescaling the output** as each block arrives — *online softmax*. That isn't
-the naive computation rescheduled; it's a different dataflow with a **loop-carried dependency** —
-each block reads state the previous block wrote. No `UPCAST`/`UNROLL`/`TC` sequence can
-*introduce* a recurrence, so online softmax lies outside BEAM's search space altogether. The gap
-is one of **algorithm, not schedule** — and that is precisely, and only, what `tk` fills.
+The fast version never forms that matrix. It streams over blocks of keys, keeping a running max
+and sum and rescaling the output as each block arrives: online softmax. That isn't the naive
+computation rescheduled; it's a different dataflow with a loop-carried dependency, where each
+block reads state the previous block wrote. No `UPCAST`/`UNROLL`/`TC` sequence can introduce a
+recurrence, so online softmax lies outside BEAM's search space. The gap is one of algorithm, not
+schedule, and that is what `tk` fills.
 
-`tk` does also ship a hand-written `matmul`, but matmul sits firmly in the first row of the
-table: it exists as a performance *canary* for the DSL, not as the production matmul (which goes
-through the graph). So the hand-written surface stays deliberately tiny — one production kernel,
-for the one thing the search cannot express.
+`tk` also ships a hand-written `matmul`, but it belongs in the first row of the table: it is a
+performance canary for the DSL, not the production matmul, which goes through the graph.
 
 :::tip For GPU experts
-The structural difference between a hand-authored kernel and a BEAM-tuned one is a *single
-field*. Every kernel in Svod is a `SINK` UOp carrying a `KernelInfo`. A graph kernel leaves
-`opts_to_apply: None`, which tells the optimizer "you choose the schedule (heuristics or
-beam)." A `tk` kernel sets `opts_to_apply: Some(vec![])` — "this body is already lowered;
-apply *zero* further optimizations." Same IR, same pipeline, one marker. The
-[lowering chapter](./lowering) traces this end to end.
+The structural difference between a hand-authored kernel and a BEAM-tuned one is a single field
+on the `SINK` UOp's `KernelInfo`: a graph kernel leaves `opts_to_apply: None`, a `tk` kernel sets
+`Some(vec![])`. Same IR, same pipeline, one marker. [Authoring into the IR](./lowering) traces
+this end to end.
 :::
 
 ---
