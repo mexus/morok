@@ -90,8 +90,10 @@ The importer processes ONNX models in two distinct phases:
 
 **`import(path, dim_bindings)`** does both phases in a single call: parses the protobuf, extracts initializers and input specs, walks the graph in topological order dispatching each ONNX node to its Tensor implementation, and returns an `OnnxModel { inputs, outputs, variables }`. No execution happens — the result is a set of lazy `Tensor` handles that compile and execute when `realize()`'d.
 
-```text
-model.onnx → import(path, dims) → OnnxModel { inputs, outputs, variables } → realize() → results
+```mermaid
+flowchart LR
+  A["model.onnx"] -->|"import(path, dims)"| B["OnnxModel (inputs, outputs, variables)"]
+  B -->|"realize()"| C["results"]
 ```
 
 For advanced use cases (inspecting graph structure before import), `import_model()` accepts a pre-parsed `ModelProto`.

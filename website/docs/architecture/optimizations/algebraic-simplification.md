@@ -27,27 +27,35 @@ Svod's symbolic simplifier rewrites UOp computation graphs using 140+ algebraic 
 
 A simple expression showing how patterns compose:
 
-```text
 Before:
-  ADD
-  ├── MUL
-  │   ├── ADD
-  │   │   ├── x
-  │   │   └── CONST(0)    <- identity
-  │   └── CONST(1)         <- identity
-  └── ADD
-      ├── CONST(3)
-      └── CONST(4)          <- constant fold
 
+```mermaid
+flowchart TD
+  A["ADD"] --> B["MUL"]
+  A --> C["ADD"]
+  B --> D["ADD"]
+  B --> E["CONST(1) (identity)"]
+  D --> F["x"]
+  D --> G["CONST(0) (identity)"]
+  C --> H["CONST(3)"]
+  C --> I["CONST(4) (constant fold)"]
+```
+
+Steps:
+
+```text
 Step 1 (identity):    ADD(x, 0) -> x
 Step 2 (identity):    MUL(x, 1) -> x
 Step 3 (const fold):  ADD(3, 4) -> CONST(7)
 Step 4 (result):      ADD(x, 7)
+```
 
 After:
-  ADD
-  ├── x
-  └── CONST(7)
+
+```mermaid
+flowchart TD
+  A["ADD"] --> B["x"]
+  A --> C["CONST(7)"]
 ```
 
 The rewrite engine applies patterns bottom-up: children simplify first, then the parent re-matches. This enables multi-step cascades in a single traversal.

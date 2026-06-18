@@ -70,11 +70,11 @@ pipelining): compute on buffer A while loading buffer B, then swap.
 
 ```text
    load K/V block 0 ──▶ LDS[A]
-   ┌───────────────────────────────────────────────┐
+   ┌──────────────────────────────────────────────────┐
    │ compute on LDS[A]   ║   load block 1 ──▶ LDS[B] │   ← overlap
    │ compute on LDS[B]   ║   load block 2 ──▶ LDS[A] │
-   │ ...                                             │
-   └───────────────────────────────────────────────┘
+   │ ...                                              │
+   └──────────────────────────────────────────────────┘
 ```
 
 The shared tiles carry their XOR swizzle (gap #3), so the cooperative fill and the per-lane read

@@ -25,6 +25,7 @@ const config: Config = {
   // parsing. `.mdx` (if added later) still gets full MDX.
   markdown: {
     format: "detect",
+    mermaid: true,
   },
 
   i18n: {
@@ -52,6 +53,8 @@ const config: Config = {
   plugins: [
     './plugins/readme-intro.mjs',
   ],
+
+  themes: ["@docusaurus/theme-mermaid"],
 
   presets: [
     [

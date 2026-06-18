@@ -36,12 +36,11 @@ for i in range:
 
 Before we loop through a reduction dimension, we first combine neighboring values. This creates larger reductions that map better to hardware instructions.
 
-```text
-Before:  [a, b, c, d, e, f, g, h]  // 8 values
-             ↓ [Horizontal reduction]
-Step 1:  [a+e, b+f, c+g, d+h]      // 4 partial sums
-             ↓ [Accumulator pattern]
-After:   acc = acc + (a+e) + (b+f) + (c+g) + (d+h)
+```mermaid
+flowchart TD
+  A["Before: [a, b, c, d, e, f, g, h] (8 values)"]
+  A -->|"Horizontal reduction"| B["Step 1: [a+e, b+f, c+g, d+h] (4 partial sums)"]
+  B -->|"Accumulator pattern"| C["After: acc = acc + (a+e) + (b+f) + (c+g) + (d+h)"]
 ```
 
 **GEP pushing** pushes GEP (get element pointer) operations through ALUs for better vectorization:

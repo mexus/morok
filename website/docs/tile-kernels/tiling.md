@@ -32,8 +32,11 @@ a few instructions before it's overwritten.
 
 A kernel is then just a loop that walks a big tensor one tile at a time:
 
-```text
-Tensor (in HBM)  ──load──▶  Tile (in registers)  ──compute──▶  Tile  ──store──▶  Tensor
+```mermaid
+flowchart LR
+  A["Tensor (in HBM)"] -->|"load"| B["Tile (in registers)"]
+  B -->|"compute"| C["Tile"]
+  C -->|"store"| D["Tensor"]
 ```
 
 This is the same mental model NVIDIA's CuTile and HazyResearch's ThunderKittens use, and it's
@@ -47,20 +50,16 @@ Why `16×16` and not some round number like `100×100`? Because the matrix core 
 fixed *fragment* size baked into the hardware — typically `16×16` or `32×32`. A tile is sized
 to be a whole number of those fragments:
 
-```text
-A 64×32 register tile, built from 16×16 fragments:
-
-      cols ──▶
-  ┌────┬────┐
-  │ F  │ F  │   each F is one 16×16 matrix-core fragment;
-  ├────┼────┤   a 64×32 tile is a 4×2 grid of them.
-  │ F  │ F  │
-  ├────┼────┤
-  │ F  │ F  │
-  ├────┼────┤
-  │ F  │ F  │
-  └────┴────┘
+```mermaid
+block-beta
+  columns 2
+  A["16×16"] B["16×16"]
+  C["16×16"] D["16×16"]
+  E["16×16"] F["16×16"]
+  G["16×16"] H["16×16"]
 ```
+
+*A `64×32` register tile is a 4×2 grid of `16×16` matrix-core fragments — the moment its data lands in registers it is already in MMA layout.*
 
 Because the tile is built from fragments, the moment its data is in registers it's *already*
 in the layout the matrix instruction wants. No shuffle before the multiply — that's gap #1

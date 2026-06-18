@@ -10,38 +10,13 @@ Svod takes the opposite approach: **lazy evaluation**. When you write `a.try_add
 
 This chapter traces that journey.
 
-```text
-tensor.realize()
-    │
-    ▼
-┌─────────────────────────────────────────────────────────┐
-│  LAZY GRAPH                                             │
-│  Tensor ops build UOp DAG (no computation yet)          │
-└─────────────────────────────────────────────────────────┘
-    │
-    ▼
-┌─────────────────────────────────────────────────────────┐
-│  RANGEIFY                                               │
-│  Movement ops → explicit RANGE loops                    │
-└─────────────────────────────────────────────────────────┘
-    │
-    ▼
-┌─────────────────────────────────────────────────────────┐
-│  KERNEL SPLITTING                                       │
-│  Split at STORE boundaries → multiple KERNELs          │
-└─────────────────────────────────────────────────────────┘
-    │
-    ▼
-┌─────────────────────────────────────────────────────────┐
-│  OPTIMIZATION & CODEGEN                                 │
-│  Heuristics/beam → LLVM IR → JIT compile               │
-└─────────────────────────────────────────────────────────┘
-    │
-    ▼
-┌─────────────────────────────────────────────────────────┐
-│  EXECUTION                                              │
-│  Parallel kernel launch → result buffer                │
-└─────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TD
+  Start["tensor.realize()"] --> LG["LAZY GRAPH: Tensor ops build UOp DAG (no computation yet)"]
+  LG --> RG["RANGEIFY: Movement ops to explicit RANGE loops"]
+  RG --> KS["KERNEL SPLITTING: Split at STORE boundaries to multiple KERNELs"]
+  KS --> OC["OPTIMIZATION and CODEGEN: Heuristics/beam to LLVM IR to JIT compile"]
+  OC --> EX["EXECUTION: Parallel kernel launch to result buffer"]
 ```
 
 Each box is a distinct phase. Let's walk through them.
@@ -150,16 +125,15 @@ Before: BUFFER.reshape([2, 3]).expand([4, 2, 3]).sum(axis=0)
 
 After rangeify, movement ops become explicit index computations:
 
-```text
-After:
-STORE
-├── INDEX[RANGE(0..2), RANGE(0..3)]          — index (src[0])
-├── REDUCE(Add)                              — value (src[1])
-│   ├── LOAD
-│   │   └── INDEX[RANGE(0..4), RANGE(0..2), RANGE(0..3)]
-│   └── RANGE(0..4, Reduce)
-├── RANGE(0..2, Global)                      — output dim 0 (range)
-└── RANGE(0..3, Global)                      — output dim 1 (range)
+```mermaid
+flowchart TD
+  STORE["STORE"] --> IDX["INDEX(RANGE(0..2), RANGE(0..3)) -- index (src[0])"]
+  STORE --> RED["REDUCE(Add) -- value (src[1])"]
+  STORE --> R2["RANGE(0..2, Global) -- output dim 0"]
+  STORE --> R3["RANGE(0..3, Global) -- output dim 1"]
+  RED --> LOAD["LOAD"]
+  RED --> RR["RANGE(0..4, Reduce)"]
+  LOAD --> LIDX["INDEX(RANGE(0..4), RANGE(0..2), RANGE(0..3))"]
 ```
 
 The `EXPAND` became a `RANGE(0..4)` that doesn't affect the buffer index—broadcasting. The `RESHAPE` became different index arithmetic. The `SUM` became `REDUCE(Add)` with the first range marked as `Reduce` type.
@@ -263,10 +237,11 @@ pub struct ScheduleItem {
 
 Not all kernels need sequential execution. Independent kernels can run in parallel:
 
-```text
-Kernel A (writes buf0)
-Kernel B (writes buf1)  ─── no dependency ─── can run in parallel
-Kernel C (reads buf0, buf1)  ─── depends on A and B
+```mermaid
+flowchart TD
+  A["Kernel A (writes buf0)"] -->|"depends on A"| C["Kernel C (reads buf0, buf1)"]
+  B["Kernel B (writes buf1)"] -->|"depends on B"| C
+  A -.->|"no dependency, run in parallel"| B
 ```
 
 The scheduler uses **Kahn's algorithm** to find parallel groups:
@@ -437,29 +412,29 @@ let c = a.matmul(&b);                 // Graph built, no computation
 
 At this point, `c` is a lazy tensor with this UOp graph:
 
-```text
-REDUCE_AXIS(Add, axis=2)
-└── MUL
-    ├── EXPAND(A, [4, 4, 4])    — A: [4, 4] → [4, 1, 4] → [4, 4, 4]
-    └── EXPAND(B, [4, 4, 4])    — B: [4, 4] → [1, 4, 4] → [4, 4, 4]
+```mermaid
+flowchart TD
+  RA["REDUCE_AXIS(Add, axis=2)"] --> MUL["MUL"]
+  MUL --> EA["EXPAND(A, [4, 4, 4]) -- A: [4, 4] to [4, 1, 4] to [4, 4, 4]"]
+  MUL --> EB["EXPAND(B, [4, 4, 4]) -- B: [4, 4] to [1, 4, 4] to [4, 4, 4]"]
 ```
 
 ### Stage 2: Rangeify
 
 Movement ops become explicit loops:
 
-```text
-STORE
-├── INDEX[BUFFER(C), RANGE(i, 0..4), RANGE(j, 0..4)]  — index
-├── REDUCE(Add)                                          — value
-│   ├── MUL
-│   │   ├── LOAD(A)
-│   │   │   └── INDEX[BUFFER(A), RANGE(i), RANGE(k, 0..4, Reduce)]
-│   │   └── LOAD(B)
-│   │       └── INDEX[BUFFER(B), RANGE(k), RANGE(j)]
-│   └── RANGE(k, Reduce)
-├── RANGE(i, Global)                                     — output dim 0
-└── RANGE(j, Global)                                     — output dim 1
+```mermaid
+flowchart TD
+  STORE["STORE"] --> CIDX["INDEX(BUFFER(C), RANGE(i, 0..4), RANGE(j, 0..4)) -- index"]
+  STORE --> RED["REDUCE(Add) -- value"]
+  STORE --> RI["RANGE(i, Global) -- output dim 0"]
+  STORE --> RJ["RANGE(j, Global) -- output dim 1"]
+  RED --> MUL["MUL"]
+  RED --> RK["RANGE(k, Reduce)"]
+  MUL --> LA["LOAD(A)"]
+  MUL --> LB["LOAD(B)"]
+  LA --> AIDX["INDEX(BUFFER(A), RANGE(i), RANGE(k, 0..4, Reduce))"]
+  LB --> BIDX["INDEX(BUFFER(B), RANGE(k), RANGE(j))"]
 ```
 
 The `i` and `j` ranges are output dimensions. The `k` range is the reduction (contracted) dimension.
@@ -468,11 +443,11 @@ The `i` and `j` ranges are output dimensions. The `k` range is the reduction (co
 
 Single STORE → single KERNEL:
 
-```text
-KERNEL
-├── SINK(STORE(...))
-├── ranges: [i: 0..4, j: 0..4]
-└── buffers: [C (output), A (input), B (input)]
+```mermaid
+flowchart TD
+  KERNEL["KERNEL"] --> SINK["SINK(STORE(...))"]
+  KERNEL --> RANGES["ranges: [i: 0..4, j: 0..4]"]
+  KERNEL --> BUFS["buffers: [C (output), A (input), B (input)]"]
 ```
 
 ### Stage 4: Schedule

@@ -77,24 +77,18 @@ KFD ring.
 The backend is split into two halves by the **`AmdIface`** trait
 (`device/src/amd/iface.rs`):
 
-```text
-        ┌─────────────────────────────────────────────────────────┐
-        │  ABOVE THE SEAM — backend-agnostic (no ioctls)          │
-        │                                                         │
-        │  AmdProgram   AmdComputeQueue   KernargArena   Timeline │
-        │  AmdConnector   AmdGraph   SignalPool   AmdAllocator    │
-        │  PM4 / AQL packet builders   ring back-pressure         │
-        └──────────────────────────────┬──────────────────────────┘
-                                       │  Arc<dyn AmdIface>
-                                       │  alloc_raw · free_raw
-                                       │  setup_ring · teardown_ring
-                                       │  wait_events
-        ┌──────────────────────────────┴──────────────────────────┐
-        │  BELOW THE SEAM — the actual driver                     │
-        │                                                         │
-        │   KfdIface  (today: KFD ioctls on /dev/kfd)             │
-        │   AmIface   (future: userspace PCI-BAR driver — WIP)    │
-        └─────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TD
+  subgraph above["ABOVE THE SEAM — backend-agnostic (no ioctls)"]
+    A1["AmdProgram, AmdComputeQueue, KernargArena, Timeline"]
+    A2["AmdConnector, AmdGraph, SignalPool, AmdAllocator"]
+    A3["PM4 / AQL packet builders, ring back-pressure"]
+  end
+  subgraph below["BELOW THE SEAM — the actual driver"]
+    B1["KfdIface (today: KFD ioctls on /dev/kfd)"]
+    B2["AmIface (future: userspace PCI-BAR driver — WIP)"]
+  end
+  above -->|"Arc(dyn AmdIface): alloc_raw, free_raw, setup_ring, teardown_ring, wait_events"| below
 ```
 
 Everything that is *not* a kernel call — the 16 MiB command ring, the PM4/AQL
@@ -167,11 +161,13 @@ to a single UOp IR; codegen maps that IR onto GPU thread indices (the
 `blockIdx`/`threadIdx`, per [IR Design](../../architecture/ir-design.md)); the renderer emits
 AMD LLVM IR; and this backend compiles and runs it:
 
-```text
-  UOp IR ──▶ AMD LLVM IR ──▶ clang (amdgcn) ──▶ ELF code object
-                                                      │
-                                                      ▼
-   AmdProgram::load  ──▶  dispatch over a KFD ring  ──▶  GPU
+```mermaid
+flowchart LR
+  A["UOp IR"] --> B["AMD LLVM IR"]
+  B --> C["clang (amdgcn)"]
+  C --> D["ELF code object"]
+  D --> E["AmdProgram::load"]
+  E -->|"dispatch over a KFD ring"| F["GPU"]
 ```
 
 The [JIT Graphs](../../architecture/jit-graphs.md) layer wraps this so a model graph compiles

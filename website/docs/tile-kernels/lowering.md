@@ -22,11 +22,13 @@ So when you author a kernel, what you're really doing is *constructing a UOp DAG
 instead of letting `rangeify` construct it for you. The output is a `SINK` UOp — the same
 thing the scheduler produces for an autotuned kernel.
 
-```text
- Autotuned kernel:   Tensor ops ──rangeify──▶ SINK(STORE(...))  ──optimize──▶ render ─▶ run
- Hand kernel (tk):   Kernel/Group builder ───▶ SINK(STORE(...))  ──(skip opt)─▶ render ─▶ run
-                                                ▲
-                                  the same SINK shape, built two different ways
+```mermaid
+flowchart LR
+  A["Tensor ops"] -->|"rangeify"| S1["SINK(STORE)"]
+  K["Kernel / Group builder"] -->|"build by hand"| S2["SINK(STORE)"]
+  S1 -->|"optimize"| R["render"]
+  S2 -->|"skip opt"| R
+  R --> X["run"]
 ```
 
 ---
@@ -94,12 +96,12 @@ entirely. This is how you test and benchmark a kernel in isolation; see the
 In production you don't want a separate launch — you want the kernel to be part of the lazy
 graph, so it fuses into scheduling and dependency tracking like everything else. That path is:
 
-```text
-graph_launch(...)
-   └─▶ Tensor::graph_kernel(...)
-          └─▶ UOp::custom_kernel(...)
-                 └─▶ Op::Call { body, args, info }       ◀── the hand kernel, as a graph node
-                        └─▶ outputs returned as AFTER(Call) edges
+```mermaid
+flowchart TD
+  A["graph_launch(...)"] --> B["Tensor::graph_kernel(...)"]
+  B --> C["UOp::custom_kernel(...)"]
+  C --> D["Op::Call (body, args, info) -- the hand kernel, as a graph node"]
+  D --> E["outputs returned as AFTER(Call) edges"]
 ```
 
 The finished `SINK` becomes the `body` of an `Op::Call` node (see `Op::Call` in the
@@ -137,18 +139,18 @@ you see immediately, not a silent detour to the slow path.
 The reward for all this is that a hand kernel prints like any other UOp graph. A trivial tile
 store — load a tile, write it back — lowers to the familiar `RANGE` / `INDEX` / `STORE` shape:
 
-```text
-[SINK]  (KernelInfo { opts_to_apply: Some([]) })
-└── [END(STORE)]
-    ├── [STORE]
-    │   ├── [INDEX]
-    │   │   ├── [DEFINE_GLOBAL(out)]
-    │   │   └── [RANGE(0..N, Local)]      # threadIdx — workgroup lane
-    │   └── [LOAD]
-    │       └── [INDEX]
-    │           ├── [DEFINE_GLOBAL(in)]
-    │           └── [RANGE(0..N, Local)]  # same RANGE via hash consing
-    └── [RANGE(0..N, Local)]
+```mermaid
+flowchart TD
+  SINK["SINK (KernelInfo opts_to_apply: Some([]))"] --> END["END(STORE)"]
+  END --> STORE["STORE"]
+  END --> RANGE["RANGE(0..N, Local) -- threadIdx, workgroup lane"]
+  STORE --> IDX_OUT["INDEX"]
+  STORE --> LOAD["LOAD"]
+  IDX_OUT --> DG_OUT["DEFINE_GLOBAL(out)"]
+  IDX_OUT --> RANGE
+  LOAD --> IDX_IN["INDEX"]
+  IDX_IN --> DG_IN["DEFINE_GLOBAL(in)"]
+  IDX_IN --> RANGE
 ```
 
 No new node types, no separate dialect — the same operations the

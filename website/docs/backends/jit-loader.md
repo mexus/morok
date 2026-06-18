@@ -12,32 +12,16 @@ This chapter describes how the CPU JIT loader works. GPU backends (CUDA, Metal, 
 
 ## Pipeline
 
-```text
-C source / LLVM IR
-       │
-       ▼
- clang -c (stdin → stdout)
-       │
-       ▼
-  ELF .o bytes (in memory)
-       │
-       ▼
- Parse sections (object crate)
-       │
-       ▼
- Anonymous mmap + copy sections
-       │
-       ▼
- Apply relocations (arch-specific)
-       │
-       ▼
- mprotect(PROT_READ | PROT_EXEC)
-       │
-       ▼
- Flush I-cache (non-x86_64)
-       │
-       ▼
- Call function pointer via libffi
+```mermaid
+flowchart TD
+  A["C source / LLVM IR"] --> B["clang -c (stdin to stdout)"]
+  B --> C["ELF .o bytes (in memory)"]
+  C --> D["Parse sections (object crate)"]
+  D --> E["Anonymous mmap + copy sections"]
+  E --> F["Apply relocations (arch-specific)"]
+  F --> G["mprotect(PROT_READ, PROT_EXEC)"]
+  G --> H["Flush I-cache (non-x86_64)"]
+  H --> I["Call function pointer via libffi"]
 ```
 
 Both the **Clang** backend (C source via `-x c`) and the **LLVM** backend (LLVM IR text via `-x ir`) share this loader. The only difference is the clang input language flag.
