@@ -4,23 +4,32 @@ sidebar_label: Authoring into the IR
 
 # Authoring into the One IR
 
-This is the chapter where `tk` stops being "a GPU tile library" and becomes "a way to write
-UOps by hand." If you haven't read [One IR to Rule Them All](../architecture/ir-design) and
-the [Execution Pipeline](../architecture/pipeline), read them first — this chapter assumes
-you know what a UOp is and how a lazy `Tensor` becomes a compiled kernel. We won't re-explain
-the philosophy. We'll show how a hand-written kernel slots *into* it.
+Most tile frameworks answer "how do I let users hand-write a kernel?" by adding a *layer* — a
+new DSL with its own compiler, its own debugger, and its own profiler bolted onto the side of
+the framework. `tk`'s defining choice is to add **no layer at all**. A hand-written kernel
+lowers into the *same* UOp IR as everything else, so it shares one rendering path, one debugger,
+and one profiler — and a developer building an ML application has exactly **one IR to learn**,
+from a `Tensor` add all the way down to a hand-tuned attention kernel.
+
+This chapter shows how that works. It assumes you've read
+[One IR to Rule Them All](../architecture/ir-design) and the
+[Execution Pipeline](../architecture/pipeline) — you should know what a UOp is and how a lazy
+`Tensor` becomes a compiled kernel. We won't re-explain that philosophy; we'll show how a
+hand-written kernel slots *into* it.
 
 ---
 
-## The trick: a kernel is just a subgraph
+## No new layer: a kernel is just a subgraph
 
-Recall the central claim from the [overview](./overview): `tk` is a builder, not a backend.
-It does not emit assembly. It emits the exact same lowered IR that the normal codegen path
-consumes — `RANGE` loops, `INDEX`/`LOAD`/`STORE` memory ops, `WMMA` matrix instructions.
+Recall the claim from the [overview](./overview): `tk` is a builder, not a backend. It does not
+emit assembly, and it does not define an IR of its own. It emits the *exact same* lowered IR the
+normal codegen path already consumes — `RANGE` loops, `INDEX`/`LOAD`/`STORE` memory ops, `WMMA`
+matrix instructions (and, where you need it, raw LLVM/ASM as `Op::Custom`).
 
-So when you author a kernel, what you're really doing is *constructing a UOp DAG by hand*
-instead of letting `rangeify` construct it for you. The output is a `SINK` UOp — the same
-thing the scheduler produces for an autotuned kernel.
+So authoring a kernel is just *constructing a UOp DAG by hand* instead of letting `rangeify`
+construct it for you. The output is a `SINK` UOp — the very same thing the scheduler produces for
+an autotuned kernel. Hand-written and compiler-generated kernels aren't two kinds of object;
+they're the same kind, built two different ways:
 
 ```mermaid
 flowchart LR
@@ -30,6 +39,32 @@ flowchart LR
   S2 -->|"skip opt"| R
   R --> X["run"]
 ```
+
+---
+
+## What staying in one IR buys you
+
+This is the whole point of the chapter, so it's worth making concrete. Because a hand-written
+kernel *is* just more UOps, it inherits all of the compiler's infrastructure for free — there is
+nothing tk-specific to build or to learn:
+
+- **One renderer.** The same `svod-codegen` path that lowers graph kernels to LLVM IR and an AMD
+  binary renders your `tk` kernel. There is no second backend to write, port, or keep in sync.
+- **One debugger.** You inspect a `tk` kernel exactly like any computation: print the UOp tree.
+  A hand-written Flash Attention and an autotuned matmul appear in the *same* textual form, with
+  the same op names — no separate dump format, no "what is kernel X" mystery.
+- **One profiler.** Because a `tk` kernel carries its `name` through the IR, it shows up in the
+  device profile *by that name* — not as an anonymous blob — timed by the same hardware-timestamp
+  path as every other kernel. Profiling hand-written and graph kernels is one workflow.
+- **One IR to learn.** This is the developer-facing payoff. To build, optimize, debug, and
+  profile an ML application on Svod — from a `Tensor` add down to a hand-tuned attention kernel —
+  you learn exactly *one* representation. There's no "tensor IR vs. kernel DSL vs. backend IR" to
+  hold in your head, because there is only the one UOp graph.
+
+The usual arrangement is the opposite: a tile DSL is a *separate* language with its own compiler,
+its own debugger, and its own profiler view, bolted onto the side of the framework. Each of those
+is a layer the framework has to build and a thing the user has to learn. `tk` adds none of them —
+that is the cost it refuses to pay.
 
 ---
 
@@ -77,6 +112,15 @@ untouched. The rewrite passes that *do* still run (algebraic simplification, ind
 are told not to descend into the kernel body. Your hand-tuned loop survives to codegen exactly
 as written — but it's still a normal UOp graph that the *same* renderer turns into LLVM IR and
 the *same* runtime executes.
+
+And this isn't only a convenience ("you already optimized it, so don't bother"). It's a
+**safety contract**, because the optimizer *cannot* safely touch a hand-written body. That body
+may contain raw LLVM/ASM intrinsics as `Op::Custom` — the machine-scheduler primitives from
+[Where the FLOPS Hide](./where-flops-hide) are exactly this. The optimizer has **no model of
+what those opaque ops do**, so re-tiling, reordering, or fusing across them could silently change
+the kernel's results — or quietly destroy the performance you hand-built. So `Some(vec![])` tells
+the optimizer the only safe thing it can do with a body it doesn't fully understand: leave it
+alone.
 
 ---
 

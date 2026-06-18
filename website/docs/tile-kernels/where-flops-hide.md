@@ -8,8 +8,9 @@ A modern AMD matrix core advertises a number that sounds like a promise. The dat
 *thousands* of TFLOPS. You write the obvious matrix multiply — three nested loops, a multiply,
 an add — and measure. You get a few percent of the number on the box.
 
-The FLOPS didn't vanish. They're hiding. And the entire job of a tile library like `tk` (and
-its inspiration, [HipKittens](https://github.com/HazyResearch/HipKittens)) is to find them.
+The FLOPS didn't vanish. They're hiding — and finding them is what *any* fast matrix kernel has
+to do, whether the compiler generates it (see the [overview](./overview)) or you write it by hand
+with a tile library like `tk` (inspired by [HipKittens](https://github.com/HazyResearch/HipKittens)).
 
 This chapter is the "why" behind everything else in this section: it explains what a matrix
 core actually needs to run flat-out, and the handful of bottlenecks that stand in the way.
@@ -126,6 +127,12 @@ worth internalizing because they justify the design:
 HipKittens' shared-tile layouts), the L2/chiplet remap in `tk/src/grid.rs` (`l2_swizzle`), and
 the compute/memory overlap is expressed as a `sched::pipeline(SchedKind::Attention, …)` marker
 on the Flash-Attention KV loop that a post-linearization scheduling pass consumes.
+
+When that high-level marker isn't enough, the AUTHOR face also exposes the raw machine-scheduler
+intrinsics directly (as `Op::Custom`) for squeezing the last few percent out of gap #4 —
+controlling wave issue priority around MFMA bursts, deferring LDS waits for register-staged
+prefetch, and pinning a cluster's loads, MFMAs, and stores against the machine scheduler.
+`sched::pipeline` is the default; these are the manual override for placing the schedule by hand.
 :::
 
 ---
@@ -142,3 +149,16 @@ Everything in the rest of this section is a response to one of these five gaps:
 
 The headline: a fast GPU kernel is not "the math, written down." It is *the math, plus an
 answer to where every cycle between two matrix instructions goes.* That's where the FLOPS hide.
+
+:::note Doesn't the compiler already use matrix cores?
+Yes — and nothing here says otherwise. For graph-native kernels, BEAM's `TC` action maps a matmul
+straight onto WMMA/MFMA and tiles it against these same gaps; the compiler is perfectly capable of
+driving the matrix cores. The five gaps are the *hardware reality* every fast kernel must beat —
+compiler-generated and hand-written alike — not a hole in the compiler.
+
+So `tk` is not a competing code path. It is the **instrument for the kernels BEAM can't express**
+([When to hand-write](./overview)), and it earns its place by adding *no extra complexity*: a `tk`
+kernel emits the same UOp IR the compiler already produces — no second backend, no separate
+toolchain, no new debugger. You reach for it only to write an implementation yourself, and even
+then you stay inside the one compiler.
+:::

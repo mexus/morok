@@ -114,11 +114,7 @@ in HipKittens' kernels. Instead the KV loop is annotated with
 post-linearization scheduling pass in codegen consumes to interleave the matrix, memory, and
 exponential instruction streams. This keeps the kernel body readable — it expresses *what* to
 overlap, and a later pass decides the concrete instruction ordering, rather than the author
-threading `s_setprio` / `sched_barrier` calls through the algorithm by hand.
-
-The kernel is validated on both gfx942 and gfx1151. (If you read a comment in `tk/src/target.rs`
-suggesting Flash Attention is gfx942-only, that comment is stale — `FA_SUPPORTED_ARCHS` lists
-both.)
+threading raw scheduling intrinsics through the algorithm by hand.
 :::
 
 ---

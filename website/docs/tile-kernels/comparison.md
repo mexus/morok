@@ -47,7 +47,7 @@ Svod's single UOp IR.
 | **Lowering** | Svod render → LLVM → AMD binary | clang | bytecode → external `tileiras` assembler → cubin (JIT at first launch) |
 | **Memory model** | **explicit** register *and* shared tiles | explicit register *and* shared tiles | **one** tile type (register-resident); shared-mem staging is implicit, chosen by the compiler |
 | **Tensor-core API** | explicit `WMMA` op + role-based fragments | typed tiles → `__builtin_amdgcn_mfma_*` | a single functional `mma()` intrinsic |
-| **Compute/memory overlap** | a `sched::pipeline` marker + a codegen pass | hand-written per kernel (`s_setprio`, `sched_barrier`) | delegated to `tileiras` |
+| **Compute/memory overlap** | a `sched::pipeline` marker + a codegen pass | hand-written per kernel (raw scheduling intrinsics) | delegated to `tileiras` |
 | **Headline differentiator** | one IR ⇒ hand kernels and autotuned kernels are peers | "built from the hardware up" | memory safety across the launch boundary |
 | **Target** | AMD gfx942 / gfx1151 | AMD CDNA / RDNA | NVIDIA `sm_80+` only |
 

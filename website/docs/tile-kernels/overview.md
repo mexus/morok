@@ -63,20 +63,43 @@ The [tiling chapter](./tiling) opens up the AUTHOR face; the
 
 ## When to hand-write, and when to let BEAM do it
 
-The decision rule is simple, and it's worth stating plainly because it's the reason `tk` is
-small:
+There's one rule, and it falls straight out of *what BEAM actually searches over*.
 
-| Kernel | How Svod builds it | Why |
-|--------|--------------------|-----|
-| matmul / GEMM | **graph-native + BEAM** | A single reduction over the contraction axis. BEAM's `TC`/`UPCAST`/`LOCAL` actions tile it well; a hand kernel buys little. |
-| feed-forward / elementwise | **graph-native + BEAM** | Plain fusible graph ops. |
-| **Flash Attention** | **hand-authored in `tk`** | Online-softmax recurrence — not expressible as one schedulable `REDUCE`. |
+BEAM — and the heuristic optimizer it falls back to — search the space of **schedules** for a
+*fixed* computation. Given a kernel's dataflow graph, they try ways to tile, vectorize, unroll,
+parallelize, stage through shared memory, and map onto matrix cores (the `OptOps` actions:
+`UPCAST`, `UNROLL`, `LOCAL`, `GROUP`, `TC`, …). What they never do is change *what* is computed:
+the nodes of the graph — the adds, muls, and reductions — are fixed; only their arrangement is
+up for grabs.
 
-`tk` *does* also ship a hand-written `matmul`, but it earns its keep as a performance canary
-for the DSL itself, not as the production matmul. Production matmul goes through the graph.
+So:
 
-In other words: **the hand-written surface is deliberately tiny.** It exists for the kernels
-the search can't reach, and nothing more.
+> If a kernel needs only a good **schedule** of a fixed dataflow, let BEAM find it. If it needs
+> a **different algorithm** than the naive one — something no reordering of the existing ops can
+> produce — you have to write it.
+
+| Property of the kernel | Built by | Examples |
+|------------------------|----------|----------|
+| **Fixed dataflow** — elementwise ops and reductions over a rectangular iteration space; only the *schedule* (tiling, vectorization, data placement, matrix-core mapping) is open | graph ops + **BEAM** | matmul / GEMM, feed-forward, layernorm, softmax |
+| **Needs a reformulated algorithm** — a loop-carried recurrence, or restructured numerics, that no reschedule of the naive ops can produce | **hand-authored in `tk`** | Flash Attention (online softmax) |
+
+### What, exactly, BEAM can't reach
+
+Naive attention forms the entire `N×N` score matrix, takes a global softmax over it, then
+multiplies by `V`. BEAM could happily tile and vectorize *that* — but it would still materialize
+the full score matrix, which is the very thing Flash Attention exists to avoid.
+
+The fast version never forms that matrix: it streams over blocks of keys, keeping a **running**
+max and sum and **rescaling the output** as each block arrives — *online softmax*. That isn't
+the naive computation rescheduled; it's a different dataflow with a **loop-carried dependency** —
+each block reads state the previous block wrote. No `UPCAST`/`UNROLL`/`TC` sequence can
+*introduce* a recurrence, so online softmax lies outside BEAM's search space altogether. The gap
+is one of **algorithm, not schedule** — and that is precisely, and only, what `tk` fills.
+
+`tk` does also ship a hand-written `matmul`, but matmul sits firmly in the first row of the
+table: it exists as a performance *canary* for the DSL, not as the production matmul (which goes
+through the graph). So the hand-written surface stays deliberately tiny — one production kernel,
+for the one thing the search cannot express.
 
 :::tip For GPU experts
 The structural difference between a hand-authored kernel and a BEAM-tuned one is a *single
