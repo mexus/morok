@@ -260,15 +260,14 @@ fn max_abs_err(got: &[f32], expected: &[f32]) -> f32 {
     got.iter().zip(expected).map(|(g, e)| (g - e).abs()).fold(0.0f32, f32::max)
 }
 
-/// Diagnostic (run on gfx1151): the wave32 matmul is deterministic-but-wrong, and
-/// garbage-scale error can't tell *which* layout transform it computes. This
-/// compares `got` against every transpose/permutation candidate — the one that
-/// reads ≈0 names the bug exactly (output transpose, A/B operand transpose, A↔B
-/// swap, …); if none match, the GLOBAL→LDS fill or replication is misplacing data.
-/// `SVOD_DEVICE=AMD:0 cargo test -p svod-tk --lib matmul::test_matmul_rdna_diagnose -- --ignored --nocapture`.
+/// The wave32 (gfx1151) matmul computes exactly `A·B` — not a transposed or
+/// operand-swapped variant. Compares `got` against every transpose/permutation
+/// candidate and asserts `A·B` is the unique match (the rest are garbage-scale).
+/// A layout regression in the wave32 fragment map would flip which candidate wins.
+/// `SVOD_DEVICE=AMD:0 cargo test -p svod-tk --lib matmul::test_matmul_rdna_computes_ab -- --ignored --nocapture`.
 #[test]
 #[ignore]
-fn test_matmul_rdna_diagnose() {
+fn test_matmul_rdna_computes_ab() {
     use svod_tensor::Tensor;
     let n = 64usize;
     let (a, b) = matmul_inputs(n);
@@ -283,8 +282,11 @@ fn test_matmul_rdna_diagnose() {
         x.as_vec::<f32>().expect("read")
     };
 
-    let candidates: Vec<(&str, Tensor)> = vec![
-        ("A·B (expected)", mm(&af, &bf)),
+    let ab_err = max_abs_err(&got, &vec(mm(&af, &bf)));
+    // bf16 accumulation over K=64 ⇒ a few thousandths; transposes/swaps are O(1).
+    assert!(ab_err < 1e-1, "wave32 matmul should equal A·B, got max abs err {ab_err:e}");
+
+    let wrong: Vec<(&str, Tensor)> = vec![
         ("(A·B)^T", tr(&mm(&af, &bf))),
         ("A^T·B", mm(&tr(&af), &bf)),
         ("A·B^T", mm(&af, &tr(&bf))),
@@ -292,18 +294,16 @@ fn test_matmul_rdna_diagnose() {
         ("B·A", mm(&bf, &af)),
         ("(B·A)^T", tr(&mm(&bf, &af))),
     ];
-    println!("RDNA matmul diagnosis (N={n}, SMALL_CFG):");
-    for (name, cand) in candidates {
-        println!("  got vs {name:16}: max abs err = {:e}", max_abs_err(&got, &vec(cand)));
+    for (name, cand) in wrong {
+        let err = max_abs_err(&got, &vec(cand));
+        assert!(err > 1.0, "wave32 matmul matches {name} (err {err:e}) — layout is not plain A·B");
     }
 }
 
-/// Element-level diagnostic: `A = I`, `B[k][j] = (k%16)*16 + (j%16)` ⇒ `C = B`, so
-/// the first 16×16 output fragment should read `got[i][j] = i*16 + j` (row i = `[16i,
-/// 16i+1, …, 16i+15]`). Any within-fragment permutation (the suspected wave32 bug)
-/// shows directly in the printed grid: at dest `(i,j)` a value `V` means the kernel
-/// placed source element `(V/16, V%16)` there. Validated on gfx942 (prints the clean
-/// grid); run on gfx1151 and paste the grid back to decode the lane/reg→(m,n) map.
+/// Element-level check of the wave32 fragment lane→(m,n) map: `A = I`,
+/// `B[k][j] = (k%16)*16 + (j%16)` ⇒ `C = B`, so the first 16×16 output fragment must
+/// read `got[i][j] = i*16 + j`. Any within-fragment permutation lands a source
+/// element at the wrong `(i,j)` and trips the assert (printing the offending row).
 /// `SVOD_DEVICE=AMD:0 cargo test -p svod-tk --lib matmul::test_matmul_rdna_grid -- --ignored --nocapture`.
 #[test]
 #[ignore]
@@ -322,10 +322,10 @@ fn test_matmul_rdna_grid() {
     b.realize().expect("realize b");
     let got = launch_matmul("matmul_grid", n, SMALL_CFG, |ker| build_matmul_cfg(ker, n, SMALL_CFG), &a, &b);
 
-    println!("got fragment(0,0) — correct row i = [16i .. 16i+15]:");
     for i in 0..16 {
         let row: Vec<i32> = (0..16).map(|j| got[i * n + j].round() as i32).collect();
-        println!("  i={i:2}: {row:?}");
+        let expected: Vec<i32> = (0..16).map(|j| (i * 16 + j) as i32).collect();
+        assert_eq!(row, expected, "fragment(0,0) row i={i} permuted: {row:?} (expected {expected:?})");
     }
 }
 
