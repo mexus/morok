@@ -27,27 +27,35 @@ Svod 的符号化简器使用 `schedule/src/symbolic/patterns.rs` 中定义的 1
 
 一个简单表达式展示模式如何组合：
 
-```text
-Before:
-  ADD
-  ├── MUL
-  │   ├── ADD
-  │   │   ├── x
-  │   │   └── CONST(0)    <- identity
-  │   └── CONST(1)         <- identity
-  └── ADD
-      ├── CONST(3)
-      └── CONST(4)          <- constant fold
+优化前：
 
+```mermaid
+flowchart TD
+  A["ADD"] --> B["MUL"]
+  A --> C["ADD"]
+  B --> D["ADD"]
+  B --> E["CONST(1) (identity)"]
+  D --> F["x"]
+  D --> G["CONST(0) (identity)"]
+  C --> H["CONST(3)"]
+  C --> I["CONST(4) (constant fold)"]
+```
+
+步骤：
+
+```text
 Step 1 (identity):    ADD(x, 0) -> x
 Step 2 (identity):    MUL(x, 1) -> x
 Step 3 (const fold):  ADD(3, 4) -> CONST(7)
 Step 4 (result):      ADD(x, 7)
+```
 
-After:
-  ADD
-  ├── x
-  └── CONST(7)
+优化后：
+
+```mermaid
+flowchart TD
+  A["ADD"] --> B["x"]
+  A --> C["CONST(7)"]
 ```
 
 重写引擎自底向上应用模式：先化简子节点，再重新匹配父节点。这使得多步级联优化在一次遍历中完成。

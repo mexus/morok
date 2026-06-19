@@ -86,12 +86,11 @@ count = clamp(64 - length, 0, 64)
 
 **模式**：`pm_split_ranges + pm_flatten_range`
 
-```text
-Before:  RANGE(end=12) % 4  // One loop with modulo (slow)
-             ↓ [Split into outer × inner]
-After:   RANGE(end=3) * 4 + RANGE(end=4)
-            ↑outer        ↑inner
-            Parallel      Sequential
+```mermaid
+flowchart TD
+  B["Before: RANGE(end=12) % 4 (one loop with modulo, slow)"] -->|"split into outer x inner"| A["After: RANGE(end=3) * 4 + RANGE(end=4)"]
+  A --> O["RANGE(end=3): outer, Parallel"]
+  A --> I["RANGE(end=4): inner, Sequential"]
 ```
 
 这使得：
@@ -244,15 +243,15 @@ RANGE(0..32)
 - **启发式模式**（BEAM=0）：快速的手写优化模式，无需编译
 - **Beam search**（BEAM>=1）：编译并运行候选方案来测量实际性能
 
-```text
-Optimization Search:
-├── Heuristic mode (BEAM=0): Hand-coded optimizations
-└── Beam search (BEAM≥1):
-    ├── Generate all possible actions (~162 base actions, workload-dependent)
-    ├── Apply to all top-K candidates in parallel
-    ├── Filter based on constraints
-    ├── Compile and run each candidate → Measure actual time
-    └── Pick fastest
+```mermaid
+flowchart TD
+  S["Optimization Search"] --> H["Heuristic mode (BEAM=0): Hand-coded optimizations"]
+  S --> B["Beam search (BEAM≥1)"]
+  B --> B1["Generate all possible actions (~162 base actions, workload-dependent)"]
+  B --> B2["Apply to all top-K candidates in parallel"]
+  B --> B3["Filter based on constraints"]
+  B --> B4["Compile and run each candidate, measure actual time"]
+  B --> B5["Pick fastest"]
 ```
 
 **注意**：NOLOCALS 是一个约束，设置 `dont_use_locals = True`，阻止后续 LOCAL 动作并影响共享内存使用决策。

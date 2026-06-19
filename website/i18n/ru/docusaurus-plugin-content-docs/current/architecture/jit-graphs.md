@@ -16,20 +16,26 @@ sidebar_label: JIT-графы
 компилирует граф один раз во время `prepare()` и переигрывает его на
 каждом `execute()` с буферами устройства, удерживаемыми на месте.
 
-```text
-Без обёртки:                         С обёрткой:
-┌─────────────────────────┐          ┌─────────────────────────┐
-│  построить граф         │          │  построить граф         │
-│  оптимизировать паттерны│          │  оптимизировать паттерны│
-│  сгенерировать ядра     │          │  сгенерировать ядра     │
-│  скомпилировать (clang) │          │  скомпилировать (clang) │
-│  выделить буферы        │          │  выделить буферы        │
-│  выполнить              │          ├─────────────────────────┤
-└─────────────────────────┘          │  записать вход. буферы  │
-                                     │  выполнить              │
-                                     │  прочитать вых. буфер   │
-                                     └─────────────────────────┘
-каждый вызов                         prepare() + каждый шаг
+```mermaid
+flowchart TD
+  subgraph WO["Without the wrapper (every call)"]
+    WO1["build graph"] --> WO2["optimize patterns"]
+    WO2 --> WO3["generate kernels"]
+    WO3 --> WO4["compile (clang)"]
+    WO4 --> WO5["alloc buffers"]
+    WO5 --> WO6["execute"]
+  end
+  subgraph WP["With the wrapper (prepare() once)"]
+    WP1["build graph"] --> WP2["optimize patterns"]
+    WP2 --> WP3["generate kernels"]
+    WP3 --> WP4["compile (clang)"]
+    WP4 --> WP5["alloc buffers"]
+  end
+  subgraph WS["Every step"]
+    WS1["write input buffers"] --> WS2["execute"]
+    WS2 --> WS3["read output buffer"]
+  end
+  WP --> WS
 ```
 
 Обёртка композируется с [движком паттернов](./optimizations/pattern-system.md)

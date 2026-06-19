@@ -9,19 +9,22 @@ sidebar_position: 0
 
 Svod एक अलग तरीका अपनाता है: **हर चीज़ के लिए एक मैकेनिज़्म**।
 
-```text
-Traditional Compiler:              Svod:
-┌─────────────────────────┐       ┌─────────────────────────┐
-│  Constant Folding       │       │                         │
-│  Dead Code Elimination  │       │   patterns! {           │
-│  Loop Unrolling         │       │       Add[x, @zero] ~> x│
-│  Operator Fusion        │       │       Mul[x, @zero] ~> 0│
-│  Vectorization          │       │       // ...more        │
-│  Memory Planning        │       │   }                     │
-│  ...20 more passes      │       │                         │
-└─────────────────────────┘       │   graph_rewrite(...)    │
-     Custom logic each            └─────────────────────────┘
-                                       One mechanism
+```mermaid
+flowchart LR
+  subgraph T["Traditional Compiler (custom logic each)"]
+    direction TB
+    T1["Constant Folding"]
+    T2["Dead Code Elimination"]
+    T3["Loop Unrolling"]
+    T4["Operator Fusion"]
+    T5["Vectorization"]
+    T6["Memory Planning"]
+    T7["...20 more passes"]
+  end
+  subgraph S["Svod (one mechanism)"]
+    direction TB
+    S1["patterns! (Add, Mul, ...more)"] --> S2["graph_rewrite(...)"]
+  end
 ```
 
 Svod में हर ऑप्टिमाइज़ेशन एक **पैटर्न** के रूप में एक्सप्रेस होता है: "जब यह स्ट्रक्चर दिखे, उसे इस स्ट्रक्चर से बदल दो।" वही `graph_rewrite()` फ़ंक्शन [अल्जेब्रिक सिम्प्लिफ़िकेशन](./algebraic-simplification.md), [इंडेक्स अरिथमेटिक](./index-arithmetic.md), [strength reduction](./strength-reduction.md), और [range ऑप्टिमाइज़ेशन](./range-optimization.md) अप्लाई करता है।
@@ -175,11 +178,13 @@ WHERE(Lt(3, 5), t, f)
 
 Children रीराइट होने के बाद, नए children के साथ नोड रीबिल्ड करें और पैटर्न फिर ट्राई करें:
 
-```text
-Stage 0: WHERE(Lt(3, 5), t, f)     → Gate (no match, process children)
-         └── Lt(3, 5)              → true (constant folding matches!)
-
-Stage 1: WHERE(true, t, f)         → t (dead code elimination matches!)
+```mermaid
+flowchart TD
+  A["Stage 0: WHERE(Lt(3, 5), t, f)"] -->|"no match, process children"| B["Gate"]
+  A --> C["Lt(3, 5)"]
+  C -->|"constant folding matches"| D["true"]
+  D --> E["Stage 1: WHERE(true, t, f)"]
+  E -->|"dead code elimination matches"| F["t"]
 ```
 
 रीकंस्ट्रक्शन स्टेज पैटर्न री-अप्लाई करता है, जो सिंगल traversal में मल्टी-स्टेप ऑप्टिमाइज़ेशन सक्षम करता है।

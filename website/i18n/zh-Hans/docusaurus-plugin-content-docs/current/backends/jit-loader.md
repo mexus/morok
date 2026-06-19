@@ -12,32 +12,16 @@ sidebar_label: JIT 编译器
 
 ## 流水线
 
-```text
-C source / LLVM IR
-       │
-       ▼
- clang -c (stdin → stdout)
-       │
-       ▼
-  ELF .o bytes（内存中）
-       │
-       ▼
- 解析 section (object crate)
-       │
-       ▼
- 匿名 mmap + 复制 section
-       │
-       ▼
- 应用重定位（架构特定）
-       │
-       ▼
- mprotect(PROT_READ | PROT_EXEC)
-       │
-       ▼
- 刷新 I-cache（非 x86_64）
-       │
-       ▼
- 通过 libffi 调用函数指针
+```mermaid
+flowchart TD
+  A["C source / LLVM IR"] --> B["clang -c (stdin to stdout)"]
+  B --> C["ELF .o bytes (in memory)"]
+  C --> D["Parse sections (object crate)"]
+  D --> E["Anonymous mmap + copy sections"]
+  E --> F["Apply relocations (arch-specific)"]
+  F --> G["mprotect(PROT_READ, PROT_EXEC)"]
+  G --> H["Flush I-cache (non-x86_64)"]
+  H --> I["Call function pointer via libffi"]
 ```
 
 **Clang** 后端（C 源码，通过 `-x c`）和 **LLVM** 后端（LLVM IR 文本，通过 `-x ir`）共享同一个加载器。唯一区别是 clang 的输入语言标志。

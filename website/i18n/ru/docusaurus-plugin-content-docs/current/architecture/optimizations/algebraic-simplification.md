@@ -27,27 +27,35 @@ sidebar_label: Алгебраическое упрощение
 
 Простое выражение, демонстрирующее, как паттерны компонуются:
 
-```text
-Before:
-  ADD
-  ├── MUL
-  │   ├── ADD
-  │   │   ├── x
-  │   │   └── CONST(0)    <- identity
-  │   └── CONST(1)         <- identity
-  └── ADD
-      ├── CONST(3)
-      └── CONST(4)          <- constant fold
+До:
 
+```mermaid
+flowchart TD
+  A["ADD"] --> B["MUL"]
+  A --> C["ADD"]
+  B --> D["ADD"]
+  B --> E["CONST(1) (identity)"]
+  D --> F["x"]
+  D --> G["CONST(0) (identity)"]
+  C --> H["CONST(3)"]
+  C --> I["CONST(4) (constant fold)"]
+```
+
+Шаги:
+
+```text
 Step 1 (identity):    ADD(x, 0) -> x
 Step 2 (identity):    MUL(x, 1) -> x
 Step 3 (const fold):  ADD(3, 4) -> CONST(7)
 Step 4 (result):      ADD(x, 7)
+```
 
-After:
-  ADD
-  ├── x
-  └── CONST(7)
+После:
+
+```mermaid
+flowchart TD
+  A["ADD"] --> B["x"]
+  A --> C["CONST(7)"]
 ```
 
 Движок перезаписи применяет паттерны снизу вверх: сначала упрощаются потомки, затем родитель повторно сопоставляется. Это позволяет многошаговым каскадам сработать за один обход.

@@ -36,12 +36,11 @@ for i in range:
 
 Reduction डायमेंशन पर लूप चलाने से पहले, हम पहले पड़ोसी वैल्यूज़ कम्बाइन करते हैं। इससे बड़ी reductions बनती हैं जो हार्डवेयर इंस्ट्रक्शन से बेहतर मैप होती हैं।
 
-```text
-Before:  [a, b, c, d, e, f, g, h]  // 8 values
-             ↓ [Horizontal reduction]
-Step 1:  [a+e, b+f, c+g, d+h]      // 4 partial sums
-             ↓ [Accumulator pattern]
-After:   acc = acc + (a+e) + (b+f) + (c+g) + (d+h)
+```mermaid
+flowchart TD
+  A["Before: [a, b, c, d, e, f, g, h] (8 values)"]
+  A -->|"Horizontal reduction"| B["Step 1: [a+e, b+f, c+g, d+h] (4 partial sums)"]
+  B -->|"Accumulator pattern"| C["After: acc = acc + (a+e) + (b+f) + (c+g) + (d+h)"]
 ```
 
 **GEP pushing** बेहतर वेक्टराइज़ेशन के लिए GEP (get element pointer) ऑपरेशन को ALUs से गुज़ारता है:

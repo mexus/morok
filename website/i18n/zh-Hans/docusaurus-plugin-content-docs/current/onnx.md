@@ -90,8 +90,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 **`import(path, dim_bindings)`** 在一次调用中完成两个阶段：解析 protobuf，提取初始化器和输入规格，按拓扑顺序遍历图并将每个 ONNX 节点分派给对应的 Tensor 实现，返回 `OnnxModel { inputs, outputs, variables }`。不会执行任何计算——结果是一组惰性 `Tensor` 句柄，调用 `realize()` 时才会编译并执行。
 
-```text
-model.onnx → import(path, dims) → OnnxModel { inputs, outputs, variables } → realize() → results
+```mermaid
+flowchart LR
+  A["model.onnx"] -->|"import(path, dims)"| B["OnnxModel (inputs, outputs, variables)"]
+  B -->|"realize()"| C["results"]
 ```
 
 对于高级用例（在导入前检查图结构），`import_model()` 接受预解析的 `ModelProto`。

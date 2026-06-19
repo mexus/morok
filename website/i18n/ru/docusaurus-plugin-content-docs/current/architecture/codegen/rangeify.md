@@ -86,12 +86,11 @@ count = clamp(64 - length, 0, 64)
 
 **Паттерн**: `pm_split_ranges + pm_flatten_range`
 
-```text
-Before:  RANGE(end=12) % 4  // One loop with modulo (slow)
-             ↓ [Split into outer × inner]
-After:   RANGE(end=3) * 4 + RANGE(end=4)
-            ↑outer        ↑inner
-            Parallel      Sequential
+```mermaid
+flowchart TD
+  B["Before: RANGE(end=12) % 4 (one loop with modulo, slow)"] -->|"split into outer x inner"| A["After: RANGE(end=3) * 4 + RANGE(end=4)"]
+  A --> O["RANGE(end=3): outer, Parallel"]
+  A --> I["RANGE(end=4): inner, Sequential"]
 ```
 
 Это позволяет:
@@ -244,15 +243,15 @@ RANGE(0..32)
 - **Эвристический режим** (BEAM=0): Быстрые захардкоженные паттерны оптимизации, без компиляции
 - **Beam search** (BEAM>=1): Компилирует и запускает кандидатов, чтобы замерить реальную производительность
 
-```text
-Optimization Search:
-├── Heuristic mode (BEAM=0): Hand-coded optimizations
-└── Beam search (BEAM≥1):
-    ├── Generate all possible actions (~162 base actions, workload-dependent)
-    ├── Apply to all top-K candidates in parallel
-    ├── Filter based on constraints
-    ├── Compile and run each candidate → Measure actual time
-    └── Pick fastest
+```mermaid
+flowchart TD
+  S["Optimization Search"] --> H["Heuristic mode (BEAM=0): Hand-coded optimizations"]
+  S --> B["Beam search (BEAM≥1)"]
+  B --> B1["Generate all possible actions (~162 base actions, workload-dependent)"]
+  B --> B2["Apply to all top-K candidates in parallel"]
+  B --> B3["Filter based on constraints"]
+  B --> B4["Compile and run each candidate, measure actual time"]
+  B --> B5["Pick fastest"]
 ```
 
 **Примечание**: NOLOCALS — ограничение, которое устанавливает `dont_use_locals = True`, запрещая дальнейшие LOCAL-действия и влияя на решения по использованию shared-памяти.

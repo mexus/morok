@@ -90,8 +90,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 **`import(path, dim_bindings)`** दोनों चरणों को एक ही कॉल में करता है: protobuf को पार्स करता है, इनिशियलाइज़र और इनपुट स्पेक्स निकालता है, ग्राफ़ को टोपोलॉजिकल क्रम में ट्रैवर्स करते हुए प्रत्येक ONNX नोड को उसके Tensor इम्प्लीमेंटेशन पर डिस्पैच करता है, और एक `OnnxModel { inputs, outputs, variables }` लौटाता है। कोई एक्ज़ीक्यूशन नहीं होता — रिज़ल्ट lazy `Tensor` हैंडल का सेट है जो `realize()` करने पर कम्पाइल और एक्ज़ीक्यूट होता है।
 
-```text
-model.onnx → import(path, dims) → OnnxModel { inputs, outputs, variables } → realize() → results
+```mermaid
+flowchart LR
+  A["model.onnx"] -->|"import(path, dims)"| B["OnnxModel (inputs, outputs, variables)"]
+  B -->|"realize()"| C["results"]
 ```
 
 एडवांस्ड यूज़ केस के लिए (इम्पोर्ट से पहले ग्राफ़ स्ट्रक्चर जाँचना), `import_model()` एक पहले से पार्स्ड `ModelProto` स्वीकार करता है।

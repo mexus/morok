@@ -36,12 +36,11 @@ for i in range:
 
 在循环遍历规约维度之前，我们先合并相邻的值。这样可以创建更大的规约，更好地映射到硬件指令。
 
-```text
-Before:  [a, b, c, d, e, f, g, h]  // 8 values
-             ↓ [Horizontal reduction]
-Step 1:  [a+e, b+f, c+g, d+h]      // 4 partial sums
-             ↓ [Accumulator pattern]
-After:   acc = acc + (a+e) + (b+f) + (c+g) + (d+h)
+```mermaid
+flowchart TD
+  A["Before: [a, b, c, d, e, f, g, h] (8 values)"]
+  A -->|"Horizontal reduction"| B["Step 1: [a+e, b+f, c+g, d+h] (4 partial sums)"]
+  B -->|"Accumulator pattern"| C["After: acc = acc + (a+e) + (b+f) + (c+g) + (d+h)"]
 ```
 
 **GEP 推送**将 GEP（get element pointer）操作推过 ALU 以改善向量化：

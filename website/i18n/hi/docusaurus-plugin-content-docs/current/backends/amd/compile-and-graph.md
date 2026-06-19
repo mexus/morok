@@ -16,17 +16,11 @@ sidebar_label: Compile और Graph
 compile path है **AMD LLVM IR text → `clang` → ELF code object → in-VRAM load**। तीन crates
 मिलकर काम करते हैं, जिन्हें `runtime/src/devices/amd.rs` में एक साथ wire किया गया है:
 
-```text
-  UOp IR
-    │  LlvmTextRenderer::amd(arch)         (svod-codegen)
-    ▼
-  AMD LLVM IR (text)
-    │  compile_ir_to_amd_object            (svod-runtime)
-    ▼
-  AMDGPU ELF code object
-    │  AmdProgram::load                    (svod-device)
-    ▼
-  resident in VRAM, kernel descriptor decoded
+```mermaid
+flowchart TD
+  A["UOp IR"] -->|"LlvmTextRenderer::amd(arch) (svod-codegen)"| B["AMD LLVM IR (text)"]
+  B -->|"compile_ir_to_amd_object (svod-runtime)"| C["AMDGPU ELF code object"]
+  C -->|"AmdProgram::load (svod-device)"| D["resident in VRAM, kernel descriptor decoded"]
 ```
 
 ### Rendering

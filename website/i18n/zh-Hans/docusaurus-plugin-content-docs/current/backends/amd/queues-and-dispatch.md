@@ -48,8 +48,12 @@ will_use_pm4(core) = !SVOD_AMD_AQL && num_xcc == 1
 一次 PM4 调度是一个固定序列，对应 tinygrad 的
 `hcq.py:371-378`：
 
-```text
-wait(timeline, prev)  →  hdp_flush  →  acquire_mem  →  exec  →  release_mem(timeline, next)
+```mermaid
+flowchart LR
+  A["wait(timeline, prev)"] --> B["hdp_flush"]
+  B --> C["acquire_mem"]
+  C --> D["exec"]
+  D --> E["release_mem(timeline, next)"]
 ```
 
 `exec` 是加载着色器地址、`RSRC1/2/3`

@@ -72,24 +72,18 @@ KFD-direct AMD के लिए वही है जो [CPU JIT लोडर](.
 
 बैकएंड **`AmdIface`** trait (`device/src/amd/iface.rs`) द्वारा दो हिस्सों में बँटा है:
 
-```text
-        ┌─────────────────────────────────────────────────────────┐
-        │  ABOVE THE SEAM — backend-agnostic (no ioctls)          │
-        │                                                         │
-        │  AmdProgram   AmdComputeQueue   KernargArena   Timeline │
-        │  AmdConnector   AmdGraph   SignalPool   AmdAllocator    │
-        │  PM4 / AQL packet builders   ring back-pressure         │
-        └──────────────────────────────┬──────────────────────────┘
-                                       │  Arc<dyn AmdIface>
-                                       │  alloc_raw · free_raw
-                                       │  setup_ring · teardown_ring
-                                       │  wait_events
-        ┌──────────────────────────────┴──────────────────────────┐
-        │  BELOW THE SEAM — the actual driver                     │
-        │                                                         │
-        │   KfdIface  (today: KFD ioctls on /dev/kfd)             │
-        │   AmIface   (future: userspace PCI-BAR driver — WIP)    │
-        └─────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TD
+  subgraph above["ABOVE THE SEAM — backend-agnostic (no ioctls)"]
+    A1["AmdProgram, AmdComputeQueue, KernargArena, Timeline"]
+    A2["AmdConnector, AmdGraph, SignalPool, AmdAllocator"]
+    A3["PM4 / AQL packet builders, ring back-pressure"]
+  end
+  subgraph below["BELOW THE SEAM — the actual driver"]
+    B1["KfdIface (today: KFD ioctls on /dev/kfd)"]
+    B2["AmIface (future: userspace PCI-BAR driver — WIP)"]
+  end
+  above -->|"Arc(dyn AmdIface): alloc_raw, free_raw, setup_ring, teardown_ring, wait_events"| below
 ```
 
 जो कुछ भी kernel call *नहीं* है — 16 MiB command ring, PM4/AQL packet construction,
@@ -157,11 +151,13 @@ AMD बैकएंड compiler का device हिस्सा है। Front
 stage ranges को `blockIdx`/`threadIdx` में बदलता है, जैसा [IR Design](../../architecture/ir-design.md)
 में बताया गया है); renderer AMD LLVM IR emit करता है; और यह बैकएंड उसे compile और run करता है:
 
-```text
-  UOp IR ──▶ AMD LLVM IR ──▶ clang (amdgcn) ──▶ ELF code object
-                                                      │
-                                                      ▼
-   AmdProgram::load  ──▶  dispatch over a KFD ring  ──▶  GPU
+```mermaid
+flowchart LR
+  A["UOp IR"] --> B["AMD LLVM IR"]
+  B --> C["clang (amdgcn)"]
+  C --> D["ELF code object"]
+  D --> E["AmdProgram::load"]
+  E -->|"dispatch over a KFD ring"| F["GPU"]
 ```
 
 [JIT ग्राफ़](../../architecture/jit-graphs.md) layer इसे wrap करती है ताकि एक model graph

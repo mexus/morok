@@ -45,8 +45,12 @@ will_use_pm4(core) = !SVOD_AMD_AQL && num_xcc == 1
 
 एक single PM4 dispatch एक fixed sequence है, tinygrad के `hcq.py:371-378` को mirror करते हुए:
 
-```text
-wait(timeline, prev)  →  hdp_flush  →  acquire_mem  →  exec  →  release_mem(timeline, next)
+```mermaid
+flowchart LR
+  A["wait(timeline, prev)"] --> B["hdp_flush"]
+  B --> C["acquire_mem"]
+  C --> D["exec"]
+  D --> E["release_mem(timeline, next)"]
 ```
 
 `exec` वह `SET_SH_REG` stream है जो shader address, `RSRC1/2/3` registers, scratch

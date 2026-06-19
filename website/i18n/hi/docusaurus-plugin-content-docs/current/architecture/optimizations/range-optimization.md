@@ -18,14 +18,12 @@ Tinygrad source: `tinygrad/codegen/simplify.py`।
 
 **कब**: Range variable modulo के साथ इस्तेमाल होता है: `RANGE(end) % c` जहाँ `end % c == 0`।
 
-```text
-Before:  RANGE(end=12) % 4     One loop, modulo in body (slow)
-              |
-         [split: end/c outer, c inner]
-              |
-After:   RANGE(end=3) * 4 + RANGE(end=4)
-           ^outer              ^inner
-           Parallel            Sequential / Vectorize
+```mermaid
+flowchart TD
+  A["Before: RANGE(end=12) % 4 (one loop, modulo in body, slow)"]
+  A -->|"split: end/c outer, c inner"| B["After: RANGE(end=3) * 4 + RANGE(end=4)"]
+  B --> C["outer: RANGE(end=3) (Parallel)"]
+  B --> D["inner: RANGE(end=4) (Sequential / Vectorize)"]
 ```
 
 **क्यों**: Splitting के बाद, inner range vectorize हो सकता है (UPCAST to SIMD width) जबकि outer range parallelize हो सकता है (GPU blocks, CPU threads)। Splitting के बिना, modulo दोनों optimizations रोकता है।
@@ -42,12 +40,10 @@ Tinygrad: `simplify.py:60-64`। Svod: `pm_split_ranges()` in `rangeify/transfor
 
 **क्या**: दो adjacent ranges को एक में merge करना, loop overhead कम करना।
 
-```text
-Before:  RANGE(0..4), RANGE(0..8)    Two loops, 12 iterations overhead
-              |
-         [merge: 4 * 8 = 32]
-              |
-After:   RANGE(0..32)                 One loop, indices via divmod
+```mermaid
+flowchart TD
+  A["Before: RANGE(0..4), RANGE(0..8) (two loops, 12 iterations overhead)"]
+  A -->|"merge: 4 * 8 = 32"| B["After: RANGE(0..32) (one loop, indices via divmod)"]
 ```
 
 **क्यों**: Loop overhead (branch prediction, counter increment) per-iteration है। Merging loops की संख्या कम करता है divmod operations की cost पर original indices reconstruct करने के लिए।
@@ -146,21 +142,19 @@ Tinygrad: `simplify.py:82-142`। Svod: `pm_reduce_simplify()` + `reduce_collaps
 
 ### Decision Tree
 
-```text
-Is this an always-run op (CONTIGUOUS, COPY)?
-  └─ YES → Keep buffer (always materialized)
-
-Does inlining exceed the buffer limit?
-  └─ YES → Keep buffer
-
-Is there a reduce in scope?
-  ├─ NO → Inline (cheap: just substitute ranges)
-  └─ YES:
-      Is pcontig level <= 2?
-        ├─ YES → Keep buffer (reduce recomputation too expensive)
-        └─ NO → Check input/output ratio
-            ├─ Ratio low (output small relative to input) → Keep buffer
-            └─ Ratio high (output >> input) → Partial inline
+```mermaid
+flowchart TD
+  Q1["Is this an always-run op (CONTIGUOUS, COPY)?"]
+  Q1 -->|"YES"| K1["Keep buffer (always materialized)"]
+  Q1 -->|"NO"| Q2["Does inlining exceed the buffer limit?"]
+  Q2 -->|"YES"| K2["Keep buffer"]
+  Q2 -->|"NO"| Q3["Is there a reduce in scope?"]
+  Q3 -->|"NO"| I1["Inline (cheap: just substitute ranges)"]
+  Q3 -->|"YES"| Q4["Is pcontig level (less than or equal to) 2?"]
+  Q4 -->|"YES"| K3["Keep buffer (reduce recomputation too expensive)"]
+  Q4 -->|"NO"| Q5["Check input/output ratio"]
+  Q5 -->|"Ratio low (output small relative to input)"| K4["Keep buffer"]
+  Q5 -->|"Ratio high (output much greater than input)"| I2["Partial inline"]
 ```
 
 :::caution Reduce Context में Unary Ops

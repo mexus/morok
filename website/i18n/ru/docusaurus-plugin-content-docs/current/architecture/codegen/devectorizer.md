@@ -36,12 +36,11 @@ for i in range:
 
 Перед тем как итерировать по измерению редукции, мы сначала объединяем соседние значения. Это создаёт более крупные редукции, которые лучше ложатся на аппаратные инструкции.
 
-```text
-Before:  [a, b, c, d, e, f, g, h]  // 8 values
-             ↓ [Horizontal reduction]
-Step 1:  [a+e, b+f, c+g, d+h]      // 4 partial sums
-             ↓ [Accumulator pattern]
-After:   acc = acc + (a+e) + (b+f) + (c+g) + (d+h)
+```mermaid
+flowchart TD
+  A["Before: [a, b, c, d, e, f, g, h] (8 values)"]
+  A -->|"Horizontal reduction"| B["Step 1: [a+e, b+f, c+g, d+h] (4 partial sums)"]
+  B -->|"Accumulator pattern"| C["After: acc = acc + (a+e) + (b+f) + (c+g) + (d+h)"]
 ```
 
 **GEP pushing** проталкивает GEP (get element pointer) через ALU для лучшей векторизации:

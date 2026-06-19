@@ -81,43 +81,31 @@ Example:  [a, b, c, d] → one vector containing all four
 साथ में: UPCAST वेक्टराइज़ करने का इंटेंट मार्क करता है → UNROLL एक्सपैंड करता है → CONTRACT कम्बाइन करता है।
 
 **UPCAST range → VECTORIZE**:
-```text
-// Before: UPCAST marks vectorization intent
-RANGE(end=4, UPCAST)
-      ↓ [pm_pre_expander]
-// Step 1: Convert to UNROLL with constant indices
-UNROLL(VCONST([0, 1, 2, 3]))
-      ↓ [expander]
-// Step 2: Expand operations with UNROLL sources
-// Operations now have unrolled sources
-      ↓ [CONTRACT or implicit]
-// After: explicit VECTORIZE
-VECTORIZE(op[0], op[1], op[2], op[3])
+```mermaid
+flowchart TD
+  A["Before: UPCAST marks vectorization intent. RANGE(end=4, UPCAST)"]
+  A -->|"pm_pre_expander"| B["Step 1: Convert to UNROLL with constant indices. UNROLL(VCONST([0, 1, 2, 3]))"]
+  B -->|"expander"| C["Step 2: Expand operations with UNROLL sources. Operations now have unrolled sources"]
+  C -->|"CONTRACT or implicit"| D["After: explicit VECTORIZE. VECTORIZE(op[0], op[1], op[2], op[3])"]
 ```
 
 **UNROLL range → repeated ऑपरेशन**:
 
 जब हम "ऑपरेशन डुप्लीकेट होते हैं" कहते हैं, तो ऐसा नहीं है कि कॉपी-पेस्ट होता है। कम्पाइलर एक सिंगल SIMD इंस्ट्रक्शन बनाता है जो सभी N एलिमेंट एक साथ प्रोसेस करती है। SIMD रजिस्टर को 4 नंबर रखने वाला बॉक्स सोचें; दो बॉक्स जोड़ने से सभी 8 नंबर एक साथ जुड़ते हैं।
 
-```text
-// Before: UPCAST marks vectorization intent
-RANGE(end=3, UPCAST)
-      ↓ [pm_pre_expander]
-// Step 1: Convert to UNROLL
-UNROLL(VCONST([0, 1, 2]))
-      ↓ [expander]
-// Step 2: Operations expand to handle all positions
-// After: operations processed together (not duplicated)
-UNROLL([op_at_0, op_at_1, op_at_2])
+```mermaid
+flowchart TD
+  A["Before: UPCAST marks vectorization intent. RANGE(end=3, UPCAST)"]
+  A -->|"pm_pre_expander"| B["Step 1: Convert to UNROLL. UNROLL(VCONST([0, 1, 2]))"]
+  B -->|"expander"| C["Step 2: Operations expand to handle all positions. After: operations processed together (not duplicated). UNROLL([op_at_0, op_at_1, op_at_2])"]
 ```
 
 **UNROLL/END/CONTRACT इंटरैक्शन**:
-```text
-Before: END(STORE(...), [RANGE(UPCAST)])
-             ↓ [pm_pre_expander]
-Step 1: END(STORE(...), [UNROLL(VCONST([0,1,2,3]))])
-             ↓ [expander]
-Step 2: END(CONTRACT(STORE(...×4)), [])
+```mermaid
+flowchart TD
+  A["Before: END(STORE(...), [RANGE(UPCAST)])"]
+  A -->|"pm_pre_expander"| B["Step 1: END(STORE(...), [UNROLL(VCONST([0,1,2,3]))])"]
+  B -->|"expander"| C["Step 2: END(CONTRACT(STORE(...x4)), [])"]
 ```
 
 **AFTER/END से ब्रॉडकास्ट**:
@@ -130,15 +118,14 @@ AFTER(VECTORIZE([x, x, x, x]), deps) → VECTORIZE([AFTER(x, deps), AFTER(x, dep
 
 GROUP_REDUCE tensor core reductions के लिए एक स्पेशल axis type है:
 
-```text
-// Before: REDUCE with GROUP_REDUCE ranges
-REDUCE(src, [range(GROUP_REDUCE)])
-           ↓ [pm_group_for_reduce]
-// After: Shared memory reduction pattern
-1. Track upstream LOCAL ranges
-2. BUFFERIZE result with group ranges (AddrSpace.LOCAL)
-3. INDEX into buffer with transformed ranges
-4. Final REDUCE with axes (range_id+100, AxisType.REDUCE)
+```mermaid
+flowchart TD
+  A["Before: REDUCE with GROUP_REDUCE ranges. REDUCE(src, [range(GROUP_REDUCE)])"]
+  A -->|"pm_group_for_reduce"| B["After: Shared memory reduction pattern"]
+  B --> S1["1. Track upstream LOCAL ranges"]
+  B --> S2["2. BUFFERIZE result with group ranges (AddrSpace.LOCAL)"]
+  B --> S3["3. INDEX into buffer with transformed ranges"]
+  B --> S4["4. Final REDUCE with axes (range_id+100, AxisType.REDUCE)"]
 ```
 
 यह shared memory से एफ़िशिएंट tensor core accumulation सक्षम करता है।
