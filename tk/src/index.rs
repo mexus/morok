@@ -139,7 +139,7 @@ pub fn load_off(buf: &Arc<UOp>, offset: Arc<UOp>) -> Arc<UOp> {
 }
 
 /// Wide LOAD of `lanes` contiguous elements from `buf` starting at element
-/// `offset` — a single `<lanes × elem>` vector load (M3's 128-bit coalesced
+/// `offset` — a single `<lanes × elem>` vector load (the 128-bit coalesced
 /// GLOBAL fill: `bf16` × 8 = `global_load_dwordx4`). The INDEX points at the
 /// first element; the vector LOAD reads the `lanes`-wide contiguous run. The
 /// caller must guarantee `offset` is `lanes`-aligned (16-byte for `vec8` bf16).

@@ -1,4 +1,4 @@
-//! Pure (GPU-free) tests for the M4 grid / chiplet L2 swizzle.
+//! Pure (GPU-free) tests for the grid / chiplet L2 swizzle.
 
 use std::sync::Arc;
 

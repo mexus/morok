@@ -1,8 +1,8 @@
-//! Grid → tile L2 / chiplet swizzle (M4).
+//! Grid → tile L2 / chiplet swizzle.
 //!
 //! Maps a *flattened* 1-D workgroup id to a `(pid_m, pid_n)` block coordinate so
 //! co-scheduled workgroups share an XCD / L2 slice — more A/B re-use across the
-//! MI300X's 8 XCDs. Pure `Index` arithmetic on `block_idx[0]`: no data movement,
+//! CDNA3's 8 XCDs (gfx942). Pure `Index` arithmetic on `block_idx[0]`: no data movement,
 //! just a permutation of *which* workgroup computes *which* output block (so the
 //! computed C is unchanged). Port of HipKittens `GEMM:50-65` + `util.cuh:90`.
 
@@ -12,7 +12,7 @@ use svod_ir::UOp;
 
 use crate::index::cidx;
 
-/// MI300X XCD (chiplet) count (HK `util.cuh:124`).
+/// CDNA3 XCD (chiplet) count (gfx942; 8 on multi-XCC). See HK `util.cuh:124`.
 pub const NUM_XCDS: i64 = 8;
 /// Grouped-M L2 swizzle group width, in blocks (HK `GEMM:48` `WGM`).
 pub const WGM: i64 = 4;
@@ -38,7 +38,7 @@ fn chiplet_transform_chunked(wgid: &Arc<UOp>, num_wgs: i64, num_xcds: i64, chunk
     UOp::try_where(cidx(limit).lt(wgid), wgid.clone(), transformed).expect("chiplet: keep-or-transform")
 }
 
-/// M4 grid / chiplet L2 swizzle: map flattened workgroup id `wgid` to a
+/// Grid / chiplet L2 swizzle: map flattened workgroup id `wgid` to a
 /// `(pid_m, pid_n)` block coordinate (in block units), reordering so
 /// co-scheduled workgroups hit the same XCD/L2 slice (HK `GEMM:50-65`). A
 /// bijection over `0..num_wgs` for any `grid_m × grid_n` grid (`grid_m`/`grid_n`

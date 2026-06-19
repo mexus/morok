@@ -242,7 +242,7 @@ fn upcast_count(axes: &[(usize, usize)]) -> i64 {
 
 /// Scalar geometry of the coalesced GLOBAL↔LDS fill for one ST tile (the part
 /// independent of the global source / tile position). Shared by the direct fill
-/// and the M2 register-staged prefetch so both address LDS identically.
+/// and the register-staged prefetch so both address LDS identically.
 struct LdsGeom {
     ept: i64,
     st_cols: i64,
@@ -963,7 +963,7 @@ impl<'k> Group<'k> {
     }
 
     /// Coalesced GLOBAL→LOCAL fill **without** the trailing workgroup barrier —
-    /// the software-pipeline primitive (FA-5 stage ii). The caller is responsible
+    /// the software-pipeline primitive (stage ii). The caller is responsible
     /// for inserting one barrier per buffer before the LDS→REG gather (so the
     /// fill is visible) and before the next overwrite (the WAR edge); decoupling
     /// the fill from its sync lets the next block's GLOBAL loads issue *ahead* of
@@ -973,7 +973,7 @@ impl<'k> Group<'k> {
     }
 
     /// Stage one tile of `src` (GLOBAL) into a fresh per-lane register buffer —
-    /// the GLOBAL→VGPR half of the M2 register prefetch. Uses the *same*
+    /// the GLOBAL→VGPR half of the register prefetch. Uses the *same*
     /// coalesced per-lane addressing as [`Self::load_global_to_local`], but lands
     /// the loaded (unswizzled) values in a flat `[total_calls, ept]` DEFINE_REG
     /// instead of LDS, so the load can be issued ahead of the consuming MFMAs.
@@ -1197,7 +1197,7 @@ impl<'k> Group<'k> {
         self.finalize_st(st, ended)
     }
 
-    /// M3 vectorized GLOBAL→LOCAL fill: the [`Self::load_global_to_local`]
+    /// Vectorized GLOBAL→LOCAL fill: the [`Self::load_global_to_local`]
     /// counterpart that issues **128-bit** (`vec8` bf16) coalesced global loads
     /// (one `global_load_dwordx4`/lane) and commits each into the XOR-swizzled
     /// LDS as `vec8/sw` contiguous `vec_sw` stores. The swizzle's XOR delta is
@@ -1220,7 +1220,7 @@ impl<'k> Group<'k> {
         let base_rows = st.base.base.rows as i64;
         let base_cols = st.base.base.cols as i64;
         let st_cols = st.cols as i64;
-        // Alignment invariants (M3 risk mitigation): the swizzle period and the
+        // Alignment invariants: the swizzle period and the
         // tile/fragment widths must admit `vw`-aligned 16-byte groups.
         if let Some(period) = st.base.swizzle.period_bytes(st.base.base.cols, itemsize) {
             assert_eq!(period % 16, 0, "vec fill: swizzle period {period}B not 16B-aligned");

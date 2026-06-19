@@ -1,4 +1,4 @@
-//! M1 ownership probe: take the VF from the GIM via the mailbox, then prove the
+//! Ownership probe: take the VF from the GIM via the mailbox, then prove the
 //! RLCG indirect path works (direct GC reads return 0xffffffff on a VF).
 //!
 //! DESTRUCTIVE — requires amdgpu unbound first:

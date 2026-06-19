@@ -64,7 +64,7 @@ fn swizzle_bytes(cols: usize, itemsize: i64) -> i64 {
 impl Swizzle {
     /// The XOR swizzle period in bytes for a `cols`-wide / `itemsize`-byte base
     /// tile (`None` for [`Swizzle::Identity`], which has no period). Used by the
-    /// M3 vectorized fill to assert 16-byte group alignment.
+    /// vectorized fill; asserts 16-byte group alignment.
     pub(crate) fn period_bytes(&self, cols: usize, itemsize: i64) -> Option<i64> {
         match self {
             Swizzle::Identity => None,

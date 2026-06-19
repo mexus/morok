@@ -72,7 +72,7 @@ pub struct Discovery {
 }
 
 impl Discovery {
-    /// Number of GC instances = XCC count (8 on MI300X SPX, 1 on APUs).
+    /// Number of GC instances = XCC count (8 on CDNA3 multi-XCC, 1 on single-XCC parts).
     pub fn xccs(&self) -> usize {
         self.regs_offset.get(&GC_HWIP).map_or(1, BTreeMap::len)
     }

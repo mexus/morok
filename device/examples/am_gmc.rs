@@ -1,4 +1,4 @@
-//! M1 GMC bring-up: full AmDev::open — handshake, discovery, build the GMMU
+//! GMC bring-up: full AmDev::open — handshake, discovery, build the GMMU
 //! over VRAM, program context0 + invalidation ranges on all 8 XCC via RLCG,
 //! and flush the TLB (ENG17 ACK polled per-XCC). Success = the GC hub accepts
 //! our page-table context.

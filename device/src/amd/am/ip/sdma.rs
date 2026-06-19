@@ -1,6 +1,6 @@
 //! SDMA (copy engine) ring bring-up for gfx942 (SDMA IP 4.4.2).
 //!
-//! SDMA registers are direct MMIO (not RLCG-gated). For M2 the ring is driven
+//! SDMA registers are direct MMIO (not RLCG-gated). The ring is driven
 //! by the `RB_WPTR` register directly with the doorbell disabled — amdgpu's
 //! `use_doorbell=false` path: `RB_WPTR = wptr_dwords << 2` (a byte offset), and
 //! `RB_RPTR` reports progress the same way. This sidesteps the NBIO doorbell

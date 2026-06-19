@@ -29,15 +29,17 @@ use crate::tiles::TileLayout;
 /// ([`Q_BLK`]/[`KV_BLK`]).
 const BLK: usize = 16;
 
-/// Multi-wave warps per workgroup (the FA-5 occupancy lift): 8 wave64 warps =
-/// `8 * 64 = 512` threads per block. Each warp owns a distinct Q-tile; all 8
+/// Multi-wave warps per workgroup (the multi-wave occupancy lift, 8 waves/block):
+/// 8 wave64 warps = `8 * 64 = 512` threads per block. Each warp owns a distinct
+/// Q-tile; all 8
 /// share one K/V LDS slot, filled collaboratively across the 512 threads.
 const NUM_WARPS: usize = 8;
 
 /// Default per-warp Q-tile height for the production double-buffered path
-/// ([`flash_attention_forward_mw_db`]). FA-4 measured `{16,16}` (the WMMA edge)
-/// as the non-regressing default on gfx942: bigger register tiles raise VGPR
-/// pressure and drop occupancy (the bottleneck). `{32,32}`/`{32,64}` stay
+/// ([`flash_attention_forward_mw_db`]). The default `{16,16}` Q/KV tile (the WMMA
+/// edge) is tuned for gfx942 register occupancy; larger tiles raise VGPR pressure
+/// and drop occupancy (the bottleneck). The multi-wave occupancy lift (8
+/// waves/block) is opt-in via [`FaConfig`]. `{32,32}`/`{32,64}` stay
 /// opt-in via the explicit-tile [`build_fa_mw_db`] args.
 const Q_BLK: usize = 16;
 /// Default per-warp KV-tile (super-block) height. See [`Q_BLK`].
@@ -53,8 +55,8 @@ fn iconst(v: i64) -> Arc<UOp> {
 /// fragment shapes (`_W32_*`), the accumulator→input relayout (an LDS round-trip on
 /// RDNA, a register copy on CDNA), and the even/odd-aware mask geometry; the launch
 /// block tracks the real wave width. The launcher gates against this list, the
-/// generic launch infra stays arch-agnostic. Both are HW-validated (gfx1151 on
-/// Strix Halo / wave32).
+/// generic launch infra stays arch-agnostic.
+/// Validated on gfx942 (CDNA3) and gfx1151 (RDNA3.5).
 pub const FA_SUPPORTED_ARCHS: &[svod_dtype::AmdArch] = &[svod_dtype::AmdArch::Gfx942, svod_dtype::AmdArch::Gfx1151];
 
 /// The **direct-launch** FA wrappers ([`flash_attention_forward`], `_mw`, `_mw_db`,

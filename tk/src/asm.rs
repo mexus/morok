@@ -1,5 +1,5 @@
 //! Raw gfx942 scheduling/synchronization primitives, injected as `Op::Custom`
-//! Void side-effects (M2 K-loop pipeline). These carry no data — each takes a
+//! Void side-effects (K-loop pipeline). These carry no data — each takes a
 //! `dep` purely so the linearizer's toposort sequences it *after* the prior
 //! cluster and a consumer can `.after([..])` it to sequence the next cluster
 //! *after* it (and keep it live through DCE).

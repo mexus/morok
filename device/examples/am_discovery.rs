@@ -66,7 +66,7 @@ fn main() {
     rd(discovery::OSSSYS_HWIP, "osssys", "regIH_RB_CNTL", 0);
     rd(discovery::SDMA0_HWIP, "sdma", "regSDMA_GFX_RB_CNTL", 0);
     // VF mailbox regs are absent from the bare-metal AM tables (vendored from
-    // kernel nbio_7_9_0 headers in M1); a direct NBIO read still validates the
+    // kernel nbio_7_9_0 headers); a direct NBIO read still validates the
     // segment bases.
     rd(discovery::NBIO_HWIP, "nbio", "regRCC_DEV0_EPF0_RCC_DOORBELL_APER_EN", 0);
     println!("M0 read-only probe complete");

@@ -123,7 +123,7 @@ fn set_aql_scratch_round_trips_through_gart() {
 ///
 /// Does the AQL packet processor honor a *native* `completion_signal` on a
 /// KFD-direct `COMPUTE_AQL` queue, with a plain busy-wait signal the host polls
-/// (no event mailbox / interrupt)? And on multi-XCC (MI300 SPX), does it fire
+/// (no event mailbox / interrupt)? And on multi-XCC CDNA3, does it fire
 /// once or once-per-XCC? This is the question gating the queue redesign (drop
 /// the PM4-`RELEASE_MEM` monotonic timeline + per-owner queues in favor of
 /// native AQL dispatch + countdown completion signals + a shared lock-free ring).

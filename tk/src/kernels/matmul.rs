@@ -39,18 +39,18 @@ pub struct MatmulCfg {
     pub wave_rows: usize,
     pub wave_cols: usize,
     pub n_accum: usize,
-    /// M4: drive `(pid_m, pid_n)` from a flattened 1-D grid via the chiplet/L2
+    /// Drive `(pid_m, pid_n)` from a flattened 1-D grid via the chiplet/L2
     /// [`l2_swizzle`](crate::grid::l2_swizzle) instead of the plain 2-D
     /// `block_idx`. Grid becomes `[grid² , 1, 1]`.
     pub l2_swizzle: bool,
-    /// M3: fill the GLOBAL→LDS strips with 128-bit (`vec8` bf16) coalesced loads
+    /// Fill the GLOBAL→LDS strips with 128-bit (`vec8` bf16) coalesced loads
     /// instead of the scalar/`vec4`-folded path.
     pub vec_load: bool,
     /// K-reduction step (LDS strip depth) for the single-buffered K-loop. Must be a
     /// multiple of 16 (the WMMA K-edge) and divide N. Lowering it cuts the live
     /// operand VGPR/lane (each WMMA input replicates all `k_step`/16 K-sub-steps),
-    /// raising occupancy — the dominant gfx1151 lever ([`GFX1151_CFG`] uses 32:
-    /// ~143 VGPR/lane → ~10 waves/SIMD vs k64's 242 → 6). gfx942 keeps [`K_STEP`]
+    /// raising occupancy — the dominant occupancy lever on RDNA3.5/wave32
+    /// ([`GFX1151_CFG`] uses 32). gfx942 keeps [`K_STEP`]
     /// (64). `0` means "use [`K_STEP`]" so older literal/`..M1_CFG` builders that
     /// predate the field still get the default — see [`MatmulCfg::k_step`].
     pub k_step: usize,
@@ -79,8 +79,8 @@ impl MatmulCfg {
     pub const fn grid(&self, n: usize) -> i64 {
         (n / self.block) as i64
     }
-    /// Launch grid for a general `m × n` C: a flattened 1-D `[gm·gn, 1, 1]` when M4
-    /// ([`l2_swizzle`]) is on (the chiplet swizzle re-derives `(pid_m, pid_n)`), else
+    /// Launch grid for a general `m × n` C: a flattened 1-D `[gm·gn, 1, 1]` when
+    /// the chiplet swizzle ([`l2_swizzle`]) is on (it re-derives `(pid_m, pid_n)`), else
     /// the plain 2-D `[gn, gm, 1]` (x = n-blocks → `block_idx[0]` = pid_n, y = m-blocks
     /// → `block_idx[1]` = pid_m — matching [`block_coords`]).
     pub const fn grid_dims_mn(&self, m: usize, n: usize) -> [i64; 3] {
@@ -94,37 +94,33 @@ impl MatmulCfg {
     }
 }
 
-/// M1+M3+M4: 8-wave (2×4) 256×256 block, two 64×64 accumulators/wave, 512
+/// 8-wave (2×4) 256×256 block, two 64×64 accumulators/wave, 512
 /// threads, the chiplet/L2 grid swizzle, and 128-bit vectorized LDS fills.
 pub const M1_CFG: MatmulCfg =
     MatmulCfg { block: 256, wave_rows: 2, wave_cols: 4, n_accum: 2, l2_swizzle: true, vec_load: true, k_step: K_STEP };
-/// M7 small-N: single-warp 64×64 block, one 64×64 accumulator, 64 threads — the
-/// grid is `(n/64)²` workgroups, ~16× M1's at a given N, so a small N keeps the
+/// Small-N: single-warp 64×64 block, one 64×64 accumulator, 64 threads — the
+/// grid is `(n/64)²` workgroups, ~16× the large-N config's at a given N, so a small N keeps the
 /// 304-CU machine fed instead of collapsing to a handful of 256×256 blocks.
 /// Keeps the plain 2-D grid + scalar fill (the swizzle/vec wins are large-N).
 pub const SMALL_CFG: MatmulCfg =
     MatmulCfg { block: 64, wave_rows: 1, wave_cols: 1, n_accum: 1, l2_swizzle: false, vec_load: false, k_step: K_STEP };
 
-/// gfx1151 (RDNA3.5, wave32) config — empirically swept on-GPU: 64×64 block, 2×2
+/// gfx1151 (RDNA3.5, wave32) config: 64×64 block, 2×2
 /// waves (4 waves / 128 threads), ONE
 /// 32×32 accumulator/wave, 128-bit vec fills, no L2 swizzle (single-XCD APU), and
 /// **`k_step = 32`**. The `reg=32` tile keeps accumulator VGPR ≈ 32/lane; the
 /// `k_step=32` halves the live WMMA-input fragment VGPR vs the default 64 (the input
-/// replicates all `k_step`/16 K-sub-steps per lane), dropping the kernel from ~242
-/// VGPR/lane → ~143 → **~10 waves/SIMD vs 6** (RDNA3.5 = 1536 VGPR/SIMD). Occupancy,
-/// not `n_accum` ILP, is the dominant gfx1151 lever; `k_step` is the strongest knob
-/// on it (the single-buffered path has no memory stall a double buffer could hide,
-/// and bigger tiles / `n_accum=2` / `reg=16` all measured *slower*). ~22.7 TFLOPS at
-/// N=2048 — 1.17× the prior k64 config, ~90% of hipBLASLt (~25). gfx942 keeps
-/// `k_step = K_STEP` (64). (`k_step=16` maxes occupancy at 16 waves/SIMD but its
-/// extra barriers + halved WMMA/iter make it *slower* than 32: the kernel saturates
-/// around 10 waves.)
+/// replicates all `k_step`/16 K-sub-steps per lane), raising occupancy. `k_step` is
+/// the dominant occupancy lever on RDNA3.5/wave32; the single-buffered path has no
+/// memory stall a double buffer could hide. gfx942 keeps `k_step = K_STEP` (64). A
+/// smaller `k_step` lowers the WMMA-input VGPR but adds barriers, so the tuned value
+/// trades occupancy against barrier overhead.
 pub const GFX1151_CFG: MatmulCfg =
     MatmulCfg { block: 64, wave_rows: 2, wave_cols: 2, n_accum: 1, l2_swizzle: false, vec_load: true, k_step: 32 };
 
-/// M7 size-adaptive config selection: small N (where the 256×256/8-wave grid
+/// Size-adaptive config selection: small N (where the 256×256/8-wave grid
 /// starves the machine) uses [`SMALL_CFG`]; everything else keeps [`M1_CFG`].
-/// The 768 threshold is the empirical crossover from the GPU-time bench.
+/// Small N uses an occupancy-tuned config; the threshold follows size-adaptive tuning.
 pub fn cfg_for_n(n: usize) -> MatmulCfg {
     if n <= 768 && n.is_multiple_of(SMALL_CFG.block) { SMALL_CFG } else { M1_CFG }
 }
@@ -147,7 +143,7 @@ fn acc_row(warp_row: &Arc<UOp>, a: usize, cfg: &MatmulCfg) -> Arc<UOp> {
 }
 
 /// The `(pid_m, pid_n)` C-block coordinate (in `block` units) for this workgroup
-/// — M4's chiplet/L2 [`l2_swizzle`](crate::grid::l2_swizzle) off a flattened 1-D
+/// — the chiplet/L2 [`l2_swizzle`](crate::grid::l2_swizzle) off a flattened 1-D
 /// grid (`block_idx[0]`) when enabled, else the plain 2-D `block_idx`. Generalized
 /// to a non-square `m × n` C (the swizzle takes the `gm × gn` block grid; the plain
 /// path reads `block_idx[1]` = pid_m, `block_idx[0]` = pid_n per [`grid_dims_mn`]).
@@ -161,9 +157,9 @@ fn block_coords(ker: &Kernel, m: usize, n: usize, cfg: &MatmulCfg) -> (Arc<UOp>,
 }
 
 /// The GPU arch(es) the tile matmul is built for: gfx942 (CDNA MFMA, wave64) and
-/// gfx1151 (RDNA3.5 WMMA, wave32 — the `_W32_*` fragment shapes), both HW-validated
-/// (gfx1151 on Strix Halo). The launcher gates against this; see
-/// [`crate::target::check_target`].
+/// gfx1151 (RDNA3.5 WMMA, wave32 — the `_W32_*` fragment shapes). The launcher
+/// gates against this; see [`crate::target::check_target`].
+/// Validated on gfx942 (CDNA3) and gfx1151 (RDNA3.5).
 pub const MATMUL_SUPPORTED_ARCHS: &[svod_dtype::AmdArch] = &[svod_dtype::AmdArch::Gfx942, svod_dtype::AmdArch::Gfx1151];
 
 /// **Graph-native** `n×n` matrix multiply — returns a lazy output [`Tensor`] (a
@@ -239,7 +235,7 @@ pub fn matmul(a: &Tensor, b: &Tensor) -> crate::LaunchResult<Option<Tensor>> {
     )
 }
 
-/// The parametrized multi-wave matmul (M1 + M7). One `cfg.block × cfg.block` C
+/// The parametrized multi-wave matmul. One `cfg.block × cfg.block` C
 /// tile per workgroup, `cfg.n_accum` col-major `reg × reg` accumulators/wave
 /// reduced over a tracked K-loop; each wave streams its A-strip rows and shared
 /// B-strip cols out of XOR-swizzled LDS. A single `END` closes the K-loop around
@@ -308,7 +304,7 @@ pub fn gemm_core<'k>(
     let tile = lp.index().clone();
 
     // Collaborative GLOBAL→LDS fill over all threads (each ends in a barrier);
-    // M3 uses 128-bit vectorized loads for the large-N strips. B is indexed as
+    // Uses 128-bit vectorized loads for the large-N strips. B is indexed as
     // [K-strip, N-block] at (tile, col).
     let a_idx = [Idx::Const(0), Idx::Const(0), Idx::from(&row), Idx::from(&tile)];
     let b_idx = [Idx::Const(0), Idx::Const(0), Idx::from(&tile), Idx::from(&col)];

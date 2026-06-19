@@ -28,8 +28,8 @@
 //! renderer consumes. Port of tinygrad's `extra/thunder/tiny/tk`.
 //!
 //! # Supported targets
-//! - **gfx942** (CDNA3, AMD MI300) — wave64, MFMA.
-//! - **gfx1151** (RDNA3.5, Strix Halo) — wave32, WMMA.
+//! - **gfx942** (CDNA3) — wave64, MFMA.
+//! - **gfx1151** (RDNA3.5) — wave32, WMMA.
 //!
 //! Inputs are bf16/f16, accumulation is f32, the WMMA/MFMA K-edge is 16; the
 //! per-arch fragment shapes resolve through [`ArchCaps`]. The layout-table

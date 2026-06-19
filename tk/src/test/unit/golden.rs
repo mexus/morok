@@ -67,10 +67,7 @@ fn fa_sink() -> Arc<UOp> {
     fa_sink_cfg(true, false)
 }
 
-// Committed gfx942 golden digests. Update ONLY for an intentional graph change.
-// Re-baked for 4c (subtile): the per-warp band moved from a folded address term
-// into the tile's base_offset — same address VALUE, one extra add node. Validated
-// numerically on gfx942 (matmul *_amd) + gfx1151/395.
+// Committed structural golden digests. Update ONLY for an intentional graph change.
 const MATMUL_DIGEST: u128 = 0x6698_e812_748b_1ec0_0000_0000_0000_0000;
 const MATMUL_NODES: usize = 483;
 const FA_DIGEST: u128 = 0x9d50_df63_2af9_357f_0000_0000_0000_0000;

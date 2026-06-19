@@ -5,8 +5,8 @@
 //! All are `#[ignore]` + device-gated: they dispatch real AMD kernels. Run with
 //! `SVOD_DEVICE=AMD:0 cargo test -p svod-tk --lib proptests -- --ignored`. The
 //! tolerances scale with the reduction dim but are intentionally loose — they catch
-//! gross errors (wrong layout, off-by-tile, NaN), not last-ULP drift; tighten after
-//! a GPU measurement pass. The structured-`Err` (malformed request) and `None`
+//! gross errors (wrong layout, off-by-tile, NaN), not last-ULP drift. The
+//! structured-`Err` (malformed request) and `None`
 //! (non-tiling length) paths are asserted directly rather than through proptest.
 
 use proptest::prelude::*;
@@ -67,7 +67,7 @@ fn prop_matmul_vs_reference_amd() {
         let exp = to_f32_vec(af.matmul(&bf).expect("ref matmul"));
 
         // abs err ~ √n·bf16_ulp and |e| ~ √n, so the atol floor grows with √n while
-        // rtol stays ~constant. TODO(gpu-tune): tighten against measured max-abs.
+        // rtol stays ~constant.
         let (atol, rtol) = (0.02 * (n as f32).sqrt(), 2e-2);
         let r = allclose_f32(&got, &exp, atol, rtol);
         prop_assert!(r.ok, "matmul n={n}: {}", r.message);
