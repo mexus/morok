@@ -121,9 +121,14 @@ pub trait PlanContext: Send + Sync {
     /// Dispatch one kernel of the plan onto this context. `program` belongs to
     /// the same plan and therefore the same backend that minted this context
     /// (a plan is single-device) — a construction invariant, not a runtime
-    /// check. Returns a per-dispatch timestamp handle when the backend stamps
-    /// dispatches (`None` otherwise). Submits asynchronously like
-    /// [`Program::execute`] with `wait=false`.
+    /// check. Submits asynchronously like [`Program::execute`] with `wait=false`.
+    ///
+    /// `profile` requests a per-dispatch HW timestamp handle (`None` otherwise,
+    /// e.g. CPU). **The caller MUST retain the returned handle until after
+    /// [`PlanContext::synchronize`]**: a profiling backend may bracket the async
+    /// dispatch with GPU-clock probes that write into scratch the handle owns, so
+    /// dropping it early frees that scratch while the GPU is still writing. Pass
+    /// `false` on the fire-and-forget path that discards the handle.
     ///
     /// # Safety
     ///
@@ -136,6 +141,7 @@ pub trait PlanContext: Send + Sync {
         vals: &[i64],
         global_size: Option<[usize; 3]>,
         local_size: Option<[usize; 3]>,
+        profile: bool,
     ) -> Result<Option<Arc<dyn crate::DispatchTimestamps>>>;
 
     /// Drain this context's in-flight work (profiled-timestamp harvest).

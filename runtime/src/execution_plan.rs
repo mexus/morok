@@ -471,11 +471,16 @@ impl ExecutionPlan {
         Ok(self.plan_ctx.get().expect("set above").as_deref())
     }
 
-    /// Submit one kernel. Returns the dispatch's HW timestamp handle when the
-    /// backend stamps dispatches — `None` otherwise (e.g. CPU). The non-profiled
-    /// `execute` path drops it.
+    /// Submit one kernel. When `profile` is set and the backend stamps
+    /// dispatches, returns the dispatch's HW timestamp handle (`None` otherwise,
+    /// e.g. CPU); the caller must hold it until after `synchronize`. The
+    /// non-profiled `execute` path passes `false` and drops the handle.
     #[inline]
-    fn execute_kernel(&self, kernel: &PreparedKernel) -> Result<Option<Arc<dyn svod_device::DispatchTimestamps>>> {
+    fn execute_kernel(
+        &self,
+        kernel: &PreparedKernel,
+        profile: bool,
+    ) -> Result<Option<Arc<dyn svod_device::DispatchTimestamps>>> {
         let buffer_ptrs: SmallVec<[*mut u8; 8]> = kernel.buffer_ptrs.iter().map(|&ptr| ptr as *mut u8).collect();
         let (global_size, local_size) = Self::kernel_launch_sizes(kernel)?;
         let program = kernel.kernel.program.as_ref();
@@ -483,7 +488,7 @@ impl ExecutionPlan {
         // plan's kernels share one queue. Others (CPU) return `None` and fall
         // back to per-call `Program::execute`.
         if let Some(ctx) = self.plan_ctx(program)? {
-            return unsafe { ctx.dispatch(program, &buffer_ptrs, &kernel.vals, global_size, local_size) }
+            return unsafe { ctx.dispatch(program, &buffer_ptrs, &kernel.vals, global_size, local_size, profile) }
                 .map_err(|e| crate::error::Error::Execution { reason: format!("Kernel {} failed: {e}", kernel.id) });
         }
         unsafe {
@@ -677,7 +682,7 @@ impl ExecutionPlan {
     #[inline]
     fn execute_op(&self, op: &PreparedOp) -> Result<()> {
         match op {
-            PreparedOp::CompiledProgram(kernel) => self.execute_kernel(kernel).map(|_| ()),
+            PreparedOp::CompiledProgram(kernel) => self.execute_kernel(kernel, /*profile=*/ false).map(|_| ()),
             PreparedOp::BufferCopy(copy) => self.execute_copy(copy),
             PreparedOp::BufferView(view) => self.execute_buffer_view(view),
             PreparedOp::CustomFunction(custom) => self.execute_custom_function(custom),
@@ -852,7 +857,7 @@ impl ExecutionPlan {
                 match &self.ops[idx] {
                     PreparedOp::CompiledProgram(kernel) => {
                         let start = Instant::now();
-                        let handle = self.execute_kernel(kernel)?;
+                        let handle = self.execute_kernel(kernel, /*profile=*/ true)?;
                         handles.push(handle);
                         profiles.push(KernelProfile {
                             kernel: Arc::clone(&kernel.kernel),

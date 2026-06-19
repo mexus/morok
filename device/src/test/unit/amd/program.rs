@@ -419,6 +419,73 @@ attributes #0 = { alwaysinline nounwind "amdgpu-flat-work-group-size"="1,64" }
     out_buf.free_amd_device_in_place();
 }
 
+/// PM4 DISPATCH TIMESTAMP PROBE (manual hardware probe; `#[ignore]`). Dispatch
+/// one trivial kernel through the per-plan `PlanContext` with `profile=true`,
+/// drain, and read back the GPU-clock `start`/`end` the two `release_mem_timestamp`
+/// probes wrote. Validates the single-XCC PM4 timestamp round-trip end to end
+/// (the path with no AQL `ENABLE_PROFILING` auto-stamp).
+///
+/// Run: SVOD_DEVICE=AMD:0 cargo test -p svod-device --lib pm4_dispatch_timestamp_probe -- --ignored --nocapture --test-threads=1
+#[test]
+#[ignore = "manual hardware probe; needs a real single-XCC AMD GPU + clang"]
+fn pm4_dispatch_timestamp_probe() {
+    use crate::allocator::RawBuffer;
+    use crate::device::Program;
+
+    let Some(alloc) = amd_alloc_or_skip() else { return };
+    let core = alloc.dev.core();
+    if !require_single_xcc(&alloc) {
+        return;
+    }
+    if core.signal_pool().is_none() {
+        core.install_signal_pool(crate::amd::signal::SignalPool::new(&alloc, 64).expect("signal pool"));
+    }
+    let mcpu = alloc.dev.arch.mcpu();
+    let ir = r#"target triple = "amdgcn-amd-amdhsa"
+declare i32 @llvm.amdgcn.workitem.id.x()
+define amdgpu_kernel void @pm4_ts_probe(ptr noalias %buf0) #0 {
+  %tid = tail call i32 @llvm.amdgcn.workitem.id.x()
+  %tid_ext = zext i32 %tid to i64
+  %p = getelementptr inbounds float, ptr %buf0, i64 %tid_ext
+  store float 0.0, ptr %p
+  ret void
+}
+attributes #0 = { alwaysinline nounwind "amdgpu-flat-work-group-size"="1,64" }
+"#;
+    let bytes = match clang_amdgcn(ir, mcpu) {
+        Some(b) => b,
+        None => {
+            eprintln!("PROBE skipped: clang amdgcn ({mcpu}) unavailable.");
+            return;
+        }
+    };
+    let prog = AmdProgram::load(alloc.dev.clone(), &alloc, &bytes, "pm4_ts_probe", 1, 0).expect("load program");
+
+    let out_buf = alloc.alloc_uncached(64).expect("output buffer");
+    let out_gpu = match &out_buf {
+        RawBuffer::AmdDevice { gpu_addr, .. } => *gpu_addr,
+        _ => panic!("output buffer must be host-visible"),
+    };
+
+    let ctx = prog.new_exec_context().expect("exec context").expect("AMD yields a plan context");
+    // profile=true: we hold `handle` across `synchronize`, so arming the probes
+    // is safe (this is exactly the invariant the `profile` flag enforces).
+    let handle = unsafe {
+        ctx.dispatch(&prog as &dyn Program, &[out_gpu as *mut u8], &[], Some([1, 1, 1]), Some([1, 1, 1]), true)
+    }
+    .expect("dispatch");
+    ctx.synchronize().expect("synchronize");
+
+    let (start, end) =
+        handle.expect("a profiled dispatch yields a timestamp handle").timestamps_ns().expect("gpu-clock timestamps");
+    assert!(end > start, "end ts ({end}) must exceed start ts ({start})");
+    let dur = end - start;
+    assert!(dur < 1_000_000_000, "a trivial kernel should run in < 1s, got {dur} ns");
+    eprintln!("PROBE PM4 dispatch timestamp: start={start} end={end} dur={dur} ns");
+
+    out_buf.free_amd_device_in_place();
+}
+
 /// PM4 GRAPH PROBE (manual hardware probe; `#[ignore]`). Single-XCC (RDNA, e.g.
 /// gfx1151) analogue of `aql_graph_capture_replay_probe`: capture a ONE-kernel
 /// static chain into a PM4 indirect buffer and replay it twice via

@@ -480,6 +480,7 @@ impl crate::device::PlanContext for OwnerCtx {
         vals: &[i64],
         global_size: Option<[usize; 3]>,
         local_size: Option<[usize; 3]>,
+        profile: bool,
     ) -> Result<Option<Arc<dyn crate::DispatchTimestamps>>> {
         // A plan is single-backend, and this context was minted by one of its
         // AmdPrograms, so every kernel it dispatches is an AmdProgram. The
@@ -490,8 +491,13 @@ impl crate::device::PlanContext for OwnerCtx {
             .downcast_ref::<crate::amd::AmdProgram>()
             .expect("AMD PlanContext dispatched a non-AMD program");
         self.pool().ensure_has_local_memory(amd.private_segment_size())?;
+        // `profile` is threaded from the caller: the fire-and-forget path passes
+        // `false` (it drops the handle immediately), so we must NOT arm the
+        // timestamp probes there — doing so would free the scratch signal slot
+        // while the async EOP probe is still in flight. Only the profiling
+        // callers that retain the handle to `synchronize` pass `true`.
         let sig = unsafe {
-            amd.execute_on(self, buffers, vals, global_size, local_size, /*wait=*/ false, /*profile=*/ true)?
+            amd.execute_on(self, buffers, vals, global_size, local_size, /*wait=*/ false, profile)?
         };
         Ok(sig.map(|s| s as Arc<dyn crate::DispatchTimestamps>))
     }

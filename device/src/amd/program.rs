@@ -720,10 +720,10 @@ impl AmdProgram {
             // on AQL), so for a profiling dispatch we acquire a scratch signal,
             // `arm(0)` it (value 0 → `is_done()`, ts fields zeroed), and bracket
             // the dispatch with two GPU-clock RELEASE_MEM probes into its
-            // start/end ts fields. Only the profiling caller (`OwnerCtx::dispatch`)
-            // sets `profile`, and it holds the returned handle until after
-            // `synchronize`, so the slot can't be reused while the GPU is still
-            // writing it.
+            // start/end ts fields. `profile` is threaded from the caller and is
+            // set ONLY by callers that retain the returned handle until after
+            // `synchronize` (the fire-and-forget execute path passes `false`), so
+            // the slot can't be reused while the GPU is still writing it.
             let ts = if profile {
                 let s = pool.acquire_signal()?;
                 s.arm(0);

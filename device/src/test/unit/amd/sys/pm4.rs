@@ -40,6 +40,35 @@ fn release_mem_cache_flush_is_arch_specific() {
 }
 
 #[test]
+fn release_mem_timestamp_is_a_bare_gpu_clock_probe() {
+    // The timestamp probe must carry the GPU-clock data_sel, no interrupt, and —
+    // despite the `CACHE_FLUSH_AND_INV_TS_EVENT` event NAME — NO cache action.
+    let event = release_mem_event_type(CACHE_FLUSH_AND_INV_TS_EVENT) | release_mem_event_index(EVENT_INDEX_END_OF_PIPE);
+    for is_gfx9 in [false, true] {
+        let pkt = release_mem_timestamp(0x1234_5678_0000_4000, is_gfx9);
+        assert_eq!(pkt.len(), 8);
+        assert_eq!(pkt[0], packet3(PACKET3_RELEASE_MEM, 6));
+        // DW1: exactly the EOP timestamp event, with no cache-flush bits OR'd in
+        // (cf. `release_mem_cache_flush_is_arch_specific`, which DOES set them).
+        assert_eq!(pkt[1], event);
+        assert_eq!(pkt[1] & RELEASE_MEM_CACHE_FLUSH_ALL, 0);
+        assert_eq!(pkt[1] & EOP_CACHE_FLUSH_GFX9, 0);
+        // DW2: DATA_SEL = GPU clock (64-bit), and NO INT_SEL (no waiter to wake).
+        assert_eq!((pkt[2] >> 29) & 0b111, DATA_SEL_SEND_GPU_CLOCK);
+        assert_eq!((pkt[2] >> 24) & 0b111, 0, "timestamp probe must not request an interrupt");
+        assert_eq!(pkt[3], 0x0000_4000); // addr lo
+        assert_eq!(pkt[4], 0x1234_5678); // addr hi
+        assert_eq!((pkt[5], pkt[6]), (0, 0), "value dwords ignored for gpu-clock data_sel");
+    }
+    // DST_SEL_MEMORY exists only on gfx10+ (it is 0, so invisible; assert the
+    // gfx9 form simply omits it and otherwise matches).
+    let gfx10 = release_mem_timestamp(0x4000, false);
+    let gfx9 = release_mem_timestamp(0x4000, true);
+    assert_eq!(gfx10[2], release_mem_data_sel(DATA_SEL_SEND_GPU_CLOCK) | release_mem_dst_sel(DST_SEL_MEMORY));
+    assert_eq!(gfx9[2], release_mem_data_sel(DATA_SEL_SEND_GPU_CLOCK));
+}
+
+#[test]
 fn acquire_mem_gfx9_shape() {
     let pkt = acquire_mem_gfx9();
     assert_eq!(pkt.len(), 7);

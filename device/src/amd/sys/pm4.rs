@@ -264,6 +264,10 @@ pub fn release_mem_timestamp(addr: u64, is_gfx9: bool) -> [u32; 8] {
     } else {
         release_mem_data_sel(DATA_SEL_SEND_GPU_CLOCK) | release_mem_dst_sel(DST_SEL_MEMORY)
     };
+    // `CACHE_FLUSH_AND_INV_TS_EVENT` names the timestamp-CAPABLE end-of-pipe
+    // event; despite the name it triggers NO cache action here — the flush /
+    // invalidate is gated by the GCR (gfx10+) / TC-action (gfx9) bits, which are
+    // deliberately omitted (cf. the completion `release_mem`, which OR's them in).
     let event_dw =
         release_mem_event_type(CACHE_FLUSH_AND_INV_TS_EVENT) | release_mem_event_index(EVENT_INDEX_END_OF_PIPE);
     [

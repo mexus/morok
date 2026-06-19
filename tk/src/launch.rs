@@ -217,8 +217,17 @@ impl CompiledLaunch {
         // SAFETY: pointers are allocated + sized to the kernel's expectations and
         // held alive by `self._buffers`; same contract as `dispatch`.
         let handle = unsafe {
-            ctx.dispatch(&*self.prog, &self.ptrs, &self.vals, Some(self.global_size), self.local_size)
-                .context(DispatchSnafu { name: self.name.clone() })?
+            // profile=true: this is the timestamp path and we hold `handle`
+            // through `synchronize` below, so arming the probes is safe.
+            ctx.dispatch(
+                &*self.prog,
+                &self.ptrs,
+                &self.vals,
+                Some(self.global_size),
+                self.local_size,
+                /*profile=*/ true,
+            )
+            .context(DispatchSnafu { name: self.name.clone() })?
         };
         ctx.synchronize().context(DispatchSnafu { name: self.name.clone() })?;
         Ok(handle.and_then(|h| h.timestamps_ns()).map(|(s, e)| e - s))
