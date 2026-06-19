@@ -5,9 +5,23 @@ use std::sync::Arc;
 
 use svod_dtype::{DType, DeviceSpec};
 use svod_ir::UOp;
+use svod_tensor::Tensor;
 
 use crate::Kernel;
-use crate::kernels::fa::{FaConfig, build_fa_mw_rdb};
+use crate::kernels::fa::{FaConfig, FaOpts, build_fa_mw_rdb, flash_attention_with};
+
+/// A non-rank-4 `q`/`k` operand is a structured `Err` (not a panic). The shape
+/// preconditions resolve before any device dispatch, so this runs GPU-free.
+#[test]
+fn flash_attention_with_non_rank4_operand_is_operand_shape_err() {
+    let q4 = Tensor::randn(&[1, 128, 4, 64]).expect("randn");
+    let q3 = Tensor::randn(&[128, 4, 64]).expect("randn"); // q: rank 3
+    let e = flash_attention_with(&q3, &q4, &q4, FaOpts::default()).err().expect("rank-3 q must error, not panic");
+    assert!(matches!(e, crate::launch::Error::OperandShape { operand: "q", .. }), "got {e:?}");
+    let k2 = Tensor::randn(&[4, 64]).expect("randn"); // k: rank 2
+    let e = flash_attention_with(&q4, &k2, &q4, FaOpts::default()).err().expect("rank-2 k must error, not panic");
+    assert!(matches!(e, crate::launch::Error::OperandShape { operand: "k", .. }), "got {e:?}");
+}
 
 /// `(o, q, k, v)` dummy BUFFER UOps for a GPU-free FA build.
 fn dummy_fa_buffers(b: usize, n: usize, h: usize, h_kv: usize, d: usize) -> Vec<Arc<UOp>> {

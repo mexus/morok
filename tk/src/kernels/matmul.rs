@@ -180,8 +180,9 @@ pub const MATMUL_SUPPORTED_ARCHS: &[svod_dtype::AmdArch] = &[svod_dtype::AmdArch
 ///
 /// Like [`crate::flash_attention_with`], the outcome is three-way (via
 /// [`crate::launch_custom`]): `Ok(None)` when the device can't run the kernel,
-/// `Err` when the request is malformed (non-square operands, or a size that isn't a
-/// multiple of the arch's block), `Ok(Some)` when it ran.
+/// `Err` when the request is malformed (an operand that isn't a statically-shaped
+/// rank-2 tensor, non-square operands, or a size that isn't a multiple of the arch's
+/// block), `Ok(Some)` when it ran.
 ///
 /// ```no_run
 /// use svod_tensor::Tensor;
@@ -194,9 +195,10 @@ pub const MATMUL_SUPPORTED_ARCHS: &[svod_dtype::AmdArch] = &[svod_dtype::AmdArch
 pub fn matmul(a: &Tensor, b: &Tensor) -> crate::LaunchResult<Option<Tensor>> {
     use snafu::{ResultExt, ensure};
 
-    let dim = |t: &Tensor, i: usize| t.shape().expect("shape")[i].as_const().expect("concrete dim");
-    let (am, an) = (dim(a, 0), dim(a, 1));
-    let (bm, bn) = (dim(b, 0), dim(b, 1));
+    let ad = crate::launch::concrete_dims(a, "matmul", "a", 2)?;
+    let bd = crate::launch::concrete_dims(b, "matmul", "b", 2)?;
+    let (am, an) = (ad[0], ad[1]);
+    let (bm, bn) = (bd[0], bd[1]);
     let n = am;
 
     crate::launch_custom(

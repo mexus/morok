@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use svod_dtype::{DType, DeviceSpec};
 use svod_ir::{Op, UOp};
+use svod_tensor::Tensor;
 
 use crate::kernels::matmul::*;
 use crate::tiles::{RT_16X16, TileLayout};
@@ -19,6 +20,19 @@ fn dummy_buffers(n: usize) -> Vec<Arc<UOp>> {
         UOp::new_buffer(DeviceSpec::Cpu, sz, DType::BFloat16),
         UOp::new_buffer(DeviceSpec::Cpu, sz, DType::BFloat16),
     ]
+}
+
+/// A non-rank-2 operand is a structured `Err` (not a panic). The shape
+/// preconditions resolve before any device dispatch, so this runs GPU-free.
+#[test]
+fn matmul_non_rank2_operand_is_operand_shape_err() {
+    let sq = Tensor::randn(&[64, 64]).expect("randn");
+    let a1 = Tensor::randn(&[64]).expect("randn"); // operand a: rank 1
+    let e = matmul(&a1, &sq).err().expect("rank-1 a must error, not panic");
+    assert!(matches!(e, crate::launch::Error::OperandShape { operand: "a", .. }), "got {e:?}");
+    let b3 = Tensor::randn(&[2, 64, 64]).expect("randn"); // operand b: rank 3
+    let e = matmul(&sq, &b3).err().expect("rank-3 b must error, not panic");
+    assert!(matches!(e, crate::launch::Error::OperandShape { operand: "b", .. }), "got {e:?}");
 }
 
 /// Pure graph-shape check (no GPU): `mma_AB` emits exactly one `WMMA` per

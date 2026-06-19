@@ -139,6 +139,41 @@ pub enum Error {
     /// Operands must be square and equal-sized (`[n,n] · [n,n]`).
     #[snafu(display("{kernel}: operands must be square and equal-sized, got {a:?} · {b:?}"))]
     NotSquare { kernel: &'static str, a: [usize; 2], b: [usize; 2] },
+
+    /// An operand's shape is indeterminate, the wrong rank, or has a symbolic
+    /// (non-constant) dimension — the kernel needs statically-known dims.
+    #[snafu(display("{kernel}: operand {operand}: {reason}"))]
+    OperandShape { kernel: &'static str, operand: &'static str, reason: String },
+}
+
+/// Resolve a tensor operand's shape to concrete `usize` dims, or an
+/// [`Error::OperandShape`] if the shape is indeterminate, the wrong rank, or has a
+/// symbolic (non-constant) dimension. Kernel builders need statically-known dims,
+/// so a malformed operand is a caller error reported through `Result`, not a panic.
+pub(crate) fn concrete_dims(
+    t: &Tensor,
+    kernel: &'static str,
+    operand: &'static str,
+    rank: usize,
+) -> Result<Vec<usize>> {
+    let shape = t
+        .shape()
+        .map_err(|_| OperandShapeSnafu { kernel, operand, reason: "indeterminate shape".to_string() }.build())?;
+    snafu::ensure!(
+        shape.len() == rank,
+        OperandShapeSnafu {
+            kernel,
+            operand,
+            reason: format!("expected a rank-{rank} tensor, got rank {}", shape.len())
+        }
+    );
+    (0..rank)
+        .map(|i| {
+            shape[i].as_const().ok_or_else(|| {
+                OperandShapeSnafu { kernel, operand, reason: format!("dim {i} is not statically known") }.build()
+            })
+        })
+        .collect()
 }
 
 /// Compile `sink` for `device` and dispatch it against `buffers`, populating the

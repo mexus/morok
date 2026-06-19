@@ -594,7 +594,8 @@ impl Default for FaOpts<'_> {
 ///   runtime sequence length doesn't tile (`N % (q_blk·NUM_WARPS) != 0`). The caller
 ///   substitutes its own attention (e.g. [`Tensor::scaled_dot_product_attention`]).
 /// - `Err` — *malformed request* on a supported device: a FIXED property is wrong —
-///   operand dtype ∉ {bf16, f16}, `D % 16 != 0`, or `H % H_KV != 0` (GQA). These are
+///   `q`/`k` not a statically-shaped rank-4 tensor, operand dtype ∉ {bf16, f16},
+///   `D % 16 != 0`, or `H % H_KV != 0` (GQA). These are
 ///   caller bugs, raised loudly instead of silently routed to the slow path. (A
 ///   genuine kernel build/dispatch failure also returns `Err`.)
 ///
@@ -610,11 +611,10 @@ impl Default for FaOpts<'_> {
 /// }
 /// ```
 pub fn flash_attention_with(q: &Tensor, k: &Tensor, v: &Tensor, opts: FaOpts) -> crate::LaunchResult<Option<Tensor>> {
-    let qs = q.shape().expect("q shape");
-    let ks = k.shape().expect("k shape");
-    let dim = |s: &svod_ir::shape::Shape, i: usize| s[i].as_const().expect("concrete dim");
-    let (b, n, h, d) = (dim(&qs, 0), dim(&qs, 1), dim(&qs, 2), dim(&qs, 3));
-    let h_kv = dim(&ks, 2);
+    let qd = crate::launch::concrete_dims(q, "flash-attention", "q", 4)?;
+    let kd = crate::launch::concrete_dims(k, "flash-attention", "k", 4)?;
+    let (b, n, h, d) = (qd[0], qd[1], qd[2], qd[3]);
+    let h_kv = kd[2];
     let (q_blk, kv_blk) = adaptive_fa_tile(b, n, h);
     let dtype = q.uop().dtype();
     let dtype_ok = dtype == DType::BFloat16 || dtype == DType::Float16;
