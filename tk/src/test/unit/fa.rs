@@ -521,13 +521,15 @@ fn test_fa_noncausal_f16_masked_amd() {
 
 /// A fully key-masked lane (`key_lens[b] == 0`) — the inactive-lane case the
 /// GigaAM JIT produces when a chunk-batch's tail lanes pad to length 0 — must
-/// yield a FINITE ZERO row, not `0/0 = NaN`. Without the softmax-denominator
-/// clamp the running sum is 0 and every output element is NaN.
+/// produce a FINITE row, not `NaN`. With no valid key the online-softmax running
+/// max stays −inf and the rescale's `−inf − (−inf)` is NaN; `flash_attention_with`
+/// floors `key_lens` to ≥ 1 so every row attends to at least key 0, keeping the
+/// (caller-discarded) inactive lane finite.
 ///
-/// `SVOD_DEVICE=AMD:0 cargo test -p svod-tk --lib fa::test_fa_key_lens_zero_is_finite_zero_amd -- --ignored --nocapture`.
+/// `SVOD_DEVICE=AMD:0 cargo test -p svod-tk --lib fa::test_fa_key_lens_zero_is_finite_amd -- --ignored --nocapture`.
 #[test]
 #[ignore]
-fn test_fa_key_lens_zero_is_finite_zero_amd() {
+fn test_fa_key_lens_zero_is_finite_amd() {
     use crate::kernels::fa::{FaOpts, flash_attention_with};
     use svod_tensor::Tensor;
 
@@ -539,7 +541,7 @@ fn test_fa_key_lens_zero_is_finite_zero_amd() {
     };
     let (q, k, v) = (mk(), mk(), mk());
 
-    // Zero valid keys ⇒ every key position is masked for every query row.
+    // Zero valid keys ⇒ every key position would be masked for every query row.
     let mut lens = Tensor::from_slice([0i32; 1]);
     lens.realize().expect("realize lens");
 
@@ -550,6 +552,5 @@ fn test_fa_key_lens_zero_is_finite_zero_amd() {
     og_f.realize().expect("realize og");
     let got: Vec<f32> = og_f.as_vec::<f32>().expect("read og");
 
-    assert!(got.iter().all(|x| x.is_finite()), "key_lens==0 must not produce NaN/Inf (denominator clamp missing?)");
-    assert!(got.iter().all(|&x| x == 0.0), "a fully key-masked lane must be an all-zero row");
+    assert!(got.iter().all(|x| x.is_finite()), "key_lens==0 lane must be finite (key_lens clamp to >=1 missing?)");
 }

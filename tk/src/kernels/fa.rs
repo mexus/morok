@@ -486,12 +486,6 @@ pub(crate) fn build_fa_mw_rdb(
     let o_reg = lp.close_carry(o_reg);
     let norm_vec = norm_vec.after(&o_reg);
 
-    // Floor the softmax denominator: a fully key-masked query row (every key
-    // beyond `key_lens[b]`, incl. the legitimate inactive-lane case key_lens==0)
-    // has running sum 0, so the bare `o_reg / norm_vec` would be 0/0 = NaN. The
-    // clamp binds only when sum == 0, giving the natural zero output (matching the
-    // SDPA fallback) and leaving every real row bit-unchanged (sum ≫ tiny).
-    let norm_vec = warp.max_scalar(norm_vec, f64::MIN_POSITIVE);
     let o_reg = o_reg / &norm_vec;
     let o_reg_t = warp.transpose(o_reg_t, &o_reg);
     let o_idx = [Idx::from(&batch), Idx::from(&q_blk), Idx::from(&head), Idx::Const(0)];
@@ -653,8 +647,21 @@ pub fn flash_attention_with(q: &Tensor, k: &Tensor, v: &Tensor, opts: FaOpts) ->
             let build_dtype = dtype.clone();
             // ABI/global order is o, q, k, v, (lens) — `out` is global[0], inputs map to
             // global[1..] in order, so `key_lens` (the 5th global) goes last.
+            //
+            // Clamp key_lens to >= 1. A fully key-masked row (key_lens[b] == 0, an
+            // inactive zero-padded lane) has no valid key, so the online-softmax
+            // running max stays -inf and the rescale's -inf - (-inf) is NaN that
+            // poisons the row. Flooring to >= 1 makes every row attend to at least
+            // key 0 (a finite value) — reducing the degenerate case to the ordinary
+            // partial-mask path. Such inactive lanes are caller-discarded, so the
+            // exact value is immaterial (only finiteness is); partial masks (already
+            // >= 1 valid key) are unchanged.
+            let key_lens_clamped = opts.key_lens.map(|lens| {
+                let ones = Tensor::full(&[b], ConstValue::Int(1), DType::Int32).expect("ones[b]");
+                lens.maximum(&ones).expect("clamp key_lens >= 1")
+            });
             let mut ins: Vec<&Tensor> = vec![q, k, v];
-            if let Some(lens) = opts.key_lens {
+            if let Some(lens) = &key_lens_clamped {
                 ins.push(lens);
             }
             let block = (NUM_WARPS * caps.wave_size) as i64;

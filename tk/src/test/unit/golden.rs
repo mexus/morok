@@ -73,16 +73,15 @@ fn fa_sink() -> Arc<UOp> {
 // numerically on gfx942 (matmul *_amd) + gfx1151/395.
 const MATMUL_DIGEST: u128 = 0x6698_e812_748b_1ec0_0000_0000_0000_0000;
 const MATMUL_NODES: usize = 483;
-// Re-baked: the softmax-denominator clamp (`norm_vec.max(tiny)`, FA NaN fix) adds
-// the floor const + max over the running-sum vector to every FA graph (was 878).
-const FA_DIGEST: u128 = 0x3694_0109_9ce8_f303_0000_0000_0000_0000;
-const FA_NODES: usize = 888;
+const FA_DIGEST: u128 = 0x9d50_df63_2af9_357f_0000_0000_0000_0000;
+const FA_NODES: usize = 878;
 // Non-causal and non-causal+key-masked build variants (pin the `causal:false` and
-// `key_lens:Some` branches GPU-free).
-const FA_NONCAUSAL_DIGEST: u128 = 0xd3a8_e181_a1cf_1a65_0000_0000_0000_0000;
-const FA_NONCAUSAL_NODES: usize = 864;
-const FA_MASKED_DIGEST: u128 = 0x8bde_914f_ba33_bf4b_0000_0000_0000_0000;
-const FA_MASKED_NODES: usize = 887;
+// `key_lens:Some` branches GPU-free). The FA all-masked-row NaN fix is a key_lens
+// clamp at the kernel ENTRY (a tensor-graph op), so the SINK graph is unchanged.
+const FA_NONCAUSAL_DIGEST: u128 = 0xd081_e893_a4c5_1800_0000_0000_0000_0000;
+const FA_NONCAUSAL_NODES: usize = 854;
+const FA_MASKED_DIGEST: u128 = 0xa94c_b474_e725_3199_0000_0000_0000_0000;
+const FA_MASKED_NODES: usize = 877;
 
 fn check(name: &str, sink: Arc<UOp>, digest: u128, nodes: usize) {
     let fp = kernel_fingerprint(&sink);

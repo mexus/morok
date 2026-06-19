@@ -110,11 +110,12 @@ fn prop_fa_vs_sdpa_amd() {
         causal in any::<bool>(),
         use_f16 in any::<bool>(),
         masked in any::<bool>(),
-        // Per-lane valid-key fraction of 128; boundaries (0 = all keys masked,
-        // 128 = none) are weighted in so the key_lens==0 NaN-clamp and the
-        // unmasked-equivalent ends are both hit across the 24 cases.
-        frac0 in prop_oneof![Just(0i64), Just(128), 0i64..=128],
-        frac1 in prop_oneof![Just(0i64), Just(128), 0i64..=128],
+        // Per-lane valid-key fraction of 128; the `128` boundary (no masking) is
+        // weighted in. Lens are floored to ≥ 1 below: `key_lens == 0` is the
+        // inactive-lane case `flash_attention_with` clamps to ≥ 1 (it can't match an
+        // all-masked SDPA row), covered separately by `test_fa_key_lens_zero_is_finite_amd`.
+        frac0 in prop_oneof![Just(1i64), Just(128), 1i64..=128],
+        frac1 in prop_oneof![Just(1i64), Just(128), 1i64..=128],
     )| {
         let (n, d) = (nblk * 128, dblk * 16);
         let dtype = if use_f16 { DType::Float16 } else { DType::BFloat16 };
@@ -124,9 +125,9 @@ fn prop_fa_vs_sdpa_amd() {
         let v = randn_dt(&[bsz, n, h, d], dtype.clone());
 
         // Key-padding mask only on the non-causal path (matches production: the
-        // GigaAM encoder masks key positions, never both). Per-lane lens in [0,n].
+        // GigaAM encoder masks key positions, never both). Per-lane lens in [1,n].
         let key_lens_vec: Option<Vec<i32>> = (masked && !causal).then(|| {
-            let mk = |frac: i64| ((frac * n as i64) / 128).clamp(0, n as i64) as i32;
+            let mk = |frac: i64| ((frac * n as i64) / 128).clamp(1, n as i64) as i32;
             (0..bsz).map(|i| if i == 0 { mk(frac0) } else { mk(frac1) }).collect()
         });
         let lens_t = key_lens_vec.as_ref().map(|kl| {
