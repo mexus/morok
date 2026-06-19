@@ -143,6 +143,13 @@ pub struct AmdDeviceCore {
     /// `false` and the SDMA queue is dead code — kept on the core for the
     /// future SDMA revival.
     has_sdma_queue: AtomicBool,
+    /// Opt-in for PM4 single-XCC graph capture (see `AmdGraph::capture`). Default
+    /// `false` (per-call dispatch) — capture is a measured regression on gfx1151
+    /// despite a bit-identical transcript, so it's exposed only for hardware that
+    /// benefits or future barrier-granularity work. Set by the device factory;
+    /// a per-device flag (not an env var) so tests toggle it without a process-
+    /// global env race and `=0` can't accidentally enable it.
+    pm4_graph: AtomicBool,
     /// Poison latch. Once a GPU fault/timeout is observed, the device is dead:
     /// every `synchronize`/`execute` against any connector on this device
     /// fails fast. Per-physical
@@ -276,6 +283,7 @@ impl AmdDevice {
             arch,
             iface,
             has_sdma_queue: AtomicBool::new(false),
+            pm4_graph: AtomicBool::new(false),
             poisoned: AtomicBool::new(false),
             error_msg: OnceLock::new(),
             copy_queue: OnceLock::new(),
@@ -438,6 +446,19 @@ impl AmdDeviceCore {
     #[inline]
     pub fn has_sdma_queue(&self) -> bool {
         self.has_sdma_queue.load(Ordering::Acquire)
+    }
+
+    /// Enable/disable PM4 single-XCC graph capture for this device. Default OFF;
+    /// set from the device factory. Tests use this to force-enable capture
+    /// without mutating the process environment.
+    pub fn set_pm4_graph(&self, on: bool) {
+        self.pm4_graph.store(on, Ordering::Release);
+    }
+
+    /// Whether PM4 graph capture is enabled (see [`set_pm4_graph`](Self::set_pm4_graph)).
+    #[inline]
+    pub fn pm4_graph(&self) -> bool {
+        self.pm4_graph.load(Ordering::Acquire)
     }
 
     /// Block in the kernel for up to `timeout_ms` waiting on **any** of the

@@ -63,6 +63,14 @@ pub fn create_amd_device(registry: &DeviceRegistry, device_id: usize, arch: AmdA
             tracing::warn!(error = %e, "SDMA copy queue unavailable; AMD buffers stay host-visible");
         }
     }
+    // PM4 graph capture is opt-in via `SVOD_PM4_GRAPH=1` (default OFF — it
+    // regresses on gfx1151). Parse the env ONCE here into the per-device flag so
+    // the capture path reads a plain bool: only "1" enables; "0"/empty/unset stay
+    // OFF (presence alone no longer enables it), and there is no per-capture env
+    // lookup to race with test toggles.
+    if std::env::var("SVOD_PM4_GRAPH").as_deref() == Ok("1") {
+        device_handle.core().set_pm4_graph(true);
+    }
     // No default connector: every dispatcher leases/owns its own connector
     // (`Program::execute` leases per call; plans/graphs hold one for their
     // lifetime). The pool starts empty and warms on first lease.

@@ -116,16 +116,18 @@ impl AmdGraph {
         // resident PM4 indirect buffer, replayed with a single doorbell — see
         // `AmdGraphPm4::capture`. Multi-XCC CDNA uses the native-AQL path below.
         //
-        // OPT-IN via `SVOD_PM4_GRAPH=1`, default OFF (per-call dispatch): on
-        // gfx1151 the CP executes one big inlined IB measurably SLOWER than the
-        // per-call ring stream it pipelines across dispatches — the GigaAM RN-T
-        // encoder is ~36% slower captured (21.7s vs 15.9s host wall, full
-        // audio.wav, 277 chunks) despite producing a BIT-IDENTICAL transcript.
-        // So the chain is captured correctly but per-call stays the default fast
-        // path; the flag exposes the (correct) capture for hardware that benefits
-        // or future barrier-granularity work. Per-call fallback below is unchanged.
+        // OPT-IN via the per-device `pm4_graph` flag, default OFF (per-call
+        // dispatch): on gfx1151 the CP executes one big inlined IB measurably
+        // SLOWER than the per-call ring stream it pipelines across dispatches —
+        // the GigaAM RN-T encoder is ~36% slower captured (21.7s vs 15.9s host
+        // wall, full audio.wav, 277 chunks) despite producing a BIT-IDENTICAL
+        // transcript. So the chain is captured correctly but per-call stays the
+        // default fast path; the flag exposes the (correct) capture for hardware
+        // that benefits or future barrier-granularity work. The fallback below is
+        // unchanged. (Flag lives on `AmdDeviceCore`, not an env var, so a value of
+        // `0` can't accidentally enable it and tests toggle it race-free.)
         if crate::amd::queue::AmdComputeQueue::will_use_pm4(dev.core()) {
-            if std::env::var_os("SVOD_PM4_GRAPH").is_none() {
+            if !dev.core().pm4_graph() {
                 return Ok(None);
             }
             return AmdGraphPm4::capture(allocator, kernels, progs, dev);
@@ -526,6 +528,16 @@ impl AmdGraphPm4 {
         // inputs (covered by the one IB-head HDP flush) so a NARROW per-CU acquire
         // suffices. Correctness rests on `deps` being the COMPLETE in-graph hazard
         // set (the GVA-keyed RAW/WAW/WAR walk in `ExecutionPlan::build_graph`).
+        //
+        // WRITE-THROUGH ASSUMPTION (load-bearing): inside the IB a producer ends
+        // with only `CS_PARTIAL_FLUSH` — there is NO per-kernel EOP cache flush
+        // (only the wrapping `replay_indirect_buffer` release_mem flushes). So the
+        // Full consumer's `acquire_mem(GL2_INV|GL2_WB)` is the ONLY thing making
+        // the producer's stores visible, which is correct ONLY because RDNA L0/L1
+        // are write-through to GL2 (producer stores have reached L2 by the time
+        // `CS_PARTIAL_FLUSH` drains). This holds on the gfx1151 target (matches the
+        // bit-identical transcript); a write-BACK part would need a producer-side
+        // GL2_WB on real RAW/WAW edges before the Full consumer.
         let barriers: Vec<GraphBarrier> =
             kernels.iter().map(|k| if k.deps.is_empty() { GraphBarrier::Narrow } else { GraphBarrier::Full }).collect();
 

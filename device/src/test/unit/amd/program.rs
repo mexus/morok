@@ -2,6 +2,36 @@ use super::test_support::{amd_alloc_or_skip, require_multi_xcc, require_single_x
 use crate::amd::program::*;
 use crate::amd::queue::build_dispatch_packet;
 
+/// Serializes the `#[ignore]` PM4-graph probes that toggle the per-device
+/// `pm4_graph` flag. The flag lives on the process-global (`DEVICE_CACHE`-backed)
+/// `AmdDeviceCore`, so two probes running concurrently would observe each other's
+/// writes; holding this lock for each probe's duration makes the save/restore in
+/// [`Pm4GraphOverride`] well-defined regardless of `--test-threads`.
+static PM4_GRAPH_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Scoped enable of the per-device `pm4_graph` capture flag: records the previous
+/// value and restores it on drop, so a probe's mutation of the shared core flag
+/// never leaks into a later test in the same process. Acquire
+/// [`PM4_GRAPH_TEST_LOCK`] first so the save/restore window is exclusive.
+struct Pm4GraphOverride<'a> {
+    core: &'a crate::amd::device::AmdDeviceCore,
+    prev: bool,
+}
+
+impl<'a> Pm4GraphOverride<'a> {
+    fn enable(core: &'a crate::amd::device::AmdDeviceCore) -> Self {
+        let prev = core.pm4_graph();
+        core.set_pm4_graph(true);
+        Self { core, prev }
+    }
+}
+
+impl Drop for Pm4GraphOverride<'_> {
+    fn drop(&mut self) {
+        self.core.set_pm4_graph(self.prev);
+    }
+}
+
 /// Compile a trivial amdgcn kernel via Phase 2, then parse it back and
 /// verify the kernel descriptor round-trips. Skipped when host clang
 /// lacks AMDGPU target.
@@ -494,7 +524,7 @@ attributes #0 = { alwaysinline nounwind "amdgpu-flat-work-group-size"="1,64" }
 /// and `synchronize_all` must drain the wrapping PM4 counter.
 ///
 /// Run: SVOD_DEVICE=AMD:0 cargo test -p svod-device --lib pm4_graph_capture_replay_probe -- --ignored --nocapture --test-threads=1
-/// (the probe forces `SVOD_PM4_GRAPH=1` internally — capture is opt-in by default).
+/// (the probe forces the per-device `pm4_graph` flag on — capture is opt-in by default).
 #[test]
 #[ignore = "manual hardware probe; needs a real single-XCC AMD GPU + clang"]
 fn pm4_graph_capture_replay_probe() {
@@ -508,9 +538,11 @@ fn pm4_graph_capture_replay_probe() {
         return;
     }
     // PM4 graph capture is opt-in (default per-call — it regresses on gfx1151);
-    // force it on so this probe exercises the capture path. Single-threaded tests.
-    // SAFETY: process is single-threaded under `--test-threads=1`.
-    unsafe { std::env::set_var("SVOD_PM4_GRAPH", "1") };
+    // force it on so this probe exercises the capture path. Serialize + restore:
+    // the flag lives on the shared device core, so we hold the test lock for the
+    // probe's duration and restore the prior value on drop (no leak, no race).
+    let _serial = PM4_GRAPH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _pm4 = Pm4GraphOverride::enable(core);
     if core.signal_pool().is_none() {
         core.install_signal_pool(crate::amd::signal::SignalPool::new(&alloc, 64).expect("signal pool"));
     }
@@ -594,8 +626,9 @@ fn pm4_graph_two_kernel_raw_dependency() {
         return;
     }
     // PM4 graph capture is opt-in (default per-call); force it on for this probe.
-    // SAFETY: process is single-threaded under `--test-threads=1`.
-    unsafe { std::env::set_var("SVOD_PM4_GRAPH", "1") };
+    // Serialize + restore the shared per-device flag (no leak, no race).
+    let _serial = PM4_GRAPH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _pm4 = Pm4GraphOverride::enable(core);
     if core.signal_pool().is_none() {
         core.install_signal_pool(crate::amd::signal::SignalPool::new(&alloc, 64).expect("signal pool"));
     }
