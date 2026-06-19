@@ -32,6 +32,12 @@ pub enum Swizzle {
 /// HipKittens `swizzle_bytes` (`st.cuh:74-86`): the bank-conflict-avoiding XOR
 /// period in bytes, selected from the tile's underlying width (in 16-col
 /// fragments) and element size. `cols` is the (per-fragment) column count.
+///
+/// # Panics
+/// `itemsize` must be 1/2/4 bytes — i.e. a swizzled shared (`ST`) tile's dtype
+/// must be a 1/2/4-byte type (bf16/f16/f32 in practice). An 8-byte element
+/// (f64/i64) panics; this is a kernel-authoring precondition, the USE-face
+/// kernels only allocate bf16/f32 LDS tiles.
 fn swizzle_bytes(cols: usize, itemsize: i64) -> i64 {
     let uw = cols / 16; // underlying width in 16-col tiles
     match itemsize {

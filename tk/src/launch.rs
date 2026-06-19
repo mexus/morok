@@ -484,6 +484,18 @@ where
         buf_uops.push(t.uop().base());
     }
 
+    // The device is resolved from `buffers[0]`, so a kernel launched with no
+    // outputs AND no inputs has nothing to resolve against — a structured error,
+    // not an index-out-of-bounds panic on the public DEBUG-face entry.
+    snafu::ensure!(
+        !buffers.is_empty(),
+        BufferSnafu {
+            slot: 0usize,
+            supplied: 0usize,
+            reason: "compile_kernel needs at least one output or input buffer".to_string()
+        }
+    );
+
     // Resolve the concrete Device (renderer/compiler/runtime) for the buffers'
     // device, honoring the env-selected CPU backend like the realize path does.
     let device_spec = buffers[0].allocator().device_spec();

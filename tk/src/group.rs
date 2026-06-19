@@ -221,7 +221,13 @@ fn wmma_desc(arch: AmdArch, dtype_in: &DType) -> WmmaMetadata {
     let ren = Renderer::for_amd_arch(arch);
     let tc =
         ren.tensor_cores.iter().find(|tc| &tc.dtype_in == dtype_in && tc.dims == (16, 16, 16)).unwrap_or_else(|| {
-            unimplemented!("no 16×16×16 WMMA for input dtype {dtype_in:?} on {arch:?} (bf16 | f16)")
+            // Precondition violation by the kernel author, not end-user input: the
+            // matrix-core operand dtype must be bf16/f16 (the only 16×16×16 WMMA
+            // inputs). The USE-face kernels pre-cast; an AUTHOR calling `mma_*`
+            // with an unsupported RT dtype lands here.
+            unimplemented!(
+                "mma: operand dtype {dtype_in:?} has no 16×16×16 WMMA on {arch:?} — operands must be bf16 or f16"
+            )
         });
     wmma_from_tc(tc, ren.device)
 }
@@ -734,6 +740,12 @@ impl<'k> Group<'k> {
     /// `(height, width)` accumulate `WMMA(A[height,inner], B[inner,width])`
     /// across the reduce axis `inner`. One [`Op::Wmma`](svod_ir::Op::Wmma) per
     /// K-iteration → one `mfma.f32.16x16x16bf16.1k`.
+    ///
+    /// # Panics
+    /// The operand tiles `a`/`b` must be **bf16 or f16** — the only 16×16×16
+    /// matrix-core input dtypes. An operand of any other dtype panics (a kernel-
+    /// authoring error). Accumulation is always f32; this precondition holds for
+    /// all four `mma_{ab,abt,atb,atbt}` variants.
     pub fn mma_ab(&self, c: RT<'k>, a: &RT<'k>, b: &RT<'k>) -> RT<'k> {
         self.mma(c, a, b, false, false)
     }

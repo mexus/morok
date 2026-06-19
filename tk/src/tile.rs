@@ -314,11 +314,21 @@ impl<'k> RV<'k> {
 
 impl Kernel {
     /// Bind the next declared buffer as a [`GL`] tile (tinygrad `ker.gl`). The
-    /// element dtype is taken from the bound buffer; `dtype` is accepted for API
-    /// parity but the concrete buffer's dtype governs.
-    pub fn gl(&self, shape: &[usize], _dtype: DType) -> GL<'_> {
+    /// element dtype is taken from the bound buffer; `dtype` is the author's
+    /// declared dtype. The buffer governs, but a debug build asserts the two have
+    /// the same byte width — addressing depends only on the element width, so a
+    /// same-width mismatch (e.g. bf16/f16) is benign while a different-width one
+    /// (e.g. f32 vs bf16) is a real declaration bug worth catching early.
+    pub fn gl(&self, shape: &[usize], dtype: DType) -> GL<'_> {
         let buf = self.next_global();
         let elem = elem_of(&buf);
+        debug_assert_eq!(
+            elem.bytes(),
+            dtype.bytes(),
+            "gl: declared dtype {dtype:?} ({}B) and bound buffer element {elem:?} ({}B) differ in width",
+            dtype.bytes(),
+            elem.bytes()
+        );
         GL { buf, shape: shape.to_vec(), elem, ker: self }
     }
 

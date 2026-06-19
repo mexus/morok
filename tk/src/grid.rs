@@ -57,24 +57,6 @@ pub fn l2_swizzle(wgid: Arc<UOp>, num_wgs: i64, grid_m: i64, grid_n: i64) -> (Ar
     (pid_m, pid_n)
 }
 
-/// Pure-`i64` reference of [`l2_swizzle`] (same integer math, no UOps) — the
-/// oracle for the GPU-free bijection test and the documentation of the exact
-/// algorithm.
-#[cfg(test)]
-pub(crate) fn l2_swizzle_ref(wgid: i64, num_wgs: i64, grid_m: i64, grid_n: i64) -> (i64, i64) {
-    let chunk_size = WGM * WGM;
-    let block = NUM_XCDS * chunk_size;
-    let limit = (num_wgs / block) * block;
-    let wgid = if wgid > limit {
-        wgid
-    } else {
-        let xcd = wgid % NUM_XCDS;
-        let local_pid = wgid / NUM_XCDS;
-        (local_pid / chunk_size) * block + xcd * chunk_size + (local_pid % chunk_size)
-    };
-    let in_group = WGM * grid_n;
-    let first_pid_m = (wgid / in_group) * WGM;
-    let gsize_m = (grid_m - first_pid_m).min(WGM);
-    let local = wgid % in_group;
-    (first_pid_m + local % gsize_m, local / gsize_m)
-}
+// A pure-`i64` reference of `l2_swizzle` (same integer math, no UOps) — the
+// oracle that documents the exact algorithm — lives next to the bijection test
+// it backs, in `crate::test::unit::grid` (`l2_swizzle_ref`).

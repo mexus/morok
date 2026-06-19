@@ -7,10 +7,12 @@
 //! the single place those are derived from an [`AmdArch`], so the builders thread
 //! one value instead of hardcoding gfx942 (wave64) literals.
 //!
-//! Today only gfx942 (CDNA3, wave64) is actually *built*: it is the validated
-//! target, and the register-tile fragment-layout tables ([`crate::tiles`] strides
-//! and `group::mma`'s per-lane upcast counts) are calibrated for it (see
-//! [`crate::WARP_THREADS`]).
+//! Both gfx942 (CDNA3, wave64) and gfx1151 (RDNA3.5, wave32) are *built* (see
+//! `MATMUL_/FA_SUPPORTED_ARCHS`). gfx942 is the validated/calibrated target — the
+//! register-tile fragment-layout tables ([`crate::tiles`] strides and
+//! `group::mma`'s per-lane upcast counts) and the [`crate::WARP_THREADS`]
+//! layout-table constant are pinned to it; gfx1151 is carried by the dedicated
+//! wave32 paths described below.
 //!
 //! What generalizes cleanly to RDNA3.5 (gfx1151, wave32): [`ArchCaps::wave_size`]
 //! (the control path — warp/lane math, launch block), the WMMA descriptor (sourced

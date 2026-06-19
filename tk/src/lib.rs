@@ -34,8 +34,9 @@
 //! Inputs are bf16/f16, accumulation is f32, the WMMA/MFMA K-edge is 16; the
 //! per-arch fragment shapes resolve through [`ArchCaps`]. The layout-table
 //! calibration is pinned to gfx942 wave64 ([`WARP_THREADS`]); the live lane count
-//! flows through [`ArchCaps::wave_size`](arch::ArchCaps::wave_size). On any other
-//! target [`flash_attention`] transparently falls back to the tensor scheduler.
+//! flows through [`ArchCaps::wave_size`](arch::ArchCaps::wave_size). On a target
+//! outside the two above [`flash_attention`] transparently falls back to the
+//! tensor scheduler.
 
 pub mod arch;
 pub mod asm;

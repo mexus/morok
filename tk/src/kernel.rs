@@ -201,6 +201,17 @@ impl Kernel {
     pub fn finish(&self, stores: usize) -> Arc<UOp> {
         let rngs: SmallVec<[Arc<UOp>; 4]> = self.range_stack.borrow_mut().drain(..).collect();
 
+        // A RANGE admits exactly one END (else a double loop footer mis-scopes
+        // the linearizer). With multiple stores we'd clone the SAME outer `rngs`
+        // into each store's `.end()`, double-ending them — so a kernel that leaves
+        // outer ranges open at `finish` must have a single store. In-tree kernels
+        // close their loops before `finish`, so `rngs` is empty and this holds.
+        debug_assert!(
+            rngs.is_empty() || stores == 1,
+            "finish: {stores} stores with {} open outer range(s) would double-end a RANGE",
+            rngs.len()
+        );
+
         let mut store_uops = Vec::with_capacity(stores);
         for _ in 0..stores {
             let (store, _buf) = self.store_stack.borrow_mut().pop().expect("finish: store stack underflow");
