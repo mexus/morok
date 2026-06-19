@@ -215,5 +215,5 @@ schedule myself" — without two compilers — is that both produce the same art
 UOps. The optimizer's `opts_to_apply` field is the seam between them, and it's one enum away
 from `None`. [tk vs HipKittens vs CuTile](./comparison) returns to why that's unusual.
 
-Next, the wrinkle that makes hand-authoring genuinely hard on AMD — keeping a kernel correct
-across wave sizes: [Wave32 vs Wave64](./wave-portability).
+Next, put the builder to work end to end: [Writing a Kernel](./first-kernel) walks through
+authoring and running the simplest real kernel, line by line.

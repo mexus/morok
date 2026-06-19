@@ -115,8 +115,9 @@ The rest of this section builds up from the hardware problem to the design compa
    `tk` represents tiles in the type system.
 3. **[Authoring into the IR](./lowering)** — how a `tk` kernel becomes UOps and joins the
    lazy graph.
-4. **[Wave32 vs Wave64](./wave-portability)** — keeping one kernel correct across two AMD
+4. **[Writing a Kernel](./first-kernel)** — authoring and running the simplest kernel, step by step.
+5. **[Wave32 vs Wave64](./wave-portability)** — keeping one kernel correct across two AMD
    architectures.
-5. **[Flash Attention](./flash-attention)** — the worked example that motivated all of this.
-6. **[Debugging](./debugging)** — running and verifying kernels by hand.
-7. **[tk vs HipKittens vs CuTile](./comparison)** — where this design sits in the landscape.
+6. **[Flash Attention](./flash-attention)** — the worked example that motivated all of this.
+7. **[Debugging](./debugging)** — running and verifying kernels by hand.
+8. **[tk vs HipKittens vs CuTile](./comparison)** — where this design sits in the landscape.

@@ -2,6 +2,7 @@ mod arch;
 mod fa;
 mod golden;
 mod grid;
+mod guide;
 mod index;
 mod kernel_probe;
 mod loop_scope;

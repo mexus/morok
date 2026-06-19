@@ -54,6 +54,7 @@ const sidebars: SidebarsConfig = {
         'tile-kernels/where-flops-hide',
         'tile-kernels/tiling',
         'tile-kernels/lowering',
+        'tile-kernels/first-kernel',
         'tile-kernels/wave-portability',
         'tile-kernels/flash-attention',
         'tile-kernels/debugging',
