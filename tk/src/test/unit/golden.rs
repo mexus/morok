@@ -124,3 +124,37 @@ fn fingerprint_is_build_deterministic() {
     assert_eq!(kernel_fingerprint(&matmul_sink()).digest, kernel_fingerprint(&matmul_sink()).digest);
     assert_eq!(kernel_fingerprint(&fa_sink()).digest, kernel_fingerprint(&fa_sink()).digest);
 }
+
+/// Sorted, de-duped `DefineLocal` slots and `DefineReg` ids in a kernel graph.
+fn local_slots_and_reg_ids(sink: &Arc<UOp>) -> (Vec<usize>, Vec<usize>) {
+    let (mut locals, mut regs) = (Vec::new(), Vec::new());
+    for u in sink.toposort() {
+        match u.op() {
+            svod_ir::Op::DefineLocal(slot) => locals.push(*slot),
+            svod_ir::Op::DefineReg { id, .. } => regs.push(*id),
+            _ => {}
+        }
+    }
+    for v in [&mut locals, &mut regs] {
+        v.sort_unstable();
+        v.dedup();
+    }
+    (locals, regs)
+}
+
+/// The per-kernel `DefineLocal`/`DefineReg` ids are deterministic across two
+/// builds AND a dense `0..n` range — the contract the custom-kernel compile-dedup
+/// relies on (structurally identical kernels mint identical LDS slot / register
+/// ids → hash-cons to ONE compiled artifact; the `@local{slot}` LDS name is
+/// stable). The fingerprint guards this only indirectly; this pins it directly.
+#[test]
+fn define_ids_are_deterministic_and_dense() {
+    for build in [matmul_sink as fn() -> Arc<UOp>, fa_sink] {
+        let (l1, r1) = local_slots_and_reg_ids(&build());
+        let (l2, r2) = local_slots_and_reg_ids(&build());
+        assert_eq!(l1, l2, "DefineLocal slots differ across two builds (dedup would break)");
+        assert_eq!(r1, r2, "DefineReg ids differ across two builds (dedup would break)");
+        assert_eq!(l1, (0..l1.len()).collect::<Vec<_>>(), "DefineLocal slots must be dense 0..n, got {l1:?}");
+        assert_eq!(r1, (0..r1.len()).collect::<Vec<_>>(), "DefineReg ids must be dense 0..n, got {r1:?}");
+    }
+}

@@ -123,16 +123,19 @@ pub fn apply_pipeline_scheduling(nodes: Vec<Arc<UOp>>, target: LlvmTarget) -> Ve
     if !target.amd_arch().is_some_and(|a| a.is_cdna()) {
         return nodes;
     }
-    let Some(marker_idx) = nodes.iter().position(|n| marker_kind(n).is_some()) else {
+    if !nodes.iter().any(|n| marker_kind(n).is_some()) {
         return nodes;
-    };
+    }
 
-    // Both kinds currently delegate to `iglp_opt(0)`, spliced at the loop top right
-    // after the marker (Stage 2 swaps the attention path for the softmax/MFMA comb).
+    // Splice `iglp_opt(0)` right after EVERY marker — a kernel may pipeline more
+    // than one loop, and each marked loop needs its own scheduling control (an
+    // un-lowered marker is an inert comment). Both kinds currently delegate to
+    // `iglp_opt(0)` (Stage 2 swaps the attention path for the softmax/MFMA comb).
     let mut out: Vec<Arc<UOp>> = Vec::with_capacity(nodes.len() + 1);
-    for (i, node) in nodes.into_iter().enumerate() {
+    for node in nodes {
+        let is_marker = marker_kind(&node).is_some();
         out.push(node);
-        if i == marker_idx {
+        if is_marker {
             out.push(iglp_opt(0));
         }
     }

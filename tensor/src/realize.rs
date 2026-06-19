@@ -1377,6 +1377,7 @@ fn prepare_execution_plan(
                     )?
                 } else {
                     svod_schedule::optimize_kernel_with_config(item.ast.clone(), &optimizer_renderer, &config.optimizer)
+                        .context(OptimizeSnafu)?
                 };
 
             // Optimizer-scheduled kernels carry their name in the schedule metadata;

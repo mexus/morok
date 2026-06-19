@@ -41,6 +41,18 @@ fn nan_in_got_vs_finite_always_fails() {
 }
 
 #[test]
+fn all_non_finite_failure_reports_nonzero_max_err() {
+    // When every mismatch is non-finite, max_abs_err must not stay at its 0.0
+    // init (which read as a misleading "max abs err 0e0") — surface it as +inf.
+    let got = [f32::NAN, f32::NAN];
+    let exp = [1.0f32, 2.0];
+    let r = allclose_f32(&got, &exp, 1e9, 1e9);
+    assert!(!r.ok);
+    assert_eq!(r.first_failure, Some(0));
+    assert!(r.max_abs_err.is_infinite(), "all-NaN failure should report inf, got {}", r.max_abs_err);
+}
+
+#[test]
 fn inf_empty_and_length_mismatch_fail() {
     assert!(!allclose_f32(&[f32::INFINITY], &[1.0], 1e9, 1e9).ok); // inf vs finite
     assert!(!allclose_f32(&[], &[], 1.0, 1.0).ok); // empty → no vacuous pass

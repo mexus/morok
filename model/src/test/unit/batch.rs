@@ -169,6 +169,58 @@ fn test_single_vs_batch_consistency() {
     }
 }
 
+/// A ragged batch (a full lane beside a shorter, zero-padded lane) must keep the
+/// full lane bit-identical to its unbatched run and must stay finite. This is the
+/// regression guard for the key-only masking + conv re-zero: a missing re-zero or
+/// a stray batch-wide reduction would let the shorter lane's padding leak into the
+/// full lane or produce NaN. (The short lane's own valid rows are NOT compared to
+/// an unbatched run — the subsampling conv over the pad boundary perturbs them and
+/// exact equivalence isn't a model invariant; the masked-attention numerics are
+/// covered by `fa_layout_parity_vs_sdpa_key_masked`.)
+#[test]
+#[ignore = "heavy: ragged-batch lane isolation + finiteness"]
+fn test_ragged_batch_keeps_full_lane_isolated_and_finite() {
+    let model = model_with_random_weights();
+    let cfg = test_config();
+    let (d, n_mels) = (cfg.d_model, cfg.n_mels);
+    let (t_full, t_short) = (10usize, 6usize);
+    let t_sub_full = model.encoder.subsampling_output_length(t_full);
+
+    // Channel-major [n_mels, T] frame fill (row m, frame f → m*T + f), zero beyond `valid`.
+    let lane = |val: f32, valid: usize, t: usize| {
+        let mut v = vec![0.0f32; n_mels * t];
+        for m in 0..n_mels {
+            for f in 0..valid {
+                v[m * t + f] = val;
+            }
+        }
+        v
+    };
+
+    // Lane A (full length) run alone.
+    let xa =
+        Tensor::from_ndarray(&ndarray::Array3::from_shape_vec((1, n_mels, t_full), lane(0.5, t_full, t_full)).unwrap());
+    let mut solo_a = model.encoder.forward_batch(&xa, &Tensor::from_slice([t_full as i32])).unwrap();
+    solo_a.realize().unwrap();
+    let solo_a = read_prefix_f32(&solo_a, d * t_sub_full);
+
+    // Batch: lane A full (0.5), lane B valid for only t_short frames (0.3) then
+    // zero-padded up to t_full.
+    let mut bd = vec![0.0f32; 2 * n_mels * t_full];
+    bd[..n_mels * t_full].copy_from_slice(&lane(0.5, t_full, t_full));
+    bd[n_mels * t_full..].copy_from_slice(&lane(0.3, t_short, t_full));
+    let batch = Tensor::from_ndarray(&ndarray::Array3::from_shape_vec((2, n_mels, t_full), bd).unwrap());
+    let mut out = model.encoder.forward_batch(&batch, &Tensor::from_slice([t_full as i32, t_short as i32])).unwrap();
+    out.realize().unwrap();
+    let all = read_prefix_f32(&out, 2 * d * t_sub_full);
+
+    assert!(all.iter().all(|x| x.is_finite()), "ragged batch produced a non-finite value");
+    // The shorter padded lane B must not perturb the full lane A.
+    for (i, (&b, &s)) in all[..d * t_sub_full].iter().zip(solo_a.iter()).enumerate() {
+        assert!((b - s).abs() < 1e-4, "lane A row {i}: batch={b} solo={s} (a ragged lane B leaked into lane A)");
+    }
+}
+
 #[test]
 #[ignore = "heavy: NaN/Inf detector across encoder forward"]
 fn test_encode_batch_full_lengths_finite() {

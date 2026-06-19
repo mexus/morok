@@ -50,7 +50,13 @@ pub fn allclose_f32(got: &[f32], expected: &[f32], atol: f32, rtol: f32) -> Allc
     for (i, (&g, &e)) in got.iter().zip(expected).enumerate() {
         let fail = if !g.is_finite() || !e.is_finite() {
             // Non-finite: require identical classification (NaN↔NaN, ±inf matching).
-            g.is_nan() != e.is_nan() || (!g.is_nan() && g != e)
+            let mismatch = g.is_nan() != e.is_nan() || (!g.is_nan() && g != e);
+            if mismatch {
+                // A non-finite mismatch has no finite magnitude; surface it as +inf
+                // so an all-non-finite failure reports `inf`, not a misleading `0e0`.
+                max_abs_err = f32::INFINITY;
+            }
+            mismatch
         } else {
             let abs = (g - e).abs();
             if abs > max_abs_err {

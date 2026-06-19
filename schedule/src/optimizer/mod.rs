@@ -108,7 +108,7 @@ use std::sync::{Arc, LazyLock};
 ///
 /// * `SVOD_NOOPT=1` - Disable all optimizations (for debugging)
 /// * `BEAM=N` - Use beam search with width N (future)
-pub fn optimize_kernel(ast: Arc<svod_ir::UOp>, renderer: &Renderer) -> Arc<svod_ir::UOp> {
+pub fn optimize_kernel(ast: Arc<svod_ir::UOp>, renderer: &Renderer) -> Result<Arc<svod_ir::UOp>, OptError> {
     optimize_kernel_with_config(ast, renderer, &OptimizerConfig::from_env())
 }
 
@@ -600,7 +600,7 @@ pub fn optimize_kernel_with_config(
     ast: Arc<svod_ir::UOp>,
     renderer: &Renderer,
     config: &OptimizerConfig,
-) -> Arc<svod_ir::UOp> {
+) -> Result<Arc<svod_ir::UOp>, OptError> {
     // Author-supplied `opts_to_apply` (tinygrad parity) is read from the kernel
     // SINK marker BEFORE pre-optimization. When set, it overrides the strategy:
     // apply exactly those opts (an empty list applies none), never heuristics.
@@ -625,10 +625,10 @@ pub fn optimize_kernel_with_config(
         // (kernel name / opts) so downstream caching + naming still resolve it.
         let saved_metadata = ast.metadata_raw();
         let lowered = graph_rewrite(&crate::symbolic::pm_lower_index_dtype(), ast, &mut ());
-        return match saved_metadata {
+        return Ok(match saved_metadata {
             Some(meta) => lowered.with_metadata_raw(meta),
             None => lowered,
-        };
+        });
     }
 
     // Pre-optimization: per-kernel stages. Kept ON for the explicit-opts path
@@ -636,7 +636,7 @@ pub fn optimize_kernel_with_config(
     let pre_optimized = apply_pre_optimization(ast);
 
     let optimized = if let Some(opts) = explicit_opts {
-        apply_explicit_opts(pre_optimized, renderer, &opts)
+        apply_explicit_opts(pre_optimized, renderer, &opts)?
     } else {
         match config.strategy {
             OptStrategy::None => pre_optimized, // No heuristic optimization, but post-optimization still needed
@@ -654,7 +654,7 @@ pub fn optimize_kernel_with_config(
     // with LOAD for arithmetic ops) and must run even when optimizations are disabled.
     // Pass the renderer to enable GPU dimension injection for GPU backends.
 
-    apply_post_optimization_with_renderer(optimized, Some(renderer))
+    Ok(apply_post_optimization_with_renderer(optimized, Some(renderer)))
 }
 
 /// Read an author-supplied `opts_to_apply` list off a kernel SINK marker.
@@ -673,18 +673,21 @@ fn kernel_opts_to_apply(ast: &Arc<svod_ir::UOp>) -> Option<Vec<Opt>> {
 ///
 /// `convert_loop_to_global` runs first (as tinygrad does), then each opt is
 /// applied in order. An empty list applies zero opts — the pass-through case
-/// for an already-lowered hand-built kernel. A failed opt is logged and skipped
-/// (this entry point is infallible); use a fallible wrapper if loud failure is
-/// needed.
-fn apply_explicit_opts(ast: Arc<svod_ir::UOp>, renderer: &Renderer, opts: &[Opt]) -> Arc<svod_ir::UOp> {
+/// for an already-lowered hand-built kernel. An opt that fails to apply is an
+/// error: the author asked for *exactly* these opts, so a failure is propagated
+/// rather than silently dropped (which would yield a kernel missing a requested
+/// transform).
+fn apply_explicit_opts(
+    ast: Arc<svod_ir::UOp>,
+    renderer: &Renderer,
+    opts: &[Opt],
+) -> Result<Arc<svod_ir::UOp>, OptError> {
     let mut scheduler = Scheduler::new(ast, renderer.clone());
-    let _ = scheduler.convert_loop_to_global();
+    scheduler.convert_loop_to_global()?;
     for opt in opts {
-        if let Err(e) = apply_opt(&mut scheduler, opt, true) {
-            tracing::error!(opt = %opt, error = %e, "explicit opts_to_apply: apply_opt failed; skipping");
-        }
+        apply_opt(&mut scheduler, opt, true)?;
     }
-    scheduler.get_optimized_ast(None)
+    Ok(scheduler.get_optimized_ast(None))
 }
 
 /// Apply optimizations with explicit strategy selection (legacy API).
@@ -694,7 +697,7 @@ pub fn optimize_kernel_with_strategy(
     ast: Arc<svod_ir::UOp>,
     renderer: &Renderer,
     strategy: OptStrategy,
-) -> Arc<svod_ir::UOp> {
+) -> Result<Arc<svod_ir::UOp>, OptError> {
     let config = OptimizerConfig { strategy, ..Default::default() };
     optimize_kernel_with_config(ast, renderer, &config)
 }

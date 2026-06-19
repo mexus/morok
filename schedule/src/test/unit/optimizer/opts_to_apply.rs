@@ -34,7 +34,7 @@ fn count_axis_type(ast: &std::sync::Arc<UOp>, axis_type: AxisType) -> usize {
 fn test_opts_to_apply_empty_skips_heuristic_upcast() {
     let sink = hand_ranged_sink(8, Some(vec![]));
     let config = OptimizerConfig { strategy: OptStrategy::Heuristic, ..Default::default() };
-    let optimized = optimize_kernel_with_config(sink, &Renderer::cpu(), &config);
+    let optimized = optimize_kernel_with_config(sink, &Renderer::cpu(), &config).expect("optimize");
 
     assert_eq!(count_axis_type(&optimized, AxisType::Upcast), 0, "opts_to_apply=() must not introduce an Upcast axis");
     assert!(count_axis_type(&optimized, AxisType::Loop) >= 1, "the manual Loop range must survive untouched");
@@ -46,7 +46,7 @@ fn test_opts_to_apply_empty_skips_heuristic_upcast() {
 fn test_opts_to_apply_empty_overrides_beam_strategy() {
     let sink = hand_ranged_sink(8, Some(vec![]));
     let config = OptimizerConfig { strategy: OptStrategy::Beam { width: 1 }, ..Default::default() };
-    let optimized = optimize_kernel_with_config(sink, &Renderer::cpu(), &config);
+    let optimized = optimize_kernel_with_config(sink, &Renderer::cpu(), &config).expect("optimize");
 
     assert_eq!(count_axis_type(&optimized, AxisType::Upcast), 0, "explicit opts must win over the beam strategy");
 }
@@ -59,14 +59,14 @@ fn test_opts_to_apply_empty_overrides_beam_strategy() {
 fn test_opts_to_apply_none_allows_heuristic_upcast() {
     let sink = hand_ranged_sink(8, None);
     let config = OptimizerConfig { strategy: OptStrategy::Heuristic, ..Default::default() };
-    let optimized = optimize_kernel_with_config(sink, &Renderer::cpu(), &config);
+    let optimized = optimize_kernel_with_config(sink, &Renderer::cpu(), &config).expect("optimize");
 
     let vectorized = optimized.toposort().iter().any(|u| u.dtype().vcount() > 1);
     assert!(vectorized, "with opts_to_apply=None the heuristic upcaster should vectorize the divisible loop");
 
     // And the empty-opts variant of the same kernel stays scalar.
     let scalar_sink = hand_ranged_sink(8, Some(vec![]));
-    let scalar = optimize_kernel_with_config(scalar_sink, &Renderer::cpu(), &config);
+    let scalar = optimize_kernel_with_config(scalar_sink, &Renderer::cpu(), &config).expect("optimize");
     assert!(
         scalar.toposort().iter().all(|u| u.dtype().vcount() == 1),
         "opts_to_apply=() must leave the kernel scalar (no vectorization)"

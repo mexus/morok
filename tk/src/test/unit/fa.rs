@@ -136,7 +136,7 @@ fn test_fa_graph_path_renders_clean() {
     // Realize builds the optimizer renderer for gfx942 via for_amd_arch.
     let opt_ren = OptimizerRenderer::for_amd_arch(svod_dtype::AmdArch::Gfx942);
     let config = OptimizerConfig::default();
-    let optimized = optimize_kernel_with_config(sink, &opt_ren, &config);
+    let optimized = optimize_kernel_with_config(sink, &opt_ren, &config).expect("optimize");
 
     // Decompose (AMD renderer's decompositor) then program_from_sink + linearize.
     let text_ren = svod_codegen::llvm::LlvmTextRenderer::amd(svod_dtype::AmdArch::Gfx942);
@@ -519,9 +519,9 @@ fn test_fa_noncausal_f16_masked_amd() {
     assert!(max_abs <= 2e-2, "non-causal masked f16 FA exceeds tol (max abs {max_abs:e})");
 }
 
-/// CLAIM-5 regression: a fully key-masked lane (`key_lens[b] == 0`) — the inactive-
-/// lane case the GigaAM JIT produces when a chunk-batch's tail lanes pad to length
-/// 0 — must yield a FINITE ZERO row, not `0/0 = NaN`. Without the softmax-denominator
+/// A fully key-masked lane (`key_lens[b] == 0`) — the inactive-lane case the
+/// GigaAM JIT produces when a chunk-batch's tail lanes pad to length 0 — must
+/// yield a FINITE ZERO row, not `0/0 = NaN`. Without the softmax-denominator
 /// clamp the running sum is 0 and every output element is NaN.
 ///
 /// `SVOD_DEVICE=AMD:0 cargo test -p svod-tk --lib fa::test_fa_key_lens_zero_is_finite_zero_amd -- --ignored --nocapture`.
