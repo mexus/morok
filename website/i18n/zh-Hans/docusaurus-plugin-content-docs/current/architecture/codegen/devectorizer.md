@@ -152,12 +152,7 @@ LOAD(INDEX(ptr, i))
 
 **做了什么**：处理从抽象向量到硬件操作的转换。
 
-**为什么重要**：Devectorize 使用 4 个概念阶段，通过 3 次 `graph_rewrite` 调用实现（阶段 3 和 4 共享一次调用）：
-
-1. **Phase 1**：创建 PTRCAT 分组连续指针访问，devectorize ALU/WMMA/buffer，展开向量 INDEX → GEP(PTRCAT)
-2. **Phase 2**：将 GEP 移过 LOAD/STORE
-3. **Phase 3**：将 PTRCAT 分发到 LOAD/STORE，创建 CAT(LOADs)，修复 image buffer
-4. **Phase 4**：将 CAT(LOADs) 分割成匹配硬件宽度的更小块
+**为什么重要**：Devectorize 通过 3 次 `graph_rewrite` 调用运行 4 个概念阶段（阶段 3 和 4 共享一次调用）——构建 PTRCAT 分组、将 GEP 移过 LOAD/STORE、分发为 CAT(LOADs)，并分割到硬件宽度。逐阶段的契约见 `schedule/src/lib.rs` 模块 docstring。
 
 **PTRCAT 构建**：
 

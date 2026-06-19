@@ -103,7 +103,7 @@ Two hardware facts shape every AMD tile kernel, and they're worth holding onto:
 
 - **CDNA** (datacenter, e.g. gfx942) issues matrix multiplies via **MFMA** instructions and
   runs **wave64** — 64 lanes per wavefront.
-- **RDNA** (including the gfx1151 Strix Halo APU Svod targets) issues **WMMA** instructions and
+- **RDNA** (e.g. gfx1151, RDNA3.5, wave32) issues **WMMA** instructions and
   runs **wave32** — 32 lanes.
 
 The lane count changes how a tile's elements are distributed across the wave, which changes the
@@ -118,8 +118,8 @@ the design:
 | Gap | Finding |
 |-----|---------|
 | gap 3 (bank structure) | The LDS micro-benchmark confirms 64 banks accessed in two phases of 32 lanes on CDNA — the structure the XOR swizzles are tuned against. |
-| gap 4 (overlap not universal) | A BF16 GEMM peaks with 8-wave ping-pong (~1580 TFLOPS); an FP8 GEMM peaks with 4-wave interleave (~3303 vs ~3066 TFLOPS for ping-pong). The right schedule depends on the dtype. |
-| gap 5 (chiplet swizzle) | Remapping workgroup IDs for XCD locality is worth on the order of 10% on a large GEMM. |
+| gap 4 (overlap not universal) | A BF16 GEMM peaks with 8-wave ping-pong; an FP8 GEMM peaks with 4-wave interleave. The optimal wave-overlap strategy varies by dtype. |
+| gap 5 (chiplet swizzle) | Remapping workgroup IDs for XCD locality yields a measurable large-GEMM speedup. |
 
 `tk` implements these levers directly: the XOR swizzles live in `tk/src/swizzle.rs` (ported from
 HipKittens' shared-tile layouts), the L2/chiplet remap in `tk/src/grid.rs` (`l2_swizzle`), and

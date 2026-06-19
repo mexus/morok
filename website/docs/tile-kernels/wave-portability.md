@@ -22,7 +22,7 @@ sizes, and Svod targets both:
 | Architecture | Example | Matrix op | Wavefront |
 |--------------|---------|-----------|-----------|
 | **CDNA** | gfx942 (datacenter) | MFMA | **wave64** — 64 lanes |
-| **RDNA** | gfx1151 (Strix Halo APU) | WMMA | **wave32** — 32 lanes |
+| **RDNA** | gfx1151 (RDNA3.5) | WMMA | **wave32** — 32 lanes |
 
 That single number ripples through everything. A `16×16` tile has 256 elements. Spread across
 64 lanes, that's 4 elements per lane; across 32 lanes, it's 8. Different lanes own different

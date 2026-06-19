@@ -67,7 +67,7 @@ NVIDIA 靠高*占用率*隐藏延迟：常驻许多 warp，一个停顿了另一
 有两个硬件事实塑造了每一个 AMD tile 内核，值得记牢：
 
 - **CDNA**（数据中心，例如 gfx942）经 **MFMA** 指令发射矩阵乘法，跑 **wave64**，即每个波前 64 个 lane。
-- **RDNA**（含 Svod 所瞄准的 gfx1151 Strix Halo APU）发射 **WMMA** 指令，跑 **wave32**，即 32 个 lane。
+- **RDNA**（例如 gfx1151，RDNA3.5，wave32）发射 **WMMA** 指令，跑 **wave32**，即 32 个 lane。
 
 lane 数一变，tile 的元素在 wave 上的分布就跟着变，寄存器布局随之改变，规约也随之改变。一个为其中一种写、却在另一种上运行、又没把这点考虑进去的内核，会悄无声息地算错。让同一个内核在两者上都正确，自成一章：[Wave32 与 Wave64](./wave-portability)。
 
@@ -77,8 +77,8 @@ HipKittens 的 `analysis/paper_experiments/` 微基准把上述瓶颈逐一量�
 | 瓶颈 | 发现 |
 |-----|---------|
 | 瓶颈 3（bank 结构） | LDS 微基准证实了 CDNA 上 64 个 bank 分两相位访问、每相位 32 lane，正是 XOR swizzle 所针对调优的结构。 |
-| 瓶颈 4（重叠并非通用） | 一个 BF16 GEMM 在 8-wave 乒乓下达到峰值（~1580 TFLOPS）；一个 FP8 GEMM 则在 4-wave 交织下达到峰值（~3303，对比乒乓的 ~3066 TFLOPS）。正确的调度取决于 dtype。 |
-| 瓶颈 5（小芯片 swizzle） | 为 XCD 局部性重映射工作组 ID，在一个大 GEMM 上约值 10%。 |
+| 瓶颈 4（重叠并非通用） | 一个 BF16 GEMM 在 8-wave 乒乓下达到峰值；一个 FP8 GEMM 则在 4-wave 交织下达到峰值。最优的 wave 重叠策略因 dtype 而异。 |
+| 瓶颈 5（小芯片 swizzle） | 为 XCD 局部性重映射工作组 ID，可在一个大 GEMM 上带来可观测的加速。 |
 
 `tk` 把这些调节杆逐一落地：XOR swizzle 在 `tk/src/swizzle.rs`（移植自 HipKittens 的共享 tile 布局），L2/小芯片重映射在 `tk/src/grid.rs`（`l2_swizzle`）；计算/内存的重叠则表达为 Flash Attention KV 循环上的一个 `sched::pipeline(SchedKind::Attention, …)` 标记，由线性化之后的一个调度遍来消费。
 

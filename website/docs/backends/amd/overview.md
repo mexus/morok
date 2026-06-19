@@ -112,7 +112,7 @@ environment variable:
 :::caution AM is not runnable yet
 Setting `SVOD_AMD_BACKEND=am` currently returns an error (`device.rs` accepts
 only `kfd`) — no AM type implements the seam yet. The userspace **AM** driver
-targets the **MI300X SR-IOV VF** (gfx9.4.3 / CDNA3) and is a work in progress:
+targets a **CDNA3 SR-IOV VF** (gfx9.4.3) and is a work in progress:
 discovery, the VF↔GIM mailbox, indirect register access, the GMMU, and GMC
 bring-up are implemented and **validated on the live VF**, but no GPU engine yet
 consumes work (the doorbell aperture is host-owned). See

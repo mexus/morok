@@ -101,7 +101,7 @@ remap करके कि कौन-सा workgroup ID कहाँ run हो�
 
 - **CDNA** (datacenter, जैसे gfx942) matrix multiplies को **MFMA** instructions के ज़रिए issue करता है और
   **wave64** चलाता है — प्रति wavefront 64 lanes।
-- **RDNA** (इसमें वह gfx1151 Strix Halo APU भी शामिल है जिसे Svod target करता है) **WMMA** instructions issue करता है और
+- **RDNA** (जैसे gfx1151, RDNA3.5, wave32) **WMMA** instructions issue करता है और
   **wave32** चलाता है — 32 lanes।
 
 lane count बदलते ही यह बदल जाता है कि एक tile के elements wave भर में कैसे बँटते हैं; इससे register layout
@@ -116,8 +116,8 @@ justify करते हैं:
 | Gap | निष्कर्ष |
 |-----|---------|
 | gap 3 (bank structure) | LDS micro-benchmark पुष्टि करता है कि CDNA पर 64 banks 32 lanes के दो phases में access होते हैं — वही structure जिसके लिए XOR swizzles tuned हैं। |
-| gap 4 (overlap हर जगह एक-सा नहीं) | एक BF16 GEMM 8-wave ping-pong के साथ peak करता है (~1580 TFLOPS); एक FP8 GEMM 4-wave interleave के साथ (~3303 बनाम ping-pong के ~3066 TFLOPS)। सही schedule dtype पर निर्भर करता है। |
-| gap 5 (chiplet swizzle) | XCD locality के लिए workgroup IDs को remap करना एक बड़े GEMM पर तक़रीबन 10% फ़ायदा देता है। |
+| gap 4 (overlap हर जगह एक-सा नहीं) | एक BF16 GEMM 8-wave ping-pong के साथ peak करता है; एक FP8 GEMM 4-wave interleave के साथ। इष्टतम wave-overlap रणनीति dtype के अनुसार बदलती है। |
+| gap 5 (chiplet swizzle) | XCD locality के लिए workgroup IDs को remap करना एक बड़े GEMM पर एक मापने योग्य speedup देता है। |
 
 `tk` इन levers को सीधे implement करता है: XOR swizzles `tk/src/swizzle.rs` में रहते हैं (HipKittens के
 shared-tile layouts से ported), L2/chiplet remap `tk/src/grid.rs` में रहता है (`l2_swizzle`), और

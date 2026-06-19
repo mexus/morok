@@ -109,7 +109,7 @@ flowchart TD
 :::caution AM 尚不可运行
 设置 `SVOD_AMD_BACKEND=am` 目前会返回错误（`device.rs` 只接受
 `kfd`）——尚无 AM 类型实现接缝。用户态 **AM** 驱动的目标是
-**MI300X SR-IOV VF**（gfx9.4.3 / CDNA3），仍在开发中：
+一块 **CDNA3 SR-IOV VF**（gfx9.4.3），仍在开发中：
 discovery、VF↔GIM mailbox、间接寄存器访问、GMMU 与 GMC
 启动均已实现并**在活动的 VF 上验证**，但尚无 GPU 引擎
 消费工作（doorbell aperture 由宿主拥有）。关于当下确切存在什么、

@@ -28,14 +28,16 @@ sections हर टुकड़े की status को explicit रूप स�
 
 ---
 
-## Target hardware: MI300X SR-IOV VF
+## Target hardware: एक CDNA3 SR-IOV VF (gfx9.4.3)
 
-driver का target है **AMD Instinct MI300X** — **gfx9.4.3 / CDNA3**, SPX mode में 8 XCCs — और
+driver का target है एक **CDNA3** GPU — **gfx9.4.3**, SPX mode में 8 XCCs — और
 विशेष रूप से उसका **SR-IOV Virtual Function** रूप (GPU एक VF है जो एक KVM guest में pass किया
 गया है)। `AmDev::open` बाक़ी हर चीज़ को सीधे अस्वीकार कर देता है: एक non-VF function, या एक
 ऐसा GC version जिसका major.minor `(9, 4)` नहीं है, fast fail करता है
-(`device/src/amd/am/dev.rs`)। पहले वाला gfx1151 "Strix Halo" APU केवल एक vendored register
+(`device/src/amd/am/dev.rs`)। पहले वाला gfx1151 (RDNA3.5) केवल एक vendored register
 table और एक vestigial unit test के रूप में बचा है; यह अब target नहीं है।
+
+> Validated on AMD Instinct MI300X (gfx942) and Ryzen AI "Strix Halo" (gfx1151).
 
 एक **VF** होना (bare metal के बजाय) defining constraint है, और यह पूरे driver को आकार देता
 है:
@@ -80,7 +82,7 @@ hardware-facing टुकड़े अतिरिक्त रूप से liv
 
 page-table geometry **4-level / 48-bit** है (`va_shifts = [12, 21, 30, 39]`), एक आकार जो
 **gfx9/11/12 में साझा है** — इसलिए geometry ख़ुद arch पर branch नहीं करती। केवल leaf PTE
-encoding (विशेष रूप से MTYPE memory-type field) arch-specific है, और **अब gfx9 (CDNA/MI300X)
+encoding (विशेष रूप से MTYPE memory-type field) arch-specific है, और **अब gfx9 (CDNA)
 और gfx11 (RDNA3) दोनों implement और unit-tested हैं** — gfx9 leaf flags MTYPE को bits 57–58
 पर रखते हैं, PDB1 `bfs` set करते हैं, PDB0 translate-further bit, और higher leaves पर
 `PDE_PTE` bit। **gfx12 ही एकमात्र शेष `unimplemented!` है** (constants captured हैं, अभी तक
@@ -159,18 +161,10 @@ privileged, PF-owned subsystems **tree से अनुपस्थित है
 ## Roadmap
 
 काम milestones के रूप में staged है, हर एक live VF पर स्वतंत्र रूप से testable (और, PF-owned
-blocks के लिए, bare-metal tinygrad AM को oracle मानकर):
+blocks के लिए, bare-metal tinygrad AM को oracle मानकर)। पहले वाले milestones implement हो चुके
+हैं; पूरा AM end-to-end integration भविष्य का काम है।
 
-| Milestone | Scope | Status |
-|---|---|---|
-| **M0** | gfx9 register + pagetable tables; read-only PCI/discovery; `am_discovery` HW test | **done** |
-| **M1** | mailbox handshake + RLCG + GMC context0 (`am_own`, `am_gmc`) | **done** |
-| **M2** | SDMA ring engine को drive करता है — MM-hub walk faults / stuck rptr को resolve करें | **in progress** |
-| **M3** | एक mapped VA पर `WRITE_DATA` execute करता एक MEC queue (एक XCC पर), फिर full per-XCC MQD/AQL | **in progress** |
-| **M4** | `AmIface` implementor + AM core पर GigaAM end-to-end | **pending** |
-| **M5** | bare-metal PSP / SMU / firmware ports (एक VF पर untestable) | **pending** |
-
-एक बार जब कोई engine work consume कर ले (M2/M3) और seam wire हो जाए (M4), AM
+एक बार जब कोई engine work consume कर ले और seam wire हो जाए, AM
 `SVOD_AMD_BACKEND=am` के माध्यम से selectable बन जाता है और पूरे मौजूदा ऊपरी हिस्से को
 unchanged चलाता है। तब वह crash-inducing concurrency जिसने AM को प्रेरित किया crash नहीं कर
 सकती — kernel को bypass कर दिया गया है।

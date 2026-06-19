@@ -152,12 +152,7 @@ Stores से रिडंडेंट loads भी हटाता है (writ
 
 **यह क्या करता है**: Abstract वेक्टर्स से हार्डवेयर ऑपरेशन का ट्रांज़िशन हैंडल करता है।
 
-**यह क्यों ज़रूरी है**: Devectorize 4 conceptual phases इस्तेमाल करता है जो 3 `graph_rewrite` calls में इम्प्लीमेंट होते हैं (phases 3 और 4 एक call शेयर करते हैं):
-
-1. **Phase 1**: Consecutive pointer accesses ग्रुप करने के लिए PTRCAT बनाएँ, ALU/WMMA/buffers devectorize करें, vector INDEX → GEP(PTRCAT) एक्सपैंड करें
-2. **Phase 2**: LOAD/STORE से GEP गुज़ारें
-3. **Phase 3**: LOAD/STORE में PTRCAT डिस्ट्रिब्यूट करें, CAT(LOADs) बनाएँ, image buffers फ़िक्स करें
-4. **Phase 4**: हार्डवेयर width मैच करने के लिए CAT(LOADs) को छोटे chunks में स्प्लिट करें
+**यह क्यों ज़रूरी है**: Devectorize 4 conceptual phases को 3 `graph_rewrite` calls में चलाता है (phases 3 और 4 एक call शेयर करते हैं) — PTRCAT groups बनाना, LOAD/STORE से GEPs गुज़ारना, CAT(LOADs) में डिस्ट्रिब्यूट करना, और हार्डवेयर width तक स्प्लिट करना। phase-दर-phase contract `schedule/src/lib.rs` module docstring में रहता है।
 
 **PTRCAT कंस्ट्रक्शन**:
 

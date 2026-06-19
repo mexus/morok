@@ -105,7 +105,7 @@ Implementor को device-open समय पर `SVOD_AMD_BACKEND` environment v
 :::caution AM अभी चलने योग्य नहीं है
 `SVOD_AMD_BACKEND=am` सेट करना फ़िलहाल एक error देता है (`device.rs` केवल `kfd` स्वीकार
 करता है) — अभी तक कोई AM type seam को implement नहीं करता। userspace **AM** driver का target
-है **MI300X SR-IOV VF** (gfx9.4.3 / CDNA3) और यह एक work in progress है: discovery, VF↔GIM
+है एक **CDNA3 SR-IOV VF** (gfx9.4.3) और यह एक work in progress है: discovery, VF↔GIM
 mailbox, indirect register access, GMMU, और GMC bring-up implement किए जा चुके हैं और **live
 VF पर validated** हैं, लेकिन अभी तक कोई GPU engine work consume नहीं करता (doorbell aperture
 host-owned है)। आज ठीक-ठीक क्या मौजूद है और boundary कहाँ है इसके लिए

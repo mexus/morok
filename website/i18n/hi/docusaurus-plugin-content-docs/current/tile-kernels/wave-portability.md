@@ -22,7 +22,7 @@ numbers बिल्कुल कचरा निकलते हैं — न 
 | Architecture | उदाहरण | Matrix op | Wavefront |
 |--------------|---------|-----------|-----------|
 | **CDNA** | gfx942 (datacenter) | MFMA | **wave64** — 64 lanes |
-| **RDNA** | gfx1151 (Strix Halo APU) | WMMA | **wave32** — 32 lanes |
+| **RDNA** | gfx1151 (RDNA3.5) | WMMA | **wave32** — 32 lanes |
 
 बस यही एक number है जिसका असर हर चीज़ पर पड़ता है। एक `16×16` tile में 256 elements होते हैं। 64 lanes में
 बाँटें तो प्रति lane 4 elements; 32 lanes में बाँटें तो 8। अलग-अलग lanes अलग-अलग elements की मालिक होती हैं।

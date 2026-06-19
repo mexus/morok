@@ -17,7 +17,7 @@ sidebar_label: Wave32 与 Wave64
 | 架构 | 示例 | 矩阵操作 | 波前 |
 |--------------|---------|-----------|------------|
 | **CDNA** | gfx942（数据中心） | MFMA | **wave64**，64 个 lane |
-| **RDNA** | gfx1151（Strix Halo APU） | WMMA | **wave32**，32 个 lane |
+| **RDNA** | gfx1151（RDNA3.5） | WMMA | **wave32**，32 个 lane |
 
 就这么一个数字，却牵动着一切。一个 `16×16` tile 有 256 个元素：摊到 64 个 lane 上，每 lane 4 个；摊到 32 个 lane 上，每 lane 8 个。不同的 lane 持有不同的元素。于是：
 
