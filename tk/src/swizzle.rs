@@ -76,6 +76,10 @@ impl Swizzle {
     /// `(row, col)`. `scalar` is the element type (the XOR variants depend on
     /// `itemsize`). The mapping is a bijection on `[0,rows)×[0,cols)`, so a write
     /// and a later read at the same logical `(row, col)` hit the same slot.
+    ///
+    /// # Panics
+    /// For a non-[`Swizzle::Identity`] variant, panics if the scalar itemsize is
+    /// not 1, 2, or 4 bytes (only bf16/f16/f32 LDS tiles are swizzled).
     pub fn swizzle_rc(&self, row: Arc<UOp>, col: Arc<UOp>, cols: usize, scalar: ScalarDType) -> (Arc<UOp>, Arc<UOp>) {
         match self {
             Swizzle::Identity => (row, col),

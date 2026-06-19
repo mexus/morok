@@ -55,6 +55,10 @@ impl Kernel {
     /// (slot = declaration index); [`Kernel::next_global`] hands those out as GL
     /// tiles bind them, and [`crate::launch`] binds the concrete buffers
     /// positionally at dispatch — the svod analog of tinygrad `sink.call(bufs)`.
+    ///
+    /// # Panics
+    /// In a debug build, panics if the arch wave size is neither 32 nor 64 — tk
+    /// only has fragment-layout tables for wave32/wave64.
     pub fn new(name: impl Into<String>, grid: [i64; 3], block: i64, buffers: Vec<Arc<UOp>>, caps: ArchCaps) -> Self {
         // tk has fragment-layout tables for wave64 (gfx942 CDNA, all kernels) and
         // wave32 (gfx11 RDNA — matmul; FA stays wave64-only until Stage 2). Any
@@ -102,9 +106,19 @@ impl Kernel {
 
     // ── lane / warp helpers ────────────────────────────────────────────────
 
+    /// The wave (warp) index of the current thread within its workgroup —
+    /// `threadIdx / wave_size`, derived from the flat thread id.
+    ///
+    /// # Panics
+    /// Panics if the `Index`-typed division cannot be constructed.
     pub fn warpid(&self) -> Arc<UOp> {
         self.thread_idx.try_div(&cidx(self.caps.wave_size as i64)).expect("warpid: index div")
     }
+    /// The lane index of the current thread within its wave —
+    /// `threadIdx % wave_size`, derived from the flat thread id.
+    ///
+    /// # Panics
+    /// Panics if the `Index`-typed modulo cannot be constructed.
     pub fn laneid(&self) -> Arc<UOp> {
         self.thread_idx.try_mod(&cidx(self.caps.wave_size as i64)).expect("laneid: index mod")
     }
@@ -182,6 +196,10 @@ impl Kernel {
 
     /// Hand out the next global buffer placeholder (a flat 1-D `Param`) as a GL
     /// tile binds it. Already flat — no `flat_ptr` unwrap is needed.
+    ///
+    /// # Panics
+    /// Panics (index out of bounds) if called more times than the number of
+    /// declared GLOBAL buffers.
     pub fn next_global(&self) -> Arc<UOp> {
         let slot = self.global_slot.get();
         self.global_slot.set(slot + 1);
@@ -198,6 +216,10 @@ impl Kernel {
     /// Close every tracked range and group the last `stores` terminal stores
     /// into the final kernel SINK (carrying `opts_to_apply = Some(vec![])` so
     /// the optimizer leaves this hand-lowered body untouched).
+    ///
+    /// # Panics
+    /// Panics on store-stack underflow — fewer terminal stores were recorded
+    /// (via [`Self::push_store`]) than the `stores` requested here.
     pub fn finish(&self, stores: usize) -> Arc<UOp> {
         let rngs: SmallVec<[Arc<UOp>; 4]> = self.range_stack.borrow_mut().drain(..).collect();
 
@@ -232,6 +254,10 @@ impl Kernel {
 
     /// Close `ranges` inner (accumulation) loops around the last store and
     /// return the store's buffer rewrapped with the close as a dependency.
+    ///
+    /// # Panics
+    /// Panics on store-stack underflow (no recorded store to close) or
+    /// range-stack underflow (fewer open ranges than `ranges`).
     pub fn endrange(&self, ranges: usize) -> Arc<UOp> {
         let (store, buf) = self.store_stack.borrow_mut().pop().expect("endrange: store stack underflow");
         let mut rngs: Vec<Arc<UOp>> = Vec::with_capacity(ranges);
@@ -249,6 +275,10 @@ impl Kernel {
     /// single `END`, else a double loop footer): the caller must chain the
     /// other accumulators' stores into it (via a shared input) so they are
     /// scoped inside the loop and survive dead-code elimination.
+    ///
+    /// # Panics
+    /// Panics on store-stack underflow (no recorded store to close) or
+    /// range-stack underflow (fewer open ranges than `ranges`).
     pub fn endrange_to(&self, ranges: usize) -> Arc<UOp> {
         let (store, _buf) = self.store_stack.borrow_mut().pop().expect("endrange_to: store stack underflow");
         let mut rngs: Vec<Arc<UOp>> = Vec::with_capacity(ranges);
@@ -273,6 +303,10 @@ impl Kernel {
     /// `after` rejects it (its passthrough must be data-producing); and only a
     /// `Barrier` actually emits the `s.barrier` fence. Anchoring a consumer-less
     /// barrier *post*-loop instead trips the CFG-builder cycle check.
+    ///
+    /// # Panics
+    /// Panics on store-stack underflow (no recorded store to close) or
+    /// range-stack underflow (fewer open ranges than `ranges`).
     pub fn endrange_barrier_to(&self, ranges: usize, deps: SmallVec<[Arc<UOp>; 4]>) -> Arc<UOp> {
         let (store, _buf) = self.store_stack.borrow_mut().pop().expect("endrange_barrier_to: store stack underflow");
         let wrapped = if deps.is_empty() { store } else { store.barrier(deps) };

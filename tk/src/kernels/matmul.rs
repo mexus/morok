@@ -35,9 +35,13 @@ pub const K_STEP: usize = 64;
 /// split into `wave_rows * n_accum` row-blocks, the N side into `wave_cols`.
 #[derive(Clone, Copy)]
 pub struct MatmulCfg {
+    /// The square C-tile edge (in elements) one workgroup computes.
     pub block: usize,
+    /// Wave grid rows — the M side splits into `wave_rows * n_accum` row-blocks.
     pub wave_rows: usize,
+    /// Wave grid columns — the N side splits into `wave_cols` col-blocks.
     pub wave_cols: usize,
+    /// `reg × reg` f32 accumulators per wave.
     pub n_accum: usize,
     /// Drive `(pid_m, pid_n)` from a flattened 1-D grid via the chiplet/L2
     /// [`l2_swizzle`](crate::grid::l2_swizzle) instead of the plain 2-D
@@ -62,7 +66,8 @@ impl MatmulCfg {
         self.block / self.wave_cols
     }
     /// The K-reduction step, resolving the `0` sentinel (older literal builders) to
-    /// the default [`K_STEP`].
+    /// the default [`K_STEP`]. The resolved value must be a multiple of 16 (the WMMA
+    /// K-edge) and divide N; a violation panics in [`gemm_core`].
     pub const fn k_step(&self) -> usize {
         if self.k_step == 0 { K_STEP } else { self.k_step }
     }
@@ -242,6 +247,9 @@ pub fn matmul(a: &Tensor, b: &Tensor) -> crate::LaunchResult<Option<Tensor>> {
 /// the last accumulator's store; the rest stay scoped inside it by chaining
 /// their A-inputs through the prior accumulator's MFMA (a `RANGE` admits one
 /// `END`). The epilogue stores each accumulator to global C at its `reg`-block.
+///
+/// # Panics
+/// Panics on the same preconditions as [`gemm_core`].
 pub fn build_matmul_cfg(ker: &Kernel, n: usize, cfg: MatmulCfg) {
     build_matmul_cfg_k(ker, n, cfg, cfg.k_step());
 }
@@ -249,6 +257,9 @@ pub fn build_matmul_cfg(ker: &Kernel, n: usize, cfg: MatmulCfg) {
 /// [`build_matmul_cfg`] with an explicit `k_step` (the LDS strip depth / K-loop
 /// reduction step, replacing the hardcoded [`K_STEP`]). A thin wrapper that binds
 /// the square `n×n` bf16→f32 ABI and runs [`gemm_core`].
+///
+/// # Panics
+/// Panics on the same preconditions as [`gemm_core`].
 pub fn build_matmul_cfg_k(ker: &Kernel, n: usize, cfg: MatmulCfg, k_step: usize) {
     // ABI: output (c, f32) then inputs (a, b — bf16), fixed by construction. Tiles in
     // `gemm_core` are declared by ROLE via the scaffold shortcuts (`ker.acc`/`operand`/
@@ -267,6 +278,11 @@ pub fn build_matmul_cfg_k(ker: &Kernel, n: usize, cfg: MatmulCfg, k_step: usize)
 /// tracked `k_step`-strip K-loop out of XOR-swizzled LDS; a single `END` closes the
 /// loop around the last accumulator's store, the rest scoped inside by chaining their
 /// A-inputs through the prior accumulator's MMA.
+///
+/// # Panics
+/// Panics unless: `m` and `n` are each a multiple of `cfg.block`; `k_step` is a
+/// multiple of 16 (the WMMA K-edge); `k` is a multiple of `k_step`; and
+/// `cfg.wave_cols == cfg.wave_rows * cfg.n_accum`.
 #[allow(clippy::too_many_arguments)]
 pub fn gemm_core<'k>(
     ker: &'k Kernel,

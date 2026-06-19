@@ -85,22 +85,37 @@ impl<'k> Group<'k> {
     }
 
     /// `a + b` for tiles of identical shape.
+    ///
+    /// # Panics
+    /// Panics if `a` and `b` have different shapes.
     pub fn add<T: RegTile<'k>>(&self, a: T, b: &T) -> T {
         self.combine_tile(a, b, add)
     }
     /// `a - b` (`add(neg)`).
+    ///
+    /// # Panics
+    /// Panics if `a` and `b` have different shapes.
     pub fn sub<T: RegTile<'k>>(&self, a: T, b: &T) -> T {
         self.combine_tile(a, b, sub)
     }
     /// `a * b`.
+    ///
+    /// # Panics
+    /// Panics if `a` and `b` have different shapes.
     pub fn mul<T: RegTile<'k>>(&self, a: T, b: &T) -> T {
         self.combine_tile(a, b, mul)
     }
     /// `a / b` (`mul(recip)`).
+    ///
+    /// # Panics
+    /// Panics if `a` and `b` have different shapes.
     pub fn div<T: RegTile<'k>>(&self, a: T, b: &T) -> T {
         self.combine_tile(a, b, div)
     }
     /// `max(a, b)`.
+    ///
+    /// # Panics
+    /// Panics if `a` and `b` have different shapes.
     pub fn maximum<T: RegTile<'k>>(&self, a: T, b: &T) -> T {
         self.combine_tile(a, b, maximum)
     }

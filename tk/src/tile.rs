@@ -333,7 +333,12 @@ impl Kernel {
     }
 
     /// Allocate a shared-memory [`ST`] tile (tinygrad `ker.st`). `dims` is the
-    /// `(rows, cols)` block size; the LDS buffer is `height×width×base` flat.
+    /// `(rows, cols)` block size, tiled into a `height×width` grid of `base`
+    /// fragments; the LDS buffer is `height×width×base` flat.
+    ///
+    /// # Panics
+    /// Panics unless `rows` is a multiple of `base.base.rows`, `cols` a multiple
+    /// of `base.base.cols`, and `cols` a multiple of the per-thread element count.
     pub fn st(&self, dims: (usize, usize), dtype: DType, layout: TileLayout, base: STBaseShape) -> ST<'_> {
         let (rows, cols) = dims;
         assert_eq!(rows % base.base.rows, 0, "ST rows {rows} not a multiple of base {}", base.base.rows);
@@ -353,6 +358,10 @@ impl Kernel {
     /// software-pipelined K-loop. The returned tile has `base_offset = None`
     /// (it addresses half 0); the caller forms the two half-views with
     /// [`ST::with_base_offset`]`(parity * `[`ST::half_elems`]`())`.
+    ///
+    /// # Panics
+    /// Panics unless `rows` is a multiple of `base.base.rows`, `cols` a multiple
+    /// of `base.base.cols`, and `cols` a multiple of the per-thread element count.
     pub fn st_db(&self, dims: (usize, usize), dtype: DType, layout: TileLayout, base: STBaseShape) -> ST<'_> {
         let (rows, cols) = dims;
         assert_eq!(rows % base.base.rows, 0, "ST rows {rows} not a multiple of base {}", base.base.rows);
@@ -367,8 +376,12 @@ impl Kernel {
     }
 
     /// Allocate a register [`RT`] tile (tinygrad `ker.rt`). `dims` is the
-    /// `(rows, cols)` block size; the per-lane buffer is
-    /// `height×width×elements_per_thread` flat.
+    /// `(rows, cols)` block size, tiled into a `height×width` grid of `base`
+    /// fragments; the per-lane buffer is `height×width×elements_per_thread` flat.
+    ///
+    /// # Panics
+    /// Panics unless `rows` is a multiple of `base.base.rows` and `cols` a
+    /// multiple of `base.base.cols`.
     pub fn rt(&self, dims: (usize, usize), dtype: DType, layout: TileLayout, base: RTBaseShape) -> RT<'_> {
         let (rows, cols) = dims;
         assert_eq!(rows % base.base.rows, 0, "RT rows {rows} not a multiple of base {}", base.base.rows);
@@ -382,7 +395,12 @@ impl Kernel {
         RT { buf, shape, layout, base, elem: dtype, ker: self }
     }
 
-    /// Allocate a register vector [`RV`] tile (tinygrad `ker.rv`).
+    /// Allocate a register vector [`RV`] tile (tinygrad `ker.rv`). `length` is
+    /// the logical vector length, floored to a multiple of `base.base.rows`
+    /// (the per-fragment row count) to give the fragment-tile count.
+    ///
+    /// # Panics
+    /// Panics (divide-by-zero) if `base.base.rows == 0`.
     pub fn rv(&self, length: usize, dtype: DType, layout: VecLayout, base: RTBaseShape) -> RV<'_> {
         let tiles = length / base.base.rows;
         let (outer, inner) = match layout {

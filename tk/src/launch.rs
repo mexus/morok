@@ -206,6 +206,11 @@ impl CompiledLaunch {
     /// read `timestamps_ns()`. The 10 ns/tick CP stamp gives true on-device
     /// kernel time, free of host launch/submit overhead.
     ///
+    /// # Panics
+    ///
+    /// In a debug build, panics if the backend reports an end timestamp earlier
+    /// than the start (the `end - start` subtraction underflows).
+    ///
     /// # Safety
     ///
     /// Identical contract to [`CompiledLaunch::dispatch`]: the bound buffers
@@ -453,6 +458,27 @@ pub fn launch_custom(
 /// [`CompiledLaunch::dispatch`], excluding render/compile from the timed region.
 /// Outputs are written in place on each dispatch (the bound output buffer is
 /// registered to its tensor, so `out.as_vec()` reads the kernel's last write).
+///
+/// ```no_run
+/// use svod_tensor::Tensor;
+/// use svod_dtype::{AmdArch, DType};
+/// use svod_tk::{ArchCaps, compile_kernel};
+/// use svod_tk::kernels::matmul::{GFX1151_CFG, build_matmul_cfg};
+/// let n = 256usize;
+/// let a = Tensor::randn(&[n, n]).unwrap().cast(DType::BFloat16).unwrap();
+/// let b = Tensor::randn(&[n, n]).unwrap().cast(DType::BFloat16).unwrap();
+/// let mut c = Tensor::empty(&[n, n], DType::Float32);
+/// let cfg = GFX1151_CFG;
+/// let block = cfg.threads(ArchCaps::for_arch(AmdArch::Gfx1151).wave_size);
+/// // Render + compile ONCE …
+/// let compiled = compile_kernel("matmul", cfg.grid_dims(n), block, &mut [&mut c], &[&a, &b],
+///     move |ker| { build_matmul_cfg(ker, n, cfg); ker.finish(cfg.n_accum) }).unwrap();
+/// // … then re-dispatch in a hot loop (the timed region excludes compilation).
+/// for _ in 0..100 {
+///     // SAFETY: the bound buffers stay allocated for `compiled`'s lifetime.
+///     unsafe { compiled.dispatch(true) }.unwrap();
+/// }
+/// ```
 pub fn compile_kernel<F>(
     name: impl Into<String>,
     grid: [i64; 3],

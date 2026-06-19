@@ -77,9 +77,11 @@ fn fa_check_target(t: &Tensor) -> crate::LaunchResult<()> {
 /// derived from the input tensors, not a tuning choice.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FaConfig {
-    /// Per-warp Q-tile height (a multiple of the WMMA edge `16`).
+    /// Per-warp Q-tile height (a multiple of the WMMA edge `16`). A value not a
+    /// multiple of 16 panics the builder (the divisibility assert).
     pub q_blk: usize,
-    /// Per-warp KV super-block height (a multiple of `16`).
+    /// Per-warp KV super-block height (a multiple of `16`). A value not a multiple
+    /// of 16 panics the builder (the divisibility assert).
     pub kv_blk: usize,
     /// Emit the fully-unrolled (flat) QKᵀ/softmax/A·V body instead of the rolled loop.
     pub unroll: bool,
@@ -511,7 +513,20 @@ fn adaptive_fa_tile(b: usize, n: usize, h: usize) -> (usize, usize) {
 
 /// Run the rolled double-buffered multi-wave flash-attention forward into `o`
 /// ([`build_fa_mw_rdb`]). One rolled KV loop over a parity-indexed 2× LDS double
-/// buffer (one [`FaScratch`]); the per-warp tile is [`adaptive_fa_tile`].
+/// buffer (one [`FaScratch`]); the per-warp tile is [`adaptive_fa_tile`]. `o` is an
+/// **output parameter**: the result is written in place into the supplied tensor.
+///
+/// ```text
+/// let mut o = Tensor::empty(&[b, n, h, d], DType::BFloat16);
+/// flash_attention_forward_mw_rdb(&mut o, &q, &k, &v)?;
+/// // `o` now holds the attention output; read it with `o.as_vec::<bf16>()`.
+/// ```
+///
+/// # Panics
+/// Panics unless the head dim `D`, the per-warp `Q_BLK`/`KV_BLK` tiles, and `N`
+/// satisfy the builder's divisibility asserts (`D % 16`, `Q_BLK % 16`,
+/// `KV_BLK % 16`, `H % H_kv`, `N % (Q_BLK·NUM_WARPS)`), and unless the input
+/// shapes are statically known (concrete dims).
 pub fn flash_attention_forward_mw_rdb(o: &mut Tensor, q: &Tensor, k: &Tensor, v: &Tensor) -> crate::LaunchResult<()> {
     fa_check_target(q)?;
     let qs = q.shape().expect("q shape");

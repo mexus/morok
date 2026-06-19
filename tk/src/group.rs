@@ -267,11 +267,13 @@ pub struct Group<'k> {
 }
 
 impl Kernel {
-    /// A single-warp group (tinygrad `ker.warp`).
+    /// A single-warp [`Group`] (tinygrad `ker.warp`) — the `1×1` wave grid that owns
+    /// the per-lane register ops (`clear`/`copy`/`map`/`reduce`/`shuffle`/`mma`).
     pub fn warp(&self) -> Group<'_> {
         self.group_2d(1, 1)
     }
-    /// An `n`-warp group laid out `1×n` (tinygrad `ker.group`).
+    /// An `n`-warp [`Group`] laid out `1×n` (tinygrad `ker.group`) — `n` cooperating
+    /// waves for the collaborative GLOBAL→LDS fill.
     pub fn group(&self, n: usize) -> Group<'_> {
         self.group_2d(1, n)
     }
@@ -369,6 +371,9 @@ impl<'k> Group<'k> {
         self.clear(reg, f64::NEG_INFINITY)
     }
     /// Fill a register *vector* with `value` (the [`RV`] analog of [`clear`]).
+    ///
+    /// # Panics
+    /// Panics if the group has more than one warp.
     pub fn clear_rv(&self, rv: RV<'k>, value: f64) -> RV<'k> {
         assert_eq!(self.warps, 1, "clear_rv is a single-warp op");
         let (buf, shape, is_float, elem) =
@@ -380,20 +385,32 @@ impl<'k> Group<'k> {
         self.finalize_tile(rv, ended)
     }
     /// Zero a register vector.
+    ///
+    /// # Panics
+    /// Panics if the group has more than one warp.
     pub fn zero_rv(&self, rv: RV<'k>) -> RV<'k> {
         self.clear_rv(rv, 0.0)
     }
     /// Fill a register vector with `1`.
+    ///
+    /// # Panics
+    /// Panics if the group has more than one warp.
     pub fn ones_rv(&self, rv: RV<'k>) -> RV<'k> {
         self.clear_rv(rv, 1.0)
     }
     /// Fill a register vector with `-∞`.
+    ///
+    /// # Panics
+    /// Panics if the group has more than one warp.
     pub fn neg_inf_rv(&self, rv: RV<'k>) -> RV<'k> {
         self.clear_rv(rv, f64::NEG_INFINITY)
     }
 
     /// Copy `src` into `dst` element-wise (tinygrad `copy`), casting on a dtype
     /// mismatch. Generic over [`RT`]/[`RV`] (softmax copies a register vector).
+    ///
+    /// # Panics
+    /// Panics if `dst` and `src` have different shapes.
     pub fn copy<T: RegTile<'k>>(&self, dst: T, src: &T) -> T {
         // Per-lane register op: wave-safe (each wave copies its own RT).
         assert_eq!(dst.shape(), src.shape(), "copy: shape mismatch");
@@ -412,6 +429,10 @@ impl<'k> Group<'k> {
     /// Transpose `src` into `dst` element-wise (tinygrad `transpose`): write
     /// `src[h, w, inner]` to `dst[w, h, inner]`, casting on a dtype mismatch.
     /// Used by FA to swap a register fragment's height/width before a WMMA.
+    ///
+    /// # Panics
+    /// Panics if the tile rank is less than 3 (it permutes the leading
+    /// `[height, width, inner]` axes).
     pub fn transpose(&self, dst: RT<'k>, src: &RT<'k>) -> RT<'k> {
         // Per-lane register op: wave-safe (each wave transposes its own RT).
         let (sbuf, sshape, selem) = (self.anchor(src.uop()), src.shape().to_vec(), src.elem().clone());
@@ -456,6 +477,10 @@ impl<'k> Group<'k> {
     /// slot at this lane, `barrier`, then fold the three sibling 16-lane slots
     /// (`(laneid + (1+i)*16) % group_threads`) to complete the warp-wide reduce,
     /// and fold the result into `vec[height]`.
+    ///
+    /// # Panics
+    /// Panics if the tile rank is less than 3 (it reads the trailing
+    /// `[.., height, width, inner]` dims).
     pub fn row_reduce<F>(&self, vec: RV<'k>, src: &RT<'k>, op: F, init_value: f64) -> RV<'k>
     where
         F: Fn(&Arc<UOp>, &Arc<UOp>) -> Arc<UOp>,
@@ -467,6 +492,10 @@ impl<'k> Group<'k> {
     /// Reduce each column of `src` into `vec` (tinygrad `col_reduce`): the
     /// transpose of [`row_reduce`] — outer loop over column-tiles, accumulate
     /// over the `(height, inner)` elements.
+    ///
+    /// # Panics
+    /// Panics if the tile rank is less than 3, or if the group has more than one
+    /// warp.
     pub fn col_reduce<F>(&self, vec: RV<'k>, src: &RT<'k>, op: F, init_value: f64) -> RV<'k>
     where
         F: Fn(&Arc<UOp>, &Arc<UOp>) -> Arc<UOp>,
@@ -501,6 +530,10 @@ impl<'k> Group<'k> {
     /// LDS, no barrier). The shared foundation for `shuffle_xor`/`compare_exchange`
     /// (and, later, scan / arg-reduce). f32 (bitcast) and i32 transports are
     /// supported today; f16/bf16/i64 are a follow-up.
+    ///
+    /// # Panics
+    /// Panics if the group has more than one warp, or if `dst` and `src` have
+    /// different shapes.
     pub fn shuffle<F>(&self, dst: RT<'k>, src: &RT<'k>, src_lane: F) -> RT<'k>
     where
         F: Fn(&Arc<UOp>) -> Arc<UOp>,
@@ -520,6 +553,10 @@ impl<'k> Group<'k> {
     /// Butterfly exchange: `dst[pos] = src[pos]` from lane `laneid ^ mask`. Arch-blind
     /// — for any `mask < wave_size` the XOR partner stays in `[0, wave_size)`, so no
     /// modulus is needed (cheaper than [`Self::shuffle_down`]). The sort/reduce primitive.
+    ///
+    /// # Panics
+    /// Panics if `mask` is not in `1..wave_size`, if the group has more than one
+    /// warp, or if `dst` and `src` have different shapes.
     pub fn shuffle_xor(&self, dst: RT<'k>, src: &RT<'k>, mask: i64) -> RT<'k> {
         let w = self.ker.caps.wave_size as i64;
         assert!(mask > 0 && mask < w, "shuffle_xor mask {mask} must be in 1..{w}");
@@ -527,6 +564,10 @@ impl<'k> Group<'k> {
     }
 
     /// Shift down: `dst[L] = src[(L + delta) mod wave_size]`.
+    ///
+    /// # Panics
+    /// Panics if `delta` is not in `1..wave_size`, if the group has more than one
+    /// warp, or if `dst` and `src` have different shapes.
     pub fn shuffle_down(&self, dst: RT<'k>, src: &RT<'k>, delta: i64) -> RT<'k> {
         let w = self.ker.caps.wave_size as i64;
         assert!(delta > 0 && delta < w, "shuffle_down delta {delta} must be in 1..{w}");
@@ -534,6 +575,10 @@ impl<'k> Group<'k> {
     }
 
     /// Shift up: `dst[L] = src[(L - delta) mod wave_size]` (the scan primitive).
+    ///
+    /// # Panics
+    /// Panics if `delta` is not in `1..wave_size`, if the group has more than one
+    /// warp, or if `dst` and `src` have different shapes.
     pub fn shuffle_up(&self, dst: RT<'k>, src: &RT<'k>, delta: i64) -> RT<'k> {
         let w = self.ker.caps.wave_size as i64;
         assert!(delta > 0 && delta < w, "shuffle_up delta {delta} must be in 1..{w}");
@@ -544,6 +589,10 @@ impl<'k> Group<'k> {
     /// mask`: each lane keeps the min or max of its element and the partner's, per
     /// `dir` — the building block of sorting networks. Per element: one `ds_bpermute`
     /// gather + an ALU min/max select (no LDS, no barrier).
+    ///
+    /// # Panics
+    /// Panics if the group has more than one warp, if `dst` and `src` have
+    /// different shapes, or if `mask` is not in `1..wave_size`.
     pub fn compare_exchange(&self, dst: RT<'k>, src: &RT<'k>, mask: i64, dir: SwapDir) -> RT<'k> {
         assert_eq!(self.warps, 1, "compare_exchange is a single-warp op");
         assert_eq!(dst.shape(), src.shape(), "compare_exchange: shape mismatch");
@@ -745,24 +794,38 @@ impl<'k> Group<'k> {
     /// The operand tiles `a`/`b` must be **bf16 or f16** — the only 16×16×16
     /// matrix-core input dtypes. An operand of any other dtype panics (a kernel-
     /// authoring error). Accumulation is always f32; this precondition holds for
-    /// all four `mma_{ab,abt,atb,atbt}` variants.
+    /// all four `mma_{ab,abt,atb,atbt}` variants. Also panics unless the operand
+    /// tile's base is the 16-column WMMA base, and on an operand-rank mismatch
+    /// (the index permutation reads the trailing fragment-grid axes).
     pub fn mma_ab(&self, c: RT<'k>, a: &RT<'k>, b: &RT<'k>) -> RT<'k> {
         self.mma(c, a, b, false, false)
     }
 
     /// `C += A·Bᵀ` (tinygrad `mma_ABt`): B fragment is read transposed
     /// (`b[width, inner]`); reduce axis stays `a.shape[-2]`.
+    ///
+    /// # Panics
+    /// Panics on an unsupported operand dtype, unless the operand base is the
+    /// 16-column WMMA base, and on an operand-rank mismatch (see [`Self::mma_ab`]).
     pub fn mma_abt(&self, c: RT<'k>, a: &RT<'k>, b: &RT<'k>) -> RT<'k> {
         self.mma(c, a, b, false, true)
     }
 
     /// `C += Aᵀ·B` (tinygrad `mma_AtB`): A fragment is read transposed
     /// (`a[inner, height]`) and the reduce axis is `a.shape[-3]`.
+    ///
+    /// # Panics
+    /// Panics on an unsupported operand dtype, unless the operand base is the
+    /// 16-column WMMA base, and on an operand-rank mismatch (see [`Self::mma_ab`]).
     pub fn mma_atb(&self, c: RT<'k>, a: &RT<'k>, b: &RT<'k>) -> RT<'k> {
         self.mma(c, a, b, true, false)
     }
 
     /// `C += Aᵀ·Bᵀ` (tinygrad `mma_AtBt`): both fragments read transposed.
+    ///
+    /// # Panics
+    /// Panics on an unsupported operand dtype, unless the operand base is the
+    /// 16-column WMMA base, and on an operand-rank mismatch (see [`Self::mma_ab`]).
     pub fn mma_atbt(&self, c: RT<'k>, a: &RT<'k>, b: &RT<'k>) -> RT<'k> {
         self.mma(c, a, b, true, true)
     }
@@ -955,6 +1018,10 @@ impl<'k> Group<'k> {
     /// let b = ker.rt((16, 16), DType::Float32, TileLayout::Row, RT_16X16);
     /// let _ = g.load(a, b, MoveIdx::default()); // RT ← RT: no LoadInto impl ⇒ won't compile
     /// ```
+    ///
+    /// # Panics
+    /// A LOCAL→REG (`ST` → `RT`) load panics unless the REG tile fits within the
+    /// ST tile — its fragment-grid rows and cols must each be `<=` the ST's.
     pub fn load<Dst, Src>(&self, dst: Dst, src: Src, ix: MoveIdx<'_>) -> Src::Output
     where
         Src: LoadInto<'k, Dst>,
@@ -968,6 +1035,10 @@ impl<'k> Group<'k> {
     /// fill is visible) and before the next overwrite (the WAR edge); decoupling
     /// the fill from its sync lets the next block's GLOBAL loads issue *ahead* of
     /// the current block's compute, overlapping memory latency with the MFMA.
+    ///
+    /// # Panics
+    /// Panics if `axis` is out of range for the GLOBAL source's rank (the
+    /// row-stride is the product of the dims after `axis`).
     pub fn fill_local_nobar(&self, dst: ST<'k>, src: GL<'k>, idxs: &[Idx], axis: usize) -> ST<'k> {
         self.load_global_to_local(dst, &src, idxs, axis, false)
     }
@@ -978,6 +1049,10 @@ impl<'k> Group<'k> {
     /// the loaded (unswizzled) values in a flat `[total_calls, ept]` DEFINE_REG
     /// instead of LDS, so the load can be issued ahead of the consuming MFMAs.
     /// Commit it with [`Self::commit_reg_to_local`] (same `st`/`idxs`/`axis`).
+    ///
+    /// # Panics
+    /// Panics if `axis` is out of range for the GLOBAL source's rank (the
+    /// row-stride is the product of the dims after `axis`).
     pub fn stage_global_to_reg(&self, st: &ST<'k>, src: &GL<'k>, idxs: &[Idx], axis: usize) -> Arc<UOp> {
         let geom = self.lds_fill_geom(st);
         let row_stride: i64 = src.shape()[axis + 1..].iter().product::<usize>() as i64;
@@ -1044,8 +1119,16 @@ impl<'k> Group<'k> {
         self.finalize_st(st, stored)
     }
 
-    /// Move data out of `src` (tinygrad `Group.store`): REG→LOCAL (fragment
-    /// scatter) and REG→GLOBAL (coalesced write-back).
+    /// Move a register tile `src` out into `dst` (tinygrad `Group.store`), with the
+    /// legal address-space pair resolved at **compile time** via [`StoreInto`]:
+    /// RT→ST (fragment scatter, the layout-transpose hop) and RT→GLOBAL (coalesced
+    /// write-back). An illegal pair has no impl, so it is a compile error, not a
+    /// runtime panic. `ix` carries the wave/global `block` offset and the REG-side
+    /// `frag` offset; `ix.axis` is the global-tile row-stride split.
+    ///
+    /// # Panics
+    /// A REG→GLOBAL store panics if `ix.axis` is out of range for the GLOBAL
+    /// destination's rank (the row-stride is the product of the dims after it).
     pub fn store<Dst, Src>(&self, dst: Dst, src: Src, ix: MoveIdx<'_>) -> Src::Output
     where
         Src: StoreInto<'k, Dst>,
@@ -1206,6 +1289,12 @@ impl<'k> Group<'k> {
     /// a single `vec8` LDS store would split on the odd deltas, so we keep the
     /// wide *global* load but narrow the swizzled *LDS* store. Ends in a
     /// workgroup barrier (the matmul fill). bf16-only.
+    ///
+    /// # Panics
+    /// Panics unless the source element itemsize is 2 bytes (bf16), the `src` and
+    /// the destination ST element types match (no cast on this path), and the
+    /// swizzle period, base cols, ST cols, and source row-stride are all aligned
+    /// to the 128-bit vector width.
     pub fn fill_local_vec(&self, dst: ST<'k>, src: GL<'k>, idxs: &[Idx], axis: usize) -> ST<'k> {
         self.load_global_to_local_vec(dst, &src, idxs, axis, true)
     }

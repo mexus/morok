@@ -31,6 +31,8 @@ pub struct GlSpec {
 }
 
 impl GlSpec {
+    /// A GLOBAL-buffer spec (logical `shape` + element `dtype`) for ABI binding
+    /// via [`Kernel::bind_abi`].
     pub fn new(shape: &[usize], dtype: DType) -> Self {
         Self { shape: shape.to_vec(), dtype }
     }
@@ -96,6 +98,10 @@ impl Kernel {
 
     /// Build-time divisibility check with a uniform message (emits no UOps, so it is
     /// invisible to the graph fingerprint).
+    ///
+    /// # Panics
+    /// Panics if `value` is not divisible by `by` (its whole job — the message
+    /// names `what`). `by == 0` is a divide-by-zero.
     pub fn assert_divisible(value: usize, by: usize, what: &str) {
         assert_eq!(value % by, 0, "{what}: {value} must be a multiple of {by}");
     }

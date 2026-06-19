@@ -82,6 +82,9 @@ impl<'k> RT<'k> {
         self.ker().warp().exp2(self)
     }
     /// `max(self, other)` element-wise.
+    ///
+    /// # Panics
+    /// Panics if `self` and `other` have different shapes.
     pub fn maximum(self, other: &Self) -> Self {
         self.ker().warp().maximum(self, other)
     }
@@ -93,6 +96,9 @@ impl<'k> RV<'k> {
         self.ker().warp().exp2(self)
     }
     /// `max(self, other)` element-wise.
+    ///
+    /// # Panics
+    /// Panics if `self` and `other` have different shapes.
     pub fn maximum(self, other: &Self) -> Self {
         self.ker().warp().maximum(self, other)
     }
