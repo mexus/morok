@@ -486,6 +486,12 @@ pub(crate) fn build_fa_mw_rdb(
     let o_reg = lp.close_carry(o_reg);
     let norm_vec = norm_vec.after(&o_reg);
 
+    // Floor the softmax denominator: a fully key-masked query row (every key
+    // beyond `key_lens[b]`, incl. the legitimate inactive-lane case key_lens==0)
+    // has running sum 0, so the bare `o_reg / norm_vec` would be 0/0 = NaN. The
+    // clamp binds only when sum == 0, giving the natural zero output (matching the
+    // SDPA fallback) and leaving every real row bit-unchanged (sum ≫ tiny).
+    let norm_vec = warp.max_scalar(norm_vec, f64::MIN_POSITIVE);
     let o_reg = o_reg / &norm_vec;
     let o_reg_t = warp.transpose(o_reg_t, &o_reg);
     let o_idx = [Idx::from(&batch), Idx::from(&q_blk), Idx::from(&head), Idx::Const(0)];

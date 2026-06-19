@@ -109,6 +109,12 @@ fn prop_fa_vs_sdpa_amd() {
         dblk in 1usize..=4,
         causal in any::<bool>(),
         use_f16 in any::<bool>(),
+        masked in any::<bool>(),
+        // Per-lane valid-key fraction of 128; boundaries (0 = all keys masked,
+        // 128 = none) are weighted in so the key_lens==0 NaN-clamp and the
+        // unmasked-equivalent ends are both hit across the 24 cases.
+        frac0 in prop_oneof![Just(0i64), Just(128), 0i64..=128],
+        frac1 in prop_oneof![Just(0i64), Just(128), 0i64..=128],
     )| {
         let (n, d) = (nblk * 128, dblk * 16);
         let dtype = if use_f16 { DType::Float16 } else { DType::BFloat16 };
@@ -117,21 +123,46 @@ fn prop_fa_vs_sdpa_amd() {
         let k = randn_dt(&[bsz, n, h, d], dtype.clone());
         let v = randn_dt(&[bsz, n, h, d], dtype.clone());
 
-        let Some(got_t) = flash_attention_with(&q, &k, &v, FaOpts { causal, key_lens: None }).expect("fa build") else {
+        // Key-padding mask only on the non-causal path (matches production: the
+        // GigaAM encoder masks key positions, never both). Per-lane lens in [0,n].
+        let key_lens_vec: Option<Vec<i32>> = (masked && !causal).then(|| {
+            let mk = |frac: i64| ((frac * n as i64) / 128).clamp(0, n as i64) as i32;
+            (0..bsz).map(|i| if i == 0 { mk(frac0) } else { mk(frac1) }).collect()
+        });
+        let lens_t = key_lens_vec.as_ref().map(|kl| {
+            let mut t = Tensor::from_slice(kl.as_slice());
+            t.realize().expect("realize key_lens");
+            t
+        });
+
+        let Some(got_t) = flash_attention_with(&q, &k, &v, FaOpts { causal, key_lens: lens_t.as_ref() })
+            .expect("fa build")
+        else {
             return Ok(()); // shapes chosen to tile; the guard prevents an ineligible device
         };
         let got = to_f32_vec(got_t);
 
         // Independent reference: f32 SDPA in [B,H,N,D] layout, permuted back to [B,N,H,D].
+        // For the masked case, the same [B,1,1,N] `arange(N) >= lens[b]` key mask
+        // (true = masked) the kernel applies — an all-masked lane is a zero row on
+        // both sides (SDPA zero-fills, the kernel's denominator clamp yields 0).
         let perm = |t: &Tensor| t.cast(DType::Float32).expect("→f32").try_permute(&[0, 2, 1, 3]).expect("perm");
         let (qp, kp, vp) = (perm(&q), perm(&k), perm(&v));
-        let refb = qp.scaled_dot_product_attention().key(&kp).value(&vp).is_causal(causal).call().expect("sdpa");
+        let sdpa = qp.scaled_dot_product_attention().key(&kp).value(&vp);
+        let refb = if let Some(kl) = &key_lens_vec {
+            let range = Tensor::arange(n as i64, None, None).expect("arange").try_reshape([1usize, 1, 1, n]).expect("reshape");
+            let lref = Tensor::from_slice(kl.as_slice()).try_reshape([bsz, 1, 1, 1]).expect("reshape lens");
+            let mask = range.try_ge(&lref).expect("ge mask");
+            sdpa.is_causal(false).attn_mask(&mask).call().expect("sdpa masked")
+        } else {
+            sdpa.is_causal(causal).call().expect("sdpa")
+        };
         let exp = to_f32_vec(refb.try_permute(&[0, 2, 1, 3]).expect("perm back"));
 
         // QKᵀ reduces over D; softmax-weighted PV ~O(1). Scale the atol floor with √D.
         let (atol, rtol) = (0.02 * (d as f32).sqrt(), 3e-2);
         let r = allclose_f32(&got, &exp, atol, rtol);
-        prop_assert!(r.ok, "fa b={bsz} n={n} h={h} d={d} causal={causal} f16={use_f16}: {}", r.message);
+        prop_assert!(r.ok, "fa b={bsz} n={n} h={h} d={d} causal={causal} f16={use_f16} key_lens={key_lens_vec:?}: {}", r.message);
     });
 }
 

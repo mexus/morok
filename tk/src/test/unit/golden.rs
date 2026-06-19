@@ -27,15 +27,28 @@ fn matmul_sink() -> Arc<UOp> {
     ker.finish(M1_CFG.n_accum)
 }
 
-fn fa_sink() -> Arc<UOp> {
-    let (b, h, h_kv, d, n) = (1usize, 2usize, 2usize, 64usize, 128usize);
-    let bufs = vec![
+/// FA dims shared by the golden builders. `o,q,k,v` are bf16; the masked variant
+/// appends a 5th `[B]` i32 `key_lens` global.
+const FA_DIMS: (usize, usize, usize, usize, usize) = (1, 2, 2, 64, 128); // (b, h, h_kv, d, n)
+
+fn fa_bufs(masked: bool) -> Vec<Arc<UOp>> {
+    let (b, h, h_kv, d, n) = FA_DIMS;
+    let mut bufs = vec![
         UOp::new_buffer(DeviceSpec::Cpu, b * n * h * d, DType::BFloat16),
         UOp::new_buffer(DeviceSpec::Cpu, b * n * h * d, DType::BFloat16),
         UOp::new_buffer(DeviceSpec::Cpu, b * n * h_kv * d, DType::BFloat16),
         UOp::new_buffer(DeviceSpec::Cpu, b * n * h_kv * d, DType::BFloat16),
     ];
-    let ker = Kernel::new("fa_mw_rdb", [h as i64, (n / 16 / 8) as i64, b as i64], 8 * 64, bufs, ArchCaps::GFX942);
+    if masked {
+        bufs.push(UOp::new_buffer(DeviceSpec::Cpu, b, DType::Int32)); // key_lens [B], trailing
+    }
+    bufs
+}
+
+fn fa_sink_cfg(causal: bool, masked: bool) -> Arc<UOp> {
+    let (b, h, h_kv, d, n) = FA_DIMS;
+    let ker =
+        Kernel::new("fa_mw_rdb", [h as i64, (n / 16 / 8) as i64, b as i64], 8 * 64, fa_bufs(masked), ArchCaps::GFX942);
     build_fa_mw_rdb(
         &ker,
         b,
@@ -43,11 +56,15 @@ fn fa_sink() -> Arc<UOp> {
         h,
         h_kv,
         d,
-        FaConfig { q_blk: 16, kv_blk: 16, ..Default::default() },
+        FaConfig { q_blk: 16, kv_blk: 16, causal, ..Default::default() },
         DType::BFloat16,
-        false,
+        masked,
     );
     ker.finish(1)
+}
+
+fn fa_sink() -> Arc<UOp> {
+    fa_sink_cfg(true, false)
 }
 
 // Committed gfx942 golden digests. Update ONLY for an intentional graph change.
@@ -56,8 +73,16 @@ fn fa_sink() -> Arc<UOp> {
 // numerically on gfx942 (matmul *_amd) + gfx1151/395.
 const MATMUL_DIGEST: u128 = 0x6698_e812_748b_1ec0_0000_0000_0000_0000;
 const MATMUL_NODES: usize = 483;
-const FA_DIGEST: u128 = 0x9d50_df63_2af9_357f_0000_0000_0000_0000;
-const FA_NODES: usize = 878;
+// Re-baked: the softmax-denominator clamp (`norm_vec.max(tiny)`, FA NaN fix) adds
+// the floor const + max over the running-sum vector to every FA graph (was 878).
+const FA_DIGEST: u128 = 0x3694_0109_9ce8_f303_0000_0000_0000_0000;
+const FA_NODES: usize = 888;
+// Non-causal and non-causal+key-masked build variants (pin the `causal:false` and
+// `key_lens:Some` branches GPU-free).
+const FA_NONCAUSAL_DIGEST: u128 = 0xd3a8_e181_a1cf_1a65_0000_0000_0000_0000;
+const FA_NONCAUSAL_NODES: usize = 864;
+const FA_MASKED_DIGEST: u128 = 0x8bde_914f_ba33_bf4b_0000_0000_0000_0000;
+const FA_MASKED_NODES: usize = 887;
 
 fn check(name: &str, sink: Arc<UOp>, digest: u128, nodes: usize) {
     let fp = kernel_fingerprint(&sink);
@@ -80,6 +105,16 @@ fn golden_matmul_cfg() {
 #[test]
 fn golden_fa_mw_rdb() {
     check("fa_mw_rdb", fa_sink(), FA_DIGEST, FA_NODES);
+}
+
+#[test]
+fn golden_fa_mw_rdb_noncausal() {
+    check("fa_mw_rdb[noncausal]", fa_sink_cfg(false, false), FA_NONCAUSAL_DIGEST, FA_NONCAUSAL_NODES);
+}
+
+#[test]
+fn golden_fa_mw_rdb_masked() {
+    check("fa_mw_rdb[noncausal,masked]", fa_sink_cfg(false, true), FA_MASKED_DIGEST, FA_MASKED_NODES);
 }
 
 /// The fingerprint is invariant to the global id counter: building the same kernel
