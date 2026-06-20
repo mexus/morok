@@ -182,7 +182,10 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec<Stri
             let ltype = ldt(&lhs.dtype());
             let rtype = ldt(&rhs.dtype());
 
-            // Debug: detect type mismatch (logged via tracing)
+            // Detect type mismatch: emitting `op T %l, %r` with mismatched operand
+            // types is invalid LLVM IR that the assembler rejects later. Surface it
+            // as a typed error here (with full diagnostic context via tracing) rather
+            // than producing a kernel that fails to compile.
             if ltype != rtype {
                 tracing::error!(
                     uop_id = uop.id,
@@ -196,6 +199,16 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec<Stri
                     rhs_op = ?rhs.op().as_ref(),
                     "Binary op type mismatch - lhs and rhs have different dtypes"
                 );
+                ctx.set_invalid_graph(format!(
+                    "binary {op:?} on uop {} has mismatched operand LLVM types ({ltype} vs {rtype}); \
+                     lhs uop {} ({:?}), rhs uop {} ({:?})",
+                    uop.id,
+                    lhs.id,
+                    lhs.dtype(),
+                    rhs.id,
+                    rhs.dtype(),
+                ));
+                return None;
             }
 
             if matches!(op, BinaryOp::Max) {
@@ -480,9 +493,11 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec<Stri
         }
 
         Op::PtrCat { .. } => {
-            panic!(
-                "PtrCat must be eliminated before codegen (devectorize should distribute it into scalar loads/stores)"
-            );
+            ctx.set_invalid_graph(format!(
+                "PtrCat on uop {} reached LLVM codegen; devectorize should distribute it into scalar loads/stores",
+                uop.id
+            ));
+            None
         }
 
         Op::Contract { src, .. } | Op::Unroll { src, .. } | Op::Detach { src } => {
@@ -672,17 +687,21 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec<Stri
         }
 
         op if op.is_movement() => {
-            panic!(
-                "movement op {:?} (id={}) reached LLVM codegen — \
-                 should have been eliminated during rangeify. \
-                 This indicates a bug in remove_movement_op or apply_bufferize_transform.",
-                std::mem::discriminant(op),
+            // Movement ops must be eliminated during rangeify (remove_movement_op /
+            // apply_bufferize_transform). Reaching codegen means the graph is malformed.
+            ctx.set_invalid_graph(format!(
+                "movement op {} (uop {}) reached LLVM codegen; should have been eliminated during rangeify",
+                op.as_ref(),
                 uop.id,
-            );
+            ));
+            None
         }
 
-        _ => {
-            kernel.push(format!("; UNSUPPORTED: {:?}", uop.op()));
+        op => {
+            // An op variant the LLVM backend has no lowering for. Surface it as a
+            // typed error instead of emitting a comment + None that would detonate
+            // later when a consumer calls `ctx.get` on this missing value.
+            ctx.set_unsupported_op(op.as_ref());
             None
         }
     }

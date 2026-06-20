@@ -67,6 +67,14 @@ impl RenderContext {
         }
     }
 
+    /// Record an `UnsupportedOp` error from a renderer op handler that reached an
+    /// op variant it cannot lower.
+    pub fn set_unsupported_op(&mut self, op: impl Into<String>) {
+        if self.pending_error.is_none() {
+            self.pending_error = Some(crate::Error::UnsupportedOp { op: op.into() });
+        }
+    }
+
     /// Drain any error recorded via [`Self::set_invalid_graph`].
     pub fn take_error(&mut self) -> Option<crate::Error> {
         self.pending_error.take()
