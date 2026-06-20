@@ -105,7 +105,7 @@ fn test_devectorize_reduction_accumulator() {
 
     // Add to accumulator
     let values = create_vector_float_iota(4);
-    let add = UOp::new(Op::Binary(BinaryOp::Add, acc_load, values), DType::Float32.vec(4));
+    let add = UOp::new(Op::Binary(BinaryOp::Add, acc_load, values), DType::Float32.vec(4).unwrap());
 
     // Store back
     let store_index = create_vector_index_iota(buffer.clone(), 4);
@@ -135,7 +135,7 @@ fn test_devectorize_multiple_buffers() {
     let load_b = UOp::load().buffer(buffer_b.clone()).index(index_b).call();
 
     // Compute A + B
-    let add = UOp::new(Op::Binary(BinaryOp::Add, load_a, load_b), DType::Float32.vec(4));
+    let add = UOp::new(Op::Binary(BinaryOp::Add, load_a, load_b), DType::Float32.vec(4).unwrap());
 
     // Store to C
     let index_c = create_vector_index_iota(buffer_c.clone(), 4);
@@ -165,7 +165,7 @@ fn test_devectorize_after_pre_expand() {
     let index = create_vector_index_iota(buffer.clone(), 4);
     let load = UOp::load().buffer(buffer.clone()).index(index).call();
     let value = create_vector_float_iota(4);
-    let add = UOp::new(Op::Binary(BinaryOp::Add, load, value), DType::Float32.vec(4));
+    let add = UOp::new(Op::Binary(BinaryOp::Add, load, value), DType::Float32.vec(4).unwrap());
 
     let store_index = create_vector_index_iota(buffer.clone(), 4);
     let store = store_index.store(add);

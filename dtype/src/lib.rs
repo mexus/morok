@@ -327,42 +327,46 @@ impl ScalarDType {
     /// (exponent_bits, mantissa_bits) for float types.
     /// Matches Tinygrad's `dtypes.finfo()`.
     ///
-    /// Float-only invariant: callers establish float-ness first (e.g. an
-    /// `is_float()` guard, or an FP8/float construction context), so a
-    /// non-float here signals a caller bug, not user input. Panics in that case.
-    pub const fn finfo(&self) -> (u32, u32) {
+    /// Float-only: returns `None` for a non-float type. Callers establish
+    /// float-ness first (an `is_float()` guard, or an FP8/float construction
+    /// context), so a non-float here signals a caller bug, not user input.
+    pub const fn finfo(&self) -> Option<(u32, u32)> {
         match self {
-            Self::FP8E4M3 => (4, 3),
-            Self::FP8E5M2 => (5, 2),
-            Self::Float16 => (5, 10),
-            Self::BFloat16 => (8, 7),
-            Self::Float32 => (8, 23),
-            Self::Float64 => (11, 52),
-            _ => panic!("finfo: not a float type (caller must guard with is_float)"),
+            Self::FP8E4M3 => Some((4, 3)),
+            Self::FP8E5M2 => Some((5, 2)),
+            Self::Float16 => Some((5, 10)),
+            Self::BFloat16 => Some((8, 7)),
+            Self::Float32 => Some((8, 23)),
+            Self::Float64 => Some((11, 52)),
+            _ => None,
         }
     }
 
     /// Exponent bias: `(1 << (exp_bits - 1)) - 1`.
     ///
-    /// Float-only invariant (inherited from [`finfo`](Self::finfo)): panics on a
+    /// Float-only (inherited from [`finfo`](Self::finfo)): returns `None` for a
     /// non-float type; callers establish float-ness first.
-    pub const fn exponent_bias(&self) -> i32 {
-        let (e, _) = self.finfo();
-        (1 << (e - 1)) - 1
+    pub const fn exponent_bias(&self) -> Option<i32> {
+        // const fn cannot use `?`; match the Option from `finfo` explicitly.
+        let (e, _) = match self.finfo() {
+            Some(v) => v,
+            None => return None,
+        };
+        Some((1 << (e - 1)) - 1)
     }
 
     /// Map float dtype to uint storage equivalent of the same bit width.
     ///
-    /// Float-only invariant: callers establish float-ness first (e.g. an
-    /// `is_float()` guard, or an FP8/float construction context), so a
-    /// non-float here signals a caller bug, not user input. Panics in that case.
-    pub const fn float_to_uint(&self) -> ScalarDType {
+    /// Float-only: returns `None` for a non-float type. Callers establish
+    /// float-ness first (an `is_float()` guard, or an FP8/float construction
+    /// context), so a non-float here signals a caller bug, not user input.
+    pub const fn float_to_uint(&self) -> Option<ScalarDType> {
         match self {
-            Self::FP8E4M3 | Self::FP8E5M2 => Self::UInt8,
-            Self::Float16 | Self::BFloat16 => Self::UInt16,
-            Self::Float32 => Self::UInt32,
-            Self::Float64 => Self::UInt64,
-            _ => panic!("float_to_uint: not a float type (caller must guard with is_float)"),
+            Self::FP8E4M3 | Self::FP8E5M2 => Some(Self::UInt8),
+            Self::Float16 | Self::BFloat16 => Some(Self::UInt16),
+            Self::Float32 => Some(Self::UInt32),
+            Self::Float64 => Some(Self::UInt64),
+            _ => None,
         }
     }
 
@@ -393,27 +397,27 @@ impl DType {
     /// Construction invariant: callers vectorize a scalar/void or a scalar
     /// pointer (often behind a `count > 1` guard). Re-vectorizing an already-
     /// vectorized type to a *different* count is a graph-construction bug and
-    /// panics; re-vectorizing to the *same* count is idempotent (see `Ptr`
-    /// arms below). `count == 1` is the identity.
-    pub fn vec(&self, count: usize) -> Self {
+    /// returns `None` (callers attach their own context); re-vectorizing to the
+    /// *same* count is idempotent (see `Ptr` arms below). `count == 1` is the
+    /// identity.
+    pub fn vec(&self, count: usize) -> Option<Self> {
         if count == 1 {
-            return self.clone();
+            return Some(self.clone());
         }
 
         match self {
-            Self::Scalar(s) if !matches!(s, ScalarDType::Void) => Self::Vector { scalar: *s, count },
-            Self::Vector { .. } => panic!("Cannot vectorize an already vectorized type"),
+            Self::Scalar(s) if !matches!(s, ScalarDType::Void) => Some(Self::Vector { scalar: *s, count }),
+            Self::Vector { .. } => None,
             Self::Ptr { vcount: 1, base, addrspace, size } => {
-                Self::Ptr { base: base.clone(), addrspace: *addrspace, size: *size, vcount: count }
+                Some(Self::Ptr { base: base.clone(), addrspace: *addrspace, size: *size, vcount: count })
             }
             // Already vectorized to target count — idempotent (transient state during
             // graph rewrite when VECTORIZE(CAST(buf)) is reconstructed before the
             // INDEX(VECTORIZE(CAST(...))) pattern consumes it).
-            Self::Ptr { vcount, .. } if *vcount == count => self.clone(),
-            Self::Ptr { vcount, .. } => {
-                panic!("Cannot vectorize an already vectorized pointer (vcount={vcount}) to different count ({count})")
-            }
-            _ => self.clone(),
+            Self::Ptr { vcount, .. } if *vcount == count => Some(self.clone()),
+            // Re-vectorizing a pointer to a different count is a construction bug.
+            Self::Ptr { .. } => None,
+            _ => Some(self.clone()),
         }
     }
 
@@ -421,11 +425,12 @@ impl DType {
     ///
     /// Construction invariant: callers build a pointer from a scalar/void/vector
     /// base (e.g. `DType::Float32.ptr(..)`, `DType::Void.ptr(..)`), never from a
-    /// pointer. A pointer-to-pointer is a graph-construction bug and panics.
-    pub fn ptr(self, size: Option<usize>, addrspace: AddrSpace) -> Self {
+    /// pointer. A pointer-to-pointer is a graph-construction bug, so this returns
+    /// `None` for a pointer receiver, letting callers attach their own context.
+    pub fn ptr(self, size: Option<usize>, addrspace: AddrSpace) -> Option<Self> {
         match self {
-            Self::Ptr { .. } => panic!("Cannot make a pointer from a pointer"),
-            _ => Self::Ptr { base: Box::new(self), addrspace, size, vcount: 1 },
+            Self::Ptr { .. } => None,
+            _ => Some(Self::Ptr { base: Box::new(self), addrspace, size, vcount: 1 }),
         }
     }
 
@@ -466,7 +471,7 @@ impl DType {
     /// ```
     /// use svod_dtype::DType;
     ///
-    /// let vec_dtype = DType::Float32.vec(4);
+    /// let vec_dtype = DType::Float32.vec(4).unwrap();
     /// assert_eq!(vec_dtype.scalar_dtype(), DType::Float32);
     ///
     /// // Enable chaining: dtype.scalar_dtype().vec(new_count)
@@ -482,7 +487,11 @@ impl DType {
     /// Useful for type conversions like bool→uint8 where the structure is preserved.
     pub fn with_base(&self, new_base: ScalarDType) -> Self {
         let count = self.vcount();
-        if count > 1 { Self::Scalar(new_base).vec(count) } else { Self::Scalar(new_base) }
+        if count > 1 {
+            Self::Scalar(new_base).vec(count).expect("with_base receiver is a fresh scalar")
+        } else {
+            Self::Scalar(new_base)
+        }
     }
 
     /// For Ptr types: replace the base dtype while preserving addrspace, size, and vcount.

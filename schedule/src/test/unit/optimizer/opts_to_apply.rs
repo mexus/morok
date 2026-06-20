@@ -11,8 +11,8 @@ use crate::optimizer::{Renderer, optimize_kernel_with_config};
 /// Build a hand-ranged `out[i] = in[i] + 1` SINK over PARAM buffers, marked
 /// with the given `opts_to_apply`. Mirrors a `Tensor::custom_kernel` body.
 fn hand_ranged_sink(n: i64, opts_to_apply: Option<Vec<Opt>>) -> std::sync::Arc<UOp> {
-    let out_buf = UOp::param(0, n as usize, DType::Float32.ptr(Some(n as usize), AddrSpace::Global), None);
-    let in_buf = UOp::param(1, n as usize, DType::Float32.ptr(Some(n as usize), AddrSpace::Global), None);
+    let out_buf = UOp::param(0, n as usize, DType::Float32.ptr(Some(n as usize), AddrSpace::Global).unwrap(), None);
+    let in_buf = UOp::param(1, n as usize, DType::Float32.ptr(Some(n as usize), AddrSpace::Global).unwrap(), None);
     let i = UOp::range_const(n, 0);
     let in_idx = UOp::index().buffer(in_buf.clone()).indices(vec![i.clone()]).ptr(true).call().unwrap();
     let loaded = UOp::load().buffer(in_buf).index(in_idx).call();

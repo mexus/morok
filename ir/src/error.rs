@@ -147,6 +147,11 @@ pub enum Error {
     #[snafu(display("VECTORIZE elements have mismatched dtypes: expected {expected:?}, got {actual:?}"))]
     VectorizeDTypeMismatch { expected: DType, actual: DType },
 
+    /// Element/source dtype cannot be vectorized to the requested count
+    /// (already a vector, or a pointer vectorized to a conflicting count).
+    #[snafu(display("dtype {dtype:?} cannot be vectorized to count {count}"))]
+    NotVectorizable { dtype: DType, count: usize },
+
     /// GEP index out of bounds.
     #[snafu(display("GEP index {index} out of bounds for vector with {vcount} elements"))]
     GepIndexOutOfBounds { index: usize, vcount: usize },

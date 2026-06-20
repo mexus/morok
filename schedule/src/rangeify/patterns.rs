@@ -1073,7 +1073,7 @@ pub fn to_param_patterns() -> TypedPatternMatcher<RangeifyBufferContext> {
         @context RangeifyBufferContext;
         // Buffer → codegen PARAM
         buf @ Buffer { size, unique: _ } => |buf, size, ctx| {
-            let ptr_dtype = extract_base_dtype(buf.dtype()).ptr(Some(*size), AddrSpace::Global);
+            let ptr_dtype = extract_base_dtype(buf.dtype()).ptr(Some(*size), AddrSpace::Global)?;
             let replacement = UOp::param(ctx.next_global(), *size, ptr_dtype, None);
             ctx.map_buffer(buf.clone(), replacement.clone());
             Some(replacement)
@@ -1127,7 +1127,7 @@ pub fn local_to_param_patterns() -> TypedPatternMatcher<LocalAddBufferContext> {
         @context LocalAddBufferContext;
         // Buffer → codegen PARAM.
         buf @ Buffer { size, unique: _ } => |buf, size, ctx| {
-            let ptr_dtype = extract_base_dtype(buf.dtype()).ptr(Some(*size), AddrSpace::Global);
+            let ptr_dtype = extract_base_dtype(buf.dtype()).ptr(Some(*size), AddrSpace::Global)?;
             let replacement = UOp::param(ctx.next_param_slot(), *size, ptr_dtype, None);
             if !ctx.has_buffer(buf) {
                 ctx.map_buffer(buf.clone(), buf.clone());
@@ -1137,7 +1137,7 @@ pub fn local_to_param_patterns() -> TypedPatternMatcher<LocalAddBufferContext> {
         // Pre-kernel Param (device: Some) → codegen PARAM (device: None)
         // Guard: skip codegen PARAMs (device: None) to prevent infinite loop
         buf @ Param { slot: _, size } if matches!(buf.op(), Op::Param { device: Some(_), .. }) => |buf, size, ctx| {
-            let ptr_dtype = extract_base_dtype(buf.dtype()).ptr(Some(*size), AddrSpace::Global);
+            let ptr_dtype = extract_base_dtype(buf.dtype()).ptr(Some(*size), AddrSpace::Global)?;
             let replacement = UOp::param(ctx.next_param_slot(), *size, ptr_dtype, None);
             if !ctx.has_buffer(buf) {
                 ctx.map_buffer(buf.clone(), buf.clone());
@@ -1562,7 +1562,7 @@ fn apply_reduce_binary(reduce_op: ReduceOp, a: Arc<UOp>, b: Arc<UOp>, dtype: &DT
             // Comparison dtype must match operand vector width:
             // - Scalar operands -> DType::Bool
             // - Vector operands -> DType::Bool.vec(vcount)
-            let cond_dtype = DType::Bool.vec(dtype.vcount());
+            let cond_dtype = DType::Bool.vec(dtype.vcount()).expect("Bool is a scalar");
             let cond = UOp::new(Op::Binary(BinaryOp::Lt, a.clone(), b.clone()), cond_dtype);
             UOp::try_where(cond, a, b).unwrap()
         }
@@ -2832,8 +2832,11 @@ pub fn pm_half_bf16_cast() -> &'static TypedPatternMatcher<()> {
             && x.dtype().base() != src.dtype().base()
         => {
             let vc = x.dtype().vcount();
-            let (f32t, u32t) = (DType::Scalar(ScalarDType::Float32).vec(vc), DType::Scalar(ScalarDType::UInt32).vec(vc));
-            let u16t = DType::Scalar(ScalarDType::UInt16).vec(vc);
+            let (f32t, u32t) = (
+                DType::Scalar(ScalarDType::Float32).vec(vc).expect("scalar dtype is vectorizable"),
+                DType::Scalar(ScalarDType::UInt32).vec(vc).expect("scalar dtype is vectorizable"),
+            );
+            let u16t = DType::Scalar(ScalarDType::UInt16).vec(vc).expect("scalar dtype is vectorizable");
             if x.dtype().base() == ScalarDType::BFloat16 {
                 // f16 → f32 (fpext) → RNE-round the low 16 bits → bf16 payload.
                 let bits = src.cast(f32t).bitcast(u32t.clone());

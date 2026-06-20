@@ -10,14 +10,14 @@ fn test_ldt_scalar() {
 
 #[test]
 fn test_ldt_vector() {
-    assert_eq!(ldt(&DType::Float32.vec(4)), "<4 x float>");
-    assert_eq!(ldt(&DType::Int32.vec(8)), "<8 x i32>");
+    assert_eq!(ldt(&DType::Float32.vec(4).unwrap()), "<4 x float>");
+    assert_eq!(ldt(&DType::Int32.vec(8).unwrap()), "<8 x i32>");
 }
 
 #[test]
 fn test_ldt_ptr() {
-    assert_eq!(ldt(&DType::Float32.ptr(None, AddrSpace::Global)), "ptr");
-    assert_eq!(ldt(&DType::Int32.vec(4).ptr(None, AddrSpace::Global)), "ptr");
+    assert_eq!(ldt(&DType::Float32.ptr(None, AddrSpace::Global).unwrap()), "ptr");
+    assert_eq!(ldt(&DType::Int32.vec(4).unwrap().ptr(None, AddrSpace::Global).unwrap()), "ptr");
 }
 
 #[test]

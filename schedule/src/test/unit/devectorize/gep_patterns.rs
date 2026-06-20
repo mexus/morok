@@ -273,7 +273,7 @@ fn test_where_devectorize() {
     let t_val = create_vector_float_iota(4);
     let f_val = create_vector_float_values(vec![10.0, 11.0, 12.0, 13.0]);
 
-    let where_op = UOp::new(Op::Ternary(TernaryOp::Where, cond, t_val, f_val), DType::Float32.vec(4));
+    let where_op = UOp::new(Op::Ternary(TernaryOp::Where, cond, t_val, f_val), DType::Float32.vec(4).unwrap());
 
     let result = apply_pm_render(&where_op);
 
@@ -322,7 +322,7 @@ fn test_where_scalar_unchanged() {
 #[test]
 fn test_gep_through_cast() {
     let vec = create_vector_float_iota(4);
-    let cast = vec.cast(DType::Int64.vec(4));
+    let cast = vec.cast(DType::Int64.vec(4).unwrap());
     let gep = cast.gep(vec![1]);
 
     let result = apply_pm_render(&gep);

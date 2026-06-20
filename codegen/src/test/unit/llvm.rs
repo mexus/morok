@@ -160,7 +160,7 @@ fn test_reduce_empty_ranges() {
 
 #[test]
 fn test_multi_index_requires_linearization() {
-    let ptr_dtype = DType::Float32.ptr(None, svod_dtype::AddrSpace::Global);
+    let ptr_dtype = DType::Float32.ptr(None, svod_dtype::AddrSpace::Global).unwrap();
     let buffer = UOp::param(0, 1024, ptr_dtype, None);
     let i = UOp::const_(DType::Index, ConstValue::Int(1));
     let j = UOp::const_(DType::Index, ConstValue::Int(2));

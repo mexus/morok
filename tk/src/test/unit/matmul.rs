@@ -53,8 +53,8 @@ fn test_mma_ab_wmma_graph_shape() {
     let wmmas: Vec<_> = out.uop().toposort().into_iter().filter(|u| matches!(u.op(), Op::Wmma { .. })).collect();
     assert_eq!(wmmas.len(), 1, "exactly one symbolic WMMA per K-iteration");
 
-    let bf16x4 = DType::BFloat16.vec(4);
-    let f32x4 = DType::Float32.vec(4);
+    let bf16x4 = DType::BFloat16.vec(4).unwrap();
+    let f32x4 = DType::Float32.vec(4).unwrap();
     let Op::Wmma { a: wa, b: wb, c: wc, metadata } = wmmas[0].op() else { unreachable!() };
     assert_eq!(wa.dtype(), bf16x4, "A operand is bf16.vec(4)");
     assert_eq!(wb.dtype(), bf16x4, "B operand is bf16.vec(4)");

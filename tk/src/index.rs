@@ -149,5 +149,5 @@ pub fn load_vec(buf: &Arc<UOp>, offset: Arc<UOp>, lanes: usize) -> Arc<UOp> {
         DType::Ptr { base, .. } => (*base).clone(),
         dt => dt,
     };
-    UOp::load().buffer(buf.clone()).index(idx).dtype(elem.vec(lanes)).call()
+    UOp::load().buffer(buf.clone()).index(idx).dtype(elem.vec(lanes).expect("load_vec element must be a scalar")).call()
 }

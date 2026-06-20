@@ -94,7 +94,7 @@ fn test_reduce_empty_ranges() {
 
 #[test]
 fn test_multi_index_requires_linearization() {
-    let ptr_dtype = DType::Float32.ptr(None, svod_dtype::AddrSpace::Global);
+    let ptr_dtype = DType::Float32.ptr(None, svod_dtype::AddrSpace::Global).unwrap();
     let buffer = UOp::param(0, 1024, ptr_dtype, None);
     let i = UOp::const_(DType::Index, ConstValue::Int(1));
     let j = UOp::const_(DType::Index, ConstValue::Int(2));
@@ -112,7 +112,7 @@ fn test_multi_index_requires_linearization() {
 
 #[test]
 fn test_gated_load_with_casted_index_emits_conditional() {
-    let ptr_dtype = DType::Float32.ptr(None, svod_dtype::AddrSpace::Global);
+    let ptr_dtype = DType::Float32.ptr(None, svod_dtype::AddrSpace::Global).unwrap();
     let buffer = UOp::param(0, 1024, ptr_dtype.clone(), None);
     let out = UOp::param(1, 1024, ptr_dtype, None);
     let idx = UOp::const_(DType::Index, ConstValue::Int(1));
@@ -131,7 +131,7 @@ fn test_gated_load_with_casted_index_emits_conditional() {
 
 #[test]
 fn test_gated_load_requires_alt() {
-    let ptr_dtype = DType::Float32.ptr(None, svod_dtype::AddrSpace::Global);
+    let ptr_dtype = DType::Float32.ptr(None, svod_dtype::AddrSpace::Global).unwrap();
     let buffer = UOp::param(0, 1024, ptr_dtype, None);
     let idx = UOp::const_(DType::Index, ConstValue::Int(1));
     let gate = UOp::const_(DType::Bool, ConstValue::Bool(true));

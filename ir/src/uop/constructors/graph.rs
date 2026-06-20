@@ -205,7 +205,9 @@ impl UOp {
         let size = concrete_shape.iter().product::<usize>().max(1);
         let dtype = match anchor.dtype() {
             DType::Ptr { .. } => anchor.dtype(),
-            dt => dt.ptr(Some(size), AddrSpace::Global),
+            dt => dt
+                .ptr(Some(size), AddrSpace::Global)
+                .expect("placeholder_like base is never a pointer (Ptr arm handled above)"),
         };
         let placeholder = UOp::param(slot, size, dtype, None);
         if concrete_shape.len() <= 1 {

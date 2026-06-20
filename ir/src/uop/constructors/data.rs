@@ -69,7 +69,7 @@ impl UOp {
     ///
     /// Dtype is inferred from the first value; all values must be same type.
     pub fn vconst(values: Vec<ConstValue>, scalar_dtype: DType) -> Arc<Self> {
-        let vec_dtype = scalar_dtype.vec(values.len());
+        let vec_dtype = scalar_dtype.vec(values.len()).expect("vconst element dtype must be a scalar");
         Self::new(Op::VConst { values }, vec_dtype)
     }
 
@@ -139,7 +139,11 @@ impl UOp {
         let dst_vcount = dtype.vcount();
 
         // Auto-promote scalar target to vector if source is vector
-        let dtype = if dst_vcount == 1 && src_vcount > 1 { dtype.vec(src_vcount) } else { dtype };
+        let dtype = if dst_vcount == 1 && src_vcount > 1 {
+            dtype.vec(src_vcount).expect("cast target with vcount==1 is vectorizable")
+        } else {
+            dtype
+        };
 
         // No-op if types match
         if self.dtype() == dtype {

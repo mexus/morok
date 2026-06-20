@@ -165,7 +165,7 @@ fn test_no_gate_unchanged() {
 #[test]
 fn test_devectorize_define_local_vec4() {
     // Create DEFINE_LOCAL with vec4 pointer dtype
-    let vec_ptr_dtype = DType::Float32.vec(4).ptr(Some(16), AddrSpace::Local);
+    let vec_ptr_dtype = DType::Float32.vec(4).unwrap().ptr(Some(16), AddrSpace::Local).unwrap();
     let def_local = UOp::define_local(0, vec_ptr_dtype);
 
     let result = apply_cast_after(&def_local);
@@ -192,7 +192,7 @@ fn test_devectorize_define_local_vec4() {
 /// Test: DEFINE_LOCAL with scalar ptr is unchanged
 #[test]
 fn test_define_local_scalar_unchanged() {
-    let scalar_ptr_dtype = DType::Float32.ptr(Some(16), AddrSpace::Local);
+    let scalar_ptr_dtype = DType::Float32.ptr(Some(16), AddrSpace::Local).unwrap();
     let def_local = UOp::define_local(0, scalar_ptr_dtype);
 
     let result = apply_cast_after(&def_local);
@@ -396,11 +396,11 @@ fn test_is_increasing_mul_negative() {
 #[test]
 fn test_devectorize_local_buffer_vector_index() {
     // DEF_LOCAL with vec3 pointer: Ptr<vec3<f32>>
-    let vec3_ptr_dtype = DType::Float32.vec(3).ptr(Some(9), AddrSpace::Local);
+    let vec3_ptr_dtype = DType::Float32.vec(3).unwrap().ptr(Some(9), AddrSpace::Local).unwrap();
     let _def_local = UOp::define_local(0, vec3_ptr_dtype.clone());
 
     // Simulate no_vectorized_buf having fired: DEF_LOCAL(Ptr<f32>).cast(Ptr<vec3<f32>>)
-    let scalar_ptr_dtype = DType::Float32.ptr(Some(9), AddrSpace::Local);
+    let scalar_ptr_dtype = DType::Float32.ptr(Some(9), AddrSpace::Local).unwrap();
     let scalar_def = UOp::define_local(1, scalar_ptr_dtype);
     let cast_def = scalar_def.cast(vec3_ptr_dtype);
 
@@ -413,7 +413,7 @@ fn test_devectorize_local_buffer_vector_index() {
     // INDEX(CAST(DEF_LOCAL), vec3_idx) — this is the problematic pattern
     let index = UOp::new(
         Op::Index { buffer: cast_def, indices: smallvec![vec3_idx], gate: None },
-        DType::Float32.vec(9).ptr(Some(9), AddrSpace::Local),
+        DType::Float32.vec(9).unwrap().ptr(Some(9), AddrSpace::Local).unwrap(),
     );
 
     // Create vec9 value and STORE
@@ -452,8 +452,8 @@ fn test_devectorize_local_buffer_vector_index() {
 fn test_devectorize_local_buffer_vec9_index() {
     // DEF_LOCAL with vec9 pointer: Ptr<vec9<f32>>
     // (This is the actual pattern from the u3u3 kernel)
-    let vec9_ptr_dtype = DType::Float32.vec(9).ptr(Some(81), AddrSpace::Local);
-    let scalar_ptr_dtype = DType::Float32.ptr(Some(81), AddrSpace::Local);
+    let vec9_ptr_dtype = DType::Float32.vec(9).unwrap().ptr(Some(81), AddrSpace::Local).unwrap();
+    let scalar_ptr_dtype = DType::Float32.ptr(Some(81), AddrSpace::Local).unwrap();
     let scalar_def = UOp::define_local(2, scalar_ptr_dtype);
     let cast_def = scalar_def.cast(vec9_ptr_dtype);
 
@@ -463,7 +463,7 @@ fn test_devectorize_local_buffer_vec9_index() {
     // INDEX(CAST(DEF_LOCAL), vec9_idx)
     let index = UOp::new(
         Op::Index { buffer: cast_def, indices: smallvec![vec9_idx], gate: None },
-        DType::Float32.vec(81).ptr(Some(81), AddrSpace::Local),
+        DType::Float32.vec(81).unwrap().ptr(Some(81), AddrSpace::Local).unwrap(),
     );
 
     // vec81 value (9 index lanes × 9 pointer vcount)

@@ -92,7 +92,7 @@ fn test_store() {
 #[test]
 fn test_codegen_param() {
     // Per-kernel codegen PARAM: no device, Ptr dtype
-    let p = UOp::param(0, 1024, DType::Float32.ptr(Some(1024), svod_dtype::AddrSpace::Global), None);
+    let p = UOp::param(0, 1024, DType::Float32.ptr(Some(1024), svod_dtype::AddrSpace::Global).unwrap(), None);
 
     assert!(matches!(p.dtype(), DType::Ptr { .. }));
 

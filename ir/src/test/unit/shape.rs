@@ -144,7 +144,7 @@ fn test_infer_const_shape() {
 #[test]
 fn test_infer_vconst_shape() {
     let values = vec![ConstValue::Float(1.0), ConstValue::Float(2.0), ConstValue::Float(3.0), ConstValue::Float(4.0)];
-    let vec = UOp::new(crate::Op::VConst { values: values.clone() }, DType::Float32.vec(4));
+    let vec = UOp::new(crate::Op::VConst { values: values.clone() }, DType::Float32.vec(4).unwrap());
     // VConst is a kernel-level op and returns None (matches Tinygrad)
     assert!(vec.shape().unwrap().is_none(), "VConst should return None for shape");
 }

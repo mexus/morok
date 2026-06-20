@@ -16,8 +16,8 @@ use svod_dtype::DType;
 use crate::Result;
 use crate::error::{
     BroadcastRequiresScalarSnafu, ContractCountMismatchSnafu, GepIndexOutOfBoundsSnafu, GepRequiresVectorSnafu,
-    GetTupleIndexOutOfBoundsSnafu, GetTupleNotATupleSnafu, UnrollCountMismatchSnafu, VectorizeDTypeMismatchSnafu,
-    VectorizeEmptySnafu,
+    GetTupleIndexOutOfBoundsSnafu, GetTupleNotATupleSnafu, NotVectorizableSnafu, UnrollCountMismatchSnafu,
+    VectorizeDTypeMismatchSnafu, VectorizeEmptySnafu,
 };
 use crate::op::Op;
 use crate::types::{CallInfo, WmmaMetadata};
@@ -39,7 +39,8 @@ impl UOp {
         // Calculate vector size from C (output) upcast axes
         let vec_size = metadata.upcast_axes.c.iter().map(|(_, size)| size).product::<usize>();
 
-        let dtype = if vec_size > 1 { base_dtype.vec(vec_size) } else { base_dtype };
+        let dtype =
+            if vec_size > 1 { base_dtype.vec(vec_size).expect("wmma output dtype is a scalar") } else { base_dtype };
 
         Self::new(Op::Wmma { a, b, c, metadata }, dtype)
     }
@@ -66,7 +67,8 @@ impl UOp {
             ensure!(expected_dtype == actual, VectorizeDTypeMismatchSnafu { expected: expected_dtype, actual });
         }
 
-        let vec_dtype = expected_dtype.vec(elements.len());
+        let count = elements.len();
+        let vec_dtype = expected_dtype.vec(count).context(NotVectorizableSnafu { dtype: expected_dtype, count })?;
         Ok(Self::new(Op::Vectorize { elements }, vec_dtype))
     }
 
@@ -135,7 +137,7 @@ impl UOp {
         let dtype = if indices.len() == 1 {
             DType::Scalar(vector_dtype.base())
         } else {
-            DType::Scalar(vector_dtype.base()).vec(indices.len())
+            DType::Scalar(vector_dtype.base()).vec(indices.len()).expect("gep result base is a scalar")
         };
 
         Ok(Self::new(Op::Gep { vector: self.clone(), indices }, dtype))
@@ -154,7 +156,7 @@ impl UOp {
         let dtype = if indices.len() == 1 {
             DType::Scalar(vector_dtype.base())
         } else {
-            DType::Scalar(vector_dtype.base()).vec(indices.len())
+            DType::Scalar(vector_dtype.base()).vec(indices.len()).expect("gep result base is a scalar")
         };
         Self::new(Op::Gep { vector: self.clone(), indices }, dtype)
     }
@@ -173,7 +175,13 @@ impl UOp {
             ensure!(dtype_count == axis_product, ContractCountMismatchSnafu { dtype_count, axis_product });
         }
 
-        let dtype = if axis_product > 1 { base_dtype.vec(axis_product) } else { base_dtype };
+        let dtype = if axis_product > 1 {
+            base_dtype
+                .vec(axis_product)
+                .context(NotVectorizableSnafu { dtype: base_dtype.clone(), count: axis_product })?
+        } else {
+            base_dtype
+        };
 
         Ok(Self::new(Op::Contract { src: self.clone(), upcast_ranges }, dtype))
     }
@@ -185,7 +193,11 @@ impl UOp {
     pub fn contract(self: &Arc<Self>, upcast_ranges: Vec<(usize, usize)>) -> Arc<Self> {
         let base_dtype = self.dtype();
         let vec_size = upcast_ranges.iter().map(|(_, size)| size).product::<usize>();
-        let dtype = if vec_size > 1 { base_dtype.vec(vec_size) } else { base_dtype };
+        let dtype = if vec_size > 1 {
+            base_dtype.vec(vec_size).expect("contract source dtype must be vectorizable")
+        } else {
+            base_dtype
+        };
         Self::new(Op::Contract { src: self.clone(), upcast_ranges }, dtype)
     }
 
@@ -242,7 +254,7 @@ impl UOp {
         assert!(!sources.is_empty(), "CAT requires at least one source");
         let dtype = dtype.unwrap_or_else(|| {
             let total_count: usize = sources.iter().map(|s| s.dtype().vcount()).sum();
-            DType::Scalar(sources[0].dtype.base()).vec(total_count)
+            DType::Scalar(sources[0].dtype.base()).vec(total_count).expect("cat result base is a scalar")
         });
         Self::new(Op::Cat { sources: SmallVec::from_vec(sources) }, dtype)
     }

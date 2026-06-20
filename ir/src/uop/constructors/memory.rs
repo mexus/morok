@@ -289,7 +289,7 @@ impl UOp {
     pub fn define_reg(size: usize) -> Arc<Self> {
         use svod_dtype::AddrSpace;
         let id = crate::uop::hash_consing::next_unique_id();
-        let ptr_dtype = DType::Void.ptr(Some(size), AddrSpace::Reg);
+        let ptr_dtype = DType::Void.ptr(Some(size), AddrSpace::Reg).expect("define_reg base is never a pointer");
         Self::new(Op::DefineReg { size, id }, ptr_dtype)
     }
 

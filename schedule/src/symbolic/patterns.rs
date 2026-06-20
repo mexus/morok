@@ -482,10 +482,10 @@ pub fn zero_folding_dsl_patterns() -> &'static TypedPatternMatcher {
         // x % x → 0
         Mod(x, x) => x.dtype().scalar().map(|dt| UOp::const_(x.dtype(), ConstValue::zero(dt))),
         // x < x → False (no dtype guard, returns bool.vec(count))
-        Lt(x, x) => Some(UOp::const_(DType::Bool.vec(x.dtype().vcount()), ConstValue::Bool(false))),
+        Lt(x, x) => Some(UOp::const_(DType::Bool.vec(x.dtype().vcount()).expect("Bool is a scalar"), ConstValue::Bool(false))),
         // x != x → False (ints+bool+index, returns bool.vec(count))
         Ne(x, x) if x.dtype().is_int() || x.dtype().is_bool() =>
-            Some(UOp::const_(DType::Bool.vec(x.dtype().vcount()), ConstValue::Bool(false))),
+            Some(UOp::const_(DType::Bool.vec(x.dtype().vcount()).expect("Bool is a scalar"), ConstValue::Bool(false))),
     }
 }
 
@@ -1926,7 +1926,7 @@ fn alu_vectorize_reorder_patterns() -> &'static TypedPatternMatcher {
 fn ne_zero_fold_patterns() -> &'static TypedPatternMatcher {
     crate::cached_patterns! {
         Ne(x, _zero @const(zv)) if zv.is_zero() => {
-            let bool_dt = DType::Bool.vec(x.dtype().vcount());
+            let bool_dt = DType::Bool.vec(x.dtype().vcount()).expect("Bool is a scalar");
             Some(x.cast(bool_dt))
         },
     }
@@ -2272,7 +2272,7 @@ pub fn gep_pushing_patterns() -> &'static TypedPatternMatcher {
                 let new_sources: Vec<Arc<UOp>> = sources.iter().map(|s| s.gep(indices.clone())).collect();
                 let gep_count = indices.len();
                 let scalar_base = vector.dtype().base();
-                let result_dtype = DType::Scalar(scalar_base).vec(gep_count);
+                let result_dtype = DType::Scalar(scalar_base).vec(gep_count).expect("scalar dtype is vectorizable");
                 // For CAST/BITCAST: need to update the target dtype in the Op
                 let new_op = match vector.op() {
                     Op::Cast { .. } => {
@@ -2358,7 +2358,7 @@ pub fn gep_pushing_patterns() -> &'static TypedPatternMatcher {
 
             // Result dtype matches the GEP output: scalar base × number of extracted elements
             let scalar_base = metadata.dtype_out.base();
-            let result_dtype = DType::Scalar(scalar_base).vec(indices.len());
+            let result_dtype = DType::Scalar(scalar_base).vec(indices.len()).expect("scalar dtype is vectorizable");
 
             Some(UOp::new(
                 Op::Wmma {

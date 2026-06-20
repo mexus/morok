@@ -179,7 +179,10 @@ impl Kernel {
     pub fn alloc_local(&self, flat_size: usize, elem: DType) -> Arc<UOp> {
         let slot = self.shared_slot.get();
         self.shared_slot.set(slot + 1);
-        UOp::define_local(slot, elem.ptr(Some(flat_size), AddrSpace::Local))
+        UOp::define_local(
+            slot,
+            elem.ptr(Some(flat_size), AddrSpace::Local).expect("alloc_local element must not be a pointer"),
+        )
     }
 
     /// Allocate register (per-lane) memory. The id is a per-kernel monotonic slot
@@ -331,7 +334,12 @@ fn flat_param(slot: usize, src: &Arc<UOp>) -> Arc<UOp> {
     match base.op() {
         Op::Buffer { size, .. } => {
             let elem = base.dtype();
-            UOp::param(slot, *size, elem.ptr(Some(*size), AddrSpace::Global), None)
+            UOp::param(
+                slot,
+                *size,
+                elem.ptr(Some(*size), AddrSpace::Global).expect("flat_param buffer element must not be a pointer"),
+                None,
+            )
         }
         // Already a buffer-like pointer (e.g. a pre-built Param): reuse as-is.
         _ => base,

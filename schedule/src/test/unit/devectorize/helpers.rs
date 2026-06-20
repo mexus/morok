@@ -95,13 +95,13 @@ pub fn create_buffer(size: usize) -> Arc<UOp> {
 
 /// Create a global buffer with specified element type.
 pub fn create_buffer_typed(size: usize, scalar: ScalarDType) -> Arc<UOp> {
-    let dtype = DType::Scalar(scalar).ptr(Some(size), AddrSpace::Global);
+    let dtype = DType::Scalar(scalar).ptr(Some(size), AddrSpace::Global).unwrap();
     UOp::new_buffer(svod_dtype::DeviceSpec::Cpu, size, dtype)
 }
 
 /// Create a local (shared) memory buffer.
 pub fn create_buffer_local(size: usize, scalar: ScalarDType) -> Arc<UOp> {
-    let dtype = DType::Scalar(scalar).ptr(Some(size), AddrSpace::Local);
+    let dtype = DType::Scalar(scalar).ptr(Some(size), AddrSpace::Local).unwrap();
     UOp::new_buffer(svod_dtype::DeviceSpec::Cpu, size, dtype)
 }
 

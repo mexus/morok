@@ -1012,7 +1012,7 @@ pub fn bufferize_to_store(
     // Calculate sdtype explicitly: `x.dtype.ptr(size=size, addrspace=opts.addrspace)`.
     // This is the pointer type used for STORE targets, ensuring consistent
     // size and addrspace across all INDEX operations in this function.
-    let sdtype = base_dtype.clone().ptr(Some(size), opts.addrspace);
+    let sdtype = base_dtype.clone().ptr(Some(size), opts.addrspace)?;
 
     // Get end_ranges for wrapping stores via `.end(*rngs)`.
     let end_ranges: SmallVec<[Arc<UOp>; 4]> = sort_ranges_by_axis_id(&collect_range_uops(ranges));
@@ -1148,7 +1148,7 @@ pub fn bufferize_to_store(
         new_lunique_buffer(ctx, device, size, base_dtype.clone())
     } else {
         // For local address space (only when allow_locals=true), create DEFINE_LOCAL directly.
-        let local_ptr_dtype = base_dtype.clone().ptr(Some(size), opts.addrspace);
+        let local_ptr_dtype = base_dtype.clone().ptr(Some(size), opts.addrspace)?;
         let local_id = ctx.next_local();
         UOp::define_local(local_id, local_ptr_dtype)
     };

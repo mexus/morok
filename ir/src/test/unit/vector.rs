@@ -23,14 +23,14 @@ fn test_vectorize_basic() {
             UOp::native_const(4.0f32)
         ])
         .dtype(),
-        DType::Float32.vec(4)
+        DType::Float32.vec(4).unwrap()
     );
 }
 
 #[test]
 fn test_vectorize_preserves_base_dtype() {
     let vec = UOp::vectorize(smallvec![UOp::native_const(1i32), UOp::native_const(2i32)]);
-    assert_eq!(vec.dtype(), DType::Int32.vec(2));
+    assert_eq!(vec.dtype(), DType::Int32.vec(2).unwrap());
 }
 
 // =========================================================================
@@ -63,7 +63,7 @@ fn test_gep_multiple_indices() {
 
     // Extract multiple elements -> produces vector of extracted elements
     let result = vec.gep(vec![0, 2]);
-    assert_eq!(result.dtype(), DType::Int32.vec(2));
+    assert_eq!(result.dtype(), DType::Int32.vec(2).unwrap());
 }
 
 // =========================================================================
@@ -75,7 +75,7 @@ fn test_vconst_basic() {
     let values = vec![ConstValue::Float(1.0), ConstValue::Float(2.0), ConstValue::Float(3.0), ConstValue::Float(4.0)];
 
     let vec = UOp::vconst(values, DType::Float64);
-    assert_eq!(vec.dtype(), DType::Float64.vec(4));
+    assert_eq!(vec.dtype(), DType::Float64.vec(4).unwrap());
 }
 
 // =========================================================================
@@ -89,7 +89,7 @@ fn test_cat_basic() {
 
     let result = UOp::cat().sources(vec![a, b]).call();
     // Cat concatenates vectors: <2 x f32> + <2 x f32> = <4 x f32>
-    assert_eq!(result.dtype(), DType::Float32.vec(4));
+    assert_eq!(result.dtype(), DType::Float32.vec(4).unwrap());
 }
 
 // =========================================================================
@@ -98,11 +98,11 @@ fn test_cat_basic() {
 
 #[test]
 fn test_ptrcat_basic() {
-    let ptr_dtype = DType::Float32.ptr(None, AddrSpace::Global);
+    let ptr_dtype = DType::Float32.ptr(None, AddrSpace::Global).unwrap();
     let a = UOp::const_(ptr_dtype.clone(), ConstValue::Int(0));
     let b = UOp::const_(ptr_dtype.clone(), ConstValue::Int(0));
 
     let result = UOp::ptrcat().sources(vec![a, b]).call();
     // PTRCAT of 2 scalar pointers → vcount=2
-    assert_eq!(result.dtype(), ptr_dtype.vec(2));
+    assert_eq!(result.dtype(), ptr_dtype.vec(2).unwrap());
 }

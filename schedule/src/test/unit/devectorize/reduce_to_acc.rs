@@ -129,8 +129,10 @@ fn test_horizontal_reduce_identity() {
     let range = create_range_reduce(8, 0);
     let src = create_vector_float_iota(4);
     // Vec4 input with vec4 output dtype
-    let reduce =
-        UOp::new(Op::Reduce { src, ranges: smallvec![range], reduce_op: ReduceOp::Add }, DType::Float32.vec(4));
+    let reduce = UOp::new(
+        Op::Reduce { src, ranges: smallvec![range], reduce_op: ReduceOp::Add },
+        DType::Float32.vec(4).unwrap(),
+    );
 
     let result = apply_pm_reduce(&reduce);
 
@@ -147,8 +149,10 @@ fn test_horizontal_reduce_16_to_4() {
     let elements: smallvec::SmallVec<[Arc<UOp>; 4]> =
         (0..16).map(|i| UOp::const_(DType::Float32, ConstValue::Float(i as f64))).collect();
     let src = UOp::vectorize(elements);
-    let reduce =
-        UOp::new(Op::Reduce { src, ranges: smallvec![range], reduce_op: ReduceOp::Add }, DType::Float32.vec(4));
+    let reduce = UOp::new(
+        Op::Reduce { src, ranges: smallvec![range], reduce_op: ReduceOp::Add },
+        DType::Float32.vec(4).unwrap(),
+    );
 
     let result = apply_pm_reduce(&reduce);
 
@@ -334,7 +338,7 @@ fn test_reduce_in_full_pipeline() {
 
     // Create a realistic REDUCE scenario
     let reduce_range = create_range_reduce(32, 0);
-    let buffer_dtype = DType::Float32.ptr(Some(1024), AddrSpace::Global);
+    let buffer_dtype = DType::Float32.ptr(Some(1024), AddrSpace::Global).unwrap();
     let buffer = UOp::new_buffer(DeviceSpec::Cpu, 1024, buffer_dtype.clone());
     let define = UOp::param(0, 1024, buffer_dtype, None);
 
@@ -368,7 +372,7 @@ fn test_reduce_with_vectorized_source() {
     // REDUCE the vectorized value to vec4 output
     let reduce = UOp::new(
         Op::Reduce { src: vectorized, ranges: smallvec![reduce_range], reduce_op: ReduceOp::Add },
-        DType::Float32.vec(4),
+        DType::Float32.vec(4).unwrap(),
     );
 
     let result = apply_pm_reduce(&reduce);

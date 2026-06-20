@@ -140,8 +140,8 @@ pub(crate) fn threefry_random_bits(key: &Tensor, counts0: &Tensor, counts1: &Ten
 /// The size-changing bitcast is handled by [`Tensor::bitcast`].
 fn bits_to_rand(bits: &Tensor, shape: &[usize], dtype: DType) -> Result<Tensor> {
     let scalar = dtype.scalar().expect("scalar dtype validated by rand_with");
-    let (_, nmant) = scalar.finfo();
-    let uint_dt = DType::Scalar(scalar.float_to_uint());
+    let (_, nmant) = scalar.finfo().expect("rand float dtype validated by rand_with");
+    let uint_dt = DType::Scalar(scalar.float_to_uint().expect("rand float dtype validated by rand_with"));
     let total_bits = (scalar.bytes() * 8) as u32;
     let shift = total_bits - nmant;
 

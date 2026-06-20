@@ -92,7 +92,7 @@ fn test_barrier_with_unroll() {
     let unroll = values.unroll(vec![(0, 4)]);
 
     // Create BARRIER wrapping UNROLL
-    let barrier = UOp::new(Op::Barrier { src: unroll, deps: smallvec![] }, DType::Int64.vec(4));
+    let barrier = UOp::new(Op::Barrier { src: unroll, deps: smallvec![] }, DType::Int64.vec(4).unwrap());
 
     // Apply expander
     let result = phase2_only(&barrier);

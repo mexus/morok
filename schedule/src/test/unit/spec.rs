@@ -17,7 +17,7 @@ use crate::spec::{spec_program, spec_tensor, type_verify};
 
 /// A GLOBAL-address-space pointer PARAM (a kernel buffer argument).
 fn global_param() -> Arc<UOp> {
-    UOp::param(0, 16, DType::Float32.ptr(Some(16), AddrSpace::Global), None)
+    UOp::param(0, 16, DType::Float32.ptr(Some(16), AddrSpace::Global).unwrap(), None)
 }
 
 fn verify_err(root: &Arc<UOp>) -> String {

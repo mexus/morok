@@ -170,11 +170,11 @@ fn test_split_load_vec8_to_vec4() {
 
     // Create CAST(INDEX) with vec8 pointer dtype (simulating expand_index output)
     let idx = create_index(buffer.clone(), 0);
-    let vec8_ptr_dtype = DType::Float32.vec(8).ptr(Some(8), AddrSpace::Global);
+    let vec8_ptr_dtype = DType::Float32.vec(8).unwrap().ptr(Some(8), AddrSpace::Global).unwrap();
     let cast_idx = idx.cast(vec8_ptr_dtype);
 
     // LOAD with vec8 result dtype
-    let load_dtype = DType::Float32.vec(8);
+    let load_dtype = DType::Float32.vec(8).unwrap();
     let load = UOp::load().buffer(buffer.clone()).index(cast_idx).dtype(load_dtype).call();
 
     let result = apply_devectorize(&load);
@@ -208,10 +208,10 @@ fn test_split_load_vec6_mixed() {
     let buffer = create_buffer(128);
 
     let idx = create_index(buffer.clone(), 0);
-    let vec6_ptr_dtype = DType::Float32.vec(6).ptr(Some(6), AddrSpace::Global);
+    let vec6_ptr_dtype = DType::Float32.vec(6).unwrap().ptr(Some(6), AddrSpace::Global).unwrap();
     let cast_idx = idx.cast(vec6_ptr_dtype);
 
-    let load_dtype = DType::Float32.vec(6);
+    let load_dtype = DType::Float32.vec(6).unwrap();
     let load = UOp::load().buffer(buffer.clone()).index(cast_idx).dtype(load_dtype).call();
 
     let result = apply_devectorize(&load);
@@ -239,7 +239,7 @@ fn test_split_store_vec8() {
     let value = create_vector_float_iota(8);
 
     let idx = create_index(buffer.clone(), 0);
-    let vec8_ptr_dtype = DType::Float32.vec(8).ptr(Some(8), AddrSpace::Global);
+    let vec8_ptr_dtype = DType::Float32.vec(8).unwrap().ptr(Some(8), AddrSpace::Global).unwrap();
     let cast_idx = idx.cast(vec8_ptr_dtype);
 
     let store = cast_idx.store(value);
@@ -269,9 +269,9 @@ fn test_split_load_preserves_nonzero_alt() {
         .gate(gate)
         .call()
         .unwrap();
-    let cast_idx = idx.cast(DType::Float32.vec(8).ptr(Some(8), AddrSpace::Global));
+    let cast_idx = idx.cast(DType::Float32.vec(8).unwrap().ptr(Some(8), AddrSpace::Global).unwrap());
     let alt = UOp::vconst(vec![ConstValue::Float(3.25); 8], DType::Float32);
-    let load = UOp::load().buffer(buffer).index(cast_idx).dtype(DType::Float32.vec(8)).alt(alt).call();
+    let load = UOp::load().buffer(buffer).index(cast_idx).dtype(DType::Float32.vec(8).unwrap()).alt(alt).call();
 
     let result = apply_correct_load_store(&load);
 
@@ -304,9 +304,9 @@ fn test_image_fixup_preserves_nonzero_alt() {
         .gate(gate)
         .call()
         .unwrap();
-    let cast_idx = idx.cast(DType::Float32.vec(4));
+    let cast_idx = idx.cast(DType::Float32.vec(4).unwrap());
     let alt = UOp::vconst(vec![ConstValue::Float(9.0); 4], DType::Float32);
-    let load = UOp::load().buffer(img).index(cast_idx).dtype(DType::Float32.vec(4)).alt(alt).call();
+    let load = UOp::load().buffer(img).index(cast_idx).dtype(DType::Float32.vec(4).unwrap()).alt(alt).call();
 
     let result = apply_correct_load_store(&load);
     let Op::Load { index, alt, .. } = result.op() else {
@@ -332,7 +332,7 @@ fn test_split_preserves_ranges() {
     let value = create_vector_float_iota(8);
 
     let idx = create_index(buffer.clone(), 0);
-    let vec8_ptr_dtype = DType::Float32.vec(8).ptr(Some(8), AddrSpace::Global);
+    let vec8_ptr_dtype = DType::Float32.vec(8).unwrap().ptr(Some(8), AddrSpace::Global).unwrap();
     let cast_idx = idx.cast(vec8_ptr_dtype);
 
     // Create range for the store
@@ -422,10 +422,10 @@ fn test_split_load_divisibility() {
         .call()
         .unwrap();
 
-    let vec8_ptr_dtype = DType::Float32.vec(8).ptr(Some(8), AddrSpace::Global);
+    let vec8_ptr_dtype = DType::Float32.vec(8).unwrap().ptr(Some(8), AddrSpace::Global).unwrap();
     let cast_idx = idx.cast(vec8_ptr_dtype);
 
-    let load_dtype = DType::Float32.vec(8);
+    let load_dtype = DType::Float32.vec(8).unwrap();
     let load = UOp::load().buffer(buffer.clone()).index(cast_idx).dtype(load_dtype).call();
 
     let result = apply_devectorize(&load);
@@ -467,10 +467,10 @@ fn test_split_load_not_divisible() {
         .call()
         .unwrap();
 
-    let vec8_ptr_dtype = DType::Float32.vec(8).ptr(Some(8), AddrSpace::Global);
+    let vec8_ptr_dtype = DType::Float32.vec(8).unwrap().ptr(Some(8), AddrSpace::Global).unwrap();
     let cast_idx = idx.cast(vec8_ptr_dtype);
 
-    let load_dtype = DType::Float32.vec(8);
+    let load_dtype = DType::Float32.vec(8).unwrap();
     let load = UOp::load().buffer(buffer.clone()).index(cast_idx).dtype(load_dtype).call();
 
     let result = apply_devectorize(&load);
