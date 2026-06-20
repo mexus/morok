@@ -5,7 +5,7 @@ use svod_ir::SInt;
 use svod_tensor::Tensor;
 
 use crate::init::{fan_in_uniform, ones, zeros};
-use crate::state::{HasStateDict, StateDict, get_tensor, prefixed};
+use crate::state::{self, HasStateDict, StateDict, TensorSnafu as StateTensorSnafu, get_tensor, prefixed};
 use crate::{load_state_field, state_field};
 
 use super::error::{StateSnafu, TensorSnafu, TkSnafu};
@@ -437,14 +437,25 @@ impl HasStateDict for ConvModule {
                 let bias = get_tensor(sd, &prefixed(prefix, "bn_bias"))?;
                 let mean = get_tensor(sd, &prefixed(prefix, "bn_mean"))?;
                 let invstd = get_tensor(sd, &prefixed(prefix, "bn_invstd"))?;
-                let fold = || -> std::result::Result<(Tensor, Tensor), Box<svod_tensor::error::Error>> {
+                let fold = || -> std::result::Result<(Tensor, Tensor), state::Error> {
                     let d = self.d_model as isize;
-                    let s = scale.try_mul(&invstd)?;
-                    let w = self.dw_weight.try_mul(&s.try_reshape([d, 1, 1])?)?;
-                    let b = self.dw_bias.try_mul(&s)?.try_add(&bias)?.try_sub(&mean.try_mul(&s)?)?;
+                    let s = scale.try_mul(&invstd).context(StateTensorSnafu)?;
+                    let w = self
+                        .dw_weight
+                        .try_mul(&s.try_reshape([d, 1, 1]).context(StateTensorSnafu)?)
+                        .context(StateTensorSnafu)?;
+                    let scaled_mean = mean.try_mul(&s).context(StateTensorSnafu)?;
+                    let b = self
+                        .dw_bias
+                        .try_mul(&s)
+                        .context(StateTensorSnafu)?
+                        .try_add(&bias)
+                        .context(StateTensorSnafu)?
+                        .try_sub(&scaled_mean)
+                        .context(StateTensorSnafu)?;
                     Ok((w, b))
                 };
-                let (w, b) = fold().map_err(|e| crate::state::Error::Tensor { source: e })?;
+                let (w, b) = fold()?;
                 self.dw_weight = w;
                 self.dw_bias = b;
                 self.conv_norm = ConvNorm::Folded;

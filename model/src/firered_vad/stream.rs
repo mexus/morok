@@ -122,11 +122,7 @@ impl FireRedVadStream {
     /// non-streaming file minus the lookahead filters).
     pub fn from_safetensors(path: &std::path::Path) -> Result<Self> {
         let sd = state::load_safetensors(path).context(super::StateSnafu)?;
-        let get = |key: &str| -> Result<Tensor> {
-            sd.get(key).cloned().ok_or_else(|| super::Error::State {
-                source: Box::new(state::Error::MissingKey { key: key.to_string() }),
-            })
-        };
+        let get = |key: &str| -> Result<Tensor> { state::get_tensor(&sd, key).context(super::StateSnafu) };
         let blocks = (0..super::BLOCKS)
             .map(|i| {
                 Ok(DfsmnBlockStream {

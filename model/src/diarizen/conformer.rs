@@ -55,7 +55,7 @@ impl PositionwiseFeedForward {
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let normed = self.ln_norm.apply(x).map_err(map_wavlm_err)?;
+        let normed = self.ln_norm.apply(x)?;
         let y = normed.linear().weight(&self.w1_weight).bias(&self.w1_bias).call().context(TensorSnafu)?;
         let y = y.silu().context(TensorSnafu)?; // Python `Swish` == SiLU.
         let y = y.linear().weight(&self.w2_weight).bias(&self.w2_bias).call().context(TensorSnafu)?;
@@ -202,7 +202,7 @@ impl ConformerMHA {
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let normed = self.ln_norm.apply(x).map_err(map_wavlm_err)?;
+        let normed = self.ln_norm.apply(x)?;
         let delta = self.mha.forward(&normed)?;
         x.try_add(&delta).context(TensorSnafu)
     }
@@ -262,7 +262,7 @@ impl ConvolutionModule {
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         // x: (B, T, C)
-        let normed = self.ln_norm.apply(x).map_err(map_wavlm_err)?;
+        let normed = self.ln_norm.apply(x)?;
         // → (B, C, T)
         let y = normed.try_permute(&[0, 2, 1]).context(TensorSnafu)?;
 
@@ -292,7 +292,7 @@ impl ConvolutionModule {
             .context(TensorSnafu)?;
 
         // BN over channel axis (axis 1 default works for NCT).
-        let y = self.bn_norm.forward(&y).map_err(map_blocks_err)?;
+        let y = self.bn_norm.forward(&y)?;
         let y = y.silu().context(TensorSnafu)?;
 
         // Pointwise conv2: (B, C, T) → (B, C, T)
@@ -366,7 +366,7 @@ impl ConformerBlock {
         let x = self.mha.forward(&x)?;
         let x = self.conv.forward(&x)?;
         let x = self.ffn2.forward(&x)?;
-        self.ln_norm.apply(&x).map_err(map_wavlm_err)
+        Ok(self.ln_norm.apply(&x)?)
     }
 }
 
@@ -445,19 +445,5 @@ impl HasStateDict for ConformerEncoder {
             layer.load_state_dict(sd, &format!("{prefix}.conformer_layer.{i}"))?;
         }
         Ok(())
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Local error trampolines
-// ---------------------------------------------------------------------------
-
-fn map_wavlm_err(e: crate::wavlm::Error) -> super::error::Error {
-    super::error::Error::WavLm { source: Box::new(e) }
-}
-
-fn map_blocks_err(e: crate::blocks::Error) -> super::error::Error {
-    match e {
-        crate::blocks::Error::Tensor { source } => super::error::Error::Tensor { source },
     }
 }

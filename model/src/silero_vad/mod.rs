@@ -215,9 +215,7 @@ impl SileroVad {
 }
 
 fn get(sd: &state::StateDict, key: &str) -> Result<Tensor> {
-    sd.get(key)
-        .cloned()
-        .ok_or_else(|| Error::State { source: Box::new(state::Error::MissingKey { key: key.to_string() }) })
+    state::get_tensor(sd, key).context(StateSnafu)
 }
 
 /// Max windows per batched conv-front-end dispatch. Larger = fewer dispatches

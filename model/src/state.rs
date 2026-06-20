@@ -8,6 +8,7 @@ use svod_tensor::Tensor;
 pub type StateDict = HashMap<String, Tensor>;
 
 #[derive(Debug, Snafu)]
+#[snafu(visibility(pub(crate)))]
 pub enum Error {
     #[snafu(display("failed to read file: {source}"))]
     Io { source: std::io::Error },
