@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use smallvec::smallvec;
-use snafu::ResultExt;
+use snafu::{OptionExt, ResultExt};
 use svod_device::Buffer;
 use svod_dtype::DType;
 use svod_dtype::ext::HasDType;
@@ -186,12 +186,8 @@ impl Tensor {
     /// The file is memory-mapped lazily — no data is read until the tensor is realized.
     /// The resulting tensor has dtype `uint8` and shape `(file_size,)`.
     pub fn from_path(path: &std::path::Path) -> Result<Self> {
-        let file_size = std::fs::metadata(path)
-            .map_err(|e| Error::IrConstruction { details: format!("DISK: {}: {e}", path.display()) })?
-            .len() as usize;
-        let canonical = path
-            .canonicalize()
-            .map_err(|e| Error::IrConstruction { details: format!("DISK: {}: {e}", path.display()) })?;
+        let file_size = std::fs::metadata(path).context(DiskSnafu { path: path.display().to_string() })?.len() as usize;
+        let canonical = path.canonicalize().context(DiskSnafu { path: path.display().to_string() })?;
         let device = svod_dtype::DeviceSpec::Disk { path: canonical };
         let buffer_uop = UOp::new_buffer(device, file_size, svod_dtype::DType::Scalar(svod_dtype::ScalarDType::UInt8));
         Ok(Self::new(buffer_uop))
@@ -875,12 +871,16 @@ impl Tensor {
             result = result.flip(&[axis_idx as isize])?;
         }
         if exclusive {
-            let dim_size = shape[axis_idx].as_const().unwrap() as isize;
+            let dim_size =
+                shape[axis_idx].as_const().context(SymbolicShapeUnsupportedSnafu { operation: "cumsum" })? as isize;
             let mut pad_spec: Vec<(isize, isize)> = vec![(0, 0); ndim];
             pad_spec[axis_idx] = (1, 0);
             result = result.try_pad(&pad_spec)?;
-            let mut shrink_spec: Vec<(isize, isize)> =
-                result.shape()?.iter().map(|s| (0, s.as_const().unwrap() as isize)).collect();
+            let mut shrink_spec: Vec<(isize, isize)> = result
+                .shape()?
+                .iter()
+                .map(|s| Ok((0, s.as_const().context(SymbolicShapeUnsupportedSnafu { operation: "cumsum" })? as isize)))
+                .collect::<Result<_>>()?;
             shrink_spec[axis_idx] = (0, dim_size);
             result = result.try_shrink(&shrink_spec)?;
         }
@@ -907,12 +907,18 @@ impl Tensor {
             result = result.flip(&[axis_idx as isize])?;
         }
         if exclusive {
-            let dim_size = shape[axis_idx].as_const().unwrap() as isize;
+            let dim_size =
+                shape[axis_idx].as_const().context(SymbolicShapeUnsupportedSnafu { operation: "cumprod" })? as isize;
             let mut pad_spec: Vec<(isize, isize)> = vec![(0, 0); ndim];
             pad_spec[axis_idx] = (1, 0);
             result = result.try_pad_value(&pad_spec, 1.0)?;
-            let mut shrink_spec: Vec<(isize, isize)> =
-                result.shape()?.iter().map(|s| (0, s.as_const().unwrap() as isize)).collect();
+            let mut shrink_spec: Vec<(isize, isize)> = result
+                .shape()?
+                .iter()
+                .map(|s| {
+                    Ok((0, s.as_const().context(SymbolicShapeUnsupportedSnafu { operation: "cumprod" })? as isize))
+                })
+                .collect::<Result<_>>()?;
             shrink_spec[axis_idx] = (0, dim_size);
             result = result.try_shrink(&shrink_spec)?;
         }

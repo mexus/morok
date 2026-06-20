@@ -1,10 +1,12 @@
 //! Convolution operations: conv2d, conv_transpose2d.
 
 use bon::bon;
+use snafu::OptionExt;
 
 use svod_ir::SInt;
 
 use crate::Tensor;
+use crate::error::SymbolicShapeUnsupportedSnafu;
 use crate::reduce::AxisSpec;
 
 type Result<T> = crate::Result<T>;
@@ -92,11 +94,14 @@ impl Tensor {
         let w_shape = weight.shape()?;
 
         let bs = x_shape[0].clone(); // SInt — concrete or symbolic (Variable batch)
-        let cin_ = x_shape[1].as_const().expect("channel dim must be concrete");
-        let cout = w_shape[0].as_const().expect("cout must be concrete");
-        let cin = w_shape[1].as_const().expect("cin/g must be concrete");
+        let cin_ = x_shape[1].as_const().context(SymbolicShapeUnsupportedSnafu { operation: "conv2d" })?;
+        let cout = w_shape[0].as_const().context(SymbolicShapeUnsupportedSnafu { operation: "conv2d" })?;
+        let cin = w_shape[1].as_const().context(SymbolicShapeUnsupportedSnafu { operation: "conv2d" })?;
 
-        let hw: Vec<usize> = w_shape[2..].iter().map(|s| s.as_const().expect("kernel dim must be concrete")).collect();
+        let hw: Vec<usize> = w_shape[2..]
+            .iter()
+            .map(|s| s.as_const().context(SymbolicShapeUnsupportedSnafu { operation: "conv2d" }))
+            .collect::<Result<Vec<_>>>()?;
         let n_spatial = hw.len();
 
         if x_shape.len() != w_shape.len() {
@@ -252,7 +257,10 @@ impl Tensor {
         output_padding: Option<&[usize]>,
     ) -> Result<Tensor> {
         let w_shape = weight.shape()?;
-        let hw: Vec<usize> = w_shape[2..].iter().map(|s| s.as_const().expect("kernel dim must be concrete")).collect();
+        let hw: Vec<usize> = w_shape[2..]
+            .iter()
+            .map(|s| s.as_const().context(SymbolicShapeUnsupportedSnafu { operation: "conv_transpose2d" }))
+            .collect::<Result<Vec<_>>>()?;
         let n_spatial = hw.len();
 
         let default_ones: Vec<usize> = vec![1; n_spatial];
@@ -263,8 +271,8 @@ impl Tensor {
         let padding = padding.unwrap_or(&default_no_pad);
         let output_padding = output_padding.unwrap_or(&default_zeros);
 
-        let cout_in = w_shape[0].as_const().unwrap();
-        let cin_g = w_shape[1].as_const().unwrap();
+        let cout_in = w_shape[0].as_const().context(SymbolicShapeUnsupportedSnafu { operation: "conv_transpose2d" })?;
+        let cin_g = w_shape[1].as_const().context(SymbolicShapeUnsupportedSnafu { operation: "conv_transpose2d" })?;
         let rcout = cout_in / groups;
 
         // Reshape to (groups, rcout, cin_g, *HW)
@@ -291,7 +299,10 @@ impl Tensor {
         let mut x = self.clone();
         if stride.iter().any(|&s| s > 1) {
             let x_shape = x.shape()?;
-            let spatial: Vec<usize> = x_shape[2..].iter().map(|s| s.as_const().unwrap()).collect();
+            let spatial: Vec<usize> = x_shape[2..]
+                .iter()
+                .map(|s| s.as_const().context(SymbolicShapeUnsupportedSnafu { operation: "conv_transpose2d" }))
+                .collect::<Result<Vec<_>>>()?;
 
             // Step 1: reshape (N,C,h,w) -> (N,C,h,1,w,1)
             let mut rshape: Vec<SInt> = vec![x_shape[0].clone(), x_shape[1].clone()];
@@ -313,8 +324,12 @@ impl Tensor {
             let x_shape = x.shape()?;
             let mut rshape: Vec<SInt> = vec![x_shape[0].clone(), x_shape[1].clone()];
             for j in 0..n_spatial {
-                let a = x_shape[2 + j * 2].as_const().unwrap();
-                let b = x_shape[2 + j * 2 + 1].as_const().unwrap();
+                let a = x_shape[2 + j * 2]
+                    .as_const()
+                    .context(SymbolicShapeUnsupportedSnafu { operation: "conv_transpose2d" })?;
+                let b = x_shape[2 + j * 2 + 1]
+                    .as_const()
+                    .context(SymbolicShapeUnsupportedSnafu { operation: "conv_transpose2d" })?;
                 rshape.push((a * b).into());
             }
             x = x.try_reshape(&rshape)?;

@@ -1290,14 +1290,10 @@ fn prepare_execution_plan(
             let base = &item.buffers[1];
             let byte_offset = offset * base.dtype().bytes();
             let byte_size = size * runtime_ast.dtype().bytes();
-            let view = base.view(byte_offset, byte_size).map_err(|e| crate::error::Error::IrConstruction {
-                details: format!(
-                    "BUFFER_VIEW failed for kernel {}: base_buffer_id={}, byte_offset={}, byte_size={}: {e}",
-                    item.kernel.id,
-                    base.id().0,
-                    byte_offset,
-                    byte_size
-                ),
+            let view = base.view(byte_offset, byte_size).context(crate::error::BufferViewSnafu {
+                kernel_id: item.kernel.id,
+                offset: byte_offset,
+                size: byte_size,
             })?;
             // Register the view under the output buffer's UOp ID so downstream
             // COPY/kernel items find it as their source buffer.
@@ -1439,16 +1435,7 @@ fn prepare_execution_plan(
             cached.var_names.iter().map(|name| item.fixedvars.get(name).copied().unwrap_or(0)).collect();
         let non_overridable_fixedvars = collect_non_overridable_fixedvars(item);
 
-        let output_indices = output_indices_from_program_metadata(&cached.globals, &cached.outs, buffer_indices.len())
-            .map_err(|e| crate::error::Error::IrConstruction {
-                details: format!(
-                    "invalid ProgramSpec output metadata for kernel id {} (globals={:?}, outs={:?}, num_buffers={}): {e}",
-                    item.kernel.id,
-                    cached.globals,
-                    cached.outs,
-                    buffer_indices.len()
-                ),
-            })?;
+        let output_indices = output_indices_from_program_metadata(&cached.globals, &cached.outs, buffer_indices.len())?;
 
         let runtime_vars = svod_runtime::execution_plan::collect_runtime_vars(&item.ast);
         let prepared = PreparedKernel {
@@ -1553,20 +1540,15 @@ fn compile_with_program_pipeline_components(
     )
     .context(RenderKernelSnafu)?;
 
-    let rendered_entry = svod_device::device::ProgramSpec::from_uop(&program).map(|spec| spec.name).map_err(|e| {
-        crate::error::Error::IrConstruction { details: format!("PROGRAM pipeline produced invalid SOURCE stage: {e}") }
-    })?;
+    let rendered_entry = svod_device::device::ProgramSpec::from_uop(&program)
+        .map(|spec| spec.name)
+        .context(crate::error::ProgramSpecSnafu { stage: "SOURCE stage" })?;
 
     let (program, compiled) =
         svod_codegen::program_pipeline::do_compile(&program, compiler).context(CompileKernelSnafu)?;
 
-    let spec =
-        svod_device::device::ProgramSpec::from_uop(&program).map_err(|e| crate::error::Error::IrConstruction {
-            details: format!(
-                "PROGRAM pipeline produced invalid ProgramSpec after compile (entry='{}'): {e}",
-                rendered_entry
-            ),
-        })?;
+    let spec = svod_device::device::ProgramSpec::from_uop(&program)
+        .context(crate::error::ProgramSpecSnafu { stage: format!("after compile (entry='{rendered_entry}')") })?;
     Ok((spec, compiled))
 }
 

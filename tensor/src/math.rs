@@ -5,7 +5,7 @@
 //! - Rounding functions: floor, ceil, round, trunc
 //! - Advanced math: erf (error function), reciprocal, square, sign
 
-use snafu::ResultExt;
+use snafu::{OptionExt, ResultExt};
 use svod_ir::ConstValue;
 
 use super::*;
@@ -398,8 +398,8 @@ impl Tensor {
                 actual: format!("{ndim}D"),
             }
         );
-        let n = shape[ndim - 1].as_const().unwrap();
-        let m = shape[ndim - 2].as_const().unwrap();
+        let n = shape[ndim - 1].as_const().context(SymbolicShapeUnsupportedSnafu { operation: "det" })?;
+        let m = shape[ndim - 2].as_const().context(SymbolicShapeUnsupportedSnafu { operation: "det" })?;
         snafu::ensure!(
             n == m,
             crate::error::ShapeMismatchSnafu {
@@ -413,7 +413,10 @@ impl Tensor {
         let float_dt = if dtype.is_float() { dtype.clone() } else { DType::Float32 };
 
         if n == 0 {
-            let batch: Vec<usize> = shape[..ndim - 2].iter().map(|s| s.as_const().unwrap()).collect();
+            let batch: Vec<usize> = shape[..ndim - 2]
+                .iter()
+                .map(|s| s.as_const().context(SymbolicShapeUnsupportedSnafu { operation: "det" }))
+                .collect::<Result<_>>()?;
             return if batch.is_empty() {
                 Ok(Tensor::const_(1.0, float_dt))
             } else {
@@ -561,7 +564,10 @@ impl Tensor {
             shape[d].as_const().ok_or_else(|| Error::SymbolicShapeUnsupported { operation: "qr".to_string() })
         };
         let (m, n) = (cdim(ndim - 2)?, cdim(ndim - 1)?);
-        let batch: Vec<usize> = shape[..ndim - 2].iter().map(|s| s.as_const().unwrap()).collect();
+        let batch: Vec<usize> = shape[..ndim - 2]
+            .iter()
+            .map(|s| s.as_const().context(SymbolicShapeUnsupportedSnafu { operation: "qr" }))
+            .collect::<Result<_>>()?;
         let float_dt = if self.uop().dtype().is_float() { self.uop().dtype() } else { DType::Float32 };
 
         let mut r = to_float(self, &float_dt)?;
@@ -624,7 +630,10 @@ impl Tensor {
                 actual: format!("[{m}, {n}]")
             }
         );
-        let dims: Vec<usize> = shape.iter().map(|s| s.as_const().unwrap()).collect();
+        let dims: Vec<usize> = shape
+            .iter()
+            .map(|s| s.as_const().context(SymbolicShapeUnsupportedSnafu { operation: op.to_string() }))
+            .collect::<Result<_>>()?;
         let dtype = self.uop().dtype();
         let float_dt = if dtype.is_float() { dtype } else { DType::Float32 };
         Ok((dims, n, float_dt))
@@ -634,8 +643,10 @@ impl Tensor {
 /// Shrink only the last two dimensions of a tensor, preserving batch dims.
 fn shrink_last2(tensor: &Tensor, ndim: usize, row_range: (isize, isize), col_range: (isize, isize)) -> Result<Tensor> {
     let shape = tensor.shape()?;
-    let mut ranges: Vec<(isize, isize)> =
-        shape[..ndim - 2].iter().map(|s| (0, s.as_const().unwrap() as isize)).collect();
+    let mut ranges: Vec<(isize, isize)> = shape[..ndim - 2]
+        .iter()
+        .map(|s| Ok((0, s.as_const().context(SymbolicShapeUnsupportedSnafu { operation: "shrink_last2" })? as isize)))
+        .collect::<Result<_>>()?;
     ranges.push(row_range);
     ranges.push(col_range);
     tensor.try_shrink(&ranges)

@@ -832,8 +832,9 @@ impl Tensor {
     pub fn triu(&self, diagonal: i64) -> Result<Tensor> {
         let shape = self.shape()?;
         let ndim = shape.len();
-        let r = shape[ndim - 2].as_const().unwrap() as i64;
-        let c = shape[ndim - 1].as_const().unwrap() as i64;
+        snafu::ensure!(ndim >= 2, NdimMinimumSnafu { op: "triu", min: 2usize, actual: ndim });
+        let r = shape[ndim - 2].as_const().context(SymbolicShapeUnsupportedSnafu { operation: "triu" })? as i64;
+        let c = shape[ndim - 1].as_const().context(SymbolicShapeUnsupportedSnafu { operation: "triu" })? as i64;
         let mask = Self::tri(r, c, diagonal)?;
         let zero = Tensor::new(self.uop().const_like(ConstValue::zero(self.uop().dtype().scalar().unwrap())));
         self.where_(&mask, &zero)
@@ -843,8 +844,9 @@ impl Tensor {
     pub fn tril(&self, diagonal: i64) -> Result<Tensor> {
         let shape = self.shape()?;
         let ndim = shape.len();
-        let r = shape[ndim - 2].as_const().unwrap() as i64;
-        let c = shape[ndim - 1].as_const().unwrap() as i64;
+        snafu::ensure!(ndim >= 2, NdimMinimumSnafu { op: "tril", min: 2usize, actual: ndim });
+        let r = shape[ndim - 2].as_const().context(SymbolicShapeUnsupportedSnafu { operation: "tril" })? as i64;
+        let c = shape[ndim - 1].as_const().context(SymbolicShapeUnsupportedSnafu { operation: "tril" })? as i64;
         let mask = Self::tri(r, c, diagonal + 1)?;
         let zero = Tensor::new(self.uop().const_like(ConstValue::zero(self.uop().dtype().scalar().unwrap())));
         zero.where_(&mask, self)

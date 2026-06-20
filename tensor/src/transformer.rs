@@ -2,11 +2,11 @@
 
 use crate::Tensor;
 use bon::bon;
-use snafu::ensure;
+use snafu::{OptionExt, ensure};
 use svod_dtype::DType;
 use svod_ir::ConstValue;
 
-use crate::error::FloatDTypeRequiredSnafu;
+use crate::error::{FloatDTypeRequiredSnafu, NdimMinimumSnafu, SymbolicShapeUnsupportedSnafu};
 
 type Result<T> = crate::Result<T>;
 
@@ -15,15 +15,18 @@ impl Tensor {
     /// Returns `self[indices]` with shape `[*indices.shape, embed_dim]`.
     pub fn embedding(&self, indices: &Tensor) -> Result<Tensor> {
         let weight_shape = self.shape()?;
-        let embed_dim = weight_shape[1].as_const().expect("embedding weight dim 1 must be concrete") as isize;
+        let embed_dim =
+            weight_shape[1].as_const().context(SymbolicShapeUnsupportedSnafu { operation: "embedding" })? as isize;
         let idx_shape = indices.shape()?;
 
         let flat = indices.try_reshape([-1])?;
         let expanded = flat.try_unsqueeze(-1)?.try_expand([-1, embed_dim])?;
         let gathered = self.gather(0, &expanded)?;
 
-        let mut out_shape: Vec<isize> =
-            idx_shape.iter().map(|d| d.as_const().expect("embedding index dims must be concrete") as isize).collect();
+        let mut out_shape: Vec<isize> = idx_shape
+            .iter()
+            .map(|d| Ok(d.as_const().context(SymbolicShapeUnsupportedSnafu { operation: "embedding" })? as isize))
+            .collect::<Result<_>>()?;
         out_shape.push(embed_dim);
         gathered.try_reshape(&out_shape)
     }
@@ -37,17 +40,19 @@ impl Tensor {
         let shape = self.shape()?;
         let last_dim = shape
             .last()
-            .expect("apply_rotary_emb requires non-scalar input")
+            .context(NdimMinimumSnafu { op: "apply_rotary_emb", min: 1usize, actual: 0usize })?
             .as_const()
-            .expect("last dim must be concrete");
+            .context(SymbolicShapeUnsupportedSnafu { operation: "apply_rotary_emb" })?;
         let half = last_dim / 2;
 
         let (x1, x2) = if interleaved {
             let mut rs: Vec<isize> = shape
                 .iter()
                 .take(shape.len() - 1)
-                .map(|d| d.as_const().expect("dims must be concrete") as isize)
-                .collect();
+                .map(|d| {
+                    Ok(d.as_const().context(SymbolicShapeUnsupportedSnafu { operation: "apply_rotary_emb" })? as isize)
+                })
+                .collect::<Result<_>>()?;
             rs.push(half as isize);
             rs.push(2);
             let r = self.try_reshape(&rs)?;
@@ -63,7 +68,12 @@ impl Tensor {
 
         if interleaved {
             let stacked = Tensor::stack(&[&real, &imag], -1)?;
-            let mut fs: Vec<isize> = shape.iter().map(|d| d.as_const().unwrap() as isize).collect();
+            let mut fs: Vec<isize> = shape
+                .iter()
+                .map(|d| {
+                    Ok(d.as_const().context(SymbolicShapeUnsupportedSnafu { operation: "apply_rotary_emb" })? as isize)
+                })
+                .collect::<Result<_>>()?;
             // Last dim already correct from original shape
             let _ = fs.last_mut().map(|d| *d = last_dim as isize);
             stacked.try_reshape(&fs)
@@ -106,7 +116,9 @@ impl Tensor {
 
         let q_shape = self.shape()?;
         let k_shape = key.shape()?;
-        let head_dim = q_shape[q_shape.len() - 1].as_const().expect("Q head_dim must be concrete");
+        let head_dim = q_shape[q_shape.len() - 1]
+            .as_const()
+            .context(SymbolicShapeUnsupportedSnafu { operation: "scaled_dot_product_attention" })?;
         let scale_val = scale.unwrap_or(1.0 / (head_dim as f64).sqrt());
 
         let scores_dtype = self.uop().dtype();
@@ -121,8 +133,12 @@ impl Tensor {
 
         // Causal mask
         if is_causal {
-            let q_len = q_shape[q_shape.len() - 2].as_const().expect("Q seq_len must be concrete");
-            let k_len = k_shape[k_shape.len() - 2].as_const().expect("K seq_len must be concrete");
+            let q_len = q_shape[q_shape.len() - 2]
+                .as_const()
+                .context(SymbolicShapeUnsupportedSnafu { operation: "scaled_dot_product_attention" })?;
+            let k_len = k_shape[k_shape.len() - 2]
+                .as_const()
+                .context(SymbolicShapeUnsupportedSnafu { operation: "scaled_dot_product_attention" })?;
             let causal = Tensor::full(&[q_len, k_len], true, DType::Bool)?.tril(0)?;
             let neg_large = Tensor::const_(ConstValue::min(scores_dtype.base()), scores_dtype.clone());
             scores = scores.where_(&causal, &neg_large)?;

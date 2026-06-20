@@ -1,8 +1,9 @@
 //! Recurrent neural network layers (RNN, GRU, LSTM).
 
 use bon::bon;
+use snafu::OptionExt;
 
-use crate::error::{NdimExactSnafu, ParamRangeSnafu};
+use crate::error::{NdimExactSnafu, ParamRangeSnafu, SymbolicShapeUnsupportedSnafu};
 use crate::s;
 
 use super::*;
@@ -82,9 +83,9 @@ impl Tensor {
         );
         let x = if layout != 0 { self.try_permute(&[1, 0, 2])? } else { self.clone() };
         let x_shape = x.shape()?;
-        let seq_length = x_shape[0].as_const().expect("static seq_length");
-        let batch_size = x_shape[1].as_const().expect("static batch_size");
-        let num_directions = w.shape()?[0].as_const().expect("static num_directions");
+        let seq_length = x_shape[0].as_const().context(SymbolicShapeUnsupportedSnafu { operation: "rnn" })?;
+        let batch_size = x_shape[1].as_const().context(SymbolicShapeUnsupportedSnafu { operation: "rnn" })?;
+        let num_directions = w.shape()?[0].as_const().context(SymbolicShapeUnsupportedSnafu { operation: "rnn" })?;
         let dtype = x.uop().dtype();
 
         snafu::ensure!(
@@ -204,9 +205,9 @@ impl Tensor {
         );
         let x = if layout != 0 { self.try_permute(&[1, 0, 2])? } else { self.clone() };
         let x_shape = x.shape()?;
-        let seq_length = x_shape[0].as_const().expect("static seq_length");
-        let batch_size = x_shape[1].as_const().expect("static batch_size");
-        let num_directions = w.shape()?[0].as_const().expect("static num_directions");
+        let seq_length = x_shape[0].as_const().context(SymbolicShapeUnsupportedSnafu { operation: "gru" })?;
+        let batch_size = x_shape[1].as_const().context(SymbolicShapeUnsupportedSnafu { operation: "gru" })?;
+        let num_directions = w.shape()?[0].as_const().context(SymbolicShapeUnsupportedSnafu { operation: "gru" })?;
         let dtype = x.uop().dtype();
 
         snafu::ensure!(
@@ -370,9 +371,9 @@ impl Tensor {
             self.clone()
         };
         let x_shape = x.shape()?;
-        let seq_length = x_shape[0].as_const().expect("static seq_length");
-        let batch_size = x_shape[1].as_const().expect("static batch_size");
-        let num_directions = w.shape()?[0].as_const().expect("static num_directions");
+        let seq_length = x_shape[0].as_const().context(SymbolicShapeUnsupportedSnafu { operation: "lstm" })?;
+        let batch_size = x_shape[1].as_const().context(SymbolicShapeUnsupportedSnafu { operation: "lstm" })?;
+        let num_directions = w.shape()?[0].as_const().context(SymbolicShapeUnsupportedSnafu { operation: "lstm" })?;
         let dtype = x.uop().dtype();
 
         snafu::ensure!(

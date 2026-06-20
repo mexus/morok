@@ -1,10 +1,12 @@
 //! Padding helpers: flat-to-pair conversion, auto-pad, pool pad resolution.
 
 use bon::bon;
+use snafu::OptionExt;
 use svod_ir::{ConstValue, SInt, UOp};
 
 use super::{AutoPad, PadMode};
 use crate::Tensor;
+use crate::error::SymbolicShapeUnsupportedSnafu;
 
 type Result<T> = crate::Result<T>;
 
@@ -257,15 +259,28 @@ fn pad_replicate(data: &Tensor, padding: &[(isize, isize)]) -> Result<Tensor> {
             continue;
         }
         let shape = result.shape()?;
-        let dim_size = shape[d].as_const().expect("replicate pad requires concrete dims") as isize;
+        let dim_size =
+            shape[d].as_const().context(SymbolicShapeUnsupportedSnafu { operation: "pad_replicate" })? as isize;
         let mut parts: Vec<Tensor> = Vec::new();
 
         if pad_before > 0 {
-            let mut shrink_ranges: Vec<(isize, isize)> =
-                shape.iter().map(|s| (0, s.as_const().unwrap() as isize)).collect();
+            let mut shrink_ranges: Vec<(isize, isize)> = shape
+                .iter()
+                .map(|s| {
+                    Ok((
+                        0,
+                        s.as_const().context(SymbolicShapeUnsupportedSnafu { operation: "pad_replicate" })? as isize,
+                    ))
+                })
+                .collect::<Result<Vec<_>>>()?;
             shrink_ranges[d] = (0, 1);
             let edge = result.try_shrink(&shrink_ranges)?;
-            let mut expand_shape: Vec<isize> = shape.iter().map(|s| s.as_const().unwrap() as isize).collect();
+            let mut expand_shape: Vec<isize> = shape
+                .iter()
+                .map(|s| {
+                    Ok(s.as_const().context(SymbolicShapeUnsupportedSnafu { operation: "pad_replicate" })? as isize)
+                })
+                .collect::<Result<Vec<_>>>()?;
             expand_shape[d] = pad_before;
             parts.push(edge.try_expand(&expand_shape)?);
         }
@@ -273,11 +288,23 @@ fn pad_replicate(data: &Tensor, padding: &[(isize, isize)]) -> Result<Tensor> {
         parts.push(result.clone());
 
         if pad_after > 0 {
-            let mut shrink_ranges: Vec<(isize, isize)> =
-                shape.iter().map(|s| (0, s.as_const().unwrap() as isize)).collect();
+            let mut shrink_ranges: Vec<(isize, isize)> = shape
+                .iter()
+                .map(|s| {
+                    Ok((
+                        0,
+                        s.as_const().context(SymbolicShapeUnsupportedSnafu { operation: "pad_replicate" })? as isize,
+                    ))
+                })
+                .collect::<Result<Vec<_>>>()?;
             shrink_ranges[d] = (dim_size - 1, dim_size);
             let edge = result.try_shrink(&shrink_ranges)?;
-            let mut expand_shape: Vec<isize> = shape.iter().map(|s| s.as_const().unwrap() as isize).collect();
+            let mut expand_shape: Vec<isize> = shape
+                .iter()
+                .map(|s| {
+                    Ok(s.as_const().context(SymbolicShapeUnsupportedSnafu { operation: "pad_replicate" })? as isize)
+                })
+                .collect::<Result<Vec<_>>>()?;
             expand_shape[d] = pad_after;
             parts.push(edge.try_expand(&expand_shape)?);
         }
@@ -299,12 +326,17 @@ fn pad_reflect(data: &Tensor, padding: &[(isize, isize)]) -> Result<Tensor> {
             continue;
         }
         let shape = result.shape()?;
-        let dim_size = shape[d].as_const().expect("reflect pad requires concrete dims") as isize;
+        let dim_size =
+            shape[d].as_const().context(SymbolicShapeUnsupportedSnafu { operation: "pad_reflect" })? as isize;
         let mut parts: Vec<Tensor> = Vec::new();
 
         if pad_before > 0 {
-            let mut shrink_ranges: Vec<(isize, isize)> =
-                shape.iter().map(|s| (0, s.as_const().unwrap() as isize)).collect();
+            let mut shrink_ranges: Vec<(isize, isize)> = shape
+                .iter()
+                .map(|s| {
+                    Ok((0, s.as_const().context(SymbolicShapeUnsupportedSnafu { operation: "pad_reflect" })? as isize))
+                })
+                .collect::<Result<Vec<_>>>()?;
             shrink_ranges[d] = (1, 1 + pad_before);
             let slice = result.try_shrink(&shrink_ranges)?;
             parts.push(slice.flip(&[d as isize])?);
@@ -313,8 +345,12 @@ fn pad_reflect(data: &Tensor, padding: &[(isize, isize)]) -> Result<Tensor> {
         parts.push(result.clone());
 
         if pad_after > 0 {
-            let mut shrink_ranges: Vec<(isize, isize)> =
-                shape.iter().map(|s| (0, s.as_const().unwrap() as isize)).collect();
+            let mut shrink_ranges: Vec<(isize, isize)> = shape
+                .iter()
+                .map(|s| {
+                    Ok((0, s.as_const().context(SymbolicShapeUnsupportedSnafu { operation: "pad_reflect" })? as isize))
+                })
+                .collect::<Result<Vec<_>>>()?;
             shrink_ranges[d] = (dim_size - 1 - pad_after, dim_size - 1);
             let slice = result.try_shrink(&shrink_ranges)?;
             parts.push(slice.flip(&[d as isize])?);
@@ -341,13 +377,15 @@ fn pad_circular(data: &Tensor, padding: &[(isize, isize)]) -> Result<Tensor> {
     let shrink_ranges: Vec<(isize, isize)> = (0..ndim)
         .map(|d| {
             let (pb, _pa) = padding[d];
-            let orig = shape[d].as_const().expect("circular pad requires concrete dims") as isize;
-            let rep_dim = rep_shape[d].as_const().unwrap() as isize;
+            let orig =
+                shape[d].as_const().context(SymbolicShapeUnsupportedSnafu { operation: "pad_circular" })? as isize;
+            let rep_dim =
+                rep_shape[d].as_const().context(SymbolicShapeUnsupportedSnafu { operation: "pad_circular" })? as isize;
             let start = if pb == 0 { 0 } else { orig - pb };
             let end = if padding[d].1 == 0 { rep_dim } else { rep_dim - orig + padding[d].1 };
-            (start, end)
+            Ok((start, end))
         })
-        .collect();
+        .collect::<Result<Vec<_>>>()?;
     repeated.try_shrink(&shrink_ranges)
 }
 
