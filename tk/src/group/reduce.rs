@@ -261,11 +261,16 @@ impl<'k> Group<'k> {
     /// matching `Tensor::topk`/`argmin`). The value `RV` is seeded by `dir`
     /// (`+∞`/`−∞`); the index `RV` must be `Int32`.
     ///
+    /// The reduced data must be **NaN-free**: the value compare lowers to an
+    /// unordered `fcmp ult`, so a NaN can win the fold and propagate as the kept
+    /// value (unlike `Tensor::argmin`, whose `==`-mask yields an out-of-range
+    /// index) — finite KNN distances satisfy this. A non-16-multiple reduced
+    /// width must be `±∞`-padded by the caller so padded lanes never win.
+    ///
     /// # Panics
     /// Panics if the group has more than one warp, the kernel is unrolled (the
     /// flat form is a follow-up), the value `RV` dtype is not the (float) source
-    /// dtype, or the index `RV` is not `Int32`. A non-16-multiple reduced width
-    /// must be `±∞`-padded by the caller so padded lanes never win.
+    /// dtype, or the index `RV` is not `Int32`.
     pub fn row_arg_reduce(&self, val: RV<'k>, idx: RV<'k>, src: &RT<'k>, dir: ArgDir) -> (RV<'k>, RV<'k>) {
         let n = src.shape().len();
         self.arg_reduce(val, idx, src, dir, src.shape()[n - 3] as i64, src.shape()[n - 2] as i64, true)
