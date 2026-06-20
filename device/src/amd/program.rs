@@ -302,7 +302,7 @@ impl AmdProgram {
         let code_buf = allocator.alloc(size, &opts, /*zero=*/ false)?;
         let (code_gpu, code_host) = match &code_buf {
             RawBuffer::AmdDevice { gpu_addr, host_ptr: Some(h), .. } => (*gpu_addr, *h),
-            _ => return Err(Error::AmdAllocFailed { reason: "code object requires host-visible AMD buffer".into() }),
+            _ => return Err(Error::NotHostVisible { what: "code object" }),
         };
         // SAFETY: code_host points to size bytes we just mmapped exclusively.
         unsafe { std::ptr::copy_nonoverlapping(parsed.image.as_ptr(), code_host.as_ptr(), parsed.image.len()) };

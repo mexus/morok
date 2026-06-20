@@ -170,9 +170,7 @@ impl AmdGraph {
         let kernargs_buf = allocator.alloc_uncached(total.max(16))?;
         let (kernargs_gpu, kernargs_host) = match &kernargs_buf {
             RawBuffer::AmdDevice { gpu_addr, host_ptr: Some(h), .. } => (*gpu_addr, h.as_ptr()),
-            _ => {
-                return Err(Error::AmdAllocFailed { reason: "graph kernargs require host-visible buffer".into() });
-            }
+            _ => return Err(Error::NotHostVisible { what: "graph kernargs" }),
         };
 
         // Bake kernargs once per kernel (shared by both lowering modes); the
@@ -488,7 +486,7 @@ impl AmdGraphPm4 {
         let kernargs_buf = allocator.alloc_uncached(total.max(16))?;
         let (kernargs_gpu, kernargs_host) = match &kernargs_buf {
             RawBuffer::AmdDevice { gpu_addr, host_ptr: Some(h), .. } => (*gpu_addr, h.as_ptr()),
-            _ => return Err(Error::AmdAllocFailed { reason: "graph kernargs require host-visible buffer".into() }),
+            _ => return Err(Error::NotHostVisible { what: "graph kernargs" }),
         };
 
         // Bake each kernel's kernarg slot once and record its geometry/identity.
@@ -555,7 +553,7 @@ impl AmdGraphPm4 {
             RawBuffer::AmdDevice { gpu_addr, host_ptr: Some(h), .. } => (*gpu_addr, h.as_ptr()),
             _ => {
                 kernargs_buf.free_amd_device_in_place();
-                return Err(Error::AmdAllocFailed { reason: "graph IB requires host-visible buffer".into() });
+                return Err(Error::NotHostVisible { what: "graph IB" });
             }
         };
         // SAFETY: ib_host owns ib_bytes >= ib.len()*4; sole writer at capture.

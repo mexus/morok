@@ -138,7 +138,7 @@ impl AmdSignal {
     /// Early-exit on fault is load-bearing for BEAM search: a bad kernel config
     /// may fault the GPU, and paying the full timeout per rejected candidate is
     /// unaffordable.
-    fn poll_until(&self, ready: impl Fn(u64) -> bool, timeout_ms: u64, what: &str) -> Result<()> {
+    fn poll_until(&self, ready: impl Fn(u64) -> bool, timeout_ms: u64, what: &'static str) -> Result<()> {
         let mut start = std::time::Instant::now();
         let mut prev = u64::MAX;
         loop {
@@ -154,8 +154,13 @@ impl AmdSignal {
                 // A hung kernel almost always raised a fault; surface it
                 // alongside the deadline.
                 let fault = self.device.upgrade().and_then(|d| d.poll_faults_nonblocking());
-                return Err(fault.unwrap_or_else(|| Error::Runtime {
-                    message: format!("AmdSignal::{what} timed out after {timeout_ms} ms (current value={v})"),
+                // The wait predicate is opaque here (increment vs. countdown
+                // convention), so `target` is reported as 0; `what` names the op.
+                return Err(fault.unwrap_or(Error::TimelineTimeout {
+                    what,
+                    target: 0,
+                    current: v,
+                    waited_ms: timeout_ms,
                 }));
             }
             if let Some(fault) = self.spin_or_escalate(start) {
@@ -392,7 +397,7 @@ impl SignalPool {
         let (base_gpu, base_host) = match &buffer {
             RawBuffer::AmdDevice { gpu_addr, host_ptr: Some(h), .. } => (*gpu_addr, *h),
             _ => {
-                return Err(Error::AmdAllocFailed { reason: "SignalPool requires host-visible AMD buffer".into() });
+                return Err(Error::NotHostVisible { what: "SignalPool" });
             }
         };
         let free_slots = Mutex::new((0..slots as u32).rev().collect()); // pop low slots first

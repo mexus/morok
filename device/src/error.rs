@@ -40,9 +40,46 @@ pub enum Error {
     #[snafu(display("invalid view: offset {offset} + size {size} exceeds buffer size {buffer_size}"))]
     InvalidView { offset: usize, size: usize, buffer_size: usize },
 
-    /// Runtime execution error.
+    /// Runtime execution error. Free-form catch-all; prefer the structured
+    /// variants below when the data is structured.
     #[snafu(display("runtime error: {message}"))]
     Runtime { message: String },
+
+    /// A launch-size runtime variable fell outside its `DefineVar` bounds.
+    #[snafu(display("variable {name}={value} is outside bounds [{min}, {max}]"))]
+    VarOutOfBounds { name: String, value: i64, min: i64, max: i64 },
+
+    /// A pipeline stage held the wrong op kind (PROGRAM/SINK/LINEAR/SOURCE
+    /// shape validation in `ProgramSpec::from_uop`).
+    #[snafu(display("expected {expected} op, got {got}"))]
+    WrongStage { expected: &'static str, got: String },
+
+    /// AMD GPU memory fault decoded from a KFD event. `class` is a short
+    /// VA-classification hint (owning / stale / nearest allocation).
+    #[snafu(display(
+        "AMD GPU memory fault on gpu_id={gpu_id} va={va:#x} \
+         (NotPresent={not_present} ReadOnly={read_only} NoExecute={no_execute} \
+         Imprecise={imprecise} ErrorType={error_type}) — {class}"
+    ))]
+    GpuFault {
+        gpu_id: u32,
+        va: u64,
+        not_present: bool,
+        read_only: bool,
+        no_execute: bool,
+        imprecise: bool,
+        error_type: u32,
+        class: String,
+    },
+
+    /// A timeline signal did not reach its target value before the deadline.
+    #[snafu(display("{what} timed out after {waited_ms} ms (target {target}, current {current})"))]
+    TimelineTimeout { what: &'static str, target: u64, current: u64, waited_ms: u64 },
+
+    /// An AMD infrastructure buffer (kernarg / ring / GART / signal / code
+    /// object / graph IB) was allocated without a host-visible mapping.
+    #[snafu(display("{what} requires a host-visible AMD buffer"))]
+    NotHostVisible { what: &'static str },
 
     #[cfg(feature = "cuda")]
     /// CUDA-specific errors.

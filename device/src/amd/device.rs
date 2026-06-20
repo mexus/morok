@@ -221,7 +221,7 @@ impl AmdDevice {
     /// Returns:
     /// - `Err(NoAmdGpu)` when there is no `/dev/kfd`, no GPU nodes in
     ///   topology, or `device_id` is out of range. Never panics.
-    /// - `Err(AmdAllocFailed)` when the host has hardware we don't support
+    /// - `Err(DeviceUnavailable)` when the host has hardware we don't support
     ///   (hardware outside the supported `AmdArch` set).
     /// - `Err(AmdIoctl)` for KFD failures (permission denied, no event page).
     pub fn open(device_id: usize) -> Result<Arc<Self>> {
@@ -249,16 +249,17 @@ impl AmdDevice {
                 reason: format!("device_id {device_id} out of range; {} GPU node(s) present", nodes.len()),
             })?
             .clone();
-        let arch = AmdArch::from_gfx_target_version(node.gfx_target_version).ok_or_else(|| Error::AmdAllocFailed {
-            reason: format!(
-                "unsupported gfx target {} (decoded major.minor.step = {}.{}.{}); supported families: \
+        let arch =
+            AmdArch::from_gfx_target_version(node.gfx_target_version).ok_or_else(|| Error::DeviceUnavailable {
+                reason: format!(
+                    "unsupported gfx target {} (decoded major.minor.step = {}.{}.{}); supported families: \
                  CDNA gfx942/950, RDNA3 gfx1100/1101/1102/1151, RDNA4 gfx1200/1201",
-                node.gfx_target_version,
-                node.gfx_target_version / 10_000,
-                (node.gfx_target_version / 100) % 100,
-                node.gfx_target_version % 100,
-            ),
-        })?;
+                    node.gfx_target_version,
+                    node.gfx_target_version / 10_000,
+                    (node.gfx_target_version / 100) % 100,
+                    node.gfx_target_version % 100,
+                ),
+            })?;
 
         // Backend selection. Today only the KFD-direct backend exists; the
         // `SVOD_AMD_BACKEND` knob is the seam where the userspace AM driver

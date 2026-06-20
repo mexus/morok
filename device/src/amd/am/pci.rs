@@ -132,7 +132,9 @@ impl PciDevice {
                 .custom_flags(libc::O_SYNC)
                 .open(&path)
                 .map_err(|e| Error::Runtime { message: format!("open {path:?}: {e}") })?;
-            let len = file.metadata().expect("BAR metadata").len() as usize;
+            let len =
+                file.metadata().map_err(|e| Error::Runtime { message: format!("stat BAR{n} {path:?}: {e}") })?.len()
+                    as usize;
             let prot = if readonly { libc::PROT_READ } else { libc::PROT_READ | libc::PROT_WRITE };
             let ptr = unsafe { libc::mmap(std::ptr::null_mut(), len, prot, libc::MAP_SHARED, file.as_raw_fd(), 0) };
             ensure!(
@@ -176,21 +178,28 @@ impl PciDevice {
         Err(Error::NoAmdGpu { reason: "no AMD display/accelerator on the PCI bus".into() })
     }
 
-    pub fn config_read16(&mut self, off: u64) -> u16 {
+    pub fn config_read16(&mut self, off: u64) -> Result<u16> {
         let mut b = [0u8; 2];
-        self.cfg.seek(SeekFrom::Start(off)).and_then(|_| self.cfg.read_exact(&mut b)).expect("config read");
-        u16::from_le_bytes(b)
+        self.cfg
+            .seek(SeekFrom::Start(off))
+            .and_then(|_| self.cfg.read_exact(&mut b))
+            .map_err(|e| Error::Runtime { message: format!("PCI config read @{off:#x}: {e}") })?;
+        Ok(u16::from_le_bytes(b))
     }
 
-    pub fn config_write16(&mut self, off: u64, val: u16) {
+    pub fn config_write16(&mut self, off: u64, val: u16) -> Result<()> {
         assert!(!self.readonly, "config write in read-only mode");
-        self.cfg.seek(SeekFrom::Start(off)).and_then(|_| self.cfg.write_all(&val.to_le_bytes())).expect("config write");
-        let _ = self.config_read16(off); // flush posted write
+        self.cfg
+            .seek(SeekFrom::Start(off))
+            .and_then(|_| self.cfg.write_all(&val.to_le_bytes()))
+            .map_err(|e| Error::Runtime { message: format!("PCI config write @{off:#x}: {e}") })?;
+        let _ = self.config_read16(off)?; // flush posted write
+        Ok(())
     }
 
     /// Enable bus mastering (GPU-initiated DMA). Ownership mode only.
-    pub fn enable_bus_master(&mut self) {
-        let cmd = self.config_read16(PCI_COMMAND);
-        self.config_write16(PCI_COMMAND, cmd | PCI_COMMAND_MASTER);
+    pub fn enable_bus_master(&mut self) -> Result<()> {
+        let cmd = self.config_read16(PCI_COMMAND)?;
+        self.config_write16(PCI_COMMAND, cmd | PCI_COMMAND_MASTER)
     }
 }

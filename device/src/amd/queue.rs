@@ -1051,7 +1051,7 @@ impl AmdCopyQueue {
         let staging_buf = allocator.alloc_uncached(STAGING_BYTES)?;
         let (gpu, host) = match &staging_buf {
             crate::allocator::RawBuffer::AmdDevice { gpu_addr, host_ptr: Some(h), .. } => (*gpu_addr, *h),
-            _ => return Err(Error::AmdAllocFailed { reason: "staging buffer requires host-visible GTT".into() }),
+            _ => return Err(Error::NotHostVisible { what: "staging buffer" }),
         };
         let staging = Mutex::new(StagingBuf { _buf: staging_buf, host, gpu, size: STAGING_BYTES });
         Ok(Arc::new(Self { inner: Mutex::new(inner), core, timeline, staging }))
@@ -1193,7 +1193,7 @@ fn create_queue(
     let ring_buf = allocator.alloc_uncached(ring_size)?;
     let (ring_gpu, ring_host) = match &ring_buf {
         crate::allocator::RawBuffer::AmdDevice { gpu_addr, host_ptr: Some(h), .. } => (*gpu_addr, *h),
-        _ => return Err(Error::AmdAllocFailed { reason: "queue ring requires host-visible buffer".into() }),
+        _ => return Err(Error::NotHostVisible { what: "queue ring" }),
     };
     // Pre-fill every AQL ring slot's header with INVALID (ROCr does this) so the
     // packet processor never treats an unpublished slot (zeroed = VENDOR_SPECIFIC)
@@ -1216,7 +1216,7 @@ fn create_queue(
     let gart_buf = allocator.alloc_uncached(0x100)?;
     let (gart_gpu, gart_host) = match &gart_buf {
         crate::allocator::RawBuffer::AmdDevice { gpu_addr, host_ptr: Some(h), .. } => (*gpu_addr, *h),
-        _ => return Err(Error::AmdAllocFailed { reason: "GART page requires host-visible buffer".into() }),
+        _ => return Err(Error::NotHostVisible { what: "GART page" }),
     };
 
     let mut qinactive_buf: Option<crate::allocator::RawBuffer> = None;
@@ -1228,11 +1228,7 @@ fn create_queue(
         let qi_buf = allocator.alloc_uncached(64)?;
         let (qi_gpu, qi_host) = match &qi_buf {
             crate::allocator::RawBuffer::AmdDevice { gpu_addr, host_ptr: Some(h), .. } => (*gpu_addr, *h),
-            _ => {
-                return Err(Error::AmdAllocFailed {
-                    reason: "queue_inactive_signal requires host-visible buffer".into(),
-                });
-            }
+            _ => return Err(Error::NotHostVisible { what: "queue_inactive_signal" }),
         };
         // SAFETY: fresh 64-byte buffer. amd_signal_t: kind=USER@0, value=0@8.
         unsafe {
@@ -1314,7 +1310,7 @@ fn create_queue(
         };
         let (ctx_gpu, ctx_host) = match &ctx_buf {
             crate::allocator::RawBuffer::AmdDevice { gpu_addr, host_ptr: Some(h), .. } => (*gpu_addr, *h),
-            _ => return Err(Error::AmdAllocFailed { reason: "ctx-save buffer requires host-visible buffer".into() }),
+            _ => return Err(Error::NotHostVisible { what: "ctx-save buffer" }),
         };
         // Per-XCC `HsaUserContextSaveAreaHeader` (40 bytes): DebugOffset@16,
         // DebugSize@20 (ErrorReason@24 / ErrorEventId@32 stay 0 — no event).

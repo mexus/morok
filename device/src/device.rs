@@ -16,7 +16,9 @@ use svod_dtype::DeviceSpec;
 use svod_ir::{BinaryOp, ConstValue, Op, TernaryOp, UOp, UnaryOp};
 
 use crate::allocator::Allocator;
-use crate::error::{Error, Result};
+use snafu::OptionExt;
+
+use crate::error::{Error, Result, VarOutOfBoundsSnafu, WrongStageSnafu};
 
 /// A compiled, executable kernel program.
 ///
@@ -266,11 +268,10 @@ fn const_value_to_i64(value: ConstValue) -> Result<i64> {
 }
 
 fn validate_var_bound(name: &str, value: i64, min_val: i64, max_val: i64) -> Result<()> {
-    if value < min_val || value > max_val {
-        return Err(Error::Runtime {
-            message: format!("variable {name}={value} is outside bounds [{min_val}, {max_val}]"),
-        });
-    }
+    snafu::ensure!(
+        value >= min_val && value <= max_val,
+        VarOutOfBoundsSnafu { name, value, min: min_val, max: max_val }
+    );
     Ok(())
 }
 
@@ -895,47 +896,42 @@ impl ProgramSpec {
     /// Validates PROGRAM stage shape and derives metadata from PROGRAM itself.
     pub fn from_uop(program: &Arc<UOp>) -> Result<Self> {
         let Op::Program { sink, device, linear, source, binary } = program.op() else {
-            return Err(Error::Runtime { message: format!("expected PROGRAM op, got {:?}", program.op()) });
+            return WrongStageSnafu { expected: "PROGRAM", got: format!("{:?}", program.op()) }.fail();
         };
 
-        if !matches!(sink.op(), Op::Sink { .. }) {
-            return Err(Error::Runtime { message: format!("PROGRAM sink stage must be SINK op, got {:?}", sink.op()) });
-        }
+        snafu::ensure!(
+            matches!(sink.op(), Op::Sink { .. }),
+            WrongStageSnafu { expected: "PROGRAM sink stage SINK", got: format!("{:?}", sink.op()) }
+        );
 
         let device_spec = match device.op() {
             Op::Device(spec) => spec.clone(),
-            _ => {
-                return Err(Error::Runtime {
-                    message: format!("PROGRAM device must be DEVICE op, got {:?}", device.op()),
-                });
-            }
+            other => return WrongStageSnafu { expected: "PROGRAM device DEVICE", got: format!("{other:?}") }.fail(),
         };
 
-        let linear =
-            linear.as_ref().ok_or_else(|| Error::Runtime { message: "PROGRAM missing LINEAR stage".to_string() })?;
-        if !matches!(linear.op(), Op::Linear { .. }) {
-            return Err(Error::Runtime {
-                message: format!("PROGRAM linear stage must be LINEAR op, got {:?}", linear.op()),
-            });
-        }
+        let linear = linear
+            .as_ref()
+            .context(WrongStageSnafu { expected: "PROGRAM LINEAR stage", got: "missing".to_string() })?;
+        snafu::ensure!(
+            matches!(linear.op(), Op::Linear { .. }),
+            WrongStageSnafu { expected: "PROGRAM linear stage LINEAR", got: format!("{:?}", linear.op()) }
+        );
 
-        let source =
-            source.as_ref().ok_or_else(|| Error::Runtime { message: "PROGRAM missing SOURCE stage".to_string() })?;
+        let source = source
+            .as_ref()
+            .context(WrongStageSnafu { expected: "PROGRAM SOURCE stage", got: "missing".to_string() })?;
         let source_code = match source.op() {
             Op::Source { code } => code.clone(),
-            _ => {
-                return Err(Error::Runtime {
-                    message: format!("PROGRAM source stage must be SOURCE op, got {:?}", source.op()),
-                });
+            other => {
+                return WrongStageSnafu { expected: "PROGRAM source stage SOURCE", got: format!("{other:?}") }.fail();
             }
         };
 
-        if let Some(binary) = binary
-            && !matches!(binary.op(), Op::ProgramBinary { .. })
-        {
-            return Err(Error::Runtime {
-                message: format!("PROGRAM binary stage must be ProgramBinary op, got {:?}", binary.op()),
-            });
+        if let Some(binary) = binary {
+            snafu::ensure!(
+                matches!(binary.op(), Op::ProgramBinary { .. }),
+                WrongStageSnafu { expected: "PROGRAM binary stage ProgramBinary", got: format!("{:?}", binary.op()) }
+            );
         }
 
         let derived = Self::derive_metadata_from_sink(sink);

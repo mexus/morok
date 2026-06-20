@@ -139,10 +139,22 @@ impl DeviceRegistry {
             #[cfg(feature = "cuda")]
             DeviceSpec::Cuda { device_id } => Box::new(crate::allocator::CudaAllocator::new(*device_id)?),
             #[cfg(not(feature = "cuda"))]
-            DeviceSpec::Cuda { .. } => unimplemented!("Cuda allocator - to be implemented"),
+            DeviceSpec::Cuda { .. } => {
+                return Err(crate::error::Error::DeviceUnavailable {
+                    reason: "CUDA device requested but the `cuda` feature is not enabled".into(),
+                });
+            }
             DeviceSpec::Amd { device_id, .. } => Box::new(crate::amd::AmdAllocator::new(*device_id)?),
-            DeviceSpec::Metal { .. } => unimplemented!("Metal allocator - to be implemented"),
-            DeviceSpec::WebGpu => unimplemented!("WebGPU allocator - to be implemented"),
+            DeviceSpec::Metal { .. } => {
+                return Err(crate::error::Error::DeviceUnavailable {
+                    reason: "Metal allocator is not yet implemented".into(),
+                });
+            }
+            DeviceSpec::WebGpu => {
+                return Err(crate::error::Error::DeviceUnavailable {
+                    reason: "WebGPU allocator is not yet implemented".into(),
+                });
+            }
             DeviceSpec::Disk { .. } => unreachable!(),
         };
 
@@ -180,7 +192,7 @@ pub fn resolve_amd_arch_from_topology(device_id: usize) -> Result<svod_dtype::Am
         reason: format!("device_id {device_id} out of range; {} GPU node(s) present", nodes.len()),
     })?;
     svod_dtype::AmdArch::from_gfx_target_version(node.gfx_target_version).ok_or_else(|| {
-        crate::error::Error::AmdAllocFailed {
+        crate::error::Error::DeviceUnavailable {
             reason: format!("unsupported gfx_target_version {} on AMD device {device_id}", node.gfx_target_version),
         }
     })
