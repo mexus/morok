@@ -5,13 +5,16 @@
 //! and validates on gfx942 (lane-distributed, so the CPU backend can't run it).
 
 use smallvec::smallvec;
-use svod_dtype::DType;
-use svod_ir::Op;
+use svod_dtype::{AmdArch, DType};
+use svod_ir::{BinaryOp, Op};
 
+use crate::arch::FragRole;
 use crate::index::Idx;
 use crate::tile::RegTile;
 use crate::tiles::{RT_16X16, ST_16X16, TileLayout, VecLayout};
-use crate::{Kernel, MoveIdx};
+use crate::{ArchCaps, ArgDir, Kernel, MoveIdx};
+
+const ROW: TileLayout = TileLayout::Row;
 
 const INV_LN2: f64 = std::f64::consts::LOG2_E; // 1 / ln(2) == log2(e)
 
@@ -101,6 +104,43 @@ fn test_row_reduce_graph_shape() {
     assert!(!topo.iter().any(|u| matches!(u.op(), Op::Wmma { .. })), "a reduction has no WMMA");
 }
 
+/// `row_arg_reduce` threads an index alongside the value: each `reduce_tree` step
+/// shuffles BOTH payloads (so the partner's index rides its own `ds_bpermute`,
+/// never re-derived) → exactly `2 * reduce_tree().len()` `Op::Custom` gathers, plus
+/// the `where`-select pair-fold (`Ternary` + `Lt`/`Eq` compares), and still no LDS,
+/// no barrier, no WMMA. Holds on both wave64 (gfx942) and wave32 (gfx1151).
+#[test]
+fn test_row_arg_reduce_graph_shape() {
+    let build = |caps: ArchCaps| {
+        let ker = Kernel::new("argred", [1, 1, 1], caps.wave_size as i64, vec![], caps);
+        let warp = ker.warp();
+        let frag = ker.caps.frag(FragRole::Accumulator);
+        let src = warp.zero(ker.rt((16, 16), DType::Float32, ROW, frag));
+        let val = warp.clear_rv(ker.rv(16, DType::Float32, VecLayout::Ortho, frag), f64::INFINITY);
+        let idx = warp.clear_rv(ker.rv(16, DType::Int32, VecLayout::Ortho, frag), -1.0);
+        // The index result transitively depends on the value path (the keep
+        // predicate reads the value compares), so its toposort covers both.
+        let (_, idx) = warp.row_arg_reduce(val, idx, &src, ArgDir::Min);
+        idx.uop().toposort()
+    };
+    for caps in [ArchCaps::GFX942, ArchCaps::for_arch(AmdArch::Gfx1151)] {
+        let want_customs = 2 * caps.reduce_tree().len();
+        let topo = build(caps);
+        let customs = topo.iter().filter(|u| matches!(u.op(), Op::Custom { .. })).count();
+        assert_eq!(customs, want_customs, "{:?}: value+index each ride a ds_bpermute per tree step", caps.arch);
+        assert!(topo.iter().any(|u| matches!(u.op(), Op::Ternary(..))), "{:?}: where-select pair-fold", caps.arch);
+        assert!(
+            topo.iter().any(|u| matches!(u.op(), Op::Binary(BinaryOp::Lt, ..))),
+            "{:?}: strict/tie Lt compare",
+            caps.arch
+        );
+        assert!(topo.iter().any(|u| matches!(u.op(), Op::Binary(BinaryOp::Eq, ..))), "{:?}: tie Eq compare", caps.arch);
+        assert!(!topo.iter().any(|u| matches!(u.op(), Op::DefineLocal(_))), "{:?}: no LDS scratch", caps.arch);
+        assert!(!topo.iter().any(|u| matches!(u.op(), Op::Barrier { .. })), "{:?}: no barrier", caps.arch);
+        assert!(!topo.iter().any(|u| matches!(u.op(), Op::Wmma { .. })), "{:?}: no WMMA", caps.arch);
+    }
+}
+
 // =============================================================================
 // Hardware-gated end-to-end softmax on gfx942.
 // =============================================================================
@@ -186,4 +226,88 @@ fn test_softmax_unroll_amd() {
         println!("softmax_u N={n} block={block}: max abs error = {max_abs:e}");
         assert!(max_abs < 1e-4, "softmax_u N={n} block={block}: max abs error {max_abs} exceeds 1e-4");
     }
+}
+
+/// `SVOD_DEVICE=AMD:0 cargo test -p svod-tk --lib reductions::test_row_argmin_amd -- --ignored --nocapture`.
+///
+/// End-to-end argmin of a known 16×16 matrix into the role-selected accumulator
+/// fragment (arch-portable: wave64 gfx942 or wave32 gfx1151). `row_arg_reduce`
+/// reduces the fragment's `inner`-carrying folded axis — the matrix *column* on the
+/// non-interleave gfx942 frag, the matrix *row* on the wave32 even/odd accumulator
+/// (the caller arranges the tile, exactly like `row_reduce` in FA). To assert one
+/// result on either layout the matrix is **symmetric**, so the per-row argmin equals
+/// the per-column argmin, and we read the output **diagonal** `out[k][k]`, which is
+/// `rv[k]` whether the result vector broadcasts along rows or columns. An involution
+/// pairs `(2k, 2k+1)` as the −1.0 minima; an extra symmetric −1.0 at `(0,6)`/`(6,0)`
+/// makes index 0 a **tie** (cols 1 and 6 → must resolve to 1).
+#[test]
+#[ignore]
+fn test_row_argmin_amd() {
+    use svod_tensor::Tensor;
+
+    let dev = Tensor::rand(&[16, 16]).expect("probe").device();
+    let Some(arch) = crate::target::resolve_arch(&dev) else {
+        eprintln!("skip test_row_argmin_amd: no AMD device");
+        return;
+    };
+    let w = arch.wave_size() as i64;
+
+    // Symmetric matrix: +1.0 except −1.0 at the involution pairs (2k, 2k+1) and a
+    // tie pair (0, 6). Symmetry ⇒ per-row argmin == per-column argmin, so the
+    // expectation is layout-independent.
+    let mut m = vec![1.0f32; 256];
+    let mut set = |i: usize, j: usize| {
+        m[i * 16 + j] = -1.0;
+        m[j * 16 + i] = -1.0;
+    };
+    for k in 0..8 {
+        set(2 * k, 2 * k + 1);
+    }
+    set(0, 6); // tie: row/col 0 now has −1.0 at {1, 6} → argmin 1; row/col 6 at {0, 7} → 0
+    let mut expect = [0i32; 16];
+    for r in 0..16usize {
+        let (mut best_v, mut best_j) = (f32::INFINITY, 0i32);
+        for c in 0..16usize {
+            if m[r * 16 + c] < best_v {
+                best_v = m[r * 16 + c];
+                best_j = c as i32;
+            }
+        }
+        expect[r] = best_j;
+    }
+
+    let mut a = Tensor::from_slice(&m).try_reshape([1usize, 1, 16, 16]).expect("reshape a");
+    a.realize().expect("realize a");
+    let mut vout = Tensor::empty(&[1, 1, 16, 16], DType::Float32);
+    let mut iout = Tensor::empty(&[1, 1, 16, 16], DType::Int32);
+
+    crate::run_kernel("argmin", [1, 1, 1], w, &mut [&mut vout, &mut iout], &[&a], |ker| {
+        let warp = ker.warp();
+        let frag = ker.caps.frag(FragRole::Accumulator);
+        let vo = ker.gl(&[1, 1, 16, 16], DType::Float32);
+        let io = ker.gl(&[1, 1, 16, 16], DType::Int32);
+        let ain = ker.gl(&[1, 1, 16, 16], DType::Float32);
+        let z = [Idx::Const(0), Idx::Const(0), Idx::Const(0), Idx::Const(0)];
+
+        let src = warp.load(ker.rt((16, 16), DType::Float32, ROW, frag), ain, MoveIdx::block(&z, 2));
+        let val = warp.clear_rv(ker.rv(16, DType::Float32, VecLayout::Ortho, frag), f64::INFINITY);
+        let idx = warp.clear_rv(ker.rv(16, DType::Int32, VecLayout::Ortho, frag), -1.0);
+        let (val, idx) = warp.row_arg_reduce(val, idx, &src, ArgDir::Min);
+
+        let vtile = warp.add_rv(warp.zero(ker.rt((16, 16), DType::Float32, ROW, frag)), &val);
+        let itile = warp.add_rv(warp.zero(ker.rt((16, 16), DType::Int32, ROW, frag)), &idx);
+        let _ = warp.store(vo, vtile, MoveIdx::block(&z, 2));
+        let _ = warp.store(io, itile, MoveIdx::block(&z, 2));
+        ker.finish(2)
+    })
+    .expect("argmin launch");
+
+    let gv = vout.as_vec::<f32>().expect("read vout");
+    let gi = iout.as_vec::<i32>().expect("read iout");
+    // Read the diagonal: out[k][k] == rv[k] regardless of the RV broadcast axis.
+    for k in 0..16usize {
+        assert_eq!(gi[k * 16 + k], expect[k], "row/col {k}: argmin index (diagonal)");
+        assert!((gv[k * 16 + k] + 1.0).abs() < 1e-6, "row/col {k}: argmin value −1.0, got {}", gv[k * 16 + k]);
+    }
+    println!("row_argmin: 16/16 correct on {arch:?} (tie at index 0 → 1)");
 }

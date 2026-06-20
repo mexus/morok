@@ -72,7 +72,7 @@ pub use launch::{Error as LaunchError, Result as LaunchResult};
 
 // ── Author your own kernel (the tile DSL) ───────────────────────────────────
 pub use arch::ArchCaps;
-pub use group::{Group, LoadInto, MoveIdx, StoreInto, SwapDir};
+pub use group::{ArgDir, Group, LoadInto, MoveIdx, StoreInto, SwapDir};
 pub use kernel::Kernel;
 pub use launch::{graph_launch, launch_custom}; // wrap a hand kernel as a lazy Tensor graph node / kernel entry
 pub use loop_scope::Loop;
