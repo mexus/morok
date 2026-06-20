@@ -4,37 +4,31 @@
 
 use std::sync::Arc;
 
+use snafu::{ResultExt, Snafu};
 use svod_ir::UOp;
 
-use crate::z3::convert::Z3Context;
+use crate::z3::convert::{ConversionError, TypeMismatchSnafu, Z3Context};
 
 /// Result of equivalence verification.
 pub type VerificationResult = Result<(), CounterExample>;
 
 /// Counterexample when verification fails.
-#[derive(Debug, Clone)]
+#[derive(Debug, Snafu)]
+#[snafu(visibility(pub))]
 pub enum CounterExample {
     /// Z3 found a concrete input where expressions differ.
+    #[snafu(display("Counterexample found: {message}\nModel: {model}"))]
     Found { message: String, model: String },
     /// Z3 timed out or returned unknown.
+    #[snafu(display("Z3 timeout or unknown result"))]
     Timeout,
     /// Conversion to Z3 failed.
-    ConversionFailed(String),
+    #[snafu(display("Conversion failed: {source}"))]
+    ConversionFailed {
+        #[snafu(source)]
+        source: ConversionError,
+    },
 }
-
-impl std::fmt::Display for CounterExample {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Found { message, model } => {
-                write!(f, "Counterexample found: {}\nModel: {}", message, model)
-            }
-            Self::Timeout => write!(f, "Z3 timeout or unknown result"),
-            Self::ConversionFailed(s) => write!(f, "Conversion failed: {}", s),
-        }
-    }
-}
-
-impl std::error::Error for CounterExample {}
 
 /// Verify that two UOp expressions are semantically equivalent.
 ///
@@ -52,15 +46,8 @@ pub fn verify_equivalence(original: &Arc<UOp>, simplified: &Arc<UOp>) -> Verific
     let mut z3ctx = Z3Context::new();
 
     // Convert both expressions to Z3
-    let z3_original = match z3ctx.convert_uop(original) {
-        Ok(expr) => expr,
-        Err(e) => return Err(CounterExample::ConversionFailed(format!("Failed to convert original: {}", e))),
-    };
-
-    let z3_simplified = match z3ctx.convert_uop(simplified) {
-        Ok(expr) => expr,
-        Err(e) => return Err(CounterExample::ConversionFailed(format!("Failed to convert simplified: {}", e))),
-    };
+    let z3_original = z3ctx.convert_uop(original).context(ConversionFailedSnafu)?;
+    let z3_simplified = z3ctx.convert_uop(simplified).context(ConversionFailedSnafu)?;
 
     // Try to cast to same type for comparison
     let (z3_original, z3_simplified) = match (z3_original.as_int(), z3_simplified.as_int()) {
@@ -86,13 +73,13 @@ pub fn verify_equivalence(original: &Arc<UOp>, simplified: &Arc<UOp>) -> Verific
                                 model,
                             });
                         }
-                        z3::SatResult::Unknown => return Err(CounterExample::Timeout),
+                        z3::SatResult::Unknown => return TimeoutSnafu.fail(),
                     }
                 }
                 _ => {
-                    return Err(CounterExample::ConversionFailed(
-                        "Type mismatch: cannot compare expressions".to_string(),
-                    ));
+                    return TypeMismatchSnafu { detail: "cannot compare expressions" }
+                        .fail::<()>()
+                        .context(ConversionFailedSnafu);
                 }
             }
         }

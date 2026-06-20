@@ -6,6 +6,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use snafu::{OptionExt, Snafu};
 use svod_dtype::DType;
 use svod_ir::types::{BinaryOp, ConstValue, TernaryOp, UnaryOp};
 use svod_ir::{Op, UOp};
@@ -97,12 +98,10 @@ impl Z3Context {
                     if let (Some(true_int), Some(false_int)) = (true_z3.as_int(), false_z3.as_int()) {
                         Dynamic::from_ast(&cond_bool.ite(&true_int, &false_int))
                     } else {
-                        return Err(ConversionError::UnsupportedOperation(
-                            "WHERE with non-integer branches".to_string(),
-                        ));
+                        return UnsupportedOperationSnafu { detail: "WHERE with non-integer branches" }.fail();
                     }
                 } else {
-                    return Err(ConversionError::UnsupportedOperation("WHERE with non-boolean condition".to_string()));
+                    return UnsupportedOperationSnafu { detail: "WHERE with non-boolean condition" }.fail();
                 }
             }
 
@@ -114,7 +113,7 @@ impl Z3Context {
                 if let (Some(a_int), Some(b_int), Some(c_int)) = (a_z3.as_int(), b_z3.as_int(), c_z3.as_int()) {
                     Dynamic::from_ast(&(a_int * b_int + c_int))
                 } else {
-                    return Err(ConversionError::UnsupportedOperation("MULACC with non-integer operands".to_string()));
+                    return UnsupportedOperationSnafu { detail: "MULACC with non-integer operands" }.fail();
                 }
             }
 
@@ -143,7 +142,7 @@ impl Z3Context {
             }
 
             _ => {
-                return Err(ConversionError::UnsupportedOperation(format!("{:?}", uop.op())));
+                return UnsupportedOpSnafu { op: uop.op().as_ref().to_string() }.fail();
             }
         };
 
@@ -161,9 +160,7 @@ impl Z3Context {
                 Ok(Dynamic::from_ast(&Int::from_u64(*v)))
             }
             ConstValue::Bool(v) => Ok(Dynamic::from_ast(&Bool::from_bool(*v))),
-            ConstValue::Float(_) => {
-                Err(ConversionError::UnsupportedType("Float constants not fully supported".to_string()))
-            }
+            ConstValue::Float(_) => UnsupportedTypeSnafu { detail: "Float constants not fully supported" }.fail(),
         }
     }
 
@@ -195,12 +192,11 @@ impl Z3Context {
 
     /// Convert unary operation.
     fn convert_unary(op: UnaryOp, src: &Dynamic) -> Result<Dynamic, ConversionError> {
-        let src_int =
-            src.as_int().ok_or_else(|| ConversionError::TypeMismatch("Expected int for unary op".to_string()))?;
+        let src_int = src.as_int().context(TypeMismatchSnafu { detail: "Expected int for unary op" })?;
 
         match op {
             UnaryOp::Neg => Ok(Dynamic::from_ast(&-src_int)),
-            _ => Err(ConversionError::UnsupportedOperation(format!("Unary op: {:?}", op))),
+            _ => UnsupportedUnaryOpSnafu { op: op.as_ref().to_string() }.fail(),
         }
     }
 
@@ -209,43 +205,43 @@ impl Z3Context {
         match op {
             // Arithmetic operations (require integers)
             BinaryOp::Add => {
-                let l = lhs.as_int().ok_or(ConversionError::TypeMismatch("ADD: expected int".to_string()))?;
-                let r = rhs.as_int().ok_or(ConversionError::TypeMismatch("ADD: expected int".to_string()))?;
+                let l = lhs.as_int().context(TypeMismatchSnafu { detail: "ADD: expected int" })?;
+                let r = rhs.as_int().context(TypeMismatchSnafu { detail: "ADD: expected int" })?;
                 Ok(Dynamic::from_ast(&(l + r)))
             }
             BinaryOp::Sub => {
-                let l = lhs.as_int().ok_or(ConversionError::TypeMismatch("SUB: expected int".to_string()))?;
-                let r = rhs.as_int().ok_or(ConversionError::TypeMismatch("SUB: expected int".to_string()))?;
+                let l = lhs.as_int().context(TypeMismatchSnafu { detail: "SUB: expected int" })?;
+                let r = rhs.as_int().context(TypeMismatchSnafu { detail: "SUB: expected int" })?;
                 Ok(Dynamic::from_ast(&(l - r)))
             }
             BinaryOp::Mul => {
-                let l = lhs.as_int().ok_or(ConversionError::TypeMismatch("MUL: expected int".to_string()))?;
-                let r = rhs.as_int().ok_or(ConversionError::TypeMismatch("MUL: expected int".to_string()))?;
+                let l = lhs.as_int().context(TypeMismatchSnafu { detail: "MUL: expected int" })?;
+                let r = rhs.as_int().context(TypeMismatchSnafu { detail: "MUL: expected int" })?;
                 Ok(Dynamic::from_ast(&(l * r)))
             }
             BinaryOp::Idiv => {
-                let l = lhs.as_int().ok_or(ConversionError::TypeMismatch("IDIV: expected int".to_string()))?;
-                let r = rhs.as_int().ok_or(ConversionError::TypeMismatch("IDIV: expected int".to_string()))?;
+                let l = lhs.as_int().context(TypeMismatchSnafu { detail: "IDIV: expected int" })?;
+                let r = rhs.as_int().context(TypeMismatchSnafu { detail: "IDIV: expected int" })?;
                 // Use truncated division (C-style)
                 Ok(Dynamic::from_ast(&z3_cdiv(&l, &r)))
             }
             BinaryOp::Mod => {
-                let l = lhs.as_int().ok_or(ConversionError::TypeMismatch("MOD: expected int".to_string()))?;
-                let r = rhs.as_int().ok_or(ConversionError::TypeMismatch("MOD: expected int".to_string()))?;
+                let l = lhs.as_int().context(TypeMismatchSnafu { detail: "MOD: expected int" })?;
+                let r = rhs.as_int().context(TypeMismatchSnafu { detail: "MOD: expected int" })?;
                 // Use C-style modulo
                 Ok(Dynamic::from_ast(&z3_cmod(&l, &r)))
             }
             BinaryOp::Max => {
-                let l = lhs.as_int().ok_or(ConversionError::TypeMismatch("MAX: expected int".to_string()))?;
-                let r = rhs.as_int().ok_or(ConversionError::TypeMismatch("MAX: expected int".to_string()))?;
+                let l = lhs.as_int().context(TypeMismatchSnafu { detail: "MAX: expected int" })?;
+                let r = rhs.as_int().context(TypeMismatchSnafu { detail: "MAX: expected int" })?;
                 // max(a, b) = if a > b then a else b
                 Ok(Dynamic::from_ast(&l.gt(&r).ite(&l, &r)))
             }
 
             // Comparison operations (return boolean)
             BinaryOp::Lt => {
-                let l = lhs.as_int().ok_or(ConversionError::TypeMismatch("LT: expected int".to_string()))?;
-                let r = rhs.as_int().ok_or(ConversionError::TypeMismatch("LT: expected int".to_string()))?;
+                let l = lhs.as_int().context(TypeMismatchSnafu { detail: "LT: expected int" })?;
+                let r = rhs.as_int().context(TypeMismatchSnafu { detail: "LT: expected int" })?;
                 Ok(Dynamic::from_ast(&l.lt(r)))
             }
             BinaryOp::Eq => {
@@ -255,7 +251,7 @@ impl Z3Context {
                 } else if let (Some(l), Some(r)) = (lhs.as_bool(), rhs.as_bool()) {
                     Ok(Dynamic::from_ast(&l.eq(r)))
                 } else {
-                    Err(ConversionError::TypeMismatch("EQ: type mismatch".to_string()))
+                    TypeMismatchSnafu { detail: "EQ: type mismatch" }.fail()
                 }
             }
             BinaryOp::Ne => {
@@ -265,7 +261,7 @@ impl Z3Context {
                 } else if let (Some(l), Some(r)) = (lhs.as_bool(), rhs.as_bool()) {
                     Ok(Dynamic::from_ast(&l.eq(r).not()))
                 } else {
-                    Err(ConversionError::TypeMismatch("NE: type mismatch".to_string()))
+                    TypeMismatchSnafu { detail: "NE: type mismatch" }.fail()
                 }
             }
 
@@ -275,7 +271,7 @@ impl Z3Context {
                 if let (Some(l), Some(r)) = (lhs.as_bool(), rhs.as_bool()) {
                     Ok(Dynamic::from_ast(&Bool::and(&[l, r])))
                 } else {
-                    Err(ConversionError::UnsupportedOperation("Bitwise AND not implemented".to_string()))
+                    UnsupportedOperationSnafu { detail: "Bitwise AND not implemented" }.fail()
                 }
             }
             BinaryOp::Or => {
@@ -283,11 +279,11 @@ impl Z3Context {
                 if let (Some(l), Some(r)) = (lhs.as_bool(), rhs.as_bool()) {
                     Ok(Dynamic::from_ast(&Bool::or(&[l, r])))
                 } else {
-                    Err(ConversionError::UnsupportedOperation("Bitwise OR not implemented".to_string()))
+                    UnsupportedOperationSnafu { detail: "Bitwise OR not implemented" }.fail()
                 }
             }
 
-            _ => Err(ConversionError::UnsupportedOperation(format!("Binary op: {:?}", op))),
+            _ => UnsupportedBinaryOpSnafu { op: op.as_ref().to_string() }.fail(),
         }
     }
 }
@@ -333,24 +329,22 @@ fn dtype_bounds(dtype: DType) -> (i64, i64) {
 }
 
 /// Z3 conversion error.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Snafu)]
+#[snafu(visibility(pub))]
 pub enum ConversionError {
-    UnsupportedOperation(String),
-    UnsupportedType(String),
-    TypeMismatch(String),
+    #[snafu(display("Unsupported operation: {detail}"))]
+    UnsupportedOperation { detail: &'static str },
+    #[snafu(display("Unsupported operation: {op}"))]
+    UnsupportedOp { op: String },
+    #[snafu(display("Unsupported operation: Unary op: {op}"))]
+    UnsupportedUnaryOp { op: String },
+    #[snafu(display("Unsupported operation: Binary op: {op}"))]
+    UnsupportedBinaryOp { op: String },
+    #[snafu(display("Unsupported type: {detail}"))]
+    UnsupportedType { detail: &'static str },
+    #[snafu(display("Type mismatch: {detail}"))]
+    TypeMismatch { detail: &'static str },
 }
-
-impl std::fmt::Display for ConversionError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::UnsupportedOperation(s) => write!(f, "Unsupported operation: {}", s),
-            Self::UnsupportedType(s) => write!(f, "Unsupported type: {}", s),
-            Self::TypeMismatch(s) => write!(f, "Type mismatch: {}", s),
-        }
-    }
-}
-
-impl std::error::Error for ConversionError {}
 
 #[cfg(test)]
 #[path = "../test/unit/z3/convert_internal.rs"]

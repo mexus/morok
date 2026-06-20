@@ -157,7 +157,7 @@ proptest! {
                     crate::z3::CounterExample::Found { .. } => {
                         prop_assert!(false, "Z3 found counterexample: {}", e);
                     }
-                    crate::z3::CounterExample::ConversionFailed(_) => {
+                    crate::z3::CounterExample::ConversionFailed { .. } => {
                         // Some operations may not be supported yet - skip
                     }
                     crate::z3::CounterExample::Timeout => {
