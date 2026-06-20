@@ -341,3 +341,218 @@ fn test_knn_topk_amd() {
         println!("knn_topk corpus={corpus} query={query} d={d} k={k} tie={tie}: OK on {arch:?}");
     }
 }
+
+// =============================================================================
+// Stage 3 — the public `svod_tk::knn` entry (prep + launch + generic-graph tail).
+// =============================================================================
+
+/// The malformed-request `Err` paths of the public [`crate::knn`] are checked BEFORE
+/// arch resolution, so they hold on ANY device (no GPU required): a `D` mismatch
+/// between the query and the corpus, `k > M`, and `k` outside the kernel's `1..=16`.
+#[test]
+fn test_knn_err_paths() {
+    use svod_tensor::Tensor;
+
+    // D mismatch: x is [4, 8], c is [16, 6] → query/corpus dims disagree.
+    let x = Tensor::randn(&[4, 8]).expect("x");
+    let c_baddim = Tensor::randn(&[16, 6]).expect("c bad-d");
+    crate::knn(&x, &c_baddim, 2).err().expect("D mismatch must error, not None/panic");
+
+    // k > M: only 3 corpus rows but k = 4.
+    let c_small = Tensor::randn(&[3, 8]).expect("c small");
+    crate::knn(&x, &c_small, 4).err().expect("k > M must error");
+
+    // k > 16 (and k == 0) are outside the kernel's 1..=16.
+    let c = Tensor::randn(&[64, 8]).expect("c");
+    crate::knn(&x, &c, 17).err().expect("k > 16 must error");
+    crate::knn(&x, &c, 0).err().expect("k == 0 must error");
+
+    // Non-rank-2 (rank-1 query) errors via `concrete_dims`, also device-independent.
+    let x1 = Tensor::randn(&[8]).expect("x rank-1");
+    crate::knn(&x1, &c, 2).err().expect("rank-1 query must error");
+}
+
+/// Device-gated **graph-shape** check (builds the lazy `(dists, idxs)` but does NOT
+/// realize — no dispatch): the `idxs` graph carries the kernel's `Op::Call`
+/// custom-kernel node AND the generic-graph tail (the sort's `Max`/`Min` compares +
+/// the gather's `Eq` select), and the outcome is `Ok(Some)`. Self-skips off an AMD GPU
+/// (the public entry returns `Ok(None)` there — the kernel can't be built without a
+/// resolved arch). Covers a ragged-D / multi-query-block shape so the tail's
+/// pad/slice/reshape are exercised in the graph.
+#[test]
+fn test_knn_graph_shape() {
+    use svod_tensor::Tensor;
+
+    if !device_supported() {
+        eprintln!("skip test_knn_graph_shape: no supported AMD GPU / toolchain");
+        return;
+    }
+    let x = Tensor::randn(&[40, 20]).expect("x [40,20]"); // N=40 (multi-block), D=20 (ragged)
+    let c = Tensor::randn(&[100, 20]).expect("c [100,20]");
+    let (dists, idxs) = crate::knn(&x, &c, 5).expect("knn builds").expect("Ok(Some) on a supported device");
+
+    let topo = idxs.uop().toposort();
+    assert!(topo.iter().any(|u| matches!(u.op(), Op::Call { .. })), "idxs graph carries the kernel Op::Call node");
+    // The bitonic sort folds the K via Max/Min compares; the gather selects via Eq.
+    assert!(
+        topo.iter().any(|u| matches!(u.op(), Op::Binary(svod_ir::BinaryOp::Max, ..))),
+        "tail sort emits a Max compare"
+    );
+    assert!(
+        topo.iter().any(|u| matches!(u.op(), Op::Binary(svod_ir::BinaryOp::Eq, ..))),
+        "tail gather emits an Eq select"
+    );
+    // The exact-distance tail (dists) carries the same kernel Call plus its own sub/sum.
+    let dtopo = dists.uop().toposort();
+    assert!(dtopo.iter().any(|u| matches!(u.op(), Op::Call { .. })), "dists graph carries the kernel Op::Call node");
+}
+
+/// `SVOD_DEVICE=AMD:0 cargo test -p svod-tk --lib knn::test_knn_amd -- --ignored --nocapture`.
+///
+/// End-to-end public [`crate::knn`] vs a generic-Tensor brute-force reference
+/// (`knn_torch_naive`): the FULL squared-L2 `‖x‖² + ‖c‖² − 2·x@cᵀ` (clamped ≥ 0),
+/// `.topk(k, dim=1, largest=false)`. Indices are compared as **sorted sets per query**
+/// (ties → smaller index, which both `topk` and the kernel honor); distances within a
+/// √D-scaled bf16 tolerance (the kernel's cross term is bf16; the returned ‖·‖² is the
+/// exact-f32 re-gather). Sweeps: `N ≤ 16` (single block) and `N > 16` (N=40,
+/// multi-block + ragged query), `D` not a multiple of 16 (D=20, zero-pad), a ragged
+/// corpus (`M % 16 != 0`), `k = 1`, and a forced-tie corpus.
+#[test]
+#[ignore]
+fn test_knn_amd() {
+    use svod_tensor::Tensor;
+    use svod_tensor::testing::allclose_f32;
+
+    if !device_supported() {
+        eprintln!("skip test_knn_amd: no supported AMD GPU / toolchain");
+        return;
+    }
+    let dev = Tensor::rand(&[16, 16]).expect("probe").device();
+    let arch = crate::target::resolve_arch(&dev).expect("resolve arch");
+
+    // (n, m, d, k, tie): single-block, multi-block, ragged-D, ragged-corpus, k=1, tie.
+    let cases: &[(usize, usize, usize, usize, bool)] = &[
+        (12, 32, 16, 4, false),  // N ≤ 16 single block
+        (40, 100, 16, 5, false), // N > 16 multi-block + ragged query (40 % 16 != 0)
+        (16, 64, 20, 4, false),  // D = 20 ragged-D (zero-pad)
+        (16, 50, 16, 3, false),  // M = 50 ragged corpus (50 % 16 != 0)
+        (32, 48, 24, 1, false),  // k = 1, ragged-D, multi-block
+        (16, 32, 16, 1, true),   // forced tie: smaller corpus index must win
+    ];
+
+    for &(n, m, d, k, tie) in cases {
+        // Deterministic per-case inputs so the sweep is reproducible (the bf16-score
+        // kernel vs the f32 oracle is sensitive to k-boundary near-ties; a fixed seed
+        // keeps the run stable, and the tie-tolerant index check below admits the
+        // legitimate same-distance swaps that do arise).
+        svod_tensor::rand::manual_seed(0x4B4E_4E00 ^ (n * 131 + m * 17 + d * 7 + k) as u64);
+        let mut x = Tensor::randn(&[n, d]).expect("randn x");
+        let mut c = Tensor::randn(&[m, d]).expect("randn c");
+        x.realize().expect("realize x");
+        c.realize().expect("realize c");
+
+        // Forced tie: duplicate corpus row 0 into row 1 (both equidistant to any query),
+        // and put query 0 ON that row so the tied pair is its nearest — the smaller
+        // corpus index (0) must be kept, the duplicate (1) excluded.
+        if tie {
+            let row0 = c.try_shrink([(0, 1), (0, d as isize)]).expect("row0");
+            let rest = c.try_shrink([(2, m as isize), (0, d as isize)]).expect("rest");
+            c = Tensor::cat(&[&row0, &row0, &rest], 0).expect("dup row0 into row1");
+            c.realize().expect("realize tie c");
+            let q0 = c.try_shrink([(0, 1), (0, d as isize)]).expect("tie q0=c[0]");
+            let qrest = x.try_shrink([(1, n as isize), (0, d as isize)]).expect("tie qrest");
+            x = Tensor::cat(&[&q0, &qrest], 0).expect("set x[0]=c[0]");
+            x.realize().expect("realize tie x");
+        }
+
+        let (mut dists, mut idxs) = crate::knn(&x, &c, k).expect("knn builds").expect("Ok(Some) on AMD");
+        dists.realize().expect("realize dists");
+        idxs.realize().expect("realize idxs");
+        let got_dist = dists.as_vec::<f32>().expect("read dists");
+        let got_idx = idxs.as_vec::<i32>().expect("read idxs");
+
+        // Brute-force reference: full ‖x−c‖² = ‖x‖² + ‖c‖² − 2·x@cᵀ (clamp ≥ 0), then
+        // topk smallest. `rfull` is the [N, M] true distance matrix (for tie resolution).
+        let (rdist, ridx, rfull) = knn_torch_naive(&x, &c, k);
+
+        let atol = 0.02 * (d as f32).sqrt();
+        let mut ok = true;
+        for q in 0..n {
+            let g: Vec<i32> = got_idx[q * k..(q + 1) * k].to_vec();
+            let e: Vec<i32> = ridx[q * k..(q + 1) * k].to_vec();
+            // The kernel scores the corpus in bf16, the oracle in f32; at the k-boundary
+            // two near-equidistant corpus rows can rank-swap (a legitimate tie the two
+            // precisions break differently). So compare by the TRUE (f32) distances, not
+            // the raw index set: the multiset of the kernel-chosen indices' true distances
+            // must match the oracle's top-k true distances (ascending), within tolerance.
+            // This rejects a genuinely-wrong neighbor but admits a same-distance swap.
+            let true_d = |idx: &[i32]| -> Vec<f32> {
+                let mut v: Vec<f32> = idx.iter().map(|&i| rfull[q * m + i as usize]).collect();
+                v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                v
+            };
+            let (gd, ed) = (true_d(&g), true_d(&e));
+            let r_idx = allclose_f32(&gd, &ed, atol, 2e-2);
+            // The kernel's chosen indices must be distinct + in range (no slot leak).
+            let mut gs = g.clone();
+            gs.sort_unstable();
+            gs.dedup();
+            let distinct = gs.len() == k && g.iter().all(|&i| (0..m as i32).contains(&i));
+            if !r_idx.ok || !distinct {
+                ok = false;
+                eprintln!(
+                    "query {q}: kernel idx {g:?} (true d {gd:?}) != ref idx {e:?} (true d {ed:?}) \
+                     distinct={distinct} (n={n} m={m} d={d} k={k} tie={tie})"
+                );
+            }
+            // The RETURNED dists are the kernel's exact f32 re-gather, sorted ascending —
+            // they must equal the oracle's k smallest true distances element-wise.
+            let r = allclose_f32(&got_dist[q * k..(q + 1) * k], &rdist[q * k..(q + 1) * k], atol, 2e-2);
+            if !r.ok {
+                ok = false;
+                eprintln!("query {q}: returned-dist mismatch {} (n={n} m={m} d={d} k={k})", r.message);
+            }
+        }
+        if tie {
+            let q0: Vec<i32> = got_idx[0..k].to_vec();
+            assert!(q0.contains(&0), "tie: query 0 must keep the smaller corpus index 0, got {q0:?}");
+            assert!(!q0.contains(&1), "tie: query 0 must NOT keep the duplicate index 1, got {q0:?}");
+        }
+        let max_dist_err = got_dist.iter().zip(&rdist).map(|(g, e)| (g - e).abs()).fold(0.0f32, f32::max);
+        assert!(ok, "knn n={n} m={m} d={d} k={k} tie={tie} on {arch:?}");
+        println!("knn n={n} m={m} d={d} k={k} tie={tie}: OK on {arch:?}, max dist err = {max_dist_err:e}");
+    }
+}
+
+/// Generic-Tensor brute-force KNN reference: full squared-L2 distance
+/// `‖x[n]‖² + ‖c[m]‖² − 2·⟨x[n],c[m]⟩` (clamped ≥ 0 for the bf16-free f32 path), then
+/// `topk(k, dim=1, largest=false)`. Returns `(dists [N·k], idxs [N·k], full [N·M])` —
+/// the top-K distances/indices (ascending, ties → smaller index) plus the full true
+/// distance matrix (so the caller can resolve k-boundary near-ties against the exact
+/// distances). Computed entirely in f32 (no kernel) — the independent oracle.
+fn knn_torch_naive(x: &svod_tensor::Tensor, c: &svod_tensor::Tensor, k: usize) -> (Vec<f32>, Vec<i32>, Vec<f32>) {
+    use svod_tensor::Tensor;
+    let xf = x.cast(DType::Float32).expect("x→f32");
+    let cf = c.cast(DType::Float32).expect("c→f32");
+    let x_sq = xf.try_mul(&xf).expect("x²").sum_with().axes(1isize).keepdim(true).call().expect("‖x‖²"); // [N,1]
+    let c_sq = cf.try_mul(&cf).expect("c²").sum_with().axes(1isize).keepdim(true).call().expect("‖c‖²"); // [M,1]
+    let cross = xf.matmul(&cf.try_permute(&[1, 0]).expect("cᵀ")).expect("x@cᵀ"); // [N,M]
+    let two = Tensor::from_slice([2.0f32]);
+    let c_sq_row = c_sq.try_permute(&[1, 0]).expect("‖c‖²ᵀ"); // [1,M]
+    let mut dist = x_sq
+        .try_add(&c_sq_row)
+        .expect("‖x‖²+‖c‖²")
+        .try_sub(&cross.try_mul(&two).expect("2·cross"))
+        .expect("full ‖x−c‖²")
+        .relu()
+        .expect("clamp ≥ 0"); // [N,M], numerically ≥ 0
+    let (mut rd, mut ri) = dist.topk(k, -1, false).expect("ref topk");
+    rd.realize().expect("realize ref dist");
+    ri.realize().expect("realize ref idx");
+    dist.realize().expect("realize ref full dist");
+    (
+        rd.as_vec::<f32>().expect("ref dist"),
+        ri.as_vec::<i32>().expect("ref idx"),
+        dist.as_vec::<f32>().expect("ref full dist"),
+    )
+}

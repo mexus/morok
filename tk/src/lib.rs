@@ -67,6 +67,7 @@ const _: () = assert!(WARP_THREADS == svod_dtype::AmdArch::Gfx942.wave_size() as
 
 // ── Use the built-in kernels (Tensor in → Tensor out) ───────────────────────
 pub use kernels::fa::{FaOpts, flash_attention, flash_attention_with};
+pub use kernels::knn::knn;
 pub use kernels::matmul::matmul;
 pub use launch::{Error as LaunchError, Result as LaunchResult};
 
@@ -74,7 +75,7 @@ pub use launch::{Error as LaunchError, Result as LaunchResult};
 pub use arch::ArchCaps;
 pub use group::{ArgDir, Group, LoadInto, MoveIdx, StoreInto, SwapDir};
 pub use kernel::Kernel;
-pub use launch::{graph_launch, launch_custom}; // wrap a hand kernel as a lazy Tensor graph node / kernel entry
+pub use launch::{graph_launch, graph_launch_multi, launch_custom}; // wrap a hand kernel as a lazy Tensor graph node / kernel entry
 pub use loop_scope::Loop;
 pub use scaffold::GlSpec;
 pub use swizzle::Swizzle;

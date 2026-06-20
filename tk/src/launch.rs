@@ -154,6 +154,11 @@ pub enum Error {
     #[snafu(display("{kernel}: operands must be square and equal-sized, got {a:?} · {b:?}"))]
     NotSquare { kernel: &'static str, a: [usize; 2], b: [usize; 2] },
 
+    /// Two operands disagree on a named shared dimension (e.g. KNN's feature dim `D`,
+    /// which the query `x` and the corpus `c` must match).
+    #[snafu(display("{kernel}: operands disagree on {dim}: {a} != {b}"))]
+    OperandDimMismatch { kernel: &'static str, dim: &'static str, a: usize, b: usize },
+
     /// An operand's shape could not be determined.
     #[snafu(display("{kernel}: operand {operand}: shape is indeterminate"))]
     OperandIndeterminateShape { kernel: &'static str, operand: &'static str },
@@ -448,6 +453,56 @@ where
     let kname = name.clone();
     Tensor::graph_kernel(&name, out, ins, move |ph| build(&crate::Kernel::new(kname, grid, block, ph, caps)))
         .context(CustomKernelSnafu { name })
+}
+
+/// The **multi-output** peer of [`graph_launch`]: a hand-built kernel that binds
+/// `outs.len()` output globals (then `ins`) and returns one lazy [`Tensor`] per
+/// output. [`graph_launch`] is the one-output specialization (and stays the common
+/// case); KNN needs two (the unsorted top-K `idx`/`val`).
+///
+/// The generic `custom_kernel` wraps EACH source in an `AFTER(callable)` and hands
+/// the build closure PARAM placeholders in source order, so passing
+/// `[outs..., ins...]` as the sources makes the placeholder/global order
+/// `out0, out1, …, in0, in1, …` — exactly the kernel's `bind_abi` declaration order
+/// (outputs first). The first `outs.len()` returned tensors are the kernel's
+/// outputs (each carrying the AFTER-call dep that realizes the kernel); the trailing
+/// per-input AFTER tensors are dropped.
+///
+/// `build` receives the placeholders and returns the finished SINK
+/// (`ker.finish(n)`); the launch geometry rides on the `Op::Special` ops minted from
+/// `grid`/`block`, as in [`graph_launch`].
+pub fn graph_launch_multi<F>(
+    name: impl Into<String>,
+    grid: [i64; 3],
+    block: i64,
+    outs: Vec<Tensor>,
+    ins: &[&Tensor],
+    caps: crate::ArchCaps,
+    build: F,
+) -> Result<Vec<Tensor>>
+where
+    F: FnOnce(&crate::Kernel) -> Arc<UOp>,
+{
+    use svod_ir::CallInfo;
+
+    let name = name.into();
+    let kname = name.clone();
+    // Sources = [outs..., ins...]; `custom_kernel_with` makes a PARAM placeholder per
+    // source in that order and returns an AFTER(callable) per source. The kernel body
+    // (built by the closure) sees those placeholders as PARAM slots 0.. in the same
+    // order, matching the outputs-first `bind_abi`. The first source (`outs[0]`) is the
+    // `self` of `custom_kernel_with`; the rest are `others`.
+    snafu::ensure!(!outs.is_empty(), BufferMissingSnafu { slot: 0usize, supplied: 0usize });
+    let mut others: Vec<&Tensor> = Vec::with_capacity(outs.len() - 1 + ins.len());
+    others.extend(outs[1..].iter());
+    others.extend(ins.iter().copied());
+
+    let info = CallInfo { name: Some(name.clone()), ..CallInfo::default() };
+    let n_out = outs.len();
+    let outputs = outs[0]
+        .custom_kernel_with(&others, info, move |ph| build(&crate::Kernel::new(kname, grid, block, ph, caps)))
+        .context(CustomKernelSnafu { name })?;
+    Ok(outputs.into_iter().take(n_out).collect())
 }
 
 /// The shared **three-way launch policy** every graph-native custom kernel follows,
