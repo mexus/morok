@@ -278,9 +278,7 @@ pub fn broadcast_shapes(shapes: &[Shape]) -> Result<Shape> {
 pub fn to_vec_usize(shape: &Shape) -> Result<Vec<usize>> {
     shape
         .iter()
-        .map(|dim| {
-            dim.as_const().ok_or_else(|| Error::SymbolicShapeUnsupported { operation: "shape conversion".to_string() })
-        })
+        .map(|dim| dim.as_const().ok_or_else(|| Error::SymbolicShapeUnsupported { operation: "shape conversion" }))
         .collect()
 }
 
@@ -295,7 +293,7 @@ pub fn to_vec_isize(shape: &Shape) -> Result<Vec<isize>> {
         .map(|dim| {
             dim.as_const()
                 .map(|v| v as isize)
-                .ok_or_else(|| Error::SymbolicShapeUnsupported { operation: "shape conversion".to_string() })
+                .ok_or_else(|| Error::SymbolicShapeUnsupported { operation: "shape conversion" })
         })
         .collect()
 }

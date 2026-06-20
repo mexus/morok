@@ -61,6 +61,12 @@ pub fn ensure_scalar(d: &Arc<UOp>) -> Arc<UOp> {
 // Dtype-dependent constants
 // ============================================================================
 
+// The `unsupported dtype` panics below are infallible internal invariants: these
+// helpers are reached only from transcendental decompositions (exp2/log2/sin/cos/pow),
+// which validate `is_float()` upstream, so dtype is always Float16/32/64. They also
+// feed non-Result tree builders (poly_n/rintk/...), so a Result here would ripple
+// through the whole decomposition path for an unreachable case.
+
 /// Number of mantissa bits for a float dtype.
 ///
 /// Extracts scalar type from Ptr if needed.

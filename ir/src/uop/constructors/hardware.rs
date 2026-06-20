@@ -10,13 +10,14 @@ use std::sync::Arc;
 
 use bon::bon;
 use smallvec::{SmallVec, smallvec};
-use snafu::ensure;
+use snafu::{OptionExt, ensure};
 use svod_dtype::DType;
 
 use crate::Result;
 use crate::error::{
     BroadcastRequiresScalarSnafu, ContractCountMismatchSnafu, GepIndexOutOfBoundsSnafu, GepRequiresVectorSnafu,
-    UnrollCountMismatchSnafu, VectorizeDTypeMismatchSnafu, VectorizeEmptySnafu,
+    GetTupleIndexOutOfBoundsSnafu, GetTupleNotATupleSnafu, UnrollCountMismatchSnafu, VectorizeDTypeMismatchSnafu,
+    VectorizeEmptySnafu,
 };
 use crate::op::Op;
 use crate::types::{CallInfo, WmmaMetadata};
@@ -70,6 +71,10 @@ impl UOp {
     }
 
     /// Create vector from scalar elements (panics on violation).
+    ///
+    /// Infallible convenience wrapper around [`Self::try_vectorize`]: callers in the
+    /// rewrite engine produce `Some(vectorize(..))` and have already validated element
+    /// dtypes by construction. Use `try_vectorize` for the checked path.
     pub fn vectorize(elements: SmallVec<[Arc<Self>; 4]>) -> Arc<Self> {
         Self::try_vectorize(elements).expect("vectorize precondition violated")
     }
@@ -328,22 +333,31 @@ impl UOp {
     /// Extract element `index` from a TUPLE (or a FUNCTION whose body is a TUPLE).
     /// dtype matches the inner element. Mirrors tinygrad `Ops.GETTUPLE`.
     ///
-    /// Panics if `self` is neither a TUPLE nor a FUNCTION whose body is a TUPLE,
-    /// or if `index` is out of bounds.
-    pub fn gettuple(self: &Arc<Self>, index: usize) -> Arc<Self> {
+    /// # Errors
+    /// - `GetTupleNotATuple` if `self` is neither a TUPLE nor a FUNCTION whose body is a TUPLE
+    /// - `GetTupleIndexOutOfBounds` if `index` is out of bounds for the tuple
+    pub fn try_gettuple(self: &Arc<Self>, index: usize) -> Result<Arc<Self>> {
         let inner_tuple_src: &SmallVec<[Arc<UOp>; 4]> = match self.op() {
             Op::Tuple { src } => src,
             Op::Function { body, .. } => match body.op() {
                 Op::Tuple { src } => src,
-                other => panic!("gettuple requires FUNCTION body to be TUPLE, got {other:?}"),
+                _ => return GetTupleNotATupleSnafu { op: "FUNCTION body (expected TUPLE)" }.fail(),
             },
-            other => panic!("gettuple requires TUPLE or FUNCTION(TUPLE) source, got {other:?}"),
+            _ => return GetTupleNotATupleSnafu { op: "non-TUPLE/non-FUNCTION source" }.fail(),
         };
         let elem_dtype = inner_tuple_src
             .get(index)
-            .unwrap_or_else(|| panic!("gettuple index {} out of bounds for length {}", index, inner_tuple_src.len()))
+            .context(GetTupleIndexOutOfBoundsSnafu { index, len: inner_tuple_src.len(), kind: "tuple" })?
             .dtype();
-        Self::new(Op::GetTuple { src: self.clone(), index }, elem_dtype)
+        Ok(Self::new(Op::GetTuple { src: self.clone(), index }, elem_dtype))
+    }
+
+    /// Extract element `index` from a TUPLE (or a FUNCTION whose body is a TUPLE).
+    ///
+    /// Panicking wrapper around [`Self::try_gettuple`]; use the fallible variant
+    /// when the source structure or index is not guaranteed by construction.
+    pub fn gettuple(self: &Arc<Self>, index: usize) -> Arc<Self> {
+        self.try_gettuple(index).expect("gettuple precondition violated")
     }
 
     /// PROGRAM wrapper with optional progressive pipeline stages.

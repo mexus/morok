@@ -314,7 +314,7 @@ pub fn run_rangeify(sink: Arc<UOp>) -> svod_ir::Result<(Arc<UOp>, IndexingContex
         .find(|n| matches!(n.op(), Op::Pad { .. } | Op::ReduceAxis { .. }));
     if leaked.is_some() {
         return Err(svod_ir::Error::SymbolicShapeUnsupported {
-            operation: "rangeify leaked high-level PAD/ReduceAxis after recovery".to_string(),
+            operation: "rangeify leaked high-level PAD/ReduceAxis after recovery",
         });
     }
 
