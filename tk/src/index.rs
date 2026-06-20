@@ -138,6 +138,25 @@ pub fn load_off(buf: &Arc<UOp>, offset: Arc<UOp>) -> Arc<UOp> {
     UOp::load().buffer(buf.clone()).index(idx).call()
 }
 
+/// Gated INDEX (ptr=true) at a flat `offset`: a STORE through it writes only when
+/// `gate` is true (out-of-bounds writes are dropped) — the masked-store form.
+pub fn index_off_gated(buf: &Arc<UOp>, offset: Arc<UOp>, gate: Arc<UOp>) -> Arc<UOp> {
+    UOp::index()
+        .buffer(buf.clone())
+        .indices(vec![offset])
+        .gate(gate)
+        .ptr(true)
+        .call()
+        .expect("index_off_gated: INDEX construction")
+}
+
+/// Gated LOAD at a flat `offset`: returns the loaded value when `gate` is true,
+/// else `alt` (out-of-bounds reads fold to the fill) — the masked-load form.
+pub fn load_off_gated(buf: &Arc<UOp>, offset: Arc<UOp>, gate: Arc<UOp>, alt: Arc<UOp>) -> Arc<UOp> {
+    let idx = index_off_gated(buf, offset, gate);
+    UOp::load().buffer(buf.clone()).index(idx).alt(alt).call()
+}
+
 /// Wide LOAD of `lanes` contiguous elements from `buf` starting at element
 /// `offset` — a single `<lanes × elem>` vector load (the 128-bit coalesced
 /// GLOBAL fill: `bf16` × 8 = `global_load_dwordx4`). The INDEX points at the

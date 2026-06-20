@@ -6,6 +6,7 @@ mod guide;
 mod index;
 mod kernel_probe;
 mod loop_scope;
+mod masked;
 mod math;
 mod matmul;
 mod proptests;

@@ -39,20 +39,31 @@ pub struct MoveIdx<'a> {
     pub block: &'a [Idx],
     pub frag: &'a [Idx],
     pub axis: usize,
+    /// Gate the GLOBAL↔REG hop against the tensor's true extent so a tile
+    /// straddling a ragged `N`/`M`/`D` edge reads `0.0` (load) / drops the write
+    /// (store) instead of touching out-of-bounds memory. No-op when the dims are
+    /// tile-aligned (the gate is elided at build time). Only the GLOBAL↔REG hops
+    /// honor it; LDS hops are always tile-sized.
+    pub masked: bool,
 }
 
 impl<'a> MoveIdx<'a> {
     /// A wave/global `block` offset at `axis` (the common fill/gather/store case).
     pub fn block(block: &'a [Idx], axis: usize) -> Self {
-        Self { block, frag: &[], axis }
+        Self { block, frag: &[], axis, masked: false }
     }
     /// A REG-side `frag` offset only.
     pub fn frag(frag: &'a [Idx]) -> Self {
-        Self { frag, block: &[], axis: 0 }
+        Self { frag, block: &[], axis: 0, masked: false }
     }
     /// Both a `block` and a `frag` offset at `axis`.
     pub fn at(block: &'a [Idx], frag: &'a [Idx], axis: usize) -> Self {
-        Self { block, frag, axis }
+        Self { block, frag, axis, masked: false }
+    }
+    /// Boundary-mask this GLOBAL↔REG hop (see [`MoveIdx::masked`]).
+    pub fn masked(mut self) -> Self {
+        self.masked = true;
+        self
     }
 }
 
@@ -86,7 +97,7 @@ impl<'k> LoadInto<'k, RT<'k>> for ST<'k> {
 impl<'k> LoadInto<'k, RT<'k>> for GL<'k> {
     type Output = RT<'k>;
     fn load_into(self, g: &Group<'k>, dst: RT<'k>, ix: MoveIdx<'_>) -> RT<'k> {
-        g.load_global_to_reg(dst, &self, ix.frag, ix.block, ix.axis)
+        g.load_global_to_reg(dst, &self, ix.frag, ix.block, ix.axis, ix.masked)
     }
 }
 impl<'k> StoreInto<'k, ST<'k>> for RT<'k> {
@@ -98,7 +109,7 @@ impl<'k> StoreInto<'k, ST<'k>> for RT<'k> {
 impl<'k> StoreInto<'k, GL<'k>> for RT<'k> {
     type Output = GL<'k>;
     fn store_into(self, g: &Group<'k>, dst: GL<'k>, ix: MoveIdx<'_>) -> GL<'k> {
-        g.store_reg_to_global(dst, &self, ix.block, ix.frag, ix.axis)
+        g.store_reg_to_global(dst, &self, ix.block, ix.frag, ix.axis, ix.masked)
     }
 }
 

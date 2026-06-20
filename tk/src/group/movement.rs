@@ -7,10 +7,12 @@
 use std::sync::Arc;
 
 use smallvec::{SmallVec, smallvec};
-use svod_ir::{AxisType, UOp};
+use svod_ir::{AxisType, ConstValue, UOp};
 
 use super::{Group, MoveIdx, iadd, idiv, idx_mul, imod, imul, lane_rc, wave_offset};
-use crate::index::{Idx, cidx, flat_index, flat_offset, index_off, load_at, load_off, load_vec};
+use crate::index::{
+    Idx, cidx, flat_index, flat_offset, index_off, index_off_gated, load_at, load_off, load_off_gated, load_vec,
+};
 use crate::tile::{GL, RT, ST};
 use crate::tiles::TileLayout;
 
@@ -459,9 +461,47 @@ impl<'k> Group<'k> {
         self.finalize_reg(rt, ended)
     }
 
+    /// The boundary gate for a GLOBAL↔REG hop: `global_row < shape[axis] &
+    /// global_col < shape[last]`, restricted to the axes that are actually ragged
+    /// (the extent is not a multiple of the per-block tile span — known at build
+    /// time, so an aligned axis adds no gate). `srow`/`scol` are the in-tile
+    /// coordinates; the block offset from `idxs` is folded back in to recover the
+    /// global position. `None` when both axes divide evenly.
+    #[allow(clippy::too_many_arguments)]
+    fn boundary_gate(
+        &self,
+        shape: &[usize],
+        idxs: &[Idx],
+        axis: usize,
+        row_tile: i64,
+        col_tile: i64,
+        srow: &Arc<UOp>,
+        scol: &Arc<UOp>,
+    ) -> Option<Arc<UOp>> {
+        let mut gate: Option<Arc<UOp>> = None;
+        let bound_row = shape[axis] as i64;
+        if bound_row % row_tile != 0 {
+            let blk = idxs.get(axis).map(|i| i.to_uop()).unwrap_or_else(|| cidx(0));
+            let g = iadd(&imul(&blk, row_tile), srow).try_cmplt(&cidx(bound_row)).expect("boundary row gate");
+            gate = Some(g);
+        }
+        let bound_col = shape[shape.len() - 1] as i64;
+        if bound_col % col_tile != 0 {
+            let blk = idxs.get(3).map(|i| i.to_uop()).unwrap_or_else(|| cidx(0));
+            let g = iadd(&imul(&blk, col_tile), scol).try_cmplt(&cidx(bound_col)).expect("boundary col gate");
+            gate = Some(match gate {
+                Some(r) => r.try_and_op(&g).expect("boundary gate and"),
+                None => g,
+            });
+        }
+        gate
+    }
+
     /// GLOBAL→REG fragment gather: each lane reads its register fragment
     /// straight from global memory (the FA Q-tile load). The mirror of
-    /// [`Self::store_reg_to_global`].
+    /// [`Self::store_reg_to_global`]. `masked` gates a tile straddling a ragged
+    /// edge (see [`Self::boundary_gate`]).
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn load_global_to_reg(
         &self,
         rt: RT<'k>,
@@ -469,6 +509,7 @@ impl<'k> Group<'k> {
         dst_idxs: &[Idx],
         idxs: &[Idx],
         axis: usize,
+        masked: bool,
     ) -> RT<'k> {
         let row_stride: i64 = src.shape()[axis + 1..].iter().product::<usize>() as i64;
         let base_rows = rt.base.base.rows as i64;
@@ -516,7 +557,16 @@ impl<'k> Group<'k> {
         let scol = iadd(&base_col, &col);
         let off = iadd(&src_i_base, &iadd(&imul(&srow, row_stride), &scol));
 
-        let mut load = load_off(src.uop(), off);
+        let gate = masked
+            .then(|| self.boundary_gate(src.shape(), idxs, axis, s3 * base_rows, s2 * base_cols, &srow, &scol))
+            .flatten();
+        let mut load = match gate {
+            Some(g) => {
+                let zero = if src.elem().is_float() { ConstValue::Float(0.0) } else { ConstValue::Int(0) };
+                load_off_gated(src.uop(), off, g, UOp::const_(src.elem().clone(), zero))
+            }
+            None => load_off(src.uop(), off),
+        };
         if src.elem() != rt.elem() {
             load = load.cast(rt.elem().clone());
         }
@@ -575,6 +625,7 @@ impl<'k> Group<'k> {
         idxs: &[Idx],
         src_idxs: &[Idx],
         axis: usize,
+        masked: bool,
     ) -> GL<'k> {
         let row_stride: i64 = dst.shape()[axis + 1..].iter().product::<usize>() as i64;
         let base_rows = rt.base.base.rows as i64;
@@ -628,7 +679,14 @@ impl<'k> Group<'k> {
         if rt.elem() != dst.elem() {
             load = load.cast(dst.elem().clone());
         }
-        let ended = index_off(dst.uop(), off).store(load).end(smallvec![height, width, inner]);
+        let gate = masked
+            .then(|| self.boundary_gate(dst.shape(), idxs, axis, s3 * base_rows, s2 * base_cols, &srow, &scol))
+            .flatten();
+        let target = match gate {
+            Some(g) => index_off_gated(dst.uop(), off, g),
+            None => index_off(dst.uop(), off),
+        };
+        let ended = target.store(load).end(smallvec![height, width, inner]);
         self.finalize_gl(dst, ended)
     }
 }
