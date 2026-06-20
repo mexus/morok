@@ -16,7 +16,7 @@ snafu = "0.8.9"
 svod-codegen = { path = "../codegen", version = "=0.1.0-alpha.3" }
 svod-device = { path = "../device", version = "=0.1.0-alpha.3" }
 svod-runtime = { path = "../runtime", version = "=0.1.0-alpha.3" }
-svod-schedule = { version = "0.1.0-alpha.3", path = "../schedule" }
+svod-schedule = { path = "../schedule", version = "=0.1.0-alpha.3" }
 
 [dev-dependencies]
 proptest = "1.9"
