@@ -326,6 +326,10 @@ impl ScalarDType {
 
     /// (exponent_bits, mantissa_bits) for float types.
     /// Matches Tinygrad's `dtypes.finfo()`.
+    ///
+    /// Float-only invariant: callers establish float-ness first (e.g. an
+    /// `is_float()` guard, or an FP8/float construction context), so a
+    /// non-float here signals a caller bug, not user input. Panics in that case.
     pub const fn finfo(&self) -> (u32, u32) {
         match self {
             Self::FP8E4M3 => (4, 3),
@@ -334,24 +338,31 @@ impl ScalarDType {
             Self::BFloat16 => (8, 7),
             Self::Float32 => (8, 23),
             Self::Float64 => (11, 52),
-            _ => panic!("finfo: not a float type"),
+            _ => panic!("finfo: not a float type (caller must guard with is_float)"),
         }
     }
 
     /// Exponent bias: `(1 << (exp_bits - 1)) - 1`.
+    ///
+    /// Float-only invariant (inherited from [`finfo`](Self::finfo)): panics on a
+    /// non-float type; callers establish float-ness first.
     pub const fn exponent_bias(&self) -> i32 {
         let (e, _) = self.finfo();
         (1 << (e - 1)) - 1
     }
 
     /// Map float dtype to uint storage equivalent of the same bit width.
+    ///
+    /// Float-only invariant: callers establish float-ness first (e.g. an
+    /// `is_float()` guard, or an FP8/float construction context), so a
+    /// non-float here signals a caller bug, not user input. Panics in that case.
     pub const fn float_to_uint(&self) -> ScalarDType {
         match self {
             Self::FP8E4M3 | Self::FP8E5M2 => Self::UInt8,
             Self::Float16 | Self::BFloat16 => Self::UInt16,
             Self::Float32 => Self::UInt32,
             Self::Float64 => Self::UInt64,
-            _ => panic!("float_to_uint: not a float type"),
+            _ => panic!("float_to_uint: not a float type (caller must guard with is_float)"),
         }
     }
 
@@ -378,6 +389,12 @@ impl DType {
     // =========================================================================
 
     /// Create a vector type from this dtype.
+    ///
+    /// Construction invariant: callers vectorize a scalar/void or a scalar
+    /// pointer (often behind a `count > 1` guard). Re-vectorizing an already-
+    /// vectorized type to a *different* count is a graph-construction bug and
+    /// panics; re-vectorizing to the *same* count is idempotent (see `Ptr`
+    /// arms below). `count == 1` is the identity.
     pub fn vec(&self, count: usize) -> Self {
         if count == 1 {
             return self.clone();
@@ -401,6 +418,10 @@ impl DType {
     }
 
     /// Create a pointer type from this dtype.
+    ///
+    /// Construction invariant: callers build a pointer from a scalar/void/vector
+    /// base (e.g. `DType::Float32.ptr(..)`, `DType::Void.ptr(..)`), never from a
+    /// pointer. A pointer-to-pointer is a graph-construction bug and panics.
     pub fn ptr(self, size: Option<usize>, addrspace: AddrSpace) -> Self {
         match self {
             Self::Ptr { .. } => panic!("Cannot make a pointer from a pointer"),
