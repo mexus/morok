@@ -48,12 +48,16 @@ impl MlirKernel {
     }
 
     /// Get function pointer for the kernel.
-    pub fn fn_ptr(&self) -> *const c_void {
+    ///
+    /// Returns [`crate::error::Error::FunctionNotFound`] if the JIT engine has
+    /// no symbol for this kernel (e.g. the entry point was renamed or stripped
+    /// during lowering) rather than dereferencing a null pointer.
+    pub fn fn_ptr(&self) -> Result<*const c_void> {
         let ptr = self.engine.lookup(&self.name);
         if ptr.is_null() {
-            panic!("kernel function '{}' not found", self.name);
+            return Err(crate::error::Error::FunctionNotFound { name: self.name.clone() });
         }
-        ptr as *const c_void
+        Ok(ptr as *const c_void)
     }
 
     /// Execute kernel with raw buffer pointers and variable values.
@@ -67,7 +71,7 @@ impl MlirKernel {
     pub unsafe fn execute_with_vals(&self, buffers: &[*mut u8], vals: &[i64]) -> Result<()> {
         type KernelFn = unsafe extern "C" fn(*const *mut u8, *const i64);
 
-        let fn_ptr = self.fn_ptr();
+        let fn_ptr = self.fn_ptr()?;
         let kernel: KernelFn = unsafe { std::mem::transmute(fn_ptr) };
 
         let buffer_usizes: Vec<usize> = buffers.iter().map(|&ptr| ptr as usize).collect();

@@ -381,7 +381,10 @@ mod mlir_backend {
             _wait: bool,
         ) -> Result<()> {
             let core_count = global_size.map(|[tc, _, _]| tc).filter(|&tc| tc > 1);
-            let fn_ptr = self.kernel.fn_ptr();
+            let fn_ptr = self
+                .kernel
+                .fn_ptr()
+                .map_err(|e| svod_device::Error::Runtime { message: format!("MLIR kernel lookup failed: {e}") })?;
 
             if let Some(count) = core_count {
                 unsafe { execute_mlir_parallel(fn_ptr, buffers, vals, self.kernel.var_names(), count) }

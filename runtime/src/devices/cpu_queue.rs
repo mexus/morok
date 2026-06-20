@@ -69,7 +69,7 @@ impl CpuQueue {
     fn execute_op(op: PendingOp) -> Result<()> {
         match op {
             PendingOp::Wait { signal, value } => {
-                signal.wait(value, 0).map_err(|e| crate::Error::Device { source: e })?;
+                signal.wait(value, 0)?;
             }
             PendingOp::Signal { signal, value } => {
                 signal.set(value);
@@ -77,9 +77,7 @@ impl CpuQueue {
             PendingOp::Exec { program, buffer_ptrs, vals, global_size, local_size } => {
                 // SAFETY: Scheduler guarantees exclusive access during execution
                 unsafe {
-                    program
-                        .execute(&buffer_ptrs, &vals, global_size, local_size, /*wait=*/ false)
-                        .map_err(|e| crate::Error::Device { source: e })?;
+                    program.execute(&buffer_ptrs, &vals, global_size, local_size, /*wait=*/ false)?;
                 }
             }
             PendingOp::Copy { dst_ptr, src_ptr, size } => {

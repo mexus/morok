@@ -31,7 +31,6 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use snafu::ResultExt;
 use svod_device::device::Device;
 use svod_device::registry::DeviceRegistry;
 use svod_device::{Allocator, Buffer, BufferId, CpuTimelineSignal, TimelineSignal};
@@ -90,7 +89,7 @@ impl DeviceContext {
 
     /// Wait for operations up to the given timeline value to complete.
     pub fn wait_for(&self, value: u64) -> Result<()> {
-        self.signal.wait(value, 0).context(crate::error::DeviceSnafu)?;
+        self.signal.wait(value, 0)?;
         Ok(())
     }
 }
@@ -436,12 +435,12 @@ impl UnifiedExecutor {
         match Self::sync_strategy(src_device, dst_device) {
             SyncStrategy::None => {
                 // Same device - direct copy
-                dst.copy_from(src).context(crate::error::DeviceSnafu)?;
+                dst.copy_from(src)?;
             }
             SyncStrategy::PeerToPeer => {
                 // Same vendor (e.g., both CUDA) - use peer-to-peer if available
                 // For now, fall back to copy_from which handles this
-                dst.copy_from(src).context(crate::error::DeviceSnafu)?;
+                dst.copy_from(src)?;
             }
             SyncStrategy::CpuMediated => {
                 // Different vendors - stage through CPU
@@ -454,7 +453,7 @@ impl UnifiedExecutor {
                 }
 
                 // copy_from handles the staging internally for cross-device copies
-                dst.copy_from(src).context(crate::error::DeviceSnafu)?;
+                dst.copy_from(src)?;
 
                 // Wait for destination device operations if needed
                 if let Some(dst_ctx) = self.contexts.get(dst_device) {

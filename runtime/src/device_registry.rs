@@ -9,13 +9,12 @@ use std::sync::Arc;
 
 use once_cell::sync::Lazy;
 use parking_lot::RwLock;
-use snafu::ResultExt;
 use svod_device::Result as DeviceResult;
 use svod_device::device::Device;
 use svod_device::registry::DeviceRegistry;
 use svod_dtype::DeviceSpec;
 
-use crate::error::{DeviceSnafu, Result, UnsupportedDeviceSnafu};
+use crate::error::{Result, UnsupportedDeviceSnafu};
 
 /// Factory function that creates a Device for a given DeviceSpec.
 ///
@@ -146,7 +145,7 @@ impl DeviceFactoryRegistry {
             .ok_or_else(|| UnsupportedDeviceSnafu { device: device_type.to_string() }.build())?;
 
         // Create device via factory
-        let device = factory(spec, alloc_registry).context(DeviceSnafu)?;
+        let device = factory(spec, alloc_registry)?;
         let arc = Arc::new(device);
         devices.insert(spec.clone(), Arc::clone(&arc));
         Ok(arc)
