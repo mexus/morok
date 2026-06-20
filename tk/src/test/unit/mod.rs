@@ -5,6 +5,7 @@ mod grid;
 mod guide;
 mod index;
 mod kernel_probe;
+mod knn;
 mod loop_scope;
 mod masked;
 mod math;
