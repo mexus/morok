@@ -259,7 +259,9 @@ impl<'k> Group<'k> {
     /// elements and the sibling 16-lane `ds_bpermute` tree, keeping the
     /// extremum's value AND its global column index (ties → smaller index,
     /// matching `Tensor::topk`/`argmin`). The value `RV` is seeded by `dir`
-    /// (`+∞`/`−∞`); the index `RV` must be `Int32`.
+    /// (`+∞`/`−∞`); the index `RV` must be `Int32`. Inside a rolled loop each trip
+    /// is a **fresh** reduce (the output pair re-seeds per the enclosing tracked
+    /// range), not a running extremum folded across trips.
     ///
     /// The reduced data must be **NaN-free**: the value compare lowers to an
     /// unordered `fcmp ult`, so a NaN can win the fold and propagate as the kept
@@ -361,12 +363,34 @@ impl<'k> Group<'k> {
             iacc = i;
         }
 
-        // Fold the lane result into (val[outer], idx[outer]), carrying the incoming
-        // running pair so it accumulates across outer iterations.
-        let v_in =
-            load_at(&val.uop().after(smallvec![outer.clone()]), val.shape(), &[Idx::from(&outer), Idx::Const(0)]);
-        let i_in =
-            load_at(&idx.uop().after(smallvec![outer.clone()]), idx.shape(), &[Idx::from(&outer), Idx::Const(0)]);
+        // Re-seed the OUTPUT pair to `dir.init()`/`-1` once per outer trip AND per
+        // enclosing tracked loop, so a reduce *inside* a rolled loop (the KNN corpus
+        // stream) starts fresh each trip instead of folding onto the previous trip's
+        // result — the running-extremum hoist that an `outer`-only edge leaves open
+        // (the output RVs' seed `clear_rv` carries no tracked-loop dependency, so it
+        // is hoisted to `run_count = 1`; this re-seed restores the per-trip start).
+        // A reduce with no enclosing tracked loop re-seeds once (`init_deps = [outer]`),
+        // identical to the prior single-fold behavior. The fold then reads THIS seed,
+        // not the carried buffer, so it is a fresh per-trip reduce, not a running one.
+        let mut out_init: SmallVec<[Arc<UOp>; 4]> = smallvec![outer.clone()];
+        out_init.extend(self.ker.tracked_ranges());
+        let vo_seed = flat_index(&val.uop().after(out_init.clone()), val.shape(), &[Idx::from(&outer), Idx::Const(0)])
+            .store(UOp::const_(velem.clone(), ConstValue::Float(dir.init())));
+        let io_seed = flat_index(&idx.uop().after(out_init), idx.shape(), &[Idx::from(&outer), Idx::Const(0)])
+            .store(UOp::const_(DType::Int32, ConstValue::Int(-1)));
+        let oseed_grp = UOp::group(vec![vo_seed, io_seed]);
+
+        // Fold the lane result into the freshly re-seeded (val[outer], idx[outer]).
+        let v_in = load_at(
+            &val.uop().after(smallvec![oseed_grp.clone(), outer.clone()]),
+            val.shape(),
+            &[Idx::from(&outer), Idx::Const(0)],
+        );
+        let i_in = load_at(
+            &idx.uop().after(smallvec![oseed_grp, outer.clone()]),
+            idx.shape(),
+            &[Idx::from(&outer), Idx::Const(0)],
+        );
         let (vout, iout) = arg_fold(dir, &v_in, &i_in, &vacc, &iacc);
         let v_store = flat_index(val.uop(), val.shape(), &[Idx::from(&outer), Idx::Const(0)]).store(vout);
         let i_store = flat_index(idx.uop(), idx.shape(), &[Idx::from(&outer), Idx::Const(0)]).store(iout);
