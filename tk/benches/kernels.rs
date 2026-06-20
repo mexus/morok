@@ -30,7 +30,7 @@ fn randn_bf16(shape: &[usize]) -> Tensor {
 /// toolchain (`check_target`), so HW dispatch stamps are available. `cargo bench`
 /// has no `#[ignore]`, so the bench self-skips cleanly here instead of recording
 /// garbage (or panicking) on CPU.
-fn requirements_met(archs: &[svod_dtype::AmdArch]) -> bool {
+fn requirements_met(archs: &'static [svod_dtype::AmdArch]) -> bool {
     let spec = Tensor::empty(&[1], DType::Float32).device(); // the env/default device
     svod_tk::target::check_target(&spec, archs).is_ok()
 }
