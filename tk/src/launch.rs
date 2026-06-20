@@ -19,7 +19,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use snafu::{IntoError, ResultExt, Snafu};
+use snafu::{IntoError, OptionExt, ResultExt, Snafu};
 use svod_codegen::program_pipeline::{self, ProgramTarget};
 use svod_device::Buffer;
 use svod_device::device::{Device, Program, ProgramSpec};
@@ -78,9 +78,18 @@ pub enum Error {
         source: Box<svod_device::Error>,
     },
 
-    /// A buffer referenced by the ABI was not supplied or could not allocate.
-    #[snafu(display("buffer slot {slot} (of {supplied} supplied): {reason}"))]
-    Buffer { slot: usize, supplied: usize, reason: String },
+    /// A buffer required by the compiled ABI was not supplied.
+    #[snafu(display("buffer slot {slot} not supplied (of {supplied} buffers)"))]
+    BufferMissing { slot: usize, supplied: usize },
+
+    /// A required buffer could not be allocated on its device.
+    #[snafu(display("allocate buffer slot {slot} (of {supplied}): {source}"))]
+    BufferAlloc {
+        slot: usize,
+        supplied: usize,
+        #[snafu(source(from(svod_device::Error, Box::new)))]
+        source: Box<svod_device::Error>,
+    },
 
     /// Realizing or allocating a tensor argument failed.
     #[snafu(display("realize tensor argument: {source}"))]
@@ -105,11 +114,16 @@ pub enum Error {
         source: Box<svod_tensor::error::Error>,
     },
 
-    /// The resolved device cannot run svod-tk tile kernels — wrong GPU arch (they
-    /// target gfx942/CDNA3 and gfx1151/RDNA3.5) or the AMD LLVM/clang toolchain is
-    /// unavailable.
-    #[snafu(display("unsupported target for svod-tk kernel: {reason}"))]
-    UnsupportedTarget { reason: String },
+    /// The resolved device's GPU arch isn't in the kernel's supported set (the tile
+    /// kernels target gfx942/CDNA3 and gfx1151/RDNA3.5).
+    #[snafu(display("unsupported target: kernel supports {supported:?}, device {spec:?} resolved to {resolved:?}"))]
+    UnsupportedArch { supported: &'static [AmdArch], spec: DeviceSpec, resolved: Option<AmdArch> },
+
+    /// The AMD LLVM (clang amdgcn) toolchain needed to compile tile kernels is absent.
+    #[snafu(display(
+        "AMD LLVM target unavailable — clang with the amdgcn backend is required (install ROCm/LLVM clang)"
+    ))]
+    ToolchainUnavailable,
 
     /// Casting an input to the kernel's bf16 operand dtype failed.
     #[snafu(display("cast matmul operand: {source}"))]
@@ -121,7 +135,7 @@ pub enum Error {
     // ── Structured "malformed request" errors ───────────────────────────────────
     // A FIXED shape/dtype property is wrong on an otherwise-runnable kernel (a caller
     // bug). Distinct from a runtime length that merely doesn't tile (`Ok(None)`) and
-    // from an unsupported device ([`Error::UnsupportedTarget`]). Carry the offending
+    // from an unsupported device ([`Error::UnsupportedArch`]). Carry the offending
     // values structurally instead of a pre-formatted string.
     /// An operand dtype is unsupported by the kernel.
     #[snafu(display("{kernel}: operand dtype {got:?} unsupported (expected {expected})"))]
@@ -140,40 +154,32 @@ pub enum Error {
     #[snafu(display("{kernel}: operands must be square and equal-sized, got {a:?} · {b:?}"))]
     NotSquare { kernel: &'static str, a: [usize; 2], b: [usize; 2] },
 
-    /// An operand's shape is indeterminate, the wrong rank, or has a symbolic
-    /// (non-constant) dimension — the kernel needs statically-known dims.
-    #[snafu(display("{kernel}: operand {operand}: {reason}"))]
-    OperandShape { kernel: &'static str, operand: &'static str, reason: String },
+    /// An operand's shape could not be determined.
+    #[snafu(display("{kernel}: operand {operand}: shape is indeterminate"))]
+    OperandIndeterminateShape { kernel: &'static str, operand: &'static str },
+
+    /// An operand has the wrong rank for the kernel.
+    #[snafu(display("{kernel}: operand {operand}: expected a rank-{expected} tensor, got rank {got}"))]
+    OperandRank { kernel: &'static str, operand: &'static str, expected: usize, got: usize },
+
+    /// An operand has a symbolic (non-constant) dimension; the kernel needs static dims.
+    #[snafu(display("{kernel}: operand {operand}: dim {axis} is not statically known"))]
+    OperandSymbolicDim { kernel: &'static str, operand: &'static str, axis: usize },
 }
 
 /// Resolve a tensor operand's shape to concrete `usize` dims, or an
-/// [`Error::OperandShape`] if the shape is indeterminate, the wrong rank, or has a
-/// symbolic (non-constant) dimension. Kernel builders need statically-known dims,
-/// so a malformed operand is a caller error reported through `Result`, not a panic.
+/// `Operand*` error if the shape is indeterminate, the wrong rank, or has a symbolic
+/// (non-constant) dimension. Kernel builders need statically-known dims, so a
+/// malformed operand is a caller error reported through `Result`, not a panic.
 pub(crate) fn concrete_dims(
     t: &Tensor,
     kernel: &'static str,
     operand: &'static str,
     rank: usize,
 ) -> Result<Vec<usize>> {
-    let shape = t
-        .shape()
-        .map_err(|_| OperandShapeSnafu { kernel, operand, reason: "indeterminate shape".to_string() }.build())?;
-    snafu::ensure!(
-        shape.len() == rank,
-        OperandShapeSnafu {
-            kernel,
-            operand,
-            reason: format!("expected a rank-{rank} tensor, got rank {}", shape.len())
-        }
-    );
-    (0..rank)
-        .map(|i| {
-            shape[i].as_const().ok_or_else(|| {
-                OperandShapeSnafu { kernel, operand, reason: format!("dim {i} is not statically known") }.build()
-            })
-        })
-        .collect()
+    let shape = t.shape().ok().context(OperandIndeterminateShapeSnafu { kernel, operand })?;
+    snafu::ensure!(shape.len() == rank, OperandRankSnafu { kernel, operand, expected: rank, got: shape.len() });
+    (0..rank).map(|i| shape[i].as_const().context(OperandSymbolicDimSnafu { kernel, operand, axis: i })).collect()
 }
 
 /// Compile `sink` for `device` and dispatch it against `buffers`, populating the
@@ -323,12 +329,8 @@ pub fn compile(device: &Device, sink: Arc<UOp>, buffers: &[Buffer]) -> Result<Co
     // Resolve buffer pointers in the compiled ABI order (sorted PARAM slots).
     let mut ptrs: Vec<*mut u8> = Vec::with_capacity(spec.globals.len());
     for &slot in &spec.globals {
-        let buf = buffers.get(slot).ok_or_else(|| {
-            BufferSnafu { slot, supplied: buffers.len(), reason: "no buffer supplied for this ABI slot".to_string() }
-                .build()
-        })?;
-        buf.ensure_allocated()
-            .map_err(|e| BufferSnafu { slot, supplied: buffers.len(), reason: e.to_string() }.build())?;
+        let buf = buffers.get(slot).context(BufferMissingSnafu { slot, supplied: buffers.len() })?;
+        buf.ensure_allocated().context(BufferAllocSnafu { slot, supplied: buffers.len() })?;
         // SAFETY: the buffer is allocated and held alive by `_buffers` below for
         // the lifetime of the `CompiledLaunch` (and thus of these raw pointers).
         ptrs.push(unsafe { buf.as_raw_ptr() });
@@ -465,7 +467,7 @@ where
 /// [`crate::matmul`] and [`crate::flash_attention_with`].
 pub fn launch_custom(
     device: &DeviceSpec,
-    archs: &[AmdArch],
+    archs: &'static [AmdArch],
     validate: impl FnOnce(AmdArch) -> Result<()>,
     applies: bool,
     build: impl FnOnce(AmdArch) -> Result<Tensor>,
@@ -548,14 +550,7 @@ where
     // The device is resolved from `buffers[0]`, so a kernel launched with no
     // outputs AND no inputs has nothing to resolve against — a structured error,
     // not an index-out-of-bounds panic on the public DEBUG-face entry.
-    snafu::ensure!(
-        !buffers.is_empty(),
-        BufferSnafu {
-            slot: 0usize,
-            supplied: 0usize,
-            reason: "compile_kernel needs at least one output or input buffer".to_string()
-        }
-    );
+    snafu::ensure!(!buffers.is_empty(), BufferMissingSnafu { slot: 0usize, supplied: 0usize });
 
     // Resolve the concrete Device (renderer/compiler/runtime) for the buffers'
     // device, honoring the env-selected CPU backend like the realize path does.
@@ -582,8 +577,7 @@ where
 /// a buffer (`from_slice`), so this only allocates for fresh outputs.
 pub fn realize_buffer(t: &Tensor) -> Result<Buffer> {
     if let Some(buf) = t.buffer() {
-        buf.ensure_allocated()
-            .map_err(|e| BufferSnafu { slot: 0usize, supplied: 0usize, reason: e.to_string() }.build())?;
+        buf.ensure_allocated().context(BufferAllocSnafu { slot: 0usize, supplied: 0usize })?;
         return Ok(buf);
     }
 
@@ -606,7 +600,7 @@ pub fn realize_buffer(t: &Tensor) -> Result<Buffer> {
     let allocator =
         svod_device::registry::registry().get(spec).context(AllocatorSnafu { spec: format!("{spec:?}") })?;
     let buffer = Buffer::allocate(allocator, dtype, shape, Default::default())
-        .map_err(|e| BufferSnafu { slot: 0usize, supplied: 0usize, reason: e.to_string() }.build())?;
+        .context(BufferAllocSnafu { slot: 0usize, supplied: 0usize })?;
     let buffer = Arc::new(buffer);
     svod_tensor::tensor_registry::register_buffer_by_uop_id(base.id, buffer.clone());
     Ok((*buffer).clone())

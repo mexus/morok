@@ -17,10 +17,10 @@ fn flash_attention_with_non_rank4_operand_is_operand_shape_err() {
     let q4 = Tensor::randn(&[1, 128, 4, 64]).expect("randn");
     let q3 = Tensor::randn(&[128, 4, 64]).expect("randn"); // q: rank 3
     let e = flash_attention_with(&q3, &q4, &q4, FaOpts::default()).err().expect("rank-3 q must error, not panic");
-    assert!(matches!(e, crate::launch::Error::OperandShape { operand: "q", .. }), "got {e:?}");
+    assert!(matches!(e, crate::launch::Error::OperandRank { operand: "q", .. }), "got {e:?}");
     let k2 = Tensor::randn(&[4, 64]).expect("randn"); // k: rank 2
     let e = flash_attention_with(&q4, &k2, &q4, FaOpts::default()).err().expect("rank-2 k must error, not panic");
-    assert!(matches!(e, crate::launch::Error::OperandShape { operand: "k", .. }), "got {e:?}");
+    assert!(matches!(e, crate::launch::Error::OperandRank { operand: "k", .. }), "got {e:?}");
 }
 
 /// `(o, q, k, v)` dummy BUFFER UOps for a GPU-free FA build.
@@ -36,7 +36,7 @@ fn dummy_fa_buffers(b: usize, n: usize, h: usize, h_kv: usize, d: usize) -> Vec<
 }
 
 /// The target gate rejects a non-gfx942 device up front (host — no GPU needed): a
-/// CPU spec resolves to no AMD arch, so `check_target` errs `UnsupportedTarget`
+/// CPU spec resolves to no AMD arch, so `check_target` errs `UnsupportedArch`
 /// instead of letting the gfx942-only kernel mis-render/compile-fail later. The
 /// gate is generic over the kernel's declared `FA_SUPPORTED_ARCHS`, not a hardcoded
 /// arch — adding another GPU is extending that list, not rewriting the gate.
@@ -45,7 +45,7 @@ fn test_target_gate_rejects_non_gfx942() {
     use crate::kernels::fa::FA_SUPPORTED_ARCHS;
     let err = crate::target::check_target(&DeviceSpec::Cpu, FA_SUPPORTED_ARCHS);
     assert!(
-        matches!(err, Err(crate::launch::Error::UnsupportedTarget { .. })),
+        matches!(err, Err(crate::launch::Error::UnsupportedArch { .. })),
         "a CPU device must be rejected by the gfx942 gate, got {err:?}"
     );
 }

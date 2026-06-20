@@ -522,18 +522,18 @@ fn adaptive_fa_tile(b: usize, n: usize, h: usize) -> (usize, usize) {
 /// // `o` now holds the attention output; read it with `o.as_vec::<bf16>()`.
 /// ```
 ///
+/// Returns `Err` if `q`/`k` aren't statically-shaped rank-4 tensors.
+///
 /// # Panics
 /// Panics unless the head dim `D`, the per-warp `Q_BLK`/`KV_BLK` tiles, and `N`
 /// satisfy the builder's divisibility asserts (`D % 16`, `Q_BLK % 16`,
-/// `KV_BLK % 16`, `H % H_kv`, `N % (Q_BLK·NUM_WARPS)`), and unless the input
-/// shapes are statically known (concrete dims).
+/// `KV_BLK % 16`, `H % H_kv`, `N % (Q_BLK·NUM_WARPS)`).
 pub fn flash_attention_forward_mw_rdb(o: &mut Tensor, q: &Tensor, k: &Tensor, v: &Tensor) -> crate::LaunchResult<()> {
     fa_check_target(q)?;
-    let qs = q.shape().expect("q shape");
-    let ks = k.shape().expect("k shape");
-    let dim = |s: &svod_ir::shape::Shape, i: usize| s[i].as_const().expect("concrete dim");
-    let (b, n, h, d) = (dim(&qs, 0), dim(&qs, 1), dim(&qs, 2), dim(&qs, 3));
-    let h_kv = dim(&ks, 2);
+    let qd = crate::launch::concrete_dims(q, "flash-attention", "q", 4)?;
+    let kd = crate::launch::concrete_dims(k, "flash-attention", "k", 4)?;
+    let (b, n, h, d) = (qd[0], qd[1], qd[2], qd[3]);
+    let h_kv = kd[2];
     let (q_blk, kv_blk) = adaptive_fa_tile(b, n, h);
     let grid = [h as i64, (n / q_blk / NUM_WARPS) as i64, b as i64];
 

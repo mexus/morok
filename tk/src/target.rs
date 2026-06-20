@@ -20,7 +20,7 @@
 
 use svod_dtype::{AmdArch, DeviceSpec};
 
-use crate::launch::{Result, UnsupportedTargetSnafu};
+use crate::launch::{Result, ToolchainUnavailableSnafu, UnsupportedArchSnafu};
 
 /// Resolve the concrete AMD [`AmdArch`] backing a [`DeviceSpec`] from the KFD
 /// topology (a non-AMD or unreadable device → `None`). The arch is deliberately
@@ -40,23 +40,13 @@ pub fn resolve_arch(spec: &DeviceSpec) -> Option<AmdArch> {
 /// **without a second topology probe**. A non-AMD spec, an unsupported/unreadable
 /// device, or a missing toolchain fails. This is the single arch resolution per
 /// launch; call it from a kernel launcher with `Tensor::device()`.
-pub fn resolve_supported_arch(spec: &DeviceSpec, supported: &[AmdArch]) -> Result<AmdArch> {
+pub fn resolve_supported_arch(spec: &DeviceSpec, supported: &'static [AmdArch]) -> Result<AmdArch> {
     let resolved = resolve_arch(spec);
     let Some(arch) = resolved.filter(|a| supported.contains(a)) else {
-        return UnsupportedTargetSnafu {
-            reason: format!(
-                "kernel supports AMD arch(es) {supported:?}, but device {spec:?} resolved to arch {resolved:?}"
-            ),
-        }
-        .fail();
+        return UnsupportedArchSnafu { supported, spec: spec.clone(), resolved }.fail();
     };
     if !svod_runtime::amd::has_amdgpu_target() {
-        return UnsupportedTargetSnafu {
-            reason: "AMD LLVM target unavailable — `clang` with the amdgcn backend is required to compile \
-                     tile kernels (install ROCm/LLVM clang)"
-                .to_string(),
-        }
-        .fail();
+        return ToolchainUnavailableSnafu.fail();
     }
     Ok(arch)
 }
@@ -64,6 +54,6 @@ pub fn resolve_supported_arch(spec: &DeviceSpec, supported: &[AmdArch]) -> Resul
 /// [`resolve_supported_arch`] discarding the arch — the gate-only wrapper for
 /// launchers that don't need the resolved arch (the SDPA-fallback eligibility
 /// check folds this into [`resolve_supported_arch`] directly instead).
-pub fn check_target(spec: &DeviceSpec, supported: &[AmdArch]) -> Result<()> {
+pub fn check_target(spec: &DeviceSpec, supported: &'static [AmdArch]) -> Result<()> {
     resolve_supported_arch(spec, supported).map(|_| ())
 }
