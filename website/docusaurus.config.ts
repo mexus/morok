@@ -25,6 +25,7 @@ const config: Config = {
   // parsing. `.mdx` (if added later) still gets full MDX.
   markdown: {
     format: "detect",
+    mermaid: true,
   },
 
   i18n: {
@@ -51,6 +52,19 @@ const config: Config = {
 
   plugins: [
     './plugins/readme-intro.mjs',
+  ],
+
+  themes: [
+    "@docusaurus/theme-mermaid",
+    [
+      "@easyops-cn/docusaurus-search-local",
+      {
+        hashed: true,
+        language: ["en", "zh", "ru", "hi"],
+        indexBlog: false,
+        highlightSearchTermsOnTargetPage: true,
+      },
+    ],
   ],
 
   presets: [
@@ -125,7 +139,7 @@ const config: Config = {
     prism: {
       theme: prismThemes.github,
       darkTheme: prismThemes.dracula,
-      additionalLanguages: ["rust"],
+      additionalLanguages: ["rust", "cpp"],
     },
   } satisfies Preset.ThemeConfig,
 };

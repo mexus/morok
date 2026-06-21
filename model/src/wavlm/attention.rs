@@ -22,7 +22,7 @@
 //!   the encoder passes down to every layer's attention forward. Each layer
 //!   gates and head-selects independently.
 
-use snafu::ResultExt;
+use snafu::{OptionExt, ResultExt};
 use svod_dtype::DType;
 use svod_tensor::reduce::AxisSpec;
 use svod_tensor::{Tensor, s};
@@ -31,7 +31,7 @@ use crate::init::{fan_in_uniform, ones, zeros};
 use crate::state::{self, HasStateDict, StateDict, get_tensor, prefixed};
 
 use super::config::WavLmConfig;
-use super::error::{Result, TensorSnafu};
+use super::error::{Result, SymbolicShapeSnafu, TensorSnafu};
 
 // ---------------------------------------------------------------------------
 // Bucket math (matches `_relative_positions_bucket(bidirectional=True)`)
@@ -190,7 +190,7 @@ impl GatedRelPosAttention {
     pub fn forward(&self, x: &Tensor, position_bias: &Tensor) -> Result<Tensor> {
         let x_shape = x.shape().context(TensorSnafu)?;
         let bsz = x_shape[0].clone();
-        let seq_len: usize = x_shape[1].as_const().expect("attention requires concrete sequence length");
+        let seq_len: usize = x_shape[1].as_const().context(SymbolicShapeSnafu { what: "attention" })?;
         let b = bsz.clone();
         let l = seq_len;
         let nk = self.num_kept();

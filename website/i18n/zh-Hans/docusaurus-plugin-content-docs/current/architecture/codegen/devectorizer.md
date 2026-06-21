@@ -36,12 +36,11 @@ for i in range:
 
 在循环遍历规约维度之前，我们先合并相邻的值。这样可以创建更大的规约，更好地映射到硬件指令。
 
-```text
-Before:  [a, b, c, d, e, f, g, h]  // 8 values
-             ↓ [Horizontal reduction]
-Step 1:  [a+e, b+f, c+g, d+h]      // 4 partial sums
-             ↓ [Accumulator pattern]
-After:   acc = acc + (a+e) + (b+f) + (c+g) + (d+h)
+```mermaid
+flowchart TD
+  A["Before: [a, b, c, d, e, f, g, h] (8 values)"]
+  A -->|"Horizontal reduction"| B["Step 1: [a+e, b+f, c+g, d+h] (4 partial sums)"]
+  B -->|"Accumulator pattern"| C["After: acc = acc + (a+e) + (b+f) + (c+g) + (d+h)"]
 ```
 
 **GEP 推送**将 GEP（get element pointer）操作推过 ALU 以改善向量化：
@@ -153,12 +152,7 @@ LOAD(INDEX(ptr, i))
 
 **做了什么**：处理从抽象向量到硬件操作的转换。
 
-**为什么重要**：Devectorize 使用 4 个概念阶段，通过 3 次 `graph_rewrite` 调用实现（阶段 3 和 4 共享一次调用）：
-
-1. **Phase 1**：创建 PTRCAT 分组连续指针访问，devectorize ALU/WMMA/buffer，展开向量 INDEX → GEP(PTRCAT)
-2. **Phase 2**：将 GEP 移过 LOAD/STORE
-3. **Phase 3**：将 PTRCAT 分发到 LOAD/STORE，创建 CAT(LOADs)，修复 image buffer
-4. **Phase 4**：将 CAT(LOADs) 分割成匹配硬件宽度的更小块
+**为什么重要**：Devectorize 通过 3 次 `graph_rewrite` 调用运行 4 个概念阶段（阶段 3 和 4 共享一次调用）——构建 PTRCAT 分组、将 GEP 移过 LOAD/STORE、分发为 CAT(LOADs)，并分割到硬件宽度。逐阶段的契约见 `schedule/src/lib.rs` 模块 docstring。
 
 **PTRCAT 构建**：
 

@@ -34,6 +34,10 @@ impl UOp {
             match cv.0 {
                 ConstValue::Int(v) => Self::const_(DType::Index, ConstValue::Int(v)),
                 ConstValue::UInt(v) => Self::const_(DType::Index, ConstValue::Int(v as i64)),
+                // Infallible by construction: `end` is always an integer loop bound built
+                // internally by the scheduler/codegen (sizes, `index_const`). A Float/Bool
+                // const here is an IR-builder bug, not user input. Kept panicking because
+                // `range_axis` feeds ~200 non-Result rewrite call sites (`Some(range_axis(..))`).
                 other => panic!("range_axis: Const end must be Int/UInt, got {other:?}"),
             }
         } else {

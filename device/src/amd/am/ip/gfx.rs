@@ -112,7 +112,7 @@ pub fn enable_mec(regs: &Regs, xcc: u16) {
         ],
     );
     // Core GFX register init the CP needs before any queue.
-    let _ = regs.gc_write("regGB_ADDR_CONFIG", xcc, 0x2a11_4042); // golden for mi300
+    let _ = regs.gc_write("regGB_ADDR_CONFIG", xcc, 0x2a11_4042); // golden for gfx942 / CDNA3
     let _ = regs.gc_write("regRLC_CNTL", xcc, 0x1); // rlc_enable_f32
     let _ = regs.gc_write_fields("regRLC_SRM_CNTL", xcc, &[("srm_enable", 1), ("auto_incr_addr", 1)]);
     let _ = regs.gc_write_fields("regGRBM_CNTL", xcc, &[("read_timeout", 0xff)]);

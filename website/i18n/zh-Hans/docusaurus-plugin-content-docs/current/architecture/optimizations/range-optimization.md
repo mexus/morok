@@ -18,14 +18,12 @@ Tinygrad 源码：`tinygrad/codegen/simplify.py`。
 
 **触发条件**：范围变量与取模一起使用：`RANGE(end) % c`，其中 `end % c == 0`。
 
-```text
-Before:  RANGE(end=12) % 4     One loop, modulo in body (slow)
-              |
-         [split: end/c outer, c inner]
-              |
-After:   RANGE(end=3) * 4 + RANGE(end=4)
-           ^outer              ^inner
-           Parallel            Sequential / Vectorize
+```mermaid
+flowchart TD
+  A["Before: RANGE(end=12) % 4 (one loop, modulo in body, slow)"]
+  A -->|"split: end/c outer, c inner"| B["After: RANGE(end=3) * 4 + RANGE(end=4)"]
+  B --> C["outer: RANGE(end=3) (Parallel)"]
+  B --> D["inner: RANGE(end=4) (Sequential / Vectorize)"]
 ```
 
 **原因**：分割后，内层范围可以向量化（UPCAST 到 SIMD 宽度），外层范围可以并行化（GPU 块、CPU 线程）。不分割的话，取模会阻止这两种优化。
@@ -42,12 +40,10 @@ Tinygrad：`simplify.py:60-64`。Svod：`rangeify/transforms.rs` 中的 `pm_spli
 
 **功能**：将两个相邻范围合并为一个，减少循环开销。
 
-```text
-Before:  RANGE(0..4), RANGE(0..8)    Two loops, 12 iterations overhead
-              |
-         [merge: 4 * 8 = 32]
-              |
-After:   RANGE(0..32)                 One loop, indices via divmod
+```mermaid
+flowchart TD
+  A["Before: RANGE(0..4), RANGE(0..8) (two loops, 12 iterations overhead)"]
+  A -->|"merge: 4 * 8 = 32"| B["After: RANGE(0..32) (one loop, indices via divmod)"]
 ```
 
 **原因**：循环开销（分支预测、计数器递增）是按迭代计算的。合并减少循环数量，代价是需要 divmod 操作来重建原始索引。
@@ -146,21 +142,19 @@ Tinygrad：`simplify.py:82-142`。Svod：`pm_reduce_simplify()` + `reduce_collap
 
 ### 决策树
 
-```text
-Is this an always-run op (CONTIGUOUS, COPY)?
-  └─ YES → Keep buffer (always materialized)
-
-Does inlining exceed the buffer limit?
-  └─ YES → Keep buffer
-
-Is there a reduce in scope?
-  ├─ NO → Inline (cheap: just substitute ranges)
-  └─ YES:
-      Is pcontig level <= 2?
-        ├─ YES → Keep buffer (reduce recomputation too expensive)
-        └─ NO → Check input/output ratio
-            ├─ Ratio low (output small relative to input) → Keep buffer
-            └─ Ratio high (output >> input) → Partial inline
+```mermaid
+flowchart TD
+  Q1["Is this an always-run op (CONTIGUOUS, COPY)?"]
+  Q1 -->|"YES"| K1["Keep buffer (always materialized)"]
+  Q1 -->|"NO"| Q2["Does inlining exceed the buffer limit?"]
+  Q2 -->|"YES"| K2["Keep buffer"]
+  Q2 -->|"NO"| Q3["Is there a reduce in scope?"]
+  Q3 -->|"NO"| I1["Inline (cheap: just substitute ranges)"]
+  Q3 -->|"YES"| Q4["Is pcontig level (less than or equal to) 2?"]
+  Q4 -->|"YES"| K3["Keep buffer (reduce recomputation too expensive)"]
+  Q4 -->|"NO"| Q5["Check input/output ratio"]
+  Q5 -->|"Ratio low (output small relative to input)"| K4["Keep buffer"]
+  Q5 -->|"Ratio high (output much greater than input)"| I2["Partial inline"]
 ```
 
 :::caution 规约上下文中的一元操作

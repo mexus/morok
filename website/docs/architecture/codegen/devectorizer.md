@@ -36,12 +36,11 @@ for i in range:
 
 Before we loop through a reduction dimension, we first combine neighboring values. This creates larger reductions that map better to hardware instructions.
 
-```text
-Before:  [a, b, c, d, e, f, g, h]  // 8 values
-             ↓ [Horizontal reduction]
-Step 1:  [a+e, b+f, c+g, d+h]      // 4 partial sums
-             ↓ [Accumulator pattern]
-After:   acc = acc + (a+e) + (b+f) + (c+g) + (d+h)
+```mermaid
+flowchart TD
+  A["Before: [a, b, c, d, e, f, g, h] (8 values)"]
+  A -->|"Horizontal reduction"| B["Step 1: [a+e, b+f, c+g, d+h] (4 partial sums)"]
+  B -->|"Accumulator pattern"| C["After: acc = acc + (a+e) + (b+f) + (c+g) + (d+h)"]
 ```
 
 **GEP pushing** pushes GEP (get element pointer) operations through ALUs for better vectorization:
@@ -153,12 +152,7 @@ Note: Not all INDEX operations get wrapped in LOAD. Pointer types (already addre
 
 **What This Does**: Handles the transition from abstract vectors to hardware operations.
 
-**Why This Matters**: Devectorize uses 4 conceptual phases implemented across 3 `graph_rewrite` calls (phases 3 and 4 share one call):
-
-1. **Phase 1**: Create PTRCAT to group consecutive pointer accesses, devectorize ALU/WMMA/buffers, expand vector INDEX → GEP(PTRCAT)
-2. **Phase 2**: Move GEP through LOAD/STORE
-3. **Phase 3**: Distribute PTRCAT through LOAD/STORE, creating CAT(LOADs), fix image buffers
-4. **Phase 4**: Split CAT(LOADs) into smaller chunks matching hardware width
+**Why This Matters**: Devectorize runs 4 conceptual phases across 3 `graph_rewrite` calls (phases 3 and 4 share one call) — building PTRCAT groups, moving GEPs through LOAD/STORE, distributing into CAT(LOADs), and splitting to hardware width. The phase-by-phase contract lives in the `schedule/src/lib.rs` module docstring.
 
 **PTRCAT Construction**:
 

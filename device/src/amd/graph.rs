@@ -25,9 +25,11 @@ use std::sync::Arc;
 use crate::allocator::RawBuffer;
 use crate::amd::AmdAllocator;
 use crate::amd::connector::OwnerCtx;
+use crate::amd::device::AmdDevice;
 use crate::amd::program::AmdProgram;
 use crate::amd::queue::{
-    AQL_PACKET_BYTES, build_barrier_and, build_barrier_and_deps, build_dispatch_packet, build_dispatch_packet_barrier,
+    AQL_PACKET_BYTES, GraphBarrier, GraphKernelPm4, append_graph_kernel_pm4, build_barrier_and, build_barrier_and_deps,
+    build_dispatch_packet, build_dispatch_packet_barrier,
 };
 use crate::amd::signal::AmdSignal;
 use crate::device::{Graph, GraphKernel};
@@ -110,10 +112,25 @@ impl AmdGraph {
         if let Some(err) = dev.core().poison_error() {
             return Err(err);
         }
-        // AQL (multi-XCC CDNA) only. Single-XCC PM4 (RDNA) falls back to per-call
-        // dispatch (its native-completion migration is not yet done).
+        // Single-XCC PM4 (RDNA, e.g. gfx1151) can capture the chain into one
+        // resident PM4 indirect buffer, replayed with a single doorbell — see
+        // `AmdGraphPm4::capture`. Multi-XCC CDNA uses the native-AQL path below.
+        //
+        // OPT-IN via the per-device `pm4_graph` flag, default OFF (per-call
+        // dispatch): on gfx1151 the CP executes one big inlined IB measurably
+        // SLOWER than the per-call ring stream it pipelines across dispatches —
+        // the GigaAM RN-T encoder is ~36% slower captured (21.7s vs 15.9s host
+        // wall, full audio.wav, 277 chunks) despite producing a BIT-IDENTICAL
+        // transcript. So the chain is captured correctly but per-call stays the
+        // default fast path; the flag exposes the (correct) capture for hardware
+        // that benefits or future barrier-granularity work. The fallback below is
+        // unchanged. (Flag lives on `AmdDeviceCore`, not an env var, so a value of
+        // `0` can't accidentally enable it and tests toggle it race-free.)
         if crate::amd::queue::AmdComputeQueue::will_use_pm4(dev.core()) {
-            return Ok(None);
+            if !dev.core().pm4_graph() {
+                return Ok(None);
+            }
+            return AmdGraphPm4::capture(allocator, kernels, progs, dev);
         }
 
         // Assign a shared `PoolQueue` to this graph (its own owner context).
@@ -153,9 +170,7 @@ impl AmdGraph {
         let kernargs_buf = allocator.alloc_uncached(total.max(16))?;
         let (kernargs_gpu, kernargs_host) = match &kernargs_buf {
             RawBuffer::AmdDevice { gpu_addr, host_ptr: Some(h), .. } => (*gpu_addr, h.as_ptr()),
-            _ => {
-                return Err(Error::AmdAllocFailed { reason: "graph kernargs require host-visible buffer".into() });
-            }
+            _ => return Err(Error::NotHostVisible { what: "graph kernargs" }),
         };
 
         // Bake kernargs once per kernel (shared by both lowering modes); the
@@ -343,6 +358,295 @@ impl Graph for AmdGraph {
         pool.queue().submit_aql(&batch)?;
         pool.register_inflight(Arc::clone(&sig));
         self.owner.set_newest(Arc::clone(&sig));
+        Ok(())
+    }
+}
+
+/// A captured, replayable AMD kernel chain (single-XCC PM4 / RDNA).
+///
+/// Capture bakes every kernel's full PM4 exec stream (the `dispatch_pm4`
+/// SET_SH_REG + DISPATCH_DIRECT sequence, each preceded by an `hdp_flush` +
+/// full `acquire_mem` hazard barrier) into ONE resident indirect buffer, with a
+/// dedicated kernarg page holding every kernel's baked args. Replay submits a
+/// single `PACKET3_INDIRECT_BUFFER` referencing that IB — wrapped in the queue's
+/// monotonic-counter `wait`/`release_mem` discipline — with one doorbell; the CP
+/// runs the whole chain inline. Mirrors [`AmdGraph`] (the AQL analogue) but uses
+/// raw PM4 since single-XCC queues are PM4, not AQL.
+pub struct AmdGraphPm4 {
+    /// Shared `PoolQueue` owner held for the graph's lifetime (queue + scratch +
+    /// PM4 counter). Replay rides this owner's counter so its `synchronize`
+    /// drains the chain, identical to per-call PM4 dispatch.
+    owner: OwnerCtx,
+    /// Per-kernel baked geometry/identity, in replay (FIFO) order. Used to
+    /// re-assemble the IB when the queue's shared scratch VA changes after
+    /// capture (a co-tenant grow); a no-op in the common pre-sized case.
+    kernels: Vec<GraphKernelPm4>,
+    /// Per-kernel hazard-barrier strength (parallel to `kernels`), computed once
+    /// from each kernel's position + `deps` at capture (see [`GraphBarrier`]).
+    barriers: Vec<GraphBarrier>,
+    /// Resident indirect buffer holding the concatenated per-kernel PM4 streams.
+    /// `RawBuffer` has no `Drop`; freed in `Drop for AmdGraphPm4` after the drain.
+    ib_buf: RawBuffer,
+    ib_gpu: u64,
+    ib_host: *mut u8,
+    /// Capacity of `ib_buf` in dwords — a rebuild must not exceed it (scratch VA
+    /// changes don't change the IB length, so this never trips, but it bounds the
+    /// host write).
+    ib_cap_dwords: u32,
+    /// Dedicated kernarg page (one slot per kernel, baked at capture). Owned so a
+    /// concurrent per-call dispatch on the shared rolling arena can't lap it.
+    kernargs_buf: RawBuffer,
+    /// Mutable replay state: the live IB dword count + the scratch VA/tmpring the
+    /// IB is currently baked against. Guarded so replay's staleness check + IB
+    /// rewrite are race-free; the `dispatch_lock` already serialises THIS graph's
+    /// replays, so the inner lock is uncontended.
+    state: parking_lot::Mutex<Pm4IbState>,
+}
+
+/// Mutable IB-bake state (see [`AmdGraphPm4::state`]).
+struct Pm4IbState {
+    /// Dword count of the currently-baked IB content (the `ib_size` field of the
+    /// INDIRECT_BUFFER packet).
+    ib_dwords: u32,
+    /// Scratch VA/tmpring the IB was last baked against. Replay rebuilds the IB
+    /// iff the queue's live scratch VA differs (co-tenant grow), so the baked
+    /// descriptor never points at unmapped VRAM.
+    baked_scratch_va: u64,
+    baked_tmpring: u32,
+}
+
+// SAFETY: `kernels`/`ib_*` are graph-owned stable mappings; the IB host pointer
+// is written only through `state`'s lock (replay rebuild), and the kernargs page
+// is immutable after capture. Raw pointers address allocator-owned buffers held
+// for the graph's lifetime.
+unsafe impl Send for AmdGraphPm4 {}
+unsafe impl Sync for AmdGraphPm4 {}
+
+impl Drop for AmdGraphPm4 {
+    /// Drain in-flight replays before freeing the IB + kernargs the GPU reads.
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            tracing::warn!("AmdGraphPm4 drop during panic unwind: skipping synchronize; in-flight replay abandoned");
+            return;
+        }
+        if let Err(e) = self.owner.synchronize() {
+            tracing::warn!(?e, "AmdGraphPm4 drop: synchronize failed (in-flight replay lost)");
+        }
+        self.ib_buf.free_amd_device_in_place();
+        self.kernargs_buf.free_amd_device_in_place();
+    }
+}
+
+impl AmdGraphPm4 {
+    /// Capture `kernels` into one resident PM4 indirect buffer. `progs` is the
+    /// already-validated concrete program for each kernel (same device, checked
+    /// by `AmdGraph::capture`).
+    fn capture(
+        allocator: &AmdAllocator,
+        kernels: &[GraphKernel],
+        progs: Vec<&AmdProgram>,
+        dev: Arc<AmdDevice>,
+    ) -> Result<Option<Box<dyn Graph>>> {
+        // Own a shared `PoolQueue` and pre-size its scratch for the biggest
+        // kernel, so no replay triggers a mid-chain scratch grow.
+        let owner = dev.core().assign_owner(allocator)?;
+        let mut max_priv_seg = 128u32;
+        for p in &progs {
+            max_priv_seg = max_priv_seg.max(p.private_segment_size());
+        }
+        owner.pool().ensure_has_local_memory(max_priv_seg)?;
+
+        // One 16-byte-aligned kernarg slot per kernel in a dedicated page,
+        // validated against each program's arity (mirrors the AQL path).
+        let mut slot_offsets: Vec<usize> = Vec::with_capacity(kernels.len());
+        let mut total = 0usize;
+        for (k, p) in kernels.iter().zip(&progs) {
+            let (buf_count, var_count) = p.arg_counts();
+            if k.buffers.len() != buf_count {
+                return Err(Error::Runtime {
+                    message: format!(
+                        "AmdGraphPm4 capture: kernel '{}' expects {buf_count} buffers, got {}",
+                        k.program.name(),
+                        k.buffers.len()
+                    ),
+                });
+            }
+            if k.vals.len() != var_count {
+                return Err(Error::Runtime {
+                    message: format!(
+                        "AmdGraphPm4 capture: kernel '{}' expects {var_count} vals, got {}",
+                        k.program.name(),
+                        k.vals.len()
+                    ),
+                });
+            }
+            slot_offsets.push(total);
+            total += p.kernarg_record_size().next_multiple_of(16);
+        }
+        let kernargs_buf = allocator.alloc_uncached(total.max(16))?;
+        let (kernargs_gpu, kernargs_host) = match &kernargs_buf {
+            RawBuffer::AmdDevice { gpu_addr, host_ptr: Some(h), .. } => (*gpu_addr, h.as_ptr()),
+            _ => return Err(Error::NotHostVisible { what: "graph kernargs" }),
+        };
+
+        // Bake each kernel's kernarg slot once and record its geometry/identity.
+        let mut baked: Vec<GraphKernelPm4> = Vec::with_capacity(kernels.len());
+        for ((k, p), &off) in kernels.iter().zip(&progs).zip(&slot_offsets) {
+            // SAFETY: off + record <= total <= allocation; sole writer.
+            let slot_host = unsafe { kernargs_host.add(off) };
+            let slot_gpu = kernargs_gpu + off as u64;
+            let bufs: Vec<u64> = k.buffers.iter().map(|&b| b as u64).collect();
+            // SAFETY: slot_host owns >= kernarg_record_size() bytes (laid out above).
+            unsafe { p.write_kernargs(slot_host, &bufs, &k.vals)? };
+
+            // PM4 launch geometry matches `execute_on`'s PM4 arm: `grid` is the
+            // workgroup count (`global_size`), `local` the workgroup size — NOT
+            // the AQL `grid = global*local` convention.
+            let g = k.global_size.unwrap_or([1, 1, 1]);
+            let l = k.local_size.unwrap_or([1, 1, 1]);
+            let (rsrc1, rsrc2, rsrc3) = p.rsrc();
+            let (wave32, target_major) = p.wave32_target();
+            baked.push(GraphKernelPm4 {
+                rsrc1,
+                rsrc2,
+                rsrc3,
+                prog_addr: p.pm4_prog_addr(),
+                enable_private_segment_sgpr: p.enable_private_segment_sgpr(),
+                kernarg_user_data: [slot_gpu as u32, (slot_gpu >> 32) as u32],
+                local: [l[0] as u32, l[1] as u32, l[2] as u32],
+                grid: [g[0] as u32, g[1] as u32, g[2] as u32],
+                wave32,
+                target_major,
+            });
+        }
+
+        // Per-kernel hazard-barrier strength from `deps`: a kernel with an
+        // in-graph producer (RAW/WAW/WAR) does a FULL L2 invalidate to observe it;
+        // a kernel with no in-graph producer reads only resident/host-stable
+        // inputs (covered by the one IB-head HDP flush) so a NARROW per-CU acquire
+        // suffices. Correctness rests on `deps` being the COMPLETE in-graph hazard
+        // set (the GVA-keyed RAW/WAW/WAR walk in `ExecutionPlan::build_graph`).
+        //
+        // WRITE-THROUGH ASSUMPTION (load-bearing): inside the IB a producer ends
+        // with only `CS_PARTIAL_FLUSH` — there is NO per-kernel EOP cache flush
+        // (only the wrapping `replay_indirect_buffer` release_mem flushes). So the
+        // Full consumer's `acquire_mem(GL2_INV|GL2_WB)` is the ONLY thing making
+        // the producer's stores visible, which is correct ONLY because RDNA L0/L1
+        // are write-through to GL2 (producer stores have reached L2 by the time
+        // `CS_PARTIAL_FLUSH` drains). This holds on the gfx1151 target (matches the
+        // bit-identical transcript); a write-BACK part would need a producer-side
+        // GL2_WB on real RAW/WAW edges before the Full consumer.
+        let barriers: Vec<GraphBarrier> =
+            kernels.iter().map(|k| if k.deps.is_empty() { GraphBarrier::Narrow } else { GraphBarrier::Full }).collect();
+
+        // Assemble the IB once against the current (pre-sized) scratch.
+        let scratch_va = owner.pool().scratch_gpu_va();
+        let tmpring = owner.pool().tmpring_size();
+        let ib = Self::assemble_ib(&baked, &barriers, scratch_va, tmpring);
+        let ib_dwords = ib.len() as u32;
+        // Resident IB buffer (uncached GTT, CP-readable like the ring). Round the
+        // capacity to a page so a co-tenant scratch-grow rebuild has identical
+        // length headroom.
+        let ib_bytes = (ib.len() * 4).max(16).next_multiple_of(0x1000);
+        let ib_buf = allocator.alloc_uncached(ib_bytes)?;
+        let (ib_gpu, ib_host) = match &ib_buf {
+            RawBuffer::AmdDevice { gpu_addr, host_ptr: Some(h), .. } => (*gpu_addr, h.as_ptr()),
+            _ => {
+                kernargs_buf.free_amd_device_in_place();
+                return Err(Error::NotHostVisible { what: "graph IB" });
+            }
+        };
+        // SAFETY: ib_host owns ib_bytes >= ib.len()*4; sole writer at capture.
+        unsafe { std::ptr::copy_nonoverlapping(ib.as_ptr() as *const u8, ib_host, ib.len() * 4) };
+
+        if std::env::var_os("SVOD_DEBUG_DISPATCH").is_some() {
+            eprintln!(
+                "[graph capture pm4] kernels={} ib_dwords={ib_dwords} ib_gpu={ib_gpu:#x} kernargs_gpu={kernargs_gpu:#x} scratch={scratch_va:#x}",
+                kernels.len(),
+            );
+        }
+
+        Ok(Some(Box::new(AmdGraphPm4 {
+            owner,
+            kernels: baked,
+            barriers,
+            ib_buf,
+            ib_gpu,
+            ib_host,
+            ib_cap_dwords: (ib_bytes / 4) as u32,
+            kernargs_buf,
+            state: parking_lot::Mutex::new(Pm4IbState {
+                ib_dwords,
+                baked_scratch_va: scratch_va,
+                baked_tmpring: tmpring,
+            }),
+        })))
+    }
+
+    /// Assemble the full IB dword stream: one IB-head HDP-flush handshake (makes
+    /// all host writes to GTT — packed mel/lengths etc. — visible to the chain),
+    /// then each kernel's `[barrier]? + exec` (see `append_graph_kernel_pm4`).
+    fn assemble_ib(kernels: &[GraphKernelPm4], barriers: &[GraphBarrier], scratch_va: u64, tmpring: u32) -> Vec<u32> {
+        let mut ib: Vec<u32> = Vec::new();
+        // One global HDP flush up front: a host-data-path flush is GPU-wide (not
+        // per-buffer), so a single handshake makes every host-written input read
+        // anywhere in the chain visible — replacing the per-call path's per-kernel
+        // HDP flush, the dominant inline-IB overhead.
+        ib.extend_from_slice(&crate::amd::sys::pm4::hdp_flush());
+        for (k, &b) in kernels.iter().zip(barriers) {
+            append_graph_kernel_pm4(&mut ib, k, b, scratch_va, tmpring);
+        }
+        ib
+    }
+
+    /// Re-bake the IB against the live scratch VA when a co-tenant grew it after
+    /// capture (rare; pre-sizing avoids it). Called holding both the queue's
+    /// dispatch lock and the `state` guard, so the rewrite can't race a
+    /// concurrent grow or another replay. The IB length is invariant under a
+    /// scratch VA change, so this fits the original capacity.
+    fn rebuild_ib(&self, st: &mut Pm4IbState, scratch_va: u64, tmpring: u32) {
+        let ib = Self::assemble_ib(&self.kernels, &self.barriers, scratch_va, tmpring);
+        debug_assert!(ib.len() as u32 <= self.ib_cap_dwords, "rebuilt PM4 graph IB overflows its buffer");
+        let n = (ib.len() as u32).min(self.ib_cap_dwords) as usize;
+        // SAFETY: ib_host owns ib_cap_dwords*4 bytes; n <= ib_cap_dwords; sole
+        // writer under the held dispatch lock + `state` guard.
+        unsafe { std::ptr::copy_nonoverlapping(ib.as_ptr() as *const u8, self.ib_host, n * 4) };
+        st.ib_dwords = n as u32;
+        st.baked_scratch_va = scratch_va;
+        st.baked_tmpring = tmpring;
+    }
+}
+
+impl Graph for AmdGraphPm4 {
+    /// Replay the captured chain: one `PACKET3_INDIRECT_BUFFER` (wrapped in the
+    /// counter `wait`/`release_mem` discipline) + one doorbell. Async — host
+    /// reads drain via the owner's counter (`synchronize_all`), identical to
+    /// per-call PM4 `wait=false`.
+    ///
+    /// `vals` is unused: the captured chain is static (no runtime vars); launch
+    /// vals are baked into the kernarg slots at capture.
+    fn replay(&self, vals: &[i64]) -> Result<()> {
+        let _ = vals;
+        let pool = self.owner.pool();
+        if let Some(err) = pool.core().poison_error() {
+            return Err(err);
+        }
+        // Hold the dispatch lock across the whole op — same fence `dispatch_pm4`
+        // and `ensure_has_local_memory` use. This pins the queue's scratch VA for
+        // the duration (no co-tenant grow can slip in between the staleness check
+        // and the submit) and orders the counter reservation against co-tenants.
+        let _disp = pool.dispatch_guard();
+        let mut st = self.state.lock();
+        // If a co-tenant grew scratch since capture/last-replay, the baked
+        // descriptor VA is stale — re-bake the IB before submitting.
+        let live_scratch = pool.scratch_gpu_va();
+        let live_tmpring = pool.tmpring_size();
+        if live_scratch != st.baked_scratch_va || live_tmpring != st.baked_tmpring {
+            self.rebuild_ib(&mut st, live_scratch, live_tmpring);
+        }
+        let v = pool.queue().replay_indirect_buffer(pool, self.ib_gpu, st.ib_dwords)?;
+        drop(st);
+        self.owner.set_pm4_high(v);
         Ok(())
     }
 }

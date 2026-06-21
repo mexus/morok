@@ -49,8 +49,12 @@ will_use_pm4(core) = !SVOD_AMD_AQL && num_xcc == 1
 A single PM4 dispatch is a fixed sequence, mirroring tinygrad's
 `hcq.py:371-378`:
 
-```text
-wait(timeline, prev)  →  hdp_flush  →  acquire_mem  →  exec  →  release_mem(timeline, next)
+```mermaid
+flowchart LR
+  A["wait(timeline, prev)"] --> B["hdp_flush"]
+  B --> C["acquire_mem"]
+  C --> D["exec"]
+  D --> E["release_mem(timeline, next)"]
 ```
 
 `exec` is the `SET_SH_REG` stream that loads the shader address, the

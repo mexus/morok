@@ -11,10 +11,10 @@ sidebar_label: Worked Example और रेफ़रेंस
 चलिए `c = a + b` (जहाँ a, b दोनों [100, 100] tensors हैं) को पूरी पाइपलाइन में ट्रेस करते हैं।
 
 ### इनिशियल Tensor ग्राफ़
-```
-[ADD]
-├── [BUFFER(a)] : Float32
-└── [BUFFER(b)] : Float32
+```mermaid
+flowchart TD
+  ADD["ADD"] --> BA["BUFFER(a) : Float32"]
+  ADD --> BB["BUFFER(b) : Float32"]
 ```
 
 ### Stage 1 के बाद: Early Movement Ops
@@ -45,19 +45,19 @@ sidebar_label: Worked Example और रेफ़रेंस
 
 ### Stage 9 के बाद: Expander
 UPCAST → UNROLL → CONTRACT (सिम्प्लीफ़ाइड — असल IR में CONTRACT wrapper होता है):
-```
-[VECTORIZE]
-├── [ADD]
-│   ├── [LOAD(a)]
-│   │   └── [INDEX]
-│   │       ├── [BUFFER(a)]
-│   │       ├── [RANGE(i, Global, 0..100)]
-│   │       └── [UNROLL(VCONST([0,1,2,3]))]  // Converted from RANGE(j, UPCAST)
-│   └── [LOAD(b)]
-│       └── [INDEX]
-│           ├── [BUFFER(b)]
-│           ├── [RANGE(i)]  // Same RANGE via hash consing
-│           └── [UNROLL(VCONST([0,1,2,3]))]  // Same UNROLL via hash consing
+```mermaid
+flowchart TD
+  V["VECTORIZE"] --> ADD["ADD"]
+  ADD --> LA["LOAD(a)"]
+  ADD --> LB["LOAD(b)"]
+  LA --> IA["INDEX"]
+  LB --> IB["INDEX"]
+  IA --> BA["BUFFER(a)"]
+  IA --> RG["RANGE(i, Global, 0..100)"]
+  IA --> UN["UNROLL(VCONST([0,1,2,3]))"]
+  IB --> BB["BUFFER(b)"]
+  IB --> RG
+  IB --> UN
 ```
 
 ### Stage 10 के बाद: Add Local Buffers
@@ -76,12 +76,12 @@ UPCAST → UNROLL → CONTRACT (सिम्प्लीफ़ाइड — अ�
 
 ### Stage 14 के बाद: Devectorize
 Devectorize के बाद वेक्टर स्ट्रक्चर (इफ़ेक्ट दिखाता है, exact UOp स्ट्रक्चर नहीं):
-```
-[VECTORIZE] : <4 x Float32>
-├── [ADD(a[0], b[0])]
-├── [ADD(a[1], b[1])]
-├── [ADD(a[2], b[2])]
-└── [ADD(a[3], b[3])]
+```mermaid
+flowchart TD
+  V["VECTORIZE : (4 x Float32)"] --> A0["ADD(a[0], b[0])"]
+  V --> A1["ADD(a[1], b[1])"]
+  V --> A2["ADD(a[2], b[2])"]
+  V --> A3["ADD(a[3], b[3])"]
 ```
 
 ### Stage 15 के बाद: Lower Index Dtype

@@ -1,11 +1,12 @@
 //! Sliding-window pooling: pool, avg_pool2d, max_pool2d, max_pool2d_with_indices.
 
 use bon::bon;
+use snafu::OptionExt;
 use svod_dtype::DType;
 use svod_ir::{ConstValue, SInt, UOp};
 
 use crate::Tensor;
-use crate::error::DivisibilitySnafu;
+use crate::error::{DivisibilitySnafu, SymbolicShapeUnsupportedSnafu};
 use crate::reduce::AxisSpec;
 
 use super::pad::apply_ceil_mode;
@@ -427,13 +428,19 @@ impl Tensor {
         let values = pooled.max_with().axes(axes.clone()).keepdim(false).call()?;
 
         // Compute indices using reverse arange trick (Tinygrad approach)
-        let spatial_sz: usize = (0..n_spatial).map(|j| shape[n_batch + j].as_const().unwrap()).product();
+        let spatial_dims_usize: Vec<usize> = (0..n_spatial)
+            .map(|j| {
+                shape[n_batch + j]
+                    .as_const()
+                    .context(SymbolicShapeUnsupportedSnafu { operation: "max_pool2d_with_indices" })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let spatial_sz: usize = spatial_dims_usize.iter().product();
 
         // Create reverse arange: spatial_sz, spatial_sz-1, ..., 1
         let idx_range = Tensor::arange(spatial_sz as i64, Some(0), Some(-1))?;
         // Reshape to match spatial dims
-        let spatial_dims: Vec<isize> =
-            (0..n_spatial).map(|j| shape[n_batch + j].as_const().unwrap() as isize).collect();
+        let spatial_dims: Vec<isize> = spatial_dims_usize.iter().map(|&d| d as isize).collect();
         let mut idx_shape: Vec<isize> = vec![1; n_batch];
         idx_shape.extend_from_slice(&spatial_dims);
         let idx = idx_range.try_reshape(&idx_shape)?;
@@ -505,7 +512,9 @@ impl Tensor {
         let n_spatial = kernel_size.len();
         let n_batch = ndim - n_spatial;
 
-        let spatial_shape: Vec<usize> = (0..n_spatial).map(|j| shape[n_batch + j].as_const().unwrap()).collect();
+        let spatial_shape: Vec<usize> = (0..n_spatial)
+            .map(|j| shape[n_batch + j].as_const().context(SymbolicShapeUnsupportedSnafu { operation: "max_unpool2d" }))
+            .collect::<Result<Vec<_>>>()?;
 
         // Inferred shape from inverse pooling formula: o = (i-1)*s - (pB+pA) + k
         let stride = stride.unwrap_or(kernel_size);
@@ -519,7 +528,10 @@ impl Tensor {
             .collect();
 
         let inferred_numel: usize = inferred_spatial.iter().product();
-        let bs: usize = (0..n_batch).map(|j| shape[j].as_const().unwrap()).product();
+        let batch_sizes: Vec<usize> = (0..n_batch)
+            .map(|j| shape[j].as_const().context(SymbolicShapeUnsupportedSnafu { operation: "max_unpool2d" }))
+            .collect::<Result<Vec<_>>>()?;
+        let bs: usize = batch_sizes.iter().product();
 
         // Flatten: (N, C, *spatial) → (N*C, 1, num_pooled)
         let num_pooled: usize = spatial_shape.iter().product();
@@ -540,7 +552,7 @@ impl Tensor {
         let result = placed.sum(-1isize)?;
 
         // Reshape to (N, C, *inferred_spatial)
-        let batch_dims: Vec<isize> = (0..n_batch).map(|j| shape[j].as_const().unwrap() as isize).collect();
+        let batch_dims: Vec<isize> = batch_sizes.iter().map(|&d| d as isize).collect();
         let mut inferred_shape: Vec<isize> = batch_dims.clone();
         inferred_shape.extend(inferred_spatial.iter().map(|&s| s as isize));
         let result = result.try_reshape(&inferred_shape)?;
@@ -608,8 +620,8 @@ impl Tensor {
         let dilations = dilations.unwrap_or(&no_dilations);
 
         let shape = self.shape()?;
-        let n = shape[0].as_const().unwrap();
-        let c_times_bl: usize = shape[1].as_const().unwrap();
+        let n = shape[0].as_const().context(SymbolicShapeUnsupportedSnafu { operation: "col2im" })?;
+        let c_times_bl: usize = shape[1].as_const().context(SymbolicShapeUnsupportedSnafu { operation: "col2im" })?;
         let bl: usize = block_shape.iter().product();
         snafu::ensure!(
             c_times_bl.is_multiple_of(bl),
@@ -682,7 +694,13 @@ impl Tensor {
                     let s = strides[j];
                     let ndim = slice.shape()?.len();
                     // [... L_j ...] → [... L_j, 1 ...] → pad → [... L_j, S ...] → [... L_j*S ...] → shrink
-                    let mut sh: Vec<isize> = slice.shape()?.iter().map(|d| d.as_const().unwrap() as isize).collect();
+                    let mut sh: Vec<isize> = slice
+                        .shape()?
+                        .iter()
+                        .map(|d| {
+                            Ok(d.as_const().context(SymbolicShapeUnsupportedSnafu { operation: "col2im" })? as isize)
+                        })
+                        .collect::<Result<Vec<_>>>()?;
                     sh.insert(dim + 1, 1);
                     slice = slice.try_reshape(&sh)?;
 
@@ -695,8 +713,16 @@ impl Tensor {
                     slice = slice.try_reshape(&sh)?;
 
                     let dilated_l = (l_j - 1) * s + 1;
-                    let mut sr: Vec<(isize, isize)> =
-                        slice.shape()?.iter().map(|d| (0, d.as_const().unwrap() as isize)).collect();
+                    let mut sr: Vec<(isize, isize)> = slice
+                        .shape()?
+                        .iter()
+                        .map(|d| {
+                            Ok((
+                                0,
+                                d.as_const().context(SymbolicShapeUnsupportedSnafu { operation: "col2im" })? as isize,
+                            ))
+                        })
+                        .collect::<Result<Vec<_>>>()?;
                     sr[dim] = (0, dilated_l as isize);
                     slice = slice.try_shrink(&sr)?;
                 }

@@ -11,10 +11,10 @@ sidebar_label: 实例演练与参考
 让我们追踪 `c = a + b`（其中 a、b 是 [100, 100] 的张量）在流水线中的全过程。
 
 ### 初始张量图
-```
-[ADD]
-├── [BUFFER(a)] : Float32
-└── [BUFFER(b)] : Float32
+```mermaid
+flowchart TD
+  ADD["ADD"] --> BA["BUFFER(a) : Float32"]
+  ADD --> BB["BUFFER(b) : Float32"]
 ```
 
 ### Stage 1 之后：早期移动操作
@@ -45,19 +45,19 @@ sidebar_label: 实例演练与参考
 
 ### Stage 9 之后：Expander
 UPCAST → UNROLL → CONTRACT（简化展示——实际 IR 有 CONTRACT 包装器）：
-```
-[VECTORIZE]
-├── [ADD]
-│   ├── [LOAD(a)]
-│   │   └── [INDEX]
-│   │       ├── [BUFFER(a)]
-│   │       ├── [RANGE(i, Global, 0..100)]
-│   │       └── [UNROLL(VCONST([0,1,2,3]))]  // Converted from RANGE(j, UPCAST)
-│   └── [LOAD(b)]
-│       └── [INDEX]
-│           ├── [BUFFER(b)]
-│           ├── [RANGE(i)]  // Same RANGE via hash consing
-│           └── [UNROLL(VCONST([0,1,2,3]))]  // Same UNROLL via hash consing
+```mermaid
+flowchart TD
+  V["VECTORIZE"] --> ADD["ADD"]
+  ADD --> LA["LOAD(a)"]
+  ADD --> LB["LOAD(b)"]
+  LA --> IA["INDEX"]
+  LB --> IB["INDEX"]
+  IA --> BA["BUFFER(a)"]
+  IA --> RG["RANGE(i, Global, 0..100)"]
+  IA --> UN["UNROLL(VCONST([0,1,2,3]))"]
+  IB --> BB["BUFFER(b)"]
+  IB --> RG
+  IB --> UN
 ```
 
 ### Stage 10 之后：添加本地 Buffer
@@ -76,12 +76,12 @@ UPCAST → UNROLL → CONTRACT（简化展示——实际 IR 有 CONTRACT 包装
 
 ### Stage 14 之后：Devectorize
 devectorize 之后的向量结构（展示效果，不是精确的 UOp 结构）：
-```
-[VECTORIZE] : <4 x Float32>
-├── [ADD(a[0], b[0])]
-├── [ADD(a[1], b[1])]
-├── [ADD(a[2], b[2])]
-└── [ADD(a[3], b[3])]
+```mermaid
+flowchart TD
+  V["VECTORIZE : (4 x Float32)"] --> A0["ADD(a[0], b[0])"]
+  V --> A1["ADD(a[1], b[1])"]
+  V --> A2["ADD(a[2], b[2])"]
+  V --> A3["ADD(a[3], b[3])"]
 ```
 
 ### Stage 15 之后：降低 Index DType

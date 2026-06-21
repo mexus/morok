@@ -10,19 +10,29 @@ sidebar_label: IR डिज़ाइन फ़िलॉसफ़ी
 
 Svod एक अलग तरीका अपनाता है, [Tinygrad](https://github.com/tinygrad/tinygrad) से उधार लिया हुआ: **tensor से मशीन कोड तक एक ही IR**।
 
-```text
-┌──────────────────┐   ┌─────────────────┐   ┌───────────────┐
-│    TensorFlow    │   │     PyTorch     │   │     Svod      │
-├──────────────────┤   ├─────────────────┤   ├───────────────┤
-│   Python API     │   │   Python API    │   │  Rust/Python  │
-│   TF Graph       │   │   FX Graph      │   │       ↓       │
-│   XLA HLO        │   │   Inductor IR   │   │    UOp IR     │
-│   MLIR dialects  │   │   Triton IR     │   │       ↓       │
-│   LLVM IR        │   │   LLVM/PTX      │   │  Machine code │
-│   Machine code   │   │   Machine code  │   │               │
-├──────────────────┤   ├─────────────────┤   ├───────────────┤
-│      5 IRs       │   │      4 IRs      │   │     1 IR      │
-└──────────────────┘   └─────────────────┘   └───────────────┘
+```mermaid
+flowchart TD
+  subgraph TF["TensorFlow (5 IRs)"]
+    direction TB
+    TF1["Python API"] --> TF2["TF Graph"]
+    TF2 --> TF3["XLA HLO"]
+    TF3 --> TF4["MLIR dialects"]
+    TF4 --> TF5["LLVM IR"]
+    TF5 --> TF6["Machine code"]
+  end
+  subgraph PT["PyTorch (4 IRs)"]
+    direction TB
+    PT1["Python API"] --> PT2["FX Graph"]
+    PT2 --> PT3["Inductor IR"]
+    PT3 --> PT4["Triton IR"]
+    PT4 --> PT5["LLVM/PTX"]
+    PT5 --> PT6["Machine code"]
+  end
+  subgraph SV["Svod (1 IR)"]
+    direction TB
+    SV1["Rust/Python"] --> SV2["UOp IR"]
+    SV2 --> SV3["Machine code"]
+  end
 ```
 
 सबसे सिंपल आर्किटेक्चर अक्सर जीतता है। यह चैप्टर बताता है कि कैसे एक सोच-समझकर डिज़ाइन किया गया IR पूरे कम्पाइलर स्टैक की जगह ले सकता है।
@@ -70,18 +80,18 @@ enum में ~60 Op वैरिएंट हैं जो ऐब्स्ट�
 
 जब आप UOp ग्राफ़ प्रिंट करते हैं, आपको उसका tree स्ट्रक्चर दिखता है:
 
-```text
-[42] STORE : Void
-├── [35] INDEX : Ptr<Float32>
-│   ├── [10] DEFINE_GLOBAL(0) : Ptr<Float32>
-│   └── [30] RANGE(axis=0, Reduce) : Index
-│       └── [5] CONST(4) : Index
-├── [40] REDUCE(Add) : Float32
-│   ├── [38] MUL : Float32
-│   │   ├── [36] LOAD : Float32
-│   │   └── [37] LOAD : Float32
-│   └── [30] → (same RANGE as above)
-└── [30] → (same RANGE as above)
+```mermaid
+flowchart TD
+  N42["[42] STORE : Void"] --> N35["[35] INDEX : Ptr(Float32)"]
+  N42 --> N40["[40] REDUCE(Add) : Float32"]
+  N42 --> N30["[30] RANGE(axis=0, Reduce) : Index"]
+  N35 --> N10["[10] DEFINE_GLOBAL(0) : Ptr(Float32)"]
+  N35 --> N30
+  N30 --> N5["[5] CONST(4) : Index"]
+  N40 --> N38["[38] MUL : Float32"]
+  N40 --> N30
+  N38 --> N36["[36] LOAD : Float32"]
+  N38 --> N37["[37] LOAD : Float32"]
 ```
 
 उन arrows पर ध्यान दें जो "(same RANGE as above)" को पॉइंट करते हैं? यह सिर्फ़ pretty-printing नहीं है — यह एक फ़ंडामेंटल प्रॉपर्टी है जिसे **hash consing** कहते हैं।
@@ -143,16 +153,16 @@ ReduceSum(data, axes=[1], keepdims=0)
 
 Svod `RANGE` ऑपरेशन से लूप्स को *explicit* बनाता है। वही रिडक्शन बनती है:
 
-```text
-[REDUCE(Add)]
-├── [LOAD]
-│   └── [INDEX]
-│       ├── [BUFFER]
-│       ├── [RANGE(axis=0, Global)]   # outer loop (parallelized)
-│       │   └── [CONST(128)]
-│       └── [RANGE(axis=1, Reduce)]   # reduction loop
-│           └── [CONST(64)]
-└── [RANGE(axis=1, Reduce)]           # same RANGE via hash consing
+```mermaid
+flowchart TD
+  RED["REDUCE(Add)"] --> LD["LOAD"]
+  RED --> R1["RANGE(axis=1, Reduce) reduction loop"]
+  LD --> IDX["INDEX"]
+  IDX --> BUF["BUFFER"]
+  IDX --> R0["RANGE(axis=0, Global) outer loop, parallelized"]
+  IDX --> R1
+  R0 --> C128["CONST(128)"]
+  R1 --> C64["CONST(64)"]
 ```
 
 हर `RANGE` का एक **AxisType** होता है जो code generator को बताता है कि इसे कैसे कम्पाइल करना है:
@@ -240,14 +250,14 @@ After Add:      x                 # Add(x, 0) → x
 
 जब आप `A.matmul(&B)` लिखते हैं, Svod एक हाई-लेवल UOp ग्राफ़ बनाता है:
 
-```text
-[REDUCE_AXIS(Add, axes=[2])]
-├── [MUL]
-│   ├── [EXPAND]           # A: [4,4] → [4,4,4]
-│   │   └── [BUFFER(A)]
-│   └── [EXPAND]           # B: [4,4] → [4,4,4]
-│       └── [PERMUTE]      # transpose for broadcasting
-│           └── [BUFFER(B)]
+```mermaid
+flowchart TD
+  RA["REDUCE_AXIS(Add, axes=[2])"] --> MUL["MUL"]
+  MUL --> EA["EXPAND (A: [4,4] to [4,4,4])"]
+  MUL --> EB["EXPAND (B: [4,4] to [4,4,4])"]
+  EA --> BA["BUFFER(A)"]
+  EB --> PERM["PERMUTE (transpose for broadcasting)"]
+  PERM --> BB["BUFFER(B)"]
 ```
 
 यह प्योर math है: "A और B को expand करो ताकि डायमेंशन अलाइन हों, elementwise मल्टिप्लाई करो, contracted axis पर sum करो।"
@@ -256,28 +266,28 @@ After Add:      x                 # Add(x, 0) → x
 
 Rangeify पास movement ops (`EXPAND`, `PERMUTE`) को `RANGE` लूप्स के साथ एक्सप्लिसिट index कम्प्यूटेशन में बदलता है:
 
-```text
-[STORE]
-├── [INDEX]
-│   ├── [DEFINE_GLOBAL(C)]
-│   ├── [RANGE(i, Global)]     # i ∈ [0, 4)
-│   │   └── [CONST(4)]
-│   └── [RANGE(j, Global)]     # j ∈ [0, 4)
-│       └── [CONST(4)]
-├── [REDUCE(Add)]
-│   ├── [MUL]
-│   │   ├── [LOAD(A)]
-│   │   │   └── [INDEX]
-│   │   │       ├── [RANGE(i)]     # same i (hash consing)
-│   │   │       └── [RANGE(k, Reduce)]
-│   │   └── [LOAD(B)]
-│   │       └── [INDEX]
-│   │           ├── [RANGE(k)]     # same k
-│   │           └── [RANGE(j)]     # same j
-│   └── [RANGE(k, Reduce)]         # k ∈ [0, 4)
-│       └── [CONST(4)]
-├── [RANGE(j, Global)]          # output dim 1 (closed)
-└── [RANGE(i, Global)]          # output dim 0 (closed)
+```mermaid
+flowchart TD
+  STORE["STORE"] --> IDXC["INDEX"]
+  STORE --> RED["REDUCE(Add)"]
+  STORE --> RJ["RANGE(j, Global) j in [0, 4)"]
+  STORE --> RI["RANGE(i, Global) i in [0, 4)"]
+  IDXC --> DG["DEFINE_GLOBAL(C)"]
+  IDXC --> RI
+  IDXC --> RJ
+  RED --> MUL["MUL"]
+  RED --> RK["RANGE(k, Reduce) k in [0, 4)"]
+  MUL --> LA["LOAD(A)"]
+  MUL --> LB["LOAD(B)"]
+  LA --> IDXA["INDEX (A)"]
+  IDXA --> RI
+  IDXA --> RK
+  LB --> IDXB["INDEX (B)"]
+  IDXB --> RK
+  IDXB --> RJ
+  RI --> C4["CONST(4)"]
+  RJ --> C4
+  RK --> C4
 ```
 
 अब हम लूप स्ट्रक्चर देख सकते हैं: `i` और `j` `Global` हैं (parallelized), `k` `Reduce` है (accumulated)।

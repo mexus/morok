@@ -23,7 +23,7 @@ fn test_add_vec4_devectorize() {
     let a = create_vector_float_iota(4);
     let b = create_vector_float_values(vec![10.0, 20.0, 30.0, 40.0]);
 
-    let add = UOp::new(Op::Binary(BinaryOp::Add, a, b), DType::Float32.vec(4));
+    let add = UOp::new(Op::Binary(BinaryOp::Add, a, b), DType::Float32.vec(4).unwrap());
 
     let result = apply_no_vectorized_alu(&add);
 
@@ -48,7 +48,7 @@ fn test_mul_vec8_devectorize() {
     let a = create_vector_float_iota(8);
     let b = create_vector_float_iota(8);
 
-    let mul = UOp::new(Op::Binary(BinaryOp::Mul, a, b), DType::Float32.vec(8));
+    let mul = UOp::new(Op::Binary(BinaryOp::Mul, a, b), DType::Float32.vec(8).unwrap());
 
     let result = apply_no_vectorized_alu(&mul);
 
@@ -85,7 +85,7 @@ fn test_sub_vec4_devectorize() {
     let a = create_vector_float_iota(4);
     let b = create_vector_float_iota(4);
 
-    let sub = UOp::new(Op::Binary(BinaryOp::Sub, a, b), DType::Float32.vec(4));
+    let sub = UOp::new(Op::Binary(BinaryOp::Sub, a, b), DType::Float32.vec(4).unwrap());
 
     let result = apply_no_vectorized_alu(&sub);
 
@@ -110,7 +110,7 @@ fn test_sub_vec4_devectorize() {
 fn test_neg_vec4_devectorize() {
     let a = create_vector_float_iota(4);
 
-    let neg = UOp::new(Op::Unary(UnaryOp::Neg, a), DType::Float32.vec(4));
+    let neg = UOp::new(Op::Unary(UnaryOp::Neg, a), DType::Float32.vec(4).unwrap());
 
     let result = apply_no_vectorized_alu(&neg);
 
@@ -132,7 +132,7 @@ fn test_neg_vec4_devectorize() {
 fn test_sqrt_vec4_devectorize() {
     let a = create_vector_float_iota(4);
 
-    let sqrt = UOp::new(Op::Unary(UnaryOp::Sqrt, a), DType::Float32.vec(4));
+    let sqrt = UOp::new(Op::Unary(UnaryOp::Sqrt, a), DType::Float32.vec(4).unwrap());
 
     let result = apply_no_vectorized_alu(&sqrt);
 
@@ -153,7 +153,7 @@ fn test_sqrt_vec4_devectorize() {
 fn test_exp2_vec4_devectorize() {
     let a = create_vector_float_iota(4);
 
-    let exp2 = UOp::new(Op::Unary(UnaryOp::Exp2, a), DType::Float32.vec(4));
+    let exp2 = UOp::new(Op::Unary(UnaryOp::Exp2, a), DType::Float32.vec(4).unwrap());
 
     let result = apply_no_vectorized_alu(&exp2);
 
@@ -188,7 +188,7 @@ fn test_unary_scalar_unchanged() {
 fn test_cast_vec4_devectorize() {
     let a = create_vector_float_iota(4);
 
-    let cast = a.cast(DType::Int64.vec(4));
+    let cast = a.cast(DType::Int64.vec(4).unwrap());
 
     let result = apply_no_vectorized_alu(&cast);
 
@@ -229,7 +229,7 @@ fn test_where_vec4_devectorize() {
     let t_val = create_vector_float_iota(4);
     let f_val = create_vector_float_values(vec![10.0, 11.0, 12.0, 13.0]);
 
-    let where_op = UOp::new(Op::Ternary(TernaryOp::Where, cond, t_val, f_val), DType::Float32.vec(4));
+    let where_op = UOp::new(Op::Ternary(TernaryOp::Where, cond, t_val, f_val), DType::Float32.vec(4).unwrap());
 
     let result = apply_no_vectorized_alu(&where_op);
 
@@ -320,7 +320,7 @@ fn test_binary_mixed_operands() {
     let scalar = create_float_const(10.0);
     let b = scalar.broadcast(4);
 
-    let add = UOp::new(Op::Binary(BinaryOp::Add, a, b), DType::Float32.vec(4));
+    let add = UOp::new(Op::Binary(BinaryOp::Add, a, b), DType::Float32.vec(4).unwrap());
 
     let result = apply_no_vectorized_alu(&add);
 
@@ -351,7 +351,7 @@ fn test_add_vec16_devectorize() {
         (0..16).map(|i| UOp::const_(DType::Float32, ConstValue::Float((i * 2) as f64))).collect();
     let b = UOp::vectorize(elements_b);
 
-    let add = UOp::new(Op::Binary(BinaryOp::Add, a, b), DType::Float32.vec(16));
+    let add = UOp::new(Op::Binary(BinaryOp::Add, a, b), DType::Float32.vec(16).unwrap());
 
     let result = apply_no_vectorized_alu(&add);
 
@@ -374,7 +374,7 @@ fn test_int_add_devectorize() {
     let a = create_vector_int_iota(4);
     let b = create_vector_int_values(vec![10, 20, 30, 40]);
 
-    let add = UOp::new(Op::Binary(BinaryOp::Add, a, b), DType::Int64.vec(4));
+    let add = UOp::new(Op::Binary(BinaryOp::Add, a, b), DType::Int64.vec(4).unwrap());
 
     let result = apply_no_vectorized_alu(&add);
 
@@ -396,7 +396,7 @@ fn test_bitwise_and_devectorize() {
     let a = create_vector_int_values(vec![0xFF, 0xF0, 0x0F, 0x00]);
     let b = create_vector_int_values(vec![0x0F, 0x0F, 0x0F, 0x0F]);
 
-    let and = UOp::new(Op::Binary(BinaryOp::And, a, b), DType::Int64.vec(4));
+    let and = UOp::new(Op::Binary(BinaryOp::And, a, b), DType::Int64.vec(4).unwrap());
 
     let result = apply_no_vectorized_alu(&and);
 

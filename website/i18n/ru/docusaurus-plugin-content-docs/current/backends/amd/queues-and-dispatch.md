@@ -50,8 +50,12 @@ will_use_pm4(core) = !SVOD_AMD_AQL && num_xcc == 1
 Одна PM4-диспетчеризация — это фиксированная последовательность, зеркалящая
 `hcq.py:371-378` из tinygrad:
 
-```text
-wait(timeline, prev)  →  hdp_flush  →  acquire_mem  →  exec  →  release_mem(timeline, next)
+```mermaid
+flowchart LR
+  A["wait(timeline, prev)"] --> B["hdp_flush"]
+  B --> C["acquire_mem"]
+  C --> D["exec"]
+  D --> E["release_mem(timeline, next)"]
 ```
 
 `exec` — это поток `SET_SH_REG`, который загружает адрес шейдера, регистры

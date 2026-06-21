@@ -19,7 +19,7 @@
 //!   **pre-LN**. Call [`Encoder::final_layer_norm_apply`] to get the
 //!   post-LN output.
 
-use snafu::ResultExt;
+use snafu::{OptionExt, ResultExt};
 use svod_dtype::DType;
 use svod_tensor::Tensor;
 
@@ -29,7 +29,7 @@ use crate::state::{self, HasStateDict, StateDict, get_tensor, prefixed};
 use super::attention::compute_position_bias;
 use super::config::WavLmConfig;
 use super::encoder_layer::EncoderLayer;
-use super::error::{Result, TensorSnafu};
+use super::error::{Result, SymbolicShapeSnafu, TensorSnafu};
 use super::layer_norm::LayerNormWeights;
 use super::pos_conv::ConvolutionalPositionalEmbedding;
 
@@ -101,7 +101,7 @@ impl Encoder {
     /// what the published Python dump uses.
     pub fn extract_features(&self, features: &Tensor) -> Result<Vec<Tensor>> {
         let shape = features.shape().context(TensorSnafu)?;
-        let l = shape[1].as_const().expect("encoder requires concrete sequence length");
+        let l = shape[1].as_const().context(SymbolicShapeSnafu { what: "encoder" })?;
 
         // FeatureProjection: LN → Linear → (dropout no-op)
         let h = self.feature_projection_norm.apply(features)?;

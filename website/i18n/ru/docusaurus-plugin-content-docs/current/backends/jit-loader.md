@@ -12,32 +12,16 @@ sidebar_label: JIT-компилятор
 
 ## Пайплайн
 
-```text
-C source / LLVM IR
-       │
-       ▼
- clang -c (stdin → stdout)
-       │
-       ▼
-  ELF .o bytes (в памяти)
-       │
-       ▼
- Парсинг секций (object crate)
-       │
-       ▼
- Анонимный mmap + копирование секций
-       │
-       ▼
- Применение релокаций (для каждой архитектуры)
-       │
-       ▼
- mprotect(PROT_READ | PROT_EXEC)
-       │
-       ▼
- Сброс I-cache (кроме x86_64)
-       │
-       ▼
- Вызов через libffi
+```mermaid
+flowchart TD
+  A["C source / LLVM IR"] --> B["clang -c (stdin to stdout)"]
+  B --> C["ELF .o bytes (in memory)"]
+  C --> D["Parse sections (object crate)"]
+  D --> E["Anonymous mmap + copy sections"]
+  E --> F["Apply relocations (arch-specific)"]
+  F --> G["mprotect(PROT_READ, PROT_EXEC)"]
+  G --> H["Flush I-cache (non-x86_64)"]
+  H --> I["Call function pointer via libffi"]
 ```
 
 И **Clang**-бэкенд (исходный код на C через `-x c`), и **LLVM**-бэкенд (текст LLVM IR через `-x ir`) используют общий загрузчик. Единственное отличие — флаг входного языка clang.

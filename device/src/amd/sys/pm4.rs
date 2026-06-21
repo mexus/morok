@@ -104,6 +104,10 @@ pub const fn release_mem_data_sel(x: u32) -> u32 {
 pub const DATA_SEL_SEND_32_BIT_LOW: u32 = 1;
 /// `data_sel = send_64_bit_data`.
 pub const DATA_SEL_SEND_64_BIT_DATA: u32 = 2;
+/// `data_sel = send_gpu_clock_counter` — the CP writes the 64-bit GPU clock
+/// counter (architected 100 MHz, 10 ns/tick) to the target address; the value
+/// fields are ignored. Used to bracket a PM4 dispatch with start/end timestamps.
+pub const DATA_SEL_SEND_GPU_CLOCK: u32 = 3;
 /// `int_sel = send_interrupt_after_write_confirm`.
 pub const INT_SEL_INTERRUPT_AFTER_WRITE: u32 = 2;
 /// `dst_sel = 0` for ordinary memory destinations.
@@ -240,6 +244,40 @@ pub fn release_mem(addr: u64, value: u32, cache_flush: bool, is_gfx9: bool) -> [
         (addr >> 32) as u32,
         value,
         0, // value_hi (unused for 32-bit data_sel)
+        0, // ctxid
+    ]
+}
+
+/// Build a PM4 RELEASE_MEM that writes the 64-bit GPU clock counter to `addr`
+/// at end-of-pipe, with NO cache flush and NO interrupt — a lightweight
+/// dispatch-timestamp probe. Bracketing a PM4 dispatch with two of these
+/// (`start` before `DISPATCH_DIRECT`, `end` after) gives the host on-device
+/// kernel duration on the single-XCC PM4 path, which — unlike the AQL path's
+/// `ENABLE_PROFILING` — gets no CP-auto-stamped `start_ts`/`end_ts`. `addr` must
+/// be 8-byte aligned (a signal slot's `start_ts`/`end_ts` fields, at +32/+40).
+pub fn release_mem_timestamp(addr: u64, is_gfx9: bool) -> [u32; 8] {
+    // GPU-clock data_sel writes 64 bits; no INT_SEL (no waiter to wake) and no
+    // cache-flush bits (a bare timestamp probe, not the coherence-carrying
+    // completion `release_mem`). DST_SEL exists only on gfx10+.
+    let memsel = if is_gfx9 {
+        release_mem_data_sel(DATA_SEL_SEND_GPU_CLOCK)
+    } else {
+        release_mem_data_sel(DATA_SEL_SEND_GPU_CLOCK) | release_mem_dst_sel(DST_SEL_MEMORY)
+    };
+    // `CACHE_FLUSH_AND_INV_TS_EVENT` names the timestamp-CAPABLE end-of-pipe
+    // event; despite the name it triggers NO cache action here — the flush /
+    // invalidate is gated by the GCR (gfx10+) / TC-action (gfx9) bits, which are
+    // deliberately omitted (cf. the completion `release_mem`, which OR's them in).
+    let event_dw =
+        release_mem_event_type(CACHE_FLUSH_AND_INV_TS_EVENT) | release_mem_event_index(EVENT_INDEX_END_OF_PIPE);
+    [
+        packet3(PACKET3_RELEASE_MEM, 6),
+        event_dw,
+        memsel,
+        addr as u32,
+        (addr >> 32) as u32,
+        0, // value lo — ignored for gpu-clock data_sel
+        0, // value hi
         0, // ctxid
     ]
 }

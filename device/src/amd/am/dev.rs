@@ -32,7 +32,7 @@ impl AmDev {
     /// Requires amdgpu unbound + root.
     pub fn open(bdf: &str) -> Result<Self> {
         let mut pci = PciDevice::open(bdf, false)?;
-        pci.enable_bus_master();
+        pci.enable_bus_master()?;
 
         // Bootstrap: FB is gated until the GIM grants access via the mailbox,
         // so the handshake (hardcoded NBIO base) runs before discovery.

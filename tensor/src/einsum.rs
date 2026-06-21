@@ -2,9 +2,9 @@
 
 use std::collections::HashMap;
 
-use snafu::ResultExt;
+use snafu::{OptionExt, ResultExt};
 
-use crate::error::UOpSnafu;
+use crate::error::{SymbolicShapeUnsupportedSnafu, UOpSnafu};
 use crate::reduce::AxisSpec;
 use crate::{Tensor, s};
 
@@ -35,14 +35,14 @@ impl Tensor {
                 .zip(xs.iter())
                 .map(|(s, x)| {
                     if s.contains("...") {
-                        let ndim = x.ndim().unwrap();
+                        let ndim = x.ndim()?;
                         let non_ell_chars = s.len() - 3; // subtract "..."
-                        ndim.saturating_sub(non_ell_chars)
+                        Ok(ndim.saturating_sub(non_ell_chars))
                     } else {
-                        0
+                        Ok(0)
                     }
                 })
-                .collect();
+                .collect::<Result<_>>()?;
 
             let max_ell_n = *ell_n.iter().max().unwrap_or(&0);
 
@@ -107,7 +107,7 @@ impl Tensor {
                     let j = s.find(c).unwrap();
                     let k = s[j + 1..].find(c).unwrap() + j + 1;
                     let shape = x.shape()?;
-                    let n = shape[j].as_const().unwrap();
+                    let n = shape[j].as_const().context(SymbolicShapeUnsupportedSnafu { operation: "einsum" })?;
                     let ndim = x.ndim()?;
 
                     if ndim > 2 {
@@ -153,7 +153,7 @@ impl Tensor {
         for (s, x) in inputs.iter().zip(xs.iter()) {
             let shape = x.shape()?;
             for (c, dim) in s.chars().zip(shape.iter()) {
-                let dim_val = dim.as_const().unwrap();
+                let dim_val = dim.as_const().context(SymbolicShapeUnsupportedSnafu { operation: "einsum" })?;
                 sz.insert(c, dim_val);
             }
         }
@@ -225,7 +225,7 @@ impl Tensor {
         let mut new_shape: Vec<isize> = Vec::new();
         let mut merged = 1isize;
         for (i, d) in shape.iter().enumerate() {
-            let v = d.as_const().unwrap() as isize;
+            let v = d.as_const().context(SymbolicShapeUnsupportedSnafu { operation: "einsum" })? as isize;
             if i >= start && i <= end {
                 merged *= v;
                 if i == end {
@@ -250,7 +250,7 @@ impl Tensor {
                 continue;
             }
             let cur_shape = result.shape()?;
-            let dim_size = cur_shape[dim].as_const().unwrap();
+            let dim_size = cur_shape[dim].as_const().context(SymbolicShapeUnsupportedSnafu { operation: "einsum" })?;
             let new_dim_size = dim_size.div_ceil(stride as usize);
 
             // Reshape dim into [new_dim_size, stride], take [:, 0]
@@ -269,8 +269,11 @@ impl Tensor {
             new_shape.splice(dim..=dim, [new_dim_size as isize, stride]);
             result = result.try_reshape(&new_shape)?;
 
-            let mut ranges: Vec<(isize, isize)> =
-                result.shape()?.iter().map(|d| (0, d.as_const().unwrap() as isize)).collect();
+            let mut ranges: Vec<(isize, isize)> = result
+                .shape()?
+                .iter()
+                .map(|d| Ok((0, d.as_const().context(SymbolicShapeUnsupportedSnafu { operation: "einsum" })? as isize)))
+                .collect::<Result<_>>()?;
             ranges[dim + 1] = (0, 1);
             result = result.try_shrink(&ranges)?;
             result = result.try_squeeze(Some((dim + 1) as isize))?;

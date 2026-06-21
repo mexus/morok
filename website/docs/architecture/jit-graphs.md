@@ -15,20 +15,26 @@ inputs and the graph; the macro generates a wrapper that compiles the graph
 once during `prepare()` and replays it on every `execute()` with the device
 buffers held in place.
 
-```text
-Without the wrapper:                 With the wrapper:
-┌─────────────────────────┐          ┌─────────────────────────┐
-│  build graph            │          │  build graph            │
-│  optimize patterns      │          │  optimize patterns      │
-│  generate kernels       │          │  generate kernels       │
-│  compile (clang)        │          │  compile (clang)        │
-│  alloc buffers          │          │  alloc buffers          │
-│  execute                │          ├─────────────────────────┤
-└─────────────────────────┘          │  write input buffers    │
-                                     │  execute                │
-                                     │  read output buffer     │
-                                     └─────────────────────────┘
-every call                           prepare() + every step
+```mermaid
+flowchart TD
+  subgraph WO["Without the wrapper (every call)"]
+    WO1["build graph"] --> WO2["optimize patterns"]
+    WO2 --> WO3["generate kernels"]
+    WO3 --> WO4["compile (clang)"]
+    WO4 --> WO5["alloc buffers"]
+    WO5 --> WO6["execute"]
+  end
+  subgraph WP["With the wrapper (prepare() once)"]
+    WP1["build graph"] --> WP2["optimize patterns"]
+    WP2 --> WP3["generate kernels"]
+    WP3 --> WP4["compile (clang)"]
+    WP4 --> WP5["alloc buffers"]
+  end
+  subgraph WS["Every step"]
+    WS1["write input buffers"] --> WS2["execute"]
+    WS2 --> WS3["read output buffer"]
+  end
+  WP --> WS
 ```
 
 The wrapper composes with the [pattern engine](./optimizations/pattern-system.md)

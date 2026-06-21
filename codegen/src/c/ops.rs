@@ -56,6 +56,14 @@ impl CContext {
         }
     }
 
+    /// Record an `UnsupportedOp` error from a renderer op handler that reached an
+    /// op variant it cannot lower.
+    pub fn set_unsupported_op(&mut self, op: impl Into<String>) {
+        if self.pending_error.is_none() {
+            self.pending_error = Some(crate::Error::UnsupportedOp { op: op.into() });
+        }
+    }
+
     /// Drain any error recorded via [`Self::set_invalid_graph`].
     pub fn take_error(&mut self) -> Option<crate::Error> {
         self.pending_error.take()
@@ -424,9 +432,11 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut CContext, kernel: &mut Vec<String>) 
         }
 
         Op::PtrCat { .. } => {
-            panic!(
-                "PtrCat must be eliminated before codegen (devectorize should distribute it into scalar loads/stores)"
-            );
+            ctx.set_invalid_graph(format!(
+                "PtrCat on uop {} reached C codegen; devectorize should distribute it into scalar loads/stores",
+                uop.id
+            ));
+            None
         }
 
         Op::Wmma { a, b, c, metadata } => {
@@ -520,9 +530,11 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut CContext, kernel: &mut Vec<String>) 
             Some(())
         }
 
-        _ => {
-            let indent = ctx.indent();
-            kernel.push(format!("{indent}/* UNSUPPORTED: {:?} */", uop.op().as_ref()));
+        op => {
+            // An op variant the C backend has no lowering for. Surface it as a typed
+            // error instead of emitting a comment + None that would detonate later
+            // when a consumer calls `ctx.get` on this missing value.
+            ctx.set_unsupported_op(op.as_ref());
             None
         }
     }

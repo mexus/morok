@@ -1,9 +1,9 @@
 use std::time::{Duration, Instant};
 
-use snafu::ResultExt;
+use snafu::{ResultExt, ensure};
 use svod_device::Buffer;
 
-use crate::jit::{DeviceSnafu, JitError, Result};
+use crate::jit::{DeviceSnafu, OutputLayoutMismatchSnafu, Result};
 
 /// Flat host-side LSTM state. `h` and `c` are `f32` vectors of equal length;
 /// for a single-layer cell `h.len() = hidden_size`, for a multi-layer stack
@@ -72,9 +72,10 @@ impl<J: RecurrentJit> JitRecurrent<J> {
     pub fn new(jit: J, state: LstmState, head_len: usize) -> Result<Self> {
         let declared_state = state.h.len() + state.c.len();
         let actual = jit.output_buffer()?.size() / std::mem::size_of::<f32>();
-        if actual != head_len + declared_state {
-            return Err(JitError::OutputLayoutMismatch { declared_head: head_len, declared_state, actual });
-        }
+        ensure!(
+            actual == head_len + declared_state,
+            OutputLayoutMismatchSnafu { declared_head: head_len, declared_state, actual }
+        );
         Ok(Self { jit, state, head_buf: vec![0.0; head_len], head_len, last_timing: StepTiming::default() })
     }
 

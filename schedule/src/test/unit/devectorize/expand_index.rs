@@ -462,3 +462,35 @@ fn test_expand_mixed_broadcast() {
     let load_count = count_loads(&result);
     assert!(load_count >= 1, "Should have at least one LOAD");
 }
+
+/// Test: Scalar-buffer INDEX with vector index — the post-Op-4 path.
+///
+/// Before the `is_vector_index` extension, the devectorizer only fired on
+/// `INDEX(VECTORIZE(buf), vec_idx)`. After Op 4's Case 4 Ptr guard, the expander
+/// keeps the buffer scalar (`INDEX(scalar_param, vec_idx)`), which the old
+/// `is_vector_index` rejected — leaving the vector INDEX unconsumed and causing
+/// the renderer to emit an illegal `<N x ptr>` GEP.
+///
+/// This test verifies the extended `is_vector_index` handles a scalar PARAM
+/// buffer with a contiguous vec4 index: the full devectorize pipeline folds it
+/// into a scalar LOAD (no PTRCAT residue).
+#[test]
+fn test_expand_scalar_buffer_contiguous_vec4() {
+    let buffer = create_buffer(64);
+    let define = buffer_to_define(&buffer);
+
+    // Build INDEX(scalar_define, vec4_iota) — no VECTORIZE wrapping the buffer.
+    let indices: smallvec::SmallVec<[Arc<UOp>; 4]> =
+        (0..4).map(|i| UOp::const_(DType::Index, ConstValue::Int(i as i64))).collect();
+    let vec_idx = UOp::vectorize(indices);
+    let idx_dtype = buffer.dtype().base();
+    let index =
+        UOp::new(Op::Index { buffer: define, indices: smallvec![vec_idx], gate: None }, DType::Scalar(idx_dtype));
+    let load = UOp::load().buffer(buffer.clone()).index(index).call();
+
+    let result = apply_devectorize(&load);
+
+    assert_no_ptrcat(&result);
+    let load_count = count_loads(&result);
+    assert!(load_count >= 1, "scalar-buffer vec4 INDEX must produce at least one LOAD");
+}

@@ -34,12 +34,14 @@ impl Layer for Relu {
 pub use pad::{auto_pad_split, flat_pads_to_pairs, resolve_pool_pads};
 
 use bon::bon;
-use snafu::ResultExt;
+use snafu::{OptionExt, ResultExt};
 use svod_dtype::DType;
 use svod_ir::SInt;
 
 use crate::Tensor;
-use crate::error::{DivisibilitySnafu, NdimExactSnafu, NdimMinimumSnafu, ParamRangeSnafu, UOpSnafu};
+use crate::error::{
+    DivisibilitySnafu, NdimExactSnafu, NdimMinimumSnafu, ParamRangeSnafu, SymbolicShapeUnsupportedSnafu, UOpSnafu,
+};
 use crate::reduce::AxisSpec;
 
 type Result<T> = crate::Result<T>;
@@ -362,9 +364,13 @@ impl Tensor {
         dilations: Option<&[i64]>,
     ) -> Result<Tensor> {
         let w_shape = weight.shape()?;
-        let kernel: Vec<usize> = kernel_shape
-            .map(|ks| ks.to_vec())
-            .unwrap_or_else(|| w_shape[2..].iter().map(|s| s.as_const().unwrap()).collect());
+        let kernel: Vec<usize> = match kernel_shape {
+            Some(ks) => ks.to_vec(),
+            None => w_shape[2..]
+                .iter()
+                .map(|s| s.as_const().context(SymbolicShapeUnsupportedSnafu { operation: "conv" }))
+                .collect::<Result<Vec<_>>>()?,
+        };
         let n = kernel.len();
         let strides_u: Vec<usize> =
             strides.map(|s| s.iter().map(|&v| v as usize).collect()).unwrap_or_else(|| vec![1; n]);
@@ -433,9 +439,13 @@ impl Tensor {
         dilations: Option<&[i64]>,
     ) -> Result<Tensor> {
         let w_shape = weight.shape()?;
-        let kernel: Vec<usize> = kernel_shape
-            .map(|ks| ks.to_vec())
-            .unwrap_or_else(|| w_shape[2..].iter().map(|s| s.as_const().unwrap()).collect());
+        let kernel: Vec<usize> = match kernel_shape {
+            Some(ks) => ks.to_vec(),
+            None => w_shape[2..]
+                .iter()
+                .map(|s| s.as_const().context(SymbolicShapeUnsupportedSnafu { operation: "conv_transpose" }))
+                .collect::<Result<Vec<_>>>()?,
+        };
         let n = kernel.len();
         let x_shape = self.shape()?;
         let input_spatial: Vec<SInt> = x_shape[2..].to_vec();
@@ -451,8 +461,8 @@ impl Tensor {
         // ConvTranspose padding resolution requires concrete spatial dims.
         let input_spatial_c: Vec<usize> = input_spatial
             .iter()
-            .map(|s| s.as_const().expect("conv_transpose requires concrete spatial dims"))
-            .collect();
+            .map(|s| s.as_const().context(SymbolicShapeUnsupportedSnafu { operation: "conv_transpose" }))
+            .collect::<Result<Vec<_>>>()?;
 
         // Path 1: output_shape provided → derive total pads, apply auto_pad
         if let Some(os) = output_shape {
@@ -692,10 +702,10 @@ impl Tensor {
         );
         let shape = self.shape()?;
         let (b, c, h, w) = (
-            shape[0].as_const().unwrap(),
-            shape[1].as_const().unwrap(),
-            shape[2].as_const().unwrap(),
-            shape[3].as_const().unwrap(),
+            shape[0].as_const().context(SymbolicShapeUnsupportedSnafu { operation: "depth_to_space" })?,
+            shape[1].as_const().context(SymbolicShapeUnsupportedSnafu { operation: "depth_to_space" })?,
+            shape[2].as_const().context(SymbolicShapeUnsupportedSnafu { operation: "depth_to_space" })?,
+            shape[3].as_const().context(SymbolicShapeUnsupportedSnafu { operation: "depth_to_space" })?,
         );
         let bs_sq = blocksize * blocksize;
         snafu::ensure!(
@@ -765,10 +775,10 @@ impl Tensor {
         );
         let shape = self.shape()?;
         let (b, c, h, w) = (
-            shape[0].as_const().unwrap(),
-            shape[1].as_const().unwrap(),
-            shape[2].as_const().unwrap(),
-            shape[3].as_const().unwrap(),
+            shape[0].as_const().context(SymbolicShapeUnsupportedSnafu { operation: "space_to_depth" })?,
+            shape[1].as_const().context(SymbolicShapeUnsupportedSnafu { operation: "space_to_depth" })?,
+            shape[2].as_const().context(SymbolicShapeUnsupportedSnafu { operation: "space_to_depth" })?,
+            shape[3].as_const().context(SymbolicShapeUnsupportedSnafu { operation: "space_to_depth" })?,
         );
         snafu::ensure!(
             h.is_multiple_of(blocksize),
@@ -922,10 +932,10 @@ impl Tensor {
         );
         let shape = self.shape()?;
         let (b, c, h, w) = (
-            shape[0].as_const().unwrap(),
-            shape[1].as_const().unwrap(),
-            shape[2].as_const().unwrap(),
-            shape[3].as_const().unwrap(),
+            shape[0].as_const().context(SymbolicShapeUnsupportedSnafu { operation: "lrn" })?,
+            shape[1].as_const().context(SymbolicShapeUnsupportedSnafu { operation: "lrn" })?,
+            shape[2].as_const().context(SymbolicShapeUnsupportedSnafu { operation: "lrn" })?,
+            shape[3].as_const().context(SymbolicShapeUnsupportedSnafu { operation: "lrn" })?,
         );
         let x_sq = self.square()?;
         let x_sq = x_sq.try_reshape([b as isize, 1, c as isize, (h * w) as isize])?;

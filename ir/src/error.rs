@@ -114,11 +114,11 @@ pub enum Error {
 
     /// Symbolic shape unsupported.
     #[snafu(display("symbolic shape is not supported for {operation}: shape dimensions must be concrete values"))]
-    SymbolicShapeUnsupported { operation: String },
+    SymbolicShapeUnsupported { operation: &'static str },
 
     /// Operation requires a known shape but shape inference returned None.
     #[snafu(display("shape inference failed for {operation}: source has no inferable shape"))]
-    MissingShape { operation: String },
+    MissingShape { operation: &'static str },
 
     /// Symbolic buffer size unsupported.
     #[snafu(display("cannot allocate buffer with symbolic size: range bound resolved to {bound:?}"))]
@@ -146,6 +146,11 @@ pub enum Error {
     /// VECTORIZE elements have mismatched dtypes.
     #[snafu(display("VECTORIZE elements have mismatched dtypes: expected {expected:?}, got {actual:?}"))]
     VectorizeDTypeMismatch { expected: DType, actual: DType },
+
+    /// Element/source dtype cannot be vectorized to the requested count
+    /// (already a vector, or a pointer vectorized to a conflicting count).
+    #[snafu(display("dtype {dtype:?} cannot be vectorized to count {count}"))]
+    NotVectorizable { dtype: DType, count: usize },
 
     /// GEP index out of bounds.
     #[snafu(display("GEP index {index} out of bounds for vector with {vcount} elements"))]
@@ -206,6 +211,10 @@ pub enum Error {
     /// GETTUPLE index out of bounds.
     #[snafu(display("GETTUPLE index {index} out of bounds for {kind} of length {len}"))]
     GetTupleIndexOutOfBounds { index: usize, len: usize, kind: &'static str },
+
+    /// GETTUPLE source is neither a TUPLE nor a FUNCTION whose body is a TUPLE.
+    #[snafu(display("GETTUPLE requires a TUPLE or FUNCTION(TUPLE) source, got {op}"))]
+    GetTupleNotATuple { op: &'static str },
 
     /// STORE node reached range assignment with no inferable shape.
     #[snafu(display("STORE node id={uop_id} has no inferable index shape during range assignment"))]

@@ -208,7 +208,7 @@ fn test_sink_cast_strip() {
 #[test]
 fn test_index_with_cast_cleanup() {
     // INDEX(buf, idx.cast(index)) where idx is i32 → INDEX(buf, idx)
-    let ptr_dtype = DType::Float32.ptr(Some(100), AddrSpace::Global);
+    let ptr_dtype = DType::Float32.ptr(Some(100), AddrSpace::Global).unwrap();
     let buffer = UOp::param(0, 100, ptr_dtype, None);
     let idx = UOp::native_const(0i32);
     let idx_cast = idx.cast(DType::Index);
@@ -230,7 +230,7 @@ fn test_index_with_cast_cleanup() {
 #[test]
 fn test_index_with_gated_cast_cleanup() {
     // INDEX(buf, idx.cast(index), valid) → INDEX(buf, idx, valid)
-    let ptr_dtype = DType::Float32.ptr(Some(100), AddrSpace::Global);
+    let ptr_dtype = DType::Float32.ptr(Some(100), AddrSpace::Global).unwrap();
     let buffer = UOp::param(0, 100, ptr_dtype, None);
     let idx = UOp::native_const(0i32);
     let idx_cast = idx.cast(DType::Index);

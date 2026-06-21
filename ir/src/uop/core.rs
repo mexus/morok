@@ -1241,8 +1241,10 @@ impl UOp {
             Op::Vectorize { .. } => {
                 let elements: SmallVec<[Arc<Self>; 4]> = new_srcs.iter().cloned().collect();
                 let elem_dtype = elements[0].dtype();
-                let new_dtype = match elem_dtype {
-                    DType::Scalar(_) | DType::Ptr { .. } => elem_dtype.vec(elements.len()),
+                let new_dtype = match &elem_dtype {
+                    DType::Scalar(_) | DType::Ptr { .. } => {
+                        elem_dtype.vec(elements.len()).expect("vectorize element is a scalar or scalar pointer")
+                    }
                     _ => self.dtype.clone(),
                 };
                 return Self::new(Op::Vectorize { elements }, new_dtype);

@@ -40,7 +40,8 @@ include!(concat!(env!("OUT_DIR"), "/hsa_sys.rs"));
 ///   flushes its writes to the fence scope before the next packet's acquire
 ///   invalidates and reads. SYSTEM scope is the conservative choice (ROCclr uses
 ///   AGENT scope intra-device and upgrades to SYSTEM only at host-read
-///   boundaries; we keep SYSTEM everywhere for now — correct, slightly slower).
+///   boundaries; this uses SYSTEM scope everywhere — conservatively correct,
+///   marginally slower than AGENT scope).
 ///
 /// Note: the earlier belief that BARRIER "wedges the queue on multi-XCC" was a
 /// misdiagnosis of the scratch-realloc-on-live-queue wedge (fixed by

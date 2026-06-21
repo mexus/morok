@@ -1,10 +1,10 @@
 //! Indexing operations for Tensors.
 
-use snafu::ResultExt;
+use snafu::{OptionExt, ResultExt};
 use strum::{Display, EnumString};
 
 use super::*;
-use crate::error::ShapeMismatchSnafu;
+use crate::error::{NdimMinimumSnafu, ShapeMismatchSnafu, SymbolicShapeUnsupportedSnafu};
 
 /// Reduction mode for scatter operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, EnumString, Display)]
@@ -540,7 +540,8 @@ impl Tensor {
         let x_dims = svod_ir::shape::to_vec_usize(&x_shape).context(UOpSnafu)?;
         let idx_shape = indices.shape()?;
         let idx_dims = svod_ir::shape::to_vec_usize(&idx_shape).context(UOpSnafu)?;
-        let last_idx_dim = *idx_dims.last().unwrap();
+        let last_idx_dim =
+            *idx_dims.last().context(NdimMinimumSnafu { op: "gather_nd", min: 1usize, actual: idx_dims.len() })?;
 
         if batch_dims == 0 {
             let strides: Vec<i64> =
@@ -584,7 +585,11 @@ impl Tensor {
                 std::iter::once(batch_size as isize).chain(inner_idx.iter().map(|&d| d as isize)).collect::<Vec<_>>(),
             )?;
 
-            let last_inner = *inner_idx.last().unwrap();
+            let last_inner = *inner_idx.last().context(NdimMinimumSnafu {
+                op: "gather_nd",
+                min: 1usize,
+                actual: inner_idx.len(),
+            })?;
             let strides: Vec<i64> =
                 (0..last_inner).map(|k| inner_x[k + 1..last_inner].iter().product::<usize>() as i64).collect();
 
@@ -629,7 +634,10 @@ impl Tensor {
         let x_shape = self.shape()?;
         let x_dims = svod_ir::shape::to_vec_usize(&x_shape).context(UOpSnafu)?;
         let idx_shape = indices.shape()?;
-        let last_idx_dim = idx_shape[idx_shape.len() - 1].as_const().unwrap();
+        snafu::ensure!(!idx_shape.is_empty(), NdimMinimumSnafu { op: "scatter_nd", min: 1usize, actual: 0usize });
+        let last_idx_dim = idx_shape[idx_shape.len() - 1]
+            .as_const()
+            .context(SymbolicShapeUnsupportedSnafu { operation: "scatter_nd" })?;
         let strides: Vec<i64> =
             (0..last_idx_dim).map(|k| x_dims[k + 1..last_idx_dim].iter().product::<usize>() as i64).collect();
         let x_numel: usize = x_dims.iter().product();

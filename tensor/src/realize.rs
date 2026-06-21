@@ -1290,14 +1290,10 @@ fn prepare_execution_plan(
             let base = &item.buffers[1];
             let byte_offset = offset * base.dtype().bytes();
             let byte_size = size * runtime_ast.dtype().bytes();
-            let view = base.view(byte_offset, byte_size).map_err(|e| crate::error::Error::IrConstruction {
-                details: format!(
-                    "BUFFER_VIEW failed for kernel {}: base_buffer_id={}, byte_offset={}, byte_size={}: {e}",
-                    item.kernel.id,
-                    base.id().0,
-                    byte_offset,
-                    byte_size
-                ),
+            let view = base.view(byte_offset, byte_size).context(crate::error::BufferViewSnafu {
+                kernel_id: item.kernel.id,
+                offset: byte_offset,
+                size: byte_size,
             })?;
             // Register the view under the output buffer's UOp ID so downstream
             // COPY/kernel items find it as their source buffer.
@@ -1361,20 +1357,36 @@ fn prepare_execution_plan(
             Arc::clone(cached)
         } else {
             let optimizer_renderer = get_optimizer_renderer(&item_device);
-            let optimized_ast = if let svod_schedule::OptStrategy::Beam { .. } = config.optimizer.strategy {
-                beam_search_optimize(
-                    item.ast.clone(),
-                    &optimizer_renderer,
-                    &item_device,
-                    &item.buffers,
-                    &config.optimizer,
-                )?
-            } else {
-                svod_schedule::optimize_kernel_with_config(item.ast.clone(), &optimizer_renderer, &config.optimizer)
-            };
+            // Author-supplied `opts_to_apply` (tinygrad parity) short-circuits
+            // before beam: such kernels must go through the heuristic entry so
+            // `apply_explicit_opts` honors the exact opt list (empty = none).
+            let has_explicit_opts =
+                matches!(item.ast.op(), Op::Sink { info: Some(ki), .. } if ki.opts_to_apply.is_some());
+            let optimized_ast =
+                if !has_explicit_opts && matches!(config.optimizer.strategy, svod_schedule::OptStrategy::Beam { .. }) {
+                    beam_search_optimize(
+                        item.ast.clone(),
+                        &optimizer_renderer,
+                        &item_device,
+                        &item.buffers,
+                        &config.optimizer,
+                    )?
+                } else {
+                    svod_schedule::optimize_kernel_with_config(item.ast.clone(), &optimizer_renderer, &config.optimizer)
+                        .context(OptimizeSnafu)?
+                };
 
-            let kernel_name =
-                optimized_ast.metadata::<svod_schedule::optimizer::KernelInfo>().map(|info| info.function_name());
+            // Optimizer-scheduled kernels carry their name in the schedule metadata;
+            // hand-lowered custom kernels (tk graph_launch) carry it on the SINK's
+            // KernelInfo instead, so fall back to that — otherwise they render as the
+            // generic "kernel" default and collapse together in the profile.
+            let kernel_name = optimized_ast
+                .metadata::<svod_schedule::optimizer::KernelInfo>()
+                .map(|info| info.function_name())
+                .or_else(|| match optimized_ast.op() {
+                    svod_ir::Op::Sink { info: Some(ki), .. } => ki.name.clone(),
+                    _ => None,
+                });
 
             let ast_decomposed = match item_device.renderer.decompositor() {
                 Some(matcher) => svod_ir::decompositions::decompose_with(&optimized_ast, &matcher),
@@ -1423,16 +1435,7 @@ fn prepare_execution_plan(
             cached.var_names.iter().map(|name| item.fixedvars.get(name).copied().unwrap_or(0)).collect();
         let non_overridable_fixedvars = collect_non_overridable_fixedvars(item);
 
-        let output_indices = output_indices_from_program_metadata(&cached.globals, &cached.outs, buffer_indices.len())
-            .map_err(|e| crate::error::Error::IrConstruction {
-                details: format!(
-                    "invalid ProgramSpec output metadata for kernel id {} (globals={:?}, outs={:?}, num_buffers={}): {e}",
-                    item.kernel.id,
-                    cached.globals,
-                    cached.outs,
-                    buffer_indices.len()
-                ),
-            })?;
+        let output_indices = output_indices_from_program_metadata(&cached.globals, &cached.outs, buffer_indices.len())?;
 
         let runtime_vars = svod_runtime::execution_plan::collect_runtime_vars(&item.ast);
         let prepared = PreparedKernel {
@@ -1537,20 +1540,15 @@ fn compile_with_program_pipeline_components(
     )
     .context(RenderKernelSnafu)?;
 
-    let rendered_entry = svod_device::device::ProgramSpec::from_uop(&program).map(|spec| spec.name).map_err(|e| {
-        crate::error::Error::IrConstruction { details: format!("PROGRAM pipeline produced invalid SOURCE stage: {e}") }
-    })?;
+    let rendered_entry = svod_device::device::ProgramSpec::from_uop(&program)
+        .map(|spec| spec.name)
+        .context(crate::error::ProgramSpecSnafu { stage: "SOURCE stage" })?;
 
     let (program, compiled) =
         svod_codegen::program_pipeline::do_compile(&program, compiler).context(CompileKernelSnafu)?;
 
-    let spec =
-        svod_device::device::ProgramSpec::from_uop(&program).map_err(|e| crate::error::Error::IrConstruction {
-            details: format!(
-                "PROGRAM pipeline produced invalid ProgramSpec after compile (entry='{}'): {e}",
-                rendered_entry
-            ),
-        })?;
+    let spec = svod_device::device::ProgramSpec::from_uop(&program)
+        .context(crate::error::ProgramSpecSnafu { stage: format!("after compile (entry='{rendered_entry}')") })?;
     Ok((spec, compiled))
 }
 
@@ -1750,9 +1748,16 @@ fn beam_search_optimize(
                     opt
                 };
 
-                // Extract kernel name before decomposition (which loses metadata)
-                let kernel_name =
-                    optimized.metadata::<svod_schedule::optimizer::KernelInfo>().map(|info| info.function_name());
+                // Extract kernel name before decomposition (which loses metadata).
+                // Hand-lowered custom kernels carry it on the SINK instead (see the
+                // non-BEAM path above), so fall back to that.
+                let kernel_name = optimized
+                    .metadata::<svod_schedule::optimizer::KernelInfo>()
+                    .map(|info| info.function_name())
+                    .or_else(|| match optimized.op() {
+                        svod_ir::Op::Sink { info: Some(ki), .. } => ki.name.clone(),
+                        _ => None,
+                    });
 
                 // Pre-codegen metrics: structural hash for `seen_libs`, ALU node
                 // count for `least_compute_ops`. Computed before compile so even

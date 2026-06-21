@@ -5,10 +5,10 @@ use svod_ir::SInt;
 use svod_tensor::Tensor;
 
 use crate::init::{fan_in_uniform, ones, zeros};
-use crate::state::{HasStateDict, StateDict, get_tensor, prefixed};
+use crate::state::{self, HasStateDict, StateDict, TensorSnafu as StateTensorSnafu, get_tensor, prefixed};
 use crate::{load_state_field, state_field};
 
-use super::error::{StateSnafu, TensorSnafu};
+use super::error::{StateSnafu, TensorSnafu, TkSnafu};
 use super::{ConvNormType, GigaAmConfig, SubsamplingMode};
 
 /// Precompute RoPE cos/sin cache tensors. Returns `(cos, sin)` each of shape
@@ -103,6 +103,9 @@ impl FeedForward {
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        // The two-linear FFN lowers to GEMM1+silu → h → GEMM2 (two reduces force `h`
+        // to realize between them), which the generic optimizer fuses + (with BEAM)
+        // tunes as well as a hand kernel — so the FFN stays plain graph ops.
         let y = self.norm.apply(x)?;
         let y = y.linear().weight(&self.linear1_weight).bias(&self.linear1_bias).call().context(TensorSnafu)?;
         let y = y.silu().context(TensorSnafu)?;
@@ -168,7 +171,12 @@ impl MultiHeadSelfAttention {
         }
     }
 
-    pub fn forward(&self, x: &Tensor, cos: &Tensor, sin: &Tensor, mask: Option<&Tensor>) -> Result<Tensor> {
+    /// `key_lens`, when present, is a realized `[B]` `i32` tensor of valid
+    /// (unpadded) key positions per batch — keys at index `>= key_lens[b]` are
+    /// masked. Passed to [`svod_tk::flash_attention_with`] as a key-only padding
+    /// mask; when the hand kernel doesn't apply it returns `None` and [`sdpa_attention`]
+    /// runs the same masked attention, so the result is correct on any device.
+    pub fn forward(&self, x: &Tensor, cos: &Tensor, sin: &Tensor, key_lens: Option<&Tensor>) -> Result<Tensor> {
         let shape = x.shape().context(TensorSnafu)?;
         let b = shape[0].clone();
         let t = shape[1].clone();
@@ -202,28 +210,71 @@ impl MultiHeadSelfAttention {
         let k = qk_input.linear().weight(&self.k_proj).bias(&self.k_bias).call().context(TensorSnafu)?;
         let v = y.linear().weight(&self.v_proj).bias(&self.v_bias).call().context(TensorSnafu)?;
 
+        // Head-split into `[B, T, H, d_k]` — the layout `flash_attention_with`
+        // consumes directly (seq second, head third, head_dim last). No
+        // `transpose(1,2)` to `[B, H, T, d_k]`: the hand kernel and the SDPA
+        // fallback both take/return `[B, T, H, d_k]`.
         let q = split_heads(&q, b.clone(), t.clone(), h, d_k)?;
         let k = split_heads(&k, b.clone(), t.clone(), h, d_k)?;
         let v = split_heads(&v, b.clone(), t.clone(), h, d_k)?;
 
-        let attn =
-            q.scaled_dot_product_attention().key(&k).value(&v).maybe_attn_mask(mask).call().context(TensorSnafu)?;
+        // The hand FA kernel when it applies (AMD + tiling shape), else this model's
+        // own SDPA — tk no longer falls back silently; the policy lives here.
+        let attn = match svod_tk::flash_attention_with(&q, &k, &v, svod_tk::FaOpts { causal: false, key_lens })
+            .context(TkSnafu)?
+        {
+            Some(out) => out,
+            None => sdpa_attention(&q, &k, &v, key_lens)?,
+        };
         let out = merge_heads(&attn, b, t, d_model)?;
         out.linear().weight(&self.out_proj).bias(&self.out_bias).call().context(TensorSnafu)
     }
 }
 
-/// `[B, T, H*d_k] → [B, T, H, d_k] → [B, H, T, d_k]`.
-fn split_heads(x: &Tensor, b: SInt, t: SInt, h: usize, d_k: usize) -> Result<Tensor> {
-    x.try_reshape([b, t, SInt::Const(h), SInt::Const(d_k)])
-        .context(TensorSnafu)?
-        .try_transpose(1, 2)
-        .context(TensorSnafu)
+/// SDPA fallback for when `svod_tk::flash_attention_with` returns `None` (non-AMD
+/// device or a non-tiling sequence length). Mirrors the kernel's contract: input
+/// and output stay `[B, T, H, d_k]`, attention is non-causal, and `key_lens` masks
+/// padded KEY positions only (`kv_pos ≥ key_lens[b]`). Permutes to the
+/// `[B, H, T, d_k]` SDPA wants and back.
+fn sdpa_attention(q: &Tensor, k: &Tensor, v: &Tensor, key_lens: Option<&Tensor>) -> Result<Tensor> {
+    let perm = |t: &Tensor| t.try_permute(&[0, 2, 1, 3]).context(TensorSnafu);
+    let (qp, kp, vp) = (perm(q)?, perm(k)?, perm(v)?);
+    let mask = match key_lens {
+        Some(lens) => {
+            let qs = q.shape().expect("q shape");
+            let dim = |i: usize| qs[i].as_const().expect("concrete dim");
+            let (b, n) = (dim(0), dim(1));
+            // [B, 1, 1, N] bool key mask: true (masked) where arange(N) ≥ key_lens[b].
+            let range = Tensor::arange(n as i64, None, None)
+                .context(TensorSnafu)?
+                .try_reshape([1usize, 1, 1, n])
+                .context(TensorSnafu)?;
+            let lens = lens.cast(DType::Int32).context(TensorSnafu)?.try_reshape([b, 1, 1, 1]).context(TensorSnafu)?;
+            Some(range.try_ge(&lens).context(TensorSnafu)?)
+        }
+        None => None,
+    };
+    let out = qp
+        .scaled_dot_product_attention()
+        .key(&kp)
+        .value(&vp)
+        .is_causal(false)
+        .maybe_attn_mask(mask.as_ref())
+        .call()
+        .context(TensorSnafu)?;
+    out.try_permute(&[0, 2, 1, 3]).context(TensorSnafu)
 }
 
-/// `[B, H, T, d_k] → [B, T, H, d_k] → [B, T, d_model]`.
+/// `[B, T, H*d_k] → [B, T, H, d_k]`. Leaves the seq-major layout that
+/// `flash_attention_with` consumes (no `transpose(1,2)` to head-major).
+fn split_heads(x: &Tensor, b: SInt, t: SInt, h: usize, d_k: usize) -> Result<Tensor> {
+    x.try_reshape([b, t, SInt::Const(h), SInt::Const(d_k)]).context(TensorSnafu)
+}
+
+/// `[B, T, H, d_k] → [B, T, d_model]`. The attention output is already
+/// seq-major, so this is a plain head-merge reshape (no transpose).
 fn merge_heads(x: &Tensor, b: SInt, t: SInt, d_model: usize) -> Result<Tensor> {
-    x.try_transpose(1, 2).context(TensorSnafu)?.try_reshape([b, t, SInt::Const(d_model)]).context(TensorSnafu)
+    x.try_reshape([b, t, SInt::Const(d_model)]).context(TensorSnafu)
 }
 
 impl HasStateDict for MultiHeadSelfAttention {
@@ -386,14 +437,25 @@ impl HasStateDict for ConvModule {
                 let bias = get_tensor(sd, &prefixed(prefix, "bn_bias"))?;
                 let mean = get_tensor(sd, &prefixed(prefix, "bn_mean"))?;
                 let invstd = get_tensor(sd, &prefixed(prefix, "bn_invstd"))?;
-                let fold = || -> std::result::Result<(Tensor, Tensor), Box<svod_tensor::error::Error>> {
+                let fold = || -> std::result::Result<(Tensor, Tensor), state::Error> {
                     let d = self.d_model as isize;
-                    let s = scale.try_mul(&invstd)?;
-                    let w = self.dw_weight.try_mul(&s.try_reshape([d, 1, 1])?)?;
-                    let b = self.dw_bias.try_mul(&s)?.try_add(&bias)?.try_sub(&mean.try_mul(&s)?)?;
+                    let s = scale.try_mul(&invstd).context(StateTensorSnafu)?;
+                    let w = self
+                        .dw_weight
+                        .try_mul(&s.try_reshape([d, 1, 1]).context(StateTensorSnafu)?)
+                        .context(StateTensorSnafu)?;
+                    let scaled_mean = mean.try_mul(&s).context(StateTensorSnafu)?;
+                    let b = self
+                        .dw_bias
+                        .try_mul(&s)
+                        .context(StateTensorSnafu)?
+                        .try_add(&bias)
+                        .context(StateTensorSnafu)?
+                        .try_sub(&scaled_mean)
+                        .context(StateTensorSnafu)?;
                     Ok((w, b))
                 };
-                let (w, b) = fold().map_err(|e| crate::state::Error::Tensor { source: e })?;
+                let (w, b) = fold()?;
                 self.dw_weight = w;
                 self.dw_bias = b;
                 self.conv_norm = ConvNorm::Folded;
@@ -594,12 +656,16 @@ impl ConformerLayer {
         }
     }
 
+    /// `key_lens` is the optional per-batch valid encoder-frame count (`[B]`
+    /// `i32`) used as a key-only padding mask in MHSA (see
+    /// [`MultiHeadSelfAttention::forward`]). `pad_mask` independently zeros
+    /// padded rows in the conv module.
     pub fn forward(
         &self,
         x: &Tensor,
         cos: &Tensor,
         sin: &Tensor,
-        att_mask: Option<&Tensor>,
+        key_lens: Option<&Tensor>,
         pad_mask: Option<&Tensor>,
     ) -> Result<Tensor> {
         let half = Tensor::from_const(0.5f64).cast(x.uop().dtype()).context(TensorSnafu)?;
@@ -608,7 +674,7 @@ impl ConformerLayer {
         let x = x.try_add(&self.ffn1.forward(x)?.try_mul(&half).context(TensorSnafu)?).context(TensorSnafu)?;
 
         // MHSA
-        let x = x.try_add(&self.mhsa.forward(&x, cos, sin, att_mask)?).context(TensorSnafu)?;
+        let x = x.try_add(&self.mhsa.forward(&x, cos, sin, key_lens)?).context(TensorSnafu)?;
 
         // Convolution
         let x = x.try_add(&self.conv.forward(&x, pad_mask)?).context(TensorSnafu)?;
@@ -713,6 +779,9 @@ impl Encoder {
         let seq_len = shape[1].clone();
         let (cos, sin) = self.slice_rope(seq_len)?;
 
+        // Single-batch path realizes `T` at the actual subsampled frame count of
+        // this mel (no bucketing / no padding), so every key position is valid:
+        // `key_lens = None` lets attention see the whole sequence.
         let mut x = x;
         for layer in &self.layers {
             x = layer.forward(&x, &cos, &sin, None, None)?;
@@ -753,6 +822,12 @@ impl Encoder {
         let shape = x.shape().context(TensorSnafu)?;
         let t_sub = shape[1].clone();
 
+        // `key_lens` = subsampled valid-frame counts as a realized `[B]` `i32`
+        // tensor — attention's key-only padding mask. Keep the `Index`-typed
+        // `lengths_sub` for the `pad_valid` comparison (the conv `pad_mask`).
+        let key_lens =
+            lengths_sub.cast(DType::Int32).context(TensorSnafu)?.try_reshape([b.clone()]).context(TensorSnafu)?;
+
         let range = Tensor::arange(self.max_encoder_frames as i64, None, None).context(TensorSnafu)?;
         let range = range.cast(DType::Index).context(TensorSnafu)?;
         let range = range.try_shrink([(SInt::Const(0), t_sub.clone())]).context(TensorSnafu)?;
@@ -761,23 +836,13 @@ impl Encoder {
         let lens = lens.try_reshape([b.clone(), SInt::Const(1)]).context(TensorSnafu)?;
         let pad_valid = range.try_lt(&lens).context(TensorSnafu)?;
 
-        let pv1 = pad_valid.try_unsqueeze(1).context(TensorSnafu)?;
-        let pv2 = pad_valid.try_unsqueeze(2).context(TensorSnafu)?;
-        let att_mask = Some(
-            pv1.bitwise_and(&pv2)
-                .context(TensorSnafu)?
-                .logical_not()
-                .context(TensorSnafu)?
-                .try_unsqueeze(1)
-                .context(TensorSnafu)?,
-        );
         let pad_mask = pad_valid.logical_not().context(TensorSnafu)?;
 
         let (cos, sin) = self.slice_rope(t_sub)?;
 
         let mut x = x;
         for layer in &self.layers {
-            x = layer.forward(&x, &cos, &sin, att_mask.as_ref(), Some(&pad_mask))?;
+            x = layer.forward(&x, &cos, &sin, Some(&key_lens), Some(&pad_mask))?;
         }
 
         x.try_transpose(-1, -2).context(TensorSnafu)

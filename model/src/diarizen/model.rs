@@ -30,7 +30,7 @@ use crate::wavlm::{LayerNormWeights, WavLm};
 
 use super::config::DiariZenConfig;
 use super::conformer::ConformerEncoder;
-use super::error::{Error, HubSnafu, PickleSnafu, Result, StateSnafu, TensorSnafu, WavLmSnafu};
+use super::error::{HubSnafu, PickleSnafu, Result, StateSnafu, TensorSnafu, WavLmSnafu};
 use super::remap::split_diarizen_state_dict;
 
 /// Every intermediate tensor captured during a [`DiariZenSegmentationModel`]
@@ -127,7 +127,7 @@ impl DiariZenSegmentationModel {
         let summed = summed.try_squeeze(Some(-1)).context(TensorSnafu)?;
 
         let h = summed.linear().weight(&self.proj_weight).bias(&self.proj_bias).call().context(TensorSnafu)?;
-        let h = self.lnorm.apply(&h).map_err(map_lnorm_err)?;
+        let h = self.lnorm.apply(&h)?;
         let h = self.conformer.forward(&h)?;
         let logits =
             h.linear().weight(&self.classifier_weight).bias(&self.classifier_bias).call().context(TensorSnafu)?;
@@ -151,7 +151,7 @@ impl DiariZenSegmentationModel {
 
         let proj_out =
             weighted_sum.linear().weight(&self.proj_weight).bias(&self.proj_bias).call().context(TensorSnafu)?;
-        let lnorm_out = self.lnorm.apply(&proj_out).map_err(map_lnorm_err)?;
+        let lnorm_out = self.lnorm.apply(&proj_out)?;
 
         let (conformer_out, conformer_blocks) = self.conformer.forward_with_block_outputs(&lnorm_out)?;
 
@@ -182,7 +182,7 @@ impl DiariZenSegmentationModel {
         let summed = stacked.linear().weight(&self.weight_sum_weight).call().context(TensorSnafu)?;
         let summed = summed.try_squeeze(Some(-1)).context(TensorSnafu)?;
         let h = summed.linear().weight(&self.proj_weight).bias(&self.proj_bias).call().context(TensorSnafu)?;
-        let h = self.lnorm.apply(&h).map_err(map_lnorm_err)?;
+        let h = self.lnorm.apply(&h)?;
         let h = self.conformer.forward(&h)?;
         h.linear().weight(&self.classifier_weight).bias(&self.classifier_bias).call().context(TensorSnafu)
     }
@@ -214,11 +214,7 @@ impl DiariZenSegmentationModel {
         // PyTorch checkpoints carry raw `running_var`; fold to `invstd` (value
         // transform + key rename) once at load. Round-tripped state dicts
         // already use `invstd` keys and skip this call.
-        let head_sd = crate::blocks::remap::fold_batchnorm(head_sd)
-            .map_err(|e| match e {
-                crate::blocks::Error::Tensor { source } => state::Error::Tensor { source },
-            })
-            .context(StateSnafu)?;
+        let head_sd = crate::blocks::remap::fold_batchnorm(head_sd)?;
         let mut model = Self::empty(config);
         model.wavlm.load_state_dict(&wavlm_sd, "").context(StateSnafu)?;
         model.load_head_state_dict(&head_sd)?;
@@ -234,13 +230,6 @@ impl DiariZenSegmentationModel {
         self.classifier_weight = get_tensor(sd, "classifier.weight").context(StateSnafu)?;
         self.classifier_bias = get_tensor(sd, "classifier.bias").context(StateSnafu)?;
         Ok(())
-    }
-}
-
-fn map_lnorm_err(e: crate::wavlm::Error) -> Error {
-    match e {
-        crate::wavlm::Error::Tensor { source } => Error::Tensor { source },
-        other => Error::WavLm { source: Box::new(other) },
     }
 }
 

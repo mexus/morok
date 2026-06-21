@@ -164,6 +164,15 @@ pub enum Error {
     #[snafu(display("IR construction error: {details}"))]
     IrConstruction { details: String },
 
+    #[snafu(display("Disk access failed for '{path}': {source}"))]
+    Disk { source: std::io::Error, path: String },
+
+    #[snafu(display("Buffer view failed for kernel {kernel_id} (offset={offset}, size={size}): {source}"))]
+    BufferView { source: svod_device::Error, kernel_id: u64, offset: usize, size: usize },
+
+    #[snafu(display("Invalid ProgramSpec at {stage}: {source}"))]
+    ProgramSpec { source: svod_device::Error, stage: String },
+
     #[snafu(display("Type mismatch: expected {expected:?}, got {actual:?}"))]
     TypeMismatch { expected: svod_dtype::DType, actual: svod_dtype::DType },
 

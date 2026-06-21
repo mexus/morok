@@ -52,9 +52,9 @@ Range {
 优先级决定循环嵌套顺序——值越小越在外层。内核边界由 `Call`/`Function` 在结构上表达，没有专门的轴类型。
 
 **示例：**
-```text
-RANGE(end=128, axis_id=R0, type=Global)
-└── CONST(128) : Index
+```mermaid
+flowchart TD
+  R["RANGE(end=128, axis_id=R0, type=Global)"] --> C["CONST(128) : Index"]
 ```
 
 ### END — 循环作用域关闭
@@ -69,11 +69,11 @@ End {
 END 关闭一个或多个 RANGE 作用域，并将其从活跃集合中移除。可以同时关闭多个 range。
 
 **示例：**
-```text
-END
-├── STORE(...)           — computation
-├── RANGE(R0, Global)    — first range closed
-└── RANGE(R1, Local)     — second range closed
+```mermaid
+flowchart TD
+  E["END"] -->|"computation"| S["STORE(...)"]
+  E -->|"first range closed"| R0["RANGE(R0, Global)"]
+  E -->|"second range closed"| R1["RANGE(R1, Local)"]
 ```
 
 ---
@@ -95,9 +95,9 @@ ReduceAxis {
 用于 rangeify **之前**。对张量维度进行操作，类似于 NumPy 的 `.sum(axis=0)`。
 
 **示例：**
-```text
-REDUCE_AXIS(Add, axes=[1])
-└── BUFFER[10, 20] : Float32
+```mermaid
+flowchart TD
+  RA["REDUCE_AXIS(Add, axes=[1])"] --> B["BUFFER[10, 20] : Float32"]
 ```
 
 将一个 `[10, 20]` 的张量沿 axis 1 求和，规约为 `[10]`。
@@ -126,13 +126,13 @@ Reduce {
 > **兼容性：** Tinygrad 的规范将 REDUCE_AXIS 限制为 `{Add, Mul, Max}`。Svod 额外支持 `Min`。
 
 **示例：**
-```text
-REDUCE(Add)
-├── MUL                      — value to accumulate
-│   ├── LOAD(A, ...)
-│   └── LOAD(B, ...)
-└── RANGE(R2, Reduce)        — range being reduced
-    └── CONST(64)
+```mermaid
+flowchart TD
+  RED["REDUCE(Add)"] -->|"value to accumulate"| MUL["MUL"]
+  MUL --> LA["LOAD(A, ...)"]
+  MUL --> LB["LOAD(B, ...)"]
+  RED -->|"range being reduced"| R2["RANGE(R2, Reduce)"]
+  R2 --> C["CONST(64)"]
 ```
 
 ### ALLREDUCE — 跨设备规约
@@ -184,11 +184,11 @@ Bufferize {
 | `removable` | `bool` | 为 `false` 时禁止 `buffer_removal` 内联此 BUFFERIZE——多消费者 realize 边界使用此设置，使得 buffer 在大型 pass 的不动点迭代中保持不变 |
 
 **示例：**
-```text
-BUFFERIZE(opts={addrspace=Global})
-├── REDUCE(Add, ...)         — computation
-├── RANGE(R0, Global)        — output dim 0
-└── RANGE(R1, Global)        — output dim 1
+```mermaid
+flowchart TD
+  BZ["BUFFERIZE(opts=(addrspace=Global))"] -->|"computation"| RED["REDUCE(Add, ...)"]
+  BZ -->|"output dim 0"| R0["RANGE(R0, Global)"]
+  BZ -->|"output dim 1"| R1["RANGE(R1, Global)"]
 ```
 
 ### INDEX — 多维 Buffer 访问
@@ -204,12 +204,12 @@ Index {
 从多维索引计算内存地址。返回元素 dtype（不是指针）。
 
 **示例：**
-```text
-INDEX : Float32
-├── PARAM(0)
-├── RANGE(R0, Global)        — index for dim 0
-├── RANGE(R1, Loop)          — index for dim 1
-└── MUL(...)                 — index for dim 2
+```mermaid
+flowchart TD
+  IDX["INDEX : Float32"] --> P["PARAM(0)"]
+  IDX -->|"index for dim 0"| R0["RANGE(R0, Global)"]
+  IDX -->|"index for dim 1"| R1["RANGE(R1, Loop)"]
+  IDX -->|"index for dim 2"| M["MUL(...)"]
 ```
 
 ### POINTER_INDEX — 底层指针算术
@@ -238,13 +238,13 @@ Load {
 从 buffer 的指定索引处读取值。对于门控加载，`alt` 字段提供当 INDEX 的 `gate` 为 false 时的替代值（完全跳过内存访问）。
 
 **示例：**
-```text
-LOAD : Float32
-├── PARAM(1)
-└── INDEX
-    ├── PARAM(1)
-    ├── RANGE(R0)
-    └── RANGE(R2)
+```mermaid
+flowchart TD
+  L["LOAD : Float32"] --> P1["PARAM(1)"]
+  L --> IDX["INDEX"]
+  IDX --> P1b["PARAM(1)"]
+  IDX --> R0["RANGE(R0)"]
+  IDX --> R2["RANGE(R2)"]
 ```
 
 ### STORE — 内存写入
@@ -264,12 +264,12 @@ Store {
 > **兼容性：** Svod 的 STORE 没有单独的 `buffer` 字段——源为：index=0, value=1, ranges=2+（range_start=2）。Tinygrad 的布局类似。
 
 **示例：**
-```text
-STORE
-├── INDEX[R0, R1]            — write address (buffer via index.src[0])
-├── REDUCE(Add, ...)         — value
-├── RANGE(R0, Global)        — output dim 0 (closed)
-└── RANGE(R1, Global)        — output dim 1 (closed)
+```mermaid
+flowchart TD
+  ST["STORE"] -->|"write address (buffer via index.src[0])"| IDX["INDEX[R0, R1]"]
+  ST -->|"value"| RED["REDUCE(Add, ...)"]
+  ST -->|"output dim 0 (closed)"| R0["RANGE(R0, Global)"]
+  ST -->|"output dim 1 (closed)"| R1["RANGE(R1, Global)"]
 ```
 
 ---
@@ -376,11 +376,11 @@ Sink {
 和具有相同源的普通 SINK，无需依赖类型擦除的旁路元数据通道。
 
 **示例：**
-```text
-SINK
-├── STORE(output_0, ...)
-├── STORE(output_1, ...)
-└── STORE(output_2, ...)
+```mermaid
+flowchart TD
+  SINK["SINK"] --> S0["STORE(output_0, ...)"]
+  SINK --> S1["STORE(output_1, ...)"]
+  SINK --> S2["STORE(output_2, ...)"]
 ```
 
 ### AFTER — 依赖标记
@@ -395,12 +395,12 @@ After {
 表达内核之间的执行依赖，不涉及数据依赖。`passthrough` 值原样返回，但必须在所有 `deps` 完成后才执行。
 
 **示例：**
-```text
-SINK
-├── AFTER
-│   ├── PARAM(0)     — passthrough (buffer reference)
-│   └── KERNEL(...)          — must complete first
-└── KERNEL(...)              — can use buffer after AFTER
+```mermaid
+flowchart TD
+  SINK["SINK"] --> AF["AFTER"]
+  AF -->|"passthrough (buffer reference)"| P0["PARAM(0)"]
+  AF -->|"must complete first"| K1["KERNEL(...)"]
+  SINK -->|"can use buffer after AFTER"| K2["KERNEL(...)"]
 ```
 
 ### BARRIER — 同步栅栏
@@ -429,12 +429,12 @@ Vectorize {
 将 N 个标量值组合成一个大小为 N 的向量。所有元素必须具有相同的基础 dtype。
 
 **示例：**
-```text
-VECTORIZE : <4 x Float32>
-├── CONST(1.0)
-├── CONST(2.0)
-├── CONST(3.0)
-└── CONST(4.0)
+```mermaid
+flowchart TD
+  V["VECTORIZE : 4 x Float32"] --> C1["CONST(1.0)"]
+  V --> C2["CONST(2.0)"]
+  V --> C3["CONST(3.0)"]
+  V --> C4["CONST(4.0)"]
 ```
 
 ### GEP — Get Element Pointer（向量元素提取）
@@ -451,10 +451,10 @@ Gep {
 - 多个索引 → 更小的向量
 
 **示例：**
-```text
-GEP([0, 2]) : <2 x Float32>
-└── VECTORIZE : <4 x Float32>
-    └── ...
+```mermaid
+flowchart TD
+  G["GEP([0, 2]) : 2 x Float32"] --> V["VECTORIZE : 4 x Float32"]
+  V --> E["..."]
 ```
 
 ### VConst — 向量常量
@@ -478,10 +478,10 @@ Cat {
 将多个向量拼接成更大的向量。输出的 `vcount` = 各输入 `vcount` 之和。
 
 **示例：**
-```text
-CAT : <8 x Float32>
-├── VECTORIZE : <4 x Float32>
-└── VECTORIZE : <4 x Float32>
+```mermaid
+flowchart TD
+  CAT["CAT : 8 x Float32"] --> V1["VECTORIZE : 4 x Float32"]
+  CAT --> V2["VECTORIZE : 4 x Float32"]
 ```
 
 ### PtrCat — 指针拼接
@@ -523,10 +523,10 @@ Contract {
 UNROLL 的逆操作——将展开的标量值收集成一个向量。输出向量大小 = 各 factor 之积。
 
 **示例：**
-```text
-CONTRACT(upcast_ranges=[(0, 4)]) : <4 x Float32>
-└── UNROLL(unroll_axes=[(0, 4)])
-    └── LOAD(...)
+```mermaid
+flowchart TD
+  CT["CONTRACT(upcast_ranges=[(0, 4)]) : 4 x Float32"] --> U["UNROLL(unroll_axes=[(0, 4)])"]
+  U --> L["LOAD(...)"]
 ```
 
 这个模式实现了 load 的向量化：展开 4 次迭代，然后将结果打包成 4 元素向量。
@@ -563,11 +563,11 @@ Wmma {
 | `tile_grid` | `(usize, usize)` | 多 FMA 批处理网格（默认 (1,1)） |
 
 **示例：**
-```text
-WMMA(dims=(16, 16, 16), dtype_in=Float16, dtype_out=Float32)
-├── A fragment : <8 x Float16>
-├── B fragment : <8 x Float16>
-└── C accumulator : <8 x Float32>
+```mermaid
+flowchart TD
+  W["WMMA(dims=(16, 16, 16), dtype_in=Float16, dtype_out=Float32)"] --> A["A fragment : 8 x Float16"]
+  W --> B["B fragment : 8 x Float16"]
+  W --> C["C accumulator : 8 x Float32"]
 ```
 
 ---
@@ -590,14 +590,12 @@ EndIf {
 仅在条件为真时执行 body。用于边界检查和稀疏操作。
 
 **示例：**
-```text
-IF
-├── LT(idx, bound)           — condition (src[0])
-├── STORE(...)               — body[0]
-└── STORE(...)               — body[1]
-
-ENDIF
-└── IF(...)                  — references IF op
+```mermaid
+flowchart TD
+  IF["IF"] -->|"condition (src[0])"| LT["LT(idx, bound)"]
+  IF -->|"body[0]"| S0["STORE(...)"]
+  IF -->|"body[1]"| S1["STORE(...)"]
+  ENDIF["ENDIF"] -->|"references IF op"| IF
 ```
 
 ---
@@ -678,9 +676,9 @@ Special {
 访问硬件提供的值（线程/块索引）。不是循环——硬件直接提供该值。
 
 **示例：**
-```text
-SPECIAL(name="blockIdx.x", end=128) : Index
-└── CONST(128)
+```mermaid
+flowchart TD
+  SP["SPECIAL(name=blockIdx.x, end=128) : Index"] --> C["CONST(128)"]
 ```
 
 ### UNIQUE / LUNIQUE — 标识标记
@@ -719,10 +717,10 @@ Device(DeviceSpec)           // device specification
 | `Flip` | `{ src, axes: Vec<bool> }` | 沿轴翻转 |
 
 **示例：** RESHAPE
-```text
-RESHAPE(new_shape=[6, 4]) : Shape[6, 4]
-├── BUFFER[2, 3, 4] : Float32
-└── CONST([6, 4]) : Shape
+```mermaid
+flowchart TD
+  RS["RESHAPE(new_shape=[6, 4]) : Shape[6, 4]"] --> B["BUFFER[2, 3, 4] : Float32"]
+  RS --> C["CONST([6, 4]) : Shape"]
 ```
 
 ---

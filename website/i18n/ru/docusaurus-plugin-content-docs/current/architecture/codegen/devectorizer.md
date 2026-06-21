@@ -36,12 +36,11 @@ for i in range:
 
 Перед тем как итерировать по измерению редукции, мы сначала объединяем соседние значения. Это создаёт более крупные редукции, которые лучше ложатся на аппаратные инструкции.
 
-```text
-Before:  [a, b, c, d, e, f, g, h]  // 8 values
-             ↓ [Horizontal reduction]
-Step 1:  [a+e, b+f, c+g, d+h]      // 4 partial sums
-             ↓ [Accumulator pattern]
-After:   acc = acc + (a+e) + (b+f) + (c+g) + (d+h)
+```mermaid
+flowchart TD
+  A["Before: [a, b, c, d, e, f, g, h] (8 values)"]
+  A -->|"Horizontal reduction"| B["Step 1: [a+e, b+f, c+g, d+h] (4 partial sums)"]
+  B -->|"Accumulator pattern"| C["After: acc = acc + (a+e) + (b+f) + (c+g) + (d+h)"]
 ```
 
 **GEP pushing** проталкивает GEP (get element pointer) через ALU для лучшей векторизации:
@@ -153,12 +152,7 @@ LOAD(INDEX(ptr, i))
 
 **Что делает**: Обрабатывает переход от абстрактных векторов к аппаратным операциям.
 
-**Зачем это нужно**: Devectorize состоит из 4 концептуальных фаз, реализованных через 3 вызова `graph_rewrite` (фазы 3 и 4 в одном вызове):
-
-1. **Фаза 1**: Создание PTRCAT для группировки последовательных обращений к указателям, девекторизация ALU/WMMA/буферов, расширение векторного INDEX → GEP(PTRCAT)
-2. **Фаза 2**: Проталкивание GEP через LOAD/STORE
-3. **Фаза 3**: Распределение PTRCAT через LOAD/STORE, создание CAT(LOADs), фиксация image-буферов
-4. **Фаза 4**: Разделение CAT(LOADs) на блоки, соответствующие аппаратной ширине
+**Зачем это нужно**: Devectorize прогоняет 4 концептуальные фазы через 3 вызова `graph_rewrite` (фазы 3 и 4 в одном вызове) — построение групп PTRCAT, проталкивание GEP через LOAD/STORE, распределение в CAT(LOADs) и разделение под аппаратную ширину. Пофазный контракт описан в docstring модуля `schedule/src/lib.rs`.
 
 **Конструирование PTRCAT**:
 

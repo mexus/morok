@@ -11,10 +11,10 @@ sidebar_label: Сквозной пример и справочник
 Проследим путь `c = a + b` (где a, b — тензоры [100, 100]) через весь пайплайн.
 
 ### Начальный граф тензоров
-```
-[ADD]
-├── [BUFFER(a)] : Float32
-└── [BUFFER(b)] : Float32
+```mermaid
+flowchart TD
+  ADD["ADD"] --> BA["BUFFER(a) : Float32"]
+  ADD --> BB["BUFFER(b) : Float32"]
 ```
 
 ### После стадии 1: Ранние Movement Ops
@@ -45,19 +45,19 @@ sidebar_label: Сквозной пример и справочник
 
 ### После стадии 9: Expander
 UPCAST → UNROLL → CONTRACT (упрощённо — реальный IR содержит CONTRACT-обёртку):
-```
-[VECTORIZE]
-├── [ADD]
-│   ├── [LOAD(a)]
-│   │   └── [INDEX]
-│   │       ├── [BUFFER(a)]
-│   │       ├── [RANGE(i, Global, 0..100)]
-│   │       └── [UNROLL(VCONST([0,1,2,3]))]  // Converted from RANGE(j, UPCAST)
-│   └── [LOAD(b)]
-│       └── [INDEX]
-│           ├── [BUFFER(b)]
-│           ├── [RANGE(i)]  // Same RANGE via hash consing
-│           └── [UNROLL(VCONST([0,1,2,3]))]  // Same UNROLL via hash consing
+```mermaid
+flowchart TD
+  V["VECTORIZE"] --> ADD["ADD"]
+  ADD --> LA["LOAD(a)"]
+  ADD --> LB["LOAD(b)"]
+  LA --> IA["INDEX"]
+  LB --> IB["INDEX"]
+  IA --> BA["BUFFER(a)"]
+  IA --> RG["RANGE(i, Global, 0..100)"]
+  IA --> UN["UNROLL(VCONST([0,1,2,3]))"]
+  IB --> BB["BUFFER(b)"]
+  IB --> RG
+  IB --> UN
 ```
 
 ### После стадии 10: Добавление локальных буферов
@@ -76,12 +76,12 @@ UPCAST → UNROLL → CONTRACT (упрощённо — реальный IR со�
 
 ### После стадии 14: Devectorize
 Векторная структура после devectorize (показан эффект, а не точная структура UOp):
-```
-[VECTORIZE] : <4 x Float32>
-├── [ADD(a[0], b[0])]
-├── [ADD(a[1], b[1])]
-├── [ADD(a[2], b[2])]
-└── [ADD(a[3], b[3])]
+```mermaid
+flowchart TD
+  V["VECTORIZE : (4 x Float32)"] --> A0["ADD(a[0], b[0])"]
+  V --> A1["ADD(a[1], b[1])"]
+  V --> A2["ADD(a[2], b[2])"]
+  V --> A3["ADD(a[3], b[3])"]
 ```
 
 ### После стадии 15: Понижение типа Index

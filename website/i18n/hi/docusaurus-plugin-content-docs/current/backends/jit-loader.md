@@ -12,32 +12,16 @@ sidebar_label: JIT कंपाइलर
 
 ## पाइपलाइन
 
-```text
-C source / LLVM IR
-       │
-       ▼
- clang -c (stdin → stdout)
-       │
-       ▼
-  ELF .o bytes (मेमोरी में)
-       │
-       ▼
- Sections पार्स करें (object crate)
-       │
-       ▼
- Anonymous mmap + sections कॉपी
-       │
-       ▼
- Relocations लागू करें (आर्किटेक्चर-विशिष्ट)
-       │
-       ▼
- mprotect(PROT_READ | PROT_EXEC)
-       │
-       ▼
- I-cache फ्लश करें (non-x86_64)
-       │
-       ▼
- libffi के माध्यम से function pointer कॉल
+```mermaid
+flowchart TD
+  A["C source / LLVM IR"] --> B["clang -c (stdin to stdout)"]
+  B --> C["ELF .o bytes (in memory)"]
+  C --> D["Parse sections (object crate)"]
+  D --> E["Anonymous mmap + copy sections"]
+  E --> F["Apply relocations (arch-specific)"]
+  F --> G["mprotect(PROT_READ, PROT_EXEC)"]
+  G --> H["Flush I-cache (non-x86_64)"]
+  H --> I["Call function pointer via libffi"]
 ```
 
 **Clang** बैकएंड (C सोर्स, `-x c` से) और **LLVM** बैकएंड (LLVM IR टेक्स्ट, `-x ir` से) दोनों एक ही लोडर साझा करते हैं। एकमात्र अंतर clang का इनपुट language flag है।

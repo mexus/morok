@@ -160,7 +160,7 @@ fn test_reduce_empty_ranges() {
 
 #[test]
 fn test_multi_index_requires_linearization() {
-    let ptr_dtype = DType::Float32.ptr(None, svod_dtype::AddrSpace::Global);
+    let ptr_dtype = DType::Float32.ptr(None, svod_dtype::AddrSpace::Global).unwrap();
     let buffer = UOp::param(0, 1024, ptr_dtype, None);
     let i = UOp::const_(DType::Index, ConstValue::Int(1));
     let j = UOp::const_(DType::Index, ConstValue::Int(2));
@@ -177,23 +177,30 @@ fn test_multi_index_requires_linearization() {
 }
 
 #[test]
-fn test_custom_is_explicitly_unsupported_in_llvm_backend() {
+fn test_custom_renders_typed_statement_in_llvm_backend() {
     let one = UOp::const_(DType::Int32, ConstValue::Int(1));
     let custom = UOp::custom(smallvec::smallvec![one], "add i32 {0}, 3".to_string(), DType::Int32);
     let sink = UOp::sink(vec![custom]);
 
-    let err = render_linearized(&sink, Some("test_custom_unsupported")).expect_err("LLVM backend must reject CUSTOM");
-    assert!(format!("{err}").contains("does not support CUSTOM/CUSTOMI"), "unexpected error: {err}");
+    let result = render_linearized(&sink, Some("test_custom")).expect("LLVM backend should render CUSTOM");
+    assert!(result.code.contains("= add i32 1, 3"), "typed CUSTOM should render its RHS:\n{}", result.code);
 }
 
 #[test]
-fn test_customi_is_explicitly_unsupported_in_llvm_backend() {
+fn test_customi_inlines_into_consumer_in_llvm_backend() {
     let a = UOp::const_(DType::Int32, ConstValue::Int(1));
     let b = UOp::const_(DType::Int32, ConstValue::Int(2));
     let c = UOp::const_(DType::Int32, ConstValue::Int(3));
+    // `{2}` selects the third dep (const 3); CUSTOMI is inlined as the operand
+    // string "3" into the consuming CUSTOM rather than emitting its own line.
     let inline = UOp::customi(smallvec::smallvec![a, b, c], "{2}".to_string(), DType::Int32);
-    let sink = UOp::sink(vec![inline]);
+    let custom = UOp::custom(smallvec::smallvec![inline], "add i32 {0}, 10".to_string(), DType::Int32);
+    let sink = UOp::sink(vec![custom]);
 
-    let err = render_linearized(&sink, Some("test_customi_unsupported")).expect_err("LLVM backend must reject CUSTOMI");
-    assert!(format!("{err}").contains("does not support CUSTOM/CUSTOMI"), "unexpected error: {err}");
+    let result = render_linearized(&sink, Some("test_customi")).expect("LLVM backend should render CUSTOMI");
+    assert!(
+        result.code.contains("= add i32 3, 10"),
+        "CUSTOMI operand should be inlined into the consumer:\n{}",
+        result.code
+    );
 }

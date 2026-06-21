@@ -24,7 +24,7 @@ use svod_ir::SInt;
 use svod_tensor::Tensor;
 
 use crate::init::{fan_in_uniform, zeros};
-use crate::state::{self, HasStateDict, StateDict, get_tensor, prefixed};
+use crate::state::{self, HasStateDict, StateDict, TensorSnafu as StateTensorSnafu, get_tensor, prefixed};
 
 use super::error::{Result, TensorSnafu};
 
@@ -87,18 +87,18 @@ impl ConvolutionalPositionalEmbedding {
 /// Reconstruct `weight = g * v / ||v||_dim01` where the norm is L2 over the
 /// (out, in/groups) axes (i.e., over all dims except dim=2, the kernel dim).
 /// `g` is expected with shape `(1, 1, k)`, `v` with shape `(out, in/g, k)`.
-fn weight_norm_reconstruct(g: &Tensor, v: &Tensor) -> Result<Tensor> {
+fn weight_norm_reconstruct(g: &Tensor, v: &Tensor) -> std::result::Result<Tensor, state::Error> {
     // ||v||_{dim=0,1}: sum of squares over dims 0 and 1, then sqrt, keepdim.
-    let v_sq = v.try_mul(v).context(TensorSnafu)?;
+    let v_sq = v.try_mul(v).context(StateTensorSnafu)?;
     let v_norm_sq = v_sq
         .sum_with()
         .axes(svod_tensor::reduce::AxisSpec::Multiple(vec![0, 1]))
         .keepdim(true)
         .call()
-        .context(TensorSnafu)?;
-    let v_norm = v_norm_sq.try_sqrt().context(TensorSnafu)?;
-    let v_dir = v.try_div(&v_norm).context(TensorSnafu)?;
-    g.try_mul(&v_dir).context(TensorSnafu)
+        .context(StateTensorSnafu)?;
+    let v_norm = v_norm_sq.try_sqrt().context(StateTensorSnafu)?;
+    let v_dir = v.try_div(&v_norm).context(StateTensorSnafu)?;
+    g.try_mul(&v_dir).context(StateTensorSnafu)
 }
 
 impl HasStateDict for ConvolutionalPositionalEmbedding {
@@ -126,27 +126,14 @@ impl HasStateDict for ConvolutionalPositionalEmbedding {
         if sd.contains_key(&modern_g) && sd.contains_key(&modern_v) {
             let g = get_tensor(sd, &modern_g)?;
             let v = get_tensor(sd, &modern_v)?;
-            self.weight = weight_norm_reconstruct(&g, &v).map_err(map_tensor_err)?;
+            self.weight = weight_norm_reconstruct(&g, &v)?;
         } else if sd.contains_key(&legacy_g) && sd.contains_key(&legacy_v) {
             let g = get_tensor(sd, &legacy_g)?;
             let v = get_tensor(sd, &legacy_v)?;
-            self.weight = weight_norm_reconstruct(&g, &v).map_err(map_tensor_err)?;
+            self.weight = weight_norm_reconstruct(&g, &v)?;
         } else {
             self.weight = get_tensor(sd, &flat)?;
         }
         Ok(())
-    }
-}
-
-/// Local helper: tunnel a wavlm tensor error through the `state` crate error
-/// boundary. The reconstruction step uses tensor ops, but `load_state_dict`'s
-/// signature is `Result<_, state::Error>`.
-fn map_tensor_err(e: super::error::Error) -> state::Error {
-    use super::error::Error;
-    match e {
-        Error::Tensor { source } => state::Error::Tensor { source },
-        other => state::Error::Tensor {
-            source: Box::new(svod_tensor::error::Error::IrConstruction { details: other.to_string() }),
-        },
     }
 }

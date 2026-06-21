@@ -29,15 +29,17 @@ GPU——页表、固件、调度——内核就永不处于调度路径中，
 
 ---
 
-## 目标硬件：MI300X SR-IOV VF
+## 目标硬件：一块 CDNA3 SR-IOV VF（gfx9.4.3）
 
-该驱动的目标是 **AMD Instinct MI300X**——**gfx9.4.3 / CDNA3**，SPX 模式下的
+该驱动的目标是一块 **CDNA3** GPU——**gfx9.4.3**，SPX 模式下的
 8 个 XCC——并且特指其 **SR-IOV 虚拟功能（Virtual Function，VF）**形态
 （该 GPU 是一个被透传进 KVM 客户机的 VF）。`AmDev::open` 会直接拒绝
 其他一切：非 VF 的功能，或 major.minor 不是 `(9, 4)` 的 GC 版本，
-都会快速失败（`device/src/amd/am/dev.rs`）。早先的 gfx1151「Strix Halo」APU
+都会快速失败（`device/src/amd/am/dev.rs`）。早先的 gfx1151（RDNA3.5）
 如今只剩下一份 vendored 寄存器表和一个残留的单元测试；它
 不再是目标。
+
+> Validated on AMD Instinct MI300X (gfx942) and Ryzen AI "Strix Halo" (gfx1151).
 
 **VF**（而非裸金属）这一身份是决定性的约束，它决定了
 整个驱动的形态：
@@ -84,7 +86,7 @@ GPU——页表、固件、调度——内核就永不处于调度路径中，
 页表几何是 **4 级 / 48 位**（`va_shifts = [12, 21, 30, 39]`），
 一种**跨 gfx9/11/12 共享**的形状——因此几何本身不随 arch 分支。
 只有叶 PTE 编码（尤其是 MTYPE 内存类型字段）才是 arch 特定的，而
-**gfx9（CDNA/MI300X）与 gfx11（RDNA3）现已实现并单元测试**——
+**gfx9（CDNA）与 gfx11（RDNA3）现已实现并单元测试**——
 gfx9 叶标志把 MTYPE 放在第 57–58 位、置 PDB1 `bfs`、置 PDB0 的
 translate-further 位，以及更高叶上的 `PDE_PTE` 位。**gfx12 是唯一
 剩下的 `unimplemented!`**（常量已捕获，尚未经过硬件验证；
@@ -164,18 +166,10 @@ GMMU 和 GMC 都已在活动的 VF 上得到证实——而 KFD 仍是那个可�
 ## 路线图
 
 工作被分阶段为里程碑，每个都可在活动的 VF 上独立测试
-（并且，对于那些 PF 拥有的块，以裸金属 tinygrad AM 作为检验器）：
+（并且，对于那些 PF 拥有的块，以裸金属 tinygrad AM 作为检验器）。早先的里程碑
+均已实现；完整的 AM 端到端集成尚属未来工作。
 
-| 里程碑 | 范围 | 状态 |
-|---|---|---|
-| **M0** | gfx9 寄存器 + 页表表；只读 PCI/discovery；`am_discovery` HW 测试 | **完成** |
-| **M1** | mailbox 握手 + RLCG + GMC context0（`am_own`、`am_gmc`） | **完成** |
-| **M2** | SDMA ring 驱动引擎——解决 MM-hub 遍历故障 / 卡住的 rptr | **进行中** |
-| **M3** | 一个 XCC 上的单个 MEC 队列执行对一个已映射 VA 的 `WRITE_DATA`，随后是完整的每 XCC MQD/AQL | **进行中** |
-| **M4** | `AmIface` 实现者 + 在 AM core 上端到端跑 GigaAM | **待办** |
-| **M5** | 裸金属 PSP / SMU / 固件移植（在 VF 上无法测试） | **待办** |
-
-一旦某个引擎消费工作（M2/M3）且接缝接好（M4），AM 便可
+一旦某个引擎消费工作且接缝接好，AM 便可
 经由 `SVOD_AMD_BACKEND=am` 选择，并原封不动地运行整个现有的上半部。
 催生 AM 的那种诱发崩溃的并发那时就无法崩溃了——内核被绕过了。
 

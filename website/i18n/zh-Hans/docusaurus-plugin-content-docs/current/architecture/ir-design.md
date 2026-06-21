@@ -10,19 +10,29 @@ sidebar_label: IR 设计哲学
 
 Svod 采用了不同的方案，借鉴自 [Tinygrad](https://github.com/tinygrad/tinygrad)：**从张量到机器码，只用一个 IR**。
 
-```text
-┌──────────────────┐   ┌─────────────────┐   ┌───────────────┐
-│    TensorFlow    │   │     PyTorch     │   │     Svod      │
-├──────────────────┤   ├─────────────────┤   ├───────────────┤
-│   Python API     │   │   Python API    │   │  Rust/Python  │
-│   TF Graph       │   │   FX Graph      │   │       ↓       │
-│   XLA HLO        │   │   Inductor IR   │   │    UOp IR     │
-│   MLIR dialects  │   │   Triton IR     │   │       ↓       │
-│   LLVM IR        │   │   LLVM/PTX      │   │  Machine code │
-│   Machine code   │   │   Machine code  │   │               │
-├──────────────────┤   ├─────────────────┤   ├───────────────┤
-│      5 IRs       │   │      4 IRs      │   │     1 IR      │
-└──────────────────┘   └─────────────────┘   └───────────────┘
+```mermaid
+flowchart TD
+  subgraph TF["TensorFlow (5 IRs)"]
+    direction TB
+    TF1["Python API"] --> TF2["TF Graph"]
+    TF2 --> TF3["XLA HLO"]
+    TF3 --> TF4["MLIR dialects"]
+    TF4 --> TF5["LLVM IR"]
+    TF5 --> TF6["Machine code"]
+  end
+  subgraph PT["PyTorch (4 IRs)"]
+    direction TB
+    PT1["Python API"] --> PT2["FX Graph"]
+    PT2 --> PT3["Inductor IR"]
+    PT3 --> PT4["Triton IR"]
+    PT4 --> PT5["LLVM/PTX"]
+    PT5 --> PT6["Machine code"]
+  end
+  subgraph SV["Svod (1 IR)"]
+    direction TB
+    SV1["Rust/Python"] --> SV2["UOp IR"]
+    SV2 --> SV3["Machine code"]
+  end
 ```
 
 最简单的架构往往胜出。本章解释一个精心设计的 IR 如何替代整个编译器栈。
@@ -69,18 +79,18 @@ pub enum Op {
 
 打印 UOp 图时，你会看到它的树形结构：
 
-```text
-[42] STORE : Void
-├── [10] DEFINE_GLOBAL(0) : Ptr<Float32>
-├── [35] INDEX : Ptr<Float32>
-│   ├── [10] → (same as above)
-│   └── [30] RANGE(axis=0, Reduce) : Index
-│       └── [5] CONST(4) : Index
-└── [40] REDUCE(Add) : Float32
-    ├── [38] MUL : Float32
-    │   ├── [36] LOAD : Float32
-    │   └── [37] LOAD : Float32
-    └── [30] → (same RANGE as above)
+```mermaid
+flowchart TD
+  N42["[42] STORE : Void"] --> N35["[35] INDEX : Ptr(Float32)"]
+  N42 --> N40["[40] REDUCE(Add) : Float32"]
+  N42 --> N30["[30] RANGE(axis=0, Reduce) : Index"]
+  N35 --> N10["[10] DEFINE_GLOBAL(0) : Ptr(Float32)"]
+  N35 --> N30
+  N30 --> N5["[5] CONST(4) : Index"]
+  N40 --> N38["[38] MUL : Float32"]
+  N40 --> N30
+  N38 --> N36["[36] LOAD : Float32"]
+  N38 --> N37["[37] LOAD : Float32"]
 ```
 
 注意到指向"same as above"的箭头了吗？这不仅仅是打印格式——它是一个叫做 **hash consing** 的基本属性。
@@ -142,16 +152,16 @@ ReduceSum(data, axes=[1], keepdims=0)
 
 Svod 用 `RANGE` 操作使循环*显式化*。同样的规约变成：
 
-```text
-[REDUCE(Add)]
-├── [LOAD]
-│   └── [INDEX]
-│       ├── [BUFFER]
-│       ├── [RANGE(axis=0, Global)]   # outer loop (parallelized)
-│       │   └── [CONST(128)]
-│       └── [RANGE(axis=1, Reduce)]   # reduction loop
-│           └── [CONST(64)]
-└── [RANGE(axis=1, Reduce)]           # same RANGE via hash consing
+```mermaid
+flowchart TD
+  RED["REDUCE(Add)"] --> LD["LOAD"]
+  RED --> R1["RANGE(axis=1, Reduce) reduction loop"]
+  LD --> IDX["INDEX"]
+  IDX --> BUF["BUFFER"]
+  IDX --> R0["RANGE(axis=0, Global) outer loop, parallelized"]
+  IDX --> R1
+  R0 --> C128["CONST(128)"]
+  R1 --> C64["CONST(64)"]
 ```
 
 每个 `RANGE` 都有一个 **AxisType**，告诉代码生成器如何编译它：
@@ -239,14 +249,14 @@ After Add:      x                 # Add(x, 0) → x
 
 当你写 `A.matmul(&B)` 时，Svod 构建一个高层 UOp 图：
 
-```text
-[REDUCE_AXIS(Add, axes=[2])]
-├── [MUL]
-│   ├── [EXPAND]           # A: [4,4] → [4,4,4]
-│   │   └── [BUFFER(A)]
-│   └── [EXPAND]           # B: [4,4] → [4,4,4]
-│       └── [PERMUTE]      # transpose for broadcasting
-│           └── [BUFFER(B)]
+```mermaid
+flowchart TD
+  RA["REDUCE_AXIS(Add, axes=[2])"] --> MUL["MUL"]
+  MUL --> EA["EXPAND (A: [4,4] to [4,4,4])"]
+  MUL --> EB["EXPAND (B: [4,4] to [4,4,4])"]
+  EA --> BA["BUFFER(A)"]
+  EB --> PERM["PERMUTE (transpose for broadcasting)"]
+  PERM --> BB["BUFFER(B)"]
 ```
 
 这是纯数学表达："扩展 A 和 B 以对齐维度，逐元素相乘，沿收缩轴求和。"
@@ -255,27 +265,28 @@ After Add:      x                 # Add(x, 0) → x
 
 Rangeify pass 将变换操作（`EXPAND`、`PERMUTE`）转换为带有 `RANGE` 循环的显式索引计算：
 
-```text
-[STORE]
-├── [DEFINE_GLOBAL(C)]
-├── [INDEX]
-│   ├── [DEFINE_GLOBAL(C)]
-│   ├── [RANGE(i, Global)]     # i ∈ [0, 4)
-│   │   └── [CONST(4)]
-│   └── [RANGE(j, Global)]     # j ∈ [0, 4)
-│       └── [CONST(4)]
-└── [REDUCE(Add)]
-    ├── [MUL]
-    │   ├── [LOAD(A)]
-    │   │   └── [INDEX]
-    │   │       ├── [RANGE(i)]     # same i (hash consing)
-    │   │       └── [RANGE(k, Reduce)]
-    │   └── [LOAD(B)]
-    │       └── [INDEX]
-    │           ├── [RANGE(k)]     # same k
-    │           └── [RANGE(j)]     # same j
-    └── [RANGE(k, Reduce)]         # k ∈ [0, 4)
-        └── [CONST(4)]
+```mermaid
+flowchart TD
+  STORE["STORE"] --> IDXC["INDEX"]
+  STORE --> RED["REDUCE(Add)"]
+  STORE --> RJ["RANGE(j, Global) j in [0, 4)"]
+  STORE --> RI["RANGE(i, Global) i in [0, 4)"]
+  IDXC --> DG["DEFINE_GLOBAL(C)"]
+  IDXC --> RI
+  IDXC --> RJ
+  RED --> MUL["MUL"]
+  RED --> RK["RANGE(k, Reduce) k in [0, 4)"]
+  MUL --> LA["LOAD(A)"]
+  MUL --> LB["LOAD(B)"]
+  LA --> IDXA["INDEX (A)"]
+  IDXA --> RI
+  IDXA --> RK
+  LB --> IDXB["INDEX (B)"]
+  IDXB --> RK
+  IDXB --> RJ
+  RI --> C4["CONST(4)"]
+  RJ --> C4
+  RK --> C4
 ```
 
 现在可以看到循环结构：`i` 和 `j` 是 `Global`（并行化），`k` 是 `Reduce`（累加）。

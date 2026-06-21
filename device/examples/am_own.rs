@@ -1,4 +1,4 @@
-//! M1 ownership probe: take the VF from the GIM via the mailbox, then prove the
+//! Ownership probe: take the VF from the GIM via the mailbox, then prove the
 //! RLCG indirect path works (direct GC reads return 0xffffffff on a VF).
 //!
 //! DESTRUCTIVE — requires amdgpu unbound first:
@@ -21,7 +21,7 @@ fn main() {
         eprintln!("WARNING: a driver is still bound to {bdf}; run device/tools/am_unbind.sh first");
     }
     let mut dev = PciDevice::open(&bdf, false).expect("open read-write (needs root + amdgpu unbound)");
-    dev.enable_bus_master();
+    dev.enable_bus_master().expect("enable bus master");
 
     // Bootstrap: on a VF the framebuffer (hence the discovery table) is gated
     // until the GIM grants access via the mailbox, so the mailbox uses the

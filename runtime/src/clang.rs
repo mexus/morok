@@ -15,6 +15,7 @@ pub use crate::jit_loader::JitKernel as ClangKernel;
 mod dlopen_impl {
     use crate::Result;
     use crate::dispatch::KernelCif;
+    use crate::error::JitResultExt;
 
     /// A compiled C kernel loaded as a shared library.
     pub struct ClangKernel {
@@ -35,18 +36,13 @@ mod dlopen_impl {
         pub fn compile(src: &str, name: &str, var_names: Vec<String>, buf_count: usize) -> Result<Self> {
             use std::io::Write;
 
-            let tmp_dir = tempfile::tempdir().map_err(|e| crate::Error::JitCompilation {
-                reason: format!("Failed to create temp directory: {e}"),
-            })?;
+            let tmp_dir = tempfile::tempdir().jit("create temp directory")?;
 
             let src_path = tmp_dir.path().join(format!("{name}.c"));
             let so_path = tmp_dir.path().join(format!("{name}.so"));
 
-            let mut src_file = std::fs::File::create(&src_path)
-                .map_err(|e| crate::Error::JitCompilation { reason: format!("Failed to create source file: {e}") })?;
-            src_file
-                .write_all(src.as_bytes())
-                .map_err(|e| crate::Error::JitCompilation { reason: format!("Failed to write source file: {e}") })?;
+            let mut src_file = std::fs::File::create(&src_path).jit("create source file")?;
+            src_file.write_all(src.as_bytes()).jit("write source file")?;
             drop(src_file);
 
             // On ARM, `-mcpu=native` enables CPU-specific tuning. `-march=native`
@@ -62,10 +58,15 @@ mod dlopen_impl {
             // is not a target svod currently supports.
             #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
             args.push("-ffixed-x18");
-            args.extend_from_slice(&["-o", so_path.to_str().unwrap(), src_path.to_str().unwrap()]);
-            let output = std::process::Command::new("clang").args(&args).output().map_err(|e| {
-                crate::Error::JitCompilation { reason: format!("Failed to run clang: {e}. Is clang installed?") }
+            let so_str = so_path.to_str().ok_or_else(|| crate::Error::JitCompilation {
+                reason: format!("temp .so path is not valid UTF-8: {}", so_path.display()),
             })?;
+            let src_str = src_path.to_str().ok_or_else(|| crate::Error::JitCompilation {
+                reason: format!("temp source path is not valid UTF-8: {}", src_path.display()),
+            })?;
+            args.extend_from_slice(&["-o", so_str, src_str]);
+            let output =
+                std::process::Command::new("clang").args(&args).output().jit("run clang (is clang installed?)")?;
 
             if !output.status.success() {
                 let stderr = String::from_utf8_lossy(&output.stderr);
@@ -74,11 +75,7 @@ mod dlopen_impl {
                 });
             }
 
-            let lib = unsafe {
-                libloading::Library::new(&so_path).map_err(|e| crate::Error::JitCompilation {
-                    reason: format!("Failed to load shared library: {e}"),
-                })?
-            };
+            let lib = unsafe { libloading::Library::new(&so_path).jit("load shared library")? };
 
             let fn_ptr = unsafe {
                 let func: libloading::Symbol<unsafe extern "C" fn()> = lib

@@ -195,23 +195,19 @@ impl UOp {
     /// tinygrad's `max_shard_shape`).
     pub fn placeholder_like(src: &Arc<Self>, slot: usize) -> Result<Arc<Self>> {
         let anchor = Self::placeholder_like_anchor(src);
-        let shape = anchor
-            .shape()?
-            .cloned()
-            .ok_or_else(|| Error::MissingShape { operation: "placeholder_like".to_string() })?;
+        let shape = anchor.shape()?.cloned().ok_or_else(|| Error::MissingShape { operation: "placeholder_like" })?;
 
         let concrete_shape: Vec<usize> = shape
             .iter()
-            .map(|d| {
-                d.as_const()
-                    .ok_or_else(|| Error::SymbolicShapeUnsupported { operation: "placeholder_like".to_string() })
-            })
+            .map(|d| d.as_const().ok_or_else(|| Error::SymbolicShapeUnsupported { operation: "placeholder_like" }))
             .collect::<Result<_>>()?;
 
         let size = concrete_shape.iter().product::<usize>().max(1);
         let dtype = match anchor.dtype() {
             DType::Ptr { .. } => anchor.dtype(),
-            dt => dt.ptr(Some(size), AddrSpace::Global),
+            dt => dt
+                .ptr(Some(size), AddrSpace::Global)
+                .expect("placeholder_like base is never a pointer (Ptr arm handled above)"),
         };
         let placeholder = UOp::param(slot, size, dtype, None);
         if concrete_shape.len() <= 1 {

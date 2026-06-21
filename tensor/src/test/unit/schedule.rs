@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use smallvec::SmallVec;
 use svod_device::Buffer;
@@ -286,6 +287,48 @@ fn test_create_schedule_collects_end_call_and_call_dependencies() {
     let mut expected = vec![p1.id, p2.id];
     expected.sort_unstable();
     assert_eq!(consumer_item.dependencies, expected);
+}
+
+/// A hand-lowered kernel body (a marked SINK, e.g. svod-tk's tile DSL or
+/// rangeify's own `reduce_to_acc`) legitimately contains intra-kernel REG
+/// accumulator AFTERs whose deps are `END(STORE)` and `RANGE` — shapes the
+/// inter-kernel callable-dependency grammar (`collect_callable_dep_ids`) does
+/// NOT accept. The scheduler must walk dependency AFTERs with
+/// `toposort_call_aware(false)`, treating the opaque CALL body as a single unit
+/// so its internal AFTERs are never validated as callable deps. This guards
+/// that boundary: `create_schedule` must succeed on such a body.
+#[test]
+fn test_create_schedule_opaque_body_intra_kernel_after_end_store() {
+    let buffer_uop = UOp::new_buffer(DeviceSpec::Cpu, 1, DType::Float32);
+
+    // Intra-kernel REG accumulator with the canonical `reduce_to_acc` edges.
+    let acc = UOp::define_reg_typed(1, DType::Float32);
+    let zero = UOp::index_const(0);
+    let idx = |buf: Arc<UOp>| UOp::index().buffer(buf).indices(vec![zero.clone()]).ptr(true).call().expect("index");
+    let load = |buf: Arc<UOp>| UOp::load().buffer(buf.clone()).index(idx(buf)).call();
+
+    let init = idx(acc.clone()).store(UOp::native_const(0.0f32)); // bare STORE
+    let range = UOp::range_const(4, 0);
+    // After([bare STORE, RANGE]) — read inside the reduce loop.
+    let acc_loop = load(acc.after(SmallVec::from_vec(vec![init, range.clone()])));
+    // END(STORE) closes the reduce loop.
+    let store_end = idx(acc.clone()).store(acc_loop).end(SmallVec::from_vec(vec![range]));
+    // After([END(STORE)]) — post-loop read threaded into the out-store chain.
+    let result = load(acc.after(SmallVec::from_vec(vec![store_end])));
+    let out_store = idx(buffer_uop.clone()).store(result);
+
+    // Marked SINK → opaque CALL body.
+    let body = UOp::sink_with_info(vec![out_store], svod_ir::KernelInfo { opts_to_apply: Some(vec![]), name: None });
+    let call = body.call(SmallVec::from_vec(vec![buffer_uop.clone()]), CallInfo::default());
+    let transformed = UOp::sink(vec![call.clone()]);
+
+    let mut input_buffers = InputBuffers::new();
+    input_buffers.insert(buffer_uop.id, cpu_buffer(1));
+
+    // Must not error with "AFTER dependency must be CALL/END(CALL)/STORE/AFTER".
+    let result = create_schedule(transformed, &input_buffers, &HashMap::new()).expect("create schedule");
+    assert_eq!(result.items.len(), 1);
+    assert_eq!(result.items[0].kernel.id, call.id);
 }
 
 #[test]

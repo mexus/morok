@@ -8,5 +8,6 @@ onnx/src/test/
 runtime/src/test/
 schedule/src/test/
 tensor/src/test/
+tk/src/test/
 tensor/benches/
 submodules/

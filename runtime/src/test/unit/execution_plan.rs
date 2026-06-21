@@ -874,9 +874,11 @@ fn test_execute_with_vars_rejects_out_of_bounds_launch_var_before_dispatch() {
 
     let mut plan = builder.build().expect("build plan");
     let err = plan.execute_with_vars(&[("N", 5)]).expect_err("out-of-bounds launch var should fail");
+    // The bound is enforced at launch-dim resolution (device side), surfaced as
+    // `Exec` carrying the underlying `svod_device` error as its source.
     match err {
-        crate::error::Error::Execution { reason } => {
-            assert!(reason.contains("outside bounds"), "unexpected error: {reason}");
+        crate::error::Error::Exec { source, .. } => {
+            assert!(source.to_string().contains("outside bounds"), "unexpected error: {source}");
         }
         other => panic!("unexpected error variant: {other:?}"),
     }

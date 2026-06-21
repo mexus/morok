@@ -58,44 +58,13 @@ sidebar_label: 概览
 
 22 个阶段分为四个大的阶段：
 
-```text
-Tensor Expression
-       │
-       ▼
-┌─────────────────────────────────────┐
-│ RANGEIFY (Stages 1-7)               │
-│ Movement ops → Explicit loops       │
-│                                     │
-│ [Make iteration explicit,           │
-│  optimize ranges]                   │
-└─────────────────────────────────────┘
-       │
-       ▼
-┌─────────────────────────────────────┐
-│ EXPANDER (Stages 8-10)              │
-│ UNROLL/UPCAST → Explicit vectors    │
-│                                     │
-│ [Expand optimization primitives]    │
-└─────────────────────────────────────┘
-       │
-       ▼
-┌─────────────────────────────────────┐
-│ DEVECTORIZER (Stages 11-15)         │
-│ Vector ops → Scalar code            │
-│                                     │
-│ [Lower to hardware-specific ops]    │
-└─────────────────────────────────────┘
-       │
-       ▼
-┌─────────────────────────────────────┐
-│ LINEARIZER (Stages 16-22)           │
-│ IR → Linear instruction sequence    │
-│                                     │
-│ [Serialize to executable code]      │
-└─────────────────────────────────────┘
-       │
-       ▼
-  Machine Code
+```mermaid
+flowchart TD
+  T["Tensor Expression"] --> R["RANGEIFY (Stages 1-7): Movement ops to Explicit loops. Make iteration explicit, optimize ranges"]
+  R --> E["EXPANDER (Stages 8-10): UNROLL/UPCAST to Explicit vectors. Expand optimization primitives"]
+  E --> D["DEVECTORIZER (Stages 11-15): Vector ops to Scalar code. Lower to hardware-specific ops"]
+  D --> L["LINEARIZER (Stages 16-22): IR to Linear instruction sequence. Serialize to executable code"]
+  L --> M["Machine Code"]
 ```
 
 每个阶段应用基于模式的重写。模式触发直到不动点，然后开始下一个阶段。

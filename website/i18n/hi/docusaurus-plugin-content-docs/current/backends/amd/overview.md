@@ -72,24 +72,18 @@ KFD-direct AMD के लिए वही है जो [CPU JIT लोडर](.
 
 बैकएंड **`AmdIface`** trait (`device/src/amd/iface.rs`) द्वारा दो हिस्सों में बँटा है:
 
-```text
-        ┌─────────────────────────────────────────────────────────┐
-        │  ABOVE THE SEAM — backend-agnostic (no ioctls)          │
-        │                                                         │
-        │  AmdProgram   AmdComputeQueue   KernargArena   Timeline │
-        │  AmdConnector   AmdGraph   SignalPool   AmdAllocator    │
-        │  PM4 / AQL packet builders   ring back-pressure         │
-        └──────────────────────────────┬──────────────────────────┘
-                                       │  Arc<dyn AmdIface>
-                                       │  alloc_raw · free_raw
-                                       │  setup_ring · teardown_ring
-                                       │  wait_events
-        ┌──────────────────────────────┴──────────────────────────┐
-        │  BELOW THE SEAM — the actual driver                     │
-        │                                                         │
-        │   KfdIface  (today: KFD ioctls on /dev/kfd)             │
-        │   AmIface   (future: userspace PCI-BAR driver — WIP)    │
-        └─────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TD
+  subgraph above["ABOVE THE SEAM — backend-agnostic (no ioctls)"]
+    A1["AmdProgram, AmdComputeQueue, KernargArena, Timeline"]
+    A2["AmdConnector, AmdGraph, SignalPool, AmdAllocator"]
+    A3["PM4 / AQL packet builders, ring back-pressure"]
+  end
+  subgraph below["BELOW THE SEAM — the actual driver"]
+    B1["KfdIface (today: KFD ioctls on /dev/kfd)"]
+    B2["AmIface (future: userspace PCI-BAR driver — WIP)"]
+  end
+  above -->|"Arc(dyn AmdIface): alloc_raw, free_raw, setup_ring, teardown_ring, wait_events"| below
 ```
 
 जो कुछ भी kernel call *नहीं* है — 16 MiB command ring, PM4/AQL packet construction,
@@ -111,7 +105,7 @@ Implementor को device-open समय पर `SVOD_AMD_BACKEND` environment v
 :::caution AM अभी चलने योग्य नहीं है
 `SVOD_AMD_BACKEND=am` सेट करना फ़िलहाल एक error देता है (`device.rs` केवल `kfd` स्वीकार
 करता है) — अभी तक कोई AM type seam को implement नहीं करता। userspace **AM** driver का target
-है **MI300X SR-IOV VF** (gfx9.4.3 / CDNA3) और यह एक work in progress है: discovery, VF↔GIM
+है एक **CDNA3 SR-IOV VF** (gfx9.4.3) और यह एक work in progress है: discovery, VF↔GIM
 mailbox, indirect register access, GMMU, और GMC bring-up implement किए जा चुके हैं और **live
 VF पर validated** हैं, लेकिन अभी तक कोई GPU engine work consume नहीं करता (doorbell aperture
 host-owned है)। आज ठीक-ठीक क्या मौजूद है और boundary कहाँ है इसके लिए
@@ -157,11 +151,13 @@ AMD बैकएंड compiler का device हिस्सा है। Front
 stage ranges को `blockIdx`/`threadIdx` में बदलता है, जैसा [IR Design](../../architecture/ir-design.md)
 में बताया गया है); renderer AMD LLVM IR emit करता है; और यह बैकएंड उसे compile और run करता है:
 
-```text
-  UOp IR ──▶ AMD LLVM IR ──▶ clang (amdgcn) ──▶ ELF code object
-                                                      │
-                                                      ▼
-   AmdProgram::load  ──▶  dispatch over a KFD ring  ──▶  GPU
+```mermaid
+flowchart LR
+  A["UOp IR"] --> B["AMD LLVM IR"]
+  B --> C["clang (amdgcn)"]
+  C --> D["ELF code object"]
+  D --> E["AmdProgram::load"]
+  E -->|"dispatch over a KFD ring"| F["GPU"]
 ```
 
 [JIT ग्राफ़](../../architecture/jit-graphs.md) layer इसे wrap करती है ताकि एक model graph

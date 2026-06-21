@@ -27,27 +27,35 @@ Svod का symbolic simplifier UOp computation graphs को 140+ अल्ज�
 
 एक सिम्पल एक्सप्रेशन जो दिखाता है कि पैटर्न कैसे compose होते हैं:
 
-```text
-Before:
-  ADD
-  ├── MUL
-  │   ├── ADD
-  │   │   ├── x
-  │   │   └── CONST(0)    <- identity
-  │   └── CONST(1)         <- identity
-  └── ADD
-      ├── CONST(3)
-      └── CONST(4)          <- constant fold
+पहले:
 
+```mermaid
+flowchart TD
+  A["ADD"] --> B["MUL"]
+  A --> C["ADD"]
+  B --> D["ADD"]
+  B --> E["CONST(1) (identity)"]
+  D --> F["x"]
+  D --> G["CONST(0) (identity)"]
+  C --> H["CONST(3)"]
+  C --> I["CONST(4) (constant fold)"]
+```
+
+चरण:
+
+```text
 Step 1 (identity):    ADD(x, 0) -> x
 Step 2 (identity):    MUL(x, 1) -> x
 Step 3 (const fold):  ADD(3, 4) -> CONST(7)
 Step 4 (result):      ADD(x, 7)
+```
 
-After:
-  ADD
-  ├── x
-  └── CONST(7)
+बाद में:
+
+```mermaid
+flowchart TD
+  A["ADD"] --> B["x"]
+  A --> C["CONST(7)"]
 ```
 
 रीराइट इंजन पैटर्न bottom-up अप्लाई करता है: पहले children सिम्प्लिफ़ाई होते हैं, फिर parent री-मैच करता है। यह सिंगल traversal में मल्टी-स्टेप cascades सक्षम करता है।

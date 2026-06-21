@@ -104,9 +104,9 @@ pub fn validate_custom_template_strict(template: &str, arg_count: usize) -> Resu
                 i
             } else {
                 saw_manual = true;
-                token.parse::<usize>().map_err(|_| Error::InvalidGraph {
+                token.parse::<usize>().map_err(|e| Error::InvalidGraph {
                     reason: format!(
-                        "custom template placeholder must be empty or numeric, got {{{token}}} in {template:?}"
+                        "custom template placeholder must be empty or numeric, got {{{token}}} in {template:?}: {e}"
                     ),
                 })?
             };

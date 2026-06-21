@@ -75,24 +75,18 @@ KFD 环调度出去。
 后端被 **`AmdIface`** trait 一分为二
 （`device/src/amd/iface.rs`）：
 
-```text
-        ┌─────────────────────────────────────────────────────────┐
-        │  ABOVE THE SEAM — backend-agnostic (no ioctls)          │
-        │                                                         │
-        │  AmdProgram   AmdComputeQueue   KernargArena   Timeline │
-        │  AmdConnector   AmdGraph   SignalPool   AmdAllocator    │
-        │  PM4 / AQL packet builders   ring back-pressure         │
-        └──────────────────────────────┬──────────────────────────┘
-                                       │  Arc<dyn AmdIface>
-                                       │  alloc_raw · free_raw
-                                       │  setup_ring · teardown_ring
-                                       │  wait_events
-        ┌──────────────────────────────┴──────────────────────────┐
-        │  BELOW THE SEAM — the actual driver                     │
-        │                                                         │
-        │   KfdIface  (today: KFD ioctls on /dev/kfd)             │
-        │   AmIface   (future: userspace PCI-BAR driver — WIP)    │
-        └─────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TD
+  subgraph above["ABOVE THE SEAM — backend-agnostic (no ioctls)"]
+    A1["AmdProgram, AmdComputeQueue, KernargArena, Timeline"]
+    A2["AmdConnector, AmdGraph, SignalPool, AmdAllocator"]
+    A3["PM4 / AQL packet builders, ring back-pressure"]
+  end
+  subgraph below["BELOW THE SEAM — the actual driver"]
+    B1["KfdIface (today: KFD ioctls on /dev/kfd)"]
+    B2["AmIface (future: userspace PCI-BAR driver — WIP)"]
+  end
+  above -->|"Arc(dyn AmdIface): alloc_raw, free_raw, setup_ring, teardown_ring, wait_events"| below
 ```
 
 每一样*不是*内核调用的东西——16 MiB 命令环、PM4/AQL
@@ -115,7 +109,7 @@ KFD 环调度出去。
 :::caution AM 尚不可运行
 设置 `SVOD_AMD_BACKEND=am` 目前会返回错误（`device.rs` 只接受
 `kfd`）——尚无 AM 类型实现接缝。用户态 **AM** 驱动的目标是
-**MI300X SR-IOV VF**（gfx9.4.3 / CDNA3），仍在开发中：
+一块 **CDNA3 SR-IOV VF**（gfx9.4.3），仍在开发中：
 discovery、VF↔GIM mailbox、间接寄存器访问、GMMU 与 GMC
 启动均已实现并**在活动的 VF 上验证**，但尚无 GPU 引擎
 消费工作（doorbell aperture 由宿主拥有）。关于当下确切存在什么、
@@ -163,11 +157,13 @@ AMD 后端是编译器的设备这一半。前端将张量降低
 `blockIdx`/`threadIdx`，参见 [IR 设计](../../architecture/ir-design.md)）；渲染器发出
 AMD LLVM IR；而本后端则编译并运行它：
 
-```text
-  UOp IR ──▶ AMD LLVM IR ──▶ clang (amdgcn) ──▶ ELF code object
-                                                      │
-                                                      ▼
-   AmdProgram::load  ──▶  dispatch over a KFD ring  ──▶  GPU
+```mermaid
+flowchart LR
+  A["UOp IR"] --> B["AMD LLVM IR"]
+  B --> C["clang (amdgcn)"]
+  C --> D["ELF code object"]
+  D --> E["AmdProgram::load"]
+  E -->|"dispatch over a KFD ring"| F["GPU"]
 ```
 
 [JIT 图](../../architecture/jit-graphs.md) 层对其进行包装，使得一个模型图编译

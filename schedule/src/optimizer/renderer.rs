@@ -284,7 +284,7 @@ impl Renderer {
         }
     }
 
-    /// Create an AMD CDNA3 GPU renderer (MI300 series).
+    /// Create an AMD CDNA3 GPU renderer.
     pub fn amd_cdna3() -> Self {
         Self {
             device: RendererDevice::AmdCdna3,
@@ -762,7 +762,7 @@ impl TensorCore {
         ]
     }
 
-    /// Get all tensor cores for AMD CDNA3 architecture (MI300).
+    /// Get all tensor cores for AMD CDNA3 architecture.
     pub fn cdna3_tensor_cores() -> Vec<TensorCore> {
         vec![
             AMD_CDNA_161632.build(DType::FP8E5M2, DType::Float32),

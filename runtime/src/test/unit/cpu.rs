@@ -8,7 +8,7 @@ use svod_dtype::{AddrSpace, DType};
 use svod_ir::{ConstValue, UOp};
 
 fn build_copy_sink() -> std::sync::Arc<UOp> {
-    let ptr_dtype = DType::Float32.ptr(None, AddrSpace::Global);
+    let ptr_dtype = DType::Float32.ptr(None, AddrSpace::Global).unwrap();
     let out = UOp::param(0, 16, ptr_dtype.clone(), None);
     let inp = UOp::param(1, 16, ptr_dtype, None);
     let idx = UOp::const_(DType::Index, ConstValue::Int(0));

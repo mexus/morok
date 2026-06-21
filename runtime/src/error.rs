@@ -13,9 +13,21 @@ pub enum Error {
     #[snafu(display("Codegen error: {source}"))]
     Codegen { source: svod_codegen::Error },
 
-    /// JIT compilation failed.
+    /// JIT compilation failed with no recoverable underlying error (pure
+    /// message: missing tool, malformed output, unsupported relocation, …).
     #[snafu(display("JIT compilation failed: {reason}"))]
     JitCompilation { reason: String },
+
+    /// JIT compilation failed; carries the underlying I/O / `object` / library
+    /// error so the real chain isn't flattened into a string. `context` names
+    /// the failing step (e.g. "spawn clang", "parse ELF"). The source is boxed
+    /// because the largest underlying error (`object::Error`) dwarfs the rest.
+    #[snafu(display("JIT compilation failed ({context}): {source}"))]
+    Jit {
+        #[snafu(source(from(JitSource, Box::new)))]
+        source: Box<JitSource>,
+        context: &'static str,
+    },
 
     /// Function not found in module.
     #[snafu(display("Function '{name}' not found in module"))]
@@ -29,9 +41,15 @@ pub enum Error {
     #[snafu(display("Invalid buffer size: {size}"))]
     InvalidBufferSize { size: usize },
 
-    /// Execution error.
+    /// Execution error with no recoverable underlying error (pure message:
+    /// validation failures, out-of-range indices, var-bounds violations, …).
     #[snafu(display("Execution error: {reason}"))]
     Execution { reason: String },
+
+    /// Execution failed while dispatching a specific operation; carries the
+    /// underlying device error and the offending op for context.
+    #[snafu(display("Execution failed ({context}): {source}"))]
+    Exec { source: svod_device::Error, context: String },
 
     /// LLVM error.
     #[snafu(display("LLVM error: {reason}"))]
@@ -47,11 +65,69 @@ pub enum Error {
 
     /// Device error (from svod_device crate).
     #[snafu(display("Device error: {source}"))]
+    #[snafu(context(false))]
     Device { source: svod_device::Error },
 }
 
-impl From<svod_device::Error> for Error {
-    fn from(source: svod_device::Error) -> Self {
-        Error::Device { source }
+/// Underlying causes a [`Error::Jit`] can wrap. Boxed in the variant because
+/// the largest source (`object::Error`) dwarfs the rest.
+#[derive(Debug, Snafu)]
+pub enum JitSource {
+    /// I/O failure spawning/driving the compiler subprocess or touching mmap.
+    #[snafu(display("{source}"))]
+    Io { source: std::io::Error },
+
+    /// ELF parsing/reading via the `object` crate.
+    #[snafu(display("{source}"))]
+    Object { source: object::Error },
+
+    /// Symbol name contained an interior NUL.
+    #[snafu(display("{source}"))]
+    Nul { source: std::ffi::NulError },
+
+    /// Shared-library load/symbol resolution (`dlopen-fallback` path only).
+    #[cfg(feature = "dlopen-fallback")]
+    #[snafu(display("{source}"))]
+    Lib { source: libloading::Error },
+}
+
+// `From<underlying> for JitSource` backs the `JitResultExt::jit` helper below,
+// which boxes the converted source into the `Jit` variant.
+impl From<std::io::Error> for JitSource {
+    fn from(source: std::io::Error) -> Self {
+        JitSource::Io { source }
+    }
+}
+
+impl From<object::Error> for JitSource {
+    fn from(source: object::Error) -> Self {
+        JitSource::Object { source }
+    }
+}
+
+impl From<std::ffi::NulError> for JitSource {
+    fn from(source: std::ffi::NulError) -> Self {
+        JitSource::Nul { source }
+    }
+}
+
+#[cfg(feature = "dlopen-fallback")]
+impl From<libloading::Error> for JitSource {
+    fn from(source: libloading::Error) -> Self {
+        JitSource::Lib { source }
+    }
+}
+
+/// Ergonomic `Result` extension: `.jit("step")` converts any [`JitSource`]-
+/// convertible error into [`Error::Jit`] with a static context label, keeping
+/// the underlying error as a real `source`.
+pub trait JitResultExt<T> {
+    /// Wrap the error into [`Error::Jit`] tagged with `context`.
+    fn jit(self, context: &'static str) -> Result<T>;
+}
+
+impl<T, E: Into<JitSource>> JitResultExt<T> for std::result::Result<T, E> {
+    fn jit(self, context: &'static str) -> Result<T> {
+        self.map_err(|e| Error::Jit { source: Box::new(e.into()), context })
     }
 }

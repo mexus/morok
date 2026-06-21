@@ -69,7 +69,7 @@ pub fn pm_lower_index_dtype() -> TypedPatternMatcher {
         vc @ VConst { values } if vc.dtype().base() == ScalarDType::Index => |vc, values| {
             let dt = select_dtype(vc);
             let vcount = vc.dtype().vcount();
-            let vec_dt = dt.vec(vcount);
+            let vec_dt = dt.vec(vcount).expect("select_dtype returns a scalar");
             let vec_index_dt = DType::Vector { scalar: ScalarDType::Index, count: vcount };
             let new_vc = UOp::new(Op::VConst { values: values.clone() }, vec_dt);
             Some(new_vc.cast(vec_index_dt))

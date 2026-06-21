@@ -10,13 +10,14 @@ use std::sync::Arc;
 
 use bon::bon;
 use smallvec::{SmallVec, smallvec};
-use snafu::ensure;
+use snafu::{OptionExt, ensure};
 use svod_dtype::DType;
 
 use crate::Result;
 use crate::error::{
     BroadcastRequiresScalarSnafu, ContractCountMismatchSnafu, GepIndexOutOfBoundsSnafu, GepRequiresVectorSnafu,
-    UnrollCountMismatchSnafu, VectorizeDTypeMismatchSnafu, VectorizeEmptySnafu,
+    GetTupleIndexOutOfBoundsSnafu, GetTupleNotATupleSnafu, NotVectorizableSnafu, UnrollCountMismatchSnafu,
+    VectorizeDTypeMismatchSnafu, VectorizeEmptySnafu,
 };
 use crate::op::Op;
 use crate::types::{CallInfo, WmmaMetadata};
@@ -38,7 +39,8 @@ impl UOp {
         // Calculate vector size from C (output) upcast axes
         let vec_size = metadata.upcast_axes.c.iter().map(|(_, size)| size).product::<usize>();
 
-        let dtype = if vec_size > 1 { base_dtype.vec(vec_size) } else { base_dtype };
+        let dtype =
+            if vec_size > 1 { base_dtype.vec(vec_size).expect("wmma output dtype is a scalar") } else { base_dtype };
 
         Self::new(Op::Wmma { a, b, c, metadata }, dtype)
     }
@@ -65,11 +67,16 @@ impl UOp {
             ensure!(expected_dtype == actual, VectorizeDTypeMismatchSnafu { expected: expected_dtype, actual });
         }
 
-        let vec_dtype = expected_dtype.vec(elements.len());
+        let count = elements.len();
+        let vec_dtype = expected_dtype.vec(count).context(NotVectorizableSnafu { dtype: expected_dtype, count })?;
         Ok(Self::new(Op::Vectorize { elements }, vec_dtype))
     }
 
     /// Create vector from scalar elements (panics on violation).
+    ///
+    /// Infallible convenience wrapper around [`Self::try_vectorize`]: callers in the
+    /// rewrite engine produce `Some(vectorize(..))` and have already validated element
+    /// dtypes by construction. Use `try_vectorize` for the checked path.
     pub fn vectorize(elements: SmallVec<[Arc<Self>; 4]>) -> Arc<Self> {
         Self::try_vectorize(elements).expect("vectorize precondition violated")
     }
@@ -130,7 +137,7 @@ impl UOp {
         let dtype = if indices.len() == 1 {
             DType::Scalar(vector_dtype.base())
         } else {
-            DType::Scalar(vector_dtype.base()).vec(indices.len())
+            DType::Scalar(vector_dtype.base()).vec(indices.len()).expect("gep result base is a scalar")
         };
 
         Ok(Self::new(Op::Gep { vector: self.clone(), indices }, dtype))
@@ -149,7 +156,7 @@ impl UOp {
         let dtype = if indices.len() == 1 {
             DType::Scalar(vector_dtype.base())
         } else {
-            DType::Scalar(vector_dtype.base()).vec(indices.len())
+            DType::Scalar(vector_dtype.base()).vec(indices.len()).expect("gep result base is a scalar")
         };
         Self::new(Op::Gep { vector: self.clone(), indices }, dtype)
     }
@@ -168,7 +175,13 @@ impl UOp {
             ensure!(dtype_count == axis_product, ContractCountMismatchSnafu { dtype_count, axis_product });
         }
 
-        let dtype = if axis_product > 1 { base_dtype.vec(axis_product) } else { base_dtype };
+        let dtype = if axis_product > 1 {
+            base_dtype
+                .vec(axis_product)
+                .context(NotVectorizableSnafu { dtype: base_dtype.clone(), count: axis_product })?
+        } else {
+            base_dtype
+        };
 
         Ok(Self::new(Op::Contract { src: self.clone(), upcast_ranges }, dtype))
     }
@@ -180,7 +193,11 @@ impl UOp {
     pub fn contract(self: &Arc<Self>, upcast_ranges: Vec<(usize, usize)>) -> Arc<Self> {
         let base_dtype = self.dtype();
         let vec_size = upcast_ranges.iter().map(|(_, size)| size).product::<usize>();
-        let dtype = if vec_size > 1 { base_dtype.vec(vec_size) } else { base_dtype };
+        let dtype = if vec_size > 1 {
+            base_dtype.vec(vec_size).expect("contract source dtype must be vectorizable")
+        } else {
+            base_dtype
+        };
         Self::new(Op::Contract { src: self.clone(), upcast_ranges }, dtype)
     }
 
@@ -237,7 +254,7 @@ impl UOp {
         assert!(!sources.is_empty(), "CAT requires at least one source");
         let dtype = dtype.unwrap_or_else(|| {
             let total_count: usize = sources.iter().map(|s| s.dtype().vcount()).sum();
-            DType::Scalar(sources[0].dtype.base()).vec(total_count)
+            DType::Scalar(sources[0].dtype.base()).vec(total_count).expect("cat result base is a scalar")
         });
         Self::new(Op::Cat { sources: SmallVec::from_vec(sources) }, dtype)
     }
@@ -328,22 +345,31 @@ impl UOp {
     /// Extract element `index` from a TUPLE (or a FUNCTION whose body is a TUPLE).
     /// dtype matches the inner element. Mirrors tinygrad `Ops.GETTUPLE`.
     ///
-    /// Panics if `self` is neither a TUPLE nor a FUNCTION whose body is a TUPLE,
-    /// or if `index` is out of bounds.
-    pub fn gettuple(self: &Arc<Self>, index: usize) -> Arc<Self> {
+    /// # Errors
+    /// - `GetTupleNotATuple` if `self` is neither a TUPLE nor a FUNCTION whose body is a TUPLE
+    /// - `GetTupleIndexOutOfBounds` if `index` is out of bounds for the tuple
+    pub fn try_gettuple(self: &Arc<Self>, index: usize) -> Result<Arc<Self>> {
         let inner_tuple_src: &SmallVec<[Arc<UOp>; 4]> = match self.op() {
             Op::Tuple { src } => src,
             Op::Function { body, .. } => match body.op() {
                 Op::Tuple { src } => src,
-                other => panic!("gettuple requires FUNCTION body to be TUPLE, got {other:?}"),
+                _ => return GetTupleNotATupleSnafu { op: "FUNCTION body (expected TUPLE)" }.fail(),
             },
-            other => panic!("gettuple requires TUPLE or FUNCTION(TUPLE) source, got {other:?}"),
+            _ => return GetTupleNotATupleSnafu { op: "non-TUPLE/non-FUNCTION source" }.fail(),
         };
         let elem_dtype = inner_tuple_src
             .get(index)
-            .unwrap_or_else(|| panic!("gettuple index {} out of bounds for length {}", index, inner_tuple_src.len()))
+            .context(GetTupleIndexOutOfBoundsSnafu { index, len: inner_tuple_src.len(), kind: "tuple" })?
             .dtype();
-        Self::new(Op::GetTuple { src: self.clone(), index }, elem_dtype)
+        Ok(Self::new(Op::GetTuple { src: self.clone(), index }, elem_dtype))
+    }
+
+    /// Extract element `index` from a TUPLE (or a FUNCTION whose body is a TUPLE).
+    ///
+    /// Panicking wrapper around [`Self::try_gettuple`]; use the fallible variant
+    /// when the source structure or index is not guaranteed by construction.
+    pub fn gettuple(self: &Arc<Self>, index: usize) -> Arc<Self> {
+        self.try_gettuple(index).expect("gettuple precondition violated")
     }
 
     /// PROGRAM wrapper with optional progressive pipeline stages.

@@ -1,4 +1,4 @@
-//! M2 SDMA copy: the real GMMU end-to-end test. Allocate VA-mapped VRAM
+//! SDMA copy: the real GMMU end-to-end test. Allocate VA-mapped VRAM
 //! buffers (ring/src/dst/rptr), fill src with a pattern, have the SDMA engine
 //! copy src→dst through vmid-0 VAs, and verify dst matches. If the page tables
 //! or context are wrong, the engine faults instead of copying.

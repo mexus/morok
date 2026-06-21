@@ -8,20 +8,26 @@ sidebar_label: JIT 图
 
 `jit_wrapper!` 宏与 `model::jit` 运行时层把这种"构建一次 / 多次运行"的模式变成**一个带类型的 Rust 结构体**。你声明输入和图；宏生成的包装器在 `prepare()` 期间编译图一次，并在每次 `execute()` 时使用就地保存的设备缓冲区重放它。
 
-```text
-不使用包装器：                       使用包装器：
-┌─────────────────────────┐          ┌─────────────────────────┐
-│  构建图                 │          │  构建图                 │
-│  优化模式               │          │  优化模式               │
-│  生成内核               │          │  生成内核               │
-│  编译 (clang)           │          │  编译 (clang)           │
-│  分配缓冲区             │          │  分配缓冲区             │
-│  执行                   │          ├─────────────────────────┤
-└─────────────────────────┘          │  写入输入缓冲区         │
-                                     │  执行                   │
-                                     │  读取输出缓冲区         │
-                                     └─────────────────────────┘
-每次调用                              prepare() + 每一步
+```mermaid
+flowchart TD
+  subgraph WO["Without the wrapper (every call)"]
+    WO1["build graph"] --> WO2["optimize patterns"]
+    WO2 --> WO3["generate kernels"]
+    WO3 --> WO4["compile (clang)"]
+    WO4 --> WO5["alloc buffers"]
+    WO5 --> WO6["execute"]
+  end
+  subgraph WP["With the wrapper (prepare() once)"]
+    WP1["build graph"] --> WP2["optimize patterns"]
+    WP2 --> WP3["generate kernels"]
+    WP3 --> WP4["compile (clang)"]
+    WP4 --> WP5["alloc buffers"]
+  end
+  subgraph WS["Every step"]
+    WS1["write input buffers"] --> WS2["execute"]
+    WS2 --> WS3["read output buffer"]
+  end
+  WP --> WS
 ```
 
 该包装器与[模式引擎](./optimizations/pattern-system.md)（在 `prepare()` 时运行）和 [JIT 加载器](../backends/jit-loader.md)（将优化后的内核转换为内存中的机器码）协同工作。本页介绍位于两者之上的包装器层。

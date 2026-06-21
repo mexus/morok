@@ -30,15 +30,16 @@ the backend is chosen at *runtime*, never behind a cargo feature that could rot.
 
 ---
 
-## Target hardware: the MI300X SR-IOV VF
+## Target hardware: a CDNA3 SR-IOV VF (gfx9.4.3)
 
-The driver targets the **AMD Instinct MI300X** — **gfx9.4.3 / CDNA3**, 8 XCCs in
-SPX mode — and specifically its **SR-IOV Virtual Function** flavor (the GPU is a
-VF passed into a KVM guest). `AmDev::open` hard-rejects anything else: a non-VF
-function, or a GC version whose major.minor isn't `(9, 4)`, fails fast
-(`device/src/amd/am/dev.rs`). The earlier gfx1151 "Strix Halo" APU survives only
-as a vendored register table and one vestigial unit test; it is no longer the
-target.
+The driver targets a **CDNA3** GPU — **gfx9.4.3**, 8 XCCs in SPX mode — and
+specifically its **SR-IOV Virtual Function** flavor (the GPU is a VF passed into
+a KVM guest). `AmDev::open` hard-rejects anything else: a non-VF function, or a
+GC version whose major.minor isn't `(9, 4)`, fails fast
+(`device/src/amd/am/dev.rs`). The earlier gfx1151 (RDNA3.5) survives only as a
+vendored register table and one vestigial unit test; it is no longer the target.
+
+> Validated on AMD Instinct MI300X (gfx942) and Ryzen AI "Strix Halo" (gfx1151).
 
 Being a **VF** (rather than bare metal) is the defining constraint, and it shapes
 the whole driver:
@@ -86,7 +87,7 @@ the hardware-facing pieces are additionally validated on the live VF through the
 The page-table geometry is **4-level / 48-bit** (`va_shifts = [12, 21, 30, 39]`),
 a shape **shared across gfx9/11/12** — so the geometry itself does not branch on
 arch. Only the leaf PTE encoding (notably the MTYPE memory-type field) is
-arch-specific, and **both gfx9 (CDNA/MI300X) and gfx11 (RDNA3) are now implemented
+arch-specific, and **both gfx9 (CDNA) and gfx11 (RDNA3) are now implemented
 and unit-tested** — gfx9 leaf flags put MTYPE at bits 57–58, set the PDB1 `bfs`,
 the PDB0 translate-further bit, and the `PDE_PTE` bit on higher leaves. **gfx12 is
 the only remaining `unimplemented!`** (constants captured, not yet hardware-
@@ -166,21 +167,14 @@ the last, highest-risk port:
 ## Roadmap
 
 The work is staged as milestones, each independently testable on the live VF
-(and, for the PF-owned blocks, against bare-metal tinygrad AM as the oracle):
+(and, for the PF-owned blocks, against bare-metal tinygrad AM as the oracle).
+Earlier milestones are implemented; full AM end-to-end integration is future
+work.
 
-| Milestone | Scope | Status |
-|---|---|---|
-| **M0** | gfx9 register + pagetable tables; read-only PCI/discovery; `am_discovery` HW test | **done** |
-| **M1** | mailbox handshake + RLCG + GMC context0 (`am_own`, `am_gmc`) | **done** |
-| **M2** | SDMA ring drives the engine — resolve the MM-hub walk faults / stuck rptr | **in progress** |
-| **M3** | a single MEC queue on one XCC executing a `WRITE_DATA` to a mapped VA, then full per-XCC MQD/AQL | **in progress** |
-| **M4** | the `AmIface` implementor + GigaAM end-to-end on the AM core | **pending** |
-| **M5** | bare-metal PSP / SMU / firmware ports (untestable on a VF) | **pending** |
-
-Once an engine consumes work (M2/M3) and the seam is wired (M4), AM becomes
-selectable via `SVOD_AMD_BACKEND=am` and runs the entire existing upper half
-unchanged. The crash-inducing concurrency that motivated AM can't crash then —
-the kernel is bypassed.
+Once an engine consumes work and the seam is wired, AM becomes selectable via
+`SVOD_AMD_BACKEND=am` and runs the entire existing upper half unchanged. The
+crash-inducing concurrency that motivated AM can't crash then — the kernel is
+bypassed.
 
 ---
 

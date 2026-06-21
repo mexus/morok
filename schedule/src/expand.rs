@@ -84,13 +84,13 @@ fn fix_bufferize_unroll(bufferize: &Arc<UOp>) -> Option<Arc<UOp>> {
     // Wrap compute in CONTRACT
     let contracted_compute = UOp::new(
         Op::Contract { src: compute.clone(), upcast_ranges: contract_axes.clone() },
-        compute.dtype().vec(inner_count),
+        compute.dtype().vec(inner_count)?,
     );
 
     // Wrap range in CONTRACT
     let contracted_range = UOp::new(
         Op::Contract { src: ranges[0].clone(), upcast_ranges: contract_axes.clone() },
-        ranges[0].dtype().vec(inner_count),
+        ranges[0].dtype().vec(inner_count)?,
     );
 
     Some(UOp::new(
@@ -502,8 +502,16 @@ fn do_expand(uop: &Arc<UOp>) -> Option<Arc<UOp>> {
                 let cat_sources: Vec<Arc<UOp>> = (0..expand_sz).map(|_| src.clone()).collect();
                 new_sources.push(UOp::cat().sources(cat_sources).call());
             } else {
-                // Case 4: Scalar -> broadcast
-                new_sources.push(src.broadcast(expand_sz));
+                // Case 4: Scalar -> broadcast (for value-typed sources only).
+                // Ptr-typed sources MUST NOT be broadcast — it creates an illegal
+                // vector-of-pointers (Ptr{vcount:N}). The downstream devectorizer
+                // handles scalar buffer + vector index via expand_index_to_vectorize
+                // + fold_expanded_index + distribute_ptrcat_load.
+                if matches!(src.dtype(), DType::Ptr { .. }) {
+                    new_sources.push(src.clone());
+                } else {
+                    new_sources.push(src.broadcast(expand_sz));
+                }
             }
         }
     }
@@ -525,9 +533,21 @@ fn do_expand(uop: &Arc<UOp>) -> Option<Arc<UOp>> {
     // `scalar()` — the latter returns None for a Vector, which would collapse a
     // multi-element output (e.g. a WMMA's count-4 D register) back to its
     // single-tile width and silently drop the per-output-tile expansion.
+    //
+    // Ptr-typed ops (a store-target INDEX with `ptr=true`) are exempt: the Case 4
+    // Ptr guard already passed the scalar buffer PARAM through unchanged, so the
+    // expanded op still references ONE scalar pointer with a vector index. We
+    // must NOT `vec()` the Ptr dtype — that creates an illegal `Ptr{vcount:N}`
+    // (vector-of-pointers) — NOR strip it to the element type, which loses the
+    // Ptr-ness that `pm_add_loads` / STORE codegen depend on. Keeping the scalar
+    // Ptr dtype mirrors the pre-expander shape: `INDEX(scalar_ptr, vec_idx)`.
     let base_dtype = uop.dtype();
     let base_count = base_dtype.vcount();
-    let new_dtype = DType::Scalar(base_dtype.base()).vec(base_count * expand_sz);
+    let new_dtype = if matches!(base_dtype, DType::Ptr { .. }) {
+        base_dtype.clone()
+    } else {
+        DType::Scalar(base_dtype.base()).vec(base_count * expand_sz).expect("scalar dtype is vectorizable")
+    };
 
     // GEP: recalculate indices for expanded vector
     // Tinygrad expander.py:60-63
@@ -610,7 +630,7 @@ pub(crate) fn fix_reduce_unroll(reduce: &Arc<UOp>) -> Option<Arc<UOp>> {
     // `TAG_TC_FINAL`) so the expander keeps the per-tile structure distinct.
     let contracted_src = if !contract_axes.is_empty() {
         let total: usize = contract_axes.iter().map(|(_, sz)| sz).product();
-        UOp::new(Op::Contract { src: src.clone(), upcast_ranges: contract_axes }, reduce.dtype().vec(total))
+        UOp::new(Op::Contract { src: src.clone(), upcast_ranges: contract_axes }, reduce.dtype().vec(total)?)
             .with_tag(smallvec::smallvec![crate::devectorize::TAG_TC_FINAL])
     } else {
         src.clone()

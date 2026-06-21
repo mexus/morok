@@ -7,7 +7,7 @@
 use snafu::ResultExt;
 use svod_arch::rnnt::{BatchBlockStep, BlockTapes};
 
-use crate::jit::{DeviceSnafu, InputSpec, JitError};
+use crate::jit::{BuildSnafu, DeviceSnafu, InputSpec, JitError};
 
 use super::block::BLOCK_STEPS;
 use super::jit::{RnntBlockJit, RnntEncProjJit};
@@ -62,8 +62,7 @@ impl RnntBlockBackend {
     /// `max_t` is the encoder-frame capacity (`max_t_sub`); the `enc` input is
     /// `[lanes, max_t, d_model]` and stays device-local across the wave.
     pub fn from_model(model: GigaAm, lanes: usize, max_t: usize) -> crate::jit::Result<Self> {
-        let (head, _) =
-            model.head.expect_rnnt("RnntBlockBackend").map_err(|e| JitError::Build { source: Box::new(e) })?;
+        let (head, _) = model.head.expect_rnnt("RnntBlockBackend").boxed().context(BuildSnafu)?;
         let (layers, p) = (head.pred_rnn_layers, head.pred_hidden);
         let joint_hidden = head.joint_hidden;
         let enc_hidden = model.config.d_model;

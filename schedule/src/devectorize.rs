@@ -364,14 +364,14 @@ fn rne(v: &Arc<UOp>, s: u32) -> Arc<UOp> {
 /// `v` is a UInt value holding the raw bits of the source float.
 /// Returns a UOp holding raw bits of the target float, which must be bitcast to get the float value.
 fn f2f(v: &Arc<UOp>, fr: ScalarDType, to: ScalarDType) -> Arc<UOp> {
-    let (fe, fm) = fr.finfo();
-    let (te, tm) = to.finfo();
+    let (fe, fm) = fr.finfo().expect("f2f operands are float by construction");
+    let (te, tm) = to.finfo().expect("f2f operands are float by construction");
     let fs = fr.bitsize();
     let ts = to.bitsize();
-    let fb = fr.exponent_bias() as i64;
-    let tb = to.exponent_bias() as i64;
-    let fr_uint = DType::Scalar(fr.float_to_uint());
-    let to_uint = DType::Scalar(to.float_to_uint());
+    let fb = fr.exponent_bias().expect("f2f operands are float by construction") as i64;
+    let tb = to.exponent_bias().expect("f2f operands are float by construction") as i64;
+    let fr_uint = DType::Scalar(fr.float_to_uint().expect("f2f operands are float by construction"));
+    let to_uint = DType::Scalar(to.float_to_uint().expect("f2f operands are float by construction"));
 
     if fe <= te && fm < tm {
         // Upcast path: e.g. FP8 → Float16
@@ -433,11 +433,13 @@ fn f2f(v: &Arc<UOp>, fr: ScalarDType, to: ScalarDType) -> Arc<UOp> {
 /// Clamp a float value to the representable range of a target FP8 dtype.
 /// Clamp a float value to the representable range of the target FP8 dtype.
 fn f2f_clamp(val: &Arc<UOp>, dt: ScalarDType) -> Arc<UOp> {
-    let (e, m) = dt.finfo();
+    let (e, m) = dt.finfo().expect("f2f_clamp target is float by construction");
     let (max_exp, max_man): (i64, i64) =
         if dt == ScalarDType::FP8E4M3 { ((1 << e) - 1, (1 << m) - 2) } else { ((1 << e) - 2, (1 << m) - 1) };
-    let mx_f64 =
-        f64::powi(2.0, (max_exp - dt.exponent_bias() as i64) as i32) * (1.0 + max_man as f64 / (1i64 << m) as f64);
+    let mx_f64 = f64::powi(
+        2.0,
+        (max_exp - dt.exponent_bias().expect("f2f_clamp target is float by construction") as i64) as i32,
+    ) * (1.0 + max_man as f64 / (1i64 << m) as f64);
     let mx = val.const_like(mx_f64);
     let neg_mx = val.const_like(-mx_f64);
 
@@ -469,13 +471,13 @@ pub fn pm_float_decomp_store() -> crate::TypedPatternMatcher<Fp8DecompCtx> {
             if index.dtype().base() == ctx.from
         => {
             let target_float = DType::Scalar(ctx.to);
-            let target_uint = DType::Scalar(ctx.to.float_to_uint());
+            let target_uint = DType::Scalar(ctx.to.float_to_uint()?);
             // Cast value to target float (handles FP8, Float32, etc. → Float16)
             let float_val = value.cast(target_float);
             // Bitwise float→FP8 conversion (includes clamping internally)
             let result = f2f(&float_val.bitcast(target_uint), ctx.to, ctx.from);
             // Change index ptr to UInt8
-            let uint8_ptr = index.dtype().with_ptr_base(DType::Scalar(ctx.from.float_to_uint()))?;
+            let uint8_ptr = index.dtype().with_ptr_base(DType::Scalar(ctx.from.float_to_uint()?))?;
             let new_index = index.with_dtype(uint8_ptr);
             Some(new_index.store_with_ranges(result, ranges.clone()))
         },
@@ -494,7 +496,7 @@ pub fn pm_float_decomp() -> crate::TypedPatternMatcher<Fp8DecompCtx> {
         x if matches!(x.op(), Op::Param { device: None, .. } | Op::DefineLocal(_) | Op::Index { .. })
             && ctx.should_decomp(x)
         => {
-            let uint8_ptr = x.dtype().with_ptr_base(DType::Scalar(ctx.from.float_to_uint()))?;
+            let uint8_ptr = x.dtype().with_ptr_base(DType::Scalar(ctx.from.float_to_uint()?))?;
             Some(x.with_dtype(uint8_ptr))
         },
 
@@ -502,13 +504,16 @@ pub fn pm_float_decomp() -> crate::TypedPatternMatcher<Fp8DecompCtx> {
         load @ Load { buffer, index, alt }
             if ctx.should_decomp(load) =>
         {
-            let uint_dtype = DType::Scalar(ctx.from.float_to_uint()).vec(load.dtype().vcount());
+            let uint_dtype =
+                DType::Scalar(ctx.from.float_to_uint()?).vec(load.dtype().vcount()).expect("scalar dtype is vectorizable");
             let uint_alt = alt.clone().map(|a| {
                 if a.dtype().base() == ctx.from {
                     a.bitcast(uint_dtype.clone())
                 } else {
-                    let target_float = DType::Scalar(ctx.to).vec(load.dtype().vcount());
-                    let target_uint = DType::Scalar(ctx.to.float_to_uint()).vec(load.dtype().vcount());
+                    let target_float = DType::Scalar(ctx.to).vec(load.dtype().vcount()).expect("scalar dtype is vectorizable");
+                    let target_uint = DType::Scalar(ctx.to.float_to_uint().expect("f2f target is float by construction"))
+                        .vec(load.dtype().vcount())
+                        .expect("scalar dtype is vectorizable");
                     let float_alt = a.cast(target_float);
                     f2f(&float_alt.bitcast(target_uint), ctx.to, ctx.from)
                 }
@@ -531,7 +536,7 @@ pub fn pm_float_decomp() -> crate::TypedPatternMatcher<Fp8DecompCtx> {
         // round-tripping it to f16 turns the fp8 MFMA into a non-existent f16 one.
         x @ Cast { src: val, .. } if ctx.should_decomp(x) => {
             let target = DType::Scalar(ctx.to);
-            let target_uint = DType::Scalar(ctx.to.float_to_uint());
+            let target_uint = DType::Scalar(ctx.to.float_to_uint()?);
             let float_val = val.cast(target);
             // Downcast: Float16 bits → FP8 bytes (includes clamping)
             let fp8_bytes = f2f(&float_val.bitcast(target_uint.clone()), ctx.to, ctx.from);
@@ -546,7 +551,7 @@ pub fn pm_float_decomp() -> crate::TypedPatternMatcher<Fp8DecompCtx> {
         => {
             let target_dtype = DType::Scalar(ctx.to);
             let new_dtype = if x.dtype().vcount() > 1 {
-                target_dtype.vec(x.dtype().vcount())
+                target_dtype.vec(x.dtype().vcount()).expect("scalar dtype is vectorizable")
             } else {
                 target_dtype.clone()
             };
@@ -1301,8 +1306,18 @@ fn is_vector_index(uop: &Arc<UOp>) -> bool {
     if idx.dtype().vcount() <= 1 {
         return false;
     }
-    let Op::Vectorize { elements } = buffer.op() else { return false };
-    !elements.is_empty() && elements.iter().all(is_define_or_after)
+    // Two buffer shapes are accepted:
+    //  (a) VECTORIZE of defines/params — the pre-Op-4 hot path: the expander
+    //      broadcast the buffer, and expand_index_to_vectorize splits per lane.
+    //  (b) A scalar define/param — the post-Op-4 path (do_expand Case 4 Ptr
+    //      guard keeps the buffer scalar). `expand_index_to_vectorize` already
+    //      handles this via its `else { buffer.clone() }` fallback; without
+    //      this predicate extension, a STORE-side INDEX(scalar_ptr, vec_idx)
+    //      survives to the renderer, which emits an illegal `<N x ptr>` GEP.
+    match buffer.op() {
+        Op::Vectorize { elements } => !elements.is_empty() && elements.iter().all(is_define_or_after),
+        _ => is_define_or_after(buffer),
+    }
 }
 
 // ============================================================================
@@ -1316,7 +1331,7 @@ fn move_gep_after_load(
     gep_inner: &Arc<UOp>,
     gep_indices: &[usize],
 ) -> Option<Arc<UOp>> {
-    let new_dtype = load.dtype().scalar_dtype().vec(gep_indices.len());
+    let new_dtype = load.dtype().scalar_dtype().vec(gep_indices.len()).expect("scalar_dtype is vectorizable");
     let inner_load = load.replace().dtype(new_dtype).src(vec![buffer.clone(), gep_inner.clone()]).call();
     Some(inner_load.gep(gep_indices.to_vec()))
 }
@@ -1460,7 +1475,7 @@ fn fold_expanded_index(midx: &Arc<UOp>) -> Option<Arc<UOp>> {
 
     let DType::Ptr { base, addrspace, size, .. } = buf.dtype().clone() else { return None };
     let scalar_ptr = DType::Ptr { base: Box::new(DType::Scalar(base.scalar()?)), addrspace, size, vcount: 1 };
-    let ptrcat_dtype = scalar_ptr.vec(global_offset);
+    let ptrcat_dtype = scalar_ptr.vec(global_offset).expect("scalar pointer with vcount 1 is vectorizable");
     let ptrcat = UOp::ptrcat().sources(ret).dtype(ptrcat_dtype).call();
     let gep_indices: Vec<usize> = idxs.into_iter().map(|x| x.unwrap()).collect();
 
@@ -1534,7 +1549,8 @@ fn distribute_ptrcat_load(
         })
         .collect();
 
-    let cat_dtype = DType::Scalar(ptrcat.dtype().base()).vec(ptrcat.dtype().vcount());
+    let cat_dtype =
+        DType::Scalar(ptrcat.dtype().base()).vec(ptrcat.dtype().vcount()).expect("scalar dtype is vectorizable");
     Some(UOp::cat().sources(loads).dtype(cat_dtype).call())
 }
 
@@ -1647,11 +1663,15 @@ fn split_load_store(ctx: &Renderer, ls: &Arc<UOp>, idx: &Arc<UOp>) -> Option<Arc
                         UOp::load()
                             .buffer(buffer.clone())
                             .index(lidx)
-                            .dtype(scalar_dtype.vec(fold_len))
+                            .dtype(scalar_dtype.vec(fold_len).expect("scalar_dtype is vectorizable"))
                             .alt(slice_vector_lane(alt, pos, fold_len))
                             .call()
                     } else {
-                        UOp::load().buffer(buffer.clone()).index(lidx).dtype(scalar_dtype.vec(fold_len)).call()
+                        UOp::load()
+                            .buffer(buffer.clone())
+                            .index(lidx)
+                            .dtype(scalar_dtype.vec(fold_len).expect("scalar_dtype is vectorizable"))
+                            .call()
                     };
                     ret.push(load);
                 }
@@ -1667,7 +1687,9 @@ fn split_load_store(ctx: &Renderer, ls: &Arc<UOp>, idx: &Arc<UOp>) -> Option<Arc
     }
 
     match ls.op() {
-        Op::Load { .. } => Some(UOp::cat().sources(ret).dtype(scalar_dtype.vec(sz)).call()),
+        Op::Load { .. } => {
+            Some(UOp::cat().sources(ret).dtype(scalar_dtype.vec(sz).expect("scalar_dtype is vectorizable")).call())
+        }
         Op::Store { .. } => Some(UOp::group(ret.into_iter().collect())),
         _ => None,
     }
@@ -1889,7 +1911,7 @@ fn image_fixup(ls: &Arc<UOp>) -> Option<Arc<UOp>> {
 
         // For unfoldable images: load vec4, then select correct element
         // result = reduce(lambda ret, i: (x % 4).ne(i).where(ret, vec_load.gep(i)), range(4), nan)
-        let vec4_dtype = ls.dtype().vec(4);
+        let vec4_dtype = ls.dtype().vec(4)?;
         let vec_load = UOp::load().buffer(ls.load_buffer()?).index(new_idx).dtype(vec4_dtype).call();
 
         // Build: WHERE(x%4 != 0, WHERE(x%4 != 1, WHERE(x%4 != 2, WHERE(x%4 != 3, nan, gep3), gep2), gep1), gep0)
@@ -2038,7 +2060,10 @@ fn apply_reduce_binary(reduce_op: ReduceOp, a: Arc<UOp>, b: Arc<UOp>, dtype: &DT
         ReduceOp::Mul => UOp::new(Op::Binary(BinaryOp::Mul, a, b), dtype.clone()),
         ReduceOp::Max => UOp::new(Op::Binary(BinaryOp::Max, a, b), dtype.clone()),
         ReduceOp::Min => {
-            let cond = UOp::new(Op::Binary(BinaryOp::Lt, a.clone(), b.clone()), DType::Bool.vec(dtype.vcount()));
+            let cond = UOp::new(
+                Op::Binary(BinaryOp::Lt, a.clone(), b.clone()),
+                DType::Bool.vec(dtype.vcount()).expect("Bool is a scalar"),
+            );
             UOp::try_where(cond, a, b).expect("WHERE")
         }
     }

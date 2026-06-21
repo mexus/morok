@@ -26,4 +26,6 @@ pub enum Error {
         "weight-norm reconstruction failed: missing or mismatched parametrizations.weight.original* (g={g_shape:?}, v={v_shape:?})"
     ))]
     WeightNormShape { g_shape: Vec<usize>, v_shape: Vec<usize> },
+    #[snafu(display("{what} requires a concrete sequence length, got a symbolic dim"))]
+    SymbolicShape { what: &'static str },
 }

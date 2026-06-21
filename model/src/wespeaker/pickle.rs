@@ -16,7 +16,7 @@ use std::path::Path;
 
 use repugnant_pickle::ops::PickleOp;
 use repugnant_pickle::{SequenceType, Value, evaluate, parse_ops};
-use snafu::{ResultExt, Snafu};
+use snafu::{OptionExt, ResultExt, Snafu};
 use svod_dtype::DType;
 use svod_tensor::Tensor;
 use zip::ZipArchive;
@@ -31,8 +31,8 @@ pub enum Error {
     Io { source: std::io::Error },
     #[snafu(display("zip: {source}"))]
     Zip { source: ZipError },
-    #[snafu(display("pickle parse: {message}"))]
-    Parse { message: String },
+    #[snafu(display("pickle parse: {source}"))]
+    Parse { source: Box<dyn std::error::Error + Send + Sync> },
     #[snafu(display("data.pkl not found in archive"))]
     NoDataPkl,
     #[snafu(display("unexpected pickle structure: {context}"))]
@@ -78,27 +78,30 @@ fn load_pytorch_bin_with_state_dict_key(
 
     // 1. Find the `*/data.pkl` member.
     let data_pkl_name =
-        zp.file_names().find(|s| s.ends_with("/data.pkl")).map(str::to_owned).ok_or(Error::NoDataPkl)?;
+        zp.file_names().find(|s| s.ends_with("/data.pkl")).map(str::to_owned).context(NoDataPklSnafu)?;
     let pfx = data_pkl_name.rsplit_once('/').map(|(p, _)| p.to_owned()).unwrap_or_default();
 
     // 2. Read its bytes.
     let mut pkl_bytes = Vec::new();
     zp.by_name(&data_pkl_name).context(ZipSnafu)?.read_to_end(&mut pkl_bytes).context(IoSnafu)?;
 
-    // 3. Parse + evaluate.
-    let (_remain, ops) = parse_ops::<nom::error::VerboseError<&[u8]>>(&pkl_bytes)
-        .map_err(|e| Error::Parse { message: format!("{e:?}") })?;
-    let (vals, _memo) = evaluate(&ops, true).map_err(|e| Error::Parse { message: format!("{e:?}") })?;
+    // 3. Parse + evaluate. The nom error borrows `pkl_bytes`; map its input to
+    //    an owned (lossy) `String` so the source is `'static` and boxable.
+    let (_remain, ops) = parse_ops::<nom::error::Error<&[u8]>>(&pkl_bytes)
+        .map_err(|e| e.map_input(|i| String::from_utf8_lossy(i).into_owned()))
+        .boxed()
+        .context(ParseSnafu)?;
+    let (vals, _memo) = evaluate(&ops, true).map_err(|e| Error::Parse { source: e.into() })?;
 
     // 4. Resolve the iterable of `(key, tensor_value)` pairs:
     //    - Lightning-style wrapper: `{state_dict: OrderedDict(...)}`. Descend
     //      one level into the named key.
     //    - Flat layout (DiariZen): top-level itself is the OrderedDict.
-    let toplevel = vals.first().ok_or_else(|| Error::Structure { context: "no toplevel value".into() })?;
+    let toplevel = vals.first().context(StructureSnafu { context: "no toplevel value" })?;
     let sd_items: &Vec<Value<'_>> = match state_dict_key {
         Some(key) => {
             let top_items = unwrap_outer_dict(toplevel)
-                .ok_or_else(|| Error::Structure { context: "toplevel not recognised as a dict-of-pairs".into() })?;
+                .context(StructureSnafu { context: "toplevel not recognised as a dict-of-pairs" })?;
             let state_dict_value = top_items
                 .iter()
                 .find_map(|item| match item {
@@ -109,13 +112,13 @@ fn load_pytorch_bin_with_state_dict_key(
                     }
                     _ => None,
                 })
-                .ok_or_else(|| Error::Structure { context: format!("no '{key}' key at toplevel") })?;
+                .context(StructureSnafu { context: format!("no '{key}' key at toplevel") })?;
             unwrap_ordered_dict_items(state_dict_value)
-                .ok_or_else(|| Error::Structure { context: format!("{key} value is not an OrderedDict") })?
+                .context(StructureSnafu { context: format!("{key} value is not an OrderedDict") })?
         }
         None => unwrap_ordered_dict_items(toplevel)
             .or_else(|| unwrap_outer_dict(toplevel))
-            .ok_or_else(|| Error::Structure { context: "toplevel not recognised as a flat OrderedDict".into() })?,
+            .context(StructureSnafu { context: "toplevel not recognised as a flat OrderedDict" })?,
     };
 
     // 5. For each entry, decode `_rebuild_tensor_v2` args and read bytes from

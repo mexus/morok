@@ -10,6 +10,7 @@ use object::read::{Object, ObjectSection, ObjectSymbol};
 use object::{Architecture, RelocationFlags, SectionKind};
 
 use crate::dispatch::KernelCif;
+use crate::error::JitResultExt;
 
 /// A compiled C kernel loaded via custom ELF relocator + mmap.
 pub struct JitKernel {
@@ -135,20 +136,11 @@ fn compile_to_object(src: &str) -> crate::Result<Vec<u8>> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|e| crate::Error::JitCompilation {
-            reason: format!("Failed to spawn clang: {e}. Is clang installed?"),
-        })?;
+        .jit("spawn clang (is clang installed?)")?;
 
-    child
-        .stdin
-        .take()
-        .expect("stdin was piped")
-        .write_all(src.as_bytes())
-        .map_err(|e| crate::Error::JitCompilation { reason: format!("Failed to write to clang stdin: {e}") })?;
+    child.stdin.take().expect("stdin was piped").write_all(src.as_bytes()).jit("write source to clang stdin")?;
 
-    let output = child
-        .wait_with_output()
-        .map_err(|e| crate::Error::JitCompilation { reason: format!("Failed to wait for clang: {e}") })?;
+    let output = child.wait_with_output().jit("wait for clang")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -170,8 +162,7 @@ fn compile_to_object(src: &str) -> crate::Result<Vec<u8>> {
 /// mmap, apply relocations, mprotect to executable, and return the function
 /// pointer for the named symbol.
 pub(crate) fn jit_load(obj: &[u8], name: &str) -> crate::Result<(*const (), memmap2::MmapMut)> {
-    let elf = object::File::parse(obj)
-        .map_err(|e| crate::Error::JitCompilation { reason: format!("Failed to parse ELF: {e}") })?;
+    let elf = object::File::parse(obj).jit("parse ELF")?;
 
     let arch = elf.architecture();
 
@@ -205,14 +196,11 @@ pub(crate) fn jit_load(obj: &[u8], name: &str) -> crate::Result<(*const (), memm
     };
 
     // Allocate and populate mmap.
-    let mut mmap = memmap2::MmapMut::map_anon(total_size)
-        .map_err(|e| crate::Error::JitCompilation { reason: format!("mmap failed: {e}") })?;
+    let mut mmap = memmap2::MmapMut::map_anon(total_size).jit("allocate anon mmap")?;
 
     for section in elf.sections() {
         if let Some(&offset) = section_offsets.get(&section.index()) {
-            let data = section
-                .data()
-                .map_err(|e| crate::Error::JitCompilation { reason: format!("Failed to read section: {e}") })?;
+            let data = section.data().jit("read ELF section")?;
             mmap[offset..offset + data.len()].copy_from_slice(data);
         }
     }
@@ -252,12 +240,8 @@ pub(crate) fn jit_load(obj: &[u8], name: &str) -> crate::Result<(*const (), memm
                     if let Some(&addr) = symbol_addrs.get(&sym_idx) {
                         addr
                     } else {
-                        let sym = elf
-                            .symbol_by_index(sym_idx)
-                            .map_err(|e| crate::Error::JitCompilation { reason: format!("Bad symbol index: {e}") })?;
-                        let sym_name = sym
-                            .name()
-                            .map_err(|e| crate::Error::JitCompilation { reason: format!("Bad symbol name: {e}") })?;
+                        let sym = elf.symbol_by_index(sym_idx).jit("bad symbol index")?;
+                        let sym_name = sym.name().jit("bad symbol name")?;
                         let addr = resolve_symbol(sym_name)?;
                         symbol_addrs.insert(sym_idx, addr);
                         addr
@@ -305,9 +289,7 @@ pub(crate) fn jit_load(obj: &[u8], name: &str) -> crate::Result<(*const (), memm
     unsafe {
         let ret = libc::mprotect(mmap.as_ptr() as *mut libc::c_void, mmap.len(), libc::PROT_READ | libc::PROT_EXEC);
         if ret != 0 {
-            return Err(crate::Error::JitCompilation {
-                reason: format!("mprotect failed: {}", std::io::Error::last_os_error()),
-            });
+            return Err(std::io::Error::last_os_error()).jit("mprotect to executable");
         }
     }
 
@@ -780,8 +762,7 @@ fn count_aarch64_external_calls(elf: &object::File, section_offsets: &HashMap<ob
 
 /// Resolve an external symbol (e.g. `sqrtf`, `expf`) via dlsym at runtime.
 fn resolve_symbol(name: &str) -> crate::Result<u64> {
-    let cname = std::ffi::CString::new(name)
-        .map_err(|e| crate::Error::JitCompilation { reason: format!("Invalid symbol name: {e}") })?;
+    let cname = std::ffi::CString::new(name).jit("symbol name has interior NUL")?;
     let ptr = unsafe { libc::dlsym(libc::RTLD_DEFAULT, cname.as_ptr()) };
     if ptr.is_null() {
         return Err(crate::Error::JitCompilation { reason: format!("Cannot resolve symbol: {name}") });

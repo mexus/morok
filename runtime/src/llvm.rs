@@ -3,9 +3,11 @@
 //! Compiles LLVM IR text via `clang -x ir -c -O2` stdin→stdout and loads the
 //! resulting object via the shared JIT ELF loader. No linked LLVM required.
 
+use tracing::debug;
+
 use crate::Result;
 use crate::dispatch::KernelCif;
-use tracing::debug;
+use crate::error::JitResultExt;
 
 /// LLVM JIT-compiled kernel using external clang + mmap ELF loader.
 pub struct LlvmKernel {
@@ -137,20 +139,11 @@ fn compile_ir_to_object(ir: &str) -> Result<Vec<u8>> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|e| crate::Error::JitCompilation {
-            reason: format!("Failed to spawn clang: {e}. Is clang installed?"),
-        })?;
+        .jit("spawn clang for IR (is clang installed?)")?;
 
-    child
-        .stdin
-        .take()
-        .expect("stdin was piped")
-        .write_all(ir.as_bytes())
-        .map_err(|e| crate::Error::JitCompilation { reason: format!("Failed to write IR to clang stdin: {e}") })?;
+    child.stdin.take().expect("stdin was piped").write_all(ir.as_bytes()).jit("write IR to clang stdin")?;
 
-    let output = child
-        .wait_with_output()
-        .map_err(|e| crate::Error::JitCompilation { reason: format!("Failed to wait for clang: {e}") })?;
+    let output = child.wait_with_output().jit("wait for clang (IR)")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);

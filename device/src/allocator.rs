@@ -627,7 +627,11 @@ impl LruAllocator {
                 unsafe { (*data.get()).fill(0) };
                 Ok(true)
             }
-            RawBuffer::Mmap { .. } => panic!("DISK device is read-only: cannot zero-init mmap buffer"),
+            // DISK is read-only and never LRU-cached (the registry hands out a
+            // bare DiskAllocator), so this arm is unreachable in practice; if a
+            // recycle ever routed here, a host memset through the read-only mmap
+            // is impossible — surface it instead of panicking.
+            RawBuffer::Mmap { .. } => UnsupportedSnafu { op: "zero-init read-only DISK mmap" }.fail(),
             RawBuffer::AmdDevice { host_ptr: Some(ptr), size, device, .. } => {
                 // Drain first: this VA was just recycled from the pool and its
                 // previous owner's async kernel may still be writing it. A host

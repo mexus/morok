@@ -66,7 +66,7 @@ pub use renderer::{Renderer, TcOpt, TensorCore};
 pub use scheduler::Scheduler;
 #[cfg(test)]
 pub use scheduler::clear_kernel_name_counts;
-pub use types::{AxisType, Opt, OptArg, OptOps};
+pub use types::{AxisType, Opt, OptArg, OptArgExt, OptOps};
 
 use crate::devectorize::{
     Fp8DecompCtx, bool_storage_patterns, pm_float_decomp, pm_float_decomp_store, pm_reduce, pm_render,
@@ -108,7 +108,7 @@ use std::sync::{Arc, LazyLock};
 ///
 /// * `SVOD_NOOPT=1` - Disable all optimizations (for debugging)
 /// * `BEAM=N` - Use beam search with width N (future)
-pub fn optimize_kernel(ast: Arc<svod_ir::UOp>, renderer: &Renderer) -> Arc<svod_ir::UOp> {
+pub fn optimize_kernel(ast: Arc<svod_ir::UOp>, renderer: &Renderer) -> Result<Arc<svod_ir::UOp>, OptError> {
     optimize_kernel_with_config(ast, renderer, &OptimizerConfig::from_env())
 }
 
@@ -600,18 +600,52 @@ pub fn optimize_kernel_with_config(
     ast: Arc<svod_ir::UOp>,
     renderer: &Renderer,
     config: &OptimizerConfig,
-) -> Arc<svod_ir::UOp> {
-    // Pre-optimization: per-kernel stages.
+) -> Result<Arc<svod_ir::UOp>, OptError> {
+    // Author-supplied `opts_to_apply` (tinygrad parity) is read from the kernel
+    // SINK marker BEFORE pre-optimization. When set, it overrides the strategy:
+    // apply exactly those opts (an empty list applies none), never heuristics.
+    let explicit_opts = kernel_opts_to_apply(&ast);
+
+    // A SINK carrying an *empty* explicit opt list AND `Op::Special` (gidx/lidx)
+    // ops is a fully hand-lowered GPU kernel — one already carrying its
+    // global/local dims, manual ranges, explicit `VECTORIZE`d WMMA operands,
+    // LDS + barriers, and lane-distributed accesses. The optimizer's passes
+    // are tuned for the tensor compiler's IR shape (movement ops, BUFFERIZE,
+    // …), not for hand-built tile IR; running them here mis-transforms the
+    // kernel (uncoalesced vectorized stores, displaced scheduling markers,
+    // broken WMMA pipelining) and regresses device perf. Mirror the direct
+    // path: lower only the `Index`-typed addressing to a concrete int width
+    // and skip every optimizer stage. Mirrors `gpudims.rs`'s existing
+    // "Specials present ⇒ skip" guard.
+    let hand_lowered = matches!(explicit_opts.as_deref(), Some([]))
+        && ast.toposort().iter().any(|u| matches!(u.op(), svod_ir::Op::Special { .. }));
+    if hand_lowered {
+        // `graph_rewrite` drops node metadata; re-attach the SINK's `KernelInfo`
+        // (kernel name / opts) so downstream caching + naming still resolve it.
+        let saved_metadata = ast.metadata_raw();
+        let lowered = graph_rewrite(&crate::symbolic::pm_lower_index_dtype(), ast, &mut ());
+        return Ok(match saved_metadata {
+            Some(meta) => lowered.with_metadata_raw(meta),
+            None => lowered,
+        });
+    }
+
+    // Pre-optimization: per-kernel stages. Kept ON for the explicit-opts path
+    // for parity with `OptStrategy::None` (which also keeps it).
     let pre_optimized = apply_pre_optimization(ast);
 
-    let optimized = match config.strategy {
-        OptStrategy::None => pre_optimized, // No heuristic optimization, but post-optimization still needed
-        OptStrategy::Heuristic => optimize_heuristic(pre_optimized, renderer, &config.heuristics),
-        OptStrategy::Beam { .. } => {
-            // Beam search requires a compile_and_time function.
-            // Use optimize_kernel_beam() for actual beam search.
-            // Fall back to heuristics for the simple API.
-            optimize_heuristic(pre_optimized, renderer, &config.heuristics)
+    let optimized = if let Some(opts) = explicit_opts {
+        apply_explicit_opts(pre_optimized, renderer, &opts)?
+    } else {
+        match config.strategy {
+            OptStrategy::None => pre_optimized, // No heuristic optimization, but post-optimization still needed
+            OptStrategy::Heuristic => optimize_heuristic(pre_optimized, renderer, &config.heuristics),
+            OptStrategy::Beam { .. } => {
+                // Beam search requires a compile_and_time function.
+                // Use optimize_kernel_beam() for actual beam search.
+                // Fall back to heuristics for the simple API.
+                optimize_heuristic(pre_optimized, renderer, &config.heuristics)
+            }
         }
     };
 
@@ -619,7 +653,40 @@ pub fn optimize_kernel_with_config(
     // with LOAD for arithmetic ops) and must run even when optimizations are disabled.
     // Pass the renderer to enable GPU dimension injection for GPU backends.
 
-    apply_post_optimization_with_renderer(optimized, Some(renderer))
+    Ok(apply_post_optimization_with_renderer(optimized, Some(renderer)))
+}
+
+/// Read an author-supplied `opts_to_apply` list off a kernel SINK marker.
+///
+/// Mirrors tinygrad's `apply_opts` reading `ast.arg.opts_to_apply`. Returns
+/// `None` (optimizer chooses) unless the AST is a `Sink` whose `KernelInfo`
+/// carries an explicit list.
+fn kernel_opts_to_apply(ast: &Arc<svod_ir::UOp>) -> Option<Vec<Opt>> {
+    match ast.op() {
+        svod_ir::Op::Sink { info: Some(ki), .. } => ki.opts_to_apply.clone(),
+        _ => None,
+    }
+}
+
+/// Apply exactly the author-supplied opts (tinygrad's `apply_opts` inner loop).
+///
+/// `convert_loop_to_global` runs first (as tinygrad does), then each opt is
+/// applied in order. An empty list applies zero opts — the pass-through case
+/// for an already-lowered hand-built kernel. An opt that fails to apply is an
+/// error: the author asked for *exactly* these opts, so a failure is propagated
+/// rather than silently dropped (which would yield a kernel missing a requested
+/// transform).
+fn apply_explicit_opts(
+    ast: Arc<svod_ir::UOp>,
+    renderer: &Renderer,
+    opts: &[Opt],
+) -> Result<Arc<svod_ir::UOp>, OptError> {
+    let mut scheduler = Scheduler::new(ast, renderer.clone());
+    scheduler.convert_loop_to_global()?;
+    for opt in opts {
+        apply_opt(&mut scheduler, opt, true)?;
+    }
+    Ok(scheduler.get_optimized_ast(None))
 }
 
 /// Apply optimizations with explicit strategy selection (legacy API).
@@ -629,7 +696,7 @@ pub fn optimize_kernel_with_strategy(
     ast: Arc<svod_ir::UOp>,
     renderer: &Renderer,
     strategy: OptStrategy,
-) -> Arc<svod_ir::UOp> {
+) -> Result<Arc<svod_ir::UOp>, OptError> {
     let config = OptimizerConfig { strategy, ..Default::default() };
     optimize_kernel_with_config(ast, renderer, &config)
 }

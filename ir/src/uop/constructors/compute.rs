@@ -94,7 +94,8 @@ macro_rules! cmp_ops {
                 Self::validate_binary_shapes(&lhs, &rhs, BinaryOp::$op)?;
                 // Preserve vectorization: <N x T> cmp <N x T> → <N x bool>
                 let vcount = dtype.vcount();
-                let result_dtype = if vcount > 1 { DType::Bool.vec(vcount) } else { DType::Bool };
+                let result_dtype =
+                    if vcount > 1 { DType::Bool.vec(vcount).expect("Bool is a scalar") } else { DType::Bool };
                 Ok(Self::new(Op::Binary(BinaryOp::$op, lhs, rhs), result_dtype))
             }
         )+

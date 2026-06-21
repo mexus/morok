@@ -98,15 +98,14 @@ ABI). Rust-привязки генерируются из него во врем
 `KfdIface::open` (`device/src/amd/iface.rs`) выдаёт их по порядку, зеркаля
 `ops_amd.py` из tinygrad:
 
-```text
-open /dev/kfd  (process-shared, один fd)
-open /dev/dri/renderD<minor>  (на узел — DRM render fd)
-   │
-   ├─ GET_VERSION            → захватить версию ABI
-   ├─ ACQUIRE_VM(drm_fd)     → зарегистрировать этот fd как VM процесса для GPU
-   ├─ RUNTIME_ENABLE         → только если ABI ≥ 1.14
-   ├─ (event-страница: alloc + bind один раз на процесс, map на устройство)
-   └─ CREATE_EVENT × 3       → queue-signal, memory-fault, hw-exception
+```mermaid
+flowchart TD
+  A["open /dev/kfd (process-shared, one fd)"] --> B["open /dev/dri/renderD(minor) (per node — the DRM render fd)"]
+  B --> C["GET_VERSION: capture ABI version"]
+  B --> D["ACQUIRE_VM(drm_fd): register this fd as the process VM for the GPU"]
+  B --> E["RUNTIME_ENABLE: only if ABI is at least 1.14"]
+  B --> F["event page: alloc + bind once per process, map per device"]
+  B --> G["CREATE_EVENT x 3: queue-signal, memory-fault, hw-exception"]
 ```
 
 С DRM render fd связана любопытная деталь: **DRM-ioctl нет вообще**. `drm_fd`

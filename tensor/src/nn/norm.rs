@@ -1,12 +1,12 @@
 //! Normalization: layernorm, rms_norm, group_norm.
 
 use bon::bon;
-use snafu::ResultExt;
+use snafu::{OptionExt, ResultExt};
 use svod_dtype::DType;
 use svod_ir::{ConstValue, UOp};
 
 use crate::Tensor;
-use crate::error::{NdimMinimumSnafu, ParamRangeSnafu, UOpSnafu};
+use crate::error::{NdimMinimumSnafu, ParamRangeSnafu, SymbolicShapeUnsupportedSnafu, UOpSnafu};
 use crate::reduce::AxisSpec;
 
 type Result<T> = crate::Result<T>;
@@ -235,7 +235,7 @@ impl Tensor {
             num_groups > 0,
             ParamRangeSnafu { op: "group_norm", param: "num_groups", value: num_groups.to_string(), constraint: "> 0" }
         );
-        let batch = x_shape[0].as_const().unwrap();
+        let batch = x_shape[0].as_const().context(SymbolicShapeUnsupportedSnafu { operation: "group_norm" })?;
 
         // Reshape to (batch, num_groups, -1), cast to f32 before layernorm
         let reshaped = self.try_reshape([batch as isize, num_groups as isize, -1])?;

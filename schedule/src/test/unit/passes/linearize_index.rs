@@ -107,7 +107,7 @@ fn test_unbounded_buffer_still_linearizes() {
     // Create a buffer with unbounded size (no concrete shape)
     // With index-based dimension extraction, linearization should still work
     // because dimensions come from the RANGE indices, not the buffer
-    let ptr_dtype = DType::Float32.ptr(None, svod_dtype::AddrSpace::Global);
+    let ptr_dtype = DType::Float32.ptr(None, svod_dtype::AddrSpace::Global).unwrap();
     let buffer = UOp::param(0, 1024, ptr_dtype, None);
     let i = make_range(4, 0);
     let j = make_range(8, 1);
@@ -126,7 +126,7 @@ fn test_unbounded_buffer_still_linearizes() {
 
 #[test]
 fn test_symbolic_dimension_is_linearized() {
-    let ptr_dtype = DType::Float32.ptr(None, svod_dtype::AddrSpace::Global);
+    let ptr_dtype = DType::Float32.ptr(None, svod_dtype::AddrSpace::Global).unwrap();
     let buffer = UOp::param(0, 1024, ptr_dtype, None);
 
     let i = make_range(4, 0);

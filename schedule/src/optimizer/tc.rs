@@ -309,16 +309,12 @@ fn apply_axis_choice_impl(
             }
         }
 
-        // Apply padding operations sequentially
+        // Apply padding operations sequentially. Propagate the inner OptError
+        // directly rather than collapsing it — the PADTO failure detail (4x work
+        // limit, unsafe ops, symbolic extent) is more actionable than a generic
+        // "padding failed" message.
         for (axes_idx, scheduler_idx, tc_dim) in padding_ops {
-            crate::optimizer::opts::apply_opt(scheduler, &crate::optimizer::Opt::padto(scheduler_idx, tc_dim), false)
-                .map_err(|_| {
-                ValidationFailedSnafu {
-                    op: "TC",
-                    reason: "padding failed (may exceed 4x work limit or have unsafe ops)",
-                }
-                .build()
-            })?;
+            crate::optimizer::opts::apply_opt(scheduler, &crate::optimizer::Opt::padto(scheduler_idx, tc_dim), false)?;
 
             // Update axes to the new padded range (PADTO substitutes the old range)
             axes[axes_idx] = scheduler.rngs()[scheduler_idx].clone();

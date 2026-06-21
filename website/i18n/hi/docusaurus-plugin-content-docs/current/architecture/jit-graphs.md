@@ -8,20 +8,26 @@ sidebar_label: JIT ग्राफ़
 
 `jit_wrapper!` macro और `model::jit` runtime layer उस build-once / run-many pattern को **एक typed Rust struct** में बदल देते हैं। आप inputs और graph declare करते हैं; macro एक wrapper generate करता है जो `prepare()` के दौरान graph को एक बार compile करता है और हर `execute()` पर device buffers को जगह पर रखते हुए उसे replay करता है।
 
-```text
-Without the wrapper:                 With the wrapper:
-┌─────────────────────────┐          ┌─────────────────────────┐
-│  build graph            │          │  build graph            │
-│  optimize patterns      │          │  optimize patterns      │
-│  generate kernels       │          │  generate kernels       │
-│  compile (clang)        │          │  compile (clang)        │
-│  alloc buffers          │          │  alloc buffers          │
-│  execute                │          ├─────────────────────────┤
-└─────────────────────────┘          │  write input buffers    │
-                                     │  execute                │
-                                     │  read output buffer     │
-                                     └─────────────────────────┘
-every call                           prepare() + every step
+```mermaid
+flowchart TD
+  subgraph WO["Without the wrapper (every call)"]
+    WO1["build graph"] --> WO2["optimize patterns"]
+    WO2 --> WO3["generate kernels"]
+    WO3 --> WO4["compile (clang)"]
+    WO4 --> WO5["alloc buffers"]
+    WO5 --> WO6["execute"]
+  end
+  subgraph WP["With the wrapper (prepare() once)"]
+    WP1["build graph"] --> WP2["optimize patterns"]
+    WP2 --> WP3["generate kernels"]
+    WP3 --> WP4["compile (clang)"]
+    WP4 --> WP5["alloc buffers"]
+  end
+  subgraph WS["Every step"]
+    WS1["write input buffers"] --> WS2["execute"]
+    WS2 --> WS3["read output buffer"]
+  end
+  WP --> WS
 ```
 
 Wrapper [पैटर्न इंजन](./optimizations/pattern-system.md) (जो `prepare()` के समय चलता है) और [JIT लोडर](../backends/jit-loader.md) (जो optimized kernels को in-memory machine code में बदलता है) के साथ compose होता है। यह पेज उस wrapper layer को कवर करता है जो दोनों के ऊपर बैठती है।

@@ -8,6 +8,8 @@ use std::sync::OnceLock;
 use svod_dtype::AmdArch;
 use tracing::debug;
 
+use crate::error::JitResultExt;
+
 /// Compile AMD LLVM IR text into a fully-linked AMDGPU code object.
 ///
 /// `clang --target=amdgcn-amd-amdhsa -mcpu={arch}` produces an `ET_DYN` ELF
@@ -75,18 +77,11 @@ pub fn compile_ir_to_amd_object(ir: &str, arch: AmdArch) -> crate::Result<Vec<u8
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|e| crate::Error::JitCompilation { reason: format!("failed to spawn clang: {e}") })?;
+        .jit("spawn clang for amdgcn IR")?;
 
-    child
-        .stdin
-        .take()
-        .expect("stdin piped")
-        .write_all(ir.as_bytes())
-        .map_err(|e| crate::Error::JitCompilation { reason: format!("failed to write IR to clang stdin: {e}") })?;
+    child.stdin.take().expect("stdin piped").write_all(ir.as_bytes()).jit("write amdgcn IR to clang stdin")?;
 
-    let output = child
-        .wait_with_output()
-        .map_err(|e| crate::Error::JitCompilation { reason: format!("failed to wait for clang: {e}") })?;
+    let output = child.wait_with_output().jit("wait for clang (amdgcn)")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);

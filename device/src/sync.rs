@@ -31,7 +31,7 @@ use std::time::{Duration, Instant};
 
 use parking_lot::{Condvar, Mutex};
 
-use crate::error::{Result, RuntimeSnafu};
+use crate::error::{Result, TimelineTimeoutSnafu};
 use snafu::ensure;
 
 /// Hardware-stamped GPU dispatch timestamps, readable once the dispatch
@@ -170,31 +170,19 @@ impl TimelineSignal for CpuTimelineSignal {
             while self.inner.value.load(Ordering::Acquire) < target {
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 if remaining.is_zero() {
+                    let current = self.inner.value.load(Ordering::Acquire);
                     ensure!(
-                        self.inner.value.load(Ordering::Acquire) >= target,
-                        RuntimeSnafu {
-                            message: format!(
-                                "timeline signal timeout: waited {}ms for value {}, current {}",
-                                timeout_ms,
-                                target,
-                                self.inner.value.load(Ordering::Acquire)
-                            )
-                        }
+                        current >= target,
+                        TimelineTimeoutSnafu { what: "timeline signal", target, current, waited_ms: timeout_ms }
                     );
                     return Ok(());
                 }
 
                 let result = self.inner.condvar.wait_for(&mut guard, remaining);
-                if result.timed_out() && self.inner.value.load(Ordering::Acquire) < target {
-                    return RuntimeSnafu {
-                        message: format!(
-                            "timeline signal timeout: waited {}ms for value {}, current {}",
-                            timeout_ms,
-                            target,
-                            self.inner.value.load(Ordering::Acquire)
-                        ),
-                    }
-                    .fail();
+                let current = self.inner.value.load(Ordering::Acquire);
+                if result.timed_out() && current < target {
+                    return TimelineTimeoutSnafu { what: "timeline signal", target, current, waited_ms: timeout_ms }
+                        .fail();
                 }
             }
             Ok(())
@@ -341,11 +329,11 @@ pub mod cuda {
 
                     while !event.is_ready() {
                         if start.elapsed() > timeout {
-                            return crate::error::RuntimeSnafu {
-                                message: format!(
-                                    "CUDA timeline signal timeout: waited {}ms for value {}",
-                                    timeout_ms, target
-                                ),
+                            return crate::error::TimelineTimeoutSnafu {
+                                what: "CUDA timeline signal",
+                                target,
+                                current: self.value.load(Ordering::Acquire),
+                                waited_ms: timeout_ms,
                             }
                             .fail();
                         }
@@ -373,13 +361,11 @@ pub mod cuda {
 
                 while self.value.load(Ordering::Acquire) < target {
                     if start.elapsed() > timeout {
-                        return crate::error::RuntimeSnafu {
-                            message: format!(
-                                "CUDA timeline signal timeout: waited {}ms for value {}, current {}",
-                                timeout_ms,
-                                target,
-                                self.value.load(Ordering::Acquire)
-                            ),
+                        return crate::error::TimelineTimeoutSnafu {
+                            what: "CUDA timeline signal",
+                            target,
+                            current: self.value.load(Ordering::Acquire),
+                            waited_ms: timeout_ms,
                         }
                         .fail();
                     }

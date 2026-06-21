@@ -52,9 +52,9 @@ Range {
 प्रायोरिटी लूप नेस्टिंग ऑर्डर तय करती है — कम वैल्यू वाले आउटर लूप होते हैं। कर्नेल बाउंड्री `Call`/`Function` के ज़रिए स्ट्रक्चरली व्यक्त होती है, इसके लिए कोई अलग ऐक्सिस टाइप नहीं है।
 
 **उदाहरण:**
-```text
-RANGE(end=128, axis_id=R0, type=Global)
-└── CONST(128) : Index
+```mermaid
+flowchart TD
+  R["RANGE(end=128, axis_id=R0, type=Global)"] --> C["CONST(128) : Index"]
 ```
 
 ### END — लूप स्कोप क्लोज़र
@@ -69,11 +69,11 @@ End {
 END एक या ज़्यादा RANGE स्कोप बंद करता है और उन्हें एक्टिव सेट से हटाता है। एक साथ कई ranges बंद की जा सकती हैं।
 
 **उदाहरण:**
-```text
-END
-├── STORE(...)           — computation
-├── RANGE(R0, Global)    — पहली range बंद हुई
-└── RANGE(R1, Local)     — दूसरी range बंद हुई
+```mermaid
+flowchart TD
+  E["END"] -->|"computation"| S["STORE(...)"]
+  E -->|"first range closed"| R0["RANGE(R0, Global)"]
+  E -->|"second range closed"| R1["RANGE(R1, Local)"]
 ```
 
 ---
@@ -95,9 +95,9 @@ ReduceAxis {
 **Rangeify से पहले** इस्तेमाल होता है। NumPy के `.sum(axis=0)` की तरह tensor डायमेंशन पर काम करता है।
 
 **उदाहरण:**
-```text
-REDUCE_AXIS(Add, axes=[1])
-└── BUFFER[10, 20] : Float32
+```mermaid
+flowchart TD
+  RA["REDUCE_AXIS(Add, axes=[1])"] --> B["BUFFER[10, 20] : Float32"]
 ```
 
 यह `[10, 20]` tensor को axis 1 पर sum करके `[10]` में बदलता है।
@@ -126,13 +126,13 @@ Reduce {
 > **कम्पैटिबिलिटी:** Tinygrad का स्पेक REDUCE_AXIS को `{Add, Mul, Max}` तक सीमित रखता है। Svod इसे `Min` के साथ एक्सटेंड करता है।
 
 **उदाहरण:**
-```text
-REDUCE(Add)
-├── MUL                      — accumulate करने के लिए वैल्यू
-│   ├── LOAD(A, ...)
-│   └── LOAD(B, ...)
-└── RANGE(R2, Reduce)        — reduce की जा रही range
-    └── CONST(64)
+```mermaid
+flowchart TD
+  RED["REDUCE(Add)"] -->|"value to accumulate"| MUL["MUL"]
+  MUL --> LA["LOAD(A, ...)"]
+  MUL --> LB["LOAD(B, ...)"]
+  RED -->|"range being reduced"| R2["RANGE(R2, Reduce)"]
+  R2 --> C["CONST(64)"]
 ```
 
 ### ALLREDUCE — क्रॉस-डिवाइस रिडक्शन
@@ -184,11 +184,11 @@ Bufferize {
 | `removable` | `bool` | `false` होने पर `buffer_removal` को इस BUFFERIZE को इनलाइन करने की अनुमति नहीं — मल्टी-कंज़्यूमर realize बाउंड्री पर इस्तेमाल होता है ताकि बफ़र मेगा-pass फ़िक्सपॉइंट इटरेशन के बीच टिका रहे |
 
 **उदाहरण:**
-```text
-BUFFERIZE(opts={addrspace=Global})
-├── REDUCE(Add, ...)         — computation
-├── RANGE(R0, Global)        — आउटपुट dim 0
-└── RANGE(R1, Global)        — आउटपुट dim 1
+```mermaid
+flowchart TD
+  BZ["BUFFERIZE(opts=(addrspace=Global))"] -->|"computation"| RED["REDUCE(Add, ...)"]
+  BZ -->|"output dim 0"| R0["RANGE(R0, Global)"]
+  BZ -->|"output dim 1"| R1["RANGE(R1, Global)"]
 ```
 
 ### INDEX — मल्टी-डायमेंशनल बफ़र एक्सेस
@@ -204,12 +204,12 @@ Index {
 मल्टी-डायमेंशनल indices से मेमोरी एड्रेस कैलकुलेट करता है। एलिमेंट dtype रिटर्न करता है (पॉइंटर नहीं)।
 
 **उदाहरण:**
-```text
-INDEX : Float32
-├── PARAM(0)
-├── RANGE(R0, Global)        — dim 0 के लिए index
-├── RANGE(R1, Loop)          — dim 1 के लिए index
-└── MUL(...)                 — dim 2 के लिए index
+```mermaid
+flowchart TD
+  IDX["INDEX : Float32"] --> P["PARAM(0)"]
+  IDX -->|"index for dim 0"| R0["RANGE(R0, Global)"]
+  IDX -->|"index for dim 1"| R1["RANGE(R1, Loop)"]
+  IDX -->|"index for dim 2"| M["MUL(...)"]
 ```
 
 ### POINTER_INDEX — लो-लेवल पॉइंटर अरिथमेटिक
@@ -238,13 +238,13 @@ Load {
 बफ़र से index पर वैल्यू रीड करता है। गेटेड loads के लिए, `alt` फ़ील्ड INDEX की `gate` false होने पर एक वैल्यू प्रदान करती है (मेमोरी एक्सेस पूरी तरह स्किप हो जाती है)।
 
 **उदाहरण:**
-```text
-LOAD : Float32
-├── PARAM(1)
-└── INDEX
-    ├── PARAM(1)
-    ├── RANGE(R0)
-    └── RANGE(R2)
+```mermaid
+flowchart TD
+  L["LOAD : Float32"] --> P1["PARAM(1)"]
+  L --> IDX["INDEX"]
+  IDX --> P1b["PARAM(1)"]
+  IDX --> R0["RANGE(R0)"]
+  IDX --> R2["RANGE(R2)"]
 ```
 
 ### STORE — मेमोरी राइट
@@ -264,12 +264,12 @@ Store {
 > **कम्पैटिबिलिटी:** Svod के STORE में अलग `buffer` फ़ील्ड नहीं है — sources हैं: index=0, value=1, ranges=2+ (range_start=2)। Tinygrad का लेआउट भी ऐसा ही है।
 
 **उदाहरण:**
-```text
-STORE
-├── INDEX[R0, R1]            — राइट एड्रेस (index.src[0] से बफ़र)
-├── REDUCE(Add, ...)         — वैल्यू
-├── RANGE(R0, Global)        — आउटपुट dim 0 (बंद)
-└── RANGE(R1, Global)        — आउटपुट dim 1 (बंद)
+```mermaid
+flowchart TD
+  ST["STORE"] -->|"write address (buffer via index.src[0])"| IDX["INDEX[R0, R1]"]
+  ST -->|"value"| RED["REDUCE(Add, ...)"]
+  ST -->|"output dim 0 (closed)"| R0["RANGE(R0, Global)"]
+  ST -->|"output dim 1 (closed)"| R1["RANGE(R1, Global)"]
 ```
 
 ---
@@ -385,11 +385,11 @@ Sink {
 AST SINK को बाकी समान-source SINK से अलग करता है।
 
 **उदाहरण:**
-```text
-SINK
-├── STORE(output_0, ...)
-├── STORE(output_1, ...)
-└── STORE(output_2, ...)
+```mermaid
+flowchart TD
+  SINK["SINK"] --> S0["STORE(output_0, ...)"]
+  SINK --> S1["STORE(output_1, ...)"]
+  SINK --> S2["STORE(output_2, ...)"]
 ```
 
 ### AFTER — डिपेंडेंसी मार्कर
@@ -404,12 +404,12 @@ After {
 कर्नेल्स के बीच बिना डेटा डिपेंडेंसी के एक्ज़ीक्यूशन डिपेंडेंसी एक्सप्रेस करता है। `passthrough` वैल्यू बिना बदले रिटर्न होती है, लेकिन सभी `deps` पूरे होने के बाद ही।
 
 **उदाहरण:**
-```text
-SINK
-├── AFTER
-│   ├── PARAM(0)     — passthrough (बफ़र रेफ़रेंस)
-│   └── KERNEL(...)          — पहले पूरा होना ज़रूरी
-└── KERNEL(...)              — AFTER के बाद बफ़र इस्तेमाल कर सकता है
+```mermaid
+flowchart TD
+  SINK["SINK"] --> AF["AFTER"]
+  AF -->|"passthrough (buffer reference)"| P0["PARAM(0)"]
+  AF -->|"must complete first"| K1["KERNEL(...)"]
+  SINK -->|"can use buffer after AFTER"| K2["KERNEL(...)"]
 ```
 
 ### BARRIER — सिंक्रोनाइज़ेशन फ़ेंस
@@ -438,12 +438,12 @@ Vectorize {
 N स्केलर वैल्यूज़ को साइज़ N के वेक्टर में जोड़ता है। सभी एलिमेंट्स का बेस dtype एक ही होना चाहिए।
 
 **उदाहरण:**
-```text
-VECTORIZE : <4 x Float32>
-├── CONST(1.0)
-├── CONST(2.0)
-├── CONST(3.0)
-└── CONST(4.0)
+```mermaid
+flowchart TD
+  V["VECTORIZE : 4 x Float32"] --> C1["CONST(1.0)"]
+  V --> C2["CONST(2.0)"]
+  V --> C3["CONST(3.0)"]
+  V --> C4["CONST(4.0)"]
 ```
 
 ### GEP — Get Element Pointer (वेक्टर एक्सट्रैक्ट)
@@ -460,10 +460,10 @@ Gep {
 - मल्टीपल indices → छोटा वेक्टर
 
 **उदाहरण:**
-```text
-GEP([0, 2]) : <2 x Float32>
-└── VECTORIZE : <4 x Float32>
-    └── ...
+```mermaid
+flowchart TD
+  G["GEP([0, 2]) : 2 x Float32"] --> V["VECTORIZE : 4 x Float32"]
+  V --> E["..."]
 ```
 
 ### VConst — वेक्टर कॉन्स्टेंट
@@ -487,10 +487,10 @@ Cat {
 वेक्टर्स को एक बड़े वेक्टर में जोड़ता है। आउटपुट `vcount` = इनपुट `vcount` का योग।
 
 **उदाहरण:**
-```text
-CAT : <8 x Float32>
-├── VECTORIZE : <4 x Float32>
-└── VECTORIZE : <4 x Float32>
+```mermaid
+flowchart TD
+  CAT["CAT : 8 x Float32"] --> V1["VECTORIZE : 4 x Float32"]
+  CAT --> V2["VECTORIZE : 4 x Float32"]
 ```
 
 ### PtrCat — पॉइंटर्स को कॉन्कैटनेट करें
@@ -532,10 +532,10 @@ Contract {
 UNROLL का उल्टा — एक्सपैंडेड स्केलर वैल्यूज़ को वेक्टर में कलेक्ट करता है। आउटपुट वेक्टर साइज़ = factors का गुणनफल।
 
 **उदाहरण:**
-```text
-CONTRACT(upcast_ranges=[(0, 4)]) : <4 x Float32>
-└── UNROLL(unroll_axes=[(0, 4)])
-    └── LOAD(...)
+```mermaid
+flowchart TD
+  CT["CONTRACT(upcast_ranges=[(0, 4)]) : 4 x Float32"] --> U["UNROLL(unroll_axes=[(0, 4)])"]
+  U --> L["LOAD(...)"]
 ```
 
 यह पैटर्न एक load को वेक्टराइज़ करता है: 4 इटरेशन एक्सपैंड करो, फिर रिज़ल्ट को 4-एलिमेंट वेक्टर में पैक करो।
@@ -572,11 +572,11 @@ Wmma {
 | `tile_grid` | `(usize, usize)` | मल्टी-FMA बैचिंग ग्रिड (डिफ़ॉल्ट (1,1)) |
 
 **उदाहरण:**
-```text
-WMMA(dims=(16, 16, 16), dtype_in=Float16, dtype_out=Float32)
-├── A fragment : <8 x Float16>
-├── B fragment : <8 x Float16>
-└── C accumulator : <8 x Float32>
+```mermaid
+flowchart TD
+  W["WMMA(dims=(16, 16, 16), dtype_in=Float16, dtype_out=Float32)"] --> A["A fragment : 8 x Float16"]
+  W --> B["B fragment : 8 x Float16"]
+  W --> C["C accumulator : 8 x Float32"]
 ```
 
 ---
@@ -599,14 +599,12 @@ EndIf {
 कंडीशन true होने पर ही body एक्ज़ीक्यूट करता है। बाउंड्री चेक और sparse ऑपरेशन के लिए इस्तेमाल होता है।
 
 **उदाहरण:**
-```text
-IF
-├── LT(idx, bound)           — condition (src[0])
-├── STORE(...)               — body[0]
-└── STORE(...)               — body[1]
-
-ENDIF
-└── IF(...)                  — IF op को रेफ़रेंस करता है
+```mermaid
+flowchart TD
+  IF["IF"] -->|"condition (src[0])"| LT["LT(idx, bound)"]
+  IF -->|"body[0]"| S0["STORE(...)"]
+  IF -->|"body[1]"| S1["STORE(...)"]
+  ENDIF["ENDIF"] -->|"references IF op"| IF
 ```
 
 ---
@@ -687,9 +685,9 @@ Special {
 हार्डवेयर-प्रदत्त वैल्यूज़ (thread/block indices) एक्सेस करता है। यह लूप नहीं है — हार्डवेयर सीधे वैल्यू देता है।
 
 **उदाहरण:**
-```text
-SPECIAL(name="blockIdx.x", end=128) : Index
-└── CONST(128)
+```mermaid
+flowchart TD
+  SP["SPECIAL(name=blockIdx.x, end=128) : Index"] --> C["CONST(128)"]
 ```
 
 ### UNIQUE / LUNIQUE — आइडेंटिटी मार्कर
@@ -729,10 +727,10 @@ Device(DeviceSpec)           // device specification
 | `Flip` | `{ src, axes: Vec<bool> }` | axes के अनुसार रिवर्स |
 
 **उदाहरण:** RESHAPE
-```text
-RESHAPE(new_shape=[6, 4]) : Shape[6, 4]
-├── BUFFER[2, 3, 4] : Float32
-└── CONST([6, 4]) : Shape
+```mermaid
+flowchart TD
+  RS["RESHAPE(new_shape=[6, 4]) : Shape[6, 4]"] --> B["BUFFER[2, 3, 4] : Float32"]
+  RS --> C["CONST([6, 4]) : Shape"]
 ```
 
 ---

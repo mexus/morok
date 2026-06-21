@@ -10,38 +10,13 @@ Svod 走的是相反的路线：**惰性求值**。当你写 `a.try_add(&b)?` �
 
 本章追踪这一过程。
 
-```text
-tensor.realize()
-    │
-    ▼
-┌─────────────────────────────────────────────────────────┐
-│  LAZY GRAPH                                             │
-│  Tensor ops build UOp DAG (no computation yet)          │
-└─────────────────────────────────────────────────────────┘
-    │
-    ▼
-┌─────────────────────────────────────────────────────────┐
-│  RANGEIFY                                               │
-│  Movement ops → explicit RANGE loops                    │
-└─────────────────────────────────────────────────────────┘
-    │
-    ▼
-┌─────────────────────────────────────────────────────────┐
-│  KERNEL SPLITTING                                       │
-│  Split at STORE boundaries → multiple KERNELs          │
-└─────────────────────────────────────────────────────────┘
-    │
-    ▼
-┌─────────────────────────────────────────────────────────┐
-│  OPTIMIZATION & CODEGEN                                 │
-│  Heuristics/beam → LLVM IR → JIT compile               │
-└─────────────────────────────────────────────────────────┘
-    │
-    ▼
-┌─────────────────────────────────────────────────────────┐
-│  EXECUTION                                              │
-│  Parallel kernel launch → result buffer                │
-└─────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TD
+  Start["tensor.realize()"] --> LG["LAZY GRAPH: Tensor ops build UOp DAG (no computation yet)"]
+  LG --> RG["RANGEIFY: Movement ops to explicit RANGE loops"]
+  RG --> KS["KERNEL SPLITTING: Split at STORE boundaries to multiple KERNELs"]
+  KS --> OC["OPTIMIZATION and CODEGEN: Heuristics/beam to LLVM IR to JIT compile"]
+  OC --> EX["EXECUTION: Parallel kernel launch to result buffer"]
 ```
 
 每个框都是一个独立的阶段。逐一讲解。
@@ -150,16 +125,15 @@ Before: BUFFER.reshape([2, 3]).expand([4, 2, 3]).sum(axis=0)
 
 经过 rangeify，变换操作变成显式的索引计算：
 
-```text
-After:
-STORE
-├── INDEX[RANGE(0..2), RANGE(0..3)]          — index (src[0])
-├── REDUCE(Add)                              — value (src[1])
-│   ├── LOAD
-│   │   └── INDEX[RANGE(0..4), RANGE(0..2), RANGE(0..3)]
-│   └── RANGE(0..4, Reduce)
-├── RANGE(0..2, Global)                      — output dim 0 (range)
-└── RANGE(0..3, Global)                      — output dim 1 (range)
+```mermaid
+flowchart TD
+  STORE["STORE"] --> IDX["INDEX(RANGE(0..2), RANGE(0..3)) -- index (src[0])"]
+  STORE --> RED["REDUCE(Add) -- value (src[1])"]
+  STORE --> R2["RANGE(0..2, Global) -- output dim 0"]
+  STORE --> R3["RANGE(0..3, Global) -- output dim 1"]
+  RED --> LOAD["LOAD"]
+  RED --> RR["RANGE(0..4, Reduce)"]
+  LOAD --> LIDX["INDEX(RANGE(0..4), RANGE(0..2), RANGE(0..3))"]
 ```
 
 `EXPAND` 变成了一个不影响 buffer 索引的 `RANGE(0..4)`——即广播。`RESHAPE` 变成了不同的索引算术。`SUM` 变成了 `REDUCE(Add)`，其中第一个范围标记为 `Reduce` 类型。
@@ -263,10 +237,11 @@ pub struct ScheduleItem {
 
 并非所有 kernel 都需要顺序执行。无依赖的 kernel 可以并行运行：
 
-```text
-Kernel A (writes buf0)
-Kernel B (writes buf1)  ─── no dependency ─── can run in parallel
-Kernel C (reads buf0, buf1)  ─── depends on A and B
+```mermaid
+flowchart TD
+  A["Kernel A (writes buf0)"] -->|"depends on A"| C["Kernel C (reads buf0, buf1)"]
+  B["Kernel B (writes buf1)"] -->|"depends on B"| C
+  A -.->|"no dependency, run in parallel"| B
 ```
 
 调度器使用 **Kahn 算法** 寻找并行组：
@@ -437,29 +412,29 @@ let c = a.matmul(&b);                 // Graph built, no computation
 
 此时，`c` 是一个惰性张量，具有如下 UOp 图：
 
-```text
-REDUCE_AXIS(Add, axis=2)
-└── MUL
-    ├── EXPAND(A, [4, 4, 4])    — A: [4, 4] → [4, 1, 4] → [4, 4, 4]
-    └── EXPAND(B, [4, 4, 4])    — B: [4, 4] → [1, 4, 4] → [4, 4, 4]
+```mermaid
+flowchart TD
+  RA["REDUCE_AXIS(Add, axis=2)"] --> MUL["MUL"]
+  MUL --> EA["EXPAND(A, [4, 4, 4]) -- A: [4, 4] to [4, 1, 4] to [4, 4, 4]"]
+  MUL --> EB["EXPAND(B, [4, 4, 4]) -- B: [4, 4] to [1, 4, 4] to [4, 4, 4]"]
 ```
 
 ### 阶段 2：Rangeify
 
 变换操作变成显式循环：
 
-```text
-STORE
-├── INDEX[BUFFER(C), RANGE(i, 0..4), RANGE(j, 0..4)]  — index
-├── REDUCE(Add)                                          — value
-│   ├── MUL
-│   │   ├── LOAD(A)
-│   │   │   └── INDEX[BUFFER(A), RANGE(i), RANGE(k, 0..4, Reduce)]
-│   │   └── LOAD(B)
-│   │       └── INDEX[BUFFER(B), RANGE(k), RANGE(j)]
-│   └── RANGE(k, Reduce)
-├── RANGE(i, Global)                                     — output dim 0
-└── RANGE(j, Global)                                     — output dim 1
+```mermaid
+flowchart TD
+  STORE["STORE"] --> CIDX["INDEX(BUFFER(C), RANGE(i, 0..4), RANGE(j, 0..4)) -- index"]
+  STORE --> RED["REDUCE(Add) -- value"]
+  STORE --> RI["RANGE(i, Global) -- output dim 0"]
+  STORE --> RJ["RANGE(j, Global) -- output dim 1"]
+  RED --> MUL["MUL"]
+  RED --> RK["RANGE(k, Reduce)"]
+  MUL --> LA["LOAD(A)"]
+  MUL --> LB["LOAD(B)"]
+  LA --> AIDX["INDEX(BUFFER(A), RANGE(i), RANGE(k, 0..4, Reduce))"]
+  LB --> BIDX["INDEX(BUFFER(B), RANGE(k), RANGE(j))"]
 ```
 
 `i` 和 `j` 范围是输出维度。`k` 范围是规约（收缩）维度。
@@ -468,11 +443,11 @@ STORE
 
 单个 STORE → 单个 KERNEL：
 
-```text
-KERNEL
-├── SINK(STORE(...))
-├── ranges: [i: 0..4, j: 0..4]
-└── buffers: [C (output), A (input), B (input)]
+```mermaid
+flowchart TD
+  KERNEL["KERNEL"] --> SINK["SINK(STORE(...))"]
+  KERNEL --> RANGES["ranges: [i: 0..4, j: 0..4]"]
+  KERNEL --> BUFS["buffers: [C (output), A (input), B (input)]"]
 ```
 
 ### 阶段 4：调度

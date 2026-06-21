@@ -105,8 +105,12 @@ enum OpData {
     Unique(usize),
     LUnique(usize),
     Device(DeviceSpec),
-    // DefineLocal includes unique ID to prevent hash consing across kernels.
-    DefineLocal(usize, usize), // (slot, unique_id)
+    // DefineLocal identity is its per-kernel slot (tinygrad parity: the LDS arg is
+    // a per-kernel-deterministic index, renumbered from 0 per kernel — no global
+    // counter — so structurally-identical kernels dedup to one compile). Slots are
+    // unique within a kernel (the renderer names LDS `@local{slot}`); across kernels
+    // they're processed as independent per-kernel ASTs, so interning is harmless.
+    DefineLocal(usize), // slot
 
     // Grouped operations
     Unary(UnaryOp),
@@ -198,7 +202,7 @@ impl UOpKey {
             Op::Unique(id) => OpData::Unique(*id),
             Op::LUnique(id) => OpData::LUnique(*id),
             Op::Device(d) => OpData::Device(d.clone()),
-            Op::DefineLocal(slot) => OpData::DefineLocal(*slot, next_unique_id()),
+            Op::DefineLocal(slot) => OpData::DefineLocal(*slot),
             Op::Unary(unary_op, _) => OpData::Unary(*unary_op),
             Op::Binary(binary_op, _, _) => OpData::Binary(*binary_op),
             Op::Ternary(ternary_op, _, _, _) => OpData::Ternary(*ternary_op),

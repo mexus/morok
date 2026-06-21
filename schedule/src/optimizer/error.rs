@@ -21,6 +21,4 @@ pub enum OptError {
     UnsupportedFeature { feature: &'static str },
     #[snafu(display("optimization would exceed device limit: {limit_type} {value} > max {max}"))]
     DeviceLimitExceeded { limit_type: &'static str, value: usize, max: usize },
-    // /// Tensor core pattern not matched.
-    // TensorCoreNotMatched { reason: String },
 }

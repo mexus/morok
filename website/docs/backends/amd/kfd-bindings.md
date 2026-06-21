@@ -95,15 +95,14 @@ A handful more (`set_memory_policy`, `get_clock_counters`,
 `KfdIface::open` (`device/src/amd/iface.rs`) issues these in order, mirroring
 tinygrad's `ops_amd.py`:
 
-```text
-open /dev/kfd  (process-shared, one fd)
-open /dev/dri/renderD<minor>  (per node — the DRM render fd)
-   │
-   ├─ GET_VERSION            → capture ABI version
-   ├─ ACQUIRE_VM(drm_fd)     → register this fd as the process VM for the GPU
-   ├─ RUNTIME_ENABLE         → only if ABI ≥ 1.14
-   ├─ (event page: alloc + bind once per process, map per device)
-   └─ CREATE_EVENT × 3       → queue-signal, memory-fault, hw-exception
+```mermaid
+flowchart TD
+  A["open /dev/kfd (process-shared, one fd)"] --> B["open /dev/dri/renderD(minor) (per node — the DRM render fd)"]
+  B --> C["GET_VERSION: capture ABI version"]
+  B --> D["ACQUIRE_VM(drm_fd): register this fd as the process VM for the GPU"]
+  B --> E["RUNTIME_ENABLE: only if ABI is at least 1.14"]
+  B --> F["event page: alloc + bind once per process, map per device"]
+  B --> G["CREATE_EVENT x 3: queue-signal, memory-fault, hw-exception"]
 ```
 
 The DRM render fd is interesting: there are **no DRM ioctls**. The `drm_fd` is

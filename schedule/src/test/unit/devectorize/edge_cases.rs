@@ -415,7 +415,7 @@ fn test_fold_expanded_index_groups_contiguous() {
     use crate::rewrite::graph_rewrite;
     use svod_dtype::AddrSpace;
 
-    let buf = UOp::param(0, 64, DType::Scalar(ScalarDType::Float32).ptr(Some(64), AddrSpace::Global), None);
+    let buf = UOp::param(0, 64, DType::Scalar(ScalarDType::Float32).ptr(Some(64), AddrSpace::Global).unwrap(), None);
     let r1 = UOp::range_axis(
         UOp::const_(DType::Index, ConstValue::Int(16)),
         svod_ir::AxisId::Renumbered(0),
@@ -459,7 +459,7 @@ fn test_fold_expanded_index_no_group_scattered() {
     use crate::rewrite::graph_rewrite;
     use svod_dtype::AddrSpace;
 
-    let buf = UOp::param(0, 64, DType::Scalar(ScalarDType::Float32).ptr(Some(64), AddrSpace::Global), None);
+    let buf = UOp::param(0, 64, DType::Scalar(ScalarDType::Float32).ptr(Some(64), AddrSpace::Global).unwrap(), None);
     let r1 = UOp::range_axis(
         UOp::const_(DType::Index, ConstValue::Int(16)),
         svod_ir::AxisId::Renumbered(0),
@@ -510,10 +510,10 @@ fn test_scatternd_ptrcat_elimination() {
     use crate::devectorize::devectorize;
     use svod_dtype::AddrSpace;
 
-    let dg0 = UOp::param(0, 64, DType::Scalar(ScalarDType::Float32).ptr(Some(64), AddrSpace::Global), None);
-    let dg1 = UOp::param(1, 2, DType::Scalar(ScalarDType::Int64).ptr(Some(2), AddrSpace::Global), None);
-    let dg2 = UOp::param(2, 32, DType::Scalar(ScalarDType::Float32).ptr(Some(32), AddrSpace::Global), None);
-    let dg3 = UOp::param(3, 64, DType::Scalar(ScalarDType::Float32).ptr(Some(64), AddrSpace::Global), None);
+    let dg0 = UOp::param(0, 64, DType::Scalar(ScalarDType::Float32).ptr(Some(64), AddrSpace::Global).unwrap(), None);
+    let dg1 = UOp::param(1, 2, DType::Scalar(ScalarDType::Int64).ptr(Some(2), AddrSpace::Global).unwrap(), None);
+    let dg2 = UOp::param(2, 32, DType::Scalar(ScalarDType::Float32).ptr(Some(32), AddrSpace::Global).unwrap(), None);
+    let dg3 = UOp::param(3, 64, DType::Scalar(ScalarDType::Float32).ptr(Some(64), AddrSpace::Global).unwrap(), None);
 
     let dg0_vec = UOp::vectorize(smallvec::smallvec![dg0.clone(); 4]);
     let dg3_vec = UOp::vectorize(smallvec::smallvec![dg3.clone(); 4]);
@@ -534,13 +534,14 @@ fn test_scatternd_ptrcat_elimination() {
 
     let store_idx = UOp::new(
         Op::Index { buffer: dg0_vec.clone(), indices: smallvec::smallvec![shared_add.clone()], gate: None },
-        DType::Scalar(ScalarDType::Float32).ptr(Some(64), AddrSpace::Global),
+        DType::Scalar(ScalarDType::Float32).ptr(Some(64), AddrSpace::Global).unwrap(),
     );
     let load_idx = UOp::new(
         Op::Index { buffer: dg3_vec.clone(), indices: smallvec::smallvec![shared_add], gate: None },
-        DType::Scalar(ScalarDType::Float32).ptr(Some(64), AddrSpace::Global).vec(4),
+        DType::Scalar(ScalarDType::Float32).ptr(Some(64), AddrSpace::Global).unwrap().vec(4).unwrap(),
     );
-    let load = UOp::load().buffer(dg3_vec).index(load_idx).dtype(DType::Scalar(ScalarDType::Float32).vec(4)).call();
+    let load =
+        UOp::load().buffer(dg3_vec).index(load_idx).dtype(DType::Scalar(ScalarDType::Float32).vec(4).unwrap()).call();
 
     // Condition: Or(Eq(cast(indices[0]), row_vals), Eq(cast(indices[1]), row_vals))
     let idx1_0 =
@@ -562,7 +563,7 @@ fn test_scatternd_ptrcat_elimination() {
     let row_vconst =
         UOp::vconst(vec![ConstValue::Int(0), ConstValue::Int(1), ConstValue::Int(2), ConstValue::Int(3)], DType::Index);
     let minus_ones = UOp::vconst(vec![ConstValue::Int(-1); 4], DType::Scalar(ScalarDType::Int32));
-    let row_vals = row_vconst.cast(DType::Scalar(ScalarDType::Int32).vec(4)).add(&minus_ones);
+    let row_vals = row_vconst.cast(DType::Scalar(ScalarDType::Int32).vec(4).unwrap()).add(&minus_ones);
 
     let eq0 = UOp::vectorize(smallvec::smallvec![cast0; 4]).eq(&row_vals);
     let eq1 = UOp::vectorize(smallvec::smallvec![cast1; 4]).eq(&row_vals);

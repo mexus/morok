@@ -15,6 +15,12 @@ fn family_predicates() {
     assert!(AmdArch::Gfx1201.is_rdna4() && !AmdArch::Gfx1201.is_rdna3());
     assert!(AmdArch::Gfx1100.has_matrix_cores());
     assert!(AmdArch::Gfx942.has_matrix_cores());
+    // RDNA3.5 (Strix Halo) is its own family: not RDNA3, not CDNA, gfx11, wave32,
+    // but still a WMMA matrix-core part.
+    assert!(AmdArch::Gfx1151.is_rdna3_5() && !AmdArch::Gfx1151.is_rdna3() && !AmdArch::Gfx1151.is_cdna());
+    assert_eq!(AmdArch::Gfx1151.gfx_major(), 11);
+    assert_eq!(AmdArch::Gfx1151.wave_size(), 32);
+    assert!(AmdArch::Gfx1151.has_matrix_cores());
 }
 
 #[test]

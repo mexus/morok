@@ -30,12 +30,13 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use smallvec::SmallVec;
+use snafu::ResultExt;
 use svod_device::device::ProgramSpec;
 use svod_device::{Buffer, BufferId};
 use svod_dtype::DeviceSpec;
 use svod_ir::{CustomFunctionKind, Op, UOp};
 
-use crate::error::Result;
+use crate::error::{ExecSnafu, Result};
 use crate::kernel_cache::CachedKernel;
 use crate::profiler::KernelProfile;
 
@@ -323,9 +324,7 @@ impl ExecutionPlan {
 
         let dims =
             ProgramSpec::resolve_launch_dims(&kernel.kernel.global_size, kernel.kernel.local_size.as_ref(), &vars)
-                .map_err(|e| crate::error::Error::Execution {
-                    reason: format!("Kernel {} launch dimensions failed: {e}", kernel.id),
-                })?;
+                .context(ExecSnafu { context: format!("kernel {} launch dimensions", kernel.id) })?;
         Ok((Some(dims.global_size), dims.local_size))
     }
 
@@ -350,11 +349,19 @@ impl ExecutionPlan {
         let all_static_kernels =
             self.ops.iter().all(|op| matches!(op, PreparedOp::CompiledProgram(k) if k.runtime_vars.is_empty()));
         if !all_static_kernels || self.ops.is_empty() {
+            tracing::debug!(
+                target: "svod_runtime::graph",
+                ops = self.ops.len(),
+                compiled = self.ops.iter().filter(|o| matches!(o, PreparedOp::CompiledProgram(_))).count(),
+                with_runtime_vars =
+                    self.ops.iter().filter(|o| matches!(o, PreparedOp::CompiledProgram(k) if !k.runtime_vars.is_empty())).count(),
+                custom = self.ops.iter().filter(|o| matches!(o, PreparedOp::CustomFunction(_))).count(),
+                copies = self.ops.iter().filter(|o| matches!(o, PreparedOp::BufferCopy(_) | PreparedOp::BufferView(_))).count(),
+                "graph: per-call fallback (not all-static-compiled)"
+            );
             return Ok(None);
         }
-        let dev = crate::device_registry::DEVICE_FACTORIES
-            .device(&self.device, svod_device::registry::registry())
-            .map_err(|e| crate::error::Error::Execution { reason: format!("device lookup: {e}") })?;
+        let dev = crate::device_registry::DEVICE_FACTORIES.device(&self.device, svod_device::registry::registry())?;
         let Some(factory) = dev.graph.clone() else { return Ok(None) };
         // Capture in the SAME order `execute` runs the kernels — flatten
         // `op_levels` (level-by-level, intra-level in index order), NOT the flat
@@ -436,7 +443,9 @@ impl ExecutionPlan {
                 });
             }
         }
-        factory(&kernels).map_err(|e| crate::error::Error::Execution { reason: format!("graph capture: {e}") })
+        let result = factory(&kernels).context(ExecSnafu { context: "graph capture" })?;
+        tracing::debug!(target: "svod_runtime::graph", kernels = kernels.len(), captured = result.is_some(), "graph: capture result");
+        Ok(result)
     }
 
     /// Lazily mint (once) the plan's execution context from `program` and cache
@@ -448,9 +457,7 @@ impl ExecutionPlan {
         if let Some(slot) = self.plan_ctx.get() {
             return Ok(slot.as_deref());
         }
-        let ctx = program
-            .new_exec_context()
-            .map_err(|e| crate::error::Error::Execution { reason: format!("exec context: {e}") })?;
+        let ctx = program.new_exec_context().context(ExecSnafu { context: "mint plan exec context" })?;
         // One-shot init race: if two threads see empty, both mint; only one wins
         // `set()`. The loser's context drops here harmlessly (its `Arc` over the
         // shared queue just decrements).
@@ -458,11 +465,16 @@ impl ExecutionPlan {
         Ok(self.plan_ctx.get().expect("set above").as_deref())
     }
 
-    /// Submit one kernel. Returns the dispatch's HW timestamp handle when the
-    /// backend stamps dispatches — `None` otherwise (e.g. CPU). The non-profiled
-    /// `execute` path drops it.
+    /// Submit one kernel. When `profile` is set and the backend stamps
+    /// dispatches, returns the dispatch's HW timestamp handle (`None` otherwise,
+    /// e.g. CPU); the caller must hold it until after `synchronize`. The
+    /// non-profiled `execute` path passes `false` and drops the handle.
     #[inline]
-    fn execute_kernel(&self, kernel: &PreparedKernel) -> Result<Option<Arc<dyn svod_device::DispatchTimestamps>>> {
+    fn execute_kernel(
+        &self,
+        kernel: &PreparedKernel,
+        profile: bool,
+    ) -> Result<Option<Arc<dyn svod_device::DispatchTimestamps>>> {
         let buffer_ptrs: SmallVec<[*mut u8; 8]> = kernel.buffer_ptrs.iter().map(|&ptr| ptr as *mut u8).collect();
         let (global_size, local_size) = Self::kernel_launch_sizes(kernel)?;
         let program = kernel.kernel.program.as_ref();
@@ -470,8 +482,8 @@ impl ExecutionPlan {
         // plan's kernels share one queue. Others (CPU) return `None` and fall
         // back to per-call `Program::execute`.
         if let Some(ctx) = self.plan_ctx(program)? {
-            return unsafe { ctx.dispatch(program, &buffer_ptrs, &kernel.vals, global_size, local_size) }
-                .map_err(|e| crate::error::Error::Execution { reason: format!("Kernel {} failed: {e}", kernel.id) });
+            return unsafe { ctx.dispatch(program, &buffer_ptrs, &kernel.vals, global_size, local_size, profile) }
+                .context(ExecSnafu { context: format!("dispatch kernel {}", kernel.id) });
         }
         unsafe {
             program
@@ -479,7 +491,7 @@ impl ExecutionPlan {
                 // device timeline; host reads (copyout / as_*) synchronize.
                 .execute(&buffer_ptrs, &kernel.vals, global_size, local_size, /*wait=*/ false)
                 .map(|_| None)
-                .map_err(|e| crate::error::Error::Execution { reason: format!("Kernel {} failed: {e}", kernel.id) })
+                .context(ExecSnafu { context: format!("execute kernel {}", kernel.id) })
         }
     }
 
@@ -576,8 +588,7 @@ impl ExecutionPlan {
 
         let mut dst = self.buffers[dst_idx].clone();
         let src = &self.buffers[src_idx];
-        dst.copy_from(src)
-            .map_err(|e| crate::error::Error::Execution { reason: format!("Copy op {} failed: {}", copy.id, e) })
+        dst.copy_from(src).context(ExecSnafu { context: format!("copy op {}", copy.id) })
     }
 
     #[inline]
@@ -664,7 +675,7 @@ impl ExecutionPlan {
     #[inline]
     fn execute_op(&self, op: &PreparedOp) -> Result<()> {
         match op {
-            PreparedOp::CompiledProgram(kernel) => self.execute_kernel(kernel).map(|_| ()),
+            PreparedOp::CompiledProgram(kernel) => self.execute_kernel(kernel, /*profile=*/ false).map(|_| ()),
             PreparedOp::BufferCopy(copy) => self.execute_copy(copy),
             PreparedOp::BufferView(view) => self.execute_buffer_view(view),
             PreparedOp::CustomFunction(custom) => self.execute_custom_function(custom),
@@ -724,8 +735,7 @@ impl ExecutionPlan {
             let (a, b) = self.buffers.split_at_mut(dst_index);
             (&mut b[0], &a[src_index])
         };
-        dst.copy_region_from(dst_off, src, src_off, len)
-            .map_err(|e| crate::error::Error::Execution { reason: format!("on-device state copy: {e}") })
+        dst.copy_region_from(dst_off, src, src_off, len).context(ExecSnafu { context: "on-device state copy" })
     }
 
     /// Get a buffer by AST id (for reading intermediate results).
@@ -796,9 +806,7 @@ impl ExecutionPlan {
         // Fast path: one captured graph submit instead of per-kernel dispatch.
         // Built once, then every call just replays.
         if let Some(graph) = self.graph().as_deref() {
-            return graph
-                .replay(&[])
-                .map_err(|e| crate::error::Error::Execution { reason: format!("graph replay failed: {e}") });
+            return graph.replay(&[]).context(ExecSnafu { context: "graph replay" });
         }
         for level in &self.op_levels {
             for &idx in level {
@@ -839,7 +847,7 @@ impl ExecutionPlan {
                 match &self.ops[idx] {
                     PreparedOp::CompiledProgram(kernel) => {
                         let start = Instant::now();
-                        let handle = self.execute_kernel(kernel)?;
+                        let handle = self.execute_kernel(kernel, /*profile=*/ true)?;
                         handles.push(handle);
                         profiles.push(KernelProfile {
                             kernel: Arc::clone(&kernel.kernel),
@@ -861,8 +869,7 @@ impl ExecutionPlan {
             // context was minted; drain it so the GPU has written back the
             // per-dispatch timestamps before we read them.
             if let Some(ctx) = self.plan_ctx.get().and_then(|s| s.as_deref()) {
-                ctx.synchronize()
-                    .map_err(|e| crate::error::Error::Execution { reason: format!("profiled drain: {e}") })?;
+                ctx.synchronize().context(ExecSnafu { context: "profiled drain" })?;
             }
             for (profile, handle) in profiles.iter_mut().zip(&handles) {
                 if let Some((start, end)) = handle.as_ref().and_then(|h| h.timestamps_ns()) {
@@ -904,9 +911,10 @@ impl ExecutionPlan {
         self.execute_profiled()
     }
 
-    /// Get the first output buffer index.
-    pub fn output_buffer_idx(&self) -> usize {
-        self.output_buffer_indices[0]
+    /// Get the first output buffer index, or `None` for an output-less plan
+    /// (mirrors [`Self::output_buffer`], which also returns `Option`).
+    pub fn output_buffer_idx(&self) -> Option<usize> {
+        self.output_buffer_indices.first().copied()
     }
 
     /// Get the AST ID to buffer index mapping.

@@ -187,11 +187,7 @@ impl FireRedVad {
     /// (model weights + `cmvn_means`/`cmvn_istd` stats).
     pub fn from_safetensors(path: &Path) -> Result<Self> {
         let sd = state::load_safetensors(path).context(StateSnafu)?;
-        let get = |key: &str| -> Result<Tensor> {
-            sd.get(key)
-                .cloned()
-                .ok_or_else(|| Error::State { source: Box::new(state::Error::MissingKey { key: key.to_string() }) })
-        };
+        let get = |key: &str| -> Result<Tensor> { state::get_tensor(&sd, key).context(StateSnafu) };
         let fsmn = |prefix: &str| -> Result<Fsmn> {
             Ok(Fsmn {
                 lookback: get(&format!("{prefix}.lookback.weight"))?,

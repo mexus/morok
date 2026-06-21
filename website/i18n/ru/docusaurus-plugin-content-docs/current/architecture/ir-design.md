@@ -10,19 +10,29 @@ sidebar_label: Философия IR
 
 Svod использует другой подход, заимствованный у [Tinygrad](https://github.com/tinygrad/tinygrad): **один IR от тензоров до машинного кода**.
 
-```text
-┌──────────────────┐   ┌─────────────────┐   ┌───────────────┐
-│    TensorFlow    │   │     PyTorch     │   │     Svod      │
-├──────────────────┤   ├─────────────────┤   ├───────────────┤
-│   Python API     │   │   Python API    │   │  Rust/Python  │
-│   TF Graph       │   │   FX Graph      │   │       ↓       │
-│   XLA HLO        │   │   Inductor IR   │   │    UOp IR     │
-│   MLIR dialects  │   │   Triton IR     │   │       ↓       │
-│   LLVM IR        │   │   LLVM/PTX      │   │  Machine code │
-│   Machine code   │   │   Machine code  │   │               │
-├──────────────────┤   ├─────────────────┤   ├───────────────┤
-│      5 IRs       │   │      4 IRs      │   │     1 IR      │
-└──────────────────┘   └─────────────────┘   └───────────────┘
+```mermaid
+flowchart TD
+  subgraph TF["TensorFlow (5 IRs)"]
+    direction TB
+    TF1["Python API"] --> TF2["TF Graph"]
+    TF2 --> TF3["XLA HLO"]
+    TF3 --> TF4["MLIR dialects"]
+    TF4 --> TF5["LLVM IR"]
+    TF5 --> TF6["Machine code"]
+  end
+  subgraph PT["PyTorch (4 IRs)"]
+    direction TB
+    PT1["Python API"] --> PT2["FX Graph"]
+    PT2 --> PT3["Inductor IR"]
+    PT3 --> PT4["Triton IR"]
+    PT4 --> PT5["LLVM/PTX"]
+    PT5 --> PT6["Machine code"]
+  end
+  subgraph SV["Svod (1 IR)"]
+    direction TB
+    SV1["Rust/Python"] --> SV2["UOp IR"]
+    SV2 --> SV3["Machine code"]
+  end
 ```
 
 Простейшая архитектура часто выигрывает. Эта глава объясняет, как один хорошо спроектированный IR может заменить целый стек компилятора.
@@ -70,18 +80,18 @@ Enum содержит ~60 вариантов Op, организованных п
 
 При печати UOp-графа видна его древовидная структура:
 
-```text
-[42] STORE : Void
-├── [35] INDEX : Ptr<Float32>
-│   ├── [10] DEFINE_GLOBAL(0) : Ptr<Float32>
-│   └── [30] RANGE(axis=0, Reduce) : Index
-│       └── [5] CONST(4) : Index
-├── [40] REDUCE(Add) : Float32
-│   ├── [38] MUL : Float32
-│   │   ├── [36] LOAD : Float32
-│   │   └── [37] LOAD : Float32
-│   └── [30] → (same RANGE as above)
-└── [30] → (same RANGE as above)
+```mermaid
+flowchart TD
+  N42["[42] STORE : Void"] --> N35["[35] INDEX : Ptr(Float32)"]
+  N42 --> N40["[40] REDUCE(Add) : Float32"]
+  N42 --> N30["[30] RANGE(axis=0, Reduce) : Index"]
+  N35 --> N10["[10] DEFINE_GLOBAL(0) : Ptr(Float32)"]
+  N35 --> N30
+  N30 --> N5["[5] CONST(4) : Index"]
+  N40 --> N38["[38] MUL : Float32"]
+  N40 --> N30
+  N38 --> N36["[36] LOAD : Float32"]
+  N38 --> N37["[37] LOAD : Float32"]
 ```
 
 Обратите внимание на стрелки «(same RANGE as above)»? Это не просто красивый вывод — это фундаментальное свойство, называемое **hash consing**.
@@ -143,16 +153,16 @@ ReduceSum(data, axes=[1], keepdims=0)
 
 Svod делает циклы *явными* через операции `RANGE`. Та же редукция становится:
 
-```text
-[REDUCE(Add)]
-├── [LOAD]
-│   └── [INDEX]
-│       ├── [BUFFER]
-│       ├── [RANGE(axis=0, Global)]   # outer loop (parallelized)
-│       │   └── [CONST(128)]
-│       └── [RANGE(axis=1, Reduce)]   # reduction loop
-│           └── [CONST(64)]
-└── [RANGE(axis=1, Reduce)]           # same RANGE via hash consing
+```mermaid
+flowchart TD
+  RED["REDUCE(Add)"] --> LD["LOAD"]
+  RED --> R1["RANGE(axis=1, Reduce) reduction loop"]
+  LD --> IDX["INDEX"]
+  IDX --> BUF["BUFFER"]
+  IDX --> R0["RANGE(axis=0, Global) outer loop, parallelized"]
+  IDX --> R1
+  R0 --> C128["CONST(128)"]
+  R1 --> C64["CONST(64)"]
 ```
 
 Каждый `RANGE` имеет **AxisType**, который говорит кодогенератору, как его компилировать:
@@ -240,14 +250,14 @@ After Add:      x                 # Add(x, 0) → x
 
 Когда вы пишете `A.matmul(&B)`, Svod строит высокоуровневый UOp-граф:
 
-```text
-[REDUCE_AXIS(Add, axes=[2])]
-├── [MUL]
-│   ├── [EXPAND]           # A: [4,4] → [4,4,4]
-│   │   └── [BUFFER(A)]
-│   └── [EXPAND]           # B: [4,4] → [4,4,4]
-│       └── [PERMUTE]      # transpose for broadcasting
-│           └── [BUFFER(B)]
+```mermaid
+flowchart TD
+  RA["REDUCE_AXIS(Add, axes=[2])"] --> MUL["MUL"]
+  MUL --> EA["EXPAND (A: [4,4] to [4,4,4])"]
+  MUL --> EB["EXPAND (B: [4,4] to [4,4,4])"]
+  EA --> BA["BUFFER(A)"]
+  EB --> PERM["PERMUTE (transpose for broadcasting)"]
+  PERM --> BB["BUFFER(B)"]
 ```
 
 Это чистая математика: «расширяем A и B для выравнивания размерностей, поэлементно умножаем, суммируем по свёрнутой оси».
@@ -256,28 +266,28 @@ After Add:      x                 # Add(x, 0) → x
 
 Проход rangeify конвертирует movement-операции (`EXPAND`, `PERMUTE`) в явные вычисления индексов с `RANGE`-циклами:
 
-```text
-[STORE]
-├── [INDEX]
-│   ├── [DEFINE_GLOBAL(C)]
-│   ├── [RANGE(i, Global)]     # i ∈ [0, 4)
-│   │   └── [CONST(4)]
-│   └── [RANGE(j, Global)]     # j ∈ [0, 4)
-│       └── [CONST(4)]
-├── [REDUCE(Add)]
-│   ├── [MUL]
-│   │   ├── [LOAD(A)]
-│   │   │   └── [INDEX]
-│   │   │       ├── [RANGE(i)]     # same i (hash consing)
-│   │   │       └── [RANGE(k, Reduce)]
-│   │   └── [LOAD(B)]
-│   │       └── [INDEX]
-│   │           ├── [RANGE(k)]     # same k
-│   │           └── [RANGE(j)]     # same j
-│   └── [RANGE(k, Reduce)]         # k ∈ [0, 4)
-│       └── [CONST(4)]
-├── [RANGE(j, Global)]          # output dim 1 (closed)
-└── [RANGE(i, Global)]          # output dim 0 (closed)
+```mermaid
+flowchart TD
+  STORE["STORE"] --> IDXC["INDEX"]
+  STORE --> RED["REDUCE(Add)"]
+  STORE --> RJ["RANGE(j, Global) j in [0, 4)"]
+  STORE --> RI["RANGE(i, Global) i in [0, 4)"]
+  IDXC --> DG["DEFINE_GLOBAL(C)"]
+  IDXC --> RI
+  IDXC --> RJ
+  RED --> MUL["MUL"]
+  RED --> RK["RANGE(k, Reduce) k in [0, 4)"]
+  MUL --> LA["LOAD(A)"]
+  MUL --> LB["LOAD(B)"]
+  LA --> IDXA["INDEX (A)"]
+  IDXA --> RI
+  IDXA --> RK
+  LB --> IDXB["INDEX (B)"]
+  IDXB --> RK
+  IDXB --> RJ
+  RI --> C4["CONST(4)"]
+  RJ --> C4
+  RK --> C4
 ```
 
 Теперь видна структура циклов: `i` и `j` — `Global` (параллелизованы), `k` — `Reduce` (аккумулируется).

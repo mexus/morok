@@ -81,43 +81,31 @@ Example:  [a, b, c, d] → one vector containing all four
 二者配合：UPCAST 标记向量化意图 → UNROLL 展开 → CONTRACT 组合。
 
 **UPCAST range → VECTORIZE**：
-```text
-// Before: UPCAST marks vectorization intent
-RANGE(end=4, UPCAST)
-      ↓ [pm_pre_expander]
-// Step 1: Convert to UNROLL with constant indices
-UNROLL(VCONST([0, 1, 2, 3]))
-      ↓ [expander]
-// Step 2: Expand operations with UNROLL sources
-// Operations now have unrolled sources
-      ↓ [CONTRACT or implicit]
-// After: explicit VECTORIZE
-VECTORIZE(op[0], op[1], op[2], op[3])
+```mermaid
+flowchart TD
+  A["Before: UPCAST marks vectorization intent. RANGE(end=4, UPCAST)"]
+  A -->|"pm_pre_expander"| B["Step 1: Convert to UNROLL with constant indices. UNROLL(VCONST([0, 1, 2, 3]))"]
+  B -->|"expander"| C["Step 2: Expand operations with UNROLL sources. Operations now have unrolled sources"]
+  C -->|"CONTRACT or implicit"| D["After: explicit VECTORIZE. VECTORIZE(op[0], op[1], op[2], op[3])"]
 ```
 
 **UNROLL range → 重复操作**：
 
 当我们说"操作被复制"时，听起来像是复制粘贴。但实际上不是。编译器创建的是单条 SIMD 指令，同时处理所有 N 个元素。把 SIMD 寄存器想象成一个装着 4 个数字的盒子；两个盒子相加就是 8 个数字同时相加。
 
-```text
-// Before: UPCAST marks vectorization intent
-RANGE(end=3, UPCAST)
-      ↓ [pm_pre_expander]
-// Step 1: Convert to UNROLL
-UNROLL(VCONST([0, 1, 2]))
-      ↓ [expander]
-// Step 2: Operations expand to handle all positions
-// After: operations processed together (not duplicated)
-UNROLL([op_at_0, op_at_1, op_at_2])
+```mermaid
+flowchart TD
+  A["Before: UPCAST marks vectorization intent. RANGE(end=3, UPCAST)"]
+  A -->|"pm_pre_expander"| B["Step 1: Convert to UNROLL. UNROLL(VCONST([0, 1, 2]))"]
+  B -->|"expander"| C["Step 2: Operations expand to handle all positions. After: operations processed together (not duplicated). UNROLL([op_at_0, op_at_1, op_at_2])"]
 ```
 
 **UNROLL/END/CONTRACT 交互**：
-```text
-Before: END(STORE(...), [RANGE(UPCAST)])
-             ↓ [pm_pre_expander]
-Step 1: END(STORE(...), [UNROLL(VCONST([0,1,2,3]))])
-             ↓ [expander]
-Step 2: END(CONTRACT(STORE(...×4)), [])
+```mermaid
+flowchart TD
+  A["Before: END(STORE(...), [RANGE(UPCAST)])"]
+  A -->|"pm_pre_expander"| B["Step 1: END(STORE(...), [UNROLL(VCONST([0,1,2,3]))])"]
+  B -->|"expander"| C["Step 2: END(CONTRACT(STORE(...x4)), [])"]
 ```
 
 **穿过 AFTER/END 的广播**：
@@ -130,15 +118,14 @@ AFTER(VECTORIZE([x, x, x, x]), deps) → VECTORIZE([AFTER(x, deps), AFTER(x, dep
 
 GROUP_REDUCE 是张量核心规约的特殊轴类型：
 
-```text
-// Before: REDUCE with GROUP_REDUCE ranges
-REDUCE(src, [range(GROUP_REDUCE)])
-           ↓ [pm_group_for_reduce]
-// After: Shared memory reduction pattern
-1. Track upstream LOCAL ranges
-2. BUFFERIZE result with group ranges (AddrSpace.LOCAL)
-3. INDEX into buffer with transformed ranges
-4. Final REDUCE with axes (range_id+100, AxisType.REDUCE)
+```mermaid
+flowchart TD
+  A["Before: REDUCE with GROUP_REDUCE ranges. REDUCE(src, [range(GROUP_REDUCE)])"]
+  A -->|"pm_group_for_reduce"| B["After: Shared memory reduction pattern"]
+  B --> S1["1. Track upstream LOCAL ranges"]
+  B --> S2["2. BUFFERIZE result with group ranges (AddrSpace.LOCAL)"]
+  B --> S3["3. INDEX into buffer with transformed ranges"]
+  B --> S4["4. Final REDUCE with axes (range_id+100, AxisType.REDUCE)"]
 ```
 
 这实现了通过共享内存进行高效的张量核心累加。

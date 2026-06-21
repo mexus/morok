@@ -4,9 +4,10 @@
 //! including relu, sigmoid, tanh, softmax, and their variants.
 
 use bon::bon;
-use snafu::ResultExt;
+use snafu::{OptionExt, ResultExt, ensure};
 use svod_ir::{ConstValue, UOp};
 
+use crate::error::{DivisibilitySnafu, SymbolicShapeUnsupportedSnafu};
 use crate::reduce::AxisSpec;
 use crate::{Result, Tensor, error::UOpSnafu};
 
@@ -323,8 +324,11 @@ impl Tensor {
         let shape = self.shape()?;
         let ndim = shape.len();
         let axis = if dim < 0 { (ndim as isize + dim) as usize } else { dim as usize };
-        let full_size = shape[axis].as_const().expect("GLU dim must be concrete");
-        assert!(full_size % 2 == 0, "GLU dimension must be even, got {full_size}");
+        let full_size = shape[axis].as_const().context(SymbolicShapeUnsupportedSnafu { operation: "glu" })?;
+        ensure!(
+            full_size % 2 == 0,
+            DivisibilitySnafu { op: "glu", lhs_name: "dim size", lhs: full_size, rhs_name: "2", rhs: 2usize }
+        );
         let half = full_size / 2;
         let halves = self.split(&[half, half], dim)?;
         let gate = halves[1].sigmoid()?;

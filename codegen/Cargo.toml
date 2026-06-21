@@ -17,6 +17,7 @@ snafu = "0.8.9"
 itertools = "0.14.0"
 tracing = "0.1"
 melior = { version = "0.26.3", features = ["ods-dialects"], optional = true }
+smallvec.workspace = true
 
 [features]
 default = []
@@ -25,5 +26,4 @@ tracing-verbose = []
 mlir = ["dep:melior"]
 
 [dev-dependencies]
-smallvec = { workspace = true }
 test-case = "3.3.1"

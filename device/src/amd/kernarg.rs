@@ -66,7 +66,7 @@ impl KernargArena {
         let buffer = allocator.alloc_uncached(ARENA_BYTES)?;
         let (base_gpu, base_host) = match &buffer {
             RawBuffer::AmdDevice { gpu_addr, host_ptr: Some(h), .. } => (*gpu_addr, *h),
-            _ => return Err(Error::AmdAllocFailed { reason: "kernarg arena requires host-visible buffer".into() }),
+            _ => return Err(Error::NotHostVisible { what: "kernarg arena" }),
         };
         Ok(Box::new(Self {
             base_gpu,

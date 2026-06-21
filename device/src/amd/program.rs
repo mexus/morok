@@ -302,7 +302,7 @@ impl AmdProgram {
         let code_buf = allocator.alloc(size, &opts, /*zero=*/ false)?;
         let (code_gpu, code_host) = match &code_buf {
             RawBuffer::AmdDevice { gpu_addr, host_ptr: Some(h), .. } => (*gpu_addr, *h),
-            _ => return Err(Error::AmdAllocFailed { reason: "code object requires host-visible AMD buffer".into() }),
+            _ => return Err(Error::NotHostVisible { what: "code object" }),
         };
         // SAFETY: code_host points to size bytes we just mmapped exclusively.
         unsafe { std::ptr::copy_nonoverlapping(parsed.image.as_ptr(), code_host.as_ptr(), parsed.image.len()) };
@@ -589,11 +589,14 @@ impl AmdProgram {
     /// VAs that outlive the dispatch, `vals` must match the kernel's variable
     /// arity, and launch dims must be valid for the kernel descriptor.
     ///
-    /// Returns the dispatch's AQL completion signal so a profiler can read its
-    /// CP-stamped `start_ts`/`end_ts` after retirement (queues run with
-    /// ENABLE_PROFILING). `None` on the PM4 path (counter-based completion,
-    /// no per-dispatch signal).
-    #[allow(clippy::missing_safety_doc)]
+    /// Returns a signal carrying the dispatch's `start_ts`/`end_ts` so a profiler
+    /// can read on-device kernel time after retirement. On AQL the CP auto-stamps
+    /// it (queues run with ENABLE_PROFILING). On the single-XCC PM4 path the CP
+    /// does not auto-stamp, so when `profile` is set we bracket the dispatch with
+    /// two GPU-clock RELEASE_MEM probes into a scratch signal's ts fields and
+    /// return it; `None` on the PM4 path when `profile` is unset (fire-and-forget,
+    /// no extra signal/packets).
+    #[allow(clippy::missing_safety_doc, clippy::too_many_arguments)]
     pub unsafe fn execute_on(
         &self,
         owner: &crate::amd::connector::OwnerCtx,
@@ -602,6 +605,7 @@ impl AmdProgram {
         global_size: Option<[usize; 3]>,
         local_size: Option<[usize; 3]>,
         wait: bool,
+        profile: bool,
     ) -> Result<Option<Arc<crate::amd::signal::AmdSignal>>> {
         let pool = owner.pool();
         // Device poisoned by an earlier fault: refuse to dispatch (the GPU
@@ -711,6 +715,23 @@ impl AmdProgram {
             // PM4 single-XCC path: completion via the queue's monotonic PM4
             // counter (RELEASE_MEM); record this owner's high value so its
             // owner-local `synchronize` waits exactly this dispatch.
+            //
+            // The PM4 CP does not auto-stamp dispatches (no ENABLE_PROFILING as
+            // on AQL), so for a profiling dispatch we acquire a scratch signal,
+            // `arm(0)` it (value 0 → `is_done()`, ts fields zeroed), and bracket
+            // the dispatch with two GPU-clock RELEASE_MEM probes into its
+            // start/end ts fields. `profile` is threaded from the caller and is
+            // set ONLY by callers that retain the returned handle until after
+            // `synchronize` (the fire-and-forget execute path passes `false`), so
+            // the slot can't be reused while the GPU is still writing it.
+            let ts = if profile {
+                let s = pool.acquire_signal()?;
+                s.arm(0);
+                Some(s)
+            } else {
+                None
+            };
+            let ts_addrs = ts.as_ref().map(|s| (s.start_ts_addr(), s.end_ts_addr()));
             let v = queue.dispatch_pm4(
                 pool,
                 self.rsrc1,
@@ -723,6 +744,7 @@ impl AmdProgram {
                 [g[0] as u32, g[1] as u32, g[2] as u32],
                 self.wave32,
                 self.target_major,
+                ts_addrs,
             )?;
             owner.set_pm4_high(v);
             // Release the dispatch lock before the (up to 30 s) blocking wait so
@@ -732,7 +754,7 @@ impl AmdProgram {
             if wait {
                 owner.synchronize()?;
             }
-            Ok(None)
+            Ok(ts)
         } else {
             // AQL path: completion via the kernel packet's own native
             // `completion_signal` (the packet processor decrements the countdown
@@ -804,7 +826,9 @@ impl Program for AmdProgram {
         // candidate. A KFD queue can't be recovered once faulted; the search
         // stays useful by *avoiding* faults (resource caps in the action
         // filter).
-        unsafe { self.execute_on(&owner, buffers, vals, global_size, local_size, wait)? };
+        unsafe {
+            self.execute_on(&owner, buffers, vals, global_size, local_size, wait, /*profile=*/ false)?
+        };
         Ok(())
     }
 

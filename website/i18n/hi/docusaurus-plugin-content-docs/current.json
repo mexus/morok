@@ -14,5 +14,9 @@
   "sidebar.defaultSidebar.doc.Introduction": {
     "message": "परिचय",
     "description": "The label for the doc item 'Introduction' in sidebar 'defaultSidebar', linking to the doc introduction"
+  },
+  "sidebar.defaultSidebar.category.Tile Kernels (tk)": {
+    "message": "Tile कर्नेल (tk)",
+    "description": "The label for category 'Tile Kernels (tk)' in sidebar 'defaultSidebar'"
   }
 }

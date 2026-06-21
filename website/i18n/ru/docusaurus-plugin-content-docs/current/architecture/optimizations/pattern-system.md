@@ -9,19 +9,22 @@ sidebar_position: 0
 
 Svod использует другой подход: **один механизм для всего**.
 
-```text
-Traditional Compiler:              Svod:
-┌─────────────────────────┐       ┌─────────────────────────┐
-│  Constant Folding       │       │                         │
-│  Dead Code Elimination  │       │   patterns! {           │
-│  Loop Unrolling         │       │       Add[x, @zero] ~> x│
-│  Operator Fusion        │       │       Mul[x, @zero] ~> 0│
-│  Vectorization          │       │       // ...more        │
-│  Memory Planning        │       │   }                     │
-│  ...20 more passes      │       │                         │
-└─────────────────────────┘       │   graph_rewrite(...)    │
-     Custom logic each            └─────────────────────────┘
-                                       One mechanism
+```mermaid
+flowchart LR
+  subgraph T["Traditional Compiler (custom logic each)"]
+    direction TB
+    T1["Constant Folding"]
+    T2["Dead Code Elimination"]
+    T3["Loop Unrolling"]
+    T4["Operator Fusion"]
+    T5["Vectorization"]
+    T6["Memory Planning"]
+    T7["...20 more passes"]
+  end
+  subgraph S["Svod (one mechanism)"]
+    direction TB
+    S1["patterns! (Add, Mul, ...more)"] --> S2["graph_rewrite(...)"]
+  end
 ```
 
 Каждая оптимизация в Svod выражается как **паттерн**: «когда видишь эту структуру, замени её вот этой». Одна и та же функция `graph_rewrite()` применяет [алгебраическое упрощение](./algebraic-simplification.md), [индексную арифметику](./index-arithmetic.md), [снижение стоимости](./strength-reduction.md) и [оптимизацию диапазонов](./range-optimization.md).
@@ -174,11 +177,13 @@ WHERE(Lt(3, 5), t, f)
 
 После перезаписи дочерних узлов перестраиваем узел с новыми потомками и снова пробуем паттерны:
 
-```text
-Stage 0: WHERE(Lt(3, 5), t, f)     → Gate (no match, process children)
-         └── Lt(3, 5)              → true (constant folding matches!)
-
-Stage 1: WHERE(true, t, f)         → t (dead code elimination matches!)
+```mermaid
+flowchart TD
+  A["Stage 0: WHERE(Lt(3, 5), t, f)"] -->|"no match, process children"| B["Gate"]
+  A --> C["Lt(3, 5)"]
+  C -->|"constant folding matches"| D["true"]
+  D --> E["Stage 1: WHERE(true, t, f)"]
+  E -->|"dead code elimination matches"| F["t"]
 ```
 
 Стадия реконструкции повторно применяет паттерны, что позволяет многошаговым оптимизациям сработать за один обход.

@@ -235,7 +235,7 @@ fn test_do_compile_rejects_empty_source_stage() {
 
 #[test]
 fn test_do_linearize_emits_cleaned_linear_stage() {
-    let ptr_dtype = DType::Float32.ptr(None, AddrSpace::Global);
+    let ptr_dtype = DType::Float32.ptr(None, AddrSpace::Global).unwrap();
     let out = UOp::param(0, 16, ptr_dtype, None);
     let idx = UOp::index_const(0);
     let gate = UOp::native_const(true);

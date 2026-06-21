@@ -135,7 +135,7 @@ fn test_index_cast_from_int() {
 #[test]
 fn test_vector_dtype_returns_none() {
     let value = ConstValue::Int(42);
-    let vec_dtype = DType::Scalar(ScalarDType::Int32).vec(4);
+    let vec_dtype = DType::Scalar(ScalarDType::Int32).vec(4).unwrap();
     // Vector dtypes have no scalar() so should return None early
     assert_eq!(value.cast(&vec_dtype), None);
 }

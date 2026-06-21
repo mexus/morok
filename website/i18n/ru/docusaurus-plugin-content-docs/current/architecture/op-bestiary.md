@@ -52,9 +52,9 @@ Range {
 Приоритет определяет порядок вложенности — меньшие значения соответствуют внешним циклам. Границы ядер выражаются структурно через `Call`/`Function`, без выделенного типа оси.
 
 **Пример:**
-```text
-RANGE(end=128, axis_id=R0, type=Global)
-└── CONST(128) : Index
+```mermaid
+flowchart TD
+  R["RANGE(end=128, axis_id=R0, type=Global)"] --> C["CONST(128) : Index"]
 ```
 
 ### END — закрытие скоупа цикла
@@ -69,11 +69,11 @@ End {
 END закрывает один или несколько скоупов RANGE и убирает их из активного набора. Можно закрыть несколько RANGE одновременно.
 
 **Пример:**
-```text
-END
-├── STORE(...)           — computation
-├── RANGE(R0, Global)    — first range closed
-└── RANGE(R1, Local)     — second range closed
+```mermaid
+flowchart TD
+  E["END"] -->|"computation"| S["STORE(...)"]
+  E -->|"first range closed"| R0["RANGE(R0, Global)"]
+  E -->|"second range closed"| R1["RANGE(R1, Local)"]
 ```
 
 ---
@@ -95,9 +95,9 @@ ReduceAxis {
 Используется **до** rangeify. Работает по измерениям тензора, как `.sum(axis=0)` в NumPy.
 
 **Пример:**
-```text
-REDUCE_AXIS(Add, axes=[1])
-└── BUFFER[10, 20] : Float32
+```mermaid
+flowchart TD
+  RA["REDUCE_AXIS(Add, axes=[1])"] --> B["BUFFER[10, 20] : Float32"]
 ```
 
 Редуцирует тензор `[10, 20]` до `[10]`, суммируя по оси 1.
@@ -126,13 +126,13 @@ Reduce {
 > **Совместимость:** Спецификация Tinygrad ограничивает REDUCE_AXIS до `{Add, Mul, Max}`. Svod расширяет это добавлением `Min`.
 
 **Пример:**
-```text
-REDUCE(Add)
-├── MUL                      — value to accumulate
-│   ├── LOAD(A, ...)
-│   └── LOAD(B, ...)
-└── RANGE(R2, Reduce)        — range being reduced
-    └── CONST(64)
+```mermaid
+flowchart TD
+  RED["REDUCE(Add)"] -->|"value to accumulate"| MUL["MUL"]
+  MUL --> LA["LOAD(A, ...)"]
+  MUL --> LB["LOAD(B, ...)"]
+  RED -->|"range being reduced"| R2["RANGE(R2, Reduce)"]
+  R2 --> C["CONST(64)"]
 ```
 
 ### ALLREDUCE — редукция между устройствами
@@ -184,11 +184,11 @@ Bufferize {
 | `removable` | `bool` | При `false` `buffer_removal` не имеет права инлайнить эту BUFFERIZE — используется на границах realize с несколькими потребителями, чтобы буфер сохранялся между итерациями фикспоинта мега-прохода |
 
 **Пример:**
-```text
-BUFFERIZE(opts={addrspace=Global})
-├── REDUCE(Add, ...)         — computation
-├── RANGE(R0, Global)        — output dim 0
-└── RANGE(R1, Global)        — output dim 1
+```mermaid
+flowchart TD
+  BZ["BUFFERIZE(opts=(addrspace=Global))"] -->|"computation"| RED["REDUCE(Add, ...)"]
+  BZ -->|"output dim 0"| R0["RANGE(R0, Global)"]
+  BZ -->|"output dim 1"| R1["RANGE(R1, Global)"]
 ```
 
 ### INDEX — многомерный доступ к буферу
@@ -204,12 +204,12 @@ Index {
 Вычисляет адрес в памяти из многомерных индексов. Возвращает DType элемента (не указатель).
 
 **Пример:**
-```text
-INDEX : Float32
-├── PARAM(0)
-├── RANGE(R0, Global)        — index for dim 0
-├── RANGE(R1, Loop)          — index for dim 1
-└── MUL(...)                 — index for dim 2
+```mermaid
+flowchart TD
+  IDX["INDEX : Float32"] --> P["PARAM(0)"]
+  IDX -->|"index for dim 0"| R0["RANGE(R0, Global)"]
+  IDX -->|"index for dim 1"| R1["RANGE(R1, Loop)"]
+  IDX -->|"index for dim 2"| M["MUL(...)"]
 ```
 
 ### POINTER_INDEX — низкоуровневая арифметика указателей
@@ -238,13 +238,13 @@ Load {
 Читает значение из буфера по индексу. Для gated loads поле `alt` задаёт значение при ложном условии INDEX-а (позволяет полностью избежать обращения к памяти).
 
 **Пример:**
-```text
-LOAD : Float32
-├── PARAM(1)
-└── INDEX
-    ├── PARAM(1)
-    ├── RANGE(R0)
-    └── RANGE(R2)
+```mermaid
+flowchart TD
+  L["LOAD : Float32"] --> P1["PARAM(1)"]
+  L --> IDX["INDEX"]
+  IDX --> P1b["PARAM(1)"]
+  IDX --> R0["RANGE(R0)"]
+  IDX --> R2["RANGE(R2)"]
 ```
 
 ### STORE — запись в память
@@ -264,12 +264,12 @@ Store {
 > **Совместимость:** У STORE в Svod нет отдельного поля `buffer` — источники: index=0, value=1, ranges=2+ (range_start=2). Устройство Tinygrad аналогично.
 
 **Пример:**
-```text
-STORE
-├── INDEX[R0, R1]            — write address (buffer via index.src[0])
-├── REDUCE(Add, ...)         — value
-├── RANGE(R0, Global)        — output dim 0 (closed)
-└── RANGE(R1, Global)        — output dim 1 (closed)
+```mermaid
+flowchart TD
+  ST["STORE"] -->|"write address (buffer via index.src[0])"| IDX["INDEX[R0, R1]"]
+  ST -->|"value"| RED["REDUCE(Add, ...)"]
+  ST -->|"output dim 0 (closed)"| R0["RANGE(R0, Global)"]
+  ST -->|"output dim 1 (closed)"| R1["RANGE(R1, Global)"]
 ```
 
 ---
@@ -383,11 +383,11 @@ Sink {
 источниками без опоры на боковой канал type-erased метаданных.
 
 **Пример:**
-```text
-SINK
-├── STORE(output_0, ...)
-├── STORE(output_1, ...)
-└── STORE(output_2, ...)
+```mermaid
+flowchart TD
+  SINK["SINK"] --> S0["STORE(output_0, ...)"]
+  SINK --> S1["STORE(output_1, ...)"]
+  SINK --> S2["STORE(output_2, ...)"]
 ```
 
 ### AFTER — маркер зависимости
@@ -402,12 +402,12 @@ After {
 Выражает зависимости выполнения между ядрами без data dependency. Значение `passthrough` возвращается без изменений, но только после завершения всех `deps`.
 
 **Пример:**
-```text
-SINK
-├── AFTER
-│   ├── PARAM(0)     — passthrough (buffer reference)
-│   └── KERNEL(...)          — must complete first
-└── KERNEL(...)              — can use buffer after AFTER
+```mermaid
+flowchart TD
+  SINK["SINK"] --> AF["AFTER"]
+  AF -->|"passthrough (buffer reference)"| P0["PARAM(0)"]
+  AF -->|"must complete first"| K1["KERNEL(...)"]
+  SINK -->|"can use buffer after AFTER"| K2["KERNEL(...)"]
 ```
 
 ### BARRIER — барьер синхронизации
@@ -436,12 +436,12 @@ Vectorize {
 Комбинирует N скалярных значений в вектор размера N. Все элементы должны иметь одинаковый базовый DType.
 
 **Пример:**
-```text
-VECTORIZE : <4 x Float32>
-├── CONST(1.0)
-├── CONST(2.0)
-├── CONST(3.0)
-└── CONST(4.0)
+```mermaid
+flowchart TD
+  V["VECTORIZE : 4 x Float32"] --> C1["CONST(1.0)"]
+  V --> C2["CONST(2.0)"]
+  V --> C3["CONST(3.0)"]
+  V --> C4["CONST(4.0)"]
 ```
 
 ### GEP — Get Element Pointer (извлечение из вектора)
@@ -458,10 +458,10 @@ Gep {
 - Несколько индексов — вектор меньшего размера
 
 **Пример:**
-```text
-GEP([0, 2]) : <2 x Float32>
-└── VECTORIZE : <4 x Float32>
-    └── ...
+```mermaid
+flowchart TD
+  G["GEP([0, 2]) : 2 x Float32"] --> V["VECTORIZE : 4 x Float32"]
+  V --> E["..."]
 ```
 
 ### VConst — векторная константа
@@ -485,10 +485,10 @@ Cat {
 Конкатенирует векторы в вектор большего размера. `vcount` на выходе = сумма `vcount` входов.
 
 **Пример:**
-```text
-CAT : <8 x Float32>
-├── VECTORIZE : <4 x Float32>
-└── VECTORIZE : <4 x Float32>
+```mermaid
+flowchart TD
+  CAT["CAT : 8 x Float32"] --> V1["VECTORIZE : 4 x Float32"]
+  CAT --> V2["VECTORIZE : 4 x Float32"]
 ```
 
 ### PtrCat — конкатенация указателей
@@ -530,10 +530,10 @@ Contract {
 Обратная операция к UNROLL — собирает расширенные скалярные значения в вектор. Размер выходного вектора = произведение множителей.
 
 **Пример:**
-```text
-CONTRACT(upcast_ranges=[(0, 4)]) : <4 x Float32>
-└── UNROLL(unroll_axes=[(0, 4)])
-    └── LOAD(...)
+```mermaid
+flowchart TD
+  CT["CONTRACT(upcast_ranges=[(0, 4)]) : 4 x Float32"] --> U["UNROLL(unroll_axes=[(0, 4)])"]
+  U --> L["LOAD(...)"]
 ```
 
 Этот паттерн векторизует загрузку: расширить 4 итерации, затем упаковать результаты в 4-элементный вектор.
@@ -570,11 +570,11 @@ Wmma {
 | `tile_grid` | `(usize, usize)` | Грид для мульти-FMA батчинга (по умолчанию (1,1)) |
 
 **Пример:**
-```text
-WMMA(dims=(16, 16, 16), dtype_in=Float16, dtype_out=Float32)
-├── A fragment : <8 x Float16>
-├── B fragment : <8 x Float16>
-└── C accumulator : <8 x Float32>
+```mermaid
+flowchart TD
+  W["WMMA(dims=(16, 16, 16), dtype_in=Float16, dtype_out=Float32)"] --> A["A fragment : 8 x Float16"]
+  W --> B["B fragment : 8 x Float16"]
+  W --> C["C accumulator : 8 x Float32"]
 ```
 
 ---
@@ -597,14 +597,12 @@ EndIf {
 Выполнить тело, только если условие истинно. Используется для проверок границ и разреженных операций.
 
 **Пример:**
-```text
-IF
-├── LT(idx, bound)           — condition (src[0])
-├── STORE(...)               — body[0]
-└── STORE(...)               — body[1]
-
-ENDIF
-└── IF(...)                  — references IF op
+```mermaid
+flowchart TD
+  IF["IF"] -->|"condition (src[0])"| LT["LT(idx, bound)"]
+  IF -->|"body[0]"| S0["STORE(...)"]
+  IF -->|"body[1]"| S1["STORE(...)"]
+  ENDIF["ENDIF"] -->|"references IF op"| IF
 ```
 
 ---
@@ -685,9 +683,9 @@ Special {
 Доступ к значениям, предоставляемым аппаратурой (индексы потоков/блоков). Это не цикл — значение даётся напрямую оборудованием.
 
 **Пример:**
-```text
-SPECIAL(name="blockIdx.x", end=128) : Index
-└── CONST(128)
+```mermaid
+flowchart TD
+  SP["SPECIAL(name=blockIdx.x, end=128) : Index"] --> C["CONST(128)"]
 ```
 
 ### UNIQUE / LUNIQUE — маркеры идентичности
@@ -728,10 +726,10 @@ Device(DeviceSpec)           // device specification
 | `Flip` | `{ src, axes: Vec<bool> }` | Развернуть по осям |
 
 **Пример:** RESHAPE
-```text
-RESHAPE(new_shape=[6, 4]) : Shape[6, 4]
-├── BUFFER[2, 3, 4] : Float32
-└── CONST([6, 4]) : Shape
+```mermaid
+flowchart TD
+  RS["RESHAPE(new_shape=[6, 4]) : Shape[6, 4]"] --> B["BUFFER[2, 3, 4] : Float32"]
+  RS --> C["CONST([6, 4]) : Shape"]
 ```
 
 ---

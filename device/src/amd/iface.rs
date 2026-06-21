@@ -463,29 +463,23 @@ impl AmdIface for KfdIface {
             // unaligned reference.
             let gpu_id = mem.gpu_id;
             let va = { mem.va };
-            let not_present = { mem.failure.NotPresent };
-            let read_only = { mem.failure.ReadOnly };
-            let no_execute = { mem.failure.NoExecute };
-            let imprecise = { mem.failure.imprecise };
+            let not_present = { mem.failure.NotPresent } != 0;
+            let read_only = { mem.failure.ReadOnly } != 0;
+            let no_execute = { mem.failure.NoExecute } != 0;
+            let imprecise = { mem.failure.imprecise } != 0;
             let error_type = { mem.ErrorType };
             // Resolve the raw VA to its owning / stale / nearest allocation —
             // turns "fault at 0x7f…" into "fault +0x40 into a RECENTLY-FREED
             // scratch region", which is what actually localizes the bug.
             let class = self.va.classify(va);
-            let va_hex = format!("{va:#x}");
-            let message = format!(
-                "AMD GPU memory fault on gpu_id={gpu_id} va={va_hex} \
-                 (NotPresent={not_present} ReadOnly={read_only} NoExecute={no_execute} \
-                 Imprecise={imprecise} ErrorType={error_type}) — {class}",
-            );
-            // Log at the fault site: the panic that eventually surfaces this is
+            // Log at the fault site: the error that eventually surfaces this is
             // a delayed re-throw at the next `synchronize()`, far from here. Once
             // only — the memory-fault event is not auto-reset, so subsequent
             // `wait_events(0)` poll-fault calls re-observe the same fault.
             if !self.fault_logged.swap(true, Ordering::Relaxed) {
                 tracing::error!(
                     gpu_id,
-                    va = va_hex.as_str(),
+                    va = format!("{va:#x}").as_str(),
                     not_present,
                     read_only,
                     no_execute,
@@ -495,7 +489,16 @@ impl AmdIface for KfdIface {
                     "AMD GPU memory fault"
                 );
             }
-            return Ok(Some(Error::Runtime { message }));
+            return Ok(Some(Error::GpuFault {
+                gpu_id,
+                va,
+                not_present,
+                read_only,
+                no_execute,
+                imprecise,
+                error_type,
+                class: class.to_string(),
+            }));
         }
         let hw = unsafe { events[2].__bindgen_anon_1.hw_exception_data };
         if hw.gpu_id != 0 {
@@ -537,7 +540,7 @@ impl KfdIface {
         };
         if p == libc::MAP_FAILED {
             let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
-            return Err(Error::AmdAllocFailed { reason: format!("doorbell mmap failed (errno {errno})") });
+            return Err(Error::AmdIoctl { ioctl: "mmap(doorbell)", errno });
         }
         let base = NonNull::new(p as *mut u8).expect("doorbell page non-null");
         let offset_in_page = (doorbell_offset & 0x1fff) as usize;
@@ -582,7 +585,7 @@ fn reserve_va(size: usize) -> Result<*mut libc::c_void> {
     let p = unsafe { mmap(std::ptr::null_mut(), size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0) };
     if p == libc::MAP_FAILED {
         let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
-        return Err(Error::AmdAllocFailed { reason: format!("VA reservation mmap failed (errno {errno})") });
+        return Err(Error::AmdIoctl { ioctl: "mmap(VA reservation)", errno });
     }
     Ok(p)
 }

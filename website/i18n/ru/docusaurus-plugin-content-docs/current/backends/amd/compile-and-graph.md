@@ -18,17 +18,11 @@ sidebar_label: Компиляция и граф
 загрузка в VRAM**. Совместно работают три крейта, связанные вместе в
 `runtime/src/devices/amd.rs`:
 
-```text
-  UOp IR
-    │  LlvmTextRenderer::amd(arch)         (svod-codegen)
-    ▼
-  AMD LLVM IR (текст)
-    │  compile_ir_to_amd_object            (svod-runtime)
-    ▼
-  AMDGPU ELF code object
-    │  AmdProgram::load                    (svod-device)
-    ▼
-  резидентно в VRAM, дескриптор ядра декодирован
+```mermaid
+flowchart TD
+  A["UOp IR"] -->|"LlvmTextRenderer::amd(arch) (svod-codegen)"| B["AMD LLVM IR (text)"]
+  B -->|"compile_ir_to_amd_object (svod-runtime)"| C["AMDGPU ELF code object"]
+  C -->|"AmdProgram::load (svod-device)"| D["resident in VRAM, kernel descriptor decoded"]
 ```
 
 ### Рендеринг

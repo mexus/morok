@@ -17,17 +17,11 @@ sidebar_label: 编译与图
 加载**。三个 crate 协作，在
 `runtime/src/devices/amd.rs` 中接线在一起：
 
-```text
-  UOp IR
-    │  LlvmTextRenderer::amd(arch)         (svod-codegen)
-    ▼
-  AMD LLVM IR (text)
-    │  compile_ir_to_amd_object            (svod-runtime)
-    ▼
-  AMDGPU ELF code object
-    │  AmdProgram::load                    (svod-device)
-    ▼
-  resident in VRAM, kernel descriptor decoded
+```mermaid
+flowchart TD
+  A["UOp IR"] -->|"LlvmTextRenderer::amd(arch) (svod-codegen)"| B["AMD LLVM IR (text)"]
+  B -->|"compile_ir_to_amd_object (svod-runtime)"| C["AMDGPU ELF code object"]
+  C -->|"AmdProgram::load (svod-device)"| D["resident in VRAM, kernel descriptor decoded"]
 ```
 
 ### 渲染

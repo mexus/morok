@@ -424,7 +424,24 @@ pub enum CustomFunctionKind {
 /// sources are distinct UOps.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 #[derive(serde::Serialize, serde::Deserialize)]
-pub struct KernelInfo {}
+#[serde(default)]
+pub struct KernelInfo {
+    /// Author-supplied optimization control, mirroring tinygrad's
+    /// `KernelInfo.opts_to_apply`:
+    /// - `None` — the optimizer chooses opts (heuristics or beam).
+    /// - `Some(vec![])` — apply *zero* opts; the AST is already in finished,
+    ///   hand-lowered form and must pass through untouched (e.g. a tile-DSL
+    ///   kernel).
+    /// - `Some(non-empty)` — apply exactly these opts, in order.
+    pub opts_to_apply: Option<Vec<crate::opt::Opt>>,
+    /// Author-supplied kernel name carried on the SINK itself (set by hand-lowered
+    /// tile-DSL kernels via their `Kernel::finish`). The optimizer-scheduled path
+    /// names kernels through its own metadata channel and leaves this `None`; the
+    /// render-name driver falls back to this when that metadata is absent, so custom
+    /// kernels (`flash_attention`, `ffn_gemm1`, `matmul_nt`, …) keep their real names
+    /// in the profile instead of collapsing to the `"kernel"` default.
+    pub name: Option<String>,
+}
 
 /// Axis type for loop ranges and reductions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

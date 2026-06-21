@@ -54,9 +54,9 @@ Kernel-boundary framing is structural via `Call`/`Function`, not a dedicated
 axis type.
 
 **Example:**
-```text
-RANGE(end=128, axis_id=R0, type=Global)
-└── CONST(128) : Index
+```mermaid
+flowchart TD
+  R["RANGE(end=128, axis_id=R0, type=Global)"] --> C["CONST(128) : Index"]
 ```
 
 ### END — Loop Scope Closer
@@ -71,11 +71,11 @@ End {
 END closes one or more RANGE scopes and removes them from the active set. Multiple ranges can be closed simultaneously.
 
 **Example:**
-```text
-END
-├── STORE(...)           — computation
-├── RANGE(R0, Global)    — first range closed
-└── RANGE(R1, Local)     — second range closed
+```mermaid
+flowchart TD
+  E["END"] -->|"computation"| S["STORE(...)"]
+  E -->|"first range closed"| R0["RANGE(R0, Global)"]
+  E -->|"second range closed"| R1["RANGE(R1, Local)"]
 ```
 
 ---
@@ -97,9 +97,9 @@ ReduceAxis {
 Used **before** rangeify. Operates on tensor dimensions like NumPy's `.sum(axis=0)`.
 
 **Example:**
-```text
-REDUCE_AXIS(Add, axes=[1])
-└── BUFFER[10, 20] : Float32
+```mermaid
+flowchart TD
+  RA["REDUCE_AXIS(Add, axes=[1])"] --> B["BUFFER[10, 20] : Float32"]
 ```
 
 This reduces a `[10, 20]` tensor to `[10]` by summing along axis 1.
@@ -128,13 +128,13 @@ Used **after** rangeify. Accumulates values across RANGE iterations and closes t
 > **Compatibility:** Tinygrad's spec restricts REDUCE_AXIS to `{Add, Mul, Max}`. Svod extends this with `Min`.
 
 **Example:**
-```text
-REDUCE(Add)
-├── MUL                      — value to accumulate
-│   ├── LOAD(A, ...)
-│   └── LOAD(B, ...)
-└── RANGE(R2, Reduce)        — range being reduced
-    └── CONST(64)
+```mermaid
+flowchart TD
+  RED["REDUCE(Add)"] -->|"value to accumulate"| MUL["MUL"]
+  MUL --> LA["LOAD(A, ...)"]
+  MUL --> LB["LOAD(B, ...)"]
+  RED -->|"range being reduced"| R2["RANGE(R2, Reduce)"]
+  R2 --> C["CONST(64)"]
 ```
 
 ### ALLREDUCE — Cross-Device Reduction
@@ -186,11 +186,11 @@ Marks where computation should materialize to memory. Triggers kernel splitting.
 | `removable` | `bool` | When `false`, `buffer_removal` is forbidden from inlining this BUFFERIZE — used at multi-consumer realize boundaries to keep the buffer fixed across mega-pass fixpoint iterations |
 
 **Example:**
-```text
-BUFFERIZE(opts={addrspace=Global})
-├── REDUCE(Add, ...)         — computation
-├── RANGE(R0, Global)        — output dim 0
-└── RANGE(R1, Global)        — output dim 1
+```mermaid
+flowchart TD
+  BZ["BUFFERIZE(opts=(addrspace=Global))"] -->|"computation"| RED["REDUCE(Add, ...)"]
+  BZ -->|"output dim 0"| R0["RANGE(R0, Global)"]
+  BZ -->|"output dim 1"| R1["RANGE(R1, Global)"]
 ```
 
 ### INDEX — Multi-Dimensional Buffer Access
@@ -206,12 +206,12 @@ Index {
 Computes memory address from multi-dimensional indices. Returns element dtype (not pointer).
 
 **Example:**
-```text
-INDEX : Float32
-├── PARAM(0)
-├── RANGE(R0, Global)        — index for dim 0
-├── RANGE(R1, Loop)          — index for dim 1
-└── MUL(...)                 — index for dim 2
+```mermaid
+flowchart TD
+  IDX["INDEX : Float32"] --> P["PARAM(0)"]
+  IDX -->|"index for dim 0"| R0["RANGE(R0, Global)"]
+  IDX -->|"index for dim 1"| R1["RANGE(R1, Loop)"]
+  IDX -->|"index for dim 2"| M["MUL(...)"]
 ```
 
 ### POINTER_INDEX — Low-Level Pointer Arithmetic
@@ -240,13 +240,13 @@ Load {
 Read value from buffer at index. For gated loads, the `alt` field provides a value when the INDEX's `gate` is false (avoids the memory access entirely).
 
 **Example:**
-```text
-LOAD : Float32
-├── PARAM(1)
-└── INDEX
-    ├── PARAM(1)
-    ├── RANGE(R0)
-    └── RANGE(R2)
+```mermaid
+flowchart TD
+  L["LOAD : Float32"] --> P1["PARAM(1)"]
+  L --> IDX["INDEX"]
+  IDX --> P1b["PARAM(1)"]
+  IDX --> R0["RANGE(R0)"]
+  IDX --> R2["RANGE(R2)"]
 ```
 
 ### STORE — Memory Write
@@ -266,12 +266,12 @@ For gated stores, use an INDEX with a gate (INDEX has an optional `gate` field).
 > **Compatibility:** Svod's STORE has no separate `buffer` field—sources are: index=0, value=1, ranges=2+ (range_start=2). Tinygrad's layout is similar.
 
 **Example:**
-```text
-STORE
-├── INDEX[R0, R1]            — write address (buffer via index.src[0])
-├── REDUCE(Add, ...)         — value
-├── RANGE(R0, Global)        — output dim 0 (closed)
-└── RANGE(R1, Global)        — output dim 1 (closed)
+```mermaid
+flowchart TD
+  ST["STORE"] -->|"write address (buffer via index.src[0])"| IDX["INDEX[R0, R1]"]
+  ST -->|"value"| RED["REDUCE(Add, ...)"]
+  ST -->|"output dim 0 (closed)"| R0["RANGE(R0, Global)"]
+  ST -->|"output dim 1 (closed)"| R1["RANGE(R1, Global)"]
 ```
 
 ---
@@ -385,11 +385,11 @@ marker that distinguishes kernel-AST SINKs from otherwise-identical bare
 SINKs without relying on type-erased side-channel metadata.
 
 **Example:**
-```text
-SINK
-├── STORE(output_0, ...)
-├── STORE(output_1, ...)
-└── STORE(output_2, ...)
+```mermaid
+flowchart TD
+  SINK["SINK"] --> S0["STORE(output_0, ...)"]
+  SINK --> S1["STORE(output_1, ...)"]
+  SINK --> S2["STORE(output_2, ...)"]
 ```
 
 ### AFTER — Dependency Marker
@@ -404,12 +404,12 @@ After {
 Expresses execution dependencies between kernels without data dependency. The `passthrough` value is returned unchanged, but only after all `deps` complete.
 
 **Example:**
-```text
-SINK
-├── AFTER
-│   ├── PARAM(0)     — passthrough (buffer reference)
-│   └── KERNEL(...)          — must complete first
-└── KERNEL(...)              — can use buffer after AFTER
+```mermaid
+flowchart TD
+  SINK["SINK"] --> AF["AFTER"]
+  AF -->|"passthrough (buffer reference)"| P0["PARAM(0)"]
+  AF -->|"must complete first"| K1["KERNEL(...)"]
+  SINK -->|"can use buffer after AFTER"| K2["KERNEL(...)"]
 ```
 
 ### BARRIER — Synchronization Fence
@@ -438,12 +438,12 @@ Vectorize {
 Combines N scalar values into a vector of size N. All elements must have the same base dtype.
 
 **Example:**
-```text
-VECTORIZE : <4 x Float32>
-├── CONST(1.0)
-├── CONST(2.0)
-├── CONST(3.0)
-└── CONST(4.0)
+```mermaid
+flowchart TD
+  V["VECTORIZE : 4 x Float32"] --> C1["CONST(1.0)"]
+  V --> C2["CONST(2.0)"]
+  V --> C3["CONST(3.0)"]
+  V --> C4["CONST(4.0)"]
 ```
 
 ### GEP — Get Element Pointer (Vector Extract)
@@ -460,10 +460,10 @@ Extracts elements from a vector:
 - Multiple indices → smaller vector
 
 **Example:**
-```text
-GEP([0, 2]) : <2 x Float32>
-└── VECTORIZE : <4 x Float32>
-    └── ...
+```mermaid
+flowchart TD
+  G["GEP([0, 2]) : 2 x Float32"] --> V["VECTORIZE : 4 x Float32"]
+  V --> E["..."]
 ```
 
 ### VConst — Vector Constant
@@ -487,10 +487,10 @@ Cat {
 Concatenates vectors into a larger vector. Output `vcount` = sum of input `vcount`s.
 
 **Example:**
-```text
-CAT : <8 x Float32>
-├── VECTORIZE : <4 x Float32>
-└── VECTORIZE : <4 x Float32>
+```mermaid
+flowchart TD
+  CAT["CAT : 8 x Float32"] --> V1["VECTORIZE : 4 x Float32"]
+  CAT --> V2["VECTORIZE : 4 x Float32"]
 ```
 
 ### PtrCat — Concatenate Pointers
@@ -532,10 +532,10 @@ Contract {
 The inverse of UNROLL—collects expanded scalar values into a vector. Output vector size = product of factors.
 
 **Example:**
-```text
-CONTRACT(upcast_ranges=[(0, 4)]) : <4 x Float32>
-└── UNROLL(unroll_axes=[(0, 4)])
-    └── LOAD(...)
+```mermaid
+flowchart TD
+  CT["CONTRACT(upcast_ranges=[(0, 4)]) : 4 x Float32"] --> U["UNROLL(unroll_axes=[(0, 4)])"]
+  U --> L["LOAD(...)"]
 ```
 
 This pattern vectorizes a load: expand 4 iterations, then pack results into a 4-element vector.
@@ -572,11 +572,11 @@ Hardware tensor core operation: `D = A × B + C`. Requires specific matrix shape
 | `tile_grid` | `(usize, usize)` | Multi-FMA batching grid (default (1,1)) |
 
 **Example:**
-```text
-WMMA(dims=(16, 16, 16), dtype_in=Float16, dtype_out=Float32)
-├── A fragment : <8 x Float16>
-├── B fragment : <8 x Float16>
-└── C accumulator : <8 x Float32>
+```mermaid
+flowchart TD
+  W["WMMA(dims=(16, 16, 16), dtype_in=Float16, dtype_out=Float32)"] --> A["A fragment : 8 x Float16"]
+  W --> B["B fragment : 8 x Float16"]
+  W --> C["C accumulator : 8 x Float32"]
 ```
 
 ---
@@ -599,14 +599,12 @@ EndIf {
 Execute body only when condition is true. Used for boundary checks and sparse operations.
 
 **Example:**
-```text
-IF
-├── LT(idx, bound)           — condition (src[0])
-├── STORE(...)               — body[0]
-└── STORE(...)               — body[1]
-
-ENDIF
-└── IF(...)                  — references IF op
+```mermaid
+flowchart TD
+  IF["IF"] -->|"condition (src[0])"| LT["LT(idx, bound)"]
+  IF -->|"body[0]"| S0["STORE(...)"]
+  IF -->|"body[1]"| S1["STORE(...)"]
+  ENDIF["ENDIF"] -->|"references IF op"| IF
 ```
 
 ---
@@ -687,9 +685,9 @@ Special {
 Accesses hardware-provided values (thread/block indices). Not a loop—the hardware provides the value directly.
 
 **Example:**
-```text
-SPECIAL(name="blockIdx.x", end=128) : Index
-└── CONST(128)
+```mermaid
+flowchart TD
+  SP["SPECIAL(name=blockIdx.x, end=128) : Index"] --> C["CONST(128)"]
 ```
 
 ### UNIQUE / LUNIQUE — Identity Markers
@@ -729,10 +727,10 @@ High-level tensor shape transformations. These are converted to explicit INDEX o
 | `Flip` | `{ src, axes: Vec<bool> }` | Reverse along axes |
 
 **Example:** RESHAPE
-```text
-RESHAPE(new_shape=[6, 4]) : Shape[6, 4]
-├── BUFFER[2, 3, 4] : Float32
-└── CONST([6, 4]) : Shape
+```mermaid
+flowchart TD
+  RS["RESHAPE(new_shape=[6, 4]) : Shape[6, 4]"] --> B["BUFFER[2, 3, 4] : Float32"]
+  RS --> C["CONST([6, 4]) : Shape"]
 ```
 
 ---

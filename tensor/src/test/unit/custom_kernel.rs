@@ -1,6 +1,8 @@
+use std::sync::Arc;
+
 use smallvec::smallvec;
 use svod_dtype::{DType, DeviceSpec};
-use svod_ir::{CallInfo, ConstValue, Op, SInt, UOp, shape::Shape};
+use svod_ir::{CallInfo, ConstValue, KernelInfo, Op, SInt, UOp, shape::Shape};
 
 use crate::{CpuBackend, PrepareConfig, Tensor, test::helpers::*};
 
@@ -130,8 +132,9 @@ crate::codegen_tests! {
 fn run_custom_op_numerical_test(backend: CpuBackend, mul_tpl: &str, add_tpl: &str) {
     test_setup();
 
-    // CUSTOM C templates only render on the C/CPU backend (the AMD/LLVM backend
-    // rejects them), so pin all tensors to CPU regardless of SVOD_DEVICE.
+    // Custom templates are backend-specific (C expressions for Clang, LLVM IR
+    // instruction RHS for LLVM); pin all tensors to CPU regardless of
+    // SVOD_DEVICE so we exercise the requested CPU backend.
     svod_dtype::default_device::with_default_device(svod_dtype::DeviceSpec::Cpu, || {
         let src = Tensor::from_slice([3.5f32]);
         let dst = Tensor::empty(&[1], DType::Float32);
@@ -170,9 +173,85 @@ fn test_tensor_custom_op_numerical_clang_backend() {
 }
 
 #[test]
-fn test_tensor_custom_op_llvm_backend_is_explicitly_unsupported() {
+fn test_tensor_custom_op_numerical_llvm_backend() {
+    // LLVM templates render the instruction RHS of a typed CUSTOM
+    // (`%vN = <rhs>`); the LLVM type lives in the RHS itself.
+    run_custom_op_numerical_test(CpuBackend::Llvm, "fmul float {0}, 2.0", "fadd float {0}, 1.0");
+}
+
+/// Build a hand-ranged `out[i] = in[i] + 1` kernel body (manual RANGE +
+/// STORE-with-ranges). Used to prove the schedule passes a custom_kernel body
+/// through lowering WITHOUT re-rangeifying author-created loops — the core
+/// precondition for the svod-tk tile DSL.
+fn hand_ranged_add1_body(n: usize) -> impl FnOnce(Vec<Arc<UOp>>) -> Arc<UOp> {
+    move |ph| {
+        let out_buf = ph[0].clone();
+        let in_buf = ph[1].clone();
+        let i = UOp::range_const(n as i64, 0);
+        let in_idx = UOp::index().buffer(in_buf.clone()).indices(vec![i.clone()]).ptr(true).call().unwrap();
+        let loaded = UOp::load().buffer(in_buf).index(in_idx).call();
+        let one = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+        let val = loaded.try_add(&one).unwrap();
+        let out_idx = UOp::index().buffer(out_buf).indices(vec![i.clone()]).ptr(true).call().unwrap();
+        // Plain STORE, with the manual loop closed by an explicit END(range) —
+        // the tinykittens `store(..).end(i)` pattern. (`store_with_ranges` is for
+        // output-upcast UNROLL, not loop closing.)
+        let store = out_idx.store(val).end(smallvec![i]);
+        // opts_to_apply = Some(vec![]) — the tinygrad `()` analog: this SINK is
+        // already in finished, hand-lowered form; the optimizer must apply zero
+        // opts (no heuristic upcast/vectorize of the manual loop).
+        UOp::sink_with_info(vec![store], KernelInfo { opts_to_apply: Some(vec![]), name: None })
+    }
+}
+
+#[test]
+fn test_custom_kernel_hand_ranged_loop_cpu() {
+    test_setup();
+    svod_dtype::default_device::with_default_device(svod_dtype::DeviceSpec::Cpu, || {
+        let n = 8usize;
+        let src = Tensor::from_slice([0.0f32, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]);
+        let dst = Tensor::empty(&[n], DType::Float32);
+
+        let mut outputs = dst.custom_kernel(&[&src], hand_ranged_add1_body(n)).expect("custom kernel should build");
+
+        let mut out = outputs.remove(0);
+        out.realize_with(&PrepareConfig::for_cpu_backend(CpuBackend::Clang)).unwrap();
+
+        let result = out.as_vec::<f32>().unwrap();
+        let expected: Vec<f32> = (0..n).map(|x| x as f32 + 1.0).collect();
+        assert_close_f32(&result, &expected, 1e-6);
+    });
+}
+
+/// Hardware-gated: `SVOD_DEVICE=AMD:0 cargo test -p svod-tensor custom_kernel::test_custom_kernel_hand_ranged_loop_amd -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn test_custom_kernel_hand_ranged_loop_amd() {
+    test_setup();
+    let n = 8usize;
+    let src = Tensor::from_slice([0.0f32, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]);
+    let dst = Tensor::empty(&[n], DType::Float32);
+
+    let mut outputs = dst.custom_kernel(&[&src], hand_ranged_add1_body(n)).expect("custom kernel should build");
+
+    let mut out = outputs.remove(0);
+    out.realize_with(&PrepareConfig::from_env()).unwrap();
+
+    let result = out.as_vec::<f32>().unwrap();
+    let expected: Vec<f32> = (0..n).map(|x| x as f32 + 1.0).collect();
+    assert_close_f32(&result, &expected, 1e-6);
+}
+
+/// Hardware-gated end-to-end raw-CUSTOM on the AMD/LLVM renderer:
+/// `SVOD_DEVICE=AMD:0 cargo test -p svod-tensor custom_kernel::test_tensor_custom_op_amd_end_to_end -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn test_tensor_custom_op_amd_end_to_end() {
     test_setup();
 
+    // Tensors land on the default device (AMD under SVOD_DEVICE=AMD:0); the
+    // kernel is rendered by the AMD LLVM renderer, compiled to an amdgcn ELF,
+    // and dispatched on the GPU — exercising the CUSTOM path end to end.
     let src = Tensor::from_slice([3.5f32]);
     let dst = Tensor::empty(&[1], DType::Float32);
 
@@ -193,7 +272,8 @@ fn test_tensor_custom_op_llvm_backend_is_explicitly_unsupported() {
         .expect("custom kernel should build");
 
     let mut out = outputs.remove(0);
-    let config = PrepareConfig::for_cpu_backend(CpuBackend::Llvm);
-    let err = out.realize_with(&config).expect_err("LLVM backend should reject CUSTOM/CUSTOMI templates");
-    assert!(format!("{err}").contains("does not support CUSTOM/CUSTOMI"), "unexpected error: {err}");
+    out.realize_with(&PrepareConfig::from_env()).unwrap();
+
+    let result = out.as_vec::<f32>().unwrap();
+    assert_close_f32(&result, &[7.0], 1e-6);
 }

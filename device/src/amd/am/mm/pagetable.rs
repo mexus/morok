@@ -3,7 +3,7 @@
 //! Pure bit/arithmetic logic — no MMIO, no backing store — so it is fully
 //! unit-tested against the AMD hardware's exact constants.
 //!
-//! **gfx11 / RDNA3 and gfx9 / CDNA (MI300X) are implemented and tested.** The
+//! **gfx11 / RDNA3 and gfx9 / CDNA are implemented and tested.** The
 //! arch split is by the `ip_ver` tuple read from IP discovery (the GC IP-block
 //! version); the gfx12 branch is marked and filled in when its hardware can
 //! validate it. The page-table *shape* (4-level / 48-bit) is shared across

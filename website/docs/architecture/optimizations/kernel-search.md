@@ -27,7 +27,7 @@ Optimization transforms loop structures by changing axis types. Each action modi
 | SWAP(axis1, axis2) | Reorder global dimensions | All |
 | PADTO(axis, amount) | Pad for alignment | All |
 | NOLOCALS | Disable local memory | All (constraint) |
-| TC | Enable tensor core usage | NVIDIA GPUs |
+| TC | Enable tensor core usage | NVIDIA & AMD GPUs (WMMA/MFMA) |
 
 The total action space is ~162 base actions (varies with kernel structure and available parallelism).
 

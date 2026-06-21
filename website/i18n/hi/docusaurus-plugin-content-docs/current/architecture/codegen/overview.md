@@ -58,44 +58,13 @@ sidebar_label: ओवरव्यू
 
 22 स्टेज चार phases में बँटते हैं:
 
-```text
-Tensor Expression
-       │
-       ▼
-┌─────────────────────────────────────┐
-│ RANGEIFY (Stages 1-7)               │
-│ Movement ops → Explicit loops       │
-│                                     │
-│ [Make iteration explicit,           │
-│  optimize ranges]                   │
-└─────────────────────────────────────┘
-       │
-       ▼
-┌─────────────────────────────────────┐
-│ EXPANDER (Stages 8-10)              │
-│ UNROLL/UPCAST → Explicit vectors    │
-│                                     │
-│ [Expand optimization primitives]    │
-└─────────────────────────────────────┘
-       │
-       ▼
-┌─────────────────────────────────────┐
-│ DEVECTORIZER (Stages 11-15)         │
-│ Vector ops → Scalar code            │
-│                                     │
-│ [Lower to hardware-specific ops]    │
-└─────────────────────────────────────┘
-       │
-       ▼
-┌─────────────────────────────────────┐
-│ LINEARIZER (Stages 16-22)           │
-│ IR → Linear instruction sequence    │
-│                                     │
-│ [Serialize to executable code]      │
-└─────────────────────────────────────┘
-       │
-       ▼
-  Machine Code
+```mermaid
+flowchart TD
+  T["Tensor Expression"] --> R["RANGEIFY (Stages 1-7): Movement ops to Explicit loops. Make iteration explicit, optimize ranges"]
+  R --> E["EXPANDER (Stages 8-10): UNROLL/UPCAST to Explicit vectors. Expand optimization primitives"]
+  E --> D["DEVECTORIZER (Stages 11-15): Vector ops to Scalar code. Lower to hardware-specific ops"]
+  D --> L["LINEARIZER (Stages 16-22): IR to Linear instruction sequence. Serialize to executable code"]
+  L --> M["Machine Code"]
 ```
 
 हर स्टेज pattern-based rewrites अप्लाई करता है। Patterns fixpoint तक चलते हैं, फिर अगला स्टेज शुरू होता है।
