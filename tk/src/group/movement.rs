@@ -67,7 +67,7 @@ impl<'k> Group<'k> {
     /// # Panics
     /// Panics if `axis` is out of range for the GLOBAL source's rank (the
     /// row-stride is the product of the dims after `axis`).
-    pub fn fill_local_nobar(&self, dst: ST<'k>, src: GL<'k>, idxs: &[Idx], axis: usize) -> ST<'k> {
+    pub fn fill_local_nobar(&self, dst: ST, src: GL, idxs: &[Idx], axis: usize) -> ST {
         self.load_global_to_local(dst, &src, idxs, axis, false)
     }
 
@@ -81,7 +81,7 @@ impl<'k> Group<'k> {
     /// # Panics
     /// Panics if `axis` is out of range for the GLOBAL source's rank (the
     /// row-stride is the product of the dims after `axis`).
-    pub fn stage_global_to_reg(&self, st: &ST<'k>, src: &GL<'k>, idxs: &[Idx], axis: usize) -> Arc<UOp> {
+    pub fn stage_global_to_reg(&self, st: &ST, src: &GL, idxs: &[Idx], axis: usize) -> Arc<UOp> {
         let geom = self.lds_fill_geom(st);
         let row_stride: i64 = src.shape()[axis + 1..].iter().product::<usize>() as i64;
         let idxs_t: Vec<Idx> = idxs
@@ -129,7 +129,7 @@ impl<'k> Group<'k> {
     /// Recomputes the identical per-lane addressing. Ends in a workgroup barrier
     /// when `barrier` (the single-buffer commit); the double-buffered pipeline
     /// passes `false` and shares one barrier per iteration.
-    pub fn commit_reg_to_local(&self, st: ST<'k>, stage: &Arc<UOp>, barrier: bool) -> ST<'k> {
+    pub fn commit_reg_to_local(&self, st: ST, stage: &Arc<UOp>, barrier: bool) -> ST {
         // The LDS destination geometry is fully determined by the tile shape (the
         // global tile position only mattered when *staging* into the registers).
         let geom = self.lds_fill_geom(&st);
@@ -181,7 +181,7 @@ impl<'k> Group<'k> {
 
     /// The [`LdsGeom`] for filling `st` collaboratively across all group
     /// threads (`elements_per_thread`, pass count, last-pass clamp).
-    fn lds_fill_geom(&self, st: &ST<'k>) -> LdsGeom {
+    fn lds_fill_geom(&self, st: &ST) -> LdsGeom {
         let ept = st.base.base.elements_per_thread() as i64;
         let st_cols = st.cols as i64;
         let base_rows = st.base.base.rows as i64;
@@ -233,14 +233,7 @@ impl<'k> Group<'k> {
     /// tile. When `barrier`, it is closed with a workgroup barrier so the
     /// subsequent gather sees it (the default); the software-pipeline path passes
     /// `false` and inserts the barrier itself (see [`Self::fill_local_nobar`]).
-    pub(super) fn load_global_to_local(
-        &self,
-        st: ST<'k>,
-        src: &GL<'k>,
-        idxs: &[Idx],
-        axis: usize,
-        barrier: bool,
-    ) -> ST<'k> {
+    pub(super) fn load_global_to_local(&self, st: ST, src: &GL, idxs: &[Idx], axis: usize, barrier: bool) -> ST {
         let row_stride: i64 = src.shape()[axis + 1..].iter().product::<usize>() as i64;
         let idxs_t: Vec<Idx> = idxs
             .iter()
@@ -330,11 +323,11 @@ impl<'k> Group<'k> {
     /// the destination ST element types match (no cast on this path), and the
     /// swizzle period, base cols, ST cols, and source row-stride are all aligned
     /// to the 128-bit vector width.
-    pub fn fill_local_vec(&self, dst: ST<'k>, src: GL<'k>, idxs: &[Idx], axis: usize) -> ST<'k> {
+    pub fn fill_local_vec(&self, dst: ST, src: GL, idxs: &[Idx], axis: usize) -> ST {
         self.load_global_to_local_vec(dst, &src, idxs, axis, true)
     }
 
-    fn load_global_to_local_vec(&self, st: ST<'k>, src: &GL<'k>, idxs: &[Idx], axis: usize, barrier: bool) -> ST<'k> {
+    fn load_global_to_local_vec(&self, st: ST, src: &GL, idxs: &[Idx], axis: usize, barrier: bool) -> ST {
         let itemsize = st.elem().base().bytes() as i64;
         assert_eq!(itemsize, 2, "vec fill: bf16-only (128-bit = vec8)");
         assert_eq!(src.elem(), st.elem(), "vec fill: cast unsupported (use the scalar fill)");
@@ -417,7 +410,7 @@ impl<'k> Group<'k> {
 
     /// LOCAL→REG fragment gather: each lane reads its WMMA fragment lanes from
     /// the (swizzled) LDS tile.
-    pub(super) fn load_local_to_reg(&self, rt: RT<'k>, st: &ST<'k>, dst_idxs: &[Idx], idxs: &[Idx]) -> RT<'k> {
+    pub(super) fn load_local_to_reg(&self, rt: RT<'k>, st: &ST, dst_idxs: &[Idx], idxs: &[Idx]) -> RT<'k> {
         let laneid = self.ker.laneid();
         let ept = rt.base.base.elements_per_thread() as i64;
         let base_rows = rt.base.base.rows as i64;
@@ -505,7 +498,7 @@ impl<'k> Group<'k> {
     pub(super) fn load_global_to_reg(
         &self,
         rt: RT<'k>,
-        src: &GL<'k>,
+        src: &GL,
         dst_idxs: &[Idx],
         idxs: &[Idx],
         axis: usize,
@@ -578,7 +571,7 @@ impl<'k> Group<'k> {
 
     /// REG→LOCAL fragment scatter: each lane writes its register fragment into
     /// the (swizzled) LDS tile (the layout-transpose hop before write-back).
-    pub(super) fn store_reg_to_local(&self, st: ST<'k>, rt: &RT<'k>, idxs: &[Idx], src_idxs: &[Idx]) -> ST<'k> {
+    pub(super) fn store_reg_to_local(&self, st: ST, rt: &RT<'k>, idxs: &[Idx], src_idxs: &[Idx]) -> ST {
         let laneid = self.ker.laneid();
         let ept = rt.base.base.elements_per_thread() as i64;
         let base_rows = rt.base.base.rows as i64;
@@ -620,13 +613,13 @@ impl<'k> Group<'k> {
     /// correct global position.
     pub(super) fn store_reg_to_global(
         &self,
-        dst: GL<'k>,
+        dst: GL,
         rt: &RT<'k>,
         idxs: &[Idx],
         src_idxs: &[Idx],
         axis: usize,
         masked: bool,
-    ) -> GL<'k> {
+    ) -> GL {
         let row_stride: i64 = dst.shape()[axis + 1..].iter().product::<usize>() as i64;
         let base_rows = rt.base.base.rows as i64;
         let base_cols = rt.base.base.cols as i64;

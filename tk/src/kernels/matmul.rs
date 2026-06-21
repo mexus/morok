@@ -286,16 +286,16 @@ pub fn build_matmul_cfg_k(ker: &Kernel, n: usize, cfg: MatmulCfg, k_step: usize)
 /// multiple of 16 (the WMMA K-edge); `k` is a multiple of `k_step`; and
 /// `cfg.wave_cols == cfg.wave_rows * cfg.n_accum`.
 #[allow(clippy::too_many_arguments)]
-pub fn gemm_core<'k>(
-    ker: &'k Kernel,
+pub fn gemm_core(
+    ker: &Kernel,
     m: usize,
     k: usize,
     n: usize,
     cfg: MatmulCfg,
     k_step: usize,
-    c_gl: GL<'k>,
-    a_gl: GL<'k>,
-    b_gl: GL<'k>,
+    c_gl: GL,
+    a_gl: GL,
+    b_gl: GL,
 ) {
     assert_eq!(m % cfg.block, 0, "gemm M={m} must be a multiple of the {} block", cfg.block);
     assert_eq!(n % cfg.block, 0, "gemm N={n} must be a multiple of the {} block", cfg.block);

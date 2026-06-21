@@ -111,8 +111,8 @@ fn score_tile<'k>(
     query: usize,
     d: usize,
     x_reg_t: &RT<'k>,
-    c_gl: &GL<'k>,
-    c_sq_gl: &GL<'k>,
+    c_gl: &GL,
+    c_sq_gl: &GL,
     m_blk: &Idx,
     masked: bool,
 ) -> RT<'k> {
@@ -199,7 +199,7 @@ pub fn build_knn_score(ker: &Kernel, corpus: usize, query: usize, d: usize) {
 /// `block_idx[0]` selects each 16-query block of a wide `[Npad, d]` query input
 /// (block-unit offset ⇒ the element offset is `q_blk·query`, exactly `q_blk·16`).
 /// `Idx::Const(0)` is the single-block (Stage-1 / `N ≤ 16`) path.
-fn load_query_t<'k>(ker: &'k Kernel, warp: &Group<'k>, query: usize, d: usize, x_gl: &GL<'k>, q_blk: &Idx) -> RT<'k> {
+fn load_query_t<'k>(ker: &'k Kernel, warp: &Group<'k>, query: usize, d: usize, x_gl: &GL, q_blk: &Idx) -> RT<'k> {
     let bf16 = DType::BFloat16;
     let (row, col) = (TileLayout::Row, TileLayout::Col);
     let x_smem = ker.shared_sw((query, d), bf16.clone(), row);
@@ -324,8 +324,8 @@ fn topk_insert<'k>(
     d: usize,
     k: usize,
     x_reg_t: &RT<'k>,
-    c_gl: &GL<'k>,
-    c_sq_gl: &GL<'k>,
+    c_gl: &GL,
+    c_sq_gl: &GL,
     m_tile: &Arc<UOp>,
     masked: bool,
     mut topk: TopK<'k>,
@@ -504,8 +504,8 @@ fn store_topk<'k>(
     warp: &Group<'k>,
     query: usize,
     k: usize,
-    idx_gl: &GL<'k>,
-    val_gl: &GL<'k>,
+    idx_gl: &GL,
+    val_gl: &GL,
     idx_after: &RT<'k>,
     val_after: &RT<'k>,
     q_blk: &Idx,

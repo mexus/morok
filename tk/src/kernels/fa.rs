@@ -119,7 +119,7 @@ struct FaScratch<'k> {
     /// accumulator and WMMA-input fragment layouts coincide so a register `copy`
     /// suffices; `Some` on gfx11, where they differ and the relayout must round-trip
     /// through LDS (store the even/odd accumulator, reload as the replicated input).
-    att_smem: Option<ST<'k>>,
+    att_smem: Option<ST>,
 }
 
 /// Loop-invariant context for the [`build_fa_mw_rdb`] KV-slice helpers: the per-warp
@@ -182,8 +182,8 @@ fn fa_qk<'k>(
     k_reg_t: RT<'k>,
     v_reg: RT<'k>,
     att: RT<'k>,
-    k_smem: ST<'k>,
-    v_smem: ST<'k>,
+    k_smem: ST,
+    v_smem: ST,
     slice_idx: &Arc<UOp>,
     war_barrier: bool,
     extra_war: &[Arc<UOp>],
@@ -220,7 +220,7 @@ fn fa_softmax_pv<'k>(
     ctx: &FaCtx<'_, 'k>,
     acc: FaAcc<'k>,
     att_mma: RT<'k>,
-    att_smem: Option<ST<'k>>,
+    att_smem: Option<ST>,
     max_vec_last: RV<'k>,
     att: RT<'k>,
     v_reg: &RT<'k>,

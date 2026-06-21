@@ -45,7 +45,7 @@ impl Kernel {
     /// Calls [`Kernel::gl`] in slice order, so the `Param` slots are identical to the
     /// hand-written sequence. A conditional/optional buffer binds with a plain
     /// [`Kernel::gl`] *after* this call (trailing-only — never interleaved).
-    pub fn bind_abi(&self, outputs: &[GlSpec], inputs: &[GlSpec]) -> (Vec<GL<'_>>, Vec<GL<'_>>) {
+    pub fn bind_abi(&self, outputs: &[GlSpec], inputs: &[GlSpec]) -> (Vec<GL>, Vec<GL>) {
         let outs = outputs.iter().map(|s| self.gl(&s.shape, s.dtype.clone())).collect();
         let ins = inputs.iter().map(|s| self.gl(&s.shape, s.dtype.clone())).collect();
         (outs, ins)
@@ -83,16 +83,16 @@ impl Kernel {
         self.rv(length, DType::Float32, VecLayout::Ortho, RT_16X16)
     }
     /// A shared (LDS) tile with the arch's canonical strip ([`crate::ArchCaps::shared_default`]).
-    pub fn shared(&self, dims: (usize, usize), dt: DType, layout: TileLayout) -> ST<'_> {
+    pub fn shared(&self, dims: (usize, usize), dt: DType, layout: TileLayout) -> ST {
         self.st(dims, dt, layout, self.caps.shared_default())
     }
     /// A 2×-size double-buffered shared tile with the canonical strip.
-    pub fn shared_db(&self, dims: (usize, usize), dt: DType, layout: TileLayout) -> ST<'_> {
+    pub fn shared_db(&self, dims: (usize, usize), dt: DType, layout: TileLayout) -> ST {
         self.st_db(dims, dt, layout, self.caps.shared_default())
     }
     /// A shared (LDS) tile with the XOR-swizzled strip ([`crate::ArchCaps::shared_swizzled`]),
     /// for kernels that swizzle to avoid LDS bank conflicts (the matmul A/B strips).
-    pub fn shared_sw(&self, dims: (usize, usize), dt: DType, layout: TileLayout) -> ST<'_> {
+    pub fn shared_sw(&self, dims: (usize, usize), dt: DType, layout: TileLayout) -> ST {
         self.st(dims, dt, layout, self.caps.shared_swizzled())
     }
 

@@ -83,33 +83,33 @@ pub trait StoreInto<'k, Dst> {
     fn store_into(self, g: &Group<'k>, dst: Dst, ix: MoveIdx) -> Self::Output;
 }
 
-impl<'k> LoadInto<'k, ST<'k>> for GL<'k> {
-    type Output = ST<'k>;
-    fn load_into(self, g: &Group<'k>, dst: ST<'k>, ix: MoveIdx) -> ST<'k> {
+impl<'k> LoadInto<'k, ST> for GL {
+    type Output = ST;
+    fn load_into(self, g: &Group<'k>, dst: ST, ix: MoveIdx) -> ST {
         g.load_global_to_local(dst, &self, &ix.block, ix.axis, true)
     }
 }
-impl<'k> LoadInto<'k, RT<'k>> for ST<'k> {
+impl<'k> LoadInto<'k, RT<'k>> for ST {
     type Output = RT<'k>;
     fn load_into(self, g: &Group<'k>, dst: RT<'k>, ix: MoveIdx) -> RT<'k> {
         g.load_local_to_reg(dst, &self, &ix.frag, &ix.block)
     }
 }
-impl<'k> LoadInto<'k, RT<'k>> for GL<'k> {
+impl<'k> LoadInto<'k, RT<'k>> for GL {
     type Output = RT<'k>;
     fn load_into(self, g: &Group<'k>, dst: RT<'k>, ix: MoveIdx) -> RT<'k> {
         g.load_global_to_reg(dst, &self, &ix.frag, &ix.block, ix.axis, ix.masked)
     }
 }
-impl<'k> StoreInto<'k, ST<'k>> for RT<'k> {
-    type Output = ST<'k>;
-    fn store_into(self, g: &Group<'k>, dst: ST<'k>, ix: MoveIdx) -> ST<'k> {
+impl<'k> StoreInto<'k, ST> for RT<'k> {
+    type Output = ST;
+    fn store_into(self, g: &Group<'k>, dst: ST, ix: MoveIdx) -> ST {
         g.store_reg_to_local(dst, &self, &ix.block, &ix.frag)
     }
 }
-impl<'k> StoreInto<'k, GL<'k>> for RT<'k> {
-    type Output = GL<'k>;
-    fn store_into(self, g: &Group<'k>, dst: GL<'k>, ix: MoveIdx) -> GL<'k> {
+impl<'k> StoreInto<'k, GL> for RT<'k> {
+    type Output = GL;
+    fn store_into(self, g: &Group<'k>, dst: GL, ix: MoveIdx) -> GL {
         g.store_reg_to_global(dst, &self, &ix.block, &ix.frag, ix.axis, ix.masked)
     }
 }
@@ -373,19 +373,19 @@ impl<'k> Group<'k> {
         let after = t.uop().after(smallvec![ended]);
         t.rewrap(after)
     }
-    pub(super) fn finalize_st(&self, t: ST<'k>, ended: Arc<UOp>) -> ST<'k> {
+    pub(super) fn finalize_st(&self, t: ST, ended: Arc<UOp>) -> ST {
         self.ker.push_store(ended.clone(), t.uop().clone());
         let after = t.uop().after(smallvec![ended]);
         t.rewrap(after)
     }
-    pub(super) fn finalize_gl(&self, t: GL<'k>, ended: Arc<UOp>) -> GL<'k> {
+    pub(super) fn finalize_gl(&self, t: GL, ended: Arc<UOp>) -> GL {
         self.ker.push_store(ended.clone(), t.uop().clone());
         let after = t.uop().after(smallvec![ended]);
         t.rewrap(after)
     }
 }
 
-impl<'k> ST<'k> {
+impl ST {
     /// A zero-copy view of the `(row_blk, col_blk)`-th sub-rectangle of warp-tile
     /// element size `dims` — folds the per-warp band into the tile's additive base
     /// offset (composing with any existing double-buffer parity offset), so a
@@ -397,7 +397,7 @@ impl<'k> ST<'k> {
     /// from the folded form (`imul(a·k + local, stride)` → `imul(local, stride) +
     /// imul(a·k, stride)`), so it is correct-by-construction but changes the kernel's
     /// content hash.
-    pub fn subtile<R: Into<Idx>, C: Into<Idx>>(&self, dims: (usize, usize), blk: (R, C)) -> ST<'k> {
+    pub fn subtile<R: Into<Idx>, C: Into<Idx>>(&self, dims: (usize, usize), blk: (R, C)) -> ST {
         let blk = (blk.0.into(), blk.1.into());
         let frag_h = (dims.0 / self.base.base.rows) as i64;
         let frag_w = (dims.1 / self.base.base.cols) as i64;

@@ -163,7 +163,7 @@ fn elem_of(buf: &Arc<UOp>) -> DType {
     }
 }
 
-/// Macro for the shared tile accessors (`uop`/`shape`/`elem`/`ker`).
+/// Macro for the shared tile accessors (`uop`/`shape`/`elem`).
 macro_rules! tile_accessors {
     () => {
         /// The backing flat 1-D pointer buffer (or its `After` re-wrap).
@@ -178,6 +178,15 @@ macro_rules! tile_accessors {
         pub fn elem(&self) -> &DType {
             &self.elem
         }
+    };
+}
+
+/// `tile_accessors!` + the `ker: &'k Kernel` accessor for tiles that carry their
+/// building kernel (the operator-overload-backed RT/RV).
+macro_rules! tile_accessors_ker {
+    () => {
+        tile_accessors!();
+
         /// The building kernel.
         pub fn ker(&self) -> &'k Kernel {
             self.ker
@@ -188,25 +197,24 @@ macro_rules! tile_accessors {
 /// A global-memory tile: the next bound buffer placeholder (`Param`) plus its
 /// logical shape (e.g. `[1, 1, N, N]`). Accessed flat in load/store.
 #[derive(Clone)]
-pub struct GL<'k> {
+pub struct GL {
     buf: Arc<UOp>,
     shape: Vec<usize>,
     elem: DType,
-    ker: &'k Kernel,
 }
 
-impl<'k> GL<'k> {
+impl GL {
     tile_accessors!();
     /// Swap the backing buffer (after a store) keeping shape/dtype.
     pub fn rewrap(&self, new_uop: Arc<UOp>) -> Self {
-        GL { buf: new_uop, shape: self.shape.clone(), elem: self.elem.clone(), ker: self.ker }
+        GL { buf: new_uop, shape: self.shape.clone(), elem: self.elem.clone() }
     }
 }
 
 /// A shared-memory (LDS) tile: a grid of [`STBaseShape`] fragments. Logical
 /// shape is `[.., height, width, base.rows, base.cols]`.
 #[derive(Clone)]
-pub struct ST<'k> {
+pub struct ST {
     buf: Arc<UOp>,
     shape: Vec<usize>,
     pub rows: usize,
@@ -214,7 +222,6 @@ pub struct ST<'k> {
     pub layout: TileLayout,
     pub base: STBaseShape,
     elem: DType,
-    ker: &'k Kernel,
     /// Optional additive flat-element offset into the backing buffer — the
     /// software double-buffer parity select (`tile % 2 * half_elems`). `None`
     /// for an ordinary single-buffered tile (the common case). When `Some`, every
@@ -223,7 +230,7 @@ pub struct ST<'k> {
     base_offset: Option<Arc<UOp>>,
 }
 
-impl<'k> ST<'k> {
+impl ST {
     tile_accessors!();
     pub fn rewrap(&self, new_uop: Arc<UOp>) -> Self {
         ST {
@@ -234,7 +241,6 @@ impl<'k> ST<'k> {
             layout: self.layout,
             base: self.base,
             elem: self.elem.clone(),
-            ker: self.ker,
             base_offset: self.base_offset.clone(),
         }
     }
@@ -247,7 +253,7 @@ impl<'k> ST<'k> {
     /// This tile viewing one half of a double buffer: every LDS access adds
     /// `off` (an `Index`-typed element offset, typically `parity * half_elems()`)
     /// to its flat address. Clones the wrapper (shares the backing buffer).
-    pub fn with_base_offset(&self, off: Arc<UOp>) -> ST<'k> {
+    pub fn with_base_offset(&self, off: Arc<UOp>) -> ST {
         let mut t = self.rewrap(self.buf.clone());
         t.base_offset = Some(off);
         t
@@ -271,7 +277,7 @@ pub struct RT<'k> {
 }
 
 impl<'k> RT<'k> {
-    tile_accessors!();
+    tile_accessors_ker!();
     pub fn rewrap(&self, new_uop: Arc<UOp>) -> Self {
         RT {
             buf: new_uop,
@@ -298,7 +304,7 @@ pub struct RV<'k> {
 }
 
 impl<'k> RV<'k> {
-    tile_accessors!();
+    tile_accessors_ker!();
     pub fn rewrap(&self, new_uop: Arc<UOp>) -> Self {
         RV {
             buf: new_uop,
@@ -319,7 +325,7 @@ impl Kernel {
     /// the same byte width — addressing depends only on the element width, so a
     /// same-width mismatch (e.g. bf16/f16) is benign while a different-width one
     /// (e.g. f32 vs bf16) is a real declaration bug worth catching early.
-    pub fn gl(&self, shape: &[usize], dtype: DType) -> GL<'_> {
+    pub fn gl(&self, shape: &[usize], dtype: DType) -> GL {
         let buf = self.next_global();
         let elem = elem_of(&buf);
         debug_assert_eq!(
@@ -329,7 +335,7 @@ impl Kernel {
             dtype.bytes(),
             elem.bytes()
         );
-        GL { buf, shape: shape.to_vec(), elem, ker: self }
+        GL { buf, shape: shape.to_vec(), elem }
     }
 
     /// Allocate a shared-memory [`ST`] tile (tinygrad `ker.st`). `dims` is the
@@ -339,7 +345,7 @@ impl Kernel {
     /// # Panics
     /// Panics unless `rows` is a multiple of `base.base.rows`, `cols` a multiple
     /// of `base.base.cols`, and `cols` a multiple of the per-thread element count.
-    pub fn st(&self, dims: (usize, usize), dtype: DType, layout: TileLayout, base: STBaseShape) -> ST<'_> {
+    pub fn st(&self, dims: (usize, usize), dtype: DType, layout: TileLayout, base: STBaseShape) -> ST {
         let (rows, cols) = dims;
         assert_eq!(rows % base.base.rows, 0, "ST rows {rows} not a multiple of base {}", base.base.rows);
         assert_eq!(cols % base.base.cols, 0, "ST cols {cols} not a multiple of base {}", base.base.cols);
@@ -349,7 +355,7 @@ impl Kernel {
         let shape = vec![height, width, base.base.rows, base.base.cols];
         let flat = shape.iter().product();
         let buf = self.alloc_local(flat, dtype.clone());
-        ST { buf, shape, rows, cols, layout, base, elem: dtype, ker: self, base_offset: None }
+        ST { buf, shape, rows, cols, layout, base, elem: dtype, base_offset: None }
     }
 
     /// Allocate a **double-buffered** shared-memory [`ST`] tile: identical logical
@@ -362,7 +368,7 @@ impl Kernel {
     /// # Panics
     /// Panics unless `rows` is a multiple of `base.base.rows`, `cols` a multiple
     /// of `base.base.cols`, and `cols` a multiple of the per-thread element count.
-    pub fn st_db(&self, dims: (usize, usize), dtype: DType, layout: TileLayout, base: STBaseShape) -> ST<'_> {
+    pub fn st_db(&self, dims: (usize, usize), dtype: DType, layout: TileLayout, base: STBaseShape) -> ST {
         let (rows, cols) = dims;
         assert_eq!(rows % base.base.rows, 0, "ST rows {rows} not a multiple of base {}", base.base.rows);
         assert_eq!(cols % base.base.cols, 0, "ST cols {cols} not a multiple of base {}", base.base.cols);
@@ -372,7 +378,7 @@ impl Kernel {
         let shape = vec![height, width, base.base.rows, base.base.cols];
         let half: usize = shape.iter().product();
         let buf = self.alloc_local(2 * half, dtype.clone());
-        ST { buf, shape, rows, cols, layout, base, elem: dtype, ker: self, base_offset: None }
+        ST { buf, shape, rows, cols, layout, base, elem: dtype, base_offset: None }
     }
 
     /// Allocate a register [`RT`] tile (tinygrad `ker.rt`). `dims` is the
