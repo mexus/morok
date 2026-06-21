@@ -324,12 +324,16 @@ pub fn gemm_core<'k>(
     // Collaborative GLOBAL→LDS fill over all threads (each ends in a barrier);
     // Uses 128-bit vectorized loads for the large-N strips. B is indexed as
     // [K-strip, N-block] at (tile, col).
-    let a_idx = [Idx::Const(0), Idx::Const(0), Idx::from(&row), Idx::from(&tile)];
-    let b_idx = [Idx::Const(0), Idx::Const(0), Idx::from(&tile), Idx::from(&col)];
     let (a_smem, b_smem) = if cfg.vec_load {
-        (g.fill_local_vec(a_smem, a_gl, &a_idx, 2), g.fill_local_vec(b_smem, b_gl, &b_idx, 2))
+        (
+            g.fill_local_vec(a_smem, a_gl, &[Idx::Const(0), Idx::Const(0), Idx::from(&row), Idx::from(&tile)], 2),
+            g.fill_local_vec(b_smem, b_gl, &[Idx::Const(0), Idx::Const(0), Idx::from(&tile), Idx::from(&col)], 2),
+        )
     } else {
-        (g.load(a_smem, a_gl, MoveIdx::block(&a_idx, 2)), g.load(b_smem, b_gl, MoveIdx::block(&b_idx, 2)))
+        (
+            g.load(a_smem, a_gl, MoveIdx::block((0, 0, row.clone(), tile.clone()), 2)),
+            g.load(b_smem, b_gl, MoveIdx::block((0, 0, tile.clone(), col.clone()), 2)),
+        )
     };
 
     // Shared B sub-tile (N col-block {warp_col}, same for every accumulator) read as a
@@ -337,14 +341,14 @@ pub fn gemm_core<'k>(
     // {warp_row + a*wave_rows}).
     let bb = g.load(
         ker.operand((k_step, reg), bf16.clone(), TileLayout::Col),
-        b_smem.subtile((k_step, reg), (Idx::Const(0), Idx::from(&warp_col))),
+        b_smem.subtile((k_step, reg), (0, warp_col.clone())),
         MoveIdx::default(),
     );
     let a_subs: Vec<RT> = (0..cfg.n_accum)
         .map(|a| {
             g.load(
                 ker.operand((reg, k_step), bf16.clone(), TileLayout::Row),
-                a_smem.subtile((reg, k_step), (Idx::Uop(acc_row(&warp_row, a, &cfg)), Idx::Const(0))),
+                a_smem.subtile((reg, k_step), (acc_row(&warp_row, a, &cfg), 0)),
                 MoveIdx::default(),
             )
         })
@@ -380,6 +384,6 @@ pub fn gemm_core<'k>(
     let mut c_t = c_gl;
     for (a, c) in final_accs.into_iter().enumerate() {
         let mrow = row.mul(&cidx(bps)).add(&acc_row(&warp_row, a, &cfg));
-        c_t = g.store(c_t, c, MoveIdx::block(&[Idx::Const(0), Idx::Const(0), Idx::Uop(mrow), Idx::from(&nidx)], 2));
+        c_t = g.store(c_t, c, MoveIdx::block((0, 0, mrow.clone(), nidx.clone()), 2));
     }
 }

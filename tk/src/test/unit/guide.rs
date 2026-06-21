@@ -15,7 +15,6 @@ use svod_dtype::{DType, DeviceSpec};
 use svod_ir::{BinaryOp, Op, UOp};
 
 use crate::arch::FragRole;
-use crate::index::Idx;
 use crate::tiles::TileLayout;
 use crate::{ArchCaps, Kernel, MoveIdx};
 
@@ -36,18 +35,17 @@ fn build_tile_add(ker: &Kernel) -> Arc<UOp> {
     // Ask for the fragment by ROLE, not a hardcoded constant — `caps.frag`
     // resolves it to the arch-correct `16×16` f32 accumulator (wave64 or wave32).
     let frag = ker.caps.frag(FragRole::Accumulator);
-    let blk = [Idx::Const(0), Idx::Const(0), Idx::Const(0), Idx::Const(0)];
 
     // global -> register, straight into the fragment layout (axis 2 splits the
     // row stride of the `[1, 1, N, N]` view).
-    let ra = warp.load(ker.rt((16, 16), DType::Float32, ROW, frag), ga, MoveIdx::block(&blk, 2));
-    let rb = warp.load(ker.rt((16, 16), DType::Float32, ROW, frag), gb, MoveIdx::block(&blk, 2));
+    let ra = warp.load(ker.rt((16, 16), DType::Float32, ROW, frag), ga, MoveIdx::block((0, 0, 0, 0), 2));
+    let rb = warp.load(ker.rt((16, 16), DType::Float32, ROW, frag), gb, MoveIdx::block((0, 0, 0, 0), 2));
 
     // The one compute op: elementwise add (note `add` takes `a` by value, `b` by ref).
     let rc = warp.add(ra, &rb);
 
     // register -> global, then close the kernel around its single store.
-    let _ = warp.store(o, rc, MoveIdx::block(&blk, 2));
+    let _ = warp.store(o, rc, MoveIdx::block((0, 0, 0, 0), 2));
     ker.finish(1)
 }
 

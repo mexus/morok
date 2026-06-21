@@ -55,6 +55,65 @@ impl From<&Arc<UOp>> for Idx {
     }
 }
 
+mod private {
+    pub trait Sealed {}
+}
+
+/// A fixed-arity tuple (or slice/array) of `Into<Idx>` elements, collected
+/// into a stack-allocated `SmallVec<[Idx; 4]>`. Implemented for arities 1..=4
+/// (covers every `MoveIdx` call site in the crate) plus `&[Idx]`, `[Idx; N]`,
+/// and `Vec<Idx>` for back-compat. Sealed — extend by adding more tuple impls.
+pub trait IntoIdxs: private::Sealed {
+    fn into_idxs(self) -> smallvec::SmallVec<[Idx; 4]>;
+}
+
+impl private::Sealed for Idx {}
+impl IntoIdxs for Idx {
+    fn into_idxs(self) -> smallvec::SmallVec<[Idx; 4]> {
+        smallvec::smallvec![self]
+    }
+}
+
+macro_rules! impl_tuple_intoids {
+    ($($a:ident:$i:tt),+) => {
+        impl<$($a),+> private::Sealed for ($($a,)+) {}
+        impl<$($a),+> IntoIdxs for ($($a,)+)
+        where
+            $($a: Into<Idx>,)+
+        {
+            fn into_idxs(self) -> smallvec::SmallVec<[Idx; 4]> {
+                smallvec::smallvec!($(self.$i.into(),)+)
+            }
+        }
+    };
+}
+
+impl_tuple_intoids!(A:0);
+impl_tuple_intoids!(A:0, B:1);
+impl_tuple_intoids!(A:0, B:1, C:2);
+impl_tuple_intoids!(A:0, B:1, C:2, D:3);
+
+impl<const N: usize> private::Sealed for [Idx; N] {}
+impl<const N: usize> IntoIdxs for [Idx; N] {
+    fn into_idxs(self) -> smallvec::SmallVec<[Idx; 4]> {
+        self.into_iter().collect()
+    }
+}
+
+impl private::Sealed for &[Idx] {}
+impl IntoIdxs for &[Idx] {
+    fn into_idxs(self) -> smallvec::SmallVec<[Idx; 4]> {
+        self.iter().cloned().collect()
+    }
+}
+
+impl private::Sealed for Vec<Idx> {}
+impl IntoIdxs for Vec<Idx> {
+    fn into_idxs(self) -> smallvec::SmallVec<[Idx; 4]> {
+        smallvec::SmallVec::from_vec(self)
+    }
+}
+
 /// A constant `Index`-typed UOp.
 pub(crate) fn cidx(v: i64) -> Arc<UOp> {
     UOp::const_(DType::Index, ConstValue::Int(v))

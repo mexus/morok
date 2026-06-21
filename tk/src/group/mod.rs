@@ -33,11 +33,12 @@ mod shuffle;
 /// ops no longer disagree on positional slots. `block` is the wave sub-tile / global
 /// block offset (the old `idxs`); `frag` is the REG-side fragment offset (the old
 /// `dst_idxs` on load / `src_idxs` on store). `axis` is the global-tile row-stride
-/// split (ignored by the LOCAL↔REG hops). Borrows the slices for the call.
-#[derive(Clone, Copy, Default)]
-pub struct MoveIdx<'a> {
-    pub block: &'a [Idx],
-    pub frag: &'a [Idx],
+/// split (ignored by the LOCAL↔REG hops). Owned `SmallVec` — constructed from any
+/// [`IntoIdxs`] (a tuple of `Into<Idx>` elements or a back-compat `&[Idx]`).
+#[derive(Clone, Default)]
+pub struct MoveIdx {
+    pub block: SmallVec<[Idx; 4]>,
+    pub frag: SmallVec<[Idx; 4]>,
     pub axis: usize,
     /// Gate the GLOBAL↔REG hop against the tensor's true extent so a tile
     /// straddling a ragged `N`/`M`/`D` edge reads `0.0` (load) / drops the write
@@ -47,18 +48,18 @@ pub struct MoveIdx<'a> {
     pub masked: bool,
 }
 
-impl<'a> MoveIdx<'a> {
+impl MoveIdx {
     /// A wave/global `block` offset at `axis` (the common fill/gather/store case).
-    pub fn block(block: &'a [Idx], axis: usize) -> Self {
-        Self { block, frag: &[], axis, masked: false }
+    pub fn block<I: crate::index::IntoIdxs>(idxs: I, axis: usize) -> Self {
+        Self { block: idxs.into_idxs(), frag: SmallVec::new(), axis, masked: false }
     }
     /// A REG-side `frag` offset only.
-    pub fn frag(frag: &'a [Idx]) -> Self {
-        Self { frag, block: &[], axis: 0, masked: false }
+    pub fn frag<I: crate::index::IntoIdxs>(idxs: I) -> Self {
+        Self { frag: idxs.into_idxs(), block: SmallVec::new(), axis: 0, masked: false }
     }
     /// Both a `block` and a `frag` offset at `axis`.
-    pub fn at(block: &'a [Idx], frag: &'a [Idx], axis: usize) -> Self {
-        Self { block, frag, axis, masked: false }
+    pub fn at<B: crate::index::IntoIdxs, F: crate::index::IntoIdxs>(block: B, frag: F, axis: usize) -> Self {
+        Self { block: block.into_idxs(), frag: frag.into_idxs(), axis, masked: false }
     }
     /// Boundary-mask this GLOBAL↔REG hop (see [`MoveIdx::masked`]).
     pub fn masked(mut self) -> Self {
@@ -72,44 +73,44 @@ impl<'a> MoveIdx<'a> {
 /// *compile* error (no impl), not a runtime panic. `Output` is the rewrapped dst.
 pub trait LoadInto<'k, Dst> {
     type Output;
-    fn load_into(self, g: &Group<'k>, dst: Dst, ix: MoveIdx<'_>) -> Self::Output;
+    fn load_into(self, g: &Group<'k>, dst: Dst, ix: MoveIdx) -> Self::Output;
 }
 
 /// A source REG tile that can be stored INTO `Dst` (`ST` or `GL`); illegal pairs are
 /// a compile error.
 pub trait StoreInto<'k, Dst> {
     type Output;
-    fn store_into(self, g: &Group<'k>, dst: Dst, ix: MoveIdx<'_>) -> Self::Output;
+    fn store_into(self, g: &Group<'k>, dst: Dst, ix: MoveIdx) -> Self::Output;
 }
 
 impl<'k> LoadInto<'k, ST<'k>> for GL<'k> {
     type Output = ST<'k>;
-    fn load_into(self, g: &Group<'k>, dst: ST<'k>, ix: MoveIdx<'_>) -> ST<'k> {
-        g.load_global_to_local(dst, &self, ix.block, ix.axis, true)
+    fn load_into(self, g: &Group<'k>, dst: ST<'k>, ix: MoveIdx) -> ST<'k> {
+        g.load_global_to_local(dst, &self, &ix.block, ix.axis, true)
     }
 }
 impl<'k> LoadInto<'k, RT<'k>> for ST<'k> {
     type Output = RT<'k>;
-    fn load_into(self, g: &Group<'k>, dst: RT<'k>, ix: MoveIdx<'_>) -> RT<'k> {
-        g.load_local_to_reg(dst, &self, ix.frag, ix.block)
+    fn load_into(self, g: &Group<'k>, dst: RT<'k>, ix: MoveIdx) -> RT<'k> {
+        g.load_local_to_reg(dst, &self, &ix.frag, &ix.block)
     }
 }
 impl<'k> LoadInto<'k, RT<'k>> for GL<'k> {
     type Output = RT<'k>;
-    fn load_into(self, g: &Group<'k>, dst: RT<'k>, ix: MoveIdx<'_>) -> RT<'k> {
-        g.load_global_to_reg(dst, &self, ix.frag, ix.block, ix.axis, ix.masked)
+    fn load_into(self, g: &Group<'k>, dst: RT<'k>, ix: MoveIdx) -> RT<'k> {
+        g.load_global_to_reg(dst, &self, &ix.frag, &ix.block, ix.axis, ix.masked)
     }
 }
 impl<'k> StoreInto<'k, ST<'k>> for RT<'k> {
     type Output = ST<'k>;
-    fn store_into(self, g: &Group<'k>, dst: ST<'k>, ix: MoveIdx<'_>) -> ST<'k> {
-        g.store_reg_to_local(dst, &self, ix.block, ix.frag)
+    fn store_into(self, g: &Group<'k>, dst: ST<'k>, ix: MoveIdx) -> ST<'k> {
+        g.store_reg_to_local(dst, &self, &ix.block, &ix.frag)
     }
 }
 impl<'k> StoreInto<'k, GL<'k>> for RT<'k> {
     type Output = GL<'k>;
-    fn store_into(self, g: &Group<'k>, dst: GL<'k>, ix: MoveIdx<'_>) -> GL<'k> {
-        g.store_reg_to_global(dst, &self, ix.block, ix.frag, ix.axis, ix.masked)
+    fn store_into(self, g: &Group<'k>, dst: GL<'k>, ix: MoveIdx) -> GL<'k> {
+        g.store_reg_to_global(dst, &self, &ix.block, &ix.frag, ix.axis, ix.masked)
     }
 }
 
@@ -396,7 +397,8 @@ impl<'k> ST<'k> {
     /// from the folded form (`imul(a·k + local, stride)` → `imul(local, stride) +
     /// imul(a·k, stride)`), so it is correct-by-construction but changes the kernel's
     /// content hash.
-    pub fn subtile(&self, dims: (usize, usize), blk: (Idx, Idx)) -> ST<'k> {
+    pub fn subtile<R: Into<Idx>, C: Into<Idx>>(&self, dims: (usize, usize), blk: (R, C)) -> ST<'k> {
+        let blk = (blk.0.into(), blk.1.into());
         let frag_h = (dims.0 / self.base.base.rows) as i64;
         let frag_w = (dims.1 / self.base.base.cols) as i64;
         let band = flat_offset(

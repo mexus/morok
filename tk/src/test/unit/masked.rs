@@ -12,7 +12,6 @@ use svod_dtype::{DType, DeviceSpec};
 use svod_ir::{Op, UOp};
 
 use crate::arch::FragRole;
-use crate::index::Idx;
 use crate::tiles::{RT_16X16, TileLayout};
 use crate::{ArchCaps, Kernel, MoveIdx};
 
@@ -29,8 +28,7 @@ fn test_masked_load_graph_shape() {
         let warp = ker.warp();
         let g = ker.gl(&shape, DType::Float32);
         let rt = ker.rt((32, 32), DType::Float32, ROW, RT_16X16);
-        let z = [Idx::Const(0), Idx::Const(0), Idx::Const(0), Idx::Const(0)];
-        let mi = MoveIdx::block(&z, 2);
+        let mi = MoveIdx::block((0, 0, 0, 0), 2);
         let mi = if masked { mi.masked() } else { mi };
         warp.load(rt, g, mi).uop().toposort()
     };
@@ -58,8 +56,7 @@ fn test_masked_store_graph_shape() {
     let warp = ker.warp();
     let g = ker.gl(&[1, 1, 17, 20], DType::Float32);
     let rt = warp.zero(ker.rt((32, 32), DType::Float32, ROW, RT_16X16));
-    let z = [Idx::Const(0), Idx::Const(0), Idx::Const(0), Idx::Const(0)];
-    let topo = warp.store(g, rt, MoveIdx::block(&z, 2).masked()).uop().toposort();
+    let topo = warp.store(g, rt, MoveIdx::block((0, 0, 0, 0), 2).masked()).uop().toposort();
     assert!(topo.iter().any(|u| matches!(u.op(), Op::Index { gate: Some(_), .. })), "masked ragged store: gated INDEX");
 }
 
@@ -95,10 +92,10 @@ fn test_masked_load_roundtrip_amd() {
         let frag = ker.caps.frag(FragRole::Accumulator);
         let o = ker.gl(&[1, 1, 32, 32], DType::Float32);
         let ain = ker.gl(&[1, 1, rows, cols], DType::Float32);
-        let z = [Idx::Const(0), Idx::Const(0), Idx::Const(0), Idx::Const(0)];
         // Masked load of a 32×32 tile straddling the [17, 20] edge → OOB lanes 0.0.
-        let tile = warp.load(ker.rt((32, 32), DType::Float32, ROW, frag), ain, MoveIdx::block(&z, 2).masked());
-        let _ = warp.store(o, tile, MoveIdx::block(&z, 2));
+        let tile =
+            warp.load(ker.rt((32, 32), DType::Float32, ROW, frag), ain, MoveIdx::block((0, 0, 0, 0), 2).masked());
+        let _ = warp.store(o, tile, MoveIdx::block((0, 0, 0, 0), 2));
         ker.finish(1)
     })
     .expect("masked_roundtrip launch");

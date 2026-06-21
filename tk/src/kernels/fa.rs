@@ -260,7 +260,7 @@ fn fa_softmax_pv<'k>(
             // band size is `att`'s element shape (its fragment grid × the base edge).
             let an = att.shape().len();
             let dims = (att.shape()[an - 3] * att.base.base.rows, att.shape()[an - 2] * att.base.base.cols);
-            let band = att_smem.subtile(dims, (Idx::from(ctx.warpid), Idx::Const(0)));
+            let band = att_smem.subtile(dims, (ctx.warpid.clone(), 0));
             let stored = warp.store(band, att, MoveIdx::default());
             let bar = stored.uop().barrier(smallvec![lp.index().clone(), norm_vec.uop().clone()]);
             let stored = stored.rewrap(stored.uop().after(smallvec![bar]));
@@ -395,8 +395,7 @@ pub(crate) fn build_fa_mw_rdb(
     let acc = FaAcc { max_vec: warp.neg_inf_rv(max_vec), norm_vec: warp.zero_rv(norm_vec), o_reg: warp.zero(o_reg) };
 
     // Load + scale this warp's Q tile, then transpose for the QKᵀ contraction.
-    let q_idx = [Idx::from(&batch), Idx::from(&q_blk), Idx::from(&head), Idx::Const(0)];
-    let q_reg_fl = warp.load(q_reg_fl, q, MoveIdx::block(&q_idx, 1));
+    let q_reg_fl = warp.load(q_reg_fl, q, MoveIdx::block((batch.clone(), q_blk.clone(), head.clone(), 0), 1));
     let q_reg_fl = q_reg_fl * ((1.0 / (d as f64).sqrt()) * std::f64::consts::LOG2_E);
     let q_reg = warp.copy(q_reg, &q_reg_fl);
     let q_reg_t = warp.transpose(q_reg_t, &q_reg);
@@ -475,8 +474,7 @@ pub(crate) fn build_fa_mw_rdb(
 
     let o_reg = o_reg / &norm_vec;
     let o_reg_t = warp.transpose(o_reg_t, &o_reg);
-    let o_idx = [Idx::from(&batch), Idx::from(&q_blk), Idx::from(&head), Idx::Const(0)];
-    let _ = warp.store(o, o_reg_t, MoveIdx::block(&o_idx, 1));
+    let _ = warp.store(o, o_reg_t, MoveIdx::block((batch.clone(), q_blk.clone(), head.clone(), 0), 1));
 }
 
 /// Per-warp tile for [`build_fa_mw_rdb`]: the bigger `{32,32}` (which amortizes the

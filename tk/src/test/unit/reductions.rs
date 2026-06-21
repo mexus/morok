@@ -9,7 +9,6 @@ use svod_dtype::{AmdArch, DType};
 use svod_ir::{BinaryOp, Op};
 
 use crate::arch::FragRole;
-use crate::index::Idx;
 use crate::tile::RegTile;
 use crate::tiles::{RT_16X16, ST_16X16, TileLayout, VecLayout};
 use crate::{ArchCaps, ArgDir, Kernel, MoveIdx};
@@ -40,8 +39,7 @@ fn build_softmax(ker: &Kernel, n: usize, block: usize) {
     {
         let a_smem = ker.st((block, block), DType::Float32, TileLayout::Row, ST_16X16);
         let a_reg = ker.rt((block, block), DType::Float32, TileLayout::Row, RT_16X16);
-        let idxs = [Idx::Const(0), Idx::Const(0), Idx::Const(0), Idx::from(&tile_col)];
-        let a_smem = warp.load(a_smem, a.clone(), MoveIdx::block(&idxs, 2));
+        let a_smem = warp.load(a_smem, a.clone(), MoveIdx::block((0, 0, 0, tile_col.clone()), 2));
         let a_reg = warp.load(a_reg, a_smem, MoveIdx::default());
         let a_reg = warp.mul_scalar(a_reg, INV_LN2);
 
@@ -63,14 +61,13 @@ fn build_softmax(ker: &Kernel, n: usize, block: usize) {
     {
         let a_smem = ker.st((block, block), DType::Float32, TileLayout::Row, ST_16X16);
         let a_reg = ker.rt((block, block), DType::Float32, TileLayout::Row, RT_16X16);
-        let idxs = [Idx::Const(0), Idx::Const(0), Idx::Const(0), Idx::from(&tile_col)];
-        let a_smem = warp.load(a_smem, a.clone(), MoveIdx::block(&idxs, 2));
+        let a_smem = warp.load(a_smem, a.clone(), MoveIdx::block((0, 0, 0, tile_col.clone()), 2));
         let a_reg = warp.load(a_reg, a_smem, MoveIdx::default());
         let a_reg = warp.mul_scalar(a_reg, INV_LN2);
         let a_reg = warp.sub_rv(a_reg, &max_vec);
         let a_reg = warp.exp2(a_reg);
         let a_reg = warp.div_rv(a_reg, &norm_vec);
-        let _ = warp.store(b, a_reg, MoveIdx::block(&idxs, 2));
+        let _ = warp.store(b, a_reg, MoveIdx::block((0, 0, 0, tile_col), 2));
     }
 }
 
@@ -287,17 +284,16 @@ fn test_row_argmin_amd() {
         let vo = ker.gl(&[1, 1, 16, 16], DType::Float32);
         let io = ker.gl(&[1, 1, 16, 16], DType::Int32);
         let ain = ker.gl(&[1, 1, 16, 16], DType::Float32);
-        let z = [Idx::Const(0), Idx::Const(0), Idx::Const(0), Idx::Const(0)];
 
-        let src = warp.load(ker.rt((16, 16), DType::Float32, ROW, frag), ain, MoveIdx::block(&z, 2));
+        let src = warp.load(ker.rt((16, 16), DType::Float32, ROW, frag), ain, MoveIdx::block((0, 0, 0, 0), 2));
         let val = warp.clear_rv(ker.rv(16, DType::Float32, VecLayout::Ortho, frag), f64::INFINITY);
         let idx = warp.clear_rv(ker.rv(16, DType::Int32, VecLayout::Ortho, frag), -1.0);
         let (val, idx) = warp.row_arg_reduce(val, idx, &src, ArgDir::Min);
 
         let vtile = warp.add_rv(warp.zero(ker.rt((16, 16), DType::Float32, ROW, frag)), &val);
         let itile = warp.add_rv(warp.zero(ker.rt((16, 16), DType::Int32, ROW, frag)), &idx);
-        let _ = warp.store(vo, vtile, MoveIdx::block(&z, 2));
-        let _ = warp.store(io, itile, MoveIdx::block(&z, 2));
+        let _ = warp.store(vo, vtile, MoveIdx::block((0, 0, 0, 0), 2));
+        let _ = warp.store(io, itile, MoveIdx::block((0, 0, 0, 0), 2));
         ker.finish(2)
     })
     .expect("argmin launch");

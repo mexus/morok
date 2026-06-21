@@ -50,7 +50,7 @@ impl<'k> Group<'k> {
     /// # Panics
     /// A LOCAL→REG (`ST` → `RT`) load panics unless the REG tile fits within the
     /// ST tile — its fragment-grid rows and cols must each be `<=` the ST's.
-    pub fn load<Dst, Src>(&self, dst: Dst, src: Src, ix: MoveIdx<'_>) -> Src::Output
+    pub fn load<Dst, Src>(&self, dst: Dst, src: Src, ix: MoveIdx) -> Src::Output
     where
         Src: super::LoadInto<'k, Dst>,
     {
@@ -157,7 +157,7 @@ impl<'k> Group<'k> {
     /// # Panics
     /// A REG→GLOBAL store panics if `ix.axis` is out of range for the GLOBAL
     /// destination's rank (the row-stride is the product of the dims after it).
-    pub fn store<Dst, Src>(&self, dst: Dst, src: Src, ix: MoveIdx<'_>) -> Src::Output
+    pub fn store<Dst, Src>(&self, dst: Dst, src: Src, ix: MoveIdx) -> Src::Output
     where
         Src: super::StoreInto<'k, Dst>,
     {

@@ -125,8 +125,7 @@ fn score_tile<'k>(
     let c_reg = ker.operand((m_rows, d), bf16.clone(), row);
     let c_reg_t = ker.operand((d, m_rows), bf16.clone(), col);
 
-    let c_idx = [Idx::Const(0), Idx::Const(0), m_blk.clone(), Idx::Const(0)];
-    let c_smem = warp.load(c_smem, c_gl.clone(), MoveIdx::block(&c_idx, 2));
+    let c_smem = warp.load(c_smem, c_gl.clone(), MoveIdx::block((0, 0, m_blk.clone(), 0), 2));
     let c_reg = warp.load(c_reg, c_smem, MoveIdx::default());
     let c_reg_t = warp.transpose(c_reg_t, &c_reg);
 
@@ -142,8 +141,7 @@ fn score_tile<'k>(
     // Load c_sq_rep[m_blk] into the SAME accumulator fragment + layout as the cross
     // MMA output, so the two align lane-for-lane (both index the accumulator frag's
     // `lane_rc`; orientation-robust per the reductions/masked tests).
-    let cs_idx = [Idx::Const(0), Idx::Const(0), m_blk.clone(), Idx::Const(0)];
-    let cs_mi = MoveIdx::block(&cs_idx, 2);
+    let cs_mi = MoveIdx::block((0, 0, m_blk.clone(), 0), 2);
     let cs_mi = if masked { cs_mi.masked() } else { cs_mi };
     let c_sq = warp.load(ker.acc((m_rows, query), col), c_sq_gl.clone(), cs_mi);
 
@@ -191,8 +189,7 @@ pub fn build_knn_score(ker: &Kernel, corpus: usize, query: usize, d: usize) {
 
     // The whole corpus in one `(corpus, query)` tile (the Stage-1 single-store shape).
     let score = score_tile(ker, &warp, corpus, query, d, &x_reg_t, &c_gl, &c_sq_gl, &Idx::Const(0), false);
-    let zero4 = [Idx::Const(0), Idx::Const(0), Idx::Const(0), Idx::Const(0)];
-    let _ = warp.store(score_gl, score, MoveIdx::block(&zero4, 2));
+    let _ = warp.store(score_gl, score, MoveIdx::block((0, 0, 0, 0), 2));
 }
 
 /// Load the query tile `[query, d]` and transpose it to its `[d, query]` Col
@@ -208,8 +205,7 @@ fn load_query_t<'k>(ker: &'k Kernel, warp: &Group<'k>, query: usize, d: usize, x
     let x_smem = ker.shared_sw((query, d), bf16.clone(), row);
     let x_reg = ker.operand((query, d), bf16.clone(), row);
     let x_reg_t = ker.operand((d, query), bf16.clone(), col);
-    let x_idx = [Idx::Const(0), Idx::Const(0), q_blk.clone(), Idx::Const(0)];
-    let x_smem = warp.load(x_smem, x_gl.clone(), MoveIdx::block(&x_idx, 2));
+    let x_smem = warp.load(x_smem, x_gl.clone(), MoveIdx::block((0, 0, q_blk.clone(), 0), 2));
     let x_reg = warp.load(x_reg, x_smem, MoveIdx::default());
     warp.transpose(x_reg_t, &x_reg)
 }
@@ -521,8 +517,11 @@ fn store_topk<'k>(
     // block, in query-tile-height units), the store-side mirror of `load_query_t`'s
     // load offset, so each workgroup writes its own 16-query rows of the `[Npad, k]`
     // output. `Idx::Const(0)` ⇒ the single-block (`N ≤ 16`) path.
-    let o_idx = [Idx::Const(0), Idx::Const(0), q_blk.clone(), Idx::Const(0)];
-    let mi = if k.is_multiple_of(BLK) { MoveIdx::block(&o_idx, 2) } else { MoveIdx::block(&o_idx, 2).masked() };
+    let mi = if k.is_multiple_of(BLK) {
+        MoveIdx::block((0, 0, q_blk.clone(), 0), 2)
+    } else {
+        MoveIdx::block((0, 0, q_blk.clone(), 0), 2).masked()
+    };
 
     // Transpose Col [BLK, query] → Row [query, BLK] (AccumulatorT), then masked-store
     // its first `k` columns to the [query, k] output. Both transposes (which push
@@ -531,7 +530,7 @@ fn store_topk<'k>(
     // the two output writes.
     let val_t = warp.transpose(ker.acc_t((query, BLK), row), val_after);
     let idx_t = warp.transpose(ker.rt((query, BLK), i32.clone(), row, acc_t), idx_after);
-    let _ = warp.store(val_gl.clone(), val_t, mi);
+    let _ = warp.store(val_gl.clone(), val_t, mi.clone());
     let _ = warp.store(idx_gl.clone(), idx_t, mi);
 }
 

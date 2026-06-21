@@ -92,8 +92,7 @@ fn test_mma_unroll_flattens_mfma() {
         let b = warp.zero(ker.rt((n, n), DType::BFloat16, TileLayout::Col, RT_16X16));
         let c = warp.zero(ker.rt((n, n), DType::Float32, TileLayout::Col, RT_16X16));
         let c = warp.mma_ab(c, &a, &b);
-        let z = || crate::index::Idx::Const(0);
-        let _ = warp.store(c_gl, c, MoveIdx::block(&[z(), z(), z(), z()], 2));
+        let _ = warp.store(c_gl, c, MoveIdx::block((0, 0, 0, 0), 2));
         ker.finish(1)
     };
 

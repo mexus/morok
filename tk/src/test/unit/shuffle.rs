@@ -7,7 +7,6 @@ use svod_dtype::{AmdArch, DType};
 use svod_ir::Op;
 
 use crate::arch::FragRole;
-use crate::index::Idx;
 use crate::tiles::{RT_16X16, TileLayout};
 use crate::{ArchCaps, Kernel, MoveIdx, SwapDir};
 
@@ -87,8 +86,7 @@ fn test_shuffle_xor_allreduce_amd() {
             let tmp = warp.shuffle_xor(ker.rt((16, 16), DType::Float32, ROW, frag), &x, mask);
             x = warp.add(x, &tmp);
         }
-        let o_idx = [Idx::Const(0), Idx::Const(0), Idx::Const(0), Idx::Const(0)];
-        let _ = warp.store(o, x, MoveIdx::block(&o_idx, 2));
+        let _ = warp.store(o, x, MoveIdx::block((0, 0, 0, 0), 2));
         ker.finish(1)
     })
     .expect("allreduce launch");
