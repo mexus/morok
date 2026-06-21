@@ -144,7 +144,7 @@ pub fn create_vector_index_iota(buffer: Arc<UOp>, count: usize) -> Arc<UOp> {
 ///
 /// In real code, this conversion happens during kernel splitting.
 /// For tests, we create codegen PARAM (device: None) directly.
-fn buffer_to_define(buffer: &Arc<UOp>) -> Arc<UOp> {
+pub fn buffer_to_define(buffer: &Arc<UOp>) -> Arc<UOp> {
     static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let size = match buffer.dtype() {

@@ -1306,8 +1306,18 @@ fn is_vector_index(uop: &Arc<UOp>) -> bool {
     if idx.dtype().vcount() <= 1 {
         return false;
     }
-    let Op::Vectorize { elements } = buffer.op() else { return false };
-    !elements.is_empty() && elements.iter().all(is_define_or_after)
+    // Two buffer shapes are accepted:
+    //  (a) VECTORIZE of defines/params — the pre-Op-4 hot path: the expander
+    //      broadcast the buffer, and expand_index_to_vectorize splits per lane.
+    //  (b) A scalar define/param — the post-Op-4 path (do_expand Case 4 Ptr
+    //      guard keeps the buffer scalar). `expand_index_to_vectorize` already
+    //      handles this via its `else { buffer.clone() }` fallback; without
+    //      this predicate extension, a STORE-side INDEX(scalar_ptr, vec_idx)
+    //      survives to the renderer, which emits an illegal `<N x ptr>` GEP.
+    match buffer.op() {
+        Op::Vectorize { elements } => !elements.is_empty() && elements.iter().all(is_define_or_after),
+        _ => is_define_or_after(buffer),
+    }
 }
 
 // ============================================================================

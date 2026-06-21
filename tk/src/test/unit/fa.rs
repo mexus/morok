@@ -116,11 +116,11 @@ fn test_fa_mw_rdb_renders_bounded() {
 /// Host regression guard for the **graph/realize-path** lowering of a hand-lowered
 /// (`opts_to_apply=Some(vec![])`) tile-kernel SINK on AMD. Mirrors the realize
 /// optimize→render path: `optimize_kernel_with_config` → `decompose_with` →
-/// `program_from_sink` → `do_linearize` → `type_verify`. Without the
-/// hand-lowered-kernel optimizer bypass (`schedule/src/optimizer/mod.rs`), the
-/// UNROLL-expander broadcasts a scalar GLOBAL `Ptr` into an illegal `Ptr{vcount:4}`
-/// vector that fails `type_verify`; with the bypass it renders identically to the
-/// direct path (`test_fa_mw_rdb_renders_bounded`): rolled QKᵀ/A·V loops, one iglp.
+/// `program_from_sink` → `do_linearize` → `type_verify`. The optimizer's
+/// hand-lowered bypass (`schedule/src/optimizer/mod.rs`) reduces the SINK with
+/// `pm_lower_index_dtype` only; the SINK's `Op::Special` (gidx/lidx) marker is
+/// what activates it. Renders identically to the direct path
+/// (`test_fa_mw_rdb_renders_bounded`): rolled QKᵀ/A·V loops, one iglp.
 #[test]
 fn test_fa_graph_path_renders_clean() {
     use svod_schedule::{OptimizerConfig, OptimizerRenderer, optimize_kernel_with_config};
@@ -179,6 +179,73 @@ fn test_fa_graph_path_renders_clean() {
         1,
         "marker lowered to one iglp delegation (identical to the direct path)"
     );
+}
+
+/// Host regression guard for the **graph/realize-path** lowering of a hand-lowered
+/// FA SINK on **RDNA3.5 (gfx1151, wave32)** — the wave32 peer of
+/// `test_fa_graph_path_renders_clean`. The optimizer's hand-lowered bypass
+/// reduces the SINK with `pm_lower_index_dtype` only, then renders to gfx11
+/// LLVM IR. Asserts the rendered IR contains zero `x ptr>` tokens (the illegal
+/// vector-of-pointers shape) and that the wave32 WMMA calls are present.
+#[test]
+fn test_fa_graph_path_renders_clean_gfx1151() {
+    use svod_schedule::{OptimizerConfig, OptimizerRenderer, optimize_kernel_with_config};
+
+    let (b, h, h_kv, d) = (1usize, 16, 16, 64);
+    let n = 512usize;
+    let (q_blk, kv_blk) = (16usize, 16usize);
+    let ker = Kernel::new(
+        "fa_mw_rdb_w32",
+        [h as i64, (n / q_blk / 8) as i64, b as i64],
+        8 * 32, // NUM_WARPS * wave32
+        dummy_fa_buffers(b, n, h, h_kv, d),
+        crate::ArchCaps::for_arch(svod_dtype::AmdArch::Gfx1151),
+    );
+    build_fa_mw_rdb(
+        &ker,
+        b,
+        n,
+        h,
+        h_kv,
+        d,
+        FaConfig { q_blk, kv_blk, causal: false, ..Default::default() },
+        svod_dtype::DType::BFloat16,
+        false,
+    );
+    let sink = ker.finish(1);
+
+    let opt_ren = OptimizerRenderer::for_amd_arch(svod_dtype::AmdArch::Gfx1151);
+    let config = OptimizerConfig::default();
+    let optimized = optimize_kernel_with_config(sink, &opt_ren, &config).expect("optimize");
+
+    let text_ren = svod_codegen::llvm::LlvmTextRenderer::amd(svod_dtype::AmdArch::Gfx1151);
+    let decomposed = match svod_codegen::traits::Renderer::decompositor(&text_ren) {
+        Some(m) => svod_ir::decompositions::decompose_with(&optimized, &m),
+        None => optimized,
+    };
+    let program = svod_codegen::program_pipeline::program_from_sink(decomposed, svod_dtype::DeviceSpec::Cpu);
+    let linearized = svod_codegen::program_pipeline::do_linearize(&program).expect("do_linearize");
+    let linear_uop = linearized
+        .toposort()
+        .into_iter()
+        .find(|u| matches!(u.op(), svod_ir::Op::Linear { .. }))
+        .expect("LINEAR present");
+    svod_schedule::spec::type_verify(&linear_uop, &svod_schedule::spec::spec_program()).expect("type_verify must pass");
+    let code = svod_codegen::traits::Renderer::render(&text_ren, &linear_uop, Some("fa_rdb_w32")).expect("render").code;
+
+    // The illegal vector-of-pointers (`<N x ptr>`) must NEVER appear in the
+    // rendered IR — it trips AMD clang with "defined with type '<N x ptr>' but
+    // expected 'ptr'". Scan for any `x ptr>` token (covers `<4 x ptr>`,
+    // `<8 x ptr>`, etc.).
+    let vec_ptr_count = code.matches("x ptr>").count();
+    assert_eq!(
+        vec_ptr_count, 0,
+        "rendered gfx1151 IR must not contain vector-of-pointers; found {vec_ptr_count} occurrences"
+    );
+
+    // RDNA WMMA, not CDNA MFMA — confirms the wave32 fragment path is taken.
+    let wmma = code.lines().filter(|l| l.contains("wmma.f32.16x16x16") && !l.contains("declare")).count();
+    assert!(wmma > 0, "wave32 graph FA must render gfx11 WMMA calls, got {wmma}");
 }
 
 /// Render-regression (CPU, no GPU) for the **RDNA3.5 (gfx1151, wave32)** FA path:

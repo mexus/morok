@@ -292,3 +292,81 @@ fn test_broadcast_count_one_is_passthrough() {
 
     assert!(std::sync::Arc::ptr_eq(&scalar, &same), "broadcast(_, 1) should clone the Arc, not wrap");
 }
+
+// =============================================================================
+// Ptr Source Guard (do_expand Case 4)
+// =============================================================================
+//
+// A scalar `Ptr`-typed source (e.g., a global buffer PARAM used by a tk
+// per-element INDEX) MUST NOT be broadcast by `do_expand` Case 4. Broadcasting
+// it produces `VECTORIZE([PARAM; N])` with dtype `Ptr{vcount:N}` — an illegal
+// "vector of N pointers" that trips `rule_vectorize` (each lane's dtype
+// `Ptr{vcount:1}` != `scalar_dtype()`). The fix passes the scalar `Ptr`
+// through unchanged; the downstream devectorizer handles scalar-buffer +
+// vector-index via `expand_index_to_vectorize` + `fold_expanded_index` +
+// `distribute_ptrcat_load`.
+
+/// `do_expand` Case 4 on a Ptr-typed buffer source: the PARAM is passed through
+/// unchanged (no `VECTORIZE` of pointer-typed elements is created), so the
+/// resulting INDEX keeps its scalar `Ptr` buffer. This unblocks the schedule
+/// optimizer for hand-lowered (`opts_to_apply=Some(vec![])`) tk kernels.
+#[test]
+fn test_do_expand_ptr_not_broadcasted() {
+    use svod_dtype::{AddrSpace, ScalarDType};
+    use svod_ir::Op;
+
+    let ptr_dtype = DType::Scalar(ScalarDType::Float32).ptr(Some(64), AddrSpace::Global).expect("ptr dtype");
+    let buf = UOp::param(0, 64, ptr_dtype, None);
+
+    // INDEX(buf, UNROLL(VCONST([0,1,2,3]), [(1,4)])) with ptr=true — the tk
+    // per-element addressing pattern that triggers do_expand Case 4 on `buf`.
+    let unroll_offset = create_unroll_iota(1, 4);
+    let index = UOp::index().buffer(buf.clone()).indices(vec![unroll_offset]).ptr(true).call().expect("index");
+
+    let result = phase2_only(&index);
+
+    // (a) No VECTORIZE node whose elements are pointer-typed may exist anywhere
+    // in the toposort — that would be the illegal "vector of pointers".
+    let bad_vec = count_ops(&result, |u| match u.op() {
+        Op::Vectorize { elements } => {
+            !elements.is_empty() && elements.iter().all(|e| matches!(e.dtype(), DType::Ptr { .. }))
+        }
+        _ => false,
+    });
+    assert_eq!(bad_vec, 0, "do_expand Case 4 must not broadcast a Ptr-typed source into a VECTORIZE-of-pointers");
+
+    // (b) The scalar `Ptr` PARAM survives pointer-equal — Case 4 pushed it
+    // through unchanged rather than wrapping it in a vector constructor.
+    let has_orig = count_ops(&result, |u| std::sync::Arc::ptr_eq(u, &buf)) >= 1;
+    assert!(has_orig, "the scalar Ptr PARAM buffer must survive (not be broadcasted away)");
+}
+
+/// `do_expand` on a Ptr-typed INDEX (store-target with `ptr=true`) must preserve
+/// the scalar `Ptr` dtype — NOT strip it to the element type. Before the fix,
+/// `DType::Scalar(base_dtype.base()).vec(...)` converted `Ptr{vcount:1, base:bf16}`
+/// to `Vector{bf16, N}`, losing the Ptr-ness that `pm_add_loads` / STORE codegen
+/// depend on. This caused `pm_add_loads` to mistake the INDEX for a value-load
+/// (wrapping it in `LOAD(INDEX)` with the wrong operand type).
+#[test]
+fn test_do_expand_ptr_index_preserves_ptr_dtype() {
+    use svod_dtype::{AddrSpace, ScalarDType};
+    use svod_ir::Op;
+
+    let ptr_dtype = DType::Scalar(ScalarDType::Float32).ptr(Some(64), AddrSpace::Global).expect("ptr dtype");
+    let buf = UOp::param(0, 64, ptr_dtype.clone(), None);
+
+    // INDEX(buf, UNROLL(VCONST([0,1,2,3]), [(1,4)])) with ptr=true — a store-target
+    // INDEX whose Upcast axis triggers do_expand on both the Add (index) and the
+    // INDEX itself.
+    let unroll_offset = create_unroll_iota(1, 4);
+    let index = UOp::index().buffer(buf).indices(vec![unroll_offset]).ptr(true).call().expect("index");
+
+    let result = phase2_only(&index);
+
+    // After expansion, every surviving INDEX node must still have a Ptr dtype.
+    // If do_expand stripped the Ptr type, the INDEX would have element dtype
+    // (Vector{Float32, 4}) which breaks pm_add_loads and STORE codegen.
+    let stripped =
+        count_ops(&result, |u| matches!(u.op(), Op::Index { .. }) && !matches!(u.dtype(), DType::Ptr { .. }));
+    assert_eq!(stripped, 0, "do_expand must not strip the Ptr dtype from a Ptr-typed INDEX");
+}

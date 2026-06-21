@@ -1281,7 +1281,12 @@ pub fn after_simplification_patterns() -> &'static TypedPatternMatcher {
             let mut new_deps = smallvec::SmallVec::<[Arc<UOp>; 4]>::new();
             let mut changed = false;
             for dep in deps {
-                // : {RANGE, STORE, CALL, BARRIER, END, UNROLL}
+                // Side-effect boundaries that survive AFTER inlining. `Custom`
+                // is included because it carries backend intrinsics / scheduling
+                // markers (e.g., `; svod.sched.pipeline` for AMDGPU iglp) whose
+                // effect is invisible to the symbolic reasoner — inlining their
+                // sources would orphan the marker.
+                // : {RANGE, STORE, CALL, BARRIER, END, UNROLL, CUSTOM}
                 if matches!(
                     dep.op(),
                     Op::Range { .. }
@@ -1290,6 +1295,7 @@ pub fn after_simplification_patterns() -> &'static TypedPatternMatcher {
                         | Op::Call { .. }
                         | Op::Barrier { .. }
                         | Op::Unroll { .. }
+                        | Op::Custom { .. }
                 ) {
                     new_deps.push(Arc::clone(dep));
                 } else {
