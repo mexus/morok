@@ -1,4 +1,5 @@
 mod arch;
+mod elementwise;
 mod fa;
 mod golden;
 mod grid;

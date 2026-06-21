@@ -16,7 +16,7 @@ use svod_ir::{ConstValue, UOp};
 use svod_tensor::Tensor;
 
 use crate::Group;
-use crate::group::{MoveIdx, lane_rc};
+use crate::group::MoveIdx;
 use crate::index::{Idx, load_at};
 use crate::kernel::Kernel;
 use crate::loop_scope::Loop;
@@ -128,15 +128,44 @@ struct FaScratch<'k> {
 /// tiles and indices instead of long positional arg lists.
 struct FaCtx<'a, 'k> {
     warp: &'a Group<'k>,
-    ker: &'a Kernel,
     lp: &'a Loop<'k>,
     q_reg_t: &'a RT<'k>,
     q_blk: &'a Arc<UOp>,
     warpid: &'a Arc<UOp>,
-    q_blk_rows: usize,
-    kv_blk_rows: usize,
     causal: bool,
     valid_len: Option<Arc<UOp>>,
+}
+
+/// Apply the FA score-mask (causal + optional padding) to the `att` tile. The
+/// causal mask zeros (via `−∞`) keys ahead of this warp's own query rows
+/// (`kv_pos > q_pos`); the padding mask zeros keys at/after the per-batch
+/// valid length (`kv_pos >= valid_len`). With neither, the tile is returned
+/// unchanged (the early-return avoids emitting any mask IR when masking is off).
+/// The per-element `(kv_pos, q_pos)` is computed arch-correctly inside
+/// [`Group::mask_where`].
+fn score_mask<'k>(
+    warp: &Group<'k>,
+    att: RT<'k>,
+    slice_idx: &Arc<UOp>,
+    q_blk: &Arc<UOp>,
+    causal: bool,
+    valid_len: Option<&Arc<UOp>>,
+) -> RT<'k> {
+    if !causal && valid_len.is_none() {
+        return att;
+    }
+    let row_blk = Idx::Uop(slice_idx.clone());
+    let col_blk = Idx::Uop(q_blk.clone());
+    let att = if causal {
+        warp.mask_where(att, row_blk.clone(), col_blk.clone(), f64::NEG_INFINITY, |kv_pos, q_pos| kv_pos.gt(q_pos))
+    } else {
+        att
+    };
+    if let Some(vl) = valid_len {
+        warp.mask_where(att, row_blk, col_blk, f64::NEG_INFINITY, move |kv_pos, _| kv_pos.ge(vl))
+    } else {
+        att
+    }
 }
 
 /// Stage 1 of a KV slice — `QKᵀ`: gather this warp's K/V fragments from the
@@ -174,42 +203,7 @@ fn fa_qk<'k>(
     let k_reg_t = warp.transpose(k_reg_t, &k_reg);
     let att = warp.mma_atb(att, &k_reg_t, ctx.q_reg_t);
 
-    // Score masking: drop keys ahead of this warp's own query rows (causal → -∞)
-    // and/or keys at/after the per-batch valid length (padding mask → -∞). The
-    // within-fragment `(kv, q)` per `(lane, element)` is read straight off the att
-    // accumulator's OWN fragment map via `lane_rc` — arch-correct for both the
-    // gfx942 contiguous stride (`kv = (lane/16)*4 + i`) and the gfx11 even/odd
-    // interleave (`kv = 2i + lane/16`), so there is no hardcoded `frag_row_stride`
-    // (its `(lane/16)*8` form is wrong for the interleave). att is `(kv = row = M,
-    // q = col = N)`; the Col tile's store map is the transpose of its load map, so
-    // `transpose = (layout == Col)` yields the accumulator `(M, N)` coords. The
-    // per-fragment `*16` and per-tile `*{q,kv}_blk_rows` offsets scale 16×16 → T×T
-    // (and asymmetric) unchanged. With neither knob set the map is skipped entirely.
-    if !ctx.causal && ctx.valid_len.is_none() {
-        return (att, v_reg);
-    }
-    let laneid = ctx.ker.laneid();
-    let (interleave, interleave_t, stride) = (att.base.interleave, att.base.interleave_t, att.base.stride as i64);
-    let transpose = att.layout == TileLayout::Col;
-    let (q_blk, slice_idx) = (ctx.q_blk.clone(), slice_idx.clone());
-    let (q_blk_rows, kv_blk_rows, causal) = (ctx.q_blk_rows, ctx.kv_blk_rows, ctx.causal);
-    let valid_len = ctx.valid_len.clone();
-    let att = warp.map(att, move |x, idx| {
-        let (kv_if, q_if) = lane_rc(transpose, interleave, interleave_t, &laneid, 16, 16, stride, &idx[2].to_uop());
-        let kv_pos = slice_idx.mul(&iconst(kv_blk_rows as i64)).add(&idx[0].to_uop().mul(&iconst(16))).add(&kv_if);
-        let q_pos = q_blk.mul(&iconst(q_blk_rows as i64)).add(&idx[1].to_uop().mul(&iconst(16))).add(&q_if);
-        let neg_inf = UOp::const_(x.dtype(), ConstValue::Float(f64::NEG_INFINITY));
-        let mut out = x.clone();
-        if causal {
-            out = UOp::try_where(kv_pos.gt(&q_pos), neg_inf.clone(), out).expect("causal where");
-        }
-        if let Some(vl) = &valid_len {
-            // Mask keys at/after the valid length: `kv_pos >= vl` (the index-typed
-            // valid count comes pre-loaded from the per-batch `lens` buffer).
-            out = UOp::try_where(kv_pos.ge(vl), neg_inf, out).expect("padding where");
-        }
-        out
-    });
+    let att = score_mask(warp, att, slice_idx, ctx.q_blk, ctx.causal, ctx.valid_len.as_ref());
     (att, v_reg)
 }
 
@@ -470,18 +464,7 @@ pub(crate) fn build_fa_mw_rdb(
     // is NOT used here: it reorders the causal-mask WHERE past its consumer, leaving
     // the renderer without its SSA value — plain `endrange` keeps the render order.
     let extra_war = [commit_k.uop().clone(), commit_v.uop().clone()];
-    let ctx = FaCtx {
-        warp: &warp,
-        ker,
-        lp: &lp,
-        q_reg_t: &q_reg_t,
-        q_blk: &q_blk,
-        warpid: &warpid,
-        q_blk_rows,
-        kv_blk_rows,
-        causal,
-        valid_len,
-    };
+    let ctx = FaCtx { warp: &warp, lp: &lp, q_reg_t: &q_reg_t, q_blk: &q_blk, warpid: &warpid, causal, valid_len };
     // The two pipeline stages: gather + QKᵀ + mask, then online-softmax + A·V.
     let FaScratch { k_reg, k_reg_t, v_reg, att, att_mma, max_vec_last, att_smem } = sc;
     let (att, v_reg) = fa_qk(&ctx, k_reg, k_reg_t, v_reg, att, k_cur, v_cur, &kv_idx, true, &extra_war);

@@ -217,7 +217,7 @@ pub(super) fn wave_offset(block: Option<&Idx>, frags: i64, local: &Arc<UOp>) -> 
 /// `rt.layout != st.layout` for the LDS hops, or `rt.layout == COL` for the
 /// global hops); `inner` is the upcast element index.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn lane_rc(
+fn lane_rc(
     transpose: bool,
     interleave: bool,
     interleave_t: bool,

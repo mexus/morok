@@ -8,8 +8,10 @@ use std::sync::Arc;
 use svod_ir::{ConstValue, UOp};
 
 use super::Group;
-use crate::index::{Idx, flat_index, load_at};
+use super::lane_rc;
+use crate::index::{Idx, cidx, flat_index, load_at};
 use crate::tile::{RT, RV, RegTile};
+use crate::tiles::TileLayout;
 
 impl<'k> Group<'k> {
     /// Fill a register tile with `value` (tinygrad `clear`).
@@ -131,5 +133,65 @@ impl<'k> Group<'k> {
             flat_index(&buf, &shape, idxs).store(op(&val, idxs))
         });
         self.finalize_tile(a, ended)
+    }
+
+    /// Per-element map with arch-correct global `(row, col)` positions — the
+    /// position-aware generalization of [`Group::map`]. For each element of
+    /// `tile`, computes its global `(row, col)` position as
+    /// `row_blk * tile_total_rows + idx[0] * frag_rows + lane_row` (and
+    /// symmetrically for `col`), where `(lane_row, lane_col)` is read off the
+    /// tile's OWN `lane_rc` map (arch-correct for both the gfx942 contiguous
+    /// stride and the gfx1151 even/odd interleave via `tile.base.interleave` /
+    /// `tile.base.interleave_t` / `tile.base.stride`). `row_blk` and `col_blk`
+    /// are the per-block element offsets in tile-row units (the loop-carried
+    /// kv-slice / q-block / corpus-tile index); pass `Idx::Const(0)` when the
+    /// tile IS the full extent. Then applies `op(x, idx, row, col)` per element.
+    ///
+    /// This replaces the leaky `warp.map(tile, |x, idx| { lane_rc(...); ... })`
+    /// pattern — `lane_rc` and the position arithmetic become implementation
+    /// details. The named mask primitives (`mask_where`) build on this.
+    pub fn map_position<F>(&self, tile: RT<'k>, row_blk: Idx, col_blk: Idx, op: F) -> RT<'k>
+    where
+        F: Fn(&Arc<UOp>, &[Idx], &Arc<UOp>, &Arc<UOp>) -> Arc<UOp>,
+    {
+        let (buf, shape) = (tile.uop().clone(), tile.shape().to_vec());
+        let rbuf = self.anchor(&buf);
+        let laneid = self.laneid();
+        let (interleave, interleave_t, stride) =
+            (tile.base.interleave, tile.base.interleave_t, tile.base.stride as i64);
+        let transpose = tile.layout == TileLayout::Col;
+        let (frag_rows, frag_cols) = (tile.base.base.rows as i64, tile.base.base.cols as i64);
+        let an = shape.len();
+        let total_rows = shape[an - 3] as i64 * frag_rows;
+        let total_cols = shape[an - 2] as i64 * frag_cols;
+        let (row_blk, col_blk) = (row_blk.to_uop(), col_blk.to_uop());
+        let ended = self.elementwise(&shape.clone(), move |idxs| {
+            let (lane_row, lane_col) =
+                lane_rc(transpose, interleave, interleave_t, &laneid, frag_rows, frag_cols, stride, &idxs[2].to_uop());
+            let row = row_blk.mul(&cidx(total_rows)).add(&idxs[0].to_uop().mul(&cidx(frag_rows))).add(&lane_row);
+            let col = col_blk.mul(&cidx(total_cols)).add(&idxs[1].to_uop().mul(&cidx(frag_cols))).add(&lane_col);
+            let val = load_at(&rbuf, &shape, idxs);
+            let out = op(&val, idxs, &row, &col);
+            flat_index(&buf, &shape, idxs).store(out)
+        });
+        self.finalize_reg(tile, ended)
+    }
+
+    /// Per-element masked fill: `where(predicate(row, col), const(fill), x)`.
+    /// The `(row, col)` per element is computed as in [`Group::map_position`].
+    /// This is the common form of the ragged-row mask (`row >= bound → +∞`),
+    /// the FA causal mask (`row > col → −∞`), and the key-padding mask
+    /// (`row >= valid_len → −∞`). For the seed form (both branches constant,
+    /// `x` ignored), use [`Group::map_position`] directly.
+    pub fn mask_where<P>(&self, tile: RT<'k>, row_blk: Idx, col_blk: Idx, fill: f64, predicate: P) -> RT<'k>
+    where
+        P: Fn(&Arc<UOp>, &Arc<UOp>) -> Arc<UOp>,
+    {
+        let elem_dt = tile.elem().clone();
+        self.map_position(tile, row_blk, col_blk, move |x, _idx, row, col| {
+            let pred = predicate(row, col);
+            let fill_v = UOp::const_(elem_dt.clone(), ConstValue::Float(fill));
+            UOp::try_where(pred, fill_v, x.clone()).expect("mask_where")
+        })
     }
 }
