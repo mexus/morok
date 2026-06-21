@@ -207,17 +207,23 @@ impl<'k> Group<'k> {
     }
 
     /// The global index, along the **folded** axis, contributed by element
-    /// `(laneid, inner)` of fragment-tile `acc`: `acc*extent + lane_rc(..)`.
-    /// Reuses the source fragment's [`lane_rc`] mapping — the same one the value
-    /// load uses — and picks the lane_rc coordinate that *varies with `inner`*,
-    /// since that (with the cross-lane tree) is exactly the axis the reduce folds.
-    /// It is the **column** for the normal (gfx942 stride-4) and `interleave_t`
-    /// layouts, and the **row** for the `transpose` (`Col`-layout) and the wave32
-    /// even/odd `interleave` accumulator — where the 16-wide reduced axis is split
-    /// across a lane's `inner` elements and its `L+16` sibling. So `row_arg_reduce`
-    /// on a wave32 accumulator reduces the interleave's `inner`-carrying axis,
-    /// exactly as `row_reduce` does (the caller arranges the tile to match).
-    fn axis_index_of(&self, src: &RT<'k>, acc: &Arc<UOp>, inner: &Arc<UOp>) -> Arc<UOp> {
+    /// `(laneid, inner)` of in-lane fragment-tile `acc` within height/width frag
+    /// `frag`: `(frag*frag_extent + acc)*extent + lane_rc(..)`. The `frag` term
+    /// (the [`Self::arg_reduce`] cross-frag fold) lifts a stacked frag's LOCAL
+    /// `0..extent` index to its GLOBAL position in the reduced axis; it is `0` (no
+    /// offset) for a single-fragment source. `frag_extent` is the per-frag span of
+    /// the folded axis (`16` for a 16×16 base), so frag `f` starts at element
+    /// `f*frag_extent`. Reuses the source fragment's [`lane_rc`] mapping — the same
+    /// one the value load uses — and picks the lane_rc coordinate that *varies with
+    /// `inner`*, since that (with the cross-lane tree) is exactly the axis the
+    /// reduce folds. It is the **column** for the normal (gfx942 stride-4) and
+    /// `interleave_t` layouts, and the **row** for the `transpose` (`Col`-layout)
+    /// and the wave32 even/odd `interleave` accumulator — where the 16-wide reduced
+    /// axis is split across a lane's `inner` elements and its `L+16` sibling. So
+    /// `row_arg_reduce` on a wave32 accumulator reduces the interleave's
+    /// `inner`-carrying axis, exactly as `row_reduce` does (the caller arranges the
+    /// tile to match).
+    fn axis_index_of(&self, src: &RT<'k>, frag: Option<&Arc<UOp>>, acc: &Arc<UOp>, inner: &Arc<UOp>) -> Arc<UOp> {
         let base_rows = src.base.base.rows as i64;
         let base_cols = src.base.base.cols as i64;
         let (r, c) = lane_rc(
@@ -239,7 +245,17 @@ impl<'k> Group<'k> {
             src.layout != TileLayout::Col
         };
         let (folded, extent) = if inner_is_col { (c, base_cols) } else { (r, base_rows) };
-        iadd(&imul(acc, extent), &folded).cast(DType::Int32)
+        // `acc` (the in-lane reduce frag) and `frag` (the stacked height/width
+        // frags the cross-frag fold sweeps) BOTH step by `extent` along the folded
+        // axis — the caller stacks the extra frags there — so the global frag index
+        // is `frag + acc`. `frag == None` (a single-fragment source) yields the
+        // prior `acc*extent + folded` op-tree verbatim, so single-frag callers are
+        // bit-identical; `Some(frag)` adds the `frag*extent` cross-frag lift.
+        let global_frag = match frag {
+            Some(f) => iadd(f, acc),
+            None => acc.clone(),
+        };
+        iadd(&imul(&global_frag, extent), &folded).cast(DType::Int32)
     }
 
     /// Record one grouped two-output terminal store and rewrap BOTH result tiles
@@ -290,8 +306,17 @@ impl<'k> Group<'k> {
     /// second `Int32` index accumulator alongside the value through the in-lane
     /// fold and the cross-lane tree. The partner's index rides its OWN
     /// `ds_bpermute` with its value, so it is never re-derived from the lane id.
-    /// `outer_end` is the tile dim mapped to `(val, idx)`; `acc_end` is the
-    /// reduced dim; `row` selects `src[outer, acc, inner]` vs `src[acc, outer, inner]`.
+    /// `outer_end` is the count of stacked height/width fragments along the reduced
+    /// axis; `acc_end` is the in-lane reduced dim; `row` selects
+    /// `src[outer, acc, inner]` vs `src[acc, outer, inner]`.
+    ///
+    /// The whole `outer_end` stacked frags fold to a SINGLE `(val[0], idx[0])` pair
+    /// per lane, carrying the GLOBAL index `outer*frag_extent + within_frag_local`
+    /// (smaller global index wins on ties, via the shared [`arg_fold`]). A
+    /// single-fragment source (`outer_end == 1`) keeps the prior structure
+    /// bit-for-bit (the `outer` loop is its degenerate one-trip output loop); a
+    /// taller source ([`Self::row_arg_reduce`] over the KNN `[TM, query]` Col score
+    /// tile's `TM/16` frags) adds the in-primitive cross-frag fold.
     #[allow(clippy::too_many_arguments)]
     fn arg_reduce(
         &self,
@@ -308,6 +333,12 @@ impl<'k> Group<'k> {
         assert!(src.elem().is_float(), "arg_reduce: value dtype must be float");
         assert_eq!(val.elem(), src.elem(), "arg_reduce: value RV dtype must match src");
         assert_eq!(idx.elem(), &DType::Int32, "arg_reduce: index RV must be Int32");
+
+        // A source one fragment tall along the reduced axis is the prior single-fold
+        // form, bit-identical; only a taller source needs the cross-frag fold.
+        if outer_end > 1 {
+            return self.arg_reduce_folded(val, idx, src, dir, outer_end, acc_end, row);
+        }
 
         let velem = src.elem().clone();
         let ept = src.shape()[src.shape().len() - 1] as i64;
@@ -343,7 +374,7 @@ impl<'k> Group<'k> {
             [Idx::from(&acc), Idx::from(&outer), Idx::from(&inner)]
         };
         let vb = load_at(src.uop(), src.shape(), &src_idx);
-        let ib = self.axis_index_of(src, &acc, &inner);
+        let ib = self.axis_index_of(src, None, &acc, &inner);
         let (vf, idf) = arg_fold(dir, &va, &ia, &vb, &ib);
         let v_fold = flat_index(&val_reg, &[1], &[Idx::Const(0)]).store(vf);
         let i_fold = flat_index(&idx_reg, &[1], &[Idx::Const(0)]).store(idf);
@@ -351,17 +382,7 @@ impl<'k> Group<'k> {
 
         // Cross-lane fold via `ds_bpermute`: value and index each ride their own
         // shuffle, so the partner's winning index is transported, not re-derived.
-        let v_partial = read0(&val_reg.after(smallvec![fold_grp.clone()]));
-        let i_partial = read0(&idx_reg.after(smallvec![fold_grp]));
-        let (mut vacc, mut iacc) = (v_partial.clone(), i_partial.clone());
-        for d in self.ker.caps.reduce_tree() {
-            let src_lane = imod(&iadd(&laneid, &cidx(d)), self.group_threads() as i64);
-            let pv = self.shuffle_lane(&v_partial, &src_lane);
-            let pi = self.shuffle_lane(&i_partial, &src_lane);
-            let (v, i) = arg_fold(dir, &vacc, &iacc, &pv, &pi);
-            vacc = v;
-            iacc = i;
-        }
+        let (vacc, iacc) = self.arg_cross_lane(dir, &val_reg, &idx_reg, &fold_grp, &laneid);
 
         // Re-seed the OUTPUT pair to `dir.init()`/`-1` once per outer trip AND per
         // enclosing tracked loop, so a reduce *inside* a rolled loop (the KNN corpus
@@ -396,5 +417,127 @@ impl<'k> Group<'k> {
         let i_store = flat_index(idx.uop(), idx.shape(), &[Idx::from(&outer), Idx::Const(0)]).store(iout);
         let out_grp = UOp::group(vec![v_store, i_store]).end(smallvec![outer]);
         self.finalize_pair(val, idx, out_grp)
+    }
+
+    /// The cross-frag-folding [`Self::arg_reduce`] for a source TALLER than one
+    /// fragment along the reduced axis (`outer_end > 1`): the `TM/16` stacked height
+    /// (or width) frags fold INTO the in-lane accumulator via a `frag` `Reduce`
+    /// range nested OUTSIDE the `(acc, inner)` fold, so the whole stacked reduced
+    /// axis collapses to the single per-lane `(val[0], idx[0])`. Each element's
+    /// global axis index is `frag*frag_extent + within_frag_local` ([`axis_index_of`]
+    /// adds the `frag*extent` lift), so ties break over the true global index — the
+    /// in-primitive replacement for the KNN kernel's old inline `fold_partials`.
+    #[allow(clippy::too_many_arguments)]
+    fn arg_reduce_folded(
+        &self,
+        val: RV<'k>,
+        idx: RV<'k>,
+        src: &RT<'k>,
+        dir: ArgDir,
+        outer_end: i64,
+        acc_end: i64,
+        row: bool,
+    ) -> (RV<'k>, RV<'k>) {
+        let velem = src.elem().clone();
+        let ept = src.shape()[src.shape().len() - 1] as i64;
+        let val_reg = self.ker.alloc_reg(1, velem.clone());
+        let idx_reg = self.ker.alloc_reg(1, DType::Int32);
+        let laneid = self.laneid();
+        let read0 = |buf: &Arc<UOp>| load_at(buf, &[1], &[Idx::Const(0)]);
+
+        // Re-init both accumulators each enclosing tracked-loop iteration: the init
+        // stores must depend on the tracked loops, or they hoist above the loop and
+        // carry stale state (cf. the single-fold path's `outer`-keyed re-init). One
+        // grouped END closes the tiny init loop once.
+        let init_deps = self.ker.tracked_ranges();
+        let i_range = self.ker.raw_range(1, AxisType::Loop);
+        let v_init = flat_index(&val_reg.after(init_deps.clone()), &[1], &[Idx::from(&i_range)])
+            .store(UOp::const_(velem.clone(), ConstValue::Float(dir.init())));
+        let i_init = flat_index(&idx_reg.after(init_deps), &[1], &[Idx::from(&i_range)])
+            .store(UOp::const_(DType::Int32, ConstValue::Int(-1)));
+        let init_grp = UOp::group(vec![v_init, i_init]).end(smallvec![i_range]);
+
+        // In-lane fold over (frag, acc, inner): the `frag` Reduce range sweeps the
+        // stacked frags so the whole reduced axis collapses into the single pair; the
+        // global axis index carries the `frag*extent` lift.
+        let frag = self.ker.raw_range(outer_end, AxisType::Reduce);
+        let acc = self.ker.raw_range(acc_end, AxisType::Reduce);
+        let inner = self.ker.raw_range(ept, AxisType::Reduce);
+        let red_deps = smallvec![init_grp.clone(), frag.clone(), acc.clone(), inner.clone()];
+        let va = read0(&val_reg.after(red_deps.clone()));
+        let ia = read0(&idx_reg.after(red_deps));
+        let src_idx = if row {
+            [Idx::from(&frag), Idx::from(&acc), Idx::from(&inner)]
+        } else {
+            [Idx::from(&acc), Idx::from(&frag), Idx::from(&inner)]
+        };
+        let vb = load_at(src.uop(), src.shape(), &src_idx);
+        let ib = self.axis_index_of(src, Some(&frag), &acc, &inner);
+        let (vf, idf) = arg_fold(dir, &va, &ia, &vb, &ib);
+        let v_fold = flat_index(&val_reg, &[1], &[Idx::Const(0)]).store(vf);
+        let i_fold = flat_index(&idx_reg, &[1], &[Idx::Const(0)]).store(idf);
+        let fold_grp = UOp::group(vec![v_fold, i_fold]).end(smallvec![frag, acc, inner]);
+
+        // Cross-lane fold via `ds_bpermute` (shared with the single-fold path).
+        let (vacc, iacc) = self.arg_cross_lane(dir, &val_reg, &idx_reg, &fold_grp, &laneid);
+
+        // The whole reduced axis collapsed to the single output slot 0. A single-trip
+        // `out` `Loop` range scopes the lone output store (the single-fold path's
+        // degenerate end-1 `outer` loop), so the grouped terminal closes exactly once.
+        // Re-seed the slot to `dir.init()`/`-1` per `out` trip + enclosing tracked loop
+        // (the same per-trip-fresh invariant as the single-fold path), then fold the
+        // lane result into it.
+        let out = self.ker.raw_range(1, AxisType::Loop);
+        let mut out_init: SmallVec<[Arc<UOp>; 4]> = smallvec![out.clone()];
+        out_init.extend(self.ker.tracked_ranges());
+        let vo_seed = flat_index(&val.uop().after(out_init.clone()), val.shape(), &[Idx::from(&out), Idx::Const(0)])
+            .store(UOp::const_(velem.clone(), ConstValue::Float(dir.init())));
+        let io_seed = flat_index(&idx.uop().after(out_init), idx.shape(), &[Idx::from(&out), Idx::Const(0)])
+            .store(UOp::const_(DType::Int32, ConstValue::Int(-1)));
+        let oseed_grp = UOp::group(vec![vo_seed, io_seed]);
+
+        let v_in = load_at(
+            &val.uop().after(smallvec![oseed_grp.clone(), out.clone()]),
+            val.shape(),
+            &[Idx::from(&out), Idx::Const(0)],
+        );
+        let i_in = load_at(
+            &idx.uop().after(smallvec![oseed_grp, out.clone()]),
+            idx.shape(),
+            &[Idx::from(&out), Idx::Const(0)],
+        );
+        let (vout, iout) = arg_fold(dir, &v_in, &i_in, &vacc, &iacc);
+        let v_store = flat_index(val.uop(), val.shape(), &[Idx::from(&out), Idx::Const(0)]).store(vout);
+        let i_store = flat_index(idx.uop(), idx.shape(), &[Idx::from(&out), Idx::Const(0)]).store(iout);
+        let out_grp = UOp::group(vec![v_store, i_store]).end(smallvec![out]);
+        self.finalize_pair(val, idx, out_grp)
+    }
+
+    /// The cross-lane `ds_bpermute` sibling-fold shared by both [`Self::arg_reduce`]
+    /// paths: read this lane's in-lane `(value, index)` partial once, then fold the
+    /// sibling 16-lane slots' partials per the arch's `reduce_tree` — value and index
+    /// each ride their OWN shuffle so the partner's winning index is transported, not
+    /// re-derived. Returns the warp-wide `(value, index)` extremum for this lane.
+    fn arg_cross_lane(
+        &self,
+        dir: ArgDir,
+        val_reg: &Arc<UOp>,
+        idx_reg: &Arc<UOp>,
+        fold_grp: &Arc<UOp>,
+        laneid: &Arc<UOp>,
+    ) -> (Arc<UOp>, Arc<UOp>) {
+        let read0 = |buf: &Arc<UOp>| load_at(buf, &[1], &[Idx::Const(0)]);
+        let v_partial = read0(&val_reg.after(smallvec![fold_grp.clone()]));
+        let i_partial = read0(&idx_reg.after(smallvec![fold_grp.clone()]));
+        let (mut vacc, mut iacc) = (v_partial.clone(), i_partial.clone());
+        for d in self.ker.caps.reduce_tree() {
+            let src_lane = imod(&iadd(laneid, &cidx(d)), self.group_threads() as i64);
+            let pv = self.shuffle_lane(&v_partial, &src_lane);
+            let pi = self.shuffle_lane(&i_partial, &src_lane);
+            let (v, i) = arg_fold(dir, &vacc, &iacc, &pv, &pi);
+            vacc = v;
+            iacc = i;
+        }
+        (vacc, iacc)
     }
 }
