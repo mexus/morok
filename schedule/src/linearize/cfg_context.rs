@@ -211,33 +211,6 @@ impl CFGContext {
             }
         }
 
-        // Step 6: Create edges for reduce RANGEs to wait for their init STOREs.
-        //
-        // When AFTER(passthrough, [init_store, reduce_range]) appears (from reduce_to_acc),
-        // the heap-based linearization may schedule RANGE before STORE due to priority
-        // tie-breaking (RANGE +5 vs STORE +1). This edge ensures zero-init STORE appears
-        // before the reduce loop, which is required for correctness.
-        //
-        // NOTE: Tinygrad's linearizer.py lacks this fix and has known issues
-        // (see comment at line 85-86: "TODO: this can happen! it causes infinite loop
-        // in shufflenet"). Our explicit edge creation is more robust.
-        for node in &nodes {
-            if let Op::After { deps, .. } = node.op() {
-                let stores: Vec<_> = deps.iter().filter(|d| matches!(d.op(), Op::Store { .. })).collect();
-                let ranges: Vec<_> = deps.iter().filter(|d| matches!(d.op(), Op::Range { .. })).collect();
-
-                for store in &stores {
-                    for range in &ranges {
-                        let would_cycle = store.backward_slice_ids().contains(&range.id);
-                        if !would_cycle {
-                            tracing::trace!(range_id = range.id, store_id = store.id, "CFGContext: reduce init edge");
-                            ctx.edges.insert(UOpKey((*range).clone()), (*store).clone());
-                        }
-                    }
-                }
-            }
-        }
-
         ctx
     }
 

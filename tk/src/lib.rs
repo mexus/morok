@@ -67,6 +67,7 @@ const _: () = assert!(WARP_THREADS == svod_dtype::AmdArch::Gfx942.wave_size() as
 
 // ── Use the built-in kernels (Tensor in → Tensor out) ───────────────────────
 pub use kernels::fa::{FaOpts, flash_attention, flash_attention_with};
+pub use kernels::kmeans::{kmeans_assign, kmeans_update};
 pub use kernels::knn::knn;
 pub use kernels::matmul::matmul;
 pub use launch::{Error as LaunchError, Result as LaunchResult};

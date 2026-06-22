@@ -1202,17 +1202,24 @@ fn is_ptr_or_image_dtype(dtype: &DType) -> bool {
 
 /// Fuse Add into WMMA's accumulator: WMMA(a,b,c) + add → WMMA(a,b,c+add)
 /// Tensor cores have built-in accumulation, so this is more efficient.
+///
+/// Preserves the WMMA's output dtype (matching tinygrad's `pm_reduce` pattern)
+/// rather than calling `UOp::wmma()` which would reset it from metadata — when
+/// the WMMA has been expanded by external UPCAST, the dtype reset hides the
+/// expansion from `devectorize_wmma`, leaking oversized operands to the renderer.
 pub fn pm_wmma_accumulate() -> &'static TypedPatternMatcher {
     crate::cached_patterns! {
         // WMMA + add → WMMA with fused accumulator.
         // Pattern: Add(WMMA(a, b, c), add) → WMMA(a, b, Add(c, add))
         Add(wmma @ Wmma { a, b, c, metadata }, add) => |wmma, a, b, c, metadata, add| {
-            // Only fuse if types match
             if wmma.dtype() != add.dtype() {
                 return None;
             }
             let new_c = c.add(add);
-            Some(UOp::wmma(a.clone(), b.clone(), new_c, metadata.clone()))
+            Some(UOp::new(
+                Op::Wmma { a: a.clone(), b: b.clone(), c: new_c, metadata: metadata.clone() },
+                wmma.dtype().clone(),
+            ))
         },
 
         // Commutative: add + WMMA → WMMA with fused accumulator
@@ -1221,7 +1228,10 @@ pub fn pm_wmma_accumulate() -> &'static TypedPatternMatcher {
                 return None;
             }
             let new_c = c.add(add);
-            Some(UOp::wmma(a.clone(), b.clone(), new_c, metadata.clone()))
+            Some(UOp::new(
+                Op::Wmma { a: a.clone(), b: b.clone(), c: new_c, metadata: metadata.clone() },
+                wmma.dtype().clone(),
+            ))
         },
     }
 }

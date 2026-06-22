@@ -32,9 +32,13 @@ name = "fa"
 harness = false
 
 [[bench]]
-name = "matmul"
+name = "kmeans"
 harness = false
 
 [[bench]]
 name = "knn"
+harness = false
+
+[[bench]]
+name = "matmul"
 harness = false

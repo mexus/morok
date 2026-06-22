@@ -356,14 +356,25 @@ fn mangle_type(llvm_type: &str) -> String {
 }
 
 /// Remove duplicate `declare ...` lines from an assembled module prefix,
-/// keeping the first occurrence. Non-`declare` lines pass through unchanged.
+/// keeping the first occurrence per **function name** (the `@name` token). Two
+/// declares for the same intrinsic with different signatures — e.g. a wave64
+/// and a wave32 `@llvm.amdgcn.wmma.*` call in the same kernel — are treated as
+/// duplicates so the second is dropped, avoiding clang's "invalid redefinition"
+/// error. Non-`declare` lines pass through unchanged.
 fn dedup_declares(prefix: String) -> String {
     let mut seen = std::collections::HashSet::new();
     let mut out: Vec<&str> = Vec::new();
     for line in prefix.lines() {
         let trimmed = line.trim_start();
-        if trimmed.starts_with("declare ") && !seen.insert(trimmed.to_string()) {
-            continue;
+        if trimmed.starts_with("declare ") {
+            // Extract the function name: the token between `@` and `(`.
+            let key = trimmed
+                .find('@')
+                .and_then(|at| trimmed[at + 1..].find('(').map(|p| &trimmed[at + 1..at + 1 + p]))
+                .unwrap_or(trimmed);
+            if !seen.insert(key.to_string()) {
+                continue;
+            }
         }
         out.push(line);
     }
