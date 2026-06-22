@@ -1367,9 +1367,9 @@ pub fn pm_add_loads() -> &'static TypedPatternMatcher<()> {
         },
 
         // Pattern 2: Cleanup STORE - remove LOAD from index position
-        Store { index: Load { index: real_index, .. }, value, ranges } =>
-            |real_index, value, ranges| {
-                Some(real_index.store_with_ranges(value.clone(), ranges.clone()))
+        Store { index: Load { index: real_index, .. }, value } =>
+            |real_index, value| {
+                Some(real_index.store(value.clone()))
             },
     }
 }

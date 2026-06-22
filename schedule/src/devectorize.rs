@@ -270,9 +270,9 @@ pub fn devectorize(ast: &Arc<UOp>, renderer: &Renderer) -> Arc<UOp> {
 pub fn bool_storage_patterns() -> &'static TypedPatternMatcher {
     crate::cached_patterns! {
         // STORE bool: cast to uint8 before storing
-        Store { index, value, ranges } if value.dtype().base().is_bool() => {
+        Store { index, value } if value.dtype().base().is_bool() => {
             let uint8_dtype = value.dtype().with_base(ScalarDType::UInt8);
-            Some(index.store_with_ranges(value.cast(uint8_dtype), ranges.clone()))
+            Some(index.store(value.cast(uint8_dtype)))
         },
 
         // LOAD bool: load as uint8, then cast to bool
@@ -467,19 +467,16 @@ pub fn pm_float_decomp_store() -> crate::TypedPatternMatcher<Fp8DecompCtx> {
 
         // STORE to FP8 buffer → f2f convert value→UInt8, store
         // In bpm, index still has FP8 ptr (ORIGINAL children, before Pattern 1 runs).
-        Store { index, value, ranges }
+        Store { index, value }
             if index.dtype().base() == ctx.from
         => {
             let target_float = DType::Scalar(ctx.to);
             let target_uint = DType::Scalar(ctx.to.float_to_uint()?);
-            // Cast value to target float (handles FP8, Float32, etc. → Float16)
             let float_val = value.cast(target_float);
-            // Bitwise float→FP8 conversion (includes clamping internally)
             let result = f2f(&float_val.bitcast(target_uint), ctx.to, ctx.from);
-            // Change index ptr to UInt8
             let uint8_ptr = index.dtype().with_ptr_base(DType::Scalar(ctx.from.float_to_uint()?))?;
             let new_index = index.with_dtype(uint8_ptr);
-            Some(new_index.store_with_ranges(result, ranges.clone()))
+            Some(new_index.store(result))
         },
     }
 }
@@ -1187,8 +1184,8 @@ pub fn pm_add_loads() -> &'static TypedPatternMatcher {
         },
 
         // Remove LOAD wrapper from STORE: STORE(LOAD(x), ...) → STORE(x, ...).
-        Store { index: Load { index: inner_idx, .. }, value, ranges }
-            => Some(inner_idx.store_with_ranges(value.clone(), ranges.clone())),
+        Store { index: Load { index: inner_idx, .. }, value }
+            => Some(inner_idx.store(value.clone())),
     }
 }
 
@@ -1254,16 +1251,16 @@ pub fn load_store_folding_patterns() -> &'static TypedPatternMatcher {
             => move_gep_after_load(load, buffer, vector, indices),
 
         // 4. GEP on STORE: STORE(GEP(x), data) → STORE(x, GEP⁻¹(data))
-        Store { index: Gep { vector, indices }, value, ranges }
-            => move_gep_on_store(vector, indices, value, ranges),
+        Store { index: Gep { vector, indices }, value }
+            => move_gep_on_store(vector, indices, value),
 
         // 5. PTRCAT after LOAD: LOAD(buf, PTRCAT) → CAT(LOAD(buf_i, ptr_i), ...)
         load @ Load { buffer, index: ptrcat @ PtrCat { sources } }
             => distribute_ptrcat_load(load, buffer, ptrcat, sources),
 
         // 6. PTRCAT after STORE: STORE(PTRCAT, data) → GROUP(STORE(ptr_i, gep(data, i)), ...)
-        Store { index: PtrCat { sources }, value, ranges }
-            => distribute_ptrcat_store(sources, value, ranges),
+        Store { index: PtrCat { sources }, value }
+            => distribute_ptrcat_store(sources, value),
     }
 }
 
@@ -1288,7 +1285,7 @@ pub fn correct_load_store_patterns() -> &'static TypedPatternMatcher<Renderer> {
 
         // Image fixup patterns.
         ls @ Load { buffer: _, index: _, alt: _ } => image_fixup(ls),
-        ls @ Store { index: _, value: _, ranges: _ } => image_fixup(ls),
+        ls @ Store { index: _, value: _ } => image_fixup(ls),
     }
 }
 
@@ -1347,19 +1344,13 @@ fn move_gep_after_load(
 }
 
 /// STORE(GEP(ptr), data) → STORE(ptr, GEP⁻¹(data)). Inverts GEP indices.
-fn move_gep_on_store(
-    gep_inner: &Arc<UOp>,
-    gep_indices: &[usize],
-    value: &Arc<UOp>,
-    ranges: &SmallVec<[Arc<UOp>; 4]>,
-) -> Option<Arc<UOp>> {
-    // Invert GEP: [2,0,1] → sorted by key → [1,2,0]
+fn move_gep_on_store(gep_inner: &Arc<UOp>, gep_indices: &[usize], value: &Arc<UOp>) -> Option<Arc<UOp>> {
     let mut inverse_map: Vec<(usize, usize)> = gep_indices.iter().enumerate().map(|(i, &x)| (x, i)).collect();
     inverse_map.sort_by_key(|&(x, _)| x);
     let inverse_indices: Vec<usize> = inverse_map.iter().map(|&(_, i)| i).collect();
 
     let reordered_value = value.gep(inverse_indices);
-    Some(gep_inner.store_with_ranges(reordered_value, ranges.clone()))
+    Some(gep_inner.store(reordered_value))
 }
 
 // ============================================================================
@@ -1565,11 +1556,7 @@ fn distribute_ptrcat_load(
 }
 
 /// STORE(PTRCAT, data) → GROUP(STOREs with GEP-sliced data)
-fn distribute_ptrcat_store(
-    sources: &[Arc<UOp>],
-    value: &Arc<UOp>,
-    ranges: &SmallVec<[Arc<UOp>; 4]>,
-) -> Option<Arc<UOp>> {
+fn distribute_ptrcat_store(sources: &[Arc<UOp>], value: &Arc<UOp>) -> Option<Arc<UOp>> {
     let value_vcount = value.dtype().vcount();
     let mut stores = Vec::new();
     let mut offset = 0usize;
@@ -1579,7 +1566,7 @@ fn distribute_ptrcat_store(
         debug_assert!(offset + ptr_count <= value_vcount, "PTRCAT size mismatch");
         let gep_indices: Vec<usize> = (offset..offset + ptr_count).collect();
         let store_value = value.gep(gep_indices);
-        stores.push(ptr.store_with_ranges(store_value, ranges.clone()));
+        stores.push(ptr.store(store_value));
         offset += ptr_count;
     }
 
@@ -1665,8 +1652,8 @@ fn split_load_store(ctx: &Renderer, ls: &Arc<UOp>, idx: &Arc<UOp>) -> Option<Arc
             let lidx = if fold_len > 1 { lidx.cast(make_vec_ptr_dtype(buf, fold_len)) } else { lidx };
 
             match ls.op() {
-                Op::Store { value, ranges, .. } => {
-                    ret.push(lidx.store_with_ranges(value.gep((pos..pos + fold_len).collect()), ranges.clone()));
+                Op::Store { value, .. } => {
+                    ret.push(lidx.store(value.gep((pos..pos + fold_len).collect())));
                 }
                 Op::Load { buffer, alt, .. } => {
                     let load = if let Some(alt) = alt {

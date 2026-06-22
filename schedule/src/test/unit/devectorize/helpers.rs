@@ -713,15 +713,10 @@ pub fn create_load_with_gep_index(buffer: Arc<UOp>, index: Arc<UOp>, gep_indices
 
 /// Create a STORE with GEP on the index.
 ///
-/// STORE(GEP(index, indices), value, ranges)
-pub fn create_store_with_gep_index(
-    index: Arc<UOp>,
-    gep_indices: Vec<usize>,
-    value: Arc<UOp>,
-    ranges: SmallVec<[Arc<UOp>; 4]>,
-) -> Arc<UOp> {
+/// STORE(GEP(index, indices), value)
+pub fn create_store_with_gep_index(index: Arc<UOp>, gep_indices: Vec<usize>, value: Arc<UOp>) -> Arc<UOp> {
     let gep_index = index.gep(gep_indices);
-    gep_index.store_with_ranges(value, ranges)
+    gep_index.store(value)
 }
 
 /// Compute the inverse permutation for GEP indices.

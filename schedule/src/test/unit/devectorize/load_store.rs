@@ -325,9 +325,6 @@ fn test_image_fixup_preserves_nonzero_alt() {
 /// Test: Split preserves ranges in STORE.
 #[test]
 fn test_split_preserves_ranges() {
-    use smallvec::smallvec;
-    use svod_ir::AxisId;
-
     let buffer = create_buffer(128);
     let value = create_vector_float_iota(8);
 
@@ -335,35 +332,18 @@ fn test_split_preserves_ranges() {
     let vec8_ptr_dtype = DType::Float32.vec(8).unwrap().ptr(Some(8), AddrSpace::Global).unwrap();
     let cast_idx = idx.cast(vec8_ptr_dtype);
 
-    // Create range for the store
-    let range = UOp::new(
-        Op::Range {
-            end: UOp::const_(DType::Index, ConstValue::Int(10)),
-            axis_id: AxisId::Renumbered(0),
-            axis_type: svod_ir::AxisType::Loop,
-            deps: smallvec::SmallVec::new(),
-        },
-        DType::Index,
-    );
-
-    let store = cast_idx.store_with_ranges(value, smallvec![range.clone()]);
+    let store = cast_idx.store(value);
 
     let result = apply_devectorize(&store);
 
-    // Check that ranges are preserved in split stores
+    // Check that store was preserved or split
     match result.op() {
         Op::Group { sources } => {
-            // Split stores should exist and each should preserve ranges
+            // Split stores should exist
             assert!(!sources.is_empty(), "Should have split stores");
-            for src in sources.iter() {
-                if let Op::Store { ranges, .. } = src.op() {
-                    assert_eq!(ranges.len(), 1, "Each split store should preserve ranges");
-                }
-            }
         }
-        Op::Store { ranges, .. } => {
-            // If not split, ranges should be preserved
-            assert_eq!(ranges.len(), 1, "Ranges should be preserved");
+        Op::Store { .. } => {
+            // If not split, store is preserved
         }
         other => panic!("Expected GROUP or STORE, got {:?}", other),
     }

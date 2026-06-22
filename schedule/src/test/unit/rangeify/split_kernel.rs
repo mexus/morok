@@ -468,17 +468,16 @@ fn test_split_store_nested_buffer_view_stays_direct() {
 }
 
 #[test]
-fn test_split_store_raw_store_with_ranges_requires_end_wrapper() {
+fn test_split_store_simple_store_splits_directly() {
     let buffer = UOp::new_buffer(DeviceSpec::Cpu, 64, DType::Float32);
     let idx = UOp::index().buffer(buffer).indices(vec![UOp::index_const(0)]).call().unwrap();
     let value = UOp::native_const(1.0f32);
-    let range = UOp::range_const(4, 0);
 
-    let raw_store = idx.store_with_ranges(value.clone(), smallvec![range.clone()]);
-    assert!(call_split_store(&raw_store).is_none(), "raw STORE with explicit ranges should not split directly");
-
-    let wrapped = raw_store.end(smallvec![range]);
-    assert!(call_split_store(&wrapped).is_some(), "END wrapper should enable splitting");
+    // A STORE with no open ranges (scalar, loop-invariant) splits directly
+    // into a single-kernel CALL — no END wrapper needed.
+    let store = idx.store(value.clone());
+    assert!(store.in_scope_ranges().is_empty(), "simple store should have no open ranges");
+    assert!(call_split_store(&store).is_some(), "simple STORE should split directly");
 }
 
 #[test]

@@ -1364,8 +1364,8 @@ impl UOp {
                 Op::Load { buffer: src(0), index: src(1), alt: new_alt }
             }
             Op::Store { .. } => {
-                assert!(new_srcs.len() >= 2, "Store requires at least 2 sources (index, value)");
-                Op::Store { index: src(0), value: src(1), ranges: new_srcs[2..].iter().cloned().collect() }
+                assert!(new_srcs.len() == 2, "Store requires exactly 2 sources (index, value)");
+                Op::Store { index: src(0), value: src(1) }
             }
 
             // Graph organization

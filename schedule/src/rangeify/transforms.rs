@@ -440,7 +440,6 @@ pub fn pm_flatten_range() -> &'static crate::TypedPatternMatcher {
     crate::cached_patterns! {
         r @ End { computation: _, ranges } if !ranges.is_empty() => |r| flatten_range_impl(r),
         r @ Reduce { src: _, ranges, reduce_op: _ } if !ranges.is_empty() => |r| flatten_range_impl(r),
-        r @ Store { index: _, value: _, ranges } if !ranges.is_empty() => |r| flatten_range_impl(r),
     }
 }
 
@@ -487,7 +486,7 @@ pub fn pm_split_ranges() -> crate::TypedPatternMatcher<SplitRangesContext> {
             },
 
         // Protect ranges used in ImageDType stores from substitution
-        _store @ Store { index: idx @ Index { buffer: buf, indices: _, gate: _ }, value: _, ranges: _ }
+        _store @ Store { index: idx @ Index { buffer: buf, indices: _, gate: _ }, value: _ }
             if is_image_dtype(buf) => |idx| {
                 protect_ranges_for_image(ctx, idx);
                 None // Don't transform, just protect
@@ -1524,7 +1523,6 @@ pub fn pm_simplify_ranges() -> &'static crate::TypedPatternMatcher {
 pub fn flatten_range_impl(r: &Arc<UOp>) -> Option<Arc<UOp>> {
     let off = match r.op() {
         Op::Reduce { .. } => 1,
-        Op::Store { .. } => 2, // (index, value, ranges...) - ranges start at index 2
         Op::End { .. } => 1,
         _ => return None,
     };

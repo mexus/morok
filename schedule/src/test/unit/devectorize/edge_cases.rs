@@ -586,7 +586,7 @@ fn test_scatternd_ptrcat_elimination() {
     .unwrap();
     let outer_where = UOp::try_where(cond, inner_where, load).unwrap();
 
-    let store = store_idx.store_with_ranges(outer_where, smallvec::smallvec![r1]);
+    let store = store_idx.store(outer_where);
     let result = devectorize(&UOp::sink(vec![store]), &crate::optimizer::Renderer::cpu());
 
     let has_ptrcat = result.toposort().iter().any(|n| matches!(n.op(), Op::PtrCat { .. }));

@@ -349,3 +349,46 @@ fn test_kmeans_update_err_paths() {
     let c_small = Tensor::randn(&[4, 64]).expect("c small");
     crate::kmeans_update(&x_small, &ids2, &c_small).err().expect("rank-2 ids must error");
 }
+
+// ── phi-dominance MRE ──────────────────────────────────────────────────────
+//
+// The generic-graph kmeans baseline (`matmul → ‖x‖²+‖c‖²−2·x·cᵀ → min over K`)
+// hits a phi-dominance violation in the generated LLVM IR at K≥1024 on gfx1151.
+// This test reproduces the issue without running the full criterion benchmark.
+//
+// Run: `SVOD_DEVICE=AMD:0 cargo test -p svod-tk -- --ignored kmeans_generic_phi`
+
+/// The generic GEMM-argmin kmeans baseline — identical to `benches/kmeans.rs`.
+fn kmeans_generic_ref(xb: &svod_tensor::Tensor, cb: &svod_tensor::Tensor) -> svod_tensor::Tensor {
+    let f32 = DType::Float32;
+    let xf = xb.cast(f32.clone()).expect("x→f32");
+    let cf = cb.cast(f32.clone()).expect("c→f32");
+    let x_sq = xf.try_mul(&xf).expect("x²").sum_with().axes(1isize).keepdim(true).call().expect("Σx²");
+    let c_sq = cf.try_mul(&cf).expect("c²").sum_with().axes(1isize).keepdim(true).call().expect("Σc²");
+    let c_sq_row = c_sq.try_transpose(0, 1).expect("c_sq→[1,K]");
+    let ct = cb.try_transpose(0, 1).expect("cᵀ");
+    let cross = xb.matmul_with().other(&ct).dtype(f32).call().expect("x·cᵀ");
+    let two_cross = cross.try_add(&cross).expect("2·cross");
+    let dist = x_sq.try_add(&c_sq_row).expect("‖x‖²+‖c²").try_sub(&two_cross).expect("−2·cross");
+    dist.min(1).expect("min over K")
+}
+
+#[test]
+#[ignore = "requires SVOD_DEVICE=AMD:0 with gfx1151"]
+fn kmeans_generic_phi_dominance_mre() {
+    use svod_tensor::Tensor;
+    let (n, d, k) = (2048usize, 64usize, 1024usize);
+    let xb = Tensor::randn(&[n, d]).expect("x").cast(DType::BFloat16).expect("x→bf16");
+    let cb = Tensor::randn(&[k, d]).expect("c").cast(DType::BFloat16).expect("c→bf16");
+
+    let mut result = kmeans_generic_ref(&xb, &cb);
+
+    let plan = result.prepare();
+    match &plan {
+        Ok(_) => {}
+        Err(e) => {
+            let msg = format!("{e}");
+            panic!("kmeans_generic prepare failed (K={k}): {msg}");
+        }
+    }
+}

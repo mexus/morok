@@ -2142,15 +2142,13 @@ pub fn store_load_folding_patterns() -> &'static TypedPatternMatcher {
         // upstream sym: converts selective overwrite into gated store.
         // When we store WHERE(gate, alt_value, load_from_same_index), the store only
         // matters where gate is true. Convert to a gated INDEX with alt as the value.
-        Store { index: idx @ Index { buffer: buf, indices, gate: None }, value: Where(gate, alt, Load { index: idx2, .. }), ranges }
+        Store { index: idx @ Index { buffer: buf, indices, gate: None }, value: Where(gate, alt, Load { index: idx2, .. }) }
             if idx.id == idx2.id && !indices.is_empty()
             => {
-                // Build WHERE(gate, original_idx, Invalid) — gates the index itself
                 let original_idx = indices[0].clone();
                 let invalid = UOp::new(Op::Invalid, original_idx.dtype());
                 let gated_idx = UOp::try_where(gate.clone(), original_idx, invalid).ok()?;
 
-                // Build new INDEX with the gated index
                 let mut new_indices: SmallVec<[Arc<UOp>; 4]> = indices.clone();
                 new_indices[0] = gated_idx;
                 let new_index = UOp::index()
@@ -2159,12 +2157,7 @@ pub fn store_load_folding_patterns() -> &'static TypedPatternMatcher {
                     .call()
                     .ok()?;
 
-                // Build STORE with the new gated index and alt as value
-                if ranges.is_empty() {
-                    Some(new_index.store(alt.clone()))
-                } else {
-                    Some(new_index.store_with_ranges(alt.clone(), ranges.clone()))
-                }
+                Some(new_index.store(alt.clone()))
             },
     }
 }

@@ -50,12 +50,9 @@ fn test_bufferize_to_store_global() {
     assert!(std::sync::Arc::ptr_eq(&end_ranges[0], &range));
 
     // Unwrap END to get STORE
-    let Op::Store { index, value, ranges } = computation.op() else {
+    let Op::Store { index, value } = computation.op() else {
         panic!("Expected STORE operation inside END, got {:?}", computation.op());
     };
-
-    // STORE should have empty ranges (iteration space on END)
-    assert!(ranges.is_empty());
 
     // Index should contain the buffer reference
     let Op::Index { buffer, .. } = index.op() else {
@@ -116,12 +113,9 @@ fn test_bufferize_to_store_local_with_barrier() {
     assert!(std::sync::Arc::ptr_eq(&end_ranges[0], &range));
 
     // Unwrap END to get STORE
-    let Op::Store { index, value, ranges } = computation.op() else {
+    let Op::Store { index, value } = computation.op() else {
         panic!("Expected STORE operation inside END, got {:?}", computation.op());
     };
-
-    // STORE should have empty ranges
-    assert!(ranges.is_empty());
 
     // Index should contain the buffer reference
     let Op::Index { buffer, .. } = index.op() else {
@@ -175,12 +169,9 @@ fn test_bufferize_to_store_multiple_ranges() {
     assert!(std::sync::Arc::ptr_eq(&end_ranges[1], &range2));
 
     // Unwrap END to get STORE
-    let Op::Store { index, value, ranges } = computation.op() else {
+    let Op::Store { index, value } = computation.op() else {
         panic!("Expected STORE operation inside END, got {:?}", computation.op());
     };
-
-    // STORE should have empty ranges
-    assert!(ranges.is_empty());
 
     // Value should be the compute
     assert!(std::sync::Arc::ptr_eq(value, &compute));
