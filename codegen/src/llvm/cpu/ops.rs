@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use svod_dtype::DType;
-use svod_ir::{BinaryOp, Op, ReduceOp, TernaryOp, UnaryOp, prelude::*};
+use svod_ir::{BinaryOp, Op, TernaryOp, UnaryOp, prelude::*};
 
 use crate::llvm::common::{RenderContext, lcast, ldt};
 
@@ -356,30 +356,21 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec<Stri
         }
 
         Op::Cast { src, dtype } => {
-            let s = ctx.get(src);
-
-            // INDEX always produces ptr in LLVM (via GEP), regardless of Svod dtype.
-            // When source is INDEX, treat source LLVM type as ptr for cast selection.
-            let is_index_src = matches!(src.op(), Op::Index { .. });
-            let src_llvm_type = if is_index_src { "ptr".to_string() } else { ldt(&src.dtype()) };
+            let src_llvm_type = ldt(&src.dtype());
             let dst_llvm_type = ldt(dtype);
 
-            // CAST(INDEX) to Ptr is a no-op - INDEX already produces ptr via GEP.
-            // This matches Tinygrad's approach (llvmir.py:189) where CAST to PtrDType
-            // is register aliasing: r[u] = r[u.src[0]]
-            if is_index_src && matches!(dtype, DType::Ptr { .. }) {
-                // Emit a bitcast as a named no-op to maintain SSA form
-                kernel.push(format!("  {dst} = bitcast ptr {s} to ptr"));
-                return Some(());
+            // Alias for noop casts: same LLVM type or target is Ptr.
+            // Matches tinygrad llvmir.py:164-165.
+            if src_llvm_type == dst_llvm_type || matches!(dtype, DType::Ptr { .. }) {
+                ctx.alias(uop.id, ctx.get(src).to_string());
+                return None;
             }
 
+            let s = ctx.get(src);
+
             if dtype.is_bool() && !src.dtype().is_bool() {
-                // Cast to bool: compare != 0 (not trunc, which only takes the low bit).
-                // Matches Tinygrad llvmir.py:99-101.
                 let cmp = if src.dtype().is_float() { "fcmp nsz arcp contract afn une" } else { "icmp ne" };
                 kernel.push(format!("  {dst} = {cmp} {src_llvm_type} {s}, zeroinitializer"));
-            } else if src_llvm_type == dst_llvm_type {
-                kernel.push(format!("  {dst} = bitcast {src_llvm_type} {s} to {dst_llvm_type}"));
             } else {
                 let cast_instr = lcast(&src.dtype(), dtype);
                 kernel.push(format!("  {dst} = {cast_instr} {src_llvm_type} {s} to {dst_llvm_type}"));
@@ -434,38 +425,6 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec<Stri
                 }
             }
 
-            let pending = ctx.take_pending_reduces();
-            for (reduce_id, info) in pending {
-                let result_name = format!("%reduce_{reduce_id}.final");
-                kernel.push(format!("  {result_name} = load {}, ptr {}", info.dtype, info.acc_ptr));
-                ctx.register(reduce_id, result_name);
-            }
-            Some(())
-        }
-
-        Op::Reduce { src, ranges, reduce_op } => {
-            let src_val = ctx.get(src);
-            let dtype = ldt(&uop.dtype());
-
-            if ranges.is_empty() {
-                kernel.push(format!("  {dst} = bitcast {dtype} {src_val} to {dtype}"));
-            } else {
-                let acc_ptr = format!("%reduce_{}", uop.id);
-                let acc_load = format!("{acc_ptr}.load");
-                let acc_new = format!("{acc_ptr}.new");
-                let instr = reduce_instr(*reduce_op, &uop.dtype());
-
-                kernel.push(format!("  {acc_load} = load {dtype}, ptr {acc_ptr}"));
-
-                if matches!(reduce_op, ReduceOp::Max | ReduceOp::Min) {
-                    render_reduce_minmax(&acc_new, *reduce_op, &uop.dtype(), &acc_load, src_val, &dtype, kernel);
-                } else {
-                    kernel.push(format!("  {acc_new} = {instr} {dtype} {acc_load}, {src_val}"));
-                }
-
-                kernel.push(format!("  store {dtype} {acc_new}, ptr {acc_ptr}"));
-                ctx.register_reduce_pending(uop.id, acc_ptr.clone(), dtype.clone());
-            }
             Some(())
         }
 
@@ -919,46 +878,6 @@ fn unary_instr(op: UnaryOp, dtype: &DType) -> Option<&'static str> {
     }
 }
 
-fn reduce_instr(op: ReduceOp, dtype: &DType) -> &'static str {
-    let is_float = dtype.is_float();
-    let is_signed = dtype.is_signed();
-
-    match op {
-        ReduceOp::Add => {
-            if is_float {
-                "fadd nsz arcp contract afn"
-            } else {
-                "add"
-            }
-        }
-        ReduceOp::Mul => {
-            if is_float {
-                "fmul nsz arcp contract afn"
-            } else {
-                "mul"
-            }
-        }
-        ReduceOp::Max => {
-            if is_float {
-                "maxnum"
-            } else if is_signed {
-                "smax"
-            } else {
-                "umax"
-            }
-        }
-        ReduceOp::Min => {
-            if is_float {
-                "minnum"
-            } else if is_signed {
-                "smin"
-            } else {
-                "umin"
-            }
-        }
-    }
-}
-
 fn mangle_type(llvm_type: &str) -> String {
     match llvm_type {
         "float" => "f32".to_string(),
@@ -1015,47 +934,6 @@ fn render_binary_pow(dst: &str, lhs: &Arc<UOp>, l: &str, r: &str, ltype: &str, k
     }
 }
 
-fn render_reduce_minmax(
-    dst: &str,
-    op: ReduceOp,
-    dtype: &DType,
-    acc: &str,
-    val: &str,
-    ltype: &str,
-    kernel: &mut Vec<String>,
-) {
-    if dtype.is_float() {
-        let intrinsic = match op {
-            ReduceOp::Max => "maxnum",
-            ReduceOp::Min => "minnum",
-            _ => unreachable!(),
-        };
-        render_intrinsic(dst, intrinsic, &[(ltype, acc), (ltype, val)], ltype, kernel);
-    } else {
-        let is_signed = dtype.is_signed();
-        let cmp = match op {
-            ReduceOp::Max => {
-                if is_signed {
-                    "sgt"
-                } else {
-                    "ugt"
-                }
-            }
-            ReduceOp::Min => {
-                if is_signed {
-                    "slt"
-                } else {
-                    "ult"
-                }
-            }
-            _ => unreachable!(),
-        };
-        let cmp_dst = format!("{dst}.cmp");
-        kernel.push(format!("  {cmp_dst} = icmp {cmp} {ltype} {acc}, {val}"));
-        kernel.push(format!("  {dst} = select i1 {cmp_dst}, {ltype} {acc}, {ltype} {val}"));
-    }
-}
-
 fn render_multi_gep(
     dst: &str,
     vec: &str,
@@ -1083,10 +961,9 @@ fn render_multi_gep(
     if indices.len() == 1 {
         kernel.push(format!("  {dst} = bitcast {elem_type} {dst}.e0 to {out_type}"));
     } else {
-        // Start the insertelement chain from the `undef` constant — `%x = undef T`
-        // is NOT a valid instruction (matches `render_vectorize`).
+        // Start the insertelement chain from `poison` (matches tinygrad llvmir.py:86).
         let count = indices.len();
-        let mut prev = "undef".to_string();
+        let mut prev = "poison".to_string();
         for i in 0..count {
             let next = if i == count - 1 { dst.to_string() } else { format!("{dst}.v{i}") };
             kernel.push(format!(
@@ -1106,7 +983,7 @@ fn render_vectorize(dst: &str, elements: &[Arc<UOp>], ctx: &RenderContext, kerne
     let count = elements.len();
     let vec_type = format!("<{count} x {scalar_type}>");
 
-    let mut prev = "undef".to_string();
+    let mut prev = "poison".to_string();
     for (i, elem) in elements.iter().enumerate() {
         let val = ctx.get(elem);
         let next = if i == count - 1 { dst.to_string() } else { format!("{dst}.v{i}") };
@@ -1146,54 +1023,6 @@ fn render_cat(dst: &str, sources: &[Arc<UOp>], ctx: &RenderContext, kernel: &mut
                 kernel.push(format!("  {next} = insertelement {out_type} {prev}, {scalar_type} {elem}, i32 {out_idx}"));
                 prev = next;
                 out_idx += 1;
-            }
-        }
-    }
-}
-
-/// Get identity element for reduce operation.
-pub fn reduce_identity(op: ReduceOp, dtype: &DType) -> String {
-    let is_vector = matches!(dtype, DType::Vector { .. });
-
-    match op {
-        ReduceOp::Add => {
-            if is_vector {
-                "zeroinitializer".to_string()
-            } else if dtype.is_float() {
-                "0.0".to_string()
-            } else {
-                "0".to_string()
-            }
-        }
-        ReduceOp::Mul => {
-            if is_vector {
-                "zeroinitializer".to_string()
-            } else if dtype.is_float() {
-                "1.0".to_string()
-            } else {
-                "1".to_string()
-            }
-        }
-        ReduceOp::Max => {
-            if is_vector {
-                "zeroinitializer".to_string()
-            } else if dtype.is_float() {
-                "-0x7FF0000000000000".to_string()
-            } else if dtype.is_signed() {
-                i64::MIN.to_string()
-            } else {
-                "0".to_string()
-            }
-        }
-        ReduceOp::Min => {
-            if is_vector {
-                "zeroinitializer".to_string() // TODO: proper +inf splat
-            } else if dtype.is_float() {
-                "0x7FF0000000000000".to_string() // +inf
-            } else if dtype.is_signed() {
-                i64::MAX.to_string()
-            } else {
-                u64::MAX.to_string()
             }
         }
     }
