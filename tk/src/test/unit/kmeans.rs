@@ -84,10 +84,11 @@ fn device_supported() -> bool {
 /// compared as exact matches (kmeans top-1 is deterministic — no sorting
 /// ambiguity); distances within a √D-scaled bf16 tolerance.
 #[test]
-#[ignore]
 fn test_kmeans_assign_amd() {
     use svod_tensor::Tensor;
     use svod_tensor::testing::allclose_f32;
+
+    svod_schedule::testing::setup_test_tracing();
 
     if !device_supported() {
         eprintln!("skip test_kmeans_assign_amd: no supported AMD GPU / toolchain");
