@@ -1,250 +1,245 @@
-//! Priority-aware topological sort for linearization.
+//! Direct port of tinygrad's linearizer (codegen/late/linearizer.py).
 //!
-//! Converts a UOp DAG into a linear instruction sequence suitable for
-//! GPU/NPU backends that require sequential instruction streams.
+//! Converts a UOp DAG into a linear instruction sequence using:
+//! 1. Priority + tuplize-based "ideal order" sort
+//! 2. Heap toposort respecting data dependencies
 
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::sync::Arc;
 
 use svod_ir::UOp;
 use svod_ir::op::Op;
 use svod_ir::types::ConstValue;
-use svod_ir::uop::core::UOpKey;
 
-/// Priority values for different operation types.
-///
-/// Lower values = higher priority (scheduled earlier).
-/// Based on Tinygrad's linearizer priority assignments.
-mod priority {
-    pub const PARAM: i32 = -20;
-    pub const DEFINE_VAR: i32 = -19;
-    pub const DEFINE_LOCAL: i32 = -18;
-    pub const DEFINE_REG: i32 = -17;
-    pub const END: i32 = -5;
-    pub const LOAD: i32 = -1;
-    pub const DEFAULT: i32 = 0;
-    pub const STORE: i32 = 1;
-    pub const RANGE: i32 = 5;
+/// Op discriminant matching tinygrad's `Ops` enum values.
+/// Used as first element of the recursive `tuplize` key.
+fn op_value(op: &Op) -> u32 {
+    match op {
+        Op::Special { .. } => 2,
+        Op::DefineLocal(_) | Op::Buffer { .. } | Op::BufferView { .. } => 3,
+        Op::DefineReg { .. } => 4,
+        Op::Param { .. } => 6,
+        Op::DefineVar { .. } => 7,
+        Op::Function { .. } => 7,
+        Op::Call { .. } => 8,
+        Op::Program { .. } => 9,
+        Op::Source { .. } => 11,
+        Op::Sink { .. } => 13,
+        Op::After { .. } => 14,
+        Op::Group { .. } => 15,
+        Op::Gep { .. } => 16,
+        Op::Vectorize { .. } => 17,
+        Op::Tuple { .. } => 18,
+        Op::GetTuple { .. } => 19,
+        Op::PointerIndex { .. } => 20,
+        Op::Index { .. } => 21,
+        Op::Shrink { .. } => 22,
+        Op::Load { .. } => 23,
+        Op::Store { .. } => 24,
+        Op::Wmma { .. } => 25,
+        Op::Cast { .. } => 27,
+        Op::BitCast { .. } => 28,
+        Op::Unary(_, _) => 34,
+        Op::Binary(_, _, _) => 36,
+        Op::Ternary(_, _, _, _) => 39,
+        Op::Barrier { .. } => 57,
+        Op::Range { .. } => 58,
+        Op::If { .. } => 59,
+        Op::End { .. } => 60,
+        Op::EndIf { .. } => 61,
+        Op::Const(_) | Op::VConst { .. } => 63,
+        Op::Custom { .. } => 64,
+        Op::CustomI { .. } => 65,
+        Op::Unique(_) => 67,
+        Op::Device(_) => 68,
+        Op::LUnique(_) => 69,
+        Op::Contiguous { .. } => 70,
+        Op::ContiguousBackward { .. } => 71,
+        Op::Detach { .. } => 72,
+        Op::Bufferize { .. } => 73,
+        Op::Copy { .. } => 74,
+        Op::MSelect { .. } => 76,
+        Op::MStack { .. } => 77,
+        Op::CustomFunction { .. } => 78,
+        Op::Reshape { .. } => 79,
+        Op::Permute { .. } => 80,
+        Op::Expand { .. } => 81,
+        Op::Pad { .. } => 82,
+        Op::Flip { .. } => 83,
+        Op::Multi { .. } => 84,
+        Op::ReduceAxis { .. } | Op::Reduce { .. } => 85,
+        Op::AllReduce { .. } => 86,
+        Op::Unroll { .. } => 87,
+        Op::Contract { .. } => 88,
+        Op::Cat { .. } => 89,
+        Op::PtrCat { .. } => 90,
+        _ => 50,
+    }
 }
 
-/// Ordering key for heap-based scheduling.
+/// Compute recursive structural sort keys (tinygrad's `tuplize`).
 ///
-/// Tuple ordering: (run_count, priority, arg_value, id)
-/// - run_count: Higher counts scheduled later (executed in inner loops)
-/// - priority: Lower values scheduled earlier
-/// - arg_value: For PARAM, slot index for consistent ordering
-/// - id: UOp ID for tie-breaking (ensures stable ordering)
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-struct OrderKey {
-    run_count: u64,
-    priority: i32,
-    arg_value: Option<i64>,
-    id: u64,
+/// Key = `[op_value, src_count, src0_key..., src1_key..., ...]`
+///
+/// Computed bottom-up from toposort (children before parents).
+/// Lexicographic `Vec<u32>` comparison matches Python's tuple comparison.
+///
+/// Keys are bounded to `MAX_KEY_LEN` elements to prevent exponential blowup
+/// on large DAGs (shared children expand recursively). The bound is generous
+/// enough that semantic ordering is preserved for all practical graph depths.
+fn compute_tuplize(nodes: &[Arc<UOp>]) -> HashMap<u64, Vec<u32>> {
+    const MAX_KEY_LEN: usize = 128;
+    let mut keys: HashMap<u64, Vec<u32>> = HashMap::with_capacity(nodes.len());
+    for node in nodes {
+        let srcs = node.op().sources();
+        let mut key = Vec::with_capacity(16);
+        key.push(op_value(node.op()));
+        key.push(srcs.len() as u32);
+        for src in &srcs {
+            if key.len() >= MAX_KEY_LEN {
+                break;
+            }
+            if let Some(ck) = keys.get(&src.id) {
+                let remaining = MAX_KEY_LEN - key.len();
+                key.extend_from_slice(&ck[..ck.len().min(remaining)]);
+            }
+        }
+        keys.insert(node.id, key);
+    }
+    keys
 }
 
-/// Convert a UOp DAG into a linear instruction sequence.
+/// Compute run_count: `prod(int(r.vmax)+1 for r in u.ranges)`.
 ///
-/// Uses priority-aware topological sorting to produce an optimal
-/// instruction order for GPU/NPU execution.
+/// Mirrors tinygrad's `run_count = prod([int(r.vmax)+1 for r in u.ranges])`.
 ///
-/// # Algorithm
-///
-/// 1. Toposort all nodes from sink
-/// 2. Build consumer graph and compute priorities (in REVERSE order!)
-/// 3. Create ideal ordering based on priorities
-/// 4. Use heap-based linearization respecting data dependencies
-/// 5. Reverse result (we build backwards from sink)
-///
-/// # Priority Assignment
-///
-/// | Op | Priority | Purpose |
-/// |----|----------|---------|
-/// | Param | -20 | Function arguments first |
-/// | DefineVar | -19 | Symbolic variables early |
-/// | DefineLocal | -18 | Local memory early |
-/// | DefineReg | -17 | Register definitions early |
-/// | End | -5 | Close loops promptly |
-/// | Const | 0 | Inlined at use site |
-/// | Load | -1 | Loads before compute |
-/// | (default) | 0 | Neutral |
-/// | Store | 1 | Stores after compute |
-/// | Range | 5 | Loop starts late |
-///
-/// # Example
-///
-/// ```ignore
-/// use svod_schedule::linearize::linearize;
-///
-/// let kernel_ast = /* ... */;
-/// let instructions = linearize(kernel_ast);
-///
-/// // instructions is now a Vec<Arc<UOp>> in execution order
-/// for (i, instr) in instructions.iter().enumerate() {
-///     println!("{}: {:?}", i, instr.op());
-/// }
-/// ```
+/// **AFTER special case**: tinygrad's `u.ranges` for AFTER returns
+/// `flatten([dep.ended_ranges for dep in deps])` — the ranges that the
+/// AFTER's deps end. This gives AFTER a high run_count, ensuring the
+/// linearizer places it after the loop (not inside it).
+fn run_count(uop: &Arc<UOp>) -> u64 {
+    match uop.op() {
+        Op::After { deps, .. } => {
+            let mut rc: u64 = 1;
+            for dep in deps {
+                for ended in dep.op().ended_ranges() {
+                    if matches!(ended.op(), Op::Range { .. }) {
+                        rc *= match ended.vmax() {
+                            ConstValue::Int(v) => (v + 1) as u64,
+                            ConstValue::UInt(v) => v + 1,
+                            _ => 1,
+                        };
+                    }
+                }
+            }
+            rc
+        }
+        _ => {
+            use svod_ir::uop::cached_property::CachedProperty;
+            use svod_ir::uop::properties::InScopeRangesProperty;
+
+            #[allow(clippy::mutable_key_type)]
+            let in_scope = InScopeRangesProperty::get(uop);
+
+            if in_scope.is_empty() {
+                return 1;
+            }
+
+            in_scope
+                .iter()
+                .map(|key| match key.0.vmax() {
+                    ConstValue::Int(v) => (v + 1) as u64,
+                    ConstValue::UInt(v) => v + 1,
+                    _ => 1,
+                })
+                .product()
+        }
+    }
+}
+
+/// Priority assignment matching tinygrad's linearizer.py:24-32.
+/// Returns `(priority, extra)` where extra is `Some(slot)` for PARAM.
+fn priority(uop: &Arc<UOp>) -> (i32, Option<i64>) {
+    match uop.op() {
+        Op::Param { slot, device: None, .. } => (-20, Some(*slot as i64)),
+        Op::DefineLocal(_) => (-18, None),
+        Op::DefineReg { .. } => (-17, None),
+        Op::Load { .. } => (-1, None),
+        Op::Store { .. } => (1, None),
+        Op::Range { .. } => (5, None),
+        Op::End { .. } => (-5, None),
+        _ => (0, None),
+    }
+}
+
+/// Direct port of tinygrad's `linearize()` (linearizer.py:8-51).
 pub fn linearize(sink: Arc<UOp>) -> Vec<Arc<UOp>> {
-    // Step 1: Toposort from sink
-    let nodes = sink.toposort();
-
-    if nodes.is_empty() {
+    let lst = sink.toposort();
+    if lst.is_empty() {
         return vec![sink];
     }
 
-    // Step 2: Build consumer graph + priorities
-    // CRITICAL: Must iterate in REVERSE order for correct consumer counting
-    #[allow(clippy::mutable_key_type)]
-    let mut consumers: HashMap<UOpKey, Vec<Arc<UOp>>> = HashMap::new();
-    #[allow(clippy::mutable_key_type)]
-    let mut out_degree: HashMap<UOpKey, usize> = HashMap::new();
-    #[allow(clippy::mutable_key_type)]
-    let mut priorities: HashMap<UOpKey, OrderKey> = HashMap::new();
-    // Map from UOp ID to Arc<UOp> for lookup
-    let mut id_to_uop: HashMap<u64, Arc<UOp>> = HashMap::new();
+    // Compute out_degree and priorities.
+    let mut out_degree: HashMap<u64, usize> = HashMap::new();
+    let mut priorities: HashMap<u64, (u64, i32, Option<i64>)> = HashMap::new();
 
-    for u in nodes.iter().rev() {
-        id_to_uop.insert(u.id, u.clone());
-
-        // Build consumer graph
-        for src in u.op().sources() {
-            consumers.entry(UOpKey(src.clone())).or_default().push(u.clone());
+    for u in &lst {
+        for s in u.op().sources() {
+            *out_degree.entry(s.id).or_default() += 1;
         }
-
-        // Compute run count from ranges
-        let run_count = compute_run_count(u);
-
-        // Assign priority based on operation type
-        let (base_priority, arg_value) = get_priority(u);
-
-        priorities.insert(UOpKey(u.clone()), OrderKey { run_count, priority: base_priority, arg_value, id: u.id });
+    }
+    for u in &lst {
+        let rc = run_count(u);
+        let (p, extra) = priority(u);
+        priorities.insert(u.id, (rc, p, extra));
     }
 
-    // Initialize out_degree (number of consumers)
-    for node in &nodes {
-        let key = UOpKey(node.clone());
-        let degree = consumers.get(&key).map_or(0, |c| c.len());
-        out_degree.insert(key, degree);
-    }
+    // Compute tuplize keys (bottom-up).
+    let tuplize = compute_tuplize(&lst);
 
-    // Step 3: Heap-based linearization (matches tinygrad's linearizer.py).
-    // Use MAX-heap: larger OrderKey (worse priority) popped first.
-    // After reversal, better priority nodes appear earlier in output.
-    let mut heap: BinaryHeap<OrderKey> = BinaryHeap::new();
-
-    let sink_key = priorities.get(&UOpKey(sink.clone())).cloned().unwrap_or(OrderKey {
-        run_count: 0,
-        priority: priority::DEFAULT,
-        arg_value: None,
-        id: sink.id,
+    // Sort all nodes by (run_count, priority, extra, tuplize) — the "ideal order".
+    // Assign sequential nkey based on sorted position.
+    let mut sorted: Vec<u64> = lst.iter().map(|u| u.id).collect();
+    sorted.sort_by(|&a, &b| {
+        let pa = &priorities[&a];
+        let pb = &priorities[&b];
+        pa.cmp(pb).then_with(|| tuplize[&a].cmp(&tuplize[&b]))
     });
-    heap.push(sink_key);
 
-    let mut result = Vec::with_capacity(nodes.len());
-    let mut visited: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    let nkey: HashMap<u64, usize> = sorted
+        .iter()
+        .enumerate()
+        .map(|(i, &id)| (id, i))
+        .collect();
 
-    while let Some(order_key) = heap.pop() {
-        let u_id = order_key.id;
+    // Heap toposort: pop highest nkey first (max-heap), reverse at end.
+    let id_map: HashMap<u64, Arc<UOp>> = lst.iter().map(|u| (u.id, u.clone())).collect();
 
-        // Skip if already processed (can happen with diamond dependencies)
-        if visited.contains(&u_id) {
+    let mut heap: BinaryHeap<(usize, u64)> = BinaryHeap::new();
+    heap.push((nkey[&sink.id], sink.id));
+
+    let mut newlst: Vec<Arc<UOp>> = Vec::with_capacity(lst.len());
+    let mut visited: HashSet<u64> = HashSet::new();
+
+    while let Some((_, uid)) = heap.pop() {
+        if !visited.insert(uid) {
             continue;
         }
+        let u = &id_map[&uid];
+        newlst.push(u.clone());
 
-        // Look up the UOp
-        let u = match id_to_uop.get(&u_id) {
-            Some(uop) => uop.clone(),
-            None => continue,
-        };
-
-        visited.insert(u_id);
-        result.push(u.clone());
-
-        // Decrement out_degree for all sources
-        for src in u.op().sources() {
-            let src_key = UOpKey(src.clone());
-            if let Some(deg) = out_degree.get_mut(&src_key) {
-                *deg = deg.saturating_sub(1);
-                if *deg == 0 && !visited.contains(&src.id) {
-                    // All consumers processed, add to heap
-                    if let Some(src_order_key) = priorities.get(&src_key) {
-                        heap.push(src_order_key.clone());
-                    }
-                }
+        for v in u.op().sources() {
+            let deg = out_degree.entry(v.id).or_default();
+            *deg = deg.saturating_sub(1);
+            if *deg == 0 && !visited.contains(&v.id) {
+                heap.push((nkey[&v.id], v.id));
             }
         }
     }
 
-    // Step 4: Reverse result (we built backwards from sink)
-    result.reverse();
+    newlst.reverse();
 
-    result
-}
-
-/// Compute the "run count" for a UOp based on its IN-SCOPE ranges.
-///
-/// The run count estimates how many times this operation executes,
-/// based on the loop bounds of enclosing ranges that are CURRENTLY ACTIVE.
-///
-/// Thread ranges are EXCLUDED because they're pseudo-loops for codegen
-/// structure, not actual loops. Instructions that depend on core_id
-/// should still be placed in the entry block.
-///
-/// CFG predecessors are propagated via the `deps` field on `Op::Range`,
-/// which makes `InScopeRangesProperty` accumulate parent loop ranges
-/// naturally through `children()`. This matches Tinygrad's
-/// `pm_add_control_flow` behavior.
-///
-/// This matches Tinygrad's linearizer where `run_count = prod([int(r.vmax)+1 for r in u.ranges])`
-/// and `u.ranges` returns only ranges that haven't been ended yet at that point.
-fn compute_run_count(uop: &Arc<UOp>) -> u64 {
-    use svod_ir::uop::cached_property::CachedProperty;
-    use svod_ir::uop::properties::InScopeRangesProperty;
-
-    #[allow(clippy::mutable_key_type)]
-    let in_scope = InScopeRangesProperty::get(uop);
-
-    if in_scope.is_empty() {
-        return 1;
-    }
-
-    // Tinygrad: run_count = prod([int(r.vmax)+1 for r in u.ranges])
-    // ALL ranges contribute, including Thread ranges. No filtering.
-    in_scope
-        .iter()
-        .map(|key| match key.0.vmax() {
-            ConstValue::Int(v) => (v + 1) as u64,
-            ConstValue::UInt(v) => v + 1,
-            _ => 1,
-        })
-        .product()
-}
-
-/// Get priority and optional argument value for a UOp.
-///
-/// Note: Tinygrad uses `u.arg` for DEFINE_VAR ordering (the name tuple).
-/// Svod uses `id` for tie-breaking since `arg_value` is numeric.
-/// This gives deterministic ordering but not alphabetical by name.
-fn get_priority(uop: &Arc<UOp>) -> (i32, Option<i64>) {
-    match uop.op() {
-        Op::Param { slot, device: None, .. } => (priority::PARAM, Some(*slot as i64)),
-        Op::DefineVar { name, .. } => {
-            // Use hash of name for stable ordering (Tinygrad: uses arg tuple for comparison)
-            // This ensures consistent ordering across runs while approximating name-based sorting
-            use std::collections::hash_map::DefaultHasher;
-            use std::hash::{Hash, Hasher};
-            let mut hasher = DefaultHasher::new();
-            name.hash(&mut hasher);
-            (priority::DEFINE_VAR, Some(hasher.finish() as i64))
-        }
-        Op::DefineLocal(_) => (priority::DEFINE_LOCAL, None),
-        Op::DefineReg { .. } => (priority::DEFINE_REG, None),
-        Op::Const(_) | Op::VConst { .. } => (priority::DEFAULT, None),
-        Op::End { .. } => (priority::END, None),
-        Op::Load { .. } => (priority::LOAD, None),
-        Op::Store { .. } => (priority::STORE, None),
-        Op::Range { .. } => (priority::RANGE, None),
-        _ => (priority::DEFAULT, None),
-    }
+    newlst
 }
 
 #[cfg(test)]

@@ -1274,19 +1274,15 @@ pub fn dce_dsl_patterns() -> &'static TypedPatternMatcher {
 /// - AFTER(x, []) → x (empty deps, just passthrough)
 pub fn after_simplification_patterns() -> &'static TypedPatternMatcher {
     crate::cached_patterns! {
-        // AFTER recursive dep flattening:
+        // AFTER recursive dep flattening + dedup (matches tinygrad symbolic.py:307-311):
         // For each dep, if it's not a side-effecting op, replace it with its sources.
-        // This inlines AFTER dep chains so only true side-effect boundaries remain.
+        // Then deduplicate by UOp id to prevent dep-list bloat.
         After { passthrough, deps } if !deps.is_empty() => {
             let mut new_deps = smallvec::SmallVec::<[Arc<UOp>; 4]>::new();
             let mut changed = false;
             for dep in deps {
-                // Side-effect boundaries that survive AFTER inlining. `Custom`
-                // is included because it carries backend intrinsics / scheduling
-                // markers (e.g., `; svod.sched.pipeline` for AMDGPU iglp) whose
-                // effect is invisible to the symbolic reasoner — inlining their
-                // sources would orphan the marker.
-                // : {RANGE, STORE, CALL, BARRIER, END, UNROLL, CUSTOM}
+                // Side-effect boundaries that survive AFTER inlining.
+                // Matches tinygrad: {RANGE, STORE, CALL, FUNCTION, BARRIER, END, UNROLL, LINEAR, STAGE}
                 if matches!(
                     dep.op(),
                     Op::Range { .. }
@@ -1296,6 +1292,7 @@ pub fn after_simplification_patterns() -> &'static TypedPatternMatcher {
                         | Op::Barrier { .. }
                         | Op::Unroll { .. }
                         | Op::Custom { .. }
+                        | Op::Function { .. }
                 ) {
                     new_deps.push(Arc::clone(dep));
                 } else {
@@ -1307,6 +1304,9 @@ pub fn after_simplification_patterns() -> &'static TypedPatternMatcher {
                 }
             }
             if changed {
+                // Dedup by UOp id (matches tinygrad's dedup(flatten(...)))
+                let mut seen = std::collections::HashSet::new();
+                new_deps.retain(|d| seen.insert(d.id));
                 if new_deps.is_empty() {
                     Some(Arc::clone(passthrough))
                 } else {
@@ -1318,6 +1318,28 @@ pub fn after_simplification_patterns() -> &'static TypedPatternMatcher {
         },
         // AFTER(x, []) → x: empty dependencies means no ordering constraint
         After { passthrough, deps } if deps.is_empty() ~> Arc::clone(passthrough),
+
+        // Remove NOOP and recursive empty-END deps from AFTER (matches tinygrad rangeify.py:458-479).
+        // A noop_after_dep is: NOOP with no sources, or END whose computation is also a noop_after_dep.
+        After { passthrough, deps } if deps.iter().any(is_noop_after_dep) => {
+            let new_deps: smallvec::SmallVec<[Arc<UOp>; 4]> =
+                deps.iter().filter(|d| !is_noop_after_dep(d)).cloned().collect();
+            if new_deps.is_empty() {
+                Some(Arc::clone(passthrough))
+            } else {
+                Some(passthrough.after(new_deps))
+            }
+        },
+    }
+}
+
+/// Check if a UOp is a noop AFTER dep (matches tinygrad's `is_noop_after_dep`).
+/// A noop_after_dep is: NOOP with no sources, or END whose computation is also a noop_after_dep.
+fn is_noop_after_dep(u: &Arc<UOp>) -> bool {
+    match u.op() {
+        Op::Noop => true,
+        Op::End { computation, .. } => is_noop_after_dep(computation),
+        _ => false,
     }
 }
 

@@ -127,6 +127,53 @@ fn check_phi_dominance(linear: &[Arc<UOp>]) -> Result<(), String> {
     Ok(())
 }
 
+/// Check the pre-linearization DAG for cross-scope dependencies.
+///
+/// A cross-scope dependency exists when node N (with RANGE R in its
+/// `InScopeRanges`) is consumed by node M (where R is NOT in M's
+/// `InScopeRanges`), AND M does not explicitly end R.  This means the tree
+/// is malformed — no linearizer can produce valid code from it.
+fn check_tree_scope(root: &Arc<UOp>) -> Result<(), String> {
+    use svod_ir::uop::cached_property::CachedProperty;
+    use svod_ir::uop::properties::InScopeRangesProperty;
+
+    let topo = root.toposort();
+    for u in &topo {
+        let u_scope = InScopeRangesProperty::get(u);
+        if u_scope.is_empty() {
+            continue;
+        }
+        // Find all consumers of u in the toposort
+        for v in &topo {
+            let v_sources = v.op().sources();
+            if !v_sources.iter().any(|s| s.id == u.id) {
+                continue;
+            }
+            // v consumes u
+            if matches!(v.op(), Op::After { .. }) {
+                continue;
+            }
+            let v_scope = InScopeRangesProperty::get(v);
+            // Every range in u's scope should be in v's scope too,
+            // unless v explicitly ends it.
+            let v_ended: HashSet<u64> = v.op().ended_ranges().iter().map(|r| r.id).collect();
+            for r in u_scope.iter() {
+                if !v_scope.contains(r) && !v_ended.contains(&r.0.id) {
+                    return Err(format!(
+                        "tree-scope violation: {:?} (scope={{{:?}}}) → consumed by {:?} (scope={{{:?}}}) which doesn't end range {}",
+                        u.op(),
+                        u_scope.iter().map(|k| k.0.id).collect::<Vec<_>>(),
+                        v.op(),
+                        v_scope.iter().map(|k| k.0.id).collect::<Vec<_>>(),
+                        r.0.id
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 // ── tests ──────────────────────────────────────────────────────────────────
 
 fn assert_no_phi_violation(sink: Arc<UOp>, renderer: &Renderer, label: &str) {
@@ -163,6 +210,7 @@ fn assert_no_phi_with_tc(sink: Arc<UOp>, renderer: &Renderer, label: &str) {
     assert!(has_wmma, "{label}: TC apply did not produce WMMA");
 
     let post = apply_post_optimization_with_renderer(ast, Some(renderer));
+    check_tree_scope(&post).unwrap_or_else(|e| panic!("{label}: tree-scope: {e}"));
     let linear = linearize_with_cfg(post);
     eprintln!("[{label}] linear={}", linear.len());
     check_phi_dominance(&linear).unwrap_or_else(|e| panic!("{label}: {e}"));
