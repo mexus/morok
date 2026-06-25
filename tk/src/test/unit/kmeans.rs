@@ -168,13 +168,14 @@ fn kmeans_naive(x: &svod_tensor::Tensor, c: &svod_tensor::Tensor) -> (Vec<i32>, 
     let cross = xf.matmul(&cf.try_permute(&[1, 0]).expect("cᵀ")).expect("x@cᵀ"); // [N,K]
     let two = svod_tensor::Tensor::from_slice([2.0f32]);
     let c_sq_row = c_sq.try_permute(&[1, 0]).expect("‖c‖²ᵀ"); // [1,K]
-    let dist = x_sq
+    let mut dist = x_sq
         .try_add(&c_sq_row)
         .expect("‖x‖²+‖c‖²")
         .try_sub(&cross.try_mul(&two).expect("2·cross"))
         .expect("full ‖x−c‖²")
         .relu()
         .expect("clamp ≥ 0"); // [N,K]
+    dist.realize().expect("realize ref dist");
     let dist_v = dist.as_vec::<f32>().expect("dist vec");
 
     let mut ids = vec![-1i32; n];
@@ -200,10 +201,11 @@ fn ref_dist_full(x: &svod_tensor::Tensor, c: &svod_tensor::Tensor, i: usize, j: 
     let xf = x.cast(DType::Float32).expect("x→f32");
     let cf = c.cast(DType::Float32).expect("c→f32");
     let d = x.shape().expect("x shape")[1].as_const().expect("D");
-    let xi = xf.try_shrink([(i as isize, 1), (0, d as isize)]).expect("xi");
-    let cj = cf.try_shrink([(j as isize, 1), (0, d as isize)]).expect("cj");
+    let xi = xf.try_shrink([(i as isize, (i + 1) as isize), (0, d as isize)]).expect("xi");
+    let cj = cf.try_shrink([(j as isize, (j + 1) as isize), (0, d as isize)]).expect("cj");
     let diff = xi.try_sub(&cj).expect("diff");
-    let dist = diff.try_mul(&diff).expect("diff²").sum_with().axes(1isize).call().expect("Σ diff²");
+    let mut dist = diff.try_mul(&diff).expect("diff²").sum_with().axes(1isize).call().expect("Σ diff²");
+    dist.realize().expect("realize ref dist_full");
     dist.as_vec::<f32>().expect("dist vec")[0]
 }
 
@@ -351,11 +353,16 @@ fn test_kmeans_update_err_paths() {
     crate::kmeans_update(&x_small, &ids2, &c_small).err().expect("rank-2 ids must error");
 }
 
-// ── phi-dominance MRE ──────────────────────────────────────────────────────
+// ── generic-baseline phi-dominance regression guard ─────────────────────────
 //
-// The generic-graph kmeans baseline (`matmul → ‖x‖²+‖c‖²−2·x·cᵀ → min over K`)
-// hits a phi-dominance violation in the generated LLVM IR at K≥1024 on gfx1151.
-// This test reproduces the issue without running the full criterion benchmark.
+// The generic GEMM-argmin kmeans baseline (`x·cᵀ → ‖x‖²+‖c‖²−2·x·cᵀ → min over K`,
+// identical to `benches/kmeans.rs`) fuses the matmul and the min-over-K into one
+// kernel. With REALIZED bf16 inputs (as the bench produces) the optimizer applied a
+// tensor core to the matmul and tiled its N-output axis — which is *also* the min's
+// reduce axis K — into Warp/Local sub-axes, so the min reduced over ranges shared
+// with the GEMM and one loop got closed by two ENDs → invalid LLVM IR ("instruction
+// does not dominate all uses"). The TC heuristic now declines a matmul whose output
+// feeds a downstream reduce. This guards the whole bench K-sweep without criterion.
 //
 // Run: `SVOD_DEVICE=AMD:0 cargo test -p svod-tk -- --ignored kmeans_generic_phi`
 
@@ -378,18 +385,17 @@ fn kmeans_generic_ref(xb: &svod_tensor::Tensor, cb: &svod_tensor::Tensor) -> svo
 #[ignore = "requires SVOD_DEVICE=AMD:0 with gfx1151"]
 fn kmeans_generic_phi_dominance_mre() {
     use svod_tensor::Tensor;
-    let (n, d, k) = (2048usize, 64usize, 1024usize);
-    let xb = Tensor::randn(&[n, d]).expect("x").cast(DType::BFloat16).expect("x→bf16");
-    let cb = Tensor::randn(&[k, d]).expect("c").cast(DType::BFloat16).expect("c→bf16");
+    let (n, d) = (2048usize, 64usize);
+    // Sweep the bench's centroid counts. Inputs are REALIZED (as the bench
+    // produces them) so the matmul + min-over-K fuse into one kernel — the regime
+    // that exposed the tensor-core-tiled-reduce-axis phi-dominance.
+    for k in [64usize, 256, 1024, 4096] {
+        let mut xb = Tensor::randn(&[n, d]).expect("x").cast(DType::BFloat16).expect("x→bf16");
+        let mut cb = Tensor::randn(&[k, d]).expect("c").cast(DType::BFloat16).expect("c→bf16");
+        xb.realize().expect("realize xb");
+        cb.realize().expect("realize cb");
 
-    let mut result = kmeans_generic_ref(&xb, &cb);
-
-    let plan = result.prepare();
-    match &plan {
-        Ok(_) => {}
-        Err(e) => {
-            let msg = format!("{e}");
-            panic!("kmeans_generic prepare failed (K={k}): {msg}");
-        }
+        let mut result = kmeans_generic_ref(&xb, &cb);
+        result.prepare().unwrap_or_else(|e| panic!("kmeans_generic prepare failed (K={k}): {e}"));
     }
 }

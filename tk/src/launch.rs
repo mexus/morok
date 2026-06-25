@@ -311,6 +311,14 @@ pub fn compile(device: &Device, sink: Arc<UOp>, buffers: &[Buffer]) -> Result<Co
     // `Scalar(Index)` and panic. Idempotent on already-lowered graphs.
     let sink = svod_schedule::graph_rewrite(&svod_schedule::symbolic::pm_lower_index_dtype(), sink, &mut ());
 
+    // Post-index symbolic simplification (as in tinygrad's late pipeline): fold
+    // the degenerate index arithmetic lowering regenerates (`x*0`, `x*1`, `x/1`,
+    // `x%1`, redundant casts). Left unfolded, those loop-invariant values reach
+    // the renderer stranded in non-dominating blocks (LLVM "does not dominate all
+    // uses"). The dead-loop-free variant preserves hand-built END/AFTER loop
+    // carries (see `symbolic_no_dead_loop`).
+    let sink = svod_schedule::graph_rewrite(svod_schedule::symbolic::symbolic_no_dead_loop(), sink, &mut ());
+
     // PROGRAM(sink, device) → SOURCE → BINARY (render + compile, cached nowhere
     // here; repeated launches recompile — the JIT cache lives a layer up).
     let program = program_pipeline::program_from_sink(sink, device.device.clone());

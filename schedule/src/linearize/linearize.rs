@@ -111,50 +111,30 @@ fn compute_tuplize(nodes: &[Arc<UOp>]) -> HashMap<u64, Vec<u32>> {
 
 /// Compute run_count: `prod(int(r.vmax)+1 for r in u.ranges)`.
 ///
-/// Mirrors tinygrad's `run_count = prod([int(r.vmax)+1 for r in u.ranges])`.
+/// Mirrors tinygrad's `run_count = prod([int(r.vmax)+1 for r in u.ranges])`,
+/// applied uniformly to every op. [`InScopeRangesProperty`] is the faithful
+/// port of tinygrad's `u.ranges` (`_ranges`): it merges the sources' in-scope
+/// ranges and pops the op's `ended_ranges()`. For an AFTER that pop already
+/// drops the ranges its deps close (e.g. a post-loop `acc.after(end_R)` yields
+/// the empty set → run_count 1), so AFTER needs no special handling — the
+/// generic path places it outside the loop, not nested inside it.
 ///
-/// **AFTER special case**: tinygrad's `u.ranges` for AFTER returns
-/// `flatten([dep.ended_ranges for dep in deps])` — the ranges that the
-/// AFTER's deps end. This gives AFTER a high run_count, ensuring the
-/// linearizer places it after the loop (not inside it).
+/// [`InScopeRangesProperty`]: svod_ir::uop::properties::InScopeRangesProperty
 fn run_count(uop: &Arc<UOp>) -> u64 {
-    match uop.op() {
-        Op::After { deps, .. } => {
-            let mut rc: u64 = 1;
-            for dep in deps {
-                for ended in dep.op().ended_ranges() {
-                    if matches!(ended.op(), Op::Range { .. }) {
-                        rc *= match ended.vmax() {
-                            ConstValue::Int(v) => (v + 1) as u64,
-                            ConstValue::UInt(v) => v + 1,
-                            _ => 1,
-                        };
-                    }
-                }
-            }
-            rc
-        }
-        _ => {
-            use svod_ir::uop::cached_property::CachedProperty;
-            use svod_ir::uop::properties::InScopeRangesProperty;
+    use svod_ir::uop::cached_property::CachedProperty;
+    use svod_ir::uop::properties::InScopeRangesProperty;
 
-            #[allow(clippy::mutable_key_type)]
-            let in_scope = InScopeRangesProperty::get(uop);
+    #[allow(clippy::mutable_key_type)]
+    let in_scope = InScopeRangesProperty::get(uop);
 
-            if in_scope.is_empty() {
-                return 1;
-            }
-
-            in_scope
-                .iter()
-                .map(|key| match key.0.vmax() {
-                    ConstValue::Int(v) => (v + 1) as u64,
-                    ConstValue::UInt(v) => v + 1,
-                    _ => 1,
-                })
-                .product()
-        }
-    }
+    in_scope
+        .iter()
+        .map(|key| match key.0.vmax() {
+            ConstValue::Int(v) => (v + 1) as u64,
+            ConstValue::UInt(v) => v + 1,
+            _ => 1,
+        })
+        .product()
 }
 
 /// Priority assignment matching tinygrad's linearizer.py:24-32.
@@ -206,11 +186,7 @@ pub fn linearize(sink: Arc<UOp>) -> Vec<Arc<UOp>> {
         pa.cmp(pb).then_with(|| tuplize[&a].cmp(&tuplize[&b]))
     });
 
-    let nkey: HashMap<u64, usize> = sorted
-        .iter()
-        .enumerate()
-        .map(|(i, &id)| (id, i))
-        .collect();
+    let nkey: HashMap<u64, usize> = sorted.iter().enumerate().map(|(i, &id)| (id, i)).collect();
 
     // Heap toposort: pop highest nkey first (max-heap), reverse at end.
     let id_map: HashMap<u64, Arc<UOp>> = lst.iter().map(|u| (u.id, u.clone())).collect();

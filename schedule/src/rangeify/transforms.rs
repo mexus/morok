@@ -19,7 +19,7 @@ use super::indexing::IndexingContext;
 use super::kernel::RangeifyBufferContext;
 use smallvec::{SmallVec, smallvec};
 use svod_ir::shape::Shape;
-use svod_ir::{AddrSpace, AxisType, BufferizeOpts, ConstValue, DType, Op, UOp, UOpKey};
+use svod_ir::{AddrSpace, BufferizeOpts, ConstValue, DType, Op, UOp, UOpKey};
 
 // ============================================================================
 // ADD_TAGS
@@ -868,31 +868,6 @@ pub(crate) fn transform_single_source(
 // ============================================================================
 // BUFFERIZE TO STORE CONVERSION
 // ============================================================================
-
-/// Create a fresh LOOP range with the same axis_id and a new constant size.
-fn create_loop_range_from_outer(outer: &Arc<UOp>, size: usize) -> Option<Arc<UOp>> {
-    use svod_ir::AxisType;
-    let Op::Range { axis_id, .. } = outer.op() else {
-        return None;
-    };
-    Some(UOp::range_axis(UOp::index_const(size as i64), *axis_id, AxisType::Loop))
-}
-
-/// Convert ReduceOp to binary operation.
-fn reduce_op_to_binary(op: svod_ir::ReduceOp, lhs: &Arc<UOp>, rhs: &Arc<UOp>) -> Option<Arc<UOp>> {
-    use svod_ir::types::{BinaryOp, ReduceOp};
-    let dtype = lhs.dtype();
-    Some(match op {
-        ReduceOp::Add => UOp::new(Op::Binary(BinaryOp::Add, lhs.clone(), rhs.clone()), dtype),
-        ReduceOp::Mul => UOp::new(Op::Binary(BinaryOp::Mul, lhs.clone(), rhs.clone()), dtype),
-        ReduceOp::Max => UOp::new(Op::Binary(BinaryOp::Max, lhs.clone(), rhs.clone()), dtype),
-        ReduceOp::Min => {
-            // Min uses WHERE(a < b, a, b) pattern
-            let cond = UOp::new(Op::Binary(BinaryOp::Lt, lhs.clone(), rhs.clone()), svod_dtype::DType::Bool);
-            UOp::try_where(cond, lhs.clone(), rhs.clone()).expect("reduce_op_to_binary: try_where failed for Min")
-        }
-    })
-}
 
 /// Calculate buffer size from BUFFERIZE ranges.
 ///

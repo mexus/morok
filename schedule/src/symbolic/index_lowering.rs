@@ -86,6 +86,20 @@ pub fn pm_lower_index_dtype() -> TypedPatternMatcher {
         // PHASE 2: Process wrapped values
         // ================================================================
 
+        // AFTER(x.cast(Index), deps) → AFTER(x, deps).cast(Index)
+        // Push the ordering wrapper inside the cast so the AFTER's result is a
+        // `cast(Index)` wrapper that the Binary/Where/etc. rules below can match
+        // and lower. AFTER is pure ordering metadata (dtype = passthrough dtype),
+        // so moving it onto the concrete-int passthrough preserves both the
+        // dependency and the lowering. Without this, a hand-built kernel that
+        // anchors an Index value to a loop scope (`x.after(scope)`) would leave an
+        // un-lowered `Op::Binary(Index)` for codegen.
+        node @ After { passthrough, deps } if node.dtype() == DType::Index => |node, passthrough, deps| {
+            let Op::Cast { src, dtype } = passthrough.op() else { return None };
+            if *dtype != DType::Index { return None; }
+            Some(src.after(deps.clone()).cast(DType::Index))
+        },
+
         // Unary(x.cast(Index)) → Unary(x.cast(dt), dt).cast(Index)
         // Handles Neg and other unary ops on Index-wrapped values.
         node if matches!(node.op(), Op::Unary(_, _)) && node.dtype() == DType::Index => |node| {

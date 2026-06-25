@@ -94,7 +94,7 @@ fn test_priority_ordering() {
     let param = UOp::param(0, 1, DType::Float32, None);
     let range = UOp::range_const(10, 0);
 
-    assert!(priority(&param).0 < 0);  // PARAM = -20
+    assert!(priority(&param).0 < 0); // PARAM = -20
     assert!(priority(&range).0 == 5); // RANGE = 5
     assert_eq!(priority(&param).1, Some(0)); // PARAM extra = slot
 }

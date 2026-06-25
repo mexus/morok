@@ -2,7 +2,7 @@
 
 use smallvec::SmallVec;
 use svod_dtype::{DType, DeviceSpec};
-use svod_ir::{AxisId, AxisType, ConstValue, ReduceOp, UOp};
+use svod_ir::{AxisId, AxisType, ConstValue, UOp};
 
 use crate::llvm::text::render;
 

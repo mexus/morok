@@ -1,6 +1,5 @@
-use smallvec::SmallVec;
 use svod_dtype::{AddrSpace, AmdArch, DType};
-use svod_ir::{AxisId, AxisType, BinaryOp, ConstValue, Op, ReduceOp, RendererDevice, WmmaMetadata, WmmaUpcastAxes};
+use svod_ir::{BinaryOp, ConstValue, Op, RendererDevice, WmmaMetadata, WmmaUpcastAxes};
 
 use super::*;
 use crate::Renderer;
