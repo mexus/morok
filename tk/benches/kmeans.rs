@@ -5,15 +5,12 @@
 //!
 //! Run: `SVOD_DEVICE=AMD:0 cargo bench -p svod-tk --bench kmeans`
 
-use std::hint::black_box;
-use std::time::Duration;
-
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use svod_dtype::DType;
 use svod_tensor::Tensor;
 
 mod common;
-use common::{plan_gpu_ns, randn_bf16, requirements_met};
+use common::{bench_plan, randn_bf16, requirements_met};
 
 /// The generic-graph **GEMM-argmin** k-means assignment baseline — what you'd
 /// write *without* the fused kernel: materialise the full `[N, K]` squared-L2
@@ -59,9 +56,7 @@ fn bench_kmeans(c: &mut Criterion) {
             let (_ids, mut dists) =
                 svod_tk::kmeans_assign(&xb, &cb).expect("tk kmeans").expect("kmeans applies for bench shape");
             let plan = dists.prepare().expect("prepare tk kmeans");
-            group.bench_with_input(BenchmarkId::new("tk", k), &k, |bencher, _| {
-                bencher.iter_custom(|iters| Duration::from_nanos(black_box(plan_gpu_ns(&plan, iters))));
-            });
+            group.bench_with_input(BenchmarkId::new("tk", k), &k, |bencher, _| bench_plan(bencher, &plan));
 
             // Reference: the generic GEMM-argmin path (materialises the [N,K] matrix).
             // Optional — the generic codegen hits a WMMA-intrinsic redeclaration on
@@ -70,7 +65,7 @@ fn bench_kmeans(c: &mut Criterion) {
             match reft.prepare() {
                 Ok(ref_plan) => {
                     group.bench_with_input(BenchmarkId::new("generic", k), &k, |bencher, _| {
-                        bencher.iter_custom(|iters| Duration::from_nanos(black_box(plan_gpu_ns(&ref_plan, iters))));
+                        bench_plan(bencher, &ref_plan)
                     });
                 }
                 Err(e) => eprintln!("svod-tk kmeans bench: skip generic row for K={k} ({e})"),
@@ -80,5 +75,9 @@ fn bench_kmeans(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_kmeans);
+criterion_group! {
+    name = benches;
+    config = Criterion::default().with_profiler(common::bench_profiler());
+    targets = bench_kmeans
+}
 criterion_main!(benches);

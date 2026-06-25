@@ -409,11 +409,18 @@ pub struct OwnerCtx {
     my_newest: Mutex<Option<Arc<AmdSignal>>>,
     /// PM4: this owner's last reserved counter value (0 = none yet).
     pm4_high: AtomicU64,
+    /// PMC: hardware counters to collect on profiling dispatches (empty = off).
+    pmc: Mutex<Vec<crate::profile::PmcCounter>>,
 }
 
 impl OwnerCtx {
     pub fn new(pool: Arc<PoolQueue>) -> Self {
-        Self { pool, my_newest: Mutex::new(None), pm4_high: AtomicU64::new(0) }
+        Self { pool, my_newest: Mutex::new(None), pm4_high: AtomicU64::new(0), pmc: Mutex::new(Vec::new()) }
+    }
+
+    /// Hardware counters to collect on this owner's profiling dispatches.
+    pub fn pmc_counters(&self) -> Vec<crate::profile::PmcCounter> {
+        self.pmc.lock().clone()
     }
 
     /// Access the shared queue (queue / arena / scratch / acquire_signal /
@@ -499,7 +506,15 @@ impl crate::device::PlanContext for OwnerCtx {
         let sig = unsafe {
             amd.execute_on(self, buffers, vals, global_size, local_size, /*wait=*/ false, profile)?
         };
-        Ok(sig.map(|s| s as Arc<dyn crate::DispatchTimestamps>))
+        Ok(sig)
+    }
+
+    fn set_pmc(&self, counters: &[crate::profile::PmcCounter]) {
+        *self.pmc.lock() = counters.to_vec();
+    }
+
+    fn pmc_available(&self) -> bool {
+        crate::amd::pmc::stable_pstate()
     }
 
     fn synchronize(&self) -> Result<()> {

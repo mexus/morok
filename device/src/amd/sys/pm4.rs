@@ -158,6 +158,9 @@ pub const PACKET3_DISPATCH_DIRECT: u32 = 0x15;
 pub const PACKET3_SET_SH_REG: u32 = 0x76;
 pub const PACKET3_SET_SH_REG_START: u32 = 0x2c00;
 pub const PACKET3_EVENT_WRITE: u32 = 0x46;
+pub const PACKET3_COPY_DATA: u32 = 0x40;
+pub const PACKET3_SET_UCONFIG_REG: u32 = 0x79;
+pub const PACKET3_SET_UCONFIG_REG_START: u32 = 0xc000;
 
 // ── SH-relative COMPUTE_* register offsets ────────────────────────────────
 //
@@ -447,6 +450,29 @@ pub fn set_sh_reg(reg_offset: u32, values: &[u32]) -> Vec<u32> {
     v.push(reg_offset & 0xFFFF);
     v.extend_from_slice(values);
     v
+}
+
+/// Build a `PACKET3_SET_UCONFIG_REG`. Same layout as [`set_sh_reg`] but for the
+/// UCONFIG register window; `reg_offset` is UCONFIG-relative
+/// (`abs_dword - PACKET3_SET_UCONFIG_REG_START`). Used for perf-counter control
+/// registers (SQ_PERFCOUNTER*, CP_PERFMON_CNTL, GRBM_GFX_INDEX).
+pub fn set_uconfig_reg(reg_offset: u32, values: &[u32]) -> Vec<u32> {
+    let n = values.len() as u32;
+    let mut v = Vec::with_capacity(2 + values.len());
+    v.push(packet3(PACKET3_SET_UCONFIG_REG, n));
+    v.push(reg_offset & 0xFFFF);
+    v.extend_from_slice(values);
+    v
+}
+
+/// Build a `PACKET3_COPY_DATA` that copies a performance-counter register into
+/// GPU memory (`src_sel=perfcounter`, `dst_sel=tc_l2`). `src_reg` is the source
+/// register's ABSOLUTE dword address; `dst` is the destination GPU VA. The final
+/// dispatch `release_mem` cache flush makes the L2 write visible to the host.
+///
+/// Layout (6 dwords): header, control `(2<<8)|4`, src reg, src hi (0), dst lo, dst hi.
+pub fn copy_data_reg_to_mem(src_reg: u32, dst: u64) -> [u32; 6] {
+    [packet3(PACKET3_COPY_DATA, 4), (2 << 8) | 4, src_reg, 0, dst as u32, (dst >> 32) as u32]
 }
 
 /// Build a `PACKET3_DISPATCH_DIRECT` packet — 5 dwords total. The PM4 CP

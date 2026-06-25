@@ -38,7 +38,7 @@ use svod_ir::{CustomFunctionKind, Op, UOp};
 
 use crate::error::{ExecSnafu, Result};
 use crate::kernel_cache::CachedKernel;
-use crate::profiler::KernelProfile;
+use crate::profiler::{KernelProfile, KernelStaticInfo, ProfileOptions, RunProfile, StageProfile};
 
 type RuntimeLaunchSizes = (Option<[usize; 3]>, Option<[usize; 3]>);
 
@@ -856,6 +856,8 @@ impl ExecutionPlan {
                             wall: start.elapsed(),
                             gpu_start_ns: None,
                             gpu_end_ns: None,
+                            static_info: None,
+                            counters: None,
                         });
                     }
                     PreparedOp::BufferCopy(copy) => self.execute_copy(copy)?,
@@ -876,9 +878,85 @@ impl ExecutionPlan {
                     profile.gpu_start_ns = Some(start);
                     profile.gpu_end_ns = Some(end);
                 }
+                profile.counters = handle.as_ref().and_then(|h| h.counters());
             }
         }
         Ok(profiles)
+    }
+
+    /// Profile the plan: run the per-dispatch path `opts.iters` times, keeping
+    /// each kernel's minimum device time (robust to outliers). Returns a
+    /// single-stage [`RunProfile`]; render it with [`RunProfile::render_table`].
+    ///
+    /// Tier-2/3 static analysis (`opts.static_analysis`) and Tier-4 hardware
+    /// counters (`opts.counters`) attach to each [`KernelProfile`] when enabled.
+    pub fn profile(&self, opts: &ProfileOptions) -> Result<RunProfile> {
+        let start = Instant::now();
+        // Tier-4: arm hardware counters on the plan's context when requested and
+        // the backend supports it in a stable power state. Degrade gracefully
+        // (no counters, a one-line note) rather than failing the run.
+        let counters = opts.counters.counters();
+        let armed_ctx = if counters.is_empty() {
+            None
+        } else {
+            let first_program = self.op_levels.iter().flatten().find_map(|&idx| match &self.ops[idx] {
+                PreparedOp::CompiledProgram(k) => Some(k.kernel.program.as_ref()),
+                _ => None,
+            });
+            match first_program.and_then(|p| self.plan_ctx(p).ok().flatten()) {
+                Some(ctx) if ctx.pmc_available() => {
+                    ctx.set_pmc(&counters);
+                    Some(ctx)
+                }
+                Some(_) => {
+                    eprintln!(
+                        "SVOD_PMC: hardware counters unavailable (needs a profile_standard \
+                         power state — run `amd-smi set -l stable_std`); reporting timing only"
+                    );
+                    None
+                }
+                None => None,
+            }
+        };
+        // Each pass is one "profile" stage; merge passes by per-kernel min time.
+        let run = |kernels| RunProfile { stages: vec![StageProfile::gpu("profile", start.elapsed(), kernels)] };
+        let mut report = run(self.execute_profiled()?);
+        for _ in 1..opts.iters {
+            report.merge_min(run(self.execute_profiled()?));
+        }
+        // Disarm so later non-profiled executions on this context don't pay for
+        // (or perturb from) counter programming.
+        if let Some(ctx) = armed_ctx {
+            ctx.set_pmc(&[]);
+        }
+        if opts.static_analysis {
+            // Profiles are in dispatch order; the compiled kernels in op_levels
+            // order line up one-to-one, so zip attaches each kernel's analysis.
+            let kernels = self.op_levels.iter().flatten().filter_map(|&idx| match &self.ops[idx] {
+                PreparedOp::CompiledProgram(k) => Some(k),
+                _ => None,
+            });
+            for (profile, pk) in report.stages[0].kernels.iter_mut().zip(kernels) {
+                profile.static_info = Some(self.kernel_static_info(pk));
+            }
+        }
+        Ok(report)
+    }
+
+    /// Tier-2/3 static analysis for one kernel: AST flop estimate, compulsory
+    /// byte traffic (each distinct buffer counted once), and decoded GPU
+    /// resources when the backend exposes them.
+    fn kernel_static_info(&self, pk: &PreparedKernel) -> KernelStaticInfo {
+        // The AST walk saturates to u64::MAX when a range/special has an
+        // unbounded symbolic end (common in hand-built kernels) — treat that as
+        // "no reliable count" rather than reporting a garbage roofline.
+        let raw_flops = svod_ir::compute_ops_estimate(&pk.ast);
+        let est_flops = (raw_flops != u64::MAX).then_some(raw_flops);
+        let mut seen = std::collections::HashSet::new();
+        let est_bytes =
+            pk.buffer_indices.iter().filter(|&&i| seen.insert(i)).map(|&i| self.buffers[i].size() as u64).sum();
+        let resources = pk.kernel.program.resource_usage();
+        KernelStaticInfo { est_flops, est_bytes, resources }
     }
 
     /// Re-execute the plan with different variable bindings.

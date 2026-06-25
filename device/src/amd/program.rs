@@ -606,7 +606,7 @@ impl AmdProgram {
         local_size: Option<[usize; 3]>,
         wait: bool,
         profile: bool,
-    ) -> Result<Option<Arc<crate::amd::signal::AmdSignal>>> {
+    ) -> Result<Option<Arc<dyn crate::sync::DispatchTimestamps>>> {
         let pool = owner.pool();
         // Device poisoned by an earlier fault: refuse to dispatch (the GPU
         // state and any cached buffer mappings are no longer trustworthy).
@@ -732,6 +732,24 @@ impl AmdProgram {
                 None
             };
             let ts_addrs = ts.as_ref().map(|s| (s.start_ts_addr(), s.end_ts_addr()));
+            // PMC: when counters are armed (gfx11 only) on a profiling dispatch,
+            // allocate a host-visible GTT readback buffer and build the PM4
+            // program/read streams that bracket the dispatch.
+            let pmc_counters = if profile && self.target_major == 11 { owner.pmc_counters() } else { Vec::new() };
+            let pmc = if pmc_counters.is_empty() {
+                None
+            } else {
+                let grid = crate::amd::pmc::PmcGrid::from_node(&self.dev.node);
+                let bytes = crate::amd::pmc::readback_bytes(pmc_counters.len(), &grid);
+                let buf = crate::amd::AmdAllocator::new(self.device_id)?.alloc_uncached(bytes.max(64))?;
+                let (gpu, host) = match &buf {
+                    crate::allocator::RawBuffer::AmdDevice { gpu_addr, host_ptr: Some(h), .. } => (*gpu_addr, *h),
+                    _ => return Err(Error::Runtime { message: "PMC readback buffer not host-visible".into() }),
+                };
+                let (start, read) = crate::amd::pmc::build_streams(&pmc_counters, &grid, gpu);
+                Some((buf, host, grid, start, read))
+            };
+            let (pmc_start, pmc_read): (&[u32], &[u32]) = pmc.as_ref().map_or((&[], &[]), |(_, _, _, s, r)| (s, r));
             let v = queue.dispatch_pm4(
                 pool,
                 self.rsrc1,
@@ -745,6 +763,8 @@ impl AmdProgram {
                 self.wave32,
                 self.target_major,
                 ts_addrs,
+                pmc_start,
+                pmc_read,
             )?;
             owner.set_pm4_high(v);
             // Release the dispatch lock before the (up to 30 s) blocking wait so
@@ -754,7 +774,16 @@ impl AmdProgram {
             if wait {
                 owner.synchronize()?;
             }
-            Ok(ts)
+            // Build the returned handle: a PMC handle (timestamps + counters) when
+            // counters were collected, else the bare timestamp signal.
+            let handle: Option<Arc<dyn crate::sync::DispatchTimestamps>> = match (ts, pmc) {
+                (Some(sig), Some((buf, host, grid, _, _))) => {
+                    Some(Arc::new(crate::amd::pmc::PmcHandle::new(sig, buf, host, pmc_counters, grid.instances())))
+                }
+                (Some(sig), None) => Some(sig),
+                (None, _) => None,
+            };
+            Ok(handle)
         } else {
             // AQL path: completion via the kernel packet's own native
             // `completion_signal` (the packet processor decrements the countdown
@@ -793,7 +822,7 @@ impl AmdProgram {
                 }
                 return Err(e);
             }
-            Ok(Some(sig))
+            Ok(Some(sig as Arc<dyn crate::sync::DispatchTimestamps>))
         }
     }
 }
@@ -851,5 +880,18 @@ impl Program for AmdProgram {
         let alloc = crate::amd::AmdAllocator::new(self.device_id)?;
         let owner = self.dev.core().assign_owner(&alloc)?;
         Ok(Some(Box::new(owner)))
+    }
+
+    /// Decode VGPR/SGPR/LDS/scratch + VGPR-limited occupancy from the kernel
+    /// descriptor. Uses the original (un-patched) `compute_pgm_rsrc1` and the
+    /// descriptor's exact segment sizes — pure static, no GPU access.
+    fn resource_usage(&self) -> Option<crate::profile::KernelResources> {
+        Some(crate::amd::occupancy::decode_resources(
+            self.kd.compute_pgm_rsrc1,
+            self.kd.group_segment_fixed_size,
+            self.kd.private_segment_fixed_size,
+            if self.wave32 { 32 } else { 64 },
+            self.target_major,
+        ))
     }
 }

@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use svod_device::{CounterSet, KernelResources, PmcCounter};
 use svod_dtype::DeviceSpec;
 
 use crate::kernel_cache::CachedKernel;
@@ -44,6 +45,27 @@ pub struct KernelProfile {
     /// dispatches ([`svod_device::DispatchTimestamps`]).
     pub gpu_start_ns: Option<u64>,
     pub gpu_end_ns: Option<u64>,
+    /// Tier-2/3 static analysis (estimated flops/bytes + decoded GPU resources),
+    /// populated by [`ExecutionPlan::profile`](crate::ExecutionPlan::profile) when
+    /// `static_analysis` is set. `None` from [`ExecutionPlan::execute_profiled`].
+    pub static_info: Option<KernelStaticInfo>,
+    /// Tier-4 hardware performance counters, populated when PMC was enabled.
+    pub counters: Option<CounterSet>,
+}
+
+/// Static per-kernel analysis: estimated work plus decoded GPU resources.
+/// Computed without running the kernel (the estimates walk the kernel AST; the
+/// resources are decoded from the compiled descriptor).
+#[derive(Debug, Clone)]
+pub struct KernelStaticInfo {
+    /// Estimated floating-point ops, from the kernel AST. `None` when the
+    /// estimate is unreliable — e.g. a hand-built kernel with unbounded symbolic
+    /// ranges, where the AST walk saturates rather than forming a real count.
+    pub est_flops: Option<u64>,
+    /// Estimated bytes moved (distinct LOAD/STORE buffers).
+    pub est_bytes: u64,
+    /// Decoded GPU resource usage, when the backend exposes it.
+    pub resources: Option<KernelResources>,
 }
 
 impl std::fmt::Debug for KernelProfile {
@@ -63,6 +85,80 @@ impl KernelProfile {
         match (self.gpu_start_ns, self.gpu_end_ns) {
             (Some(s), Some(e)) => Duration::from_nanos(e - s),
             _ => self.wall,
+        }
+    }
+}
+
+/// Which hardware counters to collect during a profiled run.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum PmcSelection {
+    /// No hardware counters (Tiers 1–3 only).
+    #[default]
+    None,
+    /// A small default set: VALU/SQ busy cycles and L2 hit/miss.
+    Default,
+    /// An explicit counter list.
+    Custom(Vec<PmcCounter>),
+}
+
+impl PmcSelection {
+    /// Resolve to the concrete counter list (empty when disabled).
+    pub fn counters(&self) -> Vec<PmcCounter> {
+        match self {
+            Self::None => Vec::new(),
+            Self::Default => PmcCounter::all().to_vec(),
+            Self::Custom(v) => v.clone(),
+        }
+    }
+
+    /// Whether any counter is selected.
+    pub fn is_enabled(&self) -> bool {
+        !matches!(self, Self::None)
+    }
+}
+
+/// Options for [`ExecutionPlan::profile`](crate::ExecutionPlan::profile).
+#[derive(Debug, Clone)]
+pub struct ProfileOptions {
+    /// Replays to run; the per-kernel minimum device time is kept (robust to outliers).
+    pub iters: u32,
+    /// Collect Tier-2/3 static analysis (flops/bytes/resources). Cheap; on by default.
+    pub static_analysis: bool,
+    /// Hardware counter selection (Tier 4).
+    pub counters: PmcSelection,
+}
+
+impl Default for ProfileOptions {
+    fn default() -> Self {
+        Self { iters: 1, static_analysis: true, counters: PmcSelection::None }
+    }
+}
+
+impl ProfileOptions {
+    /// Build from the `SVOD_PROFILE_ITERS` / `SVOD_PMC` env vars (defaults
+    /// otherwise). This is the single place profiling env vars are read; callers
+    /// that want explicit control construct [`ProfileOptions`] directly.
+    pub fn from_env() -> Self {
+        let mut o = Self::default();
+        if let Ok(n) = std::env::var("SVOD_PROFILE_ITERS").unwrap_or_default().trim().parse::<u32>() {
+            o.iters = n.max(1);
+        }
+        if let Ok(v) = std::env::var("SVOD_PMC") {
+            o.counters = parse_pmc(&v);
+        }
+        o
+    }
+}
+
+/// Parse a `SVOD_PMC` value: empty/`0` → none, `1` → default set, else a
+/// comma-separated token list ([`PmcCounter::from_token`]).
+pub(crate) fn parse_pmc(v: &str) -> PmcSelection {
+    match v.trim() {
+        "" | "0" => PmcSelection::None,
+        "1" => PmcSelection::Default,
+        list => {
+            let counters: Vec<PmcCounter> = list.split(',').filter_map(PmcCounter::from_token).collect();
+            if counters.is_empty() { PmcSelection::Default } else { PmcSelection::Custom(counters) }
         }
     }
 }
@@ -190,6 +286,183 @@ impl RunProfile {
     pub fn stage(&self, name: &str) -> Option<&StageProfile> {
         self.stages.iter().find(|s| s.name == name)
     }
+
+    /// Merge another profiling pass of the SAME plan into this one, keeping each
+    /// kernel's faster (min device-time) sample — and carrying that sample's
+    /// counters/static analysis. Both must share stage + kernel ordering (extra
+    /// stages/kernels in `other` are ignored); `self`'s stage metadata is kept.
+    /// This is the single min-merge policy used to accumulate repeated passes
+    /// (the `profile()` `iters` loop and the criterion `--profile-time` hook).
+    pub fn merge_min(&mut self, other: RunProfile) {
+        for (stage, incoming) in self.stages.iter_mut().zip(other.stages) {
+            for (best, sample) in stage.kernels.iter_mut().zip(incoming.kernels) {
+                if sample.gpu_or_wall() < best.gpu_or_wall() {
+                    *best = sample;
+                }
+            }
+        }
+    }
+
+    /// Rich per-kernel table: device time plus any populated Tier-2/3/4 metrics
+    /// (GFLOP/s, GB/s, VGPR/SGPR/LDS, HW counters). Columns appear only when the
+    /// underlying data is present, so a Tier-1-only run shows just timing.
+    pub fn render_table(&self) -> String {
+        let mut out = String::new();
+        for s in &self.stages {
+            if s.kernels.is_empty() {
+                out.push_str(&format!("{}: wall {:.1} ms (host)\n", s.name, s.wall.as_secs_f64() * 1e3));
+            } else {
+                out.push_str(&render_stage_table(s));
+            }
+        }
+        out
+    }
+}
+
+/// One aggregated table row (kernels grouped by entry point).
+struct TableRow {
+    name: String,
+    count: usize,
+    total: Duration,
+    /// Summed flop estimate, or `None` if any dispatch's estimate was unreliable.
+    flops: Option<u64>,
+    bytes: u64,
+    resources: Option<KernelResources>,
+    counters: BTreeMap<PmcCounter, u64>,
+    has_static: bool,
+}
+
+/// Format a roofline rate (GFLOP/s or GB/s) in giga-units/s; `-` when the count
+/// is unknown, zero, or the elapsed time is non-positive.
+fn roofline_rate(count: Option<u64>, secs: f64) -> String {
+    match count {
+        Some(c) if c > 0 && secs > 0.0 => format!("{:.1}", c as f64 / secs / 1e9),
+        _ => "-".into(),
+    }
+}
+
+/// Aggregate a stage's per-dispatch kernels by entry point and format a table
+/// whose columns adapt to which tiers were collected.
+fn render_stage_table(s: &StageProfile) -> String {
+    let mut rows: Vec<TableRow> = Vec::new();
+    let mut index: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for k in &s.kernels {
+        let i = *index.entry(&k.kernel.entry_point).or_insert_with(|| {
+            rows.push(TableRow {
+                name: k.kernel.entry_point.clone(),
+                count: 0,
+                total: Duration::ZERO,
+                flops: Some(0),
+                bytes: 0,
+                resources: None,
+                counters: BTreeMap::new(),
+                has_static: false,
+            });
+            rows.len() - 1
+        });
+        let r = &mut rows[i];
+        r.count += 1;
+        r.total += k.gpu_or_wall();
+        if let Some(si) = &k.static_info {
+            r.has_static = true;
+            // Sum flops only while every dispatch had a reliable estimate.
+            r.flops = match (r.flops, si.est_flops) {
+                (Some(a), Some(b)) => Some(a.saturating_add(b)),
+                _ => None,
+            };
+            r.bytes = r.bytes.saturating_add(si.est_bytes);
+            if r.resources.is_none() {
+                r.resources = si.resources;
+            }
+        }
+        if let Some(cs) = &k.counters {
+            for (&c, &v) in &cs.values {
+                *r.counters.entry(c).or_insert(0) += v;
+            }
+        }
+    }
+    rows.sort_by_key(|r| std::cmp::Reverse(r.total));
+
+    let any_static = rows.iter().any(|r| r.has_static);
+    let any_res = rows.iter().any(|r| r.resources.is_some());
+    let mut counter_cols: Vec<PmcCounter> = rows.iter().flat_map(|r| r.counters.keys().copied()).collect();
+    counter_cols.sort();
+    counter_cols.dedup();
+
+    let mut header: Vec<String> = vec!["name".into(), "cnt".into(), "total ms".into(), "mean µs".into(), "%".into()];
+    if any_static {
+        header.push("GFLOP/s".into());
+        header.push("GB/s".into());
+    }
+    if any_res {
+        header.extend(["VGPR".into(), "SGPR".into(), "LDS".into(), "occ%".into()]);
+    }
+    for c in &counter_cols {
+        header.push(c.token().into());
+    }
+
+    let grand: Duration = rows.iter().map(|r| r.total).sum();
+    let mut body: Vec<Vec<String>> = Vec::with_capacity(rows.len());
+    for r in &rows {
+        let secs = r.total.as_secs_f64();
+        let pct = 100.0 * secs / grand.as_secs_f64().max(f64::EPSILON);
+        let mut cells = vec![
+            r.name.clone(),
+            r.count.to_string(),
+            format!("{:.3}", secs * 1e3),
+            format!("{:.1}", secs * 1e6 / r.count as f64),
+            format!("{pct:.1}"),
+        ];
+        if any_static {
+            cells.push(roofline_rate(r.flops, secs));
+            cells.push(roofline_rate(Some(r.bytes), secs));
+        }
+        if any_res {
+            match r.resources {
+                Some(res) => {
+                    let occ = res.occupancy.map(|o| format!("{:.0}", o * 100.0)).unwrap_or_else(|| "-".into());
+                    cells.extend([res.vgprs.to_string(), res.sgprs.to_string(), res.lds_bytes.to_string(), occ]);
+                }
+                None => cells.extend(["-".into(), "-".into(), "-".into(), "-".into()]),
+            }
+        }
+        for c in &counter_cols {
+            cells.push(r.counters.get(c).map(u64::to_string).unwrap_or_else(|| "-".into()));
+        }
+        body.push(cells);
+    }
+
+    let mut s_out = format!("{}: {} dispatches, GPU {:.3} ms\n", s.name, s.kernels.len(), grand.as_secs_f64() * 1e3);
+    s_out.push_str(&fmt_columns(&header, &body));
+    s_out
+}
+
+/// Format a table: column 0 left-aligned, the rest right-aligned, padded to the
+/// widest cell per column.
+fn fmt_columns(header: &[String], rows: &[Vec<String>]) -> String {
+    let mut w: Vec<usize> = header.iter().map(String::len).collect();
+    for r in rows {
+        for (i, c) in r.iter().enumerate() {
+            w[i] = w[i].max(c.len());
+        }
+    }
+    let line = |cells: &[String]| -> String {
+        let mut s = String::new();
+        for (i, c) in cells.iter().enumerate() {
+            if i == 0 {
+                s.push_str(&format!("{:<width$}  ", c, width = w[i]));
+            } else {
+                s.push_str(&format!("{:>width$}  ", c, width = w[i]));
+            }
+        }
+        s.push('\n');
+        s
+    };
+    let mut out = line(header);
+    for r in rows {
+        out.push_str(&line(r));
+    }
+    out
 }
 
 impl std::fmt::Display for RunProfile {

@@ -30,6 +30,9 @@ pub mod graph;
 pub mod iface;
 #[cfg(unix)]
 pub mod kernarg;
+pub mod occupancy;
+#[cfg(unix)]
+pub mod pmc;
 #[cfg(unix)]
 pub mod program;
 #[cfg(unix)]

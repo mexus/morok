@@ -49,7 +49,7 @@ use svod_ir::pattern::is_any_const;
 use svod_ir::{DeviceSpec, Op, UOp, UOpKey};
 use svod_runtime::{
     ExecutionPlan, ExecutionPlanBuilder, PreparedBufferView, PreparedCopy, PreparedCustomFunction, PreparedKernel,
-    PreparedOp,
+    PreparedOp, ProfileOptions, RunProfile,
 };
 
 fn collect_pending_indices(tensors: &[&mut Tensor]) -> Vec<usize> {
@@ -196,6 +196,48 @@ impl Tensor {
         });
 
         Ok(())
+    }
+
+    /// Profile this tensor's execution.
+    ///
+    /// Prepares the plan, runs the profiled path per `opts` (replays for stable
+    /// device times, plus Tier-2/3 static analysis and Tier-4 counters when
+    /// enabled), finalizes the result so the tensor is realized like
+    /// [`realize`](Self::realize), and returns the per-kernel [`RunProfile`].
+    /// Render it with [`RunProfile::render_table`].
+    pub fn profile(&mut self, opts: &ProfileOptions) -> Result<RunProfile> {
+        // Nothing to dispatch for already-buffer / const / empty tensors.
+        if self.uop().has_buffer_identity() {
+            self.ensure_buffer();
+            return Ok(RunProfile::default());
+        }
+        if is_any_const(&self.uop()) {
+            let contiguous_uop = self.uop().contiguous();
+            self.set_uop(contiguous_uop);
+        }
+        if self.has_zero_elements() {
+            return Ok(RunProfile::default());
+        }
+
+        let old_uop = self.uop();
+        let input_buffer_ids: HashSet<u64> = collect_input_buffers(&old_uop).keys().copied().collect();
+
+        let plan = self.prepare()?;
+        let report = plan.profile(opts).context(ExecutionSnafu)?;
+
+        self.finalize_realize(&plan, &old_uop)?;
+        let realized_uop = self.uop();
+        if !Arc::ptr_eq(&old_uop, &realized_uop) {
+            #[allow(clippy::mutable_key_type)]
+            let becomes_map = HashMap::from([(UOpKey(old_uop), realized_uop)]);
+            crate::tensor_registry::apply_map_to_tensors(&becomes_map);
+        }
+        plan.release_intermediate_buffers(|uop_id| {
+            if !input_buffer_ids.contains(&uop_id) {
+                crate::tensor_registry::remove_buffer(uop_id);
+            }
+        });
+        Ok(report)
     }
 
     /// Finalize realization: bind output buffer to tensor.

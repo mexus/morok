@@ -8,7 +8,6 @@
 //! Run: `SVOD_DEVICE=AMD:0 cargo bench -p svod-tk --bench knn`
 
 use std::hint::black_box;
-use std::time::Duration;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use ndarray::{Array2, Axis};
@@ -16,7 +15,7 @@ use svod_dtype::DType;
 use svod_tensor::Tensor;
 
 mod common;
-use common::{plan_gpu_ns, randn_bf16, requirements_met};
+use common::{bench_plan, randn_bf16, requirements_met};
 
 /// The generic-graph **GEMM-topk** KNN baseline — what you'd write *without* the fused
 /// kernel: materialise the full `[N, M]` squared-L2 distance matrix in HBM
@@ -96,16 +95,12 @@ fn bench_knn(c: &mut Criterion) {
             // sort/gather tail (the indices are a shared intermediate of the same graph).
             let (mut dists, _idxs) = svod_tk::knn(&xb, &cb, k).expect("tk knn").expect("knn applies for bench shape");
             let plan = dists.prepare().expect("prepare tk knn");
-            group.bench_with_input(BenchmarkId::new("tk", m), &m, |bencher, _| {
-                bencher.iter_custom(|iters| Duration::from_nanos(black_box(plan_gpu_ns(&plan, iters))));
-            });
+            group.bench_with_input(BenchmarkId::new("tk", m), &m, |bencher, _| bench_plan(bencher, &plan));
 
             // Reference: the generic GEMM-topk path (materialises the [N,M] matrix).
             let mut reft = knn_generic_ref(&xb, &cb, k);
             let ref_plan = reft.prepare().expect("prepare generic knn");
-            group.bench_with_input(BenchmarkId::new("generic", m), &m, |bencher, _| {
-                bencher.iter_custom(|iters| Duration::from_nanos(black_box(plan_gpu_ns(&ref_plan, iters))));
-            });
+            group.bench_with_input(BenchmarkId::new("generic", m), &m, |bencher, _| bench_plan(bencher, &ref_plan));
         }
 
         // Native CPU baseline (host wall-clock — a different metric than the GPU rows
@@ -120,5 +115,9 @@ fn bench_knn(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_knn);
+criterion_group! {
+    name = benches;
+    config = Criterion::default().with_profiler(common::bench_profiler());
+    targets = bench_knn
+}
 criterion_main!(benches);

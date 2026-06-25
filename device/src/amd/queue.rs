@@ -490,6 +490,8 @@ impl AmdComputeQueue {
         wave32: bool,
         target_major: u32,
         ts_addrs: Option<(u64, u64)>,
+        pmc_start: &[u32],
+        pmc_read: &[u32],
     ) -> Result<u64> {
         debug_assert!(self.is_pm4, "dispatch_pm4 called on AQL queue");
         debug_assert!(
@@ -545,6 +547,9 @@ impl AmdComputeQueue {
         } else {
             q.extend_from_slice(&pm4::acquire_mem());
         }
+        // PMC: program + start the perf counters just before the dispatch so they
+        // bracket the kernel (empty unless counters are armed).
+        q.extend_from_slice(pmc_start);
         // Profiling: GPU-clock timestamp at end-of-pipe just before the CS
         // launches (after the submit barriers drain). Paired with the `end`
         // probe below, `end - start` is on-device kernel time on the PM4 path.
@@ -573,6 +578,10 @@ impl AmdComputeQueue {
         if let Some((_, end_addr)) = ts_addrs {
             q.extend_from_slice(&pm4::release_mem_timestamp(end_addr, target_major == 9));
         }
+        // PMC: sample + COPY_DATA the per-WGP counters into the GTT readback
+        // buffer (after the dispatch's CS_PARTIAL_FLUSH, so counts are final).
+        // The completion `release_mem` below flushes these L2 writes to memory.
+        q.extend_from_slice(pmc_read);
         // signal(counter, next): RELEASE_MEM after a system-scope cache flush.
         q.extend_from_slice(&pm4::release_mem(
             counter_addr,

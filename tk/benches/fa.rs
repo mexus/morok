@@ -4,15 +4,12 @@
 //!
 //! Run: `SVOD_DEVICE=AMD:0 cargo bench -p svod-tk --bench fa`
 
-use std::hint::black_box;
-use std::time::Duration;
-
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use svod_dtype::DType;
 use svod_tensor::Tensor;
 
 mod common;
-use common::{plan_gpu_ns, randn_bf16, requirements_met};
+use common::{bench_plan, randn_bf16, requirements_met};
 
 /// Attention as the model runs it: `svod_tk::flash_attention_with` — the exact GigaAM
 /// encoder call (non-causal, `[B, T, H, d_k]` layout, optional key padding; here
@@ -35,9 +32,7 @@ fn bench_fa(c: &mut Criterion) {
             .expect("flash_attention_with")
             .expect("FA kernel applies for bench shape");
         let fa_plan = fa.prepare().expect("prepare fa");
-        group.bench_with_input(BenchmarkId::new("tk", n), &n, |bencher, _| {
-            bencher.iter_custom(|iters| Duration::from_nanos(black_box(plan_gpu_ns(&fa_plan, iters))));
-        });
+        group.bench_with_input(BenchmarkId::new("tk", n), &n, |bencher, _| bench_plan(bencher, &fa_plan));
 
         // The model's fallback: non-causal SDPA. SDPA wants `[B, H, T, d]`.
         let perm = |t: &Tensor| t.cast(DType::Float32).expect("→f32").try_permute(&[0, 2, 1, 3]).expect("perm");
@@ -45,12 +40,14 @@ fn bench_fa(c: &mut Criterion) {
         let refb = qp.scaled_dot_product_attention().key(&kp).value(&vp).is_causal(false).call().expect("sdpa");
         let mut ref_t = refb.try_permute(&[0, 2, 1, 3]).expect("perm back");
         let ref_plan = ref_t.prepare().expect("prepare ref");
-        group.bench_with_input(BenchmarkId::new("sdpa", n), &n, |bencher, _| {
-            bencher.iter_custom(|iters| Duration::from_nanos(black_box(plan_gpu_ns(&ref_plan, iters))));
-        });
+        group.bench_with_input(BenchmarkId::new("sdpa", n), &n, |bencher, _| bench_plan(bencher, &ref_plan));
     }
     group.finish();
 }
 
-criterion_group!(benches, bench_fa);
+criterion_group! {
+    name = benches;
+    config = Criterion::default().with_profiler(common::bench_profiler());
+    targets = bench_fa
+}
 criterion_main!(benches);
