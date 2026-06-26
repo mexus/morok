@@ -1,5 +1,6 @@
 mod audio;
 mod batch;
+mod bounds;
 mod config;
 mod diarizen;
 mod firered_vad;
@@ -10,7 +11,6 @@ mod mel;
 mod remap;
 mod resnet;
 mod silero_vad;
-mod splitter;
 mod state;
 mod state_dict;
 mod transcribe;

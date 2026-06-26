@@ -10,7 +10,7 @@
 use svod_arch::rnnt::Word;
 
 use crate::gigaam::TranscribeOpts;
-use crate::gigaam::transcribe::{crop_words_to_core, ctc_frames_to_words, words_to_text};
+use crate::gigaam::transcribe::ctc_frames_to_words;
 
 #[test]
 fn ctc_frames_to_words_empty() {
@@ -70,55 +70,6 @@ fn ctc_frames_to_words_frame_shift_scales_linearly() {
     assert!((a[0].end - 2.0 * b[0].end).abs() < 1e-6);
 }
 
-// ─── crop_words_to_core / words_to_text ──────────────────────────────────
-
-#[test]
-fn crop_words_keeps_only_midpoints_inside_core() {
-    // Decode window starts 2s before the core; the core spans 5s (window time
-    // [2, 7)). Word "a" (mid 1.0) is pre-roll → dropped; "b" (mid 4.0) is in
-    // the core → kept and rebased by −2s; "c" (mid 8.0) is past the core → dropped.
-    let words = vec![
-        Word { text: "a".into(), start: 0.5, end: 1.5 },
-        Word { text: "b".into(), start: 3.5, end: 4.5 },
-        Word { text: "c".into(), start: 7.5, end: 8.5 },
-    ];
-    let cropped = crop_words_to_core(words, 2.0, 5.0);
-    assert_eq!(cropped, vec![Word { text: "b".into(), start: 1.5, end: 2.5 }]);
-}
-
-#[test]
-fn crop_words_clamps_straddling_word_times() {
-    // core offset 1.0, duration 3.0 → core is window time [1, 4). A word
-    // spanning [0.5, 1.8] has midpoint 1.15 ∈ core → kept; its rebased start
-    // (−0.5) clamps to 0, end becomes 0.8.
-    let words = vec![Word { text: "x".into(), start: 0.5, end: 1.8 }];
-    let cropped = crop_words_to_core(words, 1.0, 3.0);
-    assert_eq!(cropped.len(), 1);
-    assert!((cropped[0].start - 0.0).abs() < 1e-6);
-    assert!((cropped[0].end - 0.8).abs() < 1e-6);
-}
-
-#[test]
-fn crop_words_zero_offset_generous_core_is_identity() {
-    // No pre-roll/pad lead-in and a core wider than the words → every word is
-    // kept unchanged (the no-decode-window fast path).
-    let words =
-        vec![Word { text: "one".into(), start: 0.0, end: 0.4 }, Word { text: "two".into(), start: 0.5, end: 0.9 }];
-    let cropped = crop_words_to_core(words.clone(), 0.0, 10.0);
-    assert_eq!(cropped, words);
-}
-
-#[test]
-fn words_to_text_joins_with_spaces_and_drops_empties() {
-    let words = vec![
-        Word { text: "hello".into(), start: 0.0, end: 0.1 },
-        Word { text: String::new(), start: 0.1, end: 0.1 },
-        Word { text: "world".into(), start: 0.2, end: 0.3 },
-    ];
-    assert_eq!(words_to_text(&words), "hello world");
-    assert_eq!(words_to_text(&[]), "");
-}
-
 // ─── TranscribeOpts builder ──────────────────────────────────────────────
 //
 // We don't test `from_env()` directly — env-var manipulation isn't safe
@@ -127,9 +78,8 @@ fn words_to_text_joins_with_spaces_and_drops_empties() {
 // field flows through to the struct correctly.
 
 #[test]
-fn transcribe_opts_builder_overrides_all_fields() {
-    let opts = TranscribeOpts::builder().word_timestamps(true).beam_decode(true).max_scores_mib(512).build();
-    assert!(opts.word_timestamps);
+fn transcribe_opts_builder_overrides_fields() {
+    let opts = TranscribeOpts::builder().beam_decode(true).max_scores_mib(512).build();
     assert!(opts.beam_decode);
     assert_eq!(opts.max_scores_mib, 512);
 }

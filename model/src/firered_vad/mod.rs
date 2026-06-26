@@ -26,8 +26,6 @@ mod splitter;
 mod stream;
 
 pub use fbank::FireRedFbank;
-#[cfg(test)]
-pub(crate) use splitter::smooth_trailing;
 pub use splitter::{FireRedVadSplitter, FireRedVadSplitterError};
 pub use stream::{
     FireRedVadStream, FireRedVadStreamError, FireRedVadStreamer, StreamFlush, StreamVadConfig, StreamVadPostprocessor,
@@ -380,4 +378,58 @@ impl FireRedVadInference {
         }
         Ok(probs)
     }
+}
+
+/// Trailing moving-average window for [`smooth_trailing`], matching upstream
+/// FireRedVAD's `VadPostprocessor` default.
+pub(crate) const DEFAULT_SMOOTH_WINDOW: usize = 5;
+
+/// Waveform-level FireRedVAD: host fbank → device DFSMN → trailing smoothing,
+/// yielding one speech probability per [`FRAME_SHIFT`] samples. Implements
+/// [`Vad`](svod_arch::pipelines::audio::Vad), so the arch
+/// [`VadSplitter`](svod_arch::pipelines::audio::VadSplitter) (assembled by
+/// [`FireRedVadSplitter`]) drives the chunking.
+pub struct FireRedVadProbs {
+    fbank: FireRedFbank,
+    vad: FireRedVadInference,
+    smooth_window: usize,
+}
+
+impl FireRedVadProbs {
+    /// Wrap a loaded model into the waveform→probs front-end. `smooth_window`
+    /// is the trailing moving-average span ([`DEFAULT_SMOOTH_WINDOW`] upstream).
+    pub fn new(model: FireRedVad, smooth_window: usize) -> crate::jit::Result<Self> {
+        Ok(Self { fbank: FireRedFbank::new(), vad: FireRedVadInference::new(model)?, smooth_window })
+    }
+}
+
+impl svod_arch::pipelines::audio::Vad for FireRedVadProbs {
+    type Error = crate::jit::JitError;
+
+    fn samples_per_prob(&self) -> usize {
+        FRAME_SHIFT
+    }
+
+    fn probs(&mut self, waveform: &[f32]) -> std::result::Result<Vec<f32>, Self::Error> {
+        let feat = self.fbank.forward(waveform);
+        let n_frames = feat.len() / N_MELS;
+        let probs = self.vad.probs(&feat, n_frames)?;
+        Ok(smooth_trailing(&probs, self.smooth_window))
+    }
+}
+
+/// Upstream FireRedVAD probability smoothing
+/// (`VadPostprocessor._smooth_prob`): a trailing moving average of the last
+/// `w` probs, with the first `w - 1` entries replaced by the cumulative mean
+/// of the prefix (compensating the average's ramp-up).
+pub(crate) fn smooth_trailing(probs: &[f32], w: usize) -> Vec<f32> {
+    if w <= 1 {
+        return probs.to_vec();
+    }
+    (0..probs.len())
+        .map(|i| {
+            let lo = (i + 1).saturating_sub(w);
+            probs[lo..=i].iter().sum::<f32>() / (i + 1 - lo) as f32
+        })
+        .collect()
 }

@@ -32,4 +32,4 @@ pub use config::{ConvNormType, GigaAmConfig, SubsamplingMode, TransducerConfig};
 pub use error::{Error, Result};
 pub use jit::GigaAmEncoderJit;
 pub use model::{GigaAm, Head, RnntRuntime};
-pub use transcribe::{ChunkResult, TranscribeError, TranscribeOpts, TranscribeResult, Transcriber, Word};
+pub use transcribe::{GigaAmTranscriber, TranscribeError, TranscribeOpts, Word};
