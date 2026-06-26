@@ -52,4 +52,8 @@ pub use executor::{
 pub use kernel_cache::*;
 pub use leveling::{compute_topological_levels, compute_topological_order};
 pub use llvm::*;
-pub use profiler::{KernelAggregate, KernelProfile, RunProfile, StageProfile, aggregate_profiles, render_histogram};
+pub use profiler::{
+    KernelAggregate, KernelProfile, KernelStaticInfo, PmcSelection, ProfileOptions, RunProfile, StageProfile,
+    aggregate_profiles, render_histogram,
+};
+pub use svod_device::{CounterSet, KernelResources, PmcCounter};

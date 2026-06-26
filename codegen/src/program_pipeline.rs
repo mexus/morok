@@ -101,7 +101,36 @@ pub fn do_linearize(program: &Arc<UOp>) -> Result<Arc<UOp>> {
         return Ok(program.clone());
     }
 
-    let linear_ops = svod_schedule::linearize_with_cfg(sink);
+    let linear_ops = svod_schedule::linearize_with_cfg(sink.clone());
+
+    if let Ok(dir) = std::env::var("SVOD_DUMP_LINEAR") {
+        use std::io::Write;
+        // Dump pre-linearization tree (toposort with scope info)
+        let tree_path = format!("{dir}/tree_{}.txt", sink.id);
+        if let Ok(mut f) = std::fs::File::create(&tree_path) {
+            let topo = sink.toposort();
+            for (i, u) in topo.iter().enumerate() {
+                let scope = u.in_scope_ranges().iter().map(|k| k.0.id.to_string()).collect::<Vec<_>>().join(",");
+                let _ = writeln!(f, "[{i:4}] id={} {:?} scope={{{scope}}}", u.id, std::mem::discriminant(u.op()));
+            }
+        }
+        let path = format!("{dir}/linear_{}.txt", sink.id);
+        if let Some(parent) = std::path::Path::new(&path).parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(mut f) = std::fs::File::create(&path) {
+            for (i, u) in linear_ops.iter().enumerate() {
+                let _ = writeln!(
+                    f,
+                    "[{i:4}] id={} {:?} scope={{{}}}",
+                    u.id,
+                    std::mem::discriminant(u.op()),
+                    u.in_scope_ranges().iter().map(|k| k.0.id.to_string()).collect::<Vec<_>>().join(",")
+                );
+            }
+        }
+    }
+
     let linear_clean = line_rewrite_cleanups(linear_ops);
     let linear_uop = UOp::linear(linear_clean.into());
     rebuild_program(program, Some(linear_uop), source, binary)

@@ -2,6 +2,27 @@ use super::*;
 use smallvec::SmallVec;
 
 #[test]
+fn test_profile_populates_static_info_and_realizes() {
+    let a = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0]);
+    let b = Tensor::from_slice([5.0f32, 6.0, 7.0, 8.0]);
+    let mut c = &a + &b;
+
+    let report = c.profile(&ProfileOptions::default()).expect("profile");
+    assert_eq!(report.stages.len(), 1, "one profile stage");
+    let stage = &report.stages[0];
+    assert!(!stage.kernels.is_empty(), "at least one kernel dispatched");
+
+    // Tier-2 static analysis attaches to every dispatch; flops/bytes are
+    // backend-independent (resources are backend-specific, so not asserted here).
+    let si = stage.kernels[0].static_info.as_ref().expect("static_info populated");
+    assert!(si.est_flops.is_some_and(|f| f > 0), "flop estimate should be a positive count: {:?}", si.est_flops);
+    assert!(si.est_bytes > 0, "byte estimate should be positive: {}", si.est_bytes);
+
+    // profile() finalizes like realize(), so the tensor holds the result.
+    assert_eq!(c.as_vec::<f32>().expect("as_vec"), vec![6.0, 8.0, 10.0, 12.0]);
+}
+
+#[test]
 fn test_output_indices_from_program_metadata_basic() {
     let outputs = output_indices_from_program_metadata(&[0, 1, 2], &[2], 3).expect("metadata mapping should succeed");
     assert_eq!(outputs, vec![2]);

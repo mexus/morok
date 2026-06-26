@@ -623,10 +623,18 @@ pub fn optimize_kernel_with_config(
         // `graph_rewrite` drops node metadata; re-attach the SINK's `KernelInfo`
         // (kernel name / opts) so downstream caching + naming still resolve it.
         let saved_metadata = ast.metadata_raw();
+        // Mirror tinygrad's late pipeline: lower index dtypes, then run the
+        // post-index symbolic simplification. The fold removes the degenerate
+        // index arithmetic `pm_lower_index_dtype` regenerates (`x*0`, `x*1`,
+        // `x/1`, `x%1`, redundant casts) which would otherwise reach the renderer
+        // as loop-invariant values stranded in non-dominating blocks. We use the
+        // dead-loop-free variant so a hand-built END/AFTER loop carry is not
+        // broken by a trivial RANGE collapse (see `symbolic_no_dead_loop`).
         let lowered = graph_rewrite(&crate::symbolic::pm_lower_index_dtype(), ast, &mut ());
+        let simplified = graph_rewrite(crate::symbolic::symbolic_no_dead_loop(), lowered, &mut ());
         return Ok(match saved_metadata {
-            Some(meta) => lowered.with_metadata_raw(meta),
-            None => lowered,
+            Some(meta) => simplified.with_metadata_raw(meta),
+            None => simplified,
         });
     }
 

@@ -35,7 +35,7 @@ launch.dispatch(&buffers)?;
 let ns = launch.dispatch_gpu_ns();   // device-measured dispatch time
 ```
 
-`dispatch_gpu_ns()` 在派发前后读取 GPU 自己的时间戳计数器，所以你测到的是设备上的时间，而不是启动它那一来一回的延迟。`tk/benches/kernels.rs` 里的 criterion 基准正是靠这个，把一个 `tk` 内核与图原生基线作比较。
+`dispatch_gpu_ns()` 在派发前后读取 GPU 自己的时间戳计数器，所以你测到的是设备上的时间，而不是启动它那一来一回的延迟。criterion 基准正是靠这个，把一个 `tk` 内核与图原生基线作比较。而这同一批基准在 `cargo bench --profile-time` 下还能做得更多：每个受测的 plan 都会送进完整的分层 profiler——设备时间、roofline、占用率和硬件计数器——按每内核最小值累积，并写成一张表。各层级、环境变量，以及如何接入 criterion，详见 [剖析与基准测试](./profiling)。
 
 :::tip 面向 GPU 专家
 `KernelFingerprint` 是 `SINK` 的 UOp 图的一个*结构化*哈希，它捕捉的是形状（操作、dtype、边）而与实例 ID 无关，因此在不同运行和进程间都稳定。这正是它能当金标准测试键的原因：一次保留行为的重构会复现出同一个指纹，而对所发射 IR 的任何改动都会让它挪位。`dispatch_gpu_ns` 在派发前后读取设备自己的时间戳计数器，所以它测的是设备上的时间，而非启动延迟。

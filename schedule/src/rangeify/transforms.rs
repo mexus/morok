@@ -19,7 +19,7 @@ use super::indexing::IndexingContext;
 use super::kernel::RangeifyBufferContext;
 use smallvec::{SmallVec, smallvec};
 use svod_ir::shape::Shape;
-use svod_ir::{AddrSpace, AxisType, BufferizeOpts, ConstValue, DType, Op, UOp, UOpKey};
+use svod_ir::{AddrSpace, BufferizeOpts, ConstValue, DType, Op, UOp, UOpKey};
 
 // ============================================================================
 // ADD_TAGS
@@ -440,7 +440,6 @@ pub fn pm_flatten_range() -> &'static crate::TypedPatternMatcher {
     crate::cached_patterns! {
         r @ End { computation: _, ranges } if !ranges.is_empty() => |r| flatten_range_impl(r),
         r @ Reduce { src: _, ranges, reduce_op: _ } if !ranges.is_empty() => |r| flatten_range_impl(r),
-        r @ Store { index: _, value: _, ranges } if !ranges.is_empty() => |r| flatten_range_impl(r),
     }
 }
 
@@ -487,7 +486,7 @@ pub fn pm_split_ranges() -> crate::TypedPatternMatcher<SplitRangesContext> {
             },
 
         // Protect ranges used in ImageDType stores from substitution
-        _store @ Store { index: idx @ Index { buffer: buf, indices: _, gate: _ }, value: _, ranges: _ }
+        _store @ Store { index: idx @ Index { buffer: buf, indices: _, gate: _ }, value: _ }
             if is_image_dtype(buf) => |idx| {
                 protect_ranges_for_image(ctx, idx);
                 None // Don't transform, just protect
@@ -870,31 +869,6 @@ pub(crate) fn transform_single_source(
 // BUFFERIZE TO STORE CONVERSION
 // ============================================================================
 
-/// Create a fresh LOOP range with the same axis_id and a new constant size.
-fn create_loop_range_from_outer(outer: &Arc<UOp>, size: usize) -> Option<Arc<UOp>> {
-    use svod_ir::AxisType;
-    let Op::Range { axis_id, .. } = outer.op() else {
-        return None;
-    };
-    Some(UOp::range_axis(UOp::index_const(size as i64), *axis_id, AxisType::Loop))
-}
-
-/// Convert ReduceOp to binary operation.
-fn reduce_op_to_binary(op: svod_ir::ReduceOp, lhs: &Arc<UOp>, rhs: &Arc<UOp>) -> Option<Arc<UOp>> {
-    use svod_ir::types::{BinaryOp, ReduceOp};
-    let dtype = lhs.dtype();
-    Some(match op {
-        ReduceOp::Add => UOp::new(Op::Binary(BinaryOp::Add, lhs.clone(), rhs.clone()), dtype),
-        ReduceOp::Mul => UOp::new(Op::Binary(BinaryOp::Mul, lhs.clone(), rhs.clone()), dtype),
-        ReduceOp::Max => UOp::new(Op::Binary(BinaryOp::Max, lhs.clone(), rhs.clone()), dtype),
-        ReduceOp::Min => {
-            // Min uses WHERE(a < b, a, b) pattern
-            let cond = UOp::new(Op::Binary(BinaryOp::Lt, lhs.clone(), rhs.clone()), svod_dtype::DType::Bool);
-            UOp::try_where(cond, lhs.clone(), rhs.clone()).expect("reduce_op_to_binary: try_where failed for Min")
-        }
-    })
-}
-
 /// Calculate buffer size from BUFFERIZE ranges.
 ///
 /// `size = prod(int(r.vmax+1) for r in ranges)`. RANGE UOps have `vmax = end-1`,
@@ -1056,77 +1030,6 @@ pub fn bufferize_to_store(
         }
 
         let result = if ended_stores.is_empty() { buf } else { buf.after(ended_stores) };
-        ctx.map_buffer(bufferize_op.clone(), result.clone());
-        return Some(result);
-    }
-
-    // =========================================================================
-    // Case 1: single-range REDUCE with zero initialization.
-    // =========================================================================
-    if let Op::Reduce { src: reduce_src, ranges: reduce_ranges, reduce_op } = compute.op()
-        && reduce_ranges.len() == 1
-        && let Op::Range { axis_type, .. } = reduce_ranges[0].op()
-        && *axis_type == AxisType::Loop
-    {
-        // Must be global address space
-        if opts.addrspace != AddrSpace::Global {
-            return None;
-        }
-
-        let wrap_range = reduce_ranges[0].clone();
-        let device = opts.device.clone().unwrap_or_else(svod_dtype::default_device::default_device);
-
-        // Create buffer
-        let buf = new_lunique_buffer(ctx, device, size, base_dtype.clone());
-
-        // Create zero-init range (same axis_id but AxisType::Loop)
-        let zero_range = create_loop_range_from_outer(&wrap_range, size)?;
-
-        // Get identity value for reduce op
-        use crate::symbolic::dce::reduce_identity;
-        let identity = reduce_identity(*reduce_op, base_dtype.clone());
-
-        // Zero-initialize: buf[zero_range] = identity
-        let zero_idx = UOp::index()
-            .buffer(buf.clone())
-            .indices(vec![zero_range.clone()])
-            .dtype(sdtype.clone())
-            .call()
-            .expect("bufferize_to_store: failed to create INDEX for zero-init");
-        let zero_store = zero_idx.store_value(identity).end(smallvec![zero_range.clone()]);
-        let buf_zeroed = buf.after(smallvec![zero_store]);
-
-        // Use BUFFERIZE's index directly (already flattened by flatten_bufferize):
-        // `bufi = buf.index(idx, dtype=sdtype)`.
-        debug_assert!(
-            ranges.len() <= 1 || ranges.iter().all(|r| matches!(r.op(), Op::Const(_))),
-            "bufferize_to_store: unexpected multi-range after flatten_bufferize"
-        );
-        let idx = if ranges.len() == 1 && !matches!(ranges[0].op(), Op::Const(_)) {
-            ranges[0].clone()
-        } else if !end_ranges.is_empty() {
-            sort_ranges_by_axis_id(&end_ranges)[0].clone()
-        } else {
-            UOp::index_const(0)
-        };
-
-        // Collect RANGE UOps from the index expression for END wrapping
-        let sorted_end_ranges = sort_ranges_by_axis_id(&collect_range_uops(ranges));
-
-        // Accumulation: buf[idx] = buf[idx] OP reduce_src
-        let buf_idx = UOp::index()
-            .buffer(buf_zeroed.clone())
-            .indices(vec![idx])
-            .dtype(sdtype.clone())
-            .call()
-            .expect("bufferize_to_store: failed to create INDEX for accumulation");
-        let loaded = UOp::load().buffer(buf_zeroed.clone()).index(buf_idx.clone()).call();
-        let accumulated = reduce_op_to_binary(*reduce_op, &loaded, reduce_src)?;
-
-        // Wrap store with both collected end_ranges AND the wrapping reduce range.
-        let do_store = buf_idx.store_value(accumulated).end(sorted_end_ranges).end(smallvec![wrap_range]);
-
-        let result = buf_zeroed.after(smallvec![do_store]);
         ctx.map_buffer(bufferize_op.clone(), result.clone());
         return Some(result);
     }
@@ -1524,7 +1427,6 @@ pub fn pm_simplify_ranges() -> &'static crate::TypedPatternMatcher {
 pub fn flatten_range_impl(r: &Arc<UOp>) -> Option<Arc<UOp>> {
     let off = match r.op() {
         Op::Reduce { .. } => 1,
-        Op::Store { .. } => 2, // (index, value, ranges...) - ranges start at index 2
         Op::End { .. } => 1,
         _ => return None,
     };

@@ -2,3 +2,4 @@
 
 mod cpu;
 mod leveling;
+mod profiler;

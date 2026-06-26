@@ -7,5 +7,6 @@
 //! for concrete kernels built from those primitives.
 
 pub mod fa;
+pub mod kmeans;
 pub mod knn;
 pub mod matmul;

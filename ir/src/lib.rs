@@ -49,7 +49,7 @@ pub use types::{
     AddrSpace, AxisId, AxisType, BinaryOp, BufferizeOpts, CallInfo, ConstValue, ConstValueHash, ContiguousHint,
     CustomFunctionKind, KernelInfo, ReduceOp, RendererDevice, TernaryOp, UnaryOp, WmmaMetadata, WmmaUpcastAxes,
 };
-pub use uop::{IntoUOp, UOp, UOpKey};
+pub use uop::{IntoUOp, UOp, UOpKey, compute_ops_estimate};
 
 // Re-export pattern matching and rewriting infrastructure
 pub use pattern::{Matcher, RewriteResult, TypedPatternMatcher};

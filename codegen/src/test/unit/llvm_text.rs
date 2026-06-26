@@ -1,6 +1,5 @@
-use smallvec::SmallVec;
 use svod_dtype::{AddrSpace, AmdArch, DType};
-use svod_ir::{AxisId, AxisType, BinaryOp, ConstValue, Op, ReduceOp, RendererDevice, WmmaMetadata, WmmaUpcastAxes};
+use svod_ir::{BinaryOp, ConstValue, Op, RendererDevice, WmmaMetadata, WmmaUpcastAxes};
 
 use super::*;
 use crate::Renderer;
@@ -144,50 +143,7 @@ fn amd_define_local_emits_addrspace3_module_global() {
     );
 }
 
-// ── Reduce / WMMA emission (parity with tinygrad's AMDLLVMRenderer) ──────────
-
-fn reduce_sum_sink() -> std::sync::Arc<svod_ir::UOp> {
-    // sum of 5.0 over the range 0..10.
-    let const_val = UOp::const_(DType::Float32, ConstValue::Float(5.0));
-    let range =
-        UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(10)), AxisId::Renumbered(0), AxisType::Reduce);
-    let reduce = const_val.reduce(smallvec::smallvec![range.clone()], ReduceOp::Add);
-    let ranges: SmallVec<[_; 4]> = smallvec::smallvec![range];
-    UOp::sink(vec![reduce.end(ranges)])
-}
-
-#[test]
-fn amd_reduce_accumulator_uses_addrspace5() {
-    // AMDGPU rejects addrspace(0) allocas (clang: "alloca on amdgpu must be in
-    // addrspace(5)"), so the reduce accumulator allocates in addrspace(5) and
-    // addrspacecasts to a generic `ptr` — same idiom as DEFINE_REG. (tinygrad
-    // can keep addrspace(0) allocas because it feeds the triple to the LLVM
-    // C-API TargetMachine; svod emits the triple into the IR text and compiles
-    // via the clang CLI, which applies the amdgcn datalayout at parse time.)
-    let result = render_amd_linearized(&reduce_sum_sink(), AmdArch::Gfx1151, "amd_reduce");
-    println!("{}", result.code);
-
-    assert!(result.code.contains("define amdgpu_kernel void @amd_reduce("), "missing kernel ABI:\n{}", result.code);
-    assert!(
-        result.code.contains("alloca float, addrspace(5)"),
-        "reduce accumulator must alloca in addrspace(5):\n{}",
-        result.code
-    );
-    assert!(
-        result.code.contains("addrspacecast ptr addrspace(5)"),
-        "reduce accumulator must addrspacecast to a generic ptr:\n{}",
-        result.code
-    );
-}
-
-#[test]
-fn amd_reduce_ir_assembles_with_llvm_as() {
-    // Smoke-test that the emitted AMD IR actually verifies, by piping it through
-    // `llvm-as` (skipped when no such tool is on PATH). This is the regression
-    // guard that caught the addrspace(0) reduce-accumulator bug.
-    let result = render_amd_linearized(&reduce_sum_sink(), AmdArch::Gfx1151, "amd_reduce_asm");
-    assert_llvm_ir_assembles(&result.code);
-}
+// ── WMMA emission (parity with tinygrad's AMDLLVMRenderer) ──────────────────
 
 /// f16×f16→f32 WMMA metadata for an RDNA3 16×16×16 tile (`<16 x half>` inputs,
 /// `<8 x float>` accumulator).

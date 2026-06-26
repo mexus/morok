@@ -334,7 +334,9 @@ pub fn fold_invalid_load_store() -> &'static TypedPatternMatcher {
     }
 }
 
-/// Pattern matcher for simple symbolic simplifications.
+/// Tier-1 algebraic identities + constant folding WITHOUT the trivial-loop
+/// collapse ([`dead_loop_patterns`]). The shared base for [`symbolic_simple`]
+/// (which re-adds the collapse) and [`symbolic_no_dead_loop`].
 ///
 /// Contains algebraic identities and zero propagation rules:
 /// - x + 0 → x, 0 + x → x
@@ -345,63 +347,94 @@ pub fn fold_invalid_load_store() -> &'static TypedPatternMatcher {
 /// - x ^ 0 → x, 0 ^ x → x
 /// - x * 0 → 0, 0 * x → 0
 /// - x & 0 → 0, 0 & x → 0
+fn symbolic_simple_base() -> TypedPatternMatcher {
+    propagate_invalid()
+        + constant_folding_dsl_patterns()
+        + vconst_folding_patterns() // CONST and VCONST folded together at this tier
+        + bool_arithmetic_patterns()
+        + identity_and_zero_patterns()
+        + self_folding_dsl_patterns()
+        + zero_folding_dsl_patterns()
+        + division_dsl_patterns()
+        + cast_dsl_patterns()
+        + div_mod_recombine_dsl_patterns()
+        + power_dsl_patterns()
+        + boolean_dsl_simple_patterns()
+        + dce_dsl_simple_patterns()
+}
+
+/// Tier-1 algebraic identities + constant folding + the size-1 RANGE collapse.
+/// Used at lightweight stages: decompositions, `pm_simplify_valid` helpers.
 pub fn symbolic_simple() -> &'static TypedPatternMatcher {
-    static CACHED: std::sync::LazyLock<TypedPatternMatcher> = std::sync::LazyLock::new(|| {
-        // Tier 1: Basic algebraic identities, constant folding, propagate_invalid.
-        // Matches upstream `symbolic_simple` (upstream symbolic_simple).
-        // Used at lightweight stages: decompositions, pm_simplify_valid helpers.
-        propagate_invalid()
-            + constant_folding_dsl_patterns()
-            + vconst_folding_patterns()         // Upstream folds CONST+VCONST together in symbolic_simple
-            + bool_arithmetic_patterns()
-            + identity_and_zero_patterns()
-            + self_folding_dsl_patterns()
-            + zero_folding_dsl_patterns()
-            + division_dsl_patterns()
-            + cast_dsl_patterns()
-            + div_mod_recombine_dsl_patterns()
-            + power_dsl_patterns()
-            + boolean_dsl_simple_patterns()
-            + dce_dsl_simple_patterns()
-            + dead_loop_patterns()
-    });
+    static CACHED: std::sync::LazyLock<TypedPatternMatcher> =
+        std::sync::LazyLock::new(|| symbolic_simple_base() + dead_loop_patterns());
     &CACHED
 }
 
-/// Full symbolic simplification matcher (tier 2).
+/// Add the Tier-2 patterns on top of a Tier-1 base, in the fixed order the
+/// rewrite engine applies them. The order is load-bearing: each group may expose
+/// matches for a later one (e.g. commutative canonicalization before term
+/// combining, ALU folding before the comparison/range rules).
 ///
-/// Matches upstream `symbolic` (upstream symbolic_simple):
-/// symbolic_simple + commutative + inline PM + div_and_mod_symbolic + gep_pushing.
-///
-/// Pattern order matches commutative → boolean algebra → WHERE swap →
-/// WHERE ALU combine → term combining → vmin/vmax → max fold → ALU folding →
-/// comparison/lt → range mod/div → advanced division → cast/long → AFTER →
-/// VECTORIZE → gep_pushing.
-///
-/// Used at: rangeify mega-pass, merge site, post-index symbolic (Stage 16).
+/// `alu_folding` (the two-stage ALU / const push-down group) is gated: it is
+/// omitted on the hand-lowered path (see [`symbolic_no_dead_loop`]).
+fn with_tier2(tier1: TypedPatternMatcher, alu_folding: bool) -> TypedPatternMatcher {
+    let head = tier1
+        + commutative_canonicalization()
+        + boolean_dsl_patterns() // x | !x → true
+        + term_combining_dsl_patterns() // combine like terms
+        + dce_dsl_patterns() // WHERE(!cond) branch swap
+        + where_alu_combining_patterns() // hoist ALU through WHERE
+        + vmin_vmax_collapse_patterns() // vmin == vmax → const
+        + minmax_dsl_patterns(); // bound-based max/min selection
+    let head = if alu_folding {
+        head + alu_folding_dsl_patterns() // two-stage ALU, const push-down
+    } else {
+        head
+    };
+    head + comparison_dsl_patterns() // lt/le/eq simplification
+        + range_based_mod_div_patterns() // mod/div against a range bound
+        + advanced_division_dsl_patterns() // symbolic div-and-mod
+        + range_based_cast_patterns() // range-based double-cast
+        + long_to_int_narrowing_patterns() // i64 → i32 when range fits
+        + vectorize_to_vconst_patterns() // VECTORIZE(CONST..) → VCONST
+        + after_simplification_patterns() // drop redundant AFTER ordering
+        + where_bound_patterns() // WHERE(Lt) elimination via vmin/vmax
+        + gep_pushing_patterns()
+}
+
 pub fn symbolic() -> &'static TypedPatternMatcher {
-    static CACHED: std::sync::LazyLock<TypedPatternMatcher> = std::sync::LazyLock::new(|| {
-        symbolic_simple()
-            // commutative (separate PM, line 179)
-            + commutative_canonicalization()
-            // Ordered to match upstream:
-            + boolean_dsl_patterns()           // I1: x|!x (line 188)
-            + term_combining_dsl_patterns()    // I2-I8: combine terms (lines 190-196)
-            + dce_dsl_patterns()               // I12: WHERE(!cond) swap (lines 201-202)
-            + where_alu_combining_patterns()   // I13-I14: WHERE ALU combine (lines 204-208)
-            + vmin_vmax_collapse_patterns()    // I15-I16: vmin==vmax fold (lines 210-211)
-            + minmax_dsl_patterns()            // I17: max fold (line 213)
-            + alu_folding_dsl_patterns()       // I18-I20: two-stage ALU, const push (lines 217-233)
-            + comparison_dsl_patterns()        // I19-I28: lt rules (lines 219-239)
-            + range_based_mod_div_patterns()   // I29-I30 + D1-D8: range mod/div (lines 241-242)
-            + advanced_division_dsl_patterns() // D1-D8: div_and_mod_symbolic
-            + range_based_cast_patterns()       // I32: range-based double-cast (lines 246-247)
-            + long_to_int_narrowing_patterns() // I33: long→int (lines 249-250)
-            + vectorize_to_vconst_patterns()   // I37: VECTORIZE(CONST..) → VCONST (lines 258-259)
-            + after_simplification_patterns()  // I35-I36: AFTER simplify (lines 253-256)
-            + where_bound_patterns()           // WHERE(Lt) elimination via vmin/vmax
-            + gep_pushing_patterns() // gep_pushing (lines 154-177)
-    });
+    static CACHED: std::sync::LazyLock<TypedPatternMatcher> =
+        std::sync::LazyLock::new(|| with_tier2(symbolic_simple_base() + dead_loop_patterns(), true));
+    &CACHED
+}
+
+/// [`symbolic`] for **hand-lowered tk kernels** — the post-index simplification
+/// they run after `pm_lower_index_dtype`. Like the generic pipeline it folds the
+/// degenerate index arithmetic (`x*0`, `x*1`, `x/1`, `x%1`, redundant casts) that
+/// lowering regenerates; left unfolded, those loop-invariant values reach the
+/// renderer stranded in non-dominating blocks (LLVM "does not dominate all uses").
+///
+/// It differs from [`symbolic`] by exactly two omitted folds, both rooted in the
+/// same gap: hand-built kernels carry loop state through END/AFTER and lane state
+/// through SPECIAL-derived indices, whereas the generic path goes through reduce
+/// accumulators and warp-axis RANGEs. Each omission has a concrete failure:
+///
+/// * **`dead_loop`** (size-1 RANGE→const) — FA's online-softmax `m`/`l`/`o`
+///   recurrence rides a single-trip RANGE; collapsing it to a constant severs the
+///   carry and the kernel returns wrong values.
+/// * **`alu_folding`** (two-stage ALU / const push-down) — it factors per-position
+///   address arithmetic into one range-derived index (`range·stride`) shared
+///   across sibling reduces. The generic path tolerates this because `dead_loop`
+///   then collapses the trivial range away; here, with no collapse, the shared
+///   index is emitted once inside the first reduce's region and fails to dominate
+///   the others (the knn `mul(r,stride)` "does not dominate all uses").
+///
+/// Every other Tier-2 fold runs, matching the generic `symbolic` as closely as the
+/// hand-lowered carry structure allows.
+pub fn symbolic_no_dead_loop() -> &'static TypedPatternMatcher {
+    static CACHED: std::sync::LazyLock<TypedPatternMatcher> =
+        std::sync::LazyLock::new(|| with_tier2(symbolic_simple_base(), false));
     &CACHED
 }
 
@@ -842,6 +875,19 @@ fn can_safe_cast(to: &DType, from: &DType) -> bool {
         return true;
     }
 
+    // Index is the unbounded index type, so an intermediate of type Index holds
+    // every value of any integer `to`. This lets the double-cast collapse fire on
+    // the `int.cast(Index).cast(int)` chains `pm_lower_index_dtype` regenerates
+    // (e.g. the bpermute lane address). The reverse is NOT lossless: a concrete
+    // int cannot hold an arbitrary Index, so `Index.cast(int).cast(..)` may narrow
+    // and must not collapse — `to == Index` falls through to `false` below.
+    if from_scalar == ScalarDType::Index {
+        return to_scalar.is_int();
+    }
+    if to_scalar == ScalarDType::Index {
+        return false;
+    }
+
     // Get bit widths and signedness
     let (to_bits, to_signed, to_float) = match to_scalar {
         ScalarDType::Bool => (1, false, false),
@@ -1172,14 +1218,29 @@ pub fn dead_loop_patterns() -> &'static TypedPatternMatcher {
 
 /// Vmin==Vmax collapse patterns.
 ///
-/// When a node's vmin equals vmax, it's provably constant.
-/// Only applies to computation nodes (Binary, Unary, Ternary, DefineVar, Special)
-/// to avoid collapsing structural nodes like Range, Buffer, etc.
+/// When a node's vmin equals vmax, it's provably constant. Restricted to the
+/// upstream op set — comparisons (`Lt`/`Le`/`Eq`/`Ne`/`Gt`/`Ge` → Bool), integer
+/// `Idiv`/`Mod`, index `Special`/`DefineVar` (PARAM/BIND/SPECIAL) — plus `Mul`
+/// (size-1 grid `Special·stride → 0`, needed to fold hand-built index arithmetic).
+///
+/// Two op classes are deliberately EXCLUDED:
+///   * **Float arithmetic** — a sound `[c, c]` integer-style bound does not transfer
+///     to IEEE floats, where `inf - inf`, `0 * inf`, etc. carry a degenerate range
+///     but evaluate to NaN at runtime. (Guarded by `!is_float`.)
+///   * **`Add`/`Sub`/`Max`** on integers — upstream does NOT collapse these via the
+///     vmin==vmax rule. Collapsing an integer `Add` whose operands are bounded to a
+///     single value replicates the trivial-RANGE collapse that `symbolic_no_dead_loop`
+///     intentionally omits: a hand-built kernel's trip-1 loop-carry index folds to a
+///     constant and the recurrence breaks (the FA online-softmax `m`/`l`/`o` carry
+///     reads a stale slot → NaN). `Mul` is safe because `0 · x = 0` and `c · c` are
+///     exact regardless of the operand's loop structure.
 pub fn vmin_vmax_collapse_patterns() -> &'static TypedPatternMatcher {
     use svod_ir::uop::properties::SoundVminVmaxProperty;
 
+    // Collapse only computation nodes whose result is non-float (int/bool/index).
+    // Structural nodes (Range, Buffer) and float arithmetic are excluded.
     fn is_collapsible(uop: &Arc<UOp>) -> bool {
-        matches!(uop.op(), Op::Binary(..) | Op::Unary(..) | Op::Ternary(..) | Op::DefineVar { .. } | Op::Special { .. })
+        matches!(uop.op(), Op::Binary(..) | Op::DefineVar { .. } | Op::Special { .. }) && !uop.dtype().is_float()
     }
 
     fn try_collapse(uop: &Arc<UOp>) -> Option<Arc<UOp>> {
@@ -1188,21 +1249,15 @@ pub fn vmin_vmax_collapse_patterns() -> &'static TypedPatternMatcher {
     }
 
     crate::cached_patterns! {
-        // ALU/DefineVar/Special with sound vmin == vmax → const
-        // Uses SoundVminVmaxProperty: returns None for ops with unsound range analysis
-        // (LOAD, Pow, Fdiv, etc.), preventing incorrect collapse.
-        for op in binary [Add, Mul, Sub, Mod, Max, Pow, Idiv, Fdiv, And, Or, Xor, Shl, Shr, Lt, Le, Eq, Ne, Gt, Ge] {
+        // Comparisons (→ Bool), integer Idiv/Mod, and Mul with sound vmin == vmax → const.
+        // SoundVminVmaxProperty returns None for unsound ops (LOAD/Pow/Fdiv); `is_collapsible`
+        // excludes float results; Add/Sub/Max are omitted (see fn doc).
+        for op in binary [Mul, Idiv, Mod, Lt, Le, Eq, Ne, Gt, Ge] {
             r @ op(_, _) if is_collapsible(r) => { let _ = op; try_collapse(r) },
         },
-        for op in unary [Sqrt, Exp2, Log2, Sin, Reciprocal, Trunc, Not, Floor, Ceil, Round] {
-            r @ op(_) if is_collapsible(r) => { let _ = op; try_collapse(r) },
-        },
-        for op in ternary [Where, MulAcc] {
-            r @ op(_, _, _) if is_collapsible(r) => { let _ = op; try_collapse(r) },
-        },
         // DefineVar/Special with vmin == vmax → const (e.g., Variable with min==max after binding)
-        r @ DefineVar { name: _, min_val: _, max_val: _ } => try_collapse(r),
-        r @ Special { end: _, name: _ } => try_collapse(r),
+        r @ DefineVar { name: _, min_val: _, max_val: _ } if is_collapsible(r) => try_collapse(r),
+        r @ Special { end: _, name: _ } if is_collapsible(r) => try_collapse(r),
     }
 }
 
@@ -1274,19 +1329,15 @@ pub fn dce_dsl_patterns() -> &'static TypedPatternMatcher {
 /// - AFTER(x, []) → x (empty deps, just passthrough)
 pub fn after_simplification_patterns() -> &'static TypedPatternMatcher {
     crate::cached_patterns! {
-        // AFTER recursive dep flattening:
+        // AFTER recursive dep flattening + dedup (matches tinygrad symbolic.py:307-311):
         // For each dep, if it's not a side-effecting op, replace it with its sources.
-        // This inlines AFTER dep chains so only true side-effect boundaries remain.
+        // Then deduplicate by UOp id to prevent dep-list bloat.
         After { passthrough, deps } if !deps.is_empty() => {
             let mut new_deps = smallvec::SmallVec::<[Arc<UOp>; 4]>::new();
             let mut changed = false;
             for dep in deps {
-                // Side-effect boundaries that survive AFTER inlining. `Custom`
-                // is included because it carries backend intrinsics / scheduling
-                // markers (e.g., `; svod.sched.pipeline` for AMDGPU iglp) whose
-                // effect is invisible to the symbolic reasoner — inlining their
-                // sources would orphan the marker.
-                // : {RANGE, STORE, CALL, BARRIER, END, UNROLL, CUSTOM}
+                // Side-effect boundaries that survive AFTER inlining.
+                // Matches tinygrad: {RANGE, STORE, CALL, FUNCTION, BARRIER, END, UNROLL, LINEAR, STAGE}
                 if matches!(
                     dep.op(),
                     Op::Range { .. }
@@ -1296,6 +1347,7 @@ pub fn after_simplification_patterns() -> &'static TypedPatternMatcher {
                         | Op::Barrier { .. }
                         | Op::Unroll { .. }
                         | Op::Custom { .. }
+                        | Op::Function { .. }
                 ) {
                     new_deps.push(Arc::clone(dep));
                 } else {
@@ -1307,6 +1359,9 @@ pub fn after_simplification_patterns() -> &'static TypedPatternMatcher {
                 }
             }
             if changed {
+                // Dedup by UOp id (matches tinygrad's dedup(flatten(...)))
+                let mut seen = std::collections::HashSet::new();
+                new_deps.retain(|d| seen.insert(d.id));
                 if new_deps.is_empty() {
                     Some(Arc::clone(passthrough))
                 } else {
@@ -1318,6 +1373,28 @@ pub fn after_simplification_patterns() -> &'static TypedPatternMatcher {
         },
         // AFTER(x, []) → x: empty dependencies means no ordering constraint
         After { passthrough, deps } if deps.is_empty() ~> Arc::clone(passthrough),
+
+        // Remove NOOP and recursive empty-END deps from AFTER (matches tinygrad rangeify.py:458-479).
+        // A noop_after_dep is: NOOP with no sources, or END whose computation is also a noop_after_dep.
+        After { passthrough, deps } if deps.iter().any(is_noop_after_dep) => {
+            let new_deps: smallvec::SmallVec<[Arc<UOp>; 4]> =
+                deps.iter().filter(|d| !is_noop_after_dep(d)).cloned().collect();
+            if new_deps.is_empty() {
+                Some(Arc::clone(passthrough))
+            } else {
+                Some(passthrough.after(new_deps))
+            }
+        },
+    }
+}
+
+/// Check if a UOp is a noop AFTER dep (matches tinygrad's `is_noop_after_dep`).
+/// A noop_after_dep is: NOOP with no sources, or END whose computation is also a noop_after_dep.
+fn is_noop_after_dep(u: &Arc<UOp>) -> bool {
+    match u.op() {
+        Op::Noop => true,
+        Op::End { computation, .. } => is_noop_after_dep(computation),
+        _ => false,
     }
 }
 
@@ -2142,15 +2219,13 @@ pub fn store_load_folding_patterns() -> &'static TypedPatternMatcher {
         // upstream sym: converts selective overwrite into gated store.
         // When we store WHERE(gate, alt_value, load_from_same_index), the store only
         // matters where gate is true. Convert to a gated INDEX with alt as the value.
-        Store { index: idx @ Index { buffer: buf, indices, gate: None }, value: Where(gate, alt, Load { index: idx2, .. }), ranges }
+        Store { index: idx @ Index { buffer: buf, indices, gate: None }, value: Where(gate, alt, Load { index: idx2, .. }) }
             if idx.id == idx2.id && !indices.is_empty()
             => {
-                // Build WHERE(gate, original_idx, Invalid) — gates the index itself
                 let original_idx = indices[0].clone();
                 let invalid = UOp::new(Op::Invalid, original_idx.dtype());
                 let gated_idx = UOp::try_where(gate.clone(), original_idx, invalid).ok()?;
 
-                // Build new INDEX with the gated index
                 let mut new_indices: SmallVec<[Arc<UOp>; 4]> = indices.clone();
                 new_indices[0] = gated_idx;
                 let new_index = UOp::index()
@@ -2159,12 +2234,7 @@ pub fn store_load_folding_patterns() -> &'static TypedPatternMatcher {
                     .call()
                     .ok()?;
 
-                // Build STORE with the new gated index and alt as value
-                if ranges.is_empty() {
-                    Some(new_index.store(alt.clone()))
-                } else {
-                    Some(new_index.store_with_ranges(alt.clone(), ranges.clone()))
-                }
+                Some(new_index.store(alt.clone()))
             },
     }
 }

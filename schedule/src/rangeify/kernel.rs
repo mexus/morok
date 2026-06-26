@@ -260,10 +260,9 @@ pub fn split_store(_ctx: &mut Vec<Arc<UOp>>, x: &Arc<UOp>) -> Option<Arc<UOp>> {
         return None;
     }
 
-    // Guard 1: raw stores with explicit ranges or index-shape should be
-    // handled by their END wrapper, not here.
-    if let Op::Store { index, ranges, .. } = x.op()
-        && (!ranges.is_empty() || index.shape().ok().flatten().is_some())
+    // Guard 1: index-shape stores should be handled by their END wrapper, not here.
+    if let Op::Store { index, .. } = x.op()
+        && index.shape().ok().flatten().is_some()
     {
         return None;
     }

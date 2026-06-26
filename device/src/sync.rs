@@ -41,6 +41,12 @@ use snafu::ensure;
 pub trait DispatchTimestamps: Send + Sync {
     /// `(start_ns, end_ns)` on the GPU clock.
     fn timestamps_ns(&self) -> Option<(u64, u64)>;
+
+    /// Hardware performance counters harvested for this dispatch, when PMC was
+    /// armed for it. `None` by default and on backends without counter support.
+    fn counters(&self) -> Option<crate::profile::CounterSet> {
+        None
+    }
 }
 
 /// Monotonic timeline signal for synchronization.

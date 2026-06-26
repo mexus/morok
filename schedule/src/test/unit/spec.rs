@@ -31,7 +31,7 @@ fn spec_program_accepts_valid_kernel() {
     let buf = global_param();
     let idx = UOp::index().buffer(buf).indices(vec![UOp::index_const(0)]).ptr(true).call().unwrap();
     let value = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-    let store = UOp::new(Op::Store { index: idx, value, ranges: smallvec![] }, DType::Void);
+    let store = UOp::new(Op::Store { index: idx, value }, DType::Void);
     let sink = UOp::sink(vec![store]);
 
     assert!(type_verify(&sink, &spec_program()).is_ok(), "a well-formed kernel must pass the whitelist");

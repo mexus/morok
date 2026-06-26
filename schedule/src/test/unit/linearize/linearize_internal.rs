@@ -90,12 +90,11 @@ fn test_linearize_preserves_dependencies() {
 }
 
 #[test]
-#[allow(clippy::assertions_on_constants)]
 fn test_priority_ordering() {
-    // Test that priority order is respected: PARAM < default < Range
-    assert!(priority::PARAM < priority::DEFAULT);
-    assert!(priority::DEFAULT < priority::RANGE);
-    assert!(priority::END < priority::DEFAULT);
-    assert!(priority::LOAD < priority::DEFAULT);
-    assert!(priority::DEFAULT < priority::STORE);
+    let param = UOp::param(0, 1, DType::Float32, None);
+    let range = UOp::range_const(10, 0);
+
+    assert!(priority(&param).0 < 0); // PARAM = -20
+    assert!(priority(&range).0 == 5); // RANGE = 5
+    assert_eq!(priority(&param).1, Some(0)); // PARAM extra = slot
 }

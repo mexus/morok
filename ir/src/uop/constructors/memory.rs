@@ -203,29 +203,14 @@ impl UOp {
         Self::new(Op::Load { buffer, index, alt }, dtype)
     }
 
-    /// Create a STORE operation without ranges.
+    /// Create a STORE operation.
     ///
     /// Stores a value at self (INDEX location).
     /// The buffer is accessed indirectly through the INDEX node.
-    /// For stores with ranges (e.g., output upcasting), use `store_with_ranges`.
     ///
     /// For gated stores, use an INDEX with a gate (INDEX has optional gate field).
     pub fn store(self: &Arc<Self>, value: Arc<Self>) -> Arc<Self> {
-        self.store_with_ranges(value, SmallVec::new())
-    }
-
-    /// Create a STORE operation with ranges.
-    ///
-    /// Stores a value at self (INDEX location), with explicit ranges
-    /// that define the scope of the store operation. This matches Tinygrad's
-    /// architecture where STORE sources are `(index, value, *ranges)`.
-    ///
-    /// Ranges are used for output upcasting: Range(Upcast) becomes UNROLL
-    /// during expansion, which `fix_store_unroll` contracts via CONTRACT.
-    ///
-    /// For gated stores, use an INDEX with a gate (INDEX has optional gate field).
-    pub fn store_with_ranges(self: &Arc<Self>, value: Arc<Self>, ranges: SmallVec<[Arc<Self>; 4]>) -> Arc<Self> {
-        Self::new(Op::Store { index: self.clone(), value, ranges }, DType::Void)
+        Self::new(Op::Store { index: self.clone(), value }, DType::Void)
     }
 
     // =========================================================================

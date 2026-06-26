@@ -10,19 +10,10 @@ use svod_ir::{ConstValue, Op, prelude::*};
 
 use super::types::{lconst, ldt};
 
-/// Pending reduce load info.
-pub struct PendingReduce {
-    pub acc_ptr: String,
-    pub dtype: String,
-}
-
 /// Maps UOp ID → LLVM variable name.
 pub struct RenderContext {
     names: HashMap<u64, String>,
-    range_values: HashMap<usize, String>,
     counter: usize,
-    /// Pending reduce final loads: reduce_id -> (acc_ptr, dtype)
-    pending_reduces: HashMap<u64, PendingReduce>,
     /// Stack of currently open RANGE axis_ids (for correct END footer ordering).
     /// Pushed on RANGE emission, popped on END emission.
     range_stack: Vec<usize>,
@@ -40,9 +31,7 @@ impl RenderContext {
     pub fn new() -> Self {
         Self {
             names: HashMap::new(),
-            range_values: HashMap::new(),
             counter: 0,
-            pending_reduces: HashMap::new(),
             range_stack: Vec::new(),
             pending_error: None,
             module_prefix: Vec::new(),
@@ -169,16 +158,6 @@ impl RenderContext {
         self.counter
     }
 
-    /// Register a range value by axis_id.
-    pub fn register_range(&mut self, axis_id: usize, name: String) {
-        self.range_values.insert(axis_id, name);
-    }
-
-    /// Get a range value by axis_id.
-    pub fn get_range(&self, axis_id: usize) -> Option<&str> {
-        self.range_values.get(&axis_id).map(|s| s.as_str())
-    }
-
     /// Push a range axis_id onto the open-range stack (called during RANGE codegen).
     pub fn push_range(&mut self, axis_id: usize) {
         self.range_stack.push(axis_id);
@@ -187,21 +166,6 @@ impl RenderContext {
     /// Pop the innermost open range axis_id (called during END codegen).
     pub fn pop_range(&mut self) -> Option<usize> {
         self.range_stack.pop()
-    }
-
-    /// Register a pending reduce final load.
-    pub fn register_reduce_pending(&mut self, reduce_id: u64, acc_ptr: String, dtype: String) {
-        self.pending_reduces.insert(reduce_id, PendingReduce { acc_ptr, dtype });
-    }
-
-    /// Take all pending reduces (empties map).
-    pub fn take_pending_reduces(&mut self) -> HashMap<u64, PendingReduce> {
-        std::mem::take(&mut self.pending_reduces)
-    }
-
-    /// Check if there are pending reduces.
-    pub fn has_pending_reduces(&self) -> bool {
-        !self.pending_reduces.is_empty()
     }
 }
 

@@ -38,9 +38,7 @@ fn test_scheduler_shift_to_integration() {
     let index = UOp::index_const(0);
 
     // Create STORE with the REDUCE as value
-    let loop_end = UOp::const_(DType::Index, ConstValue::Int(1));
-    let loop_range = UOp::range_axis(loop_end, AxisId::Renumbered(1), AxisType::Loop);
-    let store = index.store_with_ranges(reduce.clone(), smallvec![loop_range.clone()]);
+    let store = index.store(reduce.clone());
 
     // Wrap in SINK (required for Scheduler)
     let ast = UOp::sink(vec![store]);

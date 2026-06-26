@@ -203,10 +203,6 @@ pub fn pm_pre_expander() -> &'static TypedPatternMatcher {
         // Fix REDUCE with non-Range entries in ranges
         // This detects Upcast axes and sets Vector dtype for K-vectorization
         reduce @ Reduce(_, ..) => |reduce| fix_reduce_unroll(reduce),
-
-        // Fix STORE with UNROLL in ranges/index - wrap in CONTRACT
-        // MUST run BEFORE do_expand! Tinygrad's fix_store_unroll is in pm_pre_expander.
-        store if matches!(store.op(), Op::Store { .. }) => |store| fix_store_unroll(store),
     }
 }
 
@@ -641,52 +637,6 @@ pub(crate) fn fix_reduce_unroll(reduce: &Arc<UOp>) -> Option<Arc<UOp>> {
         Op::Reduce { src: contracted_src, ranges: reduce_range.into_iter().cloned().collect(), reduce_op: *reduce_op },
         reduce.dtype(),
     ))
-}
-
-/// Based on Tinygrad's fix_store_unroll (expander.py:123-126).
-///
-/// Tinygrad's implementation:
-/// ```python
-/// def fix_store_unroll(x:UOp):
-///   store_expand, store_range = partition(x.src[2:], lambda y: y.op is Ops.UNROLL)
-///   if len(store_expand) == 0: return None
-///   return UOp(Ops.CONTRACT, dtypes.void, (x.replace(src=x.src[:2]+tuple(store_range)),),
-///              tuple(flatten(x.arg for x in store_expand)), tag=1)
-/// ```
-///
-/// This ONLY partitions DIRECT children in STORE.ranges (src[2:]).
-/// It does NOT search nested expressions or the index subtree.
-/// UNROLLs in the index/value are handled by do_expand, not here.
-fn fix_store_unroll(store: &Arc<UOp>) -> Option<Arc<UOp>> {
-    match store.op() {
-        Op::Store { index, value, ranges } => {
-            // Partition ranges into direct UNROLL ops vs non-UNROLL
-            // Matching Tinygrad: partition(x.src[2:], lambda y: y.op is Ops.UNROLL)
-            let (store_expand, store_range): (Vec<_>, Vec<_>) =
-                ranges.iter().partition(|r| matches!(r.op(), Op::Unroll { .. }));
-
-            if store_expand.is_empty() {
-                return None;
-            }
-
-            // Collect axes from UNROLL ops
-            let contract_axes: Vec<(usize, usize)> = store_expand
-                .iter()
-                .filter_map(|u| match u.op() {
-                    Op::Unroll { unroll_axes, .. } => Some(unroll_axes.clone()),
-                    _ => None,
-                })
-                .flatten()
-                .collect();
-
-            // Create new STORE with only non-UNROLL ranges
-            let new_store = index.store_with_ranges(value.clone(), store_range.into_iter().cloned().collect());
-
-            // Wrap in CONTRACT with void dtype, tagged finalized (see `TAG_TC_FINAL`).
-            Some(new_store.contract(contract_axes).with_tag(smallvec::smallvec![crate::devectorize::TAG_TC_FINAL]))
-        }
-        _ => None,
-    }
 }
 
 /// Handle END operations that have UNROLL in their ranges.

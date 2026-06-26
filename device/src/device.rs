@@ -83,6 +83,13 @@ pub trait Program: Send + Sync {
     fn new_exec_context(&self) -> Result<Option<Box<dyn PlanContext>>> {
         Ok(None)
     }
+
+    /// Static GPU resource usage (VGPR/SGPR/LDS/scratch) decoded from the
+    /// compiled kernel descriptor, for profiling/occupancy. Default `None`:
+    /// backends without a descriptor (CPU) report nothing.
+    fn resource_usage(&self) -> Option<crate::profile::KernelResources> {
+        None
+    }
 }
 
 /// One graphable kernel: a program plus its fixed buffer pointers and launch
@@ -148,6 +155,18 @@ pub trait PlanContext: Send + Sync {
 
     /// Drain this context's in-flight work (profiled-timestamp harvest).
     fn synchronize(&self) -> Result<()>;
+
+    /// Arm hardware performance counters for subsequent profiling dispatches on
+    /// this context (empty disables). Default no-op: backends without PMC ignore
+    /// it. Counters are reported via [`DispatchTimestamps::counters`].
+    fn set_pmc(&self, _counters: &[crate::profile::PmcCounter]) {}
+
+    /// Whether hardware counter collection is currently available on this
+    /// context (backend supports PMC and the GPU is in a stable power state).
+    /// Default `false`.
+    fn pmc_available(&self) -> bool {
+        false
+    }
 }
 
 /// Compilation result carrying source (JIT) or bytes (AOT).

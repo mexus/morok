@@ -4,14 +4,11 @@
 //!
 //! Run: `SVOD_DEVICE=AMD:0 cargo bench -p svod-tk --bench matmul`
 
-use std::hint::black_box;
-use std::time::Duration;
-
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use svod_dtype::DType;
 
 mod common;
-use common::{plan_gpu_ns, randn_bf16, requirements_met};
+use common::{bench_plan, randn_bf16, requirements_met};
 
 /// The svod-tk hand matmul (`svod_tk::matmul`, a graph-native `custom_kernel` node) vs
 /// svod's generic `Tensor::matmul` reference — both timed through `prepare()` →
@@ -31,19 +28,19 @@ fn bench_matmul(c: &mut Criterion) {
 
         let mut y = svod_tk::matmul(&a, &b).expect("tk matmul").expect("matmul kernel applies");
         let plan = y.prepare().expect("prepare matmul");
-        group.bench_with_input(BenchmarkId::new("tk", n), &n, |bencher, _| {
-            bencher.iter_custom(|iters| Duration::from_nanos(black_box(plan_gpu_ns(&plan, iters))));
-        });
+        group.bench_with_input(BenchmarkId::new("tk", n), &n, |bencher, _| bench_plan(bencher, &plan));
 
         // Reference: svod's generic bf16→f32 GEMM (the matmul a user would write).
         let mut reft = a.matmul_with().other(&b).dtype(DType::Float32).call().expect("ref matmul");
         let ref_plan = reft.prepare().expect("prepare ref");
-        group.bench_with_input(BenchmarkId::new("generic", n), &n, |bencher, _| {
-            bencher.iter_custom(|iters| Duration::from_nanos(black_box(plan_gpu_ns(&ref_plan, iters))));
-        });
+        group.bench_with_input(BenchmarkId::new("generic", n), &n, |bencher, _| bench_plan(bencher, &ref_plan));
     }
     group.finish();
 }
 
-criterion_group!(benches, bench_matmul);
+criterion_group! {
+    name = benches;
+    config = Criterion::default().with_profiler(common::bench_profiler());
+    targets = bench_matmul
+}
 criterion_main!(benches);

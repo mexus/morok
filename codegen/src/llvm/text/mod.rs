@@ -20,7 +20,7 @@ use svod_ir::{Op, prelude::*};
 use crate::common::is_output_buffer;
 use crate::llvm::amd;
 use crate::llvm::common::{LlvmTarget, RenderContext, ldt};
-use crate::llvm::cpu::{self, reduce_identity};
+use crate::llvm::cpu;
 use crate::{BufferArg, Error, RenderedKernel, Renderer, Result};
 
 /// Text-based LLVM IR renderer.
@@ -136,29 +136,6 @@ impl Renderer for LlvmTextRenderer {
         }
 
         // -- Build function body --
-        kernel.push("  ; Reduction accumulators".to_string());
-        for node in &nodes {
-            if let Op::Reduce { reduce_op, .. } = node.op() {
-                let dtype = ldt(&node.dtype());
-                let identity = reduce_identity(*reduce_op, &node.dtype());
-                let acc_name = format!("%reduce_{}", node.id);
-                match self.target {
-                    // AMDGPU rejects addrspace(0) allocas (`alloca on amdgpu must
-                    // be in addrspace(5)`); allocate in private/scratch and
-                    // addrspacecast to a generic `ptr` for the downstream
-                    // loads/stores, mirroring `render_define_reg`.
-                    LlvmTarget::Amd(_) => {
-                        let raw = format!("{acc_name}.raw");
-                        kernel.push(format!("  {raw} = alloca {dtype}, addrspace(5)"));
-                        kernel.push(format!("  {acc_name} = addrspacecast ptr addrspace(5) {raw} to ptr"));
-                    }
-                    LlvmTarget::Cpu => kernel.push(format!("  {acc_name} = alloca {dtype}")),
-                }
-                kernel.push(format!("  store {dtype} {identity}, ptr {acc_name}"));
-                ctx.register(node.id, acc_name);
-            }
-        }
-
         // WMMA scratch buffers — one alloca + ptrtoint per (A, B, C) operand.
         // Allocas placed in the entry block so LLVM's mem2reg can promote them
         // to vector registers across loop iterations. Without this, the WMMA
@@ -186,62 +163,6 @@ impl Renderer for LlvmTextRenderer {
             }
         }
         kernel.push("".to_string());
-
-        for node in &nodes {
-            match node.op() {
-                Op::Const(cv) => {
-                    if node.dtype().vcount() > 1 {
-                        // Vector-typed CONST → splat via insertelement +
-                        // shufflevector.
-                        //
-                        // Invariant after this pre-pass: any UOp with a vector
-                        // dtype either has a true vector value (load, ALU
-                        // result, vectorize) or — for vector CONSTs — gets a
-                        // named splat value emitted in the entry block.
-                        let scalar_dtype = node.dtype().scalar_dtype();
-                        let scalar_lit = crate::llvm::common::lconst(&cv.0, &scalar_dtype);
-                        let scalar_ty = ldt(&scalar_dtype);
-                        let count = node.dtype().vcount();
-                        let dst = ctx.name(node);
-                        kernel.push(format!(
-                            "  {dst}_splat0 = insertelement <1 x {scalar_ty}> poison, {scalar_ty} {scalar_lit}, i32 0"
-                        ));
-                        kernel.push(format!(
-                            "  {dst} = shufflevector <1 x {scalar_ty}> {dst}_splat0, \
-                             <1 x {scalar_ty}> poison, <{count} x i32> zeroinitializer"
-                        ));
-                    } else {
-                        let val = crate::llvm::common::lconst(&cv.0, &node.dtype());
-                        ctx.register(node.id, val);
-                    }
-                }
-                Op::VConst { values } => {
-                    // Per-lane vector CONST → VECTORIZE chain of scalar
-                    // CONSTs, emitted as a sequence of insertelements.
-                    let scalar_dtype = node.dtype().scalar_dtype();
-                    let scalar_ty = ldt(&scalar_dtype);
-                    let vec_ty = ldt(&node.dtype());
-                    let dst = ctx.name(node);
-                    let mut prev = "poison".to_string();
-                    for (i, cv) in values.iter().enumerate() {
-                        let scalar_lit = crate::llvm::common::lconst(cv, &scalar_dtype);
-                        let next = if i + 1 == values.len() { dst.clone() } else { format!("{dst}_e{i}") };
-                        kernel.push(format!(
-                            "  {next} = insertelement {vec_ty} {prev}, {scalar_ty} {scalar_lit}, i32 {i}"
-                        ));
-                        prev = next;
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        for node in &nodes {
-            if let Op::Range { axis_id, .. } = node.op() {
-                let name = format!("%r{}", axis_id.value());
-                ctx.register(node.id, name);
-            }
-        }
 
         for node in &nodes {
             if matches!(node.op(), Op::Noop | Op::Group { .. }) {
@@ -356,14 +277,25 @@ fn mangle_type(llvm_type: &str) -> String {
 }
 
 /// Remove duplicate `declare ...` lines from an assembled module prefix,
-/// keeping the first occurrence. Non-`declare` lines pass through unchanged.
+/// keeping the first occurrence per **function name** (the `@name` token). Two
+/// declares for the same intrinsic with different signatures — e.g. a wave64
+/// and a wave32 `@llvm.amdgcn.wmma.*` call in the same kernel — are treated as
+/// duplicates so the second is dropped, avoiding clang's "invalid redefinition"
+/// error. Non-`declare` lines pass through unchanged.
 fn dedup_declares(prefix: String) -> String {
     let mut seen = std::collections::HashSet::new();
     let mut out: Vec<&str> = Vec::new();
     for line in prefix.lines() {
         let trimmed = line.trim_start();
-        if trimmed.starts_with("declare ") && !seen.insert(trimmed.to_string()) {
-            continue;
+        if trimmed.starts_with("declare ") {
+            // Extract the function name: the token between `@` and `(`.
+            let key = trimmed
+                .find('@')
+                .and_then(|at| trimmed[at + 1..].find('(').map(|p| &trimmed[at + 1..at + 1 + p]))
+                .unwrap_or(trimmed);
+            if !seen.insert(key.to_string()) {
+                continue;
+            }
         }
         out.push(line);
     }

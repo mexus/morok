@@ -271,7 +271,7 @@ fn linearize_cleanup_pattern(uop: &Arc<UOp>, _replaced: &HashMap<u64, Arc<UOp>>)
     }
 
     // Match STORE with gated INDEX (possibly wrapped in Cast)
-    let Op::Store { index, value, ranges } = uop.op() else {
+    let Op::Store { index, value } = uop.op() else {
         return None;
     };
 
@@ -295,7 +295,7 @@ fn linearize_cleanup_pattern(uop: &Arc<UOp>, _replaced: &HashMap<u64, Arc<UOp>>)
     let final_index =
         if let Some(ref dtype) = cast_dtype { ungated_index.cast(dtype.clone()) } else { ungated_index.clone() };
 
-    let ungated_store = final_index.store_with_ranges(value.clone(), ranges.clone());
+    let ungated_store = final_index.store(value.clone());
 
     // Wrap in IF/ENDIF
     let if_op = UOp::if_(gate.clone(), smallvec![ungated_index.clone()]);
