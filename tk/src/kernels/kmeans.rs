@@ -54,10 +54,11 @@ use crate::tiles::{TileLayout, VecLayout};
 const BLK: usize = 16;
 
 /// The centroid stream-tile height — a multiple of [`BLK`] (16). Centroids are
-/// streamed in `K/TM` tiles through the assignment loop. `32` (2·BLK) matches
-/// the measured KNN optimum (fewer insert passes vs BLK-tall, not so tall the
-/// per-step cost regresses).
-const TM: usize = 32;
+/// streamed in `K/TM` tiles through the assignment loop. `16` (= BLK) keeps the
+/// centroid operand fragments small: profiling showed the taller `32`/`64` tiles
+/// push VGPR past the occupancy cliff (248/256 VGPR → 38% occ), whereas `16`
+/// holds ~176 VGPR → 50% occ and runs ~1.7× faster despite the extra passes.
+const TM: usize = 16;
 
 /// The GPU arch(es) this kernel targets (gfx942 CDNA3 wave64 + gfx1151 RDNA3.5
 /// wave32). The launcher gates against this list.
