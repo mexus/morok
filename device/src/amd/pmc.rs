@@ -1,9 +1,9 @@
 //! AMD SQ hardware performance-counter programming (PMC) for gfx11 (RDNA3.5).
 //!
-//! Ports tinygrad's PM4 sequence: program `SQ_PERFCOUNTER*_SELECT`, start/stop the
-//! perfmon via `CP_PERFMON_CNTL`, and `COPY_DATA` the per-WGP counters into a GTT
-//! buffer — summed across the SE/SA/WGP grid when read back. gfx11-only; callers
-//! gate on `target_major == 11` and stable power state (`profile_standard`).
+//! The PM4 sequence: program `SQ_PERFCOUNTER*_SELECT`, start/stop the perfmon via
+//! `CP_PERFMON_CNTL`, and `COPY_DATA` the per-WGP counters into a GTT buffer —
+//! summed across the SE/SA/WGP grid when read back. gfx11-only; callers gate on
+//! `target_major == 11` and stable power state (`profile_standard`).
 
 use std::ptr::NonNull;
 use std::sync::Arc;
@@ -56,7 +56,7 @@ fn abs_addr(r: &RegDef) -> u64 {
 }
 
 /// Emit a register write as a SET_SH_REG or SET_UCONFIG_REG packet, chosen by the
-/// register's absolute address window (mirrors tinygrad's `wreg`).
+/// register's absolute address window.
 fn wreg(out: &mut Vec<u32>, name: &str, fields: &[(&str, u32)]) {
     let r = reg(name);
     let val = r.encode(fields) as u32;

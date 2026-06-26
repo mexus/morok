@@ -30,7 +30,7 @@ Svod 的一切都围绕自动化展开。你搭好一张惰性图，调用 `real
 
 | 面孔 | 你是…… | 你接触的东西 |
 |------|----------|----------------|
-| **USE** | 只想拿到一个快内核的应用作者 | `matmul`、`flash_attention`、`flash_attention_with`，它们返回惰性 `Tensor`，无需任何内核知识 |
+| **USE** | 只想拿到一个快内核的应用作者 | `matmul`、`flash_attention`、`flash_attention_with`、`kmeans_assign`，它们返回惰性 `Tensor`，无需任何内核知识 |
 | **AUTHOR** | 正在编写一个新的 tile 内核 | `Kernel` / `Group` 构建器、`ArchCaps`、各 tile 类型（`GL`/`ST`/`RT`/`RV`）、`Swizzle`、`graph_launch` |
 | **DEBUG** | 想隔离测试或基准测试某个内核 | `compile`、`launch`、`run_kernel`、`CompiledLaunch`，以及结构化的 `KernelFingerprint` |
 
@@ -51,7 +51,7 @@ BEAM，连同它兜底时所用的启发式优化器，搜索的是某个*固定
 | 内核的属性 | 由谁构建 | 示例 |
 |------------------------|----------|----------|
 | **数据流固定**：在矩形迭代空间上做逐元素操作和规约，可调的只有*调度*（分块、向量化、数据布局、矩阵核心映射） | 图操作 + **BEAM** | matmul / GEMM、前馈、layernorm、softmax |
-| **需要重新表述算法**：带循环依赖的递推，或重新组织的数值流程，朴素操作怎么重排都产生不出来 | **在 `tk` 中手写** | Flash Attention（在线 softmax） |
+| **需要重新表述算法**：带循环依赖的递推，或重新组织的数值流程，朴素操作怎么重排都产生不出来 | **在 `tk` 中手写** | Flash Attention（在线 softmax）；暴力 k-means 分配（`kmeans_assign`）——把一次交叉项 WMMA 与一个在流式传入的质心 tile 上滚动进行的 argmin 相融合，于是完整的 `[N, K]` 距离矩阵从头至尾都无需构造 |
 
 ### BEAM 够不到的地方
 
@@ -78,6 +78,7 @@ BEAM，连同它兜底时所用的启发式优化器，搜索的是某个*固定
 5. **[Wave32 与 Wave64](./wave-portability)**：让同一个内核在两种 AMD 架构上都保持正确。
 6. **[Flash Attention](./flash-attention)**：促成这一切的实战范例。
 7. **[调试](./debugging)**：手动运行并验证内核。
-8. **[tk、HipKittens 与 CuTile 对比](./comparison)**：这套设计在整个版图中的位置。
+8. **[剖析与基准测试](./profiling)**：分层 profiler 与 criterion 集成，适用于任何 `Tensor` 或 `ExecutionPlan`。
+9. **[tk、HipKittens 与 CuTile 对比](./comparison)**：这套设计在整个版图中的位置。
 </content>
 </invoke>

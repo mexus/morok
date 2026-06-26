@@ -25,7 +25,7 @@ pub fn decode_resources(
     target_major: u32,
 ) -> KernelResources {
     // VGPRs are allocated/encoded in blocks: 8 per block in wave32, 4 in wave64
-    // (GFX10+). Confirmed on gfx1151: field 24 → (24+1)*8 = 200 VGPRs.
+    // (GFX10+). Confirmed on RDNA3.5: field 24 → (24+1)*8 = 200 VGPRs.
     let vgpr_block = if wave_size == 32 { 8 } else { 4 };
     let vgprs = (((rsrc1 >> RSRC1_VGPR_SHIFT) & RSRC1_VGPR_MASK) + 1) * vgpr_block;
     // SGPRs are encoded in blocks of 16. Informational on GFX10+, where the HW

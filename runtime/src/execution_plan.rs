@@ -890,6 +890,8 @@ impl ExecutionPlan {
     ///
     /// Tier-2/3 static analysis (`opts.static_analysis`) and Tier-4 hardware
     /// counters (`opts.counters`) attach to each [`KernelProfile`] when enabled.
+    /// Tier-4 is gated: it requires `pmc_available()` and a stable power state;
+    /// otherwise it degrades gracefully to timing-only with a one-line note.
     pub fn profile(&self, opts: &ProfileOptions) -> Result<RunProfile> {
         let start = Instant::now();
         // Tier-4: arm hardware counters on the plan's context when requested and

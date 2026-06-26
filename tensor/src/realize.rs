@@ -25,6 +25,11 @@
 //! // Get results
 //! let output = plan.output_buffer();
 //! ```
+//!
+//! To realize a tensor while also collecting per-kernel profiling data, use
+//! [`Tensor::profile`](crate::Tensor::profile) instead of
+//! [`Tensor::realize`](crate::Tensor::realize) /
+//! [`Tensor::prepare`](crate::Tensor::prepare).
 
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
@@ -1399,9 +1404,9 @@ fn prepare_execution_plan(
             Arc::clone(cached)
         } else {
             let optimizer_renderer = get_optimizer_renderer(&item_device);
-            // Author-supplied `opts_to_apply` (tinygrad parity) short-circuits
-            // before beam: such kernels must go through the heuristic entry so
-            // `apply_explicit_opts` honors the exact opt list (empty = none).
+            // Author-supplied `opts_to_apply` short-circuits before beam: such
+            // kernels must go through the heuristic entry so `apply_explicit_opts`
+            // honors the exact opt list (empty = none).
             let has_explicit_opts =
                 matches!(item.ast.op(), Op::Sink { info: Some(ki), .. } if ki.opts_to_apply.is_some());
             let optimized_ast =

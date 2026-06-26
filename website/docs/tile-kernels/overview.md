@@ -48,7 +48,7 @@ re-exported from `tk/src/lib.rs`):
 
 | Face | You are… | What you touch |
 |------|----------|----------------|
-| **USE** | an application author who just wants a fast kernel | `matmul`, `flash_attention`, `flash_attention_with` — they return lazy `Tensor`s, no kernel knowledge required |
+| **USE** | an application author who just wants a fast kernel | `matmul`, `flash_attention`, `flash_attention_with`, `kmeans_assign` — they return lazy `Tensor`s, no kernel knowledge required |
 | **AUTHOR** | writing a new tile kernel | the `Kernel` / `Group` builder, `ArchCaps`, the tile types (`GL`/`ST`/`RT`/`RV`), `Swizzle`, `graph_launch` |
 | **DEBUG** | testing or benchmarking a kernel in isolation | `compile`, `launch`, `run_kernel`, `CompiledLaunch`, and structural `KernelFingerprint`s |
 
@@ -78,7 +78,7 @@ So:
 | Property of the kernel | Built by | Examples |
 |------------------------|----------|----------|
 | **Fixed dataflow** — elementwise ops and reductions over a rectangular iteration space; only the *schedule* (tiling, vectorization, data placement, matrix-core mapping) is open | graph ops + **BEAM** | matmul / GEMM, feed-forward, layernorm, softmax |
-| **Needs a reformulated algorithm** — a loop-carried recurrence, or restructured numerics, that no reschedule of the naive ops can produce | **hand-authored in `tk`** | Flash Attention (online softmax) |
+| **Needs a reformulated algorithm** — a loop-carried recurrence, or restructured numerics, that no reschedule of the naive ops can produce | **hand-authored in `tk`** | Flash Attention (online softmax); brute-force k-means assignment (`kmeans_assign`) — a cross-term WMMA fused with a running argmin over streamed centroid tiles, so the full `[N, K]` distance matrix is never formed |
 
 ### What BEAM can't reach
 
@@ -120,4 +120,6 @@ The rest of this section builds up from the hardware problem to the design compa
    architectures.
 6. **[Flash Attention](./flash-attention)** — the worked example that motivated all of this.
 7. **[Debugging](./debugging)** — running and verifying kernels by hand.
-8. **[tk vs HipKittens vs CuTile](./comparison)** — where this design sits in the landscape.
+8. **[Profiling & Benchmarking](./profiling)** — the layered profiler and criterion integration,
+   for any `Tensor` or `ExecutionPlan`.
+9. **[tk vs HipKittens vs CuTile](./comparison)** — where this design sits in the landscape.

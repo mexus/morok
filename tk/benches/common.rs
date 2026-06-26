@@ -1,9 +1,9 @@
-//! Shared harness for svod-tk's per-kernel criterion benches (`fa`, `matmul`, `knn` —
-//! one bench binary each). They bench svod-tk's kernels through their public `Tensor`
-//! interface, timed the way the model runs them (`prepare()` → `execute_profiled`): GPU
-//! device time comes from `execute_profiled`'s per-kernel HW stamps (the criterion
-//! `iter_custom` source), so outlier rejection / CIs operate on real on-device time, not
-//! host wall-clock.
+//! Shared harness for svod-tk's per-kernel criterion benches (`fa`, `matmul`, `knn`,
+//! `kmeans` — one bench binary each). They bench svod-tk's kernels through their public
+//! `Tensor` interface, timed the way the model runs them (`prepare()` →
+//! `plan.profile(...)`): GPU device time comes from `plan.profile`'s per-kernel HW stamps
+//! (it wraps the per-kernel device-time path; the criterion `iter_custom` source), so
+//! outlier rejection / CIs operate on real on-device time, not host wall-clock.
 //!
 //! Run one kernel: `SVOD_DEVICE=AMD:0 cargo bench -p svod-tk --bench knn`
 //! GPU benches self-skip (record no samples) when no supported AMD GPU is present.

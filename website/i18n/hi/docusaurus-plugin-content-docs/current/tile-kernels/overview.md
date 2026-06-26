@@ -48,7 +48,7 @@ matrix-core ops। यानी बिल्कुल वही intermediate rep
 
 | चेहरा | आप हैं… | आप किससे काम लेते हैं |
 |------|----------|----------------|
-| **USE** | एक application author जिसे बस एक तेज़ कर्नेल चाहिए | `matmul`, `flash_attention`, `flash_attention_with` — ये lazy `Tensor` लौटाते हैं, कर्नेल की कोई जानकारी ज़रूरी नहीं |
+| **USE** | एक application author जिसे बस एक तेज़ कर्नेल चाहिए | `matmul`, `flash_attention`, `flash_attention_with`, `kmeans_assign` — ये lazy `Tensor` लौटाते हैं, कर्नेल की कोई जानकारी ज़रूरी नहीं |
 | **AUTHOR** | एक नया tile कर्नेल लिख रहे | `Kernel` / `Group` builder, `ArchCaps`, tile types (`GL`/`ST`/`RT`/`RV`), `Swizzle`, `graph_launch` |
 | **DEBUG** | किसी कर्नेल को isolation में test या benchmark कर रहे | `compile`, `launch`, `run_kernel`, `CompiledLaunch`, और structural `KernelFingerprint` |
 
@@ -77,7 +77,7 @@ graph के nodes — adds, muls, और reductions — तय हैं; ब�
 | कर्नेल का स्वभाव | किससे बनता है | उदाहरण |
 |------------------------|----------|----------|
 | **Fixed dataflow** — एक rectangular iteration space पर elementwise ops और reductions; बस *schedule* (tiling, vectorization, data placement, matrix-core mapping) खुला है | graph ops + **BEAM** | matmul / GEMM, feed-forward, layernorm, softmax |
-| **एक नए सिरे से गढ़ा गया algorithm चाहिए** — एक loop-carried recurrence, या ऐसे restructured numerics जिन्हें naive ops का कोई reschedule नहीं निकाल सकता | **`tk` में हाथ से authored** | Flash Attention (online softmax) |
+| **एक नए सिरे से गढ़ा गया algorithm चाहिए** — एक loop-carried recurrence, या ऐसे restructured numerics जिन्हें naive ops का कोई reschedule नहीं निकाल सकता | **`tk` में हाथ से authored** | Flash Attention (online softmax); brute-force k-means assignment (`kmeans_assign`) — streamed centroid tiles पर एक running argmin के साथ fuse किया गया एक cross-term WMMA, ताकि पूरी `[N, K]` distance matrix कभी बने ही नहीं |
 
 ### BEAM जहाँ नहीं पहुँच सकता
 
@@ -118,4 +118,6 @@ end to end ट्रेस करता है।
 5. **[Wave32 बनाम Wave64](./wave-portability)** — एक ही कर्नेल को दो AMD architectures पर correct रखना।
 6. **[Flash Attention](./flash-attention)** — वह worked example जिसने इस सबकी नींव रखी।
 7. **[डीबगिंग](./debugging)** — कर्नेल को हाथ से run और verify करना।
-8. **[tk बनाम HipKittens बनाम CuTile](./comparison)** — यह design इस पूरे landscape में कहाँ बैठता है।
+8. **[Profiling और Benchmarking](./profiling)** — किसी भी `Tensor` या `ExecutionPlan` के लिए, layered
+   profiler और criterion integration।
+9. **[tk बनाम HipKittens बनाम CuTile](./comparison)** — यह design इस पूरे landscape में कहाँ बैठता है।

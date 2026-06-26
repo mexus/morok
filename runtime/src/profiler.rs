@@ -1,7 +1,36 @@
-//! Per-kernel execution profiling.
+//! Layered per-kernel execution profiling.
 //!
-//! Provides structured timing data for kernel execution via
-//! [`ExecutionPlan::execute_profiled()`](crate::ExecutionPlan::execute_profiled).
+//! Profiling is organized into four tiers, each adding more detail on top of the
+//! one below; the per-item docs in this file refer to these tiers by number:
+//!
+//! - **Tier 1 — device time.** Per-kernel on-device execution time, taken from
+//!   the GPU clock stamps the backend records around each dispatch
+//!   ([`KernelProfile::gpu_or_wall`]). This is the baseline every profile carries.
+//! - **Tier 2 — roofline.** Derived throughput: GFLOP/s and GB/s, computed from
+//!   the Tier-1 device time and the static work estimates in
+//!   [`KernelStaticInfo`].
+//! - **Tier 3 — static occupancy.** VGPR/SGPR/LDS/scratch usage and the
+//!   VGPR-limited occupancy, decoded from the compiled kernel descriptor without
+//!   running anything ([`KernelResources`]).
+//! - **Tier 4 — hardware counters.** AMD SQ performance counters (busy cycles,
+//!   waves launched, VALU instructions issued) collected via PM4 perf-counter
+//!   programming. This needs a stable GPU power state; when that is unavailable
+//!   the run degrades to timing-only (Tiers 1–3).
+//!
+//! **Accumulate-and-min policy.** Repeated runs of the same plan are merged per
+//! kernel by keeping the minimum device time ([`RunProfile::merge_min`]), which
+//! is robust to outliers. The same policy backs both the
+//! [`ExecutionPlan::profile`](crate::ExecutionPlan::profile) `iters` loop and the
+//! Criterion `--profile-time` accumulator.
+//!
+//! **Entry points.** Profile a prepared plan with
+//! [`ExecutionPlan::profile`](crate::ExecutionPlan::profile) or a tensor directly
+//! with `Tensor::profile` (which wraps it). Behavior is configured
+//! through [`ProfileOptions`] (and [`ProfileOptions::from_env`], reading
+//! `SVOD_PMC` and `SVOD_PROFILE_ITERS`). The underlying per-kernel timing path is
+//! [`ExecutionPlan::execute_profiled`](crate::ExecutionPlan::execute_profiled).
+//! The library never prints; callers render a finished [`RunProfile`] with
+//! [`RunProfile::render_table`].
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -95,7 +124,8 @@ pub enum PmcSelection {
     /// No hardware counters (Tiers 1–3 only).
     #[default]
     None,
-    /// A small default set: VALU/SQ busy cycles and L2 hit/miss.
+    /// The default set, [`PmcCounter::all`]: SQ busy cycles, waves launched, and
+    /// VALU instructions issued.
     Default,
     /// An explicit counter list.
     Custom(Vec<PmcCounter>),

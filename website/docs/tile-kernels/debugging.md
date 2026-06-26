@@ -49,8 +49,11 @@ let ns = launch.dispatch_gpu_ns();   // device-measured dispatch time
 
 `dispatch_gpu_ns()` reads the GPU's own timestamp counters around the dispatch, so you're
 measuring time on the device, not the round-trip latency of launching it. This is what the
-criterion benches in `tk/benches/kernels.rs` use to compare a `tk` kernel against the
-graph-native baseline.
+criterion benches use to compare a `tk` kernel against the graph-native baseline. Those same
+benches do more under `cargo bench --profile-time`: each benchmarked plan is fed through the full
+layered profiler — device time, roofline, occupancy, and hardware counters — accumulated by
+per-kernel minimum and written to a table. See [Profiling & Benchmarking](./profiling) for the
+tiers, the env vars, and the criterion wiring.
 
 :::tip For GPU experts
 `KernelFingerprint` is a *structural* hash of the `SINK`'s UOp graph — it captures the shape (ops, dtypes, edges) independent of instance IDs, so it is stable across runs and processes. That is what makes it a golden-test key: a behavior-preserving refactor reproduces the fingerprint, while any change to the emitted IR moves it. `dispatch_gpu_ns` reads the device's own timestamp counters around the dispatch, so it measures on-device time, not launch latency.

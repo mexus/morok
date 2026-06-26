@@ -58,6 +58,7 @@ const sidebars: SidebarsConfig = {
         'tile-kernels/wave-portability',
         'tile-kernels/flash-attention',
         'tile-kernels/debugging',
+        'tile-kernels/profiling',
         'tile-kernels/comparison',
       ],
     },

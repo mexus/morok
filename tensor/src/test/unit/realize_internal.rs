@@ -3,8 +3,8 @@ use smallvec::SmallVec;
 
 #[test]
 fn test_profile_populates_static_info_and_realizes() {
-    let a = Tensor::from_slice(&[1.0f32, 2.0, 3.0, 4.0]);
-    let b = Tensor::from_slice(&[5.0f32, 6.0, 7.0, 8.0]);
+    let a = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0]);
+    let b = Tensor::from_slice([5.0f32, 6.0, 7.0, 8.0]);
     let mut c = &a + &b;
 
     let report = c.profile(&ProfileOptions::default()).expect("profile");

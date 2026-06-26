@@ -1,5 +1,5 @@
-//! Flash-attention forward — a port of tinygrad `test_tk.py::test_fa`'s forward
-//! kernel (the online-softmax attention, *not* `fa.py`'s jit/backward).
+//! Flash-attention forward — a hand-authored forward kernel using online softmax
+//! and a double-buffered K/V stream (forward only; no backward pass).
 //!
 //! One workgroup (single wave64 warp) owns one `(head, q_block, batch)` triple:
 //! it loads its Q tile into registers, then streams the K/V blocks, computing
