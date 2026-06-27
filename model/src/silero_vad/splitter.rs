@@ -29,6 +29,10 @@ impl SileroVadSplitter {
         threshold: f32,
         #[builder(default = 15.0)] min_duration: f32,
         #[builder(default = 22.0)] max_duration: f32,
+        /// Soft target chunk duration (seconds). Off by default for Silero
+        /// (greedy fill-to-max); pass `Some(secs)` to enable the target-split.
+        /// See the FireRed splitter for the rationale.
+        target_duration: Option<f32>,
         #[builder(default = 30.0)] strict_limit_duration: f32,
         #[builder(default = 8)] min_speech_probs: usize,
         #[builder(default = 4)] min_silence_probs: usize,
@@ -54,6 +58,7 @@ impl SileroVadSplitter {
                 threshold,
                 min_duration,
                 max_duration,
+                target_duration,
                 strict_limit_duration,
                 min_speech_probs,
                 min_silence_probs,

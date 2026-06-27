@@ -66,6 +66,7 @@ impl EncoderBounds {
             // validator fires when capacity < the target min duration.
             min_duration: k.min_duration.min(cap),
             max_duration: k.max_duration.min(cap),
+            target_duration: k.target_duration.map(|t| t.min(cap)),
             strict_limit_duration: k.strict_limit_duration.min(cap),
             min_speech_probs: k.min_speech_probs,
             min_silence_probs: k.min_silence_probs,
@@ -86,6 +87,8 @@ pub(crate) struct ChunkerKnobs {
     pub threshold: f32,
     pub min_duration: f32,
     pub max_duration: f32,
+    /// Soft target chunk duration (seconds); `None` keeps the greedy fill-to-max.
+    pub target_duration: Option<f32>,
     pub strict_limit_duration: f32,
     pub min_speech_probs: usize,
     pub min_silence_probs: usize,

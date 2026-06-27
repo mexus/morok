@@ -12,6 +12,7 @@ fn fast_opts() -> ChunkerOpts {
         threshold: 0.5,
         min_duration: 5.0,
         max_duration: 10.0,
+        target_duration: None,
         strict_limit_duration: 15.0,
         min_speech_probs: 1,
         min_silence_probs: 2,
@@ -118,6 +119,50 @@ fn test_chunker_all_speech_no_breaks() {
 }
 
 #[test]
+fn test_chunker_target_duration_shrinks_chunks() {
+    // 50-prob unbroken speech. Without a target the chunker fills toward max
+    // (~12-13 cores); a soft target re-splits toward ~target, giving more,
+    // shorter cores (the autoregressive-decoder deletion fix). Cores still tile
+    // the whole signal.
+    let probs = vec![1.0f32; 50];
+    let base = chunks_from_probs(&probs, &fast_opts()).unwrap();
+    let tuned = chunks_from_probs(&probs, &ChunkerOpts { target_duration: Some(5.0), ..fast_opts() }).unwrap();
+
+    let max_core = |cs: &[AudioChunk]| cs.iter().map(AudioChunk::core_len).max().unwrap();
+    assert!(max_core(&base) > 10, "baseline fills past 10: {}", max_core(&base));
+    assert!(tuned.len() > base.len(), "target yields more chunks: {} vs {}", tuned.len(), base.len());
+    assert!(
+        tuned.iter().all(|c| c.core_len() <= 10),
+        "every target core within ~1.5*target: {:?}",
+        tuned.iter().map(AudioChunk::core_len).collect::<Vec<_>>()
+    );
+    assert_eq!(tuned.first().unwrap().start_sample, 0);
+    assert_eq!(tuned.last().unwrap().end_sample, 50);
+}
+
+#[test]
+fn test_chunker_target_at_or_above_max_is_greedy() {
+    // A target >= max_duration engages nothing — identical to the greedy default.
+    let probs = cat(&[speech(8), silence(3), speech(12), silence(3), speech(20)]);
+    let key = |cs: &[AudioChunk]| {
+        cs.iter()
+            .map(|c| (c.start_sample, c.end_sample, c.decode_start_sample, c.decode_end_sample))
+            .collect::<Vec<_>>()
+    };
+    let greedy = chunks_from_probs(&probs, &fast_opts()).unwrap();
+    let big = chunks_from_probs(&probs, &ChunkerOpts { target_duration: Some(100.0), ..fast_opts() }).unwrap();
+    assert_eq!(key(&greedy), key(&big), "target >= max should clamp to the greedy path");
+}
+
+#[test]
+fn test_chunker_validates_non_positive_target() {
+    let zero = ChunkerOpts { target_duration: Some(0.0), ..fast_opts() };
+    assert!(matches!(chunks_from_probs(&speech(10), &zero), Err(Error::TargetNonPositive { .. })));
+    let neg = ChunkerOpts { target_duration: Some(-1.0), ..fast_opts() };
+    assert!(matches!(chunks_from_probs(&speech(10), &neg), Err(Error::TargetNonPositive { .. })));
+}
+
+#[test]
 fn test_chunker_pad_extends_decode_window_not_core() {
     // Run [10, 20], pad=5. The core stays the speech run; only the decode
     // window grows by the pad (cropped back to the core downstream).
@@ -185,6 +230,7 @@ fn test_chunker_align_to_640() {
         threshold: 0.5,
         min_duration: 0.0,
         max_duration: 1.0,
+        target_duration: None,
         strict_limit_duration: 1.0,
         min_speech_probs: 1,
         min_silence_probs: 2,
@@ -220,6 +266,7 @@ fn test_chunker_decode_end_can_exceed_waveform_len() {
         threshold: 0.5,
         min_duration: 0.0,
         max_duration: 1.0,
+        target_duration: None,
         strict_limit_duration: 1.0,
         min_speech_probs: 1,
         min_silence_probs: 1,
@@ -247,6 +294,7 @@ fn test_chunker_max_total_samples_clamps_core_and_decode() {
         threshold: 0.5,
         min_duration: 0.0,
         max_duration: 1.0,
+        target_duration: None,
         strict_limit_duration: 1.0,
         min_speech_probs: 1,
         min_silence_probs: 1,
@@ -346,6 +394,7 @@ proptest! {
             threshold,
             min_duration: min_dur,
             max_duration: max_dur,
+            target_duration: None,
             strict_limit_duration: strict_dur,
             min_speech_probs: min_speech,
             min_silence_probs: min_silence,
@@ -420,6 +469,7 @@ proptest! {
             threshold,
             min_duration: min_dur,
             max_duration: max_dur,
+            target_duration: None,
             strict_limit_duration: strict_dur,
             min_speech_probs: min_speech,
             min_silence_probs: min_silence,
@@ -457,6 +507,62 @@ proptest! {
     }
 
     #[test]
+    fn prop_chunker_target_caps_chunk_length(
+        probs in prop::collection::vec(0.0f32..=1.0f32, 0..400),
+        sample_rate in prop::sample::select(vec![8_000u32, 16_000, 48_000]),
+        samples_per_prob in prop::sample::select(vec![128usize, 512, 1024]),
+        threshold in 0.2f32..0.8,
+        min_dur in 0.1f32..=2.0,
+        max_extra in 0.5f32..=5.0,
+        strict_extra in 0.0f32..=10.0,
+        target_frac in 0.2f32..=0.8,
+        min_speech in 1usize..=8,
+        min_silence in 1usize..=8,
+        merge_gap in 0usize..=8,
+        pad_samples in 0usize..=4096,
+        align_to in prop::sample::select(vec![1usize, 64, 256, 640, 1024]),
+    ) {
+        // A soft target re-splits via split_long_runs at split_cap = 1.5·target
+        // (capped at max), so every chunk obeys the *target* bound — tighter than
+        // the strict-limit one.
+        let max_dur = min_dur + max_extra;
+        let strict_dur = max_dur + strict_extra;
+        let target = max_dur * target_frac; // 0 < target < max
+        let opts = ChunkerOpts {
+            sample_rate,
+            samples_per_prob,
+            threshold,
+            min_duration: min_dur,
+            max_duration: max_dur,
+            target_duration: Some(target),
+            strict_limit_duration: strict_dur,
+            min_speech_probs: min_speech,
+            min_silence_probs: min_silence,
+            merge_gap_probs: merge_gap,
+            trough_search_probs: None,
+            trough_threshold: None,
+            pad_samples,
+            preroll_samples: 0,
+            align_to,
+            max_total_samples: None,
+        };
+        let chunks = chunks_from_probs(&probs, &opts).unwrap();
+        let probs_per_sec = sample_rate as f32 / samples_per_prob as f32;
+        let target_probs = (target * probs_per_sec).ceil() as usize;
+        let max_probs = (max_dur * probs_per_sec).ceil() as usize;
+        let split_cap = (target_probs + target_probs / 2).min(max_probs);
+        let radius = min_silence;
+        let bound = crate::vad::strict_chunk_sample_bound(split_cap, radius, samples_per_prob, pad_samples, align_to);
+        for c in &chunks {
+            prop_assert!(
+                c.decode_len() <= bound,
+                "chunk {c:?} decode_len {} exceeds target split bound {bound} (split_cap={split_cap})",
+                c.decode_len()
+            );
+        }
+    }
+
+    #[test]
     fn prop_chunker_unsmoothed_coverage(
         probs in prop::collection::vec(0.0f32..=1.0f32, 1..400),
         threshold in 0.3f32..=0.7,
@@ -472,6 +578,7 @@ proptest! {
             threshold,
             min_duration: 0.05,
             max_duration: 0.5,
+            target_duration: None,
             strict_limit_duration: 0.5,
             min_speech_probs: 1,
             min_silence_probs: 1,
@@ -532,6 +639,7 @@ fn test_chunker_split_long_runs_respects_min_piece_floor() {
         threshold: 0.5,
         min_duration: 1.0,
         max_duration: 10.0,
+        target_duration: None,
         strict_limit_duration: 10.0,
         min_speech_probs: 1,
         min_silence_probs: 100, // suppress smoothing-driven termination
@@ -564,6 +672,7 @@ fn test_chunker_decoupled_trough_search_radius() {
         threshold: 0.5,
         min_duration: 1.0,
         max_duration: 10.0,
+        target_duration: None,
         strict_limit_duration: 15.0,
         min_speech_probs: 1,
         min_silence_probs: 2,

@@ -34,8 +34,8 @@
 pub(crate) mod segment;
 
 #[cfg(feature = "serde")]
-use serde::Deserialize;
-use snafu::Snafu;
+use serde::{Deserialize, Serialize};
+use snafu::{Snafu, ensure};
 
 use segment::threshold_segments;
 
@@ -46,7 +46,7 @@ use segment::threshold_segments;
 /// All `*_duration` fields are wall-clock seconds; the chunker converts to
 /// prob-grid indices via `(sample_rate, samples_per_prob)`.
 #[derive(Clone, Debug)]
-#[cfg_attr(feature = "serde", derive(Deserialize))]
+#[cfg_attr(feature = "serde", derive(Deserialize, Serialize))]
 #[cfg_attr(feature = "serde", serde(default))]
 pub struct ChunkerOpts {
     /// Sample rate of the source waveform in Hz.
@@ -64,6 +64,19 @@ pub struct ChunkerOpts {
     /// at the next inter-segment silence (or, for a single long run, at a
     /// local prob trough) instead of extending past max.
     pub max_duration: f32,
+    /// Soft target chunk duration (seconds) for deletion-sensitive autoregressive
+    /// decoders (RN-T). When `Some(t)`, pack chunks toward `t` and re-split any
+    /// still exceeding `1.5·t` at the nearest silence (via `split_long_runs`), so
+    /// chunks cluster near `t` — short, locally-coherent contexts — instead of
+    /// greedily filling to `max_duration`. `None` (default) keeps the
+    /// fill-to-max behaviour. A good start is ~0.3·`max_duration`.
+    ///
+    /// Precedence with the other duration knobs: `t` supersedes `min_duration`
+    /// for packing — the effective pack floor is `min(min_duration, t)` — so a
+    /// target below `min_duration` legitimately yields shorter chunks. A target
+    /// `>= max_duration` is a no-op (it clamps to the greedy fill-to-max path).
+    /// Must be `> 0` when set (enforced by `validate`).
+    pub target_duration: Option<f32>,
     /// Hard ceiling. A single VAD segment longer than this is split
     /// internally at prob-trough argmins so no output chunk exceeds it.
     /// Also caps chunk length when an under-min chunk would otherwise
@@ -125,6 +138,7 @@ impl Default for ChunkerOpts {
             threshold: 0.5,
             min_duration: 15.0,
             max_duration: 22.0,
+            target_duration: None,
             strict_limit_duration: 30.0,
             min_speech_probs: 8,
             min_silence_probs: 4,
@@ -199,6 +213,8 @@ pub enum Error {
     MinExceedsMax { min: f32, max: f32 },
     #[snafu(display("max_duration ({max}) must be ≤ strict_limit_duration ({strict})"))]
     MaxExceedsStrict { max: f32, strict: f32 },
+    #[snafu(display("target_duration ({target}) must be > 0 when set"))]
+    TargetNonPositive { target: f32 },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -258,7 +274,29 @@ pub fn chunks_from_probs(probs: &[f32], opts: &ChunkerOpts) -> Result<Vec<AudioC
         adapted.merge_gap_probs = (adapted.merge_gap_probs / 2).max(1);
     };
     let segments = split_long_runs(segments, probs, trough_radius, trough_threshold, strict_limit_probs);
-    let chunks = pack_segments(&segments, min_probs, max_probs, strict_limit_probs);
+
+    // With a soft `target_duration`, pack chunks toward the target then re-split
+    // any still exceeding 1.5·target at the silence nearest their midpoint
+    // (reusing `split_long_runs` with narrow argmin — bound-safe since the cap
+    // stays below `max ≤ strict`). Short, silence-aligned contexts stop an
+    // autoregressive RN-T decoder from "skipping" (deleting) earlier tokens on
+    // long chunks. `None` keeps the greedy fill-to-max behaviour.
+    // Engage only for a real soft target below max; `>= max` clamps to nothing,
+    // so it stays the greedy default.
+    let target_probs =
+        opts.target_duration.map(|d| (d * probs_per_sec).ceil() as usize).filter(|&t| t > 0 && t < max_probs);
+    let chunks = match target_probs {
+        Some(t) => {
+            // Pack toward `t`, cap the re-split at 1.5·t (never above max). The
+            // pack floor is min(min_duration, t): a target below min_duration
+            // lowers the floor so chunks can actually reach the smaller target.
+            let pack_cap = t.min(max_probs);
+            let split_cap = (t + t / 2).min(max_probs);
+            let packed = pack_segments(&segments, min_probs.min(pack_cap), pack_cap, strict_limit_probs);
+            split_long_runs(packed, probs, trough_radius, None, split_cap)
+        }
+        None => pack_segments(&segments, min_probs, max_probs, strict_limit_probs),
+    };
 
     Ok(post_process(&chunks, probs.len(), opts))
 }
@@ -266,17 +304,20 @@ pub fn chunks_from_probs(probs: &[f32], opts: &ChunkerOpts) -> Result<Vec<AudioC
 // ─── Internals ────────────────────────────────────────────────────────────
 
 fn validate(opts: &ChunkerOpts) -> Result<()> {
-    if opts.samples_per_prob == 0 {
-        return ZeroSamplesPerProbSnafu.fail();
-    }
-    if opts.align_to == 0 {
-        return ZeroAlignToSnafu.fail();
-    }
-    if opts.min_duration > opts.max_duration {
-        return MinExceedsMaxSnafu { min: opts.min_duration, max: opts.max_duration }.fail();
-    }
-    if opts.max_duration > opts.strict_limit_duration {
-        return MaxExceedsStrictSnafu { max: opts.max_duration, strict: opts.strict_limit_duration }.fail();
+    ensure!(opts.samples_per_prob != 0, ZeroSamplesPerProbSnafu);
+    ensure!(opts.align_to != 0, ZeroAlignToSnafu);
+    ensure!(
+        opts.min_duration <= opts.max_duration,
+        MinExceedsMaxSnafu { min: opts.min_duration, max: opts.max_duration }
+    );
+    ensure!(
+        opts.max_duration <= opts.strict_limit_duration,
+        MaxExceedsStrictSnafu { max: opts.max_duration, strict: opts.strict_limit_duration }
+    );
+    // A target >= max is a no-op (clamped in chunks_from_probs), but a
+    // non-positive target is a config error rather than a silent no-op.
+    if let Some(t) = opts.target_duration {
+        ensure!(t > 0.0, TargetNonPositiveSnafu { target: t });
     }
     Ok(())
 }

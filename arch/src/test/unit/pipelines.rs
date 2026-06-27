@@ -56,6 +56,7 @@ fn fast_chunker_opts() -> ChunkerOpts {
         threshold: 0.5,
         min_duration: 1.0,
         max_duration: 10.0,
+        target_duration: None,
         strict_limit_duration: 15.0,
         min_speech_probs: 1,
         min_silence_probs: 1,

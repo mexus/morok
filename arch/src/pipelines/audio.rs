@@ -188,13 +188,27 @@ impl<V: Vad> Splitter for VadSplitter<V> {
 
     /// Upper bound (in samples) on the longest chunk under the baked
     /// [`ChunkerOpts`] — the same math the chunker uses internally (see
-    /// [`strict_chunk_sample_bound`]).
+    /// [`strict_chunk_sample_bound`]). When a soft `target_duration` engages,
+    /// chunks are re-split at `1.5·target` (≤ max), so the ceiling is that, not
+    /// `strict_limit` — letting the transcriber size to the real chunk length
+    /// instead of padding every small target chunk up to `strict_limit` (which
+    /// otherwise inflates RTF on long audio).
     fn max_chunk_samples(&self) -> usize {
         let o = &self.opts;
         let probs_per_sec = o.sample_rate as f32 / o.samples_per_prob.max(1) as f32;
         let strict_limit_probs = (o.strict_limit_duration * probs_per_sec).ceil() as usize;
+        let max_probs = (o.max_duration * probs_per_sec).ceil() as usize;
+        // Mirror chunks_from_probs's split_cap exactly: a target engages when
+        // 0 < target_probs < max_probs, and re-splits at (1.5·target).min(max),
+        // so the bound matches the real ceiling (never under-sizes the JIT).
+        let cap_probs = o
+            .target_duration
+            .map(|d| (d * probs_per_sec).ceil() as usize)
+            .filter(|&t| t > 0 && t < max_probs)
+            .map(|t| (t + t / 2).min(max_probs))
+            .unwrap_or(strict_limit_probs);
         let radius = o.trough_search_probs.unwrap_or(o.min_silence_probs);
-        strict_chunk_sample_bound(strict_limit_probs, radius, o.samples_per_prob, o.pad_samples, o.align_to)
+        strict_chunk_sample_bound(cap_probs, radius, o.samples_per_prob, o.pad_samples, o.align_to)
     }
 
     fn profile_label(&self) -> &'static str {
