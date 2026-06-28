@@ -100,6 +100,46 @@ pub fn all_decomposition_patterns() -> TypedPatternMatcher<()> {
     }
 }
 
+/// f32 → bf16 round-to-nearest-even done in the integer domain, emitting no
+/// `fptrunc`. amdgcn (LLVM 18) cannot select the vectorized bf16 truncstore that
+/// `-O3` forms by fusing `fptrunc float to bfloat` + `store bfloat`; routing the
+/// bits through integers and a final `bitcast i16 → bfloat` keeps `fptrunc` away
+/// from the store. Port of Tinygrad's `cast_float_to_bf16` (`renderer/cstyle.py`),
+/// bit-exact with the native conversion and vector-count-preserving.
+fn cast_float_to_bf16(x: &Arc<UOp>) -> Arc<UOp> {
+    use crate::DType;
+    use svod_dtype::ScalarDType;
+
+    let n = x.dtype().vcount();
+    let vec = |s: ScalarDType| DType::Scalar(s).vec(n).expect("scalar dtype is vectorizable");
+
+    // The XLA/Tinygrad round-half-to-even encoding. The two branches don't split
+    // cleanly along finite/NaN lines (most NaN and Inf take the `rnd` branch); the
+    // whole expression is opaque on purpose and is verified bit-exact, so the
+    // bindings below are named after their arithmetic, not a semantic gloss.
+    let u = x.bitcast(vec(ScalarDType::UInt32));
+    // rnd = u + ((u >> 16) & 1) + 0x7fff.
+    let lsb = u.try_shr_op(&u.const_like(16)).and_then(|s| s.try_and_op(&u.const_like(1))).expect("bf16: rne lsb");
+    let rnd = u.try_add(&lsb).and_then(|r| r.try_add(&u.const_like(0x7fff))).expect("bf16: rne bias");
+    // alt = (u & 0xffff) != 0 ? (u | 0x10000) : u.
+    let low_nz =
+        u.try_and_op(&u.const_like(0xffff)).and_then(|lo| lo.try_cmpne(&u.const_like(0))).expect("bf16: low16 != 0");
+    let or_bit = u.try_or_op(&u.const_like(0x10000)).expect("bf16: or 0x10000");
+    let alt = UOp::try_where(low_nz, or_bit, u.clone()).expect("bf16: alt select");
+    // bits = ((0 - u) & 0x7f800000) != 0 ? rnd : alt.
+    let exp_nz = u
+        .neg()
+        .try_and_op(&u.const_like(0x7f80_0000))
+        .and_then(|e| e.try_cmpne(&u.const_like(0)))
+        .expect("bf16: exponent test");
+    let bits = UOp::try_where(exp_nz, rnd, alt).expect("bf16: rnd/alt select");
+    // High 16 bits are the bf16 payload: truncate to u16, reinterpret as bf16.
+    bits.try_shr_op(&bits.const_like(16))
+        .expect("bf16: extract high half")
+        .cast(vec(ScalarDType::UInt16))
+        .bitcast(vec(ScalarDType::BFloat16))
+}
+
 /// Decomposition patterns for the AMD backend.
 ///
 /// AMD's hardware `v_exp_f32`/`v_log_f32` (emitted as `@llvm.exp2`/`@llvm.log2`)
@@ -147,6 +187,14 @@ pub fn amd_decomposition_patterns() -> TypedPatternMatcher<()> {
         Tan(src)  ~> |src| xtan(&src.cast(DType::Float32)).cast(src.dtype()),
         Erf(src)  ~> |src| xerf(&src.cast(DType::Float32)).cast(src.dtype()),
         Pow(base, exp) ~> |base, exp| xpow(&base.cast(DType::Float32), &exp.cast(DType::Float32)).cast(base.dtype()),
+
+        // f32 → bf16: integer round (see `cast_float_to_bf16`) instead of the
+        // `fptrunc` whose vectorized truncstore amdgcn can't select. The result
+        // is a BitCast, never a matching Cast, so the rewrite can't recurse.
+        node @ Cast { src, .. }
+            if node.dtype().base() == svod_dtype::ScalarDType::BFloat16
+                && src.dtype().base() == svod_dtype::ScalarDType::Float32
+            ~> cast_float_to_bf16(src),
     }
 }
 
