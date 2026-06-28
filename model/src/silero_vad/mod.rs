@@ -301,6 +301,19 @@ pub struct VadInference {
     head: VadHead,
 }
 
+impl svod_arch::pipelines::audio::Vad for VadInference {
+    type Error = crate::jit::JitError;
+
+    fn samples_per_prob(&self) -> usize {
+        NUM_SAMPLES
+    }
+
+    fn probs(&mut self, waveform: &[f32]) -> std::result::Result<Vec<f32>, Self::Error> {
+        // Inherent `probs` — the conv front-end + head over the whole waveform.
+        VadInference::probs(self, waveform)
+    }
+}
+
 impl VadInference {
     pub fn new(vad: SileroVad) -> crate::jit::Result<Self> {
         use crate::jit::{InputSpec, TensorSnafu};

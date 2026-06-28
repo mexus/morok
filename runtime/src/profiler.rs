@@ -347,6 +347,29 @@ impl RunProfile {
         }
         out
     }
+
+    /// Fold another profile in, accumulating stages by name: matching stages
+    /// sum their wall, concatenate kernels (so the histogram aggregates across
+    /// runs), and merge metadata; new stage names are appended in order. Used
+    /// to combine per-window profiles when transcribing a batch one window at
+    /// a time.
+    ///
+    /// Same-named stages SUM their `wall`. A model that pre-accumulates a
+    /// stage's `wall` to a whole-run total (rather than this window's slice)
+    /// must therefore emit one profile for the run and not also rely on this
+    /// per-window merge, or the total double-counts.
+    pub fn merge(&mut self, other: RunProfile) {
+        for stage in other.stages {
+            match self.stages.iter_mut().find(|s| s.name == stage.name) {
+                Some(existing) => {
+                    existing.wall += stage.wall;
+                    existing.kernels.extend(stage.kernels);
+                    existing.meta.extend(stage.meta);
+                }
+                None => self.stages.push(stage),
+            }
+        }
+    }
 }
 
 /// One aggregated table row (kernels grouped by entry point).

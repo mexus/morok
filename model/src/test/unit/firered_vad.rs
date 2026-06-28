@@ -13,7 +13,9 @@ use std::path::{Path, PathBuf};
 use svod_dtype::DType;
 use svod_tensor::Tensor;
 
-use crate::audio::{EncoderBounds, Splitter};
+use svod_arch::pipelines::audio::Splitter;
+
+use crate::audio::EncoderBounds;
 use crate::firered_vad::{
     CORE, FRAME_LENGTH, FRAME_SHIFT, FireRedFbank, FireRedVad, FireRedVadInference, FireRedVadSplitter, N_MELS,
     smooth_trailing,
@@ -243,9 +245,16 @@ fn splitter_detects_speech_on_golden_audio() {
     let golden = crate::state::load_safetensors(&real_file("golden.safetensors")).expect("golden");
     let samples = load_golden_vec(&golden, "samples");
 
-    let mut splitter = FireRedVadSplitter::from_safetensors(&real_file("firered_vad.safetensors")).expect("splitter");
-    let bounds = EncoderBounds { sample_rate: 16_000, hop_length: 160, subsampling_factor: 4, max_mel_frames: 3000 };
-    let chunks = splitter.split(&samples, &bounds).expect("split");
+    let bounds = EncoderBounds {
+        sample_rate: 16_000,
+        hop_length: 160,
+        subsampling_factor: 4,
+        max_mel_frames: 3000,
+        recommended_target_secs: None,
+    };
+    let mut splitter =
+        FireRedVadSplitter::from_safetensors(&real_file("firered_vad.safetensors"), &bounds).expect("splitter");
+    let chunks = splitter.split(&samples).expect("split");
 
     assert!(!chunks.is_empty(), "no speech detected in a known-speech sample");
     for c in &chunks {

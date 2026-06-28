@@ -19,7 +19,8 @@ use std::time::Instant;
 
 use clap::Parser;
 
-use svod_model::audio::{AudioChunk, EncoderBounds, Splitter};
+use svod_arch::pipelines::audio::Splitter;
+use svod_model::audio::{AudioChunk, EncoderBounds};
 use svod_model::firered_vad::FireRedVadSplitter;
 use svod_model::silero_vad::SileroVadSplitter;
 
@@ -52,19 +53,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     // GigaAM-like encoder bounds (10 ms hop, 4x subsampling, ~30 s capacity) —
     // the same shape Transcriber would hand the splitter.
-    let bounds = EncoderBounds { sample_rate, hop_length: 160, subsampling_factor: 4, max_mel_frames: 3000 };
+    let bounds = EncoderBounds {
+        sample_rate,
+        hop_length: 160,
+        subsampling_factor: 4,
+        max_mel_frames: 3000,
+        recommended_target_secs: None,
+    };
 
     if !args.skip_silero {
         println!("\n=== Silero VAD ===");
         let t_init = Instant::now();
-        let splitter = SileroVadSplitter::from_hub()?;
-        bench("silero", splitter, t_init, &waveform, &bounds, duration_s, args.runs)?;
+        let splitter = SileroVadSplitter::from_hub(&bounds)?;
+        bench("silero", splitter, t_init, &waveform, duration_s, args.runs)?;
     }
     if !args.skip_firered {
         println!("\n=== FireRedVAD ===");
         let t_init = Instant::now();
-        let splitter = FireRedVadSplitter::from_hub()?;
-        bench("firered", splitter, t_init, &waveform, &bounds, duration_s, args.runs)?;
+        let splitter = FireRedVadSplitter::from_hub(&bounds)?;
+        bench("firered", splitter, t_init, &waveform, duration_s, args.runs)?;
     }
     Ok(())
 }
@@ -74,20 +81,19 @@ fn bench<S: Splitter>(
     mut splitter: S,
     t_init: Instant,
     waveform: &[f32],
-    bounds: &EncoderBounds,
     duration_s: f32,
     runs: usize,
 ) -> Result<(), S::Error> {
     println!("init (hub load + JIT prepare): {:.2}s", t_init.elapsed().as_secs_f32());
 
     let t_warmup = Instant::now();
-    let chunks = splitter.split(waveform, bounds)?;
+    let chunks = splitter.split(waveform)?;
     println!("warmup split: {:.1} ms", t_warmup.elapsed().as_secs_f64() * 1e3);
 
     let mut times_ms = Vec::with_capacity(runs);
     for _ in 0..runs {
         let t = Instant::now();
-        splitter.split(waveform, bounds)?;
+        splitter.split(waveform)?;
         times_ms.push(t.elapsed().as_secs_f64() * 1e3);
     }
     let min = times_ms.iter().cloned().fold(f64::INFINITY, f64::min);
@@ -98,7 +104,7 @@ fn bench<S: Splitter>(
     );
 
     println!("chunks ({}):", chunks.len());
-    for (i, AudioChunk { start_sample, end_sample }) in chunks.iter().enumerate() {
+    for (i, AudioChunk { start_sample, end_sample, .. }) in chunks.iter().enumerate() {
         let (s, e) = (*start_sample as f32 / 16_000.0, *end_sample as f32 / 16_000.0);
         println!("  {i}: {s:.2}s - {e:.2}s ({:.2}s)", e - s);
     }

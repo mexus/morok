@@ -1,13 +1,14 @@
-//! Audio preprocessing for ASR: mel features ([`mel`]) and chunking
-//! ([`splitter`]).
+//! Audio preprocessing for ASR: mel features ([`mel`]) and encoder sizing
+//! [`bounds`].
 //!
 //! Both submodules operate on raw `&[f32]` PCM, before any encoder JIT
-//! involvement. They're grouped here because they share the same domain
-//! (audio-level transforms over a waveform) and because the splitter +
-//! mel extractor sit back-to-back in the inference pipeline.
+//! involvement. Chunking itself lives in the arch
+//! [`pipelines`](svod_arch::pipelines::audio) layer; [`EncoderBounds`] is the
+//! model-config bridge a splitter consumes to derive its chunker config.
 
+pub(crate) mod bounds;
 pub(crate) mod mel;
-mod splitter;
 
+pub(crate) use bounds::ChunkerKnobs;
+pub use bounds::{AudioChunk, EncoderBounds};
 pub use mel::{MelConfig, MelSpectrogram};
-pub use splitter::{AudioChunk, EncoderBounds, FixedLengthSplitter, Splitter, trim_chunks_to_waveform};

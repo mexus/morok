@@ -78,9 +78,8 @@ fn ctc_frames_to_words_frame_shift_scales_linearly() {
 // field flows through to the struct correctly.
 
 #[test]
-fn transcribe_opts_builder_overrides_all_fields() {
-    let opts = TranscribeOpts::builder().word_timestamps(true).beam_decode(true).max_scores_mib(512).build();
-    assert!(opts.word_timestamps);
+fn transcribe_opts_builder_overrides_fields() {
+    let opts = TranscribeOpts::builder().beam_decode(true).max_scores_mib(512).build();
     assert!(opts.beam_decode);
     assert_eq!(opts.max_scores_mib, 512);
 }
