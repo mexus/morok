@@ -319,6 +319,16 @@ pub fn compile(device: &Device, sink: Arc<UOp>, buffers: &[Buffer]) -> Result<Co
     // carries (see `symbolic_no_dead_loop`).
     let sink = svod_schedule::graph_rewrite(svod_schedule::symbolic::symbolic_no_dead_loop(), sink, &mut ());
 
+    // Apply the backend's `Renderer::decompositor()` — the same pass `tensor::realize`
+    // runs from the optimizer, which this direct path skips. Without it a hand-built
+    // kernel misses backend-mandatory lowerings (AMD's integer f32→bf16 cast, the
+    // SLEEF transcendentals). Like Tinygrad, every kernel — custom or not — gets the
+    // renderer's decomposition matchers.
+    let sink = match device.renderer.decompositor() {
+        Some(matcher) => svod_ir::decompositions::decompose_with(&sink, &matcher),
+        None => sink,
+    };
+
     // PROGRAM(sink, device) → SOURCE → BINARY (render + compile, cached nowhere
     // here; repeated launches recompile — the JIT cache lives a layer up).
     let program = program_pipeline::program_from_sink(sink, device.device.clone());
