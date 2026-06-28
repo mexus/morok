@@ -17,41 +17,6 @@ use svod_arch::pipelines::audio::{Vad, VadSplitter};
 use crate::audio::{ChunkerKnobs, EncoderBounds};
 use crate::firered_vad::{DEFAULT_SMOOTH_WINDOW, FireRedVad, FireRedVadProbs};
 
-/// Tuned soft-target chunk duration (seconds) for the GigaAM RN-T pipeline,
-/// applied by [`ChunkProfile::Tuned`]. ~5.7 s is the joint WER+RTF optimum: short
-/// chunks cut the autoregressive decoder's skip-deletions (the largest long-form
-/// WER win on the Russian benchmark), and it keeps the encoder's `max_t_mel` in
-/// the 1024-frame power-of-two bucket — a longer target spills into 2048,
-/// ~doubling encoder cost. So `Tuned` beats `Greedy` on *both* axes here.
-const TUNED_TARGET_SECS: f32 = 5.7;
-
-/// Chunking profile for [`FireRedVadSplitter`].
-///
-/// On the GigaAM RN-T pipeline these are **not** a WER/RTF trade-off —
-/// [`Tuned`](ChunkProfile::Tuned) wins on both axes (see [`TUNED_TARGET_SECS`]);
-/// [`Greedy`](ChunkProfile::Greedy) is the legacy fill-to-max behavior, kept for
-/// parity and for decoders without autoregressive skip-deletion. For a custom
-/// target, set `target_duration` on the builder (or `SVOD_VAD_TARGET_CHUNK_SECS`),
-/// which overrides the profile.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum ChunkProfile {
-    /// Soft target-split at the tuned ~5.7 s (recommended; best WER and RTF).
-    #[default]
-    Tuned,
-    /// Greedy fill to `max_duration`; no soft target.
-    Greedy,
-}
-
-impl ChunkProfile {
-    /// The soft target (seconds) this profile applies, or `None` for greedy.
-    fn target_secs(self) -> Option<f32> {
-        match self {
-            ChunkProfile::Tuned => Some(TUNED_TARGET_SECS),
-            ChunkProfile::Greedy => None,
-        }
-    }
-}
-
 /// Builder namespace for a configured `VadSplitter<FireRedVadProbs>`.
 pub struct FireRedVadSplitter;
 
@@ -70,15 +35,11 @@ impl FireRedVadSplitter {
         threshold: f32,
         #[builder(default = 15.0)] min_duration: f32,
         #[builder(default = 22.0)] max_duration: f32,
-        /// Chunking profile (default [`ChunkProfile::Tuned`]) — soft target-split
-        /// vs. greedy fill-to-max. Overridden by `target_duration` or
-        /// `SVOD_VAD_TARGET_CHUNK_SECS` when set.
-        #[builder(default)]
-        profile: ChunkProfile,
-        /// Explicit soft target chunk duration (seconds), overriding `profile` and
-        /// the env var. `None` (default) defers to them. Chunks pack toward the
-        /// target and re-split at 1.5× it (the long-form deletion fix); a value
-        /// `>= max_duration` is a no-op (greedy).
+        /// Explicit soft target chunk duration (seconds), an override of the model
+        /// recommendation supplied via `bounds.recommended_target_secs`. `None`
+        /// (default) defers to `SVOD_VAD_TARGET_CHUNK_SECS` then that
+        /// recommendation. Chunks pack toward the target and re-split at 1.5× it
+        /// (the long-form deletion fix); a value `>= max_duration` is a no-op.
         target_duration: Option<f32>,
         #[builder(default = 30.0)] strict_limit_duration: f32,
         #[builder(default = 20)] min_speech_probs: usize,
@@ -99,11 +60,11 @@ impl FireRedVadSplitter {
         #[builder(default = std::env::var("SVOD_VAD_PREROLL_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(0.0))]
         preroll_secs: f32,
     ) -> VadSplitter<FireRedVadProbs> {
-        // Resolve the soft target: explicit override > SVOD_VAD_TARGET_CHUNK_SECS
-        // > the profile (Tuned → ~5.7 s, Greedy → None). `None` ⇒ greedy.
-        let target_duration = target_duration
-            .or_else(|| std::env::var("SVOD_VAD_TARGET_CHUNK_SECS").ok().and_then(|s| s.parse().ok()))
-            .or_else(|| profile.target_secs());
+        // Resolve the soft target: explicit override > SVOD_VAD_TARGET_CHUNK_SECS.
+        // `None` defers to the model recommendation, which `chunker_opts` ORs in
+        // from `bounds.recommended_target_secs`.
+        let target_duration =
+            target_duration.or_else(|| std::env::var("SVOD_VAD_TARGET_CHUNK_SECS").ok().and_then(|s| s.parse().ok()));
         let opts = bounds.chunker_opts(
             vad.samples_per_prob(),
             ChunkerKnobs {
@@ -124,34 +85,26 @@ impl FireRedVadSplitter {
     }
 
     /// Convenience: download the converted FireRedVAD weights from HF Hub,
-    /// prepare the JIT, and bake the splitter with the default
-    /// [`ChunkProfile::Tuned`] (env vars still apply).
+    /// prepare the JIT, and bake the splitter. The soft chunk target defaults to
+    /// `bounds.recommended_target_secs` (the model recommendation); env vars
+    /// still apply.
     pub fn from_hub(bounds: &EncoderBounds) -> Result<VadSplitter<FireRedVadProbs>, FireRedVadSplitterError> {
-        Self::from_hub_with_profile(bounds, ChunkProfile::default())
-    }
-
-    /// Like [`from_hub`](Self::from_hub) but selects the chunking [`ChunkProfile`].
-    pub fn from_hub_with_profile(
-        bounds: &EncoderBounds,
-        profile: ChunkProfile,
-    ) -> Result<VadSplitter<FireRedVadProbs>, FireRedVadSplitterError> {
-        Self::from_model(FireRedVad::from_hub().context(LoadSnafu)?, bounds, profile)
+        Self::from_model(FireRedVad::from_hub().context(LoadSnafu)?, bounds)
     }
 
     pub fn from_safetensors(
         path: &Path,
         bounds: &EncoderBounds,
     ) -> Result<VadSplitter<FireRedVadProbs>, FireRedVadSplitterError> {
-        Self::from_model(FireRedVad::from_safetensors(path).context(LoadSnafu)?, bounds, ChunkProfile::default())
+        Self::from_model(FireRedVad::from_safetensors(path).context(LoadSnafu)?, bounds)
     }
 
     fn from_model(
         model: FireRedVad,
         bounds: &EncoderBounds,
-        profile: ChunkProfile,
     ) -> Result<VadSplitter<FireRedVadProbs>, FireRedVadSplitterError> {
         let vad = FireRedVadProbs::new(model, DEFAULT_SMOOTH_WINDOW).context(InferenceSnafu)?;
-        Ok(Self::builder().vad(vad).bounds(*bounds).profile(profile).build())
+        Ok(Self::builder().vad(vad).bounds(*bounds).build())
     }
 }
 

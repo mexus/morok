@@ -229,6 +229,8 @@ impl GigaAmTranscriber {
             hop_length,
             subsampling_factor,
             max_mel_frames: model.config.max_mel_frames,
+            // Internal JIT-sizing bounds only; not used for chunking.
+            recommended_target_secs: None,
         };
         // Clamp the splitter's emission ceiling to encoder capacity, then round
         // up to the next power of two so the JIT codegen sees a clean

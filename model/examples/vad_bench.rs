@@ -53,7 +53,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     // GigaAM-like encoder bounds (10 ms hop, 4x subsampling, ~30 s capacity) —
     // the same shape Transcriber would hand the splitter.
-    let bounds = EncoderBounds { sample_rate, hop_length: 160, subsampling_factor: 4, max_mel_frames: 3000 };
+    let bounds = EncoderBounds {
+        sample_rate,
+        hop_length: 160,
+        subsampling_factor: 4,
+        max_mel_frames: 3000,
+        recommended_target_secs: None,
+    };
 
     if !args.skip_silero {
         println!("\n=== Silero VAD ===");

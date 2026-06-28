@@ -28,6 +28,11 @@ pub struct EncoderBounds {
     pub hop_length: usize,
     pub subsampling_factor: usize,
     pub max_mel_frames: usize,
+    /// Model-recommended soft chunk target (seconds), set from
+    /// [`GigaAm::recommended_chunk_secs`](crate::gigaam::GigaAm::recommended_chunk_secs);
+    /// `None` keeps the greedy fill-to-max. Filled by the *caller* (this module
+    /// must not import `GigaAm` — that would close a gigaam→audio→gigaam cycle).
+    pub recommended_target_secs: Option<f32>,
 }
 
 impl EncoderBounds {
@@ -66,7 +71,9 @@ impl EncoderBounds {
             // validator fires when capacity < the target min duration.
             min_duration: k.min_duration.min(cap),
             max_duration: k.max_duration.min(cap),
-            target_duration: k.target_duration.map(|t| t.min(cap)),
+            // Precedence: splitter override (`k.target_duration`) > the model
+            // recommendation; both clamped to encoder capacity.
+            target_duration: k.target_duration.or(self.recommended_target_secs).map(|t| t.min(cap)),
             strict_limit_duration: k.strict_limit_duration.min(cap),
             min_speech_probs: k.min_speech_probs,
             min_silence_probs: k.min_silence_probs,

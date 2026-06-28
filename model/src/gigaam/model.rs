@@ -25,6 +25,13 @@ use crate::gigaam::rnnt::RnntHead;
 use crate::gigaam::{GigaAmConfig, Result, remap};
 use crate::sentencepiece;
 
+/// WER+RTF-tuned soft chunk target (seconds) for the GigaAM RN-T pipeline.
+/// Short chunks cut the RN-T decoder's autoregressive skip-deletions (the
+/// largest long-form WER win on the Russian benchmark) and keep the encoder's
+/// `max_t_mel` in the 1024-frame power-of-two bucket. Tuned for both FireRed and
+/// Silero front-ends — it is encoder/decoder-driven, so it is VAD-independent.
+pub const TUNED_TARGET_SECS: f32 = 5.7;
+
 /// Unified GigaAM model. The `head` enum carries either a CTC projection or
 /// an RN-T predictor+joint pair; pattern-match (or use [`Head::as_ctc`] /
 /// [`Head::as_rnnt`]) to drive the head-specific inference path.
@@ -86,6 +93,13 @@ impl Head {
 }
 
 impl GigaAm {
+    /// Recommended soft chunk-target duration (seconds) for this model, or `None`
+    /// for greedy fill-to-max. RN-T benefits from the target-split (autoregressive
+    /// skip-deletion); CTC (non-autoregressive) does not, so it returns `None`.
+    pub fn recommended_chunk_secs(&self) -> Option<f32> {
+        self.head.as_rnnt().is_some().then_some(TUNED_TARGET_SECS)
+    }
+
     /// Load from a HuggingFace Hub repository (`main` revision).
     pub fn from_hub(model_id: &str) -> Result<Self> {
         Self::from_hub_with_revision(model_id, "main")

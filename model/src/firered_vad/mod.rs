@@ -26,7 +26,7 @@ mod splitter;
 mod stream;
 
 pub use fbank::FireRedFbank;
-pub use splitter::{ChunkProfile, FireRedVadSplitter, FireRedVadSplitterError};
+pub use splitter::{FireRedVadSplitter, FireRedVadSplitterError};
 pub use stream::{
     FireRedVadStream, FireRedVadStreamError, FireRedVadStreamer, StreamFlush, StreamVadConfig, StreamVadPostprocessor,
     VadEvent,

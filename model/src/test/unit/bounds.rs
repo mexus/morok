@@ -9,7 +9,13 @@ use crate::audio::EncoderBounds;
 /// max_mel_frames=2_080 → max_samples = (2080 - 8) * 160 = 331_520 samples
 /// (~20.7 s).
 fn bounds_realistic() -> EncoderBounds {
-    EncoderBounds { sample_rate: 16_000, hop_length: 160, subsampling_factor: 4, max_mel_frames: 2_080 }
+    EncoderBounds {
+        sample_rate: 16_000,
+        hop_length: 160,
+        subsampling_factor: 4,
+        max_mel_frames: 2_080,
+        recommended_target_secs: None,
+    }
 }
 
 #[test]
@@ -24,7 +30,13 @@ fn encoder_bounds_getters() {
 #[test]
 fn encoder_bounds_underflow_safe() {
     // max_mel_frames < 2 * subsampling_factor → saturating_sub clamps to 0.
-    let b = EncoderBounds { sample_rate: 16_000, hop_length: 160, subsampling_factor: 8, max_mel_frames: 4 };
+    let b = EncoderBounds {
+        sample_rate: 16_000,
+        hop_length: 160,
+        subsampling_factor: 8,
+        max_mel_frames: 4,
+        recommended_target_secs: None,
+    };
     assert_eq!(b.max_samples(), 0);
     assert_eq!(b.encoder_capacity_secs(), 0.0);
 }

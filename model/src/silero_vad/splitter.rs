@@ -29,9 +29,10 @@ impl SileroVadSplitter {
         threshold: f32,
         #[builder(default = 15.0)] min_duration: f32,
         #[builder(default = 22.0)] max_duration: f32,
-        /// Soft target chunk duration (seconds). Off by default for Silero
-        /// (greedy fill-to-max); pass `Some(secs)` to enable the target-split.
-        /// See the FireRed splitter for the rationale.
+        /// Explicit soft target chunk duration (seconds), an override of the model
+        /// recommendation supplied via `bounds.recommended_target_secs`. `None`
+        /// (default) defers to `SVOD_VAD_TARGET_CHUNK_SECS` then that
+        /// recommendation. See the FireRed splitter for the rationale.
         target_duration: Option<f32>,
         #[builder(default = 30.0)] strict_limit_duration: f32,
         #[builder(default = 8)] min_speech_probs: usize,
@@ -52,6 +53,11 @@ impl SileroVadSplitter {
         #[builder(default = std::env::var("SVOD_VAD_PREROLL_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(0.5))]
         preroll_secs: f32,
     ) -> VadSplitter<VadInference> {
+        // Resolve the soft target: explicit override > SVOD_VAD_TARGET_CHUNK_SECS.
+        // `None` defers to the model recommendation, which `chunker_opts` ORs in
+        // from `bounds.recommended_target_secs`.
+        let target_duration =
+            target_duration.or_else(|| std::env::var("SVOD_VAD_TARGET_CHUNK_SECS").ok().and_then(|s| s.parse().ok()));
         let opts = bounds.chunker_opts(
             vad.samples_per_prob(),
             ChunkerKnobs {

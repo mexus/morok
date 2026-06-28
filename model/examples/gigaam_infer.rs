@@ -93,6 +93,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         hop_length: model.config.hop_length,
         subsampling_factor: model.config.subsampling_factor,
         max_mel_frames: model.config.max_mel_frames,
+        recommended_target_secs: model.recommended_chunk_secs(),
     };
     // `assemble` sizes the (eagerly JIT-prepared) transcriber from the
     // splitter's chunk ceiling — no hand-threaded buffer size.
