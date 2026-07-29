@@ -2,14 +2,16 @@
 //!
 //! Loads a HuggingFace ModernBERT checkpoint (weights + tokenizer) in one call
 //! and runs a text input through an [`EmbeddingsPipeline`]: `HfTokenizer` →
-//! `TruncatingChunker` → `ModernBertEmbedder`. This doubles as the runnable
-//! end-to-end smoke test for the text pipeline — the analog of `gigaam_infer.rs`
-//! for audio.
+//! chunker → `ModernBertEmbedder`. By default a `TruncatingChunker` is used;
+//! pass `--window` + `--stride` to switch to `SlidingWindowChunker` for
+//! long-document windowed embedding. This doubles as the runnable end-to-end
+//! smoke test for the text pipeline — the analog of `gigaam_infer.rs` for audio.
 //!
 //! Usage:
 //!   cargo run -p svod-model --release --example modernbert_embed_infer -- "hello world"
 //!   cargo run -p svod-model --release --example modernbert_embed_infer -- --profile "hello world"
 //!   cargo run -p svod-model --release --example modernbert_embed_infer -- --repo answerdotai/ModernBERT-base --max-batch 4 "text"
+//!   cargo run -p svod-model --release --example modernbert_embed_infer -- --window 512 --stride 256 < long_doc.txt
 //!
 //! Reads stdin when no positional text is given.
 
@@ -18,7 +20,9 @@ use std::time::Instant;
 
 use clap::Parser;
 
-use svod_arch::pipelines::text::{Embed, EmbeddingsPipeline, RunOptions, TruncatingChunker};
+use svod_arch::pipelines::text::{
+    Chunker, Embed, EmbeddingsPipeline, RunOptions, SlidingWindowChunker, Tokenizer, TruncatingChunker,
+};
 use svod_dtype::DType;
 use svod_model::modernbert;
 
@@ -47,6 +51,49 @@ struct Args {
     /// Collect and print the per-stage profile.
     #[arg(long)]
     profile: bool,
+
+    /// Total window size (incl. special tokens) for SlidingWindowChunker. When
+    /// set, `--stride` is required and the chunker switches from truncating to
+    /// sliding-window.
+    #[arg(long)]
+    window: Option<usize>,
+
+    /// Step between window starts (content-token advance). Required with `--window`.
+    #[arg(long)]
+    stride: Option<usize>,
+}
+
+fn embed_and_report<T, C, E>(
+    pipeline: &mut EmbeddingsPipeline<T, C, E>,
+    text: &str,
+    profile: bool,
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    T: Tokenizer,
+    C: Chunker,
+    E: Embed,
+{
+    println!("\nEmbedding {} chars...", text.len());
+    let t = Instant::now();
+    let result = pipeline.embed(text, RunOptions { profile })?;
+    let dt = t.elapsed();
+
+    println!("  {} chunk(s)", result.chunks.len());
+    for (i, chunk) in result.chunks.iter().enumerate() {
+        let v = &chunk.values.values;
+        println!(
+            "  chunk {i} @ char {}: dim={} | L2={:.4} | first 5: {:?}",
+            chunk.char_offset,
+            v.len(),
+            v.iter().map(|x| x * x).sum::<f32>().sqrt(),
+            &v[..v.len().min(5)],
+        );
+    }
+    if let Some(prof) = &result.profile {
+        println!("\n--- Profile ---\n{prof}");
+    }
+    println!("Embed: {:.3}s", dt.as_secs_f32());
+    Ok(())
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -70,34 +117,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let t_total = Instant::now();
     println!("Loading ModernBERT from {} ({})...", args.repo, args.revision);
-    // One call fetches config.json + model.safetensors + tokenizer.json and
-    // sizes the embedder JIT from the checkpoint's max_position_embeddings.
     let (tokenizer, embedder) = modernbert::from_hub_with_revision(&args.repo, &args.revision, args.max_batch, dtype)?;
     let (_, max_seq) = embedder.capacity();
-    println!("Loaded: hidden_size={}, max_seq={}, max_batch={}", embedder.hidden_size(), max_seq, args.max_batch,);
+    println!("Loaded: hidden_size={}, max_seq={}, max_batch={}", embedder.hidden_size(), max_seq, args.max_batch);
 
-    // The embedder is already JIT-prepared with max_seq, so compose directly
-    // (rather than `assemble`, which would rebuild it) with a matching chunker.
-    let mut pipeline = EmbeddingsPipeline::new(tokenizer, TruncatingChunker::new(max_seq), embedder);
-
-    println!("\nEmbedding {} chars...", text.len());
-    let t_embed = Instant::now();
-    let result = pipeline.embed(&text, RunOptions { profile: args.profile })?;
-    let dt_embed = t_embed.elapsed();
-
-    for (i, chunk) in result.chunks.iter().enumerate() {
-        let v = &chunk.values.values;
-        println!(
-            "  chunk {i} @ char {}: dim={} | L2={:.4} | first 5: {:?}",
-            chunk.char_offset,
-            v.len(),
-            v.iter().map(|x| x * x).sum::<f32>().sqrt(),
-            &v[..v.len().min(5)],
-        );
+    match (args.window, args.stride) {
+        (Some(window), Some(stride)) => {
+            println!("Chunker: sliding window={window}, stride={stride}");
+            let mut pipeline = EmbeddingsPipeline::new(tokenizer, SlidingWindowChunker::new(window, stride), embedder);
+            embed_and_report(&mut pipeline, &text, args.profile)?;
+        }
+        (Some(_), None) | (None, Some(_)) => {
+            return Err("--window and --stride must be used together".into());
+        }
+        (None, None) => {
+            println!("Chunker: truncating max_seq={max_seq}");
+            let mut pipeline = EmbeddingsPipeline::new(tokenizer, TruncatingChunker::new(max_seq), embedder);
+            embed_and_report(&mut pipeline, &text, args.profile)?;
+        }
     }
-    if let Some(profile) = &result.profile {
-        println!("\n--- Profile ---\n{profile}");
-    }
-    println!("\nTotal: {:.2}s; embed: {:.3}s", t_total.elapsed().as_secs_f32(), dt_embed.as_secs_f32());
+
+    println!("\nTotal: {:.2}s", t_total.elapsed().as_secs_f32());
     Ok(())
 }

@@ -32,8 +32,8 @@ use svod_runtime::StageProfile;
 // ─── Results ────────────────────────────────────────────────────────────────
 
 /// One chunk's finished embedding — already pooled and normalized by the model.
-/// `TruncatingChunker` yields exactly one per input; overlapping-window
-/// chunkers (deferred) yield one per window. Position-agnostic: the
+/// `TruncatingChunker` yields exactly one per input; [`SlidingWindowChunker`]
+/// yields one per window. Position-agnostic: the
 /// [`Embed`] trait returns this, and [`EmbeddingsPipeline`] attaches each one's
 /// source position (see [`ChunkEmbedding`]).
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -44,8 +44,8 @@ pub struct Embedding {
 /// One [`Embedding`] paired with the char position where its source
 /// [`TextChunk`] began in the original text — the per-chunk pipeline result,
 /// mirroring how [`audio`](super::audio)'s `ChunkResult` carries `start_sec`/`end_sec` alongside
-/// its decoded payload. `char_offset` lets a future sliding-window chunker (or
-/// NER pipeline) tell windows apart and re-base per-token char spans back to the
+/// its decoded payload. `char_offset` lets [`SlidingWindowChunker`] (or an NER
+/// pipeline) tell windows apart and re-base per-token char spans back to the
 /// source — the same field the chunker already records on [`TextChunk`], now
 /// threaded through to the output.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -166,7 +166,7 @@ impl From<tokenizers::Error> for HfTokenizerError {
 ///
 /// `encode` calls `inner.encode(text, add_special_tokens = true)`. It does
 /// **not** configure truncation/padding — the [`Chunker`] owns the `max_seq`
-/// policy, so a future `SlidingWindowChunker` can still see the full token
+/// policy, so [`SlidingWindowChunker`] can still see the full token
 /// stream. `max_seq()` reports the model's maximum (passed in at construction).
 ///
 /// HF fetching (`from_hub(repo)`) is intentionally absent here — `hf-hub` lives
@@ -243,9 +243,8 @@ pub trait Chunker {
     }
 }
 
-/// Drops ids beyond `max_seq` and emits a single chunk at `char_offset = 0`. The
-/// `SlidingWindowChunker { window, stride }` (overlap, for long-doc embeddings /
-/// NER) is deferred — it arrives with the merge semantics it needs.
+/// Drops ids beyond `max_seq` and emits a single chunk at `char_offset = 0`. For
+/// long documents that exceed `max_seq`, use [`SlidingWindowChunker`].
 pub struct TruncatingChunker {
     max_seq: usize,
 }
@@ -275,6 +274,107 @@ impl Chunker for TruncatingChunker {
             special_tokens_mask: enc.special_tokens_mask[..take].to_vec(),
         };
         Ok(vec![TextChunk { encoding, char_offset: 0 }])
+    }
+}
+
+// ─── SlidingWindowChunker ────────────────────────────────────────────────────
+
+/// Detect boundary special-token counts: leading and trailing runs of
+/// `special_tokens_mask == 1`. Interior specials (e.g. `[UNK]`) remain content.
+fn boundary_specials(mask: &[u32]) -> (usize, usize) {
+    let lead = mask.iter().take_while(|&&m| m == 1).count();
+    let trail = mask.iter().rev().take_while(|&&m| m == 1).count().min(mask.len().saturating_sub(lead));
+    (lead, trail)
+}
+
+/// Reassemble one windowed [`Encoding`]: `lead` boundary specials from the head,
+/// the content body `[body_start..body_end]`, then `trail` specials from the
+/// tail. All five fields are built in lockstep.
+fn build_window(enc: &Encoding, lead: usize, trail: usize, content_start: usize, content_end: usize) -> Encoding {
+    let body_start = lead + content_start;
+    let body_end = lead + content_end;
+    let tail_start = enc.input_ids.len() - trail;
+
+    fn reassemble<T: Clone>(v: &[T], lead: usize, body_start: usize, body_end: usize, tail_start: usize) -> Vec<T> {
+        let mut out = Vec::with_capacity(lead + (body_end - body_start) + (v.len() - tail_start));
+        out.extend_from_slice(&v[..lead]);
+        out.extend_from_slice(&v[body_start..body_end]);
+        out.extend_from_slice(&v[tail_start..]);
+        out
+    }
+
+    Encoding {
+        input_ids: reassemble(&enc.input_ids, lead, body_start, body_end, tail_start),
+        attention_mask: reassemble(&enc.attention_mask, lead, body_start, body_end, tail_start),
+        token_type_ids: reassemble(&enc.token_type_ids, lead, body_start, body_end, tail_start),
+        offsets: reassemble(&enc.offsets, lead, body_start, body_end, tail_start),
+        special_tokens_mask: reassemble(&enc.special_tokens_mask, lead, body_start, body_end, tail_start),
+    }
+}
+
+/// Windows a long token stream into overlapping chunks of `window` total tokens
+/// (specials + content), advancing `stride` tokens per step. Each window is a
+/// well-formed sequence: boundary specials (`[CLS]`/`[SEP]` for BERT/ModernBERT)
+/// are re-attached to every window, detected generically from
+/// `special_tokens_mask` rather than hardcoded.
+///
+/// `window` is the total per-chunk length — `max_seq()` returns it so the
+/// encoder JIT is sized for full windows. `stride` is the **step** between
+/// consecutive window starts in content-token space: `stride == window` gives
+/// adjacent (non-overlapping) chunks; `stride < window` gives an overlap of
+/// `window - stride` tokens. Clamped to the content length so `stride == window`
+/// never skips content despite specials consuming part of the budget.
+///
+/// The last window may be shorter than `window` when content doesn't divide
+/// evenly — the embedder pads it. Each [`TextChunk`] carries the byte offset of
+/// its first content token as `char_offset`.
+pub struct SlidingWindowChunker {
+    window: usize,
+    stride: usize,
+}
+
+impl SlidingWindowChunker {
+    /// `window` = total sequence length per chunk (incl. specials);
+    /// `stride` = step between window starts. Panics unless `1 <= stride <= window`.
+    pub fn new(window: usize, stride: usize) -> Self {
+        assert!(window >= 1, "window must be >= 1");
+        assert!((1..=window).contains(&stride), "stride must be in 1..=window");
+        Self { window, stride }
+    }
+}
+
+impl Chunker for SlidingWindowChunker {
+    type Error = Infallible;
+
+    fn max_seq(&self) -> usize {
+        self.window
+    }
+
+    fn chunk(&mut self, enc: &Encoding) -> Result<Vec<TextChunk>, Infallible> {
+        let (lead, trail) = boundary_specials(&enc.special_tokens_mask);
+        let content_len = enc.input_ids.len().saturating_sub(lead + trail);
+        if content_len == 0 {
+            return Ok(Vec::new());
+        }
+
+        let content_window = self.window.saturating_sub(lead + trail);
+        assert!(content_window >= 1, "window ({}) too small for {} boundary special tokens", self.window, lead + trail);
+
+        let step = self.stride.min(content_window);
+
+        let mut chunks = Vec::new();
+        let mut start = 0;
+        loop {
+            let end = (start + content_window).min(content_len);
+            let char_offset = enc.offsets.get(lead + start).map_or(0, |o| o.0);
+            chunks.push(TextChunk { encoding: build_window(enc, lead, trail, start, end), char_offset });
+            if end >= content_len {
+                break;
+            }
+            start += step;
+        }
+
+        Ok(chunks)
     }
 }
 

@@ -2,7 +2,7 @@ use std::convert::Infallible;
 
 use crate::pipelines::text::{
     Chunker, Embed, Embedding, EmbeddingsPipeline, Encoding, HfTokenizer, HfTokenizerError, RunOptions, RunProfile,
-    TextChunk, TextPipelineError, Tokenizer, TruncatingChunker,
+    SlidingWindowChunker, TextChunk, TextPipelineError, Tokenizer, TruncatingChunker,
 };
 
 fn enc(ids: &[u32]) -> Encoding {
@@ -16,6 +16,35 @@ fn enc(ids: &[u32]) -> Encoding {
         offsets: (0..n).map(|i| (i, i + 1)).collect(),
         special_tokens_mask: vec![0; n],
     }
+}
+
+/// Encoding with `[CLS]`=2 / `[SEP]`=3 wrapping the content (BertProcessing
+/// convention). Content token at content-index `j` gets offset `(j, j+1)`, so a
+/// window starting at content-index `start` has `char_offset == start`.
+fn enc_with_specials(ids: &[u32]) -> Encoding {
+    let n_content = ids.len();
+    let mut input_ids = vec![2]; // [CLS]
+    input_ids.extend_from_slice(ids);
+    input_ids.push(3); // [SEP]
+    let n = input_ids.len();
+
+    let mut offsets = vec![(0, 0)];
+    offsets.extend((0..n_content).map(|i| (i, i + 1)));
+    offsets.push((n_content, n_content));
+
+    let mut special_tokens_mask = vec![0u32; n];
+    special_tokens_mask[0] = 1;
+    special_tokens_mask[n - 1] = 1;
+
+    Encoding { input_ids, attention_mask: vec![1; n], token_type_ids: vec![0; n], offsets, special_tokens_mask }
+}
+
+fn assert_field_lengths(enc: &Encoding, expected: usize) {
+    assert_eq!(enc.input_ids.len(), expected);
+    assert_eq!(enc.attention_mask.len(), expected);
+    assert_eq!(enc.token_type_ids.len(), expected);
+    assert_eq!(enc.offsets.len(), expected);
+    assert_eq!(enc.special_tokens_mask.len(), expected);
 }
 
 // ─── Stubs (host-only; no tokenizer.json, no model/device) ────────────────────
@@ -117,6 +146,153 @@ fn truncating_chunker_keeps_short_input_intact() {
     assert_eq!(out[0].encoding.input_ids, vec![1, 2, 3]);
     assert_eq!(chunker.max_seq(), 8);
     assert_eq!(chunker.profile_label(), "chunk");
+}
+
+// ─── SlidingWindowChunker ─────────────────────────────────────────────────────
+
+#[test]
+fn sliding_short_input_fits_one_window() {
+    let mut chunker = SlidingWindowChunker::new(5, 2);
+    let out = chunker.chunk(&enc_with_specials(&[10, 20, 30])).unwrap();
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].encoding.input_ids, vec![2, 10, 20, 30, 3]);
+    assert_eq!(out[0].char_offset, 0);
+}
+
+#[test]
+fn sliding_windows_long_input_with_overlap_and_correct_offsets() {
+    // [CLS] 10 11 12 13 14 15 16 [SEP] — 7 content tokens.
+    // window=5 → content_window=3; stride=2 → step=2, overlap=1.
+    let mut chunker = SlidingWindowChunker::new(5, 2);
+    let out = chunker.chunk(&enc_with_specials(&[10, 11, 12, 13, 14, 15, 16])).unwrap();
+    assert_eq!(out.len(), 3);
+
+    // Window 0: content[0..3], char_offset = 0.
+    assert_eq!(out[0].char_offset, 0);
+    assert_eq!(out[0].encoding.input_ids, vec![2, 10, 11, 12, 3]);
+    assert_eq!(out[0].encoding.special_tokens_mask, vec![1, 0, 0, 0, 1]);
+    // Offsets are absolute (carried from the source), not rebased per window.
+    assert_eq!(out[0].encoding.offsets, vec![(0, 0), (0, 1), (1, 2), (2, 3), (7, 7)]);
+    assert_field_lengths(&out[0].encoding, 5);
+
+    // Window 1: content[2..5], char_offset = 2.
+    assert_eq!(out[1].char_offset, 2);
+    assert_eq!(out[1].encoding.input_ids, vec![2, 12, 13, 14, 3]);
+    assert_eq!(out[1].encoding.offsets[1], (2, 3)); // content token 12 keeps its absolute offset
+    assert_field_lengths(&out[1].encoding, 5);
+
+    // Window 2: content[4..7], char_offset = 4.
+    assert_eq!(out[2].char_offset, 4);
+    assert_eq!(out[2].encoding.input_ids, vec![2, 14, 15, 16, 3]);
+    assert_field_lengths(&out[2].encoding, 5);
+
+    // Overlap: windows 0 and 1 share token 12.
+    assert!(out[0].encoding.input_ids[1..4].contains(&12));
+    assert!(out[1].encoding.input_ids[1..4].contains(&12));
+}
+
+#[test]
+fn sliding_stride_equals_window_gives_adjacent_chunks() {
+    // window=4 → content_window=2; stride=4 → step clamped to 2. No overlap.
+    let mut chunker = SlidingWindowChunker::new(4, 4);
+    let out = chunker.chunk(&enc_with_specials(&[10, 20, 30, 40])).unwrap();
+    assert_eq!(out.len(), 2);
+    assert_eq!(out[0].encoding.input_ids, vec![2, 10, 20, 3]);
+    assert_eq!(out[1].encoding.input_ids, vec![2, 30, 40, 3]);
+    assert_eq!(out[0].char_offset, 0);
+    assert_eq!(out[1].char_offset, 2);
+}
+
+#[test]
+fn sliding_last_window_clamped_when_content_uneven() {
+    // 5 content tokens, content_window=2 → last window gets 1 token.
+    let mut chunker = SlidingWindowChunker::new(4, 4);
+    let out = chunker.chunk(&enc_with_specials(&[10, 20, 30, 40, 50])).unwrap();
+    assert_eq!(out.len(), 3);
+    // First two windows are full (2 content tokens each); last is partial.
+    assert_eq!(out[0].encoding.input_ids, vec![2, 10, 20, 3]);
+    assert_eq!(out[1].encoding.input_ids, vec![2, 30, 40, 3]);
+    assert_eq!(out[2].encoding.input_ids, vec![2, 50, 3]);
+    assert_eq!(out[2].char_offset, 4);
+}
+
+#[test]
+fn sliding_works_without_special_tokens() {
+    // No specials: lead=0, trail=0, content = entire encoding.
+    let mut chunker = SlidingWindowChunker::new(3, 2);
+    let out = chunker.chunk(&enc(&[10, 20, 30, 40, 50, 60])).unwrap();
+    assert_eq!(out.len(), 3);
+    assert_eq!(out[0].encoding.input_ids, vec![10, 20, 30]);
+    assert_eq!(out[1].encoding.input_ids, vec![30, 40, 50]);
+    assert_eq!(out[2].encoding.input_ids, vec![50, 60]); // partial
+    assert_eq!(out[0].char_offset, 0);
+    assert_eq!(out[1].char_offset, 2);
+    assert_eq!(out[2].char_offset, 4);
+}
+
+#[test]
+fn sliding_all_specials_returns_empty() {
+    let mut chunker = SlidingWindowChunker::new(8, 4);
+    let out = chunker.chunk(&enc_with_specials(&[])).unwrap();
+    assert!(out.is_empty());
+}
+
+#[test]
+fn sliding_max_seq_returns_window_and_default_label() {
+    let chunker = SlidingWindowChunker::new(512, 256);
+    assert_eq!(chunker.max_seq(), 512);
+    assert_eq!(chunker.profile_label(), "chunk");
+}
+
+#[test]
+#[should_panic(expected = "window must be >= 1")]
+fn sliding_new_rejects_zero_window() {
+    let _ = SlidingWindowChunker::new(0, 1);
+}
+
+#[test]
+#[should_panic(expected = "stride must be in 1..=window")]
+fn sliding_new_rejects_zero_stride() {
+    let _ = SlidingWindowChunker::new(4, 0);
+}
+
+#[test]
+#[should_panic(expected = "stride must be in 1..=window")]
+fn sliding_new_rejects_stride_above_window() {
+    let _ = SlidingWindowChunker::new(4, 5);
+}
+
+#[test]
+fn sliding_pipeline_produces_per_window_embeddings() {
+    // StubTokenizer yields [10, 20, 30, 40, 50, 60] (no specials).
+    // SlidingWindowChunker(3, 2) → 3 windows at char_offsets 0, 2, 4.
+    let mut p = EmbeddingsPipeline::new(
+        StubTokenizer { ids: vec![10, 20, 30, 40, 50, 60], max_seq: 3, error: false },
+        SlidingWindowChunker::new(3, 2),
+        StubEmbed { hidden_size: 3, error: false },
+    );
+    let out = p.embed_default("ignored").unwrap();
+    assert_eq!(out.chunks.len(), 3);
+    assert_eq!(out.chunks[0].char_offset, 0);
+    assert_eq!(out.chunks[0].values.values, vec![10.0, 20.0, 30.0]);
+    assert_eq!(out.chunks[1].char_offset, 2);
+    assert_eq!(out.chunks[1].values.values, vec![30.0, 40.0, 50.0]);
+    assert_eq!(out.chunks[2].char_offset, 4);
+    assert_eq!(out.chunks[2].values.values, vec![50.0, 60.0]);
+}
+
+#[test]
+fn sliding_pipeline_profiles_with_chunk_stage() {
+    let mut p = EmbeddingsPipeline::new(
+        StubTokenizer { ids: vec![10, 20, 30, 40, 50, 60], max_seq: 3, error: false },
+        SlidingWindowChunker::new(3, 2),
+        StubEmbed { hidden_size: 3, error: false },
+    );
+    let out = p.embed("ignored", RunOptions { profile: true }).unwrap();
+    assert_eq!(out.chunks.len(), 3);
+    let profile = out.profile.expect("profile collected");
+    let names: Vec<&str> = profile.stages.iter().map(|s| s.name.as_str()).collect();
+    assert_eq!(names, vec!["tokenize", "chunk", "encode"]);
 }
 
 // ─── Embed: batch vs single-path agreement ───────────────────────────────────
