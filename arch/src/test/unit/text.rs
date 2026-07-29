@@ -1,8 +1,8 @@
 use std::convert::Infallible;
 
 use crate::pipelines::text::{
-    Chunker, Embed, Embedding, EmbeddingsPipeline, Encoding, RunOptions, RunProfile, TextChunk, Tokenizer,
-    TruncatingChunker,
+    Chunker, Embed, Embedding, EmbeddingsPipeline, Encoding, HfTokenizer, HfTokenizerError, RunOptions, RunProfile,
+    TextChunk, TextPipelineError, Tokenizer, TruncatingChunker,
 };
 
 fn enc(ids: &[u32]) -> Encoding {
@@ -148,7 +148,9 @@ fn pipeline_truncates_then_embeds() {
     let mut p = pipeline(vec![1, 2, 3, 4, 5, 6, 7], 4);
     let out = p.embed_default("ignored").unwrap();
     assert_eq!(out.chunks.len(), 1);
-    assert_eq!(out.chunks[0].values, vec![1.0, 2.0, 3.0, 4.0]);
+    // char_offset is threaded through from the chunker (TruncatingChunker → 0).
+    assert_eq!(out.chunks[0].char_offset, 0);
+    assert_eq!(out.chunks[0].values.values, vec![1.0, 2.0, 3.0, 4.0]);
     assert!(out.profile.is_none(), "default options don't profile");
 }
 
@@ -275,4 +277,139 @@ fn embed_error_maps_to_embed_variant() {
     );
     let err = p.embed_default("ignored").unwrap_err();
     assert!(matches!(err, crate::pipelines::text::TextPipelineError::Embed { .. }));
+}
+
+// ─── HfTokenizer: a real tokenizers::Tokenizer fixture ─────────────────────────
+//
+// Hand-built WordPiece tokenizer: tiny vocab + Whitespace pre-tokenizer +
+// BertProcessing wrapping each sequence in [CLS] … [SEP]. The ids are fully
+// predictable for known input, so encode() assertions are exact (specials get
+// non-trivial special_tokens_mask). Built programmatically; `fixture_json`
+// serializes it so from_bytes/from_path exercise the real JSON deserialization
+// path rather than a hand-written string.
+
+fn fixture_tokenizer() -> tokenizers::Tokenizer {
+    let vocab = [
+        ("[PAD]".to_string(), 0u32),
+        ("[UNK]".to_string(), 1),
+        ("[CLS]".to_string(), 2),
+        ("[SEP]".to_string(), 3),
+        ("hello".to_string(), 4),
+        ("world".to_string(), 5),
+        ("foo".to_string(), 6),
+        ("bar".to_string(), 7),
+    ];
+    let model = tokenizers::models::wordpiece::WordPiece::builder()
+        .vocab(vocab)
+        .unk_token("[UNK]".to_string())
+        .build()
+        .expect("wordpiece vocab contains [UNK]");
+    let mut tokenizer = tokenizers::Tokenizer::new(model);
+    tokenizer.with_pre_tokenizer(Some(tokenizers::pre_tokenizers::whitespace::Whitespace));
+    tokenizer.with_post_processor(Some(tokenizers::processors::bert::BertProcessing::new(
+        ("[SEP]".to_string(), 3),
+        ("[CLS]".to_string(), 2),
+    )));
+    tokenizer
+}
+
+fn fixture_json() -> Vec<u8> {
+    fixture_tokenizer().to_string(false).expect("serialize fixture tokenizer").into_bytes()
+}
+
+#[test]
+fn hf_tokenizer_from_bytes_encodes_known_text() {
+    let mut tok = HfTokenizer::from_bytes(fixture_json(), 512).expect("load fixture");
+    let enc = tok.encode("hello world").expect("encode");
+    // [CLS] hello world [SEP]
+    assert_eq!(enc.input_ids, vec![2, 4, 5, 3]);
+    assert_eq!(enc.attention_mask, vec![1, 1, 1, 1]);
+    // All five fields share one length — the invariant from_hf preserves.
+    let n = enc.input_ids.len();
+    assert_eq!(enc.attention_mask.len(), n);
+    assert_eq!(enc.token_type_ids.len(), n);
+    assert_eq!(enc.offsets.len(), n);
+    assert_eq!(enc.special_tokens_mask.len(), n);
+    // Specials land at the brackets; real tokens stay unmasked.
+    assert_eq!(enc.special_tokens_mask, vec![1, 0, 0, 1]);
+}
+
+#[test]
+fn hf_tokenizer_from_path_matches_from_bytes() {
+    let bytes = fixture_json();
+    // Unique temp path: tests may run in parallel.
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!("svod-arch-hf-tokenizer-{n}.json"));
+    std::fs::write(&path, &bytes).expect("write fixture to temp file");
+    let mut from_path = HfTokenizer::from_path(&path, 64).expect("load from path");
+    let mut from_bytes = HfTokenizer::from_bytes(&bytes, 64).expect("load from bytes");
+    let id_path = from_path.encode("hello world foo bar").unwrap().input_ids;
+    let id_bytes = from_bytes.encode("hello world foo bar").unwrap().input_ids;
+    assert_eq!(id_path, id_bytes);
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn encoding_from_hf_copies_all_fields() {
+    let inner = fixture_tokenizer();
+    let hf = inner.encode("hello world", true).expect("hf encode");
+    let enc = Encoding::from_hf(&hf);
+    assert_eq!(enc.input_ids, hf.get_ids().to_vec());
+    assert_eq!(enc.attention_mask, hf.get_attention_mask().to_vec());
+    assert_eq!(enc.token_type_ids, hf.get_type_ids().to_vec());
+    assert_eq!(enc.offsets, hf.get_offsets().to_vec());
+    assert_eq!(enc.special_tokens_mask, hf.get_special_tokens_mask().to_vec());
+}
+
+#[test]
+fn hf_tokenizer_max_seq_round_trips() {
+    let via_new = HfTokenizer::new(fixture_tokenizer(), 8);
+    assert_eq!(via_new.max_seq(), 8);
+    let via_bytes = HfTokenizer::from_bytes(fixture_json(), 16).expect("load fixture");
+    assert_eq!(via_bytes.max_seq(), 16);
+}
+
+#[test]
+fn hf_tokenizer_error_display_and_source() {
+    use std::error::Error as _;
+    // from_bytes returns HfTokenizerError — the From<tokenizers::Error> conversion
+    // wired on from_bytes' `?` surfaces the boxed HF error behind a sized type.
+    let err = HfTokenizer::from_bytes(b"not valid json", 8).err().expect("invalid json must error");
+    assert!(!err.to_string().is_empty());
+    assert!(err.source().is_some(), "HfTokenizerError wraps an inner error");
+    // HfTokenizerError is the named type the trait/field expect — confirm by name.
+    let _: &HfTokenizerError = &err;
+}
+
+// ─── TextPipelineError::Chunk arm (TruncatingChunker::Error = Infallible) ─────
+
+#[derive(Debug, snafu::Snafu)]
+#[snafu(display("stub chunker error"))]
+struct ErrChunkerError;
+
+/// Always fails `chunk` — reaches the otherwise-unreachable `Chunk` arm.
+struct ErrChunker {
+    max_seq: usize,
+}
+
+impl Chunker for ErrChunker {
+    type Error = ErrChunkerError;
+    fn max_seq(&self) -> usize {
+        self.max_seq
+    }
+    fn chunk(&mut self, _enc: &Encoding) -> Result<Vec<TextChunk>, ErrChunkerError> {
+        Err(ErrChunkerError)
+    }
+}
+
+#[test]
+fn chunk_error_maps_to_chunk_variant() {
+    let mut p = EmbeddingsPipeline::new(
+        StubTokenizer { ids: vec![1, 2], max_seq: 4, error: false },
+        ErrChunker { max_seq: 4 },
+        StubEmbed { hidden_size: 4, error: false },
+    );
+    let err = p.embed_default("ignored").unwrap_err();
+    assert!(matches!(err, TextPipelineError::Chunk { .. }));
 }

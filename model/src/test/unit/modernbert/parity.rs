@@ -1,6 +1,6 @@
 //! Parity against the PyTorch reference (`answerdotai/ModernBERT-base`).
 //! Heavy: loads the real checkpoint + a golden `last_hidden_state` produced by
-//! HuggingFace `transformers` (`uv run scripts/convert_modernbert.py`).
+//! HuggingFace `transformers` (`uv run scripts/generate_modernbert_golden.py`).
 //!
 //! Runs in **f32** (config dtype overridden) so it works on CPU backends
 //! without GPU bf16 transcendentals. bf16 numerical parity is implied by the
@@ -8,17 +8,19 @@
 
 use std::path::{Path, PathBuf};
 
+use svod_arch::pipelines::text::{Embed, Encoding};
+
 use svod_dtype::DType;
 use svod_tensor::Tensor;
 
-use crate::modernbert::{ModernBert, ModernBertConfig, ModernBertForMaskedLm};
+use crate::modernbert::{ModernBert, ModernBertConfig, ModernBertEmbedder, ModernBertForMaskedLm};
 use crate::state::StateDict;
 
 const HUB_REPO: &str = "answerdotai/ModernBERT-base";
 
 /// Resolve `model.safetensors` / `golden.safetensors` for the real-checkpoint
 /// tests: `SVOD_MODERNBERT` dir override → local `data/modernbert/` (output of
-/// `scripts/convert_modernbert.py`) → HF Hub download.
+/// `scripts/generate_modernbert_golden.py`) → HF Hub download.
 fn real_file(name: &str) -> PathBuf {
     let dir = std::env::var_os("SVOD_MODERNBERT")
         .map(PathBuf::from)
@@ -190,4 +192,43 @@ fn mlm_logits_match_pytorch() {
     let real_max = real_token_max_delta(&got, &want, &mask, v);
     eprintln!("MLM real-token max |delta| = {real_max:.3e}");
     assert!(real_max < 1e-2, "MLM logits drifted from PyTorch golden: real-token max |delta| = {real_max}");
+}
+
+/// Embedding-pipeline parity: Svod's fused backbone+masked-mean-pool+L2-norm JIT
+/// (`ModernBertEmbedder`) vs the PyTorch reference (`expected_embedding` from the
+/// golden, produced by `transformers` + the same pooling recipe). Validates the
+/// full embed path — not just the backbone forward — against an independent
+/// reference. The 1e-12 denominator/norm EPS Svod adds is negligible here.
+#[test]
+#[ignore = "heavy: real ModernBERT-base weights + PyTorch golden (local or HF Hub download)"]
+fn embeddings_match_pytorch() {
+    let weights = real_file("model.safetensors");
+    let golden = crate::state::load_safetensors(&real_file("golden.safetensors")).expect("golden");
+    let cfg_path = real_file("config.json");
+    let mut cfg = ModernBertConfig::from_json(&cfg_path).expect("parse config.json");
+    cfg.dtype = DType::Float32;
+    let model = ModernBert::from_safetensors(&weights, cfg).expect("load weights");
+
+    let input_ids: Vec<u32> = load_golden_vec::<i64>(&golden, "input_ids").into_iter().map(|x| x as u32).collect();
+    let attention_mask: Vec<u32> =
+        load_golden_vec::<i64>(&golden, "attention_mask").into_iter().map(|x| x as u32).collect();
+    let want: Vec<f32> = load_golden_vec(&golden, "expected_embedding");
+    let seq_len = input_ids.len();
+    let d = want.len();
+
+    let mut embedder = ModernBertEmbedder::new(model, 1, seq_len).expect("embedder");
+    let enc = Encoding {
+        input_ids,
+        attention_mask,
+        token_type_ids: vec![0; seq_len],
+        offsets: vec![(0, 0); seq_len],
+        special_tokens_mask: vec![0; seq_len],
+    };
+    let (got, _prof) = embedder.embed_batch(&[&enc], false).expect("embed");
+    let got = &got[0].values;
+    assert_eq!(got.len(), d, "embedding dim mismatch");
+
+    let max_delta = got.iter().zip(want.iter()).map(|(a, e)| (a - e).abs()).fold(0.0f32, f32::max);
+    eprintln!("embedding max |delta| = {max_delta:.3e}");
+    assert!(max_delta < 1e-3, "embedding drifted from PyTorch golden: max |delta| = {max_delta}");
 }

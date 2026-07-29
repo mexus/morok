@@ -37,6 +37,12 @@ fn l2_norm(v: &[f32]) -> f32 {
     v.iter().map(|x| x * x).sum::<f32>().sqrt()
 }
 
+/// Max elementwise absolute difference between two equal-length slices — the
+/// shared comparison primitive for the batch-vs-single and mask-leak checks.
+fn max_delta(a: &[f32], b: &[f32]) -> f32 {
+    a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max)
+}
+
 use crate::modernbert::ModernBertEmbedder;
 
 /// `embed_batch` returns one embedding per input, each of length `hidden_size`,
@@ -126,4 +132,58 @@ fn profiled_run_emits_embed_stage() {
     let prof = emb.embed(&e, true).expect("profiled").1.expect("profile present");
     assert!(prof.stages.iter().any(|s| s.name == "embed"), "embed stage present");
     assert!(emb.embed(&e, false).expect("unprofiled").1.is_none(), "unprofiled yields no profile");
+}
+
+/// Two **distinct** inputs through `embed_batch` must match the same inputs run
+/// one-at-a-time via `embed` — a cross-row leakage guard. Row `i`'s output must
+/// depend only on row `i`'s ids/mask, never on a sibling row packed into the
+/// `[max_batch, max_seq]` buffers. Exact equality: same weights, same row 0
+/// computation whether `b` binds to 1 or 2 (the symbolic-batch graph computes
+/// only the first `b` rows), so the bits must match.
+#[test]
+fn embed_batch_rows_match_single_calls() {
+    let mut emb = embedder(4, 16);
+    let e1 = encoding(&[1, 2, 3], 0);
+    let e2 = encoding(&[10, 20, 30, 40], 0);
+    let batch = emb.embed_batch(&[&e1, &e2], false).expect("embed_batch").0;
+    let s1 = emb.embed(&e1, false).expect("embed e1").0;
+    let s2 = emb.embed(&e2, false).expect("embed e2").0;
+    assert_eq!(max_delta(&batch[0].values, &s1.values), 0.0, "batch row 0 leaked from/into e1");
+    assert_eq!(max_delta(&batch[1].values, &s2.values), 0.0, "batch row 1 leaked from/into e2");
+}
+
+/// On the **batch** path the attention mask is threaded per row: a row whose
+/// real tokens are `[1,2,3]` with two trailing pads must pool to the same vector
+/// as the same row run unpadded, and must agree with its standalone `embed`. The
+/// batch packing must not collapse pooling to a raw mean over the padded length.
+/// Tolerance 1e-4 mirrors `pooling_ignores_pad_positions`.
+#[test]
+fn batch_path_respects_attention_mask() {
+    let mut emb = embedder(4, 16);
+    let padded = encoding(&[1, 2, 3], 2);
+    let unpadded = encoding(&[1, 2, 3], 0);
+    let batch = emb.embed_batch(&[&padded, &unpadded], false).expect("embed_batch").0;
+    // Pad positions must not move the pooled output within a row.
+    let d = max_delta(&batch[0].values, &batch[1].values);
+    assert!(d < 1e-4, "pad mask leaked in the batch path: max |delta| = {d}");
+    // And the batch path agrees with the single-call path for the unpadded row.
+    let alone = emb.embed(&unpadded, false).expect("embed unpadded").0;
+    let d = max_delta(&batch[1].values, &alone.values);
+    assert!(d < 1e-4, "batch row 1 disagrees with its standalone embed: max |delta| = {d}");
+}
+
+/// On the throughput path (`embed_batch`, not the batch-of-one `embed` default),
+/// a profiled run emits a GPU stage named `embed`; an unprofiled run on the same
+/// embedder emits none — the profile switch is per-call, no rebuild.
+#[test]
+fn embed_batch_profile_emits_stage() {
+    let mut emb = embedder(2, 8);
+    let e1 = encoding(&[1, 2], 0);
+    let e2 = encoding(&[3, 4], 0);
+    let prof = emb.embed_batch(&[&e1, &e2], true).expect("profiled embed_batch").1.expect("profile present");
+    assert!(prof.stages.iter().any(|s| s.name == "embed"), "embed GPU stage present");
+    assert!(
+        emb.embed_batch(&[&e1, &e2], false).expect("unprofiled embed_batch").1.is_none(),
+        "unprofiled yields no profile"
+    );
 }

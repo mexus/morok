@@ -18,6 +18,7 @@ mod jit;
 mod mlp;
 mod model;
 mod normalization;
+mod pipeline;
 mod pooling;
 mod rotary;
 
@@ -33,5 +34,6 @@ pub use jit::{ModernBertJit, ModernBertMlmJit};
 pub use mlp::ModernBertGlu;
 pub use model::ModernBert;
 pub use normalization::LayerNormWeights;
+pub use pipeline::{from_hub, from_hub_with_revision};
 pub use pooling::{cls, masked_mean};
 pub use rotary::RotaryTable;

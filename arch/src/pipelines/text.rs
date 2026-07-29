@@ -17,8 +17,8 @@
 //!
 //! Text crosses the boundary as `&str`, token ids as `&[u32]`: this crate stays
 //! free of the Tensor/device stack. The model owns ids → device internally —
-//! exactly as [`audio`]'s [`Transcriber`](super::audio::Transcriber) owns audio
-//! → mel → device.
+//! exactly as [`audio`](super::audio)'s [`Transcriber`](super::audio::Transcriber)
+//! owns audio → mel → device.
 
 use std::convert::Infallible;
 use std::path::Path;
@@ -33,18 +33,33 @@ use svod_runtime::StageProfile;
 
 /// One chunk's finished embedding — already pooled and normalized by the model.
 /// `TruncatingChunker` yields exactly one per input; overlapping-window
-/// chunkers (deferred) yield one per window.
+/// chunkers (deferred) yield one per window. Position-agnostic: the
+/// [`Embed`] trait returns this, and [`EmbeddingsPipeline`] attaches each one's
+/// source position (see [`ChunkEmbedding`]).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Embedding {
     pub values: Vec<f32>,
 }
 
-/// Aggregated pipeline output: one [`Embedding`] per chunk, plus the optional
-/// per-stage [`RunProfile`] the encoder collected. Profile stages are free-form
-/// and extensible (see [`audio`](super::audio)).
+/// One [`Embedding`] paired with the char position where its source
+/// [`TextChunk`] began in the original text — the per-chunk pipeline result,
+/// mirroring how [`audio`](super::audio)'s `ChunkResult` carries `start_sec`/`end_sec` alongside
+/// its decoded payload. `char_offset` lets a future sliding-window chunker (or
+/// NER pipeline) tell windows apart and re-base per-token char spans back to the
+/// source — the same field the chunker already records on [`TextChunk`], now
+/// threaded through to the output.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ChunkEmbedding {
+    pub char_offset: usize,
+    pub values: Embedding,
+}
+
+/// Aggregated pipeline output: one [`ChunkEmbedding`] per chunk, plus the
+/// optional per-stage [`RunProfile`] the encoder collected. Profile stages are
+/// free-form and extensible (see [`audio`](super::audio)).
 #[derive(Debug, Default)]
 pub struct Embeddings {
-    pub chunks: Vec<Embedding>,
+    pub chunks: Vec<ChunkEmbedding>,
     pub profile: Option<RunProfile>,
 }
 
@@ -282,7 +297,7 @@ pub trait Embed {
 
     /// `(max_batch, max_seq)` the JIT was prepared for. Informational; the
     /// pipeline sizes the JIT from the chunker's `max_seq` at assembly, so these
-    /// are consistent by construction (mirrors how [`audio`]'s transcriber is
+    /// are consistent by construction (mirrors how [`audio`](super::audio)'s transcriber is
     /// sized from the splitter's chunk ceiling).
     fn capacity(&self) -> (usize, usize);
 
@@ -374,7 +389,19 @@ impl<T: Tokenizer, C: Chunker, E: Embed> EmbeddingsPipeline<T, C, E> {
         } else {
             let encodings: Vec<&Encoding> = chunks.iter().map(|c| &c.encoding).collect();
             let (values, prof) = self.encoder.embed_batch(&encodings, opts.profile).context(EmbedSnafu)?;
-            Embeddings { chunks: values, profile: prof }
+            // Attach each chunk's source char position to its embedding. The
+            // embedder returns position-agnostic `Embedding`s in chunk order;
+            // zipping with the chunks' `char_offset` yields `ChunkEmbedding`s
+            // that carry their window location through to the caller — so a
+            // future sliding-window chunker (or NER pipeline) can re-base spans
+            // without re-tokenizing.
+            let chunk_embeddings = chunks
+                .into_iter()
+                .map(|c| c.char_offset)
+                .zip(values)
+                .map(|(char_offset, values)| ChunkEmbedding { char_offset, values })
+                .collect();
+            Embeddings { chunks: chunk_embeddings, profile: prof }
         };
 
         if opts.profile {

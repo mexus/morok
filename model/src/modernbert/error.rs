@@ -21,4 +21,8 @@ pub enum Error {
     Config { message: String },
     #[snafu(display("{what} requires a concrete sequence length, got a symbolic dim"))]
     SymbolicShape { what: &'static str },
+    #[snafu(display("loading tokenizer failed: {source}"))]
+    Tokenizer { source: svod_arch::pipelines::text::HfTokenizerError },
+    #[snafu(display("building embedder failed: {source}"))]
+    Embedder { source: super::embedder::EmbedderError },
 }

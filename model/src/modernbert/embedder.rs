@@ -6,6 +6,10 @@
 //! model owns the forward + fused pooling/normalization (via
 //! [`ModernBertEmbedderJit`]); the pipeline owns chunking and profile assembly.
 //!
+//! For the one-call hub loader that builds this embedder alongside a matching
+//! [`HfTokenizer`](svod_arch::pipelines::text::HfTokenizer), see
+//! [`from_hub`](crate::modernbert::from_hub).
+//!
 //! The JIT plan is sized once at construction (from `max_batch` + `max_seq`) and
 //! runs at that size every call: inputs are padded to `[max_batch, max_seq]`,
 //! `execute()` runs the full batch, and the live rows are sliced out of the
