@@ -6,3 +6,4 @@
 //! pipeline families (e.g. speaker diarization) get sibling sub-modules here.
 
 pub mod audio;
+pub mod text;

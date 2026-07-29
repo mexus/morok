@@ -7,6 +7,8 @@
 
 mod attention;
 mod config;
+mod embedder;
+mod embedder_jit;
 mod embeddings;
 mod encoder;
 mod encoder_layer;
@@ -21,6 +23,8 @@ mod rotary;
 
 pub use attention::ModernBertAttention;
 pub use config::ModernBertConfig;
+pub use embedder::{EmbedderError, ModernBertEmbedder};
+pub use embedder_jit::ModernBertEmbedderJit;
 pub use encoder::Encoder;
 pub use encoder_layer::EncoderLayer;
 pub use error::{Error, Result};

@@ -7,7 +7,7 @@ use crate::state::{HasStateDict, StateDict};
 /// A tiny config for fast unit tests: 2 layers, hidden 32, 4 heads (head_dim 8),
 /// vocab 64, intermediate 64, f32 compute. Global-every-3 still gives layer 0
 /// global and layer 1 local.
-fn tiny_cfg() -> ModernBertConfig {
+pub(crate) fn tiny_cfg() -> ModernBertConfig {
     ModernBertConfig {
         vocab_size: 64,
         hidden_size: 32,

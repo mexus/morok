@@ -1,5 +1,6 @@
 mod attention;
 mod config;
+mod embedder;
 mod head;
 mod jit;
 mod model;

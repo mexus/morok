@@ -12,6 +12,7 @@ description = "Architecture-level algorithms for the Svod ML compiler"
 serde = { version = "1.0", features = ["derive"], optional = true }
 snafu = "0.9"
 svod-runtime = { version = "=0.1.0-alpha.4", path = "../runtime" }
+tokenizers = { version = "0.23", default-features = false, features = ["onig"] }
 
 [dev-dependencies]
 proptest = "1.9"
