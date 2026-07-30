@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use svod_dtype::DType;
 use svod_tensor::Tensor;
 
-use crate::modernbert::{ModernBert, ModernBertConfig};
+use crate::modernbert::{ModernBert, ModernBertConfig, ModernBertForMaskedLm};
 use crate::state::StateDict;
 
 const HUB_REPO: &str = "answerdotai/ModernBERT-base";
@@ -137,4 +137,57 @@ fn ignoring_padding_diverges_from_golden() {
          (max |delta| = {real_max_unmasked:.3e}); the mask is not load-bearing in the golden"
     );
     eprintln!("unmasked real-token max |delta| = {real_max_unmasked:.3e} (diverges as expected)");
+}
+
+/// Load the MLM model (backbone + head) from the same weights + config as the
+/// backbone fixture, plus the golden `mlm_logits`.
+fn load_mlm_fixture() -> (ModernBertForMaskedLm, Tensor, Vec<i64>, Vec<f32>) {
+    let weights = real_file("model.safetensors");
+    let golden = crate::state::load_safetensors(&real_file("golden.safetensors")).expect("golden");
+
+    let cfg_path = real_file("config.json");
+    let mut cfg = ModernBertConfig::from_json(&cfg_path).expect("parse config.json");
+    cfg.dtype = DType::Float32;
+
+    let model = ModernBertForMaskedLm::from_safetensors(&weights, cfg).expect("load MLM weights");
+
+    let input_ids: Vec<i64> = load_golden_vec(&golden, "input_ids");
+    let want: Vec<f32> = load_golden_vec(&golden, "mlm_logits");
+    let mask: Vec<i64> = golden
+        .get("attention_mask")
+        .map(|_| load_golden_vec(&golden, "attention_mask"))
+        .unwrap_or_else(|| vec![1; input_ids.len()]);
+    let (b, l) = match golden.get("input_ids_shape") {
+        Some(t) => {
+            let mut t = t.clone();
+            t.realize().unwrap();
+            let s = t.as_vec::<i64>().unwrap();
+            (s[0] as usize, s[1] as usize)
+        }
+        None => (1, input_ids.len()),
+    };
+    let ids = Tensor::from_slice(input_ids).try_reshape([b as isize, l as isize]).unwrap();
+
+    (model, ids, mask, want)
+}
+
+/// MLM-logits parity: our backbone + MLM head (f32) vs `AutoModelForMaskedLM`.
+/// Compares **real-token positions only** (the mask is load-bearing), folding
+/// across the vocab axis. The head reuses the f32-accumulator guarantees of
+/// matmul/layernorm/GELU, so the same sub-1e-2 regime as the backbone applies.
+#[test]
+#[ignore = "heavy: real ModernBERT-base weights + PyTorch golden (local or HF Hub download)"]
+fn mlm_logits_match_pytorch() {
+    let (model, ids, mask, want) = load_mlm_fixture();
+    let v = want.len() / mask.len();
+
+    let mask_t =
+        Tensor::from_slice(mask.clone()).cast(DType::Bool).unwrap().try_reshape([1isize, mask.len() as isize]).unwrap();
+    let mut got = model.forward(&ids, Some(&mask_t)).expect("MLM forward");
+    got.realize().expect("realize logits");
+    let got = got.as_vec::<f32>().expect("logits readout");
+
+    let real_max = real_token_max_delta(&got, &want, &mask, v);
+    eprintln!("MLM real-token max |delta| = {real_max:.3e}");
+    assert!(real_max < 1e-2, "MLM logits drifted from PyTorch golden: real-token max |delta| = {real_max}");
 }

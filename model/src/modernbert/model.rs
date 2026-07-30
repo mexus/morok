@@ -81,19 +81,7 @@ impl ModernBert {
         // dtype / max_batch_size (those aren't in the on-disk config).
         let cfg_path = repo.get("config.json").context(HubSnafu)?;
         let parsed = ModernBertConfig::from_json(&cfg_path)?;
-        config.vocab_size = parsed.vocab_size;
-        config.hidden_size = parsed.hidden_size;
-        config.num_hidden_layers = parsed.num_hidden_layers;
-        config.num_attention_heads = parsed.num_attention_heads;
-        config.intermediate_size = parsed.intermediate_size;
-        config.max_position_embeddings = parsed.max_position_embeddings;
-        config.layer_norm_eps = parsed.layer_norm_eps;
-        config.global_rope_theta = parsed.global_rope_theta;
-        config.local_rope_theta = parsed.local_rope_theta;
-        config.local_attention = parsed.local_attention;
-        config.global_attn_every_n_layers = parsed.global_attn_every_n_layers;
-        config.pad_token_id = parsed.pad_token_id;
-        config.tie_word_embeddings = parsed.tie_word_embeddings;
+        config.merge_structural_from(&parsed);
 
         let weights_path = repo.get("model.safetensors").context(HubSnafu)?;
         Self::from_safetensors(&weights_path, config.clone())
@@ -112,19 +100,8 @@ impl ModernBert {
     /// loaders.
     pub fn from_state_dict(sd: &StateDict, config: ModernBertConfig) -> Result<Self> {
         let dtype = config.dtype.clone();
-        let casted: StateDict = sd
-            .iter()
-            .map(|(k, v)| {
-                let t = if v.uop().dtype() == dtype {
-                    v.clone()
-                } else {
-                    v.cast(dtype.clone()).unwrap_or_else(|_| v.clone())
-                };
-                (k.clone(), t)
-            })
-            .collect();
         let mut model = Self::empty(config);
-        model.load_state_dict(&casted, "").context(StateSnafu)?;
+        model.load_state_dict(&state::cast_all(sd, dtype), "").context(StateSnafu)?;
         Ok(model)
     }
 }

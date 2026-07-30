@@ -67,6 +67,19 @@ pub fn get_tensor(sd: &StateDict, key: &str) -> Result<Tensor> {
     sd.get(key).cloned().ok_or_else(|| Error::MissingKey { key: key.to_string() })
 }
 
+/// Cast every tensor in a state dict to `dtype`, leaving any tensor that cannot
+/// be cast (e.g. an int embedding key) at its original dtype. Shared by the
+/// ModernBERT backbone and MLM loaders so weight casting stays in one place.
+pub fn cast_all(sd: &StateDict, dtype: DType) -> StateDict {
+    sd.iter()
+        .map(|(k, v)| {
+            let t =
+                if v.uop().dtype() == dtype { v.clone() } else { v.cast(dtype.clone()).unwrap_or_else(|_| v.clone()) };
+            (k.clone(), t)
+        })
+        .collect()
+}
+
 /// Helper: format a prefixed key.
 pub fn prefixed(prefix: &str, name: &str) -> String {
     if prefix.is_empty() { name.to_string() } else { format!("{prefix}.{name}") }

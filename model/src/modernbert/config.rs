@@ -40,6 +40,10 @@ pub struct ModernBertConfig {
     pub global_attn_every_n_layers: usize,
     pub pad_token_id: usize,
     pub tie_word_embeddings: bool,
+    /// Whether the MLM decoder has a bias term (`config.json: decoder_bias`).
+    /// `true` for the published `ModernBERT-{base,large}`; the weight is tied
+    /// to the token embeddings, so only the bias is stored.
+    pub decoder_bias: bool,
     /// Caller-chosen compute dtype (bf16 by default; f32 for CPU parity).
     pub dtype: DType,
     /// Upper bound on the symbolic batch variable in the JIT wrapper.
@@ -67,6 +71,27 @@ impl ModernBertConfig {
     pub fn rope_theta(&self, layer_id: usize) -> f64 {
         if self.is_global_layer(layer_id) { self.global_rope_theta } else { self.local_rope_theta }
     }
+
+    /// Splice in the structural fields parsed from the published `config.json`,
+    /// preserving the caller-chosen `dtype` / `max_batch_size`. Shared by the
+    /// backbone (`ModernBert`) and MLM (`ModernBertForMaskedLm`) Hub loaders so
+    /// both stay in sync without copy-pasting the field list.
+    pub fn merge_structural_from(&mut self, parsed: &Self) {
+        self.vocab_size = parsed.vocab_size;
+        self.hidden_size = parsed.hidden_size;
+        self.num_hidden_layers = parsed.num_hidden_layers;
+        self.num_attention_heads = parsed.num_attention_heads;
+        self.intermediate_size = parsed.intermediate_size;
+        self.max_position_embeddings = parsed.max_position_embeddings;
+        self.layer_norm_eps = parsed.layer_norm_eps;
+        self.global_rope_theta = parsed.global_rope_theta;
+        self.local_rope_theta = parsed.local_rope_theta;
+        self.local_attention = parsed.local_attention;
+        self.global_attn_every_n_layers = parsed.global_attn_every_n_layers;
+        self.pad_token_id = parsed.pad_token_id;
+        self.tie_word_embeddings = parsed.tie_word_embeddings;
+        self.decoder_bias = parsed.decoder_bias;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -90,6 +115,7 @@ pub fn modernbert_base() -> ModernBertConfig {
         global_attn_every_n_layers: 3,
         pad_token_id: 50283,
         tie_word_embeddings: true,
+        decoder_bias: true,
         dtype: DType::BFloat16,
         max_batch_size: 1,
     }
@@ -112,6 +138,7 @@ pub fn modernbert_large() -> ModernBertConfig {
         global_attn_every_n_layers: 3,
         pad_token_id: 50283,
         tie_word_embeddings: true,
+        decoder_bias: true,
         dtype: DType::BFloat16,
         max_batch_size: 1,
     }
@@ -156,6 +183,7 @@ impl ModernBertConfig {
             global_attn_every_n_layers: raw.global_attn_every_n_layers.unwrap_or(base.global_attn_every_n_layers),
             pad_token_id: raw.pad_token_id.unwrap_or(base.pad_token_id),
             tie_word_embeddings: raw.tie_word_embeddings.unwrap_or(base.tie_word_embeddings),
+            decoder_bias: raw.decoder_bias.unwrap_or(base.decoder_bias),
             // Compute dtype is caller-chosen, not from config.json.
             dtype: base.dtype,
             max_batch_size: base.max_batch_size,
@@ -182,4 +210,5 @@ struct RawModernBertConfig {
     global_attn_every_n_layers: Option<usize>,
     pad_token_id: Option<usize>,
     tie_word_embeddings: Option<bool>,
+    decoder_bias: Option<bool>,
 }

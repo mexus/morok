@@ -19,6 +19,7 @@ fn tiny_cfg() -> ModernBertConfig {
         global_attn_every_n_layers: 3,
         pad_token_id: 0,
         tie_word_embeddings: true,
+        decoder_bias: true,
         dtype: DType::Float32,
         max_batch_size: 4,
     }
