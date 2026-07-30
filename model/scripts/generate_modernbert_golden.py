@@ -7,11 +7,13 @@ Produces `golden.safetensors` under the ModernBERT data dir
   attention_mask     (L,)    int64   1 = real token, 0 = pad
   input_ids_shape    (2,)    int64   (batch, seq_len)
   last_hidden_state  (L, D)  float32 backbone output (real tokens only matter)
+  mlm_logits         (L, V)  float32 MLM head output (vocab logits per token)
   expected_embedding (D,)    float32 masked mean-pool + L2-normalize
 
 The first four feed `last_hidden_state_matches_pytorch` (backbone parity);
+`mlm_logits` feeds `mlm_logits_match_pytorch` (MLM-head parity);
 `expected_embedding` feeds `embeddings_match_pytorch` (embed-pipeline parity).
-Both are produced by HuggingFace `transformers` so Svod's f32 output is compared
+All are produced by HuggingFace `transformers` so Svod's f32 output is compared
 against an independent reference.
 
 Usage:
@@ -26,7 +28,7 @@ from pathlib import Path
 
 import torch
 import safetensors.torch
-from transformers import AutoModel, AutoTokenizer
+from transformers import AutoModel, AutoModelForMaskedLM, AutoTokenizer
 
 # Pure masked mean-pool + L2-normalize (the canonical sentence-embedding recipe,
 # matching Svod's pool_embed). Svod guards the denominator/norm with EPS=1e-12;
@@ -52,6 +54,9 @@ def main() -> None:
     # fine-tune saved in bf16) would load/run in bf16 and produce bf16-rounded
     # logits that Svod's f32 output can never match (divergence ~0.1).
     model = AutoModel.from_pretrained(args.repo, torch_dtype=torch.float32).to(device).eval()
+    # Same f32 rationale as the backbone: the MLM head's matmul/layernorm/GELU
+    # accumulate in f32, and Svod's parity test runs in f32 too.
+    mlm = AutoModelForMaskedLM.from_pretrained(args.repo, torch_dtype=torch.float32).to(device).eval()
 
     enc = tokenizer(args.text, padding="max_length", max_length=args.max_seq, truncation=True, return_tensors="pt")
     input_ids = enc["input_ids"].to(device)
@@ -60,6 +65,7 @@ def main() -> None:
     with torch.no_grad():
         out = model(input_ids=input_ids, attention_mask=attention_mask)
         last_hidden_state = out.last_hidden_state  # (1, L, D) float32
+        mlm_logits = mlm(input_ids=input_ids, attention_mask=attention_mask).logits  # (1, L, V) float32
 
     mask_f = attention_mask.unsqueeze(-1).to(last_hidden_state.dtype)        # (1, L, 1)
     summed = (last_hidden_state * mask_f).sum(dim=1)                         # (1, D)
@@ -73,6 +79,7 @@ def main() -> None:
         "attention_mask": attention_mask.squeeze(0).to(torch.int64).cpu(),
         "input_ids_shape": torch.tensor([1, args.max_seq], dtype=torch.int64),
         "last_hidden_state": last_hidden_state.squeeze(0).to(torch.float32).cpu(),
+        "mlm_logits": mlm_logits.squeeze(0).to(torch.float32).cpu(),
         "expected_embedding": embedding.squeeze(0).to(torch.float32).cpu(),
     }
     golden_path = out_dir / "golden.safetensors"
