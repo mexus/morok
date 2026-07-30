@@ -6,6 +6,8 @@
 //! out-of-band — the API takes pre-computed `input_ids`.
 
 mod attention;
+mod classifier;
+mod classifier_jit;
 mod config;
 mod embedder;
 mod embedder_jit;
@@ -23,7 +25,11 @@ mod pooling;
 mod rotary;
 
 pub use attention::ModernBertAttention;
-pub use config::ModernBertConfig;
+#[cfg(test)]
+pub(crate) use classifier::ModernBertClassificationModel;
+pub use classifier::{ClassifierError, ModernBertClassifier};
+pub use classifier_jit::ModernBertClassifierJit;
+pub use config::{ClassifierPooling, ModernBertConfig};
 pub use embedder::{EmbedderError, ModernBertEmbedder};
 pub use embedder_jit::ModernBertEmbedderJit;
 pub use encoder::Encoder;
@@ -34,6 +40,6 @@ pub use jit::{ModernBertJit, ModernBertMlmJit};
 pub use mlp::ModernBertGlu;
 pub use model::ModernBert;
 pub use normalization::LayerNormWeights;
-pub use pipeline::{from_hub, from_hub_with_revision};
+pub use pipeline::{from_hub, from_hub_classifier, from_hub_classifier_with_revision, from_hub_with_revision};
 pub use pooling::{cls, masked_mean};
 pub use rotary::RotaryTable;

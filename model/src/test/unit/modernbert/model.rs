@@ -1,7 +1,7 @@
 use svod_dtype::DType;
 use svod_tensor::Tensor;
 
-use crate::modernbert::{ModernBert, ModernBertConfig};
+use crate::modernbert::{ClassifierPooling, ModernBert, ModernBertConfig};
 use crate::state::{HasStateDict, StateDict};
 
 /// A tiny config for fast unit tests: 2 layers, hidden 32, 4 heads (head_dim 8),
@@ -25,6 +25,10 @@ pub(crate) fn tiny_cfg() -> ModernBertConfig {
         decoder_bias: true,
         dtype: DType::Float32,
         max_batch_size: 1,
+        num_labels: 3,
+        classifier_pooling: ClassifierPooling::Cls,
+        classifier_bias: false,
+        norm_bias: false,
     }
 }
 

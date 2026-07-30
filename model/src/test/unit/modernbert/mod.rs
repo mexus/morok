@@ -1,4 +1,5 @@
 mod attention;
+mod classifier;
 mod config;
 mod embedder;
 mod head;

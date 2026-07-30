@@ -130,7 +130,7 @@ impl Embed for ModernBertEmbedder {
 
 /// Pad each chunk's `input_ids` into the `[max_batch, max_seq]` i64 JIT buffer,
 /// zero-filling past each chunk's length and over unused rows.
-fn pack_ids_buffer(
+pub(crate) fn pack_ids_buffer(
     buf: &mut svod_device::Buffer,
     batch: &[&Encoding],
     max_seq: usize,
@@ -150,7 +150,7 @@ fn pack_ids_buffer(
 /// Pad each chunk's `attention_mask` (1 = real token, 0 = pad) into the
 /// `[max_batch, max_seq]` i64 JIT buffer. The mask follows the chunk's real
 /// token count; trailing pad positions and unused rows stay 0.
-fn pack_mask_buffer(
+pub(crate) fn pack_mask_buffer(
     buf: &mut svod_device::Buffer,
     batch: &[&Encoding],
     max_seq: usize,

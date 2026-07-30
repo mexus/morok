@@ -25,4 +25,6 @@ pub enum Error {
     Tokenizer { source: svod_arch::pipelines::text::HfTokenizerError },
     #[snafu(display("building embedder failed: {source}"))]
     Embedder { source: super::embedder::EmbedderError },
+    #[snafu(display("building classifier failed: {source}"))]
+    Classifier { source: super::classifier::ClassifierError },
 }

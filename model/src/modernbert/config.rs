@@ -18,6 +18,14 @@ use svod_dtype::DType;
 
 use super::error::{Error, Result};
 
+/// Pooling strategy for the classification head. HF ModernBERT defaults to
+/// `"cls"` (take the first token); `"mean"` does a masked mean over the sequence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClassifierPooling {
+    Cls,
+    Mean,
+}
+
 /// Clean, resolved ModernBERT backbone config.
 #[derive(Clone, Debug)]
 pub struct ModernBertConfig {
@@ -48,6 +56,16 @@ pub struct ModernBertConfig {
     pub dtype: DType,
     /// Upper bound on the symbolic batch variable in the JIT wrapper.
     pub max_batch_size: usize,
+    // ── classification-only fields (ignored by the backbone / embedder) ──
+    /// Number of output classes for sequence classification.
+    pub num_labels: usize,
+    /// `"cls"` (take token 0) or `"mean"` (masked mean) — HF's
+    /// `classifier_pooling`.
+    pub classifier_pooling: ClassifierPooling,
+    /// Whether `head.dense` has a bias term (HF's `classifier_bias`).
+    pub classifier_bias: bool,
+    /// Whether LayerNorm biases are present (HF's `norm_bias`).
+    pub norm_bias: bool,
 }
 
 impl ModernBertConfig {
@@ -116,6 +134,10 @@ impl Default for ModernBertConfig {
             decoder_bias: false,
             dtype: DType::BFloat16,
             max_batch_size: 1,
+            num_labels: 2,
+            classifier_pooling: ClassifierPooling::Cls,
+            classifier_bias: false,
+            norm_bias: false,
         }
     }
 }
@@ -159,6 +181,13 @@ impl ModernBertConfig {
             decoder_bias: raw.decoder_bias.unwrap_or(d.decoder_bias),
             dtype: d.dtype,
             max_batch_size: d.max_batch_size,
+            num_labels: raw.num_labels.unwrap_or(d.num_labels),
+            classifier_pooling: match raw.classifier_pooling.as_deref() {
+                Some("mean") => ClassifierPooling::Mean,
+                _ => ClassifierPooling::Cls,
+            },
+            classifier_bias: raw.classifier_bias.unwrap_or(d.classifier_bias),
+            norm_bias: raw.norm_bias.unwrap_or(d.norm_bias),
         }
     }
 }
@@ -183,4 +212,9 @@ struct RawModernBertConfig {
     pad_token_id: Option<usize>,
     tie_word_embeddings: Option<bool>,
     decoder_bias: Option<bool>,
+    // ── classification-only fields ──
+    num_labels: Option<usize>,
+    classifier_pooling: Option<String>,
+    classifier_bias: Option<bool>,
+    norm_bias: Option<bool>,
 }
