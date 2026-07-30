@@ -90,27 +90,6 @@ impl ModernBertConfig {
     pub fn rope_theta(&self, layer_id: usize) -> f64 {
         if self.is_global_layer(layer_id) { self.global_rope_theta } else { self.local_rope_theta }
     }
-
-    /// Splice in the structural fields parsed from the published `config.json`,
-    /// preserving the caller-chosen `dtype` / `max_batch_size`. Shared by the
-    /// backbone (`ModernBert`) and MLM (`ModernBertForMaskedLm`) Hub loaders so
-    /// both stay in sync without copy-pasting the field list.
-    pub fn merge_structural_from(&mut self, parsed: &Self) {
-        self.vocab_size = parsed.vocab_size;
-        self.hidden_size = parsed.hidden_size;
-        self.num_hidden_layers = parsed.num_hidden_layers;
-        self.num_attention_heads = parsed.num_attention_heads;
-        self.intermediate_size = parsed.intermediate_size;
-        self.max_position_embeddings = parsed.max_position_embeddings;
-        self.layer_norm_eps = parsed.layer_norm_eps;
-        self.global_rope_theta = parsed.global_rope_theta;
-        self.local_rope_theta = parsed.local_rope_theta;
-        self.local_attention = parsed.local_attention;
-        self.global_attn_every_n_layers = parsed.global_attn_every_n_layers;
-        self.pad_token_id = parsed.pad_token_id;
-        self.tie_word_embeddings = parsed.tie_word_embeddings;
-        self.decoder_bias = parsed.decoder_bias;
-    }
 }
 
 impl Default for ModernBertConfig {

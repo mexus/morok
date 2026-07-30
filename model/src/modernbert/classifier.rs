@@ -24,6 +24,7 @@ use crate::jit::InputSpec;
 use crate::modernbert::config::{ClassifierPooling, ModernBertConfig};
 use crate::modernbert::error::{Result, StateSnafu, TensorSnafu};
 use crate::modernbert::head_jit::{HeadError, JitSnafu, execute_head};
+use crate::modernbert::masked_mean;
 use crate::modernbert::model::ModernBert;
 use crate::modernbert::normalization::LayerNormWeights;
 use crate::state::{self, HasStateDict, StateDict, get_tensor};
@@ -145,9 +146,6 @@ impl ModernBertClassificationModel {
 
 // ─── classify_head IR builder ──────────────────────────────────────────────
 
-/// Numerical epsilon guarding the masked-mean denominator.
-const EPS: f64 = 1e-12;
-
 /// Pool → `prediction_head_tail`. Pure IR builder — fused into the JIT plan by
 /// the `build` closure in [`ModernBertClassifierJit`].
 fn classify_head(hidden: &Tensor, mask: &Tensor, head: &ClassifierHead, pooling: ClassifierPooling) -> Result<Tensor> {
@@ -181,30 +179,6 @@ pub(crate) fn prediction_head_tail(hidden: &Tensor, head: &ClassifierHead) -> Re
         normed.linear().weight(&head.classifier_weight).bias(&head.classifier_bias).call().context(TensorSnafu)?;
 
     logits.cast(DType::Float32).context(TensorSnafu)
-}
-
-/// Masked mean over the sequence axis (no L2-norm, unlike `pool_embed`).
-/// `hidden` is `(B, L, D)`, `mask` is bool `(B, L)`. Returns `(B, D)`.
-fn masked_mean(hidden: &Tensor, mask: &Tensor) -> Result<Tensor> {
-    let dtype = hidden.uop().dtype();
-    let eps = Tensor::const_(EPS, dtype.clone());
-
-    let mask_f = mask.cast(dtype.clone()).context(TensorSnafu)?;
-    let mask_f = mask_f.try_unsqueeze(2).context(TensorSnafu)?; // (B, L, 1)
-
-    let xw_sum = hidden
-        .try_mul(&mask_f)
-        .context(TensorSnafu)?
-        .sum_with()
-        .axes(1isize)
-        .keepdim(true)
-        .call()
-        .context(TensorSnafu)?;
-    let denom = mask_f.sum_with().axes(1isize).keepdim(true).call().context(TensorSnafu)?;
-    let denom = denom.try_add(&eps).context(TensorSnafu)?;
-
-    let mean = xw_sum.try_div(&denom).context(TensorSnafu)?;
-    mean.try_squeeze(Some(1)).context(TensorSnafu)
 }
 
 // ─── runtime (owns JIT, impl Encoder + Classify) ───────────────────────────
