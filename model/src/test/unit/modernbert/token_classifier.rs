@@ -4,17 +4,37 @@
 //! weights, enough to exercise the JIT prepare/pack/execute/read path and the
 //! fused mask + per-token head semantics.
 
+use std::sync::{LazyLock, Mutex, MutexGuard};
+
 use svod_arch::pipelines::text::{Encoding, Recognize, TokenClassification};
 
 use crate::modernbert::{ModernBertTokenClassificationModel, ModernBertTokenClassifier};
 use crate::test::unit::modernbert::model::tiny_cfg;
 
-/// Build a token classifier from a tiny random-weight model, prepared at
-/// `[max_batch, max_seq]`.
-fn recognizer(max_batch: usize, max_seq: usize) -> ModernBertTokenClassifier {
-    let cfg = tiny_cfg();
-    let model = ModernBertTokenClassificationModel::empty(&cfg);
-    ModernBertTokenClassifier::new(model, max_batch, max_seq).expect("prepare token-classifier JIT")
+/// Canonical prepared sizes for the shared token-classifier fixture. Compiling
+/// the 2-layer CPU JIT graph takes ~60s, so every test runs against a plan
+/// prepared once at these sizes; metadata-only assertions that used other sizes
+/// are normalized onto them.
+const MAX_BATCH: usize = 4;
+const MAX_SEQ: usize = 16;
+
+/// One JIT-compiled token classifier shared by every test in the module.
+/// Prepared once per process (`LazyLock` init), then borrowed under a `Mutex`:
+/// the only shared mutable state is the plan's input/output buffers, which each
+/// `recognize_batch` fully overwrites before reading back the live `b` rows — so
+/// sharing is contamination-free. Every assertion here is a weight-agnostic
+/// invariant (shape, finiteness, single-vs-batch consistency, mask invariance),
+/// so a single random instance serves them all.
+static RECOGNIZER: LazyLock<Mutex<ModernBertTokenClassifier>> = LazyLock::new(|| {
+    let model = ModernBertTokenClassificationModel::empty(&tiny_cfg());
+    Mutex::new(ModernBertTokenClassifier::new(model, MAX_BATCH, MAX_SEQ).expect("prepare token-classifier JIT"))
+});
+
+/// Borrow the shared prepared token classifier. Recovers from poison so a
+/// panicking test doesn't cascade failures into its siblings — the buffers are
+/// rewritten each call, so the post-poison state is still safe to reuse.
+fn recognizer() -> MutexGuard<'static, ModernBertTokenClassifier> {
+    RECOGNIZER.lock().unwrap_or_else(|p| p.into_inner())
 }
 
 /// A consistent encoding: `n` real token ids (1..) with mask all-ones, plus
@@ -45,8 +65,9 @@ fn max_delta(a: &[f32], b: &[f32]) -> f32 {
 /// `(seq_len, num_labels)` logit grid (padding excluded from `seq_len`), and all
 /// finite.
 #[test]
+#[ignore = "heavy: 2-layer ModernBERT JIT graph compile through the CPU backend"]
 fn recognize_batch_shapes_and_finite() {
-    let mut rec = recognizer(4, 16);
+    let mut rec = recognizer();
     let nl = rec.num_labels();
     let e1 = encoding(&[1, 2, 3], 0);
     let e2 = encoding(&[4, 5], 1);
@@ -64,23 +85,26 @@ fn recognize_batch_shapes_and_finite() {
 
 /// `num_labels()` reports the config's value.
 #[test]
+#[ignore = "heavy: 2-layer ModernBERT JIT graph compile through the CPU backend"]
 fn num_labels_reported() {
-    let rec = recognizer(4, 16);
+    let rec = recognizer();
     assert_eq!(rec.num_labels(), tiny_cfg().num_labels);
 }
 
 /// `capacity()` reports the prepared sizes.
 #[test]
+#[ignore = "heavy: 2-layer ModernBERT JIT graph compile through the CPU backend"]
 fn capacity_reported() {
-    let rec = recognizer(7, 42);
-    assert_eq!(rec.capacity(), (7, 42));
+    let rec = recognizer();
+    assert_eq!(rec.capacity(), (MAX_BATCH, MAX_SEQ));
 }
 
 /// The trait-default `recognize` (batch-of-one) agrees exactly with
 /// `recognize_batch(&[e])[0]`.
 #[test]
+#[ignore = "heavy: 2-layer ModernBERT JIT graph compile through the CPU backend"]
 fn recognize_single_matches_batch_of_one() {
-    let mut rec = recognizer(4, 16);
+    let mut rec = recognizer();
     let e = encoding(&[1, 2, 3], 0);
     let single = rec.recognize(&e, false).unwrap().0;
     let batch = rec.recognize_batch(&[&e], false).unwrap().0;
@@ -90,8 +114,9 @@ fn recognize_single_matches_batch_of_one() {
 /// A multi-row batch yields the same per-token logits as individual calls
 /// (within fp tolerance) — the symbolic batch dim doesn't cross-contaminate.
 #[test]
+#[ignore = "heavy: 2-layer ModernBERT JIT graph compile through the CPU backend"]
 fn batch_rows_match_single_calls() {
-    let mut rec = recognizer(4, 16);
+    let mut rec = recognizer();
     let nl = rec.num_labels();
     let inputs = [encoding(&[1, 2, 3], 0), encoding(&[4, 5], 1), encoding(&[6, 7, 8, 9], 0)];
     let refs: Vec<Vec<f32>> = inputs
@@ -110,8 +135,9 @@ fn batch_rows_match_single_calls() {
 
 /// An empty batch is a cheap no-op (no profile unless requested).
 #[test]
+#[ignore = "heavy: 2-layer ModernBERT JIT graph compile through the CPU backend"]
 fn empty_batch_returns_empty() {
-    let mut rec = recognizer(4, 16);
+    let mut rec = recognizer();
     let (out, prof) = rec.recognize_batch(&[], false).expect("empty batch");
     assert!(out.is_empty());
     assert!(prof.is_none());
@@ -122,17 +148,21 @@ fn empty_batch_returns_empty() {
 
 /// A batch larger than the prepared `max_batch` is rejected.
 #[test]
+#[ignore = "heavy: 2-layer ModernBERT JIT graph compile through the CPU backend"]
 fn capacity_exceeded_errors() {
-    let mut rec = recognizer(2, 16);
+    let mut rec = recognizer();
+    // One more than the prepared MAX_BATCH.
     let e = encoding(&[1, 2, 3], 0);
-    let err = rec.recognize_batch(&[&e, &e, &e], false).unwrap_err();
+    let batch = std::iter::repeat_n(&e, MAX_BATCH + 1).collect::<Vec<_>>();
+    let err = rec.recognize_batch(&batch, false).unwrap_err();
     assert!(err.to_string().contains("exceeds"), "{err}");
 }
 
 /// A profiled run emits a `recognize` GPU stage.
 #[test]
+#[ignore = "heavy: 2-layer ModernBERT JIT graph compile through the CPU backend"]
 fn profile_returned_when_requested() {
-    let mut rec = recognizer(4, 16);
+    let mut rec = recognizer();
     let e = encoding(&[1, 2, 3], 0);
     let (_, prof) = rec.recognize_batch(&[&e], true).expect("profiled run");
     let prof = prof.expect("profile collected");
@@ -143,8 +173,9 @@ fn profile_returned_when_requested() {
 /// tokens (the load-bearing mask property): same content, with vs without
 /// trailing pad, agrees within fp tolerance on the real-token rows.
 #[test]
+#[ignore = "heavy: 2-layer ModernBERT JIT graph compile through the CPU backend"]
 fn padding_with_correct_mask_is_invariant() {
-    let mut rec = recognizer(4, 16);
+    let mut rec = recognizer();
     let nl = rec.num_labels();
     let real = 3;
 

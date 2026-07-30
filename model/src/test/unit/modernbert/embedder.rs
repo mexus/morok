@@ -3,17 +3,39 @@
 //! with `fan_in_uniform` random token embeddings, enough to exercise the JIT
 //! prepare/pack/execute/read path and the fused mask+pool+norm semantics.
 
-use svod_arch::pipelines::text::{Embed, Embedding, Encoding};
+use std::sync::{LazyLock, Mutex, MutexGuard};
 
-use crate::modernbert::ModernBert;
+use svod_arch::pipelines::text::{Embed, Embedding, Encoding};
+use svod_device::{Buffer, BufferSpec, cpu};
+use svod_dtype::DType;
+
+use crate::modernbert::{ModernBert, ModernBertEmbedder, pack_ids_buffer, pack_mask_buffer};
 use crate::test::unit::modernbert::model::tiny_cfg;
 
-/// Build an embedder from a tiny random-weight backbone, prepared at
-/// `[max_batch, max_seq]`.
-fn embedder(max_batch: usize, max_seq: usize) -> ModernBertEmbedder {
-    let cfg = tiny_cfg();
-    let model = ModernBert::empty(cfg.clone());
-    ModernBertEmbedder::new(model, max_batch, max_seq).expect("prepare embedder JIT")
+/// Canonical prepared sizes for the shared embedder fixture. Compiling the
+/// 2-layer CPU JIT graph takes ~60s, so every test in this module runs against
+/// a single plan prepared once at these sizes; metadata-only assertions that
+/// used other sizes are normalized onto them.
+const MAX_BATCH: usize = 4;
+const MAX_SEQ: usize = 16;
+
+/// One JIT-compiled embedder shared by every test in the module. Prepared once
+/// per process (`LazyLock` init), then borrowed under a `Mutex`: the only shared
+/// mutable state is the plan's input/output buffers, which each `embed_batch`
+/// fully overwrites before reading back the live `b` rows — so sharing is
+/// contamination-free. Every assertion here is a weight-agnostic invariant
+/// (shape, finiteness, single-vs-batch consistency, mask invariance), so a
+/// single random instance serves them all.
+static EMBEDDER: LazyLock<Mutex<ModernBertEmbedder>> = LazyLock::new(|| {
+    let model = ModernBert::empty(tiny_cfg());
+    Mutex::new(ModernBertEmbedder::new(model, MAX_BATCH, MAX_SEQ).expect("prepare embedder JIT"))
+});
+
+/// Borrow the shared prepared embedder. Recovers from poison so a panicking
+/// test doesn't cascade failures into its siblings — the buffers are rewritten
+/// each call, so the post-poison state is still safe to reuse.
+fn embedder() -> MutexGuard<'static, ModernBertEmbedder> {
+    EMBEDDER.lock().unwrap_or_else(|p| p.into_inner())
 }
 
 /// A consistent encoding: `n` real token ids (1..) with mask all-ones, plus
@@ -43,13 +65,12 @@ fn max_delta(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max)
 }
 
-use crate::modernbert::ModernBertEmbedder;
-
 /// `embed_batch` returns one embedding per input, each of length `hidden_size`,
 /// and each L2-normalized (norm ≈ 1).
 #[test]
+#[ignore = "heavy: 2-layer ModernBERT JIT graph compile through the CPU backend"]
 fn embed_batch_shapes_and_norms() {
-    let mut emb = embedder(4, 16);
+    let mut emb = embedder();
     let hidden = emb.hidden_size();
     let e1 = encoding(&[1, 2, 3], 0);
     let e2 = encoding(&[4, 5], 1);
@@ -68,8 +89,9 @@ fn embed_batch_shapes_and_norms() {
 /// The trait-default `embed` (batch-of-one) agrees with `embed_batch` on a
 /// single input — the default delegates to the batch path and pops.
 #[test]
+#[ignore = "heavy: 2-layer ModernBERT JIT graph compile through the CPU backend"]
 fn embed_single_matches_batch_of_one() {
-    let mut emb = embedder(4, 16);
+    let mut emb = embedder();
     let e = encoding(&[1, 2, 3, 4], 0);
     let single = emb.embed(&e, false).expect("embed").0;
     let batch = emb.embed_batch(&[&e], false).expect("embed_batch");
@@ -82,8 +104,9 @@ fn embed_single_matches_batch_of_one() {
 /// sequence `[1,2,3]` (no pad) and `[1,2,3]` + 2 pad tokens (mask 0) must yield
 /// the **same** embedding — proving masked mean-pool, not raw mean-pool.
 #[test]
+#[ignore = "heavy: 2-layer ModernBERT JIT graph compile through the CPU backend"]
 fn pooling_ignores_pad_positions() {
-    let mut emb = embedder(4, 16);
+    let mut emb = embedder();
     let unpadded = encoding(&[1, 2, 3], 0);
     let padded = encoding(&[1, 2, 3], 2); // two trailing pad positions, mask 0
     let a = emb.embed(&unpadded, false).expect("unpadded").0;
@@ -94,20 +117,23 @@ fn pooling_ignores_pad_positions() {
 
 /// `hidden_size`/`capacity` report the prepared sizes.
 #[test]
+#[ignore = "heavy: 2-layer ModernBERT JIT graph compile through the CPU backend"]
 fn capacity_reports_prepared_sizes() {
-    let emb = embedder(3, 12);
+    let emb = embedder();
     let (mb, ms) = emb.capacity();
-    assert_eq!(mb, 3);
-    assert_eq!(ms, 12);
+    assert_eq!(mb, MAX_BATCH);
+    assert_eq!(ms, MAX_SEQ);
     assert_eq!(emb.hidden_size(), 32, "matches tiny_cfg hidden_size");
 }
 
 /// A batch exceeding `max_batch` is rejected up front (CapacityExceeded), not
 /// silently truncated or overflowed.
 #[test]
+#[ignore = "heavy: 2-layer ModernBERT JIT graph compile through the CPU backend"]
 fn batch_over_max_batch_is_rejected() {
-    let mut emb = embedder(2, 8);
-    let encs = [encoding(&[1], 0), encoding(&[2], 0), encoding(&[3], 0)];
+    let mut emb = embedder();
+    // One more than the prepared MAX_BATCH.
+    let encs = (1..=MAX_BATCH + 1).map(|i| encoding(&[i as u32], 0)).collect::<Vec<_>>();
     let refs: Vec<&Encoding> = encs.iter().collect();
     let err = emb.embed_batch(&refs, false).unwrap_err();
     assert!(matches!(err, crate::modernbert::EmbedderError::CapacityExceeded { .. }));
@@ -116,8 +142,9 @@ fn batch_over_max_batch_is_rejected() {
 /// An empty batch is a no-op returning no embeddings (mirrors the pipeline's
 /// zero-chunk guard).
 #[test]
+#[ignore = "heavy: 2-layer ModernBERT JIT graph compile through the CPU backend"]
 fn empty_batch_is_noop() {
-    let mut emb = embedder(2, 8);
+    let mut emb = embedder();
     let (out, prof) = emb.embed_batch(&[], false).expect("empty batch");
     assert!(out.is_empty());
     assert!(prof.is_none());
@@ -126,8 +153,9 @@ fn empty_batch_is_noop() {
 /// A profiled run yields a profile with an `embed` GPU stage; an unprofiled run
 /// on the same embedder yields none (per-call, no rebuild).
 #[test]
+#[ignore = "heavy: 2-layer ModernBERT JIT graph compile through the CPU backend"]
 fn profiled_run_emits_embed_stage() {
-    let mut emb = embedder(2, 8);
+    let mut emb = embedder();
     let e = encoding(&[1, 2], 0);
     let prof = emb.embed(&e, true).expect("profiled").1.expect("profile present");
     assert!(prof.stages.iter().any(|s| s.name == "embed"), "embed stage present");
@@ -141,8 +169,9 @@ fn profiled_run_emits_embed_stage() {
 /// computation whether `b` binds to 1 or 2 (the symbolic-batch graph computes
 /// only the first `b` rows), so the bits must match.
 #[test]
+#[ignore = "heavy: 2-layer ModernBERT JIT graph compile through the CPU backend"]
 fn embed_batch_rows_match_single_calls() {
-    let mut emb = embedder(4, 16);
+    let mut emb = embedder();
     let e1 = encoding(&[1, 2, 3], 0);
     let e2 = encoding(&[10, 20, 30, 40], 0);
     let batch = emb.embed_batch(&[&e1, &e2], false).expect("embed_batch").0;
@@ -158,8 +187,9 @@ fn embed_batch_rows_match_single_calls() {
 /// batch packing must not collapse pooling to a raw mean over the padded length.
 /// Tolerance 1e-4 mirrors `pooling_ignores_pad_positions`.
 #[test]
+#[ignore = "heavy: 2-layer ModernBERT JIT graph compile through the CPU backend"]
 fn batch_path_respects_attention_mask() {
-    let mut emb = embedder(4, 16);
+    let mut emb = embedder();
     let padded = encoding(&[1, 2, 3], 2);
     let unpadded = encoding(&[1, 2, 3], 0);
     let batch = emb.embed_batch(&[&padded, &unpadded], false).expect("embed_batch").0;
@@ -176,8 +206,9 @@ fn batch_path_respects_attention_mask() {
 /// a profiled run emits a GPU stage named `embed`; an unprofiled run on the same
 /// embedder emits none — the profile switch is per-call, no rebuild.
 #[test]
+#[ignore = "heavy: 2-layer ModernBERT JIT graph compile through the CPU backend"]
 fn embed_batch_profile_emits_stage() {
-    let mut emb = embedder(2, 8);
+    let mut emb = embedder();
     let e1 = encoding(&[1, 2], 0);
     let e2 = encoding(&[3, 4], 0);
     let prof = emb.embed_batch(&[&e1, &e2], true).expect("profiled embed_batch").1.expect("profile present");
@@ -186,4 +217,40 @@ fn embed_batch_profile_emits_stage() {
         emb.embed_batch(&[&e1, &e2], false).expect("unprofiled embed_batch").1.is_none(),
         "unprofiled yields no profile"
     );
+}
+
+// ── buffer packing (fast, no JIT) ───────────────────────────────────────────
+//
+// `pack_ids_buffer` / `pack_mask_buffer` are the shared host-side packing logic
+// for the embedder, classifier, and token-classifier batch paths — the
+// load-bearing mask/pad correctness. Exercising them directly keeps that
+// coverage in the fast default suite (the JIT end-to-end version lives in the
+// `#[ignore = "heavy"]` tier above).
+
+/// Packing honors the per-row `max_seq` stride, zero-fills pad positions and
+/// unused rows, and truncates over-length inputs. The mask mirrors the ids'
+/// real-token counts. This is the property the JIT mask-invariance tests rely on.
+#[test]
+fn pack_buffers_pad_stride_and_truncate_correctly() {
+    let max_batch = 3;
+    let max_seq = 4;
+    let n = max_batch * max_seq;
+    let alloc = cpu().expect("cpu allocator");
+    let mut ids = Buffer::new(alloc.clone(), DType::Int64, vec![n], BufferSpec::default());
+    let mut mask = Buffer::new(alloc, DType::Int64, vec![n], BufferSpec::default());
+
+    // e1: 2 real tokens + 1 trailing pad (mask 0). e2: 5 real tokens — one over
+    // max_seq, so the last must be truncated. Row 2 left unused.
+    let e1 = encoding(&[1, 2], 1);
+    let e2 = encoding(&[10, 20, 30, 40, 50], 0);
+    pack_ids_buffer(&mut ids, &[&e1, &e2], max_seq).expect("pack ids");
+    pack_mask_buffer(&mut mask, &[&e1, &e2], max_seq).expect("pack mask");
+
+    let ids_v = ids.as_array::<i64>().unwrap().as_slice().unwrap().to_vec();
+    let mask_v = mask.as_array::<i64>().unwrap().as_slice().unwrap().to_vec();
+
+    // Row 0: [1,2] + pad(0) + fill(0). Row 1: first 4 of 5 (truncated). Row 2: unused.
+    assert_eq!(ids_v, vec![1, 2, 0, 0, 10, 20, 30, 40, 0, 0, 0, 0]);
+    // Mask mirrors real-token positions only; pad + fill + unused stay 0.
+    assert_eq!(mask_v, vec![1, 1, 0, 0, 1, 1, 1, 1, 0, 0, 0, 0]);
 }

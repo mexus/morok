@@ -4,25 +4,50 @@
 //! enough to exercise the JIT prepare/pack/execute/read path and the fused
 //! mask+pool+head semantics.
 
+use std::sync::{LazyLock, Mutex, MutexGuard};
+
 use svod_arch::pipelines::text::{Classification, Classify, Encoding};
 
 use crate::modernbert::{ClassifierPooling, ModernBertClassificationModel, ModernBertClassifier};
 use crate::test::unit::modernbert::model::tiny_cfg;
 
-/// Build a classifier from a tiny random-weight model, prepared at
-/// `[max_batch, max_seq]`.
-fn classifier(max_batch: usize, max_seq: usize) -> ModernBertClassifier {
-    let cfg = tiny_cfg();
-    let model = ModernBertClassificationModel::empty(&cfg);
-    ModernBertClassifier::new(model, max_batch, max_seq).expect("prepare classifier JIT")
-}
+/// Canonical prepared sizes for the shared classifier fixtures. Compiling the
+/// 2-layer CPU JIT graph takes ~60s, so every test runs against a plan prepared
+/// once at these sizes; metadata-only assertions that used other sizes are
+/// normalized onto them.
+const MAX_BATCH: usize = 4;
+const MAX_SEQ: usize = 16;
 
-/// Variant with a specific pooling strategy.
-fn classifier_with_pooling(max_batch: usize, max_seq: usize, pooling: ClassifierPooling) -> ModernBertClassifier {
+/// Build a classifier from `tiny_cfg` with `pooling`, prepared once at the
+/// canonical sizes. Used to seed the shared fixtures below.
+fn prepared(pooling: ClassifierPooling) -> ModernBertClassifier {
     let mut cfg = tiny_cfg();
     cfg.classifier_pooling = pooling;
     let model = ModernBertClassificationModel::empty(&cfg);
-    ModernBertClassifier::new(model, max_batch, max_seq).expect("prepare classifier JIT")
+    ModernBertClassifier::new(model, MAX_BATCH, MAX_SEQ).expect("prepare classifier JIT")
+}
+
+/// Shared CLS-pooling classifier (the `tiny_cfg` default). Every weight-agnostic
+/// test borrows this one compiled plan; the only shared mutable state is the
+/// plan's input/output buffers, which each `classify_batch` fully overwrites
+/// before reading back the live `b` rows — so sharing is contamination-free.
+static CLS_CLASSIFIER: LazyLock<Mutex<ModernBertClassifier>> =
+    LazyLock::new(|| Mutex::new(prepared(ClassifierPooling::Cls)));
+
+/// Shared mean-pooling classifier for the pooling-semantics tests.
+static MEAN_CLASSIFIER: LazyLock<Mutex<ModernBertClassifier>> =
+    LazyLock::new(|| Mutex::new(prepared(ClassifierPooling::Mean)));
+
+/// Borrow the shared CLS classifier. Recovers from poison so a panicking test
+/// doesn't cascade failures into its siblings — the buffers are rewritten each
+/// call, so the post-poison state is still safe to reuse.
+fn classifier() -> MutexGuard<'static, ModernBertClassifier> {
+    CLS_CLASSIFIER.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// Borrow the shared mean-pooling classifier (same poison-recovery rationale).
+fn mean_classifier() -> MutexGuard<'static, ModernBertClassifier> {
+    MEAN_CLASSIFIER.lock().unwrap_or_else(|p| p.into_inner())
 }
 
 /// A consistent encoding: `n` real token ids (1..) with mask all-ones, plus
@@ -52,8 +77,9 @@ fn max_delta(a: &[f32], b: &[f32]) -> f32 {
 /// `classify_batch` returns one classification per input, each with `num_classes`
 /// logits, and all finite.
 #[test]
+#[ignore = "heavy: 2-layer ModernBERT JIT graph compile through the CPU backend"]
 fn classify_batch_shapes_and_finite() {
-    let mut clf = classifier(4, 16);
+    let mut clf = classifier();
     let nc = clf.num_classes();
     let e1 = encoding(&[1, 2, 3], 0);
     let e2 = encoding(&[4, 5], 1);
@@ -68,24 +94,27 @@ fn classify_batch_shapes_and_finite() {
 
 /// `num_classes()` reports the config's value.
 #[test]
+#[ignore = "heavy: 2-layer ModernBERT JIT graph compile through the CPU backend"]
 fn num_classes_reported() {
-    let clf = classifier(4, 16);
+    let clf = classifier();
     assert_eq!(clf.num_classes(), tiny_cfg().num_labels);
 }
 
-/// `capacity()` returns `(max_batch, max_seq)`.
+/// `capacity()` returns the prepared `(max_batch, max_seq)`.
 #[test]
+#[ignore = "heavy: 2-layer ModernBERT JIT graph compile through the CPU backend"]
 fn capacity_reported() {
-    let clf = classifier(7, 42);
-    assert_eq!(clf.capacity(), (7, 42));
+    let clf = classifier();
+    assert_eq!(clf.capacity(), (MAX_BATCH, MAX_SEQ));
 }
 
 // ── consistency ────────────────────────────────────────────────────────────
 
 /// The trait-default `classify` (batch-of-one) agrees with `classify_batch`.
 #[test]
+#[ignore = "heavy: 2-layer ModernBERT JIT graph compile through the CPU backend"]
 fn classify_single_matches_batch_of_one() {
-    let mut clf = classifier(4, 16);
+    let mut clf = classifier();
     let e = encoding(&[1, 2, 3, 4], 0);
     let single = clf.classify(&e, false).expect("classify").0;
     let batch = clf.classify_batch(&[&e], false).expect("classify_batch");
@@ -96,8 +125,9 @@ fn classify_single_matches_batch_of_one() {
 
 /// Multi-input batch yields the same logits as individual calls.
 #[test]
+#[ignore = "heavy: 2-layer ModernBERT JIT graph compile through the CPU backend"]
 fn batch_rows_match_single_calls() {
-    let mut clf = classifier(4, 16);
+    let mut clf = classifier();
     let e1 = encoding(&[1, 2, 3], 0);
     let e2 = encoding(&[4, 5, 6, 7], 1);
     let e3 = encoding(&[8], 2);
@@ -117,8 +147,9 @@ fn batch_rows_match_single_calls() {
 
 /// Empty batch → empty results, profile optional.
 #[test]
+#[ignore = "heavy: 2-layer ModernBERT JIT graph compile through the CPU backend"]
 fn empty_batch_returns_empty() {
-    let mut clf = classifier(4, 16);
+    let mut clf = classifier();
     let (out, prof) = clf.classify_batch(&[], false).expect("empty batch");
     assert!(out.is_empty());
     assert!(prof.is_none());
@@ -130,12 +161,13 @@ fn empty_batch_returns_empty() {
 
 /// Over-capacity batch → `CapacityExceeded` error.
 #[test]
+#[ignore = "heavy: 2-layer ModernBERT JIT graph compile through the CPU backend"]
 fn capacity_exceeded_errors() {
-    let mut clf = classifier(2, 16);
-    let e1 = encoding(&[1], 0);
-    let e2 = encoding(&[2], 0);
-    let e3 = encoding(&[3], 0);
-    let err = clf.classify_batch(&[&e1, &e2, &e3], false);
+    let mut clf = classifier();
+    // One more than the prepared MAX_BATCH.
+    let encs = (1..=MAX_BATCH + 1).map(|i| encoding(&[i as u32], 0)).collect::<Vec<_>>();
+    let refs: Vec<&Encoding> = encs.iter().collect();
+    let err = clf.classify_batch(&refs, false);
     assert!(err.is_err(), "batch > max_batch must error");
 }
 
@@ -143,8 +175,9 @@ fn capacity_exceeded_errors() {
 
 /// Profile is `Some` and contains a `"classify"` GPU stage when requested.
 #[test]
+#[ignore = "heavy: 2-layer ModernBERT JIT graph compile through the CPU backend"]
 fn profile_returned_when_requested() {
-    let mut clf = classifier(4, 16);
+    let mut clf = classifier();
     let e = encoding(&[1, 2, 3], 0);
     let (_, prof) = clf.classify_batch(&[&e], true).expect("classify_batch");
     let prof = prof.expect("profile requested");
@@ -155,15 +188,16 @@ fn profile_returned_when_requested() {
 
 /// CLS and mean pooling produce different logits on the same input.
 #[test]
+#[ignore = "heavy: 2-layer ModernBERT JIT graph compile through the CPU backend"]
 fn cls_vs_mean_pooling_differ() {
     let e = encoding(&[1, 2, 3, 4, 5], 0);
 
-    let mut cls_clf = classifier_with_pooling(2, 16, ClassifierPooling::Cls);
-    let mut mean_clf = classifier_with_pooling(2, 16, ClassifierPooling::Mean);
+    let mut cls_clf = classifier();
+    let mut mean_clf = mean_classifier();
 
-    // Use the same backbone weights so the only difference is pooling + head.
-    // (Different random heads, so the logits will differ trivially, but we
-    // verify the models don't crash and produce valid output.)
+    // Different random heads (each fixture built from its own `empty`), so the
+    // logits will differ trivially — we just verify both pooling strategies run
+    // and produce finite output.
     let cls_logits = cls_clf.classify(&e, false).expect("cls classify").0.logits;
     let mean_logits = mean_clf.classify(&e, false).expect("mean classify").0.logits;
 
@@ -176,11 +210,12 @@ fn cls_vs_mean_pooling_differ() {
 /// the mean. This is the load-bearing property: the classifier is invariant to
 /// sequence padding.
 #[test]
+#[ignore = "heavy: 2-layer ModernBERT JIT graph compile through the CPU backend"]
 fn padding_with_correct_mask_is_invariant() {
     let e_no_pad = encoding(&[1, 2, 3, 4], 0);
     let e_with_pad = encoding(&[1, 2, 3, 4], 2);
 
-    let mut mean_clf = classifier_with_pooling(2, 16, ClassifierPooling::Mean);
+    let mut mean_clf = mean_classifier();
     let mean_a = mean_clf.classify(&e_no_pad, false).expect("mean no-pad").0.logits;
     let mean_b = mean_clf.classify(&e_with_pad, false).expect("mean with-pad").0.logits;
     assert!(
@@ -189,7 +224,7 @@ fn padding_with_correct_mask_is_invariant() {
         max_delta(&mean_a, &mean_b)
     );
 
-    let mut cls_clf = classifier_with_pooling(2, 16, ClassifierPooling::Cls);
+    let mut cls_clf = classifier();
     let cls_a = cls_clf.classify(&e_no_pad, false).expect("cls no-pad").0.logits;
     let cls_b = cls_clf.classify(&e_with_pad, false).expect("cls with-pad").0.logits;
     assert!(

@@ -33,6 +33,8 @@ pub use classifier::{ClassifierError, ModernBertClassifier};
 pub use classifier_jit::ModernBertClassifierJit;
 pub use config::{ClassifierPooling, ModernBertConfig};
 pub use embedder::{EmbedderError, ModernBertEmbedder};
+#[cfg(test)]
+pub(crate) use embedder::{pack_ids_buffer, pack_mask_buffer};
 pub use embedder_jit::ModernBertEmbedderJit;
 pub use encoder::Encoder;
 pub use encoder_layer::EncoderLayer;
