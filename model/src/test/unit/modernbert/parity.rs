@@ -8,7 +8,7 @@
 
 use std::path::{Path, PathBuf};
 
-use svod_arch::pipelines::text::{Classify, Embed, Encoding, Recognize};
+use svod_arch::pipelines::text::{Encoder, Encoding};
 
 use svod_dtype::DType;
 use svod_tensor::Tensor;
@@ -227,7 +227,7 @@ fn embeddings_match_pytorch() {
         offsets: vec![(0, 0); seq_len],
         special_tokens_mask: vec![0; seq_len],
     };
-    let (got, _prof) = embedder.embed_batch(&[&enc], false).expect("embed");
+    let (got, _prof) = embedder.run_batch(&[&enc], false).expect("embed");
     let got = &got[0].values;
     assert_eq!(got.len(), d, "embedding dim mismatch");
 
@@ -312,7 +312,7 @@ fn classify_logits_match_pytorch() {
     let (mut classifier, encodings, want, num_labels) = load_classifier_fixture();
 
     let refs: Vec<&Encoding> = encodings.iter().collect();
-    let (classifications, _prof) = classifier.classify_batch(&refs, false).expect("classify");
+    let (classifications, _prof) = classifier.run_batch(&refs, false).expect("classify");
 
     assert_eq!(classifications.len(), encodings.len(), "batch size mismatch");
     for (i, c) in classifications.iter().enumerate() {
@@ -341,7 +341,7 @@ fn ignoring_padding_diverges_in_classification() {
         .collect();
 
     let refs: Vec<&Encoding> = unmasked.iter().collect();
-    let (classifications, _prof) = classifier.classify_batch(&refs, false).expect("classify unmasked");
+    let (classifications, _prof) = classifier.run_batch(&refs, false).expect("classify unmasked");
 
     for (i, c) in classifications.iter().enumerate() {
         let expected = &want[i * num_labels..(i + 1) * num_labels];
@@ -430,7 +430,7 @@ fn token_logits_match_pytorch() {
     let (mut recognizer, encodings, want, num_labels, seq_len) = load_token_fixture();
 
     let refs: Vec<&Encoding> = encodings.iter().collect();
-    let (classifications, _prof) = recognizer.recognize_batch(&refs, false).expect("recognize");
+    let (classifications, _prof) = recognizer.run_batch(&refs, false).expect("recognize");
 
     assert_eq!(classifications.len(), encodings.len(), "batch size mismatch");
     let mut worst = 0.0f32;
@@ -470,7 +470,7 @@ fn ignoring_padding_diverges_in_token_classification() {
         .collect();
 
     let refs: Vec<&Encoding> = unmasked.iter().collect();
-    let (classifications, _prof) = recognizer.recognize_batch(&refs, false).expect("recognize unmasked");
+    let (classifications, _prof) = recognizer.run_batch(&refs, false).expect("recognize unmasked");
 
     for (i, c) in classifications.iter().enumerate() {
         for t in 0..seq_len {

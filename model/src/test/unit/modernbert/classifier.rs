@@ -6,7 +6,7 @@
 
 use std::sync::{LazyLock, Mutex, MutexGuard};
 
-use svod_arch::pipelines::text::{Classification, Classify, Encoding};
+use svod_arch::pipelines::text::{Classification, Classify, Encoder, Encoding};
 
 use crate::modernbert::{ClassifierPooling, ModernBertClassificationModel, ModernBertClassifier};
 use crate::test::unit::modernbert::model::tiny_cfg;
@@ -83,7 +83,7 @@ fn classify_batch_shapes_and_finite() {
     let nc = clf.num_classes();
     let e1 = encoding(&[1, 2, 3], 0);
     let e2 = encoding(&[4, 5], 1);
-    let (out, prof) = clf.classify_batch(&[&e1, &e2], false).expect("classify_batch");
+    let (out, prof) = clf.run_batch(&[&e1, &e2], false).expect("classify_batch");
     assert_eq!(out.len(), 2);
     for Classification { logits } in &out {
         assert_eq!(logits.len(), nc);
@@ -116,8 +116,8 @@ fn capacity_reported() {
 fn classify_single_matches_batch_of_one() {
     let mut clf = classifier();
     let e = encoding(&[1, 2, 3, 4], 0);
-    let single = clf.classify(&e, false).expect("classify").0;
-    let batch = clf.classify_batch(&[&e], false).expect("classify_batch");
+    let single = clf.run(&e, false).expect("classify").0;
+    let batch = clf.run_batch(&[&e], false).expect("classify_batch");
     let batch0 = &batch.0[0];
     let max = max_delta(&single.logits, &batch0.logits);
     assert_eq!(max, 0.0, "default classify must match classify_batch exactly");
@@ -132,11 +132,11 @@ fn batch_rows_match_single_calls() {
     let e2 = encoding(&[4, 5, 6, 7], 1);
     let e3 = encoding(&[8], 2);
 
-    let single1 = clf.classify(&e1, false).expect("classify e1").0;
-    let single2 = clf.classify(&e2, false).expect("classify e2").0;
-    let single3 = clf.classify(&e3, false).expect("classify e3").0;
+    let single1 = clf.run(&e1, false).expect("classify e1").0;
+    let single2 = clf.run(&e2, false).expect("classify e2").0;
+    let single3 = clf.run(&e3, false).expect("classify e3").0;
 
-    let batch = clf.classify_batch(&[&e1, &e2, &e3], false).expect("classify_batch");
+    let batch = clf.run_batch(&[&e1, &e2, &e3], false).expect("classify_batch");
 
     assert!(max_delta(&single1.logits, &batch.0[0].logits) < 1e-4);
     assert!(max_delta(&single2.logits, &batch.0[1].logits) < 1e-4);
@@ -150,11 +150,11 @@ fn batch_rows_match_single_calls() {
 #[ignore = "heavy: 2-layer ModernBERT JIT graph compile through the CPU backend"]
 fn empty_batch_returns_empty() {
     let mut clf = classifier();
-    let (out, prof) = clf.classify_batch(&[], false).expect("empty batch");
+    let (out, prof) = clf.run_batch(&[], false).expect("empty batch");
     assert!(out.is_empty());
     assert!(prof.is_none());
 
-    let (out, prof) = clf.classify_batch(&[], true).expect("empty batch profiled");
+    let (out, prof) = clf.run_batch(&[], true).expect("empty batch profiled");
     assert!(out.is_empty());
     assert!(prof.is_some(), "profiled empty batch yields a (default) profile");
 }
@@ -167,7 +167,7 @@ fn capacity_exceeded_errors() {
     // One more than the prepared MAX_BATCH.
     let encs = (1..=MAX_BATCH + 1).map(|i| encoding(&[i as u32], 0)).collect::<Vec<_>>();
     let refs: Vec<&Encoding> = encs.iter().collect();
-    let err = clf.classify_batch(&refs, false);
+    let err = clf.run_batch(&refs, false);
     assert!(err.is_err(), "batch > max_batch must error");
 }
 
@@ -179,7 +179,7 @@ fn capacity_exceeded_errors() {
 fn profile_returned_when_requested() {
     let mut clf = classifier();
     let e = encoding(&[1, 2, 3], 0);
-    let (_, prof) = clf.classify_batch(&[&e], true).expect("classify_batch");
+    let (_, prof) = clf.run_batch(&[&e], true).expect("classify_batch");
     let prof = prof.expect("profile requested");
     assert!(prof.stage("classify").is_some(), "expected a 'classify' stage in {prof:?}");
 }
@@ -198,8 +198,8 @@ fn cls_vs_mean_pooling_differ() {
     // Different random heads (each fixture built from its own `empty`), so the
     // logits will differ trivially — we just verify both pooling strategies run
     // and produce finite output.
-    let cls_logits = cls_clf.classify(&e, false).expect("cls classify").0.logits;
-    let mean_logits = mean_clf.classify(&e, false).expect("mean classify").0.logits;
+    let cls_logits = cls_clf.run(&e, false).expect("cls classify").0.logits;
+    let mean_logits = mean_clf.run(&e, false).expect("mean classify").0.logits;
 
     assert!(cls_logits.iter().all(|v| v.is_finite()));
     assert!(mean_logits.iter().all(|v| v.is_finite()));
@@ -216,8 +216,8 @@ fn padding_with_correct_mask_is_invariant() {
     let e_with_pad = encoding(&[1, 2, 3, 4], 2);
 
     let mut mean_clf = mean_classifier();
-    let mean_a = mean_clf.classify(&e_no_pad, false).expect("mean no-pad").0.logits;
-    let mean_b = mean_clf.classify(&e_with_pad, false).expect("mean with-pad").0.logits;
+    let mean_a = mean_clf.run(&e_no_pad, false).expect("mean no-pad").0.logits;
+    let mean_b = mean_clf.run(&e_with_pad, false).expect("mean with-pad").0.logits;
     assert!(
         max_delta(&mean_a, &mean_b) < 1e-3,
         "mean pooling with correct mask should be padding-invariant, got delta {}",
@@ -225,8 +225,8 @@ fn padding_with_correct_mask_is_invariant() {
     );
 
     let mut cls_clf = classifier();
-    let cls_a = cls_clf.classify(&e_no_pad, false).expect("cls no-pad").0.logits;
-    let cls_b = cls_clf.classify(&e_with_pad, false).expect("cls with-pad").0.logits;
+    let cls_a = cls_clf.run(&e_no_pad, false).expect("cls no-pad").0.logits;
+    let cls_b = cls_clf.run(&e_with_pad, false).expect("cls with-pad").0.logits;
     assert!(
         max_delta(&cls_a, &cls_b) < 1e-3,
         "CLS pooling with correct mask should be padding-invariant, got delta {}",

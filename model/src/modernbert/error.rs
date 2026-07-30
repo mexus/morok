@@ -23,10 +23,6 @@ pub enum Error {
     SymbolicShape { what: &'static str },
     #[snafu(display("loading tokenizer failed: {source}"))]
     Tokenizer { source: svod_arch::pipelines::text::HfTokenizerError },
-    #[snafu(display("building embedder failed: {source}"))]
-    Embedder { source: super::embedder::EmbedderError },
-    #[snafu(display("building classifier failed: {source}"))]
-    Classifier { source: super::classifier::ClassifierError },
-    #[snafu(display("building token classifier failed: {source}"))]
-    TokenClassifier { source: super::token_classifier::TokenClassifierError },
+    #[snafu(display("building encoder head failed: {source}"))]
+    Head { source: super::head_jit::HeadError },
 }

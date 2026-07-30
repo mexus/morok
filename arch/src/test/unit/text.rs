@@ -3,11 +3,11 @@ use std::convert::Infallible;
 use proptest::prelude::*;
 
 use crate::pipelines::text::{
-    BatchClassifications, BatchEmbeddings, BatchTokenClassifications, ChunkTokenClassification, Chunker,
-    Classification, Classify, ClassifyPipeline, ClassifyPipelineError, Embed, Embedding, EmbeddingsPipeline, Encoding,
-    Entity, HfTokenizer, HfTokenizerError, Recognize, RecognizePipeline, RecognizePipelineError, RunOptions,
-    RunProfile, Scheme, SlidingWindowChunker, TextChunk, TextPipelineError, TokenClassification, TokenLabel, Tokenizer,
-    TruncatingChunker, group_spans, labels_for_tokens,
+    BatchClassifications, BatchEmbeddings, BatchTokenClassifications, ChunkClassification, ChunkEmbedding,
+    ChunkTokenClassification, Chunker, Classification, Classify, Embed, Embedding, Encoder, EncoderPipeline,
+    EncoderPipelineError, Encoding, Entity, HfTokenizer, HfTokenizerError, Recognize, RunOptions, RunProfile, Scheme,
+    SlidingWindowChunker, TextChunk, TokenClassification, TokenLabel, Tokenizer, TruncatingChunker, group_spans,
+    labels_for_tokens,
 };
 
 fn enc(ids: &[u32]) -> Encoding {
@@ -88,19 +88,18 @@ struct StubEmbed {
     error: bool,
 }
 
-impl Embed for StubEmbed {
+impl Encoder for StubEmbed {
+    type Output = Embedding;
+    type ChunkOutput = ChunkEmbedding;
     type Error = StubEmbedError;
-    fn hidden_size(&self) -> usize {
-        self.hidden_size
-    }
     fn capacity(&self) -> (usize, usize) {
         (self.max_batch, self.hidden_size)
     }
-    fn embed_batch(
+    fn run_batch(
         &mut self,
         batch: &[&Encoding],
         profile: bool,
-    ) -> Result<(Vec<Embedding>, Option<RunProfile>), StubEmbedError> {
+    ) -> Result<(Vec<Self::Output>, Option<RunProfile>), Self::Error> {
         if self.error {
             return Err(StubEmbedError);
         }
@@ -112,6 +111,15 @@ impl Embed for StubEmbed {
             p
         });
         Ok((values, prof))
+    }
+    fn attach(chunk: &TextChunk, out: Embedding) -> ChunkEmbedding {
+        ChunkEmbedding { byte_offset: chunk.byte_offset, values: out }
+    }
+}
+
+impl Embed for StubEmbed {
+    fn hidden_size(&self) -> usize {
+        self.hidden_size
     }
 }
 
@@ -128,19 +136,18 @@ struct StubClassify {
     error: bool,
 }
 
-impl Classify for StubClassify {
+impl Encoder for StubClassify {
+    type Output = Classification;
+    type ChunkOutput = ChunkClassification;
     type Error = StubClassifyError;
-    fn num_classes(&self) -> usize {
-        self.num_classes
-    }
     fn capacity(&self) -> (usize, usize) {
         (self.max_batch, self.num_classes)
     }
-    fn classify_batch(
+    fn run_batch(
         &mut self,
         batch: &[&Encoding],
         profile: bool,
-    ) -> Result<(Vec<Classification>, Option<RunProfile>), StubClassifyError> {
+    ) -> Result<(Vec<Self::Output>, Option<RunProfile>), Self::Error> {
         if self.error {
             return Err(StubClassifyError);
         }
@@ -154,6 +161,15 @@ impl Classify for StubClassify {
             p
         });
         Ok((values, prof))
+    }
+    fn attach(chunk: &TextChunk, out: Classification) -> ChunkClassification {
+        ChunkClassification { byte_offset: chunk.byte_offset, logits: out.logits }
+    }
+}
+
+impl Classify for StubClassify {
+    fn num_classes(&self) -> usize {
+        self.num_classes
     }
 }
 
@@ -331,7 +347,7 @@ fn sliding_new_rejects_stride_above_window() {
 fn sliding_pipeline_produces_per_window_embeddings() {
     // StubTokenizer yields [10, 20, 30, 40, 50, 60] (no specials).
     // SlidingWindowChunker(3, 2) → 3 windows at byte_offsets 0, 2, 4.
-    let mut p = EmbeddingsPipeline::new(
+    let mut p = EncoderPipeline::new(
         StubTokenizer { ids: vec![10, 20, 30, 40, 50, 60], max_seq: 3, error: false },
         SlidingWindowChunker::new(3, 2),
         StubEmbed { hidden_size: 3, max_batch: 1, error: false },
@@ -348,7 +364,7 @@ fn sliding_pipeline_produces_per_window_embeddings() {
 
 #[test]
 fn sliding_pipeline_profiles_with_chunk_stage() {
-    let mut p = EmbeddingsPipeline::new(
+    let mut p = EncoderPipeline::new(
         StubTokenizer { ids: vec![10, 20, 30, 40, 50, 60], max_seq: 3, error: false },
         SlidingWindowChunker::new(3, 2),
         StubEmbed { hidden_size: 3, max_batch: 1, error: false },
@@ -368,15 +384,15 @@ fn embed_single_is_batch_of_one() {
     // the values match a direct batch call.
     let mut embed = StubEmbed { hidden_size: 3, max_batch: 1, error: false };
     let e = enc(&[4, 5, 6]);
-    let single = embed.embed(&e, false).unwrap().0;
-    let batch = embed.embed_batch(&[&e], false).unwrap().0;
+    let single = embed.run(&e, false).unwrap().0;
+    let batch = embed.run_batch(&[&e], false).unwrap().0;
     assert_eq!(single, batch.into_iter().next().unwrap());
 }
 
-// ─── EmbeddingsPipeline end-to-end ───────────────────────────────────────────
+// ─── EncoderPipeline end-to-end ───────────────────────────────────────────
 
-fn pipeline(ids: Vec<u32>, max_seq: usize) -> EmbeddingsPipeline<StubTokenizer, TruncatingChunker, StubEmbed> {
-    EmbeddingsPipeline::new(
+fn pipeline(ids: Vec<u32>, max_seq: usize) -> EncoderPipeline<StubTokenizer, TruncatingChunker, StubEmbed> {
+    EncoderPipeline::new(
         StubTokenizer { ids, max_seq, error: false },
         TruncatingChunker::new(max_seq),
         StubEmbed { hidden_size: max_seq, max_batch: 1, error: false },
@@ -451,7 +467,7 @@ fn pipeline_empty_input_skips_embed_batch_and_still_profiles_host_stages() {
 fn pipeline_zero_chunk_run_skips_embed_and_profiles_host_stages() {
     // A chunker that yields zero chunks: the empty-guard must skip embed_batch
     // (so the erroring stub is never hit) while still surfacing tokenize+chunk.
-    let p = EmbeddingsPipeline::new(
+    let p = EncoderPipeline::new(
         StubTokenizer { ids: vec![1, 2], max_seq: 4, error: false },
         NoChunkChunker { max_seq: 4 },
         StubEmbed { hidden_size: 4, max_batch: 1, error: true }, // would fail if called
@@ -484,7 +500,7 @@ impl Chunker for NoChunkChunker {
 #[test]
 fn assemble_passes_chunker_max_seq_into_builder() {
     let seen = std::cell::Cell::new(0usize);
-    let _p: EmbeddingsPipeline<_, TruncatingChunker, StubEmbed> = EmbeddingsPipeline::assemble(
+    let _p: EncoderPipeline<_, TruncatingChunker, StubEmbed> = EncoderPipeline::assemble(
         StubTokenizer { ids: vec![1], max_seq: 8, error: false },
         TruncatingChunker::new(8),
         |max_seq| {
@@ -500,24 +516,24 @@ fn assemble_passes_chunker_max_seq_into_builder() {
 
 #[test]
 fn tokenize_error_maps_to_tokenize_variant() {
-    let mut p = EmbeddingsPipeline::new(
+    let mut p = EncoderPipeline::new(
         StubTokenizer { ids: vec![1], max_seq: 4, error: true },
         TruncatingChunker::new(4),
         StubEmbed { hidden_size: 4, max_batch: 1, error: false },
     );
     let err = p.embed_default("ignored").unwrap_err();
-    assert!(matches!(err, crate::pipelines::text::TextPipelineError::Tokenize { .. }));
+    assert!(matches!(err, crate::pipelines::text::EncoderPipelineError::Tokenize { .. }));
 }
 
 #[test]
 fn embed_error_maps_to_embed_variant() {
-    let mut p = EmbeddingsPipeline::new(
+    let mut p = EncoderPipeline::new(
         StubTokenizer { ids: vec![1, 2], max_seq: 4, error: false },
         TruncatingChunker::new(4),
         StubEmbed { hidden_size: 4, max_batch: 1, error: true },
     );
     let err = p.embed_default("ignored").unwrap_err();
-    assert!(matches!(err, crate::pipelines::text::TextPipelineError::Embed { .. }));
+    assert!(matches!(err, crate::pipelines::text::EncoderPipelineError::Encode { .. }));
 }
 
 // ─── HfTokenizer: a real tokenizers::Tokenizer fixture ─────────────────────────
@@ -623,7 +639,7 @@ fn hf_tokenizer_error_display_and_source() {
     let _: &HfTokenizerError = &err;
 }
 
-// ─── TextPipelineError::Chunk arm (TruncatingChunker::Error = Infallible) ─────
+// ─── EncoderPipelineError::Chunk arm (TruncatingChunker::Error = Infallible) ─────
 
 #[derive(Debug, snafu::Snafu)]
 #[snafu(display("stub chunker error"))]
@@ -646,20 +662,20 @@ impl Chunker for ErrChunker {
 
 #[test]
 fn chunk_error_maps_to_chunk_variant() {
-    let mut p = EmbeddingsPipeline::new(
+    let mut p = EncoderPipeline::new(
         StubTokenizer { ids: vec![1, 2], max_seq: 4, error: false },
         ErrChunker { max_seq: 4 },
         StubEmbed { hidden_size: 4, max_batch: 1, error: false },
     );
     let err = p.embed_default("ignored").unwrap_err();
-    assert!(matches!(err, TextPipelineError::Chunk { .. }));
+    assert!(matches!(err, EncoderPipelineError::Chunk { .. }));
 }
 
 // ─── embed_batch (multi-text) ─────────────────────────────────────────────────
 
 #[test]
 fn batch_basic_three_texts() {
-    let mut p = EmbeddingsPipeline::new(
+    let mut p = EncoderPipeline::new(
         ByteTokenizer { max_seq: 32 },
         TruncatingChunker::new(32),
         StubEmbed { hidden_size: 32, max_batch: 8, error: false },
@@ -676,7 +692,7 @@ fn batch_basic_three_texts() {
 
 #[test]
 fn batch_with_sliding_window_varying_chunk_counts() {
-    let mut p = EmbeddingsPipeline::new(
+    let mut p = EncoderPipeline::new(
         ByteTokenizer { max_seq: 3 },
         SlidingWindowChunker::new(3, 2),
         StubEmbed { hidden_size: 3, max_batch: 8, error: false },
@@ -694,7 +710,7 @@ fn batch_with_sliding_window_varying_chunk_counts() {
 
 #[test]
 fn batch_empty_texts_returns_empty() {
-    let mut p = EmbeddingsPipeline::new(
+    let mut p = EncoderPipeline::new(
         ByteTokenizer { max_seq: 8 },
         TruncatingChunker::new(8),
         StubEmbed { hidden_size: 8, max_batch: 4, error: false },
@@ -706,7 +722,7 @@ fn batch_empty_texts_returns_empty() {
 
 #[test]
 fn batch_some_texts_produce_zero_chunks() {
-    let mut p = EmbeddingsPipeline::new(
+    let mut p = EncoderPipeline::new(
         ByteTokenizer { max_seq: 4 },
         SlidingWindowChunker::new(4, 2),
         StubEmbed { hidden_size: 4, max_batch: 4, error: false },
@@ -722,7 +738,7 @@ fn batch_some_texts_produce_zero_chunks() {
 #[test]
 fn batch_sub_batches_when_chunks_exceed_max_batch() {
     // 5 texts × 1 chunk = 5 chunks; max_batch=2 → 3 sub-batches (2, 2, 1).
-    let mut p = EmbeddingsPipeline::new(
+    let mut p = EncoderPipeline::new(
         ByteTokenizer { max_seq: 8 },
         TruncatingChunker::new(8),
         StubEmbed { hidden_size: 8, max_batch: 2, error: false },
@@ -738,7 +754,7 @@ fn batch_sub_batches_when_chunks_exceed_max_batch() {
 
 #[test]
 fn batch_profile_has_tokenize_chunk_encode_stages() {
-    let mut p = EmbeddingsPipeline::new(
+    let mut p = EncoderPipeline::new(
         ByteTokenizer { max_seq: 8 },
         TruncatingChunker::new(8),
         StubEmbed { hidden_size: 8, max_batch: 4, error: false },
@@ -755,19 +771,19 @@ fn batch_profile_has_tokenize_chunk_encode_stages() {
 
 #[test]
 fn batch_tokenize_error_maps_to_tokenize_variant() {
-    let mut p = EmbeddingsPipeline::new(
+    let mut p = EncoderPipeline::new(
         StubTokenizer { ids: vec![1], max_seq: 4, error: true },
         TruncatingChunker::new(4),
         StubEmbed { hidden_size: 4, max_batch: 4, error: false },
     );
     let err = p.embed_batch_default(&["a", "b"]).unwrap_err();
-    assert!(matches!(err, TextPipelineError::Tokenize { .. }));
+    assert!(matches!(err, EncoderPipelineError::Tokenize { .. }));
 }
 
 #[test]
 fn batch_results_match_individual_embed_calls() {
     let make_pipeline = || {
-        EmbeddingsPipeline::new(
+        EncoderPipeline::new(
             ByteTokenizer { max_seq: 4 },
             SlidingWindowChunker::new(4, 2),
             StubEmbed { hidden_size: 4, max_batch: 8, error: false },
@@ -791,13 +807,10 @@ fn batch_results_match_individual_embed_calls() {
     }
 }
 
-// ─── ClassifyPipeline ────────────────────────────────────────────────────────
+// ─── EncoderPipeline ────────────────────────────────────────────────────────
 
-fn classify_pipeline(
-    ids: Vec<u32>,
-    max_seq: usize,
-) -> ClassifyPipeline<StubTokenizer, TruncatingChunker, StubClassify> {
-    ClassifyPipeline::new(
+fn classify_pipeline(ids: Vec<u32>, max_seq: usize) -> EncoderPipeline<StubTokenizer, TruncatingChunker, StubClassify> {
+    EncoderPipeline::new(
         StubTokenizer { ids, max_seq, error: false },
         TruncatingChunker::new(max_seq),
         StubClassify { num_classes: max_seq, max_batch: 1, error: false },
@@ -808,8 +821,8 @@ fn classify_pipeline(
 fn classify_single_is_batch_of_one() {
     let mut cls = StubClassify { num_classes: 3, max_batch: 1, error: false };
     let e = enc(&[4, 5, 6]);
-    let single = cls.classify(&e, false).unwrap().0;
-    let batch = cls.classify_batch(&[&e], false).unwrap().0;
+    let single = cls.run(&e, false).unwrap().0;
+    let batch = cls.run_batch(&[&e], false).unwrap().0;
     assert_eq!(single, batch.into_iter().next().unwrap());
 }
 
@@ -843,7 +856,7 @@ fn classify_pipeline_profiles_per_call_without_rebuild() {
 
 #[test]
 fn classify_pipeline_zero_chunk_run_skips_classify_and_profiles_host_stages() {
-    let p = ClassifyPipeline::new(
+    let p = EncoderPipeline::new(
         StubTokenizer { ids: vec![1, 2], max_seq: 4, error: false },
         NoChunkChunker { max_seq: 4 },
         StubClassify { num_classes: 4, max_batch: 1, error: true }, // would fail if called
@@ -859,7 +872,7 @@ fn classify_pipeline_zero_chunk_run_skips_classify_and_profiles_host_stages() {
 #[test]
 fn classify_assemble_passes_chunker_max_seq_into_builder() {
     let seen = std::cell::Cell::new(0usize);
-    let _p: ClassifyPipeline<_, TruncatingChunker, StubClassify> = ClassifyPipeline::assemble(
+    let _p: EncoderPipeline<_, TruncatingChunker, StubClassify> = EncoderPipeline::assemble(
         StubTokenizer { ids: vec![1], max_seq: 8, error: false },
         TruncatingChunker::new(8),
         |max_seq| {
@@ -873,7 +886,7 @@ fn classify_assemble_passes_chunker_max_seq_into_builder() {
 
 #[test]
 fn classify_sliding_pipeline_produces_per_window_classifications() {
-    let mut p = ClassifyPipeline::new(
+    let mut p = EncoderPipeline::new(
         StubTokenizer { ids: vec![10, 20, 30, 40, 50, 60], max_seq: 3, error: false },
         SlidingWindowChunker::new(3, 2),
         StubClassify { num_classes: 3, max_batch: 1, error: false },
@@ -890,42 +903,42 @@ fn classify_sliding_pipeline_produces_per_window_classifications() {
 
 #[test]
 fn classify_tokenize_error_maps_to_tokenize_variant() {
-    let mut p = ClassifyPipeline::new(
+    let mut p = EncoderPipeline::new(
         StubTokenizer { ids: vec![1], max_seq: 4, error: true },
         TruncatingChunker::new(4),
         StubClassify { num_classes: 4, max_batch: 1, error: false },
     );
     let err = p.classify_default("ignored").unwrap_err();
-    assert!(matches!(err, ClassifyPipelineError::Tokenize { .. }));
+    assert!(matches!(err, EncoderPipelineError::Tokenize { .. }));
 }
 
 #[test]
 fn classify_error_maps_to_classify_variant() {
-    let mut p = ClassifyPipeline::new(
+    let mut p = EncoderPipeline::new(
         StubTokenizer { ids: vec![1, 2], max_seq: 4, error: false },
         TruncatingChunker::new(4),
         StubClassify { num_classes: 4, max_batch: 1, error: true },
     );
     let err = p.classify_default("ignored").unwrap_err();
-    assert!(matches!(err, ClassifyPipelineError::Classify { .. }));
+    assert!(matches!(err, EncoderPipelineError::Encode { .. }));
 }
 
 #[test]
 fn classify_chunk_error_maps_to_chunk_variant() {
-    let mut p = ClassifyPipeline::new(
+    let mut p = EncoderPipeline::new(
         StubTokenizer { ids: vec![1, 2], max_seq: 4, error: false },
         ErrChunker { max_seq: 4 },
         StubClassify { num_classes: 4, max_batch: 1, error: false },
     );
     let err = p.classify_default("ignored").unwrap_err();
-    assert!(matches!(err, ClassifyPipelineError::Chunk { .. }));
+    assert!(matches!(err, EncoderPipelineError::Chunk { .. }));
 }
 
-// ─── ClassifyPipeline batch ──────────────────────────────────────────────────
+// ─── EncoderPipeline batch ──────────────────────────────────────────────────
 
 #[test]
 fn classify_batch_basic_three_texts() {
-    let mut p = ClassifyPipeline::new(
+    let mut p = EncoderPipeline::new(
         ByteTokenizer { max_seq: 32 },
         TruncatingChunker::new(32),
         StubClassify { num_classes: 32, max_batch: 8, error: false },
@@ -941,7 +954,7 @@ fn classify_batch_basic_three_texts() {
 
 #[test]
 fn classify_batch_with_sliding_window_varying_chunk_counts() {
-    let mut p = ClassifyPipeline::new(
+    let mut p = EncoderPipeline::new(
         ByteTokenizer { max_seq: 3 },
         SlidingWindowChunker::new(3, 2),
         StubClassify { num_classes: 3, max_batch: 8, error: false },
@@ -958,7 +971,7 @@ fn classify_batch_with_sliding_window_varying_chunk_counts() {
 
 #[test]
 fn classify_batch_empty_texts_returns_empty() {
-    let mut p = ClassifyPipeline::new(
+    let mut p = EncoderPipeline::new(
         ByteTokenizer { max_seq: 8 },
         TruncatingChunker::new(8),
         StubClassify { num_classes: 8, max_batch: 4, error: false },
@@ -970,7 +983,7 @@ fn classify_batch_empty_texts_returns_empty() {
 
 #[test]
 fn classify_batch_some_texts_produce_zero_chunks() {
-    let mut p = ClassifyPipeline::new(
+    let mut p = EncoderPipeline::new(
         ByteTokenizer { max_seq: 4 },
         SlidingWindowChunker::new(4, 2),
         StubClassify { num_classes: 4, max_batch: 4, error: false },
@@ -984,7 +997,7 @@ fn classify_batch_some_texts_produce_zero_chunks() {
 
 #[test]
 fn classify_batch_sub_batches_when_chunks_exceed_max_batch() {
-    let mut p = ClassifyPipeline::new(
+    let mut p = EncoderPipeline::new(
         ByteTokenizer { max_seq: 8 },
         TruncatingChunker::new(8),
         StubClassify { num_classes: 8, max_batch: 2, error: false },
@@ -1000,7 +1013,7 @@ fn classify_batch_sub_batches_when_chunks_exceed_max_batch() {
 
 #[test]
 fn classify_batch_profile_has_tokenize_chunk_classify_stages() {
-    let mut p = ClassifyPipeline::new(
+    let mut p = EncoderPipeline::new(
         ByteTokenizer { max_seq: 8 },
         TruncatingChunker::new(8),
         StubClassify { num_classes: 8, max_batch: 4, error: false },
@@ -1016,19 +1029,19 @@ fn classify_batch_profile_has_tokenize_chunk_classify_stages() {
 
 #[test]
 fn classify_batch_tokenize_error_maps_to_tokenize_variant() {
-    let mut p = ClassifyPipeline::new(
+    let mut p = EncoderPipeline::new(
         StubTokenizer { ids: vec![1], max_seq: 4, error: true },
         TruncatingChunker::new(4),
         StubClassify { num_classes: 4, max_batch: 4, error: false },
     );
     let err = p.classify_batch_default(&["a", "b"]).unwrap_err();
-    assert!(matches!(err, ClassifyPipelineError::Tokenize { .. }));
+    assert!(matches!(err, EncoderPipelineError::Tokenize { .. }));
 }
 
 #[test]
 fn classify_batch_results_match_individual_classify_calls() {
     let make_pipeline = || {
-        ClassifyPipeline::new(
+        EncoderPipeline::new(
             ByteTokenizer { max_seq: 4 },
             SlidingWindowChunker::new(4, 2),
             StubClassify { num_classes: 4, max_batch: 8, error: false },
@@ -1052,7 +1065,7 @@ fn classify_batch_results_match_individual_classify_calls() {
     }
 }
 
-// ─── RecognizePipeline ───────────────────────────────────────────────────────
+// ─── EncoderPipeline ───────────────────────────────────────────────────────
 
 /// Turns ids into a deterministic `(seq_len, num_labels)` logit grid (analog of
 /// `StubClassify`): each token id `v` becomes a row of `num_labels` copies of
@@ -1064,19 +1077,18 @@ struct StubRecognize {
     error: bool,
 }
 
-impl Recognize for StubRecognize {
+impl Encoder for StubRecognize {
+    type Output = TokenClassification;
+    type ChunkOutput = ChunkTokenClassification;
     type Error = StubRecognizeError;
-    fn num_labels(&self) -> usize {
-        self.num_labels
-    }
     fn capacity(&self) -> (usize, usize) {
         (self.max_batch, self.num_labels)
     }
-    fn recognize_batch(
+    fn run_batch(
         &mut self,
         batch: &[&Encoding],
         profile: bool,
-    ) -> Result<(Vec<TokenClassification>, Option<RunProfile>), StubRecognizeError> {
+    ) -> Result<(Vec<Self::Output>, Option<RunProfile>), Self::Error> {
         if self.error {
             return Err(StubRecognizeError);
         }
@@ -1098,6 +1110,21 @@ impl Recognize for StubRecognize {
         });
         Ok((values, prof))
     }
+    fn attach(chunk: &TextChunk, out: TokenClassification) -> ChunkTokenClassification {
+        ChunkTokenClassification {
+            byte_offset: chunk.byte_offset,
+            token_offsets: chunk.encoding.offsets.clone(),
+            special_tokens_mask: chunk.encoding.special_tokens_mask.clone(),
+            logits: out.logits,
+            num_labels: out.num_labels,
+        }
+    }
+}
+
+impl Recognize for StubRecognize {
+    fn num_labels(&self) -> usize {
+        self.num_labels
+    }
 }
 
 #[derive(Debug, snafu::Snafu)]
@@ -1107,8 +1134,8 @@ struct StubRecognizeError;
 fn recognize_pipeline(
     ids: Vec<u32>,
     max_seq: usize,
-) -> RecognizePipeline<StubTokenizer, TruncatingChunker, StubRecognize> {
-    RecognizePipeline::new(
+) -> EncoderPipeline<StubTokenizer, TruncatingChunker, StubRecognize> {
+    EncoderPipeline::new(
         StubTokenizer { ids, max_seq, error: false },
         TruncatingChunker::new(max_seq),
         StubRecognize { num_labels: 1, max_batch: 1, error: false },
@@ -1119,8 +1146,8 @@ fn recognize_pipeline(
 fn recognize_single_is_batch_of_one() {
     let mut rec = StubRecognize { num_labels: 3, max_batch: 1, error: false };
     let e = enc(&[4, 5, 6]);
-    let single = rec.recognize(&e, false).unwrap().0;
-    let batch = rec.recognize_batch(&[&e], false).unwrap().0;
+    let single = rec.run(&e, false).unwrap().0;
+    let batch = rec.run_batch(&[&e], false).unwrap().0;
     assert_eq!(single, batch.into_iter().next().unwrap());
 }
 
@@ -1159,7 +1186,7 @@ fn recognize_pipeline_profiles_per_call_without_rebuild() {
 
 #[test]
 fn recognize_pipeline_zero_chunk_run_skips_recognize_and_profiles_host_stages() {
-    let p = RecognizePipeline::new(
+    let p = EncoderPipeline::new(
         StubTokenizer { ids: vec![1, 2], max_seq: 4, error: false },
         NoChunkChunker { max_seq: 4 },
         StubRecognize { num_labels: 4, max_batch: 1, error: true }, // would fail if called
@@ -1175,7 +1202,7 @@ fn recognize_pipeline_zero_chunk_run_skips_recognize_and_profiles_host_stages() 
 #[test]
 fn recognize_assemble_passes_chunker_max_seq_into_builder() {
     let seen = std::cell::Cell::new(0usize);
-    let _p: RecognizePipeline<_, TruncatingChunker, StubRecognize> = RecognizePipeline::assemble(
+    let _p: EncoderPipeline<_, TruncatingChunker, StubRecognize> = EncoderPipeline::assemble(
         StubTokenizer { ids: vec![1], max_seq: 8, error: false },
         TruncatingChunker::new(8),
         |max_seq| {
@@ -1189,7 +1216,7 @@ fn recognize_assemble_passes_chunker_max_seq_into_builder() {
 
 #[test]
 fn recognize_sliding_pipeline_produces_per_window_classifications() {
-    let mut p = RecognizePipeline::new(
+    let mut p = EncoderPipeline::new(
         StubTokenizer { ids: vec![10, 20, 30, 40, 50, 60], max_seq: 3, error: false },
         SlidingWindowChunker::new(3, 2),
         StubRecognize { num_labels: 1, max_batch: 1, error: false },
@@ -1209,42 +1236,42 @@ fn recognize_sliding_pipeline_produces_per_window_classifications() {
 
 #[test]
 fn recognize_tokenize_error_maps_to_tokenize_variant() {
-    let mut p = RecognizePipeline::new(
+    let mut p = EncoderPipeline::new(
         StubTokenizer { ids: vec![1], max_seq: 4, error: true },
         TruncatingChunker::new(4),
         StubRecognize { num_labels: 4, max_batch: 1, error: false },
     );
     let err = p.recognize_default("ignored").unwrap_err();
-    assert!(matches!(err, RecognizePipelineError::Tokenize { .. }));
+    assert!(matches!(err, EncoderPipelineError::Tokenize { .. }));
 }
 
 #[test]
 fn recognize_error_maps_to_recognize_variant() {
-    let mut p = RecognizePipeline::new(
+    let mut p = EncoderPipeline::new(
         StubTokenizer { ids: vec![1, 2], max_seq: 4, error: false },
         TruncatingChunker::new(4),
         StubRecognize { num_labels: 4, max_batch: 1, error: true },
     );
     let err = p.recognize_default("ignored").unwrap_err();
-    assert!(matches!(err, RecognizePipelineError::Recognize { .. }));
+    assert!(matches!(err, EncoderPipelineError::Encode { .. }));
 }
 
 #[test]
 fn recognize_chunk_error_maps_to_chunk_variant() {
-    let mut p = RecognizePipeline::new(
+    let mut p = EncoderPipeline::new(
         StubTokenizer { ids: vec![1, 2], max_seq: 4, error: false },
         ErrChunker { max_seq: 4 },
         StubRecognize { num_labels: 4, max_batch: 1, error: false },
     );
     let err = p.recognize_default("ignored").unwrap_err();
-    assert!(matches!(err, RecognizePipelineError::Chunk { .. }));
+    assert!(matches!(err, EncoderPipelineError::Chunk { .. }));
 }
 
-// ─── RecognizePipeline batch ─────────────────────────────────────────────────
+// ─── EncoderPipeline batch ─────────────────────────────────────────────────
 
 #[test]
 fn recognize_batch_basic_three_texts() {
-    let mut p = RecognizePipeline::new(
+    let mut p = EncoderPipeline::new(
         ByteTokenizer { max_seq: 32 },
         TruncatingChunker::new(32),
         StubRecognize { num_labels: 1, max_batch: 8, error: false },
@@ -1262,7 +1289,7 @@ fn recognize_batch_basic_three_texts() {
 
 #[test]
 fn recognize_batch_with_sliding_window_varying_chunk_counts() {
-    let mut p = RecognizePipeline::new(
+    let mut p = EncoderPipeline::new(
         ByteTokenizer { max_seq: 3 },
         SlidingWindowChunker::new(3, 2),
         StubRecognize { num_labels: 1, max_batch: 8, error: false },
@@ -1279,7 +1306,7 @@ fn recognize_batch_with_sliding_window_varying_chunk_counts() {
 
 #[test]
 fn recognize_batch_empty_texts_returns_empty() {
-    let mut p = RecognizePipeline::new(
+    let mut p = EncoderPipeline::new(
         ByteTokenizer { max_seq: 8 },
         TruncatingChunker::new(8),
         StubRecognize { num_labels: 1, max_batch: 4, error: false },
@@ -1291,7 +1318,7 @@ fn recognize_batch_empty_texts_returns_empty() {
 
 #[test]
 fn recognize_batch_some_texts_produce_zero_chunks() {
-    let mut p = RecognizePipeline::new(
+    let mut p = EncoderPipeline::new(
         ByteTokenizer { max_seq: 4 },
         SlidingWindowChunker::new(4, 2),
         StubRecognize { num_labels: 1, max_batch: 4, error: false },
@@ -1305,7 +1332,7 @@ fn recognize_batch_some_texts_produce_zero_chunks() {
 
 #[test]
 fn recognize_batch_sub_batches_when_chunks_exceed_max_batch() {
-    let mut p = RecognizePipeline::new(
+    let mut p = EncoderPipeline::new(
         ByteTokenizer { max_seq: 8 },
         TruncatingChunker::new(8),
         StubRecognize { num_labels: 1, max_batch: 2, error: false },
@@ -1321,7 +1348,7 @@ fn recognize_batch_sub_batches_when_chunks_exceed_max_batch() {
 
 #[test]
 fn recognize_batch_profile_has_tokenize_chunk_recognize_stages() {
-    let mut p = RecognizePipeline::new(
+    let mut p = EncoderPipeline::new(
         ByteTokenizer { max_seq: 8 },
         TruncatingChunker::new(8),
         StubRecognize { num_labels: 1, max_batch: 4, error: false },
@@ -1337,19 +1364,19 @@ fn recognize_batch_profile_has_tokenize_chunk_recognize_stages() {
 
 #[test]
 fn recognize_batch_tokenize_error_maps_to_tokenize_variant() {
-    let mut p = RecognizePipeline::new(
+    let mut p = EncoderPipeline::new(
         StubTokenizer { ids: vec![1], max_seq: 4, error: true },
         TruncatingChunker::new(4),
         StubRecognize { num_labels: 4, max_batch: 4, error: false },
     );
     let err = p.recognize_batch_default(&["a", "b"]).unwrap_err();
-    assert!(matches!(err, RecognizePipelineError::Tokenize { .. }));
+    assert!(matches!(err, EncoderPipelineError::Tokenize { .. }));
 }
 
 #[test]
 fn recognize_batch_results_match_individual_recognize_calls() {
     let make_pipeline = || {
-        RecognizePipeline::new(
+        EncoderPipeline::new(
             ByteTokenizer { max_seq: 4 },
             SlidingWindowChunker::new(4, 2),
             StubRecognize { num_labels: 1, max_batch: 8, error: false },

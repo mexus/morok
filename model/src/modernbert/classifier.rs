@@ -11,33 +11,22 @@
 //! pool (cls or mean) → `head.dense` → GELU → `head.norm` → `classifier` linear.
 //! Fused into one JIT plan so the `(B, L, D)` activations stay on-device.
 
-use snafu::{ResultExt, Snafu};
-use svod_arch::pipelines::text::{Classification, Classify, Encoding, RunProfile};
+use snafu::ResultExt;
+use svod_arch::pipelines::text::{
+    ChunkClassification, Classification, Classify, Encoder, Encoding, RunProfile, TextChunk,
+};
 use svod_dtype::DType;
 use svod_ir::SInt;
-use svod_runtime::StageProfile;
 use svod_tensor::{BoundVariable, PrepareConfig, Tensor};
 
 use crate::init::fan_in_uniform;
 use crate::jit::InputSpec;
 use crate::modernbert::config::{ClassifierPooling, ModernBertConfig};
-use crate::modernbert::embedder::{pack_ids_buffer, pack_mask_buffer};
 use crate::modernbert::error::{Result, StateSnafu, TensorSnafu};
+use crate::modernbert::head_jit::{HeadError, JitSnafu, execute_head};
 use crate::modernbert::model::ModernBert;
 use crate::modernbert::normalization::LayerNormWeights;
 use crate::state::{self, HasStateDict, StateDict, get_tensor};
-
-// ─── error ─────────────────────────────────────────────────────────────────
-
-#[derive(Debug, Snafu)]
-pub enum ClassifierError {
-    #[snafu(display("JIT op failed: {source}"))]
-    Jit { source: crate::jit::JitError },
-    #[snafu(display("device op failed: {source}"))]
-    Device { source: svod_device::error::Error },
-    #[snafu(display("classification batch of {got} exceeds prepared max_batch {max}"))]
-    CapacityExceeded { got: usize, max: usize },
-}
 
 // ─── head weights ──────────────────────────────────────────────────────────
 
@@ -130,18 +119,7 @@ impl ModernBertClassificationModel {
     }
 
     pub(crate) fn from_state_dict(sd: &StateDict, config: &ModernBertConfig) -> Result<Self> {
-        let dtype = config.dtype.clone();
-        let casted: StateDict = sd
-            .iter()
-            .map(|(k, v)| {
-                let t = if v.uop().dtype() == dtype {
-                    v.clone()
-                } else {
-                    v.cast(dtype.clone()).unwrap_or_else(|_| v.clone())
-                };
-                (k.clone(), t)
-            })
-            .collect();
+        let casted = crate::state::cast_all(sd, config.dtype.clone());
 
         let mut backbone = ModernBert::empty(config.clone());
         backbone.load_state_dict(&casted, "").context(StateSnafu)?;
@@ -229,12 +207,12 @@ fn masked_mean(hidden: &Tensor, mask: &Tensor) -> Result<Tensor> {
     mean.try_squeeze(Some(1)).context(TensorSnafu)
 }
 
-// ─── runtime (owns JIT, impl Classify) ─────────────────────────────────────
+// ─── runtime (owns JIT, impl Encoder + Classify) ───────────────────────────
 
 /// Finished-classifier model. Build once (eager JIT prepare) and reuse across
-/// calls. Implements [`Classify`] for drop-in use with [`ClassifyPipeline`].
-///
-/// [`ClassifyPipeline`]: svod_arch::pipelines::text::ClassifyPipeline
+/// calls. Implements [`Encoder`] (with [`Classify`] fixing the output kinds)
+/// for drop-in use with
+/// [`EncoderPipeline`](svod_arch::pipelines::text::EncoderPipeline).
 pub struct ModernBertClassifier {
     jit: crate::modernbert::classifier_jit::ModernBertClassifierJit,
     max_batch: usize,
@@ -248,7 +226,7 @@ impl ModernBertClassifier {
         model: ModernBertClassificationModel,
         max_batch: usize,
         max_seq: usize,
-    ) -> std::result::Result<Self, ClassifierError> {
+    ) -> std::result::Result<Self, HeadError> {
         let num_classes = model.head.num_labels();
         let mut jit = crate::modernbert::classifier_jit::ModernBertClassifierJit::new(model).with_b_bound(max_batch);
         let ids_spec = InputSpec::i64(&[max_batch, max_seq]);
@@ -258,49 +236,34 @@ impl ModernBertClassifier {
     }
 }
 
-impl Classify for ModernBertClassifier {
-    type Error = ClassifierError;
-
-    fn num_classes(&self) -> usize {
-        self.num_classes
-    }
+impl Encoder for ModernBertClassifier {
+    type Output = Classification;
+    type ChunkOutput = ChunkClassification;
+    type Error = HeadError;
 
     fn capacity(&self) -> (usize, usize) {
         (self.max_batch, self.max_seq)
     }
 
-    fn classify_batch(
+    fn run_batch(
         &mut self,
         batch: &[&Encoding],
         profile: bool,
-    ) -> std::result::Result<(Vec<Classification>, Option<RunProfile>), ClassifierError> {
-        let b = batch.len();
-        if b == 0 {
-            return Ok((Vec::new(), profile.then(RunProfile::default)));
-        }
-        if b > self.max_batch {
-            return Err(CapacityExceededSnafu { got: b, max: self.max_batch }.build());
-        }
-
-        pack_ids_buffer(self.jit.input_ids_mut().context(JitSnafu)?, batch, self.max_seq).context(DeviceSnafu)?;
-        pack_mask_buffer(self.jit.attention_mask_mut().context(JitSnafu)?, batch, self.max_seq).context(DeviceSnafu)?;
-
-        let vars = &[("b", b as i64)];
-        let mut prof = profile.then(RunProfile::default);
-        if let Some(p) = &mut prof {
-            let kernels = self.jit.execute_with_vars_profiled(vars).context(JitSnafu)?;
-            p.push(StageProfile::gpu("classify", std::time::Duration::ZERO, kernels));
-        } else {
-            self.jit.execute_with_vars(vars).context(JitSnafu)?;
-        }
-
-        let out = self.jit.output().context(JitSnafu)?;
-        let view = out.as_array::<f32>().context(DeviceSnafu)?;
-        let flat = view.as_slice().expect("contiguous classification buffer");
+    ) -> std::result::Result<(Vec<Classification>, Option<RunProfile>), HeadError> {
+        let (b, flat, prof) = execute_head(&mut self.jit, batch, self.max_batch, self.max_seq, profile, "classify")?;
         let nc = self.num_classes;
         let classifications: Vec<Classification> =
             (0..b).map(|i| Classification { logits: flat[i * nc..i * nc + nc].to_vec() }).collect();
-
         Ok((classifications, prof))
+    }
+
+    fn attach(chunk: &TextChunk, out: Classification) -> ChunkClassification {
+        ChunkClassification { byte_offset: chunk.byte_offset, logits: out.logits }
+    }
+}
+
+impl Classify for ModernBertClassifier {
+    fn num_classes(&self) -> usize {
+        self.num_classes
     }
 }

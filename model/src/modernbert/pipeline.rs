@@ -9,16 +9,14 @@ use svod_dtype::DType;
 use super::classifier::{ModernBertClassificationModel, ModernBertClassifier};
 use super::config::ModernBertConfig;
 use super::embedder::ModernBertEmbedder;
-use super::error::{
-    ClassifierSnafu, EmbedderSnafu, HubSnafu, Result, StateSnafu, TokenClassifierSnafu, TokenizerSnafu,
-};
+use super::error::{HeadSnafu, HubSnafu, Result, StateSnafu, TokenizerSnafu};
 use super::model::ModernBert;
 use super::token_classifier::{ModernBertTokenClassificationModel, ModernBertTokenClassifier};
 
 /// Download `config.json` + `model.safetensors` + `tokenizer.json` from a
 /// HuggingFace Hub repository (default revision `"main"`) and assemble the
 /// `(HfTokenizer, ModernBertEmbedder)` pair ready for an
-/// [`EmbeddingsPipeline`](svod_arch::pipelines::text::EmbeddingsPipeline).
+/// [`EncoderPipeline`](svod_arch::pipelines::text::EncoderPipeline).
 ///
 /// `max_seq` is derived from the checkpoint's `max_position_embeddings`;
 /// `max_batch` is caller-chosen (not in `config.json`). `dtype` selects the
@@ -50,7 +48,7 @@ pub fn from_hub_with_revision(
     let tok_path = repo.get("tokenizer.json").context(HubSnafu)?;
     let tokenizer = HfTokenizer::from_path(&tok_path, max_seq).context(TokenizerSnafu)?;
 
-    let embedder = ModernBertEmbedder::new(model, max_batch, max_seq).context(EmbedderSnafu)?;
+    let embedder = ModernBertEmbedder::new(model, max_batch, max_seq).context(HeadSnafu)?;
     Ok((tokenizer, embedder))
 }
 
@@ -58,8 +56,8 @@ pub fn from_hub_with_revision(
 
 /// Download `config.json` + `model.safetensors` + `tokenizer.json` from a
 /// HuggingFace Hub repository (default revision `"main"`) and assemble the
-/// `(HfTokenizer, ModernBertClassifier)` pair ready for a
-/// [`ClassifyPipeline`](svod_arch::pipelines::text::ClassifyPipeline).
+/// `(HfTokenizer, ModernBertClassifier)` pair ready for an
+/// [`EncoderPipeline`](svod_arch::pipelines::text::EncoderPipeline).
 ///
 /// `max_seq` is derived from the checkpoint's `max_position_embeddings`;
 /// `max_batch` is caller-chosen. `dtype` selects the compute precision.
@@ -99,7 +97,7 @@ pub fn from_hub_classifier_with_revision(
     let tok_path = repo.get("tokenizer.json").context(HubSnafu)?;
     let tokenizer = HfTokenizer::from_path(&tok_path, max_seq).context(TokenizerSnafu)?;
 
-    let classifier = ModernBertClassifier::new(model, max_batch, max_seq).context(ClassifierSnafu)?;
+    let classifier = ModernBertClassifier::new(model, max_batch, max_seq).context(HeadSnafu)?;
     Ok((tokenizer, classifier))
 }
 
@@ -107,8 +105,8 @@ pub fn from_hub_classifier_with_revision(
 
 /// Download `config.json` + `model.safetensors` + `tokenizer.json` from a
 /// HuggingFace Hub repository (default revision `"main"`) and assemble the
-/// `(HfTokenizer, ModernBertTokenClassifier)` pair ready for a
-/// [`RecognizePipeline`](svod_arch::pipelines::text::RecognizePipeline).
+/// `(HfTokenizer, ModernBertTokenClassifier)` pair ready for an
+/// [`EncoderPipeline`](svod_arch::pipelines::text::EncoderPipeline).
 ///
 /// `max_seq` is derived from the checkpoint's `max_position_embeddings`;
 /// `max_batch` is caller-chosen. `dtype` selects the compute precision.
@@ -150,6 +148,6 @@ pub fn from_hub_token_classification_with_revision(
     let tok_path = repo.get("tokenizer.json").context(HubSnafu)?;
     let tokenizer = HfTokenizer::from_path(&tok_path, max_seq).context(TokenizerSnafu)?;
 
-    let classifier = ModernBertTokenClassifier::new(model, max_batch, max_seq).context(TokenClassifierSnafu)?;
+    let classifier = ModernBertTokenClassifier::new(model, max_batch, max_seq).context(HeadSnafu)?;
     Ok((tokenizer, classifier))
 }

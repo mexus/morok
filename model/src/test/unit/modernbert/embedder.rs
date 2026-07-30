@@ -5,11 +5,12 @@
 
 use std::sync::{LazyLock, Mutex, MutexGuard};
 
-use svod_arch::pipelines::text::{Embed, Embedding, Encoding};
+use svod_arch::pipelines::text::{Embed, Embedding, Encoder, Encoding};
 use svod_device::{Buffer, BufferSpec, cpu};
 use svod_dtype::DType;
 
-use crate::modernbert::{ModernBert, ModernBertEmbedder, pack_ids_buffer, pack_mask_buffer};
+use crate::modernbert::packing::{pack_ids_buffer, pack_mask_buffer};
+use crate::modernbert::{ModernBert, ModernBertEmbedder};
 use crate::test::unit::modernbert::model::tiny_cfg;
 
 /// Canonical prepared sizes for the shared embedder fixture. Compiling the
@@ -74,7 +75,7 @@ fn embed_batch_shapes_and_norms() {
     let hidden = emb.hidden_size();
     let e1 = encoding(&[1, 2, 3], 0);
     let e2 = encoding(&[4, 5], 1);
-    let (out, prof) = emb.embed_batch(&[&e1, &e2], false).expect("embed_batch");
+    let (out, prof) = emb.run_batch(&[&e1, &e2], false).expect("embed_batch");
     assert_eq!(out.len(), 2);
     assert_eq!(out[0].values.len(), hidden);
     assert_eq!(out[1].values.len(), hidden);
@@ -93,8 +94,8 @@ fn embed_batch_shapes_and_norms() {
 fn embed_single_matches_batch_of_one() {
     let mut emb = embedder();
     let e = encoding(&[1, 2, 3, 4], 0);
-    let single = emb.embed(&e, false).expect("embed").0;
-    let batch = emb.embed_batch(&[&e], false).expect("embed_batch");
+    let single = emb.run(&e, false).expect("embed").0;
+    let batch = emb.run_batch(&[&e], false).expect("embed_batch");
     let batch0 = batch.0.into_iter().next().unwrap();
     let max = single.values.iter().zip(&batch0.values).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
     assert_eq!(max, 0.0, "default embed must match embed_batch exactly");
@@ -109,8 +110,8 @@ fn pooling_ignores_pad_positions() {
     let mut emb = embedder();
     let unpadded = encoding(&[1, 2, 3], 0);
     let padded = encoding(&[1, 2, 3], 2); // two trailing pad positions, mask 0
-    let a = emb.embed(&unpadded, false).expect("unpadded").0;
-    let b = emb.embed(&padded, false).expect("padded").0;
+    let a = emb.run(&unpadded, false).expect("unpadded").0;
+    let b = emb.run(&padded, false).expect("padded").0;
     let max = a.values.iter().zip(&b.values).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
     assert!(max < 1e-4, "pad positions leaked into the pooled embedding: max |delta| = {max}");
 }
@@ -135,8 +136,8 @@ fn batch_over_max_batch_is_rejected() {
     // One more than the prepared MAX_BATCH.
     let encs = (1..=MAX_BATCH + 1).map(|i| encoding(&[i as u32], 0)).collect::<Vec<_>>();
     let refs: Vec<&Encoding> = encs.iter().collect();
-    let err = emb.embed_batch(&refs, false).unwrap_err();
-    assert!(matches!(err, crate::modernbert::EmbedderError::CapacityExceeded { .. }));
+    let err = emb.run_batch(&refs, false).unwrap_err();
+    assert!(matches!(err, crate::modernbert::HeadError::CapacityExceeded { .. }));
 }
 
 /// An empty batch is a no-op returning no embeddings (mirrors the pipeline's
@@ -145,7 +146,7 @@ fn batch_over_max_batch_is_rejected() {
 #[ignore = "heavy: 2-layer ModernBERT JIT graph compile through the CPU backend"]
 fn empty_batch_is_noop() {
     let mut emb = embedder();
-    let (out, prof) = emb.embed_batch(&[], false).expect("empty batch");
+    let (out, prof) = emb.run_batch(&[], false).expect("empty batch");
     assert!(out.is_empty());
     assert!(prof.is_none());
 }
@@ -157,9 +158,9 @@ fn empty_batch_is_noop() {
 fn profiled_run_emits_embed_stage() {
     let mut emb = embedder();
     let e = encoding(&[1, 2], 0);
-    let prof = emb.embed(&e, true).expect("profiled").1.expect("profile present");
+    let prof = emb.run(&e, true).expect("profiled").1.expect("profile present");
     assert!(prof.stages.iter().any(|s| s.name == "embed"), "embed stage present");
-    assert!(emb.embed(&e, false).expect("unprofiled").1.is_none(), "unprofiled yields no profile");
+    assert!(emb.run(&e, false).expect("unprofiled").1.is_none(), "unprofiled yields no profile");
 }
 
 /// Two **distinct** inputs through `embed_batch` must match the same inputs run
@@ -174,9 +175,9 @@ fn embed_batch_rows_match_single_calls() {
     let mut emb = embedder();
     let e1 = encoding(&[1, 2, 3], 0);
     let e2 = encoding(&[10, 20, 30, 40], 0);
-    let batch = emb.embed_batch(&[&e1, &e2], false).expect("embed_batch").0;
-    let s1 = emb.embed(&e1, false).expect("embed e1").0;
-    let s2 = emb.embed(&e2, false).expect("embed e2").0;
+    let batch = emb.run_batch(&[&e1, &e2], false).expect("embed_batch").0;
+    let s1 = emb.run(&e1, false).expect("embed e1").0;
+    let s2 = emb.run(&e2, false).expect("embed e2").0;
     assert_eq!(max_delta(&batch[0].values, &s1.values), 0.0, "batch row 0 leaked from/into e1");
     assert_eq!(max_delta(&batch[1].values, &s2.values), 0.0, "batch row 1 leaked from/into e2");
 }
@@ -192,12 +193,12 @@ fn batch_path_respects_attention_mask() {
     let mut emb = embedder();
     let padded = encoding(&[1, 2, 3], 2);
     let unpadded = encoding(&[1, 2, 3], 0);
-    let batch = emb.embed_batch(&[&padded, &unpadded], false).expect("embed_batch").0;
+    let batch = emb.run_batch(&[&padded, &unpadded], false).expect("embed_batch").0;
     // Pad positions must not move the pooled output within a row.
     let d = max_delta(&batch[0].values, &batch[1].values);
     assert!(d < 1e-4, "pad mask leaked in the batch path: max |delta| = {d}");
     // And the batch path agrees with the single-call path for the unpadded row.
-    let alone = emb.embed(&unpadded, false).expect("embed unpadded").0;
+    let alone = emb.run(&unpadded, false).expect("embed unpadded").0;
     let d = max_delta(&batch[1].values, &alone.values);
     assert!(d < 1e-4, "batch row 1 disagrees with its standalone embed: max |delta| = {d}");
 }
@@ -211,10 +212,10 @@ fn embed_batch_profile_emits_stage() {
     let mut emb = embedder();
     let e1 = encoding(&[1, 2], 0);
     let e2 = encoding(&[3, 4], 0);
-    let prof = emb.embed_batch(&[&e1, &e2], true).expect("profiled embed_batch").1.expect("profile present");
+    let prof = emb.run_batch(&[&e1, &e2], true).expect("profiled embed_batch").1.expect("profile present");
     assert!(prof.stages.iter().any(|s| s.name == "embed"), "embed GPU stage present");
     assert!(
-        emb.embed_batch(&[&e1, &e2], false).expect("unprofiled embed_batch").1.is_none(),
+        emb.run_batch(&[&e1, &e2], false).expect("unprofiled embed_batch").1.is_none(),
         "unprofiled yields no profile"
     );
 }

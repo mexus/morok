@@ -14,11 +14,9 @@
 
 extern crate self as svod_model;
 
-use snafu::ResultExt;
-use svod_ir::SInt;
 use svod_macros::jit_wrapper;
 
-use super::error::TensorSnafu;
+use super::head_jit::shrink_mask_for_b;
 use super::model::ModernBert;
 use super::pooling::pool_embed;
 
@@ -32,17 +30,10 @@ jit_wrapper! {
         }
 
         build(input_ids, attention_mask, b) {
-            // The mask arrives as i64 (InputSpec has no bool constructor); cast
-            // to bool where `true` = real token, the convention forward/pool expect.
-            let mask = attention_mask.cast(svod_dtype::DType::Bool).context(TensorSnafu)?;
-            // Shrink the mask's batch dim to the live `b` ourselves so the mask
-            // passed to pool_embed matches the symbolic-batch hidden state that
-            // forward_batch returns. (forward_batch shrinks its own internal
-            // copy; without shrinking here, pool_embed would see a concrete
-            // max_batch mask against a symbolic-b hidden → broadcast mismatch.)
-            let mask = mask
-                .try_shrink([Some((SInt::Const(0), b.as_sint())), None])
-                .context(TensorSnafu)?;
+            // Cast the i64 mask to bool and shrink its batch dim to the live `b`
+            // (see `shrink_mask_for_b`): the mask passed to pool_embed must match
+            // the symbolic-batch hidden state that forward_batch returns.
+            let mask = shrink_mask_for_b(attention_mask, &b)?;
             let hidden = model.forward_batch(input_ids, Some(&mask), &b)?;
             pool_embed(&hidden, &mask)
         }

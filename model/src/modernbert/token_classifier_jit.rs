@@ -11,11 +11,9 @@
 
 extern crate self as svod_model;
 
-use snafu::ResultExt;
-use svod_ir::SInt;
 use svod_macros::jit_wrapper;
 
-use super::error::TensorSnafu;
+use super::head_jit::shrink_mask_for_b;
 use super::token_classifier::ModernBertTokenClassificationModel;
 
 jit_wrapper! {
@@ -28,10 +26,7 @@ jit_wrapper! {
         }
 
         build(input_ids, attention_mask, b) {
-            let mask = attention_mask.cast(svod_dtype::DType::Bool).context(TensorSnafu)?;
-            let mask = mask
-                .try_shrink([Some((SInt::Const(0), b.as_sint())), None])
-                .context(TensorSnafu)?;
+            let mask = shrink_mask_for_b(attention_mask, &b)?;
             model.forward_batch(input_ids, Some(&mask), &b)
         }
     }

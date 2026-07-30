@@ -13,30 +13,19 @@
 //! logits row. It reuses the sequence-classification head's weights and IR tail
 //! ([`prediction_head_tail`]); the two heads differ only in pooling.
 
-use snafu::{ResultExt, Snafu};
-use svod_arch::pipelines::text::{Encoding, Recognize, RunProfile, TokenClassification};
-use svod_runtime::StageProfile;
+use snafu::ResultExt;
+use svod_arch::pipelines::text::{
+    ChunkTokenClassification, Encoder, Encoding, Recognize, RunProfile, TextChunk, TokenClassification,
+};
 use svod_tensor::{BoundVariable, PrepareConfig, Tensor};
 
 use crate::jit::InputSpec;
 use crate::modernbert::classifier::{ClassifierHead, prediction_head_tail};
 use crate::modernbert::config::ModernBertConfig;
-use crate::modernbert::embedder::{pack_ids_buffer, pack_mask_buffer};
 use crate::modernbert::error::{Result, StateSnafu};
+use crate::modernbert::head_jit::{HeadError, JitSnafu, execute_head};
 use crate::modernbert::model::ModernBert;
 use crate::state::{HasStateDict, StateDict};
-
-// ─── error ─────────────────────────────────────────────────────────────────
-
-#[derive(Debug, Snafu)]
-pub enum TokenClassifierError {
-    #[snafu(display("JIT op failed: {source}"))]
-    Jit { source: crate::jit::JitError },
-    #[snafu(display("device op failed: {source}"))]
-    Device { source: svod_device::error::Error },
-    #[snafu(display("token-classification batch of {got} exceeds prepared max_batch {max}"))]
-    CapacityExceeded { got: usize, max: usize },
-}
 
 // ─── composite model (backbone + head) ─────────────────────────────────────
 
@@ -59,18 +48,7 @@ impl ModernBertTokenClassificationModel {
     }
 
     pub(crate) fn from_state_dict(sd: &StateDict, config: &ModernBertConfig) -> Result<Self> {
-        let dtype = config.dtype.clone();
-        let casted: StateDict = sd
-            .iter()
-            .map(|(k, v)| {
-                let t = if v.uop().dtype() == dtype {
-                    v.clone()
-                } else {
-                    v.cast(dtype.clone()).unwrap_or_else(|_| v.clone())
-                };
-                (k.clone(), t)
-            })
-            .collect();
+        let casted = crate::state::cast_all(sd, config.dtype.clone());
 
         let mut backbone = ModernBert::empty(config.clone());
         backbone.load_state_dict(&casted, "").context(StateSnafu)?;
@@ -96,11 +74,12 @@ impl ModernBertTokenClassificationModel {
     }
 }
 
-// ─── runtime (owns JIT, impl Recognize) ────────────────────────────────────
+// ─── runtime (owns JIT, impl Encoder + Recognize) ──────────────────────────
 
 /// Finished token-classifier model. Build once (eager JIT prepare) and reuse
-/// across calls. Implements [`Recognize`] for drop-in use with
-/// [`RecognizePipeline`](svod_arch::pipelines::text::RecognizePipeline).
+/// across calls. Implements [`Encoder`] (with [`Recognize`] fixing the output
+/// kinds) for drop-in use with
+/// [`EncoderPipeline`](svod_arch::pipelines::text::EncoderPipeline).
 pub struct ModernBertTokenClassifier {
     jit: crate::modernbert::token_classifier_jit::ModernBertTokenClassifierJit,
     max_batch: usize,
@@ -114,7 +93,7 @@ impl ModernBertTokenClassifier {
         model: ModernBertTokenClassificationModel,
         max_batch: usize,
         max_seq: usize,
-    ) -> std::result::Result<Self, TokenClassifierError> {
+    ) -> std::result::Result<Self, HeadError> {
         let num_labels = model.head.num_labels();
         let mut jit =
             crate::modernbert::token_classifier_jit::ModernBertTokenClassifierJit::new(model).with_b_bound(max_batch);
@@ -125,48 +104,24 @@ impl ModernBertTokenClassifier {
     }
 }
 
-impl Recognize for ModernBertTokenClassifier {
-    type Error = TokenClassifierError;
-
-    fn num_labels(&self) -> usize {
-        self.num_labels
-    }
+impl Encoder for ModernBertTokenClassifier {
+    type Output = TokenClassification;
+    type ChunkOutput = ChunkTokenClassification;
+    type Error = HeadError;
 
     fn capacity(&self) -> (usize, usize) {
         (self.max_batch, self.max_seq)
     }
 
-    fn recognize_batch(
+    fn run_batch(
         &mut self,
         batch: &[&Encoding],
         profile: bool,
-    ) -> std::result::Result<(Vec<TokenClassification>, Option<RunProfile>), TokenClassifierError> {
-        let b = batch.len();
-        if b == 0 {
-            return Ok((Vec::new(), profile.then(RunProfile::default)));
-        }
-        if b > self.max_batch {
-            return Err(CapacityExceededSnafu { got: b, max: self.max_batch }.build());
-        }
-
-        pack_ids_buffer(self.jit.input_ids_mut().context(JitSnafu)?, batch, self.max_seq).context(DeviceSnafu)?;
-        pack_mask_buffer(self.jit.attention_mask_mut().context(JitSnafu)?, batch, self.max_seq).context(DeviceSnafu)?;
-
-        let vars = &[("b", b as i64)];
-        let mut prof = profile.then(RunProfile::default);
-        if let Some(p) = &mut prof {
-            let kernels = self.jit.execute_with_vars_profiled(vars).context(JitSnafu)?;
-            p.push(StageProfile::gpu("recognize", std::time::Duration::ZERO, kernels));
-        } else {
-            self.jit.execute_with_vars(vars).context(JitSnafu)?;
-        }
-
+    ) -> std::result::Result<(Vec<TokenClassification>, Option<RunProfile>), HeadError> {
+        let (b, flat, prof) = execute_head(&mut self.jit, batch, self.max_batch, self.max_seq, profile, "recognize")?;
         // Output is row-major `(B, max_seq, num_labels)`; each chunk occupies a
         // `max_seq`-wide row slab. Slice to each chunk's live token count so the
         // returned grid is `(seq_len, num_labels)` — padding positions dropped.
-        let out = self.jit.output().context(JitSnafu)?;
-        let view = out.as_array::<f32>().context(DeviceSnafu)?;
-        let flat = view.as_slice().expect("contiguous token-classification buffer");
         let nl = self.num_labels;
         let stride = self.max_seq * nl;
         let results: Vec<TokenClassification> = (0..b)
@@ -176,7 +131,22 @@ impl Recognize for ModernBertTokenClassifier {
                 TokenClassification { logits: flat[start..start + seq_len * nl].to_vec(), num_labels: nl }
             })
             .collect();
-
         Ok((results, prof))
+    }
+
+    fn attach(chunk: &TextChunk, out: TokenClassification) -> ChunkTokenClassification {
+        ChunkTokenClassification {
+            byte_offset: chunk.byte_offset,
+            token_offsets: chunk.encoding.offsets.clone(),
+            special_tokens_mask: chunk.encoding.special_tokens_mask.clone(),
+            logits: out.logits,
+            num_labels: out.num_labels,
+        }
+    }
+}
+
+impl Recognize for ModernBertTokenClassifier {
+    fn num_labels(&self) -> usize {
+        self.num_labels
     }
 }

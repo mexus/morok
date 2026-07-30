@@ -20,7 +20,7 @@ use std::time::Instant;
 use clap::Parser;
 
 use svod_arch::pipelines::text::{
-    Recognize, RecognizePipeline, RunOptions, Scheme, TruncatingChunker, group_spans, labels_for_tokens,
+    Encoder, EncoderPipeline, Recognize, RunOptions, Scheme, TruncatingChunker, group_spans, labels_for_tokens,
 };
 use svod_dtype::DType;
 use svod_model::modernbert;
@@ -118,7 +118,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         |id: u32| id2label.get(id as usize).cloned().filter(|s| !s.is_empty()).unwrap_or_else(|| format!("LABEL_{id}"));
 
     println!("Chunker: truncating max_seq={max_seq}");
-    let mut pipeline = RecognizePipeline::new(tokenizer, TruncatingChunker::new(max_seq), recognizer);
+    let mut pipeline = EncoderPipeline::new(tokenizer, TruncatingChunker::new(max_seq), recognizer);
 
     println!("\nTagging {} chars (scheme = {})...", text.len(), args.scheme);
     let t = Instant::now();

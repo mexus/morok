@@ -18,7 +18,7 @@ use std::time::Instant;
 
 use clap::Parser;
 
-use svod_arch::pipelines::text::{Classify, ClassifyPipeline, RunOptions, TruncatingChunker};
+use svod_arch::pipelines::text::{Classify, Encoder, EncoderPipeline, RunOptions, TruncatingChunker};
 use svod_dtype::DType;
 use svod_model::modernbert;
 
@@ -84,7 +84,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Loaded: max_seq={max_seq}, max_batch={}, num_classes={num_classes}", args.max_batch);
 
     println!("Chunker: truncating max_seq={max_seq}");
-    let mut pipeline = ClassifyPipeline::new(tokenizer, TruncatingChunker::new(max_seq), classifier);
+    let mut pipeline = EncoderPipeline::new(tokenizer, TruncatingChunker::new(max_seq), classifier);
 
     println!("\nClassifying {} chars...", text.len());
     let t = Instant::now();

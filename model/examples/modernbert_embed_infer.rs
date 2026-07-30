@@ -21,7 +21,7 @@ use std::time::Instant;
 use clap::Parser;
 
 use svod_arch::pipelines::text::{
-    Chunker, Embed, EmbeddingsPipeline, RunOptions, SlidingWindowChunker, Tokenizer, TruncatingChunker,
+    Chunker, Embed, Encoder, EncoderPipeline, RunOptions, SlidingWindowChunker, Tokenizer, TruncatingChunker,
 };
 use svod_dtype::DType;
 use svod_model::modernbert;
@@ -64,7 +64,7 @@ struct Args {
 }
 
 fn embed_and_report<T, C, E>(
-    pipeline: &mut EmbeddingsPipeline<T, C, E>,
+    pipeline: &mut EncoderPipeline<T, C, E>,
     text: &str,
     profile: bool,
 ) -> Result<(), Box<dyn std::error::Error>>
@@ -124,7 +124,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     match (args.window, args.stride) {
         (Some(window), Some(stride)) => {
             println!("Chunker: sliding window={window}, stride={stride}");
-            let mut pipeline = EmbeddingsPipeline::new(tokenizer, SlidingWindowChunker::new(window, stride), embedder);
+            let mut pipeline = EncoderPipeline::new(tokenizer, SlidingWindowChunker::new(window, stride), embedder);
             embed_and_report(&mut pipeline, &text, args.profile)?;
         }
         (Some(_), None) | (None, Some(_)) => {
@@ -132,7 +132,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         (None, None) => {
             println!("Chunker: truncating max_seq={max_seq}");
-            let mut pipeline = EmbeddingsPipeline::new(tokenizer, TruncatingChunker::new(max_seq), embedder);
+            let mut pipeline = EncoderPipeline::new(tokenizer, TruncatingChunker::new(max_seq), embedder);
             embed_and_report(&mut pipeline, &text, args.profile)?;
         }
     }

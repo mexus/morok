@@ -6,7 +6,7 @@
 
 use std::sync::{LazyLock, Mutex, MutexGuard};
 
-use svod_arch::pipelines::text::{Encoding, Recognize, TokenClassification};
+use svod_arch::pipelines::text::{Encoder, Encoding, Recognize, TokenClassification};
 
 use crate::modernbert::{ModernBertTokenClassificationModel, ModernBertTokenClassifier};
 use crate::test::unit::modernbert::model::tiny_cfg;
@@ -71,7 +71,7 @@ fn recognize_batch_shapes_and_finite() {
     let nl = rec.num_labels();
     let e1 = encoding(&[1, 2, 3], 0);
     let e2 = encoding(&[4, 5], 1);
-    let (out, prof) = rec.recognize_batch(&[&e1, &e2], false).expect("recognize_batch");
+    let (out, prof) = rec.run_batch(&[&e1, &e2], false).expect("recognize_batch");
     assert_eq!(out.len(), 2);
     // e1: 3 real tokens → 3*num_labels logits; e2: 2 real + 1 pad → 3*num_labels.
     assert_eq!(out[0].logits.len(), 3 * nl);
@@ -106,8 +106,8 @@ fn capacity_reported() {
 fn recognize_single_matches_batch_of_one() {
     let mut rec = recognizer();
     let e = encoding(&[1, 2, 3], 0);
-    let single = rec.recognize(&e, false).unwrap().0;
-    let batch = rec.recognize_batch(&[&e], false).unwrap().0;
+    let single = rec.run(&e, false).unwrap().0;
+    let batch = rec.run_batch(&[&e], false).unwrap().0;
     assert_eq!(single.logits, batch.into_iter().next().unwrap().logits);
 }
 
@@ -122,11 +122,11 @@ fn batch_rows_match_single_calls() {
     let refs: Vec<Vec<f32>> = inputs
         .iter()
         .map(|e| {
-            let (mut s, _) = rec.recognize_batch(&[e], false).unwrap();
+            let (mut s, _) = rec.run_batch(&[e], false).unwrap();
             s.pop().unwrap().logits
         })
         .collect();
-    let (batch, _) = rec.recognize_batch(&inputs.iter().collect::<Vec<_>>(), false).unwrap();
+    let (batch, _) = rec.run_batch(&inputs.iter().collect::<Vec<_>>(), false).unwrap();
     for (got, want) in batch.iter().zip(&refs) {
         assert_eq!(got.logits.len() / nl, want.len() / nl, "seq_len mismatch");
         assert!(max_delta(&got.logits, want) < 1e-4, "row differs from single call");
@@ -138,10 +138,10 @@ fn batch_rows_match_single_calls() {
 #[ignore = "heavy: 2-layer ModernBERT JIT graph compile through the CPU backend"]
 fn empty_batch_returns_empty() {
     let mut rec = recognizer();
-    let (out, prof) = rec.recognize_batch(&[], false).expect("empty batch");
+    let (out, prof) = rec.run_batch(&[], false).expect("empty batch");
     assert!(out.is_empty());
     assert!(prof.is_none());
-    let (out, prof) = rec.recognize_batch(&[], true).expect("empty batch profiled");
+    let (out, prof) = rec.run_batch(&[], true).expect("empty batch profiled");
     assert!(out.is_empty());
     assert!(prof.is_some(), "profiled empty run still returns a default profile");
 }
@@ -154,7 +154,7 @@ fn capacity_exceeded_errors() {
     // One more than the prepared MAX_BATCH.
     let e = encoding(&[1, 2, 3], 0);
     let batch = std::iter::repeat_n(&e, MAX_BATCH + 1).collect::<Vec<_>>();
-    let err = rec.recognize_batch(&batch, false).unwrap_err();
+    let err = rec.run_batch(&batch, false).unwrap_err();
     assert!(err.to_string().contains("exceeds"), "{err}");
 }
 
@@ -164,7 +164,7 @@ fn capacity_exceeded_errors() {
 fn profile_returned_when_requested() {
     let mut rec = recognizer();
     let e = encoding(&[1, 2, 3], 0);
-    let (_, prof) = rec.recognize_batch(&[&e], true).expect("profiled run");
+    let (_, prof) = rec.run_batch(&[&e], true).expect("profiled run");
     let prof = prof.expect("profile collected");
     assert!(prof.stage("recognize").is_some(), "missing 'recognize' stage");
 }
@@ -179,8 +179,8 @@ fn padding_with_correct_mask_is_invariant() {
     let nl = rec.num_labels();
     let real = 3;
 
-    let (out_no, _) = rec.recognize_batch(&[&encoding(&[1, 2, 3], 0)], false).unwrap();
-    let (out_pad, _) = rec.recognize_batch(&[&encoding(&[1, 2, 3], 2)], false).unwrap();
+    let (out_no, _) = rec.run_batch(&[&encoding(&[1, 2, 3], 0)], false).unwrap();
+    let (out_pad, _) = rec.run_batch(&[&encoding(&[1, 2, 3], 2)], false).unwrap();
 
     assert_eq!(out_no[0].logits.len(), real * nl);
     assert_eq!(out_pad[0].logits.len(), (real + 2) * nl, "pad positions keep their own logits");
