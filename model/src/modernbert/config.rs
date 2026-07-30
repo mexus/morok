@@ -11,6 +11,7 @@
 //! `local_attention`-wide sliding window split evenly. Global layers use
 //! `global_rope_theta`; local layers use `local_rope_theta`.
 
+use std::collections::HashMap;
 use std::path::Path;
 
 use serde::Deserialize;
@@ -179,9 +180,12 @@ impl ModernBertConfig {
             pad_token_id: raw.pad_token_id.unwrap_or(d.pad_token_id),
             tie_word_embeddings: raw.tie_word_embeddings.unwrap_or(d.tie_word_embeddings),
             decoder_bias: raw.decoder_bias.unwrap_or(d.decoder_bias),
+            // Compute dtype is caller-chosen, not from config.json.
             dtype: d.dtype,
             max_batch_size: d.max_batch_size,
-            num_labels: raw.num_labels.unwrap_or(d.num_labels),
+            num_labels: raw
+                .num_labels
+                .unwrap_or_else(|| raw.id2label.as_ref().map(|m| m.len()).unwrap_or(d.num_labels)),
             classifier_pooling: match raw.classifier_pooling.as_deref() {
                 Some("mean") => ClassifierPooling::Mean,
                 _ => ClassifierPooling::Cls,
@@ -214,6 +218,8 @@ struct RawModernBertConfig {
     decoder_bias: Option<bool>,
     // ── classification-only fields ──
     num_labels: Option<usize>,
+    /// HF derives `num_labels` from `len(id2label)` when not explicitly set.
+    id2label: Option<HashMap<String, String>>,
     classifier_pooling: Option<String>,
     classifier_bias: Option<bool>,
     norm_bias: Option<bool>,

@@ -8,12 +8,15 @@
 
 use std::path::{Path, PathBuf};
 
-use svod_arch::pipelines::text::{Embed, Encoding};
+use svod_arch::pipelines::text::{Classify, Embed, Encoding};
 
 use svod_dtype::DType;
 use svod_tensor::Tensor;
 
-use crate::modernbert::{ModernBert, ModernBertConfig, ModernBertEmbedder, ModernBertForMaskedLm};
+use crate::modernbert::{
+    ModernBert, ModernBertClassificationModel, ModernBertClassifier, ModernBertConfig, ModernBertEmbedder,
+    ModernBertForMaskedLm,
+};
 use crate::state::StateDict;
 
 const HUB_REPO: &str = "answerdotai/ModernBERT-base";
@@ -231,4 +234,122 @@ fn embeddings_match_pytorch() {
     let max_delta = got.iter().zip(want.iter()).map(|(a, e)| (a - e).abs()).fold(0.0f32, f32::max);
     eprintln!("embedding max |delta| = {max_delta:.3e}");
     assert!(max_delta < 1e-3, "embedding drifted from PyTorch golden: max |delta| = {max_delta}");
+}
+
+// ── classifier parity (SST-2 fine-tuned checkpoint) ─────────────────────────
+//
+// Tests the fused backbone + classification head (pool → dense → GELU → norm →
+// classifier) against `AutoModelForSequenceClassification` from `transformers`.
+// The SST-2 model uses mean pooling and `classifier_bias = false` — exercising
+// the masked-mean path and the optional-bias code.
+
+const CLASSIFIER_HUB_REPO: &str = "AnkitAI/Sensible-ModernBERT-Sentiment-Analysis";
+
+/// Resolve classifier-parity artifacts: same 3-tier as [`real_file`] but from
+/// the SST-2 fine-tuned repo.
+fn classifier_file(name: &str) -> PathBuf {
+    let dir = std::env::var_os("SVOD_MODERNBERT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("../data/modernbert"));
+    let local = dir.join(name);
+    if local.exists() {
+        local
+    } else {
+        let api = hf_hub::api::sync::Api::new().expect("HF Hub API");
+        let repo =
+            api.repo(hf_hub::Repo::with_revision(CLASSIFIER_HUB_REPO.into(), hf_hub::RepoType::Model, "main".into()));
+        repo.get(name).unwrap_or_else(|_| panic!("download {name} from HF Hub"))
+    }
+}
+
+/// Build the classifier + golden encodings. Batch and seq_len are derived from
+/// the golden's `input_ids` shape so the JIT preparation matches the golden's
+/// padding.
+fn load_classifier_fixture() -> (ModernBertClassifier, Vec<Encoding>, Vec<f32>, usize) {
+    let golden = crate::state::load_safetensors(&classifier_file("golden_classifier.safetensors")).expect("golden");
+
+    let ids_shape = golden.get("input_ids").expect("input_ids").shape().expect("input_ids shape");
+    let batch = ids_shape[0].as_const().expect("concrete batch dim");
+    let seq_len = ids_shape[1].as_const().expect("concrete seq_len dim");
+
+    let input_ids: Vec<i64> = load_golden_vec(&golden, "input_ids");
+    let attention_mask: Vec<i64> = load_golden_vec(&golden, "attention_mask");
+    let expected_logits: Vec<f32> = load_golden_vec(&golden, "expected_logits");
+    let num_labels = expected_logits.len() / batch;
+
+    let encodings: Vec<Encoding> = (0..batch)
+        .map(|i| {
+            let off = i * seq_len;
+            Encoding {
+                input_ids: input_ids[off..off + seq_len].iter().map(|x| *x as u32).collect(),
+                attention_mask: attention_mask[off..off + seq_len].iter().map(|x| *x as u32).collect(),
+                token_type_ids: vec![0; seq_len],
+                offsets: vec![(0, 0); seq_len],
+                special_tokens_mask: vec![0; seq_len],
+            }
+        })
+        .collect();
+
+    let cfg_path = classifier_file("config.json");
+    let mut cfg = ModernBertConfig::from_json(&cfg_path).expect("parse config.json");
+    cfg.dtype = DType::Float32;
+
+    let weights_path = classifier_file("model.safetensors");
+    let sd = crate::state::load_safetensors(&weights_path).expect("load weights");
+    let model = ModernBertClassificationModel::from_state_dict(&sd, &cfg).expect("build model");
+    let classifier = ModernBertClassifier::new(model, batch, seq_len).expect("build classifier");
+
+    (classifier, encodings, expected_logits, num_labels)
+}
+
+/// Classification parity: Svod's fused backbone+head JIT (`ModernBertClassifier`)
+/// vs the PyTorch reference (`expected_logits` from the golden, produced by
+/// `transformers` `AutoModelForSequenceClassification`). The SST-2 model uses
+/// mean pooling with `classifier_bias = false`.
+#[test]
+#[ignore = "heavy: real SST-2 ModernBERT-base classifier weights + PyTorch golden (local or HF Hub download)"]
+fn classify_logits_match_pytorch() {
+    let (mut classifier, encodings, want, num_labels) = load_classifier_fixture();
+
+    let refs: Vec<&Encoding> = encodings.iter().collect();
+    let (classifications, _prof) = classifier.classify_batch(&refs, false).expect("classify");
+
+    assert_eq!(classifications.len(), encodings.len(), "batch size mismatch");
+    for (i, c) in classifications.iter().enumerate() {
+        let expected = &want[i * num_labels..(i + 1) * num_labels];
+        let max_delta = c.logits.iter().zip(expected.iter()).map(|(a, e)| (a - e).abs()).fold(0.0f32, f32::max);
+        eprintln!("[{i}] logits max |delta| = {max_delta:.3e}  got={:.4?}  want={:.4?}", c.logits, expected);
+        assert!(max_delta < 1e-3, "classification logits [{i}] drifted from PyTorch golden: max |delta| = {max_delta}");
+    }
+}
+
+/// Negative control: an all-ones mask (ignoring padding) must DIVERGE from the
+/// golden — both attention and mean-pooling are contaminated by pad tokens. If
+/// this passes, the golden isn't exercising the mask.
+#[test]
+#[ignore = "heavy: real SST-2 ModernBERT-base classifier weights + PyTorch golden (local or HF Hub download)"]
+fn ignoring_padding_diverges_in_classification() {
+    let (mut classifier, encodings, want, num_labels) = load_classifier_fixture();
+
+    let unmasked: Vec<Encoding> = encodings
+        .iter()
+        .map(|e| {
+            let mut e = e.clone();
+            e.attention_mask.fill(1);
+            e
+        })
+        .collect();
+
+    let refs: Vec<&Encoding> = unmasked.iter().collect();
+    let (classifications, _prof) = classifier.classify_batch(&refs, false).expect("classify unmasked");
+
+    for (i, c) in classifications.iter().enumerate() {
+        let expected = &want[i * num_labels..(i + 1) * num_labels];
+        let max_delta = c.logits.iter().zip(expected.iter()).map(|(a, e)| (a - e).abs()).fold(0.0f32, f32::max);
+        assert!(
+            max_delta > 1e-2,
+            "ignoring padding did NOT diverge from the golden [{i}] (max |delta| = {max_delta:.3e})"
+        );
+        eprintln!("[{i}] unmasked logits max |delta| = {max_delta:.3e} (diverges as expected)");
+    }
 }

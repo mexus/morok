@@ -42,14 +42,15 @@ pub enum ClassifierError {
 // ─── head weights ──────────────────────────────────────────────────────────
 
 /// Classification head weights: HF `head.dense` + `head.norm` + `classifier`.
-/// `dense_bias` is `None` when `classifier_bias = false` (ModernBERT default).
+/// `dense_bias` and `classifier_bias` are `None` when `classifier_bias = false`
+/// (ModernBERT default) — both `head.dense` and `classifier` use the same flag.
 #[derive(Clone)]
 pub(crate) struct ClassifierHead {
     dense_weight: Tensor,
     dense_bias: Option<Tensor>,
     norm: LayerNormWeights,
     classifier_weight: Tensor,
-    classifier_bias: Tensor,
+    classifier_bias: Option<Tensor>,
 }
 
 impl ClassifierHead {
@@ -62,7 +63,7 @@ impl ClassifierHead {
             dense_bias: None,
             norm: LayerNormWeights::with_eps(d, config.layer_norm_eps, dt.clone()),
             classifier_weight: fan_in_uniform(&[n, d], d, dt.clone()),
-            classifier_bias: fan_in_uniform(&[n], d, dt),
+            classifier_bias: config.classifier_bias.then(|| fan_in_uniform(&[n], d, dt.clone())),
         }
     }
 }
@@ -76,7 +77,9 @@ impl HasStateDict for ClassifierHead {
         }
         sd.extend(self.norm.state_dict("head.norm"));
         sd.insert("classifier.weight".to_string(), self.classifier_weight.clone());
-        sd.insert("classifier.bias".to_string(), self.classifier_bias.clone());
+        if let Some(b) = &self.classifier_bias {
+            sd.insert("classifier.bias".to_string(), b.clone());
+        }
         sd
     }
 
@@ -85,7 +88,7 @@ impl HasStateDict for ClassifierHead {
         self.dense_bias = sd.get("head.dense.bias").cloned();
         self.norm.load_state_dict(sd, "head.norm")?;
         self.classifier_weight = get_tensor(sd, "classifier.weight")?;
-        self.classifier_bias = get_tensor(sd, "classifier.bias")?;
+        self.classifier_bias = sd.get("classifier.bias").cloned();
         Ok(())
     }
 }
@@ -175,8 +178,10 @@ fn classify_head(hidden: &Tensor, mask: &Tensor, head: &ClassifierHead, pooling:
     let normed = head.norm.apply(&activated)?;
 
     // classifier: Linear(hidden → num_labels)
-    let logits =
-        normed.linear().weight(&head.classifier_weight).bias(&head.classifier_bias).call().context(TensorSnafu)?;
+    let logits = match &head.classifier_bias {
+        Some(b) => normed.linear().weight(&head.classifier_weight).bias(b).call().context(TensorSnafu)?,
+        None => normed.linear().weight(&head.classifier_weight).call().context(TensorSnafu)?,
+    };
 
     logits.cast(DType::Float32).context(TensorSnafu)
 }
