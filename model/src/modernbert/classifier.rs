@@ -42,29 +42,40 @@ pub enum ClassifierError {
 // ─── head weights ──────────────────────────────────────────────────────────
 
 /// Classification head weights: HF `head.dense` + `head.norm` + `classifier`.
-/// `dense_bias` and `classifier_bias` are `None` when `classifier_bias = false`
-/// (ModernBERT default) — both `head.dense` and `classifier` use the same flag.
+/// `dense_bias` is `None` when `classifier_bias = false` (ModernBERT default),
+/// gating `head.dense` only. The final `classifier` Linear's bias is **always
+/// present** (HF uses `nn.Linear` with the PyTorch default `bias = True`),
+/// independent of `classifier_bias`. Shared by the sequence-classification and
+/// token-classification heads — both are HF's `ModernBertPredictionHead` +
+/// `classifier`; the sequence head pools first, the token head does not.
 #[derive(Clone)]
 pub(crate) struct ClassifierHead {
     dense_weight: Tensor,
     dense_bias: Option<Tensor>,
     norm: LayerNormWeights,
     classifier_weight: Tensor,
-    classifier_bias: Option<Tensor>,
+    classifier_bias: Tensor,
 }
 
 impl ClassifierHead {
-    fn empty(config: &ModernBertConfig) -> Self {
+    pub(crate) fn empty(config: &ModernBertConfig) -> Self {
         let d = config.hidden_size;
         let n = config.num_labels;
         let dt = config.dtype.clone();
         Self {
             dense_weight: fan_in_uniform(&[d, d], d, dt.clone()),
-            dense_bias: None,
+            dense_bias: config.classifier_bias.then(|| fan_in_uniform(&[d], d, dt.clone())),
             norm: LayerNormWeights::with_eps(d, config.layer_norm_eps, dt.clone()),
             classifier_weight: fan_in_uniform(&[n, d], d, dt.clone()),
-            classifier_bias: config.classifier_bias.then(|| fan_in_uniform(&[n], d, dt.clone())),
+            classifier_bias: fan_in_uniform(&[n], d, dt.clone()),
         }
+    }
+
+    /// Number of output labels (rows of the `classifier` weight).
+    pub(crate) fn num_labels(&self) -> usize {
+        self.classifier_weight.shape().expect("classifier weight shape")[0]
+            .as_const()
+            .expect("classifier weight row count must be concrete")
     }
 }
 
@@ -77,9 +88,7 @@ impl HasStateDict for ClassifierHead {
         }
         sd.extend(self.norm.state_dict("head.norm"));
         sd.insert("classifier.weight".to_string(), self.classifier_weight.clone());
-        if let Some(b) = &self.classifier_bias {
-            sd.insert("classifier.bias".to_string(), b.clone());
-        }
+        sd.insert("classifier.bias".to_string(), self.classifier_bias.clone());
         sd
     }
 
@@ -88,7 +97,11 @@ impl HasStateDict for ClassifierHead {
         self.dense_bias = sd.get("head.dense.bias").cloned();
         self.norm.load_state_dict(sd, "head.norm")?;
         self.classifier_weight = get_tensor(sd, "classifier.weight")?;
-        self.classifier_bias = sd.get("classifier.bias").cloned();
+        // `classifier.bias` is always present in real HF checkpoints (PyTorch
+        // `nn.Linear` default); tolerate its absence by keeping the empty-init.
+        if let Some(b) = sd.get("classifier.bias") {
+            self.classifier_bias = b.clone();
+        }
         Ok(())
     }
 }
@@ -157,8 +170,8 @@ impl ModernBertClassificationModel {
 /// Numerical epsilon guarding the masked-mean denominator.
 const EPS: f64 = 1e-12;
 
-/// Pool → dense → GELU → LayerNorm → classifier linear. Pure IR builder — fused
-/// into the JIT plan by the `build` closure in [`ModernBertClassifierJit`].
+/// Pool → `prediction_head_tail`. Pure IR builder — fused into the JIT plan by
+/// the `build` closure in [`ModernBertClassifierJit`].
 fn classify_head(hidden: &Tensor, mask: &Tensor, head: &ClassifierHead, pooling: ClassifierPooling) -> Result<Tensor> {
     let pooled = match pooling {
         ClassifierPooling::Cls => {
@@ -167,21 +180,27 @@ fn classify_head(hidden: &Tensor, mask: &Tensor, head: &ClassifierHead, pooling:
         }
         ClassifierPooling::Mean => masked_mean(hidden, mask)?,
     };
+    prediction_head_tail(&pooled, head)
+}
 
+/// HF `ModernBertPredictionHead` + the `classifier` Linear: `dense → GELU →
+/// LayerNorm → classifier → f32`. Shared by the sequence-classification head
+/// (applied to the pooled `(B, D)` state) and the token-classification head
+/// (applied to the full `(B, L, D)` state — the `Linear`s broadcast over the
+/// leading axes). Returns logits in the model's `num_labels`.
+pub(crate) fn prediction_head_tail(hidden: &Tensor, head: &ClassifierHead) -> Result<Tensor> {
     // head.dense → GELU → head.norm
     let dense = if let Some(b) = &head.dense_bias {
-        pooled.linear().weight(&head.dense_weight).bias(b).call().context(TensorSnafu)?
+        hidden.linear().weight(&head.dense_weight).bias(b).call().context(TensorSnafu)?
     } else {
-        pooled.linear().weight(&head.dense_weight).call().context(TensorSnafu)?
+        hidden.linear().weight(&head.dense_weight).call().context(TensorSnafu)?
     };
     let activated = dense.gelu_exact().context(TensorSnafu)?;
     let normed = head.norm.apply(&activated)?;
 
-    // classifier: Linear(hidden → num_labels)
-    let logits = match &head.classifier_bias {
-        Some(b) => normed.linear().weight(&head.classifier_weight).bias(b).call().context(TensorSnafu)?,
-        None => normed.linear().weight(&head.classifier_weight).call().context(TensorSnafu)?,
-    };
+    // classifier: Linear(hidden → num_labels), bias always present.
+    let logits =
+        normed.linear().weight(&head.classifier_weight).bias(&head.classifier_bias).call().context(TensorSnafu)?;
 
     logits.cast(DType::Float32).context(TensorSnafu)
 }
@@ -230,9 +249,7 @@ impl ModernBertClassifier {
         max_batch: usize,
         max_seq: usize,
     ) -> std::result::Result<Self, ClassifierError> {
-        let num_classes = model.head.classifier_weight.shape().expect("classifier weight shape")[0]
-            .as_const()
-            .expect("classifier weight row count must be concrete");
+        let num_classes = model.head.num_labels();
         let mut jit = crate::modernbert::classifier_jit::ModernBertClassifierJit::new(model).with_b_bound(max_batch);
         let ids_spec = InputSpec::i64(&[max_batch, max_seq]);
         let mask_spec = InputSpec::i64(&[max_batch, max_seq]);

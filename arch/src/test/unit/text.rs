@@ -1,9 +1,13 @@
 use std::convert::Infallible;
 
+use proptest::prelude::*;
+
 use crate::pipelines::text::{
-    BatchClassifications, BatchEmbeddings, Chunker, Classify, ClassifyPipeline, ClassifyPipelineError,
-    Classification, Embed, Embedding, EmbeddingsPipeline, Encoding, HfTokenizer, HfTokenizerError,
-    RunOptions, RunProfile, SlidingWindowChunker, TextChunk, TextPipelineError, Tokenizer, TruncatingChunker,
+    BatchClassifications, BatchEmbeddings, BatchTokenClassifications, ChunkTokenClassification, Chunker,
+    Classification, Classify, ClassifyPipeline, ClassifyPipelineError, Embed, Embedding, EmbeddingsPipeline, Encoding,
+    Entity, HfTokenizer, HfTokenizerError, Recognize, RecognizePipeline, RecognizePipelineError, RunOptions,
+    RunProfile, Scheme, SlidingWindowChunker, TextChunk, TextPipelineError, TokenClassification, TokenLabel, Tokenizer,
+    TruncatingChunker, group_spans, labels_for_tokens,
 };
 
 fn enc(ids: &[u32]) -> Encoding {
@@ -21,7 +25,7 @@ fn enc(ids: &[u32]) -> Encoding {
 
 /// Encoding with `[CLS]`=2 / `[SEP]`=3 wrapping the content (BertProcessing
 /// convention). Content token at content-index `j` gets offset `(j, j+1)`, so a
-/// window starting at content-index `start` has `char_offset == start`.
+/// window starting at content-index `start` has `byte_offset == start`.
 fn enc_with_specials(ids: &[u32]) -> Encoding {
     let n_content = ids.len();
     let mut input_ids = vec![2]; // [CLS]
@@ -190,7 +194,7 @@ fn truncating_chunker_drops_beyond_max_seq_and_keeps_fields_consistent() {
     let out = chunker.chunk(&enc(&[1, 2, 3, 4, 5, 6, 7])).unwrap();
     assert_eq!(out.len(), 1);
     let c = &out[0];
-    assert_eq!(c.char_offset, 0);
+    assert_eq!(c.byte_offset, 0);
     let e = &c.encoding;
     // Sliced to max_seq on every field — masks and offsets stay aligned with ids.
     assert_eq!(e.input_ids, vec![1, 2, 3, 4]);
@@ -217,7 +221,7 @@ fn sliding_short_input_fits_one_window() {
     let out = chunker.chunk(&enc_with_specials(&[10, 20, 30])).unwrap();
     assert_eq!(out.len(), 1);
     assert_eq!(out[0].encoding.input_ids, vec![2, 10, 20, 30, 3]);
-    assert_eq!(out[0].char_offset, 0);
+    assert_eq!(out[0].byte_offset, 0);
 }
 
 #[test]
@@ -228,22 +232,22 @@ fn sliding_windows_long_input_with_overlap_and_correct_offsets() {
     let out = chunker.chunk(&enc_with_specials(&[10, 11, 12, 13, 14, 15, 16])).unwrap();
     assert_eq!(out.len(), 3);
 
-    // Window 0: content[0..3], char_offset = 0.
-    assert_eq!(out[0].char_offset, 0);
+    // Window 0: content[0..3], byte_offset = 0.
+    assert_eq!(out[0].byte_offset, 0);
     assert_eq!(out[0].encoding.input_ids, vec![2, 10, 11, 12, 3]);
     assert_eq!(out[0].encoding.special_tokens_mask, vec![1, 0, 0, 0, 1]);
     // Offsets are absolute (carried from the source), not rebased per window.
     assert_eq!(out[0].encoding.offsets, vec![(0, 0), (0, 1), (1, 2), (2, 3), (7, 7)]);
     assert_field_lengths(&out[0].encoding, 5);
 
-    // Window 1: content[2..5], char_offset = 2.
-    assert_eq!(out[1].char_offset, 2);
+    // Window 1: content[2..5], byte_offset = 2.
+    assert_eq!(out[1].byte_offset, 2);
     assert_eq!(out[1].encoding.input_ids, vec![2, 12, 13, 14, 3]);
     assert_eq!(out[1].encoding.offsets[1], (2, 3)); // content token 12 keeps its absolute offset
     assert_field_lengths(&out[1].encoding, 5);
 
-    // Window 2: content[4..7], char_offset = 4.
-    assert_eq!(out[2].char_offset, 4);
+    // Window 2: content[4..7], byte_offset = 4.
+    assert_eq!(out[2].byte_offset, 4);
     assert_eq!(out[2].encoding.input_ids, vec![2, 14, 15, 16, 3]);
     assert_field_lengths(&out[2].encoding, 5);
 
@@ -260,8 +264,8 @@ fn sliding_stride_equals_window_gives_adjacent_chunks() {
     assert_eq!(out.len(), 2);
     assert_eq!(out[0].encoding.input_ids, vec![2, 10, 20, 3]);
     assert_eq!(out[1].encoding.input_ids, vec![2, 30, 40, 3]);
-    assert_eq!(out[0].char_offset, 0);
-    assert_eq!(out[1].char_offset, 2);
+    assert_eq!(out[0].byte_offset, 0);
+    assert_eq!(out[1].byte_offset, 2);
 }
 
 #[test]
@@ -274,7 +278,7 @@ fn sliding_last_window_clamped_when_content_uneven() {
     assert_eq!(out[0].encoding.input_ids, vec![2, 10, 20, 3]);
     assert_eq!(out[1].encoding.input_ids, vec![2, 30, 40, 3]);
     assert_eq!(out[2].encoding.input_ids, vec![2, 50, 3]);
-    assert_eq!(out[2].char_offset, 4);
+    assert_eq!(out[2].byte_offset, 4);
 }
 
 #[test]
@@ -286,9 +290,9 @@ fn sliding_works_without_special_tokens() {
     assert_eq!(out[0].encoding.input_ids, vec![10, 20, 30]);
     assert_eq!(out[1].encoding.input_ids, vec![30, 40, 50]);
     assert_eq!(out[2].encoding.input_ids, vec![50, 60]); // partial
-    assert_eq!(out[0].char_offset, 0);
-    assert_eq!(out[1].char_offset, 2);
-    assert_eq!(out[2].char_offset, 4);
+    assert_eq!(out[0].byte_offset, 0);
+    assert_eq!(out[1].byte_offset, 2);
+    assert_eq!(out[2].byte_offset, 4);
 }
 
 #[test]
@@ -326,7 +330,7 @@ fn sliding_new_rejects_stride_above_window() {
 #[test]
 fn sliding_pipeline_produces_per_window_embeddings() {
     // StubTokenizer yields [10, 20, 30, 40, 50, 60] (no specials).
-    // SlidingWindowChunker(3, 2) → 3 windows at char_offsets 0, 2, 4.
+    // SlidingWindowChunker(3, 2) → 3 windows at byte_offsets 0, 2, 4.
     let mut p = EmbeddingsPipeline::new(
         StubTokenizer { ids: vec![10, 20, 30, 40, 50, 60], max_seq: 3, error: false },
         SlidingWindowChunker::new(3, 2),
@@ -334,11 +338,11 @@ fn sliding_pipeline_produces_per_window_embeddings() {
     );
     let out = p.embed_default("ignored").unwrap();
     assert_eq!(out.chunks.len(), 3);
-    assert_eq!(out.chunks[0].char_offset, 0);
+    assert_eq!(out.chunks[0].byte_offset, 0);
     assert_eq!(out.chunks[0].values.values, vec![10.0, 20.0, 30.0]);
-    assert_eq!(out.chunks[1].char_offset, 2);
+    assert_eq!(out.chunks[1].byte_offset, 2);
     assert_eq!(out.chunks[1].values.values, vec![30.0, 40.0, 50.0]);
-    assert_eq!(out.chunks[2].char_offset, 4);
+    assert_eq!(out.chunks[2].byte_offset, 4);
     assert_eq!(out.chunks[2].values.values, vec![50.0, 60.0]);
 }
 
@@ -385,8 +389,8 @@ fn pipeline_truncates_then_embeds() {
     let mut p = pipeline(vec![1, 2, 3, 4, 5, 6, 7], 4);
     let out = p.embed_default("ignored").unwrap();
     assert_eq!(out.chunks.len(), 1);
-    // char_offset is threaded through from the chunker (TruncatingChunker → 0).
-    assert_eq!(out.chunks[0].char_offset, 0);
+    // byte_offset is threaded through from the chunker (TruncatingChunker → 0).
+    assert_eq!(out.chunks[0].byte_offset, 0);
     assert_eq!(out.chunks[0].values.values, vec![1.0, 2.0, 3.0, 4.0]);
     assert!(out.profile.is_none(), "default options don't profile");
 }
@@ -681,9 +685,9 @@ fn batch_with_sliding_window_varying_chunk_counts() {
     let out = p.embed_batch_default(&["abcdef", "ab", "abcd"]).unwrap();
     assert_eq!(out.results.len(), 3);
     assert_eq!(out.results[0].chunks.len(), 3);
-    assert_eq!(out.results[0].chunks[0].char_offset, 0);
-    assert_eq!(out.results[0].chunks[1].char_offset, 2);
-    assert_eq!(out.results[0].chunks[2].char_offset, 4);
+    assert_eq!(out.results[0].chunks[0].byte_offset, 0);
+    assert_eq!(out.results[0].chunks[1].byte_offset, 2);
+    assert_eq!(out.results[0].chunks[2].byte_offset, 4);
     assert_eq!(out.results[1].chunks.len(), 1);
     assert_eq!(out.results[2].chunks.len(), 2);
 }
@@ -781,7 +785,7 @@ fn batch_results_match_individual_embed_calls() {
         let single = p.embed_default(text).unwrap();
         assert_eq!(batch.results[i].chunks.len(), single.chunks.len(), "chunk count mismatch for text {i}");
         for (b, s) in batch.results[i].chunks.iter().zip(&single.chunks) {
-            assert_eq!(b.char_offset, s.char_offset, "char_offset mismatch for text {i}");
+            assert_eq!(b.byte_offset, s.byte_offset, "byte_offset mismatch for text {i}");
             assert_eq!(b.values, s.values, "values mismatch for text {i}");
         }
     }
@@ -814,7 +818,7 @@ fn classify_pipeline_truncates_then_classifies() {
     let mut p = classify_pipeline(vec![1, 2, 3, 4, 5, 6, 7], 4);
     let out = p.classify_default("ignored").unwrap();
     assert_eq!(out.chunks.len(), 1);
-    assert_eq!(out.chunks[0].char_offset, 0);
+    assert_eq!(out.chunks[0].byte_offset, 0);
     assert_eq!(out.chunks[0].logits, vec![1.0, 2.0, 3.0, 4.0]);
     assert!(out.profile.is_none(), "default options don't profile");
 }
@@ -876,11 +880,11 @@ fn classify_sliding_pipeline_produces_per_window_classifications() {
     );
     let out = p.classify_default("ignored").unwrap();
     assert_eq!(out.chunks.len(), 3);
-    assert_eq!(out.chunks[0].char_offset, 0);
+    assert_eq!(out.chunks[0].byte_offset, 0);
     assert_eq!(out.chunks[0].logits, vec![10.0, 20.0, 30.0]);
-    assert_eq!(out.chunks[1].char_offset, 2);
+    assert_eq!(out.chunks[1].byte_offset, 2);
     assert_eq!(out.chunks[1].logits, vec![30.0, 40.0, 50.0]);
-    assert_eq!(out.chunks[2].char_offset, 4);
+    assert_eq!(out.chunks[2].byte_offset, 4);
     assert_eq!(out.chunks[2].logits, vec![50.0, 60.0]);
 }
 
@@ -945,9 +949,9 @@ fn classify_batch_with_sliding_window_varying_chunk_counts() {
     let out = p.classify_batch_default(&["abcdef", "ab", "abcd"]).unwrap();
     assert_eq!(out.results.len(), 3);
     assert_eq!(out.results[0].chunks.len(), 3);
-    assert_eq!(out.results[0].chunks[0].char_offset, 0);
-    assert_eq!(out.results[0].chunks[1].char_offset, 2);
-    assert_eq!(out.results[0].chunks[2].char_offset, 4);
+    assert_eq!(out.results[0].chunks[0].byte_offset, 0);
+    assert_eq!(out.results[0].chunks[1].byte_offset, 2);
+    assert_eq!(out.results[0].chunks[2].byte_offset, 4);
     assert_eq!(out.results[1].chunks.len(), 1);
     assert_eq!(out.results[2].chunks.len(), 2);
 }
@@ -1042,8 +1046,499 @@ fn classify_batch_results_match_individual_classify_calls() {
         let single = p.classify_default(text).unwrap();
         assert_eq!(batch.results[i].chunks.len(), single.chunks.len(), "chunk count mismatch for text {i}");
         for (b, s) in batch.results[i].chunks.iter().zip(&single.chunks) {
-            assert_eq!(b.char_offset, s.char_offset, "char_offset mismatch for text {i}");
+            assert_eq!(b.byte_offset, s.byte_offset, "byte_offset mismatch for text {i}");
             assert_eq!(b.logits, s.logits, "logits mismatch for text {i}");
+        }
+    }
+}
+
+// ─── RecognizePipeline ───────────────────────────────────────────────────────
+
+/// Turns ids into a deterministic `(seq_len, num_labels)` logit grid (analog of
+/// `StubClassify`): each token id `v` becomes a row of `num_labels` copies of
+/// `v as f32`. `profile` emits a single 1 ms `recognize` stage — enough to
+/// exercise the merge without a model.
+struct StubRecognize {
+    num_labels: usize,
+    max_batch: usize,
+    error: bool,
+}
+
+impl Recognize for StubRecognize {
+    type Error = StubRecognizeError;
+    fn num_labels(&self) -> usize {
+        self.num_labels
+    }
+    fn capacity(&self) -> (usize, usize) {
+        (self.max_batch, self.num_labels)
+    }
+    fn recognize_batch(
+        &mut self,
+        batch: &[&Encoding],
+        profile: bool,
+    ) -> Result<(Vec<TokenClassification>, Option<RunProfile>), StubRecognizeError> {
+        if self.error {
+            return Err(StubRecognizeError);
+        }
+        let nl = self.num_labels;
+        let values = batch
+            .iter()
+            .map(|e| {
+                let mut logits = Vec::with_capacity(e.input_ids.len() * nl);
+                for &id in &e.input_ids {
+                    logits.extend(std::iter::repeat_n(id as f32, nl));
+                }
+                TokenClassification { logits, num_labels: nl }
+            })
+            .collect();
+        let prof = profile.then(|| {
+            let mut p = RunProfile::default();
+            p.push(svod_runtime::StageProfile::host("recognize", std::time::Duration::from_millis(1)));
+            p
+        });
+        Ok((values, prof))
+    }
+}
+
+#[derive(Debug, snafu::Snafu)]
+#[snafu(display("stub recognize error"))]
+struct StubRecognizeError;
+
+fn recognize_pipeline(
+    ids: Vec<u32>,
+    max_seq: usize,
+) -> RecognizePipeline<StubTokenizer, TruncatingChunker, StubRecognize> {
+    RecognizePipeline::new(
+        StubTokenizer { ids, max_seq, error: false },
+        TruncatingChunker::new(max_seq),
+        StubRecognize { num_labels: 1, max_batch: 1, error: false },
+    )
+}
+
+#[test]
+fn recognize_single_is_batch_of_one() {
+    let mut rec = StubRecognize { num_labels: 3, max_batch: 1, error: false };
+    let e = enc(&[4, 5, 6]);
+    let single = rec.recognize(&e, false).unwrap().0;
+    let batch = rec.recognize_batch(&[&e], false).unwrap().0;
+    assert_eq!(single, batch.into_iter().next().unwrap());
+}
+
+#[test]
+fn recognize_pipeline_truncates_then_recognizes() {
+    let mut p = recognize_pipeline(vec![1, 2, 3, 4, 5, 6, 7], 4);
+    let out = p.recognize_default("ignored").unwrap();
+    assert_eq!(out.chunks.len(), 1);
+    let c = &out.chunks[0];
+    assert_eq!(c.byte_offset, 0);
+    assert_eq!(c.num_labels, 1);
+    assert_eq!(c.logits, vec![1.0, 2.0, 3.0, 4.0]);
+    // Per-token geometry is threaded through from the chunk's encoding.
+    assert_eq!(c.token_offsets, vec![(0, 1), (1, 2), (2, 3), (3, 4)]);
+    assert_eq!(c.special_tokens_mask, vec![0, 0, 0, 0]);
+    assert!(out.profile.is_none(), "default options don't profile");
+}
+
+#[test]
+fn recognize_pipeline_profiles_stage_order_tokenize_then_chunk_then_recognize() {
+    let mut p = recognize_pipeline(vec![1, 2, 3], 8);
+    let out = p.recognize("ignored", RunOptions { profile: true }).unwrap();
+    let profile = out.profile.expect("profile collected");
+    let names: Vec<&str> = profile.stages.iter().map(|s| s.name.as_str()).collect();
+    assert_eq!(names, vec!["tokenize", "chunk", "recognize"], "host stages lead, then the recognizer's");
+}
+
+#[test]
+fn recognize_pipeline_profiles_per_call_without_rebuild() {
+    let mut p = recognize_pipeline(vec![1, 2, 3], 8);
+    let profiled = p.recognize("ignored", RunOptions { profile: true }).unwrap();
+    assert!(profiled.profile.is_some());
+    let unprofiled = p.recognize_default("ignored").unwrap();
+    assert!(unprofiled.profile.is_none());
+}
+
+#[test]
+fn recognize_pipeline_zero_chunk_run_skips_recognize_and_profiles_host_stages() {
+    let p = RecognizePipeline::new(
+        StubTokenizer { ids: vec![1, 2], max_seq: 4, error: false },
+        NoChunkChunker { max_seq: 4 },
+        StubRecognize { num_labels: 4, max_batch: 1, error: true }, // would fail if called
+    );
+    let mut p = p;
+    let out = p.recognize("ignored", RunOptions { profile: true }).unwrap();
+    assert!(out.chunks.is_empty());
+    let profile = out.profile.expect("profile");
+    let names: Vec<&str> = profile.stages.iter().map(|s| s.name.as_str()).collect();
+    assert_eq!(names, vec!["tokenize", "chunk"], "recognizer never runs; only host stages");
+}
+
+#[test]
+fn recognize_assemble_passes_chunker_max_seq_into_builder() {
+    let seen = std::cell::Cell::new(0usize);
+    let _p: RecognizePipeline<_, TruncatingChunker, StubRecognize> = RecognizePipeline::assemble(
+        StubTokenizer { ids: vec![1], max_seq: 8, error: false },
+        TruncatingChunker::new(8),
+        |max_seq| {
+            seen.set(max_seq);
+            Ok::<_, Infallible>(StubRecognize { num_labels: max_seq, max_batch: 1, error: false })
+        },
+    )
+    .unwrap();
+    assert_eq!(seen.get(), 8);
+}
+
+#[test]
+fn recognize_sliding_pipeline_produces_per_window_classifications() {
+    let mut p = RecognizePipeline::new(
+        StubTokenizer { ids: vec![10, 20, 30, 40, 50, 60], max_seq: 3, error: false },
+        SlidingWindowChunker::new(3, 2),
+        StubRecognize { num_labels: 1, max_batch: 1, error: false },
+    );
+    let out = p.recognize_default("ignored").unwrap();
+    assert_eq!(out.chunks.len(), 3);
+    assert_eq!(out.chunks[0].byte_offset, 0);
+    assert_eq!(out.chunks[0].logits, vec![10.0, 20.0, 30.0]);
+    assert_eq!(out.chunks[0].token_offsets, vec![(0, 1), (1, 2), (2, 3)]);
+    assert_eq!(out.chunks[1].byte_offset, 2);
+    assert_eq!(out.chunks[1].logits, vec![30.0, 40.0, 50.0]);
+    assert_eq!(out.chunks[1].token_offsets, vec![(2, 3), (3, 4), (4, 5)]);
+    assert_eq!(out.chunks[2].byte_offset, 4);
+    assert_eq!(out.chunks[2].logits, vec![50.0, 60.0]);
+    assert_eq!(out.chunks[2].token_offsets, vec![(4, 5), (5, 6)]);
+}
+
+#[test]
+fn recognize_tokenize_error_maps_to_tokenize_variant() {
+    let mut p = RecognizePipeline::new(
+        StubTokenizer { ids: vec![1], max_seq: 4, error: true },
+        TruncatingChunker::new(4),
+        StubRecognize { num_labels: 4, max_batch: 1, error: false },
+    );
+    let err = p.recognize_default("ignored").unwrap_err();
+    assert!(matches!(err, RecognizePipelineError::Tokenize { .. }));
+}
+
+#[test]
+fn recognize_error_maps_to_recognize_variant() {
+    let mut p = RecognizePipeline::new(
+        StubTokenizer { ids: vec![1, 2], max_seq: 4, error: false },
+        TruncatingChunker::new(4),
+        StubRecognize { num_labels: 4, max_batch: 1, error: true },
+    );
+    let err = p.recognize_default("ignored").unwrap_err();
+    assert!(matches!(err, RecognizePipelineError::Recognize { .. }));
+}
+
+#[test]
+fn recognize_chunk_error_maps_to_chunk_variant() {
+    let mut p = RecognizePipeline::new(
+        StubTokenizer { ids: vec![1, 2], max_seq: 4, error: false },
+        ErrChunker { max_seq: 4 },
+        StubRecognize { num_labels: 4, max_batch: 1, error: false },
+    );
+    let err = p.recognize_default("ignored").unwrap_err();
+    assert!(matches!(err, RecognizePipelineError::Chunk { .. }));
+}
+
+// ─── RecognizePipeline batch ─────────────────────────────────────────────────
+
+#[test]
+fn recognize_batch_basic_three_texts() {
+    let mut p = RecognizePipeline::new(
+        ByteTokenizer { max_seq: 32 },
+        TruncatingChunker::new(32),
+        StubRecognize { num_labels: 1, max_batch: 8, error: false },
+    );
+    let out = p.recognize_batch_default(&["ab", "xyz", "hello"]).unwrap();
+    assert_eq!(out.results.len(), 3);
+    assert!(out.profile.is_none(), "default options don't profile");
+    assert_eq!(out.results[0].chunks.len(), 1);
+    assert_eq!(out.results[0].chunks[0].logits, vec![97.0, 98.0]);
+    assert_eq!(out.results[0].chunks[0].num_labels, 1);
+    assert_eq!(out.results[0].chunks[0].token_offsets, vec![(0, 1), (1, 2)]);
+    assert_eq!(out.results[1].chunks[0].logits, vec![120.0, 121.0, 122.0]);
+    assert_eq!(out.results[2].chunks[0].logits, vec![104.0, 101.0, 108.0, 108.0, 111.0]);
+}
+
+#[test]
+fn recognize_batch_with_sliding_window_varying_chunk_counts() {
+    let mut p = RecognizePipeline::new(
+        ByteTokenizer { max_seq: 3 },
+        SlidingWindowChunker::new(3, 2),
+        StubRecognize { num_labels: 1, max_batch: 8, error: false },
+    );
+    let out = p.recognize_batch_default(&["abcdef", "ab", "abcd"]).unwrap();
+    assert_eq!(out.results.len(), 3);
+    assert_eq!(out.results[0].chunks.len(), 3);
+    assert_eq!(out.results[0].chunks[0].byte_offset, 0);
+    assert_eq!(out.results[0].chunks[1].byte_offset, 2);
+    assert_eq!(out.results[0].chunks[2].byte_offset, 4);
+    assert_eq!(out.results[1].chunks.len(), 1);
+    assert_eq!(out.results[2].chunks.len(), 2);
+}
+
+#[test]
+fn recognize_batch_empty_texts_returns_empty() {
+    let mut p = RecognizePipeline::new(
+        ByteTokenizer { max_seq: 8 },
+        TruncatingChunker::new(8),
+        StubRecognize { num_labels: 1, max_batch: 4, error: false },
+    );
+    let out: BatchTokenClassifications = p.recognize_batch_default(&[]).unwrap();
+    assert!(out.results.is_empty());
+    assert!(out.profile.is_none());
+}
+
+#[test]
+fn recognize_batch_some_texts_produce_zero_chunks() {
+    let mut p = RecognizePipeline::new(
+        ByteTokenizer { max_seq: 4 },
+        SlidingWindowChunker::new(4, 2),
+        StubRecognize { num_labels: 1, max_batch: 4, error: false },
+    );
+    let out = p.recognize_batch_default(&["ab", "", "cd"]).unwrap();
+    assert_eq!(out.results.len(), 3);
+    assert_eq!(out.results[0].chunks.len(), 1);
+    assert!(out.results[1].chunks.is_empty());
+    assert_eq!(out.results[2].chunks.len(), 1);
+}
+
+#[test]
+fn recognize_batch_sub_batches_when_chunks_exceed_max_batch() {
+    let mut p = RecognizePipeline::new(
+        ByteTokenizer { max_seq: 8 },
+        TruncatingChunker::new(8),
+        StubRecognize { num_labels: 1, max_batch: 2, error: false },
+    );
+    let texts: Vec<&str> = vec!["a", "b", "c", "d", "e"];
+    let out = p.recognize_batch_default(&texts).unwrap();
+    assert_eq!(out.results.len(), 5);
+    for (i, result) in out.results.iter().enumerate() {
+        assert_eq!(result.chunks.len(), 1);
+        assert_eq!(result.chunks[0].logits, vec![texts[i].as_bytes()[0] as f32]);
+    }
+}
+
+#[test]
+fn recognize_batch_profile_has_tokenize_chunk_recognize_stages() {
+    let mut p = RecognizePipeline::new(
+        ByteTokenizer { max_seq: 8 },
+        TruncatingChunker::new(8),
+        StubRecognize { num_labels: 1, max_batch: 4, error: false },
+    );
+    let out = p.recognize_batch(&["ab", "cd"], RunOptions { profile: true }).unwrap();
+    assert_eq!(out.results.len(), 2);
+    assert!(out.results[0].profile.is_none());
+    assert!(out.results[1].profile.is_none());
+    let profile = out.profile.expect("batch profile collected");
+    let names: Vec<&str> = profile.stages.iter().map(|s| s.name.as_str()).collect();
+    assert_eq!(names, vec!["tokenize", "chunk", "recognize"]);
+}
+
+#[test]
+fn recognize_batch_tokenize_error_maps_to_tokenize_variant() {
+    let mut p = RecognizePipeline::new(
+        StubTokenizer { ids: vec![1], max_seq: 4, error: true },
+        TruncatingChunker::new(4),
+        StubRecognize { num_labels: 4, max_batch: 4, error: false },
+    );
+    let err = p.recognize_batch_default(&["a", "b"]).unwrap_err();
+    assert!(matches!(err, RecognizePipelineError::Tokenize { .. }));
+}
+
+#[test]
+fn recognize_batch_results_match_individual_recognize_calls() {
+    let make_pipeline = || {
+        RecognizePipeline::new(
+            ByteTokenizer { max_seq: 4 },
+            SlidingWindowChunker::new(4, 2),
+            StubRecognize { num_labels: 1, max_batch: 8, error: false },
+        )
+    };
+
+    let texts = ["abcde", "xy"];
+    let batch = {
+        let mut p = make_pipeline();
+        p.recognize_batch_default(&texts).unwrap()
+    };
+
+    for (i, text) in texts.iter().enumerate() {
+        let mut p = make_pipeline();
+        let single = p.recognize_default(text).unwrap();
+        assert_eq!(batch.results[i].chunks.len(), single.chunks.len(), "chunk count mismatch for text {i}");
+        for (b, s) in batch.results[i].chunks.iter().zip(&single.chunks) {
+            assert_eq!(b.byte_offset, s.byte_offset, "byte_offset mismatch for text {i}");
+            assert_eq!(b.logits, s.logits, "logits mismatch for text {i}");
+            assert_eq!(b.token_offsets, s.token_offsets, "token_offsets mismatch for text {i}");
+            assert_eq!(b.special_tokens_mask, s.special_tokens_mask, "special_tokens_mask mismatch for text {i}");
+        }
+    }
+}
+
+// ─── labels_for_tokens / group_spans decoding ───────────────────────────────
+
+/// Build a `ChunkTokenClassification` from a per-token spec: `(label_id,
+/// byte_span, is_special)`. Each token's logits are a one-hot row (so argmax
+/// yields `label_id` deterministically), sized to `num_labels`.
+fn token_chunk(spec: &[(u32, (usize, usize), bool)], num_labels: usize) -> ChunkTokenClassification {
+    let mut logits = Vec::new();
+    let mut offsets = Vec::new();
+    let mut specials = Vec::new();
+    for &(lid, span, is_special) in spec {
+        let mut row = vec![0.0_f32; num_labels];
+        if (lid as usize) < num_labels {
+            row[lid as usize] = 1.0;
+        }
+        logits.extend_from_slice(&row);
+        offsets.push(span);
+        specials.push(if is_special { 1 } else { 0 });
+    }
+    ChunkTokenClassification {
+        byte_offset: 0,
+        logits,
+        num_labels,
+        token_offsets: offsets,
+        special_tokens_mask: specials,
+    }
+}
+
+/// id2label for the decoder tests: 0=O, 1=B-PER, 2=I-PER, 3=B-LOC, 4=I-LOC.
+fn ner_id2label(id: u32) -> String {
+    ["O", "B-PER", "I-PER", "B-LOC", "I-LOC"].get(id as usize).map(|s| (*s).to_string()).unwrap_or_default()
+}
+
+/// The entity type of a prefixed label (`"B-PER"` → `"PER"`); `None` for `"O"`.
+fn typ_of(label: &str) -> Option<&str> {
+    label.split_once('-').map(|(_, t)| t)
+}
+
+#[test]
+fn labels_for_tokens_argmaxes_skips_specials_and_pairs_offsets() {
+    // token ids: 1=B-PER, 2=I-PER, 0=O, 1=B-PER, special(CLS)=1
+    let chunk = token_chunk(
+        &[(1, (0, 3), false), (2, (3, 7), false), (0, (7, 8), false), (1, (8, 12), false), (1, (0, 0), true)],
+        5,
+    );
+    let labels = labels_for_tokens(&chunk, ner_id2label);
+    assert_eq!(labels.len(), 4, "special token dropped");
+    assert_eq!(labels[0], TokenLabel { label_id: 1, label: "B-PER".into(), start: 0, end: 3, token_index: 0 });
+    assert_eq!(labels[1], TokenLabel { label_id: 2, label: "I-PER".into(), start: 3, end: 7, token_index: 1 });
+    assert_eq!(labels[2], TokenLabel { label_id: 0, label: "O".into(), start: 7, end: 8, token_index: 2 });
+    assert_eq!(labels[3], TokenLabel { label_id: 1, label: "B-PER".into(), start: 8, end: 12, token_index: 3 });
+}
+
+#[test]
+fn group_spans_bio_merges_b_i_and_breaks_on_o() {
+    let chunk = token_chunk(&[(1, (0, 3), false), (2, (3, 7), false), (0, (7, 8), false), (1, (8, 12), false)], 5);
+    let labels = labels_for_tokens(&chunk, ner_id2label);
+    let spans = group_spans(&labels, Scheme::Bio);
+    assert_eq!(spans.len(), 2);
+    assert_eq!(spans[0].label, "PER");
+    assert_eq!((spans[0].start, spans[0].end), (0, 7));
+    assert_eq!(spans[0].token_range, 0..2);
+    assert_eq!(spans[1].label, "PER");
+    assert_eq!((spans[1].start, spans[1].end), (8, 12));
+    assert_eq!(spans[1].token_range, 3..4);
+}
+
+#[test]
+fn group_spans_bio_breaks_on_type_change() {
+    // B-PER, I-LOC → mismatched I- opens a fresh LOC span.
+    let chunk = token_chunk(&[(1, (0, 3), false), (4, (3, 6), false)], 5);
+    let labels = labels_for_tokens(&chunk, ner_id2label);
+    let spans = group_spans(&labels, Scheme::Bio);
+    assert_eq!(spans.len(), 2);
+    assert_eq!(spans[0], Entity { label: "PER".into(), label_id: 1, start: 0, end: 3, token_range: 0..1 });
+    assert_eq!(spans[1], Entity { label: "LOC".into(), label_id: 4, start: 3, end: 6, token_range: 1..2 });
+}
+
+#[test]
+fn group_spans_bio_treats_stray_i_as_new_opener() {
+    // I-PER with no preceding B-PER → lenient single-token span.
+    let chunk = token_chunk(&[(2, (0, 3), false), (0, (3, 4), false)], 5);
+    let labels = labels_for_tokens(&chunk, ner_id2label);
+    let spans = group_spans(&labels, Scheme::Bio);
+    assert_eq!(spans.len(), 1);
+    assert_eq!(spans[0].label, "PER");
+    assert_eq!(spans[0].token_range, 0..1);
+}
+
+#[test]
+fn group_spans_flat_emits_one_per_token() {
+    // Flat labels (POS-style): each token its own entity, no grouping.
+    let labels: Vec<TokenLabel> = [("NNS", 0), ("VBD", 1)]
+        .into_iter()
+        .map(|(lbl, i)| TokenLabel { label_id: 0, label: lbl.into(), start: i, end: i + 1, token_index: i })
+        .collect();
+    let spans = group_spans(&labels, Scheme::Flat);
+    assert_eq!(spans.len(), 2);
+    assert_eq!(spans[0].label, "NNS");
+    assert_eq!(spans[0].token_range, 0..1);
+    assert_eq!(spans[1].label, "VBD");
+    assert_eq!(spans[1].token_range, 1..2);
+}
+
+#[test]
+fn group_spans_bilou_and_iobes() {
+    // BILOU: B-PER I-PER L-PER → one PER span over 3 tokens; U-PER → single.
+    let bilou_labels: Vec<TokenLabel> = [("B-PER", 0), ("I-PER", 1), ("L-PER", 2), ("U-PER", 3)]
+        .into_iter()
+        .map(|(lbl, i)| TokenLabel { label_id: 1, label: lbl.into(), start: i, end: i + 1, token_index: i })
+        .collect();
+    let bilou = group_spans(&bilou_labels, Scheme::Bilou);
+    assert_eq!(bilou.len(), 2);
+    assert_eq!(bilou[0].label, "PER");
+    assert_eq!(bilou[0].token_range, 0..3);
+    assert_eq!(bilou[1].label, "PER");
+    assert_eq!(bilou[1].token_range, 3..4);
+
+    // IOBES: B-PER I-PER E-PER → one span; S-PER → single.
+    let iobes_labels: Vec<TokenLabel> = [("B-PER", 0), ("I-PER", 1), ("E-PER", 2), ("S-PER", 3)]
+        .into_iter()
+        .map(|(lbl, i)| TokenLabel { label_id: 1, label: lbl.into(), start: i, end: i + 1, token_index: i })
+        .collect();
+    let iobes = group_spans(&iobes_labels, Scheme::Iobes);
+    assert_eq!(iobes.len(), 2);
+    assert_eq!(iobes[0].label, "PER");
+    assert_eq!(iobes[0].token_range, 0..3);
+    assert_eq!(iobes[1].label, "PER");
+    assert_eq!(iobes[1].token_range, 3..4);
+}
+
+proptest! {
+    /// Random BIO label sequences decode to well-formed spans: disjoint,
+    /// ordered, in-bounds ranges; every token in a span shares the span's type;
+    /// no "O" token is inside a span; byte spans match the covered tokens.
+    #[test]
+    fn prop_group_spans_bio_well_formed(
+        labels in proptest::collection::vec(
+            proptest::sample::select(vec!["O".to_string(), "B-PER".into(), "I-PER".into(), "B-LOC".into(), "I-LOC".into()]),
+            0..32,
+        )
+    ) {
+        let tokens: Vec<TokenLabel> = labels
+            .iter()
+            .enumerate()
+            .map(|(i, l)| TokenLabel { label_id: 0, label: l.clone(), start: i, end: i + 1, token_index: i })
+            .collect();
+        let n = tokens.len();
+        let entities = group_spans(&tokens, Scheme::Bio);
+
+        let mut prev_end = 0usize;
+        for e in &entities {
+            // Range is non-empty, in-bounds, ordered & disjoint with the previous.
+            prop_assert!(e.token_range.start < e.token_range.end, "empty range");
+            prop_assert!(e.token_range.end <= n, "range out of bounds");
+            prop_assert!(e.token_range.start >= prev_end, "ranges not ordered/disjoint");
+            // Byte span matches the covered tokens.
+            prop_assert_eq!(e.start, tokens[e.token_range.start].start);
+            prop_assert_eq!(e.end, tokens[e.token_range.end - 1].end);
+            // Every covered token shares the span's type and is not "O".
+            for ti in e.token_range.clone() {
+                prop_assert!(tokens[ti].label != "O", "'O' token inside a span");
+                prop_assert_eq!(typ_of(&tokens[ti].label), Some(e.label.as_str()), "type mismatch in span");
+            }
+            prev_end = e.token_range.end;
         }
     }
 }

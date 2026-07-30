@@ -8,14 +8,14 @@
 
 use std::path::{Path, PathBuf};
 
-use svod_arch::pipelines::text::{Classify, Embed, Encoding};
+use svod_arch::pipelines::text::{Classify, Embed, Encoding, Recognize};
 
 use svod_dtype::DType;
 use svod_tensor::Tensor;
 
 use crate::modernbert::{
     ModernBert, ModernBertClassificationModel, ModernBertClassifier, ModernBertConfig, ModernBertEmbedder,
-    ModernBertForMaskedLm,
+    ModernBertForMaskedLm, ModernBertTokenClassificationModel, ModernBertTokenClassifier,
 };
 use crate::state::StateDict;
 
@@ -351,5 +351,140 @@ fn ignoring_padding_diverges_in_classification() {
             "ignoring padding did NOT diverge from the golden [{i}] (max |delta| = {max_delta:.3e})"
         );
         eprintln!("[{i}] unmasked logits max |delta| = {max_delta:.3e} (diverges as expected)");
+    }
+}
+
+// ─── token classification parity ───────────────────────────────────────────
+//
+// Tests the fused backbone + token head (`prediction_head_tail` over the full
+// `(B, L, D)` state, no pooling) against `AutoModelForTokenClassification` from
+// `transformers`. The CoNLL-2003 NER fine-tune has no pooling; `classifier_bias`
+// is exercised by the always-present `classifier.bias`.
+
+const TOKEN_HUB_REPO: &str = "sanketrai/modernbert-base-conll2003-english-ner";
+
+/// Resolve token-parity artifacts: same 3-tier as [`real_file`] but from the
+/// CoNLL-2003 NER fine-tuned repo.
+fn token_file(name: &str) -> PathBuf {
+    let dir = std::env::var_os("SVOD_MODERNBERT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("../data/modernbert"));
+    let local = dir.join(name);
+    if local.exists() {
+        local
+    } else {
+        let api = hf_hub::api::sync::Api::new().expect("HF Hub API");
+        let repo = api.repo(hf_hub::Repo::with_revision(TOKEN_HUB_REPO.into(), hf_hub::RepoType::Model, "main".into()));
+        repo.get(name).unwrap_or_else(|_| panic!("download {name} from HF Hub"))
+    }
+}
+
+/// Build the token classifier + golden encodings. Batch and seq_len come from
+/// the golden's `input_ids` shape so the JIT preparation matches the golden's
+/// padding. Returns the flat `(B, L, num_labels)` expected logits + num_labels.
+fn load_token_fixture() -> (ModernBertTokenClassifier, Vec<Encoding>, Vec<f32>, usize, usize) {
+    let golden = crate::state::load_safetensors(&token_file("golden_token.safetensors")).expect("golden");
+
+    let ids_shape = golden.get("input_ids").expect("input_ids").shape().expect("input_ids shape");
+    let batch = ids_shape[0].as_const().expect("concrete batch dim");
+    let seq_len = ids_shape[1].as_const().expect("concrete seq_len dim");
+
+    let input_ids: Vec<i64> = load_golden_vec(&golden, "input_ids");
+    let attention_mask: Vec<i64> = load_golden_vec(&golden, "attention_mask");
+    let expected_logits: Vec<f32> = load_golden_vec(&golden, "expected_logits");
+    let num_labels = expected_logits.len() / (batch * seq_len);
+
+    let encodings: Vec<Encoding> = (0..batch)
+        .map(|i| {
+            let off = i * seq_len;
+            Encoding {
+                input_ids: input_ids[off..off + seq_len].iter().map(|x| *x as u32).collect(),
+                attention_mask: attention_mask[off..off + seq_len].iter().map(|x| *x as u32).collect(),
+                token_type_ids: vec![0; seq_len],
+                offsets: vec![(0, 0); seq_len],
+                special_tokens_mask: vec![0; seq_len],
+            }
+        })
+        .collect();
+
+    let cfg_path = token_file("config.json");
+    let mut cfg = ModernBertConfig::from_json(&cfg_path).expect("parse config.json");
+    cfg.dtype = DType::Float32;
+
+    let weights_path = token_file("model.safetensors");
+    let sd = crate::state::load_safetensors(&weights_path).expect("load weights");
+    let model = ModernBertTokenClassificationModel::from_state_dict(&sd, &cfg).expect("build model");
+    let recognizer = ModernBertTokenClassifier::new(model, batch, seq_len).expect("build token classifier");
+
+    (recognizer, encodings, expected_logits, num_labels, seq_len)
+}
+
+/// Token-classification parity: Svod's fused backbone + per-token head JIT
+/// (`ModernBertTokenClassifier`) vs the PyTorch reference (`expected_logits`
+/// from the golden, produced by `transformers`
+/// `AutoModelForTokenClassification`). Compares real-token positions only (mask
+/// = 1); pad positions are a don't-care.
+#[test]
+#[ignore = "heavy: real CoNLL-2003 ModernBERT-base NER weights + PyTorch golden (local or HF Hub download)"]
+fn token_logits_match_pytorch() {
+    let (mut recognizer, encodings, want, num_labels, seq_len) = load_token_fixture();
+
+    let refs: Vec<&Encoding> = encodings.iter().collect();
+    let (classifications, _prof) = recognizer.recognize_batch(&refs, false).expect("recognize");
+
+    assert_eq!(classifications.len(), encodings.len(), "batch size mismatch");
+    let mut worst = 0.0f32;
+    for (i, c) in classifications.iter().enumerate() {
+        assert_eq!(c.logits.len(), seq_len * num_labels, "per-chunk grid shape");
+        // Compare only real-token rows: pad rows are a don't-care and may drift.
+        for t in 0..seq_len {
+            if encodings[i].attention_mask[t] == 0 {
+                continue;
+            }
+            let got = &c.logits[t * num_labels..(t + 1) * num_labels];
+            let want_off = (i * seq_len + t) * num_labels;
+            let expected = &want[want_off..want_off + num_labels];
+            let max_delta = got.iter().zip(expected.iter()).map(|(a, e)| (a - e).abs()).fold(0.0f32, f32::max);
+            worst = worst.max(max_delta);
+            assert!(max_delta < 1e-3, "token logits [{i}][{t}] drifted from PyTorch golden: max |delta| = {max_delta}");
+        }
+    }
+    eprintln!("token logits real-position max |delta| = {worst:.3e}");
+}
+
+/// Negative control: an all-ones mask (ignoring padding) must DIVERGE from the
+/// golden on real-token rows — backbone attention is contaminated by pad keys.
+/// If this passes, the golden isn't exercising the mask.
+#[test]
+#[ignore = "heavy: real CoNLL-2003 ModernBERT-base NER weights + PyTorch golden (local or HF Hub download)"]
+fn ignoring_padding_diverges_in_token_classification() {
+    let (mut recognizer, encodings, want, num_labels, seq_len) = load_token_fixture();
+
+    let unmasked: Vec<Encoding> = encodings
+        .iter()
+        .map(|e| {
+            let mut e = e.clone();
+            e.attention_mask.fill(1);
+            e
+        })
+        .collect();
+
+    let refs: Vec<&Encoding> = unmasked.iter().collect();
+    let (classifications, _prof) = recognizer.recognize_batch(&refs, false).expect("recognize unmasked");
+
+    for (i, c) in classifications.iter().enumerate() {
+        for t in 0..seq_len {
+            if encodings[i].attention_mask[t] == 0 {
+                continue; // compare only originally-real positions
+            }
+            let got = &c.logits[t * num_labels..(t + 1) * num_labels];
+            let want_off = (i * seq_len + t) * num_labels;
+            let expected = &want[want_off..want_off + num_labels];
+            let max_delta = got.iter().zip(expected.iter()).map(|(a, e)| (a - e).abs()).fold(0.0f32, f32::max);
+            assert!(
+                max_delta > 1e-2,
+                "ignoring padding did NOT diverge from the golden [{i}][{t}] (max |delta| = {max_delta:.3e})"
+            );
+        }
     }
 }

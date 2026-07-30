@@ -23,6 +23,8 @@ mod normalization;
 mod pipeline;
 mod pooling;
 mod rotary;
+mod token_classifier;
+mod token_classifier_jit;
 
 pub use attention::ModernBertAttention;
 #[cfg(test)]
@@ -40,6 +42,13 @@ pub use jit::{ModernBertJit, ModernBertMlmJit};
 pub use mlp::ModernBertGlu;
 pub use model::ModernBert;
 pub use normalization::LayerNormWeights;
-pub use pipeline::{from_hub, from_hub_classifier, from_hub_classifier_with_revision, from_hub_with_revision};
+pub use pipeline::{
+    from_hub, from_hub_classifier, from_hub_classifier_with_revision, from_hub_token_classification,
+    from_hub_token_classification_with_revision, from_hub_with_revision,
+};
 pub use pooling::{cls, masked_mean};
 pub use rotary::RotaryTable;
+#[cfg(test)]
+pub(crate) use token_classifier::ModernBertTokenClassificationModel;
+pub use token_classifier::{ModernBertTokenClassifier, TokenClassifierError};
+pub use token_classifier_jit::ModernBertTokenClassifierJit;

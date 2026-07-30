@@ -98,8 +98,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             probs.iter().enumerate().max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap()).expect("non-empty logits");
         let probs_str: Vec<String> = probs.iter().map(|p| format!("{p:.4}")).collect();
         println!(
-            "  chunk {i} @ char {}: logits={:?} → class {best} (p={p:.4})  probs=[{}]",
-            chunk.char_offset,
+            "  chunk {i} @ byte {}: logits={:?} → class {best} (p={p:.4})  probs=[{}]",
+            chunk.byte_offset,
             chunk.logits,
             probs_str.join(", "),
         );

@@ -82,8 +82,8 @@ where
     for (i, chunk) in result.chunks.iter().enumerate() {
         let v = &chunk.values.values;
         println!(
-            "  chunk {i} @ char {}: dim={} | L2={:.4} | first 5: {:?}",
-            chunk.char_offset,
+            "  chunk {i} @ byte {}: dim={} | L2={:.4} | first 5: {:?}",
+            chunk.byte_offset,
             v.len(),
             v.iter().map(|x| x * x).sum::<f32>().sqrt(),
             &v[..v.len().min(5)],

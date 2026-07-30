@@ -194,6 +194,17 @@ impl ModernBertConfig {
             norm_bias: raw.norm_bias.unwrap_or(d.norm_bias),
         }
     }
+
+    /// Splice every field from a checkpoint-parsed `parsed` config into `self`,
+    /// preserving the two caller-chosen fields (`dtype`, `max_batch_size`) that
+    /// are absent from the on-disk `config.json`. All hub loaders route through
+    /// here so the field list lives in one place — a new structural field flows
+    /// through every loader without touching them.
+    pub fn apply_checkpoint(&mut self, parsed: &ModernBertConfig) {
+        let dtype = self.dtype.clone();
+        let max_batch_size = self.max_batch_size;
+        *self = ModernBertConfig { dtype, max_batch_size, ..parsed.clone() };
+    }
 }
 
 /// Serde mirror of the published `config.json`. Every field is optional so a

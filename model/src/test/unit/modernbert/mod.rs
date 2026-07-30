@@ -8,3 +8,4 @@ mod model;
 mod parity;
 mod pooling;
 mod rotary;
+mod token_classifier;

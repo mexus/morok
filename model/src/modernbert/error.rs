@@ -27,4 +27,6 @@ pub enum Error {
     Embedder { source: super::embedder::EmbedderError },
     #[snafu(display("building classifier failed: {source}"))]
     Classifier { source: super::classifier::ClassifierError },
+    #[snafu(display("building token classifier failed: {source}"))]
+    TokenClassifier { source: super::token_classifier::TokenClassifierError },
 }
