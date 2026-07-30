@@ -5,6 +5,7 @@ pub mod firered_vad;
 pub mod gigaam;
 pub(crate) mod init;
 pub mod jit;
+pub mod modernbert;
 pub mod resnet;
 pub mod sentencepiece;
 pub mod silero_vad;

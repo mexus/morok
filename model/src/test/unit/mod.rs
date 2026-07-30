@@ -8,6 +8,7 @@ mod firered_vad_stream;
 mod jit;
 mod jit_recurrent;
 mod mel;
+mod modernbert;
 mod remap;
 mod resnet;
 mod silero_vad;

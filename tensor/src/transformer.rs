@@ -88,6 +88,12 @@ impl Tensor {
     /// Scaled dot-product attention.
     /// `self` (Q): `[B, H, Sq, D]`, `key` (K): `[B, H, Sk, D]`, `value` (V): `[B, H, Sk, Dv]`.
     /// Returns `[B, H, Sq, Dv]`.
+    ///
+    /// `window = Some((left, right))` restricts each query `q` to keys in
+    /// `[q - left, q + right]` (sliding-window / banded attention, as in
+    /// ModernBERT's local layers). `None` = full (global) attention. The band is
+    /// intersected with any causal mask and the boolean `attn_mask` (when the
+    /// latter encodes padding).
     #[builder]
     pub fn scaled_dot_product_attention(
         &self,
@@ -96,6 +102,7 @@ impl Tensor {
         attn_mask: Option<&Tensor>,
         scale: Option<f64>,
         #[builder(default)] is_causal: bool,
+        window: Option<(usize, usize)>,
         softcap: Option<f64>,
     ) -> Result<Tensor> {
         let q_dtype = self.uop().dtype();
@@ -131,34 +138,68 @@ impl Tensor {
         let scale_t = Tensor::const_(scale_val, scores_dtype.clone());
         scores = scores.try_mul(&scale_t)?;
 
-        // Causal mask
+        // Build a boolean "keep" mask that ANDs together the causal constraint,
+        // the optional sliding-window band, and the user-supplied `attn_mask`.
+        // True = attend, False = masked out. The mask is applied additively
+        // (mask_out → -large) before softmax, and the weights are also zeroed
+        // post-softmax to guarantee exact-zero out-of-band columns even when a
+        // full row is masked (softmax-of-all-equal → uniform, not zero).
+        let q_len = q_shape[q_shape.len() - 2]
+            .as_const()
+            .context(SymbolicShapeUnsupportedSnafu { operation: "scaled_dot_product_attention" })?;
+        let k_len = k_shape[k_shape.len() - 2]
+            .as_const()
+            .context(SymbolicShapeUnsupportedSnafu { operation: "scaled_dot_product_attention" })?;
+
+        let mut keep_mask: Option<Tensor> = None;
+
+        // Causal: keep k ≤ q.
         if is_causal {
-            let q_len = q_shape[q_shape.len() - 2]
-                .as_const()
-                .context(SymbolicShapeUnsupportedSnafu { operation: "scaled_dot_product_attention" })?;
-            let k_len = k_shape[k_shape.len() - 2]
-                .as_const()
-                .context(SymbolicShapeUnsupportedSnafu { operation: "scaled_dot_product_attention" })?;
-            let causal = Tensor::full(&[q_len, k_len], true, DType::Bool)?.tril(0)?;
-            let neg_large = Tensor::const_(ConstValue::min(scores_dtype.base()), scores_dtype.clone());
-            scores = scores.where_(&causal, &neg_large)?;
+            let q_idx = Tensor::arange(0, Some(q_len as i64), None)?.try_unsqueeze(-1)?; // (Q, 1)
+            let k_idx = Tensor::arange(0, Some(k_len as i64), None)?; // (K,)
+            let causal = k_idx.try_le(&q_idx)?; // k <= q
+            keep_mask = Some(causal);
         }
 
-        // Attention mask
-        let mut bool_mask: Option<Tensor> = None;
+        // Sliding-window band: keep q - left ≤ k ≤ q + right.
+        if let Some((left, right)) = window {
+            let q_idx = Tensor::arange(0, Some(q_len as i64), None)?.try_unsqueeze(-1)?; // (Q, 1)
+            let k_idx = Tensor::arange(0, Some(k_len as i64), None)?; // (K,)
+            let lo = Tensor::const_(ConstValue::Int(left as i64), DType::Int32);
+            let hi = Tensor::const_(ConstValue::Int(right as i64), DType::Int32);
+            // q - left <= k  AND  k <= q + right
+            let lower = q_idx.try_sub(&lo)?.try_le(&k_idx)?;
+            let upper = k_idx.try_le(&q_idx.try_add(&hi)?)?;
+            let band = lower.try_bitand(&upper)?;
+            keep_mask = Some(match keep_mask {
+                Some(prev) => prev.try_bitand(&band)?,
+                None => band,
+            });
+        }
+
+        // User-supplied attention mask. Bool: True = mask OUT (False = keep) —
+        // invert before ANDing. Float: additive, applied separately below.
+        let mut float_additive_mask: Option<&Tensor> = None;
         if let Some(mask) = attn_mask {
-            let mask_dtype = mask.uop().dtype();
-            if mask_dtype == DType::Bool {
-                // Bool mask: True = mask out, False = keep.
-                let neg_large = Tensor::const_(ConstValue::min(scores_dtype.base()), scores_dtype.clone());
-                let zero = Tensor::const_(ConstValue::zero(scores_dtype.base()), scores_dtype.clone());
-                let additive = neg_large.where_(mask, &zero)?;
-                scores = scores.try_add(&additive)?;
-                bool_mask = Some(mask.clone());
+            if mask.uop().dtype() == DType::Bool {
+                let keep = mask.logical_not()?; // True = keep
+                keep_mask = Some(match keep_mask {
+                    Some(prev) => prev.try_bitand(&keep)?,
+                    None => keep,
+                });
             } else {
-                // Float additive mask
-                scores = scores.try_add(mask)?;
+                float_additive_mask = Some(mask);
             }
+        }
+
+        // Apply the boolean keep mask additively (out-of-band → -large).
+        if let Some(keep) = keep_mask.as_ref() {
+            let neg_large = Tensor::const_(ConstValue::min(scores_dtype.base()), scores_dtype.clone());
+            scores = scores.where_(keep, &neg_large)?;
+        }
+        // Apply a float additive mask (e.g. a pre-computed -inf padding mask).
+        if let Some(additive) = float_additive_mask {
+            scores = scores.try_add(additive)?;
         }
 
         // Softcap
@@ -169,11 +210,14 @@ impl Tensor {
             scores = scores.try_div(&cap_t)?.tanh()?.try_mul(&cap_t)?;
         }
 
-        // Softmax + output
+        // Softmax + output. Re-zero out-of-band weights so a fully-masked row
+        // (whose softmax would otherwise be uniform over the masked keys)
+        // produces exact zeros rather than `1/k_len` leakage.
         let mut attn_weights = scores.softmax(-1isize)?;
-        if let Some(mask) = bool_mask.as_ref() {
+        if let Some(keep) = keep_mask.as_ref() {
             let zero = Tensor::const_(ConstValue::zero(scores_dtype.base()), scores_dtype);
-            attn_weights = zero.where_(mask, &attn_weights)?;
+            let masked_out = keep.logical_not()?;
+            attn_weights = zero.where_(&masked_out, &attn_weights)?;
         }
         attn_weights.matmul(value)
     }
