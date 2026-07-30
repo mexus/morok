@@ -13,22 +13,43 @@ type Result<T> = crate::Result<T>;
 impl Tensor {
     /// Embedding lookup: `self` is the weight table `[vocab_size, embed_dim]`.
     /// Returns `self[indices]` with shape `[*indices.shape, embed_dim]`.
+    ///
+    /// Mirrors tinygrad's `_embedding_fwd`: a one-hot mask
+    /// (`indices.unsqueeze(-1) == arange(vocab)`) selects rows via
+    /// `where(weight, 0).sum(vocab)`. It operates on the index's natural shape
+    /// — no flatten-to-`[-1]` — so a symbolic dim on `indices` (e.g. a JIT
+    /// batch bound to a `Variable`) passes through. Only the vocab axis
+    /// (weight dim 0) must be concrete.
     pub fn embedding(&self, indices: &Tensor) -> Result<Tensor> {
         let weight_shape = self.shape()?;
-        let embed_dim =
-            weight_shape[1].as_const().context(SymbolicShapeUnsupportedSnafu { operation: "embedding" })? as isize;
-        let idx_shape = indices.shape()?;
+        let vocab_size =
+            weight_shape[0].as_const().context(SymbolicShapeUnsupportedSnafu { operation: "embedding" })?;
 
-        let flat = indices.try_reshape([-1])?;
-        let expanded = flat.try_unsqueeze(-1)?.try_expand([-1, embed_dim])?;
-        let gathered = self.gather(0, &expanded)?;
+        // one-hot mask: [*idx_shape, vocab] bool — True where the vocab row
+        // matches the index value.
+        let vocab_arange = Tensor::arange(0, Some(vocab_size as i64), None)?.cast(indices.uop().dtype())?;
+        let mask = indices.try_unsqueeze(-1)?.try_eq(&vocab_arange)?;
 
-        let mut out_shape: Vec<isize> = idx_shape
-            .iter()
-            .map(|d| Ok(d.as_const().context(SymbolicShapeUnsupportedSnafu { operation: "embedding" })? as isize))
-            .collect::<Result<_>>()?;
-        out_shape.push(embed_dim);
-        gathered.try_reshape(&out_shape)
+        // Reshape weight to [1... (per idx dim), vocab, embed] so its trailing
+        // (vocab, embed) rows broadcast under the mask in the where_. Binary
+        // ops broadcast aligning trailing dims, so no explicit broadcast_to.
+        let idx_ndim = indices.shape()?.len();
+        let mut leading_ones: Vec<isize> = (0..idx_ndim).map(|_| 1).collect();
+        leading_ones.push(vocab_size as isize);
+        leading_ones.push(-1); // embed_dim inferred from weight.
+        let weight_bc = self.try_reshape(&leading_ones)?;
+
+        // Select + collapse the vocab axis. mask.unsqueeze(-1) broadcasts over
+        // embed; summing the vocab axis (now -2) leaves [*idx_shape, embed].
+        weight_bc
+            .where_(
+                &mask.try_unsqueeze(-1)?,
+                &Tensor::new(self.uop().const_like(ConstValue::zero(self.uop().dtype().base()))),
+            )?
+            .sum_with()
+            .axes(-2isize)
+            .dtype(self.uop().dtype())
+            .call()
     }
 
     /// Apply rotary position embedding rotation.
