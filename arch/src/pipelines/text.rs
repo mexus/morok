@@ -63,6 +63,17 @@ pub struct Embeddings {
     pub profile: Option<RunProfile>,
 }
 
+/// Batch embedding result from [`embed_batch`](EmbeddingsPipeline::embed_batch):
+/// one [`Embeddings`] per input text, plus a shared [`RunProfile`] covering the
+/// entire batch run. The profile is batch-level (tokenize, chunk, and embed are
+/// timed as a whole), not per-text — each [`Embeddings`] inside `results`
+/// carries `profile: None`.
+#[derive(Debug, Default)]
+pub struct BatchEmbeddings {
+    pub results: Vec<Embeddings>,
+    pub profile: Option<RunProfile>,
+}
+
 /// Per-call run switch, orthogonal to an [`EmbeddingsPipeline`]'s construction
 /// config (sizing). Defaults to `false`, so one built pipeline serves profiled
 /// and unprofiled runs without rebuilding — mirroring [`audio::RunOptions`](super::audio::RunOptions).
@@ -208,6 +219,12 @@ impl Tokenizer for HfTokenizer {
     fn encode(&mut self, text: &str) -> Result<Encoding, HfTokenizerError> {
         let enc = self.inner.encode(text, true)?;
         Ok(Encoding::from_hf(&enc))
+    }
+
+    fn encode_batch(&mut self, texts: &[&str]) -> Result<Vec<Encoding>, HfTokenizerError> {
+        let inputs: Vec<String> = texts.iter().map(|s| s.to_string()).collect();
+        let encs = self.inner.encode_batch(inputs, true)?;
+        Ok(encs.iter().map(Encoding::from_hf).collect())
     }
 }
 
@@ -452,6 +469,10 @@ pub enum TextPipelineError<
 type PipelineResult<T, C, E> =
     Result<Embeddings, TextPipelineError<<T as Tokenizer>::Error, <C as Chunker>::Error, <E as Embed>::Error>>;
 
+/// Same folding for [`EmbeddingsPipeline::embed_batch`] / [`embed_batch_default`](EmbeddingsPipeline::embed_batch_default).
+type BatchResult<T, C, E> =
+    Result<BatchEmbeddings, TextPipelineError<<T as Tokenizer>::Error, <C as Chunker>::Error, <E as Embed>::Error>>;
+
 impl<T: Tokenizer, C: Chunker, E: Embed> EmbeddingsPipeline<T, C, E> {
     pub fn new(tokenizer: T, chunker: C, encoder: E) -> Self {
         Self { tokenizer, chunker, encoder }
@@ -464,6 +485,32 @@ impl<T: Tokenizer, C: Chunker, E: Embed> EmbeddingsPipeline<T, C, E> {
     pub fn assemble<EE>(tokenizer: T, chunker: C, build: impl FnOnce(usize) -> Result<E, EE>) -> Result<Self, EE> {
         let encoder = build(chunker.max_seq())?;
         Ok(Self::new(tokenizer, chunker, encoder))
+    }
+
+    /// Embed a flat list of chunks, sub-batching to respect the encoder's
+    /// `max_batch` capacity. Returns embeddings in chunk order plus a merged
+    /// profile (one per sub-batch, accumulated via [`RunProfile::merge`]).
+    /// Shared by [`embed`](Self::embed) and [`embed_batch`](Self::embed_batch).
+    fn embed_chunks_flat(
+        &mut self,
+        chunks: &[TextChunk],
+        profile: bool,
+    ) -> Result<(Vec<Embedding>, Option<RunProfile>), E::Error> {
+        if chunks.is_empty() {
+            return Ok((Vec::new(), None));
+        }
+        let max_batch = self.encoder.capacity().0.max(1);
+        let mut all_values = Vec::with_capacity(chunks.len());
+        let mut merged_prof: Option<RunProfile> = None;
+        for batch in chunks.chunks(max_batch) {
+            let encodings: Vec<&Encoding> = batch.iter().map(|c| &c.encoding).collect();
+            let (values, prof) = self.encoder.embed_batch(&encodings, profile)?;
+            all_values.extend(values);
+            if let Some(p) = prof {
+                merged_prof.get_or_insert_with(RunProfile::default).merge(p);
+            }
+        }
+        Ok((all_values, merged_prof))
     }
 
     /// Tokenize → chunk → embed → assemble profile. [`RunOptions`] is a per-call
@@ -481,31 +528,21 @@ impl<T: Tokenizer, C: Chunker, E: Embed> EmbeddingsPipeline<T, C, E> {
         let chunks = self.chunker.chunk(&encoding).context(ChunkSnafu)?;
         let chunk_wall = t.elapsed();
 
-        let mut embeddings = if chunks.is_empty() {
-            // No content (empty input / all-truncated): skip the empty
-            // `embed_batch` call — some models index off the batch count and
-            // would underflow on zero inputs, mirroring audio's zero-window guard.
-            Embeddings { chunks: Vec::new(), profile: None }
-        } else {
-            let encodings: Vec<&Encoding> = chunks.iter().map(|c| &c.encoding).collect();
-            let (values, prof) = self.encoder.embed_batch(&encodings, opts.profile).context(EmbedSnafu)?;
-            // Attach each chunk's source char position to its embedding. The
-            // embedder returns position-agnostic `Embedding`s in chunk order;
-            // zipping with the chunks' `char_offset` yields `ChunkEmbedding`s
-            // that carry their window location through to the caller — so a
-            // future sliding-window chunker (or NER pipeline) can re-base spans
-            // without re-tokenizing.
-            let chunk_embeddings = chunks
-                .into_iter()
-                .map(|c| c.char_offset)
-                .zip(values)
-                .map(|(char_offset, values)| ChunkEmbedding { char_offset, values })
-                .collect();
-            Embeddings { chunks: chunk_embeddings, profile: prof }
-        };
+        let (values, prof) = self.embed_chunks_flat(&chunks, opts.profile).context(EmbedSnafu)?;
+
+        // Attach each chunk's source char position to its embedding. The
+        // embedder returns position-agnostic `Embedding`s in chunk order;
+        // zipping with the chunks' `char_offset` yields `ChunkEmbedding`s
+        // that carry their window location through to the caller.
+        let chunk_embeddings = chunks
+            .iter()
+            .map(|c| c.char_offset)
+            .zip(values)
+            .map(|(char_offset, values)| ChunkEmbedding { char_offset, values })
+            .collect();
+        let mut embeddings = Embeddings { chunks: chunk_embeddings, profile: prof };
 
         if opts.profile {
-            // Lead with the host stages, then the encoder's.
             let mut p = RunProfile::default();
             p.push(StageProfile::host("tokenize", tok_wall));
             p.push(StageProfile::host(self.chunker.profile_label(), chunk_wall));
@@ -522,6 +559,70 @@ impl<T: Tokenizer, C: Chunker, E: Embed> EmbeddingsPipeline<T, C, E> {
     /// common case, without spelling out the struct.
     pub fn embed_default(&mut self, text: &str) -> PipelineResult<T, C, E> {
         self.embed(text, RunOptions::default())
+    }
+
+    /// Tokenize → chunk → embed multiple texts in one call. All chunks from all
+    /// texts are flattened into a single stream and batched through the encoder
+    /// (sub-batched to `encoder.capacity().0` when the total exceeds it),
+    /// maximizing throughput. Returns one [`Embeddings`] per input text — each
+    /// carrying its own [`ChunkEmbedding`]s with correct `char_offset`s — plus a
+    /// shared batch-level [`RunProfile`] on [`BatchEmbeddings::profile`].
+    pub fn embed_batch(
+        &mut self,
+        texts: &[&str],
+        opts: RunOptions,
+    ) -> BatchResult<T, C, E> {
+        if texts.is_empty() {
+            return Ok(BatchEmbeddings::default());
+        }
+
+        let t = Instant::now();
+        let encodings = self.tokenizer.encode_batch(texts).context(TokenizeSnafu)?;
+        let tok_wall = t.elapsed();
+
+        let t = Instant::now();
+        let mut all_chunks: Vec<TextChunk> = Vec::new();
+        let mut counts: Vec<usize> = Vec::with_capacity(texts.len());
+        for enc in &encodings {
+            let chunks = self.chunker.chunk(enc).context(ChunkSnafu)?;
+            counts.push(chunks.len());
+            all_chunks.extend(chunks);
+        }
+        let chunk_wall = t.elapsed();
+
+        let (all_values, enc_prof) = self.embed_chunks_flat(&all_chunks, opts.profile).context(EmbedSnafu)?;
+
+        // Reassemble per-text: slice the flat embedding vec by each text's chunk
+        // count and zip with the corresponding chunks' char_offsets.
+        let mut results = Vec::with_capacity(texts.len());
+        let mut idx = 0;
+        for &count in &counts {
+            let chunk_embeddings = all_chunks[idx..idx + count]
+                .iter()
+                .map(|c| c.char_offset)
+                .zip(all_values[idx..idx + count].iter().cloned())
+                .map(|(char_offset, values)| ChunkEmbedding { char_offset, values })
+                .collect();
+            results.push(Embeddings { chunks: chunk_embeddings, profile: None });
+            idx += count;
+        }
+
+        let profile = opts.profile.then(|| {
+            let mut p = RunProfile::default();
+            p.push(StageProfile::host("tokenize", tok_wall));
+            p.push(StageProfile::host(self.chunker.profile_label(), chunk_wall));
+            if let Some(rest) = enc_prof {
+                p.merge(rest);
+            }
+            p
+        });
+
+        Ok(BatchEmbeddings { results, profile })
+    }
+
+    /// [`embed_batch`](Self::embed_batch) with default [`RunOptions`] (no
+    /// profile).
+    pub fn embed_batch_default(&mut self, texts: &[&str]) -> BatchResult<T, C, E> {        self.embed_batch(texts, RunOptions::default())
     }
 
     pub fn tokenizer_mut(&mut self) -> &mut T {

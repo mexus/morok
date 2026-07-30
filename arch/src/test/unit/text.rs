@@ -1,8 +1,8 @@
 use std::convert::Infallible;
 
 use crate::pipelines::text::{
-    Chunker, Embed, Embedding, EmbeddingsPipeline, Encoding, HfTokenizer, HfTokenizerError, RunOptions, RunProfile,
-    SlidingWindowChunker, TextChunk, TextPipelineError, Tokenizer, TruncatingChunker,
+    BatchEmbeddings, Chunker, Embed, Embedding, EmbeddingsPipeline, Encoding, HfTokenizer, HfTokenizerError,
+    RunOptions, RunProfile, SlidingWindowChunker, TextChunk, TextPipelineError, Tokenizer, TruncatingChunker,
 };
 
 fn enc(ids: &[u32]) -> Encoding {
@@ -79,6 +79,7 @@ struct StubTokenizerError;
 /// exercise the merge without a model.
 struct StubEmbed {
     hidden_size: usize,
+    max_batch: usize,
     error: bool,
 }
 
@@ -88,7 +89,7 @@ impl Embed for StubEmbed {
         self.hidden_size
     }
     fn capacity(&self) -> (usize, usize) {
-        (1, self.hidden_size)
+        (self.max_batch, self.hidden_size)
     }
     fn embed_batch(
         &mut self,
@@ -112,6 +113,23 @@ impl Embed for StubEmbed {
 #[derive(Debug, snafu::Snafu)]
 #[snafu(display("stub embed error"))]
 struct StubEmbedError;
+
+/// Tokenizer that encodes each input character's byte value as a token id.
+/// Allows batch tests to distinguish which text produced which embedding —
+/// `"ab"` → ids `[97, 98]`, `"xyz"` → ids `[120, 121, 122]`, etc.
+struct ByteTokenizer {
+    max_seq: usize,
+}
+
+impl Tokenizer for ByteTokenizer {
+    type Error = Infallible;
+    fn max_seq(&self) -> usize {
+        self.max_seq
+    }
+    fn encode(&mut self, text: &str) -> Result<Encoding, Infallible> {
+        Ok(enc(&text.bytes().map(|b| b as u32).collect::<Vec<_>>()))
+    }
+}
 
 // ─── Encoding ─────────────────────────────────────────────────────────────────
 
@@ -269,7 +287,7 @@ fn sliding_pipeline_produces_per_window_embeddings() {
     let mut p = EmbeddingsPipeline::new(
         StubTokenizer { ids: vec![10, 20, 30, 40, 50, 60], max_seq: 3, error: false },
         SlidingWindowChunker::new(3, 2),
-        StubEmbed { hidden_size: 3, error: false },
+        StubEmbed { hidden_size: 3, max_batch: 1, error: false },
     );
     let out = p.embed_default("ignored").unwrap();
     assert_eq!(out.chunks.len(), 3);
@@ -286,7 +304,7 @@ fn sliding_pipeline_profiles_with_chunk_stage() {
     let mut p = EmbeddingsPipeline::new(
         StubTokenizer { ids: vec![10, 20, 30, 40, 50, 60], max_seq: 3, error: false },
         SlidingWindowChunker::new(3, 2),
-        StubEmbed { hidden_size: 3, error: false },
+        StubEmbed { hidden_size: 3, max_batch: 1, error: false },
     );
     let out = p.embed("ignored", RunOptions { profile: true }).unwrap();
     assert_eq!(out.chunks.len(), 3);
@@ -301,7 +319,7 @@ fn sliding_pipeline_profiles_with_chunk_stage() {
 fn embed_single_is_batch_of_one() {
     // The default `embed` delegates to `embed_batch(&[enc])` and pops — verify
     // the values match a direct batch call.
-    let mut embed = StubEmbed { hidden_size: 3, error: false };
+    let mut embed = StubEmbed { hidden_size: 3, max_batch: 1, error: false };
     let e = enc(&[4, 5, 6]);
     let single = embed.embed(&e, false).unwrap().0;
     let batch = embed.embed_batch(&[&e], false).unwrap().0;
@@ -314,7 +332,7 @@ fn pipeline(ids: Vec<u32>, max_seq: usize) -> EmbeddingsPipeline<StubTokenizer, 
     EmbeddingsPipeline::new(
         StubTokenizer { ids, max_seq, error: false },
         TruncatingChunker::new(max_seq),
-        StubEmbed { hidden_size: max_seq, error: false },
+        StubEmbed { hidden_size: max_seq, max_batch: 1, error: false },
     )
 }
 
@@ -389,7 +407,7 @@ fn pipeline_zero_chunk_run_skips_embed_and_profiles_host_stages() {
     let p = EmbeddingsPipeline::new(
         StubTokenizer { ids: vec![1, 2], max_seq: 4, error: false },
         NoChunkChunker { max_seq: 4 },
-        StubEmbed { hidden_size: 4, error: true }, // would fail if called
+        StubEmbed { hidden_size: 4, max_batch: 1, error: true }, // would fail if called
     );
     let mut p = p;
     let out = p.embed("ignored", RunOptions { profile: true }).unwrap();
@@ -424,7 +442,7 @@ fn assemble_passes_chunker_max_seq_into_builder() {
         TruncatingChunker::new(8),
         |max_seq| {
             seen.set(max_seq);
-            Ok::<_, Infallible>(StubEmbed { hidden_size: max_seq, error: false })
+            Ok::<_, Infallible>(StubEmbed { hidden_size: max_seq, max_batch: 1, error: false })
         },
     )
     .unwrap();
@@ -438,7 +456,7 @@ fn tokenize_error_maps_to_tokenize_variant() {
     let mut p = EmbeddingsPipeline::new(
         StubTokenizer { ids: vec![1], max_seq: 4, error: true },
         TruncatingChunker::new(4),
-        StubEmbed { hidden_size: 4, error: false },
+        StubEmbed { hidden_size: 4, max_batch: 1, error: false },
     );
     let err = p.embed_default("ignored").unwrap_err();
     assert!(matches!(err, crate::pipelines::text::TextPipelineError::Tokenize { .. }));
@@ -449,7 +467,7 @@ fn embed_error_maps_to_embed_variant() {
     let mut p = EmbeddingsPipeline::new(
         StubTokenizer { ids: vec![1, 2], max_seq: 4, error: false },
         TruncatingChunker::new(4),
-        StubEmbed { hidden_size: 4, error: true },
+        StubEmbed { hidden_size: 4, max_batch: 1, error: true },
     );
     let err = p.embed_default("ignored").unwrap_err();
     assert!(matches!(err, crate::pipelines::text::TextPipelineError::Embed { .. }));
@@ -584,8 +602,144 @@ fn chunk_error_maps_to_chunk_variant() {
     let mut p = EmbeddingsPipeline::new(
         StubTokenizer { ids: vec![1, 2], max_seq: 4, error: false },
         ErrChunker { max_seq: 4 },
-        StubEmbed { hidden_size: 4, error: false },
+        StubEmbed { hidden_size: 4, max_batch: 1, error: false },
     );
     let err = p.embed_default("ignored").unwrap_err();
     assert!(matches!(err, TextPipelineError::Chunk { .. }));
+}
+
+// ─── embed_batch (multi-text) ─────────────────────────────────────────────────
+
+#[test]
+fn batch_basic_three_texts() {
+    let mut p = EmbeddingsPipeline::new(
+        ByteTokenizer { max_seq: 32 },
+        TruncatingChunker::new(32),
+        StubEmbed { hidden_size: 32, max_batch: 8, error: false },
+    );
+    let out = p.embed_batch_default(&["ab", "xyz", "hello"]).unwrap();
+    assert_eq!(out.results.len(), 3);
+    assert!(out.profile.is_none(), "default options don't profile");
+    // ByteTokenizer maps each byte to its value: "ab" → [97, 98], etc.
+    assert_eq!(out.results[0].chunks.len(), 1);
+    assert_eq!(out.results[0].chunks[0].values.values, vec![97.0, 98.0]);
+    assert_eq!(out.results[1].chunks[0].values.values, vec![120.0, 121.0, 122.0]);
+    assert_eq!(out.results[2].chunks[0].values.values, vec![104.0, 101.0, 108.0, 108.0, 111.0]);
+}
+
+#[test]
+fn batch_with_sliding_window_varying_chunk_counts() {
+    let mut p = EmbeddingsPipeline::new(
+        ByteTokenizer { max_seq: 3 },
+        SlidingWindowChunker::new(3, 2),
+        StubEmbed { hidden_size: 3, max_batch: 8, error: false },
+    );
+    // 6 + 2 + 4 content tokens → 3 + 1 + 2 = 6 chunks total.
+    let out = p.embed_batch_default(&["abcdef", "ab", "abcd"]).unwrap();
+    assert_eq!(out.results.len(), 3);
+    assert_eq!(out.results[0].chunks.len(), 3);
+    assert_eq!(out.results[0].chunks[0].char_offset, 0);
+    assert_eq!(out.results[0].chunks[1].char_offset, 2);
+    assert_eq!(out.results[0].chunks[2].char_offset, 4);
+    assert_eq!(out.results[1].chunks.len(), 1);
+    assert_eq!(out.results[2].chunks.len(), 2);
+}
+
+#[test]
+fn batch_empty_texts_returns_empty() {
+    let mut p = EmbeddingsPipeline::new(
+        ByteTokenizer { max_seq: 8 },
+        TruncatingChunker::new(8),
+        StubEmbed { hidden_size: 8, max_batch: 4, error: false },
+    );
+    let out: BatchEmbeddings = p.embed_batch_default(&[]).unwrap();
+    assert!(out.results.is_empty());
+    assert!(out.profile.is_none());
+}
+
+#[test]
+fn batch_some_texts_produce_zero_chunks() {
+    let mut p = EmbeddingsPipeline::new(
+        ByteTokenizer { max_seq: 4 },
+        SlidingWindowChunker::new(4, 2),
+        StubEmbed { hidden_size: 4, max_batch: 4, error: false },
+    );
+    // "" → 0 tokens → 0 chunks (SlidingWindowChunker content_len guard).
+    let out = p.embed_batch_default(&["ab", "", "cd"]).unwrap();
+    assert_eq!(out.results.len(), 3);
+    assert_eq!(out.results[0].chunks.len(), 1);
+    assert!(out.results[1].chunks.is_empty());
+    assert_eq!(out.results[2].chunks.len(), 1);
+}
+
+#[test]
+fn batch_sub_batches_when_chunks_exceed_max_batch() {
+    // 5 texts × 1 chunk = 5 chunks; max_batch=2 → 3 sub-batches (2, 2, 1).
+    let mut p = EmbeddingsPipeline::new(
+        ByteTokenizer { max_seq: 8 },
+        TruncatingChunker::new(8),
+        StubEmbed { hidden_size: 8, max_batch: 2, error: false },
+    );
+    let texts: Vec<&str> = vec!["a", "b", "c", "d", "e"];
+    let out = p.embed_batch_default(&texts).unwrap();
+    assert_eq!(out.results.len(), 5);
+    for (i, result) in out.results.iter().enumerate() {
+        assert_eq!(result.chunks.len(), 1);
+        assert_eq!(result.chunks[0].values.values, vec![texts[i].as_bytes()[0] as f32]);
+    }
+}
+
+#[test]
+fn batch_profile_has_tokenize_chunk_encode_stages() {
+    let mut p = EmbeddingsPipeline::new(
+        ByteTokenizer { max_seq: 8 },
+        TruncatingChunker::new(8),
+        StubEmbed { hidden_size: 8, max_batch: 4, error: false },
+    );
+    let out = p.embed_batch(&["ab", "cd"], RunOptions { profile: true }).unwrap();
+    assert_eq!(out.results.len(), 2);
+    // Per-text profiles are None — the batch profile lives on BatchEmbeddings.
+    assert!(out.results[0].profile.is_none());
+    assert!(out.results[1].profile.is_none());
+    let profile = out.profile.expect("batch profile collected");
+    let names: Vec<&str> = profile.stages.iter().map(|s| s.name.as_str()).collect();
+    assert_eq!(names, vec!["tokenize", "chunk", "encode"]);
+}
+
+#[test]
+fn batch_tokenize_error_maps_to_tokenize_variant() {
+    let mut p = EmbeddingsPipeline::new(
+        StubTokenizer { ids: vec![1], max_seq: 4, error: true },
+        TruncatingChunker::new(4),
+        StubEmbed { hidden_size: 4, max_batch: 4, error: false },
+    );
+    let err = p.embed_batch_default(&["a", "b"]).unwrap_err();
+    assert!(matches!(err, TextPipelineError::Tokenize { .. }));
+}
+
+#[test]
+fn batch_results_match_individual_embed_calls() {
+    let make_pipeline = || {
+        EmbeddingsPipeline::new(
+            ByteTokenizer { max_seq: 4 },
+            SlidingWindowChunker::new(4, 2),
+            StubEmbed { hidden_size: 4, max_batch: 8, error: false },
+        )
+    };
+
+    let texts = ["abcde", "xy"];
+    let batch = {
+        let mut p = make_pipeline();
+        p.embed_batch_default(&texts).unwrap()
+    };
+
+    for (i, text) in texts.iter().enumerate() {
+        let mut p = make_pipeline();
+        let single = p.embed_default(text).unwrap();
+        assert_eq!(batch.results[i].chunks.len(), single.chunks.len(), "chunk count mismatch for text {i}");
+        for (b, s) in batch.results[i].chunks.iter().zip(&single.chunks) {
+            assert_eq!(b.char_offset, s.char_offset, "char_offset mismatch for text {i}");
+            assert_eq!(b.values, s.values, "values mismatch for text {i}");
+        }
+    }
 }
