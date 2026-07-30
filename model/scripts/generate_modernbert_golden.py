@@ -47,7 +47,11 @@ def main() -> None:
 
     device = "cpu"
     tokenizer = AutoTokenizer.from_pretrained(args.repo)
-    model = AutoModel.from_pretrained(args.repo).to(device).eval()
+    # Force f32: the parity tests run Svod in f32, so the golden must too.
+    # Without this a checkpoint whose config defaults to bfloat16 (e.g. a
+    # fine-tune saved in bf16) would load/run in bf16 and produce bf16-rounded
+    # logits that Svod's f32 output can never match (divergence ~0.1).
+    model = AutoModel.from_pretrained(args.repo, torch_dtype=torch.float32).to(device).eval()
 
     enc = tokenizer(args.text, padding="max_length", max_length=args.max_seq, truncation=True, return_tensors="pt")
     input_ids = enc["input_ids"].to(device)
