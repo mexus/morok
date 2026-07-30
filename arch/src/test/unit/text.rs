@@ -1,7 +1,8 @@
 use std::convert::Infallible;
 
 use crate::pipelines::text::{
-    BatchEmbeddings, Chunker, Embed, Embedding, EmbeddingsPipeline, Encoding, HfTokenizer, HfTokenizerError,
+    BatchClassifications, BatchEmbeddings, Chunker, Classify, ClassifyPipeline, ClassifyPipelineError,
+    Classification, Embed, Embedding, EmbeddingsPipeline, Encoding, HfTokenizer, HfTokenizerError,
     RunOptions, RunProfile, SlidingWindowChunker, TextChunk, TextPipelineError, Tokenizer, TruncatingChunker,
 };
 
@@ -113,6 +114,48 @@ impl Embed for StubEmbed {
 #[derive(Debug, snafu::Snafu)]
 #[snafu(display("stub embed error"))]
 struct StubEmbedError;
+
+/// Turns ids into deterministic class logits (analog of `StubEmbed`):
+/// num_classes = the id count, logits = ids as f32. `profile` emits a single
+/// 1 ms `classify` stage — enough to exercise the merge without a model.
+struct StubClassify {
+    num_classes: usize,
+    max_batch: usize,
+    error: bool,
+}
+
+impl Classify for StubClassify {
+    type Error = StubClassifyError;
+    fn num_classes(&self) -> usize {
+        self.num_classes
+    }
+    fn capacity(&self) -> (usize, usize) {
+        (self.max_batch, self.num_classes)
+    }
+    fn classify_batch(
+        &mut self,
+        batch: &[&Encoding],
+        profile: bool,
+    ) -> Result<(Vec<Classification>, Option<RunProfile>), StubClassifyError> {
+        if self.error {
+            return Err(StubClassifyError);
+        }
+        let values = batch
+            .iter()
+            .map(|e| Classification { logits: e.input_ids.iter().map(|&id| id as f32).collect() })
+            .collect();
+        let prof = profile.then(|| {
+            let mut p = RunProfile::default();
+            p.push(svod_runtime::StageProfile::host("classify", std::time::Duration::from_millis(1)));
+            p
+        });
+        Ok((values, prof))
+    }
+}
+
+#[derive(Debug, snafu::Snafu)]
+#[snafu(display("stub classify error"))]
+struct StubClassifyError;
 
 /// Tokenizer that encodes each input character's byte value as a token id.
 /// Allows batch tests to distinguish which text produced which embedding —
@@ -740,6 +783,267 @@ fn batch_results_match_individual_embed_calls() {
         for (b, s) in batch.results[i].chunks.iter().zip(&single.chunks) {
             assert_eq!(b.char_offset, s.char_offset, "char_offset mismatch for text {i}");
             assert_eq!(b.values, s.values, "values mismatch for text {i}");
+        }
+    }
+}
+
+// ─── ClassifyPipeline ────────────────────────────────────────────────────────
+
+fn classify_pipeline(
+    ids: Vec<u32>,
+    max_seq: usize,
+) -> ClassifyPipeline<StubTokenizer, TruncatingChunker, StubClassify> {
+    ClassifyPipeline::new(
+        StubTokenizer { ids, max_seq, error: false },
+        TruncatingChunker::new(max_seq),
+        StubClassify { num_classes: max_seq, max_batch: 1, error: false },
+    )
+}
+
+#[test]
+fn classify_single_is_batch_of_one() {
+    let mut cls = StubClassify { num_classes: 3, max_batch: 1, error: false };
+    let e = enc(&[4, 5, 6]);
+    let single = cls.classify(&e, false).unwrap().0;
+    let batch = cls.classify_batch(&[&e], false).unwrap().0;
+    assert_eq!(single, batch.into_iter().next().unwrap());
+}
+
+#[test]
+fn classify_pipeline_truncates_then_classifies() {
+    let mut p = classify_pipeline(vec![1, 2, 3, 4, 5, 6, 7], 4);
+    let out = p.classify_default("ignored").unwrap();
+    assert_eq!(out.chunks.len(), 1);
+    assert_eq!(out.chunks[0].char_offset, 0);
+    assert_eq!(out.chunks[0].logits, vec![1.0, 2.0, 3.0, 4.0]);
+    assert!(out.profile.is_none(), "default options don't profile");
+}
+
+#[test]
+fn classify_pipeline_profiles_stage_order_tokenize_then_chunk_then_classify() {
+    let mut p = classify_pipeline(vec![1, 2, 3], 8);
+    let out = p.classify("ignored", RunOptions { profile: true }).unwrap();
+    let profile = out.profile.expect("profile collected");
+    let names: Vec<&str> = profile.stages.iter().map(|s| s.name.as_str()).collect();
+    assert_eq!(names, vec!["tokenize", "chunk", "classify"], "host stages lead, then the classifier's");
+}
+
+#[test]
+fn classify_pipeline_profiles_per_call_without_rebuild() {
+    let mut p = classify_pipeline(vec![1, 2, 3], 8);
+    let profiled = p.classify("ignored", RunOptions { profile: true }).unwrap();
+    assert!(profiled.profile.is_some());
+    let unprofiled = p.classify_default("ignored").unwrap();
+    assert!(unprofiled.profile.is_none());
+}
+
+#[test]
+fn classify_pipeline_zero_chunk_run_skips_classify_and_profiles_host_stages() {
+    let p = ClassifyPipeline::new(
+        StubTokenizer { ids: vec![1, 2], max_seq: 4, error: false },
+        NoChunkChunker { max_seq: 4 },
+        StubClassify { num_classes: 4, max_batch: 1, error: true }, // would fail if called
+    );
+    let mut p = p;
+    let out = p.classify("ignored", RunOptions { profile: true }).unwrap();
+    assert!(out.chunks.is_empty());
+    let profile = out.profile.expect("profile");
+    let names: Vec<&str> = profile.stages.iter().map(|s| s.name.as_str()).collect();
+    assert_eq!(names, vec!["tokenize", "chunk"], "classifier never runs; only host stages");
+}
+
+#[test]
+fn classify_assemble_passes_chunker_max_seq_into_builder() {
+    let seen = std::cell::Cell::new(0usize);
+    let _p: ClassifyPipeline<_, TruncatingChunker, StubClassify> = ClassifyPipeline::assemble(
+        StubTokenizer { ids: vec![1], max_seq: 8, error: false },
+        TruncatingChunker::new(8),
+        |max_seq| {
+            seen.set(max_seq);
+            Ok::<_, Infallible>(StubClassify { num_classes: max_seq, max_batch: 1, error: false })
+        },
+    )
+    .unwrap();
+    assert_eq!(seen.get(), 8);
+}
+
+#[test]
+fn classify_sliding_pipeline_produces_per_window_classifications() {
+    let mut p = ClassifyPipeline::new(
+        StubTokenizer { ids: vec![10, 20, 30, 40, 50, 60], max_seq: 3, error: false },
+        SlidingWindowChunker::new(3, 2),
+        StubClassify { num_classes: 3, max_batch: 1, error: false },
+    );
+    let out = p.classify_default("ignored").unwrap();
+    assert_eq!(out.chunks.len(), 3);
+    assert_eq!(out.chunks[0].char_offset, 0);
+    assert_eq!(out.chunks[0].logits, vec![10.0, 20.0, 30.0]);
+    assert_eq!(out.chunks[1].char_offset, 2);
+    assert_eq!(out.chunks[1].logits, vec![30.0, 40.0, 50.0]);
+    assert_eq!(out.chunks[2].char_offset, 4);
+    assert_eq!(out.chunks[2].logits, vec![50.0, 60.0]);
+}
+
+#[test]
+fn classify_tokenize_error_maps_to_tokenize_variant() {
+    let mut p = ClassifyPipeline::new(
+        StubTokenizer { ids: vec![1], max_seq: 4, error: true },
+        TruncatingChunker::new(4),
+        StubClassify { num_classes: 4, max_batch: 1, error: false },
+    );
+    let err = p.classify_default("ignored").unwrap_err();
+    assert!(matches!(err, ClassifyPipelineError::Tokenize { .. }));
+}
+
+#[test]
+fn classify_error_maps_to_classify_variant() {
+    let mut p = ClassifyPipeline::new(
+        StubTokenizer { ids: vec![1, 2], max_seq: 4, error: false },
+        TruncatingChunker::new(4),
+        StubClassify { num_classes: 4, max_batch: 1, error: true },
+    );
+    let err = p.classify_default("ignored").unwrap_err();
+    assert!(matches!(err, ClassifyPipelineError::Classify { .. }));
+}
+
+#[test]
+fn classify_chunk_error_maps_to_chunk_variant() {
+    let mut p = ClassifyPipeline::new(
+        StubTokenizer { ids: vec![1, 2], max_seq: 4, error: false },
+        ErrChunker { max_seq: 4 },
+        StubClassify { num_classes: 4, max_batch: 1, error: false },
+    );
+    let err = p.classify_default("ignored").unwrap_err();
+    assert!(matches!(err, ClassifyPipelineError::Chunk { .. }));
+}
+
+// ─── ClassifyPipeline batch ──────────────────────────────────────────────────
+
+#[test]
+fn classify_batch_basic_three_texts() {
+    let mut p = ClassifyPipeline::new(
+        ByteTokenizer { max_seq: 32 },
+        TruncatingChunker::new(32),
+        StubClassify { num_classes: 32, max_batch: 8, error: false },
+    );
+    let out = p.classify_batch_default(&["ab", "xyz", "hello"]).unwrap();
+    assert_eq!(out.results.len(), 3);
+    assert!(out.profile.is_none(), "default options don't profile");
+    assert_eq!(out.results[0].chunks.len(), 1);
+    assert_eq!(out.results[0].chunks[0].logits, vec![97.0, 98.0]);
+    assert_eq!(out.results[1].chunks[0].logits, vec![120.0, 121.0, 122.0]);
+    assert_eq!(out.results[2].chunks[0].logits, vec![104.0, 101.0, 108.0, 108.0, 111.0]);
+}
+
+#[test]
+fn classify_batch_with_sliding_window_varying_chunk_counts() {
+    let mut p = ClassifyPipeline::new(
+        ByteTokenizer { max_seq: 3 },
+        SlidingWindowChunker::new(3, 2),
+        StubClassify { num_classes: 3, max_batch: 8, error: false },
+    );
+    let out = p.classify_batch_default(&["abcdef", "ab", "abcd"]).unwrap();
+    assert_eq!(out.results.len(), 3);
+    assert_eq!(out.results[0].chunks.len(), 3);
+    assert_eq!(out.results[0].chunks[0].char_offset, 0);
+    assert_eq!(out.results[0].chunks[1].char_offset, 2);
+    assert_eq!(out.results[0].chunks[2].char_offset, 4);
+    assert_eq!(out.results[1].chunks.len(), 1);
+    assert_eq!(out.results[2].chunks.len(), 2);
+}
+
+#[test]
+fn classify_batch_empty_texts_returns_empty() {
+    let mut p = ClassifyPipeline::new(
+        ByteTokenizer { max_seq: 8 },
+        TruncatingChunker::new(8),
+        StubClassify { num_classes: 8, max_batch: 4, error: false },
+    );
+    let out: BatchClassifications = p.classify_batch_default(&[]).unwrap();
+    assert!(out.results.is_empty());
+    assert!(out.profile.is_none());
+}
+
+#[test]
+fn classify_batch_some_texts_produce_zero_chunks() {
+    let mut p = ClassifyPipeline::new(
+        ByteTokenizer { max_seq: 4 },
+        SlidingWindowChunker::new(4, 2),
+        StubClassify { num_classes: 4, max_batch: 4, error: false },
+    );
+    let out = p.classify_batch_default(&["ab", "", "cd"]).unwrap();
+    assert_eq!(out.results.len(), 3);
+    assert_eq!(out.results[0].chunks.len(), 1);
+    assert!(out.results[1].chunks.is_empty());
+    assert_eq!(out.results[2].chunks.len(), 1);
+}
+
+#[test]
+fn classify_batch_sub_batches_when_chunks_exceed_max_batch() {
+    let mut p = ClassifyPipeline::new(
+        ByteTokenizer { max_seq: 8 },
+        TruncatingChunker::new(8),
+        StubClassify { num_classes: 8, max_batch: 2, error: false },
+    );
+    let texts: Vec<&str> = vec!["a", "b", "c", "d", "e"];
+    let out = p.classify_batch_default(&texts).unwrap();
+    assert_eq!(out.results.len(), 5);
+    for (i, result) in out.results.iter().enumerate() {
+        assert_eq!(result.chunks.len(), 1);
+        assert_eq!(result.chunks[0].logits, vec![texts[i].as_bytes()[0] as f32]);
+    }
+}
+
+#[test]
+fn classify_batch_profile_has_tokenize_chunk_classify_stages() {
+    let mut p = ClassifyPipeline::new(
+        ByteTokenizer { max_seq: 8 },
+        TruncatingChunker::new(8),
+        StubClassify { num_classes: 8, max_batch: 4, error: false },
+    );
+    let out = p.classify_batch(&["ab", "cd"], RunOptions { profile: true }).unwrap();
+    assert_eq!(out.results.len(), 2);
+    assert!(out.results[0].profile.is_none());
+    assert!(out.results[1].profile.is_none());
+    let profile = out.profile.expect("batch profile collected");
+    let names: Vec<&str> = profile.stages.iter().map(|s| s.name.as_str()).collect();
+    assert_eq!(names, vec!["tokenize", "chunk", "classify"]);
+}
+
+#[test]
+fn classify_batch_tokenize_error_maps_to_tokenize_variant() {
+    let mut p = ClassifyPipeline::new(
+        StubTokenizer { ids: vec![1], max_seq: 4, error: true },
+        TruncatingChunker::new(4),
+        StubClassify { num_classes: 4, max_batch: 4, error: false },
+    );
+    let err = p.classify_batch_default(&["a", "b"]).unwrap_err();
+    assert!(matches!(err, ClassifyPipelineError::Tokenize { .. }));
+}
+
+#[test]
+fn classify_batch_results_match_individual_classify_calls() {
+    let make_pipeline = || {
+        ClassifyPipeline::new(
+            ByteTokenizer { max_seq: 4 },
+            SlidingWindowChunker::new(4, 2),
+            StubClassify { num_classes: 4, max_batch: 8, error: false },
+        )
+    };
+
+    let texts = ["abcde", "xy"];
+    let batch = {
+        let mut p = make_pipeline();
+        p.classify_batch_default(&texts).unwrap()
+    };
+
+    for (i, text) in texts.iter().enumerate() {
+        let mut p = make_pipeline();
+        let single = p.classify_default(text).unwrap();
+        assert_eq!(batch.results[i].chunks.len(), single.chunks.len(), "chunk count mismatch for text {i}");
+        for (b, s) in batch.results[i].chunks.iter().zip(&single.chunks) {
+            assert_eq!(b.char_offset, s.char_offset, "char_offset mismatch for text {i}");
+            assert_eq!(b.logits, s.logits, "logits mismatch for text {i}");
         }
     }
 }
