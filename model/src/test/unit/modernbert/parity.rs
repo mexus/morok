@@ -39,25 +39,25 @@ fn load_golden_vec<T: svod_dtype::ext::HasDType + Default + Clone>(sd: &StateDic
     t.as_vec::<T>().expect("golden readout")
 }
 
-/// `last_hidden_state` parity: our backbone (f32) vs the PyTorch reference.
-#[test]
-#[ignore = "heavy: real ModernBERT-base weights + PyTorch golden (local or HF Hub download)"]
-fn last_hidden_state_matches_pytorch() {
+/// Load the model + golden fixture once, returning (model, ids, mask, want).
+/// `want` is `(T, D)` row-major (batch squeezed by the generator); `mask` is
+/// the per-token attention mask (1 = real, 0 = pad).
+fn load_fixture() -> (ModernBert, Tensor, Vec<i64>, Vec<f32>) {
     let weights = real_file("model.safetensors");
     let golden = crate::state::load_safetensors(&real_file("golden.safetensors")).expect("golden");
 
-    // Parse the published config.json, then force f32 for CPU parity.
     let cfg_path = real_file("config.json");
     let mut cfg = ModernBertConfig::from_json(&cfg_path).expect("parse config.json");
     cfg.dtype = DType::Float32;
 
     let model = ModernBert::from_safetensors(&weights, cfg).expect("load weights");
 
-    // The exact `input_ids` + `attention_mask` are baked into the golden by the
-    // generator script (which runs `transformers` WITH the mask, so pad tokens
-    // are excluded from attention — the Rust port must do the same).
     let input_ids: Vec<i64> = load_golden_vec(&golden, "input_ids");
     let want: Vec<f32> = load_golden_vec(&golden, "last_hidden_state");
+    let mask: Vec<i64> = golden
+        .get("attention_mask")
+        .map(|_| load_golden_vec(&golden, "attention_mask"))
+        .unwrap_or_else(|| vec![1; input_ids.len()]);
     let (b, l) = match golden.get("input_ids_shape") {
         Some(t) => {
             let mut t = t.clone();
@@ -67,43 +67,74 @@ fn last_hidden_state_matches_pytorch() {
         }
         None => (1, input_ids.len()),
     };
-
     let ids = Tensor::from_slice(input_ids).try_reshape([b as isize, l as isize]).unwrap();
-    // attention_mask is int64 1/0 → bool (true = real token). The encoder
-    // inverts internally to the SDPA "true = masked out" convention.
-    let mask = match golden.get("attention_mask") {
-        Some(t) => {
-            let mut t = t.clone();
-            t.realize().unwrap();
-            Some(t.cast(DType::Bool).unwrap().try_reshape([b as isize, l as isize]).unwrap())
-        }
-        None => None,
-    };
 
-    let mut out = model.forward(&ids, mask.as_ref()).expect("forward");
+    (model, ids, mask, want)
+}
+
+/// Run the model with `mask` (bool, true=real) and return the flat (B, L, D) f32 output.
+fn run_forward(model: &ModernBert, ids: &Tensor, mask: Option<&Tensor>) -> Vec<f32> {
+    let mut out = model.forward(ids, mask).expect("forward");
     out.realize().expect("realize output");
-    let got = out.as_vec::<f32>().expect("output readout");
+    out.as_vec::<f32>().expect("output readout")
+}
 
-    assert_eq!(got.len(), want.len(), "element count mismatch");
-    let deltas: Vec<f32> = got.iter().zip(&want).map(|(a, e)| (a - e).abs()).collect();
-    let max_abs = deltas.iter().copied().fold(0.0f32, f32::max);
-    // Per-position worst token (across hidden dim D) — separate real vs pad so a
-    // large pad-position delta doesn't mask a real-token regression.
-    let d = want.len() / l;
-    let real_max = (0..deltas.len())
-        .step_by(d)
-        .take(12) // first 12 tokens are real (per the golden attention_mask)
-        .map(|pos| deltas[pos..pos + d].iter().copied().fold(0.0f32, f32::max))
-        .fold(0.0f32, f32::max);
-    let pad_max = (12 * d..deltas.len())
-        .step_by(d)
-        .map(|pos| deltas[pos..pos + d].iter().copied().fold(0.0f32, f32::max))
-        .fold(0.0f32, f32::max);
-    eprintln!("max |delta| = {max_abs:.3e}  real-token max = {real_max:.3e}  pad-token max = {pad_max:.3e}");
+/// Max |delta| over the REAL-token positions only (where `mask == 1`), folded
+/// across the hidden dim. Pad positions are excluded: transformers' pad outputs
+/// are an artifact (the mask zeroes their attention) and a divergence there is
+/// not a model-correctness signal.
+fn real_token_max_delta(got: &[f32], want: &[f32], mask: &[i64], d: usize) -> f32 {
+    got.chunks_exact(d)
+        .zip(want.chunks_exact(d))
+        .zip(mask.iter())
+        .filter(|&(_, m)| *m == 1)
+        .flat_map(|((g, w), _)| g.iter().zip(w.iter()).map(|(a, e)| (a - e).abs()))
+        .fold(0.0f32, f32::max)
+}
 
-    // Both sides run in pure f32 (the Rust model is forced to f32 by the test;
-    // the golden is produced by `transformers` in float32). The residual is pure
-    // float-reassociation noise between the Rust and PyTorch graph orderings
-    // (relative error ~1e-5 against hidden states ranging to ±40).
-    assert!(max_abs < 2e-3, "last_hidden_state drifted from PyTorch golden: max |delta| = {max_abs}");
+/// `last_hidden_state` parity: our backbone (f32) vs the PyTorch reference.
+/// Compares **real-token positions only** — the mask is load-bearing.
+#[test]
+#[ignore = "heavy: real ModernBERT-base weights + PyTorch golden (local or HF Hub download)"]
+fn last_hidden_state_matches_pytorch() {
+    let (model, ids, mask, want) = load_fixture();
+    let d = want.len() / mask.len();
+
+    let mask_t =
+        Tensor::from_slice(mask.clone()).cast(DType::Bool).unwrap().try_reshape([1isize, mask.len() as isize]).unwrap();
+    let got = run_forward(&model, &ids, Some(&mask_t));
+
+    let real_max = real_token_max_delta(&got, &want, &mask, d);
+    eprintln!("real-token max |delta| = {real_max:.3e}");
+    assert!(real_max < 1e-3, "real-token last_hidden_state drifted from PyTorch golden: max |delta| = {real_max}");
+}
+
+/// Control: the mask must be load-bearing. Running with the correct mask matches
+/// the golden on real tokens (above); running with an all-ones mask (ignoring
+/// padding) must DIVERGE on real tokens — the 20 pad tokens would otherwise
+/// contaminate every real token's attention. If this test ever passes, the
+/// golden is no longer exercising the mask.
+#[test]
+#[ignore = "heavy: real ModernBERT-base weights + PyTorch golden (local or HF Hub download)"]
+fn ignoring_padding_diverges_from_golden() {
+    let (model, ids, mask, want) = load_fixture();
+    let d = want.len() / mask.len();
+
+    // All-ones mask: attend to every position including padding.
+    let all_ones = Tensor::from_slice(vec![1i64; mask.len()])
+        .cast(DType::Bool)
+        .unwrap()
+        .try_reshape([1isize, mask.len() as isize])
+        .unwrap();
+    let got_unmasked = run_forward(&model, &ids, Some(&all_ones));
+    let real_max_unmasked = real_token_max_delta(&got_unmasked, &want, &mask, d);
+
+    // The golden was produced WITH the mask; ignoring padding must diverge on
+    // real tokens by orders of magnitude more than the masked run (1e-3 bound).
+    assert!(
+        real_max_unmasked > 1e-2,
+        "ignoring padding did NOT diverge from the golden on real tokens \
+         (max |delta| = {real_max_unmasked:.3e}); the mask is not load-bearing in the golden"
+    );
+    eprintln!("unmasked real-token max |delta| = {real_max_unmasked:.3e} (diverges as expected)");
 }

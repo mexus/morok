@@ -9,7 +9,7 @@ use snafu::ResultExt;
 use svod_dtype::DType;
 use svod_tensor::Tensor;
 
-use crate::init::{ones, zeros};
+use crate::init::ones;
 use crate::state::{self, HasStateDict, StateDict, get_tensor, prefixed};
 
 use super::error::{Result, TensorSnafu};
@@ -28,10 +28,6 @@ impl LayerNormWeights {
 
     pub fn with_eps(size: usize, eps: f64, dtype: DType) -> Self {
         Self { weight: ones(&[size], dtype), bias: None, eps }
-    }
-
-    pub fn empty_with_bias(size: usize, eps: f64, dtype: DType) -> Self {
-        Self { weight: ones(&[size], dtype.clone()), bias: Some(zeros(&[size], dtype)), eps }
     }
 
     /// Apply LayerNorm over the last axis then affine: `(x - μ)/√(σ²+ε) * γ + β?`.

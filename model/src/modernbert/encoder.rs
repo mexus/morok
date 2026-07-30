@@ -49,11 +49,16 @@ impl Encoder {
             None => None,
         };
 
+        // Two rotary bases (global / local) → two tables. Build them once
+        // before the loop and select per layer; every global layer shares one,
+        // every local layer the other.
+        let global = RotaryTable::new(self.config.global_rope_theta, seq_len, head_dim, self.config.dtype.clone())?;
+        let local = RotaryTable::new(self.config.local_rope_theta, seq_len, head_dim, self.config.dtype.clone())?;
+
         let mut h = x.clone();
         for (layer_id, layer) in self.layers.iter().enumerate() {
-            let theta = self.config.rope_theta(layer_id);
-            let rotary = RotaryTable::new(theta, seq_len, head_dim, self.config.dtype.clone())?;
-            h = layer.forward(&h, &rotary, mask_4d.as_ref())?;
+            let rotary = if self.config.is_global_layer(layer_id) { &global } else { &local };
+            h = layer.forward(&h, rotary, mask_4d.as_ref())?;
         }
         Ok(h)
     }

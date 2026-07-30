@@ -9,15 +9,14 @@
 use std::path::Path;
 
 use snafu::ResultExt;
-use svod_ir::SInt;
-use svod_tensor::{BoundVariable, Tensor};
+use svod_tensor::Tensor;
 
 use crate::state::{self, HasStateDict, StateDict};
 
 use super::config::ModernBertConfig;
 use super::embeddings::Embeddings;
 use super::encoder::Encoder;
-use super::error::{HubSnafu, Result, StateSnafu, TensorSnafu};
+use super::error::{HubSnafu, Result, StateSnafu};
 use super::normalization::LayerNormWeights;
 
 #[derive(Clone)]
@@ -44,24 +43,6 @@ impl ModernBert {
         let x = self.embeddings.forward(input_ids)?;
         let x = self.encoder.forward(&x, padding_mask)?;
         self.final_norm.apply(&x)
-    }
-
-    /// JIT-path variant: `input_ids` / `padding_mask` are sized for the JIT
-    /// plan's `max_batch` / `max_position`; `b` shrinks the leading batch dim
-    /// to the live value at execute time. Mirrors gigaam/wavlm's pattern.
-    pub fn forward_batch(
-        &self,
-        input_ids: &Tensor,
-        padding_mask: Option<&Tensor>,
-        b: &BoundVariable,
-    ) -> Result<Tensor> {
-        let bv = b.as_sint();
-        let input_ids = input_ids.try_shrink([Some((SInt::Const(0), bv.clone())), None]).context(TensorSnafu)?;
-        let padding_mask = match padding_mask {
-            Some(m) => Some(m.try_shrink([Some((SInt::Const(0), bv)), None]).context(TensorSnafu)?),
-            None => None,
-        };
-        self.forward(&input_ids, padding_mask.as_ref())
     }
 
     /// Download `config.json` + `model.safetensors` from a HuggingFace Hub
