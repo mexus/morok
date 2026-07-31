@@ -116,8 +116,8 @@ fn load_pytorch_bin_with_state_dict_key(
             unwrap_ordered_dict_items(state_dict_value)
                 .context(StructureSnafu { context: format!("{key} value is not an OrderedDict") })?
         }
-        None => unwrap_ordered_dict_items(toplevel)
-            .or_else(|| unwrap_outer_dict(toplevel))
+        None => unwrap_outer_dict(toplevel)
+            .or_else(|| unwrap_ordered_dict_items(toplevel))
             .context(StructureSnafu { context: "toplevel not recognised as a flat OrderedDict" })?,
     };
 

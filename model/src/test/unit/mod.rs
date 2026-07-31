@@ -1,5 +1,6 @@
 mod audio;
 mod batch;
+mod bgem3;
 mod bounds;
 mod config;
 mod diarizen;
@@ -17,3 +18,4 @@ mod state_dict;
 mod transcribe;
 mod wavlm;
 mod wespeaker;
+mod xlm_roberta;

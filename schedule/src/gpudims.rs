@@ -603,9 +603,9 @@ fn get_contraction(original_dims: &[Arc<UOp>], limited_dims: &[Arc<UOp>]) -> Opt
         if is_one(acc) {
             split.push(0);
         } else {
-            match acc_old.iter().position(|o| Arc::ptr_eq(o, acc)) {
-                Some(idx) => split.push(idx + 1),
-                None => return None,
+            {
+                let idx = acc_old.iter().position(|o| Arc::ptr_eq(o, acc))?;
+                split.push(idx + 1)
             }
         }
     }
