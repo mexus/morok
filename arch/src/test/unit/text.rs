@@ -6,7 +6,7 @@ use crate::pipelines::text::{
     BatchClassifications, BatchEmbeddings, BatchTokenClassifications, ChunkClassification, ChunkEmbedding,
     ChunkTokenClassification, Chunker, Classification, Classify, Embed, Embedding, Encoder, EncoderPipeline,
     EncoderPipelineError, Encoding, Entity, HfTokenizer, HfTokenizerError, Recognize, RunOptions, RunProfile, Scheme,
-    SlidingWindowChunker, SlidingWindowChunkerBuildError, TextChunk, TokenClassification, TokenLabel, Tokenizer,
+    SlidingWindowChunker, SlidingWindowChunkerError, TextChunk, TokenClassification, TokenLabel, Tokenizer,
     TruncatingChunker, argmax, group_spans, labels_for_tokens, softmax,
 };
 
@@ -345,14 +345,14 @@ fn sliding_new_rejects_stride_above_window() {
 
 #[test]
 fn sliding_try_new_rejects_invalid_args() {
-    assert!(matches!(SlidingWindowChunker::try_new(0, 1).unwrap_err(), SlidingWindowChunkerBuildError::WindowTooSmall));
+    assert!(matches!(SlidingWindowChunker::try_new(0, 1).unwrap_err(), SlidingWindowChunkerError::WindowTooSmall));
     assert!(matches!(
         SlidingWindowChunker::try_new(4, 0).unwrap_err(),
-        SlidingWindowChunkerBuildError::StrideOutOfRange
+        SlidingWindowChunkerError::StrideOutOfRange
     ));
     assert!(matches!(
         SlidingWindowChunker::try_new(4, 5).unwrap_err(),
-        SlidingWindowChunkerBuildError::StrideOutOfRange
+        SlidingWindowChunkerError::StrideOutOfRange
     ));
 }
 
@@ -361,6 +361,41 @@ fn sliding_try_new_accepts_valid_args() {
     let c = SlidingWindowChunker::try_new(4, 2).unwrap();
     assert_eq!(c.max_seq(), 4);
     assert!(SlidingWindowChunker::try_new(1, 1).is_ok());
+}
+
+#[test]
+fn sliding_chunk_returns_err_when_window_too_small_for_specials() {
+    // window=2 is accepted by try_new (1 <= stride <= window), but a BERT-style
+    // encoding carries 2 boundary specials (CLS + SEP), leaving no content
+    // budget. This is detected at chunk time (the specials budget comes from
+    // the tokenizer output), so it must surface as an Err, not a panic.
+    let mut chunker = SlidingWindowChunker::new(2, 1);
+    let err = chunker.chunk(&enc_with_specials(&[10, 20])).unwrap_err();
+    assert!(matches!(err, SlidingWindowChunkerError::WindowTooSmallForSpecials { window: 2, specials: 2 }));
+}
+
+#[test]
+fn sliding_pipeline_surfaces_chunk_error_through_chunk_arm() {
+    // A specials-wrapping tokenizer + a window=2 chunker: the two boundary
+    // specials (CLS+SEP) exhaust the window budget, so the chunk-time error
+    // folds through EncoderPipelineError::Chunk.
+    struct SpecialsTokenizer;
+    impl Tokenizer for SpecialsTokenizer {
+        type Error = Infallible;
+        fn max_seq(&self) -> usize {
+            2
+        }
+        fn encode(&mut self, _text: &str) -> Result<Encoding, Infallible> {
+            Ok(enc_with_specials(&[10, 20]))
+        }
+    }
+    let mut p = EncoderPipeline::new(
+        SpecialsTokenizer,
+        SlidingWindowChunker::new(2, 1),
+        StubEmbed { hidden_size: 2, max_batch: 1, error: false },
+    );
+    let err = p.embed_default("ignored").unwrap_err();
+    assert!(matches!(err, EncoderPipelineError::Chunk { .. }));
 }
 
 #[test]

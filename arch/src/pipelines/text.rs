@@ -358,20 +358,26 @@ pub struct SlidingWindowChunker {
     stride: usize,
 }
 
-/// Construction error for [`SlidingWindowChunker::try_new`].
+/// Construction / chunk error for [`SlidingWindowChunker`]. The two
+/// construction variants are rejected by [`try_new`](SlidingWindowChunker::try_new);
+/// [`WindowTooSmallForSpecials`](Self::WindowTooSmallForSpecials) is detected at
+/// [`chunk`](Chunker::chunk) time, since the boundary-special budget comes from
+/// the tokenizer's runtime output, not the constructor args.
 #[derive(Debug, Snafu)]
-pub enum SlidingWindowChunkerBuildError {
+pub enum SlidingWindowChunkerError {
     #[snafu(display("window must be >= 1"))]
     WindowTooSmall,
     #[snafu(display("stride must be in 1..=window"))]
     StrideOutOfRange,
+    #[snafu(display("window ({window}) too small for {specials} boundary special tokens"))]
+    WindowTooSmallForSpecials { window: usize, specials: usize },
 }
 
 impl SlidingWindowChunker {
     /// `window` = total sequence length per chunk (incl. specials);
-    /// `stride` = step between window starts. Fallsible form of [`new`](Self::new):
+    /// `stride` = step between window starts. Fallible form of [`new`](Self::new):
     /// returns `Err` unless `1 <= stride <= window`.
-    pub fn try_new(window: usize, stride: usize) -> Result<Self, SlidingWindowChunkerBuildError> {
+    pub fn try_new(window: usize, stride: usize) -> Result<Self, SlidingWindowChunkerError> {
         ensure!(window >= 1, WindowTooSmallSnafu);
         ensure!((1..=window).contains(&stride), StrideOutOfRangeSnafu);
         Ok(Self { window, stride })
@@ -381,30 +387,36 @@ impl SlidingWindowChunker {
     /// `stride` = step between window starts. Panics unless `1 <= stride <= window`.
     /// A convenience over [`try_new`](Self::try_new) for callers with known-valid args.
     pub fn new(window: usize, stride: usize) -> Self {
-        match Self::try_new(window, stride) {
-            Ok(v) => v,
-            Err(SlidingWindowChunkerBuildError::WindowTooSmall) => panic!("window must be >= 1"),
-            Err(SlidingWindowChunkerBuildError::StrideOutOfRange) => panic!("stride must be in 1..=window"),
-        }
+        Self::try_new(window, stride).unwrap_or_else(|e| match e {
+            SlidingWindowChunkerError::WindowTooSmall => panic!("window must be >= 1"),
+            SlidingWindowChunkerError::StrideOutOfRange => panic!("stride must be in 1..=window"),
+            SlidingWindowChunkerError::WindowTooSmallForSpecials { .. } => {
+                unreachable!("only produced at chunk time, not construction")
+            }
+        })
     }
 }
 
 impl Chunker for SlidingWindowChunker {
-    type Error = Infallible;
+    type Error = SlidingWindowChunkerError;
 
     fn max_seq(&self) -> usize {
         self.window
     }
 
-    fn chunk(&mut self, enc: &Encoding) -> Result<Vec<TextChunk>, Infallible> {
+    fn chunk(&mut self, enc: &Encoding) -> Result<Vec<TextChunk>, SlidingWindowChunkerError> {
         let (lead, trail) = boundary_specials(&enc.special_tokens_mask);
         let content_len = enc.input_ids.len().saturating_sub(lead + trail);
         if content_len == 0 {
             return Ok(Vec::new());
         }
 
-        let content_window = self.window.saturating_sub(lead + trail);
-        assert!(content_window >= 1, "window ({}) too small for {} boundary special tokens", self.window, lead + trail);
+        let specials = lead + trail;
+        let content_window = self.window.saturating_sub(specials);
+        ensure!(
+            content_window >= 1,
+            WindowTooSmallForSpecialsSnafu { window: self.window, specials }
+        );
 
         let step = self.stride.min(content_window);
 
