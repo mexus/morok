@@ -40,6 +40,48 @@ pub fn load_safetensors(path: &Path) -> Result<StateDict> {
     Ok(sd)
 }
 
+/// Load safetensors weights from a HuggingFace checkpoint directory.
+///
+/// Handles both single-file (`model.safetensors`) and multi-shard
+/// (`model-00001-of-0000N.safetensors` + `model.safetensors.index.json`)
+/// checkpoints. For single-file, loads `model.safetensors` directly. For
+/// multi-shard, parses the index JSON to find all shard files, loads each,
+/// and merges into one [`StateDict`].
+pub fn load_safetensors_dir(dir: &Path) -> Result<StateDict> {
+    let single = dir.join("model.safetensors");
+    if single.exists() {
+        return load_safetensors(&single);
+    }
+
+    let index_path = dir.join("model.safetensors.index.json");
+    let index_data = std::fs::read_to_string(&index_path).context(IoSnafu)?;
+    let index: SafetensorsIndex =
+        serde_json::from_str(&index_data).map_err(|e| Error::Io { source: std::io::Error::other(e.to_string()) })?;
+
+    let mut sd = StateDict::new();
+    for shard_file in index.unique_shards() {
+        let shard_path = dir.join(&shard_file);
+        let shard_sd = load_safetensors(&shard_path)?;
+        sd.extend(shard_sd);
+    }
+    Ok(sd)
+}
+
+#[derive(serde::Deserialize)]
+pub(crate) struct SafetensorsIndex {
+    #[serde(rename = "weight_map")]
+    weight_map: HashMap<String, String>,
+}
+
+impl SafetensorsIndex {
+    pub(crate) fn unique_shards(&self) -> Vec<String> {
+        let mut shards: Vec<String> = self.weight_map.values().cloned().collect();
+        shards.sort();
+        shards.dedup();
+        shards
+    }
+}
+
 fn convert_dtype(dt: safetensors::Dtype) -> Result<DType> {
     use safetensors::Dtype as ST;
     match dt {

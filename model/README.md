@@ -15,6 +15,7 @@ plans.
 | `blocks` | Shared `Conv2dWeights`, `BatchNormWeights`, `BasicBlock`, `Bottleneck`, `ResidualStage` reused by every ResNet-shaped backbone. timm/torchvision key convention. |
 | `wavlm` | WavLM speech-representation backbone (Conv1d feature extractor + gated rel-pos Transformer, per-layer pruning) consumed by `diarizen`. |
 | `xlm_roberta` | XLM-RoBERTa text encoder backbone (absolute position embeddings, post-norm Transformer) consumed by `bgem3`. |
+| `qwen3` | Qwen3 decoder-only LLM backbone (causal attention, GQA, per-head Q/K RMSNorm, RoPE, SwiGLU) consumed by embedding models. |
 | `sentencepiece` | Minimal SentencePiece `.model` protobuf loader (vocab piece extraction). |
 
 ## Models
@@ -28,20 +29,10 @@ plans.
 | ModernBERT (base / large) | Text embeddings, fill-mask (MLM) | `modernbert` | [Answer.AI ModernBERT](https://github.com/AnswerDotAI/ModernBERT) | [`answerdotai/ModernBERT-base`](https://huggingface.co/answerdotai/ModernBERT-base) |
 | BGE-M3 (dense / sparse / ColBERT) | Text embeddings, retrieval | `bgem3` | [BAAI/bge-m3](https://huggingface.co/BAAI/bge-m3) (XLM-RoBERTa-large) | [`BAAI/bge-m3`](https://huggingface.co/BAAI/bge-m3) |
 | BGE-reranker-v2-m3 | Cross-encoder reranking | `bgem3` | [BAAI/bge-reranker-v2-m3](https://huggingface.co/BAAI/bge-reranker-v2-m3) | [`BAAI/bge-reranker-v2-m3`](https://huggingface.co/BAAI/bge-reranker-v2-m3) |
+| Qwen3-Embedding-0.6B | Text embeddings, retrieval | `qwen3` | [Qwen team](https://huggingface.co/Qwen) (Qwen3 LLM) | [`Qwen/Qwen3-Embedding-0.6B`](https://huggingface.co/Qwen/Qwen3-Embedding-0.6B) |
+| Qwen3-Reranker-0.6B | Cross-encoder reranking | `qwen3` | [Qwen team](https://huggingface.co/Qwen) (Qwen3 LLM) | [`Qwen/Qwen3-Reranker-0.6B`](https://huggingface.co/Qwen/Qwen3-Reranker-0.6B) |
 | ResNet (18 / 34 / 50 / 101 / 152) | Vision | `resnet` | [He et al. 2015](https://arxiv.org/abs/1512.03385) | [`timm/resnet*.a1_in1k`](https://huggingface.co/timm) |
 | WeSpeaker ResNet34 | Speaker embedding | `wespeaker` | [wenet-e2e/wespeaker](https://github.com/wenet-e2e/wespeaker) | [`pyannote/wespeaker-voxceleb-resnet34-LM`](https://huggingface.co/pyannote/wespeaker-voxceleb-resnet34-LM) |
-
-FireRedVAD ships two variants: the non-streaming model (`FireRedVadSplitter`
-— the whole DFSMN runs as one batched device JIT, no host recurrence) and
-the causal `Stream-VAD` checkpoint (`FireRedVadStreamer` — incremental
-push/flush API with per-layer conv caches recycled on-device between
-chunks).
-
-BGE-M3 loads from `pytorch_model.bin` (pickle, no safetensors variant) with
-the three retrieval heads in separate `.pt` files (`sparse_linear.pt`,
-`colbert_linear.pt`). The reranker loads from `model.safetensors` with a
-`roberta.` prefix on backbone keys. Both share the XLM-RoBERTa-large
-backbone (`xlm_roberta` module).
 
 ## Examples
 
