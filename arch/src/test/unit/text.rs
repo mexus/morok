@@ -423,7 +423,7 @@ fn sliding_pipeline_surfaces_chunk_error_through_chunk_arm() {
         SlidingWindowChunker::new(2, 1),
         StubEmbed { hidden_size: 2, max_batch: 1, error: false },
     );
-    let err = p.embed_default("ignored").unwrap_err();
+    let err = p.embed("ignored", ()).unwrap_err();
     assert!(matches!(err, EncoderPipelineError::Chunk { .. }));
 }
 
@@ -436,7 +436,7 @@ fn sliding_pipeline_produces_per_window_embeddings() {
         SlidingWindowChunker::new(3, 2),
         StubEmbed { hidden_size: 3, max_batch: 1, error: false },
     );
-    let out = p.embed_default("ignored").unwrap();
+    let out = p.embed("ignored", ()).unwrap();
     assert_eq!(out.chunks.len(), 3);
     assert_eq!(out.chunks[0].byte_offset, 0);
     assert_eq!(out.chunks[0].values, vec![10.0, 20.0, 30.0]);
@@ -487,7 +487,7 @@ fn pipeline(ids: Vec<u32>, max_seq: usize) -> EncoderPipeline<StubTokenizer, Tru
 fn pipeline_truncates_then_embeds() {
     // Tokenizer yields 7 ids; chunker caps at 4; embedder sees the 4 surviving.
     let mut p = pipeline(vec![1, 2, 3, 4, 5, 6, 7], 4);
-    let out = p.embed_default("ignored").unwrap();
+    let out = p.embed("ignored", ()).unwrap();
     assert_eq!(out.chunks.len(), 1);
     // byte_offset is threaded through from the chunker (TruncatingChunker → 0).
     assert_eq!(out.chunks[0].byte_offset, 0);
@@ -510,7 +510,7 @@ fn pipeline_profiles_per_call_without_rebuild() {
     // One built pipeline serves both modes.
     let profiled = p.embed("ignored", RunOptions { profile: true }).unwrap();
     assert!(profiled.profile.is_some());
-    let unprofiled = p.embed_default("ignored").unwrap();
+    let unprofiled = p.embed("ignored", ()).unwrap();
     assert!(unprofiled.profile.is_none());
 }
 
@@ -605,7 +605,7 @@ fn tokenize_error_maps_to_tokenize_variant() {
         TruncatingChunker::new(4),
         StubEmbed { hidden_size: 4, max_batch: 1, error: false },
     );
-    let err = p.embed_default("ignored").unwrap_err();
+    let err = p.embed("ignored", ()).unwrap_err();
     assert!(matches!(err, crate::pipelines::text::EncoderPipelineError::Tokenize { .. }));
 }
 
@@ -616,7 +616,7 @@ fn embed_error_maps_to_embed_variant() {
         TruncatingChunker::new(4),
         StubEmbed { hidden_size: 4, max_batch: 1, error: true },
     );
-    let err = p.embed_default("ignored").unwrap_err();
+    let err = p.embed("ignored", ()).unwrap_err();
     assert!(matches!(err, crate::pipelines::text::EncoderPipelineError::Encode { .. }));
 }
 
@@ -751,7 +751,7 @@ fn chunk_error_maps_to_chunk_variant() {
         ErrChunker { max_seq: 4 },
         StubEmbed { hidden_size: 4, max_batch: 1, error: false },
     );
-    let err = p.embed_default("ignored").unwrap_err();
+    let err = p.embed("ignored", ()).unwrap_err();
     assert!(matches!(err, EncoderPipelineError::Chunk { .. }));
 }
 
@@ -764,7 +764,7 @@ fn batch_basic_three_texts() {
         TruncatingChunker::new(32),
         StubEmbed { hidden_size: 32, max_batch: 8, error: false },
     );
-    let out = p.embed_batch_default(&["ab", "xyz", "hello"]).unwrap();
+    let out = p.embed_batch(&["ab", "xyz", "hello"], ()).unwrap();
     assert_eq!(out.results.len(), 3);
     assert!(out.profile.is_none(), "default options don't profile");
     // ByteTokenizer maps each byte to its value: "ab" → [97, 98], etc.
@@ -782,7 +782,7 @@ fn batch_with_sliding_window_varying_chunk_counts() {
         StubEmbed { hidden_size: 3, max_batch: 8, error: false },
     );
     // 6 + 2 + 4 content tokens → 3 + 1 + 2 = 6 chunks total.
-    let out = p.embed_batch_default(&["abcdef", "ab", "abcd"]).unwrap();
+    let out = p.embed_batch(&["abcdef", "ab", "abcd"], ()).unwrap();
     assert_eq!(out.results.len(), 3);
     assert_eq!(out.results[0].chunks.len(), 3);
     assert_eq!(out.results[0].chunks[0].byte_offset, 0);
@@ -799,7 +799,7 @@ fn batch_empty_texts_returns_empty() {
         TruncatingChunker::new(8),
         StubEmbed { hidden_size: 8, max_batch: 4, error: false },
     );
-    let out: BatchEmbeddings = p.embed_batch_default(&[]).unwrap();
+    let out: BatchEmbeddings = p.embed_batch(&[], ()).unwrap();
     assert!(out.results.is_empty());
     assert!(out.profile.is_none());
 }
@@ -812,7 +812,7 @@ fn batch_some_texts_produce_zero_chunks() {
         StubEmbed { hidden_size: 4, max_batch: 4, error: false },
     );
     // "" → 0 tokens → 0 chunks (SlidingWindowChunker content_len guard).
-    let out = p.embed_batch_default(&["ab", "", "cd"]).unwrap();
+    let out = p.embed_batch(&["ab", "", "cd"], ()).unwrap();
     assert_eq!(out.results.len(), 3);
     assert_eq!(out.results[0].chunks.len(), 1);
     assert!(out.results[1].chunks.is_empty());
@@ -828,7 +828,7 @@ fn batch_sub_batches_when_chunks_exceed_max_batch() {
         StubEmbed { hidden_size: 8, max_batch: 2, error: false },
     );
     let texts: Vec<&str> = vec!["a", "b", "c", "d", "e"];
-    let out = p.embed_batch_default(&texts).unwrap();
+    let out = p.embed_batch(&texts, ()).unwrap();
     assert_eq!(out.results.len(), 5);
     for (i, result) in out.results.iter().enumerate() {
         assert_eq!(result.chunks.len(), 1);
@@ -860,7 +860,7 @@ fn batch_tokenize_error_maps_to_tokenize_variant() {
         TruncatingChunker::new(4),
         StubEmbed { hidden_size: 4, max_batch: 4, error: false },
     );
-    let err = p.embed_batch_default(&["a", "b"]).unwrap_err();
+    let err = p.embed_batch(&["a", "b"], ()).unwrap_err();
     assert!(matches!(err, EncoderPipelineError::Tokenize { .. }));
 }
 
@@ -877,12 +877,12 @@ fn batch_results_match_individual_embed_calls() {
     let texts = ["abcde", "xy"];
     let batch = {
         let mut p = make_pipeline();
-        p.embed_batch_default(&texts).unwrap()
+        p.embed_batch(&texts, ()).unwrap()
     };
 
     for (i, text) in texts.iter().enumerate() {
         let mut p = make_pipeline();
-        let single = p.embed_default(text).unwrap();
+        let single = p.embed(text, ()).unwrap();
         assert_eq!(batch.results[i].chunks.len(), single.chunks.len(), "chunk count mismatch for text {i}");
         for (b, s) in batch.results[i].chunks.iter().zip(&single.chunks) {
             assert_eq!(b.byte_offset, s.byte_offset, "byte_offset mismatch for text {i}");
@@ -913,7 +913,7 @@ fn classify_single_is_batch_of_one() {
 #[test]
 fn classify_pipeline_truncates_then_classifies() {
     let mut p = classify_pipeline(vec![1, 2, 3, 4, 5, 6, 7], 4);
-    let out = p.classify_default("ignored").unwrap();
+    let out = p.classify("ignored", ()).unwrap();
     assert_eq!(out.chunks.len(), 1);
     assert_eq!(out.chunks[0].byte_offset, 0);
     assert_eq!(out.chunks[0].logits, vec![1.0, 2.0, 3.0, 4.0]);
@@ -934,7 +934,7 @@ fn classify_pipeline_profiles_per_call_without_rebuild() {
     let mut p = classify_pipeline(vec![1, 2, 3], 8);
     let profiled = p.classify("ignored", RunOptions { profile: true }).unwrap();
     assert!(profiled.profile.is_some());
-    let unprofiled = p.classify_default("ignored").unwrap();
+    let unprofiled = p.classify("ignored", ()).unwrap();
     assert!(unprofiled.profile.is_none());
 }
 
@@ -975,7 +975,7 @@ fn classify_sliding_pipeline_produces_per_window_classifications() {
         SlidingWindowChunker::new(3, 2),
         StubClassify { num_labels: 3, max_batch: 1, error: false },
     );
-    let out = p.classify_default("ignored").unwrap();
+    let out = p.classify("ignored", ()).unwrap();
     assert_eq!(out.chunks.len(), 3);
     assert_eq!(out.chunks[0].byte_offset, 0);
     assert_eq!(out.chunks[0].logits, vec![10.0, 20.0, 30.0]);
@@ -992,7 +992,7 @@ fn classify_tokenize_error_maps_to_tokenize_variant() {
         TruncatingChunker::new(4),
         StubClassify { num_labels: 4, max_batch: 1, error: false },
     );
-    let err = p.classify_default("ignored").unwrap_err();
+    let err = p.classify("ignored", ()).unwrap_err();
     assert!(matches!(err, EncoderPipelineError::Tokenize { .. }));
 }
 
@@ -1003,7 +1003,7 @@ fn classify_error_maps_to_classify_variant() {
         TruncatingChunker::new(4),
         StubClassify { num_labels: 4, max_batch: 1, error: true },
     );
-    let err = p.classify_default("ignored").unwrap_err();
+    let err = p.classify("ignored", ()).unwrap_err();
     assert!(matches!(err, EncoderPipelineError::Encode { .. }));
 }
 
@@ -1014,7 +1014,7 @@ fn classify_chunk_error_maps_to_chunk_variant() {
         ErrChunker { max_seq: 4 },
         StubClassify { num_labels: 4, max_batch: 1, error: false },
     );
-    let err = p.classify_default("ignored").unwrap_err();
+    let err = p.classify("ignored", ()).unwrap_err();
     assert!(matches!(err, EncoderPipelineError::Chunk { .. }));
 }
 
@@ -1027,7 +1027,7 @@ fn classify_batch_basic_three_texts() {
         TruncatingChunker::new(32),
         StubClassify { num_labels: 32, max_batch: 8, error: false },
     );
-    let out = p.classify_batch_default(&["ab", "xyz", "hello"]).unwrap();
+    let out = p.classify_batch(&["ab", "xyz", "hello"], ()).unwrap();
     assert_eq!(out.results.len(), 3);
     assert!(out.profile.is_none(), "default options don't profile");
     assert_eq!(out.results[0].chunks.len(), 1);
@@ -1043,7 +1043,7 @@ fn classify_batch_with_sliding_window_varying_chunk_counts() {
         SlidingWindowChunker::new(3, 2),
         StubClassify { num_labels: 3, max_batch: 8, error: false },
     );
-    let out = p.classify_batch_default(&["abcdef", "ab", "abcd"]).unwrap();
+    let out = p.classify_batch(&["abcdef", "ab", "abcd"], ()).unwrap();
     assert_eq!(out.results.len(), 3);
     assert_eq!(out.results[0].chunks.len(), 3);
     assert_eq!(out.results[0].chunks[0].byte_offset, 0);
@@ -1060,7 +1060,7 @@ fn classify_batch_empty_texts_returns_empty() {
         TruncatingChunker::new(8),
         StubClassify { num_labels: 8, max_batch: 4, error: false },
     );
-    let out: BatchClassifications = p.classify_batch_default(&[]).unwrap();
+    let out: BatchClassifications = p.classify_batch(&[], ()).unwrap();
     assert!(out.results.is_empty());
     assert!(out.profile.is_none());
 }
@@ -1072,7 +1072,7 @@ fn classify_batch_some_texts_produce_zero_chunks() {
         SlidingWindowChunker::new(4, 2),
         StubClassify { num_labels: 4, max_batch: 4, error: false },
     );
-    let out = p.classify_batch_default(&["ab", "", "cd"]).unwrap();
+    let out = p.classify_batch(&["ab", "", "cd"], ()).unwrap();
     assert_eq!(out.results.len(), 3);
     assert_eq!(out.results[0].chunks.len(), 1);
     assert!(out.results[1].chunks.is_empty());
@@ -1087,7 +1087,7 @@ fn classify_batch_sub_batches_when_chunks_exceed_max_batch() {
         StubClassify { num_labels: 8, max_batch: 2, error: false },
     );
     let texts: Vec<&str> = vec!["a", "b", "c", "d", "e"];
-    let out = p.classify_batch_default(&texts).unwrap();
+    let out = p.classify_batch(&texts, ()).unwrap();
     assert_eq!(out.results.len(), 5);
     for (i, result) in out.results.iter().enumerate() {
         assert_eq!(result.chunks.len(), 1);
@@ -1118,7 +1118,7 @@ fn classify_batch_tokenize_error_maps_to_tokenize_variant() {
         TruncatingChunker::new(4),
         StubClassify { num_labels: 4, max_batch: 4, error: false },
     );
-    let err = p.classify_batch_default(&["a", "b"]).unwrap_err();
+    let err = p.classify_batch(&["a", "b"], ()).unwrap_err();
     assert!(matches!(err, EncoderPipelineError::Tokenize { .. }));
 }
 
@@ -1135,12 +1135,12 @@ fn classify_batch_results_match_individual_classify_calls() {
     let texts = ["abcde", "xy"];
     let batch = {
         let mut p = make_pipeline();
-        p.classify_batch_default(&texts).unwrap()
+        p.classify_batch(&texts, ()).unwrap()
     };
 
     for (i, text) in texts.iter().enumerate() {
         let mut p = make_pipeline();
-        let single = p.classify_default(text).unwrap();
+        let single = p.classify(text, ()).unwrap();
         assert_eq!(batch.results[i].chunks.len(), single.chunks.len(), "chunk count mismatch for text {i}");
         for (b, s) in batch.results[i].chunks.iter().zip(&single.chunks) {
             assert_eq!(b.byte_offset, s.byte_offset, "byte_offset mismatch for text {i}");
@@ -1228,7 +1228,7 @@ fn classify_tokens_single_is_batch_of_one() {
 #[test]
 fn classify_tokens_pipeline_truncates_then_recognizes() {
     let mut p = classify_tokens_pipeline(vec![1, 2, 3, 4, 5, 6, 7], 4);
-    let out = p.classify_tokens_default("ignored").unwrap();
+    let out = p.classify_tokens("ignored", ()).unwrap();
     assert_eq!(out.chunks.len(), 1);
     let c = &out.chunks[0];
     assert_eq!(c.byte_offset, 0);
@@ -1254,7 +1254,7 @@ fn classify_tokens_pipeline_profiles_per_call_without_rebuild() {
     let mut p = classify_tokens_pipeline(vec![1, 2, 3], 8);
     let profiled = p.classify_tokens("ignored", RunOptions { profile: true }).unwrap();
     assert!(profiled.profile.is_some());
-    let unprofiled = p.classify_tokens_default("ignored").unwrap();
+    let unprofiled = p.classify_tokens("ignored", ()).unwrap();
     assert!(unprofiled.profile.is_none());
 }
 
@@ -1295,7 +1295,7 @@ fn classify_tokens_sliding_pipeline_produces_per_window_classifications() {
         SlidingWindowChunker::new(3, 2),
         StubRecognize { num_labels: 1, max_batch: 1, error: false },
     );
-    let out = p.classify_tokens_default("ignored").unwrap();
+    let out = p.classify_tokens("ignored", ()).unwrap();
     assert_eq!(out.chunks.len(), 3);
     assert_eq!(out.chunks[0].byte_offset, 0);
     assert_eq!(out.chunks[0].logits, vec![10.0, 20.0, 30.0]);
@@ -1315,7 +1315,7 @@ fn classify_tokens_tokenize_error_maps_to_tokenize_variant() {
         TruncatingChunker::new(4),
         StubRecognize { num_labels: 4, max_batch: 1, error: false },
     );
-    let err = p.classify_tokens_default("ignored").unwrap_err();
+    let err = p.classify_tokens("ignored", ()).unwrap_err();
     assert!(matches!(err, EncoderPipelineError::Tokenize { .. }));
 }
 
@@ -1326,7 +1326,7 @@ fn classify_tokens_error_maps_to_recognize_variant() {
         TruncatingChunker::new(4),
         StubRecognize { num_labels: 4, max_batch: 1, error: true },
     );
-    let err = p.classify_tokens_default("ignored").unwrap_err();
+    let err = p.classify_tokens("ignored", ()).unwrap_err();
     assert!(matches!(err, EncoderPipelineError::Encode { .. }));
 }
 
@@ -1337,7 +1337,7 @@ fn classify_tokens_chunk_error_maps_to_chunk_variant() {
         ErrChunker { max_seq: 4 },
         StubRecognize { num_labels: 4, max_batch: 1, error: false },
     );
-    let err = p.classify_tokens_default("ignored").unwrap_err();
+    let err = p.classify_tokens("ignored", ()).unwrap_err();
     assert!(matches!(err, EncoderPipelineError::Chunk { .. }));
 }
 
@@ -1350,7 +1350,7 @@ fn classify_tokens_batch_basic_three_texts() {
         TruncatingChunker::new(32),
         StubRecognize { num_labels: 1, max_batch: 8, error: false },
     );
-    let out = p.classify_tokens_batch_default(&["ab", "xyz", "hello"]).unwrap();
+    let out = p.classify_tokens_batch(&["ab", "xyz", "hello"], ()).unwrap();
     assert_eq!(out.results.len(), 3);
     assert!(out.profile.is_none(), "default options don't profile");
     assert_eq!(out.results[0].chunks.len(), 1);
@@ -1368,7 +1368,7 @@ fn classify_tokens_batch_with_sliding_window_varying_chunk_counts() {
         SlidingWindowChunker::new(3, 2),
         StubRecognize { num_labels: 1, max_batch: 8, error: false },
     );
-    let out = p.classify_tokens_batch_default(&["abcdef", "ab", "abcd"]).unwrap();
+    let out = p.classify_tokens_batch(&["abcdef", "ab", "abcd"], ()).unwrap();
     assert_eq!(out.results.len(), 3);
     assert_eq!(out.results[0].chunks.len(), 3);
     assert_eq!(out.results[0].chunks[0].byte_offset, 0);
@@ -1385,7 +1385,7 @@ fn classify_tokens_batch_empty_texts_returns_empty() {
         TruncatingChunker::new(8),
         StubRecognize { num_labels: 1, max_batch: 4, error: false },
     );
-    let out: BatchTokenClassifications = p.classify_tokens_batch_default(&[]).unwrap();
+    let out: BatchTokenClassifications = p.classify_tokens_batch(&[], ()).unwrap();
     assert!(out.results.is_empty());
     assert!(out.profile.is_none());
 }
@@ -1397,7 +1397,7 @@ fn classify_tokens_batch_some_texts_produce_zero_chunks() {
         SlidingWindowChunker::new(4, 2),
         StubRecognize { num_labels: 1, max_batch: 4, error: false },
     );
-    let out = p.classify_tokens_batch_default(&["ab", "", "cd"]).unwrap();
+    let out = p.classify_tokens_batch(&["ab", "", "cd"], ()).unwrap();
     assert_eq!(out.results.len(), 3);
     assert_eq!(out.results[0].chunks.len(), 1);
     assert!(out.results[1].chunks.is_empty());
@@ -1412,7 +1412,7 @@ fn classify_tokens_batch_sub_batches_when_chunks_exceed_max_batch() {
         StubRecognize { num_labels: 1, max_batch: 2, error: false },
     );
     let texts: Vec<&str> = vec!["a", "b", "c", "d", "e"];
-    let out = p.classify_tokens_batch_default(&texts).unwrap();
+    let out = p.classify_tokens_batch(&texts, ()).unwrap();
     assert_eq!(out.results.len(), 5);
     for (i, result) in out.results.iter().enumerate() {
         assert_eq!(result.chunks.len(), 1);
@@ -1443,7 +1443,7 @@ fn classify_tokens_batch_tokenize_error_maps_to_tokenize_variant() {
         TruncatingChunker::new(4),
         StubRecognize { num_labels: 4, max_batch: 4, error: false },
     );
-    let err = p.classify_tokens_batch_default(&["a", "b"]).unwrap_err();
+    let err = p.classify_tokens_batch(&["a", "b"], ()).unwrap_err();
     assert!(matches!(err, EncoderPipelineError::Tokenize { .. }));
 }
 
@@ -1460,12 +1460,12 @@ fn classify_tokens_batch_results_match_individual_recognize_calls() {
     let texts = ["abcde", "xy"];
     let batch = {
         let mut p = make_pipeline();
-        p.classify_tokens_batch_default(&texts).unwrap()
+        p.classify_tokens_batch(&texts, ()).unwrap()
     };
 
     for (i, text) in texts.iter().enumerate() {
         let mut p = make_pipeline();
-        let single = p.classify_tokens_default(text).unwrap();
+        let single = p.classify_tokens(text, ()).unwrap();
         assert_eq!(batch.results[i].chunks.len(), single.chunks.len(), "chunk count mismatch for text {i}");
         for (b, s) in batch.results[i].chunks.iter().zip(&single.chunks) {
             assert_eq!(b.byte_offset, s.byte_offset, "byte_offset mismatch for text {i}");
@@ -1510,8 +1510,8 @@ fn chunk_seam_reuses_chunks_across_embed_and_classify() {
         )
     };
 
-    let embeds = make_embed().embed_chunks_default(&chunks).unwrap();
-    let classes = make_classify().classify_chunks_default(&chunks).unwrap();
+    let embeds = make_embed().embed_chunks(&chunks, ()).unwrap();
+    let classes = make_classify().classify_chunks(&chunks, ()).unwrap();
 
     // Same byte_offsets, same chunk counts — geometry is shared.
     assert_eq!(embeds.chunks.len(), classes.chunks.len());
@@ -1542,11 +1542,11 @@ fn chunk_seam_feeds_one_encoding_through_two_chunkers() {
         TruncatingChunker::new(8),
         StubEmbed { hidden_size: 8, max_batch: 8, error: false },
     );
-    let t = p.embed_chunks_default(&truncated).unwrap();
+    let t = p.embed_chunks(&truncated, ()).unwrap();
     assert_eq!(t.chunks.len(), 1);
     assert_eq!(t.chunks[0].values, vec![97.0, 98.0, 99.0, 100.0]); // abcd
 
-    let w = p.embed_chunks_default(&windowed).unwrap();
+    let w = p.embed_chunks(&windowed, ()).unwrap();
     assert_eq!(w.chunks.len(), 3);
     assert_eq!(w.chunks[0].values, vec![97.0, 98.0, 99.0]);
 }
@@ -1567,7 +1567,7 @@ fn chunk_seam_batch_preserves_per_text_grouping() {
         TruncatingChunker::new(4),
         StubEmbed { hidden_size: 4, max_batch: 8, error: false },
     );
-    let out = p.embed_chunks_batch_default(&per_text).unwrap();
+    let out = p.embed_chunks_batch(&per_text, ()).unwrap();
     assert_eq!(out.results.len(), 2);
     assert_eq!(out.results[0].chunks.len(), 3);
     assert_eq!(out.results[1].chunks.len(), 1);
@@ -1585,11 +1585,11 @@ fn chunk_seam_matches_full_pipeline_output() {
         SlidingWindowChunker::new(3, 2),
         StubEmbed { hidden_size: 3, max_batch: 1, error: false },
     );
-    let direct = full.embed_default("abcdef").unwrap();
+    let direct = full.embed("abcdef", ()).unwrap();
 
     // Now feed the same chunks (rebuilt identically) through the seam.
     let chunks = shared_chunks();
-    let via_seam = full.embed_chunks_default(&chunks).unwrap();
+    let via_seam = full.embed_chunks(&chunks, ()).unwrap();
 
     assert_eq!(direct.chunks.len(), via_seam.chunks.len());
     for (d, s) in direct.chunks.iter().zip(via_seam.chunks.iter()) {
@@ -1606,7 +1606,7 @@ fn chunk_seam_empty_chunks_returns_empty_no_encode() {
         TruncatingChunker::new(4),
         StubEmbed { hidden_size: 4, max_batch: 1, error: true },
     );
-    let out = p.embed_chunks_default(&[]).unwrap();
+    let out = p.embed_chunks(&[], ()).unwrap();
     assert!(out.chunks.is_empty());
 }
 
