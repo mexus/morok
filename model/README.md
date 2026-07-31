@@ -49,6 +49,7 @@ cargo run -p svod-model --release --example yolo_detect -- --hub --scale small -
 cargo run -p svod-model --release --example whisper_infer -- audio.wav [--size tiny|base|small] [--profile]
 cargo run -p svod-model --release --example whisper_infer -- audio.wav --language auto --timestamps
 cargo run -p svod-model --release --example modernbert_embed_infer -- "hello world"            # embeddings (--window/--stride for long docs)
+cargo run -p svod-model --release --example modernbert_embed_batch_infer -- "one" "two"        # batched embeddings (multi-text throughput)
 cargo run -p svod-model --release --example modernbert_classify_infer -- "This movie was great!" # sentence classification
 cargo run -p svod-model --release --example modernbert_token_infer -- "Barack Obama was born in Hawaii" # token classification / NER
 ```
