@@ -6,7 +6,8 @@ use crate::pipelines::text::{
     BatchClassifications, BatchEmbeddings, BatchTokenClassifications, ChunkTokenClassification, Chunker,
     Classification, Classify, ClassifyTokens, Embed, Embedding, EncoderHead, EncoderPipeline, EncoderPipelineError,
     Encoding, HfTokenizer, HfTokenizerError, RunOptions, RunProfile, Scheme, SlidingWindowChunker,
-    SlidingWindowChunkerError, TextChunk, TokenClassification, TokenLabel, Tokenizer, TruncatingChunker, argmax,
+    SlidingWindowChunkerError, TextChunk, TokenClassification, TokenLabel, Tokenizer, TruncatingChunker,
+    TruncatingChunkerError, argmax,
     group_spans, group_spans_document, labels_for_tokens, softmax,
 };
 
@@ -219,6 +220,27 @@ fn truncating_chunker_keeps_short_input_intact() {
     assert_eq!(out[0].encoding.input_ids, vec![1, 2, 3]);
     assert_eq!(chunker.max_seq(), 8);
     assert_eq!(chunker.profile_label(), "chunk");
+}
+
+#[test]
+#[should_panic(expected = "max_seq must be >= 1")]
+fn truncating_new_rejects_zero() {
+    let _ = TruncatingChunker::new(0);
+}
+
+#[test]
+fn truncating_try_new_rejects_invalid_args() {
+    assert!(matches!(
+        TruncatingChunker::try_new(0).unwrap_err(),
+        TruncatingChunkerError::MaxSeqTooSmall
+    ));
+}
+
+#[test]
+fn truncating_try_new_accepts_valid_args() {
+    let c = TruncatingChunker::try_new(4).unwrap();
+    assert_eq!(c.max_seq(), 4);
+    assert!(TruncatingChunker::try_new(1).is_ok());
 }
 
 // ─── SlidingWindowChunker ─────────────────────────────────────────────────────
@@ -701,7 +723,7 @@ fn hf_tokenizer_error_display_and_source() {
     let _: &HfTokenizerError = &err;
 }
 
-// ─── EncoderPipelineError::Chunk arm (TruncatingChunker::Error = Infallible) ─────
+// ─── EncoderPipelineError::Chunk arm ─────────────────────────────────────────
 
 #[derive(Debug, snafu::Snafu)]
 #[snafu(display("stub chunker error"))]

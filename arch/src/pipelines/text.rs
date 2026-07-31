@@ -22,7 +22,6 @@
 //! exactly as [`audio`](super::audio)'s [`Transcriber`](super::audio::Transcriber)
 //! owns audio → mel → device.
 
-use std::convert::Infallible;
 use std::path::Path;
 use std::time::Instant;
 
@@ -269,24 +268,44 @@ pub trait Chunker {
 
 /// Drops ids beyond `max_seq` and emits a single chunk at `byte_offset = 0`. For
 /// long documents that exceed `max_seq`, use [`SlidingWindowChunker`].
+#[derive(Debug)]
 pub struct TruncatingChunker {
     max_seq: usize,
 }
 
+/// Construction error for [`TruncatingChunker`]: the only invariant is
+/// `max_seq >= 1` (zero would slice to an empty chunk). [`chunk`](Chunker::chunk)
+/// itself is infallible, so this type carries no chunk-time variants.
+#[derive(Debug, Snafu)]
+pub enum TruncatingChunkerError {
+    #[snafu(display("max_seq must be >= 1"))]
+    MaxSeqTooSmall,
+}
+
 impl TruncatingChunker {
+    /// Fallible form of [`new`](Self::new): returns `Err` unless `max_seq >= 1`.
+    pub fn try_new(max_seq: usize) -> Result<Self, TruncatingChunkerError> {
+        ensure!(max_seq >= 1, MaxSeqTooSmallSnafu);
+        Ok(Self { max_seq })
+    }
+
+    /// Panics unless `max_seq >= 1`. A convenience over
+    /// [`try_new`](Self::try_new) for callers with known-valid args.
     pub fn new(max_seq: usize) -> Self {
-        Self { max_seq: max_seq.max(1) }
+        Self::try_new(max_seq).unwrap_or_else(|e| match e {
+            TruncatingChunkerError::MaxSeqTooSmall => panic!("max_seq must be >= 1"),
+        })
     }
 }
 
 impl Chunker for TruncatingChunker {
-    type Error = Infallible;
+    type Error = TruncatingChunkerError;
 
     fn max_seq(&self) -> usize {
         self.max_seq
     }
 
-    fn chunk(&mut self, enc: &Encoding) -> Result<Vec<TextChunk>, Infallible> {
+    fn chunk(&mut self, enc: &Encoding) -> Result<Vec<TextChunk>, TruncatingChunkerError> {
         // Keep every field's length consistent: slice to the common cap so ids,
         // masks, and offsets stay aligned.
         let take = self.max_seq.min(enc.input_ids.len());
