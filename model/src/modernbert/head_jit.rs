@@ -38,6 +38,8 @@ pub enum HeadError {
     Device { source: svod_device::error::Error },
     #[snafu(display("{stage} batch of {got} exceeds prepared max_batch {max}"))]
     CapacityExceeded { stage: &'static str, got: usize, max: usize },
+    #[snafu(display("{stage} sequence length {got} exceeds prepared max_seq {max}"))]
+    SequenceTooLong { stage: &'static str, got: usize, max: usize },
 }
 
 /// The JIT interface the three `jit_wrapper!`-generated head types share. The
@@ -130,6 +132,12 @@ pub(crate) fn execute_head<'a, J: JitHeadPlan>(
     }
     if b > max_batch {
         return Err(CapacityExceededSnafu { stage, got: b, max: max_batch }.build());
+    }
+    // Once chunks can arrive pre-built (the public chunk seam), a caller may
+    // feed an Encoding longer than the JIT's prepared max_seq. Catch it here
+    // rather than silently truncating inside pack_*.
+    if let Some(got) = batch.iter().map(|e| e.input_ids.len()).find(|&n| n > max_seq) {
+        return Err(SequenceTooLongSnafu { stage, got, max: max_seq }.build());
     }
 
     pack_ids_buffer(jit.input_ids_mut().context(JitSnafu)?, batch, max_seq).context(DeviceSnafu)?;

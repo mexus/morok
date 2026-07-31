@@ -113,7 +113,7 @@ impl Encoder for StubEmbed {
         Ok((values, prof))
     }
     fn attach(chunk: &TextChunk, out: Embedding) -> ChunkEmbedding {
-        ChunkEmbedding { byte_offset: chunk.byte_offset, values: out }
+        ChunkEmbedding { byte_offset: chunk.byte_offset, values: out.values }
     }
 }
 
@@ -355,11 +355,11 @@ fn sliding_pipeline_produces_per_window_embeddings() {
     let out = p.embed_default("ignored").unwrap();
     assert_eq!(out.chunks.len(), 3);
     assert_eq!(out.chunks[0].byte_offset, 0);
-    assert_eq!(out.chunks[0].values.values, vec![10.0, 20.0, 30.0]);
+    assert_eq!(out.chunks[0].values, vec![10.0, 20.0, 30.0]);
     assert_eq!(out.chunks[1].byte_offset, 2);
-    assert_eq!(out.chunks[1].values.values, vec![30.0, 40.0, 50.0]);
+    assert_eq!(out.chunks[1].values, vec![30.0, 40.0, 50.0]);
     assert_eq!(out.chunks[2].byte_offset, 4);
-    assert_eq!(out.chunks[2].values.values, vec![50.0, 60.0]);
+    assert_eq!(out.chunks[2].values, vec![50.0, 60.0]);
 }
 
 #[test]
@@ -407,7 +407,7 @@ fn pipeline_truncates_then_embeds() {
     assert_eq!(out.chunks.len(), 1);
     // byte_offset is threaded through from the chunker (TruncatingChunker → 0).
     assert_eq!(out.chunks[0].byte_offset, 0);
-    assert_eq!(out.chunks[0].values.values, vec![1.0, 2.0, 3.0, 4.0]);
+    assert_eq!(out.chunks[0].values, vec![1.0, 2.0, 3.0, 4.0]);
     assert!(out.profile.is_none(), "default options don't profile");
 }
 
@@ -685,9 +685,9 @@ fn batch_basic_three_texts() {
     assert!(out.profile.is_none(), "default options don't profile");
     // ByteTokenizer maps each byte to its value: "ab" → [97, 98], etc.
     assert_eq!(out.results[0].chunks.len(), 1);
-    assert_eq!(out.results[0].chunks[0].values.values, vec![97.0, 98.0]);
-    assert_eq!(out.results[1].chunks[0].values.values, vec![120.0, 121.0, 122.0]);
-    assert_eq!(out.results[2].chunks[0].values.values, vec![104.0, 101.0, 108.0, 108.0, 111.0]);
+    assert_eq!(out.results[0].chunks[0].values, vec![97.0, 98.0]);
+    assert_eq!(out.results[1].chunks[0].values, vec![120.0, 121.0, 122.0]);
+    assert_eq!(out.results[2].chunks[0].values, vec![104.0, 101.0, 108.0, 108.0, 111.0]);
 }
 
 #[test]
@@ -748,7 +748,7 @@ fn batch_sub_batches_when_chunks_exceed_max_batch() {
     assert_eq!(out.results.len(), 5);
     for (i, result) in out.results.iter().enumerate() {
         assert_eq!(result.chunks.len(), 1);
-        assert_eq!(result.chunks[0].values.values, vec![texts[i].as_bytes()[0] as f32]);
+        assert_eq!(result.chunks[0].values, vec![texts[i].as_bytes()[0] as f32]);
     }
 }
 
@@ -1400,6 +1400,140 @@ fn recognize_batch_results_match_individual_recognize_calls() {
             assert_eq!(b.special_tokens_mask, s.special_tokens_mask, "special_tokens_mask mismatch for text {i}");
         }
     }
+}
+
+// ─── chunk-level seam (run_chunks / *_chunks) ───────────────────────────────
+
+/// Build chunks outside any pipeline: a ByteTokenizer + a SlidingWindowChunker
+/// produce chunks we can then feed to multiple pipelines' chunk seams without
+/// retokenizing.
+fn shared_chunks() -> Vec<TextChunk> {
+    let mut tok = ByteTokenizer { max_seq: 8 };
+    let enc = tok.encode("abcdef").unwrap();
+    SlidingWindowChunker::new(3, 2).chunk(&enc).unwrap()
+}
+
+#[test]
+fn chunk_seam_reuses_chunks_across_embed_and_classify() {
+    // Tokenize + chunk once, then feed the SAME chunks to an embed and a
+    // classify pipeline. Both pipelines' own tokenizers/chunkers would ERROR
+    // if the seam touched them — proving the seam skips tokenize+chunk.
+    let chunks = shared_chunks();
+    assert_eq!(chunks.len(), 3, "abcdef / window=3 stride=2 → 3 windows");
+
+    let make_embed = || {
+        EncoderPipeline::new(
+            StubTokenizer { ids: vec![], max_seq: 3, error: true },
+            TruncatingChunker::new(3),
+            StubEmbed { hidden_size: 3, max_batch: 1, error: false },
+        )
+    };
+    let make_classify = || {
+        EncoderPipeline::new(
+            StubTokenizer { ids: vec![], max_seq: 3, error: true },
+            TruncatingChunker::new(3),
+            StubClassify { num_classes: 3, max_batch: 1, error: false },
+        )
+    };
+
+    let embeds = make_embed().embed_chunks_default(&chunks).unwrap();
+    let classes = make_classify().classify_chunks_default(&chunks).unwrap();
+
+    // Same byte_offsets, same chunk counts — geometry is shared.
+    assert_eq!(embeds.chunks.len(), classes.chunks.len());
+    for (e, c) in embeds.chunks.iter().zip(classes.chunks.iter()) {
+        assert_eq!(e.byte_offset, c.byte_offset);
+    }
+    // Different payloads (embed → values, classify → logits) but both derived
+    // from the same ids. Window 0 = [97, 98, 99] = 'abc'.
+    assert_eq!(embeds.chunks[0].values, vec![97.0, 98.0, 99.0]);
+    assert_eq!(classes.chunks[0].logits, vec![97.0, 98.0, 99.0]);
+    assert_eq!(embeds.chunks[1].byte_offset, 2);
+    assert_eq!(embeds.chunks[2].byte_offset, 4);
+}
+
+#[test]
+fn chunk_seam_feeds_one_encoding_through_two_chunkers() {
+    // Tokenization caching: encode once, chunk with two different chunkers,
+    // feed each chunk set through the seam independently.
+    let mut tok = ByteTokenizer { max_seq: 8 };
+    let enc = tok.encode("abcdef").unwrap();
+    let truncated = TruncatingChunker::new(4).chunk(&enc).unwrap();
+    let windowed = SlidingWindowChunker::new(3, 2).chunk(&enc).unwrap();
+    assert_eq!(truncated.len(), 1);
+    assert_eq!(windowed.len(), 3);
+
+    let mut p = EncoderPipeline::new(
+        StubTokenizer { ids: vec![], max_seq: 8, error: true },
+        TruncatingChunker::new(8),
+        StubEmbed { hidden_size: 8, max_batch: 8, error: false },
+    );
+    let t = p.embed_chunks_default(&truncated).unwrap();
+    assert_eq!(t.chunks.len(), 1);
+    assert_eq!(t.chunks[0].values, vec![97.0, 98.0, 99.0, 100.0]); // abcd
+
+    let w = p.embed_chunks_default(&windowed).unwrap();
+    assert_eq!(w.chunks.len(), 3);
+    assert_eq!(w.chunks[0].values, vec![97.0, 98.0, 99.0]);
+}
+
+#[test]
+fn chunk_seam_batch_preserves_per_text_grouping() {
+    // Pre-built per-text chunk lists through the batch seam.
+    let chunks_a = shared_chunks(); // "abcdef" → 3 windows
+    let chunks_b = {
+        let mut tok = ByteTokenizer { max_seq: 4 };
+        let enc = tok.encode("ab").unwrap();
+        TruncatingChunker::new(4).chunk(&enc).unwrap()
+    }; // "ab" → 1 chunk
+
+    let per_text = vec![chunks_a.clone(), chunks_b.clone()];
+    let mut p = EncoderPipeline::new(
+        StubTokenizer { ids: vec![], max_seq: 4, error: true },
+        TruncatingChunker::new(4),
+        StubEmbed { hidden_size: 4, max_batch: 8, error: false },
+    );
+    let out = p.embed_chunks_batch_default(&per_text).unwrap();
+    assert_eq!(out.results.len(), 2);
+    assert_eq!(out.results[0].chunks.len(), 3);
+    assert_eq!(out.results[1].chunks.len(), 1);
+    // Same byte_offsets as the single-text seam.
+    assert_eq!(out.results[0].chunks[0].byte_offset, chunks_a[0].byte_offset);
+    assert_eq!(out.results[1].chunks[0].values, vec![97.0, 98.0]); // ab
+}
+
+#[test]
+fn chunk_seam_matches_full_pipeline_output() {
+    // The seam over chunks the chunker produced must equal the full
+    // tokenize→chunk→embed path — the seam is the encoder half, factored out.
+    let mut full = EncoderPipeline::new(
+        ByteTokenizer { max_seq: 3 },
+        SlidingWindowChunker::new(3, 2),
+        StubEmbed { hidden_size: 3, max_batch: 1, error: false },
+    );
+    let direct = full.embed_default("abcdef").unwrap();
+
+    // Now feed the same chunks (rebuilt identically) through the seam.
+    let chunks = shared_chunks();
+    let via_seam = full.embed_chunks_default(&chunks).unwrap();
+
+    assert_eq!(direct.chunks.len(), via_seam.chunks.len());
+    for (d, s) in direct.chunks.iter().zip(via_seam.chunks.iter()) {
+        assert_eq!(d.byte_offset, s.byte_offset);
+        assert_eq!(d.values, s.values);
+    }
+}
+
+#[test]
+fn chunk_seam_empty_chunks_returns_empty_no_encode() {
+    // Zero chunks → the encoder never runs (the stub would error if it did).
+    let mut p = EncoderPipeline::new(
+        StubTokenizer { ids: vec![], max_seq: 4, error: true },
+        TruncatingChunker::new(4),
+        StubEmbed { hidden_size: 4, max_batch: 1, error: true },
+    );
+    let out = p.embed_chunks_default(&[]).unwrap();
+    assert!(out.chunks.is_empty());
 }
 
 // ─── labels_for_tokens / group_spans decoding ───────────────────────────────

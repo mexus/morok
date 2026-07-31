@@ -140,6 +140,20 @@ fn batch_over_max_batch_is_rejected() {
     assert!(matches!(err, crate::modernbert::HeadError::CapacityExceeded { .. }));
 }
 
+/// An encoding longer than the prepared `max_seq` is rejected
+/// (SequenceTooLong), not silently truncated — the guard is reachable via the
+/// public chunk seam, which lets a caller feed pre-built chunks that bypass the
+/// chunker's length bound.
+#[test]
+#[ignore = "heavy: 2-layer ModernBERT JIT graph compile through the CPU backend"]
+fn sequence_over_max_seq_is_rejected() {
+    let mut emb = embedder();
+    let ids: Vec<u32> = (1..=MAX_SEQ as u32 + 1).collect();
+    let e = encoding(&ids, 0);
+    let err = emb.run_batch(&[&e], false).unwrap_err();
+    assert!(matches!(err, crate::modernbert::HeadError::SequenceTooLong { .. }));
+}
+
 /// An empty batch is a no-op returning no embeddings (mirrors the pipeline's
 /// zero-chunk guard).
 #[test]

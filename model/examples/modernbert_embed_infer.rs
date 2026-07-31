@@ -80,7 +80,7 @@ where
 
     println!("  {} chunk(s)", result.chunks.len());
     for (i, chunk) in result.chunks.iter().enumerate() {
-        let v = &chunk.values.values;
+        let v = &chunk.values;
         println!(
             "  chunk {i} @ byte {}: dim={} | L2={:.4} | first 5: {:?}",
             chunk.byte_offset,

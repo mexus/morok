@@ -84,7 +84,7 @@ impl Encoder for ModernBertEmbedder {
     }
 
     fn attach(chunk: &TextChunk, out: Embedding) -> ChunkEmbedding {
-        ChunkEmbedding { byte_offset: chunk.byte_offset, values: out }
+        ChunkEmbedding { byte_offset: chunk.byte_offset, values: out.values }
     }
 }
 

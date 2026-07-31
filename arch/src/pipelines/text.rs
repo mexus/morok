@@ -43,17 +43,19 @@ pub struct Embedding {
     pub values: Vec<f32>,
 }
 
-/// One [`Embedding`] paired with the byte position where its source
+/// One finished embedding paired with the byte position where its source
 /// [`TextChunk`] began in the original text — the per-chunk pipeline result,
 /// mirroring how [`audio`](super::audio)'s `ChunkResult` carries `start_sec`/`end_sec` alongside
 /// its decoded payload. `byte_offset` lets [`SlidingWindowChunker`] (or a token
 /// classification pipeline) tell windows apart and re-base per-token byte spans
 /// back to the source — the same field the chunker already records on
-/// [`TextChunk`], now threaded through to the output.
+/// [`TextChunk`], now threaded through to the output. `values` is the pooled +
+/// normalized vector (the model returns it as [`Embedding`]; the chunk result
+/// flattens it for direct indexing).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ChunkEmbedding {
     pub byte_offset: usize,
-    pub values: Embedding,
+    pub values: Vec<f32>,
 }
 
 /// Aggregated pipeline output: one [`ChunkEmbedding`] per chunk, plus the
@@ -749,6 +751,55 @@ impl<T: Tokenizer, C: Chunker, M: Encoder> EncoderPipeline<T, C, M> {
         Ok((results, profile))
     }
 
+    /// Run pre-built [`TextChunk`]s through the encoder, skipping tokenize and
+    /// chunk entirely — the public chunk-level seam. Sub-batches to respect the
+    /// encoder's `max_batch` and attaches each chunk's source position via
+    /// [`Encoder::attach`]. Returns one [`Encoder::ChunkOutput`] per chunk (in
+    /// order) plus the encoder-only profile (no tokenize/chunk stages, since
+    /// those ran before this call).
+    ///
+    /// This is the cross-pipeline reuse path: tokenize + chunk once, then feed
+    /// the same `Vec<TextChunk>` to an embed, classify, and/or recognize
+    /// pipeline without retokenizing. Only the [`Encode`](EncoderPipelineError::Encode)
+    /// arm is reachable (tokenize/chunk already happened). The task verbs
+    /// ([`embed_chunks`](Self::embed_chunks) / [`classify_chunks`](Self::classify_chunks) /
+    /// [`recognize_chunks`](Self::recognize_chunks)) wrap this into the named
+    /// aggregate.
+    pub fn run_chunks(
+        &mut self,
+        chunks: &[TextChunk],
+        opts: RunOptions,
+    ) -> Result<ChunkOutputs<M>, PipelineError<T, C, M>> {
+        let (chunk_outs, prof) = self.run_chunks_flat(chunks, opts.profile).context(EncodeSnafu)?;
+        Ok((chunk_outs, prof))
+    }
+
+    /// Run pre-built per-text chunk lists through the encoder — the batch form
+    /// of [`run_chunks`](Self::run_chunks). Each text's chunks are encoded
+    /// (sub-batched to the encoder's `max_batch`), and the per-text chunk-result
+    /// vecs are returned in order alongside a shared batch-level profile that
+    /// accumulates every text's encoder run.
+    ///
+    /// For maximum throughput when the per-text chunk counts are small, flatten
+    /// the inputs into one `Vec<TextChunk>` and call [`run_chunks`](Self::run_chunks)
+    /// — that fills each sub-batch across text boundaries.
+    pub fn run_chunks_batch(
+        &mut self,
+        per_text: &[Vec<TextChunk>],
+        opts: RunOptions,
+    ) -> Result<BatchChunkOutputs<M>, PipelineError<T, C, M>> {
+        let mut results = Vec::with_capacity(per_text.len());
+        let mut merged_prof: Option<RunProfile> = None;
+        for chunks in per_text {
+            let (chunk_outs, prof) = self.run_chunks_flat(chunks, opts.profile).context(EncodeSnafu)?;
+            if let Some(p) = prof {
+                merged_prof.get_or_insert_with(RunProfile::default).merge(p);
+            }
+            results.push(chunk_outs);
+        }
+        Ok((results, merged_prof))
+    }
+
     pub fn tokenizer_mut(&mut self) -> &mut T {
         &mut self.tokenizer
     }
@@ -803,6 +854,44 @@ impl<T: Tokenizer, C: Chunker, M: Embed> EncoderPipeline<T, C, M> {
         self.embed_batch(texts, RunOptions::default())
     }
 
+    /// Embed pre-built chunks — the chunk-level seam, wrapped into
+    /// [`Embeddings`]. See [`run_chunks`](Self::run_chunks).
+    pub fn embed_chunks(
+        &mut self,
+        chunks: &[TextChunk],
+        opts: RunOptions,
+    ) -> Result<Embeddings, PipelineError<T, C, M>> {
+        let (chunk_outs, profile) = self.run_chunks(chunks, opts)?;
+        Ok(Embeddings { chunks: chunk_outs, profile })
+    }
+
+    /// [`embed_chunks`](Self::embed_chunks) with default [`RunOptions`].
+    pub fn embed_chunks_default(&mut self, chunks: &[TextChunk]) -> Result<Embeddings, PipelineError<T, C, M>> {
+        self.embed_chunks(chunks, RunOptions::default())
+    }
+
+    /// Embed pre-built per-text chunk lists — the batch chunk-level seam, wrapped
+    /// into [`BatchEmbeddings`]. See
+    /// [`run_chunks_batch`](Self::run_chunks_batch).
+    pub fn embed_chunks_batch(
+        &mut self,
+        per_text: &[Vec<TextChunk>],
+        opts: RunOptions,
+    ) -> Result<BatchEmbeddings, PipelineError<T, C, M>> {
+        let (per_text_outs, profile) = self.run_chunks_batch(per_text, opts)?;
+        let results = per_text_outs.into_iter().map(|chunks| Embeddings { chunks, profile: None }).collect();
+        Ok(BatchEmbeddings { results, profile })
+    }
+
+    /// [`embed_chunks_batch`](Self::embed_chunks_batch) with default
+    /// [`RunOptions`].
+    pub fn embed_chunks_batch_default(
+        &mut self,
+        per_text: &[Vec<TextChunk>],
+    ) -> Result<BatchEmbeddings, PipelineError<T, C, M>> {
+        self.embed_chunks_batch(per_text, RunOptions::default())
+    }
+
     /// Typed accessor for the embedder (the [`Embed`] model).
     pub fn embedder_mut(&mut self) -> &mut M {
         &mut self.model
@@ -840,6 +929,44 @@ impl<T: Tokenizer, C: Chunker, M: Classify> EncoderPipeline<T, C, M> {
     /// [`classify_batch`](Self::classify_batch) with default [`RunOptions`].
     pub fn classify_batch_default(&mut self, texts: &[&str]) -> Result<BatchClassifications, PipelineError<T, C, M>> {
         self.classify_batch(texts, RunOptions::default())
+    }
+
+    /// Classify pre-built chunks — the chunk-level seam, wrapped into
+    /// [`Classifications`]. See [`run_chunks`](Self::run_chunks).
+    pub fn classify_chunks(
+        &mut self,
+        chunks: &[TextChunk],
+        opts: RunOptions,
+    ) -> Result<Classifications, PipelineError<T, C, M>> {
+        let (chunk_outs, profile) = self.run_chunks(chunks, opts)?;
+        Ok(Classifications { chunks: chunk_outs, profile })
+    }
+
+    /// [`classify_chunks`](Self::classify_chunks) with default [`RunOptions`].
+    pub fn classify_chunks_default(&mut self, chunks: &[TextChunk]) -> Result<Classifications, PipelineError<T, C, M>> {
+        self.classify_chunks(chunks, RunOptions::default())
+    }
+
+    /// Classify pre-built per-text chunk lists — the batch chunk-level seam,
+    /// wrapped into [`BatchClassifications`]. See
+    /// [`run_chunks_batch`](Self::run_chunks_batch).
+    pub fn classify_chunks_batch(
+        &mut self,
+        per_text: &[Vec<TextChunk>],
+        opts: RunOptions,
+    ) -> Result<BatchClassifications, PipelineError<T, C, M>> {
+        let (per_text_outs, profile) = self.run_chunks_batch(per_text, opts)?;
+        let results = per_text_outs.into_iter().map(|chunks| Classifications { chunks, profile: None }).collect();
+        Ok(BatchClassifications { results, profile })
+    }
+
+    /// [`classify_chunks_batch`](Self::classify_chunks_batch) with default
+    /// [`RunOptions`].
+    pub fn classify_chunks_batch_default(
+        &mut self,
+        per_text: &[Vec<TextChunk>],
+    ) -> Result<BatchClassifications, PipelineError<T, C, M>> {
+        self.classify_chunks_batch(per_text, RunOptions::default())
     }
 
     /// Typed accessor for the classifier (the [`Classify`] model).
@@ -883,6 +1010,47 @@ impl<T: Tokenizer, C: Chunker, M: Recognize> EncoderPipeline<T, C, M> {
         texts: &[&str],
     ) -> Result<BatchTokenClassifications, PipelineError<T, C, M>> {
         self.recognize_batch(texts, RunOptions::default())
+    }
+
+    /// Recognize pre-built chunks — the chunk-level seam, wrapped into
+    /// [`TokenClassifications`]. See [`run_chunks`](Self::run_chunks).
+    pub fn recognize_chunks(
+        &mut self,
+        chunks: &[TextChunk],
+        opts: RunOptions,
+    ) -> Result<TokenClassifications, PipelineError<T, C, M>> {
+        let (chunk_outs, profile) = self.run_chunks(chunks, opts)?;
+        Ok(TokenClassifications { chunks: chunk_outs, profile })
+    }
+
+    /// [`recognize_chunks`](Self::recognize_chunks) with default [`RunOptions`].
+    pub fn recognize_chunks_default(
+        &mut self,
+        chunks: &[TextChunk],
+    ) -> Result<TokenClassifications, PipelineError<T, C, M>> {
+        self.recognize_chunks(chunks, RunOptions::default())
+    }
+
+    /// Recognize pre-built per-text chunk lists — the batch chunk-level seam,
+    /// wrapped into [`BatchTokenClassifications`]. See
+    /// [`run_chunks_batch`](Self::run_chunks_batch).
+    pub fn recognize_chunks_batch(
+        &mut self,
+        per_text: &[Vec<TextChunk>],
+        opts: RunOptions,
+    ) -> Result<BatchTokenClassifications, PipelineError<T, C, M>> {
+        let (per_text_outs, profile) = self.run_chunks_batch(per_text, opts)?;
+        let results = per_text_outs.into_iter().map(|chunks| TokenClassifications { chunks, profile: None }).collect();
+        Ok(BatchTokenClassifications { results, profile })
+    }
+
+    /// [`recognize_chunks_batch`](Self::recognize_chunks_batch) with default
+    /// [`RunOptions`].
+    pub fn recognize_chunks_batch_default(
+        &mut self,
+        per_text: &[Vec<TextChunk>],
+    ) -> Result<BatchTokenClassifications, PipelineError<T, C, M>> {
+        self.recognize_chunks_batch(per_text, RunOptions::default())
     }
 
     /// Typed accessor for the recognizer (the [`Recognize`] model).
