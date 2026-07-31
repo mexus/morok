@@ -207,8 +207,8 @@ impl From<tokenizers::Error> for HfTokenizerError {
 /// policy, so [`SlidingWindowChunker`] can still see the full token stream.
 ///
 /// HF fetching (`from_hub(repo)`) is intentionally absent here — `hf-hub` lives
-/// in `svod-model`, which fetches `tokenizer.json` and hands the bytes to
-/// [`from_bytes`](HfTokenizer::from_bytes).
+/// in `svod-model`, which fetches `tokenizer.json` and hands the cached path to
+/// [`from_path`](HfTokenizer::from_path).
 pub struct HfTokenizer {
     inner: tokenizers::Tokenizer,
 }
