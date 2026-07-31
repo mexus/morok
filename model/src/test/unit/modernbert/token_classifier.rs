@@ -6,7 +6,7 @@
 
 use std::sync::{LazyLock, Mutex, MutexGuard};
 
-use svod_arch::pipelines::text::{EncoderHead, Encoding, ClassifyTokens, TokenClassification};
+use svod_arch::pipelines::text::{ClassifyTokens, EncoderHead, Encoding, TokenClassification};
 
 use crate::modernbert::{ModernBertTokenClassificationModel, ModernBertTokenClassifier};
 use crate::test::unit::modernbert::model::tiny_cfg;

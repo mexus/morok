@@ -7,8 +7,7 @@ use crate::pipelines::text::{
     Classification, Classify, ClassifyTokens, Embed, Embedding, EncoderHead, EncoderPipeline, EncoderPipelineError,
     Encoding, HfTokenizer, HfTokenizerError, RunOptions, RunProfile, Scheme, SlidingWindowChunker,
     SlidingWindowChunkerError, TextChunk, TokenClassification, TokenLabel, Tokenizer, TruncatingChunker,
-    TruncatingChunkerError, argmax,
-    group_spans, group_spans_document, labels_for_tokens, softmax,
+    TruncatingChunkerError, argmax, group_spans, group_spans_document, labels_for_tokens, softmax,
 };
 
 fn enc(ids: &[u32]) -> Encoding {
@@ -230,10 +229,7 @@ fn truncating_new_rejects_zero() {
 
 #[test]
 fn truncating_try_new_rejects_invalid_args() {
-    assert!(matches!(
-        TruncatingChunker::try_new(0).unwrap_err(),
-        TruncatingChunkerError::MaxSeqTooSmall
-    ));
+    assert!(matches!(TruncatingChunker::try_new(0).unwrap_err(), TruncatingChunkerError::MaxSeqTooSmall));
 }
 
 #[test]
@@ -375,14 +371,8 @@ fn sliding_new_rejects_stride_above_window() {
 #[test]
 fn sliding_try_new_rejects_invalid_args() {
     assert!(matches!(SlidingWindowChunker::try_new(0, 1).unwrap_err(), SlidingWindowChunkerError::WindowTooSmall));
-    assert!(matches!(
-        SlidingWindowChunker::try_new(4, 0).unwrap_err(),
-        SlidingWindowChunkerError::StrideOutOfRange
-    ));
-    assert!(matches!(
-        SlidingWindowChunker::try_new(4, 5).unwrap_err(),
-        SlidingWindowChunkerError::StrideOutOfRange
-    ));
+    assert!(matches!(SlidingWindowChunker::try_new(4, 0).unwrap_err(), SlidingWindowChunkerError::StrideOutOfRange));
+    assert!(matches!(SlidingWindowChunker::try_new(4, 5).unwrap_err(), SlidingWindowChunkerError::StrideOutOfRange));
 }
 
 #[test]
@@ -1741,9 +1731,15 @@ fn group_spans_bio_breaks_on_type_change() {
     assert_eq!(spans.len(), 2);
     // Single-token spans carry the token's softmax score; check structure + that
     // the score propagated (rather than hardcoding the one-hot softmax value).
-    assert_eq!((spans[0].label.as_str(), spans[0].label_id, spans[0].start, spans[0].end, spans[0].token_range.clone()), ("PER", 1, 0, 3, 0..1));
+    assert_eq!(
+        (spans[0].label.as_str(), spans[0].label_id, spans[0].start, spans[0].end, spans[0].token_range.clone()),
+        ("PER", 1, 0, 3, 0..1)
+    );
     assert_eq!(spans[0].score, labels[0].score);
-    assert_eq!((spans[1].label.as_str(), spans[1].label_id, spans[1].start, spans[1].end, spans[1].token_range.clone()), ("LOC", 4, 3, 6, 1..2));
+    assert_eq!(
+        (spans[1].label.as_str(), spans[1].label_id, spans[1].start, spans[1].end, spans[1].token_range.clone()),
+        ("LOC", 4, 3, 6, 1..2)
+    );
     assert_eq!(spans[1].score, labels[1].score);
 }
 

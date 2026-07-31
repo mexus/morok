@@ -438,10 +438,7 @@ impl Chunker for SlidingWindowChunker {
 
         let specials = lead + trail;
         let content_window = self.window.saturating_sub(specials);
-        ensure!(
-            content_window >= 1,
-            WindowTooSmallForSpecialsSnafu { window: self.window, specials }
-        );
+        ensure!(content_window >= 1, WindowTooSmallForSpecialsSnafu { window: self.window, specials });
 
         let step = self.stride.min(content_window);
 
@@ -810,7 +807,11 @@ impl<T: Tokenizer, C: Chunker, M: EncoderHead> EncoderPipeline<T, C, M> {
     /// cross-pipeline reuse path (tokenize + chunk once, feed the same
     /// `Vec<TextChunk>` to several pipelines). Only the
     /// [`Encode`](EncoderPipelineError::Encode) arm is reachable here.
-    fn run_chunks(&mut self, chunks: &[TextChunk], opts: RunOptions) -> Result<ModelOutputs<M>, PipelineError<T, C, M>> {
+    fn run_chunks(
+        &mut self,
+        chunks: &[TextChunk],
+        opts: RunOptions,
+    ) -> Result<ModelOutputs<M>, PipelineError<T, C, M>> {
         self.run_chunks_flat(chunks, opts.profile).context(EncodeSnafu)
     }
 
@@ -867,11 +868,7 @@ impl<T: Tokenizer, C: Chunker, M: EncoderHead> EncoderPipeline<T, C, M> {
 /// Pair finished embeddings with their source chunks' byte offsets — the
 /// position-attachment step the embed facade runs after [`EncoderPipeline::run_single_inner`].
 fn attach_embed(outputs: Vec<Embedding>, chunks: &[TextChunk]) -> Vec<ChunkEmbedding> {
-    chunks
-        .iter()
-        .zip(outputs)
-        .map(|(c, o)| ChunkEmbedding { byte_offset: c.byte_offset, values: o.values })
-        .collect()
+    chunks.iter().zip(outputs).map(|(c, o)| ChunkEmbedding { byte_offset: c.byte_offset, values: o.values }).collect()
 }
 
 /// Pair class logits with their source chunks' byte offsets — the classify facade's
@@ -900,7 +897,6 @@ fn attach_token(outputs: Vec<TokenClassification>, chunks: &[TextChunk]) -> Vec<
         })
         .collect()
 }
-
 
 impl<T: Tokenizer, C: Chunker, M: Embed> EncoderPipeline<T, C, M> {
     /// Tokenize → chunk → embed → assemble profile. See
@@ -971,7 +967,11 @@ impl<T: Tokenizer, C: Chunker, M: Classify> EncoderPipeline<T, C, M> {
     /// Tokenize → chunk → classify → assemble profile. See
     /// [`run_single_inner`](Self::run_single_inner) for the [`RunOptions`] /
     /// profile semantics.
-    pub fn classify(&mut self, text: &str, opts: impl Into<RunOptions>) -> Result<Classifications, PipelineError<T, C, M>> {
+    pub fn classify(
+        &mut self,
+        text: &str,
+        opts: impl Into<RunOptions>,
+    ) -> Result<Classifications, PipelineError<T, C, M>> {
         let opts = opts.into();
         let (outputs, chunks, profile) = self.run_single_inner(text, opts)?;
         Ok(Classifications { chunks: attach_classify(outputs, &chunks), profile })

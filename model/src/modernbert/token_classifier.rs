@@ -14,7 +14,7 @@
 //! ([`prediction_head_tail`]); the two heads differ only in pooling.
 
 use snafu::ResultExt;
-use svod_arch::pipelines::text::{EncoderHead, Encoding, ClassifyTokens, RunProfile, TokenClassification};
+use svod_arch::pipelines::text::{ClassifyTokens, EncoderHead, Encoding, RunProfile, TokenClassification};
 use svod_tensor::{BoundVariable, PrepareConfig, Tensor};
 
 use crate::jit::InputSpec;
@@ -115,7 +115,8 @@ impl EncoderHead for ModernBertTokenClassifier {
         batch: &[&Encoding],
         profile: bool,
     ) -> std::result::Result<(Vec<TokenClassification>, Option<RunProfile>), HeadError> {
-        let (b, flat, prof) = execute_head(&mut self.jit, batch, self.max_batch, self.max_seq, profile, "classify_tokens")?;
+        let (b, flat, prof) =
+            execute_head(&mut self.jit, batch, self.max_batch, self.max_seq, profile, "classify_tokens")?;
         // Output is row-major `(B, max_seq, num_labels)`; each chunk occupies a
         // `max_seq`-wide row slab. Slice to each chunk's live token count so the
         // returned grid is `(seq_len, num_labels)` — padding positions dropped.

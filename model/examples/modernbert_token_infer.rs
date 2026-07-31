@@ -20,7 +20,7 @@ use std::time::Instant;
 use clap::Parser;
 
 use svod_arch::pipelines::text::{
-    EncoderHead, EncoderPipeline, ClassifyTokens, RunOptions, Scheme, TruncatingChunker, group_spans, labels_for_tokens,
+    ClassifyTokens, EncoderHead, EncoderPipeline, RunOptions, Scheme, TruncatingChunker, group_spans, labels_for_tokens,
 };
 use svod_dtype::DType;
 use svod_model::modernbert;
@@ -106,7 +106,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("  {} chunk(s)", result.chunks.len());
     for (i, chunk) in result.chunks.iter().enumerate() {
-        let tokens = labels_for_tokens(chunk, &label_of);
+        let tokens = labels_for_tokens(chunk, label_of);
         println!("  chunk {i} @ byte {}: {} content token(s)", chunk.byte_offset, tokens.len());
         for tok in &tokens {
             let surface = text.get(tok.start..tok.end).unwrap_or("<oob>");

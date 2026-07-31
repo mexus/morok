@@ -59,7 +59,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let args = Args::parse();
     let texts: Vec<String> = if args.text.is_empty() {
-        io::stdin().lock().lines().filter_map(Result::ok).filter(|l| !l.is_empty()).collect()
+        io::stdin().lock().lines().map_while(Result::ok).filter(|l| !l.is_empty()).collect()
     } else {
         args.text
     };
