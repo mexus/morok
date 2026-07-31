@@ -20,7 +20,7 @@ mod pooling;
 mod rotary;
 
 pub use attention::ModernBertAttention;
-pub use config::{ModernBertConfig, modernbert_base, modernbert_large};
+pub use config::ModernBertConfig;
 pub use encoder::Encoder;
 pub use encoder_layer::EncoderLayer;
 pub use error::{Error, Result};
