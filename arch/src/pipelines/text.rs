@@ -4,8 +4,7 @@
 //! [`EncoderHead`] supertrait — [`Embed`] / [`Classify`] / [`ClassifyTokens`] are thin
 //! specializations that fix the per-chunk output kind — and the heavy machinery
 //! (sub-batching, truncation geometry, profile assembly, span decoding) lives in
-//! trait defaults and free functions here. This is the sibling of
-//! [`audio`](super::audio); read that module first — the shape is deliberate.
+//! trait defaults and free functions here.
 //!
 //! ```text
 //! Tokenizer::encode ─▶ Encoding ─▶ [TextChunk]            (Chunker)
@@ -18,9 +17,7 @@
 //! ```
 //!
 //! Text crosses the boundary as `&str`, token ids as `&[u32]`: this crate stays
-//! free of the Tensor/device stack. The model owns ids → device internally —
-//! exactly as [`audio`](super::audio)'s [`Transcriber`](super::audio::Transcriber)
-//! owns audio → mel → device.
+//! free of the Tensor/device stack. The model owns ids → device internally.
 //!
 //! ## Design rationale
 //!
@@ -35,8 +32,7 @@
 //! **Host-side and model-agnostic.** This crate never touches the Tensor/device
 //! stack (text in as `&str`, ids as `&[u32]`, outputs as plain `Vec<f32>`), so
 //! one assembled pipeline is reusable across any encoder backend; the model owns
-//! the ids → device step — exactly the split [`audio`](super::audio) takes with
-//! audio → mel.
+//! the ids → device step.
 //!
 //! **Chunk seam.** The verb `_chunks` variants feed pre-built [`TextChunk`]s,
 //! skipping tokenize/chunk entirely — tokenize once, then reuse the same chunks
@@ -63,9 +59,8 @@ pub struct Embedding {
 }
 
 /// One finished embedding paired with the byte position where its source
-/// [`TextChunk`] began in the original text — the per-chunk pipeline result,
-/// mirroring how [`audio`](super::audio)'s `ChunkResult` carries `start_sec`/`end_sec` alongside
-/// its decoded payload. `byte_offset` lets [`SlidingWindowChunker`] (or a token
+/// [`TextChunk`] began in the original text — the per-chunk pipeline result.
+/// `byte_offset` lets [`SlidingWindowChunker`] (or a token
 /// classification pipeline) tell windows apart and re-base per-token byte spans
 /// back to the source — the same field the chunker already records on
 /// [`TextChunk`], now threaded through to the output. `values` is the pooled +
@@ -79,7 +74,7 @@ pub struct ChunkEmbedding {
 
 /// Aggregated pipeline output: one [`ChunkEmbedding`] per chunk, plus the
 /// optional per-stage [`RunProfile`] the encoder collected. Profile stages are
-/// free-form and extensible (see [`audio`](super::audio)).
+/// free-form and extensible.
 #[derive(Debug, Default)]
 pub struct Embeddings {
     pub chunks: Vec<ChunkEmbedding>,
@@ -99,7 +94,7 @@ pub struct BatchEmbeddings {
 
 /// Per-call run switch, orthogonal to a pipeline's construction config
 /// (sizing). Defaults to `false`, so one built pipeline serves profiled and
-/// unprofiled runs without rebuilding — mirroring [`audio::RunOptions`](super::audio::RunOptions).
+/// unprofiled runs without rebuilding.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct RunOptions {
     /// Collect a per-stage [`RunProfile`] on [`Embeddings::profile`].
@@ -156,8 +151,7 @@ impl Encoding {
 // ─── Tokenizer ──────────────────────────────────────────────────────────────
 
 /// Text → [`Encoding`]. Implement [`encode`](Tokenizer::encode) (the primary
-/// op); [`encode_batch`](Tokenizer::encode_batch) defaults to looping it. The
-/// analog of [`audio::Vad`](super::audio::Vad).
+/// op); [`encode_batch`](Tokenizer::encode_batch) defaults to looping it.
 pub trait Tokenizer {
     type Error: std::error::Error + 'static;
 
@@ -251,16 +245,14 @@ impl Tokenizer for HfTokenizer {
 
 /// One chunked slice of an [`Encoding`], plus the byte offset where it begins
 /// in the source text. `byte_offset` lets a future token-classification
-/// pipeline re-base per-token byte spans back to the original text — same role
-/// as [`AudioChunk`'s](crate::vad::AudioChunk) sample offsets for word crop.
+/// pipeline re-base per-token byte spans back to the original text.
 #[derive(Clone, Debug)]
 pub struct TextChunk {
     pub encoding: Encoding,
     pub byte_offset: usize,
 }
 
-/// Turns an [`Encoding`] into ordered [`TextChunk`]s. The analog of
-/// [`audio::Splitter`](super::audio::Splitter); [`EncoderPipeline`] is
+/// Turns an [`Encoding`] into ordered [`TextChunk`]s; [`EncoderPipeline`] is
 /// generic over it.
 pub trait Chunker {
     type Error: std::error::Error + 'static;
@@ -574,8 +566,7 @@ pub struct BatchTokenClassifications {
 /// model output with its chunk's source position is the pipeline's job, not the
 /// model's — the verb facades ([`EncoderPipeline::embed`] / [`classify`] /
 /// [`classify_tokens`]) do it from the chunk + output types, so a model implements only
-/// its irreducible part. The analog of
-/// [`audio::Transcriber`](super::audio::Transcriber).
+/// its irreducible part.
 ///
 /// [`classify`]: EncoderPipeline::classify
 /// [`classify_tokens`]: EncoderPipeline::classify_tokens
@@ -587,8 +578,7 @@ pub trait EncoderHead {
 
     /// `(max_batch, max_seq)` the JIT was prepared for. Informational; the
     /// pipeline sizes the JIT from the chunker's `max_seq` at assembly, so these
-    /// are consistent by construction (mirrors how [`audio`](super::audio)'s
-    /// transcriber is sized from the splitter's chunk ceiling).
+    /// are consistent by construction.
     fn capacity(&self) -> (usize, usize);
 
     /// Run every chunk through the model (the model owns its batching/padding),
@@ -640,8 +630,7 @@ pub trait ClassifyTokens: EncoderHead<Output = TokenClassification> {
 /// for "how do I embed" still finds a named verb. Build with
 /// [`assemble`](EncoderPipeline::assemble) to size the (eagerly-JIT-prepared)
 /// encoder from the chunker's `max_seq`, or [`new`](EncoderPipeline::new) to
-/// compose three already-built parts. The analog of
-/// [`audio::Asr`](super::audio::Asr).
+/// compose three already-built parts.
 pub struct EncoderPipeline<T: Tokenizer, C: Chunker, M: EncoderHead> {
     tokenizer: T,
     chunker: C,
@@ -734,8 +723,7 @@ impl<T: Tokenizer, C: Chunker, M: EncoderHead> EncoderPipeline<T, C, M> {
     /// per-call switch: the same pipeline serves profiled and unprofiled runs
     /// without rebuilding. When `opts.profile` is set, the tokenize and chunk
     /// stages are timed and recorded ahead of the encoder's stages — so the
-    /// profile leads with `[tokenize, <chunker label>, <encoder …>]`, exactly as
-    /// [`audio::Asr::transcribe`](super::audio::Asr::transcribe) prepends `vad`.
+    /// profile leads with `[tokenize, <chunker label>, <encoder …>]`.
     fn run_single_inner(&mut self, text: &str, opts: RunOptions) -> Result<SingleRun<M>, PipelineError<T, C, M>> {
         let t = Instant::now();
         let encoding = self.tokenizer.encode(text).context(TokenizeSnafu)?;
