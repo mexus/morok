@@ -11,7 +11,7 @@
 //! pool (cls or mean) → `head.dense` → GELU → `head.norm` → `classifier` linear.
 //! Fused into one JIT plan so the `(B, L, D)` activations stay on-device.
 
-use snafu::ResultExt;
+use snafu::{OptionExt, ResultExt};
 use svod_arch::pipelines::text::{Classification, Classify, EncoderHead, Encoding, RunProfile};
 use svod_dtype::DType;
 use svod_ir::SInt;
@@ -20,7 +20,7 @@ use svod_tensor::{BoundVariable, PrepareConfig, Tensor};
 use crate::init::fan_in_uniform;
 use crate::jit::InputSpec;
 use crate::modernbert::config::{ClassifierPooling, ModernBertConfig};
-use crate::modernbert::error::{Result, StateSnafu, TensorSnafu};
+use crate::modernbert::error::{MissingMaskSnafu, Result, StateSnafu, TensorSnafu};
 use crate::modernbert::head_jit::{HeadError, JitSnafu, execute_head};
 use crate::modernbert::masked_mean;
 use crate::modernbert::model::ModernBert;
@@ -137,7 +137,7 @@ impl ModernBertClassificationModel {
         b: &BoundVariable,
     ) -> Result<Tensor> {
         let hidden = self.backbone.forward_batch(input_ids, padding_mask, b)?;
-        let mask = padding_mask.expect("classification requires an attention mask");
+        let mask = padding_mask.context(MissingMaskSnafu { what: "classification" })?;
         classify_head(&hidden, mask, &self.head, self.pooling)
     }
 }

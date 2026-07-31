@@ -13,14 +13,14 @@
 //! logits row. It reuses the sequence-classification head's weights and IR tail
 //! ([`prediction_head_tail`]); the two heads differ only in pooling.
 
-use snafu::ResultExt;
+use snafu::{OptionExt, ResultExt};
 use svod_arch::pipelines::text::{ClassifyTokens, EncoderHead, Encoding, RunProfile, TokenClassification};
 use svod_tensor::{BoundVariable, PrepareConfig, Tensor};
 
 use crate::jit::InputSpec;
 use crate::modernbert::classifier::{ClassifierHead, prediction_head_tail};
 use crate::modernbert::config::ModernBertConfig;
-use crate::modernbert::error::{Result, StateSnafu};
+use crate::modernbert::error::{MissingMaskSnafu, Result, StateSnafu};
 use crate::modernbert::head_jit::{HeadError, JitSnafu, execute_head};
 use crate::modernbert::model::ModernBert;
 use crate::state::{HasStateDict, StateDict};
@@ -66,7 +66,7 @@ impl ModernBertTokenClassificationModel {
         padding_mask: Option<&Tensor>,
         b: &BoundVariable,
     ) -> Result<Tensor> {
-        let mask = padding_mask.expect("token classification requires an attention mask");
+        let mask = padding_mask.context(MissingMaskSnafu { what: "token classification" })?;
         let hidden = self.backbone.forward_batch(input_ids, Some(mask), b)?;
         prediction_head_tail(&hidden, &self.head)
     }
