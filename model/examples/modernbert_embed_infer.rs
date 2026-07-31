@@ -1,7 +1,7 @@
 //! ModernBERT embeddings inference demo.
 //!
 //! Loads a HuggingFace ModernBERT checkpoint (weights + tokenizer) in one call
-//! and runs a text input through an [`EmbeddingsPipeline`]: `HfTokenizer` →
+//! and runs a text input through an [`EncoderPipeline`]: `HfTokenizer` →
 //! chunker → `ModernBertEmbedder`. By default a `TruncatingChunker` is used;
 //! pass `--window` + `--stride` to switch to `SlidingWindowChunker` for
 //! long-document windowed embedding. This doubles as the runnable end-to-end

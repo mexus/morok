@@ -3,7 +3,7 @@
 //! per-token raw logits `(seq_len, num_labels)` per chunk.
 //!
 //! Implements `svod_arch::pipelines::text::Recognize` so it drops straight into
-//! a [`RecognizePipeline`](svod_arch::pipelines::text::RecognizePipeline). The
+//! an [`EncoderPipeline`](svod_arch::pipelines::text::EncoderPipeline). The
 //! model owns the forward + fused token head (via
 //! [`ModernBertTokenClassifierJit`]); the pipeline owns chunking, profile
 //! assembly, and span decoding (`labels_for_tokens` / `group_spans`).

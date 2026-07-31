@@ -1,7 +1,7 @@
 //! ModernBERT sentence classification demo.
 //!
 //! Loads a HuggingFace ModernBERT classification checkpoint (weights + tokenizer)
-//! in one call and runs a text input through a [`ClassifyPipeline`]:
+//! in one call and runs a text input through an [`EncoderPipeline`]:
 //! `HfTokenizer` → `TruncatingChunker` → `ModernBertClassifier`. Prints raw
 //! logits, argmax class, and softmax probabilities per chunk. The analog of
 //! `modernbert_embed_infer.rs` for classification.

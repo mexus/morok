@@ -1,8 +1,8 @@
 //! [`ModernBertClassifier`] — sequence classification over the ModernBERT
 //! backbone: `input_ids` + `attention_mask` → raw class logits `(B, num_labels)`.
 //!
-//! Implements `svod_arch::pipelines::text::Classify` so it drops straight into a
-//! [`ClassifyPipeline`](svod_arch::pipelines::text::ClassifyPipeline). The model
+//! Implements `svod_arch::pipelines::text::Classify` so it drops straight into an
+//! [`EncoderPipeline`](svod_arch::pipelines::text::EncoderPipeline). The model
 //! owns the forward + fused classification head (via
 //! [`ModernBertClassifierJit`]); the pipeline owns chunking and profile
 //! assembly.

@@ -1,7 +1,7 @@
 //! ModernBERT token classification demo (NER / POS / chunking).
 //!
 //! Loads a HuggingFace ModernBERT token-classification checkpoint (weights +
-//! tokenizer) in one call and runs a text input through a [`RecognizePipeline`]:
+//! tokenizer) in one call and runs a text input through an [`EncoderPipeline`]:
 //! `HfTokenizer` → `TruncatingChunker` → `ModernBertTokenClassifier`. Decodes
 //! per-token labels with [`labels_for_tokens`] and groups entity spans with
 //! [`group_spans`] under a chosen [`Scheme`]. The token-classification analog of
