@@ -169,6 +169,39 @@ impl Classify for StubClassify {
 #[snafu(display("stub classify error"))]
 struct StubClassifyError;
 
+/// Records the sequence of batch sizes handed to `run_batch` (then returns
+/// deterministic embeddings, ids as f32) — lets a test observe *how* the
+/// pipeline sub-batches (across text boundaries vs per-text), which the
+/// result-checking stubs (`StubEmbed`/`StubClassify`/`StubRecognize`) can't.
+struct BatchSpy {
+    sizes: Vec<usize>,
+    max_batch: usize,
+}
+
+impl EncoderHead for BatchSpy {
+    type Output = Embedding;
+    type Error = Infallible;
+    fn capacity(&self) -> (usize, usize) {
+        (self.max_batch, 0)
+    }
+    fn run_batch(
+        &mut self,
+        batch: &[&Encoding],
+        _profile: bool,
+    ) -> Result<(Vec<Self::Output>, Option<RunProfile>), Self::Error> {
+        self.sizes.push(batch.len());
+        let values =
+            batch.iter().map(|e| Embedding { values: e.input_ids.iter().map(|&id| id as f32).collect() }).collect();
+        Ok((values, None))
+    }
+}
+
+impl Embed for BatchSpy {
+    fn hidden_size(&self) -> usize {
+        0
+    }
+}
+
 /// Tokenizer that encodes each input character's byte value as a token id.
 /// Allows batch tests to distinguish which text produced which embedding —
 /// `"ab"` → ids `[97, 98]`, `"xyz"` → ids `[120, 121, 122]`, etc.
@@ -1477,6 +1510,12 @@ fn shared_chunks() -> Vec<TextChunk> {
     SlidingWindowChunker::new(3, 2).chunk(&enc).unwrap()
 }
 
+/// Build one [`TextChunk`] directly from ids (offsets count up, no specials) —
+/// full control over chunk count/geometry without going through a chunker.
+fn text_chunk(ids: &[u32], byte_offset: usize) -> TextChunk {
+    TextChunk { encoding: enc(ids), byte_offset }
+}
+
 #[test]
 fn chunk_seam_reuses_chunks_across_embed_and_classify() {
     // Tokenize + chunk once, then feed the SAME chunks to an embed and a
@@ -1598,6 +1637,144 @@ fn chunk_seam_empty_chunks_returns_empty_no_encode() {
     );
     let out = p.embed_chunks(&[], ()).unwrap();
     assert!(out.chunks.is_empty());
+}
+
+#[test]
+fn chunk_seam_batch_coalesces_chunks_across_text_boundaries() {
+    // Two texts, one chunk each; max_batch=2. Cross-text flattening fills ONE
+    // sub-batch of 2 — the regression guard for run_chunks_batch's cross-text
+    // sub-batching. The old per-text loop recorded [1, 1] (two one-element
+    // batches); the fix records [2] (one batch spanning both texts).
+    let per_text = vec![vec![text_chunk(&[10], 0)], vec![text_chunk(&[20], 0)]];
+    let mut p = EncoderPipeline::new(
+        StubTokenizer { ids: vec![], max_seq: 4, error: true }, // would fail if the seam tokenized
+        TruncatingChunker::new(4),
+        BatchSpy { sizes: Vec::new(), max_batch: 2 },
+    );
+    let out = p.embed_chunks_batch(&per_text, ()).unwrap();
+    assert_eq!(out.results.len(), 2);
+    assert_eq!(out.results[0].chunks[0].values, vec![10.0]);
+    assert_eq!(out.results[1].chunks[0].values, vec![20.0]);
+    assert_eq!(p.embedder_mut().sizes, vec![2], "one coalesced sub-batch across both texts");
+}
+
+#[test]
+fn chunk_seam_batch_sub_batches_across_text_boundaries_when_total_exceeds_max() {
+    // 3 chunks across 2 texts, max_batch=2 → sub-batches [2, 1], where the
+    // first batch spans BOTH texts (text A's chunk + text B's first chunk).
+    // Grouping is still re-split per text afterwards. Old per-text loop: [1, 2].
+    let per_text = vec![vec![text_chunk(&[10], 0)], vec![text_chunk(&[20], 0), text_chunk(&[30], 5)]];
+    let mut p = EncoderPipeline::new(
+        StubTokenizer { ids: vec![], max_seq: 4, error: true },
+        TruncatingChunker::new(4),
+        BatchSpy { sizes: Vec::new(), max_batch: 2 },
+    );
+    let out = p.embed_chunks_batch(&per_text, ()).unwrap();
+    assert_eq!(out.results.len(), 2);
+    assert_eq!(out.results[0].chunks.len(), 1);
+    assert_eq!(out.results[1].chunks.len(), 2);
+    // Per-text grouping preserved despite cross-boundary batching.
+    assert_eq!(out.results[0].chunks[0].values, vec![10.0]);
+    assert_eq!(out.results[1].chunks[0].values, vec![20.0]);
+    assert_eq!(out.results[1].chunks[1].values, vec![30.0]);
+    assert_eq!(out.results[1].chunks[1].byte_offset, 5);
+    assert_eq!(p.embedder_mut().sizes, vec![2, 1], "ceil(3/2) sub-batches, coalesced across texts");
+}
+
+#[test]
+fn classify_chunks_batch_preserves_grouping_and_skips_tokenize() {
+    // classify_chunks_batch: per-text grouping + logits, and the seam skips
+    // tokenize/chunk (the tokenizer would error if touched).
+    let per_text = vec![vec![text_chunk(&[1, 2], 0)], vec![text_chunk(&[3], 0), text_chunk(&[4, 5, 6], 9)]];
+    let mut p = EncoderPipeline::new(
+        StubTokenizer { ids: vec![], max_seq: 8, error: true },
+        TruncatingChunker::new(8),
+        StubClassify { num_labels: 8, max_batch: 8, error: false },
+    );
+    let out = p.classify_chunks_batch(&per_text, ()).unwrap();
+    assert_eq!(out.results.len(), 2);
+    assert_eq!(out.results[0].chunks.len(), 1);
+    assert_eq!(out.results[0].chunks[0].logits, vec![1.0, 2.0]);
+    assert_eq!(out.results[0].chunks[0].byte_offset, 0);
+    assert_eq!(out.results[1].chunks.len(), 2);
+    assert_eq!(out.results[1].chunks[0].logits, vec![3.0]);
+    assert_eq!(out.results[1].chunks[1].logits, vec![4.0, 5.0, 6.0]);
+    assert_eq!(out.results[1].chunks[1].byte_offset, 9);
+}
+
+#[test]
+fn classify_tokens_chunks_threads_per_token_geometry() {
+    // classify_tokens_chunks: the single-text seam threads per-token byte
+    // offsets, special_tokens_mask, and num_labels through from the chunk.
+    let chunks = vec![text_chunk(&[4, 5, 6], 0)];
+    let mut p = EncoderPipeline::new(
+        StubTokenizer { ids: vec![], max_seq: 4, error: true },
+        TruncatingChunker::new(4),
+        StubRecognize { num_labels: 3, max_batch: 1, error: false },
+    );
+    let out = p.classify_tokens_chunks(&chunks, ()).unwrap();
+    assert_eq!(out.chunks.len(), 1);
+    let c = &out.chunks[0];
+    assert_eq!(c.num_labels, 3);
+    assert_eq!(c.logits, vec![4.0, 4.0, 4.0, 5.0, 5.0, 5.0, 6.0, 6.0, 6.0]);
+    assert_eq!(c.token_offsets, vec![(0, 1), (1, 2), (2, 3)]);
+    assert_eq!(c.special_tokens_mask, vec![0, 0, 0]);
+}
+
+#[test]
+fn classify_tokens_chunks_batch_preserves_grouping() {
+    // classify_tokens_chunks_batch: per-text grouping + per-token geometry.
+    let per_text = vec![vec![text_chunk(&[1, 2], 0)], vec![text_chunk(&[3], 0)]];
+    let mut p = EncoderPipeline::new(
+        StubTokenizer { ids: vec![], max_seq: 4, error: true },
+        TruncatingChunker::new(4),
+        StubRecognize { num_labels: 1, max_batch: 8, error: false },
+    );
+    let out = p.classify_tokens_chunks_batch(&per_text, ()).unwrap();
+    assert_eq!(out.results.len(), 2);
+    assert_eq!(out.results[0].chunks.len(), 1);
+    assert_eq!(out.results[0].chunks[0].logits, vec![1.0, 2.0]);
+    assert_eq!(out.results[0].chunks[0].token_offsets, vec![(0, 1), (1, 2)]);
+    assert_eq!(out.results[1].chunks.len(), 1);
+    assert_eq!(out.results[1].chunks[0].logits, vec![3.0]);
+    assert_eq!(out.results[1].chunks[0].token_offsets, vec![(0, 1)]);
+}
+
+#[test]
+fn chunk_seam_profiles_only_encoder_stages() {
+    // The chunk seam skips tokenize/chunk, so its profile carries ONLY the
+    // encoder's stage — distinct from the full pipeline (which leads with
+    // tokenize, chunk). Verified for all three verbs.
+    let chunks = shared_chunks();
+    assert!(!chunks.is_empty());
+
+    let names = |prof: Option<RunProfile>| {
+        prof.expect("profile collected").stages.into_iter().map(|s| s.name).collect::<Vec<_>>()
+    };
+
+    let mut embed_p = EncoderPipeline::new(
+        StubTokenizer { ids: vec![], max_seq: 3, error: true },
+        TruncatingChunker::new(3),
+        StubEmbed { hidden_size: 3, max_batch: 1, error: false },
+    );
+    let embeds = embed_p.embed_chunks(&chunks, RunOptions { profile: true }).unwrap();
+    assert_eq!(names(embeds.profile), vec!["encode"]);
+
+    let mut classify_p = EncoderPipeline::new(
+        StubTokenizer { ids: vec![], max_seq: 3, error: true },
+        TruncatingChunker::new(3),
+        StubClassify { num_labels: 3, max_batch: 1, error: false },
+    );
+    let classes = classify_p.classify_chunks(&chunks, RunOptions { profile: true }).unwrap();
+    assert_eq!(names(classes.profile), vec!["classify"]);
+
+    let mut token_p = EncoderPipeline::new(
+        StubTokenizer { ids: vec![], max_seq: 3, error: true },
+        TruncatingChunker::new(3),
+        StubRecognize { num_labels: 1, max_batch: 1, error: false },
+    );
+    let tokens = token_p.classify_tokens_chunks(&chunks, RunOptions { profile: true }).unwrap();
+    assert_eq!(names(tokens.profile), vec!["classify_tokens"]);
 }
 
 // ─── softmax / argmax ───────────────────────────────────────────────────────

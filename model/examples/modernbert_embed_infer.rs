@@ -123,8 +123,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     match (args.window, args.stride) {
         (Some(window), Some(stride)) => {
+            if window > max_seq {
+                return Err(format!("--window {window} exceeds the model's max_seq {max_seq}").into());
+            }
+            let chunker =
+                SlidingWindowChunker::try_new(window, stride).map_err(|e| format!("invalid --window/--stride: {e}"))?;
             println!("Chunker: sliding window={window}, stride={stride}");
-            let mut pipeline = EncoderPipeline::new(tokenizer, SlidingWindowChunker::new(window, stride), embedder);
+            let mut pipeline = EncoderPipeline::new(tokenizer, chunker, embedder);
             embed_and_report(&mut pipeline, &text, args.profile)?;
         }
         (Some(_), None) | (None, Some(_)) => {

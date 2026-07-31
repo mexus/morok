@@ -21,6 +21,26 @@
 //! free of the Tensor/device stack. The model owns ids → device internally —
 //! exactly as [`audio`](super::audio)'s [`Transcriber`](super::audio::Transcriber)
 //! owns audio → mel → device.
+//!
+//! ## Design rationale
+//!
+//! **One supertrait, three specializations.** [`EncoderHead`] is the whole
+//! model contract the pipeline needs (one batched forward + capacity), so the
+//! heavy machinery — sub-batching, chunk geometry, profile assembly — is written
+//! once over it. [`Embed`] / [`Classify`] / [`ClassifyTokens`] each fix
+//! [`EncoderHead::Output`] and add one informational accessor; the verb facades
+//! are bounded inherent impls, so a caller sees only the verbs their model
+//! unlocks, with no coherence conflict between tasks.
+//!
+//! **Host-side and model-agnostic.** This crate never touches the Tensor/device
+//! stack (text in as `&str`, ids as `&[u32]`, outputs as plain `Vec<f32>`), so
+//! one assembled pipeline is reusable across any encoder backend; the model owns
+//! the ids → device step — exactly the split [`audio`](super::audio) takes with
+//! audio → mel.
+//!
+//! **Chunk seam.** The verb `_chunks` variants feed pre-built [`TextChunk`]s,
+//! skipping tokenize/chunk entirely — tokenize once, then reuse the same chunks
+//! across several pipelines. Their profile carries encoder stages only.
 
 use std::path::Path;
 use std::time::Instant;
@@ -677,6 +697,11 @@ type SingleRun<M> = (Vec<<M as EncoderHead>::Output>, Vec<TextChunk>, Option<Run
 /// run shape returned by [`EncoderPipeline::run_batch_inner`]. Aliased.
 type BatchRun<M> = (Vec<Vec<<M as EncoderHead>::Output>>, Vec<Vec<TextChunk>>, Option<RunProfile>);
 
+/// `(per-text model outputs, optional profile)` — the batch chunk-seam shape
+/// returned by [`EncoderPipeline::run_chunks_batch`]. No chunks are carried: on
+/// the seam path the caller owns them. Aliased (`clippy::type_complexity`).
+type BatchModelOutputs<M> = (Vec<Vec<<M as EncoderHead>::Output>>, Option<RunProfile>);
+
 impl<T: Tokenizer, C: Chunker, M: EncoderHead> EncoderPipeline<T, C, M> {
     pub fn new(tokenizer: T, chunker: C, model: M) -> Self {
         Self { tokenizer, chunker, model }
@@ -696,7 +721,7 @@ impl<T: Tokenizer, C: Chunker, M: EncoderHead> EncoderPipeline<T, C, M> {
     /// input order) plus a merged profile (one per sub-batch, accumulated via
     /// [`RunProfile::merge`]). The verb facades pair these with the source
     /// chunks' positions afterwards. Shared by the single-text and batch paths.
-    fn run_chunks_flat(&mut self, chunks: &[TextChunk], profile: bool) -> Result<ModelOutputs<M>, M::Error> {
+    fn run_chunks_flat(&mut self, chunks: &[&TextChunk], profile: bool) -> Result<ModelOutputs<M>, M::Error> {
         if chunks.is_empty() {
             return Ok((Vec::new(), None));
         }
@@ -732,7 +757,8 @@ impl<T: Tokenizer, C: Chunker, M: EncoderHead> EncoderPipeline<T, C, M> {
         let chunks = self.chunker.chunk(&encoding).context(ChunkSnafu)?;
         let chunk_wall = t.elapsed();
 
-        let (outputs, enc_prof) = self.run_chunks_flat(&chunks, opts.profile).context(EncodeSnafu)?;
+        let chunk_refs: Vec<&TextChunk> = chunks.iter().collect();
+        let (outputs, enc_prof) = self.run_chunks_flat(&chunk_refs, opts.profile).context(EncodeSnafu)?;
 
         let profile = opts.profile.then(|| {
             let mut p = RunProfile::default();
@@ -771,7 +797,8 @@ impl<T: Tokenizer, C: Chunker, M: EncoderHead> EncoderPipeline<T, C, M> {
         }
         let chunk_wall = t.elapsed();
 
-        let (all_outs, enc_prof) = self.run_chunks_flat(&all_chunks, opts.profile).context(EncodeSnafu)?;
+        let chunk_refs: Vec<&TextChunk> = all_chunks.iter().collect();
+        let (all_outs, enc_prof) = self.run_chunks_flat(&chunk_refs, opts.profile).context(EncodeSnafu)?;
 
         // Reassemble per-text: drain the flat outputs AND the flat chunks by
         // each text's chunk count (moving, not cloning).
@@ -812,33 +839,29 @@ impl<T: Tokenizer, C: Chunker, M: EncoderHead> EncoderPipeline<T, C, M> {
         chunks: &[TextChunk],
         opts: RunOptions,
     ) -> Result<ModelOutputs<M>, PipelineError<T, C, M>> {
-        self.run_chunks_flat(chunks, opts.profile).context(EncodeSnafu)
+        let chunk_refs: Vec<&TextChunk> = chunks.iter().collect();
+        self.run_chunks_flat(&chunk_refs, opts.profile).context(EncodeSnafu)
     }
 
     /// Run pre-built per-text chunk lists through the encoder — the batch form
-    /// of [`run_chunks`](Self::run_chunks). Each text's chunks are encoded
-    /// (sub-batched to the encoder's `max_batch`); returns per-text
-    /// position-agnostic outputs plus a shared batch-level profile that
-    /// accumulates every text's encoder run.
-    ///
-    /// For maximum throughput when the per-text chunk counts are small, flatten
-    /// the inputs into one `Vec<TextChunk>` and call [`run_chunks`](Self::run_chunks)
-    /// — that fills each sub-batch across text boundaries.
+    /// of [`run_chunks`](Self::run_chunks). All chunks across all texts are
+    /// flattened into one stream and sub-batched across text boundaries (same
+    /// throughput shape as [`run_batch_inner`](Self::run_batch_inner)), then
+    /// re-split per text by each input's chunk count. Returns per-text
+    /// position-agnostic outputs plus the encoder-only profile (no
+    /// tokenize/chunk stages, since those ran before this call). Only the
+    /// [`Encode`](EncoderPipelineError::Encode) arm is reachable here.
     fn run_chunks_batch(
         &mut self,
         per_text: &[Vec<TextChunk>],
         opts: RunOptions,
-    ) -> Result<(Vec<Vec<M::Output>>, Option<RunProfile>), PipelineError<T, C, M>> {
-        let mut results = Vec::with_capacity(per_text.len());
-        let mut merged_prof: Option<RunProfile> = None;
-        for chunks in per_text {
-            let (outs, prof) = self.run_chunks_flat(chunks, opts.profile).context(EncodeSnafu)?;
-            if let Some(p) = prof {
-                merged_prof.get_or_insert_with(RunProfile::default).merge(p);
-            }
-            results.push(outs);
-        }
-        Ok((results, merged_prof))
+    ) -> Result<BatchModelOutputs<M>, PipelineError<T, C, M>> {
+        let counts: Vec<usize> = per_text.iter().map(Vec::len).collect();
+        let flat: Vec<&TextChunk> = per_text.iter().flatten().collect();
+        let (all_outs, profile) = self.run_chunks_flat(&flat, opts.profile).context(EncodeSnafu)?;
+        let mut out_iter = all_outs.into_iter();
+        let results = counts.into_iter().map(|c| out_iter.by_ref().take(c).collect::<Vec<M::Output>>()).collect();
+        Ok((results, profile))
     }
 
     pub fn tokenizer_mut(&mut self) -> &mut T {
@@ -1096,7 +1119,7 @@ impl<T: Tokenizer, C: Chunker, M: ClassifyTokens> EncoderPipeline<T, C, M> {
         Ok(BatchTokenClassifications { results, profile })
     }
 
-    /// Typed accessor for the classify_tokensr (the [`ClassifyTokens`] model).
+    /// Typed accessor for the token classifier (the [`ClassifyTokens`] model).
     pub fn token_classifier_mut(&mut self) -> &mut M {
         &mut self.model
     }
