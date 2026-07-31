@@ -880,16 +880,26 @@ impl Tensor {
             }
         };
 
-        let mut ranges: Vec<(isize, isize)> =
-            (0..ndim).map(|d| (0isize, shape[d].as_const().unwrap() as isize)).collect();
+        let mut ranges: Vec<Option<(isize, isize)>> = vec![None; ndim];
         let mut flip_axes: Vec<isize> = Vec::new();
 
         for (i, &axis) in axes.iter().enumerate() {
-            let d = shape[axis].as_const().unwrap() as i64;
             let step = steps[i];
             if step == 0 {
                 return Err(crate::error::Error::IrConstruction { details: "Slice step cannot be 0".into() });
             }
+
+            let d = match shape[axis].as_const() {
+                Some(d) => d as i64,
+                None => {
+                    if starts[i] <= 0 && ends[i] > (i64::MAX / 2) {
+                        continue;
+                    }
+                    return Err(crate::error::Error::SymbolicShapeUnsupported {
+                        operation: "slice_with on a symbolic dim".to_string(),
+                    });
+                }
+            };
 
             let (lower, upper) = if step > 0 { (0i64, d) } else { (-1i64, d - 1) };
             let mut s = starts[i].clamp(-d, d);
@@ -905,12 +915,12 @@ impl Tensor {
             let e = e.clamp(lower, upper);
 
             if step * (e - s) < 0 {
-                ranges[axis] = (0, 0);
+                ranges[axis] = Some((0, 0));
             } else if step < 0 {
                 flip_axes.push(axis as isize);
-                ranges[axis] = ((e + 1) as isize, (s + 1) as isize);
+                ranges[axis] = Some(((e + 1) as isize, (s + 1) as isize));
             } else {
-                ranges[axis] = (s as isize, e as isize);
+                ranges[axis] = Some((s as isize, e as isize));
             }
         }
 
@@ -925,7 +935,9 @@ impl Tensor {
                 continue;
             }
             let cur = result.shape()?;
-            let size = cur[axis].as_const().unwrap();
+            let size = cur[axis].as_const().ok_or_else(|| crate::error::Error::SymbolicShapeUnsupported {
+                operation: "slice_with with step on a symbolic dim".to_string(),
+            })?;
             let padded = size.div_ceil(abs_step) * abs_step;
             if padded > size {
                 let mut p = vec![(0isize, 0isize); cur.len()];

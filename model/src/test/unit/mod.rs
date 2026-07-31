@@ -20,3 +20,4 @@ mod transcribe;
 mod wavlm;
 mod wespeaker;
 mod xlm_roberta;
+mod yolo;

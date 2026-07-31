@@ -65,7 +65,7 @@ fn main() {
     // Sanity: does a CPU BAR0 write even round-trip at this paddr?
     let mut echo = vec![0u8; 16];
     dev.vram_read(src_pa, &mut echo);
-    println!("src BAR0 write→read roundtrip: {:?} (want {:?})", &echo, &pattern[..16]);
+    println!("src BAR0 write→read roundtrip: {:?} (want {:?})", echo, &pattern[..16]);
 
     // Build the command stream: copy src→dst, then fence a sentinel to rptr+64.
     let done_va = rptr.va_addr + 64;

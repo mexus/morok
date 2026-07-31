@@ -228,17 +228,17 @@ pub fn broadcast_shape(lhs: &Shape, rhs: &Shape) -> Result<Shape> {
         if l == r {
             // Same dimension (concrete value or symbolic expression)
             result.push(l.clone());
-        } else if let (Some(lv), Some(rv)) = (l.as_const(), r.as_const()) {
-            // Both concrete - apply broadcast rule
-            if lv == 1 {
-                result.push(r.clone());
-            } else if rv == 1 || lv == rv {
-                result.push(l.clone());
-            } else {
-                return BroadcastShapeMismatchSnafu { lhs: lhs.clone(), rhs: rhs.clone() }.fail();
-            }
+        } else if l.as_const() == Some(1) {
+            // NumPy broadcasting: size-1 dim expands to the other
+            result.push(r.clone());
+        } else if r.as_const() == Some(1) {
+            // NumPy broadcasting: size-1 dim expands to the other
+            result.push(l.clone());
+        } else if l.as_const().is_some() && r.as_const().is_some() {
+            // Both concrete, non-1, and not equal → error
+            return BroadcastShapeMismatchSnafu { lhs: lhs.clone(), rhs: rhs.clone() }.fail();
         } else {
-            // At least one is symbolic - use max (conservatively)
+            // At least one is symbolic (non-1) - use max (conservatively)
             result.push(crate::sint_max(&[l.clone(), r.clone()]));
         }
     }

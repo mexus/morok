@@ -1,0 +1,334 @@
+//! [`Yolo26Detect`], [`Yolo26DetectP2`], [`Yolo26DetectP6`] — YOLO v26
+//! object detection models (standard, P2, P6 topologies).
+//!
+//! All three share the same [`Detect`] head (differing only in the number of
+//! detection scales) and differ in backbone/neck depth.
+
+use snafu::{OptionExt, ResultExt};
+use svod_ir::SInt;
+use svod_tensor::{BoundVariable, Tensor};
+
+use crate::state::{self, HasStateDict, StateDict, prefixed};
+
+use super::backbone::{YoloBackbone, scaled_channels};
+use super::config::{P2_STRIDES, P6_STRIDES, YoloConfig};
+use super::error::{Result, StateSnafu, SymbolicShapeSnafu, TensorSnafu};
+use super::head::{BoxBranch, ClsBranch, dist2bbox, make_anchors};
+use super::loader;
+
+// ---------------------------------------------------------------------------
+// Detect head
+// ---------------------------------------------------------------------------
+
+/// YOLO v26 detection head (end2end, reg_max=1). Loads only the one2one
+/// branch weights (the one2many branch is training-only).
+///
+/// Forward returns a single tensor `[B, 4+nc, A]` — decoded boxes (xyxy in
+/// pixel space) concatenated with sigmoid'd class scores.
+#[derive(Clone)]
+pub struct Detect {
+    pub cv2: Vec<BoxBranch>,
+    pub cv3: Vec<ClsBranch>,
+    pub nc: usize,
+    pub reg_max: usize,
+    pub strides: Vec<usize>,
+}
+
+impl Detect {
+    pub fn empty(ch: &[usize], nc: usize, reg_max: usize) -> Self {
+        Self::empty_with_strides(ch, nc, reg_max, &super::config::DETECT_STRIDES)
+    }
+
+    pub fn empty_with_strides(ch: &[usize], nc: usize, reg_max: usize, strides: &[usize]) -> Self {
+        let hidden_box = (16usize).max(ch[0] / 4).max(reg_max * 4);
+        let hidden_cls = ch[0].max(nc.min(100));
+        Self {
+            cv2: ch.iter().map(|&c| BoxBranch::empty(c, hidden_box, reg_max)).collect(),
+            cv3: ch.iter().map(|&c| ClsBranch::empty(c, hidden_cls, nc)).collect(),
+            nc,
+            reg_max,
+            strides: strides.to_vec(),
+        }
+    }
+
+    /// Run box + cls heads on each feature map, decode boxes via dist2bbox,
+    /// sigmoid scores, and cat into `[B, 4+nc, A]`.
+    pub fn forward(&self, feats: &[Tensor]) -> Result<Tensor> {
+        let shape = feats[0].shape().context(TensorSnafu)?;
+        let b = shape[0].clone();
+
+        let mut boxes_list: Vec<Tensor> = Vec::with_capacity(feats.len());
+        let mut scores_list: Vec<Tensor> = Vec::with_capacity(feats.len());
+        let mut feat_sizes: Vec<(usize, usize)> = Vec::with_capacity(feats.len());
+
+        for (i, feat) in feats.iter().enumerate() {
+            let fshape = feat.shape().context(TensorSnafu)?;
+            let h: usize = fshape[2].as_const().context(SymbolicShapeSnafu { what: "yolo detect H" })?;
+            let w: usize = fshape[3].as_const().context(SymbolicShapeSnafu { what: "yolo detect W" })?;
+            let hw = h * w;
+            feat_sizes.push((h, w));
+
+            let box_out = self.cv2[i].forward(feat)?;
+            let box_out =
+                box_out.try_reshape([b.clone(), SInt::from(4 * self.reg_max), SInt::from(hw)]).context(TensorSnafu)?;
+            boxes_list.push(box_out);
+
+            let cls_out = self.cv3[i].forward(feat)?;
+            let cls_out = cls_out.try_reshape([b.clone(), SInt::from(self.nc), SInt::from(hw)]).context(TensorSnafu)?;
+            scores_list.push(cls_out);
+        }
+
+        let boxes_refs: Vec<&Tensor> = boxes_list.iter().collect();
+        let scores_refs: Vec<&Tensor> = scores_list.iter().collect();
+
+        let boxes = Tensor::cat(&boxes_refs, 2).context(TensorSnafu)?;
+        let scores = Tensor::cat(&scores_refs, 2).context(TensorSnafu)?;
+
+        let num_anchors: usize = feat_sizes.iter().map(|&(h, w)| h * w).sum();
+        let (anchors, strides) = make_anchors(&feat_sizes, &self.strides);
+
+        let dbox = dist2bbox(&boxes, &anchors, &strides, num_anchors)?;
+        let scores = scores.sigmoid().context(TensorSnafu)?;
+
+        Tensor::cat(&[&dbox, &scores], 1).context(TensorSnafu)
+    }
+}
+
+impl HasStateDict for Detect {
+    fn state_dict(&self, prefix: &str) -> StateDict {
+        let mut sd = StateDict::new();
+        for (i, br) in self.cv2.iter().enumerate() {
+            sd.extend(br.state_dict(&prefixed(prefix, &format!("one2one_cv2.{i}"))));
+        }
+        for (i, br) in self.cv3.iter().enumerate() {
+            sd.extend(br.state_dict(&prefixed(prefix, &format!("one2one_cv3.{i}"))));
+        }
+        sd
+    }
+
+    fn load_state_dict(&mut self, sd: &StateDict, prefix: &str) -> std::result::Result<(), state::Error> {
+        for (i, br) in self.cv2.iter_mut().enumerate() {
+            br.load_state_dict(sd, &prefixed(prefix, &format!("one2one_cv2.{i}")))?;
+        }
+        for (i, br) in self.cv3.iter_mut().enumerate() {
+            br.load_state_dict(sd, &prefixed(prefix, &format!("one2one_cv3.{i}")))?;
+        }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Yolo26Detect — standard P3/P4/P5
+// ---------------------------------------------------------------------------
+
+/// YOLO v26 object detection model (P3/8–P5/32).
+///
+/// Forward returns `[B, 4+nc, A]` (decoded boxes + scores).
+#[derive(Clone)]
+pub struct Yolo26Detect {
+    pub config: YoloConfig,
+    pub backbone: YoloBackbone,
+    pub neck: super::neck::YoloNeck,
+    pub head: Detect,
+}
+
+impl Yolo26Detect {
+    pub fn with_zero_weights(config: YoloConfig) -> Self {
+        let scale = config.scale;
+        let [_, _, c2, c3, c4] = scaled_channels(scale);
+        Self {
+            config: config.clone(),
+            backbone: YoloBackbone::empty(scale),
+            neck: super::neck::YoloNeck::empty(scale),
+            head: Detect::empty(&[c2, c3, c4], config.nc, config.reg_max),
+        }
+    }
+
+    pub fn from_hub(model_id: &str, config: YoloConfig) -> Result<Self> {
+        Self::from_hub_with_revision(model_id, "main", config)
+    }
+
+    pub fn from_hub_with_revision(model_id: &str, revision: &str, config: YoloConfig) -> Result<Self> {
+        let path = loader::download_safetensors(model_id, revision)?;
+        Self::from_safetensors(&path, config)
+    }
+
+    pub fn from_safetensors(path: &std::path::Path, config: YoloConfig) -> Result<Self> {
+        let sd = loader::prepare_state_dict(path)?;
+        Self::from_state_dict(&sd, config)
+    }
+
+    pub fn from_state_dict(sd: &StateDict, config: YoloConfig) -> Result<Self> {
+        let mut model = Self::with_zero_weights(config);
+        model.load_state_dict(sd, "").context(StateSnafu)?;
+        Ok(model)
+    }
+
+    pub fn forward(&self, images: &Tensor, batch: &BoundVariable) -> Result<Tensor> {
+        let x = loader::shrink_batch(images, batch)?;
+        let (l4, l6, l10) = self.backbone.forward(&x)?;
+        let (p3, p4, p5) = self.neck.forward(&l4, &l6, &l10)?;
+        self.head.forward(&[p3, p4, p5])
+    }
+}
+
+impl HasStateDict for Yolo26Detect {
+    fn state_dict(&self, prefix: &str) -> StateDict {
+        let mut sd = self.backbone.state_dict(prefix);
+        sd.extend(self.neck.state_dict(prefix));
+        sd.extend(self.head.state_dict(&prefixed(prefix, "23")));
+        sd
+    }
+
+    fn load_state_dict(&mut self, sd: &StateDict, prefix: &str) -> std::result::Result<(), state::Error> {
+        self.backbone.load_state_dict(sd, prefix)?;
+        self.neck.load_state_dict(sd, prefix)?;
+        self.head.load_state_dict(sd, &prefixed(prefix, "23"))?;
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Yolo26DetectP2 — P2/P3/P4/P5
+// ---------------------------------------------------------------------------
+
+/// YOLO v26-P2 object detection model (P2/4–P5/32).
+///
+/// Uses the standard backbone (tapping P2/4) with an extended P2 neck,
+/// producing four detection feature maps at strides 4, 8, 16, 32.
+#[derive(Clone)]
+pub struct Yolo26DetectP2 {
+    pub config: YoloConfig,
+    pub backbone: YoloBackbone,
+    pub neck: super::neck::YoloNeckP2,
+    pub head: Detect,
+}
+
+impl Yolo26DetectP2 {
+    pub fn with_zero_weights(config: YoloConfig) -> Self {
+        let scale = config.scale;
+        let sc = |yaml_c| crate::yolo::config::scale_channels(yaml_c, scale);
+        let ch = [sc(128), sc(256), sc(512), sc(1024)];
+        Self {
+            config: config.clone(),
+            backbone: YoloBackbone::empty(scale),
+            neck: super::neck::YoloNeckP2::empty(scale),
+            head: Detect::empty_with_strides(&ch, config.nc, config.reg_max, &P2_STRIDES),
+        }
+    }
+
+    pub fn from_hub(model_id: &str, config: YoloConfig) -> Result<Self> {
+        Self::from_hub_with_revision(model_id, "main", config)
+    }
+
+    pub fn from_hub_with_revision(model_id: &str, revision: &str, config: YoloConfig) -> Result<Self> {
+        let path = loader::download_safetensors(model_id, revision)?;
+        Self::from_safetensors(&path, config)
+    }
+
+    pub fn from_safetensors(path: &std::path::Path, config: YoloConfig) -> Result<Self> {
+        let sd = loader::prepare_state_dict(path)?;
+        Self::from_state_dict(&sd, config)
+    }
+
+    pub fn from_state_dict(sd: &StateDict, config: YoloConfig) -> Result<Self> {
+        let mut model = Self::with_zero_weights(config);
+        model.load_state_dict(sd, "").context(StateSnafu)?;
+        Ok(model)
+    }
+
+    pub fn forward(&self, images: &Tensor, batch: &BoundVariable) -> Result<Tensor> {
+        let x = loader::shrink_batch(images, batch)?;
+        let (l2, l4, l6, l10) = self.backbone.forward_with_p2(&x)?;
+        let (p2, p3, p4, p5) = self.neck.forward(&l2, &l4, &l6, &l10)?;
+        self.head.forward(&[p2, p3, p4, p5])
+    }
+}
+
+impl HasStateDict for Yolo26DetectP2 {
+    fn state_dict(&self, prefix: &str) -> StateDict {
+        let mut sd = self.backbone.state_dict(prefix);
+        sd.extend(self.neck.state_dict(prefix));
+        sd.extend(self.head.state_dict(&prefixed(prefix, "29")));
+        sd
+    }
+
+    fn load_state_dict(&mut self, sd: &StateDict, prefix: &str) -> std::result::Result<(), state::Error> {
+        self.backbone.load_state_dict(sd, prefix)?;
+        self.neck.load_state_dict(sd, prefix)?;
+        self.head.load_state_dict(sd, &prefixed(prefix, "29"))?;
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Yolo26DetectP6 — P3/P4/P5/P6
+// ---------------------------------------------------------------------------
+
+/// YOLO v26-P6 object detection model (P3/8–P6/64).
+///
+/// Uses the P6 backbone (deeper, P5=768ch, P6=1024ch) with a P6 neck,
+/// producing four detection feature maps at strides 8, 16, 32, 64.
+#[derive(Clone)]
+pub struct Yolo26DetectP6 {
+    pub config: YoloConfig,
+    pub backbone: super::backbone::YoloBackboneP6,
+    pub neck: super::neck::YoloNeckP6,
+    pub head: Detect,
+}
+
+impl Yolo26DetectP6 {
+    pub fn with_zero_weights(config: YoloConfig) -> Self {
+        let scale = config.scale;
+        let [_, _, c2, c3, c5, c6] = super::backbone::p6_scaled_channels(scale);
+        Self {
+            config: config.clone(),
+            backbone: super::backbone::YoloBackboneP6::empty(scale),
+            neck: super::neck::YoloNeckP6::empty(scale),
+            head: Detect::empty_with_strides(&[c2, c3, c5, c6], config.nc, config.reg_max, &P6_STRIDES),
+        }
+    }
+
+    pub fn from_hub(model_id: &str, config: YoloConfig) -> Result<Self> {
+        Self::from_hub_with_revision(model_id, "main", config)
+    }
+
+    pub fn from_hub_with_revision(model_id: &str, revision: &str, config: YoloConfig) -> Result<Self> {
+        let path = loader::download_safetensors(model_id, revision)?;
+        Self::from_safetensors(&path, config)
+    }
+
+    pub fn from_safetensors(path: &std::path::Path, config: YoloConfig) -> Result<Self> {
+        let sd = loader::prepare_state_dict(path)?;
+        Self::from_state_dict(&sd, config)
+    }
+
+    pub fn from_state_dict(sd: &StateDict, config: YoloConfig) -> Result<Self> {
+        let mut model = Self::with_zero_weights(config);
+        model.load_state_dict(sd, "").context(StateSnafu)?;
+        Ok(model)
+    }
+
+    pub fn forward(&self, images: &Tensor, batch: &BoundVariable) -> Result<Tensor> {
+        let x = loader::shrink_batch(images, batch)?;
+        let (l4, l6, l8, l12) = self.backbone.forward(&x)?;
+        let (p3, p4, p5, p6) = self.neck.forward(&l4, &l6, &l8, &l12)?;
+        self.head.forward(&[p3, p4, p5, p6])
+    }
+}
+
+impl HasStateDict for Yolo26DetectP6 {
+    fn state_dict(&self, prefix: &str) -> StateDict {
+        let mut sd = self.backbone.state_dict(prefix);
+        sd.extend(self.neck.state_dict(prefix));
+        sd.extend(self.head.state_dict(&prefixed(prefix, "31")));
+        sd
+    }
+
+    fn load_state_dict(&mut self, sd: &StateDict, prefix: &str) -> std::result::Result<(), state::Error> {
+        self.backbone.load_state_dict(sd, prefix)?;
+        self.neck.load_state_dict(sd, prefix)?;
+        self.head.load_state_dict(sd, &prefixed(prefix, "31"))?;
+        Ok(())
+    }
+}

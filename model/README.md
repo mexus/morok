@@ -33,6 +33,7 @@ plans.
 | Qwen3-Reranker-0.6B | Cross-encoder reranking | `qwen3` | [Qwen team](https://huggingface.co/Qwen) (Qwen3 LLM) | [`Qwen/Qwen3-Reranker-0.6B`](https://huggingface.co/Qwen/Qwen3-Reranker-0.6B) |
 | ResNet (18 / 34 / 50 / 101 / 152) | Vision | `resnet` | [He et al. 2015](https://arxiv.org/abs/1512.03385) | [`timm/resnet*.a1_in1k`](https://huggingface.co/timm) |
 | WeSpeaker ResNet34 | Speaker embedding | `wespeaker` | [wenet-e2e/wespeaker](https://github.com/wenet-e2e/wespeaker) | [`pyannote/wespeaker-voxceleb-resnet34-LM`](https://huggingface.co/pyannote/wespeaker-voxceleb-resnet34-LM) |
+| YOLO v26 (detect / cls / seg / obb / pose / depth / semseg) | Vision | `yolo` | [Ultralytics YOLO26](https://docs.ultralytics.com/models/yolo26) | [`ultralytics/yolo26n`](https://huggingface.co/ultralytics/yolo26n) |
 
 ## Examples
 
@@ -42,4 +43,6 @@ cargo run -p svod-model --release --example vad_bench -- audio.wav            # 
 cargo run -p svod-model --release --example vad_stream -- audio.wav           # streaming VAD events (simulated mic)
 cargo run -p svod-model --release --example resnet_classify -- --hub --image dog.bin --side 224
 cargo run -p svod-model --release --example wespeaker_parity -- --hub --data reference.npz
+cargo run -p svod-model --release --example yolo_detect -- --hub
+cargo run -p svod-model --release --example yolo_detect -- --hub --scale small --image photo.bin --side 640
 ```
