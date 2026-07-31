@@ -1186,9 +1186,16 @@ where
             continue;
         }
         let id = argmax(row);
-        // Score the argmax via softmax (max-subtracted, stable); an all-zero /
-        // empty row yields a uniform 1/nl probability rather than NaN.
-        let score = if row.is_empty() { 0.0 } else { softmax(row)[id] };
+        // Argmax probability = softmax(row)[id], computed in place (max-subtracted
+        // for stability) rather than allocating the full probability vector. An
+        // empty row scores 0.0; an all-zero row yields the uniform 1/nl.
+        let score = if row.is_empty() {
+            0.0
+        } else {
+            let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let sum: f32 = row.iter().map(|x| (x - max).exp()).sum();
+            (row[id] - max).exp() / sum
+        };
         let label_id = id as u32;
         let (start, end) = chunk.token_offsets.get(t).copied().unwrap_or((0, 0));
         out.push(TokenLabel { label_id, label: id2label(label_id), start, end, token_index: content_idx, score });
