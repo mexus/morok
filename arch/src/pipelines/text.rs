@@ -161,10 +161,6 @@ impl Encoding {
 pub trait Tokenizer {
     type Error: std::error::Error + 'static;
 
-    /// The model's maximum sequence length (informational / for validation);
-    /// the [`Chunker`] owns the truncation policy.
-    fn max_seq(&self) -> usize;
-
     fn encode(&mut self, text: &str) -> Result<Encoding, Self::Error>;
 
     /// Encode several inputs. Defaults to looping [`encode`](Tokenizer::encode).
@@ -208,44 +204,36 @@ impl From<tokenizers::Error> for HfTokenizerError {
 ///
 /// `encode` calls `inner.encode(text, add_special_tokens = true)`. It does
 /// **not** configure truncation/padding — the [`Chunker`] owns the `max_seq`
-/// policy, so [`SlidingWindowChunker`] can still see the full token
-/// stream. `max_seq()` reports the model's maximum (passed in at construction).
+/// policy, so [`SlidingWindowChunker`] can still see the full token stream.
 ///
 /// HF fetching (`from_hub(repo)`) is intentionally absent here — `hf-hub` lives
 /// in `svod-model`, which fetches `tokenizer.json` and hands the bytes to
 /// [`from_bytes`](HfTokenizer::from_bytes).
 pub struct HfTokenizer {
     inner: tokenizers::Tokenizer,
-    max_seq: usize,
 }
 
 impl HfTokenizer {
-    pub fn new(inner: tokenizers::Tokenizer, max_seq: usize) -> Self {
-        Self { inner, max_seq }
+    pub fn new(inner: tokenizers::Tokenizer) -> Self {
+        Self { inner }
     }
 
-    /// Load from a `tokenizer.json` path. The caller knows the model's
-    /// `max_seq` and threads it in — the same value flows to the chunker and
-    /// encoder at assembly.
-    pub fn from_path<P: AsRef<Path>>(path: P, max_seq: usize) -> Result<Self, HfTokenizerError> {
+    /// Load from a `tokenizer.json` path.
+    pub fn from_path<P: AsRef<Path>>(path: P) -> Result<Self, HfTokenizerError> {
         let inner = tokenizers::Tokenizer::from_file(path)?;
-        Ok(Self::new(inner, max_seq))
+        Ok(Self::new(inner))
     }
 
     /// Load from `tokenizer.json` bytes (e.g. fetched via `hf-hub` in
-    /// `svod-model`). See [`from_path`](Self::from_path) re: `max_seq`.
-    pub fn from_bytes<P: AsRef<[u8]>>(bytes: P, max_seq: usize) -> Result<Self, HfTokenizerError> {
+    /// `svod-model`).
+    pub fn from_bytes<P: AsRef<[u8]>>(bytes: P) -> Result<Self, HfTokenizerError> {
         let inner = tokenizers::Tokenizer::from_bytes(bytes)?;
-        Ok(Self::new(inner, max_seq))
+        Ok(Self::new(inner))
     }
 }
 
 impl Tokenizer for HfTokenizer {
     type Error = HfTokenizerError;
-
-    fn max_seq(&self) -> usize {
-        self.max_seq
-    }
 
     fn encode(&mut self, text: &str) -> Result<Encoding, HfTokenizerError> {
         let enc = self.inner.encode(text, true)?;

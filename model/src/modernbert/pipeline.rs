@@ -45,9 +45,8 @@ fn fetch_hub(
     let weights_path = repo.get("model.safetensors").context(HubSnafu)?;
     let sd = crate::state::load_safetensors(&weights_path).context(StateSnafu)?;
 
-    let max_seq = config.max_position_embeddings;
     let tok_path = repo.get("tokenizer.json").context(HubSnafu)?;
-    let tokenizer = HfTokenizer::from_path(&tok_path, max_seq).context(TokenizerSnafu)?;
+    let tokenizer = HfTokenizer::from_path(&tok_path).context(TokenizerSnafu)?;
 
     Ok((config, sd, tokenizer))
 }
