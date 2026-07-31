@@ -4,7 +4,7 @@ use proptest::prelude::*;
 
 use crate::pipelines::text::{
     BatchClassifications, BatchEmbeddings, BatchTokenClassifications, ChunkTokenClassification, Chunker,
-    Classification, Classify, ClassifyTokens, Embed, Embedding, Encoder, EncoderPipeline, EncoderPipelineError,
+    Classification, Classify, ClassifyTokens, Embed, Embedding, EncoderHead, EncoderPipeline, EncoderPipelineError,
     Encoding, HfTokenizer, HfTokenizerError, RunOptions, RunProfile, Scheme, SlidingWindowChunker,
     SlidingWindowChunkerError, TextChunk, TokenClassification, TokenLabel, Tokenizer, TruncatingChunker, argmax,
     group_spans, group_spans_document, labels_for_tokens, softmax,
@@ -88,7 +88,7 @@ struct StubEmbed {
     error: bool,
 }
 
-impl Encoder for StubEmbed {
+impl EncoderHead for StubEmbed {
     type Output = Embedding;
     type Error = StubEmbedError;
     fn capacity(&self) -> (usize, usize) {
@@ -132,7 +132,7 @@ struct StubClassify {
     error: bool,
 }
 
-impl Encoder for StubClassify {
+impl EncoderHead for StubClassify {
     type Output = Classification;
     type Error = StubClassifyError;
     fn capacity(&self) -> (usize, usize) {
@@ -494,7 +494,7 @@ fn pipeline_profiles_per_call_without_rebuild() {
 
 #[test]
 fn pipeline_surfaces_host_stages_even_when_encoder_does_not() {
-    // Encoder emits a profile only when asked — but it always does here, so to
+    // EncoderHead emits a profile only when asked — but it always does here, so to
     // exercise "encoder emits nothing", drop the embedder's stage by giving a
     // single-chunk input under a non-profiled encoder is not enough. Instead,
     // assert directly: tokenize+chunk still surface on their own via an encoder
@@ -1139,7 +1139,7 @@ struct StubRecognize {
     error: bool,
 }
 
-impl Encoder for StubRecognize {
+impl EncoderHead for StubRecognize {
     type Output = TokenClassification;
     type Error = StubRecognizeError;
     fn capacity(&self) -> (usize, usize) {

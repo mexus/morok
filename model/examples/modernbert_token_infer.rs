@@ -20,7 +20,7 @@ use std::time::Instant;
 use clap::Parser;
 
 use svod_arch::pipelines::text::{
-    Encoder, EncoderPipeline, ClassifyTokens, RunOptions, Scheme, TruncatingChunker, group_spans, labels_for_tokens,
+    EncoderHead, EncoderPipeline, ClassifyTokens, RunOptions, Scheme, TruncatingChunker, group_spans, labels_for_tokens,
 };
 use svod_dtype::DType;
 use svod_model::modernbert;

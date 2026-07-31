@@ -1,7 +1,7 @@
 //! [`ModernBertEmbedder`] — finished embeddings from the ModernBERT backbone:
 //! `input_ids` + `attention_mask` → mean-pooled, L2-normalized `(B, D)` vectors.
 //!
-//! Implements [`Encoder`] (with [`Embed`] fixing the output kinds) so it drops
+//! Implements [`EncoderHead`] (with [`Embed`] fixing the output kinds) so it drops
 //! straight into an
 //! [`EncoderPipeline`](svod_arch::pipelines::text::EncoderPipeline). The model
 //! owns the forward + fused pooling/normalization (via
@@ -18,7 +18,7 @@
 //! uses.
 
 use snafu::ResultExt;
-use svod_arch::pipelines::text::{Embed, Embedding, Encoder, Encoding, RunProfile};
+use svod_arch::pipelines::text::{Embed, Embedding, EncoderHead, Encoding, RunProfile};
 use svod_tensor::PrepareConfig;
 
 use crate::jit::InputSpec;
@@ -60,7 +60,7 @@ impl ModernBertEmbedder {
     }
 }
 
-impl Encoder for ModernBertEmbedder {
+impl EncoderHead for ModernBertEmbedder {
     type Output = Embedding;
     type Error = HeadError;
 

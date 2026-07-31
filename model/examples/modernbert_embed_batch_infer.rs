@@ -18,7 +18,7 @@ use std::time::Instant;
 
 use clap::Parser;
 
-use svod_arch::pipelines::text::{Embed, Encoder, EncoderPipeline, RunOptions, TruncatingChunker};
+use svod_arch::pipelines::text::{Embed, EncoderHead, EncoderPipeline, RunOptions, TruncatingChunker};
 use svod_dtype::DType;
 use svod_model::modernbert;
 

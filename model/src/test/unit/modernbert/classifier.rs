@@ -6,7 +6,7 @@
 
 use std::sync::{LazyLock, Mutex, MutexGuard};
 
-use svod_arch::pipelines::text::{Classification, Classify, Encoder, Encoding};
+use svod_arch::pipelines::text::{Classification, Classify, EncoderHead, Encoding};
 
 use crate::modernbert::{ClassifierHead, ClassifierPooling, ModernBertClassificationModel, ModernBertClassifier};
 use crate::state::HasStateDict;

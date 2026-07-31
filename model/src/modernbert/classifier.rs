@@ -12,7 +12,7 @@
 //! Fused into one JIT plan so the `(B, L, D)` activations stay on-device.
 
 use snafu::ResultExt;
-use svod_arch::pipelines::text::{Classification, Classify, Encoder, Encoding, RunProfile};
+use svod_arch::pipelines::text::{Classification, Classify, EncoderHead, Encoding, RunProfile};
 use svod_dtype::DType;
 use svod_ir::SInt;
 use svod_tensor::{BoundVariable, PrepareConfig, Tensor};
@@ -179,10 +179,10 @@ pub(crate) fn prediction_head_tail(hidden: &Tensor, head: &ClassifierHead) -> Re
     logits.cast(DType::Float32).context(TensorSnafu)
 }
 
-// ─── runtime (owns JIT, impl Encoder + Classify) ───────────────────────────
+// ─── runtime (owns JIT, impl EncoderHead + Classify) ───────────────────────────
 
 /// Finished-classifier model. Build once (eager JIT prepare) and reuse across
-/// calls. Implements [`Encoder`] (with [`Classify`] fixing the output kinds)
+/// calls. Implements [`EncoderHead`] (with [`Classify`] fixing the output kinds)
 /// for drop-in use with
 /// [`EncoderPipeline`](svod_arch::pipelines::text::EncoderPipeline).
 pub struct ModernBertClassifier {
@@ -208,7 +208,7 @@ impl ModernBertClassifier {
     }
 }
 
-impl Encoder for ModernBertClassifier {
+impl EncoderHead for ModernBertClassifier {
     type Output = Classification;
     type Error = HeadError;
 

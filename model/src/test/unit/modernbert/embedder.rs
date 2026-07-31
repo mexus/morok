@@ -5,7 +5,7 @@
 
 use std::sync::{LazyLock, Mutex, MutexGuard};
 
-use svod_arch::pipelines::text::{Embed, Embedding, Encoder, Encoding};
+use svod_arch::pipelines::text::{Embed, Embedding, EncoderHead, Encoding};
 use svod_device::{Buffer, BufferSpec, cpu};
 use svod_dtype::DType;
 

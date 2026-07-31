@@ -14,7 +14,7 @@
 //! ([`prediction_head_tail`]); the two heads differ only in pooling.
 
 use snafu::ResultExt;
-use svod_arch::pipelines::text::{Encoder, Encoding, ClassifyTokens, RunProfile, TokenClassification};
+use svod_arch::pipelines::text::{EncoderHead, Encoding, ClassifyTokens, RunProfile, TokenClassification};
 use svod_tensor::{BoundVariable, PrepareConfig, Tensor};
 
 use crate::jit::InputSpec;
@@ -72,10 +72,10 @@ impl ModernBertTokenClassificationModel {
     }
 }
 
-// ─── runtime (owns JIT, impl Encoder + ClassifyTokens) ──────────────────────────
+// ─── runtime (owns JIT, impl EncoderHead + ClassifyTokens) ──────────────────────────
 
 /// Finished token-classifier model. Build once (eager JIT prepare) and reuse
-/// across calls. Implements [`Encoder`] (with [`ClassifyTokens`] fixing the output
+/// across calls. Implements [`EncoderHead`] (with [`ClassifyTokens`] fixing the output
 /// kinds) for drop-in use with
 /// [`EncoderPipeline`](svod_arch::pipelines::text::EncoderPipeline).
 pub struct ModernBertTokenClassifier {
@@ -102,7 +102,7 @@ impl ModernBertTokenClassifier {
     }
 }
 
-impl Encoder for ModernBertTokenClassifier {
+impl EncoderHead for ModernBertTokenClassifier {
     type Output = TokenClassification;
     type Error = HeadError;
 

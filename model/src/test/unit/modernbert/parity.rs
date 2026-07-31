@@ -8,7 +8,7 @@
 
 use std::path::{Path, PathBuf};
 
-use svod_arch::pipelines::text::{Encoder, Encoding};
+use svod_arch::pipelines::text::{EncoderHead, Encoding};
 
 use svod_dtype::DType;
 use svod_tensor::Tensor;

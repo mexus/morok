@@ -1,7 +1,7 @@
-//! Encoder-only text inference (embeddings + classification + token
+//! EncoderHead-only text inference (embeddings + classification + token
 //! classification): tokenize → chunk → model → aggregate. Host-side and
 //! model-agnostic: a model implements only its irreducible part behind the
-//! [`Encoder`] supertrait — [`Embed`] / [`Classify`] / [`ClassifyTokens`] are thin
+//! [`EncoderHead`] supertrait — [`Embed`] / [`Classify`] / [`ClassifyTokens`] are thin
 //! specializations that fix the per-chunk output kind — and the heavy machinery
 //! (sub-batching, truncation geometry, profile assembly, span decoding) lives in
 //! trait defaults and free functions here. This is the sibling of
@@ -11,7 +11,7 @@
 //! Tokenizer::encode ─▶ Encoding ─▶ [TextChunk]            (Chunker)
 //!                                     │
 //!                                     ▼
-//!   Encoder::run_batch(tokenized chunks) ─▶ [Encoder::Output]
+//!   EncoderHead::run_batch(tokenized chunks) ─▶ [EncoderHead::Output]
 //!                                     │  EncoderPipeline assembles the profile
 //!                                     ▼
 //!                          {Embeddings, Classifications, …}
@@ -530,17 +530,17 @@ pub struct BatchTokenClassifications {
     pub profile: Option<RunProfile>,
 }
 
-// ─── Encoder (per-chunk model) ──────────────────────────────────────────────
+// ─── EncoderHead (per-chunk model) ──────────────────────────────────────────────
 
 /// Any encoder-only head: turns tokenized chunks into a per-chunk
 /// position-agnostic output. The shared shape behind the three task traits
-/// ([`Embed`] / [`Classify`] / [`ClassifyTokens`]) — they fix [`Output`](Encoder::Output)
+/// ([`Embed`] / [`Classify`] / [`ClassifyTokens`]) — they fix [`Output`](EncoderHead::Output)
 /// and add one informational accessor each, so the pipeline machinery
-/// (sub-batching, profile assembly) is written once over `Encoder` and the verbs
+/// (sub-batching, profile assembly) is written once over `EncoderHead` and the verbs
 /// stay discoverable per task.
 ///
-/// Implement [`run_batch`](Encoder::run_batch) (the throughput path — one padded
-/// JIT execute); [`run`](Encoder::run) defaults to a batch-of-one. Pairing a
+/// Implement [`run_batch`](EncoderHead::run_batch) (the throughput path — one padded
+/// JIT execute); [`run`](EncoderHead::run) defaults to a batch-of-one. Pairing a
 /// model output with its chunk's source position is the pipeline's job, not the
 /// model's — the verb facades ([`EncoderPipeline::embed`] / [`classify`] /
 /// [`classify_tokens`]) do it from the chunk + output types, so a model implements only
@@ -549,7 +549,7 @@ pub struct BatchTokenClassifications {
 ///
 /// [`classify`]: EncoderPipeline::classify
 /// [`classify_tokens`]: EncoderPipeline::classify_tokens
-pub trait Encoder {
+pub trait EncoderHead {
     /// Per-chunk model output, position-agnostic: [`Embedding`] /
     /// [`Classification`] / [`TokenClassification`].
     type Output: Default;
@@ -562,7 +562,7 @@ pub trait Encoder {
     fn capacity(&self) -> (usize, usize);
 
     /// Run every chunk through the model (the model owns its batching/padding),
-    /// returning one [`Output`](Encoder::Output) per input plus the per-stage
+    /// returning one [`Output`](EncoderHead::Output) per input plus the per-stage
     /// [`RunProfile`] — populated only when `profile` is set (a per-call choice,
     /// so the same encoder serves profiled and unprofiled runs).
     fn run_batch(&mut self, batch: &[&Encoding], profile: bool) -> Result<ModelOutputs<Self>, Self::Error>;
@@ -574,28 +574,28 @@ pub trait Encoder {
     }
 }
 
-/// Finished-embeddings head. A specialization of [`Encoder`] fixing
-/// [`Output`](Encoder::Output) = [`Embedding`]; implement
-/// [`Encoder::run_batch`] plus [`hidden_size`](Embed::hidden_size).
-pub trait Embed: Encoder<Output = Embedding> {
+/// Finished-embeddings head. A specialization of [`EncoderHead`] fixing
+/// [`Output`](EncoderHead::Output) = [`Embedding`]; implement
+/// [`EncoderHead::run_batch`] plus [`hidden_size`](Embed::hidden_size).
+pub trait Embed: EncoderHead<Output = Embedding> {
     /// The model's hidden size — the length of each finished [`Embedding`] (the
     /// model pools the sequence dimension before returning it).
     fn hidden_size(&self) -> usize;
 }
 
-/// Sentence/text-classification head. A specialization of [`Encoder`] fixing
-/// [`Output`](Encoder::Output) = [`Classification`]; implement
-/// [`Encoder::run_batch`] plus [`num_labels`](Classify::num_labels).
-pub trait Classify: Encoder<Output = Classification> {
+/// Sentence/text-classification head. A specialization of [`EncoderHead`] fixing
+/// [`Output`](EncoderHead::Output) = [`Classification`]; implement
+/// [`EncoderHead::run_batch`] plus [`num_labels`](Classify::num_labels).
+pub trait Classify: EncoderHead<Output = Classification> {
     /// The model's label count — the length of each [`Classification`]'s
     /// `logits` vector.
     fn num_labels(&self) -> usize;
 }
 
 /// Token-classification head (NER, POS tagging, chunking, …). A specialization
-/// of [`Encoder`] fixing [`Output`](Encoder::Output) = [`TokenClassification`];
-/// implement [`Encoder::run_batch`] plus [`num_labels`](ClassifyTokens::num_labels).
-pub trait ClassifyTokens: Encoder<Output = TokenClassification> {
+/// of [`EncoderHead`] fixing [`Output`](EncoderHead::Output) = [`TokenClassification`];
+/// implement [`EncoderHead::run_batch`] plus [`num_labels`](ClassifyTokens::num_labels).
+pub trait ClassifyTokens: EncoderHead<Output = TokenClassification> {
     /// The label count — the trailing dim of each [`TokenClassification`]'s
     /// `logits` grid.
     fn num_labels(&self) -> usize;
@@ -603,7 +603,7 @@ pub trait ClassifyTokens: Encoder<Output = TokenClassification> {
 
 // ─── EncoderPipeline (composer) ─────────────────────────────────────────────
 
-/// The full pipeline: a [`Tokenizer`] + a [`Chunker`] + an [`Encoder`]. One
+/// The full pipeline: a [`Tokenizer`] + a [`Chunker`] + an [`EncoderHead`]. One
 /// generic host-side composer for embeddings, classification, and token
 /// classification — `embed` / `classify` / `classify_tokens` (and their `_batch`
 /// siblings) are bounded facades over the same machinery, so a caller grepping
@@ -612,7 +612,7 @@ pub trait ClassifyTokens: Encoder<Output = TokenClassification> {
 /// encoder from the chunker's `max_seq`, or [`new`](EncoderPipeline::new) to
 /// compose three already-built parts. The analog of
 /// [`audio::Asr`](super::audio::Asr).
-pub struct EncoderPipeline<T: Tokenizer, C: Chunker, M: Encoder> {
+pub struct EncoderPipeline<T: Tokenizer, C: Chunker, M: EncoderHead> {
     tokenizer: T,
     chunker: C,
     model: M,
@@ -639,23 +639,23 @@ pub enum EncoderPipelineError<
 /// here so the verb facades' signatures stay readable (the three-param form
 /// trips `clippy::type_complexity`).
 type PipelineError<T, C, M> =
-    EncoderPipelineError<<T as Tokenizer>::Error, <C as Chunker>::Error, <M as Encoder>::Error>;
+    EncoderPipelineError<<T as Tokenizer>::Error, <C as Chunker>::Error, <M as EncoderHead>::Error>;
 
-/// `(per-input model outputs, optional profile)` — [`Encoder::run_batch`]'s
+/// `(per-input model outputs, optional profile)` — [`EncoderHead::run_batch`]'s
 /// result shape. Aliased because the inline form trips `clippy::type_complexity`.
-type ModelOutputs<M> = (Vec<<M as Encoder>::Output>, Option<RunProfile>);
+type ModelOutputs<M> = (Vec<<M as EncoderHead>::Output>, Option<RunProfile>);
 
 /// `(position-agnostic outputs, the source chunks they map to, optional profile)`
 /// — the single-text run shape returned by [`EncoderPipeline::run_single_inner`].
 /// The verb facades pair the parallel `outputs` / `chunks` into position-attached
 /// results. Aliased (`clippy::type_complexity`).
-type SingleRun<M> = (Vec<<M as Encoder>::Output>, Vec<TextChunk>, Option<RunProfile>);
+type SingleRun<M> = (Vec<<M as EncoderHead>::Output>, Vec<TextChunk>, Option<RunProfile>);
 
 /// `(per-text outputs, per-text source chunks, optional profile)` — the batch
 /// run shape returned by [`EncoderPipeline::run_batch_inner`]. Aliased.
-type BatchRun<M> = (Vec<Vec<<M as Encoder>::Output>>, Vec<Vec<TextChunk>>, Option<RunProfile>);
+type BatchRun<M> = (Vec<Vec<<M as EncoderHead>::Output>>, Vec<Vec<TextChunk>>, Option<RunProfile>);
 
-impl<T: Tokenizer, C: Chunker, M: Encoder> EncoderPipeline<T, C, M> {
+impl<T: Tokenizer, C: Chunker, M: EncoderHead> EncoderPipeline<T, C, M> {
     pub fn new(tokenizer: T, chunker: C, model: M) -> Self {
         Self { tokenizer, chunker, model }
     }
@@ -837,7 +837,7 @@ impl<T: Tokenizer, C: Chunker, M: Encoder> EncoderPipeline<T, C, M> {
 // Classify vs ClassifyTokens) ⇒ no coherence conflict; a caller gets only the verbs
 // their model's trait unlocks. Each wraps the generic inner into the task's
 // named aggregate, pairing the model's position-agnostic outputs with their
-// source chunks' positions (the old per-model `Encoder::attach`).
+// source chunks' positions (the old per-model `EncoderHead::attach`).
 
 /// Pair finished embeddings with their source chunks' byte offsets — the
 /// position-attachment step the embed facade runs after [`EncoderPipeline::run_single_inner`].
