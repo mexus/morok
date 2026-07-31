@@ -1108,11 +1108,12 @@ pub enum Scheme {
 }
 
 /// One content token's decoded prediction: the argmax label id, its display
-/// name (borrowing from the caller's label table), and its source-absolute byte
-/// span. Produced by [`labels_for_tokens`]; consumed by [`group_spans`]. Special
-/// tokens are already filtered out, so `token_index` runs contiguously over the
-/// chunk's content tokens.
-#[derive(Clone, Debug, PartialEq)]
+/// name (borrowing from the caller's label table), its source-absolute byte
+/// span, and its confidence `score` (the softmax probability of the argmax
+/// label). Produced by [`labels_for_tokens`]; consumed by [`group_spans`].
+/// Special tokens are already filtered out, so `token_index` runs contiguously
+/// over the chunk's content tokens.
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TokenLabel<'a> {
     pub label_id: u32,
     pub label: &'a str,
@@ -1120,13 +1121,18 @@ pub struct TokenLabel<'a> {
     pub end: usize,
     /// Index within the content-token vec (contiguous from 0).
     pub token_index: usize,
+    /// Softmax probability of the argmax label — the per-token confidence.
+    pub score: f32,
 }
 
 /// One decoded span: a contiguous run of same-type tokens (NER under a prefix
 /// scheme) or a single token (POS / `Scheme::Flat`). `start`/`end` are
-/// source-absolute byte offsets; `token_range` indexes the content-token vec.
-/// Owned (the `label` is detached from the caller's label table via
-/// [`TokenLabel`]'s `&str` → `String` promotion inside [`group_spans`]).
+/// source-absolute byte offsets; `token_range` indexes the content-token vec;
+/// `score` is the **minimum** member-token confidence (the conservative
+/// aggregate for thresholding — a span survives a `score >= t` filter only when
+/// every constituent token does). Owned (the `label` is detached from the
+/// caller's label table via [`TokenLabel`]'s `&str` → `String` promotion inside
+/// [`group_spans`]).
 #[derive(Clone, Debug, PartialEq)]
 pub struct Entity {
     pub label: String,
@@ -1134,13 +1140,18 @@ pub struct Entity {
     pub start: usize,
     pub end: usize,
     pub token_range: std::ops::Range<usize>,
+    /// Conservative confidence: the min of the member tokens' [`TokenLabel`]
+    /// scores (single-token spans carry that token's score unchanged).
+    pub score: f32,
 }
 
 /// Argmax each token's logits, drop special tokens, and pair every surviving
-/// content token with its source byte span + display label. `id2label` resolves
-/// a label id to its name (e.g. `"B-PER"`) as a borrowed `&str` — zero per-token
-/// allocation when the label table is a `Vec<String>` / `&[&str]`. Tokens whose
-/// `special_tokens_mask` is set are skipped. This is the per-token view (POS /
+/// content token with its source byte span, display label, and confidence
+/// score. `id2label` resolves a label id to its name (e.g. `"B-PER"`) as a
+/// borrowed `&str` — zero per-token allocation when the label table is a
+/// `Vec<String>` / `&[&str]`. Tokens whose `special_tokens_mask` is set are
+/// skipped. The `score` is the softmax probability of the argmax label (max of
+/// [`softmax`] over the row), computed in f32. This is the per-token view (POS /
 /// chunking / `none` aggregation); follow with [`group_spans`] to reconstruct
 /// entity spans under a prefix scheme.
 pub fn labels_for_tokens<'a, F>(chunk: &ChunkTokenClassification, id2label: F) -> Vec<TokenLabel<'a>>
@@ -1154,9 +1165,13 @@ where
         if *special != 0 {
             continue;
         }
-        let label_id = argmax(row) as u32;
+        let id = argmax(row);
+        // Score the argmax via softmax (max-subtracted, stable); an all-zero /
+        // empty row yields a uniform 1/nl probability rather than NaN.
+        let score = if row.is_empty() { 0.0 } else { softmax(row)[id] };
+        let label_id = id as u32;
         let (start, end) = chunk.token_offsets.get(t).copied().unwrap_or((0, 0));
-        out.push(TokenLabel { label_id, label: id2label(label_id), start, end, token_index: content_idx });
+        out.push(TokenLabel { label_id, label: id2label(label_id), start, end, token_index: content_idx, score });
         content_idx += 1;
     }
     out
@@ -1179,13 +1194,14 @@ pub fn group_spans(tokens: &[TokenLabel<'_>], scheme: Scheme) -> Vec<Entity> {
                 start: t.start,
                 end: t.end,
                 token_range: t.token_index..t.token_index + 1,
+                score: t.score,
             })
             .collect();
     }
 
     let mut entities: Vec<Entity> = Vec::new();
-    // Open span: (type, label_id, start_byte, end_byte, start_token_index)
-    let mut open: Option<(String, u32, usize, usize, usize)> = None;
+    // Open span: (type, label_id, start_byte, end_byte, start_token_index, min_score)
+    let mut open: Option<(String, u32, usize, usize, usize, f32)> = None;
 
     for t in tokens {
         let (prefix, typ) = parse_tag(t.label, scheme);
@@ -1203,38 +1219,36 @@ pub fn group_spans(tokens: &[TokenLabel<'_>], scheme: Scheme) -> Vec<Entity> {
                         start: t.start,
                         end: t.end,
                         token_range: t.token_index..t.token_index + 1,
+                        score: t.score,
                     });
                 } else {
-                    open = Some((typ, t.label_id, t.start, t.end, t.token_index));
+                    open = Some((typ, t.label_id, t.start, t.end, t.token_index, t.score));
                 }
             }
             Prefix::I => {
-                if let Some((ot, _, _, oe, _)) = open.as_mut()
+                if let Some((ot, _, _, oe, _, ms)) = open.as_mut()
                     && *ot == typ
                 {
                     *oe = t.end;
+                    *ms = (*ms).min(t.score);
                     continue;
                 }
                 // Stray I- (no matching open span): lenient — open a fresh span.
                 close_span(&mut open, &mut entities, t.token_index);
-                open = Some((typ, t.label_id, t.start, t.end, t.token_index));
+                open = Some((typ, t.label_id, t.start, t.end, t.token_index, t.score));
             }
             Prefix::L | Prefix::E => {
-                if let Some((ot, _, _, oe, _)) = open.as_mut()
-                    && *ot == typ
-                {
-                    *oe = t.end;
-                    let start_token = open.as_ref().unwrap().4;
-                    let lid = open.as_ref().unwrap().1;
-                    let start = open.as_ref().unwrap().2;
+                let matches_open = open.as_ref().is_some_and(|(ot, _, _, _, _, _)| *ot == typ);
+                if matches_open {
+                    let (_, lid, start, _, start_token, min_so_far) = open.take().unwrap();
                     entities.push(Entity {
                         label: typ,
                         label_id: lid,
                         start,
                         end: t.end,
                         token_range: start_token..t.token_index + 1,
+                        score: min_so_far.min(t.score),
                     });
-                    open = None;
                     continue;
                 }
                 // Stray L-/E-: emit a single-token span.
@@ -1245,6 +1259,7 @@ pub fn group_spans(tokens: &[TokenLabel<'_>], scheme: Scheme) -> Vec<Entity> {
                     start: t.start,
                     end: t.end,
                     token_range: t.token_index..t.token_index + 1,
+                    score: t.score,
                 });
             }
         }
@@ -1254,6 +1269,42 @@ pub fn group_spans(tokens: &[TokenLabel<'_>], scheme: Scheme) -> Vec<Entity> {
     close_span(&mut open, &mut entities, tokens.len());
 
     entities
+}
+
+/// Document-level span grouping for multi-chunk (e.g. sliding-window) token
+/// classification: the cross-chunk companion to [`group_spans`].
+///
+/// Overlapping windows predict the same source tokens more than once, and an
+/// entity straddling a window boundary is split across chunks. This collapses
+/// the overlap: every per-chunk [`TokenLabel`] is flattened into one stream,
+/// deduplicated by byte span (the highest-confidence prediction wins a
+/// disagreement), re-indexed contiguously, and re-grouped under `scheme` — so
+/// the split halves of a boundary entity merge into one [`Entity`].
+///
+/// `per_chunk` is one `Vec<TokenLabel>` per chunk (each produced by
+/// [`labels_for_tokens`]); the returned [`Entity`] spans carry source-absolute
+/// byte ranges and conservative min-score aggregation, exactly like
+/// [`group_spans`]. For non-overlapping chunkers (`TruncatingChunker`, or
+/// `SlidingWindowChunker` with `stride == window`) this is equivalent to
+/// concatenating the chunks; it matters only when windows overlap.
+pub fn group_spans_document<'a>(per_chunk: &[Vec<TokenLabel<'a>>], scheme: Scheme) -> Vec<Entity> {
+    // Flatten, then sort by (start, end, score desc) so dedup_by keeps the
+    // highest-confidence prediction for each byte span.
+    let mut all: Vec<TokenLabel<'a>> = per_chunk.iter().flatten().copied().collect();
+    all.sort_by(|a, b| {
+        a.start
+            .cmp(&b.start)
+            .then(a.end.cmp(&b.end))
+            .then(b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal))
+    });
+    all.dedup_by(|a, b| a.start == b.start && a.end == b.end);
+
+    // Re-index contiguously: group_spans reads token_index for token_range.
+    for (i, t) in all.iter_mut().enumerate() {
+        t.token_index = i;
+    }
+
+    group_spans(&all, scheme)
 }
 
 /// Tag prefix decoded by [`parse_tag`].
@@ -1291,9 +1342,9 @@ fn parse_tag(label: &str, scheme: Scheme) -> (Prefix, Option<String>) {
 }
 
 /// Flush an open span (if any) into `out` spanning `[start_token .. end_token)`.
-fn close_span(open: &mut Option<(String, u32, usize, usize, usize)>, out: &mut Vec<Entity>, end_token: usize) {
-    if let Some((typ, lid, start, end, start_token)) = open.take() {
-        out.push(Entity { label: typ, label_id: lid, start, end, token_range: start_token..end_token });
+fn close_span(open: &mut Option<(String, u32, usize, usize, usize, f32)>, out: &mut Vec<Entity>, end_token: usize) {
+    if let Some((typ, lid, start, end, start_token, score)) = open.take() {
+        out.push(Entity { label: typ, label_id: lid, start, end, token_range: start_token..end_token, score });
     }
 }
 

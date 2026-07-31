@@ -7,7 +7,7 @@ use crate::pipelines::text::{
     ChunkTokenClassification, Chunker, Classification, Classify, Embed, Embedding, Encoder, EncoderPipeline,
     EncoderPipelineError, Encoding, Entity, HfTokenizer, HfTokenizerError, Recognize, RunOptions, RunProfile, Scheme,
     SlidingWindowChunker, SlidingWindowChunkerError, TextChunk, TokenClassification, TokenLabel, Tokenizer,
-    TruncatingChunker, argmax, group_spans, labels_for_tokens, softmax,
+    TruncatingChunker, argmax, group_spans, group_spans_document, labels_for_tokens, softmax,
 };
 
 fn enc(ids: &[u32]) -> Encoding {
@@ -316,6 +316,21 @@ fn sliding_all_specials_returns_empty() {
     let mut chunker = SlidingWindowChunker::new(8, 4);
     let out = chunker.chunk(&enc_with_specials(&[])).unwrap();
     assert!(out.is_empty());
+}
+
+#[test]
+fn sliding_stride_one_maximally_overlaps() {
+    // window=2, stride=1 over 4 content tokens (no specials): each consecutive
+    // pair gets its own window, overlapping the last by 1 token.
+    let mut chunker = SlidingWindowChunker::new(2, 1);
+    let out = chunker.chunk(&enc(&[10, 20, 30, 40])).unwrap();
+    assert_eq!(out.len(), 3);
+    assert_eq!(out[0].encoding.input_ids, vec![10, 20]);
+    assert_eq!(out[1].encoding.input_ids, vec![20, 30]);
+    assert_eq!(out[2].encoding.input_ids, vec![30, 40]);
+    // byte_offsets are monotonic and advance by the stride.
+    let offsets: Vec<usize> = out.iter().map(|c| c.byte_offset).collect();
+    assert_eq!(offsets, vec![0, 1, 2]);
 }
 
 #[test]
@@ -1683,10 +1698,20 @@ fn labels_for_tokens_argmaxes_skips_specials_and_pairs_offsets() {
     );
     let labels = labels_for_tokens(&chunk, ner_id2label);
     assert_eq!(labels.len(), 4, "special token dropped");
-    assert_eq!(labels[0], TokenLabel { label_id: 1, label: "B-PER", start: 0, end: 3, token_index: 0 });
-    assert_eq!(labels[1], TokenLabel { label_id: 2, label: "I-PER", start: 3, end: 7, token_index: 1 });
-    assert_eq!(labels[2], TokenLabel { label_id: 0, label: "O", start: 7, end: 8, token_index: 2 });
-    assert_eq!(labels[3], TokenLabel { label_id: 1, label: "B-PER", start: 8, end: 12, token_index: 3 });
+    // One-hot rows: softmax score is in (0, 1]; check structure field-by-field
+    // and assert the score is a sane probability rather than hardcoding the
+    // (num_labels-dependent) softmax value.
+    let check = |t: &TokenLabel, lid, lbl, s, e, idx| {
+        assert_eq!(t.label_id, lid);
+        assert_eq!(t.label, lbl);
+        assert_eq!((t.start, t.end), (s, e));
+        assert_eq!(t.token_index, idx);
+        assert!(t.score > 0.0 && t.score <= 1.0, "score {} not in (0,1]", t.score);
+    };
+    check(&labels[0], 1, "B-PER", 0, 3, 0);
+    check(&labels[1], 2, "I-PER", 3, 7, 1);
+    check(&labels[2], 0, "O", 7, 8, 2);
+    check(&labels[3], 1, "B-PER", 8, 12, 3);
 }
 
 #[test]
@@ -1710,8 +1735,12 @@ fn group_spans_bio_breaks_on_type_change() {
     let labels = labels_for_tokens(&chunk, ner_id2label);
     let spans = group_spans(&labels, Scheme::Bio);
     assert_eq!(spans.len(), 2);
-    assert_eq!(spans[0], Entity { label: "PER".into(), label_id: 1, start: 0, end: 3, token_range: 0..1 });
-    assert_eq!(spans[1], Entity { label: "LOC".into(), label_id: 4, start: 3, end: 6, token_range: 1..2 });
+    // Single-token spans carry the token's softmax score; check structure + that
+    // the score propagated (rather than hardcoding the one-hot softmax value).
+    assert_eq!((spans[0].label.as_str(), spans[0].label_id, spans[0].start, spans[0].end, spans[0].token_range.clone()), ("PER", 1, 0, 3, 0..1));
+    assert_eq!(spans[0].score, labels[0].score);
+    assert_eq!((spans[1].label.as_str(), spans[1].label_id, spans[1].start, spans[1].end, spans[1].token_range.clone()), ("LOC", 4, 3, 6, 1..2));
+    assert_eq!(spans[1].score, labels[1].score);
 }
 
 #[test]
@@ -1730,12 +1759,13 @@ fn group_spans_flat_emits_one_per_token() {
     // Flat labels (POS-style): each token its own entity, no grouping.
     let labels: Vec<TokenLabel> = [("NNS", 0), ("VBD", 1)]
         .into_iter()
-        .map(|(lbl, i)| TokenLabel { label_id: 0, label: lbl, start: i, end: i + 1, token_index: i })
+        .map(|(lbl, i)| TokenLabel { label_id: 0, label: lbl, start: i, end: i + 1, token_index: i, score: 1.0 })
         .collect();
     let spans = group_spans(&labels, Scheme::Flat);
     assert_eq!(spans.len(), 2);
     assert_eq!(spans[0].label, "NNS");
     assert_eq!(spans[0].token_range, 0..1);
+    assert_eq!(spans[0].score, 1.0, "flat single-token span carries the token's score");
     assert_eq!(spans[1].label, "VBD");
     assert_eq!(spans[1].token_range, 1..2);
 }
@@ -1743,34 +1773,155 @@ fn group_spans_flat_emits_one_per_token() {
 #[test]
 fn group_spans_bilou_and_iobes() {
     // BILOU: B-PER I-PER L-PER → one PER span over 3 tokens; U-PER → single.
-    let bilou_labels: Vec<TokenLabel> = [("B-PER", 0), ("I-PER", 1), ("L-PER", 2), ("U-PER", 3)]
+    // Varied scores exercise the min aggregation: the 3-token span's score is
+    // min(0.9, 0.5, 0.7) = 0.5; the U singleton keeps its own 0.8.
+    let bilou_labels: Vec<TokenLabel> = [("B-PER", 0.9), ("I-PER", 0.5), ("L-PER", 0.7), ("U-PER", 0.8)]
         .into_iter()
-        .map(|(lbl, i)| TokenLabel { label_id: 1, label: lbl, start: i, end: i + 1, token_index: i })
+        .enumerate()
+        .map(|(i, (lbl, sc))| TokenLabel { label_id: 1, label: lbl, start: i, end: i + 1, token_index: i, score: sc })
         .collect();
     let bilou = group_spans(&bilou_labels, Scheme::Bilou);
     assert_eq!(bilou.len(), 2);
     assert_eq!(bilou[0].label, "PER");
     assert_eq!(bilou[0].token_range, 0..3);
+    assert_eq!(bilou[0].score, 0.5, "multi-token span score = min over members");
     assert_eq!(bilou[1].label, "PER");
     assert_eq!(bilou[1].token_range, 3..4);
+    assert_eq!(bilou[1].score, 0.8, "U singleton keeps its own score");
 
     // IOBES: B-PER I-PER E-PER → one span; S-PER → single.
-    let iobes_labels: Vec<TokenLabel> = [("B-PER", 0), ("I-PER", 1), ("E-PER", 2), ("S-PER", 3)]
+    let iobes_labels: Vec<TokenLabel> = [("B-PER", 0.6), ("I-PER", 0.4), ("E-PER", 0.95), ("S-PER", 0.3)]
         .into_iter()
-        .map(|(lbl, i)| TokenLabel { label_id: 1, label: lbl, start: i, end: i + 1, token_index: i })
+        .enumerate()
+        .map(|(i, (lbl, sc))| TokenLabel { label_id: 1, label: lbl, start: i, end: i + 1, token_index: i, score: sc })
         .collect();
     let iobes = group_spans(&iobes_labels, Scheme::Iobes);
     assert_eq!(iobes.len(), 2);
     assert_eq!(iobes[0].label, "PER");
     assert_eq!(iobes[0].token_range, 0..3);
+    assert_eq!(iobes[0].score, 0.4);
     assert_eq!(iobes[1].label, "PER");
     assert_eq!(iobes[1].token_range, 3..4);
+    assert_eq!(iobes[1].score, 0.3);
+}
+
+// ─── span decoder: adversarial / edge transitions ───────────────────────────
+
+/// `tl` builds a content TokenLabel for the edge-case tests.
+fn tl(label: &str, start: usize, end: usize, idx: usize, score: f32) -> TokenLabel<'_> {
+    TokenLabel { label_id: 0, label, start, end, token_index: idx, score }
+}
+
+#[test]
+fn group_spans_empty_and_all_o_yield_nothing() {
+    assert!(group_spans(&[], Scheme::Bio).is_empty(), "empty input");
+    let all_o = vec![tl("O", 0, 1, 0, 1.0), tl("O", 1, 2, 1, 1.0)];
+    assert!(group_spans(&all_o, Scheme::Bio).is_empty(), "all-O");
+}
+
+#[test]
+fn group_spans_bio_extends_multi_i_then_breaks_on_o() {
+    // B-PER I-PER I-PER I-PER O → one 4-token PER span, then O ends it.
+    let labels = vec![
+        tl("B-PER", 0, 3, 0, 0.9),
+        tl("I-PER", 3, 6, 1, 0.5),
+        tl("I-PER", 6, 9, 2, 0.8),
+        tl("I-PER", 9, 12, 3, 0.6),
+        tl("O", 12, 13, 4, 1.0),
+    ];
+    let spans = group_spans(&labels, Scheme::Bio);
+    assert_eq!(spans.len(), 1);
+    assert_eq!((spans[0].start, spans[0].end), (0, 12));
+    assert_eq!(spans[0].token_range, 0..4);
+    assert_eq!(spans[0].score, 0.5, "score = min over the 4 members");
+}
+
+#[test]
+fn group_spans_open_span_flushes_at_end_of_sequence() {
+    // B-PER I-PER with no closer → flushed at end as one span.
+    let labels = vec![tl("B-PER", 0, 3, 0, 0.9), tl("I-PER", 3, 6, 1, 0.4)];
+    let spans = group_spans(&labels, Scheme::Bio);
+    assert_eq!(spans.len(), 1);
+    assert_eq!((spans[0].start, spans[0].end), (0, 6));
+    assert_eq!(spans[0].token_range, 0..2);
+    assert_eq!(spans[0].score, 0.4);
+}
+
+#[test]
+fn group_spans_bilou_stray_l_emits_single() {
+    // L-PER with no open span → lenient single-token span.
+    let labels = vec![tl("L-PER", 0, 3, 0, 0.7), tl("O", 3, 4, 1, 1.0)];
+    let spans = group_spans(&labels, Scheme::Bilou);
+    assert_eq!(spans.len(), 1);
+    assert_eq!(spans[0].label, "PER");
+    assert_eq!(spans[0].token_range, 0..1);
+    assert_eq!(spans[0].score, 0.7);
+}
+
+#[test]
+fn group_spans_iobes_stray_e_emits_single() {
+    // E-PER with no open span → lenient single-token span.
+    let labels = vec![tl("E-PER", 0, 3, 0, 0.6)];
+    let spans = group_spans(&labels, Scheme::Iobes);
+    assert_eq!(spans.len(), 1);
+    assert_eq!(spans[0].label, "PER");
+    assert_eq!(spans[0].token_range, 0..1);
+    assert_eq!(spans[0].score, 0.6);
+}
+
+#[test]
+fn group_spans_bilou_mismatched_closer_flushes_then_single() {
+    // B-PER L-LOC: the L-LOC type mismatches the open PER → flush PER (B alone),
+    // then emit a single-token LOC for the stray L-.
+    let labels = vec![tl("B-PER", 0, 3, 0, 0.9), tl("L-LOC", 3, 6, 1, 0.5)];
+    let spans = group_spans(&labels, Scheme::Bilou);
+    assert_eq!(spans.len(), 2);
+    assert_eq!(spans[0].label, "PER");
+    assert_eq!((spans[0].start, spans[0].end), (0, 3));
+    assert_eq!(spans[1].label, "LOC");
+    assert_eq!((spans[1].start, spans[1].end), (3, 6));
+    assert_eq!(spans[1].score, 0.5);
+}
+
+// ─── group_spans_document (cross-chunk merge) ────────────────────────────────
+
+#[test]
+fn group_spans_document_merges_overlap_and_boundary_split() {
+    // A 3-token PER entity straddling a window boundary. Window A covers the
+    // first two tokens; window B covers the last two (overlapping on the
+    // middle token at byte span (3,7)). Per-window decoding splits the entity;
+    // the document grouping dedups the overlap and re-merges into one span.
+    let window_a = vec![tl("B-PER", 0, 3, 0, 0.9), tl("I-PER", 3, 7, 1, 0.8)];
+    // Window B sees the middle token as a stray I- (no opener in-window); the
+    // document merge re-groups it as a continuation once dedup'd.
+    let window_b = vec![tl("I-PER", 3, 7, 0, 0.85), tl("I-PER", 7, 10, 1, 0.7)];
+    let spans = group_spans_document(&[window_a, window_b], Scheme::Bio);
+    assert_eq!(spans.len(), 1);
+    assert_eq!(spans[0].label, "PER");
+    assert_eq!((spans[0].start, spans[0].end), (0, 10), "merged across the boundary");
+    assert_eq!(spans[0].token_range, 0..3, "3 unique tokens after dedup");
+    // Overlap token (3,7): higher score 0.85 kept; span score = min(0.9,0.85,0.7).
+    assert_eq!(spans[0].score, 0.7);
+}
+
+#[test]
+fn group_spans_document_non_overlapping_equivalent_to_concat() {
+    // Adjacent (non-overlapping) chunks: document grouping == concatenation.
+    let chunk0 = vec![tl("B-PER", 0, 3, 0, 1.0), tl("I-PER", 3, 6, 1, 1.0)];
+    let chunk1 = vec![tl("O", 6, 7, 0, 1.0), tl("B-LOC", 7, 10, 1, 1.0)];
+    let spans = group_spans_document(&[chunk0, chunk1], Scheme::Bio);
+    assert_eq!(spans.len(), 2);
+    assert_eq!(spans[0].label, "PER");
+    assert_eq!((spans[0].start, spans[0].end), (0, 6));
+    assert_eq!(spans[1].label, "LOC");
+    assert_eq!((spans[1].start, spans[1].end), (7, 10));
 }
 
 proptest! {
     /// Random BIO label sequences decode to well-formed spans: disjoint,
     /// ordered, in-bounds ranges; every token in a span shares the span's type;
-    /// no "O" token is inside a span; byte spans match the covered tokens.
+    /// no "O" token is inside a span; byte spans match the covered tokens; and
+    /// each span's score is the min over its member tokens.
     #[test]
     fn prop_group_spans_bio_well_formed(
         labels in proptest::collection::vec(
@@ -1778,10 +1929,19 @@ proptest! {
             0..32,
         )
     ) {
+        // Vary scores deterministically so the min-aggregation invariant is
+        // exercised (not just constant 1.0).
         let tokens: Vec<TokenLabel> = labels
             .iter()
             .enumerate()
-            .map(|(i, l)| TokenLabel { label_id: 0, label: l.as_str(), start: i, end: i + 1, token_index: i })
+            .map(|(i, l)| TokenLabel {
+                label_id: 0,
+                label: l.as_str(),
+                start: i,
+                end: i + 1,
+                token_index: i,
+                score: 1.0 - (i as f32) * 0.01,
+            })
             .collect();
         let n = tokens.len();
         let entities = group_spans(&tokens, Scheme::Bio);
@@ -1796,10 +1956,14 @@ proptest! {
             prop_assert_eq!(e.start, tokens[e.token_range.start].start);
             prop_assert_eq!(e.end, tokens[e.token_range.end - 1].end);
             // Every covered token shares the span's type and is not "O".
+            let mut min_score = f32::INFINITY;
             for ti in e.token_range.clone() {
                 prop_assert!(tokens[ti].label != "O", "'O' token inside a span");
                 prop_assert_eq!(typ_of(tokens[ti].label), Some(e.label.as_str()), "type mismatch in span");
+                min_score = min_score.min(tokens[ti].score);
             }
+            // Score = conservative min over members.
+            prop_assert_eq!(e.score, min_score, "span score is the min over members");
             prev_end = e.token_range.end;
         }
     }
