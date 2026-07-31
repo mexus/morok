@@ -700,6 +700,30 @@ fn hf_tokenizer_from_path_matches_from_bytes() {
 }
 
 #[test]
+fn hf_tokenizer_encode_batch_matches_per_input_encode() {
+    // The native HF batch path (`inner.encode_batch`) is the production
+    // tokenization path for embed_batch / classify_batch / classify_tokens_batch,
+    // distinct from the default `encode_batch` loop (it converts to Vec<String>
+    // and exercises HF's own batching). It must agree field-for-field with
+    // looping `encode` — the only thing a per-input encode could diverge on.
+    let mut tok = HfTokenizer::from_bytes(fixture_json()).expect("load fixture");
+    let texts = ["hello world", "foo bar", "hello world foo bar"];
+    let batched = tok.encode_batch(&texts).expect("encode_batch");
+    assert_eq!(batched.len(), texts.len());
+    for (i, text) in texts.iter().enumerate() {
+        let single = tok.encode(text).expect("encode");
+        let b = &batched[i];
+        assert_eq!(b.input_ids, single.input_ids, "input_ids for {text:?}");
+        assert_eq!(b.attention_mask, single.attention_mask, "attention_mask for {text:?}");
+        assert_eq!(b.token_type_ids, single.token_type_ids, "token_type_ids for {text:?}");
+        assert_eq!(b.offsets, single.offsets, "offsets for {text:?}");
+        assert_eq!(b.special_tokens_mask, single.special_tokens_mask, "special_tokens_mask for {text:?}");
+    }
+    // Sanity: the texts produce distinct id sequences (no accidental collapse).
+    assert_ne!(batched[0].input_ids, batched[1].input_ids);
+}
+
+#[test]
 fn encoding_from_hf_copies_all_fields() {
     let inner = fixture_tokenizer();
     let hf = inner.encode("hello world", true).expect("hf encode");
@@ -834,6 +858,46 @@ fn batch_sub_batches_when_chunks_exceed_max_batch() {
         assert_eq!(result.chunks.len(), 1);
         assert_eq!(result.chunks[0].values, vec![texts[i].as_bytes()[0] as f32]);
     }
+}
+
+#[test]
+fn embed_batch_sub_batches_across_text_boundaries_with_sliding_window() {
+    // The one path that was untested: multi-chunk-per-text (SlidingWindowChunker)
+    // AND total chunks > max_batch, so a sub-batch boundary lands *mid-text*.
+    // run_batch_inner's flatten → sub-batch → re-split-by-count is duplicated
+    // with the seam path; the seam is tested with varying counts, but the full
+    // tokenize→chunk→batch path under both conditions at once was not.
+    let mut p = EncoderPipeline::new(
+        ByteTokenizer,
+        SlidingWindowChunker::new(3, 3),
+        BatchSpy { sizes: Vec::new(), max_batch: 2 },
+    );
+    // "abcdefghi" (9 content tokens) -> 3 non-overlapping windows of 3;
+    // "jkl" (3 tokens) -> 1 window. Flatten = [abc, def, ghi, jkl]; max_batch=2
+    // -> sub-batches [abc,def] and [ghi,jkl] — the second straddles the boundary.
+    let out = p.embed_batch(&["abcdefghi", "jkl"], ()).unwrap();
+    assert_eq!(out.results.len(), 2);
+
+    // The cross-text coalescing is observable: the second sub-batch mixes the
+    // tail of text 0 with all of text 1.
+    assert_eq!(p.model_mut().sizes, vec![2, 2]);
+
+    // Re-split by per-text chunk count survived the cross-boundary sub-batch:
+    // correct counts, correct source byte_offsets, and the right ids (BatchSpy
+    // echoes input ids as f32) paired with each chunk.
+    let a = &out.results[0].chunks;
+    assert_eq!(a.len(), 3);
+    assert_eq!(a[0].byte_offset, 0);
+    assert_eq!(a[0].values, vec![97.0, 98.0, 99.0]); // abc
+    assert_eq!(a[1].byte_offset, 3);
+    assert_eq!(a[1].values, vec![100.0, 101.0, 102.0]); // def
+    assert_eq!(a[2].byte_offset, 6);
+    assert_eq!(a[2].values, vec![103.0, 104.0, 105.0]); // ghi
+
+    let b = &out.results[1].chunks;
+    assert_eq!(b.len(), 1);
+    assert_eq!(b[0].byte_offset, 0);
+    assert_eq!(b[0].values, vec![106.0, 107.0, 108.0]); // jkl
 }
 
 #[test]
