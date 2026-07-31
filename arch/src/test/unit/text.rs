@@ -6,8 +6,8 @@ use crate::pipelines::text::{
     BatchClassifications, BatchEmbeddings, BatchTokenClassifications, ChunkClassification, ChunkEmbedding,
     ChunkTokenClassification, Chunker, Classification, Classify, Embed, Embedding, Encoder, EncoderPipeline,
     EncoderPipelineError, Encoding, Entity, HfTokenizer, HfTokenizerError, Recognize, RunOptions, RunProfile, Scheme,
-    SlidingWindowChunker, TextChunk, TokenClassification, TokenLabel, Tokenizer, TruncatingChunker, argmax,
-    group_spans, labels_for_tokens, softmax,
+    SlidingWindowChunker, SlidingWindowChunkerBuildError, TextChunk, TokenClassification, TokenLabel, Tokenizer,
+    TruncatingChunker, argmax, group_spans, labels_for_tokens, softmax,
 };
 
 fn enc(ids: &[u32]) -> Encoding {
@@ -128,10 +128,10 @@ impl Embed for StubEmbed {
 struct StubEmbedError;
 
 /// Turns ids into deterministic class logits (analog of `StubEmbed`):
-/// num_classes = the id count, logits = ids as f32. `profile` emits a single
+/// num_labels = the id count, logits = ids as f32. `profile` emits a single
 /// 1 ms `classify` stage — enough to exercise the merge without a model.
 struct StubClassify {
-    num_classes: usize,
+    num_labels: usize,
     max_batch: usize,
     error: bool,
 }
@@ -141,7 +141,7 @@ impl Encoder for StubClassify {
     type ChunkOutput = ChunkClassification;
     type Error = StubClassifyError;
     fn capacity(&self) -> (usize, usize) {
-        (self.max_batch, self.num_classes)
+        (self.max_batch, self.num_labels)
     }
     fn run_batch(
         &mut self,
@@ -168,8 +168,8 @@ impl Encoder for StubClassify {
 }
 
 impl Classify for StubClassify {
-    fn num_classes(&self) -> usize {
-        self.num_classes
+    fn num_labels(&self) -> usize {
+        self.num_labels
     }
 }
 
@@ -341,6 +341,26 @@ fn sliding_new_rejects_zero_stride() {
 #[should_panic(expected = "stride must be in 1..=window")]
 fn sliding_new_rejects_stride_above_window() {
     let _ = SlidingWindowChunker::new(4, 5);
+}
+
+#[test]
+fn sliding_try_new_rejects_invalid_args() {
+    assert!(matches!(SlidingWindowChunker::try_new(0, 1).unwrap_err(), SlidingWindowChunkerBuildError::WindowTooSmall));
+    assert!(matches!(
+        SlidingWindowChunker::try_new(4, 0).unwrap_err(),
+        SlidingWindowChunkerBuildError::StrideOutOfRange
+    ));
+    assert!(matches!(
+        SlidingWindowChunker::try_new(4, 5).unwrap_err(),
+        SlidingWindowChunkerBuildError::StrideOutOfRange
+    ));
+}
+
+#[test]
+fn sliding_try_new_accepts_valid_args() {
+    let c = SlidingWindowChunker::try_new(4, 2).unwrap();
+    assert_eq!(c.max_seq(), 4);
+    assert!(SlidingWindowChunker::try_new(1, 1).is_ok());
 }
 
 #[test]
@@ -813,13 +833,13 @@ fn classify_pipeline(ids: Vec<u32>, max_seq: usize) -> EncoderPipeline<StubToken
     EncoderPipeline::new(
         StubTokenizer { ids, max_seq, error: false },
         TruncatingChunker::new(max_seq),
-        StubClassify { num_classes: max_seq, max_batch: 1, error: false },
+        StubClassify { num_labels: max_seq, max_batch: 1, error: false },
     )
 }
 
 #[test]
 fn classify_single_is_batch_of_one() {
-    let mut cls = StubClassify { num_classes: 3, max_batch: 1, error: false };
+    let mut cls = StubClassify { num_labels: 3, max_batch: 1, error: false };
     let e = enc(&[4, 5, 6]);
     let single = cls.run(&e, false).unwrap().0;
     let batch = cls.run_batch(&[&e], false).unwrap().0;
@@ -859,7 +879,7 @@ fn classify_pipeline_zero_chunk_run_skips_classify_and_profiles_host_stages() {
     let p = EncoderPipeline::new(
         StubTokenizer { ids: vec![1, 2], max_seq: 4, error: false },
         NoChunkChunker { max_seq: 4 },
-        StubClassify { num_classes: 4, max_batch: 1, error: true }, // would fail if called
+        StubClassify { num_labels: 4, max_batch: 1, error: true }, // would fail if called
     );
     let mut p = p;
     let out = p.classify("ignored", RunOptions { profile: true }).unwrap();
@@ -877,7 +897,7 @@ fn classify_assemble_passes_chunker_max_seq_into_builder() {
         TruncatingChunker::new(8),
         |max_seq| {
             seen.set(max_seq);
-            Ok::<_, Infallible>(StubClassify { num_classes: max_seq, max_batch: 1, error: false })
+            Ok::<_, Infallible>(StubClassify { num_labels: max_seq, max_batch: 1, error: false })
         },
     )
     .unwrap();
@@ -889,7 +909,7 @@ fn classify_sliding_pipeline_produces_per_window_classifications() {
     let mut p = EncoderPipeline::new(
         StubTokenizer { ids: vec![10, 20, 30, 40, 50, 60], max_seq: 3, error: false },
         SlidingWindowChunker::new(3, 2),
-        StubClassify { num_classes: 3, max_batch: 1, error: false },
+        StubClassify { num_labels: 3, max_batch: 1, error: false },
     );
     let out = p.classify_default("ignored").unwrap();
     assert_eq!(out.chunks.len(), 3);
@@ -906,7 +926,7 @@ fn classify_tokenize_error_maps_to_tokenize_variant() {
     let mut p = EncoderPipeline::new(
         StubTokenizer { ids: vec![1], max_seq: 4, error: true },
         TruncatingChunker::new(4),
-        StubClassify { num_classes: 4, max_batch: 1, error: false },
+        StubClassify { num_labels: 4, max_batch: 1, error: false },
     );
     let err = p.classify_default("ignored").unwrap_err();
     assert!(matches!(err, EncoderPipelineError::Tokenize { .. }));
@@ -917,7 +937,7 @@ fn classify_error_maps_to_classify_variant() {
     let mut p = EncoderPipeline::new(
         StubTokenizer { ids: vec![1, 2], max_seq: 4, error: false },
         TruncatingChunker::new(4),
-        StubClassify { num_classes: 4, max_batch: 1, error: true },
+        StubClassify { num_labels: 4, max_batch: 1, error: true },
     );
     let err = p.classify_default("ignored").unwrap_err();
     assert!(matches!(err, EncoderPipelineError::Encode { .. }));
@@ -928,7 +948,7 @@ fn classify_chunk_error_maps_to_chunk_variant() {
     let mut p = EncoderPipeline::new(
         StubTokenizer { ids: vec![1, 2], max_seq: 4, error: false },
         ErrChunker { max_seq: 4 },
-        StubClassify { num_classes: 4, max_batch: 1, error: false },
+        StubClassify { num_labels: 4, max_batch: 1, error: false },
     );
     let err = p.classify_default("ignored").unwrap_err();
     assert!(matches!(err, EncoderPipelineError::Chunk { .. }));
@@ -941,7 +961,7 @@ fn classify_batch_basic_three_texts() {
     let mut p = EncoderPipeline::new(
         ByteTokenizer { max_seq: 32 },
         TruncatingChunker::new(32),
-        StubClassify { num_classes: 32, max_batch: 8, error: false },
+        StubClassify { num_labels: 32, max_batch: 8, error: false },
     );
     let out = p.classify_batch_default(&["ab", "xyz", "hello"]).unwrap();
     assert_eq!(out.results.len(), 3);
@@ -957,7 +977,7 @@ fn classify_batch_with_sliding_window_varying_chunk_counts() {
     let mut p = EncoderPipeline::new(
         ByteTokenizer { max_seq: 3 },
         SlidingWindowChunker::new(3, 2),
-        StubClassify { num_classes: 3, max_batch: 8, error: false },
+        StubClassify { num_labels: 3, max_batch: 8, error: false },
     );
     let out = p.classify_batch_default(&["abcdef", "ab", "abcd"]).unwrap();
     assert_eq!(out.results.len(), 3);
@@ -974,7 +994,7 @@ fn classify_batch_empty_texts_returns_empty() {
     let mut p = EncoderPipeline::new(
         ByteTokenizer { max_seq: 8 },
         TruncatingChunker::new(8),
-        StubClassify { num_classes: 8, max_batch: 4, error: false },
+        StubClassify { num_labels: 8, max_batch: 4, error: false },
     );
     let out: BatchClassifications = p.classify_batch_default(&[]).unwrap();
     assert!(out.results.is_empty());
@@ -986,7 +1006,7 @@ fn classify_batch_some_texts_produce_zero_chunks() {
     let mut p = EncoderPipeline::new(
         ByteTokenizer { max_seq: 4 },
         SlidingWindowChunker::new(4, 2),
-        StubClassify { num_classes: 4, max_batch: 4, error: false },
+        StubClassify { num_labels: 4, max_batch: 4, error: false },
     );
     let out = p.classify_batch_default(&["ab", "", "cd"]).unwrap();
     assert_eq!(out.results.len(), 3);
@@ -1000,7 +1020,7 @@ fn classify_batch_sub_batches_when_chunks_exceed_max_batch() {
     let mut p = EncoderPipeline::new(
         ByteTokenizer { max_seq: 8 },
         TruncatingChunker::new(8),
-        StubClassify { num_classes: 8, max_batch: 2, error: false },
+        StubClassify { num_labels: 8, max_batch: 2, error: false },
     );
     let texts: Vec<&str> = vec!["a", "b", "c", "d", "e"];
     let out = p.classify_batch_default(&texts).unwrap();
@@ -1016,7 +1036,7 @@ fn classify_batch_profile_has_tokenize_chunk_classify_stages() {
     let mut p = EncoderPipeline::new(
         ByteTokenizer { max_seq: 8 },
         TruncatingChunker::new(8),
-        StubClassify { num_classes: 8, max_batch: 4, error: false },
+        StubClassify { num_labels: 8, max_batch: 4, error: false },
     );
     let out = p.classify_batch(&["ab", "cd"], RunOptions { profile: true }).unwrap();
     assert_eq!(out.results.len(), 2);
@@ -1032,7 +1052,7 @@ fn classify_batch_tokenize_error_maps_to_tokenize_variant() {
     let mut p = EncoderPipeline::new(
         StubTokenizer { ids: vec![1], max_seq: 4, error: true },
         TruncatingChunker::new(4),
-        StubClassify { num_classes: 4, max_batch: 4, error: false },
+        StubClassify { num_labels: 4, max_batch: 4, error: false },
     );
     let err = p.classify_batch_default(&["a", "b"]).unwrap_err();
     assert!(matches!(err, EncoderPipelineError::Tokenize { .. }));
@@ -1044,7 +1064,7 @@ fn classify_batch_results_match_individual_classify_calls() {
         EncoderPipeline::new(
             ByteTokenizer { max_seq: 4 },
             SlidingWindowChunker::new(4, 2),
-            StubClassify { num_classes: 4, max_batch: 8, error: false },
+            StubClassify { num_labels: 4, max_batch: 8, error: false },
         )
     };
 
@@ -1432,7 +1452,7 @@ fn chunk_seam_reuses_chunks_across_embed_and_classify() {
         EncoderPipeline::new(
             StubTokenizer { ids: vec![], max_seq: 3, error: true },
             TruncatingChunker::new(3),
-            StubClassify { num_classes: 3, max_batch: 1, error: false },
+            StubClassify { num_labels: 3, max_batch: 1, error: false },
         )
     };
 
@@ -1610,8 +1630,8 @@ fn token_chunk(spec: &[(u32, (usize, usize), bool)], num_labels: usize) -> Chunk
 }
 
 /// id2label for the decoder tests: 0=O, 1=B-PER, 2=I-PER, 3=B-LOC, 4=I-LOC.
-fn ner_id2label(id: u32) -> String {
-    ["O", "B-PER", "I-PER", "B-LOC", "I-LOC"].get(id as usize).map(|s| (*s).to_string()).unwrap_or_default()
+fn ner_id2label(id: u32) -> &'static str {
+    ["O", "B-PER", "I-PER", "B-LOC", "I-LOC"].get(id as usize).copied().unwrap_or("")
 }
 
 /// The entity type of a prefixed label (`"B-PER"` → `"PER"`); `None` for `"O"`.
@@ -1628,10 +1648,10 @@ fn labels_for_tokens_argmaxes_skips_specials_and_pairs_offsets() {
     );
     let labels = labels_for_tokens(&chunk, ner_id2label);
     assert_eq!(labels.len(), 4, "special token dropped");
-    assert_eq!(labels[0], TokenLabel { label_id: 1, label: "B-PER".into(), start: 0, end: 3, token_index: 0 });
-    assert_eq!(labels[1], TokenLabel { label_id: 2, label: "I-PER".into(), start: 3, end: 7, token_index: 1 });
-    assert_eq!(labels[2], TokenLabel { label_id: 0, label: "O".into(), start: 7, end: 8, token_index: 2 });
-    assert_eq!(labels[3], TokenLabel { label_id: 1, label: "B-PER".into(), start: 8, end: 12, token_index: 3 });
+    assert_eq!(labels[0], TokenLabel { label_id: 1, label: "B-PER", start: 0, end: 3, token_index: 0 });
+    assert_eq!(labels[1], TokenLabel { label_id: 2, label: "I-PER", start: 3, end: 7, token_index: 1 });
+    assert_eq!(labels[2], TokenLabel { label_id: 0, label: "O", start: 7, end: 8, token_index: 2 });
+    assert_eq!(labels[3], TokenLabel { label_id: 1, label: "B-PER", start: 8, end: 12, token_index: 3 });
 }
 
 #[test]
@@ -1675,7 +1695,7 @@ fn group_spans_flat_emits_one_per_token() {
     // Flat labels (POS-style): each token its own entity, no grouping.
     let labels: Vec<TokenLabel> = [("NNS", 0), ("VBD", 1)]
         .into_iter()
-        .map(|(lbl, i)| TokenLabel { label_id: 0, label: lbl.into(), start: i, end: i + 1, token_index: i })
+        .map(|(lbl, i)| TokenLabel { label_id: 0, label: lbl, start: i, end: i + 1, token_index: i })
         .collect();
     let spans = group_spans(&labels, Scheme::Flat);
     assert_eq!(spans.len(), 2);
@@ -1690,7 +1710,7 @@ fn group_spans_bilou_and_iobes() {
     // BILOU: B-PER I-PER L-PER → one PER span over 3 tokens; U-PER → single.
     let bilou_labels: Vec<TokenLabel> = [("B-PER", 0), ("I-PER", 1), ("L-PER", 2), ("U-PER", 3)]
         .into_iter()
-        .map(|(lbl, i)| TokenLabel { label_id: 1, label: lbl.into(), start: i, end: i + 1, token_index: i })
+        .map(|(lbl, i)| TokenLabel { label_id: 1, label: lbl, start: i, end: i + 1, token_index: i })
         .collect();
     let bilou = group_spans(&bilou_labels, Scheme::Bilou);
     assert_eq!(bilou.len(), 2);
@@ -1702,7 +1722,7 @@ fn group_spans_bilou_and_iobes() {
     // IOBES: B-PER I-PER E-PER → one span; S-PER → single.
     let iobes_labels: Vec<TokenLabel> = [("B-PER", 0), ("I-PER", 1), ("E-PER", 2), ("S-PER", 3)]
         .into_iter()
-        .map(|(lbl, i)| TokenLabel { label_id: 1, label: lbl.into(), start: i, end: i + 1, token_index: i })
+        .map(|(lbl, i)| TokenLabel { label_id: 1, label: lbl, start: i, end: i + 1, token_index: i })
         .collect();
     let iobes = group_spans(&iobes_labels, Scheme::Iobes);
     assert_eq!(iobes.len(), 2);
@@ -1726,7 +1746,7 @@ proptest! {
         let tokens: Vec<TokenLabel> = labels
             .iter()
             .enumerate()
-            .map(|(i, l)| TokenLabel { label_id: 0, label: l.clone(), start: i, end: i + 1, token_index: i })
+            .map(|(i, l)| TokenLabel { label_id: 0, label: l.as_str(), start: i, end: i + 1, token_index: i })
             .collect();
         let n = tokens.len();
         let entities = group_spans(&tokens, Scheme::Bio);
@@ -1743,7 +1763,7 @@ proptest! {
             // Every covered token shares the span's type and is not "O".
             for ti in e.token_range.clone() {
                 prop_assert!(tokens[ti].label != "O", "'O' token inside a span");
-                prop_assert_eq!(typ_of(&tokens[ti].label), Some(e.label.as_str()), "type mismatch in span");
+                prop_assert_eq!(typ_of(tokens[ti].label), Some(e.label.as_str()), "type mismatch in span");
             }
             prev_end = e.token_range.end;
         }

@@ -237,7 +237,7 @@ impl Encoder for ModernBertClassifier {
 }
 
 impl Classify for ModernBertClassifier {
-    fn num_classes(&self) -> usize {
+    fn num_labels(&self) -> usize {
         self.num_classes
     }
 }

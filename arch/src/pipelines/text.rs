@@ -26,7 +26,7 @@ use std::convert::Infallible;
 use std::path::Path;
 use std::time::Instant;
 
-use snafu::{ResultExt, Snafu};
+use snafu::{ResultExt, Snafu, ensure};
 
 pub use svod_runtime::RunProfile;
 use svod_runtime::StageProfile;
@@ -352,18 +352,40 @@ fn build_window(enc: &Encoding, lead: usize, trail: usize, content_start: usize,
 /// The last window may be shorter than `window` when content doesn't divide
 /// evenly — the embedder pads it. Each [`TextChunk`] carries the byte offset of
 /// its first content token as `byte_offset`.
+#[derive(Debug)]
 pub struct SlidingWindowChunker {
     window: usize,
     stride: usize,
 }
 
+/// Construction error for [`SlidingWindowChunker::try_new`].
+#[derive(Debug, Snafu)]
+pub enum SlidingWindowChunkerBuildError {
+    #[snafu(display("window must be >= 1"))]
+    WindowTooSmall,
+    #[snafu(display("stride must be in 1..=window"))]
+    StrideOutOfRange,
+}
+
 impl SlidingWindowChunker {
     /// `window` = total sequence length per chunk (incl. specials);
+    /// `stride` = step between window starts. Fallsible form of [`new`](Self::new):
+    /// returns `Err` unless `1 <= stride <= window`.
+    pub fn try_new(window: usize, stride: usize) -> Result<Self, SlidingWindowChunkerBuildError> {
+        ensure!(window >= 1, WindowTooSmallSnafu);
+        ensure!((1..=window).contains(&stride), StrideOutOfRangeSnafu);
+        Ok(Self { window, stride })
+    }
+
+    /// `window` = total sequence length per chunk (incl. specials);
     /// `stride` = step between window starts. Panics unless `1 <= stride <= window`.
+    /// A convenience over [`try_new`](Self::try_new) for callers with known-valid args.
     pub fn new(window: usize, stride: usize) -> Self {
-        assert!(window >= 1, "window must be >= 1");
-        assert!((1..=window).contains(&stride), "stride must be in 1..=window");
-        Self { window, stride }
+        match Self::try_new(window, stride) {
+            Ok(v) => v,
+            Err(SlidingWindowChunkerBuildError::WindowTooSmall) => panic!("window must be >= 1"),
+            Err(SlidingWindowChunkerBuildError::StrideOutOfRange) => panic!("stride must be in 1..=window"),
+        }
     }
 }
 
@@ -559,11 +581,11 @@ pub trait Embed: Encoder<Output = Embedding, ChunkOutput = ChunkEmbedding> {
 /// [`Output`](Encoder::Output) = [`Classification`] and
 /// [`ChunkOutput`](Encoder::ChunkOutput) = [`ChunkClassification`]; implement
 /// [`Encoder::run_batch`] / [`Encoder::attach`] plus
-/// [`num_classes`](Classify::num_classes).
+/// [`num_labels`](Classify::num_labels).
 pub trait Classify: Encoder<Output = Classification, ChunkOutput = ChunkClassification> {
-    /// The model's class count — the length of each [`Classification`]'s
+    /// The model's label count — the length of each [`Classification`]'s
     /// `logits` vector.
-    fn num_classes(&self) -> usize;
+    fn num_labels(&self) -> usize;
 }
 
 /// Token-classification head (NER, POS tagging, chunking, …). A specialization
@@ -1074,13 +1096,14 @@ pub enum Scheme {
 }
 
 /// One content token's decoded prediction: the argmax label id, its display
-/// name, and its source-absolute byte span. Produced by [`labels_for_tokens`];
-/// consumed by [`group_spans`]. Special tokens are already filtered out, so
-/// `token_index` runs contiguously over the chunk's content tokens.
+/// name (borrowing from the caller's label table), and its source-absolute byte
+/// span. Produced by [`labels_for_tokens`]; consumed by [`group_spans`]. Special
+/// tokens are already filtered out, so `token_index` runs contiguously over the
+/// chunk's content tokens.
 #[derive(Clone, Debug, PartialEq)]
-pub struct TokenLabel {
+pub struct TokenLabel<'a> {
     pub label_id: u32,
-    pub label: String,
+    pub label: &'a str,
     pub start: usize,
     pub end: usize,
     /// Index within the content-token vec (contiguous from 0).
@@ -1090,6 +1113,8 @@ pub struct TokenLabel {
 /// One decoded span: a contiguous run of same-type tokens (NER under a prefix
 /// scheme) or a single token (POS / `Scheme::Flat`). `start`/`end` are
 /// source-absolute byte offsets; `token_range` indexes the content-token vec.
+/// Owned (the `label` is detached from the caller's label table via
+/// [`TokenLabel`]'s `&str` → `String` promotion inside [`group_spans`]).
 #[derive(Clone, Debug, PartialEq)]
 pub struct Entity {
     pub label: String,
@@ -1101,13 +1126,14 @@ pub struct Entity {
 
 /// Argmax each token's logits, drop special tokens, and pair every surviving
 /// content token with its source byte span + display label. `id2label` resolves
-/// a label id to its name (e.g. `"B-PER"`); tokens whose `special_tokens_mask`
-/// is set are skipped. This is the per-token view (POS / chunking / `none`
-/// aggregation); follow with [`group_spans`] to reconstruct entity spans under a
-/// prefix scheme.
-pub fn labels_for_tokens<F>(chunk: &ChunkTokenClassification, id2label: F) -> Vec<TokenLabel>
+/// a label id to its name (e.g. `"B-PER"`) as a borrowed `&str` — zero per-token
+/// allocation when the label table is a `Vec<String>` / `&[&str]`. Tokens whose
+/// `special_tokens_mask` is set are skipped. This is the per-token view (POS /
+/// chunking / `none` aggregation); follow with [`group_spans`] to reconstruct
+/// entity spans under a prefix scheme.
+pub fn labels_for_tokens<'a, F>(chunk: &ChunkTokenClassification, id2label: F) -> Vec<TokenLabel<'a>>
 where
-    F: Fn(u32) -> String,
+    F: Fn(u32) -> &'a str,
 {
     let nl = chunk.num_labels.max(1);
     let mut out = Vec::new();
@@ -1131,12 +1157,12 @@ where
 /// explicit `L`/`E` closer. `Scheme::Flat` emits one entity per token. Broken
 /// transitions never panic: a stray `I-` opens a fresh span (HF's lenient
 /// `group_entities` convention).
-pub fn group_spans(tokens: &[TokenLabel], scheme: Scheme) -> Vec<Entity> {
+pub fn group_spans(tokens: &[TokenLabel<'_>], scheme: Scheme) -> Vec<Entity> {
     if matches!(scheme, Scheme::Flat) {
         return tokens
             .iter()
             .map(|t| Entity {
-                label: t.label.clone(),
+                label: t.label.to_string(),
                 label_id: t.label_id,
                 start: t.start,
                 end: t.end,
@@ -1150,8 +1176,8 @@ pub fn group_spans(tokens: &[TokenLabel], scheme: Scheme) -> Vec<Entity> {
     let mut open: Option<(String, u32, usize, usize, usize)> = None;
 
     for t in tokens {
-        let (prefix, typ) = parse_tag(&t.label, scheme);
-        let typ = typ.unwrap_or_else(|| t.label.clone());
+        let (prefix, typ) = parse_tag(t.label, scheme);
+        let typ = typ.unwrap_or_else(|| t.label.to_string());
         match prefix {
             Prefix::O => {
                 close_span(&mut open, &mut entities, t.token_index);

@@ -74,13 +74,13 @@ fn max_delta(a: &[f32], b: &[f32]) -> f32 {
 
 // ── shape / contract ───────────────────────────────────────────────────────
 
-/// `classify_batch` returns one classification per input, each with `num_classes`
+/// `classify_batch` returns one classification per input, each with `num_labels`
 /// logits, and all finite.
 #[test]
 #[ignore = "heavy: 2-layer ModernBERT JIT graph compile through the CPU backend"]
 fn classify_batch_shapes_and_finite() {
     let mut clf = classifier();
-    let nc = clf.num_classes();
+    let nc = clf.num_labels();
     let e1 = encoding(&[1, 2, 3], 0);
     let e2 = encoding(&[4, 5], 1);
     let (out, prof) = clf.run_batch(&[&e1, &e2], false).expect("classify_batch");
@@ -92,12 +92,12 @@ fn classify_batch_shapes_and_finite() {
     assert!(prof.is_none(), "unprofiled run yields no profile");
 }
 
-/// `num_classes()` reports the config's value.
+/// `num_labels()` reports the config's value.
 #[test]
 #[ignore = "heavy: 2-layer ModernBERT JIT graph compile through the CPU backend"]
-fn num_classes_reported() {
+fn num_labels_reported() {
     let clf = classifier();
-    assert_eq!(clf.num_classes(), tiny_cfg().num_labels);
+    assert_eq!(clf.num_labels(), tiny_cfg().num_labels);
 }
 
 /// `capacity()` returns the prepared `(max_batch, max_seq)`.

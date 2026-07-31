@@ -94,8 +94,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Loaded: max_seq={max_seq}, max_batch={}, num_labels={num_labels}", args.max_batch);
 
     let id2label = load.id2label;
-    let label_of =
-        |id: u32| id2label.get(id as usize).cloned().filter(|s| !s.is_empty()).unwrap_or_else(|| format!("LABEL_{id}"));
+    let label_of = |id: u32| id2label.get(id as usize).map_or("", |s| s.as_str());
 
     println!("Chunker: truncating max_seq={max_seq}");
     let mut pipeline = EncoderPipeline::new(load.tokenizer, TruncatingChunker::new(max_seq), load.classifier);

@@ -72,7 +72,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Loading ModernBERT classifier from {} ({})...", args.repo, args.revision);
     let load = modernbert::from_hub_classifier_with_revision(&args.repo, &args.revision, args.max_batch, dtype)?;
     let (_, max_seq) = load.classifier.capacity();
-    let num_classes = load.classifier.num_classes();
+    let num_classes = load.classifier.num_labels();
     println!("Loaded: max_seq={max_seq}, max_batch={}, num_classes={num_classes}", args.max_batch);
 
     println!("Chunker: truncating max_seq={max_seq}");
