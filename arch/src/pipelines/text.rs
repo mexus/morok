@@ -38,6 +38,7 @@
 //! skipping tokenize/chunk entirely — tokenize once, then reuse the same chunks
 //! across several pipelines. Their profile carries encoder stages only.
 
+#[cfg(feature = "hf-tokenizers")]
 use std::path::Path;
 use std::time::Instant;
 
@@ -129,6 +130,7 @@ pub struct Encoding {
 impl Encoding {
     /// Copy the five getter slices out of an HF `Encoding`. The borrow ends
     /// here — the adapter owns its own `Vec`s, so the source can be dropped.
+    #[cfg(feature = "hf-tokenizers")]
     pub fn from_hf(enc: &tokenizers::Encoding) -> Self {
         Self {
             input_ids: enc.get_ids().to_vec(),
@@ -163,6 +165,7 @@ pub trait Tokenizer {
     }
 }
 
+#[cfg(feature = "hf-tokenizers")]
 /// Owns a `tokenizers::Error` (which is `Box<dyn std::error::Error + Send +
 /// Sync>`) behind a sized, `Error`-implementing type. The boxed trait object is
 /// `!Sized`, and std's `impl<E: Error> Error for Box<E>` requires `E: Sized`, so
@@ -176,24 +179,28 @@ pub trait Tokenizer {
 #[derive(Debug)]
 pub struct HfTokenizerError(tokenizers::Error);
 
+#[cfg(feature = "hf-tokenizers")]
 impl std::fmt::Display for HfTokenizerError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         std::fmt::Display::fmt(&self.0, f)
     }
 }
 
+#[cfg(feature = "hf-tokenizers")]
 impl std::error::Error for HfTokenizerError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         Some(&*self.0)
     }
 }
 
+#[cfg(feature = "hf-tokenizers")]
 impl From<tokenizers::Error> for HfTokenizerError {
     fn from(err: tokenizers::Error) -> Self {
         Self(err)
     }
 }
 
+#[cfg(feature = "hf-tokenizers")]
 /// The provided [`Tokenizer`] impl: wraps a HuggingFace `tokenizers::Tokenizer`.
 ///
 /// `encode` calls `inner.encode(text, add_special_tokens = true)`. It does
@@ -207,6 +214,7 @@ pub struct HfTokenizer {
     inner: tokenizers::Tokenizer,
 }
 
+#[cfg(feature = "hf-tokenizers")]
 impl HfTokenizer {
     pub fn new(inner: tokenizers::Tokenizer) -> Self {
         Self { inner }
@@ -226,6 +234,7 @@ impl HfTokenizer {
     }
 }
 
+#[cfg(feature = "hf-tokenizers")]
 impl Tokenizer for HfTokenizer {
     type Error = HfTokenizerError;
 
@@ -305,13 +314,13 @@ impl TruncatingChunker {
 }
 
 impl Chunker for TruncatingChunker {
-    type Error = TruncatingChunkerError;
+    type Error = std::convert::Infallible;
 
     fn max_seq(&self) -> usize {
         self.max_seq
     }
 
-    fn chunk(&mut self, enc: &Encoding) -> Result<Vec<TextChunk>, TruncatingChunkerError> {
+    fn chunk(&mut self, enc: &Encoding) -> Result<Vec<TextChunk>, std::convert::Infallible> {
         // Keep every field's length consistent: slice to the common cap so ids,
         // masks, and offsets stay aligned.
         let take = self.max_seq.min(enc.input_ids.len());
@@ -416,7 +425,11 @@ impl SlidingWindowChunker {
             SlidingWindowChunkerError::WindowTooSmall => panic!("window must be >= 1"),
             SlidingWindowChunkerError::StrideOutOfRange => panic!("stride must be in 1..=window"),
             SlidingWindowChunkerError::WindowTooSmallForSpecials { .. } => {
-                unreachable!("only produced at chunk time, not construction")
+                unreachable!(
+                    "WindowTooSmallForSpecials is only returned by `Chunker::chunk` — when a \
+                     window can't fit the tokenizer's boundary specials — never by `try_new`; \
+                     reaching it here means that construction-time invariant has changed"
+                )
             }
         })
     }
@@ -1160,7 +1173,7 @@ pub struct Entity {
 /// `Vec<String>` / `&[&str]`. Tokens whose `special_tokens_mask` is set are
 /// skipped. The `score` is the softmax probability of the argmax label (max of
 /// [`softmax`] over the row), computed in f32. This is the per-token view (POS /
-/// chunking / `none` aggregation); follow with [`group_spans`] to reconstruct
+/// chunking / [`Scheme::Flat`]); follow with [`group_spans`] to reconstruct
 /// entity spans under a prefix scheme.
 pub fn labels_for_tokens<'a, F>(chunk: &ChunkTokenClassification, id2label: F) -> Vec<TokenLabel<'a>>
 where

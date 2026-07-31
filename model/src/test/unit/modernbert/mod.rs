@@ -20,3 +20,7 @@ mod token_classifier;
 // Full JIT coverage (shared fixtures → only 4 plans compile, not one per test):
 //   cargo test -p svod-model -- --ignored test::unit::modernbert:: --test-threads=1
 // The `--test-threads=1` is required: the backend is not concurrency-safe.
+//
+// Parity goldens (`golden*.safetensors`) are generated locally and intentionally
+// not committed — see `parity`'s module doc for the generate commands. Model
+// weights / configs are fetched from HF Hub on first run.

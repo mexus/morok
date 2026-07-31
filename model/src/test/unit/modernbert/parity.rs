@@ -1,6 +1,20 @@
-//! Parity against the PyTorch reference (`answerdotai/ModernBERT-base`).
-//! Heavy: loads the real checkpoint + a golden `last_hidden_state` produced by
-//! HuggingFace `transformers` (`uv run scripts/generate_modernbert_golden.py`).
+//! Parity against the PyTorch reference (`answerdotai/ModernBERT-base` and its
+//! SST-2 / CoNLL-2003 fine-tunes). Heavy: each tier loads the real checkpoint
+//! (fetched from HF Hub on first run) plus a golden produced by HuggingFace
+//! `transformers`.
+//!
+//! # Goldens are not committed
+//!
+//! The `golden*.safetensors` fixtures are generated locally and are **not** on
+//! HF Hub — only the model weights / configs are. Generate them before running
+//! the `--ignored` tier (output lands in `data/modernbert/`, overridable via
+//! `SVOD_MODERNBERT`):
+//!
+//! ```text
+//! uv run model/scripts/generate_modernbert_golden.py            // backbone + MLM + embedder
+//! uv run model/scripts/generate_modernbert_classifier_golden.py // SST-2 classifier
+//! uv run model/scripts/generate_modernbert_token_golden.py      // CoNLL-2003 NER
+//! ```
 //!
 //! Runs in **f32** (config dtype overridden) so it works on CPU backends
 //! without GPU bf16 transcendentals. bf16 numerical parity is implied by the
@@ -21,9 +35,24 @@ use crate::state::StateDict;
 
 const HUB_REPO: &str = "answerdotai/ModernBERT-base";
 
+/// `repo.get` fallback: model weights / configs live on HF Hub, but the
+/// `golden*.safetensors` fixtures are generated locally (not committed, not
+/// published) — tell the caller which is which instead of a generic "download"
+/// message that's wrong for goldens.
+fn missing_from_hub(name: &str) -> ! {
+    if name.starts_with("golden") {
+        panic!(
+            "{name} not found in data/modernbert/ and not on HF Hub — goldens are generated \
+             locally; run `model/scripts/generate_modernbert*.py` (or point SVOD_MODERNBERT at \
+             the output dir)"
+        );
+    }
+    panic!("download {name} from HF Hub")
+}
+
 /// Resolve `model.safetensors` / `golden.safetensors` for the real-checkpoint
 /// tests: `SVOD_MODERNBERT` dir override → local `data/modernbert/` (output of
-/// `scripts/generate_modernbert_golden.py`) → HF Hub download.
+/// `model/scripts/generate_modernbert_golden.py`) → HF Hub download.
 fn real_file(name: &str) -> PathBuf {
     let dir = std::env::var_os("SVOD_MODERNBERT")
         .map(PathBuf::from)
@@ -34,7 +63,7 @@ fn real_file(name: &str) -> PathBuf {
     } else {
         let api = hf_hub::api::sync::Api::new().expect("HF Hub API");
         let repo = api.repo(hf_hub::Repo::with_revision(HUB_REPO.into(), hf_hub::RepoType::Model, "main".into()));
-        repo.get(name).unwrap_or_else(|_| panic!("download {name} from HF Hub"))
+        repo.get(name).unwrap_or_else(|_| missing_from_hub(name))
     }
 }
 
@@ -258,7 +287,7 @@ fn classifier_file(name: &str) -> PathBuf {
         let api = hf_hub::api::sync::Api::new().expect("HF Hub API");
         let repo =
             api.repo(hf_hub::Repo::with_revision(CLASSIFIER_HUB_REPO.into(), hf_hub::RepoType::Model, "main".into()));
-        repo.get(name).unwrap_or_else(|_| panic!("download {name} from HF Hub"))
+        repo.get(name).unwrap_or_else(|_| missing_from_hub(name))
     }
 }
 
@@ -375,7 +404,7 @@ fn token_file(name: &str) -> PathBuf {
     } else {
         let api = hf_hub::api::sync::Api::new().expect("HF Hub API");
         let repo = api.repo(hf_hub::Repo::with_revision(TOKEN_HUB_REPO.into(), hf_hub::RepoType::Model, "main".into()));
-        repo.get(name).unwrap_or_else(|_| panic!("download {name} from HF Hub"))
+        repo.get(name).unwrap_or_else(|_| missing_from_hub(name))
     }
 }
 

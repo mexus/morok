@@ -5,10 +5,12 @@ use proptest::prelude::*;
 use crate::pipelines::text::{
     BatchClassifications, BatchEmbeddings, BatchTokenClassifications, ChunkTokenClassification, Chunker,
     Classification, Classify, ClassifyTokens, Embed, Embedding, EncoderHead, EncoderPipeline, EncoderPipelineError,
-    Encoding, HfTokenizer, HfTokenizerError, RunOptions, RunProfile, Scheme, SlidingWindowChunker,
-    SlidingWindowChunkerError, TextChunk, TokenClassification, TokenLabel, Tokenizer, TruncatingChunker,
-    TruncatingChunkerError, argmax, group_spans, group_spans_document, labels_for_tokens, softmax,
+    Encoding, RunOptions, RunProfile, Scheme, SlidingWindowChunker, SlidingWindowChunkerError, TextChunk,
+    TokenClassification, TokenLabel, Tokenizer, TruncatingChunker, TruncatingChunkerError, argmax, group_spans,
+    group_spans_document, labels_for_tokens, softmax,
 };
+#[cfg(feature = "hf-tokenizers")]
+use crate::pipelines::text::{HfTokenizer, HfTokenizerError};
 
 fn enc(ids: &[u32]) -> Encoding {
     // A full, internally-consistent encoding: every field the same length as
@@ -637,6 +639,7 @@ fn embed_error_maps_to_embed_variant() {
 // serializes it so from_bytes/from_path exercise the real JSON deserialization
 // path rather than a hand-written string.
 
+#[cfg(feature = "hf-tokenizers")]
 fn fixture_tokenizer() -> tokenizers::Tokenizer {
     let vocab = [
         ("[PAD]".to_string(), 0u32),
@@ -662,10 +665,12 @@ fn fixture_tokenizer() -> tokenizers::Tokenizer {
     tokenizer
 }
 
+#[cfg(feature = "hf-tokenizers")]
 fn fixture_json() -> Vec<u8> {
     fixture_tokenizer().to_string(false).expect("serialize fixture tokenizer").into_bytes()
 }
 
+#[cfg(feature = "hf-tokenizers")]
 #[test]
 fn hf_tokenizer_from_bytes_encodes_known_text() {
     let mut tok = HfTokenizer::from_bytes(fixture_json()).expect("load fixture");
@@ -683,6 +688,7 @@ fn hf_tokenizer_from_bytes_encodes_known_text() {
     assert_eq!(enc.special_tokens_mask, vec![1, 0, 0, 1]);
 }
 
+#[cfg(feature = "hf-tokenizers")]
 #[test]
 fn hf_tokenizer_from_path_matches_from_bytes() {
     let bytes = fixture_json();
@@ -699,6 +705,7 @@ fn hf_tokenizer_from_path_matches_from_bytes() {
     let _ = std::fs::remove_file(&path);
 }
 
+#[cfg(feature = "hf-tokenizers")]
 #[test]
 fn hf_tokenizer_encode_batch_matches_per_input_encode() {
     // The native HF batch path (`inner.encode_batch`) is the production
@@ -723,6 +730,7 @@ fn hf_tokenizer_encode_batch_matches_per_input_encode() {
     assert_ne!(batched[0].input_ids, batched[1].input_ids);
 }
 
+#[cfg(feature = "hf-tokenizers")]
 #[test]
 fn encoding_from_hf_copies_all_fields() {
     let inner = fixture_tokenizer();
@@ -735,6 +743,7 @@ fn encoding_from_hf_copies_all_fields() {
     assert_eq!(enc.special_tokens_mask, hf.get_special_tokens_mask().to_vec());
 }
 
+#[cfg(feature = "hf-tokenizers")]
 #[test]
 fn hf_tokenizer_error_display_and_source() {
     use std::error::Error as _;
