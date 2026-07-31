@@ -20,7 +20,7 @@ use std::time::Instant;
 use clap::Parser;
 
 use svod_arch::pipelines::text::{
-    Encoder, EncoderPipeline, Recognize, RunOptions, Scheme, TruncatingChunker, group_spans, labels_for_tokens,
+    Encoder, EncoderPipeline, ClassifyTokens, RunOptions, Scheme, TruncatingChunker, group_spans, labels_for_tokens,
 };
 use svod_dtype::DType;
 use svod_model::modernbert;
@@ -101,7 +101,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("\nTagging {} chars (scheme = {})...", text.len(), args.scheme);
     let t = Instant::now();
-    let result = pipeline.recognize(&text, RunOptions { profile: args.profile })?;
+    let result = pipeline.classify_tokens(&text, RunOptions { profile: args.profile })?;
     let dt = t.elapsed();
 
     println!("  {} chunk(s)", result.chunks.len());
@@ -128,7 +128,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(prof) = &result.profile {
         println!("\n--- Profile ---\n{prof}");
     }
-    println!("Recognize: {:.3}s", dt.as_secs_f32());
+    println!("ClassifyTokens: {:.3}s", dt.as_secs_f32());
     println!("\nTotal: {:.2}s", t_total.elapsed().as_secs_f32());
     Ok(())
 }

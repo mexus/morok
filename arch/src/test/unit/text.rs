@@ -3,11 +3,11 @@ use std::convert::Infallible;
 use proptest::prelude::*;
 
 use crate::pipelines::text::{
-    BatchClassifications, BatchEmbeddings, BatchTokenClassifications, ChunkClassification, ChunkEmbedding,
-    ChunkTokenClassification, Chunker, Classification, Classify, Embed, Embedding, Encoder, EncoderPipeline,
-    EncoderPipelineError, Encoding, Entity, HfTokenizer, HfTokenizerError, Recognize, RunOptions, RunProfile, Scheme,
-    SlidingWindowChunker, SlidingWindowChunkerError, TextChunk, TokenClassification, TokenLabel, Tokenizer,
-    TruncatingChunker, argmax, group_spans, group_spans_document, labels_for_tokens, softmax,
+    BatchClassifications, BatchEmbeddings, BatchTokenClassifications, ChunkTokenClassification, Chunker,
+    Classification, Classify, ClassifyTokens, Embed, Embedding, Encoder, EncoderPipeline, EncoderPipelineError,
+    Encoding, HfTokenizer, HfTokenizerError, RunOptions, RunProfile, Scheme, SlidingWindowChunker,
+    SlidingWindowChunkerError, TextChunk, TokenClassification, TokenLabel, Tokenizer, TruncatingChunker, argmax,
+    group_spans, group_spans_document, labels_for_tokens, softmax,
 };
 
 fn enc(ids: &[u32]) -> Encoding {
@@ -1131,7 +1131,7 @@ fn classify_batch_results_match_individual_classify_calls() {
 
 /// Turns ids into a deterministic `(seq_len, num_labels)` logit grid (analog of
 /// `StubClassify`): each token id `v` becomes a row of `num_labels` copies of
-/// `v as f32`. `profile` emits a single 1 ms `recognize` stage — enough to
+/// `v as f32`. `profile` emits a single 1 ms `classify_tokens` stage — enough to
 /// exercise the merge without a model.
 struct StubRecognize {
     num_labels: usize,
@@ -1166,24 +1166,24 @@ impl Encoder for StubRecognize {
             .collect();
         let prof = profile.then(|| {
             let mut p = RunProfile::default();
-            p.push(svod_runtime::StageProfile::host("recognize", std::time::Duration::from_millis(1)));
+            p.push(svod_runtime::StageProfile::host("classify_tokens", std::time::Duration::from_millis(1)));
             p
         });
         Ok((values, prof))
     }
 }
 
-impl Recognize for StubRecognize {
+impl ClassifyTokens for StubRecognize {
     fn num_labels(&self) -> usize {
         self.num_labels
     }
 }
 
 #[derive(Debug, snafu::Snafu)]
-#[snafu(display("stub recognize error"))]
+#[snafu(display("stub classify_tokens error"))]
 struct StubRecognizeError;
 
-fn recognize_pipeline(
+fn classify_tokens_pipeline(
     ids: Vec<u32>,
     max_seq: usize,
 ) -> EncoderPipeline<StubTokenizer, TruncatingChunker, StubRecognize> {
@@ -1195,7 +1195,7 @@ fn recognize_pipeline(
 }
 
 #[test]
-fn recognize_single_is_batch_of_one() {
+fn classify_tokens_single_is_batch_of_one() {
     let mut rec = StubRecognize { num_labels: 3, max_batch: 1, error: false };
     let e = enc(&[4, 5, 6]);
     let single = rec.run(&e, false).unwrap().0;
@@ -1204,9 +1204,9 @@ fn recognize_single_is_batch_of_one() {
 }
 
 #[test]
-fn recognize_pipeline_truncates_then_recognizes() {
-    let mut p = recognize_pipeline(vec![1, 2, 3, 4, 5, 6, 7], 4);
-    let out = p.recognize_default("ignored").unwrap();
+fn classify_tokens_pipeline_truncates_then_recognizes() {
+    let mut p = classify_tokens_pipeline(vec![1, 2, 3, 4, 5, 6, 7], 4);
+    let out = p.classify_tokens_default("ignored").unwrap();
     assert_eq!(out.chunks.len(), 1);
     let c = &out.chunks[0];
     assert_eq!(c.byte_offset, 0);
@@ -1219,40 +1219,40 @@ fn recognize_pipeline_truncates_then_recognizes() {
 }
 
 #[test]
-fn recognize_pipeline_profiles_stage_order_tokenize_then_chunk_then_recognize() {
-    let mut p = recognize_pipeline(vec![1, 2, 3], 8);
-    let out = p.recognize("ignored", RunOptions { profile: true }).unwrap();
+fn classify_tokens_pipeline_profiles_stage_order_tokenize_then_chunk_then_recognize() {
+    let mut p = classify_tokens_pipeline(vec![1, 2, 3], 8);
+    let out = p.classify_tokens("ignored", RunOptions { profile: true }).unwrap();
     let profile = out.profile.expect("profile collected");
     let names: Vec<&str> = profile.stages.iter().map(|s| s.name.as_str()).collect();
-    assert_eq!(names, vec!["tokenize", "chunk", "recognize"], "host stages lead, then the recognizer's");
+    assert_eq!(names, vec!["tokenize", "chunk", "classify_tokens"], "host stages lead, then the token_classifier's");
 }
 
 #[test]
-fn recognize_pipeline_profiles_per_call_without_rebuild() {
-    let mut p = recognize_pipeline(vec![1, 2, 3], 8);
-    let profiled = p.recognize("ignored", RunOptions { profile: true }).unwrap();
+fn classify_tokens_pipeline_profiles_per_call_without_rebuild() {
+    let mut p = classify_tokens_pipeline(vec![1, 2, 3], 8);
+    let profiled = p.classify_tokens("ignored", RunOptions { profile: true }).unwrap();
     assert!(profiled.profile.is_some());
-    let unprofiled = p.recognize_default("ignored").unwrap();
+    let unprofiled = p.classify_tokens_default("ignored").unwrap();
     assert!(unprofiled.profile.is_none());
 }
 
 #[test]
-fn recognize_pipeline_zero_chunk_run_skips_recognize_and_profiles_host_stages() {
+fn classify_tokens_pipeline_zero_chunk_run_skips_recognize_and_profiles_host_stages() {
     let p = EncoderPipeline::new(
         StubTokenizer { ids: vec![1, 2], max_seq: 4, error: false },
         NoChunkChunker { max_seq: 4 },
         StubRecognize { num_labels: 4, max_batch: 1, error: true }, // would fail if called
     );
     let mut p = p;
-    let out = p.recognize("ignored", RunOptions { profile: true }).unwrap();
+    let out = p.classify_tokens("ignored", RunOptions { profile: true }).unwrap();
     assert!(out.chunks.is_empty());
     let profile = out.profile.expect("profile");
     let names: Vec<&str> = profile.stages.iter().map(|s| s.name.as_str()).collect();
-    assert_eq!(names, vec!["tokenize", "chunk"], "recognizer never runs; only host stages");
+    assert_eq!(names, vec!["tokenize", "chunk"], "token_classifier never runs; only host stages");
 }
 
 #[test]
-fn recognize_assemble_passes_chunker_max_seq_into_builder() {
+fn classify_tokens_assemble_passes_chunker_max_seq_into_builder() {
     let seen = std::cell::Cell::new(0usize);
     let _p: EncoderPipeline<_, TruncatingChunker, StubRecognize> = EncoderPipeline::assemble(
         StubTokenizer { ids: vec![1], max_seq: 8, error: false },
@@ -1267,13 +1267,13 @@ fn recognize_assemble_passes_chunker_max_seq_into_builder() {
 }
 
 #[test]
-fn recognize_sliding_pipeline_produces_per_window_classifications() {
+fn classify_tokens_sliding_pipeline_produces_per_window_classifications() {
     let mut p = EncoderPipeline::new(
         StubTokenizer { ids: vec![10, 20, 30, 40, 50, 60], max_seq: 3, error: false },
         SlidingWindowChunker::new(3, 2),
         StubRecognize { num_labels: 1, max_batch: 1, error: false },
     );
-    let out = p.recognize_default("ignored").unwrap();
+    let out = p.classify_tokens_default("ignored").unwrap();
     assert_eq!(out.chunks.len(), 3);
     assert_eq!(out.chunks[0].byte_offset, 0);
     assert_eq!(out.chunks[0].logits, vec![10.0, 20.0, 30.0]);
@@ -1287,48 +1287,48 @@ fn recognize_sliding_pipeline_produces_per_window_classifications() {
 }
 
 #[test]
-fn recognize_tokenize_error_maps_to_tokenize_variant() {
+fn classify_tokens_tokenize_error_maps_to_tokenize_variant() {
     let mut p = EncoderPipeline::new(
         StubTokenizer { ids: vec![1], max_seq: 4, error: true },
         TruncatingChunker::new(4),
         StubRecognize { num_labels: 4, max_batch: 1, error: false },
     );
-    let err = p.recognize_default("ignored").unwrap_err();
+    let err = p.classify_tokens_default("ignored").unwrap_err();
     assert!(matches!(err, EncoderPipelineError::Tokenize { .. }));
 }
 
 #[test]
-fn recognize_error_maps_to_recognize_variant() {
+fn classify_tokens_error_maps_to_recognize_variant() {
     let mut p = EncoderPipeline::new(
         StubTokenizer { ids: vec![1, 2], max_seq: 4, error: false },
         TruncatingChunker::new(4),
         StubRecognize { num_labels: 4, max_batch: 1, error: true },
     );
-    let err = p.recognize_default("ignored").unwrap_err();
+    let err = p.classify_tokens_default("ignored").unwrap_err();
     assert!(matches!(err, EncoderPipelineError::Encode { .. }));
 }
 
 #[test]
-fn recognize_chunk_error_maps_to_chunk_variant() {
+fn classify_tokens_chunk_error_maps_to_chunk_variant() {
     let mut p = EncoderPipeline::new(
         StubTokenizer { ids: vec![1, 2], max_seq: 4, error: false },
         ErrChunker { max_seq: 4 },
         StubRecognize { num_labels: 4, max_batch: 1, error: false },
     );
-    let err = p.recognize_default("ignored").unwrap_err();
+    let err = p.classify_tokens_default("ignored").unwrap_err();
     assert!(matches!(err, EncoderPipelineError::Chunk { .. }));
 }
 
 // ─── EncoderPipeline batch ─────────────────────────────────────────────────
 
 #[test]
-fn recognize_batch_basic_three_texts() {
+fn classify_tokens_batch_basic_three_texts() {
     let mut p = EncoderPipeline::new(
         ByteTokenizer { max_seq: 32 },
         TruncatingChunker::new(32),
         StubRecognize { num_labels: 1, max_batch: 8, error: false },
     );
-    let out = p.recognize_batch_default(&["ab", "xyz", "hello"]).unwrap();
+    let out = p.classify_tokens_batch_default(&["ab", "xyz", "hello"]).unwrap();
     assert_eq!(out.results.len(), 3);
     assert!(out.profile.is_none(), "default options don't profile");
     assert_eq!(out.results[0].chunks.len(), 1);
@@ -1340,13 +1340,13 @@ fn recognize_batch_basic_three_texts() {
 }
 
 #[test]
-fn recognize_batch_with_sliding_window_varying_chunk_counts() {
+fn classify_tokens_batch_with_sliding_window_varying_chunk_counts() {
     let mut p = EncoderPipeline::new(
         ByteTokenizer { max_seq: 3 },
         SlidingWindowChunker::new(3, 2),
         StubRecognize { num_labels: 1, max_batch: 8, error: false },
     );
-    let out = p.recognize_batch_default(&["abcdef", "ab", "abcd"]).unwrap();
+    let out = p.classify_tokens_batch_default(&["abcdef", "ab", "abcd"]).unwrap();
     assert_eq!(out.results.len(), 3);
     assert_eq!(out.results[0].chunks.len(), 3);
     assert_eq!(out.results[0].chunks[0].byte_offset, 0);
@@ -1357,25 +1357,25 @@ fn recognize_batch_with_sliding_window_varying_chunk_counts() {
 }
 
 #[test]
-fn recognize_batch_empty_texts_returns_empty() {
+fn classify_tokens_batch_empty_texts_returns_empty() {
     let mut p = EncoderPipeline::new(
         ByteTokenizer { max_seq: 8 },
         TruncatingChunker::new(8),
         StubRecognize { num_labels: 1, max_batch: 4, error: false },
     );
-    let out: BatchTokenClassifications = p.recognize_batch_default(&[]).unwrap();
+    let out: BatchTokenClassifications = p.classify_tokens_batch_default(&[]).unwrap();
     assert!(out.results.is_empty());
     assert!(out.profile.is_none());
 }
 
 #[test]
-fn recognize_batch_some_texts_produce_zero_chunks() {
+fn classify_tokens_batch_some_texts_produce_zero_chunks() {
     let mut p = EncoderPipeline::new(
         ByteTokenizer { max_seq: 4 },
         SlidingWindowChunker::new(4, 2),
         StubRecognize { num_labels: 1, max_batch: 4, error: false },
     );
-    let out = p.recognize_batch_default(&["ab", "", "cd"]).unwrap();
+    let out = p.classify_tokens_batch_default(&["ab", "", "cd"]).unwrap();
     assert_eq!(out.results.len(), 3);
     assert_eq!(out.results[0].chunks.len(), 1);
     assert!(out.results[1].chunks.is_empty());
@@ -1383,14 +1383,14 @@ fn recognize_batch_some_texts_produce_zero_chunks() {
 }
 
 #[test]
-fn recognize_batch_sub_batches_when_chunks_exceed_max_batch() {
+fn classify_tokens_batch_sub_batches_when_chunks_exceed_max_batch() {
     let mut p = EncoderPipeline::new(
         ByteTokenizer { max_seq: 8 },
         TruncatingChunker::new(8),
         StubRecognize { num_labels: 1, max_batch: 2, error: false },
     );
     let texts: Vec<&str> = vec!["a", "b", "c", "d", "e"];
-    let out = p.recognize_batch_default(&texts).unwrap();
+    let out = p.classify_tokens_batch_default(&texts).unwrap();
     assert_eq!(out.results.len(), 5);
     for (i, result) in out.results.iter().enumerate() {
         assert_eq!(result.chunks.len(), 1);
@@ -1399,34 +1399,34 @@ fn recognize_batch_sub_batches_when_chunks_exceed_max_batch() {
 }
 
 #[test]
-fn recognize_batch_profile_has_tokenize_chunk_recognize_stages() {
+fn classify_tokens_batch_profile_has_tokenize_chunk_recognize_stages() {
     let mut p = EncoderPipeline::new(
         ByteTokenizer { max_seq: 8 },
         TruncatingChunker::new(8),
         StubRecognize { num_labels: 1, max_batch: 4, error: false },
     );
-    let out = p.recognize_batch(&["ab", "cd"], RunOptions { profile: true }).unwrap();
+    let out = p.classify_tokens_batch(&["ab", "cd"], RunOptions { profile: true }).unwrap();
     assert_eq!(out.results.len(), 2);
     assert!(out.results[0].profile.is_none());
     assert!(out.results[1].profile.is_none());
     let profile = out.profile.expect("batch profile collected");
     let names: Vec<&str> = profile.stages.iter().map(|s| s.name.as_str()).collect();
-    assert_eq!(names, vec!["tokenize", "chunk", "recognize"]);
+    assert_eq!(names, vec!["tokenize", "chunk", "classify_tokens"]);
 }
 
 #[test]
-fn recognize_batch_tokenize_error_maps_to_tokenize_variant() {
+fn classify_tokens_batch_tokenize_error_maps_to_tokenize_variant() {
     let mut p = EncoderPipeline::new(
         StubTokenizer { ids: vec![1], max_seq: 4, error: true },
         TruncatingChunker::new(4),
         StubRecognize { num_labels: 4, max_batch: 4, error: false },
     );
-    let err = p.recognize_batch_default(&["a", "b"]).unwrap_err();
+    let err = p.classify_tokens_batch_default(&["a", "b"]).unwrap_err();
     assert!(matches!(err, EncoderPipelineError::Tokenize { .. }));
 }
 
 #[test]
-fn recognize_batch_results_match_individual_recognize_calls() {
+fn classify_tokens_batch_results_match_individual_recognize_calls() {
     let make_pipeline = || {
         EncoderPipeline::new(
             ByteTokenizer { max_seq: 4 },
@@ -1438,12 +1438,12 @@ fn recognize_batch_results_match_individual_recognize_calls() {
     let texts = ["abcde", "xy"];
     let batch = {
         let mut p = make_pipeline();
-        p.recognize_batch_default(&texts).unwrap()
+        p.classify_tokens_batch_default(&texts).unwrap()
     };
 
     for (i, text) in texts.iter().enumerate() {
         let mut p = make_pipeline();
-        let single = p.recognize_default(text).unwrap();
+        let single = p.classify_tokens_default(text).unwrap();
         assert_eq!(batch.results[i].chunks.len(), single.chunks.len(), "chunk count mismatch for text {i}");
         for (b, s) in batch.results[i].chunks.iter().zip(&single.chunks) {
             assert_eq!(b.byte_offset, s.byte_offset, "byte_offset mismatch for text {i}");

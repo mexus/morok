@@ -28,7 +28,7 @@ use crate::modernbert::token_classifier_jit::ModernBertTokenClassifierJit;
 /// Head-level error for the ModernBERT encoder heads. Replaces the three
 /// near-identical per-head errors (which differed only in the capacity-message
 /// noun); `CapacityExceeded` carries the head's `stage` so the message stays
-/// task-specific ("embed batch of …", "classify batch of …", "recognize batch of …").
+/// task-specific ("embed batch of …", "classify batch of …", "classify_tokens batch of …").
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub(crate)))]
 pub enum HeadError {

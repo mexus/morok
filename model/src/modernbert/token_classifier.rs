@@ -2,7 +2,7 @@
 //! backbone (NER, POS tagging, chunking, …): `input_ids` + `attention_mask` →
 //! per-token raw logits `(seq_len, num_labels)` per chunk.
 //!
-//! Implements `svod_arch::pipelines::text::Recognize` so it drops straight into
+//! Implements `svod_arch::pipelines::text::ClassifyTokens` so it drops straight into
 //! an [`EncoderPipeline`](svod_arch::pipelines::text::EncoderPipeline). The
 //! model owns the forward + fused token head (via
 //! [`ModernBertTokenClassifierJit`]); the pipeline owns chunking, profile
@@ -14,7 +14,7 @@
 //! ([`prediction_head_tail`]); the two heads differ only in pooling.
 
 use snafu::ResultExt;
-use svod_arch::pipelines::text::{Encoder, Encoding, Recognize, RunProfile, TokenClassification};
+use svod_arch::pipelines::text::{Encoder, Encoding, ClassifyTokens, RunProfile, TokenClassification};
 use svod_tensor::{BoundVariable, PrepareConfig, Tensor};
 
 use crate::jit::InputSpec;
@@ -72,10 +72,10 @@ impl ModernBertTokenClassificationModel {
     }
 }
 
-// ─── runtime (owns JIT, impl Encoder + Recognize) ──────────────────────────
+// ─── runtime (owns JIT, impl Encoder + ClassifyTokens) ──────────────────────────
 
 /// Finished token-classifier model. Build once (eager JIT prepare) and reuse
-/// across calls. Implements [`Encoder`] (with [`Recognize`] fixing the output
+/// across calls. Implements [`Encoder`] (with [`ClassifyTokens`] fixing the output
 /// kinds) for drop-in use with
 /// [`EncoderPipeline`](svod_arch::pipelines::text::EncoderPipeline).
 pub struct ModernBertTokenClassifier {
@@ -115,7 +115,7 @@ impl Encoder for ModernBertTokenClassifier {
         batch: &[&Encoding],
         profile: bool,
     ) -> std::result::Result<(Vec<TokenClassification>, Option<RunProfile>), HeadError> {
-        let (b, flat, prof) = execute_head(&mut self.jit, batch, self.max_batch, self.max_seq, profile, "recognize")?;
+        let (b, flat, prof) = execute_head(&mut self.jit, batch, self.max_batch, self.max_seq, profile, "classify_tokens")?;
         // Output is row-major `(B, max_seq, num_labels)`; each chunk occupies a
         // `max_seq`-wide row slab. Slice to each chunk's live token count so the
         // returned grid is `(seq_len, num_labels)` — padding positions dropped.
@@ -132,7 +132,7 @@ impl Encoder for ModernBertTokenClassifier {
     }
 }
 
-impl Recognize for ModernBertTokenClassifier {
+impl ClassifyTokens for ModernBertTokenClassifier {
     fn num_labels(&self) -> usize {
         self.num_labels
     }

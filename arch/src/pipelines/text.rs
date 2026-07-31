@@ -1,7 +1,7 @@
 //! Encoder-only text inference (embeddings + classification + token
 //! classification): tokenize → chunk → model → aggregate. Host-side and
 //! model-agnostic: a model implements only its irreducible part behind the
-//! [`Encoder`] supertrait — [`Embed`] / [`Classify`] / [`Recognize`] are thin
+//! [`Encoder`] supertrait — [`Embed`] / [`Classify`] / [`ClassifyTokens`] are thin
 //! specializations that fix the per-chunk output kind — and the heavy machinery
 //! (sub-batching, truncation geometry, profile assembly, span decoding) lives in
 //! trait defaults and free functions here. This is the sibling of
@@ -259,7 +259,7 @@ pub trait Chunker {
     fn chunk(&mut self, enc: &Encoding) -> Result<Vec<TextChunk>, Self::Error>;
 
     /// Stage name for this chunker's wall in a profiled run (e.g. `"chunk"`).
-    /// The pipeline's `embed`/`classify`/`recognize` methods time `chunk` and
+    /// The pipeline's `embed`/`classify`/`classify_tokens` methods time `chunk` and
     /// record it under this label *when that call requests a profile*. Defaults
     /// to `"chunk"`.
     fn profile_label(&self) -> &'static str {
@@ -479,7 +479,7 @@ pub struct BatchClassifications {
 
 /// One chunk's raw per-token logits — the model applies the token head (HF
 /// `ModernBertPredictionHead` + `classifier`) to every position before returning.
-/// Position-agnostic: the [`Recognize`] trait returns this, and
+/// Position-agnostic: the [`ClassifyTokens`] trait returns this, and
 /// [`EncoderPipeline`] attaches each one's source position and per-token byte
 /// spans (see [`ChunkTokenClassification`]). `logits` is a flat row-major
 /// `(seq_len, num_labels)` grid where `seq_len` is the chunk's live token count
@@ -521,7 +521,7 @@ pub struct TokenClassifications {
 }
 
 /// Batch token-classification result from
-/// [`recognize_batch`](EncoderPipeline::recognize_batch): one
+/// [`classify_tokens_batch`](EncoderPipeline::classify_tokens_batch): one
 /// [`TokenClassifications`] per input text, plus a shared [`RunProfile`]
 /// covering the entire batch run. Mirrors [`BatchClassifications`].
 #[derive(Debug, Default)]
@@ -534,7 +534,7 @@ pub struct BatchTokenClassifications {
 
 /// Any encoder-only head: turns tokenized chunks into a per-chunk
 /// position-agnostic output. The shared shape behind the three task traits
-/// ([`Embed`] / [`Classify`] / [`Recognize`]) — they fix [`Output`](Encoder::Output)
+/// ([`Embed`] / [`Classify`] / [`ClassifyTokens`]) — they fix [`Output`](Encoder::Output)
 /// and add one informational accessor each, so the pipeline machinery
 /// (sub-batching, profile assembly) is written once over `Encoder` and the verbs
 /// stay discoverable per task.
@@ -543,12 +543,12 @@ pub struct BatchTokenClassifications {
 /// JIT execute); [`run`](Encoder::run) defaults to a batch-of-one. Pairing a
 /// model output with its chunk's source position is the pipeline's job, not the
 /// model's — the verb facades ([`EncoderPipeline::embed`] / [`classify`] /
-/// [`recognize`]) do it from the chunk + output types, so a model implements only
+/// [`classify_tokens`]) do it from the chunk + output types, so a model implements only
 /// its irreducible part. The analog of
 /// [`audio::Transcriber`](super::audio::Transcriber).
 ///
 /// [`classify`]: EncoderPipeline::classify
-/// [`recognize`]: EncoderPipeline::recognize
+/// [`classify_tokens`]: EncoderPipeline::classify_tokens
 pub trait Encoder {
     /// Per-chunk model output, position-agnostic: [`Embedding`] /
     /// [`Classification`] / [`TokenClassification`].
@@ -594,8 +594,8 @@ pub trait Classify: Encoder<Output = Classification> {
 
 /// Token-classification head (NER, POS tagging, chunking, …). A specialization
 /// of [`Encoder`] fixing [`Output`](Encoder::Output) = [`TokenClassification`];
-/// implement [`Encoder::run_batch`] plus [`num_labels`](Recognize::num_labels).
-pub trait Recognize: Encoder<Output = TokenClassification> {
+/// implement [`Encoder::run_batch`] plus [`num_labels`](ClassifyTokens::num_labels).
+pub trait ClassifyTokens: Encoder<Output = TokenClassification> {
     /// The label count — the trailing dim of each [`TokenClassification`]'s
     /// `logits` grid.
     fn num_labels(&self) -> usize;
@@ -605,7 +605,7 @@ pub trait Recognize: Encoder<Output = TokenClassification> {
 
 /// The full pipeline: a [`Tokenizer`] + a [`Chunker`] + an [`Encoder`]. One
 /// generic host-side composer for embeddings, classification, and token
-/// classification — `embed` / `classify` / `recognize` (and their `_batch`
+/// classification — `embed` / `classify` / `classify_tokens` (and their `_batch`
 /// siblings) are bounded facades over the same machinery, so a caller grepping
 /// for "how do I embed" still finds a named verb. Build with
 /// [`assemble`](EncoderPipeline::assemble) to size the (eagerly-JIT-prepared)
@@ -780,7 +780,7 @@ impl<T: Tokenizer, C: Chunker, M: Encoder> EncoderPipeline<T, C, M> {
     /// profile (no tokenize/chunk stages, since those ran before this call). The
     /// task verbs ([`embed_chunks`](Self::embed_chunks) /
     /// [`classify_chunks`](Self::classify_chunks) /
-    /// [`recognize_chunks`](Self::recognize_chunks)) pair these outputs with the
+    /// [`classify_tokens_chunks`](Self::classify_tokens_chunks)) pair these outputs with the
     /// caller's chunks into the named, position-attached aggregate — that is the
     /// cross-pipeline reuse path (tokenize + chunk once, feed the same
     /// `Vec<TextChunk>` to several pipelines). Only the
@@ -824,7 +824,7 @@ impl<T: Tokenizer, C: Chunker, M: Encoder> EncoderPipeline<T, C, M> {
     }
 
     /// Generic typed accessor for the encoder model. The task facades also
-    /// expose `embedder_mut` / `classifier_mut` / `recognizer_mut` aliases.
+    /// expose `embedder_mut` / `classifier_mut` / `token_classifier_mut` aliases.
     pub fn model_mut(&mut self) -> &mut M {
         &mut self.model
     }
@@ -832,9 +832,9 @@ impl<T: Tokenizer, C: Chunker, M: Encoder> EncoderPipeline<T, C, M> {
 
 // ─── Verb facades ───────────────────────────────────────────────────────────
 //
-// `embed` / `classify` / `recognize` (and their `_batch` siblings) are bounded
+// `embed` / `classify` / `classify_tokens` (and their `_batch` siblings) are bounded
 // inherent impls over the same `EncoderPipeline`. Distinct bounds (Embed vs
-// Classify vs Recognize) ⇒ no coherence conflict; a caller gets only the verbs
+// Classify vs ClassifyTokens) ⇒ no coherence conflict; a caller gets only the verbs
 // their model's trait unlocks. Each wraps the generic inner into the task's
 // named aggregate, pairing the model's position-agnostic outputs with their
 // source chunks' positions (the old per-model `Encoder::attach`).
@@ -860,7 +860,7 @@ fn attach_classify(outputs: Vec<Classification>, chunks: &[TextChunk]) -> Vec<Ch
 }
 
 /// Pair per-token logits with their source chunks' positions and per-token byte
-/// geometry — the recognize facade's attachment step. The only task that pulls
+/// geometry — the classify_tokens facade's attachment step. The only task that pulls
 /// extra fields (`offsets` / `special_tokens_mask`) from the chunk.
 fn attach_token(outputs: Vec<TokenClassification>, chunks: &[TextChunk]) -> Vec<ChunkTokenClassification> {
     chunks
@@ -1045,26 +1045,26 @@ impl<T: Tokenizer, C: Chunker, M: Classify> EncoderPipeline<T, C, M> {
     }
 }
 
-impl<T: Tokenizer, C: Chunker, M: Recognize> EncoderPipeline<T, C, M> {
-    /// Tokenize → chunk → recognize → assemble profile. See
+impl<T: Tokenizer, C: Chunker, M: ClassifyTokens> EncoderPipeline<T, C, M> {
+    /// Tokenize → chunk → classify_tokens → assemble profile. See
     /// [`run_single_inner`](Self::run_single_inner) for the [`RunOptions`] /
     /// profile semantics. Decode spans with [`labels_for_tokens`] /
     /// [`group_spans`].
-    pub fn recognize(&mut self, text: &str, opts: RunOptions) -> Result<TokenClassifications, PipelineError<T, C, M>> {
+    pub fn classify_tokens(&mut self, text: &str, opts: RunOptions) -> Result<TokenClassifications, PipelineError<T, C, M>> {
         let (outputs, chunks, profile) = self.run_single_inner(text, opts)?;
         Ok(TokenClassifications { chunks: attach_token(outputs, &chunks), profile })
     }
 
-    /// [`recognize`](Self::recognize) with default [`RunOptions`] (no profile).
-    pub fn recognize_default(&mut self, text: &str) -> Result<TokenClassifications, PipelineError<T, C, M>> {
-        self.recognize(text, RunOptions::default())
+    /// [`classify_tokens`](Self::classify_tokens) with default [`RunOptions`] (no profile).
+    pub fn classify_tokens_default(&mut self, text: &str) -> Result<TokenClassifications, PipelineError<T, C, M>> {
+        self.classify_tokens(text, RunOptions::default())
     }
 
-    /// Tokenize → chunk → recognize multiple texts in one call. Returns one
+    /// Tokenize → chunk → classify_tokens multiple texts in one call. Returns one
     /// [`TokenClassifications`] per input text — each carrying its own
     /// [`ChunkTokenClassification`]s with correct positions — plus a shared
     /// batch-level [`RunProfile`] on [`BatchTokenClassifications::profile`].
-    pub fn recognize_batch(
+    pub fn classify_tokens_batch(
         &mut self,
         texts: &[&str],
         opts: RunOptions,
@@ -1078,17 +1078,17 @@ impl<T: Tokenizer, C: Chunker, M: Recognize> EncoderPipeline<T, C, M> {
         Ok(BatchTokenClassifications { results, profile })
     }
 
-    /// [`recognize_batch`](Self::recognize_batch) with default [`RunOptions`].
-    pub fn recognize_batch_default(
+    /// [`classify_tokens_batch`](Self::classify_tokens_batch) with default [`RunOptions`].
+    pub fn classify_tokens_batch_default(
         &mut self,
         texts: &[&str],
     ) -> Result<BatchTokenClassifications, PipelineError<T, C, M>> {
-        self.recognize_batch(texts, RunOptions::default())
+        self.classify_tokens_batch(texts, RunOptions::default())
     }
 
-    /// Recognize pre-built chunks — the chunk-level seam, wrapped into
+    /// ClassifyTokens pre-built chunks — the chunk-level seam, wrapped into
     /// [`TokenClassifications`]. See [`run_chunks`](Self::run_chunks).
-    pub fn recognize_chunks(
+    pub fn classify_tokens_chunks(
         &mut self,
         chunks: &[TextChunk],
         opts: RunOptions,
@@ -1097,18 +1097,18 @@ impl<T: Tokenizer, C: Chunker, M: Recognize> EncoderPipeline<T, C, M> {
         Ok(TokenClassifications { chunks: attach_token(outputs, chunks), profile })
     }
 
-    /// [`recognize_chunks`](Self::recognize_chunks) with default [`RunOptions`].
-    pub fn recognize_chunks_default(
+    /// [`classify_tokens_chunks`](Self::classify_tokens_chunks) with default [`RunOptions`].
+    pub fn classify_tokens_chunks_default(
         &mut self,
         chunks: &[TextChunk],
     ) -> Result<TokenClassifications, PipelineError<T, C, M>> {
-        self.recognize_chunks(chunks, RunOptions::default())
+        self.classify_tokens_chunks(chunks, RunOptions::default())
     }
 
-    /// Recognize pre-built per-text chunk lists — the batch chunk-level seam,
+    /// ClassifyTokens pre-built per-text chunk lists — the batch chunk-level seam,
     /// wrapped into [`BatchTokenClassifications`]. See
     /// [`run_chunks_batch`](Self::run_chunks_batch).
-    pub fn recognize_chunks_batch(
+    pub fn classify_tokens_chunks_batch(
         &mut self,
         per_text: &[Vec<TextChunk>],
         opts: RunOptions,
@@ -1122,17 +1122,17 @@ impl<T: Tokenizer, C: Chunker, M: Recognize> EncoderPipeline<T, C, M> {
         Ok(BatchTokenClassifications { results, profile })
     }
 
-    /// [`recognize_chunks_batch`](Self::recognize_chunks_batch) with default
+    /// [`classify_tokens_chunks_batch`](Self::classify_tokens_chunks_batch) with default
     /// [`RunOptions`].
-    pub fn recognize_chunks_batch_default(
+    pub fn classify_tokens_chunks_batch_default(
         &mut self,
         per_text: &[Vec<TextChunk>],
     ) -> Result<BatchTokenClassifications, PipelineError<T, C, M>> {
-        self.recognize_chunks_batch(per_text, RunOptions::default())
+        self.classify_tokens_chunks_batch(per_text, RunOptions::default())
     }
 
-    /// Typed accessor for the recognizer (the [`Recognize`] model).
-    pub fn recognizer_mut(&mut self) -> &mut M {
+    /// Typed accessor for the classify_tokensr (the [`ClassifyTokens`] model).
+    pub fn token_classifier_mut(&mut self) -> &mut M {
         &mut self.model
     }
 }
