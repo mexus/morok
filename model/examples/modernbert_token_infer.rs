@@ -56,26 +56,6 @@ struct Args {
     profile: bool,
 }
 
-/// Resolve the `id2label` map from a checkpoint's `config.json` into a dense
-/// `Vec<String>` indexed by label id. The model itself deals in label indices;
-/// only the demo needs the names for display + BIO span grouping.
-fn load_id2label(repo: &str, revision: &str) -> Result<Vec<String>, Box<dyn std::error::Error>> {
-    let api = hf_hub::api::sync::Api::new()?;
-    let repo = api.repo(hf_hub::Repo::with_revision(repo.to_string(), hf_hub::RepoType::Model, revision.to_string()));
-    let cfg_path = repo.get("config.json")?;
-    let raw: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(cfg_path)?)?;
-    let map = raw.get("id2label").ok_or("no id2label in config.json")?.as_object().ok_or("id2label not an object")?;
-    let n = map.len();
-    let mut out = vec![String::new(); n];
-    for (k, v) in map {
-        let id: usize = k.parse()?;
-        if id < n {
-            out[id] = v.as_str().unwrap_or("").to_string();
-        }
-    }
-    Ok(out)
-}
-
 fn parse_scheme(s: &str) -> Result<Scheme, Box<dyn std::error::Error>> {
     Ok(match s.to_ascii_lowercase().as_str() {
         "bio" | "iob2" => Scheme::Bio,
@@ -107,18 +87,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let t_total = Instant::now();
     println!("Loading ModernBERT token classifier from {} ({})...", args.repo, args.revision);
-    let (tokenizer, recognizer) =
+    let load =
         modernbert::from_hub_token_classification_with_revision(&args.repo, &args.revision, args.max_batch, dtype)?;
-    let (_, max_seq) = recognizer.capacity();
-    let num_labels = recognizer.num_labels();
+    let (_, max_seq) = load.classifier.capacity();
+    let num_labels = load.classifier.num_labels();
     println!("Loaded: max_seq={max_seq}, max_batch={}, num_labels={num_labels}", args.max_batch);
 
-    let id2label = load_id2label(&args.repo, &args.revision)?;
+    let id2label = load.id2label;
     let label_of =
         |id: u32| id2label.get(id as usize).cloned().filter(|s| !s.is_empty()).unwrap_or_else(|| format!("LABEL_{id}"));
 
     println!("Chunker: truncating max_seq={max_seq}");
-    let mut pipeline = EncoderPipeline::new(tokenizer, TruncatingChunker::new(max_seq), recognizer);
+    let mut pipeline = EncoderPipeline::new(load.tokenizer, TruncatingChunker::new(max_seq), load.classifier);
 
     println!("\nTagging {} chars (scheme = {})...", text.len(), args.scheme);
     let t = Instant::now();

@@ -1116,7 +1116,7 @@ where
         if *special != 0 {
             continue;
         }
-        let label_id = argmax_u32(row);
+        let label_id = argmax(row) as u32;
         let (start, end) = chunk.token_offsets.get(t).copied().unwrap_or((0, 0));
         out.push(TokenLabel { label_id, label: id2label(label_id), start, end, token_index: content_idx });
         content_idx += 1;
@@ -1259,12 +1259,23 @@ fn close_span(open: &mut Option<(String, u32, usize, usize, usize)>, out: &mut V
     }
 }
 
-/// Index of the maximum element, or `0` for an empty row (tokens have ≥1 label
-/// in practice; the fallback keeps a degenerate row total).
-fn argmax_u32(row: &[f32]) -> u32 {
+/// Index of the maximum element, or `0` for an empty slice. NaN-safe: NaN is
+/// treated as equal to everything (never wins a strict greater-than), so a NaN
+/// row yields `0` rather than panicking — unlike `partial_cmp(b).unwrap()`.
+pub fn argmax(row: &[f32]) -> usize {
     row.iter()
         .enumerate()
         .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-        .map(|(i, _)| i as u32)
+        .map(|(i, _)| i)
         .unwrap_or(0)
+}
+
+/// Softmax probabilities (max-subtracted for numerical stability), summing to
+/// ~1. An empty slice yields an empty vec. Used to turn raw class logits into
+/// probabilities alongside [`argmax`].
+pub fn softmax(logits: &[f32]) -> Vec<f32> {
+    let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let exp: Vec<f32> = logits.iter().map(|x| (x - max).exp()).collect();
+    let sum: f32 = exp.iter().sum();
+    exp.iter().map(|x| x / sum).collect()
 }

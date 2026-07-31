@@ -26,6 +26,7 @@ fn tiny_cfg() -> ModernBertConfig {
         classifier_pooling: ClassifierPooling::Cls,
         classifier_bias: false,
         norm_bias: false,
+        id2label: vec![],
     }
 }
 

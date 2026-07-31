@@ -67,6 +67,12 @@ pub struct ModernBertConfig {
     pub classifier_bias: bool,
     /// Whether LayerNorm biases are present (HF's `norm_bias`).
     pub norm_bias: bool,
+    /// Dense label-name table for classification heads (sequence + token):
+    /// `id2label[id]` is the name of label `id`. Built from HF `config.json`'s
+    /// sparse `id2label` map — sized to `max(id)+1`, gaps filled with
+    /// `"LABEL_{id}"`. Empty for checkpoints without a label map (e.g. the
+    /// base embedder).
+    pub id2label: Vec<String>,
 }
 
 impl ModernBertConfig {
@@ -118,6 +124,7 @@ impl Default for ModernBertConfig {
             classifier_pooling: ClassifierPooling::Cls,
             classifier_bias: false,
             norm_bias: false,
+            id2label: vec![],
         }
     }
 }
@@ -144,6 +151,7 @@ impl ModernBertConfig {
 
     fn from_raw(raw: RawModernBertConfig) -> Self {
         let d = ModernBertConfig::default();
+        let id2label = dense_id2label(&raw.id2label);
         ModernBertConfig {
             vocab_size: raw.vocab_size.unwrap_or(d.vocab_size),
             hidden_size: raw.hidden_size.unwrap_or(d.hidden_size),
@@ -162,15 +170,14 @@ impl ModernBertConfig {
             // Compute dtype is caller-chosen, not from config.json.
             dtype: d.dtype,
             max_batch_size: d.max_batch_size,
-            num_labels: raw
-                .num_labels
-                .unwrap_or_else(|| raw.id2label.as_ref().map(|m| m.len()).unwrap_or(d.num_labels)),
+            num_labels: raw.num_labels.unwrap_or(if id2label.is_empty() { d.num_labels } else { id2label.len() }),
             classifier_pooling: match raw.classifier_pooling.as_deref() {
                 Some("mean") => ClassifierPooling::Mean,
                 _ => ClassifierPooling::Cls,
             },
             classifier_bias: raw.classifier_bias.unwrap_or(d.classifier_bias),
             norm_bias: raw.norm_bias.unwrap_or(d.norm_bias),
+            id2label,
         }
     }
 
@@ -184,6 +191,29 @@ impl ModernBertConfig {
         let max_batch_size = self.max_batch_size;
         *self = ModernBertConfig { dtype, max_batch_size, ..parsed.clone() };
     }
+}
+
+/// Build a dense `Vec<String>` from a sparse HF `id2label` map (`config.json`):
+/// size to `max(id)+1`, fill gaps (and empty values) with `"LABEL_{id}"`. An
+/// absent or empty map yields `vec![]`.
+fn dense_id2label(raw: &Option<HashMap<String, String>>) -> Vec<String> {
+    let Some(map) = raw else { return Vec::new() };
+    let max_id = map.keys().filter_map(|k| k.parse::<usize>().ok()).max();
+    let Some(max_id) = max_id else { return Vec::new() };
+    let mut out = vec![String::new(); max_id + 1];
+    for (k, v) in map {
+        if let Ok(id) = k.parse::<usize>()
+            && id < out.len()
+        {
+            out[id] = v.clone();
+        }
+    }
+    for (i, slot) in out.iter_mut().enumerate() {
+        if slot.is_empty() {
+            *slot = format!("LABEL_{i}");
+        }
+    }
+    out
 }
 
 /// Serde mirror of the published `config.json`. Every field is optional so a

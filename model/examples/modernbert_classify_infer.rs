@@ -18,7 +18,7 @@ use std::time::Instant;
 
 use clap::Parser;
 
-use svod_arch::pipelines::text::{Classify, Encoder, EncoderPipeline, RunOptions, TruncatingChunker};
+use svod_arch::pipelines::text::{Classify, Encoder, EncoderPipeline, RunOptions, TruncatingChunker, argmax, softmax};
 use svod_dtype::DType;
 use svod_model::modernbert;
 
@@ -49,13 +49,6 @@ struct Args {
     profile: bool,
 }
 
-fn softmax(logits: &[f32]) -> Vec<f32> {
-    let max = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-    let exp: Vec<f32> = logits.iter().map(|x| (x - max).exp()).collect();
-    let sum: f32 = exp.iter().sum();
-    exp.iter().map(|x| x / sum).collect()
-}
-
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
 
@@ -77,14 +70,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let t_total = Instant::now();
     println!("Loading ModernBERT classifier from {} ({})...", args.repo, args.revision);
-    let (tokenizer, classifier) =
-        modernbert::from_hub_classifier_with_revision(&args.repo, &args.revision, args.max_batch, dtype)?;
-    let (_, max_seq) = classifier.capacity();
-    let num_classes = classifier.num_classes();
+    let load = modernbert::from_hub_classifier_with_revision(&args.repo, &args.revision, args.max_batch, dtype)?;
+    let (_, max_seq) = load.classifier.capacity();
+    let num_classes = load.classifier.num_classes();
     println!("Loaded: max_seq={max_seq}, max_batch={}, num_classes={num_classes}", args.max_batch);
 
     println!("Chunker: truncating max_seq={max_seq}");
-    let mut pipeline = EncoderPipeline::new(tokenizer, TruncatingChunker::new(max_seq), classifier);
+    let mut pipeline = EncoderPipeline::new(load.tokenizer, TruncatingChunker::new(max_seq), load.classifier);
 
     println!("\nClassifying {} chars...", text.len());
     let t = Instant::now();
@@ -94,8 +86,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  {} chunk(s)", result.chunks.len());
     for (i, chunk) in result.chunks.iter().enumerate() {
         let probs = softmax(&chunk.logits);
-        let (best, &p) =
-            probs.iter().enumerate().max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap()).expect("non-empty logits");
+        let best = argmax(&chunk.logits);
+        let p = probs[best];
         let probs_str: Vec<String> = probs.iter().map(|p| format!("{p:.4}")).collect();
         println!(
             "  chunk {i} @ byte {}: logits={:?} → class {best} (p={p:.4})  probs=[{}]",

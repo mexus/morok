@@ -46,8 +46,9 @@ pub use mlp::ModernBertGlu;
 pub use model::ModernBert;
 pub use normalization::LayerNormWeights;
 pub use pipeline::{
-    from_hub, from_hub_classifier, from_hub_classifier_with_revision, from_hub_token_classification,
-    from_hub_token_classification_with_revision, from_hub_with_revision,
+    ModernBertClassifierLoad, ModernBertTokenClassifierLoad, from_hub, from_hub_classifier,
+    from_hub_classifier_with_revision, from_hub_token_classification, from_hub_token_classification_with_revision,
+    from_hub_with_revision,
 };
 pub use pooling::{cls, masked_mean};
 pub use rotary::RotaryTable;

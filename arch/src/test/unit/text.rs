@@ -6,8 +6,8 @@ use crate::pipelines::text::{
     BatchClassifications, BatchEmbeddings, BatchTokenClassifications, ChunkClassification, ChunkEmbedding,
     ChunkTokenClassification, Chunker, Classification, Classify, Embed, Embedding, Encoder, EncoderPipeline,
     EncoderPipelineError, Encoding, Entity, HfTokenizer, HfTokenizerError, Recognize, RunOptions, RunProfile, Scheme,
-    SlidingWindowChunker, TextChunk, TokenClassification, TokenLabel, Tokenizer, TruncatingChunker, group_spans,
-    labels_for_tokens,
+    SlidingWindowChunker, TextChunk, TokenClassification, TokenLabel, Tokenizer, TruncatingChunker, argmax,
+    group_spans, labels_for_tokens, softmax,
 };
 
 fn enc(ids: &[u32]) -> Encoding {
@@ -1534,6 +1534,52 @@ fn chunk_seam_empty_chunks_returns_empty_no_encode() {
     );
     let out = p.embed_chunks_default(&[]).unwrap();
     assert!(out.chunks.is_empty());
+}
+
+// ─── softmax / argmax ───────────────────────────────────────────────────────
+
+#[test]
+fn argmax_picks_highest_index() {
+    assert_eq!(argmax(&[1.0, 3.0, 2.0]), 1);
+    assert_eq!(argmax(&[5.0, 1.0, 2.0]), 0);
+    assert_eq!(argmax(&[1.0, 2.0, 5.0]), 2);
+}
+
+#[test]
+fn argmax_empty_returns_zero() {
+    assert_eq!(argmax(&[]), 0);
+}
+
+#[test]
+fn argmax_nan_safe_does_not_panic() {
+    // NaN must not panic (the partial_cmp().unwrap() footgun argmax replaces).
+    let _ = argmax(&[1.0, f32::NAN, 2.0]);
+    let _ = argmax(&[f32::NAN, f32::NAN]);
+}
+
+#[test]
+fn softmax_sums_to_one_and_preserves_order() {
+    let probs = softmax(&[1.0, 3.0, 2.0]);
+    assert_eq!(probs.len(), 3);
+    let sum: f32 = probs.iter().sum();
+    assert!((sum - 1.0).abs() < 1e-5, "sums to ~1, got {sum}");
+    // argmax index has the highest probability.
+    assert!(probs[1] > probs[0]);
+    assert!(probs[1] > probs[2]);
+}
+
+#[test]
+fn softmax_empty_returns_empty() {
+    assert!(softmax(&[]).is_empty());
+}
+
+#[test]
+fn softmax_large_values_do_not_overflow() {
+    // Numerical stability: max-subtraction prevents overflow.
+    let probs = softmax(&[1000.0, 1001.0, 999.0]);
+    let sum: f32 = probs.iter().sum();
+    assert!((sum - 1.0).abs() < 1e-5, "large logits sum to ~1, got {sum}");
+    assert!(probs.iter().all(|p| p.is_finite()));
 }
 
 // ─── labels_for_tokens / group_spans decoding ───────────────────────────────
