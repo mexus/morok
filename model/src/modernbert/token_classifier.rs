@@ -14,9 +14,7 @@
 //! ([`prediction_head_tail`]); the two heads differ only in pooling.
 
 use snafu::ResultExt;
-use svod_arch::pipelines::text::{
-    ChunkTokenClassification, Encoder, Encoding, Recognize, RunProfile, TextChunk, TokenClassification,
-};
+use svod_arch::pipelines::text::{Encoder, Encoding, Recognize, RunProfile, TokenClassification};
 use svod_tensor::{BoundVariable, PrepareConfig, Tensor};
 
 use crate::jit::InputSpec;
@@ -106,7 +104,6 @@ impl ModernBertTokenClassifier {
 
 impl Encoder for ModernBertTokenClassifier {
     type Output = TokenClassification;
-    type ChunkOutput = ChunkTokenClassification;
     type Error = HeadError;
 
     fn capacity(&self) -> (usize, usize) {
@@ -132,16 +129,6 @@ impl Encoder for ModernBertTokenClassifier {
             })
             .collect();
         Ok((results, prof))
-    }
-
-    fn attach(chunk: &TextChunk, out: TokenClassification) -> ChunkTokenClassification {
-        ChunkTokenClassification {
-            byte_offset: chunk.byte_offset,
-            token_offsets: chunk.encoding.offsets.clone(),
-            special_tokens_mask: chunk.encoding.special_tokens_mask.clone(),
-            logits: out.logits,
-            num_labels: out.num_labels,
-        }
     }
 }
 

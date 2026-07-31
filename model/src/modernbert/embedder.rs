@@ -18,7 +18,7 @@
 //! uses.
 
 use snafu::ResultExt;
-use svod_arch::pipelines::text::{ChunkEmbedding, Embed, Embedding, Encoder, Encoding, RunProfile, TextChunk};
+use svod_arch::pipelines::text::{Embed, Embedding, Encoder, Encoding, RunProfile};
 use svod_tensor::PrepareConfig;
 
 use crate::jit::InputSpec;
@@ -62,7 +62,6 @@ impl ModernBertEmbedder {
 
 impl Encoder for ModernBertEmbedder {
     type Output = Embedding;
-    type ChunkOutput = ChunkEmbedding;
     type Error = HeadError;
 
     fn capacity(&self) -> (usize, usize) {
@@ -81,10 +80,6 @@ impl Encoder for ModernBertEmbedder {
         let embeddings: Vec<Embedding> =
             (0..b).map(|i| Embedding { values: flat[i * d..i * d + d].to_vec() }).collect();
         Ok((embeddings, prof))
-    }
-
-    fn attach(chunk: &TextChunk, out: Embedding) -> ChunkEmbedding {
-        ChunkEmbedding { byte_offset: chunk.byte_offset, values: out.values }
     }
 }
 

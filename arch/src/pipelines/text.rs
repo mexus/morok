@@ -535,22 +535,24 @@ pub struct BatchTokenClassifications {
 /// Any encoder-only head: turns tokenized chunks into a per-chunk
 /// position-agnostic output. The shared shape behind the three task traits
 /// ([`Embed`] / [`Classify`] / [`Recognize`]) — they fix [`Output`](Encoder::Output)
-/// / [`ChunkOutput`](Encoder::ChunkOutput) and add one informational accessor
-/// each, so the pipeline machinery (sub-batching, profile assembly) is written
-/// once over `Encoder` and the verbs stay discoverable per task.
+/// and add one informational accessor each, so the pipeline machinery
+/// (sub-batching, profile assembly) is written once over `Encoder` and the verbs
+/// stay discoverable per task.
 ///
 /// Implement [`run_batch`](Encoder::run_batch) (the throughput path — one padded
-/// JIT execute) and [`attach`](Encoder::attach) (the only per-task variance:
-/// pairing a model output with its chunk's source position);
-/// [`run`](Encoder::run) defaults to a batch-of-one. The analog of
+/// JIT execute); [`run`](Encoder::run) defaults to a batch-of-one. Pairing a
+/// model output with its chunk's source position is the pipeline's job, not the
+/// model's — the verb facades ([`EncoderPipeline::embed`] / [`classify`] /
+/// [`recognize`]) do it from the chunk + output types, so a model implements only
+/// its irreducible part. The analog of
 /// [`audio::Transcriber`](super::audio::Transcriber).
+///
+/// [`classify`]: EncoderPipeline::classify
+/// [`recognize`]: EncoderPipeline::recognize
 pub trait Encoder {
     /// Per-chunk model output, position-agnostic: [`Embedding`] /
     /// [`Classification`] / [`TokenClassification`].
     type Output: Default;
-    /// Per-chunk *pipeline* result, position-attached: [`ChunkEmbedding`] /
-    /// [`ChunkClassification`] / [`ChunkTokenClassification`].
-    type ChunkOutput;
     type Error: std::error::Error + 'static;
 
     /// `(max_batch, max_seq)` the JIT was prepared for. Informational; the
@@ -565,12 +567,6 @@ pub trait Encoder {
     /// so the same encoder serves profiled and unprofiled runs).
     fn run_batch(&mut self, batch: &[&Encoding], profile: bool) -> Result<ModelOutputs<Self>, Self::Error>;
 
-    /// Attach a chunk's source position (and, for token heads, its per-token
-    /// `offsets` / `special_tokens_mask`) to a model output. The pipeline calls
-    /// this after [`run_batch`](Encoder::run_batch) — the only per-task variance,
-    /// isolated here so the machinery over `Encoder` is uniform.
-    fn attach(chunk: &TextChunk, out: Self::Output) -> Self::ChunkOutput;
-
     /// Run one chunk + its optional profile (batch-of-one fallback).
     fn run(&mut self, enc: &Encoding, profile: bool) -> Result<(Self::Output, Option<RunProfile>), Self::Error> {
         let (mut values, prof) = self.run_batch(&[enc], profile)?;
@@ -579,33 +575,27 @@ pub trait Encoder {
 }
 
 /// Finished-embeddings head. A specialization of [`Encoder`] fixing
-/// [`Output`](Encoder::Output) = [`Embedding`] and
-/// [`ChunkOutput`](Encoder::ChunkOutput) = [`ChunkEmbedding`]; implement
-/// [`Encoder::run_batch`] / [`Encoder::attach`] plus
-/// [`hidden_size`](Embed::hidden_size).
-pub trait Embed: Encoder<Output = Embedding, ChunkOutput = ChunkEmbedding> {
+/// [`Output`](Encoder::Output) = [`Embedding`]; implement
+/// [`Encoder::run_batch`] plus [`hidden_size`](Embed::hidden_size).
+pub trait Embed: Encoder<Output = Embedding> {
     /// The model's hidden size — the length of each finished [`Embedding`] (the
     /// model pools the sequence dimension before returning it).
     fn hidden_size(&self) -> usize;
 }
 
 /// Sentence/text-classification head. A specialization of [`Encoder`] fixing
-/// [`Output`](Encoder::Output) = [`Classification`] and
-/// [`ChunkOutput`](Encoder::ChunkOutput) = [`ChunkClassification`]; implement
-/// [`Encoder::run_batch`] / [`Encoder::attach`] plus
-/// [`num_labels`](Classify::num_labels).
-pub trait Classify: Encoder<Output = Classification, ChunkOutput = ChunkClassification> {
+/// [`Output`](Encoder::Output) = [`Classification`]; implement
+/// [`Encoder::run_batch`] plus [`num_labels`](Classify::num_labels).
+pub trait Classify: Encoder<Output = Classification> {
     /// The model's label count — the length of each [`Classification`]'s
     /// `logits` vector.
     fn num_labels(&self) -> usize;
 }
 
 /// Token-classification head (NER, POS tagging, chunking, …). A specialization
-/// of [`Encoder`] fixing [`Output`](Encoder::Output) = [`TokenClassification`]
-/// and [`ChunkOutput`](Encoder::ChunkOutput) = [`ChunkTokenClassification`];
-/// implement [`Encoder::run_batch`] / [`Encoder::attach`] plus
-/// [`num_labels`](Recognize::num_labels).
-pub trait Recognize: Encoder<Output = TokenClassification, ChunkOutput = ChunkTokenClassification> {
+/// of [`Encoder`] fixing [`Output`](Encoder::Output) = [`TokenClassification`];
+/// implement [`Encoder::run_batch`] plus [`num_labels`](Recognize::num_labels).
+pub trait Recognize: Encoder<Output = TokenClassification> {
     /// The label count — the trailing dim of each [`TokenClassification`]'s
     /// `logits` grid.
     fn num_labels(&self) -> usize;
@@ -655,13 +645,15 @@ type PipelineError<T, C, M> =
 /// result shape. Aliased because the inline form trips `clippy::type_complexity`.
 type ModelOutputs<M> = (Vec<<M as Encoder>::Output>, Option<RunProfile>);
 
-/// `(per-chunk pipeline results, optional profile)` — the pipeline's flattened
-/// / single-text result shape. Aliased (`clippy::type_complexity`).
-type ChunkOutputs<M> = (Vec<<M as Encoder>::ChunkOutput>, Option<RunProfile>);
+/// `(position-agnostic outputs, the source chunks they map to, optional profile)`
+/// — the single-text run shape returned by [`EncoderPipeline::run_single_inner`].
+/// The verb facades pair the parallel `outputs` / `chunks` into position-attached
+/// results. Aliased (`clippy::type_complexity`).
+type SingleRun<M> = (Vec<<M as Encoder>::Output>, Vec<TextChunk>, Option<RunProfile>);
 
-/// `(per-text chunk-result vecs, optional profile)` — the batch result shape.
-/// Aliased (`clippy::type_complexity`).
-type BatchChunkOutputs<M> = (Vec<Vec<<M as Encoder>::ChunkOutput>>, Option<RunProfile>);
+/// `(per-text outputs, per-text source chunks, optional profile)` — the batch
+/// run shape returned by [`EncoderPipeline::run_batch_inner`]. Aliased.
+type BatchRun<M> = (Vec<Vec<<M as Encoder>::Output>>, Vec<Vec<TextChunk>>, Option<RunProfile>);
 
 impl<T: Tokenizer, C: Chunker, M: Encoder> EncoderPipeline<T, C, M> {
     pub fn new(tokenizer: T, chunker: C, model: M) -> Self {
@@ -678,11 +670,11 @@ impl<T: Tokenizer, C: Chunker, M: Encoder> EncoderPipeline<T, C, M> {
     }
 
     /// Run a flat list of chunks through the encoder, sub-batching to respect
-    /// its `max_batch` capacity and attaching each chunk's source position via
-    /// [`Encoder::attach`]. Returns chunk results in order plus a merged profile
-    /// (one per sub-batch, accumulated via [`RunProfile::merge`]). Shared by the
-    /// single-text and batch entry points.
-    fn run_chunks_flat(&mut self, chunks: &[TextChunk], profile: bool) -> Result<ChunkOutputs<M>, M::Error> {
+    /// its `max_batch` capacity. Returns position-agnostic per-chunk outputs (in
+    /// input order) plus a merged profile (one per sub-batch, accumulated via
+    /// [`RunProfile::merge`]). The verb facades pair these with the source
+    /// chunks' positions afterwards. Shared by the single-text and batch paths.
+    fn run_chunks_flat(&mut self, chunks: &[TextChunk], profile: bool) -> Result<ModelOutputs<M>, M::Error> {
         if chunks.is_empty() {
             return Ok((Vec::new(), None));
         }
@@ -692,9 +684,7 @@ impl<T: Tokenizer, C: Chunker, M: Encoder> EncoderPipeline<T, C, M> {
         for batch in chunks.chunks(max_batch) {
             let encodings: Vec<&Encoding> = batch.iter().map(|c| &c.encoding).collect();
             let (values, prof) = self.model.run_batch(&encodings, profile)?;
-            for (chunk, out) in batch.iter().zip(values) {
-                all.push(M::attach(chunk, out));
-            }
+            all.extend(values);
             if let Some(p) = prof {
                 merged_prof.get_or_insert_with(RunProfile::default).merge(p);
             }
@@ -703,14 +693,15 @@ impl<T: Tokenizer, C: Chunker, M: Encoder> EncoderPipeline<T, C, M> {
     }
 
     /// Tokenize → chunk → encode → assemble profile for a single text. Returns
-    /// the chunk results and the assembled profile; the verb facades wrap these
-    /// into the named aggregate ([`Embeddings`] / [`Classifications`] / …).
-    /// [`RunOptions`] is a per-call switch: the same pipeline serves profiled
-    /// and unprofiled runs without rebuilding. When `opts.profile` is set, the
-    /// tokenize and chunk stages are timed and recorded ahead of the encoder's
-    /// stages — so the profile leads with `[tokenize, <chunker label>, <encoder …>]`,
-    /// exactly as [`audio::Asr::transcribe`](super::audio::Asr::transcribe) prepends `vad`.
-    fn run_single_inner(&mut self, text: &str, opts: RunOptions) -> Result<ChunkOutputs<M>, PipelineError<T, C, M>> {
+    /// the position-agnostic outputs, the source chunks they map to, and the
+    /// assembled profile; the verb facades pair outputs↔chunks into the named
+    /// aggregate ([`Embeddings`] / [`Classifications`] / …). [`RunOptions`] is a
+    /// per-call switch: the same pipeline serves profiled and unprofiled runs
+    /// without rebuilding. When `opts.profile` is set, the tokenize and chunk
+    /// stages are timed and recorded ahead of the encoder's stages — so the
+    /// profile leads with `[tokenize, <chunker label>, <encoder …>]`, exactly as
+    /// [`audio::Asr::transcribe`](super::audio::Asr::transcribe) prepends `vad`.
+    fn run_single_inner(&mut self, text: &str, opts: RunOptions) -> Result<SingleRun<M>, PipelineError<T, C, M>> {
         let t = Instant::now();
         let encoding = self.tokenizer.encode(text).context(TokenizeSnafu)?;
         let tok_wall = t.elapsed();
@@ -719,7 +710,7 @@ impl<T: Tokenizer, C: Chunker, M: Encoder> EncoderPipeline<T, C, M> {
         let chunks = self.chunker.chunk(&encoding).context(ChunkSnafu)?;
         let chunk_wall = t.elapsed();
 
-        let (chunk_outs, enc_prof) = self.run_chunks_flat(&chunks, opts.profile).context(EncodeSnafu)?;
+        let (outputs, enc_prof) = self.run_chunks_flat(&chunks, opts.profile).context(EncodeSnafu)?;
 
         let profile = opts.profile.then(|| {
             let mut p = RunProfile::default();
@@ -730,22 +721,18 @@ impl<T: Tokenizer, C: Chunker, M: Encoder> EncoderPipeline<T, C, M> {
             }
             p
         });
-        Ok((chunk_outs, profile))
+        Ok((outputs, chunks, profile))
     }
 
     /// Tokenize → chunk → encode multiple texts in one call. All chunks from all
     /// texts are flattened into a single stream and batched through the encoder
     /// (sub-batched to `model.capacity().0` when the total exceeds it),
-    /// maximizing throughput. Returns one chunk-result vec per input text (moved
-    /// out of the flat stream by each text's chunk count) plus a shared
+    /// maximizing throughput. Returns one (outputs, chunks) pair per input text —
+    /// moved out of the flat stream by each text's chunk count — plus a shared
     /// batch-level profile.
-    fn run_batch_inner(
-        &mut self,
-        texts: &[&str],
-        opts: RunOptions,
-    ) -> Result<BatchChunkOutputs<M>, PipelineError<T, C, M>> {
+    fn run_batch_inner(&mut self, texts: &[&str], opts: RunOptions) -> Result<BatchRun<M>, PipelineError<T, C, M>> {
         if texts.is_empty() {
-            return Ok((Vec::new(), None));
+            return Ok((Vec::new(), Vec::new(), None));
         }
 
         let t = Instant::now();
@@ -764,13 +751,15 @@ impl<T: Tokenizer, C: Chunker, M: Encoder> EncoderPipeline<T, C, M> {
 
         let (all_outs, enc_prof) = self.run_chunks_flat(&all_chunks, opts.profile).context(EncodeSnafu)?;
 
-        // Reassemble per-text: drain the flat chunk-result vec by each text's
-        // chunk count (moving, not cloning).
-        let mut results = Vec::with_capacity(texts.len());
-        let mut iter = all_outs.into_iter();
+        // Reassemble per-text: drain the flat outputs AND the flat chunks by
+        // each text's chunk count (moving, not cloning).
+        let mut per_text_outs = Vec::with_capacity(texts.len());
+        let mut per_text_chunks = Vec::with_capacity(texts.len());
+        let mut out_iter = all_outs.into_iter();
+        let mut chunk_iter = all_chunks.into_iter();
         for &count in &counts {
-            let per_text: Vec<M::ChunkOutput> = iter.by_ref().take(count).collect();
-            results.push(per_text);
+            per_text_outs.push(out_iter.by_ref().take(count).collect::<Vec<M::Output>>());
+            per_text_chunks.push(chunk_iter.by_ref().take(count).collect::<Vec<TextChunk>>());
         }
 
         let profile = opts.profile.then(|| {
@@ -782,54 +771,46 @@ impl<T: Tokenizer, C: Chunker, M: Encoder> EncoderPipeline<T, C, M> {
             }
             p
         });
-        Ok((results, profile))
+        Ok((per_text_outs, per_text_chunks, profile))
     }
 
     /// Run pre-built [`TextChunk`]s through the encoder, skipping tokenize and
-    /// chunk entirely — the public chunk-level seam. Sub-batches to respect the
-    /// encoder's `max_batch` and attaches each chunk's source position via
-    /// [`Encoder::attach`]. Returns one [`Encoder::ChunkOutput`] per chunk (in
-    /// order) plus the encoder-only profile (no tokenize/chunk stages, since
-    /// those ran before this call).
-    ///
-    /// This is the cross-pipeline reuse path: tokenize + chunk once, then feed
-    /// the same `Vec<TextChunk>` to an embed, classify, and/or recognize
-    /// pipeline without retokenizing. Only the [`Encode`](EncoderPipelineError::Encode)
-    /// arm is reachable (tokenize/chunk already happened). The task verbs
-    /// ([`embed_chunks`](Self::embed_chunks) / [`classify_chunks`](Self::classify_chunks) /
-    /// [`recognize_chunks`](Self::recognize_chunks)) wrap this into the named
-    /// aggregate.
-    pub fn run_chunks(
-        &mut self,
-        chunks: &[TextChunk],
-        opts: RunOptions,
-    ) -> Result<ChunkOutputs<M>, PipelineError<T, C, M>> {
-        let (chunk_outs, prof) = self.run_chunks_flat(chunks, opts.profile).context(EncodeSnafu)?;
-        Ok((chunk_outs, prof))
+    /// chunk entirely. Sub-batches to respect the encoder's `max_batch`. Returns
+    /// position-agnostic per-chunk outputs (in order) plus the encoder-only
+    /// profile (no tokenize/chunk stages, since those ran before this call). The
+    /// task verbs ([`embed_chunks`](Self::embed_chunks) /
+    /// [`classify_chunks`](Self::classify_chunks) /
+    /// [`recognize_chunks`](Self::recognize_chunks)) pair these outputs with the
+    /// caller's chunks into the named, position-attached aggregate — that is the
+    /// cross-pipeline reuse path (tokenize + chunk once, feed the same
+    /// `Vec<TextChunk>` to several pipelines). Only the
+    /// [`Encode`](EncoderPipelineError::Encode) arm is reachable here.
+    fn run_chunks(&mut self, chunks: &[TextChunk], opts: RunOptions) -> Result<ModelOutputs<M>, PipelineError<T, C, M>> {
+        self.run_chunks_flat(chunks, opts.profile).context(EncodeSnafu)
     }
 
     /// Run pre-built per-text chunk lists through the encoder — the batch form
     /// of [`run_chunks`](Self::run_chunks). Each text's chunks are encoded
-    /// (sub-batched to the encoder's `max_batch`), and the per-text chunk-result
-    /// vecs are returned in order alongside a shared batch-level profile that
+    /// (sub-batched to the encoder's `max_batch`); returns per-text
+    /// position-agnostic outputs plus a shared batch-level profile that
     /// accumulates every text's encoder run.
     ///
     /// For maximum throughput when the per-text chunk counts are small, flatten
     /// the inputs into one `Vec<TextChunk>` and call [`run_chunks`](Self::run_chunks)
     /// — that fills each sub-batch across text boundaries.
-    pub fn run_chunks_batch(
+    fn run_chunks_batch(
         &mut self,
         per_text: &[Vec<TextChunk>],
         opts: RunOptions,
-    ) -> Result<BatchChunkOutputs<M>, PipelineError<T, C, M>> {
+    ) -> Result<(Vec<Vec<M::Output>>, Option<RunProfile>), PipelineError<T, C, M>> {
         let mut results = Vec::with_capacity(per_text.len());
         let mut merged_prof: Option<RunProfile> = None;
         for chunks in per_text {
-            let (chunk_outs, prof) = self.run_chunks_flat(chunks, opts.profile).context(EncodeSnafu)?;
+            let (outs, prof) = self.run_chunks_flat(chunks, opts.profile).context(EncodeSnafu)?;
             if let Some(p) = prof {
                 merged_prof.get_or_insert_with(RunProfile::default).merge(p);
             }
-            results.push(chunk_outs);
+            results.push(outs);
         }
         Ok((results, merged_prof))
     }
@@ -855,15 +836,54 @@ impl<T: Tokenizer, C: Chunker, M: Encoder> EncoderPipeline<T, C, M> {
 // inherent impls over the same `EncoderPipeline`. Distinct bounds (Embed vs
 // Classify vs Recognize) ⇒ no coherence conflict; a caller gets only the verbs
 // their model's trait unlocks. Each wraps the generic inner into the task's
-// named aggregate.
+// named aggregate, pairing the model's position-agnostic outputs with their
+// source chunks' positions (the old per-model `Encoder::attach`).
+
+/// Pair finished embeddings with their source chunks' byte offsets — the
+/// position-attachment step the embed facade runs after [`EncoderPipeline::run_single_inner`].
+fn attach_embed(outputs: Vec<Embedding>, chunks: &[TextChunk]) -> Vec<ChunkEmbedding> {
+    chunks
+        .iter()
+        .zip(outputs)
+        .map(|(c, o)| ChunkEmbedding { byte_offset: c.byte_offset, values: o.values })
+        .collect()
+}
+
+/// Pair class logits with their source chunks' byte offsets — the classify facade's
+/// attachment step.
+fn attach_classify(outputs: Vec<Classification>, chunks: &[TextChunk]) -> Vec<ChunkClassification> {
+    chunks
+        .iter()
+        .zip(outputs)
+        .map(|(c, o)| ChunkClassification { byte_offset: c.byte_offset, logits: o.logits })
+        .collect()
+}
+
+/// Pair per-token logits with their source chunks' positions and per-token byte
+/// geometry — the recognize facade's attachment step. The only task that pulls
+/// extra fields (`offsets` / `special_tokens_mask`) from the chunk.
+fn attach_token(outputs: Vec<TokenClassification>, chunks: &[TextChunk]) -> Vec<ChunkTokenClassification> {
+    chunks
+        .iter()
+        .zip(outputs)
+        .map(|(c, o)| ChunkTokenClassification {
+            byte_offset: c.byte_offset,
+            token_offsets: c.encoding.offsets.clone(),
+            special_tokens_mask: c.encoding.special_tokens_mask.clone(),
+            logits: o.logits,
+            num_labels: o.num_labels,
+        })
+        .collect()
+}
+
 
 impl<T: Tokenizer, C: Chunker, M: Embed> EncoderPipeline<T, C, M> {
     /// Tokenize → chunk → embed → assemble profile. See
     /// [`run_single_inner`](Self::run_single_inner) for the [`RunOptions`] /
     /// profile semantics.
     pub fn embed(&mut self, text: &str, opts: RunOptions) -> Result<Embeddings, PipelineError<T, C, M>> {
-        let (chunks, profile) = self.run_single_inner(text, opts)?;
-        Ok(Embeddings { chunks, profile })
+        let (outputs, chunks, profile) = self.run_single_inner(text, opts)?;
+        Ok(Embeddings { chunks: attach_embed(outputs, &chunks), profile })
     }
 
     /// [`embed`](Self::embed) with default [`RunOptions`] (no profile) — the
@@ -877,8 +897,12 @@ impl<T: Tokenizer, C: Chunker, M: Embed> EncoderPipeline<T, C, M> {
     /// with correct `byte_offset`s — plus a shared batch-level [`RunProfile`] on
     /// [`BatchEmbeddings::profile`].
     pub fn embed_batch(&mut self, texts: &[&str], opts: RunOptions) -> Result<BatchEmbeddings, PipelineError<T, C, M>> {
-        let (per_text, profile) = self.run_batch_inner(texts, opts)?;
-        let results = per_text.into_iter().map(|chunks| Embeddings { chunks, profile: None }).collect();
+        let (per_text_outs, per_text_chunks, profile) = self.run_batch_inner(texts, opts)?;
+        let results = per_text_outs
+            .into_iter()
+            .zip(per_text_chunks.iter())
+            .map(|(outs, chunks)| Embeddings { chunks: attach_embed(outs, chunks), profile: None })
+            .collect();
         Ok(BatchEmbeddings { results, profile })
     }
 
@@ -895,8 +919,8 @@ impl<T: Tokenizer, C: Chunker, M: Embed> EncoderPipeline<T, C, M> {
         chunks: &[TextChunk],
         opts: RunOptions,
     ) -> Result<Embeddings, PipelineError<T, C, M>> {
-        let (chunk_outs, profile) = self.run_chunks(chunks, opts)?;
-        Ok(Embeddings { chunks: chunk_outs, profile })
+        let (outputs, profile) = self.run_chunks(chunks, opts)?;
+        Ok(Embeddings { chunks: attach_embed(outputs, chunks), profile })
     }
 
     /// [`embed_chunks`](Self::embed_chunks) with default [`RunOptions`].
@@ -913,7 +937,11 @@ impl<T: Tokenizer, C: Chunker, M: Embed> EncoderPipeline<T, C, M> {
         opts: RunOptions,
     ) -> Result<BatchEmbeddings, PipelineError<T, C, M>> {
         let (per_text_outs, profile) = self.run_chunks_batch(per_text, opts)?;
-        let results = per_text_outs.into_iter().map(|chunks| Embeddings { chunks, profile: None }).collect();
+        let results = per_text_outs
+            .into_iter()
+            .zip(per_text.iter())
+            .map(|(outs, chunks)| Embeddings { chunks: attach_embed(outs, chunks), profile: None })
+            .collect();
         Ok(BatchEmbeddings { results, profile })
     }
 
@@ -937,8 +965,8 @@ impl<T: Tokenizer, C: Chunker, M: Classify> EncoderPipeline<T, C, M> {
     /// [`run_single_inner`](Self::run_single_inner) for the [`RunOptions`] /
     /// profile semantics.
     pub fn classify(&mut self, text: &str, opts: RunOptions) -> Result<Classifications, PipelineError<T, C, M>> {
-        let (chunks, profile) = self.run_single_inner(text, opts)?;
-        Ok(Classifications { chunks, profile })
+        let (outputs, chunks, profile) = self.run_single_inner(text, opts)?;
+        Ok(Classifications { chunks: attach_classify(outputs, &chunks), profile })
     }
 
     /// [`classify`](Self::classify) with default [`RunOptions`] (no profile).
@@ -955,8 +983,12 @@ impl<T: Tokenizer, C: Chunker, M: Classify> EncoderPipeline<T, C, M> {
         texts: &[&str],
         opts: RunOptions,
     ) -> Result<BatchClassifications, PipelineError<T, C, M>> {
-        let (per_text, profile) = self.run_batch_inner(texts, opts)?;
-        let results = per_text.into_iter().map(|chunks| Classifications { chunks, profile: None }).collect();
+        let (per_text_outs, per_text_chunks, profile) = self.run_batch_inner(texts, opts)?;
+        let results = per_text_outs
+            .into_iter()
+            .zip(per_text_chunks.iter())
+            .map(|(outs, chunks)| Classifications { chunks: attach_classify(outs, chunks), profile: None })
+            .collect();
         Ok(BatchClassifications { results, profile })
     }
 
@@ -972,8 +1004,8 @@ impl<T: Tokenizer, C: Chunker, M: Classify> EncoderPipeline<T, C, M> {
         chunks: &[TextChunk],
         opts: RunOptions,
     ) -> Result<Classifications, PipelineError<T, C, M>> {
-        let (chunk_outs, profile) = self.run_chunks(chunks, opts)?;
-        Ok(Classifications { chunks: chunk_outs, profile })
+        let (outputs, profile) = self.run_chunks(chunks, opts)?;
+        Ok(Classifications { chunks: attach_classify(outputs, chunks), profile })
     }
 
     /// [`classify_chunks`](Self::classify_chunks) with default [`RunOptions`].
@@ -990,7 +1022,11 @@ impl<T: Tokenizer, C: Chunker, M: Classify> EncoderPipeline<T, C, M> {
         opts: RunOptions,
     ) -> Result<BatchClassifications, PipelineError<T, C, M>> {
         let (per_text_outs, profile) = self.run_chunks_batch(per_text, opts)?;
-        let results = per_text_outs.into_iter().map(|chunks| Classifications { chunks, profile: None }).collect();
+        let results = per_text_outs
+            .into_iter()
+            .zip(per_text.iter())
+            .map(|(outs, chunks)| Classifications { chunks: attach_classify(outs, chunks), profile: None })
+            .collect();
         Ok(BatchClassifications { results, profile })
     }
 
@@ -1015,8 +1051,8 @@ impl<T: Tokenizer, C: Chunker, M: Recognize> EncoderPipeline<T, C, M> {
     /// profile semantics. Decode spans with [`labels_for_tokens`] /
     /// [`group_spans`].
     pub fn recognize(&mut self, text: &str, opts: RunOptions) -> Result<TokenClassifications, PipelineError<T, C, M>> {
-        let (chunks, profile) = self.run_single_inner(text, opts)?;
-        Ok(TokenClassifications { chunks, profile })
+        let (outputs, chunks, profile) = self.run_single_inner(text, opts)?;
+        Ok(TokenClassifications { chunks: attach_token(outputs, &chunks), profile })
     }
 
     /// [`recognize`](Self::recognize) with default [`RunOptions`] (no profile).
@@ -1033,8 +1069,12 @@ impl<T: Tokenizer, C: Chunker, M: Recognize> EncoderPipeline<T, C, M> {
         texts: &[&str],
         opts: RunOptions,
     ) -> Result<BatchTokenClassifications, PipelineError<T, C, M>> {
-        let (per_text, profile) = self.run_batch_inner(texts, opts)?;
-        let results = per_text.into_iter().map(|chunks| TokenClassifications { chunks, profile: None }).collect();
+        let (per_text_outs, per_text_chunks, profile) = self.run_batch_inner(texts, opts)?;
+        let results = per_text_outs
+            .into_iter()
+            .zip(per_text_chunks.iter())
+            .map(|(outs, chunks)| TokenClassifications { chunks: attach_token(outs, chunks), profile: None })
+            .collect();
         Ok(BatchTokenClassifications { results, profile })
     }
 
@@ -1053,8 +1093,8 @@ impl<T: Tokenizer, C: Chunker, M: Recognize> EncoderPipeline<T, C, M> {
         chunks: &[TextChunk],
         opts: RunOptions,
     ) -> Result<TokenClassifications, PipelineError<T, C, M>> {
-        let (chunk_outs, profile) = self.run_chunks(chunks, opts)?;
-        Ok(TokenClassifications { chunks: chunk_outs, profile })
+        let (outputs, profile) = self.run_chunks(chunks, opts)?;
+        Ok(TokenClassifications { chunks: attach_token(outputs, chunks), profile })
     }
 
     /// [`recognize_chunks`](Self::recognize_chunks) with default [`RunOptions`].
@@ -1074,7 +1114,11 @@ impl<T: Tokenizer, C: Chunker, M: Recognize> EncoderPipeline<T, C, M> {
         opts: RunOptions,
     ) -> Result<BatchTokenClassifications, PipelineError<T, C, M>> {
         let (per_text_outs, profile) = self.run_chunks_batch(per_text, opts)?;
-        let results = per_text_outs.into_iter().map(|chunks| TokenClassifications { chunks, profile: None }).collect();
+        let results = per_text_outs
+            .into_iter()
+            .zip(per_text.iter())
+            .map(|(outs, chunks)| TokenClassifications { chunks: attach_token(outs, chunks), profile: None })
+            .collect();
         Ok(BatchTokenClassifications { results, profile })
     }
 

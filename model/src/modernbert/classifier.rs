@@ -12,9 +12,7 @@
 //! Fused into one JIT plan so the `(B, L, D)` activations stay on-device.
 
 use snafu::ResultExt;
-use svod_arch::pipelines::text::{
-    ChunkClassification, Classification, Classify, Encoder, Encoding, RunProfile, TextChunk,
-};
+use svod_arch::pipelines::text::{Classification, Classify, Encoder, Encoding, RunProfile};
 use svod_dtype::DType;
 use svod_ir::SInt;
 use svod_tensor::{BoundVariable, PrepareConfig, Tensor};
@@ -212,7 +210,6 @@ impl ModernBertClassifier {
 
 impl Encoder for ModernBertClassifier {
     type Output = Classification;
-    type ChunkOutput = ChunkClassification;
     type Error = HeadError;
 
     fn capacity(&self) -> (usize, usize) {
@@ -229,10 +226,6 @@ impl Encoder for ModernBertClassifier {
         let classifications: Vec<Classification> =
             (0..b).map(|i| Classification { logits: flat[i * nc..i * nc + nc].to_vec() }).collect();
         Ok((classifications, prof))
-    }
-
-    fn attach(chunk: &TextChunk, out: Classification) -> ChunkClassification {
-        ChunkClassification { byte_offset: chunk.byte_offset, logits: out.logits }
     }
 }
 

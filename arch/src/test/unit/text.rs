@@ -90,7 +90,6 @@ struct StubEmbed {
 
 impl Encoder for StubEmbed {
     type Output = Embedding;
-    type ChunkOutput = ChunkEmbedding;
     type Error = StubEmbedError;
     fn capacity(&self) -> (usize, usize) {
         (self.max_batch, self.hidden_size)
@@ -111,9 +110,6 @@ impl Encoder for StubEmbed {
             p
         });
         Ok((values, prof))
-    }
-    fn attach(chunk: &TextChunk, out: Embedding) -> ChunkEmbedding {
-        ChunkEmbedding { byte_offset: chunk.byte_offset, values: out.values }
     }
 }
 
@@ -138,7 +134,6 @@ struct StubClassify {
 
 impl Encoder for StubClassify {
     type Output = Classification;
-    type ChunkOutput = ChunkClassification;
     type Error = StubClassifyError;
     fn capacity(&self) -> (usize, usize) {
         (self.max_batch, self.num_labels)
@@ -161,9 +156,6 @@ impl Encoder for StubClassify {
             p
         });
         Ok((values, prof))
-    }
-    fn attach(chunk: &TextChunk, out: Classification) -> ChunkClassification {
-        ChunkClassification { byte_offset: chunk.byte_offset, logits: out.logits }
     }
 }
 
@@ -1149,7 +1141,6 @@ struct StubRecognize {
 
 impl Encoder for StubRecognize {
     type Output = TokenClassification;
-    type ChunkOutput = ChunkTokenClassification;
     type Error = StubRecognizeError;
     fn capacity(&self) -> (usize, usize) {
         (self.max_batch, self.num_labels)
@@ -1179,15 +1170,6 @@ impl Encoder for StubRecognize {
             p
         });
         Ok((values, prof))
-    }
-    fn attach(chunk: &TextChunk, out: TokenClassification) -> ChunkTokenClassification {
-        ChunkTokenClassification {
-            byte_offset: chunk.byte_offset,
-            token_offsets: chunk.encoding.offsets.clone(),
-            special_tokens_mask: chunk.encoding.special_tokens_mask.clone(),
-            logits: out.logits,
-            num_labels: out.num_labels,
-        }
     }
 }
 
