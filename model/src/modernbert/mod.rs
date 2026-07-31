@@ -31,6 +31,8 @@ mod token_classifier_jit;
 pub use attention::ModernBertAttention;
 #[cfg(test)]
 pub(crate) use classifier::ModernBertClassificationModel;
+#[cfg(test)]
+pub(crate) use classifier::ClassifierHead;
 pub use classifier::ModernBertClassifier;
 pub use classifier_jit::ModernBertClassifierJit;
 pub use config::{ClassifierPooling, ModernBertConfig};

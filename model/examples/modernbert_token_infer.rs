@@ -110,14 +110,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("  chunk {i} @ byte {}: {} content token(s)", chunk.byte_offset, tokens.len());
         for tok in &tokens {
             let surface = text.get(tok.start..tok.end).unwrap_or("<oob>");
-            println!("    token {}: {:<8} [{},{}) {:?}", tok.token_index, tok.label, tok.start, tok.end, surface);
+            println!(
+                "    token {}: {:<8} [{},{}) {:?}  score={:.3}",
+                tok.token_index, tok.label, tok.start, tok.end, surface, tok.score
+            );
         }
         let spans = group_spans(&tokens, scheme);
         if !spans.is_empty() {
             println!("    → {} entit(y/ies):", spans.len());
             for e in spans {
                 let surface = text.get(e.start..e.end).unwrap_or("<oob>");
-                println!("       {:<8} [{},{}) {:?}", e.label, e.start, e.end, surface);
+                println!("       {:<8} [{},{}) {:?}  score={:.3}", e.label, e.start, e.end, surface, e.score);
             }
         }
     }

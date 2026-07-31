@@ -73,6 +73,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let load = modernbert::from_hub_classifier_with_revision(&args.repo, &args.revision, args.max_batch, dtype)?;
     let (_, max_seq) = load.classifier.capacity();
     let num_classes = load.classifier.num_labels();
+    let id2label = load.id2label;
+    let label_of = |id: usize| id2label.get(id).map_or("", |s| s.as_str());
     println!("Loaded: max_seq={max_seq}, max_batch={}, num_classes={num_classes}", args.max_batch);
 
     println!("Chunker: truncating max_seq={max_seq}");
@@ -90,9 +92,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let p = probs[best];
         let probs_str: Vec<String> = probs.iter().map(|p| format!("{p:.4}")).collect();
         println!(
-            "  chunk {i} @ byte {}: logits={:?} → class {best} (p={p:.4})  probs=[{}]",
+            "  chunk {i} @ byte {}: logits={:?} → {best}={} (p={p:.4})  probs=[{}]",
             chunk.byte_offset,
             chunk.logits,
+            label_of(best),
             probs_str.join(", "),
         );
     }

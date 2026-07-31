@@ -8,7 +8,8 @@ use std::sync::{LazyLock, Mutex, MutexGuard};
 
 use svod_arch::pipelines::text::{Classification, Classify, Encoder, Encoding};
 
-use crate::modernbert::{ClassifierPooling, ModernBertClassificationModel, ModernBertClassifier};
+use crate::modernbert::{ClassifierHead, ClassifierPooling, ModernBertClassificationModel, ModernBertClassifier};
+use crate::state::HasStateDict;
 use crate::test::unit::modernbert::model::tiny_cfg;
 
 /// Canonical prepared sizes for the shared classifier fixtures. Compiling the
@@ -141,6 +142,31 @@ fn batch_rows_match_single_calls() {
     assert!(max_delta(&single1.logits, &batch.0[0].logits) < 1e-4);
     assert!(max_delta(&single2.logits, &batch.0[1].logits) < 1e-4);
     assert!(max_delta(&single3.logits, &batch.0[2].logits) < 1e-4);
+}
+
+// ── head: classifier_bias round-trip (host-only) ────────────────────────────
+
+/// `classifier_bias = true` builds a `head.dense.bias`, which `prediction_head_tail`
+/// threads into the IR — but every published checkpoint uses `false`, so the path
+/// is otherwise untested. Verify the bias is built, omitted when `false`, and
+/// survives a state-dict round-trip. (Host-only; the JIT forward is covered by
+/// the heavy classify tests, which use `false`.)
+#[test]
+fn classifier_bias_true_builds_and_round_trips_dense_bias() {
+    let mut cfg = tiny_cfg();
+    cfg.classifier_bias = true;
+    let head = ClassifierHead::empty(&cfg);
+    let sd = head.state_dict("");
+    assert!(sd.contains_key("head.dense.bias"), "classifier_bias=true emits head.dense.bias");
+
+    // The default (false) omits it.
+    let sd_false = ClassifierHead::empty(&tiny_cfg()).state_dict("");
+    assert!(!sd_false.contains_key("head.dense.bias"), "classifier_bias=false omits head.dense.bias");
+
+    // Round-trip: a fresh head loads the bias back and re-emits it.
+    let mut reloaded = ClassifierHead::empty(&cfg);
+    reloaded.load_state_dict(&sd, "").expect("load");
+    assert!(reloaded.state_dict("").contains_key("head.dense.bias"), "dense bias survives round-trip");
 }
 
 // ── guards ─────────────────────────────────────────────────────────────────
