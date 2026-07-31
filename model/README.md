@@ -24,6 +24,7 @@ plans.
 | FireRedVAD (batch + streaming) | Voice activity | `firered_vad` | [FireRedTeam/FireRedVAD](https://github.com/FireRedTeam/FireRedVAD) | [`vpermilp/firered_vad`](https://huggingface.co/vpermilp/firered_vad) |
 | Silero VAD 16k | Voice activity | `silero_vad` | [snakers4/silero-vad](https://github.com/snakers4/silero-vad) | [`vpermilp/silero-vad`](https://huggingface.co/vpermilp/silero-vad) |
 | DiariZen segmentation (WavLM + Conformer) | Speaker diarization | `diarizen` | [BUT-FIT/DiariZen](https://github.com/BUTSpeechFIT/DiariZen) | [`BUT-FIT/diarizen-wavlm-large-s80-md-v2`](https://huggingface.co/BUT-FIT/diarizen-wavlm-large-s80-md-v2) |
+| ModernBERT (base / large) | Text embeddings, fill-mask (MLM) | `modernbert` | [Answer.AI ModernBERT](https://github.com/AnswerDotAI/ModernBERT) | [`answerdotai/ModernBERT-base`](https://huggingface.co/answerdotai/ModernBERT-base) |
 | ResNet (18 / 34 / 50 / 101 / 152) | Vision | `resnet` | [He et al. 2015](https://arxiv.org/abs/1512.03385) | [`timm/resnet*.a1_in1k`](https://huggingface.co/timm) |
 | WeSpeaker ResNet34 | Speaker embedding | `wespeaker` | [wenet-e2e/wespeaker](https://github.com/wenet-e2e/wespeaker) | [`pyannote/wespeaker-voxceleb-resnet34-LM`](https://huggingface.co/pyannote/wespeaker-voxceleb-resnet34-LM) |
 

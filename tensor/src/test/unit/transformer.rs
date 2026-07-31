@@ -218,6 +218,87 @@ crate::codegen_tests! {
         assert!(matches!(err_v, crate::Error::FloatDTypeRequired { arg: "value", .. }));
     }
 
+    fn test_sdpa_window_masks_far_keys(config) {
+        // Seq len 4, head dim 1. Q=K=ones so raw scores are uniform; the only
+        // thing distinguishing which keys are attended is the window band.
+        // window=(0,0) → each query attends ONLY to itself. With V = [0,10,20,30]
+        // the output equals the value at the query's own position.
+        let q = Tensor::from_ndarray(&array![[[[1.0f32], [1.0], [1.0], [1.0]]]]); // [1,1,4,1]
+        let k = q.clone();
+        let v = Tensor::from_ndarray(&array![[[[0.0f32], [10.0], [20.0], [30.0]]]]);
+
+        let mut result = q
+            .scaled_dot_product_attention()
+            .key(&k)
+            .value(&v)
+            .window((0usize, 0usize))
+            .call()
+            .unwrap();
+        result.realize_with(&config).unwrap();
+        let view = result.array_view::<f32>().unwrap();
+        assert_eq!(view.shape(), &[1, 1, 4, 1]);
+        // Self-only attention: output[q] = v[q].
+        assert!((view[[0, 0, 0, 0]] - 0.0).abs() < 1e-4, "q0 leaked far key: {}", view[[0, 0, 0, 0]]);
+        assert!((view[[0, 0, 1, 0]] - 10.0).abs() < 1e-4);
+        assert!((view[[0, 0, 2, 0]] - 20.0).abs() < 1e-4);
+        assert!((view[[0, 0, 3, 0]] - 30.0).abs() < 1e-4);
+    }
+
+    fn test_sdpa_window_band_attends_neighbors(config) {
+        // window=(1,1): each query attends to itself and its immediate
+        // neighbours. v = [0,10,20,30]; q=1 only sees keys 0,1,2 → mean of
+        // (0,10,20)/3 = 10.0 (scores uniform). q=0 sees only keys 0,1 →
+        // mean(0,10)/2 = 5.0.
+        let q = Tensor::from_ndarray(&array![[[[1.0f32], [1.0], [1.0], [1.0]]]]);
+        let k = q.clone();
+        let v = Tensor::from_ndarray(&array![[[[0.0f32], [10.0], [20.0], [30.0]]]]);
+
+        let mut result = q
+            .scaled_dot_product_attention()
+            .key(&k)
+            .value(&v)
+            .window((1usize, 1usize))
+            .call()
+            .unwrap();
+        result.realize_with(&config).unwrap();
+        let view = result.array_view::<f32>().unwrap();
+        // q0: keys {0,1} → (0+10)/2 = 5
+        assert!((view[[0, 0, 0, 0]] - 5.0).abs() < 1e-4, "q0: {}", view[[0, 0, 0, 0]]);
+        // q1: keys {0,1,2} → (0+10+20)/3 = 10
+        assert!((view[[0, 0, 1, 0]] - 10.0).abs() < 1e-4, "q1: {}", view[[0, 0, 1, 0]]);
+        // q3: keys {2,3} → (20+30)/2 = 25
+        assert!((view[[0, 0, 3, 0]] - 25.0).abs() < 1e-4, "q3: {}", view[[0, 0, 3, 0]]);
+    }
+
+    fn test_sdpa_window_intersects_bool_mask(config) {
+        // window=(0,1) keeps keys {q, q+1}. A bool mask removes keys ≥2
+        // everywhere. So q=0 keeps {0,1}∩{0,1}={0,1} → mean(0,10)=5; q=1 keeps
+        // {1,2}∩{0,1}={1} → v[1]=10 (the window allowed key 2 but the mask
+        // stripped it — this is the intersection under test).
+        let q = Tensor::from_ndarray(&array![[[[1.0f32], [1.0], [1.0], [1.0]]]]);
+        let k = q.clone();
+        let v = Tensor::from_ndarray(&array![[[[0.0f32], [10.0], [20.0], [30.0]]]]);
+        // True = masked out. Keys ≥2 masked everywhere; key 1 also masked for q0.
+        let mask = Tensor::from_ndarray(&array![
+            [[[false, true, true, true], [false, false, true, true], [false, false, true, true], [false, false, true, true]]]
+        ]);
+
+        let mut result = q
+            .scaled_dot_product_attention()
+            .key(&k)
+            .value(&v)
+            .window((0usize, 1usize))
+            .maybe_attn_mask(Some(&mask))
+            .call()
+            .unwrap();
+        result.realize_with(&config).unwrap();
+        let view = result.array_view::<f32>().unwrap();
+        // q0: window {0,1} ∩ mask-keep {0} = {0} → v[0] = 0.
+        assert!((view[[0, 0, 0, 0]] - 0.0).abs() < 1e-4, "q0 intersect: {}", view[[0, 0, 0, 0]]);
+        // q1: window {1,2} ∩ mask-keep {0,1} = {1} → v[1] = 10.
+        assert!((view[[0, 0, 1, 0]] - 10.0).abs() < 1e-4, "q1 intersect: {}", view[[0, 0, 1, 0]]);
+    }
+
     // =========================================================================
     // Rotary Embedding tests
     // =========================================================================
