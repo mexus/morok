@@ -1,39 +1,26 @@
-use crate::modernbert::{ModernBertConfig, modernbert_base, modernbert_large};
+use crate::modernbert::ModernBertConfig;
 
-#[test]
-fn base_dims() {
-    let c = modernbert_base();
-    assert_eq!(c.hidden_size, 768);
-    assert_eq!(c.num_hidden_layers, 22);
-    assert_eq!(c.num_attention_heads, 12);
-    assert_eq!(c.head_dim(), 64);
-    assert_eq!(c.intermediate_size, 1152);
-    assert_eq!(c.vocab_size, 50368);
-    assert_eq!(c.local_attention, 128);
-    assert_eq!(c.global_attn_every_n_layers, 3);
-    assert_eq!(c.global_rope_theta, 160_000.0);
-    assert_eq!(c.local_rope_theta, 10_000.0);
-}
-
-#[test]
-fn large_dims() {
-    let c = modernbert_large();
-    assert_eq!(c.hidden_size, 1024);
-    assert_eq!(c.num_hidden_layers, 28);
-    assert_eq!(c.num_attention_heads, 16);
-    assert_eq!(c.head_dim(), 64);
-    assert_eq!(c.intermediate_size, 2624);
+fn test_cfg() -> ModernBertConfig {
+    ModernBertConfig {
+        hidden_size: 768,
+        num_attention_heads: 12,
+        local_attention: 128,
+        global_attn_every_n_layers: 3,
+        global_rope_theta: 160_000.0,
+        local_rope_theta: 10_000.0,
+        ..ModernBertConfig::default()
+    }
 }
 
 #[test]
 fn local_window_split_evenly() {
-    let c = modernbert_base();
+    let c = test_cfg();
     assert_eq!(c.local_window(), (64, 64));
 }
 
 #[test]
 fn global_layer_pattern() {
-    let c = modernbert_base();
+    let c = test_cfg();
     assert!(c.is_global_layer(0));
     assert!(c.is_global_layer(3));
     assert!(c.is_global_layer(21));
@@ -44,7 +31,7 @@ fn global_layer_pattern() {
 
 #[test]
 fn rope_theta_per_layer() {
-    let c = modernbert_base();
+    let c = test_cfg();
     assert_eq!(c.rope_theta(0), 160_000.0); // global
     assert_eq!(c.rope_theta(3), 160_000.0); // global
     assert_eq!(c.rope_theta(1), 10_000.0); // local
@@ -52,11 +39,10 @@ fn rope_theta_per_layer() {
     assert_eq!(c.rope_theta(20), 10_000.0); // local (20 % 3 == 2)
 }
 
-/// Round-trip a synthetic `config.json` (minimal fields) through
-/// `from_json_str` and confirm the parsed values land on the right fields,
-/// with absent fields falling back to base defaults.
+/// Round-trip a synthetic `config.json` through `from_json_str` and confirm
+/// the parsed values land on the right fields.
 #[test]
-fn parse_minimal_config_json() {
+fn parse_config_json() {
     let json = r#"{
         "model_type": "modernbert",
         "hidden_size": 1024,
@@ -65,13 +51,20 @@ fn parse_minimal_config_json() {
         "intermediate_size": 2624,
         "vocab_size": 50368,
         "global_rope_theta": 160000.0,
-        "local_rope_theta": 10000.0
+        "local_rope_theta": 10000.0,
+        "local_attention": 128,
+        "global_attn_every_n_layers": 3,
+        "layer_norm_eps": 1e-5,
+        "pad_token_id": 50283,
+        "tie_word_embeddings": true,
+        "decoder_bias": true
     }"#;
     let c = ModernBertConfig::from_json_str(json).expect("parse");
     assert_eq!(c.hidden_size, 1024);
     assert_eq!(c.num_hidden_layers, 28);
     assert_eq!(c.num_attention_heads, 16);
-    // Absent fields fall back to base defaults.
+    assert_eq!(c.intermediate_size, 2624);
+    assert_eq!(c.vocab_size, 50368);
     assert_eq!(c.local_attention, 128);
     assert_eq!(c.global_attn_every_n_layers, 3);
     assert_eq!(c.layer_norm_eps, 1e-5);

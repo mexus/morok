@@ -94,53 +94,29 @@ impl ModernBertConfig {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Predefined configs — values from the published `config.json`.
-// ---------------------------------------------------------------------------
-
-/// `answerdotai/ModernBERT-base`: 22 layers, hidden 768, intermediate 1152,
-/// 12 heads (head_dim 64), vocab 50368.
-pub fn modernbert_base() -> ModernBertConfig {
-    ModernBertConfig {
-        vocab_size: 50368,
-        hidden_size: 768,
-        num_hidden_layers: 22,
-        num_attention_heads: 12,
-        intermediate_size: 1152,
-        max_position_embeddings: 8192,
-        layer_norm_eps: 1e-5,
-        global_rope_theta: 160_000.0,
-        local_rope_theta: 10_000.0,
-        local_attention: 128,
-        global_attn_every_n_layers: 3,
-        pad_token_id: 50283,
-        tie_word_embeddings: true,
-        decoder_bias: true,
-        dtype: DType::BFloat16,
-        max_batch_size: 1,
-    }
-}
-
-/// `answerdotai/ModernBERT-large`: 28 layers, hidden 1024, intermediate 2624,
-/// 16 heads (head_dim 64), vocab 50368.
-pub fn modernbert_large() -> ModernBertConfig {
-    ModernBertConfig {
-        vocab_size: 50368,
-        hidden_size: 1024,
-        num_hidden_layers: 28,
-        num_attention_heads: 16,
-        intermediate_size: 2624,
-        max_position_embeddings: 8192,
-        layer_norm_eps: 1e-5,
-        global_rope_theta: 160_000.0,
-        local_rope_theta: 10_000.0,
-        local_attention: 128,
-        global_attn_every_n_layers: 3,
-        pad_token_id: 50283,
-        tie_word_embeddings: true,
-        decoder_bias: true,
-        dtype: DType::BFloat16,
-        max_batch_size: 1,
+impl Default for ModernBertConfig {
+    /// Placeholder config — structural fields are zero since [`from_hub`]
+    /// overwrites them all from `config.json`. Only `dtype` and
+    /// `max_batch_size` are caller-chosen.
+    fn default() -> Self {
+        Self {
+            vocab_size: 0,
+            hidden_size: 0,
+            num_hidden_layers: 0,
+            num_attention_heads: 0,
+            intermediate_size: 0,
+            max_position_embeddings: 0,
+            layer_norm_eps: 0.0,
+            global_rope_theta: 0.0,
+            local_rope_theta: 0.0,
+            local_attention: 0,
+            global_attn_every_n_layers: 0,
+            pad_token_id: 0,
+            tie_word_embeddings: false,
+            decoder_bias: false,
+            dtype: DType::BFloat16,
+            max_batch_size: 1,
+        }
     }
 }
 
@@ -165,28 +141,24 @@ impl ModernBertConfig {
     }
 
     fn from_raw(raw: RawModernBertConfig) -> Self {
-        // Defaults from ModernBERT-base; the `large` checkpoint overrides every
-        // structural field so the base fallback only matters for a truncated
-        // or hand-written config.
-        let base = modernbert_base();
+        let d = ModernBertConfig::default();
         ModernBertConfig {
-            vocab_size: raw.vocab_size.unwrap_or(base.vocab_size),
-            hidden_size: raw.hidden_size.unwrap_or(base.hidden_size),
-            num_hidden_layers: raw.num_hidden_layers.unwrap_or(base.num_hidden_layers),
-            num_attention_heads: raw.num_attention_heads.unwrap_or(base.num_attention_heads),
-            intermediate_size: raw.intermediate_size.unwrap_or(base.intermediate_size),
-            max_position_embeddings: raw.max_position_embeddings.unwrap_or(base.max_position_embeddings),
-            layer_norm_eps: raw.layer_norm_eps.or(raw.norm_eps).unwrap_or(base.layer_norm_eps),
-            global_rope_theta: raw.global_rope_theta.unwrap_or(base.global_rope_theta),
-            local_rope_theta: raw.local_rope_theta.unwrap_or(base.local_rope_theta),
-            local_attention: raw.local_attention.unwrap_or(base.local_attention),
-            global_attn_every_n_layers: raw.global_attn_every_n_layers.unwrap_or(base.global_attn_every_n_layers),
-            pad_token_id: raw.pad_token_id.unwrap_or(base.pad_token_id),
-            tie_word_embeddings: raw.tie_word_embeddings.unwrap_or(base.tie_word_embeddings),
-            decoder_bias: raw.decoder_bias.unwrap_or(base.decoder_bias),
-            // Compute dtype is caller-chosen, not from config.json.
-            dtype: base.dtype,
-            max_batch_size: base.max_batch_size,
+            vocab_size: raw.vocab_size.unwrap_or(d.vocab_size),
+            hidden_size: raw.hidden_size.unwrap_or(d.hidden_size),
+            num_hidden_layers: raw.num_hidden_layers.unwrap_or(d.num_hidden_layers),
+            num_attention_heads: raw.num_attention_heads.unwrap_or(d.num_attention_heads),
+            intermediate_size: raw.intermediate_size.unwrap_or(d.intermediate_size),
+            max_position_embeddings: raw.max_position_embeddings.unwrap_or(d.max_position_embeddings),
+            layer_norm_eps: raw.layer_norm_eps.or(raw.norm_eps).unwrap_or(d.layer_norm_eps),
+            global_rope_theta: raw.global_rope_theta.unwrap_or(d.global_rope_theta),
+            local_rope_theta: raw.local_rope_theta.unwrap_or(d.local_rope_theta),
+            local_attention: raw.local_attention.unwrap_or(d.local_attention),
+            global_attn_every_n_layers: raw.global_attn_every_n_layers.unwrap_or(d.global_attn_every_n_layers),
+            pad_token_id: raw.pad_token_id.unwrap_or(d.pad_token_id),
+            tie_word_embeddings: raw.tie_word_embeddings.unwrap_or(d.tie_word_embeddings),
+            decoder_bias: raw.decoder_bias.unwrap_or(d.decoder_bias),
+            dtype: d.dtype,
+            max_batch_size: d.max_batch_size,
         }
     }
 }
