@@ -62,7 +62,7 @@ fn remap_key(key: &str, config: &GigaAmConfig) -> Option<String> {
     }
 
     if parts.len() >= 4 && parts[..2] == ["head", "decoder_layers"] {
-        return Some(format!("head.{}", &parts[3..].join(".")));
+        return Some(format!("head.{}", parts[3..].join(".")));
     }
 
     // RNN-T predictor: head.decoder.embed.weight, head.decoder.lstm.{w,b}_{ih,hh}_l{N}.

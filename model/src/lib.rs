@@ -1,4 +1,5 @@
 pub mod audio;
+pub mod bgem3;
 pub mod blocks;
 pub mod diarizen;
 pub mod firered_vad;
@@ -12,6 +13,7 @@ pub mod silero_vad;
 pub mod state;
 pub mod wavlm;
 pub mod wespeaker;
+pub mod xlm_roberta;
 
 #[cfg(test)]
 mod test;

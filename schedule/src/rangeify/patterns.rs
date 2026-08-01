@@ -469,10 +469,9 @@ fn cleanup_dead_axes_bufferize(
         } else {
             // Live axis: keep range and original dimension
             new_ranges.push(Arc::clone(range));
-            if let Some(dim) = original_shape.get(i) {
+            {
+                let dim = original_shape.get(i)?;
                 reshape_dims.push(dim.clone());
-            } else {
-                return None; // Shape mismatch
             }
         }
     }

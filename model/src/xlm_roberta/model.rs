@@ -1,0 +1,122 @@
+//! Root XLM-RoBERTa backbone: embeddings → encoder stack.
+//!
+//! Loads from a HuggingFace `pytorch_model.bin` checkpoint (the published
+//! `BAAI/bge-m3` layout — there is no safetensors variant). Compute dtype is
+//! `config.dtype` (bf16 by default, f32 for CPU parity tests); weights load at
+//! their stored dtype and are cast to `config.dtype` on read.
+
+use std::path::Path;
+
+use snafu::ResultExt;
+use svod_ir::SInt;
+use svod_tensor::{BoundVariable, Tensor};
+
+use crate::state::{self, HasStateDict, StateDict};
+
+use super::config::XlmRobertaConfig;
+use super::embeddings::XlmRobertaEmbeddings;
+use super::encoder::XlmRobertaEncoder;
+use super::error::{HubSnafu, PickleSnafu, Result, StateSnafu, TensorSnafu};
+
+#[derive(Clone)]
+pub struct XlmRobertaModel {
+    pub config: XlmRobertaConfig,
+    pub embeddings: XlmRobertaEmbeddings,
+    pub encoder: XlmRobertaEncoder,
+}
+
+impl XlmRobertaModel {
+    pub fn empty(config: XlmRobertaConfig) -> Self {
+        let eps = config.layer_norm_eps;
+        let dtype = config.dtype.clone();
+        let embeddings = XlmRobertaEmbeddings::empty(
+            config.vocab_size,
+            config.hidden_size,
+            config.max_position_embeddings,
+            config.type_vocab_size,
+            eps,
+            config.pad_token_id,
+            dtype.clone(),
+        );
+        let encoder = XlmRobertaEncoder::empty(&config);
+        Self { config, embeddings, encoder }
+    }
+
+    /// Eager forward: `input_ids` `(B, L)` int + optional `padding_mask`
+    /// `(B, L)` bool → last-hidden-state `(B, L, D)`.
+    pub fn forward(&self, input_ids: &Tensor, padding_mask: Option<&Tensor>) -> Result<Tensor> {
+        let x = self.embeddings.forward(input_ids)?;
+        self.encoder.forward(&x, padding_mask)
+    }
+
+    /// JIT-path variant: `input_ids` / `padding_mask` are sized for the JIT
+    /// plan's `max_batch`; `b` shrinks the leading batch dim to the live value
+    /// at execute time.
+    pub fn forward_batch(
+        &self,
+        input_ids: &Tensor,
+        padding_mask: Option<&Tensor>,
+        b: &BoundVariable,
+    ) -> Result<Tensor> {
+        let bv = b.as_sint();
+        let input_ids = input_ids.try_shrink([Some((SInt::Const(0), bv.clone())), None]).context(TensorSnafu)?;
+        let padding_mask = match padding_mask {
+            Some(m) => Some(m.try_shrink([Some((SInt::Const(0), bv)), None]).context(TensorSnafu)?),
+            None => None,
+        };
+        self.forward(&input_ids, padding_mask.as_ref())
+    }
+
+    /// Download `config.json` + `pytorch_model.bin` from a HuggingFace Hub
+    /// repository and load the backbone.
+    pub fn from_hub(model_id: &str, mut config: XlmRobertaConfig) -> Result<Self> {
+        Self::from_hub_with_revision(model_id, "main", &mut config)
+    }
+
+    pub fn from_hub_with_revision(model_id: &str, revision: &str, config: &mut XlmRobertaConfig) -> Result<Self> {
+        let api = hf_hub::api::sync::Api::new().context(HubSnafu)?;
+        let repo =
+            api.repo(hf_hub::Repo::with_revision(model_id.to_string(), hf_hub::RepoType::Model, revision.to_string()));
+        let cfg_path = repo.get("config.json").context(HubSnafu)?;
+        let parsed = XlmRobertaConfig::from_json(&cfg_path)?;
+        config.merge_structural_from(&parsed);
+
+        let weights_path = repo.get("pytorch_model.bin").context(HubSnafu)?;
+        Self::from_pytorch_bin(&weights_path, config.clone())
+    }
+
+    /// Load from a `pytorch_model.bin` checkpoint. Weights are cast to
+    /// `config.dtype` as they are read.
+    pub fn from_pytorch_bin(path: &Path, config: XlmRobertaConfig) -> Result<Self> {
+        let sd = crate::wespeaker::pickle::load_flat_pytorch_bin(path, "").context(PickleSnafu)?;
+        Self::from_state_dict(&sd, config)
+    }
+
+    /// Build from a preloaded state dict. Each weight is cast to
+    /// `config.dtype`.
+    pub fn from_state_dict(sd: &StateDict, config: XlmRobertaConfig) -> Result<Self> {
+        let dtype = config.dtype.clone();
+        let mut model = Self::empty(config);
+        model.load_state_dict(&state::cast_all(sd, dtype), "").context(StateSnafu)?;
+        Ok(model)
+    }
+}
+
+impl HasStateDict for XlmRobertaModel {
+    fn state_dict(&self, prefix: &str) -> StateDict {
+        let mut sd = StateDict::new();
+        sd.extend(self.embeddings.state_dict(&prefix_or(prefix, "embeddings")));
+        sd.extend(self.encoder.state_dict(&prefix_or(prefix, "encoder")));
+        sd
+    }
+
+    fn load_state_dict(&mut self, sd: &StateDict, prefix: &str) -> std::result::Result<(), state::Error> {
+        self.embeddings.load_state_dict(sd, &prefix_or(prefix, "embeddings"))?;
+        self.encoder.load_state_dict(sd, &prefix_or(prefix, "encoder"))?;
+        Ok(())
+    }
+}
+
+fn prefix_or(prefix: &str, suffix: &str) -> String {
+    if prefix.is_empty() { suffix.to_string() } else { format!("{prefix}.{suffix}") }
+}
