@@ -1,0 +1,105 @@
+//! Qwen3 embedding model: decoder backbone + last-token pooling + L2 normalize.
+//!
+//! The pipeline (matching `sentence-transformers` `modules.json`):
+//! 1. Qwen3 decoder forward → `(B, L, D)` last hidden states
+//! 2. Last-token pooling → `(B, D)` (select position `L-1`)
+//! 3. L2 normalize → `(B, D)` unit-norm embeddings
+//!
+//! **Padding convention**: requires **left-padding** (standard for decoder
+//! embedding inference). With left-padding the last real token is at position
+//! `L-1`, a compile-time constant — so last-token pooling works in JIT
+//! (identical to CLS pooling in ModernBERT).
+//!
+//! Loads from the same `model.safetensors` as [`Qwen3Model`] (bare keys,
+//! no `model.` prefix).
+
+use std::path::Path;
+
+use snafu::{OptionExt, ResultExt};
+use svod_tensor::{BoundVariable, Tensor, s};
+
+use crate::state::{self, HasStateDict, StateDict};
+
+use super::config::Qwen3Config;
+use super::error::{HubSnafu, Result, StateSnafu, SymbolicShapeSnafu, TensorSnafu};
+use super::model::Qwen3Model;
+
+#[derive(Clone)]
+pub struct Qwen3Embedding {
+    pub model: Qwen3Model,
+    pub normalize: bool,
+}
+
+impl Qwen3Embedding {
+    pub fn empty(config: Qwen3Config) -> Self {
+        let model = Qwen3Model::empty(config);
+        Self { model, normalize: true }
+    }
+
+    /// Eager forward: `input_ids` `(B, L)` + `attention_mask` `(B, L)` →
+    /// embeddings `(B, D)`.
+    pub fn encode(&self, input_ids: &Tensor, attention_mask: &Tensor) -> Result<Tensor> {
+        let hidden = self.model.forward(input_ids, Some(attention_mask))?;
+        self.pool_and_normalize(&hidden)
+    }
+
+    /// JIT-path variant with rebindable batch. Returns `(B, D)`.
+    pub fn encode_batch(&self, input_ids: &Tensor, attention_mask: &Tensor, b: &BoundVariable) -> Result<Tensor> {
+        let hidden = self.model.forward_batch(input_ids, Some(attention_mask), b)?;
+        self.pool_and_normalize(&hidden)
+    }
+
+    fn pool_and_normalize(&self, hidden: &Tensor) -> Result<Tensor> {
+        let shape = hidden.shape().context(TensorSnafu)?;
+        let l: usize = shape[1].as_const().context(SymbolicShapeSnafu { what: "qwen3 pooling" })?;
+
+        // Last-token pooling: take position L-1 (requires left-padding).
+        let pooled = hidden.getitem(s![.., (l - 1) as i64, ..]).context(TensorSnafu)?;
+
+        if self.normalize { pooled.lp_normalize(-1, 2).context(TensorSnafu) } else { Ok(pooled) }
+    }
+
+    pub fn from_hub(model_id: &str, mut config: Qwen3Config) -> Result<Self> {
+        Self::from_hub_with_revision(model_id, "main", &mut config)
+    }
+
+    pub fn from_hub_with_revision(model_id: &str, revision: &str, config: &mut Qwen3Config) -> Result<Self> {
+        let api = hf_hub::api::sync::Api::new().context(HubSnafu)?;
+        let repo =
+            api.repo(hf_hub::Repo::with_revision(model_id.to_string(), hf_hub::RepoType::Model, revision.to_string()));
+        let cfg_path = repo.get("config.json").context(HubSnafu)?;
+        let parsed = Qwen3Config::from_json(&cfg_path)?;
+        config.merge_structural_from(&parsed);
+
+        let dir = crate::qwen3::download_safetensors(&repo)?;
+        Self::from_safetensors_dir(&dir, config.clone())
+    }
+
+    pub fn from_safetensors(path: &Path, config: Qwen3Config) -> Result<Self> {
+        let sd = state::load_safetensors(path).context(StateSnafu)?;
+        Self::from_state_dict(&sd, config)
+    }
+
+    /// Load from a directory containing `model.safetensors` or multi-shard files.
+    pub fn from_safetensors_dir(dir: &Path, config: Qwen3Config) -> Result<Self> {
+        let sd = state::load_safetensors_dir(dir).context(StateSnafu)?;
+        Self::from_state_dict(&sd, config)
+    }
+
+    pub fn from_state_dict(sd: &StateDict, config: Qwen3Config) -> Result<Self> {
+        let dtype = config.dtype.clone();
+        let mut model = Self::empty(config);
+        model.load_state_dict(&state::cast_all(sd, dtype), "").context(StateSnafu)?;
+        Ok(model)
+    }
+}
+
+impl HasStateDict for Qwen3Embedding {
+    fn state_dict(&self, prefix: &str) -> StateDict {
+        self.model.state_dict(prefix)
+    }
+
+    fn load_state_dict(&mut self, sd: &StateDict, prefix: &str) -> std::result::Result<(), state::Error> {
+        self.model.load_state_dict(sd, prefix)
+    }
+}

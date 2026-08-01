@@ -7,6 +7,7 @@ pub mod gigaam;
 pub(crate) mod init;
 pub mod jit;
 pub mod modernbert;
+pub mod qwen3;
 pub mod resnet;
 pub mod sentencepiece;
 pub mod silero_vad;
