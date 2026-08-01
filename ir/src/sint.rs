@@ -270,6 +270,8 @@ macro_rules! impl_sint_binop {
                         panic!("arithmetic on SInt::Infer — resolve -1 before computing")
                     }
                     (SInt::Const(a), SInt::Const(b)) => SInt::Const(a $concrete_op b),
+                    (_, SInt::Const(0)) => self.clone(),
+                    (SInt::Const(0), _) => rhs.clone(),
                     _ => {
                         let a = self.to_uop(svod_dtype::DType::Index);
                         let b = rhs.to_uop(svod_dtype::DType::Index);

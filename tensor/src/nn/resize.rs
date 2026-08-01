@@ -1,13 +1,11 @@
 //! Resize operations (ONNX Resize operator building block).
 
 use bon::bon;
-use snafu::ResultExt;
 use svod_dtype::DType;
-use svod_ir::ConstValue;
+use svod_ir::{ConstValue, SInt};
 
 use super::{AspectRatioPolicy, CoordinateTransformMode, NearestMode, ResizeMode};
 use crate::Tensor;
-use crate::error::UOpSnafu;
 
 type Result<T> = crate::Result<T>;
 
@@ -83,17 +81,7 @@ impl Tensor {
         #[builder(default = 0.0)] extrapolation_value: f64,
     ) -> Result<Tensor> {
         let ndim = self.ndim()?;
-        let shape = self.shape()?;
-        // TODO(symbolic-batch): this validates *every* dim is concrete even
-        // though only the `axes` dims are read below (line 107) and only the
-        // non-axes dims are used to build expand shapes (lines 257, 274). For
-        // a symbolic batch with concrete spatial dims (e.g. a JIT input shrunk
-        // to a bound `b`), this fails unnecessarily. Narrow this to the axes
-        // dims, and have the expand-shape construction below carry SInt rather
-        // than going through `usize`. The result is the only thing using
-        // `_shape_dims` is its discard binding — drop it once the rest of the
-        // function stops needing fully-concrete shapes.
-        let _shape_dims = svod_ir::shape::to_vec_usize(&shape).context(UOpSnafu)?;
+        let _shape = self.shape()?;
 
         let axes: Vec<usize> = axes.map(|a| a.to_vec()).unwrap_or_else(|| (0..ndim).collect());
 
@@ -109,22 +97,63 @@ impl Tensor {
             self.try_permute(&perm)?
         };
 
-        // Input spatial dimensions (last len(axes) dims of permuted x)
+        // Input spatial dimensions (last len(axes) dims of permuted x).
+        // Only the spatial (axes) dims must be concrete; the prefix (batch,
+        // channels) may be symbolic and is carried through as SInt.
         let x_shape = x.shape()?;
-        // TODO(symbolic-batch): same issue as above — only `input_shape` (the
-        // trailing spatial dims) is actually used; the non-axes prefix is
-        // copied into `expand_shape` later and never compared to a `usize`,
-        // so it could stay as `SInt` and admit symbolic dims.
-        let x_dims = svod_ir::shape::to_vec_usize(&x_shape).context(UOpSnafu)?;
-        let n_spatial = axes.len();
-        let input_shape: Vec<usize> = x_dims[ndim - n_spatial..].to_vec();
+        let n_axes = axes.len();
 
         // Filter scales/sizes to spatial dims only
-        let scales_trimmed: Option<Vec<f64>> = scales.map(|s| s[s.len().saturating_sub(n_spatial)..].to_vec());
-        let sizes_trimmed: Option<Vec<usize>> = sizes.map(|s| s[s.len().saturating_sub(n_spatial)..].to_vec());
+        let scales_trimmed: Option<Vec<f64>> = scales.map(|s| s[s.len().saturating_sub(n_axes)..].to_vec());
+        let sizes_trimmed: Option<Vec<usize>> = sizes.map(|s| s[s.len().saturating_sub(n_axes)..].to_vec());
+
+        // Identify active axes: axes where the scale != 1.0 (for scales) or
+        // where the output size differs from the input (for sizes). Inactive
+        // axes (e.g. symbolic batch with scale=1.0) are skipped entirely and
+        // carried through as-is, matching tinygrad's interpolate which only
+        // loops over trailing spatial dims.
+        let active_idx: Vec<usize> = match &scales_trimmed {
+            Some(sc) => (0..n_axes).filter(|&i| sc[i] != 1.0).collect(),
+            None => match &sizes_trimmed {
+                Some(sz) => {
+                    // For sizes, we need to compare against input shape.
+                    // Only dims that are concrete and differ are active.
+                    (0..n_axes)
+                        .filter(|&i| {
+                            let in_sz = x_shape[ndim - n_axes + i].as_const();
+                            in_sz.is_none_or(|s| s != sz[i])
+                        })
+                        .collect()
+                }
+                None => (0..n_axes).collect(),
+            },
+        };
+
+        if active_idx.is_empty() {
+            return if perm.iter().enumerate().any(|(i, &p)| p != i as isize) {
+                x.try_permute(&inv_perm_i)
+            } else {
+                Ok(x)
+            };
+        }
+
+        // Only extract/validate the active spatial dims (must be concrete).
+        let input_shape: Vec<usize> = active_idx
+            .iter()
+            .map(|&i| {
+                x_shape[ndim - n_axes + i].as_const().ok_or_else(|| crate::error::Error::SymbolicShapeUnsupported {
+                    operation: "resize on a symbolic spatial dim".to_string(),
+                })
+            })
+            .collect::<Result<_>>()?;
+
+        let scales_active: Option<Vec<f64>> =
+            scales_trimmed.as_ref().map(|sc| active_idx.iter().map(|&i| sc[i]).collect());
+        let sizes_active: Option<Vec<usize>> =
+            sizes_trimmed.as_ref().map(|sz| active_idx.iter().map(|&i| sz[i]).collect());
 
         // Compute output sizes and scales
-        let (output_sizes, final_scales) = if let Some(mut sz) = sizes_trimmed {
+        let (output_sizes, final_scales) = if let Some(mut sz) = sizes_active {
             if keep_aspect_ratio_policy == AspectRatioPolicy::NotLarger
                 || keep_aspect_ratio_policy == AspectRatioPolicy::NotSmaller
             {
@@ -140,13 +169,13 @@ impl Tensor {
                     }
                 }
                 sz = input_shape.iter().map(|&sh| (scale * sh as f64 + 0.5) as usize).collect();
-                let sc = vec![scale; n_spatial];
+                let sc = vec![scale; sz.len()];
                 (sz, sc)
             } else {
                 let sc: Vec<f64> = sz.iter().zip(&input_shape).map(|(&s, &sh)| s as f64 / sh as f64).collect();
                 (sz, sc)
             }
-        } else if let Some(sc) = scales_trimmed {
+        } else if let Some(sc) = scales_active {
             let sz: Vec<usize> = sc.iter().zip(&input_shape).map(|(&s, &sh)| (s * sh as f64) as usize).collect();
             (sz, sc)
         } else {
@@ -163,6 +192,8 @@ impl Tensor {
                 Ok(x)
             };
         }
+
+        let n_spatial = active_idx.len();
 
         // Extract per-spatial-dim ROI (start, end) pairs
         let roi_pairs: Vec<(f64, f64)> = if let Some(roi) = roi {
@@ -258,47 +289,38 @@ impl Tensor {
 
             // Sequential gather per spatial dim
             for (i, idx) in int_indexes.iter().enumerate() {
-                let dim = (ndim - n_spatial + i) as isize;
+                let dim = (ndim - n_axes + active_idx[i]) as isize;
                 let cur_shape = x.shape()?;
-                // TODO(symbolic-batch): `cur_dims` is built only to feed
-                // `expand_shape` below, which forces a `usize → isize` cast on
-                // every dim. For a symbolic prefix this loses information and
-                // aborts here. `try_expand` would need to accept `SInt` (it
-                // already does internally) so we can pass the symbolic dims
-                // through; then we'd substitute `out_sz` at the axis position
-                // and keep the rest of the shape as-is.
-                let cur_dims = svod_ir::shape::to_vec_usize(&cur_shape).context(UOpSnafu)?;
                 let out_sz = output_sizes[i];
 
                 let mut idx_shape = vec![1isize; ndim];
-                idx_shape[ndim - n_spatial + i] = out_sz as isize;
+                idx_shape[ndim - n_axes + active_idx[i]] = out_sz as isize;
                 let idx_reshaped = idx.try_reshape(&idx_shape)?;
 
-                let mut expand_shape: Vec<isize> = cur_dims.iter().map(|&d| d as isize).collect();
-                expand_shape[ndim - n_spatial + i] = out_sz as isize;
+                let mut expand_shape: Vec<SInt> = cur_shape.to_vec();
+                expand_shape[ndim - n_axes + active_idx[i]] = SInt::from(out_sz as i32);
                 let idx_expanded = idx_reshaped.try_expand(&expand_shape)?;
 
                 x = x.gather(dim, &idx_expanded)?;
             }
         } else if mode == ResizeMode::Linear {
-            let mut expand = x_dims.clone();
+            let mut expand: Vec<SInt> = x_shape.to_vec();
             for (i, &out_sz) in output_sizes.iter().enumerate() {
-                let dim_pos = ndim - n_spatial + i;
+                let dim_pos = ndim - n_axes + active_idx[i];
                 let scale = final_scales[i];
                 let input_sz = input_shape[i];
                 let index = &indexes[i];
 
                 let mut reshape = vec![1isize; ndim];
                 reshape[dim_pos] = out_sz as isize;
-                expand[dim_pos] = out_sz;
-                let expand_i: Vec<isize> = expand.iter().map(|&d| d as isize).collect();
+                expand[dim_pos] = SInt::from(out_sz as i32);
 
                 if antialias && scale < 1.0 {
-                    x = interpolate_antialias_linear(&x, index, dim_pos, input_sz, scale, &reshape, &expand_i, &dtype)?;
+                    x = interpolate_antialias_linear(&x, index, dim_pos, input_sz, scale, &reshape, &expand, &dtype)?;
                 } else {
-                    let low = index.floor()?.cast(DType::Int32)?.try_reshape(&reshape)?.try_expand(&expand_i)?;
-                    let high = index.ceil()?.cast(DType::Int32)?.try_reshape(&reshape)?.try_expand(&expand_i)?;
-                    let perc = index.try_sub(&index.floor()?)?.try_reshape(&reshape)?.try_expand(&expand_i)?;
+                    let low = index.floor()?.cast(DType::Int32)?.try_reshape(&reshape)?.try_expand(&expand)?;
+                    let high = index.ceil()?.cast(DType::Int32)?.try_reshape(&reshape)?.try_expand(&expand)?;
+                    let perc = index.try_sub(&index.floor()?)?.try_reshape(&reshape)?.try_expand(&expand)?;
 
                     let dim_i = dim_pos as isize;
                     let gathered_low = x.gather(dim_i, &low)?;
@@ -308,22 +330,19 @@ impl Tensor {
             }
         } else if mode == ResizeMode::Cubic {
             let a = cubic_coeff_a;
-            let mut expand = x_dims.clone();
+            let mut expand: Vec<SInt> = x_shape.to_vec();
             for (i, &out_sz) in output_sizes.iter().enumerate() {
-                let dim_pos = ndim - n_spatial + i;
+                let dim_pos = ndim - n_axes + active_idx[i];
                 let scale = final_scales[i];
                 let input_sz = input_shape[i];
                 let index = &indexes[i];
 
                 let mut reshape = vec![1isize; ndim];
                 reshape[dim_pos] = out_sz as isize;
-                expand[dim_pos] = out_sz;
-                let expand_i: Vec<isize> = expand.iter().map(|&d| d as isize).collect();
+                expand[dim_pos] = SInt::from(out_sz as i32);
 
                 if antialias && scale < 1.0 {
-                    x = interpolate_antialias_cubic(
-                        &x, index, dim_pos, input_sz, scale, a, &reshape, &expand_i, &dtype,
-                    )?;
+                    x = interpolate_antialias_cubic(&x, index, dim_pos, input_sz, scale, a, &reshape, &expand, &dtype)?;
                 } else {
                     let p = index.floor()?.cast(DType::Int32)?;
                     let ratio = index.try_sub(&index.floor()?)?;
@@ -368,14 +387,14 @@ impl Tensor {
                     let max_val = Tensor::const_(ConstValue::Int((input_sz - 1) as i64), DType::Int32);
                     let zero_i = Tensor::const_(ConstValue::Int(0), DType::Int32);
                     let clip = |t: &Tensor| -> Result<Tensor> {
-                        t.clamp().min(&zero_i).max(&max_val).call()?.try_reshape(&reshape)?.try_expand(&expand_i)
+                        t.clamp().min(&zero_i).max(&max_val).call()?.try_reshape(&reshape)?.try_expand(&expand)
                     };
                     let ei0 = clip(&idx0)?;
                     let ei1 = clip(&idx1)?;
                     let ei2 = clip(&idx2)?;
                     let ei3 = clip(&idx3)?;
 
-                    let ec = |c: Tensor| -> Result<Tensor> { c.try_reshape(&reshape)?.try_expand(&expand_i) };
+                    let ec = |c: Tensor| -> Result<Tensor> { c.try_reshape(&reshape)?.try_expand(&expand) };
                     let ec0 = ec(c0)?;
                     let ec1 = ec(c1)?;
                     let ec2 = ec(c2)?;
@@ -394,15 +413,13 @@ impl Tensor {
         // Apply extrapolation for tf_crop_and_resize: out-of-bounds → extrapolation_value
         if let Some(masks) = validity_mask {
             let extrap = Tensor::const_(ConstValue::Float(extrapolation_value), dtype.clone());
-            let x_shape = x.shape()?;
-            let x_dims = svod_ir::shape::to_vec_usize(&x_shape).context(UOpSnafu)?;
-            let expand_shape: Vec<isize> = x_dims.iter().map(|&d| d as isize).collect();
+            let expand_shape: Vec<SInt> = x.shape()?.to_vec();
 
             // Each mask_i is 1D [out_sz_i]; reshape to [1,..,out_sz_i,..,1] and broadcast
             let mut combined: Option<Tensor> = None;
             for (i, mask) in masks.into_iter().enumerate() {
                 let mut shape = vec![1isize; ndim];
-                shape[ndim - n_spatial + i] = output_sizes[i] as isize;
+                shape[ndim - n_axes + active_idx[i]] = output_sizes[i] as isize;
                 let broad = mask.try_reshape(&shape)?.try_expand(&expand_shape)?;
                 combined = Some(match combined {
                     Some(c) => c.bitwise_and(&broad)?,
@@ -501,7 +518,7 @@ fn interpolate_antialias_cubic(
     scale: f64,
     a: f64,
     reshape: &[isize],
-    expand_i: &[isize],
+    expand_i: &[SInt],
     dtype: &DType,
 ) -> Result<Tensor> {
     let i_start = (-2.0_f64 / scale).floor() as i32 + 1;
@@ -544,7 +561,7 @@ fn interpolate_antialias_linear(
     input_sz: usize,
     scale: f64,
     reshape: &[isize],
-    expand_i: &[isize],
+    expand_i: &[SInt],
     dtype: &DType,
 ) -> Result<Tensor> {
     let start = (-1.0_f64 / scale).floor() as i32 + 1;
@@ -583,7 +600,7 @@ fn normalize_and_gather(
     dim_pos: usize,
     input_sz: usize,
     reshape: &[isize],
-    expand_i: &[isize],
+    expand_i: &[SInt],
     dtype: &DType,
 ) -> Result<Tensor> {
     let mut total = coeffs[0].clone();

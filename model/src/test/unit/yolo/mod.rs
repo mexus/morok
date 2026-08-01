@@ -1,0 +1,10 @@
+mod classify;
+mod depth;
+mod detect_p2;
+mod detect_p6;
+mod model;
+mod obb;
+mod parity;
+mod pose;
+mod segment;
+mod semseg;

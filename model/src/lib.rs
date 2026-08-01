@@ -15,6 +15,7 @@ pub mod state;
 pub mod wavlm;
 pub mod wespeaker;
 pub mod xlm_roberta;
+pub mod yolo;
 
 #[cfg(test)]
 mod test;
