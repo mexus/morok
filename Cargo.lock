@@ -287,6 +287,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "bstr"
+version = "1.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1f7dc094d718f2e1c1559ad110e27eeaae14a5465d3d56dd6dbd793079fbd530"
+dependencies = [
+ "memchr",
+ "regex-automata",
+ "serde_core",
+]
+
+[[package]]
 name = "bumpalo"
 version = "3.20.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1037,6 +1048,17 @@ checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "fancy-regex"
+version = "0.17.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "72cf461f865c862bb7dc573f643dd6a2b6842f7c30b07882b56bd148cc2761b8"
+dependencies = [
+ "bit-set",
+ "regex-automata",
+ "regex-syntax",
 ]
 
 [[package]]
@@ -3614,18 +3636,22 @@ dependencies = [
 name = "svod-model"
 version = "0.1.0-alpha.3"
 dependencies = [
+ "base64 0.22.1",
  "bon",
  "bytemuck",
  "clap",
+ "flate2",
  "hf-hub",
  "hound",
  "ndarray",
  "ndarray-npy",
  "nom",
  "prost",
+ "rand 0.8.7",
  "rayon",
  "realfft",
  "repugnant-pickle",
+ "rustc-hash",
  "safetensors",
  "serde",
  "serde_json",
@@ -3641,6 +3667,7 @@ dependencies = [
  "svod-tk",
  "tempfile",
  "test-case",
+ "tiktoken-rs",
  "tracing",
  "tracing-subscriber",
  "wide",
@@ -3942,6 +3969,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ad99c4c6d32803332c548b1af0540b357b3f5fc0be8f6c6bfe8b2e6ae784070"
 dependencies = [
  "cfg-if",
+]
+
+[[package]]
+name = "tiktoken-rs"
+version = "0.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "027853bbf8c7763b77c5c595f1c271c7d536ced7d6f83452911b944621e57fc2"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "bstr",
+ "fancy-regex",
+ "lazy_static 1.5.0",
+ "regex",
+ "rustc-hash",
 ]
 
 [[package]]

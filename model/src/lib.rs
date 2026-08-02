@@ -14,6 +14,7 @@ pub mod silero_vad;
 pub mod state;
 pub mod wavlm;
 pub mod wespeaker;
+pub mod whisper;
 pub mod xlm_roberta;
 pub mod yolo;
 
