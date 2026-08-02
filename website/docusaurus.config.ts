@@ -11,7 +11,7 @@ const config: Config = {
     v4: true,
   },
 
-  url: "https://docs.morok.tech",
+  url: "https://svod.vpermilp.online",
   baseUrl: "/",
 
   organizationName: "Patsakula Nikita",
