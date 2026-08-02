@@ -220,6 +220,7 @@ impl GigaAmTranscriber {
             win_length: model.config.win_length,
             n_mels: model.config.n_mels,
             center: model.config.mel_center,
+            mel_scale: crate::audio::MelScale::Htk,
         });
 
         let subsampling_factor = model.config.subsampling_factor;

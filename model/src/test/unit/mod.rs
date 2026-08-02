@@ -19,5 +19,6 @@ mod state_dict;
 mod transcribe;
 mod wavlm;
 mod wespeaker;
+mod whisper;
 mod xlm_roberta;
 mod yolo;

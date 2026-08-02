@@ -1,5 +1,5 @@
 use crate::audio::mel::hann_window;
-use crate::audio::{MelConfig, MelSpectrogram};
+use crate::audio::{MelConfig, MelScale, MelSpectrogram};
 
 struct MelOutput {
     data: ndarray::Array3<f32>,
@@ -28,8 +28,15 @@ fn run_mel(config: &MelConfig, waveform: &[f32]) -> MelOutput {
 
 #[test]
 fn test_mel_spectrogram_shape_center_true() {
-    let config =
-        MelConfig { sample_rate: 16000, n_fft: 400, hop_length: 160, win_length: 400, n_mels: 64, center: true };
+    let config = MelConfig {
+        sample_rate: 16000,
+        n_fft: 400,
+        hop_length: 160,
+        win_length: 400,
+        n_mels: 64,
+        center: true,
+        mel_scale: MelScale::Htk,
+    };
 
     let waveform: Vec<f32> =
         (0..16000).map(|i| (i as f32 * 440.0 * 2.0 * std::f32::consts::PI / 16000.0).sin()).collect();
@@ -40,8 +47,15 @@ fn test_mel_spectrogram_shape_center_true() {
 
 #[test]
 fn test_mel_spectrogram_shape_center_false() {
-    let config =
-        MelConfig { sample_rate: 16000, n_fft: 320, hop_length: 160, win_length: 320, n_mels: 64, center: false };
+    let config = MelConfig {
+        sample_rate: 16000,
+        n_fft: 320,
+        hop_length: 160,
+        win_length: 320,
+        n_mels: 64,
+        center: false,
+        mel_scale: MelScale::Htk,
+    };
 
     let waveform: Vec<f32> =
         (0..16000).map(|i| (i as f32 * 440.0 * 2.0 * std::f32::consts::PI / 16000.0).sin()).collect();
@@ -52,8 +66,15 @@ fn test_mel_spectrogram_shape_center_false() {
 
 #[test]
 fn test_mel_spectrogram_values_finite() {
-    let config =
-        MelConfig { sample_rate: 16000, n_fft: 400, hop_length: 160, win_length: 400, n_mels: 64, center: true };
+    let config = MelConfig {
+        sample_rate: 16000,
+        n_fft: 400,
+        hop_length: 160,
+        win_length: 400,
+        n_mels: 64,
+        center: true,
+        mel_scale: MelScale::Htk,
+    };
 
     let waveform: Vec<f32> = vec![0.0; 1600];
     let output = run_mel(&config, &waveform);
@@ -65,8 +86,15 @@ fn test_mel_spectrogram_values_finite() {
 
 #[test]
 fn test_mel_spectrogram_sine_wave() {
-    let config =
-        MelConfig { sample_rate: 16000, n_fft: 400, hop_length: 160, win_length: 400, n_mels: 64, center: true };
+    let config = MelConfig {
+        sample_rate: 16000,
+        n_fft: 400,
+        hop_length: 160,
+        win_length: 400,
+        n_mels: 64,
+        center: true,
+        mel_scale: MelScale::Htk,
+    };
 
     let waveform: Vec<f32> =
         (0..16000).map(|i| (i as f32 * 440.0 * 2.0 * std::f32::consts::PI / 16000.0).sin()).collect();

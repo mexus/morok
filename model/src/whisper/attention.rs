@@ -1,0 +1,259 @@
+//! Multi-head attention: self-attention (encoder/decoder) and cross-attention (decoder).
+//!
+//! Matches `whisper.model.MultiHeadAttention`. Key projection has no bias;
+//! query, value, and output projections have bias.
+//!
+//! Attention scaling: Whisper pre-scales Q and K by `d_head^{-0.25}`, which
+//! equals `d_head^{-0.5}` on the scores — identical to SDPA's default
+//! `1/sqrt(d_head)`.  So we use the SDPA default scale.
+
+use snafu::ResultExt;
+use svod_dtype::DType;
+use svod_ir::ConstValue;
+use svod_tensor::Tensor;
+
+use crate::state::{self, HasStateDict, StateDict, prefixed};
+
+use super::blocks::LinearWeights;
+use super::error::{Result, TensorSnafu};
+
+#[derive(Clone)]
+pub struct MultiHeadAttention {
+    pub query: LinearWeights,
+    pub key: LinearWeights,
+    pub value: LinearWeights,
+    pub out: LinearWeights,
+    pub n_head: usize,
+}
+
+impl MultiHeadAttention {
+    pub fn empty(n_state: usize, n_head: usize) -> Self {
+        Self {
+            query: LinearWeights::empty(n_state, n_state, true),
+            key: LinearWeights::empty(n_state, n_state, false),
+            value: LinearWeights::empty(n_state, n_state, true),
+            out: LinearWeights::empty(n_state, n_state, true),
+            n_head,
+        }
+    }
+
+    /// Forward pass. `xa = None` for self-attention, `Some(enc)` for cross-attention.
+    /// `mask` is the causal mask for decoder self-attention (additive float mask).
+    pub fn forward(&self, x: &Tensor, xa: Option<&Tensor>, mask: Option<&Tensor>) -> Result<Tensor> {
+        let q = self.query.forward(x)?;
+        let kv_input = xa.unwrap_or(x);
+        let k = self.key.forward(kv_input)?;
+        let v = self.value.forward(kv_input)?;
+
+        let out = self.fa_attention(&q, &k, &v, mask.is_some())?;
+        self.out.forward(&out)
+    }
+
+    pub fn forward_return_kv(
+        &self,
+        x: &Tensor,
+        xa: Option<&Tensor>,
+        mask: Option<&Tensor>,
+    ) -> Result<(Tensor, Tensor, Tensor)> {
+        let q = self.query.forward(x)?;
+        let kv_input = xa.unwrap_or(x);
+        let k = self.key.forward(kv_input)?;
+        let v = self.value.forward(kv_input)?;
+
+        let out = self.fa_attention(&q, &k, &v, mask.is_some())?;
+        let out = self.out.forward(&out)?;
+        Ok((out, k, v))
+    }
+
+    /// Forward pass returning both the output and the raw QK attention weights
+    /// (pre-softmax, post-scale). Used for DTW alignment. Only meaningful for
+    /// cross-attention; returns `None` for self-attention when `xa.is_none()`.
+    pub fn forward_with_qk(
+        &self,
+        x: &Tensor,
+        xa: Option<&Tensor>,
+        mask: Option<&Tensor>,
+    ) -> Result<(Tensor, Option<Tensor>)> {
+        let q = self.query.forward(x)?;
+        let kv_input = xa.unwrap_or(x);
+        let k = self.key.forward(kv_input)?;
+        let v = self.value.forward(kv_input)?;
+
+        self.qkv_attention_with_qk(&q, &k, &v, mask, xa.is_some())
+    }
+
+    pub fn split_heads(&self, t: &Tensor) -> Result<Tensor> {
+        // t: [B, S, D] -> [B, S, H, Dh] -> [B, H, S, Dh]
+        let shape = t.shape().context(TensorSnafu)?;
+        let b = shape[0].clone();
+        let s = shape[1].clone();
+        let d = shape[2].as_const().ok_or_else(|| super::error::Error::Tensor {
+            source: Box::new(svod_tensor::error::Error::SymbolicShapeUnsupported { operation: "split_heads d".into() }),
+        })?;
+        let dh = d / self.n_head;
+        t.try_reshape(&[b, s, svod_ir::SInt::Const(self.n_head), svod_ir::SInt::Const(dh)])
+            .context(TensorSnafu)?
+            .try_permute(&[0, 2, 1, 3])
+            .context(TensorSnafu)
+    }
+
+    pub fn merge_heads(&self, t: &Tensor) -> Result<Tensor> {
+        // t: [B, H, S, Dh] -> [B, S, H, Dh] -> [B, S, D]
+        let shape = t.shape().context(TensorSnafu)?;
+        let b = shape[0].clone();
+        let s = shape[2].clone();
+        let h = shape[1].as_const().ok_or_else(|| super::error::Error::Tensor {
+            source: Box::new(svod_tensor::error::Error::SymbolicShapeUnsupported { operation: "merge_heads h".into() }),
+        })?;
+        let dh = shape[3].as_const().ok_or_else(|| super::error::Error::Tensor {
+            source: Box::new(svod_tensor::error::Error::SymbolicShapeUnsupported {
+                operation: "merge_heads dh".into(),
+            }),
+        })?;
+        let d = h * dh;
+        t.try_permute(&[0, 2, 1, 3])
+            .context(TensorSnafu)?
+            .try_reshape(&[b, s, svod_ir::SInt::Const(d)])
+            .context(TensorSnafu)
+    }
+
+    /// Flash-attention path: Q/K/V in [B, S, D] → split to [B, S, H, Dh] for FA,
+    /// fall back to SDPA if FA doesn't apply. `causal` controls the mask.
+    fn fa_attention(&self, q: &Tensor, k: &Tensor, v: &Tensor, causal: bool) -> Result<Tensor> {
+        let shape = q.shape().context(TensorSnafu)?;
+        let b = shape[0].clone();
+        let s = shape[1].clone();
+        let d = shape[2].as_const().ok_or_else(|| super::error::Error::Tensor {
+            source: Box::new(svod_tensor::error::Error::SymbolicShapeUnsupported {
+                operation: "fa_attention d".into(),
+            }),
+        })?;
+
+        // Split each to [B, S, H, Dh] — FA's layout (seq-major, no permute)
+        let split = |t: &Tensor| -> Result<Tensor> {
+            let sh = t.shape().context(TensorSnafu)?;
+            let tb = sh[0].clone();
+            let ts = sh[1].clone();
+            let td = sh[2].as_const().ok_or_else(|| super::error::Error::Tensor {
+                source: Box::new(svod_tensor::error::Error::SymbolicShapeUnsupported {
+                    operation: "fa_attention d".into(),
+                }),
+            })?;
+            t.try_reshape(&[tb, ts, svod_ir::SInt::Const(self.n_head), svod_ir::SInt::Const(td / self.n_head)])
+                .context(TensorSnafu)
+        };
+        let q_fa = split(q)?;
+        let k_fa = split(k)?;
+        let v_fa = split(v)?;
+
+        // Cast to bf16 for FA kernel
+        let dt = q_fa.uop().dtype();
+        let need_cast = dt != svod_dtype::DType::BFloat16 && dt != svod_dtype::DType::Float16;
+        let (q_f, k_f, v_f) = if need_cast {
+            let to = svod_dtype::DType::BFloat16;
+            (
+                q_fa.cast(to).context(TensorSnafu)?,
+                k_fa.cast(svod_dtype::DType::BFloat16).context(TensorSnafu)?,
+                v_fa.cast(svod_dtype::DType::BFloat16).context(TensorSnafu)?,
+            )
+        } else {
+            (q_fa.clone(), k_fa.clone(), v_fa.clone())
+        };
+
+        match svod_tk::flash_attention_with(&q_f, &k_f, &v_f, svod_tk::FaOpts { causal, key_lens: None })
+            .map_err(|e| svod_tensor::error::Error::IrConstruction { details: e.to_string() })
+            .context(TensorSnafu)?
+        {
+            Some(out) => {
+                let out = if need_cast { out.cast(dt).context(TensorSnafu)? } else { out };
+                out.try_reshape(&[b, s, svod_ir::SInt::Const(d)]).context(TensorSnafu)
+            }
+            None => {
+                // SDPA fallback (needs [B, H, S, Dh])
+                let perm = |t: &Tensor| t.try_permute(&[0, 2, 1, 3]).context(TensorSnafu);
+                let out = perm(&q_fa)?
+                    .scaled_dot_product_attention()
+                    .key(&perm(&k_fa)?)
+                    .value(&perm(&v_fa)?)
+                    .is_causal(causal)
+                    .call()
+                    .context(TensorSnafu)?;
+                self.merge_heads(&out)
+            }
+        }
+    }
+
+    /// Manual attention that returns softmaxed attention weights for DTW.
+    fn qkv_attention_with_qk(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        mask: Option<&Tensor>,
+        is_cross: bool,
+    ) -> Result<(Tensor, Option<Tensor>)> {
+        let q = self.split_heads(q)?; // [B, H, Sq, Dh]
+        let k = self.split_heads(k)?; // [B, H, Sk, Dh]
+        let v = self.split_heads(v)?; // [B, H, Sk, Dh]
+
+        let kt = k.try_transpose(-1, -2).context(TensorSnafu)?; // [B, H, Dh, Sk]
+        let mut scores = q.matmul(&kt).context(TensorSnafu)?; // [B, H, Sq, Sk]
+
+        let dh = {
+            let s = q.shape().context(TensorSnafu)?;
+            s[3].as_const().ok_or_else(|| super::error::Error::Tensor {
+                source: Box::new(svod_tensor::error::Error::SymbolicShapeUnsupported {
+                    operation: "qkv_attention dh".into(),
+                }),
+            })? as f64
+        };
+        let scale = 1.0 / dh.sqrt();
+        let scale_t = Tensor::const_(ConstValue::Float(scale), scores.uop().dtype().clone());
+        scores = scores.try_mul(&scale_t).context(TensorSnafu)?;
+
+        if let Some(m) = mask {
+            scores = scores.try_add(m).context(TensorSnafu)?;
+        }
+
+        let attn = scores.softmax(-1isize).context(TensorSnafu)?;
+        let out = attn.matmul(&v).context(TensorSnafu)?; // [B, H, Sq, Dh]
+        let out = self.merge_heads(&out)?;
+
+        // Return softmaxed attention weights only for cross-attention.
+        let qk_weights = is_cross.then_some(attn);
+        Ok((out, qk_weights))
+    }
+}
+
+impl HasStateDict for MultiHeadAttention {
+    fn state_dict(&self, prefix: &str) -> StateDict {
+        let mut sd = StateDict::new();
+        sd.extend(self.query.state_dict(&prefixed(prefix, "query")));
+        sd.extend(self.key.state_dict(&prefixed(prefix, "key")));
+        sd.extend(self.value.state_dict(&prefixed(prefix, "value")));
+        sd.extend(self.out.state_dict(&prefixed(prefix, "out")));
+        sd
+    }
+
+    fn load_state_dict(&mut self, sd: &StateDict, prefix: &str) -> std::result::Result<(), state::Error> {
+        self.query.load_state_dict(sd, &prefixed(prefix, "query"))?;
+        self.key.load_state_dict(sd, &prefixed(prefix, "key"))?;
+        self.value.load_state_dict(sd, &prefixed(prefix, "value"))?;
+        self.out.load_state_dict(sd, &prefixed(prefix, "out"))?;
+        Ok(())
+    }
+}
+
+/// Build the causal mask for the decoder: `[1, 1, L, L]` upper-triangular -inf.
+pub fn causal_mask(seq_len: usize, dtype: DType) -> Result<Tensor> {
+    // [L, 1] vs [L] → [L, L] bool: True where col > row (upper triangle)
+    let q_idx =
+        Tensor::arange(0, Some(seq_len as i64), None).context(TensorSnafu)?.try_unsqueeze(-1).context(TensorSnafu)?; // [L, 1]
+    let k_idx = Tensor::arange(0, Some(seq_len as i64), None).context(TensorSnafu)?; // [L]
+    let upper = q_idx.try_lt(&k_idx).context(TensorSnafu)?; // [L, L] bool
+
+    let neg_inf = Tensor::const_(ConstValue::Float(f32::NEG_INFINITY as f64), dtype.clone());
+    let zero = Tensor::const_(ConstValue::Float(0.0), dtype);
+    let float_mask = neg_inf.where_(&upper, &zero).context(TensorSnafu)?;
+    float_mask.try_unsqueeze(0).context(TensorSnafu)?.try_unsqueeze(0).context(TensorSnafu)
+}

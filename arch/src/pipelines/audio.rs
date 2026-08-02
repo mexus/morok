@@ -358,12 +358,9 @@ pub trait Transcriber {
             .zip(&metas)
             .map(|(t, m)| {
                 let cropped = crop_words_to_core(t.words, m.core_offset_sec, m.end_sec - m.start_sec);
-                ChunkResult {
-                    start_sec: m.start_sec,
-                    end_sec: m.end_sec,
-                    text: words_to_text(&cropped),
-                    words: want_words.then_some(cropped),
-                }
+                // Prefer the transcriber's text; reconstruct from words only as fallback.
+                let text = if !t.text.is_empty() { t.text } else { words_to_text(&cropped) };
+                ChunkResult { start_sec: m.start_sec, end_sec: m.end_sec, text, words: want_words.then_some(cropped) }
             })
             .collect();
 
