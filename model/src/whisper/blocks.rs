@@ -22,8 +22,12 @@ pub struct LinearWeights {
 
 impl LinearWeights {
     pub fn empty(in_features: usize, out_features: usize, has_bias: bool) -> Self {
-        let weight = fan_in_uniform(&[out_features, in_features], in_features, DType::Float32);
-        let bias = has_bias.then(|| fan_in_uniform(&[out_features], in_features, DType::Float32));
+        Self::empty_dtype(in_features, out_features, has_bias, DType::Float32)
+    }
+
+    pub fn empty_dtype(in_features: usize, out_features: usize, has_bias: bool, dtype: DType) -> Self {
+        let weight = fan_in_uniform(&[out_features, in_features], in_features, dtype.clone());
+        let bias = has_bias.then(|| fan_in_uniform(&[out_features], in_features, dtype));
         Self { weight, bias }
     }
 
@@ -62,10 +66,20 @@ pub struct LayerNormWeights {
 
 impl LayerNormWeights {
     pub fn empty(size: usize) -> Self {
-        Self { weight: ones(&[size], DType::Float32), bias: zeros(&[size], DType::Float32), eps: 1e-5 }
+        Self::empty_dtype(size, DType::Float32)
+    }
+
+    pub fn empty_dtype(size: usize, dtype: DType) -> Self {
+        Self { weight: ones(&[size], dtype.clone()), bias: zeros(&[size], dtype), eps: 1e-5 }
     }
 
     pub fn apply(&self, x: &Tensor) -> Result<Tensor> {
+        // `Tensor::layernorm` upcasts to fp32 internally for numerical
+        // stability (matching ONNX `stash_type=1`, same as the OpenAI reference's
+        // `x.float()`), then casts the normalized output back to the input dtype.
+        // The affine multiply/add then runs in the input dtype via the IR's
+        // auto-promotion lattice. This mirrors xlm_roberta's LayerNorm, which
+        // relies on the op's internal upcast rather than an explicit branch.
         let normed = x.layernorm(-1, self.eps).context(TensorSnafu)?;
         normed.try_mul(&self.weight).context(TensorSnafu)?.try_add(&self.bias).context(TensorSnafu)
     }
@@ -97,10 +111,22 @@ pub struct Conv1dWeights {
 
 impl Conv1dWeights {
     pub fn empty(in_ch: usize, out_ch: usize, kernel: usize, stride: usize, padding: usize, has_bias: bool) -> Self {
+        Self::empty_dtype(in_ch, out_ch, kernel, stride, padding, has_bias, DType::Float32)
+    }
+
+    pub fn empty_dtype(
+        in_ch: usize,
+        out_ch: usize,
+        kernel: usize,
+        stride: usize,
+        padding: usize,
+        has_bias: bool,
+        dtype: DType,
+    ) -> Self {
         let fan_in = in_ch * kernel;
         Self {
-            weight: fan_in_uniform(&[out_ch, in_ch, kernel], fan_in, DType::Float32),
-            bias: has_bias.then(|| fan_in_uniform(&[out_ch], fan_in, DType::Float32)),
+            weight: fan_in_uniform(&[out_ch, in_ch, kernel], fan_in, dtype.clone()),
+            bias: has_bias.then(|| fan_in_uniform(&[out_ch], fan_in, dtype)),
             stride,
             padding,
         }

@@ -30,17 +30,21 @@ pub struct DecoderBlock {
 
 impl DecoderBlock {
     pub fn empty(n_state: usize, n_head: usize) -> Self {
+        Self::empty_dtype(n_state, n_head, DType::Float32)
+    }
+
+    pub fn empty_dtype(n_state: usize, n_head: usize, dtype: DType) -> Self {
         let mlp = n_state * 4;
         Self {
-            attn: MultiHeadAttention::empty(n_state, n_head),
-            attn_ln: LayerNormWeights::empty(n_state),
-            cross_attn: MultiHeadAttention::empty(n_state, n_head),
-            cross_attn_ln: LayerNormWeights::empty(n_state),
-            mlp0_w: fan_in_uniform(&[mlp, n_state], n_state, DType::Float32),
-            mlp0_b: fan_in_uniform(&[mlp], n_state, DType::Float32),
-            mlp1_w: fan_in_uniform(&[n_state, mlp], mlp, DType::Float32),
-            mlp1_b: fan_in_uniform(&[n_state], mlp, DType::Float32),
-            mlp_ln: LayerNormWeights::empty(n_state),
+            attn: MultiHeadAttention::empty_dtype(n_state, n_head, dtype.clone()),
+            attn_ln: LayerNormWeights::empty_dtype(n_state, dtype.clone()),
+            cross_attn: MultiHeadAttention::empty_dtype(n_state, n_head, dtype.clone()),
+            cross_attn_ln: LayerNormWeights::empty_dtype(n_state, dtype.clone()),
+            mlp0_w: fan_in_uniform(&[mlp, n_state], n_state, dtype.clone()),
+            mlp0_b: fan_in_uniform(&[mlp], n_state, dtype.clone()),
+            mlp1_w: fan_in_uniform(&[n_state, mlp], mlp, dtype.clone()),
+            mlp1_b: fan_in_uniform(&[n_state], mlp, dtype.clone()),
+            mlp_ln: LayerNormWeights::empty_dtype(n_state, dtype),
             n_state,
         }
     }
@@ -138,12 +142,15 @@ pub struct TextDecoder {
 impl TextDecoder {
     pub fn empty(dims: &ModelDimensions) -> Self {
         let n_state = dims.n_text_state;
+        let dtype = dims.dtype.clone();
         Self {
-            token_embedding: fan_in_uniform(&[dims.n_vocab, n_state], n_state, DType::Float32),
-            positional_embedding: Tensor::zeros(&[dims.n_text_ctx, n_state], DType::Float32)
+            token_embedding: fan_in_uniform(&[dims.n_vocab, n_state], n_state, dtype.clone()),
+            positional_embedding: Tensor::zeros(&[dims.n_text_ctx, n_state], dtype.clone())
                 .expect("positional embedding"),
-            blocks: (0..dims.n_text_layer).map(|_| DecoderBlock::empty(n_state, dims.n_text_head)).collect(),
-            ln: LayerNormWeights::empty(n_state),
+            blocks: (0..dims.n_text_layer)
+                .map(|_| DecoderBlock::empty_dtype(n_state, dims.n_text_head, dtype.clone()))
+                .collect(),
+            ln: LayerNormWeights::empty_dtype(n_state, dtype),
             n_state,
             n_head: dims.n_text_head,
             n_text_ctx: dims.n_text_ctx,
@@ -299,7 +306,15 @@ impl TextDecoder {
             .cast(DType::Float32)
             .context(TensorSnafu)?;
 
-        Ok((logits, pack(self_ks)?, pack(self_vs)?, pack(cross_ks)?, pack(cross_vs)?))
+        // K/V cache outputs cast to fp32 — the cache buffers are fp32 (host
+        // round-trips them as Vec<f32>), while compute is dims.dtype (fp16).
+        Ok((
+            logits,
+            pack(self_ks)?.cast(DType::Float32).context(TensorSnafu)?,
+            pack(self_vs)?.cast(DType::Float32).context(TensorSnafu)?,
+            pack(cross_ks)?.cast(DType::Float32).context(TensorSnafu)?,
+            pack(cross_vs)?.cast(DType::Float32).context(TensorSnafu)?,
+        ))
     }
 
     /// Single-token forward with KV cache. Used for incremental decoding.
@@ -478,7 +493,12 @@ impl TextDecoder {
         let logits =
             logits.try_reshape(&[svod_ir::SInt::Const(batch), svod_ir::SInt::Const(n_vocab)]).context(TensorSnafu)?;
 
-        Ok((logits, new_k_flat, new_v_flat))
+        // K/V outputs cast to fp32 — appended into the fp32 cache buffer via SDMA.
+        Ok((
+            logits,
+            new_k_flat.cast(DType::Float32).context(TensorSnafu)?,
+            new_v_flat.cast(DType::Float32).context(TensorSnafu)?,
+        ))
     }
 
     /// Symbolic-batch variant of [`forward_step`](Self::forward_step).
@@ -647,7 +667,12 @@ impl TextDecoder {
         })?;
         let logits = logits.try_reshape(&[bv, SInt::Const(n_vocab)]).context(TensorSnafu)?;
 
-        Ok((logits, new_k_flat, new_v_flat))
+        // K/V outputs cast to fp32 — appended into the fp32 cache buffer via SDMA.
+        Ok((
+            logits,
+            new_k_flat.cast(DType::Float32).context(TensorSnafu)?,
+            new_v_flat.cast(DType::Float32).context(TensorSnafu)?,
+        ))
     }
 }
 

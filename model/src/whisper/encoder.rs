@@ -27,15 +27,19 @@ pub struct EncoderBlock {
 
 impl EncoderBlock {
     pub fn empty(n_state: usize, n_head: usize) -> Self {
+        Self::empty_dtype(n_state, n_head, DType::Float32)
+    }
+
+    pub fn empty_dtype(n_state: usize, n_head: usize, dtype: DType) -> Self {
         let mlp = n_state * 4;
         Self {
-            attn: MultiHeadAttention::empty(n_state, n_head),
-            attn_ln: LayerNormWeights::empty(n_state),
-            mlp0_w: fan_in_uniform(&[mlp, n_state], n_state, DType::Float32),
-            mlp0_b: fan_in_uniform(&[mlp], n_state, DType::Float32),
-            mlp1_w: fan_in_uniform(&[n_state, mlp], mlp, DType::Float32),
-            mlp1_b: fan_in_uniform(&[n_state], mlp, DType::Float32),
-            mlp_ln: LayerNormWeights::empty(n_state),
+            attn: MultiHeadAttention::empty_dtype(n_state, n_head, dtype.clone()),
+            attn_ln: LayerNormWeights::empty_dtype(n_state, dtype.clone()),
+            mlp0_w: fan_in_uniform(&[mlp, n_state], n_state, dtype.clone()),
+            mlp0_b: fan_in_uniform(&[mlp], n_state, dtype.clone()),
+            mlp1_w: fan_in_uniform(&[n_state, mlp], mlp, dtype.clone()),
+            mlp1_b: fan_in_uniform(&[n_state], mlp, dtype.clone()),
+            mlp_ln: LayerNormWeights::empty_dtype(n_state, dtype),
             n_state,
         }
     }
@@ -96,12 +100,15 @@ pub struct AudioEncoder {
 impl AudioEncoder {
     pub fn empty(dims: &ModelDimensions) -> Self {
         let n_state = dims.n_audio_state;
+        let dtype = dims.dtype.clone();
         Self {
-            conv1: Conv1dWeights::empty(dims.n_mels, n_state, 3, 1, 1, true),
-            conv2: Conv1dWeights::empty(n_state, n_state, 3, 2, 1, true),
+            conv1: Conv1dWeights::empty_dtype(dims.n_mels, n_state, 3, 1, 1, true, dtype.clone()),
+            conv2: Conv1dWeights::empty_dtype(n_state, n_state, 3, 2, 1, true, dtype.clone()),
             positional_embedding: sinusoids(dims.n_audio_ctx, n_state, 10_000.0).expect("sinusoidal embedding"),
-            blocks: (0..dims.n_audio_layer).map(|_| EncoderBlock::empty(n_state, dims.n_audio_head)).collect(),
-            ln_post: LayerNormWeights::empty(n_state),
+            blocks: (0..dims.n_audio_layer)
+                .map(|_| EncoderBlock::empty_dtype(n_state, dims.n_audio_head, dtype.clone()))
+                .collect(),
+            ln_post: LayerNormWeights::empty_dtype(n_state, dtype),
             n_state,
             n_head: dims.n_audio_head,
         }
@@ -109,7 +116,12 @@ impl AudioEncoder {
 
     /// Forward: mel `[B, n_mels, T]` → encoder features `[B, T/2, D]`.
     pub fn forward(&self, mel: &Tensor) -> Result<Tensor> {
-        let x = self.conv1.forward(mel)?;
+        // Cast input to the compute dtype (weights are dims.dtype; the host
+        // feeds fp32 mel). Matches `model.py:48` weight.to(x.dtype) from the
+        // other direction — we cast x to the weight dtype so the graph is uniform.
+        let dtype = self.conv1.weight.uop().dtype().clone();
+        let mel = mel.cast(dtype).context(TensorSnafu)?;
+        let x = self.conv1.forward(&mel)?;
         let x = x.gelu_exact().context(TensorSnafu)?;
         let x = self.conv2.forward(&x)?;
         let x = x.gelu_exact().context(TensorSnafu)?;
@@ -126,8 +138,11 @@ impl AudioEncoder {
             x = block.forward(&x)?;
         }
 
-        // Final LayerNorm
-        self.ln_post.apply(&x)
+        // Final LayerNorm + cast to fp32. The encoder output is consumed by the
+        // host (copyout_prefix into Vec<f32>) and fed to the prefill/step JITs
+        // which cast it back to the compute dtype. Keeping the output fp32 means
+        // the host read path works regardless of compute dtype.
+        self.ln_post.apply(&x)?.cast(DType::Float32).context(TensorSnafu)
     }
 }
 

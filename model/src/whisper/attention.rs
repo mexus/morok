@@ -28,11 +28,15 @@ pub struct MultiHeadAttention {
 
 impl MultiHeadAttention {
     pub fn empty(n_state: usize, n_head: usize) -> Self {
+        Self::empty_dtype(n_state, n_head, DType::Float32)
+    }
+
+    pub fn empty_dtype(n_state: usize, n_head: usize, dtype: DType) -> Self {
         Self {
-            query: LinearWeights::empty(n_state, n_state, true),
-            key: LinearWeights::empty(n_state, n_state, false),
-            value: LinearWeights::empty(n_state, n_state, true),
-            out: LinearWeights::empty(n_state, n_state, true),
+            query: LinearWeights::empty_dtype(n_state, n_state, true, dtype.clone()),
+            key: LinearWeights::empty_dtype(n_state, n_state, false, dtype.clone()),
+            value: LinearWeights::empty_dtype(n_state, n_state, true, dtype.clone()),
+            out: LinearWeights::empty_dtype(n_state, n_state, true, dtype),
             n_head,
         }
     }
@@ -215,7 +219,11 @@ impl MultiHeadAttention {
             scores = scores.try_add(m).context(TensorSnafu)?;
         }
 
-        let attn = scores.softmax(-1isize).context(TensorSnafu)?;
+        // Softmax in fp32, then back to q dtype — matches the OpenAI reference
+        // (`model.py:140-142`: `qk.float()` → `F.softmax(...).to(q.dtype)`).
+        let q_dtype = q.uop().dtype().clone();
+        let attn = scores.cast(DType::Float32).context(TensorSnafu)?.softmax(-1isize).context(TensorSnafu)?;
+        let attn = attn.cast(q_dtype).context(TensorSnafu)?;
         let out = attn.matmul(&v).context(TensorSnafu)?; // [B, H, Sq, Dh]
         let out = self.merge_heads(&out)?;
 

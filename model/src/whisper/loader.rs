@@ -7,7 +7,6 @@
 use std::path::Path;
 
 use crate::state::{self, HasStateDict, StateDict};
-use svod_dtype::DType;
 
 use super::config::{ModelDimensions, WhisperSize};
 use super::error::{Error, Result};
@@ -17,11 +16,13 @@ impl Whisper {
     /// Load from a safetensors state dict.
     ///
     /// HuggingFace Transformers checkpoints (`model.safetensors`) store the
-    /// weights in Float16; the compute graph is Float32, so every tensor is
-    /// upcast before loading. Int tensors (e.g. embeddings that are already
-    /// integer) are left untouched by [`state::cast_all`].
+    /// weights in Float16; the compute dtype is `dims.dtype` (Float16 by
+    /// default, settable to Float32 for CPU parity). Weights are cast to
+    /// `dims.dtype` before loading; int tensors (e.g. integer embeddings) are
+    /// left untouched by [`state::cast_all`].
     pub fn from_state_dict(sd: &StateDict, dims: ModelDimensions) -> Result<Self> {
-        let sd = state::cast_all(&remap_hf_keys(sd), DType::Float32);
+        let dtype = dims.dtype.clone();
+        let sd = state::cast_all(&remap_hf_keys(sd), dtype);
         let mut model = Self::empty(dims);
         model.load_state_dict(&sd, "").map_err(|e| Error::State { source: e })?;
         Ok(model)

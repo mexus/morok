@@ -144,12 +144,18 @@ impl WhisperTranscriber {
             }
             s
         };
+        // Device-local cache inputs: the KV caches live on-device and are
+        // recycled via SDMA copy (the RN-T block decoder / firered-vad idiom).
+        // The host never reads/writes cache floats — only integer offsets and
+        // the logits output. This unblocks low-precision compute: the cache
+        // dtype is a device-side decision, not pinned to the host Vec type.
         for &bs in &beam_sizes {
             let mut sj = WhisperDecoderStepJit::new(model.clone());
             let token_spec = InputSpec::i32(&[bs, 1]);
             let pos_emb_spec = InputSpec::f32(&[bs, 1, n_text_state]);
-            let self_cache_spec = InputSpec::f32(&[bs, N_TEXT_CTX, n_text_layer * n_text_head_local, d_head]);
-            let cross_cache_spec = InputSpec::f32(&[bs, N_AUDIO_CTX, n_text_layer * n_text_head_local, d_head]);
+            let self_cache_spec = InputSpec::f32(&[bs, N_TEXT_CTX, n_text_layer * n_text_head_local, d_head]).device_local();
+            let cross_cache_spec =
+                InputSpec::f32(&[bs, N_AUDIO_CTX, n_text_layer * n_text_head_local, d_head]).device_local();
             let mask_spec = InputSpec::f32(&[bs, 1, 1, N_TEXT_CTX + 1]);
             sj.prepare_with_config(
                 token_spec,
@@ -174,17 +180,20 @@ impl WhisperTranscriber {
             .prepare_with_config(
                 InputSpec::i32(&[max_lanes, 1]),
                 InputSpec::f32(&[max_lanes, 1, n_text_state]),
-                InputSpec::f32(&[max_lanes, N_TEXT_CTX, n_text_layer * n_text_head_local, d_head]),
-                InputSpec::f32(&[max_lanes, N_TEXT_CTX, n_text_layer * n_text_head_local, d_head]),
-                InputSpec::f32(&[max_lanes, N_AUDIO_CTX, n_text_layer * n_text_head_local, d_head]),
-                InputSpec::f32(&[max_lanes, N_AUDIO_CTX, n_text_layer * n_text_head_local, d_head]),
+                InputSpec::f32(&[max_lanes, N_TEXT_CTX, n_text_layer * n_text_head_local, d_head]).device_local(),
+                InputSpec::f32(&[max_lanes, N_TEXT_CTX, n_text_layer * n_text_head_local, d_head]).device_local(),
+                InputSpec::f32(&[max_lanes, N_AUDIO_CTX, n_text_layer * n_text_head_local, d_head]).device_local(),
+                InputSpec::f32(&[max_lanes, N_AUDIO_CTX, n_text_layer * n_text_head_local, d_head]).device_local(),
                 InputSpec::f32(&[max_lanes, 1, 1, N_TEXT_CTX + 1]),
                 &prepare_config,
             )
             .context(JitSnafu)?;
 
-        // Read positional embedding eagerly (static weight, reused every window)
-        let mut pe = model.decoder.positional_embedding.clone();
+        // Read positional embedding eagerly (static weight, reused every window).
+        // Cast to fp32 — the host decode math (pos_embedding slicing in decode.rs)
+        // operates on Vec<f32>, while the weight loads at dims.dtype (fp16).
+        let mut pe = model.decoder.positional_embedding.cast(svod_dtype::DType::Float32)
+            .map_err(|e| TranscribeError::Tensor { source: Box::new(e) })?;
         pe.realize().map_err(|e| TranscribeError::Tensor { source: Box::new(e) })?;
         let pos_embedding = pe
             .as_ndarray::<f32>()
@@ -513,10 +522,12 @@ impl Transcriber for WhisperTranscriber {
                     )
                     .map_err(|e| TranscribeError::Model { source: Box::new(e) })?;
 
-                    // Extract per-layer cross-attention weights as flat f32 vectors
+                    // Extract per-layer cross-attention weights as flat f32 vectors.
+                    // Cast to fp32 — the weights are computed at dims.dtype (fp16),
+                    // but DTW reads them as f32.
                     let mut qk_flat: Vec<Vec<f32>> = Vec::with_capacity(qk_weights.len());
                     for qk in &qk_weights {
-                        let mut qk_t = qk.clone();
+                        let mut qk_t = qk.cast(svod_dtype::DType::Float32).context(TensorSnafu)?;
                         qk_t.realize().context(TensorSnafu)?;
                         let arr = qk_t.as_ndarray::<f32>().context(TensorSnafu)?;
                         qk_flat.push(arr.as_slice().expect("contiguous qk").to_vec());

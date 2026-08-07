@@ -506,6 +506,19 @@ impl Buffer {
         self.data.allocator._copyin(self.data.raw(), self.offset, src)
     }
 
+    /// Copy `src` into this buffer starting at byte `dst_off`. Partial-write
+    /// counterpart to [`copyout_prefix`] — used to seed a region of a
+    /// device-local buffer (e.g. one lane's KV-cache row) from host memory
+    /// via the copy engine, without a host-visible mapping.
+    pub fn copyin_at(&mut self, dst_off: usize, src: &[u8]) -> Result<()> {
+        self.ensure_allocated()?;
+        snafu::ensure!(
+            dst_off + src.len() <= self.size,
+            SizeMismatchSnafu { expected: self.size, actual: dst_off + src.len() }
+        );
+        self.data.allocator._copyin(self.data.raw(), self.offset + dst_off, src)
+    }
+
     /// Copy data from this buffer to host memory.
     ///
     /// Delegates to the allocator's `_copyout`. Device backends synchronize
@@ -570,6 +583,26 @@ impl Buffer {
             UnsupportedSnafu { op: "copy_region_from across allocators" }
         );
         self.data.allocator._transfer(self.data.raw(), self.offset + dst_off, src.data.raw(), src.offset + src_off, len)
+    }
+
+    /// Copy a region within this buffer to another region in the same buffer
+    /// (on-device SDMA, no host round-trip). Used to relocate a cache row when
+    /// lane compaction shifts a surviving lane to a new row. The regions must
+    /// not overlap.
+    pub fn copy_within(&mut self, dst_off: usize, src_off: usize, len: usize) -> Result<()> {
+        self.ensure_allocated()?;
+        snafu::ensure!(
+            dst_off + len <= self.size,
+            SizeMismatchSnafu { expected: self.size, actual: dst_off + len }
+        );
+        snafu::ensure!(
+            src_off + len <= self.size,
+            SizeMismatchSnafu { expected: self.size, actual: src_off + len }
+        );
+        // No borrow conflict: .raw() returns an owned RawBuffer handle, so we
+        // can capture it twice without aliasing &mut self.
+        let src_raw = self.data.raw();
+        self.data.allocator._transfer(self.data.raw(), self.offset + dst_off, src_raw, self.offset + src_off, len)
     }
 
     /// Synchronize the device (wait for all operations to complete).

@@ -288,7 +288,7 @@ pub fn greedy_decode_cached(
 
         write_token_buf(step_jit, &[next_token as i32])?;
         let off = pos * ctx.n_state;
-        write_f32_input(step_jit.pos_emb_mut(), &ctx.pos_embedding[off..off + ctx.n_state])?;
+        write_f32_input(step_jit.pos_emb_mut().context(JitSnafu)?, &ctx.pos_embedding[off..off + ctx.n_state])?;
         ctx.write_mask(step_jit, pos, n_text_ctx, 1)?;
         step_jit.execute().context(JitSnafu)?;
         ctx.copy_kv(step_jit, pos)?;
@@ -347,13 +347,16 @@ pub struct DecodeLane {
     pub pos_embedding: Vec<f32>,
     pub n_state: usize,
 
-    // KV caches — packed into the batched step JIT at this lane's row.
-    // self_k/v grow as tokens decode (one position appended per step via
-    // SDMA writeback); cross_k/v are fixed after prefill.
+    // KV caches — seeded once into the batched step JIT's device-local buffer
+    // at this lane's row. After seeding, the cache lives on-device and grows
+    // one position per step via SDMA writeback (`copy_output_to_self_k_cache`);
+    // the host never rewrites it. `seeded_row` is the row the cache currently
+    // occupies in the [max_lanes, ...] buffer (changes on lane compaction).
     pub self_k_cache: Vec<f32>,
     pub self_v_cache: Vec<f32>,
     pub cross_k: Vec<f32>,
     pub cross_v: Vec<f32>,
+    pub seeded_row: Option<usize>,
 
     // Per-step loop state (mutated each step)
     pub next_token: u32,
@@ -412,6 +415,7 @@ impl DecodeLane {
             self_v_cache: ctx.self_v_cache,
             cross_k: ctx.cross_k,
             cross_v: ctx.cross_v,
+            seeded_row: None,
             next_token,
             tokens,
             sum_logprob,
@@ -475,15 +479,52 @@ pub fn run_batched_decode(
         // Pack each active lane's inputs into the batched JIT at its row.
         // Rows are contiguous: active lane `j` (j=0..active_count) maps to
         // row `j` in the [active_count, ...] dispatch.
+        //
+        // KV caches are device-local: the first time a lane occupies a row
+        // (and whenever compaction moves it to a new row), the seed cache
+        // (read from prefill) is copied in once via `copyin`. Thereafter the
+        // cache grows on-device via SDMA append (teardown below) — the host
+        // never rewrites it. This is the bandwidth win: one seed per lane,
+        // not a full-cache rewrite per step.
         for (row, &lane_idx) in active.iter().enumerate() {
-            let lane = &lanes[lane_idx];
+            let lane = &mut lanes[lane_idx];
             write_token_row(step_jit, row, lane.next_token)?;
             write_pos_emb_row(step_jit, row, &lane.pos_embedding[lane.pos * n_state..(lane.pos + 1) * n_state])?;
             write_self_mask_row(step_jit, row, lane.pos, n_text_ctx)?;
-            write_cache_row(step_jit.self_k_cache_mut(), row, self_row_stride, &lane.self_k_cache)?;
-            write_cache_row(step_jit.self_v_cache_mut(), row, self_row_stride, &lane.self_v_cache)?;
-            write_cache_row(step_jit.cross_k_mut(), row, cross_row_stride, &lane.cross_k)?;
-            write_cache_row(step_jit.cross_v_mut(), row, cross_row_stride, &lane.cross_v)?;
+
+            // Seed caches into this row only when the lane's row changed.
+            //
+            // Two cases:
+            // - First activation (`seeded_row == None`): seed from the host Vec
+            //   (the prefill prefix). The cache then grows on-device via SDMA.
+            // - Compaction (`seeded_row == Some(old_row)`): the earlier lane
+            //   dropped out, shifting this lane down to `row`. Copy the GROWN
+            //   cache device-to-device from `old_row` to `row` — NOT from the
+            //   host Vec, which only holds the stale prefill prefix and would
+            //   clobber positions [init_len, pos) written by prior SDMA appends.
+            match lane.seeded_row {
+                None => {
+                    copyin_cache_row(step_jit.self_k_cache_mut().context(JitSnafu)?, row, self_row_stride, &lane.self_k_cache)?;
+                    copyin_cache_row(step_jit.self_v_cache_mut().context(JitSnafu)?, row, self_row_stride, &lane.self_v_cache)?;
+                    copyin_cache_row(step_jit.cross_k_mut().context(JitSnafu)?, row, cross_row_stride, &lane.cross_k)?;
+                    copyin_cache_row(step_jit.cross_v_mut().context(JitSnafu)?, row, cross_row_stride, &lane.cross_v)?;
+                }
+                Some(old_row) if old_row != row => {
+                    let grown_bytes = lane.pos * lane.per_pos_bytes();
+                    let new_self_off = row * self_row_stride * std::mem::size_of::<f32>();
+                    let old_self_off = old_row * self_row_stride * std::mem::size_of::<f32>();
+                    copy_cache_row_device(step_jit.self_k_cache_mut().context(JitSnafu)?, new_self_off, old_self_off, grown_bytes)?;
+                    copy_cache_row_device(step_jit.self_v_cache_mut().context(JitSnafu)?, new_self_off, old_self_off, grown_bytes)?;
+                    // Cross cache is static after prefill — copy the full row.
+                    let cross_bytes = N_AUDIO_CTX * lane.per_pos_bytes();
+                    let new_cross_off = row * cross_row_stride * std::mem::size_of::<f32>();
+                    let old_cross_off = old_row * cross_row_stride * std::mem::size_of::<f32>();
+                    copy_cache_row_device(step_jit.cross_k_mut().context(JitSnafu)?, new_cross_off, old_cross_off, cross_bytes)?;
+                    copy_cache_row_device(step_jit.cross_v_mut().context(JitSnafu)?, new_cross_off, old_cross_off, cross_bytes)?;
+                }
+                _ => {}
+            }
+            lane.seeded_row = Some(row);
         }
 
         // One dispatch for all active lanes, rebound to the live count.
@@ -581,22 +622,35 @@ fn write_self_mask_row(jit: &mut WhisperDecoderStepBatchedJit, row: usize, pos: 
     Ok(())
 }
 
-/// Write a full cache buffer (self or cross) into one row of the batched JIT.
-/// `row_stride_floats` is the buffer's per-row capacity (N_TEXT_CTX or
-/// N_AUDIO_CTX positions × per_pos_floats); `data` may be shorter (e.g. only
-/// `init_len` positions populated for the self cache after prefill).
-fn write_cache_row(
-    buf_result: crate::jit::Result<&mut svod_device::Buffer>,
+/// Copy a full cache buffer (self or cross) into one row of a device-local
+/// batched JIT input via the copy engine. `row_stride_floats` is the buffer's
+/// per-row capacity (N_TEXT_CTX or N_AUDIO_CTX positions × per_pos_floats);
+/// `data` may be shorter (e.g. only `init_len` positions populated for the self
+/// cache after prefill). Used for one-time seeding; the cache then grows
+/// on-device via SDMA append.
+fn copyin_cache_row(
+    buf: &mut svod_device::Buffer,
     row: usize,
     row_stride_floats: usize,
     data: &[f32],
 ) -> Result<()> {
-    let buf = buf_result.context(JitSnafu)?;
-    let dst = buf.as_host_bytes_mut().context(DeviceSnafu)?;
     let off = row * row_stride_floats * std::mem::size_of::<f32>();
     let bytes: &[u8] = bytemuck::cast_slice(data);
-    dst[off..off + bytes.len()].copy_from_slice(bytes);
-    Ok(())
+    buf.copyin_at(off, bytes).context(DeviceSnafu)
+}
+
+/// On-device cache row relocation for lane compaction. When an earlier lane
+/// drops out, later lanes shift down — their grown caches move with them via
+/// `Buffer::copy_within` (SDMA, no host round-trip). Used instead of re-seeding
+/// from the stale host Vec, which only holds the prefill prefix and would
+/// clobber positions [init_len, pos) grown by prior SDMA appends.
+fn copy_cache_row_device(
+    buf: &mut svod_device::Buffer,
+    new_off: usize,
+    old_off: usize,
+    len: usize,
+) -> Result<()> {
+    buf.copy_within(new_off, old_off, len).context(DeviceSnafu)
 }
 
 /// Read one lane's logits row `[n_vocab]` from the batched JIT output.
@@ -742,8 +796,8 @@ pub fn beam_decode_cached(
 
         // Reorder cache by parent_map (host-side, copies ENTIRE cache incl new K/V)
         if !parent_map.is_empty() {
-            reorder_cache_host(step_jit.self_k_cache_mut(), &parent_map, per_beam_floats)?;
-            reorder_cache_host(step_jit.self_v_cache_mut(), &parent_map, per_beam_floats)?;
+            reorder_cache_host(step_jit.self_k_cache_mut().context(JitSnafu)?, &parent_map, per_beam_floats)?;
+            reorder_cache_host(step_jit.self_v_cache_mut().context(JitSnafu)?, &parent_map, per_beam_floats)?;
         }
 
         beams = new_beams;
@@ -816,10 +870,10 @@ struct DecodeCtx {
 
 impl DecodeCtx {
     fn write_caches_greedy(&self, step_jit: &mut WhisperDecoderStepJit) -> Result<()> {
-        write_f32_input(step_jit.self_k_cache_mut(), &self.self_k_cache)?;
-        write_f32_input(step_jit.self_v_cache_mut(), &self.self_v_cache)?;
-        write_f32_input(step_jit.cross_k_mut(), &self.cross_k)?;
-        write_f32_input(step_jit.cross_v_mut(), &self.cross_v)?;
+        copyin_cache_full(step_jit.self_k_cache_mut().context(JitSnafu)?, &self.self_k_cache)?;
+        copyin_cache_full(step_jit.self_v_cache_mut().context(JitSnafu)?, &self.self_v_cache)?;
+        copyin_cache_full(step_jit.cross_k_mut().context(JitSnafu)?, &self.cross_k)?;
+        copyin_cache_full(step_jit.cross_v_mut().context(JitSnafu)?, &self.cross_v)?;
         Ok(())
     }
 
@@ -833,10 +887,10 @@ impl DecodeCtx {
         let layer_heads_dh = self.self_k_cache.len() / self.init_len;
         let self_stride = n_text_ctx * layer_heads_dh;
         let cross_stride = n_audio_ctx * layer_heads_dh;
-        write_replicated_cache(step_jit.self_k_cache_mut(), &self.self_k_cache, beam_size, self_stride)?;
-        write_replicated_cache(step_jit.self_v_cache_mut(), &self.self_v_cache, beam_size, self_stride)?;
-        write_replicated_cache(step_jit.cross_k_mut(), &self.cross_k, beam_size, cross_stride)?;
-        write_replicated_cache(step_jit.cross_v_mut(), &self.cross_v, beam_size, cross_stride)?;
+        copyin_replicated_cache(step_jit.self_k_cache_mut().context(JitSnafu)?, &self.self_k_cache, beam_size, self_stride)?;
+        copyin_replicated_cache(step_jit.self_v_cache_mut().context(JitSnafu)?, &self.self_v_cache, beam_size, self_stride)?;
+        copyin_replicated_cache(step_jit.cross_k_mut().context(JitSnafu)?, &self.cross_k, beam_size, cross_stride)?;
+        copyin_replicated_cache(step_jit.cross_v_mut().context(JitSnafu)?, &self.cross_v, beam_size, cross_stride)?;
         Ok(())
     }
 
@@ -864,7 +918,7 @@ impl DecodeCtx {
             for bi in 0..beam_size {
                 packed[bi * self.n_state..(bi + 1) * self.n_state].copy_from_slice(emb);
             }
-            write_f32_input(step_jit.pos_emb_mut(), &packed)?;
+            write_f32_input(step_jit.pos_emb_mut().context(JitSnafu)?, &packed)?;
         }
         write_self_mask(step_jit, pos, n_text_ctx, beam_size)
     }
@@ -1086,35 +1140,45 @@ fn read_buf(buf: &svod_device::Buffer, n: usize) -> Result<Vec<f32>> {
     Ok(bytemuck::cast_slice(&src[..n * std::mem::size_of::<f32>()]).to_vec())
 }
 
-fn write_f32_input(buf_result: crate::jit::Result<&mut svod_device::Buffer>, data: &[f32]) -> Result<()> {
-    let buf = buf_result.context(JitSnafu)?;
+fn write_f32_input(buf: &mut svod_device::Buffer, data: &[f32]) -> Result<()> {
     write_buf(buf, bytemuck::cast_slice(data))
 }
 
-fn write_replicated_cache(
-    buf_result: crate::jit::Result<&mut svod_device::Buffer>,
+/// Copy a host `&[f32]` into a device-local cache buffer via the copy engine.
+/// The cache buffers are device-local (no host mapping); the greedy path writes
+/// from byte 0 (single-row buffer, data may be shorter than the full allocation).
+fn copyin_cache_full(buf: &mut svod_device::Buffer, data: &[f32]) -> Result<()> {
+    let bytes: &[u8] = bytemuck::cast_slice(data);
+    buf.copyin_at(0, bytes).context(DeviceSnafu)
+}
+
+fn copyin_replicated_cache(
+    buf: &mut svod_device::Buffer,
     single_data: &[f32],
     beam_size: usize,
     per_beam_floats: usize,
 ) -> Result<()> {
-    let buf = buf_result.context(JitSnafu)?;
     let n = single_data.len().min(per_beam_floats);
     let total = per_beam_floats * beam_size;
     let mut packed = vec![0f32; total];
     for bi in 0..beam_size {
         packed[bi * per_beam_floats..bi * per_beam_floats + n].copy_from_slice(&single_data[..n]);
     }
-    write_buf(buf, bytemuck::cast_slice(&packed))
+    buf.copyin_at(0, bytemuck::cast_slice(&packed)).context(DeviceSnafu)
 }
 
 fn reorder_cache_host(
-    buf_result: crate::jit::Result<&mut svod_device::Buffer>,
+    buf: &mut svod_device::Buffer,
     parent_map: &[usize],
     per_beam_floats: usize,
 ) -> Result<()> {
-    let buf = buf_result.context(JitSnafu)?;
     let total = per_beam_floats * parent_map.len();
-    let current = read_buf(buf, total)?;
+    // Device-local cache: read out via copyout_prefix, reorder on host, write
+    // back via copyin_at. This is the beam-reorder path (runs once per step
+    // when beams survive/drop), not the per-step hot loop.
+    let mut staging = vec![0u8; total * std::mem::size_of::<f32>()];
+    buf.copyout_prefix(&mut staging).context(DeviceSnafu)?;
+    let current: &[f32] = bytemuck::cast_slice(&staging);
 
     let mut reordered = vec![0f32; total];
     for (new_idx, &parent_idx) in parent_map.iter().enumerate() {
@@ -1122,7 +1186,7 @@ fn reorder_cache_host(
         reordered[dst..dst + per_beam_floats].copy_from_slice(&current[src..src + per_beam_floats]);
     }
 
-    write_buf(buf, bytemuck::cast_slice(&reordered))
+    buf.copyin_at(0, bytemuck::cast_slice(&reordered)).context(DeviceSnafu)
 }
 
 // ─── Logit filter helpers ───────────────────────────────────────────────────
