@@ -76,3 +76,32 @@ jit_wrapper! {
         }
     }
 }
+
+// Continuous-batching step JIT: same single-token forward, but with the batch
+// dimension exposed as a JIT variable `b`. One plan compiled at `max_batch`
+// serves any `b ∈ [1, max_batch]` via `execute_with_vars(&[("b", n)])` — no
+// recompilation per lane count. This is the substrate for batching decode
+// steps across multiple windows/tasks.
+jit_wrapper! {
+    WhisperDecoderStepBatchedJit(Whisper) {
+        token: Tensor,
+        pos_emb: Tensor,
+        self_k_cache: Tensor,
+        self_v_cache: Tensor,
+        cross_k: Tensor,
+        cross_v: Tensor,
+        self_mask: Tensor,
+
+        vars {
+            // Default upper bound; override with `.with_b_bound(max)` after
+            // `new()` to set the real continuous-batching lane capacity.
+            b: (1, 8),
+        }
+
+        outputs { logits, new_self_k, new_self_v }
+
+        build(token, pos_emb, self_k_cache, self_v_cache, cross_k, cross_v, self_mask, b) {
+            model.decode_step_batched(token, pos_emb, self_k_cache, self_v_cache, cross_k, cross_v, self_mask, &b)
+        }
+    }
+}

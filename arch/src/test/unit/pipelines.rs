@@ -100,8 +100,9 @@ fn transcribe_chunks_slices_decode_windows_crops_and_stitches() {
             Transcript {
                 text: String::new(),
                 words: vec![word("pre", 1.0, 3.0), word("a1", 6.0, 8.0), word("post", 16.0, 18.0)],
+                ..Default::default()
             },
-            Transcript { text: String::new(), words: vec![word("b1", 3.0, 5.0)] },
+            Transcript { text: String::new(), words: vec![word("b1", 3.0, 5.0)], ..Default::default() },
         ],
     };
     let out = asr.transcribe_chunks(&waveform, &chunks, RunOptions { words: true, profile: false }).unwrap();
@@ -142,7 +143,7 @@ fn transcribe_chunks_omits_words_when_not_wanted() {
     let waveform = vec![0.0_f32; 20];
     let chunks = vec![AudioChunk::new(0, 10)];
     let mut asr =
-        PresetTranscriber { out: vec![Transcript { text: String::new(), words: vec![word("hi", 1.0, 2.0)] }] };
+        PresetTranscriber { out: vec![Transcript { text: String::new(), words: vec![word("hi", 1.0, 2.0)], ..Default::default() }] };
     // default options → words: false, so cropped words are not surfaced.
     let out = asr.transcribe_chunks_default(&waveform, &chunks).unwrap();
     assert_eq!(out.text, "hi");
@@ -200,9 +201,9 @@ fn asr_composes_split_and_transcribe() {
     let splitter = FixedLengthSplitter::new(10, 1);
     let transcriber = PresetTranscriber {
         out: vec![
-            Transcript { text: String::new(), words: vec![word("one", 1.0, 2.0)] },
-            Transcript { text: String::new(), words: vec![word("two", 1.0, 2.0)] },
-            Transcript { text: String::new(), words: vec![word("three", 1.0, 2.0)] },
+            Transcript { text: String::new(), words: vec![word("one", 1.0, 2.0)], ..Default::default() },
+            Transcript { text: String::new(), words: vec![word("two", 1.0, 2.0)], ..Default::default() },
+            Transcript { text: String::new(), words: vec![word("three", 1.0, 2.0)], ..Default::default() },
         ],
     };
     let mut asr = Asr::new(splitter, transcriber);
@@ -232,7 +233,7 @@ impl Transcriber for ProfilingTranscriber {
             p.push(svod_runtime::StageProfile::host("decode", std::time::Duration::from_millis(1)));
             p
         });
-        Ok((Transcript { text: "x".to_string(), words: Vec::new() }, prof))
+        Ok((Transcript { text: "x".to_string(), words: Vec::new(), ..Default::default() }, prof))
     }
 }
 
@@ -271,7 +272,7 @@ fn asr_surfaces_split_stage_even_when_transcriber_does_not() {
     // surfaces on its own.
     let splitter = VadSplitter::new(MockVad { probs: vec![1.0; 4], samples_per_prob: 1 }, fast_chunker_opts());
     let transcriber =
-        PresetTranscriber { out: vec![Transcript { text: String::new(), words: vec![word("a", 1.0, 2.0)] }] };
+        PresetTranscriber { out: vec![Transcript { text: String::new(), words: vec![word("a", 1.0, 2.0)], ..Default::default() }] };
     let mut asr = Asr::new(splitter, transcriber);
     let out = asr.transcribe(&[0.0_f32; 4], RunOptions { words: false, profile: true }).unwrap();
     let profile = out.profile.expect("vad-only profile surfaces");

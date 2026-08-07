@@ -2,7 +2,8 @@
 
 use snafu::ResultExt;
 use svod_dtype::DType;
-use svod_tensor::Tensor;
+use svod_ir::SInt;
+use svod_tensor::{BoundVariable, Tensor};
 
 use crate::init::fan_in_uniform;
 use crate::state::{self, HasStateDict, StateDict, get_tensor, prefixed};
@@ -476,6 +477,175 @@ impl TextDecoder {
         })?;
         let logits =
             logits.try_reshape(&[svod_ir::SInt::Const(batch), svod_ir::SInt::Const(n_vocab)]).context(TensorSnafu)?;
+
+        Ok((logits, new_k_flat, new_v_flat))
+    }
+
+    /// Symbolic-batch variant of [`forward_step`](Self::forward_step).
+    ///
+    /// Identical computation, but the batch dimension is a JIT `Variable`
+    /// (`b`) rather than a constant inferred from `token`. Every batched
+    /// input is shrunk to `b` on dim 0 so a plan compiled at `max_batch`
+    /// serves any `b ∈ [1, max_batch]` via `execute_with_vars`.
+    ///
+    /// This is the entry point for continuous batching: the step JIT
+    /// compiles once and is rebound to the live lane count each dispatch.
+    /// The non-batched `forward_step` is unchanged for the existing
+    /// per-beam-size plans.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_step_batched(
+        &self,
+        token: &Tensor,
+        pos_emb: &Tensor,
+        self_k_cache: &Tensor,
+        self_v_cache: &Tensor,
+        cross_k: &Tensor,
+        cross_v: &Tensor,
+        self_mask: &Tensor,
+        b: &BoundVariable,
+    ) -> Result<(Tensor, Tensor, Tensor)> {
+        let n_head = self.n_head;
+        let n_layer = self.blocks.len();
+        let d_head = self.n_state / n_head;
+        let bv = b.as_sint();
+
+        // Shrink every batched input to `b` on dim 0. The JIT buffers are
+        // sized for `max_batch`; this makes the live rows a symbolic slice
+        // that flows through the whole graph as a `DefineVar`.
+        let token = token.try_shrink([Some((SInt::Const(0), bv.clone())), None]).context(TensorSnafu)?;
+        let pos_emb = pos_emb.try_shrink([Some((SInt::Const(0), bv.clone())), None, None]).context(TensorSnafu)?;
+        let self_k_cache =
+            self_k_cache.try_shrink([Some((SInt::Const(0), bv.clone())), None, None, None]).context(TensorSnafu)?;
+        let self_v_cache =
+            self_v_cache.try_shrink([Some((SInt::Const(0), bv.clone())), None, None, None]).context(TensorSnafu)?;
+        let cross_k =
+            cross_k.try_shrink([Some((SInt::Const(0), bv.clone())), None, None, None]).context(TensorSnafu)?;
+        let cross_v =
+            cross_v.try_shrink([Some((SInt::Const(0), bv.clone())), None, None, None]).context(TensorSnafu)?;
+        let self_mask =
+            self_mask.try_shrink([Some((SInt::Const(0), bv.clone())), None, None, None]).context(TensorSnafu)?;
+
+        // Embed single token + positional embedding
+        let tok_emb = self.token_embedding.embedding(&token).context(TensorSnafu)?;
+        let x = tok_emb.try_add(&pos_emb).context(TensorSnafu)?;
+        let x = x.cast(self_k_cache.uop().dtype()).context(TensorSnafu)?;
+
+        let mut x = x;
+        let mut new_ks: Vec<Tensor> = Vec::with_capacity(n_layer);
+        let mut new_vs: Vec<Tensor> = Vec::with_capacity(n_layer);
+
+        for (l, block) in self.blocks.iter().enumerate() {
+            let lh_start = l * n_head;
+            let lh_end = (l + 1) * n_head;
+
+            // ── Self-attn with cache ─────────────────────────────────────
+            let h = block.attn_ln.apply(&x)?;
+            let q = block.attn.query.forward(&h)?;
+            let new_k_raw = block.attn.key.forward(&h)?;
+            let new_v_raw = block.attn.value.forward(&h)?;
+
+            let q_h = block.attn.split_heads(&q)?;
+            let new_k_h = block.attn.split_heads(&new_k_raw)?;
+            let new_v_h = block.attn.split_heads(&new_v_raw)?;
+
+            let cached_k = self_k_cache
+                .try_shrink([None, None, Some((lh_start as isize, lh_end as isize)), None])
+                .context(TensorSnafu)?
+                .try_permute(&[0, 2, 1, 3])
+                .context(TensorSnafu)?;
+            let cached_v = self_v_cache
+                .try_shrink([None, None, Some((lh_start as isize, lh_end as isize)), None])
+                .context(TensorSnafu)?
+                .try_permute(&[0, 2, 1, 3])
+                .context(TensorSnafu)?;
+
+            let full_k = Tensor::cat(&[&cached_k, &new_k_h], 2).context(TensorSnafu)?;
+            let full_v = Tensor::cat(&[&cached_v, &new_v_h], 2).context(TensorSnafu)?;
+
+            let out = q_h
+                .scaled_dot_product_attention()
+                .key(&full_k)
+                .value(&full_v)
+                .attn_mask(&self_mask)
+                .is_causal(false)
+                .call()
+                .context(TensorSnafu)?;
+            let attn_out = block.attn.merge_heads(&out)?;
+            let attn_out = block.attn.out.forward(&attn_out)?;
+            x = x.try_add(&attn_out).context(TensorSnafu)?;
+
+            // ── Cross-attn (fixed cache, no mask) ────────────────────────
+            let h = block.cross_attn_ln.apply(&x)?;
+            let cq = block.cross_attn.query.forward(&h)?;
+            let cq_h = block.cross_attn.split_heads(&cq)?;
+
+            let layer_ck = cross_k
+                .try_shrink([None, None, Some((lh_start as isize, lh_end as isize)), None])
+                .context(TensorSnafu)?
+                .try_permute(&[0, 2, 1, 3])
+                .context(TensorSnafu)?;
+            let layer_cv = cross_v
+                .try_shrink([None, None, Some((lh_start as isize, lh_end as isize)), None])
+                .context(TensorSnafu)?
+                .try_permute(&[0, 2, 1, 3])
+                .context(TensorSnafu)?;
+
+            let cross_out = cq_h
+                .scaled_dot_product_attention()
+                .key(&layer_ck)
+                .value(&layer_cv)
+                .is_causal(false)
+                .call()
+                .context(TensorSnafu)?;
+            let cross_out = block.cross_attn.merge_heads(&cross_out)?;
+            let cross_out = block.cross_attn.out.forward(&cross_out)?;
+            x = x.try_add(&cross_out).context(TensorSnafu)?;
+
+            // ── MLP ───────────────────────────────────────────────────────
+            let h = block.mlp_ln.apply(&x)?;
+            let h = h.linear().weight(&block.mlp0_w).bias(&block.mlp0_b).call().context(TensorSnafu)?;
+            let h = h.gelu_exact().context(TensorSnafu)?;
+            let h = h.linear().weight(&block.mlp1_w).bias(&block.mlp1_b).call().context(TensorSnafu)?;
+            x = x.try_add(&h).context(TensorSnafu)?;
+
+            new_ks.push(new_k_h);
+            new_vs.push(new_v_h);
+        }
+
+        // Permute + cat new K/V. Batch is symbolic here (`bv`), so the
+        // reshape uses `bv` instead of `SInt::Const(batch)` — this is the
+        // key difference from `forward_step`.
+        let permuted_ks: Vec<Tensor> =
+            new_ks.iter().map(|t| t.try_permute(&[0, 2, 1, 3]).context(TensorSnafu)).collect::<Result<Vec<_>>>()?;
+        let permuted_vs: Vec<Tensor> =
+            new_vs.iter().map(|t| t.try_permute(&[0, 2, 1, 3]).context(TensorSnafu)).collect::<Result<Vec<_>>>()?;
+
+        let stacked_k = Tensor::cat(&permuted_ks.iter().collect::<Vec<_>>(), 1).context(TensorSnafu)?;
+        let stacked_v = Tensor::cat(&permuted_vs.iter().collect::<Vec<_>>(), 1).context(TensorSnafu)?;
+
+        let new_k_flat = stacked_k
+            .try_reshape(&[bv.clone(), SInt::Const(1usize), SInt::Const(n_layer * n_head), SInt::Const(d_head)])
+            .context(TensorSnafu)?;
+        let new_v_flat = stacked_v
+            .try_reshape(&[bv.clone(), SInt::Const(1usize), SInt::Const(n_layer * n_head), SInt::Const(d_head)])
+            .context(TensorSnafu)?;
+        let x = self.ln.apply(&x)?;
+        let logits = x
+            .linear()
+            .weight(&self.token_embedding)
+            .call()
+            .context(TensorSnafu)?
+            .cast(DType::Float32)
+            .context(TensorSnafu)?;
+
+        let n_vocab = self.token_embedding.shape().context(TensorSnafu)?[0].as_const().ok_or_else(|| {
+            super::error::Error::Tensor {
+                source: Box::new(svod_tensor::error::Error::SymbolicShapeUnsupported {
+                    operation: "forward_step_batched n_vocab".into(),
+                }),
+            }
+        })?;
+        let logits = logits.try_reshape(&[bv, SInt::Const(n_vocab)]).context(TensorSnafu)?;
 
         Ok((logits, new_k_flat, new_v_flat))
     }

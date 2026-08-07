@@ -1,6 +1,6 @@
 //! Whisper model composite: encoder + decoder + dimensions.
 
-use svod_tensor::Tensor;
+use svod_tensor::{BoundVariable, Tensor};
 
 use crate::state::{self, HasStateDict, StateDict, prefixed};
 
@@ -67,6 +67,25 @@ impl Whisper {
         self_mask: &Tensor,
     ) -> Result<(Tensor, Tensor, Tensor)> {
         self.decoder.forward_step(token, pos_emb, self_k_cache, self_v_cache, cross_k, cross_v, self_mask)
+    }
+
+    /// Symbolic-batch single-token step for continuous batching. `b` is a
+    /// JIT variable; the compiled plan is rebound to the live lane count at
+    /// execute time. See [`TextDecoder::forward_step_batched`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn decode_step_batched(
+        &self,
+        token: &Tensor,
+        pos_emb: &Tensor,
+        self_k_cache: &Tensor,
+        self_v_cache: &Tensor,
+        cross_k: &Tensor,
+        cross_v: &Tensor,
+        self_mask: &Tensor,
+        b: &BoundVariable,
+    ) -> Result<(Tensor, Tensor, Tensor)> {
+        self.decoder
+            .forward_step_batched(token, pos_emb, self_k_cache, self_v_cache, cross_k, cross_v, self_mask, b)
     }
 
     /// Full forward: encode + decode.

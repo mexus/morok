@@ -1,8 +1,9 @@
 //! KV-cached Whisper decoder: greedy, beam search, temperature fallback,
 //! and language detection — matching `whisper.decoding`.
 
+use super::config::N_AUDIO_CTX;
 use super::error::{DeviceSnafu, Error, JitSnafu, Result, TensorSnafu};
-use super::jit::{WhisperDecoderJit, WhisperDecoderStepJit, WhisperPrefillJit};
+use super::jit::{WhisperDecoderJit, WhisperDecoderStepBatchedJit, WhisperDecoderStepJit, WhisperPrefillJit};
 use super::model::Whisper;
 use super::tokenizer::WhisperTokenizer;
 use snafu::ResultExt;
@@ -318,6 +319,294 @@ pub fn greedy_decode_cached(
     }
 
     finish_decode(&tokens, tokenizer, sum_logprob, no_speech_prob, options)
+}
+
+// ─── Batched (step-locked) greedy decode ────────────────────────────────────
+//
+// The continuous-batching primitive: N lanes each carry independent decode
+// state (one per audio window), and every token step runs as a single batched
+// JIT dispatch across all active lanes. Lanes that hit EOT drop out; the loop
+// ends when no lanes remain. This is the bandwidth-amortizing path — one
+// weight read serves all lanes.
+//
+// `DecodeLane` reuses the same `DecodeCtx` fields (prefill seeds them) and
+// adds the per-step loop state that `greedy_decode_cached` kept as locals.
+
+/// One independent decode (one audio window's greedy decode attempt).
+///
+/// Built by [`DecodeLane::prefill`] from the `[1,4]` prefill JIT; the KV
+/// caches then live in the lane and are packed into the batched step JIT's
+/// `max_lanes`-sized buffers at the lane's row offset each step.
+pub struct DecodeLane {
+    // Static-per-attempt state (set by prefill, read each step)
+    pub initial_tokens: Vec<u32>,
+    pub sample_begin: usize,
+    pub init_len: usize,
+    pub suppress_tokens: Vec<i32>,
+    pub no_speech_prob: f32,
+    pub pos_embedding: Vec<f32>,
+    pub n_state: usize,
+
+    // KV caches — packed into the batched step JIT at this lane's row.
+    // self_k/v grow as tokens decode (one position appended per step via
+    // SDMA writeback); cross_k/v are fixed after prefill.
+    pub self_k_cache: Vec<f32>,
+    pub self_v_cache: Vec<f32>,
+    pub cross_k: Vec<f32>,
+    pub cross_v: Vec<f32>,
+
+    // Per-step loop state (mutated each step)
+    pub next_token: u32,
+    pub tokens: Vec<u32>,
+    pub sum_logprob: f32,
+    pub pos: usize, // current position = init_len + step
+    pub done: bool,
+}
+
+impl DecodeLane {
+    /// Run prefill for one window and build the lane state.
+    ///
+    /// `audio_raw` is the encoder output for this window, flat
+    /// `[N_AUDIO_CTX * n_audio_state]` f32 (the slice the existing
+    /// `decode_with_fallback_cached` passes to `init_decode`).
+    pub fn prefill(
+        prefill_jit: &mut WhisperPrefillJit,
+        tokenizer: &WhisperTokenizer,
+        options: &DecodeOptions,
+        n_text_ctx: usize,
+        n_vocab: usize,
+        pos_embedding: &[f32],
+        n_state: usize,
+    ) -> Result<Self> {
+        let ctx = init_decode(prefill_jit, tokenizer, options, n_text_ctx, n_vocab, pos_embedding, n_state)?;
+
+        // First token from prefill logits (mirrors greedy_decode_cached:260-278)
+        let last_logits = &ctx.prefill_logits[(ctx.init_len - 1) * n_vocab..ctx.init_len * n_vocab];
+        let mut filtered = last_logits.to_vec();
+        apply_logit_filters(
+            &mut filtered,
+            tokenizer,
+            options,
+            &ctx.initial_tokens,
+            ctx.sample_begin,
+            0,
+            &ctx.suppress_tokens,
+        );
+        let next_token = pick_token(&filtered, options.temperature);
+        let sum_logprob = log_softmax(&filtered, next_token as usize);
+
+        let mut tokens = Vec::new();
+        if next_token != tokenizer.eot() {
+            tokens.push(next_token);
+        }
+
+        Ok(Self {
+            initial_tokens: ctx.initial_tokens,
+            sample_begin: ctx.sample_begin,
+            init_len: ctx.init_len,
+            suppress_tokens: ctx.suppress_tokens,
+            no_speech_prob: ctx.no_speech_prob,
+            pos_embedding: ctx.pos_embedding,
+            n_state: ctx.n_state,
+            self_k_cache: ctx.self_k_cache,
+            self_v_cache: ctx.self_v_cache,
+            cross_k: ctx.cross_k,
+            cross_v: ctx.cross_v,
+            next_token,
+            tokens,
+            sum_logprob,
+            pos: ctx.init_len, // first step decodes at init_len
+            done: next_token == tokenizer.eot(),
+        })
+    }
+
+    /// Per-position floats in the self cache: `n_layer * n_head * d_head`.
+    fn per_pos_floats(&self) -> usize {
+        self.self_k_cache.len() / self.init_len
+    }
+
+    fn per_pos_bytes(&self) -> usize {
+        self.per_pos_floats() * std::mem::size_of::<f32>()
+    }
+
+    pub fn finish(self, tokenizer: &WhisperTokenizer, options: &DecodeOptions) -> Result<DecodeResult> {
+        finish_decode(&self.tokens, tokenizer, self.sum_logprob, self.no_speech_prob, options)
+    }
+}
+
+/// Step-locked batched greedy decode: advances every active lane by one token
+/// per JIT dispatch, until all lanes are `done` or hit `sample_len`.
+///
+/// Each lane occupies a fixed row (`lane_idx`) in the batched step JIT's
+/// buffers; inactive lanes are skipped. The plan is rebound to the active
+/// count each dispatch via `execute_with_vars(&[("b", active)])`.
+#[allow(clippy::too_many_arguments)]
+pub fn run_batched_decode(
+    lanes: &mut [DecodeLane],
+    step_jit: &mut WhisperDecoderStepBatchedJit,
+    tokenizer: &WhisperTokenizer,
+    options: &DecodeOptions,
+    n_text_ctx: usize,
+    n_vocab: usize,
+) -> Result<()> {
+    let sample_len = options.sample_len.unwrap_or(n_text_ctx / 2);
+    let eot = tokenizer.eot();
+    let n_state = lanes.first().map(|l| l.n_state).unwrap_or(0);
+
+    loop {
+        // Collect the active (not-done, not-at-sample_len) lanes by index.
+        let active: Vec<usize> = lanes
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| !l.done && l.tokens.len() < sample_len && l.next_token != eot)
+            .map(|(i, _)| i)
+            .collect();
+        if active.is_empty() {
+            break;
+        }
+        let active_count = active.len();
+
+        // Per-position float count and buffer row strides. All lanes share
+        // the same structural dims, so read them from the first active lane.
+        let per_pos_floats = lanes[active[0]].per_pos_floats();
+        let self_row_stride = n_text_ctx * per_pos_floats; // [max_lanes, N_TEXT_CTX, ...]
+        let cross_row_stride = N_AUDIO_CTX * per_pos_floats; // [max_lanes, N_AUDIO_CTX, ...]
+
+        // Pack each active lane's inputs into the batched JIT at its row.
+        // Rows are contiguous: active lane `j` (j=0..active_count) maps to
+        // row `j` in the [active_count, ...] dispatch.
+        for (row, &lane_idx) in active.iter().enumerate() {
+            let lane = &lanes[lane_idx];
+            write_token_row(step_jit, row, lane.next_token)?;
+            write_pos_emb_row(step_jit, row, &lane.pos_embedding[lane.pos * n_state..(lane.pos + 1) * n_state])?;
+            write_self_mask_row(step_jit, row, lane.pos, n_text_ctx)?;
+            write_cache_row(step_jit.self_k_cache_mut(), row, self_row_stride, &lane.self_k_cache)?;
+            write_cache_row(step_jit.self_v_cache_mut(), row, self_row_stride, &lane.self_v_cache)?;
+            write_cache_row(step_jit.cross_k_mut(), row, cross_row_stride, &lane.cross_k)?;
+            write_cache_row(step_jit.cross_v_mut(), row, cross_row_stride, &lane.cross_v)?;
+        }
+
+        // One dispatch for all active lanes, rebound to the live count.
+        step_jit.execute_with_vars(&[("b", active_count as i64)]).context(JitSnafu)?;
+
+        // Per-lane teardown: SDMA-writeback new K/V, read logits, pick token.
+        for (row, &lane_idx) in active.iter().enumerate() {
+            let lane = &mut lanes[lane_idx];
+
+            // Device-side K/V copy: append this step's new K/V at lane.pos.
+            // Input buffer is [max_lanes, N_TEXT_CTX, ...]; this lane's row
+            // starts at row*N_TEXT_CTX*per_pos_floats*4, position `pos` within
+            // that row. Output buffer is [active_count, 1, ...]; the `row`-th
+            // lane's new K/V is at row*per_pos_floats*4.
+            let per_pos_b = lane.per_pos_bytes();
+            let dst_base = row * self_row_stride * std::mem::size_of::<f32>();
+            let dst_off = dst_base + lane.pos * per_pos_b;
+            let src_off = row * per_pos_b;
+            step_jit
+                .copy_output_to_self_k_cache(1, dst_off, src_off, per_pos_b)
+                .context(JitSnafu)?;
+            step_jit
+                .copy_output_to_self_v_cache(2, dst_off, src_off, per_pos_b)
+                .context(JitSnafu)?;
+
+            // Read this lane's logits row and pick the next token.
+            let logits = read_logits_row(step_jit, row, n_vocab)?;
+            let all_toks: Vec<u32> = lane.initial_tokens.iter().copied().chain(lane.tokens.iter().copied()).collect();
+            let step = lane.pos + 1 - lane.init_len;
+            let mut filtered = logits;
+            apply_logit_filters(
+                &mut filtered,
+                tokenizer,
+                options,
+                &all_toks,
+                lane.sample_begin,
+                step,
+                &lane.suppress_tokens,
+            );
+            lane.next_token = pick_token(&filtered, options.temperature);
+            lane.sum_logprob += log_softmax(&filtered, lane.next_token as usize);
+
+            if lane.next_token != eot {
+                lane.tokens.push(lane.next_token);
+            }
+            lane.pos += 1;
+            if lane.next_token == eot || lane.tokens.len() >= sample_len {
+                lane.done = true;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+// ─── Batched JIT buffer row helpers ─────────────────────────────────────────
+//
+// The batched step JIT owns max_lanes-sized buffers; each lane writes/reads
+// its row. These wrap the per-row slicing so the main loop stays readable.
+
+fn write_token_row(jit: &mut WhisperDecoderStepBatchedJit, row: usize, token: u32) -> Result<()> {
+    let buf = jit.token_mut().context(JitSnafu)?;
+    let dst = buf.as_host_bytes_mut().context(DeviceSnafu)?;
+    // token is [max_lanes, 1] i32; row stride = 4 bytes
+    let off = row * std::mem::size_of::<i32>();
+    let tok = [token as i32];
+    let bytes: &[u8] = bytemuck::cast_slice(&tok);
+    dst[off..off + bytes.len()].copy_from_slice(bytes);
+    Ok(())
+}
+
+fn write_pos_emb_row(jit: &mut WhisperDecoderStepBatchedJit, row: usize, emb: &[f32]) -> Result<()> {
+    let buf = jit.pos_emb_mut().context(JitSnafu)?;
+    let dst = buf.as_host_bytes_mut().context(DeviceSnafu)?;
+    // pos_emb is [max_lanes, 1, n_state] f32
+    let off = row * emb.len() * std::mem::size_of::<f32>();
+    let bytes: &[u8] = bytemuck::cast_slice(emb);
+    dst[off..off + bytes.len()].copy_from_slice(bytes);
+    Ok(())
+}
+
+fn write_self_mask_row(jit: &mut WhisperDecoderStepBatchedJit, row: usize, pos: usize, n_text_ctx: usize) -> Result<()> {
+    let buf = jit.self_mask_mut().context(JitSnafu)?;
+    let dst = buf.as_host_bytes_mut().context(DeviceSnafu)?;
+    // mask is [max_lanes, 1, 1, n_text_ctx + 1]; row stride = (n_text_ctx+1)*4
+    let stride = (n_text_ctx + 1) * std::mem::size_of::<f32>();
+    let off = row * stride;
+    // [0..pos) = 0.0 (attend), [pos..n_text_ctx) = -inf (mask), [n_text_ctx] = 0.0
+    let mut mask = vec![0f32; n_text_ctx + 1];
+    for v in &mut mask[pos..n_text_ctx] {
+        *v = f32::NEG_INFINITY;
+    }
+    let bytes: &[u8] = bytemuck::cast_slice(&mask);
+    dst[off..off + bytes.len()].copy_from_slice(bytes);
+    Ok(())
+}
+
+/// Write a full cache buffer (self or cross) into one row of the batched JIT.
+/// `row_stride_floats` is the buffer's per-row capacity (N_TEXT_CTX or
+/// N_AUDIO_CTX positions × per_pos_floats); `data` may be shorter (e.g. only
+/// `init_len` positions populated for the self cache after prefill).
+fn write_cache_row(
+    buf_result: crate::jit::Result<&mut svod_device::Buffer>,
+    row: usize,
+    row_stride_floats: usize,
+    data: &[f32],
+) -> Result<()> {
+    let buf = buf_result.context(JitSnafu)?;
+    let dst = buf.as_host_bytes_mut().context(DeviceSnafu)?;
+    let off = row * row_stride_floats * std::mem::size_of::<f32>();
+    let bytes: &[u8] = bytemuck::cast_slice(data);
+    dst[off..off + bytes.len()].copy_from_slice(bytes);
+    Ok(())
+}
+
+/// Read one lane's logits row `[n_vocab]` from the batched JIT output.
+fn read_logits_row(jit: &mut WhisperDecoderStepBatchedJit, row: usize, n_vocab: usize) -> Result<Vec<f32>> {
+    let buf = jit.logits().context(JitSnafu)?;
+    let src = buf.as_host_bytes().context(DeviceSnafu)?;
+    let row_floats = n_vocab;
+    let off = row * row_floats * std::mem::size_of::<f32>();
+    let end = off + row_floats * std::mem::size_of::<f32>();
+    Ok(bytemuck::cast_slice(&src[off..end]).to_vec())
 }
 
 // ─── Cached beam search ─────────────────────────────────────────────────────

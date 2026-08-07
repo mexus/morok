@@ -40,6 +40,10 @@ use crate::vad::{AudioChunk, ChunkerOpts, chunks_from_probs, strict_chunk_sample
 pub struct Transcript {
     pub text: String,
     pub words: Vec<Word>,
+    /// Detected/source language code (e.g. `"ru"`) when the transcriber resolves
+    /// one, `None` otherwise. Populated by models that run language detection
+    /// (Whisper); left empty by models that don't.
+    pub language: Option<String>,
 }
 
 /// One speech region's final transcript. `start_sec`/`end_sec` reference the

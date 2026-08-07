@@ -34,14 +34,14 @@ pub use attention::{MultiHeadAttention, causal_mask};
 pub use blocks::{Conv1dWeights, LayerNormWeights, LinearWeights, sinusoids};
 pub use config::{ModelDimensions, WhisperSize};
 pub use decode::{
-    DecodeOptions, DecodeResult, LanguageDetection, beam_decode_cached, decode_with_fallback_cached, detect_language,
-    greedy_decode_cached, greedy_decode_with_alignment,
+    DecodeLane, DecodeOptions, DecodeResult, LanguageDetection, beam_decode_cached, decode_with_fallback_cached,
+    detect_language, greedy_decode_cached, greedy_decode_with_alignment, run_batched_decode,
 };
 pub use decoder::{DecoderBlock, TextDecoder};
 pub use dtw::{WordTiming, dtw, find_alignment_path, median_filter, path_to_word_timings};
 pub use encoder::{AudioEncoder, EncoderBlock};
 pub use error::{Error, Result};
-pub use jit::{WhisperDecoderJit, WhisperDecoderStepJit, WhisperEncoderJit, WhisperPrefillJit};
+pub use jit::{WhisperDecoderJit, WhisperDecoderStepBatchedJit, WhisperDecoderStepJit, WhisperEncoderJit, WhisperPrefillJit};
 pub use mel::WhisperMel;
 pub use model::Whisper;
 pub use tokenizer::WhisperTokenizer;

@@ -428,7 +428,7 @@ impl svod_arch::pipelines::audio::Transcriber for GigaAmTranscriber {
                         t_decode += t_dec.elapsed();
 
                         let words = ctc_frames_to_words(&text, &frames, frame_shift);
-                        transcripts.push(Transcript { text, words });
+                        transcripts.push(Transcript { text, words, ..Default::default() });
                     }
                 }
                 HeadDecoder::Rnnt { .. } => {
@@ -494,7 +494,7 @@ impl svod_arch::pipelines::audio::Transcriber for GigaAmTranscriber {
                     // `frames_to_words` strips the SentencePiece `▁` markers, so
                     // `words_to_text` reconstructs the window transcript.
                     let words = decoder.frames_to_words(&emissions, frame_shift);
-                    transcripts.push(Transcript { text: words_to_text(&words), words });
+                    transcripts.push(Transcript { text: words_to_text(&words), words, ..Default::default() });
                 }
             }
         }
