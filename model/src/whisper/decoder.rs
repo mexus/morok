@@ -456,6 +456,13 @@ impl TextDecoder {
                     operation: "forward_step cache length".into(),
                 }),
             })? + 1;
+        let cross_key_count =
+            cross_k.shape().context(TensorSnafu)?[1].as_const().ok_or_else(|| super::error::Error::Tensor {
+                source: Box::new(svod_tensor::error::Error::SymbolicShapeUnsupported {
+                    operation: "forward_step cross cache length".into(),
+                }),
+            })?;
+        let cross_splits = if cross_key_count >= 1000 && cross_key_count.is_multiple_of(10) { 10 } else { 1 };
 
         // Embed single token + positional embedding
         let tok_emb = self.token_embedding.embedding(token).context(TensorSnafu)?;
@@ -538,17 +545,30 @@ impl TextDecoder {
                 .try_shrink([None, None, Some((lh_start as isize, lh_end as isize)), None])
                 .context(TensorSnafu)?;
 
-            let cq_h = cq_seq.try_permute(&[0, 2, 1, 3]).context(TensorSnafu)?;
-            let layer_ck_h = layer_ck.try_permute(&[0, 2, 1, 3]).context(TensorSnafu)?;
-            let layer_cv_h = layer_cv.try_permute(&[0, 2, 1, 3]).context(TensorSnafu)?;
-            let cross_out = cq_h
-                .scaled_dot_product_attention()
-                .key(&layer_ck_h)
-                .value(&layer_cv_h)
-                .is_causal(false)
-                .call()
-                .context(TensorSnafu)?;
-            let cross_out = block.cross_attn.merge_heads(&cross_out)?;
+            let direct = svod_tk::single_query_attention(
+                &cq_seq,
+                &layer_ck,
+                &layer_cv,
+                svod_tk::SqAttentionOpts { split: cross_splits, ..Default::default() },
+            )
+            .map_err(|e| svod_tensor::error::Error::IrConstruction { details: e.to_string() })
+            .context(TensorSnafu)?;
+            let cross_out = match direct {
+                Some(out) => out.try_reshape([batch, 1, self.n_state]).context(TensorSnafu)?,
+                None => {
+                    let cq_h = cq_seq.try_permute(&[0, 2, 1, 3]).context(TensorSnafu)?;
+                    let layer_ck_h = layer_ck.try_permute(&[0, 2, 1, 3]).context(TensorSnafu)?;
+                    let layer_cv_h = layer_cv.try_permute(&[0, 2, 1, 3]).context(TensorSnafu)?;
+                    let out = cq_h
+                        .scaled_dot_product_attention()
+                        .key(&layer_ck_h)
+                        .value(&layer_cv_h)
+                        .is_causal(false)
+                        .call()
+                        .context(TensorSnafu)?;
+                    block.cross_attn.merge_heads(&out)?
+                }
+            };
             let cross_out = block.cross_attn.out.forward(&cross_out)?;
             x = x.try_add(&cross_out).context(TensorSnafu)?;
 
