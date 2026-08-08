@@ -27,34 +27,34 @@ fn ctc_frames_to_words_single_word() {
 
 #[test]
 fn ctc_frames_to_words_two_words_with_space() {
-    // "hi mom" — space at frame 12 should commit "hi" and start "mom".
+    // "hi mom" — the separator belongs to the following exact fragment.
     let words = ctc_frames_to_words("hi mom", &[5, 6, 12, 20, 21, 22], 0.05);
     assert_eq!(
         words,
         vec![
             Word { text: "hi".to_string(), start: 5.0 * 0.05, end: 7.0 * 0.05 },
-            Word { text: "mom".to_string(), start: 20.0 * 0.05, end: 23.0 * 0.05 },
+            Word { text: " mom".to_string(), start: 20.0 * 0.05, end: 23.0 * 0.05 },
         ]
     );
 }
 
 #[test]
 fn ctc_frames_to_words_leading_and_trailing_spaces() {
-    // " hi " — leading space commits nothing; trailing flushes "hi".
+    // Outer spaces survive in fragments; complete rendering trims them.
     let words = ctc_frames_to_words(" hi ", &[3, 5, 6, 9], 0.04);
-    assert_eq!(words, vec![Word { text: "hi".to_string(), start: 5.0 * 0.04, end: 7.0 * 0.04 }],);
+    assert_eq!(words, vec![Word { text: " hi".to_string(), start: 5.0 * 0.04, end: 7.0 * 0.04 }],);
+    assert_eq!(svod_arch::pipelines::audio::words_to_text(&words), "hi");
 }
 
 #[test]
 fn ctc_frames_to_words_consecutive_spaces() {
-    // "a  b" — two spaces between, second commits an empty pending and is
-    // a no-op.
+    // Consecutive separators are retained on the following fragment.
     let words = ctc_frames_to_words("a  b", &[2, 3, 4, 7], 0.04);
     assert_eq!(
         words,
         vec![
             Word { text: "a".to_string(), start: 2.0 * 0.04, end: 3.0 * 0.04 },
-            Word { text: "b".to_string(), start: 7.0 * 0.04, end: 8.0 * 0.04 },
+            Word { text: "  b".to_string(), start: 7.0 * 0.04, end: 8.0 * 0.04 },
         ]
     );
 }

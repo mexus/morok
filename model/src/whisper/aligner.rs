@@ -147,7 +147,7 @@ impl WhisperAligner {
     }
 }
 
-fn words_from_path(
+pub(crate) fn words_from_path(
     text_indices: &[usize],
     time_indices: &[usize],
     text_tokens: &[u32],
@@ -173,7 +173,7 @@ fn words_from_path(
     timings
         .into_iter()
         .filter(|word| !word.word.trim().is_empty())
-        .map(|word| Word { text: word.word.trim().to_string(), start: word.start, end: word.end })
+        .map(|word| Word { text: word.word, start: word.start, end: word.end })
         .collect()
 }
 

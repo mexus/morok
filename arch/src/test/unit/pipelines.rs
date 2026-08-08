@@ -81,10 +81,18 @@ fn crop_keeps_midpoints_inside_core_and_rebases() {
 }
 
 #[test]
-fn words_to_text_joins_and_drops_empties() {
-    let words = vec![word("hello", 0.0, 0.1), word("", 0.1, 0.1), word("world", 0.2, 0.3)];
-    assert_eq!(words_to_text(&words), "hello world");
+fn words_to_text_concatenates_fragments_and_drops_blanks() {
+    let words =
+        vec![word("  hello", 0.0, 0.1), word("", 0.1, 0.1), word(" \t", 0.1, 0.1), word("  world!  ", 0.2, 0.3)];
+    assert_eq!(words_to_text(&words), "hello  world!");
     assert_eq!(words_to_text(&[]), "");
+}
+
+#[test]
+fn cropped_fragments_reconstruct_without_spacing_heuristics() {
+    let words = vec![word(" prefix", 0.0, 1.0), word(" 23", 2.0, 3.0), word("-м", 3.0, 4.0), word(" доме", 4.0, 5.0)];
+    let cropped = crop_words_to_core(words, 1.5, 4.0);
+    assert_eq!(words_to_text(&cropped), "23-м доме");
 }
 
 // ─── Transcriber::transcribe_chunks default (geometry + crop + stitch) ─────────

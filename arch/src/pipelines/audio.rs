@@ -140,10 +140,17 @@ pub fn crop_segments_to_core(segments: Vec<Segment>, core_offset_sec: f32, core_
         .collect()
 }
 
-/// Join word texts with single spaces (empties dropped). Reconstructs a chunk's
-/// transcript from its (possibly cropped) words.
+/// Concatenate exact word fragments and trim only the complete text boundary.
+/// Whitespace-only fragments are ignored; meaningful internal whitespace stays
+/// exactly where the producing tokenizer placed it.
 pub fn words_to_text(words: &[Word]) -> String {
-    words.iter().map(|w| w.text.as_str()).filter(|s| !s.is_empty()).collect::<Vec<_>>().join(" ")
+    let mut text = String::new();
+    for word in words {
+        if !word.text.trim().is_empty() {
+            text.push_str(&word.text);
+        }
+    }
+    text.trim().to_string()
 }
 
 // ─── VAD ─────────────────────────────────────────────────────────────────────
@@ -398,8 +405,10 @@ pub trait Transcriber {
                 let core_dur = m.end_sec - m.start_sec;
                 let cropped_words = crop_words_to_core(t.words, m.core_offset_sec, core_dur);
                 let cropped_segments = crop_segments_to_core(t.segments, m.core_offset_sec, core_dur);
-                // Prefer the transcriber's text; reconstruct from words only as fallback.
-                let text = if !t.text.is_empty() { t.text } else { words_to_text(&cropped_words) };
+                // Cropped fragments own the core text when available; otherwise
+                // retain models that only provide complete-window text.
+                let text =
+                    if cropped_words.is_empty() { t.text.trim().to_string() } else { words_to_text(&cropped_words) };
                 ChunkResult {
                     start_sec: m.start_sec,
                     end_sec: m.end_sec,

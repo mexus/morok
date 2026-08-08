@@ -81,9 +81,11 @@ pub struct TokenEmission {
     pub frame: usize,
 }
 
-/// A grouped word and its `[start, end)` time span in seconds. Produced by
-/// [`RnntDecoder::frames_to_words`]. Mirrors upstream GigaAM's `Word` dataclass in
-/// `gigaam/types.py`.
+/// An exact transcript fragment and its `[start, end)` time span in seconds.
+///
+/// `text` retains tokenizer-provided boundary whitespace and punctuation.
+/// Concatenate fragments directly, then trim only the complete transcript or
+/// chunk boundary. Whitespace-only fragments are not emitted.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Word {
     pub text: String,
@@ -110,10 +112,9 @@ struct PendingWord {
 
 fn flush_pending(pending: &mut Option<PendingWord>, frame_shift: f32, words: &mut Vec<Word>) {
     let Some(p) = pending.take() else { return };
-    let trimmed = p.text.trim();
-    if !trimmed.is_empty() {
+    if !p.text.trim().is_empty() {
         words.push(Word {
-            text: trimmed.to_string(),
+            text: p.text,
             start: p.first_frame as f32 * frame_shift,
             end: (p.last_frame + 1) as f32 * frame_shift,
         });
@@ -324,6 +325,7 @@ impl RnntDecoder {
 
         let mut words: Vec<Word> = Vec::new();
         let mut pending: Option<PendingWord> = None;
+        let mut separator = String::new();
 
         for e in emissions {
             let piece = match self.vocabulary.get(e.token_id) {
@@ -332,9 +334,12 @@ impl RnntDecoder {
             };
             if let Some(stripped) = piece.strip_prefix(SP_MARK) {
                 flush_pending(&mut pending, frame_shift, &mut words);
-                pending = Some(PendingWord { text: stripped.to_string(), first_frame: e.frame, last_frame: e.frame });
+                separator.clear();
+                let text = if words.is_empty() { stripped.to_string() } else { format!(" {stripped}") };
+                pending = Some(PendingWord { text, first_frame: e.frame, last_frame: e.frame });
             } else if piece == " " {
                 flush_pending(&mut pending, frame_shift, &mut words);
+                separator.push(' ');
             } else {
                 match &mut pending {
                     Some(p) => {
@@ -342,8 +347,9 @@ impl RnntDecoder {
                         p.last_frame = e.frame;
                     }
                     None => {
-                        pending =
-                            Some(PendingWord { text: piece.to_string(), first_frame: e.frame, last_frame: e.frame });
+                        let mut text = std::mem::take(&mut separator);
+                        text.push_str(piece);
+                        pending = Some(PendingWord { text, first_frame: e.frame, last_frame: e.frame });
                     }
                 }
             }

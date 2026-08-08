@@ -116,6 +116,7 @@ pub(crate) enum HeadDecoder {
 pub(crate) fn ctc_frames_to_words(text: &str, frames: &[usize], frame_shift: f32) -> Vec<Word> {
     let mut words: Vec<Word> = Vec::new();
     let mut current = String::new();
+    let mut separator = String::new();
     let mut first_frame = 0usize;
     let mut last_frame = 0usize;
 
@@ -132,10 +133,12 @@ pub(crate) fn ctc_frames_to_words(text: &str, frames: &[usize], frame_shift: f32
     for (ch, &frame) in text.chars().zip(frames.iter()) {
         if ch == ' ' {
             commit(&mut words, &mut current, first_frame, last_frame);
+            separator.push(ch);
             continue;
         }
         if current.is_empty() {
             first_frame = frame;
+            current.push_str(&std::mem::take(&mut separator));
         }
         current.push(ch);
         last_frame = frame;
@@ -491,8 +494,8 @@ impl svod_arch::pipelines::audio::Transcriber for GigaAmTranscriber {
                 for (li, (_raw, emissions)) in lane_results.into_iter().enumerate() {
                     let window_len = windows[wave_start + li].len();
                     let frame_shift = (window_len as f32 / sample_rate_hz as f32) / (valid[li].max(1) as f32);
-                    // `frames_to_words` strips the SentencePiece `▁` markers, so
-                    // `words_to_text` reconstructs the window transcript.
+                    // `frames_to_words` converts SentencePiece boundaries into
+                    // exact leading-space fragments for direct reconstruction.
                     let words = decoder.frames_to_words(&emissions, frame_shift);
                     transcripts.push(Transcript { text: words_to_text(&words), words, ..Default::default() });
                 }
