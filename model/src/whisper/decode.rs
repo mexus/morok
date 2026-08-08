@@ -2,7 +2,7 @@
 
 use super::error::{DeviceSnafu, Error, JitSnafu, Result};
 use super::jit::{WhisperDecoderJit, WhisperDecoderStepJit, WhisperPrefillJit};
-use super::profile::{CopyProfile, begin_host_copy, timed_d2d};
+use super::profile::{CopyProfile, GraphProfile, begin_host_copy, timed_d2d};
 use super::tokenizer::WhisperTokenizer;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
@@ -28,7 +28,7 @@ pub fn detect_language(
     n_vocab: usize,
     tokenizer: &WhisperTokenizer,
 ) -> Result<LanguageDetection> {
-    detect_language_profile(decoder_jit, n_text_ctx, n_vocab, tokenizer, None)
+    detect_language_profile(decoder_jit, n_text_ctx, n_vocab, tokenizer, None, None)
 }
 
 pub(crate) fn detect_language_profile(
@@ -37,6 +37,7 @@ pub(crate) fn detect_language_profile(
     n_vocab: usize,
     tokenizer: &WhisperTokenizer,
     mut copies: Option<&mut CopyProfile>,
+    graph_profile: Option<&mut GraphProfile>,
 ) -> Result<LanguageDetection> {
     let sot = tokenizer.sot() as i32;
     let eot = tokenizer.eot() as i32;
@@ -46,7 +47,14 @@ pub(crate) fn detect_language_profile(
     if let (Some(copies), Some(started)) = (copies.as_deref_mut(), started) {
         copies.h2d("language_tokens", 1, token_buf.len() * std::mem::size_of::<i32>(), started.elapsed());
     }
-    decoder_jit.execute().context(JitSnafu)?;
+    if let Some(graph_profile) = graph_profile {
+        let graph_started = std::time::Instant::now();
+        let kernels = decoder_jit.execute_profiled().context(JitSnafu)?;
+        decoder_jit.output().context(JitSnafu)?.synchronize().context(DeviceSnafu)?;
+        graph_profile.record(graph_started.elapsed(), kernels);
+    } else {
+        decoder_jit.execute().context(JitSnafu)?;
+    }
     let started = begin_host_copy(copies.is_some(), decoder_jit.output().context(JitSnafu)?)?;
     let flat = read_uncached(decoder_jit)?;
     if let (Some(copies), Some(started)) = (copies, started) {
@@ -299,9 +307,18 @@ pub(crate) fn prefill_decode_seed(
     pos_embedding: &[f32],
     n_state: usize,
     mut copies: Option<&mut CopyProfile>,
+    graph_profile: Option<&mut GraphProfile>,
 ) -> Result<DecodeSeed> {
-    let metadata =
-        execute_prefill(prefill_jit, tokenizer, options, n_vocab, pos_embedding, n_state, copies.as_deref_mut())?;
+    let metadata = execute_prefill(
+        prefill_jit,
+        tokenizer,
+        options,
+        n_vocab,
+        pos_embedding,
+        n_state,
+        copies.as_deref_mut(),
+        graph_profile,
+    )?;
     let self_k_src = prefill_jit.self_k().context(JitSnafu)?.clone();
     let self_v_src = prefill_jit.self_v().context(JitSnafu)?.clone();
     let cross_k_src = prefill_jit.prepared_cross_k_mut().context(JitSnafu)?.clone();
@@ -768,8 +785,7 @@ pub(crate) fn run_fixed_slot_decode(
     n_text_ctx: usize,
     n_vocab: usize,
     profile: bool,
-    profile_kernels: bool,
-) -> Result<(Vec<DecodeResult>, DecodeScheduleStats, Vec<svod_runtime::KernelProfile>)> {
+) -> Result<(Vec<DecodeResult>, DecodeScheduleStats, GraphProfile)> {
     if seeds.len() != request_options.len() {
         return Err(decode_err("decode seed/options count mismatch"));
     }
@@ -788,7 +804,7 @@ pub(crate) fn run_fixed_slot_decode(
     let mut attempts: Vec<Option<ScheduledAttempt>> = (0..seeds.len()).map(|_| None).collect();
     let mut results: Vec<Option<DecodeResult>> = (0..seeds.len()).map(|_| None).collect();
     let mut stats = DecodeScheduleStats::default();
-    let mut profiled_kernels = Vec::new();
+    let mut graph_profile = GraphProfile::default();
     let mut rngs: Vec<_> =
         request_options.iter().enumerate().map(|(request, options)| sampling_rng(options, request)).collect();
 
@@ -905,8 +921,11 @@ pub(crate) fn run_fixed_slot_decode(
                     AttemptKind::Beam(beam) => beam.active.len(),
                 })
                 .sum::<usize>();
-            if profile_kernels && profiled_kernels.is_empty() {
-                profiled_kernels = step_jit.execute_profiled().context(JitSnafu)?;
+            if profile {
+                let graph_started = std::time::Instant::now();
+                let kernels = step_jit.execute_profiled().context(JitSnafu)?;
+                step_jit.logits().context(JitSnafu)?.synchronize().context(DeviceSnafu)?;
+                graph_profile.record(graph_started.elapsed(), kernels);
             } else {
                 step_jit.execute().context(JitSnafu)?;
             }
@@ -1077,7 +1096,7 @@ pub(crate) fn run_fixed_slot_decode(
         }
     }
 
-    Ok((collect_ordered(results).map_err(decode_err)?, stats, profiled_kernels))
+    Ok((collect_ordered(results).map_err(decode_err)?, stats, graph_profile))
 }
 
 // ─── Batched JIT buffer row helpers ─────────────────────────────────────────
@@ -1325,6 +1344,7 @@ struct PrefillMetadata {
     n_state: usize,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn execute_prefill(
     prefill_jit: &mut WhisperPrefillJit,
     tokenizer: &WhisperTokenizer,
@@ -1333,6 +1353,7 @@ fn execute_prefill(
     pos_embedding: &[f32],
     n_state: usize,
     mut copies: Option<&mut CopyProfile>,
+    graph_profile: Option<&mut GraphProfile>,
 ) -> Result<PrefillMetadata> {
     // Build initial tokens
     let mut initial_tokens = vec![tokenizer.sot()];
@@ -1362,7 +1383,14 @@ fn execute_prefill(
     }
 
     // Execute prefill JIT (plan manages all buffers, no realize)
-    prefill_jit.execute().context(JitSnafu)?;
+    if let Some(graph_profile) = graph_profile {
+        let graph_started = std::time::Instant::now();
+        let kernels = prefill_jit.execute_profiled().context(JitSnafu)?;
+        prefill_jit.logits().context(JitSnafu)?.synchronize().context(DeviceSnafu)?;
+        graph_profile.record(graph_started.elapsed(), kernels);
+    } else {
+        prefill_jit.execute().context(JitSnafu)?;
+    }
 
     // Read logits from output 0
     let started = begin_host_copy(copies.is_some(), prefill_jit.logits().context(JitSnafu)?)?;

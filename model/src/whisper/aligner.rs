@@ -11,7 +11,7 @@ use super::dtw::{find_alignment_path_selected, path_to_word_timings};
 use super::error::{DeviceSnafu, JitSnafu, Result};
 use super::jit::{WhisperAlignmentJit, WhisperAlignmentModel};
 use super::model::Whisper;
-use super::profile::{CopyProfile, begin_host_copy, timed_d2d};
+use super::profile::{CopyProfile, GraphProfile, begin_host_copy, timed_d2d};
 use super::tokenizer::WhisperTokenizer;
 use super::transcribe::Word;
 
@@ -42,10 +42,17 @@ pub struct WhisperAlignmentInput<'a> {
     pub audio_samples: usize,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Debug, Default)]
 pub(crate) struct AlignmentProfile {
-    pub(crate) graph_wall: Duration,
+    pub(crate) graph: GraphProfile,
     pub(crate) cpu_dtw_wall: Duration,
+}
+
+impl AlignmentProfile {
+    pub(crate) fn merge(&mut self, other: Self) {
+        self.graph.merge(other.graph);
+        self.cpu_dtw_wall = self.cpu_dtw_wall.saturating_add(other.cpu_dtw_wall);
+    }
 }
 
 impl WhisperAligner {
@@ -163,13 +170,17 @@ impl WhisperAligner {
         if let (Some(copies), Some(started)) = (copies.as_deref_mut(), token_started) {
             copies.h2d("alignment_tokens", 1, packed_tokens.len() * std::mem::size_of::<i32>(), started.elapsed());
         }
-        let graph_started = Instant::now();
-        self.jit.execute().context(JitSnafu)?;
+        let profiling = copies.is_some();
+        let (graph_wall, kernels) = if profiling {
+            let graph_started = Instant::now();
+            let kernels = self.jit.execute_profiled().context(JitSnafu)?;
+            self.jit.output().context(JitSnafu)?.synchronize().context(DeviceSnafu)?;
+            (graph_started.elapsed(), kernels)
+        } else {
+            self.jit.execute().context(JitSnafu)?;
+            (Duration::ZERO, Vec::new())
+        };
         let output = self.jit.output().context(JitSnafu)?;
-        if copies.is_some() {
-            output.synchronize().context(DeviceSnafu)?;
-        }
-        let graph_wall = graph_started.elapsed();
         let output_started = begin_host_copy(copies.is_some(), output)?;
         let output_bytes = output.as_host_bytes().context(DeviceSnafu)?;
         let qk_stride = self.n_heads * N_TEXT_CTX * N_AUDIO_CTX;
@@ -201,7 +212,11 @@ impl WhisperAligner {
                 words_from_path(&text_indices, &time_indices, &text_tokens, &token_probs, input.language, tokenizer)
             })
             .collect();
-        Ok((words, AlignmentProfile { graph_wall, cpu_dtw_wall: cpu_started.elapsed() }))
+        let mut graph = GraphProfile::default();
+        if profiling {
+            graph.record(graph_wall, kernels);
+        }
+        Ok((words, AlignmentProfile { graph, cpu_dtw_wall: cpu_started.elapsed() }))
     }
 }
 

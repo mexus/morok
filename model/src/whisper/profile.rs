@@ -5,9 +5,47 @@ use std::time::{Duration, Instant};
 
 use snafu::ResultExt;
 use svod_device::Buffer;
-use svod_runtime::StageProfile;
+use svod_runtime::{KernelProfile, StageProfile};
 
 use super::error::{DeviceSnafu, Result};
+
+#[derive(Debug, Default)]
+pub(crate) struct GraphProfile {
+    pub(crate) wall: Duration,
+    pub(crate) executions: usize,
+    pub(crate) kernels: Vec<KernelProfile>,
+}
+
+impl GraphProfile {
+    pub(crate) fn record(&mut self, wall: Duration, kernels: Vec<KernelProfile>) {
+        self.wall = self.wall.saturating_add(wall);
+        self.executions = self.executions.saturating_add(1);
+        self.kernels.extend(kernels);
+    }
+
+    pub(crate) fn merge(&mut self, other: Self) {
+        self.wall = self.wall.saturating_add(other.wall);
+        self.executions = self.executions.saturating_add(other.executions);
+        self.kernels.extend(other.kernels);
+    }
+
+    pub(crate) fn stage(self, name: &str) -> StageProfile {
+        let kernel_dispatches = self.kernels.len();
+        let average_wall_ms =
+            if self.executions == 0 { 0.0 } else { self.wall.as_secs_f64() * 1e3 / self.executions as f64 };
+        let mut stage = StageProfile::gpu(name, self.wall, self.kernels);
+        stage.meta.insert("executions".into(), self.executions.to_string());
+        stage.meta.insert("kernel_dispatches".into(), kernel_dispatches.to_string());
+        stage.meta.insert("accumulated_wall_ms".into(), format!("{:.3}", self.wall.as_secs_f64() * 1e3));
+        stage.meta.insert("average_execution_wall_ms".into(), format!("{average_wall_ms:.3}"));
+        stage.meta.insert(
+            "timing_semantics".into(),
+            "accumulated host wall per execution from profiled submission through explicit output synchronization"
+                .into(),
+        );
+        stage
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct CopyStats {
@@ -163,5 +201,22 @@ mod tests {
         assert_eq!(stage.meta["effective_gbps"], "0.512");
         assert_eq!(stage.meta["cache_append_bytes"], "1024");
         assert!(stage.meta["timing_semantics"].contains("not hardware DMA timestamps"));
+    }
+
+    #[test]
+    fn graph_profile_accumulates_execution_wall_and_metadata() {
+        let mut profile = GraphProfile::default();
+        profile.record(Duration::from_millis(2), Vec::new());
+        let mut other = GraphProfile::default();
+        other.record(Duration::from_millis(3), Vec::new());
+        profile.merge(other);
+
+        let stage = profile.stage("graph");
+        assert_eq!(stage.wall, Duration::from_millis(5));
+        assert_eq!(stage.meta["executions"], "2");
+        assert_eq!(stage.meta["kernel_dispatches"], "0");
+        assert_eq!(stage.meta["accumulated_wall_ms"], "5.000");
+        assert_eq!(stage.meta["average_execution_wall_ms"], "2.500");
+        assert!(stage.meta["timing_semantics"].contains("output synchronization"));
     }
 }

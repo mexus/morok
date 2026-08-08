@@ -24,7 +24,7 @@ use super::jit::{WhisperCrossKvJit, WhisperDecoderJit, WhisperDecoderStepJit, Wh
 use super::mel::WhisperMel;
 use super::model::Whisper;
 use super::plan::WhisperPlan;
-use super::profile::{CopyProfile, begin_host_copy};
+use super::profile::{CopyProfile, GraphProfile, begin_host_copy};
 use super::tokenizer::WhisperTokenizer;
 
 pub use svod_arch::rnnt::Word;
@@ -386,8 +386,7 @@ impl WhisperAlignedTranscriber {
                 .aligner
                 .align_batch_profiled(&inputs, tokenizer, profile.then_some(&mut *copies))
                 .map_err(|error| TranscribeError::Model { source: Box::new(error) })?;
-            alignment_profile.graph_wall += batch_profile.graph_wall;
-            alignment_profile.cpu_dtw_wall += batch_profile.cpu_dtw_wall;
+            alignment_profile.merge(batch_profile);
             for (recognized, words) in chunk.iter().zip(words) {
                 let segments = super::decode::split_into_segments(
                     &recognized.result.tokens,
@@ -421,12 +420,7 @@ impl Transcriber for WhisperAlignedTranscriber {
         let (recognized, mut profile_result, mut copies) = self.recognizer.recognize_windows(windows, profile)?;
         let (transcripts, alignment) = self.align_recognized(recognized, profile, &mut copies)?;
         if let Some(profile) = &mut profile_result {
-            let mut graph = StageProfile::host("alignment_graph", alignment.graph_wall);
-            graph.meta.insert(
-                "timing_semantics".into(),
-                "synchronized host wall from graph submission through GPU completion; not a hardware timestamp".into(),
-            );
-            profile.push(graph);
+            profile.push(alignment.graph.stage("alignment_graph"));
             profile.push(StageProfile::host("alignment_cpu_dtw", alignment.cpu_dtw_wall));
             for stage in copies.stages() {
                 profile.push(stage);
@@ -456,11 +450,14 @@ impl WhisperRecognizer {
 
         let mut recognized = Vec::with_capacity(windows.len());
         let mut prof = profile.then(RunProfile::default);
-        let mut encoder_kernels = Vec::new();
-        let mut decode_kernels = Vec::new();
+        let mut encoder_profile = GraphProfile::default();
+        let mut cross_kv_profile = GraphProfile::default();
+        let mut language_profile = GraphProfile::default();
+        let mut prefill_profile = GraphProfile::default();
+        let mut decoder_step_profile = GraphProfile::default();
         let mut decode_stats = DecodeScheduleStats::default();
         let mut copies = CopyProfile::default();
-        let (mut t_mel, mut t_encoder, mut t_decode) = (Duration::ZERO, Duration::ZERO, Duration::ZERO);
+        let (mut t_mel, mut t_decoder_scheduler) = (Duration::ZERO, Duration::ZERO);
 
         for batch_start in (0..windows.len()).step_by(max_batch) {
             let b = (windows.len() - batch_start).min(max_batch);
@@ -486,15 +483,16 @@ impl WhisperRecognizer {
             t_mel += t.elapsed();
 
             // ── Encode: one dispatch for b windows ───────────────────────────
-            let t = Instant::now();
-            if profile && batch_start == 0 {
-                encoder_kernels = self.encoder_jit.execute_profiled().context(JitSnafu)?;
+            if profile {
+                let graph_started = Instant::now();
+                let kernels = self.encoder_jit.execute_profiled().context(JitSnafu)?;
+                self.encoder_jit.output().context(JitSnafu)?.synchronize().context(DeviceSnafu)?;
+                encoder_profile.record(graph_started.elapsed(), kernels);
             } else {
                 self.encoder_jit.execute().context(JitSnafu)?;
             }
 
             let out_buf = self.encoder_jit.output().context(JitSnafu)?;
-            t_encoder += t.elapsed();
 
             let mut seeds = Vec::with_capacity(b);
             let mut decode_options = Vec::with_capacity(b);
@@ -504,8 +502,6 @@ impl WhisperRecognizer {
             // scheduler accepts a primary or fallback attempt.
             for bi in 0..b {
                 let base = bi * item_stride;
-
-                let t = Instant::now();
 
                 // Project encoder features once for all fallback prefills.
                 let (_, projection_wall) = timed_d2d(profile, out_buf, || {
@@ -522,7 +518,14 @@ impl WhisperRecognizer {
                 if profile {
                     copies.d2d("projection_input", 1, item_stride * std::mem::size_of::<f32>(), projection_wall);
                 }
-                self.cross_kv_jit.execute().context(JitSnafu)?;
+                if profile {
+                    let graph_started = Instant::now();
+                    let kernels = self.cross_kv_jit.execute_profiled().context(JitSnafu)?;
+                    self.cross_kv_jit.cross_k().context(JitSnafu)?.synchronize().context(DeviceSnafu)?;
+                    cross_kv_profile.record(graph_started.elapsed(), kernels);
+                } else {
+                    self.cross_kv_jit.execute().context(JitSnafu)?;
+                }
                 let cross_k_fence = self.cross_kv_jit.cross_k().context(JitSnafu)?.clone();
                 let mut fanout_bytes = 0usize;
                 let (_, fanout_wall) = timed_d2d(profile, &cross_k_fence, || {
@@ -566,6 +569,7 @@ impl WhisperRecognizer {
                         n_vocab,
                         &self.tokenizer,
                         profile.then_some(&mut copies),
+                        profile.then_some(&mut language_profile),
                     )
                     .map_err(|error| TranscribeError::Model { source: Box::new(error) })?;
                     options.language = Some(detection.language);
@@ -580,15 +584,15 @@ impl WhisperRecognizer {
                     &self.pos_embedding,
                     self.n_audio_state,
                     profile.then_some(&mut copies),
+                    profile.then_some(&mut prefill_profile),
                 )
                 .map_err(|error| TranscribeError::Model { source: Box::new(error) })?;
-                t_decode += t.elapsed();
                 seeds.push(seed);
                 decode_options.push(options);
             }
 
             let t = Instant::now();
-            let (results, batch_stats, batch_kernels) = run_fixed_slot_decode(
+            let (results, batch_stats, batch_graph_profile) = run_fixed_slot_decode(
                 &seeds,
                 &decode_options,
                 &mut self.batched_step_jit,
@@ -597,14 +601,11 @@ impl WhisperRecognizer {
                 n_text_ctx,
                 n_vocab,
                 profile,
-                profile && decode_kernels.is_empty(),
             )
             .map_err(|error| TranscribeError::Model { source: Box::new(error) })?;
             decode_stats.merge(batch_stats);
-            if decode_kernels.is_empty() {
-                decode_kernels = batch_kernels;
-            }
-            t_decode += t.elapsed();
+            decoder_step_profile.merge(batch_graph_profile);
+            t_decoder_scheduler += t.elapsed();
 
             for (bi, ((mut result, options), seed)) in results.into_iter().zip(&decode_options).zip(seeds).enumerate() {
                 if result.should_skip(options) {
@@ -621,24 +622,38 @@ impl WhisperRecognizer {
         }
 
         if let Some(p) = &mut prof {
+            let encoder_executions = encoder_profile.executions;
             p.push(StageProfile::host("mel", t_mel));
-            p.push(StageProfile::gpu("encoder", t_encoder, encoder_kernels));
-            let mut decode = StageProfile::gpu("decode", t_decode, decode_kernels);
-            decode.meta.insert("dispatches".into(), decode_stats.dispatches.to_string());
-            decode.meta.insert("active_row_steps".into(), decode_stats.active_row_steps.to_string());
-            decode.meta.insert("reserved_row_steps".into(), decode_stats.reserved_row_steps.to_string());
-            decode.meta.insert("capacity_row_steps".into(), decode_stats.capacity_row_steps.to_string());
-            decode.meta.insert("cache_clone_ops".into(), decode_stats.cache_clone_ops.to_string());
-            decode.meta.insert("cache_clone_bytes".into(), decode_stats.cache_clone_bytes.to_string());
-            decode.meta.insert("attempts".into(), decode_stats.attempts.to_string());
-            decode.meta.insert("fallback_attempts".into(), decode_stats.fallback_attempts.to_string());
+            p.push(encoder_profile.stage("encoder"));
+            p.push(cross_kv_profile.stage("cross_kv_projection"));
+            if language_profile.executions != 0 {
+                p.push(language_profile.stage("language_detection"));
+            }
+            p.push(prefill_profile.stage("prefill"));
+            let mut decoder_step = decoder_step_profile.stage("decoder_step");
+            decoder_step.meta.insert("dispatches".into(), decode_stats.dispatches.to_string());
+            decoder_step.meta.insert("dispatch_semantics".into(), "logical decoder graph executions".into());
+            decoder_step.meta.insert("active_row_steps".into(), decode_stats.active_row_steps.to_string());
+            decoder_step.meta.insert("reserved_row_steps".into(), decode_stats.reserved_row_steps.to_string());
+            decoder_step.meta.insert("capacity_row_steps".into(), decode_stats.capacity_row_steps.to_string());
+            decoder_step.meta.insert("cache_clone_ops".into(), decode_stats.cache_clone_ops.to_string());
+            decoder_step.meta.insert("cache_clone_bytes".into(), decode_stats.cache_clone_bytes.to_string());
+            decoder_step.meta.insert("attempts".into(), decode_stats.attempts.to_string());
+            decoder_step.meta.insert("fallback_attempts".into(), decode_stats.fallback_attempts.to_string());
             let utilization = if decode_stats.capacity_row_steps == 0 {
                 0.0
             } else {
                 decode_stats.active_row_steps as f64 / decode_stats.capacity_row_steps as f64
             };
-            decode.meta.insert("row_utilization".into(), format!("{utilization:.4}"));
-            p.push(decode);
+            decoder_step.meta.insert("row_utilization".into(), format!("{utilization:.4}"));
+            p.push(decoder_step);
+            let mut scheduler = StageProfile::host("decoder_scheduler_total", t_decoder_scheduler);
+            scheduler.meta.insert(
+                "timing_semantics".into(),
+                "non-additive end-to-end control-loop wall including host work, decoder_step waits, and synchronized cache/control copies".into(),
+            );
+            scheduler.meta.insert("batches".into(), encoder_executions.to_string());
+            p.push(scheduler);
         }
 
         copies.merge(decode_stats.copies.clone());

@@ -65,11 +65,17 @@ fn generalized_scheduler_runs_greedy_with_slot_refill() {
         assert_eq!(refilled.text, concurrent.text, "window {index}: slot geometry changed greedy output");
     }
     let profile = profile.unwrap();
-    let decode = profile.stage("decode").unwrap();
+    let decode = profile.stage("decoder_step").unwrap();
     assert!(!decode.kernels.is_empty());
     assert!(decode.meta["dispatches"].parse::<usize>().unwrap() > 0);
+    assert_eq!(decode.meta["executions"], decode.meta["dispatches"]);
     assert!(decode.meta["active_row_steps"].parse::<usize>().unwrap() > 0);
     assert!(decode.meta["row_utilization"].parse::<f64>().unwrap() > 0.0);
+    assert!(profile.stage("cross_kv_projection").is_some());
+    assert!(profile.stage("prefill").is_some());
+    assert!(profile.stage("decoder_scheduler_total").is_some());
+    assert!(profile.stage("alignment_graph").is_some());
+    assert!(profile.stage("alignment_cpu_dtw").is_some());
 }
 
 #[test]
