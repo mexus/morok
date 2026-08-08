@@ -68,7 +68,7 @@ fn small_decoder_dims() -> ModelDimensions {
     }
 }
 
-fn old_cross_kv_projection(model: &Whisper, audio: &Tensor) -> (Tensor, Tensor) {
+fn reference_cross_kv_projection(model: &Whisper, audio: &Tensor) -> (Tensor, Tensor) {
     let mut keys = Vec::with_capacity(model.decoder.blocks.len());
     let mut values = Vec::with_capacity(model.decoder.blocks.len());
     for block in &model.decoder.blocks {
@@ -83,7 +83,7 @@ fn old_cross_kv_projection(model: &Whisper, audio: &Tensor) -> (Tensor, Tensor) 
 }
 
 #[test]
-fn packed_cross_kv_matches_per_layer_projection() {
+fn materialized_cross_kv_matches_reference_projection() {
     let mut dims = small_decoder_dims();
     dims.n_text_layer = 3;
     let seed = Whisper::empty(dims.clone());
@@ -92,7 +92,7 @@ fn packed_cross_kv_matches_per_layer_projection() {
         (0..2 * dims.n_audio_ctx * dims.n_text_state).map(|index| (index as f32 - 31.0) * 0.017).collect();
     let audio = Tensor::from_slice(audio_values).try_reshape([2usize, dims.n_audio_ctx, dims.n_text_state]).unwrap();
 
-    let (mut expected_k, mut expected_v) = old_cross_kv_projection(&model, &audio);
+    let (mut expected_k, mut expected_v) = reference_cross_kv_projection(&model, &audio);
     let (mut actual_k, mut actual_v) = model.project_cross_kv(&audio).unwrap();
     Tensor::realize_batch([&mut expected_k, &mut expected_v, &mut actual_k, &mut actual_v]).unwrap();
 
@@ -106,12 +106,12 @@ fn packed_cross_kv_matches_per_layer_projection() {
         let expected = expected.as_vec::<f32>().unwrap();
         let actual = actual.as_vec::<f32>().unwrap();
         let max_delta = expected.iter().zip(&actual).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
-        assert!(max_delta < 1e-5, "packed cross projection drifted by {max_delta}");
+        assert!(max_delta < 1e-5, "materialized cross projection drifted by {max_delta}");
     }
 }
 
 #[test]
-fn prepared_cross_kv_has_two_single_reduction_kernels() {
+fn prepared_cross_kv_materializes_each_projection_before_packing() {
     let mut dims = small_decoder_dims();
     dims.n_text_layer = 3;
     let seed = Whisper::empty(dims.clone());
@@ -120,16 +120,30 @@ fn prepared_cross_kv_has_two_single_reduction_kernels() {
     jit.prepare(InputSpec::f32(&[1, dims.n_audio_ctx, dims.n_text_state])).unwrap();
 
     let kernels = jit.prepared_kernels().unwrap();
-    assert_eq!(kernels.len(), 2, "packed weights must not be materialized during inference");
-    for kernel in kernels {
-        let reductions = kernel
-            .ast
-            .toposort()
-            .into_iter()
-            .filter(|uop| matches!(uop.op(), Op::Range { axis_type: AxisType::Reduce, .. }))
-            .count();
-        assert_eq!(reductions, 1, "each packed projection must have one reduction axis");
-    }
+    let reduction_counts: Vec<_> = kernels
+        .iter()
+        .map(|kernel| {
+            kernel
+                .ast
+                .toposort()
+                .into_iter()
+                .filter(|uop| matches!(uop.op(), Op::Range { axis_type: AxisType::Reduce, .. }))
+                .count()
+        })
+        .collect();
+    assert!(
+        reduction_counts.iter().all(|&count| count <= 1),
+        "no dispatch may contain repeated independent reductions: {reduction_counts:?}"
+    );
+    assert_eq!(
+        reduction_counts.iter().filter(|&&count| count == 1).count(),
+        2 * dims.n_text_layer,
+        "each layer must have independent key and value projection kernels: {reduction_counts:?}"
+    );
+    assert!(
+        reduction_counts.iter().filter(|&&count| count == 0).count() >= 2,
+        "key and value packing must remain reduction-free: {reduction_counts:?}"
+    );
 }
 
 #[test]
