@@ -32,8 +32,30 @@ impl LinearWeights {
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        x.linear().weight(&self.weight).maybe_bias(self.bias.as_ref()).call().context(TensorSnafu)
+        match &self.bias {
+            Some(bias) => linear_with_bias(x, &self.weight, bias),
+            None => x.linear().weight(&self.weight).call().context(TensorSnafu),
+        }
     }
+}
+
+pub(super) fn linear_with_bias(x: &Tensor, weight: &Tensor, bias: &Tensor) -> Result<Tensor> {
+    let output_dtype = x.uop().dtype();
+    let is_low_precision = |dtype: &DType| dtype == &DType::Float16 || dtype == &DType::BFloat16;
+    let low_precision = is_low_precision(&output_dtype) && is_low_precision(&weight.uop().dtype());
+    if !low_precision {
+        return x.linear().weight(weight).bias(bias).call().context(TensorSnafu);
+    }
+
+    x.linear()
+        .weight(weight)
+        .dtype(DType::Float32)
+        .call()
+        .context(TensorSnafu)?
+        .try_add(&bias.cast(DType::Float32).context(TensorSnafu)?)
+        .context(TensorSnafu)?
+        .cast(output_dtype)
+        .context(TensorSnafu)
 }
 
 impl HasStateDict for LinearWeights {
@@ -74,12 +96,22 @@ impl LayerNormWeights {
     }
 
     pub fn apply(&self, x: &Tensor) -> Result<Tensor> {
-        // `Tensor::layernorm` upcasts to fp32 internally for numerical
-        // stability (matching ONNX `stash_type=1`, same as the OpenAI reference's
-        // `x.float()`), then casts the normalized output back to the input dtype.
-        // The affine multiply/add then runs in the input dtype via the IR's
-        // auto-promotion lattice. This mirrors xlm_roberta's LayerNorm, which
-        // relies on the op's internal upcast rather than an explicit branch.
+        let output_dtype = x.uop().dtype();
+        if output_dtype == DType::Float16 || output_dtype == DType::BFloat16 {
+            let x = x.cast(DType::Float32).context(TensorSnafu)?;
+            let weight = self.weight.cast(DType::Float32).context(TensorSnafu)?;
+            let bias = self.bias.cast(DType::Float32).context(TensorSnafu)?;
+            return x
+                .layernorm(-1, self.eps)
+                .context(TensorSnafu)?
+                .try_mul(&weight)
+                .context(TensorSnafu)?
+                .try_add(&bias)
+                .context(TensorSnafu)?
+                .cast(output_dtype)
+                .context(TensorSnafu);
+        }
+
         let normed = x.layernorm(-1, self.eps).context(TensorSnafu)?;
         normed.try_mul(&self.weight).context(TensorSnafu)?.try_add(&self.bias).context(TensorSnafu)
     }
@@ -183,4 +215,73 @@ pub fn sinusoids(length: usize, channels: usize, max_timescale: f64) -> Result<T
     let sin = scaled_time.sin().context(TensorSnafu)?;
     let cos = scaled_time.cos().context(TensorSnafu)?;
     Tensor::cat(&[&sin, &cos], -1).context(TensorSnafu)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn realized_f32(tensor: Tensor) -> Vec<f32> {
+        let mut tensor = tensor.cast(DType::Float32).unwrap();
+        tensor.realize().unwrap();
+        tensor.as_vec::<f32>().unwrap()
+    }
+
+    #[test]
+    fn fp16_layernorm_keeps_affine_in_fp32_until_final_cast() {
+        let x = Tensor::from_slice([0.1013f32, -0.2037, 0.3071, 1.913])
+            .try_reshape([1usize, 4])
+            .unwrap()
+            .cast(DType::Float16)
+            .unwrap();
+        let layer = LayerNormWeights {
+            weight: Tensor::from_slice([17.25f32, -31.5, 47.75, -63.0]).cast(DType::Float16).unwrap(),
+            bias: Tensor::from_slice([0.03125f32, -0.0625, 0.09375, -0.125]).cast(DType::Float16).unwrap(),
+            eps: 1e-5,
+        };
+
+        let reference = x
+            .cast(DType::Float32)
+            .unwrap()
+            .layernorm(-1, layer.eps)
+            .unwrap()
+            .try_mul(&layer.weight.cast(DType::Float32).unwrap())
+            .unwrap()
+            .try_add(&layer.bias.cast(DType::Float32).unwrap())
+            .unwrap()
+            .cast(DType::Float16)
+            .unwrap();
+        let legacy = x.layernorm(-1, layer.eps).unwrap().try_mul(&layer.weight).unwrap().try_add(&layer.bias).unwrap();
+        let actual = realized_f32(layer.apply(&x).unwrap());
+        let reference = realized_f32(reference);
+        let legacy = realized_f32(legacy);
+
+        assert_eq!(actual, reference, "LayerNorm must round only after the FP32 affine epilogue");
+        assert_ne!(legacy, reference, "fixture must detect rounding before the affine epilogue");
+    }
+
+    #[test]
+    fn fp16_linear_keeps_bias_epilogue_in_fp32_until_final_cast() {
+        let x = Tensor::from_slice([0.3333f32, -0.1428, 0.0909, 0.0769])
+            .try_reshape([1usize, 4])
+            .unwrap()
+            .cast(DType::Float16)
+            .unwrap();
+        let weight = Tensor::from_slice([3.0f32, -5.0, 7.0, -11.0, -2.0, 4.0, -6.0, 8.0])
+            .try_reshape([2usize, 4])
+            .unwrap()
+            .cast(DType::Float16)
+            .unwrap();
+        let bias = Tensor::from_slice([-2.5f32, 2.0]).cast(DType::Float16).unwrap();
+
+        let matmul_f32 = x.linear().weight(&weight).dtype(DType::Float32).call().unwrap();
+        let reference = matmul_f32.try_add(&bias.cast(DType::Float32).unwrap()).unwrap().cast(DType::Float16).unwrap();
+        let legacy = x.linear().weight(&weight).bias(&bias).call().unwrap();
+        let actual = realized_f32(linear_with_bias(&x, &weight, &bias).unwrap());
+        let reference = realized_f32(reference);
+        let legacy = realized_f32(legacy);
+
+        assert_eq!(actual, reference, "linear bias must be added to the FP32 accumulator");
+        assert_ne!(legacy, reference, "fixture must detect rounding before bias addition");
+    }
 }

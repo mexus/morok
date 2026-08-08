@@ -9,7 +9,7 @@ use crate::init::fan_in_uniform;
 use crate::state::{self, HasStateDict, StateDict, get_tensor, prefixed};
 
 use super::attention::{MultiHeadAttention, causal_mask};
-use super::blocks::LayerNormWeights;
+use super::blocks::{LayerNormWeights, linear_with_bias};
 use super::config::ModelDimensions;
 use super::error::{Result, TensorSnafu};
 
@@ -63,9 +63,9 @@ impl DecoderBlock {
 
         // MLP
         let h = self.mlp_ln.apply(&x)?;
-        let h = h.linear().weight(&self.mlp0_w).bias(&self.mlp0_b).call().context(TensorSnafu)?;
+        let h = linear_with_bias(&h, &self.mlp0_w, &self.mlp0_b)?;
         let h = h.gelu_exact().context(TensorSnafu)?;
-        let h = h.linear().weight(&self.mlp1_w).bias(&self.mlp1_b).call().context(TensorSnafu)?;
+        let h = linear_with_bias(&h, &self.mlp1_w, &self.mlp1_b)?;
         let x = x.try_add(&h).context(TensorSnafu)?;
         Ok(x)
     }
@@ -275,9 +275,9 @@ impl TextDecoder {
             }
 
             let h = block.mlp_ln.apply(&x)?;
-            let h = h.linear().weight(&block.mlp0_w).bias(&block.mlp0_b).call().context(TensorSnafu)?;
+            let h = linear_with_bias(&h, &block.mlp0_w, &block.mlp0_b)?;
             let h = h.gelu_exact().context(TensorSnafu)?;
-            let h = h.linear().weight(&block.mlp1_w).bias(&block.mlp1_b).call().context(TensorSnafu)?;
+            let h = linear_with_bias(&h, &block.mlp1_w, &block.mlp1_b)?;
             x = x.try_add(&h).context(TensorSnafu)?;
         }
         let selected_qk = selected_qk
@@ -363,9 +363,9 @@ impl TextDecoder {
             x = x.try_add(&cross_out).context(TensorSnafu)?;
 
             let h = block.mlp_ln.apply(&x)?;
-            let h = h.linear().weight(&block.mlp0_w).bias(&block.mlp0_b).call().context(TensorSnafu)?;
+            let h = linear_with_bias(&h, &block.mlp0_w, &block.mlp0_b)?;
             let h = h.gelu_exact().context(TensorSnafu)?;
-            let h = h.linear().weight(&block.mlp1_w).bias(&block.mlp1_b).call().context(TensorSnafu)?;
+            let h = linear_with_bias(&h, &block.mlp1_w, &block.mlp1_b)?;
             x = x.try_add(&h).context(TensorSnafu)?;
         }
 
@@ -518,9 +518,9 @@ impl TextDecoder {
 
             // ── MLP ───────────────────────────────────────────────────────
             let h = block.mlp_ln.apply(&x)?;
-            let h = h.linear().weight(&block.mlp0_w).bias(&block.mlp0_b).call().context(TensorSnafu)?;
+            let h = linear_with_bias(&h, &block.mlp0_w, &block.mlp0_b)?;
             let h = h.gelu_exact().context(TensorSnafu)?;
-            let h = h.linear().weight(&block.mlp1_w).bias(&block.mlp1_b).call().context(TensorSnafu)?;
+            let h = linear_with_bias(&h, &block.mlp1_w, &block.mlp1_b)?;
             x = x.try_add(&h).context(TensorSnafu)?;
 
             // Collect new K/V for cache update: [B, H, 1, Dh]

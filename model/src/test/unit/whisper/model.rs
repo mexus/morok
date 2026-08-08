@@ -191,6 +191,68 @@ fn prepared_cross_kv_prefill_matches_direct_decoder() {
 }
 
 #[test]
+fn cached_steps_match_teacher_forced_full_prefix() {
+    let dims = small_decoder_dims();
+    let model = Whisper::empty(dims.clone());
+    let d_head = dims.n_text_state / dims.n_text_head;
+    let layer_heads = dims.n_text_layer * dims.n_text_head;
+    let cache_elements = dims.n_text_ctx * layer_heads * d_head;
+    let audio_values: Vec<f32> =
+        (0..dims.n_audio_ctx * dims.n_text_state).map(|index| (index as f32 - 17.0) * 0.021).collect();
+    let audio = Tensor::from_slice(audio_values).try_reshape([1usize, dims.n_audio_ctx, dims.n_text_state]).unwrap();
+    let (cross_k, cross_v) = model.project_cross_kv(&audio).unwrap();
+    let mut prefix = vec![1i32, 7, 3];
+    let prefix_tensor = Tensor::from_slice(&prefix).try_reshape([1usize, prefix.len()]).unwrap();
+    let (_, mut prefill_k, mut prefill_v) = model.decode_prefill(&prefix_tensor, &cross_k, &cross_v, 0).unwrap();
+    Tensor::realize_batch([&mut prefill_k, &mut prefill_v]).unwrap();
+
+    let mut cache_k = vec![0.0f32; cache_elements];
+    let mut cache_v = vec![0.0f32; cache_elements];
+    let prefill_elements = prefix.len() * layer_heads * d_head;
+    cache_k[..prefill_elements].copy_from_slice(&prefill_k.as_vec::<f32>().unwrap());
+    cache_v[..prefill_elements].copy_from_slice(&prefill_v.as_vec::<f32>().unwrap());
+    assert_eq!(cache_k.len() * std::mem::size_of::<f32>(), dims.n_text_ctx * layer_heads * d_head * 4);
+    assert_eq!(cross_k.uop().dtype(), DType::Float32);
+    assert_eq!(prefill_k.uop().dtype(), DType::Float32);
+
+    for next_token in [5i32, 11] {
+        let pos = prefix.len();
+        let token = Tensor::from_slice([next_token]).try_reshape([1usize, 1]).unwrap();
+        let pos_emb = model
+            .decoder
+            .positional_embedding
+            .try_shrink([Some((pos as isize, pos as isize + 1)), None])
+            .unwrap()
+            .try_unsqueeze(0)
+            .unwrap();
+        let self_k = Tensor::from_slice(&cache_k).try_reshape([1usize, dims.n_text_ctx, layer_heads, d_head]).unwrap();
+        let self_v = Tensor::from_slice(&cache_v).try_reshape([1usize, dims.n_text_ctx, layer_heads, d_head]).unwrap();
+        let mut mask_values = vec![0.0f32; dims.n_text_ctx + 1];
+        mask_values[pos..dims.n_text_ctx].fill(f32::NEG_INFINITY);
+        let mask = Tensor::from_slice(&mask_values).try_reshape([1usize, 1, 1, dims.n_text_ctx + 1]).unwrap();
+        assert_eq!(mask_values.len() * std::mem::size_of::<f32>(), (dims.n_text_ctx + 1) * 4);
+
+        let (mut step_logits, mut new_k, mut new_v) =
+            model.decode_step(&token, &pos_emb, &self_k, &self_v, &cross_k, &cross_v, &mask).unwrap();
+        prefix.push(next_token);
+        let full_tokens = Tensor::from_slice(&prefix).try_reshape([1usize, prefix.len()]).unwrap();
+        let mut teacher = model.decode_with_cross_kv(&full_tokens, &cross_k, &cross_v).unwrap();
+        Tensor::realize_batch([&mut step_logits, &mut new_k, &mut new_v, &mut teacher]).unwrap();
+
+        let step = step_logits.as_vec::<f32>().unwrap();
+        let teacher = teacher.as_vec::<f32>().unwrap();
+        let teacher_last = &teacher[(prefix.len() - 1) * dims.n_vocab..prefix.len() * dims.n_vocab];
+        let max_delta = step.iter().zip(teacher_last).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        assert!(max_delta < 1e-5, "cached step at position {pos} drifted from teacher forcing by {max_delta}");
+
+        let cache_offset = pos * layer_heads * d_head;
+        let cache_end = cache_offset + layer_heads * d_head;
+        cache_k[cache_offset..cache_end].copy_from_slice(&new_k.as_vec::<f32>().unwrap());
+        cache_v[cache_offset..cache_end].copy_from_slice(&new_v.as_vec::<f32>().unwrap());
+    }
+}
+
+#[test]
 fn one_token_language_logits_match_full_context_sot_logits() {
     let dims = small_decoder_dims();
     let model = Whisper::empty(dims.clone());

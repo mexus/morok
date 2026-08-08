@@ -6,8 +6,8 @@
 use svod_arch::pipelines::audio::Transcriber;
 
 use crate::whisper::{
-    DecodeOptions, DecodeStrategy, ModelDimensions, WhisperAlignedTranscriber, WhisperPlan, WhisperSize, WhisperTask,
-    WhisperTokenizer,
+    DecodeOptions, DecodeStrategy, ModelDimensions, N_TEXT_CTX, WhisperAlignedTranscriber, WhisperPlan, WhisperSize,
+    WhisperTask, WhisperTokenizer,
 };
 
 /// Loads whisper-tiny + tokenizer from HuggingFace Hub and builds a
@@ -70,6 +70,12 @@ fn generalized_scheduler_runs_greedy_with_slot_refill() {
     assert!(decode.meta["dispatches"].parse::<usize>().unwrap() > 0);
     assert_eq!(decode.meta["executions"], decode.meta["dispatches"]);
     assert!(decode.meta["active_row_steps"].parse::<usize>().unwrap() > 0);
+    let active_steps = decode.meta["active_row_steps"].parse::<usize>().unwrap();
+    let capped_steps = N_TEXT_CTX / 2 - 1;
+    assert!(
+        active_steps < capped_steps,
+        "fake-window greedy decode approached the per-window token cap instead of emitting EOT: {active_steps}/{capped_steps} aggregate steps"
+    );
     assert!(decode.meta["row_utilization"].parse::<f64>().unwrap() > 0.0);
     assert!(profile.stage("cross_kv_projection").is_some());
     assert!(profile.stage("prefill").is_some());

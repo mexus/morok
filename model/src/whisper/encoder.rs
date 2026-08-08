@@ -8,7 +8,7 @@ use crate::init::fan_in_uniform;
 use crate::state::{self, HasStateDict, StateDict, get_tensor, prefixed};
 
 use super::attention::{MultiHeadAttention, padded_fa_sequence_len};
-use super::blocks::{Conv1dWeights, LayerNormWeights, sinusoids};
+use super::blocks::{Conv1dWeights, LayerNormWeights, linear_with_bias, sinusoids};
 use super::config::ModelDimensions;
 use super::error::{Result, TensorSnafu};
 
@@ -56,9 +56,9 @@ impl EncoderBlock {
 
         // MLP (pre-norm)
         let h = self.mlp_ln.apply(&x)?;
-        let h = h.linear().weight(&self.mlp0_w).bias(&self.mlp0_b).call().context(TensorSnafu)?;
+        let h = linear_with_bias(&h, &self.mlp0_w, &self.mlp0_b)?;
         let h = h.gelu_exact().context(TensorSnafu)?;
-        let h = h.linear().weight(&self.mlp1_w).bias(&self.mlp1_b).call().context(TensorSnafu)?;
+        let h = linear_with_bias(&h, &self.mlp1_w, &self.mlp1_b)?;
         let x = x.try_add(&h).context(TensorSnafu)?;
         Ok(x)
     }
