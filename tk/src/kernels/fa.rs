@@ -42,6 +42,10 @@ const NUM_WARPS: usize = 8;
 /// waves/block) is opt-in via [`FaConfig`]. `{32,32}`/`{32,64}` stay
 /// opt-in via the explicit-tile [`build_fa_mw_db`] args.
 const Q_BLK: usize = 16;
+/// Sequence-length multiple accepted by the baseline production flash-attention
+/// tile. Callers that explicitly choose to pad can use this without duplicating
+/// the kernel's tiling details.
+pub const FLASH_ATTENTION_SEQUENCE_MULTIPLE: usize = Q_BLK * NUM_WARPS;
 /// Default per-warp KV super-block height. `32` (2·BLK): profiling the small-grid
 /// fallback (the b=1/h=16 inference regime) showed FA is ILP/recurrence-bound, not
 /// occupancy-bound — a taller KV super-block raises per-warp WMMA ILP and halves the
