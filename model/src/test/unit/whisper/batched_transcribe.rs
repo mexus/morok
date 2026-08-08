@@ -7,7 +7,8 @@
 use svod_arch::pipelines::audio::Transcriber;
 
 use crate::whisper::{
-    DecodeOptions, ModelDimensions, WhisperAlignedTranscriber, WhisperPlan, WhisperSize, WhisperTask, WhisperTokenizer,
+    DecodeOptions, DecodeStrategy, ModelDimensions, WhisperAlignedTranscriber, WhisperPlan, WhisperSize, WhisperTask,
+    WhisperTokenizer,
 };
 
 /// Loads whisper-tiny + tokenizer from HuggingFace Hub and builds a
@@ -24,8 +25,8 @@ fn tiny_transcriber() -> WhisperAlignedTranscriber {
     let options = DecodeOptions {
         task: WhisperTask::Transcribe,
         language: None,
-        beam_size: None,
-        temperature_inc: 0.0,
+        strategy: DecodeStrategy::Greedy,
+        fallback: None,
         ..DecodeOptions::default()
     };
     let mut plan = WhisperPlan::for_model(&model.dims, WhisperSize::Tiny);

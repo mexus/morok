@@ -6,8 +6,8 @@ use svod_tensor::Tensor;
 use crate::jit::InputSpec;
 use crate::state::HasStateDict;
 use crate::whisper::{
-    DecodeOptions, DecodeResult, ModelDimensions, Whisper, WhisperCrossKvJit, WhisperDecoderJit, WhisperPlan,
-    WhisperPrefillJit, WhisperSize,
+    DecodeOptions, DecodeResult, DecodeStrategy, FallbackPolicy, ModelDimensions, Whisper, WhisperCrossKvJit,
+    WhisperDecoderJit, WhisperPlan, WhisperPrefillJit, WhisperSize,
 };
 
 fn make_dims() -> ModelDimensions {
@@ -267,6 +267,31 @@ fn prepared_plan_has_concrete_nonzero_capacities() {
 }
 
 #[test]
+fn default_decode_policy_is_explicit_openai_fallback() {
+    let options = DecodeOptions::default();
+    assert_eq!(options.strategy, DecodeStrategy::Beam { size: 5 });
+    assert_eq!(options.fallback.unwrap().sampling_temperatures, [0.2, 0.4, 0.6, 0.8, 1.0]);
+}
+
+#[test]
+fn decode_policy_rejects_invalid_geometry_and_temperatures() {
+    let invalid_beam = DecodeOptions { strategy: DecodeStrategy::Beam { size: 0 }, ..Default::default() };
+    assert!(invalid_beam.validate().is_err());
+
+    let invalid_sample = DecodeOptions { strategy: DecodeStrategy::Sample { temperature: 0.0 }, ..Default::default() };
+    assert!(invalid_sample.validate().is_err());
+
+    let invalid_fallback = DecodeOptions {
+        fallback: Some(FallbackPolicy { sampling_temperatures: vec![f32::NAN], ..FallbackPolicy::default() }),
+        ..Default::default()
+    };
+    assert!(invalid_fallback.validate().is_err());
+
+    let invalid_silence = DecodeOptions { no_speech_threshold: Some(1.1), ..Default::default() };
+    assert!(invalid_silence.validate().is_err());
+}
+
+#[test]
 fn no_speech_skip_respects_logprob_override() {
     let options = DecodeOptions::default();
     let mut result = DecodeResult {
@@ -286,4 +311,21 @@ fn no_speech_skip_respects_logprob_override() {
 
     result.avg_logprob = -0.5;
     assert!(!result.should_skip(&options));
+}
+
+#[test]
+fn confident_silence_cancels_quality_fallback() {
+    let options = DecodeOptions::default();
+    let fallback = options.fallback.as_ref().unwrap();
+    let result = DecodeResult {
+        tokens: Vec::new(),
+        token_probs: Vec::new(),
+        text: String::new(),
+        avg_logprob: -2.0,
+        no_speech_prob: 0.9,
+        temperature: 0.0,
+        compression_ratio: 3.0,
+        language: Some("en".to_string()),
+    };
+    assert!(!crate::whisper::decode::check_fallback(&result, fallback, &options));
 }

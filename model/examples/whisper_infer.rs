@@ -24,8 +24,8 @@ use clap::Parser;
 
 use svod_arch::pipelines::audio::{Asr, FixedLengthSplitter, RunOptions};
 use svod_model::whisper::{
-    CHUNK_LENGTH, DecodeOptions, SAMPLE_RATE, Whisper, WhisperAlignedTranscriber, WhisperSize, WhisperTask,
-    WhisperTokenizer,
+    CHUNK_LENGTH, DecodeOptions, DecodeStrategy, SAMPLE_RATE, Whisper, WhisperAlignedTranscriber, WhisperSize,
+    WhisperTask, WhisperTokenizer,
 };
 
 #[derive(Parser, Debug)]
@@ -88,7 +88,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let options = DecodeOptions {
         task: args.task,
         language: if args.language == "auto" { None } else { Some(args.language.clone()) },
-        beam_size: Some(5), // beam search — uses KV-cached fast path
+        strategy: DecodeStrategy::Beam { size: 5 },
         ..Default::default()
     };
 

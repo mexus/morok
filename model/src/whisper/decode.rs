@@ -74,14 +74,57 @@ impl std::str::FromStr for WhisperTask {
     }
 }
 
-#[derive(Clone)]
+/// Search algorithm for the first decode attempt.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum DecodeStrategy {
+    /// Deterministic token-by-token argmax.
+    Greedy,
+    /// Beam search with a concrete number of decoder rows.
+    Beam { size: usize },
+    /// Multinomial sampling at a positive temperature.
+    Sample { temperature: f32 },
+}
+
+impl DecodeStrategy {
+    fn temperature(self) -> f32 {
+        match self {
+            Self::Greedy | Self::Beam { .. } => 0.0,
+            Self::Sample { temperature } => temperature,
+        }
+    }
+}
+
+/// Quality-gated sampling attempts after the primary decode is rejected.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FallbackPolicy {
+    /// Positive sampling temperatures tried in order.
+    pub sampling_temperatures: Vec<f32>,
+    /// Retry when text compression exceeds this threshold.
+    pub compression_ratio_threshold: Option<f32>,
+    /// Retry below this average log-probability.
+    pub logprob_threshold: Option<f32>,
+}
+
+impl Default for FallbackPolicy {
+    fn default() -> Self {
+        Self {
+            sampling_temperatures: vec![0.2, 0.4, 0.6, 0.8, 1.0],
+            compression_ratio_threshold: Some(2.4),
+            logprob_threshold: Some(-1.0),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
 pub struct DecodeOptions {
     /// Whether to transcribe source speech or translate it to English.
     pub task: WhisperTask,
     /// Source language code, or `None` for automatic detection.
     pub language: Option<String>,
-    /// Initial sampling temperature.
-    pub temperature: f32,
+    /// Search algorithm for the first decode attempt.
+    pub strategy: DecodeStrategy,
+    /// Optional quality-gated sampling retries.
+    pub fallback: Option<FallbackPolicy>,
     /// Maximum generated token count; defaults to half the text context.
     pub sample_len: Option<usize>,
     /// Suppress blank/space as the first generated token.
@@ -90,14 +133,6 @@ pub struct DecodeOptions {
     pub suppress_tokens: Option<Vec<i32>>,
     /// Latest timestamp permitted at the beginning of a window, in seconds.
     pub max_initial_timestamp: Option<f32>,
-    /// Beam width, or `None` for greedy/sampling decode.
-    pub beam_size: Option<usize>,
-    /// Temperature increment used by fallback; zero disables fallback.
-    pub temperature_inc: f32,
-    /// Retry when text compression exceeds this threshold.
-    pub compression_ratio_threshold: Option<f32>,
-    /// Retry low-confidence decodes below this average log-probability.
-    pub logprob_threshold: Option<f32>,
     /// Skip likely silence when no-speech probability exceeds this threshold.
     pub no_speech_threshold: Option<f32>,
 }
@@ -107,18 +142,52 @@ impl Default for DecodeOptions {
         Self {
             task: WhisperTask::Transcribe,
             language: None,
-            temperature: 0.0,
+            strategy: DecodeStrategy::Beam { size: 5 },
+            fallback: Some(FallbackPolicy::default()),
             sample_len: None,
             suppress_blank: true,
             suppress_tokens: Some(vec![-1]),
             max_initial_timestamp: Some(1.0),
-            beam_size: Some(5),
-            temperature_inc: 0.2,
-            compression_ratio_threshold: Some(2.4),
-            logprob_threshold: Some(-1.0),
             no_speech_threshold: Some(0.6),
         }
     }
+}
+
+impl DecodeOptions {
+    /// Validate strategy geometry and sampling parameters before graph preparation.
+    pub fn validate(&self) -> std::result::Result<(), &'static str> {
+        match self.strategy {
+            DecodeStrategy::Beam { size: 0 } => return Err("beam size must be non-zero"),
+            DecodeStrategy::Sample { temperature } if !valid_temperature(temperature) => {
+                return Err("sampling temperature must be finite and positive");
+            }
+            _ => {}
+        }
+        if let Some(fallback) = &self.fallback {
+            if fallback.sampling_temperatures.is_empty() {
+                return Err("fallback sampling temperatures must be non-empty");
+            }
+            if fallback.sampling_temperatures.iter().any(|&temperature| !valid_temperature(temperature)) {
+                return Err("fallback sampling temperatures must be finite and positive");
+            }
+            if fallback.compression_ratio_threshold.is_some_and(|threshold| !threshold.is_finite() || threshold <= 0.0)
+            {
+                return Err("compression ratio threshold must be finite and positive");
+            }
+            if fallback.logprob_threshold.is_some_and(|threshold| !threshold.is_finite()) {
+                return Err("log-probability threshold must be finite");
+            }
+        }
+        if self.no_speech_threshold.is_some_and(|threshold| !threshold.is_finite() || !(0.0..=1.0).contains(&threshold))
+        {
+            return Err("no-speech threshold must be between zero and one");
+        }
+        Ok(())
+    }
+}
+
+fn valid_temperature(temperature: f32) -> bool {
+    temperature.is_finite() && temperature > 0.0
 }
 
 #[derive(Clone, Debug)]
@@ -128,6 +197,7 @@ pub struct DecodeResult {
     pub text: String,
     pub avg_logprob: f32,
     pub no_speech_prob: f32,
+    /// Sampling temperature of the accepted attempt; zero for greedy or beam.
     pub temperature: f32,
     pub compression_ratio: f32,
     pub language: Option<String>,
@@ -141,7 +211,11 @@ impl DecodeResult {
         if self.no_speech_prob <= no_speech_threshold {
             return false;
         }
-        options.logprob_threshold.is_none_or(|threshold| self.avg_logprob <= threshold)
+        options
+            .fallback
+            .as_ref()
+            .and_then(|fallback| fallback.logprob_threshold)
+            .is_none_or(|threshold| self.avg_logprob <= threshold)
     }
 
     pub fn clear_speech(&mut self) {
@@ -165,34 +239,35 @@ pub fn decode_with_fallback_cached(
     pos_embedding: &[f32],
     n_state: usize,
 ) -> Result<DecodeResult> {
+    options.validate().map_err(decode_err)?;
     let resolved_lang = resolve_language(options, decoder_jit, n_text_ctx, n_vocab, tokenizer)?;
 
-    let temperatures = build_temperature_schedule(options);
+    let mut strategies = vec![options.strategy];
+    if let Some(fallback) = &options.fallback {
+        strategies
+            .extend(fallback.sampling_temperatures.iter().map(|&temperature| DecodeStrategy::Sample { temperature }));
+    }
     let mut best: Option<DecodeResult> = None;
 
-    for (t_idx, &temp) in temperatures.iter().enumerate() {
+    for (attempt, &strategy) in strategies.iter().enumerate() {
         let mut opts = options.clone();
-        opts.temperature = temp;
+        opts.strategy = strategy;
+        opts.fallback = None;
         opts.language = resolved_lang.clone();
-        if temp > 0.0 {
-            opts.beam_size = None;
-        }
 
-        let result = if temp == 0.0 && opts.beam_size.unwrap_or(0) > 0 {
-            let bs = opts.beam_size.unwrap();
-            beam_decode_cached(
+        let result = match strategy {
+            DecodeStrategy::Beam { size } => beam_decode_cached(
                 prefill_jit,
-                step_jits.get_mut(&bs).ok_or_else(|| decode_err("beam JIT missing"))?,
+                step_jits.get_mut(&size).ok_or_else(|| decode_err("beam JIT missing"))?,
                 n_text_ctx,
                 n_vocab,
                 tokenizer,
                 &opts,
-                bs,
+                size,
                 pos_embedding,
                 n_state,
-            )
-        } else {
-            greedy_decode_cached(
+            )?,
+            DecodeStrategy::Greedy | DecodeStrategy::Sample { .. } => greedy_decode_cached(
                 prefill_jit,
                 step_jits.get_mut(&1).ok_or_else(|| decode_err("greedy JIT missing"))?,
                 n_text_ctx,
@@ -201,10 +276,11 @@ pub fn decode_with_fallback_cached(
                 &opts,
                 pos_embedding,
                 n_state,
-            )
-        }?;
+            )?,
+        };
 
-        let needs_fallback = t_idx < temperatures.len() - 1 && check_fallback(&result, options);
+        let needs_fallback = attempt < strategies.len() - 1
+            && options.fallback.as_ref().is_some_and(|fallback| check_fallback(&result, fallback, options));
         best = Some(result);
         if !needs_fallback {
             break;
@@ -230,34 +306,12 @@ fn resolve_language(
     Ok(Some(detection.language))
 }
 
-fn build_temperature_schedule(options: &DecodeOptions) -> Vec<f32> {
-    if options.temperature_inc <= 0.0 {
-        return vec![options.temperature];
-    }
-    let mut temps = Vec::new();
-    let mut t = options.temperature;
-    while t < 1.0 + 1e-6 {
-        temps.push(t);
-        t += options.temperature_inc;
-    }
-    temps
-}
-
-fn check_fallback(result: &DecodeResult, options: &DecodeOptions) -> bool {
-    if let Some(th) = options.compression_ratio_threshold
-        && result.compression_ratio > th
-    {
-        return true;
-    }
-    if let Some(th) = options.logprob_threshold
-        && result.avg_logprob < th
-    {
-        if let Some(ns) = options.no_speech_threshold {
-            return result.no_speech_prob <= ns;
-        }
-        return true;
-    }
-    false
+pub(crate) fn check_fallback(result: &DecodeResult, fallback: &FallbackPolicy, options: &DecodeOptions) -> bool {
+    let repetitive = fallback.compression_ratio_threshold.is_some_and(|threshold| result.compression_ratio > threshold);
+    let low_confidence = fallback.logprob_threshold.is_some_and(|threshold| result.avg_logprob < threshold);
+    let silence =
+        options.no_speech_threshold.is_some_and(|threshold| result.no_speech_prob > threshold) && low_confidence;
+    (repetitive || low_confidence) && !silence
 }
 
 // ─── Cached greedy decode ───────────────────────────────────────────────────
@@ -288,7 +342,7 @@ pub fn greedy_decode_cached(
         0,
         &ctx.suppress_tokens,
     );
-    let mut next_token = pick_token(&filtered, options.temperature);
+    let mut next_token = pick_token(&filtered, options.strategy.temperature());
     let mut sum_logprob = log_softmax(&filtered, next_token as usize);
     let no_speech_prob = ctx.no_speech_prob;
 
@@ -328,7 +382,7 @@ pub fn greedy_decode_cached(
             &ctx.suppress_tokens,
         );
 
-        next_token = pick_token(&filtered, options.temperature);
+        next_token = pick_token(&filtered, options.strategy.temperature());
         let token_logprob = log_softmax(&filtered, next_token as usize);
         sum_logprob += token_logprob;
 
@@ -416,7 +470,7 @@ impl DecodeLane {
             0,
             &ctx.suppress_tokens,
         );
-        let next_token = pick_token(&filtered, options.temperature);
+        let next_token = pick_token(&filtered, options.strategy.temperature());
         let sum_logprob = log_softmax(&filtered, next_token as usize);
 
         let mut tokens = Vec::new();
@@ -576,7 +630,7 @@ pub fn run_batched_decode(
                 step,
                 &lane.suppress_tokens,
             );
-            lane.next_token = pick_token(&filtered, options.temperature);
+            lane.next_token = pick_token(&filtered, options.strategy.temperature());
             let token_logprob = log_softmax(&filtered, lane.next_token as usize);
             lane.sum_logprob += token_logprob;
 
@@ -842,7 +896,7 @@ pub fn beam_decode_cached(
         text,
         avg_logprob,
         no_speech_prob: ctx.no_speech_prob,
-        temperature: options.temperature,
+        temperature: options.strategy.temperature(),
         compression_ratio,
         language: options.language.clone(),
     })
@@ -1203,7 +1257,7 @@ fn finish_decode(
         text,
         avg_logprob,
         no_speech_prob,
-        temperature: options.temperature,
+        temperature: options.strategy.temperature(),
         compression_ratio,
         language: options.language.clone(),
     })

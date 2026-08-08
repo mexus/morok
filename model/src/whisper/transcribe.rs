@@ -16,7 +16,7 @@ use crate::jit::InputSpec;
 
 use super::aligner::{WhisperAligner, WhisperAlignmentInput};
 use super::config::{N_AUDIO_CTX, N_FRAMES, N_TEXT_CTX, SAMPLE_RATE};
-use super::decode::{DecodeLane, DecodeOptions, run_batched_decode};
+use super::decode::{DecodeLane, DecodeOptions, DecodeStrategy, run_batched_decode};
 use super::jit::{WhisperCrossKvJit, WhisperDecoderJit, WhisperDecoderStepJit, WhisperEncoderJit, WhisperPrefillJit};
 use super::mel::WhisperMel;
 use super::model::Whisper;
@@ -102,6 +102,9 @@ impl WhisperRecognizer {
         plan.validate().map_err(|message| TranscribeError::Model {
             source: Box::new(super::error::Error::Decode { msg: message.to_string() }),
         })?;
+        options.validate().map_err(|message| TranscribeError::Model {
+            source: Box::new(super::error::Error::Decode { msg: message.to_string() }),
+        })?;
         let n_mels = model.dims.n_mels;
         let n_audio_state = model.dims.n_audio_state;
         let n_vocab = model.dims.n_vocab;
@@ -165,16 +168,23 @@ impl WhisperRecognizer {
             )
             .context(JitSnafu)?;
 
-        // Step JITs: one per beam_size needed (beam_size from options + 1 for greedy).
-        // Compiled once at construction, reused every step.
+        // Prepare only the concrete row counts required by the primary strategy
+        // and optional sampling fallback.
         let n_text_head_local = n_text_head;
         let mut step_jits: rustc_hash::FxHashMap<usize, WhisperDecoderStepJit> = rustc_hash::FxHashMap::default();
 
         let beam_sizes: std::collections::HashSet<usize> = {
             let mut s = std::collections::HashSet::new();
-            s.insert(1); // greedy (always needed for temperature fallback)
-            if let Some(bs) = options.beam_size {
-                s.insert(bs);
+            match options.strategy {
+                DecodeStrategy::Beam { size } => {
+                    s.insert(size);
+                }
+                DecodeStrategy::Greedy | DecodeStrategy::Sample { .. } => {
+                    s.insert(1);
+                }
+            }
+            if options.fallback.is_some() {
+                s.insert(1);
             }
             s
         };
@@ -282,8 +292,7 @@ impl WhisperRecognizer {
     ///
     /// Encoder + prefill still run per-window (the encoder is already
     /// batched within `max_batch`; prefill is a single 4-token forward).
-    /// Temperature fallback is disabled (`temperature_inc = 0`), so the
-    /// schedule collapses to a single greedy pass per window.
+    /// Fallback is disabled, so the schedule is one greedy pass per window.
     fn recognize_windows_batched_greedy(
         &mut self,
         windows: &[&[f32]],
@@ -300,12 +309,10 @@ impl WhisperRecognizer {
         let n_vocab = self.n_vocab;
         let n_text_ctx = self.n_text_ctx;
 
-        // Batched-path options: disable temperature fallback so the schedule
-        // collapses to a single greedy pass. Lane state is step-locked; no
-        // async restarts.
+        // The fixed-slot API is explicitly greedy and has no retry attempts.
         let mut batched_opts = self.options.clone();
-        batched_opts.temperature_inc = 0.0;
-        batched_opts.beam_size = None; // greedy-only in the batched path
+        batched_opts.strategy = DecodeStrategy::Greedy;
+        batched_opts.fallback = None;
 
         let mut recognized = Vec::with_capacity(windows.len());
         let mut lanes: Vec<(DecodeLane, DecodeOptions)> = Vec::with_capacity(windows.len());
