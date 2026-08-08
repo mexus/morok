@@ -2,6 +2,7 @@
 
 use super::error::{DeviceSnafu, Error, JitSnafu, Result};
 use super::jit::{WhisperDecoderJit, WhisperDecoderStepJit, WhisperPrefillJit};
+use super::profile::{CopyProfile, begin_host_copy, timed_d2d};
 use super::tokenizer::WhisperTokenizer;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
@@ -27,12 +28,30 @@ pub fn detect_language(
     n_vocab: usize,
     tokenizer: &WhisperTokenizer,
 ) -> Result<LanguageDetection> {
+    detect_language_profile(decoder_jit, n_text_ctx, n_vocab, tokenizer, None)
+}
+
+pub(crate) fn detect_language_profile(
+    decoder_jit: &mut WhisperDecoderJit,
+    n_text_ctx: usize,
+    n_vocab: usize,
+    tokenizer: &WhisperTokenizer,
+    mut copies: Option<&mut CopyProfile>,
+) -> Result<LanguageDetection> {
     let sot = tokenizer.sot() as i32;
     let eot = tokenizer.eot() as i32;
     let token_buf: Vec<i32> = (0..n_text_ctx).map(|i| if i == 0 { sot } else { eot }).collect();
+    let started = begin_host_copy(copies.is_some(), decoder_jit.tokens_mut().context(JitSnafu)?)?;
     write_uncached(decoder_jit, &token_buf)?;
+    if let (Some(copies), Some(started)) = (copies.as_deref_mut(), started) {
+        copies.h2d("language_tokens", 1, token_buf.len() * std::mem::size_of::<i32>(), started.elapsed());
+    }
     decoder_jit.execute().context(JitSnafu)?;
+    let started = begin_host_copy(copies.is_some(), decoder_jit.output().context(JitSnafu)?)?;
     let flat = read_uncached(decoder_jit)?;
+    if let (Some(copies), Some(started)) = (copies, started) {
+        copies.d2h("language_logits", 1, flat.len() * std::mem::size_of::<f32>(), started.elapsed());
+    }
     let sot_logits = &flat[..n_vocab];
 
     let lang_tokens = tokenizer.all_language_tokens();
@@ -270,6 +289,7 @@ impl DecodeSeed {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn prefill_decode_seed(
     prefill_jit: &mut WhisperPrefillJit,
     tokenizer: &WhisperTokenizer,
@@ -278,12 +298,30 @@ pub(crate) fn prefill_decode_seed(
     n_vocab: usize,
     pos_embedding: &[f32],
     n_state: usize,
+    mut copies: Option<&mut CopyProfile>,
 ) -> Result<DecodeSeed> {
-    let metadata = execute_prefill(prefill_jit, tokenizer, options, n_vocab, pos_embedding, n_state)?;
-    let self_k = clone_device_cache(prefill_jit.self_k().context(JitSnafu)?)?;
-    let self_v = clone_device_cache(prefill_jit.self_v().context(JitSnafu)?)?;
-    let cross_k = clone_device_cache(prefill_jit.prepared_cross_k_mut().context(JitSnafu)?)?;
-    let cross_v = clone_device_cache(prefill_jit.prepared_cross_v_mut().context(JitSnafu)?)?;
+    let metadata =
+        execute_prefill(prefill_jit, tokenizer, options, n_vocab, pos_embedding, n_state, copies.as_deref_mut())?;
+    let self_k_src = prefill_jit.self_k().context(JitSnafu)?.clone();
+    let self_v_src = prefill_jit.self_v().context(JitSnafu)?.clone();
+    let cross_k_src = prefill_jit.prepared_cross_k_mut().context(JitSnafu)?.clone();
+    let cross_v_src = prefill_jit.prepared_cross_v_mut().context(JitSnafu)?.clone();
+    let bytes = self_k_src
+        .size()
+        .saturating_add(self_v_src.size())
+        .saturating_add(cross_k_src.size())
+        .saturating_add(cross_v_src.size());
+    let ((self_k, self_v, cross_k, cross_v), wall) = timed_d2d(copies.is_some(), &self_k_src, || {
+        Ok((
+            clone_device_cache(&self_k_src)?,
+            clone_device_cache(&self_v_src)?,
+            clone_device_cache(&cross_k_src)?,
+            clone_device_cache(&cross_v_src)?,
+        ))
+    })?;
+    if let Some(copies) = copies {
+        copies.d2d("seed_snapshots", 4, bytes, wall);
+    }
     let seed = build_decode_seed(metadata, self_k, self_v, cross_k, cross_v)?;
     if seed.self_positions > n_text_ctx {
         return Err(decode_err("prefill self cache exceeds text context"));
@@ -384,6 +422,7 @@ pub(crate) struct DecodeScheduleStats {
     pub(crate) cache_clone_bytes: usize,
     pub(crate) attempts: usize,
     pub(crate) fallback_attempts: usize,
+    pub(crate) copies: CopyProfile,
 }
 
 impl DecodeScheduleStats {
@@ -396,7 +435,20 @@ impl DecodeScheduleStats {
         self.cache_clone_bytes += other.cache_clone_bytes;
         self.attempts += other.attempts;
         self.fallback_attempts += other.fallback_attempts;
+        self.copies.merge(other.copies);
     }
+}
+
+pub(crate) fn scheduler_seed_copy_accounting(rows: usize, self_bytes: usize, cross_bytes: usize) -> (usize, usize) {
+    (rows.saturating_mul(4), rows.saturating_mul(self_bytes.saturating_add(cross_bytes)).saturating_mul(2))
+}
+
+pub(crate) fn cache_append_copy_accounting(rows: usize, per_pos_bytes: usize) -> (usize, usize) {
+    (rows.saturating_mul(2), rows.saturating_mul(per_pos_bytes).saturating_mul(2))
+}
+
+pub(crate) fn beam_clone_copy_accounting(copies: usize, positions: usize, per_pos_bytes: usize) -> (usize, usize) {
+    (copies.saturating_mul(2), copies.saturating_mul(positions).saturating_mul(per_pos_bytes).saturating_mul(2))
 }
 
 /// Small independently-testable allocator enforcing whole-attempt admission.
@@ -716,6 +768,7 @@ pub(crate) fn run_fixed_slot_decode(
     n_text_ctx: usize,
     n_vocab: usize,
     profile: bool,
+    profile_kernels: bool,
 ) -> Result<(Vec<DecodeResult>, DecodeScheduleStats, Vec<svod_runtime::KernelProfile>)> {
     if seeds.len() != request_options.len() {
         return Err(decode_err("decode seed/options count mismatch"));
@@ -758,7 +811,17 @@ pub(crate) fn run_fixed_slot_decode(
                 n_vocab,
                 &mut rngs[request],
             )?;
-            seed_attempt_rows(step_jit, &attempt.reserved_rows, &seeds[request], n_text_ctx)?;
+            let (ops, bytes) = scheduler_seed_copy_accounting(
+                attempt.reserved_rows.len(),
+                seeds[request].self_cache_bytes,
+                seeds[request].cross_cache_bytes,
+            );
+            let (_, wall) = timed_d2d(profile, &seeds[request].self_k_cache, || {
+                seed_attempt_rows(step_jit, &attempt.reserved_rows, &seeds[request], n_text_ctx)
+            })?;
+            if profile {
+                stats.copies.d2d("scheduler_seeding", ops, bytes, wall);
+            }
             attempts[request] = Some(attempt);
             stats.attempts += 1;
             stats.fallback_attempts += usize::from(strategy_index > 0);
@@ -772,6 +835,9 @@ pub(crate) fn run_fixed_slot_decode(
 
         // Attempts that finish from prefill (EOT or zero budget) need no graph dispatch.
         let mut dispatch = false;
+        let control_started = begin_host_copy(profile, step_jit.token_mut().context(JitSnafu)?)?;
+        let mut control_ops = 0usize;
+        let mut control_bytes = 0usize;
         for &request in &active_requests {
             let attempt = attempts[request].as_ref().expect("active attempt");
             let sample_len = request_options[request].sample_len.unwrap_or(n_text_ctx / 2);
@@ -791,6 +857,12 @@ pub(crate) fn run_fixed_slot_decode(
                             .ok_or_else(|| decode_err("position embedding is out of bounds"))?,
                     )?;
                     write_self_mask_row(step_jit, row, attempt.pos, n_text_ctx)?;
+                    control_ops = control_ops.saturating_add(3);
+                    control_bytes = control_bytes.saturating_add(
+                        std::mem::size_of::<i32>()
+                            + seed.n_state * std::mem::size_of::<f32>()
+                            + (n_text_ctx + 1) * std::mem::size_of::<f32>(),
+                    );
                 }
                 AttemptKind::Beam(beam) => {
                     for (hypothesis, &row) in beam.active.iter().zip(&beam.rows) {
@@ -807,6 +879,12 @@ pub(crate) fn run_fixed_slot_decode(
                                 .ok_or_else(|| decode_err("position embedding is out of bounds"))?,
                         )?;
                         write_self_mask_row(step_jit, row, attempt.pos, n_text_ctx)?;
+                        control_ops = control_ops.saturating_add(3);
+                        control_bytes = control_bytes.saturating_add(
+                            std::mem::size_of::<i32>()
+                                + seed.n_state * std::mem::size_of::<f32>()
+                                + (n_text_ctx + 1) * std::mem::size_of::<f32>(),
+                        );
                     }
                 }
             }
@@ -814,6 +892,9 @@ pub(crate) fn run_fixed_slot_decode(
         }
 
         if dispatch {
+            if let Some(started) = control_started {
+                stats.copies.h2d("decoder_controls", control_ops, control_bytes, started.elapsed());
+            }
             stats.dispatches += 1;
             stats.capacity_row_steps += capacity;
             stats.reserved_row_steps += allocator.reserved();
@@ -824,7 +905,7 @@ pub(crate) fn run_fixed_slot_decode(
                     AttemptKind::Beam(beam) => beam.active.len(),
                 })
                 .sum::<usize>();
-            if profile && profiled_kernels.is_empty() {
+            if profile_kernels && profiled_kernels.is_empty() {
                 profiled_kernels = step_jit.execute_profiled().context(JitSnafu)?;
             } else {
                 step_jit.execute().context(JitSnafu)?;
@@ -846,8 +927,24 @@ pub(crate) fn run_fixed_slot_decode(
                 match &mut attempt.kind {
                     AttemptKind::Single(single) => {
                         let row = attempt.reserved_rows[0];
-                        append_row_cache(step_jit, row, attempt.pos, per_pos_bytes, row_stride_bytes)?;
+                        let fence = step_jit.new_self_k().context(JitSnafu)?.clone();
+                        let (_, wall) = timed_d2d(profile, &fence, || {
+                            append_row_cache(step_jit, row, attempt.pos, per_pos_bytes, row_stride_bytes)
+                        })?;
+                        if profile {
+                            let (ops, bytes) = cache_append_copy_accounting(1, per_pos_bytes);
+                            stats.copies.d2d("cache_append", ops, bytes, wall);
+                        }
+                        let started = begin_host_copy(profile, step_jit.logits().context(JitSnafu)?)?;
                         let mut logits = read_logits_row(step_jit, row, n_vocab)?;
+                        if let Some(started) = started {
+                            stats.copies.d2h(
+                                "decoder_logits",
+                                1,
+                                n_vocab * std::mem::size_of::<f32>(),
+                                started.elapsed(),
+                            );
+                        }
                         let all_tokens: Vec<_> =
                             seed.initial_tokens.iter().copied().chain(single.tokens.iter().copied()).collect();
                         apply_logit_filters(
@@ -869,13 +966,31 @@ pub(crate) fn run_fixed_slot_decode(
                         }
                     }
                     AttemptKind::Beam(beam) => {
-                        for &row in &beam.rows {
-                            append_row_cache(step_jit, row, attempt.pos, per_pos_bytes, row_stride_bytes)?;
+                        let append_rows = beam.rows.clone();
+                        let fence = step_jit.new_self_k().context(JitSnafu)?.clone();
+                        let (_, wall) = timed_d2d(profile, &fence, || {
+                            for &row in &append_rows {
+                                append_row_cache(step_jit, row, attempt.pos, per_pos_bytes, row_stride_bytes)?;
+                            }
+                            Ok(())
+                        })?;
+                        if profile {
+                            let (ops, bytes) = cache_append_copy_accounting(append_rows.len(), per_pos_bytes);
+                            stats.copies.d2d("cache_append", ops, bytes, wall);
                         }
                         let size = attempt.reserved_rows.len();
                         let mut candidates = Vec::new();
                         for (parent_index, (hypothesis, &row)) in beam.active.iter().zip(&beam.rows).enumerate() {
+                            let started = begin_host_copy(profile, step_jit.logits().context(JitSnafu)?)?;
                             let mut logits = read_logits_row(step_jit, row, n_vocab)?;
+                            if let Some(started) = started {
+                                stats.copies.d2h(
+                                    "decoder_logits",
+                                    1,
+                                    n_vocab * std::mem::size_of::<f32>(),
+                                    started.elapsed(),
+                                );
+                            }
                             apply_logit_filters(
                                 &mut logits,
                                 tokenizer,
@@ -908,15 +1023,23 @@ pub(crate) fn run_fixed_slot_decode(
                         );
                         beam.finished.extend(newly_finished);
                         let assignment = plan_beam_rows(&attempt.reserved_rows, &survivors).map_err(decode_err)?;
-                        clone_cache_prefix(
-                            step_jit,
-                            &assignment.copies,
-                            attempt.pos + 1,
-                            per_pos_bytes,
-                            row_stride_bytes,
-                        )?;
+                        let fence = step_jit.self_k_cache_mut().context(JitSnafu)?.clone();
+                        let (_, wall) = timed_d2d(profile, &fence, || {
+                            clone_cache_prefix(
+                                step_jit,
+                                &assignment.copies,
+                                attempt.pos + 1,
+                                per_pos_bytes,
+                                row_stride_bytes,
+                            )
+                        })?;
                         stats.cache_clone_ops += assignment.copies.len();
-                        stats.cache_clone_bytes += assignment.copies.len() * (attempt.pos + 1) * per_pos_bytes * 2;
+                        let (clone_ops, clone_bytes) =
+                            beam_clone_copy_accounting(assignment.copies.len(), attempt.pos + 1, per_pos_bytes);
+                        stats.cache_clone_bytes = stats.cache_clone_bytes.saturating_add(clone_bytes);
+                        if profile {
+                            stats.copies.d2d("beam_clone", clone_ops, clone_bytes, wall);
+                        }
                         beam.active = active;
                         beam.rows = assignment.rows;
                     }
@@ -1209,6 +1332,7 @@ fn execute_prefill(
     n_vocab: usize,
     pos_embedding: &[f32],
     n_state: usize,
+    mut copies: Option<&mut CopyProfile>,
 ) -> Result<PrefillMetadata> {
     // Build initial tokens
     let mut initial_tokens = vec![tokenizer.sot()];
@@ -1229,17 +1353,26 @@ fn execute_prefill(
     {
         let token_data: Vec<i32> = initial_tokens.iter().map(|&t| t as i32).collect();
         let buf = prefill_jit.tokens_mut().context(JitSnafu)?;
-        write_buf(buf, bytemuck::cast_slice(&token_data))?;
+        let started = begin_host_copy(copies.is_some(), buf)?;
+        let data = bytemuck::cast_slice(&token_data);
+        write_buf(buf, data)?;
+        if let (Some(copies), Some(started)) = (copies.as_deref_mut(), started) {
+            copies.h2d("prefill_tokens", 1, data.len(), started.elapsed());
+        }
     }
 
     // Execute prefill JIT (plan manages all buffers, no realize)
     prefill_jit.execute().context(JitSnafu)?;
 
     // Read logits from output 0
+    let started = begin_host_copy(copies.is_some(), prefill_jit.logits().context(JitSnafu)?)?;
     let prefill_logits = {
         let buf = prefill_jit.logits().context(JitSnafu)?;
         read_buf(buf, buf.size() / std::mem::size_of::<f32>())?
     };
+    if let (Some(copies), Some(started)) = (copies, started) {
+        copies.d2h("prefill_logits", 1, prefill_logits.len() * std::mem::size_of::<f32>(), started.elapsed());
+    }
     let no_speech_prob = tokenizer
         .no_speech()
         .map(|ns| softmax_prob(&prefill_logits[..n_vocab.min(prefill_logits.len())], ns as usize))

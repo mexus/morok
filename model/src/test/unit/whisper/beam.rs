@@ -2,7 +2,8 @@ use std::collections::HashSet;
 
 use crate::whisper::decode::{
     BeamCandidate, BeamHypothesis, BeamSurvivor, DecodeScheduleStats, SlotAllocator, attempt_strategies,
-    collect_ordered, derived_sampling_seed, finalize_beam_hypotheses, plan_beam_rows, remaining_sample_steps,
+    beam_clone_copy_accounting, cache_append_copy_accounting, collect_ordered, derived_sampling_seed,
+    finalize_beam_hypotheses, plan_beam_rows, remaining_sample_steps, scheduler_seed_copy_accounting,
     select_beam_candidates, strategy_width,
 };
 use crate::whisper::{DecodeOptions, DecodeStrategy, FallbackPolicy};
@@ -210,6 +211,7 @@ fn scheduler_stats_merge_across_encoder_batches() {
         cache_clone_bytes: 128,
         attempts: 2,
         fallback_attempts: 0,
+        copies: Default::default(),
     };
     total.merge(DecodeScheduleStats {
         dispatches: 1,
@@ -220,6 +222,7 @@ fn scheduler_stats_merge_across_encoder_batches() {
         cache_clone_bytes: 256,
         attempts: 2,
         fallback_attempts: 1,
+        copies: Default::default(),
     });
     assert_eq!(
         total,
@@ -232,6 +235,14 @@ fn scheduler_stats_merge_across_encoder_batches() {
             cache_clone_bytes: 384,
             attempts: 4,
             fallback_attempts: 1,
+            copies: Default::default(),
         }
     );
+}
+
+#[test]
+fn scheduler_copy_accounting_counts_physical_transfers() {
+    assert_eq!(scheduler_seed_copy_accounting(3, 120, 400), (12, 3120));
+    assert_eq!(cache_append_copy_accounting(3, 64), (6, 384));
+    assert_eq!(beam_clone_copy_accounting(2, 5, 64), (4, 1280));
 }

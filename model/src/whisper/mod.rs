@@ -31,6 +31,7 @@ pub mod tokenizer;
 pub mod transcribe;
 
 mod loader;
+mod profile;
 
 pub use aligner::{WhisperAligner, WhisperAlignmentInput};
 pub use attention::{MultiHeadAttention, causal_mask};

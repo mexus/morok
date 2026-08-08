@@ -14,18 +14,37 @@ use svod_tensor::PrepareConfig;
 
 use crate::jit::InputSpec;
 
-use super::aligner::{WhisperAligner, WhisperAlignmentInput};
+use super::aligner::{AlignmentProfile, WhisperAligner, WhisperAlignmentInput};
 use super::config::{N_AUDIO_CTX, N_FRAMES, N_TEXT_CTX, SAMPLE_RATE};
 use super::decode::{
-    DecodeOptions, DecodeScheduleStats, attempt_strategies, prefill_decode_seed, run_fixed_slot_decode, strategy_width,
+    DecodeOptions, DecodeScheduleStats, attempt_strategies, detect_language_profile, prefill_decode_seed,
+    run_fixed_slot_decode, strategy_width,
 };
 use super::jit::{WhisperCrossKvJit, WhisperDecoderJit, WhisperDecoderStepJit, WhisperEncoderJit, WhisperPrefillJit};
 use super::mel::WhisperMel;
 use super::model::Whisper;
 use super::plan::WhisperPlan;
+use super::profile::{CopyProfile, begin_host_copy};
 use super::tokenizer::WhisperTokenizer;
 
 pub use svod_arch::rnnt::Word;
+
+fn timed_d2d<T>(
+    enabled: bool,
+    fence: &svod_device::Buffer,
+    work: impl FnOnce() -> Result<T, TranscribeError>,
+) -> Result<(T, Duration), TranscribeError> {
+    if !enabled {
+        return work().map(|value| (value, Duration::ZERO));
+    }
+    // Exclude prior graph work, then wait for the complete async transfer group.
+    // This is synchronized host wall, not a hardware SDMA timestamp.
+    fence.synchronize().context(DeviceSnafu)?;
+    let started = Instant::now();
+    let value = work()?;
+    fence.synchronize().context(DeviceSnafu)?;
+    Ok((value, started.elapsed()))
+}
 
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub(crate)))]
@@ -273,7 +292,7 @@ impl Transcriber for WhisperRecognizer {
         windows: &[&[f32]],
         profile: bool,
     ) -> Result<(Vec<Transcript>, Option<RunProfile>), Self::Error> {
-        let (recognized, profile) = self.recognize_windows(windows, profile)?;
+        let (recognized, mut profile_result, copies) = self.recognize_windows(windows, profile)?;
         let transcripts = recognized
             .into_iter()
             .map(|recognized| {
@@ -290,7 +309,12 @@ impl Transcriber for WhisperRecognizer {
                 }
             })
             .collect();
-        Ok((transcripts, profile))
+        if let Some(profile) = &mut profile_result {
+            for stage in copies.stages() {
+                profile.push(stage);
+            }
+        }
+        Ok((transcripts, profile_result))
     }
 }
 
@@ -335,10 +359,16 @@ impl WhisperAlignedTranscriber {
         self.recognizer.set_language(language);
     }
 
-    fn align_recognized(&mut self, recognized: Vec<RecognizedWindow>) -> Result<Vec<Transcript>, TranscribeError> {
+    fn align_recognized(
+        &mut self,
+        recognized: Vec<RecognizedWindow>,
+        profile: bool,
+        copies: &mut CopyProfile,
+    ) -> Result<(Vec<Transcript>, AlignmentProfile), TranscribeError> {
         let task = self.recognizer.options.task;
         let tokenizer = &self.recognizer.tokenizer;
         let mut transcripts = Vec::with_capacity(recognized.len());
+        let mut alignment_profile = AlignmentProfile::default();
         for chunk in recognized.chunks(self.recognizer.plan.alignment_batch) {
             let inputs: Vec<_> = chunk
                 .iter()
@@ -352,10 +382,12 @@ impl WhisperAlignedTranscriber {
                     audio_samples: recognized.audio_samples,
                 })
                 .collect();
-            let words = self
+            let (words, batch_profile) = self
                 .aligner
-                .align_batch(&inputs, tokenizer)
+                .align_batch_profiled(&inputs, tokenizer, profile.then_some(&mut *copies))
                 .map_err(|error| TranscribeError::Model { source: Box::new(error) })?;
+            alignment_profile.graph_wall += batch_profile.graph_wall;
+            alignment_profile.cpu_dtw_wall += batch_profile.cpu_dtw_wall;
             for (recognized, words) in chunk.iter().zip(words) {
                 let segments = super::decode::split_into_segments(
                     &recognized.result.tokens,
@@ -370,7 +402,7 @@ impl WhisperAlignedTranscriber {
                 });
             }
         }
-        Ok(transcripts)
+        Ok((transcripts, alignment_profile))
     }
 }
 
@@ -386,11 +418,19 @@ impl Transcriber for WhisperAlignedTranscriber {
         windows: &[&[f32]],
         profile: bool,
     ) -> Result<(Vec<Transcript>, Option<RunProfile>), Self::Error> {
-        let (recognized, mut profile_result) = self.recognizer.recognize_windows(windows, profile)?;
-        let started = Instant::now();
-        let transcripts = self.align_recognized(recognized)?;
+        let (recognized, mut profile_result, mut copies) = self.recognizer.recognize_windows(windows, profile)?;
+        let (transcripts, alignment) = self.align_recognized(recognized, profile, &mut copies)?;
         if let Some(profile) = &mut profile_result {
-            profile.push(StageProfile::host("alignment", started.elapsed()));
+            let mut graph = StageProfile::host("alignment_graph", alignment.graph_wall);
+            graph.meta.insert(
+                "timing_semantics".into(),
+                "synchronized host wall from graph submission through GPU completion; not a hardware timestamp".into(),
+            );
+            profile.push(graph);
+            profile.push(StageProfile::host("alignment_cpu_dtw", alignment.cpu_dtw_wall));
+            for stage in copies.stages() {
+                profile.push(stage);
+            }
         }
         Ok((transcripts, profile_result))
     }
@@ -401,9 +441,9 @@ impl WhisperRecognizer {
         &mut self,
         windows: &[&[f32]],
         profile: bool,
-    ) -> Result<(Vec<RecognizedWindow>, Option<RunProfile>), TranscribeError> {
+    ) -> Result<(Vec<RecognizedWindow>, Option<RunProfile>, CopyProfile), TranscribeError> {
         if windows.is_empty() {
-            return Ok((Vec::new(), profile.then(RunProfile::default)));
+            return Ok((Vec::new(), profile.then(RunProfile::default), CopyProfile::default()));
         }
 
         let n_mels = self.n_mels;
@@ -419,6 +459,7 @@ impl WhisperRecognizer {
         let mut encoder_kernels = Vec::new();
         let mut decode_kernels = Vec::new();
         let mut decode_stats = DecodeScheduleStats::default();
+        let mut copies = CopyProfile::default();
         let (mut t_mel, mut t_encoder, mut t_decode) = (Duration::ZERO, Duration::ZERO, Duration::ZERO);
 
         for batch_start in (0..windows.len()).step_by(max_batch) {
@@ -433,9 +474,14 @@ impl WhisperRecognizer {
                 for bi in 0..b {
                     packed[bi * mel_stride..(bi + 1) * mel_stride].copy_from_slice(&batch_mels[bi][..mel_stride]);
                 }
+                let copy_started = begin_host_copy(profile, mel_buf)
+                    .map_err(|source| TranscribeError::Model { source: Box::new(source) })?;
                 let dst = mel_buf.as_host_bytes_mut().context(DeviceSnafu)?;
                 let src_bytes: &[u8] = bytemuck::cast_slice(&packed);
                 dst[..src_bytes.len()].copy_from_slice(src_bytes);
+                if let Some(started) = copy_started {
+                    copies.h2d("mel_input", 1, src_bytes.len(), started.elapsed());
+                }
             }
             t_mel += t.elapsed();
 
@@ -462,7 +508,7 @@ impl WhisperRecognizer {
                 let t = Instant::now();
 
                 // Project encoder features once for all fallback prefills.
-                {
+                let (_, projection_wall) = timed_d2d(profile, out_buf, || {
                     let buf = self.cross_kv_jit.audio_features_mut().context(JitSnafu)?;
                     buf.copy_region_from(
                         0,
@@ -471,10 +517,17 @@ impl WhisperRecognizer {
                         item_stride * std::mem::size_of::<f32>(),
                     )
                     .context(DeviceSnafu)?;
+                    Ok(())
+                })?;
+                if profile {
+                    copies.d2d("projection_input", 1, item_stride * std::mem::size_of::<f32>(), projection_wall);
                 }
                 self.cross_kv_jit.execute().context(JitSnafu)?;
-                {
+                let cross_k_fence = self.cross_kv_jit.cross_k().context(JitSnafu)?.clone();
+                let mut fanout_bytes = 0usize;
+                let (_, fanout_wall) = timed_d2d(profile, &cross_k_fence, || {
                     let src = self.cross_kv_jit.cross_k().context(JitSnafu)?;
+                    fanout_bytes = fanout_bytes.saturating_add(src.size().saturating_mul(2));
                     self.prefill_jit
                         .prepared_cross_k_mut()
                         .context(JitSnafu)?
@@ -486,6 +539,7 @@ impl WhisperRecognizer {
                         .copy_region_from(0, src, 0, src.size())
                         .context(DeviceSnafu)?;
                     let src = self.cross_kv_jit.cross_v().context(JitSnafu)?;
+                    fanout_bytes = fanout_bytes.saturating_add(src.size().saturating_mul(2));
                     self.prefill_jit
                         .prepared_cross_v_mut()
                         .context(JitSnafu)?
@@ -496,15 +550,24 @@ impl WhisperRecognizer {
                         .context(JitSnafu)?
                         .copy_region_from(0, src, 0, src.size())
                         .context(DeviceSnafu)?;
+                    Ok(())
+                })?;
+                if profile {
+                    copies.d2d("cross_fanout", 4, fanout_bytes, fanout_wall);
                 }
 
                 let mut options = self.options.clone();
                 if !self.tokenizer.multilingual {
                     options.language = Some("en".to_string());
                 } else if options.language.is_none() {
-                    let detection =
-                        super::decode::detect_language(&mut self.decoder_jit, n_text_ctx, n_vocab, &self.tokenizer)
-                            .map_err(|error| TranscribeError::Model { source: Box::new(error) })?;
+                    let detection = detect_language_profile(
+                        &mut self.decoder_jit,
+                        n_text_ctx,
+                        n_vocab,
+                        &self.tokenizer,
+                        profile.then_some(&mut copies),
+                    )
+                    .map_err(|error| TranscribeError::Model { source: Box::new(error) })?;
                     options.language = Some(detection.language);
                 }
 
@@ -516,6 +579,7 @@ impl WhisperRecognizer {
                     n_vocab,
                     &self.pos_embedding,
                     self.n_audio_state,
+                    profile.then_some(&mut copies),
                 )
                 .map_err(|error| TranscribeError::Model { source: Box::new(error) })?;
                 t_decode += t.elapsed();
@@ -532,6 +596,7 @@ impl WhisperRecognizer {
                 &self.tokenizer,
                 n_text_ctx,
                 n_vocab,
+                profile,
                 profile && decode_kernels.is_empty(),
             )
             .map_err(|error| TranscribeError::Model { source: Box::new(error) })?;
@@ -576,6 +641,7 @@ impl WhisperRecognizer {
             p.push(decode);
         }
 
-        Ok((recognized, prof))
+        copies.merge(decode_stats.copies.clone());
+        Ok((recognized, prof, copies))
     }
 }
