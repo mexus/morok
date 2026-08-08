@@ -11,6 +11,23 @@ use crate::tile::RT;
 use svod_ir::UOp;
 
 impl<'k> Group<'k> {
+    /// Full-wave butterfly reduction of one scalar SSA value. Each step gathers
+    /// from `laneid ^ mask`, so the result is replicated in every lane without
+    /// LDS or a barrier. `op` must be associative (normally add or max).
+    pub fn wave_reduce_scalar<F>(&self, mut value: Arc<UOp>, op: F) -> Arc<UOp>
+    where
+        F: Fn(&Arc<UOp>, &Arc<UOp>) -> Arc<UOp>,
+    {
+        assert_eq!(self.warps, 1, "wave_reduce_scalar is a single-warp op");
+        let mut mask = 1i64;
+        while mask < self.ker.caps.wave_size as i64 {
+            let partner = self.shuffle_lane(&value, &ixor(&self.laneid(), mask));
+            value = op(&value, &partner);
+            mask *= 2;
+        }
+        value
+    }
+
     /// Per-element cross-lane gather (the public face of [`Self::shuffle_lane`]): for
     /// each logical element, `dst` receives `src`'s value at the SAME position but
     /// from lane `src_lane(laneid)`. Single-warp; one `ds_bpermute` per element (no

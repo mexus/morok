@@ -106,8 +106,8 @@ jit_wrapper! {
 }
 
 // KV-cached decoder step JIT: single-token forward with K/V cache recycling.
-// Inputs: token [1,1], pos_emb [1,1,D], self/cross K/V caches, attention mask.
-// Outputs: logits [1,n_vocab], new_self_k [1,1,n_layer*H,Dh], new_self_v [...].
+// Inputs: token [B,1], pos_emb [B,1,D], self/cross K/V caches, self key lengths [B].
+// Outputs: logits [B,n_vocab], new_self_k [B,1,n_layer*H,Dh], new_self_v [...].
 // After execute: copy_output_to_self_k_cache/v_cache to append new K/V at pos.
 jit_wrapper! {
     WhisperDecoderStepJit(Whisper) {
@@ -117,12 +117,12 @@ jit_wrapper! {
         self_v_cache: Tensor,
         cross_k: Tensor,
         cross_v: Tensor,
-        self_mask: Tensor,
+        self_key_lens: Tensor,
 
         outputs { logits, new_self_k, new_self_v }
 
-        build(token, pos_emb, self_k_cache, self_v_cache, cross_k, cross_v, self_mask) {
-            model.decode_step(token, pos_emb, self_k_cache, self_v_cache, cross_k, cross_v, self_mask)
+        build(token, pos_emb, self_k_cache, self_v_cache, cross_k, cross_v, self_key_lens) {
+            model.decode_step(token, pos_emb, self_k_cache, self_v_cache, cross_k, cross_v, self_key_lens)
         }
     }
 }

@@ -868,12 +868,12 @@ pub(crate) fn run_fixed_slot_decode(
                             .get(attempt.pos * seed.n_state..(attempt.pos + 1) * seed.n_state)
                             .ok_or_else(|| decode_err("position embedding is out of bounds"))?,
                     )?;
-                    write_self_mask_row(step_jit, row, attempt.pos, n_text_ctx)?;
+                    write_self_key_len_row(step_jit, row, attempt.pos)?;
                     control_ops = control_ops.saturating_add(3);
                     control_bytes = control_bytes.saturating_add(
                         std::mem::size_of::<i32>()
                             + seed.n_state * std::mem::size_of::<f32>()
-                            + (n_text_ctx + 1) * std::mem::size_of::<f32>(),
+                            + std::mem::size_of::<i32>(),
                     );
                 }
                 AttemptKind::Beam(beam) => {
@@ -890,12 +890,12 @@ pub(crate) fn run_fixed_slot_decode(
                                 .get(attempt.pos * seed.n_state..(attempt.pos + 1) * seed.n_state)
                                 .ok_or_else(|| decode_err("position embedding is out of bounds"))?,
                         )?;
-                        write_self_mask_row(step_jit, row, attempt.pos, n_text_ctx)?;
+                        write_self_key_len_row(step_jit, row, attempt.pos)?;
                         control_ops = control_ops.saturating_add(3);
                         control_bytes = control_bytes.saturating_add(
                             std::mem::size_of::<i32>()
                                 + seed.n_state * std::mem::size_of::<f32>()
-                                + (n_text_ctx + 1) * std::mem::size_of::<f32>(),
+                                + std::mem::size_of::<i32>(),
                         );
                     }
                 }
@@ -1125,23 +1125,15 @@ fn write_pos_emb_row(jit: &mut WhisperDecoderStepJit, row: usize, emb: &[f32]) -
     Ok(())
 }
 
-fn write_self_mask_row(jit: &mut WhisperDecoderStepJit, row: usize, pos: usize, n_text_ctx: usize) -> Result<()> {
-    let buf = jit.self_mask_mut().context(JitSnafu)?;
+fn write_self_key_len_row(jit: &mut WhisperDecoderStepJit, row: usize, pos: usize) -> Result<()> {
+    let buf = jit.self_key_lens_mut().context(JitSnafu)?;
     let dst = buf.as_host_bytes_mut().context(DeviceSnafu)?;
-    // mask is [max_lanes, 1, 1, n_text_ctx + 1]; row stride = (n_text_ctx+1)*4
-    let stride = n_text_ctx
-        .checked_add(1)
-        .and_then(|positions| positions.checked_mul(std::mem::size_of::<f32>()))
-        .ok_or_else(|| decode_err("mask row stride overflow"))?;
-    let off = row.checked_mul(stride).ok_or_else(|| decode_err("mask row offset overflow"))?;
-    // [0..pos) = 0.0 (attend), [pos..n_text_ctx) = -inf (mask), [n_text_ctx] = 0.0
-    let mut mask = vec![0f32; n_text_ctx + 1];
-    let masked = mask.get_mut(pos..n_text_ctx).ok_or_else(|| decode_err("decoder position exceeds text context"))?;
-    for v in masked {
-        *v = f32::NEG_INFINITY;
-    }
-    let bytes: &[u8] = bytemuck::cast_slice(&mask);
-    let target = dst.get_mut(off..off + bytes.len()).ok_or_else(|| decode_err("mask row is out of bounds"))?;
+    let off =
+        row.checked_mul(std::mem::size_of::<i32>()).ok_or_else(|| decode_err("self key length row offset overflow"))?;
+    let len = i32::try_from(pos).map_err(|_| decode_err("decoder position exceeds i32"))?;
+    let bytes: &[u8] = bytemuck::bytes_of(&len);
+    let target =
+        dst.get_mut(off..off + bytes.len()).ok_or_else(|| decode_err("self key length row is out of bounds"))?;
     target.copy_from_slice(bytes);
     Ok(())
 }

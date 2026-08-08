@@ -10,3 +10,4 @@ pub mod fa;
 pub mod kmeans;
 pub mod knn;
 pub mod matmul;
+pub mod sq_attention;

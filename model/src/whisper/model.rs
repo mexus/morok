@@ -74,9 +74,9 @@ impl Whisper {
         self_v_cache: &Tensor,
         cross_k: &Tensor,
         cross_v: &Tensor,
-        self_mask: &Tensor,
+        self_key_lens: &Tensor,
     ) -> Result<(Tensor, Tensor, Tensor)> {
-        self.decoder.forward_step(token, pos_emb, self_k_cache, self_v_cache, cross_k, cross_v, self_mask)
+        self.decoder.forward_step(token, pos_emb, self_k_cache, self_v_cache, cross_k, cross_v, self_key_lens)
     }
 
     /// Full forward: encode + decode.

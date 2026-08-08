@@ -210,7 +210,7 @@ impl WhisperRecognizer {
                 InputSpec::f32(&[max_lanes, N_TEXT_CTX, n_text_layer * n_text_head_local, d_head]).device_local(),
                 InputSpec::f32(&[max_lanes, N_AUDIO_CTX, n_text_layer * n_text_head_local, d_head]).device_local(),
                 InputSpec::f32(&[max_lanes, N_AUDIO_CTX, n_text_layer * n_text_head_local, d_head]).device_local(),
-                InputSpec::f32(&[max_lanes, 1, 1, N_TEXT_CTX + 1]),
+                InputSpec::i32(&[max_lanes]),
                 &prepare_config,
             )
             .context(JitSnafu)?;

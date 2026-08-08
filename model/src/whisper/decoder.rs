@@ -13,6 +13,18 @@ use super::blocks::{LayerNormWeights, linear_with_bias};
 use super::config::ModelDimensions;
 use super::error::{Result, TensorSnafu};
 
+pub(crate) fn cached_step_mask(key_lens: &Tensor, batch: usize, key_count: usize) -> Result<Tensor> {
+    let range = Tensor::arange(key_count as i64, None, None)
+        .context(TensorSnafu)?
+        .try_reshape([1usize, 1, 1, key_count])
+        .context(TensorSnafu)?;
+    let lens = key_lens.try_reshape([batch, 1, 1, 1]).context(TensorSnafu)?;
+    let beyond_prefix = range.try_ge(&lens).context(TensorSnafu)?;
+    let final_key = Tensor::const_(ConstValue::Int(key_count as i64 - 1), DType::Int32);
+    let not_final = range.try_ne(&final_key).context(TensorSnafu)?;
+    beyond_prefix.try_bitand(&not_final).context(TensorSnafu)
+}
+
 /// Decoder transformer block: self-attn + cross-attn + MLP, all pre-norm.
 #[derive(Clone)]
 pub struct DecoderBlock {
@@ -413,7 +425,7 @@ impl TextDecoder {
     /// - `self_v_cache`: [B, max_len, n_layer*H, Dh] self-attn V cache
     /// - `cross_k`: [B, n_audio_ctx, n_layer*H, Dh] cross-attn K (fixed)
     /// - `cross_v`: [B, n_audio_ctx, n_layer*H, Dh] cross-attn V (fixed)
-    /// - `self_mask`: [B(or 1), 1, 1, max_len+1] additive float mask for self-attn
+    /// - `self_key_lens`: [B] i32 valid cached-key counts for self-attn
     ///
     /// Returns `(logits[B, n_vocab], new_self_k[B, 1, n_layer*H, Dh], new_self_v[...])`.
     #[allow(clippy::too_many_arguments)]
@@ -425,7 +437,7 @@ impl TextDecoder {
         self_v_cache: &Tensor,
         cross_k: &Tensor,
         cross_v: &Tensor,
-        self_mask: &Tensor,
+        self_key_lens: &Tensor,
     ) -> Result<(Tensor, Tensor, Tensor)> {
         let n_head = self.n_head;
         let n_layer = self.blocks.len();
@@ -438,6 +450,12 @@ impl TextDecoder {
                 operation: "forward_step batch".into(),
             }),
         })?;
+        let self_key_count =
+            self_k_cache.shape().context(TensorSnafu)?[1].as_const().ok_or_else(|| super::error::Error::Tensor {
+                source: Box::new(svod_tensor::error::Error::SymbolicShapeUnsupported {
+                    operation: "forward_step cache length".into(),
+                }),
+            })? + 1;
 
         // Embed single token + positional embedding
         let tok_emb = self.token_embedding.embedding(token).context(TensorSnafu)?;
@@ -458,66 +476,87 @@ impl TextDecoder {
             let new_k_raw = block.attn.key.forward(&h)?;
             let new_v_raw = block.attn.value.forward(&h)?;
 
-            // Split heads: [B, 1, D] → [B, H, 1, Dh]
-            let q_h = block.attn.split_heads(&q)?;
+            // Sequence-major projections are consumed directly by the custom path.
+            let q_seq = q.try_reshape([batch, 1, n_head, d_head]).context(TensorSnafu)?;
+            let new_k_seq = new_k_raw.try_reshape([batch, 1, n_head, d_head]).context(TensorSnafu)?;
+            let new_v_seq = new_v_raw.try_reshape([batch, 1, n_head, d_head]).context(TensorSnafu)?;
             let new_k_h = block.attn.split_heads(&new_k_raw)?;
             let new_v_h = block.attn.split_heads(&new_v_raw)?;
 
             // Slice this layer's cached K/V: [B, max_len, n_layer*H, Dh]
-            // → [B, max_len, H, Dh] → permute → [B, H, max_len, Dh]
+            // → [B, max_len, H, Dh].
             let cached_k = self_k_cache
                 .try_shrink([None, None, Some((lh_start as isize, lh_end as isize)), None])
-                .context(TensorSnafu)?
-                .try_permute(&[0, 2, 1, 3])
-                .context(TensorSnafu)?; // [B, H, max_len, Dh]
+                .context(TensorSnafu)?;
             let cached_v = self_v_cache
                 .try_shrink([None, None, Some((lh_start as isize, lh_end as isize)), None])
-                .context(TensorSnafu)?
-                .try_permute(&[0, 2, 1, 3])
                 .context(TensorSnafu)?;
 
             // Concatenate cached K/V with new K/V along seq dim:
-            // [B, H, max_len, Dh] cat [B, H, 1, Dh] → [B, H, max_len+1, Dh]
-            let full_k = Tensor::cat(&[&cached_k, &new_k_h], 2).context(TensorSnafu)?;
-            let full_v = Tensor::cat(&[&cached_v, &new_v_h], 2).context(TensorSnafu)?;
+            // [B, max_len, H, Dh] cat [B, 1, H, Dh] → [B, max_len+1, H, Dh]
+            let full_k = Tensor::cat(&[&cached_k, &new_k_seq], 1).context(TensorSnafu)?;
+            let full_v = Tensor::cat(&[&cached_v, &new_v_seq], 1).context(TensorSnafu)?;
 
-            // Attention with additive mask
-            let out = q_h
-                .scaled_dot_product_attention()
-                .key(&full_k)
-                .value(&full_v)
-                .attn_mask(self_mask)
-                .is_causal(false)
-                .call()
-                .context(TensorSnafu)?;
-            let attn_out = block.attn.merge_heads(&out)?;
+            let direct = svod_tk::single_query_attention(
+                &q_seq,
+                &full_k,
+                &full_v,
+                svod_tk::SqAttentionOpts { key_lens: Some(self_key_lens), include_last: true },
+            )
+            .map_err(|e| svod_tensor::error::Error::IrConstruction { details: e.to_string() })
+            .context(TensorSnafu)?;
+            let attn_out = match direct {
+                Some(out) => out.try_reshape([batch, 1, self.n_state]).context(TensorSnafu)?,
+                None => {
+                    let q_h = q_seq.try_permute(&[0, 2, 1, 3]).context(TensorSnafu)?;
+                    let full_k_h = full_k.try_permute(&[0, 2, 1, 3]).context(TensorSnafu)?;
+                    let full_v_h = full_v.try_permute(&[0, 2, 1, 3]).context(TensorSnafu)?;
+                    let mask = cached_step_mask(self_key_lens, batch, self_key_count)?;
+                    let out = q_h
+                        .scaled_dot_product_attention()
+                        .key(&full_k_h)
+                        .value(&full_v_h)
+                        .attn_mask(&mask)
+                        .is_causal(false)
+                        .call()
+                        .context(TensorSnafu)?;
+                    block.attn.merge_heads(&out)?
+                }
+            };
             let attn_out = block.attn.out.forward(&attn_out)?;
             x = x.try_add(&attn_out).context(TensorSnafu)?;
 
             // ── Cross-attn (fixed cache, no mask) ────────────────────────
             let h = block.cross_attn_ln.apply(&x)?;
             let cq = block.cross_attn.query.forward(&h)?;
-            let cq_h = block.cross_attn.split_heads(&cq)?;
+            let cq_seq = cq.try_reshape([batch, 1, n_head, d_head]).context(TensorSnafu)?;
 
             let layer_ck = cross_k
                 .try_shrink([None, None, Some((lh_start as isize, lh_end as isize)), None])
-                .context(TensorSnafu)?
-                .try_permute(&[0, 2, 1, 3])
-                .context(TensorSnafu)?; // [B, H, n_audio_ctx, Dh]
+                .context(TensorSnafu)?;
             let layer_cv = cross_v
                 .try_shrink([None, None, Some((lh_start as isize, lh_end as isize)), None])
-                .context(TensorSnafu)?
-                .try_permute(&[0, 2, 1, 3])
                 .context(TensorSnafu)?;
 
-            let cross_out = cq_h
-                .scaled_dot_product_attention()
-                .key(&layer_ck)
-                .value(&layer_cv)
-                .is_causal(false)
-                .call()
+            let direct = svod_tk::single_query_attention(&cq_seq, &layer_ck, &layer_cv, Default::default())
+                .map_err(|e| svod_tensor::error::Error::IrConstruction { details: e.to_string() })
                 .context(TensorSnafu)?;
-            let cross_out = block.cross_attn.merge_heads(&cross_out)?;
+            let cross_out = match direct {
+                Some(out) => out.try_reshape([batch, 1, self.n_state]).context(TensorSnafu)?,
+                None => {
+                    let cq_h = cq_seq.try_permute(&[0, 2, 1, 3]).context(TensorSnafu)?;
+                    let layer_ck_h = layer_ck.try_permute(&[0, 2, 1, 3]).context(TensorSnafu)?;
+                    let layer_cv_h = layer_cv.try_permute(&[0, 2, 1, 3]).context(TensorSnafu)?;
+                    let out = cq_h
+                        .scaled_dot_product_attention()
+                        .key(&layer_ck_h)
+                        .value(&layer_cv_h)
+                        .is_causal(false)
+                        .call()
+                        .context(TensorSnafu)?;
+                    block.cross_attn.merge_heads(&out)?
+                }
+            };
             let cross_out = block.cross_attn.out.forward(&cross_out)?;
             x = x.try_add(&cross_out).context(TensorSnafu)?;
 

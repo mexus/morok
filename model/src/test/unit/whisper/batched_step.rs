@@ -3,6 +3,7 @@
 use svod_dtype::DType;
 use svod_tensor::Tensor;
 
+use crate::whisper::decoder::cached_step_mask;
 use crate::whisper::{ModelDimensions, Whisper, WhisperSize};
 
 /// Tiny config so the CPU JIT graph compiles in seconds. `n_text_ctx` is kept
@@ -31,11 +32,25 @@ fn forward_step_fixed_batch_keeps_batch_concrete() {
     let self_v = Tensor::zeros(&[batch, dims.n_text_ctx, layer_heads, d_head], DType::Float32).unwrap();
     let cross_k = Tensor::zeros(&[batch, n_audio_ctx, layer_heads, d_head], DType::Float32).unwrap();
     let cross_v = Tensor::zeros(&[batch, n_audio_ctx, layer_heads, d_head], DType::Float32).unwrap();
-    let mask = Tensor::zeros(&[batch, 1, 1, dims.n_text_ctx + 1], DType::Float32).unwrap();
+    let key_lens = Tensor::zeros(&[batch], DType::Int32).unwrap();
 
-    let (logits, new_k, new_v) =
-        model.decode_step(&token, &pos_emb, &self_k, &self_v, &cross_k, &cross_v, &mask).unwrap();
+    let (mut logits, new_k, new_v) =
+        model.decode_step(&token, &pos_emb, &self_k, &self_v, &cross_k, &cross_v, &key_lens).unwrap();
     assert_eq!(logits.shape().unwrap()[0].as_const(), Some(batch));
     assert_eq!(new_k.shape().unwrap()[0].as_const(), Some(batch));
     assert_eq!(new_v.shape().unwrap()[0].as_const(), Some(batch));
+    logits.realize().unwrap();
+    assert!(logits.as_vec::<f32>().unwrap().into_iter().all(f32::is_finite));
+}
+
+#[test]
+fn cached_step_key_lengths_mask_only_prefix_and_appended_key() {
+    let key_lens = Tensor::from_slice([0i32, 3]);
+    let mut mask = cached_step_mask(&key_lens, 2, 6).unwrap();
+    assert_eq!(mask.shape().unwrap().iter().map(|dim| dim.as_const().unwrap()).collect::<Vec<_>>(), [2, 1, 1, 6]);
+    mask.realize().unwrap();
+    assert_eq!(
+        mask.as_vec::<bool>().unwrap(),
+        [true, true, true, true, true, false, false, false, false, true, true, false]
+    );
 }
