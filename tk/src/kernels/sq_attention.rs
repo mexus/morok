@@ -2,8 +2,9 @@
 //!
 //! One wave owns one `(batch, head)`. Q stays resident in registers while K/V
 //! stream over N; lane `l` owns dimensions `l + j*wave_size`. Dot products use
-//! XOR-shuffle all-reduces and a one-pass stable online softmax. There is no LDS,
-//! MFMA, or split-K.
+//! XOR-shuffle all-reduces and a one-pass stable online softmax. Long unmasked
+//! attention can split K/V into contiguous chunks and associatively merge their
+//! FP32 softmax states. There is no LDS or MFMA.
 
 use std::sync::Arc;
 
@@ -14,20 +15,29 @@ use svod_ir::{ConstValue, UOp};
 use svod_tensor::Tensor;
 
 use crate::Kernel;
-use crate::index::{Idx, flat_index, load_at};
+use crate::index::{Idx, flat_index, flat_offset, index_off_gated, load_at};
 use crate::scaffold::GlSpec;
 
 /// Architectures on which the scalar shuffle implementation is supported.
 pub const SQ_ATTENTION_SUPPORTED_ARCHS: &[AmdArch] = &[AmdArch::Gfx942, AmdArch::Gfx1151];
 
 /// Compile-time masking options for [`single_query_attention`].
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy)]
 pub struct SqAttentionOpts<'a> {
     /// Optional `[B]` i32 valid-key counts. Keys `0..key_lens[b]` are valid.
     pub key_lens: Option<&'a Tensor>,
     /// Also include key `N-1`. Required when `key_lens` is present; this is the
     /// Whisper self-cache layout where the current token occupies the final slot.
     pub include_last: bool,
+    /// Number of contiguous K/V chunks. Values above one are supported only for
+    /// unmasked attention when `N` is divisible by `split`.
+    pub split: usize,
+}
+
+impl Default for SqAttentionOpts<'_> {
+    fn default() -> Self {
+        Self { key_lens: None, include_last: false, split: 1 }
+    }
 }
 
 fn cidx(v: i64) -> Arc<UOp> {
@@ -53,6 +63,7 @@ pub(crate) fn build_single_query_attention(
     let wave = ker.caps.wave_size;
     Kernel::assert_divisible(d, wave, "single-query attention D");
     assert!(n > 0, "single-query attention N must be > 0");
+    assert!(!masked || include_last, "masked single-query attention must include the appended key");
     let ept = d / wave;
     let warp = ker.warp();
     let f32 = DType::Float32;
@@ -96,8 +107,19 @@ pub(crate) fn build_single_query_attention(
     let max_reg = max_reg.after(smallvec![initialized.clone()]);
     let norm_reg = norm_reg.after(smallvec![initialized]);
 
-    let lp = ker.loop_static(n as i64);
-    let key = lp.index().clone();
+    let lp = match &prefix {
+        Some(prefix) => ker.loop_dynamic(prefix.add(&cidx(1))),
+        None => ker.loop_static(n as i64),
+    };
+    let loop_index = lp.index().clone();
+    // Whisper keeps the current token after the fixed cache. A masked launch
+    // streams only the valid prefix, then maps its final iteration to that slot.
+    let key = match &prefix {
+        Some(prefix) => {
+            UOp::try_where(loop_index.lt(prefix), loop_index.clone(), cidx(n as i64 - 1)).expect("select appended key")
+        }
+        None => loop_index,
+    };
     let q_loop = q_reg.after(smallvec![key.clone()]);
     let o_loop = o_reg.after(smallvec![key.clone()]);
     let max_loop = max_reg.after(smallvec![key.clone()]);
@@ -111,33 +133,21 @@ pub(crate) fn build_single_query_attention(
         dot = dot.add(&qv.mul(&kv));
     }
     let score = warp.wave_reduce_scalar(dot, |a, p| a.add(p));
-    let valid = prefix.as_ref().map(|len| {
-        let in_prefix = key.lt(len);
-        if include_last { in_prefix.or_(&key.eq(&cidx(n as i64 - 1))) } else { in_prefix }
-    });
-
     let old_max = load_at(&max_loop, &[1], &[Idx::Const(0)]);
     let old_norm = load_at(&norm_loop, &[1], &[Idx::Const(0)]);
     let next_max = old_max.max(&score);
     let alpha = old_max.sub(&next_max).try_exp2().expect("exp2 alpha");
     let beta = score.sub(&next_max).try_exp2().expect("exp2 beta");
-    let candidate_norm = old_norm.mul(&alpha).add(&beta);
-    let select = |candidate: Arc<UOp>, old: Arc<UOp>| match &valid {
-        Some(pred) => UOp::try_where(pred.clone(), candidate, old).expect("mask select"),
-        None => candidate,
-    };
-    let new_max = select(next_max, old_max);
-    let new_norm = select(candidate_norm, old_norm);
+    let new_norm = old_norm.mul(&alpha).add(&beta);
 
-    let max_store = flat_index(&max_reg, &[1], &[Idx::Const(0)]).store(new_max);
+    let max_store = flat_index(&max_reg, &[1], &[Idx::Const(0)]).store(next_max);
     let norm_store = flat_index(&norm_reg.after(smallvec![max_store.clone()]), &[1], &[Idx::Const(0)]).store(new_norm);
     let mut output_stores = Vec::with_capacity(ept);
     for j in 0..ept {
         let dim = lane.add(&cidx((j * wave) as i64));
         let old_o = load_at(&o_loop, &[ept], &[Idx::Const(j as i64)]);
         let vv = load_at(v.uop(), v.shape(), &[Idx::from(&batch), Idx::from(&key), Idx::from(&head), Idx::from(dim)]);
-        let candidate = old_o.mul(&alpha).add(&vv.mul(&beta));
-        let new_o = select(candidate, old_o);
+        let new_o = old_o.mul(&alpha).add(&vv.mul(&beta));
         output_stores.push(
             flat_index(&o_reg.after(smallvec![norm_store.clone()]), &[ept], &[Idx::Const(j as i64)]).store(new_o),
         );
@@ -153,6 +163,201 @@ pub(crate) fn build_single_query_attention(
     for j in 0..ept {
         let dim = lane.add(&cidx((j * wave) as i64));
         let value = load_at(&final_o, &[ept], &[Idx::Const(j as i64)]).try_div(&denom).expect("normalize");
+        stores.push(
+            flat_index(out.uop(), out.shape(), &[Idx::from(&batch), Idx::Const(0), Idx::from(&head), Idx::from(dim)])
+                .store(value),
+        );
+    }
+    ker.push_store(UOp::group(stores), out.uop().clone());
+}
+
+/// Build one unnormalized online-softmax state per contiguous K/V split.
+///
+/// ABI is `numerator, stats, q, k, v`; outputs are `[B,S,H,D]` and
+/// `[B,S,H,2]`, where the final axis of stats is `(max, norm)`.
+pub(crate) fn build_single_query_attention_partial(
+    ker: &Kernel,
+    b: usize,
+    n: usize,
+    h: usize,
+    d: usize,
+    splits: usize,
+) {
+    let wave = ker.caps.wave_size;
+    Kernel::assert_divisible(d, wave, "single-query attention D");
+    assert!(splits > 1 && n.is_multiple_of(splits), "split attention requires equal non-empty chunks");
+    let ept = d / wave;
+    let chunk = n / splits;
+    let warp = ker.warp();
+    let f32 = DType::Float32;
+
+    let (outs, ins) = ker.bind_abi(
+        &[GlSpec::new(&[b, splits, h, d], f32.clone()), GlSpec::new(&[b, splits, h, 2], f32.clone())],
+        &[
+            GlSpec::new(&[b, 1, h, d], f32.clone()),
+            GlSpec::new(&[b, n, h, d], f32.clone()),
+            GlSpec::new(&[b, n, h, d], f32.clone()),
+        ],
+    );
+    let (numerator, stats) = (outs[0].clone(), outs[1].clone());
+    let (q, k, v) = (ins[0].clone(), ins[1].clone(), ins[2].clone());
+    let head = ker.grid_x();
+    let batch = ker.grid_y();
+    let split = ker.grid_z();
+    let lane = ker.laneid();
+
+    let q_reg = ker.alloc_reg(ept, f32.clone());
+    let o_reg = ker.alloc_reg(ept, f32.clone());
+    let max_reg = ker.alloc_reg(1, f32.clone());
+    let norm_reg = ker.alloc_reg(1, f32.clone());
+    let scale = f32c(std::f64::consts::LOG2_E / (d as f64).sqrt());
+    let mut init = Vec::with_capacity(2 * ept + 2);
+    for j in 0..ept {
+        let dim = lane.add(&cidx((j * wave) as i64));
+        let qv = load_at(q.uop(), q.shape(), &[Idx::from(&batch), Idx::Const(0), Idx::from(&head), Idx::from(dim)])
+            .mul(&scale);
+        init.push(flat_index(&q_reg, &[ept], &[Idx::Const(j as i64)]).store(qv));
+        init.push(flat_index(&o_reg, &[ept], &[Idx::Const(j as i64)]).store(f32c(0.0)));
+    }
+    init.push(flat_index(&max_reg, &[1], &[Idx::Const(0)]).store(f32c(f64::NEG_INFINITY)));
+    init.push(flat_index(&norm_reg, &[1], &[Idx::Const(0)]).store(f32c(0.0)));
+    let initialized = UOp::group(init);
+    let q_reg = q_reg.after(smallvec![initialized.clone()]);
+    let o_reg = o_reg.after(smallvec![initialized.clone()]);
+    let max_reg = max_reg.after(smallvec![initialized.clone()]);
+    let norm_reg = norm_reg.after(smallvec![initialized]);
+
+    let lp = ker.loop_static(chunk as i64);
+    let key = split.mul(&cidx(chunk as i64)).add(lp.index());
+    let q_loop = q_reg.after(smallvec![key.clone()]);
+    let o_loop = o_reg.after(smallvec![key.clone()]);
+    let max_loop = max_reg.after(smallvec![key.clone()]);
+    let norm_loop = norm_reg.after(smallvec![key.clone()]);
+    let mut dot = f32c(0.0);
+    for j in 0..ept {
+        let dim = lane.add(&cidx((j * wave) as i64));
+        let qv = load_at(&q_loop, &[ept], &[Idx::Const(j as i64)]);
+        let kv = load_at(k.uop(), k.shape(), &[Idx::from(&batch), Idx::from(&key), Idx::from(&head), Idx::from(dim)]);
+        dot = dot.add(&qv.mul(&kv));
+    }
+    let score = warp.wave_reduce_scalar(dot, |a, p| a.add(p));
+    let old_max = load_at(&max_loop, &[1], &[Idx::Const(0)]);
+    let old_norm = load_at(&norm_loop, &[1], &[Idx::Const(0)]);
+    let next_max = old_max.max(&score);
+    let alpha = old_max.sub(&next_max).try_exp2().expect("exp2 alpha");
+    let beta = score.sub(&next_max).try_exp2().expect("exp2 beta");
+    let max_store = flat_index(&max_reg, &[1], &[Idx::Const(0)]).store(next_max);
+    let norm_store = flat_index(&norm_reg.after(smallvec![max_store.clone()]), &[1], &[Idx::Const(0)])
+        .store(old_norm.mul(&alpha).add(&beta));
+    let mut output_stores = Vec::with_capacity(ept);
+    for j in 0..ept {
+        let dim = lane.add(&cidx((j * wave) as i64));
+        let old_o = load_at(&o_loop, &[ept], &[Idx::Const(j as i64)]);
+        let vv = load_at(v.uop(), v.shape(), &[Idx::from(&batch), Idx::from(&key), Idx::from(&head), Idx::from(dim)]);
+        output_stores.push(
+            flat_index(&o_reg.after(smallvec![norm_store.clone()]), &[ept], &[Idx::Const(j as i64)])
+                .store(old_o.mul(&alpha).add(&vv.mul(&beta))),
+        );
+    }
+    ker.push_store(UOp::group(output_stores), o_reg.clone());
+    let ended = lp.close();
+
+    let final_o = o_reg.after(smallvec![ended.clone()]);
+    let final_max = max_reg.after(smallvec![ended.clone()]);
+    let final_norm = norm_reg.after(smallvec![ended]);
+    let mut numerator_stores = Vec::with_capacity(ept);
+    for j in 0..ept {
+        let dim = lane.add(&cidx((j * wave) as i64));
+        numerator_stores.push(
+            flat_index(
+                numerator.uop(),
+                numerator.shape(),
+                &[Idx::from(&batch), Idx::from(&split), Idx::from(&head), Idx::from(dim)],
+            )
+            .store(load_at(&final_o, &[ept], &[Idx::Const(j as i64)])),
+        );
+    }
+    ker.push_store(UOp::group(numerator_stores), numerator.uop().clone());
+
+    let lane_zero = lane.eq(&cidx(0));
+    let max_off = flat_offset(stats.shape(), &[Idx::from(&batch), Idx::from(&split), Idx::from(&head), Idx::Const(0)]);
+    let norm_off = flat_offset(stats.shape(), &[Idx::from(&batch), Idx::from(&split), Idx::from(&head), Idx::Const(1)]);
+    let stats_stores = UOp::group(vec![
+        index_off_gated(stats.uop(), max_off, lane_zero.clone()).store(load_at(&final_max, &[1], &[Idx::Const(0)])),
+        index_off_gated(stats.uop(), norm_off, lane_zero).store(load_at(&final_norm, &[1], &[Idx::Const(0)])),
+    ]);
+    ker.push_store(stats_stores, stats.uop().clone());
+}
+
+/// Merge split online-softmax states without rereading K/V.
+pub(crate) fn build_single_query_attention_merge(ker: &Kernel, b: usize, h: usize, d: usize, splits: usize) {
+    let wave = ker.caps.wave_size;
+    Kernel::assert_divisible(d, wave, "single-query attention D");
+    let ept = d / wave;
+    let f32 = DType::Float32;
+    let (outs, ins) = ker.bind_abi(
+        &[GlSpec::new(&[b, 1, h, d], f32.clone())],
+        &[GlSpec::new(&[b, splits, h, d], f32.clone()), GlSpec::new(&[b, splits, h, 2], f32.clone())],
+    );
+    let (out, numerator, stats) = (outs[0].clone(), ins[0].clone(), ins[1].clone());
+    let head = ker.grid_x();
+    let batch = ker.grid_y();
+    let lane = ker.laneid();
+    let o_reg = ker.alloc_reg(ept, f32.clone());
+    let max_reg = ker.alloc_reg(1, f32.clone());
+    let norm_reg = ker.alloc_reg(1, f32.clone());
+    let mut init = Vec::with_capacity(ept + 2);
+    for j in 0..ept {
+        init.push(flat_index(&o_reg, &[ept], &[Idx::Const(j as i64)]).store(f32c(0.0)));
+    }
+    init.push(flat_index(&max_reg, &[1], &[Idx::Const(0)]).store(f32c(f64::NEG_INFINITY)));
+    init.push(flat_index(&norm_reg, &[1], &[Idx::Const(0)]).store(f32c(0.0)));
+    let initialized = UOp::group(init);
+    let o_reg = o_reg.after(smallvec![initialized.clone()]);
+    let max_reg = max_reg.after(smallvec![initialized.clone()]);
+    let norm_reg = norm_reg.after(smallvec![initialized]);
+
+    let lp = ker.loop_static(splits as i64);
+    let split = lp.index().clone();
+    let o_loop = o_reg.after(smallvec![split.clone()]);
+    let max_loop = max_reg.after(smallvec![split.clone()]);
+    let norm_loop = norm_reg.after(smallvec![split.clone()]);
+    let old_max = load_at(&max_loop, &[1], &[Idx::Const(0)]);
+    let old_norm = load_at(&norm_loop, &[1], &[Idx::Const(0)]);
+    let partial_max =
+        load_at(stats.uop(), stats.shape(), &[Idx::from(&batch), Idx::from(&split), Idx::from(&head), Idx::Const(0)]);
+    let partial_norm =
+        load_at(stats.uop(), stats.shape(), &[Idx::from(&batch), Idx::from(&split), Idx::from(&head), Idx::Const(1)]);
+    let next_max = old_max.max(&partial_max);
+    let alpha = old_max.sub(&next_max).try_exp2().expect("exp2 merge alpha");
+    let beta = partial_max.sub(&next_max).try_exp2().expect("exp2 merge beta");
+    let max_store = flat_index(&max_reg, &[1], &[Idx::Const(0)]).store(next_max);
+    let norm_store = flat_index(&norm_reg.after(smallvec![max_store.clone()]), &[1], &[Idx::Const(0)])
+        .store(old_norm.mul(&alpha).add(&partial_norm.mul(&beta)));
+    let mut output_stores = Vec::with_capacity(ept);
+    for j in 0..ept {
+        let dim = lane.add(&cidx((j * wave) as i64));
+        let old_o = load_at(&o_loop, &[ept], &[Idx::Const(j as i64)]);
+        let partial_o = load_at(
+            numerator.uop(),
+            numerator.shape(),
+            &[Idx::from(&batch), Idx::from(&split), Idx::from(&head), Idx::from(dim)],
+        );
+        output_stores.push(
+            flat_index(&o_reg.after(smallvec![norm_store.clone()]), &[ept], &[Idx::Const(j as i64)])
+                .store(old_o.mul(&alpha).add(&partial_o.mul(&beta))),
+        );
+    }
+    ker.push_store(UOp::group(output_stores), o_reg.clone());
+    let ended = lp.close();
+
+    let final_o = o_reg.after(smallvec![ended.clone()]);
+    let final_norm = norm_reg.after(smallvec![ended]);
+    let denom = load_at(&final_norm, &[1], &[Idx::Const(0)]);
+    let mut stores = Vec::with_capacity(ept);
+    for j in 0..ept {
+        let dim = lane.add(&cidx((j * wave) as i64));
+        let value = load_at(&final_o, &[ept], &[Idx::Const(j as i64)]).try_div(&denom).expect("normalize merge");
         stores.push(
             flat_index(out.uop(), out.shape(), &[Idx::from(&batch), Idx::Const(0), Idx::from(&head), Idx::from(dim)])
                 .store(value),
@@ -178,6 +383,7 @@ pub fn single_query_attention(
     let (b, n, h, d) = (qd[0], kd[1], qd[2], qd[3]);
     let dtype = q.uop().dtype();
     let masked = opts.key_lens.is_some();
+    let splits = opts.split;
 
     ensure!(
         qd[1] == 1,
@@ -231,6 +437,15 @@ pub fn single_query_attention(
             multiple: 1usize
         }
     );
+    ensure!(
+        splits > 0 && (!masked || splits == 1) && (masked || n.is_multiple_of(splits)),
+        crate::launch::DimMultipleSnafu {
+            kernel: "single-query attention",
+            dim: "split (unmasked divisor of N; masked requires 1)",
+            value: splits,
+            multiple: 1usize
+        }
+    );
     if let Some(lens) = opts.key_lens {
         let ld = crate::launch::concrete_dims(lens, "single-query attention", "key_lens", 1)?;
         ensure!(
@@ -274,23 +489,53 @@ pub fn single_query_attention(
         true,
         move |arch| {
             let caps = crate::ArchCaps::for_arch(arch);
-            let out = Tensor::empty(&[b, 1, h, d], DType::Float32);
-            let mut inputs = vec![q, k, v];
-            if let Some(lens) = opts.key_lens {
-                inputs.push(lens);
+            if splits == 1 {
+                let out = Tensor::empty(&[b, 1, h, d], DType::Float32);
+                let mut inputs = vec![q, k, v];
+                if let Some(lens) = opts.key_lens {
+                    inputs.push(lens);
+                }
+                crate::graph_launch(
+                    "sq_attention",
+                    [h as i64, b as i64, 1],
+                    caps.wave_size as i64,
+                    out,
+                    &inputs,
+                    caps,
+                    move |ker| {
+                        build_single_query_attention(ker, b, n, h, d, masked, opts.include_last);
+                        ker.finish(1)
+                    },
+                )
+            } else {
+                let partials = crate::graph_launch_multi(
+                    "sq_attention_partial",
+                    [h as i64, b as i64, splits as i64],
+                    caps.wave_size as i64,
+                    vec![
+                        Tensor::empty(&[b, splits, h, d], DType::Float32),
+                        Tensor::empty(&[b, splits, h, 2], DType::Float32),
+                    ],
+                    &[q, k, v],
+                    caps,
+                    move |ker| {
+                        build_single_query_attention_partial(ker, b, n, h, d, splits);
+                        ker.finish(2)
+                    },
+                )?;
+                crate::graph_launch(
+                    "sq_attention_merge",
+                    [h as i64, b as i64, 1],
+                    caps.wave_size as i64,
+                    Tensor::empty(&[b, 1, h, d], DType::Float32),
+                    &[&partials[0], &partials[1]],
+                    caps,
+                    move |ker| {
+                        build_single_query_attention_merge(ker, b, h, d, splits);
+                        ker.finish(1)
+                    },
+                )
             }
-            crate::graph_launch(
-                "sq_attention",
-                [h as i64, b as i64, 1],
-                caps.wave_size as i64,
-                out,
-                &inputs,
-                caps,
-                move |ker| {
-                    build_single_query_attention(ker, b, n, h, d, masked, opts.include_last);
-                    ker.finish(1)
-                },
-            )
         },
     )
 }

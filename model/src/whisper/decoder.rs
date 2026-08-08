@@ -501,7 +501,7 @@ impl TextDecoder {
                 &q_seq,
                 &full_k,
                 &full_v,
-                svod_tk::SqAttentionOpts { key_lens: Some(self_key_lens), include_last: true },
+                svod_tk::SqAttentionOpts { key_lens: Some(self_key_lens), include_last: true, split: 1 },
             )
             .map_err(|e| svod_tensor::error::Error::IrConstruction { details: e.to_string() })
             .context(TensorSnafu)?;
@@ -538,25 +538,17 @@ impl TextDecoder {
                 .try_shrink([None, None, Some((lh_start as isize, lh_end as isize)), None])
                 .context(TensorSnafu)?;
 
-            let direct = svod_tk::single_query_attention(&cq_seq, &layer_ck, &layer_cv, Default::default())
-                .map_err(|e| svod_tensor::error::Error::IrConstruction { details: e.to_string() })
+            let cq_h = cq_seq.try_permute(&[0, 2, 1, 3]).context(TensorSnafu)?;
+            let layer_ck_h = layer_ck.try_permute(&[0, 2, 1, 3]).context(TensorSnafu)?;
+            let layer_cv_h = layer_cv.try_permute(&[0, 2, 1, 3]).context(TensorSnafu)?;
+            let cross_out = cq_h
+                .scaled_dot_product_attention()
+                .key(&layer_ck_h)
+                .value(&layer_cv_h)
+                .is_causal(false)
+                .call()
                 .context(TensorSnafu)?;
-            let cross_out = match direct {
-                Some(out) => out.try_reshape([batch, 1, self.n_state]).context(TensorSnafu)?,
-                None => {
-                    let cq_h = cq_seq.try_permute(&[0, 2, 1, 3]).context(TensorSnafu)?;
-                    let layer_ck_h = layer_ck.try_permute(&[0, 2, 1, 3]).context(TensorSnafu)?;
-                    let layer_cv_h = layer_cv.try_permute(&[0, 2, 1, 3]).context(TensorSnafu)?;
-                    let out = cq_h
-                        .scaled_dot_product_attention()
-                        .key(&layer_ck_h)
-                        .value(&layer_cv_h)
-                        .is_causal(false)
-                        .call()
-                        .context(TensorSnafu)?;
-                    block.cross_attn.merge_heads(&out)?
-                }
-            };
+            let cross_out = block.cross_attn.merge_heads(&cross_out)?;
             let cross_out = block.cross_attn.out.forward(&cross_out)?;
             x = x.try_add(&cross_out).context(TensorSnafu)?;
 

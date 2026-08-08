@@ -22,26 +22,32 @@ fn bench_sq_attention(c: &mut Criterion) {
     }
     let (b, h, d) = (5usize, 20usize, 64usize);
     let mut group = c.benchmark_group("whisper_sq_attention");
-    for &(mode, n) in &[("self", 449usize), ("cross", 1500usize)] {
+    for &(mode, n) in &[("self_short", 449usize), ("self_full", 449usize), ("cross", 1500usize)] {
         group.throughput(Throughput::Elements((4 * b * h * n * d) as u64));
         let q = randn_f32(&[b, 1, h, d]);
         let k = randn_f32(&[b, n, h, d]);
         let v = randn_f32(&[b, n, h, d]);
-        let lens_values = [444i32, 445, 446, 447, 448];
-        let lens = (mode == "self").then(|| {
+        let lens_values = if mode == "self_short" { [8i32, 9, 7, 8, 9] } else { [444i32, 445, 446, 447, 448] };
+        let lens = mode.starts_with("self").then(|| {
             let mut t = Tensor::from_slice(lens_values);
             t.realize().expect("realize lens");
             t
         });
 
-        let opts = svod_tk::SqAttentionOpts { key_lens: lens.as_ref(), include_last: mode == "self" };
-        let mut tk = svod_tk::single_query_attention(&q, &k, &v, opts).expect("sq attention").expect("supported");
-        let tk_plan = tk.prepare().expect("prepare tk");
-        group.bench_with_input(BenchmarkId::new("tk", mode), &n, |bencher, _| bench_plan(bencher, &tk_plan));
+        let splits: &[usize] = if mode == "cross" { &[1, 2, 4, 5, 10] } else { &[1] };
+        for &split in splits {
+            let opts =
+                svod_tk::SqAttentionOpts { key_lens: lens.as_ref(), include_last: mode.starts_with("self"), split };
+            let mut tk = svod_tk::single_query_attention(&q, &k, &v, opts).expect("sq attention").expect("supported");
+            let tk_plan = tk.prepare().expect("prepare tk");
+            group.bench_with_input(BenchmarkId::new(format!("tk/{mode}/split_{split}"), n), &n, |bencher, _| {
+                bench_plan(bencher, &tk_plan)
+            });
+        }
 
         let perm = |t: &Tensor| t.try_permute(&[0, 2, 1, 3]).expect("permute");
         let (qp, kp, vp) = (perm(&q), perm(&k), perm(&v));
-        let mask = (mode == "self").then(|| {
+        let mask = mode.starts_with("self").then(|| {
             let values: Vec<bool> =
                 lens_values.iter().flat_map(|&len| (0..n).map(move |i| i >= len as usize && i + 1 != n)).collect();
             Tensor::from_slice(values.as_slice()).try_reshape([b, 1, 1, n]).expect("self mask")
@@ -52,7 +58,9 @@ fn bench_sq_attention(c: &mut Criterion) {
             None => sdpa.call().expect("sdpa"),
         };
         let sdpa_plan = sdpa.prepare().expect("prepare sdpa");
-        group.bench_with_input(BenchmarkId::new("sdpa", mode), &n, |bencher, _| bench_plan(bencher, &sdpa_plan));
+        group.bench_with_input(BenchmarkId::new(format!("sdpa/{mode}"), n), &n, |bencher, _| {
+            bench_plan(bencher, &sdpa_plan)
+        });
     }
     group.finish();
 }
