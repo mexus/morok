@@ -164,6 +164,15 @@ impl WhisperRecognizer {
         let n_text_state = model.dims.n_text_state;
         let n_text_layer = model.dims.n_text_layer;
         let d_head = n_text_state / n_text_head;
+        let cross_cache_spec = InputSpec::f32(&[1, N_AUDIO_CTX, n_text_layer * n_text_head, d_head]).device_local();
+
+        // Cache-consuming decoder used for language detection.
+        let mut decoder_jit = WhisperDecoderJit::new(model.clone());
+        let tokens_spec = InputSpec::i32(&[1, 1]);
+        decoder_jit
+            .prepare_with_config(cross_cache_spec.clone(), cross_cache_spec.clone(), tokens_spec, &prepare_config)
+            .context(JitSnafu)?;
+
         // Cross-attention K/V projection is token-independent. Compile it once
         // and execute it once per encoder window, before any fallback attempts.
         let mut cross_kv_jit = WhisperCrossKvJit::new(model.clone());
@@ -171,24 +180,6 @@ impl WhisperRecognizer {
         cross_config.device_local_outputs = true;
         cross_kv_jit
             .prepare_with_config(InputSpec::f32(&[1, N_AUDIO_CTX, model.dims.n_text_state]), &cross_config)
-            .context(JitSnafu)?;
-        let cross_k_dtype = cross_kv_jit.cross_k().context(JitSnafu)?.dtype().clone();
-        let cross_v_dtype = cross_kv_jit.cross_v().context(JitSnafu)?.dtype().clone();
-        if cross_k_dtype != cross_v_dtype {
-            return Err(TranscribeError::Model {
-                source: Box::new(super::error::Error::Decode {
-                    msg: "prepared cross K/V producers have different dtypes".to_string(),
-                }),
-            });
-        }
-        let cross_cache_spec =
-            InputSpec::new(&[1, N_AUDIO_CTX, n_text_layer * n_text_head, d_head], cross_k_dtype.clone()).device_local();
-
-        // Cache-consuming decoder used for language detection.
-        let mut decoder_jit = WhisperDecoderJit::new(model.clone());
-        let tokens_spec = InputSpec::i32(&[1, 1]);
-        decoder_jit
-            .prepare_with_config(cross_cache_spec.clone(), cross_cache_spec.clone(), tokens_spec, &prepare_config)
             .context(JitSnafu)?;
 
         // Timestamp-enabled prefill has a structural, model-specific prefix:
@@ -204,15 +195,6 @@ impl WhisperRecognizer {
                 &prepare_config,
             )
             .context(JitSnafu)?;
-        let self_k_dtype = prefill_jit.self_k().context(JitSnafu)?.dtype().clone();
-        let self_v_dtype = prefill_jit.self_v().context(JitSnafu)?.dtype().clone();
-        if self_k_dtype != self_v_dtype {
-            return Err(TranscribeError::Model {
-                source: Box::new(super::error::Error::Decode {
-                    msg: "prepared self K/V producers have different dtypes".to_string(),
-                }),
-            });
-        }
 
         let n_text_head_local = n_text_head;
 
@@ -224,21 +206,11 @@ impl WhisperRecognizer {
             .prepare_with_config(
                 InputSpec::i32(&[max_lanes, 1]),
                 InputSpec::f32(&[max_lanes, 1, n_text_state]),
-                InputSpec::new(
-                    &[max_lanes, N_TEXT_CTX, n_text_layer * n_text_head_local, d_head],
-                    self_k_dtype.clone(),
-                )
-                .device_local(),
-                InputSpec::new(&[max_lanes, N_TEXT_CTX, n_text_layer * n_text_head_local, d_head], self_k_dtype)
-                    .device_local(),
-                InputSpec::new(
-                    &[max_lanes, N_AUDIO_CTX, n_text_layer * n_text_head_local, d_head],
-                    cross_k_dtype.clone(),
-                )
-                .device_local(),
-                InputSpec::new(&[max_lanes, N_AUDIO_CTX, n_text_layer * n_text_head_local, d_head], cross_k_dtype)
-                    .device_local(),
-                InputSpec::new(&[max_lanes, 1, 1, N_TEXT_CTX + 1], svod_dtype::DType::Bool),
+                InputSpec::f32(&[max_lanes, N_TEXT_CTX, n_text_layer * n_text_head_local, d_head]).device_local(),
+                InputSpec::f32(&[max_lanes, N_TEXT_CTX, n_text_layer * n_text_head_local, d_head]).device_local(),
+                InputSpec::f32(&[max_lanes, N_AUDIO_CTX, n_text_layer * n_text_head_local, d_head]).device_local(),
+                InputSpec::f32(&[max_lanes, N_AUDIO_CTX, n_text_layer * n_text_head_local, d_head]).device_local(),
+                InputSpec::f32(&[max_lanes, 1, 1, N_TEXT_CTX + 1]),
                 &prepare_config,
             )
             .context(JitSnafu)?;

@@ -22,7 +22,6 @@ pub struct WhisperAligner {
     n_heads: usize,
     batch_size: usize,
     cache_stride: usize,
-    cache_dtype: svod_dtype::DType,
 }
 
 /// Inputs for one lane of a prepared alignment batch.
@@ -65,19 +64,11 @@ impl WhisperAligner {
         let n_state = model.dims.n_text_state;
         let n_layer_heads = model.dims.n_text_layer * model.dims.n_text_head;
         let d_head = n_state / model.dims.n_text_head;
-        let cache_dtype = model.cross_cache_output_dtype()?;
         let alignment_model = WhisperAlignmentModel::new(model, heads.clone());
         let mut jit = WhisperAlignmentJit::new(alignment_model);
-        let cache_spec =
-            InputSpec::new(&[batch_size, N_AUDIO_CTX, n_layer_heads, d_head], cache_dtype.clone()).device_local();
+        let cache_spec = InputSpec::f32(&[batch_size, N_AUDIO_CTX, n_layer_heads, d_head]).device_local();
         jit.prepare(cache_spec.clone(), cache_spec, InputSpec::i32(&[batch_size, N_TEXT_CTX])).context(JitSnafu)?;
-        Ok(Self {
-            jit,
-            n_heads: heads.len(),
-            batch_size,
-            cache_stride: N_AUDIO_CTX * n_layer_heads * d_head,
-            cache_dtype,
-        })
+        Ok(Self { jit, n_heads: heads.len(), batch_size, cache_stride: N_AUDIO_CTX * n_layer_heads * d_head })
     }
 
     /// Align up to the concrete batch capacity prepared at construction.
@@ -104,12 +95,12 @@ impl WhisperAligner {
             return Ok((Vec::new(), AlignmentProfile::default()));
         }
 
-        let cache_bytes = self.cache_stride * self.cache_dtype.bytes();
+        let cache_bytes = self.cache_stride * std::mem::size_of::<f32>();
         let (_, packing_wall) = timed_d2d(copies.is_some(), inputs[0].cross_k, || {
             {
                 let packed_k = self.jit.cross_k_mut().context(JitSnafu)?;
                 for (lane, input) in inputs.iter().enumerate() {
-                    if input.cross_k.dtype() != self.cache_dtype
+                    if input.cross_k.dtype() != svod_dtype::DType::Float32
                         || input.cross_k.size() != cache_bytes
                         || !std::ptr::eq(packed_k.allocator(), input.cross_k.allocator())
                     {
@@ -125,7 +116,7 @@ impl WhisperAligner {
             {
                 let packed_v = self.jit.cross_v_mut().context(JitSnafu)?;
                 for (lane, input) in inputs.iter().enumerate() {
-                    if input.cross_v.dtype() != self.cache_dtype
+                    if input.cross_v.dtype() != svod_dtype::DType::Float32
                         || input.cross_v.size() != cache_bytes
                         || !std::ptr::eq(packed_v.allocator(), input.cross_v.allocator())
                         || !std::ptr::eq(input.cross_k.allocator(), input.cross_v.allocator())

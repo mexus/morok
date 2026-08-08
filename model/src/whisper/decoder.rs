@@ -139,61 +139,22 @@ impl TextDecoder {
         Tensor::cat(&permuted.iter().collect::<Vec<_>>(), 2).context(TensorSnafu)
     }
 
-    fn validate_kv_dtypes(keys: &[Tensor], values: &[Tensor], cache: &str) -> Result<()> {
-        let dtype = keys.first().map(|tensor| tensor.uop().dtype());
-        if keys.len() != values.len()
-            || dtype.is_none()
-            || keys.iter().chain(values).any(|tensor| Some(tensor.uop().dtype()) != dtype)
-        {
-            return Err(super::error::Error::Decode { msg: format!("{cache} K/V producer dtypes are inconsistent") });
-        }
-        Ok(())
-    }
-
-    /// Packed cross-cache activation/output dtype. Dense projections currently
-    /// produce their weight dtype; quantized projections must expose a separate
-    /// output contract rather than treating low-bit weight storage as cache dtype.
-    pub fn cross_cache_output_dtype(&self) -> Result<DType> {
-        let first = self.blocks.first().ok_or_else(|| super::error::Error::Decode {
-            msg: "decoder has no cross-attention projections".to_string(),
-        })?;
-        let dtype = first.cross_attn.key.weight.uop().dtype();
-        for block in &self.blocks {
-            let key = &block.cross_attn.key;
-            let value = &block.cross_attn.value;
-            let consistent = key.weight.uop().dtype() == dtype
-                && value.weight.uop().dtype() == dtype
-                && key.bias.as_ref().is_none_or(|bias| bias.uop().dtype() == dtype)
-                && value.bias.as_ref().is_none_or(|bias| bias.uop().dtype() == dtype);
-            if !consistent {
-                return Err(super::error::Error::Decode {
-                    msg: "cross-attention K/V projection output dtypes are inconsistent".to_string(),
-                });
-            }
-        }
-        Ok(dtype.clone())
-    }
-
     /// Project encoder features into the fixed packed cross-attention cache.
     /// This graph is independent of decoder tokens and runs once per window.
     pub fn project_cross_kv(&self, xa: &Tensor) -> Result<(Tensor, Tensor)> {
-        let output_dtype = self.cross_cache_output_dtype()?;
-        let xa = xa.cast(output_dtype.clone()).context(TensorSnafu)?;
         let mut cross_ks = Vec::with_capacity(self.blocks.len());
         let mut cross_vs = Vec::with_capacity(self.blocks.len());
         for block in &self.blocks {
             // Keep each GEMM independent from the final layer/head packing.
-            let k = block.cross_attn.key.forward(&xa)?.contiguous();
-            let v = block.cross_attn.value.forward(&xa)?.contiguous();
-            if k.uop().dtype() != output_dtype || v.uop().dtype() != output_dtype {
-                return Err(super::error::Error::Decode {
-                    msg: "cross-attention K/V producers violated their output dtype contract".to_string(),
-                });
-            }
+            let k = block.cross_attn.key.forward(xa)?.contiguous();
+            let v = block.cross_attn.value.forward(xa)?.contiguous();
             cross_ks.push(block.cross_attn.split_heads(&k)?);
             cross_vs.push(block.cross_attn.split_heads(&v)?);
         }
-        Ok((Self::pack_kv(cross_ks)?, Self::pack_kv(cross_vs)?))
+        Ok((
+            Self::pack_kv(cross_ks)?.cast(DType::Float32).context(TensorSnafu)?,
+            Self::pack_kv(cross_vs)?.cast(DType::Float32).context(TensorSnafu)?,
+        ))
     }
 
     /// Forward pass producing logits for all positions.
@@ -417,8 +378,13 @@ impl TextDecoder {
             .cast(DType::Float32)
             .context(TensorSnafu)?;
 
-        Self::validate_kv_dtypes(&self_ks, &self_vs, "self-cache")?;
-        Ok((logits, Self::pack_kv(self_ks)?, Self::pack_kv(self_vs)?))
+        // K/V cache outputs cast to fp32 — the cache buffers are fp32 (host
+        // round-trips them as Vec<f32>), while compute is dims.dtype (fp16).
+        Ok((
+            logits,
+            Self::pack_kv(self_ks)?.cast(DType::Float32).context(TensorSnafu)?,
+            Self::pack_kv(self_vs)?.cast(DType::Float32).context(TensorSnafu)?,
+        ))
     }
 
     /// Decoder logits using an already prepared cross-attention cache.
@@ -442,7 +408,7 @@ impl TextDecoder {
     /// - `self_v_cache`: [B, max_len, n_layer*H, Dh] self-attn V cache
     /// - `cross_k`: [B, n_audio_ctx, n_layer*H, Dh] cross-attn K (fixed)
     /// - `cross_v`: [B, n_audio_ctx, n_layer*H, Dh] cross-attn V (fixed)
-    /// - `self_mask`: [B(or 1), 1, 1, max_len+1] bool mask; true masks a position
+    /// - `self_mask`: [B(or 1), 1, 1, max_len+1] additive float mask for self-attn
     ///
     /// Returns `(logits[B, n_vocab], new_self_k[B, 1, n_layer*H, Dh], new_self_v[...])`.
     #[allow(clippy::too_many_arguments)]
@@ -510,7 +476,7 @@ impl TextDecoder {
             let full_k = Tensor::cat(&[&cached_k, &new_k_h], 2).context(TensorSnafu)?;
             let full_v = Tensor::cat(&[&cached_v, &new_v_h], 2).context(TensorSnafu)?;
 
-            // Attention with a boolean mask, avoiding promotion of low-precision scores.
+            // Attention with additive mask
             let out = q_h
                 .scaled_dot_product_attention()
                 .key(&full_k)
@@ -570,8 +536,6 @@ impl TextDecoder {
         let permuted_vs: Vec<Tensor> =
             new_vs.iter().map(|t| t.try_permute(&[0, 2, 1, 3]).context(TensorSnafu)).collect::<Result<Vec<_>>>()?;
 
-        Self::validate_kv_dtypes(&permuted_ks, &permuted_vs, "step self-cache")?;
-
         let stacked_k = Tensor::cat(&permuted_ks.iter().collect::<Vec<_>>(), 1).context(TensorSnafu)?;
         let stacked_v = Tensor::cat(&permuted_vs.iter().collect::<Vec<_>>(), 1).context(TensorSnafu)?;
 
@@ -611,7 +575,12 @@ impl TextDecoder {
         let logits =
             logits.try_reshape(&[svod_ir::SInt::Const(batch), svod_ir::SInt::Const(n_vocab)]).context(TensorSnafu)?;
 
-        Ok((logits, new_k_flat, new_v_flat))
+        // K/V outputs cast to fp32 — appended into the fp32 cache buffer via SDMA.
+        Ok((
+            logits,
+            new_k_flat.cast(DType::Float32).context(TensorSnafu)?,
+            new_v_flat.cast(DType::Float32).context(TensorSnafu)?,
+        ))
     }
 }
 

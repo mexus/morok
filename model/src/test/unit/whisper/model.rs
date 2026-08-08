@@ -172,81 +172,6 @@ fn projected_cross_kv_and_prefill_shapes_are_concrete() {
 }
 
 #[test]
-fn float16_cache_producers_preserve_dtype_at_numerical_boundaries() {
-    let mut dims = small_decoder_dims();
-    dims.dtype = DType::Float16;
-    let model = Whisper::empty(dims.clone());
-    let audio = Tensor::zeros(&[1, dims.n_audio_ctx, dims.n_text_state], DType::Float32).unwrap();
-    let tokens = Tensor::from_slice([1i32, 2, 3]).try_reshape([1usize, 3]).unwrap();
-
-    assert_eq!(model.cross_cache_output_dtype().unwrap(), DType::Float16);
-    let (cross_k, cross_v) = model.project_cross_kv(&audio).unwrap();
-    assert_eq!(cross_k.uop().dtype(), DType::Float16);
-    assert_eq!(cross_v.uop().dtype(), DType::Float16);
-
-    let (logits, self_k, self_v) = model.decode_prefill(&tokens, &cross_k, &cross_v, 0).unwrap();
-    assert_eq!(logits.uop().dtype(), DType::Float32);
-    assert_eq!(self_k.uop().dtype(), DType::Float16);
-    assert_eq!(self_v.uop().dtype(), DType::Float16);
-
-    let qk = model.align_with_cross_kv(&tokens, &cross_k, &cross_v, &[(0, 0)]).unwrap();
-    assert_eq!(qk.uop().dtype(), DType::Float32);
-
-    let token = Tensor::from_slice([4i32]).try_reshape([1usize, 1]).unwrap();
-    let pos_emb = Tensor::zeros(&[1, 1, dims.n_text_state], DType::Float32).unwrap();
-    let cache_shape = [1, dims.n_text_ctx, dims.n_text_layer * dims.n_text_head, 4];
-    let self_k_cache = Tensor::zeros(&cache_shape, DType::Float16).unwrap();
-    let self_v_cache = Tensor::zeros(&cache_shape, DType::Float16).unwrap();
-    let mask = Tensor::zeros(&[1, 1, 1, dims.n_text_ctx + 1], DType::Bool).unwrap();
-    let (step_logits, new_k, new_v) =
-        model.decode_step(&token, &pos_emb, &self_k_cache, &self_v_cache, &cross_k, &cross_v, &mask).unwrap();
-    assert_eq!(step_logits.uop().dtype(), DType::Float32);
-    assert_eq!(new_k.uop().dtype(), DType::Float16);
-    assert_eq!(new_v.uop().dtype(), DType::Float16);
-}
-
-#[test]
-fn inconsistent_cross_projection_state_is_rejected() {
-    let mut dims = small_decoder_dims();
-    dims.dtype = DType::Float16;
-    let mut model = Whisper::empty(dims);
-    model.decoder.blocks[1].cross_attn.value.weight =
-        model.decoder.blocks[1].cross_attn.value.weight.cast(DType::Float32).unwrap();
-    let error = model.cross_cache_output_dtype().unwrap_err();
-    assert!(error.to_string().contains("K/V projection output dtypes are inconsistent"));
-}
-
-#[test]
-fn bool_step_mask_matches_legacy_additive_mask() {
-    let dims = small_decoder_dims();
-    let model = Whisper::empty(dims.clone());
-    let token = Tensor::from_slice([4i32]).try_reshape([1usize, 1]).unwrap();
-    let pos_emb = Tensor::zeros(&[1, 1, dims.n_text_state], DType::Float32).unwrap();
-    let self_shape = [1, dims.n_text_ctx, dims.n_text_layer * dims.n_text_head, 4];
-    let self_k = Tensor::zeros(&self_shape, DType::Float32).unwrap();
-    let self_v = Tensor::zeros(&self_shape, DType::Float32).unwrap();
-    let audio = Tensor::zeros(&[1, dims.n_audio_ctx, dims.n_text_state], DType::Float32).unwrap();
-    let (cross_k, cross_v) = model.project_cross_kv(&audio).unwrap();
-    let pos = 3;
-    let mut bool_values = vec![false; dims.n_text_ctx + 1];
-    bool_values[pos..dims.n_text_ctx].fill(true);
-    let bool_mask = Tensor::from_slice(bool_values).try_reshape([1usize, 1, 1, dims.n_text_ctx + 1]).unwrap();
-    let mut additive_values = vec![0.0f32; dims.n_text_ctx + 1];
-    additive_values[pos..dims.n_text_ctx].fill(f32::NEG_INFINITY);
-    let additive_mask = Tensor::from_slice(additive_values).try_reshape([1usize, 1, 1, dims.n_text_ctx + 1]).unwrap();
-
-    let (mut bool_logits, _, _) =
-        model.decode_step(&token, &pos_emb, &self_k, &self_v, &cross_k, &cross_v, &bool_mask).unwrap();
-    let (mut additive_logits, _, _) =
-        model.decode_step(&token, &pos_emb, &self_k, &self_v, &cross_k, &cross_v, &additive_mask).unwrap();
-    Tensor::realize_batch([&mut bool_logits, &mut additive_logits]).unwrap();
-    let bool_logits = bool_logits.as_vec::<f32>().unwrap();
-    let additive_logits = additive_logits.as_vec::<f32>().unwrap();
-    let max_delta = bool_logits.iter().zip(additive_logits).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
-    assert!(max_delta < 1e-5, "bool step mask drifted by {max_delta}");
-}
-
-#[test]
 fn prepared_cross_kv_prefill_matches_direct_decoder() {
     let dims = small_decoder_dims();
     let model = Whisper::empty(dims.clone());
@@ -330,8 +255,7 @@ fn prepared_language_detector_has_one_token_and_one_logits_row() {
 #[test]
 #[ignore = "heavy: prepares the cross projection and prefill graphs through the CPU backend"]
 fn prepared_cross_kv_graph_reuses_device_local_outputs() {
-    let mut dims = small_decoder_dims();
-    dims.dtype = DType::Float16;
+    let dims = small_decoder_dims();
     let model = Whisper::empty(dims.clone());
     let cache_shape = [1, dims.n_audio_ctx, dims.n_text_layer * dims.n_text_head, 4];
     let mut config = svod_tensor::PrepareConfig::from_env();
@@ -340,15 +264,13 @@ fn prepared_cross_kv_graph_reuses_device_local_outputs() {
     let mut cross = WhisperCrossKvJit::new(model.clone());
     cross.prepare_with_config(InputSpec::f32(&[1, dims.n_audio_ctx, dims.n_text_state]), &config).unwrap();
     cross.execute().unwrap();
-    assert_eq!(cross.cross_k().unwrap().dtype(), DType::Float16);
-    assert_eq!(cross.cross_v().unwrap().dtype(), DType::Float16);
 
     let mut prefill = WhisperPrefillJit::new(model);
     prefill
         .prepare(
             InputSpec::i32(&[1, 3]),
-            InputSpec::new(&cache_shape, DType::Float16).device_local(),
-            InputSpec::new(&cache_shape, DType::Float16).device_local(),
+            InputSpec::f32(&cache_shape).device_local(),
+            InputSpec::f32(&cache_shape).device_local(),
         )
         .unwrap();
     let cross_k = cross.cross_k().unwrap();
@@ -359,16 +281,14 @@ fn prepared_cross_kv_graph_reuses_device_local_outputs() {
     prefill.execute().unwrap();
 
     assert_eq!(prefill.logits().unwrap().size(), 3 * dims.n_vocab * std::mem::size_of::<f32>());
-    assert_eq!(prefill.self_k().unwrap().dtype(), DType::Float16);
-    assert_eq!(prefill.self_v().unwrap().dtype(), DType::Float16);
     assert_eq!(prefill.prepared_cross_k_mut().unwrap().size(), cross_k.size());
     assert_eq!(prefill.prepared_cross_v_mut().unwrap().size(), cross_v.size());
 
     let mut detector = WhisperDecoderJit::new(Whisper::empty(dims.clone()));
     detector
         .prepare(
-            InputSpec::new(&cache_shape, DType::Float16).device_local(),
-            InputSpec::new(&cache_shape, DType::Float16).device_local(),
+            InputSpec::f32(&cache_shape).device_local(),
+            InputSpec::f32(&cache_shape).device_local(),
             InputSpec::i32(&[1, 1]),
         )
         .unwrap();

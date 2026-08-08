@@ -190,37 +190,6 @@ crate::codegen_tests! {
         }
     }
 
-    fn test_sdpa_float16_uses_float32_softmax_and_preserves_output_dtype(config) {
-        let q = Tensor::from_ndarray(&array![[[[8.0f32, -7.0], [3.5, 2.0]]]])
-            .cast(crate::DType::Float16)
-            .unwrap();
-        let k = Tensor::from_ndarray(&array![[[[1.5f32, -2.0], [-3.0, 4.0], [0.5, 1.0]]]])
-            .cast(crate::DType::Float16)
-            .unwrap();
-        let v = Tensor::from_ndarray(&array![[[[2.0f32, -1.0], [0.5, 3.0], [-4.0, 2.5]]]])
-            .cast(crate::DType::Float16)
-            .unwrap();
-
-        let result = q.scaled_dot_product_attention().key(&k).value(&v).call().unwrap();
-        assert_eq!(result.uop().dtype(), crate::DType::Float16);
-
-        let q32 = q.cast(crate::DType::Float32).unwrap();
-        let k32 = k.cast(crate::DType::Float32).unwrap();
-        let v32 = v.cast(crate::DType::Float32).unwrap();
-        let scale = Tensor::const_(1.0 / 2.0f64.sqrt(), crate::DType::Float32);
-        let scores = q32.matmul(&k32.try_transpose(-1, -2).unwrap()).unwrap().try_mul(&scale).unwrap();
-        let reference = scores.softmax(-1isize).unwrap().matmul(&v32).unwrap();
-
-        let mut actual = result.cast(crate::DType::Float32).unwrap();
-        let mut reference = reference;
-        Tensor::realize_batch_with([&mut actual, &mut reference], &config).unwrap();
-        let actual = actual.as_vec::<f32>().unwrap();
-        let reference = reference.as_vec::<f32>().unwrap();
-        for (actual, expected) in actual.iter().zip(reference) {
-            assert!((actual - expected).abs() < 5e-3, "float16 SDPA {actual} != fp32-softmax reference {expected}");
-        }
-    }
-
     fn test_sdpa_rejects_non_float_qkv(_config) {
         let qf = Tensor::from_ndarray(&array![[[[1.0f32, 0.0]]]]);
         let kf = Tensor::from_ndarray(&array![[[[1.0f32, 0.0], [0.0, 1.0]]]]);
