@@ -76,7 +76,7 @@ pub struct WhisperRecognizer {
 
 struct RecognizedWindow {
     result: super::decode::DecodeResult,
-    audio_features: Vec<f32>,
+    audio_features: svod_device::Buffer,
     audio_samples: usize,
 }
 
@@ -441,14 +441,14 @@ impl WhisperRecognizer {
                 self.encoder_jit.execute().context(JitSnafu)?;
             }
 
-            // Device-local output → SDMA copyout of only the b valid lanes
+            // Encoder output remains device-local. Each valid lane is retained
+            // as an owned snapshot for the later alignment stage.
             let out_buf = self.encoder_jit.output().context(JitSnafu)?;
-            let mut raw = vec![0f32; b * item_stride];
-            out_buf.copyout_prefix(bytemuck::cast_slice_mut(&mut raw)).context(DeviceSnafu)?;
             t_encoder += t.elapsed();
 
             let mut seeds = Vec::with_capacity(b);
             let mut decode_options = Vec::with_capacity(b);
+            let mut alignment_audio = Vec::with_capacity(b);
 
             // Cross projection and token prefill remain per-window. Their
             // immutable device-local seeds are retained until the shared
@@ -518,6 +518,11 @@ impl WhisperRecognizer {
                 t_decode += t.elapsed();
                 seeds.push(seed);
                 decode_options.push(options);
+                alignment_audio.push(snapshot_device_region(
+                    out_buf,
+                    base * std::mem::size_of::<f32>(),
+                    item_stride * std::mem::size_of::<f32>(),
+                )?);
             }
 
             let t = Instant::now();
@@ -533,14 +538,15 @@ impl WhisperRecognizer {
             .map_err(|error| TranscribeError::Model { source: Box::new(error) })?;
             t_decode += t.elapsed();
 
-            for (bi, (mut result, options)) in results.into_iter().zip(&decode_options).enumerate() {
+            for (bi, ((mut result, options), audio_features)) in
+                results.into_iter().zip(&decode_options).zip(alignment_audio).enumerate()
+            {
                 if result.should_skip(options) {
                     result.clear_speech();
                 }
-                let base = bi * item_stride;
                 recognized.push(RecognizedWindow {
                     result,
-                    audio_features: raw[base..base + item_stride].to_vec(),
+                    audio_features,
                     audio_samples: windows[batch_start + bi].len(),
                 });
             }
@@ -554,4 +560,28 @@ impl WhisperRecognizer {
 
         Ok((recognized, prof))
     }
+}
+
+fn snapshot_device_region(
+    src: &svod_device::Buffer,
+    src_offset: usize,
+    len: usize,
+) -> Result<svod_device::Buffer, TranscribeError> {
+    let dtype = src.dtype();
+    if dtype != svod_dtype::DType::Float32 || len == 0 || !len.is_multiple_of(dtype.bytes()) {
+        return Err(TranscribeError::Model {
+            source: Box::new(super::error::Error::Decode {
+                msg: "encoder feature snapshot has invalid dtype or size".to_string(),
+            }),
+        });
+    }
+    let mut snapshot = svod_device::Buffer::allocate(
+        src.allocator_arc(),
+        dtype.clone(),
+        vec![len / dtype.bytes()],
+        svod_device::BufferSpec { cpu_access: false, ..Default::default() },
+    )
+    .context(DeviceSnafu)?;
+    snapshot.copy_region_from(0, src, src_offset, len).context(DeviceSnafu)?;
+    Ok(snapshot)
 }

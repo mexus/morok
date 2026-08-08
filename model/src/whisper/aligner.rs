@@ -22,10 +22,10 @@ pub struct WhisperAligner {
     audio_stride: usize,
 }
 
-/// Host-owned inputs for one lane of a prepared alignment batch.
+/// Inputs for one lane of a prepared alignment batch.
 pub struct WhisperAlignmentInput<'a> {
-    /// Encoder output in `[N_AUDIO_CTX, n_audio_state]` layout.
-    pub audio_features: &'a [f32],
+    /// Device-resident encoder output in `[N_AUDIO_CTX, n_audio_state]` layout.
+    pub audio_features: &'a svod_device::Buffer,
     /// Recognition tokens, including timestamp tokens when emitted.
     pub decoded_tokens: &'a [u32],
     /// Decoder probability corresponding to each decoded token.
@@ -68,13 +68,26 @@ impl WhisperAligner {
         }
 
         let audio_stride = self.audio_stride;
-        let mut packed_audio = vec![0.0f32; self.batch_size * audio_stride];
+        let audio_bytes = audio_stride * std::mem::size_of::<f32>();
+        {
+            let packed_audio = self.jit.audio_features_mut().context(JitSnafu)?;
+            for (lane, input) in inputs.iter().enumerate() {
+                if input.audio_features.dtype() != svod_dtype::DType::Float32
+                    || input.audio_features.size() != audio_bytes
+                {
+                    return Err(super::error::Error::Decode {
+                        msg: "alignment encoder features have invalid dtype or size".to_string(),
+                    });
+                }
+                packed_audio
+                    .copy_region_from(lane * audio_bytes, input.audio_features, 0, audio_bytes)
+                    .context(DeviceSnafu)?;
+            }
+        }
+
         let mut packed_tokens = vec![tokenizer.eot() as i32; self.batch_size * N_TEXT_CTX];
         let mut metadata = Vec::with_capacity(inputs.len());
         for (lane, input) in inputs.iter().enumerate() {
-            packed_audio[lane * audio_stride..lane * audio_stride + input.audio_features.len()]
-                .copy_from_slice(input.audio_features);
-
             let mut text_tokens: Vec<u32> =
                 input.decoded_tokens.iter().copied().filter(|&token| token < tokenizer.eot()).collect();
             let mut token_probs = input.token_probs[..input.token_probs.len().min(text_tokens.len())].to_vec();
@@ -100,12 +113,6 @@ impl WhisperAligner {
             metadata.push((text_tokens, token_probs, valid_text, sot_len));
         }
 
-        self.jit
-            .audio_features_mut()
-            .context(JitSnafu)?
-            .as_host_bytes_mut()
-            .context(DeviceSnafu)?
-            .copy_from_slice(bytemuck::cast_slice(&packed_audio));
         self.jit
             .tokens_mut()
             .context(JitSnafu)?
