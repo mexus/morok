@@ -66,6 +66,7 @@ fn generalized_scheduler_runs_greedy_with_slot_refill() {
     }
     let profile = profile.unwrap();
     let decode = profile.stage("decode").unwrap();
+    assert!(!decode.kernels.is_empty());
     assert!(decode.meta["dispatches"].parse::<usize>().unwrap() > 0);
     assert!(decode.meta["active_row_steps"].parse::<usize>().unwrap() > 0);
     assert!(decode.meta["row_utilization"].parse::<f64>().unwrap() > 0.0);

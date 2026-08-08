@@ -708,7 +708,8 @@ pub(crate) fn run_fixed_slot_decode(
     tokenizer: &WhisperTokenizer,
     n_text_ctx: usize,
     n_vocab: usize,
-) -> Result<(Vec<DecodeResult>, DecodeScheduleStats)> {
+    profile: bool,
+) -> Result<(Vec<DecodeResult>, DecodeScheduleStats, Vec<svod_runtime::KernelProfile>)> {
     if seeds.len() != request_options.len() {
         return Err(decode_err("decode seed/options count mismatch"));
     }
@@ -727,6 +728,7 @@ pub(crate) fn run_fixed_slot_decode(
     let mut attempts: Vec<Option<ScheduledAttempt>> = (0..seeds.len()).map(|_| None).collect();
     let mut results: Vec<Option<DecodeResult>> = (0..seeds.len()).map(|_| None).collect();
     let mut stats = DecodeScheduleStats::default();
+    let mut profiled_kernels = Vec::new();
     let mut rngs: Vec<_> =
         request_options.iter().enumerate().map(|(request, options)| sampling_rng(options, request)).collect();
 
@@ -815,7 +817,11 @@ pub(crate) fn run_fixed_slot_decode(
                     AttemptKind::Beam(beam) => beam.active.len(),
                 })
                 .sum::<usize>();
-            step_jit.execute().context(JitSnafu)?;
+            if profile && profiled_kernels.is_empty() {
+                profiled_kernels = step_jit.execute_profiled().context(JitSnafu)?;
+            } else {
+                step_jit.execute().context(JitSnafu)?;
+            }
             for &request in &active_requests {
                 let attempt = attempts[request].as_mut().expect("active attempt");
                 let sample_len = request_options[request].sample_len.unwrap_or(n_text_ctx / 2);
@@ -941,7 +947,7 @@ pub(crate) fn run_fixed_slot_decode(
         }
     }
 
-    Ok((collect_ordered(results).map_err(decode_err)?, stats))
+    Ok((collect_ordered(results).map_err(decode_err)?, stats, profiled_kernels))
 }
 
 // ─── Batched JIT buffer row helpers ─────────────────────────────────────────

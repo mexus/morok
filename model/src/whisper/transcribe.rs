@@ -415,6 +415,7 @@ impl WhisperRecognizer {
         let mut recognized = Vec::with_capacity(windows.len());
         let mut prof = profile.then(RunProfile::default);
         let mut encoder_kernels = Vec::new();
+        let mut decode_kernels = Vec::new();
         let mut decode_stats = DecodeScheduleStats::default();
         let (mut t_mel, mut t_encoder, mut t_decode) = (Duration::ZERO, Duration::ZERO, Duration::ZERO);
 
@@ -529,7 +530,7 @@ impl WhisperRecognizer {
             }
 
             let t = Instant::now();
-            let (results, batch_stats) = run_fixed_slot_decode(
+            let (results, batch_stats, batch_kernels) = run_fixed_slot_decode(
                 &seeds,
                 &decode_options,
                 &mut self.batched_step_jit,
@@ -537,9 +538,13 @@ impl WhisperRecognizer {
                 &self.tokenizer,
                 n_text_ctx,
                 n_vocab,
+                profile && decode_kernels.is_empty(),
             )
             .map_err(|error| TranscribeError::Model { source: Box::new(error) })?;
             decode_stats.merge(batch_stats);
+            if decode_kernels.is_empty() {
+                decode_kernels = batch_kernels;
+            }
             t_decode += t.elapsed();
 
             for (bi, ((mut result, options), audio_features)) in
@@ -559,7 +564,7 @@ impl WhisperRecognizer {
         if let Some(p) = &mut prof {
             p.push(StageProfile::host("mel", t_mel));
             p.push(StageProfile::gpu("encoder", t_encoder, encoder_kernels));
-            let mut decode = StageProfile::host("decode", t_decode);
+            let mut decode = StageProfile::gpu("decode", t_decode, decode_kernels);
             decode.meta.insert("dispatches".into(), decode_stats.dispatches.to_string());
             decode.meta.insert("active_row_steps".into(), decode_stats.active_row_steps.to_string());
             decode.meta.insert("reserved_row_steps".into(), decode_stats.reserved_row_steps.to_string());

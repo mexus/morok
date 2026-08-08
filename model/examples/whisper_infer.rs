@@ -8,25 +8,33 @@
 //!   cargo run -p svod-model --release --example whisper_infer -- audio.wav
 //!   cargo run -p svod-model --release --example whisper_infer -- audio.wav --profile
 //!   cargo run -p svod-model --release --example whisper_infer -- audio.wav --size base
+//!   cargo run -p svod-model --release --example whisper_infer -- audio.wav --warmup 1 --runs 5 --profile
 //!
 //! Options:
 //!   --size       Model size: tiny, base, small, medium, large-v3, turbo (default: tiny)
 //!   --language   Language code: en, fr, de, ..., or auto (default: auto)
 //!   --task       transcribe or translate (default: transcribe)
-//!   --profile    Print per-stage GPU profile
+//!   --profile    Run and print a separate per-stage GPU profile
 //!   --timestamps Print word timestamps
 //!   --repo       HF Hub repo (default: openai/whisper-{size})
 
 use std::path::PathBuf;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 
 use svod_arch::pipelines::audio::{Asr, FixedLengthSplitter, RunOptions};
 use svod_model::whisper::{
-    CHUNK_LENGTH, DecodeOptions, DecodeStrategy, SAMPLE_RATE, Whisper, WhisperAlignedTranscriber, WhisperSize,
-    WhisperTask, WhisperTokenizer,
+    CHUNK_LENGTH, DecodeOptions, DecodeStrategy, SAMPLE_RATE, Whisper, WhisperAlignedTranscriber, WhisperPlan,
+    WhisperSize, WhisperTask, WhisperTokenizer,
 };
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum Strategy {
+    Greedy,
+    Beam,
+    Sample,
+}
 
 #[derive(Parser, Debug)]
 #[command(about = "Whisper ASR transcription demo", long_about = None)]
@@ -49,6 +57,38 @@ struct Args {
     /// Task: transcribe or translate.
     #[arg(long, default_value = "transcribe")]
     task: WhisperTask,
+
+    /// Primary decoding strategy.
+    #[arg(long, value_enum, default_value_t = Strategy::Beam)]
+    strategy: Strategy,
+
+    /// Beam width used by `--strategy beam`.
+    #[arg(long, default_value_t = 5)]
+    beam_size: usize,
+
+    /// Temperature used by `--strategy sample`.
+    #[arg(long, default_value_t = 0.8)]
+    temperature: f32,
+
+    /// Disable quality-gated sampling fallback.
+    #[arg(long)]
+    no_fallback: bool,
+
+    /// Reproducible base seed for sampling and sampling fallback.
+    #[arg(long)]
+    sampling_seed: Option<u64>,
+
+    /// Override the concrete decoder row capacity.
+    #[arg(long)]
+    decoder_slots: Option<usize>,
+
+    /// Untimed warmup iterations.
+    #[arg(long, default_value_t = 0)]
+    warmup: usize,
+
+    /// Timed steady-state iterations.
+    #[arg(long, default_value_t = 1)]
+    runs: usize,
 
     /// Print word timestamps.
     #[arg(long)]
@@ -88,23 +128,71 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let options = DecodeOptions {
         task: args.task,
         language: if args.language == "auto" { None } else { Some(args.language.clone()) },
-        strategy: DecodeStrategy::Beam { size: 5 },
+        strategy: match args.strategy {
+            Strategy::Greedy => DecodeStrategy::Greedy,
+            Strategy::Beam => DecodeStrategy::Beam { size: args.beam_size },
+            Strategy::Sample => DecodeStrategy::Sample { temperature: args.temperature },
+        },
+        fallback: (!args.no_fallback).then(Default::default),
+        sampling_seed: args.sampling_seed,
         ..Default::default()
     };
+    if args.runs == 0 {
+        return Err("--runs must be non-zero".into());
+    }
 
     // Fixed-length 30s windows (no VAD dependency)
     let window_samples = CHUNK_LENGTH * SAMPLE_RATE;
     let splitter = FixedLengthSplitter::new(window_samples, SAMPLE_RATE);
 
-    let transcriber = WhisperAlignedTranscriber::new(model, tokenizer, options, size, window_samples)?;
+    let mut plan = WhisperPlan::for_model(&model.dims, size);
+    if let Some(decoder_slots) = args.decoder_slots {
+        plan.decoder_slots = decoder_slots;
+    }
+    println!(
+        "Plan: encoder batch {}, decoder slots {}, alignment batch {}",
+        plan.encoder_batch, plan.decoder_slots, plan.alignment_batch,
+    );
+    let transcriber = WhisperAlignedTranscriber::new_with_plan(model, tokenizer, options, size, window_samples, plan)?;
 
     let mut asr = Asr::new(splitter, transcriber);
 
-    println!("Transcribing...");
-    let t_transcribe = Instant::now();
-    let result =
-        asr.transcribe(&waveform, RunOptions { words: args.timestamps, profile: args.profile, ..Default::default() })?;
-    let dt_transcribe = t_transcribe.elapsed();
+    for iteration in 0..args.warmup {
+        let started = Instant::now();
+        let _ = asr.transcribe(&waveform, RunOptions::default())?;
+        println!("Warmup {}/{}: {:.3}s", iteration + 1, args.warmup, started.elapsed().as_secs_f64());
+    }
+
+    println!("Running {} measured iteration(s)...", args.runs);
+    let mut durations = Vec::with_capacity(args.runs);
+    let mut result = None;
+    for iteration in 0..args.runs {
+        let started = Instant::now();
+        let current =
+            asr.transcribe(&waveform, RunOptions { words: args.timestamps, profile: false, ..Default::default() })?;
+        let elapsed = started.elapsed();
+        let rtf = rtf(elapsed, duration_s);
+        println!("Run {}/{}: {:.3}s, RTF {:.5}x", iteration + 1, args.runs, elapsed.as_secs_f64(), rtf);
+        durations.push(elapsed);
+        result = Some(current);
+    }
+    let result = result.expect("at least one measured run");
+
+    if args.profile {
+        println!("\nRunning separate profiling pass (excluded from RTF)...");
+        let profiled = asr.transcribe(&waveform, RunOptions { profile: true, ..Default::default() })?;
+        if let Some(profile) = &profiled.profile {
+            println!("\n--- Profile ---\n{profile}");
+            for stage in &profile.stages {
+                if !stage.meta.is_empty() {
+                    println!("{} metadata:", stage.name);
+                    for (key, value) in &stage.meta {
+                        println!("  {key}: {value}");
+                    }
+                }
+            }
+        }
+    }
 
     if args.timestamps {
         for chunk in &result.chunks {
@@ -125,19 +213,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    if let Some(profile) = &result.profile {
-        println!("\n--- Profile ---\n{profile}");
-    }
-
     println!("\n--- Transcript ---\n{}", result.text);
+    let min = durations.iter().copied().min().unwrap_or(Duration::ZERO);
+    let max = durations.iter().copied().max().unwrap_or(Duration::ZERO);
+    let avg = durations.iter().sum::<Duration>() / durations.len() as u32;
     println!(
-        "\nTotal: {:.2}s; transcribe: {:.2}s; loop RTF: {:.4}x",
+        "\nMeasured: min {:.3}s / avg {:.3}s / max {:.3}s over {} run(s)",
+        min.as_secs_f64(),
+        avg.as_secs_f64(),
+        max.as_secs_f64(),
+        durations.len(),
+    );
+    println!(
+        "RTF: min {:.5}x / avg {:.5}x; throughput {:.2}x realtime; total process {:.2}s",
+        rtf(min, duration_s),
+        rtf(avg, duration_s),
+        if avg.is_zero() { 0.0 } else { duration_s / avg.as_secs_f64() as f32 },
         t_total.elapsed().as_secs_f32(),
-        dt_transcribe.as_secs_f32(),
-        if duration_s > 0.0 { dt_transcribe.as_secs_f32() / duration_s } else { 0.0 },
     );
 
     Ok(())
+}
+
+fn rtf(elapsed: Duration, audio_seconds: f32) -> f64 {
+    if audio_seconds > 0.0 { elapsed.as_secs_f64() / audio_seconds as f64 } else { 0.0 }
 }
 
 fn load_wav(path: &PathBuf) -> Result<(Vec<f32>, u32), Box<dyn std::error::Error>> {
