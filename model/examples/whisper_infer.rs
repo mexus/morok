@@ -1,8 +1,8 @@
 //! Whisper inference demo: transcribe a WAV file using Whisper ASR.
 //!
 //! Loads a WAV and runs it through an [`Asr`]: a [`FixedLengthSplitter`] feeds
-//! a [`WhisperTranscriber`]. Each 30-second window is mel → encoder JIT →
-//! greedy decode with logit filters (suppress tokens, timestamp rules).
+//! a [`WhisperAlignedTranscriber`]. Each 30-second window is mel → encoder JIT →
+//! cached beam decoding with temperature fallback, followed by DTW alignment.
 //!
 //! Usage:
 //!   cargo run -p svod-model --release --example whisper_infer -- audio.wav
@@ -11,10 +11,10 @@
 //!
 //! Options:
 //!   --size       Model size: tiny, base, small, medium, large-v3, turbo (default: tiny)
-//!   --language   Language code: en, fr, de, ... (default: en)
+//!   --language   Language code: en, fr, de, ..., or auto (default: auto)
 //!   --task       transcribe or translate (default: transcribe)
 //!   --profile    Print per-stage GPU profile
-//!   --timestamps Print per-chunk timestamps
+//!   --timestamps Print word timestamps
 //!   --repo       HF Hub repo (default: openai/whisper-{size})
 
 use std::path::PathBuf;
@@ -24,7 +24,8 @@ use clap::Parser;
 
 use svod_arch::pipelines::audio::{Asr, FixedLengthSplitter, RunOptions};
 use svod_model::whisper::{
-    CHUNK_LENGTH, DecodeOptions, SAMPLE_RATE, Whisper, WhisperSize, WhisperTokenizer, WhisperTranscriber,
+    CHUNK_LENGTH, DecodeOptions, SAMPLE_RATE, Whisper, WhisperAlignedTranscriber, WhisperSize, WhisperTask,
+    WhisperTokenizer,
 };
 
 #[derive(Parser, Debug)]
@@ -47,9 +48,9 @@ struct Args {
 
     /// Task: transcribe or translate.
     #[arg(long, default_value = "transcribe")]
-    task: String,
+    task: WhisperTask,
 
-    /// Print per-chunk timestamps.
+    /// Print word timestamps.
     #[arg(long)]
     timestamps: bool,
 
@@ -85,9 +86,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let tokenizer = WhisperTokenizer::from_hub(multilingual, num_languages)?;
 
     let options = DecodeOptions {
-        task: args.task.clone(),
+        task: args.task,
         language: if args.language == "auto" { None } else { Some(args.language.clone()) },
-        without_timestamps: true,
         beam_size: Some(5), // beam search — uses KV-cached fast path
         ..Default::default()
     };
@@ -96,18 +96,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let window_samples = CHUNK_LENGTH * SAMPLE_RATE;
     let splitter = FixedLengthSplitter::new(window_samples, SAMPLE_RATE);
 
-    let transcriber = WhisperTranscriber::new(model, tokenizer, options, size, window_samples)?;
+    let transcriber = WhisperAlignedTranscriber::new(model, tokenizer, options, size, window_samples)?;
 
     let mut asr = Asr::new(splitter, transcriber);
 
     println!("Transcribing...");
     let t_transcribe = Instant::now();
-    let result = asr.transcribe(&waveform, RunOptions { words: args.timestamps, profile: args.profile })?;
+    let result =
+        asr.transcribe(&waveform, RunOptions { words: args.timestamps, profile: args.profile, ..Default::default() })?;
     let dt_transcribe = t_transcribe.elapsed();
 
-    for chunk in &result.chunks {
-        if !chunk.text.is_empty() {
-            println!("  [{:>6.1}s] {}", chunk.start_sec, chunk.text);
+    if args.timestamps {
+        for chunk in &result.chunks {
+            for word in chunk.words.as_deref().unwrap_or_default() {
+                println!(
+                    "  [{:>6.2}s - {:>6.2}s] {}",
+                    chunk.start_sec + word.start,
+                    chunk.start_sec + word.end,
+                    word.text.trim(),
+                );
+            }
+        }
+    } else {
+        for chunk in &result.chunks {
+            if !chunk.text.is_empty() {
+                println!("  [{:>6.1}s] {}", chunk.start_sec, chunk.text);
+            }
         }
     }
 

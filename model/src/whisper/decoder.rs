@@ -2,8 +2,8 @@
 
 use snafu::ResultExt;
 use svod_dtype::DType;
-use svod_ir::SInt;
-use svod_tensor::{BoundVariable, Tensor};
+use svod_ir::ConstValue;
+use svod_tensor::Tensor;
 
 use crate::init::fan_in_uniform;
 use crate::state::{self, HasStateDict, StateDict, get_tensor, prefixed};
@@ -157,6 +157,31 @@ impl TextDecoder {
         }
     }
 
+    fn pack_kv(kvs: Vec<Tensor>) -> Result<Tensor> {
+        let permuted: Vec<Tensor> = kvs
+            .into_iter()
+            .map(|tensor| tensor.try_permute(&[0, 2, 1, 3]).context(TensorSnafu))
+            .collect::<Result<Vec<_>>>()?;
+        Tensor::cat(&permuted.iter().collect::<Vec<_>>(), 2).context(TensorSnafu)
+    }
+
+    /// Project encoder features into the fixed packed cross-attention cache.
+    /// This graph is independent of decoder tokens and runs once per window.
+    pub fn project_cross_kv(&self, xa: &Tensor) -> Result<(Tensor, Tensor)> {
+        let mut cross_ks = Vec::with_capacity(self.blocks.len());
+        let mut cross_vs = Vec::with_capacity(self.blocks.len());
+        for block in &self.blocks {
+            let k = block.cross_attn.key.forward(xa)?;
+            let v = block.cross_attn.value.forward(xa)?;
+            cross_ks.push(block.cross_attn.split_heads(&k)?);
+            cross_vs.push(block.cross_attn.split_heads(&v)?);
+        }
+        Ok((
+            Self::pack_kv(cross_ks)?.cast(DType::Float32).context(TensorSnafu)?,
+            Self::pack_kv(cross_vs)?.cast(DType::Float32).context(TensorSnafu)?,
+        ))
+    }
+
     /// Forward pass producing logits for all positions.
     /// `tokens`: `[B, L]` int tensor. `xa`: `[B, T_enc, D]` encoder output.
     /// `offset`: positional embedding offset (for KV-cached incremental decoding).
@@ -195,9 +220,14 @@ impl TextDecoder {
         logits.cast(DType::Float32).context(TensorSnafu)
     }
 
-    /// Forward pass returning both logits and cross-attention QK weights per layer.
-    /// Used for DTW word-level alignment.
-    pub fn forward_with_alignment(&self, tokens: &Tensor, xa: &Tensor, offset: usize) -> Result<(Tensor, Vec<Tensor>)> {
+    /// Teacher-forced decoder pass returning raw scaled cross-attention QK
+    /// scores for the statically selected alignment heads.
+    pub fn forward_alignment(
+        &self,
+        tokens: &Tensor,
+        xa: &Tensor,
+        alignment_heads: &[(usize, usize)],
+    ) -> Result<Tensor> {
         let seq_len =
             tokens.shape().context(TensorSnafu)?[1].as_const().ok_or_else(|| super::error::Error::Tensor {
                 source: Box::new(svod_tensor::error::Error::SymbolicShapeUnsupported {
@@ -207,10 +237,8 @@ impl TextDecoder {
 
         let tok_emb = self.token_embedding.embedding(tokens).context(TensorSnafu)?;
 
-        let pos_emb = self
-            .positional_embedding
-            .try_shrink([Some((offset as isize, (offset + seq_len) as isize)), None])
-            .context(TensorSnafu)?;
+        let pos_emb =
+            self.positional_embedding.try_shrink([Some((0isize, seq_len as isize)), None]).context(TensorSnafu)?;
 
         let x = tok_emb.try_add(&pos_emb).context(TensorSnafu)?;
         let x = x.cast(xa.uop().dtype()).context(TensorSnafu)?;
@@ -218,28 +246,66 @@ impl TextDecoder {
         let mask = causal_mask(seq_len, x.uop().dtype().clone())?;
 
         let mut x = x;
-        let mut all_qk = Vec::with_capacity(self.blocks.len());
-        for block in &self.blocks {
-            let (out, qk) = block.forward_with_qk(&x, xa, &mask)?;
-            x = out;
-            all_qk.push(qk);
-        }
+        let mut selected_qk = Vec::with_capacity(alignment_heads.len());
+        for (layer, block) in self.blocks.iter().enumerate() {
+            let h = block.attn_ln.apply(&x)?;
+            let attn_out = block.attn.forward(&h, None, Some(&mask))?;
+            x = x.try_add(&attn_out).context(TensorSnafu)?;
 
-        let x = self.ln.apply(&x)?;
-        let logits = x.linear().weight(&self.token_embedding).call().context(TensorSnafu)?;
-        Ok((logits.cast(DType::Float32).context(TensorSnafu)?, all_qk))
+            let h = block.cross_attn_ln.apply(&x)?;
+            let cross_out = block.cross_attn.forward(&h, Some(xa), None)?;
+            x = x.try_add(&cross_out).context(TensorSnafu)?;
+
+            let layer_heads: Vec<usize> = alignment_heads
+                .iter()
+                .filter_map(|&(selected_layer, head)| (selected_layer == layer).then_some(head))
+                .collect();
+            if !layer_heads.is_empty() {
+                // Keep the normal fused attention path above. Q/K are tapped a
+                // second time only in selected layers, and only selected head
+                // score matrices become graph outputs.
+                let q_heads = block.cross_attn.split_heads(&block.cross_attn.query.forward(&h)?)?;
+                let k_heads = block.cross_attn.split_heads(&block.cross_attn.key.forward(xa)?)?;
+                for head in layer_heads {
+                    let selected_q = q_heads
+                        .try_shrink([None, Some((head as isize, head as isize + 1)), None, None])
+                        .context(TensorSnafu)?;
+                    let selected_k = k_heads
+                        .try_shrink([None, Some((head as isize, head as isize + 1)), None, None])
+                        .context(TensorSnafu)?;
+                    let kt = selected_k.try_transpose(-1, -2).context(TensorSnafu)?;
+                    let scores = selected_q.matmul(&kt).context(TensorSnafu)?;
+                    let scale = Tensor::const_(
+                        ConstValue::Float(1.0 / ((self.n_state / self.n_head) as f64).sqrt()),
+                        scores.uop().dtype().clone(),
+                    );
+                    selected_qk.push(scores.try_mul(&scale).context(TensorSnafu)?);
+                }
+            }
+
+            let h = block.mlp_ln.apply(&x)?;
+            let h = h.linear().weight(&block.mlp0_w).bias(&block.mlp0_b).call().context(TensorSnafu)?;
+            let h = h.gelu_exact().context(TensorSnafu)?;
+            let h = h.linear().weight(&block.mlp1_w).bias(&block.mlp1_b).call().context(TensorSnafu)?;
+            x = x.try_add(&h).context(TensorSnafu)?;
+        }
+        Tensor::cat(&selected_qk.iter().collect::<Vec<_>>(), 1)
+            .context(TensorSnafu)?
+            .cast(DType::Float32)
+            .context(TensorSnafu)
     }
 
-    /// Prefill returning flat-packed K/V caches + logits for JIT.
-    /// Returns (logits[1,init_len,n_vocab], self_k, self_v, cross_k, cross_v)
-    /// where each packed K/V is [1, seq_len, n_layer*H, Dh].
-    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    /// Prefill consuming fixed packed cross-attention caches.
+    /// Returns `(logits[1, init_len, n_vocab], self_k, self_v)`, where each packed
+    /// self K/V is [1, seq_len, n_layer*H, Dh].
+    #[allow(clippy::too_many_arguments)]
     pub fn forward_prefill(
         &self,
         tokens: &Tensor,
-        xa: &Tensor,
+        cross_k: &Tensor,
+        cross_v: &Tensor,
         offset: usize,
-    ) -> Result<(Tensor, Tensor, Tensor, Tensor, Tensor)> {
+    ) -> Result<(Tensor, Tensor, Tensor)> {
         let seq_len =
             tokens.shape().context(TensorSnafu)?[1].as_const().ok_or_else(|| super::error::Error::Tensor {
                 source: Box::new(svod_tensor::error::Error::SymbolicShapeUnsupported {
@@ -254,17 +320,15 @@ impl TextDecoder {
             .context(TensorSnafu)?;
 
         let x = tok_emb.try_add(&pos_emb).context(TensorSnafu)?;
-        let x = x.cast(xa.uop().dtype()).context(TensorSnafu)?;
+        let x = x.cast(cross_k.uop().dtype()).context(TensorSnafu)?;
 
         let mask = causal_mask(seq_len, x.uop().dtype().clone())?;
 
         let mut x = x;
         let mut self_ks: Vec<Tensor> = Vec::with_capacity(self.blocks.len());
         let mut self_vs: Vec<Tensor> = Vec::with_capacity(self.blocks.len());
-        let mut cross_ks: Vec<Tensor> = Vec::with_capacity(self.blocks.len());
-        let mut cross_vs: Vec<Tensor> = Vec::with_capacity(self.blocks.len());
 
-        for block in &self.blocks {
+        for (layer, block) in self.blocks.iter().enumerate() {
             let h = block.attn_ln.apply(&x)?;
             let (attn_out, sk, sv) = block.attn.forward_return_kv(&h, None, Some(&mask))?;
             x = x.try_add(&attn_out).context(TensorSnafu)?;
@@ -273,11 +337,29 @@ impl TextDecoder {
             self_vs.push(block.attn.split_heads(&sv)?);
 
             let h = block.cross_attn_ln.apply(&x)?;
-            let (cross_out, ck, cv) = block.cross_attn.forward_return_kv(&h, Some(xa), None)?;
+            let query = block.cross_attn.split_heads(&block.cross_attn.query.forward(&h)?)?;
+            let head_start = layer * self.n_head;
+            let head_end = head_start + self.n_head;
+            let layer_ck = cross_k
+                .try_shrink([None, None, Some((head_start as isize, head_end as isize)), None])
+                .context(TensorSnafu)?
+                .try_permute(&[0, 2, 1, 3])
+                .context(TensorSnafu)?;
+            let layer_cv = cross_v
+                .try_shrink([None, None, Some((head_start as isize, head_end as isize)), None])
+                .context(TensorSnafu)?
+                .try_permute(&[0, 2, 1, 3])
+                .context(TensorSnafu)?;
+            let cross_out = query
+                .scaled_dot_product_attention()
+                .key(&layer_ck)
+                .value(&layer_cv)
+                .is_causal(false)
+                .call()
+                .context(TensorSnafu)?;
+            let cross_out = block.cross_attn.merge_heads(&cross_out)?;
+            let cross_out = block.cross_attn.out.forward(&cross_out)?;
             x = x.try_add(&cross_out).context(TensorSnafu)?;
-
-            cross_ks.push(block.cross_attn.split_heads(&ck)?);
-            cross_vs.push(block.cross_attn.split_heads(&cv)?);
 
             let h = block.mlp_ln.apply(&x)?;
             let h = h.linear().weight(&block.mlp0_w).bias(&block.mlp0_b).call().context(TensorSnafu)?;
@@ -285,17 +367,6 @@ impl TextDecoder {
             let h = h.linear().weight(&block.mlp1_w).bias(&block.mlp1_b).call().context(TensorSnafu)?;
             x = x.try_add(&h).context(TensorSnafu)?;
         }
-
-        // Pack per-layer K/V: each is [1, H, seq_len, Dh] → permute [1, seq_len, H, Dh]
-        // → cat dim 2 → [1, seq_len, n_layer*H, Dh]
-        let pack = |kvs: Vec<Tensor>| -> Result<Tensor> {
-            let permuted: Vec<Tensor> = kvs
-                .into_iter()
-                .map(|t| t.try_permute(&[0, 2, 1, 3]).context(TensorSnafu))
-                .collect::<Result<Vec<_>>>()?;
-            let refs: Vec<&Tensor> = permuted.iter().collect();
-            Tensor::cat(&refs, 2).context(TensorSnafu)
-        };
 
         let x = self.ln.apply(&x)?;
         let logits = x
@@ -310,11 +381,21 @@ impl TextDecoder {
         // round-trips them as Vec<f32>), while compute is dims.dtype (fp16).
         Ok((
             logits,
-            pack(self_ks)?.cast(DType::Float32).context(TensorSnafu)?,
-            pack(self_vs)?.cast(DType::Float32).context(TensorSnafu)?,
-            pack(cross_ks)?.cast(DType::Float32).context(TensorSnafu)?,
-            pack(cross_vs)?.cast(DType::Float32).context(TensorSnafu)?,
+            Self::pack_kv(self_ks)?.cast(DType::Float32).context(TensorSnafu)?,
+            Self::pack_kv(self_vs)?.cast(DType::Float32).context(TensorSnafu)?,
         ))
+    }
+
+    /// Decoder logits using an already prepared cross-attention cache.
+    pub fn forward_with_cross_kv(
+        &self,
+        tokens: &Tensor,
+        cross_k: &Tensor,
+        cross_v: &Tensor,
+        offset: usize,
+    ) -> Result<Tensor> {
+        let (logits, _, _) = self.forward_prefill(tokens, cross_k, cross_v, offset)?;
+        Ok(logits)
     }
 
     /// Single-token forward with KV cache. Used for incremental decoding.
@@ -492,180 +573,6 @@ impl TextDecoder {
         })?;
         let logits =
             logits.try_reshape(&[svod_ir::SInt::Const(batch), svod_ir::SInt::Const(n_vocab)]).context(TensorSnafu)?;
-
-        // K/V outputs cast to fp32 — appended into the fp32 cache buffer via SDMA.
-        Ok((
-            logits,
-            new_k_flat.cast(DType::Float32).context(TensorSnafu)?,
-            new_v_flat.cast(DType::Float32).context(TensorSnafu)?,
-        ))
-    }
-
-    /// Symbolic-batch variant of [`forward_step`](Self::forward_step).
-    ///
-    /// Identical computation, but the batch dimension is a JIT `Variable`
-    /// (`b`) rather than a constant inferred from `token`. Every batched
-    /// input is shrunk to `b` on dim 0 so a plan compiled at `max_batch`
-    /// serves any `b ∈ [1, max_batch]` via `execute_with_vars`.
-    ///
-    /// This is the entry point for continuous batching: the step JIT
-    /// compiles once and is rebound to the live lane count each dispatch.
-    /// The non-batched `forward_step` is unchanged for the existing
-    /// per-beam-size plans.
-    #[allow(clippy::too_many_arguments)]
-    pub fn forward_step_batched(
-        &self,
-        token: &Tensor,
-        pos_emb: &Tensor,
-        self_k_cache: &Tensor,
-        self_v_cache: &Tensor,
-        cross_k: &Tensor,
-        cross_v: &Tensor,
-        self_mask: &Tensor,
-        b: &BoundVariable,
-    ) -> Result<(Tensor, Tensor, Tensor)> {
-        let n_head = self.n_head;
-        let n_layer = self.blocks.len();
-        let d_head = self.n_state / n_head;
-        let bv = b.as_sint();
-
-        // Shrink every batched input to `b` on dim 0. The JIT buffers are
-        // sized for `max_batch`; this makes the live rows a symbolic slice
-        // that flows through the whole graph as a `DefineVar`.
-        let token = token.try_shrink([Some((SInt::Const(0), bv.clone())), None]).context(TensorSnafu)?;
-        let pos_emb = pos_emb.try_shrink([Some((SInt::Const(0), bv.clone())), None, None]).context(TensorSnafu)?;
-        let self_k_cache =
-            self_k_cache.try_shrink([Some((SInt::Const(0), bv.clone())), None, None, None]).context(TensorSnafu)?;
-        let self_v_cache =
-            self_v_cache.try_shrink([Some((SInt::Const(0), bv.clone())), None, None, None]).context(TensorSnafu)?;
-        let cross_k =
-            cross_k.try_shrink([Some((SInt::Const(0), bv.clone())), None, None, None]).context(TensorSnafu)?;
-        let cross_v =
-            cross_v.try_shrink([Some((SInt::Const(0), bv.clone())), None, None, None]).context(TensorSnafu)?;
-        let self_mask =
-            self_mask.try_shrink([Some((SInt::Const(0), bv.clone())), None, None, None]).context(TensorSnafu)?;
-
-        // Embed single token + positional embedding
-        let tok_emb = self.token_embedding.embedding(&token).context(TensorSnafu)?;
-        let x = tok_emb.try_add(&pos_emb).context(TensorSnafu)?;
-        let x = x.cast(self_k_cache.uop().dtype()).context(TensorSnafu)?;
-
-        let mut x = x;
-        let mut new_ks: Vec<Tensor> = Vec::with_capacity(n_layer);
-        let mut new_vs: Vec<Tensor> = Vec::with_capacity(n_layer);
-
-        for (l, block) in self.blocks.iter().enumerate() {
-            let lh_start = l * n_head;
-            let lh_end = (l + 1) * n_head;
-
-            // ── Self-attn with cache ─────────────────────────────────────
-            let h = block.attn_ln.apply(&x)?;
-            let q = block.attn.query.forward(&h)?;
-            let new_k_raw = block.attn.key.forward(&h)?;
-            let new_v_raw = block.attn.value.forward(&h)?;
-
-            let q_h = block.attn.split_heads(&q)?;
-            let new_k_h = block.attn.split_heads(&new_k_raw)?;
-            let new_v_h = block.attn.split_heads(&new_v_raw)?;
-
-            let cached_k = self_k_cache
-                .try_shrink([None, None, Some((lh_start as isize, lh_end as isize)), None])
-                .context(TensorSnafu)?
-                .try_permute(&[0, 2, 1, 3])
-                .context(TensorSnafu)?;
-            let cached_v = self_v_cache
-                .try_shrink([None, None, Some((lh_start as isize, lh_end as isize)), None])
-                .context(TensorSnafu)?
-                .try_permute(&[0, 2, 1, 3])
-                .context(TensorSnafu)?;
-
-            let full_k = Tensor::cat(&[&cached_k, &new_k_h], 2).context(TensorSnafu)?;
-            let full_v = Tensor::cat(&[&cached_v, &new_v_h], 2).context(TensorSnafu)?;
-
-            let out = q_h
-                .scaled_dot_product_attention()
-                .key(&full_k)
-                .value(&full_v)
-                .attn_mask(&self_mask)
-                .is_causal(false)
-                .call()
-                .context(TensorSnafu)?;
-            let attn_out = block.attn.merge_heads(&out)?;
-            let attn_out = block.attn.out.forward(&attn_out)?;
-            x = x.try_add(&attn_out).context(TensorSnafu)?;
-
-            // ── Cross-attn (fixed cache, no mask) ────────────────────────
-            let h = block.cross_attn_ln.apply(&x)?;
-            let cq = block.cross_attn.query.forward(&h)?;
-            let cq_h = block.cross_attn.split_heads(&cq)?;
-
-            let layer_ck = cross_k
-                .try_shrink([None, None, Some((lh_start as isize, lh_end as isize)), None])
-                .context(TensorSnafu)?
-                .try_permute(&[0, 2, 1, 3])
-                .context(TensorSnafu)?;
-            let layer_cv = cross_v
-                .try_shrink([None, None, Some((lh_start as isize, lh_end as isize)), None])
-                .context(TensorSnafu)?
-                .try_permute(&[0, 2, 1, 3])
-                .context(TensorSnafu)?;
-
-            let cross_out = cq_h
-                .scaled_dot_product_attention()
-                .key(&layer_ck)
-                .value(&layer_cv)
-                .is_causal(false)
-                .call()
-                .context(TensorSnafu)?;
-            let cross_out = block.cross_attn.merge_heads(&cross_out)?;
-            let cross_out = block.cross_attn.out.forward(&cross_out)?;
-            x = x.try_add(&cross_out).context(TensorSnafu)?;
-
-            // ── MLP ───────────────────────────────────────────────────────
-            let h = block.mlp_ln.apply(&x)?;
-            let h = h.linear().weight(&block.mlp0_w).bias(&block.mlp0_b).call().context(TensorSnafu)?;
-            let h = h.gelu_exact().context(TensorSnafu)?;
-            let h = h.linear().weight(&block.mlp1_w).bias(&block.mlp1_b).call().context(TensorSnafu)?;
-            x = x.try_add(&h).context(TensorSnafu)?;
-
-            new_ks.push(new_k_h);
-            new_vs.push(new_v_h);
-        }
-
-        // Permute + cat new K/V. Batch is symbolic here (`bv`), so the
-        // reshape uses `bv` instead of `SInt::Const(batch)` — this is the
-        // key difference from `forward_step`.
-        let permuted_ks: Vec<Tensor> =
-            new_ks.iter().map(|t| t.try_permute(&[0, 2, 1, 3]).context(TensorSnafu)).collect::<Result<Vec<_>>>()?;
-        let permuted_vs: Vec<Tensor> =
-            new_vs.iter().map(|t| t.try_permute(&[0, 2, 1, 3]).context(TensorSnafu)).collect::<Result<Vec<_>>>()?;
-
-        let stacked_k = Tensor::cat(&permuted_ks.iter().collect::<Vec<_>>(), 1).context(TensorSnafu)?;
-        let stacked_v = Tensor::cat(&permuted_vs.iter().collect::<Vec<_>>(), 1).context(TensorSnafu)?;
-
-        let new_k_flat = stacked_k
-            .try_reshape(&[bv.clone(), SInt::Const(1usize), SInt::Const(n_layer * n_head), SInt::Const(d_head)])
-            .context(TensorSnafu)?;
-        let new_v_flat = stacked_v
-            .try_reshape(&[bv.clone(), SInt::Const(1usize), SInt::Const(n_layer * n_head), SInt::Const(d_head)])
-            .context(TensorSnafu)?;
-        let x = self.ln.apply(&x)?;
-        let logits = x
-            .linear()
-            .weight(&self.token_embedding)
-            .call()
-            .context(TensorSnafu)?
-            .cast(DType::Float32)
-            .context(TensorSnafu)?;
-
-        let n_vocab = self.token_embedding.shape().context(TensorSnafu)?[0].as_const().ok_or_else(|| {
-            super::error::Error::Tensor {
-                source: Box::new(svod_tensor::error::Error::SymbolicShapeUnsupported {
-                    operation: "forward_step_batched n_vocab".into(),
-                }),
-            }
-        })?;
-        let logits = logits.try_reshape(&[bv, SInt::Const(n_vocab)]).context(TensorSnafu)?;
 
         // K/V outputs cast to fp32 — appended into the fp32 cache buffer via SDMA.
         Ok((

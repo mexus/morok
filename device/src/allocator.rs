@@ -348,7 +348,14 @@ impl Allocator for CpuAllocator {
     fn _transfer(&self, dest: &RawBuffer, dest_off: usize, src: &RawBuffer, src_off: usize, sz: usize) -> Result<()> {
         match (dest, src) {
             (RawBuffer::Cpu { data: dst, .. }, RawBuffer::Cpu { data: src, .. }) => {
-                // SAFETY: distinct allocations (no aliasing); scheduler exclusivity.
+                if std::ptr::eq(dst, src) {
+                    // Avoid creating aliased references when two buffer
+                    // handles share the same allocation.
+                    let buf = unsafe { &mut *dst.get() };
+                    buf.copy_within(src_off..src_off + sz, dest_off);
+                    return Ok(());
+                }
+                // SAFETY: distinct allocations; scheduler guarantees exclusivity.
                 let dst_buf = unsafe { &mut *dst.get() };
                 let src_buf = unsafe { &*src.get() };
                 dst_buf[dest_off..dest_off + sz].copy_from_slice(&src_buf[src_off..src_off + sz]);

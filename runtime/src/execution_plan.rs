@@ -723,7 +723,13 @@ impl ExecutionPlan {
         let src_index = *self.output_buffer_indices.get(out_pos).ok_or_else(|| crate::error::Error::Execution {
             reason: format!("copy_output_region_to_buffer: output {out_pos} out of range"),
         })?;
-        if src_index == dst_index {
+        let src = self.buffers.get(src_index).ok_or_else(|| crate::error::Error::Execution {
+            reason: format!("copy_output_region_to_buffer: source buffer {src_index} out of range"),
+        })?;
+        let dst = self.buffers.get(dst_index).ok_or_else(|| crate::error::Error::Execution {
+            reason: format!("copy_output_region_to_buffer: destination buffer {dst_index} out of range"),
+        })?;
+        if src.storage_id() == dst.storage_id() {
             return Err(crate::error::Error::Execution {
                 reason: "copy_output_region_to_buffer: output aliases destination".into(),
             });

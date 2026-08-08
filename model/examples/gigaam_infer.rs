@@ -104,7 +104,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let t_transcribe = Instant::now();
     // VAD split → arch pipeline machinery (decode windows → crop → stitch),
     // with the VAD stage folded into the profile.
-    let result = asr.transcribe(&waveform, RunOptions { words: args.timestamps, profile: args.profile })?;
+    let result =
+        asr.transcribe(&waveform, RunOptions { words: args.timestamps, profile: args.profile, ..Default::default() })?;
     let dt_transcribe = t_transcribe.elapsed();
 
     if args.timestamps {

@@ -512,10 +512,10 @@ impl Buffer {
     /// via the copy engine, without a host-visible mapping.
     pub fn copyin_at(&mut self, dst_off: usize, src: &[u8]) -> Result<()> {
         self.ensure_allocated()?;
-        snafu::ensure!(
-            dst_off + src.len() <= self.size,
-            SizeMismatchSnafu { expected: self.size, actual: dst_off + src.len() }
-        );
+        let end = dst_off
+            .checked_add(src.len())
+            .ok_or(crate::error::Error::SizeMismatch { expected: self.size, actual: usize::MAX })?;
+        snafu::ensure!(end <= self.size, SizeMismatchSnafu { expected: self.size, actual: end });
         self.data.allocator._copyin(self.data.raw(), self.offset + dst_off, src)
     }
 
@@ -576,8 +576,14 @@ impl Buffer {
     pub fn copy_region_from(&mut self, dst_off: usize, src: &Buffer, src_off: usize, len: usize) -> Result<()> {
         self.ensure_allocated()?;
         src.ensure_allocated()?;
-        snafu::ensure!(dst_off + len <= self.size, SizeMismatchSnafu { expected: self.size, actual: dst_off + len });
-        snafu::ensure!(src_off + len <= src.size, SizeMismatchSnafu { expected: src.size, actual: src_off + len });
+        let dst_end = dst_off
+            .checked_add(len)
+            .ok_or(crate::error::Error::SizeMismatch { expected: self.size, actual: usize::MAX })?;
+        let src_end = src_off
+            .checked_add(len)
+            .ok_or(crate::error::Error::SizeMismatch { expected: src.size, actual: usize::MAX })?;
+        snafu::ensure!(dst_end <= self.size, SizeMismatchSnafu { expected: self.size, actual: dst_end });
+        snafu::ensure!(src_end <= src.size, SizeMismatchSnafu { expected: src.size, actual: src_end });
         snafu::ensure!(
             Arc::ptr_eq(&self.data.allocator, &src.data.allocator),
             UnsupportedSnafu { op: "copy_region_from across allocators" }
@@ -591,13 +597,17 @@ impl Buffer {
     /// not overlap.
     pub fn copy_within(&mut self, dst_off: usize, src_off: usize, len: usize) -> Result<()> {
         self.ensure_allocated()?;
+        let dst_end = dst_off
+            .checked_add(len)
+            .ok_or(crate::error::Error::SizeMismatch { expected: self.size, actual: usize::MAX })?;
+        let src_end = src_off
+            .checked_add(len)
+            .ok_or(crate::error::Error::SizeMismatch { expected: self.size, actual: usize::MAX })?;
+        snafu::ensure!(dst_end <= self.size, SizeMismatchSnafu { expected: self.size, actual: dst_end });
+        snafu::ensure!(src_end <= self.size, SizeMismatchSnafu { expected: self.size, actual: src_end });
         snafu::ensure!(
-            dst_off + len <= self.size,
-            SizeMismatchSnafu { expected: self.size, actual: dst_off + len }
-        );
-        snafu::ensure!(
-            src_off + len <= self.size,
-            SizeMismatchSnafu { expected: self.size, actual: src_off + len }
+            len == 0 || dst_end <= src_off || src_end <= dst_off,
+            crate::error::RuntimeSnafu { message: "copy_within regions must not overlap" }
         );
         // No borrow conflict: .raw() returns an owned RawBuffer handle, so we
         // can capture it twice without aliasing &mut self.

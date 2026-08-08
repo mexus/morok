@@ -82,10 +82,21 @@ pub struct TokenEmission {
 }
 
 /// A grouped word and its `[start, end)` time span in seconds. Produced by
-/// [`frames_to_words`]. Mirrors upstream GigaAM's `Word` dataclass in
+/// [`RnntDecoder::frames_to_words`]. Mirrors upstream GigaAM's `Word` dataclass in
 /// `gigaam/types.py`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Word {
+    pub text: String,
+    pub start: f32,
+    pub end: f32,
+}
+
+/// A phrase-level segment of a transcript with `[start, end)` time in seconds.
+/// Produced by timestamp-token splitting (e.g. Whisper's `<|t0|> text <|t1|>`
+/// pairs). The containing result defines the time origin: decode-window-relative
+/// in `Transcript`, core-relative in `ChunkResult`.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Segment {
     pub text: String,
     pub start: f32,
     pub end: f32,
@@ -358,7 +369,7 @@ impl RnntDecoder {
 
     /// Greedy decode + per-emission `(token_id, frame)` pairs. `emissions[i]`
     /// records which token was emitted and at which encoder frame, in
-    /// decoder output order. Pair with [`frames_to_words`] to recover
+    /// decoder output order. Pair with [`Self::frames_to_words`] to recover
     /// word-level timestamps from a SentencePiece vocabulary.
     pub fn decode_with_timestamps<S: JointStep>(
         &self,

@@ -4,3 +4,5 @@ mod dtw;
 mod language;
 mod model;
 mod parity;
+mod segments;
+mod tokenizer;

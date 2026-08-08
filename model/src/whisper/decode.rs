@@ -2,11 +2,11 @@
 //! and language detection — matching `whisper.decoding`.
 
 use super::config::N_AUDIO_CTX;
-use super::error::{DeviceSnafu, Error, JitSnafu, Result, TensorSnafu};
-use super::jit::{WhisperDecoderJit, WhisperDecoderStepBatchedJit, WhisperDecoderStepJit, WhisperPrefillJit};
-use super::model::Whisper;
+use super::error::{DeviceSnafu, Error, JitSnafu, Result};
+use super::jit::{WhisperDecoderJit, WhisperDecoderStepJit, WhisperPrefillJit};
 use super::tokenizer::WhisperTokenizer;
 use snafu::ResultExt;
+use svod_arch::pipelines::audio::Segment;
 
 // ─── Language detection ─────────────────────────────────────────────────────
 
@@ -56,31 +56,59 @@ pub fn detect_language(
 
 // ─── Decode options & result ────────────────────────────────────────────────
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WhisperTask {
+    Transcribe,
+    Translate,
+}
+
+impl std::str::FromStr for WhisperTask {
+    type Err = &'static str;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        match value {
+            "transcribe" => Ok(Self::Transcribe),
+            "translate" => Ok(Self::Translate),
+            _ => Err("expected `transcribe` or `translate`"),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct DecodeOptions {
-    pub task: String,
+    /// Whether to transcribe source speech or translate it to English.
+    pub task: WhisperTask,
+    /// Source language code, or `None` for automatic detection.
     pub language: Option<String>,
+    /// Initial sampling temperature.
     pub temperature: f32,
+    /// Maximum generated token count; defaults to half the text context.
     pub sample_len: Option<usize>,
-    pub without_timestamps: bool,
+    /// Suppress blank/space as the first generated token.
     pub suppress_blank: bool,
+    /// Token IDs to suppress; `-1` expands to Whisper's non-speech set.
     pub suppress_tokens: Option<Vec<i32>>,
+    /// Latest timestamp permitted at the beginning of a window, in seconds.
     pub max_initial_timestamp: Option<f32>,
+    /// Beam width, or `None` for greedy/sampling decode.
     pub beam_size: Option<usize>,
+    /// Temperature increment used by fallback; zero disables fallback.
     pub temperature_inc: f32,
+    /// Retry when text compression exceeds this threshold.
     pub compression_ratio_threshold: Option<f32>,
+    /// Retry low-confidence decodes below this average log-probability.
     pub logprob_threshold: Option<f32>,
+    /// Skip likely silence when no-speech probability exceeds this threshold.
     pub no_speech_threshold: Option<f32>,
 }
 
 impl Default for DecodeOptions {
     fn default() -> Self {
         Self {
-            task: "transcribe".into(),
+            task: WhisperTask::Transcribe,
             language: None,
             temperature: 0.0,
             sample_len: None,
-            without_timestamps: false,
             suppress_blank: true,
             suppress_tokens: Some(vec![-1]),
             max_initial_timestamp: Some(1.0),
@@ -96,6 +124,7 @@ impl Default for DecodeOptions {
 #[derive(Clone, Debug)]
 pub struct DecodeResult {
     pub tokens: Vec<u32>,
+    pub token_probs: Vec<f32>,
     pub text: String,
     pub avg_logprob: f32,
     pub no_speech_prob: f32,
@@ -104,28 +133,22 @@ pub struct DecodeResult {
     pub language: Option<String>,
 }
 
-/// Greedy decode with cross-attention weight extraction for DTW alignment.
-pub fn greedy_decode_with_alignment(
-    model: &Whisper,
-    audio_features: &svod_tensor::Tensor,
-    tokenizer: &WhisperTokenizer,
-    _options: &DecodeOptions,
-    text_tokens: &[u32],
-) -> Result<(Vec<svod_tensor::Tensor>, usize)> {
-    let mut tokens = tokenizer.sot_sequence();
-    tokens.push(tokenizer.no_timestamps());
-    tokens.extend_from_slice(text_tokens);
-    tokens.push(tokenizer.eot());
+impl DecodeResult {
+    pub fn should_skip(&self, options: &DecodeOptions) -> bool {
+        let Some(no_speech_threshold) = options.no_speech_threshold else {
+            return false;
+        };
+        if self.no_speech_prob <= no_speech_threshold {
+            return false;
+        }
+        options.logprob_threshold.is_none_or(|threshold| self.avg_logprob <= threshold)
+    }
 
-    let token_tensor = svod_tensor::Tensor::from_slice(tokens.iter().map(|&t| t as i32).collect::<Vec<_>>())
-        .try_reshape([1usize, tokens.len()])
-        .context(TensorSnafu)?
-        .cast(svod_dtype::DType::Int32)
-        .context(TensorSnafu)?;
-
-    let (_, qk_weights) = model.decode_with_alignment(&token_tensor, audio_features, 0)?;
-    let sot_len = tokenizer.sot_sequence().len() + 1;
-    Ok((qk_weights, sot_len))
+    pub fn clear_speech(&mut self) {
+        self.tokens.clear();
+        self.token_probs.clear();
+        self.text.clear();
+    }
 }
 
 // ─── Decode with temperature fallback (cached) ──────────────────────────────
@@ -139,11 +162,10 @@ pub fn decode_with_fallback_cached(
     n_vocab: usize,
     tokenizer: &WhisperTokenizer,
     options: &DecodeOptions,
-    audio_raw: &[f32],
     pos_embedding: &[f32],
     n_state: usize,
 ) -> Result<DecodeResult> {
-    let resolved_lang = resolve_language(options, audio_raw, decoder_jit, n_text_ctx, n_vocab, tokenizer)?;
+    let resolved_lang = resolve_language(options, decoder_jit, n_text_ctx, n_vocab, tokenizer)?;
 
     let temperatures = build_temperature_schedule(options);
     let mut best: Option<DecodeResult> = None;
@@ -193,19 +215,16 @@ pub fn decode_with_fallback_cached(
 
 fn resolve_language(
     options: &DecodeOptions,
-    audio_raw: &[f32],
     decoder_jit: &mut WhisperDecoderJit,
     n_text_ctx: usize,
     n_vocab: usize,
     tokenizer: &WhisperTokenizer,
 ) -> Result<Option<String>> {
+    if !tokenizer.multilingual {
+        return Ok(Some("en".to_string()));
+    }
     if options.language.is_some() {
         return Ok(options.language.clone());
-    }
-    // Load audio features into uncached decoder JIT for language detection
-    {
-        let buf = decoder_jit.audio_features_mut().context(JitSnafu)?;
-        write_buf(buf, bytemuck::cast_slice(audio_raw))?;
     }
     let detection = detect_language(decoder_jit, n_text_ctx, n_vocab, tokenizer)?;
     Ok(Some(detection.language))
@@ -274,8 +293,10 @@ pub fn greedy_decode_cached(
     let no_speech_prob = ctx.no_speech_prob;
 
     let mut tokens = Vec::new();
+    let mut token_probs = Vec::new();
     if next_token != tokenizer.eot() {
         tokens.push(next_token);
+        token_probs.push(sum_logprob.exp());
     }
 
     let sample_len = options.sample_len.unwrap_or(n_text_ctx / 2);
@@ -308,17 +329,19 @@ pub fn greedy_decode_cached(
         );
 
         next_token = pick_token(&filtered, options.temperature);
-        sum_logprob += log_softmax(&filtered, next_token as usize);
+        let token_logprob = log_softmax(&filtered, next_token as usize);
+        sum_logprob += token_logprob;
 
         if next_token != tokenizer.eot() {
             tokens.push(next_token);
+            token_probs.push(token_logprob.exp());
         }
         if tokens.len() >= sample_len {
             break;
         }
     }
 
-    finish_decode(&tokens, tokenizer, sum_logprob, no_speech_prob, options)
+    finish_decode(&tokens, &token_probs, tokenizer, sum_logprob, no_speech_prob, options)
 }
 
 // ─── Batched (step-locked) greedy decode ────────────────────────────────────
@@ -347,11 +370,8 @@ pub struct DecodeLane {
     pub pos_embedding: Vec<f32>,
     pub n_state: usize,
 
-    // KV caches — seeded once into the batched step JIT's device-local buffer
-    // at this lane's row. After seeding, the cache lives on-device and grows
-    // one position per step via SDMA writeback (`copy_output_to_self_k_cache`);
-    // the host never rewrites it. `seeded_row` is the row the cache currently
-    // occupies in the [max_lanes, ...] buffer (changes on lane compaction).
+    // KV caches are seeded once into this lane's stable fixed-batch slot. The
+    // cache then grows on-device via SDMA writeback; lanes never compact.
     pub self_k_cache: Vec<f32>,
     pub self_v_cache: Vec<f32>,
     pub cross_k: Vec<f32>,
@@ -361,6 +381,7 @@ pub struct DecodeLane {
     // Per-step loop state (mutated each step)
     pub next_token: u32,
     pub tokens: Vec<u32>,
+    pub token_probs: Vec<f32>,
     pub sum_logprob: f32,
     pub pos: usize, // current position = init_len + step
     pub done: bool,
@@ -399,8 +420,10 @@ impl DecodeLane {
         let sum_logprob = log_softmax(&filtered, next_token as usize);
 
         let mut tokens = Vec::new();
+        let mut token_probs = Vec::new();
         if next_token != tokenizer.eot() {
             tokens.push(next_token);
+            token_probs.push(sum_logprob.exp());
         }
 
         Ok(Self {
@@ -418,6 +441,7 @@ impl DecodeLane {
             seeded_row: None,
             next_token,
             tokens,
+            token_probs,
             sum_logprob,
             pos: ctx.init_len, // first step decodes at init_len
             done: next_token == tokenizer.eot(),
@@ -434,20 +458,20 @@ impl DecodeLane {
     }
 
     pub fn finish(self, tokenizer: &WhisperTokenizer, options: &DecodeOptions) -> Result<DecodeResult> {
-        finish_decode(&self.tokens, tokenizer, self.sum_logprob, self.no_speech_prob, options)
+        finish_decode(&self.tokens, &self.token_probs, tokenizer, self.sum_logprob, self.no_speech_prob, options)
     }
 }
 
 /// Step-locked batched greedy decode: advances every active lane by one token
 /// per JIT dispatch, until all lanes are `done` or hit `sample_len`.
 ///
-/// Each lane occupies a fixed row (`lane_idx`) in the batched step JIT's
-/// buffers; inactive lanes are skipped. The plan is rebound to the active
-/// count each dispatch via `execute_with_vars(&[("b", active)])`.
+/// Each lane occupies a stable row (`lane_idx`) in a concrete fixed-capacity
+/// graph. Inactive rows still execute but their outputs are ignored.
 #[allow(clippy::too_many_arguments)]
 pub fn run_batched_decode(
     lanes: &mut [DecodeLane],
-    step_jit: &mut WhisperDecoderStepBatchedJit,
+    step_jit: &mut WhisperDecoderStepJit,
+    capacity: usize,
     tokenizer: &WhisperTokenizer,
     options: &DecodeOptions,
     n_text_ctx: usize,
@@ -456,82 +480,73 @@ pub fn run_batched_decode(
     let sample_len = options.sample_len.unwrap_or(n_text_ctx / 2);
     let eot = tokenizer.eot();
     let n_state = lanes.first().map(|l| l.n_state).unwrap_or(0);
+    for lane in lanes.iter_mut() {
+        if lane.tokens.len() >= sample_len || lane.next_token == eot {
+            lane.done = true;
+        }
+    }
+    let mut owners: Vec<Option<usize>> = vec![None; capacity];
+    let mut next_lane = 0usize;
 
     loop {
-        // Collect the active (not-done, not-at-sample_len) lanes by index.
-        let active: Vec<usize> = lanes
-            .iter()
-            .enumerate()
-            .filter(|(_, l)| !l.done && l.tokens.len() < sample_len && l.next_token != eot)
-            .map(|(i, _)| i)
-            .collect();
+        for owner in &mut owners {
+            if owner.is_some_and(|lane_index| lanes[lane_index].done) {
+                *owner = None;
+            }
+            if owner.is_none() {
+                while next_lane < lanes.len() && lanes[next_lane].done {
+                    next_lane += 1;
+                }
+                if next_lane < lanes.len() {
+                    *owner = Some(next_lane);
+                    next_lane += 1;
+                }
+            }
+        }
+
+        let active: Vec<(usize, usize)> =
+            owners.iter().enumerate().filter_map(|(slot, &owner)| owner.map(|lane_index| (slot, lane_index))).collect();
         if active.is_empty() {
             break;
         }
-        let active_count = active.len();
-
         // Per-position float count and buffer row strides. All lanes share
         // the same structural dims, so read them from the first active lane.
-        let per_pos_floats = lanes[active[0]].per_pos_floats();
+        let per_pos_floats = lanes[active[0].1].per_pos_floats();
         let self_row_stride = n_text_ctx * per_pos_floats; // [max_lanes, N_TEXT_CTX, ...]
         let cross_row_stride = N_AUDIO_CTX * per_pos_floats; // [max_lanes, N_AUDIO_CTX, ...]
 
-        // Pack each active lane's inputs into the batched JIT at its row.
-        // Rows are contiguous: active lane `j` (j=0..active_count) maps to
-        // row `j` in the [active_count, ...] dispatch.
-        //
-        // KV caches are device-local: the first time a lane occupies a row
-        // (and whenever compaction moves it to a new row), the seed cache
-        // (read from prefill) is copied in once via `copyin`. Thereafter the
-        // cache grows on-device via SDMA append (teardown below) — the host
-        // never rewrites it. This is the bandwidth win: one seed per lane,
-        // not a full-cache rewrite per step.
-        for (row, &lane_idx) in active.iter().enumerate() {
+        // Stable slots remove cache relocation when another lane finishes.
+        for &(row, lane_idx) in &active {
             let lane = &mut lanes[lane_idx];
             write_token_row(step_jit, row, lane.next_token)?;
             write_pos_emb_row(step_jit, row, &lane.pos_embedding[lane.pos * n_state..(lane.pos + 1) * n_state])?;
             write_self_mask_row(step_jit, row, lane.pos, n_text_ctx)?;
 
-            // Seed caches into this row only when the lane's row changed.
-            //
-            // Two cases:
-            // - First activation (`seeded_row == None`): seed from the host Vec
-            //   (the prefill prefix). The cache then grows on-device via SDMA.
-            // - Compaction (`seeded_row == Some(old_row)`): the earlier lane
-            //   dropped out, shifting this lane down to `row`. Copy the GROWN
-            //   cache device-to-device from `old_row` to `row` — NOT from the
-            //   host Vec, which only holds the stale prefill prefix and would
-            //   clobber positions [init_len, pos) written by prior SDMA appends.
-            match lane.seeded_row {
-                None => {
-                    copyin_cache_row(step_jit.self_k_cache_mut().context(JitSnafu)?, row, self_row_stride, &lane.self_k_cache)?;
-                    copyin_cache_row(step_jit.self_v_cache_mut().context(JitSnafu)?, row, self_row_stride, &lane.self_v_cache)?;
-                    copyin_cache_row(step_jit.cross_k_mut().context(JitSnafu)?, row, cross_row_stride, &lane.cross_k)?;
-                    copyin_cache_row(step_jit.cross_v_mut().context(JitSnafu)?, row, cross_row_stride, &lane.cross_v)?;
-                }
-                Some(old_row) if old_row != row => {
-                    let grown_bytes = lane.pos * lane.per_pos_bytes();
-                    let new_self_off = row * self_row_stride * std::mem::size_of::<f32>();
-                    let old_self_off = old_row * self_row_stride * std::mem::size_of::<f32>();
-                    copy_cache_row_device(step_jit.self_k_cache_mut().context(JitSnafu)?, new_self_off, old_self_off, grown_bytes)?;
-                    copy_cache_row_device(step_jit.self_v_cache_mut().context(JitSnafu)?, new_self_off, old_self_off, grown_bytes)?;
-                    // Cross cache is static after prefill — copy the full row.
-                    let cross_bytes = N_AUDIO_CTX * lane.per_pos_bytes();
-                    let new_cross_off = row * cross_row_stride * std::mem::size_of::<f32>();
-                    let old_cross_off = old_row * cross_row_stride * std::mem::size_of::<f32>();
-                    copy_cache_row_device(step_jit.cross_k_mut().context(JitSnafu)?, new_cross_off, old_cross_off, cross_bytes)?;
-                    copy_cache_row_device(step_jit.cross_v_mut().context(JitSnafu)?, new_cross_off, old_cross_off, cross_bytes)?;
-                }
-                _ => {}
+            if lane.seeded_row.is_none() {
+                copyin_cache_row(
+                    step_jit.self_k_cache_mut().context(JitSnafu)?,
+                    row,
+                    self_row_stride,
+                    &lane.self_k_cache,
+                )?;
+                copyin_cache_row(
+                    step_jit.self_v_cache_mut().context(JitSnafu)?,
+                    row,
+                    self_row_stride,
+                    &lane.self_v_cache,
+                )?;
+                copyin_cache_row(step_jit.cross_k_mut().context(JitSnafu)?, row, cross_row_stride, &lane.cross_k)?;
+                copyin_cache_row(step_jit.cross_v_mut().context(JitSnafu)?, row, cross_row_stride, &lane.cross_v)?;
             }
             lane.seeded_row = Some(row);
         }
 
-        // One dispatch for all active lanes, rebound to the live count.
-        step_jit.execute_with_vars(&[("b", active_count as i64)]).context(JitSnafu)?;
+        // The same concrete graph executes at every step. This keeps matrix
+        // dimensions static and makes the plan graph-capture eligible.
+        step_jit.execute().context(JitSnafu)?;
 
         // Per-lane teardown: SDMA-writeback new K/V, read logits, pick token.
-        for (row, &lane_idx) in active.iter().enumerate() {
+        for &(row, lane_idx) in &active {
             let lane = &mut lanes[lane_idx];
 
             // Device-side K/V copy: append this step's new K/V at lane.pos.
@@ -543,15 +558,12 @@ pub fn run_batched_decode(
             let dst_base = row * self_row_stride * std::mem::size_of::<f32>();
             let dst_off = dst_base + lane.pos * per_pos_b;
             let src_off = row * per_pos_b;
-            step_jit
-                .copy_output_to_self_k_cache(1, dst_off, src_off, per_pos_b)
-                .context(JitSnafu)?;
-            step_jit
-                .copy_output_to_self_v_cache(2, dst_off, src_off, per_pos_b)
-                .context(JitSnafu)?;
+            step_jit.copy_output_to_self_k_cache(1, dst_off, src_off, per_pos_b).context(JitSnafu)?;
+            step_jit.copy_output_to_self_v_cache(2, dst_off, src_off, per_pos_b).context(JitSnafu)?;
 
             // Read this lane's logits row and pick the next token.
             let logits = read_logits_row(step_jit, row, n_vocab)?;
+
             let all_toks: Vec<u32> = lane.initial_tokens.iter().copied().chain(lane.tokens.iter().copied()).collect();
             let step = lane.pos + 1 - lane.init_len;
             let mut filtered = logits;
@@ -565,10 +577,12 @@ pub fn run_batched_decode(
                 &lane.suppress_tokens,
             );
             lane.next_token = pick_token(&filtered, options.temperature);
-            lane.sum_logprob += log_softmax(&filtered, lane.next_token as usize);
+            let token_logprob = log_softmax(&filtered, lane.next_token as usize);
+            lane.sum_logprob += token_logprob;
 
             if lane.next_token != eot {
                 lane.tokens.push(lane.next_token);
+                lane.token_probs.push(token_logprob.exp());
             }
             lane.pos += 1;
             if lane.next_token == eot || lane.tokens.len() >= sample_len {
@@ -585,7 +599,7 @@ pub fn run_batched_decode(
 // The batched step JIT owns max_lanes-sized buffers; each lane writes/reads
 // its row. These wrap the per-row slicing so the main loop stays readable.
 
-fn write_token_row(jit: &mut WhisperDecoderStepBatchedJit, row: usize, token: u32) -> Result<()> {
+fn write_token_row(jit: &mut WhisperDecoderStepJit, row: usize, token: u32) -> Result<()> {
     let buf = jit.token_mut().context(JitSnafu)?;
     let dst = buf.as_host_bytes_mut().context(DeviceSnafu)?;
     // token is [max_lanes, 1] i32; row stride = 4 bytes
@@ -596,7 +610,7 @@ fn write_token_row(jit: &mut WhisperDecoderStepBatchedJit, row: usize, token: u3
     Ok(())
 }
 
-fn write_pos_emb_row(jit: &mut WhisperDecoderStepBatchedJit, row: usize, emb: &[f32]) -> Result<()> {
+fn write_pos_emb_row(jit: &mut WhisperDecoderStepJit, row: usize, emb: &[f32]) -> Result<()> {
     let buf = jit.pos_emb_mut().context(JitSnafu)?;
     let dst = buf.as_host_bytes_mut().context(DeviceSnafu)?;
     // pos_emb is [max_lanes, 1, n_state] f32
@@ -606,7 +620,7 @@ fn write_pos_emb_row(jit: &mut WhisperDecoderStepBatchedJit, row: usize, emb: &[
     Ok(())
 }
 
-fn write_self_mask_row(jit: &mut WhisperDecoderStepBatchedJit, row: usize, pos: usize, n_text_ctx: usize) -> Result<()> {
+fn write_self_mask_row(jit: &mut WhisperDecoderStepJit, row: usize, pos: usize, n_text_ctx: usize) -> Result<()> {
     let buf = jit.self_mask_mut().context(JitSnafu)?;
     let dst = buf.as_host_bytes_mut().context(DeviceSnafu)?;
     // mask is [max_lanes, 1, 1, n_text_ctx + 1]; row stride = (n_text_ctx+1)*4
@@ -628,33 +642,14 @@ fn write_self_mask_row(jit: &mut WhisperDecoderStepBatchedJit, row: usize, pos: 
 /// `data` may be shorter (e.g. only `init_len` positions populated for the self
 /// cache after prefill). Used for one-time seeding; the cache then grows
 /// on-device via SDMA append.
-fn copyin_cache_row(
-    buf: &mut svod_device::Buffer,
-    row: usize,
-    row_stride_floats: usize,
-    data: &[f32],
-) -> Result<()> {
+fn copyin_cache_row(buf: &mut svod_device::Buffer, row: usize, row_stride_floats: usize, data: &[f32]) -> Result<()> {
     let off = row * row_stride_floats * std::mem::size_of::<f32>();
     let bytes: &[u8] = bytemuck::cast_slice(data);
     buf.copyin_at(off, bytes).context(DeviceSnafu)
 }
 
-/// On-device cache row relocation for lane compaction. When an earlier lane
-/// drops out, later lanes shift down — their grown caches move with them via
-/// `Buffer::copy_within` (SDMA, no host round-trip). Used instead of re-seeding
-/// from the stale host Vec, which only holds the prefill prefix and would
-/// clobber positions [init_len, pos) grown by prior SDMA appends.
-fn copy_cache_row_device(
-    buf: &mut svod_device::Buffer,
-    new_off: usize,
-    old_off: usize,
-    len: usize,
-) -> Result<()> {
-    buf.copy_within(new_off, old_off, len).context(DeviceSnafu)
-}
-
 /// Read one lane's logits row `[n_vocab]` from the batched JIT output.
-fn read_logits_row(jit: &mut WhisperDecoderStepBatchedJit, row: usize, n_vocab: usize) -> Result<Vec<f32>> {
+fn read_logits_row(jit: &mut WhisperDecoderStepJit, row: usize, n_vocab: usize) -> Result<Vec<f32>> {
     let buf = jit.logits().context(JitSnafu)?;
     let src = buf.as_host_bytes().context(DeviceSnafu)?;
     let row_floats = n_vocab;
@@ -667,6 +662,7 @@ fn read_logits_row(jit: &mut WhisperDecoderStepBatchedJit, row: usize, n_vocab: 
 
 struct Beam {
     tokens: Vec<u32>,
+    token_probs: Vec<f32>,
     sum_logprob: f32,
 }
 
@@ -714,9 +710,9 @@ pub fn beam_decode_cached(
         let mut toks = ctx.initial_tokens.clone();
         toks.push(*tok_id as u32);
         if *tok_id as u32 == eot {
-            finished.push(Beam { tokens: toks, sum_logprob: *lp });
+            finished.push(Beam { tokens: toks, token_probs: vec![lp.exp()], sum_logprob: *lp });
         } else {
-            beams.push(Beam { tokens: toks, sum_logprob: *lp });
+            beams.push(Beam { tokens: toks, token_probs: vec![lp.exp()], sum_logprob: *lp });
         }
     }
 
@@ -746,7 +742,7 @@ pub fn beam_decode_cached(
         let all_logits = &ctx.logits_buf;
 
         // Generate + rank candidates
-        let mut candidates: Vec<(usize, usize, f32)> = Vec::new();
+        let mut candidates: Vec<(usize, usize, f32, f32)> = Vec::new();
         for (bi, beam) in beams.iter().enumerate() {
             let start = bi * n_vocab;
             if start >= all_logits.len() {
@@ -767,26 +763,28 @@ pub fn beam_decode_cached(
             let mut idx: Vec<(usize, f32)> = logprobs.iter().copied().enumerate().collect();
             idx.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
             for (tok_id, lp) in idx.into_iter().take(beam_size + 1) {
-                candidates.push((bi, tok_id, beam.sum_logprob + lp));
+                candidates.push((bi, tok_id, lp, beam.sum_logprob + lp));
             }
         }
-        candidates.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+        candidates.sort_by(|a, b| b.3.partial_cmp(&a.3).unwrap_or(std::cmp::Ordering::Equal));
 
         // Select survivors
         let mut new_beams = Vec::with_capacity(beam_size);
         let mut parent_map = Vec::with_capacity(beam_size);
-        for (parent_idx, tok_id, sum_lp) in candidates {
+        for (parent_idx, tok_id, token_lp, sum_lp) in candidates {
             if new_beams.len() >= beam_size {
                 break;
             }
             let mut toks = beams[parent_idx].tokens.clone();
+            let mut token_probs = beams[parent_idx].token_probs.clone();
             toks.push(tok_id as u32);
+            token_probs.push(token_lp.exp());
             if tok_id as u32 == eot {
                 if finished.len() < beam_size {
-                    finished.push(Beam { tokens: toks, sum_logprob: sum_lp });
+                    finished.push(Beam { tokens: toks, token_probs, sum_logprob: sum_lp });
                 }
             } else {
-                new_beams.push(Beam { tokens: toks, sum_logprob: sum_lp });
+                new_beams.push(Beam { tokens: toks, token_probs, sum_logprob: sum_lp });
                 parent_map.push(parent_idx);
             }
             if new_beams.len() >= beam_size {
@@ -808,7 +806,7 @@ pub fn beam_decode_cached(
                 if *t.last().unwrap() != eot {
                     t.push(eot);
                 }
-                finished.push(Beam { tokens: t, sum_logprob: b.sum_logprob });
+                finished.push(Beam { tokens: t, token_probs: b.token_probs, sum_logprob: b.sum_logprob });
             }
             break;
         }
@@ -823,7 +821,7 @@ pub fn beam_decode_cached(
         if *t.last().unwrap() != eot {
             t.push(eot);
         }
-        finished.push(Beam { tokens: t, sum_logprob: b.sum_logprob });
+        finished.push(Beam { tokens: t, token_probs: b.token_probs, sum_logprob: b.sum_logprob });
     }
 
     finished.sort_by(|a, b| {
@@ -834,11 +832,13 @@ pub fn beam_decode_cached(
 
     let best = finished.into_iter().next().ok_or_else(|| decode_err("beam produced nothing"))?;
     let output_tokens: Vec<u32> = best.tokens[ctx.sample_begin..].iter().copied().take_while(|&t| t != eot).collect();
+    let token_probs = best.token_probs.into_iter().take(output_tokens.len()).collect();
     let text = tokenizer.decode(&output_tokens);
     let avg_logprob = best.sum_logprob / (output_tokens.len() + 1) as f32;
     let compression_ratio = compression_ratio_text(&text);
     Ok(DecodeResult {
         tokens: output_tokens,
+        token_probs,
         text,
         avg_logprob,
         no_speech_prob: ctx.no_speech_prob,
@@ -887,8 +887,18 @@ impl DecodeCtx {
         let layer_heads_dh = self.self_k_cache.len() / self.init_len;
         let self_stride = n_text_ctx * layer_heads_dh;
         let cross_stride = n_audio_ctx * layer_heads_dh;
-        copyin_replicated_cache(step_jit.self_k_cache_mut().context(JitSnafu)?, &self.self_k_cache, beam_size, self_stride)?;
-        copyin_replicated_cache(step_jit.self_v_cache_mut().context(JitSnafu)?, &self.self_v_cache, beam_size, self_stride)?;
+        copyin_replicated_cache(
+            step_jit.self_k_cache_mut().context(JitSnafu)?,
+            &self.self_k_cache,
+            beam_size,
+            self_stride,
+        )?;
+        copyin_replicated_cache(
+            step_jit.self_v_cache_mut().context(JitSnafu)?,
+            &self.self_v_cache,
+            beam_size,
+            self_stride,
+        )?;
         copyin_replicated_cache(step_jit.cross_k_mut().context(JitSnafu)?, &self.cross_k, beam_size, cross_stride)?;
         copyin_replicated_cache(step_jit.cross_v_mut().context(JitSnafu)?, &self.cross_v, beam_size, cross_stride)?;
         Ok(())
@@ -1000,12 +1010,15 @@ fn init_decode(
     n_state: usize,
 ) -> Result<DecodeCtx> {
     // Build initial tokens
-    let lang = options.language.as_ref().ok_or_else(|| decode_err("language required"))?;
-    let lang_tok = tokenizer.language_token_for(lang).unwrap_or_else(|| tokenizer.sot());
-    let task_tok = if options.task == "transcribe" { tokenizer.transcribe() } else { tokenizer.translate() };
-    let mut initial_tokens = vec![tokenizer.sot(), lang_tok, task_tok];
-    if options.without_timestamps {
-        initial_tokens.push(tokenizer.no_timestamps());
+    let mut initial_tokens = vec![tokenizer.sot()];
+    if tokenizer.multilingual {
+        let lang = options.language.as_ref().ok_or_else(|| decode_err("language required"))?;
+        let lang_tok = tokenizer.language_token_for(lang).unwrap_or_else(|| tokenizer.sot());
+        let task_tok = match options.task {
+            WhisperTask::Transcribe => tokenizer.transcribe(),
+            WhisperTask::Translate => tokenizer.translate(),
+        };
+        initial_tokens.extend([lang_tok, task_tok]);
     }
     let sample_begin = initial_tokens.len();
     let init_len = initial_tokens.len();
@@ -1044,8 +1057,16 @@ fn init_decode(
     // total = seq * n_layer * n_head * d_head. So layer_heads_dh = total / seq.
     let self_k_cache = read_output(prefill_jit, WhisperPrefillJit::self_k)?;
     let self_v_cache = read_output(prefill_jit, WhisperPrefillJit::self_v)?;
-    let cross_k = read_output(prefill_jit, WhisperPrefillJit::cross_k)?;
-    let cross_v = read_output(prefill_jit, WhisperPrefillJit::cross_v)?;
+    // Cross K/V were projected once before fallback decoding and remain in
+    // prefill's device-local inputs. Read them only to seed the step graph.
+    let cross_k = {
+        let buf = prefill_jit.prepared_cross_k_mut().context(JitSnafu)?;
+        read_buf(buf, buf.size() / std::mem::size_of::<f32>())?
+    };
+    let cross_v = {
+        let buf = prefill_jit.prepared_cross_v_mut().context(JitSnafu)?;
+        read_buf(buf, buf.size() / std::mem::size_of::<f32>())?
+    };
 
     let _ = n_text_ctx;
 
@@ -1069,8 +1090,105 @@ fn init_decode(
 
 // ─── Result helpers ─────────────────────────────────────────────────────────
 
+/// Split a decoded token stream into timestamp-bounded segments.
+///
+/// The decoder emits paired timestamp tokens (`<|t0|> text <|t1|> text <|t2|>...`)
+/// during timestamp-enabled recognition. This function finds
+/// consecutive timestamp-token pairs — the boundary between segments — and
+/// returns one [`Segment`] per slice, with window-relative start/end times
+/// decoded from the timestamp token values.
+///
+/// Ported from the OpenAI reference (`transcribe.py:339-367`). When no
+/// consecutive timestamp pairs are found, returns a single segment spanning
+/// the whole token stream.
+pub fn split_into_segments(
+    tokens: &[u32],
+    tokenizer: &WhisperTokenizer,
+    window_duration: f32,
+) -> Vec<svod_arch::pipelines::audio::Segment> {
+    let ts_begin = tokenizer.timestamp_begin();
+    let is_ts = |t: u32| t >= ts_begin;
+
+    // Find indices where two adjacent tokens are both timestamps — these are
+    // segment boundaries (the closing ts of one segment + the opening ts of the
+    // next, shared).
+    let mut boundaries: Vec<usize> = Vec::new();
+    for i in 1..tokens.len() {
+        if is_ts(tokens[i - 1]) && is_ts(tokens[i]) {
+            boundaries.push(i);
+        }
+    }
+
+    let mut segments = Vec::new();
+    let terminal_timestamp = tokens.last().is_some_and(|&token| is_ts(token))
+        && tokens.get(tokens.len().saturating_sub(2)).is_none_or(|&token| !is_ts(token));
+
+    if boundaries.is_empty() {
+        // Whisper treats this as one window-relative segment. If any timestamp
+        // was emitted, its last value limits the segment duration.
+        let start = 0.0;
+        let end = tokens
+            .iter()
+            .rev()
+            .find(|&&token| is_ts(token))
+            .filter(|&&token| token != ts_begin)
+            .map(|&token| token_to_seconds(token, ts_begin))
+            .unwrap_or(window_duration)
+            .clamp(0.0, window_duration.max(0.0));
+        let text = tokenizer.decode(tokens);
+        let text = text.trim();
+        if !text.is_empty() && end > start {
+            segments.push(Segment { text: text.to_string(), start, end });
+        }
+        return segments;
+    }
+
+    let mut last_slice = 0;
+    for &boundary in &boundaries {
+        if boundary > last_slice {
+            segments.push(segment_from_tokens(&tokens[last_slice..boundary], tokenizer, ts_begin, window_duration));
+        }
+        last_slice = boundary;
+    }
+
+    // An unfinished tail is excluded; it will be decoded again from the last
+    // completed timestamp boundary by long-form host orchestration.
+    if terminal_timestamp && tokens.len() > last_slice {
+        segments.push(segment_from_tokens(&tokens[last_slice..], tokenizer, ts_begin, window_duration));
+    }
+
+    // Filter empty segments (can happen when consecutive timestamps have no text between them).
+    segments.retain(|s| !s.text.is_empty() && s.end > s.start);
+    segments
+}
+
+/// Decode one timestamp-bounded slice into a [`Segment`].
+fn segment_from_tokens(slice: &[u32], tokenizer: &WhisperTokenizer, ts_begin: u32, window_duration: f32) -> Segment {
+    let extent = window_duration.max(0.0);
+    let start = slice
+        .first()
+        .filter(|&&t| t >= ts_begin)
+        .map(|&t| token_to_seconds(t, ts_begin))
+        .unwrap_or(0.0)
+        .clamp(0.0, extent);
+    let end = slice
+        .last()
+        .filter(|&&t| t >= ts_begin)
+        .map(|&t| token_to_seconds(t, ts_begin))
+        .unwrap_or(start)
+        .clamp(start, extent);
+    let text = tokenizer.decode(slice).trim().to_string();
+    Segment { text, start, end }
+}
+
+/// Convert a timestamp token id to seconds: `(id - timestamp_begin) / TOKENS_PER_SECOND`.
+fn token_to_seconds(token: u32, ts_begin: u32) -> f32 {
+    (token - ts_begin) as f32 / super::config::TOKENS_PER_SECOND
+}
+
 fn finish_decode(
     tokens: &[u32],
+    token_probs: &[f32],
     tokenizer: &WhisperTokenizer,
     sum_logprob: f32,
     no_speech_prob: f32,
@@ -1081,6 +1199,7 @@ fn finish_decode(
     let compression_ratio = compression_ratio_text(&text);
     Ok(DecodeResult {
         tokens: tokens.to_vec(),
+        token_probs: token_probs.to_vec(),
         text,
         avg_logprob,
         no_speech_prob,
@@ -1167,11 +1286,7 @@ fn copyin_replicated_cache(
     buf.copyin_at(0, bytemuck::cast_slice(&packed)).context(DeviceSnafu)
 }
 
-fn reorder_cache_host(
-    buf: &mut svod_device::Buffer,
-    parent_map: &[usize],
-    per_beam_floats: usize,
-) -> Result<()> {
+fn reorder_cache_host(buf: &mut svod_device::Buffer, parent_map: &[usize], per_beam_floats: usize) -> Result<()> {
     let total = per_beam_floats * parent_map.len();
     // Device-local cache: read out via copyout_prefix, reorder on host, write
     // back via copyin_at. This is the beam-reorder path (runs once per step
@@ -1251,16 +1366,7 @@ fn apply_logit_filters(
     {
         logits[ns as usize] = f32::NEG_INFINITY;
     }
-    if !options.without_timestamps {
-        apply_timestamp_rules(logits, tokenizer, tokens, sample_begin, options);
-    } else {
-        let ts_begin = tokenizer.timestamp_begin() as usize;
-        if ts_begin < logits.len() {
-            for t in &mut logits[ts_begin..] {
-                *t = f32::NEG_INFINITY;
-            }
-        }
-    }
+    apply_timestamp_rules(logits, tokenizer, tokens, sample_begin, options);
 }
 
 fn apply_timestamp_rules(
@@ -1380,15 +1486,23 @@ fn compression_ratio_text(text: &str) -> f32 {
     raw.len() as f32 / clen as f32
 }
 
+/// Multinomial sampling from logits at temperature T. Matches the OpenAI
+/// reference's `Categorical(logits=logits/T).sample()` (`decoding.py:283`),
+/// which PyTorch implements as a numerically stable softmax (max-subtract
+/// before exp) followed by inverse-CDF sampling.
 fn sample_from_logits(logits: &[f32], temperature: f32) -> u32 {
-    let scaled: Vec<f32> = logits.iter().map(|&l| (l / temperature).exp()).collect();
-    let sum: f32 = scaled.iter().sum();
+    // Max-subtract for numerical stability: exp(x - m) avoids overflow on
+    // large positive logits. The max is a no-op for the sampling distribution
+    // (it's a constant shift that cancels in normalization).
+    let max_val = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max) / temperature;
+    let probs: Vec<f32> = logits.iter().map(|&l| ((l / temperature) - max_val).exp()).collect();
+    let sum: f32 = probs.iter().copied().sum();
     let mut r = rand::random::<f32>() * sum;
-    for (i, &p) in scaled.iter().enumerate() {
+    for (i, &p) in probs.iter().enumerate() {
         r -= p;
         if r <= 0.0 {
             return i as u32;
         }
     }
-    (scaled.len() - 1) as u32
+    (probs.len() - 1) as u32
 }

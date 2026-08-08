@@ -223,6 +223,80 @@ pub fn find_alignment_path(
     dtw(&negated, text_len, audio_frames)
 }
 
+/// Extract an alignment path from statically packed selected-head raw QK
+/// scores. Compiled strides are separate from the valid unpadded extents.
+#[allow(clippy::too_many_arguments)]
+pub fn find_alignment_path_selected(
+    qk: &[f32],
+    n_heads: usize,
+    text_stride: usize,
+    audio_stride: usize,
+    valid_text: usize,
+    valid_audio: usize,
+    medfilt_width: usize,
+    sot_len: usize,
+) -> (Vec<usize>, Vec<usize>) {
+    let valid_text = valid_text.min(text_stride);
+    let valid_audio = valid_audio.min(audio_stride);
+    if n_heads == 0 || valid_audio == 0 || valid_text <= sot_len + 1 {
+        return (Vec::new(), Vec::new());
+    }
+
+    let mut weights = vec![0.0f32; n_heads * valid_text * valid_audio];
+    for head in 0..n_heads {
+        for text in 0..valid_text {
+            let src = (head * text_stride + text) * audio_stride;
+            let dst = (head * valid_text + text) * valid_audio;
+            weights[dst..dst + valid_audio].copy_from_slice(&qk[src..src + valid_audio]);
+        }
+    }
+
+    for row in weights.chunks_exact_mut(valid_audio) {
+        let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let mut sum = 0.0;
+        for value in row.iter_mut() {
+            *value = (*value - max).exp();
+            sum += *value;
+        }
+        for value in row.iter_mut() {
+            *value /= sum;
+        }
+    }
+
+    for head in 0..n_heads {
+        for frame in 0..valid_audio {
+            let mean =
+                (0..valid_text).map(|text| weights[(head * valid_text + text) * valid_audio + frame]).sum::<f32>()
+                    / valid_text as f32;
+            let variance = (0..valid_text)
+                .map(|text| {
+                    let delta = weights[(head * valid_text + text) * valid_audio + frame] - mean;
+                    delta * delta
+                })
+                .sum::<f32>()
+                / valid_text as f32;
+            let std = variance.sqrt().max(1e-10);
+            for text in 0..valid_text {
+                let index = (head * valid_text + text) * valid_audio + frame;
+                weights[index] = (weights[index] - mean) / std;
+            }
+        }
+    }
+
+    let filtered = median_filter(&weights, n_heads * valid_text, valid_audio, medfilt_width);
+    let aligned_text = valid_text - sot_len - 1;
+    let mut cost = vec![0.0f32; aligned_text * valid_audio];
+    for text in 0..aligned_text {
+        for frame in 0..valid_audio {
+            let sum = (0..n_heads)
+                .map(|head| filtered[(head * valid_text + text + sot_len) * valid_audio + frame])
+                .sum::<f32>();
+            cost[text * valid_audio + frame] = -(sum / n_heads as f32);
+        }
+    }
+    dtw(&cost, aligned_text, valid_audio)
+}
+
 /// Convert a DTW alignment path into word-level timings.
 ///
 /// `text_indices`, `time_indices`: DTW path. `word_boundaries`: cumulative
@@ -237,7 +311,7 @@ pub fn path_to_word_timings(
     token_probs: &[f32],
     tokens_per_second: f32,
 ) -> Vec<WordTiming> {
-    if word_boundaries.len() <= 1 {
+    if word_boundaries.len() <= 1 || text_indices.is_empty() || time_indices.is_empty() {
         return Vec::new();
     }
 
@@ -255,16 +329,17 @@ pub fn path_to_word_timings(
     let n_words = word_boundaries.len() - 1;
     let mut result = Vec::with_capacity(n_words);
 
+    let last_jump = jump_times.last().copied().unwrap_or(0.0);
     for w in 0..n_words {
-        let start = jump_times.get(word_boundaries[w]).copied().unwrap_or(0.0);
-        let end = jump_times.get(word_boundaries[w + 1]).copied().unwrap_or(start);
+        let start = jump_times.get(word_boundaries[w]).copied().unwrap_or(last_jump);
+        let end = jump_times.get(word_boundaries[w + 1]).copied().unwrap_or(last_jump).max(start);
 
         // Token probabilities for this word
         let tok_start = word_boundaries[w];
         let tok_end = word_boundaries[w + 1];
         let prob = if tok_end > tok_start {
-            let slice = &token_probs[tok_start..tok_end.min(token_probs.len())];
-            slice.iter().sum::<f32>() / slice.len() as f32
+            let slice = token_probs.get(tok_start..tok_end.min(token_probs.len())).unwrap_or_default();
+            if slice.is_empty() { 0.0 } else { slice.iter().sum::<f32>() / slice.len() as f32 }
         } else {
             0.0
         };
@@ -278,5 +353,65 @@ pub fn path_to_word_timings(
         });
     }
 
+    clean_up_word_timings(&mut result);
     result
+}
+
+/// Apply OpenAI Whisper's sentence-boundary duration cleanup and punctuation
+/// attachment to raw DTW timings.
+pub fn clean_up_word_timings(words: &mut [WordTiming]) {
+    let mut durations: Vec<f32> = words
+        .iter()
+        .map(|word| word.end - word.start)
+        .filter(|duration| duration.is_finite() && *duration > 0.0)
+        .collect();
+    durations.sort_by(|a, b| a.total_cmp(b));
+    let median = match durations.len() {
+        0 => 0.0,
+        len if len % 2 == 0 => (durations[len / 2 - 1] + durations[len / 2]) / 2.0,
+        len => durations[len / 2],
+    }
+    .min(0.7);
+    let max_duration = median * 2.0;
+    if max_duration > 0.0 {
+        const SENTENCE_END: &str = ".。!！?？";
+        for index in 1..words.len() {
+            if words[index].end - words[index].start > max_duration {
+                if SENTENCE_END.contains(words[index].word.as_str()) {
+                    words[index].end = words[index].start + max_duration;
+                } else if SENTENCE_END.contains(words[index - 1].word.as_str()) {
+                    words[index].start = words[index].end - max_duration;
+                }
+            }
+        }
+    }
+
+    merge_punctuations(words, "\"'“¿([{-", "\"'.。,，!！?？:：”)]}、");
+}
+
+fn merge_punctuations(words: &mut [WordTiming], prepended: &str, appended: &str) {
+    let mut following = words.len().saturating_sub(1);
+    for previous in (0..words.len().saturating_sub(1)).rev() {
+        if words[previous].word.starts_with(' ') && prepended.contains(words[previous].word.trim()) {
+            let prefix = std::mem::take(&mut words[previous].word);
+            words[following].word.insert_str(0, &prefix);
+            let mut tokens = std::mem::take(&mut words[previous].tokens);
+            tokens.append(&mut words[following].tokens);
+            words[following].tokens = tokens;
+        } else {
+            following = previous;
+        }
+    }
+
+    let mut previous = 0;
+    for following in 1..words.len() {
+        if !words[previous].word.ends_with(' ') && appended.contains(words[following].word.as_str()) {
+            let suffix = std::mem::take(&mut words[following].word);
+            words[previous].word.push_str(&suffix);
+            let tokens = std::mem::take(&mut words[following].tokens);
+            words[previous].tokens.extend(tokens);
+        } else {
+            previous = following;
+        }
+    }
 }

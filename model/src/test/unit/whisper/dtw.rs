@@ -63,3 +63,82 @@ fn median_filter_preserves_smooth() {
         assert!((out[i] - data[i]).abs() < 1.0, "median filter changed smooth data at {i}");
     }
 }
+
+#[test]
+fn selected_alignment_ignores_compiled_padding() {
+    let (heads, text_stride, audio_stride) = (2, 8, 6);
+    let (valid_text, valid_audio) = (5, 4);
+    let mut a = vec![0.0f32; heads * text_stride * audio_stride];
+    let mut b = vec![1000.0f32; a.len()];
+    for head in 0..heads {
+        for text in 0..valid_text {
+            for frame in 0..valid_audio {
+                let index = (head * text_stride + text) * audio_stride + frame;
+                let value = -((text as isize - frame as isize).abs() as f32) + head as f32 * 0.1;
+                a[index] = value;
+                b[index] = value;
+            }
+        }
+    }
+
+    let path_a = dtw::find_alignment_path_selected(&a, heads, text_stride, audio_stride, valid_text, valid_audio, 3, 1);
+    let path_b = dtw::find_alignment_path_selected(&b, heads, text_stride, audio_stride, valid_text, valid_audio, 3, 1);
+    assert_eq!(path_a, path_b);
+}
+
+#[test]
+fn word_timings_accept_empty_alignment_path() {
+    let timings = dtw::path_to_word_timings(&[], &[], &[0, 1], &["hello".to_string()], &[vec![1]], &[0.5], 50.0);
+    assert!(timings.is_empty());
+}
+
+#[test]
+fn word_probability_averages_decoder_token_probabilities() {
+    let timings = dtw::path_to_word_timings(
+        &[0, 1, 2],
+        &[0, 1, 2],
+        &[0, 2],
+        &["hello".to_string()],
+        &[vec![10, 11]],
+        &[0.2, 0.8],
+        50.0,
+    );
+    assert_eq!(timings.len(), 1);
+    assert!((timings[0].probability - 0.5).abs() < 1e-6);
+}
+
+#[test]
+fn missing_token_probabilities_do_not_produce_nan() {
+    let timings = dtw::path_to_word_timings(&[0, 1], &[0, 1], &[0, 1], &["hello".to_string()], &[vec![10]], &[], 50.0);
+    assert_eq!(timings[0].probability, 0.0);
+}
+
+#[test]
+fn punctuation_attaches_without_changing_timing() {
+    let timings = dtw::path_to_word_timings(
+        &[0, 1, 2],
+        &[0, 1, 2],
+        &[0, 1, 2],
+        &["hello".to_string(), "!".to_string()],
+        &[vec![10], vec![11]],
+        &[0.8, 0.9],
+        50.0,
+    );
+    assert_eq!(timings[0].word, "hello!");
+    assert_eq!(timings[0].tokens, [10, 11]);
+    assert_eq!(timings[0].start, 0.0);
+    assert_eq!(timings[0].end, 0.02);
+    assert!(timings[1].word.is_empty());
+}
+
+#[test]
+fn sentence_boundary_long_duration_is_truncated() {
+    let mut words = vec![
+        dtw::WordTiming { word: "hello".into(), tokens: vec![1], start: 0.0, end: 0.2, probability: 1.0 },
+        dtw::WordTiming { word: ".".into(), tokens: vec![2], start: 0.2, end: 2.2, probability: 1.0 },
+        dtw::WordTiming { word: " next".into(), tokens: vec![3], start: 2.2, end: 2.4, probability: 1.0 },
+    ];
+    dtw::clean_up_word_timings(&mut words);
+    assert!((words[1].end - 0.6).abs() < 1e-6);
+    assert_eq!(words[0].word, "hello.");
+}

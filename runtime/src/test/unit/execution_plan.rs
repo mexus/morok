@@ -31,6 +31,30 @@ fn test_empty_plan_output_buffer_returns_none() {
 }
 
 #[test]
+fn test_copy_output_region_to_buffer() {
+    let alloc = svod_device::registry::cpu().expect("cpu allocator");
+    let mut output = Buffer::new(alloc.clone(), DType::UInt8, vec![8], Default::default());
+    let mut destination = Buffer::new(alloc, DType::UInt8, vec![8], Default::default());
+    output.copyin(&[0, 1, 2, 3, 4, 5, 6, 7]).unwrap();
+    destination.copyin(&[9; 8]).unwrap();
+
+    let mut builder = ExecutionPlanBuilder::new(DeviceSpec::Cpu);
+    let output_idx = builder.add_buffer(1, output);
+    let destination_idx = builder.add_buffer(2, destination);
+    builder.set_output_buffer(output_idx);
+    let mut plan = builder.build().unwrap();
+
+    plan.copy_output_region_to_buffer(0, destination_idx, 2, 3, 3).unwrap();
+    let mut actual = [0; 8];
+    plan.buffers()[destination_idx].copyout(&mut actual).unwrap();
+    assert_eq!(actual, [9, 9, 3, 4, 5, 9, 9, 9]);
+
+    assert!(plan.copy_output_region_to_buffer(1, destination_idx, 0, 0, 1).is_err());
+    assert!(plan.copy_output_region_to_buffer(0, 99, 0, 0, 1).is_err());
+    assert!(plan.copy_output_region_to_buffer(0, output_idx, 0, 0, 1).is_err());
+}
+
+#[test]
 fn test_builder_map_buffer_alias() {
     let alloc = svod_device::registry::cpu().expect("cpu allocator");
     let buf = Buffer::new(alloc, svod_dtype::DType::Float32, vec![8], Default::default());
