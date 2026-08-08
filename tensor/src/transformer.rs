@@ -149,15 +149,24 @@ impl Tensor {
             .context(SymbolicShapeUnsupportedSnafu { operation: "scaled_dot_product_attention" })?;
         let scale_val = scale.unwrap_or(1.0 / (head_dim as f64).sqrt());
 
-        let scores_dtype = self.uop().dtype();
+        let query_dtype = self.uop().dtype();
 
-        // Q @ K^T
-        let kt = key.try_transpose(-1, -2)?;
-        let mut scores = self.matmul(&kt)?;
-
-        // Scale
-        let scale_t = Tensor::const_(scale_val, scores_dtype.clone());
-        scores = scores.try_mul(&scale_t)?;
+        // Pre-scale low-precision Q/K so the unscaled dot product cannot
+        // overflow or discard precision before the usual 1/sqrt(D) factor is
+        // applied. This matches Whisper's explicit D^-1/4 formulation.
+        let low_precision_scores =
+            (query_dtype == DType::Float16 || query_dtype == DType::BFloat16) && key.uop().dtype() == query_dtype;
+        let mut scores = if low_precision_scores {
+            let prescale = Tensor::const_(scale_val.sqrt(), query_dtype.clone());
+            let q = self.try_mul(&prescale)?;
+            let k = key.try_mul(&prescale)?;
+            q.matmul_with().other(&k.try_transpose(-1, -2)?).dtype(DType::Float32).call()?
+        } else {
+            let scores = self.matmul(&key.try_transpose(-1, -2)?)?;
+            let scale_t = Tensor::const_(scale_val, scores.uop().dtype());
+            scores.try_mul(&scale_t)?
+        };
+        let scores_dtype = scores.uop().dtype();
 
         // Build a boolean "keep" mask that ANDs together the causal constraint,
         // the optional sliding-window band, and the user-supplied `attn_mask`.
@@ -234,16 +243,14 @@ impl Tensor {
         // Softmax + output. Re-zero out-of-band weights so a fully-masked row
         // (whose softmax would otherwise be uniform over the masked keys)
         // produces exact zeros rather than `1/k_len` leakage.
-        let low_precision_scores = scores.uop().dtype() == DType::Float16 || scores.uop().dtype() == DType::BFloat16;
-        let mut attn_weights = if low_precision_scores {
-            scores.cast(DType::Float32)?.softmax(-1isize)?.cast(scores_dtype.clone())?
-        } else {
-            scores.softmax(-1isize)?
-        };
+        let mut attn_weights = scores.softmax(-1isize)?;
         if let Some(keep) = keep_mask.as_ref() {
             let zero = Tensor::const_(ConstValue::zero(scores_dtype.base()), scores_dtype);
             let masked_out = keep.logical_not()?;
             attn_weights = zero.where_(&masked_out, &attn_weights)?;
+        }
+        if low_precision_scores {
+            attn_weights = attn_weights.cast(query_dtype)?;
         }
         attn_weights.matmul(value)
     }

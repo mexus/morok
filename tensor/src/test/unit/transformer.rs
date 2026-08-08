@@ -221,6 +221,33 @@ crate::codegen_tests! {
         }
     }
 
+    fn test_sdpa_float16_prescales_before_dot_product(config) {
+        let q = Tensor::from_slice(vec![40.0f32; 64])
+            .try_reshape([1usize, 1, 1, 64])
+            .unwrap()
+            .cast(crate::DType::Float16)
+            .unwrap();
+        let mut keys = vec![40.0f32; 64];
+        keys.extend(vec![-40.0f32; 64]);
+        let k = Tensor::from_slice(keys)
+            .try_reshape([1usize, 1, 2, 64])
+            .unwrap()
+            .cast(crate::DType::Float16)
+            .unwrap();
+        let v = Tensor::from_slice([1.0f32, 2.0])
+            .try_reshape([1usize, 1, 2, 1])
+            .unwrap()
+            .cast(crate::DType::Float16)
+            .unwrap();
+
+        let result = q.scaled_dot_product_attention().key(&k).value(&v).call().unwrap();
+        let mut result = result.cast(crate::DType::Float32).unwrap();
+        result.realize_with(&config).unwrap();
+        let value = result.as_vec::<f32>().unwrap()[0];
+        assert!(value.is_finite(), "low-precision attention overflowed before scaling");
+        assert!((value - 1.0).abs() < 1e-3, "unexpected prescaled attention output {value}");
+    }
+
     fn test_sdpa_rejects_non_float_qkv(_config) {
         let qf = Tensor::from_ndarray(&array![[[[1.0f32, 0.0]]]]);
         let kf = Tensor::from_ndarray(&array![[[[1.0f32, 0.0], [0.0, 1.0]]]]);
