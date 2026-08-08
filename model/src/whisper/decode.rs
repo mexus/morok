@@ -6,6 +6,8 @@ use super::error::{DeviceSnafu, Error, JitSnafu, Result};
 use super::jit::{WhisperDecoderJit, WhisperDecoderStepJit, WhisperPrefillJit};
 use super::tokenizer::WhisperTokenizer;
 use snafu::ResultExt;
+use std::cmp::Ordering;
+use std::collections::VecDeque;
 use svod_arch::pipelines::audio::Segment;
 
 // ─── Language detection ─────────────────────────────────────────────────────
@@ -190,6 +192,10 @@ fn valid_temperature(temperature: f32) -> bool {
     temperature.is_finite() && temperature > 0.0
 }
 
+pub(crate) fn remaining_sample_steps(sample_len: usize) -> usize {
+    sample_len.saturating_sub(1)
+}
+
 #[derive(Clone, Debug)]
 pub struct DecodeResult {
     pub tokens: Vec<u32>,
@@ -346,6 +352,11 @@ pub fn greedy_decode_cached(
     let mut sum_logprob = log_softmax(&filtered, next_token as usize);
     let no_speech_prob = ctx.no_speech_prob;
 
+    let sample_len = options.sample_len.unwrap_or(n_text_ctx / 2);
+    if sample_len == 0 {
+        return finish_decode(&[], &[], tokenizer, 0.0, no_speech_prob, options);
+    }
+
     let mut tokens = Vec::new();
     let mut token_probs = Vec::new();
     if next_token != tokenizer.eot() {
@@ -353,9 +364,9 @@ pub fn greedy_decode_cached(
         token_probs.push(sum_logprob.exp());
     }
 
-    let sample_len = options.sample_len.unwrap_or(n_text_ctx / 2);
-
-    for step in 0..sample_len {
+    // Prefill produced generated token 1, so only the remaining budget needs
+    // decoder-step dispatches.
+    for step in 0..remaining_sample_steps(sample_len) {
         if next_token == tokenizer.eot() {
             break;
         }
@@ -398,254 +409,551 @@ pub fn greedy_decode_cached(
     finish_decode(&tokens, &token_probs, tokenizer, sum_logprob, no_speech_prob, options)
 }
 
-// ─── Batched (step-locked) greedy decode ────────────────────────────────────
-//
-// The continuous-batching primitive: N lanes each carry independent decode
-// state (one per audio window), and every token step runs as a single batched
-// JIT dispatch across all active lanes. Lanes that hit EOT drop out; the loop
-// ends when no lanes remain. This is the bandwidth-amortizing path — one
-// weight read serves all lanes.
-//
-// `DecodeLane` reuses the same `DecodeCtx` fields (prefill seeds them) and
-// adds the per-step loop state that `greedy_decode_cached` kept as locals.
+// ─── Fixed-slot mixed-strategy scheduler ────────────────────────────────────
 
-/// One independent decode (one audio window's greedy decode attempt).
-///
-/// Built by [`DecodeLane::prefill`] from the `[1,4]` prefill JIT; the KV
-/// caches then live in the lane and are packed into the batched step JIT's
-/// `max_lanes`-sized buffers at the lane's row offset each step.
-pub struct DecodeLane {
-    // Static-per-attempt state (set by prefill, read each step)
-    pub initial_tokens: Vec<u32>,
-    pub sample_begin: usize,
-    pub init_len: usize,
-    pub suppress_tokens: Vec<i32>,
-    pub no_speech_prob: f32,
-    pub pos_embedding: Vec<f32>,
-    pub n_state: usize,
-
-    // KV caches are seeded once into this lane's stable fixed-batch slot. The
-    // cache then grows on-device via SDMA writeback; lanes never compact.
-    pub self_k_cache: Vec<f32>,
-    pub self_v_cache: Vec<f32>,
-    pub cross_k: Vec<f32>,
-    pub cross_v: Vec<f32>,
-    pub seeded_row: Option<usize>,
-
-    // Per-step loop state (mutated each step)
-    pub next_token: u32,
-    pub tokens: Vec<u32>,
-    pub token_probs: Vec<f32>,
-    pub sum_logprob: f32,
-    pub pos: usize, // current position = init_len + step
-    pub done: bool,
+/// Immutable output of token prefill. Fallback attempts reuse this seed rather
+/// than rerunning prefill. Cache vectors are currently host-resident and are
+/// copied into a row only when that row changes request ownership.
+pub(crate) struct DecodeSeed {
+    ctx: DecodeCtx,
 }
 
-impl DecodeLane {
-    /// Run prefill for one window and build the lane state.
-    ///
-    /// `audio_raw` is the encoder output for this window, flat
-    /// `[N_AUDIO_CTX * n_audio_state]` f32 (the slice the existing
-    /// `decode_with_fallback_cached` passes to `init_decode`).
-    pub fn prefill(
-        prefill_jit: &mut WhisperPrefillJit,
-        tokenizer: &WhisperTokenizer,
-        options: &DecodeOptions,
-        n_text_ctx: usize,
-        n_vocab: usize,
-        pos_embedding: &[f32],
-        n_state: usize,
-    ) -> Result<Self> {
-        let ctx = init_decode(prefill_jit, tokenizer, options, n_text_ctx, n_vocab, pos_embedding, n_state)?;
-
-        // First token from prefill logits (mirrors greedy_decode_cached:260-278)
-        let last_logits = &ctx.prefill_logits[(ctx.init_len - 1) * n_vocab..ctx.init_len * n_vocab];
-        let mut filtered = last_logits.to_vec();
-        apply_logit_filters(
-            &mut filtered,
-            tokenizer,
-            options,
-            &ctx.initial_tokens,
-            ctx.sample_begin,
-            0,
-            &ctx.suppress_tokens,
-        );
-        let next_token = pick_token(&filtered, options.strategy.temperature());
-        let sum_logprob = log_softmax(&filtered, next_token as usize);
-
-        let mut tokens = Vec::new();
-        let mut token_probs = Vec::new();
-        if next_token != tokenizer.eot() {
-            tokens.push(next_token);
-            token_probs.push(sum_logprob.exp());
-        }
-
-        Ok(Self {
-            initial_tokens: ctx.initial_tokens,
-            sample_begin: ctx.sample_begin,
-            init_len: ctx.init_len,
-            suppress_tokens: ctx.suppress_tokens,
-            no_speech_prob: ctx.no_speech_prob,
-            pos_embedding: ctx.pos_embedding,
-            n_state: ctx.n_state,
-            self_k_cache: ctx.self_k_cache,
-            self_v_cache: ctx.self_v_cache,
-            cross_k: ctx.cross_k,
-            cross_v: ctx.cross_v,
-            seeded_row: None,
-            next_token,
-            tokens,
-            token_probs,
-            sum_logprob,
-            pos: ctx.init_len, // first step decodes at init_len
-            done: next_token == tokenizer.eot(),
-        })
-    }
-
-    /// Per-position floats in the self cache: `n_layer * n_head * d_head`.
-    fn per_pos_floats(&self) -> usize {
-        self.self_k_cache.len() / self.init_len
-    }
-
-    fn per_pos_bytes(&self) -> usize {
-        self.per_pos_floats() * std::mem::size_of::<f32>()
-    }
-
-    pub fn finish(self, tokenizer: &WhisperTokenizer, options: &DecodeOptions) -> Result<DecodeResult> {
-        finish_decode(&self.tokens, &self.token_probs, tokenizer, self.sum_logprob, self.no_speech_prob, options)
-    }
-}
-
-/// Step-locked batched greedy decode: advances every active lane by one token
-/// per JIT dispatch, until all lanes are `done` or hit `sample_len`.
-///
-/// Each lane occupies a stable row (`lane_idx`) in a concrete fixed-capacity
-/// graph. Inactive rows still execute but their outputs are ignored.
-#[allow(clippy::too_many_arguments)]
-pub fn run_batched_decode(
-    lanes: &mut [DecodeLane],
-    step_jit: &mut WhisperDecoderStepJit,
-    capacity: usize,
+pub(crate) fn prefill_decode_seed(
+    prefill_jit: &mut WhisperPrefillJit,
     tokenizer: &WhisperTokenizer,
     options: &DecodeOptions,
     n_text_ctx: usize,
     n_vocab: usize,
+    pos_embedding: &[f32],
+    n_state: usize,
+) -> Result<DecodeSeed> {
+    Ok(DecodeSeed { ctx: init_decode(prefill_jit, tokenizer, options, n_text_ctx, n_vocab, pos_embedding, n_state)? })
+}
+
+pub(crate) fn strategy_width(strategy: DecodeStrategy) -> usize {
+    match strategy {
+        DecodeStrategy::Beam { size } => size,
+        DecodeStrategy::Greedy | DecodeStrategy::Sample { .. } => 1,
+    }
+}
+
+pub(crate) fn attempt_strategies(options: &DecodeOptions) -> Vec<DecodeStrategy> {
+    let mut strategies = vec![options.strategy];
+    if let Some(fallback) = &options.fallback {
+        strategies
+            .extend(fallback.sampling_temperatures.iter().map(|&temperature| DecodeStrategy::Sample { temperature }));
+    }
+    strategies
+}
+
+pub(crate) fn collect_ordered<T>(results: Vec<Option<T>>) -> std::result::Result<Vec<T>, &'static str> {
+    results.into_iter().map(|result| result.ok_or("missing scheduled result")).collect()
+}
+
+/// Small independently-testable allocator enforcing whole-attempt admission.
+#[derive(Debug)]
+pub(crate) struct SlotAllocator {
+    owners: Vec<Option<usize>>,
+}
+
+impl SlotAllocator {
+    pub(crate) fn new(capacity: usize) -> Self {
+        Self { owners: vec![None; capacity] }
+    }
+
+    pub(crate) fn reserve(
+        &mut self,
+        owner: usize,
+        width: usize,
+    ) -> std::result::Result<Option<Vec<usize>>, &'static str> {
+        if width == 0 {
+            return Err("attempt width must be non-zero");
+        }
+        if width > self.owners.len() {
+            return Err("decode attempt width exceeds decoder slots");
+        }
+        if self.owners.iter().filter(|slot| slot.is_none()).count() < width {
+            return Ok(None);
+        }
+        let rows: Vec<_> = self
+            .owners
+            .iter()
+            .enumerate()
+            .filter_map(|(row, current)| current.is_none().then_some(row))
+            .take(width)
+            .collect();
+        for &row in &rows {
+            self.owners[row] = Some(owner);
+        }
+        Ok(Some(rows))
+    }
+
+    pub(crate) fn release(&mut self, owner: usize) {
+        for slot in &mut self.owners {
+            if *slot == Some(owner) {
+                *slot = None;
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn owners(&self) -> &[Option<usize>] {
+        &self.owners
+    }
+}
+
+struct SingleAttempt {
+    next_token: u32,
+    tokens: Vec<u32>,
+    token_probs: Vec<f32>,
+    sum_logprob: f32,
+}
+
+struct BeamAttempt {
+    active: Vec<BeamHypothesis>,
+    rows: Vec<usize>,
+    finished: Vec<BeamHypothesis>,
+    next_logical_id: usize,
+}
+
+enum AttemptKind {
+    Single(SingleAttempt),
+    Beam(BeamAttempt),
+}
+
+struct ScheduledAttempt {
+    strategy_index: usize,
+    strategy: DecodeStrategy,
+    reserved_rows: Vec<usize>,
+    pos: usize,
+    generated_tokens: usize,
+    kind: AttemptKind,
+}
+
+impl ScheduledAttempt {
+    fn is_done(&self, sample_len: usize, eot: u32) -> bool {
+        match &self.kind {
+            AttemptKind::Single(single) => {
+                sample_len == 0 || single.next_token == eot || single.tokens.len() >= sample_len
+            }
+            AttemptKind::Beam(beam) => {
+                sample_len == 0
+                    || self.generated_tokens >= sample_len
+                    || beam.active.is_empty()
+                    || beam.finished.len() >= self.reserved_rows.len()
+            }
+        }
+    }
+}
+
+fn start_attempt(
+    strategy_index: usize,
+    strategy: DecodeStrategy,
+    rows: Vec<usize>,
+    seed: &DecodeSeed,
+    tokenizer: &WhisperTokenizer,
+    options: &DecodeOptions,
+    n_vocab: usize,
+) -> Result<ScheduledAttempt> {
+    let ctx = &seed.ctx;
+    let last = ctx
+        .prefill_logits
+        .get((ctx.init_len - 1) * n_vocab..ctx.init_len * n_vocab)
+        .ok_or_else(|| decode_err("prefill logits are truncated"))?;
+    let mut filtered = last.to_vec();
+    apply_logit_filters(
+        &mut filtered,
+        tokenizer,
+        options,
+        &ctx.initial_tokens,
+        ctx.sample_begin,
+        0,
+        &ctx.suppress_tokens,
+    );
+    let kind = match strategy {
+        DecodeStrategy::Greedy | DecodeStrategy::Sample { .. } => {
+            if options.sample_len == Some(0) {
+                return Ok(ScheduledAttempt {
+                    strategy_index,
+                    strategy,
+                    reserved_rows: rows,
+                    pos: ctx.init_len,
+                    generated_tokens: 0,
+                    kind: AttemptKind::Single(SingleAttempt {
+                        next_token: tokenizer.eot(),
+                        tokens: Vec::new(),
+                        token_probs: Vec::new(),
+                        sum_logprob: 0.0,
+                    }),
+                });
+            }
+            let next_token = pick_token(&filtered, strategy.temperature());
+            let sum_logprob = log_softmax(&filtered, next_token as usize);
+            let (tokens, token_probs) = if next_token == tokenizer.eot() {
+                (Vec::new(), Vec::new())
+            } else {
+                (vec![next_token], vec![sum_logprob.exp()])
+            };
+            AttemptKind::Single(SingleAttempt { next_token, tokens, token_probs, sum_logprob })
+        }
+        DecodeStrategy::Beam { size } => {
+            if options.sample_len == Some(0) {
+                let active = vec![BeamHypothesis {
+                    logical_id: 0,
+                    tokens: ctx.initial_tokens.clone(),
+                    token_probs: Vec::new(),
+                    sum_logprob: 0.0,
+                }];
+                return Ok(ScheduledAttempt {
+                    strategy_index,
+                    strategy,
+                    reserved_rows: rows.clone(),
+                    pos: ctx.init_len,
+                    generated_tokens: 0,
+                    kind: AttemptKind::Beam(BeamAttempt {
+                        active,
+                        rows: vec![rows[0]],
+                        finished: Vec::new(),
+                        next_logical_id: 1,
+                    }),
+                });
+            }
+            let mut ranked: Vec<_> = log_softmax_vec(&filtered).into_iter().enumerate().collect();
+            ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            let mut active = Vec::with_capacity(size);
+            let mut finished = Vec::new();
+            let mut next_logical_id = 0;
+            for (token, logprob) in ranked {
+                if active.len() >= size {
+                    break;
+                }
+                let mut tokens = ctx.initial_tokens.clone();
+                tokens.push(token as u32);
+                let hypothesis = BeamHypothesis {
+                    logical_id: next_logical_id,
+                    tokens,
+                    token_probs: vec![logprob.exp()],
+                    sum_logprob: logprob,
+                };
+                next_logical_id += 1;
+                if token as u32 == tokenizer.eot() {
+                    finished.push(hypothesis);
+                } else {
+                    active.push(hypothesis);
+                }
+            }
+            let active_rows = rows[..active.len()].to_vec();
+            AttemptKind::Beam(BeamAttempt { active, rows: active_rows, finished, next_logical_id })
+        }
+    };
+    Ok(ScheduledAttempt { strategy_index, strategy, reserved_rows: rows, pos: ctx.init_len, generated_tokens: 1, kind })
+}
+
+fn seed_attempt_rows(
+    jit: &mut WhisperDecoderStepJit,
+    rows: &[usize],
+    seed: &DecodeSeed,
+    n_text_ctx: usize,
 ) -> Result<()> {
-    let sample_len = options.sample_len.unwrap_or(n_text_ctx / 2);
-    let eot = tokenizer.eot();
-    let n_state = lanes.first().map(|l| l.n_state).unwrap_or(0);
-    for lane in lanes.iter_mut() {
-        if lane.tokens.len() >= sample_len || lane.next_token == eot {
-            lane.done = true;
-        }
+    let ctx = &seed.ctx;
+    let per_pos = ctx.per_pos_floats();
+    let self_stride = n_text_ctx.checked_mul(per_pos).ok_or_else(|| decode_err("self cache stride overflow"))?;
+    let cross_stride = N_AUDIO_CTX.checked_mul(per_pos).ok_or_else(|| decode_err("cross cache stride overflow"))?;
+    for &row in rows {
+        copyin_cache_row(jit.self_k_cache_mut().context(JitSnafu)?, row, self_stride, &ctx.self_k_cache)?;
+        copyin_cache_row(jit.self_v_cache_mut().context(JitSnafu)?, row, self_stride, &ctx.self_v_cache)?;
+        copyin_cache_row(jit.cross_k_mut().context(JitSnafu)?, row, cross_stride, &ctx.cross_k)?;
+        copyin_cache_row(jit.cross_v_mut().context(JitSnafu)?, row, cross_stride, &ctx.cross_v)?;
     }
-    let mut owners: Vec<Option<usize>> = vec![None; capacity];
-    let mut next_lane = 0usize;
-
-    loop {
-        for owner in &mut owners {
-            if owner.is_some_and(|lane_index| lanes[lane_index].done) {
-                *owner = None;
-            }
-            if owner.is_none() {
-                while next_lane < lanes.len() && lanes[next_lane].done {
-                    next_lane += 1;
-                }
-                if next_lane < lanes.len() {
-                    *owner = Some(next_lane);
-                    next_lane += 1;
-                }
-            }
-        }
-
-        let active: Vec<(usize, usize)> =
-            owners.iter().enumerate().filter_map(|(slot, &owner)| owner.map(|lane_index| (slot, lane_index))).collect();
-        if active.is_empty() {
-            break;
-        }
-        // Per-position float count and buffer row strides. All lanes share
-        // the same structural dims, so read them from the first active lane.
-        let per_pos_floats = lanes[active[0].1].per_pos_floats();
-        let self_row_stride = n_text_ctx * per_pos_floats; // [max_lanes, N_TEXT_CTX, ...]
-        let cross_row_stride = N_AUDIO_CTX * per_pos_floats; // [max_lanes, N_AUDIO_CTX, ...]
-
-        // Stable slots remove cache relocation when another lane finishes.
-        for &(row, lane_idx) in &active {
-            let lane = &mut lanes[lane_idx];
-            write_token_row(step_jit, row, lane.next_token)?;
-            write_pos_emb_row(step_jit, row, &lane.pos_embedding[lane.pos * n_state..(lane.pos + 1) * n_state])?;
-            write_self_mask_row(step_jit, row, lane.pos, n_text_ctx)?;
-
-            if lane.seeded_row.is_none() {
-                copyin_cache_row(
-                    step_jit.self_k_cache_mut().context(JitSnafu)?,
-                    row,
-                    self_row_stride,
-                    &lane.self_k_cache,
-                )?;
-                copyin_cache_row(
-                    step_jit.self_v_cache_mut().context(JitSnafu)?,
-                    row,
-                    self_row_stride,
-                    &lane.self_v_cache,
-                )?;
-                copyin_cache_row(step_jit.cross_k_mut().context(JitSnafu)?, row, cross_row_stride, &lane.cross_k)?;
-                copyin_cache_row(step_jit.cross_v_mut().context(JitSnafu)?, row, cross_row_stride, &lane.cross_v)?;
-            }
-            lane.seeded_row = Some(row);
-        }
-
-        // The same concrete graph executes at every step. This keeps matrix
-        // dimensions static and makes the plan graph-capture eligible.
-        step_jit.execute().context(JitSnafu)?;
-
-        // Per-lane teardown: SDMA-writeback new K/V, read logits, pick token.
-        for &(row, lane_idx) in &active {
-            let lane = &mut lanes[lane_idx];
-
-            // Device-side K/V copy: append this step's new K/V at lane.pos.
-            // Input buffer is [max_lanes, N_TEXT_CTX, ...]; this lane's row
-            // starts at row*N_TEXT_CTX*per_pos_floats*4, position `pos` within
-            // that row. Output buffer is [active_count, 1, ...]; the `row`-th
-            // lane's new K/V is at row*per_pos_floats*4.
-            let per_pos_b = lane.per_pos_bytes();
-            let dst_base = row * self_row_stride * std::mem::size_of::<f32>();
-            let dst_off = dst_base + lane.pos * per_pos_b;
-            let src_off = row * per_pos_b;
-            step_jit.copy_output_to_self_k_cache(1, dst_off, src_off, per_pos_b).context(JitSnafu)?;
-            step_jit.copy_output_to_self_v_cache(2, dst_off, src_off, per_pos_b).context(JitSnafu)?;
-
-            // Read this lane's logits row and pick the next token.
-            let logits = read_logits_row(step_jit, row, n_vocab)?;
-
-            let all_toks: Vec<u32> = lane.initial_tokens.iter().copied().chain(lane.tokens.iter().copied()).collect();
-            let step = lane.pos + 1 - lane.init_len;
-            let mut filtered = logits;
-            apply_logit_filters(
-                &mut filtered,
-                tokenizer,
-                options,
-                &all_toks,
-                lane.sample_begin,
-                step,
-                &lane.suppress_tokens,
-            );
-            lane.next_token = pick_token(&filtered, options.strategy.temperature());
-            let token_logprob = log_softmax(&filtered, lane.next_token as usize);
-            lane.sum_logprob += token_logprob;
-
-            if lane.next_token != eot {
-                lane.tokens.push(lane.next_token);
-                lane.token_probs.push(token_logprob.exp());
-            }
-            lane.pos += 1;
-            if lane.next_token == eot || lane.tokens.len() >= sample_len {
-                lane.done = true;
-            }
-        }
-    }
-
     Ok(())
+}
+
+fn append_row_cache(
+    jit: &mut WhisperDecoderStepJit,
+    row: usize,
+    pos: usize,
+    per_pos_bytes: usize,
+    row_stride_bytes: usize,
+) -> Result<()> {
+    let dst = row
+        .checked_mul(row_stride_bytes)
+        .and_then(|base| pos.checked_mul(per_pos_bytes).and_then(|offset| base.checked_add(offset)))
+        .ok_or_else(|| decode_err("self cache append offset overflow"))?;
+    let src = row.checked_mul(per_pos_bytes).ok_or_else(|| decode_err("step cache output offset overflow"))?;
+    jit.copy_output_to_self_k_cache(1, dst, src, per_pos_bytes).context(JitSnafu)?;
+    jit.copy_output_to_self_v_cache(2, dst, src, per_pos_bytes).context(JitSnafu)
+}
+
+fn clone_cache_prefix(
+    jit: &mut WhisperDecoderStepJit,
+    copies: &[CacheCopy],
+    positions: usize,
+    per_pos_bytes: usize,
+    row_stride_bytes: usize,
+) -> Result<()> {
+    let len = positions.checked_mul(per_pos_bytes).ok_or_else(|| decode_err("cache prefix length overflow"))?;
+    for copy in copies {
+        let src =
+            copy.src_row.checked_mul(row_stride_bytes).ok_or_else(|| decode_err("cache source offset overflow"))?;
+        let dst = copy
+            .dst_row
+            .checked_mul(row_stride_bytes)
+            .ok_or_else(|| decode_err("cache destination offset overflow"))?;
+        jit.self_k_cache_mut().context(JitSnafu)?.copy_within(dst, src, len).context(DeviceSnafu)?;
+        jit.self_v_cache_mut().context(JitSnafu)?.copy_within(dst, src, len).context(DeviceSnafu)?;
+    }
+    Ok(())
+}
+
+fn finish_attempt(
+    attempt: ScheduledAttempt,
+    seed: &DecodeSeed,
+    tokenizer: &WhisperTokenizer,
+    options: &DecodeOptions,
+) -> Result<DecodeResult> {
+    match attempt.kind {
+        AttemptKind::Single(single) => finish_decode(
+            &single.tokens,
+            &single.token_probs,
+            tokenizer,
+            if options.sample_len == Some(0) { 0.0 } else { single.sum_logprob },
+            seed.ctx.no_speech_prob,
+            options,
+        ),
+        AttemptKind::Beam(beam) => {
+            let size = attempt.reserved_rows.len();
+            let best =
+                finalize_beam_hypotheses(beam.active, beam.finished, size, tokenizer.eot(), seed.ctx.sample_begin)
+                    .ok_or_else(|| decode_err("beam produced nothing"))?;
+            let tokens: Vec<_> = best.tokens[seed.ctx.sample_begin..]
+                .iter()
+                .copied()
+                .take_while(|&token| token != tokenizer.eot())
+                .collect();
+            let token_probs = best.token_probs.into_iter().take(tokens.len()).collect::<Vec<_>>();
+            finish_decode(&tokens, &token_probs, tokenizer, best.sum_logprob, seed.ctx.no_speech_prob, options)
+        }
+    }
+}
+
+/// Decode all requests through one concrete `[decoder_slots, ...]` step graph.
+/// Attempts reserve their full width atomically and retain every reserved row,
+/// including inactive beam rows, until quality acceptance or fallback requeue.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_fixed_slot_decode(
+    seeds: &[DecodeSeed],
+    request_options: &[DecodeOptions],
+    step_jit: &mut WhisperDecoderStepJit,
+    capacity: usize,
+    tokenizer: &WhisperTokenizer,
+    n_text_ctx: usize,
+    n_vocab: usize,
+) -> Result<Vec<DecodeResult>> {
+    if seeds.len() != request_options.len() {
+        return Err(decode_err("decode seed/options count mismatch"));
+    }
+    for options in request_options {
+        options.validate().map_err(decode_err)?;
+        for strategy in attempt_strategies(options) {
+            if strategy_width(strategy) > capacity {
+                return Err(decode_err("decode attempt width exceeds decoder slots"));
+            }
+        }
+    }
+
+    let strategies: Vec<_> = request_options.iter().map(attempt_strategies).collect();
+    let mut queue: VecDeque<_> = (0..seeds.len()).map(|request| (request, 0usize)).collect();
+    let mut allocator = SlotAllocator::new(capacity);
+    let mut attempts: Vec<Option<ScheduledAttempt>> = (0..seeds.len()).map(|_| None).collect();
+    let mut results: Vec<Option<DecodeResult>> = (0..seeds.len()).map(|_| None).collect();
+
+    while results.iter().any(Option::is_none) {
+        while let Some(&(request, strategy_index)) = queue.front() {
+            let strategy = strategies[request][strategy_index];
+            let Some(rows) = allocator.reserve(request, strategy_width(strategy)).map_err(decode_err)? else {
+                break;
+            };
+            queue.pop_front();
+            let mut options = request_options[request].clone();
+            options.strategy = strategy;
+            let attempt = start_attempt(strategy_index, strategy, rows, &seeds[request], tokenizer, &options, n_vocab)?;
+            seed_attempt_rows(step_jit, &attempt.reserved_rows, &seeds[request], n_text_ctx)?;
+            attempts[request] = Some(attempt);
+        }
+
+        let active_requests: Vec<_> =
+            attempts.iter().enumerate().filter_map(|(request, attempt)| attempt.as_ref().map(|_| request)).collect();
+        if active_requests.is_empty() {
+            return Err(decode_err("fixed-slot scheduler made no progress"));
+        }
+
+        // Attempts that finish from prefill (EOT or zero budget) need no graph dispatch.
+        let mut dispatch = false;
+        for &request in &active_requests {
+            let attempt = attempts[request].as_ref().expect("active attempt");
+            let sample_len = request_options[request].sample_len.unwrap_or(n_text_ctx / 2);
+            if attempt.is_done(sample_len, tokenizer.eot()) {
+                continue;
+            }
+            let seed = &seeds[request].ctx;
+            match &attempt.kind {
+                AttemptKind::Single(single) => {
+                    let row = attempt.reserved_rows[0];
+                    write_token_row(step_jit, row, single.next_token)?;
+                    write_pos_emb_row(
+                        step_jit,
+                        row,
+                        seed.pos_embedding
+                            .get(attempt.pos * seed.n_state..(attempt.pos + 1) * seed.n_state)
+                            .ok_or_else(|| decode_err("position embedding is out of bounds"))?,
+                    )?;
+                    write_self_mask_row(step_jit, row, attempt.pos, n_text_ctx)?;
+                }
+                AttemptKind::Beam(beam) => {
+                    for (hypothesis, &row) in beam.active.iter().zip(&beam.rows) {
+                        write_token_row(
+                            step_jit,
+                            row,
+                            *hypothesis.tokens.last().ok_or_else(|| decode_err("empty beam"))?,
+                        )?;
+                        write_pos_emb_row(
+                            step_jit,
+                            row,
+                            seed.pos_embedding
+                                .get(attempt.pos * seed.n_state..(attempt.pos + 1) * seed.n_state)
+                                .ok_or_else(|| decode_err("position embedding is out of bounds"))?,
+                        )?;
+                        write_self_mask_row(step_jit, row, attempt.pos, n_text_ctx)?;
+                    }
+                }
+            }
+            dispatch = true;
+        }
+
+        if dispatch {
+            step_jit.execute().context(JitSnafu)?;
+            for &request in &active_requests {
+                let attempt = attempts[request].as_mut().expect("active attempt");
+                let sample_len = request_options[request].sample_len.unwrap_or(n_text_ctx / 2);
+                if attempt.is_done(sample_len, tokenizer.eot()) {
+                    continue;
+                }
+                let seed = &seeds[request].ctx;
+                let per_pos_bytes = seed.per_pos_bytes();
+                let row_stride_bytes = n_text_ctx
+                    .checked_mul(per_pos_bytes)
+                    .ok_or_else(|| decode_err("self cache row stride overflow"))?;
+                let mut options = request_options[request].clone();
+                options.strategy = attempt.strategy;
+                match &mut attempt.kind {
+                    AttemptKind::Single(single) => {
+                        let row = attempt.reserved_rows[0];
+                        append_row_cache(step_jit, row, attempt.pos, per_pos_bytes, row_stride_bytes)?;
+                        let mut logits = read_logits_row(step_jit, row, n_vocab)?;
+                        let all_tokens: Vec<_> =
+                            seed.initial_tokens.iter().copied().chain(single.tokens.iter().copied()).collect();
+                        apply_logit_filters(
+                            &mut logits,
+                            tokenizer,
+                            &options,
+                            &all_tokens,
+                            seed.sample_begin,
+                            attempt.pos + 1 - seed.init_len,
+                            &seed.suppress_tokens,
+                        );
+                        single.next_token = pick_token(&logits, attempt.strategy.temperature());
+                        let logprob = log_softmax(&logits, single.next_token as usize);
+                        single.sum_logprob += logprob;
+                        if single.next_token != tokenizer.eot() {
+                            single.tokens.push(single.next_token);
+                            single.token_probs.push(logprob.exp());
+                        }
+                    }
+                    AttemptKind::Beam(beam) => {
+                        for &row in &beam.rows {
+                            append_row_cache(step_jit, row, attempt.pos, per_pos_bytes, row_stride_bytes)?;
+                        }
+                        let size = attempt.reserved_rows.len();
+                        let mut candidates = Vec::new();
+                        for (parent_index, (hypothesis, &row)) in beam.active.iter().zip(&beam.rows).enumerate() {
+                            let mut logits = read_logits_row(step_jit, row, n_vocab)?;
+                            apply_logit_filters(
+                                &mut logits,
+                                tokenizer,
+                                &options,
+                                &hypothesis.tokens,
+                                seed.sample_begin,
+                                attempt.pos + 1 - seed.init_len,
+                                &seed.suppress_tokens,
+                            );
+                            let mut ranked: Vec<_> = log_softmax_vec(&logits).into_iter().enumerate().collect();
+                            ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+                            for (token, logprob) in ranked.into_iter().take(size + 1) {
+                                candidates.push(BeamCandidate {
+                                    parent_index,
+                                    parent_logical_id: hypothesis.logical_id,
+                                    parent_row: row,
+                                    token_id: token as u32,
+                                    token_logprob: logprob,
+                                    sum_logprob: hypothesis.sum_logprob + logprob,
+                                });
+                            }
+                        }
+                        let (active, newly_finished, survivors) = select_beam_candidates(
+                            &beam.active,
+                            candidates,
+                            size,
+                            tokenizer.eot(),
+                            size - beam.finished.len(),
+                            &mut beam.next_logical_id,
+                        );
+                        beam.finished.extend(newly_finished);
+                        let assignment = plan_beam_rows(&attempt.reserved_rows, &survivors).map_err(decode_err)?;
+                        clone_cache_prefix(
+                            step_jit,
+                            &assignment.copies,
+                            attempt.pos + 1,
+                            per_pos_bytes,
+                            row_stride_bytes,
+                        )?;
+                        beam.active = active;
+                        beam.rows = assignment.rows;
+                    }
+                }
+                attempt.pos += 1;
+                attempt.generated_tokens += 1;
+            }
+        }
+
+        for request in active_requests {
+            let sample_len = request_options[request].sample_len.unwrap_or(n_text_ctx / 2);
+            let done = attempts[request]
+                .as_ref()
+                .is_some_and(|attempt| attempt.is_done(sample_len, tokenizer.eot()) || attempt.pos >= n_text_ctx);
+            if !done {
+                continue;
+            }
+            let attempt = attempts[request].take().expect("completed attempt");
+            let strategy_index = attempt.strategy_index;
+            let mut options = request_options[request].clone();
+            options.strategy = attempt.strategy;
+            options.fallback = None;
+            let result = finish_attempt(attempt, &seeds[request], tokenizer, &options)?;
+            allocator.release(request);
+            let retry = strategies[request].get(strategy_index + 1).is_some()
+                && request_options[request]
+                    .fallback
+                    .as_ref()
+                    .is_some_and(|fallback| check_fallback(&result, fallback, &request_options[request]));
+            if retry {
+                queue.push_back((request, strategy_index + 1));
+            } else {
+                results[request] = Some(result);
+            }
+        }
+    }
+
+    collect_ordered(results).map_err(decode_err)
 }
 
 // ─── Batched JIT buffer row helpers ─────────────────────────────────────────
@@ -657,10 +965,11 @@ fn write_token_row(jit: &mut WhisperDecoderStepJit, row: usize, token: u32) -> R
     let buf = jit.token_mut().context(JitSnafu)?;
     let dst = buf.as_host_bytes_mut().context(DeviceSnafu)?;
     // token is [max_lanes, 1] i32; row stride = 4 bytes
-    let off = row * std::mem::size_of::<i32>();
+    let off = row.checked_mul(std::mem::size_of::<i32>()).ok_or_else(|| decode_err("token row offset overflow"))?;
     let tok = [token as i32];
     let bytes: &[u8] = bytemuck::cast_slice(&tok);
-    dst[off..off + bytes.len()].copy_from_slice(bytes);
+    let target = dst.get_mut(off..off + bytes.len()).ok_or_else(|| decode_err("token row is out of bounds"))?;
+    target.copy_from_slice(bytes);
     Ok(())
 }
 
@@ -668,9 +977,12 @@ fn write_pos_emb_row(jit: &mut WhisperDecoderStepJit, row: usize, emb: &[f32]) -
     let buf = jit.pos_emb_mut().context(JitSnafu)?;
     let dst = buf.as_host_bytes_mut().context(DeviceSnafu)?;
     // pos_emb is [max_lanes, 1, n_state] f32
-    let off = row * emb.len() * std::mem::size_of::<f32>();
+    let row_bytes =
+        emb.len().checked_mul(std::mem::size_of::<f32>()).ok_or_else(|| decode_err("position row stride overflow"))?;
+    let off = row.checked_mul(row_bytes).ok_or_else(|| decode_err("position row offset overflow"))?;
     let bytes: &[u8] = bytemuck::cast_slice(emb);
-    dst[off..off + bytes.len()].copy_from_slice(bytes);
+    let target = dst.get_mut(off..off + bytes.len()).ok_or_else(|| decode_err("position row is out of bounds"))?;
+    target.copy_from_slice(bytes);
     Ok(())
 }
 
@@ -678,15 +990,20 @@ fn write_self_mask_row(jit: &mut WhisperDecoderStepJit, row: usize, pos: usize, 
     let buf = jit.self_mask_mut().context(JitSnafu)?;
     let dst = buf.as_host_bytes_mut().context(DeviceSnafu)?;
     // mask is [max_lanes, 1, 1, n_text_ctx + 1]; row stride = (n_text_ctx+1)*4
-    let stride = (n_text_ctx + 1) * std::mem::size_of::<f32>();
-    let off = row * stride;
+    let stride = n_text_ctx
+        .checked_add(1)
+        .and_then(|positions| positions.checked_mul(std::mem::size_of::<f32>()))
+        .ok_or_else(|| decode_err("mask row stride overflow"))?;
+    let off = row.checked_mul(stride).ok_or_else(|| decode_err("mask row offset overflow"))?;
     // [0..pos) = 0.0 (attend), [pos..n_text_ctx) = -inf (mask), [n_text_ctx] = 0.0
     let mut mask = vec![0f32; n_text_ctx + 1];
-    for v in &mut mask[pos..n_text_ctx] {
+    let masked = mask.get_mut(pos..n_text_ctx).ok_or_else(|| decode_err("decoder position exceeds text context"))?;
+    for v in masked {
         *v = f32::NEG_INFINITY;
     }
     let bytes: &[u8] = bytemuck::cast_slice(&mask);
-    dst[off..off + bytes.len()].copy_from_slice(bytes);
+    let target = dst.get_mut(off..off + bytes.len()).ok_or_else(|| decode_err("mask row is out of bounds"))?;
+    target.copy_from_slice(bytes);
     Ok(())
 }
 
@@ -697,8 +1014,15 @@ fn write_self_mask_row(jit: &mut WhisperDecoderStepJit, row: usize, pos: usize, 
 /// cache after prefill). Used for one-time seeding; the cache then grows
 /// on-device via SDMA append.
 fn copyin_cache_row(buf: &mut svod_device::Buffer, row: usize, row_stride_floats: usize, data: &[f32]) -> Result<()> {
-    let off = row * row_stride_floats * std::mem::size_of::<f32>();
+    let row_bytes = row_stride_floats
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or_else(|| decode_err("cache row stride overflow"))?;
+    let off = row.checked_mul(row_bytes).ok_or_else(|| decode_err("cache row offset overflow"))?;
     let bytes: &[u8] = bytemuck::cast_slice(data);
+    let end = off.checked_add(bytes.len()).ok_or_else(|| decode_err("cache seed end overflow"))?;
+    if end > buf.size() || bytes.len() > row_bytes {
+        return Err(decode_err("cache seed row is out of bounds"));
+    }
     buf.copyin_at(off, bytes).context(DeviceSnafu)
 }
 
@@ -706,18 +1030,167 @@ fn copyin_cache_row(buf: &mut svod_device::Buffer, row: usize, row_stride_floats
 fn read_logits_row(jit: &mut WhisperDecoderStepJit, row: usize, n_vocab: usize) -> Result<Vec<f32>> {
     let buf = jit.logits().context(JitSnafu)?;
     let src = buf.as_host_bytes().context(DeviceSnafu)?;
-    let row_floats = n_vocab;
-    let off = row * row_floats * std::mem::size_of::<f32>();
-    let end = off + row_floats * std::mem::size_of::<f32>();
-    Ok(bytemuck::cast_slice(&src[off..end]).to_vec())
+    let row_bytes = n_vocab.checked_mul(std::mem::size_of::<f32>()).ok_or_else(|| decode_err("logits row overflow"))?;
+    let off = row.checked_mul(row_bytes).ok_or_else(|| decode_err("logits offset overflow"))?;
+    let end = off.checked_add(row_bytes).ok_or_else(|| decode_err("logits end overflow"))?;
+    let logits = src.get(off..end).ok_or_else(|| decode_err("logits row is out of bounds"))?;
+    Ok(bytemuck::cast_slice(logits).to_vec())
 }
 
 // ─── Cached beam search ─────────────────────────────────────────────────────
 
-struct Beam {
-    tokens: Vec<u32>,
-    token_probs: Vec<f32>,
-    sum_logprob: f32,
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct BeamHypothesis {
+    /// Stable search identity. Decoder rows are deliberately not part of it.
+    pub(crate) logical_id: usize,
+    pub(crate) tokens: Vec<u32>,
+    pub(crate) token_probs: Vec<f32>,
+    pub(crate) sum_logprob: f32,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct BeamCandidate {
+    pub(crate) parent_index: usize,
+    pub(crate) parent_logical_id: usize,
+    pub(crate) parent_row: usize,
+    pub(crate) token_id: u32,
+    pub(crate) token_logprob: f32,
+    pub(crate) sum_logprob: f32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct BeamSurvivor {
+    pub(crate) logical_id: usize,
+    pub(crate) parent_row: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CacheCopy {
+    pub(crate) src_row: usize,
+    pub(crate) dst_row: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RowAssignment {
+    /// Destination row for each survivor, in survivor (logical rank) order.
+    pub(crate) rows: Vec<usize>,
+    pub(crate) copies: Vec<CacheCopy>,
+}
+
+/// Assign fixed decoder rows without scratch storage or copy cycles.
+///
+/// The first selected child of each parent retains that parent's row. Further
+/// children use only reserved rows whose old hypotheses are no longer live.
+pub(crate) fn plan_beam_rows(
+    reserved_rows: &[usize],
+    survivors: &[BeamSurvivor],
+) -> std::result::Result<RowAssignment, &'static str> {
+    let mut unique_reserved = reserved_rows.to_vec();
+    unique_reserved.sort_unstable();
+    unique_reserved.dedup();
+    if unique_reserved.len() != reserved_rows.len() {
+        return Err("reserved beam rows must be unique");
+    }
+    if survivors.len() > reserved_rows.len() {
+        return Err("more survivors than reserved beam rows");
+    }
+    if survivors.iter().any(|survivor| !unique_reserved.contains(&survivor.parent_row)) {
+        return Err("survivor parent row is not reserved");
+    }
+
+    let mut live_parent_rows = Vec::new();
+    for survivor in survivors {
+        if !live_parent_rows.contains(&survivor.parent_row) {
+            live_parent_rows.push(survivor.parent_row);
+        }
+    }
+    let mut dead_rows = reserved_rows.iter().copied().filter(|row| !live_parent_rows.contains(row));
+    let mut retained = Vec::new();
+    let mut rows = Vec::with_capacity(survivors.len());
+    let mut copies = Vec::new();
+    for survivor in survivors {
+        if !retained.contains(&survivor.parent_row) {
+            retained.push(survivor.parent_row);
+            rows.push(survivor.parent_row);
+        } else {
+            let dst_row = dead_rows.next().ok_or("insufficient inactive rows for duplicate beam children")?;
+            rows.push(dst_row);
+            copies.push(CacheCopy { src_row: survivor.parent_row, dst_row });
+        }
+    }
+    Ok(RowAssignment { rows, copies })
+}
+
+fn candidate_order(a: &BeamCandidate, b: &BeamCandidate) -> Ordering {
+    b.sum_logprob
+        .total_cmp(&a.sum_logprob)
+        .then_with(|| a.parent_logical_id.cmp(&b.parent_logical_id))
+        .then_with(|| a.token_id.cmp(&b.token_id))
+        .then_with(|| a.parent_index.cmp(&b.parent_index))
+}
+
+/// Deterministically rank candidates and split completed from active children.
+pub(crate) fn select_beam_candidates(
+    parents: &[BeamHypothesis],
+    mut candidates: Vec<BeamCandidate>,
+    beam_size: usize,
+    eot: u32,
+    finished_capacity: usize,
+    next_logical_id: &mut usize,
+) -> (Vec<BeamHypothesis>, Vec<BeamHypothesis>, Vec<BeamSurvivor>) {
+    candidates.sort_by(candidate_order);
+    let mut active = Vec::with_capacity(beam_size);
+    let mut finished = Vec::new();
+    let mut survivors = Vec::with_capacity(beam_size);
+    for candidate in candidates {
+        if active.len() >= beam_size {
+            break;
+        }
+        let Some(parent) = parents.get(candidate.parent_index) else {
+            continue;
+        };
+        let logical_id = *next_logical_id;
+        *next_logical_id += 1;
+        let mut child = parent.clone();
+        child.logical_id = logical_id;
+        child.tokens.push(candidate.token_id);
+        child.token_probs.push(candidate.token_logprob.exp());
+        child.sum_logprob = candidate.sum_logprob;
+        if candidate.token_id == eot {
+            if finished.len() < finished_capacity {
+                finished.push(child);
+            }
+        } else {
+            active.push(child);
+            survivors.push(BeamSurvivor { logical_id, parent_row: candidate.parent_row });
+        }
+    }
+    (active, finished, survivors)
+}
+
+/// Backfill unfinished hypotheses with EOT and choose the normalized best.
+pub(crate) fn finalize_beam_hypotheses(
+    active: Vec<BeamHypothesis>,
+    mut finished: Vec<BeamHypothesis>,
+    beam_size: usize,
+    eot: u32,
+    sample_begin: usize,
+) -> Option<BeamHypothesis> {
+    for mut hypothesis in active {
+        if finished.len() >= beam_size {
+            break;
+        }
+        if hypothesis.tokens.last().is_none_or(|&token| token != eot) {
+            hypothesis.tokens.push(eot);
+        }
+        finished.push(hypothesis);
+    }
+    finished.sort_by(|a, b| {
+        let a_score = a.sum_logprob / a.tokens.len().saturating_sub(sample_begin + 1).max(1) as f32;
+        let b_score = b.sum_logprob / b.tokens.len().saturating_sub(sample_begin + 1).max(1) as f32;
+        b_score.total_cmp(&a_score).then_with(|| a.logical_id.cmp(&b.logical_id))
+    });
+    finished.into_iter().next()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -753,27 +1226,51 @@ pub fn beam_decode_cached(
     let prefill_logprobs = log_softmax_vec(&filtered);
 
     let mut indexed: Vec<(usize, f32)> = prefill_logprobs.into_iter().enumerate().collect();
-    indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    indexed.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
 
     let mut beams = Vec::new();
     let mut finished = Vec::new();
+    let mut next_logical_id = 0;
+    if sample_len == 0 {
+        beams.push(BeamHypothesis {
+            logical_id: next_logical_id,
+            tokens: ctx.initial_tokens.clone(),
+            token_probs: Vec::new(),
+            sum_logprob: 0.0,
+        });
+        next_logical_id += 1;
+    }
     for (tok_id, lp) in &indexed {
+        if sample_len == 0 {
+            break;
+        }
         if beams.len() >= beam_size {
             break;
         }
         let mut toks = ctx.initial_tokens.clone();
         toks.push(*tok_id as u32);
         if *tok_id as u32 == eot {
-            finished.push(Beam { tokens: toks, token_probs: vec![lp.exp()], sum_logprob: *lp });
+            finished.push(BeamHypothesis {
+                logical_id: next_logical_id,
+                tokens: toks,
+                token_probs: vec![lp.exp()],
+                sum_logprob: *lp,
+            });
         } else {
-            beams.push(Beam { tokens: toks, token_probs: vec![lp.exp()], sum_logprob: *lp });
+            beams.push(BeamHypothesis {
+                logical_id: next_logical_id,
+                tokens: toks,
+                token_probs: vec![lp.exp()],
+                sum_logprob: *lp,
+            });
         }
+        next_logical_id += 1;
     }
 
     let per_beam_floats = ctx.per_beam_floats(n_text_ctx);
     let sample_begin = ctx.sample_begin;
 
-    for step in 0..sample_len {
+    for step in 0..remaining_sample_steps(sample_len) {
         if beams.is_empty() || finished.len() >= beam_size {
             break;
         }
@@ -796,13 +1293,12 @@ pub fn beam_decode_cached(
         let all_logits = &ctx.logits_buf;
 
         // Generate + rank candidates
-        let mut candidates: Vec<(usize, usize, f32, f32)> = Vec::new();
+        let mut candidates = Vec::new();
         for (bi, beam) in beams.iter().enumerate() {
             let start = bi * n_vocab;
-            if start >= all_logits.len() {
-                continue;
-            }
-            let beam_logits = &all_logits[start..(start + n_vocab).min(all_logits.len())];
+            let Some(beam_logits) = all_logits.get(start..start + n_vocab) else {
+                return Err(decode_err("beam logits row is truncated"));
+            };
             let mut filtered = beam_logits.to_vec();
             apply_logit_filters(
                 &mut filtered,
@@ -815,36 +1311,29 @@ pub fn beam_decode_cached(
             );
             let logprobs = log_softmax_vec(&filtered);
             let mut idx: Vec<(usize, f32)> = logprobs.iter().copied().enumerate().collect();
-            idx.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            idx.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
             for (tok_id, lp) in idx.into_iter().take(beam_size + 1) {
-                candidates.push((bi, tok_id, lp, beam.sum_logprob + lp));
+                candidates.push(BeamCandidate {
+                    parent_index: bi,
+                    parent_logical_id: beam.logical_id,
+                    parent_row: bi,
+                    token_id: tok_id as u32,
+                    token_logprob: lp,
+                    sum_logprob: beam.sum_logprob + lp,
+                });
             }
         }
-        candidates.sort_by(|a, b| b.3.partial_cmp(&a.3).unwrap_or(std::cmp::Ordering::Equal));
 
-        // Select survivors
-        let mut new_beams = Vec::with_capacity(beam_size);
-        let mut parent_map = Vec::with_capacity(beam_size);
-        for (parent_idx, tok_id, token_lp, sum_lp) in candidates {
-            if new_beams.len() >= beam_size {
-                break;
-            }
-            let mut toks = beams[parent_idx].tokens.clone();
-            let mut token_probs = beams[parent_idx].token_probs.clone();
-            toks.push(tok_id as u32);
-            token_probs.push(token_lp.exp());
-            if tok_id as u32 == eot {
-                if finished.len() < beam_size {
-                    finished.push(Beam { tokens: toks, token_probs, sum_logprob: sum_lp });
-                }
-            } else {
-                new_beams.push(Beam { tokens: toks, token_probs, sum_logprob: sum_lp });
-                parent_map.push(parent_idx);
-            }
-            if new_beams.len() >= beam_size {
-                break;
-            }
-        }
+        let (new_beams, newly_finished, survivors) = select_beam_candidates(
+            &beams,
+            candidates,
+            beam_size,
+            eot,
+            beam_size - finished.len(),
+            &mut next_logical_id,
+        );
+        finished.extend(newly_finished);
+        let parent_map: Vec<usize> = survivors.iter().map(|survivor| survivor.parent_row).collect();
 
         // Reorder cache by parent_map (host-side, copies ENTIRE cache incl new K/V)
         if !parent_map.is_empty() {
@@ -855,36 +1344,12 @@ pub fn beam_decode_cached(
         beams = new_beams;
 
         if beams.iter().all(|b| b.tokens.len() >= n_text_ctx) {
-            for b in beams.drain(..) {
-                let mut t = b.tokens;
-                if *t.last().unwrap() != eot {
-                    t.push(eot);
-                }
-                finished.push(Beam { tokens: t, token_probs: b.token_probs, sum_logprob: b.sum_logprob });
-            }
             break;
         }
     }
 
-    // Backfill + rank
-    for b in beams {
-        if finished.len() >= beam_size {
-            break;
-        }
-        let mut t = b.tokens;
-        if *t.last().unwrap() != eot {
-            t.push(eot);
-        }
-        finished.push(Beam { tokens: t, token_probs: b.token_probs, sum_logprob: b.sum_logprob });
-    }
-
-    finished.sort_by(|a, b| {
-        let la = a.sum_logprob / a.tokens.len().saturating_sub(ctx.sample_begin + 1).max(1) as f32;
-        let lb = b.sum_logprob / b.tokens.len().saturating_sub(ctx.sample_begin + 1).max(1) as f32;
-        lb.partial_cmp(&la).unwrap_or(std::cmp::Ordering::Equal)
-    });
-
-    let best = finished.into_iter().next().ok_or_else(|| decode_err("beam produced nothing"))?;
+    let best = finalize_beam_hypotheses(beams, finished, beam_size, eot, ctx.sample_begin)
+        .ok_or_else(|| decode_err("beam produced nothing"))?;
     let output_tokens: Vec<u32> = best.tokens[ctx.sample_begin..].iter().copied().take_while(|&t| t != eot).collect();
     let token_probs = best.token_probs.into_iter().take(output_tokens.len()).collect();
     let text = tokenizer.decode(&output_tokens);
@@ -962,7 +1427,7 @@ impl DecodeCtx {
     fn write_beam_inputs(
         &self,
         step_jit: &mut WhisperDecoderStepJit,
-        beams: &[Beam],
+        beams: &[BeamHypothesis],
         beam_size: usize,
         pos: usize,
         n_text_ctx: usize,

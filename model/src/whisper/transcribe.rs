@@ -16,7 +16,7 @@ use crate::jit::InputSpec;
 
 use super::aligner::{WhisperAligner, WhisperAlignmentInput};
 use super::config::{N_AUDIO_CTX, N_FRAMES, N_TEXT_CTX, SAMPLE_RATE};
-use super::decode::{DecodeLane, DecodeOptions, DecodeStrategy, run_batched_decode};
+use super::decode::{DecodeOptions, attempt_strategies, prefill_decode_seed, run_fixed_slot_decode, strategy_width};
 use super::jit::{WhisperCrossKvJit, WhisperDecoderJit, WhisperDecoderStepJit, WhisperEncoderJit, WhisperPrefillJit};
 use super::mel::WhisperMel;
 use super::model::Whisper;
@@ -58,7 +58,6 @@ pub struct WhisperRecognizer {
     decoder_jit: WhisperDecoderJit,
     cross_kv_jit: WhisperCrossKvJit,
     prefill_jit: WhisperPrefillJit,
-    step_jits: rustc_hash::FxHashMap<usize, WhisperDecoderStepJit>,
     /// Concrete fixed-capacity step graph. Requests keep stable row ownership;
     /// inactive rows execute with ignored outputs.
     batched_step_jit: WhisperDecoderStepJit,
@@ -105,6 +104,13 @@ impl WhisperRecognizer {
         options.validate().map_err(|message| TranscribeError::Model {
             source: Box::new(super::error::Error::Decode { msg: message.to_string() }),
         })?;
+        if attempt_strategies(&options).into_iter().any(|strategy| strategy_width(strategy) > plan.decoder_slots) {
+            return Err(TranscribeError::Model {
+                source: Box::new(super::error::Error::Decode {
+                    msg: "configured decode beam width exceeds decoder_slots".to_string(),
+                }),
+            });
+        }
         let n_mels = model.dims.n_mels;
         let n_audio_state = model.dims.n_audio_state;
         let n_vocab = model.dims.n_vocab;
@@ -168,53 +174,7 @@ impl WhisperRecognizer {
             )
             .context(JitSnafu)?;
 
-        // Prepare only the concrete row counts required by the primary strategy
-        // and optional sampling fallback.
         let n_text_head_local = n_text_head;
-        let mut step_jits: rustc_hash::FxHashMap<usize, WhisperDecoderStepJit> = rustc_hash::FxHashMap::default();
-
-        let beam_sizes: std::collections::HashSet<usize> = {
-            let mut s = std::collections::HashSet::new();
-            match options.strategy {
-                DecodeStrategy::Beam { size } => {
-                    s.insert(size);
-                }
-                DecodeStrategy::Greedy | DecodeStrategy::Sample { .. } => {
-                    s.insert(1);
-                }
-            }
-            if options.fallback.is_some() {
-                s.insert(1);
-            }
-            s
-        };
-        // Device-local cache inputs: the KV caches live on-device and are
-        // recycled via SDMA copy (the RN-T block decoder / firered-vad idiom).
-        // The host never reads/writes cache floats — only integer offsets and
-        // the logits output. This unblocks low-precision compute: the cache
-        // dtype is a device-side decision, not pinned to the host Vec type.
-        for &bs in &beam_sizes {
-            let mut sj = WhisperDecoderStepJit::new(model.clone());
-            let token_spec = InputSpec::i32(&[bs, 1]);
-            let pos_emb_spec = InputSpec::f32(&[bs, 1, n_text_state]);
-            let self_cache_spec =
-                InputSpec::f32(&[bs, N_TEXT_CTX, n_text_layer * n_text_head_local, d_head]).device_local();
-            let cross_cache_spec =
-                InputSpec::f32(&[bs, N_AUDIO_CTX, n_text_layer * n_text_head_local, d_head]).device_local();
-            let mask_spec = InputSpec::f32(&[bs, 1, 1, N_TEXT_CTX + 1]);
-            sj.prepare_with_config(
-                token_spec,
-                pos_emb_spec,
-                self_cache_spec.clone(),
-                self_cache_spec,
-                cross_cache_spec.clone(),
-                cross_cache_spec,
-                mask_spec,
-                &prepare_config,
-            )
-            .context(JitSnafu)?;
-            step_jits.insert(bs, sj);
-        }
 
         // Fixed concrete batch keeps tensor-core dimensions static and avoids
         // cache movement when lanes finish.
@@ -255,7 +215,6 @@ impl WhisperRecognizer {
             decoder_jit,
             cross_kv_jit,
             prefill_jit,
-            step_jits,
             batched_step_jit,
             tokenizer,
             options,
@@ -285,162 +244,6 @@ impl WhisperRecognizer {
 
     pub fn plan(&self) -> &WhisperPlan {
         &self.plan
-    }
-
-    /// Greedy throughput path that decodes windows through stable fixed slots,
-    /// refilling each slot as its current request finishes.
-    ///
-    /// Encoder + prefill still run per-window (the encoder is already
-    /// batched within `max_batch`; prefill is a single 4-token forward).
-    /// Fallback is disabled, so the schedule is one greedy pass per window.
-    fn recognize_windows_batched_greedy(
-        &mut self,
-        windows: &[&[f32]],
-    ) -> Result<Vec<RecognizedWindow>, TranscribeError> {
-        if windows.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let n_mels = self.n_mels;
-        let d = self.n_audio_state;
-        let mel_stride = n_mels * N_FRAMES;
-        let item_stride = N_AUDIO_CTX * d;
-        let max_batch = self.max_batch;
-        let n_vocab = self.n_vocab;
-        let n_text_ctx = self.n_text_ctx;
-
-        // The fixed-slot API is explicitly greedy and has no retry attempts.
-        let mut batched_opts = self.options.clone();
-        batched_opts.strategy = DecodeStrategy::Greedy;
-        batched_opts.fallback = None;
-
-        let mut recognized = Vec::with_capacity(windows.len());
-        let mut lanes: Vec<(DecodeLane, DecodeOptions)> = Vec::with_capacity(windows.len());
-        let mut alignment_audio = Vec::with_capacity(windows.len());
-
-        // Encode + prefill in encoder-sized batches, building one DecodeLane
-        // per window. The encoder already handles up to max_batch windows per
-        // dispatch; prefill runs per-window on the resulting audio features.
-        for batch_start in (0..windows.len()).step_by(max_batch) {
-            let b = (windows.len() - batch_start).min(max_batch);
-
-            // ── Mel: compute + pack into [b, n_mels, N_FRAMES] ──────────
-            let batch_mels: Vec<Vec<f32>> = (0..b).map(|bi| self.compute_mel(windows[batch_start + bi])).collect();
-            {
-                let mel_buf = self.encoder_jit.mel_mut().context(JitSnafu)?;
-                let mut packed = vec![0f32; max_batch * mel_stride];
-                for bi in 0..b {
-                    packed[bi * mel_stride..(bi + 1) * mel_stride].copy_from_slice(&batch_mels[bi][..mel_stride]);
-                }
-                let dst = mel_buf.as_host_bytes_mut().context(DeviceSnafu)?;
-                let src_bytes: &[u8] = bytemuck::cast_slice(&packed);
-                dst[..src_bytes.len()].copy_from_slice(src_bytes);
-            }
-
-            // ── Encode: one dispatch for b windows ───────────────────────
-            self.encoder_jit.execute().context(JitSnafu)?;
-            let out_buf = self.encoder_jit.output().context(JitSnafu)?;
-            let mut raw = vec![0f32; b * item_stride];
-            out_buf.copyout_prefix(bytemuck::cast_slice_mut(&mut raw)).context(DeviceSnafu)?;
-
-            // ── Prefill: per-window, build a DecodeLane ──────────────────
-            for bi in 0..b {
-                let base = bi * item_stride;
-                // Project this window once, then bind the packed caches into
-                // both language detection and token prefill.
-                {
-                    let buf = self.cross_kv_jit.audio_features_mut().context(JitSnafu)?;
-                    buf.copy_region_from(
-                        0,
-                        out_buf,
-                        base * std::mem::size_of::<f32>(),
-                        item_stride * std::mem::size_of::<f32>(),
-                    )
-                    .context(DeviceSnafu)?;
-                }
-                self.cross_kv_jit.execute().context(JitSnafu)?;
-                {
-                    let src = self.cross_kv_jit.cross_k().context(JitSnafu)?;
-                    self.prefill_jit
-                        .prepared_cross_k_mut()
-                        .context(JitSnafu)?
-                        .copy_region_from(0, src, 0, src.size())
-                        .context(DeviceSnafu)?;
-                    self.decoder_jit
-                        .prepared_cross_k_mut()
-                        .context(JitSnafu)?
-                        .copy_region_from(0, src, 0, src.size())
-                        .context(DeviceSnafu)?;
-                    let src = self.cross_kv_jit.cross_v().context(JitSnafu)?;
-                    self.prefill_jit
-                        .prepared_cross_v_mut()
-                        .context(JitSnafu)?
-                        .copy_region_from(0, src, 0, src.size())
-                        .context(DeviceSnafu)?;
-                    self.decoder_jit
-                        .prepared_cross_v_mut()
-                        .context(JitSnafu)?
-                        .copy_region_from(0, src, 0, src.size())
-                        .context(DeviceSnafu)?;
-                }
-                // Resolve language for this window (auto-detect if unset).
-                let mut lane_opts = batched_opts.clone();
-                if !self.tokenizer.multilingual {
-                    lane_opts.language = Some("en".to_string());
-                } else if lane_opts.language.is_none() {
-                    let detection =
-                        super::decode::detect_language(&mut self.decoder_jit, n_text_ctx, n_vocab, &self.tokenizer)
-                            .map_err(|e| TranscribeError::Model { source: Box::new(e) })?;
-                    lane_opts.language = Some(detection.language);
-                }
-
-                let lane = DecodeLane::prefill(
-                    &mut self.prefill_jit,
-                    &self.tokenizer,
-                    &lane_opts,
-                    n_text_ctx,
-                    n_vocab,
-                    &self.pos_embedding,
-                    self.n_audio_state,
-                )
-                .map_err(|e| TranscribeError::Model { source: Box::new(e) })?;
-
-                alignment_audio.push(raw[base..base + item_stride].to_vec());
-                lanes.push((lane, lane_opts));
-            }
-        }
-
-        // ── Batched step-locked decode ───────────────────────────────────
-        // Run one concrete max-lane dispatch per token step. Finished rows stay
-        // inactive until their stable slots are reused.
-        let (mut lane_states, lane_options): (Vec<DecodeLane>, Vec<DecodeOptions>) = lanes.into_iter().unzip();
-        run_batched_decode(
-            &mut lane_states,
-            &mut self.batched_step_jit,
-            self.max_lanes,
-            &self.tokenizer,
-            &batched_opts,
-            n_text_ctx,
-            n_vocab,
-        )
-        .map_err(|e| TranscribeError::Model { source: Box::new(e) })?;
-
-        // ── Collect finalized recognition artifacts ──────────────────────
-        for (index, (lane, lane_opts)) in lane_states.into_iter().zip(lane_options).enumerate() {
-            let mut result =
-                lane.finish(&self.tokenizer, &lane_opts).map_err(|e| TranscribeError::Model { source: Box::new(e) })?;
-            if result.should_skip(&lane_opts) {
-                result.clear_speech();
-            }
-
-            recognized.push(RecognizedWindow {
-                result,
-                audio_features: std::mem::take(&mut alignment_audio[index]),
-                audio_samples: windows[index].len(),
-            });
-        }
-
-        Ok(recognized)
     }
 
     /// Compute mel spectrogram for a window, padded/trimmed to N_FRAMES.
@@ -527,19 +330,6 @@ impl WhisperAlignedTranscriber {
 
     pub fn set_language(&mut self, language: Option<String>) {
         self.recognizer.set_language(language);
-    }
-
-    /// Decode windows with the concrete fixed-slot scheduler.
-    ///
-    /// This throughput-oriented path uses greedy decoding and disables
-    /// temperature fallback. Use [`Transcriber::transcribe_windows`] when beam
-    /// search and fallback policy are required.
-    pub fn transcribe_windows_batched_greedy(
-        &mut self,
-        windows: &[&[f32]],
-    ) -> Result<Vec<Transcript>, TranscribeError> {
-        let recognized = self.recognizer.recognize_windows_batched_greedy(windows)?;
-        self.align_recognized(recognized)
     }
 
     fn align_recognized(&mut self, recognized: Vec<RecognizedWindow>) -> Result<Vec<Transcript>, TranscribeError> {
@@ -657,7 +447,12 @@ impl WhisperRecognizer {
             out_buf.copyout_prefix(bytemuck::cast_slice_mut(&mut raw)).context(DeviceSnafu)?;
             t_encoder += t.elapsed();
 
-            // ── Decode: per-window decode ──────────────────────────────────
+            let mut seeds = Vec::with_capacity(b);
+            let mut decode_options = Vec::with_capacity(b);
+
+            // Cross projection and token prefill remain per-window. Their
+            // immutable host seeds are retained until the shared scheduler
+            // accepts a primary or fallback attempt.
             for bi in 0..b {
                 let base = bi * item_stride;
 
@@ -700,25 +495,49 @@ impl WhisperRecognizer {
                         .context(DeviceSnafu)?;
                 }
 
-                let mut result = {
-                    super::decode::decode_with_fallback_cached(
-                        &mut self.prefill_jit,
-                        &mut self.step_jits,
-                        &mut self.decoder_jit,
-                        n_text_ctx,
-                        n_vocab,
-                        &self.tokenizer,
-                        &self.options,
-                        &self.pos_embedding,
-                        self.n_audio_state,
-                    )
+                let mut options = self.options.clone();
+                if !self.tokenizer.multilingual {
+                    options.language = Some("en".to_string());
+                } else if options.language.is_none() {
+                    let detection =
+                        super::decode::detect_language(&mut self.decoder_jit, n_text_ctx, n_vocab, &self.tokenizer)
+                            .map_err(|error| TranscribeError::Model { source: Box::new(error) })?;
+                    options.language = Some(detection.language);
                 }
-                .map_err(|e| TranscribeError::Model { source: Box::new(e) })?;
-                if result.should_skip(&self.options) {
+
+                let seed = prefill_decode_seed(
+                    &mut self.prefill_jit,
+                    &self.tokenizer,
+                    &options,
+                    n_text_ctx,
+                    n_vocab,
+                    &self.pos_embedding,
+                    self.n_audio_state,
+                )
+                .map_err(|error| TranscribeError::Model { source: Box::new(error) })?;
+                t_decode += t.elapsed();
+                seeds.push(seed);
+                decode_options.push(options);
+            }
+
+            let t = Instant::now();
+            let results = run_fixed_slot_decode(
+                &seeds,
+                &decode_options,
+                &mut self.batched_step_jit,
+                self.max_lanes,
+                &self.tokenizer,
+                n_text_ctx,
+                n_vocab,
+            )
+            .map_err(|error| TranscribeError::Model { source: Box::new(error) })?;
+            t_decode += t.elapsed();
+
+            for (bi, (mut result, options)) in results.into_iter().zip(&decode_options).enumerate() {
+                if result.should_skip(options) {
                     result.clear_speech();
                 }
-                t_decode += t.elapsed();
-
+                let base = bi * item_stride;
                 recognized.push(RecognizedWindow {
                     result,
                     audio_features: raw[base..base + item_stride].to_vec(),

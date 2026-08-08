@@ -37,9 +37,8 @@ pub use attention::{MultiHeadAttention, causal_mask};
 pub use blocks::{Conv1dWeights, LayerNormWeights, LinearWeights, sinusoids};
 pub use config::{ModelDimensions, WhisperSize};
 pub use decode::{
-    DecodeLane, DecodeOptions, DecodeResult, DecodeStrategy, FallbackPolicy, LanguageDetection, WhisperTask,
-    beam_decode_cached, decode_with_fallback_cached, detect_language, greedy_decode_cached, run_batched_decode,
-    split_into_segments,
+    DecodeOptions, DecodeResult, DecodeStrategy, FallbackPolicy, LanguageDetection, WhisperTask, beam_decode_cached,
+    decode_with_fallback_cached, detect_language, greedy_decode_cached, split_into_segments,
 };
 pub use decoder::{DecoderBlock, TextDecoder};
 pub use dtw::{

@@ -1,5 +1,6 @@
 mod batched_step;
 mod batched_transcribe;
+mod beam;
 mod dtw;
 mod language;
 mod model;

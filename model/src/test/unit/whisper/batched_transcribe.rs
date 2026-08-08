@@ -1,8 +1,7 @@
 //! Correctness tests for fixed-slot decode scheduling.
 //!
-//! The heavy tests (marked `#[ignore]`) load real `whisper-tiny` weights and
-//! compare stable-slot refill with the serial greedy path. Run with `cargo test
-//! -- --ignored`.
+//! The heavy tests (marked `#[ignore]`) load real `whisper-tiny` weights. Run
+//! them with `cargo test -- --ignored`.
 
 use svod_arch::pipelines::audio::Transcriber;
 
@@ -13,15 +12,14 @@ use crate::whisper::{
 
 /// Loads whisper-tiny + tokenizer from HuggingFace Hub and builds a
 /// transcriber with the same options soroka uses.
-fn tiny_transcriber() -> WhisperAlignedTranscriber {
+fn tiny_transcriber(decoder_slots: usize) -> WhisperAlignedTranscriber {
     let repo = "openai/whisper-tiny";
     let dims = ModelDimensions::for_size(WhisperSize::Tiny);
     let model = crate::whisper::Whisper::from_hub(repo, "main", dims).unwrap();
     let multilingual = model.is_multilingual();
     let num_languages = model.dims.num_languages();
     let tokenizer = WhisperTokenizer::from_hub(multilingual, num_languages).unwrap();
-    // Greedy + no fallback makes the two scheduling strategies directly
-    // comparable.
+    // Greedy + no fallback is deterministic across slot geometries.
     let options = DecodeOptions {
         task: WhisperTask::Transcribe,
         language: None,
@@ -30,7 +28,7 @@ fn tiny_transcriber() -> WhisperAlignedTranscriber {
         ..DecodeOptions::default()
     };
     let mut plan = WhisperPlan::for_model(&model.dims, WhisperSize::Tiny);
-    plan.decoder_slots = 1; // force slot refill across the two test windows
+    plan.decoder_slots = decoder_slots;
     plan.alignment_batch = 1;
     WhisperAlignedTranscriber::new_with_plan(model, tokenizer, options, WhisperSize::Tiny, 480_000, plan).unwrap()
 }
@@ -48,22 +46,68 @@ fn fake_windows() -> Vec<Vec<f32>> {
         .collect()
 }
 
-/// Stable slot refill must produce the same text as serial greedy decoding.
+/// Slot refill must not change deterministic greedy output.
 #[test]
 #[ignore = "heavy: real whisper-tiny weights + JIT compile"]
-fn batched_greedy_matches_serial_greedy() {
-    let mut tx = tiny_transcriber();
-    tx.set_language(Some("en".to_string())); // pin language so detection doesn't diverge
+fn generalized_scheduler_runs_greedy_with_slot_refill() {
+    let mut refill = tiny_transcriber(1);
+    let mut concurrent = tiny_transcriber(2);
+    refill.set_language(Some("en".to_string()));
+    concurrent.set_language(Some("en".to_string()));
 
     let windows = fake_windows();
     let refs: Vec<&[f32]> = windows.iter().map(|w| w.as_slice()).collect();
 
-    let (serial, _) = tx.transcribe_windows(&refs, false).expect("serial transcribe");
+    let (refilled, _) = refill.transcribe_windows(&refs, false).expect("refilled greedy transcribe");
+    let (concurrent, _) = concurrent.transcribe_windows(&refs, false).expect("concurrent greedy transcribe");
+    assert_eq!(refilled.len(), concurrent.len());
+    for (index, (refilled, concurrent)) in refilled.iter().zip(concurrent).enumerate() {
+        assert_eq!(refilled.text, concurrent.text, "window {index}: slot geometry changed greedy output");
+    }
+}
 
-    let batched = tx.transcribe_windows_batched_greedy(&refs).expect("batched greedy transcribe");
-
-    assert_eq!(serial.len(), batched.len(), "transcript count mismatch");
-    for (i, (serial, batched)) in serial.iter().zip(batched.iter()).enumerate() {
-        assert_eq!(serial.text, batched.text, "window {i}: scheduling changed decoded text");
+#[test]
+#[ignore = "heavy: real whisper-tiny weights + JIT compile"]
+fn generalized_scheduler_runs_beam_sizes_two_and_five() {
+    for size in [2, 5] {
+        let repo = "openai/whisper-tiny";
+        let dims = ModelDimensions::for_size(WhisperSize::Tiny);
+        let model = crate::whisper::Whisper::from_hub(repo, "main", dims).unwrap();
+        let multilingual = model.is_multilingual();
+        let num_languages = model.dims.num_languages();
+        let options = DecodeOptions {
+            language: Some("en".to_string()),
+            strategy: DecodeStrategy::Beam { size },
+            fallback: None,
+            sample_len: Some(4),
+            ..DecodeOptions::default()
+        };
+        let mut refill_plan = WhisperPlan::for_model(&model.dims, WhisperSize::Tiny);
+        refill_plan.decoder_slots = size;
+        let mut concurrent_plan = refill_plan.clone();
+        concurrent_plan.decoder_slots = size * 2;
+        let mut refill = WhisperAlignedTranscriber::new_with_plan(
+            model.clone(),
+            WhisperTokenizer::from_hub(multilingual, num_languages).unwrap(),
+            options.clone(),
+            WhisperSize::Tiny,
+            480_000,
+            refill_plan,
+        )
+        .unwrap();
+        let mut concurrent = WhisperAlignedTranscriber::new_with_plan(
+            model,
+            WhisperTokenizer::from_hub(multilingual, num_languages).unwrap(),
+            options,
+            WhisperSize::Tiny,
+            480_000,
+            concurrent_plan,
+        )
+        .unwrap();
+        let windows = fake_windows();
+        let refs: Vec<_> = windows.iter().map(Vec::as_slice).collect();
+        let (refilled, _) = refill.transcribe_windows(&refs, false).unwrap();
+        let (concurrent, _) = concurrent.transcribe_windows(&refs, false).unwrap();
+        assert_eq!(refilled, concurrent, "beam-{size} output changed with physical slot geometry");
     }
 }

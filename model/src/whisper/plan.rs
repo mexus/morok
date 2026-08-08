@@ -20,7 +20,9 @@ impl WhisperPlan {
         const ENCODER_SCORES_BUDGET: usize = 512 * 1024 * 1024;
         let encoder_scores = dims.n_audio_head * N_AUDIO_CTX * N_AUDIO_CTX * std::mem::size_of::<f32>();
         let encoder_batch = (ENCODER_SCORES_BUDGET / encoder_scores).clamp(1, 8);
-        Self { encoder_batch, decoder_slots: encoder_batch, alignment_batch: 1 }
+        // Five rows keep the default beam strategy constructible even when the
+        // encoder memory budget selects a smaller batch.
+        Self { encoder_batch, decoder_slots: encoder_batch.max(5), alignment_batch: 1 }
     }
 
     /// Derive recognition and alignment capacities for a model size.
