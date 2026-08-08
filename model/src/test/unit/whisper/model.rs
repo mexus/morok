@@ -191,6 +191,68 @@ fn prepared_cross_kv_prefill_matches_direct_decoder() {
 }
 
 #[test]
+fn one_token_language_logits_match_full_context_sot_logits() {
+    let dims = small_decoder_dims();
+    let model = Whisper::empty(dims.clone());
+    let audio_values: Vec<f32> = (0..dims.n_audio_ctx * dims.n_text_state).map(|i| i as f32 * 0.013).collect();
+    let audio = Tensor::from_slice(audio_values).try_reshape([1usize, dims.n_audio_ctx, dims.n_text_state]).unwrap();
+    let (cross_k, cross_v) = model.project_cross_kv(&audio).unwrap();
+    let mut padded_tokens = vec![0i32; dims.n_text_ctx];
+    padded_tokens[0] = 1;
+    let full_tokens = Tensor::from_slice(padded_tokens).try_reshape([1usize, dims.n_text_ctx]).unwrap();
+    let one_token = Tensor::from_slice([1i32]).try_reshape([1usize, 1]).unwrap();
+
+    let mut full = model.decode_with_cross_kv(&full_tokens, &cross_k, &cross_v).unwrap();
+    let mut one = model.decode_with_cross_kv(&one_token, &cross_k, &cross_v).unwrap();
+    Tensor::realize_batch([&mut full, &mut one]).unwrap();
+    let full = full.as_vec::<f32>().unwrap();
+    let one = one.as_vec::<f32>().unwrap();
+    let max_delta = full[..dims.n_vocab].iter().zip(&one).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+    assert!(max_delta < 1e-5, "one-token SOT logits drifted by {max_delta}");
+
+    let language_tokens = [2usize, 5, 9, 12];
+    let rank = |logits: &[f32]| {
+        let mut ranked = language_tokens.map(|token| (token, logits[token]));
+        ranked.sort_by(|a, b| b.1.total_cmp(&a.1));
+        ranked
+    };
+    assert_eq!(rank(&full[..dims.n_vocab]).map(|(token, _)| token), rank(&one).map(|(token, _)| token));
+}
+
+#[test]
+fn prepared_language_detector_has_one_token_and_one_logits_row() {
+    const WHISPER_TEXT_CONTEXT: i64 = 448;
+
+    let dims = small_decoder_dims();
+    let cache_shape = [1, dims.n_audio_ctx, dims.n_text_layer * dims.n_text_head, 4];
+    let model = Whisper::empty(dims.clone());
+    let audio = Tensor::zeros(&[1, dims.n_audio_ctx, dims.n_text_state], DType::Float32).unwrap();
+    let (cross_k, cross_v) = model.project_cross_kv(&audio).unwrap();
+    let token = Tensor::from_slice([1i32]).try_reshape([1usize, 1]).unwrap();
+    let logits = model.decode_with_cross_kv(&token, &cross_k, &cross_v).unwrap();
+    assert_eq!(
+        logits.shape().unwrap().iter().map(|dim| dim.as_const().unwrap()).collect::<Vec<_>>(),
+        [1, 1, dims.n_vocab]
+    );
+
+    let mut detector = WhisperDecoderJit::new(model);
+    detector
+        .prepare(
+            InputSpec::f32(&cache_shape).device_local(),
+            InputSpec::f32(&cache_shape).device_local(),
+            InputSpec::i32(&[1, 1]),
+        )
+        .unwrap();
+    assert_eq!(detector.tokens_mut().unwrap().size(), std::mem::size_of::<i32>());
+    assert_eq!(detector.output().unwrap().size(), dims.n_vocab * std::mem::size_of::<f32>());
+    assert!(detector.prepared_kernels().unwrap().iter().all(|kernel| {
+        kernel.ast.toposort().into_iter().all(|uop| {
+            !matches!(uop.op(), Op::Const(value) if matches!(value.0, ConstValue::Int(WHISPER_TEXT_CONTEXT) | ConstValue::UInt(448)))
+        })
+    }));
+}
+
+#[test]
 #[ignore = "heavy: prepares the cross projection and prefill graphs through the CPU backend"]
 fn prepared_cross_kv_graph_reuses_device_local_outputs() {
     let dims = small_decoder_dims();
@@ -227,14 +289,14 @@ fn prepared_cross_kv_graph_reuses_device_local_outputs() {
         .prepare(
             InputSpec::f32(&cache_shape).device_local(),
             InputSpec::f32(&cache_shape).device_local(),
-            InputSpec::i32(&[1, dims.n_text_ctx]),
+            InputSpec::i32(&[1, 1]),
         )
         .unwrap();
     detector.prepared_cross_k_mut().unwrap().copy_region_from(0, cross_k, 0, cross_k.size()).unwrap();
     detector.prepared_cross_v_mut().unwrap().copy_region_from(0, cross_v, 0, cross_v.size()).unwrap();
-    detector.tokens_mut().unwrap().copyin(bytemuck::cast_slice(&vec![0i32; dims.n_text_ctx])).unwrap();
+    detector.tokens_mut().unwrap().copyin(bytemuck::cast_slice(&[0i32])).unwrap();
     detector.execute().unwrap();
-    assert_eq!(detector.output().unwrap().size(), dims.n_text_ctx * dims.n_vocab * std::mem::size_of::<f32>());
+    assert_eq!(detector.output().unwrap().size(), dims.n_vocab * std::mem::size_of::<f32>());
 }
 
 #[test]

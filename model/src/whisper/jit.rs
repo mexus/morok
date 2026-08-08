@@ -72,8 +72,8 @@ jit_wrapper! {
 }
 
 // Decoder-only JIT for language detection: prepared cross K/V + tokens → logits.
-// The caller writes the current token sequence (padded with EOT to n_text_ctx)
-// and reads logits at the current position.
+// This remains separate from prefill and step because it is prepared for one SOT
+// token and returns exactly one vocabulary row.
 jit_wrapper! {
     WhisperDecoderJit(Whisper) {
         prepared_cross_k: Tensor,

@@ -24,28 +24,25 @@ pub struct LanguageDetection {
 
 pub fn detect_language(
     decoder_jit: &mut WhisperDecoderJit,
-    n_text_ctx: usize,
+    _n_text_ctx: usize,
     n_vocab: usize,
     tokenizer: &WhisperTokenizer,
 ) -> Result<LanguageDetection> {
-    detect_language_profile(decoder_jit, n_text_ctx, n_vocab, tokenizer, None, None)
+    detect_language_profile(decoder_jit, n_vocab, tokenizer, None, None)
 }
 
 pub(crate) fn detect_language_profile(
     decoder_jit: &mut WhisperDecoderJit,
-    n_text_ctx: usize,
     n_vocab: usize,
     tokenizer: &WhisperTokenizer,
     mut copies: Option<&mut CopyProfile>,
     graph_profile: Option<&mut GraphProfile>,
 ) -> Result<LanguageDetection> {
     let sot = tokenizer.sot() as i32;
-    let eot = tokenizer.eot() as i32;
-    let token_buf: Vec<i32> = (0..n_text_ctx).map(|i| if i == 0 { sot } else { eot }).collect();
     let started = begin_host_copy(copies.is_some(), decoder_jit.tokens_mut().context(JitSnafu)?)?;
-    write_uncached(decoder_jit, &token_buf)?;
+    write_uncached(decoder_jit, &[sot])?;
     if let (Some(copies), Some(started)) = (copies.as_deref_mut(), started) {
-        copies.h2d("language_tokens", 1, token_buf.len() * std::mem::size_of::<i32>(), started.elapsed());
+        copies.h2d("language_tokens", 1, std::mem::size_of::<i32>(), started.elapsed());
     }
     if let Some(graph_profile) = graph_profile {
         let graph_started = std::time::Instant::now();
@@ -56,11 +53,10 @@ pub(crate) fn detect_language_profile(
         decoder_jit.execute().context(JitSnafu)?;
     }
     let started = begin_host_copy(copies.is_some(), decoder_jit.output().context(JitSnafu)?)?;
-    let flat = read_uncached(decoder_jit)?;
+    let sot_logits = read_uncached(decoder_jit, n_vocab)?;
     if let (Some(copies), Some(started)) = (copies, started) {
-        copies.d2h("language_logits", 1, flat.len() * std::mem::size_of::<f32>(), started.elapsed());
+        copies.d2h("language_logits", 1, n_vocab * std::mem::size_of::<f32>(), started.elapsed());
     }
-    let sot_logits = &flat[..n_vocab];
 
     let lang_tokens = tokenizer.all_language_tokens();
     let lang_codes = tokenizer.all_language_codes();
@@ -1569,9 +1565,9 @@ fn write_uncached(jit: &mut WhisperDecoderJit, tokens: &[i32]) -> Result<()> {
     write_buf(buf, bytemuck::cast_slice(tokens))
 }
 
-fn read_uncached(jit: &WhisperDecoderJit) -> Result<Vec<f32>> {
+fn read_uncached(jit: &WhisperDecoderJit, n_vocab: usize) -> Result<Vec<f32>> {
     let buf = jit.output().context(JitSnafu)?;
-    read_buf(buf, buf.size() / std::mem::size_of::<f32>())
+    read_buf(buf, n_vocab)
 }
 
 /// Write data directly into the buffer's host-visible mapping.

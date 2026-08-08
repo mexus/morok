@@ -168,7 +168,7 @@ impl WhisperRecognizer {
 
         // Cache-consuming decoder used for language detection.
         let mut decoder_jit = WhisperDecoderJit::new(model.clone());
-        let tokens_spec = InputSpec::i32(&[1, N_TEXT_CTX]);
+        let tokens_spec = InputSpec::i32(&[1, 1]);
         decoder_jit
             .prepare_with_config(cross_cache_spec.clone(), cross_cache_spec.clone(), tokens_spec, &prepare_config)
             .context(JitSnafu)?;
@@ -565,7 +565,6 @@ impl WhisperRecognizer {
                 } else if options.language.is_none() {
                     let detection = detect_language_profile(
                         &mut self.decoder_jit,
-                        n_text_ctx,
                         n_vocab,
                         &self.tokenizer,
                         profile.then_some(&mut copies),
