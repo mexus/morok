@@ -22,57 +22,13 @@ const MAX_PADDED_FA_OVERHEAD_DIVISOR: usize = 16;
 
 /// Returns the padded sequence length only when padding is both necessary and
 /// sufficiently small for encoder-style self-attention.
-fn padded_fa_sequence_len(causal: bool, q_len: usize, k_len: usize, v_len: usize) -> Option<usize> {
+pub(super) fn padded_fa_sequence_len(causal: bool, q_len: usize, k_len: usize, v_len: usize) -> Option<usize> {
     let multiple = svod_tk::FLASH_ATTENTION_SEQUENCE_MULTIPLE;
     if causal || q_len != k_len || q_len != v_len || q_len < MIN_PADDED_FA_SEQUENCE || q_len.is_multiple_of(multiple) {
         return None;
     }
     let padded = q_len.next_multiple_of(multiple);
     (padded - q_len <= q_len / MAX_PADDED_FA_OVERHEAD_DIVISOR).then_some(padded)
-}
-
-fn padded_flash_attention(q: &Tensor, k: &Tensor, v: &Tensor, causal: bool) -> Result<Option<Tensor>> {
-    let dims = |t: &Tensor| -> Result<Vec<usize>> {
-        t.shape()
-            .context(TensorSnafu)?
-            .iter()
-            .map(|dim| {
-                dim.as_const().ok_or_else(|| super::error::Error::Tensor {
-                    source: Box::new(svod_tensor::error::Error::SymbolicShapeUnsupported {
-                        operation: "padded flash-attention".into(),
-                    }),
-                })
-            })
-            .collect()
-    };
-    let (qd, kd, vd) = (dims(q)?, dims(k)?, dims(v)?);
-    let Some(padded_len) = padded_fa_sequence_len(causal, qd[1], kd[1], vd[1]) else {
-        return Ok(None);
-    };
-
-    let tail = (padded_len - qd[1]) as isize;
-    let padding = [(0, 0), (0, tail), (0, 0), (0, 0)];
-    let (q_pad, k_pad, v_pad) = (
-        q.try_pad(&padding).context(TensorSnafu)?,
-        k.try_pad(&padding).context(TensorSnafu)?,
-        v.try_pad(&padding).context(TensorSnafu)?,
-    );
-    // Keep this graph-native: the custom call owns the dependency on the device-local
-    // lengths tensor, including when Tensor::full is still lazy.
-    let key_lens =
-        Tensor::full(&[qd[0]], ConstValue::Int(qd[1] as i64), DType::Int32).context(TensorSnafu)?.to(q.device());
-    let Some(out) = svod_tk::flash_attention_with(
-        &q_pad,
-        &k_pad,
-        &v_pad,
-        svod_tk::FaOpts { causal: false, key_lens: Some(&key_lens) },
-    )
-    .map_err(|e| svod_tensor::error::Error::IrConstruction { details: e.to_string() })
-    .context(TensorSnafu)?
-    else {
-        return Ok(None);
-    };
-    out.try_shrink([(0, qd[0]), (0, qd[1]), (0, qd[2]), (0, qd[3])]).map(Some).context(TensorSnafu)
 }
 
 #[derive(Clone)]
@@ -102,12 +58,22 @@ impl MultiHeadAttention {
     /// Forward pass. `xa = None` for self-attention, `Some(enc)` for cross-attention.
     /// `mask` is the causal mask for decoder self-attention (additive float mask).
     pub fn forward(&self, x: &Tensor, xa: Option<&Tensor>, mask: Option<&Tensor>) -> Result<Tensor> {
+        self.forward_with_key_lens(x, xa, mask, None)
+    }
+
+    pub(crate) fn forward_with_key_lens(
+        &self,
+        x: &Tensor,
+        xa: Option<&Tensor>,
+        mask: Option<&Tensor>,
+        key_lens: Option<&Tensor>,
+    ) -> Result<Tensor> {
         let q = self.query.forward(x)?;
         let kv_input = xa.unwrap_or(x);
         let k = self.key.forward(kv_input)?;
         let v = self.value.forward(kv_input)?;
 
-        let out = self.fa_attention(&q, &k, &v, mask.is_some())?;
+        let out = self.fa_attention(&q, &k, &v, mask.is_some(), key_lens)?;
         self.out.forward(&out)
     }
 
@@ -122,7 +88,7 @@ impl MultiHeadAttention {
         let k = self.key.forward(kv_input)?;
         let v = self.value.forward(kv_input)?;
 
-        let out = self.fa_attention(&q, &k, &v, mask.is_some())?;
+        let out = self.fa_attention(&q, &k, &v, mask.is_some(), None)?;
         let out = self.out.forward(&out)?;
         Ok((out, k, v))
     }
@@ -164,7 +130,14 @@ impl MultiHeadAttention {
 
     /// Flash-attention path: Q/K/V in [B, S, D] → split to [B, S, H, Dh] for FA,
     /// fall back to SDPA if FA doesn't apply. `causal` controls the mask.
-    fn fa_attention(&self, q: &Tensor, k: &Tensor, v: &Tensor, causal: bool) -> Result<Tensor> {
+    fn fa_attention(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        causal: bool,
+        key_lens: Option<&Tensor>,
+    ) -> Result<Tensor> {
         let shape = q.shape().context(TensorSnafu)?;
         let b = shape[0].clone();
         let s = shape[1].clone();
@@ -205,14 +178,10 @@ impl MultiHeadAttention {
             (q_fa.clone(), k_fa.clone(), v_fa.clone())
         };
 
-        let direct = svod_tk::flash_attention_with(&q_f, &k_f, &v_f, svod_tk::FaOpts { causal, key_lens: None })
+        let direct = svod_tk::flash_attention_with(&q_f, &k_f, &v_f, svod_tk::FaOpts { causal, key_lens })
             .map_err(|e| svod_tensor::error::Error::IrConstruction { details: e.to_string() })
             .context(TensorSnafu)?;
-        let fa_out = match direct {
-            some @ Some(_) => some,
-            None => padded_flash_attention(&q_f, &k_f, &v_f, causal)?,
-        };
-        match fa_out {
+        match direct {
             Some(out) => {
                 let out = if need_cast { out.cast(dt).context(TensorSnafu)? } else { out };
                 out.try_reshape(&[b, s, svod_ir::SInt::Const(d)]).context(TensorSnafu)
@@ -220,11 +189,30 @@ impl MultiHeadAttention {
             None => {
                 // SDPA fallback (needs [B, H, S, Dh])
                 let perm = |t: &Tensor| t.try_permute(&[0, 2, 1, 3]).context(TensorSnafu);
+                let mask = match key_lens {
+                    Some(lens) => {
+                        let n = shape[1].as_const().ok_or_else(|| super::error::Error::Tensor {
+                            source: Box::new(svod_tensor::error::Error::SymbolicShapeUnsupported {
+                                operation: "key-length attention mask".into(),
+                            }),
+                        })?;
+                        let range = Tensor::arange(n as i64, None, None)
+                            .context(TensorSnafu)?
+                            .try_reshape([1usize, 1, 1, n])
+                            .context(TensorSnafu)?;
+                        let lens = lens
+                            .try_reshape([b.clone(), 1usize.into(), 1usize.into(), 1usize.into()])
+                            .context(TensorSnafu)?;
+                        Some(range.try_ge(&lens).context(TensorSnafu)?)
+                    }
+                    None => None,
+                };
                 let out = perm(&q_fa)?
                     .scaled_dot_product_attention()
                     .key(&perm(&k_fa)?)
                     .value(&perm(&v_fa)?)
                     .is_causal(causal)
+                    .maybe_attn_mask(mask.as_ref())
                     .call()
                     .context(TensorSnafu)?;
                 self.merge_heads(&out)
@@ -294,11 +282,17 @@ mod tests {
     #[ignore = "GPU: padded Whisper encoder flash-attention vs unpadded SDPA"]
     fn padded_encoder_flash_attention_matches_unpadded_sdpa() {
         let (q, k, v) = encoder_shape_inputs();
-        let mut got = padded_flash_attention(&q, &k, &v, false)
-            .expect("padded flash-attention")
-            .expect("supported AMD flash-attention target")
-            .cast(DType::Float32)
-            .unwrap();
+        let padding = [(0, 0), (0, 36), (0, 0), (0, 0)];
+        let (qp, kp, vp) = (q.try_pad(&padding).unwrap(), k.try_pad(&padding).unwrap(), v.try_pad(&padding).unwrap());
+        let key_lens = Tensor::full(&[1], ConstValue::Int(1500), DType::Int32).unwrap().to(q.device());
+        let mut got =
+            svod_tk::flash_attention_with(&qp, &kp, &vp, svod_tk::FaOpts { causal: false, key_lens: Some(&key_lens) })
+                .expect("padded flash-attention")
+                .expect("supported AMD flash-attention target")
+                .try_shrink([(0, 1), (0, 1500), (0, 2), (0, 64)])
+                .unwrap()
+                .cast(DType::Float32)
+                .unwrap();
         assert_eq!(got.shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect::<Vec<_>>(), [1, 1500, 2, 64]);
         got.realize().unwrap();
 
@@ -317,18 +311,5 @@ mod tests {
         let expected = reference.as_vec::<f32>().unwrap();
         let max_abs = got.iter().zip(&expected).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
         assert!(max_abs <= 2e-2, "padded encoder FA exceeds tolerance: {max_abs:e}");
-    }
-
-    #[test]
-    #[ignore = "GPU: inspect padded Whisper encoder execution plan"]
-    fn padded_encoder_plan_contains_flash_attention_entry() {
-        let make = || Tensor::randn(&[1, 1500, 128]).unwrap().cast(DType::Float16).unwrap();
-        let (q, k, v) = (make(), make(), make());
-        let attention = MultiHeadAttention::empty_dtype(128, 2, DType::Float16);
-        let mut out = attention.fa_attention(&q, &k, &v, false).expect("Whisper encoder attention graph");
-        assert_eq!(out.shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect::<Vec<_>>(), [1, 1500, 128]);
-        let plan = out.prepare().unwrap();
-        let names = plan.kernels().map(|kernel| kernel.entry_point.as_str()).collect::<Vec<_>>();
-        assert!(names.contains(&"flash_attention"), "missing handwritten flash_attention entry in {names:?}");
     }
 }

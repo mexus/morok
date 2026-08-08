@@ -68,6 +68,12 @@ fn iconst(v: i64) -> Arc<UOp> {
 /// Validated on gfx942 (CDNA3) and gfx1151 (RDNA3.5).
 pub const FA_SUPPORTED_ARCHS: &[svod_dtype::AmdArch] = &[svod_dtype::AmdArch::Gfx942, svod_dtype::AmdArch::Gfx1151];
 
+/// Whether `device` can run the production graph flash-attention kernel.
+/// Uses the same architecture and AMD toolchain gate as [`crate::launch_custom`].
+pub fn flash_attention_supported(device: &svod_dtype::DeviceSpec) -> bool {
+    crate::target::resolve_supported_arch(device, FA_SUPPORTED_ARCHS).is_ok()
+}
+
 /// The **direct-launch** FA wrappers ([`flash_attention_forward`], `_mw`, `_mw_db`,
 /// `_mw_rdb`) hardcode the wave64 block size and the CDNA fragment tiles, so they
 /// stay gfx942-only — gfx1151 reaches the wave32 kernel only through the

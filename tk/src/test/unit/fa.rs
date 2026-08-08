@@ -43,6 +43,7 @@ fn dummy_fa_buffers(b: usize, n: usize, h: usize, h_kv: usize, d: usize) -> Vec<
 #[test]
 fn test_target_gate_rejects_non_gfx942() {
     use crate::kernels::fa::FA_SUPPORTED_ARCHS;
+    assert!(!crate::flash_attention_supported(&DeviceSpec::Cpu));
     let err = crate::target::check_target(&DeviceSpec::Cpu, FA_SUPPORTED_ARCHS);
     assert!(
         matches!(err, Err(crate::launch::Error::UnsupportedArch { .. })),

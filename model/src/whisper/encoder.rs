@@ -7,7 +7,7 @@ use svod_tensor::Tensor;
 use crate::init::fan_in_uniform;
 use crate::state::{self, HasStateDict, StateDict, get_tensor, prefixed};
 
-use super::attention::MultiHeadAttention;
+use super::attention::{MultiHeadAttention, padded_fa_sequence_len};
 use super::blocks::{Conv1dWeights, LayerNormWeights, sinusoids};
 use super::config::ModelDimensions;
 use super::error::{Result, TensorSnafu};
@@ -45,9 +45,13 @@ impl EncoderBlock {
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        self.forward_with_key_lens(x, None)
+    }
+
+    fn forward_with_key_lens(&self, x: &Tensor, key_lens: Option<&Tensor>) -> Result<Tensor> {
         // Self-attention (pre-norm)
         let h = self.attn_ln.apply(x)?;
-        let attn_out = self.attn.forward(&h, None, None)?;
+        let attn_out = self.attn.forward_with_key_lens(&h, None, None, key_lens)?;
         let x = x.try_add(&attn_out).context(TensorSnafu)?;
 
         // MLP (pre-norm)
@@ -132,10 +136,35 @@ impl AudioEncoder {
         // Add positional embedding [n_audio_ctx, D]
         let x = x.try_add(&self.positional_embedding).context(TensorSnafu)?;
 
+        let shape = x.shape().context(TensorSnafu)?;
+        let concrete = |axis: usize, operation: &str| {
+            shape[axis].as_const().ok_or_else(|| super::error::Error::Tensor {
+                source: Box::new(svod_tensor::error::Error::SymbolicShapeUnsupported { operation: operation.into() }),
+            })
+        };
+        let (batch, sequence, state) = (
+            concrete(0, "Whisper encoder batch")?,
+            concrete(1, "Whisper encoder sequence")?,
+            concrete(2, "Whisper encoder state")?,
+        );
+        let padded_sequence = encoder_padded_sequence_len(&x.device(), sequence);
+        let (mut x, key_lens) = match padded_sequence {
+            Some(padded) => {
+                let x = x.try_pad(&[(0, 0), (0, (padded - sequence) as isize), (0, 0)]).context(TensorSnafu)?;
+                let lens = Tensor::full(&[batch], svod_ir::ConstValue::Int(sequence as i64), DType::Int32)
+                    .context(TensorSnafu)?
+                    .to(x.device());
+                (x, Some(lens))
+            }
+            None => (x, None),
+        };
+
         // Transformer blocks
-        let mut x = x;
         for block in &self.blocks {
-            x = block.forward(&x)?;
+            x = block.forward_with_key_lens(&x, key_lens.as_ref())?;
+        }
+        if padded_sequence.is_some() {
+            x = x.try_shrink([(0, batch), (0, sequence), (0, state)]).context(TensorSnafu)?;
         }
 
         // Final LayerNorm + cast to fp32. The encoder output is consumed by the
@@ -144,6 +173,12 @@ impl AudioEncoder {
         // the host read path works regardless of compute dtype.
         self.ln_post.apply(&x)?.cast(DType::Float32).context(TensorSnafu)
     }
+}
+
+fn encoder_padded_sequence_len(device: &svod_dtype::DeviceSpec, sequence: usize) -> Option<usize> {
+    svod_tk::flash_attention_supported(device)
+        .then(|| padded_fa_sequence_len(false, sequence, sequence, sequence))
+        .flatten()
 }
 
 impl HasStateDict for AudioEncoder {
@@ -168,5 +203,51 @@ impl HasStateDict for AudioEncoder {
         }
         self.ln_post.load_state_dict(sd, &prefixed(prefix, "ln_post"))?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use svod_dtype::DeviceSpec;
+
+    use super::*;
+
+    fn encoder_dims(layers: usize) -> ModelDimensions {
+        ModelDimensions {
+            n_mels: 4,
+            n_audio_ctx: 1500,
+            n_audio_state: 128,
+            n_audio_head: 2,
+            n_audio_layer: layers,
+            n_vocab: 16,
+            n_text_ctx: 8,
+            n_text_state: 8,
+            n_text_head: 2,
+            n_text_layer: 1,
+            dtype: DType::Float16,
+        }
+    }
+
+    #[test]
+    fn unsupported_device_keeps_original_encoder_sequence() {
+        assert_eq!(encoder_padded_sequence_len(&DeviceSpec::Cpu, 1500), None);
+
+        let encoder = AudioEncoder::empty(&encoder_dims(1));
+        let mel = Tensor::zeros(&[1, 4, 3000], DType::Float32).unwrap();
+        let out = encoder.forward(&mel).unwrap();
+        assert_eq!(out.shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect::<Vec<_>>(), [1, 1500, 128]);
+    }
+
+    #[test]
+    #[ignore = "GPU: inspect full padded Whisper encoder execution plan"]
+    fn padded_encoder_plan_has_one_flash_attention_per_block() {
+        let encoder = AudioEncoder::empty(&encoder_dims(32));
+        let mel = Tensor::zeros(&[1, 4, 3000], DType::Float32).unwrap();
+        let mut out = encoder.forward(&mel).unwrap();
+        assert_eq!(out.shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect::<Vec<_>>(), [1, 1500, 128]);
+
+        let plan = out.prepare().unwrap();
+        let flash_attention = plan.kernels().filter(|kernel| kernel.entry_point == "flash_attention").count();
+        assert_eq!(flash_attention, 32, "expected one handwritten flash-attention dispatch per encoder block");
     }
 }
