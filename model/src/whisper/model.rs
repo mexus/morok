@@ -1,5 +1,6 @@
 //! Whisper model composite: encoder + decoder + dimensions.
 
+use svod_dtype::DType;
 use svod_tensor::Tensor;
 
 use crate::state::{self, HasStateDict, StateDict, prefixed};
@@ -46,6 +47,11 @@ impl Whisper {
     /// Project encoder features into packed cross-attention K/V once per window.
     pub fn project_cross_kv(&self, audio_features: &Tensor) -> Result<(Tensor, Tensor)> {
         self.decoder.project_cross_kv(audio_features)
+    }
+
+    /// Dense cross-projection activation/output contract used by cache consumers.
+    pub fn cross_cache_output_dtype(&self) -> Result<DType> {
+        self.decoder.cross_cache_output_dtype()
     }
 
     /// Decode logits using packed cross-attention K/V.

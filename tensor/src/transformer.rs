@@ -234,7 +234,12 @@ impl Tensor {
         // Softmax + output. Re-zero out-of-band weights so a fully-masked row
         // (whose softmax would otherwise be uniform over the masked keys)
         // produces exact zeros rather than `1/k_len` leakage.
-        let mut attn_weights = scores.softmax(-1isize)?;
+        let low_precision_scores = scores.uop().dtype() == DType::Float16 || scores.uop().dtype() == DType::BFloat16;
+        let mut attn_weights = if low_precision_scores {
+            scores.cast(DType::Float32)?.softmax(-1isize)?.cast(scores_dtype.clone())?
+        } else {
+            scores.softmax(-1isize)?
+        };
         if let Some(keep) = keep_mask.as_ref() {
             let zero = Tensor::const_(ConstValue::zero(scores_dtype.base()), scores_dtype);
             let masked_out = keep.logical_not()?;

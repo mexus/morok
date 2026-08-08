@@ -343,13 +343,14 @@ pub(crate) fn prefill_decode_seed(
 }
 
 fn clone_device_cache(src: &Buffer) -> Result<Buffer> {
-    if src.dtype() != DType::Float32 || !src.size().is_multiple_of(std::mem::size_of::<f32>()) {
-        return Err(decode_err("prefill cache must contain aligned float32 data"));
+    let element_bytes = src.dtype().bytes();
+    if element_bytes == 0 || !src.size().is_multiple_of(element_bytes) {
+        return Err(decode_err("prefill cache is not element-aligned"));
     }
     let mut clone = Buffer::allocate(
         src.allocator_arc(),
-        DType::Float32,
-        vec![src.size() / std::mem::size_of::<f32>()],
+        src.dtype().clone(),
+        vec![src.size() / element_bytes],
         BufferSpec { cpu_access: false, ..BufferSpec::default() },
     )
     .context(DeviceSnafu)?;
@@ -370,6 +371,12 @@ fn build_decode_seed(
     if cross_k.size() == 0 || cross_k.size() != cross_v.size() {
         return Err(decode_err("invalid prefill cross-cache geometry"));
     }
+    if self_k.dtype() != self_v.dtype() || cross_k.dtype() != cross_v.dtype() {
+        return Err(decode_err("prefill K/V cache dtypes disagree"));
+    }
+    if self_k.dtype() != cross_k.dtype() {
+        return Err(decode_err("prefill self and cross cache dtypes disagree"));
+    }
     for cache in [&self_v, &cross_k, &cross_v] {
         if !std::ptr::eq(self_k.allocator(), cache.allocator()) {
             return Err(decode_err("prefill caches use different allocators"));
@@ -380,8 +387,8 @@ fn build_decode_seed(
         .checked_div(metadata.init_len)
         .filter(|&bytes| bytes != 0 && bytes.checked_mul(metadata.init_len) == Some(self_k.size()))
         .ok_or_else(|| decode_err("self cache is not position-aligned"))?;
-    if per_pos_bytes % std::mem::size_of::<f32>() != 0 {
-        return Err(decode_err("self cache position is not float32-aligned"));
+    if per_pos_bytes % self_k.dtype().bytes() != 0 {
+        return Err(decode_err("self cache position is not element-aligned"));
     }
     let cross_positions = cross_k
         .size()
@@ -707,6 +714,17 @@ fn append_row_cache(
     per_pos_bytes: usize,
     row_stride_bytes: usize,
 ) -> Result<()> {
+    let output_k_dtype = jit.new_self_k().context(JitSnafu)?.dtype().clone();
+    let output_v_dtype = jit.new_self_v().context(JitSnafu)?.dtype().clone();
+    let cache_k_dtype = jit.self_k_cache_mut().context(JitSnafu)?.dtype().clone();
+    let cache_v_dtype = jit.self_v_cache_mut().context(JitSnafu)?.dtype().clone();
+    if output_k_dtype != output_v_dtype || output_k_dtype != cache_k_dtype || output_v_dtype != cache_v_dtype {
+        return Err(decode_err("step K/V outputs and cache destination dtypes disagree"));
+    }
+    let element_bytes = output_k_dtype.bytes();
+    if !per_pos_bytes.is_multiple_of(element_bytes) || !row_stride_bytes.is_multiple_of(element_bytes) {
+        return Err(decode_err("self cache append is not element-aligned"));
+    }
     let dst = row
         .checked_mul(row_stride_bytes)
         .and_then(|base| pos.checked_mul(per_pos_bytes).and_then(|offset| base.checked_add(offset)))
@@ -873,7 +891,7 @@ pub(crate) fn run_fixed_slot_decode(
                     control_bytes = control_bytes.saturating_add(
                         std::mem::size_of::<i32>()
                             + seed.n_state * std::mem::size_of::<f32>()
-                            + (n_text_ctx + 1) * std::mem::size_of::<f32>(),
+                            + (n_text_ctx + 1) * DType::Bool.bytes(),
                     );
                 }
                 AttemptKind::Beam(beam) => {
@@ -895,7 +913,7 @@ pub(crate) fn run_fixed_slot_decode(
                         control_bytes = control_bytes.saturating_add(
                             std::mem::size_of::<i32>()
                                 + seed.n_state * std::mem::size_of::<f32>()
-                                + (n_text_ctx + 1) * std::mem::size_of::<f32>(),
+                                + (n_text_ctx + 1) * DType::Bool.bytes(),
                         );
                     }
                 }
@@ -1128,28 +1146,36 @@ fn write_pos_emb_row(jit: &mut WhisperDecoderStepJit, row: usize, emb: &[f32]) -
 fn write_self_mask_row(jit: &mut WhisperDecoderStepJit, row: usize, pos: usize, n_text_ctx: usize) -> Result<()> {
     let buf = jit.self_mask_mut().context(JitSnafu)?;
     let dst = buf.as_host_bytes_mut().context(DeviceSnafu)?;
-    // mask is [max_lanes, 1, 1, n_text_ctx + 1]; row stride = (n_text_ctx+1)*4
+    if buf.dtype() != DType::Bool {
+        return Err(decode_err("decoder self mask must be bool"));
+    }
+    // True masks cached positions [pos..n_text_ctx); the appended current
+    // position at n_text_ctx remains visible, exactly matching the old mask.
+    let bool_bytes = DType::Bool.bytes();
+    if bool_bytes != 1 {
+        return Err(decode_err("decoder bool mask host encoding must be one byte"));
+    }
     let stride = n_text_ctx
         .checked_add(1)
-        .and_then(|positions| positions.checked_mul(std::mem::size_of::<f32>()))
+        .and_then(|positions| positions.checked_mul(bool_bytes))
         .ok_or_else(|| decode_err("mask row stride overflow"))?;
     let off = row.checked_mul(stride).ok_or_else(|| decode_err("mask row offset overflow"))?;
-    // [0..pos) = 0.0 (attend), [pos..n_text_ctx) = -inf (mask), [n_text_ctx] = 0.0
-    let mut mask = vec![0f32; n_text_ctx + 1];
+    let mut mask = vec![0u8; n_text_ctx + 1];
     let masked = mask.get_mut(pos..n_text_ctx).ok_or_else(|| decode_err("decoder position exceeds text context"))?;
-    for v in masked {
-        *v = f32::NEG_INFINITY;
-    }
-    let bytes: &[u8] = bytemuck::cast_slice(&mask);
-    let target = dst.get_mut(off..off + bytes.len()).ok_or_else(|| decode_err("mask row is out of bounds"))?;
-    target.copy_from_slice(bytes);
+    masked.fill(1);
+    let target = dst.get_mut(off..off + mask.len()).ok_or_else(|| decode_err("mask row is out of bounds"))?;
+    target.copy_from_slice(&mask);
     Ok(())
 }
 
 /// Seed one physical cache row from an immutable device-local snapshot.
 fn copy_device_cache_row(buf: &mut Buffer, row: usize, row_stride_bytes: usize, data: &Buffer) -> Result<()> {
-    if buf.dtype() != DType::Float32 || data.dtype() != DType::Float32 {
-        return Err(decode_err("cache seed buffers must be float32"));
+    if buf.dtype() != data.dtype() {
+        return Err(decode_err("cache seed source and destination dtypes disagree"));
+    }
+    let element_bytes = data.dtype().bytes();
+    if !row_stride_bytes.is_multiple_of(element_bytes) || !data.size().is_multiple_of(element_bytes) {
+        return Err(decode_err("cache seed copy is not element-aligned"));
     }
     if !std::ptr::eq(buf.allocator(), data.allocator()) {
         return Err(decode_err("cache seed and decoder row use different allocators"));
@@ -1797,9 +1823,9 @@ mod scheduler_seed_tests {
     use std::sync::Arc;
     use svod_device::CpuAllocator;
 
-    fn cache(allocator: Arc<CpuAllocator>, values: &[f32]) -> Buffer {
+    fn cache(allocator: Arc<CpuAllocator>, values: &[u16]) -> Buffer {
         let mut buffer =
-            Buffer::allocate(allocator, DType::Float32, vec![values.len()], BufferSpec::default()).unwrap();
+            Buffer::allocate(allocator, DType::Float16, vec![values.len()], BufferSpec::default()).unwrap();
         buffer.copyin(bytemuck::cast_slice(values)).unwrap();
         buffer
     }
@@ -1807,8 +1833,8 @@ mod scheduler_seed_tests {
     #[test]
     fn scheduler_seed_owns_device_buffers_and_seeds_multiple_rows() {
         let allocator = Arc::new(CpuAllocator);
-        let self_values = [1.0f32, 2.0, 3.0, 4.0];
-        let cross_values = [5.0f32, 6.0, 7.0, 8.0, 9.0, 10.0];
+        let self_values = [0x3c00u16, 0x4000, 0x4200, 0x4400];
+        let cross_values = [0x4500u16, 0x4600, 0x4700, 0x4800, 0x4880, 0x4900];
         let self_k_source = cache(allocator.clone(), &self_values);
         let self_v_source = cache(allocator.clone(), &self_values);
         let cross_k_source = cache(allocator.clone(), &cross_values);
@@ -1834,7 +1860,7 @@ mod scheduler_seed_tests {
         .unwrap();
 
         assert_eq!(seed.metadata.initial_tokens, [1, 2]);
-        assert_eq!(seed.per_pos_bytes, 2 * std::mem::size_of::<f32>());
+        assert_eq!(seed.per_pos_bytes, 2 * DType::Float16.bytes());
         assert_eq!(seed.self_cache_bytes, std::mem::size_of_val(&self_values));
         assert_eq!(seed.cross_cache_bytes, std::mem::size_of_val(&cross_values));
         assert_eq!((seed.self_positions, seed.cross_positions), (2, 3));
@@ -1846,8 +1872,8 @@ mod scheduler_seed_tests {
         let self_stride = 4 * seed.per_pos_bytes;
         let mut self_rows = Buffer::allocate(
             allocator.clone(),
-            DType::Float32,
-            vec![2 * self_stride / std::mem::size_of::<f32>()],
+            DType::Float16,
+            vec![2 * self_stride / DType::Float16.bytes()],
             BufferSpec::default(),
         )
         .unwrap();
@@ -1860,8 +1886,8 @@ mod scheduler_seed_tests {
 
         let mut cross_rows = Buffer::allocate(
             allocator,
-            DType::Float32,
-            vec![2 * seed.cross_cache_bytes / std::mem::size_of::<f32>()],
+            DType::Float16,
+            vec![2 * seed.cross_cache_bytes / DType::Float16.bytes()],
             BufferSpec::default(),
         )
         .unwrap();
