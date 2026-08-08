@@ -144,8 +144,9 @@ fn transcribe_chunks_empty_returns_default() {
 fn transcribe_chunks_omits_words_when_not_wanted() {
     let waveform = vec![0.0_f32; 20];
     let chunks = vec![AudioChunk::new(0, 10)];
-    let mut asr =
-        PresetTranscriber { out: vec![Transcript { text: String::new(), words: vec![word("hi", 1.0, 2.0)], ..Default::default() }] };
+    let mut asr = PresetTranscriber {
+        out: vec![Transcript { text: String::new(), words: vec![word("hi", 1.0, 2.0)], ..Default::default() }],
+    };
     // default options → words: false, so cropped words are not surfaced.
     let out = asr.transcribe_chunks_default(&waveform, &chunks).unwrap();
     assert_eq!(out.text, "hi");
@@ -245,8 +246,9 @@ fn transcribe_windows_default_merges_per_window_profiles() {
     // merges both `decode` stages into one with summed wall (1 ms × 2).
     let waveform = vec![0.0_f32; 20];
     let chunks = vec![AudioChunk::new(0, 10), AudioChunk::new(10, 20)];
-    let out =
-        ProfilingTranscriber.transcribe_chunks(&waveform, &chunks, RunOptions { profile: true, ..Default::default() }).unwrap();
+    let out = ProfilingTranscriber
+        .transcribe_chunks(&waveform, &chunks, RunOptions { profile: true, ..Default::default() })
+        .unwrap();
     let profile = out.profile.expect("profile collected");
     assert_eq!(profile.stages.len(), 1, "stages merged by name");
     assert_eq!(profile.stage("decode").unwrap().wall, std::time::Duration::from_millis(2));
@@ -273,8 +275,9 @@ fn asr_surfaces_split_stage_even_when_transcriber_does_not() {
     // Profiled run, but the transcriber emits no profile: the `vad` stage still
     // surfaces on its own.
     let splitter = VadSplitter::new(MockVad { probs: vec![1.0; 4], samples_per_prob: 1 }, fast_chunker_opts());
-    let transcriber =
-        PresetTranscriber { out: vec![Transcript { text: String::new(), words: vec![word("a", 1.0, 2.0)], ..Default::default() }] };
+    let transcriber = PresetTranscriber {
+        out: vec![Transcript { text: String::new(), words: vec![word("a", 1.0, 2.0)], ..Default::default() }],
+    };
     let mut asr = Asr::new(splitter, transcriber);
     let out = asr.transcribe(&[0.0_f32; 4], RunOptions { profile: true, ..Default::default() }).unwrap();
     let profile = out.profile.expect("vad-only profile surfaces");
