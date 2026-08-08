@@ -2,7 +2,7 @@
 
 use snafu::ResultExt;
 use svod_dtype::DType;
-use svod_ir::ConstValue;
+use svod_ir::{ConstValue, SInt};
 use svod_tensor::Tensor;
 
 use crate::init::fan_in_uniform;
@@ -111,24 +111,66 @@ pub struct TextDecoder {
     pub n_state: usize,
     pub n_head: usize,
     pub n_text_ctx: usize,
+    packed_cross_k_weight: Tensor, // [n_layer * D, D]
+    packed_cross_v_weight: Tensor, // [n_layer * D, D]
+    packed_cross_v_bias: Tensor,   // [n_layer * D]
 }
 
 impl TextDecoder {
     pub fn empty(dims: &ModelDimensions) -> Self {
         let n_state = dims.n_text_state;
         let dtype = dims.dtype.clone();
+        let blocks: Vec<_> = (0..dims.n_text_layer)
+            .map(|_| DecoderBlock::empty_dtype(n_state, dims.n_text_head, dtype.clone()))
+            .collect();
+        let (packed_cross_k_weight, packed_cross_v_weight, packed_cross_v_bias) =
+            Self::pack_cross_weights(&blocks).expect("cross-attention weights");
         Self {
             token_embedding: fan_in_uniform(&[dims.n_vocab, n_state], n_state, dtype.clone()),
             positional_embedding: Tensor::zeros(&[dims.n_text_ctx, n_state], dtype.clone())
                 .expect("positional embedding"),
-            blocks: (0..dims.n_text_layer)
-                .map(|_| DecoderBlock::empty_dtype(n_state, dims.n_text_head, dtype.clone()))
-                .collect(),
+            blocks,
             ln: LayerNormWeights::empty_dtype(n_state, dtype),
             n_state,
             n_head: dims.n_text_head,
             n_text_ctx: dims.n_text_ctx,
+            packed_cross_k_weight,
+            packed_cross_v_weight,
+            packed_cross_v_bias,
         }
+    }
+
+    fn pack_cross_weights(
+        blocks: &[DecoderBlock],
+    ) -> std::result::Result<(Tensor, Tensor, Tensor), Box<svod_tensor::error::Error>> {
+        let key_weights: Vec<_> = blocks.iter().map(|block| &block.cross_attn.key.weight).collect();
+        let value_weights: Vec<_> = blocks.iter().map(|block| &block.cross_attn.value.weight).collect();
+        let value_biases: Vec<_> = blocks
+            .iter()
+            .map(|block| block.cross_attn.value.bias.as_ref().expect("Whisper value projection has bias"))
+            .collect();
+        Ok((
+            Tensor::cat(&key_weights, 0).map_err(Box::new)?,
+            Tensor::cat(&value_weights, 0).map_err(Box::new)?,
+            Tensor::cat(&value_biases, 0).map_err(Box::new)?,
+        ))
+    }
+
+    fn rebuild_packed_cross_weights(&mut self) -> std::result::Result<(), Box<svod_tensor::error::Error>> {
+        let (mut key, mut value, mut value_bias) = Self::pack_cross_weights(&self.blocks)?;
+        Tensor::realize_batch([&mut key, &mut value, &mut value_bias]).map_err(Box::new)?;
+
+        for (layer, block) in self.blocks.iter_mut().enumerate() {
+            let start = (layer * self.n_state) as isize;
+            let end = start + self.n_state as isize;
+            block.cross_attn.key.weight = key.try_shrink([Some((start, end)), None]).map_err(Box::new)?;
+            block.cross_attn.value.weight = value.try_shrink([Some((start, end)), None]).map_err(Box::new)?;
+            block.cross_attn.value.bias = Some(value_bias.try_shrink([Some((start, end))]).map_err(Box::new)?);
+        }
+        self.packed_cross_k_weight = key;
+        self.packed_cross_v_weight = value;
+        self.packed_cross_v_bias = value_bias;
+        Ok(())
     }
 
     fn pack_kv(kvs: Vec<Tensor>) -> Result<Tensor> {
@@ -142,17 +184,23 @@ impl TextDecoder {
     /// Project encoder features into the fixed packed cross-attention cache.
     /// This graph is independent of decoder tokens and runs once per window.
     pub fn project_cross_kv(&self, xa: &Tensor) -> Result<(Tensor, Tensor)> {
-        let mut cross_ks = Vec::with_capacity(self.blocks.len());
-        let mut cross_vs = Vec::with_capacity(self.blocks.len());
-        for block in &self.blocks {
-            let k = block.cross_attn.key.forward(xa)?;
-            let v = block.cross_attn.value.forward(xa)?;
-            cross_ks.push(block.cross_attn.split_heads(&k)?);
-            cross_vs.push(block.cross_attn.split_heads(&v)?);
-        }
+        let shape = xa.shape().context(TensorSnafu)?;
+        let cache_shape = [
+            shape[0].clone(),
+            shape[1].clone(),
+            SInt::Const(self.blocks.len() * self.n_head),
+            SInt::Const(self.n_state / self.n_head),
+        ];
+        let k = xa.linear().weight(&self.packed_cross_k_weight).call().context(TensorSnafu)?;
+        let v = xa
+            .linear()
+            .weight(&self.packed_cross_v_weight)
+            .bias(&self.packed_cross_v_bias)
+            .call()
+            .context(TensorSnafu)?;
         Ok((
-            Self::pack_kv(cross_ks)?.cast(DType::Float32).context(TensorSnafu)?,
-            Self::pack_kv(cross_vs)?.cast(DType::Float32).context(TensorSnafu)?,
+            k.try_reshape(&cache_shape).context(TensorSnafu)?.cast(DType::Float32).context(TensorSnafu)?,
+            v.try_reshape(&cache_shape).context(TensorSnafu)?.cast(DType::Float32).context(TensorSnafu)?,
         ))
     }
 
@@ -602,6 +650,7 @@ impl HasStateDict for TextDecoder {
             block.load_state_dict(sd, &prefixed(prefix, &format!("blocks.{i}")))?;
         }
         self.ln.load_state_dict(sd, &prefixed(prefix, "ln"))?;
+        self.rebuild_packed_cross_weights().map_err(|source| state::Error::Tensor { source })?;
         Ok(())
     }
 }

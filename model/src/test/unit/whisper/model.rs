@@ -1,7 +1,7 @@
 //! Forward shape + state-dict round-trip tests for Whisper model.
 
 use svod_dtype::DType;
-use svod_ir::ConstValue;
+use svod_ir::{AxisType, ConstValue, Op};
 use svod_tensor::Tensor;
 
 use crate::jit::InputSpec;
@@ -65,6 +65,70 @@ fn small_decoder_dims() -> ModelDimensions {
         n_text_head: 2,
         n_text_layer: 2,
         dtype: DType::Float32,
+    }
+}
+
+fn old_cross_kv_projection(model: &Whisper, audio: &Tensor) -> (Tensor, Tensor) {
+    let mut keys = Vec::with_capacity(model.decoder.blocks.len());
+    let mut values = Vec::with_capacity(model.decoder.blocks.len());
+    for block in &model.decoder.blocks {
+        let key = block.cross_attn.key.forward(audio).unwrap();
+        let value = block.cross_attn.value.forward(audio).unwrap();
+        keys.push(block.cross_attn.split_heads(&key).unwrap().try_permute(&[0, 2, 1, 3]).unwrap());
+        values.push(block.cross_attn.split_heads(&value).unwrap().try_permute(&[0, 2, 1, 3]).unwrap());
+    }
+    let keys = Tensor::cat(&keys.iter().collect::<Vec<_>>(), 2).unwrap().cast(DType::Float32).unwrap();
+    let values = Tensor::cat(&values.iter().collect::<Vec<_>>(), 2).unwrap().cast(DType::Float32).unwrap();
+    (keys, values)
+}
+
+#[test]
+fn packed_cross_kv_matches_per_layer_projection() {
+    let mut dims = small_decoder_dims();
+    dims.n_text_layer = 3;
+    let seed = Whisper::empty(dims.clone());
+    let model = Whisper::from_state_dict(&seed.state_dict(""), dims.clone()).unwrap();
+    let audio_values: Vec<f32> =
+        (0..2 * dims.n_audio_ctx * dims.n_text_state).map(|index| (index as f32 - 31.0) * 0.017).collect();
+    let audio = Tensor::from_slice(audio_values).try_reshape([2usize, dims.n_audio_ctx, dims.n_text_state]).unwrap();
+
+    let (mut expected_k, mut expected_v) = old_cross_kv_projection(&model, &audio);
+    let (mut actual_k, mut actual_v) = model.project_cross_kv(&audio).unwrap();
+    Tensor::realize_batch([&mut expected_k, &mut expected_v, &mut actual_k, &mut actual_v]).unwrap();
+
+    let expected_shape = [2, dims.n_audio_ctx, dims.n_text_layer * dims.n_text_head, 4];
+    for (expected, actual) in [(&expected_k, &actual_k), (&expected_v, &actual_v)] {
+        assert_eq!(actual.uop().dtype(), DType::Float32);
+        assert_eq!(
+            actual.shape().unwrap().iter().map(|dim| dim.as_const().unwrap()).collect::<Vec<_>>(),
+            expected_shape
+        );
+        let expected = expected.as_vec::<f32>().unwrap();
+        let actual = actual.as_vec::<f32>().unwrap();
+        let max_delta = expected.iter().zip(&actual).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        assert!(max_delta < 1e-5, "packed cross projection drifted by {max_delta}");
+    }
+}
+
+#[test]
+fn prepared_cross_kv_has_two_single_reduction_kernels() {
+    let mut dims = small_decoder_dims();
+    dims.n_text_layer = 3;
+    let seed = Whisper::empty(dims.clone());
+    let model = Whisper::from_state_dict(&seed.state_dict(""), dims.clone()).unwrap();
+    let mut jit = WhisperCrossKvJit::new(model);
+    jit.prepare(InputSpec::f32(&[1, dims.n_audio_ctx, dims.n_text_state])).unwrap();
+
+    let kernels = jit.prepared_kernels().unwrap();
+    assert_eq!(kernels.len(), 2, "packed weights must not be materialized during inference");
+    for kernel in kernels {
+        let reductions = kernel
+            .ast
+            .toposort()
+            .into_iter()
+            .filter(|uop| matches!(uop.op(), Op::Range { axis_type: AxisType::Reduce, .. }))
+            .count();
+        assert_eq!(reductions, 1, "each packed projection must have one reduction axis");
     }
 }
 
