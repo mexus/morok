@@ -111,6 +111,41 @@ fn materialized_cross_kv_matches_reference_projection() {
 }
 
 #[test]
+fn low_precision_cross_projection_keeps_fp32_cache_storage() {
+    let mut dims = small_decoder_dims();
+    dims.dtype = DType::Float16;
+    let model = Whisper::empty(dims.clone());
+    let audio_values: Vec<f32> =
+        (0..dims.n_audio_ctx * dims.n_text_state).map(|index| (index as f32 - 13.0) * 0.037).collect();
+    let audio = Tensor::from_slice(audio_values).try_reshape([1usize, dims.n_audio_ctx, dims.n_text_state]).unwrap();
+    let native_audio = audio.cast(DType::Float16).unwrap();
+
+    let (mut expected_k, mut expected_v) = reference_cross_kv_projection(&model, &native_audio);
+    let (mut legacy_k, mut legacy_v) = reference_cross_kv_projection(&model, &audio);
+    let (mut actual_k, mut actual_v) = model.project_cross_kv(&audio).unwrap();
+    Tensor::realize_batch([
+        &mut expected_k,
+        &mut expected_v,
+        &mut legacy_k,
+        &mut legacy_v,
+        &mut actual_k,
+        &mut actual_v,
+    ])
+    .unwrap();
+
+    for ((expected, legacy), actual) in
+        [(&expected_k, &legacy_k), (&expected_v, &legacy_v)].into_iter().zip([&actual_k, &actual_v])
+    {
+        assert_eq!(actual.uop().dtype(), DType::Float32);
+        let expected = expected.as_vec::<f32>().unwrap();
+        let legacy = legacy.as_vec::<f32>().unwrap();
+        let actual = actual.as_vec::<f32>().unwrap();
+        assert_eq!(actual, expected, "projection must use the model activation dtype before FP32 cache storage");
+        assert_ne!(legacy, expected, "fixture must detect projection inherited from the FP32 encoder output");
+    }
+}
+
+#[test]
 fn prepared_cross_kv_materializes_each_projection_before_packing() {
     let mut dims = small_decoder_dims();
     dims.n_text_layer = 3;
@@ -378,6 +413,33 @@ fn alignment_forward_exports_only_selected_heads() {
     assert_eq!(shape[1].as_const(), Some(heads.len()));
     assert_eq!(shape[2].as_const(), Some(4));
     assert_eq!(shape[3].as_const(), Some(8));
+}
+
+#[test]
+fn alignment_compute_does_not_inherit_fp32_cache_storage_dtype() {
+    let mut dims = small_decoder_dims();
+    dims.dtype = DType::Float16;
+    let model = Whisper::empty(dims.clone());
+    let features = Tensor::from_slice(
+        (0..dims.n_audio_ctx * dims.n_text_state).map(|index| (index as f32 - 11.0) * 0.029).collect::<Vec<_>>(),
+    )
+    .try_reshape([1usize, dims.n_audio_ctx, dims.n_text_state])
+    .unwrap();
+    let tokens = Tensor::from_slice([1i32, 2, 3, 4]).try_reshape([1usize, 4]).unwrap();
+    let heads = [(0, 0), (1, 1)];
+    let (cross_k, cross_v) = model.project_cross_kv(&features).unwrap();
+    assert_eq!(cross_k.uop().dtype(), DType::Float32);
+
+    let mut actual = model.align_with_cross_kv(&tokens, &cross_k, &cross_v, &heads).unwrap();
+    let low_k = cross_k.cast(DType::Float16).unwrap();
+    let low_v = cross_v.cast(DType::Float16).unwrap();
+    let mut expected = model.align_with_cross_kv(&tokens, &low_k, &low_v, &heads).unwrap();
+    Tensor::realize_batch([&mut actual, &mut expected]).unwrap();
+
+    let actual = actual.as_vec::<f32>().unwrap();
+    let expected = expected.as_vec::<f32>().unwrap();
+    let max_delta = actual.iter().zip(&expected).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+    assert!(max_delta < 1e-5, "FP32 cache storage changed low-precision alignment compute by {max_delta}");
 }
 
 fn eager_audio_feature_alignment_reference(

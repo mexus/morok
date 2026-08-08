@@ -111,6 +111,7 @@ pub struct TextDecoder {
     pub n_state: usize,
     pub n_head: usize,
     pub n_text_ctx: usize,
+    activation_dtype: DType,
 }
 
 impl TextDecoder {
@@ -128,6 +129,7 @@ impl TextDecoder {
             n_state,
             n_head: dims.n_text_head,
             n_text_ctx: dims.n_text_ctx,
+            activation_dtype: dims.dtype.clone(),
         }
     }
 
@@ -142,12 +144,13 @@ impl TextDecoder {
     /// Project encoder features into the fixed packed cross-attention cache.
     /// This graph is independent of decoder tokens and runs once per window.
     pub fn project_cross_kv(&self, xa: &Tensor) -> Result<(Tensor, Tensor)> {
+        let xa = xa.cast(self.activation_dtype.clone()).context(TensorSnafu)?;
         let mut cross_ks = Vec::with_capacity(self.blocks.len());
         let mut cross_vs = Vec::with_capacity(self.blocks.len());
         for block in &self.blocks {
             // Keep each GEMM independent from the final layer/head packing.
-            let k = block.cross_attn.key.forward(xa)?.contiguous();
-            let v = block.cross_attn.value.forward(xa)?.contiguous();
+            let k = block.cross_attn.key.forward(&xa)?.contiguous();
+            let v = block.cross_attn.value.forward(&xa)?.contiguous();
             cross_ks.push(block.cross_attn.split_heads(&k)?);
             cross_vs.push(block.cross_attn.split_heads(&v)?);
         }
@@ -217,7 +220,9 @@ impl TextDecoder {
             self.positional_embedding.try_shrink([Some((0isize, seq_len as isize)), None]).context(TensorSnafu)?;
 
         let x = tok_emb.try_add(&pos_emb).context(TensorSnafu)?;
-        let x = x.cast(cross_k.uop().dtype()).context(TensorSnafu)?;
+        let x = x.cast(self.activation_dtype.clone()).context(TensorSnafu)?;
+        let cross_k = cross_k.cast(self.activation_dtype.clone()).context(TensorSnafu)?;
+        let cross_v = cross_v.cast(self.activation_dtype.clone()).context(TensorSnafu)?;
 
         let mask = causal_mask(seq_len, x.uop().dtype().clone())?;
 
