@@ -1,7 +1,6 @@
 //! KV-cached Whisper decoder: greedy, beam search, temperature fallback,
 //! and language detection — matching `whisper.decoding`.
 
-use super::config::N_AUDIO_CTX;
 use super::error::{DeviceSnafu, Error, JitSnafu, Result};
 use super::jit::{WhisperDecoderJit, WhisperDecoderStepJit, WhisperPrefillJit};
 use super::tokenizer::WhisperTokenizer;
@@ -9,6 +8,8 @@ use snafu::ResultExt;
 use std::cmp::Ordering;
 use std::collections::VecDeque;
 use svod_arch::pipelines::audio::Segment;
+use svod_device::{Buffer, BufferSpec};
+use svod_dtype::DType;
 
 // ─── Language detection ─────────────────────────────────────────────────────
 
@@ -412,10 +413,19 @@ pub fn greedy_decode_cached(
 // ─── Fixed-slot mixed-strategy scheduler ────────────────────────────────────
 
 /// Immutable output of token prefill. Fallback attempts reuse this seed rather
-/// than rerunning prefill. Cache vectors are currently host-resident and are
-/// copied into a row only when that row changes request ownership.
+/// than rerunning prefill. Cache snapshots remain device-local and are copied
+/// into a row only when that row changes request ownership.
 pub(crate) struct DecodeSeed {
     ctx: DecodeCtx,
+    self_k_cache: Buffer,
+    self_v_cache: Buffer,
+    cross_k: Buffer,
+    cross_v: Buffer,
+    per_pos_bytes: usize,
+    self_cache_bytes: usize,
+    cross_cache_bytes: usize,
+    self_positions: usize,
+    cross_positions: usize,
 }
 
 pub(crate) fn prefill_decode_seed(
@@ -427,7 +437,79 @@ pub(crate) fn prefill_decode_seed(
     pos_embedding: &[f32],
     n_state: usize,
 ) -> Result<DecodeSeed> {
-    Ok(DecodeSeed { ctx: init_decode(prefill_jit, tokenizer, options, n_text_ctx, n_vocab, pos_embedding, n_state)? })
+    let ctx = execute_prefill(prefill_jit, tokenizer, options, n_vocab, pos_embedding, n_state)?;
+    let self_k = clone_device_cache(prefill_jit.self_k().context(JitSnafu)?)?;
+    let self_v = clone_device_cache(prefill_jit.self_v().context(JitSnafu)?)?;
+    let cross_k = clone_device_cache(prefill_jit.prepared_cross_k_mut().context(JitSnafu)?)?;
+    let cross_v = clone_device_cache(prefill_jit.prepared_cross_v_mut().context(JitSnafu)?)?;
+    let seed = build_decode_seed(ctx, self_k, self_v, cross_k, cross_v)?;
+    if seed.self_positions > n_text_ctx {
+        return Err(decode_err("prefill self cache exceeds text context"));
+    }
+    Ok(seed)
+}
+
+fn clone_device_cache(src: &Buffer) -> Result<Buffer> {
+    if src.dtype() != DType::Float32 || !src.size().is_multiple_of(std::mem::size_of::<f32>()) {
+        return Err(decode_err("prefill cache must contain aligned float32 data"));
+    }
+    let mut clone = Buffer::allocate(
+        src.allocator_arc(),
+        DType::Float32,
+        vec![src.size() / std::mem::size_of::<f32>()],
+        BufferSpec { cpu_access: false, ..BufferSpec::default() },
+    )
+    .context(DeviceSnafu)?;
+    clone.copy_from(src).context(DeviceSnafu)?;
+    Ok(clone)
+}
+
+fn build_decode_seed(
+    ctx: DecodeCtx,
+    self_k: Buffer,
+    self_v: Buffer,
+    cross_k: Buffer,
+    cross_v: Buffer,
+) -> Result<DecodeSeed> {
+    if ctx.init_len == 0 || self_k.size() == 0 || self_k.size() != self_v.size() {
+        return Err(decode_err("invalid prefill self-cache geometry"));
+    }
+    if cross_k.size() == 0 || cross_k.size() != cross_v.size() {
+        return Err(decode_err("invalid prefill cross-cache geometry"));
+    }
+    for cache in [&self_v, &cross_k, &cross_v] {
+        if !std::ptr::eq(self_k.allocator(), cache.allocator()) {
+            return Err(decode_err("prefill caches use different allocators"));
+        }
+    }
+    let per_pos_bytes = self_k
+        .size()
+        .checked_div(ctx.init_len)
+        .filter(|&bytes| bytes != 0 && bytes.checked_mul(ctx.init_len) == Some(self_k.size()))
+        .ok_or_else(|| decode_err("self cache is not position-aligned"))?;
+    if per_pos_bytes % std::mem::size_of::<f32>() != 0 {
+        return Err(decode_err("self cache position is not float32-aligned"));
+    }
+    let cross_positions = cross_k
+        .size()
+        .checked_div(per_pos_bytes)
+        .filter(|&positions| positions != 0 && positions.checked_mul(per_pos_bytes) == Some(cross_k.size()))
+        .ok_or_else(|| decode_err("cross cache is not position-aligned"))?;
+    let self_cache_bytes = self_k.size();
+    let cross_cache_bytes = cross_k.size();
+
+    Ok(DecodeSeed {
+        self_k_cache: self_k,
+        self_v_cache: self_v,
+        cross_k,
+        cross_v,
+        per_pos_bytes,
+        self_cache_bytes,
+        cross_cache_bytes,
+        self_positions: ctx.init_len,
+        cross_positions,
+        ctx,
+    })
 }
 
 pub(crate) fn strategy_width(strategy: DecodeStrategy) -> usize {
@@ -655,15 +737,20 @@ fn seed_attempt_rows(
     seed: &DecodeSeed,
     n_text_ctx: usize,
 ) -> Result<()> {
-    let ctx = &seed.ctx;
-    let per_pos = ctx.per_pos_floats();
-    let self_stride = n_text_ctx.checked_mul(per_pos).ok_or_else(|| decode_err("self cache stride overflow"))?;
-    let cross_stride = N_AUDIO_CTX.checked_mul(per_pos).ok_or_else(|| decode_err("cross cache stride overflow"))?;
+    if seed.self_positions > n_text_ctx
+        || seed.self_positions.checked_mul(seed.per_pos_bytes) != Some(seed.self_cache_bytes)
+        || seed.cross_positions.checked_mul(seed.per_pos_bytes) != Some(seed.cross_cache_bytes)
+    {
+        return Err(decode_err("decode seed cache geometry mismatch"));
+    }
+    let self_stride =
+        n_text_ctx.checked_mul(seed.per_pos_bytes).ok_or_else(|| decode_err("self cache stride overflow"))?;
+    let cross_stride = seed.cross_cache_bytes;
     for &row in rows {
-        copyin_cache_row(jit.self_k_cache_mut().context(JitSnafu)?, row, self_stride, &ctx.self_k_cache)?;
-        copyin_cache_row(jit.self_v_cache_mut().context(JitSnafu)?, row, self_stride, &ctx.self_v_cache)?;
-        copyin_cache_row(jit.cross_k_mut().context(JitSnafu)?, row, cross_stride, &ctx.cross_k)?;
-        copyin_cache_row(jit.cross_v_mut().context(JitSnafu)?, row, cross_stride, &ctx.cross_v)?;
+        copy_device_cache_row(jit.self_k_cache_mut().context(JitSnafu)?, row, self_stride, &seed.self_k_cache)?;
+        copy_device_cache_row(jit.self_v_cache_mut().context(JitSnafu)?, row, self_stride, &seed.self_v_cache)?;
+        copy_device_cache_row(jit.cross_k_mut().context(JitSnafu)?, row, cross_stride, &seed.cross_k)?;
+        copy_device_cache_row(jit.cross_v_mut().context(JitSnafu)?, row, cross_stride, &seed.cross_v)?;
     }
     Ok(())
 }
@@ -838,8 +925,9 @@ pub(crate) fn run_fixed_slot_decode(
                 if attempt.is_done(sample_len, tokenizer.eot()) {
                     continue;
                 }
-                let seed = &seeds[request].ctx;
-                let per_pos_bytes = seed.per_pos_bytes();
+                let decode_seed = &seeds[request];
+                let seed = &decode_seed.ctx;
+                let per_pos_bytes = decode_seed.per_pos_bytes;
                 let row_stride_bytes = n_text_ctx
                     .checked_mul(per_pos_bytes)
                     .ok_or_else(|| decode_err("self cache row stride overflow"))?;
@@ -1007,23 +1095,20 @@ fn write_self_mask_row(jit: &mut WhisperDecoderStepJit, row: usize, pos: usize, 
     Ok(())
 }
 
-/// Copy a full cache buffer (self or cross) into one row of a device-local
-/// batched JIT input via the copy engine. `row_stride_floats` is the buffer's
-/// per-row capacity (N_TEXT_CTX or N_AUDIO_CTX positions × per_pos_floats);
-/// `data` may be shorter (e.g. only `init_len` positions populated for the self
-/// cache after prefill). Used for one-time seeding; the cache then grows
-/// on-device via SDMA append.
-fn copyin_cache_row(buf: &mut svod_device::Buffer, row: usize, row_stride_floats: usize, data: &[f32]) -> Result<()> {
-    let row_bytes = row_stride_floats
-        .checked_mul(std::mem::size_of::<f32>())
-        .ok_or_else(|| decode_err("cache row stride overflow"))?;
-    let off = row.checked_mul(row_bytes).ok_or_else(|| decode_err("cache row offset overflow"))?;
-    let bytes: &[u8] = bytemuck::cast_slice(data);
-    let end = off.checked_add(bytes.len()).ok_or_else(|| decode_err("cache seed end overflow"))?;
-    if end > buf.size() || bytes.len() > row_bytes {
+/// Seed one physical cache row from an immutable device-local snapshot.
+fn copy_device_cache_row(buf: &mut Buffer, row: usize, row_stride_bytes: usize, data: &Buffer) -> Result<()> {
+    if buf.dtype() != DType::Float32 || data.dtype() != DType::Float32 {
+        return Err(decode_err("cache seed buffers must be float32"));
+    }
+    if !std::ptr::eq(buf.allocator(), data.allocator()) {
+        return Err(decode_err("cache seed and decoder row use different allocators"));
+    }
+    let off = row.checked_mul(row_stride_bytes).ok_or_else(|| decode_err("cache row offset overflow"))?;
+    let end = off.checked_add(data.size()).ok_or_else(|| decode_err("cache seed end overflow"))?;
+    if end > buf.size() || data.size() > row_stride_bytes {
         return Err(decode_err("cache seed row is out of bounds"));
     }
-    buf.copyin_at(off, bytes).context(DeviceSnafu)
+    buf.copy_region_from(off, data, 0, data.size()).context(DeviceSnafu)
 }
 
 /// Read one lane's logits row `[n_vocab]` from the batched JIT output.
@@ -1528,6 +1613,38 @@ fn init_decode(
     pos_embedding: &[f32],
     n_state: usize,
 ) -> Result<DecodeCtx> {
+    let mut ctx = execute_prefill(prefill_jit, tokenizer, options, n_vocab, pos_embedding, n_state)?;
+
+    // Serial debug/oracle decoders retain host caches for their existing cache
+    // upload and host-remapping paths.
+    let read_output = |jit: &WhisperPrefillJit,
+                       accessor: fn(&WhisperPrefillJit) -> crate::jit::Result<&Buffer>|
+     -> Result<Vec<f32>> {
+        let buf = accessor(jit).context(JitSnafu)?;
+        read_buf(buf, buf.size() / std::mem::size_of::<f32>())
+    };
+    ctx.self_k_cache = read_output(prefill_jit, WhisperPrefillJit::self_k)?;
+    ctx.self_v_cache = read_output(prefill_jit, WhisperPrefillJit::self_v)?;
+    ctx.cross_k = {
+        let buf = prefill_jit.prepared_cross_k_mut().context(JitSnafu)?;
+        read_buf(buf, buf.size() / std::mem::size_of::<f32>())?
+    };
+    ctx.cross_v = {
+        let buf = prefill_jit.prepared_cross_v_mut().context(JitSnafu)?;
+        read_buf(buf, buf.size() / std::mem::size_of::<f32>())?
+    };
+    let _ = n_text_ctx;
+    Ok(ctx)
+}
+
+fn execute_prefill(
+    prefill_jit: &mut WhisperPrefillJit,
+    tokenizer: &WhisperTokenizer,
+    options: &DecodeOptions,
+    n_vocab: usize,
+    pos_embedding: &[f32],
+    n_state: usize,
+) -> Result<DecodeCtx> {
     // Build initial tokens
     let mut initial_tokens = vec![tokenizer.sot()];
     if tokenizer.multilingual {
@@ -1563,32 +1680,6 @@ fn init_decode(
         .map(|ns| softmax_prob(&prefill_logits[..n_vocab.min(prefill_logits.len())], ns as usize))
         .unwrap_or(f32::NAN);
 
-    // Read packed K/V from outputs 1-4 via copyout (synchronizes device)
-    let read_output = |jit: &WhisperPrefillJit,
-                       accessor: fn(&WhisperPrefillJit) -> crate::jit::Result<&svod_device::Buffer>|
-     -> Result<Vec<f32>> {
-        let buf = accessor(jit).context(JitSnafu)?;
-        read_buf(buf, buf.size() / std::mem::size_of::<f32>())
-    };
-
-    // Infer 4D shape from total element count: [1, seq, n_layer*H, Dh]
-    // seq = init_len for self, 1500 for cross. d_head = n_state / n_head.
-    // total = seq * n_layer * n_head * d_head. So layer_heads_dh = total / seq.
-    let self_k_cache = read_output(prefill_jit, WhisperPrefillJit::self_k)?;
-    let self_v_cache = read_output(prefill_jit, WhisperPrefillJit::self_v)?;
-    // Cross K/V were projected once before fallback decoding and remain in
-    // prefill's device-local inputs. Read them only to seed the step graph.
-    let cross_k = {
-        let buf = prefill_jit.prepared_cross_k_mut().context(JitSnafu)?;
-        read_buf(buf, buf.size() / std::mem::size_of::<f32>())?
-    };
-    let cross_v = {
-        let buf = prefill_jit.prepared_cross_v_mut().context(JitSnafu)?;
-        read_buf(buf, buf.size() / std::mem::size_of::<f32>())?
-    };
-
-    let _ = n_text_ctx;
-
     Ok(DecodeCtx {
         initial_tokens,
         sample_begin,
@@ -1598,10 +1689,10 @@ fn init_decode(
         no_speech_prob,
         pos_embedding: pos_embedding.to_vec(),
         n_state,
-        self_k_cache,
-        self_v_cache,
-        cross_k,
-        cross_v,
+        self_k_cache: Vec::new(),
+        self_v_cache: Vec::new(),
+        cross_k: Vec::new(),
+        cross_v: Vec::new(),
         logits_buf: Vec::new(),
         mask_buf: Vec::new(),
     })
@@ -2024,4 +2115,96 @@ fn sample_from_logits(logits: &[f32], temperature: f32) -> u32 {
         }
     }
     (probs.len() - 1) as u32
+}
+
+#[cfg(test)]
+mod scheduler_seed_tests {
+    use super::*;
+    use std::sync::Arc;
+    use svod_device::CpuAllocator;
+
+    fn cache(allocator: Arc<CpuAllocator>, values: &[f32]) -> Buffer {
+        let mut buffer =
+            Buffer::allocate(allocator, DType::Float32, vec![values.len()], BufferSpec::default()).unwrap();
+        buffer.copyin(bytemuck::cast_slice(values)).unwrap();
+        buffer
+    }
+
+    #[test]
+    fn scheduler_seed_owns_device_buffers_and_seeds_multiple_rows() {
+        let allocator = Arc::new(CpuAllocator);
+        let self_values = [1.0f32, 2.0, 3.0, 4.0];
+        let cross_values = [5.0f32, 6.0, 7.0, 8.0, 9.0, 10.0];
+        let self_k_source = cache(allocator.clone(), &self_values);
+        let self_v_source = cache(allocator.clone(), &self_values);
+        let cross_k_source = cache(allocator.clone(), &cross_values);
+        let cross_v_source = cache(allocator.clone(), &cross_values);
+        let ctx = DecodeCtx {
+            initial_tokens: vec![1, 2],
+            sample_begin: 2,
+            init_len: 2,
+            suppress_tokens: Vec::new(),
+            prefill_logits: vec![0.0; 4],
+            no_speech_prob: f32::NAN,
+            pos_embedding: Vec::new(),
+            n_state: 0,
+            self_k_cache: Vec::new(),
+            self_v_cache: Vec::new(),
+            cross_k: Vec::new(),
+            cross_v: Vec::new(),
+            logits_buf: Vec::new(),
+            mask_buf: Vec::new(),
+        };
+
+        let seed = build_decode_seed(
+            ctx,
+            clone_device_cache(&self_k_source).unwrap(),
+            clone_device_cache(&self_v_source).unwrap(),
+            clone_device_cache(&cross_k_source).unwrap(),
+            clone_device_cache(&cross_v_source).unwrap(),
+        )
+        .unwrap();
+
+        assert!(seed.ctx.self_k_cache.is_empty());
+        assert!(seed.ctx.self_v_cache.is_empty());
+        assert!(seed.ctx.cross_k.is_empty());
+        assert!(seed.ctx.cross_v.is_empty());
+        assert_eq!(seed.per_pos_bytes, 2 * std::mem::size_of::<f32>());
+        assert_eq!(seed.self_cache_bytes, std::mem::size_of_val(&self_values));
+        assert_eq!(seed.cross_cache_bytes, std::mem::size_of_val(&cross_values));
+        assert_eq!((seed.self_positions, seed.cross_positions), (2, 3));
+        assert_ne!(seed.self_k_cache.storage_id(), self_k_source.storage_id());
+        assert_ne!(seed.self_v_cache.storage_id(), self_v_source.storage_id());
+        assert_ne!(seed.cross_k.storage_id(), cross_k_source.storage_id());
+        assert_ne!(seed.cross_v.storage_id(), cross_v_source.storage_id());
+
+        let self_stride = 4 * seed.per_pos_bytes;
+        let mut self_rows = Buffer::allocate(
+            allocator.clone(),
+            DType::Float32,
+            vec![2 * self_stride / std::mem::size_of::<f32>()],
+            BufferSpec::default(),
+        )
+        .unwrap();
+        copy_device_cache_row(&mut self_rows, 0, self_stride, &seed.self_k_cache).unwrap();
+        copy_device_cache_row(&mut self_rows, 1, self_stride, &seed.self_k_cache).unwrap();
+        let self_bytes = self_rows.as_host_bytes().unwrap();
+        let expected_self: &[u8] = bytemuck::cast_slice(&self_values);
+        assert_eq!(&self_bytes[..expected_self.len()], expected_self);
+        assert_eq!(&self_bytes[self_stride..self_stride + expected_self.len()], expected_self);
+
+        let mut cross_rows = Buffer::allocate(
+            allocator,
+            DType::Float32,
+            vec![2 * seed.cross_cache_bytes / std::mem::size_of::<f32>()],
+            BufferSpec::default(),
+        )
+        .unwrap();
+        copy_device_cache_row(&mut cross_rows, 0, seed.cross_cache_bytes, &seed.cross_k).unwrap();
+        copy_device_cache_row(&mut cross_rows, 1, seed.cross_cache_bytes, &seed.cross_k).unwrap();
+        let cross_bytes = cross_rows.as_host_bytes().unwrap();
+        let expected_cross: &[u8] = bytemuck::cast_slice(&cross_values);
+        assert_eq!(&cross_bytes[..expected_cross.len()], expected_cross);
+        assert_eq!(&cross_bytes[seed.cross_cache_bytes..], expected_cross);
+    }
 }

@@ -451,8 +451,8 @@ impl WhisperRecognizer {
             let mut decode_options = Vec::with_capacity(b);
 
             // Cross projection and token prefill remain per-window. Their
-            // immutable host seeds are retained until the shared scheduler
-            // accepts a primary or fallback attempt.
+            // immutable device-local seeds are retained until the shared
+            // scheduler accepts a primary or fallback attempt.
             for bi in 0..b {
                 let base = bi * item_stride;
 
