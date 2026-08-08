@@ -1,5 +1,4 @@
-//! KV-cached Whisper decoder: greedy, beam search, temperature fallback,
-//! and language detection — matching `whisper.decoding`.
+//! Scheduled Whisper decoding, temperature fallback, and language detection.
 
 use super::error::{DeviceSnafu, Error, JitSnafu, Result};
 use super::jit::{WhisperDecoderJit, WhisperDecoderStepJit, WhisperPrefillJit};
@@ -198,6 +197,7 @@ fn valid_temperature(temperature: f32) -> bool {
     temperature.is_finite() && temperature > 0.0
 }
 
+#[cfg(test)]
 pub(crate) fn remaining_sample_steps(sample_len: usize) -> usize {
     sample_len.saturating_sub(1)
 }
@@ -237,89 +237,6 @@ impl DecodeResult {
     }
 }
 
-// ─── Decode with temperature fallback (cached) ──────────────────────────────
-
-#[allow(clippy::too_many_arguments)]
-pub fn decode_with_fallback_cached(
-    prefill_jit: &mut WhisperPrefillJit,
-    step_jits: &mut rustc_hash::FxHashMap<usize, WhisperDecoderStepJit>,
-    decoder_jit: &mut WhisperDecoderJit,
-    n_text_ctx: usize,
-    n_vocab: usize,
-    tokenizer: &WhisperTokenizer,
-    options: &DecodeOptions,
-    pos_embedding: &[f32],
-    n_state: usize,
-) -> Result<DecodeResult> {
-    options.validate().map_err(decode_err)?;
-    let resolved_lang = resolve_language(options, decoder_jit, n_text_ctx, n_vocab, tokenizer)?;
-
-    let mut strategies = vec![options.strategy];
-    if let Some(fallback) = &options.fallback {
-        strategies
-            .extend(fallback.sampling_temperatures.iter().map(|&temperature| DecodeStrategy::Sample { temperature }));
-    }
-    let mut best: Option<DecodeResult> = None;
-    let mut rng = sampling_rng(options, 0);
-
-    for (attempt, &strategy) in strategies.iter().enumerate() {
-        let mut opts = options.clone();
-        opts.strategy = strategy;
-        opts.fallback = None;
-        opts.language = resolved_lang.clone();
-
-        let result = match strategy {
-            DecodeStrategy::Beam { size } => beam_decode_cached(
-                prefill_jit,
-                step_jits.get_mut(&size).ok_or_else(|| decode_err("beam JIT missing"))?,
-                n_text_ctx,
-                n_vocab,
-                tokenizer,
-                &opts,
-                size,
-                pos_embedding,
-                n_state,
-            )?,
-            DecodeStrategy::Greedy | DecodeStrategy::Sample { .. } => greedy_decode_cached_with_rng(
-                prefill_jit,
-                step_jits.get_mut(&1).ok_or_else(|| decode_err("greedy JIT missing"))?,
-                n_text_ctx,
-                n_vocab,
-                tokenizer,
-                &opts,
-                pos_embedding,
-                n_state,
-                &mut rng,
-            )?,
-        };
-
-        let needs_fallback = attempt < strategies.len() - 1
-            && options.fallback.as_ref().is_some_and(|fallback| check_fallback(&result, fallback, options));
-        best = Some(result);
-        if !needs_fallback {
-            break;
-        }
-    }
-    best.ok_or_else(|| decode_err("no result"))
-}
-
-fn resolve_language(
-    options: &DecodeOptions,
-    decoder_jit: &mut WhisperDecoderJit,
-    n_text_ctx: usize,
-    n_vocab: usize,
-    tokenizer: &WhisperTokenizer,
-) -> Result<Option<String>> {
-    if !tokenizer.multilingual {
-        return Ok(Some("en".to_string()));
-    }
-    if options.language.is_some() {
-        return Ok(options.language.clone());
-    }
-    let detection = detect_language(decoder_jit, n_text_ctx, n_vocab, tokenizer)?;
-    Ok(Some(detection.language))
-}
-
 pub(crate) fn check_fallback(result: &DecodeResult, fallback: &FallbackPolicy, options: &DecodeOptions) -> bool {
     let repetitive = fallback.compression_ratio_threshold.is_some_and(|threshold| result.compression_ratio > threshold);
     let low_confidence = fallback.logprob_threshold.is_some_and(|threshold| result.avg_logprob < threshold);
@@ -328,128 +245,13 @@ pub(crate) fn check_fallback(result: &DecodeResult, fallback: &FallbackPolicy, o
     (repetitive || low_confidence) && !silence
 }
 
-// ─── Cached greedy decode ───────────────────────────────────────────────────
-
-#[allow(clippy::too_many_arguments)]
-pub fn greedy_decode_cached(
-    prefill_jit: &mut WhisperPrefillJit,
-    step_jit: &mut WhisperDecoderStepJit,
-    n_text_ctx: usize,
-    n_vocab: usize,
-    tokenizer: &WhisperTokenizer,
-    options: &DecodeOptions,
-    pos_embedding: &[f32],
-    n_state: usize,
-) -> Result<DecodeResult> {
-    let mut rng = sampling_rng(options, 0);
-    greedy_decode_cached_with_rng(
-        prefill_jit,
-        step_jit,
-        n_text_ctx,
-        n_vocab,
-        tokenizer,
-        options,
-        pos_embedding,
-        n_state,
-        &mut rng,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn greedy_decode_cached_with_rng(
-    prefill_jit: &mut WhisperPrefillJit,
-    step_jit: &mut WhisperDecoderStepJit,
-    n_text_ctx: usize,
-    n_vocab: usize,
-    tokenizer: &WhisperTokenizer,
-    options: &DecodeOptions,
-    pos_embedding: &[f32],
-    n_state: usize,
-    rng: &mut StdRng,
-) -> Result<DecodeResult> {
-    let mut ctx = init_decode(prefill_jit, tokenizer, options, n_text_ctx, n_vocab, pos_embedding, n_state)?;
-    ctx.write_caches_greedy(step_jit)?;
-
-    // First token from prefill logits
-    let last_logits = &ctx.prefill_logits[(ctx.init_len - 1) * n_vocab..ctx.init_len * n_vocab];
-    let mut filtered = last_logits.to_vec();
-    apply_logit_filters(
-        &mut filtered,
-        tokenizer,
-        options,
-        &ctx.initial_tokens,
-        ctx.sample_begin,
-        0,
-        &ctx.suppress_tokens,
-    );
-    let mut next_token = pick_token_with_rng(&filtered, options.strategy.temperature(), rng);
-    let mut sum_logprob = log_softmax(&filtered, next_token as usize);
-    let no_speech_prob = ctx.no_speech_prob;
-
-    let sample_len = options.sample_len.unwrap_or(n_text_ctx / 2);
-    if sample_len == 0 {
-        return finish_decode(&[], &[], tokenizer, 0.0, no_speech_prob, options);
-    }
-
-    let mut tokens = Vec::new();
-    let mut token_probs = Vec::new();
-    if next_token != tokenizer.eot() {
-        tokens.push(next_token);
-        token_probs.push(sum_logprob.exp());
-    }
-
-    // Prefill produced generated token 1, so only the remaining budget needs
-    // decoder-step dispatches.
-    for step in 0..remaining_sample_steps(sample_len) {
-        if next_token == tokenizer.eot() {
-            break;
-        }
-        let pos = ctx.init_len + step;
-
-        write_token_buf(step_jit, &[next_token as i32])?;
-        let off = pos * ctx.n_state;
-        write_f32_input(step_jit.pos_emb_mut().context(JitSnafu)?, &ctx.pos_embedding[off..off + ctx.n_state])?;
-        ctx.write_mask(step_jit, pos, n_text_ctx, 1)?;
-        step_jit.execute().context(JitSnafu)?;
-        ctx.copy_kv(step_jit, pos)?;
-
-        ctx.read_logits_into(step_jit, n_vocab)?;
-        let logits = &ctx.logits_buf;
-        let all_toks: Vec<u32> = ctx.initial_tokens.iter().copied().chain(tokens.iter().copied()).collect();
-        let mut filtered = logits.to_vec();
-        apply_logit_filters(
-            &mut filtered,
-            tokenizer,
-            options,
-            &all_toks,
-            ctx.sample_begin,
-            step + 1,
-            &ctx.suppress_tokens,
-        );
-
-        next_token = pick_token_with_rng(&filtered, options.strategy.temperature(), rng);
-        let token_logprob = log_softmax(&filtered, next_token as usize);
-        sum_logprob += token_logprob;
-
-        if next_token != tokenizer.eot() {
-            tokens.push(next_token);
-            token_probs.push(token_logprob.exp());
-        }
-        if tokens.len() >= sample_len {
-            break;
-        }
-    }
-
-    finish_decode(&tokens, &token_probs, tokenizer, sum_logprob, no_speech_prob, options)
-}
-
 // ─── Fixed-slot mixed-strategy scheduler ────────────────────────────────────
 
 /// Immutable output of token prefill. Fallback attempts reuse this seed rather
 /// than rerunning prefill. Cache snapshots remain device-local and are copied
 /// into a row only when that row changes request ownership.
 pub(crate) struct DecodeSeed {
-    ctx: DecodeCtx,
+    metadata: PrefillMetadata,
     self_k_cache: Buffer,
     self_v_cache: Buffer,
     cross_k: Buffer,
@@ -470,12 +272,12 @@ pub(crate) fn prefill_decode_seed(
     pos_embedding: &[f32],
     n_state: usize,
 ) -> Result<DecodeSeed> {
-    let ctx = execute_prefill(prefill_jit, tokenizer, options, n_vocab, pos_embedding, n_state)?;
+    let metadata = execute_prefill(prefill_jit, tokenizer, options, n_vocab, pos_embedding, n_state)?;
     let self_k = clone_device_cache(prefill_jit.self_k().context(JitSnafu)?)?;
     let self_v = clone_device_cache(prefill_jit.self_v().context(JitSnafu)?)?;
     let cross_k = clone_device_cache(prefill_jit.prepared_cross_k_mut().context(JitSnafu)?)?;
     let cross_v = clone_device_cache(prefill_jit.prepared_cross_v_mut().context(JitSnafu)?)?;
-    let seed = build_decode_seed(ctx, self_k, self_v, cross_k, cross_v)?;
+    let seed = build_decode_seed(metadata, self_k, self_v, cross_k, cross_v)?;
     if seed.self_positions > n_text_ctx {
         return Err(decode_err("prefill self cache exceeds text context"));
     }
@@ -498,13 +300,13 @@ fn clone_device_cache(src: &Buffer) -> Result<Buffer> {
 }
 
 fn build_decode_seed(
-    ctx: DecodeCtx,
+    metadata: PrefillMetadata,
     self_k: Buffer,
     self_v: Buffer,
     cross_k: Buffer,
     cross_v: Buffer,
 ) -> Result<DecodeSeed> {
-    if ctx.init_len == 0 || self_k.size() == 0 || self_k.size() != self_v.size() {
+    if metadata.init_len == 0 || self_k.size() == 0 || self_k.size() != self_v.size() {
         return Err(decode_err("invalid prefill self-cache geometry"));
     }
     if cross_k.size() == 0 || cross_k.size() != cross_v.size() {
@@ -517,8 +319,8 @@ fn build_decode_seed(
     }
     let per_pos_bytes = self_k
         .size()
-        .checked_div(ctx.init_len)
-        .filter(|&bytes| bytes != 0 && bytes.checked_mul(ctx.init_len) == Some(self_k.size()))
+        .checked_div(metadata.init_len)
+        .filter(|&bytes| bytes != 0 && bytes.checked_mul(metadata.init_len) == Some(self_k.size()))
         .ok_or_else(|| decode_err("self cache is not position-aligned"))?;
     if per_pos_bytes % std::mem::size_of::<f32>() != 0 {
         return Err(decode_err("self cache position is not float32-aligned"));
@@ -539,9 +341,9 @@ fn build_decode_seed(
         per_pos_bytes,
         self_cache_bytes,
         cross_cache_bytes,
-        self_positions: ctx.init_len,
+        self_positions: metadata.init_len,
         cross_positions,
-        ctx,
+        metadata,
     })
 }
 
@@ -701,20 +503,20 @@ fn start_attempt(
     n_vocab: usize,
     rng: &mut StdRng,
 ) -> Result<ScheduledAttempt> {
-    let ctx = &seed.ctx;
-    let last = ctx
+    let metadata = &seed.metadata;
+    let last = metadata
         .prefill_logits
-        .get((ctx.init_len - 1) * n_vocab..ctx.init_len * n_vocab)
+        .get((metadata.init_len - 1) * n_vocab..metadata.init_len * n_vocab)
         .ok_or_else(|| decode_err("prefill logits are truncated"))?;
     let mut filtered = last.to_vec();
     apply_logit_filters(
         &mut filtered,
         tokenizer,
         options,
-        &ctx.initial_tokens,
-        ctx.sample_begin,
+        &metadata.initial_tokens,
+        metadata.sample_begin,
         0,
-        &ctx.suppress_tokens,
+        &metadata.suppress_tokens,
     );
     let kind = match strategy {
         DecodeStrategy::Greedy | DecodeStrategy::Sample { .. } => {
@@ -723,7 +525,7 @@ fn start_attempt(
                     strategy_index,
                     strategy,
                     reserved_rows: rows,
-                    pos: ctx.init_len,
+                    pos: metadata.init_len,
                     generated_tokens: 0,
                     kind: AttemptKind::Single(SingleAttempt {
                         next_token: tokenizer.eot(),
@@ -746,7 +548,7 @@ fn start_attempt(
             if options.sample_len == Some(0) {
                 let active = vec![BeamHypothesis {
                     logical_id: 0,
-                    tokens: ctx.initial_tokens.clone(),
+                    tokens: metadata.initial_tokens.clone(),
                     token_probs: Vec::new(),
                     sum_logprob: 0.0,
                 }];
@@ -754,7 +556,7 @@ fn start_attempt(
                     strategy_index,
                     strategy,
                     reserved_rows: rows.clone(),
-                    pos: ctx.init_len,
+                    pos: metadata.init_len,
                     generated_tokens: 0,
                     kind: AttemptKind::Beam(BeamAttempt {
                         active,
@@ -773,7 +575,7 @@ fn start_attempt(
                 if active.len() >= size {
                     break;
                 }
-                let mut tokens = ctx.initial_tokens.clone();
+                let mut tokens = metadata.initial_tokens.clone();
                 tokens.push(token as u32);
                 let hypothesis = BeamHypothesis {
                     logical_id: next_logical_id,
@@ -792,7 +594,14 @@ fn start_attempt(
             AttemptKind::Beam(BeamAttempt { active, rows: active_rows, finished, next_logical_id })
         }
     };
-    Ok(ScheduledAttempt { strategy_index, strategy, reserved_rows: rows, pos: ctx.init_len, generated_tokens: 1, kind })
+    Ok(ScheduledAttempt {
+        strategy_index,
+        strategy,
+        reserved_rows: rows,
+        pos: metadata.init_len,
+        generated_tokens: 1,
+        kind,
+    })
 }
 
 fn seed_attempt_rows(
@@ -868,21 +677,21 @@ fn finish_attempt(
             &single.token_probs,
             tokenizer,
             if options.sample_len == Some(0) { 0.0 } else { single.sum_logprob },
-            seed.ctx.no_speech_prob,
+            seed.metadata.no_speech_prob,
             options,
         ),
         AttemptKind::Beam(beam) => {
             let size = attempt.reserved_rows.len();
             let best =
-                finalize_beam_hypotheses(beam.active, beam.finished, size, tokenizer.eot(), seed.ctx.sample_begin)
+                finalize_beam_hypotheses(beam.active, beam.finished, size, tokenizer.eot(), seed.metadata.sample_begin)
                     .ok_or_else(|| decode_err("beam produced nothing"))?;
-            let tokens: Vec<_> = best.tokens[seed.ctx.sample_begin..]
+            let tokens: Vec<_> = best.tokens[seed.metadata.sample_begin..]
                 .iter()
                 .copied()
                 .take_while(|&token| token != tokenizer.eot())
                 .collect();
             let token_probs = best.token_probs.into_iter().take(tokens.len()).collect::<Vec<_>>();
-            finish_decode(&tokens, &token_probs, tokenizer, best.sum_logprob, seed.ctx.no_speech_prob, options)
+            finish_decode(&tokens, &token_probs, tokenizer, best.sum_logprob, seed.metadata.no_speech_prob, options)
         }
     }
 }
@@ -960,7 +769,7 @@ pub(crate) fn run_fixed_slot_decode(
             if attempt.is_done(sample_len, tokenizer.eot()) {
                 continue;
             }
-            let seed = &seeds[request].ctx;
+            let seed = &seeds[request].metadata;
             match &attempt.kind {
                 AttemptKind::Single(single) => {
                     let row = attempt.reserved_rows[0];
@@ -1014,7 +823,7 @@ pub(crate) fn run_fixed_slot_decode(
                     continue;
                 }
                 let decode_seed = &seeds[request];
-                let seed = &decode_seed.ctx;
+                let seed = &decode_seed.metadata;
                 let per_pos_bytes = decode_seed.per_pos_bytes;
                 let row_stride_bytes = n_text_ctx
                     .checked_mul(per_pos_bytes)
@@ -1369,183 +1178,7 @@ pub(crate) fn finalize_beam_hypotheses(
     finished.into_iter().next()
 }
 
-#[allow(clippy::too_many_arguments)]
-pub fn beam_decode_cached(
-    prefill_jit: &mut WhisperPrefillJit,
-    step_jit: &mut WhisperDecoderStepJit,
-    n_text_ctx: usize,
-    n_vocab: usize,
-    tokenizer: &WhisperTokenizer,
-    options: &DecodeOptions,
-    beam_size: usize,
-    pos_embedding: &[f32],
-    n_state: usize,
-) -> Result<DecodeResult> {
-    let eot = tokenizer.eot();
-    let sample_len = options.sample_len.unwrap_or(n_text_ctx / 2);
-    let n_audio_ctx = 1500; // N_AUDIO_CTX
-    let mut ctx = init_decode(prefill_jit, tokenizer, options, n_text_ctx, n_vocab, pos_embedding, n_state)?;
-    ctx.write_caches_beam(step_jit, beam_size, n_text_ctx, n_audio_ctx)?;
-
-    // Seed beams from prefill logits
-    let last_logits = &ctx.prefill_logits[(ctx.init_len - 1) * n_vocab..ctx.init_len * n_vocab];
-    let mut filtered = last_logits.to_vec();
-    apply_logit_filters(
-        &mut filtered,
-        tokenizer,
-        options,
-        &ctx.initial_tokens,
-        ctx.sample_begin,
-        0,
-        &ctx.suppress_tokens,
-    );
-    let prefill_logprobs = log_softmax_vec(&filtered);
-
-    let mut indexed: Vec<(usize, f32)> = prefill_logprobs.into_iter().enumerate().collect();
-    indexed.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-
-    let mut beams = Vec::new();
-    let mut finished = Vec::new();
-    let mut next_logical_id = 0;
-    if sample_len == 0 {
-        beams.push(BeamHypothesis {
-            logical_id: next_logical_id,
-            tokens: ctx.initial_tokens.clone(),
-            token_probs: Vec::new(),
-            sum_logprob: 0.0,
-        });
-        next_logical_id += 1;
-    }
-    for (tok_id, lp) in &indexed {
-        if sample_len == 0 {
-            break;
-        }
-        if beams.len() >= beam_size {
-            break;
-        }
-        let mut toks = ctx.initial_tokens.clone();
-        toks.push(*tok_id as u32);
-        if *tok_id as u32 == eot {
-            finished.push(BeamHypothesis {
-                logical_id: next_logical_id,
-                tokens: toks,
-                token_probs: vec![lp.exp()],
-                sum_logprob: *lp,
-            });
-        } else {
-            beams.push(BeamHypothesis {
-                logical_id: next_logical_id,
-                tokens: toks,
-                token_probs: vec![lp.exp()],
-                sum_logprob: *lp,
-            });
-        }
-        next_logical_id += 1;
-    }
-
-    let per_beam_floats = ctx.per_beam_floats(n_text_ctx);
-    let sample_begin = ctx.sample_begin;
-
-    for step in 0..remaining_sample_steps(sample_len) {
-        if beams.is_empty() || finished.len() >= beam_size {
-            break;
-        }
-        let pos = ctx.init_len + step;
-
-        ctx.write_beam_inputs(step_jit, &beams, beam_size, pos, n_text_ctx, eot)?;
-        step_jit.execute().context(JitSnafu)?;
-
-        // Device-side K/V copy FIRST (SDMA, synchronized by subsequent logits read)
-        let per_pos_bytes = ctx.per_pos_bytes();
-        let cache_pos = pos * per_pos_bytes;
-        for bi in 0..beam_size {
-            let dst = bi * per_beam_floats * 4 + cache_pos;
-            step_jit.copy_output_to_self_k_cache(1, dst, bi * per_pos_bytes, per_pos_bytes).context(JitSnafu)?;
-            step_jit.copy_output_to_self_v_cache(2, dst, bi * per_pos_bytes, per_pos_bytes).context(JitSnafu)?;
-        }
-
-        let suppress_tokens: Vec<i32> = ctx.suppress_tokens.clone();
-        ctx.read_logits_into(step_jit, n_vocab * beam_size)?;
-        let all_logits = &ctx.logits_buf;
-
-        // Generate + rank candidates
-        let mut candidates = Vec::new();
-        for (bi, beam) in beams.iter().enumerate() {
-            let start = bi * n_vocab;
-            let Some(beam_logits) = all_logits.get(start..start + n_vocab) else {
-                return Err(decode_err("beam logits row is truncated"));
-            };
-            let mut filtered = beam_logits.to_vec();
-            apply_logit_filters(
-                &mut filtered,
-                tokenizer,
-                options,
-                &beam.tokens,
-                sample_begin,
-                step + 1,
-                &suppress_tokens,
-            );
-            let logprobs = log_softmax_vec(&filtered);
-            let mut idx: Vec<(usize, f32)> = logprobs.iter().copied().enumerate().collect();
-            idx.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-            for (tok_id, lp) in idx.into_iter().take(beam_size + 1) {
-                candidates.push(BeamCandidate {
-                    parent_index: bi,
-                    parent_logical_id: beam.logical_id,
-                    parent_row: bi,
-                    token_id: tok_id as u32,
-                    token_logprob: lp,
-                    sum_logprob: beam.sum_logprob + lp,
-                });
-            }
-        }
-
-        let (new_beams, newly_finished, survivors) = select_beam_candidates(
-            &beams,
-            candidates,
-            beam_size,
-            eot,
-            beam_size - finished.len(),
-            &mut next_logical_id,
-        );
-        finished.extend(newly_finished);
-        let parent_map: Vec<usize> = survivors.iter().map(|survivor| survivor.parent_row).collect();
-
-        // Reorder cache by parent_map (host-side, copies ENTIRE cache incl new K/V)
-        if !parent_map.is_empty() {
-            reorder_cache_host(step_jit.self_k_cache_mut().context(JitSnafu)?, &parent_map, per_beam_floats)?;
-            reorder_cache_host(step_jit.self_v_cache_mut().context(JitSnafu)?, &parent_map, per_beam_floats)?;
-        }
-
-        beams = new_beams;
-
-        if beams.iter().all(|b| b.tokens.len() >= n_text_ctx) {
-            break;
-        }
-    }
-
-    let best = finalize_beam_hypotheses(beams, finished, beam_size, eot, ctx.sample_begin)
-        .ok_or_else(|| decode_err("beam produced nothing"))?;
-    let output_tokens: Vec<u32> = best.tokens[ctx.sample_begin..].iter().copied().take_while(|&t| t != eot).collect();
-    let token_probs = best.token_probs.into_iter().take(output_tokens.len()).collect();
-    let text = tokenizer.decode(&output_tokens);
-    let avg_logprob = best.sum_logprob / (output_tokens.len() + 1) as f32;
-    let compression_ratio = compression_ratio_text(&text);
-    Ok(DecodeResult {
-        tokens: output_tokens,
-        token_probs,
-        text,
-        avg_logprob,
-        no_speech_prob: ctx.no_speech_prob,
-        temperature: options.strategy.temperature(),
-        compression_ratio,
-        language: options.language.clone(),
-    })
-}
-
-// ─── Shared decode context ──────────────────────────────────────────────────
-
-struct DecodeCtx {
+struct PrefillMetadata {
     initial_tokens: Vec<u32>,
     sample_begin: usize,
     init_len: usize,
@@ -1554,178 +1187,6 @@ struct DecodeCtx {
     no_speech_prob: f32,
     pos_embedding: Vec<f32>,
     n_state: usize,
-    self_k_cache: Vec<f32>,
-    self_v_cache: Vec<f32>,
-    cross_k: Vec<f32>,
-    cross_v: Vec<f32>,
-    // Reusable scratch buffers (avoid per-step allocation)
-    logits_buf: Vec<f32>,
-    mask_buf: Vec<f32>,
-}
-
-impl DecodeCtx {
-    fn write_caches_greedy(&self, step_jit: &mut WhisperDecoderStepJit) -> Result<()> {
-        copyin_cache_full(step_jit.self_k_cache_mut().context(JitSnafu)?, &self.self_k_cache)?;
-        copyin_cache_full(step_jit.self_v_cache_mut().context(JitSnafu)?, &self.self_v_cache)?;
-        copyin_cache_full(step_jit.cross_k_mut().context(JitSnafu)?, &self.cross_k)?;
-        copyin_cache_full(step_jit.cross_v_mut().context(JitSnafu)?, &self.cross_v)?;
-        Ok(())
-    }
-
-    fn write_caches_beam(
-        &self,
-        step_jit: &mut WhisperDecoderStepJit,
-        beam_size: usize,
-        n_text_ctx: usize,
-        n_audio_ctx: usize,
-    ) -> Result<()> {
-        let layer_heads_dh = self.self_k_cache.len() / self.init_len;
-        let self_stride = n_text_ctx * layer_heads_dh;
-        let cross_stride = n_audio_ctx * layer_heads_dh;
-        copyin_replicated_cache(
-            step_jit.self_k_cache_mut().context(JitSnafu)?,
-            &self.self_k_cache,
-            beam_size,
-            self_stride,
-        )?;
-        copyin_replicated_cache(
-            step_jit.self_v_cache_mut().context(JitSnafu)?,
-            &self.self_v_cache,
-            beam_size,
-            self_stride,
-        )?;
-        copyin_replicated_cache(step_jit.cross_k_mut().context(JitSnafu)?, &self.cross_k, beam_size, cross_stride)?;
-        copyin_replicated_cache(step_jit.cross_v_mut().context(JitSnafu)?, &self.cross_v, beam_size, cross_stride)?;
-        Ok(())
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn write_beam_inputs(
-        &self,
-        step_jit: &mut WhisperDecoderStepJit,
-        beams: &[BeamHypothesis],
-        beam_size: usize,
-        pos: usize,
-        n_text_ctx: usize,
-        eot: u32,
-    ) -> Result<()> {
-        // Tokens
-        let mut tokens = vec![eot as i32; beam_size];
-        for (bi, beam) in beams.iter().enumerate() {
-            tokens[bi] = *beam.tokens.last().unwrap() as i32;
-        }
-        write_token_buf(step_jit, &tokens)?;
-        // Broadcast pos_emb [n_state] to [beam_size, 1, n_state]
-        {
-            let off = pos * self.n_state;
-            let emb = &self.pos_embedding[off..off + self.n_state];
-            let mut packed = vec![0f32; beam_size * self.n_state];
-            for bi in 0..beam_size {
-                packed[bi * self.n_state..(bi + 1) * self.n_state].copy_from_slice(emb);
-            }
-            write_f32_input(step_jit.pos_emb_mut().context(JitSnafu)?, &packed)?;
-        }
-        write_self_mask(step_jit, pos, n_text_ctx, beam_size)
-    }
-
-    fn copy_kv(&self, step_jit: &mut WhisperDecoderStepJit, pos: usize) -> Result<()> {
-        let b = self.per_pos_bytes();
-        step_jit.copy_output_to_self_k_cache(1, pos * b, 0, b).context(JitSnafu)?;
-        step_jit.copy_output_to_self_v_cache(2, pos * b, 0, b).context(JitSnafu)
-    }
-
-    fn per_beam_floats(&self, n_text_ctx: usize) -> usize {
-        n_text_ctx * self.per_pos_floats()
-    }
-
-    fn per_pos_floats(&self) -> usize {
-        self.self_k_cache.len() / self.init_len
-    }
-
-    fn per_pos_bytes(&self) -> usize {
-        self.per_pos_floats() * std::mem::size_of::<f32>()
-    }
-
-    /// Read step logits into the reusable buffer, returns &mut [f32].
-    fn read_logits_into(&mut self, step_jit: &mut WhisperDecoderStepJit, n_vocab: usize) -> Result<()> {
-        let buf = step_jit.logits().context(JitSnafu)?;
-        let src = buf.as_host_bytes().context(DeviceSnafu)?;
-        let available = src.len() / std::mem::size_of::<f32>();
-        let n = n_vocab.min(available);
-        self.logits_buf.clear();
-        self.logits_buf.extend_from_slice(bytemuck::cast_slice(&src[..n * std::mem::size_of::<f32>()]));
-        Ok(())
-    }
-
-    /// Write the causal mask for the current position into the step JIT.
-    /// Uses mask_buf to avoid allocating per step.
-    fn write_mask(
-        &mut self,
-        step_jit: &mut WhisperDecoderStepJit,
-        pos: usize,
-        n_text_ctx: usize,
-        batch: usize,
-    ) -> Result<()> {
-        let needed = (n_text_ctx + 1) * batch;
-        if self.mask_buf.len() < needed {
-            self.mask_buf.resize(needed, f32::NEG_INFINITY);
-        }
-        for bi in 0..batch {
-            let off = bi * (n_text_ctx + 1);
-            // Fill [0..pos) with 0.0, [pos..n_text_ctx) with -inf, [n_text_ctx] with 0.0
-            for i in 0..pos {
-                self.mask_buf[off + i] = 0.0;
-            }
-            for i in pos..n_text_ctx {
-                self.mask_buf[off + i] = f32::NEG_INFINITY;
-            }
-            self.mask_buf[off + n_text_ctx] = 0.0;
-        }
-        let buf = step_jit.self_mask_mut().context(JitSnafu)?;
-        let dst = buf.as_host_bytes_mut().context(DeviceSnafu)?;
-        let src_bytes: &[u8] = bytemuck::cast_slice(&self.mask_buf[..needed]);
-        dst[..src_bytes.len()].copy_from_slice(src_bytes);
-        Ok(())
-    }
-}
-
-fn write_token_buf(step_jit: &mut WhisperDecoderStepJit, tokens: &[i32]) -> Result<()> {
-    let buf = step_jit.token_mut().context(JitSnafu)?;
-    write_buf(buf, bytemuck::cast_slice(tokens))?;
-    Ok(())
-}
-
-fn init_decode(
-    prefill_jit: &mut WhisperPrefillJit,
-    tokenizer: &WhisperTokenizer,
-    options: &DecodeOptions,
-    n_text_ctx: usize,
-    n_vocab: usize,
-    pos_embedding: &[f32],
-    n_state: usize,
-) -> Result<DecodeCtx> {
-    let mut ctx = execute_prefill(prefill_jit, tokenizer, options, n_vocab, pos_embedding, n_state)?;
-
-    // Serial debug/oracle decoders retain host caches for their existing cache
-    // upload and host-remapping paths.
-    let read_output = |jit: &WhisperPrefillJit,
-                       accessor: fn(&WhisperPrefillJit) -> crate::jit::Result<&Buffer>|
-     -> Result<Vec<f32>> {
-        let buf = accessor(jit).context(JitSnafu)?;
-        read_buf(buf, buf.size() / std::mem::size_of::<f32>())
-    };
-    ctx.self_k_cache = read_output(prefill_jit, WhisperPrefillJit::self_k)?;
-    ctx.self_v_cache = read_output(prefill_jit, WhisperPrefillJit::self_v)?;
-    ctx.cross_k = {
-        let buf = prefill_jit.prepared_cross_k_mut().context(JitSnafu)?;
-        read_buf(buf, buf.size() / std::mem::size_of::<f32>())?
-    };
-    ctx.cross_v = {
-        let buf = prefill_jit.prepared_cross_v_mut().context(JitSnafu)?;
-        read_buf(buf, buf.size() / std::mem::size_of::<f32>())?
-    };
-    let _ = n_text_ctx;
-    Ok(ctx)
 }
 
 fn execute_prefill(
@@ -1735,7 +1196,7 @@ fn execute_prefill(
     n_vocab: usize,
     pos_embedding: &[f32],
     n_state: usize,
-) -> Result<DecodeCtx> {
+) -> Result<PrefillMetadata> {
     // Build initial tokens
     let mut initial_tokens = vec![tokenizer.sot()];
     if tokenizer.multilingual {
@@ -1771,7 +1232,7 @@ fn execute_prefill(
         .map(|ns| softmax_prob(&prefill_logits[..n_vocab.min(prefill_logits.len())], ns as usize))
         .unwrap_or(f32::NAN);
 
-    Ok(DecodeCtx {
+    Ok(PrefillMetadata {
         initial_tokens,
         sample_begin,
         init_len,
@@ -1780,12 +1241,6 @@ fn execute_prefill(
         no_speech_prob,
         pos_embedding: pos_embedding.to_vec(),
         n_state,
-        self_k_cache: Vec::new(),
-        self_v_cache: Vec::new(),
-        cross_k: Vec::new(),
-        cross_v: Vec::new(),
-        logits_buf: Vec::new(),
-        mask_buf: Vec::new(),
     })
 }
 
@@ -1945,18 +1400,6 @@ fn read_uncached(jit: &WhisperDecoderJit) -> Result<Vec<f32>> {
     read_buf(buf, buf.size() / std::mem::size_of::<f32>())
 }
 
-fn write_self_mask(step_jit: &mut WhisperDecoderStepJit, pos: usize, n_text_ctx: usize, batch: usize) -> Result<()> {
-    let mut mask = vec![f32::NEG_INFINITY; (n_text_ctx + 1) * batch];
-    for bi in 0..batch {
-        let off = bi * (n_text_ctx + 1);
-        mask[off..off + pos].fill(0.0);
-        mask[off + n_text_ctx] = 0.0;
-    }
-    let buf = step_jit.self_mask_mut().context(JitSnafu)?;
-    write_buf(buf, bytemuck::cast_slice(&mask))?;
-    Ok(())
-}
-
 /// Write data directly into the buffer's host-visible mapping.
 /// `as_host_bytes_mut` syncs pending GPU work before returning the slice.
 /// Subsequent `execute()` sees our writes (unified memory / BAR).
@@ -1973,51 +1416,6 @@ fn read_buf(buf: &svod_device::Buffer, n: usize) -> Result<Vec<f32>> {
     let src = buf.as_host_bytes().context(DeviceSnafu)?;
     let n = n.min(src.len() / std::mem::size_of::<f32>());
     Ok(bytemuck::cast_slice(&src[..n * std::mem::size_of::<f32>()]).to_vec())
-}
-
-fn write_f32_input(buf: &mut svod_device::Buffer, data: &[f32]) -> Result<()> {
-    write_buf(buf, bytemuck::cast_slice(data))
-}
-
-/// Copy a host `&[f32]` into a device-local cache buffer via the copy engine.
-/// The cache buffers are device-local (no host mapping); the greedy path writes
-/// from byte 0 (single-row buffer, data may be shorter than the full allocation).
-fn copyin_cache_full(buf: &mut svod_device::Buffer, data: &[f32]) -> Result<()> {
-    let bytes: &[u8] = bytemuck::cast_slice(data);
-    buf.copyin_at(0, bytes).context(DeviceSnafu)
-}
-
-fn copyin_replicated_cache(
-    buf: &mut svod_device::Buffer,
-    single_data: &[f32],
-    beam_size: usize,
-    per_beam_floats: usize,
-) -> Result<()> {
-    let n = single_data.len().min(per_beam_floats);
-    let total = per_beam_floats * beam_size;
-    let mut packed = vec![0f32; total];
-    for bi in 0..beam_size {
-        packed[bi * per_beam_floats..bi * per_beam_floats + n].copy_from_slice(&single_data[..n]);
-    }
-    buf.copyin_at(0, bytemuck::cast_slice(&packed)).context(DeviceSnafu)
-}
-
-fn reorder_cache_host(buf: &mut svod_device::Buffer, parent_map: &[usize], per_beam_floats: usize) -> Result<()> {
-    let total = per_beam_floats * parent_map.len();
-    // Device-local cache: read out via copyout_prefix, reorder on host, write
-    // back via copyin_at. This is the beam-reorder path (runs once per step
-    // when beams survive/drop), not the per-step hot loop.
-    let mut staging = vec![0u8; total * std::mem::size_of::<f32>()];
-    buf.copyout_prefix(&mut staging).context(DeviceSnafu)?;
-    let current: &[f32] = bytemuck::cast_slice(&staging);
-
-    let mut reordered = vec![0f32; total];
-    for (new_idx, &parent_idx) in parent_map.iter().enumerate() {
-        let (src, dst) = (parent_idx * per_beam_floats, new_idx * per_beam_floats);
-        reordered[dst..dst + per_beam_floats].copy_from_slice(&current[src..src + per_beam_floats]);
-    }
-
-    buf.copyin_at(0, bytemuck::cast_slice(&reordered)).context(DeviceSnafu)
 }
 
 // ─── Logit filter helpers ───────────────────────────────────────────────────
@@ -2245,7 +1643,7 @@ mod scheduler_seed_tests {
         let self_v_source = cache(allocator.clone(), &self_values);
         let cross_k_source = cache(allocator.clone(), &cross_values);
         let cross_v_source = cache(allocator.clone(), &cross_values);
-        let ctx = DecodeCtx {
+        let metadata = PrefillMetadata {
             initial_tokens: vec![1, 2],
             sample_begin: 2,
             init_len: 2,
@@ -2254,16 +1652,10 @@ mod scheduler_seed_tests {
             no_speech_prob: f32::NAN,
             pos_embedding: Vec::new(),
             n_state: 0,
-            self_k_cache: Vec::new(),
-            self_v_cache: Vec::new(),
-            cross_k: Vec::new(),
-            cross_v: Vec::new(),
-            logits_buf: Vec::new(),
-            mask_buf: Vec::new(),
         };
 
         let seed = build_decode_seed(
-            ctx,
+            metadata,
             clone_device_cache(&self_k_source).unwrap(),
             clone_device_cache(&self_v_source).unwrap(),
             clone_device_cache(&cross_k_source).unwrap(),
@@ -2271,10 +1663,7 @@ mod scheduler_seed_tests {
         )
         .unwrap();
 
-        assert!(seed.ctx.self_k_cache.is_empty());
-        assert!(seed.ctx.self_v_cache.is_empty());
-        assert!(seed.ctx.cross_k.is_empty());
-        assert!(seed.ctx.cross_v.is_empty());
+        assert_eq!(seed.metadata.initial_tokens, [1, 2]);
         assert_eq!(seed.per_pos_bytes, 2 * std::mem::size_of::<f32>());
         assert_eq!(seed.self_cache_bytes, std::mem::size_of_val(&self_values));
         assert_eq!(seed.cross_cache_bytes, std::mem::size_of_val(&cross_values));
