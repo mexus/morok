@@ -19,13 +19,15 @@ pub struct WhisperAligner {
     jit: WhisperAlignmentJit,
     n_heads: usize,
     batch_size: usize,
-    audio_stride: usize,
+    cache_stride: usize,
 }
 
 /// Inputs for one lane of a prepared alignment batch.
 pub struct WhisperAlignmentInput<'a> {
-    /// Device-resident encoder output in `[N_AUDIO_CTX, n_audio_state]` layout.
-    pub audio_features: &'a svod_device::Buffer,
+    /// Device-resident packed cross-attention K cache for one recognition window.
+    pub cross_k: &'a svod_device::Buffer,
+    /// Device-resident packed cross-attention V cache for one recognition window.
+    pub cross_v: &'a svod_device::Buffer,
     /// Recognition tokens, including timestamp tokens when emitted.
     pub decoded_tokens: &'a [u32],
     /// Decoder probability corresponding to each decoded token.
@@ -45,11 +47,13 @@ impl WhisperAligner {
         }
         let heads = size.alignment_heads().to_vec();
         let n_state = model.dims.n_text_state;
+        let n_layer_heads = model.dims.n_text_layer * model.dims.n_text_head;
+        let d_head = n_state / model.dims.n_text_head;
         let alignment_model = WhisperAlignmentModel::new(model, heads.clone());
         let mut jit = WhisperAlignmentJit::new(alignment_model);
-        jit.prepare(InputSpec::f32(&[batch_size, N_AUDIO_CTX, n_state]), InputSpec::i32(&[batch_size, N_TEXT_CTX]))
-            .context(JitSnafu)?;
-        Ok(Self { jit, n_heads: heads.len(), batch_size, audio_stride: N_AUDIO_CTX * n_state })
+        let cache_spec = InputSpec::f32(&[batch_size, N_AUDIO_CTX, n_layer_heads, d_head]).device_local();
+        jit.prepare(cache_spec.clone(), cache_spec, InputSpec::i32(&[batch_size, N_TEXT_CTX])).context(JitSnafu)?;
+        Ok(Self { jit, n_heads: heads.len(), batch_size, cache_stride: N_AUDIO_CTX * n_layer_heads * d_head })
     }
 
     /// Align up to the concrete batch capacity prepared at construction.
@@ -67,21 +71,34 @@ impl WhisperAligner {
             return Ok(Vec::new());
         }
 
-        let audio_stride = self.audio_stride;
-        let audio_bytes = audio_stride * std::mem::size_of::<f32>();
+        let cache_bytes = self.cache_stride * std::mem::size_of::<f32>();
         {
-            let packed_audio = self.jit.audio_features_mut().context(JitSnafu)?;
+            let packed_k = self.jit.cross_k_mut().context(JitSnafu)?;
             for (lane, input) in inputs.iter().enumerate() {
-                if input.audio_features.dtype() != svod_dtype::DType::Float32
-                    || input.audio_features.size() != audio_bytes
+                if input.cross_k.dtype() != svod_dtype::DType::Float32
+                    || input.cross_k.size() != cache_bytes
+                    || !std::ptr::eq(packed_k.allocator(), input.cross_k.allocator())
                 {
                     return Err(super::error::Error::Decode {
-                        msg: "alignment encoder features have invalid dtype or size".to_string(),
+                        msg: "alignment cross K has invalid dtype, size, or allocator".to_string(),
                     });
                 }
-                packed_audio
-                    .copy_region_from(lane * audio_bytes, input.audio_features, 0, audio_bytes)
-                    .context(DeviceSnafu)?;
+                packed_k.copy_region_from(lane * cache_bytes, input.cross_k, 0, cache_bytes).context(DeviceSnafu)?;
+            }
+        }
+        {
+            let packed_v = self.jit.cross_v_mut().context(JitSnafu)?;
+            for (lane, input) in inputs.iter().enumerate() {
+                if input.cross_v.dtype() != svod_dtype::DType::Float32
+                    || input.cross_v.size() != cache_bytes
+                    || !std::ptr::eq(packed_v.allocator(), input.cross_v.allocator())
+                    || !std::ptr::eq(input.cross_k.allocator(), input.cross_v.allocator())
+                {
+                    return Err(super::error::Error::Decode {
+                        msg: "alignment cross V has invalid dtype, size, or allocator".to_string(),
+                    });
+                }
+                packed_v.copy_region_from(lane * cache_bytes, input.cross_v, 0, cache_bytes).context(DeviceSnafu)?;
             }
         }
 

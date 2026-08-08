@@ -1,13 +1,14 @@
 //! Forward shape + state-dict round-trip tests for Whisper model.
 
 use svod_dtype::DType;
+use svod_ir::ConstValue;
 use svod_tensor::Tensor;
 
 use crate::jit::InputSpec;
 use crate::state::HasStateDict;
 use crate::whisper::{
-    DecodeOptions, DecodeResult, DecodeStrategy, FallbackPolicy, ModelDimensions, Whisper, WhisperCrossKvJit,
-    WhisperDecoderJit, WhisperPlan, WhisperPrefillJit, WhisperSize,
+    DecodeOptions, DecodeResult, DecodeStrategy, FallbackPolicy, ModelDimensions, Whisper, WhisperAlignmentJit,
+    WhisperAlignmentModel, WhisperCrossKvJit, WhisperDecoderJit, WhisperPlan, WhisperPrefillJit, WhisperSize,
 };
 
 fn make_dims() -> ModelDimensions {
@@ -168,12 +169,122 @@ fn alignment_forward_exports_only_selected_heads() {
         .unwrap();
     let heads = &[(2, 2), (3, 0)];
 
-    let qk = model.align(&tokens, &features, heads).unwrap();
+    let (cross_k, cross_v) = model.project_cross_kv(&features).unwrap();
+    let qk = model.align_with_cross_kv(&tokens, &cross_k, &cross_v, heads).unwrap();
     let shape = qk.shape().unwrap();
     assert_eq!(shape[0].as_const(), Some(2));
     assert_eq!(shape[1].as_const(), Some(heads.len()));
     assert_eq!(shape[2].as_const(), Some(4));
     assert_eq!(shape[3].as_const(), Some(8));
+}
+
+fn eager_audio_feature_alignment_reference(
+    model: &Whisper,
+    tokens: &Tensor,
+    features: &Tensor,
+    alignment_heads: &[(usize, usize)],
+) -> Tensor {
+    let seq_len = tokens.shape().unwrap()[1].as_const().unwrap();
+    let tok_emb = model.decoder.token_embedding.embedding(tokens).unwrap();
+    let pos_emb = model.decoder.positional_embedding.try_shrink([Some((0isize, seq_len as isize)), None]).unwrap();
+    let mut x = tok_emb.try_add(&pos_emb).unwrap().cast(features.uop().dtype()).unwrap();
+    let mask = crate::whisper::causal_mask(seq_len, x.uop().dtype().clone()).unwrap();
+    let mut selected: Vec<Option<Tensor>> = (0..alignment_heads.len()).map(|_| None).collect();
+
+    for (layer, block) in model.decoder.blocks.iter().enumerate() {
+        let h = block.attn_ln.apply(&x).unwrap();
+        x = x.try_add(&block.attn.forward(&h, None, Some(&mask)).unwrap()).unwrap();
+
+        let h = block.cross_attn_ln.apply(&x).unwrap();
+        x = x.try_add(&block.cross_attn.forward(&h, Some(features), None).unwrap()).unwrap();
+        let q = block.cross_attn.split_heads(&block.cross_attn.query.forward(&h).unwrap()).unwrap();
+        let k = block.cross_attn.split_heads(&block.cross_attn.key.forward(features).unwrap()).unwrap();
+        for (index, &(_, head)) in alignment_heads.iter().enumerate().filter(|&(_, &(l, _))| l == layer) {
+            let q = q.try_shrink([None, Some((head as isize, head as isize + 1)), None, None]).unwrap();
+            let k = k.try_shrink([None, Some((head as isize, head as isize + 1)), None, None]).unwrap();
+            let scores = q.matmul(&k.try_transpose(-1, -2).unwrap()).unwrap();
+            let scale = Tensor::const_(
+                ConstValue::Float(1.0 / ((model.decoder.n_state / model.decoder.n_head) as f64).sqrt()),
+                scores.uop().dtype().clone(),
+            );
+            selected[index] = Some(scores.try_mul(&scale).unwrap());
+        }
+
+        let h = block.mlp_ln.apply(&x).unwrap();
+        let h = h.linear().weight(&block.mlp0_w).bias(&block.mlp0_b).call().unwrap().gelu_exact().unwrap();
+        let h = h.linear().weight(&block.mlp1_w).bias(&block.mlp1_b).call().unwrap();
+        x = x.try_add(&h).unwrap();
+    }
+
+    let selected: Vec<_> = selected.into_iter().map(Option::unwrap).collect();
+    Tensor::cat(&selected.iter().collect::<Vec<_>>(), 1).unwrap().cast(DType::Float32).unwrap()
+}
+
+#[test]
+fn cached_cross_alignment_matches_audio_feature_reference() {
+    let dims = small_decoder_dims();
+    let model = Whisper::empty(dims.clone());
+    let values: Vec<f32> =
+        (0..2 * dims.n_audio_ctx * dims.n_text_state).map(|index| (index as f32 - 17.0) * 0.013).collect();
+    let features = Tensor::from_slice(values).try_reshape([2usize, dims.n_audio_ctx, dims.n_text_state]).unwrap();
+    let tokens = Tensor::from_slice([1i32, 2, 3, 4, 4, 3, 2, 1]).try_reshape([2usize, 4]).unwrap();
+    let heads = [(1, 1), (0, 0)];
+
+    let mut reference = eager_audio_feature_alignment_reference(&model, &tokens, &features, &heads);
+    let (cross_k, cross_v) = model.project_cross_kv(&features).unwrap();
+    let mut cached = model.align_with_cross_kv(&tokens, &cross_k, &cross_v, &heads).unwrap();
+    reference.realize().unwrap();
+    cached.realize().unwrap();
+    let reference = reference.as_vec::<f32>().unwrap();
+    let cached = cached.as_vec::<f32>().unwrap();
+    let max_delta = reference.iter().zip(&cached).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+    assert!(max_delta < 1e-5, "cached-cross alignment drifted by {max_delta}");
+}
+
+#[test]
+#[ignore = "heavy: prepares cross projection, prefill, and alignment graphs through the CPU backend"]
+fn recognition_cross_kv_seeds_prefill_and_alignment_device_locally() {
+    let dims = small_decoder_dims();
+    let model = Whisper::empty(dims.clone());
+    let cache_shape = [1, dims.n_audio_ctx, dims.n_text_layer * dims.n_text_head, 4];
+    let mut config = svod_tensor::PrepareConfig::from_env();
+    config.device_local_outputs = true;
+
+    let mut cross = WhisperCrossKvJit::new(model.clone());
+    cross.prepare_with_config(InputSpec::f32(&[1, dims.n_audio_ctx, dims.n_text_state]), &config).unwrap();
+    cross.execute().unwrap();
+
+    let mut prefill = WhisperPrefillJit::new(model.clone());
+    prefill
+        .prepare(
+            InputSpec::i32(&[1, 3]),
+            InputSpec::f32(&cache_shape).device_local(),
+            InputSpec::f32(&cache_shape).device_local(),
+        )
+        .unwrap();
+    let alignment_model = WhisperAlignmentModel::new(model, vec![(0, 0), (1, 1)]);
+    let mut alignment = WhisperAlignmentJit::new(alignment_model);
+    alignment
+        .prepare(
+            InputSpec::f32(&cache_shape).device_local(),
+            InputSpec::f32(&cache_shape).device_local(),
+            InputSpec::i32(&[1, 3]),
+        )
+        .unwrap();
+
+    let cross_k = cross.cross_k().unwrap();
+    let cross_v = cross.cross_v().unwrap();
+    prefill.prepared_cross_k_mut().unwrap().copy_region_from(0, cross_k, 0, cross_k.size()).unwrap();
+    prefill.prepared_cross_v_mut().unwrap().copy_region_from(0, cross_v, 0, cross_v.size()).unwrap();
+    alignment.cross_k_mut().unwrap().copy_region_from(0, cross_k, 0, cross_k.size()).unwrap();
+    alignment.cross_v_mut().unwrap().copy_region_from(0, cross_v, 0, cross_v.size()).unwrap();
+    prefill.tokens_mut().unwrap().copyin(bytemuck::cast_slice(&[1i32, 2, 3])).unwrap();
+    alignment.tokens_mut().unwrap().copyin(bytemuck::cast_slice(&[1i32, 2, 3])).unwrap();
+    prefill.execute().unwrap();
+    alignment.execute().unwrap();
+
+    assert_eq!(prefill.logits().unwrap().size(), 3 * dims.n_vocab * std::mem::size_of::<f32>());
+    assert_eq!(alignment.output().unwrap().size(), 2 * 3 * dims.n_audio_ctx * std::mem::size_of::<f32>());
 }
 
 #[test]

@@ -32,14 +32,15 @@ impl Whisper {
         self.decoder.forward(tokens, audio_features, offset)
     }
 
-    /// Teacher-forced alignment pass with a static set of selected heads.
-    pub fn align(
+    /// Teacher-forced alignment using retained packed cross-attention K/V.
+    pub fn align_with_cross_kv(
         &self,
         tokens: &Tensor,
-        audio_features: &Tensor,
+        cross_k: &Tensor,
+        cross_v: &Tensor,
         alignment_heads: &[(usize, usize)],
     ) -> Result<Tensor> {
-        self.decoder.forward_alignment(tokens, audio_features, alignment_heads)
+        self.decoder.forward_alignment(tokens, cross_k, cross_v, alignment_heads)
     }
 
     /// Project encoder features into packed cross-attention K/V once per window.

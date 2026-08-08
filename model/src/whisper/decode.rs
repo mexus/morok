@@ -263,6 +263,13 @@ pub(crate) struct DecodeSeed {
     cross_positions: usize,
 }
 
+impl DecodeSeed {
+    /// Discard the attempt-local self cache and retain the immutable cross cache.
+    pub(crate) fn into_cross_kv(self) -> (Buffer, Buffer) {
+        (self.cross_k, self.cross_v)
+    }
+}
+
 pub(crate) fn prefill_decode_seed(
     prefill_jit: &mut WhisperPrefillJit,
     tokenizer: &WhisperTokenizer,

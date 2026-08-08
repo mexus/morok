@@ -69,32 +69,6 @@ impl DecoderBlock {
         let x = x.try_add(&h).context(TensorSnafu)?;
         Ok(x)
     }
-
-    /// Forward returning cross-attention QK weights (for DTW alignment).
-    /// Returns `(output, cross_attn_weights)`.
-    pub fn forward_with_qk(&self, x: &Tensor, xa: &Tensor, mask: &Tensor) -> Result<(Tensor, Tensor)> {
-        // Self-attention (causal)
-        let h = self.attn_ln.apply(x)?;
-        let attn_out = self.attn.forward(&h, None, Some(mask))?;
-        let x = x.try_add(&attn_out).context(TensorSnafu)?;
-
-        // Cross-attention with weight extraction
-        let h = self.cross_attn_ln.apply(&x)?;
-        let (cross_out, qk_weights) = self.cross_attn.forward_with_qk(&h, Some(xa), None)?;
-        let x = x.try_add(&cross_out).context(TensorSnafu)?;
-
-        // MLP
-        let h = self.mlp_ln.apply(&x)?;
-        let h = h.linear().weight(&self.mlp0_w).bias(&self.mlp0_b).call().context(TensorSnafu)?;
-        let h = h.gelu_exact().context(TensorSnafu)?;
-        let h = h.linear().weight(&self.mlp1_w).bias(&self.mlp1_b).call().context(TensorSnafu)?;
-        let x = x.try_add(&h).context(TensorSnafu)?;
-
-        let qk = qk_weights.unwrap_or_else(|| {
-            panic!("forward_with_qk requires cross-attention but got None");
-        });
-        Ok((x, qk))
-    }
 }
 
 impl HasStateDict for DecoderBlock {
@@ -220,12 +194,13 @@ impl TextDecoder {
         logits.cast(DType::Float32).context(TensorSnafu)
     }
 
-    /// Teacher-forced decoder pass returning raw scaled cross-attention QK
-    /// scores for the statically selected alignment heads.
+    /// Teacher-forced decoder pass over packed cross K/V, returning raw scaled
+    /// QK scores for the statically selected alignment heads.
     pub fn forward_alignment(
         &self,
         tokens: &Tensor,
-        xa: &Tensor,
+        cross_k: &Tensor,
+        cross_v: &Tensor,
         alignment_heads: &[(usize, usize)],
     ) -> Result<Tensor> {
         let seq_len =
@@ -241,46 +216,61 @@ impl TextDecoder {
             self.positional_embedding.try_shrink([Some((0isize, seq_len as isize)), None]).context(TensorSnafu)?;
 
         let x = tok_emb.try_add(&pos_emb).context(TensorSnafu)?;
-        let x = x.cast(xa.uop().dtype()).context(TensorSnafu)?;
+        let x = x.cast(cross_k.uop().dtype()).context(TensorSnafu)?;
 
         let mask = causal_mask(seq_len, x.uop().dtype().clone())?;
 
         let mut x = x;
-        let mut selected_qk = Vec::with_capacity(alignment_heads.len());
+        let mut selected_qk: Vec<Option<Tensor>> = (0..alignment_heads.len()).map(|_| None).collect();
         for (layer, block) in self.blocks.iter().enumerate() {
             let h = block.attn_ln.apply(&x)?;
             let attn_out = block.attn.forward(&h, None, Some(&mask))?;
             x = x.try_add(&attn_out).context(TensorSnafu)?;
 
             let h = block.cross_attn_ln.apply(&x)?;
-            let cross_out = block.cross_attn.forward(&h, Some(xa), None)?;
+            let query = block.cross_attn.split_heads(&block.cross_attn.query.forward(&h)?)?;
+            let head_start = layer * self.n_head;
+            let head_end = head_start + self.n_head;
+            let layer_ck = cross_k
+                .try_shrink([None, None, Some((head_start as isize, head_end as isize)), None])
+                .context(TensorSnafu)?
+                .try_permute(&[0, 2, 1, 3])
+                .context(TensorSnafu)?;
+            let layer_cv = cross_v
+                .try_shrink([None, None, Some((head_start as isize, head_end as isize)), None])
+                .context(TensorSnafu)?
+                .try_permute(&[0, 2, 1, 3])
+                .context(TensorSnafu)?;
+            let cross_out = query
+                .scaled_dot_product_attention()
+                .key(&layer_ck)
+                .value(&layer_cv)
+                .is_causal(false)
+                .call()
+                .context(TensorSnafu)?;
+            let cross_out = block.cross_attn.merge_heads(&cross_out)?;
+            let cross_out = block.cross_attn.out.forward(&cross_out)?;
             x = x.try_add(&cross_out).context(TensorSnafu)?;
 
-            let layer_heads: Vec<usize> = alignment_heads
+            let layer_heads: Vec<(usize, usize)> = alignment_heads
                 .iter()
-                .filter_map(|&(selected_layer, head)| (selected_layer == layer).then_some(head))
+                .enumerate()
+                .filter_map(|(selected, &(selected_layer, head))| (selected_layer == layer).then_some((selected, head)))
                 .collect();
-            if !layer_heads.is_empty() {
-                // Keep the normal fused attention path above. Q/K are tapped a
-                // second time only in selected layers, and only selected head
-                // score matrices become graph outputs.
-                let q_heads = block.cross_attn.split_heads(&block.cross_attn.query.forward(&h)?)?;
-                let k_heads = block.cross_attn.split_heads(&block.cross_attn.key.forward(xa)?)?;
-                for head in layer_heads {
-                    let selected_q = q_heads
-                        .try_shrink([None, Some((head as isize, head as isize + 1)), None, None])
-                        .context(TensorSnafu)?;
-                    let selected_k = k_heads
-                        .try_shrink([None, Some((head as isize, head as isize + 1)), None, None])
-                        .context(TensorSnafu)?;
-                    let kt = selected_k.try_transpose(-1, -2).context(TensorSnafu)?;
-                    let scores = selected_q.matmul(&kt).context(TensorSnafu)?;
-                    let scale = Tensor::const_(
-                        ConstValue::Float(1.0 / ((self.n_state / self.n_head) as f64).sqrt()),
-                        scores.uop().dtype().clone(),
-                    );
-                    selected_qk.push(scores.try_mul(&scale).context(TensorSnafu)?);
-                }
+            for (selected, head) in layer_heads {
+                let selected_q = query
+                    .try_shrink([None, Some((head as isize, head as isize + 1)), None, None])
+                    .context(TensorSnafu)?;
+                let selected_k = layer_ck
+                    .try_shrink([None, Some((head as isize, head as isize + 1)), None, None])
+                    .context(TensorSnafu)?;
+                let kt = selected_k.try_transpose(-1, -2).context(TensorSnafu)?;
+                let scores = selected_q.matmul(&kt).context(TensorSnafu)?;
+                let scale = Tensor::const_(
+                    ConstValue::Float(1.0 / ((self.n_state / self.n_head) as f64).sqrt()),
+                    scores.uop().dtype().clone(),
+                );
+                selected_qk[selected] = Some(scores.try_mul(&scale).context(TensorSnafu)?);
             }
 
             let h = block.mlp_ln.apply(&x)?;
@@ -289,6 +279,16 @@ impl TextDecoder {
             let h = h.linear().weight(&block.mlp1_w).bias(&block.mlp1_b).call().context(TensorSnafu)?;
             x = x.try_add(&h).context(TensorSnafu)?;
         }
+        let selected_qk = selected_qk
+            .into_iter()
+            .map(|qk| {
+                qk.ok_or_else(|| super::error::Error::Tensor {
+                    source: Box::new(svod_tensor::error::Error::SymbolicShapeUnsupported {
+                        operation: "alignment head layer out of range".into(),
+                    }),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
         Tensor::cat(&selected_qk.iter().collect::<Vec<_>>(), 1)
             .context(TensorSnafu)?
             .cast(DType::Float32)

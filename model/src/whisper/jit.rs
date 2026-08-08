@@ -2,8 +2,7 @@
 //!
 //! Every wrapper is prepared at a concrete capacity. Recognition projects
 //! encoder features into cross-attention caches once, then reuses them for
-//! language detection, token prefill, and fixed-slot decoder steps. Alignment
-//! uses a separate teacher-forced graph.
+//! language detection, token prefill, fixed-slot decoder steps, and alignment.
 #![allow(clippy::too_many_arguments)]
 
 extern crate self as svod_model;
@@ -25,10 +24,11 @@ impl WhisperAlignmentModel {
 
     fn forward(
         &self,
-        audio_features: &svod_tensor::Tensor,
+        cross_k: &svod_tensor::Tensor,
+        cross_v: &svod_tensor::Tensor,
         tokens: &svod_tensor::Tensor,
     ) -> super::error::Result<svod_tensor::Tensor> {
-        self.model.align(tokens, audio_features, &self.alignment_heads)
+        self.model.align_with_cross_kv(tokens, cross_k, cross_v, &self.alignment_heads)
     }
 }
 
@@ -61,11 +61,12 @@ jit_wrapper! {
 // are fixed at construction; valid token/audio lengths are host metadata.
 jit_wrapper! {
     WhisperAlignmentJit(WhisperAlignmentModel) {
-        audio_features: Tensor,
+        cross_k: Tensor,
+        cross_v: Tensor,
         tokens: Tensor,
 
-        build(audio_features, tokens) {
-            model.forward(audio_features, tokens)
+        build(cross_k, cross_v, tokens) {
+            model.forward(cross_k, cross_v, tokens)
         }
     }
 }

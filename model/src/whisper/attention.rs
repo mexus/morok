@@ -69,23 +69,6 @@ impl MultiHeadAttention {
         Ok((out, k, v))
     }
 
-    /// Forward pass returning both the output and the raw QK attention weights
-    /// (pre-softmax, post-scale). Used for DTW alignment. Only meaningful for
-    /// cross-attention; returns `None` for self-attention when `xa.is_none()`.
-    pub fn forward_with_qk(
-        &self,
-        x: &Tensor,
-        xa: Option<&Tensor>,
-        mask: Option<&Tensor>,
-    ) -> Result<(Tensor, Option<Tensor>)> {
-        let q = self.query.forward(x)?;
-        let kv_input = xa.unwrap_or(x);
-        let k = self.key.forward(kv_input)?;
-        let v = self.value.forward(kv_input)?;
-
-        self.qkv_attention_with_qk(&q, &k, &v, mask, xa.is_some())
-    }
-
     pub fn split_heads(&self, t: &Tensor) -> Result<Tensor> {
         // t: [B, S, D] -> [B, S, H, Dh] -> [B, H, S, Dh]
         let shape = t.shape().context(TensorSnafu)?;
@@ -185,51 +168,6 @@ impl MultiHeadAttention {
                 self.merge_heads(&out)
             }
         }
-    }
-
-    /// Manual attention that returns softmaxed attention weights for DTW.
-    fn qkv_attention_with_qk(
-        &self,
-        q: &Tensor,
-        k: &Tensor,
-        v: &Tensor,
-        mask: Option<&Tensor>,
-        is_cross: bool,
-    ) -> Result<(Tensor, Option<Tensor>)> {
-        let q = self.split_heads(q)?; // [B, H, Sq, Dh]
-        let k = self.split_heads(k)?; // [B, H, Sk, Dh]
-        let v = self.split_heads(v)?; // [B, H, Sk, Dh]
-
-        let kt = k.try_transpose(-1, -2).context(TensorSnafu)?; // [B, H, Dh, Sk]
-        let mut scores = q.matmul(&kt).context(TensorSnafu)?; // [B, H, Sq, Sk]
-
-        let dh = {
-            let s = q.shape().context(TensorSnafu)?;
-            s[3].as_const().ok_or_else(|| super::error::Error::Tensor {
-                source: Box::new(svod_tensor::error::Error::SymbolicShapeUnsupported {
-                    operation: "qkv_attention dh".into(),
-                }),
-            })? as f64
-        };
-        let scale = 1.0 / dh.sqrt();
-        let scale_t = Tensor::const_(ConstValue::Float(scale), scores.uop().dtype().clone());
-        scores = scores.try_mul(&scale_t).context(TensorSnafu)?;
-
-        if let Some(m) = mask {
-            scores = scores.try_add(m).context(TensorSnafu)?;
-        }
-
-        // Softmax in fp32, then back to q dtype — matches the OpenAI reference
-        // (`model.py:140-142`: `qk.float()` → `F.softmax(...).to(q.dtype)`).
-        let q_dtype = q.uop().dtype().clone();
-        let attn = scores.cast(DType::Float32).context(TensorSnafu)?.softmax(-1isize).context(TensorSnafu)?;
-        let attn = attn.cast(q_dtype).context(TensorSnafu)?;
-        let out = attn.matmul(&v).context(TensorSnafu)?; // [B, H, Sq, Dh]
-        let out = self.merge_heads(&out)?;
-
-        // Return softmaxed attention weights only for cross-attention.
-        let qk_weights = is_cross.then_some(attn);
-        Ok((out, qk_weights))
     }
 }
 
