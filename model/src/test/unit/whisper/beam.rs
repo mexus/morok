@@ -2,8 +2,8 @@ use std::collections::HashSet;
 
 use crate::whisper::decode::{
     BeamCandidate, BeamHypothesis, BeamSurvivor, DecodeScheduleStats, SlotAllocator, attempt_strategies,
-    collect_ordered, finalize_beam_hypotheses, plan_beam_rows, remaining_sample_steps, select_beam_candidates,
-    strategy_width,
+    collect_ordered, derived_sampling_seed, finalize_beam_hypotheses, plan_beam_rows, remaining_sample_steps,
+    select_beam_candidates, strategy_width,
 };
 use crate::whisper::{DecodeOptions, DecodeStrategy, FallbackPolicy};
 
@@ -161,6 +161,15 @@ fn fallback_sequence_changes_beam_attempt_to_width_one_sampling() {
         ]
     );
     assert_eq!(strategies.into_iter().map(strategy_width).collect::<Vec<_>>(), [5, 1, 1]);
+}
+
+#[test]
+fn sampling_seed_is_stable_and_request_specific() {
+    let base = 0x1234_5678_9abc_def0;
+    assert_eq!(derived_sampling_seed(base, 0), base);
+    assert_eq!(derived_sampling_seed(base, 1), derived_sampling_seed(base, 1));
+    assert_ne!(derived_sampling_seed(base, 1), derived_sampling_seed(base, 2));
+    assert_ne!(derived_sampling_seed(base, 0), derived_sampling_seed(base, 1));
 }
 
 #[test]

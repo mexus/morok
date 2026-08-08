@@ -4,6 +4,8 @@
 use super::error::{DeviceSnafu, Error, JitSnafu, Result};
 use super::jit::{WhisperDecoderJit, WhisperDecoderStepJit, WhisperPrefillJit};
 use super::tokenizer::WhisperTokenizer;
+use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
 use snafu::ResultExt;
 use std::cmp::Ordering;
 use std::collections::VecDeque;
@@ -128,6 +130,8 @@ pub struct DecodeOptions {
     pub strategy: DecodeStrategy,
     /// Optional quality-gated sampling retries.
     pub fallback: Option<FallbackPolicy>,
+    /// Base seed for reproducible per-request sampling streams.
+    pub sampling_seed: Option<u64>,
     /// Maximum generated token count; defaults to half the text context.
     pub sample_len: Option<usize>,
     /// Suppress blank/space as the first generated token.
@@ -147,6 +151,7 @@ impl Default for DecodeOptions {
             language: None,
             strategy: DecodeStrategy::Beam { size: 5 },
             fallback: Some(FallbackPolicy::default()),
+            sampling_seed: None,
             sample_len: None,
             suppress_blank: true,
             suppress_tokens: Some(vec![-1]),
@@ -255,6 +260,7 @@ pub fn decode_with_fallback_cached(
             .extend(fallback.sampling_temperatures.iter().map(|&temperature| DecodeStrategy::Sample { temperature }));
     }
     let mut best: Option<DecodeResult> = None;
+    let mut rng = sampling_rng(options, 0);
 
     for (attempt, &strategy) in strategies.iter().enumerate() {
         let mut opts = options.clone();
@@ -274,7 +280,7 @@ pub fn decode_with_fallback_cached(
                 pos_embedding,
                 n_state,
             )?,
-            DecodeStrategy::Greedy | DecodeStrategy::Sample { .. } => greedy_decode_cached(
+            DecodeStrategy::Greedy | DecodeStrategy::Sample { .. } => greedy_decode_cached_with_rng(
                 prefill_jit,
                 step_jits.get_mut(&1).ok_or_else(|| decode_err("greedy JIT missing"))?,
                 n_text_ctx,
@@ -283,6 +289,7 @@ pub fn decode_with_fallback_cached(
                 &opts,
                 pos_embedding,
                 n_state,
+                &mut rng,
             )?,
         };
 
@@ -334,6 +341,32 @@ pub fn greedy_decode_cached(
     pos_embedding: &[f32],
     n_state: usize,
 ) -> Result<DecodeResult> {
+    let mut rng = sampling_rng(options, 0);
+    greedy_decode_cached_with_rng(
+        prefill_jit,
+        step_jit,
+        n_text_ctx,
+        n_vocab,
+        tokenizer,
+        options,
+        pos_embedding,
+        n_state,
+        &mut rng,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn greedy_decode_cached_with_rng(
+    prefill_jit: &mut WhisperPrefillJit,
+    step_jit: &mut WhisperDecoderStepJit,
+    n_text_ctx: usize,
+    n_vocab: usize,
+    tokenizer: &WhisperTokenizer,
+    options: &DecodeOptions,
+    pos_embedding: &[f32],
+    n_state: usize,
+    rng: &mut StdRng,
+) -> Result<DecodeResult> {
     let mut ctx = init_decode(prefill_jit, tokenizer, options, n_text_ctx, n_vocab, pos_embedding, n_state)?;
     ctx.write_caches_greedy(step_jit)?;
 
@@ -349,7 +382,7 @@ pub fn greedy_decode_cached(
         0,
         &ctx.suppress_tokens,
     );
-    let mut next_token = pick_token(&filtered, options.strategy.temperature());
+    let mut next_token = pick_token_with_rng(&filtered, options.strategy.temperature(), rng);
     let mut sum_logprob = log_softmax(&filtered, next_token as usize);
     let no_speech_prob = ctx.no_speech_prob;
 
@@ -394,7 +427,7 @@ pub fn greedy_decode_cached(
             &ctx.suppress_tokens,
         );
 
-        next_token = pick_token(&filtered, options.strategy.temperature());
+        next_token = pick_token_with_rng(&filtered, options.strategy.temperature(), rng);
         let token_logprob = log_softmax(&filtered, next_token as usize);
         sum_logprob += token_logprob;
 
@@ -657,6 +690,7 @@ impl ScheduledAttempt {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn start_attempt(
     strategy_index: usize,
     strategy: DecodeStrategy,
@@ -665,6 +699,7 @@ fn start_attempt(
     tokenizer: &WhisperTokenizer,
     options: &DecodeOptions,
     n_vocab: usize,
+    rng: &mut StdRng,
 ) -> Result<ScheduledAttempt> {
     let ctx = &seed.ctx;
     let last = ctx
@@ -698,7 +733,7 @@ fn start_attempt(
                     }),
                 });
             }
-            let next_token = pick_token(&filtered, strategy.temperature());
+            let next_token = pick_token_with_rng(&filtered, strategy.temperature(), rng);
             let sum_logprob = log_softmax(&filtered, next_token as usize);
             let (tokens, token_probs) = if next_token == tokenizer.eot() {
                 (Vec::new(), Vec::new())
@@ -883,6 +918,8 @@ pub(crate) fn run_fixed_slot_decode(
     let mut attempts: Vec<Option<ScheduledAttempt>> = (0..seeds.len()).map(|_| None).collect();
     let mut results: Vec<Option<DecodeResult>> = (0..seeds.len()).map(|_| None).collect();
     let mut stats = DecodeScheduleStats::default();
+    let mut rngs: Vec<_> =
+        request_options.iter().enumerate().map(|(request, options)| sampling_rng(options, request)).collect();
 
     while results.iter().any(Option::is_none) {
         while let Some(&(request, strategy_index)) = queue.front() {
@@ -893,7 +930,16 @@ pub(crate) fn run_fixed_slot_decode(
             queue.pop_front();
             let mut options = request_options[request].clone();
             options.strategy = strategy;
-            let attempt = start_attempt(strategy_index, strategy, rows, &seeds[request], tokenizer, &options, n_vocab)?;
+            let attempt = start_attempt(
+                strategy_index,
+                strategy,
+                rows,
+                &seeds[request],
+                tokenizer,
+                &options,
+                n_vocab,
+                &mut rngs[request],
+            )?;
             seed_attempt_rows(step_jit, &attempt.reserved_rows, &seeds[request], n_text_ctx)?;
             attempts[request] = Some(attempt);
             stats.attempts += 1;
@@ -991,7 +1037,8 @@ pub(crate) fn run_fixed_slot_decode(
                             attempt.pos + 1 - seed.init_len,
                             &seed.suppress_tokens,
                         );
-                        single.next_token = pick_token(&logits, attempt.strategy.temperature());
+                        single.next_token =
+                            pick_token_with_rng(&logits, attempt.strategy.temperature(), &mut rngs[request]);
                         let logprob = log_softmax(&logits, single.next_token as usize);
                         single.sum_logprob += logprob;
                         if single.next_token != tokenizer.eot() {
@@ -1863,8 +1910,23 @@ fn finish_decode(
     })
 }
 
-fn pick_token(logits: &[f32], temperature: f32) -> u32 {
-    if temperature > 0.0 { sample_from_logits(logits, temperature) } else { argmax(logits) as u32 }
+fn pick_token_with_rng(logits: &[f32], temperature: f32, rng: &mut impl Rng) -> u32 {
+    if temperature > 0.0 { sample_from_logits(logits, temperature, rng) } else { argmax(logits) as u32 }
+}
+
+pub(crate) fn derived_sampling_seed(base: u64, request: usize) -> u64 {
+    if request == 0 {
+        return base;
+    }
+    let mut value = base ^ (request as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    value ^ (value >> 31)
+}
+
+fn sampling_rng(options: &DecodeOptions, request: usize) -> StdRng {
+    let seed = options.sampling_seed.map(|base| derived_sampling_seed(base, request)).unwrap_or_else(rand::random);
+    StdRng::seed_from_u64(seed)
 }
 
 fn decode_err(msg: &str) -> Error {
@@ -2144,14 +2206,14 @@ fn compression_ratio_text(text: &str) -> f32 {
 /// reference's `Categorical(logits=logits/T).sample()` (`decoding.py:283`),
 /// which PyTorch implements as a numerically stable softmax (max-subtract
 /// before exp) followed by inverse-CDF sampling.
-fn sample_from_logits(logits: &[f32], temperature: f32) -> u32 {
+fn sample_from_logits(logits: &[f32], temperature: f32, rng: &mut impl Rng) -> u32 {
     // Max-subtract for numerical stability: exp(x - m) avoids overflow on
     // large positive logits. The max is a no-op for the sampling distribution
     // (it's a constant shift that cancels in normalization).
     let max_val = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max) / temperature;
     let probs: Vec<f32> = logits.iter().map(|&l| ((l / temperature) - max_val).exp()).collect();
     let sum: f32 = probs.iter().copied().sum();
-    let mut r = rand::random::<f32>() * sum;
+    let mut r = rng.r#gen::<f32>() * sum;
     for (i, &p) in probs.iter().enumerate() {
         r -= p;
         if r <= 0.0 {

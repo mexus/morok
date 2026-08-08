@@ -116,3 +116,48 @@ fn generalized_scheduler_runs_beam_sizes_two_and_five() {
         assert_eq!(refilled, concurrent, "beam-{size} output changed with physical slot geometry");
     }
 }
+
+#[test]
+#[ignore = "heavy: real whisper-tiny weights + JIT compile"]
+fn seeded_sampling_is_independent_of_slot_geometry() {
+    let repo = "openai/whisper-tiny";
+    let dims = ModelDimensions::for_size(WhisperSize::Tiny);
+    let model = crate::whisper::Whisper::from_hub(repo, "main", dims).unwrap();
+    let multilingual = model.is_multilingual();
+    let num_languages = model.dims.num_languages();
+    let options = DecodeOptions {
+        language: Some("en".to_string()),
+        strategy: DecodeStrategy::Sample { temperature: 0.8 },
+        fallback: None,
+        sampling_seed: Some(42),
+        sample_len: Some(4),
+        ..DecodeOptions::default()
+    };
+    let mut serial_plan = WhisperPlan::for_model(&model.dims, WhisperSize::Tiny);
+    serial_plan.decoder_slots = 1;
+    let mut concurrent_plan = serial_plan.clone();
+    concurrent_plan.decoder_slots = 2;
+    let mut serial = WhisperAlignedTranscriber::new_with_plan(
+        model.clone(),
+        WhisperTokenizer::from_hub(multilingual, num_languages).unwrap(),
+        options.clone(),
+        WhisperSize::Tiny,
+        480_000,
+        serial_plan,
+    )
+    .unwrap();
+    let mut concurrent = WhisperAlignedTranscriber::new_with_plan(
+        model,
+        WhisperTokenizer::from_hub(multilingual, num_languages).unwrap(),
+        options,
+        WhisperSize::Tiny,
+        480_000,
+        concurrent_plan,
+    )
+    .unwrap();
+    let windows = fake_windows();
+    let refs: Vec<_> = windows.iter().map(Vec::as_slice).collect();
+    let (serial, _) = serial.transcribe_windows(&refs, false).unwrap();
+    let (concurrent, _) = concurrent.transcribe_windows(&refs, false).unwrap();
+    assert_eq!(serial, concurrent);
+}
