@@ -1,8 +1,9 @@
 use std::collections::HashSet;
 
 use crate::whisper::decode::{
-    BeamCandidate, BeamHypothesis, BeamSurvivor, SlotAllocator, attempt_strategies, collect_ordered,
-    finalize_beam_hypotheses, plan_beam_rows, remaining_sample_steps, select_beam_candidates, strategy_width,
+    BeamCandidate, BeamHypothesis, BeamSurvivor, DecodeScheduleStats, SlotAllocator, attempt_strategies,
+    collect_ordered, finalize_beam_hypotheses, plan_beam_rows, remaining_sample_steps, select_beam_candidates,
+    strategy_width,
 };
 use crate::whisper::{DecodeOptions, DecodeStrategy, FallbackPolicy};
 
@@ -187,4 +188,41 @@ fn scheduler_collection_preserves_input_order_after_out_of_order_completion() {
         completed[request] = Some(value);
     }
     assert_eq!(collect_ordered(completed).unwrap(), ["first", "second", "third"]);
+}
+
+#[test]
+fn scheduler_stats_merge_across_encoder_batches() {
+    let mut total = DecodeScheduleStats {
+        dispatches: 2,
+        active_row_steps: 6,
+        reserved_row_steps: 8,
+        capacity_row_steps: 10,
+        cache_clone_ops: 1,
+        cache_clone_bytes: 128,
+        attempts: 2,
+        fallback_attempts: 0,
+    };
+    total.merge(DecodeScheduleStats {
+        dispatches: 1,
+        active_row_steps: 2,
+        reserved_row_steps: 3,
+        capacity_row_steps: 5,
+        cache_clone_ops: 2,
+        cache_clone_bytes: 256,
+        attempts: 2,
+        fallback_attempts: 1,
+    });
+    assert_eq!(
+        total,
+        DecodeScheduleStats {
+            dispatches: 3,
+            active_row_steps: 8,
+            reserved_row_steps: 11,
+            capacity_row_steps: 15,
+            cache_clone_ops: 3,
+            cache_clone_bytes: 384,
+            attempts: 4,
+            fallback_attempts: 1,
+        }
+    );
 }

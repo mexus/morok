@@ -16,7 +16,9 @@ use crate::jit::InputSpec;
 
 use super::aligner::{WhisperAligner, WhisperAlignmentInput};
 use super::config::{N_AUDIO_CTX, N_FRAMES, N_TEXT_CTX, SAMPLE_RATE};
-use super::decode::{DecodeOptions, attempt_strategies, prefill_decode_seed, run_fixed_slot_decode, strategy_width};
+use super::decode::{
+    DecodeOptions, DecodeScheduleStats, attempt_strategies, prefill_decode_seed, run_fixed_slot_decode, strategy_width,
+};
 use super::jit::{WhisperCrossKvJit, WhisperDecoderJit, WhisperDecoderStepJit, WhisperEncoderJit, WhisperPrefillJit};
 use super::mel::WhisperMel;
 use super::model::Whisper;
@@ -413,6 +415,7 @@ impl WhisperRecognizer {
         let mut recognized = Vec::with_capacity(windows.len());
         let mut prof = profile.then(RunProfile::default);
         let mut encoder_kernels = Vec::new();
+        let mut decode_stats = DecodeScheduleStats::default();
         let (mut t_mel, mut t_encoder, mut t_decode) = (Duration::ZERO, Duration::ZERO, Duration::ZERO);
 
         for batch_start in (0..windows.len()).step_by(max_batch) {
@@ -526,7 +529,7 @@ impl WhisperRecognizer {
             }
 
             let t = Instant::now();
-            let results = run_fixed_slot_decode(
+            let (results, batch_stats) = run_fixed_slot_decode(
                 &seeds,
                 &decode_options,
                 &mut self.batched_step_jit,
@@ -536,6 +539,7 @@ impl WhisperRecognizer {
                 n_vocab,
             )
             .map_err(|error| TranscribeError::Model { source: Box::new(error) })?;
+            decode_stats.merge(batch_stats);
             t_decode += t.elapsed();
 
             for (bi, ((mut result, options), audio_features)) in
@@ -555,7 +559,22 @@ impl WhisperRecognizer {
         if let Some(p) = &mut prof {
             p.push(StageProfile::host("mel", t_mel));
             p.push(StageProfile::gpu("encoder", t_encoder, encoder_kernels));
-            p.push(StageProfile::host("decode", t_decode));
+            let mut decode = StageProfile::host("decode", t_decode);
+            decode.meta.insert("dispatches".into(), decode_stats.dispatches.to_string());
+            decode.meta.insert("active_row_steps".into(), decode_stats.active_row_steps.to_string());
+            decode.meta.insert("reserved_row_steps".into(), decode_stats.reserved_row_steps.to_string());
+            decode.meta.insert("capacity_row_steps".into(), decode_stats.capacity_row_steps.to_string());
+            decode.meta.insert("cache_clone_ops".into(), decode_stats.cache_clone_ops.to_string());
+            decode.meta.insert("cache_clone_bytes".into(), decode_stats.cache_clone_bytes.to_string());
+            decode.meta.insert("attempts".into(), decode_stats.attempts.to_string());
+            decode.meta.insert("fallback_attempts".into(), decode_stats.fallback_attempts.to_string());
+            let utilization = if decode_stats.capacity_row_steps == 0 {
+                0.0
+            } else {
+                decode_stats.active_row_steps as f64 / decode_stats.capacity_row_steps as f64
+            };
+            decode.meta.insert("row_utilization".into(), format!("{utilization:.4}"));
+            p.push(decode);
         }
 
         Ok((recognized, prof))

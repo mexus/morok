@@ -532,6 +532,31 @@ pub(crate) fn collect_ordered<T>(results: Vec<Option<T>>) -> std::result::Result
     results.into_iter().map(|result| result.ok_or("missing scheduled result")).collect()
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct DecodeScheduleStats {
+    pub(crate) dispatches: usize,
+    pub(crate) active_row_steps: usize,
+    pub(crate) reserved_row_steps: usize,
+    pub(crate) capacity_row_steps: usize,
+    pub(crate) cache_clone_ops: usize,
+    pub(crate) cache_clone_bytes: usize,
+    pub(crate) attempts: usize,
+    pub(crate) fallback_attempts: usize,
+}
+
+impl DecodeScheduleStats {
+    pub(crate) fn merge(&mut self, other: Self) {
+        self.dispatches += other.dispatches;
+        self.active_row_steps += other.active_row_steps;
+        self.reserved_row_steps += other.reserved_row_steps;
+        self.capacity_row_steps += other.capacity_row_steps;
+        self.cache_clone_ops += other.cache_clone_ops;
+        self.cache_clone_bytes += other.cache_clone_bytes;
+        self.attempts += other.attempts;
+        self.fallback_attempts += other.fallback_attempts;
+    }
+}
+
 /// Small independently-testable allocator enforcing whole-attempt admission.
 #[derive(Debug)]
 pub(crate) struct SlotAllocator {
@@ -576,6 +601,10 @@ impl SlotAllocator {
                 *slot = None;
             }
         }
+    }
+
+    fn reserved(&self) -> usize {
+        self.owners.iter().filter(|owner| owner.is_some()).count()
     }
 
     #[cfg(test)]
@@ -835,7 +864,7 @@ pub(crate) fn run_fixed_slot_decode(
     tokenizer: &WhisperTokenizer,
     n_text_ctx: usize,
     n_vocab: usize,
-) -> Result<Vec<DecodeResult>> {
+) -> Result<(Vec<DecodeResult>, DecodeScheduleStats)> {
     if seeds.len() != request_options.len() {
         return Err(decode_err("decode seed/options count mismatch"));
     }
@@ -853,6 +882,7 @@ pub(crate) fn run_fixed_slot_decode(
     let mut allocator = SlotAllocator::new(capacity);
     let mut attempts: Vec<Option<ScheduledAttempt>> = (0..seeds.len()).map(|_| None).collect();
     let mut results: Vec<Option<DecodeResult>> = (0..seeds.len()).map(|_| None).collect();
+    let mut stats = DecodeScheduleStats::default();
 
     while results.iter().any(Option::is_none) {
         while let Some(&(request, strategy_index)) = queue.front() {
@@ -866,6 +896,8 @@ pub(crate) fn run_fixed_slot_decode(
             let attempt = start_attempt(strategy_index, strategy, rows, &seeds[request], tokenizer, &options, n_vocab)?;
             seed_attempt_rows(step_jit, &attempt.reserved_rows, &seeds[request], n_text_ctx)?;
             attempts[request] = Some(attempt);
+            stats.attempts += 1;
+            stats.fallback_attempts += usize::from(strategy_index > 0);
         }
 
         let active_requests: Vec<_> =
@@ -918,6 +950,16 @@ pub(crate) fn run_fixed_slot_decode(
         }
 
         if dispatch {
+            stats.dispatches += 1;
+            stats.capacity_row_steps += capacity;
+            stats.reserved_row_steps += allocator.reserved();
+            stats.active_row_steps += active_requests
+                .iter()
+                .map(|&request| match &attempts[request].as_ref().expect("active attempt").kind {
+                    AttemptKind::Single(_) => 1,
+                    AttemptKind::Beam(beam) => beam.active.len(),
+                })
+                .sum::<usize>();
             step_jit.execute().context(JitSnafu)?;
             for &request in &active_requests {
                 let attempt = attempts[request].as_mut().expect("active attempt");
@@ -1004,6 +1046,8 @@ pub(crate) fn run_fixed_slot_decode(
                             per_pos_bytes,
                             row_stride_bytes,
                         )?;
+                        stats.cache_clone_ops += assignment.copies.len();
+                        stats.cache_clone_bytes += assignment.copies.len() * (attempt.pos + 1) * per_pos_bytes * 2;
                         beam.active = active;
                         beam.rows = assignment.rows;
                     }
@@ -1041,7 +1085,7 @@ pub(crate) fn run_fixed_slot_decode(
         }
     }
 
-    collect_ordered(results).map_err(decode_err)
+    Ok((collect_ordered(results).map_err(decode_err)?, stats))
 }
 
 // ─── Batched JIT buffer row helpers ─────────────────────────────────────────

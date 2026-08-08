@@ -59,11 +59,16 @@ fn generalized_scheduler_runs_greedy_with_slot_refill() {
     let refs: Vec<&[f32]> = windows.iter().map(|w| w.as_slice()).collect();
 
     let (refilled, _) = refill.transcribe_windows(&refs, false).expect("refilled greedy transcribe");
-    let (concurrent, _) = concurrent.transcribe_windows(&refs, false).expect("concurrent greedy transcribe");
+    let (concurrent, profile) = concurrent.transcribe_windows(&refs, true).expect("concurrent greedy transcribe");
     assert_eq!(refilled.len(), concurrent.len());
     for (index, (refilled, concurrent)) in refilled.iter().zip(concurrent).enumerate() {
         assert_eq!(refilled.text, concurrent.text, "window {index}: slot geometry changed greedy output");
     }
+    let profile = profile.unwrap();
+    let decode = profile.stage("decode").unwrap();
+    assert!(decode.meta["dispatches"].parse::<usize>().unwrap() > 0);
+    assert!(decode.meta["active_row_steps"].parse::<usize>().unwrap() > 0);
+    assert!(decode.meta["row_utilization"].parse::<f64>().unwrap() > 0.0);
 }
 
 #[test]
