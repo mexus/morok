@@ -178,9 +178,13 @@ impl MultiHeadAttention {
             (q_fa.clone(), k_fa.clone(), v_fa.clone())
         };
 
-        let direct = svod_tk::flash_attention_with(&q_f, &k_f, &v_f, svod_tk::FaOpts { causal, key_lens })
-            .map_err(|e| svod_tensor::error::Error::IrConstruction { details: e.to_string() })
-            .context(TensorSnafu)?;
+        let direct = if (d / self.n_head).is_multiple_of(16) {
+            svod_tk::flash_attention_with(&q_f, &k_f, &v_f, svod_tk::FaOpts { causal, key_lens })
+                .map_err(|e| svod_tensor::error::Error::IrConstruction { details: e.to_string() })
+                .context(TensorSnafu)?
+        } else {
+            None
+        };
         match direct {
             Some(out) => {
                 let out = if need_cast { out.cast(dt).context(TensorSnafu)? } else { out };

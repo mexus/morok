@@ -13,6 +13,44 @@ use super::blocks::{LayerNormWeights, linear_with_bias};
 use super::config::ModelDimensions;
 use super::error::{Result, TensorSnafu};
 
+#[derive(Clone, Copy)]
+struct StepAttentionConfig {
+    custom_self: bool,
+    custom_cross: bool,
+    cross_splits: Option<usize>,
+}
+
+impl Default for StepAttentionConfig {
+    fn default() -> Self {
+        Self { custom_self: true, custom_cross: true, cross_splits: None }
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum StepAttentionMode {
+    Generic,
+    CustomSelf,
+    CustomCross { split: usize },
+    CustomBoth { split: usize },
+}
+
+#[cfg(test)]
+impl From<StepAttentionMode> for StepAttentionConfig {
+    fn from(mode: StepAttentionMode) -> Self {
+        match mode {
+            StepAttentionMode::Generic => Self { custom_self: false, custom_cross: false, cross_splits: None },
+            StepAttentionMode::CustomSelf => Self { custom_self: true, custom_cross: false, cross_splits: None },
+            StepAttentionMode::CustomCross { split } => {
+                Self { custom_self: false, custom_cross: true, cross_splits: Some(split) }
+            }
+            StepAttentionMode::CustomBoth { split } => {
+                Self { custom_self: true, custom_cross: true, cross_splits: Some(split) }
+            }
+        }
+    }
+}
+
 pub(crate) fn cached_step_mask(key_lens: &Tensor, batch: usize, key_count: usize) -> Result<Tensor> {
     let range = Tensor::arange(key_count as i64, None, None)
         .context(TensorSnafu)?
@@ -193,20 +231,22 @@ impl TextDecoder {
             .context(TensorSnafu)?;
 
         let x = tok_emb.try_add(&pos_emb).context(TensorSnafu)?;
-        let x = x.cast(xa.uop().dtype()).context(TensorSnafu)?;
+        let x = x.cast(self.activation_dtype.clone()).context(TensorSnafu)?;
+        let xa = xa.cast(self.activation_dtype.clone()).context(TensorSnafu)?;
 
         let mask = causal_mask(seq_len, x.uop().dtype().clone())?;
 
         let mut x = x;
         for block in &self.blocks {
-            x = block.forward(&x, xa, &mask)?;
+            x = block.forward(&x, &xa, &mask)?;
         }
 
         // Final LayerNorm
         let x = self.ln.apply(&x)?;
 
         // Tied output: logits = x @ token_embedding.T  → [B, L, n_vocab]
-        let logits = x.linear().weight(&self.token_embedding).call().context(TensorSnafu)?;
+        let output_weight = self.token_embedding.cast(x.uop().dtype()).context(TensorSnafu)?;
+        let logits = x.linear().weight(&output_weight).call().context(TensorSnafu)?;
         logits.cast(DType::Float32).context(TensorSnafu)
     }
 
@@ -338,7 +378,9 @@ impl TextDecoder {
             .context(TensorSnafu)?;
 
         let x = tok_emb.try_add(&pos_emb).context(TensorSnafu)?;
-        let x = x.cast(cross_k.uop().dtype()).context(TensorSnafu)?;
+        let x = x.cast(self.activation_dtype.clone()).context(TensorSnafu)?;
+        let cross_k = cross_k.cast(self.activation_dtype.clone()).context(TensorSnafu)?;
+        let cross_v = cross_v.cast(self.activation_dtype.clone()).context(TensorSnafu)?;
 
         let mask = causal_mask(seq_len, x.uop().dtype().clone())?;
 
@@ -389,7 +431,7 @@ impl TextDecoder {
         let x = self.ln.apply(&x)?;
         let logits = x
             .linear()
-            .weight(&self.token_embedding)
+            .weight(&self.token_embedding.cast(x.uop().dtype()).context(TensorSnafu)?)
             .call()
             .context(TensorSnafu)?
             .cast(DType::Float32)
@@ -439,6 +481,55 @@ impl TextDecoder {
         cross_v: &Tensor,
         self_key_lens: &Tensor,
     ) -> Result<(Tensor, Tensor, Tensor)> {
+        self.forward_step_with_config(
+            token,
+            pos_emb,
+            self_k_cache,
+            self_v_cache,
+            cross_k,
+            cross_v,
+            self_key_lens,
+            StepAttentionConfig::default(),
+        )
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_step_with_attention_mode(
+        &self,
+        token: &Tensor,
+        pos_emb: &Tensor,
+        self_k_cache: &Tensor,
+        self_v_cache: &Tensor,
+        cross_k: &Tensor,
+        cross_v: &Tensor,
+        self_key_lens: &Tensor,
+        mode: StepAttentionMode,
+    ) -> Result<(Tensor, Tensor, Tensor)> {
+        self.forward_step_with_config(
+            token,
+            pos_emb,
+            self_k_cache,
+            self_v_cache,
+            cross_k,
+            cross_v,
+            self_key_lens,
+            mode.into(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_step_with_config(
+        &self,
+        token: &Tensor,
+        pos_emb: &Tensor,
+        self_k_cache: &Tensor,
+        self_v_cache: &Tensor,
+        cross_k: &Tensor,
+        cross_v: &Tensor,
+        self_key_lens: &Tensor,
+        attention: StepAttentionConfig,
+    ) -> Result<(Tensor, Tensor, Tensor)> {
         let n_head = self.n_head;
         let n_layer = self.blocks.len();
         let d_head = self.n_state / n_head;
@@ -462,12 +553,14 @@ impl TextDecoder {
                     operation: "forward_step cross cache length".into(),
                 }),
             })?;
-        let cross_splits = if cross_key_count >= 1000 && cross_key_count.is_multiple_of(4) { 4 } else { 1 };
+        let cross_splits = attention
+            .cross_splits
+            .unwrap_or_else(|| if cross_key_count >= 1000 && cross_key_count.is_multiple_of(4) { 4 } else { 1 });
 
         // Embed single token + positional embedding
         let tok_emb = self.token_embedding.embedding(token).context(TensorSnafu)?;
         let x = tok_emb.try_add(pos_emb).context(TensorSnafu)?;
-        let x = x.cast(self_k_cache.uop().dtype()).context(TensorSnafu)?;
+        let x = x.cast(self.activation_dtype.clone()).context(TensorSnafu)?;
 
         let mut x = x;
         let mut new_ks: Vec<Tensor> = Vec::with_capacity(n_layer);
@@ -504,20 +597,36 @@ impl TextDecoder {
             let full_k = Tensor::cat(&[&cached_k, &new_k_seq], 1).context(TensorSnafu)?;
             let full_v = Tensor::cat(&[&cached_v, &new_v_seq], 1).context(TensorSnafu)?;
 
-            let direct = svod_tk::single_query_attention(
-                &q_seq,
-                &full_k,
-                &full_v,
-                svod_tk::SqAttentionOpts { key_lens: Some(self_key_lens), include_last: true, split: 1 },
-            )
-            .map_err(|e| svod_tensor::error::Error::IrConstruction { details: e.to_string() })
-            .context(TensorSnafu)?;
+            let direct = if attention.custom_self {
+                svod_tk::single_query_attention(
+                    &q_seq.cast(DType::Float32).context(TensorSnafu)?,
+                    &full_k,
+                    &full_v,
+                    svod_tk::SqAttentionOpts { key_lens: Some(self_key_lens), include_last: true, split: 1 },
+                )
+                .map_err(|e| svod_tensor::error::Error::IrConstruction { details: e.to_string() })
+                .context(TensorSnafu)?
+            } else {
+                None
+            };
             let attn_out = match direct {
-                Some(out) => out.try_reshape([batch, 1, self.n_state]).context(TensorSnafu)?,
+                Some(out) => out
+                    .try_reshape([batch, 1, self.n_state])
+                    .context(TensorSnafu)?
+                    .cast(self.activation_dtype.clone())
+                    .context(TensorSnafu)?,
                 None => {
                     let q_h = q_seq.try_permute(&[0, 2, 1, 3]).context(TensorSnafu)?;
-                    let full_k_h = full_k.try_permute(&[0, 2, 1, 3]).context(TensorSnafu)?;
-                    let full_v_h = full_v.try_permute(&[0, 2, 1, 3]).context(TensorSnafu)?;
+                    let full_k_h = full_k
+                        .cast(self.activation_dtype.clone())
+                        .context(TensorSnafu)?
+                        .try_permute(&[0, 2, 1, 3])
+                        .context(TensorSnafu)?;
+                    let full_v_h = full_v
+                        .cast(self.activation_dtype.clone())
+                        .context(TensorSnafu)?
+                        .try_permute(&[0, 2, 1, 3])
+                        .context(TensorSnafu)?;
                     let mask = cached_step_mask(self_key_lens, batch, self_key_count)?;
                     let out = q_h
                         .scaled_dot_product_attention()
@@ -538,23 +647,35 @@ impl TextDecoder {
             let cq = block.cross_attn.query.forward(&h)?;
             let cq_seq = cq.try_reshape([batch, 1, n_head, d_head]).context(TensorSnafu)?;
 
-            let direct = svod_tk::single_query_attention_packed(
-                &cq_seq,
-                cross_k,
-                cross_v,
-                lh_start,
-                svod_tk::SqAttentionOpts { split: cross_splits, ..Default::default() },
-            )
-            .map_err(|e| svod_tensor::error::Error::IrConstruction { details: e.to_string() })
-            .context(TensorSnafu)?;
+            let direct = if attention.custom_cross {
+                svod_tk::single_query_attention_packed(
+                    &cq_seq.cast(DType::Float32).context(TensorSnafu)?,
+                    cross_k,
+                    cross_v,
+                    lh_start,
+                    svod_tk::SqAttentionOpts { split: cross_splits, ..Default::default() },
+                )
+                .map_err(|e| svod_tensor::error::Error::IrConstruction { details: e.to_string() })
+                .context(TensorSnafu)?
+            } else {
+                None
+            };
             let cross_out = match direct {
-                Some(out) => out.try_reshape([batch, 1, self.n_state]).context(TensorSnafu)?,
+                Some(out) => out
+                    .try_reshape([batch, 1, self.n_state])
+                    .context(TensorSnafu)?
+                    .cast(self.activation_dtype.clone())
+                    .context(TensorSnafu)?,
                 None => {
                     let layer_ck = cross_k
                         .try_shrink([None, None, Some((lh_start as isize, lh_end as isize)), None])
+                        .context(TensorSnafu)?
+                        .cast(self.activation_dtype.clone())
                         .context(TensorSnafu)?;
                     let layer_cv = cross_v
                         .try_shrink([None, None, Some((lh_start as isize, lh_end as isize)), None])
+                        .context(TensorSnafu)?
+                        .cast(self.activation_dtype.clone())
                         .context(TensorSnafu)?;
                     let cq_h = cq_seq.try_permute(&[0, 2, 1, 3]).context(TensorSnafu)?;
                     let layer_ck_h = layer_ck.try_permute(&[0, 2, 1, 3]).context(TensorSnafu)?;
@@ -614,7 +735,7 @@ impl TextDecoder {
         let x = self.ln.apply(&x)?;
         let logits = x
             .linear()
-            .weight(&self.token_embedding)
+            .weight(&self.token_embedding.cast(x.uop().dtype()).context(TensorSnafu)?)
             .call()
             .context(TensorSnafu)?
             .cast(DType::Float32)

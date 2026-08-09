@@ -15,14 +15,19 @@ use super::model::Whisper;
 impl Whisper {
     /// Load from a safetensors state dict.
     ///
-    /// HuggingFace Transformers checkpoints (`model.safetensors`) store the
-    /// weights in Float16; the compute dtype is `dims.dtype` (Float16 by
-    /// default, settable to Float32 for CPU parity). Weights are cast to
-    /// `dims.dtype` before loading; int tensors (e.g. integer embeddings) are
-    /// left untouched by [`state::cast_all`].
+    /// HuggingFace Transformers checkpoints store weights in Float32. Linear
+    /// and convolution weights are cast to `dims.dtype`, while embeddings and
+    /// LayerNorm affine parameters retain checkpoint precision to match
+    /// OpenAI's mixed-precision forward pass.
     pub fn from_state_dict(sd: &StateDict, dims: ModelDimensions) -> Result<Self> {
         let dtype = dims.dtype.clone();
-        let sd = state::cast_all(&remap_hf_keys(sd), dtype);
+        let remapped = remap_hf_keys(sd);
+        let mut sd = state::cast_all(&remapped, dtype);
+        for (key, tensor) in &remapped {
+            if keeps_checkpoint_dtype(key) {
+                sd.insert(key.clone(), tensor.clone());
+            }
+        }
         let mut model = Self::empty(dims);
         model.load_state_dict(&sd, "").map_err(|e| Error::State { source: e })?;
         Ok(model)
@@ -50,6 +55,15 @@ impl Whisper {
         let repo = format!("openai/whisper-{}", size.name());
         Self::from_hub(&repo, "main", dims)
     }
+}
+
+fn keeps_checkpoint_dtype(key: &str) -> bool {
+    key == "encoder.positional_embedding"
+        || key == "decoder.positional_embedding"
+        || key == "decoder.token_embedding.weight"
+        || key.starts_with("encoder.ln_post.")
+        || key.starts_with("decoder.ln.")
+        || [".attn_ln.", ".cross_attn_ln.", ".mlp_ln."].iter().any(|part| key.contains(part))
 }
 
 /// Remap HuggingFace Transformers keys to the original OpenAI naming

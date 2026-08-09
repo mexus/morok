@@ -124,7 +124,7 @@ impl AudioEncoder {
         // feeds fp32 mel). Matches `model.py:48` weight.to(x.dtype) from the
         // other direction — we cast x to the weight dtype so the graph is uniform.
         let dtype = self.conv1.weight.uop().dtype().clone();
-        let mel = mel.cast(dtype).context(TensorSnafu)?;
+        let mel = mel.cast(dtype.clone()).context(TensorSnafu)?;
         let x = self.conv1.forward(&mel)?;
         let x = x.gelu_exact().context(TensorSnafu)?;
         let x = self.conv2.forward(&x)?;
@@ -134,7 +134,7 @@ impl AudioEncoder {
         let x = x.try_permute(&[0, 2, 1]).context(TensorSnafu)?;
 
         // Add positional embedding [n_audio_ctx, D]
-        let x = x.try_add(&self.positional_embedding).context(TensorSnafu)?;
+        let x = x.try_add(&self.positional_embedding).context(TensorSnafu)?.cast(dtype).context(TensorSnafu)?;
 
         let shape = x.shape().context(TensorSnafu)?;
         let concrete = |axis: usize, operation: &str| {

@@ -49,7 +49,8 @@ fn encoder_output_matches_pytorch() {
     let weights = resolve_file("model.safetensors");
     let golden_path = resolve_file("golden.safetensors");
 
-    let dims = ModelDimensions::for_size(WhisperSize::Tiny);
+    let mut dims = ModelDimensions::for_size(WhisperSize::Tiny);
+    dims.dtype = DType::Float32;
     let sd = state::load_safetensors(&weights).expect("load weights");
     // Strip "model." prefix if present (HF safetensors)
     let sd: StateDict = sd
@@ -88,7 +89,8 @@ fn decoder_logits_match_pytorch() {
     let weights = resolve_file("model.safetensors");
     let golden_path = resolve_file("golden.safetensors");
 
-    let dims = ModelDimensions::for_size(WhisperSize::Tiny);
+    let mut dims = ModelDimensions::for_size(WhisperSize::Tiny);
+    dims.dtype = DType::Float32;
     let sd = state::load_safetensors(&weights).expect("load weights");
     let sd: StateDict = sd
         .iter()

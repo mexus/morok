@@ -30,10 +30,10 @@ pub struct ModelDimensions {
     pub n_text_state: usize,
     pub n_text_head: usize,
     pub n_text_layer: usize,
-    /// Compute dtype for weights and activations. Defaults to Float16
-    /// (matching HuggingFace checkpoint storage); set to Float32 for CPU
-    /// parity tests or hardware without fp16 support. fp8 is viable on
-    /// AMD-GPU paths only (CPU/MLIR treat it as raw i8).
+    /// Compute dtype for projected weights and activations. Defaults to
+    /// Float16; set to Float32 for CPU parity tests or hardware without fp16
+    /// support. fp8 is viable on AMD-GPU paths only (CPU/MLIR treat it as raw
+    /// i8).
     pub dtype: DType,
 }
 

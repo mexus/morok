@@ -146,6 +146,48 @@ fn low_precision_cross_projection_keeps_fp32_cache_storage() {
 }
 
 #[test]
+fn low_precision_load_preserves_openai_fp32_parameters() {
+    let source_dims = small_decoder_dims();
+    let source = Whisper::empty(source_dims.clone()).state_dict("");
+    let mut low_dims = source_dims;
+    low_dims.dtype = DType::Float16;
+    let model = Whisper::from_state_dict(&source, low_dims).unwrap();
+
+    assert_eq!(model.encoder.conv1.weight.uop().dtype(), DType::Float16);
+    assert_eq!(model.encoder.blocks[0].attn.query.weight.uop().dtype(), DType::Float16);
+    assert_eq!(model.encoder.positional_embedding.uop().dtype(), DType::Float32);
+    assert_eq!(model.encoder.blocks[0].attn_ln.weight.uop().dtype(), DType::Float32);
+    assert_eq!(model.decoder.token_embedding.uop().dtype(), DType::Float32);
+    assert_eq!(model.decoder.positional_embedding.uop().dtype(), DType::Float32);
+    assert_eq!(model.decoder.blocks[0].cross_attn_ln.bias.uop().dtype(), DType::Float32);
+    assert_eq!(model.decoder.ln.weight.uop().dtype(), DType::Float32);
+}
+
+#[test]
+fn low_precision_prefill_does_not_inherit_fp32_cache_storage_dtype() {
+    let source_dims = small_decoder_dims();
+    let source = Whisper::empty(source_dims.clone()).state_dict("");
+    let mut dims = source_dims;
+    dims.dtype = DType::Float16;
+    let model = Whisper::from_state_dict(&source, dims.clone()).unwrap();
+    let audio = Tensor::from_slice(
+        (0..dims.n_audio_ctx * dims.n_text_state).map(|index| (index as f32 - 9.0) * 0.031).collect::<Vec<_>>(),
+    )
+    .try_reshape([1usize, dims.n_audio_ctx, dims.n_text_state])
+    .unwrap();
+    let tokens = Tensor::from_slice([1i32, 2, 3]).try_reshape([1usize, 3]).unwrap();
+    let (cross_k, cross_v) = model.project_cross_kv(&audio).unwrap();
+    assert_eq!(cross_k.uop().dtype(), DType::Float32);
+
+    let (mut actual, _, _) = model.decode_prefill(&tokens, &cross_k, &cross_v, 0).unwrap();
+    let (mut expected, _, _) = model
+        .decode_prefill(&tokens, &cross_k.cast(DType::Float16).unwrap(), &cross_v.cast(DType::Float16).unwrap(), 0)
+        .unwrap();
+    Tensor::realize_batch([&mut actual, &mut expected]).unwrap();
+    assert_eq!(actual.as_vec::<f32>().unwrap(), expected.as_vec::<f32>().unwrap());
+}
+
+#[test]
 fn prepared_cross_kv_materializes_each_projection_before_packing() {
     let mut dims = small_decoder_dims();
     dims.n_text_layer = 3;
