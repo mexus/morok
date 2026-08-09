@@ -1029,7 +1029,20 @@ fn collect_callable_buffers(
                 buffers.push(buffer);
                 uop_ids.push(canonical_src.id);
             }
-            Op::Buffer { size, .. } | Op::Param { size, .. } => {
+            Op::Buffer { .. } | Op::Param { .. } => {
+                let size = match canonical_src.op() {
+                    Op::Buffer { size, .. } => *size,
+                    Op::Param { .. } => canonical_src
+                        .shape()
+                        .ok()
+                        .flatten()
+                        .and_then(svod_ir::shape::to_static)
+                        .and_then(|shape| shape.into_iter().try_fold(1usize, usize::checked_mul))
+                        .ok_or_else(|| Error::IrConstruction {
+                            details: "PARAM allocation requires a concrete shape".to_string(),
+                        })?,
+                    _ => unreachable!(),
+                };
                 let canonical_id = canonical_src.buf_uop().id;
                 if canonical_id != canonical_src.id {
                     alias_ids.push(canonical_src.id);
@@ -1060,7 +1073,7 @@ fn collect_callable_buffers(
                     } else {
                         Default::default()
                     };
-                    let buffer = Buffer::new(target_device.allocator.clone(), scalar_dtype.clone(), vec![*size], spec);
+                    let buffer = Buffer::new(target_device.allocator.clone(), scalar_dtype.clone(), vec![size], spec);
 
                     // Track in allocated_buffers
                     allocated_buffers.insert(canonical_id, buffer.clone());

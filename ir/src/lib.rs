@@ -49,7 +49,8 @@ pub use opt::{Opt, OptArg, OptOps};
 pub use sint::{IntoShrinkRange, SInt, ShrinkRange, sint_max, sint_min, sint_prod};
 pub use types::{
     AddrSpace, AxisId, AxisType, BinaryOp, BufferizeOpts, CallInfo, ConstValue, ConstValueHash, ContiguousHint,
-    CustomFunctionKind, KernelInfo, ReduceOp, RendererDevice, TernaryOp, UnaryOp, WmmaMetadata, WmmaUpcastAxes,
+    CustomFunctionKind, KernelInfo, ParamArg, ReduceOp, RendererDevice, TernaryOp, UnaryOp, WmmaMetadata,
+    WmmaUpcastAxes,
 };
 pub use uop::{
     CanonicalArg, CanonicalConst, CanonicalDType, CanonicalGraph, CanonicalNode, CanonicalShapeDim, IntoUOp, UOp,

@@ -858,8 +858,8 @@ pub(crate) fn restore_post_schedule_cache(root: &Arc<UOp>, normalization: &Sched
 
     for node in root.toposort() {
         match node.op() {
-            Op::Param { slot, device: Some(_), .. } => {
-                if let Some(original) = normalization.param_values.get(*slot) {
+            Op::Param { arg, .. } if arg.device.is_some() => {
+                if let Some(original) = normalization.param_values.get(arg.slot) {
                     let restored_original = restore_post_schedule_cache(original, normalization);
                     subs.insert(UOpKey(node.clone()), restored_original);
                 }
@@ -907,11 +907,14 @@ fn restore_bind_placeholders_for_schedule(root: &Arc<UOp>, normalization: &Sched
     let mut subs: HashMap<UOpKey, Arc<UOp>> = HashMap::new();
 
     for node in root.toposort() {
-        let Op::Param { slot, device: Some(_), .. } = node.op() else {
+        let Op::Param { arg, .. } = node.op() else {
             continue;
         };
+        if arg.device.is_none() {
+            continue;
+        }
 
-        let Some(original) = normalization.param_values.get(*slot) else {
+        let Some(original) = normalization.param_values.get(arg.slot) else {
             continue;
         };
         if matches!(original.op(), Op::Bind { .. }) {

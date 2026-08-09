@@ -1035,7 +1035,7 @@ fn find_kernel_output(ast: &Arc<UOp>) -> Option<Arc<UOp>> {
                 Op::Index { buffer: inner_buf, .. } => inner_buf.clone(),
                 _ => buffer.clone(),
             };
-            if matches!(output_buf.op(), Op::Param { device: None, .. }) {
+            if matches!(output_buf.op(), Op::Param { arg, .. } if arg.device.is_none()) {
                 return Some(output_buf);
             }
         }
@@ -1134,11 +1134,14 @@ pub fn local_to_param_patterns() -> TypedPatternMatcher<LocalAddBufferContext> {
             }
             Some(replacement)
         },
-        // Pre-kernel Param (device: Some) → codegen PARAM (device: None)
-        // Guard: skip codegen PARAMs (device: None) to prevent infinite loop
-        buf @ Param { slot: _, size } if matches!(buf.op(), Op::Param { device: Some(_), .. }) => |buf, size, ctx| {
-            let ptr_dtype = extract_base_dtype(buf.dtype()).ptr(Some(*size), AddrSpace::Global)?;
-            let replacement = UOp::param(ctx.next_param_slot(), *size, ptr_dtype, None);
+        // Pre-kernel PARAM → codegen PARAM. The missing device metadata prevents
+        // this rule from repeatedly matching its own replacement.
+        buf @ Param { arg } if arg.device.is_some() => |buf, arg, ctx| {
+            let Op::Param { shape, .. } = buf.op() else { unreachable!() };
+            let mut arg = arg.clone();
+            arg.slot = ctx.next_param_slot();
+            arg.device = None;
+            let replacement = UOp::new(Op::Param { shape: shape.clone(), arg }, buf.dtype());
             if !ctx.has_buffer(buf) {
                 ctx.map_buffer(buf.clone(), buf.clone());
             }

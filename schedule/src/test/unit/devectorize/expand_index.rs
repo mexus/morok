@@ -90,7 +90,7 @@ fn test_expand_contiguous_preserves_buffer() {
 
     assert_no_ptrcat(&result);
     // Verify codegen PARAM is present in the result tree
-    let define_count = count_ops(&result, |u| matches!(u.op(), Op::Param { device: None, .. }));
+    let define_count = count_ops(&result, |u| matches!(u.op(), Op::Param { arg, .. } if arg.device.is_none()));
     assert!(define_count > 0, "Codegen PARAM reference should be present");
 }
 

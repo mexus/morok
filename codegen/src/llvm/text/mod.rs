@@ -92,7 +92,7 @@ impl Renderer for LlvmTextRenderer {
 
         for node in &nodes {
             match node.op() {
-                Op::Param { device: None, .. } => {
+                Op::Param { .. } => {
                     buffers.push(node.clone());
                 }
                 Op::DefineVar { .. } => {
@@ -102,12 +102,17 @@ impl Renderer for LlvmTextRenderer {
             }
         }
 
-        buffers.sort_by_key(|b| if let Op::Param { slot, device: None, .. } = b.op() { *slot } else { usize::MAX });
+        buffers.sort_by_key(|b| if let Op::Param { arg, .. } = b.op() { arg.slot } else { usize::MAX });
 
         for (i, buf) in buffers.iter().enumerate() {
-            if let Op::Param { slot, device: None, .. } = buf.op() {
+            if let Op::Param { arg, .. } = buf.op() {
                 let is_output = is_output_buffer(buf, &nodes);
-                buffer_args.push(BufferArg { index: *slot, name: format!("data{i}"), dtype: buf.dtype(), is_output });
+                buffer_args.push(BufferArg {
+                    index: arg.slot,
+                    name: format!("data{i}"),
+                    dtype: buf.dtype(),
+                    is_output,
+                });
             }
         }
 

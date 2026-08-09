@@ -490,7 +490,8 @@ pub fn pm_float_decomp() -> crate::TypedPatternMatcher<Fp8DecompCtx> {
         @context Fp8DecompCtx;
 
         // Pattern 1: INDEX/DEFINE with FP8 ptr base → change ptr to UInt8
-        x if matches!(x.op(), Op::Param { device: None, .. } | Op::DefineLocal(_) | Op::Index { .. })
+        x if matches!(x.op(), Op::Param { arg, .. } if arg.device.is_none())
+            || matches!(x.op(), Op::DefineLocal(_) | Op::Index { .. })
             && ctx.should_decomp(x)
         => {
             let uint8_ptr = x.dtype().with_ptr_base(DType::Scalar(ctx.from.float_to_uint()?))?;
@@ -1301,7 +1302,8 @@ pub fn correct_load_store_patterns() -> &'static TypedPatternMatcher<Renderer> {
 // ============================================================================
 
 fn is_define_or_after(uop: &Arc<UOp>) -> bool {
-    matches!(uop.unwrap_after().op(), Op::DefineLocal(_) | Op::DefineReg { .. } | Op::Param { device: None, .. })
+    matches!(uop.unwrap_after().op(), Op::DefineLocal(_) | Op::DefineReg { .. })
+        || matches!(uop.unwrap_after().op(), Op::Param { arg, .. } if arg.device.is_none())
 }
 
 /// Matches INDEX(VECTORIZE(Defines.or_after()), vec_idx) only.
@@ -1481,7 +1483,7 @@ fn fold_expanded_index(midx: &Arc<UOp>) -> Option<Arc<UOp>> {
         return None;
     }
 
-    let DType::Ptr { base, addrspace, size, .. } = buf.dtype().clone() else { return None };
+    let (base, addrspace, size) = buf.ptrdtype()?;
     let scalar_ptr = DType::Ptr { base: Box::new(DType::Scalar(base.scalar()?)), addrspace, size, vcount: 1 };
     let ptrcat_dtype = scalar_ptr.vec(global_offset).expect("scalar pointer with vcount 1 is vectorizable");
     let ptrcat = UOp::ptrcat().sources(ret).dtype(ptrcat_dtype).call();

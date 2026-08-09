@@ -286,7 +286,11 @@ fn test_normalize_for_schedule_cache_collects_var_vals_and_strips_bind_values() 
         "normalized graph should replace BIND placeholders with PARAM for reversible restore"
     );
     assert!(
-        normalized.normalized.toposort().iter().any(|node| matches!(node.op(), Op::Param { device: Some(_), .. })),
+        normalized
+            .normalized
+            .toposort()
+            .iter()
+            .any(|node| matches!(node.op(), Op::Param { arg, .. } if arg.device.is_some())),
         "normalized graph should include PARAM placeholders for stripped runtime BIND values"
     );
 }
@@ -375,7 +379,7 @@ fn test_post_sched_cache_restore_rewrites_call_boundary_params() {
     let restored = crate::realize::restore_post_schedule_cache(&kernel_graph, &normalization);
 
     assert!(
-        restored.toposort().iter().all(|n| !matches!(n.op(), Op::Param { device: Some(_), .. })),
+        restored.toposort().iter().all(|n| !matches!(n.op(), Op::Param { arg, .. } if arg.device.is_some())),
         "restored callable graph should not retain normalized PARAM placeholders"
     );
     assert!(
@@ -402,7 +406,7 @@ fn test_buffer_view_normalization_and_restore_parity() {
         "normalized cache graph should strip BUFFER_VIEW placeholders to PARAM"
     );
     assert!(
-        norm_a.normalized.toposort().iter().any(|n| matches!(n.op(), Op::Param { device: Some(_), .. })),
+        norm_a.normalized.toposort().iter().any(|n| matches!(n.op(), Op::Param { arg, .. } if arg.device.is_some())),
         "normalized buffer-view graph should include PARAM placeholders"
     );
 

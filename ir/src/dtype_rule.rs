@@ -51,7 +51,8 @@ pub fn dtype_from_op(op: &Op) -> Option<DType> {
         Op::Noop | Op::Custom { .. } | Op::CustomI { .. } | Op::VConst { .. } => None,
 
         // These operations still keep their storage dtype outside Op metadata.
-        Op::Param { .. } | Op::Buffer { .. } | Op::DefineLocal(_) | Op::DefineReg { .. } => None,
+        Op::Param { arg, .. } => Some(arg.dtype.clone()),
+        Op::Buffer { .. } | Op::DefineLocal(_) | Op::DefineReg { .. } => None,
         Op::BufferView { buffer, .. } => Some(buffer.dtype()),
         Op::Index { .. } | Op::Load { .. } | Op::PointerIndex { .. } => None,
 

@@ -218,7 +218,7 @@ fn test_full_pipeline_creates_load_for_input_buffers() {
             Op::Index { buffer, .. } => {
                 let buf_name = match buffer.op() {
                     Op::Buffer { .. } => "BUFFER",
-                    Op::Param { device: None, .. } => "PARAM",
+                    Op::Param { arg, .. } if arg.device.is_none() => "PARAM",
                     Op::DefineLocal(_) => "DEFINE_LOCAL",
                     _ => "OTHER",
                 };
@@ -229,8 +229,8 @@ fn test_full_pipeline_creates_load_for_input_buffers() {
                 svod_ir::BinaryOp::Add => "ADD",
                 _ => "BINARY",
             },
-            Op::Param { slot, device: None, .. } => {
-                println!("  PARAM({})", slot);
+            Op::Param { arg, .. } if arg.device.is_none() => {
+                println!("  PARAM({})", arg.slot);
                 continue;
             }
             Op::DefineLocal(id) => {
@@ -259,7 +259,8 @@ fn test_full_pipeline_creates_load_for_input_buffers() {
         .iter()
         .filter(|node| {
             if let Op::Index { buffer, .. } = node.op() {
-                matches!(buffer.op(), Op::Buffer { .. } | Op::Param { device: None, .. })
+                matches!(buffer.op(), Op::Buffer { .. })
+                    || matches!(buffer.op(), Op::Param { arg, .. } if arg.device.is_none())
             } else {
                 false
             }

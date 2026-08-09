@@ -29,7 +29,7 @@ fn test_debuf_global() {
 
     // Should return a codegen PARAM
     let op = result.expect("Expected Some result");
-    assert!(matches!(op.op(), Op::Param { device: None, .. }));
+    assert!(matches!(op.op(), Op::Param { arg, .. } if arg.device.is_none()));
     assert_eq!(ctx.global_counter, 1);
 }
 
@@ -203,7 +203,7 @@ fn test_debuf_buffer_mapping() {
     // Pattern returns codegen PARAM and maps BUFFER → PARAM
     assert!(result.is_some());
     let param = result.unwrap();
-    assert!(matches!(param.op(), Op::Param { slot: 0, device: None, .. }));
+    assert!(matches!(param.op(), Op::Param { arg, .. } if arg.slot == 0 && arg.device.is_none()));
 
     // Buffer should be tracked, mapping to PARAM (not itself)
     assert!(ctx.has_buffer(&buffer));
@@ -599,7 +599,7 @@ fn test_handle_after_global_buffer_tracked() {
     // Should return the buffer unwrapped
     match result {
         Some(op) => {
-            assert!(matches!(op.op(), Op::Param { device: None, .. }));
+            assert!(matches!(op.op(), Op::Param { arg, .. } if arg.device.is_none()));
             // Global buffer SHOULD be in buffer map
             assert!(ctx.has_buffer(&global_buf));
             assert!(Arc::ptr_eq(ctx.get_buffer(&global_buf).unwrap(), &after));

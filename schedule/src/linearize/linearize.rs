@@ -141,7 +141,7 @@ fn run_count(uop: &Arc<UOp>) -> u64 {
 /// Returns `(priority, extra)` where extra is `Some(slot)` for PARAM.
 fn priority(uop: &Arc<UOp>) -> (i32, Option<i64>) {
     match uop.op() {
-        Op::Param { slot, device: None, .. } => (-20, Some(*slot as i64)),
+        Op::Param { arg, .. } if arg.device.is_none() => (-20, Some(arg.slot as i64)),
         Op::DefineLocal(_) => (-18, None),
         Op::DefineReg { .. } => (-17, None),
         Op::Load { .. } => (-1, None),

@@ -660,7 +660,7 @@ pub fn infer_shape_from_op(uop: &UOp) -> crate::Result<Option<Shape>> {
         // =====================================================================
         // Buffer operations have shape (size,)
         Op::Buffer { size, .. } => Some(smallvec![SInt::from(*size)]),
-        Op::Param { size, .. } => Some(smallvec![SInt::from(*size)]),
+        Op::Param { shape, .. } => extract_shape_from_uop(shape),
         Op::BufferView { size, .. } => Some(smallvec![SInt::from(*size)]),
 
         // Passthrough operations

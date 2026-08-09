@@ -244,9 +244,9 @@ impl UOp {
         }
     }
 
-    /// Get pointer dtype components if this UOp has a Ptr dtype.
+    /// Get address dtype components from a Ptr dtype or PARAM metadata.
     ///
-    /// Returns `(base, addrspace, size)` for Ptr types, None otherwise.
+    /// Returns `(base, addrspace, size)` for address-bearing values, None otherwise.
     /// This simplifies pattern matching on pointer types.
     ///
     /// # Examples
@@ -261,8 +261,11 @@ impl UOp {
     /// }
     /// ```
     pub fn ptrdtype(&self) -> Option<(&DType, svod_dtype::AddrSpace, Option<usize>)> {
-        match &self.dtype {
-            DType::Ptr { base, addrspace, size, .. } => Some((base.as_ref(), *addrspace, *size)),
+        match (&self.dtype, self.op()) {
+            (_, Op::Param { arg, .. }) => {
+                Some((&arg.dtype, arg.addrspace.unwrap_or(svod_dtype::AddrSpace::Global), None))
+            }
+            (DType::Ptr { base, addrspace, size, .. }, _) => Some((base.as_ref(), *addrspace, *size)),
             _ => None,
         }
     }
@@ -459,14 +462,7 @@ impl UOp {
                     None
                 }
             }
-            Op::Param { device: Some(device), .. } => {
-                if let Op::Device(spec) = device.op() {
-                    Some(spec.clone())
-                } else {
-                    None
-                }
-            }
-            Op::Param { device: None, .. } => None,
+            Op::Param { arg, .. } => arg.device.clone(),
             Op::Copy { device, .. } => {
                 if let Op::Device(spec) = device.op() {
                     Some(spec.clone())
@@ -1121,14 +1117,9 @@ impl UOp {
                 assert_eq!(new_srcs.len(), 2);
                 Op::Buffer { unique: src(0), device: src(1), size: *size }
             }
-            Op::Param { slot, size, device } => {
-                if device.is_some() {
-                    assert_eq!(new_srcs.len(), 1);
-                    Op::Param { slot: *slot, size: *size, device: Some(src(0)) }
-                } else {
-                    assert_eq!(new_srcs.len(), 0);
-                    return self.clone();
-                }
+            Op::Param { arg, .. } => {
+                assert_eq!(new_srcs.len(), 1);
+                Op::Param { shape: src(0), arg: arg.clone() }
             }
             Op::BufferView { size, offset, .. } => {
                 assert_eq!(new_srcs.len(), 1);

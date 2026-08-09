@@ -153,7 +153,7 @@ fn test_split_store_creates_sink() {
                 };
                 // Buffer should be converted to codegen PARAM
                 assert!(
-                    matches!(store_buf.op(), Op::Param { device: None, .. }),
+                    matches!(store_buf.op(), Op::Param { arg, .. } if arg.device.is_none()),
                     "Expected codegen PARAM, got {:?}",
                     store_buf.op()
                 );

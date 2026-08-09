@@ -180,21 +180,26 @@ impl Renderer for MlirRenderer {
 
         for node in &nodes {
             match node.op() {
-                Op::Param { device: None, .. } => buffers.push(node.clone()),
+                Op::Param { .. } => buffers.push(node.clone()),
                 Op::DefineVar { .. } => variables.push(node.clone()),
                 _ => {}
             }
         }
-        buffers.sort_by_key(|b| if let Op::Param { slot, device: None, .. } = b.op() { *slot } else { usize::MAX });
+        buffers.sort_by_key(|b| if let Op::Param { arg, .. } = b.op() { arg.slot } else { usize::MAX });
 
         // Build buffer_args and var_names for RenderedKernel metadata
         let mut buffer_args: Vec<BufferArg> = Vec::new();
         let mut var_names: Vec<String> = Vec::new();
 
         for (i, buf) in buffers.iter().enumerate() {
-            if let Op::Param { slot, device: None, .. } = buf.op() {
+            if let Op::Param { arg, .. } = buf.op() {
                 let is_output = is_output_buffer(buf, &nodes);
-                buffer_args.push(BufferArg { index: *slot, name: format!("data{i}"), dtype: buf.dtype(), is_output });
+                buffer_args.push(BufferArg {
+                    index: arg.slot,
+                    name: format!("data{i}"),
+                    dtype: buf.dtype(),
+                    is_output,
+                });
             }
         }
         for var in &variables {
@@ -361,7 +366,7 @@ fn render_node<'c, 'a: 'c>(
     match node.op() {
         // Skip meta-ops and already-handled ops
         Op::Const(_)
-        | Op::Param { device: None, .. }
+        | Op::Param { .. }
         | Op::DefineLocal(_)
         | Op::DefineVar { .. }
         | Op::Noop

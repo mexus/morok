@@ -101,8 +101,19 @@ impl UOp {
         // Determine result dtype based on (dtype, ptr) parameters
         // Priority: explicit dtype > ptr flag > default (element type)
         let result_dtype = match (dtype, ptr.unwrap_or(false)) {
-            (Some(d), _) => d,              // Explicit dtype takes precedence
-            (None, true) => buffer.dtype(), // ptr=true: keep Ptr dtype
+            (Some(d), _) => d, // Explicit dtype takes precedence
+            (None, true) => match buffer.dtype() {
+                dtype @ DType::Ptr { .. } => dtype,
+                _ => buffer
+                    .ptrdtype()
+                    .map(|(base, addrspace, size)| DType::Ptr {
+                        base: Box::new(base.clone()),
+                        addrspace,
+                        size,
+                        vcount: 1,
+                    })
+                    .unwrap_or_else(|| buffer.dtype()),
+            },
             (None, false) => match buffer.dtype() {
                 // ptr=false: extract element type
                 DType::Ptr { base, .. } => base.as_ref().clone(),

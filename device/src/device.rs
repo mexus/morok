@@ -834,7 +834,7 @@ impl ProgramSpec {
         /// derivation looks through these wrappers too.
         fn walk(uop: &Arc<UOp>) -> Option<usize> {
             match uop.op() {
-                Op::Param { slot, device: None, .. } => Some(*slot),
+                Op::Param { arg, .. } if arg.device.is_none() => Some(arg.slot),
                 Op::Index { buffer, .. } => walk(buffer),
                 Op::Cast { src, .. } | Op::BitCast { src, .. } => walk(src),
                 Op::Gep { vector, .. } => walk(vector),
@@ -864,8 +864,8 @@ impl ProgramSpec {
                         global_size[0] = UOp::index_const(max_val.saturating_add(1));
                     }
                 }
-                Op::Param { slot, device: None, .. } => {
-                    globals.push(*slot);
+                Op::Param { arg, .. } if arg.device.is_none() => {
+                    globals.push(arg.slot);
                 }
                 Op::Special { end, name } => {
                     if let Some((kind, axis)) = Self::special_launch_axis(name) {

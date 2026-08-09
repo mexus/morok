@@ -41,7 +41,7 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec<Stri
     match uop.op() {
         Op::Const(_)
         | Op::VConst { .. }
-        | Op::Param { device: None, .. }
+        | Op::Param { .. }
         | Op::DefineVar { .. }
         | Op::Noop
         | Op::Sink { .. }
@@ -69,7 +69,10 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec<Stri
 
         Op::Index { buffer, indices, .. } => {
             let buf = ctx.get(buffer);
-            let buf_type = ldt(&buffer.dtype());
+            let buf_type = match buffer.dtype() {
+                DType::Ptr { .. } => ldt(&buffer.dtype()),
+                _ => "ptr".to_string(),
+            };
 
             if indices.is_empty() {
                 kernel.push(format!("  {dst} = bitcast {buf_type} {buf} to {}", ldt(&uop.dtype())));

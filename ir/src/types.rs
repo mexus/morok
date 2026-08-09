@@ -353,6 +353,37 @@ impl ConstValue {
 // Re-export AddrSpace from dtype to avoid duplication
 pub use svod_dtype::AddrSpace;
 
+/// Structured metadata for PARAM and, eventually, BUFFER definitions.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct ParamArg {
+    pub slot: usize,
+    pub dtype: DType,
+    pub vmin_vmax: Option<(ConstValueHash, ConstValueHash)>,
+    pub multiple_of: Option<usize>,
+    pub name: Option<String>,
+    pub addrspace: Option<AddrSpace>,
+    pub axis: Option<usize>,
+    pub device: Option<DeviceSpec>,
+    pub volatile: bool,
+}
+
+impl ParamArg {
+    pub fn buffer(slot: usize, dtype: DType, addrspace: AddrSpace, device: Option<DeviceSpec>) -> Self {
+        Self {
+            slot,
+            dtype,
+            vmin_vmax: None,
+            multiple_of: None,
+            name: None,
+            addrspace: Some(addrspace),
+            axis: None,
+            device,
+            volatile: false,
+        }
+    }
+}
+
 /// Options for BUFFERIZE operation.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[derive(serde::Serialize, serde::Deserialize)]

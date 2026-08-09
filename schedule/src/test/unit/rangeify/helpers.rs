@@ -70,7 +70,7 @@ pub fn extract_kernel(uop: &Arc<UOp>) -> Option<Arc<UOp>> {
 
 /// Count codegen PARAM operations (device: None) in a UOp graph.
 pub fn count_codegen_params(uop: &Arc<UOp>) -> usize {
-    count_ops(uop, |op| matches!(op, Op::Param { device: None, .. }))
+    count_ops(uop, |op| matches!(op, Op::Param { arg, .. } if arg.device.is_none()))
 }
 
 /// Count DEFINE_LOCAL operations in a UOp graph.

@@ -37,22 +37,28 @@ fn canonical_graph_preserves_dag_sharing_and_source_order() {
 }
 
 #[test]
-fn canonical_graph_records_pointer_dtype_and_shape() {
+fn canonical_graph_records_structured_param_and_shape_source() {
     let ptr = DType::Float16.ptr(Some(32), AddrSpace::Global).unwrap();
     let param = UOp::param(4, 32, ptr, None);
     let graph = CanonicalGraph::from_root("kernel_ast", &param).unwrap();
 
-    assert_eq!(graph.nodes[0].shape, Some(vec![CanonicalShapeDim::Const { value: 32 }]));
+    assert_eq!(graph.nodes[1].src, vec![0]);
+    assert_eq!(graph.nodes[1].shape, Some(vec![CanonicalShapeDim::Const { value: 32 }]));
+    assert_eq!(graph.nodes[1].dtype, CanonicalDType::Scalar { name: "float16".to_string() });
     assert_eq!(
-        graph.nodes[0].dtype,
-        CanonicalDType::Pointer {
-            base: Box::new(CanonicalDType::Scalar { name: "float16".to_string() }),
-            address_space: "global".to_string(),
-            size: Some(32),
-            count: 1,
+        graph.nodes[1].arg,
+        CanonicalArg::Param {
+            slot: 4,
+            dtype: CanonicalDType::Scalar { name: "float16".to_string() },
+            vmin_vmax: None,
+            multiple_of: None,
+            name: None,
+            address_space: Some("global".to_string()),
+            axis: None,
+            device: None,
+            volatile: false,
         }
     );
-    assert_eq!(graph.nodes[0].arg, CanonicalArg::Param { slot: 4, size: 32 });
 }
 
 #[test]

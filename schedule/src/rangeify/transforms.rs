@@ -108,7 +108,7 @@ fn resolve_single_function(function: &Arc<UOp>) -> svod_ir::Result<Option<Arc<UO
     let mut params: Vec<(usize, Arc<UOp>)> = body
         .toposort()
         .into_iter()
-        .filter_map(|u| if let Op::Param { slot, .. } = u.op() { Some((*slot, u)) } else { None })
+        .filter_map(|u| if let Op::Param { arg, .. } = u.op() { Some((arg.slot, u)) } else { None })
         .collect();
     params.sort_unstable_by_key(|(slot, _)| *slot);
 
@@ -1194,12 +1194,9 @@ fn reduce_collapse_with(src: &Arc<UOp>, ranges: &[Arc<UOp>], pm: &crate::TypedPa
                 }
                 if matches!(
                     child.op(),
-                    Op::Const(_)
-                        | Op::VConst { .. }
-                        | Op::DefineVar { .. }
-                        | Op::Param { device: None, .. }
-                        | Op::DefineLocal { .. }
-                ) {
+                    Op::Const(_) | Op::VConst { .. } | Op::DefineVar { .. } | Op::DefineLocal { .. }
+                ) || matches!(child.op(), Op::Param { arg, .. } if arg.device.is_none())
+                {
                     return;
                 }
                 let vmin = match child.vmin() {

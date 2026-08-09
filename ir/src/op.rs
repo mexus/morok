@@ -79,9 +79,8 @@ pub enum Op {
     /// enabling structural deduplication of identical computations on different buffers.
     /// Matches Tinygrad's Ops.PARAM (engine/schedule.py:125).
     Param {
-        slot: usize,
-        size: usize,
-        device: Option<Arc<UOp>>,
+        shape: Arc<UOp>,
+        arg: ParamArg,
     },
     Buffer {
         unique: Arc<UOp>,
@@ -355,9 +354,7 @@ impl Op {
             | Self::Source { .. }
             | Self::ProgramBinary { .. } => SmallVec::new(),
 
-            // Param has optional device child — pre-kernel PARAMs have device, codegen PARAMs don't
-            Self::Param { device: Some(d), .. } => SmallVec::from_slice(&[d]),
-            Self::Param { device: None, .. } => SmallVec::new(),
+            Self::Param { shape, .. } => SmallVec::from_slice(&[shape]),
 
             // Graph organization operations
             Self::Sink { sources, .. } | Self::Group { sources } => sources.iter().collect(),

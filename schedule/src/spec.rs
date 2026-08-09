@@ -225,10 +225,13 @@ fn rule_end() -> SpecRule {
     })
 }
 
-/// `spec.py:74` — PARAM (DEFINE_GLOBAL) is a global-address-space pointer.
+/// `spec.py:88-89` — PARAM carries structured metadata and its storage dtype.
 fn rule_param() -> SpecRule {
     Box::new(|u| match u.op() {
-        Op::Param { .. } => Some(ok_if(is_ptr_in(&u.dtype(), AddrSpace::Global), "PARAM must be a GLOBAL pointer")),
+        Op::Param { arg, .. } => Some(ok_if(
+            arg.dtype == u.dtype() && arg.addrspace == Some(AddrSpace::Global),
+            "PARAM dtype/address space must match its metadata",
+        )),
         _ => None,
     })
 }

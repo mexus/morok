@@ -58,7 +58,7 @@ fn test_kmeans_assign_graph_shape() {
         let stores_to = |slot: usize| {
             topo.iter().any(|u| {
                 let Op::Store { .. } = u.op() else { return false };
-                u.toposort().iter().any(|s| matches!(s.op(), Op::Param { slot: p, .. } if *p == slot))
+                u.toposort().iter().any(|s| matches!(s.op(), Op::Param { arg, .. } if arg.slot == slot))
             })
         };
         assert!(stores_to(0), "{arch:?}: store into the ids output (Param 0)");

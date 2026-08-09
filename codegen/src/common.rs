@@ -39,7 +39,7 @@ pub fn collect_buffers_and_vars(root: &Arc<UOp>) -> (Vec<Arc<UOp>>, Vec<Arc<UOp>
     let mut buffers = Vec::new();
     for node in &nodes {
         match node.op() {
-            Op::Buffer { .. } | Op::Param { device: None, .. } | Op::DefineLocal(_) => {
+            Op::Buffer { .. } | Op::Param { .. } | Op::DefineLocal(_) => {
                 buffers.push(node.clone());
             }
             _ => {}
@@ -48,7 +48,7 @@ pub fn collect_buffers_and_vars(root: &Arc<UOp>) -> (Vec<Arc<UOp>>, Vec<Arc<UOp>
 
     // Sort buffers by internal ID (matches split_kernel.rs ordering)
     buffers.sort_by_key(|b| match b.op() {
-        Op::Param { slot, device: None, .. } => *slot as u64,
+        Op::Param { arg, .. } => arg.slot as u64,
         Op::DefineLocal(id) => (*id as u64) + (1u64 << 32),
         Op::Buffer { .. } => b.id + (1u64 << 48),
         _ => b.id,

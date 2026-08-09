@@ -133,7 +133,7 @@ enum OpData {
     // `next_unique_id`). Without the discriminator, `BufferData(0, size)`
     // could collide between an LUnique slot 0 and a Unique with global id 0.
     BufferData { local: bool, id: usize, size: usize },
-    ParamData(usize, usize), // (slot, size) — dedup by structure, matching Tinygrad's UOp cache
+    ParamData(ParamArg),
     BufferView(usize, usize),
     Bufferize(BufferizeOpts),
 
@@ -239,7 +239,7 @@ impl UOpKey {
             Op::Source { code } => OpData::SourceCode(code.clone()),
             Op::ProgramBinary { bytes } => OpData::ProgramBinaryBytes(bytes.clone()),
             Op::Contiguous { opts, .. } => OpData::ContiguousOpts(opts.to_vec()),
-            Op::Param { slot, size, .. } => OpData::ParamData(*slot, *size),
+            Op::Param { arg, .. } => OpData::ParamData(arg.clone()),
             // All remaining ops encode semantic data entirely through children
             // (captured by src_hashes) — no extra OpData needed.
             Op::Noop => OpData::None,

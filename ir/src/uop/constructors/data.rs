@@ -105,7 +105,17 @@ impl UOp {
     /// Used by pre-schedule normalization (BUFFER→PARAM) to erase buffer identity.
     /// Matches Tinygrad's `UOp.param(slot, dtype, shape, device)` (ops.py:817-819).
     pub fn param(slot: usize, size: usize, dtype: DType, device: Option<Arc<Self>>) -> Arc<Self> {
-        Self::new(Op::Param { slot, size, device }, dtype)
+        let (dtype, addrspace) = match dtype {
+            DType::Ptr { base, addrspace, .. } => (*base, addrspace),
+            dtype => (dtype, svod_dtype::AddrSpace::Global),
+        };
+        let device = device.and_then(|device| match device.op() {
+            Op::Device(spec) => Some(spec.clone()),
+            _ => None,
+        });
+        let shape = crate::shape::shape_to_uop(&smallvec::smallvec![crate::SInt::Const(size)]);
+        let arg = crate::ParamArg::buffer(slot, dtype.clone(), addrspace, device);
+        Self::new(Op::Param { shape, arg }, dtype)
     }
 
     /// Create a buffer view.

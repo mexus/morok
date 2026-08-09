@@ -220,7 +220,10 @@ fn test_toposort_call_aware_boundaries() {
     let call = body.call(smallvec![arg0.clone(), arg1.clone()], CallInfo::default());
 
     let include_bodies = call.toposort_call_aware(true);
-    assert!(include_bodies.iter().any(|u| matches!(u.op(), Op::Param { slot: 0, .. })), "expected CALL body params");
+    assert!(
+        include_bodies.iter().any(|u| matches!(u.op(), Op::Param { arg, .. } if arg.slot == 0)),
+        "expected CALL body params"
+    );
 
     let preserve_boundaries = call.toposort_call_aware(false);
     assert!(preserve_boundaries.iter().any(|u| matches!(u.op(), Op::Call { .. })), "expected CALL node itself");
@@ -631,9 +634,9 @@ fn test_placeholder_like_concrete_shape() {
 
     match placeholder.op() {
         Op::Reshape { src, .. } => match src.op() {
-            Op::Param { slot, size, .. } => {
-                assert_eq!(*slot, 7);
-                assert_eq!(*size, 6);
+            Op::Param { shape, arg } => {
+                assert_eq!(arg.slot, 7);
+                assert!(matches!(shape.op(), Op::Const(value) if value.0 == ConstValue::Int(6)));
             }
             op => panic!("expected PARAM under RESHAPE, got {op:?}"),
         },

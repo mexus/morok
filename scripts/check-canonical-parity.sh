@@ -23,11 +23,11 @@ if not expect_equal:
   fixture = sys.argv[1].rsplit('/', 1)[-1].split('-rust.json')[0]
   signatures = {
     "scalar_load": {
-      "rust": [("PARAM", 0), ("CONST", 0), ("INDEX", 2), ("LOAD", 2)],
+      "rust": [("CONST", 0), ("PARAM", 1), ("CONST", 0), ("INDEX", 2), ("LOAD", 2)],
       "python": [("CONST", 0), ("PARAM", 1), ("CONST", 0), ("INDEX", 2), ("LOAD", 1)],
     },
     "gated_load": {
-      "rust": [("PARAM", 0), ("CONST", 0), ("CONST", 0), ("CMPLT", 2), ("INDEX", 3), ("CONST", 0), ("LOAD", 3)],
+      "rust": [("CONST", 0), ("PARAM", 1), ("CONST", 0), ("CONST", 0), ("CMPLT", 2), ("INDEX", 3), ("CONST", 0), ("LOAD", 3)],
       "python": [("CONST", 0), ("PARAM", 1), ("CONST", 0), ("CONST", 0), ("CMPLT", 2), ("CONST", 0), ("WHERE", 3), ("INDEX", 2), ("LOAD", 1)],
     },
   }
@@ -40,10 +40,11 @@ if not expect_equal:
     raise SystemExit(1)
   rust_param = next(node for node in rust["nodes"] if node["op"] == "PARAM")
   python_param = next(node for node in python["nodes"] if node["op"] == "PARAM")
-  assert rust_param["dtype"]["kind"] == "pointer" and python_param["dtype"]["kind"] == "scalar"
+  assert rust_param["dtype"]["kind"] == "scalar" and python_param["dtype"]["kind"] == "scalar"
+  assert rust_param["arg"] == python_param["arg"]
   assert rust["nodes"][-1]["src"][0] == rust_param["id"] and python["nodes"][-1]["src"][0] != python_param["id"]
   detail = " plus WHERE(index, Invalid) validity" if fixture == "gated_load" else ""
-  print(f"known representation divergence: PARAM shape/pointer encoding and redundant LOAD buffer source{detail}")
+  print(f"known representation divergence: redundant LOAD buffer source{detail}")
 PY
   printf 'canonical fixture: %s: ok\n' "$fixture"
 done

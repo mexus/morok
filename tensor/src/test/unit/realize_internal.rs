@@ -144,7 +144,7 @@ fn test_restore_post_schedule_pre_schedule_rewrites_runtime_buf_uops() {
             .items
             .iter()
             .flat_map(|item| item.sources.iter())
-            .any(|src| matches!(src.op(), Op::Param { device: Some(_), .. })),
+            .any(|src| matches!(src.op(), Op::Param { arg, .. } if arg.device.is_some())),
         "cached pre-schedule should keep normalized PARAM placeholders"
     );
 
@@ -155,11 +155,11 @@ fn test_restore_post_schedule_pre_schedule_rewrites_runtime_buf_uops() {
             .items
             .iter()
             .flat_map(|item| item.sources.iter())
-            .all(|src| !matches!(src.op(), Op::Param { device: Some(_), .. })),
+            .all(|src| !matches!(src.op(), Op::Param { arg, .. } if arg.device.is_some())),
         "restored pre-schedule should rewrite callable source PARAM placeholders"
     );
     assert!(
-        restored.output_buffer_uops.iter().all(|u| !matches!(u.op(), Op::Param { device: Some(_), .. })),
+        restored.output_buffer_uops.iter().all(|u| !matches!(u.op(), Op::Param { arg, .. } if arg.device.is_some())),
         "restored pre-schedule should rewrite output buffer PARAM placeholders"
     );
     assert!(
@@ -172,7 +172,7 @@ fn test_restore_post_schedule_pre_schedule_rewrites_runtime_buf_uops() {
             .items
             .iter()
             .flat_map(|item| item.sources.iter())
-            .any(|src| matches!(src.op(), Op::Param { device: Some(_), .. })),
+            .any(|src| matches!(src.op(), Op::Param { arg, .. } if arg.device.is_some())),
         "restoring should not mutate cached pre-schedule"
     );
 }

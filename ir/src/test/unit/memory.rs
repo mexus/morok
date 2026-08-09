@@ -91,15 +91,17 @@ fn test_store() {
 
 #[test]
 fn test_codegen_param() {
-    // Per-kernel codegen PARAM: no device, Ptr dtype
+    // Per-kernel codegen PARAM: scalar storage dtype and global address metadata.
     let p = UOp::param(0, 1024, DType::Float32.ptr(Some(1024), svod_dtype::AddrSpace::Global).unwrap(), None);
 
-    assert!(matches!(p.dtype(), DType::Ptr { .. }));
+    assert_eq!(p.dtype(), DType::Float32);
+    assert_eq!(p.shape().unwrap().unwrap()[0].as_const(), Some(1024));
 
-    if let Op::Param { slot, size, device } = p.op() {
-        assert_eq!(*slot, 0);
-        assert_eq!(*size, 1024);
-        assert!(device.is_none());
+    if let Op::Param { arg, .. } = p.op() {
+        assert_eq!(arg.slot, 0);
+        assert_eq!(arg.dtype, DType::Float32);
+        assert_eq!(arg.addrspace, Some(svod_dtype::AddrSpace::Global));
+        assert!(arg.device.is_none());
     } else {
         panic!("Expected Param op");
     }

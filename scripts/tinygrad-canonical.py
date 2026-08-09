@@ -64,11 +64,18 @@ def canonical_value(value: Any) -> Any:
 def canonical_arg(node: UOp) -> dict[str, Any]:
   if node.op is Ops.CONST: return {"kind": "const", "value": canonical_const(node.arg, node.dtype)}
   if node.op is Ops.PARAM and isinstance(node.arg, ParamArg):
-    size = 1
-    for dim in node.shape:
-      if not isinstance(dim, int): return {"kind": "python", "value": canonical_value(node.arg)}
-      size *= dim
-    return {"kind": "param", "slot": node.arg.slot, "size": size}
+    return {
+      "kind": "param",
+      "slot": node.arg.slot,
+      "dtype": canonical_dtype(node.arg.dtype),
+      "vmin_vmax": None if node.arg.vmin_vmax is None else [canonical_const(value, node.arg.dtype) for value in node.arg.vmin_vmax],
+      "multiple_of": node.arg.multiple_of,
+      "name": node.arg.name,
+      "address_space": None if node.arg.addrspace is None else node.arg.addrspace.name.lower(),
+      "axis": node.arg.axis,
+      "device": canonical_value(node.arg.device),
+      "volatile": node.arg.volatile,
+    }
   if node.arg is None: return {"kind": "none"}
   # Unsupported target metadata remains explicit rather than falling back to a
   # Python repr silently. Add a typed mapping when a parity fixture reaches it.
