@@ -5,10 +5,20 @@
 
 use svod_arch::pipelines::audio::Transcriber;
 
+use crate::whisper::transcribe::bounded_window_batches;
 use crate::whisper::{
     DecodeOptions, DecodeStrategy, ModelDimensions, N_TEXT_CTX, WhisperAlignedTranscriber, WhisperPlan, WhisperSize,
     WhisperTask, WhisperTokenizer,
 };
+
+#[test]
+fn long_form_windows_are_consumed_in_bounded_retention_batches() {
+    let windows: Vec<_> = (0..19).collect();
+    let batches: Vec<_> = bounded_window_batches(&windows, 8).map(|batch| batch.to_vec()).collect();
+
+    assert_eq!(batches.iter().map(Vec::len).collect::<Vec<_>>(), [8, 8, 3]);
+    assert_eq!(batches.concat(), windows);
+}
 
 /// Loads whisper-tiny + tokenizer from HuggingFace Hub and builds a
 /// transcriber with the same options soroka uses.

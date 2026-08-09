@@ -292,10 +292,14 @@ impl Transcriber for WhisperRecognizer {
         windows: &[&[f32]],
         profile: bool,
     ) -> Result<(Vec<Transcript>, Option<RunProfile>), Self::Error> {
-        let (recognized, mut profile_result, copies) = self.recognize_windows(windows, profile)?;
-        let transcripts = recognized
-            .into_iter()
-            .map(|recognized| {
+        let mut transcripts = Vec::with_capacity(windows.len());
+        let mut profile_result = profile.then(RunProfile::default);
+        // Recognized windows own device-resident cross K/V snapshots. Consume
+        // them one encoder batch at a time instead of retaining one pair for
+        // every window in a long recording.
+        for batch in bounded_window_batches(windows, self.max_batch) {
+            let (recognized, mut batch_profile, copies) = self.recognize_windows(batch, profile)?;
+            transcripts.extend(recognized.into_iter().map(|recognized| {
                 let segments = super::decode::split_into_segments(
                     &recognized.result.tokens,
                     &self.tokenizer,
@@ -307,11 +311,14 @@ impl Transcriber for WhisperRecognizer {
                     segments,
                     language: recognized.result.language,
                 }
-            })
-            .collect();
-        if let Some(profile) = &mut profile_result {
-            for stage in copies.stages() {
-                profile.push(stage);
+            }));
+            if let Some(batch_profile) = &mut batch_profile {
+                for stage in copies.stages() {
+                    batch_profile.push(stage);
+                }
+            }
+            if let (Some(profile_result), Some(batch_profile)) = (&mut profile_result, batch_profile) {
+                profile_result.merge(batch_profile);
             }
         }
         Ok((transcripts, profile_result))
@@ -417,17 +424,29 @@ impl Transcriber for WhisperAlignedTranscriber {
         windows: &[&[f32]],
         profile: bool,
     ) -> Result<(Vec<Transcript>, Option<RunProfile>), Self::Error> {
-        let (recognized, mut profile_result, mut copies) = self.recognizer.recognize_windows(windows, profile)?;
-        let (transcripts, alignment) = self.align_recognized(recognized, profile, &mut copies)?;
-        if let Some(profile) = &mut profile_result {
-            profile.push(alignment.graph.stage("alignment_graph"));
-            profile.push(StageProfile::host("alignment_cpu_dtw", alignment.cpu_dtw_wall));
-            for stage in copies.stages() {
-                profile.push(stage);
+        let mut transcripts = Vec::with_capacity(windows.len());
+        let mut profile_result = profile.then(RunProfile::default);
+        for batch in bounded_window_batches(windows, self.recognizer.max_batch) {
+            let (recognized, mut batch_profile, mut copies) = self.recognizer.recognize_windows(batch, profile)?;
+            let (batch_transcripts, alignment) = self.align_recognized(recognized, profile, &mut copies)?;
+            transcripts.extend(batch_transcripts);
+            if let Some(batch_profile) = &mut batch_profile {
+                batch_profile.push(alignment.graph.stage("alignment_graph"));
+                batch_profile.push(StageProfile::host("alignment_cpu_dtw", alignment.cpu_dtw_wall));
+                for stage in copies.stages() {
+                    batch_profile.push(stage);
+                }
+            }
+            if let (Some(profile_result), Some(batch_profile)) = (&mut profile_result, batch_profile) {
+                profile_result.merge(batch_profile);
             }
         }
         Ok((transcripts, profile_result))
     }
+}
+
+pub(crate) fn bounded_window_batches<T>(windows: &[T], batch_size: usize) -> impl Iterator<Item = &[T]> {
+    windows.chunks(batch_size.max(1))
 }
 
 impl WhisperRecognizer {
