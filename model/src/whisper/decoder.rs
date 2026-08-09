@@ -462,7 +462,7 @@ impl TextDecoder {
                     operation: "forward_step cross cache length".into(),
                 }),
             })?;
-        let cross_splits = if cross_key_count >= 1000 && cross_key_count.is_multiple_of(10) { 10 } else { 1 };
+        let cross_splits = if cross_key_count >= 1000 && cross_key_count.is_multiple_of(4) { 4 } else { 1 };
 
         // Embed single token + positional embedding
         let tok_emb = self.token_embedding.embedding(token).context(TensorSnafu)?;
