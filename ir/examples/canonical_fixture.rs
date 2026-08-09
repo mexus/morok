@@ -1,4 +1,4 @@
-use svod_dtype::DType;
+use svod_dtype::{AddrSpace, DType};
 use svod_ir::{BinaryOp, CanonicalGraph, ConstValue, Op, TernaryOp, UOp};
 
 fn fixture(name: &str) -> std::sync::Arc<UOp> {
@@ -13,6 +13,21 @@ fn fixture(name: &str) -> std::sync::Arc<UOp> {
             let condition = UOp::const_(DType::Bool, ConstValue::Bool(true));
             let value = UOp::const_(DType::Float16, ConstValue::Float(1.0));
             UOp::new(Op::Ternary(TernaryOp::Where, condition, value, UOp::invalid_marker()), DType::Float16)
+        }
+        "scalar_load" | "gated_load" => {
+            let param = UOp::param(0, 16, DType::Float32.ptr(Some(16), AddrSpace::Global).unwrap(), None);
+            let index = UOp::index_const(3);
+            let gate = if name == "gated_load" {
+                Some(UOp::new(Op::Binary(BinaryOp::Lt, index.clone(), UOp::index_const(5)), DType::Bool))
+            } else {
+                None
+            };
+            let indexed = UOp::index().buffer(param.clone()).indices(vec![index]).maybe_gate(gate).call().unwrap();
+            UOp::load()
+                .buffer(param)
+                .index(indexed)
+                .maybe_alt((name == "gated_load").then(|| UOp::const_(DType::Float32, ConstValue::Float(0.0))))
+                .call()
         }
         _ => panic!("unknown fixture {name:?}"),
     }
