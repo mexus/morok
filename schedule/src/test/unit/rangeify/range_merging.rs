@@ -123,9 +123,8 @@ fn test_invalid_marker_detection() {
     // Test that invalid marker is correctly detected
     let invalid = UOp::invalid_marker();
 
-    // Should be Op::Invalid, not a constant
-    assert!(matches!(invalid.op(), Op::Invalid));
-    assert_eq!(invalid.dtype(), DType::Index);
+    assert!(UOp::is_invalid_marker(&invalid));
+    assert_eq!(invalid.dtype(), DType::Bool);
 }
 
 #[test]
@@ -139,7 +138,7 @@ fn test_padding_uses_invalid_marker() {
 
     // Verify structure: WHERE(valid, idx, Invalid)
     if let Op::Ternary(TernaryOp::Where, _cond, _true_val, false_val) = padded.op() {
-        assert!(matches!(false_val.op(), Op::Invalid));
+        assert!(UOp::is_invalid_marker(false_val));
     } else {
         panic!("Expected WHERE operation");
     }

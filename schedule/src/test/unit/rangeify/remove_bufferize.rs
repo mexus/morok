@@ -212,7 +212,7 @@ fn invalid_index_value_is_not_substituted() {
     match result {
         RewriteResult::Rewritten(rewritten) => {
             assert!(
-                !rewritten.any_in_subtree(|n| matches!(n.op(), Op::Invalid)),
+                !rewritten.any_in_subtree(UOp::is_invalid_marker),
                 "Invalid index value must not be substituted into the inlined compute"
             );
             assert!(

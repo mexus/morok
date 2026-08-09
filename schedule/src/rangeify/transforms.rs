@@ -1202,12 +1202,14 @@ fn reduce_collapse_with(src: &Arc<UOp>, ranges: &[Arc<UOp>], pm: &crate::TypedPa
                     return;
                 }
                 let vmin = match child.vmin() {
+                    ConstValue::Invalid => return,
                     ConstValue::Int(i) => *i,
                     ConstValue::UInt(u) => *u as i64,
                     ConstValue::Float(f) => *f as i64,
                     ConstValue::Bool(b) => *b as i64,
                 };
                 let vmax = match child.vmax() {
+                    ConstValue::Invalid => return,
                     ConstValue::Int(i) => *i,
                     ConstValue::UInt(u) => *u as i64,
                     ConstValue::Float(f) => *f as i64,

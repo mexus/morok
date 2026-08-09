@@ -3,6 +3,7 @@ pub mod bitwise;
 pub mod comparison;
 pub mod const_cast;
 pub mod control;
+pub mod dtype_rule;
 pub mod memory;
 pub mod movement;
 pub mod pattern;

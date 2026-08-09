@@ -3,8 +3,9 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use crate::DType;
 use crate::op::Op;
-use crate::types::{AxisType, BinaryOp, ConstValue};
+use crate::types::{AxisType, BinaryOp, ConstValue, ConstValueHash};
 use crate::uop::UOp;
 
 impl UOp {
@@ -390,7 +391,7 @@ impl UOp {
                 // WHERE(valid, idx, INVALID) → return valid
                 cond.clone()
             }
-            Op::Invalid => {
+            Op::Const(ConstValueHash(ConstValue::Invalid)) => {
                 // Bare Invalid is NOT valid
                 Self::const_(DType::Bool, ConstValue::Bool(false))
             }
@@ -403,7 +404,7 @@ impl UOp {
 
     /// Check if a UOp represents an invalid index marker.
     ///
-    /// Matches both scalar `Op::Invalid` and vectorized `VECTORIZE(Invalid, ..., Invalid)`
+    /// Matches both scalar Invalid and vectorized `VECTORIZE(Invalid, ..., Invalid)`
     /// where ALL elements are Invalid. The vectorized form appears after expansion
     /// broadcasts scalar Invalid across lanes.
     ///
@@ -411,10 +412,8 @@ impl UOp {
     /// `has_invalid()` in symbolic patterns which uses `any()` for guard semantics.
     pub fn is_invalid_marker(uop: &Arc<Self>) -> bool {
         match uop.op() {
-            Op::Invalid => true,
-            Op::Vectorize { elements } => {
-                !elements.is_empty() && elements.iter().all(|e| matches!(e.op(), Op::Invalid))
-            }
+            Op::Const(ConstValueHash(ConstValue::Invalid)) => true,
+            Op::Vectorize { elements } => !elements.is_empty() && elements.iter().all(Self::is_invalid_marker),
             _ => false,
         }
     }
@@ -437,10 +436,7 @@ impl UOp {
     /// let padded = UOp::where_op(valid, actual_idx, invalid)?;
     /// ```
     pub fn invalid_marker() -> Arc<Self> {
-        use svod_dtype::DType;
-
-        // Invalid marker for out-of-bounds indices (used in padding/masking)
-        Self::new(Op::Invalid, DType::Index)
+        Self::const_(DType::Bool, ConstValue::Invalid)
     }
 
     /// Check if this UOp is a monotonically increasing function of its inputs.

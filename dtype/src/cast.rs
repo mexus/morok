@@ -5,15 +5,17 @@ impl ScalarDType {
     const fn promotion_lattice(self) -> &'static [Self] {
         use ScalarDType::*;
         match self {
-            Bool => &[Int8, UInt8],
+            Bool => &[WeakInt],
+            WeakInt => &[Int8, UInt8],
             Int8 => &[Int16],
             Int16 => &[Int32],
             Int32 => &[Int64],
-            Int64 => &[FP8E4M3, FP8E5M2],
+            Int64 => &[WeakFloat],
             UInt8 => &[Int16, UInt16],
             UInt16 => &[Int32, UInt32],
             UInt32 => &[Int64, UInt64],
-            UInt64 => &[FP8E4M3, FP8E5M2],
+            UInt64 => &[WeakFloat],
+            WeakFloat => &[FP8E4M3, FP8E5M2],
             FP8E5M2 => &[Float16, BFloat16],
             FP8E4M3 => &[Float16, BFloat16],
             Float16 => &[Float32],
@@ -31,7 +33,7 @@ impl ScalarDType {
 
     /// Check if casting from `from` to `to` is safe (preserves value).
     pub fn can_safe_cast(self, to: Self) -> bool {
-        // Same type (compare discriminants) or from Bool (Bool can cast to anything)
+        // Port of tinygrad's can_lossless_cast.
         if self == to || matches!(self, Self::Bool) {
             return true;
         }
@@ -41,20 +43,42 @@ impl ScalarDType {
             return self.is_int();
         }
 
-        let from_bytes = self.bytes();
-        let to_bytes = to.bytes();
-        match (self.is_unsigned(), self.is_signed(), self.is_float(), to.is_unsigned(), to.is_signed(), to.is_float()) {
-            // Unsigned -> Unsigned: only if target is larger
-            (true, _, _, true, _, _) => from_bytes < to_bytes,
-            // Signed -> Signed: only if target is same size or larger
-            (_, true, _, _, true, _) => from_bytes <= to_bytes,
-            // Unsigned -> Signed: only if target is strictly larger
-            (true, _, _, _, true, _) => from_bytes < to_bytes,
-            // Integer -> Float: safe if integer is Int32 or smaller
-            (_, _, false, _, _, true) => from_bytes <= Self::Int32.bytes(),
-            // Float -> Float: only if target is larger
-            (_, _, true, _, _, true) => from_bytes < to_bytes,
+        use ScalarDType::*;
+        match to {
+            WeakInt => self.is_signed() || self.is_unsigned(),
+            Float64 => matches!(
+                self,
+                Float32 | Float16 | BFloat16 | FP8E4M3 | FP8E5M2 | UInt32 | UInt16 | UInt8 | Int32 | Int16 | Int8
+            ),
+            Float32 => matches!(self, Float16 | BFloat16 | FP8E4M3 | FP8E5M2 | UInt16 | UInt8 | Int16 | Int8),
+            Float16 => matches!(self, FP8E4M3 | FP8E5M2 | UInt8 | Int8),
+            UInt64 => matches!(self, UInt32 | UInt16 | UInt8),
+            UInt32 => matches!(self, UInt16 | UInt8),
+            UInt16 => matches!(self, UInt8),
+            Int64 => matches!(self, UInt32 | UInt16 | UInt8 | Int32 | Int16 | Int8),
+            Int32 => matches!(self, UInt16 | UInt8 | Int16 | Int8),
+            Int16 => matches!(self, UInt8 | Int8),
             _ => false,
+        }
+    }
+
+    /// Commit a weak scalar to the current Tinygrad defaults.
+    pub const fn strong(self) -> Self {
+        match self {
+            Self::WeakInt => Self::Int32,
+            Self::WeakFloat => Self::Float32,
+            _ => self,
+        }
+    }
+
+    /// Return the weak scalar of the same numeric kind.
+    pub const fn weak(self) -> Self {
+        if self.is_int() {
+            Self::WeakInt
+        } else if self.is_float() {
+            Self::WeakFloat
+        } else {
+            self
         }
     }
 }
@@ -120,6 +144,31 @@ impl DType {
             Some(DType::Vector { scalar: scalar_result, count: vcount })
         } else {
             Some(DType::Scalar(scalar_result))
+        }
+    }
+
+    /// Return the floating-point computation dtype for a scalar input.
+    pub fn least_upper_float(dtype: Self) -> Option<Self> {
+        if dtype == Self::WeakInt {
+            Some(Self::WeakFloat)
+        } else if dtype.is_float() || dtype == Self::WeakFloat {
+            Some(dtype)
+        } else {
+            Self::least_upper_dtype(&[dtype, Self::Float32])
+        }
+    }
+
+    pub fn strong_dtype(&self) -> Self {
+        match self {
+            Self::Scalar(s) => Self::Scalar(s.strong()),
+            _ => self.clone(),
+        }
+    }
+
+    pub fn weak_dtype(&self) -> Self {
+        match self {
+            Self::Scalar(s) => Self::Scalar(s.weak()),
+            _ => self.clone(),
         }
     }
 }

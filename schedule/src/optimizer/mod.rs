@@ -386,7 +386,11 @@ pub fn apply_post_optimization_with_renderer(ast: Arc<svod_ir::UOp>, renderer: O
     // =========================================================================
     let t_stage = std::time::Instant::now();
     static PM_FINAL: LazyLock<crate::TypedPatternMatcher> = LazyLock::new(|| {
-        symbolic_simple() + get_late_rewrite_patterns() + pm_render() + crate::linearize::pm_split_ends()
+        symbolic_simple()
+            + get_late_rewrite_patterns()
+            + pm_render()
+            + crate::linearize::pm_split_ends()
+            + crate::symbolic::patterns::pm_remove_invalid()
     });
     let rendered = graph_rewrite(&*PM_FINAL, with_lowered_idx, &mut ());
     tracing::debug!(

@@ -37,8 +37,6 @@ pub enum Op {
     LUnique(usize),
     Device(DeviceSpec),
     Noop,
-    #[pattern(skip)]
-    Invalid,
     DefineLocal(usize),
 
     // Graph organization operations (2 variants)
@@ -347,7 +345,6 @@ impl Op {
             | Self::LUnique(_)
             | Self::Device(_)
             | Self::Noop
-            | Self::Invalid
             | Self::DefineLocal(_)
             | Self::VConst { .. }
             | Self::DefineVar { .. }

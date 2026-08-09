@@ -55,13 +55,28 @@ impl UOp {
             return Err(Error::VoidTypeInOp);
         }
 
-        // Try to find common type
-        let target_dtype = DType::least_upper_dtype(&[lhs_dtype.clone(), rhs_dtype.clone()])
-            .ok_or(Error::TypePromotionFailed { lhs: lhs_dtype.clone(), rhs: rhs_dtype.clone() })?;
+        // Invalid matches any consumer dtype while remaining the canonical bool
+        // node. It does not participate in promotion or receive an implicit cast.
+        let target_dtype = if Self::is_invalid_marker(&lhs) {
+            rhs_dtype.clone()
+        } else if Self::is_invalid_marker(&rhs) {
+            lhs_dtype.clone()
+        } else {
+            DType::least_upper_dtype(&[lhs_dtype.clone(), rhs_dtype.clone()])
+                .ok_or(Error::TypePromotionFailed { lhs: lhs_dtype.clone(), rhs: rhs_dtype.clone() })?
+        };
 
         // Cast if needed
-        let lhs = if lhs_dtype != target_dtype { lhs.cast(target_dtype.clone()) } else { lhs };
-        let rhs = if rhs_dtype != target_dtype { rhs.cast(target_dtype.clone()) } else { rhs };
+        let lhs = if lhs_dtype != target_dtype && !Self::is_invalid_marker(&lhs) {
+            lhs.cast(target_dtype.clone())
+        } else {
+            lhs
+        };
+        let rhs = if rhs_dtype != target_dtype && !Self::is_invalid_marker(&rhs) {
+            rhs.cast(target_dtype.clone())
+        } else {
+            rhs
+        };
 
         Ok((lhs, rhs, target_dtype))
     }
@@ -93,6 +108,7 @@ impl UOp {
         // Only check if divisor is a constant
         if let Op::Const(const_hash) = divisor.op() {
             let is_zero = match const_hash.0 {
+                ConstValue::Invalid => false,
                 ConstValue::Int(v) => v == 0,
                 ConstValue::UInt(v) => v == 0,
                 ConstValue::Float(v) => v == 0.0,

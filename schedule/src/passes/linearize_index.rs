@@ -61,7 +61,7 @@ pub fn extract_index_dimension(idx_uop: &Arc<UOp>) -> Option<i64> {
     // The RANGE inside is the OUTPUT range, which is larger than the buffer dimension.
     // Extract the actual input dimension from the validity condition.
     if let Op::Ternary(svod_ir::TernaryOp::Where, cond, true_val, false_val) = idx_uop.op()
-        && matches!(false_val.op(), Op::Invalid)
+        && UOp::is_invalid_marker(false_val)
     {
         return extract_dim_from_validity(cond, true_val);
     }
@@ -161,7 +161,7 @@ fn as_index_expr(expr: Arc<UOp>) -> Arc<UOp> {
 fn extract_index_dimension_expr(idx_uop: &Arc<UOp>) -> Option<Arc<UOp>> {
     // Case 0: WHERE(cond, idx, Invalid) from PAD
     if let Op::Ternary(svod_ir::TernaryOp::Where, cond, true_val, false_val) = idx_uop.op()
-        && matches!(false_val.op(), Op::Invalid)
+        && UOp::is_invalid_marker(false_val)
     {
         return extract_dim_from_validity(cond, true_val).map(UOp::index_const);
     }

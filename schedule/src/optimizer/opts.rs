@@ -3,7 +3,7 @@
 //! Implements: UPCAST (SIMD), LOCAL (shared memory), GROUP (two-stage reduction),
 //! UNROLL (loop unrolling), SWAP (axis reordering), NOLOCALS (disable local mem).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use smallvec::SmallVec;
@@ -340,8 +340,7 @@ fn apply_nolocals(scheduler: &mut Scheduler) -> Result<(), OptError> {
 ///
 /// - Only pad constant-sized axes
 /// - Cannot pad UPCAST/UNROLL/THREAD axes (already vectorized/expanded)
-/// - For REDUCE axes: only with ADD reduction and no unsafe ops before reduce
-/// - Don't add more than 4x work (padding 1→5 rejected)
+/// - Padding must add strictly less than 4x work
 ///
 /// # Algorithm
 ///
@@ -349,8 +348,6 @@ fn apply_nolocals(scheduler: &mut Scheduler) -> Result<(), OptError> {
 /// 2. Create validity condition: idx < old_size
 /// 3. Add validity gate to all INDEX ops using this range
 fn apply_padto(scheduler: &mut Scheduler, rng: Arc<UOp>, alignment: usize) -> Result<(), OptError> {
-    use svod_ir::ReduceOp;
-
     let (end, axis_id, axis_type) = match rng.op() {
         Op::Range { end, axis_id, axis_type, .. } => (end.clone(), *axis_id, *axis_type),
         _ => return ExpectedRangeOperationSnafu.fail(),
@@ -378,29 +375,9 @@ fn apply_padto(scheduler: &mut Scheduler, rng: Arc<UOp>, alignment: usize) -> Re
         return Ok(());
     }
 
-    // Constraint 4: don't add more than 4x work. Exactly 4x is admitted.
-    if old_sz * 4 < new_sz {
+    // Match Tinygrad: padding must add strictly less than 4x work.
+    if old_sz <= new_sz / 4 {
         return ValidationFailedSnafu { op: "PADTO", reason: "padding would add more than 4x work" }.fail();
-    }
-
-    // Constraint 3: for REDUCE axes, only with ADD and no unsafe ops
-    if matches!(axis_type, AxisType::Reduce | AxisType::GroupReduce)
-        && let Some(reduce_op) = scheduler.reduceop()
-    {
-        // Check reduce operation is ADD
-        if let Op::Reduce { reduce_op: op, .. } = reduce_op.op()
-            && *op != ReduceOp::Add
-        {
-            return ValidationFailedSnafu { op: "PADTO", reason: "can only pad ADD reductions (not MAX/MUL)" }.fail();
-        }
-        // Check for unsafe operations before reduce
-        if has_unsafe_ops_before_reduce(&reduce_op) {
-            return ValidationFailedSnafu {
-                op: "PADTO",
-                reason: "cannot pad with unsafe ops (EXP, LOG, DIV, comparisons) before reduce",
-            }
-            .fail();
-        }
     }
 
     // Create new padded range
@@ -417,6 +394,18 @@ fn apply_padto(scheduler: &mut Scheduler, rng: Arc<UOp>, alignment: usize) -> Re
     #[allow(clippy::mutable_key_type)]
     let mut subst_map = HashMap::new();
     subst_map.insert(UOpKey(rng.clone()), new_rng.clone());
+
+    // Store indices retain their validity directly. Load-side indices also keep
+    // Invalid in the value graph so validity survives later transformations.
+    let store_targets: HashSet<UOpKey> = scheduler
+        .ast()
+        .backward_slice()
+        .into_iter()
+        .filter_map(|node| match node.op() {
+            Op::Store { index, .. } => Some(UOpKey(index.clone())),
+            _ => None,
+        })
+        .collect();
 
     // Update INDEX operations that use this range - add validity gate.
     // The replacement INDEX must use the new padded range in its indices
@@ -467,7 +456,12 @@ fn apply_padto(scheduler: &mut Scheduler, rng: Arc<UOp>, alignment: usize) -> Re
                     ValidationFailedSnafu { op: "PADTO", reason: "failed to create gated INDEX" }.build()
                 })?
             };
-            subst_map.insert(UOpKey(buf_op.clone()), new_index);
+            let replacement = if store_targets.contains(&UOpKey(buf_op.clone())) {
+                new_index
+            } else {
+                new_index.valid(valid.clone())
+            };
+            subst_map.insert(UOpKey(buf_op.clone()), replacement);
         }
     }
 
@@ -481,35 +475,12 @@ fn apply_padto(scheduler: &mut Scheduler, rng: Arc<UOp>, alignment: usize) -> Re
 /// Check if a buffer INDEX operation uses a specific range.
 fn buf_uses_range(buf_op: &Arc<UOp>, rng: &Arc<UOp>) -> bool {
     if let Op::Index { indices, .. } = buf_op.op() {
-        // Check if the range appears in the indices dependency graph
         for idx in indices {
-            for node in idx.toposort() {
+            for node in idx.get_idx().toposort() {
                 if Arc::ptr_eq(&node, rng) {
                     return true;
                 }
             }
-        }
-    }
-    false
-}
-
-/// Check for unsafe operations before reduce that prevent PADTO.
-///
-/// Cannot pad reduce axes if these appear before reduction:
-/// - RECIPROCAL, LOG2, EXP2, IDIV, POW (non-linear ops where padding zeros changes result)
-/// - Comparisons (LT, etc.) that could mask valid data
-fn has_unsafe_ops_before_reduce(reduce_op: &Arc<UOp>) -> bool {
-    use svod_ir::types::{BinaryOp, UnaryOp};
-
-    for node in reduce_op.toposort() {
-        match node.op() {
-            // Unsafe unary ops
-            Op::Unary(UnaryOp::Reciprocal | UnaryOp::Log2 | UnaryOp::Exp2, _) => return true,
-            // Unsafe binary ops
-            Op::Binary(BinaryOp::Idiv | BinaryOp::Pow, _, _) => return true,
-            // Comparisons before sum are unsafe (padding zeros would add false comparisons)
-            Op::Binary(BinaryOp::Lt, _, _) => return true,
-            _ => {}
         }
     }
     false

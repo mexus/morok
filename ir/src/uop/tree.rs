@@ -10,7 +10,7 @@ use std::{borrow::Cow, rc::Rc};
 
 use ptree::{Style, TreeItem};
 
-use crate::{Op, UOp};
+use crate::{ConstValue, ConstValueHash, Op, UOp};
 
 /// Wrapper for compact tree rendering with back-references for shared nodes.
 ///
@@ -102,6 +102,7 @@ fn truncate_for_display(code: &str) -> String {
 /// Output format: `[id] OP_NAME : dtype shape=[...]`
 fn format_node(uop: &Arc<UOp>) -> String {
     let op_str = match uop.op() {
+        Op::Const(ConstValueHash(ConstValue::Invalid)) => "INVALID".to_string(),
         Op::Const(val) => format!("CONST({:?})", val.0),
         Op::DefineLocal(id) => format!("DEFINE_LOCAL({id})"),
         Op::DefineVar { name, min_val, max_val } => format!("DEFINE_VAR('{name}', min={min_val}, max={max_val})"),
@@ -160,7 +161,6 @@ fn format_node(uop: &Arc<UOp>) -> String {
         Op::LUnique(id) => format!("LUNIQUE({id})"),
         Op::Device(spec) => format!("DEVICE({spec:?})"),
         Op::Noop => "NOOP".to_string(),
-        Op::Invalid => "INVALID".to_string(),
         Op::BufferView { size, offset, .. } => format!("BUFFER_VIEW(size={size}, offset={offset})"),
         Op::MStack { .. } => "MSTACK".to_string(),
         Op::MSelect { device_index, .. } => format!("MSELECT(idx={device_index})"),

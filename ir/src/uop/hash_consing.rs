@@ -242,7 +242,7 @@ impl UOpKey {
             Op::Param { slot, size, .. } => OpData::ParamData(*slot, *size),
             // All remaining ops encode semantic data entirely through children
             // (captured by src_hashes) — no extra OpData needed.
-            Op::Noop | Op::Invalid => OpData::None,
+            Op::Noop => OpData::None,
             // Multi-child ops: children ARE the data
             Op::Group { .. }
             | Op::Vectorize { .. }

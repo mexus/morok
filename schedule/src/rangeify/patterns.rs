@@ -619,7 +619,7 @@ fn remove_bufferize(
     let subs_map: HashMap<UOpKey, Arc<UOp>> = buf_ranges
         .iter()
         .zip(idx_ranges.iter())
-        .filter(|(k, v)| !matches!(k.op(), Op::Const(_)) && !matches!(v.op(), Op::Invalid))
+        .filter(|(k, v)| !matches!(k.op(), Op::Const(_)) && !UOp::is_invalid_marker(v))
         .map(|(k, v)| (UOpKey(Arc::clone(k)), Arc::clone(v)))
         .collect();
     Some(src.substitute_gated(&subs_map))
@@ -731,6 +731,7 @@ fn reduce_mul_chain(src: &Arc<UOp>, ranges: &SmallVec<[Arc<UOp>; 4]>, reduce_op:
             // For MAX reduce, only factor out non-negative values
             if reduce_op == ReduceOp::Max {
                 let is_non_negative = match factor.vmin() {
+                    ConstValue::Invalid => false,
                     ConstValue::Int(v) => *v >= 0,
                     ConstValue::UInt(_) => true,
                     ConstValue::Float(v) => *v >= 0.0,

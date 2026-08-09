@@ -19,7 +19,7 @@ use std::sync::LazyLock;
 
 use itertools::Itertools;
 use svod_dtype::{AddrSpace, DType, ScalarDType};
-use svod_ir::{AxisId, BinaryOp, ConstValue, Op, ReduceOp, TernaryOp, UOp, UOpKey, UnaryOp, WmmaMetadata};
+use svod_ir::{AxisId, BinaryOp, ConstValue, ConstValueHash, Op, ReduceOp, UOp, UOpKey, UnaryOp, WmmaMetadata};
 
 use crate::TypedPatternMatcher;
 use smallvec::SmallVec;
@@ -643,7 +643,7 @@ pub fn pm_render() -> &'static TypedPatternMatcher {
         Where(cond, load @ Load { index, .. }, alt)
             if index_has_gate_matching(index, cond)
             => |cond, load, index, alt| {
-                let casted_alt = cast_alt_avoiding_roundtrip(alt, &load.dtype());
+                let casted_alt = cast_load_alt(alt, load);
                 let new_load = UOp::load()
                     .buffer(load.load_buffer()?)
                     .index(index.clone())
@@ -659,7 +659,7 @@ pub fn pm_render() -> &'static TypedPatternMatcher {
         Where(cond, alt, load @ Load { index, .. })
             if index_has_inverted_gate_matching(index, cond)
             => |cond, alt, load, index| {
-                let casted_alt = cast_alt_avoiding_roundtrip(alt, &load.dtype());
+                let casted_alt = cast_load_alt(alt, load);
                 let new_load = UOp::load()
                     .buffer(load.load_buffer()?)
                     .index(index.clone())
@@ -671,16 +671,21 @@ pub fn pm_render() -> &'static TypedPatternMatcher {
     }
 }
 
-/// Cast alt value to load dtype, avoiding roundtrip casts.
+/// Convert a gated load's alternate value, matching Tinygrad's late gater.
+/// Invalid means the load's zero value; casts avoid roundtrips when possible.
 /// If alt is CAST(inner) and inner.dtype == load_dtype, use inner directly
 /// to avoid e.g. uint→float→uint.
-fn cast_alt_avoiding_roundtrip(alt: &Arc<UOp>, load_dtype: &DType) -> Arc<UOp> {
+fn cast_load_alt(alt: &Arc<UOp>, load: &Arc<UOp>) -> Arc<UOp> {
+    if UOp::is_invalid_marker(alt) {
+        return load.const_like(ConstValue::Int(0));
+    }
+    let load_dtype = load.dtype();
     if let Op::Cast { src: inner, .. } = alt.op()
-        && inner.dtype() == *load_dtype
+        && inner.dtype() == load_dtype
     {
         return inner.clone();
     }
-    alt.cast(load_dtype.clone())
+    alt.cast(load_dtype)
 }
 
 /// Check if GEP is identity: GEP(x, [0,1,...,n-1]) where n == x.vcount
@@ -785,14 +790,6 @@ fn devectorize_alu(alu: &Arc<UOp>) -> Option<Arc<UOp>> {
         return None;
     }
 
-    // Skip WHERE(cond, t, Invalid) — used for image indexing.
-    // Handles both scalar Invalid and vectorized VECTORIZE(Invalid,...) from expansion.
-    if let Op::Ternary(TernaryOp::Where, _, _, f) = alu.op()
-        && UOp::is_invalid_marker(f)
-    {
-        return None;
-    }
-
     // Skip ALUs that touch an AMX-WMMA accumulator. Scalarizing here would
     // turn the single `<N x float>` accumulator Add into N scalar ops and
     // prevent `pm_wmma_accumulate` from fusing `Add(WMMA, x)` into the
@@ -808,8 +805,18 @@ fn devectorize_alu(alu: &Arc<UOp>) -> Option<Arc<UOp>> {
     let elements: SmallVec<[Arc<UOp>; 4]> = (0..vcount)
         .map(|i| {
             // Apply GEP to each source, broadcasting scalars
-            let new_sources: Vec<Arc<UOp>> =
-                sources.iter().map(|s| if s.dtype().vcount() > 1 { s.gep(vec![i]) } else { s.clone() }).collect();
+            let new_sources: Vec<Arc<UOp>> = sources
+                .iter()
+                .map(|s| {
+                    if UOp::is_invalid_marker(s) {
+                        UOp::invalid_marker()
+                    } else if s.dtype().vcount() > 1 {
+                        s.gep(vec![i])
+                    } else {
+                        s.clone()
+                    }
+                })
+                .collect();
 
             // CAST and BITCAST need special handling: Op::Cast/BitCast has its own dtype field
             // that must be updated to scalar, not just the UOp's result dtype.
@@ -1422,7 +1429,7 @@ fn fold_expanded_index(midx: &Arc<UOp>) -> Option<Arc<UOp>> {
         let gate_id = lane_gate.as_ref().map_or(u64::MAX, |g| g.id);
 
         let (root, offset) = match idx.op() {
-            Op::Invalid => (UOp::invalid_marker(), 0),
+            Op::Const(ConstValueHash(ConstValue::Invalid)) => (UOp::invalid_marker(), 0),
             Op::Binary(BinaryOp::Add, l, r) if matches!(r.op(), Op::Const(cv) if matches!(cv.0, ConstValue::Int(_))) => {
                 let Op::Const(cv) = r.op() else { unreachable!() };
                 let ConstValue::Int(off) = cv.0 else { unreachable!() };
@@ -1967,7 +1974,7 @@ pub fn pm_reduce() -> TypedPatternMatcher<ReduceContext> {
 
         // Match ALL REDUCEs - empty ranges handled by returning reduced value directly
         red @ Reduce(_, ..) => {
-            reduce_to_acc(red, ctx)
+            normalize_invalid_reduce(red).or_else(|| reduce_to_acc(red, ctx))
         },
 
         // Merge END nodes sharing the same reduce ranges.
@@ -1975,6 +1982,20 @@ pub fn pm_reduce() -> TypedPatternMatcher<ReduceContext> {
             ctx.merge_reduce_ends(_sources)
         },
     }
+}
+
+/// Padded Invalid lanes contribute the operation's identity. This is the
+/// typed-Invalid behavior introduced with Tinygrad's Invalid PADTO.
+fn normalize_invalid_reduce(red: &Arc<UOp>) -> Option<Arc<UOp>> {
+    let Op::Reduce { src, ranges, reduce_op } = red.op() else { return None };
+    let Op::Ternary(svod_ir::TernaryOp::Where, cond, x, invalid) = src.op() else { return None };
+    if !UOp::is_invalid_marker(invalid) {
+        return None;
+    }
+
+    let identity = reduce_identity(*reduce_op, x.dtype());
+    let valid_src = UOp::try_where(cond.clone(), x.clone(), identity).ok()?;
+    Some(UOp::new(Op::Reduce { src: valid_src, ranges: ranges.clone(), reduce_op: *reduce_op }, red.dtype()))
 }
 
 /// Horizontal reduce for accumulator pattern.

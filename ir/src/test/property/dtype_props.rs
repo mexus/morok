@@ -114,6 +114,7 @@ proptest! {
 
         if let Some(casted_int) = zero_int.cast(&dtype) {
             match casted_int {
+                ConstValue::Invalid => unreachable!(),
                 ConstValue::Int(v) => prop_assert_eq!(v, 0),
                 ConstValue::UInt(v) => prop_assert_eq!(v, 0),
                 ConstValue::Float(v) => prop_assert_eq!(v, 0.0),
@@ -123,6 +124,7 @@ proptest! {
 
         if let Some(casted_float) = zero_float.cast(&dtype) {
             match casted_float {
+                ConstValue::Invalid => unreachable!(),
                 ConstValue::Int(v) => prop_assert_eq!(v, 0),
                 ConstValue::UInt(v) => prop_assert_eq!(v, 0),
                 ConstValue::Float(v) => prop_assert_eq!(v, 0.0),
@@ -132,6 +134,7 @@ proptest! {
 
         if let Some(casted_bool) = zero_bool.cast(&dtype) {
             match casted_bool {
+                ConstValue::Invalid => unreachable!(),
                 ConstValue::Int(v) => prop_assert_eq!(v, 0),
                 ConstValue::UInt(v) => prop_assert_eq!(v, 0),
                 ConstValue::Float(v) => prop_assert_eq!(v, 0.0),
@@ -148,6 +151,7 @@ proptest! {
 
         if let Some(casted) = one.cast(&dtype) {
             match casted {
+                ConstValue::Invalid => unreachable!(),
                 ConstValue::Int(v) => prop_assert_eq!(v, 1),
                 ConstValue::UInt(v) => prop_assert_eq!(v, 1),
                 ConstValue::Float(v) => prop_assert_eq!(v, 1.0),
@@ -235,6 +239,7 @@ proptest! {
 /// Convert ConstValue to f64 for numeric comparison.
 fn const_value_to_f64(cv: &ConstValue) -> f64 {
     match cv {
+        ConstValue::Invalid => panic!("Invalid has no numeric value"),
         ConstValue::Int(v) => *v as f64,
         ConstValue::UInt(v) => *v as f64,
         ConstValue::Float(v) => *v,

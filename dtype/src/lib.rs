@@ -163,28 +163,34 @@ pub enum ImageKind {
 pub enum ScalarDType {
     Bool = 0,
 
-    // Interleaved signed/unsigned for correct LUB priority (lower = more specific)
-    Int8 = 1,
-    UInt8 = 2,
-    Int16 = 3,
-    UInt16 = 4,
-    Int32 = 5,
-    UInt32 = 6,
-    Int64 = 7,
-    UInt64 = 8,
+    /// Python integer literal before a consumer commits it to a storage width.
+    WeakInt = 1,
 
-    FP8E4M3 = 9,
-    FP8E5M2 = 10,
-    Float16 = 11,
-    BFloat16 = 12,
-    Float32 = 13,
-    Float64 = 14,
+    // Interleaved signed/unsigned for correct LUB priority (lower = more specific)
+    Int8 = 2,
+    UInt8 = 3,
+    Int16 = 4,
+    UInt16 = 5,
+    Int32 = 6,
+    UInt32 = 7,
+    Int64 = 8,
+    UInt64 = 9,
+
+    /// Python floating-point literal before a consumer commits it to a storage width.
+    WeakFloat = 10,
+
+    FP8E4M3 = 11,
+    FP8E5M2 = 12,
+    Float16 = 13,
+    BFloat16 = 14,
+    Float32 = 15,
+    Float64 = 16,
 
     /// Void type for metadata operations (no data).
-    Void = 15,
+    Void = 17,
 
     /// Index type for array indexing and loop iteration.
-    Index = 16,
+    Index = 18,
 }
 
 /// Data type including scalars, vectors, pointers, and images.
@@ -210,6 +216,7 @@ impl ScalarDType {
     pub const fn bytes(&self) -> usize {
         match self {
             Self::Bool => 1,
+            Self::WeakInt | Self::WeakFloat => 100,
             Self::Int8 => 1,
             Self::Int16 => 2,
             Self::Int32 => 4,
@@ -253,9 +260,15 @@ impl ScalarDType {
         matches!(self, Self::FP8E4M3 | Self::FP8E5M2)
     }
 
+    pub const fn is_weak(&self) -> bool {
+        matches!(self, Self::WeakInt | Self::WeakFloat)
+    }
+
     pub const fn min_value(&self) -> f64 {
         match self {
             Self::Bool => 0.0,
+            Self::WeakInt => i64::MIN as f64,
+            Self::WeakFloat => f64::MIN,
             Self::Int8 => i8::MIN as f64,
             Self::Int16 => i16::MIN as f64,
             Self::Int32 => i32::MIN as f64,
@@ -274,6 +287,8 @@ impl ScalarDType {
     pub const fn max_value(&self) -> f64 {
         match self {
             Self::Bool => 1.0,
+            Self::WeakInt => i64::MAX as f64,
+            Self::WeakFloat => f64::MAX,
             Self::Int8 => i8::MAX as f64,
             Self::Int16 => i16::MAX as f64,
             Self::Int32 => i32::MAX as f64,
@@ -295,6 +310,8 @@ impl ScalarDType {
     pub const fn c_style(&self) -> &'static str {
         match self {
             Self::Bool => "bool",
+            Self::WeakInt => "weakint",
+            Self::WeakFloat => "weakfloat",
             Self::Int8 => "signed char",
             Self::Int16 => "short",
             Self::Int32 => "int",
@@ -563,6 +580,10 @@ impl DType {
         self.base().is_fp8()
     }
 
+    pub fn is_weak(&self) -> bool {
+        self.base().is_weak()
+    }
+
     pub fn min_value(&self) -> f64 {
         self.base().min_value()
     }
@@ -595,6 +616,12 @@ impl DType {
 impl DType {
     pub const fn bool_() -> Self {
         Self::Scalar(ScalarDType::Bool)
+    }
+    pub const fn weakint() -> Self {
+        Self::Scalar(ScalarDType::WeakInt)
+    }
+    pub const fn weakfloat() -> Self {
+        Self::Scalar(ScalarDType::WeakFloat)
     }
     pub const fn int8() -> Self {
         Self::Scalar(ScalarDType::Int8)
@@ -644,6 +671,8 @@ impl DType {
 #[allow(non_upper_case_globals)]
 impl DType {
     pub const Bool: Self = Self::Scalar(ScalarDType::Bool);
+    pub const WeakInt: Self = Self::Scalar(ScalarDType::WeakInt);
+    pub const WeakFloat: Self = Self::Scalar(ScalarDType::WeakFloat);
     pub const Int8: Self = Self::Scalar(ScalarDType::Int8);
     pub const Int16: Self = Self::Scalar(ScalarDType::Int16);
     pub const Int32: Self = Self::Scalar(ScalarDType::Int32);

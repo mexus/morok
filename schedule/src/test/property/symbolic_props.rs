@@ -609,6 +609,7 @@ fn eval_uop(expr: &Arc<UOp>, vars: &std::collections::HashMap<String, i64>) -> O
     use svod_ir::uop::eval::eval_binary_op;
     match expr.op() {
         Op::Const(cv) => match cv.0 {
+            ConstValue::Invalid => Some(i64::MIN),
             ConstValue::Int(v) => Some(v),
             _ => None,
         },
@@ -631,7 +632,6 @@ fn eval_uop(expr: &Arc<UOp>, vars: &std::collections::HashMap<String, i64>) -> O
             let v = eval_uop(x, vars)?;
             Some(if v == 0 { 1 } else { 0 })
         }
-        Op::Invalid => Some(i64::MIN), // sentinel for invalid
         _ => None,
     }
 }

@@ -254,7 +254,7 @@ fn test_where_branch_dtype_compatibility() {
     )
     .unwrap();
     // Result dtype comes from first non-condition argument (true_val)
-    assert_eq!(result.dtype(), DType::Int32);
+    assert_eq!(result.dtype(), DType::Float32);
 }
 
 #[test]

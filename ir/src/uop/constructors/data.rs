@@ -31,6 +31,9 @@ impl UOp {
     ///
     /// Use `native_const` for type-inferred constants from Rust values.
     pub fn const_(dtype: DType, value: ConstValue) -> Arc<Self> {
+        if value == ConstValue::Invalid {
+            return Self::new(Op::Const(ConstValueHash(ConstValue::Invalid)), DType::Bool);
+        }
         let normalized = value.cast(&dtype).unwrap_or(value);
         Self::new(Op::Const(ConstValueHash(normalized)), dtype)
     }

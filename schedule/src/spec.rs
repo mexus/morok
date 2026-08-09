@@ -104,6 +104,10 @@ fn is_ptr_in(dt: &DType, want: AddrSpace) -> bool {
     matches!(dt, DType::Ptr { addrspace, .. } if *addrspace == want)
 }
 
+fn matches_dtype(value: &Arc<UOp>, dtype: &DType) -> bool {
+    value.dtype() == *dtype || UOp::is_invalid_marker(value)
+}
+
 // ============================================================================
 // spec_shared — valid in both the tensor graph and lowered programs
 // (port of `spec_shared`, spec.py:45)
@@ -114,6 +118,7 @@ fn rule_const() -> SpecRule {
     Box::new(|u| match u.op() {
         Op::Const(cvh) => {
             let valid = match cvh.0 {
+                ConstValue::Invalid => u.dtype() == DType::Bool,
                 ConstValue::Bool(_) => u.dtype().is_bool(),
                 ConstValue::Float(_) => u.dtype().is_float(),
                 ConstValue::Int(_) | ConstValue::UInt(_) => u.dtype().is_int(),
@@ -131,23 +136,23 @@ fn rule_alu() -> SpecRule {
         let result_base = u.dtype().base();
         match u.op() {
             // Unary preserves dtype.
-            Op::Unary(_, x) => Some(ok_if(x.dtype().base() == result_base, "unary operand dtype mismatch")),
+            Op::Unary(_, x) => Some(ok_if(matches_dtype(x, &u.dtype()), "unary operand dtype mismatch")),
 
             // WHERE: bool condition, matching value/result dtypes (spec.py:56).
             Op::Ternary(TernaryOp::Where, c, x, y) => Some(ok_if(
-                c.dtype().is_bool() && x.dtype() == y.dtype() && u.dtype() == x.dtype(),
+                c.dtype().is_bool() && matches_dtype(x, &u.dtype()) && matches_dtype(y, &u.dtype()),
                 "WHERE condition must be bool with matching value/result dtypes",
             )),
             // MULACC: a*b+c, all sharing the result base.
             Op::Ternary(TernaryOp::MulAcc, a, b, c) => {
-                Some(ok_if([a, b, c].iter().all(|s| s.dtype().base() == result_base), "MULACC operand dtype mismatch"))
+                Some(ok_if([a, b, c].iter().all(|s| matches_dtype(s, &u.dtype())), "MULACC operand dtype mismatch"))
             }
 
             Op::Binary(op, x, y) => {
                 let (xb, yb) = (x.dtype().base(), y.dtype().base());
                 let valid = if op.is_comparison() {
                     // CMPLT/CMPNE/CMPEQ: bool result, operands share base (spec.py:57).
-                    u.dtype().is_bool() && xb == yb
+                    u.dtype().is_bool() && (matches_dtype(x, &y.dtype()) || matches_dtype(y, &x.dtype()))
                 } else if matches!(op, BinaryOp::Shl | BinaryOp::Shr) {
                     // Shift distance may be a different int width (spec.py:59).
                     u.dtype() == x.dtype() && y.dtype().is_int()
@@ -158,7 +163,7 @@ fn rule_alu() -> SpecRule {
                     // PRNG mixes uint widths; not a uniform-base ALU.
                     true
                 } else {
-                    xb == result_base && yb == result_base
+                    matches_dtype(x, &u.dtype()) && matches_dtype(y, &u.dtype())
                 };
                 Some(ok_if(valid, "binary operand/result dtype mismatch"))
             }
@@ -170,7 +175,7 @@ fn rule_alu() -> SpecRule {
 /// `spec.py:67` — RANGE dtype matches its bound's dtype.
 fn rule_range() -> SpecRule {
     Box::new(|u| match u.op() {
-        Op::Range { end, .. } => Some(ok_if(u.dtype() == end.dtype(), "RANGE dtype must match its bound dtype")),
+        Op::Range { end, .. } => Some(ok_if(matches_dtype(end, &u.dtype()), "RANGE dtype must match its bound dtype")),
         _ => None,
     })
 }
@@ -179,7 +184,7 @@ fn rule_range() -> SpecRule {
 fn rule_index_integer() -> SpecRule {
     Box::new(|u| match u.op() {
         Op::Index { indices, .. } => Some(ok_if(
-            indices.iter().all(|idx| idx.dtype().is_int()),
+            indices.iter().all(|idx| idx.dtype().is_int() || UOp::is_invalid_marker(idx)),
             "non-integer value reached a memory INDEX operand",
         )),
         Op::PointerIndex { offset, .. } => Some(ok_if(offset.dtype().is_int(), "non-integer offset in POINTER_INDEX")),
@@ -292,7 +297,7 @@ fn rule_no_movement() -> SpecRule {
 /// `spec.py:208` — Svod models `Invalid` as its own op (vs tinygrad's
 /// `CONST(arg=Invalid)`); it must be folded out before a program.
 fn rule_no_invalid() -> SpecRule {
-    Box::new(|u| matches!(u.op(), Op::Invalid).then_some(Err("Invalid op must be folded out before a program")))
+    Box::new(|u| UOp::is_invalid_marker(u).then_some(Err("Invalid constant must be folded out before a program")))
 }
 
 /// `PtrCat`/`Cat` (tinygrad PTRCAT/VCAT) must be distributed into scalar

@@ -9,6 +9,7 @@ use svod_ir::{ConstValue, UOp};
 /// Convert a DType to its C scalar type string.
 pub fn c_scalar(s: ScalarDType) -> &'static str {
     match s {
+        ScalarDType::WeakInt | ScalarDType::WeakFloat => panic!("weak dtype reached C rendering"),
         ScalarDType::Bool => "_Bool",
         ScalarDType::Int8 => "signed char",
         ScalarDType::UInt8 => "unsigned char",
@@ -30,6 +31,7 @@ pub fn c_scalar(s: ScalarDType) -> &'static str {
 /// Space-free identifier base for vector typedef names (e.g. `uchar4`, `llong2`).
 fn c_vector_base(s: ScalarDType) -> &'static str {
     match s {
+        ScalarDType::WeakInt | ScalarDType::WeakFloat => panic!("weak dtype reached C vector rendering"),
         ScalarDType::Bool => "bool",
         ScalarDType::Int8 => "schar",
         ScalarDType::UInt8 | ScalarDType::FP8E4M3 | ScalarDType::FP8E5M2 => "uchar",
@@ -65,6 +67,7 @@ pub fn c_dtype(dtype: &DType) -> String {
 /// Render a constant value as a C literal.
 pub fn c_const(val: &ConstValue, dtype: &DType) -> String {
     match val {
+        ConstValue::Invalid => panic!("Invalid reached C constant rendering"),
         ConstValue::Bool(b) => if *b { "1" } else { "0" }.to_string(),
         ConstValue::Int(i) => {
             let base = dtype.base();

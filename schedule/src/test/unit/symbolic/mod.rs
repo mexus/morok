@@ -1293,7 +1293,7 @@ fn test_propagate_invalid_through_neg() {
 
     let cond = UOp::var("c", DType::Bool, 0, 1);
     let x = UOp::var("x", DType::Index, 0, 100);
-    let invalid = UOp::new(Op::Invalid, DType::Index);
+    let invalid = UOp::invalid_marker();
     let gated = UOp::try_where(cond.clone(), x.clone(), invalid.clone()).unwrap();
     let negated = gated.neg(); // MUL(WHERE(cond, x, Invalid), -1)
 
@@ -1304,12 +1304,61 @@ fn test_propagate_invalid_through_neg() {
         panic!("Expected WHERE, got: {}", result.tree());
     };
     assert!(Arc::ptr_eq(c, &cond), "condition should be preserved");
-    assert!(matches!(inv.op(), Op::Invalid), "false branch should be Invalid");
+    assert!(UOp::is_invalid_marker(inv), "false branch should be Invalid");
     assert!(
         matches!(inner.op(), Op::Binary(svod_ir::BinaryOp::Mul, _, _)),
         "true branch should be MUL(x, -1), got: {}",
         inner.tree()
     );
+}
+
+#[test]
+fn test_propagate_invalid_through_cast_preserves_gate() {
+    use crate::symbolic::patterns::propagate_invalid;
+
+    let cond = UOp::var("c", DType::Bool, 0, 1);
+    let x = UOp::var("x", DType::Float16, 0, 100);
+    let gated = UOp::try_where(cond.clone(), x, UOp::invalid_marker()).unwrap();
+    let result = graph_rewrite(propagate_invalid(), gated.cast(DType::Float32), &mut ());
+
+    let Op::Ternary(TernaryOp::Where, result_cond, value, invalid) = result.op() else {
+        panic!("expected gated cast, got: {}", result.tree());
+    };
+    assert!(Arc::ptr_eq(result_cond, &cond));
+    assert!(matches!(value.op(), Op::Cast { .. }));
+    assert!(UOp::is_invalid_marker(invalid));
+    assert_eq!(invalid.dtype(), DType::Bool);
+}
+
+#[test]
+fn test_propagate_invalid_through_comparison_preserves_gate() {
+    use crate::symbolic::patterns::propagate_invalid;
+
+    let cond = UOp::var("c", DType::Bool, 0, 1);
+    let x = UOp::var("x", DType::Float32, 0, 100);
+    let gated = UOp::try_where(cond.clone(), x, UOp::invalid_marker()).unwrap();
+    let result = graph_rewrite(propagate_invalid(), gated.lt(&UOp::native_const(1.0f32)), &mut ());
+
+    let Op::Ternary(TernaryOp::Where, result_cond, value, invalid) = result.op() else {
+        panic!("expected gated comparison, got: {}", result.tree());
+    };
+    assert!(Arc::ptr_eq(result_cond, &cond));
+    assert!(matches!(value.op(), Op::Binary(BinaryOp::Lt, _, _)));
+    assert!(UOp::is_invalid_marker(invalid));
+    assert_eq!(invalid.dtype(), DType::Bool);
+}
+
+#[test]
+fn test_remove_typed_invalid_lanes_at_final_cleanup() {
+    use crate::symbolic::patterns::pm_remove_invalid;
+
+    let invalid = UOp::invalid_marker();
+    let one = UOp::const_(DType::Float16, ConstValue::Float(1.0));
+    let result = graph_rewrite(pm_remove_invalid(), UOp::vectorize(vec![invalid, one].into()), &mut ());
+
+    assert!(!result.any_in_subtree(UOp::is_invalid_marker));
+    let Op::Vectorize { elements } = result.op() else { panic!("expected VECTORIZE, got: {}", result.tree()) };
+    assert!(matches!(elements[0].op(), Op::Const(cv) if cv.0 == ConstValue::Float(0.0)));
 }
 
 // ====== Tests for MINMAX patterns (minmax_dsl_patterns) ======

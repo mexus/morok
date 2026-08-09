@@ -106,11 +106,11 @@ impl Tensor {
 
         match scalar {
             Bool => DType::Int32,
-            Int8 | Int16 => DType::Int32,
+            WeakInt | Int8 | Int16 => DType::Int32,
             Int32 | Int64 => dtype.clone(),
             UInt8 | UInt16 => DType::UInt32,
             UInt32 | UInt64 => dtype.clone(),
-            Float16 | BFloat16 | FP8E4M3 | FP8E5M2 => DType::Float32,
+            WeakFloat | Float16 | BFloat16 | FP8E4M3 | FP8E5M2 => DType::Float32,
             Float32 | Float64 => dtype.clone(),
             Void | Index => dtype.clone(),
         }

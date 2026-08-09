@@ -212,8 +212,8 @@ pub fn propagate_invalid() -> &'static TypedPatternMatcher {
         // engine rebuilds the parent WHERE via with_sources, placing bare INVALID in the true branch.
         // Upstream avoids this because their pattern ordering resolves it during reconstruction;
         // Svod needs explicit canonicalization.
-        Where(cond, inv, x) if matches!(inv.op(), Op::Invalid) => {
-            let invalid = if inv.dtype() == x.dtype() { inv.clone() } else { UOp::new(Op::Invalid, x.dtype()) };
+        Where(cond, inv, x) if UOp::is_invalid_marker(inv) => {
+            let invalid = inv.clone();
             // Inline NOT simplification: if cond is already NOT(c), flipping gives c (not NOT(NOT(c))).
             // Without this, repeated canonicalization creates NOT(NOT(NOT(...))) chains because
             // the rewrite engine doesn't process children between pattern applications on the same node.
@@ -224,6 +224,17 @@ pub fn propagate_invalid() -> &'static TypedPatternMatcher {
             UOp::try_where(flipped, x.clone(), invalid).ok()
         },
 
+        // Invalid control flow poisons the selected value.
+        Where(invalid, _a, _b) if UOp::is_invalid_marker(invalid)
+            ~> UOp::invalid_marker(),
+
+        // A condition that is valid only under `cond` lifts that validity out.
+        Where(Where(cond, x, invalid), a, b) if UOp::is_invalid_marker(invalid) => {
+            let inner = UOp::try_where(x.clone(), a.clone(), b.clone()).ok()?;
+            let marker = UOp::invalid_marker();
+            UOp::try_where(cond.clone(), inner, marker).ok()
+        },
+
         // Merge nested WHERE: a.where(b.where(c, d), d) → (a & b).where(c, d)
         // .
         Where(c1, Where(c2, x, d), d) ~> {
@@ -231,63 +242,98 @@ pub fn propagate_invalid() -> &'static TypedPatternMatcher {
             UOp::try_where(combined, x.clone(), d.clone()).expect("failed to create WHERE")
         },
 
-        // Drop WHERE-Invalid through CAST
-        // CAST(WHERE(cond, x, Invalid)) → CAST(x)
-        // INVALID only lives in Index dtype for INDEX addresses. After CAST to a
-        // different type, the protection is irrelevant — the outer value-level WHERE
-        // on the PAD/Concat handles correctness.
-        Cast { src: Where(_cond, x, invalid), dtype } if matches!(invalid.op(), Op::Invalid) ~> x.cast(dtype.clone()),
+        // Preserve the live outer branch while lifting nested validity.
+        Where(a, Where(cond, x, invalid), c)
+            if UOp::is_invalid_marker(invalid) && !UOp::is_invalid_marker(c)
+            => {
+                let inner = UOp::try_where(a.clone(), x.clone(), c.clone()).ok()?;
+                let combined = a.not().or_(cond);
+                let marker = UOp::invalid_marker();
+                UOp::try_where(combined, inner, marker).ok()
+            },
+        Where(a, b, Where(cond, x, invalid))
+            if UOp::is_invalid_marker(invalid) && !UOp::is_invalid_marker(b)
+            => {
+                let inner = UOp::try_where(a.clone(), b.clone(), x.clone()).ok()?;
+                let combined = a.or_(cond);
+                let marker = UOp::invalid_marker();
+                UOp::try_where(combined, inner, marker).ok()
+            },
 
-        // Push binary ALU (non-comparison) through WHERE-with-Invalid (left operand)
+        // Unary/cast operations preserve Invalid and move inside its gate.
+        for op in unary [*] {
+            op(invalid) if UOp::is_invalid_marker(invalid)
+                ~> { let _ = op; UOp::invalid_marker() },
+            r @ op(Where(cond, x, invalid)) if UOp::is_invalid_marker(invalid) => {
+                let inner = UOp::new(Op::Unary(op, x.clone()), r.dtype());
+                let marker = UOp::invalid_marker();
+                UOp::try_where(cond.clone(), inner, marker).ok()
+            },
+        },
+
+        Cast { src: invalid, .. } if UOp::is_invalid_marker(invalid)
+            ~> UOp::invalid_marker(),
+        Cast { src: Where(cond, x, invalid), dtype } if UOp::is_invalid_marker(invalid) => {
+            let inner = x.cast(dtype.clone());
+            let marker = UOp::invalid_marker();
+            UOp::try_where(cond.clone(), inner, marker).ok()
+        },
+        BitCast { src: invalid, .. } if UOp::is_invalid_marker(invalid)
+            ~> UOp::invalid_marker(),
+        BitCast { src: Where(cond, x, invalid), dtype } if UOp::is_invalid_marker(invalid) => {
+            let inner = x.bitcast(dtype.clone());
+            let marker = UOp::invalid_marker();
+            UOp::try_where(cond.clone(), inner, marker).ok()
+        },
+
+        // Push binary ALU through WHERE-with-Invalid (left operand)
         // ALU(WHERE(cond, x, Invalid), y) → WHERE(cond, ALU(x, y), Invalid)
-        for op in binary [Add, Mul, Sub, Mod, Max, Idiv, Fdiv, Pow, And, Or, Xor, Shl, Shr] {
+        for op in binary [*] {
             r @ op(Where(cond, x, invalid), y)
-                if matches!(invalid.op(), Op::Invalid)
+                if UOp::is_invalid_marker(invalid)
                 ~> {
                     let inner = UOp::new(Op::Binary(op, x.clone(), y.clone()), r.dtype());
-                    UOp::try_where(cond.clone(), inner, invalid.clone()).expect("failed to create WHERE")
+                    let marker = UOp::invalid_marker();
+                    UOp::try_where(cond.clone(), inner, marker).expect("failed to create WHERE")
                 },
         },
 
-        // Push binary ALU (non-comparison) through WHERE-with-Invalid (right operand)
+        // Push binary ALU through WHERE-with-Invalid (right operand)
         // ALU(y, WHERE(cond, x, Invalid)) → WHERE(cond, ALU(y, x), Invalid)
-        for op in binary [Add, Mul, Sub, Mod, Max, Idiv, Fdiv, Pow, And, Or, Xor, Shl, Shr] {
+        for op in binary [*] {
             r @ op(y, Where(cond, x, invalid))
-                if matches!(invalid.op(), Op::Invalid)
+                if UOp::is_invalid_marker(invalid)
                 ~> {
                     let inner = UOp::new(Op::Binary(op, y.clone(), x.clone()), r.dtype());
-                    UOp::try_where(cond.clone(), inner, invalid.clone()).expect("failed to create WHERE")
+                    let marker = UOp::invalid_marker();
+                    UOp::try_where(cond.clone(), inner, marker).expect("failed to create WHERE")
                 },
-        },
-
-        // Strip WHERE-Invalid from comparison inputs
-        // CMP(WHERE(cond, x, Invalid), y) → CMP(x, y)
-        // When comparing padded values, the Invalid region is already gated downstream,
-        // so we can safely compare just the valid part.
-        for op in binary [Lt, Le, Eq, Ne, Gt, Ge] {
-            r @ op(Where(_cond, x, invalid), y)
-                if matches!(invalid.op(), Op::Invalid)
-                ~> UOp::new(Op::Binary(op, x.clone(), y.clone()), r.dtype()),
-        },
-
-        // CMP(y, WHERE(cond, x, Invalid)) → CMP(y, x) (right operand variant)
-        for op in binary [Lt, Le, Eq, Ne, Gt, Ge] {
-            r @ op(y, Where(_cond, x, invalid))
-                if matches!(invalid.op(), Op::Invalid)
-                ~> UOp::new(Op::Binary(op, y.clone(), x.clone()), r.dtype()),
         },
 
         // ALU with bare Invalid → Invalid
-        // upstream: only from left position with auto-commutation.
-        // Left position (all ops):
+        // Tinygrad's Invalid is the bottom of the promotion lattice. Svod uses
+        // a typed marker, so create one with the operation's result dtype.
         for op in binary [Add, Mul, Sub, Mod, Max, Idiv, Fdiv, Pow, And, Or, Xor, Shl, Shr] {
-            op(invalid, y) if matches!(invalid.op(), Op::Invalid) && y.dtype() == DType::Index
-                ~> { let _ = op; invalid.clone() },
+            op(invalid, _y) if UOp::is_invalid_marker(invalid)
+                ~> { let _ = op; UOp::invalid_marker() },
+            op(_y, invalid) if UOp::is_invalid_marker(invalid)
+                ~> { let _ = op; UOp::invalid_marker() },
         },
-        // Right position (commutative ops only — upstream auto-commutation):
-        for op in binary [Add, Mul, Max, And, Or, Xor] {
-            op(y, invalid) if matches!(invalid.op(), Op::Invalid) && y.dtype() == DType::Index
-                ~> { let _ = op; invalid.clone() },
+    }
+}
+
+/// Final-only cleanup of Invalid validity markers.
+///
+/// Invalid must survive optimization and gate lowering, but cannot reach a
+/// rendered program. Typed data Invalid becomes typed zero; Index Invalid is
+/// retained for late memory gate lowering.
+pub fn pm_remove_invalid() -> &'static TypedPatternMatcher {
+    crate::cached_patterns! {
+        r @ Where(cond, x, invalid) if UOp::is_invalid_marker(invalid) =>
+            UOp::try_where(cond.clone(), x.clone(), r.const_like(0)).ok(),
+        r @ Vectorize { elements } if elements.iter().any(UOp::is_invalid_marker) => {
+            let zero = UOp::const_(r.dtype().scalar_dtype(), ConstValue::Int(0));
+            Some(UOp::vectorize(elements.iter().map(|x| if UOp::is_invalid_marker(x) { zero.clone() } else { x.clone() }).collect()))
         },
     }
 }
@@ -308,7 +354,7 @@ pub fn fold_invalid_load_store() -> &'static TypedPatternMatcher {
     crate::cached_patterns! {
         // LOAD(INDEX(buf, ...Invalid...)) → const 0 (any per-dimension Invalid means OOB)
         load @ Load { index: Index { indices, .. }, .. }
-            if indices.iter().any(|idx| matches!(idx.op(), Op::Invalid))
+            if indices.iter().any(UOp::is_invalid_marker)
             => {
                 let zero = ConstValue::zero(load.dtype().scalar()?);
                 Some(load.const_like(zero))
@@ -316,7 +362,7 @@ pub fn fold_invalid_load_store() -> &'static TypedPatternMatcher {
 
         // LOAD(CAST(INDEX(buf, ...Invalid...))) → const 0
         load @ Load { index: Cast { src: Index { indices, .. }, .. }, .. }
-            if indices.iter().any(|idx| matches!(idx.op(), Op::Invalid))
+            if indices.iter().any(UOp::is_invalid_marker)
             => {
                 let zero = ConstValue::zero(load.dtype().scalar()?);
                 Some(load.const_like(zero))
@@ -324,12 +370,12 @@ pub fn fold_invalid_load_store() -> &'static TypedPatternMatcher {
 
         // STORE(INDEX(buf, ...Invalid...), value) → NOOP
         Store { index: Index { indices, .. }, .. }
-            if indices.iter().any(|idx| matches!(idx.op(), Op::Invalid))
+            if indices.iter().any(UOp::is_invalid_marker)
             ~> UOp::new(Op::Noop, DType::Void),
 
         // STORE(CAST(INDEX(buf, ...Invalid...)), value) → NOOP
         Store { index: Cast { src: Index { indices, .. }, .. }, .. }
-            if indices.iter().any(|idx| matches!(idx.op(), Op::Invalid))
+            if indices.iter().any(UOp::is_invalid_marker)
             ~> UOp::new(Op::Noop, DType::Void),
     }
 }
@@ -1444,8 +1490,8 @@ pub fn pm_move_where_on_load() -> &'static TypedPatternMatcher {
 /// Check if a UOp is or contains Invalid (scalar or vectorized).
 fn has_invalid(uop: &Arc<UOp>) -> bool {
     match uop.op() {
-        Op::Invalid => true,
-        Op::Vectorize { elements } => elements.iter().any(|e| matches!(e.op(), Op::Invalid)),
+        Op::Const(ConstValueHash(ConstValue::Invalid)) => true,
+        Op::Vectorize { elements } => elements.iter().any(UOp::is_invalid_marker),
         _ => false,
     }
 }
@@ -2212,6 +2258,20 @@ pub fn sym_phase3_patterns() -> &'static TypedPatternMatcher {
 ///   (gated store rewrite: selective overwrite becomes gated store with alternative value)
 pub fn store_load_folding_patterns() -> &'static TypedPatternMatcher {
     crate::cached_patterns! {
+        // Invalid values suppress writes.
+        Store { index: _index, value: invalid } if UOp::is_invalid_marker(invalid)
+            ~> UOp::new(Op::Noop, DType::Void),
+
+        // STORE(index, WHERE(cond, value, Invalid)) becomes a gated store.
+        Store { index: Index { buffer, indices, gate: None }, value: Where(cond, value, invalid) }
+            if UOp::is_invalid_marker(invalid) && !indices.is_empty()
+            => {
+                let mut gated_indices = indices.clone();
+                gated_indices[0] = gated_indices[0].valid(cond.clone());
+                let index = UOp::index().buffer(buffer.clone()).indices(gated_indices).call().ok()?;
+                Some(index.store(value.clone()))
+            },
+
         // STORE(idx, LOAD(idx)) → NOOP when the INDEX nodes are ptr_eq
         Store { index, value: Load { index, .. } } ~> UOp::new(Op::Noop, DType::Void),
 
@@ -2223,7 +2283,7 @@ pub fn store_load_folding_patterns() -> &'static TypedPatternMatcher {
             if idx.id == idx2.id && !indices.is_empty()
             => {
                 let original_idx = indices[0].clone();
-                let invalid = UOp::new(Op::Invalid, original_idx.dtype());
+                let invalid = UOp::invalid_marker();
                 let gated_idx = UOp::try_where(gate.clone(), original_idx, invalid).ok()?;
 
                 let mut new_indices: SmallVec<[Arc<UOp>; 4]> = indices.clone();

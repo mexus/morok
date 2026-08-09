@@ -434,7 +434,7 @@ pub fn infer_shape_from_op(uop: &UOp) -> crate::Result<Option<Shape>> {
 
         Op::VConst { .. } => None,
 
-        Op::Unique(_) | Op::LUnique(_) | Op::Device(_) | Op::Noop | Op::Invalid => None,
+        Op::Unique(_) | Op::LUnique(_) | Op::Device(_) | Op::Noop => None,
 
         // DefineLocal: shape from PtrDType.size
         Op::DefineLocal(_id) => {

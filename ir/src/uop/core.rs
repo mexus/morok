@@ -1068,7 +1068,6 @@ impl UOp {
             | Op::LUnique(_)
             | Op::Device(_)
             | Op::Noop
-            | Op::Invalid
             | Op::DefineLocal(_)
             | Op::VConst { .. }
             | Op::DefineVar { .. }
@@ -1373,8 +1372,20 @@ impl UOp {
             Op::Group { .. } => Op::Group { sources: new_srcs.iter().cloned().collect() },
         };
 
-        // Preserve original dtype and tag through source reconstruction.
-        Self::new_tagged(new_op, self.dtype.clone(), self.tag.clone())
+        // Current Tinygrad re-derives dtype when a rewritten source changes
+        // dtype. Invalid is polymorphic and therefore does not force a rebuild.
+        let source_dtypes_unchanged = self
+            .op
+            .children()
+            .iter()
+            .zip(new_op.children())
+            .all(|(old, new)| old.dtype() == new.dtype() || Self::is_invalid_marker(new));
+        let dtype = if source_dtypes_unchanged {
+            self.dtype.clone()
+        } else {
+            crate::dtype_from_op(&new_op).unwrap_or_else(|| self.dtype.clone())
+        };
+        Self::new_tagged(new_op, dtype, self.tag.clone())
     }
 }
 

@@ -26,6 +26,7 @@ pub fn ldt(dtype: &DType) -> String {
 /// Convert a ScalarDType to LLVM type string.
 fn ldt_scalar(s: ScalarDType) -> &'static str {
     match s {
+        ScalarDType::WeakInt | ScalarDType::WeakFloat => panic!("weak dtype reached LLVM rendering"),
         ScalarDType::Bool => "i1",
         ScalarDType::Int8 | ScalarDType::UInt8 => "i8",
         ScalarDType::Int16 | ScalarDType::UInt16 => "i16",
@@ -43,6 +44,7 @@ fn ldt_scalar(s: ScalarDType) -> &'static str {
 /// Convert a constant value to LLVM literal string.
 pub fn lconst(val: &ConstValue, dtype: &DType) -> String {
     match val {
+        ConstValue::Invalid => panic!("Invalid reached LLVM constant rendering"),
         ConstValue::Int(i) => i.to_string(),
         ConstValue::UInt(u) => (*u as i64).to_string(),
         ConstValue::Float(f) => format_float(*f, dtype),

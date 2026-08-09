@@ -61,10 +61,14 @@ impl UOp {
         // This matches Tinygrad's broadcast: `UOp(Ops.VECTORIZE, self.dtype.vec(count), ...)`
         // For Ptr types: Ptr{vcount:1}.vec(N) → Ptr{vcount:N} (vector of pointers)
         // For Scalar types: Scalar(Float32).vec(N) → Vector{Float32, N}
-        let expected_dtype = elements[0].dtype();
-        for elem in elements.iter().skip(1) {
+        let expected_dtype =
+            elements.iter().find(|elem| !Self::is_invalid_marker(elem)).unwrap_or(&elements[0]).dtype();
+        for elem in &elements {
             let actual = elem.dtype();
-            ensure!(expected_dtype == actual, VectorizeDTypeMismatchSnafu { expected: expected_dtype, actual });
+            ensure!(
+                expected_dtype == actual || Self::is_invalid_marker(elem),
+                VectorizeDTypeMismatchSnafu { expected: expected_dtype, actual }
+            );
         }
 
         let count = elements.len();

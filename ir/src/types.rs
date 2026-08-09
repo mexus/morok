@@ -18,6 +18,9 @@ use svod_dtype::{DType, ScalarDType};
 #[derive(Debug, Clone, Copy, derive_more::From)]
 #[derive(serde::Serialize, serde::Deserialize)]
 pub enum ConstValue {
+    /// Canonical poison value. Its UOp dtype is always bool and consumers treat
+    /// it as matching any dtype.
+    Invalid,
     Int(i64),
     UInt(u64),
     Float(f64),
@@ -27,6 +30,7 @@ pub enum ConstValue {
 impl PartialEq for ConstValue {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
+            (Self::Invalid, Self::Invalid) => true,
             (Self::Int(a), Self::Int(b)) => a == b,
             (Self::UInt(a), Self::UInt(b)) => a == b,
             (Self::Float(a), Self::Float(b)) => a.to_bits() == b.to_bits(),
@@ -66,6 +70,7 @@ impl Hash for ConstValue {
     fn hash<H: Hasher>(&self, state: &mut H) {
         discriminant(self).hash(state);
         match self {
+            ConstValue::Invalid => {}
             ConstValue::Int(v) => v.hash(state),
             ConstValue::UInt(v) => v.hash(state),
             ConstValue::Float(v) => v.to_bits().hash(state),
@@ -85,6 +90,7 @@ macro_rules! cast_via {
 macro_rules! impl_cast {
     ($self:expr, $to:expr) => {
         match ($self, $to) {
+            (ConstValue::Invalid, _) => ConstValue::Invalid,
             (ConstValue::Bool(v), dt) => cast_bool(v, dt)?,
             (ConstValue::Int(v), dt) => cast_int(v, dt)?,
             (ConstValue::UInt(v), dt) => cast_uint(v, dt)?,
@@ -98,9 +104,9 @@ fn cast_bool(v: bool, to: ScalarDType) -> Option<ConstValue> {
     use ScalarDType::*;
     Some(match to {
         Bool => ConstValue::Bool(v),
-        Int8 | Int16 | Int32 | Int64 | Index => ConstValue::Int(v as i64),
+        WeakInt | Int8 | Int16 | Int32 | Int64 | Index => ConstValue::Int(v as i64),
         UInt8 | UInt16 | UInt32 | UInt64 => ConstValue::UInt(v as u64),
-        Float16 | BFloat16 | Float32 | Float64 => ConstValue::Float(v as u8 as f64),
+        WeakFloat | Float16 | BFloat16 | Float32 | Float64 => ConstValue::Float(v as u8 as f64),
         _ => return None,
     })
 }
@@ -113,12 +119,12 @@ fn cast_int(v: i64, to: ScalarDType) -> Option<ConstValue> {
         Int8 => ConstValue::Int(cast_via!(v, i8, i64)),
         Int16 => ConstValue::Int(cast_via!(v, i16, i64)),
         Int32 => ConstValue::Int(cast_via!(v, i32, i64)),
-        Int64 | Index => ConstValue::Int(v),
+        WeakInt | Int64 | Index => ConstValue::Int(v),
         UInt8 => ConstValue::UInt(cast_via!(v, u8, u64)),
         UInt16 => ConstValue::UInt(cast_via!(v, u16, u64)),
         UInt32 => ConstValue::UInt(cast_via!(v, u32, u64)),
         UInt64 => ConstValue::UInt(v as u64),
-        Float16 | BFloat16 | Float32 | Float64 => ConstValue::Float(v as f64),
+        WeakFloat | Float16 | BFloat16 | Float32 | Float64 => ConstValue::Float(v as f64),
         _ => return None,
     })
 }
@@ -131,12 +137,12 @@ fn cast_uint(v: u64, to: ScalarDType) -> Option<ConstValue> {
         Int8 => ConstValue::Int(cast_via!(v, i8, i64)),
         Int16 => ConstValue::Int(cast_via!(v, i16, i64)),
         Int32 => ConstValue::Int(cast_via!(v, i32, i64)),
-        Int64 | Index => ConstValue::Int(v as i64),
+        WeakInt | Int64 | Index => ConstValue::Int(v as i64),
         UInt8 => ConstValue::UInt(cast_via!(v, u8, u64)),
         UInt16 => ConstValue::UInt(cast_via!(v, u16, u64)),
         UInt32 => ConstValue::UInt(cast_via!(v, u32, u64)),
         UInt64 => ConstValue::UInt(v),
-        Float16 | BFloat16 | Float32 | Float64 => ConstValue::Float(v as f64),
+        WeakFloat | Float16 | BFloat16 | Float32 | Float64 => ConstValue::Float(v as f64),
         _ => return None,
     })
 }
@@ -149,13 +155,13 @@ fn cast_float(v: f64, to: ScalarDType) -> Option<ConstValue> {
         Int8 => ConstValue::Int(cast_via!(v, i8, i64)),
         Int16 => ConstValue::Int(cast_via!(v, i16, i64)),
         Int32 => ConstValue::Int(cast_via!(v, i32, i64)),
-        Int64 | Index => ConstValue::Int(v as i64),
+        WeakInt | Int64 | Index => ConstValue::Int(v as i64),
         // Float-to-unsigned: route through i64 first.
         UInt8 => ConstValue::UInt(cast_via!(v as i64, u8, u64)),
         UInt16 => ConstValue::UInt(cast_via!(v as i64, u16, u64)),
         UInt32 => ConstValue::UInt(cast_via!(v as i64, u32, u64)),
         UInt64 => ConstValue::UInt((v as i64) as u64),
-        Float16 | BFloat16 | Float32 | Float64 => ConstValue::Float(v),
+        WeakFloat | Float16 | BFloat16 | Float32 | Float64 => ConstValue::Float(v),
         _ => return None,
     })
 }
@@ -163,6 +169,7 @@ fn cast_float(v: f64, to: ScalarDType) -> Option<ConstValue> {
 impl ConstValue {
     pub const fn dtype(&self) -> DType {
         match self {
+            ConstValue::Invalid => DType::Bool,
             ConstValue::Int(_) => DType::Int64,
             ConstValue::UInt(_) => DType::UInt64,
             ConstValue::Float(_) => DType::Float64,
@@ -174,9 +181,9 @@ impl ConstValue {
         use ScalarDType::*;
         match dtype {
             Bool => Self::Bool(false),
-            Int8 | Int16 | Int32 | Int64 => Self::Int(0),
+            WeakInt | Int8 | Int16 | Int32 | Int64 => Self::Int(0),
             UInt8 | UInt16 | UInt32 | UInt64 => Self::UInt(0),
-            FP8E4M3 | FP8E5M2 | Float16 | BFloat16 | Float32 | Float64 => Self::Float(0.0),
+            WeakFloat | FP8E4M3 | FP8E5M2 | Float16 | BFloat16 | Float32 | Float64 => Self::Float(0.0),
             Void | Index => Self::Int(0), // TODO: remove this types from scalars
         }
     }
@@ -185,9 +192,9 @@ impl ConstValue {
         use ScalarDType::*;
         match dtype {
             Bool => Self::Bool(true),
-            Int8 | Int16 | Int32 | Int64 => Self::Int(1),
+            WeakInt | Int8 | Int16 | Int32 | Int64 => Self::Int(1),
             UInt8 | UInt16 | UInt32 | UInt64 => Self::UInt(1),
-            FP8E4M3 | FP8E5M2 | Float16 | BFloat16 | Float32 | Float64 => Self::Float(1.0),
+            WeakFloat | FP8E4M3 | FP8E5M2 | Float16 | BFloat16 | Float32 | Float64 => Self::Float(1.0),
             Void | Index => Self::Int(1), // TODO: remove this types from scalars
         }
     }
@@ -195,8 +202,8 @@ impl ConstValue {
     pub const fn neg_one(dtype: ScalarDType) -> Option<Self> {
         use ScalarDType::*;
         Some(match dtype {
-            Int8 | Int16 | Int32 | Int64 | Index => Self::Int(-1),
-            FP8E4M3 | FP8E5M2 | Float16 | BFloat16 | Float32 | Float64 => Self::Float(-1.0),
+            WeakInt | Int8 | Int16 | Int32 | Int64 | Index => Self::Int(-1),
+            WeakFloat | FP8E4M3 | FP8E5M2 | Float16 | BFloat16 | Float32 | Float64 => Self::Float(-1.0),
             _ => return None,
         })
     }
@@ -209,12 +216,12 @@ impl ConstValue {
             Int8 => Self::Int(i8::MIN as i64),
             Int16 => Self::Int(i16::MIN as i64),
             Int32 => Self::Int(i32::MIN as i64),
-            Int64 | Index => Self::Int(i64::MIN),
+            WeakInt | Int64 | Index => Self::Int(i64::MIN),
             UInt8 | UInt16 | UInt32 | UInt64 => Self::UInt(0),
             FP8E4M3 | FP8E5M2 | Float16 => Self::Float(-65504.0),
             BFloat16 => Self::Float(-3.38953e38),
             Float32 => Self::Float(f32::MIN as f64),
-            Float64 => Self::Float(f64::MIN),
+            WeakFloat | Float64 => Self::Float(f64::MIN),
             Void => Self::Int(0),
         }
     }
@@ -227,7 +234,7 @@ impl ConstValue {
             Int8 => Self::Int(i8::MAX as i64),
             Int16 => Self::Int(i16::MAX as i64),
             Int32 => Self::Int(i32::MAX as i64),
-            Int64 | Index => Self::Int(i64::MAX),
+            WeakInt | Int64 | Index => Self::Int(i64::MAX),
             UInt8 => Self::UInt(u8::MAX as u64),
             UInt16 => Self::UInt(u16::MAX as u64),
             UInt32 => Self::UInt(u32::MAX as u64),
@@ -235,7 +242,7 @@ impl ConstValue {
             FP8E4M3 | FP8E5M2 | Float16 => Self::Float(65504.0),
             BFloat16 => Self::Float(3.38953e38),
             Float32 => Self::Float(f32::MAX as f64),
-            Float64 => Self::Float(f64::MAX),
+            WeakFloat | Float64 => Self::Float(f64::MAX),
             Void => Self::Int(0),
         }
     }
@@ -954,6 +961,7 @@ pub struct ConstValueHash(pub ConstValue);
 impl PartialEq for ConstValueHash {
     fn eq(&self, other: &Self) -> bool {
         match (self.0, other.0) {
+            (ConstValue::Invalid, ConstValue::Invalid) => true,
             (ConstValue::Int(a), ConstValue::Int(b)) => a == b,
             (ConstValue::UInt(a), ConstValue::UInt(b)) => a == b,
             (ConstValue::Float(a), ConstValue::Float(b)) => a.to_bits() == b.to_bits(),
@@ -969,6 +977,7 @@ impl Hash for ConstValueHash {
     fn hash<H: Hasher>(&self, state: &mut H) {
         (discriminant(&self.0)).hash(state);
         match self.0 {
+            ConstValue::Invalid => {}
             ConstValue::Int(v) => v.hash(state),
             ConstValue::UInt(v) => v.hash(state),
             ConstValue::Float(v) => v.to_bits().hash(state),

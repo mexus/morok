@@ -276,6 +276,7 @@ fn concrete_launch_size(size: [usize; 3]) -> [Arc<UOp>; 3] {
 
 fn const_value_to_i64(value: ConstValue) -> Result<i64> {
     match value {
+        ConstValue::Invalid => Err(Error::Runtime { message: "Invalid reached launch-size evaluation".to_string() }),
         ConstValue::Int(v) => Ok(v),
         ConstValue::UInt(v) => i64::try_from(v)
             .map_err(|_| Error::Runtime { message: format!("launch-size constant {v} does not fit i64") }),

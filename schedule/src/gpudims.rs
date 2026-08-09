@@ -326,6 +326,7 @@ fn compute_store_masks(
 /// Extract i64 value from ConstValue.
 fn const_to_i64(cv: &ConstValue) -> Option<i64> {
     match cv {
+        ConstValue::Invalid => None,
         ConstValue::Int(v) => Some(*v),
         ConstValue::UInt(v) => Some(*v as i64),
         ConstValue::Bool(v) => Some(*v as i64),

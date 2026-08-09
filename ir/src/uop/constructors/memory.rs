@@ -68,6 +68,9 @@ impl UOp {
         // Allows both scalar (Index, Int64, Int32) and vector (Index.vec(N), Int64.vec(N))
         // for devectorized register/local buffer indexing.
         for idx in &indices {
+            if Self::is_invalid_marker(idx) {
+                continue;
+            }
             let base = idx.dtype().base();
             ensure!(
                 matches!(

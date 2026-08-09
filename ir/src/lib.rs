@@ -19,6 +19,7 @@ extern crate self as svod_ir;
 
 // Module declarations
 pub mod decompositions;
+pub mod dtype_rule;
 pub mod error;
 pub mod indexing;
 pub mod kernel_info;
@@ -40,6 +41,7 @@ pub mod rewrite;
 pub mod test;
 
 // Re-exports at crate root for ergonomic access.
+pub use dtype_rule::dtype_from_op;
 pub use error::{Error, IndexTypeMismatchSnafu, Result};
 pub use indexing::IndexSpec;
 pub use op::Op;

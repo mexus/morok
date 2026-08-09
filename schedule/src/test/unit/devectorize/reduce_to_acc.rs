@@ -70,6 +70,20 @@ fn test_reduce_scalar_max() {
     assert!(count_define_regs(&result) > 0);
 }
 
+#[test]
+fn test_invalid_padded_lane_uses_reduce_identity() {
+    let range = create_range_reduce(16, 0);
+    let cond = UOp::var("valid", DType::Bool, 0, 1);
+    let value = UOp::var("value", DType::Float32, 0, 100);
+    let src = UOp::try_where(cond, value, UOp::invalid_marker()).unwrap();
+    let reduce = create_reduce(src, vec![range], ReduceOp::Max);
+
+    let result = apply_pm_reduce(&reduce);
+
+    assert!(!matches!(result.op(), Op::Reduce { .. }));
+    assert!(!result.any_in_subtree(UOp::is_invalid_marker));
+}
+
 /// Test: REDUCE(scalar, [Range], Min) → accumulator pattern with Min (uses WHERE).
 #[test]
 fn test_reduce_scalar_min() {

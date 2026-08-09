@@ -118,9 +118,17 @@ fn spec_program_rejects_movement_op() {
 
 #[test]
 fn spec_program_rejects_invalid_op() {
-    let inv = UOp::new(Op::Invalid, DType::Void);
+    let inv = UOp::invalid_marker();
     let sink = UOp::sink(vec![inv]);
     assert!(verify_err(&sink).contains("Invalid"), "Invalid must be folded out before a program");
+}
+
+#[test]
+fn spec_tensor_accepts_polymorphic_invalid_consumers() {
+    let invalid = UOp::invalid_marker();
+    let value = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+    let add = UOp::new(Op::Binary(BinaryOp::Add, value, invalid), DType::Float32);
+    assert!(type_verify(&add, &spec_tensor()).is_ok());
 }
 
 #[test]
