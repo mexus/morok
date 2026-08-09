@@ -538,17 +538,11 @@ impl TextDecoder {
             let cq = block.cross_attn.query.forward(&h)?;
             let cq_seq = cq.try_reshape([batch, 1, n_head, d_head]).context(TensorSnafu)?;
 
-            let layer_ck = cross_k
-                .try_shrink([None, None, Some((lh_start as isize, lh_end as isize)), None])
-                .context(TensorSnafu)?;
-            let layer_cv = cross_v
-                .try_shrink([None, None, Some((lh_start as isize, lh_end as isize)), None])
-                .context(TensorSnafu)?;
-
-            let direct = svod_tk::single_query_attention(
+            let direct = svod_tk::single_query_attention_packed(
                 &cq_seq,
-                &layer_ck,
-                &layer_cv,
+                cross_k,
+                cross_v,
+                lh_start,
                 svod_tk::SqAttentionOpts { split: cross_splits, ..Default::default() },
             )
             .map_err(|e| svod_tensor::error::Error::IrConstruction { details: e.to_string() })
@@ -556,6 +550,12 @@ impl TextDecoder {
             let cross_out = match direct {
                 Some(out) => out.try_reshape([batch, 1, self.n_state]).context(TensorSnafu)?,
                 None => {
+                    let layer_ck = cross_k
+                        .try_shrink([None, None, Some((lh_start as isize, lh_end as isize)), None])
+                        .context(TensorSnafu)?;
+                    let layer_cv = cross_v
+                        .try_shrink([None, None, Some((lh_start as isize, lh_end as isize)), None])
+                        .context(TensorSnafu)?;
                     let cq_h = cq_seq.try_permute(&[0, 2, 1, 3]).context(TensorSnafu)?;
                     let layer_ck_h = layer_ck.try_permute(&[0, 2, 1, 3]).context(TensorSnafu)?;
                     let layer_cv_h = layer_cv.try_permute(&[0, 2, 1, 3]).context(TensorSnafu)?;

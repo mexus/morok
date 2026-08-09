@@ -48,14 +48,22 @@ fn f32c(v: f64) -> Arc<UOp> {
     UOp::const_(DType::Float32, ConstValue::Float(v))
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct HeadSelection {
+    pub(crate) count: usize,
+    pub(crate) total: usize,
+    pub(crate) offset: usize,
+}
+
 /// Build the one-wave single-query attention kernel.
 ///
-/// ABI is `out, q, k, v, [key_lens]`, with sequence-major `[B,S,H,D]` globals.
+/// ABI is `out, q, k, v, [key_lens]`, with sequence-major `[B,S,H,D]` Q/output
+/// and `[B,S,H_total,D]` K/V globals.
 pub(crate) fn build_single_query_attention(
     ker: &Kernel,
     b: usize,
     n: usize,
-    h: usize,
+    heads: HeadSelection,
     d: usize,
     masked: bool,
     include_last: bool,
@@ -69,16 +77,17 @@ pub(crate) fn build_single_query_attention(
     let f32 = DType::Float32;
 
     let (outs, ins) = ker.bind_abi(
-        &[GlSpec::new(&[b, 1, h, d], f32.clone())],
+        &[GlSpec::new(&[b, 1, heads.count, d], f32.clone())],
         &[
-            GlSpec::new(&[b, 1, h, d], f32.clone()),
-            GlSpec::new(&[b, n, h, d], f32.clone()),
-            GlSpec::new(&[b, n, h, d], f32.clone()),
+            GlSpec::new(&[b, 1, heads.count, d], f32.clone()),
+            GlSpec::new(&[b, n, heads.total, d], f32.clone()),
+            GlSpec::new(&[b, n, heads.total, d], f32.clone()),
         ],
     );
     let (out, q, k, v) = (outs[0].clone(), ins[0].clone(), ins[1].clone(), ins[2].clone());
     let batch = ker.grid_y();
     let head = ker.grid_x();
+    let packed_head = head.add(&cidx(heads.offset as i64));
     let lane = ker.laneid();
     let prefix = masked.then(|| {
         let lens = ker.gl(&[b], DType::Int32);
@@ -129,7 +138,8 @@ pub(crate) fn build_single_query_attention(
     for j in 0..ept {
         let dim = lane.add(&cidx((j * wave) as i64));
         let qv = load_at(&q_loop, &[ept], &[Idx::Const(j as i64)]);
-        let kv = load_at(k.uop(), k.shape(), &[Idx::from(&batch), Idx::from(&key), Idx::from(&head), Idx::from(dim)]);
+        let kv =
+            load_at(k.uop(), k.shape(), &[Idx::from(&batch), Idx::from(&key), Idx::from(&packed_head), Idx::from(dim)]);
         dot = dot.add(&qv.mul(&kv));
     }
     let score = warp.wave_reduce_scalar(dot, |a, p| a.add(p));
@@ -146,7 +156,8 @@ pub(crate) fn build_single_query_attention(
     for j in 0..ept {
         let dim = lane.add(&cidx((j * wave) as i64));
         let old_o = load_at(&o_loop, &[ept], &[Idx::Const(j as i64)]);
-        let vv = load_at(v.uop(), v.shape(), &[Idx::from(&batch), Idx::from(&key), Idx::from(&head), Idx::from(dim)]);
+        let vv =
+            load_at(v.uop(), v.shape(), &[Idx::from(&batch), Idx::from(&key), Idx::from(&packed_head), Idx::from(dim)]);
         let new_o = old_o.mul(&alpha).add(&vv.mul(&beta));
         output_stores.push(
             flat_index(&o_reg.after(smallvec![norm_store.clone()]), &[ept], &[Idx::Const(j as i64)]).store(new_o),
@@ -173,13 +184,14 @@ pub(crate) fn build_single_query_attention(
 
 /// Build one unnormalized online-softmax state per contiguous K/V split.
 ///
-/// ABI is `numerator, stats, q, k, v`; outputs are `[B,S,H,D]` and
-/// `[B,S,H,2]`, where the final axis of stats is `(max, norm)`.
+/// ABI is `numerator, stats, q, k, v`; K/V use `[B,N,H_total,D]`, while
+/// outputs are `[B,S,H,D]` and `[B,S,H,2]`, where the final axis of stats is
+/// `(max, norm)`.
 pub(crate) fn build_single_query_attention_partial(
     ker: &Kernel,
     b: usize,
     n: usize,
-    h: usize,
+    heads: HeadSelection,
     d: usize,
     splits: usize,
 ) {
@@ -192,16 +204,20 @@ pub(crate) fn build_single_query_attention_partial(
     let f32 = DType::Float32;
 
     let (outs, ins) = ker.bind_abi(
-        &[GlSpec::new(&[b, splits, h, d], f32.clone()), GlSpec::new(&[b, splits, h, 2], f32.clone())],
         &[
-            GlSpec::new(&[b, 1, h, d], f32.clone()),
-            GlSpec::new(&[b, n, h, d], f32.clone()),
-            GlSpec::new(&[b, n, h, d], f32.clone()),
+            GlSpec::new(&[b, splits, heads.count, d], f32.clone()),
+            GlSpec::new(&[b, splits, heads.count, 2], f32.clone()),
+        ],
+        &[
+            GlSpec::new(&[b, 1, heads.count, d], f32.clone()),
+            GlSpec::new(&[b, n, heads.total, d], f32.clone()),
+            GlSpec::new(&[b, n, heads.total, d], f32.clone()),
         ],
     );
     let (numerator, stats) = (outs[0].clone(), outs[1].clone());
     let (q, k, v) = (ins[0].clone(), ins[1].clone(), ins[2].clone());
     let head = ker.grid_x();
+    let packed_head = head.add(&cidx(heads.offset as i64));
     let batch = ker.grid_y();
     let split = ker.grid_z();
     let lane = ker.laneid();
@@ -237,7 +253,8 @@ pub(crate) fn build_single_query_attention_partial(
     for j in 0..ept {
         let dim = lane.add(&cidx((j * wave) as i64));
         let qv = load_at(&q_loop, &[ept], &[Idx::Const(j as i64)]);
-        let kv = load_at(k.uop(), k.shape(), &[Idx::from(&batch), Idx::from(&key), Idx::from(&head), Idx::from(dim)]);
+        let kv =
+            load_at(k.uop(), k.shape(), &[Idx::from(&batch), Idx::from(&key), Idx::from(&packed_head), Idx::from(dim)]);
         dot = dot.add(&qv.mul(&kv));
     }
     let score = warp.wave_reduce_scalar(dot, |a, p| a.add(p));
@@ -253,7 +270,8 @@ pub(crate) fn build_single_query_attention_partial(
     for j in 0..ept {
         let dim = lane.add(&cidx((j * wave) as i64));
         let old_o = load_at(&o_loop, &[ept], &[Idx::Const(j as i64)]);
-        let vv = load_at(v.uop(), v.shape(), &[Idx::from(&batch), Idx::from(&key), Idx::from(&head), Idx::from(dim)]);
+        let vv =
+            load_at(v.uop(), v.shape(), &[Idx::from(&batch), Idx::from(&key), Idx::from(&packed_head), Idx::from(dim)]);
         output_stores.push(
             flat_index(&o_reg.after(smallvec![norm_store.clone()]), &[ept], &[Idx::Const(j as i64)])
                 .store(old_o.mul(&alpha).add(&vv.mul(&beta))),
@@ -368,7 +386,8 @@ pub(crate) fn build_single_query_attention_merge(ker: &Kernel, b: usize, h: usiz
 
 /// Graph-native FP32 single-query attention.
 ///
-/// Q is `[B,1,H,D]`, K/V are `[B,N,H,D]`, and output is `[B,1,H,D]`.
+/// Q is `[B,1,H,D]`, K/V are `[B,N,H_total,D]`, and output is `[B,1,H,D]`.
+/// The first `H` K/V heads are selected.
 /// Returns `Ok(None)` when the target is not gfx942/gfx1151. No generic SDPA
 /// fallback is performed here.
 pub fn single_query_attention(
@@ -377,13 +396,28 @@ pub fn single_query_attention(
     v: &Tensor,
     opts: SqAttentionOpts<'_>,
 ) -> crate::LaunchResult<Option<Tensor>> {
+    single_query_attention_packed(q, k, v, 0, opts)
+}
+
+/// Graph-native FP32 single-query attention over selected heads in packed K/V.
+///
+/// Q is `[B,1,H,D]`, K/V are `[B,N,H_total,D]`, and heads
+/// `head_offset..head_offset+H` are selected without materializing a slice.
+pub fn single_query_attention_packed(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    head_offset: usize,
+    opts: SqAttentionOpts<'_>,
+) -> crate::LaunchResult<Option<Tensor>> {
     let qd = crate::launch::concrete_dims(q, "single-query attention", "q", 4)?;
     let kd = crate::launch::concrete_dims(k, "single-query attention", "k", 4)?;
     let vd = crate::launch::concrete_dims(v, "single-query attention", "v", 4)?;
-    let (b, n, h, d) = (qd[0], kd[1], qd[2], qd[3]);
+    let (b, n, h, h_total, d) = (qd[0], kd[1], qd[2], kd[2], qd[3]);
     let dtype = q.uop().dtype();
     let masked = opts.key_lens.is_some();
     let splits = opts.split;
+    let heads = HeadSelection { count: h, total: h_total, offset: head_offset };
 
     ensure!(
         qd[1] == 1,
@@ -399,8 +433,13 @@ pub fn single_query_attention(
         crate::launch::OperandDimMismatchSnafu { kernel: "single-query attention", dim: "K batch B", a: kd[0], b }
     );
     ensure!(
-        kd[2] == h,
-        crate::launch::OperandDimMismatchSnafu { kernel: "single-query attention", dim: "K heads H", a: kd[2], b: h }
+        head_offset <= h_total && h <= h_total - head_offset,
+        crate::launch::OperandDimMismatchSnafu {
+            kernel: "single-query attention",
+            dim: "selected K heads (offset + H <= H_total)",
+            a: head_offset.saturating_add(h),
+            b: h_total
+        }
     );
     ensure!(
         kd[3] == d,
@@ -411,9 +450,12 @@ pub fn single_query_attention(
             b: d
         }
     );
-    for (dim, a, expected) in
-        [("V batch B", vd[0], b), ("V sequence N", vd[1], n), ("V heads H", vd[2], h), ("V head dim D", vd[3], d)]
-    {
+    for (dim, a, expected) in [
+        ("V batch B", vd[0], b),
+        ("V sequence N", vd[1], n),
+        ("V total heads H_total", vd[2], h_total),
+        ("V head dim D", vd[3], d),
+    ] {
         ensure!(
             a == expected,
             crate::launch::OperandDimMismatchSnafu { kernel: "single-query attention", dim, a, b: expected }
@@ -503,7 +545,7 @@ pub fn single_query_attention(
                     &inputs,
                     caps,
                     move |ker| {
-                        build_single_query_attention(ker, b, n, h, d, masked, opts.include_last);
+                        build_single_query_attention(ker, b, n, heads, d, masked, opts.include_last);
                         ker.finish(1)
                     },
                 )
@@ -519,7 +561,7 @@ pub fn single_query_attention(
                     &[q, k, v],
                     caps,
                     move |ker| {
-                        build_single_query_attention_partial(ker, b, n, h, d, splits);
+                        build_single_query_attention_partial(ker, b, n, heads, d, splits);
                         ker.finish(2)
                     },
                 )?;
