@@ -11,6 +11,41 @@ use crate::tile::RT;
 use svod_ir::UOp;
 
 impl<'k> Group<'k> {
+    /// Butterfly reduction within each fixed-width power-of-two subgroup. XOR
+    /// partners never cross a subgroup boundary, so the result is replicated in
+    /// every lane of that subgroup without LDS or a barrier.
+    pub fn subgroup_reduce_scalar<F>(&self, mut value: Arc<UOp>, width: usize, op: F) -> Arc<UOp>
+    where
+        F: Fn(&Arc<UOp>, &Arc<UOp>) -> Arc<UOp>,
+    {
+        assert_eq!(self.warps, 1, "subgroup_reduce_scalar is a single-warp op");
+        assert!(width.is_power_of_two(), "subgroup width must be a power of two");
+        assert!(width <= self.ker.caps.wave_size, "subgroup width must not exceed wave size");
+        assert!(self.ker.caps.wave_size.is_multiple_of(width), "subgroup width must divide wave size");
+        let mut mask = 1i64;
+        while mask < width as i64 {
+            let partner = self.shuffle_lane(&value, &ixor(&self.laneid(), mask));
+            value = op(&value, &partner);
+            mask *= 2;
+        }
+        value
+    }
+
+    /// Gather one scalar SSA value from `src_lane` into every lane of the wave.
+    pub fn broadcast_scalar(&self, value: &Arc<UOp>, src_lane: i64) -> Arc<UOp> {
+        assert_eq!(self.warps, 1, "broadcast_scalar is a single-warp op");
+        let w = self.ker.caps.wave_size as i64;
+        assert!((0..w).contains(&src_lane), "broadcast source lane {src_lane} must be in 0..{w}");
+        self.shuffle_lane(value, &crate::index::cidx(src_lane))
+    }
+
+    /// Lane index within a fixed-width power-of-two subgroup.
+    pub fn subgroup_laneid(&self, width: usize) -> Arc<UOp> {
+        assert!(width.is_power_of_two(), "subgroup width must be a power of two");
+        assert!(self.ker.caps.wave_size.is_multiple_of(width), "subgroup width must divide wave size");
+        iand(&self.laneid(), width as i64 - 1)
+    }
+
     /// Full-wave butterfly reduction of one scalar SSA value. Each step gathers
     /// from `laneid ^ mask`, so the result is replicated in every lane without
     /// LDS or a barrier. `op` must be associative (normally add or max).

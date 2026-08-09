@@ -37,8 +37,8 @@ fn sink(caps: ArchCaps, masked: bool) -> Arc<UOp> {
     ker.finish(1)
 }
 
-fn split_sinks(caps: ArchCaps, splits: usize) -> (Arc<UOp>, Arc<UOp>) {
-    let (b, n, h, h_total, d, head_offset) = (2, 20, 3, 7, 64, 2);
+fn split_sinks(caps: ArchCaps, splits: usize, d: usize) -> (Arc<UOp>, Arc<UOp>) {
+    let (b, n, h, h_total, head_offset) = (2, 20, 3, 7, 2);
     let partial_buffers = vec![
         UOp::new_buffer(DeviceSpec::Cpu, b * splits * h * d, DType::Float32),
         UOp::new_buffer(DeviceSpec::Cpu, b * splits * h * 2, DType::Float32),
@@ -84,21 +84,36 @@ fn sq_attention_graph_shape_both_arches() {
             assert!(!topo.iter().any(|u| matches!(u.op(), Op::Wmma { .. })), "{:?}: no MFMA/WMMA", caps.arch);
             assert!(!topo.iter().any(|u| matches!(u.op(), Op::Barrier { .. })), "{:?}: no barrier", caps.arch);
         }
-        let (partial, merge) = split_sinks(caps, 4);
-        for (name, graph) in [("partial", partial), ("merge", merge)] {
-            let topo = graph.toposort();
-            assert!(topo.iter().any(|u| matches!(u.op(), Op::Range { .. })), "{:?}: split {name} loop", caps.arch);
-            assert!(!topo.iter().any(|u| matches!(u.op(), Op::DefineLocal(_))), "{:?}: split {name} no LDS", caps.arch);
-            assert!(
-                !topo.iter().any(|u| matches!(u.op(), Op::Wmma { .. })),
-                "{:?}: split {name} no MFMA/WMMA",
+        for d in [64, 128] {
+            let (partial, merge) = split_sinks(caps, 4, d);
+            let partial_topo = partial.toposort();
+            let partial_shuffles = partial_topo.iter().filter(|u| matches!(u.op(), Op::Custom { .. })).count();
+            let groups = caps.wave_size / 8;
+            let expected = 3 + 2 * caps.wave_size.ilog2() as usize + groups;
+            assert_eq!(
+                partial_shuffles, expected,
+                "{:?} D={d}: width-8 dot, tile reductions, and beta broadcasts",
                 caps.arch
             );
-            assert!(
-                !topo.iter().any(|u| matches!(u.op(), Op::Barrier { .. })),
-                "{:?}: split {name} no barrier",
-                caps.arch
-            );
+            for (name, graph) in [("partial", partial), ("merge", merge)] {
+                let topo = graph.toposort();
+                assert!(topo.iter().any(|u| matches!(u.op(), Op::Range { .. })), "{:?}: split {name} loop", caps.arch);
+                assert!(
+                    !topo.iter().any(|u| matches!(u.op(), Op::DefineLocal(_))),
+                    "{:?}: split {name} no LDS",
+                    caps.arch
+                );
+                assert!(
+                    !topo.iter().any(|u| matches!(u.op(), Op::Wmma { .. })),
+                    "{:?}: split {name} no MFMA/WMMA",
+                    caps.arch
+                );
+                assert!(
+                    !topo.iter().any(|u| matches!(u.op(), Op::Barrier { .. })),
+                    "{:?}: split {name} no barrier",
+                    caps.arch
+                );
+            }
         }
     }
 }
@@ -107,7 +122,7 @@ fn sq_attention_graph_shape_both_arches() {
 fn sq_attention_renders_both_arches() {
     for arch in [AmdArch::Gfx942, AmdArch::Gfx1151] {
         let caps = ArchCaps::for_arch(arch);
-        let (partial, merge) = split_sinks(caps, 4);
+        let (partial, merge) = split_sinks(caps, 4, 64);
         for (name, graph, shuffle) in [
             ("sq_attention", sink(caps, true), true),
             ("sq_attention_partial", partial, true),
@@ -218,4 +233,35 @@ fn sq_attention_numerical_amd() {
             assert!(max_abs < 2e-4, "split {split} max abs error {max_abs}");
         }
     }
+
+    // Production cross-cache geometry. A 150-key chunk leaves a ragged width-8
+    // tile on both wave64 (8 groups) and wave32 (4 groups).
+    let (b, n, h, h_total, d, head_offset) = (5, 1500, 20, 24, 64, 2);
+    let mut q = Tensor::randn(&[b, 1, h, d]).expect("production q");
+    let mut k = Tensor::randn(&[b, n, h_total, d]).expect("production k");
+    let mut v = Tensor::randn(&[b, n, h_total, d]).expect("production v");
+    q.realize().expect("realize production q");
+    k.realize().expect("realize production k");
+    v.realize().expect("realize production v");
+    let expected = cpu_reference(
+        &q.as_vec::<f32>().expect("production q vec"),
+        &k.as_vec::<f32>().expect("production k vec"),
+        &v.as_vec::<f32>().expect("production v vec"),
+        (b, n, h, h_total, d),
+        head_offset,
+        None,
+    );
+    let mut got = crate::single_query_attention_packed(
+        &q,
+        &k,
+        &v,
+        head_offset,
+        SqAttentionOpts { split: 10, ..Default::default() },
+    )
+    .expect("production sq attention")
+    .expect("production supported");
+    got.realize().expect("realize production output");
+    let got = got.as_vec::<f32>().expect("production output vec");
+    let max_abs = got.iter().zip(&expected).map(|(a, e)| (a - e).abs()).fold(0.0f32, f32::max);
+    assert!(max_abs < 2e-4, "production split 10 max abs error {max_abs}");
 }

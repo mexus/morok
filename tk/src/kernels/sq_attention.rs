@@ -15,7 +15,7 @@ use svod_ir::{ConstValue, UOp};
 use svod_tensor::Tensor;
 
 use crate::Kernel;
-use crate::index::{Idx, flat_index, flat_offset, index_off_gated, load_at};
+use crate::index::{Idx, flat_index, flat_offset, index_off_gated, load_at, load_off_gated};
 use crate::scaffold::GlSpec;
 
 /// Architectures on which the scalar shuffle implementation is supported.
@@ -195,11 +195,16 @@ pub(crate) fn build_single_query_attention_partial(
     d: usize,
     splits: usize,
 ) {
+    const SUBGROUP: usize = 8;
     let wave = ker.caps.wave_size;
     Kernel::assert_divisible(d, wave, "single-query attention D");
+    Kernel::assert_divisible(d, SUBGROUP, "split single-query attention D");
     assert!(splits > 1 && n.is_multiple_of(splits), "split attention requires equal non-empty chunks");
     let ept = d / wave;
+    let dot_ept = d / SUBGROUP;
     let chunk = n / splits;
+    let groups = wave / SUBGROUP;
+    let tiles = chunk.div_ceil(groups);
     let warp = ker.warp();
     let f32 = DType::Float32;
 
@@ -222,17 +227,21 @@ pub(crate) fn build_single_query_attention_partial(
     let split = ker.grid_z();
     let lane = ker.laneid();
 
-    let q_reg = ker.alloc_reg(ept, f32.clone());
+    let q_reg = ker.alloc_reg(dot_ept, f32.clone());
     let o_reg = ker.alloc_reg(ept, f32.clone());
     let max_reg = ker.alloc_reg(1, f32.clone());
     let norm_reg = ker.alloc_reg(1, f32.clone());
     let scale = f32c(std::f64::consts::LOG2_E / (d as f64).sqrt());
-    let mut init = Vec::with_capacity(2 * ept + 2);
-    for j in 0..ept {
-        let dim = lane.add(&cidx((j * wave) as i64));
+    let subgroup_lane = warp.subgroup_laneid(SUBGROUP);
+    let group = lane.idiv(&cidx(SUBGROUP as i64));
+    let mut init = Vec::with_capacity(dot_ept + ept + 2);
+    for j in 0..dot_ept {
+        let dim = subgroup_lane.add(&cidx((j * SUBGROUP) as i64));
         let qv = load_at(q.uop(), q.shape(), &[Idx::from(&batch), Idx::Const(0), Idx::from(&head), Idx::from(dim)])
             .mul(&scale);
-        init.push(flat_index(&q_reg, &[ept], &[Idx::Const(j as i64)]).store(qv));
+        init.push(flat_index(&q_reg, &[dot_ept], &[Idx::Const(j as i64)]).store(qv));
+    }
+    for j in 0..ept {
         init.push(flat_index(&o_reg, &[ept], &[Idx::Const(j as i64)]).store(f32c(0.0)));
     }
     init.push(flat_index(&max_reg, &[1], &[Idx::Const(0)]).store(f32c(f64::NEG_INFINITY)));
@@ -243,38 +252,58 @@ pub(crate) fn build_single_query_attention_partial(
     let max_reg = max_reg.after(smallvec![initialized.clone()]);
     let norm_reg = norm_reg.after(smallvec![initialized]);
 
-    let lp = ker.loop_static(chunk as i64);
-    let key = split.mul(&cidx(chunk as i64)).add(lp.index());
+    let lp = ker.loop_static(tiles as i64);
+    let tile_offset = lp.index().mul(&cidx(groups as i64));
+    let group_offset = tile_offset.add(&group);
+    let valid = group_offset.lt(&cidx(chunk as i64));
+    let key = split.mul(&cidx(chunk as i64)).add(&group_offset);
     let q_loop = q_reg.after(smallvec![key.clone()]);
     let o_loop = o_reg.after(smallvec![key.clone()]);
     let max_loop = max_reg.after(smallvec![key.clone()]);
     let norm_loop = norm_reg.after(smallvec![key.clone()]);
     let mut dot = f32c(0.0);
-    for j in 0..ept {
-        let dim = lane.add(&cidx((j * wave) as i64));
-        let qv = load_at(&q_loop, &[ept], &[Idx::Const(j as i64)]);
-        let kv =
-            load_at(k.uop(), k.shape(), &[Idx::from(&batch), Idx::from(&key), Idx::from(&packed_head), Idx::from(dim)]);
+    for j in 0..dot_ept {
+        let dim = subgroup_lane.add(&cidx((j * SUBGROUP) as i64));
+        let qv = load_at(&q_loop, &[dot_ept], &[Idx::Const(j as i64)]);
+        let k_off =
+            flat_offset(k.shape(), &[Idx::from(&batch), Idx::from(&key), Idx::from(&packed_head), Idx::from(dim)]);
+        let kv = load_off_gated(k.uop(), k_off, valid.clone(), f32c(0.0));
         dot = dot.add(&qv.mul(&kv));
     }
-    let score = warp.wave_reduce_scalar(dot, |a, p| a.add(p));
+    let score = warp.subgroup_reduce_scalar(dot, SUBGROUP, |a, p| a.add(p));
+    let score = UOp::try_where(valid.clone(), score, f32c(f64::NEG_INFINITY)).expect("mask tail score");
     let old_max = load_at(&max_loop, &[1], &[Idx::Const(0)]);
     let old_norm = load_at(&norm_loop, &[1], &[Idx::Const(0)]);
-    let next_max = old_max.max(&score);
+    let tile_max = warp.wave_reduce_scalar(score.clone(), |a, p| a.max(p));
+    let next_max = old_max.max(&tile_max);
     let alpha = old_max.sub(&next_max).try_exp2().expect("exp2 alpha");
     let beta = score.sub(&next_max).try_exp2().expect("exp2 beta");
+    let representative = subgroup_lane.eq(&cidx(0));
+    let norm_term = UOp::try_where(representative, beta.clone(), f32c(0.0)).expect("one beta per subgroup");
+    let tile_norm = warp.wave_reduce_scalar(norm_term, |a, p| a.add(p));
     let max_store = flat_index(&max_reg, &[1], &[Idx::Const(0)]).store(next_max);
     let norm_store = flat_index(&norm_reg.after(smallvec![max_store.clone()]), &[1], &[Idx::Const(0)])
-        .store(old_norm.mul(&alpha).add(&beta));
+        .store(old_norm.mul(&alpha).add(&tile_norm));
+    let group_betas: Vec<_> = (0..groups).map(|g| warp.broadcast_scalar(&beta, (g * SUBGROUP) as i64)).collect();
     let mut output_stores = Vec::with_capacity(ept);
     for j in 0..ept {
         let dim = lane.add(&cidx((j * wave) as i64));
         let old_o = load_at(&o_loop, &[ept], &[Idx::Const(j as i64)]);
-        let vv =
-            load_at(v.uop(), v.shape(), &[Idx::from(&batch), Idx::from(&key), Idx::from(&packed_head), Idx::from(dim)]);
+        let mut tile_o = f32c(0.0);
+        for (g, group_beta) in group_betas.iter().enumerate() {
+            let group_key_offset = tile_offset.add(&cidx(g as i64));
+            let group_valid = group_key_offset.lt(&cidx(chunk as i64));
+            let group_key = split.mul(&cidx(chunk as i64)).add(&group_key_offset);
+            let v_off = flat_offset(
+                v.shape(),
+                &[Idx::from(&batch), Idx::from(&group_key), Idx::from(&packed_head), Idx::from(dim.clone())],
+            );
+            let vv = load_off_gated(v.uop(), v_off, group_valid, f32c(0.0));
+            tile_o = tile_o.add(&vv.mul(group_beta));
+        }
         output_stores.push(
             flat_index(&o_reg.after(smallvec![norm_store.clone()]), &[ept], &[Idx::Const(j as i64)])
-                .store(old_o.mul(&alpha).add(&vv.mul(&beta))),
+                .store(old_o.mul(&alpha).add(&tile_o)),
         );
     }
     ker.push_store(UOp::group(output_stores), o_reg.clone());
