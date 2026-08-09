@@ -245,6 +245,7 @@ impl UOpKey {
             Op::Noop => OpData::None,
             // Multi-child ops: children ARE the data
             Op::Group { .. }
+            | Op::Stack { .. }
             | Op::Vectorize { .. }
             | Op::Cat { .. }
             | Op::PtrCat { .. }

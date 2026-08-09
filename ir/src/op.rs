@@ -187,7 +187,10 @@ pub enum Op {
         deps: SmallVec<[Arc<UOp>; 4]>,
     },
 
-    // Vector operations (5 variants)
+    // Shaped value and legacy vector operations (6 variants)
+    Stack {
+        sources: SmallVec<[Arc<UOp>; 4]>,
+    },
     Vectorize {
         elements: SmallVec<[Arc<UOp>; 4]>,
     },
@@ -430,7 +433,8 @@ impl Op {
                 children
             }
 
-            // Vector operations
+            // Shaped value and vector operations
+            Self::Stack { sources } => sources.iter().collect(),
             Self::Vectorize { elements } => elements.iter().collect(),
             Self::Gep { vector, .. } => SmallVec::from_slice(&[vector]),
             Self::Cat { sources } | Self::PtrCat { sources } => sources.iter().collect(),

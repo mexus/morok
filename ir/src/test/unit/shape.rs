@@ -192,14 +192,26 @@ fn test_shape_caching() {
 fn test_shape_to_uop_non_empty() {
     use crate::op::Op;
 
-    // Non-empty shape should create Vectorize with elements
     let shape = smallvec![SInt::from(3), SInt::from(4)];
     let shape_uop = shape_to_uop(&shape);
 
-    // Should be Vectorize with correct number of elements
-    if let Op::Vectorize { elements } = shape_uop.op() {
-        assert_eq!(elements.len(), 2, "Shape [3, 4] should have 2 elements");
+    if let Op::Stack { sources } = shape_uop.op() {
+        assert_eq!(sources.len(), 2, "shape [3, 4] should have two STACK sources");
+        assert_eq!(shape_uop.dtype(), DType::Index);
     } else {
-        panic!("Expected Vectorize, got {:?}", shape_uop.op());
+        panic!("expected STACK, got {:?}", shape_uop.op());
     }
+}
+
+#[test]
+fn test_shape_to_uop_empty_and_single() {
+    use crate::op::Op;
+
+    let empty = shape_to_uop(&smallvec![]);
+    assert!(matches!(empty.op(), Op::Stack { sources } if sources.is_empty()));
+    assert_eq!(empty.dtype(), DType::Void);
+
+    let single = shape_to_uop(&smallvec![SInt::from(7)]);
+    assert!(matches!(single.op(), Op::Const(_)));
+    assert_eq!(single.dtype(), DType::Index);
 }

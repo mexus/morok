@@ -302,7 +302,7 @@ pub fn to_vec_isize(shape: &Shape) -> Result<Vec<isize>> {
 // Movement Op Argument Extraction (marg equivalent)
 // =========================================================================
 
-/// Extract shape dimensions from a VECTORIZE or CONST UOp.
+/// Extract shape dimensions from a STACK or CONST UOp.
 ///
 /// Following Tinygrad's `marg` pattern, this extracts concrete or symbolic
 /// dimensions from the UOp used to store shape information.
@@ -314,7 +314,9 @@ fn extract_shape_from_uop(shape_uop: &Arc<UOp>) -> Option<Shape> {
         // Unwrap and decode the underlying shape payload.
         Op::Cast { src, .. } | Op::BitCast { src, .. } => extract_shape_from_uop(src),
 
-        // VECTORIZE with Index-typed elements
+        Op::Stack { sources } => Some(sources.iter().cloned().map(SInt::from).collect()),
+
+        // Legacy shape payloads remain readable during the STACK cutover.
         Op::Vectorize { elements } => Some(elements.into_iter().cloned().map(SInt::from).collect()),
 
         // Single CONST value (for 1D shapes)
@@ -337,6 +339,12 @@ fn extract_shape_from_uop(shape_uop: &Arc<UOp>) -> Option<Shape> {
             Some(dims)
         }
 
+        // A one-dimensional symbolic shape is represented directly by its
+        // scalar integer expression rather than a one-element STACK.
+        _ if shape_uop.dtype().is_int() && shape_uop.shape().ok().flatten().is_some_and(|shape| shape.is_empty()) => {
+            Some(smallvec![SInt::Symbolic(shape_uop.clone())])
+        }
+
         _ => None,
     }
 }
@@ -355,7 +363,7 @@ fn extract_ranges_from_uops(begins_uop: &Arc<UOp>, ends_uop: &Arc<UOp>) -> Optio
     Some(begins.into_iter().zip(ends).collect())
 }
 
-/// Convert a Shape to a VECTORIZE UOp for use in movement operations.
+/// Convert a Shape to Tinygrad's scalar/STACK shape argument encoding.
 ///
 /// This creates a UOp that encodes the shape dimensions, suitable for
 /// passing to Reshape, Expand, etc.
@@ -368,30 +376,28 @@ fn extract_ranges_from_uops(begins_uop: &Arc<UOp>, ends_uop: &Arc<UOp>) -> Optio
 /// # use smallvec::smallvec;
 /// let shape = smallvec![SInt::from(3), SInt::from(4), SInt::from(5)];
 /// let shape_uop = shape_to_uop(&shape);
-/// assert_eq!(shape_uop.dtype(), DType::Index.vec(3));
+/// assert_eq!(shape_uop.dtype(), DType::Index);
 ///
 /// // Scalar (empty shape) is supported
 /// let scalar_shape: smallvec::SmallVec<[SInt; 4]> = smallvec![];
 /// let scalar_uop = shape_to_uop(&scalar_shape);
-/// // VConst with empty values represents scalar
+/// // Empty STACK represents scalar
 /// ```
 pub fn shape_to_uop(shape: &Shape) -> Arc<UOp> {
     use smallvec::SmallVec;
     use svod_dtype::DType;
 
-    // Empty shape = scalar: use VConst with empty values
-    // extract_shape_from_uop will decode this back to empty Shape
     if shape.is_empty() {
-        return UOp::vconst(vec![], DType::Index);
+        return UOp::stack(SmallVec::new());
     }
 
     let elements: SmallVec<[Arc<UOp>; 4]> = shape.iter().map(|dim| dim.to_uop(DType::Index)).collect();
-    UOp::vectorize(elements)
+    if elements.len() == 1 { elements[0].clone() } else { UOp::stack(elements) }
 }
 
 /// Convert a vector of (begin, end) ranges to two UOps for Pad/Shrink operations.
 ///
-/// Returns (begins_uop, ends_uop) as VECTORIZE UOps.
+/// Returns shape arguments using the scalar/STACK encoding.
 ///
 /// # Panics
 /// Panics if `ranges` is empty; handle scalars at the callsite.
@@ -404,7 +410,10 @@ pub fn ranges_to_uops(ranges: &[(SInt, SInt)]) -> (Arc<UOp>, Arc<UOp>) {
     let begins: SmallVec<[Arc<UOp>; 4]> = ranges.iter().map(|(begin, _)| begin.to_uop(DType::Index)).collect();
     let ends: SmallVec<[Arc<UOp>; 4]> = ranges.iter().map(|(_, end)| end.to_uop(DType::Index)).collect();
 
-    (UOp::vectorize(begins), UOp::vectorize(ends))
+    let encode = |values: SmallVec<[Arc<UOp>; 4]>| {
+        if values.len() == 1 { values[0].clone() } else { UOp::stack(values) }
+    };
+    (encode(begins), encode(ends))
 }
 
 // =========================================================================
@@ -433,6 +442,20 @@ pub fn infer_shape_from_op(uop: &UOp) -> crate::Result<Option<Shape>> {
         Op::Const(_) => Some(SmallVec::new()), // Scalar has empty shape
 
         Op::VConst { .. } => None,
+
+        Op::Stack { sources } => {
+            if sources.is_empty() {
+                Some(SmallVec::new())
+            } else {
+                let source_shape = sources[0].shape()?.ok_or_else(|| crate::Error::VoidTypeInOp)?;
+                if sources.iter().skip(1).any(|source| source.shape().ok().flatten() != Some(source_shape)) {
+                    return Ok(None);
+                }
+                let mut shape = smallvec![SInt::from(sources.len())];
+                shape.extend(source_shape.iter().cloned());
+                Some(shape)
+            }
+        }
 
         Op::Unique(_) | Op::LUnique(_) | Op::Device(_) | Op::Noop => None,
 

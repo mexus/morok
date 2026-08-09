@@ -139,6 +139,7 @@ fn format_node(uop: &Arc<UOp>) -> String {
         Op::GetTuple { index, .. } => format!("GETTUPLE({index})"),
         Op::Source { code } => format!("SOURCE('{}')", truncate_for_display(code)),
         Op::ProgramBinary { bytes } => format!("BINARY(len={})", bytes.len()),
+        Op::Stack { sources } => format!("STACK(len={})", sources.len()),
         Op::Vectorize { elements } => format!("VECTORIZE(len={})", elements.len()),
         Op::Gep { indices, .. } => format!("GEP(indices={indices:?})"),
         Op::VConst { values } => format!("VCONST(len={})", values.len()),

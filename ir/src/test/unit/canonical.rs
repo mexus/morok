@@ -66,6 +66,17 @@ fn canonical_float_uses_exact_bits() {
 }
 
 #[test]
+fn canonical_stack_has_scalar_dtype_shape_and_ordered_sources() {
+    let stack = UOp::stack(smallvec::smallvec![UOp::native_const(1i32), UOp::native_const(2i32)]);
+    let graph = CanonicalGraph::from_root("tensor", &stack).unwrap();
+
+    assert_eq!(graph.nodes[2].op, "STACK");
+    assert_eq!(graph.nodes[2].dtype, CanonicalDType::Scalar { name: "int32".to_string() });
+    assert_eq!(graph.nodes[2].shape, Some(vec![CanonicalShapeDim::Const { value: 2 }]));
+    assert_eq!(graph.nodes[2].src, vec![0, 1]);
+}
+
+#[test]
 fn canonical_multiple_roots_are_ordered_and_deduplicated() {
     let shared = UOp::const_(DType::Int32, ConstValue::Int(1));
     let lhs = UOp::new(Op::Binary(BinaryOp::Add, shared.clone(), shared.clone()), DType::Int32);

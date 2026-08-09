@@ -172,6 +172,27 @@ fn rule_alu() -> SpecRule {
     })
 }
 
+/// `spec.py:59-62` — STACK is empty/void or a shaped collection of
+/// same-shaped values matching the promoted scalar result dtype.
+fn rule_stack() -> SpecRule {
+    Box::new(|u| match u.op() {
+        Op::Stack { sources } if sources.is_empty() => {
+            Some(ok_if(u.dtype() == DType::Void, "empty STACK must have void dtype"))
+        }
+        Op::Stack { sources } => {
+            let first_shape = sources[0].shape().ok().flatten();
+            Some(ok_if(
+                sources.iter().all(|source| {
+                    source.shape().ok().flatten() == first_shape
+                        && (matches_dtype(source, &u.dtype()) || source.dtype().is_weak())
+                }),
+                "STACK sources must have matching shapes and scalar dtype",
+            ))
+        }
+        _ => None,
+    })
+}
+
 /// `spec.py:67` — RANGE dtype matches its bound's dtype.
 fn rule_range() -> SpecRule {
     Box::new(|u| match u.op() {
@@ -271,6 +292,7 @@ fn rule_shared_structural() -> SpecRule {
 fn spec_shared() -> Vec<SpecRule> {
     vec![
         rule_const(),
+        rule_stack(),
         rule_alu(),
         rule_range(),
         rule_index_integer(),

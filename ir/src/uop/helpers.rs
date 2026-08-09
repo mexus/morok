@@ -413,6 +413,7 @@ impl UOp {
     pub fn is_invalid_marker(uop: &Arc<Self>) -> bool {
         match uop.op() {
             Op::Const(ConstValueHash(ConstValue::Invalid)) => true,
+            Op::Stack { sources } => !sources.is_empty() && sources.iter().all(Self::is_invalid_marker),
             Op::Vectorize { elements } => !elements.is_empty() && elements.iter().all(Self::is_invalid_marker),
             _ => false,
         }

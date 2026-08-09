@@ -35,7 +35,8 @@ pub fn compute_sound_vmin_vmax(uop: &Arc<UOp>) -> Option<(ConstValue, ConstValue
             *SoundVminVmaxProperty::get(src)
         }
 
-        // Union of element ranges: Vectorize, Cat — sound only if all sources are sound
+        // Union of element ranges: Stack, Vectorize, Cat — sound only if all sources are sound
+        Op::Stack { sources } => sound_sources_range(sources),
         Op::Vectorize { elements } => sound_sources_range(elements),
         Op::Cat { sources } => sound_sources_range(sources),
 

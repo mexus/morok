@@ -108,20 +108,21 @@ def fixture(name: str) -> UOp:
   if name == "weak_float_neg_zero": return UOp.const(-0.0)
   if name == "invalid_where":
     return UOp(Ops.WHERE, src=(UOp.const(True), UOp.const(1.0, dtypes.float16), UOp.const(Invalid)))
+  if name == "scalar_stack":
+    return UOp(Ops.STACK, src=(UOp.const(1, dtypes.int32), UOp.const(2, dtypes.int32)))
   if name in {"scalar_load", "gated_load"}:
     from tinygrad.dtype import AddrSpace
     param = UOp(Ops.PARAM, src=(shape_to_shape_arg((16,)),), arg=ParamArg(0, dtypes.float32, addrspace=AddrSpace.GLOBAL))
     index = UOp.const(3)
     if name == "scalar_load": return UOp(Ops.LOAD, src=(UOp(Ops.INDEX, src=(param, index)),))
     valid = UOp(Ops.CMPLT, src=(index, UOp.const(5)))
-    gated_index = UOp(Ops.INDEX, src=(param, index, valid))
-    return UOp(Ops.LOAD, src=(gated_index, UOp.const(0.0, dtypes.float32)))
+    return UOp(Ops.LOAD, src=(UOp(Ops.INDEX, src=(param, index.valid(valid))),))
   raise ValueError(f"unknown fixture {name!r}")
 
 
 def main() -> None:
   parser = argparse.ArgumentParser()
-  parser.add_argument("fixture", choices=("weak_int_add", "weak_float_neg_zero", "invalid_where", "scalar_load", "gated_load"))
+  parser.add_argument("fixture", choices=("weak_int_add", "weak_float_neg_zero", "invalid_where", "scalar_stack", "scalar_load", "gated_load"))
   parser.add_argument("--stage", default="tensor")
   args = parser.parse_args()
   verify_target()

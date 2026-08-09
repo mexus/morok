@@ -1233,6 +1233,9 @@ impl UOp {
                 Op::Barrier { src: src(0), deps: new_srcs[1..].iter().cloned().collect() }
             }
 
+            Op::Stack { .. } => {
+                return Self::stack(new_srcs.iter().cloned().collect());
+            }
             // Vector operations — recompute dtype from new elements when element
             // dtype category changed (e.g. Scalar → Ptr during rewrite reconstruction).
             // Preserving old dtype is wrong when DEFINE_LOCAL → AFTER(Ptr) changes

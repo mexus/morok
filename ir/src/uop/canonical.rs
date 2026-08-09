@@ -407,6 +407,7 @@ fn canonical_arg(op: &Op) -> CanonicalArg {
         | Op::PointerIndex { .. }
         | Op::Copy { .. }
         | Op::MStack { .. }
+        | Op::Stack { .. }
         | Op::Reshape { .. }
         | Op::Expand { .. }
         | Op::Pad { .. }
@@ -457,6 +458,7 @@ fn canonical_op_name(op: &Op) -> String {
             Op::PointerIndex { .. } => "POINTER_INDEX",
             Op::Copy { .. } => "COPY",
             Op::MStack { .. } => "MSTACK",
+            Op::Stack { .. } => "STACK",
             Op::Reshape { .. } => "RESHAPE",
             Op::Permute { .. } => "PERMUTE",
             Op::Expand { .. } => "EXPAND",

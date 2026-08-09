@@ -64,6 +64,23 @@ impl UOp {
         ptr: Option<bool>,
     ) -> Result<Arc<Self>> {
         let indices = indices.into();
+
+        // STACK is a shaped value, so a constant scalar index selects a lane
+        // directly rather than constructing a memory INDEX.
+        if let Op::Stack { sources } = buffer.op()
+            && indices.len() == 1
+            && gate.is_none()
+            && let Op::Const(value) = indices[0].op()
+            && let Some(index) = match value.0 {
+                crate::ConstValue::Int(index) if index >= 0 => Some(index as usize),
+                crate::ConstValue::UInt(index) => usize::try_from(index).ok(),
+                _ => None,
+            }
+            && let Some(source) = sources.get(index)
+        {
+            return Ok(source.clone());
+        }
+
         // Validate that all indices have integer/index base dtype.
         // Allows both scalar (Index, Int64, Int32) and vector (Index.vec(N), Int64.vec(N))
         // for devectorized register/local buffer indexing.

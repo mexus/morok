@@ -1137,12 +1137,13 @@ fn is_const_zero(uop: &Arc<UOp>) -> bool {
     matches!(uop.op(), Op::Const(cv) if cv.0 == ConstValue::Int(0))
 }
 
-/// Extract shape UOps from a vectorize/const (symbolic-aware).
+/// Extract individual dimensions from a scalar/STACK shape argument.
 /// Returns individual element UOps — may be CONST or symbolic expressions.
 /// Matches upstream `marg` which extracts via `sgep`.
 fn extract_shape_uops(uop: &Arc<UOp>) -> Vec<Arc<UOp>> {
     match uop.op() {
         Op::Cast { src, .. } | Op::BitCast { src, .. } => extract_shape_uops(src),
+        Op::Stack { sources } => sources.to_vec(),
         Op::Vectorize { elements } => elements.to_vec(),
         Op::Const(_) => vec![uop.clone()],
         Op::VConst { values } => values
@@ -1153,7 +1154,8 @@ fn extract_shape_uops(uop: &Arc<UOp>) -> Vec<Arc<UOp>> {
                 _ => panic!("Expected int/uint constant in VConst shape uops"),
             })
             .collect(),
-        _ => panic!("Expected vectorize or constant for shape uops, got {:?}", uop.op()),
+        _ if uop.dtype().is_int() => vec![uop.clone()],
+        _ => panic!("expected STACK or scalar integer for shape uops, got {:?}", uop.op()),
     }
 }
 
@@ -1161,6 +1163,17 @@ fn extract_shape_uops(uop: &Arc<UOp>) -> Vec<Arc<UOp>> {
 fn extract_shape_from_uop(uop: &Arc<UOp>) -> Vec<SInt> {
     match uop.op() {
         Op::Cast { src, .. } | Op::BitCast { src, .. } => extract_shape_from_uop(src),
+        Op::Stack { sources } => sources
+            .iter()
+            .map(|source| match source.op() {
+                Op::Const(cv) => match cv.0 {
+                    ConstValue::Int(n) => SInt::Const(n as usize),
+                    ConstValue::UInt(n) => SInt::Const(n as usize),
+                    _ => SInt::Symbolic(source.clone()),
+                },
+                _ => SInt::Symbolic(source.clone()),
+            })
+            .collect(),
         Op::Vectorize { elements } => elements
             .iter()
             .map(|elem| match elem.op() {
@@ -1185,7 +1198,8 @@ fn extract_shape_from_uop(uop: &Arc<UOp>) -> Vec<SInt> {
                 _ => panic!("Expected int/uint constant in VConst shape"),
             })
             .collect(),
-        _ => panic!("Expected vectorize or constant for shape, got {:?}", uop.op()),
+        _ if uop.dtype().is_int() => vec![SInt::Symbolic(uop.clone())],
+        _ => panic!("expected STACK or scalar integer for shape, got {:?}", uop.op()),
     }
 }
 

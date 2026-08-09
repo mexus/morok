@@ -14,6 +14,7 @@ fn fixture(name: &str) -> std::sync::Arc<UOp> {
             let value = UOp::const_(DType::Float16, ConstValue::Float(1.0));
             UOp::new(Op::Ternary(TernaryOp::Where, condition, value, UOp::invalid_marker()), DType::Float16)
         }
+        "scalar_stack" => UOp::stack(smallvec::smallvec![UOp::native_const(1i32), UOp::native_const(2i32)]),
         "scalar_load" | "gated_load" => {
             let param = UOp::param(0, 16, DType::Float32.ptr(Some(16), AddrSpace::Global).unwrap(), None);
             let index = UOp::index_const(3);

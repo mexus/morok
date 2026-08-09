@@ -650,7 +650,7 @@ fn test_placeholder_like_symbolic_shape_fails() {
     let shaped = buf.try_reshape(&Shape::from_iter([SInt::from(n)])).unwrap();
 
     let err = UOp::placeholder_like(&shaped, 0).expect_err("symbolic placeholder_like should fail");
-    assert!(format!("{err}").contains("symbolic shape is not supported"));
+    assert!(format!("{err}").contains("symbolic shape is not supported"), "unexpected error: {err}");
 }
 
 #[test]

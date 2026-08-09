@@ -5,6 +5,9 @@
 
 use std::sync::Arc;
 
+use smallvec::SmallVec;
+use svod_dtype::DType;
+
 use crate::Result;
 use crate::op::Op;
 use crate::uop::UOp;
@@ -12,6 +15,17 @@ use crate::uop::UOp;
 // Low-level constructors (pub(crate) - not yet used but will be needed for optimization passes)
 #[allow(dead_code)]
 impl UOp {
+    /// Build a shaped value while retaining a scalar element dtype.
+    pub fn stack(sources: SmallVec<[Arc<Self>; 4]>) -> Arc<Self> {
+        let dtype = if sources.is_empty() {
+            DType::Void
+        } else {
+            crate::dtype_from_op(&Op::Stack { sources: sources.clone() })
+                .expect("STACK sources must have a promotable dtype")
+        };
+        Self::new(Op::Stack { sources }, dtype)
+    }
+
     /// Reshape tensor to new shape (low-level, UOp-based constructor).
     ///
     /// Takes a UOp for the shape parameter (used internally by compiler passes).

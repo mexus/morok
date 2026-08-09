@@ -115,6 +115,9 @@ pub fn dtype_from_op(op: &Op) -> Option<DType> {
         Op::Wmma { c, .. } => Some(c.dtype()),
         Op::MStack { buffers } => buffers.first().map(|buffer| buffer.dtype()),
 
+        Op::Stack { sources } if sources.is_empty() => Some(DType::Void),
+        Op::Stack { sources } => promote(sources.iter().map(|source| source.dtype())),
+
         Op::Vectorize { elements } => {
             let scalar = promote(elements.iter().map(|element| element.dtype()))?;
             scalar.vec(elements.len())
