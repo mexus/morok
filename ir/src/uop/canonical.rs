@@ -211,6 +211,27 @@ impl CanonicalGraph {
     }
 }
 
+/// Emit one canonical graph to stderr when its stage matches
+/// `SVOD_DUMP_CANONICAL_STAGE` by prefix.
+pub fn dump_canonical_stage(stage: &str, root: &Arc<UOp>) {
+    let Ok(prefix) = std::env::var("SVOD_DUMP_CANONICAL_STAGE") else {
+        return;
+    };
+    if !stage.starts_with(&prefix) {
+        return;
+    }
+
+    eprintln!("[dump-canonical] {stage} :");
+    match CanonicalGraph::from_root(stage, root) {
+        Ok(graph) => match graph.to_pretty_json() {
+            Ok(json) => eprintln!("{json}"),
+            Err(error) => eprintln!("[dump-canonical] {stage} : JSON error: {error}"),
+        },
+        Err(error) => eprintln!("[dump-canonical] {stage} : graph error: {error}"),
+    }
+    eprintln!("[dump-canonical] {stage} : end");
+}
+
 fn canonical_node(id: usize, node: &Arc<UOp>, ids: &HashMap<u64, usize>) -> crate::Result<CanonicalNode> {
     let shape = node.shape()?.map(|shape| {
         shape

@@ -53,7 +53,7 @@ pub use types::{
 };
 pub use uop::{
     CanonicalArg, CanonicalConst, CanonicalDType, CanonicalGraph, CanonicalNode, CanonicalShapeDim, IntoUOp, UOp,
-    UOpKey, compute_ops_estimate,
+    UOpKey, compute_ops_estimate, dump_canonical_stage,
 };
 
 // Re-export pattern matching and rewriting infrastructure

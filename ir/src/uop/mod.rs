@@ -29,7 +29,10 @@ pub mod range_eval;
 pub mod tree;
 
 // Re-export the main types
-pub use canonical::{CanonicalArg, CanonicalConst, CanonicalDType, CanonicalGraph, CanonicalNode, CanonicalShapeDim};
+pub use canonical::{
+    CanonicalArg, CanonicalConst, CanonicalDType, CanonicalGraph, CanonicalNode, CanonicalShapeDim,
+    dump_canonical_stage,
+};
 pub use core::{IntoUOp, UOp, UOpKey};
 pub use cost::compute_ops_estimate;
 pub use hash_consing::{gc_dead_refs, live_uop_ids};

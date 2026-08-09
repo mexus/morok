@@ -161,7 +161,6 @@ pub fn apply_post_optimization_with_renderer(ast: Arc<svod_ir::UOp>, renderer: O
     // allocation-independent canonical JSON used by parity tooling.
     let dump_per_stage = std::env::var("SVOD_PER_STAGE_UOPS").is_ok();
     let dump_stage_prefix = std::env::var("SVOD_DUMP_STAGE").ok();
-    let dump_canonical_prefix = std::env::var("SVOD_DUMP_CANONICAL_STAGE").ok();
     let print_stage = |label: &str, node: &Arc<svod_ir::UOp>| {
         if dump_per_stage {
             eprintln!("[per-stage] {} : node_count={}", label, node.node_count());
@@ -173,19 +172,7 @@ pub fn apply_post_optimization_with_renderer(ast: Arc<svod_ir::UOp>, renderer: O
             eprintln!("{}", node.tree());
             eprintln!("[dump-stage] {} : end", label);
         }
-        if let Some(ref prefix) = dump_canonical_prefix
-            && label.starts_with(prefix.as_str())
-        {
-            eprintln!("[dump-canonical] {} :", label);
-            match svod_ir::CanonicalGraph::from_root(label, node) {
-                Ok(graph) => match graph.to_pretty_json() {
-                    Ok(json) => eprintln!("{json}"),
-                    Err(error) => eprintln!("[dump-canonical] {label} : JSON error: {error}"),
-                },
-                Err(error) => eprintln!("[dump-canonical] {label} : graph error: {error}"),
-            }
-            eprintln!("[dump-canonical] {} : end", label);
-        }
+        svod_ir::dump_canonical_stage(label, node);
     };
     print_stage("00-initial", &ast);
 
@@ -457,10 +444,12 @@ pub fn apply_post_optimization_with_renderer(ast: Arc<svod_ir::UOp>, renderer: O
     assert_gated_loads_have_alt("after_bool_storage_pattern", &bs);
 
     // Re-attach metadata (e.g., KernelInfo) that was lost during graph rewrites
-    match saved_metadata {
+    let optimized = match saved_metadata {
         Some(meta) => bs.with_metadata_raw(meta),
         None => bs,
-    }
+    };
+    svod_ir::dump_canonical_stage("optimized", &optimized);
+    optimized
 }
 
 fn assert_gated_loads_have_alt(stage: &str, root: &Arc<svod_ir::UOp>) {

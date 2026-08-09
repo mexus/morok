@@ -638,6 +638,7 @@ fn schedule_result_from_sink_with_cache(
     mut var_vals: HashMap<String, i64>,
     config: &PrepareConfig,
 ) -> Result<crate::schedule::ScheduleResult> {
+    svod_ir::dump_canonical_stage("tensor", &sink);
     if config.disable_schedule_cache || schedule_cache_disabled_by_env() {
         return schedule_result_from_sink_uncached(sink, var_vals, config);
     }

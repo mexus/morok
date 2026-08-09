@@ -506,6 +506,7 @@ pub fn try_get_kernel_graph(root: Arc<UOp>) -> svod_ir::Result<(Arc<UOp>, Rangei
     let result = fix_assign(&after_split)?;
     tracing::debug!(elapsed_ms = t_stage.elapsed().as_millis() as u64, "kernel split: fix_assign complete");
 
+    svod_ir::dump_canonical_stage("kernel_ast", &result);
     Ok((result, ctx))
 }
 

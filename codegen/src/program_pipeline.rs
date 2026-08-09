@@ -90,7 +90,9 @@ fn rebuild_program(
 /// Create initial PROGRAM(sink, device) state.
 pub fn program_from_sink(sink: Arc<UOp>, device: DeviceSpec) -> Arc<UOp> {
     let sink = if matches!(sink.op(), Op::Sink { .. }) { sink } else { UOp::sink(vec![sink]) };
-    UOp::program(sink, UOp::device(device), None, None, None)
+    let program = UOp::program(sink, UOp::device(device), None, None, None);
+    svod_ir::dump_canonical_stage("program", &program);
+    program
 }
 
 /// PROGRAM -> LINEAR stage.
@@ -133,7 +135,9 @@ pub fn do_linearize(program: &Arc<UOp>) -> Result<Arc<UOp>> {
 
     let linear_clean = line_rewrite_cleanups(linear_ops);
     let linear_uop = UOp::linear(linear_clean.into());
-    rebuild_program(program, Some(linear_uop), source, binary)
+    let linearized = rebuild_program(program, Some(linear_uop), source, binary)?;
+    svod_ir::dump_canonical_stage("linearized", &linearized);
+    Ok(linearized)
 }
 
 /// PROGRAM(+LINEAR) -> SOURCE stage via Renderer.
@@ -164,6 +168,7 @@ pub fn do_render(program: &Arc<UOp>, renderer: &dyn Renderer, name: Option<&str>
     let source_uop = UOp::source(spec.src.clone());
     let mut rendered = rebuild_program(&linearized, linear, Some(source_uop), None)?;
     rendered = rendered.with_metadata(spec.clone());
+    svod_ir::dump_canonical_stage("source", &rendered);
     Ok((rendered, spec))
 }
 
@@ -204,6 +209,7 @@ pub fn do_compile(program: &Arc<UOp>, compiler: &dyn Compiler) -> Result<(Arc<UO
     let binary_uop = UOp::binary(compiled.bytes.clone());
     let mut compiled_program = rebuild_program(program, linear, source, Some(binary_uop))?;
     compiled_program = compiled_program.with_metadata(spec);
+    svod_ir::dump_canonical_stage("binary", &compiled_program);
     Ok((compiled_program, compiled))
 }
 

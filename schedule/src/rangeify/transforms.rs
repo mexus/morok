@@ -430,6 +430,7 @@ pub fn rangeify_with_map(sink: Arc<UOp>) -> svod_ir::Result<RangeifyResult> {
     // Build RangeifyContext for return
     let rangeify_ctx = RangeifyContext { range_counter: indexing_ctx.range_counter(), range_map: HashMap::new() };
 
+    svod_ir::dump_canonical_stage("rangeified", &sink);
     Ok(RangeifyResult { sink, context: rangeify_ctx, uop_list })
 }
 
