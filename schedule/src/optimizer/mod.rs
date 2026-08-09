@@ -157,8 +157,11 @@ pub fn apply_post_optimization_with_renderer(ast: Arc<svod_ir::UOp>, renderer: O
     // which pass blows up on a bloated input. Set SVOD_DUMP_STAGE=<prefix>
     // to also dump the full UOp tree at any stage whose label starts with
     // that prefix (e.g. SVOD_DUMP_STAGE=13 dumps stage 13-pm_add_loads).
+    // SVOD_DUMP_CANONICAL_STAGE uses the same prefix matching but emits the
+    // allocation-independent canonical JSON used by parity tooling.
     let dump_per_stage = std::env::var("SVOD_PER_STAGE_UOPS").is_ok();
     let dump_stage_prefix = std::env::var("SVOD_DUMP_STAGE").ok();
+    let dump_canonical_prefix = std::env::var("SVOD_DUMP_CANONICAL_STAGE").ok();
     let print_stage = |label: &str, node: &Arc<svod_ir::UOp>| {
         if dump_per_stage {
             eprintln!("[per-stage] {} : node_count={}", label, node.node_count());
@@ -169,6 +172,19 @@ pub fn apply_post_optimization_with_renderer(ast: Arc<svod_ir::UOp>, renderer: O
             eprintln!("[dump-stage] {} :", label);
             eprintln!("{}", node.tree());
             eprintln!("[dump-stage] {} : end", label);
+        }
+        if let Some(ref prefix) = dump_canonical_prefix
+            && label.starts_with(prefix.as_str())
+        {
+            eprintln!("[dump-canonical] {} :", label);
+            match svod_ir::CanonicalGraph::from_root(label, node) {
+                Ok(graph) => match graph.to_pretty_json() {
+                    Ok(json) => eprintln!("{json}"),
+                    Err(error) => eprintln!("[dump-canonical] {label} : JSON error: {error}"),
+                },
+                Err(error) => eprintln!("[dump-canonical] {label} : graph error: {error}"),
+            }
+            eprintln!("[dump-canonical] {} : end", label);
         }
     };
     print_stage("00-initial", &ast);
