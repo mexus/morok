@@ -12,8 +12,12 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use svod_dtype::DeviceSpec;
-use svod_ir::{BinaryOp, ConstValue, Op, TernaryOp, UOp, UnaryOp};
+use sha2::{Digest, Sha256};
+use svod_dtype::{AddrSpace, DType, DeviceSpec, ScalarDType};
+use svod_ir::{
+    BINARY_STAGE_IDENTITY_VERSION, BinaryOp, BinaryStageIdentity, ConstValue, Op, SOURCE_STAGE_IDENTITY_VERSION,
+    SourceStageIdentity, StageAbiParam, StageAbiParamKind, StageDigest, TernaryOp, UOp, UnaryOp,
+};
 
 use crate::allocator::Allocator;
 use snafu::OptionExt;
@@ -74,12 +78,11 @@ pub trait Program: Send + Sync {
         &()
     }
 
-    /// Mint a reusable per-plan execution context, or `None` for per-call
-    /// dispatch. An `ExecutionPlan` calls this once on its first kernel's
-    /// program and reuses the returned context for every dispatch, so all the
-    /// plan's kernels share one queue (distinct plans → distinct queues for
-    /// cross-plan parallelism). Default `None`: the backend's `execute` is
-    /// already self-contained (CPU), so the plan dispatches per-call.
+    /// Mint reusable logical per-plan state, or `None` for per-call dispatch.
+    /// An `ExecutionPlan` calls this once on its first kernel and reuses it for
+    /// dispatch, native replay templates, profiling, and epoch-scoped hardware
+    /// lane acquisition. Default `None`: the backend's `execute` is already
+    /// self-contained.
     fn new_exec_context(&self) -> Result<Option<Box<dyn PlanContext>>> {
         Ok(None)
     }
@@ -93,10 +96,8 @@ pub trait Program: Send + Sync {
 }
 
 /// One graphable kernel: a program plus its fixed buffer pointers and launch
-/// dims, captured once. Buffer pointers are plan-owned and stable across calls
-/// (`ExecutionPlan::buffers`), so a graph can bake them in and only re-patch
-/// variable-derived launch dims + `vals` on replay. Bundles the device,
-/// program, buffers, and launch vars of a single graph call.
+/// dims, captured once. Replay may replace the captured buffer addresses and
+/// scalar vars without rebuilding the backend command stream.
 pub struct GraphKernel<'a> {
     pub program: &'a dyn Program,
     pub buffers: Vec<*mut u8>,
@@ -116,16 +117,26 @@ pub struct GraphKernel<'a> {
 /// per-graph, not per-kernel, launch cost. Replay is equivalent to running every
 /// captured kernel in order.
 pub trait Graph: Send + Sync {
-    /// Re-dispatch the captured chain. `vals` are positional updated launch
-    /// vars (same order as capture); empty replays the baked-in values.
-    fn replay(&self, vals: &[i64]) -> Result<()>;
+    /// Re-dispatch the captured chain. Buffers and vars are flattened in capture
+    /// order; empty slices replay the captured values.
+    fn replay(&self, buffers: &[u64], vals: &[i64]) -> Result<()>;
+
+    /// Replay a profiling-specific linked variant and return ready per-dispatch
+    /// timestamps in capture order. Backends without graph timestamps return
+    /// `None`, allowing the runtime to retain its per-call fallback.
+    fn replay_profiled(
+        &self,
+        _buffers: &[u64],
+        _vals: &[i64],
+    ) -> Result<Option<Vec<Arc<dyn crate::DispatchTimestamps>>>> {
+        Ok(None)
+    }
 }
 
-/// A reusable per-plan execution context: a lease of device-level dispatch
-/// resources (e.g. an AMD queue from the pool) held by an `ExecutionPlan` for
-/// its lifetime so every kernel in the plan dispatches onto the same queue.
-/// Minted by [`Program::new_exec_context`]; backends with no reusable context
-/// (CPU) return `None` and the plan falls back to per-call [`Program::execute`].
+/// Reusable logical per-plan state. A backend may acquire an exclusive hardware
+/// lane for one replay epoch, but the context itself does not imply lifetime
+/// queue ownership. Minted by [`Program::new_exec_context`]; backends with no
+/// reusable context return `None` and use per-call [`Program::execute`].
 pub trait PlanContext: Send + Sync {
     /// Dispatch one kernel of the plan onto this context. `program` belongs to
     /// the same plan and therefore the same backend that minted this context
@@ -153,8 +164,26 @@ pub trait PlanContext: Send + Sync {
         profile: bool,
     ) -> Result<Option<Arc<dyn crate::DispatchTimestamps>>>;
 
+    /// Replay an execution plan's already-linked neutral topology. Hardware
+    /// backends may lower/link it on the first call and patch only invocation
+    /// state thereafter. A declined outcome keeps the generic per-operation path.
+    fn replay_linked_plan(
+        &self,
+        _submissions: &[crate::hcq::SemanticLinkedSubmission],
+        _calls: &[PlanCall<'_>],
+    ) -> Result<NativeReplayOutcome> {
+        Ok(NativeReplayOutcome::Declined(NativeReplayDecline::BackendUnsupported))
+    }
+
     /// Drain this context's in-flight work (profiled-timestamp harvest).
     fn synchronize(&self) -> Result<()>;
+
+    /// End one direct-dispatch replay epoch without waiting for GPU completion.
+    /// Exclusive-lane backends release publication authority here while
+    /// retaining queue identity for FIFO ordering in the next epoch.
+    fn finish_replay(&self) -> Result<()> {
+        Ok(())
+    }
 
     /// Arm hardware performance counters for subsequent profiling dispatches on
     /// this context (empty disables). Default no-op: backends without PMC ignore
@@ -167,6 +196,52 @@ pub trait PlanContext: Send + Sync {
     fn pmc_available(&self) -> bool {
         false
     }
+}
+
+/// Why an execution plan could not use backend-native linked replay.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NativeReplayDecline {
+    NoCompiledProgram,
+    NoPlanContext,
+    MixedComputeDevices { expected: DeviceSpec, actual: DeviceSpec },
+    ForeignProgramEndpoint { operation: u64, argument: usize, expected: DeviceSpec, actual: DeviceSpec },
+    IncompatibleProgramAllocation { operation: u64, argument: usize, expected: DeviceSpec },
+    ForeignCopyEndpoint { operation: u64, endpoint: CopyEndpoint, expected: DeviceSpec, actual: DeviceSpec },
+    IncompatibleCopyAllocation { operation: u64, endpoint: CopyEndpoint, expected: DeviceSpec },
+    BackendUnsupported,
+}
+
+/// Result of attempting backend-native linked replay.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NativeReplayOutcome {
+    Executed,
+    Declined(NativeReplayDecline),
+}
+
+/// Copy endpoint whose ownership prevented native replay.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CopyEndpoint {
+    Destination,
+    Source,
+}
+
+/// Current invocation values for one captured plan operation. Structure and
+/// programs are stable; buffer addresses, scalar vars, and launch geometry are
+/// deliberately supplied on every replay.
+pub enum PlanCall<'a> {
+    Program {
+        program: &'a dyn Program,
+        buffers: &'a [u64],
+        vals: &'a [i64],
+        global_size: Option<[usize; 3]>,
+        local_size: Option<[usize; 3]>,
+    },
+    Copy {
+        dst: u64,
+        src: u64,
+        bytes: usize,
+    },
+    Unsupported,
 }
 
 /// Compilation result carrying source (JIT) or bytes (AOT).
@@ -206,35 +281,320 @@ pub struct CompiledSpec {
 
     /// Number of buffer arguments (for CIF construction at compile time).
     pub buf_count: usize,
+
+    /// Complete kernel argument ABI in source-signature order.
+    pub abi: Vec<AbiParamDescriptor>,
+
+    linear_stage: Option<Arc<UOp>>,
+    stage_identity: Option<BinaryStageIdentity>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum AbiParamKind {
+    Storage(AddrSpace),
+    Scalar,
+}
+
+/// One external PARAM argument. The vector containing these descriptors is
+/// always sorted by `slot` and is the sole source of kernel ABI ordering.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct AbiParamDescriptor {
+    pub slot: usize,
+    pub kind: AbiParamKind,
+    pub dtype: DType,
+    pub name: Option<String>,
+}
+
+impl AbiParamDescriptor {
+    pub fn from_param(param: &Arc<UOp>) -> Result<Self> {
+        let Op::Param { arg, .. } = param.op() else {
+            return Err(Error::ProgramAbiMismatch {
+                reason: format!("ABI descriptor source is non-PARAM {:?}", param.op()),
+            });
+        };
+        if arg.slot == usize::MAX {
+            return Err(Error::UnassignedProgramParam {
+                stage: "ABI descriptor construction",
+                param: arg.name.clone().unwrap_or_else(|| format!("{:?} storage", arg.addrspace)),
+            });
+        }
+        if arg.addrspace.is_none() && arg.name.is_none() {
+            return Err(Error::ProgramAbiMismatch { reason: format!("scalar PARAM in slot {} has no name", arg.slot) });
+        }
+        if arg.dtype != param.dtype() {
+            return Err(Error::ProgramAbiMismatch {
+                reason: format!(
+                    "PARAM slot {} metadata dtype {:?} does not match UOp dtype {:?}",
+                    arg.slot,
+                    arg.dtype,
+                    param.dtype()
+                ),
+            });
+        }
+        if arg.addrspace.is_none() && param.dtype() != DType::Int32 {
+            return Err(Error::ProgramAbiMismatch {
+                reason: format!("scalar PARAM slot {} has non-canonical final ABI dtype {:?}", arg.slot, param.dtype()),
+            });
+        }
+        Ok(Self {
+            slot: arg.slot,
+            kind: arg.addrspace.map_or(AbiParamKind::Scalar, AbiParamKind::Storage),
+            dtype: param.dtype(),
+            name: arg.name.clone(),
+        })
+    }
+
+    pub fn is_storage(&self) -> bool {
+        matches!(self.kind, AbiParamKind::Storage(_))
+    }
+}
+
+fn stage_abi(abi: &[AbiParamDescriptor]) -> Vec<StageAbiParam> {
+    abi.iter()
+        .map(|param| StageAbiParam {
+            slot: param.slot,
+            kind: match param.kind {
+                AbiParamKind::Storage(space) => StageAbiParamKind::Storage(space),
+                AbiParamKind::Scalar => StageAbiParamKind::Scalar,
+            },
+            dtype: param.dtype.clone(),
+            name: param.name.clone(),
+        })
+        .collect()
+}
+
+fn sha256(bytes: &[u8]) -> StageDigest {
+    StageDigest(Sha256::digest(bytes).into())
+}
+
+fn linear_sha256(linear: &Arc<UOp>) -> Result<StageDigest> {
+    let graph = svod_ir::CanonicalGraph::from_root("source-stage-linear-v1", linear).map_err(|error| {
+        Error::ProgramStageMismatch { stage: "SOURCE", reason: format!("cannot encode LINEAR identity: {error}") }
+    })?;
+    let encoded = graph.to_pretty_json().map_err(|error| Error::ProgramStageMismatch {
+        stage: "SOURCE",
+        reason: format!("cannot serialize LINEAR identity: {error}"),
+    })?;
+    Ok(sha256(encoded.as_bytes()))
+}
+
+fn source_stage_identity_from_parts(
+    abi: &[AbiParamDescriptor],
+    target: &DeviceSpec,
+    entry_name: String,
+    linear: &Arc<UOp>,
+    source: &str,
+) -> Result<SourceStageIdentity> {
+    Ok(SourceStageIdentity {
+        version: SOURCE_STAGE_IDENTITY_VERSION,
+        abi: stage_abi(abi),
+        target: target.clone(),
+        entry_name,
+        linear_sha256: linear_sha256(linear)?,
+        source_sha256: sha256(source.as_bytes()),
+    })
+}
+
+/// Construct the semantic identity for one rendered SOURCE stage.
+pub fn source_stage_identity(
+    info: &svod_ir::ProgramInfo,
+    abi: &[AbiParamDescriptor],
+    linear: &Arc<UOp>,
+    source: &str,
+) -> Result<SourceStageIdentity> {
+    source_stage_identity_from_parts(abi, &info.target, info.function_name(), linear, source)
+}
+
+/// Construct the semantic identity for one compiled BINARY stage.
+pub fn binary_stage_identity(source: SourceStageIdentity, compiler_key: &str, bytes: &[u8]) -> BinaryStageIdentity {
+    BinaryStageIdentity {
+        version: BINARY_STAGE_IDENTITY_VERSION,
+        source,
+        compiler_key: compiler_key.to_string(),
+        binary_sha256: sha256(bytes),
+    }
+}
+
+/// Validate a SOURCE UOp against an independently derived identity.
+pub fn validate_source_stage(source: &Arc<UOp>, expected: &SourceStageIdentity) -> Result<()> {
+    let Op::Source { code, identity } = source.op() else {
+        return Err(Error::ProgramStageMismatch {
+            stage: "SOURCE",
+            reason: format!("expected SOURCE, got {:?}", source.op()),
+        });
+    };
+    let actual = identity.as_ref().ok_or_else(|| Error::ProgramStageMismatch {
+        stage: "SOURCE",
+        reason: "stage has no semantic identity".into(),
+    })?;
+    if actual != expected || actual.source_sha256 != sha256(code.as_bytes()) {
+        return Err(Error::ProgramStageMismatch {
+            stage: "SOURCE",
+            reason: format!("expected {expected:?}, got {actual:?}"),
+        });
+    }
+    Ok(())
+}
+
+/// Validate a BINARY UOp against an independently derived identity.
+pub fn validate_binary_stage(binary: &Arc<UOp>, expected: &BinaryStageIdentity) -> Result<Vec<u8>> {
+    let Op::ProgramBinary { bytes, identity } = binary.op() else {
+        return Err(Error::ProgramStageMismatch {
+            stage: "BINARY",
+            reason: format!("expected BINARY, got {:?}", binary.op()),
+        });
+    };
+    let actual = identity.as_ref().ok_or_else(|| Error::ProgramStageMismatch {
+        stage: "BINARY",
+        reason: "stage has no semantic identity".into(),
+    })?;
+    if actual != expected || actual.binary_sha256 != sha256(bytes) {
+        return Err(Error::ProgramStageMismatch {
+            stage: "BINARY",
+            reason: format!("expected {expected:?}, got {actual:?}"),
+        });
+    }
+    Ok(bytes.clone())
+}
+
+/// Validate the complete external kernel ABI and its compact runtime
+/// projections. PARAM slots choose signature positions; buffer and scalar
+/// vectors remain compact in descriptor order.
+pub fn validate_abi_descriptors(
+    abi: &[AbiParamDescriptor],
+    expected_buf_count: usize,
+    expected_var_names: &[String],
+) -> Result<()> {
+    let mut previous_slot = None;
+    let mut buf_count = 0usize;
+    let mut var_names = Vec::new();
+    let mut unique_names = std::collections::HashSet::new();
+
+    for descriptor in abi {
+        if descriptor.slot == usize::MAX {
+            return Err(Error::UnassignedProgramParam {
+                stage: "ABI descriptor validation",
+                param: descriptor.name.clone().unwrap_or_else(|| format!("{:?} storage", descriptor.kind)),
+            });
+        }
+        if previous_slot.is_some_and(|slot| descriptor.slot <= slot) {
+            return Err(Error::ProgramAbiMismatch {
+                reason: format!(
+                    "ABI descriptors must have strictly ascending unique slots, got slot {} after {:?}",
+                    descriptor.slot, previous_slot
+                ),
+            });
+        }
+        previous_slot = Some(descriptor.slot);
+
+        match &descriptor.kind {
+            AbiParamKind::Storage(_) => {
+                if descriptor.name.is_some() {
+                    return Err(Error::ProgramAbiMismatch {
+                        reason: format!("storage PARAM slot {} must not have a scalar name", descriptor.slot),
+                    });
+                }
+                let supported_dtype = match &descriptor.dtype {
+                    DType::Scalar(dtype) => !matches!(
+                        dtype,
+                        ScalarDType::Void | ScalarDType::Index | ScalarDType::WeakInt | ScalarDType::WeakFloat
+                    ),
+                    DType::Vector { scalar, count } => {
+                        *count > 0
+                            && !matches!(
+                                scalar,
+                                ScalarDType::Void | ScalarDType::Index | ScalarDType::WeakInt | ScalarDType::WeakFloat
+                            )
+                    }
+                    DType::Ptr { .. } | DType::Image { .. } => false,
+                };
+                if !supported_dtype {
+                    return Err(Error::ProgramAbiMismatch {
+                        reason: format!(
+                            "storage PARAM slot {} has unsupported element dtype {:?}",
+                            descriptor.slot, descriptor.dtype
+                        ),
+                    });
+                }
+                buf_count += 1;
+            }
+            AbiParamKind::Scalar => {
+                if descriptor.dtype != DType::Int32 {
+                    return Err(Error::ProgramAbiMismatch {
+                        reason: format!(
+                            "scalar PARAM slot {} has non-canonical final ABI dtype {:?}",
+                            descriptor.slot, descriptor.dtype
+                        ),
+                    });
+                }
+                let name = descriptor.name.as_deref().filter(|name| !name.is_empty()).ok_or_else(|| {
+                    Error::ProgramAbiMismatch {
+                        reason: format!("scalar PARAM in slot {} has no name", descriptor.slot),
+                    }
+                })?;
+                if !unique_names.insert(name) {
+                    return Err(Error::ProgramAbiMismatch { reason: format!("duplicate scalar PARAM name {name:?}") });
+                }
+                var_names.push(name.to_string());
+            }
+        }
+    }
+
+    if buf_count != expected_buf_count || var_names != expected_var_names {
+        return Err(Error::ProgramAbiMismatch {
+            reason: format!(
+                "ABI descriptors project to {buf_count} buffers/vars {var_names:?}, expected {expected_buf_count}/{expected_var_names:?}"
+            ),
+        });
+    }
+    Ok(())
 }
 
 impl CompiledSpec {
     /// Create a new CompiledSpec for JIT backends (source-based).
-    pub fn from_source(name: String, src: String, ast: Arc<UOp>, buf_count: usize) -> Self {
-        Self {
+    pub fn from_source(name: String, src: String, ast: Arc<UOp>, abi: Vec<AbiParamDescriptor>) -> Result<Self> {
+        let buf_count = abi.iter().filter(|arg| arg.is_storage()).count();
+        let var_names = abi
+            .iter()
+            .filter_map(|arg| (!arg.is_storage()).then(|| arg.name.clone().unwrap_or_default()))
+            .collect::<Vec<_>>();
+        validate_abi_descriptors(&abi, buf_count, &var_names)?;
+        Ok(Self {
             name,
             src: Some(src),
             bytes: Vec::new(),
             ast,
-            var_names: Vec::new(),
+            var_names,
             global_size: default_launch_size(),
             local_size: Some(default_launch_size()),
             buf_count,
-        }
+            abi,
+            linear_stage: None,
+            stage_identity: None,
+        })
     }
 
     /// Create a new CompiledSpec for AOT backends (bytecode-based).
-    pub fn from_bytes(name: String, bytes: Vec<u8>, ast: Arc<UOp>) -> Self {
-        Self {
+    pub fn from_bytes(name: String, bytes: Vec<u8>, ast: Arc<UOp>, abi: Vec<AbiParamDescriptor>) -> Result<Self> {
+        let buf_count = abi.iter().filter(|arg| arg.is_storage()).count();
+        let var_names = abi
+            .iter()
+            .filter_map(|arg| (!arg.is_storage()).then(|| arg.name.clone().unwrap_or_default()))
+            .collect::<Vec<_>>();
+        validate_abi_descriptors(&abi, buf_count, &var_names)?;
+        Ok(Self {
             name,
             src: None,
             bytes,
             ast,
-            var_names: Vec::new(),
+            var_names,
             global_size: default_launch_size(),
             local_size: Some(default_launch_size()),
-            buf_count: 0,
-        }
+            buf_count,
+            abi,
+            linear_stage: None,
+            stage_identity: None,
+        })
     }
 
     /// Create a new CompiledSpec with work sizes for JIT backends.
@@ -244,18 +604,71 @@ impl CompiledSpec {
         ast: Arc<UOp>,
         global_size: [usize; 3],
         local_size: Option<[usize; 3]>,
-        buf_count: usize,
-    ) -> Self {
-        Self {
+        abi: Vec<AbiParamDescriptor>,
+    ) -> Result<Self> {
+        let buf_count = abi.iter().filter(|arg| arg.is_storage()).count();
+        let var_names = abi
+            .iter()
+            .filter_map(|arg| (!arg.is_storage()).then(|| arg.name.clone().unwrap_or_default()))
+            .collect::<Vec<_>>();
+        validate_abi_descriptors(&abi, buf_count, &var_names)?;
+        Ok(Self {
             name,
             src: Some(src),
             bytes: Vec::new(),
             ast,
-            var_names: Vec::new(),
+            var_names,
             global_size: concrete_launch_size(global_size),
             local_size: local_size.map(concrete_launch_size),
             buf_count,
+            abi,
+            linear_stage: None,
+            stage_identity: None,
+        })
+    }
+
+    /// Bind compiler output to the exact staged PROGRAM that produced it.
+    pub fn bind_program_stage(
+        &mut self,
+        linear: Arc<UOp>,
+        target: &DeviceSpec,
+        compiler_key: &str,
+        identity: BinaryStageIdentity,
+    ) -> Result<()> {
+        self.linear_stage = Some(linear);
+        self.stage_identity = Some(identity);
+        self.validate_stage_identity(target, compiler_key)
+    }
+
+    /// Validate all semantic stage fields required before executable loading.
+    pub fn validate_stage_identity(&self, target: &DeviceSpec, compiler_key: &str) -> Result<()> {
+        let identity = self.stage_identity.as_ref().ok_or_else(|| Error::ProgramStageMismatch {
+            stage: "BINARY",
+            reason: "compiled specification has no semantic stage identity".into(),
+        })?;
+        let linear = self.linear_stage.as_ref().ok_or_else(|| Error::ProgramStageMismatch {
+            stage: "SOURCE",
+            reason: "compiled specification has no LINEAR identity input".into(),
+        })?;
+        let source = self.src.as_deref().ok_or_else(|| Error::ProgramStageMismatch {
+            stage: "SOURCE",
+            reason: "compiled specification does not retain its source payload".into(),
+        })?;
+        let expected_source = source_stage_identity_from_parts(&self.abi, target, self.name.clone(), linear, source)?;
+        if identity.source != expected_source {
+            return Err(Error::ProgramStageMismatch {
+                stage: "SOURCE",
+                reason: format!("expected {expected_source:?}, got {:?}", identity.source),
+            });
         }
+        let expected_binary = binary_stage_identity(expected_source, compiler_key, &self.bytes);
+        if identity != &expected_binary {
+            return Err(Error::ProgramStageMismatch {
+                stage: "BINARY",
+                reason: format!("expected {expected_binary:?}, got {identity:?}"),
+            });
+        }
+        Ok(())
     }
 }
 
@@ -308,8 +721,14 @@ fn checked_launch_binary(op: BinaryOp, lhs: i64, rhs: i64) -> Result<i64> {
         BinaryOp::Add => lhs.checked_add(rhs),
         BinaryOp::Sub => lhs.checked_sub(rhs),
         BinaryOp::Mul => lhs.checked_mul(rhs),
-        BinaryOp::Idiv => (rhs != 0).then(|| lhs.checked_div(rhs)).flatten(),
-        BinaryOp::Mod => (rhs != 0).then(|| lhs.checked_rem(rhs)).flatten(),
+        BinaryOp::FloorDiv => lhs
+            .checked_div(rhs)
+            .and_then(|q| lhs.checked_rem(rhs).map(|r| if r != 0 && (lhs < 0) != (rhs < 0) { q - 1 } else { q })),
+        BinaryOp::FloorMod => {
+            lhs.checked_rem(rhs).and_then(|r| if r != 0 && (r < 0) != (rhs < 0) { r.checked_add(rhs) } else { Some(r) })
+        }
+        BinaryOp::CDiv => (rhs != 0).then(|| lhs.checked_div(rhs)).flatten(),
+        BinaryOp::CMod => (rhs != 0).then(|| lhs.checked_rem(rhs)).flatten(),
         BinaryOp::Max => Some(lhs.max(rhs)),
         // Integer power: only support non-negative exponents that fit in u32.
         BinaryOp::Pow => u32::try_from(rhs).ok().and_then(|e| lhs.checked_pow(e)),
@@ -359,17 +778,28 @@ fn checked_launch_ternary(op: TernaryOp, a: i64, b: i64, c: i64) -> Result<i64> 
 fn eval_launch_expr(expr: &Arc<UOp>, vars: &HashMap<&str, i64>) -> Result<i64> {
     match expr.op() {
         Op::Const(value) => const_value_to_i64(value.0),
-        Op::DefineVar { name, min_val, max_val } => {
-            let value = vars.get(name.as_str()).copied().ok_or_else(|| Error::Runtime {
+        Op::Param { arg, .. } if arg.addrspace.is_none() => {
+            let name = arg
+                .name
+                .as_deref()
+                .ok_or_else(|| Error::Runtime { message: "scalar launch-size PARAM has no name".to_string() })?;
+            let value = vars.get(name).copied().ok_or_else(|| Error::Runtime {
                 message: format!("missing runtime value for launch-size variable {name}"),
             })?;
-            validate_var_bound(name, value, *min_val, *max_val)?;
+            if let Some((min, max)) = &arg.vmin_vmax
+                && let (Some(min), Some(max)) = (min.0.try_int(), max.0.try_int())
+            {
+                validate_var_bound(name, value, min, max)?;
+            }
             Ok(value)
         }
         Op::Bind { var, value } => {
             let bound = eval_launch_expr(value, vars)?;
-            if let Op::DefineVar { name, min_val, max_val } = var.op() {
-                validate_var_bound(name, bound, *min_val, *max_val)?;
+            if let Op::Param { arg, .. } = var.op()
+                && let (Some(name), Some((min, max))) = (&arg.name, &arg.vmin_vmax)
+                && let (Some(min), Some(max)) = (min.0.try_int(), max.0.try_int())
+            {
+                validate_var_bound(name, bound, min, max)?;
             }
             Ok(bound)
         }
@@ -530,6 +960,9 @@ pub trait Renderer: Send + Sync {
         None
     }
 
+    /// Operations this concrete code renderer accepts without decomposition.
+    fn supported_ops(&self) -> svod_ir::RendererOps;
+
     /// Returns decomposition patterns for operations this backend doesn't support.
     ///
     /// This is used by the realization pass to decompose complex operations
@@ -541,6 +974,22 @@ pub trait Renderer: Send + Sync {
     /// Backends that don't support certain operations (e.g., transcendentals)
     /// should override this to return appropriate patterns.
     fn decompositor(&self) -> Option<svod_ir::pattern::TypedPatternMatcher<()>> {
+        None
+    }
+
+    /// Renderer-local final rewrites, separate from unsupported-op decomposition.
+    fn extra_matcher(&self) -> Option<svod_ir::pattern::TypedPatternMatcher<()>> {
+        None
+    }
+
+    /// Optional bottom-up rewrite before target instruction selection.
+    fn pre_isel_matcher(&self) -> Option<svod_ir::pattern::TypedPatternMatcher<crate::isa::PreIselContext>> {
+        None
+    }
+
+    /// Optional bottom-up target instruction selector. Source renderers leave
+    /// this absent; providing it marks the renderer as an ISA target.
+    fn isel_matcher(&self) -> Option<svod_ir::pattern::TypedPatternMatcher<crate::isa::IselContext>> {
         None
     }
 }
@@ -628,6 +1077,13 @@ impl Device {
         runtime: RuntimeFactory,
     ) -> Self {
         let compilers = vec![(renderer.clone(), compiler.clone())];
+        let runtime_device = device.clone();
+        let runtime_compiler_key = compiler.cache_key();
+        let raw_runtime = runtime;
+        let runtime: RuntimeFactory = Arc::new(move |spec| {
+            spec.validate_stage_identity(&runtime_device, runtime_compiler_key)?;
+            raw_runtime(spec)
+        });
         Self { device, allocator, compilers, renderer, compiler, runtime, graph: None }
     }
 
@@ -701,27 +1157,144 @@ pub struct ProgramSpec {
 
     /// Number of buffer arguments (for CIF construction at compile time).
     pub buf_count: usize,
-}
 
-#[derive(Debug)]
-struct DerivedProgramMetadata {
-    vars: Vec<Variable>,
-    var_names: Vec<String>,
-    globals: Vec<usize>,
-    outs: Vec<usize>,
-    ins: Vec<usize>,
-    global_size: [Arc<UOp>; 3],
-    local_size: Option<[Arc<UOp>; 3]>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LaunchDimKind {
-    Global,
-    Local,
-    DirectGlobal,
+    /// Complete kernel argument ABI in source-signature order.
+    pub abi: Vec<AbiParamDescriptor>,
 }
 
 impl ProgramSpec {
+    fn same_uops(a: &[Arc<UOp>], b: &[Arc<UOp>]) -> bool {
+        a.len() == b.len() && a.iter().zip(b).all(|(a, b)| a.content_hash == b.content_hash)
+    }
+
+    fn same_param_semantics(actual: &Arc<UOp>, expected: &Arc<UOp>) -> bool {
+        match (actual.op(), expected.op()) {
+            (
+                Op::Param { shape: actual_shape, arg: actual_arg },
+                Op::Param { shape: expected_shape, arg: expected_arg },
+            ) => {
+                actual.dtype() == expected.dtype()
+                    && actual_arg == expected_arg
+                    && actual_shape.content_hash == expected_shape.content_hash
+            }
+            _ => false,
+        }
+    }
+
+    /// Validate ProgramInfo against the executable SINK without relying on UOp
+    /// allocation identity. The returned descriptors remain the runtime ABI
+    /// projection; PARAM semantics are checked separately before projection.
+    pub fn validate_program_param_abi(sink: &Arc<UOp>, info: &svod_ir::ProgramInfo) -> Result<Vec<AbiParamDescriptor>> {
+        let mut occupied: HashMap<usize, String> = HashMap::new();
+        let executable = sink.toposort_call_aware(false);
+        let executable_ids = executable.iter().map(|node| node.id).collect::<std::collections::HashSet<_>>();
+
+        for node in &executable {
+            if let Op::Special { name, .. } = node.op()
+                && !matches!(name.chars().last().and_then(|axis| axis.to_digit(10)), Some(0..=2))
+            {
+                return Err(Error::ProgramAbiMismatch { reason: format!("invalid SPECIAL axis name {name:?}") });
+            }
+            let body = match node.op() {
+                Op::Call { body, .. } | Op::Function { body, .. } => body,
+                _ => continue,
+            };
+            for formal in body.toposort_call_aware(true) {
+                if matches!(formal.op(), Op::Param { .. }) && executable_ids.contains(&formal.id) {
+                    return Err(Error::LeakedOpaqueProgramParam {
+                        param: format!("UOp {} {:?}", formal.id, formal.op()),
+                    });
+                }
+            }
+        }
+
+        let mut abi = Vec::new();
+        for node in executable {
+            let Op::Param { arg, .. } = node.op() else { continue };
+            let descriptor = AbiParamDescriptor::from_param(&node)?;
+            let class = format!("{:?} {:?}", descriptor.kind, descriptor.name);
+            if let Some(first) = occupied.insert(arg.slot, class.clone()) {
+                return Err(Error::DuplicateProgramParamSlot { slot: arg.slot, first, second: class });
+            }
+            abi.push(descriptor);
+        }
+        abi.sort_by_key(|param| param.slot);
+        let globals = abi.iter().filter(|param| param.is_storage()).map(|param| param.slot).collect::<Vec<_>>();
+        let info_vars = info
+            .vars
+            .iter()
+            .map(|var| {
+                let descriptor = AbiParamDescriptor::from_param(var)?;
+                if descriptor.is_storage() {
+                    return Err(Error::ProgramAbiMismatch {
+                        reason: format!("ProgramInfo.vars contains storage PARAM in slot {}", descriptor.slot),
+                    });
+                }
+                Ok(descriptor)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let vars = abi.iter().filter(|param| !param.is_storage()).cloned().collect::<Vec<_>>();
+        let expected = svod_ir::ProgramInfo::from_sink(sink, info.target.clone());
+        if info.vars.len() != expected.vars.len()
+            || !info
+                .vars
+                .iter()
+                .zip(&expected.vars)
+                .all(|(actual, expected)| Self::same_param_semantics(actual, expected))
+        {
+            return Err(Error::ProgramAbiMismatch {
+                reason: format!(
+                    "ProgramInfo.vars semantic mismatch: sink requires {:?}; ProgramInfo has {:?} (projected ABI {info_vars:?})",
+                    expected.vars, info.vars
+                ),
+            });
+        }
+        if globals != expected.globals || info.globals != expected.globals {
+            return Err(Error::ProgramAbiMismatch {
+                reason: format!(
+                    "ProgramInfo.globals mismatch: sink requires {:?} with ABI {vars:?}/{abi:?}; ProgramInfo has {:?}",
+                    expected.globals, info.globals
+                ),
+            });
+        }
+        if info.outs != expected.outs {
+            return Err(Error::ProgramAbiMismatch {
+                reason: format!(
+                    "ProgramInfo.outs mismatch: sink requires {:?}; ProgramInfo has {:?}",
+                    expected.outs, info.outs
+                ),
+            });
+        }
+        if info.ins != expected.ins {
+            return Err(Error::ProgramAbiMismatch {
+                reason: format!(
+                    "ProgramInfo.ins mismatch: sink requires {:?}; ProgramInfo has {:?}",
+                    expected.ins, info.ins
+                ),
+            });
+        }
+        if !Self::same_uops(&info.global_size, &expected.global_size) {
+            return Err(Error::ProgramAbiMismatch {
+                reason: "ProgramInfo.global_size does not match canonical sink launch dimensions".into(),
+            });
+        }
+        if match (&info.local_size, &expected.local_size) {
+            (Some(actual), Some(expected)) => !Self::same_uops(actual, expected),
+            (None, None) => false,
+            _ => true,
+        } {
+            return Err(Error::ProgramAbiMismatch {
+                reason: "ProgramInfo.local_size does not match canonical sink launch dimensions".into(),
+            });
+        }
+        if info.outs.iter().chain(&info.ins).any(|slot| !info.globals.contains(slot)) {
+            return Err(Error::ProgramAbiMismatch { reason: "ProgramInfo ins/outs contains a non-global slot".into() });
+        }
+        let var_names = vars.iter().map(|param| param.name.clone().unwrap_or_default()).collect::<Vec<_>>();
+        validate_abi_descriptors(&abi, globals.len(), &var_names)?;
+        Ok(abi)
+    }
+
     /// Create a new program specification.
     pub fn new(name: String, src: String, device: DeviceSpec, ast: Arc<UOp>) -> Self {
         Self {
@@ -737,6 +1310,7 @@ impl ProgramSpec {
             outs: Vec::new(),
             ins: Vec::new(),
             buf_count: 0,
+            abi: Vec::new(),
         }
     }
 
@@ -786,136 +1360,11 @@ impl ProgramSpec {
         self.ins = ins;
     }
 
-    /// Derive and apply metadata from `self.ast`.
-    ///
-    /// Extracts program metadata from the kernel graph and keeps renderer
-    /// wrappers aligned on one metadata path.
-    pub fn apply_derived_metadata_from_ast(&mut self) {
-        let derived = Self::derive_metadata_from_sink(&self.ast);
-        self.globals = derived.globals;
-        self.outs = derived.outs;
-        self.ins = derived.ins;
-        if self.vars.is_empty() {
-            self.vars = derived.vars;
-        }
-        if self.var_names.is_empty() {
-            self.var_names = derived.var_names;
-        }
-        if self.buf_count == 0 {
-            self.buf_count = self.globals.len();
-        }
-        self.global_size = derived.global_size;
-        self.local_size = derived.local_size;
-    }
-
-    fn special_launch_axis(name: &str) -> Option<(LaunchDimKind, usize)> {
-        let kind = match name.chars().next()? {
-            'g' => LaunchDimKind::Global,
-            'l' => LaunchDimKind::Local,
-            'i' => LaunchDimKind::DirectGlobal,
-            _ => return None,
-        };
-        let suffix_start = name.rfind(|ch: char| !ch.is_ascii_digit()).map(|idx| idx + 1).unwrap_or(0);
-        if suffix_start == name.len() {
-            return None;
-        }
-        let axis = name[suffix_start..].parse::<usize>().ok()?;
-        (axis < 3).then_some((kind, axis))
-    }
-
-    fn extract_param_slot_from_index(index: &Arc<UOp>) -> Option<usize> {
-        /// Walk an arbitrary UOp expression chasing the underlying `Op::Param` slot.
-        /// Handles passthroughs (`Cast`, `Bitcast`), and vector wrappers
-        /// (`Vectorize` with all-identical `Param` elements, `Gep` into such a
-        /// vector). Devectorize doesn't always eliminate vectorized PARAM
-        /// pointers (e.g. scatter stores at `cpu/ops.rs:15-18`), so a kernel's
-        /// output `Op::Store` may have an `index` whose `buffer` is a
-        /// `Vectorize` of N copies of the same `Op::Param`, so the metadata
-        /// derivation looks through these wrappers too.
-        fn walk(uop: &Arc<UOp>) -> Option<usize> {
-            match uop.op() {
-                Op::Param { arg, .. } if arg.device.is_none() => Some(arg.slot),
-                Op::Index { buffer, .. } => walk(buffer),
-                Op::Cast { src, .. } | Op::BitCast { src, .. } => walk(src),
-                Op::Gep { vector, .. } => walk(vector),
-                Op::Vectorize { elements } => {
-                    let first = walk(elements.first()?)?;
-                    elements.iter().skip(1).all(|e| walk(e) == Some(first)).then_some(first)
-                }
-                _ => None,
-            }
-        }
-        walk(index)
-    }
-
-    fn derive_metadata_from_sink(sink: &Arc<UOp>) -> DerivedProgramMetadata {
-        let mut vars = Vec::new();
-        let mut globals = Vec::new();
-        let mut outs = Vec::new();
-        let mut ins = Vec::new();
-        let mut global_size = default_launch_size();
-        let mut local_size = Some(default_launch_size());
-
-        for node in sink.toposort() {
-            match node.op() {
-                Op::DefineVar { name, min_val, max_val } => {
-                    vars.push(Variable::new(name.clone(), *min_val, *max_val));
-                    if name == "core_id" {
-                        global_size[0] = UOp::index_const(max_val.saturating_add(1));
-                    }
-                }
-                Op::Param { arg, .. } if arg.device.is_none() => {
-                    globals.push(arg.slot);
-                }
-                Op::Special { end, name } => {
-                    if let Some((kind, axis)) = Self::special_launch_axis(name) {
-                        match kind {
-                            LaunchDimKind::Global => global_size[axis] = end.clone(),
-                            LaunchDimKind::Local => {
-                                local_size.get_or_insert_with(default_launch_size)[axis] = end.clone()
-                            }
-                            LaunchDimKind::DirectGlobal => {
-                                global_size[axis] = end.clone();
-                                local_size = None;
-                            }
-                        }
-                    }
-                }
-                Op::Store { index, .. } => {
-                    if let Some(slot) = Self::extract_param_slot_from_index(index) {
-                        outs.push(slot);
-                    }
-                }
-                Op::Load { index, .. } => {
-                    if let Some(slot) = Self::extract_param_slot_from_index(index) {
-                        ins.push(slot);
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        vars.sort_by(|a, b| a.name.cmp(&b.name));
-        vars.dedup_by(|a, b| a.name == b.name);
-        let var_names = vars.iter().map(|v| v.name.clone()).collect();
-
-        globals.sort_unstable();
-        globals.dedup();
-
-        outs.sort_unstable();
-        outs.dedup();
-
-        ins.sort_unstable();
-        ins.dedup();
-
-        DerivedProgramMetadata { vars, var_names, globals, outs, ins, global_size, local_size }
-    }
-
     /// Build a ProgramSpec from a PROGRAM UOp state.
     ///
     /// Validates PROGRAM stage shape and derives metadata from PROGRAM itself.
     pub fn from_uop(program: &Arc<UOp>) -> Result<Self> {
-        let Op::Program { sink, device, linear, source, binary } = program.op() else {
+        let Op::Program { sink, info, linear, source, binary } = program.op() else {
             return WrongStageSnafu { expected: "PROGRAM", got: format!("{:?}", program.op()) }.fail();
         };
 
@@ -923,11 +1372,6 @@ impl ProgramSpec {
             matches!(sink.op(), Op::Sink { .. }),
             WrongStageSnafu { expected: "PROGRAM sink stage SINK", got: format!("{:?}", sink.op()) }
         );
-
-        let device_spec = match device.op() {
-            Op::Device(spec) => spec.clone(),
-            other => return WrongStageSnafu { expected: "PROGRAM device DEVICE", got: format!("{other:?}") }.fail(),
-        };
 
         let linear = linear
             .as_ref()
@@ -941,45 +1385,72 @@ impl ProgramSpec {
             .as_ref()
             .context(WrongStageSnafu { expected: "PROGRAM SOURCE stage", got: "missing".to_string() })?;
         let source_code = match source.op() {
-            Op::Source { code } => code.clone(),
+            Op::Source { code, .. } => code.clone(),
             other => {
                 return WrongStageSnafu { expected: "PROGRAM source stage SOURCE", got: format!("{other:?}") }.fail();
             }
         };
 
+        let abi = Self::validate_program_param_abi(sink, info)?;
+        let expected_source = source_stage_identity(info, &abi, linear, &source_code)?;
+        validate_source_stage(source, &expected_source)?;
+
         if let Some(binary) = binary {
-            snafu::ensure!(
-                matches!(binary.op(), Op::ProgramBinary { .. }),
-                WrongStageSnafu { expected: "PROGRAM binary stage ProgramBinary", got: format!("{:?}", binary.op()) }
-            );
+            let Op::ProgramBinary { bytes, identity } = binary.op() else {
+                return WrongStageSnafu {
+                    expected: "PROGRAM binary stage ProgramBinary",
+                    got: format!("{:?}", binary.op()),
+                }
+                .fail();
+            };
+            let compiler_key = identity.as_ref().map(|identity| identity.compiler_key.as_str()).ok_or_else(|| {
+                Error::ProgramStageMismatch { stage: "BINARY", reason: "stage has no semantic identity".into() }
+            })?;
+            if compiler_key.is_empty() {
+                return Err(Error::ProgramStageMismatch {
+                    stage: "BINARY",
+                    reason: "compiler cache key is empty".into(),
+                });
+            }
+            let expected_binary = binary_stage_identity(expected_source.clone(), compiler_key, bytes);
+            validate_binary_stage(binary, &expected_binary)?;
         }
 
-        let derived = Self::derive_metadata_from_sink(sink);
-        let meta = program.metadata::<ProgramSpec>();
+        let mut spec = Self::new(info.function_name(), source_code, info.target.clone(), sink.clone());
+        spec.vars = info
+            .vars
+            .iter()
+            .filter_map(|u| match u.op() {
+                Op::Param { arg, .. } => Some(Variable::new(
+                    arg.name.clone().unwrap_or_else(|| format!("p{}", arg.slot)),
+                    arg.vmin_vmax
+                        .as_ref()
+                        .and_then(|(v, _)| match v.0 {
+                            svod_ir::ConstValue::Int(value) => Some(value),
+                            _ => None,
+                        })
+                        .unwrap_or(i64::MIN),
+                    arg.vmin_vmax
+                        .as_ref()
+                        .and_then(|(_, v)| match v.0 {
+                            svod_ir::ConstValue::Int(value) => Some(value),
+                            _ => None,
+                        })
+                        .unwrap_or(i64::MAX),
+                )),
+                _ => None,
+            })
+            .collect();
+        spec.var_names = spec.vars.iter().map(|v| v.name.clone()).collect();
+        spec.globals = info.globals.clone();
+        spec.outs = info.outs.clone();
+        spec.ins = info.ins.clone();
+        spec.buf_count = spec.globals.len();
+        spec.abi = abi;
+        spec.global_size = info.global_size.clone();
+        spec.local_size = info.local_size.clone();
 
-        let name = meta.as_ref().map(|m| m.name.clone()).unwrap_or_else(|| "kernel".to_string());
-
-        let mut spec = Self::new(name, source_code, device_spec, sink.clone());
-        spec.vars = meta.as_ref().map(|m| m.vars.clone()).filter(|vars| !vars.is_empty()).unwrap_or(derived.vars);
-        spec.var_names =
-            meta.as_ref().map(|m| m.var_names.clone()).filter(|names| !names.is_empty()).unwrap_or(derived.var_names);
-        spec.globals =
-            meta.as_ref().map(|m| m.globals.clone()).filter(|globals| !globals.is_empty()).unwrap_or(derived.globals);
-        spec.outs = meta.as_ref().map(|m| m.outs.clone()).filter(|outs| !outs.is_empty()).unwrap_or(derived.outs);
-        spec.ins = meta.as_ref().map(|m| m.ins.clone()).filter(|ins| !ins.is_empty()).unwrap_or(derived.ins);
-        spec.buf_count = meta.as_ref().map(|m| m.buf_count).filter(|count| *count > 0).unwrap_or(spec.globals.len());
-        // Launch dims: always derive from the SPECIAL UOps in the SINK,
-        // ignoring any upstream `meta` value (iterate SPECIAL and set
-        // `special_size[name_suffix] = end`). Keeping a meta override
-        // here causes a dispatch-vs-IR mismatch: the meta-supplied
-        // `global_size` is in kernel-name positional order ([g_x_size,
-        // g_y_size]) but the SPECIAL UOps (post-gpudims `reverse=true`) may
-        // assign axes to gidx in the opposite order, so the GPU dispatch
-        // packet ends up with grid_size_x grid_size_y swapped relative to
-        // what the LLVM IR's `workgroup.id.x` / `workgroup.id.y` use —
-        // manifests as a 21× OOB on `r_g1375g64...` (`Phase 10/11`).
-        spec.global_size = derived.global_size;
-        spec.local_size = derived.local_size;
+        validate_abi_descriptors(&spec.abi, spec.buf_count, &spec.var_names)?;
 
         Ok(spec)
     }

@@ -131,6 +131,25 @@ pub struct Buffer {
 }
 
 impl Buffer {
+    /// Device which owns the underlying allocation.
+    pub fn device_spec(&self) -> svod_dtype::DeviceSpec {
+        self.data.allocator.device_spec()
+    }
+
+    /// Verify that an AMD-tagged buffer is backed by the exact physical KFD
+    /// device, not merely by an allocator reporting the same display spec.
+    pub fn matches_native_device(&self, expected: &svod_dtype::DeviceSpec) -> Result<bool> {
+        let svod_dtype::DeviceSpec::Amd { device_id } = expected else {
+            return Ok(self.device_spec() == *expected);
+        };
+        self.data.ensure_allocated()?;
+        let RawBuffer::AmdDevice { device, .. } = self.data.raw() else {
+            return Ok(false);
+        };
+        let expected_device = crate::amd::AmdDevice::open(*device_id)?;
+        Ok(Arc::ptr_eq(device.core(), expected_device.core()))
+    }
+
     /// Create a new buffer with lazy allocation (not zero-initialized).
     pub fn new(allocator: Arc<dyn Allocator>, dtype: DType, shape: Vec<usize>, options: BufferSpec) -> Self {
         Self::new_with_zero_init(allocator, dtype, shape, options, false)
@@ -659,6 +678,16 @@ impl Buffer {
                 unimplemented!("CUDA buffer raw pointers not yet supported for kernel execution")
             }
         }
+    }
+
+    /// Resolve this buffer view to the address consumed by a target program.
+    /// This is Tinygrad HCQ's host-side GETADDR stage: AMD returns a GPU VA,
+    /// while host backends return their process address.
+    pub fn device_address(&self) -> Result<u64> {
+        self.ensure_allocated()?;
+        // SAFETY: the returned integer is used only while the owning Buffer is
+        // retained by the execution plan; it is never dereferenced here.
+        Ok(unsafe { self.as_raw_ptr() } as usize as u64)
     }
 
     /// Get the raw data pointer for testing buffer identity.

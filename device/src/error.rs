@@ -45,6 +45,10 @@ pub enum Error {
     #[snafu(display("runtime error: {message}"))]
     Runtime { message: String },
 
+    /// A backend command stream cannot fit its hardware field or queue budget.
+    #[snafu(display("{kind} command stream is too large: {actual} (limit {limit})"))]
+    CommandStreamTooLarge { kind: &'static str, actual: usize, limit: usize },
+
     /// A launch-size runtime variable fell outside its `DefineVar` bounds.
     #[snafu(display("variable {name}={value} is outside bounds [{min}, {max}]"))]
     VarOutOfBounds { name: String, value: i64, min: i64, max: i64 },
@@ -53,6 +57,33 @@ pub enum Error {
     /// shape validation in `ProgramSpec::from_uop`).
     #[snafu(display("expected {expected} op, got {got}"))]
     WrongStage { expected: &'static str, got: String },
+
+    /// Two distinct PARAM definitions occupy the same final program argument
+    /// slot. BUFFER allocations use a separate internal namespace.
+    #[snafu(display("duplicate PROGRAM PARAM slot {slot}: {first} conflicts with {second}"))]
+    DuplicateProgramParamSlot { slot: usize, first: String, second: String },
+
+    /// Final PROGRAM construction reached the reserved unassigned PARAM slot.
+    #[snafu(display("unassigned PROGRAM PARAM reached {stage}: {param}"))]
+    UnassignedProgramParam { stage: &'static str, param: String },
+
+    /// Renderer argument discovery disagreed with canonical ProgramInfo.
+    #[snafu(display("renderer PROGRAM ABI mismatch: {reason}"))]
+    ProgramAbiMismatch { reason: String },
+
+    /// A cached SOURCE/BINARY payload does not belong to the executable
+    /// PROGRAM identity that is attempting to reuse it.
+    #[snafu(display("PROGRAM {stage} stage identity mismatch: {reason}"))]
+    ProgramStageMismatch { stage: &'static str, reason: String },
+
+    /// A FUNCTION/CALL formal PARAM escaped its opaque body into the enclosing
+    /// executable graph.
+    #[snafu(display("opaque formal PARAM leaked into PROGRAM ABI: {param}"))]
+    LeakedOpaqueProgramParam { param: String },
+
+    /// PROGRAM metadata was built for a different renderer target.
+    #[snafu(display("PROGRAM target {actual:?} does not match renderer target {expected:?}"))]
+    ProgramTargetMismatch { expected: svod_dtype::DeviceSpec, actual: svod_dtype::DeviceSpec },
 
     /// AMD GPU memory fault decoded from a KFD event. `class` is a short
     /// VA-classification hint (owning / stale / nearest allocation).
@@ -94,6 +125,12 @@ pub enum Error {
     /// AMD KFD ioctl failure.
     #[snafu(display("AMD ioctl {ioctl} failed (errno {errno})"))]
     AmdIoctl { ioctl: &'static str, errno: i32 },
+
+    /// Queue creation reached an active KFD queue, then doorbell mapping and
+    /// rollback destruction both failed. Backing allocations must be
+    /// quarantined because the kernel may still reference them.
+    #[snafu(display("AMD queue {queue_id} remained active after setup rollback failed: {cause}"))]
+    AmdQueueStillActive { queue_id: u32, cause: String },
 
     /// AMD allocation failure (VRAM exhaustion, BAR-resize required, etc.).
     #[snafu(display("AMD allocation failed: {reason}"))]
