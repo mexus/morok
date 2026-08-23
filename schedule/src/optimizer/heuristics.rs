@@ -421,10 +421,10 @@ pub fn apply_masked_upcasts(scheduler: &mut Scheduler) -> bool {
 /// Grouped reduction for small output dimensions.
 ///
 /// When the product of upcastable output dimensions is small (<= 2048,
-/// or 240 under `SVOD_NOLOCALS`), apply GROUPTOP on output axes to enable
+/// or 240 when local selection is disabled), apply GROUPTOP on output axes to enable
 /// local reduction.
 pub fn try_grouped_reduction(scheduler: &mut Scheduler, config: &HeuristicsConfig) -> bool {
-    if !scheduler.renderer().has_local || config.disable_locals || !scheduler.renderer().has_shared {
+    if !scheduler.renderer().has_local || !scheduler.renderer().has_shared {
         return false;
     }
 
@@ -433,7 +433,7 @@ pub fn try_grouped_reduction(scheduler: &mut Scheduler, config: &HeuristicsConfi
     let full_shape = scheduler.full_shape();
     let group_for_reduces: i64 = upcastable.iter().map(|&i| full_shape.get(i).copied().unwrap_or(1)).product();
 
-    let threshold: i64 = if std::env::var("SVOD_NOLOCALS").is_ok() { 240 } else { 2048 };
+    let threshold: i64 = if config.disable_locals { 240 } else { 2048 };
     if group_for_reduces > threshold {
         return false;
     }

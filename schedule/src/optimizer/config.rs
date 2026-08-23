@@ -294,6 +294,7 @@ impl HeuristicsConfig {
     /// * `SVOD_MV_ROWS_PER_THREAD` / `MV_ROWS_PER_THREAD` - Matvec output split
     /// * `SVOD_K_VECTORIZE` - Enable K-axis vectorization (default: disabled)
     /// * `SVOD_NO_OUTPUT_UPCAST` - Disable output dimension upcasting (default: enabled)
+    /// * `SVOD_NOLOCALS` - Disable LOCAL axis selection after grouped-reduction matching
     /// * `SVOD_TC` - Tensor-core usage: `0` disables, `2` shape-only, else enabled
     /// * `TC_OPT` / `SVOD_TC_OPT` - Strict (`0`), relaxed (`1`), or padded (`2`)
     /// * `TC_SELECT` / `SVOD_TC_SELECT` - Auto (`-1`) or a tensor-core index
@@ -311,6 +312,7 @@ impl HeuristicsConfig {
         let k_vectorize = std::env::var("SVOD_K_VECTORIZE").is_ok();
         // Default enabled, use SVOD_NO_OUTPUT_UPCAST to disable
         let output_upcast = std::env::var("SVOD_NO_OUTPUT_UPCAST").is_err();
+        let disable_locals = std::env::var("SVOD_NOLOCALS").is_ok();
         // Tensor-core usage: `SVOD_TC=0` disables (vector matmul), `2` is
         // shape-only, anything else (or unset) keeps the default Enabled. Lets
         // bit-identity tests pin the numerics to the non-MFMA path.
@@ -339,6 +341,7 @@ impl HeuristicsConfig {
             thread_count,
             k_vectorize,
             output_upcast,
+            disable_locals,
             tc_enabled,
             tc_opt,
             tc_select,
