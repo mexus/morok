@@ -88,7 +88,11 @@ impl OpRegistry {
             "Add" => vec![inp(inputs, 0).try_add(inp(inputs, 1))?],
             "Sub" => vec![inp(inputs, 0).try_sub(inp(inputs, 1))?],
             "Mul" => vec![inp(inputs, 0).try_mul(inp(inputs, 1))?],
-            "Div" => vec![inp(inputs, 0).try_div(inp(inputs, 1))?],
+            "Div" => {
+                let x = inp(inputs, 0);
+                let y = inp(inputs, 1);
+                vec![if x.uop().dtype().is_int() { x.try_cdiv(y)? } else { x.try_div(y)? }]
+            }
             "Neg" => vec![inp(inputs, 0).try_neg()?],
             "Abs" => vec![inp(inputs, 0).try_abs()?],
             "Pow" => vec![inp(inputs, 0).try_pow(inp(inputs, 1))?],
@@ -99,7 +103,7 @@ impl OpRegistry {
                 vec![if fmod == 1 {
                     // fmod=1: C-style remainder (sign of dividend)
                     if x.uop().dtype().is_int() {
-                        x.try_mod(y)?
+                        Tensor::from_lazy(x.uop().try_cmod(&y.uop())?)
                     } else {
                         // floats: x - trunc(x/y) * y (primitive MOD is integer-only)
                         let div = x.try_div(y)?;
@@ -107,12 +111,7 @@ impl OpRegistry {
                     }
                 } else if x.uop().dtype().is_int() {
                     // fmod=0 integers: Python-style modulo (sign of divisor)
-                    let trunc_mod = x.try_mod(y)?;
-                    let zero = trunc_mod.zero()?;
-                    let mod_ne_zero = trunc_mod.try_ne(&zero)?;
-                    let signs_differ = trunc_mod.bitwise_xor(y)?.try_lt(&zero)?;
-                    let needs_adj = mod_ne_zero.bitwise_and(&signs_differ)?;
-                    trunc_mod.try_add(&y.where_(&needs_adj, &zero)?)?
+                    x.try_mod(y)?
                 } else {
                     // fmod=0 floats: x - floor(x/y) * y
                     let div = x.try_div(y)?;
