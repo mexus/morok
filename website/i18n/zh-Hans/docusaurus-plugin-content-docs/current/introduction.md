@@ -29,7 +29,7 @@ Svod 是一个基于 Rust 的 ML 编译器，灵感来自 [Tinygrad](https://git
 | [ir](https://github.com/npatsakula/svod/tree/main/ir/) | UOp 图 IR：80+ 操作、符号整数、溯源 |
 | [device](https://github.com/npatsakula/svod/tree/main/device/) | 缓冲区管理：惰性分配、零拷贝视图、LRU 缓存 |
 | [schedule](https://github.com/npatsakula/svod/tree/main/schedule/) | 优化引擎：20+ 趟、RANGEIFY、Z3 验证 |
-| [codegen](https://github.com/npatsakula/svod/tree/main/codegen/) | 代码生成：Clang（默认）、LLVM JIT、MLIR |
+| [codegen](https://github.com/npatsakula/svod/tree/main/codegen/) | 代码生成：Clang（默认）、LLVM JIT |
 | [runtime](https://github.com/npatsakula/svod/tree/main/runtime/) | JIT 编译与内核执行 |
 | [tensor](https://github.com/npatsakula/svod/tree/main/tensor/) | 高层惰性张量 API |
 | [onnx](https://github.com/npatsakula/svod/tree/main/onnx/) | ONNX 模型导入器 |

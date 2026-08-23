@@ -44,7 +44,7 @@ Optimization actions applied:
 No changes—symbolic already clean.
 
 ### After Stage 9: Expander
-UPCAST → UNROLL → CONTRACT (simplified—actual IR has CONTRACT wrapper):
+UPCAST expansion is represented directly with STACK/INDEX structure:
 ```mermaid
 flowchart TD
   V["VECTORIZE"] --> ADD["ADD"]
@@ -54,13 +54,13 @@ flowchart TD
   LB --> IB["INDEX"]
   IA --> BA["BUFFER(a)"]
   IA --> RG["RANGE(i, Global, 0..100)"]
-  IA --> UN["UNROLL(VCONST([0,1,2,3]))"]
+  IA --> UN["RANGE(j, Upcast, 0..4)"]
   IB --> BB["BUFFER(b)"]
   IB --> RG
   IB --> UN
 ```
 
-Note: `RANGE(i)` and `UNROLL(VCONST([0,1,2,3]))` are shared by both INDEX nodes via hash consing. The UNROLL was converted from `RANGE(j, UPCAST)`.
+Note: shared ranges and index expressions are deduplicated by hash consing.
 
 ### After Stage 10: Add Local Buffers
 (If LOCAL opt was chosen)
@@ -220,8 +220,6 @@ Svod has some patterns/enhancements not in Tinygrad:
 | Enhancement | Location | Purpose |
 |-------------|---------|---------|
 | Nested INDEX flattening with identical indices | `movement_op_patterns()` | Removes redundant `INDEX(INDEX(ptr, [i]), [i])` |
-| CAT → VECTORIZE | `pm_render` | Converts CAT to explicit VECTORIZE (can't render CAT directly) |
-| PTRCAT([x]) unwrap | `pm_render` | Removes single-element PTRCAT wrappers |
 | GEP through CAST/BITCAST | `gep_pushing_patterns()` | Pushes GEP through type casts for better optimization |
 | Image dtype guard | `pm_add_loads()` | Skips LOAD wrapping for Image dtype (handled in codegen) |
 
@@ -236,7 +234,6 @@ Svod has some patterns/enhancements not in Tinygrad:
 | **AxisType** | How a loop executes | Global=parallel, Reduce=accumulate |
 | **Buffer** | Allocated memory holding data | A tensor's data lives in a buffer |
 | **Bufferize** | Store result in memory instead of computing on-demand | Materialize intermediate value |
-| **CONTRACT** | Combine multiple values into one vector | `[a, b, c, d] → vec4(a,b,c,d)` |
 | **Devectorize** | Split vectors to match hardware | `vec8 → vec4, vec4` |
 | **Divmod** | Division and remainder operations | `x // 7, x % 7` |
 | **Fixpoint** | When applying patterns no longer changes anything | Patterns fire until fixpoint |

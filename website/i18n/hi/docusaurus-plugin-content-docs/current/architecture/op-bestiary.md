@@ -347,7 +347,7 @@ Program {
 `codegen/src/program_pipeline.rs` के ज़रिए लागू होने वाले `SINK → LINEAR
 → SOURCE → PROGRAM_BINARY` स्टेजिंग (`do_linearize`/`do_render`/
 `do_compile`/`get_program`) से कर्नेल को गुज़ारता है। हर स्टेज अगला
-फ़ील्ड भरती है। C/LLVM/MLIR रेंडरर `Op::Linear` इनपुट की उम्मीद रखते हैं
+फ़ील्ड भरती है। C/LLVM रेंडरर `Op::Linear` इनपुट की उम्मीद रखते हैं
 और panic के बजाय per-context `pending_error` के ज़रिए
 `Error::InvalidGraph` रिपोर्ट करते हैं; render से पहले मल्टी-इंडेक्स
 `INDEX` को `pm_linearize_multi_index` से लो-कर लेना चाहिए।
@@ -364,7 +364,7 @@ Linear { ops: SmallVec<[Arc<UOp>; 8]> }
 ### SOURCE / PROGRAM_BINARY — कंपाइलेशन आर्टिफ़ैक्ट्स
 
 ```rust
-Source { code: String }              // रेंडर्ड सोर्स (C / LLVM-IR / MLIR)
+Source { code: String }              // रेंडर्ड सोर्स (C / LLVM-IR)
 ProgramBinary { bytes: Vec<u8> }     // कंपाइल्ड आर्टिफ़ैक्ट
 ```
 
@@ -742,7 +742,7 @@ flowchart TD
 | ऑपरेशन | उद्देश्य |
 |---------|----------|
 | `Copy` | एक वैल्यू की एक्सप्लिसिट कॉपी |
-| `BufferView` | `{ buffer, size, offset }` — मौजूदा बफ़र का किसी offset पर स्लाइस |
+| `Slice` | `{ buffer, offset, size }` — buffer पर contiguous typed slice metadata |
 | `MStack` | मेमोरी स्टैक एलोकेशन |
 | `MSelect` | मेमोरी सिलेक्ट (कंडीशनल मेमोरी एक्सेस) |
 | `Multi` | मल्टी-आउटपुट ऑपरेशन |
@@ -764,7 +764,7 @@ flowchart TD
 |---------|--------|
 | **लूप कंट्रोल** | `RANGE`, `END` |
 | **रिडक्शन** | `REDUCE_AXIS`, `REDUCE`, `ALLREDUCE` |
-| **मेमोरी** | `BUFFER`, `BUFFER_VIEW`, `BUFFERIZE`, `INDEX`, `POINTER_INDEX`, `LOAD`, `STORE` |
+| **मेमोरी** | `BUFFER`, `SLICE`, `STAGE`, `INDEX`, `LOAD`, `STORE` |
 | **कर्नेल और कॉलेबल** | `SINK`, `CALL`, `FUNCTION`, `TUPLE`, `GET_TUPLE`, `PROGRAM`, `LINEAR`, `SOURCE`, `PROGRAM_BINARY`, `AFTER`, `BARRIER` |
 | **वेक्टर** | `VECTORIZE`, `GEP`, `VCONST`, `CAT`, `PTRCAT` |
 | **Expansion** | `UNROLL`, `CONTRACT` |

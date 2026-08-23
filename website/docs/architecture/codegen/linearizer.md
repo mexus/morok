@@ -98,7 +98,7 @@ Transcendental function approximations (SIN, EXP, LOG, etc.) are implemented via
 
 **Why This Matters**: Some patterns are easier to apply after decomposition. This stage does final cleanup before converting to a linear sequence.
 
-**Pattern**: `symbolic_simple() + get_late_rewrite_patterns() + pm_render()`
+**Pattern**: `symbolic_simple() + get_late_rewrite_patterns()`
 
 Note: `extra_matcher` and `pm_split_ends` run separately, not as part of this combined pass.
 
@@ -107,12 +107,6 @@ Note: `extra_matcher` and `pm_split_ends` run separately, not as part of this co
 // Make vector constants explicit
 CONST(1.0) used as vec4 → VECTORIZE(1.0, 1.0, 1.0, 1.0)
 ```
-
-**CAT to VECTORIZE** (via `pm_render`):
-```text
-CAT(a, b, c, d) → VECTORIZE(a, b, c, d)
-```
-CAT cannot be rendered directly; explicit VECTORIZE is required for codegen.
 
 **GEP resolution**: Convert remaining GEP operations.
 
