@@ -27,6 +27,22 @@ fn upcast_and_unroll_ranges_become_shaped_coordinates() {
 }
 
 #[test]
+fn expansion_runs_movement_cleanup_in_the_same_fixpoint() {
+    let range = UOp::range_axis(UOp::index_const(4), AxisId::Renumbered(7), AxisType::Upcast);
+    let result = pre_expand(&UOp::sink(vec![range]));
+    let Op::Sink { sources, .. } = result.op() else { panic!("expected SINK") };
+    assert!(matches!(sources[0].op(), Op::Stack { .. }), "{}", sources[0].tree());
+
+    let buffer = UOp::param(0, 4, DType::Float32, None);
+    let indexed = (0..4)
+        .map(|index| UOp::index().buffer(buffer.clone()).indices(vec![UOp::index_const(index)]).call().unwrap())
+        .collect();
+    let result = pre_expand(&UOp::sink(vec![UOp::stack(indexed)]));
+    let Op::Sink { sources, .. } = result.op() else { panic!("expected SINK") };
+    assert!(std::sync::Arc::ptr_eq(&sources[0], &buffer), "{}", sources[0].tree());
+}
+
+#[test]
 fn wmma_shapes_operands_independently_and_reconstructs_output() {
     let first = UOp::range_axis(UOp::index_const(2), AxisId::Renumbered(7), AxisType::Upcast);
     let second = UOp::range_axis(UOp::index_const(3), AxisId::Renumbered(9), AxisType::Upcast);

@@ -1476,22 +1476,31 @@ fn materialize_stack_broadcast(expand: &Arc<UOp>, src: &Arc<UOp>) -> Option<Arc<
 }
 
 pub(crate) fn movement_cleanup_patterns() -> TypedPatternMatcher {
-    crate::cached_patterns! {
-        // movement.py mop_cleanup, in source order.
-        reshape @ Reshape { src: _inner @ Reshape { src, .. }, new_shape }
-            => Some(UOp::new(Op::Reshape { src: src.clone(), new_shape: new_shape.clone() }, reshape.dtype())),
+    mop_cleanup_patterns() + crate::cached_patterns! {
+        // Devectorizer-only movement materialization. These are deliberately
+        // excluded from the earlier Tinygrad-exact expander cleanup.
         reshape @ Reshape { src: Stack { sources }, new_shape: _ }
             if sources.len() == 1
                 && sources[0].shape().ok().flatten().zip(reshape.shape().ok().flatten()).is_some_and(|(a, b)| a == b)
             => Some(sources[0].clone()),
+        reshape @ Reshape { src, new_shape: _ } => materialize_leading_singletons(reshape, src),
+    }
+    .clone()
+}
+
+pub(crate) fn mop_cleanup_patterns() -> TypedPatternMatcher {
+    crate::cached_patterns! {
+        // movement.py mop_cleanup, in source order.
+        reshape @ Reshape { src: _inner @ Reshape { src, .. }, new_shape }
+            => Some(UOp::new(Op::Reshape { src: src.clone(), new_shape: new_shape.clone() }, reshape.dtype())),
         reshape @ Reshape { src, .. }
             if src.shape().ok().flatten().zip(reshape.shape().ok().flatten()).is_some_and(|(a, b)| a == b)
             => Some(src.clone()),
-        reshape @ Reshape { src, new_shape: _ } => materialize_leading_singletons(reshape, src),
         Permute { src: _inner @ Permute { src, axes: inner_axes }, axes }
             => merge_permutes(src, inner_axes, axes),
         Permute { src, axes } if axes.iter().enumerate().all(|(i, axis)| i == *axis)
             => Some(src.clone()),
+        stack @ Stack { sources } => collapse_sequential_stack_indices(stack, sources),
         Index { buffer: Stack { sources }, indices } => const_index_into_stack(sources, indices),
         Index { buffer: _inner @ Index { buffer, indices: inner_indices }, indices: outer_indices }
             if inner_indices.iter().chain(outer_indices.iter())
@@ -1506,6 +1515,24 @@ pub(crate) fn movement_cleanup_patterns() -> TypedPatternMatcher {
                 UOp::index().buffer(buffer.clone()).indices(vec![selected]).call().ok()
             },
     }.clone()
+}
+
+fn collapse_sequential_stack_indices(stack: &Arc<UOp>, sources: &SmallVec<[Arc<UOp>; 4]>) -> Option<Arc<UOp>> {
+    let first = sources.first()?;
+    let Op::Index { buffer, indices } = first.op() else { return None };
+    if indices.len() != 1
+        || stack.shape().ok().flatten()? != buffer.shape().ok().flatten()?
+        || sources.iter().enumerate().any(|(position, source)| {
+            !matches!(source.op(), Op::Index { buffer: candidate, indices }
+                if Arc::ptr_eq(candidate, buffer)
+                    && indices.len() == 1
+                    && matches!(indices[0].op(), Op::Const(value)
+                        if value.0.try_int().and_then(|value| usize::try_from(value).ok()) == Some(position)))
+        })
+    {
+        return None;
+    }
+    Some(buffer.clone())
 }
 
 pub(crate) fn pm_scalarize_register_stack_index_preserve_deps() -> &'static TypedPatternMatcher {

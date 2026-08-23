@@ -176,7 +176,10 @@ pub fn expander2() -> &'static TypedPatternMatcher<RangeMap> {
 
 pub fn pre_expand(ast: &Arc<UOp>) -> Arc<UOp> {
     let mut range_map = build_range_map(ast);
-    crate::rewrite::graph_rewrite(expander2(), ast.clone(), &mut range_map)
+    let matcher = expander2().clone()
+        + crate::rangeify::pm_flatten_range().clone().with_context::<RangeMap>()
+        + crate::devectorize::mop_cleanup_patterns().with_context::<RangeMap>();
+    crate::rewrite::graph_rewrite(&matcher, ast.clone(), &mut range_map)
 }
 
 fn fix_group_for_reduce(reduce: &Arc<UOp>) -> Option<Arc<UOp>> {
