@@ -30,6 +30,11 @@ fn int_const(dtype: DType, value: i64) -> Arc<UOp> {
     UOp::const_(dtype, ConstValue::Int(value))
 }
 
+fn integer_const(dtype: DType, value: u64) -> Arc<UOp> {
+    let constant = if dtype.is_unsigned() { ConstValue::UInt(value) } else { ConstValue::Int(value as i64) };
+    UOp::const_(dtype, constant)
+}
+
 fn verify_program_err(root: &Arc<UOp>) -> String {
     type_verify(root, &spec_program()).expect_err("expected spec_program rejection").to_string()
 }
@@ -293,6 +298,49 @@ fn spec_program_rejects_weakfloat_only_at_program_level() {
         UOp::const_(DType::WeakFloat, ConstValue::Float(1.0)),
         UOp::const_(DType::Float32, ConstValue::Float(1.0)),
     );
+}
+
+#[test]
+fn spec_shift_dtype_matrix_matches_pinned_uint32_exception() {
+    let integer_dtypes = [
+        DType::Int8,
+        DType::UInt8,
+        DType::Int16,
+        DType::UInt16,
+        DType::Int32,
+        DType::UInt32,
+        DType::Int64,
+        DType::UInt64,
+    ];
+
+    for lhs_dtype in integer_dtypes {
+        let lhs = integer_const(lhs_dtype.clone(), 8);
+        for op in [BinaryOp::Shl, BinaryOp::Shr] {
+            let same = UOp::new(Op::Binary(op, lhs.clone(), integer_const(lhs_dtype.clone(), 1)), lhs_dtype.clone());
+            assert!(type_verify(&UOp::sink(vec![same]), &spec_program()).is_ok(), "{op:?} {lhs_dtype:?}");
+
+            let uint32 = UOp::new(Op::Binary(op, lhs.clone(), UOp::native_const(1u32)), lhs_dtype.clone());
+            assert!(type_verify(&UOp::sink(vec![uint32]), &spec_program()).is_ok(), "{op:?} {lhs_dtype:?} << u32");
+
+            let weak = UOp::new(Op::Binary(op, lhs.clone(), UOp::index_const(1)), lhs_dtype.clone());
+            assert!(type_verify(&UOp::sink(vec![weak.clone()]), &spec_tensor()).is_ok());
+            assert!(type_verify(&UOp::sink(vec![weak]), &spec_program()).is_err(), "weak count must commit first");
+
+            let unrelated_dtype = if lhs_dtype == DType::Int8 { DType::Int16 } else { DType::Int8 };
+            let unrelated = UOp::new(Op::Binary(op, lhs.clone(), integer_const(unrelated_dtype, 1)), lhs_dtype.clone());
+            assert!(type_verify(&UOp::sink(vec![unrelated]), &spec_program()).is_err(), "{op:?} {lhs_dtype:?}");
+        }
+    }
+
+    let lhs = UOp::vconst(vec![ConstValue::Int(8), ConstValue::Int(16)], DType::Int16);
+    let count = UOp::vconst(vec![ConstValue::UInt(1), ConstValue::UInt(2)], DType::UInt32);
+    for op in [BinaryOp::Shl, BinaryOp::Shr] {
+        let vector_count = UOp::new(Op::Binary(op, lhs.clone(), count.clone()), DType::Int16.vec(2).unwrap());
+        assert!(
+            type_verify(&UOp::sink(vec![vector_count]), &spec_program()).is_err(),
+            "vector u32 is not the exception"
+        );
+    }
 }
 
 #[test]

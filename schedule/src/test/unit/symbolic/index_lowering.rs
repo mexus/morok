@@ -117,6 +117,35 @@ fn committing_shift_lhs_rederives_result_dtype() {
 }
 
 #[test]
+fn weak_shift_counts_commit_to_each_integer_lhs_width() {
+    let integer_dtypes = [
+        DType::Int8,
+        DType::UInt8,
+        DType::Int16,
+        DType::UInt16,
+        DType::Int32,
+        DType::UInt32,
+        DType::Int64,
+        DType::UInt64,
+    ];
+
+    for dtype in integer_dtypes {
+        let value = if dtype.is_unsigned() { ConstValue::UInt(8) } else { ConstValue::Int(8) };
+        let lhs = UOp::const_(dtype.clone(), value);
+        for op in [BinaryOp::Shl, BinaryOp::Shr] {
+            let shift = UOp::new(Op::Binary(op, lhs.clone(), UOp::index_const(1)), dtype.clone());
+            let lowered = graph_rewrite(&pm_commit_weak(), shift, &mut ());
+            let Op::Binary(actual, actual_lhs, actual_rhs) = lowered.op() else { panic!("expected shift") };
+            assert_eq!(*actual, op);
+            assert_eq!(lowered.dtype(), dtype);
+            assert_eq!(actual_lhs.dtype(), dtype);
+            assert_eq!(actual_rhs.dtype(), dtype);
+            assert!(lowered.toposort().iter().all(|node| !node.dtype().is_weak()), "{}", lowered.tree());
+        }
+    }
+}
+
+#[test]
 fn weak_bitwise_and_shift_indices_commit_before_program() {
     let ptr = DType::Float32.ptr(Some(16), AddrSpace::Global).unwrap();
     let buffer = UOp::param(0, 16, DType::Scalar(ptr.base()), None);
