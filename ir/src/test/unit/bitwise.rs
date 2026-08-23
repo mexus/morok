@@ -6,7 +6,7 @@ use std::f32::consts::PI;
 
 use svod_dtype::DType;
 
-use crate::{ConstValue, UOp, error::Error}; // ConstValue kept for i8, i16, u8
+use crate::{ConstValue, Op, UOp, error::Error}; // ConstValue kept for i8, i16, u8
 
 // =========================================================================
 // Basic Bitwise Operations with Int Types
@@ -69,6 +69,46 @@ fn test_shift_preserves_lhs_dtype() {
     // Shift should preserve LHS dtype (Int64), not promote
     let result = value.try_shl_op(&shift).unwrap();
     assert_eq!(result.dtype(), DType::Int64);
+}
+
+#[test]
+fn test_shift_dtype_matrix_preserves_lhs_and_rhs_types() {
+    let integer_dtypes = [
+        DType::Int8,
+        DType::UInt8,
+        DType::Int16,
+        DType::UInt16,
+        DType::Int32,
+        DType::UInt32,
+        DType::Int64,
+        DType::UInt64,
+    ];
+
+    for lhs_dtype in integer_dtypes {
+        let lhs = UOp::const_(lhs_dtype.clone(), ConstValue::Int(1));
+        for rhs in [UOp::index_const(1), UOp::native_const(1u32)] {
+            for shifted in [lhs.try_shl_op(&rhs).unwrap(), lhs.try_shr_op(&rhs).unwrap()] {
+                let Op::Binary(_, actual_lhs, actual_rhs) = shifted.op() else { panic!("expected shift") };
+                assert_eq!(shifted.dtype(), lhs_dtype);
+                assert_eq!(actual_lhs.dtype(), lhs_dtype);
+                assert_eq!(actual_rhs.dtype(), rhs.dtype());
+            }
+        }
+    }
+}
+
+#[test]
+fn test_weak_shift_lhs_is_not_promoted_by_strong_count() {
+    let lhs = UOp::index_const(8);
+    for rhs_dtype in [DType::Int8, DType::UInt16, DType::Int64, DType::UInt32] {
+        let rhs = UOp::const_(rhs_dtype.clone(), ConstValue::Int(1));
+        for shifted in [lhs.try_shl_op(&rhs).unwrap(), lhs.try_shr_op(&rhs).unwrap()] {
+            let Op::Binary(_, actual_lhs, actual_rhs) = shifted.op() else { panic!("expected shift") };
+            assert_eq!(shifted.dtype(), DType::WeakInt);
+            assert_eq!(actual_lhs.dtype(), DType::WeakInt);
+            assert_eq!(actual_rhs.dtype(), rhs_dtype);
+        }
+    }
 }
 
 #[test]
