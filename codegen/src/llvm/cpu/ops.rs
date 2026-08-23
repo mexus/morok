@@ -776,7 +776,7 @@ fn binary_instr(op: BinaryOp, dtype: &DType) -> &'static str {
         }
         BinaryOp::Lt => {
             if is_float {
-                "fcmp nsz arcp contract afn ult"
+                "fcmp nsz arcp contract afn olt"
             } else if is_signed {
                 "icmp slt"
             } else {
@@ -785,7 +785,7 @@ fn binary_instr(op: BinaryOp, dtype: &DType) -> &'static str {
         }
         BinaryOp::Le => {
             if is_float {
-                "fcmp nsz arcp contract afn ule"
+                "fcmp nsz arcp contract afn ole"
             } else if is_signed {
                 "icmp sle"
             } else {
@@ -794,7 +794,7 @@ fn binary_instr(op: BinaryOp, dtype: &DType) -> &'static str {
         }
         BinaryOp::Gt => {
             if is_float {
-                "fcmp nsz arcp contract afn ugt"
+                "fcmp nsz arcp contract afn ogt"
             } else if is_signed {
                 "icmp sgt"
             } else {
@@ -803,7 +803,7 @@ fn binary_instr(op: BinaryOp, dtype: &DType) -> &'static str {
         }
         BinaryOp::Ge => {
             if is_float {
-                "fcmp nsz arcp contract afn uge"
+                "fcmp nsz arcp contract afn oge"
             } else if is_signed {
                 "icmp sge"
             } else {

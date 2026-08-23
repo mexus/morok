@@ -67,6 +67,44 @@ fn test_simple_add() {
 }
 
 #[test]
+fn llvm_float_comparisons_use_tinygrad_nan_predicates() {
+    let lhs = UOp::param(0, 1, DType::Float32, None);
+    let rhs = UOp::param(1, 1, DType::Float32, None);
+    let index = UOp::const_(DType::Int32, ConstValue::Int(0));
+    let lhs = UOp::load().index(UOp::index().buffer(lhs).indices(vec![index.clone()]).call().unwrap()).call();
+    let rhs = UOp::load().index(UOp::index().buffer(rhs).indices(vec![index]).call().unwrap()).call();
+    let sink = UOp::sink(vec![
+        lhs.try_cmplt(&rhs).unwrap(),
+        lhs.try_cmple(&rhs).unwrap(),
+        lhs.try_cmpgt(&rhs).unwrap(),
+        lhs.try_cmpge(&rhs).unwrap(),
+        lhs.try_cmpeq(&rhs).unwrap(),
+        lhs.try_cmpne(&rhs).unwrap(),
+    ]);
+    let linear = UOp::linear(svod_schedule::linearize_with_cfg(sink).into());
+
+    for rendered in [
+        render(&linear, Some("cpu_float_cmp")).expect("CPU LLVM render"),
+        LlvmTextRenderer::amd(AmdArch::Gfx1151).render(&linear, Some("amd_float_cmp")).expect("AMD LLVM render"),
+    ] {
+        for predicate in ["olt", "ole", "ogt", "oge", "oeq", "une"] {
+            assert!(
+                rendered.code.lines().any(|line| line.contains("fcmp ") && line.contains(predicate)),
+                "{predicate}:\n{}",
+                rendered.code
+            );
+        }
+        for predicate in ["ult", "ule", "ugt", "uge"] {
+            assert!(
+                !rendered.code.lines().any(|line| line.contains("fcmp ") && line.contains(predicate)),
+                "unordered relational predicate {predicate}:\n{}",
+                rendered.code
+            );
+        }
+    }
+}
+
+#[test]
 fn llvm_rejects_end_for_non_innermost_range() {
     let bound = UOp::const_(DType::Int32, ConstValue::Int(2));
     let outer = UOp::range_axis_dtype(bound.clone(), AxisId::Renumbered(0), AxisType::Loop, DType::Int32);
