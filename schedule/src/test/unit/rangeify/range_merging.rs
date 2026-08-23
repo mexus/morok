@@ -196,7 +196,7 @@ fn create_buffer_with_size(size: usize) -> Arc<UOp> {
 /// Helper to create a 2D shaped UOp via RESHAPE
 fn create_reshaped_2d(sizes: &[usize]) -> Arc<UOp> {
     let src = create_buffer_with_size(sizes.iter().product());
-    let new_shape = UOp::vectorize(sizes.iter().map(|&s| UOp::index_const(s as i64)).collect());
+    let new_shape = UOp::stack(sizes.iter().map(|&s| UOp::index_const(s as i64)).collect());
     UOp::new(Op::Reshape { src, new_shape }, DType::Float32)
 }
 

@@ -5,11 +5,13 @@ use svod_ir::types::ConstValue;
 use svod_ir::{Op, UOp};
 
 use crate::TypedPatternMatcher;
-use crate::symbolic::symbolic_simple;
+use crate::symbolic::{pm_fold_cast_const, symbolic_simple};
 
 /// Get the symbolic_simple pattern matcher (reduces duplication).
 pub fn get_matcher() -> &'static TypedPatternMatcher {
-    symbolic_simple()
+    static MATCHER: std::sync::LazyLock<TypedPatternMatcher> =
+        std::sync::LazyLock::new(|| symbolic_simple() + pm_fold_cast_const());
+    &MATCHER
 }
 
 /// Assert that a UOp transforms to a specific constant value.

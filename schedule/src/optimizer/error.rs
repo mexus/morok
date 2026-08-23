@@ -3,6 +3,8 @@ use snafu::Snafu;
 #[derive(Debug, Clone, PartialEq, Eq, Snafu)]
 #[snafu(visibility(pub))]
 pub enum OptError {
+    #[snafu(display("{source}"))]
+    Spec { source: crate::spec::SpecError },
     #[snafu(display("invalid argument type for operation; expected {expected}, found {found}"))]
     InvalidArgType { expected: &'static str, found: &'static str },
     #[snafu(display("operation validation failed for {op}: {reason}"))]
@@ -19,6 +21,8 @@ pub enum OptError {
     MissingAxisParameter,
     #[snafu(display("backend doesn't support required feature: {feature}"))]
     UnsupportedFeature { feature: &'static str },
+    #[snafu(display("optimizer renderer is not bound to a concrete code renderer"))]
+    MissingRendererCapabilities,
     #[snafu(display("optimization would exceed device limit: {limit_type} {value} > max {max}"))]
     DeviceLimitExceeded { limit_type: &'static str, value: usize, max: usize },
 }

@@ -44,21 +44,6 @@ fn test_magic_unsigned_div_10() {
 }
 
 #[test]
-fn test_is_power_of_two() {
-    assert!(is_power_of_two(1));
-    assert!(is_power_of_two(2));
-    assert!(is_power_of_two(4));
-    assert!(is_power_of_two(8));
-    assert!(is_power_of_two(1024));
-
-    assert!(!is_power_of_two(0));
-    assert!(!is_power_of_two(-1));
-    assert!(!is_power_of_two(3));
-    assert!(!is_power_of_two(6));
-    assert!(!is_power_of_two(7));
-}
-
-#[test]
 fn test_magic_unsigned_invalid() {
     // Zero divisor
     assert!(magic_unsigned(100, 0).is_none());
@@ -101,4 +86,16 @@ fn test_magic_unsigned_div_12_factorization() {
         let actual = ((shifted as i128 * m as i128) >> s) as i64;
         assert_eq!(expected, actual, "Failed for x = {}", x);
     }
+}
+
+#[test]
+fn fast_division_does_not_rewrite_signed_negative_range() {
+    let x = UOp::variable("x".into(), -100, 100, svod_ir::DType::Int32);
+    let divisor = UOp::const_(svod_ir::DType::Int32, ConstValue::Int(7));
+    let div = x.cdiv(&divisor);
+
+    assert!(matches!(
+        fast_division_patterns(std::collections::HashSet::new()).rewrite(&div, &mut ()),
+        svod_ir::RewriteResult::NoMatch
+    ));
 }

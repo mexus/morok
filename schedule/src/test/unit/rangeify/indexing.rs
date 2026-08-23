@@ -11,7 +11,10 @@ use std::sync::Arc;
 
 use svod_ir::{AxisId, AxisType, DType, Op, SInt, UOp};
 
-use crate::rangeify::IndexingContext;
+use crate::rangeify::{
+    IndexingContext,
+    indexing::{broadcast_ranges, data_sources},
+};
 
 // ===== Basic Range Creation =====
 
@@ -40,6 +43,48 @@ fn test_indexing_context_realize_map() {
 
     ctx.mark_realize_all(&x).unwrap();
     assert!(ctx.should_realize(&x));
+}
+
+#[test]
+fn test_data_sources_exclude_index_metadata_and_after_dependencies() {
+    let buffer = UOp::new_buffer(svod_device::DeviceSpec::Cpu, 8, DType::Float32);
+    let range = UOp::range_axis(UOp::index_const(8), AxisId::Renumbered(0), AxisType::Loop);
+    let index = UOp::index().buffer(buffer.clone()).indices(vec![range]).call().unwrap();
+    let dep = UOp::noop();
+    let after = buffer.after(smallvec::smallvec![dep]);
+
+    let index_sources = data_sources(&index);
+    assert_eq!(index_sources.len(), 1);
+    assert!(Arc::ptr_eq(&index_sources[0], &buffer));
+
+    let after_sources = data_sources(&after);
+    assert_eq!(after_sources.len(), 1);
+    assert!(Arc::ptr_eq(&after_sources[0], &buffer));
+}
+
+#[test]
+fn test_broadcast_ranges_preserves_extra_range_for_zero_rank_shapes() {
+    let source = UOp::var("source", DType::Float32, 0, 4);
+    let consumer = source.try_add(&UOp::var("other", DType::Float32, 0, 4)).unwrap();
+    let range = UOp::range_axis(UOp::index_const(4), AxisId::Renumbered(0), AxisType::Loop);
+
+    let mapped = broadcast_ranges(&consumer, &source, std::slice::from_ref(&range));
+
+    assert_eq!(mapped.len(), 1);
+    assert!(Arc::ptr_eq(&mapped[0], &range));
+}
+
+#[test]
+fn test_broadcast_ranges_zeroes_expanded_singleton_axis() {
+    let source = UOp::const_(DType::Float32, 1.0f32.into()).try_reshape(&smallvec::smallvec![SInt::Const(1)]).unwrap();
+    let expanded = source.try_expand(&smallvec::smallvec![SInt::Const(4)]).unwrap();
+    let consumer = expanded.try_add(&expanded).unwrap();
+    let range = UOp::range_axis(UOp::index_const(4), AxisId::Renumbered(0), AxisType::Loop);
+
+    let mapped = broadcast_ranges(&consumer, &source, &[range]);
+
+    assert_eq!(mapped.len(), 1);
+    assert!(matches!(mapped[0].op(), Op::Const(_)));
 }
 
 // ===== Range Counter =====
@@ -91,7 +136,7 @@ fn test_symbolic_size_range() {
     let mut ctx = IndexingContext::new();
 
     // Create symbolic size
-    let n = UOp::var("n", DType::Index, 0, i64::MAX);
+    let n = UOp::define_var("n".to_string(), 0, i64::MAX);
     let symbolic_size = SInt::Symbolic(n.clone());
 
     let range = ctx.new_range(&symbolic_size, AxisType::Loop);
@@ -227,34 +272,4 @@ fn test_multiple_contexts_independent() {
 
     let r = ctx2.new_range(&SInt::Const(30), AxisType::Loop);
     assert!(matches!(r.op(), Op::Range { axis_id: AxisId::Unrenumbered(0), .. }));
-}
-
-#[test]
-fn test_recovery_stats_tracking() {
-    let mut ctx = IndexingContext::new();
-    ctx.record_recovery_retry(3, 5);
-
-    assert_eq!(ctx.stats.recovery_retries, 1);
-    assert_eq!(ctx.stats.leaked_pad_ops, 3);
-    assert_eq!(ctx.stats.leaked_reduceaxis_ops, 5);
-}
-
-#[test]
-fn test_fallback_counters_track_attempts() {
-    let mut ctx = IndexingContext::new();
-
-    let mut last_pad_allowed = true;
-    for _ in 0..300 {
-        last_pad_allowed = ctx.record_pad_fallback();
-    }
-
-    let mut last_reduce_allowed = true;
-    for _ in 0..300 {
-        last_reduce_allowed = ctx.record_reduceaxis_fallback();
-    }
-
-    assert!(last_pad_allowed, "PAD fallback should remain enabled for recovery");
-    assert!(last_reduce_allowed, "ReduceAxis fallback should remain enabled for recovery");
-    assert_eq!(ctx.stats.pad_fallback_attempts, 300);
-    assert_eq!(ctx.stats.reduceaxis_fallback_attempts, 300);
 }

@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use smallvec::smallvec;
-use svod_dtype::{DType, DeviceSpec};
+use svod_dtype::{AddrSpace, DType, DeviceSpec};
 use svod_ir::{AxisId, AxisType, ConstValue, Op, UOp};
 
 use super::helpers::extract_kernel;
@@ -58,6 +58,70 @@ fn test_split_store_basic() {
         // With proper BUFFER ops, sources should contain the buffer
         assert!(!sources.is_empty(), "Kernel sources should contain the buffer");
     }
+}
+
+#[test]
+fn test_split_store_dense_global_params_with_internal_buffer() {
+    // Original storage identities are intentionally sparse. Only the two
+    // globals belong to the CALL tuple; wrapped local/register allocations and
+    // a scalar variable do not consume global slots.
+    let output = UOp::buffer(41, 4, DType::Float32, AddrSpace::Global, Some(DeviceSpec::Cpu));
+    let local = UOp::buffer(700, 4, DType::Float32, AddrSpace::Local, None);
+    let local_peer = UOp::buffer(701, 4, DType::Float32, AddrSpace::Local, None);
+    let reg = UOp::buffer(800, 1, DType::Float32, AddrSpace::Reg, None);
+    let input = UOp::buffer(990, 4, DType::Float32, AddrSpace::Global, Some(DeviceSpec::Cpu));
+    let scalar = UOp::variable("N".to_string(), 1, 4, DType::Float32).bind(UOp::native_const(2.0f32));
+    let zero = UOp::index_const(0);
+
+    let output_idx = UOp::index().buffer(output.clone()).indices(vec![zero.clone()]).call().unwrap();
+    let local_stack = UOp::new(
+        Op::MStack { buffers: smallvec![local.clone(), local_peer] },
+        DType::Float32.ptr(Some(8), AddrSpace::Local).unwrap(),
+    )
+    .after(smallvec![UOp::noop()]);
+    let local_idx = UOp::index().buffer(local_stack).indices(vec![zero.clone()]).call().unwrap();
+    let reg_idx =
+        UOp::index().buffer(reg.clone().after(smallvec![UOp::noop()])).indices(vec![zero.clone()]).call().unwrap();
+    let input_idx = UOp::index().buffer(input.clone()).indices(vec![zero]).call().unwrap();
+    let value = UOp::load()
+        .index(local_idx)
+        .call()
+        .try_add(&UOp::load().index(reg_idx).call())
+        .unwrap()
+        .try_add(&UOp::load().index(input_idx).call())
+        .unwrap()
+        .try_add(&scalar)
+        .unwrap();
+    let call = call_split_store(&output_idx.store(value)).expect("STORE should split");
+
+    let Op::Call { body, args, .. } = call.op() else { panic!("expected CALL") };
+    assert_eq!(args.len(), 3, "CALL sources are two globals followed by the scalar binding");
+    assert!(args.iter().any(|arg| Arc::ptr_eq(arg, &output)));
+    assert!(args.iter().any(|arg| Arc::ptr_eq(arg, &input)));
+    assert!(matches!(args.last().unwrap().op(), Op::Bind { .. }));
+
+    let mut global_slots: Vec<usize> = body
+        .toposort()
+        .into_iter()
+        .filter_map(|u| match u.op() {
+            Op::Param { arg, .. } if arg.addrspace == Some(AddrSpace::Global) => Some(arg.slot),
+            _ => None,
+        })
+        .collect();
+    global_slots.sort_unstable();
+    global_slots.dedup();
+    assert_eq!(global_slots, vec![0, 1], "PARAM slots must be dense CALL positions");
+    let program_info = svod_ir::ProgramInfo::from_sink(body, DeviceSpec::Cpu);
+    assert_eq!(program_info.globals, vec![0, 1], "PROGRAM globals are direct CALL tuple positions");
+    assert_eq!(program_info.vars.len(), 1, "scalar variables are PROGRAM values, not globals");
+    assert!(body.toposort().iter().any(
+        |u| matches!(u.op(), Op::Buffer { arg, .. } if arg.addrspace == Some(AddrSpace::Local) && arg.slot == 700)
+    ));
+    assert!(
+        body.toposort().iter().any(
+            |u| matches!(u.op(), Op::Buffer { arg, .. } if arg.addrspace == Some(AddrSpace::Reg) && arg.slot == 800)
+        )
+    );
 }
 
 #[test]
@@ -323,7 +387,7 @@ fn test_split_store_end_with_mixed_ranges() {
 }
 
 // ============================================================================
-// COPY/BUFFER_VIEW Support Tests
+// COPY Support Tests
 // ============================================================================
 
 #[test]
@@ -352,38 +416,8 @@ fn test_split_store_with_copy() {
 }
 
 #[test]
-fn test_split_store_with_buffer_view() {
-    // Create a BUFFER_VIEW operation with proper BUFFER
-    let base_buffer = UOp::new_buffer(DeviceSpec::Cpu, 512, DType::Float32);
-    let buffer_view = base_buffer.view(256, 128);
-
-    // Create STORE using the BUFFER_VIEW result with proper BUFFER
-    let output_buffer = UOp::new_buffer(DeviceSpec::Cpu, 256, DType::Float32);
-    let const_idx = UOp::index_const(0);
-    let store_idx = UOp::index().buffer(output_buffer).indices(vec![const_idx]).call().unwrap();
-    let store = store_idx.store(buffer_view.clone());
-
-    let result = call_split_store(&store);
-
-    assert!(result.is_some());
-    let kernel = result.unwrap();
-
-    // Verify kernel AST is BUFFER_VIEW, not SINK
-    if let Op::Call { body: ast, .. } = kernel.op() {
-        if let Op::BufferView { size, offset, .. } = ast.op() {
-            assert_eq!(*size, 256);
-            assert_eq!(*offset, 128);
-        } else {
-            panic!("Expected BUFFER_VIEW operation as kernel AST, got: {:?}", ast.op());
-        }
-    } else {
-        panic!("Expected CALL operation");
-    }
-}
-
-#[test]
 fn test_split_store_normal_computation_uses_sink() {
-    // Create normal arithmetic computation (no COPY/BUFFER_VIEW)
+    // Create normal arithmetic computation (no COPY)
     let a = UOp::native_const(1.0f32);
     let b = UOp::native_const(2.0f32);
     let value = a.try_add(&b).unwrap();
@@ -443,31 +477,6 @@ fn test_split_store_nested_copy_in_store() {
 }
 
 #[test]
-fn test_split_store_nested_buffer_view_stays_direct() {
-    let base_buffer = UOp::new_buffer(DeviceSpec::Cpu, 512, DType::Float32);
-    let buffer_view = base_buffer.view(256, 128);
-
-    let output_buffer = UOp::new_buffer(DeviceSpec::Cpu, 256, DType::Float32);
-    let const_idx = UOp::index_const(0);
-    let store_idx = UOp::index().buffer(output_buffer).indices(vec![const_idx]).call().unwrap();
-    let store = store_idx.store(buffer_view);
-
-    let range = UOp::range_const(10, 0);
-    let end = store.end(smallvec![range]);
-    let result = call_split_store(&end).expect("END(STORE(BUFFER_VIEW)) should split");
-    let result = expect_end_call(&result, 1);
-
-    let Op::Call { body: ast, .. } = result.op() else {
-        panic!("Expected CALL operation");
-    };
-    assert!(
-        matches!(effect_body(ast).op(), Op::BufferView { .. }),
-        "Expected BUFFER_VIEW kernel AST, got: {:?}",
-        ast.op()
-    );
-}
-
-#[test]
 fn test_split_store_simple_store_splits_directly() {
     let buffer = UOp::new_buffer(DeviceSpec::Cpu, 64, DType::Float32);
     let idx = UOp::index().buffer(buffer).indices(vec![UOp::index_const(0)]).call().unwrap();
@@ -503,29 +512,6 @@ fn test_split_store_open_outer_range_returns_none() {
 }
 
 #[test]
-fn test_try_get_kernel_graph_rejects_normal_cross_device_kernel() {
-    let cpu = UOp::new_buffer(DeviceSpec::Cpu, 16, DType::Float32);
-    let cuda = UOp::new_buffer(DeviceSpec::Cuda { device_id: 0 }, 16, DType::Float32);
-
-    let idx0 = UOp::index_const(0);
-    let cpu_idx = UOp::index().buffer(cpu.clone()).indices(vec![idx0.clone()]).call().unwrap();
-    let cuda_idx = UOp::index().buffer(cuda.clone()).indices(vec![idx0.clone()]).call().unwrap();
-    let cpu_val = UOp::load().buffer(cpu).index(cpu_idx).call();
-    let cuda_val = UOp::load().buffer(cuda).index(cuda_idx).call();
-    let value = cpu_val.try_add(&cuda_val).unwrap();
-
-    let out = UOp::new_buffer(DeviceSpec::Cpu, 16, DType::Float32);
-    let out_idx = UOp::index().buffer(out).indices(vec![idx0]).call().unwrap();
-    let root = UOp::sink(vec![out_idx.store(value)]);
-
-    let err = match try_get_kernel_graph(root) {
-        Ok(_) => panic!("normal mixed-device kernel should fail"),
-        Err(err) => err,
-    };
-    assert!(format!("{err}").contains("same device"), "unexpected error: {err}");
-}
-
-#[test]
 fn test_try_get_kernel_graph_allows_cross_device_copy() {
     let src = UOp::new_buffer(DeviceSpec::Cpu, 16, DType::Float32);
     let copy = src.copy_to_device(DeviceSpec::Cuda { device_id: 0 });
@@ -548,8 +534,9 @@ fn test_try_get_kernel_graph_allows_cross_device_copy() {
 fn test_try_get_kernel_graph_ignores_bind_args_for_device_validation() {
     let buffer = UOp::new_buffer(DeviceSpec::Cpu, 16, DType::Float32);
     let var = UOp::define_var("i".to_string(), 0, 15);
-    let bind_with_device_child = var.bind(UOp::device(DeviceSpec::Cuda { device_id: 0 }));
-    let idx = UOp::index().buffer(buffer).indices(vec![bind_with_device_child]).call().unwrap();
+    let cuda_param = UOp::param(1, 1, DType::Index, Some(DeviceSpec::Cuda { device_id: 0 }));
+    let bind_with_device_storage = var.bind(cuda_param);
+    let idx = UOp::index().buffer(buffer).indices(vec![bind_with_device_storage]).call().unwrap();
     let root = UOp::sink(vec![idx.store(UOp::native_const(1.0f32))]);
 
     match try_get_kernel_graph(root) {
@@ -560,11 +547,10 @@ fn test_try_get_kernel_graph_ignores_bind_args_for_device_validation() {
 
 #[test]
 fn test_split_store_copy_precedence_documented() {
-    // This test documents the COPY/BUFFER_VIEW detection behavior.
+    // This test documents the COPY detection behavior.
     //
     // **Behavior:** The stored value of the STORE is checked directly for
-    // COPY/BUFFER_VIEW ops.
-    // If found, the COPY/BV becomes the kernel AST directly.
+    // COPY ops. If found, the COPY becomes the kernel AST directly.
 
     // Create nested COPY: COPY(COPY(buffer)) with proper BUFFER
     let base_buffer = UOp::new_buffer(DeviceSpec::Cpu, 100, DType::Float32);

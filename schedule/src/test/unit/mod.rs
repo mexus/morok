@@ -2,6 +2,8 @@ pub mod dce;
 pub mod devectorize;
 pub mod expand;
 pub mod gpudims;
+pub mod late_coalesce;
+pub mod multi;
 pub mod optimizer;
 pub mod passes;
 pub mod pattern;

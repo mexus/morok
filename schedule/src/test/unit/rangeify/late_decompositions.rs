@@ -2,13 +2,25 @@
 //!
 //! Based on Tinygrad's decompositions.py:321-367.
 
+use std::sync::Arc;
 use svod_ir::types::ConstValue;
+
+use svod_dtype::DType;
 use svod_ir::{BinaryOp, Op, UOp, UnaryOp};
 
 use crate::rangeify::patterns::{
     pm_comparison_negations, pm_div_to_shr, pm_fdiv_to_mul, pm_mod_to_and, pm_mul_to_shl, pm_neg_from_mul,
 };
 use crate::rewrite::graph_rewrite;
+use crate::symbolic::{pm_fold_cast_const, symbolic_simple};
+
+fn range_var(max: i64) -> Arc<UOp> {
+    UOp::variable("x".into(), 0, max, DType::Int32)
+}
+
+fn late_rewrite(matcher: &'static crate::TypedPatternMatcher, root: Arc<UOp>) -> Arc<UOp> {
+    graph_rewrite(&(symbolic_simple() + pm_fold_cast_const() + matcher), root, &mut ())
+}
 
 // ============================================================================
 // MOD → AND PATTERNS
@@ -19,10 +31,10 @@ fn test_mod_power_of_two_becomes_and() {
     let matcher = pm_mod_to_and();
 
     // x % 8 → x & 7
-    let x = UOp::range(UOp::index_const(100), 0);
+    let x = range_var(99);
     let modulo = x.mod_(&UOp::index_const(8));
 
-    let result = graph_rewrite(&matcher, modulo, &mut ());
+    let result = late_rewrite(matcher, modulo);
 
     // Should be And(x, 7)
     if let Op::Binary(BinaryOp::And, lhs, rhs) = result.op() {
@@ -42,13 +54,13 @@ fn test_mod_non_power_of_two_unchanged() {
     let matcher = pm_mod_to_and();
 
     // x % 7 should NOT change (7 is not power of two)
-    let x = UOp::range(UOp::index_const(100), 0);
+    let x = range_var(99);
     let modulo = x.mod_(&UOp::index_const(7));
 
     let result = graph_rewrite(&matcher, modulo.clone(), &mut ());
 
-    // Should still be Mod
-    assert!(matches!(result.op(), Op::Binary(BinaryOp::Mod, _, _)), "x % 7 should remain Mod");
+    // Should still be FloorMod
+    assert!(matches!(result.op(), Op::Binary(BinaryOp::FloorMod, _, _)), "x % 7 should remain FloorMod");
 }
 
 #[test]
@@ -56,10 +68,10 @@ fn test_mod_power_of_two_various_sizes() {
     let matcher = pm_mod_to_and();
 
     for power in [2, 4, 16, 32, 64, 128, 256, 512, 1024] {
-        let x = UOp::range(UOp::index_const(10000), 0);
+        let x = range_var(9999);
         let modulo = x.mod_(&UOp::index_const(power));
 
-        let result = graph_rewrite(&matcher, modulo, &mut ());
+        let result = late_rewrite(matcher, modulo);
 
         if let Op::Binary(BinaryOp::And, _, rhs) = result.op() {
             if let Op::Const(c) = rhs.op() {
@@ -80,10 +92,10 @@ fn test_mul_power_of_two_becomes_shl() {
     let matcher = pm_mul_to_shl();
 
     // x * 8 → x << 3
-    let x = UOp::range(UOp::index_const(100), 0);
+    let x = range_var(99);
     let mul = x.mul(&UOp::index_const(8));
 
-    let result = graph_rewrite(&matcher, mul, &mut ());
+    let result = late_rewrite(matcher, mul);
 
     // Should be Shl(x, 3)
     if let Op::Binary(BinaryOp::Shl, lhs, rhs) = result.op() {
@@ -103,7 +115,7 @@ fn test_mul_non_power_of_two_unchanged() {
     let matcher = pm_mul_to_shl();
 
     // x * 7 should NOT change (7 is not power of two)
-    let x = UOp::range(UOp::index_const(100), 0);
+    let x = range_var(99);
     let mul = x.mul(&UOp::index_const(7));
 
     let result = graph_rewrite(&matcher, mul.clone(), &mut ());
@@ -117,10 +129,10 @@ fn test_mul_by_one_returns_identity() {
     let matcher = pm_mul_to_shl();
 
     // x * 1 → x (handled specially, not converted to shift)
-    let x = UOp::range(UOp::index_const(100), 0);
+    let x = range_var(99);
     let mul = x.mul(&UOp::index_const(1));
 
-    let result = graph_rewrite(&matcher, mul, &mut ());
+    let result = late_rewrite(matcher, mul);
 
     assert!(std::sync::Arc::ptr_eq(&result, &x), "x * 1 should return x");
 }
@@ -134,10 +146,10 @@ fn test_mul_neg_one_becomes_neg() {
     let matcher = pm_neg_from_mul();
 
     // x * -1 → NEG(x)
-    let x = UOp::range(UOp::index_const(100), 0);
+    let x = range_var(99);
     let mul = x.mul(&UOp::index_const(-1));
 
-    let result = graph_rewrite(&matcher, mul, &mut ());
+    let result = late_rewrite(matcher, mul);
 
     // Should be Neg(x)
     if let Op::Unary(UnaryOp::Neg, inner) = result.op() {
@@ -152,7 +164,7 @@ fn test_mul_pos_one_unchanged_by_neg_pattern() {
     let matcher = pm_neg_from_mul();
 
     // x * 1 should NOT match the neg pattern
-    let x = UOp::range(UOp::index_const(100), 0);
+    let x = range_var(99);
     let mul = x.mul(&UOp::index_const(1));
 
     let result = graph_rewrite(&matcher, mul.clone(), &mut ());
@@ -171,10 +183,10 @@ fn test_div_power_of_two_becomes_shr() {
 
     // x // 8 → x >> 3 (for non-negative x)
     // Use a range with non-negative vmin
-    let x = UOp::range(UOp::index_const(100), 0);
-    let div = x.idiv(&UOp::index_const(8));
+    let x = range_var(99);
+    let div = x.cdiv(&UOp::index_const(8));
 
-    let result = graph_rewrite(&matcher, div, &mut ());
+    let result = late_rewrite(matcher, div);
 
     // Should be Shr(x, 3)
     if let Op::Binary(BinaryOp::Shr, lhs, rhs) = result.op() {
@@ -194,13 +206,13 @@ fn test_div_non_power_of_two_unchanged() {
     let matcher = pm_div_to_shr();
 
     // x // 7 should NOT change (7 is not power of two)
-    let x = UOp::range(UOp::index_const(100), 0);
-    let div = x.idiv(&UOp::index_const(7));
+    let x = range_var(99);
+    let div = x.cdiv(&UOp::index_const(7));
 
     let result = graph_rewrite(&matcher, div.clone(), &mut ());
 
-    // Should still be Idiv
-    assert!(matches!(result.op(), Op::Binary(BinaryOp::Idiv, _, _)), "x // 7 should remain Idiv");
+    // Should still be CDiv
+    assert!(matches!(result.op(), Op::Binary(BinaryOp::CDiv, _, _)), "x // 7 should remain CDiv");
 }
 
 #[test]
@@ -208,13 +220,13 @@ fn test_div_by_one_unchanged() {
     let matcher = pm_div_to_shr();
 
     // x // 1 should NOT be converted to shift (guard in pattern)
-    let x = UOp::range(UOp::index_const(100), 0);
-    let div = x.idiv(&UOp::index_const(1));
+    let x = range_var(99);
+    let div = x.cdiv(&UOp::index_const(1));
 
     let result = graph_rewrite(&matcher, div.clone(), &mut ());
 
-    // Should still be Idiv (trivial case skipped)
-    assert!(matches!(result.op(), Op::Binary(BinaryOp::Idiv, _, _)), "x // 1 should remain Idiv");
+    // Should still be CDiv (trivial case skipped)
+    assert!(matches!(result.op(), Op::Binary(BinaryOp::CDiv, _, _)), "x // 1 should remain CDiv");
 }
 
 #[test]
@@ -222,10 +234,10 @@ fn test_div_power_of_two_various_sizes() {
     let matcher = pm_div_to_shr();
 
     for (power, shift) in [(2, 1), (4, 2), (16, 4), (32, 5), (64, 6), (128, 7), (256, 8)] {
-        let x = UOp::range(UOp::index_const(10000), 0);
-        let div = x.idiv(&UOp::index_const(power));
+        let x = range_var(9999);
+        let div = x.cdiv(&UOp::index_const(power));
 
-        let result = graph_rewrite(&matcher, div, &mut ());
+        let result = late_rewrite(matcher, div);
 
         if let Op::Binary(BinaryOp::Shr, _, rhs) = result.op() {
             if let Op::Const(c) = rhs.op() {
@@ -310,12 +322,12 @@ fn test_not_lt_becomes_reversed_lt() {
     let matcher = pm_comparison_negations();
 
     // !(x < 5) → (4 < x)
-    let x = UOp::range(UOp::index_const(100), 0);
+    let x = range_var(99);
     let five = UOp::index_const(5);
     let lt = x.try_cmplt(&five).unwrap();
     let not_lt = lt.not();
 
-    let result = graph_rewrite(&matcher, not_lt, &mut ());
+    let result = late_rewrite(matcher, not_lt);
 
     // Should be Lt(4, x)
     if let Op::Binary(BinaryOp::Lt, lhs, rhs) = result.op() {
@@ -337,12 +349,12 @@ fn test_not_reversed_lt_becomes_lt() {
     let matcher = pm_comparison_negations();
 
     // !(5 < x) → (x < 6)
-    let x = UOp::range(UOp::index_const(100), 0);
+    let x = range_var(99);
     let five = UOp::index_const(5);
     let lt = five.try_cmplt(&x).unwrap();
     let not_lt = lt.not();
 
-    let result = graph_rewrite(&matcher, not_lt, &mut ());
+    let result = late_rewrite(matcher, not_lt);
 
     // Should be Lt(x, 6)
     if let Op::Binary(BinaryOp::Lt, lhs, rhs) = result.op() {
@@ -364,7 +376,7 @@ fn test_range_compression() {
     let matcher = pm_comparison_negations();
 
     // (3 < x) & (x < 5) → x == 4
-    let x = UOp::range(UOp::index_const(100), 0);
+    let x = range_var(99);
     let three = UOp::index_const(3);
     let five = UOp::index_const(5);
 
@@ -372,7 +384,7 @@ fn test_range_compression() {
     let lt_five = x.try_cmplt(&five).unwrap(); // x < 5
     let combined = gt_three.try_and_op(&lt_five).unwrap();
 
-    let result = graph_rewrite(&matcher, combined, &mut ());
+    let result = late_rewrite(matcher, combined);
 
     // Should be Eq(x, 4)
     if let Op::Binary(BinaryOp::Eq, lhs, rhs) = result.op() {
@@ -395,14 +407,14 @@ fn test_negated_mul_comparison() {
     let matcher = pm_comparison_negations();
 
     // x*-1 < 5 → -5 < x
-    let x = UOp::range(UOp::index_const(100), 0);
+    let x = range_var(99);
     let neg_one = UOp::index_const(-1);
     let five = UOp::index_const(5);
 
     let neg_x = x.mul(&neg_one);
     let lt = neg_x.try_cmplt(&five).unwrap();
 
-    let result = graph_rewrite(&matcher, lt, &mut ());
+    let result = late_rewrite(matcher, lt);
 
     // Should be Lt(-5, x)
     if let Op::Binary(BinaryOp::Lt, lhs, rhs) = result.op() {
@@ -417,4 +429,22 @@ fn test_negated_mul_comparison() {
     } else {
         panic!("Expected Lt operation, got {:?}", result.op());
     }
+}
+
+#[test]
+fn test_weak_lowering_concretizes_compact_weak_stack_before_final_rewrite() {
+    let lanes = UOp::vconst((0..4).map(ConstValue::Int).collect(), DType::WeakInt);
+    let root = UOp::sink(vec![lanes]);
+
+    let lowered = graph_rewrite(&crate::symbolic::pm_lower_index_dtype(), root, &mut ());
+    let result = graph_rewrite(crate::optimizer::final_rewrite_patterns(), lowered, &mut ());
+
+    assert!(
+        result.toposort().iter().all(|u| !u.dtype().is_weak()),
+        "weak lowering must prevent final rendering from minting weak scalar constants:\n{}",
+        result.tree()
+    );
+    let Op::Sink { sources, .. } = result.op() else { panic!("expected SINK") };
+    assert!(matches!(sources[0].op(), Op::VConst { values } if values.len() == 4));
+    assert_eq!(sources[0].dtype(), DType::Int32.vec(4).unwrap());
 }

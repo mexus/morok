@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
-use svod_dtype::{DType, DeviceSpec, ImageKind};
-use svod_ir::{AxisId, AxisType, ReduceOp, UOp};
+use svod_dtype::{AddrSpace, DType, DeviceSpec};
+use svod_ir::{AxisId, AxisType, Op, ParamArg, ReduceOp, UOp};
 
 use crate::optimizer::config::{HeuristicsConfig, TcOpt};
 use crate::optimizer::heuristics::{apply_image_upcasts, apply_matvec_fast_path, try_tensor_cores};
@@ -70,7 +70,9 @@ fn test_apply_matvec_fast_path_respects_disable_flag() {
 #[test]
 fn test_apply_image_upcasts_non_stub_behavior() {
     let g = UOp::range_axis(UOp::index_const(8), AxisId::Renumbered(0), AxisType::Global);
-    let img = UOp::new_buffer(DeviceSpec::Cpu, 64, DType::Image { kind: ImageKind::Float, shape: vec![8, 8] });
+    let shape = svod_ir::shape::shape_to_uop(&smallvec::smallvec![2usize.into(), 8usize.into(), 4usize.into()]);
+    let arg = ParamArg::buffer(0, DType::Float32, AddrSpace::Global, Some(DeviceSpec::Cpu));
+    let img = UOp::new(Op::Buffer { shape, arg }, DType::Float32);
     let indexed = UOp::index().buffer(img).indices(vec![g.clone()]).call().expect("image index should build");
     let sink = UOp::sink(vec![indexed, g]);
 

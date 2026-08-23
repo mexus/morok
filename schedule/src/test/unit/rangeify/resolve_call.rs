@@ -64,7 +64,9 @@ fn test_resolve_call_preserves_opaque_call() {
 /// belong in CALL, not FUNCTION. CALL is preserved by resolve_calls.
 #[test]
 fn test_resolve_call_preserves_program_call() {
-    let program = UOp::program(UOp::sink(vec![]), UOp::device(DeviceSpec::Cpu), None, None, None);
+    let sink = UOp::sink(vec![]);
+    let info = svod_ir::ProgramInfo::from_sink(&sink, DeviceSpec::Cpu);
+    let program = UOp::program(sink, info, None, None, None);
     let call = program.call(smallvec![], CallInfo::default());
 
     let resolved = resolve_calls(call).expect("resolve_calls should succeed");
@@ -110,6 +112,36 @@ fn test_resolve_call_preserves_precompile_function() {
         }
         op => panic!("expected precompile FUNCTION to be preserved, got {op:?}"),
     }
+}
+
+#[test]
+fn test_resolve_call_preserves_precompile_gettuple_and_actual() {
+    let formal = UOp::param(0, 8, DType::Float32, None);
+    let actual = UOp::new_buffer(DeviceSpec::Cpu, 8, DType::Float32);
+    let info = CallInfo { precompile: true, ..CallInfo::default() };
+    let function = formal.function(smallvec![actual.clone()], info);
+    let gettuple = function.try_gettuple(0).unwrap();
+
+    let resolved = resolve_calls(gettuple).expect("precompiled FUNCTION must remain opaque");
+    let Op::GetTuple { src, index: 0 } = resolved.op() else { panic!("expected GETTUPLE root") };
+    let Op::Function { args, info, .. } = src.op() else { panic!("expected preserved FUNCTION source") };
+    assert!(info.precompile);
+    assert_eq!(args.len(), 1);
+    assert!(Arc::ptr_eq(&args[0], &actual));
+}
+
+#[test]
+fn test_resolve_call_keeps_nested_function_under_opaque_outer_function() {
+    let nested_formal = UOp::param(0, 8, DType::Float32, None);
+    let nested_actual = UOp::new_buffer(DeviceSpec::Cpu, 8, DType::Float32);
+    let nested = nested_formal.function(smallvec![nested_actual], CallInfo::default());
+    let outer_info = CallInfo { precompile: true, ..CallInfo::default() };
+    let outer = nested.function(smallvec![], outer_info);
+
+    let resolved = resolve_calls(outer).expect("opaque outer FUNCTION must preserve its body");
+    let Op::Function { body, info, .. } = resolved.op() else { panic!("expected outer FUNCTION") };
+    assert!(info.precompile);
+    assert!(body.toposort().iter().any(|node| matches!(node.op(), Op::Function { info, .. } if !info.precompile)));
 }
 
 /// Tinygrad parity: BIND is value-producing (not in `_OPAQUE_CALL_BODIES`), so a
@@ -191,7 +223,7 @@ fn test_resolve_call_error_arg_count_mismatch() {
     let function = body.function(smallvec![a0], CallInfo::default());
 
     let err = resolve_calls(function).expect_err("resolve_calls should fail");
-    assert!(matches!(err, Error::CallArgCountMismatch { expected: 2, got: 1 }));
+    assert!(matches!(err, Error::CallFormalSlotMissing { slot: 1, arg_count: 1 }));
 }
 
 #[test]
@@ -230,6 +262,22 @@ fn test_rangeify_pipeline_runs_resolve_call() {
 
     let (out, _ctx) = rangeify(function).expect("rangeify should succeed");
     assert!(!out.toposort().iter().any(|u| matches!(u.op(), Op::Function { .. })));
+}
+
+#[test]
+fn test_rangeify_consumes_expression_valued_function_result_shape() {
+    let p1 = UOp::scalar_param(1, Some("p1".into()), DType::WeakInt, 1, 8);
+    let extent = p1.try_add(&p1).unwrap();
+    let formal = UOp::param_with_shape(0, &smallvec![svod_ir::SInt::Symbolic(extent)], DType::Float32, None);
+    let actual_dim = UOp::define_var("actual".into(), 1, 8);
+    let actual_extent = actual_dim.try_add(&actual_dim).unwrap();
+    let actual =
+        UOp::param_with_shape(7, &smallvec![svod_ir::SInt::Symbolic(actual_extent.clone())], DType::Float32, None);
+    let output = formal.function(smallvec![actual, actual_dim], CallInfo::default()).try_gettuple(0).unwrap();
+
+    assert_eq!(output.shape().unwrap().unwrap().as_slice(), &[svod_ir::SInt::Symbolic(actual_extent)]);
+    let (resolved, _) = rangeify(output).expect("rangeify should consume substituted call shape");
+    assert!(resolved.toposort().iter().all(|node| !matches!(node.op(), Op::Function { .. })));
 }
 
 #[test]

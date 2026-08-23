@@ -197,7 +197,7 @@ proptest! {
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(1000))]
 
-    /// x / x should simplify to 1 (for x as variable, not constant 0)
+    /// x / x simplifies only when the declared range excludes zero.
     #[test]
     fn self_idiv_one(x in arb_var_uop(DType::Int32)) {
         let expr = x.try_div(&x).unwrap();
@@ -205,11 +205,13 @@ proptest! {
         let matcher = symbolic_simple();
         let simplified = graph_rewrite(&matcher, expr, &mut ());
 
-        // Should simplify to constant 1
-        match simplified.op() {
-            Op::Const(cv) => prop_assert_eq!(cv.0, ConstValue::Int(1),
-                "x / x should be 1"),
-            _ => prop_assert!(false, "x / x should simplify to Const(1), got {:?}", simplified.op()),
+        if x.vmin().try_int().is_some_and(|min| min > 0) || x.vmax().try_int().is_some_and(|max| max < 0) {
+            match simplified.op() {
+                Op::Const(cv) => prop_assert_eq!(cv.0, ConstValue::Int(1), "nonzero x / x should be 1"),
+                _ => prop_assert!(false, "nonzero x / x should simplify to Const(1), got {:?}", simplified.op()),
+            }
+        } else {
+            prop_assert!(matches!(simplified.op(), Op::Binary(BinaryOp::FloorDiv, ..)));
         }
     }
 
@@ -430,7 +432,7 @@ proptest! {
         let simplified = graph_rewrite(&matcher, div2, &mut ());
 
         // Should simplify to a // (b * c)
-        if let Op::Binary(BinaryOp::Idiv, var, divisor) = simplified.op() {
+        if let Op::Binary(BinaryOp::FloorDiv, var, divisor) = simplified.op() {
             prop_assert!(Arc::ptr_eq(var, &a), "Variable should be preserved");
             if let Op::Const(cv) = divisor.op() {
                 let expected = (b as i64) * (c as i64);
@@ -440,7 +442,7 @@ proptest! {
                 prop_assert!(false, "Divisor should be constant");
             }
         } else {
-            prop_assert!(false, "Should simplify to Idiv");
+            prop_assert!(false, "Should simplify to FloorDiv");
         }
     }
 
@@ -498,11 +500,11 @@ proptest! {
         let simplified = graph_rewrite(&matcher, mod2, &mut ());
 
         // Should simplify to a % b
-        if let Op::Binary(BinaryOp::Mod, var, divisor) = simplified.op() {
+        if let Op::Binary(BinaryOp::FloorMod, var, divisor) = simplified.op() {
             prop_assert!(Arc::ptr_eq(var, &a), "Variable should be preserved");
             prop_assert!(Arc::ptr_eq(divisor, &b_uop), "Divisor should be preserved");
         } else {
-            prop_assert!(false, "Should simplify to Mod(a, b)");
+            prop_assert!(false, "Should simplify to FloorMod(a, b)");
         }
     }
 
@@ -599,7 +601,7 @@ proptest! {
 }
 
 // ============================================================================
-// Div/Mod Soundness: simplified expression must evaluate identically to original
+// Div/FloorMod Soundness: simplified expression must evaluate identically to original
 // for ALL variable assignments within declared ranges.
 // ============================================================================
 
@@ -636,6 +638,24 @@ fn eval_uop(expr: &Arc<UOp>, vars: &std::collections::HashMap<String, i64>) -> O
     }
 }
 
+fn eval_typed_uop(expr: &Arc<UOp>, variable: &str, value: ConstValue) -> Option<ConstValue> {
+    use svod_ir::uop::eval::{eval_binary_op_typed, eval_unary_op_typed};
+
+    match expr.op() {
+        Op::Const(constant) => Some(constant.0),
+        Op::DefineVar { name, .. } if name == variable => Some(value),
+        Op::Bind { var, .. } => eval_typed_uop(var, variable, value),
+        Op::Binary(op, lhs, rhs) => eval_binary_op_typed(
+            *op,
+            eval_typed_uop(lhs, variable, value)?,
+            eval_typed_uop(rhs, variable, value)?,
+            expr.dtype().base(),
+        ),
+        Op::Unary(op, src) => eval_unary_op_typed(*op, eval_typed_uop(src, variable, value)?, expr.dtype().base()),
+        _ => None,
+    }
+}
+
 /// Generate (a*f + b*g + const) expressions for divmod testing.
 /// Variables have range [0, max_val), constants in [-20, 20], divisor in [2, 16].
 fn arb_divmod_expr() -> impl Strategy<Value = (Arc<UOp>, i64, Vec<(String, i64, i64)>)> {
@@ -649,8 +669,8 @@ fn arb_divmod_expr() -> impl Strategy<Value = (Arc<UOp>, i64, Vec<(String, i64, 
         1i64..8,    // var_b_max
     )
         .prop_map(|(fa, fb, k, div, a_max, b_max)| {
-            let a = UOp::var("a", DType::Index, 0, a_max);
-            let b = UOp::var("b", DType::Index, 0, b_max);
+            let a = UOp::variable("a".into(), 0, a_max, DType::Int32);
+            let b = UOp::variable("b".into(), 0, b_max, DType::Int32);
             let mut expr = UOp::index_const(k);
             if fa != 0 {
                 expr = expr.try_add(&UOp::index_const(fa).try_mul(&a).unwrap()).unwrap();
@@ -666,7 +686,7 @@ fn arb_divmod_expr() -> impl Strategy<Value = (Arc<UOp>, i64, Vec<(String, i64, 
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(2000))]
 
-    /// Mod simplification must preserve semantics for ALL variable values in range.
+    /// FloorMod simplification must preserve semantics for ALL variable values in range.
     #[test]
     fn divmod_mod_soundness((expr, div, var_ranges) in arb_divmod_expr()) {
         let c = UOp::index_const(div);
@@ -684,14 +704,14 @@ proptest! {
 
                 if let (Some(orig), Some(simp)) = (eval_uop(&modded, &vars), eval_uop(&simplified, &vars)) {
                     prop_assert_eq!(orig, simp,
-                        "Mod mismatch at a={}, b={}, div={}.\n  Original: {}\n  Simplified: {}",
+                        "FloorMod mismatch at a={}, b={}, div={}.\n  Original: {}\n  Simplified: {}",
                         a_val, b_val, div, modded.tree(), simplified.tree());
                 }
             }
         }
     }
 
-    /// Idiv simplification must preserve semantics for ALL variable values in range.
+    /// FloorDiv simplification must preserve semantics for ALL variable values in range.
     #[test]
     fn divmod_idiv_soundness((expr, div, var_ranges) in arb_divmod_expr()) {
         let c = UOp::index_const(div);
@@ -708,10 +728,84 @@ proptest! {
 
                 if let (Some(orig), Some(simp)) = (eval_uop(&divided, &vars), eval_uop(&simplified, &vars)) {
                     prop_assert_eq!(orig, simp,
-                        "Idiv mismatch at a={}, b={}, div={}.\n  Original: {}\n  Simplified: {}",
+                        "FloorDiv mismatch at a={}, b={}, div={}.\n  Original: {}\n  Simplified: {}",
                         a_val, b_val, div, divided.tree(), simplified.tree());
                 }
             }
+        }
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(1000))]
+
+    #[test]
+    fn affine_congruence_rewrites_preserve_exact_typed_runtime(
+        divisor in 8i64..=16,
+        offset in 0i64..=2,
+        max in 2i64..=5,
+    ) {
+        let dtype = DType::Int16;
+        let x = UOp::var("affine_x", dtype.clone(), 0, max);
+        let divisor_uop = UOp::const_(dtype.clone(), ConstValue::Int(divisor));
+        let numerator = x
+            .mul(&UOp::const_(dtype.clone(), ConstValue::Int(divisor + 1)))
+            .add(&UOp::const_(dtype, ConstValue::Int(offset)));
+
+        for original in [numerator.mod_(&divisor_uop), numerator.floor_div(&divisor_uop)] {
+            let rewritten = graph_rewrite(symbolic(), original.clone(), &mut ());
+            prop_assert!(!Arc::ptr_eq(&original, &rewritten), "congruence rule did not fire for {}", original.tree());
+            for value in 0..=max {
+                prop_assert_eq!(
+                    eval_typed_uop(&original, "affine_x", ConstValue::Int(value)),
+                    eval_typed_uop(&rewritten, "affine_x", ConstValue::Int(value)),
+                    "typed affine rewrite mismatch for original {} and replacement {}",
+                    original.tree(),
+                    rewritten.tree(),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn typed_int8_divmod_rewrites_preserve_wrapping_runtime(
+        unsigned in any::<bool>(),
+        raw_x in any::<u8>(),
+        factor in 1u8..=8,
+        offset in 0u8..=8,
+    ) {
+        let (dtype, x_value, factor_value, offset_value, min, max) = if unsigned {
+            (
+                DType::UInt8,
+                ConstValue::UInt(raw_x as u64),
+                ConstValue::UInt(factor as u64),
+                ConstValue::UInt(offset as u64),
+                0,
+                u8::MAX as i64,
+            )
+        } else {
+            (
+                DType::Int8,
+                ConstValue::Int((raw_x as i8) as i64),
+                ConstValue::Int(factor as i64),
+                ConstValue::Int(offset as i64),
+                i8::MIN as i64,
+                i8::MAX as i64,
+            )
+        };
+        let x = UOp::var("typed_x", dtype.clone(), min, max);
+        let divisor = UOp::const_(dtype.clone(), factor_value);
+        let expression = x.mul(&divisor).add(&UOp::const_(dtype, offset_value));
+
+        for original in [expression.floor_div(&divisor), expression.mod_(&divisor)] {
+            let rewritten = graph_rewrite(symbolic(), original.clone(), &mut ());
+            prop_assert_eq!(
+                eval_typed_uop(&original, "typed_x", x_value),
+                eval_typed_uop(&rewritten, "typed_x", x_value),
+                "typed rewrite mismatch for original {} and replacement {}",
+                original.tree(),
+                rewritten.tree(),
+            );
         }
     }
 }

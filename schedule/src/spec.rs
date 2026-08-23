@@ -12,22 +12,19 @@
 //! Verification is gated by `SVOD_SPEC` (default on, like tinygrad's `SPEC=1`)
 //! so it can be disabled for perf. It turns a malformed kernel — a movement op
 //! that should have been lowered to index arithmetic, a `<N x float>` leaking
-//! into a memory index, a surviving `PtrCat` — into a recoverable `Err` *before*
+//! into a memory index — into a recoverable `Err` *before*
 //! the renderer turns it into a panic / malformed IR / GPU fault, so beam search
 //! skips the offending candidate cleanly.
 //!
 //! [`spec_program`] is a whitelist (port of tinygrad's `spec_program` +
 //! `spec_shared`): a lowered, pre-render kernel may contain only the ops below.
-//! Architectural divergences from tinygrad — Svod renders `Reduce`/`Wmma`/
-//! `Contract`/`Unroll`/`VConst` directly rather than expanding them before
-//! linearize, and wraps the body in `Op::Linear` — are accepted explicitly.
-//! [`spec_tensor`] stays in assertion mode (no enforced call site yet).
+//! Both tensor and program specs are whitelists, matching Tinygrad.
 
 use std::sync::Arc;
 
 use snafu::Snafu;
-use svod_dtype::DType;
-use svod_ir::{AddrSpace, BinaryOp, ConstValue, Op, TernaryOp, UOp};
+use svod_dtype::{AddrSpace, DType, DeviceSpec};
+use svod_ir::{BinaryOp, ConstValue, Op, TernaryOp, UOp, UnaryOp};
 
 #[derive(Debug, Clone, PartialEq, Eq, Snafu)]
 #[snafu(visibility(pub))]
@@ -82,6 +79,7 @@ pub fn type_verify(root: &Arc<UOp>, spec: &Spec) -> Result<(), SpecError> {
         // (`spec.py:39`); mirror that with a gated dump for diagnosis.
         if std::env::var_os("SVOD_SPEC_DEBUG").is_some() {
             eprintln!("[SPEC] reject #{index} {} (dtype {:?}): {reason}", u.op().as_ref(), u.dtype());
+            eprintln!("{}", u.tree());
         }
         return VerificationSnafu { index, op: u.op().as_ref().to_string(), dtype: format!("{:?}", u.dtype()), reason }
             .fail();
@@ -98,14 +96,42 @@ fn ok_if(valid: bool, reason: &'static str) -> Result<(), &'static str> {
     if valid { Ok(()) } else { Err(reason) }
 }
 
-/// `true` if `dt` is a pointer in the given address space (port of tinygrad's
-/// `isinstance(x.dtype, PtrDType) and x.dtype.addrspace == ...`).
-fn is_ptr_in(dt: &DType, want: AddrSpace) -> bool {
-    matches!(dt, DType::Ptr { addrspace, .. } if *addrspace == want)
-}
-
 fn matches_dtype(value: &Arc<UOp>, dtype: &DType) -> bool {
     value.dtype() == *dtype || UOp::is_invalid_marker(value)
+}
+
+fn is_invalid_index_value(value: &Arc<UOp>) -> bool {
+    if !value.dtype().is_bool() {
+        return false;
+    }
+    match value.op() {
+        Op::Const(cvh) => cvh.0 == ConstValue::Invalid,
+        Op::VConst { values } => !values.is_empty() && values.iter().all(|value| *value == ConstValue::Invalid),
+        Op::Stack { sources } => !sources.is_empty() && sources.iter().all(is_invalid_index_value),
+        _ => false,
+    }
+}
+
+fn legal_address(address: &Arc<UOp>) -> bool {
+    match address.op() {
+        Op::Index { .. } | Op::Shrink { .. } => true,
+        Op::Cast { src, .. } => matches!(src.op(), Op::Index { .. } | Op::Shrink { .. }),
+        _ => false,
+    }
+}
+
+// Tinygrad's CHECK_OOB defaults to disabled. The checks below mirror the
+// enabled-independent early exits; Svod has no dynamic CHECK_OOB context or
+// validate_index_with_z3 equivalent.
+fn validate_index(address: &Arc<UOp>) -> bool {
+    let Op::Index { indices, .. } = address.op() else { return true };
+    if indices.len() != 1 {
+        return true;
+    }
+    if UOp::is_invalid_marker(&indices[0]) {
+        return true;
+    }
+    true
 }
 
 // ============================================================================
@@ -125,6 +151,16 @@ fn rule_const() -> SpecRule {
             };
             Some(ok_if(valid, "CONST value type does not match its dtype"))
         }
+        Op::VConst { values } => {
+            let valid = values.len() == u.dtype().vcount()
+                && values.iter().all(|value| match value {
+                    ConstValue::Invalid | ConstValue::Bool(_) => u.dtype().is_bool(),
+                    ConstValue::Float(_) => u.dtype().is_float(),
+                    ConstValue::Int(_) | ConstValue::UInt(_) => u.dtype().is_int(),
+                });
+            Some(ok_if(valid, "VCONST value types do not match its dtype"))
+        }
+        Op::Stack { .. } if is_invalid_index_value(u) => Some(Ok(())),
         _ => None,
     })
 }
@@ -136,35 +172,50 @@ fn rule_alu() -> SpecRule {
         let result_base = u.dtype().base();
         match u.op() {
             // Unary preserves dtype.
-            Op::Unary(_, x) => Some(ok_if(matches_dtype(x, &u.dtype()), "unary operand dtype mismatch")),
+            Op::Unary(_, x) => {
+                Some(ok_if(matches_dtype(x, &u.dtype()) || x.dtype().is_weak(), "unary operand dtype mismatch"))
+            }
 
             // WHERE: bool condition, matching value/result dtypes (spec.py:56).
             Op::Ternary(TernaryOp::Where, c, x, y) => Some(ok_if(
-                c.dtype().is_bool() && matches_dtype(x, &u.dtype()) && matches_dtype(y, &u.dtype()),
+                c.dtype() == DType::Bool
+                    && (matches_dtype(x, &u.dtype()) || x.dtype().is_weak())
+                    && (matches_dtype(y, &u.dtype()) || y.dtype().is_weak()),
                 "WHERE condition must be bool with matching value/result dtypes",
             )),
             // MULACC: a*b+c, all sharing the result base.
-            Op::Ternary(TernaryOp::MulAcc, a, b, c) => {
-                Some(ok_if([a, b, c].iter().all(|s| matches_dtype(s, &u.dtype())), "MULACC operand dtype mismatch"))
-            }
+            Op::Ternary(TernaryOp::MulAcc, a, b, c) => Some(ok_if(
+                [a, b, c].iter().all(|s| matches_dtype(s, &u.dtype()) || s.dtype().is_weak()),
+                "MULACC operand dtype mismatch",
+            )),
 
             Op::Binary(op, x, y) => {
                 let (xb, yb) = (x.dtype().base(), y.dtype().base());
-                let valid = if op.is_comparison() {
-                    // CMPLT/CMPNE/CMPEQ: bool result, operands share base (spec.py:57).
-                    u.dtype().is_bool() && (matches_dtype(x, &y.dtype()) || matches_dtype(y, &x.dtype()))
-                } else if matches!(op, BinaryOp::Shl | BinaryOp::Shr) {
-                    // Shift distance may be a different int width (spec.py:59).
-                    u.dtype() == x.dtype() && y.dtype().is_int()
-                } else if matches!(op, BinaryOp::Idiv | BinaryOp::Mod) {
-                    // C-style int div/mod must be integer (spec.py:60).
-                    u.dtype().is_int() && xb == result_base && yb == result_base
-                } else if matches!(op, BinaryOp::Threefry) {
-                    // PRNG mixes uint widths; not a uniform-base ALU.
-                    true
-                } else {
-                    matches_dtype(x, &u.dtype()) && matches_dtype(y, &u.dtype())
-                };
+                let valid =
+                    if matches!(op, BinaryOp::And | BinaryOp::Or | BinaryOp::Xor | BinaryOp::Shl | BinaryOp::Shr)
+                        && (x.dtype().is_float() || y.dtype().is_float())
+                    {
+                        false
+                    } else if op.is_comparison() {
+                        // CMPLT/CMPNE/CMPEQ: bool result, operands share base (spec.py:57).
+                        u.dtype() == DType::Bool
+                            && (matches_dtype(x, &y.dtype())
+                                || matches_dtype(y, &x.dtype())
+                                || x.dtype().is_weak()
+                                || y.dtype().is_weak())
+                    } else if matches!(op, BinaryOp::Shl | BinaryOp::Shr) {
+                        // Same-dtype shifts use the generic ALU rule. The only
+                        // differing shift-count dtype accepted by the pinned rule
+                        // is uint32.
+                        (matches_dtype(x, &u.dtype()) || x.dtype().is_weak())
+                            && (matches_dtype(y, &u.dtype()) || y.dtype().is_weak() || y.dtype() == DType::UInt32)
+                    } else if matches!(op, BinaryOp::FloorDiv | BinaryOp::FloorMod | BinaryOp::CDiv | BinaryOp::CMod) {
+                        // Integer div/mod variants must be integer (spec.py:60).
+                        u.dtype().is_int() && xb == result_base && yb == result_base
+                    } else {
+                        (matches_dtype(x, &u.dtype()) || x.dtype().is_weak())
+                            && (matches_dtype(y, &u.dtype()) || y.dtype().is_weak())
+                    };
                 Some(ok_if(valid, "binary operand/result dtype mismatch"))
             }
             _ => None,
@@ -184,6 +235,7 @@ fn rule_stack() -> SpecRule {
             Some(ok_if(
                 sources.iter().all(|source| {
                     source.shape().ok().flatten() == first_shape
+                        && source.dtype().vcount() == 1
                         && (matches_dtype(source, &u.dtype()) || source.dtype().is_weak())
                 }),
                 "STACK sources must have matching shapes and scalar dtype",
@@ -196,19 +248,44 @@ fn rule_stack() -> SpecRule {
 /// `spec.py:67` — RANGE dtype matches its bound's dtype.
 fn rule_range() -> SpecRule {
     Box::new(|u| match u.op() {
-        Op::Range { end, .. } => Some(ok_if(matches_dtype(end, &u.dtype()), "RANGE dtype must match its bound dtype")),
+        Op::Range { end, axis_id, .. } => Some(ok_if(
+            !axis_id.path().is_empty() && matches_dtype(end, &u.dtype()),
+            "RANGE requires a non-empty integer axis path and matching bound dtype",
+        )),
         _ => None,
     })
 }
 
-/// `spec.py:70` — every `INDEX`/`POINTER_INDEX` address operand must be integer.
+/// `spec.py:82` — every `INDEX` address operand must be integer.
 fn rule_index_integer() -> SpecRule {
     Box::new(|u| match u.op() {
         Op::Index { indices, .. } => Some(ok_if(
-            indices.iter().all(|idx| idx.dtype().is_int() || UOp::is_invalid_marker(idx)),
+            indices.iter().all(|idx| idx.dtype().is_int() || is_invalid_index_value(idx)),
             "non-integer value reached a memory INDEX operand",
         )),
-        Op::PointerIndex { offset, .. } => Some(ok_if(offset.dtype().is_int(), "non-integer offset in POINTER_INDEX")),
+        _ => None,
+    })
+}
+
+/// `spec.py:117-122` — gated and ungated memory accesses have four exact source
+/// layouts and use INDEX/SHRINK addresses (optionally cast).
+fn rule_memory() -> SpecRule {
+    Box::new(|u| match u.op() {
+        Op::Load { index, alt: None, gate: None } if legal_address(index) => {
+            Some(ok_if(validate_index(index), "invalid ungated LOAD"))
+        }
+        Op::Load { index, alt: Some(alt), gate: Some(gate) } if legal_address(index) && gate.dtype() == DType::Bool => {
+            Some(ok_if(
+                matches_dtype(alt, &u.dtype()) && validate_index(index),
+                "gated LOAD requires a matching alt and valid index",
+            ))
+        }
+        Op::Store { index, gate: None, .. } if legal_address(index) => {
+            Some(ok_if(validate_index(index), "invalid ungated STORE"))
+        }
+        Op::Store { index, gate: Some(gate), .. } if legal_address(index) && gate.dtype() == DType::Bool => {
+            Some(ok_if(validate_index(index), "invalid gated STORE"))
+        }
         _ => None,
     })
 }
@@ -217,10 +294,15 @@ fn rule_index_integer() -> SpecRule {
 /// gpudims has replaced ranges with SPECIAL on the GPU path, a `SPECIAL`).
 fn rule_end() -> SpecRule {
     Box::new(|u| match u.op() {
-        Op::End { ranges, .. } => Some(ok_if(
-            ranges.iter().all(|r| matches!(r.op(), Op::Range { .. } | Op::Special { .. })),
-            "END closes a non-RANGE/SPECIAL operand",
-        )),
+        Op::End { ranges, .. } if ranges.iter().all(|r| matches!(r.op(), Op::Range { .. })) => Some(Ok(())),
+        Op::End { ranges, .. }
+            if ranges.len() == 2
+                && matches!(ranges[0].op(), Op::Range { .. })
+                && ranges[0].dtype() == DType::Void
+                && ranges[1].dtype() == DType::Bool =>
+        {
+            Some(Ok(()))
+        }
         _ => None,
     })
 }
@@ -228,9 +310,52 @@ fn rule_end() -> SpecRule {
 /// `spec.py:88-89` — PARAM carries structured metadata and its storage dtype.
 fn rule_param() -> SpecRule {
     Box::new(|u| match u.op() {
-        Op::Param { arg, .. } => Some(ok_if(
-            arg.dtype == u.dtype() && arg.addrspace == Some(AddrSpace::Global),
-            "PARAM dtype/address space must match its metadata",
+        // ParamArg is statically present in Svod's PARAM variant.
+        Op::Param { .. } => Some(Ok(())),
+        _ => None,
+    })
+}
+
+/// Pinned `spec.py:228`: GETADDR is a scalar uint64 address for a concrete
+/// device and accepts exactly BUFFER/PARAM storage, optionally through AFTER.
+fn rule_getaddr() -> SpecRule {
+    fn storage_source(source: &Arc<UOp>) -> bool {
+        match source.op() {
+            Op::Buffer { arg, .. } | Op::Param { arg, .. } => arg.addrspace.is_some(),
+            Op::After { passthrough, .. } => storage_source(passthrough),
+            _ => false,
+        }
+    }
+
+    Box::new(|u| match u.op() {
+        Op::GetAddr { src, device } => Some(ok_if(
+            u.dtype() == DType::UInt64 && storage_source(src) && is_device(device),
+            "GETADDR requires BUFFER/PARAM storage, uint64 result, and a concrete device",
+        )),
+        _ => None,
+    })
+}
+
+fn is_device(device: &DeviceSpec) -> bool {
+    match device {
+        DeviceSpec::Cpu
+        | DeviceSpec::Cuda { .. }
+        | DeviceSpec::Amd { .. }
+        | DeviceSpec::Metal { .. }
+        | DeviceSpec::WebGpu
+        | DeviceSpec::Disk { .. } => true,
+    }
+}
+
+/// Pinned `spec.py:90-91`: lowered storage is exactly one shape source plus
+/// ParamArg metadata, and only REG/LOCAL BUFFERs are legal in programs.
+fn rule_program_buffer() -> SpecRule {
+    Box::new(|u| match u.op() {
+        Op::Buffer { arg, .. } => Some(ok_if(
+            matches!(arg.addrspace, Some(AddrSpace::Reg | AddrSpace::Local))
+                && arg.device.is_none()
+                && u.dtype() == arg.dtype,
+            "program BUFFER must be a structured REG/LOCAL allocation",
         )),
         _ => None,
     })
@@ -240,60 +365,67 @@ fn rule_param() -> SpecRule {
 fn rule_group() -> SpecRule {
     Box::new(|u| match u.op() {
         Op::Group { sources } => Some(ok_if(
-            sources.iter().all(|s| matches!(s.op(), Op::Store { .. } | Op::Group { .. } | Op::Noop)),
-            "GROUP may only hold STORE/GROUP/NOOP",
+            u.dtype() == DType::Void
+                && sources.iter().all(|s| {
+                    matches!(s.op(), Op::Store { .. } | Op::Group { .. } | Op::Noop | Op::Ins { .. } | Op::End { .. })
+                }),
+            "GROUP must be void and may only hold GROUP/STORE/NOOP/INS/END",
         )),
         _ => None,
     })
 }
 
-/// `spec.py:81` — DEFINE_LOCAL is a local-address-space pointer.
-fn rule_define_local() -> SpecRule {
+fn rule_after() -> SpecRule {
     Box::new(|u| match u.op() {
-        Op::DefineLocal(_) => {
-            Some(ok_if(is_ptr_in(&u.dtype(), AddrSpace::Local), "DEFINE_LOCAL must be a LOCAL pointer"))
+        Op::After { passthrough, .. }
+            if passthrough.op().is_movement()
+                || matches!(
+                    passthrough.op(),
+                    Op::Param { .. }
+                        | Op::Buffer { .. }
+                        | Op::Index { .. }
+                        | Op::After { .. }
+                        | Op::BitCast { .. }
+                        | Op::Contiguous { .. }
+                        | Op::Ins { .. }
+                ) =>
+        {
+            Some(ok_if(matches_dtype(passthrough, &u.dtype()), "AFTER passthrough dtype mismatch"))
         }
         _ => None,
     })
 }
 
-/// `spec.py:96` — SPECIAL is indexed by an integer bound and named.
-fn rule_special() -> SpecRule {
+fn rule_shared_structural() -> SpecRule {
     Box::new(|u| match u.op() {
-        Op::Special { end, .. } => Some(ok_if(end.dtype().is_int(), "SPECIAL bound must be integer")),
+        Op::Sink { .. } => Some(ok_if(u.dtype() == DType::Void, "SINK must be void")),
+        Op::Noop => Some(Ok(())),
+        Op::Cast { dtype, .. } | Op::BitCast { dtype, .. } => {
+            Some(ok_if(*dtype == u.dtype(), "CAST arg dtype must equal result dtype"))
+        }
+        Op::Custom { .. } | Op::CustomI { .. } => Some(Ok(())),
+        Op::Call { body, .. } if body.dtype() != DType::Void => {
+            Some(ok_if(matches_dtype(body, &DType::UInt64), "non-void CALL target must be uint64"))
+        }
+        Op::Barrier { .. } => Some(ok_if(u.dtype() == DType::Void, "BARRIER must be void")),
+        Op::Wmma { .. } => Some(Ok(())),
+        Op::Ins { .. } => Some(Ok(())),
         _ => None,
     })
 }
 
-/// Structural ops with no further dtype invariant — accepted as in `spec_shared`
-/// (SINK/NOOP/CAST/BITCAST/LOAD/STORE/WMMA/BARRIER/AFTER/CUSTOM/DEFINE_VAR/
-/// DEFINE_REG/BIND). `Call` is shared (`spec_tensor` CALL, spec.py:143).
-fn rule_shared_structural() -> SpecRule {
-    Box::new(|u| {
-        matches!(
-            u.op(),
-            Op::Sink { .. }
-                | Op::Noop
-                | Op::Cast { .. }
-                | Op::BitCast { .. }
-                | Op::Load { .. }
-                | Op::Store { .. }
-                | Op::Wmma { .. }
-                | Op::Barrier { .. }
-                | Op::After { .. }
-                | Op::Custom { .. }
-                | Op::CustomI { .. }
-                | Op::Call { .. }
-                | Op::DefineVar { .. }
-                | Op::DefineReg { .. }
-                | Op::Bind { .. }
-        )
-        .then_some(Ok(()))
+fn rule_tensor_store() -> SpecRule {
+    Box::new(|u| match u.op() {
+        Op::Store { gate: None, .. } => Some(ok_if(u.dtype() == DType::Void, "tensor STORE must be void")),
+        _ => None,
     })
 }
 
 fn spec_shared() -> Vec<SpecRule> {
     vec![
+        // Pinned spec.py:49-129 order. Some adjacent, disjoint Python patterns
+        // share a Rust closure, but their first-match precedence is unchanged.
+        rule_shared_structural(),
         rule_const(),
         rule_stack(),
         rule_alu(),
@@ -301,87 +433,96 @@ fn spec_shared() -> Vec<SpecRule> {
         rule_index_integer(),
         rule_end(),
         rule_param(),
+        rule_program_buffer(),
         rule_group(),
-        rule_define_local(),
-        rule_special(),
-        rule_shared_structural(),
+        rule_after(),
+        rule_memory(),
+        rule_tensor_store(),
     ]
 }
 
 // ============================================================================
 // spec_program — additionally valid in lowered programs (port of `spec_program`,
-// spec.py:200) plus Svod architectural ops
+// spec.py:203)
 // ============================================================================
 
-/// `spec.py:205` — movement ops are lowered to index arithmetic before a kernel
+/// `spec.py:205` — weak dtypes are legal in the tensor graph but must be
+/// committed before a program. This must run before the shared CONST rule.
+fn rule_no_weak_dtype() -> SpecRule {
+    Box::new(|u| u.dtype().is_weak().then_some(Err("weak dtype must be lowered before a program")))
+}
+
+/// Typed constants reaching a program must already carry the exact semantic
+/// value obtained by committing each lane to their declared scalar dtype.
+fn rule_canonical_const() -> SpecRule {
+    Box::new(|u| {
+        let values: &[ConstValue] = match u.op() {
+            Op::Const(value) if value.0 != ConstValue::Invalid => std::slice::from_ref(&value.0),
+            Op::VConst { values } => values,
+            _ => return None,
+        };
+        let scalar_dtype = u.dtype().scalar_dtype();
+        (!values.iter().all(|value| {
+            *value == ConstValue::Invalid || value.cast(&scalar_dtype).is_some_and(|committed| committed == *value)
+        }))
+        .then_some(Err("typed constant value is not canonical for its dtype"))
+    })
+}
+
+/// `spec.py:208` — the buffer-cropping SHRINK used by memory accesses is the
+/// sole movement op allowed in a program. This ordered exception must run
+/// before the general movement rejection.
+fn rule_special_shrink() -> SpecRule {
+    Box::new(|u| match u.op() {
+        Op::Shrink { src, sizes, .. }
+            if matches!(src.op(), Op::Param { .. } | Op::Buffer { .. } | Op::After { .. })
+                && matches!(sizes.op(), Op::Const(_)) =>
+        {
+            Some(Ok(()))
+        }
+        _ => None,
+    })
+}
+
+/// `spec.py:210-211` — movement ops are lowered to index arithmetic before a kernel
 /// is linearized; a surviving one is a lowering bug.
 fn rule_no_movement() -> SpecRule {
     Box::new(|u| u.op().is_movement().then_some(Err("movement op must be lowered away before a program")))
 }
 
-/// `spec.py:208` — Svod models `Invalid` as its own op (vs tinygrad's
+/// `spec.py:216-217` — Svod models `Invalid` as its own op (vs tinygrad's
 /// `CONST(arg=Invalid)`); it must be folded out before a program.
 fn rule_no_invalid() -> SpecRule {
     Box::new(|u| UOp::is_invalid_marker(u).then_some(Err("Invalid constant must be folded out before a program")))
 }
 
-/// `PtrCat`/`Cat` (tinygrad PTRCAT/VCAT) must be distributed into scalar
-/// loads/stores by the devectorizer; they have no rendering (spec.py:250 — "need
-/// to be deleted").
-fn rule_no_ptrcat_cat() -> SpecRule {
-    Box::new(|u| match u.op() {
-        Op::PtrCat { .. } => Some(Err("PtrCat survived devectorization; must be distributed into scalar accesses")),
-        Op::Cat { .. } => Some(Err("Cat (VCAT) survived devectorization; must be distributed into scalar accesses")),
-        _ => None,
-    })
-}
-
-/// `spec.py:215` (STACK) — VECTORIZE collects exactly `vcount` lane values, each
-/// the scalar form of the result dtype.
-fn rule_vectorize() -> SpecRule {
-    Box::new(|u| match u.op() {
-        Op::Vectorize { elements } => {
-            let scalar = u.dtype().scalar_dtype();
-            Some(ok_if(
-                elements.len() == u.dtype().vcount() && elements.iter().all(|e| e.dtype() == scalar),
-                "VECTORIZE lane count/dtype does not match its vector dtype",
-            ))
-        }
-        _ => None,
-    })
-}
-
-/// `spec.py:216,242` — GEP's output lane count matches its index count (covers
-/// both single-lane scalar extracts and multi-lane shuffles).
-fn rule_gep() -> SpecRule {
-    Box::new(|u| match u.op() {
-        Op::Gep { indices, .. } => {
-            Some(ok_if(u.dtype().vcount() == indices.len(), "GEP lane count does not match its index count"))
-        }
-        _ => None,
-    })
-}
-
 /// `spec.py:219-220` — IF has a bool gate; ENDIF closes an IF.
 fn rule_if() -> SpecRule {
     Box::new(|u| match u.op() {
-        Op::If { condition, .. } => Some(ok_if(condition.dtype().is_bool(), "IF condition must be bool")),
-        Op::EndIf { .. } => Some(Ok(())),
+        Op::If { condition, body } => Some(ok_if(
+            u.dtype() == DType::Void
+                && condition.dtype() == DType::Bool
+                && body.len() == 1
+                && matches!(body[0].op(), Op::Cast { .. } | Op::Index { .. } | Op::Shrink { .. }),
+            "IF must be void with a bool condition and one CAST/INDEX/SHRINK dedup source",
+        )),
+        Op::EndIf { if_op } => Some(ok_if(
+            u.dtype() == DType::Void && matches!(if_op.op(), Op::If { .. }),
+            "ENDIF must be void and close an IF",
+        )),
         _ => None,
     })
 }
 
-/// Svod architectural ops that legitimately survive into a linearized kernel,
-/// unlike tinygrad which expands them earlier: the `Op::Linear` body wrapper,
-/// vector constants, accumulator reductions, and the WMMA expander ops. Accepted
-/// structurally (their internal invariants are enforced where they are built).
-fn rule_program_structural() -> SpecRule {
-    Box::new(|u| {
-        matches!(
-            u.op(),
-            Op::Linear { .. } | Op::VConst { .. } | Op::Reduce { .. } | Op::Contract { .. } | Op::Unroll { .. }
-        )
-        .then_some(Ok(()))
+/// `spec.py:223-224` — SPECIAL has an int32 bound and result after index
+/// lowering. Its name is statically represented as a String in Svod's schema.
+fn rule_program_special() -> SpecRule {
+    Box::new(|u| match u.op() {
+        Op::Special { end, .. } => Some(ok_if(
+            u.dtype() == DType::Int32 && end.dtype() == DType::Int32,
+            "SPECIAL bound and result must be int32 after index lowering",
+        )),
+        _ => None,
     })
 }
 
@@ -389,20 +530,221 @@ fn rule_program_structural() -> SpecRule {
 /// whitelist: program-only rules first, then the shared rules.
 pub fn spec_program() -> Spec {
     let mut rules = vec![
+        rule_no_weak_dtype(),
+        rule_canonical_const(),
+        rule_special_shrink(),
         rule_no_movement(),
+        // Pinned spec.py:213-214 repeats the REG/LOCAL BUFFER allowance here
+        // before INVALID, then appends spec_shared (which contains it again).
+        rule_program_buffer(),
         rule_no_invalid(),
-        rule_no_ptrcat_cat(),
-        rule_vectorize(),
-        rule_gep(),
         rule_if(),
-        rule_program_structural(),
+        rule_program_special(),
     ];
     rules.extend(spec_shared());
     Spec { rules, whitelist: true }
 }
 
-/// Spec for the tensor graph (`spec_tensor`, spec.py:116). Currently the shared
-/// rules in assertion mode — there is no enforced tensor-graph call site yet.
+/// Runtime command-queue graph spec (`spec_hcq` at the pinned commit).
+/// GETADDR intentionally lives here, not in kernel `spec_program`.
+pub fn spec_hcq() -> Spec {
+    let mut rules = vec![rule_getaddr()];
+    rules.extend(spec_shared());
+    Spec { rules, whitelist: true }
+}
+
+fn rule_tensor_unary() -> SpecRule {
+    Box::new(|u| match u.op() {
+        Op::Unary(UnaryOp::Sin | UnaryOp::Log2 | UnaryOp::Exp2 | UnaryOp::Sqrt | UnaryOp::Reciprocal, _) => {
+            Some(ok_if(u.dtype().is_float(), "transcendental unary op must be float"))
+        }
+        _ => None,
+    })
+}
+
+/// Pinned `spec.py:140-142`: tensor BUFFERs are GLOBAL storage with a device.
+fn rule_tensor_buffer() -> SpecRule {
+    Box::new(|u| match u.op() {
+        Op::Buffer { shape, arg } if arg.addrspace == Some(AddrSpace::Global) => Some(ok_if(
+            arg.device.is_some() && u.dtype() == arg.dtype && matches_dtype(shape, &DType::WeakInt),
+            "tensor BUFFER must be structured GLOBAL storage with a device",
+        )),
+        _ => None,
+    })
+}
+
+fn rule_tensor_slice() -> SpecRule {
+    Box::new(|u| match u.op() {
+        Op::Slice { buffer, offset, .. } => Some(ok_if(
+            matches!(offset.op(), Op::Const(_))
+                && offset.dtype() == DType::WeakInt
+                && matches!(buffer.base().op(), Op::Buffer { .. } | Op::Param { .. } | Op::Stage { .. }),
+            "SLICE requires buffer-backed storage and a constant weakint offset",
+        )),
+        _ => None,
+    })
+}
+
+/// STAGE is an intermediate tensor operation transformed to BUFFER before lowering.
+fn rule_tensor_stage() -> SpecRule {
+    Box::new(|u| matches!(u.op(), Op::Stage { .. }).then_some(Ok(())))
+}
+
+fn rule_tensor_bind() -> SpecRule {
+    Box::new(|u| match u.op() {
+        Op::Bind { var, value } => Some(ok_if(
+            matches!(var.op(), Op::Param { .. })
+                && [DType::Int32, DType::Int64, DType::WeakInt].contains(&u.dtype())
+                && matches!(value.op(), Op::Const(_))
+                && value.dtype() == u.dtype(),
+            "BIND must bind an integer PARAM to a matching constant",
+        )),
+        _ => None,
+    })
+}
+
+fn rule_tensor_call_function_tuple() -> SpecRule {
+    Box::new(|u| match u.op() {
+        // CustomFunctionKind is a closed enum, so the Python `isinstance(arg,
+        // str)` construction check is enforced by the Rust schema.
+        Op::CustomFunction { .. } => Some(Ok(())),
+        Op::Call { body, .. }
+            if u.dtype() == DType::Void
+                && matches!(
+                    body.op(),
+                    Op::Sink { .. }
+                        | Op::Linear { .. }
+                        | Op::Program { .. }
+                        | Op::Copy { .. }
+                        | Op::Slice { .. }
+                        | Op::CustomFunction { .. }
+                ) =>
+        {
+            Some(Ok(()))
+        }
+        Op::Function { body, .. } => Some(ok_if(
+            u.dtype() == DType::Void && matches!(body.op(), Op::Tuple { .. }),
+            "FUNCTION must be void and start with TUPLE",
+        )),
+        Op::Tuple { .. } => Some(ok_if(u.dtype() == DType::Void, "TUPLE must be void")),
+        Op::GetTuple { src, index } => {
+            let tuple = match src.op() {
+                Op::Tuple { src } => Some(src),
+                Op::Function { body, .. } => match body.op() {
+                    Op::Tuple { src } => Some(src),
+                    _ => None,
+                },
+                _ => None,
+            };
+            Some(ok_if(
+                tuple.is_some_and(|items| *index < items.len() && matches_dtype(&items[*index], &u.dtype())),
+                "GETTUPLE index/source/dtype mismatch",
+            ))
+        }
+        _ => None,
+    })
+}
+
+fn rule_tensor_special_movement_reduce() -> SpecRule {
+    Box::new(|u| match u.op() {
+        Op::Special { end, .. } => Some(ok_if(
+            end.dtype() == DType::WeakInt && matches_dtype(end, &u.dtype()),
+            "tensor SPECIAL must preserve weakint dtype",
+        )),
+        Op::Reshape { .. } | Op::Expand { .. } => Some(Ok(())),
+        Op::Pad { begin_pads, end_pads, .. } | Op::Shrink { offsets: begin_pads, sizes: end_pads, .. } => Some(ok_if(
+            begin_pads.shape().ok().flatten() == end_pads.shape().ok().flatten(),
+            "PAD/SHRINK bound shapes must match",
+        )),
+        Op::Permute { .. } | Op::Flip { .. } => Some(Ok(())),
+        Op::Reduce { ranges, .. } => Some(ok_if(
+            ranges.iter().all(|r| [DType::WeakInt, DType::Int32].contains(&r.dtype())),
+            "REDUCE ranges must be weakint/int32",
+        )),
+        _ => None,
+    })
+}
+
+fn rule_tensor_copy_multi_contiguous() -> SpecRule {
+    fn mstack_len(source: &Arc<UOp>) -> Option<usize> {
+        match source.op() {
+            Op::MStack { buffers } => Some(buffers.len()),
+            op if op.is_movement() => op.sources().first().and_then(|source| mstack_len(source)),
+            _ => None,
+        }
+    }
+
+    Box::new(|u| match u.op() {
+        Op::Copy { src, device } => {
+            Some(ok_if(matches_dtype(src, &u.dtype()) && is_device(device), "COPY dtype/device mismatch"))
+        }
+        Op::AllReduce { src, device, .. } => {
+            Some(ok_if(matches_dtype(src, &u.dtype()) && is_device(device), "ALLREDUCE dtype/device mismatch"))
+        }
+        // Svod represents the supported tuple-device subset explicitly as
+        // MSTACK. Keep this strict: arbitrary MSELECT sources are not target
+        // tensor forms and must not reach multi_pm.
+        Op::MSelect { buffer, device_index } => Some(ok_if(
+            mstack_len(buffer).is_some_and(|len| *device_index < len) && matches_dtype(buffer, &u.dtype()),
+            "MSELECT requires an in-range MSTACK source with matching dtype",
+        )),
+        Op::MStack { buffers } => Some(ok_if(
+            !buffers.is_empty()
+                && buffers.iter().all(|s| matches_dtype(s, &u.dtype()))
+                && (buffers.iter().all(|s| s.device_spec().is_some())
+                    || (!buffers.is_empty()
+                        && buffers.iter().all(|s| Arc::ptr_eq(s, &buffers[0]))
+                        && buffers[0].device_spec().is_none())),
+            "MSTACK device/source mismatch",
+        )),
+        // Op::Multi is Svod's single-axis representation of tensor UNSHARD.
+        Op::Multi { src, axis } => Some(ok_if(
+            matches_dtype(src, &u.dtype()) && src.shape().ok().flatten().is_some_and(|shape| *axis < shape.len()),
+            "MULTI must preserve dtype and shard an existing source axis",
+        )),
+        Op::Contiguous { src, opts } => Some(ok_if(
+            opts.is_empty() && matches_dtype(src, &u.dtype()),
+            "CONTIGUOUS must have no arg and preserve dtype",
+        )),
+        Op::Detach { src } | Op::ContiguousBackward { src } => {
+            Some(ok_if(matches_dtype(src, &u.dtype()), "contiguous/detach dtype mismatch"))
+        }
+        _ => None,
+    })
+}
+
+fn rule_tensor_codegen() -> SpecRule {
+    Box::new(|u| match u.op() {
+        Op::Linear { .. } => Some(ok_if(u.dtype() == DType::Void, "LINEAR must be void")),
+        Op::Source { .. } => Some(ok_if(u.dtype() == DType::Void, "SOURCE must be void")),
+        Op::ProgramBinary { .. } => Some(ok_if(u.dtype() == DType::UInt8, "BINARY must be uint8")),
+        Op::Program { sink, linear, source, binary, .. } => Some(ok_if(
+            u.dtype() == DType::Void
+                && matches!(sink.op(), Op::Sink { .. })
+                && source.as_ref().is_none_or(|x| matches!(x.op(), Op::Source { .. }))
+                && binary.as_ref().is_none_or(|x| matches!(x.op(), Op::ProgramBinary { .. }))
+                && linear.as_ref().is_none_or(|x| matches!(x.op(), Op::Linear { .. }))
+                && !(source.is_some() && linear.is_none())
+                && !(binary.is_some() && source.is_none()),
+            "invalid progressive PROGRAM sources",
+        )),
+        _ => None,
+    })
+}
+
+/// Tensor-graph whitelist (`spec_tensor`, pinned spec.py:136-200).
 pub fn spec_tensor() -> Spec {
-    Spec { rules: spec_shared(), whitelist: false }
+    let mut rules = vec![
+        rule_tensor_unary(),
+        rule_tensor_buffer(),
+        rule_tensor_slice(),
+        rule_tensor_stage(),
+        rule_tensor_bind(),
+        rule_tensor_call_function_tuple(),
+        rule_tensor_special_movement_reduce(),
+        rule_tensor_copy_multi_contiguous(),
+        rule_tensor_codegen(),
+    ];
+    rules.extend(spec_shared());
+    Spec { rules, whitelist: true }
 }

@@ -10,6 +10,19 @@ use svod_dtype::DType;
 use svod_ir::pattern::RewriteResult;
 use svod_ir::{BinaryOp, ConstValue, Op, UOp};
 
+#[test]
+fn test_getaddr_pattern() {
+    let matcher = patterns! {
+        GetAddr(src) ~> src
+    };
+    let buffer = UOp::new_buffer(svod_dtype::DeviceSpec::Cpu, 4, DType::UInt8);
+    let address = buffer.getaddr(None);
+    match matcher.rewrite(&address, &mut ()) {
+        RewriteResult::Rewritten(rewritten) => assert!(Arc::ptr_eq(&rewritten, &buffer)),
+        _ => panic!("expected GETADDR pattern to match"),
+    }
+}
+
 /// Helper to create a binary operation UOp
 fn binary(op: BinaryOp, lhs: Arc<UOp>, rhs: Arc<UOp>) -> Arc<UOp> {
     let dtype = lhs.dtype();
@@ -575,22 +588,22 @@ fn test_nested_struct_field_extraction() {
     use svod_ir::types::{AddrSpace, BufferizeOpts};
 
     // Test nested struct field extraction:
-    // Index { buffer: Bufferize { compute, ranges, .. }, indices, gate: None }
-    // This should extract `ranges` from the inner Bufferize AND `indices` from the outer Index.
+    // Index { buffer: Stage { compute, ranges, .. }, indices }
+    // This should extract `ranges` from the inner Stage AND `indices` from the outer Index.
     //
     // Note: We use a simple comparison function for testing since ranges_equal is not available here
     let matcher = patterns! {
-        Index { buffer: Bufferize { compute, ranges, .. }, indices, gate: None }
+        Index { buffer: Stage { compute, ranges, .. }, indices }
             if ranges.len() == indices.len() ~> compute
     };
 
-    let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global, removable: true };
+    let opts = BufferizeOpts { device: None, local_axis: None, addrspace: AddrSpace::Global, removable: true };
     let compute = UOp::native_const(42.0f32);
     let range1 = UOp::range(UOp::index_const(10), 0);
     let range2 = UOp::range(UOp::index_const(20), 1);
 
-    // Create: INDEX(BUFFERIZE(compute, [r1, r2]), [r1, r2])
-    let buf = UOp::bufferize(compute.clone(), vec![range1.clone(), range2.clone()], opts);
+    // Create: INDEX(STAGE(compute, [r1, r2]), [r1, r2])
+    let buf = UOp::stage(compute.clone(), vec![range1.clone(), range2.clone()], opts);
     let idx = UOp::index().buffer(buf).indices(vec![range1.clone(), range2.clone()]).call().unwrap();
 
     // Should match and return compute (ranges.len() == indices.len())
@@ -598,7 +611,7 @@ fn test_nested_struct_field_extraction() {
         RewriteResult::Rewritten(r) => {
             assert!(Arc::ptr_eq(&r, &compute), "Should extract compute from nested pattern");
         }
-        _ => panic!("Nested Index(Bufferize) pattern should match with extracted ranges"),
+        _ => panic!("Nested Index(Stage) pattern should match with extracted ranges"),
     }
 }
 
@@ -608,17 +621,17 @@ fn test_nested_struct_field_extraction_mismatch() {
 
     // Test that guard fails when ranges.len() != indices.len()
     let matcher = patterns! {
-        Index { buffer: Bufferize { compute, ranges, .. }, indices, gate: None }
+        Index { buffer: Stage { compute, ranges, .. }, indices }
             if ranges.len() == indices.len() ~> compute
     };
 
-    let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global, removable: true };
+    let opts = BufferizeOpts { device: None, local_axis: None, addrspace: AddrSpace::Global, removable: true };
     let compute = UOp::native_const(42.0f32);
     let range1 = UOp::range(UOp::index_const(10), 0);
     let range2 = UOp::range(UOp::index_const(20), 1);
 
-    // Create: INDEX(BUFFERIZE(compute, [r1, r2]), [r1]) - different lengths
-    let buf = UOp::bufferize(compute.clone(), vec![range1.clone(), range2], opts);
+    // Create: INDEX(STAGE(compute, [r1, r2]), [r1]) - different lengths
+    let buf = UOp::stage(compute.clone(), vec![range1.clone(), range2], opts);
     let idx = UOp::index().buffer(buf).indices(vec![range1]).call().unwrap();
 
     // Should NOT match because ranges.len() (2) != indices.len() (1)
@@ -1053,42 +1066,42 @@ fn test_rest_pattern_with_guard() {
 fn test_bufferize_variable_ranges() {
     use svod_ir::types::{AddrSpace, BufferizeOpts};
 
-    // Test Bufferize { compute: c, .. } with varying number of ranges
-    // This pattern should match Bufferize with 0, 1, 2, or more ranges
+    // Test Stage { compute: c, .. } with varying number of ranges
+    // This pattern should match Stage with 0, 1, 2, or more ranges
     let matcher = patterns! {
-        Bufferize { compute: c, .. } if matches!(c.op(), Op::Const(_)) ~> c
+        Stage { compute: c, .. } if matches!(c.op(), Op::Const(_)) ~> c
     };
 
-    let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global, removable: true };
+    let opts = BufferizeOpts { device: None, local_axis: None, addrspace: AddrSpace::Global, removable: true };
     let const_val = UOp::native_const(42.0f32);
     let range1 = UOp::range(UOp::index_const(10), 0);
     let range2 = UOp::range(UOp::index_const(20), 1);
 
     // Test with 0 ranges
-    let buf0 = UOp::bufferize(const_val.clone(), vec![], opts.clone());
+    let buf0 = UOp::stage(const_val.clone(), vec![], opts.clone());
     match matcher.rewrite(&buf0, &mut ()) {
         RewriteResult::Rewritten(r) => {
             assert!(Arc::ptr_eq(&r, &const_val), "Should rewrite to const_val with 0 ranges");
         }
-        _ => panic!("Bufferize {{ compute: c, .. }} should match with 0 ranges"),
+        _ => panic!("Stage {{ compute: c, .. }} should match with 0 ranges"),
     }
 
     // Test with 1 range
-    let buf1 = UOp::bufferize(const_val.clone(), vec![range1.clone()], opts.clone());
+    let buf1 = UOp::stage(const_val.clone(), vec![range1.clone()], opts.clone());
     match matcher.rewrite(&buf1, &mut ()) {
         RewriteResult::Rewritten(r) => {
             assert!(Arc::ptr_eq(&r, &const_val), "Should rewrite to const_val with 1 range");
         }
-        _ => panic!("Bufferize {{ compute: c, .. }} should match with 1 range"),
+        _ => panic!("Stage {{ compute: c, .. }} should match with 1 range"),
     }
 
     // Test with 2 ranges
-    let buf2 = UOp::bufferize(const_val.clone(), vec![range1, range2], opts);
+    let buf2 = UOp::stage(const_val.clone(), vec![range1, range2], opts);
     match matcher.rewrite(&buf2, &mut ()) {
         RewriteResult::Rewritten(r) => {
             assert!(Arc::ptr_eq(&r, &const_val), "Should rewrite to const_val with 2 ranges");
         }
-        _ => panic!("Bufferize {{ compute: c, .. }} should match with 2 ranges"),
+        _ => panic!("Stage {{ compute: c, .. }} should match with 2 ranges"),
     }
 }
 
@@ -1120,53 +1133,21 @@ fn test_index_variable_indices() {
         }
         _ => panic!("Index {{ buffer: c, .. }} should match with 2 indices"),
     }
-
-    // Test with gate (optional field) - use index_gated constructor
-    let gate = UOp::const_(DType::Bool, ConstValue::Int(1));
-    let index_gated = UOp::index().buffer(const_val.clone()).indices(vec![idx1]).gate(gate).call().unwrap();
-    match matcher.rewrite(&index_gated, &mut ()) {
-        RewriteResult::Rewritten(r) => {
-            assert!(Arc::ptr_eq(&r, &const_val), "Should rewrite to const_val with gate");
-        }
-        _ => panic!("Index {{ buffer: c, .. }} should match with gate"),
-    }
 }
 
 #[test]
-fn test_index_gate_bare_binding() {
-    // Test that bare `gate` field binding extracts Option<Arc<UOp>>
-    // This tests if the DSL already supports optional field binding
+fn test_load_target_field_bindings() {
     let matcher = patterns! {
-        Index { buffer: b, indices: _, gate } => {
-            // gate should be Option<Arc<UOp>>
-            // indices should be SmallVec<[Arc<UOp>; 4]>
-            match gate {
-                Some(g) => Some(g.clone()),  // Return the gate if present
-                None => Some(b.clone()),      // Return the buffer if no gate
-            }
-        }
+        Load { index, alt: _, gate: _ } ~> index
     };
 
     let buffer = UOp::native_const(42.0f32);
     let idx = UOp::index_const(0);
-    let gate_val = UOp::const_(DType::Bool, ConstValue::Int(1));
-
-    // Test ungated index
-    let ungated = UOp::index().buffer(buffer.clone()).indices(vec![idx.clone()]).call().unwrap();
-    match matcher.rewrite(&ungated, &mut ()) {
-        RewriteResult::Rewritten(r) => {
-            assert!(Arc::ptr_eq(&r, &buffer), "Should return buffer when no gate");
-        }
-        _ => panic!("Pattern should match ungated Index"),
-    }
-
-    // Test gated index
-    let gated = UOp::index().buffer(buffer.clone()).indices(vec![idx]).gate(gate_val.clone()).call().unwrap();
-    match matcher.rewrite(&gated, &mut ()) {
-        RewriteResult::Rewritten(r) => {
-            assert!(Arc::ptr_eq(&r, &gate_val), "Should return gate when present");
-        }
-        _ => panic!("Pattern should match gated Index"),
+    let index = UOp::index().buffer(buffer).indices(vec![idx]).call().unwrap();
+    let load = UOp::load().index(index.clone()).call();
+    match matcher.rewrite(&load, &mut ()) {
+        RewriteResult::Rewritten(r) => assert!(Arc::ptr_eq(&r, &index)),
+        _ => panic!("Load target fields should match"),
     }
 }
 
@@ -1179,12 +1160,12 @@ fn test_tuple_prefix_semantics_vs_exact() {
     // Verify that Tuple now uses prefix semantics (matches first N, ignores rest)
     // rather than exact semantics (requires exactly N children)
 
-    // Pattern: Bufferize with compute only (via struct syntax)
+    // Pattern: Stage with compute only (via struct syntax)
     let matcher = patterns! {
-        Bufferize { compute: c, .. } ~> c
+        Stage { compute: c, .. } ~> c
     };
 
-    let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global, removable: true };
+    let opts = BufferizeOpts { device: None, local_axis: None, addrspace: AddrSpace::Global, removable: true };
     let const_val = UOp::native_const(42.0f32);
     let range1 = UOp::range(UOp::index_const(10), 0);
     let range2 = UOp::range(UOp::index_const(20), 1);
@@ -1197,12 +1178,12 @@ fn test_tuple_prefix_semantics_vs_exact() {
         (2, vec![range1.clone(), range2.clone()]),
         (3, vec![range1, range2, range3]),
     ] {
-        let buf = UOp::bufferize(const_val.clone(), ranges, opts.clone());
+        let buf = UOp::stage(const_val.clone(), ranges, opts.clone());
         match matcher.rewrite(&buf, &mut ()) {
             RewriteResult::Rewritten(r) => {
                 assert!(Arc::ptr_eq(&r, &const_val), "Should rewrite with {} ranges", n);
             }
-            _ => panic!("Bufferize {{ compute: c, .. }} should match with {} ranges (prefix semantics)", n),
+            _ => panic!("Stage {{ compute: c, .. }} should match with {} ranges (prefix semantics)", n),
         }
     }
 }
@@ -1613,72 +1594,12 @@ fn test_symbolic_simple_add_zero() {
     assert!(Arc::ptr_eq(&result, &x), "combined patterns + graph_rewrite(Add(0, x)) should simplify to x");
 }
 
-// ===== Option Pattern Tests (gate: None, gate: Some(g)) =====
-
 #[test]
-fn test_option_none_pattern() {
-    // Test gate: None pattern matching
-    let matcher = patterns! {
-        Index { buffer: b, indices: _, gate: None } ~> b
-    };
-
-    let buffer = UOp::native_const(42.0f32);
-    let idx = UOp::index_const(0);
-
-    // Ungated index should match
-    let ungated = UOp::index().buffer(buffer.clone()).indices(vec![idx.clone()]).call().unwrap();
-    match matcher.rewrite(&ungated, &mut ()) {
-        RewriteResult::Rewritten(r) => {
-            assert!(Arc::ptr_eq(&r, &buffer), "Should extract buffer from ungated Index");
-        }
-        _ => panic!("Index with gate: None should match"),
-    }
-
-    // Gated index should NOT match
-    let gate = UOp::const_(DType::Bool, ConstValue::Int(1));
-    let gated = UOp::index().buffer(buffer.clone()).indices(vec![idx]).gate(gate).call().unwrap();
-    match matcher.rewrite(&gated, &mut ()) {
-        RewriteResult::NoMatch => {} // Expected
-        _ => panic!("Index with gate: Some(_) should NOT match gate: None pattern"),
-    }
-}
-
-#[test]
-fn test_option_some_pattern() {
-    // Test gate: Some(g) pattern matching
-    let matcher = patterns! {
-        Index { buffer: _, indices: _, gate: Some(g) } ~> g
-    };
-
-    let buffer = UOp::native_const(42.0f32);
-    let idx = UOp::index_const(0);
-    let gate = UOp::const_(DType::Bool, ConstValue::Int(1));
-
-    // Gated index should match and extract the gate
-    let gated = UOp::index().buffer(buffer.clone()).indices(vec![idx.clone()]).gate(gate.clone()).call().unwrap();
-    match matcher.rewrite(&gated, &mut ()) {
-        RewriteResult::Rewritten(r) => {
-            assert!(Arc::ptr_eq(&r, &gate), "Should extract gate from gated Index");
-        }
-        _ => panic!("Index with gate: Some(g) should match"),
-    }
-
-    // Ungated index should NOT match
-    let ungated = UOp::index().buffer(buffer.clone()).indices(vec![idx]).call().unwrap();
-    match matcher.rewrite(&ungated, &mut ()) {
-        RewriteResult::NoMatch => {} // Expected
-        _ => panic!("Index with gate: None should NOT match gate: Some(g) pattern"),
-    }
-}
-
-#[test]
-fn test_nested_index_with_gate_none() {
-    // Test the exact pattern from flatten_cascaded_index in DSL form
+fn test_nested_index_target_fields() {
     let matcher = patterns! {
         Index {
-            buffer: Index { buffer: real_buffer, indices: inner_indices, gate: None },
-            indices: outer_indices,
-            gate: None
+            buffer: Index { buffer: real_buffer, indices: inner_indices },
+            indices: outer_indices
         } if outer_indices.len() == 1 && inner_indices.len() == 1 => |real_buffer, inner_indices| {
             UOp::index().buffer(real_buffer.clone()).indices(vec![inner_indices[0].clone()]).call().ok()
         }
@@ -1696,24 +1617,15 @@ fn test_nested_index_with_gate_none() {
     match matcher.rewrite(&outer_idx, &mut ()) {
         RewriteResult::Rewritten(r) => {
             // Result should be INDEX(real_buffer, [idx1])
-            if let Op::Index { buffer, indices, gate } = r.op() {
+            if let Op::Index { buffer, indices } = r.op() {
                 assert!(Arc::ptr_eq(buffer, &real_buffer), "Buffer should be real_buffer");
                 assert_eq!(indices.len(), 1, "Should have 1 index");
                 assert!(Arc::ptr_eq(&indices[0], &idx1), "Index should be idx1 from inner");
-                assert!(gate.is_none(), "Gate should be None");
             } else {
                 panic!("Result should be Index op");
             }
         }
         _ => panic!("Nested Index pattern should match"),
-    }
-
-    // With a gate on outer, should NOT match
-    let gate = UOp::const_(DType::Bool, ConstValue::Int(1));
-    let gated_outer = UOp::index().buffer(inner_idx.clone()).indices(vec![idx2.clone()]).gate(gate).call().unwrap();
-    match matcher.rewrite(&gated_outer, &mut ()) {
-        RewriteResult::NoMatch => {} // Expected - outer gate is Some
-        _ => panic!("Should NOT match when outer gate is Some"),
     }
 }
 

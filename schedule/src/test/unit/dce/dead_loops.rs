@@ -10,8 +10,8 @@
 use smallvec::smallvec;
 use std::sync::Arc;
 use svod_dtype::DType;
-use svod_ir::UOp;
 use svod_ir::types::ConstValue;
+use svod_ir::{AxisId, AxisType, Op, UOp};
 
 use crate::rewrite::graph_rewrite;
 
@@ -49,10 +49,13 @@ fn test_range_negative_to_const() {
 fn test_range_symbolic_dead() {
     // size ∈ [0,5], RANGE(size - 10) → Const(0)
     // vmax(size - 10) = 5 - 10 = -5 ≤ 0, so dead
-    let size = UOp::var("size", DType::Int32, 0, 5);
+    let size = UOp::variable("size".into(), 0, 5, DType::Int32);
     let ten = UOp::native_const(10i32);
     let count = size.try_sub(&ten).expect("SUB should succeed");
-    let range = UOp::range(count, 0);
+    let range = UOp::new(
+        Op::Range { end: count.clone(), axis_id: AxisId::Renumbered(0), axis_type: AxisType::Loop, deps: smallvec![] },
+        count.dtype(),
+    );
 
     let matcher = get_matcher();
     let result = graph_rewrite(&matcher, range, &mut ());

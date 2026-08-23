@@ -85,17 +85,13 @@ fn test_reduce_unparented_max() {
 }
 
 #[test]
-fn test_reduce_unparented_min() {
-    // Input: REDUCE(CONST(42), [range(5)], MIN)
-    // Expected: CONST(42)
+fn test_reduce_unparented_min_is_not_supported_counterexample() {
+    // Tinygrad 8c8b43de only removes unparented ADD, MAX, and MUL reductions.
     let const_val = UOp::native_const(42i32);
     let range = UOp::range_axis(UOp::index_const(5), AxisId::Renumbered(0), AxisType::Reduce);
-    let reduce = const_val.clone().reduce(vec![range].into(), ReduceOp::Min);
+    let reduce = const_val.reduce(vec![range].into(), ReduceOp::Min);
 
-    let result = reduce_unparented(&reduce).expect("Should simplify");
-
-    // Result should be the constant value itself
-    assert!(Arc::ptr_eq(&result, &const_val));
+    assert!(reduce_unparented(&reduce).is_none());
 }
 
 #[test]

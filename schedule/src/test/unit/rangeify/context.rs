@@ -250,13 +250,13 @@ fn test_transform_with_bufferize() {
 
     let compute = UOp::const_(DType::Float32, ConstValue::Float(1.0));
     let range = UOp::index_const(10);
-    let bufferize = UOp::bufferize(compute, vec![range], BufferizeOpts::local());
+    let stage = UOp::stage(compute, vec![range], BufferizeOpts::local());
 
     let rangeified = UOp::const_(DType::Float32, ConstValue::Float(2.0));
 
-    ctx.record_transform(bufferize.clone(), rangeified.clone());
+    ctx.record_transform(stage.clone(), rangeified.clone());
 
-    let retrieved = ctx.get_rangeified(&bufferize).unwrap();
+    let retrieved = ctx.get_rangeified(&stage).unwrap();
     assert!(Arc::ptr_eq(retrieved, &rangeified));
 }
 

@@ -14,7 +14,6 @@ use std::sync::Arc;
 
 use indexmap::IndexMap;
 use smallvec::SmallVec;
-use svod_dtype::DeviceSpec;
 use svod_ir::{CallInfo, Op, SInt, UOp, UOpKey};
 use tracing::{debug, trace};
 
@@ -66,8 +65,8 @@ pub struct RangeifyBufferContext {
     pub local_counter: usize,
     pub lunique_counter: usize,
     pub buffer_map: HashMap<UOpKey, Arc<UOp>>,
-    /// Bound variables: maps variable name → (DEFINE_VAR UOp, optional bound value).
-    /// Populated when BIND(DEFINE_VAR, CONST) is stripped during kernel splitting.
+    /// Bound variables: maps variable name → (variable UOp, optional bound value).
+    /// Populated when BIND(variable, CONST) is stripped during kernel splitting.
     /// The UOp is kept for kernel sources; the i64 is the concrete bound value
     /// (None for schedule-loop wrappers — Range-bound variables).
     pub vars: HashMap<String, (Arc<UOp>, Option<i64>)>,
@@ -126,10 +125,14 @@ impl RangeifyBufferContext {
         self.buffer_map.insert(UOpKey(original), replacement);
     }
 
-    /// Track a bound variable with its DEFINE_VAR UOp and concrete value.
+    /// Track a bound variable UOp and its concrete value.
     pub fn add_var(&mut self, var: Arc<UOp>, value: Option<i64>) {
-        if let Op::DefineVar { name, .. } = var.op() {
-            self.vars.insert(name.clone(), (var, value));
+        let name = match var.op() {
+            Op::Param { arg, .. } if arg.addrspace.is_none() => arg.name.clone(),
+            _ => None,
+        };
+        if let Some(name) = name {
+            self.vars.insert(name, (var, value));
         }
     }
 }
@@ -159,7 +162,7 @@ pub struct LocalAddBufferContext {
     pub param_slot: usize,
     /// Buffer → AFTER mapping (IndexMap maintains insertion order)
     pub map: IndexMap<UOpKey, Arc<UOp>>,
-    /// Bound variables: binding UOp (typically BIND) -> (DEFINE_VAR UOp, optional bound value).
+    /// Bound variables: binding UOp (typically BIND) -> (variable UOp, optional bound value).
     ///
     /// Uses IndexMap to preserve insertion order for CALL source argument parity.
     pub vars: IndexMap<UOpKey, (Arc<UOp>, Option<i64>)>,
@@ -190,14 +193,14 @@ impl LocalAddBufferContext {
 
     /// Track a bound variable and its binding source.
     pub fn add_var(&mut self, binding: Arc<UOp>, var: Arc<UOp>, value: Option<i64>) {
-        if let Op::DefineVar { name, .. } = var.op() {
+        let var_name = |uop: &Arc<UOp>| match uop.op() {
+            Op::Param { arg, .. } if arg.addrspace.is_none() => arg.name.clone(),
+            _ => None,
+        };
+        if let Some(name) = var_name(&var) {
             // Keep latest binding for a variable name while preserving insertion order.
             if let Some(existing_key) = self.vars.iter().find_map(|(k, (existing_var, _))| {
-                if matches!(existing_var.op(), Op::DefineVar { name: existing_name, .. } if existing_name == name) {
-                    Some(k.clone())
-                } else {
-                    None
-                }
+                if var_name(existing_var).as_deref() == Some(name.as_str()) { Some(k.clone()) } else { None }
             }) {
                 self.vars.swap_remove(&existing_key);
             }
@@ -222,7 +225,7 @@ impl LocalAddBufferContext {
 
 /// Extract the stored value from a STORE/END(STORE) structure.
 ///
-/// Used to check if the stored value is COPY/BUFFER_VIEW without traversing
+/// Used to check if the stored value is COPY/SLICE without traversing
 /// the entire subgraph.
 fn extract_stored_value(ret: &Arc<UOp>) -> &Arc<UOp> {
     match ret.op() {
@@ -260,13 +263,6 @@ pub fn split_store(_ctx: &mut Vec<Arc<UOp>>, x: &Arc<UOp>) -> Option<Arc<UOp>> {
         return None;
     }
 
-    // Guard 1: index-shape stores should be handled by their END wrapper, not here.
-    if let Op::Store { index, .. } = x.op()
-        && index.shape().ok().flatten().is_some()
-    {
-        return None;
-    }
-
     // Verify operation type (only STORE and END(STORE) are valid)
     let is_valid = match x.op() {
         Op::Store { .. } => true,
@@ -282,7 +278,7 @@ pub fn split_store(_ctx: &mut Vec<Arc<UOp>>, x: &Arc<UOp>) -> Option<Arc<UOp>> {
 
     // Context-dependent rewrite per kernel.
     //
-    // Context-free patterns (movement_op, syntactic_sugar, flatten_range) were already
+    // Context-free movement and flatten-range patterns were already
     // applied in try_get_kernel_graph's pre-pass. Here we only run patterns that
     // need LocalAddBufferContext (Buffer/Param→codegen PARAM, Bind, After, Range renumber,
     // NOOP→zero, Contiguous→extract opts).
@@ -297,12 +293,11 @@ pub fn split_store(_ctx: &mut Vec<Arc<UOp>>, x: &Arc<UOp>) -> Option<Arc<UOp>> {
         _ => None,
     };
 
-    // Check for COPY/BUFFER_VIEW directly on the stored value.
+    // Check for COPY/SLICE directly on the stored value.
     // No graph traversal needed — just walk the STORE/END structure.
     let stored = extract_stored_value(&ret);
-    let ast = if matches!(stored.op(), Op::Copy { .. } | Op::BufferView { .. }) {
-        // Keep COPY/BUFFER_VIEW call bodies as direct ops so runtime lowering
-        // can classify them into PreparedOp::BufferCopy/BufferView.
+    let ast = if matches!(stored.op(), Op::Copy { .. } | Op::Slice { .. }) {
+        // Keep host-side effects as direct call bodies.
         if let Some(ranges) = &closed_ranges { stored.end(ranges.clone()) } else { stored.clone() }
     } else {
         // Mark AST SINK structurally so it hash-cons-distinguishes from
@@ -325,35 +320,6 @@ pub fn split_store(_ctx: &mut Vec<Arc<UOp>>, x: &Arc<UOp>) -> Option<Arc<UOp>> {
     );
 
     Some(call)
-}
-
-fn validate_normal_kernel_devices(root: &Arc<UOp>) -> svod_ir::Result<()> {
-    for node in root.toposort() {
-        let Op::Call { body, args, .. } = node.op() else {
-            continue;
-        };
-        if !matches!(body.op(), Op::Sink { .. }) {
-            continue;
-        }
-
-        let mut devices: Vec<DeviceSpec> = Vec::new();
-        for arg in args {
-            if matches!(arg.op(), Op::Bind { .. }) {
-                continue;
-            }
-            let Some(device) = arg.device_spec() else {
-                continue;
-            };
-            if !devices.contains(&device) {
-                devices.push(device);
-            }
-        }
-        if devices.len() > 1 {
-            return Err(svod_ir::Error::KernelSplitMixedDevices { devices });
-        }
-    }
-
-    Ok(())
 }
 
 /// Fix inter-kernel dependencies (like fix_assign).
@@ -464,7 +430,7 @@ pub fn try_get_kernel_graph(root: Arc<UOp>) -> svod_ir::Result<(Arc<UOp>, Rangei
         .unwrap_or(0);
     let mut ctx = RangeifyBufferContext::with_lunique_start(lunique_start);
 
-    // PASS 1: bufferize → store (pm_gate_kernel_sink + pm_add_buffers + pm_add_range_tags, bottom_up=True)
+    // PASS 1: stage → store (pm_gate_kernel_sink + pm_add_buffers + pm_add_range_tags, bottom_up=True)
     let t_stage = std::time::Instant::now();
     let after_buffers = {
         use svod_ir::op::pattern_derived::OpKey;
@@ -486,7 +452,7 @@ pub fn try_get_kernel_graph(root: Arc<UOp>) -> svod_ir::Result<(Arc<UOp>, Rangei
 
     // Pre-run pm_flatten_range on the FULL graph ONCE before kernel splitting.
     //
-    // split_store includes pm_flatten_range but NOT pm_mops/pm_syntactic_sugar
+    // split_store includes pm_flatten_range but NOT pm_mops
     // (those were already applied in earlier pipeline stages). Running flatten_range once
     // on the full graph avoids redundant per-kernel traversals on overlapping subgraphs.
     let t_stage = std::time::Instant::now();
@@ -499,8 +465,6 @@ pub fn try_get_kernel_graph(root: Arc<UOp>) -> svod_ir::Result<(Arc<UOp>, Rangei
     let t_stage = std::time::Instant::now();
     let after_split = split_all_stores(&after_ctx_free);
     tracing::debug!(elapsed_ms = t_stage.elapsed().as_millis() as u64, "kernel split: split_all_stores complete");
-
-    validate_normal_kernel_devices(&after_split)?;
 
     let t_stage = std::time::Instant::now();
     let result = fix_assign(&after_split)?;
@@ -576,7 +540,7 @@ fn detect_expanded_dimensions(source: &Arc<UOp>, input_shape: &[SInt]) -> Vec<bo
         .map(|(axis_id, dim)| match dim {
             SInt::Const(n) if *n > 1 => {
                 let end = UOp::index_const(*n as i64);
-                UOp::range_axis(end, svod_ir::AxisId::Unrenumbered(axis_id), svod_ir::AxisType::Loop)
+                UOp::range_axis(end, svod_ir::AxisId::Unrenumbered(axis_id), svod_ir::AxisType::Weak)
             }
             _ => UOp::index_const(0),
         })
@@ -595,13 +559,12 @@ fn detect_expanded_dimensions(source: &Arc<UOp>, input_shape: &[SInt]) -> Vec<bo
 
     let substituted = indexed.substitute(&substitutions);
 
-    use super::patterns::{movement_op_patterns, pm_syntactic_sugar};
+    use super::patterns::movement_op_patterns;
     use crate::rewrite::graph_rewrite_bottom_up;
 
-    // pm_mops + pm_syntactic_sugar (early movement ops, bottom_up=True)
+    // pm_mops (movement ops, bottom_up=True)
     use std::sync::LazyLock;
-    static PM_MOPS: LazyLock<crate::TypedPatternMatcher> =
-        LazyLock::new(|| movement_op_patterns() + pm_syntactic_sugar());
+    static PM_MOPS: LazyLock<crate::TypedPatternMatcher> = LazyLock::new(movement_op_patterns);
     let transformed = graph_rewrite_bottom_up(&*PM_MOPS, substituted, &mut ());
 
     let surviving_range_ids = collect_range_ids(&transformed);

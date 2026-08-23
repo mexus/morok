@@ -5,7 +5,6 @@
 
 use std::sync::Arc;
 
-use svod_dtype::DType;
 use svod_ir::{AxisId, AxisType, BinaryOp, Op, ReduceOp, TernaryOp};
 
 use crate::optimizer::config::HeuristicsConfig;
@@ -220,7 +219,7 @@ pub fn apply_image_upcasts(scheduler: &mut Scheduler) -> bool {
         let Op::Index { buffer, indices, .. } = buf.op() else {
             continue;
         };
-        if !matches!(buffer.dtype(), DType::Image { .. }) {
+        if !buffer.shape().ok().flatten().is_some_and(|shape| shape.len() == 3 && shape[2].as_const() == Some(4)) {
             continue;
         }
 
@@ -478,7 +477,7 @@ pub fn apply_matmul_tiling(scheduler: &mut Scheduler, config: &HeuristicsConfig)
 
     // Output axes are GLOBAL/LOCAL/LOOP. After the OUTER→LOOP migration,
     // matmul output axes arrive as Loop, so no Outer arm is needed.
-    let output_axes = scheduler.axes_of(&[AxisType::Global, AxisType::Local, AxisType::Loop]);
+    let output_axes = scheduler.axes_of(&[AxisType::Global, AxisType::Local, AxisType::Weak]);
     debug!(output_axes = ?output_axes, "apply_matmul_tiling: output axes");
 
     // Need at least 2 output axes for 2D tiling
@@ -536,7 +535,7 @@ pub fn apply_matmul_output_upcasting(scheduler: &mut Scheduler, config: &Heurist
 fn find_axis_by_axis_id(scheduler: &Scheduler, axis_id: AxisId) -> Option<usize> {
     scheduler.rngs().iter().enumerate().find_map(|(i, rng)| {
         if let Op::Range { axis_id: id, .. } = rng.op()
-            && *id == axis_id
+            && id == &axis_id
         {
             return Some(i);
         }
@@ -640,7 +639,7 @@ pub fn apply_matvec_fast_path(scheduler: &mut Scheduler, config: &HeuristicsConf
         let axis_id = trial
             .rngs()
             .get(current_axis)
-            .and_then(|rng| if let Op::Range { axis_id, .. } = rng.op() { Some(*axis_id) } else { None });
+            .and_then(|rng| if let Op::Range { axis_id, .. } = rng.op() { Some(axis_id.clone()) } else { None });
 
         if block_size > 1 {
             if apply_opt(&mut trial, &Opt::local(current_axis, block_size), true).is_err() {
@@ -695,7 +694,7 @@ pub fn apply_threading(scheduler: &mut Scheduler, max_threads: usize) -> bool {
         }
 
         // Only thread LOOP axes.
-        let loop_axes = scheduler.axes_of(&[AxisType::Loop]);
+        let loop_axes = scheduler.axes_of(&[AxisType::Weak]);
         let mut thread_applied = false;
         for &axis_idx in &loop_axes {
             let rngs = scheduler.rngs();
@@ -883,7 +882,7 @@ pub fn apply_local_dims(scheduler: &mut Scheduler, config: &HeuristicsConfig) ->
 
     // Rank axes by (has_expand_pattern, axis_index) — expand axes (stride-0 in
     // some buffer = broadcast) first, then higher axis indices.
-    let eligible_axes = scheduler.axes_of(&[AxisType::Global, AxisType::Loop]);
+    let eligible_axes = scheduler.axes_of(&[AxisType::Global, AxisType::Weak]);
     let full_shape = scheduler.full_shape();
 
     let mut local_axis_ranking: Vec<(bool, usize)> = Vec::new();

@@ -4,7 +4,7 @@
 //! - Creates DEFINE_REG for accumulator
 //! - Initializes accumulator with identity value
 //! - Loops over reduce_range with binary operations
-//! - Handles horizontal reduction for vector types
+//! - Handles horizontal reduction for shaped values
 //!
 //! Critical behavior tested:
 //! - input_ranges excludes parallel axes (Thread, Global, Local, Warp)
@@ -18,9 +18,105 @@ use std::sync::Arc;
 use smallvec::smallvec;
 use svod_dtype::DType;
 use svod_ir::types::ConstValue;
-use svod_ir::{BinaryOp, Op, ReduceOp, UOp};
+use svod_ir::{BinaryOp, Op, ReduceOp, RendererDevice, SInt, UOp, WmmaMetadata};
 
 use super::helpers::*;
+
+fn test_wmma(c: Arc<UOp>) -> Arc<UOp> {
+    let operand = UOp::stack((0..6).map(|i| UOp::var(format!("operand_{i}"), DType::Float32, -100, 100)).collect());
+    UOp::wmma(
+        operand.clone(),
+        operand,
+        c,
+        WmmaMetadata {
+            name: "test".into(),
+            dims: (16, 16, 16),
+            dtype_in: DType::Float32,
+            dtype_out: DType::Float32,
+            device: RendererDevice::Cpu,
+            threads: 32,
+            upcast_axes: None,
+            reduce_axes: vec![],
+            tile_grid: (1, 1),
+        },
+    )
+}
+
+fn shaped_values(prefix: &str, shape: &[usize]) -> Arc<UOp> {
+    let count = shape.iter().product();
+    UOp::stack((0..count).map(|i| UOp::var(format!("{prefix}_{i}"), DType::Float32, -100, 100)).collect())
+        .try_reshape(&shape.iter().copied().map(SInt::Const).collect())
+        .unwrap()
+}
+
+#[test]
+fn test_wmma_add_direct_moves_into_accumulator() {
+    let accumulator = shaped_values("acc", &[6]);
+    let add = shaped_values("add", &[6]);
+    let result = crate::rewrite::graph_rewrite(
+        crate::devectorize::pm_wmma_add(),
+        test_wmma(accumulator.clone()).add(&add),
+        &mut (),
+    );
+
+    let Op::Wmma { c, .. } = result.op() else { panic!("direct WMMA add must fuse") };
+    assert!(matches!(c.op(), Op::Binary(BinaryOp::Add, lhs, rhs)
+        if Arc::ptr_eq(lhs, &accumulator) && Arc::ptr_eq(rhs, &add)));
+}
+
+#[test]
+fn test_wmma_add_moves_through_permute() {
+    let accumulator = shaped_values("acc", &[2, 3]);
+    let add = shaped_values("add", &[3, 2]);
+    let permuted = test_wmma(accumulator).try_permute(vec![1, 0]).unwrap();
+    let result = crate::rewrite::graph_rewrite(crate::devectorize::pm_wmma_add(), permuted.add(&add), &mut ());
+
+    let Op::Permute { src, axes } = result.op() else { panic!("output permutation must remain outside WMMA") };
+    assert_eq!(axes, &[1, 0]);
+    let Op::Wmma { c, .. } = src.op() else { panic!("permuted add must fuse into WMMA") };
+    assert!(
+        matches!(c.op(), Op::Binary(BinaryOp::Add, _, moved) if matches!(moved.op(), Op::Permute { axes, .. } if axes == &[1, 0]))
+    );
+}
+
+#[test]
+fn test_wmma_add_moves_through_permute_reshape() {
+    let accumulator = shaped_values("acc", &[6]);
+    let add = shaped_values("add", &[3, 2]);
+    let reshaped = test_wmma(accumulator).try_reshape(&smallvec![SInt::Const(2), SInt::Const(3)]).unwrap();
+    let result = crate::rewrite::graph_rewrite(
+        crate::devectorize::pm_wmma_add(),
+        reshaped.try_permute(vec![1, 0]).unwrap().add(&add),
+        &mut (),
+    );
+
+    let Op::Permute { src, .. } = result.op() else { panic!("output permutation must remain") };
+    let Op::Reshape { src, .. } = src.op() else { panic!("output reshape must remain") };
+    let Op::Wmma { c, .. } = src.op() else { panic!("reshape-permute add must fuse into WMMA") };
+    assert!(matches!(c.op(), Op::Binary(BinaryOp::Add, _, moved) if matches!(moved.op(), Op::Reshape { src, .. }
+        if matches!(src.op(), Op::Permute { .. }))));
+}
+
+#[test]
+fn test_movement_cleanup_must_precede_reduce_local() {
+    let accumulator = shaped_values("acc", &[6]);
+    let add = shaped_values("add", &[3, 2]);
+    let wmma = test_wmma(accumulator);
+    let inner = wmma.try_reshape(&smallvec![SInt::Const(3), SInt::Const(2)]).unwrap();
+    let outer = inner.try_reshape(&smallvec![SInt::Const(2), SInt::Const(3)]).unwrap();
+    let root = outer.try_permute(vec![1, 0]).unwrap().add(&add);
+
+    let mut ctx = crate::devectorize::ReduceContext::default();
+    let without_cleanup = crate::rewrite::graph_rewrite(&crate::devectorize::pm_reduce_local(), root.clone(), &mut ctx);
+    assert!(matches!(without_cleanup.op(), Op::Binary(BinaryOp::Add, ..)), "counterexample must not match early");
+
+    let matcher = crate::devectorize::movement_cleanup_patterns().with_context::<crate::devectorize::ReduceContext>()
+        + crate::devectorize::pm_reduce_local();
+    let mut ctx = crate::devectorize::ReduceContext::default();
+    let ordered = crate::rewrite::graph_rewrite(&matcher, root, &mut ctx);
+    assert!(ordered.toposort().iter().any(|node| matches!(node.op(), Op::Wmma { c, .. }
+        if matches!(c.op(), Op::Binary(BinaryOp::Add, ..)))));
+}
 
 // =============================================================================
 // Happy Path Tests: Basic REDUCE operations
@@ -39,6 +135,13 @@ fn test_reduce_scalar_add() {
     assert!(!matches!(result.op(), Op::Reduce { .. }), "Should transform REDUCE to accumulator pattern");
     // Should have DEFINE_REG in the tree
     assert!(count_define_regs(&result) > 0, "Should contain DEFINE_REG");
+    assert!(
+        result
+            .toposort()
+            .iter()
+            .any(|node| matches!(node.op(), Op::Buffer { arg, .. } if arg.addrspace == Some(svod_ir::AddrSpace::Reg) && arg.slot == 0)),
+        "first reduction accumulator must use dense REG slot 0"
+    );
     // Should have END in the tree
     assert!(count_ends(&result) > 0, "Should contain END");
 }
@@ -71,7 +174,7 @@ fn test_reduce_scalar_max() {
 }
 
 #[test]
-fn test_invalid_padded_lane_uses_reduce_identity() {
+fn test_invalid_padded_lane_survives_reduction_removal() {
     let range = create_range_reduce(16, 0);
     let cond = UOp::var("valid", DType::Bool, 0, 1);
     let value = UOp::var("value", DType::Float32, 0, 100);
@@ -81,7 +184,10 @@ fn test_invalid_padded_lane_uses_reduce_identity() {
     let result = apply_pm_reduce(&reduce);
 
     assert!(!matches!(result.op(), Op::Reduce { .. }));
-    assert!(!result.any_in_subtree(UOp::is_invalid_marker));
+    assert!(
+        result.any_in_subtree(UOp::is_invalid_marker),
+        "reduction removal must preserve Invalid for the later gater"
+    );
 }
 
 /// Test: REDUCE(scalar, [Range], Min) → accumulator pattern with Min (uses WHERE).
@@ -98,19 +204,48 @@ fn test_reduce_scalar_min() {
     assert!(count_define_regs(&result) > 0);
 }
 
-/// Test: REDUCE(<4 x f32>, [Range], Add) → horizontal reduction then accumulator.
+/// Test: REDUCE(shaped f32[4], [Range], Add) → horizontal reduction then accumulator.
 #[test]
-fn test_reduce_vector_to_scalar() {
+fn test_reduce_shaped_to_scalar() {
     let range = create_range_reduce(16, 0);
-    // Vector source that reduces to scalar
-    let src = create_vector_float_iota(4);
-    let reduce = src.reduce(smallvec![range], ReduceOp::Add);
-    // Output dtype is scalar f32
+    let src = UOp::stack((0..4).map(|i| UOp::const_(DType::Float32, ConstValue::Float(i as f64))).collect());
+    let reduce = src.reduce_with_num_axes(smallvec![range], ReduceOp::Add, 1);
 
     let result = apply_pm_reduce(&reduce);
 
     assert!(!matches!(result.op(), Op::Reduce { .. }), "Should transform REDUCE");
     assert!(count_define_regs(&result) > 0);
+    assert!(result.toposort().iter().any(|node| {
+        matches!(node.op(), Op::Index { buffer, indices }
+            if Arc::ptr_eq(buffer, &src) && indices.len() == 1)
+    }));
+}
+
+#[test]
+fn test_horizontal_reduce_uses_target_dtype() {
+    let range = create_range_reduce(16, 0);
+    let source_dtype = DType::BFloat16.vec(16).unwrap();
+    let target_dtype = DType::BFloat16.vec(4).unwrap();
+    let src = UOp::stack((0..4).map(|i| UOp::const_(source_dtype.clone(), ConstValue::Float(i as f64))).collect());
+    let reduce = UOp::new(
+        Op::Reduce { src: src.clone(), ranges: smallvec![range], reduce_op: ReduceOp::Add, num_axes: 1 },
+        target_dtype.clone(),
+    );
+
+    let result = apply_pm_reduce(&reduce);
+
+    assert_eq!(result.dtype(), target_dtype);
+    for node in result.toposort() {
+        if let Op::Index { buffer, .. } = node.op()
+            && Arc::ptr_eq(buffer, &src)
+        {
+            assert_eq!(node.dtype(), target_dtype);
+        }
+        if let Op::Binary(BinaryOp::Add, lhs, rhs) = node.op() {
+            assert_eq!(lhs.dtype(), rhs.dtype());
+        }
+    }
+    assert!(!result.toposort().iter().any(|node| matches!(node.op(), Op::Cast { .. })));
 }
 
 // =============================================================================
@@ -119,59 +254,25 @@ fn test_reduce_vector_to_scalar() {
 
 /// Test: Horizontal reduce with no ranges → direct horizontal reduction.
 ///
-/// REDUCE(<4 x f32>, [], Add) → tree reduction of GEPs
-/// Note: The output dtype follows the REDUCE's dtype, which may still be vector.
+/// REDUCE(shaped f32[4], [], Add) → left fold of scalar INDEXes.
 #[test]
 fn test_horizontal_reduce_no_ranges() {
-    let src = create_vector_float_iota(4);
-    // Empty ranges: just horizontal reduce
-    let reduce = src.reduce(smallvec![], ReduceOp::Add);
+    let src = UOp::stack((0..4).map(|i| UOp::const_(DType::Float32, ConstValue::Float(i as f64))).collect());
+    let reduce = src.reduce_with_num_axes(smallvec![], ReduceOp::Add, 1);
 
     let result = apply_pm_reduce(&reduce);
 
-    // With no ranges, should just be horizontal reduction (no DEFINE_REG)
     assert!(!matches!(result.op(), Op::Reduce { .. }), "Should transform REDUCE");
-    // Note: The default reduce without explicit output dtype keeps the input dtype.
-    // This is correct behavior - horizontal reduction happens based on dtype mismatch.
-    // No accumulator needed for horizontal-only reduce
     assert_eq!(count_define_regs(&result), 0, "Should not have DEFINE_REG for horizontal-only reduce");
-}
-
-/// Test: Vector identity (vcount in == vcount out) → no GEPs needed.
-#[test]
-fn test_horizontal_reduce_identity() {
-    let range = create_range_reduce(8, 0);
-    let src = create_vector_float_iota(4);
-    // Vec4 input with vec4 output dtype
-    let reduce = UOp::new(
-        Op::Reduce { src, ranges: smallvec![range], reduce_op: ReduceOp::Add },
-        DType::Float32.vec(4).unwrap(),
+    assert_eq!(result.dtype(), DType::Float32);
+    assert_eq!(
+        result
+            .toposort()
+            .iter()
+            .filter(|node| matches!(node.op(), Op::Index { buffer, .. } if Arc::ptr_eq(buffer, &src)))
+            .count(),
+        4
     );
-
-    let result = apply_pm_reduce(&reduce);
-
-    assert!(!matches!(result.op(), Op::Reduce { .. }));
-    // Output should still be vec4
-    assert_eq!(result.dtype().vcount(), 4);
-}
-
-/// Test: <16 x f32> → <4 x f32> requires 4-stride horizontal GEPs.
-#[test]
-fn test_horizontal_reduce_16_to_4() {
-    let range = create_range_reduce(8, 0);
-    // 16 elements to 4 elements
-    let elements: smallvec::SmallVec<[Arc<UOp>; 4]> =
-        (0..16).map(|i| UOp::const_(DType::Float32, ConstValue::Float(i as f64))).collect();
-    let src = UOp::vectorize(elements);
-    let reduce = UOp::new(
-        Op::Reduce { src, ranges: smallvec![range], reduce_op: ReduceOp::Add },
-        DType::Float32.vec(4).unwrap(),
-    );
-
-    let result = apply_pm_reduce(&reduce);
-
-    assert!(!matches!(result.op(), Op::Reduce { .. }));
-    assert_eq!(result.dtype().vcount(), 4);
 }
 
 // =============================================================================
@@ -181,8 +282,8 @@ fn test_horizontal_reduce_16_to_4() {
 /// Test: REDUCE with empty ranges → direct horizontal reduction.
 #[test]
 fn test_reduce_empty_ranges() {
-    let src = create_vector_float_iota(4);
-    let reduce = src.reduce(smallvec![], ReduceOp::Add);
+    let src = UOp::stack((0..4).map(|i| UOp::const_(DType::Float32, ConstValue::Float(i as f64))).collect());
+    let reduce = src.reduce_with_num_axes(smallvec![], ReduceOp::Add, 1);
 
     let result = apply_pm_reduce(&reduce);
 
@@ -347,50 +448,23 @@ fn test_input_ranges_mixed_axis_types() {
 fn test_reduce_in_full_pipeline() {
     use crate::devectorize::pm_reduce;
     use crate::rewrite::graph_rewrite;
-    use crate::symbolic::patterns::gep_pushing_patterns;
-    use svod_dtype::{AddrSpace, DeviceSpec};
-
     // Create a realistic REDUCE scenario
     let reduce_range = create_range_reduce(32, 0);
-    let buffer_dtype = DType::Float32.ptr(Some(1024), AddrSpace::Global).unwrap();
-    let buffer = UOp::new_buffer(DeviceSpec::Cpu, 1024, buffer_dtype.clone());
-    let define = UOp::param(0, 1024, buffer_dtype, None);
+    let define = UOp::param(0, 1024, DType::Float32, None);
 
     // LOAD from buffer
     let idx = UOp::index().buffer(define).indices(vec![reduce_range.clone()]).call().unwrap();
-    let load = UOp::load().buffer(buffer.clone()).index(idx).call();
+    let load = UOp::load().index(idx).call();
 
     // REDUCE over load
     let reduce = load.reduce(smallvec![reduce_range], ReduceOp::Add);
 
     // Apply pm_reduce + gep_pushing (as done in optimizer)
-    let combined = pm_reduce() + gep_pushing_patterns().with_context();
+    let combined = pm_reduce();
     let mut ctx = crate::devectorize::ReduceContext::default();
     let result = graph_rewrite(&combined, reduce, &mut ctx);
 
     // Should transform REDUCE to accumulator pattern
     assert!(!matches!(result.op(), Op::Reduce { .. }), "REDUCE should be transformed");
     assert!(count_define_regs(&result) > 0, "Should have DEFINE_REG for accumulator");
-}
-
-/// Test: REDUCE with vectorized CONTRACT source.
-#[test]
-fn test_reduce_with_vectorized_source() {
-    let reduce_range = create_range_reduce(16, 0);
-
-    // Create a vectorized source via VECTORIZE
-    let elements: smallvec::SmallVec<[Arc<UOp>; 4]> =
-        (0..4).map(|i| UOp::const_(DType::Float32, ConstValue::Float(i as f64))).collect();
-    let vectorized = UOp::vectorize(elements);
-
-    // REDUCE the vectorized value to vec4 output
-    let reduce = UOp::new(
-        Op::Reduce { src: vectorized, ranges: smallvec![reduce_range], reduce_op: ReduceOp::Add },
-        DType::Float32.vec(4).unwrap(),
-    );
-
-    let result = apply_pm_reduce(&reduce);
-
-    assert!(!matches!(result.op(), Op::Reduce { .. }));
-    assert_eq!(result.dtype().vcount(), 4);
 }

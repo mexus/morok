@@ -70,7 +70,8 @@ fn build_matmul_only(n: i64, k: i64, d: i64) -> Arc<UOp> {
 /// - `open_ranges`: RANGEs whose END has not yet been seen.
 /// - `range_deps`: transitive closure of RANGE dependencies for each UOp.
 ///
-/// AFTER nodes strip all range deps (they represent the loop-exit value).
+/// AFTER merges source scopes and removes only ranges ended by its dependency
+/// chain, matching Tinygrad's `ended_ranges` semantics.
 fn check_phi_dominance(linear: &[Arc<UOp>]) -> Result<(), String> {
     let mut range_deps: HashMap<u64, HashSet<u64>> = HashMap::new();
     let mut open_ranges: HashSet<u64> = HashSet::new();
@@ -104,7 +105,28 @@ fn check_phi_dominance(linear: &[Arc<UOp>]) -> Result<(), String> {
             }
 
             Op::After { .. } => {
-                range_deps.insert(uop.id, HashSet::new());
+                let mut deps = HashSet::new();
+                for src in uop.op().sources() {
+                    deps.extend(range_deps.get(&src.id).cloned().unwrap_or_default());
+                }
+                for ended in uop.op().ended_ranges() {
+                    match ended.op() {
+                        Op::Range { .. } => {
+                            deps.remove(&ended.id);
+                        }
+                        _ => {
+                            for rid in range_deps.get(&ended.id).cloned().unwrap_or_default() {
+                                deps.remove(&rid);
+                            }
+                        }
+                    }
+                }
+                for rid in &deps {
+                    if !open_ranges.contains(rid) {
+                        return Err(format!("AFTER at [{idx}] depends on closed range {rid}"));
+                    }
+                }
+                range_deps.insert(uop.id, deps);
             }
 
             _ => {
@@ -179,8 +201,9 @@ fn check_tree_scope(root: &Arc<UOp>) -> Result<(), String> {
 // ── tests ──────────────────────────────────────────────────────────────────
 
 fn assert_no_phi_violation(sink: Arc<UOp>, renderer: &Renderer, label: &str) {
+    let renderer = renderer.clone().with_rewrite_capabilities(svod_ir::RendererOps::all(), None, None);
     let config = OptimizerConfig { strategy: OptStrategy::Heuristic, ..Default::default() };
-    let optimized = optimize_kernel_with_config(sink, renderer, &config)
+    let optimized = optimize_kernel_with_config(sink, &renderer, &config)
         .unwrap_or_else(|e| panic!("{label}: optimizer failed: {e:?}"));
 
     // Diagnostics
@@ -202,6 +225,7 @@ fn assert_no_phi_violation(sink: Arc<UOp>, renderer: &Renderer, label: &str) {
 // tests), then run the full post-optimization + linearize pipeline.
 
 fn assert_no_phi_with_tc(sink: Arc<UOp>, renderer: &Renderer, label: &str) {
+    let renderer = renderer.clone().with_rewrite_capabilities(svod_ir::RendererOps::all(), None, None);
     let mut scheduler = Scheduler::new(sink, renderer.clone());
 
     // Apply TC: tc_select=-1 (auto), axis0=0, axis1=1.
@@ -211,7 +235,7 @@ fn assert_no_phi_with_tc(sink: Arc<UOp>, renderer: &Renderer, label: &str) {
     let has_wmma = ast.toposort().iter().any(|u| matches!(u.op(), Op::Wmma { .. }));
     assert!(has_wmma, "{label}: TC apply did not produce WMMA");
 
-    let post = apply_post_optimization_with_renderer(ast, Some(renderer));
+    let post = apply_post_optimization_with_renderer(ast, &renderer);
     check_tree_scope(&post).unwrap_or_else(|e| panic!("{label}: tree-scope: {e}"));
     let linear = linearize_with_cfg(post);
     eprintln!("[{label}] linear={}", linear.len());

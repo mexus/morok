@@ -1,224 +1,224 @@
-//! Pre-expander test suite (expand.rs).
-//!
-//! Tests for the UNROLL/CONTRACT expansion system, ported from Tinygrad's
-//! TestExpander class (test_uop_graph.py:663-811).
+use smallvec::smallvec;
+use svod_dtype::DType;
+use svod_ir::{AxisId, AxisType, ConstValue, Op, ReduceOp, RendererDevice, SInt, UOp, WmmaMetadata, WmmaUpcastAxes};
 
-pub mod bufferize_unroll;
-pub mod do_contract;
-pub mod do_expand;
-pub mod edge_cases;
-pub mod end_unrolls;
-pub mod fix_reduce;
-pub mod group_reduce;
-pub mod helpers;
-pub mod shift_to_integration;
-pub mod swizzle;
-
-use crate::expand::*;
-use svod_ir::{AxisType, prelude::*};
+use crate::devectorize::pm_expand_broadcast;
+use crate::expand::{build_range_map, pm_group_for_reduce, pre_expand};
+use crate::rewrite::graph_rewrite;
 
 #[test]
-fn test_pre_expand_passthrough() {
-    // A simple REDUCE with proper Range ops should pass through unchanged
-    let end = UOp::const_(DType::Index, ConstValue::Int(32));
-    let range = UOp::range_axis(end, svod_ir::AxisId::Renumbered(0), AxisType::Reduce);
-    let src = UOp::const_(DType::Float32, ConstValue::Float(0.0));
-    let reduce = src.reduce(smallvec::smallvec![range.clone()], ReduceOp::Add);
-
-    let result = pre_expand(&reduce);
-
-    // Should be unchanged (though may be a new node due to graph_rewrite)
-    if let Op::Reduce { ranges, .. } = result.op() {
-        assert_eq!(ranges.len(), 1);
-        assert!(matches!(ranges[0].op(), Op::Range { axis_type: AxisType::Reduce, .. }));
-    } else {
-        panic!("Expected REDUCE op");
-    }
+fn range_map_uses_kernel_coordinate_order() {
+    let first = UOp::range_axis(UOp::index_const(2), AxisId::Renumbered(7), AxisType::Upcast);
+    let second = UOp::range_axis(UOp::index_const(3), AxisId::Renumbered(9), AxisType::Unroll);
+    let sink = UOp::sink(vec![first, second]);
+    let map = build_range_map(&sink);
+    assert_eq!(map[&AxisId::Renumbered(7)], 0);
+    assert_eq!(map[&AxisId::Renumbered(9)], 1);
 }
 
 #[test]
-fn test_vectorize_expansion_with_mixed_sources() {
-    // Test that VECTORIZE with mixed scalar/vector sources after expansion
-    // produces CAT instead of invalid VECTORIZE.
-    //
-    // This tests the fix for: "Invalid VECTORIZE operand count: 2, expected 4"
-    // which occurred when beam search used width >= 3.
+fn upcast_and_unroll_ranges_become_shaped_coordinates() {
+    let first = UOp::range_axis(UOp::index_const(2), AxisId::Renumbered(7), AxisType::Upcast);
+    let second = UOp::range_axis(UOp::index_const(3), AxisId::Renumbered(9), AxisType::Unroll);
+    let result = pre_expand(&UOp::sink(vec![first, second]));
+    let Op::Sink { sources, .. } = result.op() else { panic!("expected SINK") };
+    assert_eq!(sources[0].shape().unwrap().unwrap().as_slice(), &[SInt::Const(2), SInt::Const(1)]);
+    assert_eq!(sources[1].shape().unwrap().unwrap().as_slice(), &[SInt::Const(1), SInt::Const(3)]);
+}
 
-    // Create an UNROLL operation (simulates expanded loop)
-    let values = UOp::vconst(vec![ConstValue::Int(0), ConstValue::Int(1), ConstValue::Int(2)], DType::Int64);
-    let unroll = values.unroll(vec![(0, 3)]);
+#[test]
+fn wmma_shapes_operands_independently_and_reconstructs_output() {
+    let first = UOp::range_axis(UOp::index_const(2), AxisId::Renumbered(7), AxisType::Upcast);
+    let second = UOp::range_axis(UOp::index_const(3), AxisId::Renumbered(9), AxisType::Upcast);
+    let a_lanes =
+        UOp::stack((0..2).map(|value| UOp::const_(DType::Float32, ConstValue::Float(value as f64))).collect())
+            .try_reshape(&smallvec![SInt::Const(2), SInt::Const(1)])
+            .unwrap();
+    let b_lanes =
+        UOp::stack((0..3).map(|value| UOp::const_(DType::Float32, ConstValue::Float(value as f64))).collect())
+            .try_reshape(&smallvec![SInt::Const(1), SInt::Const(3)])
+            .unwrap();
+    let metadata = WmmaMetadata {
+        name: "test".into(),
+        dims: (16, 16, 16),
+        dtype_in: DType::Float32,
+        dtype_out: DType::Float32,
+        device: RendererDevice::Cpu,
+        threads: 32,
+        upcast_axes: Some(WmmaUpcastAxes {
+            a: vec![(AxisId::Renumbered(7), 2)],
+            b: vec![(AxisId::Renumbered(9), 3)],
+            c: vec![(AxisId::Renumbered(7), 2)],
+        }),
+        reduce_axes: vec![],
+        tile_grid: (1, 1),
+    };
+    let accumulator = UOp::stack(smallvec![UOp::const_(DType::Float32, ConstValue::Float(0.0)); 2]);
+    let result = pre_expand(&UOp::sink(vec![first, second, UOp::wmma(a_lanes, b_lanes, accumulator, metadata)]));
+    let Op::Sink { sources, .. } = result.op() else { panic!("expected SINK") };
+    assert_eq!(sources[2].shape().unwrap().unwrap().as_slice(), &[SInt::Const(2), SInt::Const(1)]);
+    let expanded = sources[2].toposort().into_iter().find(|u| matches!(u.op(), Op::Wmma { .. })).unwrap();
+    let Op::Wmma { a, b, metadata, .. } = expanded.op() else { unreachable!() };
+    assert_eq!(a.shape().unwrap().unwrap().as_slice(), &[SInt::Const(1), SInt::Const(2)]);
+    assert_eq!(b.shape().unwrap().unwrap().as_slice(), &[SInt::Const(1), SInt::Const(3)]);
+    assert!(metadata.upcast_axes.is_none());
+}
 
-    // Create a scalar constant
-    let scalar = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+#[test]
+fn nested_split_axis_survives_wmma_contract_and_output_unroll() {
+    let nested = AxisId::Renumbered(7).child(1).child(0);
+    let scalar = AxisId::Renumbered(7);
+    let nested_range = UOp::range_axis(UOp::index_const(2), nested.clone(), AxisType::Upcast);
+    let scalar_range = UOp::range_axis(UOp::index_const(3), scalar, AxisType::Upcast);
+    let lanes = UOp::stack((0..6).map(|value| UOp::native_const(value as f32)).collect())
+        .try_reshape(&smallvec![SInt::Const(2), SInt::Const(3)])
+        .unwrap();
+    let metadata = WmmaMetadata {
+        name: "nested-test".into(),
+        dims: (16, 16, 16),
+        dtype_in: DType::Float32,
+        dtype_out: DType::Float32,
+        device: RendererDevice::Cpu,
+        threads: 32,
+        upcast_axes: Some(WmmaUpcastAxes {
+            a: vec![(nested.clone(), 2)],
+            b: vec![(nested.clone(), 2)],
+            c: vec![(nested, 2)],
+        }),
+        reduce_axes: vec![],
+        tile_grid: (1, 1),
+    };
+    let accumulator = UOp::stack(smallvec![UOp::native_const(0.0f32); 2]);
+    let result = pre_expand(&UOp::sink(vec![
+        nested_range,
+        scalar_range,
+        UOp::wmma(lanes.clone(), lanes, accumulator, metadata),
+    ]));
+    let Op::Sink { sources, .. } = result.op() else { panic!("expected SINK") };
+    assert_eq!(sources[2].shape().unwrap().unwrap().as_slice(), &[SInt::Const(2), SInt::Const(3)]);
+    let expanded = sources[2].toposort().into_iter().find(|u| matches!(u.op(), Op::Wmma { .. })).unwrap();
+    let Op::Wmma { a, b, metadata, .. } = expanded.op() else { unreachable!() };
+    assert_eq!(a.shape().unwrap().unwrap().as_slice(), &[SInt::Const(3), SInt::Const(2)]);
+    assert_eq!(b.shape().unwrap().unwrap().as_slice(), &[SInt::Const(3), SInt::Const(2)]);
+    assert!(metadata.upcast_axes.is_none());
+}
 
-    // Create a Binary op with UNROLL - this will trigger expansion
-    // The scalar source will be broadcast, creating a vector
-    let binary = UOp::new(Op::Binary(svod_ir::BinaryOp::Add, scalar.clone(), unroll.clone()), DType::Float32);
+#[test]
+fn wmma_broadcast_stacks_fragments_before_reshape() {
+    let shaped = |count, shape: &[usize]| {
+        UOp::stack((0..count).map(|value| UOp::native_const(value as f32)).collect())
+            .try_reshape(&shape.iter().copied().map(SInt::Const).collect())
+            .unwrap()
+    };
+    let metadata = WmmaMetadata {
+        name: "broadcast-test".into(),
+        dims: (16, 16, 16),
+        dtype_in: DType::Float32,
+        dtype_out: DType::Float32,
+        device: RendererDevice::Cpu,
+        threads: 32,
+        upcast_axes: None,
+        reduce_axes: vec![],
+        tile_grid: (1, 1),
+    };
+    let wmma = UOp::wmma(shaped(64, &[4, 1, 16]), shaped(64, &[1, 4, 16]), shaped(8, &[8]), metadata);
+    let result = graph_rewrite(pm_expand_broadcast(), wmma, &mut ());
 
-    // Run pre_expand - should not panic
-    let result = pre_expand(&binary);
+    assert_eq!(result.shape().unwrap().unwrap().as_slice(), &[SInt::Const(4), SInt::Const(4), SInt::Const(8)]);
+    let Op::Reshape { src, .. } = result.op() else { panic!("expected STACK reshape") };
+    assert!(matches!(src.op(), Op::Stack { sources } if sources.len() == 16));
+}
 
-    // Result should be wrapped in UNROLL with expanded inner op
-    assert!(
-        matches!(result.op(), Op::Unroll { .. } | Op::Binary(..)),
-        "Expected UNROLL or Binary, got {:?}",
-        result.op()
+#[test]
+fn pre_expansion_wmma_accepts_scalar_inputs() {
+    let metadata = WmmaMetadata {
+        name: "scalar-input-test".into(),
+        dims: (16, 16, 16),
+        dtype_in: DType::Float32,
+        dtype_out: DType::Float32,
+        device: RendererDevice::Cpu,
+        threads: 32,
+        upcast_axes: None,
+        reduce_axes: vec![],
+        tile_grid: (1, 1),
+    };
+    let accumulator = UOp::stack(smallvec![UOp::native_const(0.0f32); 8]);
+    let wmma = UOp::wmma(UOp::native_const(1.0f32), UOp::native_const(2.0f32), accumulator, metadata);
+    assert_eq!(wmma.shape().unwrap().unwrap().as_slice(), &[SInt::Const(8)]);
+}
+
+#[test]
+fn shaped_reduce_axes_are_expanded_before_reduction_lowering() {
+    let upcast = UOp::range_axis(UOp::index_const(4), AxisId::Renumbered(2), AxisType::Unroll);
+    let loop_range = UOp::range_axis(UOp::index_const(8), AxisId::Renumbered(3), AxisType::Reduce);
+    let source = upcast.cast(DType::Float32);
+    let reduce = source.reduce(smallvec![loop_range, upcast], ReduceOp::Add);
+    let result = pre_expand(&reduce);
+    assert_eq!(result.shape().unwrap().unwrap().as_slice(), &[SInt::Const(1)]);
+    assert!(result.toposort().iter().any(|node| matches!(node.op(), Op::Reduce { num_axes: 1, .. })));
+}
+
+#[test]
+fn grouped_reduce_loop_keeps_nested_axis_identity_and_range_dependencies() {
+    let ordering = UOp::range_axis(UOp::index_const(2), AxisId::Renumbered(3), AxisType::Loop);
+    let ended = UOp::new(Op::Noop, DType::Void).end(smallvec![ordering]);
+    let after = UOp::index_const(1).after(smallvec![ended]);
+    let grouped_axis = AxisId::Renumbered(7).child(1).child(0);
+    let grouped = UOp::new(
+        Op::Range {
+            end: UOp::index_const(4),
+            axis_id: grouped_axis.clone(),
+            axis_type: AxisType::GroupReduce,
+            deps: smallvec![after.clone()],
+        },
+        DType::WeakInt,
     );
+    let reduce = grouped.cast(DType::Float32).reduce(smallvec![grouped], ReduceOp::Add);
+
+    let lowered = graph_rewrite(pm_group_for_reduce(), reduce, &mut ());
+    assert!(lowered.toposort().iter().any(|node| {
+        matches!(node.op(), Op::Stage { opts, .. } if opts.local_axis.as_ref() == Some(&grouped_axis))
+    }));
+    let loop_range = lowered
+        .toposort()
+        .into_iter()
+        .find(|node| {
+            matches!(
+                node.op(),
+                Op::Range { axis_id, axis_type: AxisType::Reduce, .. }
+                    if axis_id == &grouped_axis.group_reduce_loop()
+            )
+        })
+        .expect("derived grouped-reduce loop");
+    let Op::Range { deps, .. } = loop_range.op() else { unreachable!() };
+    assert_eq!(deps.len(), 1);
+    assert!(std::sync::Arc::ptr_eq(&deps[0], &after));
+    assert_eq!(grouped_axis.group_reduce_loop().path(), &[7, 1, 0, 2]);
 }
 
 #[test]
-fn test_vectorize_all_scalar_sources() {
-    // When all sources are scalar after expansion, VECTORIZE should be used
-    let scalar_a = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-    let scalar_b = UOp::const_(DType::Float32, ConstValue::Float(2.0));
+fn grouped_reduce_loop_does_not_collide_with_offset_axis_or_range_map_parent() {
+    let grouped_axis = AxisId::Renumbered(0);
+    let grouped = UOp::range_axis(UOp::index_const(4), grouped_axis.clone(), AxisType::GroupReduce);
+    let old_offset_collision = UOp::range_axis(UOp::index_const(4), AxisId::Renumbered(100), AxisType::Upcast);
+    let split_outer = UOp::range_axis(UOp::index_const(4), grouped_axis.child(0), AxisType::Upcast);
+    let split_inner = UOp::range_axis(UOp::index_const(4), grouped_axis.child(1), AxisType::Upcast);
+    let derived = UOp::range_axis(UOp::index_const(4), grouped_axis.group_reduce_loop(), AxisType::Upcast);
+    let map = build_range_map(&UOp::sink(vec![old_offset_collision, split_outer, split_inner, derived]));
 
-    // Create VECTORIZE with scalars only (no UNROLL)
-    let vectorize = UOp::vectorize(smallvec::smallvec![scalar_a, scalar_b]);
+    assert_eq!(map.len(), 4);
+    assert!(map.contains_key(&AxisId::Renumbered(100)));
+    assert!(map.contains_key(&grouped_axis.child(0)));
+    assert!(map.contains_key(&grouped_axis.child(1)));
+    assert!(map.contains_key(&grouped_axis.group_reduce_loop()));
 
-    // No expansion needed - should pass through unchanged
-    let result = pre_expand(&vectorize);
-
-    // Should still be VECTORIZE (or equivalent)
-    assert_eq!(result.dtype().vcount(), 2);
-}
-
-#[test]
-fn test_fix_reduce_unroll_with_unroll_ops() {
-    // Test new Tinygrad-aligned behavior: fix_reduce_unroll partitions
-    // REDUCE.ranges into RANGE ops vs UNROLL ops, moving UNROLL to CONTRACT.
-    //
-    // This tests simplified partition-based logic.
-
-    // Create an UNROLL op (simulates what Phase 1 produces from Range(Unroll))
-    let values =
-        UOp::vconst(vec![ConstValue::Int(0), ConstValue::Int(1), ConstValue::Int(2), ConstValue::Int(3)], DType::Int64);
-    let unroll = values.unroll(vec![(1, 4)]);
-
-    // Create a Reduce range
-    let reduce_end = UOp::const_(DType::Index, ConstValue::Int(16));
-    let reduce_range = UOp::range_axis(reduce_end, svod_ir::AxisId::Renumbered(0), AxisType::Reduce);
-
-    let src = UOp::const_(DType::Float32, ConstValue::Float(0.0));
-    let reduce = src.reduce(smallvec::smallvec![reduce_range.clone(), unroll], ReduceOp::Add);
-
-    // fix_reduce_unroll should:
-    // 1. Partition ranges into [Range(Reduce)] and [UNROLL]
-    // 2. Create CONTRACT wrapper on source with UNROLL axes
-    // 3. Return REDUCE with only Range ops
-    let result = fix_reduce_unroll(&reduce);
-    assert!(result.is_some(), "Expected Some when UNROLL is in ranges");
-
-    if let Some(fixed) = result
-        && let Op::Reduce { src: fixed_src, ranges, .. } = fixed.op()
-    {
-        // Source should be wrapped in CONTRACT
-        assert!(matches!(fixed_src.op(), Op::Contract { .. }), "Expected CONTRACT wrapper");
-        // Ranges should only contain Range ops (UNROLL moved to CONTRACT)
-        assert!(ranges.iter().all(|r| matches!(r.op(), Op::Range { .. })), "All ranges should be Range ops");
-    }
-}
-
-/// Test REDUCE bug: ranges=[] after fix_reduce_unroll when Range(Reduce) is in ranges.
-///
-/// Problem: When REDUCE has Range(Reduce) and UNROLL in its ranges, fix_reduce_unroll
-/// should partition into reduce_range (Range ops) and reduce_expand (UNROLL ops).
-/// The bug is that Range(Reduce) is being lost, resulting in ranges=[].
-///
-/// Example:
-/// - Before: REDUCE(ranges=[Range(R0, Reduce), RANGE(R3, Unroll)])
-/// - Expected after fix_reduce_unroll: REDUCE(ranges=[Range(R0, Reduce)], src=CONTRACT(...))
-/// - Actual: REDUCE(ranges=[]) → horizontal_reduce returns input unchanged (wrong dtype)
-#[test]
-fn test_reduce_empty_ranges_bug() {
-    // Create data buffer representing [[1.0, 2.0], [3.0, 4.0]]
-    // Layout: [1.0, 2.0, 3.0, 4.0]
-    let data_buf = UOp::buffer_id(Some(0));
-    let _data_val = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-
-    // Create INDEX to access elements
-    // Simulating axis 1 reduction: for each row, sum columns 0 and 1
-    // After reduce, should have 2 elements (one per row)
-    let index = UOp::index().buffer(data_buf).indices(vec![UOp::index_const(0)]).call().expect("index");
-
-    // Create REDUCE with both Range(Reduce) and UNROLL
-    // Range(R0, Reduce): the reduce axis (axis 1)
-    // RANGE(R3, Unroll): unrolled axis (axis 0)
-    let reduce_end = UOp::const_(DType::Index, ConstValue::Int(2));
-    let reduce_range = UOp::range_axis(reduce_end, svod_ir::AxisId::Renumbered(0), AxisType::Reduce);
-
-    // Create UNROLL for axis 0 (keepdim behavior)
-    let values = UOp::vconst(vec![ConstValue::Int(0), ConstValue::Int(1)], DType::Int64);
-    let unroll = values.unroll(vec![(1, 2)]);
-
-    // REDUCE with both Range and UNROLL
-    let reduce = index.reduce(smallvec::smallvec![reduce_range.clone(), unroll], ReduceOp::Add);
-
-    println!("BEFORE pre_expand:");
-    println!("REDUCE: {}", reduce.tree());
-
-    // Run pre_expand (which calls fix_reduce_unroll)
-    let result = pre_expand(&reduce);
-
-    println!("AFTER pre_expand:");
-    println!("RESULT: {}", result.tree());
-
-    // The bug manifests when result has empty ranges
-    if let Op::Reduce { ranges, .. } = result.op()
-        && ranges.is_empty()
-    {
-        panic!(
-            "BUG: REDUCE has empty ranges after pre_expand - this causes horizontal_reduce to return unchanged input"
-        );
-    }
-}
-
-/// `pre_expand` is a single combined rewrite (`sym + pm_pre_expander +
-/// pm_group_for_reduce + expander`) — no Phase 1 pre-pass.
-///
-/// Behavioral assertion: a REDUCE containing both an UNROLL source and a
-/// `Range(Reduce)` resolves in one `pre_expand` call. The result must NOT
-/// be the same REDUCE with mixed Range+UNROLL ranges, must NOT have empty
-/// ranges (see `test_reduce_empty_ranges_bug`), and remaining ranges must
-/// be pure `Op::Range`, not `Op::Unroll`.
-#[test]
-fn test_pre_expand_single_pass_handles_unroll_and_reduce_together() {
-    // UNROLL source with axis id 1.
-    let values =
-        UOp::vconst(vec![ConstValue::Int(0), ConstValue::Int(1), ConstValue::Int(2), ConstValue::Int(3)], DType::Int64);
-    let unroll = values.unroll(vec![(1, 4)]);
-
-    // Range(Reduce) with axis id 0.
-    let reduce_end = UOp::const_(DType::Index, ConstValue::Int(8));
-    let reduce_range = UOp::range_axis(reduce_end, svod_ir::AxisId::Renumbered(0), AxisType::Reduce);
-
-    let src = UOp::const_(DType::Float32, ConstValue::Float(0.0));
-    let reduce = src.reduce(smallvec::smallvec![reduce_range, unroll], ReduceOp::Add);
-
-    let result = pre_expand(&reduce);
-
-    // Walk the result and confirm no node is a REDUCE that still contains
-    // an UNROLL in its `ranges`. After a single combined rewrite the UNROLL
-    // must have been absorbed (typically into a CONTRACT wrapper).
-    fn no_unroll_in_reduce_ranges(uop: &std::sync::Arc<UOp>, depth: usize) {
-        if depth > 32 {
-            return; // guard against pathological depth
-        }
-        if let Op::Reduce { ranges, .. } = uop.op() {
-            assert!(
-                !ranges.is_empty(),
-                "REDUCE with empty ranges after pre_expand (guarded by test_reduce_empty_ranges_bug)"
-            );
-            for r in ranges {
-                assert!(
-                    !matches!(r.op(), Op::Unroll { .. }),
-                    "REDUCE.ranges must not contain Unroll after single-pass pre_expand; got {:?}",
-                    r.op()
-                );
-            }
-        }
-        for child in uop.op().sources() {
-            no_unroll_in_reduce_ranges(&child, depth + 1);
-        }
-    }
-    no_unroll_in_reduce_ranges(&result, 0);
+    let reduce = grouped.cast(DType::Float32).reduce(smallvec![grouped], ReduceOp::Add);
+    let lowered = graph_rewrite(pm_group_for_reduce(), reduce, &mut ());
+    assert!(lowered.toposort().iter().any(|node| {
+        matches!(node.op(), Op::Range { axis_id, axis_type: AxisType::Reduce, .. }
+            if axis_id == &grouped_axis.group_reduce_loop())
+    }));
+    assert!(!lowered.toposort().iter().any(|node| {
+        matches!(node.op(), Op::Range { axis_id: AxisId::Renumbered(100), axis_type: AxisType::Reduce, .. })
+    }));
 }

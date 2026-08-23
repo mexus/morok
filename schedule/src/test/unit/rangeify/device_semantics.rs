@@ -7,8 +7,6 @@
 //!
 //! Based on Tinygrad's device-related tests.
 
-use std::sync::Arc;
-
 use svod_dtype::{AddrSpace, DType, DeviceSpec};
 use svod_ir::{Op, UOp};
 
@@ -29,15 +27,10 @@ fn test_extract_device_from_buffer() {
 }
 
 #[test]
-fn test_device_uop_creation() {
-    // Create Device UOp directly
-    let device = UOp::device(DeviceSpec::Cpu);
-
-    if let Op::Device(spec) = device.op() {
-        assert_eq!(*spec, DeviceSpec::Cpu);
-    } else {
-        panic!("Expected Device op");
-    }
+fn test_copy_device_metadata() {
+    let copy = UOp::native_const(1.0f32).copy_to_device(DeviceSpec::Cpu);
+    assert!(matches!(copy.op(), Op::Copy { device: DeviceSpec::Cpu, .. }));
+    assert_eq!(copy.op().children().len(), 1);
 }
 
 // ===== Address Space Tests =====
@@ -75,11 +68,10 @@ fn test_multiple_buffers_same_device() {
     let b = UOp::new_buffer(DeviceSpec::Cpu, 100, DType::Float32);
 
     // Both should have CPU device
-    if let Op::Buffer { device: dev_a, .. } = a.op()
-        && let Op::Buffer { device: dev_b, .. } = b.op()
-        && let (Op::Device(spec_a), Op::Device(spec_b)) = (dev_a.op(), dev_b.op())
+    if let Op::Buffer { arg: arg_a, .. } = a.op()
+        && let Op::Buffer { arg: arg_b, .. } = b.op()
     {
-        assert_eq!(spec_a, spec_b, "Same device type should match");
+        assert_eq!(arg_a.device, arg_b.device, "Same device type should match");
     }
 }
 
@@ -105,25 +97,9 @@ fn test_device_propagation_through_ops() {
 
     // Verify each buffer has a device child
     for node in &topo {
-        if let Op::Buffer { device, .. } = node.op() {
-            assert!(matches!(device.op(), Op::Device(_)), "Buffer should have device");
+        if let Op::Buffer { arg, .. } = node.op() {
+            assert!(arg.device.is_some(), "Buffer should have device");
         }
-    }
-}
-
-// ===== Buffer View Device =====
-
-#[test]
-fn test_buffer_view_inherits_device() {
-    // Buffer view should reference original buffer's device
-    let buffer = UOp::new_buffer(DeviceSpec::Cpu, 100, DType::Float32);
-    let view = buffer.view(50, 10);
-
-    // View contains reference to original buffer
-    if let Op::BufferView { buffer: ref_buf, .. } = view.op() {
-        assert!(Arc::ptr_eq(ref_buf, &buffer));
-    } else {
-        panic!("Expected BufferView op");
     }
 }
 

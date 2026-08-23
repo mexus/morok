@@ -6,7 +6,6 @@ pub mod codegen_integration;
 pub mod codegen_patterns;
 pub mod context;
 pub mod cycle_detection;
-pub mod dead_axis;
 pub mod deduplication;
 pub mod device_semantics;
 pub mod edge_cases;
@@ -26,8 +25,10 @@ pub mod range_merging;
 pub mod reduce_simplify;
 pub mod remove_bufferize;
 pub mod resolve_call;
+pub mod simplify_ranges;
 pub mod split_kernel;
 pub mod split_patterns;
+pub mod split_ranges;
 pub mod split_reduceop;
 pub mod transform;
 

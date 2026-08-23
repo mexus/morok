@@ -227,8 +227,7 @@ fn test_split_with_expand_detects_broadcast() {
     let reshaped =
         buffer.try_reshape(&vec![SInt::Const(100), SInt::Const(1), SInt::Const(1000)].into_iter().collect()).unwrap();
 
-    let expand_shape =
-        UOp::vectorize(vec![UOp::index_const(100), UOp::index_const(500), UOp::index_const(1000)].into());
+    let expand_shape = UOp::stack(vec![UOp::index_const(100), UOp::index_const(500), UOp::index_const(1000)].into());
     let expanded = UOp::new(Op::Expand { src: reshaped, new_shape: expand_shape }, DType::Float32);
 
     // Reduce on axis 1 (the expanded dimension)
@@ -258,7 +257,7 @@ fn test_split_with_nested_movement_ops() {
     let reshaped1 = buffer.try_reshape(&vec![SInt::Const(50), SInt::Const(1)].into_iter().collect()).unwrap();
 
     // Expand to [50, 1000] (axis 1 broadcast)
-    let expand_shape = UOp::vectorize(vec![UOp::index_const(50), UOp::index_const(1000)].into());
+    let expand_shape = UOp::stack(vec![UOp::index_const(50), UOp::index_const(1000)].into());
     let expanded = UOp::new(svod_ir::Op::Expand { src: reshaped1, new_shape: expand_shape }, DType::Float32);
 
     // Reshape to [50000] (flatten)
@@ -294,8 +293,7 @@ fn test_split_skips_expanded_dimensions() {
     let reshaped =
         buffer.try_reshape(&vec![SInt::Const(100), SInt::Const(1), SInt::Const(100000)].into_iter().collect()).unwrap();
 
-    let expand_shape =
-        UOp::vectorize(vec![UOp::index_const(100), UOp::index_const(50), UOp::index_const(100000)].into());
+    let expand_shape = UOp::stack(vec![UOp::index_const(100), UOp::index_const(50), UOp::index_const(100000)].into());
     let expanded = UOp::new(svod_ir::Op::Expand { src: reshaped, new_shape: expand_shape }, DType::Float32);
 
     // Reduce on axis 2

@@ -5,7 +5,6 @@
 //!
 //! Based on Tinygrad's PTX/NIR bool->uint8 patterns.
 
-use smallvec::smallvec;
 use svod_dtype::{DType, ScalarDType};
 use svod_ir::types::ConstValue;
 use svod_ir::{Op, UOp};
@@ -25,7 +24,7 @@ fn test_bool_load_to_uint8() {
     let index = create_index(buffer.clone(), 0);
 
     // Create a LOAD that returns bool
-    let load = create_load(buffer.clone(), index);
+    let load = create_load(index);
 
     // Verify initial state
     assert_eq!(load.dtype().base(), ScalarDType::Bool);
@@ -55,7 +54,7 @@ fn test_bool_load_to_uint8() {
 fn test_non_bool_load_unchanged() {
     let buffer = create_buffer(64); // float32 buffer
     let index = create_index(buffer.clone(), 0);
-    let load = create_load(buffer.clone(), index);
+    let load = create_load(index);
 
     assert_eq!(load.dtype().base(), ScalarDType::Float32);
 
@@ -71,7 +70,7 @@ fn test_non_bool_load_unchanged() {
 fn test_int32_load_unchanged() {
     let buffer = create_buffer_typed(64, ScalarDType::Int32);
     let index = create_index(buffer.clone(), 0);
-    let load = create_load(buffer.clone(), index);
+    let load = create_load(index);
 
     let result = apply_bool_storage(&load);
 
@@ -133,6 +132,16 @@ fn test_non_bool_store_unchanged() {
     }
 }
 
+#[test]
+fn test_invalid_bool_store_is_left_for_final_cleanup() {
+    let buffer = create_bool_buffer(1);
+    let index = create_index(buffer, 0);
+    let store = create_store(index, UOp::invalid_marker());
+
+    let result = apply_bool_storage(&store);
+    assert!(std::sync::Arc::ptr_eq(&result, &store));
+}
+
 // =============================================================================
 // Roundtrip Tests
 // =============================================================================
@@ -149,7 +158,7 @@ fn test_bool_roundtrip() {
     let store_result = apply_bool_storage(&store);
 
     // Load bool value
-    let load = create_load(buffer.clone(), index);
+    let load = create_load(index);
     let load_result = apply_bool_storage(&load);
 
     // Verify store has uint8 cast
@@ -168,7 +177,7 @@ fn test_bool_roundtrip() {
 fn test_bool_with_devectorize() {
     let buffer = create_bool_buffer(64);
     let index = create_index(buffer.clone(), 0);
-    let load = create_load(buffer.clone(), index);
+    let load = create_load(index);
 
     // Apply full devectorize (all phases)
     let result = apply_devectorize(&load);
@@ -179,6 +188,16 @@ fn test_bool_with_devectorize() {
         result.dtype().base() == ScalarDType::Bool || result.dtype().base() == ScalarDType::UInt8,
         "Result should be bool or uint8"
     );
+}
+
+#[test]
+fn test_bool_bitcast_with_devectorize_becomes_cast() {
+    let bitcast = UOp::new(Op::BitCast { src: create_bool_const(true), dtype: DType::UInt8 }, DType::UInt8);
+
+    let result = apply_devectorize(&bitcast);
+
+    assert!(!result.toposort().iter().any(|uop| matches!(uop.op(), Op::BitCast { .. })));
+    assert_eq!(result.dtype(), DType::UInt8);
 }
 
 // =============================================================================
@@ -194,7 +213,7 @@ fn test_vector_bool_load() {
     let index = create_index(buffer.clone(), 0);
 
     // Create load with explicit bool dtype
-    let load = create_load(buffer.clone(), index);
+    let load = create_load(index);
 
     let result = apply_bool_storage(&load);
 
@@ -226,7 +245,7 @@ fn test_vector_bool_store() {
             Op::Cast { dtype, .. } => {
                 assert_eq!(dtype.base(), ScalarDType::UInt8);
             }
-            Op::Vectorize { .. } => {
+            Op::Stack { .. } => {
                 // Could be VECTORIZE of casts
             }
             _ => {}
@@ -234,25 +253,23 @@ fn test_vector_bool_store() {
     }
 }
 
-/// Test: bool_storage keeps alt on gated loads.
+/// Post-gater boundary: bool_storage keeps the gate and converted alt.
 #[test]
 fn test_bool_gated_load_preserves_alt() {
     let buffer = create_bool_buffer(64);
     let idx = UOp::const_(DType::Index, ConstValue::Int(0));
     let gate = create_bool_const(false);
-    let gated_index =
-        UOp::new(Op::Index { buffer: buffer.clone(), indices: smallvec![idx], gate: Some(gate) }, DType::Bool);
-    let load =
-        UOp::load().buffer(buffer.clone()).index(gated_index).alt(create_bool_const(true)).dtype(DType::Bool).call();
+    let index = UOp::index().buffer(buffer).indices(vec![idx]).call().unwrap();
+    let load = UOp::load().index(index).alt(create_bool_const(true)).gate(gate).call();
 
     let result = apply_bool_storage(&load);
     let Op::Cast { src, .. } = result.op() else {
         panic!("Expected CAST wrapping converted bool load, got {:?}", result.op());
     };
-    let Op::Load { index, alt, .. } = src.op() else {
+    let Op::Load { alt, gate, .. } = src.op() else {
         panic!("Expected inner LOAD after bool storage, got {:?}", src.op());
     };
-    assert!(matches!(index.op(), Op::Index { gate: Some(_), .. }), "Expected gated INDEX to remain on LOAD");
+    assert!(gate.is_some(), "Expected late LOAD gate to be preserved");
     let Some(alt) = alt else {
         panic!("Expected gated LOAD alt to be preserved by bool_storage");
     };

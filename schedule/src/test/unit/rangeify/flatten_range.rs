@@ -1,7 +1,6 @@
 //! Tests for range flattening and canonicalization.
 //!
-//! Validates that flatten_range correctly unnests and canonicalizes RANGE operations
-//! for kernel deduplication.
+//! Validates that flatten_range canonicalizes ended RANGE dependencies.
 
 use std::sync::Arc;
 
@@ -42,8 +41,8 @@ fn test_flatten_ranges_identity() {
 // ===== Nesting Tests =====
 
 #[test]
-fn test_flatten_range_nested_end() {
-    // END(END(x, [r1]), [r2]) → END(x, [r1, r2])
+fn test_flatten_range_does_not_unwrap_nested_end_counterexample() {
+    // Tinygrad only flattens the explicit ended-range sources, not computation ENDs.
     use smallvec::smallvec;
     use svod_ir::Op;
 
@@ -55,24 +54,15 @@ fn test_flatten_range_nested_end() {
     let inner_end = computation.clone().end(smallvec![r1.clone()]);
     let outer_end = inner_end.end(smallvec![r2.clone()]);
 
-    // Flatten
     let flattened = flatten_range_impl(&outer_end);
-
-    // Should have flattened
-    assert!(flattened.is_some(), "Nested END should be flattened");
-
-    let flattened = flattened.unwrap();
-    if let Op::End { ranges, .. } = flattened.op() {
-        // Should contain both ranges (order may vary due to toposort)
-        assert_eq!(ranges.len(), 2, "Should have 2 ranges after flattening");
-    } else {
-        panic!("Expected END operation");
-    }
+    assert!(flattened.is_none());
+    assert!(
+        matches!(outer_end.op(), Op::End { computation, ranges } if Arc::ptr_eq(computation, &inner_end) && ranges.len() == 1)
+    );
 }
 
 #[test]
-fn test_flatten_range_deeply_nested() {
-    // END(END(END(x, [r1]), [r2]), [r3]) → END(x, [r1, r2, r3])
+fn test_flatten_range_does_not_unwrap_deeply_nested_end_counterexample() {
     use smallvec::smallvec;
     use svod_ir::Op;
 
@@ -86,22 +76,12 @@ fn test_flatten_range_deeply_nested() {
     let end2 = end1.end(smallvec![r2.clone()]);
     let end3 = end2.end(smallvec![r3.clone()]);
 
-    // Flatten
-    let flattened = flatten_range_impl(&end3);
-
-    assert!(flattened.is_some(), "Deeply nested END should be flattened");
-
-    let flattened = flattened.unwrap();
-    if let Op::End { ranges, .. } = flattened.op() {
-        assert_eq!(ranges.len(), 3, "Should have 3 ranges after deep flattening");
-    } else {
-        panic!("Expected END operation");
-    }
+    assert!(flatten_range_impl(&end3).is_none());
+    assert!(matches!(end3.op(), Op::End { ranges, .. } if ranges.len() == 1));
 }
 
 #[test]
-fn test_flatten_range_preserves_computation() {
-    // Flattening should preserve the inner computation
+fn test_flatten_range_flattens_explicit_range_expression_and_preserves_computation() {
     use smallvec::smallvec;
     use svod_ir::Op;
 
@@ -113,9 +93,8 @@ fn test_flatten_range_preserves_computation() {
     let r1 = UOp::range(UOp::index_const(10), 0);
     let r2 = UOp::range(UOp::index_const(20), 1);
 
-    // END(END(add, [r1]), [r2])
-    let inner_end = add.clone().end(smallvec![r1.clone()]);
-    let outer_end = inner_end.end(smallvec![r2.clone()]);
+    let combined_range = r1.add(&r2);
+    let outer_end = add.clone().end(smallvec![combined_range]);
 
     let flattened = flatten_range_impl(&outer_end);
 
@@ -123,24 +102,15 @@ fn test_flatten_range_preserves_computation() {
     let flattened = flattened.unwrap();
 
     if let Op::End { computation, ranges } = flattened.op() {
-        // Computation should be preserved (the inner END, which contains the add)
-        // Note: flatten_range_impl only flattens one level at a time
+        assert!(Arc::ptr_eq(computation, &add));
         assert_eq!(ranges.len(), 2);
-
-        // The computation is now the inner END (with its single range)
-        // To fully flatten, we'd need to call flatten_ranges which uses toposort
-        if let Op::End { computation: inner_comp, .. } = computation.op() {
-            // Inner computation should be the ADD
-            assert!(matches!(inner_comp.op(), Op::Binary(..)));
-        }
     } else {
         panic!("Expected END operation");
     }
 }
 
 #[test]
-fn test_flatten_ranges_full_graph() {
-    // Test full graph flattening via flatten_ranges
+fn test_flatten_ranges_nested_end_graph_is_identity() {
     use smallvec::smallvec;
     use svod_ir::Op;
 
@@ -152,13 +122,8 @@ fn test_flatten_ranges_full_graph() {
     let inner_end = computation.clone().end(smallvec![r1.clone()]);
     let outer_end = inner_end.end(smallvec![r2.clone()]);
 
-    // Full graph flattening
     let flattened = flatten_ranges(&outer_end);
-
-    // Should have applied transformation (different pointer)
-    assert!(!Arc::ptr_eq(&flattened, &outer_end), "Graph should be transformed");
-
-    // Result should still be an END
+    assert!(Arc::ptr_eq(&flattened, &outer_end));
     assert!(matches!(flattened.op(), Op::End { .. }));
 }
 

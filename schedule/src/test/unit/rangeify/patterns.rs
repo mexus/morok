@@ -2,7 +2,7 @@
 //!
 //! Tests verify that all pattern matchers correctly transform UOps:
 //! - early_rewrites: DETACH and CONTIGUOUS_BACKWARD removal
-//! - buffer_folding: Noop bufferize removal and constant propagation
+//! - buffer_folding: Noop stage removal and constant propagation
 //! - dead_axis_removal: Remove size-1 dimensions
 //! - buffer_removal: Cost-based buffer elimination
 //!
@@ -11,9 +11,8 @@
 use std::f32::consts::PI;
 use std::sync::Arc;
 
-use svod_device::DeviceSpec;
 use svod_dtype::DType;
-use svod_ir::{AxisId, AxisType, BufferizeOpts, ConstValue, Op, ReduceOp, UOp};
+use svod_ir::{AxisId, AxisType, BufferizeOpts, ConstValue, Op, UOp};
 
 use crate::pattern::RewriteResult;
 use crate::rangeify::IndexingContext;
@@ -92,16 +91,16 @@ fn test_early_rewrites_nested_detach() {
 fn test_buffer_folding_noop_bufferize() {
     let matcher = patterns::buffer_folding();
 
-    // Test: INDEX(BUFFERIZE(x, ranges), ranges) → x when ranges are equal
+    // Test: INDEX(STAGE(x, ranges), ranges) → x when ranges are equal
     let x = UOp::native_const(1.0f32);
     let range_end = UOp::index_const(10);
     let range = UOp::range_axis(range_end, AxisId::Renumbered(0), AxisType::Loop);
 
-    let bufferize = UOp::bufferize(x.clone(), vec![range.clone()], BufferizeOpts::local());
-    let index = UOp::index().buffer(bufferize).indices(vec![range]).call().unwrap();
+    let stage = UOp::stage(x.clone(), vec![range.clone()], BufferizeOpts::local());
+    let index = UOp::index().buffer(stage).indices(vec![range]).call().unwrap();
 
     let result = matcher.rewrite(&index, &mut ());
-    assert!(matches!(result, RewriteResult::Rewritten(_)), "Should remove noop BUFFERIZE");
+    assert!(matches!(result, RewriteResult::Rewritten(_)), "Should remove noop STAGE");
 
     if let RewriteResult::Rewritten(rewritten) = result {
         assert!(Arc::ptr_eq(&rewritten, &x), "Should return the compute directly");
@@ -112,14 +111,14 @@ fn test_buffer_folding_noop_bufferize() {
 fn test_buffer_folding_bufferize_const() {
     let matcher = patterns::buffer_folding();
 
-    // Test: BUFFERIZE(CONST) → CONST
+    // Test: STAGE(CONST) → CONST
     let const_val = UOp::native_const(42.0f32);
     let range_end = UOp::index_const(10);
     let range = UOp::range_axis(range_end, AxisId::Renumbered(0), AxisType::Loop);
-    let bufferize = UOp::bufferize(const_val.clone(), vec![range], BufferizeOpts::local());
+    let stage = UOp::stage(const_val.clone(), vec![range], BufferizeOpts::local());
 
-    let result = matcher.rewrite(&bufferize, &mut ());
-    assert!(matches!(result, RewriteResult::Rewritten(_)), "Should remove BUFFERIZE from CONST");
+    let result = matcher.rewrite(&stage, &mut ());
+    assert!(matches!(result, RewriteResult::Rewritten(_)), "Should remove STAGE from CONST");
 
     if let RewriteResult::Rewritten(rewritten) = result {
         assert!(Arc::ptr_eq(&rewritten, &const_val), "Should return the constant directly");
@@ -150,8 +149,7 @@ fn test_buffer_folding_copy_const() {
 
     // Test: COPY(CONST, device) → CONST
     let const_val = UOp::native_const(1.0f32);
-    let device = UOp::device(svod_ir::DeviceSpec::Cpu);
-    let copy = const_val.copy(device);
+    let copy = const_val.copy(svod_ir::DeviceSpec::Cpu);
 
     let result = matcher.rewrite(&copy, &mut ());
     assert!(matches!(result, RewriteResult::Rewritten(_)), "Should remove COPY from CONST");
@@ -165,7 +163,7 @@ fn test_buffer_folding_copy_const() {
 fn test_buffer_folding_no_match_different_ranges() {
     let matcher = patterns::buffer_folding();
 
-    // Test: INDEX(BUFFERIZE(x, r1), r2) should NOT match when r1 != r2
+    // Test: INDEX(STAGE(x, r1), r2) should NOT match when r1 != r2
     let x = UOp::native_const(1.0f32);
     let range1_end = UOp::index_const(10);
     let range1 = UOp::range_axis(range1_end, AxisId::Renumbered(0), AxisType::Loop);
@@ -173,8 +171,8 @@ fn test_buffer_folding_no_match_different_ranges() {
     let range2_end = UOp::index_const(20);
     let range2 = UOp::range_axis(range2_end, AxisId::Renumbered(1), AxisType::Loop);
 
-    let bufferize = UOp::bufferize(x, vec![range1], BufferizeOpts::local());
-    let index = UOp::index().buffer(bufferize).indices(vec![range2]).call().unwrap();
+    let stage = UOp::stage(x, vec![range1], BufferizeOpts::local());
+    let index = UOp::index().buffer(stage).indices(vec![range2]).call().unwrap();
 
     let result = matcher.rewrite(&index, &mut ());
     // This might match or not depending on implementation details,
@@ -195,21 +193,21 @@ fn test_buffer_folding_no_match_different_ranges() {
 fn test_dead_axis_removal_single_dead_axis() {
     let matcher = patterns::dead_axis_removal();
 
-    // Create a BUFFERIZE with one dead axis (range with size 1)
+    // Create a STAGE with one dead axis (range with size 1)
     let x = UOp::native_const(1.0f32);
     let dead_range_end = UOp::index_const(1); // size 1 = dead
     let dead_range = UOp::range_axis(dead_range_end, AxisId::Renumbered(0), AxisType::Loop);
 
-    let bufferize = UOp::bufferize(x.clone(), vec![dead_range], BufferizeOpts::local());
+    let stage = UOp::stage(x.clone(), vec![dead_range], BufferizeOpts::local());
 
-    let result = matcher.rewrite(&bufferize, &mut ());
+    let result = matcher.rewrite(&stage, &mut ());
 
     // Should restructure to [EXPAND(]RESHAPE(BUFFERIZE_no_ranges)[)] - Tinygrad behavior
-    // The BUFFERIZE is KEPT (not removed) so it can be converted to STORE later.
+    // The STAGE is KEPT (not removed) so it can be converted to STORE later.
     // Note: identity EXPAND is eliminated at construction time, so EXPAND may not be present.
     match result {
         RewriteResult::Rewritten(rewritten) => {
-            // Accept EXPAND(RESHAPE(BUFFERIZE)) or RESHAPE(BUFFERIZE) (when expand is identity)
+            // Accept EXPAND(RESHAPE(STAGE)) or RESHAPE(STAGE) (when expand is identity)
             let reshape_op = match rewritten.op() {
                 Op::Expand { src, .. } => src,
                 Op::Reshape { .. } => &rewritten,
@@ -217,8 +215,8 @@ fn test_dead_axis_removal_single_dead_axis() {
             };
             if let Op::Reshape { src: bufferize_op, .. } = reshape_op.op() {
                 assert!(
-                    matches!(bufferize_op.op(), Op::Bufferize { ranges, .. } if ranges.is_empty()),
-                    "Inner should be BUFFERIZE with no ranges, got: {}",
+                    matches!(bufferize_op.op(), Op::Stage { ranges, .. } if ranges.is_empty()),
+                    "Inner should be STAGE with no ranges, got: {}",
                     rewritten.tree()
                 );
             } else {
@@ -235,7 +233,7 @@ fn test_dead_axis_removal_single_dead_axis() {
 fn test_dead_axis_removal_mixed_axes() {
     let matcher = patterns::dead_axis_removal();
 
-    // Create BUFFERIZE with mix of live and dead axes
+    // Create STAGE with mix of live and dead axes
     // NOTE: When compute is native_const (no ranges), ALL ranges are dead
     // because compute doesn't depend on any of them (Tinygrad behavior)
     let x = UOp::native_const(1.0f32);
@@ -245,9 +243,9 @@ fn test_dead_axis_removal_mixed_axes() {
     let dead_range_end = UOp::index_const(1);
     let dead_range = UOp::range_axis(dead_range_end, AxisId::Renumbered(1), AxisType::Loop);
 
-    let bufferize = UOp::bufferize(x.clone(), vec![live_range.clone(), dead_range], BufferizeOpts::local());
+    let stage = UOp::stage(x.clone(), vec![live_range.clone(), dead_range], BufferizeOpts::local());
 
-    let result = matcher.rewrite(&bufferize, &mut ());
+    let result = matcher.rewrite(&stage, &mut ());
 
     match result {
         RewriteResult::Rewritten(rewritten) => {
@@ -256,8 +254,8 @@ fn test_dead_axis_removal_mixed_axes() {
             if let Op::Expand { src: reshape_op, .. } = rewritten.op() {
                 if let Op::Reshape { src: bufferize_op, .. } = reshape_op.op() {
                     assert!(
-                        matches!(bufferize_op.op(), Op::Bufferize { ranges, .. } if ranges.is_empty()),
-                        "Inner should be BUFFERIZE with no ranges, got: {}",
+                        matches!(bufferize_op.op(), Op::Stage { ranges, .. } if ranges.is_empty()),
+                        "Inner should be STAGE with no ranges, got: {}",
                         rewritten.tree()
                     );
                 } else {
@@ -278,7 +276,7 @@ fn test_dead_axis_removal_mixed_axes() {
 fn test_dead_axis_removal_no_dead_axes_simple_compute() {
     let matcher = patterns::dead_axis_removal();
 
-    // Create BUFFERIZE with "live" axes (size > 1), but simple compute (no ranges)
+    // Create STAGE with "live" axes (size > 1), but simple compute (no ranges)
     // NOTE: When compute is native_const (no ranges), ALL ranges are dead
     // because compute doesn't depend on any of them (Tinygrad behavior)
     let x = UOp::native_const(1.0f32);
@@ -288,9 +286,9 @@ fn test_dead_axis_removal_no_dead_axes_simple_compute() {
     let range2_end = UOp::index_const(20);
     let range2 = UOp::range_axis(range2_end, AxisId::Renumbered(1), AxisType::Loop);
 
-    let bufferize = UOp::bufferize(x.clone(), vec![range1, range2], BufferizeOpts::local());
+    let stage = UOp::stage(x.clone(), vec![range1, range2], BufferizeOpts::local());
 
-    let result = matcher.rewrite(&bufferize, &mut ());
+    let result = matcher.rewrite(&stage, &mut ());
 
     // All ranges are dead (compute has no ranges) → EXPAND(RESHAPE(BUFFERIZE_no_ranges))
     match result {
@@ -299,8 +297,8 @@ fn test_dead_axis_removal_no_dead_axes_simple_compute() {
             if let Op::Expand { src: reshape_op, .. } = rewritten.op() {
                 if let Op::Reshape { src: bufferize_op, .. } = reshape_op.op() {
                     assert!(
-                        matches!(bufferize_op.op(), Op::Bufferize { ranges, .. } if ranges.is_empty()),
-                        "Inner should be BUFFERIZE with no ranges, got: {}",
+                        matches!(bufferize_op.op(), Op::Stage { ranges, .. } if ranges.is_empty()),
+                        "Inner should be STAGE with no ranges, got: {}",
                         rewritten.tree()
                     );
                 } else {
@@ -327,7 +325,7 @@ fn test_movement_op_removal_no_match_without_ranges() {
     let permute = UOp::new(Op::Permute { src: src.clone(), axes: vec![1, 0] }, DType::Float32);
 
     // Without ranges assigned, should NOT remove
-    // (The bufferize pattern will try to match but return None without ranges)
+    // (The stage pattern will try to match but return None without ranges)
     let result = matcher.rewrite(&permute, &mut ctx);
     assert!(matches!(result, RewriteResult::NoMatch), "Should NOT remove movement op without ranges assigned");
 }
@@ -370,7 +368,7 @@ fn test_movement_op_removal_reshape() {
 
     // Create a RESHAPE operation
     let src = UOp::native_const(1.0f32);
-    let new_shape = UOp::vectorize(smallvec::smallvec![UOp::index_const(4), UOp::index_const(8)]);
+    let new_shape = UOp::stack(smallvec::smallvec![UOp::index_const(4), UOp::index_const(8)]);
     let reshape = UOp::new(Op::Reshape { src: src.clone(), new_shape }, DType::Float32);
 
     // Assign ranges
@@ -402,7 +400,7 @@ fn test_movement_op_removal_expand() {
 
     // Create an EXPAND operation
     let src = UOp::native_const(1.0f32);
-    let new_shape = UOp::vectorize(smallvec::smallvec![UOp::index_const(4), UOp::index_const(8)]);
+    let new_shape = UOp::stack(smallvec::smallvec![UOp::index_const(4), UOp::index_const(8)]);
     let expand = UOp::new(Op::Expand { src: src.clone(), new_shape }, DType::Float32);
 
     // Assign ranges
@@ -438,47 +436,10 @@ fn test_movement_op_removal_non_movement_op() {
     let sqrt = src.try_sqrt().unwrap();
 
     // Non-movement ops without ranges should not match the movement removal pattern
-    // (they may match other patterns like bufferize, but without ranges assigned,
+    // (they may match other patterns like stage, but without ranges assigned,
     // apply_bufferize_transform returns None)
     let result = matcher.rewrite(&sqrt, &mut ctx);
     assert!(matches!(result, RewriteResult::NoMatch), "Should not match non-movement ops without ranges");
-}
-
-#[test]
-fn test_pad_fallback_recovers_without_suppression() {
-    let matcher = patterns::apply_rangeify_patterns();
-    let mut ctx = IndexingContext::new();
-
-    for _ in 0..300 {
-        let _ = ctx.record_pad_fallback();
-    }
-
-    let src = UOp::new_buffer(DeviceSpec::Cpu, 4, DType::Float32);
-    let r = UOp::range_axis(UOp::index_const(4), AxisId::Renumbered(0), AxisType::Loop);
-    ctx.set_ranges(&src, vec![r.clone()], vec![r]);
-
-    let begin_pads = UOp::vectorize(vec![UOp::index_const(1)].into());
-    let end_pads = UOp::vectorize(vec![UOp::index_const(1)].into());
-    let pad = UOp::new(Op::Pad { src, begin_pads, end_pads }, DType::Float32);
-
-    let result = matcher.rewrite(&pad, &mut ctx);
-    assert!(matches!(result, RewriteResult::Rewritten(_)), "PAD fallback should remain enabled");
-}
-
-#[test]
-fn test_reduceaxis_fallback_recovers_without_suppression() {
-    let matcher = patterns::apply_rangeify_patterns();
-    let mut ctx = IndexingContext::new();
-
-    for _ in 0..300 {
-        let _ = ctx.record_reduceaxis_fallback();
-    }
-
-    let src = UOp::new_buffer(DeviceSpec::Cpu, 4, DType::Float32);
-    let reduce = src.try_reduce_axis(ReduceOp::Add, vec![0]).unwrap();
-
-    let result = matcher.rewrite(&reduce, &mut ctx);
-    assert!(matches!(result, RewriteResult::Rewritten(_)), "ReduceAxis fallback should remain enabled");
 }
 
 // ===== Integration Tests =====
@@ -503,18 +464,18 @@ fn test_pattern_composition() {
         panic!("Should have rewritten");
     };
 
-    // Now wrap in BUFFERIZE
+    // Now wrap in STAGE
     let range_end = UOp::index_const(10);
     let range = UOp::range_axis(range_end, AxisId::Renumbered(0), AxisType::Loop);
-    let bufferize = UOp::bufferize(unwrapped, vec![range], BufferizeOpts::local());
+    let stage = UOp::stage(unwrapped, vec![range], BufferizeOpts::local());
 
-    // Apply buffer_folding to remove BUFFERIZE(CONST)
+    // Apply buffer_folding to remove STAGE(CONST)
     let folding = patterns::buffer_folding();
-    let result2 = folding.rewrite(&bufferize, &mut ());
+    let result2 = folding.rewrite(&stage, &mut ());
 
     match result2 {
         RewriteResult::Rewritten(rewritten) => {
-            assert!(Arc::ptr_eq(&rewritten, &x), "Should have removed both DETACH and BUFFERIZE");
+            assert!(Arc::ptr_eq(&rewritten, &x), "Should have removed both DETACH and STAGE");
         }
         _ => {
             // Acceptable depending on implementation

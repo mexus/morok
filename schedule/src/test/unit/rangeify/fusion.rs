@@ -74,7 +74,7 @@ fn test_binop_reshape_fusion() {
     let add = a.try_add(&b).unwrap();
 
     // Reshape to (10, 10)
-    let new_shape = UOp::vectorize(smallvec![UOp::index_const(10), UOp::index_const(10)]);
+    let new_shape = UOp::stack(smallvec![UOp::index_const(10), UOp::index_const(10)]);
     let reshaped = UOp::new(Op::Reshape { src: add, new_shape }, DType::Float32);
 
     let sink = UOp::sink(vec![reshaped]);
@@ -92,7 +92,7 @@ fn test_binop_permute_fusion() {
     let add = a.try_add(&b).unwrap();
 
     // First reshape to 2D
-    let new_shape = UOp::vectorize(smallvec![UOp::index_const(10), UOp::index_const(10)]);
+    let new_shape = UOp::stack(smallvec![UOp::index_const(10), UOp::index_const(10)]);
     let reshaped = UOp::new(Op::Reshape { src: add, new_shape }, DType::Float32);
 
     // Then permute (swap dims)
@@ -112,7 +112,7 @@ fn test_reduce_fusion_basic() {
     let a = create_buffer(100);
 
     // Create reshape first (reduce needs shape info)
-    let new_shape = UOp::vectorize(smallvec![UOp::index_const(10), UOp::index_const(10)]);
+    let new_shape = UOp::stack(smallvec![UOp::index_const(10), UOp::index_const(10)]);
     let reshaped = UOp::new(Op::Reshape { src: a, new_shape }, DType::Float32);
 
     // Reduce on axis 1
@@ -133,7 +133,7 @@ fn test_reduce_binop_fusion() {
     let add = a.try_add(&b).unwrap();
 
     // Reshape for reduction
-    let new_shape = UOp::vectorize(smallvec![UOp::index_const(10), UOp::index_const(10)]);
+    let new_shape = UOp::stack(smallvec![UOp::index_const(10), UOp::index_const(10)]);
     let reshaped = UOp::new(Op::Reshape { src: add, new_shape }, DType::Float32);
 
     // Reduce

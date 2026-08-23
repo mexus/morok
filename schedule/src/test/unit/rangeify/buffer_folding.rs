@@ -15,14 +15,14 @@ fn create_range(end: i64, axis_id: usize) -> Arc<UOp> {
 }
 
 fn create_bufferize(compute: Arc<UOp>, ranges: Vec<Arc<UOp>>) -> Arc<UOp> {
-    UOp::bufferize_global(compute, ranges)
+    UOp::stage_global(compute, ranges)
 }
 
 // Pattern 1: Noop Buffer Removal Tests
 
 #[test]
 fn test_noop_bufferize_same_ranges() {
-    // INDEX(BUFFERIZE(x, R), R) → x
+    // INDEX(STAGE(x, R), R) → x
     let x = UOp::param(1, 10, DType::Float32, None);
     let range = create_range(10, 0);
     let ranges = vec![range.clone()];
@@ -34,12 +34,12 @@ fn test_noop_bufferize_same_ranges() {
     let result = graph_rewrite(&matcher, indexed, &mut ());
 
     // Should fold to just x
-    assert!(Arc::ptr_eq(&result, &x), "Noop BUFFERIZE should be removed");
+    assert!(Arc::ptr_eq(&result, &x), "Noop STAGE should be removed");
 }
 
 #[test]
 fn test_noop_bufferize_different_ranges() {
-    // INDEX(BUFFERIZE(x, R1), R2) where R1 != R2 should NOT fold
+    // INDEX(STAGE(x, R1), R2) where R1 != R2 should NOT fold
     let x = UOp::param(1, 1024, DType::Float32, None);
     let range1 = create_range(10, 0);
     let range2 = create_range(10, 1); // Different axis_id
@@ -56,7 +56,7 @@ fn test_noop_bufferize_different_ranges() {
 
 #[test]
 fn test_noop_bufferize_multiple_ranges() {
-    // INDEX(BUFFERIZE(x, [R1, R2]), [R1, R2]) → x
+    // INDEX(STAGE(x, [R1, R2]), [R1, R2]) → x
     let x = UOp::param(1, 200, DType::Float32, None);
     let range1 = create_range(10, 0);
     let range2 = create_range(20, 1);
@@ -69,17 +69,14 @@ fn test_noop_bufferize_multiple_ranges() {
     let result = graph_rewrite(&matcher, indexed, &mut ());
 
     // Should fold to just x (after possible noop shrink)
-    assert!(
-        !matches!(result.op(), svod_ir::Op::Bufferize { .. }),
-        "Noop BUFFERIZE with multiple ranges should be removed"
-    );
+    assert!(!matches!(result.op(), svod_ir::Op::Stage { .. }), "Noop STAGE with multiple ranges should be removed");
 }
 
-// Pattern 2: BUFFERIZE(CONST) → CONST Tests
+// Pattern 2: STAGE(CONST) → CONST Tests
 
 #[test]
 fn test_bufferize_const_folding() {
-    // BUFFERIZE(CONST, ranges) → CONST
+    // STAGE(CONST, ranges) → CONST
     let const_val = create_const(42);
     let range = create_range(10, 0);
 
@@ -89,7 +86,7 @@ fn test_bufferize_const_folding() {
     let result = graph_rewrite(&matcher, bufferized, &mut ());
 
     // Should fold to just the constant
-    assert!(Arc::ptr_eq(&result, &const_val), "BUFFERIZE(CONST) should fold to CONST");
+    assert!(Arc::ptr_eq(&result, &const_val), "STAGE(CONST) should fold to CONST");
 }
 
 #[test]
@@ -110,7 +107,7 @@ fn test_bufferize_different_const_types() {
         let matcher = buffer_folding();
         let result = graph_rewrite(&matcher, bufferized, &mut ());
 
-        assert!(Arc::ptr_eq(&result, &const_val), "BUFFERIZE(CONST) should fold for {:?}", dtype);
+        assert!(Arc::ptr_eq(&result, &const_val), "STAGE(CONST) should fold for {:?}", dtype);
     }
 }
 
@@ -151,9 +148,7 @@ fn test_index_const_multiple_indices() {
 fn test_copy_const_folding() {
     // COPY(CONST, device) → CONST
     let const_val = create_const(99);
-    let device = UOp::device(svod_device::DeviceSpec::Cpu);
-
-    let copy = const_val.copy(device);
+    let copy = const_val.copy(svod_device::DeviceSpec::Cpu);
 
     let matcher = buffer_folding();
     let result = graph_rewrite(&matcher, copy, &mut ());
@@ -170,8 +165,7 @@ fn test_copy_const_different_devices() {
     let devices = vec![svod_device::DeviceSpec::Cpu, svod_device::DeviceSpec::Cuda { device_id: 0 }];
 
     for device_spec in devices {
-        let device = UOp::device(device_spec);
-        let copy = const_val.copy(device);
+        let copy = const_val.copy(device_spec);
 
         let matcher = buffer_folding();
         let result = graph_rewrite(&matcher, copy, &mut ());
@@ -184,7 +178,7 @@ fn test_copy_const_different_devices() {
 
 #[test]
 fn test_nested_constant_folding() {
-    // INDEX(BUFFERIZE(CONST, R1), R1) should fold through both patterns
+    // INDEX(STAGE(CONST, R1), R1) should fold through both patterns
     let const_val = create_const(123);
     let range = create_range(15, 0);
 
@@ -200,7 +194,7 @@ fn test_nested_constant_folding() {
 
 #[test]
 fn test_noop_fold_non_const_operations() {
-    // INDEX(BUFFERIZE(x, R), R) should fold to x even for non-constant operations
+    // INDEX(STAGE(x, R), R) should fold to x even for non-constant operations
     // Use symbolic variables instead of param (which requires pointer dtype)
     let x = UOp::var("x", DType::Float32, 0, 100);
     let y = UOp::var("y", DType::Float32, 0, 100);
@@ -215,5 +209,5 @@ fn test_noop_fold_non_const_operations() {
     let result = graph_rewrite(&matcher, indexed.clone(), &mut ());
 
     // Should fold - noop buffer removal works for all operations
-    assert!(Arc::ptr_eq(&result, &add), "Noop BUFFERIZE+INDEX should fold regardless of operation type");
+    assert!(Arc::ptr_eq(&result, &add), "Noop STAGE+INDEX should fold regardless of operation type");
 }

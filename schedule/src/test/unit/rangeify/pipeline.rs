@@ -2,8 +2,8 @@
 //!
 //! Tests verify the complete transformation pipeline from tensor operations
 //! to executable kernels:
-//! - Phase 1-4: run_rangeify (movement ops → BUFFERIZE+INDEX)
-//! - Phase 5: try_get_kernel_graph (BUFFERIZE → CALL wrappers)
+//! - Phase 1-4: run_rangeify (movement ops → STAGE+INDEX)
+//! - Phase 5: try_get_kernel_graph (STAGE → CALL wrappers)
 //! - End-to-end scenarios
 //!
 //! Based on Tinygrad's test_schedule.py integration tests.
@@ -199,7 +199,7 @@ fn test_run_rangeify_preserves_structure() {
 
     // Structure may change but computation should be equivalent
     match rangeified.op() {
-        Op::Binary { .. } | Op::Const(_) | Op::Bufferize { .. } | Op::Index { .. } => {
+        Op::Binary { .. } | Op::Const(_) | Op::Stage { .. } | Op::Index { .. } => {
             // All acceptable transformations
         }
         _ => {}
@@ -246,11 +246,13 @@ fn test_kernel_split_pipeline_with_end() {
 fn test_kernel_split_pipeline_load_store() {
     // Test: LOAD + STORE pattern
     let in_buf = UOp::new_buffer(DeviceSpec::Cpu, 100, DType::Float32);
-    let _out_buf = UOp::new_buffer(DeviceSpec::Cpu, 100, DType::Float32);
+    let out_buf = UOp::new_buffer(DeviceSpec::Cpu, 100, DType::Float32);
     let index = UOp::index_const(0);
 
-    let load = UOp::load().buffer(in_buf).index(index.clone()).call();
-    let store = index.store(load);
+    let load_index = UOp::index().buffer(in_buf).indices(vec![index.clone()]).call().unwrap();
+    let store_index = UOp::index().buffer(out_buf).indices(vec![index]).call().unwrap();
+    let load = UOp::load().index(load_index).call();
+    let store = store_index.store(load);
 
     let (result, _context) = try_get_kernel_graph(store).expect("kernel split pipeline should succeed for load/store");
 
@@ -263,13 +265,16 @@ fn test_kernel_split_pipeline_multiple_loads() {
     // Test: Multiple LOADs feeding into STORE
     let buf1 = UOp::new_buffer(DeviceSpec::Cpu, 100, DType::Float32);
     let buf2 = UOp::new_buffer(DeviceSpec::Cpu, 100, DType::Float32);
-    let _out_buf = UOp::new_buffer(DeviceSpec::Cpu, 100, DType::Float32);
+    let out_buf = UOp::new_buffer(DeviceSpec::Cpu, 100, DType::Float32);
     let index = UOp::index_const(0);
 
-    let load1 = UOp::load().buffer(buf1).index(index.clone()).call();
-    let load2 = UOp::load().buffer(buf2).index(index.clone()).call();
+    let index1 = UOp::index().buffer(buf1).indices(vec![index.clone()]).call().unwrap();
+    let index2 = UOp::index().buffer(buf2).indices(vec![index.clone()]).call().unwrap();
+    let store_index = UOp::index().buffer(out_buf).indices(vec![index]).call().unwrap();
+    let load1 = UOp::load().index(index1).call();
+    let load2 = UOp::load().index(index2).call();
     let sum = load1.try_add(&load2).unwrap();
-    let store = index.store(sum);
+    let store = store_index.store(sum);
 
     let (result, _context) =
         try_get_kernel_graph(store).expect("kernel split pipeline should succeed for multiple loads");
@@ -431,18 +436,18 @@ fn test_pipeline_applies_early_rewrites_first() {
 fn test_pipeline_applies_buffer_folding() {
     // Test: buffer_folding patterns should be applied
 
-    // Create BUFFERIZE(CONST) which should be folded
+    // Create STAGE(CONST) which should be folded
     let const_val = UOp::native_const(42.0f32);
     let range_end = UOp::index_const(10);
     let range = UOp::range_axis(range_end, AxisId::Renumbered(0), AxisType::Loop);
-    let bufferize = UOp::bufferize(const_val.clone(), vec![range], BufferizeOpts::local());
+    let stage = UOp::stage(const_val.clone(), vec![range], BufferizeOpts::local());
 
-    let rangeified = rangeify_unwrap(bufferize);
+    let rangeified = rangeify_unwrap(stage);
 
-    // BUFFERIZE(CONST) may be folded to CONST
-    // Or may remain as BUFFERIZE depending on pipeline phase
+    // STAGE(CONST) may be folded to CONST
+    // Or may remain as STAGE depending on pipeline phase
     match rangeified.op() {
-        Op::Const(_) | Op::Bufferize { .. } => {} // Both acceptable
+        Op::Const(_) | Op::Stage { .. } => {} // Both acceptable
         _ => {}
     }
 }

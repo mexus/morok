@@ -106,7 +106,12 @@ impl CFGContext {
             if matches!(node.op(), Op::End { .. } | Op::Sink { .. })
                 && let Some(node_deps) = deps.get(&UOpKey(node.clone()))
             {
-                for dep_key in node_deps.keys() {
+                // Python dicts preserve the original topological insertion order.
+                for dep_node in &nodes {
+                    let dep_key = UOpKey(dep_node.clone());
+                    if !node_deps.contains_key(&dep_key) {
+                        continue;
+                    }
                     // Only consider END nodes
                     if !matches!(dep_key.0.op(), Op::End { .. }) {
                         continue;
@@ -118,7 +123,7 @@ impl CFGContext {
                     }
 
                     // Skip if already assigned
-                    if nesting.contains_key(dep_key) {
+                    if nesting.contains_key(&dep_key) {
                         continue;
                     }
 
@@ -129,7 +134,7 @@ impl CFGContext {
                         // Check if node's RANGE is in dep's dependencies
                         // node.src[1] in Tinygrad is the RANGE - we get it from ranges
                         if let Some(range) = ranges.first() {
-                            deps.get(dep_key).is_some_and(|dep_deps| dep_deps.contains_key(&UOpKey(range.clone())))
+                            deps.get(&dep_key).is_some_and(|dep_deps| dep_deps.contains_key(&UOpKey(range.clone())))
                         } else {
                             false
                         }
@@ -138,7 +143,7 @@ impl CFGContext {
                     };
 
                     if is_nested {
-                        nesting.insert(dep_key.clone(), node.clone());
+                        nesting.insert(dep_key, node.clone());
                     }
                 }
             }
@@ -147,8 +152,10 @@ impl CFGContext {
         // Step 3: Group siblings by parent
         #[allow(clippy::mutable_key_type)]
         let mut siblings: HashMap<UOpKey, Vec<Arc<UOp>>> = HashMap::new();
-        for (end_key, parent) in &nesting {
-            siblings.entry(UOpKey(parent.clone())).or_default().push(end_key.0.clone());
+        for node in &nodes {
+            if let Some(parent) = nesting.get(&UOpKey(node.clone())) {
+                siblings.entry(UOpKey(parent.clone())).or_default().push(node.clone());
+            }
         }
 
         // Step 4 & 5: Order siblings and create edges

@@ -75,7 +75,7 @@ pub fn count_codegen_params(uop: &Arc<UOp>) -> usize {
 
 /// Count DEFINE_LOCAL operations in a UOp graph.
 pub fn count_define_locals(uop: &Arc<UOp>) -> usize {
-    count_ops(uop, |op| matches!(op, Op::DefineLocal(_)))
+    count_ops(uop, |op| matches!(op, Op::Buffer { arg, .. } if arg.addrspace == Some(svod_dtype::AddrSpace::Local)))
 }
 
 /// Count STORE operations in a UOp graph.
@@ -88,9 +88,9 @@ pub fn count_ends(uop: &Arc<UOp>) -> usize {
     count_ops(uop, |op| matches!(op, Op::End { .. }))
 }
 
-/// Count BUFFERIZE operations in a UOp graph.
+/// Count STAGE operations in a UOp graph.
 pub fn count_bufferizes(uop: &Arc<UOp>) -> usize {
-    count_ops(uop, |op| matches!(op, Op::Bufferize { .. }))
+    count_ops(uop, |op| matches!(op, Op::Stage { .. }))
 }
 
 // ============================================================================
@@ -112,14 +112,14 @@ pub fn create_range_symbolic(end: Arc<UOp>, axis_id: usize) -> Arc<UOp> {
     UOp::range(end, axis_id)
 }
 
-/// Create a BUFFERIZE operation with global address space.
+/// Create a STAGE operation with global address space.
 pub fn create_bufferize(compute: Arc<UOp>, ranges: Vec<Arc<UOp>>) -> Arc<UOp> {
-    UOp::bufferize_global(compute, ranges)
+    UOp::stage_global(compute, ranges)
 }
 
-/// Create a BUFFERIZE operation with custom options.
+/// Create a STAGE operation with custom options.
 pub fn create_bufferize_opts(compute: Arc<UOp>, ranges: Vec<Arc<UOp>>, opts: BufferizeOpts) -> Arc<UOp> {
-    UOp::bufferize(compute, ranges, opts)
+    UOp::stage(compute, ranges, opts)
 }
 
 // ============================================================================
@@ -142,9 +142,9 @@ fn test_is_identity_value() {
     assert!(!is_identity_value(&ConstValue::Int(0), &BinaryOp::Sub, false));
     assert!(is_identity_value(&ConstValue::Int(0), &BinaryOp::Sub, true));
 
-    // Idiv only has right identity
-    assert!(!is_identity_value(&ConstValue::Int(1), &BinaryOp::Idiv, false));
-    assert!(is_identity_value(&ConstValue::Int(1), &BinaryOp::Idiv, true));
+    // FloorDiv only has right identity
+    assert!(!is_identity_value(&ConstValue::Int(1), &BinaryOp::FloorDiv, false));
+    assert!(is_identity_value(&ConstValue::Int(1), &BinaryOp::FloorDiv, true));
 
     // Non-identity values
     assert!(!is_identity_value(&ConstValue::Int(2), &BinaryOp::Add, false));

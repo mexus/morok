@@ -13,7 +13,7 @@ use svod_ir::{Op, UOp};
 /// - vmax = -1: 0 iterations (truly empty/dead)
 /// - vmax < 0: unreachable/dead code
 ///
-/// Also recognizes `Const(0)` with Index dtype as a dead range marker.
+/// Also recognizes weak-integer `Const(0)` as a dead range marker.
 /// This happens after the rewrite engine transforms dead RANGE → Const(0).
 pub fn is_empty_range(uop: &Arc<UOp>) -> bool {
     use svod_dtype::DType;
@@ -34,7 +34,7 @@ pub fn is_empty_range(uop: &Arc<UOp>) -> bool {
             matches!(vmax, ConstValue::Int(v) if *v < 0)
             // Note: UInt cannot be negative, so no UInt case needed for "empty"
         }
-        Op::Const(cv) if uop.dtype() == DType::Index => {
+        Op::Const(cv) if uop.dtype() == DType::WeakInt => {
             // Dead ranges become Const(0) after rewrite engine processes them.
             // Recognize this pattern in END/REDUCE ranges.
             matches!(cv.0, ConstValue::Int(0) | ConstValue::UInt(0))
@@ -89,12 +89,15 @@ fn dtype_min(dtype: &svod_dtype::DType) -> svod_ir::types::ConstValue {
     if dtype.is_bool() {
         return Bool(false);
     }
+    if *dtype == svod_dtype::DType::WeakInt {
+        return Int(i64::MIN);
+    }
     // Integer types: signed use MIN, unsigned use 0
     match dtype.base() {
         ScalarDType::Int8 => Int(i8::MIN as i64),
         ScalarDType::Int16 => Int(i16::MIN as i64),
         ScalarDType::Int32 => Int(i32::MIN as i64),
-        ScalarDType::Int64 | ScalarDType::Index => Int(i64::MIN),
+        ScalarDType::Int64 => Int(i64::MIN),
         ScalarDType::UInt8 => UInt(0),
         ScalarDType::UInt16 => UInt(0),
         ScalarDType::UInt32 => UInt(0),
@@ -114,12 +117,15 @@ fn dtype_max(dtype: &svod_dtype::DType) -> svod_ir::types::ConstValue {
     if dtype.is_bool() {
         return Bool(true);
     }
+    if *dtype == svod_dtype::DType::WeakInt {
+        return Int(i64::MAX);
+    }
     // Integer types
     match dtype.base() {
         ScalarDType::Int8 => Int(i8::MAX as i64),
         ScalarDType::Int16 => Int(i16::MAX as i64),
         ScalarDType::Int32 => Int(i32::MAX as i64),
-        ScalarDType::Int64 | ScalarDType::Index => Int(i64::MAX),
+        ScalarDType::Int64 => Int(i64::MAX),
         ScalarDType::UInt8 => UInt(u8::MAX as u64),
         ScalarDType::UInt16 => UInt(u16::MAX as u64),
         ScalarDType::UInt32 => UInt(u32::MAX as u64),

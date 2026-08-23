@@ -1,7 +1,7 @@
 //! Unit tests for [`pm_remove_bufferize`].
 //!
 //! Covered behavior:
-//! - `INDEX(BUFFERIZE)` inlining:
+//! - `INDEX(STAGE)` inlining:
 //!     - always-run sources (Contiguous / Copy / Noop) are kept,
 //!     - non-removable bufferizes are kept,
 //!     - the >3 accessed-buffer threshold,
@@ -29,26 +29,29 @@ fn range(end: i64, axis_id: usize) -> Arc<UOp> {
 }
 
 fn param(slot: usize, size: usize) -> Arc<UOp> {
-    let dev = UOp::device(DeviceSpec::Cpu);
-    UOp::param(slot, size, DType::Float32, Some(dev))
+    UOp::param(slot, size, DType::Float32, Some(DeviceSpec::Cpu))
 }
 
 fn removable_bufferize(compute: Arc<UOp>, ranges: Vec<Arc<UOp>>) -> Arc<UOp> {
-    UOp::bufferize(compute, ranges, BufferizeOpts::local())
+    UOp::stage(compute, ranges, BufferizeOpts::local())
 }
 
 fn non_removable_bufferize(compute: Arc<UOp>, ranges: Vec<Arc<UOp>>) -> Arc<UOp> {
-    UOp::bufferize(compute, ranges, BufferizeOpts { device: None, addrspace: AddrSpace::Local, removable: false })
+    UOp::stage(
+        compute,
+        ranges,
+        BufferizeOpts { device: None, local_axis: None, addrspace: AddrSpace::Local, removable: false },
+    )
 }
 
-/// Build `INDEX(BUFFERIZE(compute, buf_ranges), idx_ranges)`.
+/// Build `INDEX(STAGE(compute, buf_ranges), idx_ranges)`.
 fn index_bufferize(compute: Arc<UOp>, buf_ranges: Vec<Arc<UOp>>, idx_ranges: Vec<Arc<UOp>>) -> Arc<UOp> {
     let buf = removable_bufferize(compute, buf_ranges);
     UOp::index().buffer(buf).indices(idx_ranges).call().expect("INDEX construction must succeed")
 }
 
 // ============================================================================
-// Rule 1: INDEX(BUFFERIZE) — `remove_bufferize` cost heuristic
+// Rule 1: INDEX(STAGE) — `remove_bufferize` cost heuristic
 // ============================================================================
 
 #[test]
@@ -60,7 +63,7 @@ fn always_run_contiguous_is_kept() {
     let idx = index_bufferize(contig, vec![r.clone()], vec![r]);
     let result = pm_remove_bufferize().rewrite(&idx, &mut ());
 
-    assert!(matches!(result, RewriteResult::NoMatch), "BUFFERIZE(CONTIGUOUS) must not be inlined");
+    assert!(matches!(result, RewriteResult::NoMatch), "STAGE(CONTIGUOUS) must not be inlined");
 }
 
 #[test]
@@ -72,7 +75,7 @@ fn always_run_copy_is_kept() {
     let idx = index_bufferize(cp, vec![r.clone()], vec![r]);
     let result = pm_remove_bufferize().rewrite(&idx, &mut ());
 
-    assert!(matches!(result, RewriteResult::NoMatch), "BUFFERIZE(COPY) must not be inlined");
+    assert!(matches!(result, RewriteResult::NoMatch), "STAGE(COPY) must not be inlined");
 }
 
 #[test]
@@ -81,7 +84,7 @@ fn always_run_noop_is_kept() {
     let idx = index_bufferize(UOp::noop(), vec![r.clone()], vec![r]);
     let result = pm_remove_bufferize().rewrite(&idx, &mut ());
 
-    assert!(matches!(result, RewriteResult::NoMatch), "BUFFERIZE(NOOP) must not be inlined");
+    assert!(matches!(result, RewriteResult::NoMatch), "STAGE(NOOP) must not be inlined");
 }
 
 #[test]
@@ -97,12 +100,12 @@ fn non_removable_bufferize_is_kept() {
     let idx = UOp::index().buffer(buf).indices(vec![r]).call().expect("INDEX");
     let result = pm_remove_bufferize().rewrite(&idx, &mut ());
 
-    assert!(matches!(result, RewriteResult::NoMatch), "non-removable BUFFERIZE must not be inlined");
+    assert!(matches!(result, RewriteResult::NoMatch), "non-removable STAGE must not be inlined");
 }
 
 #[test]
 fn three_accessed_buffers_inlines() {
-    // At the threshold (3 distinct Param/Bufferize/MStack accesses) — inline.
+    // At the threshold (3 distinct Param/Stage/MStack accesses) — inline.
     let r = range(8, 0);
     let p1 = UOp::index().buffer(param(0, 8)).indices(vec![r.clone()]).call().expect("idx");
     let p2 = UOp::index().buffer(param(1, 8)).indices(vec![r.clone()]).call().expect("idx");
@@ -114,7 +117,7 @@ fn three_accessed_buffers_inlines() {
 
     assert!(
         matches!(result, RewriteResult::Rewritten(_)),
-        "BUFFERIZE accessing 3 Params must be inlined (threshold is `> 3`)"
+        "STAGE accessing 3 Params must be inlined (threshold is `> 3`)"
     );
 }
 
@@ -130,7 +133,7 @@ fn four_accessed_buffers_is_kept() {
     let idx = index_bufferize(compute, vec![r.clone()], vec![r]);
     let result = pm_remove_bufferize().rewrite(&idx, &mut ());
 
-    assert!(matches!(result, RewriteResult::NoMatch), "BUFFERIZE accessing 4 Params must be kept (threshold is `> 3`)");
+    assert!(matches!(result, RewriteResult::NoMatch), "STAGE accessing 4 Params must be kept (threshold is `> 3`)");
 }
 
 #[test]
@@ -146,7 +149,7 @@ fn buffer_in_reduce_is_kept() {
 
     assert!(
         matches!(result, RewriteResult::NoMatch),
-        "BUFFERIZE whose reduce body reads a Param must be kept (`buffer_in_reduce`)"
+        "STAGE whose reduce body reads a Param must be kept (`buffer_in_reduce`)"
     );
 }
 
@@ -163,7 +166,7 @@ fn reduce_without_buffer_access_inlines() {
 
     assert!(
         matches!(result, RewriteResult::Rewritten(_)),
-        "BUFFERIZE(REDUCE(const)) must inline — `buffer_in_reduce` is false"
+        "STAGE(REDUCE(const)) must inline — `buffer_in_reduce` is false"
     );
 }
 

@@ -3,11 +3,146 @@ mod index_lowering;
 use crate::{
     pattern::RewriteResult,
     rewrite::graph_rewrite,
+    symbolic::patterns::{
+        commutative_canonicalization, comparison_dsl_patterns, sym_phase3_patterns, term_combining_dsl_patterns,
+    },
     symbolic::{sym, symbolic, symbolic_simple},
 };
+use smallvec::smallvec;
 use std::{f32::consts::PI, sync::Arc};
 use svod_dtype::DType;
 use svod_ir::{BinaryOp, ConstValue, Op, TernaryOp, UOp, UnaryOp};
+
+fn assert_binary_sources(root: &Arc<UOp>, lhs: &Arc<UOp>, rhs: &Arc<UOp>) {
+    let Op::Binary(_, actual_lhs, actual_rhs) = root.op() else {
+        panic!("expected binary root, got {:?}", root.op());
+    };
+    assert!(Arc::ptr_eq(actual_lhs, lhs), "unexpected lhs: {:?}", root.op());
+    assert!(Arc::ptr_eq(actual_rhs, rhs), "unexpected rhs: {:?}", root.op());
+}
+
+#[test]
+fn commutative_index_ops_follow_tinygrad_structural_order() {
+    let end = UOp::index_const(8);
+    let special = UOp::special(end.clone(), "gidx0".to_string());
+    let range = UOp::range(end, 0);
+
+    for op in [BinaryOp::Add, BinaryOp::Mul, BinaryOp::And, BinaryOp::Or, BinaryOp::Xor, BinaryOp::Max] {
+        let authored = UOp::new(Op::Binary(op, special.clone(), range.clone()), DType::WeakInt);
+        let reversed = UOp::new(Op::Binary(op, range.clone(), special.clone()), DType::WeakInt);
+        let authored = graph_rewrite(commutative_canonicalization(), authored, &mut ());
+        let reversed = graph_rewrite(commutative_canonicalization(), reversed, &mut ());
+
+        assert_binary_sources(&authored, &special, &range);
+        assert_binary_sources(&reversed, &special, &range);
+        assert!(Arc::ptr_eq(&authored, &reversed));
+        assert_eq!(authored.content_hash, reversed.content_hash);
+    }
+}
+
+#[test]
+fn commutative_index_order_covers_constants_ranges_and_nested_trees() {
+    let range0 = UOp::range_const(8, 0);
+    let range1 = UOp::range_const(8, 1);
+    let constant = UOp::index_const(3);
+
+    let const_first = constant.try_add(&range0).unwrap();
+    let const_first = graph_rewrite(commutative_canonicalization(), const_first, &mut ());
+    assert_binary_sources(&const_first, &range0, &constant);
+
+    let ranges_reversed = range1.try_add(&range0).unwrap();
+    let ranges_reversed = graph_rewrite(commutative_canonicalization(), ranges_reversed, &mut ());
+    assert_binary_sources(&ranges_reversed, &range0, &range1);
+
+    let nested = range1.try_add(&range0).unwrap();
+    let special = UOp::special(UOp::index_const(8), "gidx0".to_string());
+    let nested_first = nested.try_add(&special).unwrap();
+    let nested_first = graph_rewrite(commutative_canonicalization(), nested_first, &mut ());
+    let Op::Binary(BinaryOp::Add, actual_special, actual_nested) = nested_first.op() else {
+        panic!("expected nested ADD, got {:?}", nested_first.op());
+    };
+    assert!(Arc::ptr_eq(actual_special, &special));
+    assert_binary_sources(actual_nested, &range0, &range1);
+
+    let nested_other_order = special.try_add(&range0.try_add(&range1).unwrap()).unwrap();
+    let nested_other_order = graph_rewrite(commutative_canonicalization(), nested_other_order, &mut ());
+    assert!(Arc::ptr_eq(&nested_first, &nested_other_order));
+
+    let var_a = UOp::define_var("a".to_string(), 0, 8);
+    let var_b = UOp::define_var("b".to_string(), 0, 8);
+    let vars_reversed = var_b.try_add(&var_a).unwrap();
+    let vars_reversed = graph_rewrite(commutative_canonicalization(), vars_reversed, &mut ());
+    assert_binary_sources(&vars_reversed, &var_a, &var_b);
+}
+
+#[test]
+fn commutative_order_is_weakint_only_and_preserves_tags() {
+    for dtype in [DType::Index, DType::Int32, DType::Float32] {
+        let lhs = UOp::const_(dtype.clone(), if dtype.is_float() { 4.0.into() } else { 4.into() });
+        let rhs = UOp::const_(dtype.clone(), if dtype.is_float() { 3.0.into() } else { 3.into() });
+        let authored = UOp::new(Op::Binary(BinaryOp::Add, lhs.clone(), rhs.clone()), dtype);
+        let result = graph_rewrite(commutative_canonicalization(), authored.clone(), &mut ());
+        assert!(Arc::ptr_eq(&result, &authored));
+        assert_binary_sources(&result, &lhs, &rhs);
+    }
+
+    let range = UOp::range_const(8, 0);
+    let special = UOp::special(UOp::index_const(8), "gidx0".to_string());
+    let tagged = range.try_add(&special).unwrap().with_tag(smallvec![7]);
+    let result = graph_rewrite(commutative_canonicalization(), tagged, &mut ());
+    assert_binary_sources(&result, &special, &range);
+    assert_eq!(result.tag().as_deref(), Some(&[7][..]));
+}
+
+#[test]
+fn commutative_order_projects_vconst_as_tinygrad_stack() {
+    let vconst = UOp::vconst(vec![ConstValue::Int(2), ConstValue::Int(1)], DType::WeakInt);
+    let stack = UOp::stack(smallvec![UOp::range_const(8, 0), UOp::special(UOp::index_const(8), "gidx0".to_string()),]);
+    let authored = UOp::new(Op::Binary(BinaryOp::Add, vconst.clone(), stack.clone()), vconst.dtype());
+
+    let ordered = graph_rewrite(commutative_canonicalization(), authored, &mut ());
+    assert_binary_sources(&ordered, &stack, &vconst);
+
+    let left = UOp::stack(smallvec![UOp::range_const(8, 1), UOp::range_const(8, 0)]);
+    let right = UOp::stack(smallvec![
+        UOp::special(UOp::index_const(8), "gidx1".to_string()),
+        UOp::special(UOp::index_const(8), "gidx0".to_string()),
+    ]);
+    let authored = UOp::new(Op::Binary(BinaryOp::Add, left.clone(), right.clone()), left.dtype());
+    let ordered = graph_rewrite(commutative_canonicalization(), authored, &mut ());
+    assert_binary_sources(&ordered, &right, &left);
+}
+
+#[test]
+fn commutative_order_does_not_break_structural_ties_or_incomparable_args() {
+    let base = UOp::index_const(7);
+    let left = base.with_tag(smallvec![1]);
+    let right = base.with_tag(smallvec![2]);
+    let tied = UOp::new(Op::Binary(BinaryOp::Add, right.clone(), left.clone()), DType::WeakInt);
+    let tied = graph_rewrite(commutative_canonicalization(), tied, &mut ());
+    assert_binary_sources(&tied, &right, &left);
+
+    let end = UOp::index_const(8);
+    let weak = UOp::range_axis(end.clone(), svod_ir::AxisId::Renumbered(0), svod_ir::AxisType::Weak);
+    let global = UOp::range_axis(end, svod_ir::AxisId::Renumbered(0), svod_ir::AxisType::Global);
+    let incomparable = weak.try_add(&global).unwrap();
+    let incomparable = graph_rewrite(commutative_canonicalization(), incomparable, &mut ());
+    assert_binary_sources(&incomparable, &weak, &global);
+}
+
+#[test]
+fn symbolic_boundary_applies_structural_commutative_order() {
+    let range = UOp::range_const(8, 0);
+    let special = UOp::special(UOp::index_const(8), "gidx0".to_string());
+    let reversed = range.try_add(&special).unwrap();
+    let simple = graph_rewrite(symbolic_simple(), reversed.clone(), &mut ());
+    assert_binary_sources(&simple, &range, &special);
+
+    for matcher in [symbolic(), sym()] {
+        let result = graph_rewrite(matcher, reversed.clone(), &mut ());
+        assert_binary_sources(&result, &special, &range);
+    }
+}
 
 #[test]
 fn test_symbolic_simple_identity_folding() {
@@ -146,13 +281,39 @@ fn test_symbolic_simple_const_folding() {
     }
 }
 
+#[test]
+fn reduced_float_folding_commits_result_before_comparison() {
+    let matcher = symbolic_simple();
+    let one = UOp::const_(DType::FP8E4M3, ConstValue::Float(1.0));
+    let half_ulp = UOp::const_(DType::FP8E4M3, ConstValue::Float(0.0625));
+    let add = one.try_add(&half_ulp).unwrap();
+    let folded = graph_rewrite(&matcher, add, &mut ());
+    assert!(matches!(folded.op(), Op::Const(value) if value.0 == ConstValue::Float(1.0)));
+
+    let rounded = UOp::const_(DType::Float32, ConstValue::Float(-3.2));
+    let exact_grid_value = UOp::const_(DType::Float32, ConstValue::Float(-3.200000047683716));
+    let comparison = rounded.try_cmpeq(&exact_grid_value).unwrap();
+    let folded_comparison = graph_rewrite(symbolic(), comparison, &mut ());
+    assert!(matches!(folded_comparison.op(), Op::Const(value) if value.0 == ConstValue::Bool(true)));
+}
+
+#[test]
+fn reduced_float_vconst_folding_commits_each_result_lane() {
+    let matcher = symbolic_simple();
+    let values = UOp::vconst(vec![ConstValue::Float(1.0), ConstValue::Float(1.125)], DType::FP8E4M3);
+    let increments = UOp::vconst(vec![ConstValue::Float(0.0625), ConstValue::Float(0.0625)], DType::FP8E4M3);
+    let folded = graph_rewrite(&matcher, values.try_add(&increments).unwrap(), &mut ());
+    assert!(matches!(folded.op(), Op::VConst { values }
+        if values == &vec![ConstValue::Float(1.0), ConstValue::Float(1.25)]));
+}
+
 // ====== Tests for NEW patterns ======
 
 #[test]
 fn test_self_division() {
     // Test: x // x -> 1
     let matcher = symbolic_simple();
-    let x = UOp::var("x", DType::Int32, 0, i64::MAX);
+    let x = UOp::var("x", DType::Int32, 1, 100);
     let div = x.try_div(&x).unwrap();
 
     let result = matcher.rewrite(&div, &mut ());
@@ -189,8 +350,8 @@ fn test_division_by_neg_one() {
 fn test_idempotent_modulo() {
     // Test: (x % y) % y -> x % y
     let matcher = symbolic_simple();
-    let x = UOp::var("x", DType::Int32, 0, i64::MAX);
-    let y = UOp::var("y", DType::Int32, 0, i64::MAX);
+    let x = UOp::var("x", DType::Int32, 0, 100);
+    let y = UOp::var("y", DType::Int32, 1, 10);
 
     // Build (x % y) % y
     let inner_mod = x.try_mod(&y).unwrap();
@@ -200,11 +361,11 @@ fn test_idempotent_modulo() {
     assert!(matches!(result, RewriteResult::Rewritten(_)));
     if let RewriteResult::Rewritten(rewritten) = result {
         // Should be equivalent to inner_mod (x % y)
-        if let Op::Binary(BinaryOp::Mod, a, b) = rewritten.op() {
+        if let Op::Binary(BinaryOp::FloorMod, a, b) = rewritten.op() {
             assert!(std::sync::Arc::ptr_eq(a, &x));
             assert!(std::sync::Arc::ptr_eq(b, &y));
         } else {
-            panic!("Expected Binary(Mod, x, y), got {:?}", rewritten.op());
+            panic!("Expected Binary(FloorMod, x, y), got {:?}", rewritten.op());
         }
     }
 }
@@ -276,7 +437,7 @@ fn test_self_comparison_lt() {
 fn test_self_modulo() {
     // Test: x % x -> 0
     let matcher = symbolic_simple();
-    let x = UOp::var("x", DType::Int32, 0, i64::MAX);
+    let x = UOp::var("x", DType::Int32, 1, 100);
     let modulo = x.try_mod(&x).unwrap();
 
     let result = matcher.rewrite(&modulo, &mut ());
@@ -324,25 +485,18 @@ fn test_self_inequality_float_no_fold() {
 
 #[test]
 fn test_float_self_division() {
-    // Test: x / x -> 1.0 (float division)
+    // Zero is in range, so x/x may be NaN and must remain a division.
     let matcher = symbolic_simple();
     let x = UOp::var("x", DType::Float32, 0, i64::MAX);
     let div = x.try_div(&x).unwrap();
 
     let result = matcher.rewrite(&div, &mut ());
-    assert!(matches!(result, RewriteResult::Rewritten(_)));
-    if let RewriteResult::Rewritten(rewritten) = result {
-        if let Op::Const(cv) = rewritten.op() {
-            assert_eq!(cv.0, ConstValue::Float(1.0));
-        } else {
-            panic!("Expected Const(1.0), got {:?}", rewritten.op());
-        }
-    }
+    assert!(matches!(result, RewriteResult::NoMatch));
 }
 
 #[test]
 fn test_division_cancel_multiplication() {
-    // Test: (x * y) / y -> x
+    // Floating cancellation changes overflow, underflow, rounding, and y=0.
     let matcher = symbolic_simple();
     let x = UOp::var("x", DType::Float32, 0, i64::MAX);
     let y = UOp::var("y", DType::Float32, 0, i64::MAX);
@@ -351,18 +505,25 @@ fn test_division_cancel_multiplication() {
     let div = mul.try_div(&y).unwrap();
 
     let result = matcher.rewrite(&div, &mut ());
-    assert!(matches!(result, RewriteResult::Rewritten(_)));
-    if let RewriteResult::Rewritten(rewritten) = result {
-        assert!(std::sync::Arc::ptr_eq(&rewritten, &x));
-    }
+    assert!(matches!(result, RewriteResult::NoMatch));
+}
+
+#[test]
+fn test_finite_nonzero_float_self_division() {
+    let x = UOp::var("x", DType::Float32, 1, 10);
+    let div = x.try_div(&x).unwrap();
+    let RewriteResult::Rewritten(result) = symbolic_simple().rewrite(&div, &mut ()) else {
+        panic!("finite non-zero x/x should fold")
+    };
+    assert!(matches!(result.op(), Op::Const(value) if value.0 == ConstValue::Float(1.0)));
 }
 
 #[test]
 fn test_int_division_cancel_multiplication() {
     // Test: (x * y) // y -> x (integer division)
     let matcher = symbolic_simple();
-    let x = UOp::var("x", DType::Int32, 0, i64::MAX);
-    let y = UOp::var("y", DType::Int32, 0, i64::MAX);
+    let x = UOp::var("x", DType::Int32, -10, 10);
+    let y = UOp::var("y", DType::Int32, 2, 3);
 
     let mul = x.try_mul(&y).unwrap();
     let div = mul.try_div(&y).unwrap();
@@ -379,7 +540,7 @@ fn test_int_division_cancel_multiplication() {
 #[test]
 fn test_cast_int_to_float_constant() {
     // Test: cast(int_const) -> float_const
-    let matcher = symbolic_simple();
+    let matcher = crate::symbolic::pm_fold_cast_const();
     let int_val = UOp::native_const(42i32);
     let cast = int_val.cast(DType::Float32);
 
@@ -398,7 +559,7 @@ fn test_cast_int_to_float_constant() {
 #[test]
 fn test_cast_float_to_int_constant() {
     // Test: cast(float_const) -> int_const
-    let matcher = symbolic_simple();
+    let matcher = crate::symbolic::pm_fold_cast_const();
     let float_val = UOp::native_const(PI);
     let cast = float_val.cast(DType::Int32);
 
@@ -417,7 +578,7 @@ fn test_cast_float_to_int_constant() {
 #[test]
 fn test_cast_bool_to_int_constant() {
     // Test: cast(bool_const) -> int_const
-    let matcher = symbolic_simple();
+    let matcher = crate::symbolic::pm_fold_cast_const();
     let bool_val = UOp::native_const(true);
     let cast = bool_val.cast(DType::Int32);
 
@@ -772,12 +933,219 @@ fn test_alu_fold_add_then_sub_negative() {
 
 // ========== Division Pattern Tests ==========
 
+fn eval_closed_typed(expr: &Arc<UOp>) -> Option<ConstValue> {
+    use svod_ir::uop::eval::{eval_binary_op_typed, eval_unary_op_typed};
+
+    match expr.op() {
+        Op::Const(value) => Some(value.0),
+        Op::DefineVar { min_val, max_val, .. } if min_val == max_val => {
+            ConstValue::Int(*min_val).cast(&expr.dtype().scalar_dtype())
+        }
+        Op::Binary(op, lhs, rhs) => {
+            eval_binary_op_typed(*op, eval_closed_typed(lhs)?, eval_closed_typed(rhs)?, expr.dtype().base())
+        }
+        Op::Unary(op, src) => eval_unary_op_typed(*op, eval_closed_typed(src)?, expr.dtype().base()),
+        _ => None,
+    }
+}
+
+#[test]
+fn typed_divmod_wrap_counterexamples_do_not_misrewrite() {
+    let i8_const = |value| UOp::const_(DType::Int8, ConstValue::Int(value));
+
+    let div = i8_const(100).mul(&i8_const(2)).add(&i8_const(1)).floor_div(&i8_const(2));
+    let div_result = graph_rewrite(symbolic(), div.clone(), &mut ());
+    assert_eq!(eval_closed_typed(&div), Some(ConstValue::Int(-28)));
+    assert_eq!(eval_closed_typed(&div_result), eval_closed_typed(&div));
+    assert!(!matches!(div_result.op(), Op::Const(value) if value.0 == ConstValue::Int(100)));
+
+    let modulo = i8_const(100).mul(&i8_const(3)).add(&i8_const(1)).mod_(&i8_const(3));
+    let mod_result = graph_rewrite(symbolic(), modulo.clone(), &mut ());
+    assert_eq!(eval_closed_typed(&modulo), Some(ConstValue::Int(0)));
+    assert_eq!(eval_closed_typed(&mod_result), eval_closed_typed(&modulo));
+    assert!(!matches!(mod_result.op(), Op::Const(value) if value.0 == ConstValue::Int(1)));
+
+    let x = UOp::var("wrap_x", DType::Int8, 100, 100);
+    let y = UOp::var("wrap_y", DType::Int8, 2, 2);
+    let cancellation = x.mul(&y).floor_div(&y);
+    assert!(matches!(
+        crate::symbolic::patterns::division_dsl_patterns().rewrite(&cancellation, &mut ()),
+        RewriteResult::NoMatch
+    ));
+}
+
+#[test]
+fn typed_divmod_guards_cover_zero_and_integer_boundaries() {
+    let zero = UOp::var("zero", DType::Int8, 0, 0);
+    assert!(matches!(symbolic_simple().rewrite(&zero.floor_div(&zero), &mut ()), RewriteResult::NoMatch));
+    assert!(matches!(symbolic_simple().rewrite(&zero.mod_(&zero), &mut ()), RewriteResult::NoMatch));
+
+    let min = UOp::var("min", DType::Int8, i8::MIN as i64, i8::MIN as i64);
+    let neg_one = UOp::const_(DType::Int8, ConstValue::Int(-1));
+    assert!(matches!(symbolic_simple().rewrite(&min.floor_div(&neg_one), &mut ()), RewriteResult::NoMatch));
+
+    let umax = UOp::var("umax", DType::UInt8, u8::MAX as i64, u8::MAX as i64);
+    let two = UOp::const_(DType::UInt8, ConstValue::UInt(2));
+    let wrapped = umax.mul(&two).floor_div(&two);
+    assert!(matches!(
+        crate::symbolic::patterns::division_dsl_patterns().rewrite(&wrapped, &mut ()),
+        RewriteResult::NoMatch
+    ));
+}
+
+#[test]
+fn typed_division_cancellation_still_fires_when_product_is_exact() {
+    for dtype in [
+        DType::Int8,
+        DType::UInt8,
+        DType::WeakInt,
+        DType::Index,
+        DType::Int8.vec(4).unwrap(),
+        DType::UInt8.vec(4).unwrap(),
+    ] {
+        let x = UOp::var("safe_x", dtype.clone(), 2, 10);
+        let y = UOp::var("safe_y", dtype, 2, 3);
+        let expression = x.mul(&y).floor_div(&y);
+        let RewriteResult::Rewritten(result) =
+            crate::symbolic::patterns::division_dsl_patterns().rewrite(&expression, &mut ())
+        else {
+            panic!("safe typed cancellation did not fire for {}", expression.tree());
+        };
+        assert!(Arc::ptr_eq(&result, &x));
+    }
+}
+
+#[test]
+fn qr_affine_divmod_congruence_folds_when_typed_arithmetic_is_exact() {
+    let x = UOp::var("qr_index", DType::WeakInt, 0, 2);
+    let five = UOp::const_(DType::WeakInt, ConstValue::Int(5));
+    let numerator = x.mul(&x.const_like(6)).add(&x.const_like(2));
+
+    let modulo = graph_rewrite(symbolic(), numerator.mod_(&five), &mut ());
+    assert!(
+        matches!(modulo.op(), Op::Binary(BinaryOp::Add, lhs, rhs)
+        if (Arc::ptr_eq(lhs, &x)
+            && matches!(rhs.op(), Op::Const(value) if value.0 == ConstValue::Int(2)))
+            || (Arc::ptr_eq(rhs, &x)
+                && matches!(lhs.op(), Op::Const(value) if value.0 == ConstValue::Int(2)))),
+        "unexpected modulo replacement: {}",
+        modulo.tree()
+    );
+
+    let quotient = graph_rewrite(symbolic(), numerator.floor_div(&five), &mut ());
+    assert!(Arc::ptr_eq(&quotient, &x), "unexpected quotient replacement: {}", quotient.tree());
+}
+
+#[test]
+fn qr_affine_divmod_congruence_rejects_wrapping_source() {
+    let x = UOp::var("qr_wrapping_index", DType::Int8, 20, 21);
+    let five = UOp::const_(DType::Int8, ConstValue::Int(5));
+    let numerator = x.mul(&x.const_like(6)).add(&x.const_like(2));
+
+    for expression in [numerator.mod_(&five), numerator.floor_div(&five)] {
+        assert!(
+            matches!(
+                crate::symbolic::patterns::advanced_division_dsl_patterns().rewrite(&expression, &mut ()),
+                RewriteResult::NoMatch
+            ),
+            "wrapping congruence source was rewritten: {}",
+            expression.tree()
+        );
+    }
+}
+
+#[test]
+fn affine_divmod_congruence_rejects_hardware_vectors_without_dropping_terms() {
+    let dtype = DType::Int8.vec(4).unwrap();
+    let x = UOp::var("vector_x", dtype.clone(), 0, 1);
+    let y = UOp::var("vector_y", dtype.clone(), 0, 1);
+    let divisor = UOp::const_(dtype.clone(), ConstValue::Int(5));
+
+    let vector_const = |value| UOp::const_(dtype.clone(), ConstValue::Int(value));
+    let modulo = x.mul(&vector_const(6)).add(&y.mul(&vector_const(2))).mod_(&divisor);
+    let quotient = x.mul(&vector_const(11)).add(&y.mul(&vector_const(6))).floor_div(&divisor);
+    for expression in [modulo, quotient] {
+        assert!(matches!(
+            crate::symbolic::patterns::advanced_division_dsl_patterns().rewrite(&expression, &mut ()),
+            RewriteResult::NoMatch
+        ));
+    }
+}
+
+#[test]
+fn affine_divmod_congruence_preserves_broadcast_shape() {
+    let scalar = |name| UOp::var(name, DType::Int8, 0, 1);
+    let constant = |value| UOp::const_(DType::Int8, ConstValue::Int(value));
+    let a = scalar("shape_a");
+    let d = scalar("shape_d");
+    let b = UOp::stack(vec![scalar("shape_b0"), scalar("shape_b1")].into());
+    let numerator = a.mul(&constant(6)).add(&b.mul(&constant(5))).add(&d.mul(&constant(11)));
+    let expression = numerator.mod_(&constant(5));
+    assert_eq!(expression.shape().unwrap().unwrap().len(), 1);
+    assert!(matches!(
+        crate::symbolic::patterns::advanced_division_dsl_patterns().rewrite(&expression, &mut ()),
+        RewriteResult::NoMatch
+    ));
+}
+
+#[test]
+fn divmod_guards_do_not_overflow_host_arithmetic() {
+    let dtype = DType::WeakInt;
+    let x = UOp::var("x", dtype.clone(), 0, 1);
+    let c1 = UOp::const_(dtype.clone(), ConstValue::Int(i64::MAX));
+    let c2 = UOp::const_(dtype.clone(), ConstValue::Int(i64::MAX));
+    let c3 = UOp::const_(dtype, ConstValue::Int(1));
+    let expression = x.mod_(&c1).mul(&c2).add(&x.floor_div(&c1).mul(&c3));
+    let _ = crate::symbolic::patterns::div_mod_recombine_dsl_patterns().rewrite(&expression, &mut ());
+}
+
+#[test]
+fn signed_floor_division_rewrites_keep_negative_cases_exact() {
+    let i8_const = |value| UOp::const_(DType::Int8, ConstValue::Int(value));
+
+    let x = UOp::var("comparison_x", DType::Int8, -1, 1);
+    let comparison = x.floor_div(&i8_const(3)).lt(&i8_const(0));
+    let RewriteResult::Rewritten(lifted) = comparison_dsl_patterns().rewrite(&comparison, &mut ()) else {
+        panic!("positive-divisor comparison should lift");
+    };
+    assert!(matches!(lifted.op(), Op::Binary(BinaryOp::Lt, lhs, rhs)
+        if Arc::ptr_eq(lhs, &x) && matches!(rhs.op(), Op::Const(value) if value.0 == ConstValue::Int(0))));
+
+    let nested = i8_const(-128).floor_div(&i8_const(-9)).floor_div(&i8_const(-2));
+    assert!(matches!(
+        crate::symbolic::patterns::advanced_division_dsl_patterns().rewrite(&nested, &mut ()),
+        RewriteResult::NoMatch
+    ));
+    assert_eq!(eval_closed_typed(&nested), Some(ConstValue::Int(-7)));
+
+    let recombine = i8_const(-20)
+        .floor_div(&i8_const(-9))
+        .mod_(&i8_const(-2))
+        .add(&i8_const(-20).floor_div(&i8_const(18)).mul(&i8_const(-2)));
+    assert!(matches!(
+        crate::symbolic::patterns::div_mod_recombine_dsl_patterns().rewrite(&recombine, &mut ()),
+        RewriteResult::NoMatch
+    ));
+    assert_eq!(eval_closed_typed(&recombine), Some(ConstValue::Int(4)));
+}
+
+#[test]
+fn exact_division_probe_does_not_panic_on_signed_min_over_neg_one() {
+    let min = UOp::const_(DType::Int64, ConstValue::Int(i64::MIN));
+    let zero = UOp::var("zero", DType::Int64, 0, 0);
+    let expression = min.add(&zero).floor_div(&UOp::const_(DType::Int64, ConstValue::Int(-1)));
+    assert!(matches!(
+        crate::symbolic::patterns::advanced_division_dsl_patterns().rewrite(&expression, &mut ()),
+        RewriteResult::NoMatch
+    ));
+}
+
 #[test]
 fn test_division_cancel_with_multiplication() {
     // Test: (a * b) // b → a
     let matcher = symbolic_simple();
-    let a = UOp::var("a", DType::Int32, 0, i64::MAX);
-    let b = UOp::var("b", DType::Int32, 0, i64::MAX);
+    let a = UOp::var("a", DType::Int32, -100, 100);
+    let b = UOp::var("b", DType::Int32, 1, 100);
     let mul = a.try_mul(&b).unwrap();
     let div = mul.try_div(&b).unwrap();
 
@@ -805,7 +1173,7 @@ fn test_division_chain_folding() {
 
     if let RewriteResult::Rewritten(rewritten) = result {
         // Should be a // 6
-        if let Op::Binary(BinaryOp::Idiv, var, c) = rewritten.op() {
+        if let Op::Binary(BinaryOp::FloorDiv, var, c) = rewritten.op() {
             assert!(Arc::ptr_eq(var, &a));
             if let Op::Const(cv) = c.op() {
                 assert_eq!(cv.0, ConstValue::Int(6));
@@ -813,7 +1181,7 @@ fn test_division_chain_folding() {
                 panic!("Expected constant, got {:?}", c.op());
             }
         } else {
-            panic!("Expected Idiv, got {:?}", rewritten.op());
+            panic!("Expected FloorDiv, got {:?}", rewritten.op());
         }
     }
 }
@@ -822,7 +1190,7 @@ fn test_division_chain_folding() {
 fn test_exact_division_with_divides_helper() {
     // Test: (12 * x) // 3 → 4 * x (using divides helper)
     let matcher = symbolic();
-    let x = UOp::var("x", DType::Int32, 0, i64::MAX);
+    let x = UOp::var("x", DType::Int32, 0, 100);
     let c12 = UOp::native_const(12i32);
     let c3 = UOp::native_const(3i32);
     let mul = c12.try_mul(&x).unwrap();
@@ -850,8 +1218,8 @@ fn test_exact_division_with_divides_helper() {
 fn test_modulo_with_divisible_left_operand() {
     // Test: (6 * x + y) % 3 → y % 3 (since 6*x is divisible by 3)
     let matcher = symbolic();
-    let x = UOp::var("x", DType::Int32, 0, i64::MAX);
-    let y = UOp::var("y", DType::Int32, 0, i64::MAX);
+    let x = UOp::var("x", DType::Int32, 0, 100);
+    let y = UOp::var("y", DType::Int32, 0, 100);
     let c6 = UOp::native_const(6i32);
     let c3 = UOp::native_const(3i32);
     let mul = c6.try_mul(&x).unwrap();
@@ -863,11 +1231,11 @@ fn test_modulo_with_divisible_left_operand() {
 
     if let RewriteResult::Rewritten(rewritten) = result {
         // Should be y % 3
-        if let Op::Binary(BinaryOp::Mod, var, c) = rewritten.op() {
+        if let Op::Binary(BinaryOp::FloorMod, var, c) = rewritten.op() {
             assert!(Arc::ptr_eq(var, &y));
             assert!(Arc::ptr_eq(c, &c3));
         } else {
-            panic!("Expected Mod, got {:?}", rewritten.op());
+            panic!("Expected FloorMod, got {:?}", rewritten.op());
         }
     }
 }
@@ -876,8 +1244,8 @@ fn test_modulo_with_divisible_left_operand() {
 fn test_modulo_with_divisible_right_operand() {
     // Test: (x + 9 * y) % 3 → x % 3 (since 9*y is divisible by 3)
     let matcher = symbolic();
-    let x = UOp::var("x", DType::Int32, 0, i64::MAX);
-    let y = UOp::var("y", DType::Int32, 0, i64::MAX);
+    let x = UOp::var("x", DType::Int32, 0, 100);
+    let y = UOp::var("y", DType::Int32, 0, 100);
     let c9 = UOp::native_const(9i32);
     let c3 = UOp::native_const(3i32);
     let mul = c9.try_mul(&y).unwrap();
@@ -889,11 +1257,11 @@ fn test_modulo_with_divisible_right_operand() {
 
     if let RewriteResult::Rewritten(rewritten) = result {
         // Should be x % 3
-        if let Op::Binary(BinaryOp::Mod, var, c) = rewritten.op() {
+        if let Op::Binary(BinaryOp::FloorMod, var, c) = rewritten.op() {
             assert!(Arc::ptr_eq(var, &x));
             assert!(Arc::ptr_eq(c, &c3));
         } else {
-            panic!("Expected Mod, got {:?}", rewritten.op());
+            panic!("Expected FloorMod, got {:?}", rewritten.op());
         }
     }
 }
@@ -902,8 +1270,8 @@ fn test_modulo_with_divisible_right_operand() {
 fn test_modulo_no_simplification() {
     // Test: (x + y) % 3 → no simplification (neither divisible by 3)
     let matcher = symbolic_simple();
-    let x = UOp::var("x", DType::Int32, 0, i64::MAX);
-    let y = UOp::var("y", DType::Int32, 0, i64::MAX);
+    let x = UOp::var("x", DType::Int32, 0, 100);
+    let y = UOp::var("y", DType::Int32, 0, 100);
     let c3 = UOp::native_const(3i32);
     let add = x.try_add(&y).unwrap();
     let modulo = add.try_mod(&c3).unwrap();
@@ -919,8 +1287,8 @@ fn test_modulo_no_simplification() {
 fn test_distribute_division_over_addition() {
     // Test: (6*x + 9*y) // 3 → (2*x) + (3*y)
     let matcher = symbolic();
-    let x = UOp::var("x", DType::Int32, 0, i64::MAX);
-    let y = UOp::var("y", DType::Int32, 0, i64::MAX);
+    let x = UOp::var("x", DType::Int32, 0, 100);
+    let y = UOp::var("y", DType::Int32, 0, 100);
     let c6 = UOp::native_const(6i32);
     let c9 = UOp::native_const(9i32);
     let c3 = UOp::native_const(3i32);
@@ -965,8 +1333,8 @@ fn test_distribute_division_over_addition() {
 fn test_distribute_division_over_subtraction() {
     // Test: (12*x - 6*y) // 3 → (4*x) - (2*y)
     let matcher = symbolic();
-    let x = UOp::var("x", DType::Int32, 0, i64::MAX);
-    let y = UOp::var("y", DType::Int32, 0, i64::MAX);
+    let x = UOp::var("x", DType::Int32, 0, 100);
+    let y = UOp::var("y", DType::Int32, 0, 100);
     let c12 = UOp::native_const(12i32);
     let c6 = UOp::native_const(6i32);
     let c3 = UOp::native_const(3i32);
@@ -1011,73 +1379,63 @@ fn test_distribute_division_over_subtraction() {
 }
 
 #[test]
-fn test_distribute_multiplication_over_addition() {
-    // Test: 2 * (x + y) → (2*x) + (2*y) for Index dtype
-    // Tinygrad only distributes const * (index + const) — line 199
-    let matcher = symbolic();
-    let x = UOp::var("x", DType::Index, 0, i64::MAX);
-    let y = UOp::index_const(5);
-    let c2 = UOp::index_const(2);
-
-    let add = x.try_add(&y).unwrap();
-    let mul = c2.try_mul(&add).unwrap();
-
-    let result = matcher.rewrite(&mul, &mut ());
-    assert!(matches!(result, RewriteResult::Rewritten(_)));
-
-    if let RewriteResult::Rewritten(rewritten) = result {
-        // Should be (2*x) + (2*y)
-        if let Op::Binary(BinaryOp::Add, left, right) = rewritten.op() {
-            // Check left: 2*x
-            if let Op::Binary(BinaryOp::Mul, c, var) = left.op() {
-                assert!(Arc::ptr_eq(c, &c2));
-                assert!(Arc::ptr_eq(var, &x));
-            }
-
-            // Check right: 2*y
-            if let Op::Binary(BinaryOp::Mul, c, var) = right.op() {
-                assert!(Arc::ptr_eq(c, &c2));
-                assert!(Arc::ptr_eq(var, &y));
-            }
-        } else {
-            panic!("Expected Add, got {:?}", rewritten.op());
+fn test_distribute_multiplication_over_weak_addition_commutes() {
+    let x = UOp::var("x", DType::WeakInt, 0, i64::MAX);
+    let c5 = UOp::const_(DType::WeakInt, ConstValue::Int(5));
+    let c2 = UOp::const_(DType::WeakInt, ConstValue::Int(2));
+    for add in [x.try_add(&c5).unwrap(), c5.try_add(&x).unwrap()] {
+        for mul in [c2.try_mul(&add).unwrap(), add.try_mul(&c2).unwrap()] {
+            let RewriteResult::Rewritten(result) = term_combining_dsl_patterns().rewrite(&mul, &mut ()) else {
+                panic!("expected weak multiplication distribution for {}", mul.tree());
+            };
+            assert!(matches!(result.op(), Op::Binary(BinaryOp::Add, ..)), "{}", result.tree());
         }
     }
 }
 
 #[test]
-fn test_distribute_multiplication_over_addition_reversed() {
-    // Test: (x + y) * 3 → (x*3) + (y*3) for Index dtype
-    // Tinygrad sym line 430: (index + y) * const → only in sym tier
-    // Uses graph_rewrite for fixpoint (commutative canon may fire first)
-    use crate::rewrite::graph_rewrite;
-    let x = UOp::var("x", DType::Index, 0, i64::MAX);
-    let y = UOp::var("y", DType::Index, 0, i64::MAX);
-    let c3 = UOp::index_const(3);
+fn test_weak_distribution_preserves_negation_rule_priority() {
+    let x = UOp::var("x", DType::WeakInt, -100, 100);
+    let c5 = UOp::const_(DType::WeakInt, ConstValue::Int(5));
+    let neg_one = UOp::const_(DType::WeakInt, ConstValue::Int(-1));
+    let mul = neg_one.try_mul(&x.try_add(&c5).unwrap()).unwrap();
 
-    let add = x.try_add(&y).unwrap();
-    let mul = add.try_mul(&c3).unwrap();
-
-    let result = graph_rewrite(sym(), mul, &mut ());
-    // Should be distributed: some form of x*3 + y*3
-    assert!(matches!(result.op(), Op::Binary(BinaryOp::Add, ..)), "Expected Add, got {:?}", result.op());
+    let RewriteResult::Rewritten(result) = term_combining_dsl_patterns().rewrite(&mul, &mut ()) else {
+        panic!("expected specific negation distribution");
+    };
+    let Op::Binary(BinaryOp::Add, lhs, rhs) = result.op() else { panic!("expected Add, got {}", result.tree()) };
+    assert!(
+        matches!(lhs.op(), Op::Binary(BinaryOp::Mul, value, c) if Arc::ptr_eq(value, &x) && matches!(c.op(), Op::Const(cv) if cv.0 == ConstValue::Int(-1)))
+    );
+    assert!(matches!(rhs.op(), Op::Const(cv) if cv.0 == ConstValue::Int(-5)));
 }
 
 #[test]
-fn test_distribute_large_constant() {
-    // Test: (x + y) * 100 → (x*100) + (y*100) for Index dtype
-    // Tinygrad sym line 430: (index + y) * const → only in sym tier
-    use crate::rewrite::graph_rewrite;
-    let x = UOp::var("x", DType::Index, 0, i64::MAX);
-    let y = UOp::var("y", DType::Index, 0, i64::MAX);
-    let c100 = UOp::index_const(100);
+fn test_distribute_weak_addition_over_multiplication_commutes() {
+    let x = UOp::var("x", DType::WeakInt, 0, i64::MAX);
+    let y = UOp::var("y", DType::WeakInt, 0, i64::MAX);
+    let c3 = UOp::const_(DType::WeakInt, ConstValue::Int(3));
+    for add in [x.try_add(&y).unwrap(), y.try_add(&x).unwrap()] {
+        for mul in [add.try_mul(&c3).unwrap(), c3.try_mul(&add).unwrap()] {
+            let RewriteResult::Rewritten(result) = sym_phase3_patterns().rewrite(&mul, &mut ()) else {
+                panic!("expected weak multiplication distribution for {}", mul.tree());
+            };
+            assert!(matches!(result.op(), Op::Binary(BinaryOp::Add, ..)), "{}", result.tree());
+        }
+    }
+}
 
-    let add = x.try_add(&y).unwrap();
-    let mul = add.try_mul(&c100).unwrap();
+#[test]
+fn test_multiplication_distribution_does_not_match_concrete_int() {
+    let x = UOp::var("x", DType::Int32, 0, i64::MAX);
+    let y = UOp::var("y", DType::Int32, 0, i64::MAX);
+    let mul = x.try_add(&y).unwrap().try_mul(&UOp::native_const(3i32)).unwrap();
 
-    let result = graph_rewrite(sym(), mul, &mut ());
-    // Should distribute: some form of x*100 + y*100
-    assert!(matches!(result.op(), Op::Binary(BinaryOp::Add, ..)), "Expected Add, got {:?}", result.op());
+    assert!(matches!(sym_phase3_patterns().rewrite(&mul, &mut ()), RewriteResult::NoMatch));
+
+    let add_const = x.try_add(&UOp::native_const(5i32)).unwrap();
+    let mul_const = UOp::native_const(3i32).try_mul(&add_const).unwrap();
+    assert!(matches!(term_combining_dsl_patterns().rewrite(&mul_const, &mut ()), RewriteResult::NoMatch));
 }
 
 // ========== Compositional Optimization Tests ==========
@@ -1162,7 +1520,7 @@ fn test_multiplication_chain_folding() {
     // This is the simplified version of the failing case
 
     let matcher = symbolic();
-    let a = UOp::var("a", DType::Int32, 0, i64::MAX);
+    let a = UOp::var("a", DType::Int32, 0, 100);
     let c2 = UOp::native_const(2i32);
 
     // Build (a * 2) * 2
@@ -1354,10 +1712,10 @@ fn test_remove_typed_invalid_lanes_at_final_cleanup() {
 
     let invalid = UOp::invalid_marker();
     let one = UOp::const_(DType::Float16, ConstValue::Float(1.0));
-    let result = graph_rewrite(pm_remove_invalid(), UOp::vectorize(vec![invalid, one].into()), &mut ());
+    let result = graph_rewrite(pm_remove_invalid(), UOp::stack(vec![invalid, one].into()), &mut ());
 
     assert!(!result.any_in_subtree(UOp::is_invalid_marker));
-    let Op::Vectorize { elements } = result.op() else { panic!("expected VECTORIZE, got: {}", result.tree()) };
+    let Op::Stack { sources: elements } = result.op() else { panic!("expected VECTORIZE, got: {}", result.tree()) };
     assert!(matches!(elements[0].op(), Op::Const(cv) if cv.0 == ConstValue::Float(0.0)));
 }
 
@@ -1766,7 +2124,7 @@ fn test_nested_div_div() {
     assert!(matches!(result, RewriteResult::Rewritten(_)));
 
     if let RewriteResult::Rewritten(rewritten) = result {
-        if let Op::Binary(BinaryOp::Idiv, var, c) = rewritten.op() {
+        if let Op::Binary(BinaryOp::FloorDiv, var, c) = rewritten.op() {
             assert!(Arc::ptr_eq(var, &a));
             if let Op::Const(cv) = c.op() {
                 assert_eq!(cv.0, ConstValue::Int(90));
@@ -1774,7 +2132,7 @@ fn test_nested_div_div() {
                 panic!("Expected constant 90, got {:?}", c.op());
             }
         } else {
-            panic!("Expected Idiv, got {:?}", rewritten.op());
+            panic!("Expected FloorDiv, got {:?}", rewritten.op());
         }
     }
 }
@@ -1819,11 +2177,11 @@ fn test_nested_mod_mod_same_divisor() {
     assert!(matches!(result, RewriteResult::Rewritten(_)));
 
     if let RewriteResult::Rewritten(rewritten) = result {
-        if let Op::Binary(BinaryOp::Mod, var, c) = rewritten.op() {
+        if let Op::Binary(BinaryOp::FloorMod, var, c) = rewritten.op() {
             assert!(Arc::ptr_eq(var, &a));
             assert!(Arc::ptr_eq(c, &c5));
         } else {
-            panic!("Expected Mod(a, 5), got {:?}", rewritten.op());
+            panic!("Expected FloorMod(a, 5), got {:?}", rewritten.op());
         }
     }
 }
@@ -2114,7 +2472,7 @@ fn test_nested_div_const() {
     // Pattern is in symbolic tier 2 (advanced_division), not symbolic_simple,
     // to avoid infinite loop with fast_division_patterns in Stage 18-19.
     let matcher = symbolic();
-    let a = UOp::var("a", DType::Int32, 0, i64::MAX);
+    let a = UOp::var("a", DType::Int32, 0, 100);
     let c2 = UOp::native_const(2i32);
     let c1 = UOp::native_const(1i32);
 
@@ -2128,7 +2486,7 @@ fn test_nested_div_const() {
 
     if let RewriteResult::Rewritten(rewritten) = result {
         // Should become (a + 2) // 4
-        if let Op::Binary(BinaryOp::Idiv, lhs, rhs) = rewritten.op() {
+        if let Op::Binary(BinaryOp::FloorDiv, lhs, rhs) = rewritten.op() {
             // lhs should be a + 2
             if let Op::Binary(BinaryOp::Add, var, c) = lhs.op() {
                 assert!(Arc::ptr_eq(var, &a));
@@ -2147,7 +2505,7 @@ fn test_nested_div_const() {
                 panic!("Expected constant 4, got {:?}", rhs.op());
             }
         } else {
-            panic!("Expected Idiv, got {:?}", rewritten.op());
+            panic!("Expected FloorDiv, got {:?}", rewritten.op());
         }
     }
 }
@@ -2173,7 +2531,7 @@ fn test_nested_div_const_larger() {
     // Verify the result is equivalent: either (a+15)//12 or a further-simplified form.
     // The key property: the nested division should not survive.
     assert!(
-        !matches!(result.op(), Op::Binary(BinaryOp::Idiv, lhs, _) if matches!(lhs.op(), Op::Binary(BinaryOp::Add, inner, _) if matches!(inner.op(), Op::Binary(BinaryOp::Idiv, _, _)))),
+        !matches!(result.op(), Op::Binary(BinaryOp::FloorDiv, lhs, _) if matches!(lhs.op(), Op::Binary(BinaryOp::Add, inner, _) if matches!(inner.op(), Op::Binary(BinaryOp::FloorDiv, _, _)))),
         "Nested (a//c1 + c2) // c3 should be simplified, got: {}",
         result.tree()
     );
@@ -2308,23 +2666,6 @@ fn test_cast_where_push() {
 // ========== Batch A+B: New Pattern Tests ==========
 
 // --- A1: vmin==vmax collapse ---
-
-#[test]
-fn test_vmin_vmax_collapse_addition() {
-    // Var(5,5) + Const(3) → Const(8) since vmin==vmax==8
-    let matcher = symbolic();
-    let x = UOp::var("x", DType::Int32, 5, 5); // single-value range
-    let c3 = UOp::native_const(3i32);
-    let add = x.try_add(&c3).unwrap();
-
-    use crate::rewrite::graph_rewrite;
-    let result = graph_rewrite(&matcher, add, &mut ());
-    if let Op::Const(cv) = result.op() {
-        assert_eq!(cv.0, ConstValue::Int(8));
-    } else {
-        panic!("Expected const 8, got {:?}", result.op());
-    }
-}
 
 // --- A3: Bool arithmetic ---
 
@@ -2526,55 +2867,68 @@ fn test_range_div_end() {
 // --- B1: c0*x < c1 ---
 
 #[test]
-fn test_mul_lt_ceil_div() {
-    // 3*x < 10 → x < 4 (ceil(10/3) = 4) for Index dtype
-    let matcher = symbolic();
-    let x = UOp::var("x", DType::Index, 0, i64::MAX);
-    let c3 = UOp::index_const(3);
-    let c10 = UOp::index_const(10);
-    let mul = c3.try_mul(&x).unwrap();
-    let lt = mul.try_cmplt(&c10).unwrap();
+fn test_weak_mul_lt_ceil_div() {
+    let x = UOp::var("x", DType::WeakInt, -100, 100);
+    let c3 = UOp::const_(DType::WeakInt, ConstValue::Int(3));
+    let c10 = UOp::const_(DType::WeakInt, ConstValue::Int(10));
+    let lt = c3.try_mul(&x).unwrap().try_cmplt(&c10).unwrap();
 
-    let result = matcher.rewrite(&lt, &mut ());
-    assert!(matches!(result, RewriteResult::Rewritten(_)));
-    if let RewriteResult::Rewritten(rewritten) = result {
-        if let Op::Binary(BinaryOp::Lt, var, c) = rewritten.op() {
-            assert!(Arc::ptr_eq(var, &x));
-            if let Op::Const(cv) = c.op() {
-                assert_eq!(cv.0, ConstValue::Int(4));
-            } else {
-                panic!("Expected const 4, got {:?}", c.op());
-            }
-        } else {
-            panic!("Expected Lt, got {:?}", rewritten.op());
-        }
-    }
+    let RewriteResult::Rewritten(result) = comparison_dsl_patterns().rewrite(&lt, &mut ()) else {
+        panic!("expected weak ceil-div comparison simplification");
+    };
+    let Op::Binary(BinaryOp::Lt, lhs, rhs) = result.op() else { panic!("expected Lt, got {}", result.tree()) };
+    assert!(Arc::ptr_eq(lhs, &x));
+    assert_eq!(rhs.dtype(), DType::WeakInt);
+    assert!(matches!(rhs.op(), Op::Const(cv) if cv.0 == ConstValue::Int(4)));
 }
 
 #[test]
-fn test_mul_lt_exact_div() {
-    // 4*x < 12 → x < 3 (ceil(12/4) = 3)
-    let matcher = symbolic();
-    let x = UOp::var("x", DType::Index, 0, 100);
-    let c4 = UOp::index_const(4);
-    let c12 = UOp::index_const(12);
-    let mul = c4.try_mul(&x).unwrap();
-    let lt = mul.try_cmplt(&c12).unwrap();
+fn test_weak_negative_mul_lt_ceil_div() {
+    let x = UOp::var("x", DType::WeakInt, -100, 100);
+    let c0 = UOp::const_(DType::WeakInt, ConstValue::Int(-3));
+    let c1 = UOp::const_(DType::WeakInt, ConstValue::Int(10));
+    let lt = c0.try_mul(&x).unwrap().try_cmplt(&c1).unwrap();
 
-    let result = matcher.rewrite(&lt, &mut ());
-    assert!(matches!(result, RewriteResult::Rewritten(_)));
-    if let RewriteResult::Rewritten(rewritten) = result {
-        if let Op::Binary(BinaryOp::Lt, var, c) = rewritten.op() {
-            assert!(Arc::ptr_eq(var, &x));
-            if let Op::Const(cv) = c.op() {
-                assert_eq!(cv.0, ConstValue::Int(3));
-            } else {
-                panic!("Expected const 3, got {:?}", c.op());
-            }
-        } else {
-            panic!("Expected Lt, got {:?}", rewritten.op());
-        }
+    let RewriteResult::Rewritten(result) = comparison_dsl_patterns().rewrite(&lt, &mut ()) else {
+        panic!("expected signed weak ceil-div comparison simplification");
+    };
+    let Op::Binary(BinaryOp::Lt, lhs, rhs) = result.op() else { panic!("expected Lt, got {}", result.tree()) };
+    assert!(
+        matches!(lhs.op(), Op::Binary(BinaryOp::Mul, value, c) if Arc::ptr_eq(value, &x) && matches!(c.op(), Op::Const(cv) if cv.0 == ConstValue::Int(-1)))
+    );
+    assert!(matches!(rhs.op(), Op::Const(cv) if cv.0 == ConstValue::Int(4)));
+}
+
+#[test]
+fn test_weak_mul_lt_negative_bound_and_commuted_coefficient() {
+    let x = UOp::var("x", DType::WeakInt, -100, 100);
+    let c0 = UOp::const_(DType::WeakInt, ConstValue::Int(-3));
+    let c1 = UOp::const_(DType::WeakInt, ConstValue::Int(-10));
+    let lt = x.try_mul(&c0).unwrap().try_cmplt(&c1).unwrap();
+
+    let RewriteResult::Rewritten(result) = comparison_dsl_patterns().rewrite(&lt, &mut ()) else {
+        panic!("expected signed weak ceil-div comparison simplification");
+    };
+    let Op::Binary(BinaryOp::Lt, lhs, rhs) = result.op() else { panic!("expected Lt, got {}", result.tree()) };
+    assert!(
+        matches!(lhs.op(), Op::Binary(BinaryOp::Mul, value, c) if Arc::ptr_eq(value, &x) && matches!(c.op(), Op::Const(cv) if cv.0 == ConstValue::Int(-1)))
+    );
+    assert!(matches!(rhs.op(), Op::Const(cv) if cv.0 == ConstValue::Int(-3)));
+}
+
+#[test]
+fn test_mul_lt_ceil_div_matches_only_target_weak_coefficients() {
+    for c0 in [-1, 1] {
+        let x = UOp::var("x", DType::WeakInt, -100, 100);
+        let coefficient = UOp::const_(DType::WeakInt, ConstValue::Int(c0));
+        let bound = UOp::const_(DType::WeakInt, ConstValue::Int(10));
+        let lt = coefficient.try_mul(&x).unwrap().try_cmplt(&bound).unwrap();
+        assert!(matches!(comparison_dsl_patterns().rewrite(&lt, &mut ()), RewriteResult::NoMatch));
     }
+
+    let x = UOp::var("x", DType::Int32, -100, 100);
+    let lt = UOp::native_const(3i32).try_mul(&x).unwrap().try_cmplt(&UOp::native_const(10i32)).unwrap();
+    assert!(matches!(comparison_dsl_patterns().rewrite(&lt, &mut ()), RewriteResult::NoMatch));
 }
 
 // --- WHERE ALU combining ---
@@ -2692,7 +3046,21 @@ fn test_simplify_valid_no_parseable_clauses() {
     let combined = a.and_(&b);
 
     let result = simplify_valid(&combined);
-    assert!(result.is_none(), "Non-Lt clauses should not be simplified");
+    assert!(result.is_some_and(|result| Arc::ptr_eq(&result, &a)), "duplicate clauses should be deduplicated");
+}
+
+#[test]
+fn test_uop_given_valid_does_not_leak_fake_params() {
+    use crate::symbolic::valid_simplification::uop_given_valid;
+
+    let x = UOp::var("x", DType::Int32, 0, 100);
+    let valid = x.lt(&UOp::native_const(10i32));
+    let expression = x.try_add(&UOp::native_const(1i32)).unwrap();
+    let result = uop_given_valid(&valid, &expression, false);
+
+    assert!(!result.toposort().iter().any(|node| {
+        matches!(node.op(), Op::Param { arg, .. } if arg.name.as_deref().is_some_and(|name| name.starts_with("fake")))
+    }));
 }
 
 #[test]
@@ -2827,7 +3195,7 @@ fn test_sound_vmin_vmax_load_unsound() {
     let buf = UOp::new_buffer(svod_dtype::DeviceSpec::Cpu, 100, DType::Scalar(svod_dtype::ScalarDType::Float32));
     let idx = UOp::index_const(0);
     let index = UOp::index().buffer(buf.clone()).indices(vec![idx]).call().unwrap();
-    let load = UOp::load().buffer(buf).index(index).call();
+    let load = UOp::load().index(index).call();
     let result = compute_sound_vmin_vmax(&load);
     assert!(result.is_none(), "LOAD should be unsound");
 }
@@ -2841,6 +3209,106 @@ fn test_sound_vmin_vmax_nested_sound() {
     let sum = c.try_add(&r).unwrap();
     let result = compute_sound_vmin_vmax(&sum);
     assert_eq!(result, Some((ConstValue::Int(3), ConstValue::Int(12))));
+}
+
+fn unknown_f32() -> Arc<UOp> {
+    let buffer = UOp::new_buffer(svod_dtype::DeviceSpec::Cpu, 1, DType::Float32);
+    let index = UOp::index().buffer(buffer).indices(vec![UOp::index_const(0)]).call().unwrap();
+    UOp::load().index(index).call()
+}
+
+#[test]
+fn unknown_float_max_finite_limit_does_not_fold() {
+    use crate::rewrite::graph_rewrite;
+
+    let value = unknown_f32();
+    let finite_max = UOp::const_(DType::Float32, ConstValue::Float(f32::MAX as f64));
+    let maximum = value.try_max(&finite_max).unwrap();
+    let result = graph_rewrite(symbolic(), maximum, &mut ());
+    assert!(matches!(result.op(), Op::Binary(BinaryOp::Max, ..)), "unknown f32 MAX was folded: {}", result.tree());
+}
+
+#[test]
+fn unknown_float_comparison_and_where_do_not_fold() {
+    use crate::rewrite::graph_rewrite;
+
+    let value = unknown_f32();
+    let finite_max = UOp::const_(DType::Float32, ConstValue::Float(f32::MAX as f64));
+    let condition = value.try_cmplt(&finite_max).unwrap();
+    let comparison = graph_rewrite(symbolic(), condition.clone(), &mut ());
+    assert!(matches!(comparison.op(), Op::Binary(BinaryOp::Lt, ..)));
+
+    let selected = UOp::try_where(condition, value.const_like(1.0), value.const_like(2.0)).unwrap();
+    let result = graph_rewrite(symbolic(), selected, &mut ());
+    assert!(
+        matches!(result.op(), Op::Ternary(TernaryOp::Where, ..)),
+        "unknown float WHERE was folded: {}",
+        result.tree()
+    );
+}
+
+#[test]
+fn unknown_float_self_comparison_does_not_assume_no_nan() {
+    use crate::rewrite::graph_rewrite;
+
+    let value = unknown_f32();
+    let result = graph_rewrite(symbolic_simple(), value.try_cmplt(&value).unwrap(), &mut ());
+    assert!(matches!(result.op(), Op::Binary(BinaryOp::Lt, ..)), "unknown float x<x was folded: {}", result.tree());
+}
+
+#[test]
+fn float_max_tie_does_not_discard_signed_zero() {
+    use crate::rewrite::graph_rewrite;
+
+    let index = UOp::var("i", DType::Int32, 0, 1);
+    let condition = index.try_cmplt(&UOp::native_const(1i32)).unwrap();
+    let negative_zero = UOp::const_(DType::Float32, ConstValue::Float(-0.0));
+    let positive_zero = UOp::const_(DType::Float32, ConstValue::Float(0.0));
+    let selected = UOp::try_where(condition, negative_zero, positive_zero.clone()).unwrap();
+    let maximum = selected.try_max(&positive_zero).unwrap();
+
+    let result = graph_rewrite(symbolic(), maximum, &mut ());
+    assert!(matches!(result.op(), Op::Binary(BinaryOp::Max, ..)), "float MAX tie was folded: {}", result.tree());
+}
+
+#[test]
+fn explicitly_bounded_float_comparison_can_fold() {
+    use crate::rewrite::graph_rewrite;
+
+    let value = UOp::var("bounded", DType::Float32, -1, 1);
+    let condition = value.try_cmplt(&value.const_like(2.0)).unwrap();
+    let result = graph_rewrite(symbolic(), condition, &mut ());
+    assert!(matches!(result.op(), Op::Const(value) if value.0 == ConstValue::Bool(true)));
+}
+
+#[test]
+fn unknown_float_division_power_and_reciprocal_are_not_algebraically_rewritten() {
+    use crate::rewrite::graph_rewrite;
+
+    let value = unknown_f32();
+    let self_div = value.try_div(&value).unwrap();
+    assert!(matches!(graph_rewrite(sym(), self_div, &mut ()).op(), Op::Binary(BinaryOp::Fdiv, ..)));
+
+    let square = value.try_pow(&value.const_like(2.0)).unwrap();
+    assert!(matches!(graph_rewrite(sym(), square, &mut ()).op(), Op::Binary(BinaryOp::Pow, ..)));
+
+    let product = value.try_mul(&value).unwrap();
+    let reciprocal = UOp::try_reciprocal(&product).unwrap();
+    assert!(matches!(graph_rewrite(sym(), reciprocal, &mut ()).op(), Op::Unary(UnaryOp::Reciprocal, ..)));
+}
+
+#[test]
+fn float_add_zero_preserves_signed_zero_semantics() {
+    use crate::rewrite::graph_rewrite;
+
+    let value = unknown_f32();
+    let positive_zero = UOp::const_(DType::Float32, ConstValue::Float(0.0));
+    let negative_zero = UOp::const_(DType::Float32, ConstValue::Float(-0.0));
+
+    let positive = graph_rewrite(symbolic_simple(), value.try_add(&positive_zero).unwrap(), &mut ());
+    assert!(matches!(positive.op(), Op::Binary(BinaryOp::Add, ..)));
+    let negative = graph_rewrite(symbolic_simple(), value.try_add(&negative_zero).unwrap(), &mut ());
+    assert!(Arc::ptr_eq(&negative, &value));
 }
 
 // ============================================================================

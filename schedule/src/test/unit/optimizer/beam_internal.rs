@@ -206,9 +206,9 @@ fn test_thread_action_applied_to_loop_axis() {
     use super::super::renderer::Renderer;
     use svod_ir::{AxisId, AxisType, UOp};
 
-    // Create a kernel with Loop axis (CPU threading target)
+    // Create a kernel with Weak axis (CPU threading target)
     let end_64 = UOp::index_const(64);
-    let r_loop = UOp::range_axis(end_64, AxisId::Renumbered(0), AxisType::Loop);
+    let r_loop = UOp::range_axis(end_64, AxisId::Renumbered(0), AxisType::Weak);
     let compute = UOp::native_const(1.0f32);
     let sink = UOp::sink(vec![compute, r_loop]);
 
@@ -226,7 +226,7 @@ fn test_thread_action_applied_to_loop_axis() {
     }
     let mut test_scheduler = scheduler.clone();
     let result = apply_opt(&mut test_scheduler, &Opt::thread(0, thread_count), true);
-    assert!(result.is_ok(), "THREAD(0, {}) should succeed on Loop axis: {:?}", thread_count, result);
+    assert!(result.is_ok(), "THREAD(0, {}) should succeed on Weak axis: {:?}", thread_count, result);
 
     // Verify Thread axis was created
     let thread_axes = test_scheduler.axes_of(&[AxisType::Thread]);
@@ -238,9 +238,9 @@ fn test_generate_actions_includes_thread_for_cpu() {
     use super::super::renderer::Renderer;
     use svod_ir::{AxisId, AxisType, UOp};
 
-    // Create a kernel with Loop axis
+    // Create a kernel with Weak axis
     let end_64 = UOp::index_const(64);
-    let r_loop = UOp::range_axis(end_64, AxisId::Renumbered(0), AxisType::Loop);
+    let r_loop = UOp::range_axis(end_64, AxisId::Renumbered(0), AxisType::Weak);
     let compute = UOp::native_const(1.0f32);
     let sink = UOp::sink(vec![compute, r_loop]);
 

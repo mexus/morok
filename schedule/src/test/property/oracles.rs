@@ -118,7 +118,7 @@ proptest! {
         let x = UOp::var(&name, DType::Int32, min_val, min_val + range_size);
 
         let expr = UOp::new(
-            svod_ir::Op::Binary(svod_ir::types::BinaryOp::Idiv, Arc::clone(&x), Arc::clone(&x)),
+            svod_ir::Op::Binary(svod_ir::types::BinaryOp::FloorDiv, Arc::clone(&x), Arc::clone(&x)),
             DType::Int32,
         );
 

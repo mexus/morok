@@ -7,7 +7,7 @@
 //!
 //! - [`symbolic`] - Symbolic simplification patterns
 //! - [`mod@rangeify`] - RANGEIFY transformation (movement ops → kernels)
-//!   - Phases 1-4: Movement ops to BUFFERIZE with symbolic simplification
+//!   - Phases 1-4: Movement ops to STAGE with symbolic simplification
 //!   - Phase 5: Kernel splitting at STORE boundaries
 //! - [`mod@linearize`] - Priority-aware topological sort for GPU/NPU backends
 //! - [`optimizer`] - Kernel optimization layer (OptOps, Scheduler, heuristics)
@@ -21,7 +21,9 @@
 pub mod devectorize;
 pub mod expand;
 pub mod gpudims;
+pub mod late;
 pub mod linearize;
+pub mod multi;
 pub mod optimizer;
 pub mod passes;
 pub mod rangeify;
@@ -42,13 +44,13 @@ pub use svod_ir::pattern;
 pub use svod_ir::rewrite;
 
 // Re-export main types
-pub use linearize::{CFGContext, linearize, linearize_with_cfg};
+pub use linearize::{CFGContext, add_control_flow, linearize, linearize_with_cfg};
 pub use rangeify::{RangeifyResult, rangeify, rangeify_with_map, try_get_kernel_graph};
 pub use svod_ir::pattern::{Matcher, RewriteResult, TypedPatternMatcher};
 pub use svod_ir::rewrite::graph_rewrite;
 
 // Re-export expand pass
-pub use expand::{expander, pm_group_for_reduce, pm_pre_expander, pre_expand};
+pub use expand::{build_range_map, expander2, pm_group_for_reduce, pre_expand};
 
 // Re-export devectorize pass
 pub use devectorize::devectorize;
@@ -56,16 +58,13 @@ pub use devectorize::devectorize;
 // Re-export gpudims pass
 pub use gpudims::pm_add_gpudims;
 
-// Re-export backend-agnostic pass helpers (linearize_index)
-pub use passes::{build_linear_index, compute_row_major_strides, count_divmod, extract_index_dimension};
-
 // Re-export optimizer entry points
 pub use optimizer::{
     BeamConfig, BeamResult, CandidateMetrics, HeuristicsConfig, OptError, OptStrategy, OptimizerConfig,
     Renderer as OptimizerRenderer, Scheduler, TcOptLevel, TcSelect, TcUsage, apply_post_optimization,
     apply_post_optimization_with_renderer, beam_search_cached, compute_ops_estimate, hand_coded_optimizations,
-    hash_post_codegen_ir, optimize_kernel, optimize_kernel_with_config, optimize_kernel_with_strategy,
-    prepare_scheduler,
+    hash_post_codegen_ir, optimize_kernel, optimize_kernel_with_config, optimize_kernel_with_config_and_final_rewrite,
+    optimize_kernel_with_strategy, prepare_scheduler,
 };
 
 // Re-export UOp for macro usage

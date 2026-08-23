@@ -20,16 +20,14 @@ fn test_debuf_global() {
     let mut ctx = RangeifyBufferContext::new();
 
     // Create a BUFFER operation directly
-    let unique = UOp::buffer_id(Some(0));
-    let device = UOp::device(svod_device::DeviceSpec::Cpu);
-    let buffer = UOp::new(Op::Buffer { unique, device, size: 100 }, DType::Float32);
+    let buffer = UOp::new_buffer(svod_device::DeviceSpec::Cpu, 100, DType::Float32);
 
     // Apply pattern via matcher
     let result = apply_patterns(&buffer, &mut ctx);
 
     // Should return a codegen PARAM
     let op = result.expect("Expected Some result");
-    assert!(matches!(op.op(), Op::Param { arg, .. } if arg.device.is_none()));
+    assert!(matches!(op.op(), Op::Param { arg, .. } if arg.device == Some(svod_device::DeviceSpec::Cpu)));
     assert_eq!(ctx.global_counter, 1);
 }
 
@@ -38,8 +36,8 @@ fn test_unbind_kernel() {
     let mut ctx = RangeifyBufferContext::new();
 
     // Create a BIND operation
-    let var = UOp::new(Op::DefineVar { name: "x".to_string(), min_val: 0, max_val: 10 }, DType::Index);
-    let value = UOp::index_const(5);
+    let var = UOp::variable("x".to_string(), 0, 10, DType::WeakInt);
+    let value = UOp::const_(DType::WeakInt, ConstValue::Int(5));
     let bind = var.bind(value);
 
     // Apply pattern via matcher
@@ -47,7 +45,7 @@ fn test_unbind_kernel() {
 
     // Should return just the variable
     let op = result.expect("Expected Some result");
-    assert!(matches!(op.op(), Op::DefineVar { .. }));
+    assert!(matches!(op.op(), Op::Param { arg, .. } if arg.addrspace.is_none()));
     assert!(ctx.vars.contains_key("x"));
     let (_, bound_val) = ctx.vars.get("x").unwrap();
     assert_eq!(*bound_val, Some(5));
@@ -164,14 +162,10 @@ fn test_debuf_counter_increment() {
     let mut ctx = RangeifyBufferContext::new();
 
     // Create first buffer
-    let unique1 = UOp::buffer_id(Some(1));
-    let device1 = UOp::device(svod_device::DeviceSpec::Cpu);
-    let buffer1 = UOp::new(Op::Buffer { unique: unique1, device: device1, size: 100 }, DType::Float32);
+    let buffer1 = UOp::new_buffer(svod_device::DeviceSpec::Cpu, 100, DType::Float32);
 
     // Create second buffer
-    let unique2 = UOp::buffer_id(Some(2));
-    let device2 = UOp::device(svod_device::DeviceSpec::Cpu);
-    let buffer2 = UOp::new(Op::Buffer { unique: unique2, device: device2, size: 200 }, DType::Float32);
+    let buffer2 = UOp::new_buffer(svod_device::DeviceSpec::Cpu, 200, DType::Float32);
 
     // Apply patterns to first buffer
     let result1 = apply_patterns(&buffer1, &mut ctx);
@@ -194,16 +188,15 @@ fn test_debuf_counter_increment() {
 fn test_debuf_buffer_mapping() {
     let mut ctx = RangeifyBufferContext::new();
 
-    let unique = UOp::buffer_id(Some(0));
-    let device = UOp::device(svod_device::DeviceSpec::Cpu);
-    let buffer = UOp::new(Op::Buffer { unique, device, size: 100 }, DType::Float32);
+    let buffer = UOp::new_buffer(svod_device::DeviceSpec::Cpu, 100, DType::Float32);
 
     let result = apply_patterns(&buffer, &mut ctx);
 
     // Pattern returns codegen PARAM and maps BUFFER → PARAM
     assert!(result.is_some());
     let param = result.unwrap();
-    assert!(matches!(param.op(), Op::Param { arg, .. } if arg.slot == 0 && arg.device.is_none()));
+    assert!(matches!(param.op(), Op::Param { arg, .. }
+        if arg.slot == 0 && arg.device == Some(svod_device::DeviceSpec::Cpu)));
 
     // Buffer should be tracked, mapping to PARAM (not itself)
     assert!(ctx.has_buffer(&buffer));
@@ -298,21 +291,6 @@ fn test_renumber_range_no_change_if_same() {
 
     // Should return None since it's already renumbered
     assert!(result.is_none());
-}
-
-#[test]
-#[ignore = "Incomplete: only tests negative case, missing spurious sources test case"]
-fn test_cleanup_const_define_var() {
-    let mut ctx = RangeifyBufferContext::new();
-
-    // Create a DEFINE_VAR
-    let define_var = UOp::new(Op::DefineVar { name: "x".to_string(), min_val: 0, max_val: 10 }, DType::Index);
-
-    // Without sources, should not match
-    let result = apply_patterns(&define_var, &mut ctx);
-    assert!(result.is_none());
-
-    // TODO: Test with spurious sources once we have a way to create them
 }
 
 #[test]
@@ -457,6 +435,8 @@ fn test_remove_zero_range_verification() {
 
     let result = apply_patterns(&range, &mut ctx);
 
+    assert_eq!(ctx.range_counter, 1, "materialized RANGE must still consume its canonical id");
+
     // Should rewrite to CONST(0)
     match result {
         Some(const_op) => {
@@ -468,8 +448,8 @@ fn test_remove_zero_range_verification() {
                 // Should NOT be the same as the original range
                 assert!(!std::sync::Arc::ptr_eq(&const_op, &range));
 
-                // Should have Index dtype (same as range)
-                assert_eq!(const_op.dtype(), DType::Index);
+                // Mathematical constants remain weak until target-width lowering.
+                assert_eq!(const_op.dtype(), DType::WeakInt);
             } else {
                 panic!("Expected CONST operation");
             }
@@ -558,9 +538,8 @@ fn test_handle_after_local_buffer_not_tracked() {
     // They are kernel-scoped and synchronized via BARRIER, not AFTER
     let mut ctx = RangeifyBufferContext::new();
 
-    // Create a local buffer (DEFINE_LOCAL with Ptr{Local} dtype)
-    let local_dtype = DType::Float32.ptr(Some(1024), AddrSpace::Local).unwrap();
-    let local_buf = UOp::define_local(1, local_dtype);
+    // Create a structured local buffer.
+    let local_buf = UOp::buffer(1, 1024, DType::Float32, AddrSpace::Local, None);
 
     // Wrap in AFTER operation
     let store = UOp::noop();
@@ -572,7 +551,7 @@ fn test_handle_after_local_buffer_not_tracked() {
     // Should return the buffer unwrapped
     match result {
         Some(op) => {
-            assert!(matches!(op.op(), Op::DefineLocal(_)));
+            assert!(matches!(op.op(), Op::Buffer { arg, .. } if arg.addrspace == Some(AddrSpace::Local)));
             // Local buffer should NOT be in buffer map
             assert!(!ctx.has_buffer(&local_buf));
         }
@@ -587,7 +566,7 @@ fn test_handle_after_global_buffer_tracked() {
 
     // Create a global buffer (PARAM with Ptr{Global} dtype)
     let global_dtype = DType::Float32.ptr(Some(1024), AddrSpace::Global).unwrap();
-    let global_buf = UOp::param(1, 1024, global_dtype, None);
+    let global_buf = UOp::param(1, 1024, DType::Scalar(global_dtype.base()), None);
 
     // Wrap in AFTER operation
     let store = UOp::noop();
@@ -615,8 +594,8 @@ fn test_handle_after_mstack_with_local_buffer() {
 
     // Create local buffer
     let local_dtype = DType::Float32.ptr(Some(512), AddrSpace::Local).unwrap();
-    let local_buf1 = UOp::define_local(1, local_dtype.clone());
-    let local_buf2 = UOp::define_local(2, local_dtype.clone());
+    let local_buf1 = UOp::buffer(1, 512, DType::Float32, AddrSpace::Local, None);
+    let local_buf2 = UOp::buffer(2, 512, DType::Float32, AddrSpace::Local, None);
 
     // Create MSTACK
     let mstack = UOp::new(Op::MStack { buffers: smallvec![local_buf1.clone(), local_buf2] }, local_dtype);
@@ -633,7 +612,9 @@ fn test_handle_after_mstack_with_local_buffer() {
         Some(op) => {
             // Verify MSTACK was actually unwrapped to local_buf1 (not just any DEFINE_LOCAL)
             assert!(Arc::ptr_eq(&op, &local_buf1), "Should unwrap to first buffer in MSTACK");
-            assert!(matches!(op.op(), Op::DefineLocal(1)));
+            assert!(
+                matches!(op.op(), Op::Buffer { arg, .. } if arg.slot == 1 && arg.addrspace == Some(AddrSpace::Local))
+            );
             // Local buffer should NOT be tracked
             assert!(!ctx.has_buffer(&local_buf1));
         }
@@ -648,7 +629,7 @@ fn test_handle_after_mselect_with_local_buffer() {
 
     // Create local buffer
     let local_dtype = DType::Int32.ptr(Some(256), AddrSpace::Local).unwrap();
-    let local_buf = UOp::define_local(3, local_dtype.clone());
+    let local_buf = UOp::buffer(3, 256, DType::Int32, AddrSpace::Local, None);
 
     // Create MSELECT
     let mselect = UOp::new(Op::MSelect { buffer: local_buf.clone(), device_index: 0 }, local_dtype);
@@ -665,7 +646,9 @@ fn test_handle_after_mselect_with_local_buffer() {
         Some(op) => {
             // Verify MSELECT was actually unwrapped to local_buf (not just any DEFINE_LOCAL)
             assert!(Arc::ptr_eq(&op, &local_buf), "Should unwrap to buffer from MSELECT");
-            assert!(matches!(op.op(), Op::DefineLocal(3)));
+            assert!(
+                matches!(op.op(), Op::Buffer { arg, .. } if arg.slot == 3 && arg.addrspace == Some(AddrSpace::Local))
+            );
             // Local buffer should NOT be tracked
             assert!(!ctx.has_buffer(&local_buf));
         }
@@ -679,11 +662,10 @@ fn test_handle_after_mixed_address_spaces() {
     let mut ctx = RangeifyBufferContext::new();
 
     // Create both local and global buffers
-    let local_dtype = DType::Float32.ptr(Some(128), AddrSpace::Local).unwrap();
     let global_dtype = DType::Float32.ptr(Some(128), AddrSpace::Global).unwrap();
 
-    let local_buf = UOp::define_local(10, local_dtype);
-    let global_buf = UOp::param(11, 128, global_dtype, None);
+    let local_buf = UOp::buffer(10, 128, DType::Float32, AddrSpace::Local, None);
+    let global_buf = UOp::param(11, 128, DType::Scalar(global_dtype.base()), None);
 
     // Wrap both in AFTER
     let store1 = UOp::noop();

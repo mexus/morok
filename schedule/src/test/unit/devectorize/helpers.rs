@@ -10,10 +10,7 @@ use svod_dtype::{AddrSpace, DType, ScalarDType};
 use svod_ir::types::ConstValue;
 use svod_ir::{Op, UOp};
 
-use crate::devectorize::{
-    bool_storage_patterns, correct_load_store_patterns, devectorize, load_store_folding_patterns,
-    load_store_indexing_patterns, no_vectorized_alu, pm_render,
-};
+use crate::devectorize::{bool_storage_patterns, devectorize, devectorize_patterns, no_vectorized_alu};
 use crate::optimizer::Renderer;
 use crate::rewrite::graph_rewrite;
 
@@ -23,26 +20,8 @@ use crate::rewrite::graph_rewrite;
 
 /// Apply full devectorize pass to a UOp.
 ///
-/// Single-pass rewriting followed by pm_render
-/// to convert CAT to VECTORIZE for rendering.
 pub fn apply_devectorize(uop: &Arc<UOp>) -> Arc<UOp> {
-    let devectorized = devectorize(uop, &Renderer::cpu());
-    // Also run pm_render to convert CAT to VECTORIZE (required for codegen)
-    graph_rewrite(pm_render(), devectorized, &mut ())
-}
-
-/// Apply load_store_folding patterns only.
-///
-/// Includes: expand_index, GEP movement, PTRCAT distribution.
-pub fn apply_load_store_folding(uop: &Arc<UOp>) -> Arc<UOp> {
-    graph_rewrite(load_store_folding_patterns(), uop.clone(), &mut ())
-}
-
-/// Apply correct_load_store patterns only.
-///
-/// Includes: split_load, split_store (CAST(INDEX) patterns).
-pub fn apply_correct_load_store(uop: &Arc<UOp>) -> Arc<UOp> {
-    graph_rewrite(correct_load_store_patterns(), uop.clone(), &mut Renderer::cpu())
+    devectorize(uop, &Renderer::cpu())
 }
 
 /// Apply bool storage patterns only.
@@ -52,28 +31,9 @@ pub fn apply_bool_storage(uop: &Arc<UOp>) -> Arc<UOp> {
     graph_rewrite(bool_storage_patterns(), uop.clone(), &mut ())
 }
 
-/// Apply pm_render patterns (post-devectorize rendering).
-///
-/// Includes: CAT→VECTORIZE, multi-index GEP→VECTORIZE, unwrap single-element.
-pub fn apply_pm_render(uop: &Arc<UOp>) -> Arc<UOp> {
-    graph_rewrite(pm_render(), uop.clone(), &mut ())
-}
-
 /// Apply ALU devectorization patterns.
 pub fn apply_no_vectorized_alu(uop: &Arc<UOp>) -> Arc<UOp> {
     graph_rewrite(no_vectorized_alu(), uop.clone(), &mut ())
-}
-
-/// Apply pm_render patterns for VECTORIZE normalization.
-///
-/// (Legacy name for compatibility - now uses pm_render)
-pub fn apply_vectorize_normalize(uop: &Arc<UOp>) -> Arc<UOp> {
-    apply_pm_render(uop)
-}
-
-/// Apply load_store_indexing patterns (gate dropping).
-pub fn apply_load_store_indexing(uop: &Arc<UOp>) -> Arc<UOp> {
-    graph_rewrite(load_store_indexing_patterns(), uop.clone(), &mut ())
 }
 
 /// Apply cast_after pattern.
@@ -88,21 +48,19 @@ pub fn apply_cast_after(uop: &Arc<UOp>) -> Arc<UOp> {
 
 /// Create a global buffer with float32 element type.
 ///
-/// Returns a BUFFER UOp with Ptr dtype pointing to float32 data.
+/// Returns a BUFFER UOp with float32 element dtype.
 pub fn create_buffer(size: usize) -> Arc<UOp> {
     create_buffer_typed(size, ScalarDType::Float32)
 }
 
 /// Create a global buffer with specified element type.
 pub fn create_buffer_typed(size: usize, scalar: ScalarDType) -> Arc<UOp> {
-    let dtype = DType::Scalar(scalar).ptr(Some(size), AddrSpace::Global).unwrap();
-    UOp::new_buffer(svod_dtype::DeviceSpec::Cpu, size, dtype)
+    UOp::new_buffer(svod_dtype::DeviceSpec::Cpu, size, DType::Scalar(scalar))
 }
 
 /// Create a local (shared) memory buffer.
 pub fn create_buffer_local(size: usize, scalar: ScalarDType) -> Arc<UOp> {
-    let dtype = DType::Scalar(scalar).ptr(Some(size), AddrSpace::Local).unwrap();
-    UOp::new_buffer(svod_dtype::DeviceSpec::Cpu, size, dtype)
+    UOp::buffer(0, size, DType::Scalar(scalar), AddrSpace::Local, None)
 }
 
 /// Create a bool buffer.
@@ -122,22 +80,17 @@ pub fn create_index(buffer: Arc<UOp>, idx: i64) -> Arc<UOp> {
     UOp::index().buffer(buffer).indices(vec![idx_uop]).call().unwrap()
 }
 
-/// Create a vector INDEX with iota pattern: [0, 1, 2, ..., count-1].
+/// Create a shaped INDEX with iota pattern: [0, 1, 2, ..., count-1].
 ///
-/// Creates INDEX(VECTORIZE([def, def, ...]), VECTORIZE([0, 1, ..., count-1]))
-/// matching the expand_index pattern.
+/// Creates `INDEX(def, STACK([0, 1, ..., count-1]))`.
 pub fn create_vector_index_iota(buffer: Arc<UOp>, count: usize) -> Arc<UOp> {
     let indices: SmallVec<[Arc<UOp>; 4]> =
         (0..count).map(|i| UOp::const_(DType::Index, ConstValue::Int(i as i64))).collect();
-    let vec_idx = UOp::vectorize(indices);
+    let vec_idx = UOp::stack(indices);
     let idx_dtype = buffer.dtype().base();
 
-    // Wrap buffer in VECTORIZE to match the expand_index pattern:
-    // INDEX(VECTORIZE(Defines.or_after()), vec_idx)
     let define = buffer_to_define(&buffer);
-    let buf_vec = define.broadcast(count);
-
-    UOp::new(Op::Index { buffer: buf_vec, indices: smallvec::smallvec![vec_idx], gate: None }, DType::Scalar(idx_dtype))
+    UOp::new(Op::Index { buffer: define, indices: smallvec::smallvec![vec_idx] }, DType::Scalar(idx_dtype))
 }
 
 /// Convert a BUFFER to codegen PARAM for testing.
@@ -147,67 +100,56 @@ pub fn create_vector_index_iota(buffer: Arc<UOp>, count: usize) -> Arc<UOp> {
 pub fn buffer_to_define(buffer: &Arc<UOp>) -> Arc<UOp> {
     static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let size = match buffer.dtype() {
-        DType::Ptr { size: Some(s), .. } => s,
-        _ => 1024,
-    };
+    let size = buffer.buffer_size().unwrap_or(1024);
     UOp::param(id, size, buffer.dtype(), None)
 }
 
-/// Create a vector INDEX with offset: [offset, offset+1, offset+2, ..., offset+count-1].
+/// Create a shaped INDEX with offset: [offset, offset+1, ..., offset+count-1].
 pub fn create_vector_index_offset(buffer: Arc<UOp>, count: usize, offset: i64) -> Arc<UOp> {
     let indices: SmallVec<[Arc<UOp>; 4]> =
         (0..count).map(|i| UOp::const_(DType::Index, ConstValue::Int(offset + i as i64))).collect();
-    let vec_idx = UOp::vectorize(indices);
+    let vec_idx = UOp::stack(indices);
     let idx_dtype = buffer.dtype().base();
 
     let define = buffer_to_define(&buffer);
-    let buf_vec = define.broadcast(count);
-
-    UOp::new(Op::Index { buffer: buf_vec, indices: smallvec::smallvec![vec_idx], gate: None }, DType::Scalar(idx_dtype))
+    UOp::new(Op::Index { buffer: define, indices: smallvec::smallvec![vec_idx] }, DType::Scalar(idx_dtype))
 }
 
-/// Create a vector INDEX with scaled pattern: [0*scale, 1*scale, 2*scale, ..., (count-1)*scale].
+/// Create a shaped INDEX with scaled pattern: [0*scale, 1*scale, 2*scale, ..., (count-1)*scale].
 ///
 /// This creates strided access patterns.
 pub fn create_vector_index_scaled(buffer: Arc<UOp>, count: usize, scale: i64) -> Arc<UOp> {
     let indices: SmallVec<[Arc<UOp>; 4]> =
         (0..count).map(|i| UOp::const_(DType::Index, ConstValue::Int(i as i64 * scale))).collect();
-    let vec_idx = UOp::vectorize(indices);
+    let vec_idx = UOp::stack(indices);
     let idx_dtype = buffer.dtype().base();
 
     let define = buffer_to_define(&buffer);
-    let buf_vec = define.broadcast(count);
-
-    UOp::new(Op::Index { buffer: buf_vec, indices: smallvec::smallvec![vec_idx], gate: None }, DType::Scalar(idx_dtype))
+    UOp::new(Op::Index { buffer: define, indices: smallvec::smallvec![vec_idx] }, DType::Scalar(idx_dtype))
 }
 
-/// Create a vector INDEX with explicit values.
+/// Create a shaped INDEX with explicit values.
 pub fn create_vector_index_values(buffer: Arc<UOp>, values: Vec<i64>) -> Arc<UOp> {
     let indices: SmallVec<[Arc<UOp>; 4]> =
         values.iter().map(|&v| UOp::const_(DType::Index, ConstValue::Int(v))).collect();
-    let vec_idx = UOp::vectorize(indices);
+    let vec_idx = UOp::stack(indices);
     let idx_dtype = buffer.dtype().base();
-    let count = values.len();
 
     let define = buffer_to_define(&buffer);
-    let buf_vec = define.broadcast(count);
-
-    UOp::new(Op::Index { buffer: buf_vec, indices: smallvec::smallvec![vec_idx], gate: None }, DType::Scalar(idx_dtype))
+    UOp::new(Op::Index { buffer: define, indices: smallvec::smallvec![vec_idx] }, DType::Scalar(idx_dtype))
 }
 
-/// Create a gated vector INDEX.
+/// Create a gated shaped INDEX.
 pub fn create_vector_index_gated(buffer: Arc<UOp>, count: usize, gate: Arc<UOp>) -> Arc<UOp> {
     let indices: SmallVec<[Arc<UOp>; 4]> =
         (0..count).map(|i| UOp::const_(DType::Index, ConstValue::Int(i as i64))).collect();
-    let vec_idx = UOp::vectorize(indices);
+    let vec_idx = UOp::stack(indices);
     let idx_dtype = buffer.dtype().base();
 
     let define = buffer_to_define(&buffer);
-    let buf_vec = define.broadcast(count);
 
     UOp::new(
-        Op::Index { buffer: buf_vec, indices: smallvec::smallvec![vec_idx], gate: Some(gate) },
+        Op::Index { buffer: define, indices: smallvec::smallvec![vec_idx.valid(gate.broadcast(count))] },
         DType::Scalar(idx_dtype),
     )
 }
@@ -250,8 +192,8 @@ pub fn create_index_with_range(buffer: Arc<UOp>, axis_id: usize, bound: i64, sca
 // =============================================================================
 
 /// Create a LOAD operation.
-pub fn create_load(buffer: Arc<UOp>, index: Arc<UOp>) -> Arc<UOp> {
-    UOp::load().buffer(buffer).index(index).call()
+pub fn create_load(index: Arc<UOp>) -> Arc<UOp> {
+    UOp::load().index(index).call()
 }
 
 /// Create a STORE operation.
@@ -259,12 +201,6 @@ pub fn create_load(buffer: Arc<UOp>, index: Arc<UOp>) -> Arc<UOp> {
 /// Note: `index` must be an INDEX operation that references the buffer.
 pub fn create_store(index: Arc<UOp>, value: Arc<UOp>) -> Arc<UOp> {
     index.store(value)
-}
-
-/// Create a vector LOAD with iota index.
-pub fn create_vector_load_iota(buffer: Arc<UOp>, count: usize) -> Arc<UOp> {
-    let index = create_vector_index_iota(buffer.clone(), count);
-    UOp::load().buffer(buffer).index(index).call()
 }
 
 /// Create a vector STORE with iota index.
@@ -296,77 +232,45 @@ pub fn create_bool_const(value: bool) -> Arc<UOp> {
 pub fn create_vector_float_iota(count: usize) -> Arc<UOp> {
     let elements: SmallVec<[Arc<UOp>; 4]> =
         (0..count).map(|i| UOp::const_(DType::Float32, ConstValue::Float(i as f64))).collect();
-    UOp::vectorize(elements)
+    UOp::stack(elements)
 }
 
 /// Create a vector int constant with iota pattern.
 pub fn create_vector_int_iota(count: usize) -> Arc<UOp> {
     let elements: SmallVec<[Arc<UOp>; 4]> =
         (0..count).map(|i| UOp::const_(DType::Int64, ConstValue::Int(i as i64))).collect();
-    UOp::vectorize(elements)
+    UOp::stack(elements)
 }
 
 /// Create a vector constant from explicit float values.
 pub fn create_vector_float_values(values: Vec<f64>) -> Arc<UOp> {
     let elements: SmallVec<[Arc<UOp>; 4]> =
         values.into_iter().map(|v| UOp::const_(DType::Float32, ConstValue::Float(v))).collect();
-    UOp::vectorize(elements)
+    UOp::stack(elements)
 }
 
 /// Create a vector constant from explicit int values.
 pub fn create_vector_int_values(values: Vec<i64>) -> Arc<UOp> {
     let elements: SmallVec<[Arc<UOp>; 4]> =
         values.into_iter().map(|v| UOp::const_(DType::Int64, ConstValue::Int(v))).collect();
-    UOp::vectorize(elements)
+    UOp::stack(elements)
 }
 
 /// Create a vector bool constant.
 pub fn create_vector_bool(values: Vec<bool>) -> Arc<UOp> {
     let elements: SmallVec<[Arc<UOp>; 4]> =
         values.into_iter().map(|v| UOp::const_(DType::Bool, ConstValue::Bool(v))).collect();
-    UOp::vectorize(elements)
+    UOp::stack(elements)
 }
 
 // =============================================================================
 // Assertion Helpers
 // =============================================================================
 
-/// Assert that a UOp is a PTRCAT with expected source count.
-pub fn assert_is_ptrcat(uop: &Arc<UOp>, expected_count: usize) {
-    match uop.op() {
-        Op::PtrCat { sources } => {
-            assert_eq!(
-                sources.len(),
-                expected_count,
-                "PTRCAT source count mismatch: expected {}, got {}",
-                expected_count,
-                sources.len()
-            );
-        }
-        other => panic!("Expected PTRCAT, got {:?}", other),
-    }
-}
-
-/// Assert that a UOp is a CAT with expected source count.
-pub fn assert_is_cat(uop: &Arc<UOp>, expected_count: usize) {
-    match uop.op() {
-        Op::Cat { sources } => {
-            assert_eq!(
-                sources.len(),
-                expected_count,
-                "CAT source count mismatch: expected {}, got {}",
-                expected_count,
-                sources.len()
-            );
-        }
-        other => panic!("Expected CAT, got {:?}", other),
-    }
-}
-
 /// Assert that a UOp is a VECTORIZE with expected element count.
 pub fn assert_is_vectorize(uop: &Arc<UOp>, expected_count: usize) {
     match uop.op() {
-        Op::Vectorize { elements } => {
+        Op::Stack { sources: elements } => {
             assert_eq!(
                 elements.len(),
                 expected_count,
@@ -379,9 +283,15 @@ pub fn assert_is_vectorize(uop: &Arc<UOp>, expected_count: usize) {
     }
 }
 
-/// Assert that a UOp has expected vcount (vector width).
+/// Assert the target shaped element count, falling back to mechanical vector width.
 pub fn assert_vcount(uop: &Arc<UOp>, expected: usize) {
-    assert_eq!(uop.dtype().vcount(), expected, "vcount mismatch: expected {}, got {}", expected, uop.dtype().vcount());
+    let count = uop
+        .shape()
+        .ok()
+        .flatten()
+        .and_then(|shape| shape.iter().try_fold(1usize, |product, dim| Some(product * dim.as_const()?)))
+        .unwrap_or_else(|| uop.dtype().vcount());
+    assert_eq!(count, expected, "element count mismatch: expected {expected}, got {count}");
 }
 
 /// Assert dtype matches expected.
@@ -402,20 +312,6 @@ pub fn assert_is_load(uop: &Arc<UOp>) {
 /// Assert that a UOp is a STORE.
 pub fn assert_is_store(uop: &Arc<UOp>) {
     assert!(matches!(uop.op(), Op::Store { .. }), "Expected STORE, got {:?}", uop.op());
-}
-
-/// Assert that a UOp is a GEP with expected indices.
-pub fn assert_is_gep(uop: &Arc<UOp>, expected_indices: &[usize]) {
-    match uop.op() {
-        Op::Gep { indices, .. } => {
-            assert_eq!(
-                indices, expected_indices,
-                "GEP indices mismatch: expected {:?}, got {:?}",
-                expected_indices, indices
-            );
-        }
-        other => panic!("Expected GEP, got {:?}", other),
-    }
 }
 
 /// Assert that a UOp is a CAST.
@@ -485,24 +381,9 @@ pub fn count_indices(uop: &Arc<UOp>) -> usize {
     count_ops(uop, |u| matches!(u.op(), Op::Index { .. }))
 }
 
-/// Count PTRCAT operations in the tree.
-pub fn count_ptrcats(uop: &Arc<UOp>) -> usize {
-    count_ops(uop, |u| matches!(u.op(), Op::PtrCat { .. }))
-}
-
-/// Count CAT operations in the tree.
-pub fn count_cats(uop: &Arc<UOp>) -> usize {
-    count_ops(uop, |u| matches!(u.op(), Op::Cat { .. }))
-}
-
 /// Count VECTORIZE operations in the tree.
 pub fn count_vectorizes(uop: &Arc<UOp>) -> usize {
-    count_ops(uop, |u| matches!(u.op(), Op::Vectorize { .. }))
-}
-
-/// Count GEP operations in the tree.
-pub fn count_geps(uop: &Arc<UOp>) -> usize {
-    count_ops(uop, |u| matches!(u.op(), Op::Gep { .. }))
+    count_ops(uop, |u| matches!(u.op(), Op::Stack { .. }))
 }
 
 /// Count CAST operations in the tree.
@@ -514,54 +395,21 @@ pub fn count_casts(uop: &Arc<UOp>) -> usize {
 // Unwrap Helpers
 // =============================================================================
 
-/// Unwrap PTRCAT and return sources.
-pub fn unwrap_ptrcat(uop: &Arc<UOp>) -> SmallVec<[Arc<UOp>; 4]> {
-    match uop.op() {
-        Op::PtrCat { sources } => sources.clone(),
-        other => panic!("Expected PTRCAT, got {:?}", other),
-    }
-}
-
-/// Unwrap CAT and return sources.
-pub fn unwrap_cat(uop: &Arc<UOp>) -> SmallVec<[Arc<UOp>; 4]> {
-    match uop.op() {
-        Op::Cat { sources } => sources.clone(),
-        other => panic!("Expected CAT, got {:?}", other),
-    }
-}
-
 /// Unwrap VECTORIZE and return elements.
 pub fn unwrap_vectorize(uop: &Arc<UOp>) -> SmallVec<[Arc<UOp>; 4]> {
     match uop.op() {
-        Op::Vectorize { elements } => elements.clone(),
+        Op::Stack { sources } => sources.clone(),
         other => panic!("Expected VECTORIZE, got {:?}", other),
-    }
-}
-
-/// Unwrap LOAD and return (buffer, index).
-pub fn unwrap_load(uop: &Arc<UOp>) -> (Arc<UOp>, Arc<UOp>) {
-    match uop.op() {
-        Op::Load { buffer, index, .. } => (buffer.clone(), index.clone()),
-        other => panic!("Expected LOAD, got {:?}", other),
     }
 }
 
 /// Unwrap STORE and return (index, value).
 ///
-/// The buffer can be accessed via `index.op()` (which should be an INDEX op)
-/// or use the `store_buffer()` helper on the store UOp.
+/// The buffer can be accessed via `index.op()` (which should be an INDEX op).
 pub fn unwrap_store(uop: &Arc<UOp>) -> (Arc<UOp>, Arc<UOp>) {
     match uop.op() {
         Op::Store { index, value, .. } => (index.clone(), value.clone()),
         other => panic!("Expected STORE, got {:?}", other),
-    }
-}
-
-/// Unwrap GEP and return (vector, indices).
-pub fn unwrap_gep(uop: &Arc<UOp>) -> (Arc<UOp>, Vec<usize>) {
-    match uop.op() {
-        Op::Gep { vector, indices } => (vector.clone(), indices.clone()),
-        other => panic!("Expected GEP, got {:?}", other),
     }
 }
 
@@ -573,11 +421,10 @@ pub fn unwrap_cast(uop: &Arc<UOp>) -> (Arc<UOp>, DType) {
     }
 }
 
-/// Unwrap INDEX and return (buffer, indices, gate).
-#[allow(clippy::type_complexity)]
-pub fn unwrap_index(uop: &Arc<UOp>) -> (Arc<UOp>, SmallVec<[Arc<UOp>; 4]>, Option<Arc<UOp>>) {
+/// Unwrap INDEX and return (buffer, indices).
+pub fn unwrap_index(uop: &Arc<UOp>) -> (Arc<UOp>, SmallVec<[Arc<UOp>; 4]>) {
     match uop.op() {
-        Op::Index { buffer, indices, gate } => (buffer.clone(), indices.clone(), gate.clone()),
+        Op::Index { buffer, indices } => (buffer.clone(), indices.clone()),
         other => panic!("Expected INDEX, got {:?}", other),
     }
 }
@@ -605,17 +452,9 @@ pub fn apply_pm_reduce(uop: &Arc<UOp>) -> Arc<UOp> {
     graph_rewrite(&pm_reduce(), uop.clone(), &mut ctx)
 }
 
-/// Apply GEP movement and related load/store folding patterns.
-///
-/// This uses load_store_folding_patterns which includes:
-/// - expand_index patterns
-/// - gep_movement patterns (move_gep_after_load, move_gep_on_store)
-/// - ptrcat_distribution patterns
-///
-/// For isolated GEP movement testing, the patterns still apply correctly
-/// because the other patterns won't fire on inputs that don't match.
+/// Apply the target devectorizer2 matcher for focused GEP movement tests.
 pub fn apply_gep_movement(uop: &Arc<UOp>) -> Arc<UOp> {
-    apply_load_store_folding(uop)
+    graph_rewrite(devectorize_patterns(), uop.clone(), &mut ())
 }
 
 // =============================================================================
@@ -629,19 +468,19 @@ pub fn create_reduce(src: Arc<UOp>, ranges: Vec<Arc<UOp>>, reduce_op: ReduceOp) 
 
 /// Create a Range with Loop axis type.
 pub fn create_range_loop(end: i64, axis_id: u32) -> Arc<UOp> {
-    let end_uop = UOp::const_(DType::Index, ConstValue::Int(end));
+    let end_uop = UOp::const_(DType::WeakInt, ConstValue::Int(end));
     UOp::range_axis(end_uop, AxisId::Renumbered(axis_id as usize), AxisType::Loop)
 }
 
 /// Create a Range with Reduce axis type.
 pub fn create_range_reduce(end: i64, axis_id: u32) -> Arc<UOp> {
-    let end_uop = UOp::const_(DType::Index, ConstValue::Int(end));
+    let end_uop = UOp::const_(DType::WeakInt, ConstValue::Int(end));
     UOp::range_axis(end_uop, AxisId::Renumbered(axis_id as usize), AxisType::Reduce)
 }
 
 /// Create a Range with Thread axis type (parallel).
 pub fn create_range_thread(end: i64, axis_id: u32) -> Arc<UOp> {
-    let end_uop = UOp::const_(DType::Index, ConstValue::Int(end));
+    let end_uop = UOp::const_(DType::WeakInt, ConstValue::Int(end));
     UOp::range_axis(end_uop, AxisId::Renumbered(axis_id as usize), AxisType::Thread)
 }
 
@@ -663,7 +502,11 @@ pub fn create_range_local(end: i64, axis_id: u32) -> Arc<UOp> {
 
 /// Assert that a UOp is a DEFINE_REG.
 pub fn assert_is_define_reg(uop: &Arc<UOp>) {
-    assert!(matches!(uop.op(), Op::DefineReg { .. }), "Expected DEFINE_REG, got {:?}", uop.op());
+    assert!(
+        matches!(uop.op(), Op::Buffer { arg, .. } if arg.addrspace == Some(AddrSpace::Reg)),
+        "Expected REG BUFFER, got {:?}",
+        uop.op()
+    );
 }
 
 /// Assert that a UOp has the specified number of AFTER dependencies.
@@ -689,7 +532,7 @@ pub fn assert_is_reduce(uop: &Arc<UOp>) {
 /// Unwrap REDUCE and return (src, ranges, reduce_op).
 pub fn unwrap_reduce(uop: &Arc<UOp>) -> (Arc<UOp>, SmallVec<[Arc<UOp>; 4]>, ReduceOp) {
     match uop.op() {
-        Op::Reduce { src, ranges, reduce_op } => (src.clone(), ranges.clone(), *reduce_op),
+        Op::Reduce { src, ranges, reduce_op, .. } => (src.clone(), ranges.clone(), *reduce_op),
         other => panic!("Expected REDUCE, got {:?}", other),
     }
 }
@@ -700,22 +543,14 @@ pub fn unwrap_reduce(uop: &Arc<UOp>) -> (Arc<UOp>, SmallVec<[Arc<UOp>; 4]>, Redu
 
 /// Create a GEP operation with explicit indices.
 pub fn create_gep(vector: Arc<UOp>, indices: Vec<usize>) -> Arc<UOp> {
-    vector.gep(indices)
-}
-
-/// Create a LOAD with GEP on the index.
-///
-/// LOAD(buffer, GEP(index, indices))
-pub fn create_load_with_gep_index(buffer: Arc<UOp>, index: Arc<UOp>, gep_indices: Vec<usize>) -> Arc<UOp> {
-    let gep_index = index.gep(gep_indices);
-    UOp::load().buffer(buffer).index(gep_index).call()
+    vector.index_axes(indices)
 }
 
 /// Create a STORE with GEP on the index.
 ///
 /// STORE(GEP(index, indices), value)
 pub fn create_store_with_gep_index(index: Arc<UOp>, gep_indices: Vec<usize>, value: Arc<UOp>) -> Arc<UOp> {
-    let gep_index = index.gep(gep_indices);
+    let gep_index = index.index_axes(gep_indices);
     gep_index.store(value)
 }
 
@@ -740,7 +575,7 @@ pub fn count_reduces(uop: &Arc<UOp>) -> usize {
 
 /// Count DEFINE_REG operations in the tree.
 pub fn count_define_regs(uop: &Arc<UOp>) -> usize {
-    count_ops(uop, |u| matches!(u.op(), Op::DefineReg { .. }))
+    count_ops(uop, |u| matches!(u.op(), Op::Buffer { arg, .. } if arg.addrspace == Some(AddrSpace::Reg)))
 }
 
 /// Count END operations in the tree.

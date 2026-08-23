@@ -61,7 +61,7 @@ pub fn clear_kernel_name_counts() {
 /// scheduler.convert_loop_to_global()?;
 ///
 /// // Apply optimizations
-/// scheduler.apply_opt(Opt::upcast(0, 4))?;  // Vectorize by 4
+/// scheduler.apply_opt(Opt::upcast(0, 4))?;  // Stack by 4
 /// scheduler.apply_opt(Opt::local(1, 16))?;  // 16 threads per workgroup
 ///
 /// // Get result
@@ -213,7 +213,7 @@ impl Scheduler {
         // Sort by (axis_type.priority(), axis_id)
         ranges.sort_by_key(|rng| {
             if let Op::Range { axis_id, axis_type, .. } = rng.op() {
-                (axis_type.priority(), *axis_id)
+                (axis_type.priority(), axis_id.clone())
             } else {
                 unreachable!("Filtered to only Range ops")
             }
@@ -447,7 +447,7 @@ impl Scheduler {
             .enumerate()
             .filter_map(|(i, rng)| {
                 if let Op::Range { axis_type, end, .. } = rng.op() {
-                    if !matches!(axis_type, AxisType::Global | AxisType::Local | AxisType::Loop) {
+                    if !matches!(axis_type, AxisType::Global | AxisType::Local | AxisType::Weak) {
                         return None;
                     }
 
@@ -730,13 +730,13 @@ impl Scheduler {
 
         // 2. Create new range
         let new_rng = input_new_rng.unwrap_or_else(|| {
-            let end = UOp::const_(svod_dtype::DType::Index, ConstValue::Int(amount as i64));
+            let end = rng.const_like(amount as i64);
             UOp::range_axis(end, AxisId::Renumbered(self.maxarg() + 1), new_type)
         });
 
         // 3. Create reduced old range (same axis_id and type, symbolic end allowed)
         let replaced_rng = if let Op::Range { axis_id, axis_type, .. } = rng.op() {
-            UOp::range_axis(old_end.clone(), *axis_id, *axis_type)
+            UOp::range_axis(old_end.clone(), axis_id.clone(), *axis_type)
         } else {
             return ExpectedRangeOperationSnafu.fail();
         };
@@ -753,7 +753,7 @@ impl Scheduler {
         } else {
             // Bottom order: old varies faster
             // Example: [0,1,2,3, 4,5,6,7, 8,9,10,11, ...]
-            let amount_uop = UOp::const_(svod_dtype::DType::Index, ConstValue::Int(amount as i64));
+            let amount_uop = replaced_rng.const_like(amount as i64);
             replaced_rng
                 .try_mul(&amount_uop)
                 .expect("Multiplication should not fail for index types")
@@ -824,19 +824,19 @@ impl Scheduler {
         output_ranges
     }
 
-    /// Get LOOP ranges that can be safely parallelized to GLOBAL.
+    /// Get WEAK ranges that can be safely parallelized to GLOBAL.
     ///
     /// A range is globalizable if:
-    /// 1. It's currently a LOOP axis
+    /// 1. It's currently a WEAK axis
     /// 2. It appears in all output operations (STORE nodes)
     ///
     /// This ensures parallelizing the range won't cause race conditions.
     pub(crate) fn globalizable_rngs(&self) -> Vec<Arc<UOp>> {
-        // Start with LOOP axes from outputs
+        // Start with WEAK axes from outputs
         let mut candidates: Vec<_> = self
             .output_rngs()
             .into_iter()
-            .filter(|r| if let Op::Range { axis_type, .. } = r.op() { *axis_type == AxisType::Loop } else { false })
+            .filter(|r| if let Op::Range { axis_type, .. } = r.op() { *axis_type == AxisType::Weak } else { false })
             .collect();
 
         // Find all STORE and SINK operations
@@ -864,7 +864,7 @@ impl Scheduler {
         candidates
     }
 
-    /// Convert eligible LOOP axes to GLOBAL for parallelization.
+    /// Convert eligible WEAK axes to GLOBAL for parallelization.
     ///
     /// Identifies which loops can be safely parallelized and converts them to
     /// GLOBAL (GPU thread) axes. Only applicable for GPU backends (has_local=true).
@@ -888,7 +888,7 @@ impl Scheduler {
             return Ok(());
         }
 
-        // Build substitution map: LOOP → GLOBAL
+        // Build substitution map: WEAK -> GLOBAL
         #[allow(clippy::mutable_key_type)]
         let mut subst_map = std::collections::HashMap::new();
         for rng in globalizable {
@@ -960,9 +960,10 @@ impl Scheduler {
 
                         // Get letter for axis type
                         let letter = match axis_type {
+                            AxisType::Device => "d",
                             AxisType::Global => "g",
                             AxisType::Local => "l",
-                            AxisType::Loop => "L",
+                            AxisType::Weak | AxisType::Loop => "L",
                             AxisType::Upcast => "u",
                             AxisType::Reduce => "R",
                             AxisType::GroupReduce => "G",
@@ -994,6 +995,17 @@ impl Scheduler {
         // 2. Flatten ranges (top-down graph_rewrite default).
         let flattened_ast =
             crate::rewrite::graph_rewrite(crate::rangeify::pm_flatten_range(), self.ast.clone(), &mut ());
+
+        let flattened_ast = match flattened_ast.op() {
+            Op::Sink { sources, info } => {
+                let mut structural = info.clone().unwrap_or_default();
+                structural.name = Some(name.clone());
+                structural.applied_opts = self.applied_opts.clone();
+                structural.dont_use_locals = self.dont_use_locals;
+                UOp::sink_with_info(sources.iter().cloned().collect(), structural)
+            }
+            _ => flattened_ast,
+        };
 
         // 3. Attach metadata
         let info = KernelInfo { name, applied_opts: self.applied_opts.clone(), dont_use_locals: self.dont_use_locals };

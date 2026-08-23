@@ -5,8 +5,8 @@
 //! and provides tensor core configurations for hardware-accelerated matrix multiplication.
 
 use smallvec::SmallVec;
-use svod_dtype::{AmdArch, DType};
-use svod_ir::RendererDevice;
+use svod_dtype::{AmdArch, DType, ScalarDType};
+use svod_ir::{RendererDevice, RendererOps, TypedPatternMatcher};
 
 /// Tensor core optimization operation.
 ///
@@ -77,7 +77,7 @@ impl std::fmt::Display for SwizzleAxis {
 ///
 /// Describes what features and optimizations a particular backend supports.
 /// Used by the optimizer to determine valid transformations and enforce device limits.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Renderer {
     /// Backend device identifier.
     pub device: RendererDevice,
@@ -103,6 +103,11 @@ pub struct Renderer {
     /// Used to validate thread count in THREAD optimization.
     /// None if unlimited or not applicable.
     pub global_max: Option<Vec<usize>>,
+
+    /// Maximum product of global and local size for each hardware axis.
+    ///
+    /// HIP exposes this separately from the global grid limit.
+    pub global_prod_max: Option<Vec<usize>>,
 
     /// Maximum local work group size.
     ///
@@ -132,9 +137,59 @@ pub struct Renderer {
     /// When false, the devectorize pass falls back to scalar fold widths and
     /// skips wide load/store generation.
     pub supports_float4: bool,
+
+    /// Renderer-owned final rewrite rules (`Renderer.extra_matcher` in tinygrad).
+    extra_matcher: Option<TypedPatternMatcher>,
+
+    /// Target-specific decomposition rules derived from operations absent from
+    /// the renderer's support table.
+    decomposition_matcher: Option<TypedPatternMatcher>,
+
+    /// Exact operation table reported by the selected code renderer.
+    renderer_ops: Option<RendererOps>,
+
+    /// Scalar storage/ALU formats accepted natively by this target.
+    supported_dtypes: std::collections::HashSet<ScalarDType>,
+}
+
+impl std::fmt::Debug for Renderer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Renderer")
+            .field("device", &self.device)
+            .field("has_local", &self.has_local)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Renderer {
+    fn dtype_set(dtypes: &[ScalarDType]) -> std::collections::HashSet<ScalarDType> {
+        dtypes.iter().copied().collect()
+    }
+
+    fn common_dtypes() -> std::collections::HashSet<ScalarDType> {
+        use ScalarDType::*;
+        Self::dtype_set(&[
+            Bool, Int8, UInt8, Int16, UInt16, Int32, UInt32, Int64, UInt64, Float16, BFloat16, Float32, Float64,
+        ])
+    }
+
+    fn fp8_dtypes() -> std::collections::HashSet<ScalarDType> {
+        let mut ret = Self::common_dtypes();
+        ret.extend([ScalarDType::FP8E4M3, ScalarDType::FP8E5M2]);
+        ret
+    }
+
+    fn pre_bf16_dtypes() -> std::collections::HashSet<ScalarDType> {
+        let mut ret = Self::common_dtypes();
+        ret.remove(&ScalarDType::BFloat16);
+        ret
+    }
+
+    fn webgpu_dtypes() -> std::collections::HashSet<ScalarDType> {
+        use ScalarDType::*;
+        Self::dtype_set(&[Bool, Int8, UInt8, Int16, UInt16, Int32, UInt32, Float32])
+    }
+
     /// Create a CPU renderer configuration.
     pub fn cpu() -> Self {
         let cores = std::thread::available_parallelism().map(|p| p.get()).unwrap_or(8);
@@ -145,11 +200,16 @@ impl Renderer {
             has_threads: true,
             shared_max: 0,
             global_max: Some(vec![cores]), // Actual available CPU cores
+            global_prod_max: None,
             local_max: None,
             upcast_max: 16, // AVX512 can do 16-wide float
             buffer_max: None,
             tensor_cores: vec![],
             supports_float4: true,
+            extra_matcher: None,
+            decomposition_matcher: None,
+            renderer_ops: None,
+            supported_dtypes: Self::common_dtypes(),
         }
     }
 
@@ -169,11 +229,16 @@ impl Renderer {
             has_threads: false,
             shared_max: 49152,
             global_max: Some(vec![2147483647, 65535, 65535]),
+            global_prod_max: None,
             local_max: Some(1024),
             upcast_max: 8,
             buffer_max: None,
             tensor_cores: TensorCore::sm75_tensor_cores(),
             supports_float4: true,
+            extra_matcher: None,
+            decomposition_matcher: None,
+            renderer_ops: None,
+            supported_dtypes: Self::pre_bf16_dtypes(),
         }
     }
 
@@ -186,11 +251,16 @@ impl Renderer {
             has_threads: false,
             shared_max: 49152,
             global_max: Some(vec![2147483647, 65535, 65535]),
+            global_prod_max: None,
             local_max: Some(1024),
             upcast_max: 8,
             buffer_max: None,
             tensor_cores: TensorCore::sm80_tensor_cores(allow_tf32),
             supports_float4: true,
+            extra_matcher: None,
+            decomposition_matcher: None,
+            renderer_ops: None,
+            supported_dtypes: Self::common_dtypes(),
         }
     }
 
@@ -203,11 +273,16 @@ impl Renderer {
             has_threads: false,
             shared_max: 49152,
             global_max: Some(vec![2147483647, 65535, 65535]),
+            global_prod_max: None,
             local_max: Some(1024),
             upcast_max: 8,
             buffer_max: None,
             tensor_cores: TensorCore::sm89_tensor_cores(allow_tf32),
             supports_float4: true,
+            extra_matcher: None,
+            decomposition_matcher: None,
+            renderer_ops: None,
+            supported_dtypes: Self::fp8_dtypes(),
         }
     }
 
@@ -220,11 +295,16 @@ impl Renderer {
             has_threads: false,
             shared_max: 32768, // 32KB for Metal
             global_max: None,
+            global_prod_max: None,
             local_max: Some(1024),
             upcast_max: 4,        // float4 for Metal
             buffer_max: Some(31), // Metal has 31 buffer argument limit
             tensor_cores: TensorCore::metal_tensor_cores(),
             supports_float4: true,
+            extra_matcher: None,
+            decomposition_matcher: None,
+            renderer_ops: None,
+            supported_dtypes: Self::common_dtypes(),
         }
     }
 
@@ -237,11 +317,16 @@ impl Renderer {
             has_threads: true, // CPU-style threading
             shared_max: 0,
             global_max: Some(vec![256]),
+            global_prod_max: None,
             local_max: None,
             upcast_max: 16,
             buffer_max: None,
             tensor_cores: TensorCore::amx_tensor_cores(),
             supports_float4: true,
+            extra_matcher: None,
+            decomposition_matcher: None,
+            renderer_ops: None,
+            supported_dtypes: Self::common_dtypes(),
         }
     }
 
@@ -259,11 +344,16 @@ impl Renderer {
             has_threads: false,
             shared_max: 65536, // 64KB for RDNA3
             global_max: Some(vec![2147483647, 65535, 65535]),
+            global_prod_max: Some(vec![u32::MAX as usize; 3]),
             local_max: Some(1024),
             upcast_max: 8,
             buffer_max: None,
             tensor_cores: TensorCore::rdna3_tensor_cores(),
             supports_float4: true,
+            extra_matcher: None,
+            decomposition_matcher: None,
+            renderer_ops: None,
+            supported_dtypes: Self::common_dtypes(),
         }
     }
 
@@ -276,11 +366,16 @@ impl Renderer {
             has_threads: false,
             shared_max: 65536,
             global_max: Some(vec![2147483647, 65535, 65535]),
+            global_prod_max: Some(vec![u32::MAX as usize; 3]),
             local_max: Some(1024),
             upcast_max: 8,
             buffer_max: None,
             tensor_cores: TensorCore::rdna4_tensor_cores(),
             supports_float4: true,
+            extra_matcher: None,
+            decomposition_matcher: None,
+            renderer_ops: None,
+            supported_dtypes: Self::common_dtypes(),
         }
     }
 
@@ -293,11 +388,18 @@ impl Renderer {
             has_threads: false,
             shared_max: 65536, // 64KB for CDNA
             global_max: Some(vec![2147483647, 65535, 65535]),
+            global_prod_max: Some(vec![u32::MAX as usize; 3]),
             local_max: Some(1024),
             upcast_max: 8,
             buffer_max: None,
             tensor_cores: TensorCore::cdna3_tensor_cores(),
             supports_float4: true,
+            extra_matcher: None,
+            decomposition_matcher: None,
+            renderer_ops: None,
+            // gfx942 has native OCP FP8 MFMA operands even though HIP does not
+            // expose FP8 as a general-purpose storage/ALU type on this arch.
+            supported_dtypes: Self::fp8_dtypes(),
         }
     }
 
@@ -310,26 +412,28 @@ impl Renderer {
             has_threads: false,
             shared_max: 65536,
             global_max: Some(vec![2147483647, 65535, 65535]),
+            global_prod_max: Some(vec![u32::MAX as usize; 3]),
             local_max: Some(1024),
             upcast_max: 8,
             buffer_max: None,
             tensor_cores: TensorCore::cdna4_tensor_cores(),
             supports_float4: true,
+            extra_matcher: None,
+            decomposition_matcher: None,
+            renderer_ops: None,
+            supported_dtypes: Self::fp8_dtypes(),
         }
     }
 
     /// Per-axis local work-group size limits `(x, y, z)`, or `None` when only
     /// the product cap ([`local_max`](Self::local_max)) applies.
     ///
-    /// AMD/HIP caps the 3rd local axis at 64 below the 1024-thread product limit
-    /// (tinygrad's `local_max = (1024, 1024, 64)`), so a candidate with product
-    /// ≤ 1024 but z > 64 is still invalid and must be bounded at gpudims time.
+    /// This is distinct from [`local_max`](Self::local_max), which caps the
+    /// product of all local axes.
     pub fn local_max_axes(&self) -> Option<[usize; 3]> {
         match self.device {
-            RendererDevice::AmdRdna3
-            | RendererDevice::AmdRdna4
-            | RendererDevice::AmdCdna3
-            | RendererDevice::AmdCdna4 => Some([1024, 1024, 64]),
+            RendererDevice::CudaSm75 | RendererDevice::CudaSm80 | RendererDevice::CudaSm89 => Some([1024, 1024, 64]),
+            RendererDevice::WebGpu => Some([256, 256, 64]),
             _ => None,
         }
     }
@@ -354,11 +458,16 @@ impl Renderer {
             has_threads: false,
             shared_max: 65536, // 64KB for Xe
             global_max: Some(vec![2147483647, 65535, 65535]),
+            global_prod_max: None,
             local_max: Some(512),
             upcast_max: 8,
             buffer_max: None,
             tensor_cores: TensorCore::intel_tensor_cores(),
             supports_float4: true,
+            extra_matcher: None,
+            decomposition_matcher: None,
+            renderer_ops: None,
+            supported_dtypes: Self::common_dtypes(),
         }
     }
 
@@ -371,12 +480,60 @@ impl Renderer {
             has_threads: false,
             shared_max: 16384, // 16KB typical for WebGPU
             global_max: Some(vec![65535, 65535, 65535]),
+            global_prod_max: None,
             local_max: Some(256),
             upcast_max: 4,
             buffer_max: Some(8), // WebGPU has 8 buffer limit in some implementations
             tensor_cores: vec![],
             supports_float4: false,
+            extra_matcher: None,
+            decomposition_matcher: None,
+            renderer_ops: None,
+            supported_dtypes: Self::webgpu_dtypes(),
         }
+    }
+
+    /// Bind the concrete code renderer's operation table and target-local
+    /// rewrites to this hardware optimization profile.
+    pub fn with_codegen_renderer(mut self, renderer: &dyn svod_device::device::Renderer) -> Self {
+        self.renderer_ops = Some(renderer.supported_ops());
+        self.decomposition_matcher = renderer.decompositor();
+        self.extra_matcher = renderer.extra_matcher();
+        self
+    }
+
+    /// Bind explicit renderer capabilities. This is primarily useful for
+    /// renderer unit tests and non-device embedding layers.
+    pub fn with_rewrite_capabilities(
+        mut self,
+        supported_ops: RendererOps,
+        decomposition_matcher: Option<TypedPatternMatcher>,
+        extra_matcher: Option<TypedPatternMatcher>,
+    ) -> Self {
+        self.renderer_ops = Some(supported_ops);
+        self.decomposition_matcher = decomposition_matcher;
+        self.extra_matcher = extra_matcher;
+        self
+    }
+
+    pub(crate) fn supported_ops(&self) -> Option<&RendererOps> {
+        self.renderer_ops.as_ref()
+    }
+
+    pub(crate) fn supports_dtype(&self, dtype: ScalarDType) -> bool {
+        self.supported_dtypes.contains(&dtype)
+    }
+
+    pub(crate) fn supported_dtypes(&self) -> std::collections::HashSet<ScalarDType> {
+        self.supported_dtypes.clone()
+    }
+
+    pub(crate) fn decomposition_matcher(&self) -> Option<&TypedPatternMatcher> {
+        self.decomposition_matcher.as_ref()
+    }
+
+    pub(crate) fn extra_matcher(&self) -> Option<&TypedPatternMatcher> {
+        self.extra_matcher.as_ref()
     }
 }
 
@@ -616,6 +773,24 @@ pub const AMD_CDNA_161632: TcConfig = TcConfig {
     tile_grid: (1, 1),
 };
 
+pub const AMD_CDNA_1616128: TcConfig = TcConfig {
+    dims: (16, 16, 128),
+    threads: 64,
+    ept: (32, 32, 4),
+    opts: &[L(0), L(0), L(0), L(0), U(1), U(1), L(1), L(1)],
+    swizzle_a: (
+        &[SU(0), SU(1), SL(4), SL(5), R(5), R(6)],
+        &[R(0), R(1)],
+        &[SL(0), SL(1), SL(2), SL(3), R(2), R(3), R(4)],
+    ),
+    swizzle_b: (
+        &[SL(0), SL(1), SL(2), SL(3), R(5), R(6)],
+        &[R(0), R(1)],
+        &[SL(4), SL(5), SU(0), SU(1), R(2), R(3), R(4)],
+    ),
+    tile_grid: (1, 1),
+};
+
 // Apple Metal Tensor Cores
 pub const METAL_888: TcConfig = TcConfig {
     dims: (8, 8, 8),
@@ -705,7 +880,7 @@ impl TensorCore {
 
     /// Get the upcast axes configuration for WMMA construction.
     ///
-    /// Returns axes configuration for CONTRACT operations.
+    /// Returns tensor-core expansion axis configuration.
     /// Format: (A_axes, B_axes, output_axes)
     pub fn upcast_axes(&self) -> (Vec<usize>, Vec<usize>, Vec<usize>) {
         // This is simplified - actual implementation depends on opts sequence
@@ -749,6 +924,7 @@ impl TensorCore {
             AMD_RDNA3.build(DType::Float16, DType::Float32),
             AMD_RDNA3.build(DType::Float16, DType::Float16),
             AMD_RDNA3.build(DType::BFloat16, DType::Float32),
+            AMD_RDNA3.build(DType::Int8, DType::Int32),
         ]
     }
 
@@ -769,16 +945,14 @@ impl TensorCore {
             AMD_CDNA_161632.build(DType::FP8E4M3, DType::Float32),
             AMD_CDNA_161616.build(DType::Float16, DType::Float32),
             AMD_CDNA_161616.build(DType::BFloat16, DType::Float32),
-            // CDNA3 fp32 MFMA runs at the packed-vector fp32 rate — only a
-            // measured (BEAM) selection can know whether the rigid lane
-            // layout beats a tiled vector kernel, so the heuristics skip it.
-            AMD_CDNA_16164.build_beam_only(DType::Float32, DType::Float32),
         ]
     }
 
     /// Get all tensor cores for AMD CDNA4 architecture.
     pub fn cdna4_tensor_cores() -> Vec<TensorCore> {
         vec![
+            AMD_CDNA_1616128.build(DType::FP8E5M2, DType::Float32),
+            AMD_CDNA_1616128.build(DType::FP8E4M3, DType::Float32),
             AMD_CDNA_161632.build(DType::FP8E5M2, DType::Float32),
             AMD_CDNA_161632.build(DType::FP8E4M3, DType::Float32),
             AMD_CDNA_161632.build(DType::Float16, DType::Float32),

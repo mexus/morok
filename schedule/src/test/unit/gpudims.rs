@@ -7,7 +7,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use svod_dtype::{AddrSpace, DType};
+use svod_dtype::DType;
 use svod_ir::types::{AxisId, AxisType};
 use svod_ir::{Op, UOp};
 
@@ -19,7 +19,7 @@ fn create_local_range(end_value: i64, axis_id: usize) -> Arc<UOp> {
 
 /// Helper: Create a GLOBAL buffer (Ptr to Global memory).
 fn create_global_buffer(buf_id: usize) -> Arc<UOp> {
-    UOp::param(buf_id, 1024, DType::Float32.ptr(Some(1024), AddrSpace::Global).unwrap(), None)
+    UOp::param(buf_id, 1024, DType::Float32, None)
 }
 
 /// Helper: Create an INDEX into a buffer with given indices.

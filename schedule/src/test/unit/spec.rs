@@ -1,150 +1,336 @@
-//! Tests for the `spec_program` whitelist (port of tinygrad `type_verify`).
+//! Rule-level tests for Tinygrad's `spec_program` at pinned commit 8c8b43de.
 //!
-//! A lowered, pre-render kernel must match the whitelist exactly: valid ops
-//! pass, and the malformed cases tinygrad rejects (`spec.py`) become a
-//! recoverable `SpecError` — a non-integer memory index, a surviving
-//! `PtrCat`/`Cat`, a movement op that should have been lowered to index
-//! arithmetic, an unfolded `Invalid`, or any op outside the program whitelist.
+//! Program-only rules are tested directly, including ordering-sensitive rules.
+//! `spec_tensor` is used where useful to prove that a rejection comes from the
+//! program rule rather than an inherited `spec_shared` rule.
 
 use std::sync::Arc;
 
 use smallvec::smallvec;
 use svod_dtype::{AddrSpace, DType};
 use svod_ir::types::ConstValue;
-use svod_ir::{BinaryOp, Op, TernaryOp, UOp};
+use svod_ir::{BinaryOp, ConstValueHash, Op, ParamArg, ReduceOp, UOp};
 
-use crate::spec::{spec_program, spec_tensor, type_verify};
+use crate::optimizer::apply_pre_optimization;
+use crate::spec::{spec_hcq, spec_program, spec_tensor, type_verify};
 
-/// A GLOBAL-address-space pointer PARAM (a kernel buffer argument).
-fn global_param() -> Arc<UOp> {
-    UOp::param(0, 16, DType::Float32.ptr(Some(16), AddrSpace::Global).unwrap(), None)
+fn global_param(slot: usize) -> Arc<UOp> {
+    UOp::new(
+        Op::Param {
+            shape: UOp::stack(smallvec![]),
+            arg: ParamArg::buffer(slot, DType::Float32, AddrSpace::Global, None),
+        },
+        DType::Float32,
+    )
 }
 
-fn verify_err(root: &Arc<UOp>) -> String {
+fn int_const(dtype: DType, value: i64) -> Arc<UOp> {
+    UOp::const_(dtype, ConstValue::Int(value))
+}
+
+fn verify_program_err(root: &Arc<UOp>) -> String {
     type_verify(root, &spec_program()).expect_err("expected spec_program rejection").to_string()
 }
 
 #[test]
-fn spec_program_accepts_valid_kernel() {
-    // STORE(value -> INDEX(buf, [int])) wrapped in a SINK: every node satisfies a
-    // program rule (PARAM=GLOBAL ptr, integer index, matching-dtype CONST, STORE).
-    let buf = global_param();
-    let idx = UOp::index().buffer(buf).indices(vec![UOp::index_const(0)]).ptr(true).call().unwrap();
-    let value = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-    let store = UOp::new(Op::Store { index: idx, value }, DType::Void);
-    let sink = UOp::sink(vec![store]);
+fn spec_hcq_accepts_exact_getaddr_and_rejects_non_storage_source() {
+    let param = global_param(0);
+    let address = UOp::new(Op::GetAddr { src: param, device: svod_dtype::DeviceSpec::Cpu }, DType::UInt64);
+    assert!(type_verify(&UOp::sink(vec![address]), &spec_hcq()).is_ok());
 
-    assert!(type_verify(&sink, &spec_program()).is_ok(), "a well-formed kernel must pass the whitelist");
+    let invalid =
+        UOp::new(Op::GetAddr { src: UOp::native_const(1u32), device: svod_dtype::DeviceSpec::Cpu }, DType::UInt64);
+    assert!(type_verify(&UOp::sink(vec![invalid]), &spec_hcq()).is_err());
 }
 
 #[test]
-fn spec_program_accepts_integer_alu() {
-    // ALU over integer constants: shared-base arithmetic is valid.
-    let sum = UOp::index_const(2).add(&UOp::index_const(3));
-    let sink = UOp::sink(vec![sum]);
-    assert!(type_verify(&sink, &spec_program()).is_ok());
+fn spec_program_accepts_only_structured_local_and_reg_buffers() {
+    for addrspace in [AddrSpace::Local, AddrSpace::Reg] {
+        let buffer = UOp::new(
+            Op::Buffer { shape: int_const(DType::Int32, 4), arg: ParamArg::buffer(3, DType::Float32, addrspace, None) },
+            DType::Float32,
+        );
+        assert!(type_verify(&UOp::sink(vec![buffer]), &spec_program()).is_ok());
+    }
+
+    let global = UOp::new(
+        Op::Buffer {
+            shape: int_const(DType::Int32, 4),
+            arg: ParamArg::buffer(3, DType::Float32, AddrSpace::Global, Some(svod_dtype::DeviceSpec::Cpu)),
+        },
+        DType::Float32,
+    );
+    assert!(type_verify(&UOp::sink(vec![global]), &spec_program()).is_err());
 }
 
 #[test]
-fn spec_program_accepts_float_alu() {
-    // The Idiv/Mod-must-be-int rule must NOT reject legitimate float ALU:
-    // Fdiv/Max/Pow over floats, a bool-producing comparison, an int-shifted SHL,
-    // and a bool-conditioned WHERE all pass. (Guards against the verifier being
-    // over-broad and rejecting valid float ops.)
-    let f = UOp::const_(DType::Float32, ConstValue::Float(1.5));
-    let g = UOp::const_(DType::Float32, ConstValue::Float(2.0));
-    let cond = UOp::alu(BinaryOp::Lt, f.clone(), g.clone()); // f32,f32 -> bool
+fn spec_tensor_accepts_structured_global_buffer() {
+    let buffer = UOp::new_buffer(svod_dtype::DeviceSpec::Cpu, 4, DType::Float32);
+    assert!(type_verify(&UOp::sink(vec![buffer]), &spec_tensor()).is_ok());
+}
 
-    let sink = UOp::sink(vec![
-        UOp::alu(BinaryOp::Fdiv, f.clone(), g.clone()),
-        UOp::alu(BinaryOp::Max, f.clone(), g.clone()),
-        UOp::alu(BinaryOp::Pow, f.clone(), g.clone()),
-        cond.clone(),
-        UOp::alu(BinaryOp::Shl, UOp::index_const(3), UOp::index_const(1)),
-        UOp::new(Op::Ternary(TernaryOp::Where, cond, f, g), DType::Float32),
+#[test]
+fn preoptimization_rejects_malformed_dtype_before_rewrites() {
+    let malformed = UOp::new(
+        Op::Binary(BinaryOp::Add, UOp::native_const(1i32), UOp::const_(DType::Float32, ConstValue::Float(1.0))),
+        DType::Int32,
+    );
+    let err =
+        apply_pre_optimization(UOp::sink(vec![malformed])).expect_err("mixed ALU dtype must fail at target boundary");
+    assert!(err.to_string().contains("binary operand/result dtype mismatch"), "unexpected error: {err}");
+}
+
+#[test]
+fn preoptimization_rejects_malformed_tensor_shape_and_source() {
+    let bad_shape = UOp::new(
+        Op::Buffer {
+            shape: int_const(DType::Int32, 4),
+            arg: ParamArg::buffer(0, DType::Float32, AddrSpace::Global, Some(svod_dtype::DeviceSpec::Cpu)),
+        },
+        DType::Float32,
+    );
+    assert!(apply_pre_optimization(UOp::sink(vec![bad_shape])).is_err(), "GLOBAL BUFFER shape must be weakint");
+
+    let bad_source = UOp::native_const(1i32).mselect(0);
+    let err = apply_pre_optimization(UOp::sink(vec![bad_source])).expect_err("MSELECT requires a target multi source");
+    assert!(err.to_string().contains("MSELECT requires"), "unexpected error: {err}");
+}
+
+#[test]
+fn preoptimization_rejects_unsupported_movement_and_bad_multi_axis() {
+    let buffer = UOp::new_buffer(svod_dtype::DeviceSpec::Cpu, 4, DType::Float32);
+    let legacy_reduce =
+        UOp::new(Op::ReduceAxis { src: buffer.clone(), reduce_op: ReduceOp::Add, axes: vec![0] }, DType::Float32);
+    let err = apply_pre_optimization(UOp::sink(vec![legacy_reduce])).expect_err("REDUCE_AXIS is not target tensor IR");
+    assert!(err.to_string().contains("no matching rule"), "unexpected error: {err}");
+
+    let bad_axis = UOp::multi(buffer, 1);
+    let err = apply_pre_optimization(UOp::sink(vec![bad_axis])).expect_err("MULTI axis must exist in its source shape");
+    assert!(err.to_string().contains("MULTI must"), "unexpected error: {err}");
+}
+
+#[test]
+fn preoptimization_accepts_valid_custom_kernel_forms() {
+    let buffer = global_param(0);
+    let index = UOp::index().buffer(buffer).indices(vec![int_const(DType::Int32, 0)]).call().unwrap();
+    let loaded = UOp::load().index(index.clone()).call();
+    let custom = UOp::custom(smallvec![loaded], "({0} + 1.0f)".to_string(), DType::Float32);
+    let kernel = UOp::sink(vec![index.store(custom)]);
+
+    assert!(apply_pre_optimization(kernel).is_ok(), "valid hand-authored custom kernel must cross the tensor boundary");
+}
+
+#[test]
+fn spec_shared_accepts_weakint_index_but_not_weakfloat_index() {
+    let buffer = global_param(0);
+    let weakint_index = UOp::new(
+        Op::Index { buffer: buffer.clone(), indices: smallvec![UOp::const_(DType::WeakInt, ConstValue::Int(0))] },
+        DType::Float32,
+    );
+    let weakfloat_index = UOp::new(
+        Op::Index { buffer, indices: smallvec![UOp::const_(DType::WeakFloat, ConstValue::Float(0.0))] },
+        DType::Float32,
+    );
+
+    assert!(type_verify(&UOp::sink(vec![weakint_index]), &spec_tensor()).is_ok());
+    assert!(type_verify(&UOp::sink(vec![weakfloat_index]), &spec_tensor()).is_err());
+}
+
+fn raw_index(index: Arc<UOp>) -> Arc<UOp> {
+    UOp::new(Op::Index { buffer: global_param(0), indices: smallvec![index] }, DType::Float32)
+}
+
+#[test]
+fn spec_shared_accepts_exact_invalid_index_values() {
+    let scalar = UOp::invalid_marker();
+    let vconst = UOp::vconst(vec![ConstValue::Invalid; 4], DType::Bool);
+    let vectorize = UOp::stack(smallvec![
+        UOp::invalid_marker(),
+        UOp::invalid_marker(),
+        UOp::invalid_marker(),
+        UOp::invalid_marker(),
     ]);
-    assert!(type_verify(&sink, &spec_program()).is_ok(), "legitimate float ALU must pass: {:?}", verify_err(&sink));
+
+    for index in [scalar, vconst, vectorize] {
+        assert!(type_verify(&UOp::sink(vec![raw_index(index)]), &spec_tensor()).is_ok());
+    }
 }
 
 #[test]
-fn spec_program_rejects_float_mod_and_idiv() {
-    // Primitive Idiv/Mod are integer-only (tinygrad spec.py rule_alu). Float
-    // modulo must be decomposed upstream (e.g. ONNX float Mod -> x - trunc(x/y)*y);
-    // a float Binary(Mod)/Binary(Idiv) reaching the verifier is the latent bug
-    // this rule guards against. Built via UOp::new — the verifier, not the
-    // constructor, is what must reject them.
-    let f = UOp::const_(DType::Float32, ConstValue::Float(7.0));
-    let g = UOp::const_(DType::Float32, ConstValue::Float(3.0));
+fn spec_shared_rejects_bool_and_mixed_invalid_index_values() {
+    let ordinary_bool = UOp::const_(DType::Bool, ConstValue::Bool(false));
+    let ordinary_bool_vector = UOp::vconst(vec![ConstValue::Bool(false), ConstValue::Bool(true)], DType::Bool);
+    let mixed =
+        UOp::new(Op::VConst { values: vec![ConstValue::Bool(false), ConstValue::Int(0)] }, DType::Bool.vec(2).unwrap());
 
-    let bad_mod = UOp::new(Op::Binary(BinaryOp::Mod, f.clone(), g.clone()), DType::Float32);
+    for index in [ordinary_bool, ordinary_bool_vector] {
+        let err = type_verify(&UOp::sink(vec![raw_index(index)]), &spec_tensor())
+            .expect_err("ordinary Bool index must be rejected")
+            .to_string();
+        assert!(err.contains("non-integer value reached a memory INDEX operand"), "unexpected rejection: {err}");
+    }
     assert!(
-        verify_err(&UOp::sink(vec![bad_mod])).contains("binary operand/result dtype mismatch"),
-        "float Mod must be rejected"
+        type_verify(&UOp::sink(vec![raw_index(mixed)]), &spec_tensor()).is_err(),
+        "mixed Bool/int vector must be rejected"
+    );
+}
+
+#[test]
+fn spec_shared_preserves_integer_index_rules() {
+    let scalar = int_const(DType::Int32, 1);
+    let vector = UOp::vconst(vec![ConstValue::Int(0), ConstValue::Int(1)], DType::Int32);
+
+    for index in [scalar, vector] {
+        assert!(type_verify(&UOp::sink(vec![raw_index(index)]), &spec_tensor()).is_ok());
+    }
+}
+
+fn assert_weak_rejected_only_at_program_level(weak: Arc<UOp>, concrete: Arc<UOp>) {
+    let weak_sink = UOp::sink(vec![weak]);
+    assert!(type_verify(&weak_sink, &spec_tensor()).is_ok(), "weak dtype is legal in spec_shared/spec_tensor");
+    assert!(type_verify(&weak_sink, &spec_program()).is_err(), "weak dtype must be rejected by spec_program");
+    assert!(type_verify(&UOp::sink(vec![concrete]), &spec_program()).is_ok(), "concrete counterpart must pass");
+}
+
+#[test]
+fn spec_program_rejects_weakint_only_at_program_level() {
+    assert_weak_rejected_only_at_program_level(
+        UOp::const_(DType::WeakInt, ConstValue::Int(1)),
+        int_const(DType::Int32, 1),
+    );
+}
+
+#[test]
+fn spec_program_rejects_weakfloat_only_at_program_level() {
+    assert_weak_rejected_only_at_program_level(
+        UOp::const_(DType::WeakFloat, ConstValue::Float(1.0)),
+        UOp::const_(DType::Float32, ConstValue::Float(1.0)),
+    );
+}
+
+#[test]
+fn spec_program_rejects_noncanonical_typed_constants() {
+    let midpoint = 1.0 + 2f64.powi(-24);
+    let scalar = UOp::new(Op::Const(ConstValueHash(ConstValue::Float(midpoint))), DType::Float32);
+    let vector = UOp::new(
+        Op::VConst { values: vec![ConstValue::Float(1.0), ConstValue::Float(midpoint)] },
+        DType::Float32.vec(2).unwrap(),
     );
 
-    let bad_idiv = UOp::new(Op::Binary(BinaryOp::Idiv, f, g), DType::Float32);
+    for constant in [scalar, vector] {
+        let err = verify_program_err(&UOp::sink(vec![constant]));
+        assert!(err.contains("typed constant value is not canonical for its dtype"), "unexpected error: {err}");
+    }
+}
+
+#[test]
+fn spec_program_accepts_canonical_typed_constants_and_nans() {
+    let scalar_nan = UOp::new(Op::Const(ConstValueHash(ConstValue::Float(f64::NAN))), DType::Float32);
+    let vector_nan = UOp::new(
+        Op::VConst { values: vec![ConstValue::Float(f64::NAN), ConstValue::Float(1.0)] },
+        DType::Float32.vec(2).unwrap(),
+    );
+
+    for constant in [UOp::const_(DType::Float32, ConstValue::Float(1.0)), scalar_nan, vector_nan] {
+        assert!(type_verify(&UOp::sink(vec![constant]), &spec_program()).is_ok());
+    }
+
+    let payload_nan =
+        UOp::new(Op::Const(ConstValueHash(ConstValue::Float(f64::from_bits(0x7ff8_0000_0000_0001)))), DType::Float32);
+    assert!(verify_program_err(&UOp::sink(vec![payload_nan])).contains("typed constant value is not canonical"));
+}
+
+#[test]
+fn spec_program_allows_special_shrink_before_movement_rejection() {
+    // Pinned spec.py:207-208 deliberately places this rule before the general
+    // movement-op rejection. The final source must be CONST.
+    let shrink = UOp::new(
+        Op::Shrink { src: global_param(0), offsets: int_const(DType::Int32, 0), sizes: int_const(DType::Int32, 1) },
+        DType::Float32,
+    );
+
     assert!(
-        verify_err(&UOp::sink(vec![bad_idiv])).contains("binary operand/result dtype mismatch"),
-        "float Idiv must be rejected"
+        type_verify(&UOp::sink(vec![shrink]), &spec_program()).is_ok(),
+        "special SHRINK must win before movement rejection"
     );
 }
 
 #[test]
-fn spec_program_rejects_float_index() {
-    // A `<float>` reaching an INDEX operand (faulty horizontal-reduction lowering).
-    // Built directly: `UOp::index` would reject the non-int index at construction.
-    let fidx = UOp::const_(DType::Float32, ConstValue::Float(0.0));
-    let bad = UOp::new(Op::Index { buffer: global_param(), indices: smallvec![fidx], gate: None }, DType::Float32);
-    let sink = UOp::sink(vec![bad]);
-    assert!(verify_err(&sink).contains("INDEX"), "float index must be rejected");
-}
-
-#[test]
-fn spec_program_rejects_surviving_ptrcat() {
-    // PtrCat must be distributed into scalar accesses by the devectorizer.
-    let ptrcat = UOp::ptrcat().sources(vec![global_param()]).call();
-    let sink = UOp::sink(vec![ptrcat]);
-    assert!(verify_err(&sink).contains("PtrCat"), "surviving PtrCat must be rejected");
-}
-
-#[test]
-fn spec_program_rejects_movement_op() {
-    // Movement ops are lowered to index arithmetic before linearize; a survivor
-    // is a lowering bug (tinygrad `spec.py:205`).
-    let reshape = UOp::new(Op::Reshape { src: UOp::index_const(0), new_shape: UOp::index_const(1) }, DType::Index);
+fn spec_program_rejects_other_movement_ops() {
+    let reshape =
+        UOp::new(Op::Reshape { src: int_const(DType::Int32, 0), new_shape: int_const(DType::Int32, 1) }, DType::Int32);
     let sink = UOp::sink(vec![reshape]);
-    assert!(verify_err(&sink).contains("movement"), "movement op must be rejected in a program");
+
+    assert!(type_verify(&sink, &spec_tensor()).is_ok(), "movement is tensor-graph legal");
+    assert!(verify_program_err(&sink).contains("movement"), "movement must be rejected in a program");
 }
 
 #[test]
-fn spec_program_rejects_invalid_op() {
-    let inv = UOp::invalid_marker();
-    let sink = UOp::sink(vec![inv]);
-    assert!(verify_err(&sink).contains("Invalid"), "Invalid must be folded out before a program");
+fn spec_program_rejects_invalid_that_shared_spec_accepts() {
+    let sink = UOp::sink(vec![UOp::invalid_marker()]);
+
+    assert!(type_verify(&sink, &spec_tensor()).is_ok(), "Invalid is legal in spec_shared/spec_tensor");
+    assert!(verify_program_err(&sink).contains("Invalid"), "Invalid must be folded before a program");
 }
 
 #[test]
-fn spec_tensor_accepts_polymorphic_invalid_consumers() {
-    let invalid = UOp::invalid_marker();
-    let value = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-    let add = UOp::new(Op::Binary(BinaryOp::Add, value, invalid), DType::Float32);
-    assert!(type_verify(&add, &spec_tensor()).is_ok());
+fn spec_program_accepts_devectorized_shaped_stack() {
+    let lanes = (0..4).map(|value| UOp::const_(DType::BFloat16, ConstValue::Float(value as f64))).collect();
+    let vector = UOp::stack(lanes);
+
+    assert!(type_verify(&UOp::sink(vec![vector]), &spec_program()).is_ok());
+}
+
+#[test]
+fn spec_program_accepts_shaped_index() {
+    let lanes = (0..4).map(|value| UOp::const_(DType::Float32, ConstValue::Float(value as f64))).collect();
+    let vector = UOp::stack(lanes);
+    assert!(type_verify(&UOp::sink(vec![vector.index_axes(vec![2])]), &spec_program()).is_ok());
+}
+
+fn valid_if(condition: Arc<UOp>) -> Arc<UOp> {
+    let index = UOp::index().buffer(global_param(0)).indices(vec![int_const(DType::Int32, 0)]).call().unwrap();
+    UOp::new(Op::If { condition, body: smallvec![index] }, DType::Void)
+}
+
+#[test]
+fn spec_program_accepts_well_formed_if_and_endif() {
+    let condition = UOp::const_(DType::Bool, ConstValue::Bool(true));
+    assert!(type_verify(&UOp::sink(vec![UOp::endif(valid_if(condition))]), &spec_program()).is_ok());
+}
+
+#[test]
+fn spec_program_rejects_if_with_non_index_dedup_source() {
+    let condition = UOp::const_(DType::Bool, ConstValue::Bool(true));
+    let bad_if = UOp::new(Op::If { condition, body: smallvec![int_const(DType::Int32, 0)] }, DType::Void);
+    assert!(
+        type_verify(&UOp::sink(vec![bad_if]), &spec_program()).is_err(),
+        "IF dedup source must be CAST/INDEX/SHRINK"
+    );
+}
+
+#[test]
+fn spec_program_rejects_endif_without_if() {
+    let bad_endif = UOp::new(Op::EndIf { if_op: int_const(DType::Int32, 0) }, DType::Void);
+    assert!(type_verify(&UOp::sink(vec![bad_endif]), &spec_program()).is_err(), "ENDIF must close an IF");
+}
+
+#[test]
+fn spec_program_requires_special_to_be_lowered_int32() {
+    let valid = UOp::new(Op::Special { end: int_const(DType::Int32, 8), name: "lidx0".to_string() }, DType::Int32);
+    assert!(type_verify(&UOp::sink(vec![valid]), &spec_program()).is_ok());
+
+    let wrong_width =
+        UOp::new(Op::Special { end: int_const(DType::Int64, 8), name: "lidx0".to_string() }, DType::Int64);
+    assert!(
+        type_verify(&UOp::sink(vec![wrong_width]), &spec_program()).is_err(),
+        "SPECIAL source and result must be int32 after index lowering"
+    );
 }
 
 #[test]
 fn spec_program_rejects_op_outside_whitelist() {
-    // MULTI is a tensor-graph op with no program rule — the whitelist fails on it
-    // (tinygrad: a uop matching no pattern raises, `spec.py:38`).
-    let multi = UOp::new(Op::Multi { src: UOp::index_const(0), axis: 0 }, DType::Index);
+    let multi = UOp::new(Op::Multi { src: int_const(DType::Int32, 0), axis: 0 }, DType::Int32);
     let sink = UOp::sink(vec![multi]);
-    assert!(verify_err(&sink).contains("no matching rule"), "an op outside the whitelist must be rejected");
-}
-
-#[test]
-fn spec_tensor_assertion_mode_passes_unmatched() {
-    // spec_tensor runs in assertion mode: an op with no applicable rule passes
-    // (only explicit `Err` rules fire). Contrast with the spec_program whitelist.
-    let multi = UOp::new(Op::Multi { src: UOp::index_const(0), axis: 0 }, DType::Index);
-    let sink = UOp::sink(vec![multi]);
-    assert!(type_verify(&sink, &spec_tensor()).is_ok(), "assertion mode passes unmatched ops");
+    assert!(verify_program_err(&sink).contains("no matching rule"));
 }

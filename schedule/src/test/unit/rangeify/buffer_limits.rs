@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use svod_device::DeviceSpec;
 use svod_dtype::DType;
-use svod_ir::{AddrSpace, AxisType, BufferizeOpts, Op, SInt, UOp, UOpKey};
+use svod_ir::{AddrSpace, AxisId, AxisType, BufferizeOpts, Op, SInt, UOp, UOpKey};
 use test_case::test_case;
 
 use crate::rangeify::indexing::IndexingContext;
@@ -25,9 +25,9 @@ use crate::rewrite::graph_rewrite;
 
 /// Create a test BUFFER with given size and dtype.
 fn create_test_buffer(size: usize, dtype: DType, id: usize, device: DeviceSpec) -> Arc<UOp> {
-    let unique = UOp::buffer_id(Some(id));
-    let device_op = UOp::device(device);
-    UOp::new(Op::Buffer { unique, device: device_op, size }, dtype)
+    let shape = svod_ir::shape::shape_to_uop(&smallvec::smallvec![SInt::Const(size)]);
+    let arg = svod_ir::ParamArg::buffer(id, dtype.clone(), AddrSpace::Global, Some(device));
+    UOp::new(Op::Buffer { shape, arg }, dtype)
 }
 
 /// Create a computation graph that accesses multiple buffers.
@@ -60,7 +60,7 @@ fn create_multi_buffer_computation(num_buffers: usize, device: DeviceSpec) -> (V
     (buffers, computation)
 }
 
-/// Count the number of BUFFERIZE operations in a UOp tree.
+/// Count the number of STAGE operations in a UOp tree.
 #[allow(clippy::mutable_key_type)]
 fn count_bufferizes(uop: &Arc<UOp>) -> usize {
     let mut count = 0;
@@ -73,7 +73,7 @@ fn count_bufferizes(uop: &Arc<UOp>) -> usize {
             continue;
         }
 
-        if matches!(current.op(), Op::Bufferize { .. }) {
+        if matches!(current.op(), Op::Stage { .. }) {
             count += 1;
         }
 
@@ -85,7 +85,7 @@ fn count_bufferizes(uop: &Arc<UOp>) -> usize {
     count
 }
 
-/// Count the number of unique BUFFER/BUFFERIZE operations accessed by a computation.
+/// Count the number of unique BUFFER/STAGE operations accessed by a computation.
 ///
 /// This replicates the buffer counting logic used by buffer_limit_patterns.
 #[allow(clippy::mutable_key_type, dead_code)]
@@ -100,7 +100,7 @@ fn count_accessed_buffers(uop: &Arc<UOp>) -> usize {
         }
 
         match uop.op() {
-            Op::Bufferize { opts, .. } if opts.addrspace == AddrSpace::Global => {
+            Op::Stage { opts, .. } if opts.addrspace == AddrSpace::Global => {
                 buffers.push(Arc::clone(uop));
                 return; // Stop traversal
             }
@@ -124,6 +124,78 @@ fn count_accessed_buffers(uop: &Arc<UOp>) -> usize {
     buffers.len()
 }
 
+#[test]
+fn test_buffer_limit_keeps_ids_consumed_by_collapsed_ranges() {
+    let device = DeviceSpec::Cpu;
+    let mut ctx = IndexingContext::new();
+    let visible = ctx.new_range(&SInt::Const(10), AxisType::Weak);
+    // This range models an axis created during indexing and removed by dead-axis cleanup.
+    let _collapsed = ctx.new_range_from_uop(&UOp::index_const(1), AxisType::Weak);
+
+    let indexed = |slot| {
+        UOp::index()
+            .buffer(create_test_buffer(10, DType::Float32, slot, device.clone()))
+            .indices(vec![visible.clone()])
+            .call()
+            .unwrap()
+    };
+    let lhs = indexed(0).try_add(&indexed(1)).unwrap();
+    let root = lhs.try_add(&indexed(2)).unwrap();
+
+    let result = graph_rewrite(&buffer_limit_patterns(3), root, &mut ctx);
+    let stage_ids: Vec<_> = result
+        .toposort()
+        .into_iter()
+        .filter_map(|u| match u.op() {
+            Op::Stage { ranges, .. } => ranges.iter().find_map(|r| match r.op() {
+                Op::Range { axis_id, .. } => Some(axis_id.clone()),
+                _ => None,
+            }),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(stage_ids, vec![AxisId::Unrenumbered(2)]);
+    assert_eq!(ctx.range_counter(), 3);
+}
+
+#[test]
+fn test_buffer_limit_mixed_device_and_weak_ranges_use_exact_next_id() {
+    let device = DeviceSpec::Cpu;
+    let mut ctx = IndexingContext::new();
+    let weak = ctx.new_range(&SInt::Const(10), AxisType::Weak);
+    let _collapsed = ctx.new_range_from_uop(&UOp::index_const(1), AxisType::Weak);
+    let launched = UOp::range_axis(UOp::index_const(10), AxisId::Renumbered(7), AxisType::Device);
+
+    let indexed = |slot, range: Arc<UOp>| {
+        UOp::index()
+            .buffer(create_test_buffer(10, DType::Float32, slot, device.clone()))
+            .indices(vec![range])
+            .call()
+            .unwrap()
+    };
+    let mixed = indexed(0, weak.clone()).try_add(&indexed(1, launched.clone())).unwrap();
+    let root = mixed.try_add(&indexed(2, weak)).unwrap();
+
+    let result = graph_rewrite(&buffer_limit_patterns(3), root, &mut ctx);
+    let stage_ranges = result
+        .toposort()
+        .into_iter()
+        .find_map(|u| match u.op() {
+            Op::Stage { ranges, .. } => Some(ranges.clone()),
+            _ => None,
+        })
+        .expect("buffer limit should materialize the mixed source");
+
+    assert!(stage_ranges.iter().any(|r| Arc::ptr_eq(r, &launched)));
+    assert!(
+        stage_ranges.iter().any(|r| {
+            matches!(r.op(), Op::Range { axis_id: AxisId::Unrenumbered(2), axis_type: AxisType::Weak, .. })
+        })
+    );
+    assert_eq!(ctx.range_counter(), 3);
+}
+
 // ============================================================================
 // Phase 1: Device Limit Tests
 // ============================================================================
@@ -139,7 +211,7 @@ fn test_metal_limit_at_threshold() {
     let (_, computation) = create_multi_buffer_computation(30, device.clone());
 
     let matcher = buffer_limit_patterns(31);
-    let result = graph_rewrite(&matcher, computation.clone(), &mut ());
+    let result = graph_rewrite(&matcher, computation.clone(), &mut IndexingContext::new());
 
     // Should NOT materialize (30 <= 30, within limit)
     assert!(
@@ -158,7 +230,7 @@ fn test_metal_limit_exceeded() {
 
     let before_count = count_bufferizes(&computation);
     let matcher = buffer_limit_patterns(31);
-    let result = graph_rewrite(&matcher, computation.clone(), &mut ());
+    let result = graph_rewrite(&matcher, computation.clone(), &mut IndexingContext::new());
     let after_count = count_bufferizes(&result);
 
     // Should have materialized some operations
@@ -177,7 +249,7 @@ fn test_webgpu_limit_at_threshold() {
     let (_, computation) = create_multi_buffer_computation(7, device);
 
     let matcher = buffer_limit_patterns(8);
-    let result = graph_rewrite(&matcher, computation.clone(), &mut ());
+    let result = graph_rewrite(&matcher, computation.clone(), &mut IndexingContext::new());
 
     // Should NOT materialize (7 <= 7, within limit)
     assert!(
@@ -196,7 +268,7 @@ fn test_webgpu_limit_exceeded() {
 
     let before_count = count_bufferizes(&computation);
     let matcher = buffer_limit_patterns(8);
-    let result = graph_rewrite(&matcher, computation.clone(), &mut ());
+    let result = graph_rewrite(&matcher, computation.clone(), &mut IndexingContext::new());
     let after_count = count_bufferizes(&result);
 
     // Should have materialized some operations
@@ -281,9 +353,9 @@ fn test_materialize_only_elementwise() {
 
     // The computation is a chain of ADD operations (elementwise)
     let matcher = buffer_limit_patterns(31);
-    let result = graph_rewrite(&matcher, computation, &mut ());
+    let result = graph_rewrite(&matcher, computation, &mut IndexingContext::new());
 
-    // Should have created BUFFERIZE operations for elementwise ops
+    // Should have created STAGE operations for elementwise ops
     let bufferize_count = count_bufferizes(&result);
     assert!(bufferize_count > 0, "Should have materialized elementwise operations");
 }
@@ -301,7 +373,7 @@ fn test_output_buffer_accounting(num_buffers: usize, should_materialize: bool) {
 
     let before_count = count_bufferizes(&computation);
     let matcher = buffer_limit_patterns(31); // Metal limit
-    let result = graph_rewrite(&matcher, computation.clone(), &mut ());
+    let result = graph_rewrite(&matcher, computation.clone(), &mut IndexingContext::new());
     let after_count = count_bufferizes(&result);
 
     if should_materialize {
@@ -323,10 +395,9 @@ fn test_extract_device_no_device() {
 }
 
 #[test]
-fn test_extract_device_from_device_op() {
-    // Graph with Op::Device
-    let device_op = UOp::device(DeviceSpec::Cpu);
-    assert_eq!(extract_device_from_graph(&device_op), Some(DeviceSpec::Cpu), "Should extract CPU device");
+fn test_extract_device_from_copy_metadata() {
+    let copy = UOp::native_const(1.0f32).copy_to_device(DeviceSpec::Cpu);
+    assert_eq!(extract_device_from_graph(&copy), Some(DeviceSpec::Cpu), "Should extract COPY target device");
 }
 
 #[test]
@@ -343,7 +414,7 @@ fn test_no_double_materialization() {
     let device = DeviceSpec::Cpu;
     let (buffers, _) = create_multi_buffer_computation(35, device.clone());
 
-    // Create a graph with an already-materialized BUFFERIZE
+    // Create a graph with an already-materialized STAGE
     let mut ctx = IndexingContext::new();
     let range = ctx.new_range(&SInt::Const(10), AxisType::Loop);
     let ranges = vec![range.clone()];
@@ -352,16 +423,16 @@ fn test_no_double_materialization() {
     let indexed1 = UOp::index().buffer(buffers[0].clone()).indices(ranges.clone()).call().unwrap();
 
     // Materialize it
-    let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global, removable: true };
-    let materialized = UOp::bufferize(indexed1, ranges.clone(), opts);
+    let opts = BufferizeOpts { device: None, local_axis: None, addrspace: AddrSpace::Global, removable: true };
+    let materialized = UOp::stage(indexed1, ranges.clone(), opts);
     let indexed_materialized = UOp::index().buffer(materialized).indices(ranges).call().unwrap();
 
-    // Count BUFFERIZE operations before
+    // Count STAGE operations before
     let before_count = count_bufferizes(&indexed_materialized);
 
     // Apply pattern (shouldn't double-materialize)
     let matcher = buffer_limit_patterns(31);
-    let result = graph_rewrite(&matcher, indexed_materialized, &mut ());
+    let result = graph_rewrite(&matcher, indexed_materialized, &mut ctx);
 
     let after_count = count_bufferizes(&result);
     assert_eq!(before_count, after_count, "Should not double-materialize already-materialized operations");
@@ -412,7 +483,7 @@ fn test_multiple_binary_ops() {
     // Apply buffer limit (10 buffer limit)
     let before_count = count_bufferizes(&expr);
     let matcher = buffer_limit_patterns(10);
-    let result = graph_rewrite(&matcher, expr, &mut ());
+    let result = graph_rewrite(&matcher, expr, &mut ctx);
     let after_count = count_bufferizes(&result);
 
     // Should have materialized some intermediate results
@@ -459,7 +530,7 @@ fn test_ternary_op_materialization() {
     // Apply buffer limit (10 buffer limit)
     let before_count = count_bufferizes(&where_op);
     let matcher = buffer_limit_patterns(10);
-    let result = graph_rewrite(&matcher, where_op, &mut ());
+    let result = graph_rewrite(&matcher, where_op, &mut ctx);
     let after_count = count_bufferizes(&result);
 
     // Should have materialized some intermediate results

@@ -47,13 +47,14 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use smallvec::{SmallVec, smallvec};
-use svod_ir::UOp;
 use svod_ir::op::Op;
 use svod_ir::pattern::TypedPatternMatcher;
 use svod_ir::rewrite::{graph_rewrite, graph_rewrite_bottom_up};
+use svod_ir::{DType, UOp};
 
 pub use cfg_context::CFGContext;
 pub use linearize::linearize;
+pub(crate) use linearize::{tinygrad_tuplize_cmp, tinygrad_weakint_expr};
 
 /// Split multi-range ENDs into nested single-range ENDs.
 ///
@@ -65,95 +66,56 @@ pub use linearize::linearize;
 ///
 /// Based on Tinygrad's `pm_split_ends` (linearizer.py:93-100).
 ///
-/// Note: The `ranges` field may contain non-RANGE ops (like CONST or Add expressions)
-/// after optimization passes. We extract actual RANGE ops first, matching Tinygrad's
-/// `.ranges` property behavior.
 pub fn pm_split_ends() -> &'static TypedPatternMatcher {
     crate::cached_patterns! {
-        // Match ALL END ops - split_end handles extraction and filtering
-        End { computation, ranges } => |computation, ranges| {
-            split_end(computation, ranges)
+        end @ End { computation, ranges } => |end, computation, ranges| {
+            split_end(end, computation, ranges)
         },
     }
 }
 
 /// Split a multi-range END into nested single-range ENDs.
 ///
-/// Extracts actual RANGE ops from the ranges field (which may contain arbitrary
-/// expressions after optimization), then creates nested single-range ENDs.
-///
 /// Tag preservation: the input END's tag (set by `reduce_to_acc` —
 /// `TAG_MERGEABLE`) is restored on the outermost nested END so
-/// downstream `merge_sibling_ends` can still find the result. Without
+/// downstream reduction merging can still find the result. Without
 /// this, `UOp::end(...)` constructs a fresh END with no tag and the
 /// merge pass becomes a no-op.
 pub(crate) fn split_end_with_tag(
+    original: &Arc<UOp>,
     computation: &Arc<UOp>,
-    ranges: &SmallVec<[Arc<UOp>; 4]>,
+    sources: &SmallVec<[Arc<UOp>; 4]>,
     tag: Option<smallvec::SmallVec<[usize; 2]>>,
 ) -> Option<Arc<UOp>> {
-    // Extract RANGE ops using the cached `.ranges()` property.
-    // Matches Tinygrad's `UOp.sink(*e.src[1:]).ranges`.
-    let sink = UOp::sink(ranges.iter().cloned().collect());
-    let actual_ranges = sink.ranges().clone();
+    let (backedges, targets): (SmallVec<[Arc<UOp>; 4]>, SmallVec<[Arc<UOp>; 4]>) =
+        sources.iter().cloned().partition(|source| source.dtype() == DType::Void || source.dtype() == DType::Bool);
+    let mut sorted_ranges = UOp::sink(targets.into_vec()).ranges().clone();
 
-    // No actual RANGEs: this END closes no loops (its `ranges` were optimized to
-    // constants/expressions). Tinygrad's `do_split_ends` returns `e.src[0]` here —
-    // the empty `for` loop leaves `ret = e.src[0]` (linearizer.py:89-90) — so the
-    // empty END is eliminated and never reaches the renderer or `spec_program`'s
-    // `END closes only RANGEs` invariant. Mirror that: replace the END with its
-    // computation. (Returning `None`/keeping it left inert `END(_, [CONST])` nodes
-    // in LINEAR, which the renderer ignored but the spec whitelist rejects.)
-    if actual_ranges.is_empty() {
-        return Some(computation.clone());
-    }
-
-    // Single RANGE - create simple single-range END
-    if actual_ranges.len() == 1 {
-        // Only return Some if this is different from the original
-        if ranges.len() == 1 && ranges[0].id == actual_ranges[0].id {
-            return None; // No change needed
-        }
-        let new_end = computation.end(SmallVec::from_elem(actual_ranges[0].clone(), 1));
-        return Some(new_end.rtag(tag));
-    }
-
-    // Step 2: Sort RANGEs by (axis_id, axis_type) descending (innermost first).
     // Matches Tinygrad's `sorted(..., key=lambda x: x.arg, reverse=True)` where
-    // x.arg = (axis_id, axis_type, ...) — tuple comparison gives lex ordering.
-    let mut sorted_ranges = actual_ranges;
+    // x.arg = (axis_id, axis_type, ...) -- tuple comparison gives lex ordering.
     sorted_ranges.sort_by(|a, b| {
         let (a_id, a_ty) = match a.op() {
-            Op::Range { axis_id, axis_type, .. } => (axis_id.value(), axis_type.priority()),
+            Op::Range { axis_id, axis_type, .. } => (axis_id, axis_type.priority()),
             _ => unreachable!("filtered to RANGEs only"),
         };
         let (b_id, b_ty) = match b.op() {
-            Op::Range { axis_id, axis_type, .. } => (axis_id.value(), axis_type.priority()),
+            Op::Range { axis_id, axis_type, .. } => (axis_id, axis_type.priority()),
             _ => unreachable!("filtered to RANGEs only"),
         };
         (b_id, b_ty).cmp(&(a_id, a_ty))
     });
 
-    // Step 3: Wrap computation in nested single-range ENDs.
-    // The first range in sorted_ranges is innermost, so it wraps computation first.
-    // Result: END(END(comp, inner), outer) — linearizer emits inner END first.
-    // The outermost END carries the original tag (TAG_MERGEABLE) so the merge
-    // pass can find it; inner ENDs are untagged (they bind to a single range
-    // and are not merge candidates).
     let mut result = computation.clone();
-    let last_idx = sorted_ranges.len() - 1;
-    for (i, range) in sorted_ranges.into_iter().enumerate() {
+    for range in sorted_ranges {
         result = result.end(SmallVec::from_elem(range, 1));
-        if i == last_idx {
-            result = result.rtag(tag.clone());
-        }
     }
+    result = result.end(backedges).rtag(tag);
 
-    Some(result)
+    (!Arc::ptr_eq(&result, original)).then_some(result)
 }
 
-fn split_end(computation: &Arc<UOp>, ranges: &SmallVec<[Arc<UOp>; 4]>) -> Option<Arc<UOp>> {
-    split_end_with_tag(computation, ranges, None)
+fn split_end(original: &Arc<UOp>, computation: &Arc<UOp>, ranges: &SmallVec<[Arc<UOp>; 4]>) -> Option<Arc<UOp>> {
+    split_end_with_tag(original, computation, ranges, original.tag().clone())
 }
 
 /// Pattern matcher for adding control flow dependencies to RANGE operations.
@@ -196,11 +158,14 @@ fn pm_add_control_flow() -> TypedPatternMatcher<CFGContext> {
 /// sink = graph_rewrite(sink, pm_add_control_flow, ctx=CFGContext(sink), bottom_up=True)
 /// linearize(sink)
 /// ```
-pub fn linearize_with_cfg(sink: Arc<UOp>) -> Vec<Arc<UOp>> {
+pub fn add_control_flow(sink: Arc<UOp>) -> Arc<UOp> {
     let sink = graph_rewrite(pm_split_ends(), sink, &mut ());
     let mut cfg = CFGContext::new(&sink);
-    let sink = graph_rewrite_bottom_up(&pm_add_control_flow(), sink, &mut cfg);
-    linearize(sink)
+    graph_rewrite_bottom_up(&pm_add_control_flow(), sink, &mut cfg)
+}
+
+pub fn linearize_with_cfg(sink: Arc<UOp>) -> Vec<Arc<UOp>> {
+    linearize(add_control_flow(sink))
 }
 
 /// Line rewrite infrastructure for operating on linearized instruction lists.
@@ -257,60 +222,35 @@ fn replace_sources_from_map(uop: &Arc<UOp>, replaced: &HashMap<u64, Arc<UOp>>) -
 ///
 /// Transforms:
 /// ```text
-/// STORE(INDEX(buf, idx, gate), value) → IF(gate) + STORE(INDEX(buf, idx), value) + ENDIF
+/// STORE(index, value, gate) → IF(gate) + STORE(index, value) + ENDIF
 /// ```
 ///
-/// Also handles Cast-wrapped INDEX:
-/// ```text
-/// STORE(Cast(INDEX(buf, idx, gate)), value) → IF(gate) + STORE(Cast(INDEX(buf, idx)), value) + ENDIF
-/// ```
+/// The address may be INDEX/SHRINK or a Cast-wrapped INDEX/SHRINK.
 fn linearize_cleanup_pattern(uop: &Arc<UOp>, _replaced: &HashMap<u64, Arc<UOp>>) -> Option<(Arc<UOp>, Vec<Arc<UOp>>)> {
-    // Panic if IF/ENDIF already present
     if matches!(uop.op(), Op::If { .. } | Op::EndIf { .. }) {
-        panic!("IF/ENDIF not allowed in graph before line_rewrite_cleanups");
+        panic!("if not allowed in graph");
     }
 
-    // Match STORE with gated INDEX (possibly wrapped in Cast)
-    let Op::Store { index, value } = uop.op() else {
+    let Op::Store { index, value, gate: Some(gate) } = uop.op() else {
         return None;
     };
-
-    // Unwrap Cast if present, tracking whether we need to rewrap
-    let (actual_index, cast_dtype) = match index.op() {
-        Op::Cast { src, dtype } => (src, Some(dtype.clone())),
-        _ => (index, None),
-    };
-
-    let Op::Index { buffer, indices, gate: Some(gate) } = actual_index.op() else {
+    if gate.dtype() != svod_dtype::DType::Bool {
         return None;
+    }
+
+    let address_op = match index.op() {
+        Op::Cast { src, .. } => src.op(),
+        op => op,
     };
+    if !matches!(address_op, Op::Index { .. } | Op::Shrink { .. }) {
+        return None;
+    }
 
-    // Create ungated INDEX, preserving the original dtype.
-    // Use UOp::new directly because after pm_lower_index_dtype, indices are
-    // concrete i32/i64 — the builder rejects non-Index indices.
-    let ungated_index =
-        UOp::new(Op::Index { buffer: buffer.clone(), indices: indices.clone(), gate: None }, actual_index.dtype());
-
-    // Rewrap in Cast if the original was Cast-wrapped
-    let final_index =
-        if let Some(ref dtype) = cast_dtype { ungated_index.cast(dtype.clone()) } else { ungated_index.clone() };
-
-    let ungated_store = final_index.store(value.clone());
-
-    // Wrap in IF/ENDIF
-    let if_op = UOp::if_(gate.clone(), smallvec![ungated_index.clone()]);
+    let ungated_store = UOp::new(Op::Store { index: index.clone(), value: value.clone(), gate: None }, uop.dtype());
+    let if_op = UOp::if_(gate.clone(), smallvec![index.clone()]);
     let endif_op = UOp::endif(if_op.clone());
 
-    // Emit all created nodes: IF, ungated INDEX (+ Cast if present), STORE, ENDIF.
-    // line_rewrite only emits nodes explicitly listed in outputs.
-    let mut outputs = vec![if_op, ungated_index];
-    if cast_dtype.is_some() {
-        outputs.push(final_index);
-    }
-    outputs.push(ungated_store.clone());
-    outputs.push(endif_op);
-
-    Some((ungated_store, outputs))
+    Some((ungated_store.clone(), vec![if_op, ungated_store, endif_op]))
 }
 
 /// Line rewrite for injecting IF/ENDIF around gated stores.
@@ -319,7 +259,7 @@ fn linearize_cleanup_pattern(uop: &Arc<UOp>, _replaced: &HashMap<u64, Arc<UOp>>)
 ///
 /// This operates on the linearized instruction list (not the DAG) to convert:
 /// ```text
-/// STORE(INDEX(buf, idx, gate), value) → IF(gate) + STORE(INDEX(buf, idx), value) + ENDIF
+/// STORE(index, value, gate) → IF(gate) + STORE(index, value) + ENDIF
 /// ```
 ///
 /// Only needed for backends that don't support gated stores natively.

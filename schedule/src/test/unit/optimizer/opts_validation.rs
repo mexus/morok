@@ -521,8 +521,16 @@ fn test_double_reduce() {
 #[test]
 fn test_full_upcast_no_longer_pre_rejects_symbolic_end() {
     let const_val = UOp::native_const(1.0f32);
-    let symbolic_end = UOp::var("b", DType::Int32, 1, 4);
-    let range = UOp::range_axis(symbolic_end, AxisId::Renumbered(0), AxisType::Global);
+    let symbolic_end = UOp::variable("b".into(), 1, 4, DType::Int32);
+    let range = UOp::new(
+        svod_ir::Op::Range {
+            end: symbolic_end.clone(),
+            axis_id: AxisId::Renumbered(0),
+            axis_type: AxisType::Global,
+            deps: smallvec::smallvec![],
+        },
+        symbolic_end.dtype(),
+    );
     let pattern = UOp::sink(vec![const_val, range]);
 
     let mut sched = Scheduler::new(pattern, Renderer::cpu());

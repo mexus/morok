@@ -219,16 +219,31 @@ impl Z3Context {
                 let r = rhs.as_int().context(TypeMismatchSnafu { detail: "MUL: expected int" })?;
                 Ok(Dynamic::from_ast(&(l * r)))
             }
-            BinaryOp::Idiv => {
-                let l = lhs.as_int().context(TypeMismatchSnafu { detail: "IDIV: expected int" })?;
-                let r = rhs.as_int().context(TypeMismatchSnafu { detail: "IDIV: expected int" })?;
-                // Use truncated division (C-style)
+            BinaryOp::FloorDiv => {
+                let l = lhs.as_int().context(TypeMismatchSnafu { detail: "FLOORDIV: expected int" })?;
+                let r = rhs.as_int().context(TypeMismatchSnafu { detail: "FLOORDIV: expected int" })?;
+                let q = z3_cdiv(&l, &r);
+                let rem = z3_cmod(&l, &r);
+                let zero = Int::from_i64(0);
+                let adjust = Bool::and(&[rem.eq(&zero).not(), (&l * &r).lt(&zero)]);
+                Ok(Dynamic::from_ast(&adjust.ite(&(q.clone() - 1), &q)))
+            }
+            BinaryOp::FloorMod => {
+                let l = lhs.as_int().context(TypeMismatchSnafu { detail: "FLOORMOD: expected int" })?;
+                let r = rhs.as_int().context(TypeMismatchSnafu { detail: "FLOORMOD: expected int" })?;
+                let rem = z3_cmod(&l, &r);
+                let zero = Int::from_i64(0);
+                let adjust = Bool::and(&[rem.eq(&zero).not(), (&l * &r).lt(&zero)]);
+                Ok(Dynamic::from_ast(&(rem + adjust.ite(&r, &zero))))
+            }
+            BinaryOp::CDiv => {
+                let l = lhs.as_int().context(TypeMismatchSnafu { detail: "CDIV: expected int" })?;
+                let r = rhs.as_int().context(TypeMismatchSnafu { detail: "CDIV: expected int" })?;
                 Ok(Dynamic::from_ast(&z3_cdiv(&l, &r)))
             }
-            BinaryOp::Mod => {
-                let l = lhs.as_int().context(TypeMismatchSnafu { detail: "MOD: expected int" })?;
-                let r = rhs.as_int().context(TypeMismatchSnafu { detail: "MOD: expected int" })?;
-                // Use C-style modulo
+            BinaryOp::CMod => {
+                let l = lhs.as_int().context(TypeMismatchSnafu { detail: "CMOD: expected int" })?;
+                let r = rhs.as_int().context(TypeMismatchSnafu { detail: "CMOD: expected int" })?;
                 Ok(Dynamic::from_ast(&z3_cmod(&l, &r)))
             }
             BinaryOp::Max => {

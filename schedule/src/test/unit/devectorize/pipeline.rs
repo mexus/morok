@@ -22,7 +22,7 @@ use super::helpers::*;
 fn test_devectorize_contiguous_load() {
     let buffer = create_buffer(64);
     let index = create_vector_index_iota(buffer.clone(), 4);
-    let load = UOp::load().buffer(buffer.clone()).index(index).call();
+    let load = UOp::load().index(index).call();
 
     let result = apply_devectorize(&load);
 
@@ -55,7 +55,7 @@ fn test_devectorize_strided_load() {
     let buffer = create_buffer(128);
     // Strided access: [0, 2, 4, 6]
     let index = create_vector_index_scaled(buffer.clone(), 4, 2);
-    let load = UOp::load().buffer(buffer.clone()).index(index).call();
+    let load = UOp::load().index(index).call();
 
     let result = apply_devectorize(&load);
 
@@ -73,23 +73,18 @@ fn test_devectorize_strided_load() {
 /// Simulates typical tiled matmul memory access with output upcast.
 #[test]
 fn test_devectorize_matmul_pattern() {
-    use crate::devectorize::{devectorize, pm_render};
-    use crate::rewrite::graph_rewrite;
+    use crate::devectorize::devectorize;
 
     let buffer = create_buffer(256);
 
     // Create 8 contiguous accesses (simulating 8-wide output upcast)
     let index = create_vector_index_iota(buffer.clone(), 8);
-    let load = UOp::load().buffer(buffer.clone()).index(index).call();
+    let load = UOp::load().index(index).call();
 
-    // Step 1: Run devectorize (without pm_render)
-    let after_devectorize = devectorize(&load, &crate::optimizer::Renderer::cpu());
-
-    // Step 2: Run pm_render
-    let result = graph_rewrite(pm_render(), after_devectorize, &mut ());
+    let result = devectorize(&load, &crate::optimizer::Renderer::cpu());
 
     // Should produce vec8 result through devectorization
-    assert_eq!(result.dtype().vcount(), 8, "Total vcount should be 8");
+    assert_vcount(&result, 8);
     let load_count = count_loads(&result);
     assert!(load_count >= 1, "Should have at least one LOAD");
 }
@@ -101,7 +96,7 @@ fn test_devectorize_reduction_accumulator() {
 
     // Load vec4 accumulator
     let acc_index = create_vector_index_iota(buffer.clone(), 4);
-    let acc_load = UOp::load().buffer(buffer.clone()).index(acc_index).call();
+    let acc_load = UOp::load().index(acc_index).call();
 
     // Add to accumulator
     let values = create_vector_float_iota(4);
@@ -128,11 +123,11 @@ fn test_devectorize_multiple_buffers() {
 
     // Load from A
     let index_a = create_vector_index_iota(buffer_a.clone(), 4);
-    let load_a = UOp::load().buffer(buffer_a.clone()).index(index_a).call();
+    let load_a = UOp::load().index(index_a).call();
 
     // Load from B
     let index_b = create_vector_index_iota(buffer_b.clone(), 4);
-    let load_b = UOp::load().buffer(buffer_b.clone()).index(index_b).call();
+    let load_b = UOp::load().index(index_b).call();
 
     // Compute A + B
     let add = UOp::new(Op::Binary(BinaryOp::Add, load_a, load_b), DType::Float32.vec(4).unwrap());
@@ -163,7 +158,7 @@ fn test_devectorize_after_pre_expand() {
 
     // Create a simple kernel pattern that would come from pre_expand
     let index = create_vector_index_iota(buffer.clone(), 4);
-    let load = UOp::load().buffer(buffer.clone()).index(index).call();
+    let load = UOp::load().index(index).call();
     let value = create_vector_float_iota(4);
     let add = UOp::new(Op::Binary(BinaryOp::Add, load, value), DType::Float32.vec(4).unwrap());
 
@@ -179,7 +174,7 @@ fn test_devectorize_after_pre_expand() {
 
 /// Test: Output upcast pattern.
 ///
-/// Simulates output upcast where STORE has vectorized index.
+/// Simulates output upcast where STORE has a shaped index.
 #[test]
 fn test_devectorize_with_output_upcast() {
     let buffer = create_buffer(256);
@@ -205,11 +200,10 @@ fn test_devectorize_with_output_upcast() {
 fn test_devectorize_loop_index() {
     let buffer = create_buffer(256);
 
-    // Create codegen PARAM and broadcast to match the expand_index pattern.
+    // Create codegen PARAM to match the stacked INDEX rule.
     static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(20000);
     let def_id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let define = UOp::param(def_id, 256, buffer.dtype(), None);
-    let buf_vec = define.broadcast(4);
 
     // Create index: range * 4 + [0,1,2,3]
     let range = UOp::new(
@@ -237,16 +231,47 @@ fn test_devectorize_loop_index() {
         })
         .collect();
 
-    let vec_idx = UOp::vectorize(indices);
-    let index =
-        UOp::new(Op::Index { buffer: buf_vec, indices: smallvec::smallvec![vec_idx], gate: None }, DType::Float32);
+    let vec_idx = UOp::stack(indices);
+    let index = UOp::new(Op::Index { buffer: define, indices: smallvec::smallvec![vec_idx] }, DType::Float32);
 
-    let load = UOp::load().buffer(define).index(index).call();
+    let load = UOp::load().index(index).call();
     let result = apply_devectorize(&load);
 
     // Should produce valid vectorized load with vec4
-    assert_eq!(result.dtype().vcount(), 4, "Total vcount should be 4");
+    assert_vcount(&result, 4);
     assert!(count_loads(&result) >= 1, "Should have at least one LOAD");
+}
+
+#[test]
+fn flat_2d_memory_index_and_shaped_value_index_remain_distinct() {
+    let buffer = UOp::param(22000, 64, DType::Float32, None);
+    let row = UOp::range_const(8, 22001);
+    let row_offset = row.mul(&UOp::index_const(8));
+    let offsets = UOp::stack((0..4).map(|lane| row_offset.add(&UOp::index_const(lane))).collect());
+    let memory_index = UOp::index().buffer(buffer.clone()).indices(vec![offsets]).call().unwrap();
+    let result = apply_devectorize(&UOp::load().index(memory_index).call());
+
+    for node in result.toposort().into_iter().filter(|node| matches!(node.op(), Op::Index { .. })) {
+        let Op::Index { buffer: address, indices } = node.op() else { unreachable!() };
+        if address.addrspace().is_some() {
+            assert!(
+                Arc::ptr_eq(address, &buffer),
+                "memory lane must remain INDEX(PARAM, flat_offset):\n{}",
+                node.tree()
+            );
+            assert_eq!(indices.len(), 1);
+            assert!(indices[0].shape().unwrap().unwrap().is_empty());
+        }
+    }
+
+    let shaped = UOp::stack((0..4).map(|value| UOp::native_const(value as i32)).collect())
+        .try_reshape(&smallvec::smallvec![svod_ir::SInt::Const(2), svod_ir::SInt::Const(2)])
+        .unwrap();
+    let shaped_index =
+        UOp::index().buffer(shaped.clone()).indices(vec![row.mod_(&UOp::index_const(2))]).call().unwrap();
+    assert!(shaped_index.addrspace().is_none());
+    assert_eq!(shaped_index.shape().unwrap().unwrap().as_slice(), &[svod_ir::SInt::Const(2)]);
+    assert!(matches!(shaped_index.op(), Op::Index { buffer: source, .. } if Arc::ptr_eq(source, &shaped)));
 }
 
 // =============================================================================
@@ -288,7 +313,7 @@ fn test_devectorize_sink_multiple_stores() {
 fn test_devectorize_float16() {
     let buffer = create_buffer_typed(64, ScalarDType::Float16);
     let index = create_vector_index_iota(buffer.clone(), 4);
-    let load = UOp::load().buffer(buffer.clone()).index(index).call();
+    let load = UOp::load().index(index).call();
 
     let result = apply_devectorize(&load);
 
@@ -301,7 +326,7 @@ fn test_devectorize_float16() {
 fn test_devectorize_int32() {
     let buffer = create_buffer_typed(64, ScalarDType::Int32);
     let index = create_vector_index_iota(buffer.clone(), 4);
-    let load = UOp::load().buffer(buffer.clone()).index(index).call();
+    let load = UOp::load().index(index).call();
 
     let result = apply_devectorize(&load);
 
@@ -313,7 +338,7 @@ fn test_devectorize_int32() {
 fn test_devectorize_bool_pipeline() {
     let buffer = create_bool_buffer(64);
     let index = create_index(buffer.clone(), 0); // Scalar index for bool
-    let load = UOp::load().buffer(buffer.clone()).index(index).call();
+    let load = UOp::load().index(index).call();
 
     let result = apply_devectorize(&load);
 

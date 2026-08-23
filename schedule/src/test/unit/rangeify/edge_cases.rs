@@ -32,19 +32,19 @@ fn test_zero_size_range() {
 fn test_empty_bufferize() {
     let mut ctx = RangeifyBufferContext::new();
 
-    // BUFFERIZE with no ranges (scalar store)
+    // STAGE with no ranges (scalar store)
     let compute = UOp::native_const(42.0f32);
-    let bufferize = UOp::new(
-        Op::Bufferize {
+    let stage = UOp::new(
+        Op::Stage {
             compute: compute.clone(),
             ranges: SmallVec::new(),
-            opts: BufferizeOpts { device: None, addrspace: AddrSpace::Global, removable: true },
+            opts: BufferizeOpts { device: None, local_axis: None, addrspace: AddrSpace::Global, removable: true },
         },
         DType::Float32,
     );
 
     // Should convert successfully
-    let result = bufferize_to_store(&bufferize, &mut ctx, true);
+    let result = bufferize_to_store(&stage, &mut ctx);
     assert!(result.is_some());
 
     // Result should be AFTER(passthrough=BUFFER, deps=[STORE])
@@ -95,20 +95,20 @@ fn test_zero_size_end() {
 
 #[test]
 fn test_zero_size_pipeline() {
-    // Full pipeline with zero-size BUFFERIZE
+    // Full pipeline with zero-size STAGE
     let compute = UOp::native_const(0i32);
-    let bufferize = UOp::new(
-        Op::Bufferize {
+    let stage = UOp::new(
+        Op::Stage {
             compute,
             ranges: SmallVec::new(),
-            opts: BufferizeOpts { device: None, addrspace: AddrSpace::Global, removable: true },
+            opts: BufferizeOpts { device: None, local_axis: None, addrspace: AddrSpace::Global, removable: true },
         },
         DType::Int32,
     );
 
     // Run through pipeline
     let (result, _context) =
-        try_get_kernel_graph(bufferize).expect("kernel split pipeline should succeed for zero-size bufferize");
+        try_get_kernel_graph(stage).expect("kernel split pipeline should succeed for zero-size stage");
 
     // Should create a CALL even with zero ranges
     // Extract CALL from result (may be wrapped in AFTER structure)
@@ -121,44 +121,20 @@ fn test_zero_size_pipeline() {
 fn test_bufferize_with_zero_range_inside() {
     let mut ctx = RangeifyBufferContext::new();
 
-    // Create BUFFERIZE with a zero-sized range
+    // Create STAGE with a zero-sized range
     // Zero-sized buffers are invalid (Tinygrad: "assert size > 0")
     let compute = UOp::native_const(1.0f32);
     let range_zero = UOp::range_const(0, 0);
 
-    let bufferize = UOp::new(
-        Op::Bufferize {
+    let stage = UOp::new(
+        Op::Stage {
             compute: compute.clone(),
             ranges: smallvec::smallvec![range_zero.clone()],
-            opts: BufferizeOpts { device: None, addrspace: AddrSpace::Global, removable: true },
+            opts: BufferizeOpts { device: None, local_axis: None, addrspace: AddrSpace::Global, removable: true },
         },
         DType::Float32,
     );
 
     // Should panic because zero-sized buffers are not allowed
-    let _result = bufferize_to_store(&bufferize, &mut ctx, true);
-}
-
-#[test]
-#[should_panic(expected = "Cannot allocate buffer: range vmax resolved to")]
-fn test_multiple_zero_ranges() {
-    let mut ctx = RangeifyBufferContext::new();
-
-    // Create BUFFERIZE with multiple zero-sized ranges
-    // Zero-sized buffers are invalid (Tinygrad: "assert size > 0")
-    let compute = UOp::native_const(true);
-    let range1 = UOp::range_const(0, 0);
-    let range2 = UOp::range_const(0, 1);
-
-    let bufferize = UOp::new(
-        Op::Bufferize {
-            compute,
-            ranges: smallvec::smallvec![range1.clone(), range2.clone()],
-            opts: BufferizeOpts { device: None, addrspace: AddrSpace::Local, removable: true },
-        },
-        DType::Bool,
-    );
-
-    // Should panic because zero-sized buffers are not allowed
-    let _result = bufferize_to_store(&bufferize, &mut ctx, true);
+    let _result = bufferize_to_store(&stage, &mut ctx);
 }

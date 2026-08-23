@@ -399,7 +399,7 @@ impl HeuristicsConfig {
 /// Top-level optimizer configuration.
 ///
 /// Combines strategy selection, beam search settings, and heuristic parameters.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct OptimizerConfig {
     /// Optimization strategy (None, Heuristic, or Beam).
     pub strategy: OptStrategy,
@@ -407,6 +407,19 @@ pub struct OptimizerConfig {
     pub beam: BeamConfig,
     /// Heuristics configuration (used when strategy is Heuristic).
     pub heuristics: HeuristicsConfig,
+    /// Tinygrad-compatible transcendental mode. Values >= 2 force decomposition.
+    pub transcendental: i32,
+}
+
+impl Default for OptimizerConfig {
+    fn default() -> Self {
+        Self {
+            strategy: OptStrategy::default(),
+            beam: BeamConfig::default(),
+            heuristics: HeuristicsConfig::default(),
+            transcendental: 1,
+        }
+    }
 }
 
 #[bon]
@@ -422,8 +435,10 @@ impl OptimizerConfig {
         #[builder(default)] strategy: OptStrategy,
         #[builder(default = BeamConfig::from_env())] beam: BeamConfig,
         #[builder(default = HeuristicsConfig::from_env())] heuristics: HeuristicsConfig,
+        #[builder(default = std::env::var("TRANSCENDENTAL").ok().and_then(|value| value.parse().ok()).unwrap_or(1))]
+        transcendental: i32,
     ) -> Self {
-        Self { strategy, beam, heuristics }
+        Self { strategy, beam, heuristics, transcendental }
     }
 
     /// Create configuration from environment variables.
@@ -438,8 +453,9 @@ impl OptimizerConfig {
         let strategy = OptStrategy::from_env();
         let beam = BeamConfig::from_env().with_strategy_width(&strategy);
         let heuristics = HeuristicsConfig::from_env();
+        let transcendental = std::env::var("TRANSCENDENTAL").ok().and_then(|value| value.parse().ok()).unwrap_or(1);
 
-        Self { strategy, beam, heuristics }
+        Self { strategy, beam, heuristics, transcendental }
     }
 }
 

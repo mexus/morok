@@ -10,14 +10,14 @@ use crate::test::unit::rangeify::helpers::{count_kernels, count_stores};
 
 #[test]
 fn test_single_store_one_kernel() {
-    // Single BUFFERIZE → Should create 1 CALL wrapper
+    // Single STAGE → Should create 1 CALL wrapper
     let compute = UOp::native_const(1.0f32);
     let range = UOp::range_const(10, 0);
 
-    let bufferize = UOp::bufferize_global(compute, vec![range]);
+    let stage = UOp::stage_global(compute, vec![range]);
 
     let (result, _context) =
-        try_get_kernel_graph(bufferize).expect("kernel split pipeline should succeed for single store");
+        try_get_kernel_graph(stage).expect("kernel split pipeline should succeed for single store");
 
     // Should create exactly 1 callable wrapper
     assert_eq!(count_kernels(&result), 1);
@@ -25,23 +25,23 @@ fn test_single_store_one_kernel() {
 
 #[test]
 fn test_double_store_two_kernels() {
-    // Two independent BUFFERIZEs → Should create 2 CALL wrappers
+    // Two independent STAGEs → Should create 2 CALL wrappers
     let compute1 = UOp::native_const(1.0f32);
     let compute2 = UOp::native_const(2.0f32);
 
     let range1 = UOp::range_const(10, 0);
     let range2 = UOp::range_const(20, 1);
 
-    let bufferize1 = UOp::bufferize_global(compute1, vec![range1]);
+    let bufferize1 = UOp::stage_global(compute1, vec![range1]);
 
-    let bufferize2 = UOp::bufferize_global(compute2, vec![range2]);
+    let bufferize2 = UOp::stage_global(compute2, vec![range2]);
 
     // Create a root that references both (e.g., SINK)
     let root = UOp::sink(vec![bufferize1, bufferize2]);
 
     let (result, _context) = try_get_kernel_graph(root).expect("kernel split pipeline should succeed for double store");
 
-    // Should create 2 callable wrappers (one per BUFFERIZE)
+    // Should create 2 callable wrappers (one per STAGE)
     assert_eq!(count_kernels(&result), 2);
 }
 
@@ -49,25 +49,25 @@ fn test_double_store_two_kernels() {
 fn test_shared_buffer_one_kernel() {
     let mut ctx = RangeifyBufferContext::new();
 
-    // Same BUFFERIZE used twice → should reuse buffer
+    // Same STAGE used twice → should reuse buffer
     let compute = UOp::native_const(42i32);
     let range = UOp::range_const(5, 0);
 
-    let bufferize = UOp::bufferize_global(compute, vec![range]);
+    let stage = UOp::stage_global(compute, vec![range]);
 
     // Convert to STORE twice (simulating reuse)
     use crate::rangeify::transforms::bufferize_to_store;
 
-    let _result1 = bufferize_to_store(&bufferize, &mut ctx, true);
-    let _result2 = bufferize_to_store(&bufferize, &mut ctx, true);
+    let _result1 = bufferize_to_store(&stage, &mut ctx);
+    let _result2 = bufferize_to_store(&stage, &mut ctx);
 
     // For BUFFER ops (global address space), global_counter is NOT incremented
     // But the buffer should still be tracked and reused
-    assert!(ctx.has_buffer(&bufferize));
+    assert!(ctx.has_buffer(&stage));
 
     // Getting the buffer twice should return the same one
-    let buf1 = ctx.get_buffer(&bufferize).unwrap();
-    let buf2 = ctx.get_buffer(&bufferize).unwrap();
+    let buf1 = ctx.get_buffer(&stage).unwrap();
+    let buf2 = ctx.get_buffer(&stage).unwrap();
     assert!(std::sync::Arc::ptr_eq(buf1, buf2));
 }
 
@@ -75,20 +75,20 @@ fn test_shared_buffer_one_kernel() {
 fn test_independent_buffers_separate() {
     let mut ctx = RangeifyBufferContext::new();
 
-    // Different BUFFERIZEs → separate buffers (BUFFER nodes, not DEFINE_GLOBAL)
+    // Different STAGEs → separate buffers (BUFFER nodes, not DEFINE_GLOBAL)
     let compute1 = UOp::native_const(1.0f32);
     let compute2 = UOp::native_const(2.0f32);
 
     let range = UOp::range_const(10, 0);
 
-    let bufferize1 = UOp::bufferize_global(compute1, vec![range.clone()]);
+    let bufferize1 = UOp::stage_global(compute1, vec![range.clone()]);
 
-    let bufferize2 = UOp::bufferize_global(compute2, vec![range]);
+    let bufferize2 = UOp::stage_global(compute2, vec![range]);
 
     use crate::rangeify::transforms::bufferize_to_store;
 
-    bufferize_to_store(&bufferize1, &mut ctx, true);
-    bufferize_to_store(&bufferize2, &mut ctx, true);
+    bufferize_to_store(&bufferize1, &mut ctx);
+    bufferize_to_store(&bufferize2, &mut ctx);
 
     // For BUFFER ops, global_counter is NOT incremented
     // But both should be tracked separately
@@ -138,10 +138,10 @@ fn test_pipeline_kernel_count() {
     let compute = UOp::native_const(false);
     let range = UOp::range_const(100, 0); // Loop range, not OUTER
 
-    let bufferize = UOp::bufferize_global(compute, vec![range]);
+    let stage = UOp::stage_global(compute, vec![range]);
 
     let (result, _context) =
-        try_get_kernel_graph(bufferize).expect("kernel split pipeline should succeed for kernel count");
+        try_get_kernel_graph(stage).expect("kernel split pipeline should succeed for kernel count");
 
     // Verify exactly 1 callable wrapper was created
     assert_eq!(count_kernels(&result), 1);

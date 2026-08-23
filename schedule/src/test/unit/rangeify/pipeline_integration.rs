@@ -12,9 +12,9 @@ use crate::test::unit::rangeify::helpers::{count_bufferizes, count_codegen_param
 
 #[test]
 fn test_pipeline_two_bufferizes() {
-    // Two BUFFERIZEs with different address spaces.
-    // pm_add_buffers (allow_locals=false) converts only GLOBAL BUFFERIZEs to STORE/BUFFER.
-    // LOCAL BUFFERIZEs remain as-is and are converted later in codegen (pm_add_buffers_local).
+    // Two STAGEs with different address spaces.
+    // Kernel splitting converts only GLOBAL STAGEs to STORE/BUFFER.
+    // LOCAL STAGEs remain for pm_add_local_buffers in codegen.
     // This matches Tinygrad's two-stage buffer conversion.
     let compute1 = UOp::native_const(1.0f32);
     let compute2 = UOp::native_const(42i32);
@@ -22,23 +22,23 @@ fn test_pipeline_two_bufferizes() {
     let range1 = UOp::range_const(10, 0);
     let range2 = UOp::range_const(5, 1);
 
-    let bufferize_global = UOp::bufferize_global(compute1, vec![range1]);
+    let stage_global = UOp::stage_global(compute1, vec![range1]);
 
-    let bufferize_local = UOp::bufferize_local(compute2, vec![range2]);
+    let stage_local = UOp::stage_local(compute2, vec![range2]);
 
     // Create root with both
-    let root = UOp::sink(vec![bufferize_global, bufferize_local]);
+    let root = UOp::sink(vec![stage_global, stage_local]);
 
     let (result, _context) =
         try_get_kernel_graph(root).expect("kernel split pipeline should succeed for two bufferizes");
 
-    // Global BUFFERIZE should be converted to BUFFER (and eventually codegen PARAM in kernel AST)
+    // Global STAGE should be converted to BUFFER (and eventually codegen PARAM in kernel AST)
     let global_count = count_codegen_params(&result);
-    assert!(global_count >= 1, "Should have at least 1 codegen PARAM from global BUFFERIZE");
+    assert!(global_count >= 1, "Should have at least 1 codegen PARAM from global STAGE");
 
-    // Local BUFFERIZE should remain as BUFFERIZE (not converted to DEFINE_LOCAL yet)
+    // Local STAGE should remain as STAGE (not converted to DEFINE_LOCAL yet)
     let local_bufferize_count = count_bufferizes(&result);
-    assert!(local_bufferize_count >= 1, "Local BUFFERIZE should remain unconverted (handled later in codegen)");
+    assert!(local_bufferize_count >= 1, "Local STAGE should remain unconverted (handled later in codegen)");
 }
 
 #[test]
@@ -47,10 +47,10 @@ fn test_pipeline_preserves_structure() {
     let compute = UOp::native_const(PI);
     let range = UOp::range_const(20, 0);
 
-    let bufferize = UOp::bufferize_global(compute.clone(), vec![range.clone()]);
+    let stage = UOp::stage_global(compute.clone(), vec![range.clone()]);
 
     let (result, _context) =
-        try_get_kernel_graph(bufferize.clone()).expect("kernel split pipeline should preserve structure");
+        try_get_kernel_graph(stage.clone()).expect("kernel split pipeline should preserve structure");
 
     // Extract CALL from result (may be wrapped in AFTER structure)
     let kernel = extract_kernel(&result).expect("Pipeline should create a CALL");
@@ -77,10 +77,10 @@ fn test_pipeline_context_threading() {
     let compute = UOp::native_const(true);
     let range = UOp::range_const(8, 0);
 
-    let bufferize = UOp::bufferize_global(compute, vec![range]);
+    let stage = UOp::stage_global(compute, vec![range]);
 
     let (result, _context) =
-        try_get_kernel_graph(bufferize).expect("kernel split pipeline should preserve context threading");
+        try_get_kernel_graph(stage).expect("kernel split pipeline should preserve context threading");
 
     // After pipeline:
     // - Stage 1 (bufferize_to_store) creates BUFFER and tracks in context
@@ -101,29 +101,29 @@ fn test_pipeline_context_threading() {
 #[test]
 fn test_pipeline_mixed_addrspace() {
     // Global and Local buffers in the same graph.
-    // pm_add_buffers (allow_locals=false) converts only GLOBAL BUFFERIZEs.
-    // LOCAL BUFFERIZEs are preserved for later codegen conversion.
+    // Kernel splitting converts only GLOBAL STAGEs.
+    // LOCAL STAGEs are preserved for pm_add_local_buffers in codegen.
     let global_compute = UOp::native_const(1.0f32);
     let local_compute = UOp::native_const(2.0f32);
 
     let range = UOp::range_const(16, 0);
 
-    let global_buf = UOp::bufferize_global(global_compute, vec![range.clone()]);
+    let global_buf = UOp::stage_global(global_compute, vec![range.clone()]);
 
-    let local_buf = UOp::bufferize_local(local_compute, vec![range]);
+    let local_buf = UOp::stage_local(local_compute, vec![range]);
 
     // Create a SINK with both
     let root = UOp::sink(vec![global_buf, local_buf]);
 
     let (result, _context) = try_get_kernel_graph(root).expect("kernel split pipeline should handle mixed addrspace");
 
-    // Global BUFFERIZE should be converted
+    // Global STAGE should be converted
     let globals = count_codegen_params(&result);
-    assert!(globals >= 1, "Should have at least 1 codegen PARAM from global BUFFERIZE");
+    assert!(globals >= 1, "Should have at least 1 codegen PARAM from global STAGE");
 
-    // Local BUFFERIZE should remain unconverted
+    // Local STAGE should remain unconverted
     let local_bufferizes = count_bufferizes(&result);
-    assert!(local_bufferizes >= 1, "Local BUFFERIZE should remain for later codegen conversion");
+    assert!(local_bufferizes >= 1, "Local STAGE should remain for later codegen conversion");
 }
 
 #[test]
@@ -136,18 +136,18 @@ fn test_pipeline_reshape_buffer_to_load() {
     let input_buffer = UOp::new_buffer(svod_device::DeviceSpec::Cpu, 12, DType::Float32);
 
     // RESHAPE to 3x4
-    let reshape_shape = UOp::vectorize(vec![UOp::index_const(3), UOp::index_const(4)].into());
+    let reshape_shape = UOp::stack(vec![UOp::index_const(3), UOp::index_const(4)].into());
     let reshaped = UOp::new(Op::Reshape { src: input_buffer, new_shape: reshape_shape }, DType::Float32);
 
     // Create another RESHAPE(BUFFER) with same shape
     let input_buffer2 = UOp::new_buffer(svod_device::DeviceSpec::Cpu, 12, DType::Float32);
-    let reshape_shape2 = UOp::vectorize(vec![UOp::index_const(3), UOp::index_const(4)].into());
+    let reshape_shape2 = UOp::stack(vec![UOp::index_const(3), UOp::index_const(4)].into());
     let reshaped2 = UOp::new(Op::Reshape { src: input_buffer2, new_shape: reshape_shape2 }, DType::Float32);
 
     // Add two reshaped buffers (this is exactly what Tensor::from_slice + add does)
     let compute = reshaped.try_add(&reshaped2).expect("Add should work");
 
-    // Wrap in CONTIGUOUS + SINK (Tinygrad approach: no pre-existing BUFFERIZE)
+    // Wrap in CONTIGUOUS + SINK (Tinygrad approach: no pre-existing STAGE)
     let contiguous = compute.contiguous();
     let sink = UOp::sink(vec![contiguous]);
 
@@ -169,12 +169,12 @@ fn test_full_pipeline_creates_load_for_input_buffers() {
     let input_buffer = UOp::new_buffer(svod_device::DeviceSpec::Cpu, 12, DType::Float32);
 
     // RESHAPE to 3x4
-    let reshape_shape = UOp::vectorize(vec![UOp::index_const(3), UOp::index_const(4)].into());
+    let reshape_shape = UOp::stack(vec![UOp::index_const(3), UOp::index_const(4)].into());
     let reshaped = UOp::new(Op::Reshape { src: input_buffer, new_shape: reshape_shape }, DType::Float32);
 
     // Create another RESHAPE(BUFFER) with same shape
     let input_buffer2 = UOp::new_buffer(svod_device::DeviceSpec::Cpu, 12, DType::Float32);
-    let reshape_shape2 = UOp::vectorize(vec![UOp::index_const(3), UOp::index_const(4)].into());
+    let reshape_shape2 = UOp::stack(vec![UOp::index_const(3), UOp::index_const(4)].into());
     let reshaped2 = UOp::new(Op::Reshape { src: input_buffer2, new_shape: reshape_shape2 }, DType::Float32);
 
     // Add two reshaped buffers
@@ -191,7 +191,7 @@ fn test_full_pipeline_creates_load_for_input_buffers() {
     println!("After rangeify:");
     for node in rangeified.toposort() {
         let op_name = match node.op() {
-            Op::Bufferize { .. } => "BUFFERIZE",
+            Op::Stage { .. } => "STAGE",
             Op::Buffer { .. } => "BUFFER",
             Op::Index { .. } => "INDEX",
             Op::Binary(svod_ir::BinaryOp::Add, _, _) => "ADD",
@@ -217,9 +217,9 @@ fn test_full_pipeline_creates_load_for_input_buffers() {
             Op::Load { .. } => "LOAD",
             Op::Index { buffer, .. } => {
                 let buf_name = match buffer.op() {
+                    Op::Buffer { arg, .. } if arg.addrspace == Some(svod_dtype::AddrSpace::Local) => "LOCAL_BUFFER",
                     Op::Buffer { .. } => "BUFFER",
                     Op::Param { arg, .. } if arg.device.is_none() => "PARAM",
-                    Op::DefineLocal(_) => "DEFINE_LOCAL",
                     _ => "OTHER",
                 };
                 println!("  INDEX(buf={}) [{:?}]", buf_name, node.dtype());
@@ -233,8 +233,8 @@ fn test_full_pipeline_creates_load_for_input_buffers() {
                 println!("  PARAM({})", arg.slot);
                 continue;
             }
-            Op::DefineLocal(id) => {
-                println!("  DEFINE_LOCAL({})", id);
+            Op::Buffer { arg, .. } if arg.addrspace == Some(svod_dtype::AddrSpace::Local) => {
+                println!("  LOCAL_BUFFER({})", arg.slot);
                 continue;
             }
             Op::Buffer { .. } => "BUFFER",
@@ -274,20 +274,20 @@ fn test_full_pipeline_creates_load_for_input_buffers() {
 #[test]
 #[ignore = "Pipeline doesn't handle complex chaining yet"]
 fn test_pipeline_chained_operations() {
-    // Test: A → bufferize → B → bufferize → C
+    // Test: A → stage → B → stage → C
     // Should create 2 buffers and appropriate kernel boundaries
 
     let compute_a = UOp::native_const(1i32);
     let range_a = UOp::range_const(10, 0);
 
-    let buf_a = UOp::bufferize_global(compute_a.clone(), vec![range_a]);
+    let buf_a = UOp::stage_global(compute_a.clone(), vec![range_a]);
 
     // Use buf_a as input to next operation
     // (In real code, this would be a load from buf_a)
     let compute_b = buf_a; // Simplified for testing
     let range_b = UOp::range_const(5, 1);
 
-    let buf_b = UOp::bufferize_global(compute_b, vec![range_b]);
+    let buf_b = UOp::stage_global(compute_b, vec![range_b]);
 
     let (result, _context) =
         try_get_kernel_graph(buf_b).expect("kernel split pipeline should handle chained operations");
