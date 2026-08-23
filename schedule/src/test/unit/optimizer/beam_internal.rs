@@ -61,6 +61,20 @@ fn test_beam_cache_key_includes_post_optimization_behavior() {
 }
 
 #[test]
+fn test_beam_cache_key_distinguishes_exact_amd_targets() {
+    use svod_dtype::AmdArch;
+
+    let ast = UOp::sink(vec![UOp::native_const(1i32)]);
+    let config = BeamConfig::default();
+    let gfx1100 = Scheduler::new(ast.clone(), crate::optimizer::Renderer::for_amd_arch(AmdArch::Gfx1100));
+    let gfx1151 = Scheduler::new(ast, crate::optimizer::Renderer::for_amd_arch(AmdArch::Gfx1151));
+    assert_ne!(
+        CacheKey::from_scheduler(&gfx1100, &config, 0).to_bytes(),
+        CacheKey::from_scheduler(&gfx1151, &config, 0).to_bytes()
+    );
+}
+
+#[test]
 fn test_beam_search_with_mock_scoring() {
     use super::super::renderer::Renderer;
     use svod_ir::UOp;

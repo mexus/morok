@@ -32,6 +32,29 @@ fn test_for_amd_arch_maps_each_family() {
 }
 
 #[test]
+fn test_renderer_fingerprint_tracks_exact_target_and_capabilities() {
+    use svod_dtype::AmdArch;
+
+    let gfx1100 = Renderer::for_amd_arch(AmdArch::Gfx1100);
+    let gfx1151 = Renderer::for_amd_arch(AmdArch::Gfx1151);
+    assert_ne!(gfx1100.cache_fingerprint(), gfx1151.cache_fingerprint());
+
+    let mut constrained = gfx1151.clone();
+    constrained.upcast_max -= 1;
+    assert_ne!(gfx1151.cache_fingerprint(), constrained.cache_fingerprint());
+
+    constrained = gfx1151.clone();
+    constrained.tensor_cores.clear();
+    assert_ne!(gfx1151.cache_fingerprint(), constrained.cache_fingerprint());
+
+    let all_ops = gfx1151.clone().with_rewrite_capabilities(svod_ir::RendererOps::all(), None, None);
+    let mut fewer_ops = svod_ir::RendererOps::all();
+    fewer_ops.binary.remove(&svod_ir::BinaryOp::Threefry);
+    let fewer_ops = gfx1151.with_rewrite_capabilities(fewer_ops, None, None);
+    assert_ne!(all_ops.cache_fingerprint(), fewer_ops.cache_fingerprint());
+}
+
+#[test]
 fn test_amd_fp8_dtype_capabilities_are_arch_specific() {
     use svod_dtype::{AmdArch, ScalarDType};
 

@@ -82,6 +82,9 @@ pub struct Renderer {
     /// Backend device identifier.
     pub device: RendererDevice,
 
+    /// Exact target within the broad renderer family, such as `gfx1151`.
+    target: Option<String>,
+
     /// Whether the backend supports local/shared memory (GPU workgroups).
     pub has_local: bool,
 
@@ -152,6 +155,10 @@ pub struct Renderer {
     /// support is described by `tensor_cores`; ordinary ALU support may be
     /// narrower and is queried separately.
     supported_dtypes: std::collections::HashSet<ScalarDType>,
+
+    /// Stable semantic identities for matcher closures, which cannot be hashed.
+    decomposition_profile: &'static str,
+    extra_profile: &'static str,
 }
 
 impl std::fmt::Debug for Renderer {
@@ -197,6 +204,7 @@ impl Renderer {
         let cores = std::thread::available_parallelism().map(|p| p.get()).unwrap_or(8);
         Self {
             device: RendererDevice::Cpu,
+            target: None,
             has_local: false,
             has_shared: false,
             has_threads: true,
@@ -212,6 +220,8 @@ impl Renderer {
             decomposition_matcher: None,
             renderer_ops: None,
             supported_dtypes: Self::common_dtypes(),
+            decomposition_profile: "none",
+            extra_profile: "none",
         }
     }
 
@@ -226,6 +236,7 @@ impl Renderer {
     pub fn cuda_sm75() -> Self {
         Self {
             device: RendererDevice::CudaSm75,
+            target: None,
             has_local: true,
             has_shared: true,
             has_threads: false,
@@ -241,6 +252,8 @@ impl Renderer {
             decomposition_matcher: None,
             renderer_ops: None,
             supported_dtypes: Self::pre_bf16_dtypes(),
+            decomposition_profile: "none",
+            extra_profile: "none",
         }
     }
 
@@ -248,6 +261,7 @@ impl Renderer {
     pub fn cuda_sm80(allow_tf32: bool) -> Self {
         Self {
             device: RendererDevice::CudaSm80,
+            target: None,
             has_local: true,
             has_shared: true,
             has_threads: false,
@@ -263,6 +277,8 @@ impl Renderer {
             decomposition_matcher: None,
             renderer_ops: None,
             supported_dtypes: Self::common_dtypes(),
+            decomposition_profile: "none",
+            extra_profile: "none",
         }
     }
 
@@ -270,6 +286,7 @@ impl Renderer {
     pub fn cuda_sm89(allow_tf32: bool) -> Self {
         Self {
             device: RendererDevice::CudaSm89,
+            target: None,
             has_local: true,
             has_shared: true,
             has_threads: false,
@@ -285,6 +302,8 @@ impl Renderer {
             decomposition_matcher: None,
             renderer_ops: None,
             supported_dtypes: Self::fp8_dtypes(),
+            decomposition_profile: "none",
+            extra_profile: "none",
         }
     }
 
@@ -292,6 +311,7 @@ impl Renderer {
     pub fn metal() -> Self {
         Self {
             device: RendererDevice::Metal,
+            target: None,
             has_local: true,
             has_shared: true,
             has_threads: false,
@@ -307,6 +327,8 @@ impl Renderer {
             decomposition_matcher: None,
             renderer_ops: None,
             supported_dtypes: Self::common_dtypes(),
+            decomposition_profile: "none",
+            extra_profile: "none",
         }
     }
 
@@ -314,6 +336,7 @@ impl Renderer {
     pub fn apple_amx() -> Self {
         Self {
             device: RendererDevice::AppleAmx,
+            target: None,
             has_local: false, // AMX doesn't use traditional local memory
             has_shared: false,
             has_threads: true, // CPU-style threading
@@ -329,6 +352,8 @@ impl Renderer {
             decomposition_matcher: None,
             renderer_ops: None,
             supported_dtypes: Self::common_dtypes(),
+            decomposition_profile: "none",
+            extra_profile: "none",
         }
     }
 
@@ -341,6 +366,7 @@ impl Renderer {
     pub fn amd_rdna3() -> Self {
         Self {
             device: RendererDevice::AmdRdna3,
+            target: None,
             has_local: true,
             has_shared: true,
             has_threads: false,
@@ -356,6 +382,8 @@ impl Renderer {
             decomposition_matcher: None,
             renderer_ops: None,
             supported_dtypes: Self::common_dtypes(),
+            decomposition_profile: "none",
+            extra_profile: "none",
         }
     }
 
@@ -363,6 +391,7 @@ impl Renderer {
     pub fn amd_rdna4() -> Self {
         Self {
             device: RendererDevice::AmdRdna4,
+            target: None,
             has_local: true,
             has_shared: true,
             has_threads: false,
@@ -378,6 +407,8 @@ impl Renderer {
             decomposition_matcher: None,
             renderer_ops: None,
             supported_dtypes: Self::common_dtypes(),
+            decomposition_profile: "none",
+            extra_profile: "none",
         }
     }
 
@@ -385,6 +416,7 @@ impl Renderer {
     pub fn amd_cdna3() -> Self {
         Self {
             device: RendererDevice::AmdCdna3,
+            target: None,
             has_local: true,
             has_shared: true,
             has_threads: false,
@@ -402,6 +434,8 @@ impl Renderer {
             // gfx942 has native OCP FP8 MFMA operands even though HIP does not
             // expose FP8 as a general-purpose storage/ALU type on this arch.
             supported_dtypes: Self::fp8_dtypes(),
+            decomposition_profile: "none",
+            extra_profile: "none",
         }
     }
 
@@ -409,6 +443,7 @@ impl Renderer {
     pub fn amd_cdna4() -> Self {
         Self {
             device: RendererDevice::AmdCdna4,
+            target: None,
             has_local: true,
             has_shared: true,
             has_threads: false,
@@ -424,6 +459,8 @@ impl Renderer {
             decomposition_matcher: None,
             renderer_ops: None,
             supported_dtypes: Self::fp8_dtypes(),
+            decomposition_profile: "none",
+            extra_profile: "none",
         }
     }
 
@@ -443,18 +480,21 @@ impl Renderer {
     /// Select the AMD optimizer profile matching a gfx arch. CDNA gfx942 maps
     /// to CDNA3 and gfx950 to CDNA4; RDNA3/RDNA4 families map to their profiles.
     pub fn for_amd_arch(arch: AmdArch) -> Self {
-        match arch {
+        let mut renderer = match arch {
             AmdArch::Gfx942 => Self::amd_cdna3(),
             AmdArch::Gfx950 => Self::amd_cdna4(),
             _ if arch.is_rdna4() => Self::amd_rdna4(),
             _ => Self::amd_rdna3(),
-        }
+        };
+        renderer.target = Some(arch.mcpu().to_string());
+        renderer
     }
 
     /// Create an Intel Xe GPU renderer.
     pub fn intel_xe() -> Self {
         Self {
             device: RendererDevice::IntelXe,
+            target: None,
             has_local: true,
             has_shared: true,
             has_threads: false,
@@ -470,6 +510,8 @@ impl Renderer {
             decomposition_matcher: None,
             renderer_ops: None,
             supported_dtypes: Self::common_dtypes(),
+            decomposition_profile: "none",
+            extra_profile: "none",
         }
     }
 
@@ -477,6 +519,7 @@ impl Renderer {
     pub fn webgpu() -> Self {
         Self {
             device: RendererDevice::WebGpu,
+            target: None,
             has_local: true,
             has_shared: true,
             has_threads: false,
@@ -492,6 +535,8 @@ impl Renderer {
             decomposition_matcher: None,
             renderer_ops: None,
             supported_dtypes: Self::webgpu_dtypes(),
+            decomposition_profile: "none",
+            extra_profile: "none",
         }
     }
 
@@ -501,6 +546,30 @@ impl Renderer {
         self.renderer_ops = Some(renderer.supported_ops());
         self.decomposition_matcher = renderer.decompositor();
         self.extra_matcher = renderer.extra_matcher();
+        self.target = renderer.gpu_arch().and_then(|arch| arch.amd()).map(|arch| arch.mcpu().to_string());
+        self.decomposition_profile = if self.decomposition_matcher.is_some() {
+            match self.device {
+                RendererDevice::AmdRdna3
+                | RendererDevice::AmdRdna4
+                | RendererDevice::AmdCdna3
+                | RendererDevice::AmdCdna4 => "amd-decomposition-v1",
+                _ => "backend-decomposition-v1",
+            }
+        } else {
+            "none"
+        };
+        self.extra_profile = if self.extra_matcher.is_some() {
+            match self.device {
+                RendererDevice::Cpu => "llvm-cpu-extra-v1",
+                RendererDevice::AmdRdna3
+                | RendererDevice::AmdRdna4
+                | RendererDevice::AmdCdna3
+                | RendererDevice::AmdCdna4 => "llvm-amd-fp8-extra-v1",
+                _ => "backend-extra-v1",
+            }
+        } else {
+            "none"
+        };
         self
     }
 
@@ -515,7 +584,51 @@ impl Renderer {
         self.renderer_ops = Some(supported_ops);
         self.decomposition_matcher = decomposition_matcher;
         self.extra_matcher = extra_matcher;
+        self.decomposition_profile =
+            if self.decomposition_matcher.is_some() { "explicit-decomposition-v1" } else { "none" };
+        self.extra_profile = if self.extra_matcher.is_some() { "explicit-extra-v1" } else { "none" };
         self
+    }
+
+    /// Deterministic identity for every optimizer-visible renderer behavior.
+    pub fn cache_fingerprint(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        1u32.hash(&mut hasher);
+        self.device.hash(&mut hasher);
+        self.target.hash(&mut hasher);
+        self.has_local.hash(&mut hasher);
+        self.has_shared.hash(&mut hasher);
+        self.has_threads.hash(&mut hasher);
+        self.shared_max.hash(&mut hasher);
+        self.global_max.hash(&mut hasher);
+        self.global_prod_max.hash(&mut hasher);
+        self.local_max.hash(&mut hasher);
+        self.local_max_axes().hash(&mut hasher);
+        self.upcast_max.hash(&mut hasher);
+        self.buffer_max.hash(&mut hasher);
+        self.supports_float4.hash(&mut hasher);
+        self.decomposition_profile.hash(&mut hasher);
+        self.extra_profile.hash(&mut hasher);
+
+        let mut dtypes = self.supported_dtypes.iter().copied().collect::<Vec<_>>();
+        dtypes.sort();
+        dtypes.hash(&mut hasher);
+        self.tensor_cores.hash(&mut hasher);
+
+        if let Some(ops) = &self.renderer_ops {
+            let mut unary = ops.unary.iter().map(AsRef::<str>::as_ref).collect::<Vec<_>>();
+            let mut binary = ops.binary.iter().map(AsRef::<str>::as_ref).collect::<Vec<_>>();
+            let mut ternary = ops.ternary.iter().map(|op| format!("{op:?}")).collect::<Vec<_>>();
+            unary.sort_unstable();
+            binary.sort_unstable();
+            ternary.sort_unstable();
+            unary.hash(&mut hasher);
+            binary.hash(&mut hasher);
+            ternary.hash(&mut hasher);
+        }
+        hasher.finish()
     }
 
     pub(crate) fn supported_ops(&self) -> Option<&RendererOps> {
@@ -576,7 +689,7 @@ impl Renderer {
 /// - Accumulates across 16 K elements
 /// - Uses 32 threads (warp size)
 /// - Each thread handles multiple elements via opts
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct TensorCore {
     /// Matrix dimensions (N, M, K).
     pub dims: (usize, usize, usize),

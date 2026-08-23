@@ -590,6 +590,8 @@ struct CacheKey {
     beam_width: usize,
     /// Renderer/TC backend.
     device: svod_ir::RendererDevice,
+    /// Full target/capability/rewrite identity.
+    renderer_fingerprint: u64,
     /// Upcast/unroll product cap at search time.
     max_upcast: usize,
     /// Local/warp/group_reduce product cap at search time.
@@ -612,10 +614,11 @@ impl CacheKey {
         let ast_hash = hasher.finish();
 
         Self {
-            schema: 2,
+            schema: 3,
             ast_hash,
             beam_width: config.beam_width,
             device: scheduler.ren.device,
+            renderer_fingerprint: scheduler.ren.cache_fingerprint(),
             max_upcast: config.max_upcast,
             max_local: config.max_local,
             max_uops: config.max_uops,
@@ -626,9 +629,10 @@ impl CacheKey {
     /// Convert to bytes for database key.
     fn to_bytes(&self) -> Vec<u8> {
         let device_str = self.device.canonical();
-        let mut bytes = Vec::with_capacity(60 + device_str.len());
+        let mut bytes = Vec::with_capacity(68 + device_str.len());
         bytes.extend_from_slice(&self.schema.to_le_bytes());
         bytes.extend_from_slice(&self.ast_hash.to_le_bytes());
+        bytes.extend_from_slice(&self.renderer_fingerprint.to_le_bytes());
         bytes.extend_from_slice(&self.beam_width.to_le_bytes());
         bytes.extend_from_slice(&self.max_upcast.to_le_bytes());
         bytes.extend_from_slice(&self.max_local.to_le_bytes());
