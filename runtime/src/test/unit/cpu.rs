@@ -4,21 +4,7 @@
 
 use crate::devices::cpu::{CpuBackend, create_cpu_device_with_backend};
 use svod_device::registry::DeviceRegistry;
-use svod_dtype::{AddrSpace, DType};
-use svod_ir::{ConstValue, UOp};
-
-fn build_copy_sink() -> std::sync::Arc<UOp> {
-    let ptr_dtype = DType::Float32.ptr(None, AddrSpace::Global).unwrap();
-    let out = UOp::param(0, 16, ptr_dtype.clone(), None);
-    let inp = UOp::param(1, 16, ptr_dtype, None);
-    let idx = UOp::const_(DType::Index, ConstValue::Int(0));
-
-    let out_index = UOp::index().buffer(out).indices(vec![idx.clone()]).call().expect("output INDEX");
-    let in_index = UOp::index().buffer(inp.clone()).indices(vec![idx]).call().expect("input INDEX");
-    let load = UOp::load().buffer(inp).index(in_index).call();
-    let store = out_index.store(load);
-    UOp::sink(vec![store])
-}
+use svod_ir::UOp;
 
 #[test]
 fn test_cpu_device_creation_llvm() {
@@ -57,8 +43,18 @@ entry:
     assert!(compiled.bytes.is_empty(), "LLVM JIT should have empty bytes");
     assert_eq!(compiled.name, "test_kernel");
 
-    // Test 2: Runtime factory
-    let program = (device.runtime)(&compiled).expect("RuntimeFactory should succeed");
+    // Direct-source compilation remains supported, but executable loading requires
+    // a semantic PROGRAM stage identity.
+    let err = match (device.runtime)(&compiled) {
+        Ok(_) => panic!("identity-less compiler output must not reach the runtime"),
+        Err(err) => err,
+    };
+    assert!(matches!(err, svod_device::Error::ProgramStageMismatch { .. }), "{err:?}");
+
+    let staged = svod_codegen::program_pipeline::program_from_sink(UOp::sink(vec![]), DeviceSpec::Cpu).unwrap();
+    let (staged, _) = svod_codegen::program_pipeline::do_render(&staged, device.renderer.as_ref()).unwrap();
+    let (_, mut compiled) = svod_codegen::program_pipeline::do_compile(&staged, device.compiler.as_ref()).unwrap();
+    let program = (device.runtime)(&compiled).expect("validated RuntimeFactory should succeed");
     // Note: program.name() might not match spec.name (it's a TODO in LlvmProgram)
     assert!(!program.name().is_empty(), "Program should have a name");
 
@@ -68,6 +64,13 @@ entry:
     unsafe {
         program.execute(&pointers, &[], None, None, /*wait=*/ true).expect("Execution should succeed");
     }
+
+    compiled.bytes.push(0);
+    let err = match (device.runtime)(&compiled) {
+        Ok(_) => panic!("tampered compiler output must not reach the runtime"),
+        Err(err) => err,
+    };
+    assert!(matches!(err, svod_device::Error::ProgramStageMismatch { stage: "BINARY", .. }), "{err:?}");
 }
 
 #[test]
@@ -90,20 +93,71 @@ fn test_compile_invalid_ir() {
 }
 
 #[test]
-fn test_renderer_metadata_consistent_between_clang_and_llvm() {
+fn cpu_runtime_rejects_missing_stage_identity_before_loading() {
     let registry = DeviceRegistry::default();
-    let clang = create_cpu_device_with_backend(&registry, CpuBackend::Clang).expect("create clang device");
-    let llvm = create_cpu_device_with_backend(&registry, CpuBackend::Llvm).expect("create llvm device");
+    let device = create_cpu_device_with_backend(&registry, CpuBackend::Llvm).unwrap();
+    let mut compiled = svod_device::device::CompiledSpec::from_source(
+        "bad_abi".into(),
+        "define void @bad_abi(ptr %data) { ret void }".into(),
+        UOp::sink(vec![]),
+        vec![],
+    )
+    .unwrap();
+    compiled.buf_count = 1;
 
-    let sink = build_copy_sink();
-    let linear = UOp::linear(sink.toposort().into());
-    let clang_spec = clang.renderer.render(&linear, Some("meta_copy")).expect("clang render");
-    let llvm_spec = llvm.renderer.render(&linear, Some("meta_copy")).expect("llvm render");
+    let err = match (device.runtime)(&compiled) {
+        Ok(_) => panic!("runtime must reject count-only ABI before JIT creation"),
+        Err(err) => err,
+    };
+    assert!(matches!(err, svod_device::Error::ProgramStageMismatch { .. }), "{err:?}");
+}
 
-    assert_eq!(clang_spec.globals, vec![0, 1]);
-    assert_eq!(clang_spec.outs, vec![0]);
-    assert_eq!(clang_spec.ins, vec![1]);
-    assert_eq!(clang_spec.globals, llvm_spec.globals);
-    assert_eq!(clang_spec.outs, llvm_spec.outs);
-    assert_eq!(clang_spec.ins, llvm_spec.ins);
+#[test]
+fn cpu_dispatch_binds_interleaved_abi_values() {
+    use svod_device::device::{AbiParamDescriptor, AbiParamKind};
+    use svod_dtype::{AddrSpace, DType};
+
+    let abi = vec![
+        AbiParamDescriptor { slot: 0, kind: AbiParamKind::Storage(AddrSpace::Global), dtype: DType::Int32, name: None },
+        AbiParamDescriptor { slot: 1, kind: AbiParamKind::Scalar, dtype: DType::Int32, name: Some("low".into()) },
+        AbiParamDescriptor { slot: 2, kind: AbiParamKind::Storage(AddrSpace::Global), dtype: DType::Int32, name: None },
+        AbiParamDescriptor { slot: 3, kind: AbiParamKind::Scalar, dtype: DType::Int32, name: Some("high".into()) },
+    ];
+    let kernel = crate::jit_loader::JitKernel::compile_with_abi(
+        "void interleaved(int *data0, int data1, int *data2, int data3) { *data0 = data1; *data2 = data3; }",
+        "interleaved",
+        vec!["low".into(), "high".into()],
+        &abi,
+    )
+    .expect("compile interleaved ABI fixture");
+    let (mut low, mut high) = (0i32, 0i32);
+    let buffers = vec![(&mut low as *mut i32).cast::<u8>(), (&mut high as *mut i32).cast::<u8>()];
+    let err = unsafe { kernel.execute_with_vals(&buffers[..1], &[17, -9]) }
+        .expect_err("runtime ABI arity mismatch must be typed");
+    assert!(matches!(err, crate::Error::Device { source: svod_device::Error::ProgramAbiMismatch { .. } }), "{err:?}");
+    unsafe { kernel.execute_with_vals(&buffers, &[17, -9]).expect("execute interleaved ABI fixture") };
+    assert_eq!((low, high), (17, -9));
+}
+
+#[test]
+fn cpu_dispatch_binds_sparse_storage_slots_by_ordinal() {
+    use svod_device::device::{AbiParamDescriptor, AbiParamKind};
+    use svod_dtype::{AddrSpace, DType};
+
+    let abi = vec![
+        AbiParamDescriptor { slot: 0, kind: AbiParamKind::Storage(AddrSpace::Global), dtype: DType::Int32, name: None },
+        AbiParamDescriptor { slot: 5, kind: AbiParamKind::Storage(AddrSpace::Global), dtype: DType::Int32, name: None },
+    ];
+    let kernel = crate::jit_loader::JitKernel::compile_with_abi(
+        "void sparse(int *data0, int *data5) { *data0 = 17; *data5 = -9; }",
+        "sparse",
+        vec![],
+        &abi,
+    )
+    .expect("compile sparse storage ABI fixture");
+    let (mut first, mut second) = (0i32, 0i32);
+    let buffers = [(&mut first as *mut i32).cast::<u8>(), (&mut second as *mut i32).cast::<u8>()];
+
+    unsafe { kernel.execute_with_vals(&buffers, &[]).unwrap() };
+    assert_eq!((first, second), (17, -9));
 }

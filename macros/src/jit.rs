@@ -555,6 +555,13 @@ pub(crate) fn generate(jit: JitWrapper) -> Result<TokenStream> {
                     .map_err(|e| svod_model::jit::JitError::Runtime { source: e })
             }
 
+            pub fn execute_profiled_static(&mut self) -> svod_model::jit::Result<Vec<svod_runtime::KernelProfile>> {
+                let state = self.state.as_mut().ok_or(svod_model::jit::JitError::NotPrepared)?;
+                state.plan.profile(&svod_runtime::ProfileOptions::default())
+                    .map(|mut profile| profile.stages.pop().map_or_else(Vec::new, |stage| stage.kernels))
+                    .map_err(|e| svod_model::jit::JitError::Runtime { source: e })
+            }
+
             pub fn execute_with_vars(&mut self, vars: &[(&str, i64)]) -> svod_model::jit::Result<()> {
                 let state = self.state.as_mut().ok_or(svod_model::jit::JitError::NotPrepared)?;
                 state.plan.execute_with_vars(vars)

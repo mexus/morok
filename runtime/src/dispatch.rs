@@ -21,16 +21,21 @@ use smallvec::SmallVec;
 pub(crate) struct KernelCif {
     cif: Cif,
     arg_count: usize,
+    abi: Vec<svod_device::device::AbiParamKind>,
 }
 
 unsafe impl Send for KernelCif {}
 unsafe impl Sync for KernelCif {}
 
 impl KernelCif {
-    /// Create a CIF for a kernel with `arg_count` u64 arguments returning void.
-    pub fn new(arg_count: usize) -> Self {
-        let types = (0..arg_count).map(|_| Type::u64()).collect::<Vec<_>>();
-        Self { cif: Cif::new(types, Type::void()), arg_count }
+    pub fn from_abi(abi: &[svod_device::device::AbiParamDescriptor]) -> Self {
+        let types =
+            abi.iter().map(|arg| if arg.is_storage() { Type::pointer() } else { Type::i32() }).collect::<Vec<_>>();
+        Self {
+            cif: Cif::new(types, Type::void()),
+            arg_count: abi.len(),
+            abi: abi.iter().map(|arg| arg.kind.clone()).collect(),
+        }
     }
 
     /// Call the kernel, packing buffers + vals as u64 args.
@@ -49,15 +54,19 @@ impl KernelCif {
         buffers: &[*mut u8],
         vals: &[i64],
         var_patch: Option<(usize, usize)>,
-    ) {
-        assert_eq!(
-            buffers.len() + vals.len(),
-            self.arg_count,
-            "kernel dispatch: expected {} args, got {} bufs + {} vals",
-            self.arg_count,
-            buffers.len(),
-            vals.len()
-        );
+    ) -> svod_device::Result<()> {
+        let expected_buffers =
+            self.abi.iter().filter(|kind| matches!(kind, svod_device::device::AbiParamKind::Storage(_))).count();
+        let expected_vals = self.arg_count - expected_buffers;
+        if buffers.len() != expected_buffers || vals.len() != expected_vals {
+            return Err(svod_device::Error::ProgramAbiMismatch {
+                reason: format!(
+                    "kernel dispatch expected {expected_buffers} buffers/{expected_vals} scalars, got {}/{}",
+                    buffers.len(),
+                    vals.len()
+                ),
+            });
+        }
 
         thread_local! {
             static PACKED: RefCell<SmallVec<[u64; 32]>> = RefCell::new(SmallVec::new());
@@ -68,15 +77,32 @@ impl KernelCif {
                 packed.resize(self.arg_count, 0);
             }
 
-            for (idx, &ptr) in buffers.iter().enumerate() {
-                packed[idx] = ptr as u64;
-            }
-            for (idx, &val) in vals.iter().enumerate() {
-                packed[buffers.len() + idx] = val as u64;
+            let (mut buffer_idx, mut var_idx) = (0usize, 0usize);
+            for (arg_idx, kind) in self.abi.iter().enumerate() {
+                match kind {
+                    svod_device::device::AbiParamKind::Storage(_) => {
+                        packed[arg_idx] = buffers[buffer_idx] as u64;
+                        buffer_idx += 1;
+                    }
+                    svod_device::device::AbiParamKind::Scalar => {
+                        packed[arg_idx] = vals[var_idx] as u64;
+                        var_idx += 1;
+                    }
+                }
             }
 
             if let Some((var_idx, value)) = var_patch {
-                packed[buffers.len() + var_idx] = value as u64;
+                let Some(arg_idx) = self
+                    .abi
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, kind)| matches!(kind, svod_device::device::AbiParamKind::Scalar))
+                    .nth(var_idx)
+                    .map(|(idx, _)| idx)
+                else {
+                    return;
+                };
+                packed[arg_idx] = value as u64;
             }
 
             let mut ffi_args: SmallVec<[middle::Arg; 32]> = SmallVec::with_capacity(self.arg_count);
@@ -88,5 +114,15 @@ impl KernelCif {
                 self.cif.call::<()>(CodePtr(fn_ptr as *mut _), &ffi_args);
             }
         });
+        if let Some((var_idx, _)) = var_patch
+            && var_idx >= expected_vals
+        {
+            return Err(svod_device::Error::ProgramAbiMismatch {
+                reason: format!(
+                    "kernel dispatch scalar patch index {var_idx} out of range for {expected_vals} scalars"
+                ),
+            });
+        }
+        Ok(())
     }
 }

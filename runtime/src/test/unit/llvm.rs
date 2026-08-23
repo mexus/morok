@@ -1,5 +1,16 @@
 use super::*;
 
+fn storage_abi(count: usize) -> Vec<svod_device::device::AbiParamDescriptor> {
+    (0..count)
+        .map(|slot| svod_device::device::AbiParamDescriptor {
+            slot,
+            kind: svod_device::device::AbiParamKind::Storage(svod_dtype::AddrSpace::Global),
+            dtype: svod_dtype::DType::Float32,
+            name: None,
+        })
+        .collect()
+}
+
 #[test]
 fn test_llvm_kernel_no_args() {
     let ir = r#"
@@ -8,7 +19,7 @@ fn test_llvm_kernel_no_args() {
         }
     "#;
 
-    let kernel = LlvmKernel::compile_ir(ir, "test_kernel", "test_kernel", vec![], 0).unwrap();
+    let kernel = LlvmKernel::compile_ir_with_abi(ir, "test_kernel", "test_kernel", vec![], &storage_abi(0)).unwrap();
     assert_eq!(kernel.name(), "test_kernel");
 
     unsafe {
@@ -24,7 +35,7 @@ fn test_llvm_kernel_with_args() {
         }
     "#;
 
-    let kernel = LlvmKernel::compile_ir(ir, "add_kernel", "add_kernel", vec![], 2).unwrap();
+    let kernel = LlvmKernel::compile_ir_with_abi(ir, "add_kernel", "add_kernel", vec![], &storage_abi(2)).unwrap();
 
     let mut data1 = vec![0u8; 16];
     let mut data2 = vec![0u8; 16];
@@ -43,6 +54,6 @@ fn test_kernel_drop_order() {
         }
     "#;
 
-    let kernel = LlvmKernel::compile_ir(ir, "test", "test", vec![], 0).unwrap();
+    let kernel = LlvmKernel::compile_ir_with_abi(ir, "test", "test", vec![], &storage_abi(0)).unwrap();
     drop(kernel); // Should not crash
 }

@@ -27,13 +27,17 @@ unsafe impl Send for JitKernel {}
 unsafe impl Sync for JitKernel {}
 
 impl JitKernel {
-    /// Compile C source code via clang (stdin→stdout) and load the resulting
-    /// object file into executable memory.
-    pub fn compile(src: &str, name: &str, var_names: Vec<String>, buf_count: usize) -> crate::Result<Self> {
+    pub fn compile_with_abi(
+        src: &str,
+        name: &str,
+        var_names: Vec<String>,
+        abi: &[svod_device::device::AbiParamDescriptor],
+    ) -> crate::Result<Self> {
+        let buffer_count = abi.iter().filter(|arg| arg.is_storage()).count();
+        svod_device::device::validate_abi_descriptors(abi, buffer_count, &var_names)?;
         let obj = compile_to_object(src)?;
         let (fn_ptr, mmap) = jit_load(&obj, name)?;
-        let cif = KernelCif::new(buf_count + var_names.len());
-        tracing::debug!(kernel.name = %name, "JIT kernel compiled and loaded");
+        let cif = KernelCif::from_abi(abi);
         Ok(Self { _mmap: mmap, fn_ptr, name: name.to_string(), var_names, cif })
     }
 
@@ -44,7 +48,7 @@ impl JitKernel {
     /// Caller must ensure buffer pointers are valid/aligned and `vals` length
     /// matches `var_names`.
     pub unsafe fn execute_with_vals(&self, buffers: &[*mut u8], vals: &[i64]) -> crate::Result<()> {
-        unsafe { self.cif.dispatch(self.fn_ptr, buffers, vals, None) };
+        unsafe { self.cif.dispatch(self.fn_ptr, buffers, vals, None)? };
         Ok(())
     }
 

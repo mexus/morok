@@ -41,6 +41,43 @@ use svod_dtype::DeviceSpec;
 
 use crate::kernel_cache::CachedKernel;
 
+/// Timestamp resources attached to one HCQ batch finalizer. Dispatch paths add
+/// records in queue order; the terminal submission waits that same queue
+/// timeline once, after which collection converts clocks and releases every
+/// backend-owned handle together.
+pub(crate) struct SubmissionProfileFinalizer {
+    profiles: Vec<KernelProfile>,
+    handles: Vec<Option<Arc<dyn svod_device::DispatchTimestamps>>>,
+}
+
+impl SubmissionProfileFinalizer {
+    pub(crate) fn with_capacity(capacity: usize) -> Self {
+        Self { profiles: Vec::with_capacity(capacity), handles: Vec::with_capacity(capacity) }
+    }
+
+    pub(crate) fn push(&mut self, profile: KernelProfile, handle: Option<Arc<dyn svod_device::DispatchTimestamps>>) {
+        self.profiles.push(profile);
+        self.handles.push(handle);
+    }
+
+    pub(crate) fn finish(
+        mut self,
+        synchronize: impl FnOnce() -> crate::error::Result<()>,
+    ) -> crate::error::Result<Vec<KernelProfile>> {
+        if self.handles.iter().any(Option::is_some) {
+            synchronize()?;
+        }
+        for (profile, handle) in self.profiles.iter_mut().zip(&self.handles) {
+            if let Some((start, end)) = handle.as_ref().and_then(|handle| handle.timestamps_ns()) {
+                profile.gpu_start_ns = Some(start);
+                profile.gpu_end_ns = Some(end);
+            }
+            profile.counters = handle.as_ref().and_then(|handle| handle.counters());
+        }
+        Ok(self.profiles)
+    }
+}
+
 /// Per-kernel timing from a profiled execution.
 ///
 /// Holds an `Arc<CachedKernel>` for zero-copy access to kernel metadata
@@ -448,7 +485,7 @@ fn render_stage_table(s: &StageProfile) -> String {
         header.push("GB/s".into());
     }
     if any_res {
-        header.extend(["VGPR".into(), "SGPR".into(), "LDS".into(), "occ%".into()]);
+        header.extend(["VGPR".into(), "SGPR".into(), "LDS".into(), "scratch".into(), "occ%".into()]);
     }
     for c in &counter_cols {
         header.push(c.token().into());
@@ -474,9 +511,15 @@ fn render_stage_table(s: &StageProfile) -> String {
             match r.resources {
                 Some(res) => {
                     let occ = res.occupancy.map(|o| format!("{:.0}", o * 100.0)).unwrap_or_else(|| "-".into());
-                    cells.extend([res.vgprs.to_string(), res.sgprs.to_string(), res.lds_bytes.to_string(), occ]);
+                    cells.extend([
+                        res.vgprs.to_string(),
+                        res.sgprs.to_string(),
+                        res.lds_bytes.to_string(),
+                        res.scratch_bytes.to_string(),
+                        occ,
+                    ]);
                 }
-                None => cells.extend(["-".into(), "-".into(), "-".into(), "-".into()]),
+                None => cells.extend(["-".into(), "-".into(), "-".into(), "-".into(), "-".into()]),
             }
         }
         for c in &counter_cols {

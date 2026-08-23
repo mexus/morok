@@ -75,6 +75,7 @@ pub fn create_amd_device(registry: &DeviceRegistry, device_id: usize, arch: AmdA
     // (`Program::execute` leases per call; plans/graphs hold one for their
     // lifetime). The pool starts empty and warms on first lease.
     let runtime: RuntimeFactory = Arc::new(move |compiled: &CompiledSpec| -> Result<Box<dyn Program>> {
+        svod_device::device::validate_abi_descriptors(&compiled.abi, compiled.buf_count, &compiled.var_names)?;
         // `CompiledSpec.bytes` is the clang-produced amdgcn ELF.
         if compiled.bytes.is_empty() {
             return Err(svod_device::Error::Runtime {
@@ -86,14 +87,7 @@ pub fn create_amd_device(registry: &DeviceRegistry, device_id: usize, arch: AmdA
         // one is cheap — the shared DEVICE_CACHE returns the same
         // Arc<AmdDevice>, so no kernel ioctls re-execute.
         let alloc = AmdAllocator::new(device_id)?;
-        let prg = AmdProgram::load(
-            Arc::clone(&device_handle),
-            &alloc,
-            &compiled.bytes,
-            &compiled.name,
-            compiled.buf_count,
-            compiled.var_names.len(),
-        )?;
+        let prg = AmdProgram::load(Arc::clone(&device_handle), &alloc, &compiled.bytes, &compiled.name, &compiled.abi)?;
         Ok(Box::new(prg) as Box<dyn Program>)
     });
 
@@ -123,7 +117,7 @@ impl Renderer for AmdRendererWrapper {
             .map_err(|e| svod_device::Error::Runtime { message: format!("AMD IR rendering failed: {e}") })?;
         let mut spec = ProgramSpec::new(rendered.name.clone(), rendered.code.clone(), self.device.clone(), ast.clone());
         spec.set_var_names(rendered.var_names.clone());
-        spec.apply_derived_metadata_from_ast();
+        spec.abi = rendered.abi.clone();
         if spec.buf_count == 0 {
             spec.buf_count = rendered.buffer_args.len();
         }
@@ -138,10 +132,26 @@ impl Renderer for AmdRendererWrapper {
         Some(svod_dtype::GpuArch::Amd(self.arch))
     }
 
+    fn supported_ops(&self) -> svod_ir::RendererOps {
+        let mut ops = svod_ir::RendererOps::all();
+        ops.binary.remove(&svod_ir::BinaryOp::Threefry);
+        ops.binary.remove(&svod_ir::BinaryOp::Pow);
+        ops.binary.remove(&svod_ir::BinaryOp::Max);
+        for op in [
+            svod_ir::UnaryOp::Exp,
+            svod_ir::UnaryOp::Log,
+            svod_ir::UnaryOp::Cos,
+            svod_ir::UnaryOp::Tan,
+            svod_ir::UnaryOp::Erf,
+        ] {
+            ops.unary.remove(&op);
+        }
+        ops
+    }
+
     fn decompositor(&self) -> Option<svod_ir::pattern::TypedPatternMatcher<()>> {
-        // AMD's hardware exp2/log2 are lower precision than CPU libm; route the
-        // exp/log/trig family through the SLEEF polynomial pass (sqrt stays
-        // native). See `amd_decomposition_patterns` for the rationale.
+        // Target Exp2/Log2/Sin/Sqrt selection is centralized in the scheduler.
+        // This matcher only handles Morok's additional transcendental ops.
         Some(svod_ir::decompositions::amd_decomposition_patterns())
     }
 }
@@ -154,11 +164,9 @@ impl Compiler for AmdCompiler {
     fn compile(&self, spec: &ProgramSpec) -> Result<CompiledSpec> {
         let bytes = crate::amd::compile_ir_to_amd_object(&spec.src, self.arch)
             .map_err(|e| svod_device::Error::Runtime { message: format!("AMD clang compile failed: {e}") })?;
-        let mut compiled = CompiledSpec::from_bytes(spec.name.clone(), bytes, spec.ast.clone());
-        compiled.var_names = spec.var_names.clone();
+        let mut compiled = CompiledSpec::from_bytes(spec.name.clone(), bytes, spec.ast.clone(), spec.abi.clone())?;
         compiled.global_size = spec.global_size.clone();
         compiled.local_size = spec.local_size.clone();
-        compiled.buf_count = spec.buf_count;
         Ok(compiled)
     }
 

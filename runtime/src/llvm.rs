@@ -25,48 +25,40 @@ unsafe impl Send for LlvmKernel {}
 unsafe impl Sync for LlvmKernel {}
 
 impl LlvmKernel {
-    /// Compile LLVM IR text to executable code via external clang.
-    pub fn compile_ir(
+    pub fn compile_ir_with_abi(
         ir: &str,
         entry_point: impl Into<String>,
         name: impl Into<String>,
         var_names: Vec<String>,
-        buf_count: usize,
+        abi: &[svod_device::device::AbiParamDescriptor],
     ) -> Result<Self> {
         let entry_point = entry_point.into();
         let name = name.into();
-
+        let buffer_count = abi.iter().filter(|arg| arg.is_storage()).count();
+        svod_device::device::validate_abi_descriptors(abi, buffer_count, &var_names)?;
         debug!(kernel.name = %name, ir.length = ir.len(), "Compiling LLVM IR via external clang");
-
         if let Ok(dir) = std::env::var("SVOD_DUMP_LLVM_IR") {
             let path = std::path::Path::new(&dir).join(format!("{name}.ll"));
             let _ = std::fs::create_dir_all(&dir);
             let _ = std::fs::write(&path, ir);
         }
-
         if let Ok(dir) = std::env::var("SVOD_DUMP_POST_O2_IR") {
-            // Run the same `-O2 -funroll-loops -fvectorize -fslp-vectorize`
-            // pipeline as the JIT compile but emit textual LLVM IR instead
-            // of an object file. Writes `<dir>/<name>.post.ll`.
             let _ = std::fs::create_dir_all(&dir);
             if let Some(post_ir) = compile_ir_to_post_o2_text(ir) {
                 let path = std::path::Path::new(&dir).join(format!("{name}.post.ll"));
                 let _ = std::fs::write(&path, post_ir);
             }
         }
-
         let obj = compile_ir_to_object(ir)?;
         let (fn_ptr, mmap) = crate::jit_loader::jit_load(&obj, &entry_point)?;
-        let cif = KernelCif::new(buf_count + var_names.len());
-
+        let cif = KernelCif::from_abi(abi);
         debug!(kernel.name = %name, "LLVM kernel compiled and loaded");
-
         Ok(Self { _mmap: mmap, fn_ptr, entry_point, name, var_names, cif })
     }
 
     /// Compile a RenderedKernel from the codegen crate.
     pub fn compile(kernel: &svod_codegen::RenderedKernel) -> Result<Self> {
-        Self::compile_ir(&kernel.code, &kernel.name, &kernel.name, kernel.var_names.clone(), kernel.buffer_args.len())
+        Self::compile_ir_with_abi(&kernel.code, &kernel.name, &kernel.name, kernel.var_names.clone(), &kernel.abi)
     }
 
     pub fn var_names(&self) -> &[String] {
@@ -95,7 +87,7 @@ impl LlvmKernel {
             "Executing LLVM kernel"
         );
 
-        unsafe { self.cif.dispatch(self.fn_ptr, buffers, vals, None) };
+        unsafe { self.cif.dispatch(self.fn_ptr, buffers, vals, None)? };
 
         Ok(())
     }

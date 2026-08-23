@@ -1,9 +1,27 @@
 use super::*;
 
+fn abi(buffers: usize, vars: &[&str]) -> Vec<svod_device::device::AbiParamDescriptor> {
+    use svod_device::device::{AbiParamDescriptor, AbiParamKind};
+    (0..buffers)
+        .map(|slot| AbiParamDescriptor {
+            slot,
+            kind: AbiParamKind::Storage(svod_dtype::AddrSpace::Global),
+            dtype: svod_dtype::DType::Float32,
+            name: None,
+        })
+        .chain(vars.iter().enumerate().map(|(index, name)| AbiParamDescriptor {
+            slot: buffers + index,
+            kind: AbiParamKind::Scalar,
+            dtype: svod_dtype::DType::Int32,
+            name: Some((*name).into()),
+        }))
+        .collect()
+}
+
 #[test]
 fn test_jit_loader_noop() {
     let src = "void test_kernel(void) { }\n";
-    let kernel = JitKernel::compile(src, "test_kernel", vec![], 0).unwrap();
+    let kernel = JitKernel::compile_with_abi(src, "test_kernel", vec![], &abi(0, &[])).unwrap();
     assert_eq!(kernel.name(), "test_kernel");
     unsafe {
         kernel.execute_with_vals(&[], &[]).unwrap();
@@ -17,7 +35,7 @@ void add_kernel(float* restrict a, float* restrict b, float* restrict out) {
     out[0] = a[0] + b[0];
 }
 "#;
-    let kernel = JitKernel::compile(src, "add_kernel", vec![], 3).unwrap();
+    let kernel = JitKernel::compile_with_abi(src, "add_kernel", vec![], &abi(3, &[])).unwrap();
 
     let mut a = [1.0f32];
     let mut b = [2.0f32];
@@ -39,7 +57,7 @@ void math_kernel(float* restrict in_buf, float* restrict out) {
     out[0] = __builtin_sqrtf(in_buf[0]);
 }
 "#;
-    let kernel = JitKernel::compile(src, "math_kernel", vec![], 2).unwrap();
+    let kernel = JitKernel::compile_with_abi(src, "math_kernel", vec![], &abi(2, &[])).unwrap();
 
     let mut input = [9.0f32];
     let mut out = [0.0f32];
@@ -62,7 +80,7 @@ void var_kernel(float* restrict out, const int N) {
     }
 }
 "#;
-    let kernel = JitKernel::compile(src, "var_kernel", vec!["N".to_string()], 1).unwrap();
+    let kernel = JitKernel::compile_with_abi(src, "var_kernel", vec!["N".to_string()], &abi(1, &["N"])).unwrap();
 
     let mut out = [0.0f32; 8];
     let buffers = vec![out.as_mut_ptr() as *mut u8];

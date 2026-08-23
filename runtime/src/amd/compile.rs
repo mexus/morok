@@ -62,7 +62,6 @@ pub fn compile_ir_to_amd_object(ir: &str, arch: AmdArch) -> crate::Result<Vec<u8
         "--target=amdgcn-amd-amdhsa",
         &mcpu_arg,
         "-mcumode",
-        "-nogpulib",
         "-nogpuinc",
         "-Wno-override-module",
         "-fno-math-errno",

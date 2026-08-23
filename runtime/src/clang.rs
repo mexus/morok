@@ -33,8 +33,16 @@ mod dlopen_impl {
     unsafe impl Sync for ClangKernel {}
 
     impl ClangKernel {
-        pub fn compile(src: &str, name: &str, var_names: Vec<String>, buf_count: usize) -> Result<Self> {
+        pub fn compile_with_abi(
+            src: &str,
+            name: &str,
+            var_names: Vec<String>,
+            abi: &[svod_device::device::AbiParamDescriptor],
+        ) -> Result<Self> {
             use std::io::Write;
+
+            let buffer_count = abi.iter().filter(|arg| arg.is_storage()).count();
+            svod_device::device::validate_abi_descriptors(abi, buffer_count, &var_names)?;
 
             let tmp_dir = tempfile::tempdir().jit("create temp directory")?;
 
@@ -84,14 +92,14 @@ mod dlopen_impl {
                 *func as *const ()
             };
 
-            let cif = KernelCif::new(buf_count + var_names.len());
+            let cif = KernelCif::from_abi(abi);
             tracing::debug!(kernel.name = %name, "Clang kernel compiled and loaded (dlopen)");
 
             Ok(Self { _lib: lib, fn_ptr, name: name.to_string(), var_names, cif, _tmp_dir: tmp_dir })
         }
 
         pub unsafe fn execute_with_vals(&self, buffers: &[*mut u8], vals: &[i64]) -> Result<()> {
-            unsafe { self.cif.dispatch(self.fn_ptr, buffers, vals, None) };
+            unsafe { self.cif.dispatch(self.fn_ptr, buffers, vals, None)? };
             Ok(())
         }
 
