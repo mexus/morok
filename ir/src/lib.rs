@@ -51,7 +51,7 @@ pub use types::{
     AddrSpace, AxisId, AxisType, BINARY_STAGE_IDENTITY_VERSION, BinaryOp, BinaryStageIdentity, BufferizeOpts, CallInfo,
     ConstValue, ConstValueHash, ContiguousHint, CustomFunctionKind, InsArg, KernelInfo, ParamArg, ProgramInfo,
     ReduceOp, RendererDevice, RendererOps, SOURCE_STAGE_IDENTITY_VERSION, SourceStageIdentity, StageAbiParam,
-    StageAbiParamKind, StageDigest, TernaryOp, UnaryOp, WmmaMetadata, WmmaUpcastAxes,
+    StageAbiParamKind, StageDigest, TernaryOp, UnaryOp, WmmaMetadata, WmmaUpcastAxes, to_function_name,
 };
 pub use uop::{
     CanonicalArg, CanonicalAxis, CanonicalConst, CanonicalDType, CanonicalGraph, CanonicalNode, CanonicalProgramValue,

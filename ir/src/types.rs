@@ -665,18 +665,40 @@ impl Hash for ProgramInfo {
     }
 }
 
+/// Convert a diagnostic kernel name to Tinygrad's renderer-safe identifier.
+pub fn to_function_name(name: &str) -> String {
+    let chars = name.chars().collect::<Vec<_>>();
+    let mut output = String::new();
+    let mut index = 0;
+
+    while index < chars.len() {
+        if chars[index] == '\x1b' && chars.get(index + 1) == Some(&'[') {
+            let end = if chars.get(index + 2) == Some(&'K') {
+                Some(index + 2)
+            } else {
+                (index + 2..chars.len()).find(|&candidate| chars[candidate] == 'm')
+            };
+            if let Some(end) = end {
+                index = end + 1;
+                continue;
+            }
+        }
+
+        let character = chars[index];
+        if character.is_ascii_alphanumeric() || character == '_' {
+            output.push(character);
+        } else {
+            output.push_str(&format!("{:02X}", character as u32));
+        }
+        index += 1;
+    }
+
+    output
+}
+
 impl ProgramInfo {
     pub fn function_name(&self) -> String {
-        self.name
-            .chars()
-            .map(|character| {
-                if character.is_ascii_alphanumeric() || character == '_' {
-                    character.to_string()
-                } else {
-                    format!("{:02X}", character as u32)
-                }
-            })
-            .collect()
+        to_function_name(&self.name)
     }
 
     fn ssimplify(uop: &Arc<crate::UOp>) -> Arc<crate::UOp> {

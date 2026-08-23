@@ -44,6 +44,8 @@ struct MockRenderer {
 
 struct CAbiRenderer;
 
+struct LlvmAbiRenderer;
+
 impl Renderer for CAbiRenderer {
     fn supported_ops(&self) -> svod_ir::RendererOps {
         svod_ir::RendererOps::all()
@@ -52,6 +54,27 @@ impl Renderer for CAbiRenderer {
     fn render(&self, ast: &std::sync::Arc<UOp>, name: Option<&str>) -> svod_device::Result<ProgramSpec> {
         let rendered = crate::c::render(ast, name)
             .map_err(|error| svod_device::Error::Runtime { message: format!("C rendering failed: {error}") })?;
+        let mut spec = ProgramSpec::new(rendered.name, rendered.code, DeviceSpec::Cpu, ast.clone());
+        spec.var_names = rendered.var_names;
+        spec.buf_count = rendered.buffer_args.len();
+        spec.abi = rendered.abi;
+        Ok(spec)
+    }
+
+    fn device(&self) -> &DeviceSpec {
+        static DEVICE: DeviceSpec = DeviceSpec::Cpu;
+        &DEVICE
+    }
+}
+
+impl Renderer for LlvmAbiRenderer {
+    fn supported_ops(&self) -> svod_ir::RendererOps {
+        svod_ir::RendererOps::all()
+    }
+
+    fn render(&self, ast: &std::sync::Arc<UOp>, name: Option<&str>) -> svod_device::Result<ProgramSpec> {
+        let rendered = crate::llvm::text::render(ast, name)
+            .map_err(|error| svod_device::Error::Runtime { message: format!("LLVM rendering failed: {error}") })?;
         let mut spec = ProgramSpec::new(rendered.name, rendered.code, DeviceSpec::Cpu, ast.clone());
         spec.var_names = rendered.var_names;
         spec.buf_count = rendered.buffer_args.len();
@@ -1008,6 +1031,32 @@ fn test_structured_custom_name_wins_over_optimizer_shape_name() {
     let program = crate::program_pipeline::program_from_sink(sink, DeviceSpec::Cpu).expect("program");
     let Op::Program { info, .. } = program.op() else { panic!("expected PROGRAM") };
     assert_eq!(info.name, "flash_attention");
+}
+
+#[test]
+fn test_structured_symbolic_name_is_sanitized_at_renderer_boundary() {
+    let sink = UOp::sink_with_info(
+        vec![UOp::noop()],
+        svod_ir::KernelInfo {
+            name: Some("E_\x1b[31mL?\x1b[0mn6".to_string()),
+            opts_to_apply: Some(vec![]),
+            ..Default::default()
+        },
+    );
+
+    for renderer in [&CAbiRenderer as &dyn Renderer, &LlvmAbiRenderer as &dyn Renderer] {
+        let program =
+            crate::program_pipeline::program_from_sink_with_renderer(sink.clone(), renderer).expect("program");
+        let Op::Program { info, .. } = program.op() else { panic!("expected PROGRAM") };
+        assert_eq!(info.name, "E_\x1b[31mL?\x1b[0mn6");
+        assert_eq!(info.function_name(), "E_L3Fn6");
+
+        let (_, spec) = crate::program_pipeline::do_render(&program, renderer).expect("render sanitized PROGRAM");
+        assert_eq!(spec.name, "E_L3Fn6");
+        assert!(spec.src.contains("E_L3Fn6"), "{}", spec.src);
+        assert!(!spec.src.contains('?'), "{}", spec.src);
+        assert!(!spec.src.contains('\x1b'), "{}", spec.src);
+    }
 }
 
 #[test]
