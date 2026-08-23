@@ -8,7 +8,7 @@ use std::f32::consts::PI;
 use svod_ir::{Op, UOp};
 
 use crate::rangeify::try_get_kernel_graph;
-use crate::test::unit::rangeify::helpers::{count_bufferizes, count_codegen_params, count_kernels, extract_kernel};
+use crate::test::unit::rangeify::helpers::{count_codegen_params, count_kernels, extract_kernel};
 
 #[test]
 fn test_pipeline_two_bufferizes() {
@@ -29,16 +29,11 @@ fn test_pipeline_two_bufferizes() {
     // Create root with both
     let root = UOp::sink(vec![stage_global, stage_local]);
 
-    let (result, _context) =
-        try_get_kernel_graph(root).expect("kernel split pipeline should succeed for two bufferizes");
-
-    // Global STAGE should be converted to BUFFER (and eventually codegen PARAM in kernel AST)
-    let global_count = count_codegen_params(&result);
-    assert!(global_count >= 1, "Should have at least 1 codegen PARAM from global STAGE");
-
-    // Local STAGE should remain as STAGE (not converted to DEFINE_LOCAL yet)
-    let local_bufferize_count = count_bufferizes(&result);
-    assert!(local_bufferize_count >= 1, "Local STAGE should remain unconverted (handled later in codegen)");
+    let err = match try_get_kernel_graph(root) {
+        Err(err) => err,
+        Ok(_) => panic!("outer local STAGE must fail the final kernel-graph boundary"),
+    };
+    assert!(err.to_string().contains("kernel graph specification"), "unexpected error: {err}");
 }
 
 #[test]
@@ -115,15 +110,11 @@ fn test_pipeline_mixed_addrspace() {
     // Create a SINK with both
     let root = UOp::sink(vec![global_buf, local_buf]);
 
-    let (result, _context) = try_get_kernel_graph(root).expect("kernel split pipeline should handle mixed addrspace");
-
-    // Global STAGE should be converted
-    let globals = count_codegen_params(&result);
-    assert!(globals >= 1, "Should have at least 1 codegen PARAM from global STAGE");
-
-    // Local STAGE should remain unconverted
-    let local_bufferizes = count_bufferizes(&result);
-    assert!(local_bufferizes >= 1, "Local STAGE should remain for later codegen conversion");
+    let err = match try_get_kernel_graph(root) {
+        Err(err) => err,
+        Ok(_) => panic!("outer local STAGE must fail the final kernel-graph boundary"),
+    };
+    assert!(err.to_string().contains("kernel graph specification"), "unexpected error: {err}");
 }
 
 #[test]

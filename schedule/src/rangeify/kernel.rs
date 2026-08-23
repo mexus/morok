@@ -14,10 +14,20 @@ use std::sync::Arc;
 
 use indexmap::IndexMap;
 use smallvec::SmallVec;
+use snafu::{ResultExt, Snafu};
 use svod_ir::{CallInfo, Op, SInt, UOp, UOpKey};
 use tracing::{debug, trace};
 
 pub use svod_ir::KernelInfo;
+
+#[derive(Debug, Snafu)]
+#[snafu(visibility(pub))]
+pub enum KernelGraphError {
+    #[snafu(display("kernel graph construction failed: {source}"))]
+    Ir { source: svod_ir::Error },
+    #[snafu(display("kernel graph specification failed: {source}"))]
+    Spec { source: crate::spec::SpecError },
+}
 
 // ============================================================================
 // CONFIGURATION
@@ -415,7 +425,7 @@ fn fix_assign(root: &Arc<UOp>) -> svod_ir::Result<Arc<UOp>> {
 ///
 /// # Returns
 /// Returns `(result, RangeifyBufferContext)`.
-pub fn try_get_kernel_graph(root: Arc<UOp>) -> svod_ir::Result<(Arc<UOp>, RangeifyBufferContext)> {
+pub fn try_get_kernel_graph(root: Arc<UOp>) -> Result<(Arc<UOp>, RangeifyBufferContext), KernelGraphError> {
     use super::transforms::pm_add_buffers_patterns;
     use crate::rewrite::graph_rewrite_bottom_up;
 
@@ -467,8 +477,12 @@ pub fn try_get_kernel_graph(root: Arc<UOp>) -> svod_ir::Result<(Arc<UOp>, Rangei
     tracing::debug!(elapsed_ms = t_stage.elapsed().as_millis() as u64, "kernel split: split_all_stores complete");
 
     let t_stage = std::time::Instant::now();
-    let result = fix_assign(&after_split)?;
+    let result = fix_assign(&after_split).context(IrSnafu)?;
     tracing::debug!(elapsed_ms = t_stage.elapsed().as_millis() as u64, "kernel split: fix_assign complete");
+
+    if crate::spec::spec_enabled() {
+        crate::spec::verify_kernel_graph(&result).context(SpecSnafu)?;
+    }
 
     svod_ir::dump_canonical_stage("kernel_ast", &result);
     Ok((result, ctx))

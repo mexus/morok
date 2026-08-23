@@ -20,6 +20,7 @@
 //! `spec_shared`): a lowered, pre-render kernel may contain only the ops below.
 //! Both tensor and program specs are whitelists, matching Tinygrad.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use snafu::Snafu;
@@ -29,8 +30,18 @@ use svod_ir::{BinaryOp, ConstValue, Op, TernaryOp, UOp, UnaryOp};
 #[derive(Debug, Clone, PartialEq, Eq, Snafu)]
 #[snafu(visibility(pub))]
 pub enum SpecError {
-    #[snafu(display("UOp verification failed at {index} on {op} (dtype {dtype}): {reason}"))]
-    Verification { index: usize, op: String, dtype: String, reason: &'static str },
+    #[snafu(display(
+        "{boundary} verification failed at {index} on {op} id={uop_id} (dtype {dtype}, source path {source_path:?}): {reason}"
+    ))]
+    Verification {
+        boundary: &'static str,
+        index: usize,
+        uop_id: u64,
+        op: String,
+        dtype: String,
+        source_path: Vec<usize>,
+        reason: &'static str,
+    },
 }
 
 /// A single spec rule (mirrors one `(UPat, predicate)` entry in tinygrad).
@@ -67,8 +78,53 @@ pub fn spec_enabled() -> bool {
 /// `spec.py:31`). In whitelist mode a uop matching no rule fails, exactly as
 /// tinygrad's `ret is not True → raise`.
 pub fn type_verify(root: &Arc<UOp>, spec: &Spec) -> Result<(), SpecError> {
-    let nodes = root.toposort();
-    for (index, u) in nodes.iter().enumerate() {
+    type_verify_call_aware(root, spec, true, "UOp")
+}
+
+fn verification_sources(node: &Arc<UOp>, include_call_bodies: bool) -> Vec<(usize, Arc<UOp>)> {
+    if include_call_bodies {
+        return node.op().sources().into_iter().enumerate().collect();
+    }
+    match node.op() {
+        // Source zero is the opaque body; retain the real source indices in diagnostics.
+        Op::Call { args, .. } | Op::Function { args, .. } => {
+            args.iter().cloned().enumerate().map(|(index, arg)| (index + 1, arg)).collect()
+        }
+        Op::Program { .. } => Vec::new(),
+        _ => node.op().sources().into_iter().enumerate().collect(),
+    }
+}
+
+fn type_verify_call_aware(
+    root: &Arc<UOp>,
+    spec: &Spec,
+    include_call_bodies: bool,
+    boundary: &'static str,
+) -> Result<(), SpecError> {
+    let mut visited = HashSet::new();
+    let mut nodes = Vec::new();
+    let mut stack = vec![(root.clone(), Vec::new(), false)];
+    while let Some((node, path, processed)) = stack.pop() {
+        if visited.contains(&node.id) {
+            continue;
+        }
+        if processed {
+            visited.insert(node.id);
+            nodes.push((node, path));
+            continue;
+        }
+        stack.push((node.clone(), path.clone(), true));
+        let children = verification_sources(&node, include_call_bodies);
+        for (source_index, child) in children.into_iter().rev() {
+            if !visited.contains(&child.id) {
+                let mut child_path = path.clone();
+                child_path.push(source_index);
+                stack.push((child, child_path, false));
+            }
+        }
+    }
+
+    for (index, (u, source_path)) in nodes.iter().enumerate() {
         let reason = match spec.check(u) {
             Some(Ok(())) => continue,
             Some(Err(reason)) => reason,
@@ -81,8 +137,16 @@ pub fn type_verify(root: &Arc<UOp>, spec: &Spec) -> Result<(), SpecError> {
             eprintln!("[SPEC] reject #{index} {} (dtype {:?}): {reason}", u.op().as_ref(), u.dtype());
             eprintln!("{}", u.tree());
         }
-        return VerificationSnafu { index, op: u.op().as_ref().to_string(), dtype: format!("{:?}", u.dtype()), reason }
-            .fail();
+        return VerificationSnafu {
+            boundary,
+            index,
+            uop_id: u.id,
+            op: u.op().as_ref().to_string(),
+            dtype: format!("{:?}", u.dtype()),
+            source_path: source_path.clone(),
+            reason,
+        }
+        .fail();
     }
     Ok(())
 }
@@ -452,6 +516,13 @@ fn rule_no_weak_dtype() -> SpecRule {
     Box::new(|u| u.dtype().is_weak().then_some(Err("weak dtype must be lowered before a program")))
 }
 
+fn rule_no_legacy_index_dtype() -> SpecRule {
+    Box::new(|u| {
+        (u.dtype().base() == svod_dtype::ScalarDType::Index)
+            .then_some(Err("legacy Index dtype must be lowered before a program"))
+    })
+}
+
 /// Typed constants reaching a program must already carry the exact semantic
 /// value obtained by committing each lane to their declared scalar dtype.
 fn rule_canonical_const() -> SpecRule {
@@ -530,6 +601,7 @@ fn rule_program_special() -> SpecRule {
 /// whitelist: program-only rules first, then the shared rules.
 pub fn spec_program() -> Spec {
     let mut rules = vec![
+        rule_no_legacy_index_dtype(),
         rule_no_weak_dtype(),
         rule_canonical_const(),
         rule_special_shrink(),
@@ -543,6 +615,13 @@ pub fn spec_program() -> Spec {
     ];
     rules.extend(spec_shared());
     Spec { rules, whitelist: true }
+}
+
+/// Verify the invariant established by `pm_lower_index_dtype` before any
+/// target-dependent decomposition can obscure its source.
+pub fn verify_no_legacy_index_dtype(root: &Arc<UOp>) -> Result<(), SpecError> {
+    let spec = Spec { rules: vec![rule_no_legacy_index_dtype()], whitelist: false };
+    type_verify_call_aware(root, &spec, true, "post-index-lowering")
 }
 
 /// Runtime command-queue graph spec (`spec_hcq` at the pinned commit).
@@ -747,4 +826,103 @@ pub fn spec_tensor() -> Spec {
     ];
     rules.extend(spec_shared());
     Spec { rules, whitelist: true }
+}
+
+fn call_arguments_match_body(body: &Arc<UOp>, args: &[Arc<UOp>]) -> bool {
+    let mut slots = HashSet::new();
+    for formal in body.toposort_call_aware(false) {
+        let Op::Param { arg, .. } = formal.op() else { continue };
+        if arg.slot == usize::MAX {
+            continue;
+        }
+        if !slots.insert(arg.slot) {
+            continue;
+        }
+        let Some(actual) = args.get(arg.slot) else { return false };
+        let actual_axis = match actual.op() {
+            Op::Param { arg, .. } | Op::Buffer { arg, .. } => arg.axis,
+            Op::After { passthrough, .. } => match passthrough.buf_uop().op() {
+                Op::Param { arg, .. } | Op::Buffer { arg, .. } => arg.axis,
+                _ => None,
+            },
+            _ => None,
+        };
+        if formal.dtype() != actual.dtype() || arg.axis != actual_axis {
+            return false;
+        }
+    }
+    slots.iter().max().is_none_or(|max_slot| *max_slot < args.len())
+}
+
+fn supported_kernel_call_body(body: &Arc<UOp>) -> bool {
+    match body.op() {
+        Op::Sink { .. } | Op::Linear { .. } | Op::Program { .. } | Op::Copy { .. } | Op::Slice { .. } => true,
+        Op::End { computation, .. } => matches!(computation.op(), Op::Copy { .. } | Op::Slice { .. }),
+        _ => false,
+    }
+}
+
+fn rule_kernel_graph() -> SpecRule {
+    Box::new(|u| match u.op() {
+        Op::Sink { .. } => Some(ok_if(u.dtype() == DType::Void, "kernel-graph SINK must be void")),
+        Op::Bind { .. } => Some(Ok(())),
+        Op::Const(_) => Some(Ok(())),
+        Op::Stack { sources } => Some(ok_if(
+            sources.is_empty()
+                || sources
+                    .iter()
+                    .all(|source| matches!(source.op(), Op::Const(_) | Op::Bind { .. } | Op::Param { .. })),
+            "kernel-graph STACK may only contain CONST/BIND/PARAM sources",
+        )),
+        Op::Param { arg, .. } => Some(ok_if(u.dtype() == arg.dtype, "kernel-graph PARAM metadata dtype mismatch")),
+        Op::Buffer { arg, .. } => Some(ok_if(
+            arg.addrspace == Some(AddrSpace::Global) && u.dtype() == arg.dtype,
+            "kernel-graph BUFFER must be GLOBAL with matching metadata dtype",
+        )),
+        Op::Reshape { .. } | Op::BitCast { .. } => Some(Ok(())),
+        Op::MStack { buffers } => Some(ok_if(
+            !buffers.is_empty()
+                && buffers.iter().all(|source| matches_dtype(source, &u.dtype()))
+                && (buffers.iter().all(|source| source.device_spec().is_some())
+                    || (buffers.iter().all(|source| Arc::ptr_eq(source, &buffers[0]))
+                        && buffers[0].device_spec().is_none())),
+            "kernel-graph MSTACK requires a non-empty concrete-device layout or one repeated device-free source",
+        )),
+        Op::MSelect { buffer, device_index } => Some(ok_if(
+            matches!(buffer.op(), Op::MStack { buffers }
+                if *device_index < buffers.len() && matches_dtype(buffer, &u.dtype())),
+            "kernel-graph MSELECT requires an in-range MSTACK source with matching dtype",
+        )),
+        Op::Call { body, args, .. } => Some(ok_if(
+            u.dtype() == DType::Void && supported_kernel_call_body(body) && call_arguments_match_body(body, args),
+            "kernel-graph CALL requires a supported opaque body and positional arguments matching its PARAM slots",
+        )),
+        Op::After { passthrough, deps } => Some(ok_if(
+            matches_dtype(passthrough, &u.dtype())
+                && (passthrough.op().is_movement()
+                    || matches!(
+                        passthrough.op(),
+                        Op::Param { .. }
+                            | Op::After { .. }
+                            | Op::Buffer { .. }
+                            | Op::MStack { .. }
+                            | Op::MSelect { .. }
+                            | Op::BitCast { .. }
+                            | Op::Reshape { .. }
+                    ))
+                && deps.iter().all(|dep| matches!(dep.op(), Op::Call { .. } | Op::After { .. })),
+            "kernel-graph AFTER requires a storage/view passthrough, matching dtype, and CALL/AFTER dependencies",
+        )),
+        _ => None,
+    })
+}
+
+/// Outer callified graph whitelist from pinned Tinygrad `spec_kernel_graph`.
+/// CALL bodies remain opaque, matching `type_verify(..., enter_calls=False)`.
+pub fn spec_kernel_graph() -> Spec {
+    Spec { rules: vec![rule_kernel_graph()], whitelist: true }
+}
+
+pub fn verify_kernel_graph(root: &Arc<UOp>) -> Result<(), SpecError> {
+    type_verify_call_aware(root, &spec_kernel_graph(), false, "kernel graph")
 }

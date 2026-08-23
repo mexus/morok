@@ -41,8 +41,8 @@ use crate::{
     PrepareConfig, Result, Tensor,
     error::{
         BatchOutputMismatchSnafu, CompileKernelSnafu, CreateProgramSnafu, DeviceSnafu, EmptyScheduleSnafu,
-        ExecutionSnafu, IrConstructionSnafu, OptimizeSnafu, RangeifySnafu, RenderKernelSnafu, ShapeUnknownSnafu,
-        UOpSnafu,
+        ExecutionSnafu, IrConstructionSnafu, KernelGraphSnafu, OptimizeSnafu, RangeifySnafu, RenderKernelSnafu,
+        ShapeUnknownSnafu, UOpSnafu,
     },
     schedule::ScheduleItem,
 };
@@ -669,7 +669,8 @@ fn schedule_result_from_sink_with_cache(
         None => {
             let rangeify_result =
                 svod_schedule::rangeify_with_map(normalization.normalized.clone()).context(RangeifySnafu)?;
-            let (kernel_graph, _) = svod_schedule::try_get_kernel_graph(rangeify_result.sink).context(RangeifySnafu)?;
+            let (kernel_graph, _) =
+                svod_schedule::try_get_kernel_graph(rangeify_result.sink).context(KernelGraphSnafu)?;
             let pre_schedule = crate::schedule::create_pre_schedule(kernel_graph)?;
             let new_entry = Arc::new(crate::schedule_cache::CachedSchedule { pre_schedule: Arc::new(pre_schedule) });
             let guard = cache.guard();
@@ -697,7 +698,7 @@ fn schedule_result_from_sink_uncached(
     let normalization = normalize_for_schedule_cache(&sink)?;
     merge_var_vals_checked(&mut var_vals, &normalization.var_vals, "uncached schedule normalization")?;
     let rangeify_result = svod_schedule::rangeify_with_map(normalization.normalized.clone()).context(RangeifySnafu)?;
-    let (kernel_graph, _) = svod_schedule::try_get_kernel_graph(rangeify_result.sink).context(RangeifySnafu)?;
+    let (kernel_graph, _) = svod_schedule::try_get_kernel_graph(rangeify_result.sink).context(KernelGraphSnafu)?;
     let pre_schedule = crate::schedule::create_pre_schedule(kernel_graph)?;
     let restored_pre_schedule = restore_post_schedule_pre_schedule(&pre_schedule, &normalization);
     let input_buffers = build_schedule_input_buffers(&restored_pre_schedule);
@@ -1731,7 +1732,15 @@ fn beam_search_optimize(
                 let optimized = if let Some(cached) = cache_pin.get(&cache_key) {
                     cached.clone()
                 } else {
-                    let opt = apply_post_optimization_with_renderer(raw_ast, &renderer_c);
+                    let opt = match apply_post_optimization_with_renderer(raw_ast, &renderer_c) {
+                        Ok(opt) => opt,
+                        Err(e) => {
+                            if log_surpass_c {
+                                eprintln!("[BEAM drop] post_opt_verify_err: {e:?} opts={opts_snapshot:?}");
+                            }
+                            return None;
+                        }
+                    };
                     cache_pin.insert(cache_key, opt.clone());
                     opt
                 };
@@ -1944,7 +1953,7 @@ fn beam_search_optimize(
     // Apply post-optimization to final result with renderer so pm_add_gpudims runs
     // (Thread → core_id, Global → SPECIAL).
     let raw_ast = result.scheduler.get_optimized_ast(None);
-    Ok(apply_post_optimization_with_renderer(raw_ast, renderer))
+    apply_post_optimization_with_renderer(raw_ast, renderer).context(OptimizeSnafu)
 }
 
 #[cfg(test)]

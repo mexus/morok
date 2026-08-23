@@ -297,6 +297,16 @@ mod lower_index_stage_tests {
     }
 
     #[test]
+    fn post_optimization_propagates_stale_index_before_decomposition() {
+        let stale = UOp::param(0, 1, DType::Index, None);
+        let renderer = Renderer::cpu().with_rewrite_capabilities(svod_ir::RendererOps::all(), None, None);
+        let err = apply_post_optimization_with_renderer(UOp::sink(vec![stale]), &renderer)
+            .expect_err("legacy Index must fail at the post-index-lowering invariant");
+        assert!(err.to_string().contains("post-index-lowering"), "unexpected error: {err}");
+        assert!(err.to_string().contains("legacy Index dtype"), "unexpected error: {err}");
+    }
+
+    #[test]
     fn extra_symbolic_distributes_weak_index_before_lowering() {
         let buffer = UOp::param(0, 64, DType::Float32, None);
         let x = UOp::variable("x".into(), 0, 7, DType::WeakInt);
@@ -493,7 +503,7 @@ pub fn optimize_kernel(ast: Arc<svod_ir::UOp>, renderer: &Renderer) -> Result<Ar
 /// Called by both heuristic and beam search paths for consistent behavior.
 /// The concrete renderer is required because final decomposition is capability-dependent.
 #[tracing::instrument(skip_all)]
-pub fn apply_post_optimization(ast: Arc<svod_ir::UOp>, renderer: &Renderer) -> Arc<svod_ir::UOp> {
+pub fn apply_post_optimization(ast: Arc<svod_ir::UOp>, renderer: &Renderer) -> Result<Arc<svod_ir::UOp>, OptError> {
     apply_post_optimization_with_renderer(ast, renderer)
 }
 
@@ -508,7 +518,10 @@ pub fn apply_post_optimization(ast: Arc<svod_ir::UOp>, renderer: &Renderer) -> A
 /// * `ast` - The kernel AST to optimize
 /// * `renderer` - Bound optimizer and code-renderer capabilities
 #[tracing::instrument(skip_all)]
-pub fn apply_post_optimization_with_renderer(ast: Arc<svod_ir::UOp>, renderer: &Renderer) -> Arc<svod_ir::UOp> {
+pub fn apply_post_optimization_with_renderer(
+    ast: Arc<svod_ir::UOp>,
+    renderer: &Renderer,
+) -> Result<Arc<svod_ir::UOp>, OptError> {
     let transcendental = std::env::var("TRANSCENDENTAL").ok().and_then(|value| value.parse().ok()).unwrap_or(1);
     apply_post_optimization_configured(ast, renderer, transcendental)
 }
@@ -517,7 +530,7 @@ fn apply_post_optimization_configured(
     ast: Arc<svod_ir::UOp>,
     renderer: &Renderer,
     transcendental: i32,
-) -> Arc<svod_ir::UOp> {
+) -> Result<Arc<svod_ir::UOp>, OptError> {
     apply_post_optimization_configured_with_capture(ast, renderer, transcendental, None)
 }
 
@@ -526,7 +539,7 @@ fn apply_post_optimization_configured_with_capture(
     renderer: &Renderer,
     transcendental: i32,
     final_rewrite_capture: Option<&mut Option<Arc<svod_ir::UOp>>>,
-) -> Arc<svod_ir::UOp> {
+) -> Result<Arc<svod_ir::UOp>, OptError> {
     // Save metadata before graph_rewrite destroys it (e.g., KernelInfo with kernel name)
     let saved_metadata = ast.metadata_raw();
 
@@ -738,6 +751,9 @@ fn apply_post_optimization_configured_with_capture(
         "after post-index symbolic"
     );
     print_stage("18-final_symbolic", &with_lowered_idx);
+    if crate::spec::spec_enabled() {
+        crate::spec::verify_no_legacy_index_dtype(&with_lowered_idx).map_err(|source| OptError::Spec { source })?;
+    }
 
     let t_stage = std::time::Instant::now();
     let cast_float = graph_rewrite(pm_cast_float_alu(), with_lowered_idx, &mut ());
@@ -848,7 +864,7 @@ fn apply_post_optimization_configured_with_capture(
         None => rendered,
     };
     svod_ir::dump_canonical_stage("final_rewrite", &optimized);
-    optimized
+    Ok(optimized)
 }
 
 fn assert_target_renderer_boundary(root: &Arc<UOp>) {
@@ -1285,12 +1301,7 @@ fn optimize_kernel_with_config_impl(
     // with LOAD for arithmetic ops) and must run even when optimizations are disabled.
     // Pass the renderer to enable GPU dimension injection for GPU backends.
 
-    Ok(apply_post_optimization_configured_with_capture(
-        optimized,
-        renderer,
-        config.transcendental,
-        final_rewrite_capture,
-    ))
+    apply_post_optimization_configured_with_capture(optimized, renderer, config.transcendental, final_rewrite_capture)
 }
 
 /// Read an author-supplied `opts_to_apply` list off a kernel SINK marker.

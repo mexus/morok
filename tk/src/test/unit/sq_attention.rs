@@ -142,7 +142,8 @@ fn sq_attention_renders_both_arches() {
                 svod_codegen::traits::Renderer::decompositor(&renderer),
                 None,
             );
-            let optimized = svod_schedule::apply_post_optimization_with_renderer(graph, &opt_renderer);
+            let optimized =
+                svod_schedule::apply_post_optimization_with_renderer(graph, &opt_renderer).expect("post optimization");
             let program = svod_codegen::program_pipeline::program_from_sink(optimized, DeviceSpec::Cpu)
                 .expect("final target graph");
             let linearized = svod_codegen::program_pipeline::do_linearize(&program).expect("linearize");

@@ -21,7 +21,7 @@ pub mod transforms;
 // Context types
 pub use context::RangeifyContext;
 pub use indexing::{IndexingContext, run_rangeify};
-pub use kernel::{LocalAddBufferContext, RangeifyBufferContext};
+pub use kernel::{KernelGraphError, LocalAddBufferContext, RangeifyBufferContext};
 
 // Entry points
 pub use kernel::try_get_kernel_graph;

@@ -12,7 +12,9 @@ use svod_ir::types::ConstValue;
 use svod_ir::{BinaryOp, ConstValueHash, Op, ParamArg, ReduceOp, UOp};
 
 use crate::optimizer::apply_pre_optimization;
-use crate::spec::{spec_hcq, spec_program, spec_tensor, type_verify};
+use crate::spec::{
+    SpecError, spec_hcq, spec_program, spec_tensor, type_verify, verify_kernel_graph, verify_no_legacy_index_dtype,
+};
 
 fn global_param(slot: usize) -> Arc<UOp> {
     UOp::new(
@@ -30,6 +32,91 @@ fn int_const(dtype: DType, value: i64) -> Arc<UOp> {
 
 fn verify_program_err(root: &Arc<UOp>) -> String {
     type_verify(root, &spec_program()).expect_err("expected spec_program rejection").to_string()
+}
+
+fn kernel_param(slot: usize, dtype: DType) -> Arc<UOp> {
+    UOp::new(
+        Op::Param {
+            shape: UOp::stack(smallvec![]),
+            arg: ParamArg::buffer(slot, dtype.clone(), AddrSpace::Global, None),
+        },
+        dtype,
+    )
+}
+
+fn kernel_call(formals: Vec<Arc<UOp>>, args: Vec<Arc<UOp>>) -> Arc<UOp> {
+    UOp::sink(formals).call(args.into(), svod_ir::CallInfo::default())
+}
+
+#[test]
+fn spec_kernel_graph_accepts_valid_multi_output_call_graph() {
+    let formal = kernel_param(0, DType::Float32);
+    let input = UOp::new_buffer(svod_dtype::DeviceSpec::Cpu, 4, DType::Float32);
+    let call = kernel_call(vec![formal], vec![input]);
+    let out0 = UOp::new_buffer(svod_dtype::DeviceSpec::Cpu, 4, DType::Float32).after(smallvec![call.clone()]);
+    let out1 = UOp::new_buffer(svod_dtype::DeviceSpec::Cpu, 4, DType::Float32).after(smallvec![call]);
+
+    verify_kernel_graph(&UOp::sink(vec![out0, out1])).expect("valid multi-output kernel graph");
+}
+
+#[test]
+fn spec_kernel_graph_rejects_call_body_and_argument_order() {
+    let bad_body = UOp::native_const(0i32).call(smallvec![], svod_ir::CallInfo::default());
+    let err = verify_kernel_graph(&UOp::sink(vec![bad_body])).expect_err("CONST is not an opaque kernel body");
+    assert!(err.to_string().contains("supported opaque body"), "unexpected error: {err}");
+
+    let float_formal = kernel_param(0, DType::Float32);
+    let int_formal = kernel_param(1, DType::Int32);
+    let float_actual = UOp::new_buffer(svod_dtype::DeviceSpec::Cpu, 4, DType::Float32);
+    let int_actual = UOp::new_buffer(svod_dtype::DeviceSpec::Cpu, 4, DType::Int32);
+    let reversed = kernel_call(vec![float_formal, int_formal], vec![int_actual, float_actual]);
+    let err = verify_kernel_graph(&UOp::sink(vec![reversed])).expect_err("CALL args are positional");
+    assert!(err.to_string().contains("positional arguments"), "unexpected error: {err}");
+}
+
+#[test]
+fn spec_kernel_graph_checks_mselect_index_and_mstack_layout() {
+    let cpu = UOp::new_buffer(svod_dtype::DeviceSpec::Cpu, 4, DType::Float32);
+    let cuda = UOp::new_buffer(svod_dtype::DeviceSpec::Cuda { device_id: 0 }, 4, DType::Float32);
+    let stack = UOp::mstack(smallvec![cpu.clone(), cuda]);
+    verify_kernel_graph(&UOp::sink(vec![stack.mselect(1)])).expect("concrete-device MSTACK layout");
+
+    let err = verify_kernel_graph(&UOp::sink(vec![stack.mselect(2)])).expect_err("MSELECT index must be in range");
+    assert!(err.to_string().contains("in-range MSTACK"), "unexpected error: {err}");
+
+    let device_free = kernel_param(0, DType::Float32);
+    let malformed = UOp::mstack(smallvec![cpu, device_free]);
+    let err = verify_kernel_graph(&UOp::sink(vec![malformed])).expect_err("mixed device metadata must fail");
+    assert!(err.to_string().contains("MSTACK"), "unexpected error: {err}");
+}
+
+#[test]
+fn spec_kernel_graph_checks_after_dependency_shape_and_context() {
+    let output = UOp::new_buffer(svod_dtype::DeviceSpec::Cpu, 4, DType::Float32);
+    let malformed = output.after(smallvec![UOp::native_const(1i32)]);
+    let err = verify_kernel_graph(&UOp::sink(vec![malformed.clone()])).expect_err("AFTER dependency must be callable");
+    assert!(err.to_string().contains("CALL/AFTER dependencies"), "unexpected error: {err}");
+    match err {
+        SpecError::Verification { boundary, uop_id, source_path, .. } => {
+            assert_eq!(boundary, "kernel graph");
+            assert_eq!(uop_id, malformed.id);
+            assert_eq!(source_path, vec![0]);
+        }
+    }
+}
+
+#[test]
+fn spec_kernel_graph_accepts_copy_only_as_supported_opaque_call_body() {
+    let formal = kernel_param(0, DType::Float32);
+    let copy = formal.copy_to_device(svod_dtype::DeviceSpec::Cuda { device_id: 0 });
+    let input = UOp::new_buffer(svod_dtype::DeviceSpec::Cpu, 4, DType::Float32);
+    let call = copy.call(smallvec![input], svod_ir::CallInfo::default());
+    verify_kernel_graph(&UOp::sink(vec![call])).expect("cross-device COPY call");
+
+    let direct = UOp::new_buffer(svod_dtype::DeviceSpec::Cpu, 4, DType::Float32)
+        .copy_to_device(svod_dtype::DeviceSpec::Cuda { device_id: 0 });
+    let err = verify_kernel_graph(&UOp::sink(vec![direct])).expect_err("bare COPY must not survive in the outer graph");
+    assert!(err.to_string().contains("no matching rule"), "unexpected error: {err}");
 }
 
 #[test]
@@ -206,6 +293,28 @@ fn spec_program_rejects_weakfloat_only_at_program_level() {
         UOp::const_(DType::WeakFloat, ConstValue::Float(1.0)),
         UOp::const_(DType::Float32, ConstValue::Float(1.0)),
     );
+}
+
+#[test]
+fn spec_program_explicitly_rejects_legacy_index_dtype() {
+    let sink = UOp::sink(vec![UOp::const_(DType::Index, ConstValue::Int(1))]);
+    let err = verify_program_err(&sink);
+    assert!(err.contains("legacy Index dtype must be lowered"), "unexpected error: {err}");
+}
+
+#[test]
+fn post_index_lowering_invariant_reports_typed_context() {
+    let stale = UOp::new(Op::Noop, DType::Index);
+    let err = verify_no_legacy_index_dtype(&UOp::sink(vec![stale.clone()]))
+        .expect_err("post-index-lowering boundary must reject Index");
+    match err {
+        SpecError::Verification { boundary, uop_id, source_path, reason, .. } => {
+            assert_eq!(boundary, "post-index-lowering");
+            assert_eq!(uop_id, stale.id);
+            assert_eq!(source_path, vec![0]);
+            assert_eq!(reason, "legacy Index dtype must be lowered before a program");
+        }
+    }
 }
 
 #[test]

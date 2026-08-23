@@ -235,7 +235,7 @@ fn assert_no_phi_with_tc(sink: Arc<UOp>, renderer: &Renderer, label: &str) {
     let has_wmma = ast.toposort().iter().any(|u| matches!(u.op(), Op::Wmma { .. }));
     assert!(has_wmma, "{label}: TC apply did not produce WMMA");
 
-    let post = apply_post_optimization_with_renderer(ast, &renderer);
+    let post = apply_post_optimization_with_renderer(ast, &renderer).expect("post optimization");
     check_tree_scope(&post).unwrap_or_else(|e| panic!("{label}: tree-scope: {e}"));
     let linear = linearize_with_cfg(post);
     eprintln!("[{label}] linear={}", linear.len());

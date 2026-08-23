@@ -45,7 +45,7 @@ pub use svod_ir::rewrite;
 
 // Re-export main types
 pub use linearize::{CFGContext, add_control_flow, linearize, linearize_with_cfg};
-pub use rangeify::{RangeifyResult, rangeify, rangeify_with_map, try_get_kernel_graph};
+pub use rangeify::{KernelGraphError, RangeifyResult, rangeify, rangeify_with_map, try_get_kernel_graph};
 pub use svod_ir::pattern::{Matcher, RewriteResult, TypedPatternMatcher};
 pub use svod_ir::rewrite::graph_rewrite;
 
