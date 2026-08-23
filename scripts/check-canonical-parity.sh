@@ -123,11 +123,9 @@ done
   --left-name rust-first --right-name rust-second
 "$ROOT/scripts/canonical-diff.py" "$FIRST/multi_output_callified-python.json" "$SECOND/multi_output_callified-python.json" \
   --left-name python-first --right-name python-second
-record_mismatch production-fixture multi_output_callified EVID-01B \
-  "$FIRST/multi_output_callified-rust.json" "$FIRST/multi_output_callified-python.json" \
-  "$SECOND/multi_output_callified-rust.json" "$SECOND/multi_output_callified-python.json"
-PRODUCTION_GAPS+=(multi_output_callified)
-printf 'canonical production fixture: multi_output_callified: deterministic mismatch\n'
+"$ROOT/scripts/canonical-diff.py" "$FIRST/multi_output_callified-rust.json" "$FIRST/multi_output_callified-python.json"
+"$ROOT/scripts/canonical-diff.py" "$SECOND/multi_output_callified-rust.json" "$SECOND/multi_output_callified-python.json"
+printf 'canonical production fixture: multi_output_callified: strict parity ok\n'
 
 PRODUCTION_STAGES=(tensor rangeified kernel_ast scheduled optimized postrange expanded coalesced gated program linearized)
 for stage in "${PRODUCTION_STAGES[@]}"; do

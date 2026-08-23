@@ -10,73 +10,28 @@ aligned field differences (1):
     rust: 5
     python: 'unaligned:5'
 
-[production-fixture multi_output_callified issue=EVID-01B]
-canonical document sha256:
-  rust: 154854a8f47bc51a4217679ff32bd4f4e185a7f7997cf29d0204024bbd4522f6
-  python: 6c3d0c9038044709b7195a761e5dd015313f5d28f6803290a948109b47a6c4aa
-canonical field mismatch at stage kernel_ast:
-aligned field differences (4):
-  nodes 1/1 BUFFER $.arg.slot
-    rust: 9223372036854775808
-    python: 0
-  nodes 2/2 PARAM $.arg.device
-    rust: None
-    python: 'CPU'
-  nodes 5/5 PARAM $.arg.device
-    rust: None
-    python: 'CPU'
-  nodes 15/15 BUFFER $.arg.slot
-    rust: 9223372036854775809
-    python: 1
-  first rust source chain: 23:SINK -> 14:AFTER -> 1:BUFFER
-  first python source chain: 23:SINK -> 14:AFTER -> 1:BUFFER
-
 [production-stage kernel_ast issue=EVID-01B]
 canonical document sha256:
-  rust: 41410fafee886fc6b2383d74928671a75c204be4b59d970ba8b1f01c31cee6b0
+  rust: 4fd519313605729df8d94fae12cce19a2ef07a0a25aee9e2ff9b0467513747db
   python: 58a41d1f38338fab1af92336f8fa35988a6f00abdf8d4a9448bdea7796714aec
 canonical structural mismatch at stage kernel_ast (insert):
   rust ids 23:23: []
   python ids 23:24: ['PARAM']
-aligned field differences (5):
-  nodes 1/1 BUFFER $.arg.slot
-    rust: 9223372036854775808
-    python: 0
-  nodes 2/2 PARAM $.arg.device
-    rust: None
-    python: 'CPU'
-  nodes 5/5 PARAM $.arg.device
-    rust: None
-    python: 'CPU'
-  nodes 12/12 BUFFER $.arg.slot
-    rust: 9223372036854775809
-    python: 1
+aligned field differences (1):
   nodes 24/25 BIND $.src[0]
     rust: 14
     python: 'unaligned:23'
-  first rust source chain: 29:SINK -> 28:AFTER -> 1:BUFFER
-  first python source chain: 30:SINK -> 29:AFTER -> 1:BUFFER
+  first rust source chain: 29:SINK -> 28:AFTER -> 27:CALL -> 26:AFTER -> 25:CALL -> 24:BIND
+  first python source chain: 30:SINK -> 29:AFTER -> 28:CALL -> 27:AFTER -> 26:CALL -> 25:BIND
 
 [production-stage scheduled issue=EVID-01B]
 canonical document sha256:
-  rust: 2d25cd31933ae0b24322515643528431f36a8a926be9cd45906ea7279e76548f
+  rust: 53ff57045dc9186a9ff52357caa9225b07701a2aa156e59469fd61fc70adf02c
   python: 12f1be06009b77d43845ecbe5ea87830d7c4019b6eef668e99f2013ae750e15e
-canonical schedule mismatch at stage scheduled (7 field differences):
-  $.items[0].ast.nodes[1].arg.device
-    rust: None
-    python: 'CPU'
-  $.items[0].ast.nodes[4].arg.device
-    rust: None
-    python: 'CPU'
+canonical schedule mismatch at stage scheduled (3 field differences):
   $.items[0].buffers[0].buffer_slot
     rust: 9223372036854775809
     python: 0
-  $.items[1].ast.nodes[1].arg.device
-    rust: None
-    python: 'CPU'
-  $.items[1].ast.nodes[4].arg.device
-    rust: None
-    python: 'CPU'
   $.items[1].buffers[0].buffer_slot
     rust: 9223372036854775808
     python: 0
@@ -86,15 +41,12 @@ canonical schedule mismatch at stage scheduled (7 field differences):
 
 [production-stage optimized issue=EVID-01B]
 canonical document sha256:
-  rust: 9bdcf33d530d9cb36d5e03047da6150613f8daecdd4ddfa4e0bbb51009c5b940
+  rust: e2ead17e5ee0dc279a67719d1e961793eb6595a8464cb5bfde45af0a153e3721
   python: 0fb0b1ecfa9913703650f74bba19418a3003fa99015b221a4aa507e39a87ef0b
 canonical structural mismatch at stage optimized (insert):
   rust ids 4:4: []
   python ids 4:8: ['CONST', 'MUL', 'RANGE', 'ADD']
-aligned field differences (9):
-  nodes 1/1 PARAM $.arg.device
-    rust: None
-    python: 'CPU'
+aligned field differences (7):
   nodes 2/2 CONST $.arg.value.value
     rust: 16
     python: 1
@@ -104,9 +56,6 @@ aligned field differences (9):
   nodes 5/9 MUL $.src[0]
     rust: 3
     python: 'unaligned:7'
-  nodes 9/13 PARAM $.arg.device
-    rust: None
-    python: 'CPU'
   nodes 18/22 END $.src[2]
     rust: 6
     python: 'unaligned:6'
@@ -119,20 +68,17 @@ aligned field differences (9):
   nodes 19/23 SINK $.arg.name
     rust: 'E_L16u4'
     python: 'E_16_4'
-  first rust source chain: 19:SINK -> 18:END -> 17:STORE -> 8:INDEX -> 1:PARAM
-  first python source chain: 23:SINK -> 22:END -> 21:STORE -> 12:INDEX -> 1:PARAM
+  first rust source chain: 19:SINK -> 18:END -> 3:RANGE -> 2:CONST
+  first python source chain: 23:SINK -> 22:END -> 3:RANGE -> 2:CONST
 
 [production-stage postrange issue=EVID-01B]
 canonical document sha256:
-  rust: 3a3c323d43c6fa0453a1910f89d9acaf2ad78e3d6abe936510a95b4e910028c0
+  rust: e4adeb9d505def6ebb7b958a8ea46fa57737ea81945d195e0d7dc3ae06ed868a
   python: 14c75f036bbedbbbf159e2192f3b6c7649cfb5642d1e4c77a5c58f58a86cc580
 canonical structural mismatch at stage postrange (insert):
   rust ids 4:4: []
   python ids 4:8: ['CONST', 'MUL', 'RANGE', 'ADD']
-aligned field differences (9):
-  nodes 1/1 PARAM $.arg.device
-    rust: None
-    python: 'CPU'
+aligned field differences (7):
   nodes 2/2 CONST $.arg.value.value
     rust: 16
     python: 1
@@ -142,9 +88,6 @@ aligned field differences (9):
   nodes 5/9 MUL $.src[0]
     rust: 3
     python: 'unaligned:7'
-  nodes 9/13 PARAM $.arg.device
-    rust: None
-    python: 'CPU'
   nodes 18/22 END $.src[2]
     rust: 6
     python: 'unaligned:6'
@@ -157,90 +100,67 @@ aligned field differences (9):
   nodes 19/23 SINK $.arg.name
     rust: 'E_L16u4'
     python: 'E_16_4'
-  first rust source chain: 19:SINK -> 18:END -> 17:STORE -> 8:INDEX -> 1:PARAM
-  first python source chain: 23:SINK -> 22:END -> 21:STORE -> 12:INDEX -> 1:PARAM
+  first rust source chain: 19:SINK -> 18:END -> 3:RANGE -> 2:CONST
+  first python source chain: 23:SINK -> 22:END -> 3:RANGE -> 2:CONST
 
 [production-stage expanded issue=EVID-01B]
 canonical document sha256:
-  rust: b11876924383f6b2a89d59f75cfb2648694465cb34f34d5abdfb82ed10e00e9b
+  rust: 5d73bc592a6fd2bf2f84d727a51639ed7afa160564d89159ac2f6c6308a98268
   python: 3db050a040d111ed5d7807dd519675a87a7f3ed381fc4d9e63b6388655023fc6
-canonical structural mismatch at stage expanded: nodes 22/22 $.src[2]
-  rust: 10
-  python: '<missing>'
-aligned field differences (7):
-  nodes 1/1 PARAM $.arg.device
-    rust: None
-    python: 'CPU'
+canonical field mismatch at stage expanded:
+aligned field differences (4):
   nodes 3/3 RANGE $.arg.axis[0]
     rust: 0
     python: 2
   nodes 3/3 RANGE $.arg.axis_type
     rust: 'WEAK'
     python: 'LOCAL'
-  nodes 13/13 PARAM $.arg.device
-    rust: None
-    python: 'CPU'
-  nodes 22/22 END $.src[2]
-    rust: 10
-    python: '<missing>'
   nodes 23/23 SINK $.arg.applied_opts[1]
     rust: '<missing>'
     python: {'op': 'LOCAL', 'axis': 0, 'arg': {'Int': 16}}
   nodes 23/23 SINK $.arg.name
     rust: 'E_L16u4'
     python: 'E_16_4'
-  first rust source chain: 23:SINK -> 22:END -> 21:STORE -> 12:INDEX -> 1:PARAM
-  first python source chain: 23:SINK -> 22:END -> 21:STORE -> 12:INDEX -> 1:PARAM
+  first rust source chain: 23:SINK -> 22:END -> 3:RANGE
+  first python source chain: 23:SINK -> 22:END -> 3:RANGE
 
 [production-stage coalesced issue=EVID-01B]
 canonical document sha256:
-  rust: 6a498a0245861b4a16917c4b2d987cd6452b82e4299144313901d52c57c1a9e8
+  rust: 18342c05b3732a0c9ad65f4f575eb105aca63d2e73dbaa11f552cde383fa3f39
   python: 4e17a5fd557b00b30a63f8c858f77647b47143a349e06f3c3249385e03bd4704
 canonical structural mismatch at stage coalesced (replace):
   rust ids 3:4: ['RANGE']
   python ids 3:4: ['SPECIAL']
-aligned field differences (9):
-  nodes 1/1 PARAM $.arg.device
-    rust: None
-    python: 'CPU'
+aligned field differences (6):
   nodes 5/5 MUL $.src[0]
     rust: 3
     python: 'unaligned:3'
-  nodes 7/7 PARAM $.arg.device
-    rust: None
-    python: 'CPU'
   nodes 32/32 GROUP $.shape
     rust: [{'kind': 'const', 'value': 4}]
     python: None
-  nodes 34/33 END $.shape
+  nodes 33/33 END $.shape
     rust: [{'kind': 'const', 'value': 4}]
     python: None
-  nodes 34/33 END $.src[1]
+  nodes 33/33 END $.src[1]
     rust: 3
     python: 'unaligned:3'
-  nodes 34/33 END $.src[2]
-    rust: 33
-    python: '<missing>'
-  nodes 35/34 SINK $.arg.applied_opts[1]
+  nodes 34/34 SINK $.arg.applied_opts[1]
     rust: '<missing>'
     python: {'op': 'LOCAL', 'axis': 0, 'arg': {'Int': 16}}
-  nodes 35/34 SINK $.arg.name
+  nodes 34/34 SINK $.arg.name
     rust: 'E_L16u4'
     python: 'E_16_4'
-  first rust source chain: 35:SINK -> 34:END -> 32:GROUP -> 31:STORE -> 6:SHRINK -> 1:PARAM
-  first python source chain: 34:SINK -> 33:END -> 32:GROUP -> 31:STORE -> 6:SHRINK -> 1:PARAM
+  first rust source chain: 34:SINK -> 33:END -> 32:GROUP -> 31:STORE -> 6:SHRINK -> 5:MUL
+  first python source chain: 34:SINK -> 33:END -> 32:GROUP -> 31:STORE -> 6:SHRINK -> 5:MUL
 
 [production-stage gated issue=EVID-01B]
 canonical document sha256:
-  rust: dc3db684cc9a2324148273deb6e9d28b6d7daf0e5da11297c8c00ed03993575f
+  rust: da2373a8f8984b4000d1efc186f3fd5bbc2a4417c98c1ac705a40517800f3934
   python: 803d0d1809cb42d64855b55a4c4c8e371b7279af28344f71587048d388cdc670
 canonical structural mismatch at stage gated (replace):
   rust ids 3:4: ['RANGE']
   python ids 3:4: ['SPECIAL']
-aligned field differences (14):
-  nodes 1/1 PARAM $.arg.device
-    rust: None
-    python: 'CPU'
+aligned field differences (11):
   nodes 4/4 CONST $.arg.value.value
     rust: 2
     python: 4
@@ -250,9 +170,6 @@ aligned field differences (14):
   nodes 7/6 SHRINK $.src[2]
     rust: 6
     python: 4
-  nodes 8/7 PARAM $.arg.device
-    rust: None
-    python: 'CPU'
   nodes 9/8 SHRINK $.src[1]
     rust: 5
     python: 'unaligned:5'
@@ -265,35 +182,29 @@ aligned field differences (14):
   nodes 32/32 GROUP $.shape
     rust: [{'kind': 'const', 'value': 4}]
     python: None
-  nodes 34/33 END $.shape
+  nodes 33/33 END $.shape
     rust: [{'kind': 'const', 'value': 4}]
     python: None
-  nodes 34/33 END $.src[1]
+  nodes 33/33 END $.src[1]
     rust: 3
     python: 'unaligned:3'
-  nodes 34/33 END $.src[2]
-    rust: 33
-    python: '<missing>'
-  nodes 35/34 SINK $.arg.applied_opts[1]
+  nodes 34/34 SINK $.arg.applied_opts[1]
     rust: '<missing>'
     python: {'op': 'LOCAL', 'axis': 0, 'arg': {'Int': 16}}
-  nodes 35/34 SINK $.arg.name
+  nodes 34/34 SINK $.arg.name
     rust: 'E_L16u4'
     python: 'E_16_4'
-  first rust source chain: 35:SINK -> 34:END -> 32:GROUP -> 31:STORE -> 7:SHRINK -> 1:PARAM
-  first python source chain: 34:SINK -> 33:END -> 32:GROUP -> 31:STORE -> 6:SHRINK -> 1:PARAM
+  first rust source chain: 34:SINK -> 33:END -> 32:GROUP -> 31:STORE -> 7:SHRINK -> 5:SHL -> 4:CONST
+  first python source chain: 34:SINK -> 33:END -> 32:GROUP -> 31:STORE -> 6:SHRINK -> 4:CONST
 
 [production-stage program issue=EVID-01B]
 canonical document sha256:
-  rust: 67d3cfce06ba91e123331a5af5b22866582aa34cadce3e2d261fa68bad098a9c
+  rust: 190677f20a9ff64e49e3bc947d71cb2f0313a65f7236f74bb7d3e71468abb5d9
   python: 367bdcf113b10562bfbce6e01dd2d06c38a0ef624efda503cfb27ce593984d45
 canonical structural mismatch at stage program (replace):
   rust ids 3:4: ['RANGE']
   python ids 3:4: ['SPECIAL']
-aligned field differences (14):
-  nodes 1/1 PARAM $.arg.device
-    rust: None
-    python: 'CPU'
+aligned field differences (12):
   nodes 4/4 CONST $.arg.value.value
     rust: 2
     python: 4
@@ -303,9 +214,6 @@ aligned field differences (14):
   nodes 7/6 SHRINK $.src[2]
     rust: 6
     python: 4
-  nodes 8/7 PARAM $.arg.device
-    rust: None
-    python: 'CPU'
   nodes 9/8 SHRINK $.src[1]
     rust: 5
     python: 'unaligned:5'
@@ -333,20 +241,17 @@ aligned field differences (14):
   nodes 35/34 PROGRAM $.arg.name
     rust: 'E_L16u4'
     python: 'E_16_4'
-  first rust source chain: 35:PROGRAM -> 34:SINK -> 33:END -> 32:GROUP -> 31:STORE -> 7:SHRINK -> 1:PARAM
-  first python source chain: 34:PROGRAM -> 33:SINK -> 32:GROUP -> 31:STORE -> 6:SHRINK -> 1:PARAM
+  first rust source chain: 35:PROGRAM -> 34:SINK -> 33:END -> 32:GROUP -> 31:STORE -> 7:SHRINK -> 5:SHL -> 4:CONST
+  first python source chain: 34:PROGRAM -> 33:SINK -> 32:GROUP -> 31:STORE -> 6:SHRINK -> 4:CONST
 
 [production-stage linearized issue=EVID-01B]
 canonical document sha256:
-  rust: 76e8d0ebda8842de905bcd0eff4af9834c2b01451aaa89adf5486a885a734004
+  rust: 28e780eee81aee1e2e5d5d18f7e30710560e63b0490383391829a007febe3349
   python: d99019a6ad41841ea662a61214cb8602d88701589d9064ec7382de5be86624fb
 canonical structural mismatch at stage linearized (replace):
   rust ids 3:4: ['RANGE']
   python ids 3:4: ['SPECIAL']
-aligned field differences (36):
-  nodes 1/1 PARAM $.arg.device
-    rust: None
-    python: 'CPU'
+aligned field differences (34):
   nodes 4/4 CONST $.arg.value.value
     rust: 2
     python: 4
@@ -356,9 +261,6 @@ aligned field differences (36):
   nodes 7/6 SHRINK $.src[2]
     rust: 6
     python: 4
-  nodes 8/7 PARAM $.arg.device
-    rust: None
-    python: 'CPU'
   nodes 9/8 SHRINK $.src[1]
     rust: 5
     python: 'unaligned:5'
@@ -452,5 +354,5 @@ aligned field differences (36):
   nodes 36/35 PROGRAM $.arg.name
     rust: 'E_L16u4'
     python: 'E_16_4'
-  first rust source chain: 36:PROGRAM -> 35:LINEAR -> 1:PARAM
-  first python source chain: 35:PROGRAM -> 34:LINEAR -> 1:PARAM
+  first rust source chain: 36:PROGRAM -> 35:LINEAR -> 4:CONST
+  first python source chain: 35:PROGRAM -> 34:LINEAR -> 4:CONST
