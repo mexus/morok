@@ -515,3 +515,107 @@ fn test_arena_reports_memory_savings() {
         result.memory_saved
     );
 }
+
+#[test]
+fn test_arena_reports_demand_commitment_padding_and_reuse_metrics() {
+    // Each logical buffer is 400 bytes and rounds to 512. Cross-level reuse
+    // commits one 512-byte arena for 800 logical / 1024 rounded bytes.
+    let mut schedule = vec![make_sink_item(100, make_buffer(100)), make_sink_item(101, make_buffer(100))];
+    chain_deps(&mut schedule);
+
+    let result = plan(&schedule, &HashSet::new(), PlannerMode::Arena);
+    let metrics = &result.metrics;
+    assert_eq!(metrics.logical_allocations, 2);
+    assert_eq!(metrics.logical_bytes, 800);
+    assert_eq!(metrics.rounded_bytes, 1024);
+    assert_eq!(metrics.padding_bytes, 224);
+    assert_eq!(metrics.logical_peak_bytes, 400);
+    assert_eq!(metrics.arena_committed_bytes, 512);
+    assert_eq!(metrics.physical_bytes, 512);
+    assert_eq!(metrics.fragmentation_bytes, 112);
+    assert_eq!(metrics.reused_allocations, 1);
+    assert_eq!(metrics.reused_bytes, 288);
+}
+
+#[test]
+fn test_remap_reports_exact_physical_and_reused_bytes() {
+    let mut schedule = vec![make_sink_item(105, make_buffer(100)), make_sink_item(106, make_buffer(100))];
+    chain_deps(&mut schedule);
+
+    let result = plan(&schedule, &HashSet::new(), PlannerMode::Remap);
+    assert_eq!(result.metrics.logical_bytes, 800);
+    assert_eq!(result.metrics.rounded_bytes, 1024);
+    assert_eq!(result.metrics.physical_bytes, 400);
+    assert_eq!(result.metrics.reused_allocations, 1);
+    assert_eq!(result.metrics.reused_bytes, 400);
+}
+
+#[test]
+fn test_disabled_mode_measures_baseline_and_exclusion_reasons() {
+    let eligible = make_buffer(64);
+    let output = make_buffer(32);
+    let transfer_owned = make_buffer(16);
+    let mut schedule = vec![
+        make_sink_item(110, eligible),
+        make_sink_item(111, output.clone()),
+        make_nonsink_item(112, transfer_owned),
+    ];
+    chain_deps(&mut schedule);
+    let result = plan(&schedule, &HashSet::from([output.id().0]), PlannerMode::Disabled);
+
+    assert_eq!(result.metrics.mode, PlannerMode::Disabled);
+    assert_eq!(result.metrics.logical_allocations, 1);
+    assert_eq!(result.metrics.logical_bytes, 256);
+    assert_eq!(result.metrics.physical_bytes, 256);
+    assert_eq!(result.metrics.reused_allocations, 0);
+    assert_eq!(result.metrics.exclusions[&PlannerExclusionReason::Output].allocations, 1);
+    assert_eq!(result.metrics.exclusions[&PlannerExclusionReason::Output].bytes, 128);
+    assert_eq!(result.metrics.exclusions[&PlannerExclusionReason::NonSinkOperation].allocations, 1);
+    assert_eq!(result.metrics.exclusions[&PlannerExclusionReason::NonSinkOperation].bytes, 64);
+}
+
+#[test]
+fn test_fork_join_same_level_buffers_never_alias_overlapping_arena_bytes() {
+    let mut schedule: Vec<_> = (0..4).map(|i| make_sink_item(120 + i, make_buffer(256))).collect();
+    let root = schedule[0].kernel.id;
+    let (left, right) = (schedule[1].kernel.id, schedule[2].kernel.id);
+    schedule[1].dependencies = vec![root];
+    schedule[2].dependencies = vec![root];
+    schedule[3].dependencies = vec![left, right];
+    assert_eq!(compute_item_levels(&schedule).unwrap(), [0, 1, 1, 2]);
+
+    let result = plan(&schedule, &HashSet::new(), PlannerMode::Arena);
+    let left = &result.buffer_replace[&BufferKey { kernel_idx: 1, buffer_idx: 0 }];
+    let right = &result.buffer_replace[&BufferKey { kernel_idx: 2, buffer_idx: 0 }];
+    assert_eq!(left.storage_id(), right.storage_id());
+    assert!(
+        left.offset() + left.size() <= right.offset() || right.offset() + right.size() <= left.offset(),
+        "same-level fork allocations overlap: left=[{},{}), right=[{},{})",
+        left.offset(),
+        left.offset() + left.size(),
+        right.offset(),
+        right.offset() + right.size(),
+    );
+    assert_eq!(result.metrics.logical_peak_bytes, left.size() + right.size());
+}
+
+#[test]
+fn test_real_numeric_result_matches_with_planner_disabled_and_arena() {
+    fn run(mode: PlannerMode) -> Vec<f32> {
+        let a = crate::Tensor::from_slice([1.0f32, -2.0, 3.5, 4.0]);
+        let b = crate::Tensor::from_slice([0.5f32, 3.0, -1.5, 2.0]);
+        let first = &a + &b;
+        let second = &first * &a;
+        let mut output = &second + &b;
+        let mut config = crate::PrepareConfig::default();
+        config.planner_mode = mode;
+        config.disable_schedule_cache = true;
+        output.realize_with(&config).expect("realize numeric planner differential");
+        output.as_vec::<f32>().expect("numeric output")
+    }
+
+    let disabled = run(PlannerMode::Disabled);
+    let arena = run(PlannerMode::Arena);
+    assert_eq!(arena, disabled);
+    assert_eq!(arena, [2.0, 1.0, 5.5, 26.0]);
+}

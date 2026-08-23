@@ -8,6 +8,7 @@ use svod_runtime::CpuBackend;
 use svod_schedule::OptimizerConfig;
 
 use crate::error::{DeviceFactorySnafu, DeviceSnafu};
+use crate::memory_planner::PlannerMode;
 
 /// Resolves a `DeviceSpec` into a concrete `Device` for compilation.
 ///
@@ -53,6 +54,10 @@ impl DeviceResolver for CpuBackendResolver {
 pub struct PrepareConfig {
     pub optimizer: OptimizerConfig,
     pub(crate) resolver: Arc<dyn DeviceResolver>,
+    /// Memory planning policy for this preparation. Keeping this in the config
+    /// makes planner-on/off comparisons deterministic without process-global
+    /// environment mutation.
+    pub planner_mode: PlannerMode,
     /// When `true`, force the cache-cold rangeify/scheduling path even if
     /// `SVOD_DISABLE_SCHEDULE_CACHE` is unset. Primarily useful in tests
     /// that need to compare cache-warm vs cache-cold outputs without mutating
@@ -69,6 +74,7 @@ impl std::fmt::Debug for PrepareConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PrepareConfig")
             .field("optimizer", &self.optimizer)
+            .field("planner_mode", &self.planner_mode)
             .field("disable_schedule_cache", &self.disable_schedule_cache)
             .field("device_local_outputs", &self.device_local_outputs)
             .finish_non_exhaustive()
@@ -80,6 +86,7 @@ impl Default for PrepareConfig {
         Self {
             optimizer: OptimizerConfig::default(),
             resolver: Arc::new(EnvResolver),
+            planner_mode: PlannerMode::Arena,
             disable_schedule_cache: false,
             device_local_outputs: false,
         }
@@ -87,11 +94,12 @@ impl Default for PrepareConfig {
 }
 
 impl PrepareConfig {
-    /// Read both `SVOD_CPU_BACKEND` and optimizer env vars.
+    /// Read `SVOD_MEMORY_PLANNER`, `SVOD_CPU_BACKEND`, and optimizer env vars.
     pub fn from_env() -> Self {
         Self {
             optimizer: OptimizerConfig::from_env(),
             resolver: Arc::new(EnvResolver),
+            planner_mode: crate::memory_planner::mode_from_env(),
             disable_schedule_cache: false,
             device_local_outputs: false,
         }
@@ -106,6 +114,7 @@ impl PrepareConfig {
         Self {
             optimizer: OptimizerConfig::from_env(),
             resolver: Arc::new(CpuBackendResolver(backend)),
+            planner_mode: crate::memory_planner::mode_from_env(),
             disable_schedule_cache: false,
             device_local_outputs: false,
         }
@@ -138,7 +147,13 @@ impl PrepareConfig {
 
 impl From<OptimizerConfig> for PrepareConfig {
     fn from(optimizer: OptimizerConfig) -> Self {
-        Self { optimizer, resolver: Arc::new(EnvResolver), disable_schedule_cache: false, device_local_outputs: false }
+        Self {
+            optimizer,
+            resolver: Arc::new(EnvResolver),
+            planner_mode: PlannerMode::Arena,
+            disable_schedule_cache: false,
+            device_local_outputs: false,
+        }
     }
 }
 

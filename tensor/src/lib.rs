@@ -89,6 +89,7 @@ pub mod variable;
 // Re-export for public API
 pub use config::PrepareConfig;
 pub use index::{Idx, IndexSpec};
+pub use memory_planner::PlannerMode;
 pub use svod_dtype::default_device::{clear_default_device, default_device, set_default_device, with_default_device};
 pub use svod_runtime::CpuBackend;
 pub use tensor_registry::apply_map_to_tensors;

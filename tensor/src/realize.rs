@@ -1168,8 +1168,9 @@ fn prepare_execution_plan(
     // Liveness-based memory planning. `PlannerMode::Arena` (default) packs
     // plannable buffers into one or two large allocations; `Remap` swaps
     // per-pool `Arc<Buffer>`s; `Disabled` short-circuits. Mode is selected
-    // by `SVOD_MEMORY_PLANNER` (`Arena` if unset).
-    let planner_mode = crate::memory_planner::mode_from_env();
+    // explicitly by PrepareConfig (`from_env` is the environment-reading
+    // constructor).
+    let planner_mode = config.planner_mode;
     let output_buffer_ids = collect_output_buffer_ids(
         &schedule_items,
         &schedule_result.output_uop_ids,
@@ -1184,13 +1185,24 @@ fn prepare_execution_plan(
     let item_levels = crate::memory_planner::compute_item_levels(&schedule_items)?;
     let planner_result =
         crate::memory_planner::memory_planner(&schedule_items, &item_levels, &output_buffer_ids, planner_mode);
+    trace!(
+        mode = ?planner_result.metrics.mode,
+        replacements = planner_result.buffer_replace.len(),
+        buffers_reused = planner_result.buffers_reused,
+        memory_saved_bytes = planner_result.memory_saved,
+        logical_bytes = planner_result.metrics.logical_bytes,
+        rounded_bytes = planner_result.metrics.rounded_bytes,
+        logical_peak_bytes = planner_result.metrics.logical_peak_bytes,
+        arena_committed_bytes = planner_result.metrics.arena_committed_bytes,
+        physical_bytes = planner_result.metrics.physical_bytes,
+        fragmentation_bytes = planner_result.metrics.fragmentation_bytes,
+        padding_bytes = planner_result.metrics.padding_bytes,
+        reused_allocations = planner_result.metrics.reused_allocations,
+        reused_bytes = planner_result.metrics.reused_bytes,
+        exclusions = ?planner_result.metrics.exclusions,
+        "memory planner measurements"
+    );
     if !planner_result.buffer_replace.is_empty() {
-        trace!(
-            replacements = planner_result.buffer_replace.len(),
-            buffers_reused = planner_result.buffers_reused,
-            memory_saved_bytes = planner_result.memory_saved,
-            "applying memory planner buffer replacements"
-        );
         crate::memory_planner::apply_buffer_replacements(&mut schedule_items, &planner_result.buffer_replace);
     }
     // The planner injects zero ordering edges; the real safety invariant (op
