@@ -66,14 +66,19 @@ impl UOp {
                 .ok_or(Error::TypePromotionFailed { lhs: lhs_dtype.clone(), rhs: rhs_dtype.clone() })?
         };
 
-        // Cast if needed
+        fn cast_strong_source(source: Arc<UOp>, source_dtype: &DType, target_dtype: &DType) -> Arc<UOp> {
+            if source_dtype.is_weak() && !target_dtype.is_weak() { source } else { source.cast(target_dtype.clone()) }
+        }
+
+        // Weak sources remain mathematical until pm_commit_weak consumes the
+        // concrete dtype demand. Strong promotions are explicit immediately.
         let lhs = if lhs_dtype != target_dtype && !Self::is_invalid_marker(&lhs) {
-            lhs.cast(target_dtype.clone())
+            cast_strong_source(lhs, &lhs_dtype, &target_dtype)
         } else {
             lhs
         };
         let rhs = if rhs_dtype != target_dtype && !Self::is_invalid_marker(&rhs) {
-            rhs.cast(target_dtype.clone())
+            cast_strong_source(rhs, &rhs_dtype, &target_dtype)
         } else {
             rhs
         };

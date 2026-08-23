@@ -18,6 +18,22 @@ fn test_add_same_type() {
 }
 
 #[test]
+fn weak_sources_remain_uncast_until_lowering() {
+    for result in [
+        UOp::const_(DType::WeakInt, ConstValue::Int(7)).try_add(&UOp::native_const(2i32)).unwrap(),
+        UOp::const_(DType::WeakFloat, ConstValue::Float(-0.0)).try_add(&UOp::native_const(1.0f32)).unwrap(),
+    ] {
+        let Op::Binary(BinaryOp::Add, lhs, rhs) = result.op() else { panic!("expected ADD") };
+        assert!(matches!(lhs.op(), Op::Const(_)), "weak lhs must remain direct: {lhs:?}");
+        assert!(matches!(rhs.op(), Op::Const(_)), "strong rhs must remain a constant: {rhs:?}");
+        assert!(lhs.dtype().is_weak());
+        assert!(!rhs.dtype().is_weak());
+        assert_eq!(result.dtype(), rhs.dtype());
+        assert!(!result.toposort().iter().any(|node| matches!(node.op(), Op::Cast { .. })));
+    }
+}
+
+#[test]
 fn test_sub_same_type() {
     assert_eq!(UOp::native_const(10.0f32).try_sub(&UOp::native_const(3.0f32)).unwrap().dtype(), DType::Float32);
 }
