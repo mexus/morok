@@ -266,10 +266,12 @@ pub fn split_store(_ctx: &mut Vec<Arc<UOp>>, x: &Arc<UOp>) -> Option<Arc<UOp>> {
 
     trace!(uop_id = x.id, op = ?std::mem::discriminant(x.op()), "split_store: entering");
 
-    // If any ranges are still open here, this is not a kernel boundary.
-    // END(STORE) nodes that close their full output range have empty in-scope
-    // ranges after ended_ranges() is applied.
-    if !x.in_scope_ranges().is_empty() {
+    // DEVICE ranges are launch lanes and remain open across a callable boundary.
+    // Any computational range still makes this an interior STORE.
+    if x.in_scope_ranges()
+        .iter()
+        .any(|range| !matches!(range.0.op(), Op::Range { axis_type: svod_ir::AxisType::Device, .. }))
+    {
         return None;
     }
 

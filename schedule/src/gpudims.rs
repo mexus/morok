@@ -45,6 +45,13 @@ pub fn pm_add_gpudims() -> TypedPatternMatcher<Renderer> {
         @context Renderer;
         // add gpudims must be last
         sink @ Sink { sources: _sources } => |sink| add_gpudims(ctx, sink),
+    }
+}
+
+/// DEVICE ranges are launch bindings, independent of GPU thread-dimension
+/// support. Run this for every renderer before the capability-gated GPU pass.
+pub fn pm_lower_device_ranges() -> TypedPatternMatcher {
+    crate::patterns! {
         // DEVICE is bound at launch, not dispatched as a program axis.
         range @ Range { end: _, axis_id: _, axis_type }
             if *axis_type == AxisType::Device => |range| lower_device_range(range),

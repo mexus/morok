@@ -501,6 +501,29 @@ fn test_split_store_open_loop_range_returns_none() {
 }
 
 #[test]
+fn test_split_store_open_device_range_splits() {
+    let buffer = UOp::new_buffer(DeviceSpec::Cpu, 2, DType::Float32);
+    let device = UOp::range_axis(UOp::index_const(2), AxisId::Renumbered(0), AxisType::Device);
+    let idx = UOp::index().buffer(buffer).indices(vec![device]).call().unwrap();
+    let store = idx.store(UOp::native_const(1.0f32));
+
+    assert!(!store.in_scope_ranges().is_empty());
+    assert!(call_split_store(&store).is_some(), "DEVICE is a launch lane, not a computational loop");
+}
+
+#[test]
+fn test_split_store_open_device_and_loop_ranges_does_not_split() {
+    let buffer = UOp::new_buffer(DeviceSpec::Cpu, 4, DType::Float32);
+    let device = UOp::range_axis(UOp::index_const(2), AxisId::Renumbered(0), AxisType::Device);
+    let loop_range = UOp::range_axis(UOp::index_const(2), AxisId::Renumbered(1), AxisType::Loop);
+    let index = device.mul(&UOp::index_const(2)).add(&loop_range);
+    let idx = UOp::index().buffer(buffer).indices(vec![index]).call().unwrap();
+    let store = idx.store(UOp::native_const(1.0f32));
+
+    assert!(call_split_store(&store).is_none(), "open LOOP must remain an interior STORE");
+}
+
+#[test]
 fn test_split_store_open_outer_range_returns_none() {
     let buffer = UOp::new_buffer(DeviceSpec::Cpu, 64, DType::Float32);
     let range = UOp::range_axis(UOp::index_const(4), AxisId::Renumbered(0), AxisType::Loop);

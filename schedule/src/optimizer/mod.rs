@@ -640,10 +640,11 @@ fn apply_post_optimization_configured_with_capture(
     print_stage("11-local_buffers", &with_local_buffers);
 
     let t_stage = std::time::Instant::now();
+    let with_device_ranges = graph_rewrite(&crate::gpudims::pm_lower_device_ranges(), with_local_buffers, &mut ());
     let with_gpudims = if renderer.has_local || renderer.has_threads {
-        graph_rewrite(&pm_add_gpudims(), with_local_buffers, &mut renderer.clone())
+        graph_rewrite(&pm_add_gpudims(), with_device_ranges, &mut renderer.clone())
     } else {
-        with_local_buffers
+        with_device_ranges
     };
     tracing::debug!(
         ast.optimized = with_gpudims.tree(),

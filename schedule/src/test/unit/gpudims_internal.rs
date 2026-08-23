@@ -68,7 +68,7 @@ fn test_device_range_lowers_and_end_drops_all_params() {
     let other = UOp::variable("other".to_string(), 0, 7, DType::Index);
     let computation = device.add(&UOp::const_(DType::Index, ConstValue::Int(1)));
     let ended = computation.end(smallvec::smallvec![device, other]);
-    let lowered = crate::rewrite::graph_rewrite(&pm_add_gpudims(), ended, &mut Renderer::amd_cdna3());
+    let lowered = crate::rewrite::graph_rewrite(&pm_lower_device_ranges(), ended, &mut ());
 
     let Op::End { ranges, .. } = lowered.op() else { panic!("target keeps an empty END") };
     assert!(ranges.is_empty(), "Tinygrad removes every PARAM when _device_num is present");
@@ -76,6 +76,16 @@ fn test_device_range_lowers_and_end_drops_all_params() {
         lowered.toposort().into_iter().find(|uop| is_device_num(uop)).expect("DEVICE range should become _device_num");
     assert_eq!(device_num.dtype(), DType::Index);
     assert_eq!(device_num.vmax(), &ConstValue::Int(3));
+}
+
+#[test]
+fn test_device_range_lowers_without_gpu_dimension_capability() {
+    let range =
+        UOp::range_axis_dtype(UOp::native_const(2i32), svod_ir::AxisId::Renumbered(0), AxisType::Device, DType::Int32);
+    let lowered = crate::rewrite::graph_rewrite(&pm_lower_device_ranges(), range, &mut ());
+    assert!(matches!(lowered.op(), Op::Param { arg, .. } if arg.name.as_deref() == Some("_device_num")));
+    assert_eq!(lowered.vmin().try_int(), Some(0));
+    assert_eq!(lowered.vmax().try_int(), Some(1));
 }
 
 #[test]
