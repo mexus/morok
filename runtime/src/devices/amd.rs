@@ -20,6 +20,9 @@ use svod_device::registry::DeviceRegistry;
 use svod_dtype::{AmdArch, DeviceSpec};
 use svod_ir::UOp;
 
+use crate::clang::ClangToolchain;
+use crate::object_cache::{CompilerIdentity, OBJECT_CACHE_SCHEMA, ObjectCache, ObjectCacheKey};
+
 /// Create an `AMD:N` device end-to-end (allocator + renderer + compiler +
 /// runtime). The arch is queried from KFD topology at device-open time and
 /// stored on the opened `AmdDevice` (NOT in the `DeviceSpec`). The
@@ -29,7 +32,20 @@ pub fn create_amd_device(registry: &DeviceRegistry, device_id: usize, arch: AmdA
     let spec = DeviceSpec::Amd { device_id };
     let allocator = registry.get(&spec)?;
     let renderer = Arc::new(AmdRendererWrapper { device: spec.clone(), arch });
-    let compiler = Arc::new(AmdCompiler { arch });
+    let cache = ObjectCache::from_env().map_err(runtime_as_device)?.map(Arc::new);
+    let toolchain = ClangToolchain::discover(cache.as_deref()).map_err(runtime_as_device)?;
+    let flags = crate::amd::compile::amd_object_flags(arch);
+    let identity = CompilerIdentity {
+        schema: OBJECT_CACHE_SCHEMA,
+        backend: "amd-clang".into(),
+        target_architecture: format!("amdgcn-amd-amdhsa/{}", arch.mcpu()),
+        toolchain: toolchain.identity().into(),
+        flags,
+        abi: format!("amdhsa-kernel-abi-v1;wave-size={}", arch.wave_size()),
+        object_format: "elf64-amdgpu-code-object-relocatable-v1".into(),
+    };
+    let cache_key = identity.cache_key();
+    let compiler = Arc::new(AmdCompiler { arch, cache, toolchain, identity, cache_key });
     // Build the per-device process-shared state: the signal pool (singleton
     // per physical AMD:N, lives on AmdDeviceCore). Each `ExecutionPlan` /
     // `AmdGraph` / per-call `Program::execute` leases or builds its OWN
@@ -162,19 +178,38 @@ impl Renderer for AmdRendererWrapper {
 
 struct AmdCompiler {
     arch: AmdArch,
+    cache: Option<Arc<ObjectCache>>,
+    toolchain: ClangToolchain,
+    identity: CompilerIdentity,
+    cache_key: String,
 }
 
 impl Compiler for AmdCompiler {
     fn compile(&self, spec: &ProgramSpec) -> Result<CompiledSpec> {
-        let bytes = crate::amd::compile_ir_to_amd_object(&spec.src, self.arch)
-            .map_err(|e| svod_device::Error::Runtime { message: format!("AMD clang compile failed: {e}") })?;
+        let key = ObjectCacheKey::new(spec.src.as_bytes(), self.identity.clone());
+        let bytes = if let Some(cache) = &self.cache {
+            cache.get_or_compile(
+                &key,
+                |bytes| crate::amd::compile::validate_amd_object(bytes, self.arch, &spec.name),
+                || crate::amd::compile::compile_ir_to_amd_object_with(&self.toolchain, &spec.src, self.arch),
+            )
+        } else {
+            crate::amd::compile::compile_ir_to_amd_object_with(&self.toolchain, &spec.src, self.arch).and_then(
+                |bytes| crate::amd::compile::validate_amd_object(&bytes, self.arch, &spec.name).map(|()| bytes),
+            )
+        }
+        .map_err(runtime_as_device)?;
         let mut compiled = CompiledSpec::from_bytes(spec.name.clone(), bytes, spec.ast.clone(), spec.abi.clone())?;
         compiled.global_size = spec.global_size.clone();
         compiled.local_size = spec.local_size.clone();
         Ok(compiled)
     }
 
-    fn cache_key(&self) -> &'static str {
-        "amd-clang"
+    fn cache_key(&self) -> &str {
+        &self.cache_key
     }
+}
+
+fn runtime_as_device(error: crate::Error) -> svod_device::Error {
+    svod_device::Error::Runtime { message: error.to_string() }
 }

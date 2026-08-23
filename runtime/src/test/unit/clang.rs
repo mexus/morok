@@ -42,3 +42,16 @@ void add_kernel(float* restrict a, float* restrict b, float* restrict out) {
 
     assert_eq!(out[0], 3.0);
 }
+
+#[test]
+fn cpu_object_validation_checks_header_and_entry_symbol() {
+    let toolchain = ClangToolchain::discover(None).unwrap();
+    let flags = c_object_flags();
+    let object = compile_c_object(&toolchain, "void cached_kernel(void) {}\n", &flags).unwrap();
+    validate_c_object(&object, "cached_kernel").unwrap();
+    assert!(validate_c_object(&object, "other_kernel").is_err());
+
+    let mut wrong_machine = object;
+    wrong_machine[18..20].copy_from_slice(&0xffffu16.to_le_bytes());
+    assert!(validate_c_object(&wrong_machine, "cached_kernel").is_err());
+}

@@ -916,11 +916,11 @@ pub trait Compiler: Send + Sync {
     /// ```
     fn compile(&self, spec: &ProgramSpec) -> Result<CompiledSpec>;
 
-    /// Cache key identifying this compiler backend.
+    /// Cache key identifying the exact compiler configuration.
     ///
-    /// Used to differentiate compiled artifacts when the same device type
-    /// can have multiple compiler backends (e.g., clang vs llvm-jit).
-    fn cache_key(&self) -> &'static str;
+    /// This includes the backend and all target/toolchain/ABI settings that can
+    /// affect bytes, not merely a family name such as `clang`.
+    fn cache_key(&self) -> &str;
 }
 
 /// A renderer that transforms UOp graphs into source code.
@@ -1079,10 +1079,10 @@ impl Device {
     ) -> Self {
         let compilers = vec![(renderer.clone(), compiler.clone())];
         let runtime_device = device.clone();
-        let runtime_compiler_key = compiler.cache_key();
+        let runtime_compiler_key = compiler.cache_key().to_string();
         let raw_runtime = runtime;
         let runtime: RuntimeFactory = Arc::new(move |spec| {
-            spec.validate_stage_identity(&runtime_device, runtime_compiler_key)?;
+            spec.validate_stage_identity(&runtime_device, &runtime_compiler_key)?;
             raw_runtime(spec)
         });
         Self { device, allocator, compilers, renderer, compiler, runtime, graph: None }

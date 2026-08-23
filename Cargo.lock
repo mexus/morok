@@ -3574,6 +3574,7 @@ dependencies = [
  "papaya",
  "parking_lot 0.12.5",
  "rayon",
+ "sha2",
  "smallvec",
  "snafu 0.8.9",
  "svod-codegen",

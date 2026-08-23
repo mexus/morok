@@ -7,6 +7,91 @@ use svod_device::registry::DeviceRegistry;
 use svod_ir::UOp;
 
 #[test]
+fn llvm_jit_emits_reusable_object_bytes() {
+    use svod_device::device::ProgramSpec;
+    use svod_dtype::DeviceSpec;
+
+    let registry = DeviceRegistry::default();
+    let device = create_cpu_device_with_backend(&registry, CpuBackend::Llvm).unwrap();
+    let spec = ProgramSpec::new(
+        "source_only".into(),
+        "define void @source_only() { ret void }".into(),
+        DeviceSpec::Cpu,
+        UOp::sink(vec![]),
+    );
+    let compiled = device.compiler.compile(&spec).unwrap();
+    assert!(compiled.src.is_none());
+    assert!(!compiled.bytes.is_empty());
+    crate::clang::validate_relocatable_object(&compiled.bytes, "source_only").unwrap();
+    assert!(device.compiler.cache_key().starts_with("cpu-llvm-clang:"));
+}
+
+#[cfg(unix)]
+#[test]
+fn clang_object_cache_survives_fresh_process_without_invoking_clang() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Command;
+
+    const HELPER: &str = "SVOD_TEST_CLANG_CACHE_CHILD";
+    if std::env::var_os(HELPER).is_some() {
+        use svod_device::device::ProgramSpec;
+        use svod_dtype::DeviceSpec;
+
+        let registry = DeviceRegistry::default();
+        let device = create_cpu_device_with_backend(&registry, CpuBackend::Clang).unwrap();
+        let spec = ProgramSpec::new(
+            "fresh_process_kernel".into(),
+            "void fresh_process_kernel(float *out) { out[0] = 7.0f; }\n".into(),
+            DeviceSpec::Cpu,
+            UOp::sink(vec![]),
+        );
+        let compiled = device.compiler.compile(&spec).unwrap();
+        assert!(!compiled.bytes.is_empty());
+        return;
+    }
+
+    let directory = tempfile::tempdir().unwrap();
+    let bin = directory.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let count = directory.path().join("clang-invocations");
+    let real_clang = Command::new("sh").args(["-c", "command -v clang"]).output().unwrap();
+    assert!(real_clang.status.success());
+    let real_clang = std::fs::canonicalize(String::from_utf8(real_clang.stdout).unwrap().trim()).unwrap();
+    let wrapper = bin.join("clang");
+    std::fs::write(
+        &wrapper,
+        format!("#!/bin/sh\nprintf 'invoked\\n' >> '{}'\nexec '{}' \"$@\"\n", count.display(), real_clang.display()),
+    )
+    .unwrap();
+    let mut permissions = std::fs::metadata(&wrapper).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&wrapper, permissions).unwrap();
+
+    let test_name = std::thread::current().name().unwrap().to_string();
+    let executable = std::env::current_exe().unwrap();
+    let mut paths = vec![bin];
+    paths.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap()));
+    let path = std::env::join_paths(paths).unwrap();
+    let run_child = || {
+        Command::new(&executable)
+            .args(["--exact", &test_name, "--nocapture"])
+            .env(HELPER, "1")
+            .env("PATH", &path)
+            .env("SVOD_OBJECT_CACHE_DIR", directory.path().join("cache"))
+            .env("SVOD_OBJECT_CACHE_MAX_BYTES", "10485760")
+            .status()
+            .unwrap()
+    };
+
+    assert!(run_child().success());
+    let cold_count = std::fs::read_to_string(&count).unwrap().lines().count();
+    assert!(cold_count >= 3, "cold process must probe version/target and compile");
+    assert!(run_child().success());
+    let warm_count = std::fs::read_to_string(&count).unwrap().lines().count();
+    assert_eq!(warm_count, cold_count, "warm fresh process invoked clang");
+}
+
+#[test]
 fn test_cpu_device_creation_llvm() {
     let registry = DeviceRegistry::default();
     let device =
@@ -14,7 +99,7 @@ fn test_cpu_device_creation_llvm() {
 
     // Verify device properties
     assert_eq!(device.base_device_key(), "CPU");
-    assert_eq!(device.compiler.cache_key(), "llvm-jit");
+    assert!(device.compiler.cache_key().starts_with("cpu-llvm-clang:"));
 }
 
 #[test]
@@ -39,8 +124,8 @@ entry:
 
     // Test 1: Compile
     let compiled = device.compiler.compile(&spec).expect("Compile should succeed");
-    assert!(compiled.src.is_some(), "LLVM JIT should have source");
-    assert!(compiled.bytes.is_empty(), "LLVM JIT should have empty bytes");
+    assert!(compiled.src.is_none(), "LLVM compiler should hand reusable object bytes to runtime");
+    assert!(!compiled.bytes.is_empty(), "LLVM compiler should emit a relocatable object");
     assert_eq!(compiled.name, "test_kernel");
 
     // Direct-source compilation remains supported, but executable loading requires
@@ -85,11 +170,9 @@ fn test_compile_invalid_ir() {
     let sink = UOp::sink(vec![]);
     let spec = ProgramSpec::new("test".to_string(), "this is not valid LLVM IR".to_string(), DeviceSpec::Cpu, sink);
 
-    // Compilation should fail gracefully
-    // Note: Current implementation doesn't validate, so this will pass
-    // TODO: Add LLVM IR validation to LlvmCompiler
+    // Object emission validates LLVM IR before it can reach the runtime.
     let result = device.compiler.compile(&spec);
-    assert!(result.is_ok(), "Should return CompiledSpec even with invalid IR (validation TODO)");
+    assert!(result.is_err(), "invalid LLVM IR must fail during object compilation");
 }
 
 #[test]

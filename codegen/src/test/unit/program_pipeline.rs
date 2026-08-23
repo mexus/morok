@@ -638,7 +638,7 @@ impl Compiler for MockCompiler {
         Ok(compiled)
     }
 
-    fn cache_key(&self) -> &'static str {
+    fn cache_key(&self) -> &str {
         "mock"
     }
 }
@@ -650,7 +650,7 @@ impl Compiler for PanicCompiler {
         panic!("compiler should not be invoked when PROGRAM already has BINARY")
     }
 
-    fn cache_key(&self) -> &'static str {
+    fn cache_key(&self) -> &str {
         "mock"
     }
 }
@@ -662,7 +662,7 @@ impl Compiler for OtherCompiler {
         panic!("compiler-key mismatch must be rejected before compilation")
     }
 
-    fn cache_key(&self) -> &'static str {
+    fn cache_key(&self) -> &str {
         "other"
     }
 }

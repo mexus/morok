@@ -6,6 +6,230 @@
 //! With `dlopen-fallback` feature: compiles via `clang -shared -O2` and loads
 //! the resulting shared library via `dlopen` for kernel execution.
 
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+
+use object::read::{Object, ObjectSymbol};
+use object::{Architecture, BinaryFormat, Endianness, ObjectKind};
+use sha2::{Digest, Sha256};
+
+use crate::error::JitResultExt;
+use crate::object_cache::ObjectCache;
+use crate::{Error, Result};
+
+/// Resolved Clang executable plus an exact persisted identity. The executable
+/// digest makes replacement unambiguous; `--version` remains in the identity
+/// for diagnostics and toolchain-version auditability.
+#[derive(Debug, Clone)]
+pub(crate) struct ClangToolchain {
+    executable: PathBuf,
+    executable_digest: [u8; 32],
+    identity: String,
+}
+
+impl ClangToolchain {
+    pub(crate) fn discover(cache: Option<&ObjectCache>) -> Result<Self> {
+        let executable = resolve_executable("clang")?;
+        let executable_bytes = std::fs::read(&executable).jit("read clang executable")?;
+        let executable_digest: [u8; 32] = Sha256::digest(&executable_bytes).into();
+        let probe_input = executable_digest;
+        let version = if let Some(cache) = cache {
+            cache.get_or_create_probe("clang-version", &probe_input, || run_probe(&executable, &["--version"]))?
+        } else {
+            run_probe(&executable, &["--version"])?
+        };
+        let version = String::from_utf8(version)
+            .map_err(|error| Error::JitCompilation { reason: format!("clang --version was not UTF-8: {error}") })?;
+        let identity =
+            format!("path={};sha256={};version={}", executable.display(), hex(&executable_digest), version.trim());
+        Ok(Self { executable, executable_digest, identity })
+    }
+
+    pub(crate) fn identity(&self) -> &str {
+        &self.identity
+    }
+
+    pub(crate) fn target_identity(&self, cache: Option<&ObjectCache>, flags: &[String]) -> Result<String> {
+        let mut probe_input = Vec::new();
+        probe_input.extend_from_slice(&self.executable_digest);
+        for flag in flags {
+            probe_input.extend_from_slice(&(flag.len() as u64).to_le_bytes());
+            probe_input.extend_from_slice(flag.as_bytes());
+        }
+        let create = || {
+            let mut command = Command::new(&self.executable);
+            command.args(flags).arg("-###").stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+            let output = command.output().jit("probe clang target architecture")?;
+            if !output.status.success() {
+                return Err(Error::JitCompilation {
+                    reason: format!("clang target probe failed:\n{}", String::from_utf8_lossy(&output.stderr)),
+                });
+            }
+            let mut identity = output.stderr;
+            identity.extend_from_slice(&output.stdout);
+            Ok(identity)
+        };
+        let output = if let Some(cache) = cache {
+            cache.get_or_create_probe("clang-target", &probe_input, create)?
+        } else {
+            create()?
+        };
+        String::from_utf8(output)
+            .map_err(|error| Error::JitCompilation { reason: format!("clang target probe was not UTF-8: {error}") })
+    }
+
+    pub(crate) fn command(&self) -> Command {
+        Command::new(&self.executable)
+    }
+}
+
+pub(crate) fn c_object_flags() -> Vec<String> {
+    #[cfg(feature = "dlopen-fallback")]
+    {
+        let march = match std::env::consts::ARCH {
+            "x86_64" | "loongarch64" => "-march=native",
+            "riscv64" => "-march=rv64g",
+            _ => "-mcpu=native",
+        };
+        let mut flags = vec!["-shared", "-O2", march, "-fPIC", "-fno-math-errno", "-fno-ident", "-lm", "-x", "c"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+        flags.push("-ffixed-x18".into());
+        flags.extend(["-", "-o", "<temporary-shared-object>"].map(str::to_string));
+        flags
+    }
+    #[cfg(not(feature = "dlopen-fallback"))]
+    {
+        crate::jit_loader::c_object_flags()
+    }
+}
+
+pub(crate) fn compile_c_object(toolchain: &ClangToolchain, src: &str, flags: &[String]) -> Result<Vec<u8>> {
+    #[cfg(not(feature = "dlopen-fallback"))]
+    {
+        let mut child = toolchain
+            .command()
+            .args(flags)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .jit("spawn clang (is clang installed?)")?;
+        child.stdin.take().expect("stdin was piped").write_all(src.as_bytes()).jit("write source to clang stdin")?;
+        let output = child.wait_with_output().jit("wait for clang")?;
+        if !output.status.success() {
+            return Err(Error::JitCompilation {
+                reason: format!(
+                    "clang compilation failed:\n{}\nSource:\n{src}",
+                    String::from_utf8_lossy(&output.stderr)
+                ),
+            });
+        }
+        if output.stdout.is_empty() {
+            return Err(Error::JitCompilation { reason: "clang produced empty output".into() });
+        }
+        Ok(output.stdout)
+    }
+    #[cfg(feature = "dlopen-fallback")]
+    {
+        let directory = tempfile::tempdir().jit("create clang output directory")?;
+        let output_path = directory.path().join("kernel.so");
+        let mut args = flags.to_vec();
+        *args.last_mut().expect("C flags have output placeholder") = output_path.display().to_string();
+        let mut child = toolchain
+            .command()
+            .args(&args)
+            .stdin(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .jit("spawn clang shared-object compiler")?;
+        child.stdin.take().expect("stdin was piped").write_all(src.as_bytes()).jit("write source to clang stdin")?;
+        let output = child.wait_with_output().jit("wait for clang shared-object compiler")?;
+        if !output.status.success() {
+            return Err(Error::JitCompilation {
+                reason: format!("clang shared-object compilation failed:\n{}", String::from_utf8_lossy(&output.stderr)),
+            });
+        }
+        std::fs::read(output_path).jit("read clang shared object")
+    }
+}
+
+pub(crate) fn validate_c_object(bytes: &[u8], symbol: &str) -> Result<()> {
+    #[cfg(not(feature = "dlopen-fallback"))]
+    let expected_kind = ObjectKind::Relocatable;
+    #[cfg(feature = "dlopen-fallback")]
+    let expected_kind = ObjectKind::Dynamic;
+    validate_host_object(bytes, symbol, expected_kind)
+}
+
+pub(crate) fn validate_relocatable_object(bytes: &[u8], symbol: &str) -> Result<()> {
+    validate_host_object(bytes, symbol, ObjectKind::Relocatable)
+}
+
+fn validate_host_object(bytes: &[u8], symbol: &str, expected_kind: ObjectKind) -> Result<()> {
+    let file = object::File::parse(bytes).jit("parse cached CPU object")?;
+    if file.format() != BinaryFormat::Elf
+        || file.endianness() != host_endianness()
+        || file.architecture() != host_architecture()?
+    {
+        return Err(Error::JitCompilation { reason: "cached CPU object has incompatible ELF target".into() });
+    }
+    if file.kind() != expected_kind {
+        return Err(Error::JitCompilation {
+            reason: format!("cached CPU object kind {:?} does not match expected {expected_kind:?}", file.kind()),
+        });
+    }
+    if !file.symbols().any(|candidate| candidate.is_definition() && candidate.name() == Ok(symbol)) {
+        return Err(Error::JitCompilation { reason: format!("cached CPU object has no entry symbol {symbol:?}") });
+    }
+    Ok(())
+}
+
+fn host_architecture() -> Result<Architecture> {
+    match std::env::consts::ARCH {
+        "x86_64" => Ok(Architecture::X86_64),
+        "aarch64" => Ok(Architecture::Aarch64),
+        "riscv64" => Ok(Architecture::Riscv64),
+        "loongarch64" => Ok(Architecture::LoongArch64),
+        "powerpc64" => Ok(Architecture::PowerPc64),
+        arch => Err(Error::JitCompilation { reason: format!("unsupported CPU object architecture {arch}") }),
+    }
+}
+
+fn host_endianness() -> Endianness {
+    if cfg!(target_endian = "little") { Endianness::Little } else { Endianness::Big }
+}
+
+fn resolve_executable(name: &str) -> Result<PathBuf> {
+    let path = std::env::var_os("PATH").ok_or_else(|| Error::JitCompilation { reason: "PATH is not set".into() })?;
+    for directory in std::env::split_paths(&path) {
+        let candidate = directory.join(name);
+        if candidate.is_file() {
+            return candidate.canonicalize().jit("canonicalize clang executable");
+        }
+    }
+    Err(Error::JitCompilation { reason: format!("{name} not found in PATH") })
+}
+
+fn run_probe(executable: &Path, args: &[&str]) -> Result<Vec<u8>> {
+    let output = Command::new(executable).args(args).output().jit("run clang identity probe")?;
+    if !output.status.success() {
+        return Err(Error::JitCompilation {
+            reason: format!("clang identity probe failed:\n{}", String::from_utf8_lossy(&output.stderr)),
+        });
+    }
+    let mut bytes = output.stdout;
+    bytes.extend_from_slice(&output.stderr);
+    Ok(bytes)
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
 // Default: JIT ELF loader (no temp files, no dlopen)
 #[cfg(not(feature = "dlopen-fallback"))]
 pub use crate::jit_loader::JitKernel as ClangKernel;
@@ -39,50 +263,26 @@ mod dlopen_impl {
             var_names: Vec<String>,
             abi: &[svod_device::device::AbiParamDescriptor],
         ) -> Result<Self> {
-            use std::io::Write;
-
             let buffer_count = abi.iter().filter(|arg| arg.is_storage()).count();
             svod_device::device::validate_abi_descriptors(abi, buffer_count, &var_names)?;
+            let toolchain = super::ClangToolchain::discover(None)?;
+            let flags = super::c_object_flags();
+            let bytes = super::compile_c_object(&toolchain, src, &flags)?;
+            Self::load_object_with_abi(&bytes, name, var_names, abi)
+        }
 
-            let tmp_dir = tempfile::tempdir().jit("create temp directory")?;
-
-            let src_path = tmp_dir.path().join(format!("{name}.c"));
+        pub fn load_object_with_abi(
+            bytes: &[u8],
+            name: &str,
+            var_names: Vec<String>,
+            abi: &[svod_device::device::AbiParamDescriptor],
+        ) -> Result<Self> {
+            let buffer_count = abi.iter().filter(|arg| arg.is_storage()).count();
+            svod_device::device::validate_abi_descriptors(abi, buffer_count, &var_names)?;
+            super::validate_c_object(bytes, name)?;
+            let tmp_dir = tempfile::tempdir().jit("create shared-object load directory")?;
             let so_path = tmp_dir.path().join(format!("{name}.so"));
-
-            let mut src_file = std::fs::File::create(&src_path).jit("create source file")?;
-            src_file.write_all(src.as_bytes()).jit("write source file")?;
-            drop(src_file);
-
-            // On ARM, `-mcpu=native` enables CPU-specific tuning. `-march=native`
-            // only sets the base ISA family on ARM.
-            let march = match std::env::consts::ARCH {
-                "x86_64" | "loongarch64" => "-march=native",
-                "riscv64" => "-march=rv64g",
-                _ => "-mcpu=native",
-            };
-            let mut args = vec!["-shared", "-O2", march, "-fPIC", "-fno-math-errno", "-fno-ident", "-lm"];
-            // Reserve x18 only on macOS ARM, where the kernel clobbers it on
-            // context switch. Linux ARM treats x18 as a free GPR; Windows ARM
-            // is not a target svod currently supports.
-            #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-            args.push("-ffixed-x18");
-            let so_str = so_path.to_str().ok_or_else(|| crate::Error::JitCompilation {
-                reason: format!("temp .so path is not valid UTF-8: {}", so_path.display()),
-            })?;
-            let src_str = src_path.to_str().ok_or_else(|| crate::Error::JitCompilation {
-                reason: format!("temp source path is not valid UTF-8: {}", src_path.display()),
-            })?;
-            args.extend_from_slice(&["-o", so_str, src_str]);
-            let output =
-                std::process::Command::new("clang").args(&args).output().jit("run clang (is clang installed?)")?;
-
-            if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                return Err(crate::Error::JitCompilation {
-                    reason: format!("clang compilation failed:\n{stderr}\nSource:\n{src}"),
-                });
-            }
-
+            std::fs::write(&so_path, bytes).jit("write cached shared object")?;
             let lib = unsafe { libloading::Library::new(&so_path).jit("load shared library")? };
 
             let fn_ptr = unsafe {

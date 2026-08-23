@@ -35,6 +35,7 @@ pub mod jit_loader;
 pub mod kernel_cache;
 pub mod leveling;
 pub mod llvm;
+pub mod object_cache;
 pub mod profiler;
 
 #[cfg(test)]

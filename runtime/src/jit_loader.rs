@@ -35,8 +35,22 @@ impl JitKernel {
     ) -> crate::Result<Self> {
         let buffer_count = abi.iter().filter(|arg| arg.is_storage()).count();
         svod_device::device::validate_abi_descriptors(abi, buffer_count, &var_names)?;
-        let obj = compile_to_object(src)?;
-        let (fn_ptr, mmap) = jit_load(&obj, name)?;
+        let toolchain = crate::clang::ClangToolchain::discover(None)?;
+        let flags = c_object_flags();
+        let object = crate::clang::compile_c_object(&toolchain, src, &flags)?;
+        Self::load_object_with_abi(&object, name, var_names, abi)
+    }
+
+    pub fn load_object_with_abi(
+        object: &[u8],
+        name: &str,
+        var_names: Vec<String>,
+        abi: &[svod_device::device::AbiParamDescriptor],
+    ) -> crate::Result<Self> {
+        let buffer_count = abi.iter().filter(|arg| arg.is_storage()).count();
+        svod_device::device::validate_abi_descriptors(abi, buffer_count, &var_names)?;
+        crate::clang::validate_c_object(object, name)?;
+        let (fn_ptr, mmap) = jit_load(object, name)?;
         let cif = KernelCif::from_abi(abi);
         Ok(Self { _mmap: mmap, fn_ptr, name: name.to_string(), var_names, cif })
     }
@@ -52,6 +66,7 @@ impl JitKernel {
         Ok(())
     }
 
+    #[cfg(not(feature = "dlopen-fallback"))]
     pub(crate) fn cif(&self) -> &KernelCif {
         &self.cif
     }
@@ -98,11 +113,7 @@ pub(crate) fn platform_clang_flags() -> &'static [&'static str] {
     }
 }
 
-/// Pipe C source to clang via stdin, receive relocatable object from stdout.
-fn compile_to_object(src: &str) -> crate::Result<Vec<u8>> {
-    use std::io::Write;
-    use std::process::{Command, Stdio};
-
+pub(crate) fn c_object_flags() -> Vec<String> {
     let arch = std::env::consts::ARCH;
 
     // Architecture-specific tuning. On ARM, `-march=native` only sets the
@@ -117,7 +128,7 @@ fn compile_to_object(src: &str) -> crate::Result<Vec<u8>> {
 
     let target = elf_target_triple();
 
-    let mut args = vec![
+    let args = vec![
         "-c",
         "-x",
         "c",
@@ -130,34 +141,11 @@ fn compile_to_object(src: &str) -> crate::Result<Vec<u8>> {
         "-nostdlib",
         "-fno-ident",
     ];
-    args.push(&target);
-    args.extend_from_slice(platform_clang_flags());
-    args.extend_from_slice(&["-", "-o", "-"]);
-
-    let mut child = Command::new("clang")
-        .args(&args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .jit("spawn clang (is clang installed?)")?;
-
-    child.stdin.take().expect("stdin was piped").write_all(src.as_bytes()).jit("write source to clang stdin")?;
-
-    let output = child.wait_with_output().jit("wait for clang")?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(crate::Error::JitCompilation {
-            reason: format!("clang compilation failed:\n{stderr}\nSource:\n{src}"),
-        });
-    }
-
-    if output.stdout.is_empty() {
-        return Err(crate::Error::JitCompilation { reason: "clang produced empty output".to_string() });
-    }
-
-    Ok(output.stdout)
+    let mut flags = args.into_iter().map(str::to_string).collect::<Vec<_>>();
+    flags.push(target);
+    flags.extend(platform_clang_flags().iter().map(|flag| (*flag).to_string()));
+    flags.extend(["-", "-o", "-"].map(str::to_string));
+    flags
 }
 
 // ── ELF Loading ─────────────────────────────────────────────────────────────

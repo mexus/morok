@@ -49,4 +49,7 @@ attributes #0 = { alwaysinline nounwind "no-builtins" "amdgpu-flat-work-group-si
     assert!(!obj.is_empty(), "empty AMD code object");
     // AMDGPU code objects are ELF; check the magic header.
     assert_eq!(&obj[..4], b"\x7fELF", "output is not ELF");
+    validate_amd_object(&obj, AmdArch::Gfx1100, "amd_smoke").expect("valid gfx1100 object");
+    assert!(validate_amd_object(&obj, AmdArch::Gfx1101, "amd_smoke").is_err(), "wrong target arch must fail");
+    assert!(validate_amd_object(&obj, AmdArch::Gfx1100, "other_kernel").is_err(), "wrong kernel must fail");
 }

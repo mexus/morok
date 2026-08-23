@@ -50,9 +50,24 @@ impl LlvmKernel {
             }
         }
         let obj = compile_ir_to_object(ir)?;
-        let (fn_ptr, mmap) = crate::jit_loader::jit_load(&obj, &entry_point)?;
+        Self::load_object_with_abi(&obj, entry_point, name, var_names, abi)
+    }
+
+    pub fn load_object_with_abi(
+        object: &[u8],
+        entry_point: impl Into<String>,
+        name: impl Into<String>,
+        var_names: Vec<String>,
+        abi: &[svod_device::device::AbiParamDescriptor],
+    ) -> Result<Self> {
+        let entry_point = entry_point.into();
+        let name = name.into();
+        let buffer_count = abi.iter().filter(|arg| arg.is_storage()).count();
+        svod_device::device::validate_abi_descriptors(abi, buffer_count, &var_names)?;
+        crate::clang::validate_relocatable_object(object, &entry_point)?;
+        let (fn_ptr, mmap) = crate::jit_loader::jit_load(object, &entry_point)?;
         let cif = KernelCif::from_abi(abi);
-        debug!(kernel.name = %name, "LLVM kernel compiled and loaded");
+        debug!(kernel.name = %name, "LLVM kernel object loaded");
         Ok(Self { _mmap: mmap, fn_ptr, entry_point, name, var_names, cif })
     }
 
@@ -103,11 +118,11 @@ impl LlvmKernel {
 /// (same as the C path in jit_loader), so the JIT ELF loader can handle
 /// relocations consistently.
 fn compile_ir_to_object(ir: &str) -> Result<Vec<u8>> {
-    use std::io::Write;
-    use std::process::{Command, Stdio};
+    let toolchain = crate::clang::ClangToolchain::discover(None)?;
+    compile_ir_to_object_with(&toolchain, ir, &llvm_object_flags())
+}
 
-    let target = crate::jit_loader::elf_target_triple();
-
+pub(crate) fn llvm_object_flags() -> Vec<String> {
     let mut args = vec![
         "-x",
         "ir",
@@ -120,13 +135,27 @@ fn compile_ir_to_object(ir: &str) -> Result<Vec<u8>> {
         "-funroll-loops",
         "-fvectorize",
         "-fslp-vectorize",
-    ];
-    args.push(&target);
-    args.extend_from_slice(crate::jit_loader::platform_clang_flags());
-    args.extend_from_slice(&["-", "-o", "-"]);
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect::<Vec<_>>();
+    args.push(crate::jit_loader::elf_target_triple());
+    args.extend(crate::jit_loader::platform_clang_flags().iter().map(|flag| (*flag).to_string()));
+    args.extend(["-", "-o", "-"].map(str::to_string));
+    args
+}
 
-    let mut child = Command::new("clang")
-        .args(&args)
+pub(crate) fn compile_ir_to_object_with(
+    toolchain: &crate::clang::ClangToolchain,
+    ir: &str,
+    args: &[String],
+) -> Result<Vec<u8>> {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let mut child = toolchain
+        .command()
+        .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
