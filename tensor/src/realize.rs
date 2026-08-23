@@ -768,7 +768,10 @@ pub(crate) fn normalize_for_schedule_cache(sink: &Arc<UOp>) -> Result<ScheduleCa
             s
         });
         ctx.param_buffers.push((node.id, node.clone()));
-        RewriteResult::Rewritten(UOp::param(slot, size, node.dtype(), arg.device.clone()))
+        RewriteResult::Rewritten(
+            UOp::param(slot, size, node.dtype(), arg.device.clone())
+                .with_tag(smallvec::smallvec![svod_ir::uop::canonical::TAG_SCHEDULE_CACHE_PARAM]),
+        )
     });
 
     // Strip runtime value from BIND for cache-key stability and collect var_vals.
@@ -860,14 +863,22 @@ pub(crate) fn restore_post_schedule_cache(root: &Arc<UOp>, normalization: &Sched
 
     for node in root.toposort() {
         match node.op() {
-            Op::Param { arg, .. } if arg.device.is_some() => {
+            Op::Param { arg, .. }
+                if node
+                    .tag()
+                    .as_ref()
+                    .is_some_and(|tags| tags.contains(&svod_ir::uop::canonical::TAG_SCHEDULE_CACHE_PARAM)) =>
+            {
                 if let Some(original) = normalization.param_values.get(arg.slot) {
                     let restored_original = restore_post_schedule_cache(original, normalization);
                     subs.insert(UOpKey(node.clone()), restored_original);
                 }
             }
             Op::Buffer { arg, .. } => {
-                let schedule_local = arg.slot & (1usize << (usize::BITS - 1)) != 0;
+                let schedule_local = node
+                    .tag()
+                    .as_ref()
+                    .is_some_and(|tags| tags.contains(&svod_ir::uop::canonical::TAG_SCHEDULE_LOCAL_BUFFER));
                 if arg.addrspace != Some(svod_ir::AddrSpace::Global) || !schedule_local {
                     continue;
                 }
@@ -901,7 +912,7 @@ pub(crate) fn restore_post_schedule_cache(root: &Arc<UOp>, normalization: &Sched
 /// `pre_schedule` is cached with normalized PARAM placeholders; this helper
 /// restores source/output buffer UOps to run-specific BUFFER identities while
 /// callable identities/ASTs stay cached.
-fn restore_post_schedule_pre_schedule(
+pub(crate) fn restore_post_schedule_pre_schedule(
     pre_schedule: &crate::schedule::PreSchedule,
     normalization: &ScheduleCacheNormalization,
 ) -> crate::schedule::PreSchedule {
@@ -930,10 +941,11 @@ fn restore_post_schedule_pre_schedule(
         let end = cursor + source_count;
         let sources = restored_flat[cursor..end].to_vec();
         cursor = end;
-        let ast = restore_post_schedule_cache(&item.ast, normalization);
         restored_items.push(crate::schedule::PreScheduleItem {
             kernel: item.kernel.clone(),
-            ast,
+            // Callable bodies contain codegen PARAM formals. Only CALL args
+            // and output identities are restored to concrete runtime buffers.
+            ast: item.ast.clone(),
             sources,
             dependencies: item.dependencies.clone(),
             bound_ranges: item.bound_ranges.clone(),
@@ -1082,7 +1094,7 @@ fn resolve_compiled_kernel_buffer_indices(
     Ok(buffer_indices)
 }
 
-type OptKey = (u64, DeviceSpec, &'static str, u64);
+type OptKey = (u64, DeviceSpec, String, u64);
 
 /// Bounded global cache for optimized + compiled kernels keyed by AST hash.
 ///
@@ -1344,12 +1356,12 @@ fn prepare_execution_plan(
             .find(|spec| !spec.is_disk())
             .unwrap_or_else(svod_dtype::default_device::default_device);
         let item_device = config.resolve_device(&item_device_spec, alloc_registry)?;
-        let item_codegen: &'static str = item_device.compiler.cache_key();
+        let item_codegen = item_device.compiler.cache_key();
 
         let opt_key = (
             crate::schedule_cache::content_hash(&item.ast),
             item_device.device.clone(),
-            item_codegen,
+            item_codegen.to_string(),
             optimizer_fingerprint,
         );
 
@@ -1560,7 +1572,7 @@ fn compile_with_program_pipeline_components(
 }
 
 /// Resolve the device string for cache keying (includes compiler cache key).
-pub(crate) fn resolve_codegen(param_buffers: &[(u64, Arc<UOp>)], config: &PrepareConfig) -> Result<&'static str> {
+pub(crate) fn resolve_codegen(param_buffers: &[(u64, Arc<UOp>)], config: &PrepareConfig) -> Result<String> {
     let alloc_registry = svod_device::registry::registry();
     let spec = param_buffers
         .iter()
@@ -1578,7 +1590,7 @@ pub(crate) fn resolve_codegen(param_buffers: &[(u64, Arc<UOp>)], config: &Prepar
         })
         .unwrap_or_else(svod_dtype::default_device::default_device);
     let device = config.resolve_device(&spec, alloc_registry)?;
-    Ok(device.compiler.cache_key())
+    Ok(device.compiler.cache_key().to_string())
 }
 
 /// Get the optimizer renderer for a device.

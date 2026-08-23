@@ -562,6 +562,10 @@ fn canonical_padding_values(value: &Arc<UOp>) -> crate::Result<Vec<usize>> {
 /// Tag carried only by rangeify-created global buffers whose high-bit slot is
 /// an internal cache-restoration namespace rather than semantic PROGRAM ABI.
 pub const TAG_SCHEDULE_LOCAL_BUFFER: usize = usize::MAX - 2;
+/// Tag on PARAMs created for the callable ABI after rangeify.
+pub const TAG_CODEGEN_PARAM: usize = usize::MAX - 3;
+/// Tag on global PARAM placeholders used only by the schedule cache.
+pub const TAG_SCHEDULE_CACHE_PARAM: usize = usize::MAX - 4;
 
 fn canonical_arg(node: &Arc<UOp>, ids: &HashMap<u64, usize>, verbose: bool) -> crate::Result<CanonicalArg> {
     Ok(match node.op() {

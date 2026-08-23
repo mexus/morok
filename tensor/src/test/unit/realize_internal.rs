@@ -208,26 +208,24 @@ fn test_restore_post_schedule_pre_schedule_rewrites_runtime_buf_uops() {
     let pre_schedule_cached = crate::schedule::create_pre_schedule(kernel_graph_cached).expect("pre schedule");
 
     assert!(
-        pre_schedule_cached
-            .items
-            .iter()
-            .flat_map(|item| item.sources.iter())
-            .any(|src| matches!(src.op(), Op::Param { arg, .. } if arg.device.is_some())),
+        pre_schedule_cached.items.iter().flat_map(|item| item.sources.iter()).any(|src| {
+            src.tag().as_ref().is_some_and(|tags| tags.contains(&svod_ir::uop::canonical::TAG_SCHEDULE_CACHE_PARAM))
+        }),
         "cached pre-schedule should keep normalized PARAM placeholders"
     );
 
     let restored = restore_post_schedule_pre_schedule(&pre_schedule_cached, &normalization);
 
     assert!(
-        restored
-            .items
-            .iter()
-            .flat_map(|item| item.sources.iter())
-            .all(|src| !matches!(src.op(), Op::Param { arg, .. } if arg.device.is_some())),
+        restored.items.iter().flat_map(|item| item.sources.iter()).all(|src| {
+            !src.tag().as_ref().is_some_and(|tags| tags.contains(&svod_ir::uop::canonical::TAG_SCHEDULE_CACHE_PARAM))
+        }),
         "restored pre-schedule should rewrite callable source PARAM placeholders"
     );
     assert!(
-        restored.output_buffer_uops.iter().all(|u| !matches!(u.op(), Op::Param { arg, .. } if arg.device.is_some())),
+        restored.output_buffer_uops.iter().all(|u| {
+            !u.tag().as_ref().is_some_and(|tags| tags.contains(&svod_ir::uop::canonical::TAG_SCHEDULE_CACHE_PARAM))
+        }),
         "restored pre-schedule should rewrite output buffer PARAM placeholders"
     );
     assert!(
@@ -236,11 +234,9 @@ fn test_restore_post_schedule_pre_schedule_rewrites_runtime_buf_uops() {
     );
 
     assert!(
-        pre_schedule_cached
-            .items
-            .iter()
-            .flat_map(|item| item.sources.iter())
-            .any(|src| matches!(src.op(), Op::Param { arg, .. } if arg.device.is_some())),
+        pre_schedule_cached.items.iter().flat_map(|item| item.sources.iter()).any(|src| {
+            src.tag().as_ref().is_some_and(|tags| tags.contains(&svod_ir::uop::canonical::TAG_SCHEDULE_CACHE_PARAM))
+        }),
         "restoring should not mutate cached pre-schedule"
     );
 }

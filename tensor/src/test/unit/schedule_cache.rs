@@ -97,7 +97,7 @@ fn test_prepare_with_reuses_same_schedule_cache_entry() {
     );
 }
 
-fn batch_cache_key(tensors: &[&Tensor], cfg: &PrepareConfig) -> (u64, &'static str) {
+fn batch_cache_key(tensors: &[&Tensor], cfg: &PrepareConfig) -> (u64, String) {
     let sink = UOp::sink(tensors.iter().map(|t| t.uop().contiguous()).collect());
     let normalized = crate::realize::normalize_for_schedule_cache(&sink).expect("normalize cache key");
     let codegen = crate::realize::resolve_codegen(&normalized.param_buffers, cfg).expect("batch codegen");
@@ -114,12 +114,14 @@ fn test_resolve_codegen_skips_disk_buffers() {
         .resolve_device(&svod_dtype::DeviceSpec::Cpu, registry)
         .expect("CPU device should resolve")
         .compiler
-        .cache_key();
+        .cache_key()
+        .to_string();
     let expected_default = config
         .resolve_device(&svod_dtype::default_device::default_device(), registry)
         .expect("default device should resolve")
         .compiler
-        .cache_key();
+        .cache_key()
+        .to_string();
 
     let disk = UOp::new_buffer(
         svod_dtype::DeviceSpec::Disk { path: std::path::PathBuf::from("weights.bin") },
@@ -361,7 +363,8 @@ fn test_post_sched_cache_restore_materializes_runtime_buffers() {
         svod_ir::AddrSpace::Global,
         Some(svod_dtype::DeviceSpec::Cpu),
     );
-    let placeholder = UOp::new(Op::Buffer { shape, arg }, DType::Float32);
+    let placeholder = UOp::new(Op::Buffer { shape, arg }, DType::Float32)
+        .with_tag(smallvec::smallvec![svod_ir::uop::canonical::TAG_SCHEDULE_LOCAL_BUFFER]);
     let root = UOp::sink(vec![placeholder]);
 
     let normalization = crate::realize::ScheduleCacheNormalization {
@@ -378,7 +381,7 @@ fn test_post_sched_cache_restore_materializes_runtime_buffers() {
 }
 
 #[test]
-fn test_post_sched_cache_restore_rewrites_call_boundary_params() {
+fn test_post_sched_cache_restore_keeps_codegen_params_inside_call_body() {
     crate::test::helpers::test_setup();
 
     let c = &Tensor::from_slice([1.0f32, 2.0, 3.0]) + &Tensor::from_slice([4.0f32, 5.0, 6.0]);
@@ -388,15 +391,27 @@ fn test_post_sched_cache_restore_rewrites_call_boundary_params() {
     let rangeify = svod_schedule::rangeify_with_map(normalization.normalized.clone()).unwrap();
     let (kernel_graph, _) = svod_schedule::try_get_kernel_graph(rangeify.sink).unwrap();
 
-    let restored = crate::realize::restore_post_schedule_cache(&kernel_graph, &normalization);
+    let pre_schedule = crate::schedule::create_pre_schedule(kernel_graph).unwrap();
+    let restored = crate::realize::restore_post_schedule_pre_schedule(&pre_schedule, &normalization);
 
     assert!(
-        restored.toposort().iter().all(|n| !matches!(n.op(), Op::Param { arg, .. } if arg.device.is_some())),
-        "restored callable graph should not retain normalized PARAM placeholders"
+        restored.items.iter().flat_map(|item| &item.sources).all(|source| matches!(source.op(), Op::Buffer { .. })),
+        "CALL arguments must restore to runtime buffers"
     );
     assert!(
-        restored.toposort().iter().all(|n| !matches!(n.op(), Op::LUnique(_))),
-        "restored callable graph should not retain LUNIQUE placeholders"
+        restored.items.iter().all(|item| item.ast.toposort().iter().any(|node| {
+            matches!(node.op(), Op::Param { .. })
+                && node.tag().as_ref().is_some_and(|tags| tags.contains(&svod_ir::uop::canonical::TAG_CODEGEN_PARAM))
+        })),
+        "callable bodies must retain codegen PARAM formals"
+    );
+    assert!(
+        restored.items.iter().all(|item| item
+            .ast
+            .toposort()
+            .iter()
+            .all(|node| !matches!(node.op(), Op::Buffer { .. }))),
+        "codegen AST must not contain runtime BUFFERs"
     );
 }
 

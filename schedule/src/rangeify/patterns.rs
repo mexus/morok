@@ -27,10 +27,17 @@ use crate::rangeify::transforms::{cast_to_dtype, get_range_size, partition_reduc
 
 pub use crate::devectorize::pm_add_loads;
 
-const TAG_CODEGEN_PARAM: usize = usize::MAX - 3;
-
 fn is_codegen_param(node: &Arc<UOp>) -> bool {
-    matches!(node.op(), Op::Param { .. }) && node.tag().as_ref().is_some_and(|tags| tags.contains(&TAG_CODEGEN_PARAM))
+    matches!(node.op(), Op::Param { .. })
+        && node.tag().as_ref().is_some_and(|tags| tags.contains(&svod_ir::uop::canonical::TAG_CODEGEN_PARAM))
+}
+
+fn mark_codegen_param(node: Arc<UOp>) -> Arc<UOp> {
+    let mut tags = node.tag().clone().unwrap_or_default();
+    if !tags.contains(&svod_ir::uop::canonical::TAG_CODEGEN_PARAM) {
+        tags.push(svod_ir::uop::canonical::TAG_CODEGEN_PARAM);
+    }
+    node.with_tag(tags)
 }
 
 // Forward declarations for types from other modules
@@ -914,8 +921,12 @@ pub fn local_to_param_patterns() -> TypedPatternMatcher<LocalAddBufferContext> {
         // structured compiler-managed allocations and must not consume slots.
         buf @ Buffer { arg } if arg.addrspace == Some(AddrSpace::Global) => |buf, ctx| {
             let size = buf.buffer_size()?;
-            let replacement = UOp::param(ctx.next_param_slot(), size, extract_base_dtype(buf.dtype()), arg.device.clone())
-                .with_tag(smallvec::smallvec![TAG_CODEGEN_PARAM]);
+            let replacement = mark_codegen_param(UOp::param(
+                ctx.next_param_slot(),
+                size,
+                extract_base_dtype(buf.dtype()),
+                arg.device.clone(),
+            ));
             if !ctx.has_buffer(buf) {
                 ctx.map_buffer(buf.clone(), buf.clone());
             }
@@ -929,8 +940,7 @@ pub fn local_to_param_patterns() -> TypedPatternMatcher<LocalAddBufferContext> {
             let Op::Param { shape, .. } = buf.op() else { unreachable!() };
             let mut arg = arg.clone();
             arg.slot = ctx.next_param_slot();
-            let replacement = UOp::new(Op::Param { shape: shape.clone(), arg }, buf.dtype())
-                .with_tag(smallvec::smallvec![TAG_CODEGEN_PARAM]);
+            let replacement = mark_codegen_param(UOp::new(Op::Param { shape: shape.clone(), arg }, buf.dtype()).rtag(buf.tag().clone()));
             if !ctx.has_buffer(buf) {
                 ctx.map_buffer(buf.clone(), buf.clone());
             }

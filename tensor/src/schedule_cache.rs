@@ -23,8 +23,8 @@ pub(crate) fn content_hash(uop: &UOp) -> u64 {
     uop.content_hash
 }
 
-/// Cache key: (content_hash of normalized sink, codegen backend string).
-type ScheduleCacheKey = (u64, &'static str);
+/// Cache key: (content hash of normalized sink, exact compiler identity).
+type ScheduleCacheKey = (u64, String);
 
 /// Cached output of rangeify + try_get_kernel_graph pipeline.
 ///
@@ -41,8 +41,8 @@ pub(crate) struct CachedSchedule {
 
 /// Global schedule-level cache.
 ///
-/// Keyed by (content_hash, codegen_backend) so identical computations
-/// on the same backend share the cached pipeline output.
+/// Keyed by content and exact compiler identity so target, toolchain, flags,
+/// ABI, and object-format changes cannot replay an incompatible schedule.
 static SCHEDULE_CACHE: OnceLock<HashMap<ScheduleCacheKey, Arc<CachedSchedule>>> = OnceLock::new();
 
 pub(crate) fn schedule_cache() -> &'static HashMap<ScheduleCacheKey, Arc<CachedSchedule>> {
@@ -54,7 +54,7 @@ pub(crate) fn schedule_cache() -> &'static HashMap<ScheduleCacheKey, Arc<CachedS
 /// Uses pre-schedule cache normalization (BUFFER->PARAM + strip BIND
 /// runtime values), then content-hashes the result.
 #[cfg(test)]
-pub(crate) fn cache_key_for(tensor: &crate::Tensor, config: &crate::PrepareConfig) -> Option<(u64, &'static str)> {
+pub(crate) fn cache_key_for(tensor: &crate::Tensor, config: &crate::PrepareConfig) -> Option<(u64, String)> {
     let sink = UOp::sink(vec![tensor.uop().contiguous()]);
     let normalized = crate::realize::normalize_for_schedule_cache(&sink).ok()?;
     let param_buffers = normalized.param_buffers;
