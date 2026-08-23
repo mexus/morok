@@ -130,3 +130,23 @@ fn mock_allocation_outcomes_are_scripted_fifo() {
     assert_eq!(iface.allocation_count(), 1);
     alloc.free(buffer, 64, &BufferSpec::default());
 }
+
+#[test]
+fn user_buffer_free_failed_drain_poisons_and_quarantines_allocation() {
+    let iface = Arc::new(MockAmdIface::default());
+    let alloc = mock_allocator(&iface);
+    alloc.dev.core().install_signal_pool(crate::amd::signal::SignalPool::new(&alloc, 64).unwrap());
+    let pool = crate::amd::connector::PoolQueue::new_with_resources(Arc::clone(alloc.dev.core()), &alloc).unwrap();
+    let buffer = alloc.alloc(64, &BufferSpec::default(), false).unwrap();
+    let allocations = iface.allocation_count();
+    pool.next_pm4();
+    iface.script_wait(Err(Error::AmdIoctl { ioctl: "mock user-buffer drain", errno: 5 }));
+
+    alloc.free(buffer, 64, &BufferSpec::default());
+    assert!(alloc.dev.is_poisoned());
+    assert_eq!(iface.allocation_count(), allocations);
+    assert_eq!(iface.free_count(), 0);
+    assert_eq!(iface.live_handle_count(), allocations);
+    drop(pool);
+    assert_eq!(iface.free_count(), 0);
+}

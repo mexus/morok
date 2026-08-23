@@ -140,7 +140,7 @@ impl AmdLinkedPlan {
         let max_private = programs.iter().map(|p| p.private_segment_size()).max().unwrap_or(0);
         lane.ensure_has_local_memory(max_private)?;
         let pm4 = lane.queue().is_pm4();
-        let allocator = crate::amd::AmdAllocator::new(programs[0].device_id())?;
+        let allocator = owner.allocator();
         let mut offsets = vec![None; calls.len()];
         let mut bytes = 0usize;
         for (operation, call) in calls.iter().enumerate() {
@@ -505,6 +505,8 @@ impl AmdLinkedPlan {
             let mut copy_publication = (!copy_lengths.is_empty())
                 .then(|| copy_queue.unwrap().prepare_linked_publication(&copy_lengths))
                 .transpose()?;
+            owner.core().publication_checkpoint(crate::amd::iface::PublicationStage::AfterReservation)?;
+            owner.core().publication_checkpoint(crate::amd::iface::PublicationStage::BeforeDoorbell)?;
 
             // Device-wide drains must see this final point before the first
             // doorbell. A partial publication poisons the core; a host-only
@@ -544,6 +546,7 @@ impl AmdLinkedPlan {
                     QueueKind::Copy(_) => copy_publication.as_mut().unwrap().publish(&submission.replay),
                 }
                 published = true;
+                owner.core().publication_checkpoint(crate::amd::iface::PublicationStage::AfterDoorbell)?;
             }
             if let Some(publication) = publication {
                 publication.publish();

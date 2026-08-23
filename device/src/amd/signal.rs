@@ -286,6 +286,12 @@ impl Timeline {
         self.value.fetch_add(1, Ordering::AcqRel)
     }
 
+    /// Undo the most recent reservation before its doorbell was rung. Queue
+    /// publication authority guarantees there can be no later reservation.
+    pub(crate) fn rollback(&self, reserved: u64) -> bool {
+        self.value.compare_exchange(reserved + 1, reserved, Ordering::AcqRel, Ordering::Acquire).is_ok()
+    }
+
     /// Highest value reserved so far (the value the next `signal` packet writes
     /// is `current()`; the last reserved is `current() - 1`).
     #[inline]

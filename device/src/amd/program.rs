@@ -593,10 +593,6 @@ impl AmdProgram {
         &self.dev
     }
 
-    pub(crate) fn device_id(&self) -> usize {
-        self.device_id
-    }
-
     /// `kd.kernarg_size` — byte count of one kernarg record (ABI padded).
     pub fn kernarg_record_size(&self) -> usize {
         self.kernarg_size()

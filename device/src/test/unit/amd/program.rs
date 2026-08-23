@@ -1,5 +1,8 @@
-use super::test_support::{amd_alloc_or_skip, require_multi_xcc, require_single_xcc};
+use super::test_support::{MockAmdIface, amd_alloc_or_skip, require_multi_xcc, require_single_xcc};
+use crate::amd::AmdAllocator;
 use crate::amd::program::*;
+use crate::error::Error;
+use std::sync::Arc;
 
 /// Serializes the `#[ignore]` PM4-graph probes that toggle the per-device
 /// `pm4_graph` flag. The flag lives on the process-global (`DEVICE_CACHE`-backed)
@@ -129,6 +132,249 @@ fn clang_amdgcn(ir: &str, mcpu: &str) -> Option<Vec<u8>> {
         return None;
     }
     Some(out.stdout)
+}
+
+#[test]
+fn mock_program_code_allocation_is_balanced_on_success_and_failure() {
+    let ir = r#"target triple = "amdgcn-amd-amdhsa"
+define amdgpu_kernel void @mock_program() #0 {
+entry:
+  ret void
+}
+attributes #0 = { nounwind "amdgpu-flat-work-group-size"="1,1" }
+"#;
+    let Some(bytes) = clang_amdgcn(ir, "gfx1100") else {
+        eprintln!("skipping: clang amdgcn target unavailable");
+        return;
+    };
+
+    let iface = Arc::new(MockAmdIface::default());
+    let device = iface.device();
+    let allocator = AmdAllocator { dev: Arc::clone(&device), device_id: 0 };
+    let program = AmdProgram::load(device, &allocator, &bytes, "mock_program", &[]).expect("program load");
+    assert_eq!((iface.allocation_count(), iface.live_handle_count()), (1, 1));
+    drop(program);
+    assert_eq!((iface.free_count(), iface.live_handle_count()), (1, 0));
+
+    let iface = Arc::new(MockAmdIface::default());
+    let device = iface.device();
+    let allocator = AmdAllocator { dev: Arc::clone(&device), device_id: 0 };
+    iface.script_alloc(Err(Error::Runtime { message: "scripted code allocation".into() }));
+    assert!(AmdProgram::load(device, &allocator, &bytes, "mock_program", &[]).is_err());
+    assert_eq!((iface.allocation_count(), iface.free_count(), iface.live_handle_count()), (0, 0, 0));
+}
+
+#[test]
+fn mock_program_post_allocation_validation_reclaims_code() {
+    let ir = r#"target triple = "amdgcn-amd-amdhsa"
+declare ptr addrspace(4) @llvm.amdgcn.dispatch.ptr()
+define amdgpu_kernel void @dispatch_ptr_program() #0 {
+entry:
+  %dispatch = call ptr addrspace(4) @llvm.amdgcn.dispatch.ptr()
+  %value = load volatile i8, ptr addrspace(4) %dispatch, align 1
+  ret void
+}
+attributes #0 = { nounwind "amdgpu-flat-work-group-size"="1,1" }
+"#;
+    let Some(bytes) = clang_amdgcn(ir, "gfx1100") else {
+        eprintln!("skipping: clang amdgcn target unavailable");
+        return;
+    };
+    let iface = Arc::new(MockAmdIface::default());
+    let device = iface.device();
+    let allocator = AmdAllocator { dev: Arc::clone(&device), device_id: 0 };
+    assert!(matches!(
+        AmdProgram::load(device, &allocator, &bytes, "dispatch_ptr_program", &[]),
+        Err(Error::Runtime { message }) if message.contains("ENABLE_SGPR_DISPATCH_PTR")
+    ));
+    assert_eq!((iface.allocation_count(), iface.free_count(), iface.live_handle_count()), (1, 1, 0));
+}
+
+#[test]
+fn mock_graph_capture_storage_unwinds_each_post_lane_allocation() {
+    let ir = r#"target triple = "amdgcn-amd-amdhsa"
+define amdgpu_kernel void @graph_program() #0 {
+entry:
+  ret void
+}
+attributes #0 = { nounwind "amdgpu-flat-work-group-size"="1,1" }
+"#;
+    let Some(bytes) = clang_amdgcn(ir, "gfx1100") else {
+        eprintln!("skipping: clang amdgcn target unavailable");
+        return;
+    };
+
+    for fail_at in 6..=8 {
+        let iface = Arc::new(MockAmdIface::default());
+        let device = iface.device();
+        let allocator = AmdAllocator { dev: Arc::clone(&device), device_id: 0 };
+        device.core().install_signal_pool(crate::amd::signal::SignalPool::new(&allocator, 64).expect("signal pool"));
+        device.core().set_pm4_graph(true);
+        let program = AmdProgram::load(Arc::clone(&device), &allocator, &bytes, "graph_program", &[]).unwrap();
+        let allocations_before = iface.allocation_count();
+        let frees_before = iface.free_count();
+        for _ in 0..fail_at {
+            iface.script_alloc(Ok(()));
+        }
+        iface.script_alloc(Err(Error::Runtime { message: "scripted graph allocation".into() }));
+        let kernels = [crate::device::GraphKernel {
+            program: &program,
+            buffers: Vec::new(),
+            vals: Vec::new(),
+            global_size: Some([1, 1, 1]),
+            local_size: Some([1, 1, 1]),
+            deps: Vec::new(),
+        }];
+        assert!(crate::amd::graph::AmdGraph::capture(&allocator, &kernels).is_err(), "fail_at={fail_at}");
+        assert_eq!(iface.allocation_count() - allocations_before, fail_at, "fail_at={fail_at}");
+        assert_eq!(iface.free_count() - frees_before, fail_at - 6, "fail_at={fail_at}");
+        assert!(iface.free_issues().is_empty());
+    }
+}
+
+#[test]
+fn mock_graph_success_drop_frees_kernarg_and_both_resident_streams_once() {
+    let ir = r#"target triple = "amdgcn-amd-amdhsa"
+define amdgpu_kernel void @graph_program() #0 {
+entry:
+  ret void
+}
+attributes #0 = { nounwind "amdgpu-flat-work-group-size"="1,1" }
+"#;
+    let Some(bytes) = clang_amdgcn(ir, "gfx1100") else {
+        eprintln!("skipping: clang amdgcn target unavailable");
+        return;
+    };
+    let iface = Arc::new(MockAmdIface::default());
+    let device = iface.device();
+    let allocator = AmdAllocator { dev: Arc::clone(&device), device_id: 0 };
+    device.core().install_signal_pool(crate::amd::signal::SignalPool::new(&allocator, 64).unwrap());
+    device.core().set_pm4_graph(true);
+    let program = AmdProgram::load(Arc::clone(&device), &allocator, &bytes, "graph_program", &[]).unwrap();
+    let kernels = [crate::device::GraphKernel {
+        program: &program,
+        buffers: Vec::new(),
+        vals: Vec::new(),
+        global_size: Some([1, 1, 1]),
+        local_size: Some([1, 1, 1]),
+        deps: Vec::new(),
+    }];
+    let allocations_before = iface.allocation_count();
+    let graph = crate::amd::graph::AmdGraph::capture(&allocator, &kernels).unwrap().expect("graph");
+    assert_eq!(iface.allocation_count() - allocations_before, 9);
+    drop(graph);
+    assert_eq!(iface.free_count(), 3);
+    assert!(iface.free_issues().is_empty());
+}
+
+#[test]
+fn mock_graph_failed_drain_quarantines_graph_program_and_queue_storage() {
+    let ir = r#"target triple = "amdgcn-amd-amdhsa"
+define amdgpu_kernel void @graph_program() #0 {
+entry:
+  ret void
+}
+attributes #0 = { nounwind "amdgpu-flat-work-group-size"="1,1" }
+"#;
+    let Some(bytes) = clang_amdgcn(ir, "gfx1100") else {
+        eprintln!("skipping: clang amdgcn target unavailable");
+        return;
+    };
+    let iface = Arc::new(MockAmdIface::default());
+    let device = iface.device();
+    let allocator = AmdAllocator { dev: Arc::clone(&device), device_id: 0 };
+    device.core().install_signal_pool(crate::amd::signal::SignalPool::new(&allocator, 64).unwrap());
+    device.core().set_pm4_graph(true);
+    let program = AmdProgram::load(Arc::clone(&device), &allocator, &bytes, "graph_program", &[]).unwrap();
+    let kernels = [crate::device::GraphKernel {
+        program: &program,
+        buffers: Vec::new(),
+        vals: Vec::new(),
+        global_size: Some([1, 1, 1]),
+        local_size: Some([1, 1, 1]),
+        deps: Vec::new(),
+    }];
+    let graph = crate::amd::graph::AmdGraph::capture(&allocator, &kernels).unwrap().expect("graph");
+    graph.replay(&[], &[]).expect("mock publication");
+    iface.script_wait(Err(Error::AmdIoctl { ioctl: "mock graph drain", errno: 5 }));
+    let allocations = iface.allocation_count();
+    drop(graph);
+    drop(program);
+    assert!(device.is_poisoned());
+    assert_eq!(iface.allocation_count(), allocations);
+    assert_eq!(iface.free_count(), 0);
+    assert_eq!(iface.live_handle_count(), allocations);
+}
+
+#[test]
+fn mock_linked_plan_capture_and_transactional_publication_own_storage() {
+    let ir = r#"target triple = "amdgcn-amd-amdhsa"
+define amdgpu_kernel void @linked_program() #0 {
+entry:
+  ret void
+}
+attributes #0 = { nounwind "amdgpu-flat-work-group-size"="1,1" }
+"#;
+    let Some(bytes) = clang_amdgcn(ir, "gfx1100") else {
+        eprintln!("skipping: clang amdgcn target unavailable");
+        return;
+    };
+    let iface = Arc::new(MockAmdIface::default());
+    let device = iface.device();
+    let allocator = AmdAllocator { dev: Arc::clone(&device), device_id: 0 };
+    device.core().install_signal_pool(crate::amd::signal::SignalPool::new(&allocator, 64).unwrap());
+    let program = AmdProgram::load(Arc::clone(&device), &allocator, &bytes, "linked_program", &[]).unwrap();
+    let pool = crate::amd::connector::PoolQueue::new_with_resources(Arc::clone(device.core()), &allocator).unwrap();
+    let owner = crate::amd::connector::OwnerCtx::new(Arc::clone(device.core()), allocator.clone());
+    let semantic = crate::hcq::SemanticLinkedPlan::from_lane_submissions(
+        vec![crate::hcq::LaneSubmission {
+            lane: crate::hcq::DeviceQueue {
+                device: svod_dtype::DeviceSpec::Amd { device_id: 0 },
+                queue: crate::hcq::QueueKind::Compute(0),
+            },
+            waits: Vec::new(),
+            commands: vec![crate::hcq::TopologyCommand { operation: 0, copy_leg: None }],
+            signal_value: 1,
+        }],
+        |_| [0x1000, 0x1008],
+    )
+    .unwrap();
+    let calls = [crate::device::PlanCall::Program {
+        program: &program,
+        buffers: &[],
+        vals: &[],
+        global_size: Some([1, 1, 1]),
+        local_size: Some([1, 1, 1]),
+    }];
+
+    let allocations = iface.allocation_count();
+    iface.script_alloc(Err(Error::Runtime { message: "scripted linked kernarg allocation".into() }));
+    assert!(crate::amd::AmdLinkedPlan::capture(&owner, &pool, &semantic, &calls).is_err());
+    assert_eq!(iface.allocation_count(), allocations);
+
+    let mut linked =
+        crate::amd::AmdLinkedPlan::capture(&owner, &pool, &semantic, &calls).unwrap().expect("linked plan");
+    assert_eq!(iface.allocation_count(), allocations + 1);
+
+    iface.script_publication(Err(Error::Runtime { message: "scripted linked after reservation".into() }));
+    let failure = linked.replay(&owner, &pool, &calls).unwrap_err();
+    assert!(!failure.published);
+    assert!(!device.is_poisoned());
+
+    iface.script_publication(Ok(()));
+    iface.script_publication(Err(Error::Runtime { message: "scripted linked before doorbell".into() }));
+    let failure = linked.replay(&owner, &pool, &calls).unwrap_err();
+    assert!(!failure.published);
+    assert!(!device.is_poisoned());
+
+    iface.script_publication(Ok(()));
+    iface.script_publication(Ok(()));
+    iface.script_publication(Err(Error::Runtime { message: "scripted linked after doorbell".into() }));
+    let failure = linked.replay(&owner, &pool, &calls).unwrap_err();
+    assert!(failure.published);
+    assert!(device.is_poisoned());
+    drop(linked);
+    assert_eq!(iface.free_count(), 0, "linked kernargs and all device storage must be quarantined");
 }
 
 /// PHASE-2 GATE (manual hardware probe; `#[ignore]`). Captures a static

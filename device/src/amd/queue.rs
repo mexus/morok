@@ -1226,6 +1226,102 @@ pub(crate) struct LinkedCopyPublication<'a> {
     inner: parking_lot::MutexGuard<'a, QueueInner>,
 }
 
+/// Rolls an unpublished queue-timeline reservation back on ordinary failure or
+/// panic. Once a doorbell has been rung, abandonment poisons the device instead.
+struct TimelineReservation<'a> {
+    pool: &'a PoolQueue,
+    core: &'a AmdDeviceCore,
+    value: u64,
+    published: bool,
+    committed: bool,
+    write_idx: Option<(*mut QueueInner, u64)>,
+}
+
+impl<'a> TimelineReservation<'a> {
+    fn new(pool: &'a PoolQueue, core: &'a AmdDeviceCore, value: u64) -> Self {
+        Self { pool, core, value, published: false, committed: false, write_idx: None }
+    }
+
+    fn track_write_idx(&mut self, inner: &mut QueueInner) {
+        self.write_idx = Some((inner, inner.write_idx));
+    }
+
+    fn mark_published(&mut self) {
+        self.published = true;
+    }
+
+    fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for TimelineReservation<'_> {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        if self.published {
+            self.core.poison("AMD queue publication failed after ringing its doorbell");
+        } else {
+            if let Some((inner, write_idx)) = self.write_idx {
+                // SAFETY: the reservation is declared after, and therefore
+                // drops before, the mutex guard that keeps `inner` stable.
+                unsafe { (*inner).write_idx = write_idx };
+            }
+            if !self.pool.rollback_pm4(self.value) {
+                self.core.poison("AMD timeline reservation rollback lost publication authority");
+            }
+        }
+    }
+}
+
+struct CopyTimelineReservation<'a> {
+    timeline: &'a Timeline,
+    core: &'a AmdDeviceCore,
+    value: u64,
+    published: bool,
+    committed: bool,
+    write_idx: Option<(*mut QueueInner, u64)>,
+}
+
+impl<'a> CopyTimelineReservation<'a> {
+    fn new(timeline: &'a Timeline, core: &'a AmdDeviceCore, value: u64) -> Self {
+        Self { timeline, core, value, published: false, committed: false, write_idx: None }
+    }
+
+    fn track_write_idx(&mut self, inner: &mut QueueInner) {
+        self.write_idx = Some((inner, inner.write_idx));
+    }
+
+    fn mark_published(&mut self) {
+        self.published = true;
+    }
+
+    fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for CopyTimelineReservation<'_> {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        if self.published {
+            self.core.poison("AMD copy publication failed after ringing its doorbell");
+        } else {
+            if let Some((inner, write_idx)) = self.write_idx {
+                // SAFETY: see TimelineReservation::drop; the queue mutex guard
+                // still owns this inner value while the reservation drops.
+                unsafe { (*inner).write_idx = write_idx };
+            }
+            if !self.timeline.rollback(self.value) {
+                self.core.poison("AMD copy timeline reservation rollback lost publication authority");
+            }
+        }
+    }
+}
+
 impl LinkedCopyPublication<'_> {
     pub(crate) fn publish(&mut self, replay: &crate::hcq::ReplayCommandBuffer) {
         push_sdma_bytes(&mut self.inner, replay.bytes());
@@ -1365,9 +1461,7 @@ impl AmdComputeQueue {
             std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
             let linked = crate::hcq::CommandBufferCache::default()
                 .link(&program.aql, &crate::hcq::LinkPatchValues(vec![control_gpu]))?;
-            let reserved = pool.next_pm4();
-            debug_assert_eq!(reserved, next, "queue lease must serialize timeline reservation");
-            self.submit_linked_aql(&linked.replay_buffer())?;
+            self.publish_linked_aql_timeline(pool, &linked.replay_buffer(), next)?;
             let finalizer = SubmissionFinalizer::timeline(Arc::clone(pool.pm4_signal()), next, timestamps.clone());
             return Ok(HcqDispatchResult { timestamps, finalizer });
         }
@@ -1445,8 +1539,19 @@ impl AmdComputeQueue {
         wait_pm4_headroom(&g, q.len()).inspect_err(|error| self.core.poison(&error.to_string()))?;
         let reserved = pool.next_pm4();
         debug_assert_eq!(reserved, next, "queue lease must serialize timeline reservation");
+        let mut reservation = TimelineReservation::new(pool, &self.core, reserved);
+        reservation.track_write_idx(&mut g);
+        self.core.publication_checkpoint(crate::amd::iface::PublicationStage::AfterReservation)?;
+        let write_idx = g.write_idx;
         g.push_pm4(&q);
+        if let Err(error) = self.core.publication_checkpoint(crate::amd::iface::PublicationStage::BeforeDoorbell) {
+            g.write_idx = write_idx;
+            return Err(error);
+        }
         g.ring_doorbell(/*is_pm4=*/ true);
+        reservation.mark_published();
+        self.core.publication_checkpoint(crate::amd::iface::PublicationStage::AfterDoorbell)?;
+        reservation.commit();
         let finalizer = SubmissionFinalizer::timeline(Arc::clone(pool.pm4_signal()), next, timestamps.clone());
         Ok(HcqDispatchResult { finalizer, timestamps })
     }
@@ -1509,9 +1614,23 @@ impl AmdComputeQueue {
         // as large as this replay and serializes mutation through its state lock.
         unsafe { std::ptr::copy_nonoverlapping(replay.bytes().as_ptr(), resident_host, replay.bytes().len()) };
         std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+        let mut g = self.inner.lock();
+        wait_pm4_headroom(&g, indirect.len()).inspect_err(|error| self.core.poison(&error.to_string()))?;
         let reserved = pool.next_pm4();
         debug_assert_eq!(reserved, next, "queue lease must serialize timeline reservation");
-        self.submit_dwords(&indirect)?;
+        let mut reservation = TimelineReservation::new(pool, &self.core, reserved);
+        reservation.track_write_idx(&mut g);
+        self.core.publication_checkpoint(crate::amd::iface::PublicationStage::AfterReservation)?;
+        let write_idx = g.write_idx;
+        g.push_pm4(&indirect);
+        if let Err(error) = self.core.publication_checkpoint(crate::amd::iface::PublicationStage::BeforeDoorbell) {
+            g.write_idx = write_idx;
+            return Err(error);
+        }
+        g.ring_doorbell(/*is_pm4=*/ true);
+        reservation.mark_published();
+        self.core.publication_checkpoint(crate::amd::iface::PublicationStage::AfterDoorbell)?;
+        reservation.commit();
         Ok(SubmissionFinalizer::timeline(Arc::clone(pool.pm4_signal()), next, None))
     }
 
@@ -1548,9 +1667,7 @@ impl AmdComputeQueue {
         std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
         linked.patch(replay, runtime, system)?;
         validate_aql_packet_count(replay.bytes().len() / AQL_PACKET_BYTES)?;
-        let reserved = pool.next_pm4();
-        debug_assert_eq!(reserved, next, "queue lease must serialize timeline reservation");
-        self.submit_linked_aql(replay)?;
+        self.publish_linked_aql_timeline(pool, replay, next)?;
         Ok(SubmissionFinalizer::timeline(Arc::clone(pool.pm4_signal()), next, None))
     }
 
@@ -1599,6 +1716,39 @@ impl AmdComputeQueue {
             })
             .collect::<Vec<_>>();
         self.submit_aql(&packets)
+    }
+
+    fn publish_linked_aql_timeline(
+        &self,
+        pool: &PoolQueue,
+        replay: &crate::hcq::ReplayCommandBuffer,
+        next: u64,
+    ) -> Result<()> {
+        if replay.bytes().len() % AQL_PACKET_BYTES != 0 {
+            return Err(Error::Runtime { message: "linked AQL stream is not packet aligned".into() });
+        }
+        let packets = replay.bytes().len() / AQL_PACKET_BYTES;
+        validate_aql_packet_count(packets)?;
+        let mut g = self.inner.lock();
+        wait_aql_headroom(&g, packets).inspect_err(|error| self.core.poison(&error.to_string()))?;
+        let reserved = pool.next_pm4();
+        debug_assert_eq!(reserved, next, "queue lease must serialize timeline reservation");
+        let mut reservation = TimelineReservation::new(pool, &self.core, reserved);
+        reservation.track_write_idx(&mut g);
+        self.core.publication_checkpoint(crate::amd::iface::PublicationStage::AfterReservation)?;
+        let write_idx = g.write_idx;
+        for packet in replay.bytes().chunks_exact(AQL_PACKET_BYTES) {
+            g.push_aql(packet);
+        }
+        if let Err(error) = self.core.publication_checkpoint(crate::amd::iface::PublicationStage::BeforeDoorbell) {
+            g.write_idx = write_idx;
+            return Err(error);
+        }
+        g.ring_doorbell(/*is_pm4=*/ false);
+        reservation.mark_published();
+        self.core.publication_checkpoint(crate::amd::iface::PublicationStage::AfterDoorbell)?;
+        reservation.commit();
+        Ok(())
     }
 
     pub(crate) fn prepare_linked_publication(&self, byte_lengths: &[usize]) -> Result<LinkedComputePublication<'_>> {
@@ -2024,6 +2174,7 @@ impl AmdCopyQueue {
             let copy_packets = size.div_ceil(sdma::SDMA_MAX_COPY_BYTES);
             wait_sdma_headroom(&g, copy_packets * 7 * 4 + 4 * 4)
                 .inspect_err(|error| self.core.poison(&error.to_string()))?;
+            let write_idx = g.write_idx;
             let mut off = 0usize;
             while off < size {
                 let n = (size - off).min(sdma::SDMA_MAX_COPY_BYTES);
@@ -2032,12 +2183,27 @@ impl AmdCopyQueue {
             }
             // Reserve + fence the timeline value the host waits on.
             let target = self.timeline.next();
+            let mut reservation = CopyTimelineReservation::new(&self.timeline, &self.core, target);
+            reservation.track_write_idx(&mut g);
+            if let Err(error) = self.core.publication_checkpoint(crate::amd::iface::PublicationStage::AfterReservation)
+            {
+                g.write_idx = write_idx;
+                return Err(error);
+            }
             push_sdma(&mut g, &sdma::fence(self.timeline.value_addr(), target as u32, self.core.arch.gfx_major()));
             // GART wptr first, then doorbell — same ordering as the compute
             // queue. SDMA doorbell + wptr are byte counters (= write_idx).
             unsafe { std::ptr::write_volatile(g.write_ptr_host.as_ptr(), g.write_idx) };
             std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+            if let Err(error) = self.core.publication_checkpoint(crate::amd::iface::PublicationStage::BeforeDoorbell) {
+                g.write_idx = write_idx;
+                unsafe { std::ptr::write_volatile(g.write_ptr_host.as_ptr(), write_idx) };
+                return Err(error);
+            }
             unsafe { std::ptr::write_volatile(g.doorbell.as_ptr(), g.write_idx) };
+            reservation.mark_published();
+            self.core.publication_checkpoint(crate::amd::iface::PublicationStage::AfterDoorbell)?;
+            reservation.commit();
             SubmissionFinalizer::timeline(Arc::clone(self.timeline.signal()), target, None)
         };
         // Wait for this submission's exact fence outside the queue lock. At the

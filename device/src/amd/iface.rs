@@ -65,6 +65,20 @@ pub trait AmdIface: Send + Sync + std::fmt::Debug {
     /// `Ok(Some(Error::Runtime{..}))` on a fault, `Ok(None)` on a normal
     /// wake-up/timeout, `Err` if the WAIT_EVENTS ioctl itself failed.
     fn wait_events(&self, timeout_ms: u32) -> Result<Option<Error>>;
+
+    /// Fault-injection checkpoint around queue publication. Production
+    /// backends keep the default no-op; the host mock scripts failures here to
+    /// prove reservation rollback and post-doorbell poisoning.
+    fn publication_checkpoint(&self, _stage: PublicationStage) -> Result<()> {
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PublicationStage {
+    AfterReservation,
+    BeforeDoorbell,
+    AfterDoorbell,
 }
 
 /// Result after KFD has definitively stopped a queue. A leaked doorbell mapping
@@ -235,8 +249,10 @@ impl KfdIface {
         if let Err(e) = unsafe { ioctl::kfd_create_event(kfd_fd.as_raw_fd(), &mut hw_event as *mut _) } {
             return Err(Error::AmdIoctl { ioctl: "AMDKFD_IOC_CREATE_EVENT(hw fault)", errno: e as i32 });
         }
+        let mut hardware_event = EventGuard::new(kfd_fd.as_raw_fd(), hw_event.event_id);
         queue_event.disarm();
         memory_event.disarm();
+        hardware_event.disarm();
 
         // The mailbox sits at event_page + slot_index * 8. SDMA fence packets
         // write the queue event_id here to wake up `WAIT_EVENTS` from `sleep()`.
@@ -267,6 +283,15 @@ impl KfdIface {
             va: VaRegistry::default(),
             fault_logged: AtomicBool::new(false),
         })
+    }
+}
+
+impl Drop for KfdIface {
+    fn drop(&mut self) {
+        for event_id in [self.queue_event_id, self.mem_fault_event_id, self.hw_fault_event_id] {
+            let mut args = kfd::kfd_ioctl_destroy_event_args { event_id, pad: 0 };
+            let _ = unsafe { ioctl::kfd_destroy_event(self.kfd_fd.as_raw_fd(), &mut args as *mut _) };
+        }
     }
 }
 

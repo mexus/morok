@@ -121,3 +121,19 @@ fn future_signal_wait_fails_without_another_backend_wait() {
     let waits_after = iface.transcript().iter().filter(|call| matches!(call, MockAmdCall::WaitEvents { .. })).count();
     assert_eq!(waits_after, waits_before, "future wait reached the backend despite device poison");
 }
+
+#[test]
+fn mock_signal_pool_construction_failure_and_drop_balance_backing() {
+    let iface = Arc::new(MockAmdIface::default());
+    let device = iface.device();
+    let allocator = AmdAllocator { dev: device, device_id: 0 };
+    iface.script_alloc(Err(Error::Runtime { message: "scripted signal allocation".into() }));
+    assert!(SignalPool::new(&allocator, 64).is_err());
+    assert_eq!((iface.allocation_count(), iface.free_count(), iface.live_handle_count()), (0, 0, 0));
+
+    let pool = SignalPool::new(&allocator, 64).unwrap();
+    assert_eq!(iface.live_handle_count(), 1);
+    drop(pool);
+    assert_eq!((iface.allocation_count(), iface.free_count(), iface.live_handle_count()), (1, 1, 0));
+    assert!(iface.free_issues().is_empty());
+}

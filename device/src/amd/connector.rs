@@ -398,6 +398,10 @@ impl PoolQueue {
         self.pm4_counter.next()
     }
 
+    pub(crate) fn rollback_pm4(&self, reserved: u64) -> bool {
+        self.pm4_counter.rollback(reserved)
+    }
+
     /// Highest submitted PM4 counter value (the value the next `signal` packet
     /// would write). A drain waits until the GPU has written `value - 1`.
     pub fn pm4_value(&self) -> u64 {
@@ -572,6 +576,10 @@ impl OwnerCtx {
     #[inline]
     pub fn core(&self) -> &Arc<AmdDeviceCore> {
         &self.core
+    }
+
+    pub(crate) fn allocator(&self) -> &AmdAllocator {
+        &self.allocator
     }
 
     pub fn lease(&self) -> Result<QueueLease> {

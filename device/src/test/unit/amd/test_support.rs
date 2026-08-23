@@ -15,7 +15,7 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 
 use crate::amd::device::AmdDevice;
-use crate::amd::iface::{AllocKind, AllocResult, AmdIface, QueueHandle, QueueTeardown, RingDesc};
+use crate::amd::iface::{AllocKind, AllocResult, AmdIface, PublicationStage, QueueHandle, QueueTeardown, RingDesc};
 use crate::amd::va_registry::AllocTag;
 use crate::error::{Error, Result};
 
@@ -29,6 +29,7 @@ pub(crate) enum MockAmdCall {
     SetupRing { ring_size: usize, queue_type: u32 },
     TeardownRing { queue_id: u32 },
     WaitEvents { timeout_ms: u32 },
+    PublicationCheckpoint { stage: PublicationStage },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -72,6 +73,11 @@ struct MockQueue {
     doorbell: MockAllocation,
 }
 
+enum MockPublicationOutcome {
+    Return(Result<()>),
+    Panic,
+}
+
 #[derive(Default)]
 struct MockAmdState {
     next_handle: u64,
@@ -87,6 +93,7 @@ struct MockAmdState {
     setup_script: VecDeque<Result<()>>,
     teardown_script: VecDeque<Result<QueueTeardown>>,
     wait_script: VecDeque<Result<Option<Error>>>,
+    publication_script: VecDeque<MockPublicationOutcome>,
     transcript: Vec<MockAmdCall>,
     free_issues: Vec<MockFreeIssue>,
 }
@@ -130,6 +137,14 @@ impl MockAmdIface {
 
     pub(crate) fn script_wait(&self, outcome: Result<Option<Error>>) {
         self.state.lock().wait_script.push_back(outcome);
+    }
+
+    pub(crate) fn script_publication(&self, outcome: Result<()>) {
+        self.state.lock().publication_script.push_back(MockPublicationOutcome::Return(outcome));
+    }
+
+    pub(crate) fn script_publication_panic(&self) {
+        self.state.lock().publication_script.push_back(MockPublicationOutcome::Panic);
     }
 
     pub(crate) fn allocation_count(&self) -> usize {
@@ -277,6 +292,16 @@ impl AmdIface for MockAmdIface {
             std::thread::sleep(std::time::Duration::from_millis(timeout_ms.into()));
         }
         Ok(None)
+    }
+
+    fn publication_checkpoint(&self, stage: PublicationStage) -> Result<()> {
+        let mut state = self.state.lock();
+        state.transcript.push(MockAmdCall::PublicationCheckpoint { stage });
+        match state.publication_script.pop_front() {
+            Some(MockPublicationOutcome::Return(outcome)) => outcome,
+            Some(MockPublicationOutcome::Panic) => panic!("scripted publication panic at {stage:?}"),
+            None => Ok(()),
+        }
     }
 }
 

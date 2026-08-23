@@ -250,6 +250,11 @@ impl AmdDevice {
     /// event-page setup so lifecycle tests can exercise the core on any host.
     #[cfg(test)]
     pub(crate) fn synthetic(iface: Arc<dyn crate::amd::iface::AmdIface>) -> Arc<Self> {
+        Self::synthetic_with_xcc(iface, 1)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn synthetic_with_xcc(iface: Arc<dyn crate::amd::iface::AmdIface>, num_xcc: u32) -> Arc<Self> {
         let node = AmdNode {
             node_id: 0,
             gpu_id: 1,
@@ -262,7 +267,7 @@ impl AmdDevice {
             max_waves_per_simd: 8,
             lds_size_in_kb: 64,
             wave_front_size: 32,
-            num_xcc: 1,
+            num_xcc,
             num_cp_queues: 1,
             max_slots_scratch_cu: 32,
         };
@@ -423,6 +428,19 @@ impl AmdDeviceCore {
     #[inline]
     pub(crate) fn iface(&self) -> &Arc<dyn crate::amd::iface::AmdIface> {
         &self.iface
+    }
+
+    #[inline]
+    pub(crate) fn publication_checkpoint(&self, stage: crate::amd::iface::PublicationStage) -> Result<()> {
+        #[cfg(test)]
+        {
+            return self.iface.publication_checkpoint(stage);
+        }
+        #[cfg(not(test))]
+        {
+            let _ = stage;
+            Ok(())
+        }
     }
 
     /// Borrow the process-global signal pool (lazy-installed by the device
@@ -601,9 +619,15 @@ pub(crate) fn ensure_event_page(kfd_fd: &OwnedFd, drm_fd: &OwnedFd, node: &AmdNo
             n_success: 0,
         };
         if let Err(e) = unsafe { ioctl::kfd_map_memory_to_gpu(kfd_fd.as_raw_fd(), &mut map_args as *mut _) } {
+            if map_args.n_success != 0 {
+                unmap_event_page_from_gpu(kfd_fd, ep.handle, node.gpu_id);
+            }
             return Err(Error::AmdIoctl { ioctl: "AMDKFD_IOC_MAP_MEMORY_TO_GPU(event page reuse)", errno: e as i32 });
         }
         if map_args.n_success != 1 {
+            if map_args.n_success != 0 {
+                unmap_event_page_from_gpu(kfd_fd, ep.handle, node.gpu_id);
+            }
             return Err(Error::AmdAllocFailed {
                 reason: format!("event-page reuse mapped to {} of 1 GPU(s)", map_args.n_success),
             });
@@ -621,6 +645,17 @@ pub(crate) fn ensure_event_page(kfd_fd: &OwnedFd, drm_fd: &OwnedFd, node: &AmdNo
     let ep = allocation.commit();
     *g = Some(ep);
     Ok(ep)
+}
+
+fn unmap_event_page_from_gpu(kfd_fd: &OwnedFd, handle: u64, gpu_id: u32) {
+    let mut gpu_id = gpu_id;
+    let mut args = kfd::kfd_ioctl_unmap_memory_from_gpu_args {
+        handle,
+        device_ids_array_ptr: &mut gpu_id as *mut _ as u64,
+        n_devices: 1,
+        n_success: 0,
+    };
+    let _ = unsafe { ioctl::kfd_unmap_memory_from_gpu(kfd_fd.as_raw_fd(), &mut args as *mut _) };
 }
 
 /// Allocate the 0x8000-byte event page (GTT-pinned, uncached, host-visible).

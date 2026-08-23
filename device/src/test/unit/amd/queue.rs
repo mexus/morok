@@ -1,8 +1,30 @@
-use super::test_support::amd_alloc_or_skip;
+use super::test_support::{MockAmdCall, MockAmdIface, amd_alloc_or_skip};
+use crate::amd::AmdAllocator;
+use crate::amd::connector::PoolQueue;
+use crate::amd::iface::PublicationStage;
 use crate::amd::queue::*;
 use crate::amd::sys::hsa::{
     hsa_fence_scope_t_HSA_FENCE_SCOPE_SYSTEM, hsa_kernel_dispatch_packet_t, kernel_dispatch_header,
 };
+use crate::error::Error;
+use std::sync::Arc;
+
+fn mock_allocator(xccs: u32) -> (Arc<MockAmdIface>, AmdAllocator) {
+    let iface = Arc::new(MockAmdIface::default());
+    let dev = crate::amd::device::AmdDevice::synthetic_with_xcc(
+        Arc::clone(&iface) as Arc<dyn crate::amd::iface::AmdIface>,
+        xccs,
+    );
+    (iface, AmdAllocator { dev, device_id: 0 })
+}
+
+fn install_signal_pool(allocator: &AmdAllocator) {
+    allocator.dev.core().install_signal_pool(crate::amd::signal::SignalPool::new(allocator, 64).expect("signal pool"));
+}
+
+fn scripted_error(stage: &'static str) -> Error {
+    Error::Runtime { message: format!("scripted {stage} failure") }
+}
 
 #[test]
 fn aql_packet_header_layout() {
@@ -63,6 +85,342 @@ fn linked_transaction_limits_include_aggregate_and_sdma_wrap_padding() {
         linked_sdma_published_bytes(56, 64, &[32, 32]),
         Err(crate::error::Error::CommandStreamTooLarge { kind: "SDMA linked transaction", .. })
     ));
+}
+
+#[test]
+fn mock_compute_queue_construction_unwinds_every_allocation_stage() {
+    for (xccs, allocation_stages) in [(1, 4), (2, 5)] {
+        for fail_at in 0..allocation_stages {
+            let (iface, allocator) = mock_allocator(xccs);
+            for _ in 0..fail_at {
+                iface.script_alloc(Ok(()));
+            }
+            iface.script_alloc(Err(scripted_error("compute queue allocation")));
+
+            assert!(AmdComputeQueue::create(&allocator).is_err(), "xccs={xccs}, fail_at={fail_at}");
+            assert_eq!(iface.allocation_count(), fail_at, "xccs={xccs}, fail_at={fail_at}");
+            assert_eq!(iface.free_count(), fail_at, "xccs={xccs}, fail_at={fail_at}");
+            assert_eq!(iface.live_handle_count(), 0, "xccs={xccs}, fail_at={fail_at}");
+            assert!(iface.free_issues().is_empty());
+        }
+    }
+}
+
+#[test]
+fn mock_compute_queue_setup_success_failure_and_active_rollback_are_owned() {
+    let (iface, allocator) = mock_allocator(1);
+    iface.script_setup(Err(scripted_error("setup")));
+    assert!(AmdComputeQueue::create(&allocator).is_err());
+    assert_eq!((iface.allocation_count(), iface.free_count(), iface.live_handle_count()), (4, 4, 0));
+
+    let queue = AmdComputeQueue::create(&allocator).expect("queue");
+    assert_eq!(iface.live_queue_count(), 1);
+    drop(queue);
+    assert_eq!((iface.allocation_count(), iface.free_count(), iface.live_handle_count()), (8, 8, 0));
+    assert_eq!((iface.queue_setup_count(), iface.queue_teardown_count(), iface.live_queue_count()), (1, 1, 0));
+    assert!(iface.free_issues().is_empty());
+
+    let queue = AmdComputeQueue::create(&allocator).expect("queue with leaked doorbell");
+    iface.script_teardown(Ok(crate::amd::iface::QueueTeardown::DoorbellLeaked { errno: 12 }));
+    drop(queue);
+    assert_eq!((iface.allocation_count(), iface.free_count(), iface.live_handle_count()), (12, 12, 0));
+    assert_eq!(iface.live_queue_count(), 0);
+
+    let (iface, allocator) = mock_allocator(1);
+    iface.script_setup(Err(Error::AmdQueueStillActive { queue_id: 77, cause: "scripted rollback failure".into() }));
+    assert!(matches!(AmdComputeQueue::create(&allocator), Err(Error::AmdQueueStillActive { .. })));
+    assert!(allocator.dev.is_poisoned());
+    assert_eq!((iface.allocation_count(), iface.free_count(), iface.live_handle_count()), (4, 0, 4));
+}
+
+#[test]
+fn mock_copy_queue_construction_unwinds_ring_signal_and_staging_stages() {
+    for fail_at in 0..3 {
+        let (iface, allocator) = mock_allocator(1);
+        install_signal_pool(&allocator);
+        let baseline_allocs = iface.allocation_count();
+        for _ in 0..fail_at {
+            iface.script_alloc(Ok(()));
+        }
+        iface.script_alloc(Err(scripted_error("copy queue allocation")));
+
+        assert!(AmdCopyQueue::create(&allocator).is_err(), "fail_at={fail_at}");
+        assert_eq!(iface.allocation_count() - baseline_allocs, fail_at, "fail_at={fail_at}");
+        assert_eq!(iface.free_count(), fail_at, "fail_at={fail_at}");
+        assert_eq!(iface.live_handle_count(), baseline_allocs, "fail_at={fail_at}");
+        assert_eq!(iface.queue_setup_count(), usize::from(fail_at == 2));
+        assert_eq!(iface.queue_teardown_count(), usize::from(fail_at == 2));
+        assert!(iface.free_issues().is_empty());
+    }
+
+    let (iface, allocator) = mock_allocator(1);
+    let pool = crate::amd::signal::SignalPool::new(&allocator, 64).expect("signal pool");
+    let held = (0..64).map(|_| pool.acquire().unwrap()).collect::<Vec<_>>();
+    allocator.dev.core().install_signal_pool(Arc::clone(&pool));
+    assert!(AmdCopyQueue::create(&allocator).is_err());
+    assert_eq!((iface.allocation_count(), iface.free_count()), (3, 2));
+    assert_eq!((iface.queue_setup_count(), iface.queue_teardown_count()), (1, 1));
+    drop(held);
+
+    let (iface, allocator) = mock_allocator(1);
+    install_signal_pool(&allocator);
+    let baseline = iface.allocation_count();
+    iface.script_alloc(Ok(()));
+    iface.script_alloc(Ok(()));
+    iface.script_alloc(Err(scripted_error("staging")));
+    iface.script_teardown(Err(scripted_error("partial queue destroy")));
+    assert!(AmdCopyQueue::create(&allocator).is_err());
+    assert!(allocator.dev.is_poisoned());
+    assert_eq!(iface.allocation_count(), baseline + 2);
+    assert_eq!(iface.free_count(), 0);
+    assert_eq!(iface.live_handle_count(), baseline + 2);
+    assert_eq!(iface.live_queue_count(), 1);
+}
+
+#[test]
+fn mock_copy_queue_drop_balances_or_quarantines_after_destroy_failure() {
+    let (iface, allocator) = mock_allocator(1);
+    install_signal_pool(&allocator);
+    let baseline = iface.allocation_count();
+    let queue = AmdCopyQueue::create(&allocator).expect("copy queue");
+    drop(queue);
+    assert_eq!(iface.allocation_count() - baseline, 3);
+    assert_eq!(iface.free_count(), 3);
+    assert_eq!((iface.queue_teardown_count(), iface.live_queue_count()), (1, 0));
+
+    let (iface, allocator) = mock_allocator(1);
+    install_signal_pool(&allocator);
+    let baseline = iface.allocation_count();
+    let queue = AmdCopyQueue::create(&allocator).expect("copy queue");
+    iface.script_teardown(Err(scripted_error("destroy")));
+    drop(queue);
+    assert!(allocator.dev.is_poisoned());
+    assert_eq!(iface.allocation_count() - baseline, 3);
+    assert_eq!(iface.free_count(), 0);
+    assert_eq!(iface.live_handle_count(), baseline + 3);
+    assert_eq!(iface.live_queue_count(), 1);
+}
+
+#[test]
+fn mock_pool_queue_construction_unwinds_queue_arena_and_scratch_stages() {
+    let (iface, allocator) = mock_allocator(1);
+    install_signal_pool(&allocator);
+    let baseline = iface.allocation_count();
+    for fail_at in 0..6 {
+        let allocations_before = iface.allocation_count();
+        let frees_before = iface.free_count();
+        for _ in 0..fail_at {
+            iface.script_alloc(Ok(()));
+        }
+        iface.script_alloc(Err(scripted_error("pool allocation")));
+        assert!(PoolQueue::new_with_resources(Arc::clone(allocator.dev.core()), &allocator).is_err());
+        assert_eq!(iface.allocation_count() - allocations_before, fail_at, "fail_at={fail_at}");
+        assert_eq!(iface.free_count() - frees_before, fail_at, "fail_at={fail_at}");
+        assert_eq!(iface.live_handle_count(), baseline, "fail_at={fail_at}");
+        assert!(iface.free_issues().is_empty());
+    }
+
+    let allocations_before = iface.allocation_count();
+    let frees_before = iface.free_count();
+    let queue = PoolQueue::new_with_resources(Arc::clone(allocator.dev.core()), &allocator).expect("pool queue");
+    drop(queue);
+    assert_eq!(iface.allocation_count() - allocations_before, 6);
+    assert_eq!(iface.free_count() - frees_before, 6);
+    assert_eq!(iface.live_handle_count(), baseline);
+}
+
+#[test]
+fn mock_pm4_and_aql_publication_failures_restore_or_poison_by_doorbell_stage() {
+    for xccs in [1, 2] {
+        let (iface, allocator) = mock_allocator(xccs);
+        install_signal_pool(&allocator);
+        let pool = PoolQueue::new_with_resources(Arc::clone(allocator.dev.core()), &allocator).expect("pool queue");
+        let mut submission = crate::hcq::Submission::new(crate::hcq::QueueKind::Compute(0));
+        submission.push(crate::hcq::Command::MemoryBarrier).push(crate::hcq::Command::Compute(
+            crate::hcq::ComputeDispatch {
+                workgroup_size: [1, 1, 1],
+                grid_size: [1, 1, 1],
+                private_segment_size: 0,
+                group_segment_size: 0,
+                kernel_object: 0x1000,
+                kernarg_address: 0x2000,
+                completion_signal: 0,
+                barrier: true,
+                amd_pm4: Some(crate::hcq::AmdPm4Dispatch {
+                    rsrc: [0, 0, 0],
+                    program_address: 0x1000,
+                    enable_private_segment_sgpr: false,
+                    workgroup_count: [1, 1, 1],
+                    wave32: true,
+                    target_major: 11,
+                }),
+            },
+        ));
+
+        iface.script_publication(Err(scripted_error("after reservation")));
+        assert!(pool.queue().submit_hcq_dispatch(&pool, &submission, &[], &[]).is_err());
+        assert_eq!(pool.pm4_value(), 1);
+        assert!(!allocator.dev.is_poisoned());
+
+        iface.script_publication(Ok(()));
+        iface.script_publication(Err(scripted_error("before doorbell")));
+        assert!(pool.queue().submit_hcq_dispatch(&pool, &submission, &[], &[]).is_err());
+        assert_eq!(pool.pm4_value(), 1);
+        assert!(!allocator.dev.is_poisoned());
+
+        iface.script_publication(Ok(()));
+        iface.script_publication(Ok(()));
+        iface.script_publication(Err(scripted_error("after doorbell")));
+        let post_doorbell_error = match pool.queue().submit_hcq_dispatch(&pool, &submission, &[], &[]) {
+            Ok(_) => panic!("scripted post-doorbell failure unexpectedly succeeded"),
+            Err(error) => error,
+        };
+        assert_eq!(pool.pm4_value(), 2, "post-doorbell reservation xccs={xccs}, error={post_doorbell_error:?}");
+        assert!(allocator.dev.is_poisoned(), "xccs={xccs}, error={post_doorbell_error:?}");
+        let stages = iface
+            .transcript()
+            .into_iter()
+            .filter_map(|call| match call {
+                MockAmdCall::PublicationCheckpoint { stage } => Some(stage),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            stages,
+            [
+                PublicationStage::AfterReservation,
+                PublicationStage::AfterReservation,
+                PublicationStage::BeforeDoorbell,
+                PublicationStage::AfterReservation,
+                PublicationStage::BeforeDoorbell,
+                PublicationStage::AfterDoorbell,
+            ]
+        );
+        drop(pool);
+        assert_eq!(iface.free_count(), 0, "poisoned xccs={xccs} resources must be quarantined");
+    }
+}
+
+#[test]
+fn mock_copy_publication_restores_before_doorbell_and_poisons_after() {
+    let (iface, allocator) = mock_allocator(1);
+    install_signal_pool(&allocator);
+    let baseline = iface.allocation_count();
+    let queue = AmdCopyQueue::create(&allocator).expect("copy queue");
+
+    iface.script_publication(Err(scripted_error("copy after reservation")));
+    assert!(queue.copy_fenced(0x1000, 0x2000, 4).is_err());
+    assert!(!allocator.dev.is_poisoned());
+
+    iface.script_publication(Ok(()));
+    iface.script_publication(Err(scripted_error("copy before doorbell")));
+    assert!(queue.copy_fenced(0x1000, 0x2000, 4).is_err());
+    assert!(!allocator.dev.is_poisoned());
+
+    iface.script_publication(Ok(()));
+    iface.script_publication(Ok(()));
+    iface.script_publication(Err(scripted_error("copy after doorbell")));
+    assert!(queue.copy_fenced(0x1000, 0x2000, 4).is_err());
+    assert!(allocator.dev.is_poisoned());
+    drop(queue);
+    assert_eq!(iface.free_count(), 0);
+    assert_eq!(iface.live_handle_count(), baseline + 3);
+    assert_eq!(iface.live_queue_count(), 1);
+}
+
+#[test]
+fn mock_publication_panic_restores_before_doorbell_and_poisons_after() {
+    let (iface, allocator) = mock_allocator(1);
+    install_signal_pool(&allocator);
+    let pool = PoolQueue::new_with_resources(Arc::clone(allocator.dev.core()), &allocator).unwrap();
+    let mut submission = crate::hcq::Submission::new(crate::hcq::QueueKind::Compute(0));
+    submission.push(crate::hcq::Command::MemoryBarrier);
+
+    iface.script_publication(Ok(()));
+    iface.script_publication_panic();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = pool.queue().submit_hcq_dispatch(&pool, &submission, &[], &[]);
+    }));
+    assert!(result.is_err());
+    assert_eq!(pool.pm4_value(), 1);
+    assert!(!allocator.dev.is_poisoned());
+
+    iface.script_publication(Ok(()));
+    iface.script_publication(Ok(()));
+    iface.script_publication_panic();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = pool.queue().submit_hcq_dispatch(&pool, &submission, &[], &[]);
+    }));
+    assert!(result.is_err());
+    assert_eq!(pool.pm4_value(), 2);
+    assert!(allocator.dev.is_poisoned());
+    drop(pool);
+    assert_eq!(iface.free_count(), 0);
+}
+
+#[test]
+fn mock_pool_failed_drain_and_panic_abandonment_quarantine_every_backing() {
+    let (iface, allocator) = mock_allocator(1);
+    install_signal_pool(&allocator);
+    let baseline = iface.allocation_count();
+    let pool = PoolQueue::new_with_resources(Arc::clone(allocator.dev.core()), &allocator).expect("pool queue");
+    pool.next_pm4();
+    iface.script_wait(Err(scripted_error("drain")));
+    drop(pool);
+    assert!(allocator.dev.is_poisoned());
+    assert_eq!(iface.free_count(), 0);
+    assert_eq!(iface.live_handle_count(), baseline + 6);
+
+    let (iface, allocator) = mock_allocator(1);
+    install_signal_pool(&allocator);
+    let baseline = iface.allocation_count();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _pool = PoolQueue::new_with_resources(Arc::clone(allocator.dev.core()), &allocator).unwrap();
+        panic!("scripted pool abandonment");
+    }));
+    assert!(result.is_err());
+    assert!(allocator.dev.is_poisoned());
+    assert_eq!(iface.free_count(), 0);
+    assert_eq!(iface.live_handle_count(), baseline + 6);
+}
+
+#[test]
+fn mock_scratch_growth_preserves_old_state_on_drain_or_allocation_failure() {
+    let (iface, allocator) = mock_allocator(1);
+    install_signal_pool(&allocator);
+    let pool = PoolQueue::new_with_resources(Arc::clone(allocator.dev.core()), &allocator).expect("pool queue");
+    let allocations = iface.allocation_count();
+    pool.next_pm4();
+    iface.script_wait(Err(scripted_error("scratch drain")));
+    assert!(pool.ensure_has_local_memory(4096).is_err());
+    assert_eq!(iface.allocation_count(), allocations, "failed drain must not allocate replacement scratch");
+    assert_eq!(iface.free_count(), 0, "failed drain must not free old scratch");
+    assert!(allocator.dev.is_poisoned());
+    drop(pool);
+    assert_eq!(iface.free_count(), 0);
+
+    let (iface, allocator) = mock_allocator(1);
+    install_signal_pool(&allocator);
+    let baseline = iface.allocation_count();
+    let pool = PoolQueue::new_with_resources(Arc::clone(allocator.dev.core()), &allocator).expect("pool queue");
+    iface.script_alloc(Err(scripted_error("replacement scratch allocation")));
+    assert!(pool.ensure_has_local_memory(4096).is_err());
+    assert!(!allocator.dev.is_poisoned());
+    assert_eq!(iface.allocation_count(), baseline + 6);
+    assert_eq!(iface.free_count(), 0, "old scratch must survive replacement allocation failure");
+    drop(pool);
+    assert_eq!(iface.free_count(), 6);
+
+    let (iface, allocator) = mock_allocator(1);
+    install_signal_pool(&allocator);
+    let baseline = iface.allocation_count();
+    let pool = PoolQueue::new_with_resources(Arc::clone(allocator.dev.core()), &allocator).expect("pool queue");
+    pool.ensure_has_local_memory(4096).expect("scratch growth");
+    assert_eq!(iface.allocation_count(), baseline + 7);
+    assert_eq!(iface.free_count(), 1, "successful publication frees exactly the drained old scratch");
+    drop(pool);
+    assert_eq!(iface.free_count(), 7);
+    assert!(iface.free_issues().is_empty());
 }
 
 #[test]
