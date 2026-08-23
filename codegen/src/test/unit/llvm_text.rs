@@ -144,7 +144,8 @@ fn render_amd_linearized(root: &std::sync::Arc<svod_ir::UOp>, arch: AmdArch, nam
         code_renderer.decompositor(),
         None,
     );
-    let lowered = svod_schedule::apply_post_optimization_with_renderer(root.clone(), &optimizer_renderer);
+    let lowered = svod_schedule::apply_post_optimization_with_renderer(root.clone(), &optimizer_renderer)
+        .expect("post optimization");
     let linear = svod_ir::UOp::linear(svod_schedule::linearize_with_cfg(lowered).into());
     code_renderer.render(&linear, Some(name)).expect("AMD render")
 }
@@ -427,6 +428,26 @@ fn amd_wmma_bf16_f32_ssa_assembles() {
         result.code
     );
     assert_llvm_ir_assembles(&result.code);
+}
+
+#[test]
+fn amd_wmma_int8_i32_packs_signed_operands() {
+    let meta = wmma_meta((16, 16, 16), DType::Int8, DType::Int32, 8);
+    let sink = wmma_ssa_sink(DType::Int8, 16, DType::Int32, 8, meta);
+    let result = render_amd_linearized(&sink, AmdArch::Gfx1151, "amd_wmma_int8");
+
+    assert_eq!(result.code.matches("bitcast <16 x i8>").count(), 2, "{}", result.code);
+    assert_eq!(result.code.matches("to <4 x i32>").count(), 2, "{}", result.code);
+    assert!(
+        result.code.contains("@llvm.amdgcn.wmma.i32.16x16x16.iu8(i1 true, <4 x i32>")
+            && result.code.contains(", i1 true, <4 x i32>")
+            && result.code.contains(", <8 x i32>")
+            && result.code.contains(", i1 false)"),
+        "RDNA int8 WMMA signature must carry packed operands and signedness flags:\n{}",
+        result.code
+    );
+    assert_llvm_ir_assembles(&result.code);
+    assert_amd_ir_compiles(&result.code, AmdArch::Gfx1151.mcpu());
 }
 
 #[test]

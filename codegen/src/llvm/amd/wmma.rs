@@ -69,9 +69,10 @@ pub fn render_wmma_amd(
     let scaled_fp8 = matches!(arch, AmdArch::Gfx950)
         && k == 128
         && matches!(in_scalar, Some(ScalarDType::FP8E4M3 | ScalarDType::FP8E5M2));
-    let a_op = bitcast_operand(kernel, &dst, "a", &a_dtype, &a_name, bf16_native, scaled_fp8);
-    let b_op = bitcast_operand(kernel, &dst, "b", &b_dtype, &b_name, bf16_native, scaled_fp8);
-    let c_op = bitcast_operand(kernel, &dst, "c", &c_dtype, &c_name, bf16_native, false);
+    let rdna_int8 = !arch.is_cdna() && !arch.is_rdna4() && in_scalar == Some(ScalarDType::Int8);
+    let a_op = bitcast_operand(kernel, &dst, "a", &a_dtype, &a_name, bf16_native, scaled_fp8, rdna_int8);
+    let b_op = bitcast_operand(kernel, &dst, "b", &b_dtype, &b_name, bf16_native, scaled_fp8, rdna_int8);
+    let c_op = bitcast_operand(kernel, &dst, "c", &c_dtype, &c_name, bf16_native, false, false);
 
     let (acc_wire, acc_reinterpreted) = wmma_wire_type(&out_dtype, bf16_native);
     let call_dst = if acc_reinterpreted { format!("{dst}.r") } else { dst.clone() };
@@ -91,7 +92,14 @@ pub fn render_wmma_amd(
         ", i1 false".to_string()
     };
 
-    kernel.push(format!("  {call_dst} = call {acc_wire} @{intrinsic}({a_op}, {b_op}, {c_op}{tail})"));
+    let args = if rdna_int8 {
+        // The `iu8` intrinsic carries one signedness flag before each packed
+        // operand. Int8 inputs set both flags; the trailing flag is opsel.
+        format!("i1 true, {a_op}, i1 true, {b_op}, {c_op}, i1 false")
+    } else {
+        format!("{a_op}, {b_op}, {c_op}{tail}")
+    };
+    kernel.push(format!("  {call_dst} = call {acc_wire} @{intrinsic}({args})"));
 
     if acc_reinterpreted {
         // bf16→bf16: the call returns `<N x i16>`; reinterpret it back to bf16.
@@ -115,14 +123,21 @@ fn hardware_dtype(uop: &Arc<UOp>) -> DType {
 /// differs from its natural `ldt` type (a bitcast is then required). bf16 lanes
 /// go as `i16` (the `bf16.1k`/RDNA `.bf16` intrinsics), except for the CDNA4
 /// K=32 `.bf16` form which takes native `<N x bfloat>` (`bf16_native`); K=32
-/// fp8 lanes pack into one `iN`, while scaled K=128 uses packed i32 vectors.
+/// fp8 lanes pack into one `iN`, scaled K=128 uses packed i32 vectors, and
+/// RDNA3 int8 lanes pack four-at-a-time into i32 vectors.
 fn wmma_wire_type(dtype: &DType, bf16_native: bool) -> (String, bool) {
-    wmma_wire_type_with_scaled_fp8(dtype, bf16_native, false)
+    wmma_wire_type_with_scaled_fp8(dtype, bf16_native, false, false)
 }
 
-fn wmma_wire_type_with_scaled_fp8(dtype: &DType, bf16_native: bool, scaled_fp8: bool) -> (String, bool) {
+fn wmma_wire_type_with_scaled_fp8(
+    dtype: &DType,
+    bf16_native: bool,
+    scaled_fp8: bool,
+    rdna_int8: bool,
+) -> (String, bool) {
     match dtype {
         DType::Vector { scalar: ScalarDType::BFloat16, count } if !bf16_native => (format!("<{count} x i16>"), true),
+        DType::Vector { scalar: ScalarDType::Int8, count } if rdna_int8 => (format!("<{} x i32>", count / 4), true),
         DType::Vector { scalar: ScalarDType::FP8E4M3 | ScalarDType::FP8E5M2, count } if scaled_fp8 => {
             (format!("<{} x i32>", count / 4), true)
         }
@@ -145,8 +160,9 @@ fn bitcast_operand(
     name: &str,
     bf16_native: bool,
     scaled_fp8: bool,
+    rdna_int8: bool,
 ) -> String {
-    let (wire_ty, reinterpreted) = wmma_wire_type_with_scaled_fp8(dtype, bf16_native, scaled_fp8);
+    let (wire_ty, reinterpreted) = wmma_wire_type_with_scaled_fp8(dtype, bf16_native, scaled_fp8, rdna_int8);
     if !reinterpreted {
         return format!("{wire_ty} {name}");
     }

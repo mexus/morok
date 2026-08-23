@@ -73,6 +73,13 @@ fn rdna3_wmma_naming() {
 }
 
 #[test]
+fn rdna3_int8_uses_packed_i32_wire_type() {
+    let dtype = DType::Int8.vec(16).unwrap();
+    assert_eq!(wmma_wire_type_with_scaled_fp8(&dtype, false, false, true), ("<4 x i32>".to_string(), true));
+    assert_eq!(wmma_wire_type_with_scaled_fp8(&dtype, false, false, false), ("<16 x i8>".to_string(), false));
+}
+
+#[test]
 fn rdna4_fp8_wmma_naming() {
     let name =
         resolve_intrinsic(AmdArch::Gfx1201, Some(ScalarDType::FP8E4M3), Some(ScalarDType::Float32), (16, 16, 16));
