@@ -19,8 +19,20 @@ fn sint_vmax(s: &SInt) -> usize {
         SInt::Const(v) => *v,
         SInt::Symbolic(uop) => match uop.op() {
             Op::DefineVar { max_val, .. } => *max_val as usize,
+            Op::Param { arg, .. } if arg.addrspace.is_none() => arg
+                .vmin_vmax
+                .as_ref()
+                .and_then(|(_, max)| max.0.try_int())
+                .and_then(|max| usize::try_from(max).ok())
+                .unwrap_or(1),
             Op::Bind { var, .. } => match var.op() {
                 Op::DefineVar { max_val, .. } => *max_val as usize,
+                Op::Param { arg, .. } if arg.addrspace.is_none() => arg
+                    .vmin_vmax
+                    .as_ref()
+                    .and_then(|(_, max)| max.0.try_int())
+                    .and_then(|max| usize::try_from(max).ok())
+                    .unwrap_or(1),
                 _ => 1,
             },
             _ => 1,
@@ -133,7 +145,7 @@ pub struct KernelInfo {
 /// # Global Graph Substitution
 ///
 /// Tensors are registered in a global registry to support atomic graph substitution.
-/// When rangeify transforms a UOp (e.g., NEG → BUFFERIZE(NEG)), all tensors
+/// When rangeify transforms a UOp (e.g., NEG → STAGE(NEG)), all tensors
 /// referencing it are updated atomically via `apply_map_to_tensors()`.
 ///
 /// This is critical for diamond patterns (like argmin's NEG feeding both MAX and EQ)
@@ -404,7 +416,7 @@ impl Tensor {
         } else {
             let diff = stop.sub(&start);
             let one = UOp::const_(dtype.clone(), ConstValue::one(dtype.base()));
-            let ceildiv = diff.add(&step.sub(&one)).idiv(&step);
+            let ceildiv = diff.add(&step.sub(&one)).floor_div(&step);
             let output_len_sint = SInt::from(ceildiv.clone());
             let ones: Shape = vec![SInt::Const(1)].into();
             let target: Shape = vec![output_len_sint].into();

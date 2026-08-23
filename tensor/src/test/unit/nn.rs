@@ -236,7 +236,7 @@ crate::codegen_tests! {
     // The failure is NOT specific to conv2d groups. It's a fundamental bug in the
     // CONTIGUOUS realization path: assign_ranges() creates separate RANGE nodes for
     // CONTIGUOUS realization that leak into the outer STORE scope when the inner
-    // BUFFERIZE is removed. split_store() then rejects the END because it sees
+    // STAGE is removed. split_store() then rejects the END because it sees
     // non-OUTER ranges in scope. This affects ANY tensor with multiple non-trivial
     // dims that goes through CONTIGUOUS realization.
     // Minimal repro: Tensor::from_slice(&[1.0f32, 2.0]).contiguous().realize()
@@ -336,6 +336,21 @@ crate::codegen_tests! {
         for val in result.iter() {
             assert!((*val - (-5.0)).abs() < 1e-4, "max_pool2d with padding should use -inf fill, got {val}");
         }
+    }
+
+    fn test_max_pool2d_large_symmetric_pad(config) {
+        let x_data: Vec<f32> = (1..=25).map(|v| v as f32).collect();
+        let x = Tensor::from_ndarray(&Array4::from_shape_vec((1, 1, 5, 5), x_data).unwrap());
+        let mut result = x
+            .max_pool2d()
+            .kernel_size(&[5, 5])
+            .stride(&[1, 1])
+            .padding(&[(2, 2), (2, 2)])
+            .call()
+            .unwrap();
+        result.realize_with(&config).unwrap();
+        let values = result.as_vec::<f32>().unwrap();
+        assert_eq!(values[0], 13.0);
     }
 
     fn test_max_pool2d_with_indices_basic(config) {
@@ -631,7 +646,7 @@ fn test_densenet_two_layer_kernel_count() {
     let result = Tensor::cat(&[&cat1, &conv3x3_2], 1).unwrap();
 
     let uop = result.uop();
-    let sink = svod_ir::UOp::sink(vec![uop.clone()]);
+    let sink = svod_ir::UOp::sink(vec![uop.contiguous()]);
     // Normalize Buffer→Param before rangeify (matches real pipeline)
     let normalization = crate::realize::normalize_for_schedule_cache(&sink).expect("normalize schedule cache");
     let (rangeified, _ctx) = svod_schedule::rangeify::rangeify(normalization.normalized).unwrap();

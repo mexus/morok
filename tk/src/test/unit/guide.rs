@@ -78,7 +78,12 @@ fn test_tile_add_graph_shape() {
         !topo.iter().any(|u| matches!(u.op(), Op::Wmma { .. })),
         "no matrix core: this is a plain elementwise kernel"
     );
-    assert!(!topo.iter().any(|u| matches!(u.op(), Op::DefineLocal(_))), "no LDS: the round-trip is register-only");
+    assert!(
+        !topo
+            .iter()
+            .any(|u| matches!(u.op(), Op::Buffer { arg, .. } if arg.addrspace == Some(svod_ir::AddrSpace::Local))),
+        "no LDS: the round-trip is register-only"
+    );
 }
 
 /// `SVOD_DEVICE=AMD:0 cargo test -p svod-tk --lib guide::test_tile_add_amd -- --ignored`.

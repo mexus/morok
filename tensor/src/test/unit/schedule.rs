@@ -14,6 +14,53 @@ fn cpu_buffer(numel: usize) -> Buffer {
     Buffer::new(alloc, DType::Float32, vec![numel], Default::default())
 }
 
+#[test]
+fn slice_is_resolved_to_alias_handle_before_runtime_planning() {
+    let base_uop = UOp::new_buffer(DeviceSpec::Cpu, 8, DType::Float32);
+    let intermediate_uop = UOp::new_buffer(DeviceSpec::Cpu, 5, DType::Float32);
+    let output_uop = UOp::new_buffer(DeviceSpec::Cpu, 2, DType::Float32);
+    let first_slice = base_uop.contiguous_slice(5, 2, DType::Float32);
+    let first_call =
+        first_slice.call(smallvec::smallvec![intermediate_uop.clone(), base_uop.clone()], CallInfo::default());
+    let second_slice = intermediate_uop.contiguous_slice(2, 1, DType::Float32);
+    let second_call =
+        second_slice.call(smallvec::smallvec![output_uop.clone(), intermediate_uop.clone()], CallInfo::default());
+    let pre = PreSchedule {
+        items: vec![
+            PreScheduleItem {
+                kernel: first_call.clone(),
+                ast: first_slice,
+                sources: vec![intermediate_uop.clone(), base_uop.clone()],
+                dependencies: vec![],
+                bound_ranges: vec![],
+            },
+            PreScheduleItem {
+                kernel: second_call.clone(),
+                ast: second_slice,
+                sources: vec![output_uop.clone(), intermediate_uop.clone()],
+                dependencies: vec![first_call.id],
+                bound_ranges: vec![],
+            },
+        ],
+        invocations: vec![
+            KernelInvocation { kernel_id: first_call.id, fixedvars: HashMap::new() },
+            KernelInvocation { kernel_id: second_call.id, fixedvars: HashMap::new() },
+        ],
+        output_buffer_uops: vec![output_uop.clone()],
+    };
+    let base = cpu_buffer(8);
+    let storage = base.storage_id();
+    let result = instantiate_schedule(&pre, &HashMap::from([(base_uop.id, base)]), &HashMap::new(), false).unwrap();
+
+    assert!(result.items.is_empty(), "SLICE must not survive as an executable schedule item");
+    assert_eq!(result.output_uop_ids, vec![output_uop.id]);
+    assert!(!result.alias_output_buffers.contains_key(&intermediate_uop.id));
+    let output = &result.alias_output_buffers[&output_uop.id];
+    assert_eq!(output.storage_id(), storage);
+    assert_eq!(output.offset(), 3 * DType::Float32.bytes());
+    assert_eq!(output.size(), 2 * DType::Float32.bytes());
+}
+
 fn assert_ir_construction_error_contains(err: crate::Error, needle: &str) {
     match err {
         crate::Error::IrConstruction { details } => {
@@ -84,6 +131,35 @@ fn test_create_schedule_mselect_uses_canonical_buffer_id() {
     assert_eq!(item.buffers.len(), 1);
     assert_eq!(item.buffers[0].id(), input.id());
     assert!(item.alias_registered_ids.contains(&mselect.id));
+}
+
+#[test]
+fn test_create_schedule_rejects_unresolved_mstack_ownership() {
+    let buffer0 = UOp::new_buffer(DeviceSpec::Cpu, 4, DType::Float32);
+    let buffer1 = UOp::new_buffer(DeviceSpec::Cpu, 4, DType::Float32);
+    let mstack = UOp::mstack(SmallVec::from_vec(vec![buffer0, buffer1]));
+    let body = UOp::sink(vec![UOp::native_const(0.0f32)]);
+    let call = body.call(SmallVec::from_vec(vec![mstack]), CallInfo::default());
+
+    let err = match create_schedule(UOp::sink(vec![call]), &InputBuffers::new(), &HashMap::new()) {
+        Ok(_) => panic!("bare MSTACK ownership must be rejected"),
+        Err(err) => err,
+    };
+    assert_ir_construction_error_contains(err, "must resolve a primary buffer id");
+}
+
+#[test]
+fn test_create_schedule_rejects_out_of_range_mselect() {
+    let buffer = UOp::new_buffer(DeviceSpec::Cpu, 4, DType::Float32);
+    let mselect = UOp::mstack(SmallVec::from_vec(vec![buffer])).mselect(1);
+    let body = UOp::sink(vec![UOp::native_const(0.0f32)]);
+    let call = body.call(SmallVec::from_vec(vec![mselect]), CallInfo::default());
+
+    let err = match create_schedule(UOp::sink(vec![call]), &InputBuffers::new(), &HashMap::new()) {
+        Ok(_) => panic!("out-of-range MSELECT must be rejected"),
+        Err(err) => err,
+    };
+    assert_ir_construction_error_contains(err, "must resolve a primary buffer id");
 }
 
 #[test]
@@ -302,10 +378,10 @@ fn test_create_schedule_opaque_body_intra_kernel_after_end_store() {
     let buffer_uop = UOp::new_buffer(DeviceSpec::Cpu, 1, DType::Float32);
 
     // Intra-kernel REG accumulator with the canonical `reduce_to_acc` edges.
-    let acc = UOp::define_reg_typed(1, DType::Float32);
+    let acc = UOp::buffer(0, 1, DType::Float32, svod_ir::AddrSpace::Reg, None);
     let zero = UOp::index_const(0);
-    let idx = |buf: Arc<UOp>| UOp::index().buffer(buf).indices(vec![zero.clone()]).ptr(true).call().expect("index");
-    let load = |buf: Arc<UOp>| UOp::load().buffer(buf.clone()).index(idx(buf)).call();
+    let idx = |buf: Arc<UOp>| UOp::index().buffer(buf).indices(vec![zero.clone()]).call().expect("index");
+    let load = |buf: Arc<UOp>| UOp::load().index(idx(buf)).call();
 
     let init = idx(acc.clone()).store(UOp::native_const(0.0f32)); // bare STORE
     let range = UOp::range_const(4, 0);
@@ -318,7 +394,8 @@ fn test_create_schedule_opaque_body_intra_kernel_after_end_store() {
     let out_store = idx(buffer_uop.clone()).store(result);
 
     // Marked SINK → opaque CALL body.
-    let body = UOp::sink_with_info(vec![out_store], svod_ir::KernelInfo { opts_to_apply: Some(vec![]), name: None });
+    let body =
+        UOp::sink_with_info(vec![out_store], svod_ir::KernelInfo { opts_to_apply: Some(vec![]), ..Default::default() });
     let call = body.call(SmallVec::from_vec(vec![buffer_uop.clone()]), CallInfo::default());
     let transformed = UOp::sink(vec![call.clone()]);
 
@@ -407,12 +484,8 @@ fn test_create_schedule_accepts_store_in_after_dependencies() {
     let producer =
         UOp::sink(vec![UOp::native_const(1.0f32)]).call(SmallVec::from_vec(vec![input.clone()]), CallInfo::default());
 
-    let store_idx = UOp::index()
-        .buffer(passthrough.clone())
-        .indices(vec![UOp::index_const(0)])
-        .ptr(true)
-        .call()
-        .expect("store index");
+    let store_idx =
+        UOp::index().buffer(passthrough.clone()).indices(vec![UOp::index_const(0)]).call().expect("store index");
     let side_store = store_idx.store(UOp::native_const(0.0f32));
 
     let after = passthrough.after(SmallVec::from_vec(vec![producer.clone(), side_store]));
@@ -573,7 +646,7 @@ fn test_create_schedule_rejects_non_concrete_outer_range_bounds() {
         Ok(_) => panic!("non-concrete OUTER RANGE bounds should fail"),
         Err(err) => err,
     };
-    assert_ir_construction_error_contains(err, "schedule range vmax must be concrete integer");
+    assert_ir_construction_error_contains(err, "schedule range vmin must be concrete integer");
 }
 
 #[test]

@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use smallvec::{SmallVec, smallvec};
 use svod_dtype::{AmdArch, DType};
-use svod_ir::{AxisType, RendererDevice, UOp, WmmaMetadata, WmmaUpcastAxes};
+use svod_ir::{AxisId, AxisType, RendererDevice, UOp, WmmaMetadata, WmmaUpcastAxes};
 use svod_schedule::optimizer::{Renderer, TensorCore};
 
 use super::Group;
@@ -20,13 +20,14 @@ use crate::tile::RT;
 /// `dims`/`dtype_in`/`dtype_out`/`threads`/`tile_grid` copy straight across. The
 /// `upcast_axes` are `log2(elements_per_thread)` size-2 entries per operand
 /// (mirrors the optimizer's `tc.rs` construction, where every upcast/reduce split
-/// is by 2); the axis-id *values* are cosmetic on tk's expander-free direct path —
-/// codegen/devectorize read only the sizes — so we descend from 4, which
-/// reproduces the prior hand layout `[(4,2),(3,2)]` for the gfx942 16×16×16 case.
+/// is by 2). The direct TK path has no RANGE nodes, so these are stable structural
+/// identities for the fragment dimensions rather than scheduler range identities.
 /// `reduce_axes` is empty: tk's `mma` carries the K reduce as its own `inner`
 /// range, not inside the WMMA metadata.
 fn wmma_from_tc(tc: &TensorCore, device: RendererDevice) -> WmmaMetadata {
-    let axes = |ept: usize| -> Vec<(usize, usize)> { (0..(ept as f64).log2() as usize).map(|i| (4 - i, 2)).collect() };
+    let axes = |ept: usize| -> Vec<(AxisId, usize)> {
+        (0..(ept as f64).log2() as usize).map(|i| (AxisId::Renumbered(4 - i), 2)).collect()
+    };
     WmmaMetadata {
         name: format!("WMMA_{}_{}_{}_{:?}_{:?}", tc.dims.0, tc.dims.1, tc.dims.2, tc.dtype_in, tc.dtype_out),
         dims: tc.dims,
@@ -34,11 +35,11 @@ fn wmma_from_tc(tc: &TensorCore, device: RendererDevice) -> WmmaMetadata {
         dtype_out: tc.dtype_out.clone(),
         device,
         threads: tc.threads,
-        upcast_axes: WmmaUpcastAxes {
+        upcast_axes: Some(WmmaUpcastAxes {
             a: axes(tc.elements_per_thread.0),
             b: axes(tc.elements_per_thread.1),
             c: axes(tc.elements_per_thread.2),
-        },
+        }),
         reduce_axes: vec![],
         tile_grid: tc.tile_grid,
     }
@@ -69,7 +70,7 @@ fn wmma_desc(arch: AmdArch, dtype_in: &DType) -> WmmaMetadata {
 /// (`wmma_from_tc` builds these as `log2(elements_per_thread)` size-2 entries, so
 /// the product is the elements-per-thread). gfx942 16×16×16 → A/B/C = 4/4/4; RDNA
 /// → 16/16/8 (replicated 16-wide inputs, 8-wide accumulator). Empty axes ⇒ 1.
-fn upcast_count(axes: &[(usize, usize)]) -> i64 {
+fn upcast_count(axes: &[(AxisId, usize)]) -> i64 {
     axes.iter().map(|(_, sz)| *sz as i64).product()
 }
 
@@ -136,8 +137,10 @@ impl<'k> Group<'k> {
         // 16/16/8), not a hardcoded 4.
         assert_eq!(a.base.base.cols, 16, "mma: only the 16-col WMMA base is supported");
         let meta = wmma_desc(self.ker.caps.arch, a.elem());
-        let (a_w, b_w, c_w) =
-            (upcast_count(&meta.upcast_axes.a), upcast_count(&meta.upcast_axes.b), upcast_count(&meta.upcast_axes.c));
+        let (a_w, b_w, c_w) = {
+            let axes = meta.upcast_axes.as_ref().expect("unexpanded WMMA metadata");
+            (upcast_count(&axes.a), upcast_count(&axes.b), upcast_count(&axes.c))
+        };
 
         let h_end = c.shape()[c.shape().len() - 3] as i64;
         let w_end = c.shape()[c.shape().len() - 2] as i64;
@@ -146,7 +149,7 @@ impl<'k> Group<'k> {
         let width = self.ker.raw_range(w_end, AxisType::Loop);
         let inner = self.ker.raw_range(k_end, AxisType::Reduce);
 
-        let a_in = UOp::vectorize(
+        let a_in = UOp::stack(
             (0..a_w)
                 .map(|i| {
                     let idx = if a_t {
@@ -158,7 +161,7 @@ impl<'k> Group<'k> {
                 })
                 .collect(),
         );
-        let b_in = UOp::vectorize(
+        let b_in = UOp::stack(
             (0..b_w)
                 .map(|i| {
                     let idx = if b_t {
@@ -177,7 +180,7 @@ impl<'k> Group<'k> {
         // (`acc.after([..reduce_range]).index(..)`): the `After([inner])` keeps
         // the read inside the K loop so it observes the prior iteration's store.
         let c_acc = c.uop().after(smallvec![inner.clone()]);
-        let d_in = UOp::vectorize(
+        let d_in = UOp::stack(
             (0..c_w)
                 .map(|i| load_at(&c_acc, c.shape(), &[Idx::from(&height), Idx::from(&width), Idx::Const(i)]))
                 .collect(),
@@ -187,7 +190,7 @@ impl<'k> Group<'k> {
         let c_i: Vec<Arc<UOp>> = (0..c_w)
             .map(|i| {
                 flat_index(c.uop(), c.shape(), &[Idx::from(&height), Idx::from(&width), Idx::Const(i)])
-                    .store(out.gep(vec![i as usize]))
+                    .store(out.index_axes(vec![i as usize]))
             })
             .collect();
         let c_store = UOp::group(c_i).end(smallvec![height, width, inner]);
@@ -210,8 +213,10 @@ impl<'k> Group<'k> {
     fn mma_u(&self, c: RT<'k>, a: &RT<'k>, b: &RT<'k>, a_t: bool, b_t: bool) -> RT<'k> {
         assert_eq!(a.base.base.cols, 16, "mma_u: only the 16-col WMMA base is supported");
         let meta = wmma_desc(self.ker.caps.arch, a.elem());
-        let (a_w, b_w, c_w) =
-            (upcast_count(&meta.upcast_axes.a), upcast_count(&meta.upcast_axes.b), upcast_count(&meta.upcast_axes.c));
+        let (a_w, b_w, c_w) = {
+            let axes = meta.upcast_axes.as_ref().expect("unexpanded WMMA metadata");
+            (upcast_count(&axes.a), upcast_count(&axes.b), upcast_count(&axes.c))
+        };
 
         let h_end = c.shape()[c.shape().len() - 3] as i64;
         let w_end = c.shape()[c.shape().len() - 2] as i64;
@@ -228,7 +233,7 @@ impl<'k> Group<'k> {
                 // `c.after([inner])` loop-carry).
                 let mut frag_prev: Option<Arc<UOp>> = None;
                 for k in 0..k_end {
-                    let a_in = UOp::vectorize(
+                    let a_in = UOp::stack(
                         (0..a_w)
                             .map(|i| {
                                 let idx = if a_t {
@@ -240,7 +245,7 @@ impl<'k> Group<'k> {
                             })
                             .collect(),
                     );
-                    let b_in = UOp::vectorize(
+                    let b_in = UOp::stack(
                         (0..b_w)
                             .map(|i| {
                                 let idx = if b_t {
@@ -269,7 +274,7 @@ impl<'k> Group<'k> {
                     // hoisted out (see `Group::anchor`); subsequent k/fragment reads
                     // chain through their stores, which are already loop-scoped.
                     let c_src = if deps.is_empty() { self.anchor(c.uop()) } else { c.uop().after(deps) };
-                    let d_in = UOp::vectorize(
+                    let d_in = UOp::stack(
                         (0..c_w)
                             .map(|i| load_at(&c_src, c.shape(), &[Idx::Const(h), Idx::Const(w), Idx::Const(i)]))
                             .collect(),
@@ -278,7 +283,7 @@ impl<'k> Group<'k> {
                     let c_i: Vec<Arc<UOp>> = (0..c_w)
                         .map(|i| {
                             flat_index(c.uop(), c.shape(), &[Idx::Const(h), Idx::Const(w), Idx::Const(i)])
-                                .store(out.gep(vec![i as usize]))
+                                .store(out.index_axes(vec![i as usize]))
                         })
                         .collect();
                     frag_prev = Some(UOp::group(c_i));

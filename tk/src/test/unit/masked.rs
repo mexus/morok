@@ -1,6 +1,7 @@
 //! Masked boundary GLOBAL↔REG load/store ([`crate::MoveIdx::masked`]): a tile
 //! straddling a ragged `N`/`D` edge reads `0.0` (load) / drops the write (store)
-//! via a gated `INDEX` + `LOAD` `alt`, instead of touching out-of-bounds memory.
+//! via validity-encoded index operands and a `WHERE` fill, instead of touching
+//! out-of-bounds memory.
 //! The gate is elided at build time when the dims are tile-aligned.
 //!
 //! Graph-shape checks run GPU-free; the round-trip is `#[ignore]` (arch-aware,
@@ -9,7 +10,7 @@
 use std::sync::Arc;
 
 use svod_dtype::{DType, DeviceSpec};
-use svod_ir::{Op, UOp};
+use svod_ir::{Op, TernaryOp, UOp};
 
 use crate::arch::FragRole;
 use crate::tiles::{RT_16X16, TileLayout};
@@ -17,8 +18,8 @@ use crate::{ArchCaps, Kernel, MoveIdx};
 
 const ROW: TileLayout = TileLayout::Row;
 
-/// A masked GLOBAL→REG load over a ragged tensor emits a gated `INDEX` and a
-/// `LOAD` carrying an `alt` fill; an unmasked load does not; and a masked load
+/// A masked GLOBAL→REG load over a ragged tensor emits an `INDEX` containing a
+/// `WHERE(gate, index, INVALID)` and a `WHERE` fill; an unmasked load does not; and a masked load
 /// over a tile-aligned tensor elides the gate (both axes divide evenly).
 #[test]
 fn test_masked_load_graph_shape() {
@@ -32,23 +33,32 @@ fn test_masked_load_graph_shape() {
         let mi = if masked { mi.masked() } else { mi };
         warp.load(rt, g, mi).uop().toposort()
     };
-    let has_gate = |t: &[Arc<UOp>]| t.iter().any(|u| matches!(u.op(), Op::Index { gate: Some(_), .. }));
-    let has_alt = |t: &[Arc<UOp>]| t.iter().any(|u| matches!(u.op(), Op::Load { alt: Some(_), .. }));
+    let has_valid_index = |t: &[Arc<UOp>]| {
+        t.iter().any(|u| {
+            matches!(
+                u.op(),
+                Op::Index { indices, .. }
+                    if indices.iter().any(|idx| matches!(idx.op(), Op::Ternary(TernaryOp::Where, _, _, invalid) if UOp::is_invalid_marker(invalid)))
+            )
+        })
+    };
+    let has_fill = |t: &[Arc<UOp>]| {
+        t.iter().any(|u| matches!(u.op(), Op::Ternary(TernaryOp::Where, _, _, alt) if !UOp::is_invalid_marker(alt)))
+    };
 
     // Ragged N=17 and D=20 (a 32×32 tile straddles both) + masked → gated load.
     let ragged = build([1, 1, 17, 20], true);
-    assert!(has_gate(&ragged), "masked ragged load: gated INDEX");
-    assert!(has_alt(&ragged), "masked ragged load: LOAD with alt fill");
+    assert!(has_valid_index(&ragged), "masked ragged load: validity-encoded INDEX");
+    assert!(has_fill(&ragged), "masked ragged load: WHERE with alternate fill");
 
     // Same ragged shape, unmasked → no gate (caller opted out).
-    assert!(!has_gate(&build([1, 1, 17, 20], false)), "unmasked load: no gate");
+    assert!(!has_valid_index(&build([1, 1, 17, 20], false)), "unmasked load: no validity mask");
 
     // Masked but tile-aligned (32×32) → gate elided at build time.
-    assert!(!has_gate(&build([1, 1, 32, 32], true)), "masked aligned load: gate elided");
+    assert!(!has_valid_index(&build([1, 1, 32, 32], true)), "masked aligned load: mask elided");
 }
 
-/// A masked REG→GLOBAL store over a ragged tensor gates the store `INDEX` (no
-/// `alt` — out-of-bounds writes are simply dropped).
+/// A masked REG→GLOBAL store over a ragged tensor validity-encodes its index.
 #[test]
 fn test_masked_store_graph_shape() {
     let bufs = vec![UOp::new_buffer(DeviceSpec::Cpu, 17 * 20, DType::Float32)];
@@ -57,7 +67,16 @@ fn test_masked_store_graph_shape() {
     let g = ker.gl(&[1, 1, 17, 20], DType::Float32);
     let rt = warp.zero(ker.rt((32, 32), DType::Float32, ROW, RT_16X16));
     let topo = warp.store(g, rt, MoveIdx::block((0, 0, 0, 0), 2).masked()).uop().toposort();
-    assert!(topo.iter().any(|u| matches!(u.op(), Op::Index { gate: Some(_), .. })), "masked ragged store: gated INDEX");
+    assert!(
+        topo.iter().any(|u| {
+            matches!(
+                u.op(),
+                Op::Index { indices, .. }
+                    if indices.iter().any(|idx| matches!(idx.op(), Op::Ternary(TernaryOp::Where, _, _, invalid) if UOp::is_invalid_marker(invalid)))
+            )
+        }),
+        "masked ragged store: validity-encoded INDEX"
+    );
 }
 
 /// `SVOD_DEVICE=AMD:0 cargo test -p svod-tk --lib masked::test_masked_load_roundtrip_amd -- --ignored --nocapture`.

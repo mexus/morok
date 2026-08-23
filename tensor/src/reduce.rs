@@ -110,7 +110,7 @@ impl Tensor {
             Int32 | Int64 => dtype.clone(),
             UInt8 | UInt16 => DType::UInt32,
             UInt32 | UInt64 => dtype.clone(),
-            WeakFloat | Float16 | BFloat16 | FP8E4M3 | FP8E5M2 => DType::Float32,
+            WeakFloat | Float16 | BFloat16 | FP8E4M3 | FP8E4M3FNUZ | FP8E5M2 | FP8E5M2FNUZ => DType::Float32,
             Float32 | Float64 => dtype.clone(),
             Void | Index => dtype.clone(),
         }
@@ -125,7 +125,14 @@ impl Tensor {
     fn should_cast_back_after_sum(dtype: &DType) -> bool {
         matches!(
             dtype.scalar(),
-            Some(ScalarDType::Float16 | ScalarDType::BFloat16 | ScalarDType::FP8E4M3 | ScalarDType::FP8E5M2)
+            Some(
+                ScalarDType::Float16
+                    | ScalarDType::BFloat16
+                    | ScalarDType::FP8E4M3
+                    | ScalarDType::FP8E4M3FNUZ
+                    | ScalarDType::FP8E5M2
+                    | ScalarDType::FP8E5M2FNUZ
+            )
         )
     }
 
@@ -633,6 +640,8 @@ fn reduction_identity(op: ReduceOp, dtype: &DType) -> ConstValue {
     match op {
         ReduceOp::Add => ConstValue::zero(s),
         ReduceOp::Mul => ConstValue::one(s),
+        ReduceOp::Max if dtype.is_float() => ConstValue::Float(dtype.analysis_bounds().0),
+        ReduceOp::Min if dtype.is_float() => ConstValue::Float(dtype.analysis_bounds().1),
         ReduceOp::Max => ConstValue::min(s),
         ReduceOp::Min => ConstValue::max(s),
     }

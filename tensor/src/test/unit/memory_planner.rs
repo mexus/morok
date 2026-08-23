@@ -315,49 +315,6 @@ fn test_memory_planner_reuses_unmasked_store_outputs() {
 }
 
 #[test]
-fn test_memory_planner_skips_masked_store_outputs() {
-    // b1 is at a later level and would reuse b0 — but the masked store output
-    // b0 is non-plannable, so no reuse happens.
-    let b0 = make_buffer(256);
-    let b1 = make_buffer(256);
-    let target = UOp::new_buffer(DeviceSpec::Cpu, 256, DType::Float32);
-    let index = UOp::index()
-        .buffer(target.clone())
-        .indices(vec![UOp::index_const(0)])
-        .gate(UOp::native_const(true))
-        .call()
-        .unwrap();
-
-    let mut schedule = vec![make_store_item(&target, b0, index), make_sink_item(62, b1)];
-    chain_deps(&mut schedule);
-    let result = plan(&schedule, &HashSet::new(), PlannerMode::Remap);
-
-    assert_eq!(result.buffers_reused, 0);
-    assert!(result.buffer_replace.is_empty());
-}
-
-#[test]
-fn test_memory_planner_skips_wrapped_masked_store_outputs() {
-    let b0 = make_buffer(256);
-    let b1 = make_buffer(256);
-    let target = UOp::new_buffer(DeviceSpec::Cpu, 256, DType::Float32);
-    let index = UOp::index()
-        .buffer(target.clone())
-        .indices(vec![UOp::index_const(0)])
-        .gate(UOp::native_const(true))
-        .call()
-        .unwrap()
-        .cast(DType::Index);
-
-    let mut schedule = vec![make_store_item(&target, b0, index), make_sink_item(63, b1)];
-    chain_deps(&mut schedule);
-    let result = plan(&schedule, &HashSet::new(), PlannerMode::Remap);
-
-    assert_eq!(result.buffers_reused, 0);
-    assert!(result.buffer_replace.is_empty());
-}
-
-#[test]
 fn test_memory_planner_skips_non_sink_noopt_buffers() {
     let b0 = make_buffer(256);
     let b1 = make_buffer(256);

@@ -1,7 +1,7 @@
 //! Global tensor registry for atomic graph substitution.
 //!
 //! This module implements Tinygrad's `all_tensors` pattern using papaya's lock-free HashMap.
-//! When rangeify transforms a UOp (e.g., NEG → BUFFERIZE(NEG)), the `becomes_map` must be
+//! When rangeify transforms a UOp (e.g., NEG → STAGE(NEG)), the `becomes_map` must be
 //! applied to ALL tensors that reference it - not just the one being realized.
 //!
 //! Without this, diamond patterns (like argmin's NEG feeding both MAX and EQ) fail because

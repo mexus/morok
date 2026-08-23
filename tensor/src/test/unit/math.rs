@@ -79,6 +79,7 @@ fn test_erf_basic() {
     let t = Tensor::from_slice([0.0f32, 1.0, -1.0]);
     let result = t.erf().unwrap();
     assert_eq!(result.uop().dtype(), DType::Float32);
+    assert!(result.uop().toposort().iter().any(|node| matches!(node.op(), Op::Unary(svod_ir::UnaryOp::Erf, _))));
 }
 
 #[test]
@@ -138,6 +139,28 @@ fn test_isinf() {
 }
 
 crate::codegen_tests! {
+    fn test_transcendental_values(config) {
+        let input = Tensor::from_slice([-3.25f32, -0.5, 0.0, 0.75, 4.0]);
+        let exp2 = input.try_exp2().unwrap().realize_with_and(&config).as_vec::<f32>().unwrap();
+        let expected_exp2 = [-3.25f32, -0.5, 0.0, 0.75, 4.0].map(f32::exp2);
+        assert_close_f32(&exp2, &expected_exp2, 2e-6);
+
+        let positive = Tensor::from_slice([f32::MIN_POSITIVE, 0.125, 0.75, 1.0, 17.0]);
+        let log2 = positive.try_log2().unwrap().realize_with_and(&config).as_vec::<f32>().unwrap();
+        let expected_log2 = [f32::MIN_POSITIVE, 0.125, 0.75, 1.0, 17.0].map(f32::log2);
+        assert_close_f32(&log2, &expected_log2, 2e-6);
+
+        // 1e6 exercises Payne-Hanek rather than the small-angle Cody-Waite path.
+        let angles = Tensor::from_slice([-1_000_000.0f32, -31.0, -0.5, 0.0, 31.0, 1_000_000.0]);
+        let sin = angles.sin().unwrap().realize_with_and(&config).as_vec::<f32>().unwrap();
+        let expected_sin = [-1_000_000.0f32, -31.0, -0.5, 0.0, 31.0, 1_000_000.0].map(f32::sin);
+        assert_close_f32(&sin, &expected_sin, 2e-6);
+
+        let roots = Tensor::from_slice([0.0f32, 0.25, 1.0, 2.0, 100.0]);
+        let sqrt = roots.try_sqrt().unwrap().realize_with_and(&config).as_vec::<f32>().unwrap();
+        assert_close_f32(&sqrt, &[0.0, 0.5, 1.0, std::f32::consts::SQRT_2, 10.0], 2e-6);
+    }
+
     fn test_isnan_values(config) {
         let t = Tensor::from_slice([1.0f32, f32::NAN, 3.0]);
         let vals = t.isnan().unwrap().realize_with_and(&config).as_vec::<bool>().unwrap();

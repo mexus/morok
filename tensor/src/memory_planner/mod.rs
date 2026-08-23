@@ -29,12 +29,11 @@
 mod tlsf;
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 
 use snafu::ResultExt;
 use svod_device::Buffer;
 use svod_dtype::{DType, DeviceSpec};
-use svod_ir::{Op, UOp};
+use svod_ir::Op;
 use tracing::{debug, trace};
 
 use crate::schedule::Schedule;
@@ -89,7 +88,7 @@ pub fn mode_from_env() -> PlannerMode {
     parse_mode(std::env::var("SVOD_MEMORY_PLANNER").ok().as_deref())
 }
 
-type LogicalBufferView = (usize, usize, DType, Vec<usize>);
+type LogicalBufferAlias = (usize, usize, DType, Vec<usize>);
 
 /// Round up to the nearest multiple of block_size.
 #[inline]
@@ -197,8 +196,7 @@ fn collect_noopt_buffer_ids(schedule: &Schedule) -> HashSet<u64> {
     // storage. Keying by `Buffer::id()` would miss views (since each view
     // mints a fresh handle id); keying by `storage_id()` correctly groups
     // every view of one allocation under one bucket.
-    let mut by_storage: HashMap<u64, HashSet<LogicalBufferView>> = HashMap::new();
-    let mut masked_store_ids = HashSet::new();
+    let mut by_storage: HashMap<u64, HashSet<LogicalBufferAlias>> = HashMap::new();
     for item in schedule {
         for buffer in &item.buffers {
             by_storage.entry(buffer.storage_id().0).or_default().insert((
@@ -207,15 +205,6 @@ fn collect_noopt_buffer_ids(schedule: &Schedule) -> HashSet<u64> {
                 buffer.dtype(),
                 buffer.shape().to_vec(),
             ));
-        }
-
-        let uop_id_to_buffer_id: HashMap<u64, u64> =
-            item.buffer_uop_ids.iter().copied().zip(item.buffers.iter().map(|b| b.id().0)).collect();
-        for node in item.ast.toposort() {
-            let Op::Store { index, .. } = node.op() else {
-                continue;
-            };
-            collect_masked_store_buffer_ids(index, &uop_id_to_buffer_id, &mut masked_store_ids);
         }
     }
 
@@ -236,28 +225,7 @@ fn collect_noopt_buffer_ids(schedule: &Schedule) -> HashSet<u64> {
         .filter(|item| !matches!(item.ast.op(), Op::Sink { .. }))
         .flat_map(|item| item.buffers.iter().map(|b| b.id().0))
         .chain(aliased_ids)
-        .chain(masked_store_ids)
         .collect()
-}
-
-fn collect_masked_store_buffer_ids(
-    index: &Arc<UOp>,
-    uop_id_to_buffer_id: &HashMap<u64, u64>,
-    masked_store_ids: &mut HashSet<u64>,
-) {
-    match index.op() {
-        Op::Index { buffer, gate: Some(_), .. } => {
-            if let Some(buffer_id) = uop_id_to_buffer_id.get(&buffer.buf_uop().id) {
-                masked_store_ids.insert(*buffer_id);
-            }
-        }
-        Op::Index { .. } => {}
-        other => {
-            for child in other.children() {
-                collect_masked_store_buffer_ids(child, uop_id_to_buffer_id, masked_store_ids);
-            }
-        }
-    }
 }
 
 fn should_skip_buffer(buffer: &Buffer, output_buffer_ids: &HashSet<u64>, noopt_buffer_ids: &HashSet<u64>) -> bool {
@@ -280,7 +248,7 @@ fn should_skip_buffer(buffer: &Buffer, output_buffer_ids: &HashSet<u64>, noopt_b
 /// Sharing one implementation guarantees these levels equal the runtime's
 /// per-op levels (so level-interval reuse decisions match real execution
 /// order), provided op emission stays 1:1 with schedule items — enforced by the
-/// BufferView guard + the `op_count` assert in `prepare_execution_plan`.
+/// the `op_count` assert in `prepare_execution_plan`.
 pub fn compute_item_levels(schedule: &Schedule) -> crate::Result<Vec<usize>> {
     let node_ids: Vec<u64> = schedule.iter().map(|it| it.kernel.id).collect();
     let callable_deps: Vec<Vec<u64>> = schedule.iter().map(|it| it.dependencies.clone()).collect();

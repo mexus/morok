@@ -393,6 +393,20 @@ crate::codegen_tests! {
         assert_close_f32(&t.min(()).unwrap().realize_with_and(&config).as_vec::<f32>().unwrap(), &[-5.0], 1e-6);
     }
 
+    fn test_empty_float_max_uses_negative_infinity(config) {
+        test_setup();
+        let t = Tensor::empty(&[0], DType::Float32);
+        let values = t.max(()).unwrap().realize_with_and(&config).as_vec::<f32>().unwrap();
+        assert_eq!(values, [f32::NEG_INFINITY]);
+    }
+
+    fn test_empty_float_min_uses_positive_infinity(config) {
+        test_setup();
+        let t = Tensor::empty(&[0], DType::Float32);
+        let values = t.min(()).unwrap().realize_with_and(&config).as_vec::<f32>().unwrap();
+        assert_eq!(values, [f32::INFINITY]);
+    }
+
     // ========== Argmax Tests (from Tinygrad test_ops.py:1087-1105) ==========
 
     fn test_argmax_debug_steps(config) {

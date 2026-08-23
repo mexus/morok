@@ -30,7 +30,7 @@ fn test_flat_offset_dynamic_index_survives() {
     let r = UOp::range_const(16, 0);
     let off = flat_offset(&[2, 16], &[Idx::Const(1), Idx::from(&r)]);
 
-    assert_eq!(off.dtype(), DType::Index);
+    assert_eq!(off.dtype(), DType::WeakInt);
     assert!(!matches!(off.op(), Op::Const(_)), "offset with a dynamic index must not fold to a constant");
     assert!(off.toposort().iter().any(|u| Arc::ptr_eq(u, &r)), "the dynamic range must appear in the offset graph");
 }
@@ -47,8 +47,12 @@ fn test_flat_offset_unit_stride_skips_mul() {
 fn test_flat_ptr_unwraps_reshape_to_param() {
     // A multi-dim placeholder is RESHAPE(PARAM); flat_ptr must return the flat
     // PARAM and its element dtype.
-    let ph = UOp::placeholder_like(&UOp::new_buffer(svod_dtype::DeviceSpec::Cpu, 12, DType::Float32), 0)
-        .expect("placeholder");
+    let ph = UOp::placeholder_like(
+        &UOp::new_buffer(svod_dtype::DeviceSpec::Cpu, 12, DType::Float32),
+        0,
+        svod_dtype::AddrSpace::Global,
+    )
+    .expect("placeholder");
     // 1-D buffer reshaped to (3, 4) for the test.
     let ph = ph
         .try_reshape(&svod_ir::shape::Shape::from_iter([svod_ir::SInt::Const(3), svod_ir::SInt::Const(4)]))

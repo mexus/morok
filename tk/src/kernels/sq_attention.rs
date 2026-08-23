@@ -41,7 +41,7 @@ impl Default for SqAttentionOpts<'_> {
 }
 
 fn cidx(v: i64) -> Arc<UOp> {
-    UOp::const_(DType::Index, ConstValue::Int(v))
+    UOp::index_const(v)
 }
 
 fn f32c(v: f64) -> Arc<UOp> {
@@ -91,7 +91,7 @@ pub(crate) fn build_single_query_attention(
     let lane = ker.laneid();
     let prefix = masked.then(|| {
         let lens = ker.gl(&[b], DType::Int32);
-        load_at(lens.uop(), lens.shape(), &[Idx::from(&batch)]).cast(DType::Index)
+        load_at(lens.uop(), lens.shape(), &[Idx::from(&batch)])
     });
 
     let q_reg = ker.alloc_reg(ept, f32.clone());
@@ -233,7 +233,7 @@ pub(crate) fn build_single_query_attention_partial(
     let norm_reg = ker.alloc_reg(1, f32.clone());
     let scale = f32c(std::f64::consts::LOG2_E / (d as f64).sqrt());
     let subgroup_lane = warp.subgroup_laneid(SUBGROUP);
-    let group = lane.idiv(&cidx(SUBGROUP as i64));
+    let group = lane.floor_div(&cidx(SUBGROUP as i64));
     let mut init = Vec::with_capacity(dot_ept + ept + 2);
     for j in 0..dot_ept {
         let dim = subgroup_lane.add(&cidx((j * SUBGROUP) as i64));

@@ -123,6 +123,12 @@ crate::codegen_tests! {
         assert_eq!(result.as_vec::<f32>().unwrap(), [1.0, 3.0, 5.0]);
     }
 
+    fn test_masked_select_requires_bool(_config) {
+        let tensor = Tensor::from_slice([1i32, 2]);
+        let mask = Tensor::from_slice([1i32, 0]);
+        assert!(matches!(tensor.masked_select(&mask), Err(Error::TypeMismatch { expected, .. }) if expected == DType::Bool));
+    }
+
     // =========================================================================
     // NonZero Tests
     // =========================================================================
@@ -136,6 +142,19 @@ crate::codegen_tests! {
         assert_eq!(view[[0, 0]], 0); // index of 1
         assert_eq!(view[[1, 0]], 2); // index of 2
         assert_eq!(view[[2, 0]], 4); // index of 3
+    }
+
+    fn test_nonzero_scalar_and_empty(config) {
+        for (tensor, expected_shape) in [
+            (Tensor::const_(1i32, DType::Int32), vec![1, 0]),
+            (Tensor::const_(0i32, DType::Int32), vec![0, 0]),
+            (Tensor::empty_zero(DType::Int32), vec![0, 1]),
+        ] {
+            let mut result = tensor.nonzero().unwrap().contiguous();
+            result.realize_with(&config).unwrap();
+            assert_eq!(get_shape(&result), expected_shape);
+            assert!(result.as_vec::<i32>().unwrap().is_empty());
+        }
     }
 
     fn test_nonzero_2d_debug_coords(config) {

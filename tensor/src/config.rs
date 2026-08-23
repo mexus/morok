@@ -111,25 +111,12 @@ impl PrepareConfig {
         }
     }
 
-    /// AMD variant for the `codegen_tests!` macro: returns `Some(_)` only
-    /// when this host has a [supported](svod_dtype::AmdArch) AMD GPU
-    /// (RDNA3 + CDNA). On other hosts the macro's `amd::*` tests skip with
-    /// a clear message.
-    ///
-    /// **Status**: the AMD realize pipeline (CPU→VRAM staging + dispatch +
-    /// result copy-back) is not yet wired in `realize.rs`; until it is, this
-    /// function returns `None` even on supported hardware. The macro
-    /// scaffold is in place so that flipping the pipeline integration is a
-    /// one-line change here.
+    /// AMD variant for the `codegen_tests!` macro. The test runs only when the
+    /// active default is a topology-supported AMD device; otherwise it skips.
     pub fn for_amd_if_available() -> Option<Self> {
-        // Detect supported AMD device. Returns None when the host has no
-        // /dev/kfd, no GPU nodes, or only unsupported gfx targets.
-        let _arch = amd_test_arch()?;
-        // TODO(phase 7.1): swap to an AmdBackendResolver once realize.rs
-        // supports cross-device buffer staging. Returning None for now means
-        // the codegen_tests!::amd variant always skips on this host — by
-        // design, not a bug.
-        None
+        let DeviceSpec::Amd { device_id } = svod_dtype::default_device::default_device() else { return None };
+        svod_device::registry::resolve_amd_arch_from_topology(device_id).ok()?;
+        Some(Self::from_env())
     }
 }
 

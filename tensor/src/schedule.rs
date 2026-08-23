@@ -17,7 +17,6 @@ use std::sync::Arc;
 use svod_device::Buffer;
 use svod_device::device::Device;
 use svod_device::registry;
-use svod_dtype::DType;
 use svod_ir::{Op, UOp};
 use tracing::{debug, trace};
 
@@ -56,12 +55,14 @@ fn source_primary_buffer_id(src: &Arc<UOp>) -> Option<u64> {
         Op::Bind { .. } => None,
         Op::MSelect { buffer, device_index } => {
             if let Op::MStack { buffers } = buffer.op() {
-                buffers.get(*device_index).map(|b| b.buf_uop().id).or_else(|| Some(src.buf_uop().id))
+                buffers.get(*device_index).map(|b| b.buf_uop().id)
             } else {
                 Some(src.buf_uop().id)
             }
         }
-        Op::MStack { buffers } => buffers.first().map(|b| b.buf_uop().id),
+        // A bare MSTACK owns multiple buffers. Until schedule items carry that
+        // ownership explicitly, resolving it to one shard would be incorrect.
+        Op::MStack { .. } => None,
         _ => None,
     }
 }
@@ -164,7 +165,7 @@ fn callable_sources(callable: &Arc<UOp>) -> Option<Vec<Arc<UOp>>> {
 
 /// Schedule-level RANGEs are uniquely identified by being paired with an
 /// `END(Call)` in the transformed graph — the END structurally proves the
-/// Range wraps a kernel call. Standalone `Bind(DefineVar, Range)` arguments
+/// Range wraps a kernel call. Standalone `Bind(variable, Range)` arguments
 /// (user-supplied symbolic variable binds) reference Ranges with no END
 /// pairing and must be skipped to avoid being mistaken for loop wrappers.
 fn collect_scheduled_range_ids(root: &Arc<UOp>, callable_ids: &HashSet<u64>) -> HashSet<u64> {
@@ -193,15 +194,21 @@ fn collect_call_bound_ranges(callable: &Arc<UOp>, scheduled_range_ids: &HashSet<
         let Op::Bind { var, value } = arg.op() else {
             continue;
         };
-        let Op::DefineVar { name, .. } = var.op() else {
-            return IrConstructionSnafu {
-                details: format!("CALL BIND source must wrap DEFINE_VAR, got {:?}", var.op()),
-            }
-            .fail();
-        };
         let Op::Range { .. } = value.op() else {
-            // User variable binds (`BIND(DEFINE_VAR, CONST)`) are not schedule loops.
+            // User variable binds (`BIND(variable, CONST)`) are not schedule loops.
             continue;
+        };
+        let name = match var.op() {
+            Op::DefineVar { name, .. } => name,
+            Op::Param { arg, .. } if arg.addrspace.is_none() => arg.name.as_ref().ok_or_else(|| {
+                Error::IrConstruction { details: "CALL BIND scalar PARAM source must have a name".to_string() }
+            })?,
+            _ => {
+                return IrConstructionSnafu {
+                    details: format!("CALL BIND Range source must wrap a variable, got {:?}", var.op()),
+                }
+                .fail();
+            }
         };
         // Only Ranges paired with an `END(Call)` are schedule-level wrappers;
         // standalone Range-valued binds carry runtime values, not loop counters.
@@ -612,6 +619,8 @@ pub struct ScheduleResult {
     /// Extracted directly from the SINK's sources via `buf_uop()`.
     /// For single-tensor realize, contains one ID.
     pub output_uop_ids: Vec<u64>,
+    /// Concrete handles for alias-only outputs that have no executable item.
+    pub alias_output_buffers: HashMap<u64, Buffer>,
 }
 
 /// Buffers collected for a single callable.
@@ -780,12 +789,38 @@ pub fn instantiate_schedule(
     };
 
     let mut templates: HashMap<u64, ScheduleItemTemplate> = HashMap::with_capacity(pre_schedule.items.len());
+    let mut alias_dependencies: HashMap<u64, Vec<u64>> = HashMap::new();
+    let mut alias_output_ids = HashSet::new();
     for item in &pre_schedule.items {
         let nodes = item.ast.toposort();
 
         // Map sources to actual Buffers.
-        let kb =
-            collect_callable_buffers(&item.sources, &item.ast, input_buffers, &mut allocated_buffers, &output_ids)?;
+        let mut kb = collect_callable_buffers(&item.sources, input_buffers, &mut allocated_buffers, &output_ids)?;
+
+        let effect = match item.ast.op() {
+            Op::End { computation, .. } => computation,
+            _ => &item.ast,
+        };
+        if let Op::Slice { offset, size, .. } = effect.op() {
+            let offset = match offset.op() {
+                Op::Const(value) => value.0.try_int().and_then(|value| usize::try_from(value).ok()),
+                _ => None,
+            }
+            .ok_or_else(|| Error::IrConstruction { details: "SLICE offset must be a non-negative constant".into() })?;
+            if kb.buffers.len() < 2 || kb.uop_ids.len() < 2 {
+                return IrConstructionSnafu {
+                    details: format!("SLICE call {} requires output and base buffers", item.kernel.id),
+                }
+                .fail();
+            }
+            let base = &kb.buffers[1];
+            let view = base.view(offset * base.dtype().bytes(), size * effect.dtype().bytes()).context(DeviceSnafu)?;
+            allocated_buffers.insert(kb.uop_ids[0], view.clone());
+            alias_output_ids.insert(kb.uop_ids[0]);
+            kb.buffers[0] = view;
+            alias_dependencies.insert(item.kernel.id, item.dependencies.clone());
+            continue;
+        }
 
         debug!(callable.id = item.kernel.id, num_sources = item.sources.len(), "Schedule item created");
 
@@ -797,6 +832,7 @@ pub fn instantiate_schedule(
                 .iter()
                 .filter_map(|n| match n.op() {
                     Op::DefineVar { name, .. } => Some(name.as_str()),
+                    Op::Param { arg, .. } if arg.addrspace.is_none() => arg.name.as_deref(),
                     _ => None,
                 })
                 .collect();
@@ -821,8 +857,21 @@ pub fn instantiate_schedule(
         );
     }
 
+    fn executable_dependencies(dependencies: &[u64], aliases: &HashMap<u64, Vec<u64>>, out: &mut HashSet<u64>) {
+        for dependency in dependencies {
+            if let Some(nested) = aliases.get(dependency) {
+                executable_dependencies(nested, aliases, out);
+            } else {
+                out.insert(*dependency);
+            }
+        }
+    }
+
     let mut schedule = Vec::with_capacity(pre_schedule.invocations.len());
     for invocation in &pre_schedule.invocations {
+        if alias_dependencies.contains_key(&invocation.kernel_id) {
+            continue;
+        }
         let Some(template) = templates.get(&invocation.kernel_id) else {
             return IrConstructionSnafu {
                 details: format!("invocation references unknown kernel id {}", invocation.kernel_id),
@@ -836,6 +885,10 @@ pub fn instantiate_schedule(
         fixedvars.extend(invocation.fixedvars.iter().map(|(k, v)| (k.clone(), *v)));
         let loop_var_names: HashSet<String> = invocation.fixedvars.keys().cloned().collect();
 
+        let mut dependencies = HashSet::new();
+        executable_dependencies(&template.dependencies, &alias_dependencies, &mut dependencies);
+        let mut dependencies: Vec<u64> = dependencies.into_iter().collect();
+        dependencies.sort_unstable();
         schedule.push(ScheduleItem {
             kernel: template.kernel.clone(),
             ast: template.ast.clone(),
@@ -843,18 +896,23 @@ pub fn instantiate_schedule(
             buffer_uop_ids: template.buffer_uop_ids.clone(),
             fixedvars,
             loop_var_names,
-            dependencies: template.dependencies.clone(),
+            dependencies,
             instance_dependencies: Vec::new(),
             alias_registered_ids: template.alias_registered_ids.clone(),
         });
     }
 
-    if schedule.is_empty() {
-        return EmptyScheduleSnafu.fail();
-    }
-
     let output_uop_ids: Vec<u64> = pre_schedule.output_buffer_uops.iter().map(|u| u.buf_uop().id).collect();
-    Ok(ScheduleResult { items: schedule, output_uop_ids })
+    let alias_output_buffers = output_uop_ids
+        .iter()
+        .filter_map(|id| {
+            if !alias_output_ids.contains(id) {
+                return None;
+            }
+            allocated_buffers.get(id).cloned().or_else(|| input_buffers.get(id).cloned()).map(|buffer| (*id, buffer))
+        })
+        .collect();
+    Ok(ScheduleResult { items: schedule, output_uop_ids, alias_output_buffers })
 }
 
 pub fn create_schedule(
@@ -925,7 +983,6 @@ fn find_first_input_buffer_device(
 /// input buffer. Newly allocated buffers are tracked in `allocated_buffers`.
 fn collect_callable_buffers(
     sources: &[Arc<UOp>],
-    ast: &Arc<UOp>,
     input_buffers: &InputBuffers,
     allocated_buffers: &mut HashMap<u64, Buffer>,
     output_ids: &HashSet<u64>,
@@ -1006,32 +1063,13 @@ fn collect_callable_buffers(
                     return Err(Error::BufferNotFound { uop_id: canonical_id });
                 }
             }
-            // Callable args/sources are typically Buffer/Param/After/DefineLocal.
-            Op::DefineLocal(_id) => {
-                // Allocate local/shared memory buffer on same device as inputs
-                let ptr_dtype = canonical_src.dtype();
-                let size = compute_buffer_size(ast, &canonical_src)?;
-
-                // Extract the base scalar dtype from the Ptr type
-                let scalar_dtype = match ptr_dtype {
-                    svod_dtype::DType::Ptr { base, .. } => *base,
-                    other => {
-                        return ExpectedPtrDtypeSnafu { context: "DEFINE_LOCAL", actual: other.clone() }.fail();
-                    }
-                };
-
-                let buffer =
-                    Buffer::new(target_device.allocator.clone(), scalar_dtype.clone(), vec![size], Default::default());
-
-                // Track in allocated_buffers (no registry needed)
-                allocated_buffers.insert(canonical_src.id, buffer.clone());
-
-                buffers.push(buffer);
-                uop_ids.push(canonical_src.id);
-            }
+            // LOCAL/REG BUFFERs are compiler-managed and never runtime arguments.
+            Op::Buffer { arg, .. } if arg.addrspace != Some(svod_ir::AddrSpace::Global) => {}
             Op::Buffer { .. } | Op::Param { .. } => {
                 let size = match canonical_src.op() {
-                    Op::Buffer { size, .. } => *size,
+                    Op::Buffer { .. } => canonical_src.buffer_size().ok_or_else(|| Error::IrConstruction {
+                        details: "BUFFER allocation requires a concrete shape".to_string(),
+                    })?,
                     Op::Param { .. } => canonical_src
                         .shape()
                         .ok()
@@ -1135,17 +1173,4 @@ fn schedule_range_bounds(range: &Arc<UOp>) -> Result<(i64, i64)> {
             .fail();
     }
     Ok((vmin, vmax))
-}
-
-/// Compute buffer size from the buffer definition's dtype.
-///
-/// Buffer size is embedded in the Ptr dtype by debuf() during rangeify
-/// (`dtype.ptr(size=...)`).
-fn compute_buffer_size(_ast: &Arc<UOp>, buffer_def: &Arc<UOp>) -> Result<usize> {
-    // Extract size from Ptr dtype (set by debuf() in split_patterns.rs)
-    match buffer_def.dtype() {
-        DType::Ptr { size: Some(s), .. } => Ok(s),
-        DType::Ptr { size: None, .. } => BufferPtrNoSizeSnafu.fail(),
-        other => ExpectedPtrDtypeSnafu { context: "buffer_size", actual: other.clone() }.fail(),
-    }
 }
