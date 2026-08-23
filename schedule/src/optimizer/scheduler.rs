@@ -916,7 +916,7 @@ impl Scheduler {
     /// Get the optimized AST with kernel metadata attached.
     ///
     /// This is the final step of optimization, which:
-    /// 1. Generates a kernel name from the shape (e.g., "r_g16l16R32u4")
+    /// 1. Generates a kernel name from the shape (e.g., "r_16_16_32_4")
     /// 2. Flattens nested ranges
     /// 3. Attaches KernelInfo metadata
     ///
@@ -933,60 +933,54 @@ impl Scheduler {
     /// ```ignore
     /// let optimized = scheduler.get_optimized_ast(None);
     /// let info = optimized.metadata::<KernelInfo>().unwrap();
-    /// println!("Kernel: {}", info.name); // "r_g16l16R32u4"
+    /// println!("Kernel: {}", info.name); // "r_16_16_32_4"
     /// ```
     pub fn get_optimized_ast(&self, name_override: Option<String>) -> Arc<UOp> {
         use crate::optimizer::KernelInfo;
 
         // 1. Generate kernel name
+        let custom_name = name_override.is_some();
         let name = name_override.unwrap_or_else(|| {
             // Prefix: "r" for reduce, "E" for elementwise
             let prefix = if self.reduceop().is_some() { "r" } else { "E" };
 
-            // Encode each range: {letter}{size}.
-            let shape_parts: Vec<String> = self
-                .rngs()
-                .iter()
-                .filter_map(|rng| {
-                    if let Op::Range { end, axis_type, .. } = rng.op() {
-                        // Get size if constant
-                        let size = if let Op::Const(cv) = end.op()
-                            && let svod_ir::ConstValue::Int(sz) = cv.0
-                        {
-                            sz.to_string()
-                        } else {
-                            "?".to_string()
-                        };
+            let extent_name = |end: &Arc<UOp>| match end.op() {
+                Op::Const(cv) => cv.0.try_int().map_or_else(|| "?".to_string(), |size| size.to_string()),
+                _ => "?".to_string(),
+            };
 
-                        // Get letter for axis type
-                        let letter = match axis_type {
-                            AxisType::Device => "d",
-                            AxisType::Global => "g",
-                            AxisType::Local => "l",
-                            AxisType::Weak | AxisType::Loop => "L",
-                            AxisType::Upcast => "u",
-                            AxisType::Reduce => "R",
-                            AxisType::GroupReduce => "G",
-                            AxisType::Unroll => "r",
-                            AxisType::Warp => "w",
-                            AxisType::Thread => "t",
-                            AxisType::Placeholder => "P",
-                        };
-
-                        Some(format!("{}{}", letter, size))
-                    } else {
-                        None
-                    }
+            // Tinygrad uses color only to distinguish axis classes in
+            // diagnostics. Function names retain only ordered extents.
+            let mut specials: Vec<_> = self
+                .ast
+                .toposort()
+                .into_iter()
+                .filter_map(|node| match node.op() {
+                    Op::Special { end, name } => Some((name.clone(), extent_name(end))),
+                    _ => None,
                 })
                 .collect();
+            specials.sort_by(|left, right| left.0.cmp(&right.0));
+            let mut shape_parts: Vec<String> = specials.into_iter().map(|(_, extent)| extent).collect();
+            shape_parts.extend(
+                self.rngs()
+                    .iter()
+                    .filter_map(|rng| {
+                        let Op::Range { end, .. } = rng.op() else { return None };
+                        Some(extent_name(end))
+                    })
+                    .collect::<Vec<_>>(),
+            );
 
-            format!("{}_{}", prefix, shape_parts.join(""))
+            if shape_parts.is_empty() { prefix.to_string() } else { format!("{}_{}", prefix, shape_parts.join("_")) }
         });
 
         // Deduplicate kernel names
-        let name = {
+        let name = if custom_name {
+            name
+        } else {
             let mut counts = kernel_name_counts().lock().unwrap();
-            let count = counts.entry(name.clone()).or_insert(0);
+            let count = counts.entry(svod_ir::to_function_name(&name)).or_insert(0);
             *count += 1;
 
             if *count > 1 { format!("{}n{}", name, *count - 1) } else { name }

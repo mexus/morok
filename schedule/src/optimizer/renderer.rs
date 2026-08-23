@@ -225,6 +225,35 @@ impl Renderer {
         }
     }
 
+    /// Tinygrad's abstract base renderer instantiated with a CPU target.
+    ///
+    /// This models reference compiler stages that intentionally use the base
+    /// renderer rather than a concrete CPU backend. Runtime CPU renderers must
+    /// continue to use [`Self::cpu`].
+    pub fn tinygrad_base_cpu() -> Self {
+        Self {
+            device: RendererDevice::Cpu,
+            target: None,
+            has_local: true,
+            has_shared: true,
+            has_threads: false,
+            shared_max: 32768,
+            global_max: Some(vec![0x8fff_ffff; 3]),
+            global_prod_max: None,
+            local_max: Some(0x8fff_ffff),
+            upcast_max: 16,
+            buffer_max: None,
+            tensor_cores: vec![],
+            supports_float4: true,
+            extra_matcher: None,
+            decomposition_matcher: None,
+            renderer_ops: Some(RendererOps::default()),
+            supported_dtypes: Self::common_dtypes(),
+            decomposition_profile: "none",
+            extra_profile: "none",
+        }
+    }
+
     /// Create a CUDA GPU renderer configuration (SM80/Ampere by default).
     ///
     /// For specific architectures, use `cuda_sm75()`, `cuda_sm80()`, or `cuda_sm89()`.

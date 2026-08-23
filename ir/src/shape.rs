@@ -884,11 +884,7 @@ pub fn infer_shape_from_op(uop: &UOp) -> crate::Result<Option<Shape>> {
         Op::Custom { .. } | Op::CustomI { .. } | Op::CustomFunction { .. } => None,
 
         // Graph organization operations have no shape
-        Op::Sink { .. } => None,
-        Op::Group { sources } => match sources.first() {
-            Some(src) => src.shape()?.cloned(),
-            None => None,
-        },
+        Op::Sink { .. } | Op::Group { .. } => None,
 
         Op::GetAddr { .. } => Some(smallvec![]),
     })

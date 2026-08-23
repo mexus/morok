@@ -11,6 +11,18 @@ fn test_renderer_cpu() {
 }
 
 #[test]
+fn test_tinygrad_base_cpu_renderer_is_distinct_from_runtime_cpu() {
+    let runtime = Renderer::cpu();
+    let reference = Renderer::tinygrad_base_cpu();
+
+    assert!(!runtime.has_local && !runtime.has_shared && runtime.has_threads);
+    assert!(reference.has_local && reference.has_shared && !reference.has_threads);
+    assert_eq!(reference.shared_max, 32768);
+    assert_eq!(reference.global_max, Some(vec![0x8fff_ffff; 3]));
+    assert_eq!(reference.local_max, Some(0x8fff_ffff));
+}
+
+#[test]
 fn test_renderer_cuda() {
     let r = Renderer::cuda();
     assert_eq!(r.device, RendererDevice::CudaSm80); // Default is SM80/Ampere

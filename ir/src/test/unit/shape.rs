@@ -1,6 +1,6 @@
 use smallvec::smallvec;
 
-use svod_dtype::DType;
+use svod_dtype::{DType, DeviceSpec};
 
 use crate::{ConstValue, SInt, UOp, shape::*};
 
@@ -14,6 +14,12 @@ fn test_is_static() {
     // For now, just test with concrete values
     let also_static = smallvec![SInt::from(3), SInt::from(10)];
     assert!(is_static(&also_static));
+}
+
+#[test]
+fn group_is_shape_opaque() {
+    let source = UOp::new_buffer(DeviceSpec::Cpu, 4, DType::Float32);
+    assert!(UOp::group(vec![source]).shape().unwrap().is_none());
 }
 
 #[test]

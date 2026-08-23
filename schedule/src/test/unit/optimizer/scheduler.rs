@@ -1314,12 +1314,7 @@ fn test_get_optimized_ast_reduce_kernel() {
     assert!(info.is_some());
 
     let info = info.unwrap();
-    // Kernel name should be: r_g16l8R32u4
-    assert!(info.name.starts_with("r_"));
-    assert!(info.name.contains("g16"));
-    assert!(info.name.contains("l8"));
-    assert!(info.name.contains("R32"));
-    assert!(info.name.contains("u4"));
+    assert!(info.name.starts_with("r_16_8_4_32"), "{}", info.name);
 }
 
 #[test]
@@ -1342,9 +1337,19 @@ fn test_get_optimized_ast_elementwise_kernel() {
     assert!(info.is_some());
 
     let info = info.unwrap();
-    // Kernel name should be: E_g256
-    assert!(info.name.starts_with("E_"));
-    assert!(info.name.contains("g256"));
+    assert!(info.name.starts_with("E_256"));
+}
+
+#[test]
+fn test_kernel_name_places_special_extents_before_range_extents() {
+    let special =
+        UOp::new(Op::Special { end: UOp::index_const(8), name: "gidx1".to_string() }, svod_dtype::DType::Int32);
+    let range = UOp::range_axis(UOp::index_const(16), AxisId::Renumbered(0), AxisType::Local);
+    let scheduler = Scheduler::new(UOp::sink(vec![special, range]), Renderer::cuda());
+
+    let optimized = scheduler.get_optimized_ast(None);
+    let info = optimized.metadata::<crate::optimizer::KernelInfo>().unwrap();
+    assert!(info.name.starts_with("E_8_16"));
 }
 
 #[test]
@@ -1366,6 +1371,8 @@ fn test_get_optimized_ast_custom_name() {
 
     let info = info.unwrap();
     assert_eq!(info.name, "custom_kernel");
+    let repeated = scheduler.get_optimized_ast(Some("custom_kernel".to_string()));
+    assert_eq!(repeated.metadata::<KernelInfo>().unwrap().name, "custom_kernel");
 }
 
 #[test]
@@ -1433,9 +1440,9 @@ fn test_kernel_name_deduplication() {
     assert_ne!(info1.name, info3.name, "Third kernel should have different name than first");
 
     // They should all start with the same base name
-    assert!(info1.name.starts_with("E_g16"), "First kernel name should start with E_g16");
-    assert!(info2.name.starts_with("E_g16"), "Second kernel name should start with E_g16");
-    assert!(info3.name.starts_with("E_g16"), "Third kernel name should start with E_g16");
+    assert!(info1.name.starts_with("E_16"), "First kernel name should start with E_16");
+    assert!(info2.name.starts_with("E_16"), "Second kernel name should start with E_16");
+    assert!(info3.name.starts_with("E_16"), "Third kernel name should start with E_16");
 
     // The second and third should have the deduplication suffix 'n'
     assert!(info2.name.contains('n'), "Second kernel should have deduplication suffix");

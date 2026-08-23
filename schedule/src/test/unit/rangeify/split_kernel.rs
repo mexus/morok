@@ -99,6 +99,15 @@ fn test_split_store_dense_global_params_with_internal_buffer() {
     assert!(args.iter().any(|arg| Arc::ptr_eq(arg, &output)));
     assert!(args.iter().any(|arg| Arc::ptr_eq(arg, &input)));
     assert!(matches!(args.last().unwrap().op(), Op::Bind { .. }));
+    let Op::Bind { var: call_var, value: call_value } = args.last().unwrap().op() else { unreachable!() };
+    let Op::Bind { var: body_var, value: body_value } = scalar.op() else { unreachable!() };
+    assert!(Arc::ptr_eq(call_value, body_value));
+    assert!(!Arc::ptr_eq(call_var, body_var), "CALL binding must not alias the body-local PARAM");
+    let (Op::Param { arg: call_arg, .. }, Op::Param { arg: body_arg, .. }) = (call_var.op(), body_var.op()) else {
+        panic!("scalar binding must retain PARAM semantics")
+    };
+    assert_eq!(call_arg, body_arg, "boundary identity must not change scalar metadata");
+    assert_eq!(call_var.dtype(), body_var.dtype());
 
     let mut global_slots: Vec<usize> = body
         .toposort()

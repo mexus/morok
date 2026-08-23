@@ -99,25 +99,11 @@ Strict requested capture uses `SVOD_CAPTURE_CANONICAL_STAGE`,
 request panics on graph serialization, JSON serialization, or file-write
 failure. `SVOD_DUMP_CANONICAL_STAGE` remains a best-effort diagnostic stream.
 
-The production fixture currently has strict parity at `tensor` and
-`rangeified`. Later captures are deterministic and recorded exactly in
-`CANONICAL_KNOWN_GAPS.txt`:
-
-- `kernel_ast`: callified PARAM device metadata and authored generated BUFFER
-  slots differ after the narrow implicit-name normalization.
-- `scheduled`: the same AST metadata differs, and the schedule artifact exposes
-  Svod's high-bit generated BUFFER slot versus Tinygrad slot zero.
-- `optimized`/`postrange`: range/optimization structure, applied opts, and
-  semantic generated kernel names differ.
-- `expanded`/`coalesced`/`gated`: the expand and late memory graphs differ in
-  constant placement, weak commitment, and grouping.
-- `program`/`linearized`: Svod gives GROUP a shaped value while Tinygrad leaves
-  GROUP shape unknown.
-
-These are not normalized away and keep EVID-01B open. Ordinary script mode
-fails on every production mismatch. `CANONICAL_RECORD_KNOWN_GAPS=1` succeeds
-only when both independent captures are deterministic and exactly match the
-checked-in manifest.
+The production fixture has strict parity at every captured stage from `tensor`
+through `linearized`. The checked manifest contains only the independent
+`padded_reduction` REDUCE-01 expected failure. Ordinary script mode fails on any
+new production mismatch. `CANONICAL_RECORD_KNOWN_GAPS=1` succeeds only when both
+independent captures are deterministic and exactly match the checked manifest.
 
 Every mismatch diagnostic starts with SHA-256 hashes of both complete validated
 documents. Hash input is deterministic JSON with recursively sorted object keys,

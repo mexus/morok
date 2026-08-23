@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use svod_dtype::{DType, DeviceSpec};
-use svod_ir::{ConstValue, KernelInfo, Op, RendererOps, UOp};
+use svod_ir::{ConstValue, KernelInfo, Op, UOp};
 use svod_schedule::optimizer::{OptStrategy, OptimizerConfig, Renderer};
 
 fn tensor_graph(multi_output: bool) -> Arc<UOp> {
@@ -299,7 +299,7 @@ fn main() {
     }
     assert!(!pre_schedule.items.is_empty());
 
-    let renderer = Renderer::cpu().with_rewrite_capabilities(RendererOps::all(), None, None);
+    let renderer = Renderer::tinygrad_base_cpu();
     let config = OptimizerConfig { strategy: OptStrategy::Heuristic, ..Default::default() };
     let optimized =
         svod_schedule::optimizer::optimize_kernel_with_config(ast, &renderer, &config).expect("production optimizer");
