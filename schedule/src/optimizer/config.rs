@@ -91,14 +91,14 @@ impl TcUsage {
 /// Tensor core optimization level.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub enum TcOpt {
-    /// Strict matching (TC_OPT=0).
+    /// Strict matching (TC_OPT=0, default).
+    #[default]
     Strict,
 
     /// Relaxed matching (TC_OPT=1).
     Relaxed,
 
-    /// Padded matching (TC_OPT=2, default).
-    #[default]
+    /// Padded matching (TC_OPT=2).
     Padded,
 }
 
@@ -295,6 +295,8 @@ impl HeuristicsConfig {
     /// * `SVOD_K_VECTORIZE` - Enable K-axis vectorization (default: disabled)
     /// * `SVOD_NO_OUTPUT_UPCAST` - Disable output dimension upcasting (default: enabled)
     /// * `SVOD_TC` - Tensor-core usage: `0` disables, `2` shape-only, else enabled
+    /// * `TC_OPT` / `SVOD_TC_OPT` - Strict (`0`), relaxed (`1`), or padded (`2`)
+    /// * `TC_SELECT` / `SVOD_TC_SELECT` - Auto (`-1`) or a tensor-core index
     pub fn from_env() -> Self {
         let parse_usize = |keys: &[&str], default: usize| {
             keys.iter().find_map(|k| std::env::var(k).ok().and_then(|v| v.parse::<usize>().ok())).unwrap_or(default)
@@ -317,6 +319,17 @@ impl HeuristicsConfig {
             Some("2") => TcUsage::ShapeOnly,
             _ => TcUsage::Enabled,
         };
+        let tc_opt = match parse_usize(&["SVOD_TC_OPT", "TC_OPT"], 0) {
+            1 => TcOpt::Relaxed,
+            2 => TcOpt::Padded,
+            _ => TcOpt::Strict,
+        };
+        let tc_select = ["SVOD_TC_SELECT", "TC_SELECT"]
+            .iter()
+            .find_map(|key| std::env::var(key).ok().and_then(|value| value.parse::<i32>().ok()))
+            .and_then(|value| usize::try_from(value).ok())
+            .map(TcSelect::Index)
+            .unwrap_or(TcSelect::Auto);
 
         Self {
             matvec_enabled,
@@ -327,6 +340,8 @@ impl HeuristicsConfig {
             k_vectorize,
             output_upcast,
             tc_enabled,
+            tc_opt,
+            tc_select,
             ..Default::default()
         }
     }
@@ -336,7 +351,7 @@ impl Default for HeuristicsConfig {
     fn default() -> Self {
         Self {
             tc_enabled: TcUsage::Enabled,
-            tc_opt: TcOpt::Padded,
+            tc_opt: TcOpt::Strict,
             tc_select: TcSelect::Auto,
             matvec_enabled: true,
             matvec_blocksize: 4,
@@ -438,6 +453,7 @@ impl OptimizerConfig {
         #[builder(default = std::env::var("TRANSCENDENTAL").ok().and_then(|value| value.parse().ok()).unwrap_or(1))]
         transcendental: i32,
     ) -> Self {
+        let beam = beam.with_strategy_width(&strategy);
         Self { strategy, beam, heuristics, transcendental }
     }
 

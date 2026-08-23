@@ -40,7 +40,7 @@ fn test_beam_config_builder() {
 fn test_heuristics_config_default() {
     let config = HeuristicsConfig::default();
     assert_eq!(config.tc_enabled, TcUsage::Enabled);
-    assert_eq!(config.tc_opt, TcOpt::Padded);
+    assert_eq!(config.tc_opt, TcOpt::Strict);
     assert!(config.matvec_enabled);
     assert_eq!(config.threads_per_row, 8);
     assert_eq!(config.rows_per_thread, 4);
@@ -79,6 +79,7 @@ fn test_optimizer_config_builder() {
         .build();
 
     assert_eq!(config.strategy, OptStrategy::Beam { width: 8 });
+    assert_eq!(config.beam.beam_width, 8);
     assert_eq!(config.beam.max_upcast, 512);
 }
 

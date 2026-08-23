@@ -1,4 +1,4 @@
-use super::super::types::OptOps;
+use super::super::types::{OptArgExt, OptOps};
 use super::*;
 
 #[test]
@@ -40,6 +40,14 @@ fn test_beam_actions_contains_expected_types() {
     assert!(has_tc);
     assert!(has_swap);
     // NOLOCALS is env-gated (`SVOD_NOLOCALS`), tested separately.
+}
+
+#[test]
+fn test_beam_tensor_core_actions_keep_strict_default_and_padded_axes() {
+    let tensor_core_actions = BEAM_ACTIONS.iter().filter(|action| action.op == OptOps::TC).collect::<Vec<_>>();
+    assert_eq!(tensor_core_actions.len(), 10);
+    assert!(tensor_core_actions.iter().any(|action| action.arg.tc().unwrap().1 == 0));
+    assert_eq!(tensor_core_actions.iter().filter(|action| action.arg.tc().unwrap().1 == 2).count(), 9);
 }
 
 #[test]
