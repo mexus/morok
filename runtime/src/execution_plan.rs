@@ -55,12 +55,6 @@ struct BufferAccess {
     end: usize,
 }
 
-impl BufferAccess {
-    fn overlaps(&self, other: &Self) -> bool {
-        self.storage == other.storage && self.start < other.end && other.start < self.end
-    }
-}
-
 #[derive(Clone, Debug)]
 struct HcqPreparedOperation {
     operation: usize,
@@ -71,38 +65,20 @@ struct HcqPreparedOperation {
     is_copy: bool,
 }
 
-#[cfg(test)]
-#[allow(dead_code)]
-#[derive(Debug)]
-struct HcqEpoch {
-    submissions: Vec<svod_device::hcq::Submission>,
-    resets: Vec<u64>,
-}
-
-#[derive(Clone, Copy)]
-enum HcqPoint {
-    PriorDevice,
-    Operation(usize),
-    FinalDevice,
-}
-
 struct HcqLinkedPlan {
-    operations: Vec<HcqPreparedOperation>,
-    linked: Vec<svod_device::hcq::SemanticLinkedSubmission>,
-    replay: Mutex<Vec<svod_device::hcq::SemanticReplaySubmission>>,
-    lanes: Vec<svod_device::hcq::LaneSubmission>,
+    semantic: svod_device::hcq::SemanticLinkedPlan,
 }
 
 impl HcqLinkedPlan {
     fn capture(operations: Vec<HcqPreparedOperation>) -> Result<Self> {
-        use svod_device::hcq::{Command, CommandField, PatchSource, QueueKind, Submission, SystemField};
-
         let topology = operations
             .iter()
             .map(|operation| {
                 let resource = |access: &BufferAccess| svod_device::hcq::TopologyResource {
                     id: access.storage.0,
                     owner: access.owner.clone(),
+                    start: access.start,
+                    end: access.end,
                 };
                 let reads = operation.reads.iter().map(resource).collect::<Vec<_>>();
                 let writes = operation.writes.iter().map(resource).collect::<Vec<_>>();
@@ -128,217 +104,18 @@ impl HcqLinkedPlan {
         // resources therefore stage rather than assuming family-wide access.
         let lanes = svod_device::hcq::schedule_device_lanes(
             &topology,
-            svod_device::hcq::QueueMergeLimits::UNLIMITED,
+            svod_device::hcq::QueueMergeLimits::NO_MERGE,
             |executor, owner| executor == owner,
         );
-        let mut submissions = Vec::with_capacity(operations.len() + usize::from(!operations.is_empty()));
-        let mut first_use = HashSet::new();
-        let mut prior: Vec<(&HcqPreparedOperation, usize)> = Vec::with_capacity(operations.len());
-        let mut latest_by_queue: HashMap<QueueKind, usize> = HashMap::new();
-        let bind_point = |submission: &mut Submission, command: usize, point: HcqPoint, store: bool| -> Result<()> {
-            let slot = match point {
-                HcqPoint::PriorDevice => 0,
-                HcqPoint::Operation(index) => index as u32 + 1,
-                HcqPoint::FinalDevice => operations.len() as u32 + 1,
-            };
-            let (address, value) = if store {
-                (CommandField::StoreDst, CommandField::StoreValue)
-            } else {
-                (CommandField::WaitAddress, CommandField::WaitValue)
-            };
-            submission.bind(command, address, PatchSource::System(SystemField::TimelineSignal(slot)))?.bind(
-                command,
-                value,
-                PatchSource::System(SystemField::TimelineValue(slot)),
-            )?;
-            Ok(())
-        };
-
-        for (index, operation) in operations.iter().enumerate() {
-            let mut submission = Submission::new(operation.queue);
-            if first_use.insert(operation.queue) {
-                submission.push(Command::MemoryBarrier);
-                let command = submission.commands.len();
-                submission.push(Command::Wait { signal_address: 0, value: 0 });
-                bind_point(&mut submission, command, HcqPoint::PriorDevice, false)?;
-            }
-            let mut waits: HashMap<QueueKind, usize> = HashMap::new();
-            for (producer, producer_index) in &prior {
-                if producer.queue == operation.queue {
-                    continue;
-                }
-                let raw = producer.writes.iter().any(|a| operation.reads.iter().any(|b| a.overlaps(b)));
-                let war = producer.reads.iter().any(|a| operation.writes.iter().any(|b| a.overlaps(b)));
-                let waw = producer.writes.iter().any(|a| operation.writes.iter().any(|b| a.overlaps(b)));
-                if raw || war || waw {
-                    waits
-                        .entry(producer.queue)
-                        .and_modify(|v| *v = (*v).max(*producer_index))
-                        .or_insert(*producer_index);
-                }
-            }
-            let mut waits: Vec<_> = waits.into_iter().collect();
-            waits.sort_unstable_by_key(|(queue, _)| match queue {
-                QueueKind::Compute(n) => (0, *n),
-                QueueKind::Copy(n) => (1, *n),
-            });
-            for (_, producer) in waits {
-                let command = submission.commands.len();
-                submission.push(Command::Wait { signal_address: 0, value: 0 });
-                bind_point(&mut submission, command, HcqPoint::Operation(producer), false)?;
-            }
-            submission.push(Command::Execute { operation: operation.operation });
-            let command = submission.commands.len();
-            submission.push(Command::Store { dst: 0, value: 0 });
-            bind_point(&mut submission, command, HcqPoint::Operation(index), true)?;
-            latest_by_queue.insert(operation.queue, index);
-            prior.push((operation, index));
-            submissions.push(submission);
-        }
-
-        if !operations.is_empty() {
-            let finalizer_queue = QueueKind::Compute(0);
-            let mut finalizer = Submission::new(finalizer_queue);
-            if !first_use.contains(&finalizer_queue) {
-                finalizer.push(Command::MemoryBarrier);
-                let command = finalizer.commands.len();
-                finalizer.push(Command::Wait { signal_address: 0, value: 0 });
-                bind_point(&mut finalizer, command, HcqPoint::PriorDevice, false)?;
-            }
-            let mut queues: Vec<_> = latest_by_queue.into_iter().collect();
-            queues.sort_unstable_by_key(|(queue, _)| match queue {
-                QueueKind::Compute(n) => (0, *n),
-                QueueKind::Copy(n) => (1, *n),
-            });
-            for (queue, producer) in queues {
-                if queue != finalizer_queue {
-                    let command = finalizer.commands.len();
-                    finalizer.push(Command::Wait { signal_address: 0, value: 0 });
-                    bind_point(&mut finalizer, command, HcqPoint::Operation(producer), false)?;
-                }
-            }
-            let command = finalizer.commands.len();
-            finalizer.push(Command::Store { dst: 0, value: 0 });
-            bind_point(&mut finalizer, command, HcqPoint::FinalDevice, true)?;
-            submissions.push(finalizer);
-        }
-
-        let linked: Vec<_> = submissions.into_iter().map(svod_device::hcq::SemanticLinkedSubmission::new).collect();
-        let replay = linked.iter().map(|submission| submission.replay_buffer()).collect();
-        Ok(Self { operations, linked, replay: Mutex::new(replay), lanes })
+        let semantic = svod_device::hcq::SemanticLinkedPlan::from_lane_submissions(lanes, |_| {
+            [
+                NEXT_HCQ_SIGNAL_ADDRESS.fetch_add(8, Ordering::Relaxed),
+                NEXT_HCQ_SIGNAL_ADDRESS.fetch_add(8, Ordering::Relaxed),
+            ]
+        })
+        .context(ExecSnafu { context: "link semantic HCQ topology" })?;
+        Ok(Self { semantic })
     }
-
-    fn patch_epoch(&self, timelines: &mut svod_device::hcq::SubmissionTimelines) -> Result<Vec<u64>> {
-        use svod_device::hcq::{RuntimePatchValues, SystemField, SystemPatchValues};
-        if self.operations.is_empty() {
-            return Ok(Vec::new());
-        }
-        let mut points = Vec::with_capacity(self.operations.len());
-        let mut system = SystemPatchValues::default();
-        let prior = timelines.device();
-        system.0.insert(SystemField::TimelineSignal(0), prior.signal_address);
-        system.0.insert(SystemField::TimelineValue(0), prior.value);
-        for (index, operation) in self.operations.iter().enumerate() {
-            let point = timelines.reserve_queue(operation.queue);
-            points.push(point);
-            system.0.insert(SystemField::TimelineSignal(index as u32 + 1), point.signal_address);
-            system.0.insert(SystemField::TimelineValue(index as u32 + 1), point.value);
-        }
-        let final_point = timelines.finalize_device();
-        let final_slot = self.operations.len() as u32 + 1;
-        system.0.insert(SystemField::TimelineSignal(final_slot), final_point.signal_address);
-        system.0.insert(SystemField::TimelineValue(final_slot), final_point.value);
-        let mut replay = self
-            .replay
-            .lock()
-            .map_err(|_| crate::error::Error::Execution { reason: "HCQ replay lock poisoned".into() })?;
-        for ((linked, replay), _) in self.linked.iter().zip(replay.iter_mut()).zip(0..) {
-            linked
-                .patch(replay, &RuntimePatchValues::default(), &system)
-                .context(ExecSnafu { context: "patch linked semantic HCQ submission" })?;
-        }
-        Ok(timelines.take_resets())
-    }
-}
-
-#[cfg(test)]
-fn build_hcq_epoch(
-    operations: &[HcqPreparedOperation],
-    timelines: &mut svod_device::hcq::SubmissionTimelines,
-) -> HcqEpoch {
-    use svod_device::hcq::{Command, QueueKind, Submission};
-
-    if operations.is_empty() {
-        return HcqEpoch { submissions: Vec::new(), resets: Vec::new() };
-    }
-
-    let prior_epoch = timelines.device();
-    let mut submissions = Vec::with_capacity(operations.len() + 1);
-    let mut first_use = HashSet::new();
-    let mut prior: Vec<(&HcqPreparedOperation, svod_device::hcq::TimelinePoint)> = Vec::with_capacity(operations.len());
-    let mut latest_by_queue: HashMap<QueueKind, svod_device::hcq::TimelinePoint> = HashMap::new();
-
-    for operation in operations {
-        let timeline = timelines.reserve_queue(operation.queue);
-        let mut submission = Submission::new(operation.queue);
-        if first_use.insert(operation.queue) {
-            submission.push(Command::MemoryBarrier).wait_for(prior_epoch);
-        }
-
-        // Keep only the newest dependency from each producer queue. FIFO makes
-        // same-queue dependencies implicit; the three overlap tests are RAW,
-        // WAR, and WAW respectively.
-        let mut waits: HashMap<QueueKind, svod_device::hcq::TimelinePoint> = HashMap::new();
-        for (producer, producer_timeline) in &prior {
-            if producer.queue == operation.queue {
-                continue;
-            }
-            let raw = producer.writes.iter().any(|a| operation.reads.iter().any(|b| a.overlaps(b)));
-            let war = producer.reads.iter().any(|a| operation.writes.iter().any(|b| a.overlaps(b)));
-            let waw = producer.writes.iter().any(|a| operation.writes.iter().any(|b| a.overlaps(b)));
-            if raw || war || waw {
-                waits
-                    .entry(producer.queue)
-                    .and_modify(|v| {
-                        if producer_timeline.value > v.value {
-                            *v = *producer_timeline;
-                        }
-                    })
-                    .or_insert(*producer_timeline);
-            }
-        }
-        let mut waits: Vec<_> = waits.into_iter().collect();
-        waits.sort_unstable_by_key(|(queue, _)| match queue {
-            QueueKind::Compute(n) => (0, *n),
-            QueueKind::Copy(n) => (1, *n),
-        });
-        for (_queue, value) in waits {
-            submission.push(Command::Wait { signal_address: value.signal_address, value: value.value });
-        }
-        submission.push(Command::Execute { operation: operation.operation }).signal(timeline);
-        latest_by_queue.insert(operation.queue, timeline);
-        prior.push((operation, timeline));
-        submissions.push(submission);
-    }
-
-    let finalizer_queue = QueueKind::Compute(0);
-    let mut finalizer = Submission::new(finalizer_queue);
-    if !first_use.contains(&finalizer_queue) {
-        finalizer.push(Command::MemoryBarrier).wait_for(prior_epoch);
-    }
-    let mut queues: Vec<_> = latest_by_queue.into_iter().collect();
-    queues.sort_unstable_by_key(|(queue, _)| match queue {
-        QueueKind::Compute(n) => (0, *n),
-        QueueKind::Copy(n) => (1, *n),
-    });
-    for (queue, value) in queues {
-        if queue != finalizer_queue {
-            finalizer.wait_for(value);
-        }
-    }
-    finalizer.signal(timelines.finalize_device());
-    submissions.push(finalizer);
-    HcqEpoch { submissions, resets: timelines.take_resets() }
 }
 
 // ============================================================================
@@ -576,9 +353,6 @@ pub struct ExecutionPlan {
     /// the backend has no reusable context (CPU) → per-call `Program::execute`.
     plan_ctx: std::sync::OnceLock<Option<Box<dyn svod_device::PlanContext>>>,
 
-    /// Monotonic HCQ state. Signal addresses are stable for the plan lifetime;
-    /// values roll forward once per execution epoch.
-    hcq_timeline: Mutex<svod_device::hcq::SubmissionTimelines>,
     hcq_executor: Mutex<svod_device::hcq::CpuQueueExecutor>,
     hcq_linked: std::sync::OnceLock<HcqLinkedPlan>,
     /// First failure after a semantic HCQ epoch reserved timeline points.
@@ -607,6 +381,20 @@ impl ExecutionPlan {
 
     fn replay_native_linked_plan(&self) -> Result<svod_device::device::NativeReplayOutcome> {
         use svod_device::device::{CopyEndpoint, NativeReplayDecline, NativeReplayOutcome};
+
+        let semantic = &self.hcq_linked.get().expect("HCQ plan linked by builder").semantic;
+        if let Some(operation) = semantic.staged_copy() {
+            return Ok(NativeReplayOutcome::Declined(NativeReplayDecline::StagedCopy { operation }));
+        }
+        if let Some(expected) = semantic.lanes().first().map(|submission| &submission.lane.device)
+            && let Some(actual) =
+                semantic.lanes().iter().map(|submission| &submission.lane.device).find(|d| d != &expected)
+        {
+            return Ok(NativeReplayOutcome::Declined(NativeReplayDecline::MixedComputeDevices {
+                expected: expected.clone(),
+                actual: actual.clone(),
+            }));
+        }
 
         enum CallValues<'a> {
             Program {
@@ -770,8 +558,7 @@ impl ExecutionPlan {
                 CallValues::Unsupported => svod_device::PlanCall::Unsupported,
             })
             .collect::<Vec<_>>();
-        ctx.replay_linked_plan(&self.hcq_linked.get().expect("HCQ plan linked by builder").linked, &calls)
-            .context(ExecSnafu { context: "replay native linked HCQ plan" })
+        ctx.replay_linked_plan(semantic, &calls).context(ExecSnafu { context: "replay native linked HCQ plan" })
     }
 
     fn buffer_access(&self, index: usize) -> Result<BufferAccess> {
@@ -853,28 +640,7 @@ impl ExecutionPlan {
             let writes = write_indices.into_iter().map(map_access).collect::<Result<Vec<_>>>()?;
             operations.push(HcqPreparedOperation { operation, device, queue, reads, writes, is_copy });
         }
-        // Queue numbers are lane-local in HCQ2. Encode the deterministic device
-        // partition into the neutral queue number for existing single-device
-        // lowerers; device 0 remains queue 0 and therefore packet-compatible.
-        let mut devices = operations.iter().map(|op| op.device.clone()).collect::<Vec<_>>();
-        devices.sort_by_key(DeviceSpec::canonicalize);
-        devices.dedup();
-        for op in &mut operations {
-            let lane = devices.iter().position(|device| device == &op.device).unwrap() as u32;
-            op.queue = match op.queue {
-                QueueKind::Compute(_) => QueueKind::Compute(lane),
-                QueueKind::Copy(_) => QueueKind::Copy(lane),
-            };
-        }
         Ok(operations)
-    }
-
-    fn patch_hcq_epoch(&self) -> Result<Vec<u64>> {
-        let mut state = self
-            .hcq_timeline
-            .lock()
-            .map_err(|_| crate::error::Error::Execution { reason: "HCQ timeline lock poisoned".into() })?;
-        self.hcq_linked.get().expect("HCQ plan linked by builder").patch_epoch(&mut state)
     }
 
     fn submission_error(error: svod_device::hcq::SubmissionExecutionError<crate::error::Error>) -> crate::error::Error {
@@ -1194,6 +960,65 @@ impl ExecutionPlan {
         dst.copy_from(src).context(ExecSnafu { context: format!("copy op {}", copy.id) })
     }
 
+    fn copy_buffers(&self, operation: usize) -> Result<(&Buffer, &Buffer)> {
+        let PreparedOp::BufferCopy(copy) = self.ops.get(operation).ok_or_else(|| crate::error::Error::Execution {
+            reason: format!("HCQ copy operation {operation} is out of range"),
+        })?
+        else {
+            return Err(crate::error::Error::Execution {
+                reason: format!("HCQ copy leg references non-copy operation {operation}"),
+            });
+        };
+        if copy.buffer_indices.len() < 2 {
+            return Err(crate::error::Error::Execution {
+                reason: format!("Copy op {} requires at least two buffer indices", copy.id),
+            });
+        }
+        let dst = self.buffers.get(copy.buffer_indices[0]).ok_or_else(|| crate::error::Error::Execution {
+            reason: format!("Copy op {} destination buffer is out of range", copy.id),
+        })?;
+        let src = self.buffers.get(copy.buffer_indices[1]).ok_or_else(|| crate::error::Error::Execution {
+            reason: format!("Copy op {} source buffer is out of range", copy.id),
+        })?;
+        if dst.size() != src.size() {
+            return Err(crate::error::Error::Execution {
+                reason: format!("Copy op {} size mismatch: dst={}, src={}", copy.id, dst.size(), src.size()),
+            });
+        }
+        Ok((dst, src))
+    }
+
+    fn execute_topology_command(
+        &self,
+        command: &svod_device::hcq::TopologyCommand,
+        staging: &mut HashMap<usize, Vec<u8>>,
+    ) -> Result<()> {
+        use svod_device::hcq::CopyLeg;
+
+        match command.copy_leg {
+            None => self.execute_op(&self.ops[command.operation]),
+            Some(CopyLeg::Direct) => {
+                let PreparedOp::BufferCopy(copy) = &self.ops[command.operation] else { unreachable!() };
+                self.execute_copy(copy)
+            }
+            Some(CopyLeg::ToHost) => {
+                let (_, src) = self.copy_buffers(command.operation)?;
+                let mut bytes = vec![0; src.size()];
+                src.copyout(&mut bytes).context(ExecSnafu { context: "HCQ staged copy to host" })?;
+                staging.insert(command.operation, bytes);
+                Ok(())
+            }
+            Some(CopyLeg::FromHost) => {
+                let (dst, _) = self.copy_buffers(command.operation)?;
+                let bytes = staging.remove(&command.operation).ok_or_else(|| crate::error::Error::Execution {
+                    reason: format!("HCQ staged copy {} has no host epoch buffer", command.operation),
+                })?;
+                let mut dst = dst.clone();
+                dst.copyin(&bytes).context(ExecSnafu { context: "HCQ staged copy from host" })
+            }
+        }
+    }
+
     #[inline]
     fn execute_custom_function(&self, custom: &PreparedCustomFunction) -> Result<()> {
         let mut buffers = Vec::with_capacity(custom.buffer_indices.len());
@@ -1377,56 +1202,42 @@ impl ExecutionPlan {
             return Ok(());
         }
         let mut graph_replayed = false;
-        let resets = match self.patch_hcq_epoch() {
-            Ok(resets) => resets,
-            Err(error) => return self.poison_hcq(Err(error)),
-        };
         let result = (|| {
-            for &signal in &resets {
-                executor.set_signal(signal, 0);
-            }
             let linked = self.hcq_linked.get().expect("HCQ plan linked by builder");
-            let replay = linked
-                .replay
-                .lock()
-                .map_err(|_| crate::error::Error::Execution { reason: "HCQ replay lock poisoned".into() })?;
-            for submission in replay.iter().map(|replay| replay.submission()) {
-                // SAFETY: plan epochs encode copies as validated prepared Execute
-                // operations, never as unresolved host-address Copy commands.
-                unsafe {
-                    executor.submit(submission, |operation| {
-                        if let Some(graph) = graph {
-                            if !graph_replayed {
-                                let mut buffers = Vec::new();
-                                let mut vals = Vec::new();
-                                for level in &self.op_levels {
-                                    for &index in level {
-                                        if let PreparedOp::CompiledProgram(kernel) = &self.ops[index] {
-                                            for &buffer in &kernel.buffer_indices {
-                                                buffers.push(self.buffers[buffer].device_address().context(
-                                                    ExecSnafu {
-                                                        context: format!(
-                                                            "resolve graph replay buffer for kernel {}",
-                                                            kernel.id
-                                                        ),
-                                                    },
-                                                )?);
-                                            }
-                                            vals.extend_from_slice(&kernel.vals);
+            let mut staging = HashMap::new();
+            // SAFETY: semantic plan submissions contain only waits, callback
+            // execution, and timeline stores; copies are resolved by Buffer.
+            unsafe {
+                linked.semantic.execute_cpu(&mut executor, |_, command| {
+                    if let Some(graph) = graph {
+                        if !graph_replayed {
+                            let mut buffers = Vec::new();
+                            let mut vals = Vec::new();
+                            for level in &self.op_levels {
+                                for &index in level {
+                                    if let PreparedOp::CompiledProgram(kernel) = &self.ops[index] {
+                                        for &buffer in &kernel.buffer_indices {
+                                            buffers.push(self.buffers[buffer].device_address().context(ExecSnafu {
+                                                context: format!(
+                                                    "resolve graph replay buffer for kernel {}",
+                                                    kernel.id
+                                                ),
+                                            })?);
                                         }
+                                        vals.extend_from_slice(&kernel.vals);
                                     }
                                 }
-                                graph.replay(&buffers, &vals).context(ExecSnafu { context: "graph replay" })?;
-                                graph_replayed = true;
                             }
-                        } else {
-                            self.execute_op(&self.ops[operation])?;
+                            graph.replay(&buffers, &vals).context(ExecSnafu { context: "graph replay" })?;
+                            graph_replayed = true;
                         }
-                        Ok(())
-                    })
-                }
-                .map_err(Self::submission_error)?;
+                    } else {
+                        self.execute_topology_command(command, &mut staging)?;
+                    }
+                    Ok(())
+                })
             }
+            .map_err(Self::submission_error)?;
             if let Some(ctx) = self.plan_ctx.get().and_then(|context| context.as_deref()) {
                 ctx.finish_replay().context(ExecSnafu { context: "finish direct HCQ replay" })?;
             }
@@ -1466,19 +1277,8 @@ impl ExecutionPlan {
             .hcq_executor
             .lock()
             .map_err(|_| crate::error::Error::Execution { reason: "CPU HCQ executor lock poisoned".into() })?;
-        let resets = match self.patch_hcq_epoch() {
-            Ok(resets) => resets,
-            Err(error) => return self.poison_hcq(Err(error)),
-        };
         let result = (|| {
-            for &signal in &resets {
-                executor.set_signal(signal, 0);
-            }
             let linked = self.hcq_linked.get().expect("HCQ plan linked by builder");
-            let replay = linked
-                .replay
-                .lock()
-                .map_err(|_| crate::error::Error::Execution { reason: "HCQ replay lock poisoned".into() })?;
 
             if let Some(graph) =
                 self.graph_endpoints_match_device()?.then(|| self.graph()).and_then(|graph| graph.as_deref())
@@ -1526,23 +1326,24 @@ impl ExecutionPlan {
                             Some(handle),
                         );
                     }
-                    // Keep the plan's neutral device/queue epochs coherent with a
-                    // graph replay without executing the modeled operations again.
-                    for submission in replay.iter().map(|replay| replay.submission()) {
-                        // SAFETY: generated plan epochs contain no raw Copy commands.
-                        unsafe { executor.submit(submission, |_| Ok::<_, crate::error::Error>(())) }
+                    // Keep neutral lane timelines coherent without replaying the graph.
+                    unsafe {
+                        linked
+                            .semantic
+                            .execute_cpu(&mut executor, |_, _| Ok::<_, crate::error::Error>(()))
                             .map_err(Self::submission_error)?;
                     }
                     return finalizer.finish(|| Ok(()));
                 }
             }
 
-            for submission in replay.iter().map(|replay| replay.submission()) {
-                // SAFETY: plan epochs encode copies as validated prepared Execute
-                // operations, never as unresolved host-address Copy commands.
-                unsafe {
-                    executor.submit(submission, |idx| {
-                        match &self.ops[idx] {
+            let mut staging = HashMap::new();
+            unsafe {
+                linked.semantic.execute_cpu(&mut executor, |_, command| {
+                    if command.copy_leg.is_some() {
+                        self.execute_topology_command(command, &mut staging)?;
+                    } else {
+                        match &self.ops[command.operation] {
                             PreparedOp::CompiledProgram(kernel) => {
                                 let start = Instant::now();
                                 let handle = self.execute_kernel(kernel, /*profile=*/ true)?;
@@ -1560,14 +1361,14 @@ impl ExecutionPlan {
                                     handle,
                                 );
                             }
-                            PreparedOp::BufferCopy(copy) => self.execute_copy(copy)?,
+                            PreparedOp::BufferCopy(_) => unreachable!(),
                             PreparedOp::CustomFunction(custom) => self.execute_custom_function(custom)?,
                         }
-                        Ok(())
-                    })
-                }
-                .map_err(Self::submission_error)?;
+                    }
+                    Ok(())
+                })
             }
+            .map_err(Self::submission_error)?;
             finalizer.finish(|| {
                 if let Some(ctx) = self.plan_ctx.get().and_then(|context| context.as_deref()) {
                     ctx.synchronize().context(ExecSnafu { context: "profiled HCQ finalizer" })?;
@@ -1758,7 +1559,7 @@ impl std::fmt::Debug for ExecutionPlan {
             .field("op_order", &self.op_order.len())
             .field("kernels", &kernel_count)
             .field("buffers", &self.buffers.len())
-            .field("hcq_lanes", &self.hcq_linked.get().map(|linked| linked.lanes.len()))
+            .field("hcq_lanes", &self.hcq_linked.get().map(|linked| linked.semantic.lanes().len()))
             .field("device", &self.device)
             .finish()
     }
@@ -1946,20 +1747,6 @@ impl ExecutionPlanBuilder {
             alias_ids: self.alias_ids,
             graph: std::sync::OnceLock::new(),
             plan_ctx: std::sync::OnceLock::new(),
-            hcq_timeline: Mutex::new(svod_device::hcq::SubmissionTimelines::new(
-                [
-                    NEXT_HCQ_SIGNAL_ADDRESS.fetch_add(8, Ordering::Relaxed),
-                    NEXT_HCQ_SIGNAL_ADDRESS.fetch_add(8, Ordering::Relaxed),
-                ],
-                [
-                    NEXT_HCQ_SIGNAL_ADDRESS.fetch_add(8, Ordering::Relaxed),
-                    NEXT_HCQ_SIGNAL_ADDRESS.fetch_add(8, Ordering::Relaxed),
-                ],
-                [
-                    NEXT_HCQ_SIGNAL_ADDRESS.fetch_add(8, Ordering::Relaxed),
-                    NEXT_HCQ_SIGNAL_ADDRESS.fetch_add(8, Ordering::Relaxed),
-                ],
-            )),
             hcq_executor: Mutex::new(svod_device::hcq::CpuQueueExecutor::default()),
             hcq_linked: std::sync::OnceLock::new(),
             hcq_poison: std::sync::OnceLock::new(),

@@ -356,7 +356,25 @@ fn gpu(id: usize) -> DeviceSpec {
 }
 
 fn resource(id: u64, owner: DeviceSpec) -> crate::hcq::TopologyResource {
-    crate::hcq::TopologyResource { id, owner }
+    resource_range(id, owner, 0, 16)
+}
+
+fn resource_range(id: u64, owner: DeviceSpec, start: usize, end: usize) -> crate::hcq::TopologyResource {
+    crate::hcq::TopologyResource { id, owner, start, end }
+}
+
+fn lane_signals(lane: &crate::hcq::DeviceQueue) -> [u64; 2] {
+    let device = match &lane.device {
+        DeviceSpec::Amd { device_id } => *device_id as u64 + 1,
+        DeviceSpec::Cpu => 0,
+        _ => 0x100,
+    };
+    let queue = match lane.queue {
+        QueueKind::Compute(number) => number as u64 * 4,
+        QueueKind::Copy(number) => number as u64 * 4 + 2,
+    };
+    let first = 0x1000 + device * 0x100 + queue * 0x10;
+    [first, first + 8]
 }
 
 fn copy_op(
@@ -375,7 +393,7 @@ fn copy_op(
 
 #[test]
 fn two_device_direct_peer_copy_stays_on_target_lane() {
-    use crate::hcq::{CopyLeg, QueueMergeLimits, schedule_device_lanes};
+    use crate::hcq::{CopyLeg, QueueMergeLimits, SemanticLinkedPlan, schedule_device_lanes};
     let op = copy_op(0, resource(1, gpu(0)), resource(2, gpu(1)));
     let scheduled = schedule_device_lanes(&[op], QueueMergeLimits::UNLIMITED, |executor, owner| {
         matches!((executor, owner), (DeviceSpec::Amd { .. }, DeviceSpec::Amd { .. }))
@@ -383,11 +401,22 @@ fn two_device_direct_peer_copy_stays_on_target_lane() {
     assert_eq!(scheduled.len(), 1);
     assert_eq!(scheduled[0].lane.device, gpu(1));
     assert_eq!(scheduled[0].commands[0].copy_leg, Some(CopyLeg::Direct));
+
+    let plan = SemanticLinkedPlan::from_lane_submissions(scheduled, lane_signals).unwrap();
+    let mut null = NullHcq::default();
+    let mut executed = Vec::new();
+    plan.execute_null(&mut null, |lane, command| {
+        executed.push((lane.clone(), command.clone()));
+        Ok::<_, ()>(())
+    })
+    .unwrap();
+    assert_eq!(executed.len(), 1);
+    assert_eq!(executed[0].1.copy_leg, Some(CopyLeg::Direct));
 }
 
 #[test]
 fn two_device_inaccessible_copy_inserts_ordered_host_staging() {
-    use crate::hcq::{CopyLeg, QueueMergeLimits, schedule_device_lanes};
+    use crate::hcq::{CopyLeg, QueueMergeLimits, SemanticLinkedPlan, schedule_device_lanes};
     let op = copy_op(4, resource(10, gpu(0)), resource(11, gpu(1)));
     let scheduled = schedule_device_lanes(&[op], QueueMergeLimits::UNLIMITED, |executor, owner| executor == owner);
     assert_eq!(scheduled.len(), 2);
@@ -397,6 +426,16 @@ fn two_device_inaccessible_copy_inserts_ordered_host_staging() {
     assert_eq!(scheduled[1].commands[0].copy_leg, Some(CopyLeg::FromHost));
     assert_eq!(scheduled[1].waits[0].lane, scheduled[0].lane);
     assert_eq!(scheduled[1].waits[0].value, scheduled[0].signal_value);
+
+    let plan = SemanticLinkedPlan::from_lane_submissions(scheduled, lane_signals).unwrap();
+    let mut null = NullHcq::default();
+    let mut legs = Vec::new();
+    plan.execute_null(&mut null, |_, command| {
+        legs.push(command.copy_leg.unwrap());
+        Ok::<_, ()>(())
+    })
+    .unwrap();
+    assert_eq!(legs, [CopyLeg::ToHost, CopyLeg::FromHost]);
 }
 
 #[test]
@@ -434,6 +473,269 @@ fn queue_merge_limits_split_exactly_after_boundary() {
     let scheduled =
         schedule_device_lanes(&ops, QueueMergeLimits { max_submissions: 2, max_commands: 2 }, |a, b| a == b);
     assert_eq!(scheduled.iter().map(|s| s.commands.len()).collect::<Vec<_>>(), [2, 2, 1]);
+
+    let unmerged = schedule_device_lanes(&ops, QueueMergeLimits::NO_MERGE, |a, b| a == b);
+    assert_eq!(unmerged.iter().map(|s| s.commands.len()).collect::<Vec<_>>(), [1, 1, 1, 1, 1]);
+}
+
+#[test]
+fn equal_queue_numbers_on_different_devices_keep_distinct_timelines() {
+    use crate::hcq::{DeviceQueue, QueueMergeLimits, SemanticLinkedPlan, TopologyOperation, TopologyOperationKind};
+    let operations = [
+        TopologyOperation {
+            operation: 0,
+            lane: DeviceQueue { device: gpu(0), queue: QueueKind::Compute(0) },
+            reads: vec![],
+            writes: vec![],
+            kind: TopologyOperationKind::Execute,
+        },
+        TopologyOperation {
+            operation: 1,
+            lane: DeviceQueue { device: gpu(1), queue: QueueKind::Compute(0) },
+            reads: vec![],
+            writes: vec![],
+            kind: TopologyOperationKind::Execute,
+        },
+    ];
+    let lanes = crate::hcq::schedule_device_lanes(&operations, QueueMergeLimits::UNLIMITED, |a, b| a == b);
+    let plan = SemanticLinkedPlan::from_lane_submissions(lanes, lane_signals).unwrap();
+    assert_ne!(plan.bindings()[0].point.signal_address, plan.bindings()[1].point.signal_address);
+
+    let mut null = NullHcq::default();
+    let mut devices = Vec::new();
+    plan.execute_null(&mut null, |lane, _| {
+        devices.push(lane.device.clone());
+        Ok::<_, ()>(())
+    })
+    .unwrap();
+    assert_eq!(devices, [gpu(0), gpu(1)]);
+}
+
+#[test]
+fn compute_copy_dependencies_execute_in_both_directions() {
+    use crate::hcq::{DeviceQueue, QueueMergeLimits, SemanticLinkedPlan, TopologyOperation, TopologyOperationKind};
+    let first = resource(30, gpu(0));
+    let second = resource(31, gpu(0));
+    let operations = [
+        TopologyOperation {
+            operation: 0,
+            lane: DeviceQueue { device: gpu(0), queue: QueueKind::Compute(0) },
+            reads: vec![],
+            writes: vec![first.clone()],
+            kind: TopologyOperationKind::Execute,
+        },
+        copy_op(1, first, second.clone()),
+        TopologyOperation {
+            operation: 2,
+            lane: DeviceQueue { device: gpu(0), queue: QueueKind::Compute(0) },
+            reads: vec![second],
+            writes: vec![],
+            kind: TopologyOperationKind::Execute,
+        },
+    ];
+    let lanes = crate::hcq::schedule_device_lanes(&operations, QueueMergeLimits::NO_MERGE, |a, b| a == b);
+    assert_eq!(lanes[1].waits[0].lane.queue, QueueKind::Compute(0));
+    assert_eq!(lanes[2].waits[0].lane.queue, QueueKind::Copy(0));
+
+    let plan = SemanticLinkedPlan::from_lane_submissions(lanes, lane_signals).unwrap();
+    let mut null = NullHcq::default();
+    let mut order = Vec::new();
+    plan.execute_null(&mut null, |_, command| {
+        order.push(command.operation);
+        Ok::<_, ()>(())
+    })
+    .unwrap();
+    assert_eq!(order, [0, 1, 2]);
+}
+
+#[test]
+fn raw_war_and_waw_hazards_wait_for_the_producer_lane() {
+    use crate::hcq::{DeviceQueue, QueueMergeLimits, TopologyOperation, TopologyOperationKind};
+    let compute = DeviceQueue { device: gpu(0), queue: QueueKind::Compute(0) };
+    let copy = DeviceQueue { device: gpu(0), queue: QueueKind::Copy(0) };
+    let cases = [
+        (vec![], vec![resource(40, gpu(0))], vec![resource(40, gpu(0))], vec![]),
+        (vec![resource(41, gpu(0))], vec![], vec![], vec![resource(41, gpu(0))]),
+        (vec![], vec![resource(42, gpu(0))], vec![], vec![resource(42, gpu(0))]),
+    ];
+    for (producer_reads, producer_writes, consumer_reads, consumer_writes) in cases {
+        let operations = [
+            TopologyOperation {
+                operation: 0,
+                lane: compute.clone(),
+                reads: producer_reads,
+                writes: producer_writes,
+                kind: TopologyOperationKind::Execute,
+            },
+            TopologyOperation {
+                operation: 1,
+                lane: copy.clone(),
+                reads: consumer_reads,
+                writes: consumer_writes,
+                kind: TopologyOperationKind::Execute,
+            },
+        ];
+        let lanes = crate::hcq::schedule_device_lanes(&operations, QueueMergeLimits::NO_MERGE, |a, b| a == b);
+        assert_eq!(lanes[1].waits, [crate::hcq::LaneWait { lane: compute.clone(), value: 1 }]);
+        let plan = crate::hcq::SemanticLinkedPlan::from_lane_submissions(lanes, lane_signals).unwrap();
+        let mut null = NullHcq::default();
+        let mut order = Vec::new();
+        plan.execute_null(&mut null, |_, command| {
+            order.push(command.operation);
+            Ok::<_, ()>(())
+        })
+        .unwrap();
+        assert_eq!(order, [0, 1]);
+    }
+}
+
+#[test]
+fn topology_hazards_require_overlapping_byte_ranges() {
+    use crate::hcq::{DeviceQueue, QueueMergeLimits, TopologyOperation, TopologyOperationKind};
+    let producer = |write| TopologyOperation {
+        operation: 0,
+        lane: DeviceQueue { device: gpu(0), queue: QueueKind::Compute(0) },
+        reads: vec![],
+        writes: vec![write],
+        kind: TopologyOperationKind::Execute,
+    };
+    let consumer = |operation, read| TopologyOperation {
+        operation,
+        lane: DeviceQueue { device: gpu(0), queue: QueueKind::Copy(0) },
+        reads: vec![read],
+        writes: vec![],
+        kind: TopologyOperationKind::Execute,
+    };
+
+    let disjoint = crate::hcq::schedule_device_lanes(
+        &[producer(resource_range(50, gpu(0), 0, 8)), consumer(1, resource_range(50, gpu(0), 8, 16))],
+        QueueMergeLimits::NO_MERGE,
+        |a, b| a == b,
+    );
+    assert!(disjoint[1].waits.is_empty());
+    let overlap = crate::hcq::schedule_device_lanes(
+        &[producer(resource_range(50, gpu(0), 0, 9)), consumer(1, resource_range(50, gpu(0), 8, 16))],
+        QueueMergeLimits::NO_MERGE,
+        |a, b| a == b,
+    );
+    assert_eq!(overlap[1].waits[0].value, 1);
+    let plan = crate::hcq::SemanticLinkedPlan::from_lane_submissions(overlap, lane_signals).unwrap();
+    let mut null = NullHcq::default();
+    let mut order = Vec::new();
+    plan.execute_null(&mut null, |_, command| {
+        order.push(command.operation);
+        Ok::<_, ()>(())
+    })
+    .unwrap();
+    assert_eq!(order, [0, 1]);
+}
+
+#[test]
+fn merged_waits_target_and_execute_published_boundaries() {
+    use crate::hcq::{DeviceQueue, QueueMergeLimits, SemanticLinkedPlan, TopologyOperation, TopologyOperationKind};
+    let first = resource(60, gpu(0));
+    let operations = [
+        TopologyOperation {
+            operation: 0,
+            lane: DeviceQueue { device: gpu(0), queue: QueueKind::Compute(0) },
+            reads: vec![],
+            writes: vec![first.clone()],
+            kind: TopologyOperationKind::Execute,
+        },
+        TopologyOperation {
+            operation: 1,
+            lane: DeviceQueue { device: gpu(0), queue: QueueKind::Compute(0) },
+            reads: vec![],
+            writes: vec![],
+            kind: TopologyOperationKind::Execute,
+        },
+        TopologyOperation {
+            operation: 2,
+            lane: DeviceQueue { device: gpu(0), queue: QueueKind::Copy(0) },
+            reads: vec![first],
+            writes: vec![],
+            kind: TopologyOperationKind::Execute,
+        },
+    ];
+    let lanes = crate::hcq::schedule_device_lanes(&operations, QueueMergeLimits::UNLIMITED, |a, b| a == b);
+    assert_eq!(lanes.len(), 2);
+    assert_eq!(lanes[0].signal_value, 2);
+    assert_eq!(lanes[1].waits[0].value, 2);
+
+    let plan = SemanticLinkedPlan::from_lane_submissions(lanes, lane_signals).unwrap();
+    let mut null = NullHcq::default();
+    let mut null_order = Vec::new();
+    plan.execute_null(&mut null, |_, command| {
+        null_order.push(command.operation);
+        Ok::<_, ()>(())
+    })
+    .unwrap();
+    assert_eq!(null_order, [0, 1, 2]);
+
+    let mut cpu = CpuQueueExecutor::default();
+    let mut order = Vec::new();
+    unsafe {
+        plan.execute_cpu(&mut cpu, |_, command| {
+            order.push(command.operation);
+            Ok::<_, ()>(())
+        })
+    }
+    .unwrap();
+    assert_eq!(order, [0, 1, 2]);
+}
+
+#[test]
+fn semantic_linked_submission_retains_concrete_lane_identity() {
+    let lane = crate::hcq::DeviceQueue { device: gpu(1), queue: QueueKind::Compute(0) };
+    let linked = SemanticLinkedSubmission::new_for_lane(lane.clone(), Submission::new(QueueKind::Compute(0))).unwrap();
+    assert_eq!(linked.lane(), &lane);
+    assert_eq!(linked.replay_buffer().lane(), &lane);
+}
+
+#[test]
+fn native_adapter_preserves_single_device_submission_shape() {
+    use crate::hcq::{
+        Command, DeviceQueue, QueueMergeLimits, SemanticLinkedPlan, TopologyOperation, TopologyOperationKind,
+    };
+
+    let value = resource(70, gpu(0));
+    let operations = [
+        TopologyOperation {
+            operation: 0,
+            lane: DeviceQueue { device: gpu(0), queue: QueueKind::Compute(0) },
+            reads: vec![],
+            writes: vec![value.clone()],
+            kind: TopologyOperationKind::Execute,
+        },
+        TopologyOperation {
+            operation: 1,
+            lane: DeviceQueue { device: gpu(0), queue: QueueKind::Copy(0) },
+            reads: vec![value],
+            writes: vec![],
+            kind: TopologyOperationKind::Execute,
+        },
+    ];
+    let lanes = crate::hcq::schedule_device_lanes(&operations, QueueMergeLimits::NO_MERGE, |a, b| a == b);
+    let plan = SemanticLinkedPlan::from_lane_submissions(lanes, lane_signals).unwrap();
+    let native = plan.native_submissions().unwrap();
+
+    assert_eq!(native.len(), 3);
+    assert_eq!(native[0].lane().queue, QueueKind::Compute(0));
+    assert!(matches!(
+        native[0].static_submission().commands.as_slice(),
+        [Command::MemoryBarrier, Command::Wait { .. }, Command::Execute { operation: 0 }, Command::Store { .. }]
+    ));
+    assert!(matches!(
+        native[1].static_submission().commands.as_slice(),
+        [
+            Command::MemoryBarrier,
+            Command::Wait { .. },
+            Command::Wait { .. },
+            Command::Execute { operation: 1 },
+            Command::Store { .. }
+        ]
+    ));
+    assert!(matches!(native[2].static_submission().commands.as_slice(), [Command::Wait { .. }, Command::Store { .. }]));
 }
 
 #[test]

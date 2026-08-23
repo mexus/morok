@@ -5,7 +5,7 @@
 //! to device addresses, packs C-like kernargs, and describes queue commands in
 //! their exact submission order. Backends lower the commands to native packets.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::error::{Error, Result};
@@ -31,6 +31,14 @@ pub struct DeviceQueue {
 pub struct TopologyResource {
     pub id: u64,
     pub owner: DeviceSpec,
+    pub start: usize,
+    pub end: usize,
+}
+
+impl TopologyResource {
+    fn overlaps(&self, other: &Self) -> bool {
+        self.id == other.id && self.owner == other.owner && self.start < other.end && other.start < self.end
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -83,6 +91,7 @@ pub struct QueueMergeLimits {
 
 impl QueueMergeLimits {
     pub const UNLIMITED: Self = Self { max_submissions: 0, max_commands: 0 };
+    pub const NO_MERGE: Self = Self { max_submissions: 1, max_commands: 0 };
 }
 
 /// Partition neutral operations by concrete device/queue lane, insert host
@@ -108,12 +117,17 @@ pub fn schedule_device_lanes(
     let mut expanded = Vec::new();
     for op in operations {
         match &op.kind {
-            TopologyOperationKind::Copy { src, dst, .. }
+            TopologyOperationKind::Copy { src, dst, bytes }
                 if !(can_access(&op.lane.device, &src.owner) && can_access(&src.owner, &dst.owner)) =>
             {
                 // A unique host resource prevents unrelated staged copies from
                 // aliasing while still creating the required dependency edge.
-                let stage = TopologyResource { id: u64::MAX - op.operation as u64, owner: host.clone() };
+                let stage = TopologyResource {
+                    id: u64::MAX - op.operation as u64,
+                    owner: host.clone(),
+                    start: 0,
+                    end: (*bytes).max(1),
+                };
                 expanded.push(Expanded {
                     operation: op.operation,
                     lane: DeviceQueue { device: src.owner.clone(), queue: QueueKind::Copy(0) },
@@ -129,11 +143,11 @@ pub fn schedule_device_lanes(
                     leg: Some(CopyLeg::FromHost),
                 });
             }
-            TopologyOperationKind::Copy { .. } => expanded.push(Expanded {
+            TopologyOperationKind::Copy { src, dst, .. } => expanded.push(Expanded {
                 operation: op.operation,
                 lane: op.lane.clone(),
-                reads: op.reads.clone(),
-                writes: op.writes.clone(),
+                reads: vec![src.clone()],
+                writes: vec![dst.clone()],
                 leg: Some(CopyLeg::Direct),
             }),
             TopologyOperationKind::Execute => expanded.push(Expanded {
@@ -147,10 +161,9 @@ pub fn schedule_device_lanes(
     }
 
     let hazard = |a: &Expanded, b: &Expanded| {
-        let same = |x: &TopologyResource, y: &TopologyResource| x.id == y.id && x.owner == y.owner;
-        a.writes.iter().any(|x| b.reads.iter().any(|y| same(x, y)))
-            || a.reads.iter().any(|x| b.writes.iter().any(|y| same(x, y)))
-            || a.writes.iter().any(|x| b.writes.iter().any(|y| same(x, y)))
+        a.writes.iter().any(|x| b.reads.iter().any(|y| x.overlaps(y)))
+            || a.reads.iter().any(|x| b.writes.iter().any(|y| x.overlaps(y)))
+            || a.writes.iter().any(|x| b.writes.iter().any(|y| x.overlaps(y)))
     };
     let mut sequence: HashMap<DeviceQueue, u64> = HashMap::new();
     let mut prior: Vec<(Expanded, u64)> = Vec::new();
@@ -212,6 +225,31 @@ pub fn schedule_device_lanes(
             merged.push(submission);
             counts.push(1);
         }
+    }
+    // A merged submission publishes only its final signal. Rewrite every wait
+    // to the first published boundary containing the logical producer value.
+    // This must happen after merging: retaining an interior value describes a
+    // timeline point which no executable submission actually stores.
+    for index in 0..merged.len() {
+        let mut waits: HashMap<DeviceQueue, u64> = HashMap::new();
+        for wait in std::mem::take(&mut merged[index].waits) {
+            let value = merged
+                .iter()
+                .find(|producer| producer.lane == wait.lane && producer.signal_value >= wait.value)
+                .map(|producer| producer.signal_value)
+                .unwrap_or(wait.value);
+            waits.entry(wait.lane).and_modify(|current| *current = (*current).max(value)).or_insert(value);
+        }
+        merged[index].waits = waits.into_iter().map(|(lane, value)| LaneWait { lane, value }).collect();
+        merged[index].waits.sort_by_key(|wait| {
+            (
+                wait.lane.device.canonicalize(),
+                match wait.lane.queue {
+                    QueueKind::Compute(n) => (0, n),
+                    QueueKind::Copy(n) => (1, n),
+                },
+            )
+        });
     }
     merged
 }
@@ -735,17 +773,36 @@ pub struct ReplayCommandBuffer {
 /// bound scalar fields are changed for each replay.
 #[derive(Debug, Clone)]
 pub struct SemanticLinkedSubmission {
+    lane: DeviceQueue,
     submission: Arc<Submission>,
 }
 
 #[derive(Debug, Clone)]
 pub struct SemanticReplaySubmission {
+    lane: DeviceQueue,
     submission: Submission,
 }
 
 impl SemanticLinkedSubmission {
     pub fn new(submission: Submission) -> Self {
-        Self { submission: Arc::new(submission) }
+        let lane = DeviceQueue { device: DeviceSpec::Cpu, queue: submission.queue };
+        Self { lane, submission: Arc::new(submission) }
+    }
+
+    pub fn new_for_lane(lane: DeviceQueue, submission: Submission) -> Result<Self> {
+        if lane.queue != submission.queue {
+            return Err(Error::Runtime {
+                message: format!(
+                    "HCQ semantic lane {:?} disagrees with submission queue {:?}",
+                    lane.queue, submission.queue
+                ),
+            });
+        }
+        Ok(Self { lane, submission: Arc::new(submission) })
+    }
+
+    pub fn lane(&self) -> &DeviceQueue {
+        &self.lane
     }
 
     pub fn static_submission(&self) -> &Submission {
@@ -753,7 +810,7 @@ impl SemanticLinkedSubmission {
     }
 
     pub fn replay_buffer(&self) -> SemanticReplaySubmission {
-        SemanticReplaySubmission { submission: (*self.submission).clone() }
+        SemanticReplaySubmission { lane: self.lane.clone(), submission: (*self.submission).clone() }
     }
 
     pub fn patch(
@@ -764,6 +821,7 @@ impl SemanticLinkedSubmission {
     ) -> Result<()> {
         if replay.submission.commands.len() != self.submission.commands.len()
             || replay.submission.queue != self.submission.queue
+            || replay.lane != self.lane
         {
             return Err(Error::Runtime { message: "HCQ semantic replay does not belong to linked submission".into() });
         }
@@ -782,8 +840,236 @@ impl SemanticLinkedSubmission {
 }
 
 impl SemanticReplaySubmission {
+    pub fn lane(&self) -> &DeviceQueue {
+        &self.lane
+    }
+
     pub fn submission(&self) -> &Submission {
         &self.submission
+    }
+}
+
+/// Concrete mapping from a scheduler-local lane value to the signal point an
+/// executor will publish. Logical values may skip after queue merging, while
+/// concrete points remain dense on each device/queue timeline.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TimelineBinding {
+    pub lane: DeviceQueue,
+    pub logical_value: u64,
+    pub point: TimelinePoint,
+}
+
+/// Executable host/null form of the device-aware lane topology. The original
+/// [`LaneSubmission`] commands remain the source of truth, including copy-leg
+/// identity; queue commands are materialized only when submitted to a host
+/// executor.
+#[derive(Debug, Clone)]
+pub struct SemanticLinkedPlan {
+    lanes: Arc<[LaneSubmission]>,
+    bindings: Arc<[TimelineBinding]>,
+}
+
+impl SemanticLinkedPlan {
+    /// Reserve one concrete timeline per `DeviceQueue` and bind each published
+    /// merged boundary. `timeline_signals` is called once for every concrete
+    /// lane, including equal queue numbers belonging to different devices.
+    pub fn from_lane_submissions(
+        lanes: Vec<LaneSubmission>,
+        mut timeline_signals: impl FnMut(&DeviceQueue) -> [u64; 2],
+    ) -> Result<Self> {
+        let mut timelines: HashMap<DeviceQueue, EpochTimeline> = HashMap::new();
+        let mut bindings = Vec::with_capacity(lanes.len());
+        for submission in &lanes {
+            let timeline = timelines
+                .entry(submission.lane.clone())
+                .or_insert_with(|| EpochTimeline::new(timeline_signals(&submission.lane)));
+            bindings.push(TimelineBinding {
+                lane: submission.lane.clone(),
+                logical_value: submission.signal_value,
+                point: timeline.reserve(),
+            });
+        }
+
+        for submission in &lanes {
+            for wait in &submission.waits {
+                if !bindings.iter().any(|binding| binding.lane == wait.lane && binding.logical_value == wait.value) {
+                    return Err(Error::Runtime {
+                        message: format!(
+                            "HCQ lane {:?} waits for unpublished {:?} value {}",
+                            submission.lane, wait.lane, wait.value
+                        ),
+                    });
+                }
+            }
+        }
+        Ok(Self { lanes: lanes.into(), bindings: bindings.into() })
+    }
+
+    pub fn lanes(&self) -> &[LaneSubmission] {
+        &self.lanes
+    }
+
+    pub fn bindings(&self) -> &[TimelineBinding] {
+        &self.bindings
+    }
+
+    pub fn staged_copy(&self) -> Option<usize> {
+        self.lanes.iter().flat_map(|lane| &lane.commands).find_map(|command| {
+            matches!(command.copy_leg, Some(CopyLeg::ToHost | CopyLeg::FromHost)).then_some(command.operation)
+        })
+    }
+
+    /// Materialize the established single-device submission ABI from the
+    /// authoritative lane topology. Native backends use this adapter to retain
+    /// their packet shape; scheduling and dependency discovery stay above it.
+    pub fn native_submissions(&self) -> Result<Vec<SemanticLinkedSubmission>> {
+        use CommandField::{StoreDst, StoreValue, WaitAddress, WaitValue};
+
+        if self.lanes.is_empty() {
+            return Ok(Vec::new());
+        }
+        if self.lanes.iter().any(|lane| lane.commands.len() != 1) {
+            return Err(Error::Runtime { message: "native HCQ lowering requires unmerged lane submissions".into() });
+        }
+        let device = self.lanes[0].lane.device.clone();
+        if self.lanes.iter().any(|lane| lane.lane.device != device) {
+            return Err(Error::Runtime { message: "native HCQ lowering requires one concrete device".into() });
+        }
+
+        let bind_point = |submission: &mut Submission, command: usize, slot: u32, store: bool| -> Result<()> {
+            let (address, value) = if store { (StoreDst, StoreValue) } else { (WaitAddress, WaitValue) };
+            submission.bind(command, address, PatchSource::System(SystemField::TimelineSignal(slot)))?.bind(
+                command,
+                value,
+                PatchSource::System(SystemField::TimelineValue(slot)),
+            )?;
+            Ok(())
+        };
+        let producers = self
+            .lanes
+            .iter()
+            .enumerate()
+            .map(|(index, lane)| ((lane.lane.clone(), lane.signal_value), index))
+            .collect::<HashMap<_, _>>();
+        let mut first_use = HashSet::new();
+        let mut latest = HashMap::new();
+        let mut submissions = Vec::with_capacity(self.lanes.len() + 1);
+
+        for (index, lane) in self.lanes.iter().enumerate() {
+            let mut submission = Submission::new(lane.lane.queue);
+            if first_use.insert(lane.lane.clone()) {
+                submission.push(Command::MemoryBarrier);
+                let command = submission.commands.len();
+                submission.push(Command::Wait { signal_address: 0, value: 0 });
+                bind_point(&mut submission, command, 0, false)?;
+            }
+            for wait in &lane.waits {
+                let producer = producers.get(&(wait.lane.clone(), wait.value)).ok_or_else(|| Error::Runtime {
+                    message: format!("native HCQ wait has no producer: {:?} value {}", wait.lane, wait.value),
+                })?;
+                let command = submission.commands.len();
+                submission.push(Command::Wait { signal_address: 0, value: 0 });
+                bind_point(&mut submission, command, *producer as u32 + 1, false)?;
+            }
+            submission.push(Command::Execute { operation: lane.commands[0].operation });
+            let command = submission.commands.len();
+            submission.push(Command::Store { dst: 0, value: 0 });
+            bind_point(&mut submission, command, index as u32 + 1, true)?;
+            latest.insert(lane.lane.clone(), index);
+            submissions.push(SemanticLinkedSubmission::new_for_lane(lane.lane.clone(), submission)?);
+        }
+
+        let final_lane = DeviceQueue { device, queue: QueueKind::Compute(0) };
+        let mut finalizer = Submission::new(final_lane.queue);
+        if !first_use.contains(&final_lane) {
+            finalizer.push(Command::MemoryBarrier);
+            let command = finalizer.commands.len();
+            finalizer.push(Command::Wait { signal_address: 0, value: 0 });
+            bind_point(&mut finalizer, command, 0, false)?;
+        }
+        let mut latest = latest.into_iter().collect::<Vec<_>>();
+        latest.sort_by_key(|(lane, _)| match lane.queue {
+            QueueKind::Compute(number) => (0, number),
+            QueueKind::Copy(number) => (1, number),
+        });
+        for (lane, producer) in latest {
+            if lane != final_lane {
+                let command = finalizer.commands.len();
+                finalizer.push(Command::Wait { signal_address: 0, value: 0 });
+                bind_point(&mut finalizer, command, producer as u32 + 1, false)?;
+            }
+        }
+        let command = finalizer.commands.len();
+        finalizer.push(Command::Store { dst: 0, value: 0 });
+        bind_point(&mut finalizer, command, self.lanes.len() as u32 + 1, true)?;
+        submissions.push(SemanticLinkedSubmission::new_for_lane(final_lane, finalizer)?);
+        Ok(submissions)
+    }
+
+    pub fn submission(&self, index: usize) -> Option<Submission> {
+        let lane = self.lanes.get(index)?;
+        let completion = self.binding(&lane.lane, lane.signal_value)?;
+        let mut submission = Submission::new(lane.lane.queue);
+        for wait in &lane.waits {
+            submission.wait_for(self.binding(&wait.lane, wait.value)?);
+        }
+        for command in &lane.commands {
+            submission.push(Command::Execute { operation: command.operation });
+        }
+        submission.signal(completion);
+        Some(submission)
+    }
+
+    pub fn execute_null<E>(
+        &self,
+        executor: &mut NullHcq,
+        mut execute: impl FnMut(&DeviceQueue, &TopologyCommand) -> std::result::Result<(), E>,
+    ) -> std::result::Result<(), SubmissionExecutionError<E>> {
+        for (index, lane) in self.lanes.iter().enumerate() {
+            let submission = self.submission(index).expect("validated semantic linked plan");
+            let mut command_index = 0;
+            executor.submit_with(&submission, |operation| {
+                let command = &lane.commands[command_index];
+                command_index += 1;
+                debug_assert_eq!(operation, command.operation);
+                execute(&lane.lane, command)
+            })?;
+        }
+        Ok(())
+    }
+
+    /// # Safety
+    ///
+    /// The callback must uphold the memory and hazard requirements of each
+    /// unresolved operation. Materialized plan commands themselves contain no
+    /// raw host copy addresses.
+    pub unsafe fn execute_cpu<E>(
+        &self,
+        executor: &mut CpuQueueExecutor,
+        mut execute: impl FnMut(&DeviceQueue, &TopologyCommand) -> std::result::Result<(), E>,
+    ) -> std::result::Result<(), SubmissionExecutionError<E>> {
+        for (index, lane) in self.lanes.iter().enumerate() {
+            let submission = self.submission(index).expect("validated semantic linked plan");
+            let mut command_index = 0;
+            // SAFETY: generated commands contain only waits, Execute callbacks,
+            // and stores. The caller owns safety of the unresolved operation.
+            unsafe {
+                executor.submit(&submission, |operation| {
+                    let command = &lane.commands[command_index];
+                    command_index += 1;
+                    debug_assert_eq!(operation, command.operation);
+                    execute(&lane.lane, command)
+                })?;
+            }
+        }
+        Ok(())
+    }
+
+    fn binding(&self, lane: &DeviceQueue, logical_value: u64) -> Option<TimelinePoint> {
+        self.bindings
+            .iter()
+            .find(|binding| &binding.lane == lane && binding.logical_value == logical_value)
+            .map(|binding| binding.point)
     }
 }
 

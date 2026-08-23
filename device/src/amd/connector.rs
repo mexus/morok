@@ -684,17 +684,19 @@ impl crate::device::PlanContext for OwnerCtx {
 
     fn replay_linked_plan(
         &self,
-        submissions: &[crate::hcq::SemanticLinkedSubmission],
+        semantic: &crate::hcq::SemanticLinkedPlan,
         calls: &[crate::device::PlanCall<'_>],
     ) -> Result<crate::device::NativeReplayOutcome> {
+        if let Some(reason) = crate::amd::linked_plan::native_topology_decline(semantic) {
+            return Ok(crate::device::NativeReplayOutcome::Declined(reason));
+        }
         let mut plan = self.linked_plan.lock();
         // Release a direct-session lease and retire this owner's prior mutable
         // replay storage before trying to claim a native replay lane.
         self.synchronize()?;
         let lane = self.lease()?;
         if plan.is_none() {
-            let Some(captured) =
-                crate::amd::linked_plan::AmdLinkedPlan::capture(self, lane.pool(), submissions, calls)?
+            let Some(captured) = crate::amd::linked_plan::AmdLinkedPlan::capture(self, lane.pool(), semantic, calls)?
             else {
                 return Ok(crate::device::NativeReplayOutcome::Declined(
                     crate::device::NativeReplayDecline::BackendUnsupported,

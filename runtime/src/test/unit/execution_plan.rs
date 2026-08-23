@@ -1187,84 +1187,56 @@ fn hcq_op(operation: usize, queue: svod_device::hcq::QueueKind, reads: &[u64], w
     }
 }
 
-fn mock_timelines() -> svod_device::hcq::SubmissionTimelines {
-    svod_device::hcq::SubmissionTimelines::new([0x10, 0x18], [0x20, 0x28], [0x30, 0x38])
-}
-
-fn mock_epoch(operations: &[HcqPreparedOperation], state: &mut svod_device::hcq::SubmissionTimelines) -> HcqEpoch {
-    build_hcq_epoch(operations, state)
-}
-
-fn operation_submission(epoch: &HcqEpoch, operation: usize) -> &svod_device::hcq::Submission {
-    epoch
-        .submissions
+fn operation_submission(plan: &HcqLinkedPlan, operation: usize) -> &svod_device::hcq::LaneSubmission {
+    plan.semantic
+        .lanes()
         .iter()
-        .find(|submission| submission.commands.contains(&svod_device::hcq::Command::Execute { operation }))
+        .find(|submission| submission.commands.iter().any(|command| command.operation == operation))
         .expect("operation submission")
 }
 
-fn has_wait(submission: &svod_device::hcq::Submission, signal_address: u64, value: u64) -> bool {
-    submission.commands.contains(&svod_device::hcq::Command::Wait { signal_address, value })
+fn hcq_plan(operations: &[HcqPreparedOperation]) -> HcqLinkedPlan {
+    HcqLinkedPlan::capture(operations.to_vec()).unwrap()
 }
 
 #[test]
 fn hcq_independent_compute_and_copy_can_overlap() {
     use svod_device::hcq::QueueKind;
-    let mut state = mock_timelines();
-    let epoch = mock_epoch(
-        &[hcq_op(0, QueueKind::Compute(0), &[1], &[2]), hcq_op(1, QueueKind::Copy(0), &[3], &[4])],
-        &mut state,
-    );
-    assert!(!has_wait(operation_submission(&epoch, 1), 0x20, 1));
+    let plan = hcq_plan(&[hcq_op(0, QueueKind::Compute(0), &[1], &[2]), hcq_op(1, QueueKind::Copy(0), &[3], &[4])]);
+    assert!(operation_submission(&plan, 1).waits.is_empty());
 }
 
 #[test]
 fn hcq_raw_dependency_waits_for_cross_queue_writer() {
     use svod_device::hcq::QueueKind;
-    let mut state = mock_timelines();
-    let epoch = mock_epoch(
-        &[hcq_op(0, QueueKind::Compute(0), &[], &[1]), hcq_op(1, QueueKind::Copy(0), &[1], &[2])],
-        &mut state,
-    );
-    assert!(has_wait(operation_submission(&epoch, 1), 0x20, 1));
+    let plan = hcq_plan(&[hcq_op(0, QueueKind::Compute(0), &[], &[1]), hcq_op(1, QueueKind::Copy(0), &[1], &[2])]);
+    assert_eq!(operation_submission(&plan, 1).waits[0].lane.queue, QueueKind::Compute(0));
 }
 
 #[test]
 fn hcq_war_dependency_waits_for_cross_queue_reader() {
     use svod_device::hcq::QueueKind;
-    let mut state = mock_timelines();
-    let epoch = mock_epoch(
-        &[hcq_op(0, QueueKind::Compute(0), &[1], &[]), hcq_op(1, QueueKind::Copy(0), &[], &[1])],
-        &mut state,
-    );
-    assert!(has_wait(operation_submission(&epoch, 1), 0x20, 1));
+    let plan = hcq_plan(&[hcq_op(0, QueueKind::Compute(0), &[1], &[]), hcq_op(1, QueueKind::Copy(0), &[], &[1])]);
+    assert_eq!(operation_submission(&plan, 1).waits[0].lane.queue, QueueKind::Compute(0));
 }
 
 #[test]
 fn hcq_waw_dependency_waits_for_cross_queue_writer() {
     use svod_device::hcq::QueueKind;
-    let mut state = mock_timelines();
-    let epoch = mock_epoch(
-        &[hcq_op(0, QueueKind::Copy(0), &[], &[1]), hcq_op(1, QueueKind::Compute(0), &[], &[1])],
-        &mut state,
-    );
-    assert!(has_wait(operation_submission(&epoch, 1), 0x30, 1));
+    let plan = hcq_plan(&[hcq_op(0, QueueKind::Copy(0), &[], &[1]), hcq_op(1, QueueKind::Compute(0), &[], &[1])]);
+    assert_eq!(operation_submission(&plan, 1).waits[0].lane.queue, QueueKind::Copy(0));
 }
 
 #[test]
 fn hcq_compute_to_copy_and_copy_to_compute_use_queue_timelines() {
     use svod_device::hcq::QueueKind;
-    let mut state = mock_timelines();
-    let epoch = mock_epoch(
-        &[
-            hcq_op(0, QueueKind::Compute(0), &[], &[1]),
-            hcq_op(1, QueueKind::Copy(0), &[1], &[2]),
-            hcq_op(2, QueueKind::Compute(0), &[2], &[3]),
-        ],
-        &mut state,
-    );
-    assert!(has_wait(operation_submission(&epoch, 1), 0x20, 1));
-    assert!(has_wait(operation_submission(&epoch, 2), 0x30, 1));
+    let plan = hcq_plan(&[
+        hcq_op(0, QueueKind::Compute(0), &[], &[1]),
+        hcq_op(1, QueueKind::Copy(0), &[1], &[2]),
+        hcq_op(2, QueueKind::Compute(0), &[2], &[3]),
+    ]);
+    assert_eq!(operation_submission(&plan, 1).waits[0].lane.queue, QueueKind::Compute(0));
+    assert_eq!(operation_submission(&plan, 2).waits[0].lane.queue, QueueKind::Copy(0));
 }
 
 #[derive(Debug)]
@@ -1336,7 +1308,7 @@ fn repeated_normal_execution_repatches_vars_buffers_and_mixed_copy_plan() {
     }));
     builder.set_output_buffer(output_idx);
     let mut plan = builder.build().unwrap();
-    let static_commands = plan.hcq_linked.get().unwrap().linked[0].static_submission().commands.as_ptr();
+    let static_lanes = plan.hcq_linked.get().unwrap().semantic.lanes().as_ptr();
 
     plan.execute_with_vars(&[("N", 3)]).unwrap();
     let mut first = [0; 4];
@@ -1355,7 +1327,7 @@ fn repeated_normal_execution_repatches_vars_buffers_and_mixed_copy_plan() {
     assert_eq!(calls.len(), 2);
     assert_eq!((calls[0].2, calls[1].2), (3, 7));
     assert_ne!(calls[0].1, calls[1].1, "replacement buffer address must be patched on replay");
-    assert_eq!(plan.hcq_linked.get().unwrap().linked[0].static_submission().commands.as_ptr(), static_commands);
+    assert_eq!(plan.hcq_linked.get().unwrap().semantic.lanes().as_ptr(), static_lanes);
 }
 
 #[derive(Debug)]
@@ -1368,6 +1340,14 @@ impl Allocator for TaggedCpuAllocator {
 
     fn name(&self) -> &str {
         "tagged-cpu"
+    }
+
+    fn _copyin(&self, dest: &RawBuffer, dest_off: usize, src: &[u8]) -> svod_device::Result<()> {
+        CpuAllocator._copyin(dest, dest_off, src)
+    }
+
+    fn _copyout(&self, dest: &mut [u8], src: &RawBuffer, src_off: usize) -> svod_device::Result<()> {
+        CpuAllocator._copyout(dest, src, src_off)
     }
 
     fn device_spec(&self) -> DeviceSpec {
@@ -1444,7 +1424,7 @@ impl PlanContext for NativeReplayContext {
 
     fn replay_linked_plan(
         &self,
-        _submissions: &[svod_device::hcq::SemanticLinkedSubmission],
+        _plan: &svod_device::hcq::SemanticLinkedPlan,
         _calls: &[PlanCall<'_>],
     ) -> svod_device::Result<NativeReplayOutcome> {
         self.replays.fetch_add(1, Ordering::SeqCst);
@@ -1458,6 +1438,45 @@ impl PlanContext for NativeReplayContext {
 
 fn tagged_buffer(device: DeviceSpec) -> Buffer {
     Buffer::new(Arc::new(TaggedCpuAllocator(device)), DType::UInt8, vec![4], Default::default())
+}
+
+#[test]
+fn staged_copy_uses_fresh_host_storage_each_epoch() {
+    use svod_device::hcq::CopyLeg;
+
+    let mut source = tagged_buffer(DeviceSpec::Amd { device_id: 0 });
+    source.copyin(&[1, 2, 3, 4]).unwrap();
+    let mut builder = ExecutionPlanBuilder::new(DeviceSpec::Cpu);
+    let dst = builder.add_buffer(20_101, tagged_buffer(DeviceSpec::Cpu));
+    let src = builder.add_buffer(20_102, source);
+    builder.add_op(PreparedOp::BufferCopy(PreparedCopy {
+        id: 20_103,
+        buffer_indices: vec![dst, src],
+        dependencies: vec![],
+    }));
+    builder.set_output_buffer(dst);
+    let mut plan = builder.build().unwrap();
+    let legs = plan
+        .hcq_linked
+        .get()
+        .unwrap()
+        .semantic
+        .lanes()
+        .iter()
+        .map(|lane| lane.commands[0].copy_leg.unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(legs, [CopyLeg::ToHost, CopyLeg::FromHost]);
+
+    plan.execute().unwrap();
+    let mut first = [0; 4];
+    plan.output_buffer().unwrap().copyout(&mut first).unwrap();
+    assert_eq!(first, [1, 2, 3, 4]);
+
+    plan.buffer_at_mut(src).unwrap().copyin(&[9, 8, 7, 6]).unwrap();
+    plan.execute().unwrap();
+    let mut second = [0; 4];
+    plan.output_buffer().unwrap().copyout(&mut second).unwrap();
+    assert_eq!(second, [9, 8, 7, 6]);
 }
 
 #[test]
@@ -1518,13 +1537,13 @@ fn graph_replay_rejects_forged_amd_allocation_ownership() {
     assert_eq!(replays.load(Ordering::SeqCst), 0, "forged endpoint reached graph backend");
 }
 
-fn native_copy_plan() -> (ExecutionPlan, Arc<AtomicUsize>, usize, usize, usize) {
+fn native_copy_plan_with_source(source_device: DeviceSpec) -> (ExecutionPlan, Arc<AtomicUsize>, usize, usize, usize) {
     let owner = DeviceSpec::Cpu;
     let replays = Arc::new(AtomicUsize::new(0));
     let mut builder = ExecutionPlanBuilder::new(owner.clone());
     let kernel_idx = builder.add_buffer(21_001, tagged_buffer(owner.clone()));
     let dst_idx = builder.add_buffer(21_002, tagged_buffer(owner.clone()));
-    let src_idx = builder.add_buffer(21_003, tagged_buffer(owner.clone()));
+    let src_idx = builder.add_buffer(21_003, tagged_buffer(source_device));
     builder.add_kernel(PreparedKernel {
         id: 21_010,
         ast: UOp::sink(vec![]),
@@ -1558,6 +1577,20 @@ fn native_copy_plan() -> (ExecutionPlan, Arc<AtomicUsize>, usize, usize, usize) 
     }));
     builder.set_output_buffer(dst_idx);
     (builder.build().unwrap(), replays, kernel_idx, dst_idx, src_idx)
+}
+
+fn native_copy_plan() -> (ExecutionPlan, Arc<AtomicUsize>, usize, usize, usize) {
+    native_copy_plan_with_source(DeviceSpec::Cpu)
+}
+
+#[test]
+fn native_replay_rejects_staged_semantic_copy() {
+    let (plan, replays, _, _, _) = native_copy_plan_with_source(DeviceSpec::Amd { device_id: 0 });
+    assert_eq!(
+        plan.replay_native_linked_plan().unwrap(),
+        NativeReplayOutcome::Declined(NativeReplayDecline::StagedCopy { operation: 1 })
+    );
+    assert_eq!(replays.load(Ordering::SeqCst), 0);
 }
 
 #[test]
@@ -1641,8 +1674,8 @@ fn concurrent_execution_plans_keep_linked_context_timelines_isolated() {
 
     let left = Arc::new(copy_plan(4));
     let right = Arc::new(copy_plan(7));
-    let left_signal = left.hcq_timeline.lock().unwrap().device().signal_address;
-    let right_signal = right.hcq_timeline.lock().unwrap().device().signal_address;
+    let left_signal = left.hcq_linked.get().unwrap().semantic.bindings()[0].point.signal_address;
+    let right_signal = right.hcq_linked.get().unwrap().semantic.bindings()[0].point.signal_address;
     assert_ne!(left_signal, right_signal);
     let a = Arc::clone(&left);
     let b = Arc::clone(&right);
@@ -1669,38 +1702,6 @@ fn concurrent_execution_plans_keep_linked_context_timelines_isolated() {
 #[test]
 fn hcq_same_queue_dependencies_are_fifo_elided() {
     use svod_device::hcq::QueueKind;
-    let mut state = mock_timelines();
-    let epoch = mock_epoch(
-        &[hcq_op(0, QueueKind::Compute(0), &[], &[1]), hcq_op(1, QueueKind::Compute(0), &[1], &[2])],
-        &mut state,
-    );
-    let second = operation_submission(&epoch, 1);
-    assert_eq!(
-        second.commands.iter().filter(|command| matches!(command, svod_device::hcq::Command::Wait { .. })).count(),
-        0
-    );
-}
-
-#[test]
-fn hcq_finalizer_waits_copy_queue_and_signals_device_epoch() {
-    use svod_device::hcq::{Command, QueueKind};
-    let mut state = mock_timelines();
-    let epoch = mock_epoch(&[hcq_op(0, QueueKind::Copy(0), &[1], &[2])], &mut state);
-    let finalizer = epoch.submissions.last().unwrap();
-    assert_eq!(finalizer.queue, QueueKind::Compute(0));
-    assert!(has_wait(finalizer, 0x30, 1));
-    assert!(finalizer.commands.contains(&Command::Store { dst: 0x10, value: 1 }));
-}
-
-#[test]
-fn hcq_epoch_rollover_is_monotonic() {
-    use svod_device::hcq::{Command, QueueKind};
-    let mut state = mock_timelines();
-    let operations = [hcq_op(0, QueueKind::Compute(0), &[1], &[2])];
-    let first = mock_epoch(&operations, &mut state);
-    let second = mock_epoch(&operations, &mut state);
-    assert!(operation_submission(&second, 0).commands.contains(&Command::Wait { signal_address: 0x10, value: 1 }));
-    assert!(operation_submission(&second, 0).commands.contains(&Command::Store { dst: 0x20, value: 2 }));
-    assert!(second.submissions.last().unwrap().commands.contains(&Command::Store { dst: 0x10, value: 2 }));
-    assert_eq!(first.submissions.last().unwrap().commands.last(), Some(&Command::Store { dst: 0x10, value: 1 }));
+    let plan = hcq_plan(&[hcq_op(0, QueueKind::Compute(0), &[], &[1]), hcq_op(1, QueueKind::Compute(0), &[1], &[2])]);
+    assert!(operation_submission(&plan, 1).waits.is_empty());
 }

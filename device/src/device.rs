@@ -169,7 +169,7 @@ pub trait PlanContext: Send + Sync {
     /// state thereafter. A declined outcome keeps the generic per-operation path.
     fn replay_linked_plan(
         &self,
-        _submissions: &[crate::hcq::SemanticLinkedSubmission],
+        _plan: &crate::hcq::SemanticLinkedPlan,
         _calls: &[PlanCall<'_>],
     ) -> Result<NativeReplayOutcome> {
         Ok(NativeReplayOutcome::Declined(NativeReplayDecline::BackendUnsupported))
@@ -208,6 +208,7 @@ pub enum NativeReplayDecline {
     IncompatibleProgramAllocation { operation: u64, argument: usize, expected: DeviceSpec },
     ForeignCopyEndpoint { operation: u64, endpoint: CopyEndpoint, expected: DeviceSpec, actual: DeviceSpec },
     IncompatibleCopyAllocation { operation: u64, endpoint: CopyEndpoint, expected: DeviceSpec },
+    StagedCopy { operation: usize },
     BackendUnsupported,
 }
 

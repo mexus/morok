@@ -13,9 +13,20 @@ use crate::device::PlanCall;
 use crate::error::{Error, Result};
 use crate::hcq::{
     AmdPm4Dispatch, Command, CommandBufferCache, CommandField, ComputeDispatch, LinkPatchValues, LinkedCommandBuffer,
-    PatchSource, QueueKind, ReplayCommandBuffer, RuntimePatchValues, SemanticLinkedSubmission, Submission,
+    PatchSource, QueueKind, ReplayCommandBuffer, RuntimePatchValues, SemanticLinkedPlan, Submission,
     SubmissionTimelines, SystemField, SystemPatchValues,
 };
+
+pub(crate) fn native_topology_decline(plan: &SemanticLinkedPlan) -> Option<crate::device::NativeReplayDecline> {
+    if let Some(operation) = plan.staged_copy() {
+        return Some(crate::device::NativeReplayDecline::StagedCopy { operation });
+    }
+    let mut devices = plan.lanes().iter().map(|submission| &submission.lane.device);
+    let expected = devices.next()?.clone();
+    devices
+        .find(|device| **device != expected)
+        .map(|actual| crate::device::NativeReplayDecline::MixedComputeDevices { expected, actual: actual.clone() })
+}
 
 struct KernargSlot {
     operation: usize,
@@ -105,7 +116,7 @@ impl AmdLinkedPlan {
     pub(crate) fn capture(
         owner: &OwnerCtx,
         lane: &PoolQueue,
-        semantic: &[SemanticLinkedSubmission],
+        semantic: &SemanticLinkedPlan,
         calls: &[PlanCall<'_>],
     ) -> Result<Option<Self>> {
         if calls.iter().any(|call| matches!(call, PlanCall::Unsupported)) {
@@ -148,11 +159,12 @@ impl AmdLinkedPlan {
             _ => return Err(Error::NotHostVisible { what: "linked plan kernargs" }),
         };
 
+        let semantic_submissions = semantic.native_submissions()?;
         let mut slots = Vec::new();
         let mut links = Vec::new();
         let mut native = Vec::new();
         let mut operation_count = 0usize;
-        for linked_semantic in semantic {
+        for linked_semantic in &semantic_submissions {
             let original = linked_semantic.static_submission();
             let operation_slot =
                 original.commands.iter().any(|command| matches!(command, Command::Execute { .. })).then(|| {
@@ -545,5 +557,53 @@ impl AmdLinkedPlan {
             self.timelines = timelines_before;
         }
         result.map_err(|error| ReplayFailure { error, published })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::native_topology_decline;
+    use crate::device::NativeReplayDecline;
+    use crate::hcq::{CopyLeg, DeviceQueue, LaneSubmission, QueueKind, SemanticLinkedPlan, TopologyCommand};
+    use svod_dtype::DeviceSpec;
+
+    fn plan(lanes: Vec<LaneSubmission>) -> SemanticLinkedPlan {
+        SemanticLinkedPlan::from_lane_submissions(lanes, |_| [0x1000, 0x1008]).unwrap()
+    }
+
+    #[test]
+    fn native_topology_rejects_staged_copy() {
+        let semantic = plan(vec![LaneSubmission {
+            lane: DeviceQueue { device: DeviceSpec::Amd { device_id: 0 }, queue: QueueKind::Copy(0) },
+            waits: vec![],
+            commands: vec![TopologyCommand { operation: 4, copy_leg: Some(CopyLeg::ToHost) }],
+            signal_value: 1,
+        }]);
+        assert_eq!(native_topology_decline(&semantic), Some(NativeReplayDecline::StagedCopy { operation: 4 }));
+    }
+
+    #[test]
+    fn native_topology_rejects_mixed_devices() {
+        let semantic = plan(vec![
+            LaneSubmission {
+                lane: DeviceQueue { device: DeviceSpec::Amd { device_id: 0 }, queue: QueueKind::Compute(0) },
+                waits: vec![],
+                commands: vec![TopologyCommand { operation: 0, copy_leg: None }],
+                signal_value: 1,
+            },
+            LaneSubmission {
+                lane: DeviceQueue { device: DeviceSpec::Amd { device_id: 1 }, queue: QueueKind::Compute(0) },
+                waits: vec![],
+                commands: vec![TopologyCommand { operation: 1, copy_leg: None }],
+                signal_value: 1,
+            },
+        ]);
+        assert!(matches!(
+            native_topology_decline(&semantic),
+            Some(NativeReplayDecline::MixedComputeDevices {
+                expected: DeviceSpec::Amd { device_id: 0 },
+                actual: DeviceSpec::Amd { device_id: 1 },
+            })
+        ));
     }
 }
