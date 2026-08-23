@@ -50,6 +50,16 @@ fn canonical_slot(slot: usize) -> i128 {
     if slot == usize::MAX { -1 } else { slot as i128 }
 }
 
+fn canonical_schedule_slot(buffer: &Arc<UOp>, slot: usize) -> i128 {
+    if buffer.tag().as_ref().is_some_and(|tags| tags.contains(&svod_ir::uop::canonical::TAG_SCHEDULE_LOCAL_BUFFER)) {
+        // Tinygrad's scheduled BUFFER descriptors are allocation-local; the
+        // argument/global slot fields carry ordering and identity separately.
+        0
+    } else {
+        canonical_slot(slot)
+    }
+}
+
 fn schedule_buffer(source: &Arc<UOp>, argument_index: usize) -> serde_json::Value {
     let buffer = source.buf_uop();
     let (origin, slot) = match buffer.op() {
@@ -60,7 +70,7 @@ fn schedule_buffer(source: &Arc<UOp>, argument_index: usize) -> serde_json::Valu
     serde_json::json!({
         "argument_index": argument_index,
         "global_slot": argument_index,
-        "buffer_slot": canonical_slot(slot),
+        "buffer_slot": canonical_schedule_slot(&buffer, slot),
         "origin": origin,
     })
 }

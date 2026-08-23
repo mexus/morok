@@ -10,35 +10,6 @@ aligned field differences (1):
     rust: 5
     python: 'unaligned:5'
 
-[production-stage kernel_ast issue=EVID-01B]
-canonical document sha256:
-  rust: 4fd519313605729df8d94fae12cce19a2ef07a0a25aee9e2ff9b0467513747db
-  python: 58a41d1f38338fab1af92336f8fa35988a6f00abdf8d4a9448bdea7796714aec
-canonical structural mismatch at stage kernel_ast (insert):
-  rust ids 23:23: []
-  python ids 23:24: ['PARAM']
-aligned field differences (1):
-  nodes 24/25 BIND $.src[0]
-    rust: 14
-    python: 'unaligned:23'
-  first rust source chain: 29:SINK -> 28:AFTER -> 27:CALL -> 26:AFTER -> 25:CALL -> 24:BIND
-  first python source chain: 30:SINK -> 29:AFTER -> 28:CALL -> 27:AFTER -> 26:CALL -> 25:BIND
-
-[production-stage scheduled issue=EVID-01B]
-canonical document sha256:
-  rust: 53ff57045dc9186a9ff52357caa9225b07701a2aa156e59469fd61fc70adf02c
-  python: 12f1be06009b77d43845ecbe5ea87830d7c4019b6eef668e99f2013ae750e15e
-canonical schedule mismatch at stage scheduled (3 field differences):
-  $.items[0].buffers[0].buffer_slot
-    rust: 9223372036854775809
-    python: 0
-  $.items[1].buffers[0].buffer_slot
-    rust: 9223372036854775808
-    python: 0
-  $.items[1].buffers[1].buffer_slot
-    rust: 9223372036854775809
-    python: 0
-
 [production-stage optimized issue=EVID-01B]
 canonical document sha256:
   rust: e2ead17e5ee0dc279a67719d1e961793eb6595a8464cb5bfde45af0a153e3721

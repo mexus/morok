@@ -566,6 +566,8 @@ pub const TAG_SCHEDULE_LOCAL_BUFFER: usize = usize::MAX - 2;
 pub const TAG_CODEGEN_PARAM: usize = usize::MAX - 3;
 /// Tag on global PARAM placeholders used only by the schedule cache.
 pub const TAG_SCHEDULE_CACHE_PARAM: usize = usize::MAX - 4;
+/// Tag separating a CALL-source binding PARAM from its body-local counterpart.
+pub const TAG_CALL_BIND_PARAM: usize = usize::MAX - 5;
 
 fn canonical_arg(node: &Arc<UOp>, ids: &HashMap<u64, usize>, verbose: bool) -> crate::Result<CanonicalArg> {
     Ok(match node.op() {

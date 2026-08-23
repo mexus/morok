@@ -948,11 +948,17 @@ pub fn local_to_param_patterns() -> TypedPatternMatcher<LocalAddBufferContext> {
         },
         // Remove BIND in AST while preserving the binding as a CALL source.
         b @ Bind { var, value } => |b, var, value, ctx| {
+            let _ = b;
             let bound_val = match value.op() {
                 Op::Const(cv) => cv.0.try_int(),
                 _ => None,
             };
-            ctx.add_var(b.clone(), var.clone(), bound_val);
+            let mut tags = var.tag().clone().unwrap_or_default();
+            if !tags.contains(&svod_ir::uop::canonical::TAG_CALL_BIND_PARAM) {
+                tags.push(svod_ir::uop::canonical::TAG_CALL_BIND_PARAM);
+            }
+            let call_var = var.with_tag(tags);
+            ctx.add_var(call_var.bind(value.clone()), call_var, bound_val);
             Some(var.clone())
         },
         // Handle AFTER, MSTACK, MSELECT uniformly.
