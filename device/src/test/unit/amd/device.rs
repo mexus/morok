@@ -38,14 +38,11 @@ fn aql_scratch_descriptor_gfx9_encoding() {
     assert_eq!(d.wave64_lane_byte_size, 256); // wave64: priv_seg * 64 / 64
 }
 
-/// Cross-model parallelism (Pillar A): `assign_owner` must spread distinct
-/// owners across distinct pool queues (fill-empty-first) up to `hw_queues`, and
-/// the (hw_queues+1)-th owner must co-tenant an existing queue (the pool never
-/// exceeds `hw_queues` — what kills the KFD-queue-exhaustion crash). Manual
-/// probe: assumes isolated execution (the queue pool is process-global).
+/// Exclusive lanes fill the bounded hardware pool, then become available for
+/// atomic reuse only after their non-clone lease drops.
 #[test]
 #[ignore = "manual hardware probe; needs a real AMD GPU"]
-fn assign_owner_spreads_then_cotenants() {
+fn queue_leases_are_exclusive_and_reused() {
     use std::collections::HashSet;
     let Some(alloc) = super::test_support::amd_alloc_or_skip() else { return };
     let core = alloc.dev.core();
@@ -54,20 +51,12 @@ fn assign_owner_spreads_then_cotenants() {
     }
     let n = core.hw_queues();
     assert!(n >= 1, "hw_queues must be >= 1");
-    // Hold all owners alive so their queues stay referenced (strong_count > 1).
-    let owners: Vec<_> = (0..n).map(|_| core.assign_owner(&alloc).expect("assign")).collect();
-    let distinct: HashSet<_> = owners.iter().map(|o| o.queue_ptr()).collect();
-    assert_eq!(distinct.len(), n, "first {n} owners must land on {n} distinct queues (fill-empty-first)");
-    // The overflow owner has no idle queue left → co-tenants an existing one;
-    // the pool stays capped at `n` (no unbounded KFD-queue creation).
-    let extra = core.assign_owner(&alloc).expect("assign overflow");
-    assert!(
-        distinct.contains(&extra.queue_ptr()),
-        "overflow owner must co-tenant an existing queue, not grow the pool"
-    );
-    eprintln!(
-        "PROBE assign_owner: {n} owners → {n} distinct queues, overflow co-tenanted (pool capped at hw_queues={n})"
-    );
+    let mut leases: Vec<_> = (0..n).map(|_| core.lease_queue(&alloc).expect("lease")).collect();
+    let distinct: HashSet<_> = leases.iter().map(|lease| lease.queue_ptr()).collect();
+    assert_eq!(distinct.len(), n, "simultaneous leases must own distinct queues");
+    let released = leases.pop().unwrap().queue_ptr();
+    let reused = core.lease_queue(&alloc).expect("reuse released lane");
+    assert_eq!(reused.queue_ptr(), released, "released lane must be reused without creating another queue");
 }
 
 #[test]

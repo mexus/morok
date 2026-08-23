@@ -1,7 +1,7 @@
 //! `KernargArena`: bump allocator for AMDGPU kernel-argument buffers.
 //!
 //! Sized at 16 MiB GTT-coherent. **One per `PoolQueue`**. A dispatch holds the
-//! queue's dispatch lock across bump + kernarg write + ring submission, so the
+//! lane's exclusive lease across bump + kernarg write + ring submission, so the
 //! bump cursor order matches the ring order — a wrapped slot is provably free
 //! once the whole pool drains. Each `Program::execute` claims `kernarg_size`
 //! bytes (16-byte aligned per ABI). The arena wraps when it fills; on wrap we
@@ -16,7 +16,7 @@ use std::sync::{Arc, Weak};
 
 use parking_lot::Mutex;
 
-use crate::allocator::RawBuffer;
+use crate::allocator::{AmdBufferGuard, RawBuffer};
 use crate::amd::AmdAllocator;
 use crate::amd::device::AmdDeviceCore;
 use crate::error::{Error, Result};
@@ -42,7 +42,7 @@ unsafe impl Send for KernargArena {}
 unsafe impl Sync for KernargArena {}
 
 impl Drop for KernargArena {
-    /// Free the 16 MiB GTT-coherent backing. `RawBuffer` lacks a `Drop` (the
+    /// Free the 16 MiB CPU-visible VRAM backing. `RawBuffer` lacks a `Drop` (the
     /// allocator path consumes it by destructure), so the arena — owned
     /// directly by `PoolQueue` — would otherwise leak its allocation every
     /// time a queue drops. Safe against unmap-while-busy because
@@ -55,16 +55,13 @@ impl Drop for KernargArena {
 
 impl KernargArena {
     pub fn new(allocator: &AmdAllocator, core: &Arc<AmdDeviceCore>) -> Result<Box<Self>> {
-        // Allocate as COHERENT|UNCACHED GTT (the ring/GART/signal mapping), NOT
-        // via `alloc()` — `AmdAllocator::_alloc` ignores `BufferSpec::uncached`
-        // and would place the arena in write-combining VRAM. Kernargs are written
-        // by the host every dispatch and read by the CP; on a WC mapping the
-        // doorbell path (a no-op `Release` fence on x86, not an `sfence`) does not
-        // drain the WC buffer, so the CP can fetch a STALE kernarg — a wrong/freed
-        // buffer pointer — and wedge with no fault event. UncachedGtt is coherent,
-        // so the write is visible without a WC flush.
-        let buffer = allocator.alloc_uncached(ARENA_BYTES)?;
-        let (base_gpu, base_host) = match &buffer {
+        // Tinygrad keeps both the ordinary kernarg arena and graph-owned
+        // kernargs in CPU-visible VRAM. Queue publication performs the required
+        // store fence before ringing the doorbell.
+        let buffer = AmdBufferGuard::new(
+            allocator.alloc_host_visible_tagged(ARENA_BYTES, crate::amd::va_registry::AllocTag::Kernarg)?,
+        );
+        let (base_gpu, base_host) = match buffer.buffer() {
             RawBuffer::AmdDevice { gpu_addr, host_ptr: Some(h), .. } => (*gpu_addr, *h),
             _ => return Err(Error::NotHostVisible { what: "kernarg arena" }),
         };
@@ -74,7 +71,7 @@ impl KernargArena {
             size: ARENA_BYTES,
             cursor: Mutex::new(0),
             core: Arc::downgrade(core),
-            _buffer: buffer,
+            _buffer: buffer.into_inner(),
         }))
     }
 
@@ -94,14 +91,8 @@ impl KernargArena {
             // Wrap. Drop the cursor lock before the potentially multi-second
             // drain so other threads aren't blocked; then re-take and reset.
             drop(cur);
-            if let Some(core) = self.core.upgrade()
-                && let Err(e) = core.synchronize_all()
-            {
-                // A poisoned device is the only way this fails on the happy
-                // path; the caller will hit the same error on the very next
-                // dispatch anyway. Warn and proceed: the host will clobber
-                // some slot, but the GPU is also dead, so it's moot.
-                tracing::warn!(?e, "kernarg arena wrap: synchronize_all failed");
+            if let Some(core) = self.core.upgrade() {
+                core.synchronize_all()?;
             }
             let mut cur = self.cursor.lock();
             *cur = size;
@@ -117,8 +108,8 @@ impl KernargArena {
 
     /// # Safety
     /// Caller must ensure `offset + size <= self.size` and that no concurrent
-    /// writer holds the same slot. The dispatch lock held across bump + write +
-    /// dispatch (in `execute_on`) guarantees the only producer of a given slot
+    /// writer holds the same slot. The exclusive lane lease held across bump +
+    /// write + dispatch guarantees the only producer of a given slot
     /// is the caller of `bump`, and that the GPU reads it before it is reused.
     pub unsafe fn host_at(&self, offset: usize) -> *mut u8 {
         unsafe { self.base_host.as_ptr().add(offset) }

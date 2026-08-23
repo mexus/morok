@@ -30,6 +30,8 @@ pub mod graph;
 pub mod iface;
 #[cfg(unix)]
 pub mod kernarg;
+#[cfg(unix)]
+mod linked_plan;
 pub mod occupancy;
 #[cfg(unix)]
 pub mod pmc;
@@ -45,13 +47,11 @@ pub mod va_registry;
 #[cfg(unix)]
 pub use allocator::AmdAllocator;
 #[cfg(unix)]
-pub use connector::{OwnerCtx, PoolQueue};
-#[cfg(unix)]
 pub use device::{AmdDevice, AmdDeviceCore};
 #[cfg(unix)]
 pub use graph::AmdGraph;
 #[cfg(unix)]
-pub use iface::{AllocKind, AllocResult, AmdIface, KfdIface, QueueHandle, RingDesc};
+pub use iface::{AllocKind, AllocResult, AmdIface, KfdIface, QueueHandle, QueueTeardown, RingDesc};
 #[cfg(unix)]
 pub use kernarg::KernargArena;
 #[cfg(unix)]

@@ -7,32 +7,31 @@
 //! different `queue_type` codes. AQL packets are 64 bytes (`HsaKernelDispatchPacket`
 //! + `HsaBarrierAndPacket`); SDMA submissions are raw dword sequences.
 //!
-//! Dispatch goes through `dispatch_pm4` (single-XCC PM4 ring, fenced on the
+//! Dispatch goes through HCQ command-buffer lowering (single-XCC PM4 ring, fenced on the
 //! `PoolQueue`'s monotonic counter) or the native AQL path (multi-XCC CDNA,
-//! completion via per-op signals). `AmdCopyQueue::copy_fenced` stages
+//! completion via queue-owned PM4 timeline stores). `AmdCopyQueue::copy_fenced` stages
 //! host↔device / device↔device copies via SDMA, fenced on its own timeline.
 
 #![cfg(unix)]
 
-use std::mem::size_of;
 use std::ptr::NonNull;
 use std::sync::Arc;
 
 use parking_lot::Mutex;
 use tracing::debug;
 
-use crate::allocator::{Allocator, BufferSpec};
+use crate::allocator::{Allocator, AmdBufferGuard, BufferSpec};
 
 use crate::amd::AmdAllocator;
-use crate::amd::connector::PoolQueue;
+use crate::amd::connector::{PoolQueue, SubmissionFinalizer};
 use crate::amd::device::AmdDeviceCore;
 use crate::amd::signal::Timeline;
 use crate::amd::sys::hsa::{
     hsa_fence_scope_t_HSA_FENCE_SCOPE_SYSTEM, hsa_kernel_dispatch_packet_t,
     hsa_packet_header_t_HSA_PACKET_HEADER_BARRIER, hsa_packet_header_t_HSA_PACKET_HEADER_SCACQUIRE_FENCE_SCOPE,
     hsa_packet_header_t_HSA_PACKET_HEADER_SCRELEASE_FENCE_SCOPE, hsa_packet_header_t_HSA_PACKET_HEADER_TYPE,
-    hsa_packet_type_t_HSA_PACKET_TYPE_BARRIER_AND, hsa_packet_type_t_HSA_PACKET_TYPE_INVALID,
-    hsa_packet_type_t_HSA_PACKET_TYPE_VENDOR_SPECIFIC, hsa_signal_t, kernel_dispatch_header,
+    hsa_packet_type_t_HSA_PACKET_TYPE_INVALID, hsa_packet_type_t_HSA_PACKET_TYPE_VENDOR_SPECIFIC, hsa_signal_t,
+    kernel_dispatch_header,
 };
 use crate::amd::sys::kfd;
 use crate::amd::sys::pm4;
@@ -48,8 +47,9 @@ pub const AQL_PACKET_BYTES: usize = 64;
 const INVALID_AQL_HEADER: u32 = hsa_packet_type_t_HSA_PACKET_TYPE_INVALID << hsa_packet_header_t_HSA_PACKET_HEADER_TYPE;
 /// 16 MiB ring — the compute-ring default size.
 pub const COMPUTE_RING_BYTES: usize = 16 * 1024 * 1024;
-/// SDMA ring is smaller; 1 MiB is plenty for short copy bursts.
-pub const COPY_RING_BYTES: usize = 1024 * 1024;
+/// Match Tinygrad's KFD SDMA ring size. Linked HCQ plans can enqueue long copy
+/// bursts asynchronously, unlike the synchronous staging path.
+pub const COPY_RING_BYTES: usize = 16 * 1024 * 1024;
 
 /// Conservative upper bound on the dwords a single PM4 dispatch writes to the
 /// ring (wait, HDP flush, acquire_mem, the SET_SH_REG stream, DISPATCH_DIRECT,
@@ -62,56 +62,36 @@ const MAX_DISPATCH_DWORDS: usize = 1024;
 /// letting the host run thousands of dispatches ahead of the GPU.
 const RING_MAX_INFLIGHT: u64 = (COMPUTE_RING_BYTES / 4 / MAX_DISPATCH_DWORDS / 2) as u64;
 
-/// Build an AQL `hsa_barrier_and_packet_t` (64 bytes) with no dependencies and
-/// the given `completion_signal` handle. Used as a graph batch's terminator:
-/// because each kernel-dispatch packet sets the header BARRIER bit (the chain is
-/// serialised), a trailing barrier_and completes — and fires `completion_signal`
-/// (countdown decrement) — only once the last kernel in the batch retires.
-///
-/// Layout: `header`@0, `dep_signal[5]`@8..48 (all 0 = no deps), `completion_signal`@56.
-pub fn build_barrier_and(completion_signal: u64) -> [u32; 16] {
-    // Compose the 16-bit header in u32 (generated enum consts are `c_uint`):
-    // BARRIER_AND type + barrier bit + system-scope acquire/release fences.
-    let header: u32 = hsa_packet_type_t_HSA_PACKET_TYPE_BARRIER_AND
-        | (1 << hsa_packet_header_t_HSA_PACKET_HEADER_BARRIER)
-        | (hsa_fence_scope_t_HSA_FENCE_SCOPE_SYSTEM << hsa_packet_header_t_HSA_PACKET_HEADER_SCACQUIRE_FENCE_SCOPE)
-        | (hsa_fence_scope_t_HSA_FENCE_SCOPE_SYSTEM << hsa_packet_header_t_HSA_PACKET_HEADER_SCRELEASE_FENCE_SCOPE);
-    let mut p = [0u32; 16];
-    p[0] = header; // dw0: header (low 16) + reserved (high 16 = 0)
-    p[14] = completion_signal as u32; // completion_signal.handle @ byte 56
-    p[15] = (completion_signal >> 32) as u32;
-    p
+pub(crate) fn validate_pm4_dword_count(dwords: usize) -> Result<()> {
+    if dwords == 0 || dwords > MAX_DISPATCH_DWORDS {
+        return Err(Error::CommandStreamTooLarge {
+            kind: "PM4 ring submission",
+            actual: dwords,
+            limit: MAX_DISPATCH_DWORDS,
+        });
+    }
+    Ok(())
 }
 
-/// Build an AQL `hsa_barrier_and_packet_t` (64 bytes) that gates a following
-/// dispatch on up to five producer completion signals — WITHOUT the header
-/// BARRIER bit. Because the BARRIER bit is clear, this packet does NOT wait for
-/// prior packets in the ring to complete: it only blocks until each (non-zero)
-/// `deps[i]` signal value reaches 0, so earlier *independent* kernels keep
-/// running. The system-scope acquire/release fences make the producers' writes
-/// visible to the consumer. Used by DAG-driven graph dispatch to enforce true
-/// data dependencies while leaving the per-dispatch BARRIER bit stripped.
-///
-/// Up to the first five `deps` are written into `dep_signal[0..5]` (dwords
-/// 2/3, 4/5, 6/7, 8/9, 10/11); callers chain multiple packets for >5 deps.
-/// `completion` (0 = none) at dwords 14/15.
-///
-/// Layout: `header`@0, `dep_signal[5]`@8..48, `completion_signal`@56.
-pub fn build_barrier_and_deps(deps: &[u64], completion: u64) -> [u32; 16] {
-    // BARRIER_AND type + system-scope acquire/release fences, but NO barrier bit.
-    let header: u32 = hsa_packet_type_t_HSA_PACKET_TYPE_BARRIER_AND
-        | (hsa_fence_scope_t_HSA_FENCE_SCOPE_SYSTEM << hsa_packet_header_t_HSA_PACKET_HEADER_SCACQUIRE_FENCE_SCOPE)
-        | (hsa_fence_scope_t_HSA_FENCE_SCOPE_SYSTEM << hsa_packet_header_t_HSA_PACKET_HEADER_SCRELEASE_FENCE_SCOPE);
-    let mut p = [0u32; 16];
-    p[0] = header; // dw0: header (low 16) + reserved (high 16 = 0)
-    // dep_signal[i] handle at dwords 2+2*i / 3+2*i (byte 8 + 8*i). Up to 5.
-    for (i, &dep) in deps.iter().take(5).enumerate() {
-        p[2 + 2 * i] = dep as u32;
-        p[3 + 2 * i] = (dep >> 32) as u32;
+pub(crate) fn build_pm4_indirect_buffer(pm4_addr: u64, pm4_count: usize) -> Result<[u32; 4]> {
+    let count = u32::try_from(pm4_count).map_err(|_| Error::CommandStreamTooLarge {
+        kind: "PM4 indirect buffer",
+        actual: pm4_count,
+        limit: pm4::INDIRECT_BUFFER_SIZE_MASK as usize,
+    })?;
+    if count == 0 || count > pm4::INDIRECT_BUFFER_SIZE_MASK {
+        return Err(Error::CommandStreamTooLarge {
+            kind: "PM4 indirect buffer",
+            actual: pm4_count,
+            limit: pm4::INDIRECT_BUFFER_SIZE_MASK as usize,
+        });
     }
-    p[14] = completion as u32; // completion_signal.handle @ byte 56
-    p[15] = (completion >> 32) as u32;
-    p
+    Ok([
+        pm4::packet3(pm4::PACKET3_INDIRECT_BUFFER, 2),
+        pm4_addr as u32,
+        (pm4_addr >> 32) as u32,
+        count | pm4::INDIRECT_BUFFER_VALID,
+    ])
 }
 
 /// Build an AQL vendor-specific packet (64 bytes) pointing the AQL packet
@@ -120,12 +100,17 @@ pub fn build_barrier_and_deps(deps: &[u64], completion: u64) -> [u32; 16] {
 /// the AQL queue: the AQL header acquire fence covers DATA caches only — NOT the
 /// instruction cache — so a code object placed on a recycled VA must be preceded
 /// by this explicit invalidate, mirroring ROCr `GpuAgent::InvalidateCodeCaches`
-/// at code-object load. The BARRIER bit + system-scope fences serialise it ahead
-/// of the following dispatch on every XCC. Unlike the old vendor-IB path, this
-/// carries no `RELEASE_MEM`/signal write, so the multi-XCC timeline-slot race
-/// that motivated deleting vendor IBs does not apply (broadcast cache-invalidate
-/// is idempotent across XCCs).
-pub fn build_aql_vendor_ib_packet(pm4_addr: u64, pm4_count: u32) -> [u32; 16] {
+/// at code-object load. The BARRIER bit + system-scope fences serialize each
+/// control run around native dispatch packets. Multi-XCC timestamp and timeline
+/// writes inside these IBs are predicated to XCC0.
+pub fn build_aql_vendor_ib_packet(pm4_addr: u64, pm4_count: u32) -> Result<[u32; 16]> {
+    if pm4_count == 0 || pm4_count > pm4::INDIRECT_BUFFER_SIZE_MASK {
+        return Err(Error::CommandStreamTooLarge {
+            kind: "PM4 indirect buffer",
+            actual: pm4_count as usize,
+            limit: pm4::INDIRECT_BUFFER_SIZE_MASK as usize,
+        });
+    }
     let header: u32 = hsa_packet_type_t_HSA_PACKET_TYPE_VENDOR_SPECIFIC
         | (1 << hsa_packet_header_t_HSA_PACKET_HEADER_BARRIER)
         | (hsa_fence_scope_t_HSA_FENCE_SCOPE_SYSTEM << hsa_packet_header_t_HSA_PACKET_HEADER_SCACQUIRE_FENCE_SCOPE)
@@ -138,7 +123,7 @@ pub fn build_aql_vendor_ib_packet(pm4_addr: u64, pm4_count: u32) -> [u32; 16] {
     p[3] = (pm4_addr >> 32) as u32;
     p[4] = pm4_count | pm4::INDIRECT_BUFFER_VALID;
     p[5] = 10; // poll interval
-    p
+    Ok(p)
 }
 
 /// Pack a kernel-dispatch packet describing a single launch.
@@ -170,10 +155,7 @@ pub fn build_dispatch_packet(
 /// Like [`build_dispatch_packet`] but with explicit control over the header
 /// BARRIER bit. When `barrier` is `false` the bit is cleared, so the AQL packet
 /// processor does NOT wait for all prior packets to COMPLETE before launching
-/// this kernel — letting independent kernels overlap. True data dependencies
-/// are then carried by preceding `barrier_and` packets (see
-/// [`build_barrier_and_deps`]). All other fields are identical to
-/// [`build_dispatch_packet`].
+/// this kernel. All other fields are identical to [`build_dispatch_packet`].
 #[allow(clippy::too_many_arguments)]
 pub fn build_dispatch_packet_barrier(
     workgroup_size: [u16; 3],
@@ -217,6 +199,668 @@ pub fn build_dispatch_packet_barrier(
     p
 }
 
+/// Lower one backend-neutral HCQ compute command to an AMD AQL packet.
+/// Geometry conversion is deliberately outside this function: callers provide
+/// the exact AQL work-item grid in `ComputeDispatch::grid_size`.
+pub fn lower_hcq_compute(command: &crate::hcq::ComputeDispatch) -> Result<hsa_kernel_dispatch_packet_t> {
+    let workgroup_size = command.workgroup_size.map(|v| {
+        u16::try_from(v).map_err(|_| Error::Runtime { message: format!("AMD HCQ workgroup dimension {v} exceeds u16") })
+    });
+    let [x, y, z] = workgroup_size;
+    Ok(build_dispatch_packet_barrier(
+        [x?, y?, z?],
+        command.grid_size,
+        command.private_segment_size,
+        command.group_segment_size,
+        command.kernel_object,
+        command.kernarg_address,
+        command.completion_signal,
+        command.barrier,
+    ))
+}
+
+/// Lower a neutral compute submission to native AQL packets. AQL has no
+/// standalone packet for the HCQ memory barrier; its intent is carried by the
+/// following dispatch's BARRIER bit and system-scope acquire/release fences.
+pub fn lower_hcq_aql(submission: &crate::hcq::Submission) -> Result<Vec<[u32; 16]>> {
+    if !matches!(submission.queue, crate::hcq::QueueKind::Compute(_)) {
+        return Err(Error::Runtime {
+            message: format!("AQL lowering requires a compute queue, got {:?}", submission.queue),
+        });
+    }
+    let mut packets = Vec::new();
+    let mut pending_barrier = false;
+    for command in &submission.commands {
+        match command {
+            crate::hcq::Command::MemoryBarrier => pending_barrier = true,
+            crate::hcq::Command::Compute(dispatch) => {
+                if pending_barrier && !dispatch.barrier {
+                    return Err(Error::Runtime {
+                        message: "AMD AQL MemoryBarrier requires the following compute dispatch barrier bit".into(),
+                    });
+                }
+                let packet = lower_hcq_compute(dispatch)?;
+                let mut dwords = [0u32; 16];
+                // SAFETY: the AQL dispatch packet is exactly 16 dwords and POD.
+                unsafe { std::ptr::copy_nonoverlapping(&packet as *const _ as *const u32, dwords.as_mut_ptr(), 16) };
+                packets.push(dwords);
+                pending_barrier = false;
+            }
+            _ => return Err(unsupported_hcq(submission.queue, command)),
+        }
+    }
+    if pending_barrier {
+        return Err(Error::Runtime { message: "AMD AQL submission ends with an unconsumed MemoryBarrier".into() });
+    }
+    Ok(packets)
+}
+
+/// Wrap one ordinary AQL dispatch in the queue-owned timeline protocol.
+/// Kernel completion handles must remain unset; optional profiling uses PM4
+/// timestamp stores in the surrounding control runs.
+pub fn finalize_hcq_aql_timeline_submission(
+    submission: &crate::hcq::Submission,
+    counter_address: u64,
+    previous: u64,
+    next: u64,
+    timestamps: Option<(u64, u64)>,
+) -> Result<crate::hcq::Submission> {
+    let computes = submission
+        .commands
+        .iter()
+        .filter_map(|command| match command {
+            crate::hcq::Command::Compute(dispatch) => Some(dispatch),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if computes.len() != 1 {
+        return Err(Error::Runtime {
+            message: format!("AMD AQL ordinary dispatch requires exactly one compute command, got {}", computes.len()),
+        });
+    }
+    if computes[0].completion_signal != 0 {
+        return Err(Error::Runtime {
+            message: "AMD AQL kernel completion must remain unset; the queue timeline owns completion".into(),
+        });
+    }
+
+    let mut finalized = crate::hcq::Submission::new(submission.queue);
+    finalized.push(crate::hcq::Command::Wait { signal_address: counter_address, value: previous });
+    for command in &submission.commands {
+        if matches!(command, crate::hcq::Command::Compute(_))
+            && let Some((start, _)) = timestamps
+        {
+            finalized.push(crate::hcq::Command::Timestamp { dst: start });
+        }
+        finalized.push(command.clone());
+        if matches!(command, crate::hcq::Command::Compute(_))
+            && let Some((_, end)) = timestamps
+        {
+            finalized.push(crate::hcq::Command::Timestamp { dst: end });
+        }
+    }
+    finalized.push(crate::hcq::Command::Store { dst: counter_address, value: next });
+    Ok(finalized)
+}
+
+/// Lower AQL while recording native patch sites from the packet layout emitted
+/// above. Completion is deliberately not patchable: queue-owned PM4 timeline
+/// stores finalize every supported AQL submission.
+pub fn lower_hcq_aql_command_buffer(submission: &crate::hcq::Submission) -> Result<crate::hcq::LoweredCommandBuffer> {
+    use crate::hcq::{Command, CommandField as F, PatchEncoding, PatchSite};
+
+    let packets = lower_hcq_aql(submission)?;
+    let mut sites = Vec::new();
+    let mut consumed = std::collections::BTreeSet::new();
+    let mut packet = 0usize;
+    for (command_index, command) in submission.commands.iter().enumerate() {
+        if let Command::Compute(dispatch) = command {
+            if dispatch.completion_signal != 0 {
+                return Err(Error::Runtime {
+                    message: "AMD linked AQL kernel completion must remain unset; the queue timeline owns completion"
+                        .into(),
+                });
+            }
+            let base = packet * AQL_PACKET_BYTES;
+            let mut site = |field, byte_offset, encoding| {
+                if let Some(source) = command_binding(submission, command_index, field) {
+                    sites.push(PatchSite { byte_offset: base + byte_offset, encoding, source, addend: 0 });
+                    consumed.insert((command_index, field));
+                }
+            };
+            for axis in 0..3u8 {
+                site(F::ComputeWorkgroup(axis), 4 + axis as usize * 2, PatchEncoding::U16);
+                site(F::ComputeGrid(axis), 12 + axis as usize * 4, PatchEncoding::U32);
+            }
+            site(F::ComputeKernelObject, 32, PatchEncoding::U64);
+            site(F::ComputeKernargAddress, 40, PatchEncoding::U64);
+            packet += 1;
+        }
+    }
+    if consumed.len() != submission.patches().len() {
+        let missing = submission.patches().iter().find(|p| !consumed.contains(&(p.command, p.field))).unwrap();
+        return Err(Error::Runtime {
+            message: format!("AMD AQL lowering cannot patch {:?} on command {}", missing.field, missing.command),
+        });
+    }
+
+    let mut bytes = Vec::with_capacity(packets.len() * AQL_PACKET_BYTES);
+    for packet in packets {
+        bytes.extend_from_slice(dwords_as_bytes(&packet));
+    }
+    Ok(crate::hcq::LoweredCommandBuffer { bytes, patches: crate::hcq::PatchTable::from_sites(sites) })
+}
+
+/// AQL submission program matching Tinygrad's `AMDComputeAQLQueue._prep_aql`:
+/// native dispatch packets stay in the AQL stream while every contiguous run of
+/// PM4-only HCQ commands is stored in resident memory and invoked by a barriered
+/// vendor-IB packet. This is what gives AQL queues arbitrary memory wait/store
+/// semantics without inventing unsupported architected AQL packet forms.
+pub struct LoweredAqlSubmissionProgram {
+    pub aql: crate::hcq::LoweredCommandBuffer,
+    pub control: crate::hcq::LoweredCommandBuffer,
+}
+
+pub fn lower_hcq_aql_submission_program(
+    submission: &crate::hcq::Submission,
+    state: Pm4LoweringState,
+    control_address: crate::hcq::PatchSource,
+) -> Result<LoweredAqlSubmissionProgram> {
+    use crate::hcq::{Command, LoweredCommandBuffer, PatchEncoding, PatchSite, PatchTable, Submission};
+
+    if !matches!(submission.queue, crate::hcq::QueueKind::Compute(_)) {
+        return Err(Error::Runtime { message: "AQL submission program requires a compute queue".into() });
+    }
+
+    let mut aql_bytes = Vec::new();
+    let mut aql_sites = Vec::new();
+    let mut control_bytes = Vec::new();
+    let mut control_sites = Vec::new();
+    let mut run = Submission::new(submission.queue);
+
+    let flush_run = |run: &mut Submission,
+                     aql_bytes: &mut Vec<u8>,
+                     aql_sites: &mut Vec<PatchSite>,
+                     control_bytes: &mut Vec<u8>,
+                     control_sites: &mut Vec<PatchSite>|
+     -> Result<()> {
+        if run.commands.is_empty() {
+            return Ok(());
+        }
+        let lowered = lower_hcq_pm4_command_buffer(run, state)?;
+        let control_offset = control_bytes.len();
+        control_bytes.extend_from_slice(&lowered.bytes);
+        for mut site in lowered.patches.link.into_iter().chain(lowered.patches.runtime).chain(lowered.patches.system) {
+            site.byte_offset += control_offset;
+            control_sites.push(site);
+        }
+
+        let packet_offset = aql_bytes.len();
+        let pm4_count = u32::try_from(lowered.bytes.len() / 4).map_err(|_| Error::CommandStreamTooLarge {
+            kind: "PM4 indirect buffer",
+            actual: lowered.bytes.len() / 4,
+            limit: pm4::INDIRECT_BUFFER_SIZE_MASK as usize,
+        })?;
+        let packet = build_aql_vendor_ib_packet(0, pm4_count)?;
+        aql_bytes.extend_from_slice(dwords_as_bytes(&packet));
+        aql_sites.push(PatchSite {
+            byte_offset: packet_offset + 8,
+            encoding: PatchEncoding::U64,
+            source: control_address,
+            addend: control_offset as u64,
+        });
+        run.clear();
+        Ok(())
+    };
+
+    for (command_index, command) in submission.commands.iter().enumerate() {
+        if matches!(command, Command::Compute(_)) {
+            flush_run(&mut run, &mut aql_bytes, &mut aql_sites, &mut control_bytes, &mut control_sites)?;
+            let mut one = Submission::new(submission.queue);
+            one.push(command.clone());
+            for patch in submission.patches().iter().filter(|patch| patch.command == command_index) {
+                one.bind(0, patch.field, patch.source)?;
+            }
+            let lowered = lower_hcq_aql_command_buffer(&one)?;
+            let offset = aql_bytes.len();
+            aql_bytes.extend_from_slice(&lowered.bytes);
+            for mut site in
+                lowered.patches.link.into_iter().chain(lowered.patches.runtime).chain(lowered.patches.system)
+            {
+                site.byte_offset += offset;
+                aql_sites.push(site);
+            }
+        } else {
+            let out = run.commands.len();
+            run.push(command.clone());
+            for patch in submission.patches().iter().filter(|patch| patch.command == command_index) {
+                run.bind(out, patch.field, patch.source)?;
+            }
+        }
+    }
+    flush_run(&mut run, &mut aql_bytes, &mut aql_sites, &mut control_bytes, &mut control_sites)?;
+
+    Ok(LoweredAqlSubmissionProgram {
+        aql: LoweredCommandBuffer { bytes: aql_bytes, patches: PatchTable::from_sites(aql_sites) },
+        control: LoweredCommandBuffer { bytes: control_bytes, patches: PatchTable::from_sites(control_sites) },
+    })
+}
+
+/// Host-known state needed while lowering a neutral command buffer to raw PM4.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Pm4LoweringState {
+    pub scratch_address: u64,
+    pub tmpring_size: u32,
+    pub target_major: u32,
+    /// Restrict PM4 timestamp and timeline writes to one XCC. This is required
+    /// for PM4 control runs launched through a multi-XCC AQL vendor IB.
+    pub completion_xcc_mask: Option<u32>,
+}
+
+/// Queue-finalized dispatch result. The queue owns timestamp allocation and
+/// packet insertion; callers only retain the resulting handle until collection.
+pub(crate) struct HcqDispatchResult {
+    pub(crate) finalizer: Arc<SubmissionFinalizer>,
+    pub(crate) timestamps: Option<Arc<crate::amd::signal::AmdSignal>>,
+}
+
+fn unsupported_hcq(queue: crate::hcq::QueueKind, command: &crate::hcq::Command) -> Error {
+    Error::Runtime { message: format!("AMD {queue:?} does not support HCQ command {command:?}") }
+}
+
+fn value_u32(kind: &str, value: u64) -> Result<u32> {
+    u32::try_from(value).map_err(|_| Error::Runtime {
+        message: format!("AMD {kind} value {value} exceeds the 32-bit hardware timeline comparison field"),
+    })
+}
+
+/// Lower a complete neutral compute submission to one ordered PM4 stream.
+/// Queue-invalid packet forms are errors rather than silently changing engines.
+pub fn lower_hcq_pm4(submission: &crate::hcq::Submission, state: Pm4LoweringState) -> Result<Vec<u32>> {
+    if !matches!(submission.queue, crate::hcq::QueueKind::Compute(_)) {
+        return Err(Error::Runtime {
+            message: format!("PM4 lowering requires a compute queue, got {:?}", submission.queue),
+        });
+    }
+    let is_gfx9 = state.target_major == 9;
+    let mut q = Vec::new();
+    for command in &submission.commands {
+        match command {
+            crate::hcq::Command::Wait { signal_address, value } => {
+                q.extend_from_slice(&pm4::wait_reg_mem(*signal_address, value_u32("wait", *value)?, u32::MAX));
+            }
+            crate::hcq::Command::MemoryBarrier => {
+                q.extend_from_slice(&pm4::hdp_flush());
+                if is_gfx9 {
+                    q.extend_from_slice(&pm4::acquire_mem_gfx9());
+                } else {
+                    q.extend_from_slice(&pm4::acquire_mem());
+                }
+            }
+            crate::hcq::Command::Store { dst, value } => {
+                if let Some(mask) = state.completion_xcc_mask {
+                    q.extend_from_slice(&pm4::pred_exec(mask, 8));
+                }
+                q.extend_from_slice(&pm4::release_mem_write(*dst, *value, true, true, false, is_gfx9));
+            }
+            crate::hcq::Command::Timestamp { dst } => {
+                // Tinygrad: EOP drain, clock write, then acquire the timestamp.
+                let mut timestamp = Vec::new();
+                timestamp.extend_from_slice(&pm4::release_mem_order(is_gfx9));
+                timestamp.extend_from_slice(&pm4::release_mem_timestamp(*dst, is_gfx9));
+                if is_gfx9 {
+                    timestamp.extend_from_slice(&pm4::acquire_mem_gfx9());
+                } else {
+                    timestamp.extend_from_slice(&pm4::acquire_mem());
+                }
+                if let Some(mask) = state.completion_xcc_mask {
+                    q.extend_from_slice(&pm4::pred_exec(mask, timestamp.len() as u32));
+                }
+                q.extend(timestamp);
+            }
+            crate::hcq::Command::Compute(dispatch) => {
+                let native = dispatch.amd_pm4.as_ref().ok_or_else(|| Error::Runtime {
+                    message: "AMD PM4 compute requires ComputeDispatch::amd_pm4 metadata".into(),
+                })?;
+                if native.target_major != state.target_major {
+                    return Err(Error::Runtime {
+                        message: format!(
+                            "AMD PM4 command targets gfx{}, queue lowering targets gfx{}",
+                            native.target_major, state.target_major
+                        ),
+                    });
+                }
+                let mut user_data = Vec::with_capacity(if native.enable_private_segment_sgpr { 6 } else { 2 });
+                if native.enable_private_segment_sgpr {
+                    user_data.extend_from_slice(&[
+                        state.scratch_address as u32,
+                        (state.scratch_address >> 32) as u32 | (1 << 31),
+                        u32::MAX,
+                        0x20c1_4000,
+                    ]);
+                }
+                user_data
+                    .extend_from_slice(&[dispatch.kernarg_address as u32, (dispatch.kernarg_address >> 32) as u32]);
+                build_exec_pm4(
+                    &mut q,
+                    native.rsrc[0],
+                    native.rsrc[1],
+                    native.rsrc[2],
+                    native.program_address,
+                    &user_data,
+                    state.scratch_address,
+                    state.tmpring_size,
+                    dispatch.workgroup_size,
+                    native.workgroup_count,
+                    native.wave32,
+                    native.target_major,
+                );
+            }
+            crate::hcq::Command::Copy { .. } | crate::hcq::Command::Execute { .. } => {
+                return Err(unsupported_hcq(submission.queue, command));
+            }
+        }
+    }
+    Ok(q)
+}
+
+/// Lower a complete neutral copy submission to one ordered SDMA stream.
+pub fn lower_hcq_sdma(submission: &crate::hcq::Submission, target_major: u32) -> Result<Vec<u32>> {
+    if !matches!(submission.queue, crate::hcq::QueueKind::Copy(_)) {
+        return Err(Error::Runtime {
+            message: format!("SDMA lowering requires a copy queue, got {:?}", submission.queue),
+        });
+    }
+    let mut q = Vec::new();
+    for command in &submission.commands {
+        match command {
+            crate::hcq::Command::Wait { signal_address, value } => {
+                q.extend_from_slice(&sdma::poll_regmem_geq(*signal_address, value_u32("wait", *value)?));
+            }
+            // Tinygrad defines memory barriers only for compute queues. The
+            // scheduler emits this common prologue on first queue use; SDMA FIFO
+            // ordering makes it an empty packet sequence.
+            crate::hcq::Command::MemoryBarrier => {}
+            crate::hcq::Command::Copy { dst, src, bytes } => {
+                let mut off = 0usize;
+                while off < *bytes {
+                    let n = (*bytes - off).min(sdma::SDMA_MAX_COPY_BYTES);
+                    q.extend_from_slice(&sdma::copy_linear(*src + off as u64, *dst + off as u64, n));
+                    off += n;
+                }
+            }
+            crate::hcq::Command::Timestamp { dst } => q.extend_from_slice(&sdma::timestamp_global(*dst)),
+            crate::hcq::Command::Store { dst, value } => {
+                q.extend_from_slice(&sdma::fence(*dst, value_u32("store", *value)?, target_major));
+            }
+            crate::hcq::Command::Compute(_) | crate::hcq::Command::Execute { .. } => {
+                return Err(unsupported_hcq(submission.queue, command));
+            }
+        }
+    }
+    Ok(q)
+}
+
+fn dwords_to_le_bytes(dwords: &[u32]) -> Vec<u8> {
+    dwords.iter().flat_map(|word| word.to_le_bytes()).collect()
+}
+
+fn record_u64_sites(
+    sites: &mut Vec<crate::hcq::PatchSite>,
+    dword: usize,
+    source: crate::hcq::PatchSource,
+    addend: u64,
+) {
+    sites.push(crate::hcq::PatchSite {
+        byte_offset: dword * 4,
+        encoding: crate::hcq::PatchEncoding::Low32,
+        source,
+        addend,
+    });
+    sites.push(crate::hcq::PatchSite {
+        byte_offset: (dword + 1) * 4,
+        encoding: crate::hcq::PatchEncoding::High32,
+        source,
+        addend,
+    });
+}
+
+fn command_binding(
+    submission: &crate::hcq::Submission,
+    command: usize,
+    field: crate::hcq::CommandField,
+) -> Option<crate::hcq::PatchSource> {
+    submission.patches().iter().find(|patch| patch.command == command && patch.field == field).map(|patch| patch.source)
+}
+
+/// Lower PM4 and return backend-originated scatter metadata. Packet offsets are
+/// recorded from the exact packet append positions below, never inferred by
+/// searching the resulting byte stream.
+pub fn lower_hcq_pm4_command_buffer(
+    submission: &crate::hcq::Submission,
+    state: Pm4LoweringState,
+) -> Result<crate::hcq::LoweredCommandBuffer> {
+    use crate::hcq::{Command, CommandField as F, PatchEncoding, PatchSite};
+
+    let dwords = lower_hcq_pm4(submission, state)?;
+    let mut sites = Vec::new();
+    let mut consumed = std::collections::BTreeSet::new();
+    let mut cursor = 0usize;
+    for (command_index, command) in submission.commands.iter().enumerate() {
+        let mut one = crate::hcq::Submission::new(submission.queue);
+        one.push(command.clone());
+        let command_len = lower_hcq_pm4(&one, state)?.len();
+        macro_rules! pair {
+            ($field:expr, $dword:expr) => {
+                if let Some(source) = command_binding(submission, command_index, $field) {
+                    record_u64_sites(&mut sites, cursor + $dword, source, 0);
+                    consumed.insert((command_index, $field));
+                }
+            };
+        }
+        macro_rules! word {
+            ($field:expr, $dword:expr) => {
+                if let Some(source) = command_binding(submission, command_index, $field) {
+                    sites.push(PatchSite {
+                        byte_offset: (cursor + $dword) * 4,
+                        encoding: PatchEncoding::U32,
+                        source,
+                        addend: 0,
+                    });
+                    consumed.insert((command_index, $field));
+                }
+            };
+        }
+        match command {
+            Command::Wait { .. } => {
+                pair!(F::WaitAddress, 2);
+                word!(F::WaitValue, 4);
+            }
+            Command::Store { .. } => {
+                let pred = usize::from(state.completion_xcc_mask.is_some()) * 2;
+                pair!(F::StoreDst, pred + 3);
+                pair!(F::StoreValue, pred + 5);
+            }
+            Command::Timestamp { .. } => {
+                let pred = usize::from(state.completion_xcc_mask.is_some()) * 2;
+                pair!(F::TimestampDst, pred + 11);
+            }
+            Command::Compute(dispatch) => {
+                let native = dispatch.amd_pm4.as_ref().expect("validated by lower_hcq_pm4");
+                let acquire = if state.target_major == 9 { 7 } else { 8 };
+                if let Some(source) = command_binding(submission, command_index, F::ComputeProgramAddress) {
+                    sites.push(PatchSite {
+                        byte_offset: (cursor + acquire + 2) * 4,
+                        encoding: PatchEncoding::Low32ShiftRight(8),
+                        source,
+                        addend: 0,
+                    });
+                    sites.push(PatchSite {
+                        byte_offset: (cursor + acquire + 3) * 4,
+                        encoding: PatchEncoding::High32ShiftRight(8),
+                        source,
+                        addend: 0,
+                    });
+                    consumed.insert((command_index, F::ComputeProgramAddress));
+                }
+                let scratch_packet = acquire + 4 + 4 + 3 + 3;
+                if let Some(source) = command_binding(submission, command_index, F::ComputeScratchTmpring) {
+                    sites.push(PatchSite {
+                        byte_offset: (cursor + scratch_packet - 1) * 4,
+                        encoding: PatchEncoding::U32,
+                        source,
+                        addend: 0,
+                    });
+                    consumed.insert((command_index, F::ComputeScratchTmpring));
+                }
+                if let Some(source) = command_binding(submission, command_index, F::ComputeScratchAddress) {
+                    sites.push(PatchSite {
+                        byte_offset: (cursor + scratch_packet + 2) * 4,
+                        encoding: PatchEncoding::Low32ShiftRight(8),
+                        source,
+                        addend: 0,
+                    });
+                    sites.push(PatchSite {
+                        byte_offset: (cursor + scratch_packet + 3) * 4,
+                        encoding: PatchEncoding::High32ShiftRight(8),
+                        source,
+                        addend: 0,
+                    });
+                    consumed.insert((command_index, F::ComputeScratchAddress));
+                }
+                let user_packet = scratch_packet + 4 + 5;
+                if native.enable_private_segment_sgpr
+                    && let Some(source) = command_binding(submission, command_index, F::ComputeScratchAddress)
+                {
+                    sites.push(PatchSite {
+                        byte_offset: (cursor + user_packet + 2) * 4,
+                        encoding: PatchEncoding::Low32,
+                        source,
+                        addend: 0,
+                    });
+                    sites.push(PatchSite {
+                        byte_offset: (cursor + user_packet + 3) * 4,
+                        encoding: PatchEncoding::High32Or(1 << 31),
+                        source,
+                        addend: 0,
+                    });
+                }
+                let kernarg_word = user_packet + 2 + usize::from(native.enable_private_segment_sgpr) * 4;
+                pair!(F::ComputeKernargAddress, kernarg_word);
+                let resource_packet = user_packet + 2 + if native.enable_private_segment_sgpr { 6 } else { 2 };
+                let local_packet = resource_packet + 3;
+                for axis in 0..3u8 {
+                    word!(F::ComputeWorkgroup(axis), local_packet + 5 + axis as usize);
+                }
+                let dispatch_packet = local_packet + 10;
+                for axis in 0..3u8 {
+                    word!(F::ComputeGrid(axis), dispatch_packet + 1 + axis as usize);
+                }
+            }
+            Command::MemoryBarrier => {}
+            Command::Copy { .. } | Command::Execute { .. } => unreachable!("validated by lower_hcq_pm4"),
+        }
+        cursor += command_len;
+    }
+    if consumed.len() != submission.patches().len() {
+        let missing =
+            submission.patches().iter().find(|patch| !consumed.contains(&(patch.command, patch.field))).unwrap();
+        return Err(Error::Runtime {
+            message: format!("AMD PM4 lowering cannot patch {:?} on command {}", missing.field, missing.command),
+        });
+    }
+    Ok(crate::hcq::LoweredCommandBuffer {
+        bytes: dwords_to_le_bytes(&dwords),
+        patches: crate::hcq::PatchTable::from_sites(sites),
+    })
+}
+
+/// SDMA counterpart to [`lower_hcq_pm4_command_buffer`]. Chunked copies emit a
+/// pair of address sites per chunk with the chunk offset as lowering metadata.
+pub fn lower_hcq_sdma_command_buffer(
+    submission: &crate::hcq::Submission,
+    target_major: u32,
+) -> Result<crate::hcq::LoweredCommandBuffer> {
+    use crate::hcq::{Command, CommandField as F, PatchEncoding, PatchSite};
+
+    let dwords = lower_hcq_sdma(submission, target_major)?;
+    let mut sites = Vec::new();
+    let mut consumed = std::collections::BTreeSet::new();
+    let mut cursor = 0usize;
+    for (command_index, command) in submission.commands.iter().enumerate() {
+        match command {
+            Command::Wait { .. } => {
+                if let Some(source) = command_binding(submission, command_index, F::WaitAddress) {
+                    record_u64_sites(&mut sites, cursor + 1, source, 0);
+                    consumed.insert((command_index, F::WaitAddress));
+                }
+                if let Some(source) = command_binding(submission, command_index, F::WaitValue) {
+                    sites.push(PatchSite {
+                        byte_offset: (cursor + 3) * 4,
+                        encoding: PatchEncoding::U32,
+                        source,
+                        addend: 0,
+                    });
+                    consumed.insert((command_index, F::WaitValue));
+                }
+                cursor += 6;
+            }
+            Command::MemoryBarrier => {}
+            Command::Copy { bytes, .. } => {
+                let mut offset = 0usize;
+                while offset < *bytes {
+                    if let Some(source) = command_binding(submission, command_index, F::CopySrc) {
+                        record_u64_sites(&mut sites, cursor + 3, source, offset as u64);
+                        consumed.insert((command_index, F::CopySrc));
+                    }
+                    if let Some(source) = command_binding(submission, command_index, F::CopyDst) {
+                        record_u64_sites(&mut sites, cursor + 5, source, offset as u64);
+                        consumed.insert((command_index, F::CopyDst));
+                    }
+                    let n = (*bytes - offset).min(sdma::SDMA_MAX_COPY_BYTES);
+                    offset += n;
+                    cursor += 7;
+                }
+            }
+            Command::Timestamp { .. } => {
+                if let Some(source) = command_binding(submission, command_index, F::TimestampDst) {
+                    record_u64_sites(&mut sites, cursor + 1, source, 0);
+                    consumed.insert((command_index, F::TimestampDst));
+                }
+                cursor += 3;
+            }
+            Command::Store { .. } => {
+                if let Some(source) = command_binding(submission, command_index, F::StoreDst) {
+                    record_u64_sites(&mut sites, cursor + 1, source, 0);
+                    consumed.insert((command_index, F::StoreDst));
+                }
+                if let Some(source) = command_binding(submission, command_index, F::StoreValue) {
+                    sites.push(PatchSite {
+                        byte_offset: (cursor + 3) * 4,
+                        encoding: PatchEncoding::U32,
+                        source,
+                        addend: 0,
+                    });
+                    consumed.insert((command_index, F::StoreValue));
+                }
+                cursor += 4;
+            }
+            Command::Compute(_) | Command::Execute { .. } => unreachable!("validated by lower_hcq_sdma"),
+        }
+    }
+    if consumed.len() != submission.patches().len() {
+        let missing =
+            submission.patches().iter().find(|patch| !consumed.contains(&(patch.command, patch.field))).unwrap();
+        return Err(Error::Runtime {
+            message: format!("AMD SDMA lowering cannot patch {:?} on command {}", missing.field, missing.command),
+        });
+    }
+    Ok(crate::hcq::LoweredCommandBuffer {
+        bytes: dwords_to_le_bytes(&dwords),
+        patches: crate::hcq::PatchTable::from_sites(sites),
+    })
+}
+
 /// Compute queue. Wraps either a `KFD_IOC_QUEUE_TYPE_COMPUTE` (PM4) ring on
 /// single-XCC GPUs (gfx11/12 default) or a `KFD_IOC_QUEUE_TYPE_COMPUTE_AQL`
 /// ring on multi-XCC CDNA. The two paths share the same KFD setup, doorbell
@@ -224,13 +868,12 @@ pub fn build_dispatch_packet_barrier(
 /// format we write into the ring and whether the GART contains an
 /// `amd_queue_t` AQL descriptor.
 ///
-/// `inner` is guarded by a per-queue `Mutex`: the brief critical section is the
-/// packet write + doorbell ring (and the rare scratch-descriptor patch), so a
-/// shared `Arc<AmdComputeQueue>` is safe when more owners than queues co-tenant
-/// one ring. Cross-queue parallelism comes from the pool holding many queues,
-/// each with its own lock — the MES interleaves them on the CP pipes.
+/// The lane lease prevents co-tenant publication. The mutex additionally makes
+/// the safe Rust API sound until publication methods take a tokenized mutable
+/// lease directly.
 pub struct AmdComputeQueue {
     inner: Mutex<QueueInner>,
+    state: QueueState,
     /// Immutable device identity (kfd_fd, drm_fd, node, arch, poison latch).
     core: Arc<AmdDeviceCore>,
     /// `true` when this queue submits raw PM4 dwords directly; `false` when
@@ -246,6 +889,7 @@ pub struct AmdComputeQueue {
 /// busy-polls, so completion needs no interrupt/TRAP.
 pub struct AmdCopyQueue {
     inner: Mutex<QueueInner>,
+    state: QueueState,
     core: Arc<AmdDeviceCore>,
     timeline: Arc<Timeline>,
     /// Host-visible GTT bounce buffer for host↔device staging. A device-local
@@ -255,11 +899,25 @@ pub struct AmdCopyQueue {
     staging: Mutex<StagingBuf>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum QueueState {
+    Constructing,
+    Active,
+    Destroyed,
+    Quarantined,
+}
+
 struct StagingBuf {
     _buf: crate::allocator::RawBuffer,
     host: NonNull<u8>,
     gpu: u64,
     size: usize,
+}
+
+impl Drop for StagingBuf {
+    fn drop(&mut self) {
+        self._buf.free_amd_device_in_place();
+    }
 }
 
 // SAFETY: `host`/`gpu` address a stable GTT mapping owned by `_buf`; all access
@@ -280,6 +938,9 @@ struct QueueInner {
     /// every doorbell ring. Skipping it makes the GPU's
     /// command processor see the doorbell change but stall on a stale wptr.
     write_ptr_host: NonNull<u64>,
+    /// KFD-updated queue read pointer. SDMA publication waits for unread ring
+    /// space before writing, matching Tinygrad's `put_value - read_ptr` guard.
+    read_ptr_host: NonNull<u64>,
     /// Host base of the GART page (the `AmdQueueT` descriptor). On AQL queues
     /// the scratch fields at fixed offsets are patched here when the
     /// connector's scratch buffer is (re)allocated; see `set_aql_scratch`.
@@ -311,6 +972,46 @@ struct QueueInner {
 unsafe impl Send for QueueInner {}
 unsafe impl Sync for QueueInner {}
 
+/// Owns an activated queue only while later construction remains fallible.
+/// Teardown runs before the backing `QueueInner` is dropped; teardown failure
+/// poisons the device so `QueueInner::drop` quarantines its mappings.
+struct ActivatedQueueGuard {
+    inner: Option<QueueInner>,
+    core: Arc<AmdDeviceCore>,
+    state: QueueState,
+}
+
+impl ActivatedQueueGuard {
+    fn new(inner: QueueInner, core: Arc<AmdDeviceCore>) -> Self {
+        Self { inner: Some(inner), core, state: QueueState::Constructing }
+    }
+
+    fn into_inner(mut self) -> QueueInner {
+        self.state = QueueState::Active;
+        self.inner.take().expect("activated queue guard already disarmed")
+    }
+}
+
+impl Drop for ActivatedQueueGuard {
+    fn drop(&mut self) {
+        let Some(inner) = self.inner.as_ref() else { return };
+        debug_assert_eq!(self.state, QueueState::Constructing);
+        if std::thread::panicking() {
+            self.state = QueueState::Quarantined;
+            self.core.poison("partially constructed queue abandoned during panic unwind");
+            return;
+        }
+        match self.core.iface().teardown_ring(inner.queue_id, inner.doorbell_base) {
+            Ok(_) => self.state = QueueState::Destroyed,
+            Err(error) => {
+                self.state = QueueState::Quarantined;
+                self.core.poison(&error.to_string());
+                tracing::warn!(?error, "partial queue teardown failed; backing allocations quarantined");
+            }
+        }
+    }
+}
+
 impl Drop for QueueInner {
     /// Free the queue's KFD-allocated VRAM/GTT backings. `RawBuffer` itself
     /// has no `Drop` (the existing `AmdAllocator::_free` consumes RawBuffer
@@ -339,6 +1040,85 @@ impl Drop for QueueInner {
         if let Some(ctx) = self._ctx_buf.as_ref() {
             ctx.free_amd_device_in_place();
         }
+        if let Some(qinactive) = self._qinactive_buf.as_ref() {
+            qinactive.free_amd_device_in_place();
+        }
+    }
+}
+
+impl Drop for AmdComputeQueue {
+    fn drop(&mut self) {
+        let _ = self.close();
+    }
+}
+
+impl Drop for AmdCopyQueue {
+    fn drop(&mut self) {
+        if self.state != QueueState::Active {
+            return;
+        }
+        if std::thread::panicking() {
+            self.core.poison("copy queue abandoned during panic unwind");
+            self.state = QueueState::Quarantined;
+            return;
+        }
+        if let Err(error) = self.timeline.drain(COPY_TIMEOUT_MS) {
+            self.core.poison(&error.to_string());
+            self.state = QueueState::Quarantined;
+            tracing::warn!(?error, "copy queue drain failed; queue and backing quarantined");
+            return;
+        }
+        let (queue_id, doorbell_base) = {
+            let inner = self.inner.lock();
+            (inner.queue_id, inner.doorbell_base)
+        };
+        if let Err(error) = self.core.iface().teardown_ring(queue_id, doorbell_base) {
+            self.core.poison(&error.to_string());
+            self.state = QueueState::Quarantined;
+            tracing::warn!(?error, "copy queue teardown failed; backing allocations quarantined");
+        } else {
+            self.state = QueueState::Destroyed;
+        }
+    }
+}
+
+impl AmdComputeQueue {
+    /// Destroy the KFD queue exactly once. Backing remains owned by `inner` and
+    /// is released by normal field drop only after this reaches `Destroyed`.
+    pub(crate) fn close(&mut self) -> Result<()> {
+        if self.state == QueueState::Destroyed {
+            return Ok(());
+        }
+        if self.state == QueueState::Quarantined || std::thread::panicking() {
+            if std::thread::panicking() {
+                self.core.poison("compute queue abandoned during panic unwind");
+            }
+            self.state = QueueState::Quarantined;
+            return Err(self
+                .core
+                .poison_error()
+                .unwrap_or_else(|| Error::Runtime { message: "AMD compute queue is quarantined".into() }));
+        }
+        debug_assert_eq!(self.state, QueueState::Active);
+        let inner = self.inner.get_mut();
+        match self.core.iface().teardown_ring(inner.queue_id, inner.doorbell_base) {
+            Ok(_) => {
+                self.state = QueueState::Destroyed;
+                Ok(())
+            }
+            Err(error) => {
+                self.core.poison(&error.to_string());
+                self.state = QueueState::Quarantined;
+                tracing::warn!(?error, "compute queue teardown failed; backing allocations quarantined");
+                Err(error)
+            }
+        }
+    }
+
+    pub(crate) fn quarantine(&mut self) {
+        if self.state == QueueState::Active {
+            self.state = QueueState::Quarantined;
+        }
     }
 }
 
@@ -365,6 +1145,18 @@ impl QueueInner {
             idx = (idx + 1) % ring_dwords;
         }
         self.write_idx += dwords.len() as u64;
+    }
+
+    fn push_pm4_bytes(&mut self, bytes: &[u8]) {
+        let ring_dwords = self.ring_size / 4;
+        let mut idx = (self.write_idx as usize) % ring_dwords;
+        for word in bytes.chunks_exact(4) {
+            let value = u32::from_le_bytes(word.try_into().unwrap());
+            // SAFETY: ring_host spans ring_size bytes; idx < ring_dwords.
+            unsafe { std::ptr::write_volatile((self.ring_host.as_ptr() as *mut u32).add(idx), value) };
+            idx = (idx + 1) % ring_dwords;
+        }
+        self.write_idx += (bytes.len() / 4) as u64;
     }
 
     /// Write one 64-byte AQL packet at the current slot. `write_idx` counts
@@ -412,6 +1204,37 @@ impl QueueInner {
     }
 }
 
+pub(crate) struct LinkedComputePublication<'a> {
+    inner: parking_lot::MutexGuard<'a, QueueInner>,
+    is_pm4: bool,
+}
+
+impl LinkedComputePublication<'_> {
+    pub(crate) fn publish(&mut self, replay: &crate::hcq::ReplayCommandBuffer) {
+        if self.is_pm4 {
+            self.inner.push_pm4_bytes(replay.bytes());
+        } else {
+            for packet in replay.bytes().chunks_exact(AQL_PACKET_BYTES) {
+                self.inner.push_aql(packet);
+            }
+        }
+        self.inner.ring_doorbell(self.is_pm4);
+    }
+}
+
+pub(crate) struct LinkedCopyPublication<'a> {
+    inner: parking_lot::MutexGuard<'a, QueueInner>,
+}
+
+impl LinkedCopyPublication<'_> {
+    pub(crate) fn publish(&mut self, replay: &crate::hcq::ReplayCommandBuffer) {
+        push_sdma_bytes(&mut self.inner, replay.bytes());
+        unsafe { std::ptr::write_volatile(self.inner.write_ptr_host.as_ptr(), self.inner.write_idx) };
+        std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+        unsafe { std::ptr::write_volatile(self.inner.doorbell.as_ptr(), self.inner.write_idx) };
+    }
+}
+
 impl AmdComputeQueue {
     /// Create a compute queue. The queue kind is selected by `is_aql =
     /// xccs > 1`. Single-XCC GPUs (the gfx11/12 default) use the
@@ -436,7 +1259,7 @@ impl AmdComputeQueue {
         let queue_type = if is_pm4 { kfd::KFD_IOC_QUEUE_TYPE_COMPUTE } else { kfd::KFD_IOC_QUEUE_TYPE_COMPUTE_AQL };
         let inner = create_queue(allocator, queue_type, COMPUTE_RING_BYTES, !is_pm4, /*needs_cwsr=*/ true)?;
         debug!(gpu_id = core.node.gpu_id, num_xcc = core.node.num_xcc, is_pm4 = is_pm4, "AmdComputeQueue created");
-        Ok(Box::new(Self { inner: Mutex::new(inner), core: Arc::clone(core), is_pm4 }))
+        Ok(Box::new(Self { inner: Mutex::new(inner), state: QueueState::Active, core: Arc::clone(core), is_pm4 }))
     }
 
     /// `true` when this queue submits raw PM4 dwords (single-XCC); `false`
@@ -465,46 +1288,92 @@ impl AmdComputeQueue {
         Ok(())
     }
 
-    /// Atomically build + submit one PM4 (single-XCC) kernel dispatch.
+    /// Lower and publish one per-call neutral compute submission. PM4 wraps the
+    /// common intent in its monotonic wait/store timeline. AQL carries the same
+    /// wait/store timeline in barriered vendor IB packets around a native kernel
+    /// packet whose completion field remains unset.
     ///
-    /// The queue's `inner` lock serializes packet assembly + ring blit +
-    /// doorbell; the caller additionally holds `pool.dispatch_lock` across the
-    /// whole op so the PM4 counter reservation and ring submission stay ordered
-    /// against co-tenant owners on this shared queue.
+    /// The caller's exclusive lane lease keeps PM4 counter reservation and ring
+    /// publication ordered. The backend-local `inner` guard is uncontended.
     ///
-    /// Sequence:
-    /// `wait(counter, prev) → memory_barrier → exec → signal(counter, next)`.
+    /// Sequence (timestamps are present only when the submission requests them):
+    /// `wait(counter, prev) → memory_barrier → [timestamp] → exec → [timestamp]
+    /// → signal(counter, next)`.
     /// Returns the counter value this dispatch signals.
-    #[allow(clippy::too_many_arguments)]
-    pub fn dispatch_pm4(
+    pub(crate) fn submit_hcq_dispatch(
         &self,
         pool: &PoolQueue,
-        rsrc1: u32,
-        rsrc2: u32,
-        rsrc3: u32,
-        prog_addr: u64,
-        enable_private_segment_sgpr: bool,
-        user_data: &[u32],
-        local: [u32; 3],
-        grid: [u32; 3],
-        wave32: bool,
-        target_major: u32,
-        ts_addrs: Option<(u64, u64)>,
+        submission: &crate::hcq::Submission,
         pmc_start: &[u32],
         pmc_read: &[u32],
-    ) -> Result<u64> {
-        debug_assert!(self.is_pm4, "dispatch_pm4 called on AQL queue");
+    ) -> Result<HcqDispatchResult> {
         debug_assert!(
             Arc::ptr_eq(&self.core, pool.core()),
-            "dispatch_pm4: pool core ≠ queue core (queue gpu_id={}, pool gpu_id={}); \
+            "submit_hcq_dispatch: pool core ≠ queue core (queue gpu_id={}, pool gpu_id={}); \
              cross-device dispatch silently corrupts scratch/counter VAs",
             self.core.node.gpu_id,
             pool.core().node.gpu_id,
         );
-        // The caller (`execute_on`) holds `pool.dispatch_lock` across the whole
-        // op (kernarg bump + write + this dispatch), so the PM4 counter state
-        // and ring stay consistent across the back-pressure and wrap waits
-        // against co-tenant owners on this shared queue.
+        if let Some(err) = self.core.poison_error() {
+            return Err(err);
+        }
+        if !self.is_pm4 {
+            if !pmc_start.is_empty() || !pmc_read.is_empty() {
+                return Err(Error::Runtime { message: "AMD AQL PMC register profiling is unsupported".into() });
+            }
+            pool.ensure_pm4_headroom()?;
+            self.wait_dispatch_headroom(pool)?;
+            let counter_addr = pool.pm4_signal().value_addr();
+            let prev = pool.pm4_value().saturating_sub(1);
+            let next = pool.pm4_value();
+            let timestamps = if submission.profile_requested() {
+                let signal = pool.acquire_timestamp_signal()?;
+                signal.reset(0);
+                Some(signal)
+            } else {
+                None
+            };
+
+            let finalized = finalize_hcq_aql_timeline_submission(
+                submission,
+                counter_addr,
+                prev,
+                next,
+                timestamps.as_ref().map(|signal| (signal.start_ts_addr(), signal.end_ts_addr())),
+            )?;
+
+            let program = lower_hcq_aql_submission_program(
+                &finalized,
+                Pm4LoweringState {
+                    scratch_address: pool.scratch_gpu_va(),
+                    tmpring_size: pool.tmpring_size(),
+                    target_major: self.core.arch.gfx_major(),
+                    completion_xcc_mask: (self.core.node.num_xcc > 1).then_some(1),
+                },
+                crate::hcq::PatchSource::LinkAddress(0),
+            )?;
+            let control_offset = pool.arena().bump(program.control.bytes.len(), 16)?;
+            let control_gpu = pool.arena().gpu_at(control_offset);
+            // SAFETY: the arena reservation covers the full resident PM4 control stream.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    program.control.bytes.as_ptr(),
+                    pool.arena().host_at(control_offset),
+                    program.control.bytes.len(),
+                );
+            }
+            std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+            let linked = crate::hcq::CommandBufferCache::default()
+                .link(&program.aql, &crate::hcq::LinkPatchValues(vec![control_gpu]))?;
+            let reserved = pool.next_pm4();
+            debug_assert_eq!(reserved, next, "queue lease must serialize timeline reservation");
+            self.submit_linked_aql(&linked.replay_buffer())?;
+            let finalizer = SubmissionFinalizer::timeline(Arc::clone(pool.pm4_signal()), next, timestamps.clone());
+            return Ok(HcqDispatchResult { timestamps, finalizer });
+        }
+
+        // The caller owns the lane across kernarg bump, write, and publication,
+        // so the PM4 counter and ring remain in the same order.
         // Keep the PM4 counter < 2^32 (drain+reset at the watermark) before
         // reserving this dispatch's value.
         pool.ensure_pm4_headroom()?;
@@ -514,85 +1383,72 @@ impl AmdComputeQueue {
         let counter_addr = pool.pm4_signal().value_addr();
         let scratch_addr = pool.scratch_gpu_va();
         let tmpring_size = pool.tmpring_size();
-        // Assemble the full USER_DATA prefix here, under the lock, so the scratch
-        // SGPR descriptor (words 0-3) is derived from the SAME `scratch_addr` as
-        // the `COMPUTE_DISPATCH_SCRATCH_BASE` register below. Building it in
-        // `AmdProgram::execute` (outside the lock) let a concurrent scratch
-        // realloc slip in between the two reads, so the descriptor and the
-        // register could point at different buffers. The scratch base address
-        // is read exactly once and reused for the descriptor and the register.
-        let mut full_user_data: Vec<u32> = Vec::with_capacity(user_data.len() + 4);
-        if enable_private_segment_sgpr {
-            full_user_data.push(scratch_addr as u32);
-            full_user_data.push((scratch_addr >> 32) as u32 | (1u32 << 31));
-            full_user_data.push(0xFFFF_FFFF);
-            full_user_data.push(0x20c1_4000);
-        }
-        full_user_data.extend_from_slice(user_data);
+        let target_major = self.core.arch.gfx_major();
         let mut g = self.inner.lock();
         let prev = pool.pm4_value().saturating_sub(1);
-        let next = pool.next_pm4();
+        let next = pool.pm4_value();
 
-        let mut q: Vec<u32> = Vec::with_capacity(96);
-        // wait(counter, prev): no-op on the first dispatch (prev == 0).
-        q.extend_from_slice(&pm4::wait_reg_mem(counter_addr, prev as u32, 0xFFFF_FFFF));
-        // memory_barrier: HDP flush handshake + a FULL acquire (L2 invalidate),
-        // emitted unconditionally per dispatch. It makes host-/SDMA-written inputs
-        // visible and invalidates stale L2 regardless of producer. `build_exec_pm4`
-        // below then does the narrow per-exec acquire; the full→narrow pair is the
-        // standard submit-barrier-then-exec acquire sequence.
-        q.extend_from_slice(&pm4::hdp_flush());
-        if target_major == 9 {
-            q.extend_from_slice(&pm4::acquire_mem_gfx9());
+        let timestamps = if submission.profile_requested() {
+            let signal = pool.acquire_timestamp_signal()?;
+            signal.reset(0);
+            Some(signal)
         } else {
-            q.extend_from_slice(&pm4::acquire_mem());
-        }
-        // PMC: program + start the perf counters just before the dispatch so they
-        // bracket the kernel (empty unless counters are armed).
-        q.extend_from_slice(pmc_start);
-        // Profiling: GPU-clock timestamp at end-of-pipe just before the CS
-        // launches (after the submit barriers drain). Paired with the `end`
-        // probe below, `end - start` is on-device kernel time on the PM4 path.
-        if let Some((start_addr, _)) = ts_addrs {
-            q.extend_from_slice(&pm4::release_mem_timestamp(start_addr, target_major == 9));
-        }
-        // exec: SET_SH_REG stream + DISPATCH_DIRECT.
-        build_exec_pm4(
-            &mut q,
-            rsrc1,
-            rsrc2,
-            rsrc3,
-            prog_addr,
-            &full_user_data,
-            scratch_addr,
-            tmpring_size,
-            local,
-            grid,
-            wave32,
-            target_major,
-        );
-        // Profiling: GPU-clock timestamp at the dispatch's end-of-pipe. Emitted
-        // before the completion `release_mem` so it captures CS completion just
-        // ahead of the output cache flush (consistent with the `start` probe's
-        // EOP point, so the delta is kernel time).
-        if let Some((_, end_addr)) = ts_addrs {
-            q.extend_from_slice(&pm4::release_mem_timestamp(end_addr, target_major == 9));
-        }
-        // PMC: sample + COPY_DATA the per-WGP counters into the GTT readback
-        // buffer (after the dispatch's CS_PARTIAL_FLUSH, so counts are final).
-        // The completion `release_mem` below flushes these L2 writes to memory.
-        q.extend_from_slice(pmc_read);
-        // signal(counter, next): RELEASE_MEM after a system-scope cache flush.
-        q.extend_from_slice(&pm4::release_mem(
-            counter_addr,
-            next as u32,
-            /*cache_flush=*/ true,
-            target_major == 9,
-        ));
+            None
+        };
+        let ts_addrs = timestamps.as_ref().map(|signal| (signal.start_ts_addr(), signal.end_ts_addr()));
 
+        let mut finalized = crate::hcq::Submission::new(submission.queue);
+        finalized.push(crate::hcq::Command::Wait { signal_address: counter_addr, value: prev });
+        for command in &submission.commands {
+            if matches!(command, crate::hcq::Command::Compute(_))
+                && let Some((start_addr, _)) = ts_addrs
+            {
+                finalized.push(crate::hcq::Command::Timestamp { dst: start_addr });
+            }
+            finalized.push(command.clone());
+            if matches!(command, crate::hcq::Command::Compute(_))
+                && let Some((_, end_addr)) = ts_addrs
+            {
+                finalized.push(crate::hcq::Command::Timestamp { dst: end_addr });
+            }
+        }
+        finalized.push(crate::hcq::Command::Store { dst: counter_addr, value: next });
+
+        let state =
+            Pm4LoweringState { scratch_address: scratch_addr, tmpring_size, target_major, completion_xcc_mask: None };
+        let q = if pmc_start.is_empty() && pmc_read.is_empty() {
+            lower_hcq_pm4(&finalized, state)?
+        } else {
+            // PMC register programs are backend diagnostics rather than neutral
+            // HCQ commands. Keep their established bracketing while all semantic
+            // queue commands use the common lowerer.
+            let compute = finalized
+                .commands
+                .iter()
+                .position(|command| matches!(command, crate::hcq::Command::Compute(_)))
+                .ok_or_else(|| Error::Runtime { message: "AMD PM4 HCQ submission has no compute command".into() })?;
+            let mut prefix = crate::hcq::Submission::new(finalized.queue);
+            prefix.commands.extend_from_slice(&finalized.commands[..compute]);
+            let mut middle = crate::hcq::Submission::new(finalized.queue);
+            middle.commands.extend_from_slice(&finalized.commands[compute..finalized.commands.len() - 1]);
+            let mut suffix = crate::hcq::Submission::new(finalized.queue);
+            suffix.commands.push(finalized.commands.last().unwrap().clone());
+            let mut q = lower_hcq_pm4(&prefix, state)?;
+            q.extend_from_slice(pmc_start);
+            q.extend(lower_hcq_pm4(&middle, state)?);
+            q.extend_from_slice(pmc_read);
+            q.extend(lower_hcq_pm4(&suffix, state)?);
+            q
+        };
+
+        validate_pm4_dword_count(q.len())?;
+        wait_pm4_headroom(&g, q.len()).inspect_err(|error| self.core.poison(&error.to_string()))?;
+        let reserved = pool.next_pm4();
+        debug_assert_eq!(reserved, next, "queue lease must serialize timeline reservation");
         g.push_pm4(&q);
         g.ring_doorbell(/*is_pm4=*/ true);
-        Ok(next)
+        let finalizer = SubmissionFinalizer::timeline(Arc::clone(pool.pm4_signal()), next, timestamps.clone());
+        Ok(HcqDispatchResult { finalizer, timestamps })
     }
 
     /// Push a pre-built PM4 dword stream into the ring with ONE doorbell — the
@@ -612,59 +1468,97 @@ impl AmdComputeQueue {
         if let Some(err) = self.core.poison_error() {
             return Err(err);
         }
-        // Ring contiguity is serialized by the inner `Mutex` (one writer
-        // produces a contiguous run + doorbell). No `Release` fence here —
+        validate_pm4_dword_count(dwords.len())?;
+        // The lane lease gives one writer a contiguous run + doorbell. No
+        // `Release` fence here —
         // `ring_doorbell` already issues its own publication barrier.
         let mut g = self.inner.lock();
+        wait_pm4_headroom(&g, dwords.len()).inspect_err(|error| self.core.poison(&error.to_string()))?;
         g.push_pm4(dwords);
         g.ring_doorbell(/*is_pm4=*/ true);
         Ok(())
     }
 
-    /// Replay a captured PM4 graph (single-XCC): submit ONE
-    /// `PACKET3_INDIRECT_BUFFER` referencing the graph's resident IB, wrapped in
-    /// the SAME monotonic-counter discipline `dispatch_pm4` uses per kernel —
-    /// `wait(counter, prev) → INDIRECT_BUFFER(ib) → release_mem(counter, next)` —
-    /// with ONE doorbell. The CP runs the whole baked kernel chain inline (per-
-    /// kernel hazard barriers + execs live in the IB); the wrapping `wait`/
-    /// `release_mem` serialise this replay against the previous one and fire the
-    /// pool counter so the owner's `synchronize` drains it, exactly like a
-    /// per-call dispatch but for the whole chain at once. `ib_size` is the IB's
-    /// dword count. Returns the counter value this replay signals.
-    ///
-    /// The caller (`AmdGraphPm4::replay`) holds `pool.dispatch_lock` across the
-    /// whole op so the counter reservation, the (re)built IB's baked scratch VA,
-    /// and the ring submission stay ordered against co-tenant owners.
-    pub fn replay_indirect_buffer(&self, pool: &PoolQueue, ib_gpu: u64, ib_size: u32) -> Result<u64> {
-        debug_assert!(self.is_pm4, "replay_indirect_buffer on AQL queue");
-        if let Some(err) = self.core.poison_error() {
-            return Err(err);
-        }
-        // Same counter housekeeping as `dispatch_pm4`: keep the counter < 2^32
-        // and bound in-flight replays so the host can't lap the ring.
+    /// Patch and publish a linked PM4 graph through the same counter discipline
+    /// as ordinary PM4 dispatch. The native command stream was lowered once at
+    /// capture; replay only updates invocation and queue-owned fields.
+    pub(crate) fn replay_linked_pm4(
+        &self,
+        pool: &PoolQueue,
+        linked: &crate::hcq::LinkedCommandBuffer,
+        replay: &mut crate::hcq::ReplayCommandBuffer,
+        resident_host: *mut u8,
+        resident_gpu: u64,
+        runtime: &crate::hcq::RuntimePatchValues,
+        system: &mut crate::hcq::SystemPatchValues,
+    ) -> Result<Arc<SubmissionFinalizer>> {
+        debug_assert!(self.is_pm4, "replay_linked_pm4 on AQL queue");
         pool.ensure_pm4_headroom()?;
         self.wait_dispatch_headroom(pool)?;
         let counter_addr = pool.pm4_signal().value_addr();
-        let is_gfx9 = self.core.arch.gfx_major() == 9;
-        let mut g = self.inner.lock();
         let prev = pool.pm4_value().saturating_sub(1);
-        let next = pool.next_pm4();
+        let next = pool.pm4_value();
+        system.0.insert(crate::hcq::SystemField::TimelineSignal(0), counter_addr);
+        system.0.insert(crate::hcq::SystemField::TimelineValue(0), prev);
+        system.0.insert(crate::hcq::SystemField::TimelineValue(1), next);
+        system.0.insert(crate::hcq::SystemField::ScratchAddress, pool.scratch_gpu_va());
+        system.0.insert(crate::hcq::SystemField::ScratchTmpring, pool.tmpring_size() as u64);
+        linked.patch(replay, runtime, system)?;
+        let indirect = build_pm4_indirect_buffer(resident_gpu, replay.bytes().len() / 4)?;
+        // SAFETY: graph capture owns a host-visible resident allocation at least
+        // as large as this replay and serializes mutation through its state lock.
+        unsafe { std::ptr::copy_nonoverlapping(replay.bytes().as_ptr(), resident_host, replay.bytes().len()) };
+        std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+        let reserved = pool.next_pm4();
+        debug_assert_eq!(reserved, next, "queue lease must serialize timeline reservation");
+        self.submit_dwords(&indirect)?;
+        Ok(SubmissionFinalizer::timeline(Arc::clone(pool.pm4_signal()), next, None))
+    }
 
-        let mut q: Vec<u32> = Vec::with_capacity(20);
-        // wait(counter, prev): serialise this replay behind the previous one
-        // (no-op on the first; prev == 0).
-        q.extend_from_slice(&pm4::wait_reg_mem(counter_addr, prev as u32, 0xFFFF_FFFF));
-        // Run the baked chain inline.
-        q.push(pm4::packet3(pm4::PACKET3_INDIRECT_BUFFER, 2));
-        q.push(ib_gpu as u32);
-        q.push((ib_gpu >> 32) as u32);
-        q.push(ib_size | pm4::INDIRECT_BUFFER_VALID);
-        // signal(counter, next) after a system-scope cache flush — makes the
-        // chain's outputs host-visible and fires the counter the owner waits on.
-        q.extend_from_slice(&pm4::release_mem(counter_addr, next as u32, /*cache_flush=*/ true, is_gfx9));
-        g.push_pm4(&q);
-        g.ring_doorbell(/*is_pm4=*/ true);
-        Ok(next)
+    /// Patch and publish a linked AQL stream plus its resident PM4 control IBs
+    /// through the queue-owned timeline. Kernel packets carry no completion;
+    /// the trailing control IB publishes `next` after all prior AQL packets.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn replay_linked_aql_timeline(
+        &self,
+        pool: &PoolQueue,
+        linked: &crate::hcq::LinkedCommandBuffer,
+        replay: &mut crate::hcq::ReplayCommandBuffer,
+        control_linked: &crate::hcq::LinkedCommandBuffer,
+        control_replay: &mut crate::hcq::ReplayCommandBuffer,
+        control_host: *mut u8,
+        runtime: &crate::hcq::RuntimePatchValues,
+        system: &mut crate::hcq::SystemPatchValues,
+    ) -> Result<Arc<SubmissionFinalizer>> {
+        debug_assert!(!self.is_pm4, "replay_linked_aql_timeline on PM4 queue");
+        pool.ensure_pm4_headroom()?;
+        self.wait_dispatch_headroom(pool)?;
+        let counter_addr = pool.pm4_signal().value_addr();
+        let prev = pool.pm4_value().saturating_sub(1);
+        let next = pool.pm4_value();
+        system.0.insert(crate::hcq::SystemField::TimelineSignal(0), counter_addr);
+        system.0.insert(crate::hcq::SystemField::TimelineValue(0), prev);
+        system.0.insert(crate::hcq::SystemField::TimelineValue(1), next);
+        control_linked.patch(control_replay, runtime, system)?;
+        // SAFETY: graph capture owns a host-visible allocation at least as large
+        // as the immutable control replay and serializes replay through its mutex.
+        unsafe {
+            std::ptr::copy_nonoverlapping(control_replay.bytes().as_ptr(), control_host, control_replay.bytes().len());
+        }
+        std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+        linked.patch(replay, runtime, system)?;
+        validate_aql_packet_count(replay.bytes().len() / AQL_PACKET_BYTES)?;
+        let reserved = pool.next_pm4();
+        debug_assert_eq!(reserved, next, "queue lease must serialize timeline reservation");
+        self.submit_linked_aql(replay)?;
+        Ok(SubmissionFinalizer::timeline(Arc::clone(pool.pm4_signal()), next, None))
+    }
+
+    /// Lower and publish one complete HCQ command buffer with one doorbell.
+    pub fn submit_hcq_pm4(&self, submission: &crate::hcq::Submission, state: Pm4LoweringState) -> Result<()> {
+        debug_assert!(self.is_pm4, "submit_hcq_pm4 on AQL queue");
+        let dwords = lower_hcq_pm4(submission, state)?;
+        self.submit_dwords(&dwords)
     }
 
     /// Re-blit a captured sequence of 64-byte AQL packets into the ring with ONE
@@ -678,9 +1572,10 @@ impl AmdComputeQueue {
         if let Some(err) = self.core.poison_error() {
             return Err(err);
         }
-        // Ring contiguity is serialized by the inner `Mutex` (one writer
-        // produces a contiguous run of packets + one doorbell).
+        validate_aql_packet_count(packets.len())?;
+        // The lane lease gives one writer a contiguous packet run + doorbell.
         let mut g = self.inner.lock();
+        wait_aql_headroom(&g, packets.len()).inspect_err(|error| self.core.poison(&error.to_string()))?;
         for p in packets {
             g.push_aql(dwords_as_bytes(p));
         }
@@ -688,64 +1583,36 @@ impl AmdComputeQueue {
         Ok(())
     }
 
-    /// Submit ONE native AQL kernel-dispatch packet: push it + ring the
-    /// doorbell, nothing else. No PM4 prologue, no `RELEASE_MEM` epilogue, no
-    /// `PRED_EXEC` gating, no timeline reservation — completion is whatever the
-    /// packet's own `completion_signal` field points at (the hardware
-    /// countdown). The packet's system-scope acquire/release fences handle
-    /// coherence and FIFO queue order handles sequencing, so the old vendor-IB
-    /// prologue + XCC0-gated RELEASE_MEM are gone.
-    pub fn dispatch_aql_native(&self, packet: &hsa_kernel_dispatch_packet_t) -> Result<()> {
-        debug_assert!(!self.is_pm4, "dispatch_aql_native on PM4 queue");
-        debug_assert_eq!(size_of::<hsa_kernel_dispatch_packet_t>(), AQL_PACKET_BYTES);
-        if let Some(err) = self.core.poison_error() {
-            return Err(err);
+    pub fn submit_linked_aql(&self, replay: &crate::hcq::ReplayCommandBuffer) -> Result<()> {
+        if replay.bytes().len() % AQL_PACKET_BYTES != 0 {
+            return Err(Error::Runtime { message: "linked AQL stream is not packet aligned".into() });
         }
-        // Ring write + doorbell are serialized by the inner `Mutex`; the caller
-        // (`execute_on`) additionally holds `pool.dispatch_lock` so the packet's
-        // kernarg slot is the one just bumped.
-        // SAFETY: `hsa_kernel_dispatch_packet_t` is `#[repr(C)]` and exactly
-        // `AQL_PACKET_BYTES` (debug-asserted above).
-        let bytes = unsafe { std::slice::from_raw_parts(packet as *const _ as *const u8, AQL_PACKET_BYTES) };
-        let mut g = self.inner.lock();
-        g.push_aql(bytes);
-        g.ring_doorbell(/*is_pm4=*/ false);
-        Ok(())
+        let packets = replay
+            .bytes()
+            .chunks_exact(AQL_PACKET_BYTES)
+            .map(|bytes| {
+                let mut packet = [0u32; 16];
+                for (word, bytes) in packet.iter_mut().zip(bytes.chunks_exact(4)) {
+                    *word = u32::from_le_bytes(bytes.try_into().unwrap());
+                }
+                packet
+            })
+            .collect::<Vec<_>>();
+        self.submit_aql(&packets)
     }
 
-    /// Dispatch a kernel whose completion is detected via a TRAILING
-    /// `barrier_and` packet (which carries `completion`), NOT the kernel packet's
-    /// own `completion_signal` field. On multi-XCC the kernel packet's native
-    /// per-call completion_signal intermittently strands (the queue goes idle and
-    /// the signal never fires — see memory `amd-multi-xcc-aql-hang`); a
-    /// `barrier_and` gates on the kernel's retirement across all XCCs and fires
-    /// its signal reliably (the same gated-signal mechanism the graph batch
-    /// terminator uses, HW-confirmed to fire once on 8 XCCs). The kernel packet
-    /// passed here MUST have `completion_signal = 0`.
-    ///
-    /// When `ib_gpu != 0`, a one-shot I-cache-invalidate vendor-IB is prepended
-    /// (first dispatch of a program; recycled-VA stale-I-cache guard). Everything
-    /// goes into ONE atomic ring write + doorbell, in order:
-    /// `[icache ACQUIRE_MEM]? -> kernel dispatch -> barrier_and(completion)`.
-    /// AQL queues only.
-    pub fn dispatch_aql_with_barrier_signal(
-        &self,
-        ib_gpu: u64,
-        ib_dwords: u32,
-        packet: &hsa_kernel_dispatch_packet_t,
-        completion: u64,
-    ) -> Result<()> {
-        debug_assert!(!self.is_pm4, "dispatch_aql_with_barrier_signal on PM4 queue");
-        // SAFETY: `hsa_kernel_dispatch_packet_t` is `#[repr(C)]`, exactly 64 bytes
-        // (= 16 dwords); reinterpret as the dword array `submit_aql` takes.
-        let mut kd = [0u32; 16];
-        unsafe { std::ptr::copy_nonoverlapping(packet as *const _ as *const u32, kd.as_mut_ptr(), 16) };
-        let bar = build_barrier_and(completion);
-        if ib_gpu != 0 {
-            self.submit_aql(&[build_aql_vendor_ib_packet(ib_gpu, ib_dwords), kd, bar])
-        } else {
-            self.submit_aql(&[kd, bar])
+    pub(crate) fn prepare_linked_publication(&self, byte_lengths: &[usize]) -> Result<LinkedComputePublication<'_>> {
+        if let Some(error) = self.core.poison_error() {
+            return Err(error);
         }
+        let inner = self.inner.lock();
+        let units = validate_linked_compute_lengths(self.is_pm4, inner.ring_size, byte_lengths)?;
+        if self.is_pm4 {
+            wait_pm4_headroom(&inner, units).inspect_err(|error| self.core.poison(&error.to_string()))?;
+        } else {
+            wait_aql_headroom(&inner, units).inspect_err(|error| self.core.poison(&error.to_string()))?;
+        }
+        Ok(LinkedComputePublication { inner, is_pm4: self.is_pm4 })
     }
 
     /// Patch the AQL `amd_queue_t` scratch descriptor in the GART page. The AQL
@@ -760,9 +1627,7 @@ impl AmdComputeQueue {
             return;
         }
         use crate::amd::sys::hsa;
-        // Called only while the queue is drained (the caller holds it idle), so
-        // the descriptor write can't race a dispatch; locking briefly to read the
-        // stable GART base pointer.
+        // Called during construction or under the lane's exclusive lease.
         let base = self.inner.lock().gart_host.as_ptr();
         // SAFETY: `base` is the GART page we mmapped; every offset lands inside
         // the 256-byte AmdQueueT descriptor that occupies the page.
@@ -830,40 +1695,113 @@ impl AmdComputeQueue {
     }
 }
 
-impl Drop for AmdComputeQueue {
-    /// Destroy the in-kernel KFD compute queue object. Without this, every
-    /// `kfd_create_queue` ioctl leaves a queue id permanently registered with
-    /// the kernel until process exit — and the per-process compute-queue
-    /// limit (typically 32) is over LIFETIME creations, not concurrent ones,
-    /// so a long-running process that creates+drops plans (BEAM-style) would
-    /// eventually hit the cap with zero live connectors. The userspace ring
-    /// / GART / EOP / ctx-save buffers free via the underlying
-    /// `RawBuffer::Drop` chain when `self.inner` drops next.
-    ///
-    /// `PoolQueue::Drop` has already drained the queue before
-    /// reaching this point on the happy path. During panic unwind the
-    /// pool queue skips its drain to keep teardown bounded — destroying
-    /// the KFD queue with in-flight CP work risks a kernel-side fault that
-    /// crashes the process before useful diagnostics flush, so we also
-    /// skip and accept the queue-id leak (process exit reclaims it).
-    fn drop(&mut self) {
-        if std::thread::panicking() {
-            return;
+pub(crate) fn validate_aql_packet_count(packets: usize) -> Result<()> {
+    let slots = COMPUTE_RING_BYTES / AQL_PACKET_BYTES;
+    if packets == 0 || packets >= slots {
+        return Err(Error::CommandStreamTooLarge { kind: "AQL ring submission", actual: packets, limit: slots - 1 });
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_linked_compute_lengths(is_pm4: bool, ring_size: usize, byte_lengths: &[usize]) -> Result<usize> {
+    let unit = if is_pm4 { 4 } else { AQL_PACKET_BYTES };
+    let kind = if is_pm4 { "PM4 linked transaction" } else { "AQL linked transaction" };
+    let capacity = ring_size / unit;
+    let units = byte_lengths.iter().try_fold(0usize, |total, &bytes| {
+        if bytes == 0 || bytes % unit != 0 {
+            return Err(Error::Runtime { message: format!("{kind} stream is not {unit}-byte aligned") });
         }
-        // `&mut self` → exclusive; `get_mut` needs no unsafe.
-        let inner = self.inner.get_mut();
-        let (queue_id, doorbell_base) = (inner.queue_id, inner.doorbell_base);
-        self.core.iface().teardown_ring(queue_id, doorbell_base);
+        total.checked_add(bytes / unit).ok_or(Error::CommandStreamTooLarge {
+            kind,
+            actual: usize::MAX,
+            limit: capacity - 1,
+        })
+    })?;
+    if units == 0 || units >= capacity {
+        return Err(Error::CommandStreamTooLarge { kind, actual: units, limit: capacity - 1 });
+    }
+    Ok(units)
+}
+
+pub(crate) fn linked_sdma_published_bytes(write_idx: u64, ring_size: usize, byte_lengths: &[usize]) -> Result<u64> {
+    let mut next = write_idx;
+    for &bytes in byte_lengths {
+        if bytes == 0 || bytes % 4 != 0 || bytes >= ring_size {
+            return Err(Error::CommandStreamTooLarge {
+                kind: "SDMA linked transaction",
+                actual: bytes,
+                limit: ring_size - 4,
+            });
+        }
+        let pos = (next as usize) % ring_size;
+        if pos + bytes > ring_size {
+            next += (ring_size - pos) as u64;
+        }
+        next = next.checked_add(bytes as u64).ok_or(Error::CommandStreamTooLarge {
+            kind: "SDMA linked transaction",
+            actual: usize::MAX,
+            limit: ring_size - 4,
+        })?;
+    }
+    let published = next.saturating_sub(write_idx);
+    if published >= ring_size as u64 {
+        return Err(Error::CommandStreamTooLarge {
+            kind: "SDMA linked transaction",
+            actual: published.min(usize::MAX as u64) as usize,
+            limit: ring_size - 4,
+        });
+    }
+    Ok(published)
+}
+
+fn wait_pm4_headroom(g: &QueueInner, dwords: usize) -> Result<()> {
+    let capacity = g.ring_size / 4;
+    if dwords == 0 || dwords >= capacity {
+        return Err(Error::CommandStreamTooLarge { kind: "PM4 ring submission", actual: dwords, limit: capacity - 1 });
+    }
+    let start = std::time::Instant::now();
+    loop {
+        // KFD compute queue read/write pointers are monotonically increasing
+        // dword indices; only ring addressing wraps.
+        let read = unsafe { std::ptr::read_volatile(g.read_ptr_host.as_ptr()) };
+        if g.write_idx + dwords as u64 - read <= capacity as u64 {
+            return Ok(());
+        }
+        if start.elapsed().as_millis() >= 30_000 {
+            return Err(Error::TimelineTimeout {
+                what: "PM4 ring headroom",
+                target: g.write_idx + dwords as u64 - capacity as u64,
+                current: read,
+                waited_ms: 30_000,
+            });
+        }
+        std::hint::spin_loop();
+        if start.elapsed().as_micros() >= 100 {
+            std::thread::yield_now();
+        }
     }
 }
 
-impl Drop for AmdCopyQueue {
-    fn drop(&mut self) {
-        let (queue_id, doorbell_base) = {
-            let g = self.inner.lock();
-            (g.queue_id, g.doorbell_base)
-        };
-        self.core.iface().teardown_ring(queue_id, doorbell_base);
+fn wait_aql_headroom(g: &QueueInner, packets: usize) -> Result<()> {
+    let slots = g.ring_size / AQL_PACKET_BYTES;
+    let start = std::time::Instant::now();
+    loop {
+        let read = unsafe { std::ptr::read_volatile(g.read_ptr_host.as_ptr()) };
+        if g.write_idx + packets as u64 - read <= slots as u64 {
+            return Ok(());
+        }
+        if start.elapsed().as_millis() >= 30_000 {
+            return Err(Error::TimelineTimeout {
+                what: "AQL ring headroom",
+                target: g.write_idx + packets as u64 - slots as u64,
+                current: read,
+                waited_ms: 30_000,
+            });
+        }
+        std::hint::spin_loop();
+        if start.elapsed().as_micros() >= 100 {
+            std::thread::yield_now();
+        }
     }
 }
 
@@ -942,98 +1880,6 @@ pub(crate) fn build_exec_pm4(
     q.extend_from_slice(&pm4::event_write(pm4::CS_PARTIAL_FLUSH, pm4::EVENT_INDEX_PARTIAL_FLUSH));
 }
 
-/// Geometry + program identity for one kernel of a captured PM4 graph, baked at
-/// capture so the IB builder doesn't re-derive it per replay. Mirrors the fields
-/// `dispatch_pm4` reads off the `AmdProgram` + the per-call USER_DATA prefix.
-pub(crate) struct GraphKernelPm4 {
-    pub rsrc1: u32,
-    pub rsrc2: u32,
-    pub rsrc3: u32,
-    pub prog_addr: u64,
-    pub enable_private_segment_sgpr: bool,
-    /// Kernarg pointer SGPRs (`[lo, hi]`); the scratch-descriptor SGPRs are
-    /// prepended from the live scratch VA in `append_graph_kernel_pm4`.
-    pub kernarg_user_data: [u32; 2],
-    pub local: [u32; 3],
-    pub grid: [u32; 3],
-    pub wave32: bool,
-    pub target_major: u32,
-}
-
-/// Per-kernel hazard barrier strength for a captured PM4 graph IB. Selected by
-/// `AmdGraphPm4::capture` from each kernel's `deps`, narrowing the per-call
-/// `full acquire_mem` prologue to only what each kernel needs. Back-to-back
-/// inline in the IB, 515 redundant full L2 invalidates dominate, so this is the
-/// load-bearing perf lever. (The HDP flush for host-written inputs is emitted
-/// ONCE at the IB head — it is a global host-data-path flush, not per-buffer — so
-/// it is not part of the per-kernel barrier.)
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum GraphBarrier {
-    /// Full L2 invalidate + write-back. For a kernel that depends on an earlier
-    /// kernel's GPU output (RAW/WAW/WAR): the producer's stores reached L2; this
-    /// consumer invalidates + write-backs every cache level so it observes them.
-    Full,
-    /// Per-CU narrow invalidate (skip L2). For a kernel with NO in-graph producer
-    /// (reads only resident/host-stable inputs, covered by the IB-head HDP
-    /// flush): the prior kernel's trailing `CS_PARTIAL_FLUSH` drained the CS, so
-    /// only the per-CU caches need invalidating — and `build_exec_pm4` already
-    /// issues exactly that narrow acquire, so the prologue here is empty.
-    Narrow,
-}
-
-/// Append one kernel's PM4 exec stream to a captured graph IB — the per-kernel
-/// `dispatch_pm4` sequence WITHOUT the per-call counter `wait`/`release_mem` and
-/// HDP flush: `[acquire_mem(full)]? → build_exec_pm4`. The IB runs in FIFO order
-/// on replay, so inter-kernel ordering is implicit; the `barrier` (selected per
-/// `GraphBarrier`, paired with the prior kernel's `CS_PARTIAL_FLUSH` inside
-/// `build_exec_pm4`) is the hazard fence that makes a producer's stores visible
-/// to a dependent consumer (RAW/WAW/WAR). Host inputs are covered by the IB-head
-/// HDP flush the caller emits once. `scratch_addr`/`tmpring_size` are read from
-/// the queue's live scratch at (re)build time so the descriptor SGPRs (words 0-3)
-/// and `COMPUTE_DISPATCH_SCRATCH_BASE` are derived from the SAME VA.
-pub(crate) fn append_graph_kernel_pm4(
-    q: &mut Vec<u32>,
-    k: &GraphKernelPm4,
-    barrier: GraphBarrier,
-    scratch_addr: u64,
-    tmpring_size: u32,
-) {
-    // Hazard barrier, narrowed to what this kernel needs (see `GraphBarrier`).
-    // A `Full` kernel invalidates L2 to see its in-graph producer; a `Narrow`
-    // kernel relies on `build_exec_pm4`'s own per-CU narrow acquire.
-    if barrier == GraphBarrier::Full {
-        if k.target_major == 9 {
-            q.extend_from_slice(&pm4::acquire_mem_gfx9());
-        } else {
-            q.extend_from_slice(&pm4::acquire_mem());
-        }
-    }
-    // Assemble USER_DATA exactly as `dispatch_pm4`: optional 4-dword scratch
-    // descriptor (derived from the SAME `scratch_addr`) then the kernarg ptr.
-    let mut full_user_data: Vec<u32> = Vec::with_capacity(6);
-    if k.enable_private_segment_sgpr {
-        full_user_data.push(scratch_addr as u32);
-        full_user_data.push((scratch_addr >> 32) as u32 | (1u32 << 31));
-        full_user_data.push(0xFFFF_FFFF);
-        full_user_data.push(0x20c1_4000);
-    }
-    full_user_data.extend_from_slice(&k.kernarg_user_data);
-    build_exec_pm4(
-        q,
-        k.rsrc1,
-        k.rsrc2,
-        k.rsrc3,
-        k.prog_addr,
-        &full_user_data,
-        scratch_addr,
-        tmpring_size,
-        k.local,
-        k.grid,
-        k.wave32,
-        k.target_major,
-    );
-}
-
 /// Per-copy completion-wait timeout. A staging copy that never signals means
 /// a wedged SDMA engine — fail loud rather than spin forever.
 const COPY_TIMEOUT_MS: u64 = 30_000;
@@ -1044,26 +1890,65 @@ const STAGING_BYTES: usize = sdma::SDMA_MAX_COPY_BYTES;
 
 impl AmdCopyQueue {
     pub fn create(allocator: &AmdAllocator) -> Result<Arc<Self>> {
-        let inner = create_queue(
-            allocator,
-            kfd::KFD_IOC_QUEUE_TYPE_SDMA,
-            COPY_RING_BYTES,
-            /*aql=*/ false,
-            /*needs_cwsr=*/ false,
-        )?;
         let core = Arc::clone(allocator.dev.core());
+        let inner = ActivatedQueueGuard::new(
+            create_queue(
+                allocator,
+                kfd::KFD_IOC_QUEUE_TYPE_SDMA,
+                COPY_RING_BYTES,
+                /*aql=*/ false,
+                /*needs_cwsr=*/ false,
+            )?,
+            Arc::clone(&core),
+        );
         let signal = core
             .signal_pool()
             .ok_or_else(|| Error::AmdAllocFailed { reason: "copy queue needs the signal pool installed first".into() })?
             .acquire()?;
         let timeline = Timeline::new(Arc::new(signal));
-        let staging_buf = allocator.alloc_uncached(STAGING_BYTES)?;
-        let (gpu, host) = match &staging_buf {
+        let staging_buf = AmdBufferGuard::new(
+            allocator.alloc_uncached_tagged(STAGING_BYTES, crate::amd::va_registry::AllocTag::Staging)?,
+        );
+        let (gpu, host) = match staging_buf.buffer() {
             crate::allocator::RawBuffer::AmdDevice { gpu_addr, host_ptr: Some(h), .. } => (*gpu_addr, *h),
             _ => return Err(Error::NotHostVisible { what: "staging buffer" }),
         };
-        let staging = Mutex::new(StagingBuf { _buf: staging_buf, host, gpu, size: STAGING_BYTES });
-        Ok(Arc::new(Self { inner: Mutex::new(inner), core, timeline, staging }))
+        let staging = Mutex::new(StagingBuf { _buf: staging_buf.into_inner(), host, gpu, size: STAGING_BYTES });
+        Ok(Arc::new(Self { inner: Mutex::new(inner.into_inner()), state: QueueState::Active, core, timeline, staging }))
+    }
+
+    /// Lower and publish one complete HCQ copy command buffer with one
+    /// doorbell. Completion is represented by explicit `Store` finalizers in
+    /// the submission; this method therefore does not add a private fence.
+    pub fn submit_hcq(&self, submission: &crate::hcq::Submission) -> Result<()> {
+        if let Some(err) = self.core.poison_error() {
+            return Err(err);
+        }
+        let dwords = lower_hcq_sdma(submission, self.core.arch.gfx_major())?;
+        if dwords.len() * 4 >= COPY_RING_BYTES {
+            return Err(Error::CommandStreamTooLarge {
+                kind: "SDMA ring submission",
+                actual: dwords.len() * 4,
+                limit: COPY_RING_BYTES - 4,
+            });
+        }
+        let mut g = self.inner.lock();
+        wait_sdma_headroom(&g, dwords.len() * 4).inspect_err(|error| self.core.poison(&error.to_string()))?;
+        push_sdma(&mut g, &dwords);
+        unsafe { std::ptr::write_volatile(g.write_ptr_host.as_ptr(), g.write_idx) };
+        std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+        unsafe { std::ptr::write_volatile(g.doorbell.as_ptr(), g.write_idx) };
+        Ok(())
+    }
+
+    pub(crate) fn prepare_linked_publication(&self, byte_lengths: &[usize]) -> Result<LinkedCopyPublication<'_>> {
+        if let Some(error) = self.core.poison_error() {
+            return Err(error);
+        }
+        let inner = self.inner.lock();
+        let published = linked_sdma_published_bytes(inner.write_idx, inner.ring_size, byte_lengths)?;
+        wait_sdma_sequence_headroom(&inner, published).inspect_err(|error| self.core.poison(&error.to_string()))?;
+        Ok(LinkedCopyPublication { inner })
     }
 
     /// Stage host bytes into device-local VRAM at `dst_gpu`, chunked through the
@@ -1128,11 +2013,17 @@ impl AmdCopyQueue {
     /// `inner`; the busy-poll wait runs after the lock is released (so the lock
     /// is never held across a multi-second GPU wait).
     pub fn copy_fenced(&self, src: u64, dst: u64, size: usize) -> Result<()> {
+        if let Some(error) = self.core.poison_error() {
+            return Err(error);
+        }
         if size == 0 {
             return Ok(());
         }
-        {
+        let finalizer = {
             let mut g = self.inner.lock();
+            let copy_packets = size.div_ceil(sdma::SDMA_MAX_COPY_BYTES);
+            wait_sdma_headroom(&g, copy_packets * 7 * 4 + 4 * 4)
+                .inspect_err(|error| self.core.poison(&error.to_string()))?;
             let mut off = 0usize;
             while off < size {
                 let n = (size - off).min(sdma::SDMA_MAX_COPY_BYTES);
@@ -1141,19 +2032,30 @@ impl AmdCopyQueue {
             }
             // Reserve + fence the timeline value the host waits on.
             let target = self.timeline.next();
-            push_sdma(&mut g, &sdma::fence(self.timeline.value_addr(), target as u32));
+            push_sdma(&mut g, &sdma::fence(self.timeline.value_addr(), target as u32, self.core.arch.gfx_major()));
             // GART wptr first, then doorbell — same ordering as the compute
             // queue. SDMA doorbell + wptr are byte counters (= write_idx).
             unsafe { std::ptr::write_volatile(g.write_ptr_host.as_ptr(), g.write_idx) };
-            std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
+            std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
             unsafe { std::ptr::write_volatile(g.doorbell.as_ptr(), g.write_idx) };
+            SubmissionFinalizer::timeline(Arc::clone(self.timeline.signal()), target, None)
+        };
+        // Wait for this submission's exact fence outside the queue lock. At the
+        // rollover watermark, drain any later reservations before resetting the
+        // shared 32-bit memory timeline. Coherence for copied data is handled by
+        // the consuming compute dispatch's full acquire_mem prologue.
+        finalizer.wait(COPY_TIMEOUT_MS).inspect_err(|error| self.core.poison(&error.to_string()))?;
+        if self.timeline.current() > crate::amd::signal::TIMELINE_WRAP_WATERMARK {
+            // Serialize the snapshot, wait, and reset against all SDMA timeline
+            // reservations. Otherwise another copy can reserve after the drain
+            // snapshot and have its in-flight generation reset underneath it.
+            let _queue = self.inner.lock();
+            if self.timeline.current() > crate::amd::signal::TIMELINE_WRAP_WATERMARK {
+                self.timeline.drain(COPY_TIMEOUT_MS).inspect_err(|error| self.core.poison(&error.to_string()))?;
+                self.timeline.reset_after_drain();
+            }
         }
-        // Block on the fence value (== `current() - 1`) outside the lock; `drain`
-        // also wrap-resets the 32-bit timeline once past the watermark, with the
-        // engine idle. Coherence for the copied data is handled by the consuming
-        // compute dispatch's full `acquire_mem` prologue (it invalidates L2), so
-        // no extra cache bookkeeping is needed here.
-        self.timeline.drain(COPY_TIMEOUT_MS)
+        Ok(())
     }
 }
 
@@ -1174,6 +2076,73 @@ fn push_sdma(g: &mut QueueInner, dwords: &[u32]) {
     // SAFETY: pos + bytes ≤ ring_size after the wrap guard above.
     unsafe { std::ptr::copy_nonoverlapping(dwords.as_ptr() as *const u8, g.ring_host.as_ptr().add(pos), bytes) };
     g.write_idx += bytes as u64;
+}
+
+fn push_sdma_bytes(g: &mut QueueInner, bytes: &[u8]) {
+    let pos = (g.write_idx as usize) % g.ring_size;
+    if pos + bytes.len() > g.ring_size {
+        let pad = g.ring_size - pos;
+        // SAFETY: ring_host spans ring_size bytes; pos + pad == ring_size.
+        unsafe { std::ptr::write_bytes(g.ring_host.as_ptr().add(pos), 0, pad) };
+        g.write_idx += pad as u64;
+    }
+    let pos = (g.write_idx as usize) % g.ring_size;
+    // SAFETY: the prepared publication validated alignment, length, and wrap.
+    unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), g.ring_host.as_ptr().add(pos), bytes.len()) };
+    g.write_idx += bytes.len() as u64;
+}
+
+fn wait_sdma_headroom(g: &QueueInner, bytes: usize) -> Result<()> {
+    if bytes >= g.ring_size {
+        return Err(Error::CommandStreamTooLarge {
+            kind: "SDMA ring submission",
+            actual: bytes,
+            limit: g.ring_size - 4,
+        });
+    }
+    let pos = (g.write_idx as usize) % g.ring_size;
+    let published = bytes + if pos + bytes > g.ring_size { g.ring_size - pos } else { 0 };
+    let start = std::time::Instant::now();
+    loop {
+        let read = unsafe { std::ptr::read_volatile(g.read_ptr_host.as_ptr()) };
+        if g.write_idx + published as u64 - read <= g.ring_size as u64 {
+            return Ok(());
+        }
+        if start.elapsed().as_millis() >= COPY_TIMEOUT_MS as u128 {
+            return Err(Error::TimelineTimeout {
+                what: "SDMA ring headroom",
+                target: g.write_idx + published as u64 - g.ring_size as u64,
+                current: read,
+                waited_ms: COPY_TIMEOUT_MS,
+            });
+        }
+        std::hint::spin_loop();
+        if start.elapsed().as_micros() >= 100 {
+            std::thread::yield_now();
+        }
+    }
+}
+
+fn wait_sdma_sequence_headroom(g: &QueueInner, published: u64) -> Result<()> {
+    let start = std::time::Instant::now();
+    loop {
+        let read = unsafe { std::ptr::read_volatile(g.read_ptr_host.as_ptr()) };
+        if g.write_idx + published - read <= g.ring_size as u64 {
+            return Ok(());
+        }
+        if start.elapsed().as_millis() >= COPY_TIMEOUT_MS as u128 {
+            return Err(Error::TimelineTimeout {
+                what: "SDMA linked transaction headroom",
+                target: g.write_idx + published - g.ring_size as u64,
+                current: read,
+                waited_ms: COPY_TIMEOUT_MS,
+            });
+        }
+        std::hint::spin_loop();
+        if start.elapsed().as_micros() >= 100 {
+            std::thread::yield_now();
+        }
+    }
 }
 
 impl std::fmt::Debug for AmdComputeQueue {
@@ -1199,8 +2168,9 @@ fn create_queue(
     // Ring + GART are both VRAM with COHERENT | UNCACHED | PUBLIC flags
     // (uncached + cpu-accessible). Using plain VRAM (no UNCACHED) makes
     // KFD reject the create_queue ioctl with EINVAL.
-    let ring_buf = allocator.alloc_uncached(ring_size)?;
-    let (ring_gpu, ring_host) = match &ring_buf {
+    let ring_buf =
+        AmdBufferGuard::new(allocator.alloc_uncached_tagged(ring_size, crate::amd::va_registry::AllocTag::QueueRing)?);
+    let (ring_gpu, ring_host) = match ring_buf.buffer() {
         crate::allocator::RawBuffer::AmdDevice { gpu_addr, host_ptr: Some(h), .. } => (*gpu_addr, *h),
         _ => return Err(Error::NotHostVisible { what: "queue ring" }),
     };
@@ -1222,20 +2192,22 @@ fn create_queue(
     // rptr/wptr live at fixed offsets inside it; KFD reads the descriptor
     // when wiring up the queue. The GART page is a 0x100-byte uncached,
     // cpu-accessible allocation.
-    let gart_buf = allocator.alloc_uncached(0x100)?;
-    let (gart_gpu, gart_host) = match &gart_buf {
+    let gart_buf =
+        AmdBufferGuard::new(allocator.alloc_uncached_tagged(0x100, crate::amd::va_registry::AllocTag::QueueGart)?);
+    let (gart_gpu, gart_host) = match gart_buf.buffer() {
         crate::allocator::RawBuffer::AmdDevice { gpu_addr, host_ptr: Some(h), .. } => (*gpu_addr, *h),
         _ => return Err(Error::NotHostVisible { what: "GART page" }),
     };
 
-    let mut qinactive_buf: Option<crate::allocator::RawBuffer> = None;
+    let mut qinactive_buf: Option<AmdBufferGuard> = None;
     let mut qinactive_host: Option<NonNull<u8>> = None;
     if aql {
         // A host-visible amd_signal_t the CP trap handler writes its exception
         // code into (e.g. 0x401 insufficient-scratch) when it halts the queue.
         // Without a real handle the CP can't report WHY it halted (silent wedge).
-        let qi_buf = allocator.alloc_uncached(64)?;
-        let (qi_gpu, qi_host) = match &qi_buf {
+        let qi_buf =
+            AmdBufferGuard::new(allocator.alloc_uncached_tagged(64, crate::amd::va_registry::AllocTag::QueueInactive)?);
+        let (qi_gpu, qi_host) = match qi_buf.buffer() {
             crate::allocator::RawBuffer::AmdDevice { gpu_addr, host_ptr: Some(h), .. } => (*gpu_addr, *h),
             _ => return Err(Error::NotHostVisible { what: "queue_inactive_signal" }),
         };
@@ -1304,7 +2276,7 @@ fn create_queue(
         let ctx_save_restore_size = wg_data_size + ctl_stack_size;
         let cwsr_buffer_size = ((ctx_save_restore_size + debug_memory_size) * xccs).next_multiple_of(0x1000);
         let plain = BufferSpec { cpu_access: false, nolru: true, ..Default::default() };
-        let eop_buf = allocator.alloc(0x1000, &plain, /*zero=*/ false)?;
+        let eop_buf = AmdBufferGuard::new(allocator.alloc(0x1000, &plain, /*zero=*/ false)?);
         // ctx-save MUST be host-visible and zeroed: we write the per-XCC CWSR
         // header (`HsaUserContextSaveAreaHeader`) the CP reads on every context
         // save/restore (MES preempts a busy queue as routine runlist scheduling).
@@ -1312,12 +2284,12 @@ fn create_queue(
         // and the queue silently strands (rptr frozen, no fault) — the exact
         // multi-XCC wedge. Mirrors libhsakmt `fill_cwsr_header`.
         let ctx_spec = BufferSpec { cpu_access: true, nolru: true, ..Default::default() };
-        let ctx_buf = allocator.alloc(cwsr_buffer_size, &ctx_spec, /*zero=*/ true)?;
-        let eop_gpu = match &eop_buf {
+        let ctx_buf = AmdBufferGuard::new(allocator.alloc(cwsr_buffer_size, &ctx_spec, /*zero=*/ true)?);
+        let eop_gpu = match eop_buf.buffer() {
             crate::allocator::RawBuffer::AmdDevice { gpu_addr, .. } => *gpu_addr,
             _ => 0,
         };
-        let (ctx_gpu, ctx_host) = match &ctx_buf {
+        let (ctx_gpu, ctx_host) = match ctx_buf.buffer() {
             crate::allocator::RawBuffer::AmdDevice { gpu_addr, host_ptr: Some(h), .. } => (*gpu_addr, *h),
             _ => return Err(Error::NotHostVisible { what: "ctx-save buffer" }),
         };
@@ -1355,7 +2327,14 @@ fn create_queue(
         gpu_id: dev.node.gpu_id,
         queue_type,
     };
-    let qh = dev.iface().setup_ring(&desc)?;
+    let qh = match dev.iface().setup_ring(&desc) {
+        Ok(handle) => handle,
+        Err(error @ Error::AmdQueueStillActive { .. }) => {
+            dev.poison(&error.to_string());
+            return Err(error);
+        }
+        Err(error) => return Err(error),
+    };
     let queue_id = qh.queue_id;
     let doorbell = qh.doorbell;
     let doorbell_base = qh.doorbell_base;
@@ -1364,6 +2343,7 @@ fn create_queue(
     // write_dispatch_id field lives at a fixed offset inside the AmdQueueT
     // descriptor we wrote into the page.
     let write_ptr_host = unsafe { NonNull::new_unchecked(gart_host.as_ptr().add(wptr_offset as usize) as *mut u64) };
+    let read_ptr_host = unsafe { NonNull::new_unchecked(gart_host.as_ptr().add(rptr_offset as usize) as *mut u64) };
 
     Ok(QueueInner {
         ring_host,
@@ -1371,15 +2351,16 @@ fn create_queue(
         doorbell,
         doorbell_base,
         write_ptr_host,
+        read_ptr_host,
         gart_host,
         write_idx: 0,
         queue_id,
         qinactive_host,
-        _ring_buf: ring_buf,
-        _gart_buf: gart_buf,
-        _eop_buf: eop_buf,
-        _ctx_buf: ctx_buf,
-        _qinactive_buf: qinactive_buf,
+        _ring_buf: ring_buf.into_inner(),
+        _gart_buf: gart_buf.into_inner(),
+        _eop_buf: eop_buf.map(AmdBufferGuard::into_inner),
+        _ctx_buf: ctx_buf.map(AmdBufferGuard::into_inner),
+        _qinactive_buf: qinactive_buf.map(AmdBufferGuard::into_inner),
     })
 }
 

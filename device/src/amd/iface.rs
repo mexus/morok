@@ -59,12 +59,20 @@ pub trait AmdIface: Send + Sync + std::fmt::Debug {
     /// return its queue id + mmapped doorbell.
     fn setup_ring(&self, desc: &RingDesc) -> Result<QueueHandle>;
     /// Destroy the in-kernel queue object and `munmap` the queue's doorbell
-    /// page (`doorbell_base` is the mmap base from [`QueueHandle`]). Best-effort.
-    fn teardown_ring(&self, queue_id: u32, doorbell_base: NonNull<u8>);
+    /// page (`doorbell_base` is the mmap base from [`QueueHandle`]).
+    fn teardown_ring(&self, queue_id: u32, doorbell_base: NonNull<u8>) -> Result<QueueTeardown>;
     /// Block up to `timeout_ms` on the device's completion + fault events.
     /// `Ok(Some(Error::Runtime{..}))` on a fault, `Ok(None)` on a normal
     /// wake-up/timeout, `Err` if the WAIT_EVENTS ioctl itself failed.
     fn wait_events(&self, timeout_ms: u32) -> Result<Option<Error>>;
+}
+
+/// Result after KFD has definitively stopped a queue. A leaked doorbell mapping
+/// is a host-resource leak, but no longer requires GPU backing quarantine.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QueueTeardown {
+    Complete,
+    DoorbellLeaked { errno: i32 },
 }
 
 /// Allocation flavor — selects the KFD flag set built in [`AmdIface::alloc_raw`].
@@ -411,26 +419,40 @@ impl AmdIface for KfdIface {
             return Err(Error::AmdIoctl { ioctl: "AMDKFD_IOC_CREATE_QUEUE", errno: e as i32 });
         }
 
-        let (doorbell_base, doorbell) = self.doorbell_mmap(args.doorbell_offset)?;
+        let (doorbell_base, doorbell) = match self.doorbell_mmap(args.doorbell_offset) {
+            Ok(mapping) => mapping,
+            Err(error) => {
+                let mut destroy = kfd::kfd_ioctl_destroy_queue_args { queue_id: args.queue_id, ..Default::default() };
+                // SAFETY: queue creation above succeeded and returned this id.
+                if let Err(errno) = unsafe { ioctl::kfd_destroy_queue(self.kfd_fd.as_raw_fd(), &mut destroy as *mut _) }
+                {
+                    return Err(Error::AmdQueueStillActive {
+                        queue_id: args.queue_id,
+                        cause: format!("doorbell mapping failed ({error}); rollback destroy errno {errno}"),
+                    });
+                }
+                return Err(error);
+            }
+        };
         debug!(queue_id = args.queue_id, doorbell_offset = args.doorbell_offset, "AMD queue created");
         Ok(QueueHandle { queue_id: args.queue_id, doorbell_base, doorbell })
     }
 
-    fn teardown_ring(&self, queue_id: u32, doorbell_base: NonNull<u8>) {
+    fn teardown_ring(&self, queue_id: u32, doorbell_base: NonNull<u8>) -> Result<QueueTeardown> {
         let mut args = kfd::kfd_ioctl_destroy_queue_args { queue_id, ..Default::default() };
         // SAFETY: `kfd_fd` is alive (held via Arc<OwnedFd>); the queue_id was
         // returned by KFD on the matching create_queue call.
-        let rc = unsafe { ioctl::kfd_destroy_queue(self.kfd_fd.as_raw_fd(), &mut args as *mut _) };
-        if let Err(e) = rc {
-            tracing::warn!(?e, queue_id, "teardown_ring: kfd_destroy_queue failed");
-        }
+        unsafe { ioctl::kfd_destroy_queue(self.kfd_fd.as_raw_fd(), &mut args as *mut _) }
+            .map_err(|errno| Error::AmdIoctl { ioctl: "AMDKFD_IOC_DESTROY_QUEUE", errno: errno as i32 })?;
         // Release the per-queue doorbell MMIO page mapped in `doorbell_mmap`.
         // SAFETY: `doorbell_base` is the mmap base returned for this queue and
         // is no longer referenced once the queue is destroyed.
         if unsafe { munmap(doorbell_base.as_ptr().cast(), DOORBELL_PAGE_BYTES) } != 0 {
             let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
-            tracing::warn!(queue_id, errno, "teardown_ring: doorbell munmap failed");
+            tracing::warn!(queue_id, errno, "teardown_ring: destroyed queue but leaked doorbell mapping");
+            return Ok(QueueTeardown::DoorbellLeaked { errno });
         }
+        Ok(QueueTeardown::Complete)
     }
 
     fn wait_events(&self, timeout_ms: u32) -> Result<Option<Error>> {

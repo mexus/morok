@@ -34,6 +34,12 @@ pub enum AllocTag {
     Vram,
     /// GTT-pinned host-visible control memory (queue ring, GART, signal slots).
     Gtt,
+    SignalPool,
+    QueueRing,
+    QueueGart,
+    QueueInactive,
+    Staging,
+    Kernarg,
     /// Register-spill scratch — GPU-only VRAM, realloc'd per kernel as private
     /// segment sizes grow.
     Scratch,
@@ -44,6 +50,12 @@ impl AllocTag {
         match self {
             AllocTag::Vram => "VRAM buffer",
             AllocTag::Gtt => "GTT control",
+            AllocTag::SignalPool => "GTT signal pool",
+            AllocTag::QueueRing => "GTT queue ring",
+            AllocTag::QueueGart => "GTT queue GART",
+            AllocTag::QueueInactive => "GTT queue-inactive signal",
+            AllocTag::Staging => "GTT SDMA staging",
+            AllocTag::Kernarg => "kernarg",
             AllocTag::Scratch => "scratch",
         }
     }

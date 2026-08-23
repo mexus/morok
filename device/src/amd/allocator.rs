@@ -16,13 +16,14 @@ use std::sync::Arc;
 use svod_dtype::DeviceSpec;
 use tracing::debug;
 
-use crate::allocator::{Allocator, BufferSpec, RawBuffer};
+use crate::allocator::{Allocator, AmdBufferGuard, BufferSpec, RawBuffer};
 use crate::amd::device::AmdDevice;
 use crate::amd::iface::AllocKind;
 use crate::amd::va_registry::AllocTag;
 use crate::error::{Result, UnsupportedSnafu};
 
 /// VRAM-/GTT-backed buffer allocator routed through KFD ioctls.
+#[derive(Clone)]
 pub struct AmdAllocator {
     pub dev: Arc<AmdDevice>,
     pub device_id: usize,
@@ -56,6 +57,28 @@ impl AmdAllocator {
     pub fn alloc_uncached(&self, size: usize) -> Result<RawBuffer> {
         do_alloc(&self.dev, size, AllocKind::UncachedGtt, /*cpu_accessible=*/ true, /*zero_init=*/ true)
     }
+
+    pub(crate) fn alloc_uncached_tagged(&self, size: usize, tag: AllocTag) -> Result<RawBuffer> {
+        do_alloc_tagged(
+            &self.dev,
+            size,
+            AllocKind::UncachedGtt,
+            tag,
+            /*cpu_accessible=*/ true,
+            /*zero_init=*/ true,
+        )
+    }
+
+    pub(crate) fn alloc_host_visible_tagged(&self, size: usize, tag: AllocTag) -> Result<RawBuffer> {
+        do_alloc_tagged(
+            &self.dev,
+            size,
+            AllocKind::DeviceVram { executable: true },
+            tag,
+            /*cpu_accessible=*/ true,
+            /*zero_init=*/ true,
+        )
+    }
 }
 
 impl std::fmt::Debug for AmdAllocator {
@@ -79,11 +102,17 @@ impl Allocator for AmdAllocator {
         // device-only buffer pass `zero=false` and SDMA-zero it ourselves below,
         // keeping `zero=true` honored regardless of host visibility.
         let seam_zero = zero && cpu_access;
-        let buf = do_alloc(&self.dev, size, AllocKind::DeviceVram { executable: true }, cpu_access, seam_zero)?;
-        if zero && let RawBuffer::AmdDevice { host_ptr: None, gpu_addr, size: bsize, .. } = &buf {
+        let buf = AmdBufferGuard::new(do_alloc(
+            &self.dev,
+            size,
+            AllocKind::DeviceVram { executable: true },
+            cpu_access,
+            seam_zero,
+        )?);
+        if zero && let RawBuffer::AmdDevice { host_ptr: None, gpu_addr, size: bsize, .. } = buf.buffer() {
             self.copy_queue()?.device_zero(*gpu_addr, *bsize)?;
         }
-        Ok(buf)
+        Ok(buf.into_inner())
     }
 
     fn _copyin(&self, dest: &RawBuffer, dest_off: usize, src: &[u8]) -> Result<()> {
@@ -187,11 +216,10 @@ impl Allocator for AmdAllocator {
         //    EVERY connector registered on this core — this is the per-VM
         //    fence: all queues share one page table, so unmapping `gpu_addr`
         //    while ANY queue's CP still references it faults the whole VM.
-        //    Draining all timelines guarantees every in-flight reader (on any
-        //    connector) has retired before the unmap. Logged-and-ignore
-        //    on failure: free is called from `Drop`, so we can't propagate.
-        if let Err(e) = device.synchronize() {
-            tracing::warn!(?e, gpu_addr, "AmdAllocator::free: device synchronize failed; freeing anyway");
+        //    Drop cannot propagate a failed drain; quarantine the mapping instead.
+        if let Err(error) = device.synchronize() {
+            tracing::warn!(?error, gpu_addr, size, "AmdAllocator::free: drain failed; allocation quarantined");
+            return;
         }
         // The unmap + munmap + free (host or PROT_NONE reservation share the
         // same VA region) is the backend's job.
@@ -243,6 +271,17 @@ fn do_alloc(
         AllocKind::DeviceVram { .. } => AllocTag::Vram,
         AllocKind::UncachedGtt => AllocTag::Gtt,
     };
+    do_alloc_tagged(dev, size, kind, tag, cpu_accessible, zero_init)
+}
+
+fn do_alloc_tagged(
+    dev: &Arc<AmdDevice>,
+    size: usize,
+    kind: AllocKind,
+    tag: AllocTag,
+    cpu_accessible: bool,
+    zero_init: bool,
+) -> Result<RawBuffer> {
     let r = dev.core().iface().alloc_raw(size, kind, tag, cpu_accessible, zero_init)?;
     Ok(RawBuffer::AmdDevice {
         gpu_addr: r.gpu_va,

@@ -1,30 +1,25 @@
-//! `PoolQueue`: a SHARED dispatch queue + lightweight per-owner contexts.
+//! Exclusive AMD compute lanes and logical execution contexts.
 //!
 //! A `PoolQueue` bundles the dispatch state that backs a single KFD compute
 //! queue: the queue itself (ring + doorbell), a kernarg bump arena, the scratch
-//! backing, the PM4 monotonic completion counter, and the pool-level in-flight
-//! AQL signal list. It is a SHARED resource — multiple owners hold an
-//! `Arc<PoolQueue>` and co-tenant the same ring. Dispatch atomicity comes from
-//! `dispatch_lock`: an owner holds it
-//! across a whole op (kernarg bump + write + ring submission) so kernarg order
-//! ≡ ring order on a shared queue. Cross-queue parallelism comes from the pool
-//! holding several `PoolQueue`s — the GPU's MES interleaves their independent
-//! rings on the CP pipes.
+//! backing, the compute timeline counter, and linked-plan finalizers. A queue is
+//! published through only while a non-clone [`QueueLease`] owns its lane bit.
+//! Uncontended acquisition is one atomic compare-exchange; bounded contention
+//! parks instead of co-tenanting a mutable hardware ring.
 //!
-//! [`OwnerCtx`] is the lightweight per-owner handle. It holds an
-//! `Arc<PoolQueue>` plus the owner's own completion bookkeeping (its last AQL
-//! signal / its last PM4 counter value), so `OwnerCtx::synchronize` can drain
-//! only this owner's work — the owner-local fast path. The whole-pool drain
+//! [`OwnerCtx`] is logical per-plan state. It owns completion bookkeeping,
+//! profiling configuration, and replay templates, but not a queue. The whole-
+//! pool drain
 //! (`PoolQueue::drain_all`, reached via `AmdDeviceCore::synchronize_all`) is the
 //! host-visibility/free fence used by `AmdAllocator::_copyin`/`_copyout`/`_free`.
 
 #![cfg(unix)]
 
 use std::collections::VecDeque;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 
 use crate::amd::AmdAllocator;
 use crate::amd::device::{AmdDeviceCore, ScratchState, alloc_scratch};
@@ -32,52 +27,288 @@ use crate::amd::kernarg::KernargArena;
 use crate::amd::queue::AmdComputeQueue;
 use crate::amd::signal::{AmdSignal, TIMELINE_WRAP_WATERMARK, Timeline};
 use crate::error::{Error, Result};
+use crate::sync::TimelineSignal;
 
-/// A SHARED dispatch queue. Multiple owners hold `Arc<PoolQueue>` and co-tenant
-/// the same KFD compute queue; the pool holds a bounded number of these so
-/// distinct owners can run on distinct queues (cross-queue parallelism) without
-/// exhausting KFD queues.
+/// One hardware compute lane, retained by [`QueuePool`] and published through
+/// only by its current [`QueueLease`].
 ///
 /// Owns: KFD compute queue, kernarg arena, scratch backing, PM4 completion
-/// counter, pool-level in-flight AQL signals. `dispatch_lock` serializes a
-/// whole op (bump + write + submit) so a shared ring's kernarg order matches
-/// its ring order.
+/// counter, and lane-level linked-plan finalizers.
 #[derive(Debug)]
-pub struct PoolQueue {
+pub(crate) struct PoolQueue {
     /// Shared immutable identity. Cloned across all queues backed by the same
     /// physical AMD:N (and across `AmdDevice` for back-compat).
     core: Arc<AmdDeviceCore>,
-    /// The KFD compute queue — own ring + doorbell + GART. Its `inner` is a
-    /// `parking_lot::Mutex<QueueInner>`, so a shared `Arc<PoolQueue>` can be
-    /// dispatched by several co-tenant owners safely; the brief critical
-    /// section is the packet write + doorbell. Distinct `PoolQueue`s' queues
-    /// are interleaved by the GPU's MES, not a CPU lock.
+    /// The KFD compute queue: ring, doorbell, and GART. Its backend-local mutex
+    /// is uncontended because publication requires the lane's unique lease.
     queue: Box<AmdComputeQueue>,
     /// Kernel-argument bump arena (16 MiB GTT). One per `PoolQueue`. The
-    /// `dispatch_lock` held across bump + write + dispatch makes the bump cursor
+    /// Exclusive lane publication makes the bump cursor
     /// order match the ring submission order, so a wrapped slot is provably free
     /// once the whole pool drains. Freed on the queue's drop via
     /// `Drop for KernargArena`, after `Drop for PoolQueue` has drained.
     arena: Box<KernargArena>,
     /// Scratch backing. Grown on demand by [`ensure_has_local_memory`](Self::ensure_has_local_memory)
-    /// under the `dispatch_lock` (park-and-grow on a live multi-XCC queue).
+    /// while the lane's exclusive lease is held.
     scratch_state: Mutex<ScratchState>,
     /// PM4 monotonic completion counter + its signal. Used by the PM4 single-XCC
     /// dispatch path and the SDMA-style monotonic drain. (The SDMA copy queue
-    /// has its own separate `Timeline`; this one is untouched by SDMA.) The AQL
-    /// `execute_on` path uses `inflight` instead.
+    /// has its own separate `Timeline`; this one is untouched by SDMA.) AQL
+    /// carries this timeline's waits and stores through vendor IB packets.
     pm4_counter: Arc<Timeline>,
-    /// Serializes a whole op (kernarg bump + write + ring submission) on this
-    /// shared queue, and the scratch park-and-grow. Lock order is always
-    /// `dispatch_lock` → queue inner `Mutex`, never the reverse.
-    dispatch_lock: Mutex<()>,
-    /// Pool-level in-flight native AQL completion signals (FIFO) — ALL owners'
-    /// in-flight work on this queue. Each AQL dispatch arms a pool signal to 1;
-    /// the packet processor decrements it to 0 on completion. Retired front
-    /// slots are reclaimed on the next [`acquire_signal`](Self::acquire_signal)
-    /// or drained by [`drain_all`](Self::drain_all). `synchronize_all` drains it
-    /// via the core's `Weak<PoolQueue>` registry without touching the queue.
-    inflight: Mutex<VecDeque<Arc<AmdSignal>>>,
+    /// Pool-level in-flight linked-plan finalizers (FIFO) for all owners.
+    /// `synchronize_all` drains them via the core's `Weak<PoolQueue>` registry
+    /// without touching the queue.
+    inflight: Mutex<VecDeque<Arc<SubmissionFinalizer>>>,
+}
+
+/// Atomic lane claims, split from queue construction so exclusivity can be
+/// tested without AMD hardware.
+#[derive(Debug)]
+struct LaneClaims {
+    claimed: AtomicU64,
+    capacity: usize,
+}
+
+impl LaneClaims {
+    fn new(capacity: usize) -> Self {
+        Self { claimed: AtomicU64::new(0), capacity: capacity.clamp(1, u64::BITS as usize) }
+    }
+
+    fn try_claim(&self, initialized: usize) -> Option<usize> {
+        let count = initialized.min(self.capacity);
+        let valid = if count == u64::BITS as usize { u64::MAX } else { (1u64 << count).wrapping_sub(1) };
+        let mut observed = self.claimed.load(Ordering::Acquire);
+        loop {
+            let available = valid & !observed;
+            if available == 0 {
+                return None;
+            }
+            let slot = available.trailing_zeros() as usize;
+            match self.claimed.compare_exchange_weak(
+                observed,
+                observed | (1u64 << slot),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Some(slot),
+                Err(actual) => observed = actual,
+            }
+        }
+    }
+
+    fn claim_new(&self, slot: usize) {
+        let previous = self.claimed.fetch_or(1u64 << slot, Ordering::AcqRel);
+        debug_assert_eq!(previous & (1u64 << slot), 0);
+    }
+
+    fn release(&self, slot: usize) {
+        let previous = self.claimed.fetch_and(!(1u64 << slot), Ordering::Release);
+        debug_assert_ne!(previous & (1u64 << slot), 0);
+    }
+}
+
+/// Bounded lazy pool of compute lanes. Queue creation is serialized and cold;
+/// acquisition of an initialized idle lane is lock-free.
+#[derive(Debug)]
+pub(crate) struct QueuePool {
+    queues: Box<[OnceLock<Arc<PoolQueue>>]>,
+    initialized: AtomicUsize,
+    claims: LaneClaims,
+    create_lock: Mutex<()>,
+    wait_lock: Mutex<()>,
+    available: Condvar,
+}
+
+impl QueuePool {
+    pub(crate) fn new(capacity: usize) -> Self {
+        let capacity = capacity.clamp(1, u64::BITS as usize);
+        Self {
+            queues: (0..capacity).map(|_| OnceLock::new()).collect(),
+            initialized: AtomicUsize::new(0),
+            claims: LaneClaims::new(capacity),
+            create_lock: Mutex::new(()),
+            wait_lock: Mutex::new(()),
+            available: Condvar::new(),
+        }
+    }
+
+    pub(crate) fn acquire(&self, core: &Arc<AmdDeviceCore>, allocator: &AmdAllocator) -> Result<QueueLease> {
+        loop {
+            if let Some(error) = core.poison_error() {
+                return Err(error);
+            }
+            let initialized = self.initialized.load(Ordering::Acquire);
+            if let Some(slot) = self.claims.try_claim(initialized) {
+                let queue = Arc::clone(self.queues[slot].get().expect("initialized lane missing queue"));
+                return Ok(QueueLease { core: Arc::clone(core), slot, queue: Some(queue) });
+            }
+
+            {
+                let _create = self.create_lock.lock();
+                let initialized = self.initialized.load(Ordering::Acquire);
+                if let Some(slot) = self.claims.try_claim(initialized) {
+                    let queue = Arc::clone(self.queues[slot].get().expect("initialized lane missing queue"));
+                    return Ok(QueueLease { core: Arc::clone(core), slot, queue: Some(queue) });
+                }
+                if initialized < self.claims.capacity {
+                    let queue = PoolQueue::new_with_resources(Arc::clone(core), allocator)?;
+                    self.claims.claim_new(initialized);
+                    self.queues[initialized].set(Arc::clone(&queue)).expect("queue lane initialized twice");
+                    self.initialized.store(initialized + 1, Ordering::Release);
+                    return Ok(QueueLease { core: Arc::clone(core), slot: initialized, queue: Some(queue) });
+                }
+            }
+
+            // Pair the retry with release's wait mutex to avoid a lost wakeup.
+            let mut wait = self.wait_lock.lock();
+            if let Some(error) = core.poison_error() {
+                return Err(error);
+            }
+            let initialized = self.initialized.load(Ordering::Acquire);
+            if let Some(slot) = self.claims.try_claim(initialized) {
+                let queue = Arc::clone(self.queues[slot].get().expect("initialized lane missing queue"));
+                return Ok(QueueLease { core: Arc::clone(core), slot, queue: Some(queue) });
+            }
+            self.available.wait(&mut wait);
+        }
+    }
+
+    fn release(&self, slot: usize) {
+        let _wait = self.wait_lock.lock();
+        self.claims.release(slot);
+        self.available.notify_one();
+    }
+
+    pub(crate) fn notify_poisoned(&self) {
+        let _wait = self.wait_lock.lock();
+        self.available.notify_all();
+    }
+}
+
+/// Exclusive publication authority for one hardware compute lane.
+pub(crate) struct QueueLease {
+    core: Arc<AmdDeviceCore>,
+    slot: usize,
+    queue: Option<Arc<PoolQueue>>,
+}
+
+impl QueueLease {
+    #[inline]
+    pub fn pool(&self) -> &PoolQueue {
+        self.queue.as_deref().expect("queue lease already released")
+    }
+
+    #[cfg(test)]
+    pub fn queue_ptr(&self) -> *const PoolQueue {
+        Arc::as_ptr(self.queue.as_ref().expect("queue lease already released"))
+    }
+}
+
+impl std::ops::Deref for QueueLease {
+    type Target = PoolQueue;
+
+    fn deref(&self) -> &Self::Target {
+        self.pool()
+    }
+}
+
+impl std::fmt::Debug for QueueLease {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("QueueLease").field("slot", &self.slot).finish_non_exhaustive()
+    }
+}
+
+impl Drop for QueueLease {
+    fn drop(&mut self) {
+        if self.queue.take().is_some() {
+            self.core.queue_pool().release(self.slot);
+        }
+    }
+}
+
+/// Completion resources attached by the AMD queue finalizer to one HCQ
+/// submission. This is the only object retained by owner and queue lifecycle
+/// code; native AQL decrement semantics and PM4 memory-timeline semantics stay
+/// private to the backend.
+#[derive(Debug)]
+pub(crate) struct SubmissionFinalizer {
+    signal: Arc<AmdSignal>,
+    value: u64,
+    _timestamps: Option<Arc<AmdSignal>>,
+    publication: Mutex<PublicationState>,
+    publication_changed: Condvar,
+    code: Mutex<Vec<Arc<crate::amd::program::CodeObject>>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PublicationState {
+    Prepared,
+    Published,
+    Failed,
+}
+
+impl SubmissionFinalizer {
+    pub(crate) fn timeline(signal: Arc<AmdSignal>, value: u64, timestamps: Option<Arc<AmdSignal>>) -> Arc<Self> {
+        Arc::new(Self {
+            signal,
+            value,
+            _timestamps: timestamps,
+            publication: Mutex::new(PublicationState::Published),
+            publication_changed: Condvar::new(),
+            code: Mutex::new(Vec::new()),
+        })
+    }
+
+    pub(crate) fn prepared_timeline(signal: Arc<AmdSignal>, value: u64) -> Arc<Self> {
+        Arc::new(Self {
+            signal,
+            value,
+            _timestamps: None,
+            publication: Mutex::new(PublicationState::Prepared),
+            publication_changed: Condvar::new(),
+            code: Mutex::new(Vec::new()),
+        })
+    }
+
+    pub(crate) fn mark_published(&self) {
+        *self.publication.lock() = PublicationState::Published;
+        self.publication_changed.notify_all();
+    }
+
+    pub(crate) fn mark_failed(&self) {
+        *self.publication.lock() = PublicationState::Failed;
+        self.publication_changed.notify_all();
+    }
+
+    pub(crate) fn retain_code(&self, code: Arc<crate::amd::program::CodeObject>) {
+        self.code.lock().push(code);
+    }
+
+    pub fn wait(&self, timeout_ms: u64) -> Result<()> {
+        let mut publication = self.publication.lock();
+        while *publication == PublicationState::Prepared {
+            self.publication_changed.wait(&mut publication);
+        }
+        match *publication {
+            PublicationState::Published => {
+                drop(publication);
+                self.signal.wait_signal_value(self.value, timeout_ms)
+            }
+            PublicationState::Failed => Err(Error::Runtime {
+                message: "AMD submission failed before its terminal timeline point was published".into(),
+            }),
+            PublicationState::Prepared => unreachable!(),
+        }
+    }
+
+    fn retired(&self) -> bool {
+        match *self.publication.lock() {
+            PublicationState::Published => self.signal.value() >= self.value,
+            PublicationState::Failed => true,
+            PublicationState::Prepared => false,
+        }
+    }
 }
 
 impl PoolQueue {
@@ -122,7 +353,6 @@ impl PoolQueue {
                 size: scratch_size,
             }),
             pm4_counter,
-            dispatch_lock: Mutex::new(()),
             inflight: Mutex::new(VecDeque::new()),
         });
         // Register in the core so `synchronize_all` can drain this queue's
@@ -157,15 +387,6 @@ impl PoolQueue {
         &self.core
     }
 
-    /// Acquire the dispatch lock. An owner holds this across a whole op (kernarg
-    /// bump + write + ring submission) so kernarg order ≡ ring order on the
-    /// shared queue, and the scratch park-and-grow holds it to fence co-tenant
-    /// dispatches during the swap. Lock order: `dispatch_lock` → queue inner.
-    #[inline]
-    pub fn dispatch_guard(&self) -> parking_lot::MutexGuard<'_, ()> {
-        self.dispatch_lock.lock()
-    }
-
     /// PM4 completion-counter signal (forwards to the shared `Timeline`).
     pub fn pm4_signal(&self) -> &Arc<AmdSignal> {
         self.pm4_counter.signal()
@@ -196,100 +417,44 @@ impl PoolQueue {
 
     /// Drain ALL submitted GPU work on this queue (every owner's). Blocks until
     /// the PM4 counter observes `pm4_value() - 1`, then waits every in-flight
-    /// AQL signal. Reads only signal slots — never takes `dispatch_lock` — so
-    /// holding `dispatch_lock` across a caller that also calls `drain_all`
-    /// (e.g. `ensure_has_local_memory`) is deadlock-free.
+    /// linked-plan timeline. Reads only signal slots and does not interfere with
+    /// lane acquisition.
     pub fn drain_all(&self) -> Result<()> {
         if let Some(err) = self.core.poison_error() {
             return Err(err);
         }
         // Drain the monotonic PM4 counter (PM4 / SDMA-style work)...
         self.pm4_counter.drain(30_000).inspect_err(|e| self.core.poison(&e.to_string()))?;
-        // ...then every in-flight native completion signal (AQL per-op work).
+        // ...then every in-flight linked-plan timeline.
         // Snapshot under the lock, wait outside it, then drop the retired ones —
         // `retain` keeps any signal a concurrent dispatch armed after the
         // snapshot, so we never lose track of still-pending work.
-        let snapshot: Vec<Arc<AmdSignal>> = self.inflight.lock().iter().cloned().collect();
-        for sig in &snapshot {
-            sig.wait_done(30_000).inspect_err(|e| self.core.poison(&e.to_string()))?;
+        let snapshot: Vec<Arc<SubmissionFinalizer>> = self.inflight.lock().iter().cloned().collect();
+        for finalizer in &snapshot {
+            finalizer.wait(30_000).inspect_err(|e| self.core.poison(&e.to_string()))?;
         }
-        self.inflight.lock().retain(|s| !s.is_done());
+        self.inflight.lock().retain(|finalizer| !finalizer.retired());
         Ok(())
     }
 
-    /// Acquire a fresh native completion signal for one AQL dispatch. First
-    /// reclaims retired in-flight signals (FIFO — they return their pool slots
-    /// on drop), then takes a new slot. If the pool is momentarily exhausted,
-    /// blocks on the OLDEST in-flight dispatch (the queue head — pool-level, so
-    /// this is whichever owner's dispatch is oldest): the back-pressure that
-    /// bounds how far the host can run ahead of the GPU. The returned signal is
-    /// armed to 1; the caller places [`signal_handle`](AmdSignal::signal_handle)
-    /// in the dispatch packet and registers it via [`register_inflight`](Self::register_inflight).
-    pub fn acquire_signal(&self) -> Result<Arc<AmdSignal>> {
-        let pool = self
-            .core
-            .signal_pool()
-            .cloned()
-            .ok_or_else(|| Error::Runtime { message: "acquire_signal: signal pool not installed".into() })?;
-        loop {
-            // Reclaim any retired signals from the front (FIFO completion order).
-            {
-                let mut inflight = self.inflight.lock();
-                while inflight.front().is_some_and(|s| s.is_done()) {
-                    inflight.pop_front();
-                }
-            }
-            match pool.acquire() {
-                Ok(sig) => {
-                    sig.arm(1);
-                    return Ok(Arc::new(sig));
-                }
-                // Pool exhausted: block on the oldest in-flight dispatch (queue
-                // head), drop it, and retry. If nothing is in flight there is no
-                // slot to wait for, so surface the exhaustion error.
-                Err(e) => {
-                    let oldest = self.inflight.lock().front().cloned();
-                    match oldest {
-                        Some(sig) => {
-                            sig.wait_done(30_000).inspect_err(|e| self.core.poison(&e.to_string()))?;
-                            self.inflight.lock().pop_front();
-                        }
-                        None => return Err(e),
-                    }
-                }
-            }
-        }
-    }
-
-    /// Reserve a raw signal slot held for a graph's lifetime — armed to 1 but
-    /// NOT registered in `inflight`. Unlike [`acquire_signal`](Self::acquire_signal),
-    /// these are not FIFO in-flight completion signals: a DAG graph holds one per
-    /// kernel for its whole lifetime and re-arms them each replay, so they must
-    /// not be reclaimed by the in-flight FIFO. Returns `Err` when the pool is
-    /// exhausted (the caller falls back to blanket-BARRIER capture).
-    pub fn reserve_signal(&self) -> Result<Arc<AmdSignal>> {
-        let pool = self
-            .core
-            .signal_pool()
-            .cloned()
-            .ok_or_else(|| Error::Runtime { message: "reserve_signal: signal pool not installed".into() })?;
+    /// Allocate a profiling/timestamp slot. Its returned handle owns the slot;
+    /// replay and runtime finalizers retain it until timestamp collection.
+    pub fn acquire_timestamp_signal(&self) -> Result<Arc<AmdSignal>> {
+        let pool =
+            self.core.signal_pool().cloned().ok_or_else(|| Error::Runtime {
+                message: "acquire_timestamp_signal: signal pool not installed".into(),
+            })?;
         let sig = pool.acquire()?;
-        sig.arm(1);
         Ok(Arc::new(sig))
     }
 
-    /// Register a dispatched AQL completion signal as in-flight (FIFO,
+    /// Register an AQL submission finalizer as in-flight (FIFO,
     /// pool-level). Kept alive until it retires and a later acquire/drain
     /// reclaims it.
-    pub fn register_inflight(&self, sig: Arc<AmdSignal>) {
-        self.inflight.lock().push_back(sig);
-    }
-
-    /// Free slots in the shared signal pool (0 if not installed). Graph capture
-    /// checks this before reserving one slot per kernel so a large graph can't
-    /// drain the pool below the headroom per-op dispatch + PM4 counters need.
-    pub fn signal_free(&self) -> usize {
-        self.core.signal_pool().map(|p| p.free()).unwrap_or(0)
+    pub fn register_inflight(&self, finalizer: Arc<SubmissionFinalizer>) {
+        let mut inflight = self.inflight.lock();
+        inflight.retain(|entry| !entry.retired());
+        inflight.push_back(finalizer);
     }
 
     /// Keep the PM4 counter below 2^32 on the dispatch hot path.
@@ -301,10 +466,11 @@ impl PoolQueue {
     /// never reach → false 30 s timeout. Calling this before reserving each
     /// counter value forces the drain+reset at the 2^31 watermark, so the
     /// reserved value stays `< 2^32` and the `as u32` truncations stay lossless.
-    /// The dispatch lock held across the op makes the check + drain sequential.
+    /// The exclusive lane lease makes the check + drain sequential.
     pub fn ensure_pm4_headroom(&self) -> Result<()> {
         if self.pm4_counter.current() > TIMELINE_WRAP_WATERMARK {
             self.drain_all()?;
+            self.pm4_counter.reset_after_drain();
         }
         Ok(())
     }
@@ -317,58 +483,26 @@ impl PoolQueue {
         if private_segment_size <= current {
             return Ok(());
         }
-        // Serialize the realloc (alloc new → swap → drain → free old) against
-        // concurrent co-tenant dispatchers on this shared queue. Holding the
-        // dispatch lock blocks every co-tenant from enqueuing the stale scratch
-        // VA during the swap. `drain_all` waits only on signals
-        // (never takes `dispatch_lock`), so this is deadlock-free.
-        let _g = self.dispatch_lock.lock();
-        // Re-check under the guard: another dispatcher may have grown scratch
-        // while we waited for the lock.
+        // QueueLease is the exclusive publication authority, so no publisher
+        // can enqueue the stale scratch VA during this transaction.
         if private_segment_size <= self.scratch_state.lock().size_per_thread {
             return Ok(());
         }
+        self.drain_all()?;
         let (va, size, tmpring, rounded, handle, aql_desc) =
             alloc_scratch(self.core.iface(), &self.core.node, &self.core.arch, private_segment_size)?;
-        let swapped = {
+        let old = {
             let mut state = self.scratch_state.lock();
-            if rounded > state.size_per_thread {
-                let old = (state.gpu_va, state.size, state.handle);
-                *state = ScratchState { gpu_va: va, size_per_thread: rounded, tmpring_size: tmpring, handle, size };
-                Some(old)
-            } else {
-                None
-            }
+            let old = (state.gpu_va, state.size, state.handle);
+            *state = ScratchState { gpu_va: va, size_per_thread: rounded, tmpring_size: tmpring, handle, size };
+            old
         };
-        match swapped {
-            // Park-and-grow — the only safe ordering on a live multi-XCC queue.
-            // Drain to idle first so no dispatch is mid-flight or still reading
-            // the old scratch; publish the NEW descriptor (self-flushed to GART)
-            // so the live `amd_queue_t` never points at soon-to-be-unmapped
-            // VRAM; only THEN free the old backing. Skipping the drain (or
-            // freeing before republish) silently wedges the CP. No-op republish
-            // on PM4 queues.
-            Some((old_va, old_size, old_handle)) => {
-                if let Err(e) = self.drain_all() {
-                    tracing::warn!(?e, "scratch grow: drain failed; proceeding with republish");
-                }
-                self.queue.set_aql_scratch(&aql_desc);
-                self.core.iface().free_raw(old_va, old_size, old_handle);
-            }
-            // Lost the race — another dispatcher already grew scratch past our
-            // target. Free the buffer we redundantly allocated.
-            None => self.free_scratch(va, size, handle),
-        }
+        // The exclusive lane lease keeps the new host state and live AQL descriptor
+        // atomic with respect to publication. The successful drain proves the
+        // old backing is no longer referenced.
+        self.queue.set_aql_scratch(&aql_desc);
+        self.core.iface().free_raw(old.0, old.1, old.2);
         Ok(())
-    }
-
-    /// Drain → unmap → munmap → free a scratch backing buffer. Old scratch is no
-    /// longer referenced once the queue drains.
-    fn free_scratch(&self, va: u64, size: usize, handle: u64) {
-        if let Err(e) = self.drain_all() {
-            tracing::warn!(?e, va, "scratch realloc: drain failed; freeing anyway");
-        }
-        self.core.iface().free_raw(va, size, handle);
     }
 }
 
@@ -383,6 +517,8 @@ impl Drop for PoolQueue {
     /// work is then abandoned — the caller saw a panic anyway.
     fn drop(&mut self) {
         if std::thread::panicking() {
+            self.core.poison("compute queue abandoned during panic unwind");
+            self.queue.quarantine();
             tracing::warn!(
                 "PoolQueue drop during panic unwind: skipping drain; \
                  in-flight GPU work + scratch backing abandoned"
@@ -390,32 +526,42 @@ impl Drop for PoolQueue {
             return;
         }
         if let Err(e) = self.drain_all() {
-            tracing::warn!(?e, "PoolQueue drop: drain failed (in-flight work lost)");
+            self.queue.quarantine();
+            tracing::warn!(?e, "PoolQueue drop: drain failed; hardware allocations quarantined");
+            return;
+        }
+        if self.queue.close().is_err() {
+            return;
         }
         let state = *self.scratch_state.lock();
-        self.free_scratch(state.gpu_va, state.size, state.handle);
+        self.core.iface().free_raw(state.gpu_va, state.size, state.handle);
     }
 }
 
-/// Lightweight per-owner dispatch context. Holds an `Arc<PoolQueue>` (the shared
-/// queue this owner dispatches on) plus the owner's own completion bookkeeping,
-/// so [`synchronize`](Self::synchronize) can wait on ONLY this owner's work (the
-/// owner-local fast path). The whole-pool drain
-/// (`AmdDeviceCore::synchronize_all` → `PoolQueue::drain_all`) is the
-/// host-visibility/free fence.
-pub struct OwnerCtx {
-    pool: Arc<PoolQueue>,
-    /// AQL: this owner's last in-flight completion signal.
-    my_newest: Mutex<Option<Arc<AmdSignal>>>,
-    /// PM4: this owner's last reserved counter value (0 = none yet).
-    pm4_high: AtomicU64,
+/// Logical per-plan context. Queue ownership is acquired separately through a
+/// non-clone [`QueueLease`]. Direct fallback retains one lease as its replay
+/// session so per-kernel trait calls preserve FIFO ordering.
+pub(crate) struct OwnerCtx {
+    core: Arc<AmdDeviceCore>,
+    allocator: AmdAllocator,
+    session: Mutex<Option<QueueLease>>,
+    /// This owner's newest HCQ submission, independent of native queue path.
+    newest: Mutex<Option<Arc<SubmissionFinalizer>>>,
     /// PMC: hardware counters to collect on profiling dispatches (empty = off).
     pmc: Mutex<Vec<crate::profile::PmcCounter>>,
+    linked_plan: Mutex<Option<crate::amd::linked_plan::AmdLinkedPlan>>,
 }
 
 impl OwnerCtx {
-    pub fn new(pool: Arc<PoolQueue>) -> Self {
-        Self { pool, my_newest: Mutex::new(None), pm4_high: AtomicU64::new(0), pmc: Mutex::new(Vec::new()) }
+    pub fn new(core: Arc<AmdDeviceCore>, allocator: AmdAllocator) -> Self {
+        Self {
+            core,
+            allocator,
+            session: Mutex::new(None),
+            newest: Mutex::new(None),
+            pmc: Mutex::new(Vec::new()),
+            linked_plan: Mutex::new(None),
+        }
     }
 
     /// Hardware counters to collect on this owner's profiling dispatches.
@@ -423,51 +569,61 @@ impl OwnerCtx {
         self.pmc.lock().clone()
     }
 
-    /// Access the shared queue (queue / arena / scratch / acquire_signal /
-    /// dispatch_guard).
     #[inline]
-    pub fn pool(&self) -> &Arc<PoolQueue> {
-        &self.pool
+    pub fn core(&self) -> &Arc<AmdDeviceCore> {
+        &self.core
     }
 
-    /// Record this owner's most recent in-flight AQL signal (the one to wait on
+    pub fn lease(&self) -> Result<QueueLease> {
+        self.core.lease_queue(&self.allocator)
+    }
+
+    fn finish_session(&self) {
+        drop(self.session.lock().take());
+    }
+
+    /// Record this owner's most recent in-flight finalizer (the one to wait on
     /// in the owner-local `synchronize`).
-    pub fn set_newest(&self, sig: Arc<AmdSignal>) {
-        *self.my_newest.lock() = Some(sig);
-    }
-
-    /// Record this owner's highest reserved PM4 counter value.
-    pub fn set_pm4_high(&self, v: u64) {
-        self.pm4_high.store(v, Ordering::Release);
+    pub fn set_newest(&self, finalizer: Arc<SubmissionFinalizer>) {
+        *self.newest.lock() = Some(finalizer);
     }
 
     /// Owner-local drain: wait on ONLY this owner's last submitted work. AQL:
     /// wait its newest signal. PM4: wait the shared counter to reach this
     /// owner's high value. Polls the device poison latch and bails on fault.
     pub fn synchronize(&self) -> Result<()> {
-        if let Some(err) = self.pool.core.poison_error() {
+        if let Some(err) = self.core.poison_error() {
             return Err(err);
         }
-        let newest = self.my_newest.lock().clone();
-        if let Some(sig) = newest {
-            sig.wait_done(30_000).inspect_err(|e| self.pool.core.poison(&e.to_string()))?;
-            return Ok(());
-        }
-        let high = self.pm4_high.load(Ordering::Acquire);
-        if high > 0 {
-            self.pool
-                .pm4_signal()
-                .wait_signal_value(high, 30_000)
-                .inspect_err(|e| self.pool.core.poison(&e.to_string()))?;
+        // Dispatch holds `session` through `set_newest`, so taking the snapshot
+        // under the same lock cannot miss an already-doorbelled submission.
+        let (finalizer, lease) = {
+            let mut session = self.session.lock();
+            let finalizer = self.newest.lock().clone();
+            (finalizer, session.take())
+        };
+        drop(lease);
+        if let Some(finalizer) = finalizer {
+            finalizer.wait(30_000).inspect_err(|e| self.core.poison(&e.to_string()))?;
         }
         Ok(())
     }
+}
 
-    /// Identity of the shared queue this owner dispatches on — used by the
-    /// concurrency test to assert distinct owners landed on distinct queues.
-    #[cfg(test)]
-    pub fn queue_ptr(&self) -> *const PoolQueue {
-        Arc::as_ptr(&self.pool)
+impl Drop for OwnerCtx {
+    fn drop(&mut self) {
+        if self.linked_plan.get_mut().is_none() {
+            return;
+        }
+        // The cached linked plan owns host-visible kernarg storage referenced by
+        // asynchronous dispatches. Fence the owner's final submission before
+        // Rust drops the plan and unmaps that storage.
+        if let Err(e) = self.synchronize() {
+            tracing::warn!(?e, "OwnerCtx drop: linked-plan work could not be drained; storage quarantined");
+            if let Some(plan) = self.linked_plan.get_mut().take() {
+                std::mem::forget(plan);
+            }
+        }
     }
 }
 
@@ -477,8 +633,8 @@ impl std::fmt::Debug for OwnerCtx {
     }
 }
 
-/// An `OwnerCtx` IS the per-plan execution context: it holds the leased queue
-/// for the plan's lifetime, so every kernel dispatches onto the same ring.
+/// Direct per-operation fallback retains one exclusive lane for the context's
+/// replay session, preserving queue FIFO ordering until context drop.
 impl crate::device::PlanContext for OwnerCtx {
     unsafe fn dispatch(
         &self,
@@ -497,16 +653,62 @@ impl crate::device::PlanContext for OwnerCtx {
             .as_any()
             .downcast_ref::<crate::amd::AmdProgram>()
             .expect("AMD PlanContext dispatched a non-AMD program");
-        self.pool().ensure_has_local_memory(amd.private_segment_size())?;
-        // `profile` is threaded from the caller: the fire-and-forget path passes
-        // `false` (it drops the handle immediately), so we must NOT arm the
-        // timestamp probes there — doing so would free the scratch signal slot
-        // while the async EOP probe is still in flight. Only the profiling
-        // callers that retain the handle to `synchronize` pass `true`.
-        let sig = unsafe {
-            amd.execute_on(self, buffers, vals, global_size, local_size, /*wait=*/ false, profile)?
-        };
-        Ok(sig)
+        if !Arc::ptr_eq(amd.device().core(), &self.core) {
+            return Err(Error::Runtime {
+                message: "AMD PlanContext received a program from another physical device".into(),
+            });
+        }
+        let mut session = self.session.lock();
+        let result = (|| {
+            if session.is_none() {
+                // A new epoch may use another lane; retire the previous epoch
+                // before relying on this lane's FIFO ordering.
+                if let Some(finalizer) = self.newest.lock().clone() {
+                    finalizer.wait(30_000).inspect_err(|e| self.core.poison(&e.to_string()))?;
+                }
+                *session = Some(self.lease()?);
+            }
+            let lane = session.as_ref().unwrap();
+            lane.ensure_has_local_memory(amd.private_segment_size())?;
+            // Only profiling callers retain timestamp handles long enough to
+            // synchronize them; fire-and-forget dispatch must not arm probes.
+            unsafe {
+                amd.execute_on(self, lane.pool(), buffers, vals, global_size, local_size, /*wait=*/ false, profile)
+            }
+        })();
+        if result.is_err() {
+            drop(session.take());
+        }
+        result
+    }
+
+    fn replay_linked_plan(
+        &self,
+        submissions: &[crate::hcq::SemanticLinkedSubmission],
+        calls: &[crate::device::PlanCall<'_>],
+    ) -> Result<crate::device::NativeReplayOutcome> {
+        let mut plan = self.linked_plan.lock();
+        // Release a direct-session lease and retire this owner's prior mutable
+        // replay storage before trying to claim a native replay lane.
+        self.synchronize()?;
+        let lane = self.lease()?;
+        if plan.is_none() {
+            let Some(captured) =
+                crate::amd::linked_plan::AmdLinkedPlan::capture(self, lane.pool(), submissions, calls)?
+            else {
+                return Ok(crate::device::NativeReplayOutcome::Declined(
+                    crate::device::NativeReplayDecline::BackendUnsupported,
+                ));
+            };
+            *plan = Some(captured);
+        }
+        if let Err(failure) = plan.as_mut().unwrap().replay(self, lane.pool(), calls) {
+            if failure.published {
+                self.core.poison(&failure.error.to_string());
+            }
+            return Err(failure.error);
+        }
+        Ok(crate::device::NativeReplayOutcome::Executed)
     }
 
     fn set_pmc(&self, counters: &[crate::profile::PmcCounter]) {
@@ -519,5 +721,35 @@ impl crate::device::PlanContext for OwnerCtx {
 
     fn synchronize(&self) -> Result<()> {
         OwnerCtx::synchronize(self)
+    }
+
+    fn finish_replay(&self) -> Result<()> {
+        self.finish_session();
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::LaneClaims;
+
+    #[test]
+    fn lane_claims_are_exclusive_and_reusable() {
+        let claims = LaneClaims::new(3);
+        assert_eq!(claims.try_claim(0), None);
+        assert_eq!(claims.try_claim(3), Some(0));
+        assert_eq!(claims.try_claim(3), Some(1));
+        assert_eq!(claims.try_claim(3), Some(2));
+        assert_eq!(claims.try_claim(3), None);
+        claims.release(1);
+        assert_eq!(claims.try_claim(3), Some(1));
+    }
+
+    #[test]
+    fn lane_claims_never_expose_uninitialized_slots() {
+        let claims = LaneClaims::new(4);
+        claims.claim_new(0);
+        assert_eq!(claims.try_claim(1), None);
+        assert_eq!(claims.try_claim(2), Some(1));
     }
 }

@@ -1,652 +1,473 @@
-//! `AmdGraph`: capture a static kernel chain into a replayable batch of native
-//! AQL kernel-dispatch packets, replayed on the device's **shared** compute
-//! queue with one doorbell + one completion signal.
+//! AMD graph capture through backend-neutral HCQ submissions.
 //!
-//! Capture builds one `hsa_kernel_dispatch_packet_t` per kernel, kernargs baked
-//! into a dedicated page (the chain is static — no runtime vars, and the plan
-//! owns its buffers so their VAs are stable across replays). Each packet sets
-//! the header BARRIER bit, so the chain is serialised in queue order. Replay
-//! acquires a fresh per-op completion signal, blits the N packets plus a
-//! terminating [`build_barrier_and`](crate::amd::queue::build_barrier_and)
-//! (carrying that signal) into the shared ring with one doorbell (serialised by
-//! the queue's inner Mutex), and registers the signal as in-flight — exactly
-//! like a per-call dispatch, just N+1 packets in one shot. The barrier_and
-//! fires the signal once the last kernel retires; host reads drain it via
-//! `AmdDevice::synchronize` → `synchronize_all`.
-//!
-//! Runs on a shared `PoolQueue` from the device pool. Scope: multi-XCC CDNA
-//! (AQL). Single-XCC PM4 (RDNA) chains and non-AMD / mixed-device chains return
-//! `Ok(None)` → per-call dispatch.
+//! Capture lowers and links one immutable native command stream. Replay updates
+//! canonical kernargs plus the linked stream's runtime/system patch sites and
+//! publishes it with one doorbell. No AQL packet or PM4 stream is rebuilt.
 
 #![cfg(unix)]
 
 use std::sync::Arc;
 
-use crate::allocator::RawBuffer;
+use crate::allocator::{AmdBufferGuard, RawBuffer};
 use crate::amd::AmdAllocator;
 use crate::amd::connector::OwnerCtx;
-use crate::amd::device::AmdDevice;
 use crate::amd::program::AmdProgram;
 use crate::amd::queue::{
-    AQL_PACKET_BYTES, GraphBarrier, GraphKernelPm4, append_graph_kernel_pm4, build_barrier_and, build_barrier_and_deps,
-    build_dispatch_packet, build_dispatch_packet_barrier,
+    AQL_PACKET_BYTES, Pm4LoweringState, build_pm4_indirect_buffer, lower_hcq_aql_submission_program,
+    lower_hcq_pm4_command_buffer, validate_aql_packet_count,
 };
-use crate::amd::signal::AmdSignal;
 use crate::device::{Graph, GraphKernel};
 use crate::error::{Error, Result};
+use crate::hcq::{
+    AmdPm4Dispatch, Command, CommandBufferCache, CommandField, ComputeDispatch, LinkPatchValues, LinkedCommandBuffer,
+    PatchSource, QueueKind, ReplayCommandBuffer, RuntimePatchValues, Submission, SystemField, SystemPatchValues,
+};
 
-/// A captured, replayable AMD kernel chain (multi-XCC AQL).
+struct KernargSlot {
+    host: *mut u8,
+    buffers: Vec<u64>,
+    vals: Vec<i64>,
+    buffer_count: usize,
+    var_count: usize,
+    record_size: usize,
+    abi: Vec<crate::device::AbiParamDescriptor>,
+}
+
+enum NativeGraph {
+    Aql,
+    Pm4,
+}
+
+struct ReplayState {
+    command: ReplayCommandBuffer,
+    profile_command: Option<ReplayCommandBuffer>,
+    control: Option<ReplayCommandBuffer>,
+    profile_control: Option<ReplayCommandBuffer>,
+}
+
+struct ProfileGraph {
+    linked: Arc<LinkedCommandBuffer>,
+    control: Option<GraphControl>,
+    signal_count: usize,
+}
+
+struct GraphControl {
+    linked: Arc<LinkedCommandBuffer>,
+    host: *mut u8,
+    gpu: u64,
+    buffer: RawBuffer,
+}
+
+impl Drop for GraphControl {
+    fn drop(&mut self) {
+        self.buffer.free_amd_device_in_place();
+    }
+}
+
+/// A linked AMD command buffer and graph-owned canonical kernarg storage.
 pub struct AmdGraph {
-    /// This graph's owner context over a shared `PoolQueue` (queue + scratch +
-    /// signal pool). Held for the graph's lifetime; the queue is shared with
-    /// per-call dispatch and co-tenant owners — they compose via the queue's
-    /// FIFO order (replay blits its whole batch under the inner Mutex).
     owner: OwnerCtx,
-    /// The captured AQL packet stream, replayed verbatim each call. In DAG mode
-    /// this interleaves `barrier_and` dep-gates (barrier-bit=0, gating only on
-    /// producer signals) with BARRIER-stripped kernel-dispatch packets that each
-    /// carry their own completion signal (`kernel_sigs[e]`). In blanket-BARRIER
-    /// fallback mode it is one BARRIER-serialised dispatch packet per kernel
-    /// (completion_signal=0). Static: kernargs are baked into `kernargs_buf`.
-    packets: Vec<[u32; 16]>,
-    /// DAG mode only: one graph-lifetime completion signal per kernel (emission
-    /// order). Each dispatch packet fires `kernel_sigs[e]`; dependent kernels'
-    /// `barrier_and` packets gate on the producers' handles. Re-armed to 1 before
-    /// every replay. Empty ⇒ blanket-BARRIER fallback (no DAG overlap). Held for
-    /// the graph's lifetime (reserved off the signal pool, never FIFO in-flight).
-    kernel_sigs: Vec<Arc<AmdSignal>>,
-    /// Dedicated kernargs page (one slot per kernel, baked at capture). Owned so
-    /// concurrent per-call dispatch on the shared rolling arena can't lap it.
-    /// `RawBuffer` has no `Drop`; freed in `Drop for AmdGraph` after the drain.
+    max_private: u32,
+    _programs: Vec<Arc<crate::amd::program::CodeObject>>,
+    native: NativeGraph,
+    linked: Arc<LinkedCommandBuffer>,
+    control: Option<GraphControl>,
+    profile: Option<ProfileGraph>,
+    state: parking_lot::Mutex<ReplayState>,
+    slots: Vec<KernargSlot>,
     kernargs_buf: RawBuffer,
 }
 
-// SAFETY: `packets` is immutable after capture; the owner + kernargs page are
-// graph-owned stable mappings. Replay only reads `packets`/the page and pushes
-// through the queue's own synchronisation.
+// SAFETY: raw pointers refer to the graph-owned host mapping. Replay writes are
+// serialized by `state`, and drop drains the queue before freeing that mapping.
 unsafe impl Send for AmdGraph {}
 unsafe impl Sync for AmdGraph {}
 
+fn lower_graph_submission(
+    allocator: &AmdAllocator,
+    submission: &Submission,
+    links: &[u64],
+    state: Pm4LoweringState,
+    pm4: bool,
+) -> Result<(Arc<LinkedCommandBuffer>, Option<GraphControl>)> {
+    if pm4 {
+        let lowered = lower_hcq_pm4_command_buffer(submission, state)?;
+        build_pm4_indirect_buffer(0, lowered.bytes.len() / 4)?;
+        let linked = CommandBufferCache::default().link(&lowered, &LinkPatchValues(links.to_vec()))?;
+        let buffer = AmdBufferGuard::new(
+            allocator.alloc_host_visible_tagged(lowered.bytes.len().max(16), crate::amd::va_registry::AllocTag::Gtt)?,
+        );
+        let (gpu, host) = match buffer.buffer() {
+            RawBuffer::AmdDevice { gpu_addr, host_ptr: Some(host), .. } => (*gpu_addr, host.as_ptr()),
+            _ => return Err(Error::NotHostVisible { what: "PM4 graph command buffer" }),
+        };
+        return Ok((Arc::clone(&linked), Some(GraphControl { linked, host, gpu, buffer: buffer.into_inner() })));
+    }
+
+    let control_link = links.len();
+    let program = lower_hcq_aql_submission_program(submission, state, PatchSource::LinkAddress(control_link))?;
+    validate_aql_packet_count(program.aql.bytes.len() / AQL_PACKET_BYTES)?;
+    let buffer = AmdBufferGuard::new(
+        allocator
+            .alloc_host_visible_tagged(program.control.bytes.len().max(16), crate::amd::va_registry::AllocTag::Gtt)?,
+    );
+    let (gpu, host) = match buffer.buffer() {
+        RawBuffer::AmdDevice { gpu_addr, host_ptr: Some(host), .. } => (*gpu_addr, host.as_ptr()),
+        _ => return Err(Error::NotHostVisible { what: "AQL graph control program" }),
+    };
+    let mut native_links = links.to_vec();
+    native_links.push(gpu);
+    let values = LinkPatchValues(native_links);
+    let control = CommandBufferCache::default().link(&program.control, &values)?;
+    let linked = CommandBufferCache::default().link(&program.aql, &values)?;
+    Ok((linked, Some(GraphControl { linked: control, host, gpu, buffer: buffer.into_inner() })))
+}
+
 impl Drop for AmdGraph {
-    /// Drain in-flight replays before freeing the kernargs page the GPU reads.
-    /// Owner-local drain is sufficient: the graph's own terminating barrier_and
-    /// signal is the owner's newest. Skipped on panic unwind (same rationale as
-    /// `PoolQueue::Drop`).
     fn drop(&mut self) {
         if std::thread::panicking() {
-            tracing::warn!("AmdGraph drop during panic unwind: skipping synchronize; in-flight replay abandoned");
+            tracing::warn!("AmdGraph drop during panic unwind: in-flight replay abandoned");
             return;
         }
-        if let Err(e) = self.owner.synchronize() {
-            tracing::warn!(?e, "AmdGraph drop: synchronize failed (in-flight replay lost)");
+        if let Err(error) = self.owner.synchronize() {
+            tracing::warn!(?error, "AmdGraph drop: synchronize failed; storage quarantined");
+            return;
         }
-        // `RawBuffer` has no `Drop`; free the kernargs page now that the GPU is
-        // idle on it (drained above).
         self.kernargs_buf.free_amd_device_in_place();
     }
 }
 
 impl AmdGraph {
-    /// Capture `kernels` into one replayable native-AQL batch. Returns `Ok(None)`
-    /// when the chain isn't graphable here (non-AMD program, single-XCC PM4, or
-    /// mixed devices) so the caller falls back to per-call dispatch.
     pub fn capture(allocator: &AmdAllocator, kernels: &[GraphKernel]) -> Result<Option<Box<dyn Graph>>> {
         if kernels.is_empty() {
             return Ok(None);
         }
-        // Recover the concrete AmdProgram for every kernel; all must share one
-        // physical device.
-        let mut progs: Vec<&AmdProgram> = Vec::with_capacity(kernels.len());
-        for k in kernels {
-            let Some(p) = k.program.as_any().downcast_ref::<AmdProgram>() else {
-                return Ok(None);
-            };
-            progs.push(p);
+        let mut programs = Vec::with_capacity(kernels.len());
+        for kernel in kernels {
+            let Some(program) = kernel.program.as_any().downcast_ref::<AmdProgram>() else { return Ok(None) };
+            programs.push(program);
         }
-        let dev = Arc::clone(progs[0].device());
-        for p in &progs[1..] {
-            if !Arc::ptr_eq(p.device(), &dev) {
-                return Ok(None);
-            }
+        let device = Arc::clone(programs[0].device());
+        if programs.iter().skip(1).any(|program| !Arc::ptr_eq(program.device(), &device)) {
+            return Ok(None);
         }
-        if let Some(err) = dev.core().poison_error() {
-            return Err(err);
+        if let Some(error) = device.core().poison_error() {
+            return Err(error);
         }
-        // Single-XCC PM4 (RDNA, e.g. gfx1151) can capture the chain into one
-        // resident PM4 indirect buffer, replayed with a single doorbell — see
-        // `AmdGraphPm4::capture`. Multi-XCC CDNA uses the native-AQL path below.
-        //
-        // OPT-IN via the per-device `pm4_graph` flag, default OFF (per-call
-        // dispatch): on gfx1151 the CP executes one big inlined IB measurably
-        // SLOWER than the per-call ring stream it pipelines across dispatches —
-        // the GigaAM RN-T encoder is ~36% slower captured (21.7s vs 15.9s host
-        // wall, full audio.wav, 277 chunks) despite producing a BIT-IDENTICAL
-        // transcript. So the chain is captured correctly but per-call stays the
-        // default fast path; the flag exposes the (correct) capture for hardware
-        // that benefits or future barrier-granularity work. The fallback below is
-        // unchanged. (Flag lives on `AmdDeviceCore`, not an env var, so a value of
-        // `0` can't accidentally enable it and tests toggle it race-free.)
-        if crate::amd::queue::AmdComputeQueue::will_use_pm4(dev.core()) {
-            if !dev.core().pm4_graph() {
-                return Ok(None);
-            }
-            return AmdGraphPm4::capture(allocator, kernels, progs, dev);
+        let pm4 = crate::amd::queue::AmdComputeQueue::will_use_pm4(device.core());
+        if pm4 && !device.core().pm4_graph() {
+            return Ok(None);
         }
 
-        // Assign a shared `PoolQueue` to this graph (its own owner context).
-        let owner = dev.core().assign_owner(allocator)?;
-        let mut max_priv_seg = 128u32;
-        for p in &progs {
-            max_priv_seg = max_priv_seg.max(p.private_segment_size());
-        }
-        owner.pool().ensure_has_local_memory(max_priv_seg)?;
+        let owner = OwnerCtx::new(Arc::clone(device.core()), allocator.clone());
+        let lane = owner.lease()?;
+        let max_private = programs.iter().map(|p| p.private_segment_size()).max().unwrap_or(128).max(128);
+        lane.ensure_has_local_memory(max_private)?;
 
-        // One 16-byte-aligned kernarg slot per kernel in a dedicated page.
-        let mut slot_offsets: Vec<usize> = Vec::with_capacity(kernels.len());
-        let mut total = 0usize;
-        for (k, p) in kernels.iter().zip(&progs) {
-            let (buf_count, var_count) = p.arg_counts();
-            if k.buffers.len() != buf_count {
-                return Err(Error::Runtime {
-                    message: format!(
-                        "AmdGraph capture: kernel '{}' expects {buf_count} buffers, got {}",
-                        k.program.name(),
-                        k.buffers.len()
+        let mut offsets = Vec::with_capacity(kernels.len());
+        let mut bytes = 0usize;
+        for (kernel, program) in kernels.iter().zip(&programs) {
+            let (buffer_count, var_count) = program.arg_counts();
+            if kernel.buffers.len() != buffer_count || kernel.vals.len() != var_count {
+                return Err(Error::ProgramAbiMismatch {
+                    reason: format!(
+                        "AMD graph kernel '{}' expected {buffer_count} buffers/{var_count} vars, got {}/{}",
+                        kernel.program.name(),
+                        kernel.buffers.len(),
+                        kernel.vals.len()
                     ),
                 });
             }
-            if k.vals.len() != var_count {
-                return Err(Error::Runtime {
-                    message: format!(
-                        "AmdGraph capture: kernel '{}' expects {var_count} vals, got {}",
-                        k.program.name(),
-                        k.vals.len()
-                    ),
-                });
-            }
-            slot_offsets.push(total);
-            total += p.kernarg_record_size().next_multiple_of(16);
+            offsets.push(bytes);
+            bytes += program.kernarg_record_size().next_multiple_of(16);
         }
-        let kernargs_buf = allocator.alloc_uncached(total.max(16))?;
-        let (kernargs_gpu, kernargs_host) = match &kernargs_buf {
-            RawBuffer::AmdDevice { gpu_addr, host_ptr: Some(h), .. } => (*gpu_addr, h.as_ptr()),
+        let kernargs_buf = AmdBufferGuard::new(
+            allocator.alloc_host_visible_tagged(bytes.max(16), crate::amd::va_registry::AllocTag::Kernarg)?,
+        );
+        let (kernargs_gpu, kernargs_host) = match kernargs_buf.buffer() {
+            RawBuffer::AmdDevice { gpu_addr, host_ptr: Some(host), .. } => (*gpu_addr, host.as_ptr()),
             _ => return Err(Error::NotHostVisible { what: "graph kernargs" }),
         };
 
-        // Bake kernargs once per kernel (shared by both lowering modes); the
-        // packet header / completion signal differ per mode but the kernarg slot
-        // is identical. Record each kernel's pre-computed launch geometry so the
-        // packet builders below don't re-derive it.
-        struct Baked {
-            workgroup: [u16; 3],
-            grid: [u32; 3],
-            priv_seg: u32,
-            group_seg: u32,
-            prog_addr: u64,
-            slot_gpu: u64,
-        }
-        let mut baked: Vec<Baked> = Vec::with_capacity(kernels.len());
-        for ((k, p), &off) in kernels.iter().zip(&progs).zip(&slot_offsets) {
-            // SAFETY: off + record <= total <= allocation; sole writer.
-            let slot_host = unsafe { kernargs_host.add(off) };
-            let slot_gpu = kernargs_gpu + off as u64;
-            let bufs: Vec<u64> = k.buffers.iter().map(|&b| b as u64).collect();
-            // SAFETY: slot_host owns >= kernarg_record_size() bytes (laid out above).
-            unsafe { p.write_kernargs(slot_host, &bufs, &k.vals)? };
-
-            let g = k.global_size.unwrap_or([1, 1, 1]);
-            let l = k.local_size.unwrap_or([1, 1, 1]);
-            baked.push(Baked {
-                workgroup: [l[0] as u16, l[1] as u16, l[2] as u16],
-                grid: [(g[0] * l[0]) as u32, (g[1] * l[1]) as u32, (g[2] * l[2]) as u32],
-                priv_seg: p.private_segment_size(),
-                group_seg: p.group_segment_size(),
-                prog_addr: p.aql_prog_addr(),
-                slot_gpu,
+        let mut submission = Submission::new(QueueKind::Compute(0));
+        let wait = submission.commands.len();
+        submission.push(Command::Wait { signal_address: 0, value: 0 });
+        submission.bind(wait, CommandField::WaitAddress, PatchSource::System(SystemField::TimelineSignal(0)))?;
+        submission.bind(wait, CommandField::WaitValue, PatchSource::System(SystemField::TimelineValue(0)))?;
+        let mut links = Vec::with_capacity(kernels.len() * 2);
+        let mut slots = Vec::with_capacity(kernels.len());
+        for (((kernel, program), &offset), index) in kernels.iter().zip(&programs).zip(&offsets).zip(0usize..) {
+            let slot_gpu = kernargs_gpu + offset as u64;
+            let (buffer_count, var_count) = program.arg_counts();
+            slots.push(KernargSlot {
+                // SAFETY: offsets were packed within the graph allocation.
+                host: unsafe { kernargs_host.add(offset) },
+                buffers: kernel.buffers.iter().map(|p| *p as u64).collect(),
+                vals: kernel.vals.clone(),
+                buffer_count,
+                var_count,
+                record_size: program.kernarg_record_size(),
+                abi: program.abi().to_vec(),
             });
-        }
 
-        // Try to reserve one graph-lifetime completion signal per kernel for
-        // DAG-driven dispatch (independent kernels overlap; true deps enforced by
-        // barrier_and packets). If the signal pool can't fund every slot, drop the
-        // partial reservation and fall back to blanket-BARRIER capture — same
-        // result, no overlap. Reservation is all-or-nothing.
-        // Reserve one graph-lifetime signal per kernel for DAG dep-gating, but
-        // only if the pool keeps enough headroom afterwards for per-op AQL
-        // back-pressure + PM4 counters — otherwise a large graph would drain the
-        // pool and make later per-call `acquire_signal` hard-fail. If headroom is
-        // short, skip DAG entirely (no partial reservation) and use the
-        // blanket-BARRIER fallback.
-        const SIGNAL_RESERVE_HEADROOM: usize = 128;
-        let mut kernel_sigs: Vec<Arc<AmdSignal>> = Vec::with_capacity(kernels.len());
-        let mut dag_ok =
-            !kernels.is_empty() && owner.pool().signal_free() >= kernels.len().saturating_add(SIGNAL_RESERVE_HEADROOM);
-        if dag_ok {
-            for _ in 0..kernels.len() {
-                match owner.pool().reserve_signal() {
-                    Ok(s) => kernel_sigs.push(s),
-                    Err(_) => {
-                        dag_ok = false;
-                        break;
-                    }
-                }
+            submission.push(Command::MemoryBarrier);
+            let g = kernel.global_size.unwrap_or([1, 1, 1]);
+            let l = kernel.local_size.unwrap_or([1, 1, 1]);
+            let (rsrc1, rsrc2, rsrc3) = program.rsrc();
+            let (wave32, target_major) = program.wave32_target();
+            let command = submission.commands.len();
+            submission.push(Command::Compute(ComputeDispatch {
+                workgroup_size: l.map(|v| v as u32),
+                grid_size: if pm4 {
+                    g.map(|v| v as u32)
+                } else {
+                    [g[0] * l[0], g[1] * l[1], g[2] * l[2]].map(|v| v as u32)
+                },
+                private_segment_size: program.private_segment_size(),
+                group_segment_size: program.group_segment_size(),
+                kernel_object: 0,
+                kernarg_address: 0,
+                completion_signal: 0,
+                barrier: true,
+                amd_pm4: Some(AmdPm4Dispatch {
+                    rsrc: [rsrc1, rsrc2, rsrc3],
+                    program_address: 0,
+                    enable_private_segment_sgpr: program.enable_private_segment_sgpr(),
+                    workgroup_count: g.map(|v| v as u32),
+                    wave32,
+                    target_major,
+                }),
+            }));
+            let program_link = links.len();
+            links.push(if pm4 { program.pm4_prog_addr() } else { program.aql_prog_addr() });
+            let kernarg_link = links.len();
+            links.push(slot_gpu);
+            submission.bind(
+                command,
+                if pm4 { CommandField::ComputeProgramAddress } else { CommandField::ComputeKernelObject },
+                PatchSource::LinkAddress(program_link),
+            )?;
+            submission.bind(command, CommandField::ComputeKernargAddress, PatchSource::LinkAddress(kernarg_link))?;
+            if pm4 {
+                submission.bind(
+                    command,
+                    CommandField::ComputeScratchAddress,
+                    PatchSource::System(SystemField::ScratchAddress),
+                )?;
+                submission.bind(
+                    command,
+                    CommandField::ComputeScratchTmpring,
+                    PatchSource::System(SystemField::ScratchTmpring),
+                )?;
             }
-            if !dag_ok {
-                kernel_sigs.clear(); // drop the partial reservation back to the pool
-            }
+            let _ = (index, &kernel.deps); // FIFO barriers conservatively satisfy every dependency edge.
         }
+        let store = submission.commands.len();
+        submission.push(Command::Store { dst: 0, value: 0 });
+        submission.bind(store, CommandField::StoreDst, PatchSource::System(SystemField::TimelineSignal(0)))?;
+        submission.bind(store, CommandField::StoreValue, PatchSource::System(SystemField::TimelineValue(1)))?;
 
-        let pack = |dw: &mut [u32; 16], packet: &crate::amd::sys::hsa::hsa_kernel_dispatch_packet_t| {
-            // SAFETY: hsa_kernel_dispatch_packet_t is repr(C), exactly 64 bytes.
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    packet as *const _ as *const u8,
-                    dw.as_mut_ptr() as *mut u8,
-                    AQL_PACKET_BYTES,
-                );
+        let profile_linked = {
+            let mut profiled = submission.clone();
+            profiled.request_profile();
+            let computes: Vec<usize> = profiled
+                .commands
+                .iter()
+                .enumerate()
+                .filter_map(|(index, command)| matches!(command, Command::Compute(_)).then_some(index))
+                .collect();
+            for (slot, &index) in computes.iter().enumerate().rev() {
+                profiled.insert(index + 1, Command::Timestamp { dst: 0 });
+                profiled.bind(
+                    index + 1,
+                    CommandField::TimestampDst,
+                    PatchSource::System(SystemField::Timestamp((slot * 2 + 1) as u32)),
+                )?;
+                profiled.insert(index, Command::Timestamp { dst: 0 });
+                profiled.bind(
+                    index,
+                    CommandField::TimestampDst,
+                    PatchSource::System(SystemField::Timestamp((slot * 2) as u32)),
+                )?;
             }
+            let state = Pm4LoweringState {
+                scratch_address: lane.scratch_gpu_va(),
+                tmpring_size: lane.tmpring_size(),
+                target_major: device.core().arch.gfx_major(),
+                completion_xcc_mask: (!pm4 && device.core().node.num_xcc > 1).then_some(1),
+            };
+            Some(lower_graph_submission(allocator, &profiled, &links, state, pm4)?)
         };
 
-        let mut packets: Vec<[u32; 16]> = Vec::new();
-        if dag_ok {
-            // DAG emission: each kernel is preceded by barrier_and dep-gates that
-            // wait on its not-yet-satisfied producers' signals, then a
-            // BARRIER-stripped dispatch carrying the kernel's own completion
-            // signal. `satisfied` is monotonic across the batch: once a producer
-            // has been gated on, a later consumer of the same producer needs no
-            // fresh barrier_and (the producer is already retired in queue order).
-            let mut satisfied: std::collections::HashSet<usize> = std::collections::HashSet::new();
-            for (e, (k, b)) in kernels.iter().zip(&baked).enumerate() {
-                let needed: Vec<usize> = k.deps.iter().copied().filter(|d| !satisfied.contains(d)).collect();
-                for chunk in needed.chunks(5) {
-                    let dep_handles: Vec<u64> = chunk.iter().map(|&d| kernel_sigs[d].signal_handle()).collect();
-                    packets.push(build_barrier_and_deps(&dep_handles, /*completion=*/ 0));
-                }
-                satisfied.extend(needed);
-                let packet = build_dispatch_packet_barrier(
-                    b.workgroup,
-                    b.grid,
-                    b.priv_seg,
-                    b.group_seg,
-                    b.prog_addr,
-                    b.slot_gpu,
-                    /*completion_signal=*/ kernel_sigs[e].signal_handle(),
-                    /*barrier=*/ false,
-                );
-                let mut dwords = [0u32; 16];
-                pack(&mut dwords, &packet);
-                packets.push(dwords);
-            }
-        } else {
-            tracing::info!(
-                kernels = kernels.len(),
-                "AmdGraph: DAG overlap disabled (signal budget); falling back to blanket-BARRIER capture"
-            );
-            // Blanket-BARRIER fallback: one BARRIER-serialised dispatch per kernel
-            // (completion_signal=0); the batch's terminating barrier_and carries
-            // the replay signal. Identical to the pre-DAG behaviour.
-            for b in &baked {
-                let packet = build_dispatch_packet(
-                    b.workgroup,
-                    b.grid,
-                    b.priv_seg,
-                    b.group_seg,
-                    b.prog_addr,
-                    b.slot_gpu,
-                    /*completion_signal=*/ 0,
-                );
-                let mut dwords = [0u32; 16];
-                pack(&mut dwords, &packet);
-                packets.push(dwords);
-            }
-        }
+        let state = Pm4LoweringState {
+            scratch_address: lane.scratch_gpu_va(),
+            tmpring_size: lane.tmpring_size(),
+            target_major: device.core().arch.gfx_major(),
+            completion_xcc_mask: (!pm4 && device.core().node.num_xcc > 1).then_some(1),
+        };
+        let (linked, control) = lower_graph_submission(allocator, &submission, &links, state, pm4)?;
+        let command = linked.replay_buffer();
+        let profile_command = profile_linked.as_ref().map(|(linked, _)| linked.replay_buffer());
+        let control_command = control.as_ref().map(|control| control.linked.replay_buffer());
+        let profile_control_command = profile_linked
+            .as_ref()
+            .and_then(|(_, control)| control.as_ref().map(|control| control.linked.replay_buffer()));
+        Ok(Some(Box::new(Self {
+            owner,
+            max_private,
+            _programs: programs.iter().map(|program| program.code_object()).collect(),
+            native: if pm4 { NativeGraph::Pm4 } else { NativeGraph::Aql },
+            linked,
+            control,
+            profile: profile_linked.map(|(linked, control)| ProfileGraph {
+                linked,
+                control,
+                signal_count: kernels.len(),
+            }),
+            state: parking_lot::Mutex::new(ReplayState {
+                command,
+                profile_command,
+                control: control_command,
+                profile_control: profile_control_command,
+            }),
+            slots,
+            kernargs_buf: kernargs_buf.into_inner(),
+        })))
+    }
 
-        if std::env::var_os("SVOD_DEBUG_DISPATCH").is_some() {
-            eprintln!(
-                "[graph capture] kernels={} dag={dag_ok} kernargs_gpu={kernargs_gpu:#x} scratch={:#x}",
-                kernels.len(),
-                owner.pool().scratch_gpu_va(),
-            );
+    fn patch_kernargs(&self, buffers: &[u64], vals: &[i64]) -> Result<()> {
+        let expected_buffers: usize = self.slots.iter().map(|slot| slot.buffer_count).sum();
+        let expected_vals: usize = self.slots.iter().map(|slot| slot.var_count).sum();
+        if (!buffers.is_empty() && buffers.len() != expected_buffers)
+            || (!vals.is_empty() && vals.len() != expected_vals)
+        {
+            return Err(Error::ProgramAbiMismatch {
+                reason: format!(
+                    "AMD graph replay expected {expected_buffers} buffers/{expected_vals} vars, got {}/{}",
+                    buffers.len(),
+                    vals.len()
+                ),
+            });
         }
-
-        Ok(Some(Box::new(AmdGraph { owner, packets, kernel_sigs, kernargs_buf })))
+        let mut buffer_offset = 0;
+        let mut var_offset = 0;
+        for slot in &self.slots {
+            let slot_buffers = if buffers.is_empty() {
+                &slot.buffers
+            } else {
+                &buffers[buffer_offset..buffer_offset + slot.buffer_count]
+            };
+            let slot_vals = if vals.is_empty() { &slot.vals } else { &vals[var_offset..var_offset + slot.var_count] };
+            // SAFETY: each slot is disjoint, graph-owned, and replay is serialized.
+            let dst = unsafe { std::slice::from_raw_parts_mut(slot.host, slot.record_size) };
+            crate::hcq::ClikeKernargLayout::from_abi(&slot.abi).pack(dst, slot_buffers, slot_vals)?;
+            buffer_offset += slot.buffer_count;
+            var_offset += slot.var_count;
+        }
+        Ok(())
     }
 }
 
 impl Graph for AmdGraph {
-    /// Replay the captured chain: acquire a fresh completion signal, blit the N
-    /// dispatch packets + a terminating barrier_and (carrying that signal) into
-    /// the shared ring with one doorbell, register the signal in-flight. Async —
-    /// host reads drain via `synchronize_all`, identical to per-call `wait=false`.
-    ///
-    /// `vals` is unused: the captured chain is static (no runtime vars), so launch
-    /// vals are baked into the kernarg slots at capture.
-    fn replay(&self, vals: &[i64]) -> Result<()> {
-        let _ = vals;
-        let pool = self.owner.pool();
-        if let Some(err) = pool.core().poison_error() {
-            return Err(err);
+    fn replay(&self, buffers: &[u64], vals: &[i64]) -> Result<()> {
+        if let Some(error) = self.owner.core().poison_error() {
+            return Err(error);
         }
-        // Serialize replays of THIS graph on the (shared) queue: hold the queue's
-        // dispatch lock — which also fences against a co-tenant scratch grow that
-        // would unmap scratch mid-replay — and drain the PREVIOUS batch before
-        // touching the shared graph-lifetime per-kernel signals. The per-kernel
-        // `kernel_sigs` are re-armed each replay (below); re-arming them while a
-        // prior batch is still in flight corrupts its dep-gates (a producer's
-        // signal reset to 1 under a consumer still polling for 0) and lets a
-        // second batch lap the ring. Waiting the owner's last batch restores the
-        // one-replay-in-flight invariant the per-call path gets for free; it is a
-        // no-op when a host readback already drained it (the common case).
-        let _disp = pool.dispatch_guard();
+        let mut state = self.state.lock();
         self.owner.synchronize()?;
-        // DAG mode: re-arm every per-kernel completion signal to 1 (the previous
-        // batch, drained above, left them at 0). The Release store in `arm`
-        // precedes the `submit_aql` doorbell's SeqCst fence, so the GPU never
-        // observes a stale 0. The owner's batch completion still rides the
-        // terminating barrier_and below — never the kernel_sigs.
-        for s in &self.kernel_sigs {
-            s.arm(1);
+        let lane = self.owner.lease()?;
+        lane.ensure_has_local_memory(self.max_private)?;
+        self.patch_kernargs(buffers, vals)?;
+        match self.native {
+            NativeGraph::Aql => {
+                let control = self.control.as_ref().expect("AQL graph control");
+                let ReplayState { command, control: control_command, .. } = &mut *state;
+                let mut system = SystemPatchValues::default();
+                let finalizer = lane.queue().replay_linked_aql_timeline(
+                    lane.pool(),
+                    &self.linked,
+                    command,
+                    &control.linked,
+                    control_command.as_mut().expect("AQL graph control replay"),
+                    control.host,
+                    &RuntimePatchValues::default(),
+                    &mut system,
+                )?;
+                self.owner.set_newest(finalizer);
+            }
+            NativeGraph::Pm4 => {
+                let resident = self.control.as_ref().expect("PM4 graph resident command buffer");
+                let mut system = SystemPatchValues::default();
+                let finalizer = lane.queue().replay_linked_pm4(
+                    lane.pool(),
+                    &self.linked,
+                    &mut state.command,
+                    resident.host,
+                    resident.gpu,
+                    &RuntimePatchValues::default(),
+                    &mut system,
+                )?;
+                self.owner.set_newest(finalizer);
+            }
         }
-        // Fresh per-op completion signal (armed to 1; handles pool back-pressure
-        // by draining the oldest in-flight replay/dispatch when exhausted).
-        let sig = pool.acquire_signal()?;
-        // Captured packets + one terminating barrier_and (barrier-bit=1) that
-        // fires `sig` once the WHOLE batch retires — the owner's single
-        // batch-completion handle, independent of the per-kernel signals.
-        let mut batch = self.packets.clone();
-        batch.push(build_barrier_and(sig.signal_handle()));
-        pool.queue().submit_aql(&batch)?;
-        pool.register_inflight(Arc::clone(&sig));
-        self.owner.set_newest(Arc::clone(&sig));
         Ok(())
     }
-}
 
-/// A captured, replayable AMD kernel chain (single-XCC PM4 / RDNA).
-///
-/// Capture bakes every kernel's full PM4 exec stream (the `dispatch_pm4`
-/// SET_SH_REG + DISPATCH_DIRECT sequence, each preceded by an `hdp_flush` +
-/// full `acquire_mem` hazard barrier) into ONE resident indirect buffer, with a
-/// dedicated kernarg page holding every kernel's baked args. Replay submits a
-/// single `PACKET3_INDIRECT_BUFFER` referencing that IB — wrapped in the queue's
-/// monotonic-counter `wait`/`release_mem` discipline — with one doorbell; the CP
-/// runs the whole chain inline. Mirrors [`AmdGraph`] (the AQL analogue) but uses
-/// raw PM4 since single-XCC queues are PM4, not AQL.
-pub struct AmdGraphPm4 {
-    /// Shared `PoolQueue` owner held for the graph's lifetime (queue + scratch +
-    /// PM4 counter). Replay rides this owner's counter so its `synchronize`
-    /// drains the chain, identical to per-call PM4 dispatch.
-    owner: OwnerCtx,
-    /// Per-kernel baked geometry/identity, in replay (FIFO) order. Used to
-    /// re-assemble the IB when the queue's shared scratch VA changes after
-    /// capture (a co-tenant grow); a no-op in the common pre-sized case.
-    kernels: Vec<GraphKernelPm4>,
-    /// Per-kernel hazard-barrier strength (parallel to `kernels`), computed once
-    /// from each kernel's position + `deps` at capture (see [`GraphBarrier`]).
-    barriers: Vec<GraphBarrier>,
-    /// Resident indirect buffer holding the concatenated per-kernel PM4 streams.
-    /// `RawBuffer` has no `Drop`; freed in `Drop for AmdGraphPm4` after the drain.
-    ib_buf: RawBuffer,
-    ib_gpu: u64,
-    ib_host: *mut u8,
-    /// Capacity of `ib_buf` in dwords — a rebuild must not exceed it (scratch VA
-    /// changes don't change the IB length, so this never trips, but it bounds the
-    /// host write).
-    ib_cap_dwords: u32,
-    /// Dedicated kernarg page (one slot per kernel, baked at capture). Owned so a
-    /// concurrent per-call dispatch on the shared rolling arena can't lap it.
-    kernargs_buf: RawBuffer,
-    /// Mutable replay state: the live IB dword count + the scratch VA/tmpring the
-    /// IB is currently baked against. Guarded so replay's staleness check + IB
-    /// rewrite are race-free; the `dispatch_lock` already serialises THIS graph's
-    /// replays, so the inner lock is uncontended.
-    state: parking_lot::Mutex<Pm4IbState>,
-}
-
-/// Mutable IB-bake state (see [`AmdGraphPm4::state`]).
-struct Pm4IbState {
-    /// Dword count of the currently-baked IB content (the `ib_size` field of the
-    /// INDIRECT_BUFFER packet).
-    ib_dwords: u32,
-    /// Scratch VA/tmpring the IB was last baked against. Replay rebuilds the IB
-    /// iff the queue's live scratch VA differs (co-tenant grow), so the baked
-    /// descriptor never points at unmapped VRAM.
-    baked_scratch_va: u64,
-    baked_tmpring: u32,
-}
-
-// SAFETY: `kernels`/`ib_*` are graph-owned stable mappings; the IB host pointer
-// is written only through `state`'s lock (replay rebuild), and the kernargs page
-// is immutable after capture. Raw pointers address allocator-owned buffers held
-// for the graph's lifetime.
-unsafe impl Send for AmdGraphPm4 {}
-unsafe impl Sync for AmdGraphPm4 {}
-
-impl Drop for AmdGraphPm4 {
-    /// Drain in-flight replays before freeing the IB + kernargs the GPU reads.
-    fn drop(&mut self) {
-        if std::thread::panicking() {
-            tracing::warn!("AmdGraphPm4 drop during panic unwind: skipping synchronize; in-flight replay abandoned");
-            return;
+    fn replay_profiled(
+        &self,
+        buffers: &[u64],
+        vals: &[i64],
+    ) -> Result<Option<Vec<Arc<dyn crate::DispatchTimestamps>>>> {
+        let Some(profile) = &self.profile else { return Ok(None) };
+        if let Some(error) = self.owner.core().poison_error() {
+            return Err(error);
         }
-        if let Err(e) = self.owner.synchronize() {
-            tracing::warn!(?e, "AmdGraphPm4 drop: synchronize failed (in-flight replay lost)");
+        let mut state = self.state.lock();
+        self.owner.synchronize()?;
+        let lane = self.owner.lease()?;
+        lane.ensure_has_local_memory(self.max_private)?;
+        self.patch_kernargs(buffers, vals)?;
+        let signals = (0..profile.signal_count).map(|_| lane.acquire_timestamp_signal()).collect::<Result<Vec<_>>>()?;
+        for signal in &signals {
+            signal.reset(0);
         }
-        self.ib_buf.free_amd_device_in_place();
-        self.kernargs_buf.free_amd_device_in_place();
-    }
-}
-
-impl AmdGraphPm4 {
-    /// Capture `kernels` into one resident PM4 indirect buffer. `progs` is the
-    /// already-validated concrete program for each kernel (same device, checked
-    /// by `AmdGraph::capture`).
-    fn capture(
-        allocator: &AmdAllocator,
-        kernels: &[GraphKernel],
-        progs: Vec<&AmdProgram>,
-        dev: Arc<AmdDevice>,
-    ) -> Result<Option<Box<dyn Graph>>> {
-        // Own a shared `PoolQueue` and pre-size its scratch for the biggest
-        // kernel, so no replay triggers a mid-chain scratch grow.
-        let owner = dev.core().assign_owner(allocator)?;
-        let mut max_priv_seg = 128u32;
-        for p in &progs {
-            max_priv_seg = max_priv_seg.max(p.private_segment_size());
+        let mut system = SystemPatchValues::default();
+        for (slot, signal) in signals.iter().enumerate() {
+            system.0.insert(SystemField::Timestamp((slot * 2) as u32), signal.start_ts_addr());
+            system.0.insert(SystemField::Timestamp((slot * 2 + 1) as u32), signal.end_ts_addr());
         }
-        owner.pool().ensure_has_local_memory(max_priv_seg)?;
-
-        // One 16-byte-aligned kernarg slot per kernel in a dedicated page,
-        // validated against each program's arity (mirrors the AQL path).
-        let mut slot_offsets: Vec<usize> = Vec::with_capacity(kernels.len());
-        let mut total = 0usize;
-        for (k, p) in kernels.iter().zip(&progs) {
-            let (buf_count, var_count) = p.arg_counts();
-            if k.buffers.len() != buf_count {
-                return Err(Error::Runtime {
-                    message: format!(
-                        "AmdGraphPm4 capture: kernel '{}' expects {buf_count} buffers, got {}",
-                        k.program.name(),
-                        k.buffers.len()
-                    ),
-                });
+        match self.native {
+            NativeGraph::Aql => {
+                let control = profile.control.as_ref().expect("profile AQL graph control");
+                let ReplayState { profile_command, profile_control, .. } = &mut *state;
+                let finalizer = lane.queue().replay_linked_aql_timeline(
+                    lane.pool(),
+                    &profile.linked,
+                    profile_command.as_mut().expect("profile graph command"),
+                    &control.linked,
+                    profile_control.as_mut().expect("profile AQL graph control replay"),
+                    control.host,
+                    &RuntimePatchValues::default(),
+                    &mut system,
+                )?;
+                self.owner.set_newest(finalizer);
             }
-            if k.vals.len() != var_count {
-                return Err(Error::Runtime {
-                    message: format!(
-                        "AmdGraphPm4 capture: kernel '{}' expects {var_count} vals, got {}",
-                        k.program.name(),
-                        k.vals.len()
-                    ),
-                });
+            NativeGraph::Pm4 => {
+                let resident = profile.control.as_ref().expect("profile PM4 graph resident command buffer");
+                let command = state.profile_command.as_mut().expect("profile graph command");
+                let finalizer = lane.queue().replay_linked_pm4(
+                    lane.pool(),
+                    &profile.linked,
+                    command,
+                    resident.host,
+                    resident.gpu,
+                    &RuntimePatchValues::default(),
+                    &mut system,
+                )?;
+                self.owner.set_newest(finalizer);
             }
-            slot_offsets.push(total);
-            total += p.kernarg_record_size().next_multiple_of(16);
         }
-        let kernargs_buf = allocator.alloc_uncached(total.max(16))?;
-        let (kernargs_gpu, kernargs_host) = match &kernargs_buf {
-            RawBuffer::AmdDevice { gpu_addr, host_ptr: Some(h), .. } => (*gpu_addr, h.as_ptr()),
-            _ => return Err(Error::NotHostVisible { what: "graph kernargs" }),
-        };
-
-        // Bake each kernel's kernarg slot once and record its geometry/identity.
-        let mut baked: Vec<GraphKernelPm4> = Vec::with_capacity(kernels.len());
-        for ((k, p), &off) in kernels.iter().zip(&progs).zip(&slot_offsets) {
-            // SAFETY: off + record <= total <= allocation; sole writer.
-            let slot_host = unsafe { kernargs_host.add(off) };
-            let slot_gpu = kernargs_gpu + off as u64;
-            let bufs: Vec<u64> = k.buffers.iter().map(|&b| b as u64).collect();
-            // SAFETY: slot_host owns >= kernarg_record_size() bytes (laid out above).
-            unsafe { p.write_kernargs(slot_host, &bufs, &k.vals)? };
-
-            // PM4 launch geometry matches `execute_on`'s PM4 arm: `grid` is the
-            // workgroup count (`global_size`), `local` the workgroup size — NOT
-            // the AQL `grid = global*local` convention.
-            let g = k.global_size.unwrap_or([1, 1, 1]);
-            let l = k.local_size.unwrap_or([1, 1, 1]);
-            let (rsrc1, rsrc2, rsrc3) = p.rsrc();
-            let (wave32, target_major) = p.wave32_target();
-            baked.push(GraphKernelPm4 {
-                rsrc1,
-                rsrc2,
-                rsrc3,
-                prog_addr: p.pm4_prog_addr(),
-                enable_private_segment_sgpr: p.enable_private_segment_sgpr(),
-                kernarg_user_data: [slot_gpu as u32, (slot_gpu >> 32) as u32],
-                local: [l[0] as u32, l[1] as u32, l[2] as u32],
-                grid: [g[0] as u32, g[1] as u32, g[2] as u32],
-                wave32,
-                target_major,
-            });
-        }
-
-        // Per-kernel hazard-barrier strength from `deps`: a kernel with an
-        // in-graph producer (RAW/WAW/WAR) does a FULL L2 invalidate to observe it;
-        // a kernel with no in-graph producer reads only resident/host-stable
-        // inputs (covered by the one IB-head HDP flush) so a NARROW per-CU acquire
-        // suffices. Correctness rests on `deps` being the COMPLETE in-graph hazard
-        // set (the GVA-keyed RAW/WAW/WAR walk in `ExecutionPlan::build_graph`).
-        //
-        // WRITE-THROUGH ASSUMPTION (load-bearing): inside the IB a producer ends
-        // with only `CS_PARTIAL_FLUSH` — there is NO per-kernel EOP cache flush
-        // (only the wrapping `replay_indirect_buffer` release_mem flushes). So the
-        // Full consumer's `acquire_mem(GL2_INV|GL2_WB)` is the ONLY thing making
-        // the producer's stores visible, which is correct ONLY because RDNA L0/L1
-        // are write-through to GL2 (producer stores have reached L2 by the time
-        // `CS_PARTIAL_FLUSH` drains). This holds on the gfx1151 target (matches the
-        // bit-identical transcript); a write-BACK part would need a producer-side
-        // GL2_WB on real RAW/WAW edges before the Full consumer.
-        let barriers: Vec<GraphBarrier> =
-            kernels.iter().map(|k| if k.deps.is_empty() { GraphBarrier::Narrow } else { GraphBarrier::Full }).collect();
-
-        // Assemble the IB once against the current (pre-sized) scratch.
-        let scratch_va = owner.pool().scratch_gpu_va();
-        let tmpring = owner.pool().tmpring_size();
-        let ib = Self::assemble_ib(&baked, &barriers, scratch_va, tmpring);
-        let ib_dwords = ib.len() as u32;
-        // Resident IB buffer (uncached GTT, CP-readable like the ring). Round the
-        // capacity to a page so a co-tenant scratch-grow rebuild has identical
-        // length headroom.
-        let ib_bytes = (ib.len() * 4).max(16).next_multiple_of(0x1000);
-        let ib_buf = allocator.alloc_uncached(ib_bytes)?;
-        let (ib_gpu, ib_host) = match &ib_buf {
-            RawBuffer::AmdDevice { gpu_addr, host_ptr: Some(h), .. } => (*gpu_addr, h.as_ptr()),
-            _ => {
-                kernargs_buf.free_amd_device_in_place();
-                return Err(Error::NotHostVisible { what: "graph IB" });
-            }
-        };
-        // SAFETY: ib_host owns ib_bytes >= ib.len()*4; sole writer at capture.
-        unsafe { std::ptr::copy_nonoverlapping(ib.as_ptr() as *const u8, ib_host, ib.len() * 4) };
-
-        if std::env::var_os("SVOD_DEBUG_DISPATCH").is_some() {
-            eprintln!(
-                "[graph capture pm4] kernels={} ib_dwords={ib_dwords} ib_gpu={ib_gpu:#x} kernargs_gpu={kernargs_gpu:#x} scratch={scratch_va:#x}",
-                kernels.len(),
-            );
-        }
-
-        Ok(Some(Box::new(AmdGraphPm4 {
-            owner,
-            kernels: baked,
-            barriers,
-            ib_buf,
-            ib_gpu,
-            ib_host,
-            ib_cap_dwords: (ib_bytes / 4) as u32,
-            kernargs_buf,
-            state: parking_lot::Mutex::new(Pm4IbState {
-                ib_dwords,
-                baked_scratch_va: scratch_va,
-                baked_tmpring: tmpring,
-            }),
-        })))
-    }
-
-    /// Assemble the full IB dword stream: one IB-head HDP-flush handshake (makes
-    /// all host writes to GTT — packed mel/lengths etc. — visible to the chain),
-    /// then each kernel's `[barrier]? + exec` (see `append_graph_kernel_pm4`).
-    fn assemble_ib(kernels: &[GraphKernelPm4], barriers: &[GraphBarrier], scratch_va: u64, tmpring: u32) -> Vec<u32> {
-        let mut ib: Vec<u32> = Vec::new();
-        // One global HDP flush up front: a host-data-path flush is GPU-wide (not
-        // per-buffer), so a single handshake makes every host-written input read
-        // anywhere in the chain visible — replacing the per-call path's per-kernel
-        // HDP flush, the dominant inline-IB overhead.
-        ib.extend_from_slice(&crate::amd::sys::pm4::hdp_flush());
-        for (k, &b) in kernels.iter().zip(barriers) {
-            append_graph_kernel_pm4(&mut ib, k, b, scratch_va, tmpring);
-        }
-        ib
-    }
-
-    /// Re-bake the IB against the live scratch VA when a co-tenant grew it after
-    /// capture (rare; pre-sizing avoids it). Called holding both the queue's
-    /// dispatch lock and the `state` guard, so the rewrite can't race a
-    /// concurrent grow or another replay. The IB length is invariant under a
-    /// scratch VA change, so this fits the original capacity.
-    fn rebuild_ib(&self, st: &mut Pm4IbState, scratch_va: u64, tmpring: u32) {
-        let ib = Self::assemble_ib(&self.kernels, &self.barriers, scratch_va, tmpring);
-        debug_assert!(ib.len() as u32 <= self.ib_cap_dwords, "rebuilt PM4 graph IB overflows its buffer");
-        let n = (ib.len() as u32).min(self.ib_cap_dwords) as usize;
-        // SAFETY: ib_host owns ib_cap_dwords*4 bytes; n <= ib_cap_dwords; sole
-        // writer under the held dispatch lock + `state` guard.
-        unsafe { std::ptr::copy_nonoverlapping(ib.as_ptr() as *const u8, self.ib_host, n * 4) };
-        st.ib_dwords = n as u32;
-        st.baked_scratch_va = scratch_va;
-        st.baked_tmpring = tmpring;
-    }
-}
-
-impl Graph for AmdGraphPm4 {
-    /// Replay the captured chain: one `PACKET3_INDIRECT_BUFFER` (wrapped in the
-    /// counter `wait`/`release_mem` discipline) + one doorbell. Async — host
-    /// reads drain via the owner's counter (`synchronize_all`), identical to
-    /// per-call PM4 `wait=false`.
-    ///
-    /// `vals` is unused: the captured chain is static (no runtime vars); launch
-    /// vals are baked into the kernarg slots at capture.
-    fn replay(&self, vals: &[i64]) -> Result<()> {
-        let _ = vals;
-        let pool = self.owner.pool();
-        if let Some(err) = pool.core().poison_error() {
-            return Err(err);
-        }
-        // Hold the dispatch lock across the whole op — same fence `dispatch_pm4`
-        // and `ensure_has_local_memory` use. This pins the queue's scratch VA for
-        // the duration (no co-tenant grow can slip in between the staleness check
-        // and the submit) and orders the counter reservation against co-tenants.
-        let _disp = pool.dispatch_guard();
-        let mut st = self.state.lock();
-        // If a co-tenant grew scratch since capture/last-replay, the baked
-        // descriptor VA is stale — re-bake the IB before submitting.
-        let live_scratch = pool.scratch_gpu_va();
-        let live_tmpring = pool.tmpring_size();
-        if live_scratch != st.baked_scratch_va || live_tmpring != st.baked_tmpring {
-            self.rebuild_ib(&mut st, live_scratch, live_tmpring);
-        }
-        let v = pool.queue().replay_indirect_buffer(pool, self.ib_gpu, st.ib_dwords)?;
-        drop(st);
-        self.owner.set_pm4_high(v);
-        Ok(())
+        self.owner.synchronize()?;
+        Ok(Some(signals.into_iter().map(|signal| signal as Arc<dyn crate::DispatchTimestamps>).collect()))
     }
 }
