@@ -610,6 +610,51 @@ pub fn pm_float_decomp() -> crate::TypedPatternMatcher<Fp8DecompCtx> {
     }
 }
 
+fn is_ocp_fp8(dtype: &DType) -> bool {
+    matches!(dtype.base(), ScalarDType::FP8E4M3 | ScalarDType::FP8E5M2)
+}
+
+fn widen_non_native_fp8(node: &Arc<UOp>) -> Option<Arc<UOp>> {
+    let float_dtype = || node.dtype().with_base(ScalarDType::Float32);
+    let widen = |source: &Arc<UOp>| source.cast(source.dtype().with_base(ScalarDType::Float32));
+    match node.op() {
+        Op::Unary(op, source) if is_ocp_fp8(&node.dtype()) => {
+            Some(UOp::new(Op::Unary(*op, widen(source)), float_dtype()).cast(node.dtype()))
+        }
+        Op::Binary(op, lhs, rhs) if is_ocp_fp8(&node.dtype()) => {
+            Some(UOp::new(Op::Binary(*op, widen(lhs), widen(rhs)), float_dtype()).cast(node.dtype()))
+        }
+        Op::Binary(op, lhs, rhs)
+            if node.dtype() == DType::Bool && is_ocp_fp8(&lhs.dtype()) && is_ocp_fp8(&rhs.dtype()) =>
+        {
+            Some(UOp::new(Op::Binary(*op, widen(lhs), widen(rhs)), DType::Bool))
+        }
+        Op::Ternary(svod_ir::TernaryOp::Where, condition, if_true, if_false) if is_ocp_fp8(&node.dtype()) => {
+            Some(UOp::try_where(condition.clone(), widen(if_true), widen(if_false)).ok()?.cast(node.dtype()))
+        }
+        Op::Ternary(op, first, second, third) if is_ocp_fp8(&node.dtype()) => Some(
+            UOp::new(Op::Ternary(*op, widen(first), widen(second), widen(third)), float_dtype()).cast(node.dtype()),
+        ),
+        Op::Cast { src, dtype } if is_ocp_fp8(dtype) && src.dtype().base() != ScalarDType::Float32 => {
+            Some(src.cast(src.dtype().with_base(ScalarDType::Float32)).cast(dtype.clone()))
+        }
+        Op::Cast { src, dtype } if is_ocp_fp8(&src.dtype()) && dtype.base() != ScalarDType::Float32 => {
+            Some(src.cast(src.dtype().with_base(ScalarDType::Float32)).cast(dtype.clone()))
+        }
+        _ => None,
+    }
+}
+
+/// AMD LLVM accepts OCP FP8 storage, conversions, and MFMA operands, but not
+/// ordinary FP8 ALU. Widen only those ALU/cast nodes, matching Tinygrad's
+/// `create_non_native_float_pats`; WMMA and memory nodes remain untouched.
+pub fn amd_non_native_fp8_patterns() -> &'static TypedPatternMatcher {
+    crate::cached_patterns! {
+        node if matches!(node.op(), Op::Unary(..) | Op::Binary(..) | Op::Ternary(..) | Op::Cast { .. })
+            => widen_non_native_fp8(node),
+    }
+}
+
 // ============================================================================
 // 64-bit integer decomposition
 // ============================================================================

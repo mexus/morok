@@ -37,8 +37,14 @@ fn test_amd_fp8_dtype_capabilities_are_arch_specific() {
 
     for arch in [AmdArch::Gfx942, AmdArch::Gfx950] {
         let renderer = Renderer::for_amd_arch(arch);
-        assert!(renderer.supports_dtype(ScalarDType::FP8E4M3), "{arch} must keep OCP FP8 native");
-        assert!(renderer.supports_dtype(ScalarDType::FP8E5M2), "{arch} must keep OCP BF8 native");
+        assert!(renderer.supports_storage_dtype(ScalarDType::FP8E4M3), "{arch} must keep OCP FP8 storage");
+        assert!(renderer.supports_storage_dtype(ScalarDType::FP8E5M2), "{arch} must keep OCP BF8 storage");
+        assert!(renderer.supports_conversion_dtype(ScalarDType::FP8E4M3), "{arch} must keep OCP FP8 conversion");
+        assert!(renderer.supports_conversion_dtype(ScalarDType::FP8E5M2), "{arch} must keep OCP BF8 conversion");
+        assert!(!renderer.supports_alu_dtype(ScalarDType::FP8E4M3), "{arch} must widen ordinary FP8 ALU");
+        assert!(!renderer.supports_alu_dtype(ScalarDType::FP8E5M2), "{arch} must widen ordinary BF8 ALU");
+        assert!(renderer.supports_matrix_dtype(ScalarDType::FP8E4M3), "{arch} must keep FP8 matrix operands");
+        assert!(renderer.supports_matrix_dtype(ScalarDType::FP8E5M2), "{arch} must keep BF8 matrix operands");
         assert!(!renderer.supports_dtype(ScalarDType::FP8E4M3FNUZ), "{arch} must decompose FNUZ FP8");
         assert!(!renderer.supports_dtype(ScalarDType::FP8E5M2FNUZ), "{arch} must decompose FNUZ BF8");
     }

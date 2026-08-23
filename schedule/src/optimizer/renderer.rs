@@ -148,7 +148,9 @@ pub struct Renderer {
     /// Exact operation table reported by the selected code renderer.
     renderer_ops: Option<RendererOps>,
 
-    /// Scalar storage/ALU formats accepted natively by this target.
+    /// Scalar storage and conversion formats accepted by this target. Matrix
+    /// support is described by `tensor_cores`; ordinary ALU support may be
+    /// narrower and is queried separately.
     supported_dtypes: std::collections::HashSet<ScalarDType>,
 }
 
@@ -522,6 +524,24 @@ impl Renderer {
 
     pub(crate) fn supports_dtype(&self, dtype: ScalarDType) -> bool {
         self.supported_dtypes.contains(&dtype)
+    }
+
+    pub fn supports_storage_dtype(&self, dtype: ScalarDType) -> bool {
+        self.supports_dtype(dtype)
+    }
+
+    pub fn supports_conversion_dtype(&self, dtype: ScalarDType) -> bool {
+        self.supports_dtype(dtype)
+    }
+
+    pub fn supports_alu_dtype(&self, dtype: ScalarDType) -> bool {
+        self.supports_dtype(dtype)
+            && !(matches!(self.device, RendererDevice::AmdCdna3 | RendererDevice::AmdCdna4)
+                && matches!(dtype, ScalarDType::FP8E4M3 | ScalarDType::FP8E5M2))
+    }
+
+    pub fn supports_matrix_dtype(&self, dtype: ScalarDType) -> bool {
+        self.tensor_cores.iter().any(|tensor_core| tensor_core.dtype_in.base() == dtype)
     }
 
     pub(crate) fn supported_dtypes(&self) -> std::collections::HashSet<ScalarDType> {

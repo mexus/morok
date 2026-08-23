@@ -154,6 +154,10 @@ impl Renderer for AmdRendererWrapper {
         // This matcher only handles Morok's additional transcendental ops.
         Some(svod_ir::decompositions::amd_decomposition_patterns())
     }
+
+    fn extra_matcher(&self) -> Option<svod_ir::pattern::TypedPatternMatcher<()>> {
+        Some(svod_codegen::llvm::amd_extra_matcher())
+    }
 }
 
 struct AmdCompiler {

@@ -142,7 +142,7 @@ fn render_amd_linearized(root: &std::sync::Arc<svod_ir::UOp>, arch: AmdArch, nam
     let optimizer_renderer = svod_schedule::OptimizerRenderer::for_amd_arch(arch).with_rewrite_capabilities(
         svod_ir::RendererOps::all(),
         code_renderer.decompositor(),
-        None,
+        Some(crate::llvm::amd_extra_matcher()),
     );
     let lowered = svod_schedule::apply_post_optimization_with_renderer(root.clone(), &optimizer_renderer)
         .expect("post optimization");
@@ -192,6 +192,30 @@ fn amd_uses_ocml_and_contract_only_float_flags() {
     assert!(rendered.code.contains("call float @__ocml_exp2_f32"), "missing OCML call:\n{}", rendered.code);
     assert!(rendered.code.contains("fdiv contract float"), "missing contract-only fdiv:\n{}", rendered.code);
     assert!(!rendered.code.contains(" arcp "), "AMD must not permit approximate reciprocal:\n{}", rendered.code);
+}
+
+#[test]
+fn amd_cdna_ordinary_fp8_alu_widens_without_changing_storage() {
+    for arch in [AmdArch::Gfx942, AmdArch::Gfx950] {
+        for dtype in [DType::FP8E4M3, DType::FP8E5M2] {
+            let input = UOp::param(0, 2, dtype.clone(), None);
+            let output = UOp::param(1, 1, dtype.clone(), None);
+            let first = UOp::index().buffer(input.clone()).indices(vec![UOp::native_const(0i32)]).call().unwrap();
+            let second = UOp::index().buffer(input).indices(vec![UOp::native_const(1i32)]).call().unwrap();
+            let output = UOp::index().buffer(output).indices(vec![UOp::native_const(0i32)]).call().unwrap();
+            let first = UOp::load().index(first).call();
+            let second = UOp::load().index(second).call();
+            let value = first.try_add(&second).unwrap().try_mul(&second).unwrap();
+            let rendered = render_amd_linearized(&UOp::sink(vec![output.store(value)]), arch, "amd_fp8_alu");
+
+            assert!(rendered.code.lines().any(|line| line.contains("fadd contract float")), "{}", rendered.code);
+            assert!(rendered.code.lines().any(|line| line.contains("fmul contract float")), "{}", rendered.code);
+            assert!(!rendered.code.contains("fadd contract i8"), "{}", rendered.code);
+            assert!(!rendered.code.contains("fmul contract i8"), "{}", rendered.code);
+            assert!(rendered.code.contains("load <2 x i8>") && rendered.code.contains("store i8"), "{}", rendered.code);
+            assert_amd_ir_compiles(&rendered.code, arch.mcpu());
+        }
+    }
 }
 
 #[test]
@@ -545,6 +569,7 @@ fn amd_wmma_fp8_packs_operands_to_i64() {
             result.code
         );
         assert_llvm_ir_assembles(&result.code);
+        assert_amd_ir_compiles(&result.code, arch.mcpu());
     }
 }
 
@@ -566,6 +591,7 @@ fn amd_wmma_gfx950_scaled_fp8_uses_i32_vectors_and_scale_immediates() {
         result.code
     );
     assert_llvm_ir_assembles(&result.code);
+    assert_amd_ir_compiles(&result.code, AmdArch::Gfx950.mcpu());
 }
 
 /// Pipe `ir` through an `llvm-as` on PATH and assert it parses. Skips (returns)
