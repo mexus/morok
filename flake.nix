@@ -82,20 +82,8 @@
           clang
         ];
 
-        mlirSysPrefix = pkgs.symlinkJoin {
-          name = "mlir-sys-prefix";
-          paths = [
-            llvm.llvm.dev # llvm-config, LLVM headers
-            llvm.llvm.lib # LLVM libraries
-            llvm.mlir # MLIR libraries (libMLIR*)
-            llvm.mlir.dev # MLIR headers (mlir-c/)
-          ];
-        };
-
         commonArgs = {
           inherit src nativeBuildInputs;
-          MLIR_SYS_210_PREFIX = "${mlirSysPrefix}";
-          TABLEGEN_210_PREFIX = "${mlirSysPrefix}";
           LIBCLANG_PATH = "${pkgs.libclang.lib}/lib/";
           ONNX_TEST_DATA = "${onnxTestData}/onnx/backend/test/data";
           # cc-wrapper appends NIX_HARDENING_ENABLE flags to *every* clang call,

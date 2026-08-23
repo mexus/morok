@@ -30,6 +30,3 @@ svod-schedule = { path = "../schedule", version = "=0.1.0-alpha.3", features = [
   "testing",
 ] }
 svod-runtime = { path = "../runtime" }
-
-[features]
-mlir = ["svod-tensor/mlir"]

@@ -16,9 +16,8 @@ let code = render(&kernel_graph, backend)?;
 |---------|--------|---------|---------|
 | **Clang** | C source → `clang -c` → JIT ELF loader | always | yes |
 | **LLVM JIT** | LLVM IR text → `clang -x ir` → JIT ELF loader | always | no |
-| **MLIR** | MLIR (arith/scf/llvm dialects) → MLIR ExecutionEngine | `mlir` | no |
 
-Select at runtime via `SVOD_CPU_BACKEND` env var (`clang`, `llvm`, `mlir`).
+Select at runtime via `SVOD_CPU_BACKEND` env var (`clang` or `llvm`).
 
 **Planned:**
 

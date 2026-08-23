@@ -28,7 +28,6 @@ strum = { version = "0.28.0", features = ["derive"] }
 
 [features]
 default = []
-mlir = ["svod-runtime/mlir"]
 # Enable trace-level spans in hot paths (compile-time control)
 tracing-verbose = []
 

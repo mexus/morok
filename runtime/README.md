@@ -17,9 +17,8 @@ kernel.execute(&[buf_a.ptr(), buf_b.ptr(), buf_out.ptr()])?;
 |---------|-------------|---------|
 | **Clang** (default) | Compiles C via `clang -c`, loads via JIT ELF loader | always |
 | **LLVM JIT** | Compiles LLVM IR via `clang -x ir`, loads via JIT ELF loader | always |
-| **MLIR** | Lowers MLIR dialects to LLVM, JIT via MLIR ExecutionEngine | `mlir` |
 
-Select at runtime: `SVOD_CPU_BACKEND=clang|llvm|mlir`
+Select at runtime: `SVOD_CPU_BACKEND=clang|llvm`
 
 **Planned:**
 
