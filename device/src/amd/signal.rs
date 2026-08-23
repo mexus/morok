@@ -23,7 +23,10 @@ use crate::sync::TimelineSignal;
 /// Spin / yield budget before escalating to a KFD WAIT_EVENTS sleep: cheap
 /// polling for short waits, kernel blocking for long ones so a stalled wait
 /// doesn't pin a CPU.
+#[cfg(not(test))]
 const WAIT_EVENTS_ESCALATE_MS: u64 = 200;
+#[cfg(test)]
+const WAIT_EVENTS_ESCALATE_MS: u64 = 1;
 
 /// 64-byte slot laid out as an `amd_signal_t` (kind@0, value@8). The AQL packet
 /// processor reads a dispatch packet's `completion_signal.handle` as the struct
@@ -130,6 +133,9 @@ impl AmdSignal {
         let mut start = std::time::Instant::now();
         let mut prev = u64::MAX;
         loop {
+            if let Some(error) = self.device.upgrade().and_then(|device| device.poison_error()) {
+                return Err(error);
+            }
             let v = self.load();
             if ready(v) {
                 return Ok(());
@@ -151,7 +157,7 @@ impl AmdSignal {
                     waited_ms: timeout_ms,
                 }));
             }
-            if let Some(fault) = self.spin_or_escalate(start) {
+            if let Some(fault) = self.spin_or_escalate(start)? {
                 return Err(fault);
             }
         }
@@ -185,12 +191,11 @@ impl AmdSignal {
     /// wakes us when the device's `queue_event` fires, eliminating CPU burn
     /// for stalled or long-running dispatches.
     ///
-    /// Returns `Some(Error)` when KFD reports a GPU fault during the kernel
-    /// wait so callers can break out of the spin immediately. `None` for
-    /// normal wake-ups (queue_event fired, WAIT_EVENTS timed out internally,
-    /// device dropped, or the pure spin/yield path).
+    /// Returns the typed `WAIT_EVENTS` failure directly. Otherwise, `Some`
+    /// carries a reported GPU fault and `None` means a normal wake-up, timeout,
+    /// dropped device, or the pure spin/yield path.
     #[inline]
-    fn spin_or_escalate(&self, start: std::time::Instant) -> Option<Error> {
+    fn spin_or_escalate(&self, start: std::time::Instant) -> Result<Option<Error>> {
         let elapsed_ms = start.elapsed().as_millis() as u64;
         if elapsed_ms >= WAIT_EVENTS_ESCALATE_MS
             && let Some(dev) = self.device.upgrade()
@@ -202,15 +207,16 @@ impl AmdSignal {
             // here so we bail with the actual error instead of grinding
             // through the rest of the timeout.
             match dev.wait_events(WAIT_EVENTS_ESCALATE_MS as u32) {
-                Ok(Some(fault)) => return Some(fault),
-                Ok(None) | Err(_) => return None,
+                Ok(Some(fault)) => return Ok(Some(fault)),
+                Ok(None) => return Ok(None),
+                Err(error) => return Err(error),
             }
         }
         std::hint::spin_loop();
         if start.elapsed().as_micros() >= 100 {
             std::thread::yield_now();
         }
-        None
+        Ok(None)
     }
 }
 

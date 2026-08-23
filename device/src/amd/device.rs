@@ -209,6 +209,44 @@ impl std::ops::Deref for AmdDevice {
 }
 
 impl AmdDevice {
+    /// Build a host-only device around a synthetic topology node and backend.
+    /// This deliberately bypasses the device cache, KFD, and process-global
+    /// event-page setup so lifecycle tests can exercise the core on any host.
+    #[cfg(test)]
+    pub(crate) fn synthetic(iface: Arc<dyn crate::amd::iface::AmdIface>) -> Arc<Self> {
+        let node = AmdNode {
+            node_id: 0,
+            gpu_id: 1,
+            drm_render_minor: 0,
+            gfx_target_version: 110_000,
+            simd_count: 4,
+            array_count: 1,
+            simd_arrays_per_engine: 1,
+            simd_per_cu: 4,
+            max_waves_per_simd: 8,
+            lds_size_in_kb: 64,
+            wave_front_size: 32,
+            num_xcc: 1,
+            num_cp_queues: 1,
+            max_slots_scratch_cu: 32,
+        };
+        let core = Arc::new(AmdDeviceCore {
+            node,
+            arch: AmdArch::Gfx1100,
+            iface,
+            has_sdma_queue: AtomicBool::new(false),
+            pm4_graph: AtomicBool::new(false),
+            poisoned: AtomicBool::new(false),
+            error_msg: OnceLock::new(),
+            connectors: parking_lot::Mutex::new(Vec::new()),
+            signal_pool: OnceLock::new(),
+            copy_queue: OnceLock::new(),
+            queue_pool: crate::amd::connector::QueuePool::new(1),
+            hw_queues: 1,
+        });
+        Arc::new(Self { core })
+    }
+
     /// Open the `device_id`-th GPU node.
     ///
     /// Returns:
@@ -432,13 +470,28 @@ impl AmdDeviceCore {
     /// Returns `Ok(None)` for normal wake-ups (queue_event fired, timeout,
     /// or no event yet).
     pub fn wait_events(&self, timeout_ms: u32) -> Result<Option<Error>> {
-        let r = self.iface.wait_events(timeout_ms)?;
-        // Poison with the bare fault message (not `Error::Display`, which would
-        // prepend "runtime error: "). The backend already built the rich string.
-        if let Some(Error::Runtime { message }) = &r {
-            self.poison(message);
+        match self.iface.wait_events(timeout_ms) {
+            Ok(fault) => {
+                if let Some(error) = &fault {
+                    self.poison_error_message(error);
+                }
+                Ok(fault)
+            }
+            Err(error) => {
+                // Preserve the backend's typed error for the waiter that
+                // observed it, while making every other owner fail fast.
+                self.poison_error_message(&error);
+                Err(error)
+            }
         }
-        Ok(r)
+    }
+
+    fn poison_error_message(&self, error: &Error) {
+        match error {
+            // Avoid doubling the Runtime display prefix in future failures.
+            Error::Runtime { message } => self.poison(message),
+            _ => self.poison(&error.to_string()),
+        }
     }
 
     /// `true` once a fault/timeout has poisoned the device. Hot-path gate.
@@ -472,9 +525,9 @@ impl AmdDeviceCore {
         // pre-refactor contract: ioctl error / no fault → `None`; fault →
         // poison with the bare message + return `Some`.
         match self.iface.wait_events(0) {
-            Ok(Some(Error::Runtime { message })) => {
-                self.poison(&message);
-                Some(Error::Runtime { message })
+            Ok(Some(error)) => {
+                self.poison_error_message(&error);
+                Some(error)
             }
             _ => None,
         }

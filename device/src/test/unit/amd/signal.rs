@@ -1,8 +1,18 @@
-use super::test_support::amd_alloc_or_skip;
+use super::test_support::{MockAmdCall, MockAmdIface, amd_alloc_or_skip};
+use crate::amd::AmdAllocator;
 use crate::amd::signal::*;
 use crate::error::Error;
 use crate::sync::TimelineSignal;
 use std::sync::Arc;
+
+fn mock_signal() -> (Arc<MockAmdIface>, Arc<crate::amd::AmdDevice>, Arc<SignalPool>, Arc<AmdSignal>) {
+    let iface = Arc::new(MockAmdIface::default());
+    let device = iface.device();
+    let allocator = AmdAllocator { dev: Arc::clone(&device), device_id: 0 };
+    let pool = SignalPool::new(&allocator, 1).expect("mock signal pool");
+    let signal = Arc::new(pool.acquire().expect("mock signal"));
+    (iface, device, pool, signal)
+}
 
 /// Live pool round-trip on real hardware (skipped when no supported AMD
 /// GPU is present).
@@ -65,4 +75,49 @@ fn released_signal_slot_is_reset_before_reuse() {
     let reused = pool.acquire().expect("reacquire");
     assert_eq!(reused.slot(), slot);
     assert_eq!(reused.value(), 0);
+}
+
+#[test]
+fn wait_events_error_stays_typed_and_poisons_owner() {
+    let (iface, device, _pool, signal) = mock_signal();
+    iface.script_wait(Err(Error::AmdIoctl { ioctl: "AMDKFD_IOC_WAIT_EVENTS", errno: 5 }));
+
+    let error = signal.wait(1, 10_000).expect_err("scripted wait failure");
+    assert!(matches!(error, Error::AmdIoctl { ioctl: "AMDKFD_IOC_WAIT_EVENTS", errno: 5 }));
+    assert!(device.is_poisoned());
+    assert!(matches!(device.poison_error(), Some(Error::Runtime { message }) if message.contains("WAIT_EVENTS")));
+    assert_eq!(iface.transcript().iter().filter(|call| matches!(call, MockAmdCall::WaitEvents { .. })).count(), 1);
+}
+
+#[test]
+fn poisoned_owner_wakes_active_signal_waiter() {
+    let (iface, device, _pool, signal) = mock_signal();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let waiter = std::thread::spawn(move || tx.send(signal.wait(1, 60_000)).unwrap());
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    while !iface.transcript().iter().any(|call| matches!(call, MockAmdCall::WaitEvents { .. })) {
+        assert!(std::time::Instant::now() < deadline, "waiter never entered event polling");
+        std::thread::yield_now();
+    }
+    device.poison("concurrent synthetic fault");
+    let error = rx
+        .recv_timeout(std::time::Duration::from_secs(1))
+        .expect("poisoned waiter did not wake")
+        .expect_err("poisoned waiter must fail");
+    assert!(matches!(error, Error::Runtime { message } if message == "concurrent synthetic fault"));
+    waiter.join().unwrap();
+}
+
+#[test]
+fn future_signal_wait_fails_without_another_backend_wait() {
+    let (iface, _device, _pool, signal) = mock_signal();
+    iface.script_wait(Err(Error::AmdIoctl { ioctl: "AMDKFD_IOC_WAIT_EVENTS", errno: 19 }));
+    assert!(matches!(signal.wait(1, 10_000), Err(Error::AmdIoctl { ioctl: "AMDKFD_IOC_WAIT_EVENTS", errno: 19 })));
+    let waits_before = iface.transcript().iter().filter(|call| matches!(call, MockAmdCall::WaitEvents { .. })).count();
+
+    let error = signal.wait(1, 10_000).expect_err("poison must fail before polling");
+    assert!(matches!(error, Error::Runtime { message } if message.contains("WAIT_EVENTS")));
+    let waits_after = iface.transcript().iter().filter(|call| matches!(call, MockAmdCall::WaitEvents { .. })).count();
+    assert_eq!(waits_after, waits_before, "future wait reached the backend despite device poison");
 }

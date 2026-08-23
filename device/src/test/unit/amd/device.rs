@@ -1,6 +1,10 @@
 use crate::amd::device::*;
+use crate::amd::iface::{AmdIface, QueueTeardown, RingDesc};
 use crate::error::Error;
+use std::sync::Arc;
 use svod_dtype::AmdArch;
+
+use super::test_support::{MockAmdCall, MockAmdIface};
 
 /// On hosts without `/dev/kfd` (or without a supported GPU), `open` must
 /// surface a clean `Err` — never panic.
@@ -66,4 +70,44 @@ fn pack_tmpring_wavesize_width_by_arch() {
     assert_eq!(pack_tmpring(1, 0x3FFFF, &AmdArch::Gfx1100) >> 12, 0x7FFF);
     assert_eq!(pack_tmpring(1, 0x3FFFF, &AmdArch::Gfx1200) >> 12, 0x3FFFF);
     assert_eq!(pack_tmpring(0xABC, 0, &AmdArch::Gfx1100) & 0xFFF, 0xABC);
+}
+
+#[test]
+fn mock_queue_setup_and_teardown_are_accounted_and_scripted() {
+    let iface = Arc::new(MockAmdIface::default());
+    let _device = iface.device();
+    let desc = RingDesc {
+        ring_gpu: 0x1000,
+        gart_gpu: 0x2000,
+        wptr_offset: 0,
+        rptr_offset: 8,
+        eop_gpu: 0,
+        eop_size: 0,
+        ctx_gpu: 0,
+        ctx_save_restore_size: 0,
+        ctl_stack_size: 0,
+        ring_size: 0x4000,
+        gpu_id: 1,
+        queue_type: 2,
+    };
+
+    iface.script_setup(Err(Error::AmdIoctl { ioctl: "mock setup", errno: 5 }));
+    assert!(matches!(iface.setup_ring(&desc), Err(Error::AmdIoctl { ioctl: "mock setup", errno: 5 })));
+    let queue = iface.setup_ring(&desc).expect("default setup");
+    assert_eq!(queue.doorbell_base.as_ptr() as usize % 0x1000, 0);
+    assert_eq!(iface.queue_setup_count(), 1);
+    assert_eq!(iface.live_queue_count(), 1);
+
+    iface.script_teardown(Err(Error::AmdIoctl { ioctl: "mock teardown", errno: 16 }));
+    assert!(matches!(
+        iface.teardown_ring(queue.queue_id, queue.doorbell_base),
+        Err(Error::AmdIoctl { ioctl: "mock teardown", errno: 16 })
+    ));
+    assert_eq!(iface.live_queue_count(), 1);
+    iface.script_teardown(Ok(QueueTeardown::Complete));
+    assert_eq!(iface.teardown_ring(queue.queue_id, queue.doorbell_base).unwrap(), QueueTeardown::Complete);
+    assert_eq!(iface.queue_teardown_count(), 1);
+    assert_eq!(iface.live_queue_count(), 0);
+    assert_eq!(iface.transcript().iter().filter(|call| matches!(call, MockAmdCall::SetupRing { .. })).count(), 2);
+    assert_eq!(iface.transcript().iter().filter(|call| matches!(call, MockAmdCall::TeardownRing { .. })).count(), 2);
 }
