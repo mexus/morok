@@ -222,6 +222,7 @@ pub struct RangeifyResult {
 ///
 /// # Pipeline
 ///
+/// **Pre-stage**: multi_pm + supported-subset validation, then add_tags
 /// **Stage 0**: Range assignment (run_rangeify)
 /// **Stage 1**: movement_op_patterns (BOTTOM_UP) - Early movement ops
 /// **Stage 2**: pm_load_collapse - Collapse load tensor indexing
@@ -232,11 +233,24 @@ pub struct RangeifyResult {
 #[allow(clippy::mutable_key_type)]
 #[tracing::instrument(skip_all)]
 pub fn rangeify_with_map(sink: Arc<UOp>) -> svod_ir::Result<RangeifyResult> {
+    // Resolve the exact hardware-independent multi subset before tags capture
+    // tensor identity and before range assignment can materialize its sources.
+    let t_stage = std::time::Instant::now();
+    svod_ir::dump_canonical_stage("pre_multi", &sink);
+    let mut sink = crate::rewrite::graph_rewrite_preserve_calls(&crate::multi::multi_pm(), sink, &mut ());
+    svod_ir::dump_canonical_stage("post_multi", &sink);
+    crate::multi::validate_supported_subset(&sink)?;
+    tracing::debug!(
+        uop.tree = sink.tree(),
+        node_count = sink.node_count(),
+        elapsed_ms = t_stage.elapsed().as_millis() as u64,
+        "pre-rangeify multi-device resolution complete"
+    );
     // add_tags: assign sequential integer tags to UOps.
-    // MUST run FIRST — tags track tensor identity through the entire pipeline.
+    // Tags track tensor identity after shard-local structure is normalized.
     let t_stage = std::time::Instant::now();
     let mut tag_ctx = AddTagsCtx::new();
-    let mut sink = crate::rewrite::graph_rewrite_bottom_up_preserve_calls(&add_tags_patterns(), sink, &mut tag_ctx);
+    sink = crate::rewrite::graph_rewrite_bottom_up_preserve_calls(&add_tags_patterns(), sink, &mut tag_ctx);
     let output_tag_order: HashMap<usize, usize> = match sink.op() {
         Op::Sink { sources, .. } => sources
             .iter()
@@ -259,6 +273,7 @@ pub fn rangeify_with_map(sink: Arc<UOp>) -> svod_ir::Result<RangeifyResult> {
     // resolve_function before heavy range/movement stages.
     let t_stage = std::time::Instant::now();
     sink = resolve_calls(sink)?;
+    crate::multi::validate_supported_subset(&sink)?;
     tracing::debug!(
         node_count = sink.node_count(),
         elapsed_ms = t_stage.elapsed().as_millis() as u64,

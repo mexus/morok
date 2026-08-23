@@ -218,6 +218,36 @@ pub enum Error {
     /// STORE node reached range assignment with no inferable shape.
     #[snafu(display("STORE node id={uop_id} has no inferable index shape during range assignment"))]
     StoreMissingShape { uop_id: u64 },
+
+    /// MULTI layouts on one operation disagree and would require resharding.
+    #[snafu(display(
+        "unsupported MULTI layout: {operation} has mismatched shard axes {axes:?}; resharding metadata is unavailable"
+    ))]
+    MultiAxisMismatch { operation: &'static str, axes: Vec<usize> },
+
+    /// A MULTI wraps another MULTI, which represents unsupported multi-axis sharding.
+    #[snafu(display("unsupported nested MULTI at axis {axis}; multi-axis sharding metadata is unavailable"))]
+    MultiNested { axis: usize },
+
+    /// A movement cannot be proven to preserve the represented shard boundary.
+    #[snafu(display("unsupported {operation} across MULTI axis {axis}: {reason}"))]
+    MultiMovementUnsupported { operation: &'static str, axis: usize, reason: &'static str },
+
+    /// A reduction crosses the shard axis and therefore requires a collective.
+    #[snafu(display(
+        "unsupported reduction across MULTI axis {axis}: all-reduce lowering is not implemented at this compiler boundary"
+    ))]
+    MultiReductionAcrossShardAxis { axis: usize },
+
+    /// A non-scalar operand has no representable layout relative to a MULTI operand.
+    #[snafu(display(
+        "unsupported {operation} with MULTI axis {axis}: non-scalar operand id={source_id} has no shard layout; per-shard subviews require shard-range metadata"
+    ))]
+    MultiLayoutMissing { operation: &'static str, axis: usize, source_id: u64 },
+
+    /// A MULTI or MSELECT form survived the supported pre-rangeify rewrites.
+    #[snafu(display("unsupported multi-device form {operation}: {reason}"))]
+    MultiUnsupported { operation: &'static str, reason: &'static str },
 }
 
 /// Enhance an error with provenance information for a UOp.

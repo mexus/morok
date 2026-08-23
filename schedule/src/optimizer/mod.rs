@@ -1151,7 +1151,6 @@ fn pm_mod_to_idiv() -> &'static crate::TypedPatternMatcher {
 /// These stages run BEFORE heuristic/beam optimization, per-kernel.
 ///
 /// Stages:
-/// 0. Exact in-kernel multi-device resolution (`multi_pm`)
 /// 1. Movement ops (`pm_mops`, bottom-up)
 /// 2. Load collapse (`pm_load_collapse`)
 /// 3. Split ranges + flatten (`pm_split_ranges + pm_flatten_range`)
@@ -1163,23 +1162,15 @@ fn pm_mod_to_idiv() -> &'static crate::TypedPatternMatcher {
 pub fn apply_pre_optimization(ast: Arc<svod_ir::UOp>) -> Result<Arc<svod_ir::UOp>, OptError> {
     tracing::debug!(ast.initial = ast.tree(), node_count = ast.node_count(), "kernel initial");
 
-    // Tinygrad full_rewrite_to_sink verifies the original tensor/kernel DAG at
-    // this exact boundary, before multi_pm or any preprocessing can hide an
-    // invalid target form.
+    // Tinygrad full_rewrite_to_sink verifies the original kernel DAG at this
+    // boundary before per-kernel preprocessing.
     if crate::spec::spec_enabled() {
         crate::spec::type_verify(&ast, &crate::spec::spec_tensor()).map_err(|source| OptError::Spec { source })?;
     }
 
     use crate::rangeify::transforms::SplitRangesContext;
 
-    let t_stage = std::time::Instant::now();
-    let mut sink = graph_rewrite(&crate::multi::multi_pm(), ast, &mut ());
-    tracing::debug!(
-        ast.pre = sink.tree(),
-        node_count = sink.node_count(),
-        elapsed_ms = t_stage.elapsed().as_millis() as u64,
-        "pre-opt: in-kernel multi-device resolution complete"
-    );
+    let mut sink = ast;
 
     let t_stage = std::time::Instant::now();
     use crate::rangeify::patterns::movement_op_patterns;
