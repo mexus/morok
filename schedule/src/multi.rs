@@ -6,7 +6,9 @@
 
 use std::sync::Arc;
 
-use svod_ir::{ConstValue, Op, UOp};
+use smallvec::{SmallVec, smallvec};
+use svod_dtype::{DType, ScalarDType};
+use svod_ir::{CallInfo, ConstValue, CustomFunctionKind, Op, ReduceOp, UOp};
 
 use crate::TypedPatternMatcher;
 
@@ -84,7 +86,40 @@ fn reduce_axis_multi(root: &Arc<UOp>, multi: &Arc<UOp>) -> Option<Arc<UOp>> {
     let Op::ReduceAxis { reduce_op, axes, .. } = root.op() else { return None };
     let (local, axis) = multi_axis(multi)?;
     if axes.contains(&axis) {
-        return None;
+        if !matches!(reduce_op, ReduceOp::Add | ReduceOp::Max) {
+            return None;
+        }
+        let Op::MStack { buffers } = local.op() else { return None };
+        if buffers.len() < 2 {
+            return None;
+        }
+        let device = buffers.first()?.device_spec()?;
+        let mut local_reductions = SmallVec::with_capacity(buffers.len());
+        let widen_dtype = buffers
+            .iter()
+            .map(|shard| match shard.op() {
+                Op::Cast { src, .. } if [DType::Float16, DType::BFloat16].contains(&src.dtype()) => Some(src.dtype()),
+                _ => None,
+            })
+            .collect::<Option<Vec<_>>>()
+            .and_then(|dtypes| dtypes.iter().all(|dtype| dtype == &dtypes[0]).then(|| dtypes[0].clone()));
+
+        for shard in buffers {
+            let reduced = UOp::new(
+                Op::ReduceAxis { src: shard.clone(), reduce_op: *reduce_op, axes: axes.clone() },
+                root.dtype(),
+            );
+            local_reductions.push(match &widen_dtype {
+                Some(dtype) => reduced.cast(dtype.clone()),
+                None => reduced,
+            });
+        }
+        let collective = UOp::allreduce(UOp::mstack(local_reductions), device, *reduce_op);
+        let result = match widen_dtype {
+            Some(_) => collective.cast(root.dtype()),
+            None => collective,
+        };
+        return Some(result.rtag(root.tag().clone()));
     }
     let output_axis = axis - axes.iter().filter(|&&reduced_axis| reduced_axis < axis).count();
     Some(
@@ -93,6 +128,57 @@ fn reduce_axis_multi(root: &Arc<UOp>, multi: &Arc<UOp>) -> Option<Arc<UOp>> {
             output_axis,
         )
         .rtag(root.tag().clone()),
+    )
+}
+
+fn lower_host_allreduce(root: &Arc<UOp>) -> Option<Arc<UOp>> {
+    let Op::AllReduce { src, device, reduce_op } = root.op() else { return None };
+    if !matches!(reduce_op, ReduceOp::Add | ReduceOp::Max) {
+        return None;
+    }
+    let Op::MStack { buffers } = src.op() else { return None };
+    if buffers.len() < 2 || buffers.iter().any(|buffer| buffer.device_spec().is_none()) {
+        return None;
+    }
+    // DeviceSpec cannot represent Tinygrad's tuple-valued collective target.
+    // This subset returns one result on the first shard's device.
+    if buffers.first()?.device_spec().as_ref() != Some(device) {
+        return None;
+    }
+
+    // Host staging reads every shard before publishing, so shard zero is a safe
+    // in-place destination and provides a concrete schedule allocation.
+    let output = buffers[0].clone();
+    let mut args = SmallVec::with_capacity(buffers.len() + 1);
+    args.push(output.clone());
+    args.extend(buffers.iter().map(|buffer| buffer.contiguous()));
+    let mut formals = smallvec![UOp::placeholder_like(&output, 0, svod_ir::AddrSpace::Global).ok()?];
+    for (slot, buffer) in buffers.iter().enumerate() {
+        formals.push(UOp::placeholder_like(buffer, slot + 1, svod_ir::AddrSpace::Global).ok()?);
+    }
+    let body = UOp::custom_function(CustomFunctionKind::AllReduce { reduce_op: *reduce_op }, formals);
+    let call =
+        body.call(args, CallInfo { name: Some("host_allreduce".into()), precompile: true, ..CallInfo::default() });
+    Some(output.after(smallvec![call]).rtag(root.tag().clone()))
+}
+
+fn host_allreduce_dtype_supported(dtype: &DType) -> bool {
+    matches!(
+        dtype,
+        DType::Scalar(
+            ScalarDType::Float16
+                | ScalarDType::BFloat16
+                | ScalarDType::Float32
+                | ScalarDType::Float64
+                | ScalarDType::Int8
+                | ScalarDType::Int16
+                | ScalarDType::Int32
+                | ScalarDType::Int64
+                | ScalarDType::UInt8
+                | ScalarDType::UInt16
+                | ScalarDType::UInt32
+                | ScalarDType::UInt64
+        )
     )
 }
 
@@ -188,6 +274,14 @@ pub fn multi_pm() -> TypedPatternMatcher {
     }
 }
 
+/// Lower represented collectives into opaque host-runtime calls before kernel
+/// formation. The call body is never sent through `spec_program`.
+pub fn lower_allreduce_pm() -> TypedPatternMatcher {
+    crate::patterns! {
+        root @ AllReduce { src: _, device: _, reduce_op: _ } => |root| lower_host_allreduce(root),
+    }
+}
+
 fn operation_name(op: &Op) -> &'static str {
     match op {
         Op::Unary(..) => "unary ALU",
@@ -235,6 +329,51 @@ fn classify_supported_form(node: &Arc<UOp>) -> svod_ir::Result<()> {
             operation: "MSELECT",
             reason: "selection did not resolve to an in-range MSTACK shard",
         });
+    }
+
+    if let Op::AllReduce { src, device, reduce_op } = node.op() {
+        let Op::MStack { buffers } = src.op() else {
+            return Err(svod_ir::Error::MultiUnsupported {
+                operation: "ALLREDUCE",
+                reason: "collective source must be an explicit MSTACK",
+            });
+        };
+        if buffers.len() < 2 {
+            return Err(svod_ir::Error::MultiUnsupported {
+                operation: "ALLREDUCE",
+                reason: "collective requires at least two explicit shards",
+            });
+        }
+        if !host_allreduce_dtype_supported(&src.dtype()) {
+            return Err(svod_ir::Error::MultiUnsupported {
+                operation: "ALLREDUCE",
+                reason: "host collective dtype is not supported",
+            });
+        }
+        if !matches!(reduce_op, ReduceOp::Add | ReduceOp::Max) {
+            return Err(svod_ir::Error::MultiUnsupported {
+                operation: "ALLREDUCE",
+                reason: "only SUM and MAX collectives are supported",
+            });
+        }
+        let expected_shape = buffers[0].shape()?.cloned();
+        if buffers.iter().any(|buffer| {
+            buffer.dtype() != src.dtype()
+                || buffer.device_spec().is_none()
+                || buffer.shape().ok().flatten() != expected_shape.as_ref()
+        }) {
+            return Err(svod_ir::Error::MultiUnsupported {
+                operation: "ALLREDUCE",
+                reason: "explicit shards must have identical dtype and shape with concrete devices",
+            });
+        }
+        if buffers.first().and_then(|buffer| buffer.device_spec()).as_ref() != Some(device) {
+            return Err(svod_ir::Error::MultiUnsupported {
+                operation: "ALLREDUCE",
+                reason: "single-output collective target must match the first shard device",
+            });
+        }
+        return Ok(());
     }
 
     let layouts: Vec<_> = node.op().sources().iter().map(source_layout).collect();
@@ -315,6 +454,17 @@ fn classify_supported_form(node: &Arc<UOp>) -> svod_ir::Result<()> {
 pub fn validate_supported_subset(root: &Arc<UOp>) -> svod_ir::Result<()> {
     for node in root.toposort_call_aware(true) {
         classify_supported_form(&node)?;
+    }
+    Ok(())
+}
+
+/// Final scheduling boundary: collectives must have become opaque runtime calls.
+pub fn validate_no_unresolved_allreduce(root: &Arc<UOp>) -> svod_ir::Result<()> {
+    if root.toposort_call_aware(true).iter().any(|node| matches!(node.op(), Op::AllReduce { .. })) {
+        return Err(svod_ir::Error::MultiUnsupported {
+            operation: "ALLREDUCE",
+            reason: "collective did not lower to an executable host schedule item",
+        });
     }
     Ok(())
 }

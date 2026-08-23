@@ -235,7 +235,7 @@ pub enum Error {
 
     /// A reduction crosses the shard axis and therefore requires a collective.
     #[snafu(display(
-        "unsupported reduction across MULTI axis {axis}: all-reduce lowering is not implemented at this compiler boundary"
+        "unsupported reduction across MULTI axis {axis}: explicit MSTACK shard buffers are required for all-reduce lowering"
     ))]
     MultiReductionAcrossShardAxis { axis: usize },
 

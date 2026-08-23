@@ -657,6 +657,7 @@ fn arg_key(op: &Op) -> ArgKey {
         Op::CustomFunction { kind, .. } => ArgKey::Index(match kind {
             svod_ir::CustomFunctionKind::EncDec => 0,
             svod_ir::CustomFunctionKind::Graph => 1,
+            svod_ir::CustomFunctionKind::AllReduce { reduce_op } => 2 + usize::from(reduce_value(*reduce_op)),
         }),
         Op::Wmma { metadata, .. } => ArgKey::Wmma(
             metadata.dims,

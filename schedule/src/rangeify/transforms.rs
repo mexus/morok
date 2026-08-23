@@ -240,6 +240,8 @@ pub fn rangeify_with_map(sink: Arc<UOp>) -> svod_ir::Result<RangeifyResult> {
     let mut sink = crate::rewrite::graph_rewrite_preserve_calls(&crate::multi::multi_pm(), sink, &mut ());
     svod_ir::dump_canonical_stage("post_multi", &sink);
     crate::multi::validate_supported_subset(&sink)?;
+    sink = crate::rewrite::graph_rewrite_preserve_calls(&crate::multi::lower_allreduce_pm(), sink, &mut ());
+    crate::multi::validate_no_unresolved_allreduce(&sink)?;
     tracing::debug!(
         uop.tree = sink.tree(),
         node_count = sink.node_count(),

@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use smallvec::SmallVec;
 use svod_device::Buffer;
-use svod_ir::{AxisId, AxisType, CallInfo, DType, DeviceSpec, Op, UOp};
+use svod_ir::{AxisId, AxisType, CallInfo, DType, DeviceSpec, Op, ReduceOp, UOp};
 
 use crate::schedule::{
     InputBuffers, KernelInvocation, PreSchedule, PreScheduleItem, ScheduleItem, create_schedule, instantiate_schedule,
@@ -160,6 +160,41 @@ fn test_create_schedule_rejects_out_of_range_mselect() {
         Err(err) => err,
     };
     assert_ir_construction_error_contains(err, "must resolve a primary buffer id");
+}
+
+#[test]
+fn host_collective_schedule_item_depends_on_every_shard_producer() {
+    let output = UOp::new_buffer(DeviceSpec::Cpu, 2, DType::Float32);
+    let shard0 = UOp::new_buffer(DeviceSpec::Cpu, 2, DType::Float32);
+    let shard1 = UOp::new_buffer(DeviceSpec::Cpu, 2, DType::Float32);
+    let producer0 =
+        UOp::sink(vec![UOp::native_const(0.0f32)]).call(SmallVec::from_vec(vec![shard0.clone()]), CallInfo::default());
+    let producer1 =
+        UOp::sink(vec![UOp::native_const(0.0f32)]).call(SmallVec::from_vec(vec![shard1.clone()]), CallInfo::default());
+    let formals = SmallVec::from_vec(vec![
+        UOp::placeholder_like(&output, 0, svod_ir::AddrSpace::Global).unwrap(),
+        UOp::placeholder_like(&shard0, 1, svod_ir::AddrSpace::Global).unwrap(),
+        UOp::placeholder_like(&shard1, 2, svod_ir::AddrSpace::Global).unwrap(),
+    ]);
+    let collective = UOp::custom_function(svod_ir::CustomFunctionKind::AllReduce { reduce_op: ReduceOp::Add }, formals)
+        .call(
+            SmallVec::from_vec(vec![
+                output.clone(),
+                shard0.after(SmallVec::from_vec(vec![producer0.clone()])),
+                shard1.after(SmallVec::from_vec(vec![producer1.clone()])),
+            ]),
+            CallInfo::default(),
+        );
+    let transformed =
+        UOp::sink(vec![producer0.clone(), producer1.clone(), output.after(smallvec::smallvec![collective.clone()])]);
+    let inputs = HashMap::from([(output.id, cpu_buffer(2)), (shard0.id, cpu_buffer(2)), (shard1.id, cpu_buffer(2))]);
+
+    let schedule = create_schedule(transformed, &inputs, &HashMap::new()).unwrap();
+    let item = schedule.items.iter().find(|item| item.kernel.id == collective.id).unwrap();
+    let mut expected = vec![producer0.id, producer1.id];
+    expected.sort_unstable();
+    assert_eq!(item.dependencies, expected);
+    assert!(matches!(item.ast.op(), Op::CustomFunction { kind: svod_ir::CustomFunctionKind::AllReduce { .. }, .. }));
 }
 
 #[test]

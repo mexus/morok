@@ -533,9 +533,8 @@ pub struct CallInfo {
 
 /// Explicit runtime custom-function kinds.
 ///
-/// Both variants are reserved: the IR can construct them and the schedule
-/// lowers them, but the runtime returns an `Unsupported` error until backends
-/// implement them.
+/// Reserved helpers remain typed `Unsupported` at runtime; `AllReduce` is the
+/// correctness-first host implementation used by collective schedule items.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[derive(serde::Serialize, serde::Deserialize)]
 pub enum CustomFunctionKind {
@@ -543,6 +542,8 @@ pub enum CustomFunctionKind {
     EncDec,
     /// JIT graph-capture hook.
     Graph,
+    /// Correctness-first host-staged collective over explicit shard buffers.
+    AllReduce { reduce_op: ReduceOp },
 }
 
 /// Structural marker carried in `Op::Sink::info` indicating the SINK is a

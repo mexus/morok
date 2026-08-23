@@ -38,3 +38,60 @@ fn test_encdec_unsupported_does_not_require_buffers_first() {
         .expect_err("encdec should fail as unsupported");
     assert!(matches!(err, crate::Error::Unsupported { .. }));
 }
+
+fn f32_buffer(values: &[f32]) -> Buffer {
+    let alloc = svod_device::registry::cpu().expect("cpu allocator");
+    let mut buffer = Buffer::new(alloc, DType::Float32, vec![values.len()], Default::default());
+    let bytes = values.iter().flat_map(|value| value.to_le_bytes()).collect::<Vec<_>>();
+    buffer.copyin(&bytes).unwrap();
+    buffer
+}
+
+fn read_f32(buffer: &Buffer) -> Vec<f32> {
+    let mut bytes = vec![0; buffer.size()];
+    buffer.copyout(&mut bytes).unwrap();
+    bytes.chunks_exact(4).map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap())).collect()
+}
+
+#[test]
+fn host_allreduce_executes_sum_and_max_numerically() {
+    for (op, expected) in [(svod_ir::ReduceOp::Add, vec![5.0, 3.0, 7.0]), (svod_ir::ReduceOp::Max, vec![4.0, 5.0, 9.0])]
+    {
+        let mut buffers = vec![f32_buffer(&[0.0; 3]), f32_buffer(&[1.0, 5.0, -2.0]), f32_buffer(&[4.0, -2.0, 9.0])];
+        run_custom_function(&CustomFunctionKind::AllReduce { reduce_op: op }, &[], &mut buffers, &HashMap::new())
+            .unwrap();
+        assert_eq!(read_f32(&buffers[0]), expected);
+    }
+}
+
+#[test]
+fn host_allreduce_executes_float16_sum_on_storage_grid() {
+    let alloc = svod_device::registry::cpu().expect("cpu allocator");
+    let make = |values: &[f64]| {
+        let mut buffer = Buffer::new(alloc.clone(), DType::Float16, vec![values.len()], Default::default());
+        let bytes = values
+            .iter()
+            .flat_map(|value| {
+                (svod_dtype::cast::committed_float_bits(*value, svod_dtype::ScalarDType::Float16).unwrap() as u16)
+                    .to_le_bytes()
+            })
+            .collect::<Vec<_>>();
+        buffer.copyin(&bytes).unwrap();
+        buffer
+    };
+    let mut buffers = vec![make(&[0.0, 0.0]), make(&[1.5, -2.0]), make(&[2.25, 5.0])];
+    run_custom_function(
+        &CustomFunctionKind::AllReduce { reduce_op: svod_ir::ReduceOp::Add },
+        &[],
+        &mut buffers,
+        &HashMap::new(),
+    )
+    .unwrap();
+    let mut bytes = vec![0; buffers[0].size()];
+    buffers[0].copyout(&mut bytes).unwrap();
+    let values = bytes
+        .chunks_exact(2)
+        .map(|chunk| svod_dtype::cast::f16_bits_to_float(u16::from_le_bytes(chunk.try_into().unwrap())))
+        .collect::<Vec<_>>();
+    assert_eq!(values, vec![3.75, 3.0]);
+}

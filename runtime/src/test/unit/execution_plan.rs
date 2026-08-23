@@ -162,6 +162,38 @@ fn test_execute_custom_function_op_returns_unsupported() {
     );
 }
 
+#[test]
+fn test_execution_plan_runs_host_allreduce_numerically() {
+    let alloc = svod_device::registry::cpu().expect("cpu allocator");
+    let make = |values: &[f32]| {
+        let mut buffer = Buffer::new(alloc.clone(), DType::Float32, vec![values.len()], Default::default());
+        let bytes = values.iter().flat_map(|value| value.to_le_bytes()).collect::<Vec<_>>();
+        buffer.copyin(&bytes).unwrap();
+        buffer
+    };
+    let mut builder = ExecutionPlanBuilder::new(DeviceSpec::Cpu);
+    let output = builder.add_buffer(301, make(&[0.0, 0.0]));
+    let shard0 = builder.add_buffer(302, make(&[4.0, 7.0]));
+    let shard1 = builder.add_buffer(303, make(&[11.0, 7.0]));
+    builder.add_op(PreparedOp::CustomFunction(PreparedCustomFunction {
+        id: 300,
+        kind: CustomFunctionKind::AllReduce { reduce_op: svod_ir::ReduceOp::Add },
+        attrs: smallvec::smallvec![],
+        buffer_indices: vec![output, shard0, shard1],
+        fixedvars: HashMap::new(),
+        dependencies: Vec::new(),
+        runtime_vars: Vec::new(),
+    }));
+    builder.set_output_buffer(output);
+    let plan = builder.build().unwrap();
+
+    plan.execute().unwrap();
+    let mut bytes = vec![0; 2 * std::mem::size_of::<f32>()];
+    plan.output_buffer().unwrap().copyout(&mut bytes).unwrap();
+    let values = bytes.chunks_exact(4).map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap())).collect::<Vec<_>>();
+    assert_eq!(values, vec![15.0, 14.0]);
+}
+
 #[derive(Debug)]
 struct Copy4F32Program {
     calls: Arc<AtomicUsize>,

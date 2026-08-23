@@ -188,7 +188,8 @@ pub fn float_to_f16_bits(value: f64) -> u16 {
     sign | round_shift(significand, (28 - exponent) as u32) as u16
 }
 
-fn f16_bits_to_float(bits: u16) -> f64 {
+/// Decode one IEEE binary16 storage value.
+pub fn f16_bits_to_float(bits: u16) -> f64 {
     let sign = bits & 0x8000 != 0;
     let exponent = (bits >> 10) & 0x1f;
     let mantissa = bits & 0x03ff;

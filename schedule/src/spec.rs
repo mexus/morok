@@ -856,7 +856,12 @@ fn call_arguments_match_body(body: &Arc<UOp>, args: &[Arc<UOp>]) -> bool {
 
 fn supported_kernel_call_body(body: &Arc<UOp>) -> bool {
     match body.op() {
-        Op::Sink { .. } | Op::Linear { .. } | Op::Program { .. } | Op::Copy { .. } | Op::Slice { .. } => true,
+        Op::Sink { .. }
+        | Op::Linear { .. }
+        | Op::Program { .. }
+        | Op::Copy { .. }
+        | Op::Slice { .. }
+        | Op::CustomFunction { .. } => true,
         Op::End { computation, .. } => matches!(computation.op(), Op::Copy { .. } | Op::Slice { .. }),
         _ => false,
     }
