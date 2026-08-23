@@ -1,8 +1,10 @@
 //! Unit tests for vmin/vmax range analysis.
 
 use std::f32::consts::PI;
+use std::sync::Arc;
 
-use crate::{AxisId, ConstValue, Op, UOp};
+use crate::uop::range_eval::compute_sound_vmin_vmax;
+use crate::{AxisId, BinaryOp, ConstValue, Op, UOp};
 use svod_dtype::DType;
 
 // ============================================================================
@@ -259,8 +261,8 @@ fn test_vmin_vmax_cast_range() {
     // Cast to Int8 which has range [-128, 127]
     let casted = var.cast(DType::Int8);
 
-    // Should be clamped to Int8 bounds
-    assert_eq!(casted.vmin(), &ConstValue::Int(0));
+    // The interior wraps through the full Int8 domain; endpoint clamping is unsound.
+    assert_eq!(casted.vmin(), &ConstValue::Int(-128));
     assert_eq!(casted.vmax(), &ConstValue::Int(127));
 }
 
@@ -290,7 +292,7 @@ fn test_vmin_vmax_where_false() {
 fn test_vmin_vmax_where_range() {
     // Condition can be either true or false - use a comparison to get bool dtype
     let var = UOp::define_var("cond".to_string(), 0, 1);
-    let zero = UOp::const_(DType::Index, ConstValue::Int(0));
+    let zero = UOp::index_const(0);
     let cond = var.try_cmpgt(&zero).unwrap();
     let true_val = UOp::native_const(10i32);
     let false_val = UOp::native_const(5i32);
@@ -368,11 +370,275 @@ fn test_vmin_vmax_float_ops() {
     assert_eq!(prod.vmax(), &ConstValue::Float(3.75));
 
     let div = a.try_div(&b).unwrap();
-    // 2.5 / 1.5 = 1.666...
+    // The f32 operation is committed before its analysis bound is recorded.
     if let ConstValue::Float(min_val) = div.vmin() {
-        assert!((min_val - 1.6666666666666667).abs() < 1e-10);
+        assert_eq!(*min_val, (2.5f32 / 1.5f32) as f64);
     } else {
         panic!("Expected float result");
+    }
+}
+
+fn unknown_float(dtype: DType) -> Arc<UOp> {
+    let buffer = UOp::new_buffer(svod_dtype::DeviceSpec::Cpu, 1, dtype);
+    let index = UOp::index().buffer(buffer).indices(vec![UOp::index_const(0)]).call().unwrap();
+    UOp::load().index(index).call()
+}
+
+#[test]
+fn unknown_float_formats_use_infinite_analysis_bounds() {
+    let dtypes = [
+        DType::FP8E4M3,
+        DType::FP8E5M2,
+        DType::FP8E4M3FNUZ,
+        DType::FP8E5M2FNUZ,
+        DType::Float16,
+        DType::BFloat16,
+        DType::Float32,
+        DType::Float64,
+    ];
+    for dtype in dtypes {
+        let value = unknown_float(dtype.clone());
+        assert_eq!(value.vmin(), &ConstValue::Float(f64::NEG_INFINITY), "{dtype:?}");
+        assert_eq!(value.vmax(), &ConstValue::Float(f64::INFINITY), "{dtype:?}");
+        assert!(compute_sound_vmin_vmax(&value).is_none(), "{dtype:?}");
+    }
+
+    let param = UOp::param(0, 1, DType::Float32, Some(svod_dtype::DeviceSpec::Cpu));
+    assert_eq!(param.vmin(), &ConstValue::Float(f64::NEG_INFINITY));
+    assert_eq!(param.vmax(), &ConstValue::Float(f64::INFINITY));
+    assert!(compute_sound_vmin_vmax(&param).is_none());
+}
+
+#[test]
+fn unknown_vector_and_shaped_float_values_stay_unbounded() {
+    let scalar = unknown_float(DType::Float32);
+    let vector = UOp::stack(vec![scalar.clone(), scalar.clone(), scalar.clone(), scalar.clone()].into());
+    let shaped = UOp::stack(vec![vector.clone(), vector].into());
+    for value in [scalar, shaped] {
+        assert_eq!(value.vmin(), &ConstValue::Float(f64::NEG_INFINITY));
+        assert_eq!(value.vmax(), &ConstValue::Float(f64::INFINITY));
+        assert!(compute_sound_vmin_vmax(&value).is_none());
+    }
+}
+
+#[test]
+fn float_constants_specials_and_overflow_have_only_sound_exact_bounds() {
+    for value in [f64::NEG_INFINITY, -0.0, 0.0, f64::INFINITY] {
+        let constant = UOp::const_(DType::Float32, ConstValue::Float(value));
+        assert_eq!(compute_sound_vmin_vmax(&constant), Some((ConstValue::Float(value), ConstValue::Float(value))));
+    }
+
+    let nan = UOp::const_(DType::Float32, ConstValue::Float(f64::NAN));
+    assert!(nan.vmin().try_float().unwrap().is_nan());
+    assert!(compute_sound_vmin_vmax(&nan).is_none());
+
+    for dtype in [DType::Float16, DType::BFloat16, DType::Float32, DType::Float64] {
+        let max = UOp::const_(dtype.clone(), ConstValue::Float(dtype.max_value()));
+        let overflow = max.try_add(&max).unwrap();
+        let ConstValue::Float(bound) = overflow.vmin() else { panic!("expected float bound") };
+        assert!(bound.is_infinite(), "{dtype:?} finite overflow must include infinity");
+        assert_eq!(overflow.vmin(), overflow.vmax());
+    }
+}
+
+#[test]
+fn unknown_float_cast_and_division_ranges_are_conservative() {
+    let value = unknown_float(DType::Float32);
+    let cast = value.cast(DType::Float16);
+    assert_eq!(cast.vmin(), &ConstValue::Float(f64::NEG_INFINITY));
+    assert_eq!(cast.vmax(), &ConstValue::Float(f64::INFINITY));
+    assert!(compute_sound_vmin_vmax(&cast).is_none());
+
+    let divisor = unknown_float(DType::Float32);
+    let division = value.try_div(&divisor).unwrap();
+    assert_eq!(division.vmin(), &ConstValue::Float(f64::NEG_INFINITY));
+    assert_eq!(division.vmax(), &ConstValue::Float(f64::INFINITY));
+    assert!(compute_sound_vmin_vmax(&division).is_none());
+
+    let bounded_int = UOp::var("i", DType::Int32, -3, 7);
+    let exact_float_cast = bounded_int.cast(DType::Float16);
+    assert_eq!(compute_sound_vmin_vmax(&exact_float_cast), Some((ConstValue::Float(-3.0), ConstValue::Float(7.0))));
+}
+
+#[test]
+fn float_division_by_zero_tracks_infinity_and_nan() {
+    let one = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+    let zero = UOp::const_(DType::Float32, ConstValue::Float(0.0));
+    let one_over_zero = UOp::new(Op::Binary(BinaryOp::Fdiv, one, zero.clone()), DType::Float32);
+    assert_eq!(
+        compute_sound_vmin_vmax(&one_over_zero),
+        Some((ConstValue::Float(f64::INFINITY), ConstValue::Float(f64::INFINITY)))
+    );
+
+    let zero_over_zero = UOp::new(Op::Binary(BinaryOp::Fdiv, zero.clone(), zero), DType::Float32);
+    assert!(zero_over_zero.vmin().try_float().is_some_and(f64::is_nan));
+    assert!(compute_sound_vmin_vmax(&zero_over_zero).is_none());
+
+    let unknown = unknown_float(DType::Float32);
+    let unknown_over_zero = UOp::new(
+        Op::Binary(BinaryOp::Fdiv, unknown, UOp::const_(DType::Float32, ConstValue::Float(0.0))),
+        DType::Float32,
+    );
+    assert_eq!(unknown_over_zero.vmin(), &ConstValue::Float(f64::NEG_INFINITY));
+    assert_eq!(unknown_over_zero.vmax(), &ConstValue::Float(f64::INFINITY));
+    assert!(compute_sound_vmin_vmax(&unknown_over_zero).is_none());
+}
+
+#[test]
+fn sound_float_ranges_preserve_signed_zero_and_domains() {
+    let index = UOp::var("i", DType::Int32, 0, 1);
+    let condition = index.try_cmplt(&UOp::native_const(1i32)).unwrap();
+    let negative_zero = UOp::const_(DType::Float32, ConstValue::Float(-0.0));
+    let positive_zero = UOp::const_(DType::Float32, ConstValue::Float(0.0));
+    let selected = UOp::try_where(condition, negative_zero, positive_zero).unwrap();
+
+    let (min, max) = compute_sound_vmin_vmax(&selected).expect("NaN-free WHERE has sound bounds");
+    assert!(matches!(min, ConstValue::Float(v) if v == 0.0 && v.is_sign_negative()));
+    assert!(matches!(max, ConstValue::Float(v) if v == 0.0 && v.is_sign_positive()));
+    assert!(compute_sound_vmin_vmax(&UOp::try_reciprocal(&selected).unwrap()).is_none());
+
+    let negative = UOp::const_(DType::Float32, ConstValue::Float(-1.0));
+    assert!(compute_sound_vmin_vmax(&UOp::try_sqrt(&negative).unwrap()).is_none());
+}
+
+#[test]
+fn reduced_float_casts_include_overflow_and_unknown_specials() {
+    let near_f16_overflow = UOp::var("wide", DType::Int32, 65_504, 65_520).cast(DType::Float16);
+    assert_eq!(
+        compute_sound_vmin_vmax(&near_f16_overflow),
+        Some((ConstValue::Float(65_504.0), ConstValue::Float(f64::INFINITY)))
+    );
+
+    let unknown = unknown_float(DType::Float32);
+    for dtype in [DType::FP8E4M3, DType::FP8E5M2, DType::FP8E4M3FNUZ, DType::FP8E5M2FNUZ, DType::BFloat16] {
+        let cast = unknown.cast(dtype.clone());
+        assert_eq!(cast.vmin(), &ConstValue::Float(f64::NEG_INFINITY), "{dtype:?}");
+        assert_eq!(cast.vmax(), &ConstValue::Float(f64::INFINITY), "{dtype:?}");
+        assert!(compute_sound_vmin_vmax(&cast).is_none(), "{dtype:?}");
+    }
+}
+
+fn binary(op: BinaryOp, lhs: Arc<UOp>, rhs: Arc<UOp>, dtype: DType) -> Arc<UOp> {
+    UOp::new(Op::Binary(op, lhs, rhs), dtype)
+}
+
+#[test]
+fn narrow_integer_ranges_commit_or_fall_back_before_float_proofs() {
+    let signed = UOp::var("signed", DType::Int8, 100, 127);
+    let sum = signed.try_add(&signed).unwrap();
+    assert_eq!(compute_sound_vmin_vmax(&sum), Some((ConstValue::Int(-128), ConstValue::Int(127))));
+
+    let as_float = sum.cast(DType::Float32);
+    assert_eq!(compute_sound_vmin_vmax(&as_float), Some((ConstValue::Float(-128.0), ConstValue::Float(127.0))));
+    let positive = as_float.try_cmpgt(&UOp::const_(DType::Float32, ConstValue::Float(0.0))).unwrap();
+    assert_eq!(compute_sound_vmin_vmax(&positive), Some((ConstValue::Bool(false), ConstValue::Bool(true))));
+
+    let selected = UOp::try_where(positive, UOp::native_const(7i32), UOp::native_const(11i32)).unwrap();
+    assert_eq!(compute_sound_vmin_vmax(&selected), Some((ConstValue::Int(7), ConstValue::Int(11))));
+
+    let unsigned = UOp::var("unsigned", DType::UInt8, 200, 255);
+    let increment = UOp::var("increment", DType::UInt8, 0, 100);
+    let wrapped = unsigned.try_add(&increment).unwrap();
+    assert_eq!(compute_sound_vmin_vmax(&wrapped), Some((ConstValue::UInt(0), ConstValue::UInt(255))));
+
+    let minuend = UOp::var("minuend", DType::UInt8, 0, 20);
+    let subtrahend = UOp::var("subtrahend", DType::UInt8, 10, 30);
+    let underflow = binary(BinaryOp::Sub, minuend, subtrahend, DType::UInt8);
+    assert_eq!(compute_sound_vmin_vmax(&underflow), Some((ConstValue::UInt(0), ConstValue::UInt(255))));
+}
+
+#[test]
+fn narrow_integer_multiplication_shifts_negation_mulacc_and_safe_ranges_are_sound() {
+    let lhs = UOp::var("lhs", DType::Int8, 20, 30);
+    let rhs = UOp::var("rhs", DType::Int8, 10, 10);
+    let wrapped_product = lhs.try_mul(&rhs).unwrap();
+    assert_eq!(compute_sound_vmin_vmax(&wrapped_product), Some((ConstValue::Int(-128), ConstValue::Int(127))));
+
+    let safe_lhs = UOp::var("safe_lhs", DType::Int8, 10, 20);
+    let safe_rhs = UOp::var("safe_rhs", DType::Int8, 3, 4);
+    let safe_sum = safe_lhs.try_add(&safe_rhs).unwrap();
+    assert_eq!(compute_sound_vmin_vmax(&safe_sum), Some((ConstValue::Int(13), ConstValue::Int(24))));
+
+    let shift_value = UOp::var("shift_value", DType::Int8, 60, 64);
+    let shift = UOp::var("shift", DType::UInt8, 1, 1);
+    assert_eq!(
+        compute_sound_vmin_vmax(&shift_value.try_shl_op(&shift).unwrap()),
+        Some((ConstValue::Int(-128), ConstValue::Int(127)))
+    );
+    assert_eq!(
+        compute_sound_vmin_vmax(&shift_value.try_shr_op(&shift).unwrap()),
+        Some((ConstValue::Int(30), ConstValue::Int(32)))
+    );
+
+    let negated = UOp::new(Op::Unary(crate::UnaryOp::Neg, UOp::var("neg", DType::Int8, -128, -127)), DType::Int8);
+    assert_eq!(compute_sound_vmin_vmax(&negated), Some((ConstValue::Int(-128), ConstValue::Int(127))));
+
+    let a = UOp::var("a", DType::Int8, 10, 12);
+    let b = UOp::var("b", DType::Int8, 2, 3);
+    let c = UOp::var("c", DType::Int8, 1, 2);
+    let mulacc = UOp::try_mulacc(a, b, c).unwrap();
+    assert!(compute_sound_vmin_vmax(&mulacc).is_none());
+    assert_eq!((mulacc.vmin(), mulacc.vmax()), (&ConstValue::Int(-128), &ConstValue::Int(127)));
+}
+
+#[test]
+fn integer_cast_ranges_commit_without_endpoint_only_wrap() {
+    let wide = UOp::var("wide", DType::Int16, -200, 300);
+    let narrow = wide.cast(DType::Int8);
+    assert!(compute_sound_vmin_vmax(&narrow).is_none());
+    assert_eq!((narrow.vmin(), narrow.vmax()), (&ConstValue::Int(-128), &ConstValue::Int(127)));
+
+    let nonnegative = UOp::var("nonnegative", DType::Int16, 0, 100).cast(DType::UInt8);
+    assert_eq!(compute_sound_vmin_vmax(&nonnegative), Some((ConstValue::UInt(0), ConstValue::UInt(100))));
+
+    let crosses_zero = UOp::var("crosses_zero", DType::Int8, -1, 1).cast(DType::Bool);
+    assert_eq!(compute_sound_vmin_vmax(&crosses_zero), Some((ConstValue::Bool(false), ConstValue::Bool(true))));
+}
+
+#[test]
+fn unknown_and_nan_capable_float_comparisons_never_narrow_ordinary_bounds() {
+    let ops = [BinaryOp::Eq, BinaryOp::Ne, BinaryOp::Lt, BinaryOp::Le, BinaryOp::Gt, BinaryOp::Ge];
+    for dtype in [DType::FP8E4M3, DType::FP8E5M2FNUZ, DType::Float16, DType::BFloat16, DType::Float32] {
+        let unknown = unknown_float(dtype.clone());
+        let finite = UOp::const_(dtype.clone(), ConstValue::Float(1.0));
+        let infinity = UOp::const_(dtype.clone(), ConstValue::Float(f64::INFINITY));
+        let negative_infinity = UOp::const_(dtype, ConstValue::Float(f64::NEG_INFINITY));
+        for op in ops {
+            for comparison in [
+                binary(op, unknown.clone(), finite.clone(), DType::Bool),
+                binary(op, unknown.clone(), infinity.clone(), DType::Bool),
+                binary(op, unknown.clone(), negative_infinity.clone(), DType::Bool),
+                binary(op, unknown.clone(), unknown.clone(), DType::Bool),
+            ] {
+                assert_eq!((comparison.vmin(), comparison.vmax()), (&ConstValue::Bool(false), &ConstValue::Bool(true)));
+            }
+        }
+    }
+
+    let nan = UOp::const_(DType::Float32, ConstValue::Float(f64::NAN));
+    for op in ops {
+        let comparison = binary(op, nan.clone(), nan.clone(), DType::Bool);
+        assert_eq!((comparison.vmin(), comparison.vmax()), (&ConstValue::Bool(false), &ConstValue::Bool(true)));
+    }
+}
+
+#[test]
+fn nan_free_float_ranges_allow_all_reflexive_comparison_proofs() {
+    let value = UOp::var("finite", DType::Float32, -3, 7);
+    for (op, expected) in [
+        (BinaryOp::Eq, true),
+        (BinaryOp::Ne, false),
+        (BinaryOp::Lt, false),
+        (BinaryOp::Le, true),
+        (BinaryOp::Gt, false),
+        (BinaryOp::Ge, true),
+    ] {
+        let comparison = binary(op, value.clone(), value.clone(), DType::Bool);
+        assert_eq!(
+            compute_sound_vmin_vmax(&comparison),
+            Some((ConstValue::Bool(expected), ConstValue::Bool(expected)))
+        );
+        assert_eq!((comparison.vmin(), comparison.vmax()), (&ConstValue::Bool(expected), &ConstValue::Bool(expected)));
     }
 }
 

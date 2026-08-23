@@ -5,11 +5,21 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use smallvec::smallvec;
-use svod_dtype::DType;
-use svod_dtype::DeviceSpec;
+use svod_dtype::{AddrSpace, DType, DeviceSpec};
 
 use crate::pattern::{Matcher, RewriteResult};
-use crate::{AxisId, CallInfo, ConstValue, Op, SInt, UOp, UOpKey, shape::Shape}; // ConstValue kept for DType::Index
+use crate::{AxisId, BinaryOp, CallInfo, ConstValue, Op, SInt, UOp, UOpKey, shape::Shape}; // ConstValue kept for DType::Index
+
+fn program(
+    sink: Arc<UOp>,
+    target: DeviceSpec,
+    linear: Option<Arc<UOp>>,
+    source: Option<Arc<UOp>>,
+    binary: Option<Arc<UOp>>,
+) -> Arc<UOp> {
+    let info = crate::ProgramInfo::from_sink(&sink, target);
+    UOp::program(sink, info, linear, source, binary)
+}
 
 struct RewriteCallToFirstArg;
 
@@ -29,6 +39,112 @@ fn test_const_creation() {
     let c1 = UOp::native_const(1.0f32);
     assert_eq!(c1.dtype(), DType::Float32);
     assert!(matches!(c1.op(), Op::Const(_)));
+}
+
+#[test]
+fn typed_constants_commit_and_report_unsupported_conversions() {
+    let value = 1.0 / 123_008.0;
+    let constant = UOp::const_(DType::Float16, ConstValue::Float(value));
+    assert!(matches!(constant.op(), Op::Const(value) if value.0 == ConstValue::Float(8.106231689453125e-6)));
+
+    let error = UOp::try_const_(DType::BFloat16, ConstValue::Float(1e300)).unwrap_err();
+    assert!(matches!(
+        error,
+        crate::Error::ConstantConversion { dtype: DType::Scalar(svod_dtype::ScalarDType::BFloat16), .. }
+    ));
+
+    let pointer = DType::Float32.ptr(None, svod_dtype::AddrSpace::Global).unwrap();
+    assert!(matches!(UOp::try_const_(pointer, ConstValue::Float(1.0)), Err(crate::Error::ConstantConversion { .. })));
+}
+
+#[test]
+fn vconst_commits_every_lane() {
+    let vector = UOp::vconst(
+        vec![ConstValue::Float(1.0625), ConstValue::Float(1.1875), ConstValue::Float(-0.0)],
+        DType::FP8E4M3,
+    );
+    assert!(matches!(vector.op(), Op::VConst { values }
+        if values == &vec![ConstValue::Float(1.0), ConstValue::Float(1.25), ConstValue::Float(-0.0)]));
+
+    let fnuz = UOp::vconst(vec![ConstValue::Float(-0.0)], DType::FP8E4M3FNUZ);
+    assert!(matches!(fnuz.op(), Op::VConst { values }
+        if values[0] == ConstValue::Float(0.0) && values[0] != ConstValue::Float(-0.0)));
+}
+
+#[test]
+fn const_like_converts_to_receiver_scalar_dtype() {
+    let receiver = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+    let constant = receiver.const_like(2i64);
+
+    assert_eq!(constant.dtype(), DType::Float32);
+    assert!(matches!(constant.op(), Op::Const(value) if value.0 == ConstValue::Float(2.0)));
+    assert_eq!(constant.shape().unwrap().unwrap().as_slice(), &[]);
+}
+
+#[test]
+fn const_like_expands_independent_receiver_shape() {
+    for width in [4usize, 5, 8] {
+        let receiver =
+            UOp::stack((0..width).map(|value| UOp::const_(DType::Int32, ConstValue::Int(value as i64))).collect());
+        let constant = receiver.const_like(1i64);
+
+        assert_eq!(constant.dtype(), DType::Int32);
+        assert_eq!(constant.shape().unwrap().unwrap().as_slice(), &[width.into()]);
+        assert!(matches!(constant.op(), Op::Expand { src, .. }
+            if matches!(src.op(), Op::Const(value) if value.0 == ConstValue::Int(1))));
+        assert!(
+            receiver.try_add(&constant).is_ok(),
+            "width {width} constant must satisfy strict binary shape validation"
+        );
+    }
+}
+
+#[test]
+fn const_like_expands_mechanical_stack_receivers() {
+    let receiver = UOp::stack(smallvec![
+        UOp::native_const(0i32),
+        UOp::native_const(1i32),
+        UOp::native_const(2i32),
+        UOp::native_const(3i32),
+    ]);
+    let constant = receiver.const_like(7i64);
+
+    assert_eq!(constant.dtype(), DType::Int32);
+    assert_eq!(constant.shape().unwrap().unwrap().as_slice(), &[4usize.into()]);
+    assert!(matches!(constant.op(), Op::Expand { .. }));
+}
+
+#[test]
+fn vconst_like_stacks_after_movement_lowering() {
+    let receiver = UOp::stack(smallvec![
+        UOp::native_const(0.0f32),
+        UOp::native_const(1.0f32),
+        UOp::native_const(2.0f32),
+        UOp::native_const(3.0f32),
+    ]);
+    let constant = receiver.vconst_like(0);
+
+    assert_eq!(constant.dtype(), DType::Float32);
+    assert!(matches!(constant.op(), Op::Stack { sources } if sources.len() == 4));
+    assert!(!constant.toposort().iter().any(|node| node.op().is_movement()));
+}
+
+#[test]
+fn const_like_shapes_invalid_without_retyping_it() {
+    let receiver =
+        UOp::stack((0..5).map(|value| UOp::const_(DType::Float32, ConstValue::Float(value as f64))).collect());
+    let invalid = receiver.const_like(ConstValue::Invalid);
+
+    assert_eq!(invalid.dtype(), DType::Bool);
+    assert_eq!(invalid.shape().unwrap().unwrap().as_slice(), &[5usize.into()]);
+    assert!(matches!(invalid.op(), Op::Expand { src, .. } if UOp::is_invalid_marker(src)));
+    assert!(UOp::is_invalid_marker(&invalid));
+
+    let vector = UOp::stack(smallvec![UOp::native_const(0i32), UOp::native_const(1i32)]);
+    let vector_invalid = vector.const_like(ConstValue::Invalid);
+    assert_eq!(vector_invalid.dtype(), DType::Bool);
+    assert_eq!(vector_invalid.shape().unwrap().unwrap().as_slice(), &[2usize.into()]);
+    assert!(UOp::is_invalid_marker(&vector_invalid));
 }
 
 #[test]
@@ -52,6 +168,25 @@ fn test_hash_consing_with_src() {
 
     // Should be the same object
     assert!(Arc::ptr_eq(&add1, &add2), "Hash consing should work with src nodes");
+}
+
+#[test]
+fn test_hash_consing_preserves_differently_tagged_child_order() {
+    let base = UOp::index_const(7);
+    let left = base.with_tag(smallvec![1]);
+    let right = base.with_tag(smallvec![2]);
+    assert_eq!(left.content_hash, right.content_hash);
+    assert_ne!(left.id, right.id);
+
+    let forward = UOp::new(Op::Binary(BinaryOp::Add, left.clone(), right.clone()), DType::WeakInt);
+    let reverse = UOp::new(Op::Binary(BinaryOp::Add, right.clone(), left.clone()), DType::WeakInt);
+    assert!(!Arc::ptr_eq(&forward, &reverse));
+    let Op::Binary(_, forward_left, forward_right) = forward.op() else { panic!("expected ADD") };
+    let Op::Binary(_, reverse_left, reverse_right) = reverse.op() else { panic!("expected ADD") };
+    assert!(Arc::ptr_eq(forward_left, &left));
+    assert!(Arc::ptr_eq(forward_right, &right));
+    assert!(Arc::ptr_eq(reverse_left, &right));
+    assert!(Arc::ptr_eq(reverse_right, &left));
 }
 
 /// Test that hash consing works across threads.
@@ -232,7 +367,7 @@ fn test_toposort_call_aware_boundaries() {
     assert!(!preserve_boundaries.iter().any(|u| matches!(u.op(), Op::Param { .. })), "CALL body should be excluded");
 
     let sink = UOp::sink(vec![call.clone()]);
-    let program = UOp::program(sink.clone(), UOp::device(DeviceSpec::Cpu), None, None, None);
+    let program = program(sink.clone(), DeviceSpec::Cpu, None, None, None);
     let program_include = program.toposort_call_aware(true);
     assert!(program_include.iter().any(|u| Arc::ptr_eq(u, &sink)));
     let program_preserve = program.toposort_call_aware(false);
@@ -314,8 +449,9 @@ fn test_buffer_creation() {
     assert!(matches!(buf.op(), Op::Buffer { .. }));
     assert_eq!(buf.dtype(), DType::Float32);
 
-    if let Op::Buffer { size, .. } = buf.op() {
-        assert_eq!(*size, 100);
+    if let Op::Buffer { arg, .. } = buf.op() {
+        assert_eq!(arg.device, Some(DeviceSpec::Cpu));
+        assert_eq!(buf.shape().unwrap().unwrap().as_slice(), &[SInt::Const(100)]);
     } else {
         panic!("Expected Buffer op");
     }
@@ -331,20 +467,13 @@ fn test_buffer_hash_consing() {
 }
 
 #[test]
-fn test_buffer_hash_consing_lunique_distinct_from_unique() {
-    // LUnique slots and Unique global ids both start at small numbers, so
-    // collapsing them into the same OpData::BufferData key (without the
-    // `local` discriminator) would hash-cons distinct buffers together.
-    let unique_zero = UOp::buffer_id(Some(0));
-    let lunique_zero = UOp::lunique(Some(0));
-    let device = UOp::device(DeviceSpec::Cpu);
-    let buf_unique = UOp::new(Op::Buffer { unique: unique_zero, device: device.clone(), size: 64 }, DType::Float32);
-    let buf_lunique = UOp::new(Op::Buffer { unique: lunique_zero, device, size: 64 }, DType::Float32);
-
-    assert!(
-        !Arc::ptr_eq(&buf_unique, &buf_lunique),
-        "Buffer wrapping Unique(0) must not hash-cons with buffer wrapping LUnique(0)"
-    );
+fn test_buffer_hash_consing_distinguishes_slots() {
+    let shape = crate::shape::shape_to_uop(&smallvec![SInt::Const(64)]);
+    let arg0 = crate::ParamArg::buffer(0, DType::Float32, svod_dtype::AddrSpace::Global, Some(DeviceSpec::Cpu));
+    let arg1 = crate::ParamArg::buffer(1, DType::Float32, svod_dtype::AddrSpace::Global, Some(DeviceSpec::Cpu));
+    let buf0 = UOp::new(Op::Buffer { shape: shape.clone(), arg: arg0 }, DType::Float32);
+    let buf1 = UOp::new(Op::Buffer { shape, arg: arg1 }, DType::Float32);
+    assert!(!Arc::ptr_eq(&buf0, &buf1), "BUFFER slot is part of structural identity");
 }
 
 #[test]
@@ -368,22 +497,6 @@ fn test_has_buffer_identity_through_get_tuple_chain() {
 }
 
 #[test]
-fn test_buffer_view() {
-    let buf = UOp::new_buffer(DeviceSpec::Cpu, 1000, DType::Float32);
-    let view = buf.view(100, 50);
-
-    assert!(matches!(view.op(), Op::BufferView { .. }));
-    assert_eq!(view.dtype(), DType::Float32);
-
-    if let Op::BufferView { size, offset, .. } = view.op() {
-        assert_eq!(*size, 100);
-        assert_eq!(*offset, 50);
-    } else {
-        panic!("Expected BufferView op");
-    }
-}
-
-#[test]
 fn test_index_operation() {
     let buf = UOp::new_buffer(DeviceSpec::Cpu, 100, DType::Float32);
     let idx = UOp::const_(DType::Index, ConstValue::UInt(10));
@@ -394,12 +507,14 @@ fn test_index_operation() {
 }
 
 #[test]
-fn test_device_and_unique() {
-    let dev = UOp::device(DeviceSpec::Cpu);
-    assert!(matches!(dev.op(), Op::Device(_)));
-    if let Op::Device(spec) = dev.op() {
-        assert_eq!(*spec, DeviceSpec::Cpu);
-    }
+fn test_copy_device_metadata_and_unique() {
+    let src = UOp::new_buffer(DeviceSpec::Cpu, 1, DType::Float32);
+    let cpu_copy = src.copy_to_device(DeviceSpec::Cpu);
+    let cuda_copy = src.copy_to_device(DeviceSpec::Cuda { device_id: 0 });
+    assert!(matches!(cpu_copy.op(), Op::Copy { device: DeviceSpec::Cpu, .. }));
+    assert_eq!(cpu_copy.op().children().len(), 1);
+    assert!(!Arc::ptr_eq(&cpu_copy, &cuda_copy), "copy target must participate in hash consing");
+    assert!(matches!(cpu_copy.with_sources(vec![src]).op(), Op::Copy { device: DeviceSpec::Cpu, .. }));
 
     let uniq = UOp::buffer_id(Some(42));
     assert!(matches!(uniq.op(), Op::Unique(42)));
@@ -572,24 +687,31 @@ fn test_tuple_hash_consing() {
 #[test]
 fn test_program_family_constructors_and_with_sources() {
     let sink = UOp::sink(vec![]);
-    let device = UOp::device(DeviceSpec::Cpu);
     let linear = UOp::linear(smallvec![UOp::noop()]);
     let source = UOp::source("void kernel() {}".to_string());
     let binary = UOp::binary(vec![1, 2, 3, 4]);
+    assert_eq!(binary.dtype(), DType::UInt8);
+
+    let stage0 = program(sink.clone(), DeviceSpec::Cpu, None, None, None);
+    assert_eq!(stage0.op().sources().iter().map(|u| u.id).collect::<Vec<_>>(), vec![sink.id]);
+    let other_target = program(sink.clone(), DeviceSpec::Cuda { device_id: 0 }, None, None, None);
+    assert!(!Arc::ptr_eq(&stage0, &other_target), "PROGRAM target participates in hash consing");
+    let stage1 = program(sink.clone(), DeviceSpec::Cpu, Some(linear.clone()), None, None);
+    assert_eq!(stage1.op().sources().iter().map(|u| u.id).collect::<Vec<_>>(), vec![sink.id, linear.id]);
+    let stage2 = program(sink.clone(), DeviceSpec::Cpu, Some(linear.clone()), Some(source.clone()), None);
+    assert_eq!(stage2.op().sources().iter().map(|u| u.id).collect::<Vec<_>>(), vec![sink.id, linear.id, source.id]);
 
     let program =
-        UOp::program(sink.clone(), device.clone(), Some(linear.clone()), Some(source.clone()), Some(binary.clone()));
-    assert_eq!(program.op().children().len(), 5);
+        program(sink.clone(), DeviceSpec::Cpu, Some(linear.clone()), Some(source.clone()), Some(binary.clone()));
+    assert_eq!(program.op().children().len(), 4);
+    assert_eq!(
+        program.op().sources().iter().map(|u| u.id).collect::<Vec<_>>(),
+        vec![sink.id, linear.id, source.id, binary.id]
+    );
     match program.op() {
-        Op::Program {
-            sink: p_sink,
-            device: p_device,
-            linear: Some(p_linear),
-            source: Some(p_source),
-            binary: Some(p_binary),
-        } => {
+        Op::Program { sink: p_sink, info, linear: Some(p_linear), source: Some(p_source), binary: Some(p_binary) } => {
             assert!(Arc::ptr_eq(p_sink, &sink));
-            assert!(Arc::ptr_eq(p_device, &device));
+            assert_eq!(info.target, DeviceSpec::Cpu);
             assert!(Arc::ptr_eq(p_linear, &linear));
             assert!(Arc::ptr_eq(p_source, &source));
             assert!(Arc::ptr_eq(p_binary, &binary));
@@ -601,18 +723,11 @@ fn test_program_family_constructors_and_with_sources() {
     let linear2 = UOp::linear(smallvec![UOp::native_const(7i32)]);
     let source2 = UOp::source("void kernel2() {}".to_string());
     let binary2 = UOp::binary(vec![9, 8]);
-    let rewritten =
-        program.with_sources(vec![sink2.clone(), device.clone(), linear2.clone(), source2.clone(), binary2.clone()]);
+    let rewritten = program.with_sources(vec![sink2.clone(), linear2.clone(), source2.clone(), binary2.clone()]);
     match rewritten.op() {
-        Op::Program {
-            sink: p_sink,
-            device: p_device,
-            linear: Some(p_linear),
-            source: Some(p_source),
-            binary: Some(p_binary),
-        } => {
+        Op::Program { sink: p_sink, info, linear: Some(p_linear), source: Some(p_source), binary: Some(p_binary) } => {
             assert!(Arc::ptr_eq(p_sink, &sink2));
-            assert!(Arc::ptr_eq(p_device, &device));
+            assert_eq!(info.target, DeviceSpec::Cpu);
             assert!(Arc::ptr_eq(p_linear, &linear2));
             assert!(Arc::ptr_eq(p_source, &source2));
             assert!(Arc::ptr_eq(p_binary, &binary2));
@@ -622,11 +737,125 @@ fn test_program_family_constructors_and_with_sources() {
 }
 
 #[test]
+fn stage_identity_participates_in_hash_consing_and_content_hash() {
+    let identity = crate::SourceStageIdentity {
+        version: crate::SOURCE_STAGE_IDENTITY_VERSION,
+        abi: vec![],
+        target: DeviceSpec::Cpu,
+        entry_name: "kernel".into(),
+        linear_sha256: crate::StageDigest([1; 32]),
+        source_sha256: crate::StageDigest([2; 32]),
+    };
+    let other_identity = crate::SourceStageIdentity { entry_name: "other".into(), ..identity.clone() };
+    let raw = UOp::source("source".into());
+    let first = UOp::source_with_identity("source".into(), identity.clone());
+    let same = UOp::source_with_identity("source".into(), identity.clone());
+    let other = UOp::source_with_identity("source".into(), other_identity);
+    assert!(Arc::ptr_eq(&first, &same));
+    assert_ne!(raw.content_hash, first.content_hash);
+    assert_ne!(first.content_hash, other.content_hash);
+    assert_ne!(crate::UOpKey(first.clone()), crate::UOpKey(other));
+
+    let binary_identity = crate::BinaryStageIdentity {
+        version: crate::BINARY_STAGE_IDENTITY_VERSION,
+        source: identity.clone(),
+        compiler_key: "compiler-a".into(),
+        binary_sha256: crate::StageDigest([3; 32]),
+    };
+    let other_binary_identity =
+        crate::BinaryStageIdentity { compiler_key: "compiler-b".into(), ..binary_identity.clone() };
+    let raw_binary = UOp::binary(vec![1, 2, 3]);
+    let binary = UOp::binary_with_identity(vec![1, 2, 3], binary_identity);
+    let other_binary = UOp::binary_with_identity(vec![1, 2, 3], other_binary_identity);
+    assert_ne!(raw_binary.content_hash, binary.content_hash);
+    assert_ne!(binary.content_hash, other_binary.content_hash);
+    assert_ne!(crate::UOpKey(binary), crate::UOpKey(other_binary));
+}
+
+#[test]
+fn test_program_info_from_sink_is_structural_program_identity() {
+    let param0 = UOp::param(0, 8, DType::Float32, None);
+    let param1 = UOp::param(1, 8, DType::Float32, None);
+    let index = UOp::index_const(0);
+    let load_index = UOp::index().buffer(param1).indices(vec![index.clone()]).call().unwrap();
+    let load = UOp::load().index(load_index).call();
+    let store_index = UOp::index().buffer(param0).indices(vec![index]).call().unwrap();
+    let store = store_index.store(load);
+    let var = UOp::define_var("n".to_string(), 1, 16);
+    let global = UOp::special(var.clone(), "gidx0".to_string());
+    let local = UOp::special(UOp::index_const(4), "lidx0".to_string());
+    let sink = UOp::sink_with_info(
+        vec![store, global, local],
+        crate::KernelInfo { name: Some("named_kernel".to_string()), ..Default::default() },
+    );
+
+    let info = crate::ProgramInfo::from_sink(&sink, DeviceSpec::Cpu);
+    assert_eq!(info.name, "named_kernel");
+    assert_eq!(info.globals, vec![0, 1]);
+    assert_eq!(info.outs, vec![0]);
+    assert_eq!(info.ins, vec![1]);
+    assert_eq!(info.vars.len(), 1);
+    assert_eq!(info.global_size[0].vmax(), &ConstValue::Int(16));
+    assert_eq!(info.local_size.as_ref().unwrap()[0].vmax(), &ConstValue::Int(4));
+
+    let first = UOp::program(sink.clone(), info.clone(), None, None, None);
+    let second = UOp::program(sink.clone(), info.clone(), None, None, None);
+    assert!(Arc::ptr_eq(&first, &second));
+
+    let mut renamed = info;
+    renamed.name = "other".to_string();
+    let other = UOp::program(sink, renamed, None, None, None);
+    assert!(!Arc::ptr_eq(&first, &other));
+}
+
+#[test]
+fn test_program_info_simplifies_special_launch_extent() {
+    let n = UOp::define_var("n".to_string(), 1, 16);
+    let extent =
+        n.mul(&UOp::const_(DType::WeakInt, ConstValue::Int(1))).add(&UOp::const_(DType::WeakInt, ConstValue::Int(0)));
+    let sink = UOp::sink(vec![UOp::special(extent, "gidx0".to_string())]);
+
+    let info = crate::ProgramInfo::from_sink(&sink, DeviceSpec::Cpu);
+    assert!(Arc::ptr_eq(&info.global_size[0], &n));
+}
+
+#[test]
+fn test_program_info_defaults_and_shrink_buffer_identity() {
+    let defaults = crate::ProgramInfo::default();
+    assert_eq!(defaults.name, "test");
+    assert!(defaults.local_size.is_none());
+    assert!(defaults.vars.is_empty());
+    assert!(defaults.globals.is_empty());
+    assert!(defaults.outs.is_empty());
+    assert!(defaults.ins.is_empty());
+
+    let param = UOp::param(3, 8, DType::Float32, None);
+    let shrink = param.try_shrink(&[(crate::SInt::Const(0), crate::SInt::Const(1))]).unwrap();
+    let sink = UOp::sink(vec![shrink.store(UOp::native_const(1.0f32))]);
+    let info = crate::ProgramInfo::from_sink(&sink, DeviceSpec::Cpu);
+    assert_eq!(info.globals, vec![3]);
+    assert_eq!(info.outs, vec![3]);
+}
+
+#[test]
+fn test_program_info_discovers_cast_shrink_memory() {
+    let output = UOp::param(3, 8, DType::Float32, None);
+    let input = UOp::param(4, 8, DType::Float32, None);
+    let output = output.try_shrink(&[(crate::SInt::Const(0), crate::SInt::Const(1))]).unwrap().cast(DType::Float32);
+    let input = input.try_shrink(&[(crate::SInt::Const(0), crate::SInt::Const(1))]).unwrap().cast(DType::Float32);
+    let sink = UOp::sink(vec![output.store(UOp::load().index(input).call())]);
+
+    let info = crate::ProgramInfo::from_sink(&sink, DeviceSpec::Cpu);
+    assert_eq!(info.outs, vec![3]);
+    assert_eq!(info.ins, vec![4]);
+}
+
+#[test]
 fn test_placeholder_like_concrete_shape() {
     let buf = UOp::new_buffer(DeviceSpec::Cpu, 6, DType::Float32);
     let shaped = buf.try_reshape(&Shape::from_iter([SInt::Const(2), SInt::Const(3)])).unwrap();
 
-    let placeholder = UOp::placeholder_like(&shaped, 7).expect("placeholder_like should succeed");
+    let placeholder = UOp::placeholder_like(&shaped, 7, AddrSpace::Global).expect("placeholder_like should succeed");
     let placeholder_shape = placeholder.shape().unwrap().cloned().expect("placeholder should have shape");
     assert_eq!(placeholder_shape.len(), 2);
     assert_eq!(placeholder_shape[0].as_const(), Some(2));
@@ -645,6 +874,33 @@ fn test_placeholder_like_concrete_shape() {
 }
 
 #[test]
+fn test_placeholder_like_reg_preserves_shape_and_address_space() {
+    let shaped = UOp::new_buffer(DeviceSpec::Cpu, 6, DType::Float32)
+        .try_reshape(&Shape::from_iter([SInt::Const(2), SInt::Const(3)]))
+        .unwrap();
+
+    let placeholder = UOp::placeholder_like(&shaped, 7, AddrSpace::Reg).expect("REG placeholder_like");
+    assert_eq!(placeholder.addrspace(), Some(AddrSpace::Reg));
+    assert_eq!(
+        placeholder.shape().unwrap().unwrap().iter().map(SInt::as_const).collect::<Vec<_>>(),
+        vec![Some(2), Some(3)]
+    );
+    assert!(placeholder.toposort().iter().any(
+        |node| matches!(node.op(), Op::Buffer { arg, .. } if arg.slot == 7 && arg.addrspace == Some(AddrSpace::Reg))
+    ));
+}
+
+#[test]
+fn test_placeholder_like_commits_weak_storage_dtype() {
+    let weak = UOp::const_(DType::WeakInt, ConstValue::Int(3));
+    let placeholder =
+        UOp::placeholder_like(&weak, 2, AddrSpace::Global).expect("weak placeholder should commit storage dtype");
+
+    assert_eq!(placeholder.dtype(), DType::Int32);
+    assert!(matches!(placeholder.op(), Op::Param { arg, .. } if arg.dtype == DType::Int32));
+}
+
+#[test]
 fn test_placeholder_like_symbolic_shape_fails() {
     // Symbolic input is rejected outright — tinygrad's placeholder_like
     // asserts the shape is all concrete ints, and we mirror that contract.
@@ -652,7 +908,7 @@ fn test_placeholder_like_symbolic_shape_fails() {
     let buf = UOp::new_buffer(DeviceSpec::Cpu, 8, DType::Float32);
     let shaped = buf.try_reshape(&Shape::from_iter([SInt::from(n)])).unwrap();
 
-    let err = UOp::placeholder_like(&shaped, 0).expect_err("symbolic placeholder_like should fail");
+    let err = UOp::placeholder_like(&shaped, 0, AddrSpace::Global).expect_err("symbolic placeholder_like should fail");
     assert!(format!("{err}").contains("symbolic shape is not supported"), "unexpected error: {err}");
 }
 
@@ -663,7 +919,8 @@ fn test_placeholder_like_multi_uses_shard_shape() {
         .unwrap();
     let multi = UOp::multi(shard, 0);
 
-    let placeholder = UOp::placeholder_like(&multi, 3).expect("placeholder_like should succeed for MULTI shard shape");
+    let placeholder = UOp::placeholder_like(&multi, 3, AddrSpace::Global)
+        .expect("placeholder_like should succeed for MULTI shard shape");
     let shape = placeholder.shape().unwrap().cloned().expect("placeholder should have shape");
     assert_eq!(shape.iter().map(|d| d.as_const()).collect::<Vec<_>>(), vec![Some(2), Some(3)]);
 }
@@ -679,7 +936,8 @@ fn test_placeholder_like_mstack_mselect_uses_buffer_shape() {
     let stacked = UOp::mstack(smallvec::smallvec![shard0, shard1]);
     let selected = stacked.mselect(1);
 
-    let placeholder = UOp::placeholder_like(&selected, 4).expect("placeholder_like should succeed for MSELECT");
+    let placeholder =
+        UOp::placeholder_like(&selected, 4, AddrSpace::Global).expect("placeholder_like should succeed for MSELECT");
     let shape = placeholder.shape().unwrap().cloned().expect("placeholder should have shape");
     assert_eq!(shape.iter().map(|d| d.as_const()).collect::<Vec<_>>(), vec![Some(2), Some(2)]);
 }

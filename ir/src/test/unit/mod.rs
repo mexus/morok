@@ -1,5 +1,6 @@
 pub mod arithmetic;
 pub mod bitwise;
+pub mod call_shape;
 pub mod canonical;
 pub mod comparison;
 pub mod const_cast;

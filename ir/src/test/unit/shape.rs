@@ -42,6 +42,17 @@ fn test_shape_product() {
 }
 
 #[test]
+fn binary_alu_broadcasts_shaped_operands() {
+    let lhs = UOp::stack(smallvec![UOp::native_const(1.0f32); 8]);
+    let rhs = UOp::stack(smallvec![UOp::native_const(2.0f32); 128])
+        .try_reshape(&smallvec![SInt::Const(4), SInt::Const(4), SInt::Const(8)])
+        .unwrap();
+
+    let sum = lhs.try_add(&rhs).unwrap();
+    assert_eq!(sum.shape().unwrap().unwrap().as_slice(), &[SInt::Const(4), SInt::Const(4), SInt::Const(8)]);
+}
+
+#[test]
 fn test_validate_shape() {
     assert!(validate_shape(&[1, 2, 3]).is_ok());
     assert!(validate_shape(&[1, -2, 3]).is_err());
@@ -197,7 +208,7 @@ fn test_shape_to_uop_non_empty() {
 
     if let Op::Stack { sources } = shape_uop.op() {
         assert_eq!(sources.len(), 2, "shape [3, 4] should have two STACK sources");
-        assert_eq!(shape_uop.dtype(), DType::Index);
+        assert_eq!(shape_uop.dtype(), DType::WeakInt);
     } else {
         panic!("expected STACK, got {:?}", shape_uop.op());
     }
@@ -213,5 +224,5 @@ fn test_shape_to_uop_empty_and_single() {
 
     let single = shape_to_uop(&smallvec![SInt::from(7)]);
     assert!(matches!(single.op(), Op::Const(_)));
-    assert_eq!(single.dtype(), DType::Index);
+    assert_eq!(single.dtype(), DType::WeakInt);
 }

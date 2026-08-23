@@ -22,7 +22,6 @@
 //! ```
 
 pub mod helpers;
-pub mod ptrcat;
 pub mod transcendentals;
 
 use std::sync::Arc;
@@ -32,72 +31,90 @@ use crate::rewrite::graph_rewrite_bottom_up;
 use crate::uop::UOp;
 use svod_macros::patterns;
 
-use transcendentals::{xcos, xerf, xexp, xexp2, xlog, xlog2, xpow, xrsqrt, xsin, xsqrt, xtan};
+use transcendentals::{xcos, xexp, xexp2, xlog, xlog2, xpow, xsin, xtan};
 
-/// Vector-of-pointer decomposition for MLIR backend.
-///
-/// MLIR's LLVM dialect doesn't support `vector<N x ptr>` types. This pattern
-/// eliminates VECTORIZE and PtrCat operations on pointer types that weren't
-/// consumed by LOAD/STORE patterns during devectorization.
-///
-/// # Example
-///
-/// ```ignore
-/// impl Renderer for MlirRenderer {
-///     fn decompositor(&self) -> Option<TypedPatternMatcher<()>> {
-///         Some(ptrcat_decomposition_patterns())
-///     }
-/// }
-/// ```
-pub fn ptrcat_decomposition_patterns() -> TypedPatternMatcher<()> {
-    use crate::DType;
+fn same_truncating_bucket(a: &Arc<UOp>, b: &Arc<UOp>) -> bool {
+    let (Some(amin), Some(amax), Some(bmin), Some(bmax)) =
+        (a.vmin().try_int(), a.vmax().try_int(), b.vmin().try_int(), b.vmax().try_int())
+    else {
+        return false;
+    };
+    (amin >= 0 && bmin > 0) || (amax <= 0 && bmax < 0)
+}
 
+fn floor_correction(a: &Arc<UOp>, b: &Arc<UOp>, remainder: &Arc<UOp>) -> Arc<UOp> {
+    let zero = a.const_like(0);
+    remainder.ne(&zero).and_(&a.lt(&zero).ne(&b.lt(&zero)))
+}
+
+/// Lower floor division/modulo to the C-style truncating operations exposed by
+/// code-generation targets. This is Tinygrad's `floordiv_to_idiv` and
+/// `floormod_to_mod` decomposition.
+pub fn divmod_decomposition_patterns() -> TypedPatternMatcher<()> {
     patterns! {
-        // Eliminate VECTORIZE on pointers by returning first element
-        // (VECTORIZE on pointers that isn't consumed by GEP is dead code)
-        Vectorize { elements } if matches!(elements[0].dtype(), DType::Ptr { .. }) ~> |elements| elements[0].clone(),
-
-        // Eliminate bare PtrCat by returning first pointer
-        // (PtrCat not consumed by LOAD/STORE is dead code)
-        PtrCat { sources } ~> |sources| sources[0].clone(),
+        FloorDiv(a, b) => {
+            let q = a.cdiv(b);
+            if same_truncating_bucket(a, b) {
+                Some(q)
+            } else {
+                let r = a.cmod(b);
+                Some(q.sub(&floor_correction(a, b, &r).cast(a.dtype())))
+            }
+        },
+        FloorMod(a, b) => {
+            let r = a.cmod(b);
+            if same_truncating_bucket(a, b) {
+                Some(r)
+            } else {
+                let correction = floor_correction(a, b, &r);
+                Some(r.add(&UOp::try_where(correction, b.clone(), b.const_like(0)).expect("floor modulo correction")))
+            }
+        },
     }
 }
 
-/// All decomposition patterns for transcendental operations.
-///
-/// Returns a `TypedPatternMatcher` that decomposes:
-/// - Unary: Exp2, Log2, Exp, Log, Sin, Cos, Tan, Sqrt, Rsqrt, Erf
-/// - Binary: Pow
-///
-/// Backends that don't support these operations natively can use this
-/// matcher with `decompose_with()` to decompose them into primitives.
-///
-/// # Example
-///
-/// ```ignore
-/// impl Renderer for CpuRenderer {
-///     fn decompositor(&self) -> Option<TypedPatternMatcher<()>> {
-///         Some(all_decomposition_patterns())
-///     }
-/// }
-/// ```
-pub fn all_decomposition_patterns() -> TypedPatternMatcher<()> {
-    patterns! {
-        // Transcendental unary ops
-        Exp2(src) ~> |src| xexp2(src),
-        Log2(src) ~> |src| xlog2(src),
-        Exp(src)  ~> |src| xexp(src),
-        Log(src)  ~> |src| xlog(src),
-        Sin(src)  ~> |src| xsin(src),
-        Cos(src)  ~> |src| xcos(src),
-        Tan(src)  ~> |src| xtan(src),
-        Sqrt(src) ~> |src| xsqrt(src),
-        Rsqrt(src) ~> |src| xrsqrt(src),
-        Erf(src)  ~> |src| xerf(src),
+/// Pinned Tinygrad `get_transcendental_patterns`: decompose target
+/// transcendentals only when the renderer lacks them, unless force mode is on.
+pub fn get_transcendental_patterns(supported: &crate::RendererOps, force: bool) -> TypedPatternMatcher<()> {
+    use crate::{DType, UnaryOp};
+    use svod_dtype::ScalarDType::{Float16, Float32, Float64};
 
-        // Binary pow: x^y = exp2(y * log2(x))
-        Pow(base, exp) ~> |base, exp| xpow(base, exp),
+    fn approximation_dtype(dtype: &DType) -> bool {
+        matches!(dtype.base(), Float16 | Float32 | Float64)
     }
+    fn other_float(dtype: &DType) -> bool {
+        dtype.is_float() && !approximation_dtype(dtype)
+    }
+
+    let mut pm = TypedPatternMatcher::default();
+    if force || !supported.supports_unary(UnaryOp::Exp2) {
+        pm = pm
+            + patterns! {
+                Exp2(src) if approximation_dtype(&src.dtype()) ~> |src| xexp2(src),
+                node @ Exp2(src) if other_float(&src.dtype())
+                    ~> |node, src| src.cast(DType::Float32).try_exp2().expect("float32 exp2").cast(node.dtype()),
+            };
+    }
+    if force || !supported.supports_unary(UnaryOp::Log2) {
+        pm = pm
+            + patterns! {
+                Log2(src) if approximation_dtype(&src.dtype()) ~> |src| xlog2(src),
+                node @ Log2(src) if other_float(&src.dtype())
+                    ~> |node, src| src.cast(DType::Float32).try_log2().expect("float32 log2").cast(node.dtype()),
+            };
+    }
+    if force || !supported.supports_unary(UnaryOp::Sin) {
+        pm = pm
+            + patterns! {
+                Sin(src) if approximation_dtype(&src.dtype()) ~> |src| xsin(src),
+                node @ Sin(src) if other_float(&src.dtype())
+                    ~> |node, src| src.cast(DType::Float32).try_sin().expect("float32 sin").cast(node.dtype()),
+            };
+    }
+    if force || !supported.supports_unary(UnaryOp::Sqrt) {
+        pm = pm + patterns! { Sqrt(src) ~> |src| xpow(src, &src.const_like(0.5)), };
+    }
+    pm
 }
 
 /// f32 → bf16 round-to-nearest-even done in the integer domain, emitting no
@@ -142,15 +159,10 @@ fn cast_float_to_bf16(x: &Arc<UOp>) -> Arc<UOp> {
 
 /// Decomposition patterns for the AMD backend.
 ///
-/// AMD's hardware `v_exp_f32`/`v_log_f32` (emitted as `@llvm.exp2`/`@llvm.log2`)
-/// are lower precision than CPU libm, so the exp/log/trig family is routed
-/// through the SLEEF `~1 ULP` polynomials instead. This mirrors tinygrad's
-/// `TRANSCENDENTAL=2` force mode (`uop/decompositions.py`), and uses the same
-/// coefficients (`transcendentals.rs`).
-///
-/// `Sqrt`/`Rsqrt` are deliberately **omitted** — AMD's `@llvm.sqrt` is
-/// IEEE-correct (~0.5 ULP), better than the polynomial, and tinygrad likewise
-/// keeps `SQRT` native in `AMDLLVMRenderer.code_for_op`.
+/// This supplements the renderer-conditioned target matcher for Morok-only
+/// Exp/Log/Cos/Tan/Pow operations. Exp2/Log2/Sin/Sqrt and renderer-supported
+/// Erf are deliberately
+/// absent so there is exactly one approximation-selection path.
 ///
 /// Every pattern is guarded to `f16`/`f32`/`f64` (tinygrad's
 /// `TRANSCENDENTAL_DTYPES`): the polynomials are only defined for those, and
@@ -163,14 +175,10 @@ pub fn amd_decomposition_patterns() -> TypedPatternMatcher<()> {
         matches!(d.base(), Float16 | Float32 | Float64)
     }
     patterns! {
-        Exp2(src) if transc(&src.dtype()) ~> |src| xexp2(src),
-        Log2(src) if transc(&src.dtype()) ~> |src| xlog2(src),
         Exp(src)  if transc(&src.dtype()) ~> |src| xexp(src),
         Log(src)  if transc(&src.dtype()) ~> |src| xlog(src),
-        Sin(src)  if transc(&src.dtype()) ~> |src| xsin(src),
         Cos(src)  if transc(&src.dtype()) ~> |src| xcos(src),
         Tan(src)  if transc(&src.dtype()) ~> |src| xtan(src),
-        Erf(src)  if transc(&src.dtype()) ~> |src| xerf(src),
 
         // Binary pow: x^y = exp2(y * log2(x))
         Pow(base, exp) if transc(&base.dtype()) ~> |base, exp| xpow(base, exp),
@@ -178,14 +186,10 @@ pub fn amd_decomposition_patterns() -> TypedPatternMatcher<()> {
         // bf16/fp8/int fall back to f32 then cast back (tinygrad's cast arm).
         // Int `Pow` would otherwise hit `@llvm.pow.f64`, which amdgcn can't
         // select; bf16/fp8 transcendentals have no native intrinsic either.
-        Exp2(src) ~> |src| xexp2(&src.cast(DType::Float32)).cast(src.dtype()),
-        Log2(src) ~> |src| xlog2(&src.cast(DType::Float32)).cast(src.dtype()),
         Exp(src)  ~> |src| xexp(&src.cast(DType::Float32)).cast(src.dtype()),
         Log(src)  ~> |src| xlog(&src.cast(DType::Float32)).cast(src.dtype()),
-        Sin(src)  ~> |src| xsin(&src.cast(DType::Float32)).cast(src.dtype()),
         Cos(src)  ~> |src| xcos(&src.cast(DType::Float32)).cast(src.dtype()),
         Tan(src)  ~> |src| xtan(&src.cast(DType::Float32)).cast(src.dtype()),
-        Erf(src)  ~> |src| xerf(&src.cast(DType::Float32)).cast(src.dtype()),
         Pow(base, exp) ~> |base, exp| xpow(&base.cast(DType::Float32), &exp.cast(DType::Float32)).cast(base.dtype()),
 
         // f32 → bf16: integer round (see `cast_float_to_bf16`) instead of the

@@ -14,7 +14,8 @@ use crate::UOp;
 use crate::types::{BinaryOp, ConstValue, TernaryOp, UnaryOp};
 
 use svod_dtype::ScalarDType as Scalar;
-static NON_SUPPORTED: &[Scalar] = &[Scalar::FP8E4M3, Scalar::FP8E5M2, Scalar::Index, Scalar::Void];
+static NON_SUPPORTED: &[Scalar] =
+    &[Scalar::FP8E4M3, Scalar::FP8E4M3FNUZ, Scalar::FP8E5M2, Scalar::FP8E5M2FNUZ, Scalar::Index, Scalar::Void];
 
 pub fn const_(dtype: ScalarDType) -> impl Strategy<Value = ConstValue> {
     use ScalarDType::*;
@@ -132,8 +133,8 @@ pub fn arb_binary_op() -> impl Strategy<Value = BinaryOp> {
         5 => Just(BinaryOp::Add),
         5 => Just(BinaryOp::Mul),
         4 => Just(BinaryOp::Sub),
-        2 => Just(BinaryOp::Idiv),
-        2 => Just(BinaryOp::Mod),
+        2 => Just(BinaryOp::FloorDiv),
+        2 => Just(BinaryOp::FloorMod),
         3 => Just(BinaryOp::Max),
         1 => Just(BinaryOp::Pow),
         3 => Just(BinaryOp::Lt),

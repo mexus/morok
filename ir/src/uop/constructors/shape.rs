@@ -23,6 +23,10 @@ impl UOp {
             crate::dtype_from_op(&Op::Stack { sources: sources.clone() })
                 .expect("STACK sources must have a promotable dtype")
         };
+        let sources = sources
+            .into_iter()
+            .map(|source| if Self::is_invalid_marker(&source) { source } else { source.cast(dtype.clone()) })
+            .collect();
         Self::new(Op::Stack { sources }, dtype)
     }
 
@@ -65,9 +69,9 @@ impl UOp {
     ///
     /// Takes UOps for range parameters (used internally by compiler passes).
     /// For the public API with validation, use `try_shrink`.
-    pub(crate) fn shrink(src: Arc<Self>, begins: Arc<Self>, ends: Arc<Self>) -> Arc<Self> {
+    pub(crate) fn shrink(src: Arc<Self>, offsets: Arc<Self>, sizes: Arc<Self>) -> Arc<Self> {
         let dtype = src.dtype();
-        Self::new(Op::Shrink { src, begins, ends }, dtype)
+        Self::new(Op::Shrink { src, offsets, sizes }, dtype)
     }
 
     /// Flip (reverse) axes (low-level, UOp-based constructor).
@@ -244,9 +248,10 @@ impl UOp {
             }
         }
 
-        let (begins, ends) = ranges_to_uops(ranges);
+        let offsets_and_sizes: Vec<_> = ranges.iter().map(|(begin, end)| (begin.clone(), end - begin)).collect();
+        let (offsets, sizes) = ranges_to_uops(&offsets_and_sizes);
         let dtype = self.dtype();
-        let result = Self::new(Op::Shrink { src: self.clone(), begins, ends }, dtype);
+        let result = Self::new(Op::Shrink { src: self.clone(), offsets, sizes }, dtype);
         // Tinygrad (movement.py:128): return self if ret.shape == self.shape else ret
         if result.shape().ok().flatten() == self.shape().ok().flatten() {
             return Ok(self.clone());

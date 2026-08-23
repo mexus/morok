@@ -1,29 +1,23 @@
-//! Hardware-specific operations: WMMA, vectorize, callable kernels/programs.
+//! Hardware-specific operations: WMMA, lane packing, callable kernels/programs.
 //!
 //! This module contains hardware-specific operations:
 //! - Tensor cores: wmma
-//! - Vectorization: vectorize, gep, contract, unroll, cat, ptrcat
+//! - Vectorization: stack and index helpers
 //! - Multi-device: mstack, mselect
 //! - Callable/program IR: call, program
 
 use std::sync::Arc;
 
-use bon::bon;
 use smallvec::{SmallVec, smallvec};
 use snafu::{OptionExt, ensure};
 use svod_dtype::DType;
 
 use crate::Result;
-use crate::error::{
-    BroadcastRequiresScalarSnafu, ContractCountMismatchSnafu, GepIndexOutOfBoundsSnafu, GepRequiresVectorSnafu,
-    GetTupleIndexOutOfBoundsSnafu, GetTupleNotATupleSnafu, NotVectorizableSnafu, UnrollCountMismatchSnafu,
-    VectorizeDTypeMismatchSnafu, VectorizeEmptySnafu,
-};
+use crate::error::{BroadcastRequiresScalarSnafu, GetTupleIndexOutOfBoundsSnafu, GetTupleNotATupleSnafu};
 use crate::op::Op;
 use crate::types::{CallInfo, WmmaMetadata};
 use crate::uop::UOp;
 
-#[bon]
 impl UOp {
     // =========================================================================
     // Tensor Core Operations
@@ -34,14 +28,7 @@ impl UOp {
     /// Computes D = A × B + C using hardware matrix units.
     /// `metadata` specifies dimensions, dtypes, and upcast axes for vectorization.
     pub fn wmma(a: Arc<Self>, b: Arc<Self>, c: Arc<Self>, metadata: WmmaMetadata) -> Arc<Self> {
-        let base_dtype = metadata.dtype_out.clone();
-
-        // Calculate vector size from C (output) upcast axes
-        let vec_size = metadata.upcast_axes.c.iter().map(|(_, size)| size).product::<usize>();
-
-        let dtype =
-            if vec_size > 1 { base_dtype.vec(vec_size).expect("wmma output dtype is a scalar") } else { base_dtype };
-
+        let dtype = c.dtype();
         Self::new(Op::Wmma { a, b, c, metadata }, dtype)
     }
 
@@ -49,49 +36,13 @@ impl UOp {
     // Vectorization Operations
     // =========================================================================
 
-    /// Create vector from scalar elements (fallible version with validation).
+    /// Broadcast a scalar value along a new leading axis (fallible version).
     ///
-    /// # Errors
-    /// - `VectorizeRequiresMultiple` if elements is empty
-    /// - `VectorizeDTypeMismatch` if elements have different scalar dtypes
-    pub fn try_vectorize(elements: SmallVec<[Arc<Self>; 4]>) -> Result<Arc<Self>> {
-        ensure!(!elements.is_empty(), VectorizeEmptySnafu);
-
-        // Use full dtype (not scalar_dtype) to preserve Ptr type for pointer vectors.
-        // This matches Tinygrad's broadcast: `UOp(Ops.VECTORIZE, self.dtype.vec(count), ...)`
-        // For Ptr types: Ptr{vcount:1}.vec(N) → Ptr{vcount:N} (vector of pointers)
-        // For Scalar types: Scalar(Float32).vec(N) → Vector{Float32, N}
-        let expected_dtype =
-            elements.iter().find(|elem| !Self::is_invalid_marker(elem)).unwrap_or(&elements[0]).dtype();
-        for elem in &elements {
-            let actual = elem.dtype();
-            ensure!(
-                expected_dtype == actual || Self::is_invalid_marker(elem),
-                VectorizeDTypeMismatchSnafu { expected: expected_dtype, actual }
-            );
-        }
-
-        let count = elements.len();
-        let vec_dtype = expected_dtype.vec(count).context(NotVectorizableSnafu { dtype: expected_dtype, count })?;
-        Ok(Self::new(Op::Vectorize { elements }, vec_dtype))
-    }
-
-    /// Create vector from scalar elements (panics on violation).
-    ///
-    /// Infallible convenience wrapper around [`Self::try_vectorize`]: callers in the
-    /// rewrite engine produce `Some(vectorize(..))` and have already validated element
-    /// dtypes by construction. Use `try_vectorize` for the checked path.
-    pub fn vectorize(elements: SmallVec<[Arc<Self>; 4]>) -> Arc<Self> {
-        Self::try_vectorize(elements).expect("vectorize precondition violated")
-    }
-
-    /// Broadcast a scalar value to a vector by replication (fallible version).
-    ///
-    /// Creates a VECTORIZE operation with `count` copies of the source.
+    /// Creates a STACK operation with `count` copies of the source.
     /// If `count == 1`, returns the source unchanged.
     ///
     /// # Errors
-    /// - `BroadcastRequiresScalar` if source has vcount > 1
+    /// - `BroadcastRequiresScalar` if source has a vector dtype
     pub fn try_broadcast(self: &Arc<Self>, count: usize) -> Result<Arc<Self>> {
         ensure!(self.dtype().vcount() == 1, BroadcastRequiresScalarSnafu { dtype: self.dtype() });
 
@@ -99,12 +50,12 @@ impl UOp {
             return Ok(self.clone());
         }
         let elements: SmallVec<[Arc<Self>; 4]> = (0..count).map(|_| self.clone()).collect();
-        Ok(Self::vectorize(elements))
+        Ok(Self::stack(elements))
     }
 
-    /// Broadcast a scalar value to a vector by replication.
+    /// Broadcast a scalar value along a new leading axis.
     ///
-    /// Creates a VECTORIZE operation with `count` copies of the source.
+    /// Creates a STACK operation with `count` copies of the source.
     /// If `count == 1`, returns the source unchanged.
     ///
     /// # Example
@@ -116,180 +67,8 @@ impl UOp {
         if count == 1 {
             return self.clone();
         }
-        if let Op::Const(cvh) = self.op() {
-            return Self::vconst(vec![cvh.0; count], self.dtype().scalar_dtype());
-        }
         let elements: SmallVec<[Arc<Self>; 4]> = (0..count).map(|_| self.clone()).collect();
-        Self::vectorize(elements)
-    }
-
-    /// Extract element(s) from vector (fallible version with validation).
-    ///
-    /// # Errors
-    /// - `GepRequiresVector` if source has vcount <= 1
-    /// - `GepIndexOutOfBounds` if any index >= source vcount
-    pub fn try_gep(self: &Arc<Self>, indices: Vec<usize>) -> Result<Arc<Self>> {
-        let vector_dtype = self.dtype();
-        let vcount = vector_dtype.vcount();
-
-        ensure!(vcount > 1, GepRequiresVectorSnafu { dtype: vector_dtype.clone() });
-
-        for &index in &indices {
-            ensure!(index < vcount, GepIndexOutOfBoundsSnafu { index, vcount });
-        }
-
-        let dtype = if indices.len() == 1 {
-            DType::Scalar(vector_dtype.base())
-        } else {
-            DType::Scalar(vector_dtype.base()).vec(indices.len()).expect("gep result base is a scalar")
-        };
-
-        Ok(Self::new(Op::Gep { vector: self.clone(), indices }, dtype))
-    }
-
-    /// Extract element(s) from vector (Get Element Pointer).
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// let elem = vector.gep(vec![0]);      // Extract single element
-    /// let sub = vector.gep(vec![0, 2]);    // Extract multiple elements
-    /// ```
-    pub fn gep(self: &Arc<Self>, indices: Vec<usize>) -> Arc<Self> {
-        let vector_dtype = self.dtype();
-        let dtype = if indices.len() == 1 {
-            DType::Scalar(vector_dtype.base())
-        } else {
-            DType::Scalar(vector_dtype.base()).vec(indices.len()).expect("gep result base is a scalar")
-        };
-        Self::new(Op::Gep { vector: self.clone(), indices }, dtype)
-    }
-
-    /// Contract unrolled values back into vectorized form (fallible version).
-    ///
-    /// # Errors
-    /// - `ContractCountMismatch` if dtype.vcount != product of axis sizes
-    pub fn try_contract(self: &Arc<Self>, upcast_ranges: Vec<(usize, usize)>) -> Result<Arc<Self>> {
-        let base_dtype = self.dtype();
-        let dtype_count = base_dtype.vcount();
-        let axis_product: usize = upcast_ranges.iter().map(|(_, size)| size).product();
-
-        // Only validate if dtype is not void (STORE ops have void dtype)
-        if base_dtype != DType::Void {
-            ensure!(dtype_count == axis_product, ContractCountMismatchSnafu { dtype_count, axis_product });
-        }
-
-        let dtype = if axis_product > 1 {
-            base_dtype
-                .vec(axis_product)
-                .context(NotVectorizableSnafu { dtype: base_dtype.clone(), count: axis_product })?
-        } else {
-            base_dtype
-        };
-
-        Ok(Self::new(Op::Contract { src: self.clone(), upcast_ranges }, dtype))
-    }
-
-    /// Contract unrolled values back into vectorized form.
-    ///
-    /// Pairs with UNROLL: UNROLL expands loops for optimization,
-    /// CONTRACT combines the results. Used in WMMA and vectorization passes.
-    pub fn contract(self: &Arc<Self>, upcast_ranges: Vec<(usize, usize)>) -> Arc<Self> {
-        let base_dtype = self.dtype();
-        let vec_size = upcast_ranges.iter().map(|(_, size)| size).product::<usize>();
-        let dtype = if vec_size > 1 {
-            base_dtype.vec(vec_size).expect("contract source dtype must be vectorizable")
-        } else {
-            base_dtype
-        };
-        Self::new(Op::Contract { src: self.clone(), upcast_ranges }, dtype)
-    }
-
-    /// Expand a value across unrolled loop iterations (fallible version).
-    ///
-    /// # Errors
-    /// - `UnrollCountMismatch` if src.dtype.vcount != product of axis sizes
-    pub fn try_unroll(self: &Arc<Self>, unroll_axes: Vec<(usize, usize)>) -> Result<Arc<Self>> {
-        let dtype = self.dtype();
-        let dtype_count = dtype.vcount();
-        let axis_product: usize = unroll_axes.iter().map(|(_, size)| size).product();
-
-        // Only validate if we have axes to unroll
-        if !unroll_axes.is_empty() {
-            ensure!(dtype_count == axis_product, UnrollCountMismatchSnafu { dtype_count, axis_product });
-        }
-
-        Ok(Self::new(Op::Unroll { src: self.clone(), unroll_axes }, dtype))
-    }
-
-    /// Expand a value across unrolled loop iterations.
-    ///
-    /// Creates multiple versions of the computation for each unroll axis.
-    /// Pairs with CONTRACT which combines results back together.
-    pub fn unroll(self: &Arc<Self>, unroll_axes: Vec<(usize, usize)>) -> Arc<Self> {
-        let dtype = self.dtype();
-        Self::new(Op::Unroll { src: self.clone(), unroll_axes }, dtype)
-    }
-
-    /// Create UNROLL with explicit dtype (for do_contract pattern).
-    ///
-    /// Used when UNROLL dtype should differ from source dtype,
-    /// specifically when CONTRACT collapses UNROLL via GEP and
-    /// we need to preserve the per-iteration element type.
-    ///
-    /// Based on Tinygrad's pattern where partial contraction creates
-    /// UNROLL with remaining axes but CONTRACT's dtype.
-    pub fn unroll_with_dtype(self: &Arc<Self>, unroll_axes: Vec<(usize, usize)>, dtype: DType) -> Arc<Self> {
-        Self::new(Op::Unroll { src: self.clone(), unroll_axes }, dtype)
-    }
-
-    /// Create a CAT operation (concatenate vectors).
-    ///
-    /// # Example
-    /// ```ignore
-    /// // Infer dtype (sum of vcounts)
-    /// UOp::cat().sources(vec![a, b]).call()
-    ///
-    /// // Explicit dtype
-    /// UOp::cat().sources(vec![a, b]).dtype(vec8_dtype).call()
-    /// ```
-    #[builder]
-    pub fn cat(sources: Vec<Arc<Self>>, dtype: Option<DType>) -> Arc<Self> {
-        assert!(!sources.is_empty(), "CAT requires at least one source");
-        let dtype = dtype.unwrap_or_else(|| {
-            let total_count: usize = sources.iter().map(|s| s.dtype().vcount()).sum();
-            DType::Scalar(sources[0].dtype.base()).vec(total_count).expect("cat result base is a scalar")
-        });
-        Self::new(Op::Cat { sources: SmallVec::from_vec(sources) }, dtype)
-    }
-
-    /// Create a PTRCAT operation (concatenate pointers).
-    ///
-    /// # Example
-    /// ```ignore
-    /// UOp::ptrcat().sources(vec![a, b]).dtype(ptr_dtype).call()
-    /// ```
-    #[builder]
-    pub fn ptrcat(sources: Vec<Arc<Self>>, dtype: Option<DType>) -> Arc<Self> {
-        assert!(!sources.is_empty(), "PTRCAT requires at least one source");
-        let dtype = dtype.unwrap_or_else(|| {
-            // Compute vcount from total source pointer vcount, matching CAT's approach.
-            let total_vcount: usize = sources
-                .iter()
-                .map(|s| match s.dtype() {
-                    DType::Ptr { base, .. } => base.vcount(),
-                    other => other.vcount(),
-                })
-                .sum();
-            let base = &sources[0].dtype;
-            match base {
-                DType::Ptr { base, addrspace, size, .. } => {
-                    DType::Ptr { base: base.clone(), addrspace: *addrspace, size: *size, vcount: total_vcount }
-                }
-                _ => base.clone(),
-            }
-        });
-        Self::new(Op::PtrCat { sources: SmallVec::from_vec(sources) }, dtype)
+        Self::stack(elements)
     }
 
     // =========================================================================
@@ -324,15 +103,32 @@ impl UOp {
         Self::new(Op::Call { body: self.clone(), args, info }, DType::Void)
     }
 
+    /// Typed instruction-style CALL. Its result is scalar and its body remains opaque.
+    pub fn call_typed(
+        self: &Arc<Self>,
+        args: SmallVec<[Arc<Self>; 4]>,
+        info: CallInfo,
+        return_dtype: DType,
+    ) -> Arc<Self> {
+        Self::new(Op::Call { body: self.clone(), args, info }, return_dtype)
+    }
+
     /// FUNCTION wrapper around a value-producing body UOp and runtime arguments.
     ///
     /// FUNCTION dtype is always void per tinygrad's spec, and its body is
     /// always a TUPLE; non-Tuple bodies are auto-wrapped.
-    /// For opaque bodies (SINK / PROGRAM / COPY / BUFFER_VIEW / CUSTOM_FUNCTION) prefer
+    /// For opaque bodies (SINK / PROGRAM / COPY / SLICE / CUSTOM_FUNCTION) prefer
     /// `.call()` instead — those mirror tinygrad's `_OPAQUE_CALL_BODIES` set.
     pub fn function(self: &Arc<Self>, args: SmallVec<[Arc<Self>; 4]>, info: CallInfo) -> Arc<Self> {
         let body = if matches!(self.op(), Op::Tuple { .. }) { self.clone() } else { self.maketuple() };
         Self::new(Op::Function { body, args, info }, DType::Void)
+    }
+
+    /// Fallible FUNCTION constructor with positional formal/actual validation.
+    pub fn try_function(self: &Arc<Self>, args: SmallVec<[Arc<Self>; 4]>, info: CallInfo) -> Result<Arc<Self>> {
+        let body = if matches!(self.op(), Op::Tuple { .. }) { self.clone() } else { self.maketuple() };
+        crate::shape::function_param_substitutions(&body, &args)?;
+        Ok(Self::new(Op::Function { body, args, info }, DType::Void))
     }
 
     /// Construct a TUPLE from value-producing UOps. dtype is always void.
@@ -379,12 +175,12 @@ impl UOp {
     /// PROGRAM wrapper with optional progressive pipeline stages.
     pub fn program(
         sink: Arc<Self>,
-        device: Arc<Self>,
+        info: crate::ProgramInfo,
         linear: Option<Arc<Self>>,
         source: Option<Arc<Self>>,
         binary: Option<Arc<Self>>,
     ) -> Arc<Self> {
-        Self::new(Op::Program { sink, device, linear, source, binary }, DType::Void)
+        Self::new(Op::Program { sink, info, linear, source, binary }, DType::Void)
     }
 
     /// LINEAR stage payload.
@@ -394,11 +190,27 @@ impl UOp {
 
     /// SOURCE stage payload.
     pub fn source(code: String) -> Arc<Self> {
-        Self::new(Op::Source { code }, DType::Void)
+        Self::new(Op::Source { code, identity: None }, DType::Void)
+    }
+
+    /// SOURCE stage payload bound to an executable PROGRAM identity.
+    pub fn source_with_identity(code: String, identity: crate::SourceStageIdentity) -> Arc<Self> {
+        Self::new(Op::Source { code, identity: Some(identity) }, DType::Void)
     }
 
     /// BINARY stage payload.
     pub fn binary(bytes: Vec<u8>) -> Arc<Self> {
-        Self::new(Op::ProgramBinary { bytes }, DType::Void)
+        Self::new(Op::ProgramBinary { bytes, identity: None }, DType::UInt8)
+    }
+
+    /// BINARY stage payload bound to its exact SOURCE and compiler identity.
+    pub fn binary_with_identity(bytes: Vec<u8>, identity: crate::BinaryStageIdentity) -> Arc<Self> {
+        Self::new(Op::ProgramBinary { bytes, identity: Some(identity) }, DType::UInt8)
+    }
+
+    /// Construct a target instruction. INS has no inferred dtype because an
+    /// instruction may define a value of any target type or be void.
+    pub fn ins(sources: impl IntoIterator<Item = Arc<Self>>, dtype: DType, arg: crate::InsArg) -> Arc<Self> {
+        Self::new(Op::Ins { sources: sources.into_iter().collect(), arg }, dtype)
     }
 }

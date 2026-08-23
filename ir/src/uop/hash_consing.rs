@@ -64,7 +64,7 @@ pub(crate) fn next_uop_id() -> u64 {
 struct UOpKey {
     op_discriminant: std::mem::Discriminant<Op>,
     dtype: DType,
-    src_hashes: SmallVec<[u64; 4]>,
+    src_ids: SmallVec<[u64; 4]>,
     op_data: OpData,
     tag: Option<SmallVec<[usize; 2]>>,
     /// Pre-computed hash — avoids re-hashing on every HashMap operation.
@@ -85,7 +85,7 @@ impl PartialEq for UOpKey {
         self.cached_hash == other.cached_hash
             && self.op_discriminant == other.op_discriminant
             && self.dtype == other.dtype
-            && self.src_hashes == other.src_hashes
+            && self.src_ids == other.src_ids
             && self.op_data == other.op_data
             && self.tag == other.tag
     }
@@ -104,13 +104,7 @@ enum OpData {
     Const(ConstValueHash),
     Unique(usize),
     LUnique(usize),
-    Device(DeviceSpec),
-    // DefineLocal identity is its per-kernel slot (tinygrad parity: the LDS arg is
-    // a per-kernel-deterministic index, renumbered from 0 per kernel — no global
-    // counter — so structurally-identical kernels dedup to one compile). Slots are
-    // unique within a kernel (the renderer names LDS `@local{slot}`); across kernels
-    // they're processed as independent per-kernel ASTs, so interning is harmless.
-    DefineLocal(usize), // slot
+    CopyDevice(DeviceSpec),
 
     // Grouped operations
     Unary(UnaryOp),
@@ -124,18 +118,9 @@ enum OpData {
     // Special operations
     MSelectIdx(usize),
     SpecialName(String),
-
-    // Buffer operations
-    //
-    // `local` distinguishes buffers tagged by `Op::LUnique` (per-kernel local
-    // counter starting at 0 — see `schedule/src/rangeify/kernel.rs`'s
-    // `next_lunique`) from buffers tagged by `Op::Unique` (the global atomic
-    // `next_unique_id`). Without the discriminator, `BufferData(0, size)`
-    // could collide between an LUnique slot 0 and a Unique with global id 0.
-    BufferData { local: bool, id: usize, size: usize },
     ParamData(ParamArg),
-    BufferView(usize, usize),
-    Bufferize(BufferizeOpts),
+    SliceSize(usize),
+    Stage(BufferizeOpts),
 
     // Movement/Reshape operations
     PermuteAxes(Vec<usize>),
@@ -144,29 +129,26 @@ enum OpData {
 
     // Reduction operations
     ReduceAxisData(ReduceOp, Vec<usize>),
-    ReduceOp(ReduceOp),
-    AllReduceOp(ReduceOp),
+    ReduceData(ReduceOp, usize),
+    AllReduceData(ReduceOp, DeviceSpec),
 
     // Control flow operations
     RangeData(AxisId, AxisType),
 
     // Vector operations
-    GepIndices(Vec<usize>),
     VConstValues(Vec<ConstValueHash>),
 
     // Symbolic/Define operations
     DefineVarData(String, i64, i64), // (name, min_val, max_val)
-    DefineRegData(usize, usize),     // (size, id)
 
     // Advanced operations
     WmmaData(Box<WmmaMetadata>),
-    ContractRanges(Vec<(usize, usize)>),
-    UnrollAxes(Vec<(usize, usize)>),
     CustomCode(String),
     CustomFunctionKind(CustomFunctionKind),
     CallInfoData(CallInfo),
-    SourceCode(String),
-    ProgramBinaryBytes(Vec<u8>),
+    SourceData(String, Option<SourceStageIdentity>),
+    ProgramBinaryData(Vec<u8>, Option<BinaryStageIdentity>),
+    ProgramData(ProgramInfo, Option<SourceStageIdentity>, Option<BinaryStageIdentity>),
     SinkInfo(Option<crate::types::KernelInfo>),
 
     // Movement operations with extra data
@@ -177,32 +159,28 @@ enum OpData {
 
     // Operations with only children (no extra semantic data)
     None,
+
+    GetAddrDevice(DeviceSpec),
+    // Tail variant preserves all pre-existing OpData hash discriminants.
+    InsArg(InsArg),
 }
 
-/// Get child UOp structural hashes for hash consing.
-///
-/// Uses `content_hash` (structural) instead of `id` (identity) so that
-/// structurally identical children produce the same key — even if they're
-/// different `Arc` pointers. This makes hash consing truly structural,
-/// matching Tinygrad's behavior where `id()` works because hash consing
-/// guarantees same structure = same object.
-///
-/// Returns SmallVec of hashes, optimized for common case of ≤4 children (inline storage).
-fn src_hashes(op: &Op) -> SmallVec<[u64; 4]> {
-    op.children().into_iter().map(|child| child.content_hash).collect()
+/// Child identities for in-process hash consing. Children are already
+/// hash-consed, while IDs distinguish equal-content nodes with different tags
+/// and cannot alias on a content-hash collision.
+fn src_ids(op: &Op) -> SmallVec<[u64; 4]> {
+    op.children().into_iter().map(|child| child.id).collect()
 }
 
 impl UOpKey {
     fn new(op: &Op, dtype: DType, tag: &Option<SmallVec<[usize; 2]>>) -> Self {
         let op_discriminant = discriminant(op);
-        let src_hashes = src_hashes(op);
+        let src_ids = src_ids(op);
 
         let op_data = match op {
             Op::Const(c) => OpData::Const(*c),
             Op::Unique(id) => OpData::Unique(*id),
             Op::LUnique(id) => OpData::LUnique(*id),
-            Op::Device(d) => OpData::Device(d.clone()),
-            Op::DefineLocal(slot) => OpData::DefineLocal(*slot),
             Op::Unary(unary_op, _) => OpData::Unary(*unary_op),
             Op::Binary(binary_op, _, _) => OpData::Binary(*binary_op),
             Op::Ternary(ternary_op, _, _, _) => OpData::Ternary(*ternary_op),
@@ -210,57 +188,55 @@ impl UOpKey {
             Op::BitCast { dtype, .. } => OpData::BitCastDType(dtype.clone()),
             Op::MSelect { device_index, .. } => OpData::MSelectIdx(*device_index),
             Op::Special { name, .. } => OpData::SpecialName(name.clone()),
-            Op::Buffer { unique, size, .. } => match unique.op() {
-                Op::Unique(id) => OpData::BufferData { local: false, id: *id, size: *size },
-                Op::LUnique(id) => OpData::BufferData { local: true, id: *id, size: *size },
-                // Fallback: use UOp's stable id (already globally unique).
-                _ => OpData::BufferData { local: false, id: unique.id as usize, size: *size },
-            },
-            Op::BufferView { size, offset, .. } => OpData::BufferView(*size, *offset),
-            Op::Bufferize { opts, .. } => OpData::Bufferize(opts.clone()),
+            Op::GetAddr { device, .. } => OpData::GetAddrDevice(device.clone()),
+            Op::Copy { device, .. } => OpData::CopyDevice(device.clone()),
+            Op::Buffer { arg, .. } | Op::Param { arg, .. } => OpData::ParamData(arg.clone()),
+            Op::Slice { size, .. } => OpData::SliceSize(*size),
+            Op::Stage { opts, .. } => OpData::Stage(opts.clone()),
             Op::Permute { axes, .. } => OpData::PermuteAxes(axes.clone()),
             Op::Flip { axes, .. } => OpData::FlipAxes(axes.clone()),
             Op::Multi { axis, .. } => OpData::MultiAxis(*axis),
             Op::ReduceAxis { reduce_op, axes, .. } => OpData::ReduceAxisData(*reduce_op, axes.clone()),
-            Op::Reduce { reduce_op, .. } => OpData::ReduceOp(*reduce_op),
-            Op::AllReduce { reduce_op, .. } => OpData::AllReduceOp(*reduce_op),
-            Op::Range { axis_id, axis_type, .. } => OpData::RangeData(*axis_id, *axis_type),
-            Op::Gep { indices, .. } => OpData::GepIndices(indices.clone()),
+            Op::Reduce { reduce_op, num_axes, .. } => OpData::ReduceData(*reduce_op, *num_axes),
+            Op::AllReduce { reduce_op, device, .. } => OpData::AllReduceData(*reduce_op, device.clone()),
+            Op::Range { axis_id, axis_type, .. } => OpData::RangeData(axis_id.clone(), *axis_type),
             Op::VConst { values } => OpData::VConstValues(values.iter().map(|v| ConstValueHash(*v)).collect()),
             Op::DefineVar { name, min_val, max_val } => OpData::DefineVarData(name.clone(), *min_val, *max_val),
-            Op::DefineReg { size, id } => OpData::DefineRegData(*size, *id),
             Op::Wmma { metadata, .. } => OpData::WmmaData(metadata.clone().into()),
-            Op::Contract { upcast_ranges, .. } => OpData::ContractRanges(upcast_ranges.clone()),
-            Op::Unroll { unroll_axes, .. } => OpData::UnrollAxes(unroll_axes.clone()),
             Op::Custom { code, .. } | Op::CustomI { code, .. } => OpData::CustomCode(code.clone()),
             Op::CustomFunction { kind, .. } => OpData::CustomFunctionKind(kind.clone()),
             Op::Call { info, .. } | Op::Function { info, .. } => OpData::CallInfoData(info.clone()),
             Op::Sink { info, .. } => OpData::SinkInfo(info.clone()),
-            Op::Source { code } => OpData::SourceCode(code.clone()),
-            Op::ProgramBinary { bytes } => OpData::ProgramBinaryBytes(bytes.clone()),
+            Op::Source { code, identity } => OpData::SourceData(code.clone(), identity.clone()),
+            Op::ProgramBinary { bytes, identity } => OpData::ProgramBinaryData(bytes.clone(), identity.clone()),
+            Op::Program { info, source, binary, .. } => OpData::ProgramData(
+                info.clone(),
+                source.as_ref().and_then(|stage| match stage.op() {
+                    Op::Source { identity, .. } => identity.clone(),
+                    _ => None,
+                }),
+                binary.as_ref().and_then(|stage| match stage.op() {
+                    Op::ProgramBinary { identity, .. } => identity.clone(),
+                    _ => None,
+                }),
+            ),
+            Op::Ins { arg, .. } => OpData::InsArg(arg.clone()),
             Op::Contiguous { opts, .. } => OpData::ContiguousOpts(opts.to_vec()),
-            Op::Param { arg, .. } => OpData::ParamData(arg.clone()),
             // All remaining ops encode semantic data entirely through children
-            // (captured by src_hashes) — no extra OpData needed.
+            // (captured by src_ids) — no extra OpData needed.
             Op::Noop => OpData::None,
             // Multi-child ops: children ARE the data
             Op::Group { .. }
             | Op::Stack { .. }
-            | Op::Vectorize { .. }
-            | Op::Cat { .. }
-            | Op::PtrCat { .. }
             | Op::MStack { .. }
             | Op::Barrier { .. }
             | Op::Linear { .. }
-            | Op::Program { .. }
             | Op::Tuple { .. } => OpData::None,
             Op::GetTuple { index, .. } => OpData::GetTupleIndex(*index),
             // Movement ops: shape/bounds are Arc<UOp> children
             Op::Reshape { .. } | Op::Expand { .. } | Op::Pad { .. } | Op::Shrink { .. } => OpData::None,
             // Memory/control: all fields are Arc<UOp> children
-            Op::Index { .. } | Op::PointerIndex { .. } | Op::Copy { .. } | Op::Load { .. } | Op::Store { .. } => {
-                OpData::None
-            }
+            Op::Index { .. } | Op::Load { .. } | Op::Store { .. } => OpData::None,
             Op::If { .. } | Op::EndIf { .. } | Op::End { .. } | Op::After { .. } => OpData::None,
             // Single-source ops with no extra data
             Op::Detach { .. } | Op::ContiguousBackward { .. } | Op::Precast { .. } => OpData::None,
@@ -276,7 +252,7 @@ impl UOpKey {
             let mut h = Xxh64::new(0);
             op_discriminant.hash(&mut h);
             dtype.hash(&mut h);
-            for id in &src_hashes {
+            for id in &src_ids {
                 h.write_u64(*id);
             }
             op_data.hash(&mut h);
@@ -284,7 +260,7 @@ impl UOpKey {
             h.finish()
         };
 
-        Self { op_discriminant, dtype, src_hashes, op_data, tag: tag.clone(), cached_hash }
+        Self { op_discriminant, dtype, src_ids, op_data, tag: tag.clone(), cached_hash }
     }
 }
 
@@ -372,6 +348,15 @@ impl UOp {
     #[track_caller]
     pub fn new_tagged(op: Op, dtype: DType, tag: Option<SmallVec<[usize; 2]>>) -> Arc<Self> {
         use papaya::{Compute, Operation};
+
+        if let Op::Load { index, alt, gate } = &op {
+            assert_eq!(dtype, index.dtype(), "LOAD dtype must match its address dtype");
+            assert_eq!(alt.is_some(), gate.is_some(), "LOAD requires either index only or index, alt, and gate");
+            if let (Some(alt), Some(gate)) = (alt, gate) {
+                assert_eq!(gate.dtype(), DType::Bool, "LOAD gate must have bool dtype");
+                assert!(Self::is_invalid_marker(alt) || alt.dtype() == dtype, "LOAD alt dtype must match LOAD dtype");
+            }
+        }
 
         let caller_location = std::panic::Location::caller();
         let key = UOpKey::new(&op, dtype.clone(), &tag);

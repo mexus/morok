@@ -27,6 +27,18 @@ fn test_xor_int32() {
     assert_eq!(UOp::native_const(0b1010i32).try_xor_op(&UOp::native_const(0b1100i32)).unwrap().dtype(), DType::Int32);
 }
 
+#[test]
+fn test_weak_int_bitwise_and_shift_graph_construction() {
+    let value = UOp::index_const(0b1010);
+    let mask = UOp::index_const(0b1100);
+    let shift = UOp::index_const(2);
+
+    for node in [value.try_and_op(&mask).unwrap(), value.try_xor_op(&mask).unwrap(), value.try_shr_op(&shift).unwrap()]
+    {
+        assert_eq!(node.dtype(), DType::WeakInt);
+    }
+}
+
 // =========================================================================
 // Shift Operations
 // =========================================================================
@@ -57,6 +69,16 @@ fn test_shift_preserves_lhs_dtype() {
     // Shift should preserve LHS dtype (Int64), not promote
     let result = value.try_shl_op(&shift).unwrap();
     assert_eq!(result.dtype(), DType::Int64);
+}
+
+#[test]
+fn test_shift_rejects_bool_sources_without_broadening_bitwise_bool() {
+    let value = UOp::native_const(true);
+    let shift = UOp::native_const(false);
+
+    assert!(value.try_shl_op(&shift).is_err());
+    assert!(value.try_shr_op(&shift).is_err());
+    assert!(value.try_and_op(&shift).is_ok());
 }
 
 // =========================================================================
@@ -184,6 +206,14 @@ fn test_shr_float_error() {
 
     let result = float_val.try_shr_op(&shift);
     assert!(matches!(result, Err(Error::InvalidDTypeForBinaryOp { .. })));
+}
+
+#[test]
+fn test_shift_float_rhs_error() {
+    let value = UOp::native_const(16i32);
+    let shift = UOp::native_const(1.0f32);
+
+    assert!(matches!(value.try_shr_op(&shift), Err(Error::InvalidDTypeForBinaryOp { .. })));
 }
 
 #[test]

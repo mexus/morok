@@ -30,8 +30,8 @@ pub mod tree;
 
 // Re-export the main types
 pub use canonical::{
-    CanonicalArg, CanonicalConst, CanonicalDType, CanonicalGraph, CanonicalNode, CanonicalShapeDim,
-    dump_canonical_stage,
+    CanonicalArg, CanonicalAxis, CanonicalConst, CanonicalDType, CanonicalGraph, CanonicalNode, CanonicalProgramValue,
+    CanonicalShapeDim, CanonicalVerboseNode, dump_canonical_stage,
 };
 pub use core::{IntoUOp, UOp, UOpKey};
 pub use cost::compute_ops_estimate;

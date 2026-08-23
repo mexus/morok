@@ -10,12 +10,13 @@
 //! - Explicit Result types instead of exceptions
 //! - Non-automatic broadcasting (must be explicit)
 
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use smallvec::{SmallVec, smallvec};
 use snafu::ensure;
 
-use crate::{ConstValue, Op, Result, SInt, UOp, error::*};
+use crate::{ConstValue, Op, Result, SInt, UOp, UOpKey, error::*};
 
 /// Shape type - sequence of symbolic integers.
 ///
@@ -310,14 +311,16 @@ pub fn to_vec_isize(shape: &Shape) -> Result<Vec<isize>> {
 /// Returns None if the UOp is not in the expected format.
 fn extract_shape_from_uop(shape_uop: &Arc<UOp>) -> Option<Shape> {
     match shape_uop.op() {
-        // pm_lower_index_dtype can wrap shape args in CAST(Index <- Int32/Int64).
-        // Unwrap and decode the underlying shape payload.
-        Op::Cast { src, .. } | Op::BitCast { src, .. } => extract_shape_from_uop(src),
+        // A cast around an aggregate shape payload is representation-only. A
+        // cast around a scalar expression is itself the symbolic dimension,
+        // matching Tinygrad's shape_to_shape_arg/marg behavior.
+        Op::Cast { src, .. } | Op::BitCast { src, .. }
+            if matches!(src.op(), Op::Stack { .. } | Op::VConst { .. } | Op::Const(_)) =>
+        {
+            extract_shape_from_uop(src)
+        }
 
         Op::Stack { sources } => Some(sources.iter().cloned().map(SInt::from).collect()),
-
-        // Legacy shape payloads remain readable during the STACK cutover.
-        Op::Vectorize { elements } => Some(elements.into_iter().cloned().map(SInt::from).collect()),
 
         // Single CONST value (for 1D shapes)
         Op::Const(const_hash) => match const_hash.0 {
@@ -349,6 +352,122 @@ fn extract_shape_from_uop(shape_uop: &Arc<UOp>) -> Option<Shape> {
     }
 }
 
+fn display_slot(slot: usize) -> isize {
+    if slot == usize::MAX { -1 } else { slot as isize }
+}
+
+fn actual_for_formal<'a>(slot: usize, args: &'a [Arc<UOp>]) -> crate::Result<&'a Arc<UOp>> {
+    let actual = if slot == usize::MAX { args.last() } else { args.get(slot) };
+    actual.ok_or(crate::Error::CallFormalSlotMissing { slot: display_slot(slot), arg_count: args.len() })
+}
+
+/// Build the pinned FUNCTION formal-to-actual map used when inlining a body.
+///
+/// PARAM slots are positional and may be sparse; unused actual arguments are
+/// valid. Tinygrad's scalar slot `-1` is represented by `usize::MAX` and is a
+/// free body variable during execution, so it is excluded here.
+#[allow(clippy::mutable_key_type)]
+pub fn function_param_substitutions(body: &Arc<UOp>, args: &[Arc<UOp>]) -> crate::Result<HashMap<UOpKey, Arc<UOp>>> {
+    let mut substitutions = HashMap::new();
+    for formal in body.toposort_call_aware(false) {
+        let Op::Param { arg, .. } = formal.op() else { continue };
+        if arg.slot == usize::MAX {
+            continue;
+        }
+
+        let actual = actual_for_formal(arg.slot, args)?;
+        let actual_axis = match actual.op() {
+            Op::Param { arg, .. } | Op::Buffer { arg, .. } => arg.axis,
+            _ => None,
+        };
+        if arg.axis != actual_axis {
+            return Err(crate::Error::CallArgAxisMismatch {
+                arg_index: arg.slot,
+                expected: arg.axis,
+                got: actual_axis,
+            });
+        }
+
+        let expected_shape = formal.shape()?.cloned();
+        let got_shape = actual.shape()?.cloned();
+        if !matches!((&expected_shape, &got_shape), (Some(expected), Some(got)) if max_shapes_equal(expected, got)) {
+            return Err(crate::Error::CallArgShapeMismatch {
+                arg_index: arg.slot,
+                expected: expected_shape.map(Box::new),
+                got: got_shape.map(Box::new),
+            });
+        }
+        if formal.dtype() != actual.dtype() {
+            return Err(crate::Error::CallArgDTypeMismatch {
+                arg_index: arg.slot,
+                expected: formal.dtype(),
+                got: actual.dtype(),
+            });
+        }
+
+        substitutions.insert(UOpKey(formal), actual.clone());
+    }
+    Ok(substitutions)
+}
+
+/// Substitute only PARAMs reachable from one selected FUNCTION output shape.
+///
+/// This intentionally does not inspect or validate the rest of the FUNCTION
+/// body. Tinygrad rewrites each selected `inner_shape` independently, including
+/// Python slot `-1` selecting the last call argument.
+#[allow(clippy::mutable_key_type)]
+pub fn substitute_selected_shape(shape: &Shape, _function: &Arc<UOp>, args: &[Arc<UOp>]) -> crate::Result<Shape> {
+    let mut substitutions = HashMap::new();
+    for dim in shape {
+        let SInt::Symbolic(expr) = dim else { continue };
+        for formal in expr.toposort_call_aware(false) {
+            let Op::Param { arg, .. } = formal.op() else { continue };
+            let actual = actual_for_formal(arg.slot, args)?;
+            if actual.dtype() == svod_dtype::DType::Void {
+                return Err(crate::Error::CallShapeSubstitutionUnsupported {
+                    slot: display_slot(arg.slot),
+                    reason: "void actual argument cannot be used as a symbolic value".into(),
+                });
+            }
+            substitutions.insert(UOpKey(formal), actual.clone());
+        }
+    }
+
+    let formal_ids: HashMap<u64, isize> = substitutions
+        .keys()
+        .map(|key| {
+            let Op::Param { arg, .. } = key.0.op() else { unreachable!("substitution key must be PARAM") };
+            (key.0.id, display_slot(arg.slot))
+        })
+        .collect();
+    let caller_ids: HashSet<u64> =
+        args.iter().flat_map(|arg| arg.toposort_call_aware(false)).map(|node| node.id).collect();
+
+    let mut result = Shape::with_capacity(shape.len());
+    let mut dangling = Vec::new();
+    for dim in shape {
+        let SInt::Symbolic(expr) = dim else {
+            result.push(dim.clone());
+            continue;
+        };
+        let rewritten = expr.substitute_walk_preserve_calls(&substitutions);
+        for node in rewritten.toposort_call_aware(false) {
+            if let Some(slot) = formal_ids.get(&node.id)
+                && !caller_ids.contains(&node.id)
+            {
+                dangling.push(*slot);
+            }
+        }
+        result.push(SInt::from(rewritten));
+    }
+    dangling.sort_unstable();
+    dangling.dedup();
+    if !dangling.is_empty() {
+        return Err(crate::Error::CallShapeDanglingFormal { slots: dangling });
+    }
+    Ok(result)
+}
+
 /// Extract padding/shrink ranges from UOps.
 ///
 /// Returns pairs of (begin, end) for each dimension.
@@ -376,7 +495,7 @@ fn extract_ranges_from_uops(begins_uop: &Arc<UOp>, ends_uop: &Arc<UOp>) -> Optio
 /// # use smallvec::smallvec;
 /// let shape = smallvec![SInt::from(3), SInt::from(4), SInt::from(5)];
 /// let shape_uop = shape_to_uop(&shape);
-/// assert_eq!(shape_uop.dtype(), DType::Index);
+/// assert_eq!(shape_uop.dtype(), DType::WeakInt);
 ///
 /// // Scalar (empty shape) is supported
 /// let scalar_shape: smallvec::SmallVec<[SInt; 4]> = smallvec![];
@@ -390,9 +509,19 @@ pub fn shape_to_uop(shape: &Shape) -> Arc<UOp> {
     if shape.is_empty() {
         return UOp::stack(SmallVec::new());
     }
+    if shape.len() == 1 {
+        return shape[0].to_uop(DType::WeakInt);
+    }
 
-    let elements: SmallVec<[Arc<UOp>; 4]> = shape.iter().map(|dim| dim.to_uop(DType::Index)).collect();
-    if elements.len() == 1 { elements[0].clone() } else { UOp::stack(elements) }
+    let elements: SmallVec<[Arc<UOp>; 4]> = shape
+        .iter()
+        .map(|dim| match dim {
+            SInt::Const(value) => UOp::const_(DType::WeakInt, ConstValue::Int(*value as i64)),
+            SInt::Symbolic(value) => value.clone(),
+            SInt::Infer => panic!("cannot encode unresolved SInt::Infer in a shape argument"),
+        })
+        .collect();
+    UOp::stack(elements)
 }
 
 /// Convert a vector of (begin, end) ranges to two UOps for Pad/Shrink operations.
@@ -407,8 +536,8 @@ pub fn ranges_to_uops(ranges: &[(SInt, SInt)]) -> (Arc<UOp>, Arc<UOp>) {
 
     assert!(!ranges.is_empty(), "ranges_to_uops does not support empty ranges (scalars); handle at callsite");
 
-    let begins: SmallVec<[Arc<UOp>; 4]> = ranges.iter().map(|(begin, _)| begin.to_uop(DType::Index)).collect();
-    let ends: SmallVec<[Arc<UOp>; 4]> = ranges.iter().map(|(_, end)| end.to_uop(DType::Index)).collect();
+    let begins: SmallVec<[Arc<UOp>; 4]> = ranges.iter().map(|(begin, _)| begin.to_uop(DType::WeakInt)).collect();
+    let ends: SmallVec<[Arc<UOp>; 4]> = ranges.iter().map(|(_, end)| end.to_uop(DType::WeakInt)).collect();
 
     let encode = |values: SmallVec<[Arc<UOp>; 4]>| {
         if values.len() == 1 { values[0].clone() } else { UOp::stack(values) }
@@ -457,23 +586,7 @@ pub fn infer_shape_from_op(uop: &UOp) -> crate::Result<Option<Shape>> {
             }
         }
 
-        Op::Unique(_) | Op::LUnique(_) | Op::Device(_) | Op::Noop => None,
-
-        // DefineLocal: shape from PtrDType.size
-        Op::DefineLocal(_id) => {
-            use svod_dtype::DType;
-            match uop.dtype() {
-                DType::Ptr { size: Some(s), .. } => Some(smallvec![SInt::from(s)]),
-                DType::Ptr { size: None, .. } => {
-                    let neg_one = UOp::index_const(-1);
-                    Some(smallvec![SInt::from(neg_one)])
-                }
-                dtype => {
-                    return crate::error::BufferDefRequiresPtrDTypeSnafu { op: "DefineLocal", dtype: dtype.clone() }
-                        .fail();
-                }
-            }
-        }
+        Op::Unique(_) | Op::LUnique(_) | Op::Noop => None,
 
         // =====================================================================
         // Unary operations - preserve shape
@@ -481,43 +594,25 @@ pub fn infer_shape_from_op(uop: &UOp) -> crate::Result<Option<Shape>> {
         Op::Unary(_, input) => input.shape()?.cloned(),
 
         // =====================================================================
-        // Binary operations - validate shapes match
+        // Elementwise operations use NumPy-style broadcasting. The expander
+        // materializes these broadcasts before devectorization.
         // =====================================================================
-        Op::Binary(op, lhs, rhs) => {
-            match (lhs.shape()?, rhs.shape()?) {
-                (Some(lhs_shape), Some(rhs_shape)) if !shapes_equal(lhs_shape, rhs_shape) => {
-                    // Both have shapes but they differ - ERROR
-                    return BinaryShapeMismatchSnafu {
-                        op: *op,
-                        lhs: Box::new(lhs_shape.clone()),
-                        rhs: Box::new(rhs_shape.clone()),
-                    }
-                    .fail();
-                }
-                (Some(s), _) | (_, Some(s)) => Some(s.clone()),
-                (None, None) => None, // Both shapeless - valid (RANGE + RANGE)
-            }
-        }
+        Op::Binary(_op, lhs, rhs) => match (lhs.shape()?, rhs.shape()?) {
+            (Some(lhs_shape), Some(rhs_shape)) => Some(broadcast_shapes(&[lhs_shape.clone(), rhs_shape.clone()])?),
+            (Some(shape), _) | (_, Some(shape)) => Some(shape.clone()),
+            (None, None) => None,
+        },
 
         // =====================================================================
         // Ternary operations
         // =====================================================================
-        Op::Ternary(_, _condition, true_val, false_val) => {
-            // Result has shape of value branches - they must match
-            let true_shape = true_val.shape()?;
-            let false_shape = false_val.shape()?;
-
-            match (true_shape, false_shape) {
-                (Some(ts), Some(fs)) if !shapes_equal(ts, fs) => {
-                    return crate::error::TernaryBranchShapeMismatchSnafu {
-                        true_branch: Box::new(ts.clone()),
-                        false_branch: Box::new(fs.clone()),
-                    }
-                    .fail();
-                }
-                (Some(s), _) | (_, Some(s)) => Some(s.clone()),
-                (None, None) => None,
-            }
+        Op::Ternary(_, condition, true_val, false_val) => {
+            let shapes = [condition, true_val, false_val]
+                .into_iter()
+                .filter_map(|source| source.shape().transpose())
+                .map(|shape| shape.cloned())
+                .collect::<Result<Vec<_>>>()?;
+            if shapes.is_empty() { None } else { Some(broadcast_shapes(&shapes)?) }
         }
 
         // =====================================================================
@@ -550,17 +645,10 @@ pub fn infer_shape_from_op(uop: &UOp) -> crate::Result<Option<Shape>> {
         }
 
         // =====================================================================
-        // Vector operations (kernel-level, no tensor shape)
-        // =====================================================================
-        Op::Vectorize { .. } => None,
-
-        Op::Gep { .. } => Some(SmallVec::new()), // Extract element from vector -> scalar
-
-        // =====================================================================
         // Movement operations
         // =====================================================================
         Op::Reshape { new_shape, .. } => {
-            // Extract shape from VECTORIZE/CONST UOp
+            // Extract shape from STACK/VCONST/CONST UOps.
             extract_shape_from_uop(new_shape)
         }
 
@@ -571,7 +659,7 @@ pub fn infer_shape_from_op(uop: &UOp) -> crate::Result<Option<Shape>> {
         }
 
         Op::Expand { new_shape, .. } => {
-            // Extract shape from VECTORIZE/CONST UOp
+            // Extract shape from STACK/VCONST/CONST UOps.
             extract_shape_from_uop(new_shape)
         }
 
@@ -593,29 +681,15 @@ pub fn infer_shape_from_op(uop: &UOp) -> crate::Result<Option<Shape>> {
             )
         }
 
-        Op::Shrink { src, begins, ends } => {
+        Op::Shrink { src, offsets, sizes } => {
             let src_shape = src.shape()?.ok_or_else(|| crate::Error::VoidTypeInOp)?;
-            let ranges = extract_ranges_from_uops(begins, ends).ok_or_else(|| crate::Error::VoidTypeInOp)?;
+            let ranges = extract_ranges_from_uops(offsets, sizes).ok_or_else(|| crate::Error::VoidTypeInOp)?;
 
             if src_shape.len() != ranges.len() {
                 return Ok(None);
             }
 
-            // New shape = end - begin for each dimension
-            Some(
-                ranges
-                    .iter()
-                    .zip(src_shape.iter())
-                    .map(|((begin, end), dim)| {
-                        // Identity range (0, dim_size) → preserve dim (supports symbolic batch)
-                        if begin.as_const() == Some(0) && end == dim {
-                            return Ok(dim.clone());
-                        }
-                        // end - begin (works for both concrete and symbolic)
-                        Ok(end - begin)
-                    })
-                    .collect::<crate::Result<Shape>>()?,
-            )
+            Some(ranges.into_iter().map(|(_, size)| size).collect())
         }
 
         Op::Flip { src, .. } => {
@@ -645,9 +719,12 @@ pub fn infer_shape_from_op(uop: &UOp) -> crate::Result<Option<Shape>> {
             )
         }
 
-        Op::Reduce { .. } => {
-            // Reduce with ranges - context dependent
-            None
+        Op::Reduce { src, num_axes, .. } => {
+            let src_shape = src.shape()?.ok_or_else(|| crate::Error::VoidTypeInOp)?;
+            if *num_axes > src_shape.len() {
+                return Err(crate::Error::ReduceInvalidNumAxes { num_axes: *num_axes, shape_dims: src_shape.len() });
+            }
+            Some(src_shape.iter().skip(*num_axes).cloned().collect())
         }
 
         Op::AllReduce { src, .. } => {
@@ -658,10 +735,8 @@ pub fn infer_shape_from_op(uop: &UOp) -> crate::Result<Option<Shape>> {
         // =====================================================================
         // Buffer and memory operations - shape depends on buffer
         // =====================================================================
-        // Buffer operations have shape (size,)
-        Op::Buffer { size, .. } => Some(smallvec![SInt::from(*size)]),
-        Op::Param { shape, .. } => extract_shape_from_uop(shape),
-        Op::BufferView { size, .. } => Some(smallvec![SInt::from(*size)]),
+        Op::Buffer { shape, .. } | Op::Param { shape, .. } => extract_shape_from_uop(shape),
+        Op::Slice { size, .. } => Some(smallvec![SInt::from(*size)]),
 
         // Passthrough operations
         Op::Copy { src, .. } => src.shape()?.cloned(),
@@ -670,9 +745,8 @@ pub fn infer_shape_from_op(uop: &UOp) -> crate::Result<Option<Shape>> {
             None => None,
         },
 
-        // BUFFERIZE shape is derived from ranges (like Tinygrad)
-        // Shape = [end_0, end_1, ...] where end_i is the size of each range
-        Op::Bufferize { ranges, .. } => {
+        // STAGE prepends its closed range extents to the compute shape.
+        Op::Stage { compute, ranges, .. } => {
             let mut dims: Shape = SmallVec::new();
             for range in ranges.iter() {
                 match range.op() {
@@ -713,16 +787,28 @@ pub fn infer_shape_from_op(uop: &UOp) -> crate::Result<Option<Shape>> {
                     }
                 }
             }
+            let Some(compute_shape) = compute.shape()? else { return Ok(None) };
+            dims.extend(compute_shape.iter().cloned());
             Some(dims)
         }
 
-        // These have no shape
-        Op::Index { .. } | Op::Load { .. } | Op::Store { .. } => None,
+        Op::Index { buffer, indices } => {
+            let mut shape = Shape::new();
+            for index in indices {
+                let Some(index_shape) = index.shape()? else { return Ok(None) };
+                shape.extend(index_shape.iter().cloned());
+            }
+            let Some(buffer_shape) = buffer.shape()? else { return Ok(None) };
+            shape.extend(buffer_shape.iter().skip(indices.len()).cloned());
+            Some(shape)
+        }
+        Op::Load { index, .. } | Op::Store { index, .. } => index.shape()?.cloned(),
 
         // =====================================================================
         // Control flow - no static shape
         // =====================================================================
-        Op::If { .. } | Op::EndIf { .. } | Op::Range { .. } | Op::Barrier { .. } => None,
+        Op::Range { .. } => Some(SmallVec::new()),
+        Op::If { .. } | Op::EndIf { .. } | Op::Barrier { .. } => None,
 
         // End passes through the computation shape
         Op::End { computation, .. } => computation.shape()?.cloned(),
@@ -733,24 +819,36 @@ pub fn infer_shape_from_op(uop: &UOp) -> crate::Result<Option<Shape>> {
         // MSelect passes through buffer shape
         Op::MSelect { buffer, .. } => buffer.shape()?.cloned(),
 
-        Op::Special { .. } => None,
+        Op::Special { .. } => Some(SmallVec::new()),
 
         Op::DefineVar { .. } => Some(SmallVec::new()), // Variable is scalar
 
         Op::Bind { value, .. } => value.shape()?.cloned(),
 
-        Op::DefineReg { size, .. } => Some(smallvec![SInt::from(*size)]),
-
         // =====================================================================
         // Advanced operations
         // =====================================================================
-        Op::Wmma { .. } | Op::Contract { .. } | Op::Unroll { .. } => {
-            // These require more complex shape computation
-            None
+        Op::Wmma { a, b, c, .. } => {
+            let (Some(a_shape), Some(b_shape), Some(c_shape)) = (a.shape()?, b.shape()?, c.shape()?) else {
+                return Ok(None);
+            };
+            let Some((c_width, c_prefix)) = c_shape.split_last() else {
+                return Ok(None);
+            };
+            let a_prefix = &a_shape[..a_shape.len().saturating_sub(1)];
+            let b_prefix = &b_shape[..b_shape.len().saturating_sub(1)];
+            let mut shape = broadcast_shapes(&[a_prefix.into(), b_prefix.into(), c_prefix.into()])?;
+            shape.push(c_width.clone());
+            Some(shape)
         }
-
         Op::Program { .. } | Op::Linear { .. } | Op::Source { .. } | Op::ProgramBinary { .. } => None,
-        Op::Call { body, .. } | Op::Function { body, .. } => body.shape()?.cloned(),
+        // INS shape is scalar; vector width is part of the target encoding.
+        Op::Ins { .. } => (uop.dtype() != svod_dtype::DType::Void).then(SmallVec::new),
+        // FUNCTION is a void tuple-producing wrapper. A void CALL has no
+        // shape; typed instruction-style CALLs are scalar, independent of the
+        // opaque implementation body.
+        Op::Function { .. } => None,
+        Op::Call { .. } => (uop.dtype() != svod_dtype::DType::Void).then(SmallVec::new),
         // TUPLE is a void-typed grouping; it has no shape itself.
         Op::Tuple { .. } => None,
         // GETTUPLE returns the shape of its inner element when the source is a TUPLE
@@ -761,7 +859,7 @@ pub fn infer_shape_from_op(uop: &UOp) -> crate::Result<Option<Shape>> {
                 .ok_or(crate::Error::GetTupleIndexOutOfBounds { index: *index, len: tuple_src.len(), kind: "TUPLE" })?
                 .shape()?
                 .cloned(),
-            Op::Function { body, .. } => match body.op() {
+            Op::Function { body, args, .. } => match body.op() {
                 Op::Tuple { src: tuple_src } => tuple_src
                     .get(*index)
                     .ok_or(crate::Error::GetTupleIndexOutOfBounds {
@@ -770,7 +868,8 @@ pub fn infer_shape_from_op(uop: &UOp) -> crate::Result<Option<Shape>> {
                         kind: "FUNCTION(TUPLE)",
                     })?
                     .shape()?
-                    .cloned(),
+                    .map(|shape| substitute_selected_shape(shape, body, args))
+                    .transpose()?,
                 _ => None,
             },
             _ => None,
@@ -791,10 +890,6 @@ pub fn infer_shape_from_op(uop: &UOp) -> crate::Result<Option<Shape>> {
             None => None,
         },
 
-        // PointerIndex is a scalar index operation (no shape)
-        Op::PointerIndex { .. } => Some(smallvec![]),
-
-        // Cat and PtrCat are kernel-level vector ops (no tensor shape)
-        Op::Cat { .. } | Op::PtrCat { .. } => None,
+        Op::GetAddr { .. } => Some(smallvec![]),
     })
 }

@@ -4,7 +4,10 @@ use proptest::prelude::*;
 
 use svod_dtype::DType;
 
-use crate::types::ConstValue;
+use crate::UOp;
+use crate::types::{BinaryOp, ConstValue};
+use crate::uop::eval::eval_binary_op_typed;
+use crate::uop::range_eval::compute_sound_vmin_vmax;
 
 use super::generators::*;
 
@@ -156,6 +159,195 @@ proptest! {
                 ConstValue::UInt(v) => prop_assert_eq!(v, 1),
                 ConstValue::Float(v) => prop_assert_eq!(v, 1.0),
                 ConstValue::Bool(v) => prop_assert!(v), // 1 -> true
+            }
+        }
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(1000))]
+
+    #[test]
+    fn exact_float_operation_sound_bounds_enclose_special_results(
+        a_bits in any::<u32>(),
+        b_bits in any::<u32>(),
+        op in prop_oneof![Just(BinaryOp::Add), Just(BinaryOp::Mul), Just(BinaryOp::Fdiv)],
+    ) {
+        let a = f32::from_bits(a_bits);
+        let b = f32::from_bits(b_bits);
+        let lhs = UOp::const_(DType::Float32, ConstValue::Float(a as f64));
+        let rhs = UOp::const_(DType::Float32, ConstValue::Float(b as f64));
+        let expr = UOp::new(crate::Op::Binary(op, lhs, rhs), DType::Float32);
+        let expected = eval_binary_op_typed(op, ConstValue::Float(a as f64), ConstValue::Float(b as f64), svod_dtype::ScalarDType::Float32);
+
+        match expected {
+            Some(ConstValue::Float(value)) if value.is_nan() => prop_assert!(compute_sound_vmin_vmax(&expr).is_none()),
+            Some(value) => prop_assert_eq!(compute_sound_vmin_vmax(&expr), Some((value, value))),
+            None => prop_assert!(compute_sound_vmin_vmax(&expr).is_none()),
+        }
+    }
+}
+
+fn value_is_enclosed(value: ConstValue, min: ConstValue, max: ConstValue) -> bool {
+    match (value, min, max) {
+        (ConstValue::Int(value), ConstValue::Int(min), ConstValue::Int(max)) => min <= value && value <= max,
+        (ConstValue::UInt(value), ConstValue::UInt(min), ConstValue::UInt(max)) => min <= value && value <= max,
+        (ConstValue::Bool(value), ConstValue::Bool(min), ConstValue::Bool(max)) => min <= value && value <= max,
+        _ => false,
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(1000))]
+
+    #[test]
+    fn sampled_int8_binary_values_are_enclosed_by_sound_ranges(
+        a in any::<(i8, i8)>(),
+        b in any::<(i8, i8)>(),
+        shift in 0i8..8,
+    ) {
+        let (amin, amax) = if a.0 <= a.1 { (a.0, a.1) } else { (a.1, a.0) };
+        let (bmin, bmax) = if b.0 <= b.1 { (b.0, b.1) } else { (b.1, b.0) };
+        let lhs = UOp::var("prop_i8_lhs", DType::Int8, i64::from(amin), i64::from(amax));
+        let rhs = UOp::var("prop_i8_rhs", DType::Int8, i64::from(bmin), i64::from(bmax));
+        let samples_a = [amin, amax, ((i16::from(amin) + i16::from(amax)) / 2) as i8];
+        let samples_b = [bmin, bmax, ((i16::from(bmin) + i16::from(bmax)) / 2) as i8];
+
+        for op in [
+            BinaryOp::Add,
+            BinaryOp::Sub,
+            BinaryOp::Mul,
+            BinaryOp::Max,
+            BinaryOp::FloorDiv,
+            BinaryOp::CDiv,
+            BinaryOp::FloorMod,
+            BinaryOp::CMod,
+            BinaryOp::And,
+            BinaryOp::Or,
+            BinaryOp::Xor,
+        ] {
+            let expr = UOp::new(crate::Op::Binary(op, lhs.clone(), rhs.clone()), DType::Int8);
+            if let Some((min, max)) = compute_sound_vmin_vmax(&expr) {
+                for a in samples_a {
+                    for b in samples_b {
+                        if let Some(value) = eval_binary_op_typed(
+                            op,
+                            ConstValue::Int(i64::from(a)),
+                            ConstValue::Int(i64::from(b)),
+                            svod_dtype::ScalarDType::Int8,
+                        ) {
+                            prop_assert!(value_is_enclosed(value, min, max), "{op:?}: {a}, {b} -> {value:?} not in [{min:?}, {max:?}]");
+                        }
+                    }
+                }
+            }
+        }
+
+        let shift_rhs = UOp::const_(DType::Int8, ConstValue::Int(i64::from(shift)));
+        for op in [BinaryOp::Shl, BinaryOp::Shr] {
+            let expr = UOp::new(crate::Op::Binary(op, lhs.clone(), shift_rhs.clone()), DType::Int8);
+            if let Some((min, max)) = compute_sound_vmin_vmax(&expr) {
+                for a in samples_a {
+                    let value = eval_binary_op_typed(
+                        op,
+                        ConstValue::Int(i64::from(a)),
+                        ConstValue::Int(i64::from(shift)),
+                        svod_dtype::ScalarDType::Int8,
+                    ).unwrap();
+                    prop_assert!(value_is_enclosed(value, min, max), "{op:?}: {a}, {shift} -> {value:?} not in [{min:?}, {max:?}]");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sampled_uint8_binary_values_are_enclosed_by_sound_ranges(
+        a in any::<(u8, u8)>(),
+        b in any::<(u8, u8)>(),
+        shift in 0u8..8,
+    ) {
+        let (amin, amax) = if a.0 <= a.1 { (a.0, a.1) } else { (a.1, a.0) };
+        let (bmin, bmax) = if b.0 <= b.1 { (b.0, b.1) } else { (b.1, b.0) };
+        let lhs = UOp::var("prop_u8_lhs", DType::UInt8, i64::from(amin), i64::from(amax));
+        let rhs = UOp::var("prop_u8_rhs", DType::UInt8, i64::from(bmin), i64::from(bmax));
+        let samples_a = [amin, amax, amin + (amax - amin) / 2];
+        let samples_b = [bmin, bmax, bmin + (bmax - bmin) / 2];
+
+        for op in [
+            BinaryOp::Add,
+            BinaryOp::Sub,
+            BinaryOp::Mul,
+            BinaryOp::Max,
+            BinaryOp::FloorDiv,
+            BinaryOp::CDiv,
+            BinaryOp::FloorMod,
+            BinaryOp::CMod,
+            BinaryOp::And,
+            BinaryOp::Or,
+            BinaryOp::Xor,
+        ] {
+            let expr = UOp::new(crate::Op::Binary(op, lhs.clone(), rhs.clone()), DType::UInt8);
+            if let Some((min, max)) = compute_sound_vmin_vmax(&expr) {
+                for a in samples_a {
+                    for b in samples_b {
+                        if let Some(value) = eval_binary_op_typed(
+                            op,
+                            ConstValue::UInt(u64::from(a)),
+                            ConstValue::UInt(u64::from(b)),
+                            svod_dtype::ScalarDType::UInt8,
+                        ) {
+                            prop_assert!(value_is_enclosed(value, min, max), "{op:?}: {a}, {b} -> {value:?} not in [{min:?}, {max:?}]");
+                        }
+                    }
+                }
+            }
+        }
+
+        let shift_rhs = UOp::const_(DType::UInt8, ConstValue::UInt(u64::from(shift)));
+        for op in [BinaryOp::Shl, BinaryOp::Shr] {
+            let expr = UOp::new(crate::Op::Binary(op, lhs.clone(), shift_rhs.clone()), DType::UInt8);
+            if let Some((min, max)) = compute_sound_vmin_vmax(&expr) {
+                for a in samples_a {
+                    let value = eval_binary_op_typed(
+                        op,
+                        ConstValue::UInt(u64::from(a)),
+                        ConstValue::UInt(u64::from(shift)),
+                        svod_dtype::ScalarDType::UInt8,
+                    ).unwrap();
+                    prop_assert!(value_is_enclosed(value, min, max), "{op:?}: {a}, {shift} -> {value:?} not in [{min:?}, {max:?}]");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sampled_narrow_integer_cast_values_are_enclosed(
+        pair in any::<(i16, i16)>(),
+        upair in any::<(u16, u16)>(),
+    ) {
+        let (min, max) = if pair.0 <= pair.1 { pair } else { (pair.1, pair.0) };
+        let src = UOp::var("prop_cast_i16", DType::Int16, i64::from(min), i64::from(max));
+        let samples = [min, max, ((i32::from(min) + i32::from(max)) / 2) as i16];
+        for target in [DType::Int8, DType::UInt8] {
+            let cast = src.cast(target.clone());
+            if let Some((range_min, range_max)) = compute_sound_vmin_vmax(&cast) {
+                for value in samples {
+                    let value = ConstValue::Int(i64::from(value)).cast(&target).unwrap();
+                    prop_assert!(value_is_enclosed(value, range_min, range_max));
+                }
+            }
+        }
+
+        let (min, max) = if upair.0 <= upair.1 { upair } else { (upair.1, upair.0) };
+        let src = UOp::var("prop_cast_u16", DType::UInt16, i64::from(min), i64::from(max));
+        let samples = [min, max, min + (max - min) / 2];
+        for target in [DType::Int8, DType::UInt8] {
+            let cast = src.cast(target.clone());
+            if let Some((range_min, range_max)) = compute_sound_vmin_vmax(&cast) {
+                for value in samples {
+                    let value = ConstValue::UInt(u64::from(value)).cast(&target).unwrap();
+                    prop_assert!(value_is_enclosed(value, range_min, range_max));
+                }
             }
         }
     }

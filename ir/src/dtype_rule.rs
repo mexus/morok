@@ -40,21 +40,28 @@ pub fn dtype_from_op(op: &Op) -> Option<DType> {
         | Op::Program { .. }
         | Op::Linear { .. }
         | Op::Source { .. }
-        | Op::ProgramBinary { .. }
         | Op::CustomFunction { .. }
         | Op::Store { .. }
         | Op::Unique(_)
-        | Op::LUnique(_)
-        | Op::Device(_) => Some(DType::Void),
+        | Op::LUnique(_) => Some(DType::Void),
+
+        Op::ProgramBinary { .. } => Some(DType::UInt8),
 
         Op::Const(value) => Some(const_dtype(&value.0)),
-        Op::Noop | Op::Custom { .. } | Op::CustomI { .. } | Op::VConst { .. } => None,
+        Op::Noop | Op::Custom { .. } | Op::CustomI { .. } | Op::VConst { .. } | Op::Ins { .. } => None,
 
         // These operations still keep their storage dtype outside Op metadata.
-        Op::Param { arg, .. } => Some(arg.dtype.clone()),
-        Op::Buffer { .. } | Op::DefineLocal(_) | Op::DefineReg { .. } => None,
-        Op::BufferView { buffer, .. } => Some(buffer.dtype()),
-        Op::Index { .. } | Op::Load { .. } | Op::PointerIndex { .. } => None,
+        Op::Param { arg, .. } | Op::Buffer { arg, .. } => Some(arg.dtype.clone()),
+        Op::Slice { .. } => None,
+        Op::Index { buffer, indices } => Some(if matches!(buffer.op(), Op::Param { .. }) && is_image_shape(buffer) {
+            DType::Float32
+        } else if !indices.is_empty() && buffer.dtype().vcount() > 1 && !is_storage_index_source(buffer) {
+            buffer.dtype().scalar_dtype()
+        } else {
+            buffer.dtype()
+        }),
+        Op::Load { index, .. } => Some(index.dtype()),
+        Op::GetAddr { .. } => Some(DType::UInt64),
 
         Op::Cast { dtype, .. } | Op::BitCast { dtype, .. } => Some(dtype.clone()),
 
@@ -91,7 +98,7 @@ pub fn dtype_from_op(op: &Op) -> Option<DType> {
 
         Op::MSelect { buffer, .. }
         | Op::Copy { src: buffer, .. }
-        | Op::Bufferize { compute: buffer, .. }
+        | Op::Stage { compute: buffer, .. }
         | Op::Reshape { src: buffer, .. }
         | Op::Permute { src: buffer, .. }
         | Op::Expand { src: buffer, .. }
@@ -106,11 +113,10 @@ pub fn dtype_from_op(op: &Op) -> Option<DType> {
         | Op::Contiguous { src: buffer, .. }
         | Op::ContiguousBackward { src: buffer }
         | Op::After { passthrough: buffer, .. }
-        | Op::Precast { src: buffer }
-        | Op::Contract { src: buffer, .. }
-        | Op::Unroll { src: buffer, .. } => Some(buffer.dtype()),
+        | Op::Precast { src: buffer } => Some(buffer.dtype()),
 
-        Op::Special { end, .. } | Op::Range { end, .. } => Some(end.dtype()),
+        Op::Special { end, .. } => Some(end.dtype()),
+        Op::Range { end, .. } => Some(end.dtype()),
         Op::Bind { var, value } if var.dtype() == value.dtype() => Some(var.dtype()),
         Op::Bind { .. } => None,
         Op::Wmma { c, .. } => Some(c.dtype()),
@@ -118,17 +124,6 @@ pub fn dtype_from_op(op: &Op) -> Option<DType> {
 
         Op::Stack { sources } if sources.is_empty() => Some(DType::Void),
         Op::Stack { sources } => promote(sources.iter().map(|source| source.dtype())),
-
-        Op::Vectorize { elements } => {
-            let scalar = promote(elements.iter().map(|element| element.dtype()))?;
-            scalar.vec(elements.len())
-        }
-        Op::Gep { vector, indices } => vector.dtype().scalar_dtype().vec(indices.len()),
-        Op::Cat { sources } => {
-            let scalar = promote(sources.iter().map(|source| source.dtype().scalar_dtype()))?;
-            scalar.vec(sources.iter().map(|source| source.dtype().vcount()).sum())
-        }
-        Op::PtrCat { .. } => None,
 
         Op::DefineVar { .. } => None,
         Op::Call { body, .. } if body.dtype() == DType::Void => Some(DType::Void),
@@ -145,5 +140,17 @@ fn tuple_element(src: &std::sync::Arc<UOp>, index: usize) -> Option<&std::sync::
     match tuple.op() {
         Op::Tuple { src } => src.get(index),
         _ => None,
+    }
+}
+
+fn is_image_shape(u: &std::sync::Arc<UOp>) -> bool {
+    u.shape().ok().flatten().is_some_and(|shape| shape.len() == 3 && shape[2].as_const() == Some(4))
+}
+
+fn is_storage_index_source(u: &std::sync::Arc<UOp>) -> bool {
+    match u.op() {
+        Op::Param { .. } | Op::Buffer { .. } | Op::Slice { .. } => true,
+        Op::After { passthrough, .. } | Op::Precast { src: passthrough } => is_storage_index_source(passthrough),
+        _ => false,
     }
 }

@@ -1,10 +1,10 @@
-//! Memory operations: load, store, index, copy, bufferize.
+//! Memory operations: load, store, index, copy, stage.
 //!
 //! This module contains operations for memory access:
-//! - Indexing: index, index_gated, pointer_index, slice
+//! - Indexing: index, getaddr, slice
 //! - Memory access: load, store (gate is on INDEX, not LOAD/STORE)
 //! - Device operations: copy, copy_to_device
-//! - Bufferization: bufferize, bufferize_global, bufferize_local
+//! - Bufferization: stage, stage_global, stage_local
 //! - Memory definitions: define_local, define_reg
 
 use std::sync::Arc;
@@ -32,36 +32,22 @@ impl UOp {
     ///
     /// All indices must have Index dtype.
     ///
-    /// # Dtype behavior (matches Tinygrad's `buf.index(idx, ptr=False, dtype=None)`)
-    /// - If `dtype` is provided: use it directly (explicit dtype takes precedence)
-    /// - If `ptr` is true: keep the buffer's Ptr dtype (for STORE targets)
-    /// - Otherwise (ptr=false, default): extract element type from buffer (for LOAD sources)
+    /// The dtype is inferred from the buffer. Shape is carried independently by
+    /// the buffer and index sources, never by widening the access dtype.
     ///
     /// # Examples
     /// ```ignore
-    /// // Element dtype (default) - for LOAD
+    /// // Inferred dtype
     /// UOp::index().buffer(buf).indices(vec![idx]).call()?
     ///
-    /// // Ptr dtype via ptr=true - for STORE (preferred, Tinygrad-aligned)
-    /// UOp::index().buffer(buf).indices(vec![idx]).ptr(true).call()?
-    ///
-    /// // Explicit Ptr dtype - for STORE (legacy, works but prefer .ptr(true))
-    /// let ptr_dtype = DType::Float32.ptr(Some(size), AddrSpace::Global);
-    /// UOp::index().buffer(buf).indices(vec![idx]).dtype(ptr_dtype).call()?
-    ///
-    /// // With gate
-    /// UOp::index().buffer(buf).indices(vec![idx]).gate(gate_uop).call()?
+    /// // With validity
+    /// UOp::index().buffer(buf).indices(vec![idx.valid(gate_uop)]).call()?
     /// ```
     #[builder]
     pub fn index<I: Into<SmallVec<[Arc<Self>; 4]>>>(
         buffer: Arc<Self>,
         indices: I,
-        gate: Option<Arc<Self>>,
         dtype: Option<DType>,
-        /// When true, keep buffer's Ptr dtype (for STORE targets).
-        /// When false (default), extract element type (for LOAD sources).
-        /// Matches Tinygrad's `buf.index(idx, ptr=True/False)`.
-        ptr: Option<bool>,
     ) -> Result<Arc<Self>> {
         let indices = indices.into();
 
@@ -69,7 +55,6 @@ impl UOp {
         // directly rather than constructing a memory INDEX.
         if let Op::Stack { sources } = buffer.op()
             && indices.len() == 1
-            && gate.is_none()
             && let Op::Const(value) = indices[0].op()
             && let Some(index) = match value.0 {
                 crate::ConstValue::Int(index) if index >= 0 => Some(index as usize),
@@ -81,59 +66,60 @@ impl UOp {
             return Ok(source.clone());
         }
 
-        // Validate that all indices have integer/index base dtype.
-        // Allows both scalar (Index, Int64, Int32) and vector (Index.vec(N), Int64.vec(N))
-        // for devectorized register/local buffer indexing.
+        // Tinygrad accepts every integer dtype, including weak integers.
         for idx in &indices {
             if Self::is_invalid_marker(idx) {
                 continue;
             }
-            let base = idx.dtype().base();
-            ensure!(
-                matches!(
-                    base,
-                    svod_dtype::ScalarDType::Index | svod_dtype::ScalarDType::Int64 | svod_dtype::ScalarDType::Int32
-                ),
-                IndexTypeMismatchSnafu { actual: idx.dtype() }
-            );
+            ensure!(idx.dtype().is_int(), IndexTypeMismatchSnafu { actual: idx.dtype() });
         }
 
-        // Determine result dtype based on (dtype, ptr) parameters
-        // Priority: explicit dtype > ptr flag > default (element type)
-        let result_dtype = match (dtype, ptr.unwrap_or(false)) {
-            (Some(d), _) => d, // Explicit dtype takes precedence
-            (None, true) => match buffer.dtype() {
-                dtype @ DType::Ptr { .. } => dtype,
-                _ => buffer
-                    .ptrdtype()
-                    .map(|(base, addrspace, size)| DType::Ptr {
-                        base: Box::new(base.clone()),
-                        addrspace,
-                        size,
-                        vcount: 1,
-                    })
-                    .unwrap_or_else(|| buffer.dtype()),
-            },
-            (None, false) => match buffer.dtype() {
-                // ptr=false: extract element type
-                DType::Ptr { base, .. } => base.as_ref().clone(),
-                other => other,
-            },
-        };
-
-        Ok(Self::new(Op::Index { buffer, indices, gate }, result_dtype))
+        let op = Op::Index { buffer, indices };
+        let inferred = crate::dtype_from_op(&op).expect("INDEX has an inferred dtype");
+        let result_dtype = dtype.unwrap_or_else(|| inferred.clone());
+        ensure!(
+            result_dtype == inferred || result_dtype.weak_dtype() == inferred.weak_dtype(),
+            crate::error::DTypeMismatchSnafu { lhs: inferred, rhs: result_dtype.clone() }
+        );
+        Ok(Self::new(op, result_dtype))
     }
 
-    /// Create a pointer index operation (pointer arithmetic).
+    /// Index the leading axis at one or more constant positions.
     ///
-    /// Performs pointer + offset arithmetic for address calculation in kernels.
-    /// Both self (ptr) and offset should have Index dtype.
-    pub fn pointer_index(self: &Arc<Self>, offset: Arc<Self>) -> Result<Arc<Self>> {
-        let ptr_dtype = self.dtype();
-        let offset_dtype = offset.dtype();
-        ensure!(ptr_dtype == DType::Index, IndexTypeMismatchSnafu { actual: ptr_dtype });
-        ensure!(offset_dtype == DType::Index, IndexTypeMismatchSnafu { actual: offset_dtype });
-        Ok(Self::new(Op::PointerIndex { ptr: self.clone(), offset }, DType::Index))
+    /// Multiple positions are represented by one shaped STACK index, exactly as
+    /// Tinygrad's `INDEX(value, STACK(CONST...))`.
+    pub fn index_axes(self: &Arc<Self>, positions: Vec<usize>) -> Arc<Self> {
+        assert!(!positions.is_empty(), "INDEX requires at least one position");
+        let index = if positions.len() == 1 {
+            Self::index_const(positions[0] as i64)
+        } else {
+            Self::stack(positions.into_iter().map(|position| Self::index_const(position as i64)).collect())
+        };
+        Self::index().buffer(self.clone()).indices(vec![index]).call().expect("constant INDEX must be valid")
+    }
+
+    /// Lower a storage object to its 64-bit address on `device`.
+    ///
+    /// Matches Tinygrad's canonical `getaddr`: unsupported values pass through,
+    /// while BUFFER/PARAM and their supported storage wrappers produce GETADDR.
+    pub fn getaddr(self: &Arc<Self>, device: Option<DeviceSpec>) -> Arc<Self> {
+        let mut base = self;
+        while let Op::After { passthrough, .. } = base.op() {
+            base = passthrough;
+        }
+        if !matches!(
+            base.op(),
+            Op::Buffer { .. }
+                | Op::Param { .. }
+                | Op::Slice { .. }
+                | Op::ProgramBinary { .. }
+                | Op::MStack { .. }
+                | Op::MSelect { .. }
+        ) {
+            return self.clone();
+        }
+        let device = device.or_else(|| self.device_spec()).expect("GETADDR requires an explicit or source device");
+        Self::new(Op::GetAddr { src: self.clone(), device }, DType::UInt64)
     }
 
     /// Multi-dimensional slicing with IndexSpec.
@@ -173,21 +159,6 @@ impl UOp {
         }
     }
 
-    /// Gated slicing - conditional access with gate.
-    pub fn slice_gated(buffer: Arc<Self>, specs: Vec<IndexSpec>, gate: Arc<Self>) -> Result<Arc<Self>> {
-        let mut indices = Vec::new();
-
-        for spec in specs {
-            match spec {
-                IndexSpec::Single(idx) => indices.push(idx),
-                IndexSpec::Range { start, .. } => indices.push(start),
-                IndexSpec::Full | IndexSpec::NewAxis => {}
-            }
-        }
-
-        if indices.is_empty() { Ok(buffer) } else { Self::index().buffer(buffer).indices(indices).gate(gate).call() }
-    }
-
     // =========================================================================
     // Index Helpers
     // =========================================================================
@@ -216,22 +187,19 @@ impl UOp {
     ///
     /// # Example
     /// ```ignore
-    /// // Infer dtype from buffer
-    /// UOp::load().buffer(buf).index(idx).call()
-    ///
-    /// // Explicit dtype for vector loads
-    /// UOp::load().buffer(buf).index(idx).dtype(vec4_dtype).call()
+    /// // Infer dtype from the address
+    /// UOp::load().index(idx).call()
     ///
     /// // With alt value for gated loads
-    /// UOp::load().buffer(buf).index(idx).alt(zero).call()
+    /// UOp::load().index(idx).alt(zero).gate(gate).call()
     /// ```
     #[builder]
-    pub fn load(buffer: Arc<Self>, index: Arc<Self>, dtype: Option<DType>, alt: Option<Arc<Self>>) -> Arc<Self> {
-        let dtype = dtype.unwrap_or_else(|| match &buffer.dtype {
-            DType::Ptr { base, .. } => (**base).clone(),
-            other => other.clone(),
-        });
-        Self::new(Op::Load { buffer, index, alt }, dtype)
+    pub fn load(index: Arc<Self>, dtype: Option<DType>, alt: Option<Arc<Self>>, gate: Option<Arc<Self>>) -> Arc<Self> {
+        let inferred = index.dtype();
+        let dtype = dtype.unwrap_or_else(|| inferred.clone());
+        assert_eq!(dtype, inferred, "LOAD dtype must match INDEX element dtype");
+        assert_eq!(alt.is_some(), gate.is_some(), "LOAD requires either index only or index, alt, and gate");
+        Self::new(Op::Load { index, alt, gate }, dtype)
     }
 
     /// Create a STORE operation.
@@ -241,7 +209,12 @@ impl UOp {
     ///
     /// For gated stores, use an INDEX with a gate (INDEX has optional gate field).
     pub fn store(self: &Arc<Self>, value: Arc<Self>) -> Arc<Self> {
-        Self::new(Op::Store { index: self.clone(), value }, DType::Void)
+        Self::new(Op::Store { index: self.clone(), value, gate: None }, DType::Void)
+    }
+
+    /// Store a value conditionally at this address.
+    pub fn store_gated(self: &Arc<Self>, value: Arc<Self>, gate: Arc<Self>) -> Arc<Self> {
+        Self::new(Op::Store { index: self.clone(), value, gate: Some(gate) }, DType::Void)
     }
 
     // =========================================================================
@@ -250,84 +223,42 @@ impl UOp {
 
     /// Copy to a different device.
     pub fn copy_to_device(self: &Arc<Self>, device: DeviceSpec) -> Arc<Self> {
-        let dev = Self::device(device);
-        Self::new(Op::Copy { src: self.clone(), device: dev }, self.dtype.clone())
+        Self::new(Op::Copy { src: self.clone(), device }, self.dtype.clone())
     }
 
-    /// Create a COPY operation with explicit device UOp.
-    ///
-    /// Unlike `copy_to_device` which takes a `DeviceSpec`, this takes
-    /// a device UOp directly (useful when you already have one).
-    pub fn copy(self: &Arc<Self>, device: Arc<Self>) -> Arc<Self> {
-        let dtype = self.dtype.clone();
-        Self::new(Op::Copy { src: self.clone(), device }, dtype)
+    /// Create a COPY operation with an explicit target device.
+    pub fn copy(self: &Arc<Self>, device: DeviceSpec) -> Arc<Self> {
+        self.copy_to_device(device)
     }
 
     // =========================================================================
     // Bufferization Operations
     // =========================================================================
 
-    /// Create a BUFFERIZE operation.
+    /// Create a STAGE operation.
     ///
     /// Marks a computation to be materialized into a buffer.
     /// The computation is evaluated over the given ranges and stored.
-    pub fn bufferize(compute: Arc<Self>, ranges: Vec<Arc<Self>>, opts: BufferizeOpts) -> Arc<Self> {
+    pub fn stage(compute: Arc<Self>, ranges: Vec<Arc<Self>>, opts: BufferizeOpts) -> Arc<Self> {
         let dtype = compute.dtype.clone();
-        Self::new(Op::Bufferize { compute, ranges: SmallVec::from_vec(ranges), opts }, dtype)
+        Self::new(Op::Stage { compute, ranges: SmallVec::from_vec(ranges), opts }, dtype)
     }
 
-    /// Create a BUFFERIZE operation with Global address space.
+    /// Create a STAGE operation with Global address space.
     ///
-    /// This is the most common pattern - bufferize to global memory.
-    pub fn bufferize_global(compute: Arc<Self>, ranges: Vec<Arc<Self>>) -> Arc<Self> {
-        Self::bufferize(compute, ranges, BufferizeOpts { device: None, addrspace: AddrSpace::Global, removable: true })
+    /// This is the most common pattern - stage to global memory.
+    pub fn stage_global(compute: Arc<Self>, ranges: Vec<Arc<Self>>) -> Arc<Self> {
+        Self::stage(
+            compute,
+            ranges,
+            BufferizeOpts { device: None, local_axis: None, addrspace: AddrSpace::Global, removable: true },
+        )
     }
 
-    /// Create a BUFFERIZE operation with Local address space.
+    /// Create a STAGE operation with Local address space.
     ///
     /// For shared/local memory bufferization.
-    pub fn bufferize_local(compute: Arc<Self>, ranges: Vec<Arc<Self>>) -> Arc<Self> {
-        Self::bufferize(compute, ranges, BufferizeOpts { device: None, addrspace: AddrSpace::Local, removable: true })
-    }
-
-    // =========================================================================
-    // Memory Definition Operations
-    // =========================================================================
-
-    /// Create a DEFINE_LOCAL operation.
-    ///
-    /// Defines a local (shared) memory allocation with the given ID.
-    pub fn define_local(id: usize, dtype: DType) -> Arc<Self> {
-        Self::new(Op::DefineLocal(id), dtype)
-    }
-
-    /// Define register memory (void pointer - type determined by usage).
-    pub fn define_reg(size: usize) -> Arc<Self> {
-        use svod_dtype::AddrSpace;
-        let id = crate::uop::hash_consing::next_unique_id();
-        let ptr_dtype = DType::Void.ptr(Some(size), AddrSpace::Reg).expect("define_reg base is never a pointer");
-        Self::new(Op::DefineReg { size, id }, ptr_dtype)
-    }
-
-    /// Define register memory with explicit element type.
-    ///
-    /// Creates a typed register accumulator for use in reductions.
-    /// The element_dtype specifies the type of each element (e.g., Float32 for a float accumulator).
-    pub fn define_reg_typed(size: usize, element_dtype: DType) -> Arc<Self> {
-        let id = crate::uop::hash_consing::next_unique_id();
-        Self::define_reg_typed_with_id(size, element_dtype, id)
-    }
-
-    /// Like [`Self::define_reg_typed`] but with a caller-supplied `id`. Hand-built
-    /// kernels pass a **per-kernel-deterministic** slot (not the global
-    /// `next_unique_id()`), so structurally-identical kernels produce identical
-    /// `DefineReg` content hashes and dedup to a single compile (tinygrad parity:
-    /// `DEFINE_REG` arg is a per-kernel slot). The id is identity-only — the
-    /// renderer renumbers registers locally.
-    pub fn define_reg_typed_with_id(size: usize, element_dtype: DType, id: usize) -> Arc<Self> {
-        use svod_dtype::AddrSpace;
-        let ptr_dtype =
-            DType::Ptr { base: Box::new(element_dtype), addrspace: AddrSpace::Reg, size: Some(size), vcount: 1 };
-        Self::new(Op::DefineReg { size, id }, ptr_dtype)
+    pub fn stage_local(compute: Arc<Self>, ranges: Vec<Arc<Self>>) -> Arc<Self> {
+        Self::stage(compute, ranges, BufferizeOpts::local())
     }
 }

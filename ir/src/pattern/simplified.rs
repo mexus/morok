@@ -4,8 +4,8 @@
 //!
 //! `SimplifiedPatternMatcher` uses a two-tier dispatch strategy:
 //!
-//! 1. **Indexed patterns**: Stored in a `HashMap<OpKey, Vec<Closure>>` for O(1) lookup
-//! 2. **Wildcard patterns**: Tried after indexed patterns for ops without specific patterns
+//! 1. **Indexed patterns**: Stored in a `HashMap<OpKey, Vec<Entry>>` for O(1) lookup
+//! 2. **Wildcard patterns**: Merged with indexed candidates in source order
 //!
 //! The `patterns!` macro generates closures that use native Rust `match` expressions,
 //! avoiding runtime pattern interpretation overhead.
@@ -43,6 +43,8 @@ use super::RewriteResult;
 /// Uses `Arc` instead of `Box` to enable `Clone` on `SimplifiedPatternMatcher`,
 /// which is needed for caching combined matchers via `LazyLock`.
 pub type PatternClosure<C> = Arc<dyn Fn(&Arc<UOp>, &mut C) -> RewriteResult + Send + Sync>;
+
+type PatternEntry<C> = (usize, PatternClosure<C>);
 
 /// High-performance pattern matcher with O(1) OpKey-based dispatch.
 ///
@@ -93,15 +95,16 @@ pub type PatternClosure<C> = Arc<dyn Fn(&Arc<UOp>, &mut C) -> RewriteResult + Se
 /// ```
 pub struct SimplifiedPatternMatcher<C = ()> {
     /// Patterns indexed by OpKey - tried first for O(1) dispatch
-    indexed: HashMap<OpKey, Vec<PatternClosure<C>>>,
-    /// Wildcard patterns - tried after indexed patterns
-    wildcards: Vec<PatternClosure<C>>,
+    indexed: HashMap<OpKey, Vec<PatternEntry<C>>>,
+    /// Wildcard patterns merged with indexed candidates by registration order.
+    wildcards: Vec<PatternEntry<C>>,
+    next_sequence: usize,
 }
 
 impl<C> SimplifiedPatternMatcher<C> {
     /// Create a new empty pattern matcher.
     pub fn new() -> Self {
-        Self { indexed: HashMap::new(), wildcards: Vec::new() }
+        Self { indexed: HashMap::new(), wildcards: Vec::new(), next_sequence: 0 }
     }
 
     /// Add pattern for specific OpKey(s).
@@ -112,17 +115,19 @@ impl<C> SimplifiedPatternMatcher<C> {
     where
         F: Fn(&Arc<UOp>, &mut C) -> RewriteResult + Send + Sync + 'static,
     {
+        let sequence = self.next_sequence;
+        self.next_sequence += 1;
         if keys.is_empty() {
             // No keys = wildcard pattern
-            self.wildcards.push(Arc::new(closure));
+            self.wildcards.push((sequence, Arc::new(closure)));
         } else if keys.len() == 1 {
             // Single key - store directly
-            self.indexed.entry(keys[0].clone()).or_default().push(Arc::new(closure));
+            self.indexed.entry(keys[0].clone()).or_default().push((sequence, Arc::new(closure)));
         } else {
             // Multiple keys - share the closure via Arc clone
             let shared: PatternClosure<C> = Arc::new(closure);
             for key in keys {
-                self.indexed.entry(key.clone()).or_default().push(Arc::clone(&shared));
+                self.indexed.entry(key.clone()).or_default().push((sequence, Arc::clone(&shared)));
             }
         }
     }
@@ -134,7 +139,42 @@ impl<C> SimplifiedPatternMatcher<C> {
     where
         F: Fn(&Arc<UOp>, &mut C) -> RewriteResult + Send + Sync + 'static,
     {
-        self.wildcards.push(Arc::new(closure));
+        let sequence = self.next_sequence;
+        self.next_sequence += 1;
+        self.wildcards.push((sequence, Arc::new(closure)));
+    }
+
+    /// Return a matcher whose rewrites run only when `guard` accepts the root.
+    ///
+    /// The guard is attached to every entry so the matcher remains composable
+    /// with `+` without changing source-order priority.
+    pub fn guarded<F>(&self, guard: F) -> Self
+    where
+        C: 'static,
+        F: Fn(&Arc<UOp>) -> bool + Send + Sync + 'static,
+    {
+        let guard = Arc::new(guard);
+        let mut result = Self::new();
+        for (key, entries) in &self.indexed {
+            for (sequence, closure) in entries {
+                let guard = Arc::clone(&guard);
+                let closure = Arc::clone(closure);
+                result.indexed.entry(key.clone()).or_default().push((
+                    *sequence,
+                    Arc::new(move |uop, ctx| if guard(uop) { closure(uop, ctx) } else { RewriteResult::NoMatch }),
+                ));
+            }
+        }
+        for (sequence, closure) in &self.wildcards {
+            let guard = Arc::clone(&guard);
+            let closure = Arc::clone(closure);
+            result.wildcards.push((
+                *sequence,
+                Arc::new(move |uop, ctx| if guard(uop) { closure(uop, ctx) } else { RewriteResult::NoMatch }),
+            ));
+        }
+        result.next_sequence = self.next_sequence;
+        result
     }
 
     /// Number of registered patterns.
@@ -171,30 +211,25 @@ impl<C> SimplifiedPatternMatcher<C> {
     pub fn rewrite(&self, uop: &Arc<UOp>, ctx: &mut C) -> RewriteResult {
         let key = OpKey::from_op(uop.op());
 
-        // Try patterns indexed by this OpKey
-        if let Some(patterns) = self.indexed.get(&key) {
-            let pattern_count = patterns.len();
-            tracing::trace!(op_key = ?key, pattern_count, "trying indexed patterns");
-
-            for (idx, closure) in patterns.iter().enumerate() {
-                let result = closure(uop, ctx);
-                if !matches!(result, RewriteResult::NoMatch) {
-                    tracing::debug!(op_key = ?key, pattern_idx = idx, "pattern matched");
-                    return result;
-                }
-            }
-        }
-
-        // Try wildcard patterns
-        if !self.wildcards.is_empty() {
-            tracing::trace!(wildcard_count = self.wildcards.len(), "trying wildcard patterns");
-
-            for (idx, closure) in self.wildcards.iter().enumerate() {
-                let result = closure(uop, ctx);
-                if !matches!(result, RewriteResult::NoMatch) {
-                    tracing::debug!(wildcard_idx = idx, "wildcard pattern matched");
-                    return result;
-                }
+        let indexed = self.indexed.get(&key).map(Vec::as_slice).unwrap_or_default();
+        let mut indexed_pos = 0;
+        let mut wildcard_pos = 0;
+        while indexed_pos < indexed.len() || wildcard_pos < self.wildcards.len() {
+            let take_indexed = wildcard_pos == self.wildcards.len()
+                || (indexed_pos < indexed.len() && indexed[indexed_pos].0 < self.wildcards[wildcard_pos].0);
+            let (sequence, closure) = if take_indexed {
+                let entry = &indexed[indexed_pos];
+                indexed_pos += 1;
+                entry
+            } else {
+                let entry = &self.wildcards[wildcard_pos];
+                wildcard_pos += 1;
+                entry
+            };
+            let result = closure(uop, ctx);
+            if !matches!(result, RewriteResult::NoMatch) {
+                tracing::debug!(op_key = ?key, pattern_sequence = sequence, "pattern matched");
+                return result;
             }
         }
 
@@ -204,7 +239,7 @@ impl<C> SimplifiedPatternMatcher<C> {
 
 impl<C> Clone for SimplifiedPatternMatcher<C> {
     fn clone(&self) -> Self {
-        Self { indexed: self.indexed.clone(), wildcards: self.wildcards.clone() }
+        Self { indexed: self.indexed.clone(), wildcards: self.wildcards.clone(), next_sequence: self.next_sequence }
     }
 }
 
@@ -228,20 +263,21 @@ impl SimplifiedPatternMatcher<()> {
     /// ```
     pub fn with_context<D: 'static + Send + Sync>(&self) -> SimplifiedPatternMatcher<D> {
         let mut result = SimplifiedPatternMatcher::<D>::new();
-        for (key, closures) in &self.indexed {
-            for closure in closures {
+        for (key, entries) in &self.indexed {
+            for (sequence, closure) in entries {
                 let closure = Arc::clone(closure);
                 result
                     .indexed
                     .entry(key.clone())
                     .or_default()
-                    .push(Arc::new(move |uop: &Arc<UOp>, _ctx: &mut D| closure(uop, &mut ())));
+                    .push((*sequence, Arc::new(move |uop: &Arc<UOp>, _ctx: &mut D| closure(uop, &mut ()))));
             }
         }
-        for closure in &self.wildcards {
+        for (sequence, closure) in &self.wildcards {
             let closure = Arc::clone(closure);
-            result.wildcards.push(Arc::new(move |uop: &Arc<UOp>, _ctx: &mut D| closure(uop, &mut ())));
+            result.wildcards.push((*sequence, Arc::new(move |uop: &Arc<UOp>, _ctx: &mut D| closure(uop, &mut ()))));
         }
+        result.next_sequence = self.next_sequence;
         result
     }
 }
@@ -260,12 +296,17 @@ impl<C> std::ops::Add for SimplifiedPatternMatcher<C> {
 
     /// Combine two matchers. Patterns from `rhs` are appended.
     fn add(mut self, rhs: Self) -> Self::Output {
+        let offset = self.next_sequence;
         // Merge indexed patterns
         for (key, patterns) in rhs.indexed {
-            self.indexed.entry(key).or_default().extend(patterns);
+            self.indexed
+                .entry(key)
+                .or_default()
+                .extend(patterns.into_iter().map(|(sequence, closure)| (sequence + offset, closure)));
         }
         // Merge wildcards
-        self.wildcards.extend(rhs.wildcards);
+        self.wildcards.extend(rhs.wildcards.into_iter().map(|(sequence, closure)| (sequence + offset, closure)));
+        self.next_sequence += rhs.next_sequence;
         self
     }
 }

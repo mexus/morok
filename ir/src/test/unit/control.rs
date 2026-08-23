@@ -2,13 +2,13 @@
 //!
 //! Tests control flow operations: If, EndIf, Range, End, Barrier.
 
-use std::{f32::consts::PI, f64::consts::E};
+use std::{f32::consts::PI, f64::consts::E, sync::Arc};
 
 use smallvec::smallvec;
 
 use svod_dtype::DType;
 
-use crate::{AxisId, AxisType, ConstValue, UOp};
+use crate::{AxisId, AxisType, ConstValue, Op, UOp};
 
 // =========================================================================
 // Basic If/EndIf Tests
@@ -100,7 +100,7 @@ fn test_range_global_axis() {
 
     let range_op = UOp::range_axis(end, AxisId::Renumbered(0), AxisType::Global);
 
-    assert_eq!(range_op.dtype(), DType::Index);
+    assert_eq!(range_op.dtype(), DType::WeakInt);
 }
 
 #[test]
@@ -109,52 +109,52 @@ fn test_range_warp_axis() {
 
     let range_op = UOp::range_axis(end, AxisId::Renumbered(1), AxisType::Warp);
 
-    assert_eq!(range_op.dtype(), DType::Index);
+    assert_eq!(range_op.dtype(), DType::WeakInt);
 }
 
 #[test]
 fn test_range_local_axis() {
     let end = UOp::native_const(256i32);
     let range_op = UOp::range_axis(end, AxisId::Renumbered(0), AxisType::Local);
-    assert_eq!(range_op.dtype(), DType::Index);
+    assert_eq!(range_op.dtype(), DType::WeakInt);
 }
 
 #[test]
 fn test_range_loop_axis() {
     let end = UOp::native_const(100i32);
     let range_op = UOp::range(end, 2);
-    assert_eq!(range_op.dtype(), DType::Index);
+    assert_eq!(range_op.dtype(), DType::WeakInt);
 }
 
 #[test]
 fn test_range_reduce_axis() {
     let end = UOp::native_const(1024i32);
     let range_op = UOp::range_axis(end, AxisId::Renumbered(0), AxisType::Reduce);
-    assert_eq!(range_op.dtype(), DType::Index);
+    assert_eq!(range_op.dtype(), DType::WeakInt);
 }
 
 #[test]
 fn test_range_unroll_axis() {
     let end = UOp::native_const(4i32);
     let range_op = UOp::range_axis(end, AxisId::Renumbered(3), AxisType::Unroll);
-    assert_eq!(range_op.dtype(), DType::Index);
+    assert_eq!(range_op.dtype(), DType::WeakInt);
 }
 
 #[test]
 fn test_range_thread_axis() {
     let end = UOp::native_const(8i32);
     let range_op = UOp::range_axis(end, AxisId::Renumbered(1), AxisType::Thread);
-    assert_eq!(range_op.dtype(), DType::Index);
+    assert_eq!(range_op.dtype(), DType::WeakInt);
 }
 
 #[test]
-fn test_range_dtype_is_index() {
-    // Verify all Range operations return DType::Index
+fn test_range_dtype_follows_end() {
     let end = UOp::native_const(10i32);
     let axis_types = vec![
         AxisType::Global,
         AxisType::Warp,
         AxisType::Local,
+        AxisType::Weak,
         AxisType::Loop,
         AxisType::GroupReduce,
         AxisType::Reduce,
@@ -166,8 +166,63 @@ fn test_range_dtype_is_index() {
     for (idx, axis_type) in axis_types.into_iter().enumerate() {
         let range_op = UOp::range_axis(end.clone(), AxisId::Renumbered(idx), axis_type);
 
-        assert_eq!(range_op.dtype(), DType::Index);
+        assert_eq!(range_op.dtype(), DType::WeakInt);
     }
+}
+
+#[test]
+fn test_weak_axis_priority_letter_and_serialization() {
+    assert_eq!(AxisType::Weak.priority(), -1);
+    assert_eq!(AxisType::Weak.letter(), 'L');
+    assert_eq!(AxisType::Weak.cmp(&AxisType::Loop), std::cmp::Ordering::Equal);
+    assert_eq!(serde_json::to_string(&AxisType::Weak).unwrap(), "\"Weak\"");
+    assert_eq!(serde_json::from_str::<AxisType>("\"Weak\"").unwrap(), AxisType::Weak);
+}
+
+#[test]
+fn test_nested_axis_id_serialization_and_ordering() {
+    let outer = AxisId::Renumbered(2).child(0);
+    let inner = AxisId::Renumbered(2).child(1).child(0);
+    let encoded = serde_json::to_string(&inner).unwrap();
+
+    assert_eq!(serde_json::from_str::<AxisId>(&encoded).unwrap(), inner);
+    assert_eq!(outer.path(), &[2, 0]);
+    assert_eq!(inner.path(), &[2, 1, 0]);
+    assert!(outer < inner);
+}
+
+#[test]
+fn test_grouped_reduce_loop_axis_tree_name_keeps_parent_path() {
+    let axis = AxisId::Renumbered(2).child(1).group_reduce_loop();
+    let range = UOp::range_axis(UOp::index_const(8), axis, AxisType::Reduce);
+
+    assert!(range.tree().contains("RANGE(R2_1_2, Reduce)"));
+}
+
+#[test]
+fn test_weak_range_and_concrete_control_dtypes() {
+    let range = UOp::range_const(10, 0);
+    assert_eq!(range.dtype(), DType::WeakInt);
+
+    let small = UOp::define_var("small".to_string(), 0, 10);
+    let large = UOp::define_var("large".to_string(), 0, i64::MAX);
+    assert_eq!(small.dtype(), DType::WeakInt);
+    assert_eq!(large.dtype(), DType::WeakInt);
+
+    let special = UOp::special(UOp::index_const(8), "gidx0".to_string());
+    assert_eq!(special.dtype(), DType::WeakInt);
+}
+
+#[test]
+fn test_range_and_special_explicit_dtype_preserve_concrete_end() {
+    let end = UOp::native_const(8i32);
+    let range = UOp::range_axis_dtype(end.clone(), AxisId::Renumbered(0), AxisType::Global, DType::Int32);
+    let special = UOp::special_dtype(end.clone(), "gidx0".to_string(), DType::Int32);
+
+    assert_eq!(range.dtype(), DType::Int32);
+    assert_eq!(special.dtype(), DType::Int32);
+    assert!(matches!(range.op(), Op::Range { end: range_end, .. } if Arc::ptr_eq(range_end, &end)));
+    assert!(matches!(special.op(), Op::Special { end: special_end, .. } if Arc::ptr_eq(special_end, &end)));
 }
 
 // =========================================================================
@@ -228,8 +283,7 @@ fn test_barrier_basic() {
 
     let barrier = src.barrier(smallvec![]);
 
-    // Barrier preserves src dtype
-    assert_eq!(barrier.dtype(), DType::Float32);
+    assert_eq!(barrier.dtype(), DType::Void);
 }
 
 #[test]
@@ -239,7 +293,7 @@ fn test_barrier_with_single_dep() {
 
     let barrier = src.barrier(smallvec![dep]);
 
-    assert_eq!(barrier.dtype(), DType::Int32);
+    assert_eq!(barrier.dtype(), DType::Void);
 }
 
 #[test]
@@ -251,12 +305,11 @@ fn test_barrier_with_multiple_deps() {
 
     let barrier = src.barrier(smallvec![dep1, dep2, dep3]);
 
-    assert_eq!(barrier.dtype(), DType::Float64);
+    assert_eq!(barrier.dtype(), DType::Void);
 }
 
 #[test]
-fn test_barrier_preserves_dtype() {
-    // Test that Barrier preserves various dtypes
+fn test_barrier_is_void_for_all_source_dtypes() {
     let dtypes = vec![
         (DType::Int8, ConstValue::Int(1)),
         (DType::Int32, ConstValue::Int(100)),
@@ -269,7 +322,7 @@ fn test_barrier_preserves_dtype() {
         let src = UOp::const_(dtype.clone(), value);
         let barrier = src.barrier(smallvec![]);
 
-        assert_eq!(barrier.dtype(), dtype);
+        assert_eq!(barrier.dtype(), DType::Void);
     }
 }
 
@@ -317,9 +370,9 @@ fn test_multiple_sequential_ranges() {
     let range3 = UOp::range(end3, 2);
 
     // All ranges should be valid
-    assert_eq!(range1.dtype(), DType::Index);
-    assert_eq!(range2.dtype(), DType::Index);
-    assert_eq!(range3.dtype(), DType::Index);
+    assert_eq!(range1.dtype(), DType::WeakInt);
+    assert_eq!(range2.dtype(), DType::WeakInt);
+    assert_eq!(range3.dtype(), DType::WeakInt);
 }
 
 // =========================================================================
@@ -349,13 +402,13 @@ fn test_endif_dtype_is_void() {
 }
 
 #[test]
-fn test_range_confirms_index_dtype() {
+fn test_range_confirms_end_dtype() {
     let end = UOp::native_const(100i32);
 
     let range_op = UOp::range(end, 0);
 
     // Confirm Range dtype
-    assert_eq!(range_op.dtype(), DType::Index);
+    assert_eq!(range_op.dtype(), DType::WeakInt);
 }
 
 #[test]
@@ -374,13 +427,12 @@ fn test_end_dtype_is_void() {
 }
 
 #[test]
-fn test_barrier_dtype_preservation() {
-    // Test that Barrier preserves src dtype across different types
+fn test_barrier_dtype_is_void() {
     let int_src = UOp::native_const(42i32);
     let int_barrier = int_src.barrier(smallvec![]);
-    assert_eq!(int_barrier.dtype(), DType::Int32);
+    assert_eq!(int_barrier.dtype(), DType::Void);
 
     let float_src = UOp::native_const(PI);
     let float_barrier = float_src.barrier(smallvec![]);
-    assert_eq!(float_barrier.dtype(), DType::Float32);
+    assert_eq!(float_barrier.dtype(), DType::Void);
 }

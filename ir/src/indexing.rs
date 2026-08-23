@@ -98,4 +98,4 @@ macro_rules! s {
     };
 }
 
-// UOp::slice and UOp::slice_gated methods have been moved to uop/constructors/memory.rs
+// UOp::slice has been moved to uop/constructors/memory.rs

@@ -73,10 +73,8 @@ fn traversal_children(node: &Arc<UOp>, mode: TraversalMode) -> (Vec<Arc<UOp>>, V
         Op::Call { body, args, .. } | Op::Function { body, args, .. } => {
             (args.iter().cloned().collect(), vec![body.clone()])
         }
-        // Program holds compiled artifacts (linear/source/binary) wrapped as
-        // UOps; traversing through them during rewrite passes is expensive
-        // and unnecessary — only the device producer is traversed.
-        Op::Program { sink, device, linear, source, binary } => {
+        // PROGRAM is opaque when preserving call bodies.
+        Op::Program { sink, linear, source, binary, .. } => {
             let mut skipped = Vec::with_capacity(
                 1 + usize::from(linear.is_some()) + usize::from(source.is_some()) + usize::from(binary.is_some()),
             );
@@ -90,7 +88,7 @@ fn traversal_children(node: &Arc<UOp>, mode: TraversalMode) -> (Vec<Arc<UOp>>, V
             if let Some(binary) = binary {
                 skipped.push(binary.clone());
             }
-            (vec![device.clone()], skipped)
+            (Vec::new(), skipped)
         }
         _ => (node.op().sources().into_iter().collect(), Vec::new()),
     }
@@ -480,6 +478,11 @@ pub fn graph_rewrite_walk<M: Matcher<C>, C>(matcher: &M, root: Arc<UOp>, ctx: &m
     RewriteEngine::new(None::<&NoMatcher>, Some(matcher), ctx, TraversalMode::Full).walk_rewrite(root)
 }
 
+/// Single-pass walk rewrite that does not enter CALL/FUNCTION bodies or PROGRAM internals.
+pub fn graph_rewrite_walk_preserve_calls<M: Matcher<C>, C>(matcher: &M, root: Arc<UOp>, ctx: &mut C) -> Arc<UOp> {
+    RewriteEngine::new(None::<&NoMatcher>, Some(matcher), ctx, TraversalMode::PreserveCallBodies).walk_rewrite(root)
+}
+
 /// Apply graph rewriting with both top-down and bottom-up patterns.
 /// - `bpm` patterns see ORIGINAL children (Stage 0)
 /// - `pm` patterns see OPTIMIZED children (Stage 1)
@@ -496,7 +499,7 @@ where
 /// - `bpm` patterns see ORIGINAL children (Stage 0)
 /// - `pm` patterns see OPTIMIZED children (Stage 1)
 /// - Traversal skips CALL/FUNCTION bodies and PROGRAM internals
-/// - CALL/FUNCTION args and PROGRAM device are still traversed
+/// - CALL/FUNCTION args are still traversed; PROGRAM has no traversed internals
 pub fn graph_rewrite_with_bpm_preserve_calls<PM, BPM, C>(pm: &PM, bpm: &BPM, root: Arc<UOp>, ctx: &mut C) -> Arc<UOp>
 where
     PM: Matcher<C>,
@@ -509,7 +512,7 @@ where
 ///
 /// CALL/FUNCTION/PROGRAM nodes are still matchable/rewriteable, but traversal
 /// does not descend into CALL/FUNCTION bodies or PROGRAM internals.
-/// CALL/FUNCTION arguments and PROGRAM device are still traversed.
+/// CALL/FUNCTION arguments are still traversed; PROGRAM has no traversed internals.
 pub fn graph_rewrite_preserve_calls<PM, C>(pm: &PM, root: Arc<UOp>, ctx: &mut C) -> Arc<UOp>
 where
     PM: Matcher<C>,
@@ -521,7 +524,7 @@ where
 ///
 /// CALL/FUNCTION/PROGRAM nodes are still matchable/rewriteable, but traversal
 /// does not descend into CALL/FUNCTION bodies or PROGRAM internals.
-/// CALL/FUNCTION arguments and PROGRAM device are still traversed.
+/// CALL/FUNCTION arguments are still traversed; PROGRAM has no traversed internals.
 pub fn graph_rewrite_bottom_up_preserve_calls<BPM, C>(bpm: &BPM, root: Arc<UOp>, ctx: &mut C) -> Arc<UOp>
 where
     BPM: Matcher<C>,

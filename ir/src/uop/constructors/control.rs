@@ -13,7 +13,7 @@ use smallvec::SmallVec;
 use svod_dtype::DType;
 
 use crate::op::Op;
-use crate::types::{AxisId, AxisType, ConstValue};
+use crate::types::{AxisId, AxisType};
 use crate::uop::UOp;
 
 impl UOp {
@@ -22,35 +22,23 @@ impl UOp {
     // =========================================================================
 
     /// Create a Range operation with specified axis type.
-    ///
-    /// `end` is coerced to `DType::Index` to keep range arithmetic
-    /// (`try_mul`/`try_add` in `shift_to`) on a uniform integer dtype. Const
-    /// inputs are rebuilt directly so structural pattern matches still see
-    /// `Op::Range { end: Op::Const(..) }` instead of a `Cast` wrapper.
     pub fn range_axis(end: Arc<Self>, axis_id: AxisId, axis_type: AxisType) -> Arc<Self> {
-        let end = if end.dtype() == DType::Index {
-            end
-        } else if let Op::Const(cv) = end.op() {
-            match cv.0 {
-                ConstValue::Int(v) => Self::const_(DType::Index, ConstValue::Int(v)),
-                ConstValue::UInt(v) => Self::const_(DType::Index, ConstValue::Int(v as i64)),
-                // Infallible by construction: `end` is always an integer loop bound built
-                // internally by the scheduler/codegen (sizes, `index_const`). A Float/Bool
-                // const here is an IR-builder bug, not user input. Kept panicking because
-                // `range_axis` feeds ~200 non-Result rewrite call sites (`Some(range_axis(..))`).
-                other => panic!("range_axis: Const end must be Int/UInt, got {other:?}"),
-            }
-        } else {
-            end.cast(DType::Index)
-        };
-        Self::new(Op::Range { end, axis_id, axis_type, deps: SmallVec::new() }, DType::Index)
+        Self::range_axis_dtype(end, axis_id, axis_type, DType::WeakInt)
+    }
+
+    /// Create a Range operation with an explicit index dtype.
+    pub fn range_axis_dtype(end: Arc<Self>, axis_id: AxisId, axis_type: AxisType, dtype: DType) -> Arc<Self> {
+        assert!(end.dtype().is_int(), "range_axis: end must be integer, got {:?}", end.dtype());
+        assert!(dtype.is_int(), "range_axis: dtype must be integer, got {dtype:?}");
+        let end = end.cast(dtype.clone());
+        Self::new(Op::Range { end, axis_id, axis_type, deps: SmallVec::new() }, dtype)
     }
 
     /// Create a RANGE operation with Loop axis type (convenience for tests).
     ///
     /// Uses `AxisId::Renumbered` since tests typically work with renumbered kernels.
     pub fn range(end: Arc<Self>, axis_id: usize) -> Arc<Self> {
-        Self::range_axis(end, AxisId::Renumbered(axis_id), AxisType::Loop)
+        Self::range_axis(end, AxisId::Renumbered(axis_id), AxisType::Weak)
     }
 
     /// Create a RANGE operation with constant end value (convenience for tests).
@@ -58,8 +46,8 @@ impl UOp {
     /// Uses `AxisId::Renumbered` since tests typically work with renumbered kernels.
     /// Creates a `Loop` range (inside kernels).
     pub fn range_const(end_value: i64, axis_id: usize) -> Arc<Self> {
-        let end = Self::const_(DType::Index, ConstValue::Int(end_value));
-        Self::range_axis(end, AxisId::Renumbered(axis_id), AxisType::Loop)
+        let end = Self::index_const(end_value);
+        Self::range_axis(end, AxisId::Renumbered(axis_id), AxisType::Weak)
     }
 
     // =========================================================================
@@ -102,8 +90,7 @@ impl UOp {
     /// Self passes through; `deps` are operations that must complete before
     /// any consumer of this barrier executes.
     pub fn barrier(self: &Arc<Self>, deps: SmallVec<[Arc<Self>; 4]>) -> Arc<Self> {
-        let dtype = self.dtype();
-        Self::new(Op::Barrier { src: self.clone(), deps }, dtype)
+        Self::new(Op::Barrier { src: self.clone(), deps }, DType::Void)
     }
 
     // =========================================================================
@@ -122,7 +109,14 @@ impl UOp {
     ///
     /// Range is [min_val, max_val] inclusive.
     pub fn define_var(name: String, min_val: i64, max_val: i64) -> Arc<Self> {
-        Self::new(Op::DefineVar { name, min_val, max_val }, DType::Index)
+        Self::variable(name, min_val, max_val, DType::WeakInt)
+    }
+
+    /// Create Tinygrad's scalar ALU PARAM representation for a symbolic variable.
+    pub fn variable(name: String, min_val: i64, max_val: i64, dtype: DType) -> Arc<Self> {
+        let shape = crate::shape::shape_to_uop(&SmallVec::new());
+        let arg = crate::ParamArg::variable(name, dtype.clone(), min_val, max_val);
+        Self::new(Op::Param { shape, arg }, dtype)
     }
 
     /// Bind concrete value to symbolic variable.
@@ -140,6 +134,14 @@ impl UOp {
     /// Unlike RANGE which is a loop, SPECIAL represents hardware-provided indices.
     /// The `name` identifies the dimension (rendered as-is in codegen).
     pub fn special(end: Arc<Self>, name: String) -> Arc<Self> {
-        Self::new(Op::Special { end, name }, DType::Index)
+        Self::special_dtype(end, name, DType::WeakInt)
+    }
+
+    /// Create a hardware index with an explicit dtype.
+    pub fn special_dtype(end: Arc<Self>, name: String, dtype: DType) -> Arc<Self> {
+        assert!(end.dtype().is_int(), "special: end must be integer, got {:?}", end.dtype());
+        assert!(dtype.is_int(), "special: dtype must be integer, got {dtype:?}");
+        let end = end.cast(dtype.clone());
+        Self::new(Op::Special { end, name }, dtype)
     }
 }

@@ -6,7 +6,7 @@ use std::f32::consts::PI;
 
 use svod_dtype::DType;
 
-use crate::{ConstValue, UOp, error::Error}; // ConstValue kept for Void, Float16, i8, u8
+use crate::{BinaryOp, ConstValue, Op, UOp, error::Error, uop::eval::eval_binary_op}; // ConstValue kept for Void, Float16, i8, u8
 
 // =========================================================================
 // Basic Arithmetic Operations
@@ -35,6 +35,65 @@ fn test_mod_same_type() {
 #[test]
 fn test_idiv_same_type() {
     assert_eq!(UOp::native_const(10i32).try_div(&UOp::native_const(3i32)).unwrap().dtype(), DType::Int32);
+}
+
+#[test]
+fn test_integer_division_operation_split() {
+    let a = UOp::native_const(-9i32);
+    let b = UOp::native_const(5i32);
+    assert!(matches!(a.try_div(&b).unwrap().op(), Op::Binary(BinaryOp::FloorDiv, ..)));
+    assert!(matches!(a.try_mod(&b).unwrap().op(), Op::Binary(BinaryOp::FloorMod, ..)));
+    assert!(matches!(a.try_cdiv(&b).unwrap().op(), Op::Binary(BinaryOp::CDiv, ..)));
+    assert!(matches!(a.try_cmod(&b).unwrap().op(), Op::Binary(BinaryOp::CMod, ..)));
+}
+
+#[test]
+fn test_signed_floor_divmod_semantics() {
+    for a in -12i64..=12 {
+        for b in -6i64..=6 {
+            if b == 0 {
+                continue;
+            }
+            let floor_div = match eval_binary_op(BinaryOp::FloorDiv, ConstValue::Int(a), ConstValue::Int(b)) {
+                Some(ConstValue::Int(v)) => v,
+                other => panic!("unexpected floor div result: {other:?}"),
+            };
+            let floor_mod = match eval_binary_op(BinaryOp::FloorMod, ConstValue::Int(a), ConstValue::Int(b)) {
+                Some(ConstValue::Int(v)) => v,
+                other => panic!("unexpected floor mod result: {other:?}"),
+            };
+            let cdiv = match eval_binary_op(BinaryOp::CDiv, ConstValue::Int(a), ConstValue::Int(b)) {
+                Some(ConstValue::Int(v)) => v,
+                other => panic!("unexpected C div result: {other:?}"),
+            };
+            let cmod = match eval_binary_op(BinaryOp::CMod, ConstValue::Int(a), ConstValue::Int(b)) {
+                Some(ConstValue::Int(v)) => v,
+                other => panic!("unexpected C mod result: {other:?}"),
+            };
+
+            assert_eq!(a, floor_div * b + floor_mod);
+            assert!(floor_mod == 0 || (floor_mod < 0) == (b < 0));
+            assert_eq!(cdiv, a / b);
+            assert_eq!(cmod, a % b);
+        }
+    }
+}
+
+#[test]
+fn test_floor_divmod_decompose_to_c_ops() {
+    let a = UOp::define_var("a".to_string(), -20, 20);
+    let b = UOp::define_var("b".to_string(), 1, 7);
+    for root in [a.try_div(&b).unwrap(), a.try_mod(&b).unwrap()] {
+        let lowered =
+            crate::decompositions::decompose_with(&root, &crate::decompositions::divmod_decomposition_patterns());
+        assert!(
+            !lowered
+                .toposort()
+                .iter()
+                .any(|u| { matches!(u.op(), Op::Binary(BinaryOp::FloorDiv | BinaryOp::FloorMod, ..)) })
+        );
+        assert!(lowered.toposort().iter().any(|u| matches!(u.op(), Op::Binary(BinaryOp::CDiv | BinaryOp::CMod, ..))));
+    }
 }
 
 #[test]

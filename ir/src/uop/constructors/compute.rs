@@ -68,13 +68,15 @@ macro_rules! bitwise_binary_ops {
     };
 }
 
-/// Macro for shift operations that only check LHS dtype.
+/// Macro for shift operations. Tinygrad requires both operands to be integer,
+/// while the result dtype is always inherited from the LHS.
 macro_rules! shift_ops {
     ($($method:ident => $op:ident),+ $(,)?) => {
         $(
             pub fn $method(self: &Arc<Self>, rhs: &Arc<Self>) -> Result<Arc<Self>> {
                 let dtype = self.dtype();
-                Self::check_bitwise_dtype(dtype.clone(), BinaryOp::$op)?;
+                Self::check_shift_dtype(dtype.clone(), BinaryOp::$op)?;
+                Self::check_shift_dtype(rhs.dtype(), BinaryOp::$op)?;
                 Self::validate_binary_shapes(self, rhs, BinaryOp::$op)?;
                 Ok(Self::new(Op::Binary(BinaryOp::$op, self.clone(), rhs.clone()), dtype))
             }
@@ -175,19 +177,21 @@ impl UOp {
     }
 
     division_ops! {
-        try_mod => Mod,
+        try_mod => FloorMod,
+        try_cmod => CMod,
+        try_cdiv => CDiv,
     }
 
     /// Division with automatic type-based operator selection.
     ///
-    /// Uses Idiv for integer types and Fdiv for float types.
+    /// Uses floor division for integer types and exact division for float types.
     #[track_caller]
     pub fn try_div(self: &Arc<Self>, rhs: &Arc<Self>) -> Result<Arc<Self>> {
         Self::check_division_by_zero(rhs)?;
         let (lhs, rhs, dtype) = Self::promote_and_cast(self.clone(), rhs.clone())?;
 
         // Choose division operator based on dtype
-        let op = if dtype.is_float() { BinaryOp::Fdiv } else { BinaryOp::Idiv };
+        let op = if dtype.is_float() { BinaryOp::Fdiv } else { BinaryOp::FloorDiv };
 
         Self::validate_binary_shapes(&lhs, &rhs, op)?;
         Ok(Self::new(Op::Binary(op, lhs, rhs), dtype))
@@ -215,35 +219,14 @@ impl UOp {
     /// `propagate_invalid` (which only handles Binary ops) can push WHERE+Invalid
     /// through negation.
     ///
-    /// If `self` has a shape, broadcasts -1 to match (RESHAPE+EXPAND), matching
-    /// Tinygrad's Tensor-level `_broadcasted()`. If shapeless (schedule/symbolic
-    /// context), uses a scalar const directly.
+    /// `const_like` gives -1 the receiver's dtype and independent shape.
     #[track_caller]
     pub fn neg(self: &Arc<Self>) -> Arc<Self> {
         // Tinygrad: logical_not for bool, MUL(-1) for everything else
         if self.dtype.is_bool() {
             return self.not();
         }
-        use crate::types::ConstValue;
-        let dtype = self.dtype.clone();
-        // Use Int(-1) or Float(-1.0) and let const_() handle dtype cast (wraps for unsigned).
-        // Matches Tinygrad where Python's -1 is cast via dtypes.as_const(-1, dtype).
-        let neg_one = if dtype.is_float() { ConstValue::Float(-1.0) } else { ConstValue::Int(-1) };
-        let mut neg_one_uop = Self::const_(dtype.clone(), neg_one);
-
-        // Broadcast scalar -1 to match self's shape if present.
-        // Matches Tinygrad's _broadcasted: reshape to (1,)*ndim then expand to shape.
-        if let Ok(Some(shape)) = self.shape()
-            && !shape.is_empty()
-        {
-            use crate::sint::SInt;
-            use smallvec::SmallVec;
-            let ones: SmallVec<[SInt; 4]> = shape.iter().map(|_| SInt::from(1)).collect();
-            neg_one_uop = neg_one_uop.try_reshape(&ones).expect("neg: reshape failed");
-            neg_one_uop = neg_one_uop.try_expand(shape).expect("neg: expand failed");
-        }
-
-        self.mul(&neg_one_uop)
+        self.mul(&self.const_like(-1i64))
     }
 
     /// Absolute value: |x|.
@@ -431,8 +414,10 @@ impl UOp {
         add => try_add,
         sub => try_sub,
         mul => try_mul,
-        idiv => try_div,
+        floor_div => try_div,
         mod_ => try_mod,
+        cdiv => try_cdiv,
+        cmod => try_cmod,
         max => try_max,
 
         // Bitwise

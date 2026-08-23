@@ -3,7 +3,7 @@ use snafu::Snafu;
 use svod_dtype::DType;
 use svod_dtype::DeviceSpec;
 
-use crate::{BinaryOp, UnaryOp, shape::Shape};
+use crate::{BinaryOp, ConstValue, UnaryOp, shape::Shape};
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -88,6 +88,10 @@ pub enum Error {
     #[snafu(display("reduce axis {axis} is invalid for shape with {shape_dims} dimensions"))]
     ReduceAxisInvalid { axis: i32, shape_dims: usize },
 
+    /// Shaped reduction removes more leading axes than its source has.
+    #[snafu(display("reduce num_axes {num_axes} is invalid for shape with {shape_dims} dimensions"))]
+    ReduceInvalidNumAxes { num_axes: usize, shape_dims: usize },
+
     /// Shape mismatch in elementwise operation.
     #[snafu(display("shape mismatch: cannot perform elementwise operation on shapes {lhs_shape:?} and {rhs_shape:?}"))]
     ShapeMismatch { lhs_shape: Vec<usize>, rhs_shape: Vec<usize> },
@@ -120,6 +124,14 @@ pub enum Error {
     #[snafu(display("shape inference failed for {operation}: source has no inferable shape"))]
     MissingShape { operation: &'static str },
 
+    /// A canonical parity document cannot represent this graph without losing semantics.
+    #[snafu(display("canonical serialization failed: {detail}"))]
+    CanonicalSerialization { detail: String },
+
+    /// A constant value cannot be represented by its declared dtype.
+    #[snafu(display("cannot commit constant {value:?} to dtype {dtype:?}"))]
+    ConstantConversion { value: ConstValue, dtype: DType },
+
     /// Symbolic buffer size unsupported.
     #[snafu(display("cannot allocate buffer with symbolic size: range bound resolved to {bound:?}"))]
     SymbolicBufferSize { bound: crate::ConstValue },
@@ -130,7 +142,7 @@ pub enum Error {
     ))]
     TernaryBranchShapeMismatch { true_branch: Box<Shape>, false_branch: Box<Shape> },
 
-    /// DefineLocal must have Ptr dtype.
+    /// Legacy buffer definitions required pointer dtype.
     #[snafu(display(
         "{op} must have Ptr dtype (following Tinygrad spec), got {dtype:?}. Use DefineVar for scalar variables."
     ))]
@@ -139,35 +151,6 @@ pub enum Error {
     // =========================================================================
     // UOp Builder Guards (user-facing API for kernel implementation)
     // =========================================================================
-    /// VECTORIZE requires at least one element.
-    #[snafu(display("VECTORIZE requires at least one element"))]
-    VectorizeEmpty,
-
-    /// VECTORIZE elements have mismatched dtypes.
-    #[snafu(display("VECTORIZE elements have mismatched dtypes: expected {expected:?}, got {actual:?}"))]
-    VectorizeDTypeMismatch { expected: DType, actual: DType },
-
-    /// Element/source dtype cannot be vectorized to the requested count
-    /// (already a vector, or a pointer vectorized to a conflicting count).
-    #[snafu(display("dtype {dtype:?} cannot be vectorized to count {count}"))]
-    NotVectorizable { dtype: DType, count: usize },
-
-    /// GEP index out of bounds.
-    #[snafu(display("GEP index {index} out of bounds for vector with {vcount} elements"))]
-    GepIndexOutOfBounds { index: usize, vcount: usize },
-
-    /// GEP requires vector source.
-    #[snafu(display("GEP requires vector source (vcount > 1), got {dtype:?}"))]
-    GepRequiresVector { dtype: DType },
-
-    /// CONTRACT dtype count != axis product.
-    #[snafu(display("CONTRACT dtype count {dtype_count} != axis product {axis_product}"))]
-    ContractCountMismatch { dtype_count: usize, axis_product: usize },
-
-    /// UNROLL src dtype count != axis product.
-    #[snafu(display("UNROLL src dtype count {dtype_count} != axis product {axis_product}"))]
-    UnrollCountMismatch { dtype_count: usize, axis_product: usize },
-
     /// WHERE condition must be bool.
     #[snafu(display("WHERE condition must be bool, got {actual:?}"))]
     WhereConditionNotBool { actual: DType },
@@ -197,6 +180,22 @@ pub enum Error {
     /// CALL argument dtype mismatch.
     #[snafu(display("CALL argument {arg_index} dtype mismatch: expected {expected:?}, got {got:?}"))]
     CallArgDTypeMismatch { arg_index: usize, expected: DType, got: DType },
+
+    /// A formal PARAM references a positional argument that is not present.
+    #[snafu(display("FUNCTION formal PARAM slot {slot} has no argument (argument count {arg_count})"))]
+    CallFormalSlotMissing { slot: isize, arg_count: usize },
+
+    /// CALL/FUNCTION argument sharding axes must agree.
+    #[snafu(display("CALL argument {arg_index} axis mismatch: expected {expected:?}, got {got:?}"))]
+    CallArgAxisMismatch { arg_index: usize, expected: Option<usize>, got: Option<usize> },
+
+    /// A symbolic output dimension cannot use the selected actual argument.
+    #[snafu(display("FUNCTION shape substitution for formal slot {slot} is unsupported: {reason}"))]
+    CallShapeSubstitutionUnsupported { slot: isize, reason: String },
+
+    /// Shape substitution completed without replacing every body-local formal.
+    #[snafu(display("FUNCTION result shape retains dangling formal PARAM slots {slots:?}"))]
+    CallShapeDanglingFormal { slots: Vec<isize> },
 
     /// Kernel split dependency cycle detected while fixing AFTER assignments.
     #[snafu(display(

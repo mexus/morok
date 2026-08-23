@@ -25,7 +25,7 @@ use std::fmt;
 pub enum OptOps {
     /// Apply tensor core optimization (hardware matrix multiplication).
     TC,
-    /// Vectorize by combining multiple iterations (SIMD).
+    /// Stack by combining multiple iterations (SIMD).
     UPCAST,
     /// Unroll reduction loops for better instruction-level parallelism.
     UNROLL,

@@ -185,8 +185,8 @@ cached_property! {
     VminVmaxProperty: (ConstValue, ConstValue) {
         cache_field: vmin_vmax_cache,
         compute: |uop| {
-            crate::uop::range_eval::compute_sound_vmin_vmax(uop)
-                .unwrap_or_else(|| crate::uop::range_eval::dtype_bounds(&uop.dtype))
+            crate::uop::range_eval::compute_vmin_vmax(uop)
+                .unwrap_or_else(|| crate::uop::range_eval::analysis_bounds(&uop.dtype))
         }
     }
 }

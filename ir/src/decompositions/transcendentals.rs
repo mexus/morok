@@ -7,10 +7,7 @@
 //! - Paper: <https://arxiv.org/pdf/2001.09258>
 //! - SLEEF: <https://github.com/shibatch/sleef>
 
-use std::{
-    f64::consts::{FRAC_1_PI, LN_2},
-    sync::Arc,
-};
+use std::{f64::consts::LN_2, sync::Arc};
 
 use svod_dtype::{DType, ScalarDType};
 
@@ -158,24 +155,15 @@ pub fn xlog2(d: &Arc<UOp>) -> Arc<UOp> {
     let d = &ensure_scalar(d);
     let dtype = d.dtype();
 
-    // For float16, upcast to float32 for precision
-    if dtype.scalar() == Some(ScalarDType::Float16) {
-        let d_f32 = d.cast(DType::Float32);
-        let result_f32 = xlog2(&d_f32);
-        return result_f32.cast(dtype);
-    }
-
-    let flt_min = match dtype.scalar() {
-        Some(ScalarDType::Float64) => 1e-4,
-        _ => 1e-4,
-    };
+    let flt_min = if dtype.scalar() == Some(ScalarDType::Float16) { 6.1e-5 } else { 1e-4 };
     let flt_min_const = float_const(&dtype, flt_min);
 
     // Check for denormals
     let is_denormal = d.try_cmplt(&flt_min_const).expect("xlog2: cmplt denormal");
 
-    // Scale up denormals by 2^64
-    let scale_up = float_const(&dtype, (2.0_f64).powi(64));
+    // float16 cannot represent 2^64, so Tinygrad scales its denormals by 2^10.
+    let denormal_exp = if dtype.scalar() == Some(ScalarDType::Float16) { 10 } else { 64 };
+    let scale_up = float_const(&dtype, (2.0_f64).powi(denormal_exp));
     let scaled = d.try_mul(&scale_up).expect("xlog2: mul scale");
     let a = UOp::try_where(is_denormal.clone(), scaled, d.clone()).expect("xlog2: where denormal");
 
@@ -191,8 +179,8 @@ pub fn xlog2(d: &Arc<UOp>) -> Arc<UOp> {
 
     // Adjust exponent for denormals
     let int_dtype = float_to_int_dtype(&dtype);
-    let sixty_four = int_const(&int_dtype, 64);
-    let e_adjusted = e.try_sub(&sixty_four).expect("xlog2: sub 64");
+    let denormal_exp_const = int_const(&int_dtype, denormal_exp as i64);
+    let e_adjusted = e.try_sub(&denormal_exp_const).expect("xlog2: subtract denormal exponent");
     let e = UOp::try_where(is_denormal, e_adjusted, e).expect("xlog2: where e adjust");
     let e_float = e.cast(dtype.clone());
 
@@ -226,12 +214,12 @@ pub fn xlog2(d: &Arc<UOp>) -> Arc<UOp> {
     let s_hi = e_float.try_add(&x_log2e).expect("xlog2: e + x*log2e");
 
     // For float32, add correction term
-    let s = if dtype.scalar() == Some(ScalarDType::Float64) {
-        s_hi
-    } else {
+    let s = if dtype.scalar() == Some(ScalarDType::Float32) {
         let s_lo_coeff = float_const(&dtype, 3.273_447_448_356_849e-8);
         let s_lo = x.try_mul(&s_lo_coeff).expect("xlog2: s_lo");
         s_hi.try_add(&s_lo).expect("xlog2: s_hi + s_lo")
+    } else {
+        s_hi
     };
 
     let r = t_term.try_add(&s).expect("xlog2: final add");
@@ -241,24 +229,19 @@ pub fn xlog2(d: &Arc<UOp>) -> Arc<UOp> {
     let neg_inf = float_const(&dtype, f64::NEG_INFINITY);
     let nan = float_const(&dtype, f64::NAN);
     let neg_zero = float_const(&dtype, -0.0);
+    let zero = float_const(&dtype, 0.0);
 
     // log2(inf) = inf
     let is_inf = d.try_cmpeq(&inf).expect("xlog2: cmpeq inf");
     let r = UOp::try_where(is_inf, inf.clone(), r).expect("xlog2: where inf");
 
-    // log2(x < 0) = nan
+    // log2(+/-0) = -inf.
+    let is_zero = d.try_cmpeq(&zero).expect("xlog2: cmpeq zero");
+    let r = UOp::try_where(is_zero, neg_inf.clone(), r).expect("xlog2: where zero");
+
+    // log2(x < -0.0) = nan.
     let is_neg = d.try_cmplt(&neg_zero).expect("xlog2: cmplt neg");
     let r = UOp::try_where(is_neg, nan.clone(), r).expect("xlog2: where neg");
-
-    // log2(0) = -inf (check by looking at result being very negative)
-    let log2_zero = match dtype.scalar() {
-        Some(ScalarDType::Float64) => -1087.0,
-        Some(ScalarDType::Float32) => -191.0,
-        _ => -79.0,
-    };
-    let log2_zero_const = float_const(&dtype, log2_zero);
-    let is_zero = r.try_cmpeq(&log2_zero_const).expect("xlog2: cmpeq zero");
-    let r = UOp::try_where(is_zero, neg_inf.clone(), r).expect("xlog2: where zero");
 
     // log2(nan) = nan
     let is_nan = d.try_cmpne(d).expect("xlog2: cmpne nan");
@@ -297,11 +280,12 @@ pub fn xsin(d: &Arc<UOp>) -> Arc<UOp> {
     // x_abs = |x|
     let x_abs = x.try_mul(&x_sign).expect("xsin: abs");
 
-    // Cody-Waite reduction
-    let (r, q) = cody_waite_reduction(&x_abs);
-
-    // sin polynomial on reduced argument
-    let result = sin_poly_small(&r, &q);
+    let (large_r, large_q) = payne_hanek_reduction(&x_abs);
+    let (small_r, small_q) = cody_waite_reduction(&x_abs);
+    let small = sin_poly_small(&small_r, &small_q);
+    let large = sin_poly_large(&large_r, &large_q);
+    let result = UOp::try_where(x_abs.try_cmplt(&float_const(&dtype, 30.0)).expect("xsin: threshold"), small, large)
+        .expect("xsin: reduction select");
 
     // Adjust sign
     let result = result.try_mul(&x_sign).expect("xsin: sign adjust");
@@ -328,7 +312,7 @@ pub fn xexp(d: &Arc<UOp>) -> Arc<UOp> {
     let dtype = d.dtype();
     let log2_e = float_const(&dtype, std::f64::consts::LOG2_E);
     let scaled = d.try_mul(&log2_e).expect("xexp: mul log2e");
-    xexp2(&scaled)
+    scaled.try_exp2().expect("xexp: exp2")
 }
 
 /// xlog: ln(d) = log2(d) / log2(e) = log2(d) * ln(2)
@@ -337,7 +321,7 @@ pub fn xlog(d: &Arc<UOp>) -> Arc<UOp> {
     let d = &ensure_scalar(d);
     let dtype = d.dtype();
     let ln_2 = float_const(&dtype, std::f64::consts::LN_2);
-    let log2_d = xlog2(d);
+    let log2_d = d.try_log2().expect("xlog: log2");
     log2_d.try_mul(&ln_2).expect("xlog: mul ln2")
 }
 
@@ -463,8 +447,8 @@ pub fn xpow(base: &Arc<UOp>, exponent: &Arc<UOp>) -> Arc<UOp> {
     // base < 0
     let base_neg = base.try_cmplt(&zero).expect("xpow: cmplt base");
 
-    // Check if exponent is integer: exp != cast(cast(exp, int), float)
-    let int_dtype = float_to_int_dtype(&dtype);
+    // Tinygrad deliberately uses int32 for pow's integer/odd tests.
+    let int_dtype = DType::Int32;
     let exp_int = exponent.cast(int_dtype.clone());
     let exp_back = exp_int.cast(dtype.clone());
     let non_int = exponent.try_cmpne(&exp_back).expect("xpow: cmpne int");
@@ -484,17 +468,18 @@ pub fn xpow(base: &Arc<UOp>, exponent: &Arc<UOp>) -> Arc<UOp> {
     // Adjustment for negative base: -1 if odd exponent, 1 otherwise
     let odd_adj = UOp::try_where(is_odd_bool, neg_one, one.clone()).expect("xpow: where odd");
 
-    // non_int → nan, else odd_adj
-    let adj = UOp::try_where(non_int, nan, odd_adj).expect("xpow: where non_int");
+    // -inf never becomes NaN for a non-integer exponent.
+    let neg_inf = float_const(&dtype, f64::NEG_INFINITY);
+    let finite_neg_base = base.try_cmpne(&neg_inf).expect("xpow: negative infinity check");
+    let non_int_result = UOp::try_where(finite_neg_base, nan, one.clone()).expect("xpow: non-int negative base");
+    let adj = UOp::try_where(non_int, non_int_result, odd_adj).expect("xpow: where non_int");
 
     // Apply adjustment only for negative base
     let result = UOp::try_where(base_neg, ret.try_mul(&adj).expect("xpow: mul adj"), ret).expect("xpow: where neg");
 
-    // 0^0 = 1
-    let base_zero = base.try_cmpeq(&zero).expect("xpow: cmpeq base zero");
+    // x^0 = 1, including 0^0 and inf^0.
     let exp_zero = exponent.try_cmpeq(&zero).expect("xpow: cmpeq exp zero");
-    let both_zero = base_zero.try_and_op(&exp_zero).expect("xpow: and zeros");
-    UOp::try_where(both_zero, one, result).expect("xpow: where 0^0")
+    UOp::try_where(exp_zero, one, result).expect("xpow: where exponent zero")
 }
 
 // ============================================================================
@@ -506,12 +491,20 @@ pub fn xpow(base: &Arc<UOp>, exponent: &Arc<UOp>) -> Arc<UOp> {
 /// Returns (reduced_value, quadrant)
 fn cody_waite_reduction(d: &Arc<UOp>) -> (Arc<UOp>, Arc<UOp>) {
     let dtype = scalar_dtype(&d.dtype());
-    let m_1_pi = FRAC_1_PI; // 1/π
-
-    // quadrant = round(d / π)
-    let m_1_pi_const = float_const(&dtype, m_1_pi);
-    let d_over_pi = d.try_mul(&m_1_pi_const).expect("cody_waite: d/pi");
-    let quadrant = rintk(&d_over_pi);
+    let m_1_pi = 0.318_309_886_183_790_7;
+    let qdh = if dtype.scalar() == Some(ScalarDType::Float64) {
+        d.mul(&float_const(&dtype, m_1_pi / 16_777_216.0))
+            .cast(DType::Int64)
+            .cast(dtype.clone())
+            .mul(&float_const(&dtype, 16_777_216.0))
+    } else {
+        float_const(&dtype, 0.0)
+    };
+    let quadrant = if dtype.scalar() == Some(ScalarDType::Float64) {
+        rintk(&d.mul(&float_const(&dtype, m_1_pi)).sub(&qdh))
+    } else {
+        rintk(&d.mul(&float_const(&dtype, m_1_pi)))
+    };
     let q_float = quadrant.cast(dtype.clone());
 
     // Reduce: d - quadrant * π (using extended precision constants)
@@ -522,11 +515,13 @@ fn cody_waite_reduction(d: &Arc<UOp>) -> (Arc<UOp>, Arc<UOp>) {
         let pi_c = float_const(&dtype, 1.224_646_786_410_718_9e-16);
         let pi_d = float_const(&dtype, 1.273_663_432_702_19e-24);
 
-        let mut r = d.clone();
-        r = r.try_sub(&q_float.try_mul(&pi_a).expect("cw: mul pi_a")).expect("cw: sub pi_a");
+        let mut r = d.add(&qdh.mul(&pi_a.neg()));
+        r = r.add(&q_float.mul(&pi_a.neg()));
+        r = r.add(&qdh.mul(&pi_b.neg()));
         r = r.try_sub(&q_float.try_mul(&pi_b).expect("cw: mul pi_b")).expect("cw: sub pi_b");
+        r = r.add(&qdh.mul(&pi_c.neg()));
         r = r.try_sub(&q_float.try_mul(&pi_c).expect("cw: mul pi_c")).expect("cw: sub pi_c");
-        r = r.try_sub(&q_float.try_mul(&pi_d).expect("cw: mul pi_d")).expect("cw: sub pi_d");
+        r = r.add(&qdh.add(&q_float).mul(&pi_d.neg()));
         r
     } else if dtype.scalar() == Some(ScalarDType::Float16) {
         // Float16 needs float32 precision
@@ -540,7 +535,72 @@ fn cody_waite_reduction(d: &Arc<UOp>) -> (Arc<UOp>, Arc<UOp>) {
         r
     };
 
-    (reduced, quadrant)
+    (reduced, quadrant.cast(DType::Int32))
+}
+
+/// Payne-Hanek reduction using the pinned 190-bit 2/pi table.
+fn payne_hanek_reduction(d: &Arc<UOp>) -> (Arc<UOp>, Arc<UOp>) {
+    let dtype = d.dtype();
+    let intermediate = if dtype.scalar() == Some(ScalarDType::Float16) { DType::Float32 } else { dtype.clone() };
+    let uint_dtype = match dtype.scalar() {
+        Some(ScalarDType::Float64) => DType::UInt64,
+        Some(ScalarDType::Float32) => DType::UInt32,
+        Some(ScalarDType::Float16) => DType::UInt16,
+        _ => unreachable!("transcendental dtype guard"),
+    };
+    let (mantissa_mask, normalize_mask) = match dtype.scalar() {
+        Some(ScalarDType::Float64) => (0x000f_ffff_ffff_ffff_i64, 0x3fe0_0000_0000_0000_i64),
+        Some(ScalarDType::Float32) => (0x807f_ffff_i64, 0x3f00_0000_i64),
+        Some(ScalarDType::Float16) => (0x83ff_i64, 0x3800_i64),
+        _ => unreachable!("transcendental dtype guard"),
+    };
+    let bits = d.bitcast(uint_dtype.clone());
+    let exponent = shr(&bits, mantissa_bits(&dtype)).and_(&int_const(&uint_dtype, exponent_mask(&dtype)));
+    let f = bits
+        .and_(&int_const(&uint_dtype, mantissa_mask))
+        .try_or_op(&int_const(&uint_dtype, normalize_mask))
+        .expect("payne-hanek normalize mantissa")
+        .bitcast(dtype.clone());
+    let e = exponent.sub(&int_const(&uint_dtype, exponent_bias(&dtype))).add(&int_const(&uint_dtype, 1));
+    let ia = f.cast(intermediate.clone()).mul(&float_const(&intermediate, 4.294_967_296e9)).cast(DType::UInt64);
+    let i = shr(&e.cast(DType::UInt64), 5);
+    let e = e.cast(DType::Int32).and_(&int_const(&DType::Int32, 31));
+    let offset = int_const(&DType::Int32, 32).sub(&e);
+    const TWO_OVER_PI: [i64; 7] = [0, 0x28be60db, 0x9391054a, 0x7f09d5f4, 0x7d4d3770, 0x36d8a566, 0x4f10e410];
+    fn take(i: &Arc<UOp>, offset: usize) -> Arc<UOp> {
+        let mut out = int_const(&DType::UInt32, 0);
+        for count in (0..TWO_OVER_PI.len() - 1 - offset).rev() {
+            out = UOp::try_where(
+                i.ne(&int_const(&DType::UInt64, count as i64)),
+                out,
+                int_const(&DType::UInt32, TWO_OVER_PI[count + offset]),
+            )
+            .expect("payne-hanek table select");
+        }
+        out
+    }
+    let a = [take(&i, 0), take(&i, 1), take(&i, 2), take(&i, 3)];
+    let dynamic_shl = |x: &Arc<UOp>, y: &Arc<UOp>| {
+        x.cast(DType::UInt64).mul(&pow2if(y, &DType::Float32).cast(DType::UInt64)).cast(DType::UInt32)
+    };
+    let dynamic_shr = |x: &Arc<UOp>, y: &Arc<UOp>| {
+        x.cast(DType::UInt64).cdiv(&pow2if(y, &DType::Float32).cast(DType::UInt64)).cast(DType::UInt32)
+    };
+    let hi = dynamic_shl(&a[0], &e).try_or_op(&dynamic_shr(&a[1], &offset)).expect("payne-hanek hi");
+    let mi = dynamic_shl(&a[1], &e).try_or_op(&dynamic_shr(&a[2], &offset)).expect("payne-hanek mi");
+    let lo = dynamic_shl(&a[2], &e).try_or_op(&dynamic_shr(&a[3], &offset)).expect("payne-hanek lo");
+    let hp_mul = |x: &Arc<UOp>, y: &Arc<UOp>| x.cast(DType::UInt64).mul(&y.cast(DType::UInt64));
+    let p = shl(&hp_mul(&ia, &hi), 32).add(&hp_mul(&ia, &mi)).add(&shr(&hp_mul(&ia, &lo), 32));
+    let q = shr(&p, 62).cast(DType::Int32);
+    let p = p.and_(&int_const(&DType::UInt64, 0x3fff_ffff_ffff_ffff));
+    let r =
+        p.cast(intermediate.clone()).mul(&float_const(&intermediate, 3.406_121_580_086_554_5e-19)).cast(dtype.clone());
+    let below_half = f.lt(&float_const(&dtype, 0.5));
+    (
+        UOp::try_where(below_half.clone(), r.clone(), r.sub(&float_const(&dtype, std::f64::consts::FRAC_PI_2)))
+            .expect("payne-hanek remainder"),
+        UOp::try_where(below_half, q.clone(), q.add(&int_const(&DType::Int32, 1))).expect("payne-hanek quadrant"),
+    )
 }
 
 /// Float32 Cody-Waite reduction helper.
@@ -587,7 +647,7 @@ fn sin_poly_small(r: &Arc<UOp>, q: &Arc<UOp>) -> Arc<UOp> {
     let result = sin_poly(r);
 
     // q & 1 != 0 → negate
-    let int_dtype = float_to_int_dtype(&dtype);
+    let int_dtype = DType::Int32;
     let one_int = int_const(&int_dtype, 1);
     let q_and_1 = q.try_and_op(&one_int).expect("sin_small: q & 1");
     let zero_int = int_const(&int_dtype, 0);
@@ -598,4 +658,16 @@ fn sin_poly_small(r: &Arc<UOp>, q: &Arc<UOp>) -> Arc<UOp> {
     let sign = UOp::try_where(is_odd, neg_one, one).expect("sin_small: where sign");
 
     result.try_mul(&sign).expect("sin_small: mul sign")
+}
+
+fn sin_poly_large(r: &Arc<UOp>, q: &Arc<UOp>) -> Arc<UOp> {
+    let dtype = r.dtype();
+    let odd = q.and_(&int_const(&DType::Int32, 1)).ne(&int_const(&DType::Int32, 0));
+    let shifted = r.add(
+        &UOp::try_where(odd, float_const(&dtype, std::f64::consts::FRAC_PI_2), float_const(&dtype, 0.0))
+            .expect("sin large shift"),
+    );
+    let result = sin_poly(&shifted);
+    let flip = q.and_(&int_const(&DType::Int32, 2)).ne(&int_const(&DType::Int32, 0));
+    result.mul(&UOp::try_where(flip, float_const(&dtype, -1.0), float_const(&dtype, 1.0)).expect("sin large sign"))
 }

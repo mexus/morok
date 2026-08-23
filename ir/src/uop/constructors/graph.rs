@@ -10,7 +10,7 @@
 use std::sync::Arc;
 
 use smallvec::SmallVec;
-use svod_dtype::{AddrSpace, DType};
+use svod_dtype::DType;
 
 use crate::op::Op;
 use crate::types::{CallInfo, CustomFunctionKind, KernelInfo};
@@ -27,7 +27,7 @@ fn is_opaque_call_body(op: &Op) -> bool {
             | Op::Program { .. }
             | Op::Linear { .. }
             | Op::Copy { .. }
-            | Op::BufferView { .. }
+            | Op::Slice { .. }
             | Op::CustomFunction { .. }
     )
 }
@@ -188,35 +188,15 @@ impl UOp {
 
     /// Create a PARAM placeholder shaped like `src` for custom kernel building.
     ///
-    /// Rejects symbolic input via `all_int`-style check and creates a global
-    /// pointer PARAM with the same logical shape, matching tinygrad's
-    /// `placeholder_like`. For multi-device wrappers (MULTI/MSELECT/MSTACK),
+    /// Rejects symbolic input via `all_int`-style check and creates storage in
+    /// the requested address space with the same logical shape, matching
+    /// Tinygrad's `placeholder_like`. For multi-device wrappers (MULTI/MSELECT/MSTACK),
     /// placeholder shape is derived from the underlying shard (analog of
     /// tinygrad's `max_shard_shape`).
-    pub fn placeholder_like(src: &Arc<Self>, slot: usize) -> Result<Arc<Self>> {
+    pub fn placeholder_like(src: &Arc<Self>, slot: usize, addrspace: svod_dtype::AddrSpace) -> Result<Arc<Self>> {
         let anchor = Self::placeholder_like_anchor(src);
         let shape = anchor.shape()?.cloned().ok_or_else(|| Error::MissingShape { operation: "placeholder_like" })?;
-
-        let concrete_shape: Vec<usize> = shape
-            .iter()
-            .map(|d| d.as_const().ok_or_else(|| Error::SymbolicShapeUnsupported { operation: "placeholder_like" }))
-            .collect::<Result<_>>()?;
-
-        let size = concrete_shape.iter().product::<usize>().max(1);
-        let dtype = match anchor.dtype() {
-            DType::Ptr { .. } => anchor.dtype(),
-            dt => dt
-                .ptr(Some(size), AddrSpace::Global)
-                .expect("placeholder_like base is never a pointer (Ptr arm handled above)"),
-        };
-        let placeholder = UOp::param(slot, size, dtype, None);
-        if concrete_shape.len() <= 1 {
-            return Ok(placeholder);
-        }
-
-        let reshaped = placeholder
-            .try_reshape(&crate::shape::Shape::from_iter(concrete_shape.into_iter().map(crate::SInt::Const)))?;
-        Ok(reshaped)
+        Self::placeholder(&shape, anchor.dtype(), slot, addrspace, None)
     }
 
     /// Build a custom kernel callable and return `AFTER(callable)` outputs for all inputs.
@@ -225,7 +205,7 @@ impl UOp {
     /// are built from those sources, and the closure returns the kernel body UOp.
     ///
     /// Body dispatch mirrors tinygrad's `_OPAQUE_CALL_BODIES` set:
-    /// - Opaque bodies (`Sink`, `Program`, `Linear`, `Copy`, `BufferView`,
+    /// - Opaque bodies (`Sink`, `Program`, `Linear`, `Copy`, `Slice`,
     ///   `CustomFunction`) wrap into `Op::Call`. An info-less `Sink` is
     ///   auto-promoted to a kernel-marked `Sink` first.
     /// - Value-producing bodies wrap into `Op::Function`, which auto-wraps
@@ -238,8 +218,11 @@ impl UOp {
         let contig_srcs: Vec<Arc<Self>> =
             srcs.into_iter().map(|x| if matches!(x.op(), Op::After { .. }) { x } else { x.contiguous() }).collect();
 
-        let placeholders: Vec<Arc<Self>> =
-            contig_srcs.iter().enumerate().map(|(i, s)| UOp::placeholder_like(s, i)).collect::<Result<_>>()?;
+        let placeholders: Vec<Arc<Self>> = contig_srcs
+            .iter()
+            .enumerate()
+            .map(|(i, s)| UOp::placeholder_like(s, i, svod_dtype::AddrSpace::Global))
+            .collect::<Result<_>>()?;
 
         let mut body = fxn(placeholders);
         if let Op::Sink { sources, info: None } = body.op() {

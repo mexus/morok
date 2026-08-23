@@ -5,7 +5,7 @@
 //! - [`data`] - Constants, buffers, device specifications
 //! - [`compute`] - Arithmetic, transcendental, bitwise, comparison operations
 //! - [`shape`] - Shape manipulation (reshape, permute, expand, pad, shrink, flip)
-//! - [`memory`] - Memory operations (load, store, index, copy, bufferize)
+//! - [`memory`] - Memory operations (load, store, index, copy, stage)
 //! - [`control`] - Control flow (range, if/end, barrier, var)
 //! - [`reduce`] - Reduction operations
 //! - [`hardware`] - Hardware-specific (WMMA, vectorize, call, program)
@@ -88,8 +88,14 @@ impl UOp {
     /// # Errors
     /// Returns `InvalidDTypeForOp` if dtype is not int or bool
     pub(crate) fn check_bitwise_dtype(dtype: DType, operation: BinaryOp) -> Result<()> {
-        // Allow bool and all integer types (signed, unsigned, AND Index for loop counters)
         let is_valid = dtype.is_bool() || dtype.is_int();
+        if !is_valid { Err(Error::InvalidDTypeForBinaryOp { operation, dtypes: smallvec![dtype] }) } else { Ok(()) }
+    }
+
+    /// Shifts require mathematical or concrete integers. Unlike AND/OR/XOR,
+    /// Tinygrad does not accept bool operands for SHL/SHR.
+    pub(crate) fn check_shift_dtype(dtype: DType, operation: BinaryOp) -> Result<()> {
+        let is_valid = dtype.is_int();
         if !is_valid { Err(Error::InvalidDTypeForBinaryOp { operation, dtypes: smallvec![dtype] }) } else { Ok(()) }
     }
 
@@ -120,10 +126,7 @@ impl UOp {
         Ok(())
     }
 
-    /// Validate that binary operation operands have compatible shapes.
-    ///
-    /// This enforces exact shape matching (no broadcasting). Both operands must have
-    /// the same shape, or at least one must be shapeless (None).
+    /// Validate that binary operation operands have broadcast-compatible shapes.
     ///
     /// # Arguments
     /// * `lhs` - Left-hand side operand
@@ -131,22 +134,20 @@ impl UOp {
     /// * `op` - Binary operation type (for error reporting)
     ///
     /// # Errors
-    /// Returns `BinaryShapeMismatch` if both operands have shapes and they differ
+    /// Returns `BinaryShapeMismatch` if both operands have incompatible shapes.
     pub(crate) fn validate_binary_shapes(lhs: &Arc<Self>, rhs: &Arc<Self>, op: crate::BinaryOp) -> Result<()> {
         use crate::error::BinaryShapeMismatchSnafu;
-        use crate::shape::shapes_equal;
+        use crate::shape::broadcast_shapes;
 
         // Get shapes from both operands
         let lhs_shape = lhs.shape()?;
         let rhs_shape = rhs.shape()?;
 
-        // Validate: either shapes match or at least one is None
         match (lhs_shape, rhs_shape) {
-            (Some(ls), Some(rs)) if !shapes_equal(ls, rs) => {
-                // Both have shapes but they differ - ERROR
+            (Some(ls), Some(rs)) if broadcast_shapes(&[ls.clone(), rs.clone()]).is_err() => {
                 BinaryShapeMismatchSnafu { op, lhs: Box::new(ls.clone()), rhs: Box::new(rs.clone()) }.fail()
             }
-            _ => Ok(()), // Either shapes match or at least one is None
+            _ => Ok(()),
         }
     }
 

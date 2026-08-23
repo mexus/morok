@@ -17,7 +17,7 @@ pub enum AmdArch {
     Gfx1102,
     // RDNA3.5 — Strix Halo / Strix Point APU (gfx11.5); shares RDNA3's WMMA ISA, wave32.
     Gfx1151,
-    // RDNA4 — next-gen Radeon; WMMA with bf16/fp8 packing, wave32.
+    // RDNA4 — Radeon RX 9000; gfx12 WMMA, wave32.
     Gfx1200,
     Gfx1201,
 }
@@ -53,7 +53,7 @@ impl AmdArch {
         matches!(self, Self::Gfx1151)
     }
 
-    /// RDNA4 family (next-gen Radeon; WMMA with bf16/fp8 packing, wave32).
+    /// RDNA4 family (Radeon RX 9000; gfx12 WMMA, wave32).
     pub const fn is_rdna4(self) -> bool {
         matches!(self, Self::Gfx1200 | Self::Gfx1201)
     }

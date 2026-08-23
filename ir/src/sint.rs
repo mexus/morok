@@ -52,7 +52,7 @@ fn symbolic_contains_max_term(expr: &Arc<UOp>, needle: &Arc<UOp>) -> bool {
 /// // Symbolic dimension - use DefineVar for truly dynamic dimensions
 /// let batch_size = UOp::new(
 ///     Op::DefineVar { name: "batch".to_string(), min_val: 1, max_val: 1024 },
-///     DType::Index,
+///     DType::Int32,
 /// );
 /// let dynamic_dim = SInt::from(batch_size);
 /// assert!(!dynamic_dim.is_const());
@@ -105,6 +105,23 @@ impl fmt::Display for SInt {
 }
 
 impl SInt {
+    /// Materialize this dimension for arithmetic without narrowing symbolic values.
+    pub fn arithmetic_uop(&self) -> Arc<UOp> {
+        match self {
+            SInt::Const(v) => UOp::index_const(*v as i64),
+            SInt::Symbolic(uop) => uop.clone(),
+            SInt::Infer => panic!("cannot convert SInt::Infer to UOp - resolve -1 first"),
+        }
+    }
+
+    fn arithmetic_pair(&self, rhs: &SInt) -> (Arc<UOp>, Arc<UOp>) {
+        match (self, rhs) {
+            (SInt::Const(_), SInt::Symbolic(value)) => (self.to_uop(value.dtype()), value.clone()),
+            (SInt::Symbolic(value), SInt::Const(_)) => (value.clone(), rhs.to_uop(value.dtype())),
+            _ => (self.arithmetic_uop(), rhs.arithmetic_uop()),
+        }
+    }
+
     /// Check if this is a concrete constant.
     pub fn is_const(&self) -> bool {
         matches!(self, SInt::Const(_))
@@ -210,8 +227,7 @@ impl SInt {
                     return self.clone();
                 }
 
-                let a = self.to_uop(svod_dtype::DType::Index);
-                let b = rhs.to_uop(svod_dtype::DType::Index);
+                let (a, b) = self.arithmetic_pair(rhs);
 
                 if symbolic_contains_max_term(&a, &b) {
                     return self.clone();
@@ -245,8 +261,7 @@ impl SInt {
             }
             (SInt::Const(a), SInt::Const(b)) => SInt::Const(*a.min(b)),
             _ => {
-                let a = self.to_uop(svod_dtype::DType::Index);
-                let b = rhs.to_uop(svod_dtype::DType::Index);
+                let (a, b) = self.arithmetic_pair(rhs);
                 // min(a, b) = -max(-a, -b)
                 let neg_max = a.neg().try_max(&b.neg()).unwrap();
                 SInt::Symbolic(neg_max.neg())
@@ -273,8 +288,7 @@ macro_rules! impl_sint_binop {
                     (_, SInt::Const(0)) => self.clone(),
                     (SInt::Const(0), _) => rhs.clone(),
                     _ => {
-                        let a = self.to_uop(svod_dtype::DType::Index);
-                        let b = rhs.to_uop(svod_dtype::DType::Index);
+                        let (a, b) = self.arithmetic_pair(rhs);
                         SInt::Symbolic(a.$uop_method(&b).unwrap())
                     }
                 }
@@ -334,8 +348,7 @@ impl std::ops::Sub for &SInt {
             (_, SInt::Const(0)) => self.clone(),
             _ if self == rhs => SInt::Const(0),
             _ => {
-                let a = self.to_uop(svod_dtype::DType::Index);
-                let b = rhs.to_uop(svod_dtype::DType::Index);
+                let (a, b) = self.arithmetic_pair(rhs);
                 SInt::Symbolic(a.try_sub(&b).unwrap())
             }
         }

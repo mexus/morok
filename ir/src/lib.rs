@@ -48,20 +48,21 @@ pub use op::Op;
 pub use opt::{Opt, OptArg, OptOps};
 pub use sint::{IntoShrinkRange, SInt, ShrinkRange, sint_max, sint_min, sint_prod};
 pub use types::{
-    AddrSpace, AxisId, AxisType, BinaryOp, BufferizeOpts, CallInfo, ConstValue, ConstValueHash, ContiguousHint,
-    CustomFunctionKind, KernelInfo, ParamArg, ReduceOp, RendererDevice, TernaryOp, UnaryOp, WmmaMetadata,
-    WmmaUpcastAxes,
+    AddrSpace, AxisId, AxisType, BINARY_STAGE_IDENTITY_VERSION, BinaryOp, BinaryStageIdentity, BufferizeOpts, CallInfo,
+    ConstValue, ConstValueHash, ContiguousHint, CustomFunctionKind, InsArg, KernelInfo, ParamArg, ProgramInfo,
+    ReduceOp, RendererDevice, RendererOps, SOURCE_STAGE_IDENTITY_VERSION, SourceStageIdentity, StageAbiParam,
+    StageAbiParamKind, StageDigest, TernaryOp, UnaryOp, WmmaMetadata, WmmaUpcastAxes,
 };
 pub use uop::{
-    CanonicalArg, CanonicalConst, CanonicalDType, CanonicalGraph, CanonicalNode, CanonicalShapeDim, IntoUOp, UOp,
-    UOpKey, compute_ops_estimate, dump_canonical_stage,
+    CanonicalArg, CanonicalAxis, CanonicalConst, CanonicalDType, CanonicalGraph, CanonicalNode, CanonicalProgramValue,
+    CanonicalShapeDim, CanonicalVerboseNode, IntoUOp, UOp, UOpKey, compute_ops_estimate, dump_canonical_stage,
 };
 
 // Re-export pattern matching and rewriting infrastructure
 pub use pattern::{Matcher, RewriteResult, TypedPatternMatcher};
 pub use rewrite::{
     graph_rewrite, graph_rewrite_bottom_up_preserve_calls, graph_rewrite_preserve_calls,
-    graph_rewrite_with_bpm_preserve_calls,
+    graph_rewrite_walk_preserve_calls, graph_rewrite_with_bpm_preserve_calls,
 };
 
 // Re-export external types for convenience

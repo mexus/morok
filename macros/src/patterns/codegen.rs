@@ -150,8 +150,8 @@ enum OpClass {
 /// The generated metadata at svod_ir::op::pattern_derived::pattern_metadata::BINARY_OPS
 /// can be used for runtime validation.
 const BINARY_OPS: &[&str] = &[
-    "Add", "Mul", "Sub", "Mod", "Max", "Pow", "Idiv", "Fdiv", "Lt", "Le", "Eq", "Ne", "Gt", "Ge", "And", "Or", "Xor",
-    "Shl", "Shr", "Threefry",
+    "Add", "Mul", "Sub", "FloorMod", "CMod", "Max", "Pow", "FloorDiv", "CDiv", "Fdiv", "Lt", "Le", "Eq", "Ne", "Gt",
+    "Ge", "And", "Or", "Xor", "Shl", "Shr", "Threefry",
 ];
 
 /// Unary IR operations.
@@ -186,6 +186,7 @@ const TERNARY_OPS: &[&str] = &["Where", "MulAcc"];
 /// Single-source operations mapped to their pattern helper method names.
 /// NOTE: These ops must have `src` as their first child field.
 const SINGLE_SOURCE_OPS: &[(&str, &str)] = &[
+    ("GetAddr", "get_addr"),
     ("Detach", "detach"),
     ("ContiguousBackward", "contiguous_backward"),
     ("Cast", "cast"),
@@ -195,8 +196,6 @@ const SINGLE_SOURCE_OPS: &[(&str, &str)] = &[
     ("Pad", "pad"),
     ("Shrink", "shrink"),
     ("Flip", "flip"),
-    ("Contract", "contract"),
-    ("Unroll", "unroll"),
     ("Contiguous", "contiguous"),
     ("Precast", "precast"),
     ("BitCast", "bitcast"),
@@ -207,7 +206,7 @@ const SINGLE_SOURCE_OPS: &[(&str, &str)] = &[
 /// Map of operation names to their child field names (in positional order).
 ///
 /// This is used for tuple-style pattern matching: `Op(x, y)` where we need
-/// to know that `x` maps to `buffer` and `y` maps to `index` for Load.
+/// to know that positional memory patterns map to their required operands.
 ///
 /// Ops not in this list default to single `src` field handling via SINGLE_SOURCE_OPS.
 const OP_CHILD_FIELDS: &[(&str, &[&str])] = &[
@@ -221,17 +220,14 @@ const OP_CHILD_FIELDS: &[(&str, &[&str])] = &[
     ("Barrier", &["src"]),
     // Buffer ops
     ("Buffer", &["unique", "device"]),
-    ("BufferView", &["buffer"]),
+    ("Slice", &["buffer", "offset"]),
     ("MSelect", &["buffer"]),
     ("Index", &["buffer"]),
-    ("PointerIndex", &["ptr", "offset"]),
-    ("Copy", &["src", "device"]),
-    ("Bufferize", &["compute"]),
+    ("Copy", &["src"]),
+    ("Stage", &["compute"]),
     // Memory ops
-    ("Load", &["buffer", "index"]),
-    ("LoadGated", &["buffer", "index", "gate"]),
-    ("Store", &["buffer", "index", "value"]),
-    ("StoreGated", &["buffer", "index", "value", "gate"]),
+    ("Load", &["index"]),
+    ("Store", &["index", "value"]),
     // Symbolic
     ("Bind", &["var", "value"]),
     // Callable
@@ -241,7 +237,7 @@ const OP_CHILD_FIELDS: &[(&str, &[&str])] = &[
     ("GetTuple", &["src"]),
     // Reduction
     ("Reduce", &["src"]),
-    ("AllReduce", &["src", "device"]),
+    ("AllReduce", &["src"]),
     // WMMA
     ("Wmma", &["a", "b", "c"]),
 ];
@@ -1008,7 +1004,7 @@ fn compute_ordering_cross_product(children: &[(TokenStream2, InlineMatchOutput)]
     result
 }
 
-/// Generate inline match for struct-style ops like Bufferize { compute: x, .. }
+/// Generate inline match for struct-style ops like Stage { compute: x, .. }
 fn generate_inline_op_struct_match(
     op: &Ident,
     fields: &[FieldPattern],

@@ -15,36 +15,45 @@ impl UOp {
     pub fn const_factor(&self) -> i64 {
         match &self.op {
             Op::Const(cv) => match &cv.0 {
-                ConstValue::Int(i) => *i,
-                ConstValue::UInt(u) => *u as i64,
+                ConstValue::Int(i) => {
+                    if *i == i64::MIN {
+                        1
+                    } else {
+                        *i
+                    }
+                }
+                ConstValue::UInt(u) => i64::try_from(*u).unwrap_or(1),
                 _ => 1,
             },
             // VCONST: GCD of all elements
-            Op::VConst { values } => values
-                .iter()
-                .filter_map(|v| match v {
-                    ConstValue::Int(i) => Some(*i),
-                    ConstValue::UInt(u) => Some(*u as i64),
-                    _ => None,
-                })
-                .map(|v| v.abs())
-                .reduce(gcd)
-                .unwrap_or(1),
+            Op::VConst { values } => {
+                let mut factor = None;
+                for value in values {
+                    let value = match value {
+                        ConstValue::Int(i) => i.checked_abs(),
+                        ConstValue::UInt(u) => i64::try_from(*u).ok(),
+                        _ => continue,
+                    };
+                    let Some(value) = value else { return 1 };
+                    factor = Some(factor.map_or(value, |factor| gcd(factor, value)));
+                }
+                factor.unwrap_or(1)
+            }
             // MUL: only immediate CONST child
             Op::Binary(BinaryOp::Mul, a, b) => {
                 if let Op::Const(cv) = &a.op
                     && let ConstValue::Int(i) = cv.0
                 {
-                    return i;
+                    return if i == i64::MIN { 1 } else { i };
                 }
                 if let Op::Const(cv) = &b.op
                     && let ConstValue::Int(i) = cv.0
                 {
-                    return i;
+                    return if i == i64::MIN { 1 } else { i };
                 }
                 1
             }
-            Op::Binary(BinaryOp::Add, a, b) => gcd(a.const_factor().abs(), b.const_factor().abs()),
+            Op::Binary(BinaryOp::Add, a, b) => gcd(a.const_factor(), b.const_factor()),
             _ => 1,
         }
     }
@@ -63,14 +72,18 @@ impl UOp {
         match self.op() {
             Op::Const(cv) => {
                 let ConstValue::Int(val) = cv.0 else { return None };
-                if val % v == 0 { Some(Self::const_(self.dtype(), ConstValue::Int(val / v))) } else { None }
+                if val.checked_rem(v)? == 0 {
+                    Some(Self::const_(self.dtype(), ConstValue::Int(val.checked_div(v)?)))
+                } else {
+                    None
+                }
             }
             // VCONST: divide each element if all are divisible
             Op::VConst { values } => {
                 let divided: Option<Vec<ConstValue>> = values
                     .iter()
                     .map(|val| match val {
-                        ConstValue::Int(i) if i % v == 0 => Some(ConstValue::Int(i / v)),
+                        ConstValue::Int(i) if i.checked_rem(v) == Some(0) => Some(ConstValue::Int(i.checked_div(v)?)),
                         _ => None,
                     })
                     .collect();
@@ -122,7 +135,7 @@ impl UOp {
             // about — bail.
             let const_self = c_self.try_int()?;
             let const_v = c_v.try_int()?;
-            if const_v == 0 || const_self % const_v != 0 {
+            if const_v == 0 || const_self.checked_rem(const_v)? != 0 {
                 return None;
             }
             // Multiset diff: build counts from `fac`, subtract `div_fac` factors.
@@ -140,7 +153,7 @@ impl UOp {
                 return None;
             }
             // Multiply remaining factors, seeded with the const quotient.
-            let mut result = self.const_like(const_self / const_v);
+            let mut result = self.const_like(const_self.checked_div(const_v)?);
             for (factor, count) in counts.values() {
                 for _ in 0..*count {
                     result = result.try_mul(factor).ok()?;
@@ -196,7 +209,7 @@ impl UOp {
         }
 
         // Step 4: numeric GCD of all const_factors
-        let numeric = decomp.iter().map(|(_, f)| f.abs()).reduce(gcd).unwrap_or(1);
+        let numeric = decomp.iter().map(|(_, f)| f.checked_abs().unwrap_or(1)).reduce(gcd).unwrap_or(1);
 
         // Step 5: multiply common symbolic factors with numeric GCD
         let mut result = uops[0].const_like(numeric);
@@ -219,7 +232,7 @@ impl UOp {
     ///
     /// Returns `(non_const_part, const_value)` — when no const is present the
     /// const slot is the operation's identity element (`0` for ADD, `1` for
-    /// MUL, `dtype.min` for MAX). Relies on the const-on-right canonicalization
+    /// MUL, the analysis lower bound for MAX). Relies on the const-on-right canonicalization
     /// invariant, so only the right operand is checked.
     ///
     /// # Examples
@@ -306,6 +319,11 @@ impl UOp {
         result
     }
 
+    /// Returns this UOp and every node it depends on.
+    pub fn backward_slice_with_self(self: &Arc<Self>) -> Vec<Arc<Self>> {
+        self.backward_slice()
+    }
+
     /// Create a new RANGE UOp with a different axis type.
     ///
     /// This is a convenience method for the optimizer to convert ranges between
@@ -324,7 +342,7 @@ impl UOp {
     /// ```
     pub fn with_axis_type(self: &Arc<Self>, new_type: AxisType) -> Arc<Self> {
         if let Op::Range { end, axis_id, .. } = self.op() {
-            Self::range_axis(end.clone(), *axis_id, new_type)
+            Self::range_axis(end.clone(), axis_id.clone(), new_type)
         } else {
             panic!("with_axis_type() called on non-RANGE operation: {:?}", self.op);
         }
@@ -404,17 +422,23 @@ impl UOp {
 
     /// Check if a UOp represents an invalid index marker.
     ///
-    /// Matches both scalar Invalid and vectorized `VECTORIZE(Invalid, ..., Invalid)`
-    /// where ALL elements are Invalid. The vectorized form appears after expansion
-    /// broadcasts scalar Invalid across lanes.
+    /// Matches scalar Invalid, shaped movement wrappers, and vectorized/stacked
+    /// forms where every lane is Invalid.
     ///
     /// Uses `all()` semantics (entire vector must be Invalid). This differs from
     /// `has_invalid()` in symbolic patterns which uses `any()` for guard semantics.
     pub fn is_invalid_marker(uop: &Arc<Self>) -> bool {
         match uop.op() {
             Op::Const(ConstValueHash(ConstValue::Invalid)) => true,
+            Op::Reshape { src, .. }
+            | Op::Permute { src, .. }
+            | Op::Expand { src, .. }
+            | Op::Pad { src, .. }
+            | Op::Shrink { src, .. }
+            | Op::Flip { src, .. }
+            | Op::Detach { src } => Self::is_invalid_marker(src),
+            Op::VConst { values } => !values.is_empty() && values.iter().all(|value| *value == ConstValue::Invalid),
             Op::Stack { sources } => !sources.is_empty() && sources.iter().all(Self::is_invalid_marker),
-            Op::Vectorize { elements } => !elements.is_empty() && elements.iter().all(Self::is_invalid_marker),
             _ => false,
         }
     }
@@ -476,7 +500,7 @@ impl UOp {
             Op::Binary(BinaryOp::Add, a, b) => a.is_increasing() && b.is_increasing(),
 
             // MUL/IDIV by non-negative constant
-            Op::Binary(BinaryOp::Mul | BinaryOp::Idiv, a, b) => {
+            Op::Binary(BinaryOp::Mul | BinaryOp::FloorDiv, a, b) => {
                 if let Op::Const(cv) = b.op() {
                     matches!(cv.0, ConstValue::Int(n) if n >= 0) && a.is_increasing()
                 } else {
@@ -492,6 +516,9 @@ impl UOp {
 /// Computes the greatest common divisor using Euclid's algorithm.
 /// Always returns a non-negative value.
 pub fn gcd(a: i64, b: i64) -> i64 {
+    if a == i64::MIN || b == i64::MIN {
+        return 1;
+    }
     let (mut a, mut b) = (a.abs(), b.abs());
     while b != 0 {
         let temp = b;

@@ -2,7 +2,37 @@
 //!
 //! Tests mathematical transcendental functions: Sqrt, Exp2, Log2, Sin, Reciprocal, Trunc.
 
-use crate::UOp;
+use crate::{
+    DType, Op, RendererOps, UOp, UnaryOp, decompositions::get_transcendental_patterns, rewrite::graph_rewrite,
+};
+
+fn rewrite_transcendental(op: UnaryOp, supported: RendererOps, force: bool) -> std::sync::Arc<UOp> {
+    let src = UOp::native_const(0.25f32);
+    let root = UOp::new(Op::Unary(op, src), DType::Float32);
+    graph_rewrite(&get_transcendental_patterns(&supported, force), root, &mut ())
+}
+
+#[test]
+fn supported_transcendentals_stay_native() {
+    for op in [UnaryOp::Exp2, UnaryOp::Log2, UnaryOp::Sin, UnaryOp::Sqrt] {
+        let result = rewrite_transcendental(op, RendererOps::all(), false);
+        assert!(matches!(result.op(), Op::Unary(found, _) if *found == op));
+    }
+}
+
+#[test]
+fn unsupported_transcendentals_are_decomposed() {
+    for op in [UnaryOp::Exp2, UnaryOp::Log2, UnaryOp::Sin, UnaryOp::Sqrt] {
+        let result = rewrite_transcendental(op, RendererOps::default(), false);
+        assert!(!result.toposort().iter().any(|node| matches!(node.op(), Op::Unary(found, _) if *found == op)));
+    }
+}
+
+#[test]
+fn force_threshold_decomposes_supported_transcendentals() {
+    let result = rewrite_transcendental(UnaryOp::Exp2, RendererOps::all(), true);
+    assert!(!result.toposort().iter().any(|node| matches!(node.op(), Op::Unary(UnaryOp::Exp2, _))));
+}
 
 // =========================================================================
 // Square Root (Sqrt) Tests
