@@ -217,7 +217,7 @@ fn test_split_store_creates_sink() {
                 };
                 // Buffer should be converted to codegen PARAM
                 assert!(
-                    matches!(store_buf.op(), Op::Param { arg, .. } if arg.device.is_none()),
+                    matches!(store_buf.op(), Op::Param { arg, .. } if arg.device == Some(svod_dtype::DeviceSpec::Cpu)),
                     "Expected codegen PARAM, got {:?}",
                     store_buf.op()
                 );

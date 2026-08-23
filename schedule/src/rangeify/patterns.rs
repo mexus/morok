@@ -27,6 +27,12 @@ use crate::rangeify::transforms::{cast_to_dtype, get_range_size, partition_reduc
 
 pub use crate::devectorize::pm_add_loads;
 
+const TAG_CODEGEN_PARAM: usize = usize::MAX - 3;
+
+fn is_codegen_param(node: &Arc<UOp>) -> bool {
+    matches!(node.op(), Op::Param { .. }) && node.tag().as_ref().is_some_and(|tags| tags.contains(&TAG_CODEGEN_PARAM))
+}
+
 // Forward declarations for types from other modules
 use super::indexing::IndexingContext;
 use super::indexing::ranges_equal;
@@ -820,7 +826,7 @@ fn find_kernel_output(ast: &Arc<UOp>) -> Option<Arc<UOp>> {
                 Op::Index { buffer: inner_buf, .. } => inner_buf.clone(),
                 _ => buffer.clone(),
             };
-            if matches!(output_buf.op(), Op::Param { arg, .. } if arg.device.is_none()) {
+            if is_codegen_param(&output_buf) {
                 return Some(output_buf);
             }
         }
@@ -908,7 +914,8 @@ pub fn local_to_param_patterns() -> TypedPatternMatcher<LocalAddBufferContext> {
         // structured compiler-managed allocations and must not consume slots.
         buf @ Buffer { arg } if arg.addrspace == Some(AddrSpace::Global) => |buf, ctx| {
             let size = buf.buffer_size()?;
-            let replacement = UOp::param(ctx.next_param_slot(), size, extract_base_dtype(buf.dtype()), None);
+            let replacement = UOp::param(ctx.next_param_slot(), size, extract_base_dtype(buf.dtype()), arg.device.clone())
+                .with_tag(smallvec::smallvec![TAG_CODEGEN_PARAM]);
             if !ctx.has_buffer(buf) {
                 ctx.map_buffer(buf.clone(), buf.clone());
             }
@@ -917,13 +924,13 @@ pub fn local_to_param_patterns() -> TypedPatternMatcher<LocalAddBufferContext> {
         // Pre-kernel PARAM → codegen PARAM. The missing device metadata prevents
         // this rule from repeatedly matching its own replacement.
         buf @ Param { arg }
-            if arg.device.is_some() && arg.addrspace == Some(AddrSpace::Global)
+            if !is_codegen_param(buf) && arg.device.is_some() && arg.addrspace == Some(AddrSpace::Global)
             => |buf, arg, ctx| {
             let Op::Param { shape, .. } = buf.op() else { unreachable!() };
             let mut arg = arg.clone();
             arg.slot = ctx.next_param_slot();
-            arg.device = None;
-            let replacement = UOp::new(Op::Param { shape: shape.clone(), arg }, buf.dtype());
+            let replacement = UOp::new(Op::Param { shape: shape.clone(), arg }, buf.dtype())
+                .with_tag(smallvec::smallvec![TAG_CODEGEN_PARAM]);
             if !ctx.has_buffer(buf) {
                 ctx.map_buffer(buf.clone(), buf.clone());
             }

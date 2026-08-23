@@ -429,7 +429,7 @@ fn canonical_node(
         op: canonical_op_name(node.op()),
         dtype: canonical_dtype(&node.dtype()),
         shape,
-        arg: canonical_arg(node.op(), ids, verbose)?,
+        arg: canonical_arg(node, ids, verbose)?,
         src,
     })
 }
@@ -559,8 +559,12 @@ fn canonical_padding_values(value: &Arc<UOp>) -> crate::Result<Vec<usize>> {
         .collect()
 }
 
-fn canonical_arg(op: &Op, ids: &HashMap<u64, usize>, verbose: bool) -> crate::Result<CanonicalArg> {
-    Ok(match op {
+/// Tag carried only by rangeify-created global buffers whose high-bit slot is
+/// an internal cache-restoration namespace rather than semantic PROGRAM ABI.
+pub const TAG_SCHEDULE_LOCAL_BUFFER: usize = usize::MAX - 2;
+
+fn canonical_arg(node: &Arc<UOp>, ids: &HashMap<u64, usize>, verbose: bool) -> crate::Result<CanonicalArg> {
+    Ok(match node.op() {
         Op::Const(constant) => CanonicalArg::Const { value: canonical_const(constant.0) },
         Op::Unique(_) | Op::LUnique(_) => {
             return Err(crate::Error::CanonicalSerialization {
@@ -580,7 +584,13 @@ fn canonical_arg(op: &Op, ids: &HashMap<u64, usize>, verbose: bool) -> crate::Re
         Op::GetAddr { device, .. } => CanonicalArg::Device { name: device.canonicalize() },
         Op::Copy { device, .. } => CanonicalArg::Device { name: device.canonicalize() },
         Op::Param { arg, .. } | Op::Buffer { arg, .. } => CanonicalArg::Param {
-            slot: canonical_param_slot(arg.slot),
+            slot: if matches!(node.op(), Op::Buffer { .. })
+                && node.tag().as_ref().is_some_and(|tags| tags.contains(&TAG_SCHEDULE_LOCAL_BUFFER))
+            {
+                (arg.slot & (usize::MAX >> 1)) as i128
+            } else {
+                canonical_param_slot(arg.slot)
+            },
             dtype: canonical_dtype(&arg.dtype),
             vmin_vmax: arg.vmin_vmax.as_ref().map(|(min, max)| (canonical_const(min.0), canonical_const(max.0))),
             multiple_of: arg.multiple_of,

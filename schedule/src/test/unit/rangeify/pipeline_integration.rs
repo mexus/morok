@@ -210,7 +210,7 @@ fn test_full_pipeline_creates_load_for_input_buffers() {
                 let buf_name = match buffer.op() {
                     Op::Buffer { arg, .. } if arg.addrspace == Some(svod_dtype::AddrSpace::Local) => "LOCAL_BUFFER",
                     Op::Buffer { .. } => "BUFFER",
-                    Op::Param { arg, .. } if arg.device.is_none() => "PARAM",
+                    Op::Param { .. } => "PARAM",
                     _ => "OTHER",
                 };
                 println!("  INDEX(buf={}) [{:?}]", buf_name, node.dtype());
@@ -220,7 +220,7 @@ fn test_full_pipeline_creates_load_for_input_buffers() {
                 svod_ir::BinaryOp::Add => "ADD",
                 _ => "BINARY",
             },
-            Op::Param { arg, .. } if arg.device.is_none() => {
+            Op::Param { arg, .. } => {
                 println!("  PARAM({})", arg.slot);
                 continue;
             }
@@ -250,8 +250,7 @@ fn test_full_pipeline_creates_load_for_input_buffers() {
         .iter()
         .filter(|node| {
             if let Op::Index { buffer, .. } = node.op() {
-                matches!(buffer.op(), Op::Buffer { .. })
-                    || matches!(buffer.op(), Op::Param { arg, .. } if arg.device.is_none())
+                matches!(buffer.op(), Op::Buffer { .. } | Op::Param { .. })
             } else {
                 false
             }

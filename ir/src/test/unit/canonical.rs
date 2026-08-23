@@ -116,6 +116,15 @@ fn canonical_buffer_preserves_authored_high_bit_slot_at_every_stage() {
 }
 
 #[test]
+fn canonical_buffer_strips_only_marked_schedule_local_slot_namespace() {
+    let slot = (1usize << (usize::BITS - 1)) | 17;
+    let buffer = UOp::buffer(slot, 4, DType::Float32, AddrSpace::Global, Some(DeviceSpec::Cpu))
+        .with_tag(smallvec::smallvec![crate::uop::canonical::TAG_SCHEDULE_LOCAL_BUFFER]);
+    let graph = CanonicalGraph::from_root("kernel_ast", &buffer).unwrap();
+    assert!(matches!(graph.nodes.last().unwrap().arg, CanonicalArg::Param { slot: 17, .. }));
+}
+
+#[test]
 fn canonical_range_and_special_record_explicit_dtype_and_direct_extent() {
     let end = UOp::native_const(8i32);
     let range = UOp::range_axis_dtype(end.clone(), AxisId::Renumbered(0), AxisType::Global, DType::Int32);

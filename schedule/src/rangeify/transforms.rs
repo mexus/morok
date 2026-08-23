@@ -873,6 +873,7 @@ fn new_lunique_buffer(
     let slot = (1usize << (usize::BITS - 1)) | ctx.next_lunique();
     let arg = svod_ir::ParamArg::buffer(slot, dtype.clone(), AddrSpace::Global, Some(device));
     UOp::new(Op::Buffer { shape, arg }, dtype)
+        .with_tag(smallvec::smallvec![svod_ir::uop::canonical::TAG_SCHEDULE_LOCAL_BUFFER])
 }
 
 /// Convert STAGE operation to STORE with buffer allocation and END wrapping.
@@ -1083,9 +1084,7 @@ fn reduce_collapse_with(src: &Arc<UOp>, ranges: &[Arc<UOp>], pm: &crate::TypedPa
                 if in_scope.contains(&key) || replaces.contains_key(&key) {
                     return;
                 }
-                if matches!(child.op(), Op::Const(_) | Op::VConst { .. })
-                    || matches!(child.op(), Op::Param { arg, .. } if arg.device.is_none())
-                {
+                if matches!(child.op(), Op::Const(_) | Op::VConst { .. }) || matches!(child.op(), Op::Param { .. }) {
                     return;
                 }
                 let vmin = match child.vmin() {
