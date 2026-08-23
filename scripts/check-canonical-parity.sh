@@ -44,7 +44,7 @@ done
 "$ROOT/scripts/evid02-safety-diff.py" "$SECOND/evid02-safety-rust.json" "$SECOND/evid02-safety-python.json"
 printf 'EVID-02 padded-WMMA safety stages: strict parity ok\n'
 
-for fixture in invalid_where scalar_stack shaped_stack buffer scalar_load gated_load \
+for fixture in weak_int_add weak_float_neg_zero invalid_where scalar_stack shaped_stack buffer scalar_load gated_load \
                scalar_store mixed_valid_load copy allreduce multi_output_call local_wmma_staging \
                range_split_outer range_split_inner range_split_nested program_info symbolic_function; do
   if [[ "$fixture" == "program_info" ]]; then stage_args=(--stage program); else stage_args=(); fi
@@ -96,24 +96,6 @@ record_mismatch() {
   cat "$first_diff" >>"$GENERATED_MANIFEST"
   printf '\n' >>"$GENERATED_MANIFEST"
 }
-
-for fixture in weak_int_add weak_float_neg_zero; do
-  for artifacts in "$FIRST" "$SECOND"; do
-    cargo run --quiet --manifest-path "$ROOT/Cargo.toml" -p svod-ir --example canonical_fixture -- "$fixture" \
-      >"$artifacts/$fixture-rust.json"
-    (cd "$REFERENCE" && uv run python ../../scripts/tinygrad-canonical.py "$fixture") \
-      >"$artifacts/$fixture-python.json"
-  done
-  "$ROOT/scripts/canonical-diff.py" "$FIRST/$fixture-rust.json" "$SECOND/$fixture-rust.json" \
-    --left-name rust-first --right-name rust-second
-  "$ROOT/scripts/canonical-diff.py" "$FIRST/$fixture-python.json" "$SECOND/$fixture-python.json" \
-    --left-name python-first --right-name python-second
-  record_mismatch direct-fixture "$fixture" EVID-01B \
-    "$FIRST/$fixture-rust.json" "$FIRST/$fixture-python.json" \
-    "$SECOND/$fixture-rust.json" "$SECOND/$fixture-python.json"
-  PRODUCTION_GAPS+=("$fixture")
-  printf 'canonical derived promotion fixture: %s: deterministic mismatch\n' "$fixture"
-done
 
 for fixture in padded_reduction; do
   for artifacts in "$FIRST" "$SECOND"; do

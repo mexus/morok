@@ -1,31 +1,3 @@
-[direct-fixture weak_int_add issue=EVID-01B]
-canonical document sha256:
-  rust: 382c2e085600958b2d48d1bc7ab266e92167ea0cfb3aa8277411f3dea954f65e
-  python: e771807aeb6621d6af3b4e155c280dda4a403167b07f2aae126ca200efddc4e5
-canonical structural mismatch at stage tensor (delete):
-  rust ids 1:2: ['CAST']
-  python ids 1:1: []
-aligned field differences (1):
-  nodes 3/2 ADD $.src[0]
-    rust: 1
-    python: 0
-  first rust source chain: 3:ADD
-  first python source chain: 2:ADD
-
-[direct-fixture weak_float_neg_zero issue=EVID-01B]
-canonical document sha256:
-  rust: f3d2b2b5fbdaec1f88cf55da58b199eb436d10627ef5dc89c72c972a3767acb1
-  python: cf56c0d9d6a64efbc591e66b07bbd7f34d5373a63eb64046a0fa28dc248cc289
-canonical structural mismatch at stage tensor (delete):
-  rust ids 1:2: ['CAST']
-  python ids 1:1: []
-aligned field differences (1):
-  nodes 3/2 ADD $.src[0]
-    rust: 1
-    python: 0
-  first rust source chain: 3:ADD
-  first python source chain: 2:ADD
-
 [expected-failure padded_reduction issue=REDUCE-01]
 canonical document sha256:
   rust: aab74fa51ca002a7f13e656216ea2a70df1f592b455d842c1ddf76ee6ccf6645
