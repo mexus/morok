@@ -305,6 +305,44 @@ fn test_compile_with_program_pipeline_components_accepts_program_input() {
 }
 
 #[test]
+fn test_optimized_kernel_key_includes_exact_compiler_and_renderer_identity() {
+    let ast = UOp::sink(vec![UOp::native_const(1.0f32)]);
+    let renderer = svod_schedule::OptimizerRenderer::cpu();
+    let mut changed_renderer = renderer.clone();
+    changed_renderer.supports_float4 = false;
+
+    let base = optimized_kernel_key(
+        &ast,
+        &svod_dtype::DeviceSpec::Cpu,
+        "cpu-clang:17:flags-a",
+        renderer.cache_fingerprint(),
+        7,
+    );
+    assert_ne!(
+        base,
+        optimized_kernel_key(
+            &ast,
+            &svod_dtype::DeviceSpec::Cpu,
+            "cpu-clang:18:flags-a",
+            renderer.cache_fingerprint(),
+            7,
+        ),
+        "exact compiler identity must participate in optimized-kernel caching"
+    );
+    assert_ne!(
+        base,
+        optimized_kernel_key(
+            &ast,
+            &svod_dtype::DeviceSpec::Cpu,
+            "cpu-clang:17:flags-a",
+            changed_renderer.cache_fingerprint(),
+            7,
+        ),
+        "optimizer-visible renderer capabilities must participate in optimized-kernel caching"
+    );
+}
+
+#[test]
 fn test_compile_with_program_pipeline_components_rejects_non_program_input() {
     let sink = UOp::sink(vec![UOp::native_const(1.0f32)]);
 

@@ -34,9 +34,8 @@
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 
-use svod_schedule::{
-    Scheduler, apply_post_optimization_with_config, beam_search_cached_with_behavior, prepare_scheduler,
-};
+use svod_schedule::optimizer::beam::{CompiledCandidate, PreparedCandidate, beam_search_cached_staged};
+use svod_schedule::{Scheduler, apply_post_optimization_with_config, prepare_scheduler};
 use tracing::{debug, trace};
 
 use crate::{
@@ -1094,7 +1093,23 @@ fn resolve_compiled_kernel_buffer_indices(
     Ok(buffer_indices)
 }
 
-type OptKey = (u64, DeviceSpec, String, u64);
+type OptKey = (u64, DeviceSpec, String, u64, u64);
+
+fn optimized_kernel_key(
+    ast: &Arc<UOp>,
+    device: &DeviceSpec,
+    compiler_identity: &str,
+    renderer_fingerprint: u64,
+    optimizer_fingerprint: u64,
+) -> OptKey {
+    (
+        crate::schedule_cache::content_hash(ast),
+        device.clone(),
+        compiler_identity.to_string(),
+        renderer_fingerprint,
+        optimizer_fingerprint,
+    )
+}
 
 /// Bounded global cache for optimized + compiled kernels keyed by AST hash.
 ///
@@ -1357,18 +1372,18 @@ fn prepare_execution_plan(
             .unwrap_or_else(svod_dtype::default_device::default_device);
         let item_device = config.resolve_device(&item_device_spec, alloc_registry)?;
         let item_codegen = item_device.compiler.cache_key();
-
-        let opt_key = (
-            crate::schedule_cache::content_hash(&item.ast),
-            item_device.device.clone(),
-            item_codegen.to_string(),
+        let optimizer_renderer = get_optimizer_renderer(&item_device);
+        let opt_key = optimized_kernel_key(
+            &item.ast,
+            &item_device.device,
+            item_codegen,
+            optimizer_renderer.cache_fingerprint(),
             optimizer_fingerprint,
         );
 
         let cached = if let Some(cached) = opt_cache.get(&opt_key, &opt_guard) {
             Arc::clone(cached)
         } else {
-            let optimizer_renderer = get_optimizer_renderer(&item_device);
             // Author-supplied `opts_to_apply` short-circuits before beam: such
             // kernels must go through the heuristic entry so `apply_explicit_opts`
             // honors the exact opt list (empty = none).
@@ -1662,12 +1677,12 @@ fn beam_search_optimize(
 
     // Clone buffers for the closure (Buffer is Clone + Send + Sync)
     let buffers: Vec<Buffer> = buffers.to_vec();
-    let bench_config = svod_runtime::BenchmarkConfig::default();
+    let mut bench_config = svod_runtime::BenchmarkConfig::default();
+    bench_config.timing_runs = beam_config.num_runs;
 
     // Clone device components for the closure
     let dev_renderer = device.renderer.clone();
     let dev_compiler = device.compiler.clone();
-    let dev_runtime = device.runtime.clone();
     let max_uops = beam_config.max_uops;
 
     // Force rayon's global thread pool to materialise before the BEAM loop so
@@ -1677,15 +1692,10 @@ fn beam_search_optimize(
     // ranking against fast candidates that happen to run first.
     svod_runtime::warmup_thread_pool();
 
-    // Per-candidate **compile-only** timeout (default 10s). Rust can't
-    // safely deliver SIGALRM to a worker, so we use a two-stage detached
-    // worker thread: the worker signals `CompileDone` once
-    // codegen/compile/runtime-link finish, after which execution runs
-    // unbounded (only `early_stop` aborts a slow run). Side effect: a hung
-    // clang invocation orphans one OS thread per timeout, reaped at
-    // process exit.
-    let compile_timeout =
-        Duration::from_secs(std::env::var("BEAM_TIMEOUT_SEC").ok().and_then(|s| s.parse().ok()).unwrap_or(10));
+    // Per-candidate compile-only timeout. Rust cannot interrupt an arbitrary
+    // compiler implementation, so a timed-out worker is detached and reaped at
+    // process exit. Runtime creation and execution happen later, serially.
+    let compile_timeout = Duration::from_secs(beam_config.compile_timeout_secs);
 
     // When `BEAM_LOG_SURPASS_MAX` is set, every dropped candidate prints
     // one line with the failure reason, applied-opt chain, and (for "too
@@ -1701,260 +1711,211 @@ fn beam_search_optimize(
     // reads + bounded-lock writes.
     let post_opt_cache: Arc<papaya::HashMap<u64, Arc<UOp>>> = Arc::new(papaya::HashMap::new());
 
-    // Compile-and-time closure: compilation is NOT timed, only execution. Wrapped
-    // in catch_unwind because beam search explores speculative candidates that
-    // may trigger rewrite engine limits or other panics. Wrapped in a worker
-    // thread + recv_timeout so a hung clang invocation cannot block BEAM.
-    //
-    // Returns `CandidateMetrics` (timing + structural IR hash + compute-op count)
-    // so the beam loop can apply `seen_libs` dedup and the
-    // `least_compute_ops*1000` compute-bloat filter. The optional `early_stop`
-    // argument is propagated into `BenchmarkConfig` so `benchmark_kernel` can
-    // abort the run loop the moment any single run exceeds the threshold.
-    let compile_and_time = |s: &Scheduler, early_stop: Option<Duration>| -> Option<svod_schedule::CandidateMetrics> {
+    struct PreparedBeamProgram {
+        program: Arc<UOp>,
+        opts: Vec<svod_schedule::optimizer::Opt>,
+    }
+
+    struct CompiledBeamProgram {
+        spec: svod_device::device::ProgramSpec,
+        compiled: svod_device::device::CompiledSpec,
+        opts: Vec<svod_schedule::optimizer::Opt>,
+    }
+
+    let prepare = |s: &Scheduler| -> Option<PreparedCandidate<PreparedBeamProgram>> {
         use std::panic::{AssertUnwindSafe, catch_unwind};
-        use std::sync::mpsc;
+        let opts = s.applied_opts.clone();
+        match catch_unwind(AssertUnwindSafe(|| {
+            let raw_ast = s.get_optimized_ast(None);
 
-        // Per-call clones move into the worker. All Arc/Clone — no deep copy.
-        let s_owned = s.clone();
-        let renderer_c = renderer.clone();
-        let dev_renderer_c = dev_renderer.clone();
-        let dev_compiler_c = dev_compiler.clone();
-        let dev_runtime_c = dev_runtime.clone();
-        let buffers_c = buffers.clone();
-        let bench_config_c = bench_config.clone();
-        let max_uops_c = max_uops;
-        let post_opt_cache_c = Arc::clone(&post_opt_cache);
-        let optimizer_config_c = post_optimizer_config.clone();
-        let log_surpass_c = log_surpass;
-        // Snapshot the applied-opts chain so the diagnostic line in the worker
-        // thread can identify which BEAM branch triggered the drop without
-        // having to send the full Scheduler back across the channel.
-        let opts_snapshot: Vec<svod_schedule::optimizer::Opt> = s_owned.applied_opts.clone();
-
-        // Two-stage signal: CompileDone fires when codegen/compile/runtime-link
-        // finish; Final carries the benchmark result (or None on failure/panic).
-        // Capacity 2 so the worker never blocks on send. Detached: drop the
-        // JoinHandle so the parent can abandon the worker on compile timeout.
-        enum WorkerMsg {
-            CompileDone,
-            Final(Option<svod_schedule::CandidateMetrics>),
-        }
-        let (tx, rx) = mpsc::sync_channel::<WorkerMsg>(2);
-        let tx_compile = tx.clone();
-        let _ = std::thread::spawn(move || {
-            let result = catch_unwind(AssertUnwindSafe(|| {
-                let raw_ast = s_owned.get_optimized_ast(None);
-
-                // Apply post-optimization passes for accurate timing.
-                // Pass the renderer so pm_add_gpudims fires for has_threads/has_local backends —
-                // otherwise the Thread axis stays as a plain RANGE and gets rendered as a
-                // sequential `for` loop instead of a parallel core_id dispatch, making BEAM
-                // candidates time as single-threaded and converge to wrong tile shapes.
-                //
-                // Cache by `raw_ast.content_hash`: BEAM expands children of the same
-                // parent in lockstep, so siblings share `raw_ast` and would otherwise
-                // re-run the full graph rewrite (~13 ms each).
-                let cache_key = raw_ast.content_hash;
-                let cache_pin = post_opt_cache_c.pin();
-                let optimized = if let Some(cached) = cache_pin.get(&cache_key) {
-                    cached.clone()
-                } else {
-                    let opt = match apply_post_optimization_with_config(raw_ast, &renderer_c, &optimizer_config_c) {
-                        Ok(opt) => opt,
-                        Err(e) => {
-                            if log_surpass_c {
-                                eprintln!("[BEAM drop] post_opt_verify_err: {e:?} opts={opts_snapshot:?}");
-                            }
-                            return None;
+            let cache_key = raw_ast.content_hash;
+            let cache_pin = post_opt_cache.pin();
+            let optimized = if let Some(cached) = cache_pin.get(&cache_key) {
+                cached.clone()
+            } else {
+                let opt = match apply_post_optimization_with_config(raw_ast, renderer, &post_optimizer_config) {
+                    Ok(opt) => opt,
+                    Err(e) => {
+                        if log_surpass {
+                            eprintln!("[BEAM drop] post_opt_verify_err: {e:?} opts={opts:?}");
                         }
-                    };
-                    cache_pin.insert(cache_key, opt.clone());
-                    opt
+                        return None;
+                    }
                 };
+                cache_pin.insert(cache_key, opt.clone());
+                opt
+            };
 
-                // Pre-codegen metrics: structural hash for `seen_libs`, ALU node
-                // count for `least_compute_ops`. Computed before compile so even
-                // failed compiles still consume a slot fairly.
-                let ir_hash = svod_schedule::hash_post_codegen_ir(&optimized);
-                let compute_ops = svod_schedule::compute_ops_estimate(&optimized);
+            let ir_hash = svod_schedule::hash_post_codegen_ir(&optimized);
+            let compute_ops = svod_schedule::compute_ops_estimate(&optimized);
 
-                let mut program = match svod_codegen::program_pipeline::program_from_sink_with_renderer(
-                    optimized,
-                    dev_renderer_c.as_ref(),
-                ) {
+            let mut program =
+                match svod_codegen::program_pipeline::program_from_sink_with_renderer(optimized, dev_renderer.as_ref())
+                {
                     Ok(program) => program,
                     Err(e) => {
-                        if log_surpass_c {
-                            eprintln!("[BEAM drop] target_verify_err: {e:?} opts={opts_snapshot:?}");
+                        if log_surpass {
+                            eprintln!("[BEAM drop] target_verify_err: {e:?} opts={opts:?}");
                         }
                         return None;
                     }
                 };
 
-                // Linearize *now* so we can count flat uops. Counting the
-                // post-optimization AST `toposort()` (the earlier behavior)
-                // under-counts because svod's high-level Reduce/Index/Cast
-                // nodes get fanned out into many flat uops by the codegen
-                // pipeline. Counting post-linearize gives the number to
-                // compare against `BEAM_UOPS_MAX`.
-                program = match svod_codegen::program_pipeline::do_linearize(&program) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        if log_surpass_c {
-                            eprintln!("[BEAM drop] linearize_err: {e:?} opts={opts_snapshot:?}");
-                        }
-                        return None;
-                    }
-                };
-                let (linear_uops_count, top_op_counts) = if let svod_ir::Op::Program { linear: Some(linear), .. } =
-                    program.op()
-                    && let svod_ir::Op::Linear { ops } = linear.op()
-                {
-                    (ops.len(), if log_surpass_c { count_top_ops(ops, 8) } else { Vec::new() })
-                } else {
-                    (0, Vec::new())
-                };
-                if linear_uops_count > max_uops_c {
-                    if log_surpass_c {
-                        eprintln!(
-                            "[BEAM drop] too_many_uops: linear={linear_uops_count} max={max_uops_c} opts={opts_snapshot:?} top_ops=[{}]",
-                            fmt_op_counts(&top_op_counts)
-                        );
+            program = match svod_codegen::program_pipeline::do_linearize(&program) {
+                Ok(program) => program,
+                Err(e) => {
+                    if log_surpass {
+                        eprintln!("[BEAM drop] linearize_err: {e:?} opts={opts:?}");
                     }
                     return None;
                 }
-
-                // Render and compile through PROGRAM stages (NOT timed).
-                let (spec, compiled) = match compile_with_program_pipeline_components(
-                    program,
-                    dev_renderer_c.as_ref(),
-                    dev_compiler_c.as_ref(),
-                ) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        if log_surpass_c {
-                            eprintln!("[BEAM drop] compile_err: {e:?} opts={opts_snapshot:?}");
-                        }
-                        return None;
-                    }
-                };
-                let program = match (dev_runtime_c)(&compiled) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        if log_surpass_c {
-                            eprintln!("[BEAM drop] runtime_err: {e:?} opts={opts_snapshot:?}");
-                        }
-                        return None;
-                    }
-                };
-
-                // Compile phase done — release parent from the `BEAM_TIMEOUT_SEC`
-                // bound. Anything below is execution-only (bounded by `early_stop`).
-                let _ = tx_compile.send(WorkerMsg::CompileDone);
-
-                // Extract buffer pointers inside the worker (avoids Sync issue
-                // and keeps raw pointers thread-local).
-                let buffer_ptrs: Vec<*mut u8> = buffers_c.iter().map(|b| unsafe { b.as_raw_ptr() }).collect();
-
-                // Time ONLY execution. Each non-runtime variable gets the midpoint
-                // of its declared range (`(vmin+vmax)/2`) so symbolic-bound kernels
-                // do representative work. `core_id` stays unbound (patched per-thread
-                // by `execute_parallel`).
-                let mut user_var_vals: HashMap<&str, i64> = HashMap::new();
-                for v in &spec.vars {
-                    if v.name != "core_id" {
-                        user_var_vals.insert(v.name.as_str(), (v.min + v.max) / 2);
-                    }
+            };
+            let (linear_uops_count, top_op_counts) = if let Op::Program { linear: Some(linear), .. } = program.op()
+                && let Op::Linear { ops } = linear.op()
+            {
+                (ops.len(), if log_surpass { count_top_ops(ops, 8) } else { Vec::new() })
+            } else {
+                (0, Vec::new())
+            };
+            if linear_uops_count > max_uops {
+                if log_surpass {
+                    eprintln!(
+                        "[BEAM drop] too_many_uops: linear={linear_uops_count} max={max_uops} opts={opts:?} top_ops=[{}]",
+                        fmt_op_counts(&top_op_counts)
+                    );
                 }
-                let launch_dims = spec.launch_dims(&user_var_vals).ok()?;
-                let vals: Vec<i64> =
-                    spec.var_names.iter().map(|n| user_var_vals.get(n.as_str()).copied().unwrap_or(0)).collect();
+                return None;
+            }
 
-                // Bound BEAM dispatch grid: if `prod(global_size) > MAX_TEST_GLOBAL_SIZE`,
-                // halve the largest dim (>16) until it fits, then scale the measured
-                // time by `factor = original_size / shrunk_size` to recover the
-                // full-grid estimate. Svod's CPU dispatch has `global_size[0]` = thread
-                // count, typically ≤ 16, so this is a no-op for CPU and only engages
-                // for GPU-style large grids.
-                const MAX_TEST_GLOBAL_SIZE: usize = 65536;
-                let mut test_global_size = launch_dims.global_size;
-                let original_size: usize = test_global_size.iter().product();
-                while test_global_size.iter().product::<usize>() > MAX_TEST_GLOBAL_SIZE {
-                    let mut halved = false;
-                    for j in (0..test_global_size.len()).rev() {
-                        if test_global_size[j] > 16 {
-                            test_global_size[j] /= 2;
-                            halved = true;
-                            break;
-                        }
+            Some(PreparedCandidate { artifact: PreparedBeamProgram { program, opts }, ir_hash, compute_ops })
+        })) {
+            Ok(prepared) => prepared,
+            Err(_) => {
+                if log_surpass {
+                    eprintln!("[BEAM drop] panic_in_prepare opts={:?}", s.applied_opts);
+                }
+                None
+            }
+        }
+    };
+
+    let compile = |prepared: PreparedBeamProgram| -> Option<CompiledCandidate<CompiledBeamProgram>> {
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+        use std::sync::mpsc;
+
+        let opts = prepared.opts;
+        let diagnostic_opts = opts.clone();
+        let renderer = dev_renderer.clone();
+        let compiler = dev_compiler.clone();
+        let (tx, rx) = mpsc::sync_channel(1);
+        let _ = std::thread::spawn(move || {
+            let result = catch_unwind(AssertUnwindSafe(|| {
+                compile_with_program_pipeline_components(prepared.program, renderer.as_ref(), compiler.as_ref()).ok()
+            }))
+            .ok()
+            .flatten();
+            let _ = tx.send(result);
+        });
+        let (spec, compiled) = match rx.recv_timeout(compile_timeout) {
+            Ok(Some(compiled)) => compiled,
+            Ok(None) => {
+                if log_surpass {
+                    eprintln!("[BEAM drop] compile_err opts={diagnostic_opts:?}");
+                }
+                return None;
+            }
+            Err(_) => {
+                if log_surpass {
+                    eprintln!("[BEAM drop] compile_timeout opts={diagnostic_opts:?}");
+                }
+                return None;
+            }
+        };
+        let binary_key = if compiled.bytes.is_empty() {
+            let source = compiled.src.as_deref().unwrap_or(&spec.src);
+            let mut key = Vec::with_capacity(source.len() + 1);
+            key.push(b'S');
+            key.extend_from_slice(source.as_bytes());
+            key
+        } else {
+            let mut key = Vec::with_capacity(compiled.bytes.len() + 1);
+            key.push(b'B');
+            key.extend_from_slice(&compiled.bytes);
+            key
+        };
+        Some(CompiledCandidate { artifact: CompiledBeamProgram { spec, compiled, opts }, binary_key })
+    };
+
+    let dev_runtime = device.runtime.clone();
+    let benchmark = |candidate: &CompiledBeamProgram, early_stop: Option<Duration>| -> Option<Duration> {
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+        match catch_unwind(AssertUnwindSafe(|| {
+            let program = match (dev_runtime)(&candidate.compiled) {
+                Ok(program) => program,
+                Err(e) => {
+                    if log_surpass {
+                        eprintln!("[BEAM drop] runtime_err: {e:?} opts={:?}", candidate.opts);
                     }
-                    if !halved {
+                    return None;
+                }
+            };
+
+            let buffer_ptrs: Vec<*mut u8> = buffers.iter().map(|buffer| unsafe { buffer.as_raw_ptr() }).collect();
+
+            let mut user_var_vals: HashMap<&str, i64> = HashMap::new();
+            for variable in &candidate.spec.vars {
+                if variable.name != "core_id" {
+                    user_var_vals.insert(variable.name.as_str(), (variable.min + variable.max) / 2);
+                }
+            }
+            let launch_dims = candidate.spec.launch_dims(&user_var_vals).ok()?;
+            let vals: Vec<i64> = candidate
+                .spec
+                .var_names
+                .iter()
+                .map(|name| user_var_vals.get(name.as_str()).copied().unwrap_or(0))
+                .collect();
+
+            const MAX_TEST_GLOBAL_SIZE: usize = 65536;
+            let mut test_global_size = launch_dims.global_size;
+            let original_size: usize = test_global_size.iter().product();
+            while test_global_size.iter().product::<usize>() > MAX_TEST_GLOBAL_SIZE {
+                let mut halved = false;
+                for axis in (0..test_global_size.len()).rev() {
+                    if test_global_size[axis] > 16 {
+                        test_global_size[axis] /= 2;
+                        halved = true;
                         break;
                     }
                 }
-                let shrunk_size: usize = test_global_size.iter().product();
-                let factor: f64 = if shrunk_size > 0 { original_size as f64 / shrunk_size as f64 } else { 1.0 };
-
-                let mut bench_config = bench_config_c.clone();
-                // Translate the unshrunk early-stop threshold into the shrunk
-                // timing domain so per-run abort fires at the same effective point.
-                bench_config.early_stop = early_stop.map(|t| {
-                    let nanos = t.as_nanos() as f64 / factor;
-                    Duration::from_nanos(nanos.min(u64::MAX as f64) as u64)
-                });
-                // CPU/AMX have no hardware cache-invalidate primitive — run warm-cache.
-                // GPU backends keep the invalidate.
-                bench_config.clear_l2 = renderer_c.device.has_hardware_cache_invalidate();
-                let result = unsafe {
-                    svod_runtime::benchmark_kernel(
-                        program.as_ref(),
-                        &buffer_ptrs,
-                        &vals,
-                        Some(test_global_size),
-                        launch_dims.local_size,
-                        &bench_config,
-                    )
-                    .ok()?
-                };
-
-                // Scale measured time back to the full-grid estimate.
-                let scaled_nanos = (result.min.as_nanos() as f64 * factor).min(u64::MAX as f64);
-                let timing = Duration::from_nanos(scaled_nanos as u64);
-                Some(svod_schedule::CandidateMetrics { timing, ir_hash, compute_ops })
-            }));
-            let final_result = match result {
-                Ok(opt) => opt,
-                Err(_) => {
-                    if log_surpass_c {
-                        eprintln!("[BEAM drop] panic_in_worker opts={opts_snapshot:?}");
-                    }
-                    None
-                }
-            };
-            // Receiver may have already given up on compile timeout — ignore send errors.
-            let _ = tx.send(WorkerMsg::Final(final_result));
-        });
-
-        // Stage 1: wait for compile to finish, bounded by `BEAM_TIMEOUT_SEC`.
-        // Three outcomes:
-        // - `CompileDone`: compile succeeded, fall through to unbounded execution wait.
-        // - `Final(_)`: compile failed/aborted before reaching the signal (early return
-        //   on linearize_err / too_many_uops / compile_err / runtime_err, or panic).
-        // - timeout: clang hung past the budget; abandon the worker (orphaned thread).
-        match rx.recv_timeout(compile_timeout) {
-            Ok(WorkerMsg::CompileDone) => {
-                // Stage 2: execution. Unbounded — `bench_config.early_stop`
-                // aborts a slow run from inside `benchmark_kernel`.
-                match rx.recv() {
-                    Ok(WorkerMsg::Final(metrics)) => metrics,
-                    _ => None,
+                if !halved {
+                    break;
                 }
             }
-            Ok(WorkerMsg::Final(metrics)) => metrics,
+            let shrunk_size: usize = test_global_size.iter().product();
+            let factor = if shrunk_size > 0 { original_size as f64 / shrunk_size as f64 } else { 1.0 };
+
+            let mut config = bench_config.clone();
+            config.early_stop = early_stop
+                .map(|timing| Duration::from_nanos((timing.as_nanos() as f64 / factor).min(u64::MAX as f64) as u64));
+            config.clear_l2 = renderer.device.has_hardware_cache_invalidate();
+            let result = unsafe {
+                svod_runtime::benchmark_kernel(
+                    program.as_ref(),
+                    &buffer_ptrs,
+                    &vals,
+                    Some(test_global_size),
+                    launch_dims.local_size,
+                    &config,
+                )
+                .ok()?
+            };
+            Some(Duration::from_nanos((result.min.as_nanos() as f64 * factor).min(u64::MAX as f64) as u64))
+        })) {
+            Ok(timing) => timing,
             Err(_) => {
                 if log_surpass {
-                    eprintln!("[BEAM drop] compile_timeout opts={:?}", s.applied_opts);
+                    eprintln!("[BEAM drop] panic_in_benchmark opts={:?}", candidate.opts);
                 }
                 None
             }
@@ -1971,7 +1932,15 @@ fn beam_search_optimize(
         post_optimizer_config.hash(&mut hasher);
         hasher.finish()
     };
-    let result = beam_search_cached_with_behavior(scheduler, beam_config, behavior_fingerprint, compile_and_time);
+    let result = beam_search_cached_staged(
+        scheduler,
+        beam_config,
+        device.compiler.cache_key(),
+        behavior_fingerprint,
+        prepare,
+        compile,
+        benchmark,
+    );
     std::panic::set_hook(prev_hook);
     let result = result.context(OptimizeSnafu)?;
 
@@ -1980,6 +1949,16 @@ fn beam_search_optimize(
         opts = ?result.scheduler.applied_opts,
         timing = ?result.timing,
         iterations = result.iterations,
+        generated = result.generated,
+        unique_ir = result.unique_ir,
+        compiled = result.compiled,
+        unique_binary = result.unique_binary,
+        benchmarked = result.benchmarked,
+        generation_time = ?result.stage_timings.generation,
+        filtering_time = ?result.stage_timings.filtering,
+        compilation_time = ?result.stage_timings.compilation,
+        binary_dedup_time = ?result.stage_timings.binary_dedup,
+        benchmarking_time = ?result.stage_timings.benchmarking,
         "beam_search_optimize: completed"
     );
 

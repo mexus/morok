@@ -25,15 +25,30 @@ fn test_beam_config_default() {
     assert_eq!(config.beam_width, 4);
     assert_eq!(config.max_upcast, 256);
     assert_eq!(config.max_local, 1024);
+    assert_eq!(config.min_progress_ns, 10);
+    assert!(!config.enable_nolocals);
+    assert!(config.compile_workers > 0);
+    assert_eq!(config.compile_timeout_secs, 10);
 }
 
 #[test]
 fn test_beam_config_builder() {
-    let config = BeamConfig::builder().beam_width(8).max_upcast(512).build();
+    let config = BeamConfig::builder()
+        .beam_width(8)
+        .max_upcast(512)
+        .min_progress_ns(25)
+        .enable_nolocals(true)
+        .compile_workers(3)
+        .compile_timeout_secs(7)
+        .build();
 
     assert_eq!(config.beam_width, 8);
     assert_eq!(config.max_upcast, 512);
     assert_eq!(config.max_local, 1024); // default
+    assert_eq!(config.min_progress_ns, 25);
+    assert!(config.enable_nolocals);
+    assert_eq!(config.compile_workers, 3);
+    assert_eq!(config.compile_timeout_secs, 7);
 }
 
 #[test]

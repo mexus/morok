@@ -55,9 +55,36 @@ fn test_beam_cache_key_includes_post_optimization_behavior() {
     let scheduler = Scheduler::new(UOp::sink(vec![UOp::native_const(1i32)]), crate::optimizer::Renderer::cpu());
     let config = BeamConfig::default();
     assert_ne!(
-        CacheKey::from_scheduler(&scheduler, &config, 0).to_bytes(),
-        CacheKey::from_scheduler(&scheduler, &config, 1).to_bytes()
+        CacheKey::from_scheduler(&scheduler, &config, "compiler", 0).to_bytes(),
+        CacheKey::from_scheduler(&scheduler, &config, "compiler", 1).to_bytes()
     );
+}
+
+#[test]
+fn test_beam_cache_key_includes_exact_compiler_identity() {
+    let scheduler = Scheduler::new(UOp::sink(vec![UOp::native_const(1i32)]), crate::optimizer::Renderer::cpu());
+    let config = BeamConfig::default();
+    assert_ne!(
+        CacheKey::from_scheduler(&scheduler, &config, "cpu-clang:17", 0).to_bytes(),
+        CacheKey::from_scheduler(&scheduler, &config, "cpu-clang:18", 0).to_bytes()
+    );
+}
+
+#[test]
+fn test_beam_cache_key_includes_behavior_controls() {
+    let scheduler = Scheduler::new(UOp::sink(vec![UOp::native_const(1i32)]), crate::optimizer::Renderer::cpu());
+    let base = BeamConfig::default();
+    let base_key = CacheKey::from_scheduler(&scheduler, &base, "compiler", 0).to_bytes();
+    let variants = [
+        BeamConfig { min_progress_ns: base.min_progress_ns + 1, ..base.clone() },
+        BeamConfig { enable_nolocals: !base.enable_nolocals, ..base.clone() },
+        BeamConfig { compile_timeout_secs: base.compile_timeout_secs + 1, ..base.clone() },
+        BeamConfig { num_runs: base.num_runs + 1, ..base.clone() },
+        BeamConfig { compile_workers: base.compile_workers + 1, ..base.clone() },
+    ];
+    for variant in variants {
+        assert_ne!(base_key, CacheKey::from_scheduler(&scheduler, &variant, "compiler", 0).to_bytes());
+    }
 }
 
 #[test]
@@ -69,9 +96,161 @@ fn test_beam_cache_key_distinguishes_exact_amd_targets() {
     let gfx1100 = Scheduler::new(ast.clone(), crate::optimizer::Renderer::for_amd_arch(AmdArch::Gfx1100));
     let gfx1151 = Scheduler::new(ast, crate::optimizer::Renderer::for_amd_arch(AmdArch::Gfx1151));
     assert_ne!(
-        CacheKey::from_scheduler(&gfx1100, &config, 0).to_bytes(),
-        CacheKey::from_scheduler(&gfx1151, &config, 0).to_bytes()
+        CacheKey::from_scheduler(&gfx1100, &config, "amd", 0).to_bytes(),
+        CacheKey::from_scheduler(&gfx1151, &config, "amd", 0).to_bytes()
     );
+}
+
+fn weak_axis_scheduler(constant: i32) -> Scheduler {
+    use svod_ir::{AxisId, AxisType};
+
+    let range = UOp::range_axis(UOp::index_const(64), AxisId::Renumbered(0), AxisType::Weak);
+    Scheduler::new(UOp::sink(vec![UOp::native_const(constant), range]), crate::optimizer::Renderer::cpu())
+}
+
+#[test]
+fn test_staged_beam_filters_parallel_compiles_dedups_and_serializes_timing() {
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone)]
+    struct FakeArtifact {
+        index: usize,
+    }
+
+    fn enter(active: &AtomicUsize, maximum: &AtomicUsize) {
+        let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+        maximum.fetch_max(now, Ordering::SeqCst);
+    }
+
+    let scheduler = weak_axis_scheduler(0x51a9);
+    let config = BeamConfig {
+        beam_width: 2,
+        min_progress_ns: 1_000_000_000,
+        compile_workers: 3,
+        disable_cache: true,
+        ..BeamConfig::default()
+    };
+    let prepared = Arc::new(AtomicUsize::new(0));
+    let opts_by_index = Arc::new(Mutex::new(HashMap::new()));
+    let compile_calls = Arc::new(AtomicUsize::new(0));
+    let compile_active = Arc::new(AtomicUsize::new(0));
+    let compile_max = Arc::new(AtomicUsize::new(0));
+    let benchmark_calls = Arc::new(AtomicUsize::new(0));
+    let benchmark_active = Arc::new(AtomicUsize::new(0));
+    let benchmark_max = Arc::new(AtomicUsize::new(0));
+
+    let result = beam_search_staged(
+        scheduler,
+        &config,
+        {
+            let prepared = Arc::clone(&prepared);
+            let opts_by_index = Arc::clone(&opts_by_index);
+            move |candidate| {
+                let index = prepared.fetch_add(1, Ordering::SeqCst);
+                opts_by_index.lock().unwrap().insert(index, candidate.applied_opts.clone());
+                Some(PreparedCandidate {
+                    artifact: FakeArtifact { index },
+                    ir_hash: if index <= 1 { 0 } else { index as u64 },
+                    compute_ops: if index == 2 { 1001 } else { 1 },
+                })
+            }
+        },
+        {
+            let calls = Arc::clone(&compile_calls);
+            let active = Arc::clone(&compile_active);
+            let maximum = Arc::clone(&compile_max);
+            move |artifact: FakeArtifact| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                enter(&active, &maximum);
+                std::thread::sleep(Duration::from_millis(5));
+                active.fetch_sub(1, Ordering::SeqCst);
+                let binary_key =
+                    if matches!(artifact.index, 3 | 4) { vec![0xdd] } else { artifact.index.to_le_bytes().to_vec() };
+                Some(CompiledCandidate { artifact, binary_key })
+            }
+        },
+        {
+            let calls = Arc::clone(&benchmark_calls);
+            let active = Arc::clone(&benchmark_active);
+            let maximum = Arc::clone(&benchmark_max);
+            move |artifact: &FakeArtifact, _| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                enter(&active, &maximum);
+                std::thread::sleep(Duration::from_millis(1));
+                active.fetch_sub(1, Ordering::SeqCst);
+                Some(Duration::from_nanos(10_000 - artifact.index as u64))
+            }
+        },
+    )
+    .unwrap();
+
+    let generated = prepared.load(Ordering::SeqCst);
+    assert!(generated > 6, "test scheduler must expose enough candidates");
+    assert_eq!(result.generated, generated);
+    assert_eq!(result.unique_ir, generated - 1, "one structural duplicate must be removed");
+    assert_eq!(compile_calls.load(Ordering::SeqCst), result.unique_ir - 1, "excessive candidate must not compile");
+    assert_eq!(result.compiled, compile_calls.load(Ordering::SeqCst));
+    assert_eq!(result.unique_binary, result.compiled - 1, "one duplicate binary must be removed");
+    assert_eq!(benchmark_calls.load(Ordering::SeqCst), result.unique_binary);
+    assert_eq!(result.benchmarked, result.unique_binary);
+    assert!(compile_max.load(Ordering::SeqCst) > 1, "compilation should overlap");
+    assert!(compile_max.load(Ordering::SeqCst) <= config.compile_workers, "compile concurrency must be bounded");
+    assert_eq!(benchmark_max.load(Ordering::SeqCst), 1, "backend timing must be serialized");
+
+    let winning_index = opts_by_index
+        .lock()
+        .unwrap()
+        .keys()
+        .copied()
+        .filter(|index| *index != 1 && *index != 2 && *index != 4)
+        .max()
+        .unwrap();
+    assert_eq!(result.scheduler.applied_opts, opts_by_index.lock().unwrap()[&winning_index]);
+}
+
+#[test]
+fn test_staged_beam_cache_cold_and_warm_choose_same_winner() {
+    use std::hash::{Hash, Hasher};
+
+    let scheduler = weak_axis_scheduler(0x6b17);
+    let config = BeamConfig {
+        min_progress_ns: 1_000_000_000,
+        compile_workers: 2,
+        disable_cache: false,
+        ..BeamConfig::default()
+    };
+    let compiler_identity = "fake-compiler:beam-cold-warm-v1";
+    let key = CacheKey::from_scheduler(&scheduler, &config, compiler_identity, 0x1234);
+    cache_invalidate(&key);
+
+    let run = |scheduler: Scheduler| {
+        beam_search_cached_staged(
+            scheduler,
+            &config,
+            compiler_identity,
+            0x1234,
+            |candidate| {
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                candidate.applied_opts.hash(&mut hasher);
+                let identity = hasher.finish();
+                Some(PreparedCandidate { artifact: identity, ir_hash: identity, compute_ops: 1 })
+            },
+            |identity| Some(CompiledCandidate { artifact: identity, binary_key: identity.to_le_bytes().to_vec() }),
+            |identity, _| Some(Duration::from_nanos(1 + identity % 10_000)),
+        )
+        .unwrap()
+    };
+
+    let cold = run(scheduler.clone());
+    let warm = run(scheduler);
+    cache_invalidate(&key);
+
+    assert!(cold.iterations > 0);
+    assert_eq!(warm.iterations, 0, "second search should replay the persistent BEAM entry");
+    assert_eq!(cold.scheduler.applied_opts, warm.scheduler.applied_opts);
+    assert_eq!(cold.timing, warm.timing);
 }
 
 #[test]

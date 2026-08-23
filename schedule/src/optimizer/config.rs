@@ -156,14 +156,37 @@ pub struct BeamConfig {
     pub max_uops: usize,
     /// Number of benchmark runs per kernel.
     pub num_runs: usize,
+    /// Minimum improvement in nanoseconds required to continue searching.
+    pub min_progress_ns: u64,
+    /// Whether the NOLOCALS action is part of the search space.
+    pub enable_nolocals: bool,
+    /// Maximum number of candidates compiled concurrently.
+    pub compile_workers: usize,
+    /// Per-candidate backend compilation timeout in seconds.
+    pub compile_timeout_secs: u64,
     /// Disable disk cache.
     pub disable_cache: bool,
 }
 
 impl Default for BeamConfig {
     fn default() -> Self {
-        Self { beam_width: 4, max_upcast: 256, max_local: 1024, max_uops: 3000, num_runs: 3, disable_cache: false }
+        Self {
+            beam_width: 4,
+            max_upcast: 256,
+            max_local: 1024,
+            max_uops: 3000,
+            num_runs: 3,
+            min_progress_ns: 10,
+            enable_nolocals: false,
+            compile_workers: default_beam_compile_workers(),
+            compile_timeout_secs: 10,
+            disable_cache: false,
+        }
     }
+}
+
+fn default_beam_compile_workers() -> usize {
+    std::thread::available_parallelism().map(|parallelism| parallelism.get()).unwrap_or(1)
 }
 
 #[bon]
@@ -183,9 +206,27 @@ impl BeamConfig {
         #[builder(default = std::env::var("BEAM_UOPS_MAX").ok().and_then(|s| s.parse().ok()).unwrap_or(3000))]
         max_uops: usize,
         #[builder(default = std::env::var("BEAM_RUNS").ok().and_then(|s| s.parse().ok()).unwrap_or(3))] num_runs: usize,
+        #[builder(default = std::env::var("BEAM_MIN_PROGRESS").ok().and_then(|s| s.parse().ok()).unwrap_or(10))]
+        min_progress_ns: u64,
+        #[builder(default = std::env::var("SVOD_NOLOCALS").is_ok())] enable_nolocals: bool,
+        #[builder(default = std::env::var("PARALLEL").ok().and_then(|s| s.parse().ok()).unwrap_or_else(default_beam_compile_workers))]
+        compile_workers: usize,
+        #[builder(default = std::env::var("BEAM_TIMEOUT_SEC").ok().and_then(|s| s.parse().ok()).unwrap_or(10))]
+        compile_timeout_secs: u64,
         #[builder(default = std::env::var("IGNORE_BEAM_CACHE").is_ok())] disable_cache: bool,
     ) -> Self {
-        Self { beam_width, max_upcast, max_local, max_uops, num_runs, disable_cache }
+        Self {
+            beam_width,
+            max_upcast,
+            max_local,
+            max_uops,
+            num_runs,
+            min_progress_ns,
+            enable_nolocals,
+            compile_workers,
+            compile_timeout_secs,
+            disable_cache,
+        }
     }
 
     /// Create configuration from environment variables.
@@ -197,6 +238,10 @@ impl BeamConfig {
     /// * `BEAM_LOCAL_MAX` - Max local memory elements (default: 1024)
     /// * `BEAM_UOPS_MAX` - Max UOps before rejecting (default: 3000)
     /// * `BEAM_RUNS` - Benchmark runs per kernel (default: 3)
+    /// * `BEAM_MIN_PROGRESS` - Minimum progress in nanoseconds (default: 10)
+    /// * `SVOD_NOLOCALS` - Include the NOLOCALS action if set
+    /// * `PARALLEL` - Maximum concurrent candidate compilations (default: host parallelism)
+    /// * `BEAM_TIMEOUT_SEC` - Per-candidate compile timeout in seconds (default: 10)
     /// * `IGNORE_BEAM_CACHE` - Bypass disk cache if set
     pub fn from_env() -> Self {
         let beam_width = std::env::var("BEAM").ok().and_then(|s| s.parse().ok()).unwrap_or(4);
@@ -204,9 +249,25 @@ impl BeamConfig {
         let max_local = std::env::var("BEAM_LOCAL_MAX").ok().and_then(|s| s.parse().ok()).unwrap_or(1024);
         let max_uops = std::env::var("BEAM_UOPS_MAX").ok().and_then(|s| s.parse().ok()).unwrap_or(3000);
         let num_runs = std::env::var("BEAM_RUNS").ok().and_then(|s| s.parse().ok()).unwrap_or(3);
+        let min_progress_ns = std::env::var("BEAM_MIN_PROGRESS").ok().and_then(|s| s.parse().ok()).unwrap_or(10);
+        let enable_nolocals = std::env::var("SVOD_NOLOCALS").is_ok();
+        let compile_workers =
+            std::env::var("PARALLEL").ok().and_then(|s| s.parse().ok()).unwrap_or_else(default_beam_compile_workers);
+        let compile_timeout_secs = std::env::var("BEAM_TIMEOUT_SEC").ok().and_then(|s| s.parse().ok()).unwrap_or(10);
         let disable_cache = std::env::var("IGNORE_BEAM_CACHE").is_ok();
 
-        Self { beam_width, max_upcast, max_local, max_uops, num_runs, disable_cache }
+        Self {
+            beam_width,
+            max_upcast,
+            max_local,
+            max_uops,
+            num_runs,
+            min_progress_ns,
+            enable_nolocals,
+            compile_workers,
+            compile_timeout_secs,
+            disable_cache,
+        }
     }
 
     /// Get beam width from strategy if applicable.
