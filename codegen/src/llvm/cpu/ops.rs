@@ -128,6 +128,7 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec<Stri
             let idx = ctx.get(index);
             let dtype = ldt(&memory_access_dtype(index, &uop.dtype()));
             let idx_type = "ptr";
+            let volatile = if is_volatile_access(index) { "volatile " } else { "" };
 
             let gate_info = match (alt, gate) {
                 (None, None) => None,
@@ -146,12 +147,12 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec<Stri
                 kernel.push(format!("{entry_label}:"));
                 kernel.push(format!("  br i1 {gate}, label %{load_label}, label %{exit_label}"));
                 kernel.push(format!("{load_label}:"));
-                kernel.push(format!("  {load_val} = load {dtype}, {idx_type} {idx}"));
+                kernel.push(format!("  {load_val} = load {volatile}{dtype}, {idx_type} {idx}"));
                 kernel.push(format!("  br label %{exit_label}"));
                 kernel.push(format!("{exit_label}:"));
                 kernel.push(format!("  {dst} = phi {dtype} [{load_val}, %{load_label}], [{alt_val}, %{entry_label}]"));
             } else {
-                kernel.push(format!("  {dst} = load {dtype}, {idx_type} {idx}"));
+                kernel.push(format!("  {dst} = load {volatile}{dtype}, {idx_type} {idx}"));
             }
             Some(())
         }
@@ -168,8 +169,9 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec<Stri
             let val = ctx.get(value);
             let val_type = ldt(&memory_access_dtype(index, &value.dtype()));
             let idx_type = "ptr";
+            let volatile = if is_volatile_access(index) { "volatile " } else { "" };
 
-            kernel.push(format!("  store {val_type} {val}, {idx_type} {idx}"));
+            kernel.push(format!("  store {volatile}{val_type} {val}, {idx_type} {idx}"));
             Some(())
         }
 
@@ -649,6 +651,26 @@ fn memory_access_dtype(index: &Arc<UOp>, scalar: &DType) -> DType {
         scalar.scalar_dtype().vec(count).expect("grouped memory dtype must be vectorizable")
     } else {
         scalar.clone()
+    }
+}
+
+fn is_volatile_access(index: &Arc<UOp>) -> bool {
+    let mut current = index;
+    loop {
+        match current.op() {
+            Op::Param { arg, .. } => return arg.volatile,
+            Op::Index { buffer, .. } => current = buffer,
+            Op::Shrink { src, .. }
+            | Op::Cast { src, .. }
+            | Op::After { passthrough: src, .. }
+            | Op::Reshape { src, .. }
+            | Op::Permute { src, .. }
+            | Op::Expand { src, .. }
+            | Op::Pad { src, .. }
+            | Op::Flip { src, .. } => current = src,
+            Op::MSelect { buffer, .. } => current = buffer,
+            _ => return false,
+        }
     }
 }
 

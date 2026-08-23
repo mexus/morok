@@ -139,7 +139,8 @@ impl crate::Renderer for CRenderer {
                     DType::Ptr { base, .. } => c_dtype(base),
                     _ => c_dtype(&dtype),
                 };
-                params.push(format!("{elem_type}* restrict {source_name}"));
+                let volatile = if arg.volatile { "volatile " } else { "" };
+                params.push(format!("{volatile}{elem_type}* restrict {source_name}"));
             } else {
                 params.push(format!("const {} {source_name}", c_dtype(&param.dtype())));
             }

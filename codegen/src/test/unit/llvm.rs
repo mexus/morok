@@ -2,7 +2,7 @@
 
 use smallvec::SmallVec;
 use svod_dtype::{AddrSpace, DType, DeviceSpec};
-use svod_ir::{AxisId, AxisType, ConstValue, Op, UOp};
+use svod_ir::{AxisId, AxisType, ConstValue, Op, ParamArg, UOp};
 
 use crate::llvm::common::lconst;
 use crate::llvm::text::render;
@@ -10,6 +10,12 @@ use crate::llvm::text::render;
 fn render_linearized(root: &std::sync::Arc<UOp>, name: Option<&str>) -> crate::Result<crate::RenderedKernel> {
     let linear = UOp::linear(svod_schedule::linearize_with_cfg(root.clone()).into());
     render(&linear, name)
+}
+
+fn volatile_param(slot: usize, size: usize) -> std::sync::Arc<UOp> {
+    let mut arg = ParamArg::buffer(slot, DType::Float32, AddrSpace::Global, None);
+    arg.volatile = true;
+    UOp::new(Op::Param { shape: UOp::index_const(size as i64), arg }, DType::Float32)
 }
 
 #[test]
@@ -51,6 +57,26 @@ fn grouped_shrink_renders_single_vector_load_and_store() {
     let rendered = render_linearized(&sink, Some("grouped_memory")).expect("render grouped LLVM memory");
     assert_eq!(rendered.code.matches("load <4 x float>").count(), 1, "{}", rendered.code);
     assert_eq!(rendered.code.matches("store <4 x float>").count(), 1, "{}", rendered.code);
+}
+
+#[test]
+fn volatile_scalar_and_grouped_memory_accesses_render_explicitly() {
+    let index = UOp::index_const(0);
+    let scalar_input = UOp::index().buffer(volatile_param(1, 1)).indices(vec![index.clone()]).call().unwrap();
+    let scalar_output = UOp::index().buffer(volatile_param(0, 1)).indices(vec![index]).call().unwrap();
+    let scalar = UOp::sink(vec![scalar_output.store(UOp::load().index(scalar_input).call())]);
+    let scalar = render_linearized(&scalar, Some("volatile_scalar")).expect("render volatile scalar LLVM");
+    assert!(scalar.code.contains("load volatile float"), "{}", scalar.code);
+    assert!(scalar.code.contains("store volatile float"), "{}", scalar.code);
+
+    let shrink =
+        |src| UOp::new(Op::Shrink { src, offsets: UOp::index_const(0), sizes: UOp::index_const(4) }, DType::Float32);
+    let grouped_input = shrink(volatile_param(1, 8));
+    let grouped_output = shrink(volatile_param(0, 8));
+    let grouped = UOp::sink(vec![grouped_output.store(UOp::load().index(grouped_input).call())]);
+    let grouped = render_linearized(&grouped, Some("volatile_grouped")).expect("render volatile grouped LLVM");
+    assert!(grouped.code.contains("load volatile <4 x float>"), "{}", grouped.code);
+    assert!(grouped.code.contains("store volatile <4 x float>"), "{}", grouped.code);
 }
 
 #[test]

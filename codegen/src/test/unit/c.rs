@@ -1,8 +1,8 @@
 //! C renderer tests for code generation verification.
 
 use smallvec::SmallVec;
-use svod_dtype::{DType, DeviceSpec};
-use svod_ir::{AxisId, AxisType, ConstValue, Op, ReduceOp, UOp, WmmaMetadata, WmmaUpcastAxes};
+use svod_dtype::{AddrSpace, DType, DeviceSpec};
+use svod_ir::{AxisId, AxisType, ConstValue, Op, ParamArg, ReduceOp, UOp, WmmaMetadata, WmmaUpcastAxes};
 
 use crate::c::render;
 use crate::c::types::c_const;
@@ -25,6 +25,12 @@ fn slotted_var(name: &str, slot: usize) -> std::sync::Arc<UOp> {
     UOp::new(Op::Param { shape: shape.clone(), arg }, DType::Int32)
 }
 
+fn volatile_param(slot: usize, size: usize) -> std::sync::Arc<UOp> {
+    let mut arg = ParamArg::buffer(slot, DType::Float32, AddrSpace::Global, None);
+    arg.volatile = true;
+    UOp::new(Op::Param { shape: UOp::index_const(size as i64), arg }, DType::Float32)
+}
+
 #[test]
 fn c_signature_uses_canonical_mixed_param_slot_order() {
     let sink = UOp::sink(vec![
@@ -40,6 +46,17 @@ fn c_signature_uses_canonical_mixed_param_slot_order() {
         rendered
             .code
             .contains("void mixed_abi(float* restrict data0, const int data1, float* restrict data2, const int data3)"),
+        "{}",
+        rendered.code
+    );
+}
+
+#[test]
+fn c_qualifies_only_volatile_buffer_parameters() {
+    let sink = UOp::sink(vec![volatile_param(0, 1), UOp::param(1, 1, DType::Float32, None)]);
+    let rendered = render_linearized(&sink, Some("volatile_params")).expect("render volatile C ABI");
+    assert!(
+        rendered.code.contains("void volatile_params(volatile float* restrict data0, float* restrict data1)"),
         "{}",
         rendered.code
     );
