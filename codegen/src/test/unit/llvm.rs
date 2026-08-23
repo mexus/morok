@@ -15,7 +15,7 @@ fn render_linearized(root: &std::sync::Arc<UOp>, name: Option<&str>) -> crate::R
 fn volatile_param(slot: usize, size: usize) -> std::sync::Arc<UOp> {
     let mut arg = ParamArg::buffer(slot, DType::Float32, AddrSpace::Global, None);
     arg.volatile = true;
-    UOp::new(Op::Param { shape: UOp::index_const(size as i64), arg }, DType::Float32)
+    UOp::new(Op::Param { shape: UOp::native_const(size as i32), arg }, DType::Float32)
 }
 
 #[test]
@@ -61,7 +61,7 @@ fn grouped_shrink_renders_single_vector_load_and_store() {
 
 #[test]
 fn volatile_scalar_and_grouped_memory_accesses_render_explicitly() {
-    let index = UOp::index_const(0);
+    let index = UOp::native_const(0i32);
     let scalar_input = UOp::index().buffer(volatile_param(1, 1)).indices(vec![index.clone()]).call().unwrap();
     let scalar_output = UOp::index().buffer(volatile_param(0, 1)).indices(vec![index]).call().unwrap();
     let scalar = UOp::sink(vec![scalar_output.store(UOp::load().index(scalar_input).call())]);
@@ -69,8 +69,9 @@ fn volatile_scalar_and_grouped_memory_accesses_render_explicitly() {
     assert!(scalar.code.contains("load volatile float"), "{}", scalar.code);
     assert!(scalar.code.contains("store volatile float"), "{}", scalar.code);
 
-    let shrink =
-        |src| UOp::new(Op::Shrink { src, offsets: UOp::index_const(0), sizes: UOp::index_const(4) }, DType::Float32);
+    let shrink = |src| {
+        UOp::new(Op::Shrink { src, offsets: UOp::native_const(0i32), sizes: UOp::native_const(4i32) }, DType::Float32)
+    };
     let grouped_input = shrink(volatile_param(1, 8));
     let grouped_output = shrink(volatile_param(0, 8));
     let grouped = UOp::sink(vec![grouped_output.store(UOp::load().index(grouped_input).call())]);
