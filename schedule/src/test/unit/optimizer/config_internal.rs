@@ -69,6 +69,7 @@ fn test_optimizer_config_default() {
     let config = OptimizerConfig::default();
     assert_eq!(config.strategy, OptStrategy::Heuristic);
     assert_eq!(config.beam.beam_width, 4);
+    assert!(config.disable_fast_idiv);
 }
 
 #[test]

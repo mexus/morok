@@ -51,6 +51,16 @@ fn test_beam_tensor_core_actions_keep_strict_default_and_padded_axes() {
 }
 
 #[test]
+fn test_beam_cache_key_includes_post_optimization_behavior() {
+    let scheduler = Scheduler::new(UOp::sink(vec![UOp::native_const(1i32)]), crate::optimizer::Renderer::cpu());
+    let config = BeamConfig::default();
+    assert_ne!(
+        CacheKey::from_scheduler(&scheduler, &config, 0).to_bytes(),
+        CacheKey::from_scheduler(&scheduler, &config, 1).to_bytes()
+    );
+}
+
+#[test]
 fn test_beam_search_with_mock_scoring() {
     use super::super::renderer::Renderer;
     use svod_ir::UOp;

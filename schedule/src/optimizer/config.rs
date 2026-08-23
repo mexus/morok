@@ -424,6 +424,8 @@ pub struct OptimizerConfig {
     pub heuristics: HeuristicsConfig,
     /// Tinygrad-compatible transcendental mode. Values >= 2 force decomposition.
     pub transcendental: i32,
+    /// Disable non-power-of-two magic integer division rewrites.
+    pub disable_fast_idiv: bool,
 }
 
 impl Default for OptimizerConfig {
@@ -433,6 +435,7 @@ impl Default for OptimizerConfig {
             beam: BeamConfig::default(),
             heuristics: HeuristicsConfig::default(),
             transcendental: 1,
+            disable_fast_idiv: true,
         }
     }
 }
@@ -452,9 +455,11 @@ impl OptimizerConfig {
         #[builder(default = HeuristicsConfig::from_env())] heuristics: HeuristicsConfig,
         #[builder(default = std::env::var("TRANSCENDENTAL").ok().and_then(|value| value.parse().ok()).unwrap_or(1))]
         transcendental: i32,
+        #[builder(default = std::env::var("DISABLE_FAST_IDIV").ok().and_then(|value| value.parse::<i32>().ok()).unwrap_or(1) != 0)]
+        disable_fast_idiv: bool,
     ) -> Self {
         let beam = beam.with_strategy_width(&strategy);
-        Self { strategy, beam, heuristics, transcendental }
+        Self { strategy, beam, heuristics, transcendental, disable_fast_idiv }
     }
 
     /// Create configuration from environment variables.
@@ -470,8 +475,10 @@ impl OptimizerConfig {
         let beam = BeamConfig::from_env().with_strategy_width(&strategy);
         let heuristics = HeuristicsConfig::from_env();
         let transcendental = std::env::var("TRANSCENDENTAL").ok().and_then(|value| value.parse().ok()).unwrap_or(1);
+        let disable_fast_idiv =
+            std::env::var("DISABLE_FAST_IDIV").ok().and_then(|value| value.parse::<i32>().ok()).unwrap_or(1) != 0;
 
-        Self { strategy, beam, heuristics, transcendental }
+        Self { strategy, beam, heuristics, transcendental, disable_fast_idiv }
     }
 }
 

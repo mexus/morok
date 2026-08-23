@@ -55,8 +55,8 @@ pub mod types;
 
 // Re-exports
 pub use beam::{
-    BeamResult, CandidateMetrics, beam_search, beam_search_cached, clear_cache, compute_ops_estimate,
-    hash_post_codegen_ir, replay_opts,
+    BeamResult, CandidateMetrics, beam_search, beam_search_cached, beam_search_cached_with_behavior, clear_cache,
+    compute_ops_estimate, hash_post_codegen_ir, replay_opts,
 };
 pub use config::{BeamConfig, HeuristicsConfig, OptStrategy, OptimizerConfig, TcOpt as TcOptLevel, TcSelect, TcUsage};
 pub use error::OptError;
@@ -522,22 +522,28 @@ pub fn apply_post_optimization_with_renderer(
     ast: Arc<svod_ir::UOp>,
     renderer: &Renderer,
 ) -> Result<Arc<svod_ir::UOp>, OptError> {
-    let transcendental = std::env::var("TRANSCENDENTAL").ok().and_then(|value| value.parse().ok()).unwrap_or(1);
-    apply_post_optimization_configured(ast, renderer, transcendental)
+    apply_post_optimization_with_config(ast, renderer, &OptimizerConfig::from_env())
 }
 
-fn apply_post_optimization_configured(
+pub fn apply_post_optimization_with_config(
     ast: Arc<svod_ir::UOp>,
     renderer: &Renderer,
-    transcendental: i32,
+    config: &OptimizerConfig,
 ) -> Result<Arc<svod_ir::UOp>, OptError> {
-    apply_post_optimization_configured_with_capture(ast, renderer, transcendental, None)
+    apply_post_optimization_configured_with_capture(
+        ast,
+        renderer,
+        config.transcendental,
+        config.disable_fast_idiv,
+        None,
+    )
 }
 
 fn apply_post_optimization_configured_with_capture(
     ast: Arc<svod_ir::UOp>,
     renderer: &Renderer,
     transcendental: i32,
+    disable_fast_idiv: bool,
     final_rewrite_capture: Option<&mut Option<Arc<svod_ir::UOp>>>,
 ) -> Result<Arc<svod_ir::UOp>, OptError> {
     // Save metadata before graph_rewrite destroys it (e.g., KernelInfo with kernel name)
@@ -795,7 +801,7 @@ fn apply_post_optimization_configured_with_capture(
     let t_stage = std::time::Instant::now();
     let force_transcendental = transcendental >= 2;
     let mut pm_decomp = pm_early_decomp
-        + get_late_rewrite_patterns(&renderer_ctx)
+        + get_late_rewrite_patterns(&renderer_ctx, disable_fast_idiv)
         + svod_ir::decompositions::get_transcendental_patterns(supported_ops, force_transcendental);
     if let Some(matcher) = renderer_ctx.decomposition_matcher() {
         pm_decomp = pm_decomp + matcher.clone();
@@ -1084,7 +1090,7 @@ fn early_decomposition_patterns(supported: &svod_ir::RendererOps) -> crate::Type
 /// - MUL → SHL: `x * 2^n → x << n` for power-of-two multiplier
 /// - NEG from MUL: `x * -1 → NEG(x)`
 /// - Fast integer division (magic number multiplication)
-fn get_late_rewrite_patterns(renderer: &Renderer) -> crate::TypedPatternMatcher {
+fn get_late_rewrite_patterns(renderer: &Renderer, disable_fast_idiv: bool) -> crate::TypedPatternMatcher {
     use svod_ir::{BinaryOp as B, TernaryOp as T, UnaryOp as U};
     let supported = renderer.supported_ops().expect("late rewrites require concrete renderer capabilities");
     let mut pm = pm_mod_to_and().clone() + pm_half_bf16_cast().clone();
@@ -1095,10 +1101,10 @@ fn get_late_rewrite_patterns(renderer: &Renderer) -> crate::TypedPatternMatcher 
         pm = pm + pm_mul_to_shl().clone();
     }
     if supported.supports_binary(B::Shr) {
-        pm = pm
-            + pm_div_to_shr().clone()
-            + crate::symbolic::fast_division_patterns(renderer.supported_dtypes())
-            + pm_mod_to_idiv().clone();
+        pm = pm + pm_div_to_shr().clone();
+        if !disable_fast_idiv {
+            pm = pm + crate::symbolic::fast_division_patterns(renderer.supported_dtypes()) + pm_mod_to_idiv().clone();
+        }
     }
     if supported.supports_unary(U::Neg) {
         pm = pm + pm_neg_from_mul().clone();
@@ -1301,7 +1307,22 @@ fn optimize_kernel_with_config_impl(
     // with LOAD for arithmetic ops) and must run even when optimizations are disabled.
     // Pass the renderer to enable GPU dimension injection for GPU backends.
 
-    apply_post_optimization_configured_with_capture(optimized, renderer, config.transcendental, final_rewrite_capture)
+    apply_post_optimization_configured_with_capture(
+        optimized,
+        renderer,
+        config.transcendental,
+        config.disable_fast_idiv,
+        final_rewrite_capture,
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn apply_late_rewrites(
+    root: Arc<svod_ir::UOp>,
+    renderer: &Renderer,
+    disable_fast_idiv: bool,
+) -> Arc<svod_ir::UOp> {
+    graph_rewrite(&get_late_rewrite_patterns(renderer, disable_fast_idiv), root, &mut ())
 }
 
 /// Read an author-supplied `opts_to_apply` list off a kernel SINK marker.

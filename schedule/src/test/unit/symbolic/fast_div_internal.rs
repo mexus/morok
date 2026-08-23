@@ -99,3 +99,35 @@ fn fast_division_does_not_rewrite_signed_negative_range() {
         svod_ir::RewriteResult::NoMatch
     ));
 }
+
+#[test]
+fn fast_division_replacements_are_exhaustive_for_eight_bit_ranges() {
+    use std::collections::{HashMap, HashSet};
+    use svod_ir::{Op, UOpKey};
+
+    for (dtype, vmax, wider) in [
+        (svod_ir::DType::UInt8, u8::MAX as i64, ScalarDType::UInt16),
+        (svod_ir::DType::Int8, i8::MAX as i64, ScalarDType::Int16),
+    ] {
+        let variable = UOp::variable("x".into(), 0, vmax, dtype.clone());
+        let supported = HashSet::from([dtype.base(), wider]);
+        for divisor in (2..=vmax).filter(|divisor| !(*divisor as u64).is_power_of_two()) {
+            let Some(replacement) = fast_idiv(&variable, divisor, false, &supported) else { continue };
+            for value in 0..=vmax {
+                let substituted = replacement.substitute(&HashMap::from([(
+                    UOpKey(variable.clone()),
+                    UOp::const_(dtype.clone(), ConstValue::Int(value)),
+                )]));
+                let folded = svod_ir::rewrite::graph_rewrite(
+                    &(crate::symbolic::symbolic() + crate::symbolic::pm_fold_cast_const()),
+                    substituted,
+                    &mut (),
+                );
+                let Op::Const(actual) = folded.op() else {
+                    panic!("replacement did not fold for {dtype:?} {value}/{divisor}: {}", folded.tree())
+                };
+                assert_eq!(actual.0.try_int(), Some(value / divisor), "{dtype:?} {value}/{divisor}");
+            }
+        }
+    }
+}

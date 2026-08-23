@@ -582,6 +582,8 @@ static CACHE_DB: Lazy<Option<sled::Db>> = Lazy::new(|| {
 /// looser cap could reintroduce a kernel that no longer satisfies the new cap.
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 struct CacheKey {
+    /// On-disk key schema. Bump whenever replay semantics change.
+    schema: u32,
     /// Hash of the AST structure.
     ast_hash: u64,
     /// Beam width used for search.
@@ -594,11 +596,13 @@ struct CacheKey {
     max_local: usize,
     /// UOp count cap at search time.
     max_uops: usize,
+    /// Post-optimization behavior not represented by BeamConfig.
+    behavior_fingerprint: u64,
 }
 
 impl CacheKey {
     /// Create a cache key from a scheduler and config.
-    fn from_scheduler(scheduler: &Scheduler, config: &BeamConfig) -> Self {
+    fn from_scheduler(scheduler: &Scheduler, config: &BeamConfig, behavior_fingerprint: u64) -> Self {
         // Use structural hash for cross-run stability. The recursive Hash for UOp
         // traverses (dtype, op) of the entire DAG — same AST structure produces
         // the same hash regardless of process-local ids.
@@ -608,24 +612,28 @@ impl CacheKey {
         let ast_hash = hasher.finish();
 
         Self {
+            schema: 2,
             ast_hash,
             beam_width: config.beam_width,
             device: scheduler.ren.device,
             max_upcast: config.max_upcast,
             max_local: config.max_local,
             max_uops: config.max_uops,
+            behavior_fingerprint,
         }
     }
 
     /// Convert to bytes for database key.
     fn to_bytes(&self) -> Vec<u8> {
         let device_str = self.device.canonical();
-        let mut bytes = Vec::with_capacity(48 + device_str.len());
+        let mut bytes = Vec::with_capacity(60 + device_str.len());
+        bytes.extend_from_slice(&self.schema.to_le_bytes());
         bytes.extend_from_slice(&self.ast_hash.to_le_bytes());
         bytes.extend_from_slice(&self.beam_width.to_le_bytes());
         bytes.extend_from_slice(&self.max_upcast.to_le_bytes());
         bytes.extend_from_slice(&self.max_local.to_le_bytes());
         bytes.extend_from_slice(&self.max_uops.to_le_bytes());
+        bytes.extend_from_slice(&self.behavior_fingerprint.to_le_bytes());
         bytes.extend_from_slice(device_str.as_bytes());
         bytes
     }
@@ -689,7 +697,20 @@ pub fn beam_search_cached<F>(
 where
     F: Fn(&Scheduler, Option<Duration>) -> Option<CandidateMetrics> + Sync,
 {
-    let key = CacheKey::from_scheduler(&scheduler, config);
+    beam_search_cached_with_behavior(scheduler, config, 0, compile_and_time)
+}
+
+/// Run cached beam search with an explicit post-optimization behavior identity.
+pub fn beam_search_cached_with_behavior<F>(
+    scheduler: Scheduler,
+    config: &BeamConfig,
+    behavior_fingerprint: u64,
+    compile_and_time: F,
+) -> Result<BeamResult, OptError>
+where
+    F: Fn(&Scheduler, Option<Duration>) -> Option<CandidateMetrics> + Sync,
+{
+    let key = CacheKey::from_scheduler(&scheduler, config, behavior_fingerprint);
 
     // Check cache (unless disabled)
     if !config.disable_cache

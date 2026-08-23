@@ -216,6 +216,30 @@ fn test_div_non_power_of_two_unchanged() {
 }
 
 #[test]
+fn fast_integer_division_is_explicitly_opt_in() {
+    let renderer = crate::optimizer::Renderer::cpu().with_rewrite_capabilities(svod_ir::RendererOps::all(), None, None);
+    let x = range_var(99);
+    let division = x.cdiv(&UOp::native_const(7i32));
+    let modulo = x.cmod(&UOp::native_const(7i32));
+
+    let disabled =
+        crate::optimizer::apply_late_rewrites(UOp::sink(vec![division.clone(), modulo.clone()]), &renderer, true);
+    assert!(disabled.toposort().iter().any(|node| matches!(node.op(), Op::Binary(BinaryOp::CDiv, ..))));
+    assert!(disabled.toposort().iter().any(|node| matches!(node.op(), Op::Binary(BinaryOp::CMod, ..))));
+
+    let enabled = crate::optimizer::apply_late_rewrites(UOp::sink(vec![division, modulo]), &renderer, false);
+    assert!(
+        !enabled.toposort().iter().any(|node| matches!(node.op(), Op::Binary(BinaryOp::CDiv | BinaryOp::CMod, ..))),
+        "{}",
+        enabled.tree()
+    );
+
+    let power_of_two = x.cdiv(&UOp::native_const(8i32));
+    let power_of_two = crate::optimizer::apply_late_rewrites(power_of_two, &renderer, true);
+    assert!(matches!(power_of_two.op(), Op::Binary(BinaryOp::Shr, ..)), "{}", power_of_two.tree());
+}
+
+#[test]
 fn test_div_by_one_unchanged() {
     let matcher = pm_div_to_shr();
 

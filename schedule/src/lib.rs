@@ -62,8 +62,9 @@ pub use gpudims::pm_add_gpudims;
 pub use optimizer::{
     BeamConfig, BeamResult, CandidateMetrics, HeuristicsConfig, OptError, OptStrategy, OptimizerConfig,
     Renderer as OptimizerRenderer, Scheduler, TcOptLevel, TcSelect, TcUsage, apply_post_optimization,
-    apply_post_optimization_with_renderer, beam_search_cached, compute_ops_estimate, hand_coded_optimizations,
-    hash_post_codegen_ir, optimize_kernel, optimize_kernel_with_config, optimize_kernel_with_config_and_final_rewrite,
+    apply_post_optimization_with_config, apply_post_optimization_with_renderer, beam_search_cached,
+    beam_search_cached_with_behavior, compute_ops_estimate, hand_coded_optimizations, hash_post_codegen_ir,
+    optimize_kernel, optimize_kernel_with_config, optimize_kernel_with_config_and_final_rewrite,
     optimize_kernel_with_strategy, prepare_scheduler,
 };
 

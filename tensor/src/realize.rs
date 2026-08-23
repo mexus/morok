@@ -34,7 +34,9 @@
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 
-use svod_schedule::{Scheduler, apply_post_optimization_with_renderer, beam_search_cached, prepare_scheduler};
+use svod_schedule::{
+    Scheduler, apply_post_optimization_with_config, beam_search_cached_with_behavior, prepare_scheduler,
+};
 use tracing::{debug, trace};
 
 use crate::{
@@ -1624,6 +1626,7 @@ fn beam_search_optimize(
     optimizer_config: &svod_schedule::OptimizerConfig,
 ) -> Result<Arc<UOp>> {
     let beam_config = &optimizer_config.beam;
+    let post_optimizer_config = optimizer_config.clone();
     // Prepare scheduler (applies symbolic simplification and loop→global).
     // BEAM and heuristic are mutually exclusive.
     let scheduler = prepare_scheduler(ast, renderer).context(OptimizeSnafu)?;
@@ -1698,6 +1701,7 @@ fn beam_search_optimize(
         let bench_config_c = bench_config.clone();
         let max_uops_c = max_uops;
         let post_opt_cache_c = Arc::clone(&post_opt_cache);
+        let optimizer_config_c = post_optimizer_config.clone();
         let log_surpass_c = log_surpass;
         // Snapshot the applied-opts chain so the diagnostic line in the worker
         // thread can identify which BEAM branch triggered the drop without
@@ -1732,7 +1736,7 @@ fn beam_search_optimize(
                 let optimized = if let Some(cached) = cache_pin.get(&cache_key) {
                     cached.clone()
                 } else {
-                    let opt = match apply_post_optimization_with_renderer(raw_ast, &renderer_c) {
+                    let opt = match apply_post_optimization_with_config(raw_ast, &renderer_c, &optimizer_config_c) {
                         Ok(opt) => opt,
                         Err(e) => {
                             if log_surpass_c {
@@ -1938,7 +1942,12 @@ fn beam_search_optimize(
     // but the default hook prints them first.
     let prev_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(|_| {}));
-    let result = beam_search_cached(scheduler, beam_config, compile_and_time);
+    let behavior_fingerprint = {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        post_optimizer_config.hash(&mut hasher);
+        hasher.finish()
+    };
+    let result = beam_search_cached_with_behavior(scheduler, beam_config, behavior_fingerprint, compile_and_time);
     std::panic::set_hook(prev_hook);
     let result = result.context(OptimizeSnafu)?;
 
@@ -1953,7 +1962,7 @@ fn beam_search_optimize(
     // Apply post-optimization to final result with renderer so pm_add_gpudims runs
     // (Thread → core_id, Global → SPECIAL).
     let raw_ast = result.scheduler.get_optimized_ast(None);
-    apply_post_optimization_with_renderer(raw_ast, renderer).context(OptimizeSnafu)
+    apply_post_optimization_with_config(raw_ast, renderer, &post_optimizer_config).context(OptimizeSnafu)
 }
 
 #[cfg(test)]
