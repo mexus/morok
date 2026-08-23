@@ -223,16 +223,20 @@ impl KfdIface {
         if let Err(e) = unsafe { ioctl::kfd_create_event(kfd_fd.as_raw_fd(), &mut qe as *mut _) } {
             return Err(Error::AmdIoctl { ioctl: "AMDKFD_IOC_CREATE_EVENT(queue signal)", errno: e as i32 });
         }
+        let mut queue_event = EventGuard::new(kfd_fd.as_raw_fd(), qe.event_id);
         let mut mem_event =
             kfd::kfd_ioctl_create_event_args { event_type: kfd::KFD_IOC_EVENT_MEMORY, ..Default::default() };
         if let Err(e) = unsafe { ioctl::kfd_create_event(kfd_fd.as_raw_fd(), &mut mem_event as *mut _) } {
             return Err(Error::AmdIoctl { ioctl: "AMDKFD_IOC_CREATE_EVENT(mem fault)", errno: e as i32 });
         }
+        let mut memory_event = EventGuard::new(kfd_fd.as_raw_fd(), mem_event.event_id);
         let mut hw_event =
             kfd::kfd_ioctl_create_event_args { event_type: kfd::KFD_IOC_EVENT_HW_EXCEPTION, ..Default::default() };
         if let Err(e) = unsafe { ioctl::kfd_create_event(kfd_fd.as_raw_fd(), &mut hw_event as *mut _) } {
             return Err(Error::AmdIoctl { ioctl: "AMDKFD_IOC_CREATE_EVENT(hw fault)", errno: e as i32 });
         }
+        queue_event.disarm();
+        memory_event.disarm();
 
         // The mailbox sits at event_page + slot_index * 8. SDMA fence packets
         // write the queue event_id here to wake up `WAIT_EVENTS` from `sleep()`.
@@ -263,6 +267,29 @@ impl KfdIface {
             va: VaRegistry::default(),
             fault_logged: AtomicBool::new(false),
         })
+    }
+}
+
+struct EventGuard {
+    kfd_fd: i32,
+    event_id: Option<u32>,
+}
+
+impl EventGuard {
+    fn new(kfd_fd: i32, event_id: u32) -> Self {
+        Self { kfd_fd, event_id: Some(event_id) }
+    }
+
+    fn disarm(&mut self) {
+        self.event_id = None;
+    }
+}
+
+impl Drop for EventGuard {
+    fn drop(&mut self) {
+        let Some(event_id) = self.event_id else { return };
+        let mut args = kfd::kfd_ioctl_destroy_event_args { event_id, pad: 0 };
+        let _ = unsafe { ioctl::kfd_destroy_event(self.kfd_fd, &mut args as *mut _) };
     }
 }
 
@@ -324,12 +351,19 @@ impl AmdIface for KfdIface {
             n_devices: 1,
             n_success: 0,
         };
-        if let Err(e) = unsafe { ioctl::kfd_map_memory_to_gpu(self.kfd_fd.as_raw_fd(), &mut map_args as *mut _) } {
+        let map_result = unsafe { ioctl::kfd_map_memory_to_gpu(self.kfd_fd.as_raw_fd(), &mut map_args as *mut _) };
+        if let Err(e) = map_result {
+            if map_args.n_success != 0 {
+                self.unmap_kfd(mem_handle);
+            }
             self.free_kfd(mem_handle);
             unsafe { munmap(va as *mut _, size) };
             return Err(Error::AmdIoctl { ioctl: "AMDKFD_IOC_MAP_MEMORY_TO_GPU", errno: e as i32 });
         }
         if map_args.n_success != 1 {
+            if map_args.n_success != 0 {
+                self.unmap_kfd(mem_handle);
+            }
             self.free_kfd(mem_handle);
             unsafe { munmap(va as *mut _, size) };
             return Err(Error::AmdAllocFailed {
@@ -347,6 +381,7 @@ impl AmdIface for KfdIface {
                 // `zero_init && !cpu_access` request reaching this point is a
                 // caller bug (e.g. a future path that bypasses `_alloc`).
                 None => {
+                    self.unmap_kfd(mem_handle);
                     self.free_kfd(mem_handle);
                     unsafe { munmap(va as *mut _, size) };
                     return Err(Error::AmdAllocFailed {
@@ -535,6 +570,17 @@ impl AmdIface for KfdIface {
 }
 
 impl KfdIface {
+    fn unmap_kfd(&self, handle: u64) {
+        let mut gpu_id = self.node.gpu_id;
+        let mut args = kfd::kfd_ioctl_unmap_memory_from_gpu_args {
+            handle,
+            device_ids_array_ptr: &mut gpu_id as *mut _ as u64,
+            n_devices: 1,
+            n_success: 0,
+        };
+        let _ = unsafe { ioctl::kfd_unmap_memory_from_gpu(self.kfd_fd.as_raw_fd(), &mut args as *mut _) };
+    }
+
     fn free_kfd(&self, handle: u64) {
         let mut args = kfd::kfd_ioctl_free_memory_of_gpu_args { handle };
         // SAFETY: self.kfd_fd is alive; handle is from a successful alloc.

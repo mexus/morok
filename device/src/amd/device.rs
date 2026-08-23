@@ -56,6 +56,42 @@ pub(crate) struct EventPageState {
     pub(crate) size: usize,
 }
 
+struct EventPageAllocation<'a> {
+    kfd_fd: &'a OwnedFd,
+    state: EventPageState,
+    gpu_id: u32,
+    gpu_mapped: bool,
+    committed: bool,
+}
+
+impl EventPageAllocation<'_> {
+    fn commit(mut self) -> EventPageState {
+        self.committed = true;
+        self.state
+    }
+}
+
+impl Drop for EventPageAllocation<'_> {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        if self.gpu_mapped {
+            let mut gpu_id = self.gpu_id;
+            let mut args = kfd::kfd_ioctl_unmap_memory_from_gpu_args {
+                handle: self.state.handle,
+                device_ids_array_ptr: &mut gpu_id as *mut _ as u64,
+                n_devices: 1,
+                n_success: 0,
+            };
+            let _ = unsafe { ioctl::kfd_unmap_memory_from_gpu(self.kfd_fd.as_raw_fd(), &mut args as *mut _) };
+        }
+        unsafe { libc::munmap(self.state.va as *mut _, self.state.size) };
+        let mut args = kfd::kfd_ioctl_free_memory_of_gpu_args { handle: self.state.handle };
+        let _ = unsafe { ioctl::kfd_free_memory_of_gpu(self.kfd_fd.as_raw_fd(), &mut args as *mut _) };
+    }
+}
+
 /// Scratch backing memory + `COMPUTE_TMPRING_SIZE` packing. Held under a
 /// mutex on `PoolQueue` so [`PoolQueue::ensure_has_local_memory`](crate::amd::connector::PoolQueue::ensure_has_local_memory)
 /// can grow the scratch buffer when a freshly-loaded program demands more
@@ -567,24 +603,30 @@ pub(crate) fn ensure_event_page(kfd_fd: &OwnedFd, drm_fd: &OwnedFd, node: &AmdNo
         if let Err(e) = unsafe { ioctl::kfd_map_memory_to_gpu(kfd_fd.as_raw_fd(), &mut map_args as *mut _) } {
             return Err(Error::AmdIoctl { ioctl: "AMDKFD_IOC_MAP_MEMORY_TO_GPU(event page reuse)", errno: e as i32 });
         }
+        if map_args.n_success != 1 {
+            return Err(Error::AmdAllocFailed {
+                reason: format!("event-page reuse mapped to {} of 1 GPU(s)", map_args.n_success),
+            });
+        }
         return Ok(*ep);
     }
 
-    let (va, size, handle) = alloc_event_page(kfd_fd, drm_fd, node)?;
+    let allocation = alloc_event_page(kfd_fd, drm_fd, node)?;
     // Bind the page to this KFD process — only on first init.
-    let mut bind = kfd::kfd_ioctl_create_event_args { event_page_offset: handle, ..Default::default() };
+    let mut bind =
+        kfd::kfd_ioctl_create_event_args { event_page_offset: allocation.state.handle, ..Default::default() };
     if let Err(e) = unsafe { ioctl::kfd_create_event(kfd_fd.as_raw_fd(), &mut bind as *mut _) } {
         return Err(Error::AmdIoctl { ioctl: "AMDKFD_IOC_CREATE_EVENT(bind page)", errno: e as i32 });
     }
-    let ep = EventPageState { handle, va, size };
+    let ep = allocation.commit();
     *g = Some(ep);
     Ok(ep)
 }
 
 /// Allocate the 0x8000-byte event page (GTT-pinned, uncached, host-visible).
-/// Returns `(va, size, kfd_handle)`. The handle goes into the
-/// `event_page_offset` field of the bind `AMDKFD_IOC_CREATE_EVENT` call.
-fn alloc_event_page(kfd_fd: &OwnedFd, drm_fd: &OwnedFd, node: &AmdNode) -> Result<(u64, usize, u64)> {
+/// The returned guard unwinds the VA, GPU map, and KFD handle unless page
+/// binding commits it to process-global state.
+fn alloc_event_page<'a>(kfd_fd: &'a OwnedFd, drm_fd: &OwnedFd, node: &AmdNode) -> Result<EventPageAllocation<'a>> {
     use libc::{
         MAP_ANONYMOUS, MAP_FIXED, MAP_NORESERVE, MAP_PRIVATE, MAP_SHARED, PROT_NONE, PROT_READ, PROT_WRITE, mmap,
         munmap,
@@ -615,13 +657,19 @@ fn alloc_event_page(kfd_fd: &OwnedFd, drm_fd: &OwnedFd, node: &AmdNode) -> Resul
     }
     let handle = args.handle;
     let mmap_offset = args.mmap_offset;
+    let mut allocation = EventPageAllocation {
+        kfd_fd,
+        state: EventPageState { handle, va: va as u64, size },
+        gpu_id: node.gpu_id,
+        gpu_mapped: false,
+        committed: false,
+    };
 
     // Map host-visible via drm_fd at the reserved VA.
     let host = unsafe {
         mmap(va, size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, drm_fd.as_raw_fd(), mmap_offset as i64)
     };
     if host == libc::MAP_FAILED || !std::ptr::eq(host, va) {
-        unsafe { munmap(va, size) };
         return Err(Error::AmdAllocFailed { reason: "event-page host mmap failed".into() });
     }
 
@@ -633,12 +681,18 @@ fn alloc_event_page(kfd_fd: &OwnedFd, drm_fd: &OwnedFd, node: &AmdNode) -> Resul
         n_devices: 1,
         n_success: 0,
     };
-    if let Err(e) = unsafe { ioctl::kfd_map_memory_to_gpu(kfd_fd.as_raw_fd(), &mut map_args as *mut _) } {
-        unsafe { munmap(va, size) };
+    let map_result = unsafe { ioctl::kfd_map_memory_to_gpu(kfd_fd.as_raw_fd(), &mut map_args as *mut _) };
+    allocation.gpu_mapped = map_args.n_success != 0;
+    if let Err(e) = map_result {
         return Err(Error::AmdIoctl { ioctl: "AMDKFD_IOC_MAP_MEMORY_TO_GPU(event page)", errno: e as i32 });
     }
+    if map_args.n_success != 1 {
+        return Err(Error::AmdAllocFailed {
+            reason: format!("event page mapped to {} of 1 GPU(s)", map_args.n_success),
+        });
+    }
 
-    Ok((va as u64, size, handle))
+    Ok(allocation)
 }
 
 /// Allocate a scratch buffer sized for `private_segment_size` bytes per
