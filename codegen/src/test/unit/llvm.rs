@@ -1,9 +1,10 @@
 //! LLVM renderer tests for loop and reduction codegen.
 
 use smallvec::SmallVec;
-use svod_dtype::{DType, DeviceSpec};
-use svod_ir::{AxisId, AxisType, ConstValue, UOp};
+use svod_dtype::{AddrSpace, DType, DeviceSpec};
+use svod_ir::{AxisId, AxisType, ConstValue, Op, UOp};
 
+use crate::llvm::common::lconst;
 use crate::llvm::text::render;
 
 fn render_linearized(root: &std::sync::Arc<UOp>, name: Option<&str>) -> crate::Result<crate::RenderedKernel> {
@@ -13,7 +14,7 @@ fn render_linearized(root: &std::sync::Arc<UOp>, name: Option<&str>) -> crate::R
 
 #[test]
 fn test_render_linear_input_succeeds() {
-    let sink = UOp::sink(vec![UOp::native_const(1.0f32)]);
+    let sink = UOp::sink(vec![UOp::const_(DType::Float32, ConstValue::Float(1.0))]);
     let linear = UOp::linear(svod_schedule::linearize_with_cfg(sink.clone()).into());
 
     let rendered = render(&linear, Some("test_linear")).expect("LLVM codegen from LINEAR should succeed");
@@ -21,9 +22,42 @@ fn test_render_linear_input_succeeds() {
 }
 
 #[test]
+fn llvm_constants_use_committed_storage_bits() {
+    let half = UOp::const_(DType::Float16, ConstValue::Float(1.0 / 123_008.0));
+    let Op::Const(half) = half.op() else { unreachable!() };
+    assert_eq!(lconst(&half.0, &DType::Float16), "0xH0088");
+
+    let fp8 = UOp::const_(DType::FP8E4M3, ConstValue::Float(1.1875));
+    let Op::Const(fp8) = fp8.op() else { unreachable!() };
+    assert_eq!(lconst(&fp8.0, &DType::FP8E4M3), "58");
+}
+
+#[test]
+fn grouped_shrink_renders_single_vector_load_and_store() {
+    let shrink = |src| {
+        UOp::new(
+            Op::Shrink {
+                src,
+                offsets: UOp::const_(DType::Int32, ConstValue::Int(0)),
+                sizes: UOp::const_(DType::Int32, ConstValue::Int(4)),
+            },
+            DType::Float32,
+        )
+    };
+    let output = shrink(UOp::param(0, 8, DType::Float32, None));
+    let input = shrink(UOp::param(1, 8, DType::Float32, None));
+    let sink = UOp::sink(vec![output.store(UOp::load().index(input).call())]);
+
+    let rendered = render_linearized(&sink, Some("grouped_memory")).expect("render grouped LLVM memory");
+    assert_eq!(rendered.code.matches("load <4 x float>").count(), 1, "{}", rendered.code);
+    assert_eq!(rendered.code.matches("store <4 x float>").count(), 1, "{}", rendered.code);
+}
+
+#[test]
 fn test_render_rejects_non_linear_inputs() {
-    let sink = UOp::sink(vec![UOp::native_const(1.0f32)]);
-    let program = UOp::program(sink.clone(), UOp::device(DeviceSpec::Cpu), None, None, None);
+    let sink = UOp::sink(vec![UOp::const_(DType::Float32, ConstValue::Float(1.0))]);
+    let info = svod_ir::ProgramInfo::from_sink(&sink, DeviceSpec::Cpu);
+    let program = UOp::program(sink.clone(), info, None, None, None);
 
     let err = render(&program, Some("test_program_input")).expect_err("PROGRAM input must fail");
     assert!(format!("{err}").contains("expects LINEAR input"), "unexpected error: {err:?}");
@@ -43,8 +77,11 @@ fn test_render_rejects_non_linear_inputs() {
 #[test]
 fn test_range_end_basic() {
     // Create range: for i in 0..10
-    let end = UOp::const_(DType::Index, ConstValue::Int(10));
-    let range = UOp::range_axis(end, AxisId::Renumbered(0), AxisType::Loop);
+    let end = UOp::const_(DType::Int64, ConstValue::Int(10));
+    let range = UOp::new(
+        Op::Range { end, axis_id: AxisId::Renumbered(0), axis_type: AxisType::Loop, deps: SmallVec::new() },
+        DType::Int64,
+    );
 
     // Create a NOOP as the computation (empty loop body)
     let noop = UOp::noop();
@@ -87,8 +124,7 @@ fn test_range_end_basic() {
 /// return acc;  // should be 50.0
 #[test]
 fn test_multi_index_requires_linearization() {
-    let ptr_dtype = DType::Float32.ptr(None, svod_dtype::AddrSpace::Global).unwrap();
-    let buffer = UOp::param(0, 1024, ptr_dtype, None);
+    let buffer = UOp::param(0, 1024, DType::Float32, None);
     let i = UOp::const_(DType::Index, ConstValue::Int(1));
     let j = UOp::const_(DType::Index, ConstValue::Int(2));
     let index = UOp::index().buffer(buffer).indices(vec![i, j]).call().unwrap();
@@ -101,6 +137,32 @@ fn test_multi_index_requires_linearization() {
         matches!(&err, crate::Error::InvalidGraph { reason } if reason.contains("linearized INDEX")),
         "expected InvalidGraph(linearized INDEX), got {err:?}",
     );
+}
+
+#[test]
+fn shaped_reg_index_renders_as_memory_load() {
+    let reg = UOp::buffer(0, 4, DType::Float32, AddrSpace::Reg, None);
+    let index = UOp::index().buffer(reg).indices(vec![UOp::const_(DType::Int32, ConstValue::Int(2))]).call().unwrap();
+    let sink = UOp::sink(vec![UOp::load().index(index).call()]);
+
+    let result = render_linearized(&sink, Some("shaped_reg_load")).unwrap();
+    assert!(result.code.contains("getelementptr inbounds float, ptr %reg0, i32 2"), "{}", result.code);
+    assert!(result.code.contains("load float, ptr"), "{}", result.code);
+    assert!(!result.code.contains("extractelement <4 x float> %reg0"), "{}", result.code);
+}
+
+#[test]
+fn shaped_reg_after_index_renders_as_memory_load() {
+    let reg = UOp::buffer(0, 4, DType::Float32, AddrSpace::Reg, None);
+    let after = reg.after(smallvec::smallvec![UOp::noop()]);
+    assert_eq!(after.addrspace(), Some(AddrSpace::Reg));
+    let index = UOp::index().buffer(after).indices(vec![UOp::const_(DType::Int32, ConstValue::Int(2))]).call().unwrap();
+    let sink = UOp::sink(vec![UOp::load().index(index).call()]);
+
+    let result = render_linearized(&sink, Some("shaped_reg_after_load")).unwrap();
+    assert!(result.code.contains("getelementptr inbounds float, ptr %reg0, i32 2"), "{}", result.code);
+    assert!(result.code.contains("load float, ptr"), "{}", result.code);
+    assert!(!result.code.contains("extractelement <4 x float> %reg0"), "{}", result.code);
 }
 
 #[test]

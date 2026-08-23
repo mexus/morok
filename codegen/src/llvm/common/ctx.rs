@@ -16,13 +16,13 @@ pub struct RenderContext {
     counter: usize,
     /// Stack of currently open RANGE axis_ids (for correct END footer ordering).
     /// Pushed on RANGE emission, popped on END emission.
-    range_stack: Vec<usize>,
+    range_stack: Vec<String>,
     /// Side-channel error set by `render_uop` when it detects a graph invariant
     /// violation. The render loop drains this after each call and propagates as
     /// a typed [`crate::Error`].
     pending_error: Option<crate::Error>,
     /// Module-level LLVM IR lines that must be emitted *before* `define`. Used
-    /// by AMD's `Op::DefineLocal` to emit `@local_N = addrspace(3) global ...`
+    /// by AMD LOCAL BUFFER rendering to emit `@local_N = addrspace(3) global ...`
     /// declarations, which cannot be expressed inline in the function body.
     module_prefix: Vec<String>,
 }
@@ -39,7 +39,7 @@ impl RenderContext {
     }
 
     /// Append a line to the module-level prefix block. Used by AMD's
-    /// `Op::DefineLocal` to emit `@local_N = ... addrspace(3) global ...`.
+    /// LOCAL BUFFERs to emit `@local_N = ... addrspace(3) global ...`.
     pub fn push_module_prefix(&mut self, line: impl Into<String>) {
         self.module_prefix.push(line.into());
     }
@@ -83,16 +83,18 @@ impl RenderContext {
             Op::Const(cv) => lconst(&cv.0, &uop.dtype()),
             Op::VConst { values } => self.render_vconst(values, uop),
             Op::Param { arg, .. } => format!("%data{}", arg.slot),
-            Op::DefineLocal(id) => format!("%local{id}"),
+            Op::Buffer { arg, .. } if arg.addrspace == Some(svod_ir::AddrSpace::Local) => {
+                format!("%local{}", arg.slot)
+            }
             Op::DefineVar { name, .. } => format!("%{name}"),
-            Op::DefineReg { .. } => {
+            Op::Buffer { arg, .. } if arg.addrspace == Some(svod_ir::AddrSpace::Reg) => {
                 let n = format!("%reg{}", self.counter);
                 self.counter += 1;
                 n
             }
             Op::Range { axis_id, .. } => {
                 // Range variables are named by axis_id
-                format!("%r{}", axis_id.value())
+                format!("%r{}", axis_id.name())
             }
             _ => {
                 let n = format!("%v{}", self.counter);
@@ -159,13 +161,27 @@ impl RenderContext {
     }
 
     /// Push a range axis_id onto the open-range stack (called during RANGE codegen).
-    pub fn push_range(&mut self, axis_id: usize) {
+    pub fn push_range(&mut self, axis_id: String) {
         self.range_stack.push(axis_id);
     }
 
-    /// Pop the innermost open range axis_id (called during END codegen).
-    pub fn pop_range(&mut self) -> Option<usize> {
-        self.range_stack.pop()
+    /// Close the exact innermost range named by END.
+    pub fn close_range(&mut self, expected: &str) -> bool {
+        match self.range_stack.pop() {
+            Some(actual) if actual == expected => true,
+            Some(actual) => {
+                self.set_invalid_graph(format!("END closes range {expected}, but innermost open range is {actual}"));
+                false
+            }
+            None => {
+                self.set_invalid_graph(format!("END closes range {expected}, but no range is open"));
+                false
+            }
+        }
+    }
+
+    pub fn open_ranges(&self) -> &[String] {
+        &self.range_stack
     }
 }
 

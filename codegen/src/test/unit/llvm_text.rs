@@ -1,23 +1,52 @@
 use svod_dtype::{AddrSpace, AmdArch, DType};
-use svod_ir::{BinaryOp, ConstValue, Op, RendererDevice, WmmaMetadata, WmmaUpcastAxes};
+use svod_ir::{AxisId, AxisType, BinaryOp, ConstValue, Op, RendererDevice, WmmaMetadata, WmmaUpcastAxes};
 
 use super::*;
 use crate::Renderer;
 use crate::llvm::LlvmTextRenderer;
 
+fn slotted_var(name: &str, slot: usize) -> std::sync::Arc<UOp> {
+    let var = UOp::variable(name.to_string(), 0, 16, DType::Int32);
+    let Op::Param { shape, arg } = var.op() else { unreachable!() };
+    let mut arg = arg.clone();
+    arg.slot = slot;
+    UOp::new(Op::Param { shape: shape.clone(), arg }, DType::Int32)
+}
+
+#[test]
+fn llvm_signature_uses_canonical_mixed_param_slot_order() {
+    let sink = UOp::sink(vec![
+        slotted_var("high", 3),
+        UOp::param(2, 1, DType::Float32, None),
+        slotted_var("low", 1),
+        UOp::param(0, 1, DType::Float32, None),
+    ]);
+    let linear = UOp::linear(svod_schedule::linearize_with_cfg(sink).into());
+    let rendered = render(&linear, Some("mixed_abi")).expect("render mixed ABI");
+    assert_eq!(rendered.buffer_args.iter().map(|arg| arg.index).collect::<Vec<_>>(), vec![0, 2]);
+    assert_eq!(rendered.var_names, vec!["low", "high"]);
+    assert!(
+        rendered.code.contains(
+            "define void @mixed_abi(ptr noalias align 32 %data0, i32 %data1, ptr noalias align 32 %data2, i32 %data3)"
+        ),
+        "{}",
+        rendered.code
+    );
+}
+
 #[test]
 fn test_simple_add() {
-    let a = UOp::param(0, 1, DType::Float32.ptr(Some(1), AddrSpace::Global).unwrap(), None);
-    let b = UOp::param(1, 1, DType::Float32.ptr(Some(1), AddrSpace::Global).unwrap(), None);
-    let out = UOp::param(2, 1, DType::Float32.ptr(Some(1), AddrSpace::Global).unwrap(), None);
+    let a = UOp::param(0, 1, DType::Float32, None);
+    let b = UOp::param(1, 1, DType::Float32, None);
+    let out = UOp::param(2, 1, DType::Float32, None);
 
-    let idx = UOp::index_const(0);
+    let idx = UOp::const_(DType::Int32, ConstValue::Int(0));
     let a_idx = UOp::index().buffer(a.clone()).indices(vec![idx.clone()]).call().unwrap();
     let b_idx = UOp::index().buffer(b.clone()).indices(vec![idx.clone()]).call().unwrap();
     let out_idx = UOp::index().buffer(out.clone()).indices(vec![idx.clone()]).call().unwrap();
 
-    let a_load = UOp::load().buffer(a.clone()).index(a_idx).call();
-    let b_load = UOp::load().buffer(b.clone()).index(b_idx).call();
+    let a_load = UOp::load().index(a_idx).call();
+    let b_load = UOp::load().index(b_idx).call();
 
     let add = UOp::new(Op::Binary(BinaryOp::Add, a_load, b_load), DType::Float32);
 
@@ -37,6 +66,33 @@ fn test_simple_add() {
     assert!(result.code.contains("store"));
 }
 
+#[test]
+fn llvm_rejects_end_for_non_innermost_range() {
+    let bound = UOp::const_(DType::Int32, ConstValue::Int(2));
+    let outer = UOp::range_axis_dtype(bound.clone(), AxisId::Renumbered(0), AxisType::Loop, DType::Int32);
+    let inner = UOp::range_axis_dtype(bound, AxisId::Renumbered(1), AxisType::Loop, DType::Int32);
+    let zero = UOp::native_const(0i32);
+    let end_outer = zero.end(smallvec::smallvec![outer.clone()]);
+    let linear = UOp::linear(smallvec::smallvec![outer.op().sources()[0].clone(), zero, outer, inner, end_outer]);
+
+    let err = render(&linear, Some("bad_end_order")).expect_err("mismatched END must fail");
+    assert!(format!("{err}").contains("innermost open range"), "unexpected error: {err}");
+}
+
+#[test]
+fn llvm_rejects_unclosed_range() {
+    let range = UOp::range_axis_dtype(
+        UOp::const_(DType::Int32, ConstValue::Int(2)),
+        AxisId::Renumbered(0),
+        AxisType::Loop,
+        DType::Int32,
+    );
+    let linear = UOp::linear(smallvec::smallvec![range.op().sources()[0].clone(), range]);
+
+    let err = render(&linear, Some("unclosed_range")).expect_err("unclosed RANGE must fail");
+    assert!(format!("{err}").contains("unclosed LLVM ranges"), "unexpected error: {err}");
+}
+
 // ── AMD target tests ───────────────────────────────────────────────────────
 //
 // These exercise the AMDLLVMRenderer codegen path without invoking clang.
@@ -44,16 +100,23 @@ fn test_simple_add() {
 // gated on Phase 2 and verified separately.
 
 fn render_amd_linearized(root: &std::sync::Arc<svod_ir::UOp>, arch: AmdArch, name: &str) -> crate::RenderedKernel {
-    let linear = svod_ir::UOp::linear(svod_schedule::linearize_with_cfg(root.clone()).into());
-    LlvmTextRenderer::amd(arch).render(&linear, Some(name)).expect("AMD render")
+    let code_renderer = LlvmTextRenderer::amd(arch);
+    let optimizer_renderer = svod_schedule::OptimizerRenderer::for_amd_arch(arch).with_rewrite_capabilities(
+        svod_ir::RendererOps::all(),
+        code_renderer.decompositor(),
+        None,
+    );
+    let lowered = svod_schedule::apply_post_optimization_with_renderer(root.clone(), &optimizer_renderer);
+    let linear = svod_ir::UOp::linear(svod_schedule::linearize_with_cfg(lowered).into());
+    code_renderer.render(&linear, Some(name)).expect("AMD render")
 }
 
 #[test]
 fn amd_emits_kernel_abi_and_target_triple() {
-    let p = UOp::param(0, 1, DType::Float32.ptr(Some(1), AddrSpace::Global).unwrap(), None);
-    let idx = UOp::index_const(0);
+    let p = UOp::param(0, 1, DType::Float32, None);
+    let idx = UOp::const_(DType::Int32, ConstValue::Int(0));
     let p_idx = UOp::index().buffer(p.clone()).indices(vec![idx]).call().unwrap();
-    let store = p_idx.store(UOp::native_const(1.0f32));
+    let store = p_idx.store(UOp::const_(DType::Float32, ConstValue::Float(1.0)));
     let sink = UOp::sink(vec![store]);
 
     let result = render_amd_linearized(&sink, AmdArch::Gfx1100, "amd_smoke");
@@ -70,16 +133,39 @@ fn amd_emits_kernel_abi_and_target_triple() {
 }
 
 #[test]
+fn amd_uses_ocml_and_contract_only_float_flags() {
+    let input = UOp::param(0, 1, DType::Float32, None);
+    let output = UOp::param(1, 1, DType::Float32, None);
+    let idx = UOp::const_(DType::Int32, ConstValue::Int(0));
+    let input_idx = UOp::index().buffer(input).indices(vec![idx.clone()]).call().unwrap();
+    let output_idx = UOp::index().buffer(output).indices(vec![idx]).call().unwrap();
+    let value = UOp::load().index(input_idx).call();
+    let result = value.try_exp2().unwrap().try_div(&value).unwrap();
+    let sink = UOp::sink(vec![output_idx.store(result)]);
+
+    let rendered = render_amd_linearized(&sink, AmdArch::Gfx1151, "amd_float_flags");
+
+    assert!(
+        rendered.code.contains("declare float @__ocml_exp2_f32(float)"),
+        "missing OCML declaration:\n{}",
+        rendered.code
+    );
+    assert!(rendered.code.contains("call float @__ocml_exp2_f32"), "missing OCML call:\n{}", rendered.code);
+    assert!(rendered.code.contains("fdiv contract float"), "missing contract-only fdiv:\n{}", rendered.code);
+    assert!(!rendered.code.contains(" arcp "), "AMD must not permit approximate reciprocal:\n{}", rendered.code);
+}
+
+#[test]
 fn amd_special_emits_workgroup_workitem_intrinsics() {
     // y[gidx0] = x[lidx0]
-    let x = UOp::param(0, 1, DType::Float32.ptr(Some(1), AddrSpace::Global).unwrap(), None);
-    let y = UOp::param(1, 1, DType::Float32.ptr(Some(1), AddrSpace::Global).unwrap(), None);
+    let x = UOp::param(0, 1, DType::Float32, None);
+    let y = UOp::param(1, 1, DType::Float32, None);
 
-    let g = UOp::special(UOp::index_const(8), "gidx0".to_string());
-    let l = UOp::special(UOp::index_const(4), "lidx0".to_string());
+    let g = UOp::special(UOp::const_(DType::Int32, ConstValue::Int(8)), "gidx0".to_string());
+    let l = UOp::special(UOp::const_(DType::Int32, ConstValue::Int(4)), "lidx0".to_string());
 
     let x_idx = UOp::index().buffer(x.clone()).indices(vec![l]).call().unwrap();
-    let load = UOp::load().buffer(x.clone()).index(x_idx).call();
+    let load = UOp::load().index(x_idx).call();
 
     let y_idx = UOp::index().buffer(y.clone()).indices(vec![g]).call().unwrap();
     let store = y_idx.store(load);
@@ -130,8 +216,8 @@ fn amd_barrier_emits_fence_and_s_barrier() {
 
 #[test]
 fn amd_define_local_emits_addrspace3_module_global() {
-    // DefineLocal with size=16, base=f32 → @local<id> addrspace(3) global
-    let local = UOp::new(Op::DefineLocal(42), DType::Float32.ptr(Some(16), AddrSpace::Local).unwrap());
+    // LOCAL BUFFER with size=16, base=f32 -> @local<slot> addrspace(3) global
+    let local = UOp::buffer(42, 16, DType::Float32, AddrSpace::Local, None);
     let sink = UOp::sink(vec![local]);
     let result = render_amd_linearized(&sink, AmdArch::Gfx1100, "amd_lds");
     println!("{}", result.code);
@@ -155,7 +241,11 @@ fn wmma_f16_f32_metadata() -> WmmaMetadata {
         dtype_out: DType::Float32,
         device: RendererDevice::AppleAmx, // unused by the AMD path (keyed on `arch`)
         threads: 32,
-        upcast_axes: WmmaUpcastAxes { a: vec![(2, 16)], b: vec![(2, 16)], c: vec![(2, 8)] },
+        upcast_axes: Some(WmmaUpcastAxes {
+            a: vec![(svod_ir::AxisId::Renumbered(2), 16)],
+            b: vec![(svod_ir::AxisId::Renumbered(2), 16)],
+            c: vec![(svod_ir::AxisId::Renumbered(2), 8)],
+        }),
         reduce_axes: vec![],
         tile_grid: (1, 1),
     }
@@ -209,7 +299,11 @@ fn cpu_amx_f32_metadata() -> WmmaMetadata {
         dtype_out: DType::Float32,
         device: RendererDevice::AppleAmx,
         threads: 1,
-        upcast_axes: WmmaUpcastAxes { a: vec![(2, 256)], b: vec![(2, 256)], c: vec![(2, 256)] },
+        upcast_axes: Some(WmmaUpcastAxes {
+            a: vec![(svod_ir::AxisId::Renumbered(2), 256)],
+            b: vec![(svod_ir::AxisId::Renumbered(2), 256)],
+            c: vec![(svod_ir::AxisId::Renumbered(2), 256)],
+        }),
         reduce_axes: vec![],
         tile_grid: (1, 1),
     }
@@ -224,13 +318,11 @@ fn cpu_amx_f32_metadata() -> WmmaMetadata {
 // operand bitcasts.
 
 fn wmma_buf_load(slot: usize, dt: DType) -> std::sync::Arc<svod_ir::UOp> {
-    let p = UOp::param(slot, 1, dt.ptr(Some(1), AddrSpace::Global).unwrap(), None);
-    let idx = UOp::index_const(0);
-    // `ptr(true)` keeps the INDEX result a `ptr` (as the devectorizer does for
-    // LOAD sources), so the load renders `load <ty>, ptr %p` — not the
-    // `load <ty>, <ty> %p` that the bare element-typed default would emit.
-    let p_idx = UOp::index().buffer(p.clone()).indices(vec![idx]).ptr(true).call().unwrap();
-    UOp::load().buffer(p).index(p_idx).call()
+    let p = UOp::param(slot, 1, dt, None);
+    let idx = UOp::const_(DType::Int32, ConstValue::Int(0));
+    // PARAM and INDEX both carry the storage dtype; INDEX renders as an address.
+    let p_idx = UOp::index().buffer(p.clone()).indices(vec![idx]).call().unwrap();
+    UOp::load().index(p_idx).call()
 }
 
 fn wmma_meta(dims: (usize, usize, usize), in_dt: DType, out_dt: DType, c_count: usize) -> WmmaMetadata {
@@ -241,7 +333,11 @@ fn wmma_meta(dims: (usize, usize, usize), in_dt: DType, out_dt: DType, c_count: 
         dtype_out: out_dt,
         device: RendererDevice::AppleAmx, // unused by the AMD path (keyed on `arch`)
         threads: 32,
-        upcast_axes: WmmaUpcastAxes { a: vec![(2, 16)], b: vec![(2, 16)], c: vec![(2, c_count)] },
+        upcast_axes: Some(WmmaUpcastAxes {
+            a: vec![(svod_ir::AxisId::Renumbered(2), 16)],
+            b: vec![(svod_ir::AxisId::Renumbered(2), 16)],
+            c: vec![(svod_ir::AxisId::Renumbered(2), c_count)],
+        }),
         reduce_axes: vec![],
         tile_grid: (1, 1),
     }
@@ -296,6 +392,37 @@ fn amd_wmma_bf16_f32_ssa_assembles() {
 }
 
 #[test]
+fn amd_gfx12_f16_wmma_compiles() {
+    let meta = wmma_meta((16, 16, 16), DType::Float16, DType::Float32, 8);
+    let sink = wmma_ssa_sink(DType::Float16, 8, DType::Float32, 8, meta);
+    for arch in [AmdArch::Gfx1200, AmdArch::Gfx1201] {
+        let result = render_amd_linearized(&sink, arch, "amd_gfx12_wmma_f16");
+        assert!(
+            result.code.contains("@llvm.amdgcn.wmma.f32.16x16x16.f16.v8f32.v8f16(<8 x half>, <8 x half>, <8 x float>)"),
+            "gfx12 WMMA must use LLVM's overloaded vector suffixes:\n{}",
+            result.code
+        );
+        assert_llvm_ir_assembles(&result.code);
+        assert_amd_ir_compiles(&result.code, arch.mcpu());
+    }
+}
+
+#[test]
+fn amd_gfx1201_direct_fp8_wmma_is_rejected() {
+    let meta = wmma_meta((16, 16, 16), DType::FP8E4M3, DType::Float32, 8);
+    let sink = wmma_ssa_sink(DType::FP8E4M3, 8, DType::Float32, 8, meta);
+    let linear = UOp::linear(svod_schedule::linearize_with_cfg(sink).into());
+    let err = svod_codegen_renderer(&linear, AmdArch::Gfx1201)
+        .expect_err("pinned Tinygrad RDNA4 table has no native FP8 WMMA");
+    assert!(err.to_string().contains("no WMMA/MFMA intrinsic for arch=gfx1201"), "unexpected error: {err}");
+}
+
+fn svod_codegen_renderer(linear: &std::sync::Arc<svod_ir::UOp>, arch: AmdArch) -> crate::Result<crate::RenderedKernel> {
+    use crate::Renderer;
+    crate::llvm::LlvmTextRenderer::amd(arch).render(linear, Some("amd_direct_fp8"))
+}
+
+#[test]
 fn amd_wmma_bf16_bf16_bitcasts_result() {
     // bf16 accumulator: all three operands go as i16 and the i16 result is
     // bitcast back to bf16 (tinygrad llvmir.py:292-294).
@@ -345,16 +472,38 @@ fn amd_wmma_fp8_packs_operands_to_i64() {
     // → uint64). MFMA carries the trailing cbsz/abid/blgp immediates.
     let meta = wmma_meta((16, 16, 32), DType::FP8E4M3, DType::Float32, 4);
     let sink = wmma_ssa_sink(DType::FP8E4M3, 8, DType::Float32, 4, meta);
-    let result = render_amd_linearized(&sink, AmdArch::Gfx942, "amd_wmma_fp8");
+    for arch in [AmdArch::Gfx942, AmdArch::Gfx950] {
+        let result = render_amd_linearized(&sink, arch, "amd_wmma_fp8");
+        println!("{}", result.code);
+        assert!(
+            result.code.contains("bitcast <8 x i8>") && result.code.contains(" to i64"),
+            "fp8 operands must pack into i64 on {arch}:\n{}",
+            result.code
+        );
+        assert!(
+            result.code.contains("(i64, i64, <4 x float>, i32, i32, i32)"),
+            "fp8 MFMA declaration wrong on {arch}:\n{}",
+            result.code
+        );
+        assert_llvm_ir_assembles(&result.code);
+    }
+}
+
+#[test]
+fn amd_wmma_gfx950_scaled_fp8_uses_i32_vectors_and_scale_immediates() {
+    let meta = wmma_meta((16, 16, 128), DType::FP8E5M2, DType::Float32, 4);
+    let sink = wmma_ssa_sink(DType::FP8E5M2, 32, DType::Float32, 4, meta);
+    let result = render_amd_linearized(&sink, AmdArch::Gfx950, "amd_wmma_scaled_fp8");
     println!("{}", result.code);
     assert!(
-        result.code.contains("bitcast <8 x i8>") && result.code.contains(" to i64"),
-        "fp8 operands must pack into i64:\n{}",
+        result.code.contains("bitcast <32 x i8>") && result.code.contains("to <8 x i32>"),
+        "scaled FP8 operands must pack as eight i32 words:\n{}",
         result.code
     );
     assert!(
-        result.code.contains("(i64, i64, <4 x float>, i32, i32, i32)"),
-        "fp8 MFMA declaration wrong:\n{}",
+        result.code.contains("@llvm.amdgcn.mfma.scale.f32.16x16x128.f8f6f4(")
+            && result.code.contains("i32 1, i32 1, i32 0, i32 127, i32 0, i32 127)"),
+        "scaled BF8 MFMA signature/immediates are wrong:\n{}",
         result.code
     );
     assert_llvm_ir_assembles(&result.code);
@@ -413,16 +562,59 @@ fn assert_llvm_ir_assembles(ir: &str) {
     assert!(ok, "llvm-as rejected the emitted AMD IR:\n{ir}\n--- llvm-as stderr ---\n{stderr}");
 }
 
+fn assert_amd_ir_compiles(ir: &str, arch: &str) {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let has_target =
+        Command::new("clang").arg("--print-targets").output().ok().filter(|out| out.status.success()).is_some_and(
+            |out| String::from_utf8_lossy(&out.stdout).lines().any(|line| line.trim_start().starts_with("amdgcn")),
+        );
+    if !has_target {
+        eprintln!("skipping gfx12 compile test: clang has no AMDGPU target");
+        return;
+    }
+
+    let mcpu = format!("-mcpu={arch}");
+    let mut child = Command::new("clang")
+        .args([
+            "-x",
+            "ir",
+            "-c",
+            "-O2",
+            "--target=amdgcn-amd-amdhsa",
+            &mcpu,
+            "-nogpulib",
+            "-nogpuinc",
+            "-Wno-override-module",
+            "-",
+            "-o",
+            "/dev/null",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn clang");
+    child.stdin.take().unwrap().write_all(ir.as_bytes()).expect("write AMD IR");
+    let output = child.wait_with_output().expect("wait for clang");
+    assert!(
+        output.status.success(),
+        "clang rejected emitted {arch} IR:\n{}\n{ir}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 #[test]
 fn test_custom_typed_statement_emits_ssa_assignment() {
     // A typed CUSTOM renders the RHS of an SSA assignment (`%v = <rhs>`); the
     // LLVM type lives in the RHS, so the template is a full instruction RHS.
-    let a = UOp::param(0, 1, DType::Float32.ptr(Some(1), AddrSpace::Global).unwrap(), None);
-    let out = UOp::param(1, 1, DType::Float32.ptr(Some(1), AddrSpace::Global).unwrap(), None);
-    let idx = UOp::index_const(0);
+    let a = UOp::param(0, 1, DType::Float32, None);
+    let out = UOp::param(1, 1, DType::Float32, None);
+    let idx = UOp::const_(DType::Int32, ConstValue::Int(0));
     let a_idx = UOp::index().buffer(a.clone()).indices(vec![idx.clone()]).call().unwrap();
     let out_idx = UOp::index().buffer(out.clone()).indices(vec![idx.clone()]).call().unwrap();
-    let a_load = UOp::load().buffer(a.clone()).index(a_idx).call();
+    let a_load = UOp::load().index(a_idx).call();
     let custom = UOp::custom(smallvec::smallvec![a_load], "fmul float {0}, 2.0".to_string(), DType::Float32);
     let store = out_idx.store(custom);
     let sink = UOp::sink(vec![store]);
@@ -438,8 +630,8 @@ fn test_custom_typed_statement_emits_ssa_assignment() {
 fn test_customi_inline_is_substituted_into_consumer() {
     // CUSTOMI registers its formatted text as an operand and is inlined into
     // consumers rather than emitted as its own instruction.
-    let out = UOp::param(0, 1, DType::Float32.ptr(Some(1), AddrSpace::Global).unwrap(), None);
-    let idx = UOp::index_const(0);
+    let out = UOp::param(0, 1, DType::Float32, None);
+    let idx = UOp::const_(DType::Int32, ConstValue::Int(0));
     let out_idx = UOp::index().buffer(out.clone()).indices(vec![idx.clone()]).call().unwrap();
     let inline = UOp::customi(smallvec::SmallVec::new(), "4.0".to_string(), DType::Float32);
     let store = out_idx.store(inline);
@@ -455,8 +647,8 @@ fn test_customi_inline_is_substituted_into_consumer() {
 fn test_custom_void_hoists_declare_to_module_prefix_amd() {
     // A Void CUSTOM emits raw IR lines; any `declare` is hoisted (deduplicated)
     // to the module prefix so custom bodies can reference arbitrary intrinsics.
-    let out = UOp::param(0, 1, DType::Float32.ptr(Some(1), AddrSpace::Global).unwrap(), None);
-    let idx = UOp::index_const(0);
+    let out = UOp::param(0, 1, DType::Float32, None);
+    let idx = UOp::const_(DType::Int32, ConstValue::Int(0));
     let out_idx = UOp::index().buffer(out.clone()).indices(vec![idx.clone()]).call().unwrap();
     let one = UOp::const_(DType::Float32, ConstValue::Float(1.0));
     let store = out_idx.store(one);

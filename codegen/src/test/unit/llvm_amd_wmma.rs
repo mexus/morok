@@ -76,7 +76,55 @@ fn rdna3_wmma_naming() {
 fn rdna4_fp8_wmma_naming() {
     let name =
         resolve_intrinsic(AmdArch::Gfx1201, Some(ScalarDType::FP8E4M3), Some(ScalarDType::Float32), (16, 16, 16));
-    assert_eq!(name.as_deref(), Some("llvm.amdgcn.wmma.f32.16x16x16.fp8.fp8"));
+    assert!(name.is_none());
+}
+
+#[test]
+fn rdna4_uses_llvm_overloaded_wmma_names() {
+    assert_eq!(
+        resolve_intrinsic(AmdArch::Gfx1201, Some(ScalarDType::Float16), Some(ScalarDType::Float32), (16, 16, 16))
+            .as_deref(),
+        Some("llvm.amdgcn.wmma.f32.16x16x16.f16.v8f32.v8f16")
+    );
+    assert_eq!(
+        resolve_intrinsic(AmdArch::Gfx1201, Some(ScalarDType::BFloat16), Some(ScalarDType::BFloat16), (16, 16, 16))
+            .as_deref(),
+        Some("llvm.amdgcn.wmma.bf16.16x16x16.bf16.v8i16.v8i16")
+    );
+}
+
+#[test]
+fn fp8_intrinsics_follow_architecture_tables() {
+    assert_eq!(
+        resolve_intrinsic(AmdArch::Gfx942, Some(ScalarDType::FP8E4M3), Some(ScalarDType::Float32), (16, 16, 32))
+            .as_deref(),
+        Some("llvm.amdgcn.mfma.f32.16x16x32.fp8.fp8")
+    );
+    assert!(
+        resolve_intrinsic(AmdArch::Gfx942, Some(ScalarDType::FP8E4M3), Some(ScalarDType::Float32), (16, 16, 128))
+            .is_none(),
+        "gfx942 has no scaled K=128 MFMA"
+    );
+    assert_eq!(
+        resolve_intrinsic(AmdArch::Gfx950, Some(ScalarDType::FP8E4M3), Some(ScalarDType::Float32), (16, 16, 128))
+            .as_deref(),
+        Some("llvm.amdgcn.mfma.scale.f32.16x16x128.f8f6f4")
+    );
+    assert!(
+        resolve_intrinsic(AmdArch::Gfx950, Some(ScalarDType::FP8E4M3), Some(ScalarDType::Float32), (16, 16, 32))
+            .is_some(),
+        "gfx950 retains the unscaled K=32 FP8 MFMA"
+    );
+    assert!(
+        resolve_intrinsic(AmdArch::Gfx1151, Some(ScalarDType::FP8E4M3), Some(ScalarDType::Float32), (16, 16, 16))
+            .is_none(),
+        "gfx1151 has no FP8 WMMA"
+    );
+    assert!(
+        resolve_intrinsic(AmdArch::Gfx1151, Some(ScalarDType::FP8E4M3), Some(ScalarDType::Float32), (16, 16, 32))
+            .is_none(),
+        "gfx1151 must not inherit CDNA FP8 MFMA"
+    );
 }
 
 #[test]

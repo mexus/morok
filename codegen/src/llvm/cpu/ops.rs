@@ -10,28 +10,6 @@ use svod_ir::{BinaryOp, Op, TernaryOp, UnaryOp, prelude::*};
 
 use crate::llvm::common::{RenderContext, lcast, ldt};
 
-/// Extract a scalar `ptr` from a vectorized `<N x ptr>` via `extractelement ... i32 0`.
-///
-/// When the devectorize pipeline doesn't fully eliminate vectorized PARAM pointers
-/// (see `no_vectorized_buf` / `no_vectorized_index` which only target DEFINE_LOCAL/DEFINE_REG),
-/// the GEP result can be `<N x ptr>`. All elements are identical (broadcast of the same buffer
-/// pointer), so extracting element 0 yields the correct scalar ptr for LLVM load/store.
-fn maybe_extract_scalar_ptr(
-    dst: &str,
-    idx: &str,
-    idx_type: &str,
-    dtype: &DType,
-    kernel: &mut Vec<String>,
-) -> (String, String) {
-    if matches!(dtype, DType::Ptr { vcount, .. } if *vcount > 1) {
-        let extract = format!("{dst}.ptr");
-        kernel.push(format!("  {extract} = extractelement {idx_type} {idx}, i32 0"));
-        (extract, "ptr".to_string())
-    } else {
-        (idx.to_string(), idx_type.to_string())
-    }
-}
-
 /// Render a UOp to LLVM IR string.
 ///
 /// Returns None for meta-ops that don't produce instructions.
@@ -46,36 +24,28 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec<Stri
         | Op::Noop
         | Op::Sink { .. }
         | Op::Group { .. }
-        | Op::Buffer { .. }
         | Op::Unique(_)
-        | Op::Device(_)
         | Op::Call { .. }
         | Op::Barrier { .. } => None,
 
-        Op::DefineLocal(_) | Op::DefineReg { .. } => {
-            // Emit alloca for local/register memory.
-            // Read base type and size from dtype (matching Tinygrad's x.dtype.base/x.dtype.size).
-            // After devectorize's no_vectorized_buf, dtype is the canonical source of truth.
-            let (base_dtype, alloc_size) = match uop.dtype() {
-                DType::Ptr { base, size, .. } => (base.as_ref().clone(), size.unwrap_or(1)),
-                other => (other, 1),
-            };
+        Op::Buffer { arg, .. }
+            if matches!(arg.addrspace, Some(svod_ir::AddrSpace::Local | svod_ir::AddrSpace::Reg)) =>
+        {
+            let base_dtype = arg.dtype.clone();
+            let alloc_size = uop.buffer_size().unwrap_or(1);
             let base = ldt(&base_dtype);
-            // Tinygrad: DEFINE_LOCAL gets align 16 (for SSE vector loads), DEFINE_REG gets default.
-            let align = if matches!(uop.op(), Op::DefineLocal(_)) { ", align 16" } else { "" };
+            let align = if arg.addrspace == Some(svod_ir::AddrSpace::Local) { ", align 16" } else { "" };
             kernel.push(format!("  {dst} = alloca [{alloc_size} x {base}]{align}"));
             Some(())
         }
 
+        Op::Buffer { .. } => None,
+
         Op::Index { buffer, indices, .. } => {
             let buf = ctx.get(buffer);
-            let buf_type = match buffer.dtype() {
-                DType::Ptr { .. } => ldt(&buffer.dtype()),
-                _ => "ptr".to_string(),
-            };
 
             if indices.is_empty() {
-                kernel.push(format!("  {dst} = bitcast {buf_type} {buf} to {}", ldt(&uop.dtype())));
+                kernel.push(format!("  {dst} = bitcast ptr {buf} to {}", ldt(&uop.dtype())));
             } else {
                 let (final_idx, final_idx_type) = if indices.len() == 1 {
                     (ctx.get(&indices[0]).to_string(), ldt(&indices[0].dtype()))
@@ -88,62 +58,81 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec<Stri
                     return None;
                 };
 
-                let elem_type = match uop.dtype() {
-                    svod_dtype::DType::Ptr { ref base, .. } => ldt(base),
-                    other => ldt(&other),
+                let vector_count = match buffer.dtype() {
+                    svod_dtype::DType::Vector { count, .. } => Some(count),
+                    _ if !matches!(
+                        buffer.op(),
+                        Op::Param { .. } | Op::Buffer { .. } | Op::After { .. } | Op::Index { .. }
+                    ) =>
+                    {
+                        buffer
+                            .shape()
+                            .ok()
+                            .flatten()
+                            .and_then(|shape| shape.iter().try_fold(1usize, |count, dim| Some(count * dim.as_const()?)))
+                            .filter(|count| *count > 1)
+                    }
+                    _ => None,
                 };
+                if let Some(count) = vector_count {
+                    let vector_dtype =
+                        buffer.dtype().scalar_dtype().vec(count).expect("INDEX vector source must be vectorizable");
+                    kernel.push(format!(
+                        "  {dst} = extractelement {} {buf}, {final_idx_type} {final_idx}",
+                        ldt(&vector_dtype)
+                    ));
+                    return Some(());
+                }
+
+                let elem_type = ldt(&uop.dtype());
 
                 // Gate is NOT handled here — matching Tinygrad's approach where INDEX
                 // always emits a plain GEP. The gate is handled at LOAD level (branch+phi)
                 // and at STORE level (IF/ENDIF via line_rewrite_cleanups).
                 kernel.push(format!(
-                    "  {dst} = getelementptr inbounds {elem_type}, {buf_type} {buf}, {final_idx_type} {final_idx}"
+                    "  {dst} = getelementptr inbounds {elem_type}, ptr {buf}, {final_idx_type} {final_idx}"
                 ));
             }
             Some(())
         }
 
-        Op::PointerIndex { ptr, offset } => {
-            let ptr_val = ctx.get(ptr);
-            let off_val = ctx.get(offset);
-            let elem_type = ldt(&uop.dtype());
-            let ptr_type = ldt(&ptr.dtype());
-            let off_type = ldt(&offset.dtype());
-
+        Op::Shrink { src, offsets, sizes: _ } => {
+            let buf = ctx.get(src);
+            let idx = ctx.get(offsets);
             kernel.push(format!(
-                "  {dst} = getelementptr inbounds {elem_type}, {ptr_type} {ptr_val}, {off_type} {off_val}"
+                "  {dst} = getelementptr inbounds {}, ptr {buf}, {} {idx}",
+                ldt(&uop.dtype()),
+                ldt(&offsets.dtype())
             ));
             Some(())
         }
 
-        Op::Load { index, alt, .. } => {
-            let idx = ctx.get(index);
-            let dtype = ldt(&uop.dtype());
-            let idx_type = ldt(&index.dtype());
-
-            let (idx, idx_type) = maybe_extract_scalar_ptr(&dst, idx, &idx_type, &index.dtype(), kernel);
-
-            // Gated LOAD: emit branch+phi to avoid null deref.
-            // Matches Tinygrad's pattern (llvmir.py:123-129) which requires BOTH
-            // a gated INDEX and an alt value on the LOAD. If gate exists without
-            // alt, that's a pipeline bug (line_rewrite_cleanups should provide it).
-            // Unwrap one CAST layer to find the INDEX gate (matches Tinygrad's .or_casted("idx")).
-            // The pipeline CAN produce CAST(INDEX) — devectorize handles this shape explicitly.
-            let actual_index = match index.op() {
-                Op::Cast { src, .. } => src,
-                _ => index,
-            };
-            let gate_info = if let Op::Index { gate: Some(gate_uop), .. } = actual_index.op() {
-                let Some(alt_uop) = alt.as_ref() else {
+        Op::Load { index, alt, gate } => {
+            if alt.is_some() != gate.is_some() {
+                ctx.set_invalid_graph(format!("LOAD on uop {} must have either neither or both alt and gate", uop.id));
+                return None;
+            }
+            if let (Some(alt), Some(gate)) = (alt, gate) {
+                if gate.dtype() != DType::Bool {
+                    ctx.set_invalid_graph(format!("gated LOAD on uop {} requires a scalar bool gate", uop.id));
+                    return None;
+                }
+                if alt.dtype() != uop.dtype() {
                     ctx.set_invalid_graph(format!(
-                        "gated LOAD on uop {} has no alt value; line_rewrite_cleanups must lift gated LOADs",
+                        "gated LOAD on uop {} requires alt dtype to match the load dtype",
                         uop.id
                     ));
                     return None;
-                };
-                Some((ctx.get(gate_uop).to_string(), ctx.get(alt_uop).to_string()))
-            } else {
-                None
+                }
+            }
+            let idx = ctx.get(index);
+            let dtype = ldt(&memory_access_dtype(index, &uop.dtype()));
+            let idx_type = "ptr";
+
+            let gate_info = match (alt, gate) {
+                (None, None) => None,
+                (Some(alt), Some(gate)) => Some((ctx.get(gate).to_string(), ctx.get(alt).to_string())),
+                _ => unreachable!(),
             };
 
             if let Some((gate, alt_val)) = gate_info {
@@ -167,13 +156,18 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec<Stri
             Some(())
         }
 
-        Op::Store { index, value, .. } => {
+        Op::Store { index, value, gate } => {
+            if gate.is_some() {
+                ctx.set_invalid_graph(format!(
+                    "gated STORE on uop {} reached LLVM codegen; linear cleanup must rewrite it to IF/STORE/ENDIF",
+                    uop.id
+                ));
+                return None;
+            }
             let idx = ctx.get(index);
             let val = ctx.get(value);
-            let val_type = ldt(&value.dtype());
-            let idx_type = ldt(&index.dtype());
-
-            let (idx, idx_type) = maybe_extract_scalar_ptr(&dst, idx, &idx_type, &index.dtype(), kernel);
+            let val_type = ldt(&memory_access_dtype(index, &value.dtype()));
+            let idx_type = "ptr";
 
             kernel.push(format!("  store {val_type} {val}, {idx_type} {idx}"));
             Some(())
@@ -388,12 +382,12 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec<Stri
         }
 
         Op::Range { axis_id, end, .. } => {
-            let id = axis_id.value();
+            let id = axis_id.name();
             let dtype = ldt(&uop.dtype());
             let end_val = ctx.get(end).to_string();
 
             // Track range nesting for correct END footer ordering.
-            ctx.push_range(id);
+            ctx.push_range(id.clone());
 
             // Matches Tinygrad llvmir.py:156-165 exactly:
             //   entry → loop_entry (preheader) → loop_latch (phi+incr+cmp) → loop_body / loop_exit
@@ -412,57 +406,32 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec<Stri
         }
 
         Op::End { ranges, .. } => {
-            // After pm_split_ends, each END has exactly one RANGE.
-            // Use the range_stack to emit footer blocks in correct nesting order
-            // (innermost first = LIFO), regardless of the END's ranges field order.
-            let range_count = ranges.iter().filter(|r| matches!(r.op(), Op::Range { .. })).count();
-            for _ in 0..range_count {
-                if let Some(id) = ctx.pop_range() {
-                    // Matches Tinygrad llvmir.py:166-170 exactly:
-                    //   body → loop_footer → loop_latch (back edge)
-                    //   loop_exit: falls through after loop
-                    kernel.push(format!("  br label %loop_footer_{id}"));
-                    kernel.push(format!("loop_footer_{id}:"));
-                    kernel.push(format!("  br label %loop_latch_{id}"));
-                    kernel.push(format!("loop_exit_{id}:"));
+            // After pm_split_ends each END closes the exact RANGE it names,
+            // matching Tinygrad's END renderer rather than an anonymous stack pop.
+            for range in ranges {
+                let Op::Range { axis_id, .. } = range.op() else { continue };
+                let id = axis_id.name();
+                if !ctx.close_range(&id) {
+                    return Some(());
                 }
+                kernel.push(format!("  br label %loop_footer_{id}"));
+                kernel.push(format!("loop_footer_{id}:"));
+                kernel.push(format!("  br label %loop_latch_{id}"));
+                kernel.push(format!("loop_exit_{id}:"));
             }
 
             Some(())
         }
 
-        Op::Gep { vector, indices } => {
-            let vec = ctx.get(vector);
-            let vec_type = ldt(&vector.dtype());
-            let out_type = ldt(&uop.dtype());
-
-            if indices.len() == 1 {
-                kernel.push(format!("  {dst} = extractelement {vec_type} {vec}, i32 {}", indices[0]));
-            } else {
-                render_multi_gep(&dst, vec, &vector.dtype(), indices, &out_type, kernel);
+        Op::Stack { sources } => {
+            if sources.is_empty() {
+                return None;
             }
+            render_vectorize(&dst, sources, ctx, kernel);
             Some(())
         }
 
-        Op::Vectorize { elements } => {
-            render_vectorize(&dst, elements, ctx, kernel);
-            Some(())
-        }
-
-        Op::Cat { sources } => {
-            render_cat(&dst, sources, ctx, kernel);
-            Some(())
-        }
-
-        Op::PtrCat { .. } => {
-            ctx.set_invalid_graph(format!(
-                "PtrCat on uop {} reached LLVM codegen; devectorize should distribute it into scalar loads/stores",
-                uop.id
-            ));
-            None
-        }
-
-        Op::Contract { src, .. } | Op::Unroll { src, .. } | Op::Detach { src } => {
+        Op::Detach { src } => {
             let s = ctx.get(src);
             ctx.alias(uop.id, s.to_string());
             None
@@ -669,6 +638,20 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec<Stri
     }
 }
 
+fn memory_access_dtype(index: &Arc<UOp>, scalar: &DType) -> DType {
+    let count = index
+        .shape()
+        .ok()
+        .flatten()
+        .and_then(|shape| shape.iter().try_fold(1usize, |count, dim| count.checked_mul(dim.as_const()?)))
+        .unwrap_or(1);
+    if count > 1 {
+        scalar.scalar_dtype().vec(count).expect("grouped memory dtype must be vectorizable")
+    } else {
+        scalar.clone()
+    }
+}
+
 /// Materialize a scalar literal as a value usable in a `dtype`-typed
 /// instruction. For scalar `dtype` returns the literal as-is; for vector
 /// `dtype` emits a splat (insertelement + shufflevector) into `kernel`
@@ -739,6 +722,9 @@ fn binary_instr(op: BinaryOp, dtype: &DType) -> &'static str {
     let is_signed = dtype.is_signed();
 
     match op {
+        BinaryOp::FloorDiv | BinaryOp::FloorMod => {
+            unreachable!("floor div/mod must be decomposed before LLVM rendering")
+        }
         BinaryOp::Add => {
             if is_float {
                 "fadd nsz arcp contract afn"
@@ -763,14 +749,14 @@ fn binary_instr(op: BinaryOp, dtype: &DType) -> &'static str {
             }
         }
         BinaryOp::Fdiv => "fdiv nsz arcp contract afn",
-        BinaryOp::Idiv => {
+        BinaryOp::CDiv => {
             if is_signed {
                 "sdiv"
             } else {
                 "udiv"
             }
         }
-        BinaryOp::Mod => {
+        BinaryOp::CMod => {
             if is_float {
                 "frem nsz arcp contract afn"
             } else if is_signed {
@@ -937,46 +923,6 @@ fn render_binary_pow(dst: &str, lhs: &Arc<UOp>, l: &str, r: &str, ltype: &str, k
     }
 }
 
-fn render_multi_gep(
-    dst: &str,
-    vec: &str,
-    vec_dtype: &DType,
-    indices: &[usize],
-    out_type: &str,
-    kernel: &mut Vec<String>,
-) {
-    let vec_type = ldt(vec_dtype);
-
-    let elem_dtype = match vec_dtype {
-        DType::Ptr { base, addrspace, size, .. } => {
-            DType::Ptr { base: base.clone(), addrspace: *addrspace, size: *size, vcount: 1 }
-        }
-        DType::Vector { scalar, .. } => DType::Scalar(*scalar),
-        _ => DType::Scalar(vec_dtype.base()),
-    };
-    let elem_type = ldt(&elem_dtype);
-
-    for (i, &idx) in indices.iter().enumerate() {
-        let elem = format!("{dst}.e{i}");
-        kernel.push(format!("  {elem} = extractelement {vec_type} {vec}, i32 {idx}"));
-    }
-
-    if indices.len() == 1 {
-        kernel.push(format!("  {dst} = bitcast {elem_type} {dst}.e0 to {out_type}"));
-    } else {
-        // Start the insertelement chain from `poison` (matches tinygrad llvmir.py:86).
-        let count = indices.len();
-        let mut prev = "poison".to_string();
-        for i in 0..count {
-            let next = if i == count - 1 { dst.to_string() } else { format!("{dst}.v{i}") };
-            kernel.push(format!(
-                "  {next} = insertelement <{count} x {elem_type}> {prev}, {elem_type} {dst}.e{i}, i32 {i}"
-            ));
-            prev = next;
-        }
-    }
-}
-
 fn render_vectorize(dst: &str, elements: &[Arc<UOp>], ctx: &RenderContext, kernel: &mut Vec<String>) {
     if elements.is_empty() {
         return;
@@ -992,41 +938,5 @@ fn render_vectorize(dst: &str, elements: &[Arc<UOp>], ctx: &RenderContext, kerne
         let next = if i == count - 1 { dst.to_string() } else { format!("{dst}.v{i}") };
         kernel.push(format!("  {next} = insertelement {vec_type} {prev}, {scalar_type} {val}, i32 {i}"));
         prev = next;
-    }
-}
-
-fn render_cat(dst: &str, sources: &[Arc<UOp>], ctx: &RenderContext, kernel: &mut Vec<String>) {
-    if sources.is_empty() {
-        return;
-    }
-
-    let total_count: usize = sources.iter().map(|s| s.dtype().vcount()).sum();
-    let scalar_type = ldt(&sources[0].dtype().scalar_dtype());
-    let out_type = format!("<{total_count} x {scalar_type}>");
-
-    let mut out_idx = 0;
-    let mut prev = "undef".to_string();
-
-    for src in sources.iter() {
-        let src_val = ctx.get(src);
-        let src_count = src.dtype().vcount();
-
-        if src_count == 1 {
-            let next = if out_idx == total_count - 1 { dst.to_string() } else { format!("{dst}.c{out_idx}") };
-            kernel.push(format!("  {next} = insertelement {out_type} {prev}, {scalar_type} {src_val}, i32 {out_idx}"));
-            prev = next;
-            out_idx += 1;
-        } else {
-            let src_type = ldt(&src.dtype());
-            for i in 0..src_count {
-                let elem = format!("{dst}.e{out_idx}");
-                kernel.push(format!("  {elem} = extractelement {src_type} {src_val}, i32 {i}"));
-
-                let next = if out_idx == total_count - 1 { dst.to_string() } else { format!("{dst}.c{out_idx}") };
-                kernel.push(format!("  {next} = insertelement {out_type} {prev}, {scalar_type} {elem}, i32 {out_idx}"));
-                prev = next;
-                out_idx += 1;
-            }
-        }
     }
 }

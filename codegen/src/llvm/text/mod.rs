@@ -17,11 +17,11 @@ use svod_dtype::AmdArch;
 use svod_ir::pattern::TypedPatternMatcher;
 use svod_ir::{Op, prelude::*};
 
-use crate::common::is_output_buffer;
+use crate::common::{collect_abi_params, is_output_buffer};
 use crate::llvm::amd;
 use crate::llvm::common::{LlvmTarget, RenderContext, ldt};
 use crate::llvm::cpu;
-use crate::{BufferArg, Error, RenderedKernel, Renderer, Result};
+use crate::{BufferArg, Error, RenderedKernel, RenderedOperation, Renderer, Result};
 
 /// Text-based LLVM IR renderer.
 ///
@@ -72,6 +72,7 @@ impl Renderer for LlvmTextRenderer {
                 });
             }
         };
+        crate::common::reject_unsupported_fnuz(&nodes, "LLVM")?;
 
         // Instruction-scheduling pass: lower any `sched::pipeline` markers into the
         // gfx9 machine scheduling controls (s_setprio brackets, sched.barrier fences,
@@ -84,60 +85,51 @@ impl Renderer for LlvmTextRenderer {
 
         let mut ctx = RenderContext::new();
         let mut kernel: Vec<String> = Vec::new();
+        let mut operations = Vec::new();
         let mut buffer_args: Vec<BufferArg> = Vec::new();
         let mut var_names: Vec<String> = Vec::new();
 
-        let mut buffers: Vec<Arc<UOp>> = Vec::new();
-        let mut variables: Vec<Arc<UOp>> = Vec::new();
+        let abi_params = collect_abi_params(&nodes)?;
 
-        for node in &nodes {
-            match node.op() {
-                Op::Param { .. } => {
-                    buffers.push(node.clone());
-                }
-                Op::DefineVar { .. } => {
-                    variables.push(node.clone());
-                }
-                _ => {}
-            }
-        }
-
-        buffers.sort_by_key(|b| if let Op::Param { arg, .. } = b.op() { arg.slot } else { usize::MAX });
-
-        for (i, buf) in buffers.iter().enumerate() {
+        for buf in
+            abi_params.iter().filter(|param| matches!(param.op(), Op::Param { arg, .. } if arg.addrspace.is_some()))
+        {
             if let Op::Param { arg, .. } = buf.op() {
                 let is_output = is_output_buffer(buf, &nodes);
                 buffer_args.push(BufferArg {
                     index: arg.slot,
-                    name: format!("data{i}"),
+                    name: format!("data{}", arg.slot),
                     dtype: buf.dtype(),
                     is_output,
                 });
             }
         }
 
-        for var in &variables {
-            if let Op::DefineVar { name, .. } = var.op() {
-                var_names.push(name.clone());
-            }
+        for var in
+            abi_params.iter().filter(|param| matches!(param.op(), Op::Param { arg, .. } if arg.addrspace.is_none()))
+        {
+            let name = match var.op() {
+                Op::Param { arg, .. } => arg.name.as_ref().ok_or_else(|| Error::InvalidGraph {
+                    reason: format!("scalar PARAM in slot {} has no name", arg.slot),
+                })?,
+                other => return Err(Error::InvalidGraph { reason: format!("non-PARAM in ABI list: {other:?}") }),
+            };
+            var_names.push(name.clone());
         }
         // -- Build function parameters --
         let mut inner_params: Vec<String> = Vec::new();
 
-        // Buffer pointer parameters
-        for (i, buf) in buffers.iter().enumerate() {
-            inner_params.push(format!("ptr noalias align 32 %buf{i}"));
-            ctx.register(buf.id, format!("%buf{i}"));
-        }
-
-        // Variable parameters
-        for var in &variables {
-            let var_base_name =
-                if let Op::DefineVar { name, .. } = var.op() { name.clone() } else { "var".to_string() };
-            let var_dtype = var.dtype();
-            let var_dtype_str = ldt(&var_dtype);
-            inner_params.push(format!("{var_dtype_str} %{var_base_name}"));
-            ctx.register(var.id, format!("%{var_base_name}"));
+        for param in &abi_params {
+            let Op::Param { arg, .. } = param.op() else {
+                return Err(Error::InvalidGraph { reason: "non-PARAM in ABI list".into() });
+            };
+            let source_name = format!("%data{}", arg.slot);
+            if arg.addrspace.is_some() {
+                inner_params.push(format!("ptr noalias align 32 {source_name}"));
+            } else {
+                inner_params.push(format!("{} {source_name}", ldt(&param.dtype())));
+            }
+            ctx.register(param.id, source_name);
         }
 
         // -- Build function body --
@@ -174,6 +166,7 @@ impl Renderer for LlvmTextRenderer {
                 ctx.register(node.id, String::new());
                 continue;
             }
+            let first_line = kernel.len();
             match self.target {
                 LlvmTarget::Cpu => {
                     cpu::render_uop(node, &mut ctx, &mut kernel);
@@ -185,6 +178,25 @@ impl Renderer for LlvmTextRenderer {
             if let Some(err) = ctx.take_error() {
                 return Err(err);
             }
+            operations.push(RenderedOperation {
+                uop_id: node.id,
+                op: node.op().as_ref().to_string(),
+                source_ids: node.op().sources().iter().map(|source| source.id).collect(),
+                result: ctx.try_get(node).map(str::to_string),
+                lines: kernel[first_line..].to_vec(),
+            });
+        }
+
+        if self.target.is_amd() {
+            // Tinygrad's AMD C frontend emits `contract` only. In particular,
+            // `arcp` turns division into an unrefined reciprocal on AMDGPU.
+            for line in &mut kernel {
+                *line = line.replace(" nsz arcp contract afn ", " contract ");
+            }
+        }
+
+        if !ctx.open_ranges().is_empty() {
+            return Err(Error::InvalidGraph { reason: format!("unclosed LLVM ranges: {:?}", ctx.open_ranges()) });
         }
 
         kernel.push("  ret void".to_string());
@@ -199,7 +211,7 @@ impl Renderer for LlvmTextRenderer {
         // Module-level prefix:
         //   1. amdgcn intrinsic declarations + CPU intrinsic declarations
         //   2. fp8 helper (AMD-only, only when the kernel uses fp8)
-        //   3. addrspace(3) LDS globals from `Op::DefineLocal` (AMD-only)
+        //   3. addrspace(3) LDS globals from LOCAL BUFFERs (AMD-only)
         let mut module_blocks: Vec<String> = Vec::new();
         module_blocks.push(generate_intrinsic_declarations(&kernel, &self.target));
         if self.target.is_amd()
@@ -244,6 +256,14 @@ attributes #0 = {{ {attrs} }}
         let mut result = RenderedKernel::new(ir, kernel_name.to_string());
         result.buffer_args = buffer_args;
         result.var_names = var_names;
+        result.abi = abi_params
+            .iter()
+            .map(|param| {
+                svod_device::device::AbiParamDescriptor::from_param(param)
+                    .map_err(|error| Error::InvalidGraph { reason: error.to_string() })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        result.operations = operations;
 
         Ok(result)
     }
@@ -343,6 +363,14 @@ fn generate_intrinsic_declarations(kernel: &[String], target: &LlvmTarget) -> St
     }
 
     if target.is_amd() {
+        for (suffix, llvm_type) in [("f16", "half"), ("f32", "float"), ("f64", "double")] {
+            for op in ["sqrt", "log2", "exp2", "sin"] {
+                let name = format!("@__ocml_{op}_{suffix}");
+                if kernel_str.contains(&name) {
+                    decls.push(format!("declare {llvm_type} {name}({llvm_type})"));
+                }
+            }
+        }
         // Scalar (non-mangled) amdgcn intrinsics; declared whenever referenced
         // in the kernel body. Source: AMDGPU LLVM intrinsic reference.
         for (pattern, decl) in [

@@ -2,18 +2,52 @@
 
 use smallvec::SmallVec;
 use svod_dtype::{DType, DeviceSpec};
-use svod_ir::{AxisId, AxisType, ConstValue, ReduceOp, UOp, WmmaMetadata, WmmaUpcastAxes};
+use svod_ir::{AxisId, AxisType, ConstValue, Op, ReduceOp, UOp, WmmaMetadata, WmmaUpcastAxes};
 
 use crate::c::render;
+use crate::c::types::c_const;
 
 fn render_linearized(root: &std::sync::Arc<UOp>, name: Option<&str>) -> crate::Result<crate::RenderedKernel> {
     let linear = UOp::linear(svod_schedule::linearize_with_cfg(root.clone()).into());
     render(&linear, name)
 }
 
+fn concrete_range(end: i64, axis_type: AxisType) -> std::sync::Arc<UOp> {
+    let end = UOp::const_(DType::Int32, ConstValue::Int(end));
+    UOp::new(Op::Range { end, axis_id: AxisId::Renumbered(0), axis_type, deps: SmallVec::new() }, DType::Int32)
+}
+
+fn slotted_var(name: &str, slot: usize) -> std::sync::Arc<UOp> {
+    let var = UOp::variable(name.to_string(), 0, 16, DType::Int32);
+    let Op::Param { shape, arg } = var.op() else { unreachable!() };
+    let mut arg = arg.clone();
+    arg.slot = slot;
+    UOp::new(Op::Param { shape: shape.clone(), arg }, DType::Int32)
+}
+
+#[test]
+fn c_signature_uses_canonical_mixed_param_slot_order() {
+    let sink = UOp::sink(vec![
+        slotted_var("high", 3),
+        UOp::param(2, 1, DType::Float32, None),
+        slotted_var("low", 1),
+        UOp::param(0, 1, DType::Float32, None),
+    ]);
+    let rendered = render_linearized(&sink, Some("mixed_abi")).expect("render mixed ABI");
+    assert_eq!(rendered.buffer_args.iter().map(|arg| arg.index).collect::<Vec<_>>(), vec![0, 2]);
+    assert_eq!(rendered.var_names, vec!["low", "high"]);
+    assert!(
+        rendered
+            .code
+            .contains("void mixed_abi(float* restrict data0, const int data1, float* restrict data2, const int data3)"),
+        "{}",
+        rendered.code
+    );
+}
+
 #[test]
 fn test_render_linear_input_succeeds() {
-    let sink = UOp::sink(vec![UOp::native_const(1.0f32)]);
+    let sink = UOp::sink(vec![UOp::const_(DType::Float32, ConstValue::Float(1.0))]);
     let linear = UOp::linear(svod_schedule::linearize_with_cfg(sink.clone()).into());
 
     let rendered = render(&linear, Some("test_linear")).expect("C codegen from LINEAR should succeed");
@@ -21,9 +55,143 @@ fn test_render_linear_input_succeeds() {
 }
 
 #[test]
+fn grouped_shrink_renders_single_vector_load_and_store() {
+    let shrink = |src| {
+        UOp::new(
+            Op::Shrink {
+                src,
+                offsets: UOp::const_(DType::Int32, ConstValue::Int(0)),
+                sizes: UOp::const_(DType::Int32, ConstValue::Int(4)),
+            },
+            DType::Float32,
+        )
+    };
+    let output = shrink(UOp::param(0, 8, DType::Float32, None));
+    let input = shrink(UOp::param(1, 8, DType::Float32, None));
+    let sink = UOp::sink(vec![output.store(UOp::load().index(input).call())]);
+
+    let rendered = render_linearized(&sink, Some("grouped_memory")).expect("render grouped C memory");
+    assert_eq!(rendered.code.matches("float4").count(), 4, "{}", rendered.code);
+}
+
+#[test]
+fn grouped_half_shrink_declares_shape_width_vector() {
+    let shrink = |src| {
+        UOp::new(
+            Op::Shrink {
+                src,
+                offsets: UOp::const_(DType::Int32, ConstValue::Int(0)),
+                sizes: UOp::const_(DType::Int32, ConstValue::Int(4)),
+            },
+            DType::Float16,
+        )
+    };
+    let output = shrink(UOp::param(0, 8, DType::Float16, None));
+    let input = shrink(UOp::param(1, 8, DType::Float16, None));
+    let sink = UOp::sink(vec![output.store(UOp::load().index(input).call())]);
+
+    let rendered = render_linearized(&sink, Some("grouped_half_memory")).expect("render grouped half C memory");
+    assert!(rendered.code.contains("typedef _Float16 half4"), "{}", rendered.code);
+    assert_eq!(rendered.code.matches("half4").count(), 4, "{}", rendered.code);
+    assert!(!rendered.code.contains("void4"), "{}", rendered.code);
+}
+
+#[test]
+fn clang_materializes_tinygrad_ssa_boundaries() {
+    let out = UOp::param(0, 1, DType::Int32, None);
+    let out_index =
+        UOp::index().buffer(out).indices(vec![UOp::const_(DType::Index, ConstValue::Int(0))]).call().unwrap();
+    let selected = UOp::try_where(
+        UOp::const_(DType::Bool, ConstValue::Bool(true)),
+        UOp::const_(DType::Int32, ConstValue::Int(2)),
+        UOp::const_(DType::Int32, ConstValue::Int(3)),
+    )
+    .unwrap();
+    let rendered = render_linearized(&UOp::sink(vec![out_index.store(selected)]), Some("materialize_where"))
+        .expect("render WHERE materialization");
+    assert!(rendered.code.contains("int alu0 = (1 ? 2 : 3);"), "{}", rendered.code);
+    assert!(rendered.code.contains("= alu0;"), "{}", rendered.code);
+
+    let input = UOp::param(0, 1, DType::Float32, None);
+    let output = UOp::param(1, 1, DType::Float32, None);
+    let zero = UOp::const_(DType::Index, ConstValue::Int(0));
+    let input_index = UOp::index().buffer(input).indices(vec![zero.clone()]).call().unwrap();
+    let output_index = UOp::index().buffer(output).indices(vec![zero]).call().unwrap();
+    let rendered = render_linearized(
+        &UOp::sink(vec![output_index.store(UOp::load().index(input_index).call())]),
+        Some("materialize_load"),
+    )
+    .expect("render LOAD materialization");
+    assert!(rendered.code.contains("float val0 = *(data0 + 0LL);"), "{}", rendered.code);
+    assert!(rendered.code.contains("= val0;"), "{}", rendered.code);
+
+    let vector = UOp::vconst(vec![ConstValue::UInt(1); 4], DType::UInt32);
+    let cast = vector.cast(DType::UInt32.vec(4).unwrap()).cast(DType::Int32.vec(4).unwrap());
+    let rendered = render_linearized(&UOp::sink(vec![cast]), Some("materialize_vector_cast"))
+        .expect("render vector CAST materialization");
+    assert!(rendered.code.contains("int4 cast0 = __builtin_convertvector"), "{}", rendered.code);
+}
+
+#[test]
+fn clang_preserves_shape_width_across_materialized_values_and_store_aliases() {
+    let shaped = UOp::stack((0..4).map(|value| UOp::const_(DType::UInt32, ConstValue::UInt(value))).collect());
+    let cast = shaped.cast(DType::Float32);
+    let rendered = render_linearized(&UOp::sink(vec![cast]), Some("materialize_shaped_cast"))
+        .expect("render scalar-dtype shaped CAST");
+    assert!(rendered.code.contains("typedef float float4"), "{}", rendered.code);
+    assert!(rendered.code.contains("float4 cast0 = __builtin_convertvector"), "{}", rendered.code);
+
+    let output = UOp::new(
+        Op::Shrink {
+            src: UOp::param(0, 4, DType::Int32, None),
+            offsets: UOp::const_(DType::Int32, ConstValue::Int(0)),
+            sizes: UOp::const_(DType::Int32, ConstValue::Int(4)),
+        },
+        DType::Int32,
+    );
+    let value = UOp::stack((0..4).map(|value| UOp::const_(DType::Int32, ConstValue::Int(value))).collect()).detach();
+    let rendered = render_linearized(&UOp::sink(vec![output.store(value)]), Some("store_shaped_alias"))
+        .expect("render shaped alias STORE");
+    assert!(rendered.code.contains("*((int4*)(data0 + 0)) ="), "{}", rendered.code);
+}
+
+#[test]
+fn clang_preserves_address_casts_as_pointers() {
+    let index = UOp::index()
+        .buffer(UOp::param(0, 1, DType::Float32, None))
+        .indices(vec![UOp::const_(DType::Index, ConstValue::Int(0))])
+        .call()
+        .unwrap();
+    let address = index.cast(DType::Int32);
+    let output = UOp::index()
+        .buffer(UOp::param(1, 1, DType::Int32, None))
+        .indices(vec![UOp::const_(DType::Index, ConstValue::Int(0))])
+        .call()
+        .unwrap();
+    let rendered =
+        render_linearized(&UOp::sink(vec![output.store(UOp::load().index(address).call())]), Some("address_cast"))
+            .expect("render address CAST");
+    assert!(rendered.code.contains("((int*)(data0 + 0LL))"), "{}", rendered.code);
+    assert!(!rendered.code.contains("__builtin_convertvector"), "{}", rendered.code);
+}
+
+#[test]
+fn clang_vector_alignment_rounds_down_like_tinygrad() {
+    let vector = UOp::const_(DType::Float32.vec(3).unwrap(), ConstValue::Float(0.0));
+    let rendered = render_linearized(&UOp::sink(vec![vector]), Some("float3_alignment")).expect("render float3");
+
+    assert!(
+        rendered.code.contains("typedef float float3 __attribute__((aligned(8),ext_vector_type(3)))"),
+        "{}",
+        rendered.code
+    );
+}
+
+#[test]
 fn test_render_rejects_non_linear_inputs() {
-    let sink = UOp::sink(vec![UOp::native_const(1.0f32)]);
-    let program = UOp::program(sink.clone(), UOp::device(DeviceSpec::Cpu), None, None, None);
+    let sink = UOp::sink(vec![UOp::const_(DType::Float32, ConstValue::Float(1.0))]);
+    let info = svod_ir::ProgramInfo::from_sink(&sink, DeviceSpec::Cpu);
+    let program = UOp::program(sink.clone(), info, None, None, None);
 
     let err = render(&program, Some("test_program_input")).expect_err("PROGRAM input must fail");
     assert!(format!("{err}").contains("expects LINEAR input"), "unexpected error: {err:?}");
@@ -33,9 +201,38 @@ fn test_render_rejects_non_linear_inputs() {
 }
 
 #[test]
+fn test_getaddr_must_be_resolved_before_codegen() {
+    let buffer = UOp::new_buffer(DeviceSpec::Cpu, 4, DType::UInt8);
+    let address = buffer.getaddr(None);
+    let linear = UOp::linear(vec![buffer, address].into());
+    let err = render(&linear, Some("getaddr")).expect_err("GETADDR is an HCQ runtime op, not a kernel op");
+    assert!(format!("{err}").contains("GetAddr"), "unexpected error: {err:?}");
+}
+
+#[test]
+fn test_render_rejects_fnuz_without_fallback() {
+    let constant = UOp::const_(DType::FP8E5M2FNUZ, ConstValue::Float(1.0));
+    let linear = UOp::linear(vec![constant].into());
+    let err = render(&linear, Some("fnuz")).expect_err("FNUZ rendering must fail");
+    let message = format!("{err}");
+    assert!(message.contains("does not support FP8E5M2FNUZ"), "unexpected error: {message}");
+    assert!(message.contains("cannot use OCP FP8 decomposition or raw-byte fallback"), "unexpected error: {message}");
+}
+
+#[test]
+fn c_constants_consume_committed_values_and_fp8_bits() {
+    let f32_value = UOp::const_(DType::Float32, ConstValue::Float(-3.2));
+    let Op::Const(f32_value) = f32_value.op() else { unreachable!() };
+    assert_eq!(c_const(&f32_value.0, &DType::Float32), "-3.2e0f");
+
+    let fp8 = UOp::const_(DType::FP8E4M3, ConstValue::Float(1.1875));
+    let Op::Const(fp8) = fp8.op() else { unreachable!() };
+    assert_eq!(c_const(&fp8.0, &DType::FP8E4M3), "58");
+}
+
+#[test]
 fn test_range_end_basic() {
-    let end = UOp::const_(DType::Index, ConstValue::Int(10));
-    let range = UOp::range_axis(end, AxisId::Renumbered(0), AxisType::Loop);
+    let range = concrete_range(10, AxisType::Loop);
     let noop = UOp::noop();
     let ranges: SmallVec<[_; 4]> = smallvec::smallvec![range];
     let end_op = noop.end(ranges);
@@ -51,8 +248,7 @@ fn test_range_end_basic() {
 #[test]
 fn test_reduce_add_basic() {
     let const_val = UOp::const_(DType::Float32, ConstValue::Float(5.0));
-    let range =
-        UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(10)), AxisId::Renumbered(0), AxisType::Reduce);
+    let range = concrete_range(10, AxisType::Reduce);
 
     let reduce = const_val.reduce(smallvec::smallvec![range.clone()], ReduceOp::Add);
     let ranges: SmallVec<[_; 4]> = smallvec::smallvec![range];
@@ -70,7 +266,7 @@ fn test_reduce_add_basic() {
 #[test]
 fn test_reduce_max() {
     let const_val = UOp::const_(DType::Float32, ConstValue::Float(3.0));
-    let range = UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(5)), AxisId::Renumbered(0), AxisType::Reduce);
+    let range = concrete_range(5, AxisType::Reduce);
 
     let reduce = const_val.reduce(smallvec::smallvec![range.clone()], ReduceOp::Max);
     let ranges: SmallVec<[_; 4]> = smallvec::smallvec![range];
@@ -94,8 +290,7 @@ fn test_reduce_empty_ranges() {
 
 #[test]
 fn test_multi_index_requires_linearization() {
-    let ptr_dtype = DType::Float32.ptr(None, svod_dtype::AddrSpace::Global).unwrap();
-    let buffer = UOp::param(0, 1024, ptr_dtype, None);
+    let buffer = UOp::param(0, 1024, DType::Float32, None);
     let i = UOp::const_(DType::Index, ConstValue::Int(1));
     let j = UOp::const_(DType::Index, ConstValue::Int(2));
     let index = UOp::index().buffer(buffer).indices(vec![i, j]).call().unwrap();
@@ -111,40 +306,23 @@ fn test_multi_index_requires_linearization() {
 }
 
 #[test]
-fn test_gated_load_with_casted_index_emits_conditional() {
-    let ptr_dtype = DType::Float32.ptr(None, svod_dtype::AddrSpace::Global).unwrap();
-    let buffer = UOp::param(0, 1024, ptr_dtype.clone(), None);
-    let out = UOp::param(1, 1024, ptr_dtype, None);
+fn test_gated_load_emits_conditional_dereference() {
+    let buffer = UOp::param(0, 1024, DType::Float32, None);
+    let out = UOp::param(1, 1024, DType::Float32, None);
     let idx = UOp::const_(DType::Index, ConstValue::Int(1));
     let gate = UOp::const_(DType::Bool, ConstValue::Bool(true));
-    let gated_index = UOp::index().buffer(buffer.clone()).indices(vec![idx]).gate(gate).call().unwrap();
-    let casted_index = gated_index.cast(buffer.dtype());
+    let index = UOp::index().buffer(buffer).indices(vec![idx]).call().unwrap();
     let alt = UOp::const_(DType::Float32, ConstValue::Float(7.0));
-    let load = UOp::load().buffer(buffer).index(casted_index).alt(alt).call();
+    let load = UOp::load().index(index).alt(alt).gate(gate).call();
     let out_idx = UOp::index().buffer(out).indices(vec![UOp::const_(DType::Index, ConstValue::Int(0))]).call().unwrap();
     let sink = UOp::sink(vec![out_idx.store(load)]);
 
-    let rendered = render_linearized(&sink, Some("test_gated_load_with_casted_index_emits_conditional"))
-        .expect("C backend should render casted gated load");
-    assert!(rendered.code.contains(" ? "), "gated load should render ternary conditional:\n{}", rendered.code);
-}
-
-#[test]
-fn test_gated_load_requires_alt() {
-    let ptr_dtype = DType::Float32.ptr(None, svod_dtype::AddrSpace::Global).unwrap();
-    let buffer = UOp::param(0, 1024, ptr_dtype, None);
-    let idx = UOp::const_(DType::Index, ConstValue::Int(1));
-    let gate = UOp::const_(DType::Bool, ConstValue::Bool(true));
-    let gated_index = UOp::index().buffer(buffer.clone()).indices(vec![idx]).gate(gate).call().unwrap();
-    let casted_index = gated_index.cast(buffer.dtype());
-    let load = UOp::load().buffer(buffer).index(casted_index).call();
-    let sink = UOp::sink(vec![load]);
-
-    let err = render_linearized(&sink, Some("test_gated_load_requires_alt"))
-        .expect_err("gated LOAD without alt must surface as InvalidGraph");
+    let rendered = render_linearized(&sink, Some("test_gated_load_emits_conditional_dereference"))
+        .expect("C backend should render gated load");
     assert!(
-        matches!(&err, crate::Error::InvalidGraph { reason } if reason.contains("no alt value")),
-        "expected InvalidGraph(no alt value), got {err:?}",
+        rendered.code.contains("1 ? *(data0 + 1LL) : 7.0f"),
+        "gated load should conditionally evaluate the dereference:\n{}",
+        rendered.code
     );
 }
 
@@ -157,7 +335,11 @@ fn amx_f32_metadata() -> WmmaMetadata {
         dtype_out: DType::Float32,
         device: svod_ir::RendererDevice::AppleAmx,
         threads: 1,
-        upcast_axes: WmmaUpcastAxes { a: vec![(2, 256)], b: vec![(2, 256)], c: vec![(2, 256)] },
+        upcast_axes: Some(WmmaUpcastAxes {
+            a: vec![(svod_ir::AxisId::Renumbered(2), 256)],
+            b: vec![(svod_ir::AxisId::Renumbered(2), 256)],
+            c: vec![(svod_ir::AxisId::Renumbered(2), 256)],
+        }),
         reduce_axes: vec![],
         tile_grid: (1, 1),
     }
@@ -172,7 +354,11 @@ fn amx_f16_to_f32_metadata() -> WmmaMetadata {
         dtype_out: DType::Float32,
         device: svod_ir::RendererDevice::AppleAmx,
         threads: 1,
-        upcast_axes: WmmaUpcastAxes { a: vec![(2, 256)], b: vec![(2, 256)], c: vec![(2, 256)] },
+        upcast_axes: Some(WmmaUpcastAxes {
+            a: vec![(svod_ir::AxisId::Renumbered(2), 256)],
+            b: vec![(svod_ir::AxisId::Renumbered(2), 256)],
+            c: vec![(svod_ir::AxisId::Renumbered(2), 256)],
+        }),
         reduce_axes: vec![],
         tile_grid: (1, 1),
     }
@@ -187,7 +373,11 @@ fn amx_tile_grid_metadata() -> WmmaMetadata {
         dtype_out: DType::Float32,
         device: svod_ir::RendererDevice::AppleAmx,
         threads: 1,
-        upcast_axes: WmmaUpcastAxes { a: vec![(2, 256)], b: vec![(2, 256)], c: vec![(2, 256)] },
+        upcast_axes: Some(WmmaUpcastAxes {
+            a: vec![(svod_ir::AxisId::Renumbered(2), 256)],
+            b: vec![(svod_ir::AxisId::Renumbered(2), 256)],
+            c: vec![(svod_ir::AxisId::Renumbered(2), 256)],
+        }),
         reduce_axes: vec![],
         tile_grid: (2, 2),
     }
@@ -255,6 +445,11 @@ fn test_wmma_function_call() {
 
     // Verify the kernel body contains a WMMA function call
     assert!(result.code.contains("__WMMA_16_16_1_float_float("), "Missing WMMA function call:\n{}", result.code);
+    assert!(
+        result.code.lines().any(|line| line.trim_start().starts_with("float256 wmma") && line.contains(" = __WMMA")),
+        "WMMA result width was lost:\n{}",
+        result.code
+    );
 }
 
 #[test]

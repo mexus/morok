@@ -20,6 +20,26 @@ pub struct RenderedKernel {
 
     /// Variable names in order (for populating vars array at runtime).
     pub var_names: Vec<String>,
+
+    /// Complete PARAM ABI in generated source-signature order.
+    pub abi: Vec<svod_device::device::AbiParamDescriptor>,
+
+    /// Per-UOp source bindings emitted by structured text renderers.
+    ///
+    /// This is diagnostic/verifier metadata only. It lets safety tests tie an
+    /// emitted branch, load, phi, or store back to the exact LINEAR operation
+    /// without parsing unrelated instructions in the complete source string.
+    pub operations: Vec<RenderedOperation>,
+}
+
+/// Generated source owned by one LINEAR UOp.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenderedOperation {
+    pub uop_id: u64,
+    pub op: String,
+    pub source_ids: Vec<u64>,
+    pub result: Option<String>,
+    pub lines: Vec<String>,
 }
 
 /// Information about a buffer argument to the kernel.
@@ -41,7 +61,7 @@ pub struct BufferArg {
 impl RenderedKernel {
     /// Create a new rendered kernel.
     pub fn new(code: String, name: String) -> Self {
-        Self { code, name, buffer_args: Vec::new(), var_names: Vec::new() }
+        Self { code, name, buffer_args: Vec::new(), var_names: Vec::new(), abi: Vec::new(), operations: Vec::new() }
     }
 
     /// Add a buffer argument.

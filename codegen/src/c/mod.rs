@@ -21,7 +21,7 @@ use std::sync::Arc;
 use svod_ir::pattern::TypedPatternMatcher;
 use svod_ir::{Op, prelude::*};
 
-use crate::common::{is_output_buffer, validate_custom_template_strict};
+use crate::common::{collect_abi_params, is_output_buffer, validate_custom_template_strict};
 use crate::{BufferArg, Error, RenderedKernel, Result};
 
 use self::ops::{CContext, count_references, render_uop};
@@ -52,6 +52,7 @@ impl crate::Renderer for CRenderer {
                 return Err(Error::InvalidGraph { reason: format!("C renderer expects LINEAR input, got {other:?}") });
             }
         };
+        crate::common::reject_unsupported_fnuz(&nodes, "C")?;
 
         for (i, node) in nodes.iter().enumerate() {
             tracing::debug!(position = i, op = node.op().as_ref(), id = node.id, "c linearized node");
@@ -63,28 +64,18 @@ impl crate::Renderer for CRenderer {
             }
         }
 
-        // Collect buffers and variables from linearized stream
-        let mut buffers: Vec<Arc<UOp>> = Vec::new();
-        let mut variables: Vec<Arc<UOp>> = Vec::new();
-
-        for node in &nodes {
-            match node.op() {
-                Op::Param { .. } => buffers.push(node.clone()),
-                Op::DefineVar { .. } => variables.push(node.clone()),
-                _ => {}
-            }
-        }
-
-        buffers.sort_by_key(|b| if let Op::Param { arg, .. } = b.op() { arg.slot } else { usize::MAX });
+        let abi_params = collect_abi_params(&nodes)?;
 
         // Build buffer args metadata
         let mut buffer_args: Vec<BufferArg> = Vec::new();
-        for (i, buf) in buffers.iter().enumerate() {
+        for buf in
+            abi_params.iter().filter(|param| matches!(param.op(), Op::Param { arg, .. } if arg.addrspace.is_some()))
+        {
             if let Op::Param { arg, .. } = buf.op() {
                 let is_output = is_output_buffer(buf, &nodes);
                 buffer_args.push(BufferArg {
                     index: arg.slot,
-                    name: format!("data{i}"),
+                    name: format!("data{}", arg.slot),
                     dtype: buf.dtype(),
                     is_output,
                 });
@@ -93,10 +84,16 @@ impl crate::Renderer for CRenderer {
 
         // Build var_names
         let mut var_names: Vec<String> = Vec::new();
-        for var in &variables {
-            if let Op::DefineVar { name, .. } = var.op() {
-                var_names.push(name.clone());
-            }
+        for var in
+            abi_params.iter().filter(|param| matches!(param.op(), Op::Param { arg, .. } if arg.addrspace.is_none()))
+        {
+            let name = match var.op() {
+                Op::Param { arg, .. } => arg.name.as_ref().ok_or_else(|| Error::InvalidGraph {
+                    reason: format!("scalar PARAM in slot {} has no name", arg.slot),
+                })?,
+                other => return Err(Error::InvalidGraph { reason: format!("non-PARAM in ABI list: {other:?}") }),
+            };
+            var_names.push(name.clone());
         }
         // Count references for SSA inlining decisions
         let ref_counts = count_references(&nodes);
@@ -131,26 +128,22 @@ impl crate::Renderer for CRenderer {
         // Build typed function params
         let mut params: Vec<String> = Vec::new();
 
-        // Buffer parameters
-        for (i, buf) in buffers.iter().enumerate() {
-            let buf_dtype = buf.dtype();
-            let elem_type = match &buf_dtype {
-                DType::Ptr { base, .. } => c_dtype(base),
-                _ => c_dtype(&buf_dtype),
+        for param in &abi_params {
+            let Op::Param { arg, .. } = param.op() else {
+                return Err(Error::InvalidGraph { reason: "non-PARAM in ABI list".into() });
             };
-            let name = format!("data{i}");
-            params.push(format!("{elem_type}* restrict {name}"));
-            ctx.register(buf.id, name);
-        }
-
-        // Variable parameters
-        for var in &variables {
-            if let Op::DefineVar { name, .. } = var.op() {
-                let var_dtype = &var.dtype();
-                let c_type = c_dtype(var_dtype);
-                params.push(format!("const {c_type} {name}"));
-                ctx.register(var.id, name.clone());
+            let source_name = format!("data{}", arg.slot);
+            if arg.addrspace.is_some() {
+                let dtype = param.dtype();
+                let elem_type = match &dtype {
+                    DType::Ptr { base, .. } => c_dtype(base),
+                    _ => c_dtype(&dtype),
+                };
+                params.push(format!("{elem_type}* restrict {source_name}"));
+            } else {
+                params.push(format!("const {} {source_name}", c_dtype(&param.dtype())));
             }
+            ctx.register(param.id, source_name);
         }
 
         // Function signature
@@ -158,12 +151,12 @@ impl crate::Renderer for CRenderer {
 
         // Local memory allocations (stack arrays on CPU)
         for node in &nodes {
-            if let Op::DefineLocal(id) = node.op() {
-                let (base, size) = match node.dtype() {
-                    DType::Ptr { base, size, .. } => (c_dtype(&base), size.unwrap_or(1)),
-                    other => (c_dtype(&other), 1),
-                };
-                let name = format!("local{id}");
+            if let Op::Buffer { arg, .. } = node.op()
+                && arg.addrspace == Some(svod_ir::AddrSpace::Local)
+            {
+                let base = c_dtype(&arg.dtype);
+                let size = node.buffer_size().unwrap_or(1);
+                let name = format!("local{}", arg.slot);
                 code_lines.push(format!("  {base} {name}[{size}];"));
                 ctx.register(node.id, name);
             }
@@ -205,7 +198,7 @@ impl crate::Renderer for CRenderer {
         // Pre-register range variable names
         for node in &nodes {
             if let Op::Range { axis_id, .. } = node.op() {
-                let name = format!("ridx{}", axis_id.value());
+                let name = format!("ridx{}", axis_id.name());
                 ctx.register(node.id, name);
             }
         }
@@ -215,7 +208,7 @@ impl crate::Renderer for CRenderer {
         let mut kernel_body: Vec<String> = Vec::new();
         for node in &nodes {
             if matches!(node.op(), Op::Noop | Op::Group { .. }) {
-                // Register with empty string so downstream UNROLL/CONTRACT can alias them.
+                // Register with an empty string for downstream control nodes.
                 // Matches LLVM backend behavior — these are structural no-ops.
                 ctx.register(node.id, String::new());
                 continue;
@@ -241,6 +234,13 @@ impl crate::Renderer for CRenderer {
         let mut result = RenderedKernel::new(code, kernel_name.to_string());
         result.buffer_args = buffer_args;
         result.var_names = var_names;
+        result.abi = abi_params
+            .iter()
+            .map(|param| {
+                svod_device::device::AbiParamDescriptor::from_param(param)
+                    .map_err(|error| Error::InvalidGraph { reason: error.to_string() })
+            })
+            .collect::<Result<Vec<_>>>()?;
 
         Ok(result)
     }

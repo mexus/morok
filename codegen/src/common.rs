@@ -1,10 +1,24 @@
 //! Common utilities shared between codegen backends.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use svod_ir::{Op, UOp};
 
 use crate::{Error, Result};
+
+/// FNUZ FP8 formats have different bias, zero, NaN, and saturation semantics
+/// from the OCP formats. No renderer currently implements those semantics.
+pub fn reject_unsupported_fnuz(nodes: &[Arc<UOp>], renderer: &str) -> Result<()> {
+    if let Some(dtype) = nodes.iter().map(|node| node.dtype().base()).find(|dtype| dtype.is_fp8_fnuz()) {
+        return Err(Error::TypeError {
+            reason: format!(
+                "{renderer} renderer does not support {dtype:?}; FNUZ cannot use OCP FP8 decomposition or raw-byte fallback"
+            ),
+        });
+    }
+    Ok(())
+}
 
 /// Check whether a buffer (PARAM/DefineGlobal) is used as a STORE target in the graph.
 pub fn is_output_buffer(def_global: &Arc<UOp>, nodes: &[Arc<UOp>]) -> bool {
@@ -28,44 +42,42 @@ pub fn is_output_buffer(def_global: &Arc<UOp>, nodes: &[Arc<UOp>]) -> bool {
 /// Collect buffer and variable parameters from a UOp graph.
 ///
 /// Collects:
-/// - Buffers: PARAM, DEFINE_LOCAL operations
-/// - Variables: DEFINE_VAR operations (passed as i64 kernel params)
+/// - Buffers: address-space PARAM operations
+/// - Variables: DEFINE_VAR and scalar PARAM operations
 ///
 /// Returns (buffers, variables) sorted for deterministic function signatures.
-pub fn collect_buffers_and_vars(root: &Arc<UOp>) -> (Vec<Arc<UOp>>, Vec<Arc<UOp>>) {
+pub fn collect_buffers_and_vars(root: &Arc<UOp>) -> Result<(Vec<Arc<UOp>>, Vec<Arc<UOp>>)> {
     let nodes = root.toposort();
+    let params = collect_abi_params(&nodes)?;
+    Ok(params.into_iter().partition(|param| matches!(param.op(), Op::Param { arg, .. } if arg.addrspace.is_some())))
+}
 
-    // Collect buffers
-    let mut buffers = Vec::new();
-    for node in &nodes {
-        match node.op() {
-            Op::Buffer { .. } | Op::Param { .. } | Op::DefineLocal(_) => {
-                buffers.push(node.clone());
-            }
-            _ => {}
+/// Collect PARAMs in the canonical external ABI order. All PARAM address
+/// spaces are arguments in the pinned renderer; local/register BUFFERs are
+/// internal scratch allocations and therefore deliberately excluded.
+pub(crate) fn collect_abi_params(nodes: &[Arc<UOp>]) -> Result<Vec<Arc<UOp>>> {
+    let mut params = Vec::new();
+    let mut occupied = HashMap::new();
+    for node in nodes {
+        let Op::Param { arg, .. } = node.op() else { continue };
+        if arg.slot == usize::MAX {
+            return Err(Error::InvalidGraph { reason: "unassigned PARAM reached renderer ABI collection".into() });
         }
+        if arg.addrspace.is_none() && arg.name.is_none() {
+            return Err(Error::InvalidGraph { reason: format!("scalar PARAM in slot {} has no name", arg.slot) });
+        }
+        if let Some(first) = occupied.insert(arg.slot, node.id) {
+            return Err(Error::InvalidGraph {
+                reason: format!("duplicate PARAM slot {} for UOps {first} and {}", arg.slot, node.id),
+            });
+        }
+        params.push(node.clone());
     }
-
-    // Sort buffers by internal ID (matches split_kernel.rs ordering)
-    buffers.sort_by_key(|b| match b.op() {
-        Op::Param { arg, .. } => arg.slot as u64,
-        Op::DefineLocal(id) => (*id as u64) + (1u64 << 32),
-        Op::Buffer { .. } => b.id + (1u64 << 48),
-        _ => b.id,
+    params.sort_by_key(|param| match param.op() {
+        Op::Param { arg, .. } => arg.slot,
+        _ => usize::MAX,
     });
-
-    // Collect DefineVar nodes - these become i64 kernel parameters
-    let mut variables = Vec::new();
-    for node in &nodes {
-        if matches!(node.op(), Op::DefineVar { .. }) {
-            variables.push(node.clone());
-        }
-    }
-
-    // Sort variables by name for deterministic function signatures
-    variables.sort_by_key(|v| if let Op::DefineVar { name, .. } = v.op() { name.clone() } else { String::new() });
-
-    (buffers, variables)
+    Ok(params)
 }
 
 pub fn validate_custom_template_strict(template: &str, arg_count: usize) -> Result<()> {

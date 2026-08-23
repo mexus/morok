@@ -1,12 +1,16 @@
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use svod_device::device::{CompiledSpec, Compiler, ProgramSpec, Renderer};
+use svod_device::device::{
+    AbiParamDescriptor, CompiledSpec, Compiler, ProgramSpec, Renderer, binary_stage_identity, source_stage_identity,
+    validate_binary_stage, validate_source_stage,
+};
 use svod_device::{Error, Result};
 use svod_dtype::DeviceSpec;
-use svod_ir::{Op, UOp};
+use svod_ir::{Op, ProgramInfo, UOp, UOpKey};
 use svod_schedule::linearize::line_rewrite_cleanups;
 
-type ProgramParts = (Arc<UOp>, Arc<UOp>, Option<Arc<UOp>>, Option<Arc<UOp>>, Option<Arc<UOp>>);
+type ProgramParts = (Arc<UOp>, ProgramInfo, Option<Arc<UOp>>, Option<Arc<UOp>>, Option<Arc<UOp>>);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProgramTarget {
@@ -20,21 +24,35 @@ fn invalid_program_state(details: impl Into<String>) -> Error {
 }
 
 fn unpack_program(program: &Arc<UOp>) -> Result<ProgramParts> {
-    let Op::Program { sink, device, linear, source, binary } = program.op() else {
+    let Op::Program { sink, info, linear, source, binary } = program.op() else {
         return Err(invalid_program_state(format!("expected PROGRAM op, got {:?}", program.op())));
     };
-    Ok((sink.clone(), device.clone(), linear.clone(), source.clone(), binary.clone()))
+    Ok((sink.clone(), info.clone(), linear.clone(), source.clone(), binary.clone()))
 }
 
 fn validate_program_shape(program: &Arc<UOp>) -> Result<()> {
-    let (sink, device, linear, source, binary) = unpack_program(program)?;
+    let (sink, info, linear, source, binary) = unpack_program(program)?;
+
+    let expected_arity = match (linear.is_some(), source.is_some(), binary.is_some()) {
+        (false, false, false) => 1,
+        (true, false, false) => 2,
+        (true, true, false) => 3,
+        (true, true, true) => 4,
+        _ => {
+            return Err(invalid_program_state(
+                "malformed PROGRAM state: stages must be SINK[, LINEAR[, SOURCE[, BINARY]]]",
+            ));
+        }
+    };
+    if program.op().sources().len() != expected_arity {
+        return Err(invalid_program_state(format!(
+            "malformed PROGRAM state: expected {expected_arity} progressive sources, got {}",
+            program.op().sources().len()
+        )));
+    }
 
     if !matches!(sink.op(), Op::Sink { .. }) {
         return Err(invalid_program_state(format!("PROGRAM sink must be SINK op, got {:?}", sink.op())));
-    }
-
-    if !matches!(device.op(), Op::Device(_)) {
-        return Err(invalid_program_state(format!("PROGRAM device must be DEVICE op, got {:?}", device.op())));
     }
 
     if let Some(linear) = &linear
@@ -58,22 +76,144 @@ fn validate_program_shape(program: &Arc<UOp>) -> Result<()> {
         )));
     }
 
-    if source.is_some() && linear.is_none() {
-        return Err(invalid_program_state("malformed PROGRAM state: SOURCE requires LINEAR stage"));
-    }
-    if binary.is_some() && source.is_none() {
-        return Err(invalid_program_state("malformed PROGRAM state: BINARY requires SOURCE stage"));
-    }
+    verify_final_sink(&sink)?;
+    validate_program_info(&sink, &info, None)?;
 
     Ok(())
 }
 
-fn preserve_program_context(new_program: Arc<UOp>, old_program: &Arc<UOp>) -> Arc<UOp> {
-    let mut out = new_program.rtag(old_program.tag().clone());
-    if let Some(meta) = old_program.metadata_raw() {
-        out = out.with_metadata_raw(meta);
+fn verify_final_sink(sink: &Arc<UOp>) -> Result<()> {
+    if svod_schedule::spec::spec_enabled() {
+        svod_schedule::spec::type_verify(sink, &svod_schedule::spec::spec_program())
+            .map_err(|error| invalid_program_state(error.to_string()))?;
     }
-    out
+    Ok(())
+}
+
+fn preserve_program_context(new_program: Arc<UOp>, old_program: &Arc<UOp>) -> Arc<UOp> {
+    new_program.rtag(old_program.tag().clone())
+}
+
+fn param_class(node: &Arc<UOp>) -> String {
+    let Op::Param { arg, .. } = node.op() else { return format!("{:?}", node.op()) };
+    match arg.addrspace {
+        None if arg.name.as_deref() == Some("_device_num") => "device scalar PARAM".to_string(),
+        None => format!("scalar PARAM {}", arg.name.as_deref().unwrap_or("<unnamed>")),
+        Some(svod_ir::AddrSpace::Global) => "global storage PARAM".to_string(),
+        Some(svod_ir::AddrSpace::Local) => "local storage PARAM".to_string(),
+        Some(svod_ir::AddrSpace::Reg) => "register storage PARAM".to_string(),
+    }
+}
+
+fn validate_param_slots(nodes: &[Arc<UOp>], stage: &'static str) -> Result<()> {
+    let mut occupied: HashMap<usize, Arc<UOp>> = HashMap::new();
+    for node in nodes {
+        let Op::Param { arg, .. } = node.op() else { continue };
+        if arg.slot == usize::MAX {
+            return Err(Error::UnassignedProgramParam { stage, param: param_class(node) });
+        }
+        if let Some(first) = occupied.insert(arg.slot, node.clone()) {
+            return Err(Error::DuplicateProgramParamSlot {
+                slot: arg.slot,
+                first: param_class(&first),
+                second: param_class(node),
+            });
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn executable_params(sink: &Arc<UOp>) -> Result<Vec<Arc<UOp>>> {
+    let executable = sink.toposort_call_aware(false);
+    let executable_keys = executable.iter().map(|node| UOpKey(node.clone())).collect::<HashSet<_>>();
+    for node in &executable {
+        if let Op::Special { name, .. } = node.op()
+            && !matches!(name.chars().last().and_then(|axis| axis.to_digit(10)), Some(0..=2))
+        {
+            return Err(Error::ProgramAbiMismatch { reason: format!("invalid SPECIAL axis name {name:?}") });
+        }
+        let body = match node.op() {
+            Op::Call { body, .. } | Op::Function { body, .. } => body,
+            _ => continue,
+        };
+        for formal in body.toposort_call_aware(true) {
+            if matches!(formal.op(), Op::Param { .. }) && executable_keys.contains(&UOpKey(formal.clone())) {
+                return Err(Error::LeakedOpaqueProgramParam { param: param_class(&formal) });
+            }
+        }
+    }
+    let mut params = executable.into_iter().filter(|node| matches!(node.op(), Op::Param { .. })).collect::<Vec<_>>();
+    validate_param_slots(&params, "final PROGRAM ABI validation")?;
+    params.sort_by_key(|node| match node.op() {
+        Op::Param { arg, .. } => arg.slot,
+        _ => usize::MAX,
+    });
+    Ok(params)
+}
+
+fn validate_program_info(
+    sink: &Arc<UOp>,
+    info: &ProgramInfo,
+    expected_target: Option<&DeviceSpec>,
+) -> Result<Vec<AbiParamDescriptor>> {
+    if let Some(expected) = expected_target
+        && &info.target != expected
+    {
+        return Err(Error::ProgramTargetMismatch { expected: expected.clone(), actual: info.target.clone() });
+    }
+    ProgramSpec::validate_program_param_abi(sink, info)
+}
+
+/// Port of Tinygrad's `pm_number_params`: assigned PARAM count is the initial
+/// slot and every unassigned PARAM is numbered in final topological walk order.
+/// Unlike the pinned implementation, occupied sparse slots are skipped rather
+/// than collided with; authored slots are never renumbered.
+pub(crate) fn number_params(sink: Arc<UOp>) -> Result<Arc<UOp>> {
+    let all_nodes = sink.toposort_call_aware(true);
+    let nodes = sink.toposort_call_aware(false);
+    let mut occupied = HashSet::new();
+    let mut authored = Vec::new();
+    for node in &nodes {
+        if let Op::Param { arg, .. } = node.op()
+            && arg.slot != usize::MAX
+        {
+            authored.push(node.clone());
+            occupied.insert(arg.slot);
+        }
+    }
+    validate_param_slots(&authored, "authored slot validation")?;
+
+    // Pinned Tinygrad seeds numbering with the full authored topological count,
+    // including opaque bodies, but its numbering rewrite preserves boundaries.
+    let mut next_slot =
+        all_nodes.iter().filter(|node| matches!(node.op(), Op::Param { arg, .. } if arg.slot != usize::MAX)).count();
+    let mut replacements = HashMap::new();
+
+    for node in nodes {
+        let Op::Param { shape, arg } = node.op() else { continue };
+        if arg.slot != usize::MAX {
+            continue;
+        }
+        while occupied.contains(&next_slot) {
+            next_slot = next_slot.checked_add(1).ok_or_else(|| Error::UnassignedProgramParam {
+                stage: "PARAM numbering slot exhaustion",
+                param: param_class(&node),
+            })?;
+        }
+        let mut numbered = arg.clone();
+        numbered.slot = next_slot;
+        occupied.insert(next_slot);
+        next_slot = next_slot.checked_add(1).ok_or_else(|| Error::UnassignedProgramParam {
+            stage: "PARAM numbering slot exhaustion",
+            param: param_class(&node),
+        })?;
+        let replacement = UOp::new(Op::Param { shape: shape.clone(), arg: numbered }, node.dtype());
+        replacements.insert(UOpKey(node), replacement);
+    }
+
+    let sink = sink.substitute_preserve_calls(&replacements);
+    executable_params(&sink)?;
+    Ok(sink)
 }
 
 fn rebuild_program(
@@ -82,17 +222,59 @@ fn rebuild_program(
     source: Option<Arc<UOp>>,
     binary: Option<Arc<UOp>>,
 ) -> Result<Arc<UOp>> {
-    let (sink, device, _, _, _) = unpack_program(base_program)?;
-    let rebuilt = UOp::program(sink, device, linear, source, binary);
+    let (sink, info, _, _, _) = unpack_program(base_program)?;
+    let rebuilt = UOp::program(sink, info, linear, source, binary);
     Ok(preserve_program_context(rebuilt, base_program))
 }
 
-/// Create initial PROGRAM(sink, device) state.
-pub fn program_from_sink(sink: Arc<UOp>, device: DeviceSpec) -> Arc<UOp> {
+/// Verify the final target graph and create initial PROGRAM(sink) state.
+pub fn program_from_sink(sink: Arc<UOp>, device: DeviceSpec) -> Result<Arc<UOp>> {
+    program_from_sink_impl(sink, device, None)
+}
+
+/// Renderer-aware PROGRAM boundary. ProgramInfo is deliberately discovered
+/// before either ISA rewrite, matching Tinygrad's `do_to_program` ordering.
+pub fn program_from_sink_with_renderer(sink: Arc<UOp>, renderer: &dyn Renderer) -> Result<Arc<UOp>> {
+    program_from_sink_impl(sink, renderer.device().clone(), Some(renderer))
+}
+
+fn program_from_sink_impl(sink: Arc<UOp>, device: DeviceSpec, renderer: Option<&dyn Renderer>) -> Result<Arc<UOp>> {
     let sink = if matches!(sink.op(), Op::Sink { .. }) { sink } else { UOp::sink(vec![sink]) };
-    let program = UOp::program(sink, UOp::device(device), None, None, None);
+    // Hand-authored kernels carry their stable name in structured SINK info.
+    // Optimizer metadata may also be present with an auto-generated shape name;
+    // it is only the fallback for ordinary scheduled kernels.
+    let kernel_name = match sink.op() {
+        Op::Sink { info: Some(info), .. } if info.name.is_some() => info.name.clone(),
+        _ => sink.metadata::<svod_schedule::optimizer::KernelInfo>().map(|info| info.function_name()),
+    };
+    // Tinygrad's target boundary is final rewrite -> implicit barriers -> CFG ->
+    // PARAM numbering -> spec_program -> ProgramInfo -> PROGRAM/linearization.
+    let sink = number_params(svod_schedule::add_control_flow(sink))?;
+    verify_final_sink(&sink)?;
+    let mut info = ProgramInfo::from_sink(&sink, device);
+    if let Some(name) = kernel_name {
+        info.name = name;
+    }
+    let sink = if let Some(renderer) = renderer {
+        let sink = if let Some(matcher) = renderer.pre_isel_matcher() {
+            svod_ir::rewrite::graph_rewrite_bottom_up(&matcher, sink, &mut svod_device::isa::PreIselContext::default())
+        } else {
+            sink
+        };
+        if let Some(matcher) = renderer.isel_matcher() {
+            let mut context = svod_device::isa::IselContext::new(&sink);
+            svod_ir::rewrite::graph_rewrite_bottom_up(&matcher, sink, &mut context)
+        } else {
+            sink
+        }
+    } else {
+        sink
+    };
+    let program = UOp::program(sink, info, None, None, None);
+    let (sink, info, _, _, _) = unpack_program(&program)?;
+    validate_program_info(&sink, &info, renderer.map(Renderer::device))?;
     svod_ir::dump_canonical_stage("program", &program);
-    program
+    Ok(program)
 }
 
 /// PROGRAM -> LINEAR stage.
@@ -103,7 +285,7 @@ pub fn do_linearize(program: &Arc<UOp>) -> Result<Arc<UOp>> {
         return Ok(program.clone());
     }
 
-    let linear_ops = svod_schedule::linearize_with_cfg(sink.clone());
+    let linear_ops = svod_schedule::linearize(sink.clone());
 
     if let Ok(dir) = std::env::var("SVOD_DUMP_LINEAR") {
         use std::io::Write;
@@ -141,74 +323,121 @@ pub fn do_linearize(program: &Arc<UOp>) -> Result<Arc<UOp>> {
 }
 
 /// PROGRAM(+LINEAR) -> SOURCE stage via Renderer.
-pub fn do_render(program: &Arc<UOp>, renderer: &dyn Renderer, name: Option<&str>) -> Result<(Arc<UOp>, ProgramSpec)> {
+pub fn do_render(program: &Arc<UOp>, renderer: &dyn Renderer) -> Result<(Arc<UOp>, ProgramSpec)> {
+    let (input_sink, input_info, _, _, _) = unpack_program(program)?;
+    let expected_abi = validate_program_info(&input_sink, &input_info, Some(renderer.device()))?;
     let linearized = do_linearize(program)?;
-    let (_sink, _device, linear, source, binary) = unpack_program(&linearized)?;
-
-    if source.is_some() || binary.is_some() {
-        return Err(invalid_program_state(format!(
-            "do_render expects PROGRAM stage with LINEAR only (source=None,binary=None), got source_present={}, binary_present={}",
-            source.is_some(),
-            binary.is_some()
-        )));
-    }
+    let (_sink, info, linear, source, binary) = unpack_program(&linearized)?;
 
     let linear_uop = linear.clone().ok_or_else(|| invalid_program_state("PROGRAM has no LINEAR stage"))?;
 
-    // Verify kernel invariants (integer indices, no surviving PtrCat) before
-    // the renderer turns a malformed kernel into a panic / malformed IR / GPU
-    // fault. Recoverable: beam search maps this to a skipped candidate.
-    // Port of tinygrad `type_verify(lst, spec_program)` (codegen/__init__.py:135).
-    if svod_schedule::spec::spec_enabled() {
-        svod_schedule::spec::type_verify(&linear_uop, &svod_schedule::spec::spec_program())
-            .map_err(|e| invalid_program_state(e.to_string()))?;
+    if let Some(source_uop) = source {
+        let Op::Source { code, .. } = source_uop.op() else {
+            return Err(invalid_program_state("PROGRAM source stage is not a SOURCE UOp"));
+        };
+        let expected = source_stage_identity(&info, &expected_abi, &linear_uop, code)?;
+        validate_source_stage(&source_uop, &expected)?;
+        let spec = ProgramSpec::from_uop(&linearized)?;
+        return Ok((linearized, spec));
     }
 
-    let spec = renderer.render(&linear_uop, name)?;
-    let source_uop = UOp::source(spec.src.clone());
-    let mut rendered = rebuild_program(&linearized, linear, Some(source_uop), None)?;
-    rendered = rendered.with_metadata(spec.clone());
+    if binary.is_some() {
+        return Err(invalid_program_state("PROGRAM BINARY stage cannot exist without SOURCE"));
+    }
+
+    let rendered_spec = renderer.render(&linear_uop, Some(&info.function_name()))?;
+    let rendered_vars = rendered_spec
+        .abi
+        .iter()
+        .filter(|param| !param.is_storage())
+        .map(|param| param.name.clone().unwrap_or_default())
+        .collect::<Vec<_>>();
+    let rendered_buffers = rendered_spec.abi.iter().filter(|param| param.is_storage()).count();
+    if rendered_spec.abi != expected_abi
+        || rendered_spec.buf_count != rendered_buffers
+        || rendered_spec.var_names != rendered_vars
+        || rendered_spec.device != info.target
+        || rendered_spec.name != info.function_name()
+    {
+        return Err(Error::ProgramAbiMismatch {
+            reason: format!("ProgramInfo ABI is {expected_abi:?}; renderer reported {:?}", rendered_spec.abi),
+        });
+    }
+    let source_identity = source_stage_identity(&info, &expected_abi, &linear_uop, &rendered_spec.src)?;
+    let source_uop = UOp::source_with_identity(rendered_spec.src.clone(), source_identity.clone());
+    validate_source_stage(&source_uop, &source_identity)?;
+    let rendered = rebuild_program(&linearized, linear, Some(source_uop), None)?;
+    let (_, _, _, rebuilt_source, _) = unpack_program(&rendered)?;
+    validate_source_stage(
+        rebuilt_source.as_ref().ok_or_else(|| invalid_program_state("rebuilt PROGRAM lost SOURCE stage"))?,
+        &source_identity,
+    )?;
     svod_ir::dump_canonical_stage("source", &rendered);
+    let spec = ProgramSpec::from_uop(&rendered)?;
     Ok((rendered, spec))
 }
 
 /// PROGRAM(+SOURCE) -> BINARY stage via Compiler.
 pub fn do_compile(program: &Arc<UOp>, compiler: &dyn Compiler) -> Result<(Arc<UOp>, CompiledSpec)> {
     validate_program_shape(program)?;
-    let (sink, _device, linear, source, binary) = unpack_program(program)?;
-
-    if let Some(binary_uop) = binary {
-        let Op::ProgramBinary { bytes } = binary_uop.op() else {
-            return Err(invalid_program_state("PROGRAM binary stage is not a ProgramBinary UOp"));
-        };
-
-        let spec = ProgramSpec::from_uop(program)?;
-
-        let mut compiled = CompiledSpec::from_bytes(spec.name.clone(), bytes.clone(), sink);
-        if !spec.src.is_empty() {
-            compiled.src = Some(spec.src.clone());
-        }
-        compiled.var_names = spec.var_names.clone();
-        compiled.global_size = spec.global_size.clone();
-        compiled.local_size = spec.local_size.clone();
-        compiled.buf_count = spec.buf_count;
-        return Ok((program.clone(), compiled));
-    }
-
-    if source.is_none() {
-        return Err(invalid_program_state("PROGRAM has no SOURCE stage"));
-    }
-
-    let spec = ProgramSpec::from_uop(program)?;
-    if spec.src.is_empty() {
+    let (sink, info, linear, source, binary) = unpack_program(program)?;
+    let source = source.ok_or_else(|| invalid_program_state("PROGRAM has no SOURCE stage"))?;
+    let linear_uop = linear.clone().ok_or_else(|| invalid_program_state("PROGRAM has no LINEAR stage"))?;
+    if matches!(source.op(), Op::Source { code, .. } if code.is_empty()) {
         return Err(invalid_program_state("PROGRAM has empty SOURCE stage"));
     }
 
-    let compiled = compiler.compile(&spec)?;
+    let spec = ProgramSpec::from_uop(program)?;
+    let expected_source = source_stage_identity(&info, &spec.abi, &linear_uop, &spec.src)?;
+    validate_source_stage(&source, &expected_source)?;
 
-    let binary_uop = UOp::binary(compiled.bytes.clone());
-    let mut compiled_program = rebuild_program(program, linear, source, Some(binary_uop))?;
-    compiled_program = compiled_program.with_metadata(spec);
+    if let Some(binary_uop) = binary {
+        let bytes = match binary_uop.op() {
+            Op::ProgramBinary { bytes, .. } => bytes,
+            _ => return Err(invalid_program_state("PROGRAM binary stage is not a ProgramBinary UOp")),
+        };
+        let expected_binary = binary_stage_identity(expected_source, compiler.cache_key(), bytes);
+        let bytes = validate_binary_stage(&binary_uop, &expected_binary)?;
+        let mut compiled = CompiledSpec::from_bytes(spec.name.clone(), bytes, sink, spec.abi.clone())?;
+        compiled.src = Some(spec.src.clone());
+        compiled.global_size = spec.global_size.clone();
+        compiled.local_size = spec.local_size.clone();
+        compiled.bind_program_stage(linear_uop, &info.target, compiler.cache_key(), expected_binary)?;
+        return Ok((program.clone(), compiled));
+    }
+
+    let mut compiled = compiler.compile(&spec)?;
+    svod_device::device::validate_abi_descriptors(&compiled.abi, compiled.buf_count, &compiled.var_names)?;
+    if compiled.abi != spec.abi
+        || compiled.buf_count != spec.buf_count
+        || compiled.var_names != spec.var_names
+        || compiled.name != spec.name
+        || compiled.src.as_ref().is_some_and(|source| source != &spec.src)
+    {
+        return Err(Error::ProgramAbiMismatch {
+            reason: format!(
+                "compiler changed PROGRAM ABI: source abi={:?}, buffers={}, vars={:?}; compiled abi={:?}, buffers={}, vars={:?}",
+                spec.abi, spec.buf_count, spec.var_names, compiled.abi, compiled.buf_count, compiled.var_names
+            ),
+        });
+    }
+
+    compiled.src = Some(spec.src.clone());
+    let binary_identity = binary_stage_identity(expected_source, compiler.cache_key(), &compiled.bytes);
+    compiled.bind_program_stage(linear_uop, &info.target, compiler.cache_key(), binary_identity.clone())?;
+    let binary_uop = UOp::binary_with_identity(compiled.bytes.clone(), binary_identity.clone());
+    validate_binary_stage(&binary_uop, &binary_identity)?;
+    let compiled_program = rebuild_program(program, linear, Some(source), Some(binary_uop))?;
+    let (_, _, _, rebuilt_source, rebuilt_binary) = unpack_program(&compiled_program)?;
+    validate_source_stage(
+        rebuilt_source.as_ref().ok_or_else(|| invalid_program_state("rebuilt PROGRAM lost SOURCE stage"))?,
+        &binary_identity.source,
+    )?;
+    validate_binary_stage(
+        rebuilt_binary.as_ref().ok_or_else(|| invalid_program_state("rebuilt PROGRAM lost BINARY stage"))?,
+        &binary_identity,
+    )?;
+    ProgramSpec::from_uop(&compiled_program)?;
     svod_ir::dump_canonical_stage("binary", &compiled_program);
     Ok((compiled_program, compiled))
 }
@@ -218,12 +447,13 @@ pub fn get_program(
     input: &Arc<UOp>,
     renderer: &dyn Renderer,
     compiler: &dyn Compiler,
-    name: Option<&str>,
     target: ProgramTarget,
 ) -> Result<Arc<UOp>> {
     let mut program = match input.op() {
         Op::Program { .. } => {
             validate_program_shape(input)?;
+            let (_, info, _, _, _) = unpack_program(input)?;
+            validate_program_info(&unpack_program(input)?.0, &info, Some(renderer.device()))?;
             input.clone()
         }
         other => return Err(invalid_program_state(format!("expected PROGRAM input, got {other:?}"))),
@@ -237,21 +467,18 @@ pub fn get_program(
     }
 
     if matches!(target, ProgramTarget::Source | ProgramTarget::Binary) {
-        let (_, _, _, source, _) = unpack_program(&program)?;
-        if source.is_none() {
-            let (rendered, _) = do_render(&program, renderer, name)?;
-            program = rendered;
-        }
+        let (rendered, _) = do_render(&program, renderer)?;
+        program = rendered;
     }
 
     if matches!(target, ProgramTarget::Binary) {
-        let (_, _, _, _, binary) = unpack_program(&program)?;
-        if binary.is_none() {
-            let (compiled, _) = do_compile(&program, compiler)?;
-            program = compiled;
-        }
+        let (compiled, _) = do_compile(&program, compiler)?;
+        program = compiled;
     }
 
     validate_program_shape(&program)?;
+    if matches!(target, ProgramTarget::Source | ProgramTarget::Binary) {
+        ProgramSpec::from_uop(&program)?;
+    }
     Ok(program)
 }
