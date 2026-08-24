@@ -110,3 +110,13 @@ fn test_reduce_axis_mixed_size_dims() {
         if std::sync::Arc::ptr_eq(src, &shaped) && axes == &[1, 0, 2, 3]));
     assert_eq!(result.shape().unwrap().unwrap().as_slice(), &[SInt::Const(4)]);
 }
+
+#[test]
+fn test_reduce_axis_rejects_duplicate_axes_like_tinygrad_permute() {
+    use crate::SInt;
+    use crate::shape::shape_to_uop;
+    use smallvec::smallvec;
+
+    let shaped = UOp::reshape(UOp::native_const(1.0f32), shape_to_uop(&smallvec![SInt::Const(2), SInt::Const(3)]));
+    assert!(shaped.try_reduce_axis(ReduceOp::Add, vec![0, 0]).is_err());
+}

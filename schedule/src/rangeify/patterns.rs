@@ -94,7 +94,9 @@ pub fn early_rewrites() -> TypedPatternMatcher {
         reduce @ Reduce { src: x, ranges: _, reduce_op: _, num_axes: _ }
             if has_zero_size(x) && !has_zero_size(reduce) => {
             let Op::Reduce { reduce_op, .. } = reduce.op() else { return None };
-            Some(crate::symbolic::dce::reduce_identity(*reduce_op, reduce.dtype()))
+            let identity = crate::symbolic::dce::reduce_identity(*reduce_op, reduce.dtype());
+            let Op::Const(value) = identity.op() else { unreachable!("reduction identity must be constant") };
+            Some(reduce.const_like(value.0))
         },
 
         // Any non-SINK op with zero size → const 0.

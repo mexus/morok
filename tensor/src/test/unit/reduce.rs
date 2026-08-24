@@ -346,6 +346,18 @@ crate::codegen_tests! {
         assert_close_f32(&result.realize_with_and(&config).as_vec::<f32>().unwrap(), &[3.0, 7.0], 1e-6);
     }
 
+    fn test_sum_empty_axis_preserves_nonreduced_shape(config) {
+        test_setup();
+        let t = Tensor::empty(&[0, 3], DType::Float32);
+        let mut squeezed = t.sum(0).unwrap();
+        assert_eq!(squeezed.shape().unwrap().as_slice(), &[SInt::Const(3)]);
+        assert_eq!(squeezed.realize_with_and(&config).as_vec::<f32>().unwrap(), [0.0; 3]);
+
+        let mut kept = t.sum_with().axes(0).keepdim(true).call().unwrap();
+        assert_eq!(kept.shape().unwrap().as_slice(), &[SInt::Const(1), SInt::Const(3)]);
+        assert_eq!(kept.realize_with_and(&config).as_vec::<f32>().unwrap(), [0.0; 3]);
+    }
+
     fn test_sum_single_element_value(config) {
         test_setup();
         let t = Tensor::from_slice([42.0f32]);

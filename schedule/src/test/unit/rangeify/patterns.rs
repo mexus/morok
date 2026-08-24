@@ -69,6 +69,21 @@ fn test_early_rewrites_no_match_for_other_ops() {
 }
 
 #[test]
+fn test_early_rewrites_preserves_shaped_empty_reduction_identity() {
+    let source = UOp::new_buffer(svod_dtype::DeviceSpec::Cpu, 0, DType::Float32)
+        .try_reshape(&smallvec::smallvec![svod_ir::SInt::Const(0), svod_ir::SInt::Const(3)])
+        .unwrap();
+    let reduce = source.try_reduce_axis(svod_ir::ReduceOp::Add, vec![0]).unwrap();
+    let result = patterns::early_rewrites().rewrite(&reduce, &mut ());
+    let RewriteResult::Rewritten(identity) = result else { panic!("empty reduction must fold") };
+
+    assert_eq!(identity.shape().unwrap().unwrap().as_slice(), &[svod_ir::SInt::Const(3)]);
+    assert!(
+        matches!(identity.op(), Op::Expand { src, .. } if matches!(src.op(), Op::Const(value) if value.0.try_float() == Some(0.0)))
+    );
+}
+
+#[test]
 fn test_early_rewrites_nested_detach() {
     let matcher = patterns::early_rewrites();
 

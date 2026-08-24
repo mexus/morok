@@ -152,6 +152,7 @@ fn device_lane_binding(call_id: u64, ast: &Arc<UOp>, lane_count: Option<usize>) 
 struct MultiSourceExpansion {
     lanes: Vec<Vec<Arc<UOp>>>,
     bind_device_num: bool,
+    is_multi: bool,
 }
 
 fn expand_multi_sources(call_id: u64, ast: &Arc<UOp>, sources: &[Arc<UOp>]) -> Result<MultiSourceExpansion> {
@@ -176,7 +177,7 @@ fn expand_multi_sources(call_id: u64, ast: &Arc<UOp>, sources: &[Arc<UOp>]) -> R
 
     let bind_device_num = device_lane_binding(call_id, ast, lane_count)?;
     let Some(lane_count) = lane_count else {
-        return Ok(MultiSourceExpansion { lanes: vec![sources.to_vec()], bind_device_num: false });
+        return Ok(MultiSourceExpansion { lanes: vec![sources.to_vec()], bind_device_num: false, is_multi: false });
     };
     let effect = match ast.op() {
         Op::End { computation, .. } => computation,
@@ -222,7 +223,7 @@ fn expand_multi_sources(call_id: u64, ast: &Arc<UOp>, sources: &[Arc<UOp>]) -> R
         }
     }
 
-    Ok(MultiSourceExpansion { lanes, bind_device_num })
+    Ok(MultiSourceExpansion { lanes, bind_device_num, is_multi: true })
 }
 
 fn collect_callable_dep_ids(dep: &Arc<UOp>, out: &mut HashSet<u64>) -> Result<()> {
@@ -965,7 +966,7 @@ pub fn instantiate_schedule(
         };
         let cross_device_effect = matches!(effect.op(), Op::Copy { .. })
             || matches!(effect.op(), Op::CustomFunction { kind: CustomFunctionKind::AllReduce { .. }, .. });
-        if lane_buffers.len() > 1 && !cross_device_effect {
+        if expansion.is_multi && !cross_device_effect {
             for (lane, kb) in lane_buffers.iter().enumerate() {
                 let mut expected: Option<svod_dtype::DeviceSpec> = None;
                 for buffer in &kb.buffers {
