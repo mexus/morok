@@ -95,3 +95,55 @@ fn host_allreduce_executes_float16_sum_on_storage_grid() {
         .collect::<Vec<_>>();
     assert_eq!(values, vec![3.75, 3.0]);
 }
+
+#[test]
+fn host_allreduce_bfloat16_sum_overflows_on_float32_grid() {
+    let alloc = svod_device::registry::cpu().expect("cpu allocator");
+    let make = |bits: u16| {
+        let mut buffer = Buffer::new(alloc.clone(), DType::BFloat16, vec![1], Default::default());
+        buffer.copyin(&bits.to_le_bytes()).unwrap();
+        buffer
+    };
+    let max_finite = 0x7f7f;
+    let mut buffers = vec![make(0), make(max_finite), make(max_finite)];
+
+    run_custom_function(
+        &CustomFunctionKind::AllReduce { reduce_op: svod_ir::ReduceOp::Add },
+        &[],
+        &mut buffers,
+        &HashMap::new(),
+    )
+    .unwrap();
+
+    let mut bytes = [0; 2];
+    buffers[0].copyout(&mut bytes).unwrap();
+    assert_eq!(u16::from_le_bytes(bytes), 0x7f80);
+}
+
+#[test]
+fn host_allreduce_rejects_shape_and_element_alignment_mismatches() {
+    let alloc = svod_device::registry::cpu().expect("cpu allocator");
+    let make = |shape: &[usize]| Buffer::new(alloc.clone(), DType::Float32, shape.to_vec(), Default::default());
+
+    let mut shape_mismatch = vec![make(&[2]), make(&[1, 2]), make(&[2])];
+    let err = run_custom_function(
+        &CustomFunctionKind::AllReduce { reduce_op: svod_ir::ReduceOp::Add },
+        &[],
+        &mut shape_mismatch,
+        &HashMap::new(),
+    )
+    .unwrap_err();
+    assert!(matches!(err, crate::Error::Execution { reason } if reason.contains("identical dtype, shape")));
+
+    let base = make(&[1]);
+    let odd = || base.view(0, 3).unwrap();
+    let mut unaligned = vec![odd(), odd(), odd()];
+    let err = run_custom_function(
+        &CustomFunctionKind::AllReduce { reduce_op: svod_ir::ReduceOp::Add },
+        &[],
+        &mut unaligned,
+        &HashMap::new(),
+    )
+    .unwrap_err();
+    assert!(matches!(err, crate::Error::Execution { reason } if reason.contains("not aligned")));
+}

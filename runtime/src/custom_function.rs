@@ -44,8 +44,30 @@ fn run_host_allreduce(reduce_op: ReduceOp, buffers: &mut [Buffer]) -> Result<()>
     }
     let dtype = buffers[0].dtype();
     let byte_len = buffers[0].size();
-    if buffers.iter().any(|buffer| buffer.dtype() != dtype || buffer.size() != byte_len) {
-        return Err(Error::Execution { reason: "all-reduce buffers must have identical dtype and byte size".into() });
+    let shape = buffers[0].shape();
+    if buffers.iter().any(|buffer| buffer.dtype() != dtype || buffer.size() != byte_len || buffer.shape() != shape) {
+        return Err(Error::Execution {
+            reason: "all-reduce buffers must have identical dtype, shape, and byte size".into(),
+        });
+    }
+    let element_width = match dtype {
+        DType::Scalar(ScalarDType::Float16 | ScalarDType::BFloat16 | ScalarDType::Int16 | ScalarDType::UInt16) => 2,
+        DType::Scalar(ScalarDType::Float32 | ScalarDType::Int32 | ScalarDType::UInt32) => 4,
+        DType::Scalar(ScalarDType::Float64 | ScalarDType::Int64 | ScalarDType::UInt64) => 8,
+        DType::Scalar(ScalarDType::Int8 | ScalarDType::UInt8) => 1,
+        ref other => {
+            return Err(Error::Unsupported {
+                kind: "AllReduce".into(),
+                reason: format!("host collective dtype {other:?} is not supported"),
+            });
+        }
+    };
+    if !byte_len.is_multiple_of(element_width) {
+        return Err(Error::Execution {
+            reason: format!(
+                "all-reduce byte size {byte_len} is not aligned to {element_width}-byte {dtype:?} elements"
+            ),
+        });
     }
     let mut shards = Vec::with_capacity(buffers.len() - 1);
     for buffer in &buffers[1..] {
@@ -122,7 +144,12 @@ fn run_host_allreduce(reduce_op: ReduceOp, buffers: &mut [Buffer]) -> Result<()>
                     let rhs = decode(shard);
                     value = match reduce_op {
                         ReduceOp::Add => {
-                            svod_dtype::cast::commit_float(value + rhs, scalar).ok_or_else(|| Error::Execution {
+                            let sum = if scalar == ScalarDType::BFloat16 {
+                                ((value as f32) + (rhs as f32)) as f64
+                            } else {
+                                value + rhs
+                            };
+                            svod_dtype::cast::commit_float(sum, scalar).ok_or_else(|| Error::Execution {
                                 reason: format!("cannot commit {value} + {rhs} as {scalar:?} during all-reduce"),
                             })?
                         }
@@ -136,12 +163,7 @@ fn run_host_allreduce(reduce_op: ReduceOp, buffers: &mut [Buffer]) -> Result<()>
                 output[offset..offset + 2].copy_from_slice(&bits.to_le_bytes());
             }
         }
-        other => {
-            return Err(Error::Unsupported {
-                kind: "AllReduce".into(),
-                reason: format!("host collective dtype {other:?} is not supported"),
-            });
-        }
+        _ => unreachable!("dtype was validated above"),
     }
 
     buffers[0].copyin(&output).map_err(|source| Error::Exec { source, context: "host all-reduce copyin".into() })
