@@ -202,6 +202,14 @@ fn preoptimization_rejects_unsupported_movement_and_bad_multi_axis() {
 }
 
 #[test]
+fn spec_program_rejects_tensor_form_reduce() {
+    let tensor_reduce = UOp::native_const(1.0f32).reduce_with_num_axes(smallvec![], ReduceOp::Add, 1);
+    let err = type_verify(&UOp::sink(vec![tensor_reduce]), &spec_program())
+        .expect_err("tensor REDUCE must not reach codegen");
+    assert!(err.to_string().contains("must be rangeified"), "unexpected error: {err}");
+}
+
+#[test]
 fn preoptimization_accepts_valid_custom_kernel_forms() {
     let buffer = global_param(0);
     let index = UOp::index().buffer(buffer).indices(vec![int_const(DType::Int32, 0)]).call().unwrap();

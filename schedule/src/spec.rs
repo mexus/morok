@@ -567,6 +567,15 @@ fn rule_no_invalid() -> SpecRule {
     Box::new(|u| UOp::is_invalid_marker(u).then_some(Err("Invalid constant must be folded out before a program")))
 }
 
+fn rule_no_tensor_reduce() -> SpecRule {
+    Box::new(|u| match u.op() {
+        Op::Reduce { num_axes, .. } if *num_axes != 0 => {
+            Some(Err("tensor-form REDUCE must be rangeified before a program"))
+        }
+        _ => None,
+    })
+}
+
 /// `spec.py:219-220` — IF has a bool gate; ENDIF closes an IF.
 fn rule_if() -> SpecRule {
     Box::new(|u| match u.op() {
@@ -610,6 +619,7 @@ pub fn spec_program() -> Spec {
         // before INVALID, then appends spec_shared (which contains it again).
         rule_program_buffer(),
         rule_no_invalid(),
+        rule_no_tensor_reduce(),
         rule_if(),
         rule_program_special(),
     ];

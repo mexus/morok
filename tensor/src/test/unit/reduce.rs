@@ -3,6 +3,7 @@ use crate::test::helpers::*;
 use crate::*;
 use ndarray::array;
 use svod_dtype::DType;
+use svod_ir::Op;
 
 #[test]
 fn test_axis_spec_all() {
@@ -57,6 +58,19 @@ fn test_sum_acc_dtype() {
     assert_eq!(Tensor::sum_acc_dtype(&DType::BFloat16), DType::Float32);
     assert_eq!(Tensor::sum_acc_dtype(&DType::Float32), DType::Float32);
     assert_eq!(Tensor::sum_acc_dtype(&DType::Float64), DType::Float64);
+}
+
+#[test]
+fn test_keepdim_wraps_squeezed_tensor_reduce_in_reshape() {
+    let tensor = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]).try_reshape([2, 3]).unwrap();
+    let squeezed = tensor.sum(1).unwrap();
+    let kept = tensor.sum_with().axes(1).keepdim(true).call().unwrap();
+
+    assert!(matches!(squeezed.uop().op(), Op::Reduce { ranges, num_axes: 1, .. } if ranges.is_empty()));
+    assert_eq!(squeezed.shape().unwrap().as_slice(), &[SInt::Const(2)]);
+    assert!(matches!(kept.uop().op(), Op::Reshape { src, .. }
+        if matches!(src.op(), Op::Reduce { ranges, num_axes: 1, .. } if ranges.is_empty())));
+    assert_eq!(kept.shape().unwrap().as_slice(), &[SInt::Const(2), SInt::Const(1)]);
 }
 
 // ========== Argmax Tests ==========

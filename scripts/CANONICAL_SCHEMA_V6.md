@@ -99,11 +99,11 @@ Strict requested capture uses `SVOD_CAPTURE_CANONICAL_STAGE`,
 request panics on graph serialization, JSON serialization, or file-write
 failure. `SVOD_DUMP_CANONICAL_STAGE` remains a best-effort diagnostic stream.
 
-The production fixture has strict parity at every captured stage from `tensor`
-through `linearized`. The checked manifest contains only the independent
-`padded_reduction` REDUCE-01 expected failure. Ordinary script mode fails on any
-new production mismatch. `CANONICAL_RECORD_KNOWN_GAPS=1` succeeds only when both
-independent captures are deterministic and exactly match the checked manifest.
+The direct corpus and production fixture have strict parity, including every
+captured production stage from `tensor` through `linearized`. The checked
+mismatch manifest is empty. Ordinary script mode fails on any new mismatch.
+`CANONICAL_RECORD_KNOWN_GAPS=1` succeeds only when both independent captures are
+deterministic and exactly match the checked manifest.
 
 Every mismatch diagnostic starts with SHA-256 hashes of both complete validated
 documents. Hash input is deterministic JSON with recursively sorted object keys,
@@ -125,11 +125,9 @@ and rich PROGRAM metadata created through `ProgramInfo.from_sink` with dense
 mixed storage/scalar slots, symbolic launch value, sizes, ABI lists, name, and
 common target.
 
-Exact expected failures remain for symbolic FUNCTION result shape (IR-03;
-Tinygrad inserts an additional weak-index CAST during parameter substitution)
-and padded reduction (REDUCE-01; Svod retains REDUCE_AXIS where Tinygrad emits
-REDUCE). A real production multi-output callification capture is deterministic
-and remains in EVID-01B because callified PARAM device metadata differs.
+Padded reduction now uses the pinned tensor-form `REDUCE` representation, so no
+exact expected-failure fixture remains. Symbolic FUNCTION result shape and real
+production multi-output callification also compare strictly.
 Pointer/image/vector dtype,
 tuple-device/target, callable gradient identity, nondefault Tinygrad-only
 KernelInfo/Target fields, UNIQUE/LUNIQUE, and non-verbose BINARY remain explicit

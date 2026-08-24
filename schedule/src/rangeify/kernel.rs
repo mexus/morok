@@ -595,7 +595,7 @@ fn find_split_candidates(
     is_expanded: &[bool],
     config: &SplitReduceOpConfig,
 ) -> Vec<SplitCandidate> {
-    let Op::ReduceAxis { axes: reduce_axes, .. } = reduce.op() else {
+    let Op::Reduce { num_axes, .. } = reduce.op() else {
         return vec![];
     };
 
@@ -608,7 +608,7 @@ fn find_split_candidates(
 
     let mut candidates = Vec::new();
 
-    for &axis in reduce_axes {
+    for axis in 0..*num_axes {
         if axis >= is_expanded.len() || is_expanded[axis] {
             continue;
         }
@@ -642,7 +642,7 @@ fn apply_split_transformation(
     candidate: &SplitCandidate,
     input_shape: &[SInt],
 ) -> Option<Arc<UOp>> {
-    let Op::ReduceAxis { reduce_op, axes: reduce_axes, .. } = reduce.op() else {
+    let Op::Reduce { reduce_op, num_axes, .. } = reduce.op() else {
         return None;
     };
 
@@ -668,23 +668,7 @@ fn apply_split_transformation(
 
     let permuted = reshaped.try_permute(permutation.clone()).ok()?;
 
-    let adjusted_axes: Vec<usize> = reduce_axes
-        .iter()
-        .map(|&axis| {
-            if axis < dim_to_split {
-                axis
-            } else if axis == dim_to_split {
-                dim_to_split + 1
-            } else {
-                axis + 1
-            }
-        })
-        .collect();
-
-    let permuted_axes: Vec<usize> =
-        adjusted_axes.iter().map(|&old_axis| permutation.iter().position(|&p| p == old_axis).unwrap()).collect();
-
-    let first_reduce = permuted.try_reduce_axis(*reduce_op, permuted_axes).ok()?;
+    let first_reduce = permuted.try_reduce_axis(*reduce_op, (0..*num_axes).collect()).ok()?;
 
     let contiguous = first_reduce.contiguous();
 
@@ -698,15 +682,18 @@ fn apply_split_transformation(
     second_reduce.try_reshape(final_shape).ok()
 }
 
-/// Split large REDUCE_AXIS into two stages.
+/// Split a large tensor-form REDUCE into two stages.
 pub fn split_reduceop(reduce: &Arc<UOp>, config: &SplitReduceOpConfig) -> Option<Arc<UOp>> {
     if !config.enabled {
         return None;
     }
 
-    let Op::ReduceAxis { src: source, .. } = reduce.op() else {
+    let Op::Reduce { src: source, ranges, num_axes, .. } = reduce.op() else {
         return None;
     };
+    if *num_axes == 0 || !ranges.is_empty() {
+        return None;
+    }
 
     let input_shape = source.shape().ok()??;
     let output_shape = reduce.shape().ok()??;

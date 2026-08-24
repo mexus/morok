@@ -207,7 +207,7 @@ pub fn run_rangeify(sink: Arc<UOp>) -> svod_ir::Result<(Arc<UOp>, IndexingContex
     assign_ranges(&forward_topo, &consumer_map, &mut ctx, &mut simplify_cache)?;
 
     // Step 4: Apply rangeify patterns (pm_apply_rangeify)
-    // Converts ReduceAxis→REDUCE, PAD→WHERE, creates STAGE+INDEX, removes movement ops.
+    // Converts tensor REDUCE to ranged REDUCE, PAD→WHERE, creates STAGE+INDEX, removes movement ops.
     // Must run bottom_up so patterns see ORIGINAL children (bottom_up=True).
     let rangeify_matcher = super::patterns::apply_rangeify_patterns();
     let transformed_sink = crate::rewrite::graph_rewrite_bottom_up_preserve_calls(&rangeify_matcher, sink, &mut ctx);
@@ -552,7 +552,6 @@ fn assign_ranges(
             } else {
                 continue;
             }
-        // ReduceAxis uses the same consumer_rngs branching as all other ops
         } else if consumer_rngs.is_empty() {
             continue;
         } else if consumer_rngs.len() == 1 {
@@ -570,14 +569,14 @@ fn assign_ranges(
         if !ending.is_empty() {
             debug!(
                 ending_count = ending.len(),
-                triggers_realization = matches!(x.op(), Op::ReduceAxis { .. }) || is_elementwise_op(x),
+                triggers_realization = matches!(x.op(), Op::Reduce { .. }) || is_elementwise_op(x),
                 "Ending ranges detected (pre-in_rngs check)"
             );
         }
         // Use ending ranges directly without filtering (matches upstream behavior).
         let filtered_ending = ending.clone();
 
-        if !filtered_ending.is_empty() && (matches!(x.op(), Op::ReduceAxis { .. }) || is_elementwise_op(x)) {
+        if !filtered_ending.is_empty() && (matches!(x.op(), Op::Reduce { .. }) || is_elementwise_op(x)) {
             if let Some(shape) = x.shape().ok().flatten() {
                 // Start with existing realize_axes (from merge_consumer_ranges)
                 let mut realize_axes: Vec<usize> = ctx.get_realize_axes(x).cloned().unwrap_or_default();
@@ -646,65 +645,23 @@ fn assign_ranges(
                     out_rngs.clone()
                 }
             }
-            Op::ReduceAxis { src, axes, .. } => {
+            Op::Reduce { src, num_axes, .. } if *num_axes > 0 => {
                 if let Some(in_shape) = src.shape()? {
-                    // Trace ReduceAxis range assignment details
                     if tracing::enabled!(tracing::Level::TRACE) {
                         let out_shape = x.shape()?;
                         trace!(
                             uop.id = x.id,
-                            reduce.axes = ?axes,
+                            reduce.num_axes = *num_axes,
                             in_shape.len = in_shape.len(),
                             out_shape.len = ?out_shape.as_ref().map(|s| s.len()),
                             out_rngs.len = out_rngs.len(),
-                            "ReduceAxis range assignment"
+                            "tensor REDUCE range assignment"
                         );
-                        for (idx, rng) in out_rngs.iter().enumerate() {
-                            match rng.op() {
-                                Op::Binary(binop, a, b) => {
-                                    trace!(
-                                        range.index = idx,
-                                        range.id = rng.id,
-                                        op = "Binary",
-                                        binary_op = ?binop,
-                                        left.id = a.id,
-                                        right.id = b.id,
-                                        "ReduceAxis out_rngs entry"
-                                    );
-                                }
-                                Op::Range { axis_id, axis_type, .. } => {
-                                    trace!(
-                                        range.index = idx,
-                                        range.id = rng.id,
-                                        op = "Range",
-                                        axis.id = ?axis_id,
-                                        axis.type_ = ?axis_type,
-                                        "ReduceAxis out_rngs entry"
-                                    );
-                                }
-                                _ => {
-                                    trace!(
-                                        range.index = idx,
-                                        range.id = rng.id,
-                                        op = ?std::mem::discriminant(rng.op()),
-                                        "ReduceAxis out_rngs entry"
-                                    );
-                                }
-                            }
-                        }
                     }
 
                     let mut rngs = Vec::with_capacity(in_shape.len());
-                    for (i, s) in in_shape.iter().enumerate() {
-                        if axes.contains(&i) {
-                            rngs.push(ctx.new_range(s, AxisType::Reduce));
-                        } else if i < out_rngs.len() {
-                            rngs.push(Arc::clone(&out_rngs[i]));
-                            trace!(dim.index = i, range.id = out_rngs[i].id, "ReduceAxis using existing out_rngs");
-                        } else {
-                            rngs.push(ctx.new_range(s, AxisType::Weak));
-                        }
-                    }
+                    rngs.extend(in_shape.iter().take(*num_axes).map(|s| ctx.new_range(s, AxisType::Reduce)));
+                    rngs.extend(out_rngs.iter().cloned());
                     rngs
                 } else {
                     out_rngs.clone()

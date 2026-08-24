@@ -89,8 +89,8 @@ fn non_sharded_reduce_axis_runs_per_shard_before_rangeify() {
     let rewritten = graph_rewrite(&multi_pm(), reduced.clone(), &mut ());
 
     assert!(matches!(rewritten.op(), Op::Multi { src, axis: 0 }
-        if matches!(src.op(), Op::ReduceAxis { src: inner, axes, .. }
-            if Arc::ptr_eq(inner, &local) && axes == &[0])));
+        if matches!(src.op(), Op::Reduce { src: inner, ranges, num_axes: 1, .. }
+            if Arc::ptr_eq(inner, &local) && ranges.is_empty())));
     validate_supported_subset(&rewritten).unwrap();
 
     let rangeified = rangeify_with_map(UOp::sink(vec![reduced])).unwrap();
@@ -100,7 +100,7 @@ fn non_sharded_reduce_axis_runs_per_shard_before_rangeify() {
             .sink
             .toposort()
             .iter()
-            .all(|node| { !matches!(node.op(), Op::ReduceAxis { src, .. } if matches!(src.op(), Op::Multi { .. })) })
+            .all(|node| { !matches!(node.op(), Op::Reduce { src, .. } if matches!(src.op(), Op::Multi { .. })) })
     );
 }
 
@@ -226,17 +226,17 @@ fn shard_axis_reduce_emits_local_sum_then_allreduce() {
     let shard1 = buffer(8).try_reshape(&smallvec![SInt::Const(2), SInt::Const(4)]).unwrap();
     let shards = UOp::mstack(smallvec![shard0.clone(), shard1.clone()]);
     let reduced = UOp::multi(shards, 0).try_reduce_axis(ReduceOp::Add, vec![0]).unwrap();
-    let rewritten = graph_rewrite(&multi_pm(), reduced, &mut ());
+    let rewritten = graph_rewrite(&multi_pm(), reduced.clone(), &mut ());
 
     let Op::AllReduce { src, reduce_op: ReduceOp::Add, .. } = rewritten.op() else {
         panic!("expected ALLREDUCE, got {:?}", rewritten.op());
     };
     let Op::MStack { buffers } = src.op() else { panic!("expected local reduction MSTACK") };
     assert_eq!(buffers.len(), 2);
-    assert!(matches!(buffers[0].op(), Op::ReduceAxis { src, reduce_op: ReduceOp::Add, axes }
-        if Arc::ptr_eq(src, &shard0) && axes == &[0]));
-    assert!(matches!(buffers[1].op(), Op::ReduceAxis { src, reduce_op: ReduceOp::Add, axes }
-        if Arc::ptr_eq(src, &shard1) && axes == &[0]));
+    assert!(matches!(buffers[0].op(), Op::Reduce { src, reduce_op: ReduceOp::Add, ranges, num_axes: 1 }
+        if Arc::ptr_eq(src, &shard0) && ranges.is_empty()));
+    assert!(matches!(buffers[1].op(), Op::Reduce { src, reduce_op: ReduceOp::Add, ranges, num_axes: 1 }
+        if Arc::ptr_eq(src, &shard1) && ranges.is_empty()));
     validate_supported_subset(&rewritten).unwrap();
 }
 
@@ -260,7 +260,7 @@ fn reduced_precision_cast_is_restored_around_collective() {
     let low1 = UOp::new_buffer(DeviceSpec::Cpu, 4, DType::Float16);
     let shards = UOp::mstack(smallvec![low0.cast(DType::Float32), low1.cast(DType::Float32)]);
     let reduced = UOp::multi(shards, 0).try_reduce_axis(ReduceOp::Add, vec![0]).unwrap();
-    let rewritten = graph_rewrite(&multi_pm(), reduced, &mut ());
+    let rewritten = graph_rewrite(&multi_pm(), reduced.clone(), &mut ());
 
     let Op::Cast { src: collective, dtype: DType::Scalar(svod_dtype::ScalarDType::Float32) } = rewritten.op() else {
         panic!("expected widened result cast, got {:?}", rewritten.op());
@@ -271,9 +271,39 @@ fn reduced_precision_cast_is_restored_around_collective() {
 }
 
 #[test]
+fn non_leading_shard_axis_reduce_permutes_each_explicit_shard_before_allreduce() {
+    let shard0 = buffer(8).try_reshape(&smallvec![SInt::Const(2), SInt::Const(4)]).unwrap();
+    let shard1 = buffer(8).try_reshape(&smallvec![SInt::Const(2), SInt::Const(4)]).unwrap();
+    let shards = UOp::mstack(smallvec![shard0.clone(), shard1.clone()]);
+    let reduced = UOp::multi(shards, 1).try_reduce_axis(ReduceOp::Add, vec![1]).unwrap();
+    let rewritten = graph_rewrite(&multi_pm(), reduced.clone(), &mut ());
+
+    let Op::AllReduce { src, reduce_op: ReduceOp::Add, .. } = rewritten.op() else {
+        panic!("expected ALLREDUCE, got {:?}", rewritten.op());
+    };
+    let Op::MStack { buffers } = src.op() else { panic!("expected local reduction MSTACK") };
+    for (local, shard) in buffers.iter().zip([shard0, shard1]) {
+        let Op::Reduce { src, ranges, num_axes: 1, .. } = local.op() else { panic!("expected tensor REDUCE") };
+        assert!(ranges.is_empty());
+        assert!(matches!(src.op(), Op::Permute { src, axes }
+            if Arc::ptr_eq(src, &shard) && axes == &[1, 0]));
+    }
+
+    let rangeified = rangeify_with_map(UOp::sink(vec![reduced])).unwrap();
+    assert!(
+        rangeified
+            .sink
+            .toposort_call_aware(true)
+            .iter()
+            .all(|node| !matches!(node.op(), Op::Reduce { num_axes, .. } if *num_axes != 0))
+    );
+}
+
+#[test]
 fn allreduce_lowers_to_opaque_host_call_before_program_codegen() {
-    let shard0 = buffer(4);
-    let allreduce = UOp::allreduce(UOp::mstack(smallvec![shard0.clone(), buffer(4)]), DeviceSpec::Cpu, ReduceOp::Add);
+    let local0 = buffer(4).try_reduce_axis(ReduceOp::Add, vec![0]).unwrap();
+    let local1 = buffer(4).try_reduce_axis(ReduceOp::Add, vec![0]).unwrap();
+    let allreduce = UOp::allreduce(UOp::mstack(smallvec![local0, local1]), DeviceSpec::Cpu, ReduceOp::Add);
     let lowered = graph_rewrite(&lower_allreduce_pm(), allreduce.clone(), &mut ());
     validate_no_unresolved_allreduce(&lowered).unwrap();
 
@@ -284,7 +314,8 @@ fn allreduce_lowers_to_opaque_host_call_before_program_codegen() {
         Op::CustomFunction { kind: svod_ir::CustomFunctionKind::AllReduce { reduce_op: ReduceOp::Add }, .. }
     ));
     assert_eq!(args.len(), 3, "output plus two explicit shard buffers");
-    assert!(Arc::ptr_eq(&args[0], &shard0), "collective output must be a concrete in-place shard buffer");
+    assert!(matches!(args[0].op(), Op::Contiguous { .. }));
+    assert!(Arc::ptr_eq(&args[0], &args[1]), "collective output must alias materialized shard zero");
     assert!(matches!(body.op(), Op::CustomFunction { attrs, .. } if attrs.len() == args.len()));
     assert!(lowered.toposort_call_aware(true).iter().all(|node| !matches!(node.op(), Op::AllReduce { .. })));
 
@@ -294,4 +325,18 @@ fn allreduce_lowers_to_opaque_host_call_before_program_codegen() {
         node.op(),
         Op::CustomFunction { kind: svod_ir::CustomFunctionKind::AllReduce { .. }, .. }
     )));
+}
+
+#[test]
+fn heterogeneous_explicit_shards_are_rejected_before_collective_rewrite() {
+    let float = UOp::new_buffer(DeviceSpec::Cpu, 4, DType::Float32);
+    let integer = UOp::new_buffer(DeviceSpec::Cpu, 4, DType::Int32);
+    let reduced =
+        UOp::multi(UOp::mstack(smallvec![float, integer]), 0).try_reduce_axis(ReduceOp::Add, vec![0]).unwrap();
+
+    let err = match rangeify_with_map(UOp::sink(vec![reduced])) {
+        Ok(_) => panic!("heterogeneous shards must be rejected"),
+        Err(err) => err,
+    };
+    assert!(err.to_string().contains("identical dtype and shape"), "unexpected error: {err}");
 }

@@ -4,11 +4,12 @@
 //! carry a shard range or a tuple-valued device, so rewrites that need either
 //! are deliberately not represented here.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use smallvec::{SmallVec, smallvec};
 use svod_dtype::{DType, ScalarDType};
-use svod_ir::{CallInfo, ConstValue, CustomFunctionKind, Op, ReduceOp, UOp};
+use svod_ir::{CallInfo, ConstValue, CustomFunctionKind, Op, ReduceOp, UOp, UOpKey};
 
 use crate::TypedPatternMatcher;
 
@@ -76,59 +77,58 @@ fn passthrough_unary_wrapper(root: &Arc<UOp>, multi: &Arc<UOp>) -> Option<Arc<UO
 fn reduce_multi(root: &Arc<UOp>, multi: &Arc<UOp>) -> Option<Arc<UOp>> {
     let Op::Reduce { ranges, reduce_op, num_axes, .. } = root.op() else { return None };
     let (local, axis) = multi_axis(multi)?;
-    if axis < *num_axes {
+    if *num_axes == 0 || !ranges.is_empty() {
         return None;
     }
-    Some(UOp::multi(local.reduce_with_num_axes(ranges.clone(), *reduce_op, *num_axes), axis - num_axes))
-}
-
-fn reduce_axis_multi(root: &Arc<UOp>, multi: &Arc<UOp>) -> Option<Arc<UOp>> {
-    let Op::ReduceAxis { reduce_op, axes, .. } = root.op() else { return None };
-    let (local, axis) = multi_axis(multi)?;
-    if axes.contains(&axis) {
-        if !matches!(reduce_op, ReduceOp::Add | ReduceOp::Max) {
-            return None;
-        }
-        let Op::MStack { buffers } = local.op() else { return None };
-        if buffers.len() < 2 {
-            return None;
-        }
-        let device = buffers.first()?.device_spec()?;
-        let mut local_reductions = SmallVec::with_capacity(buffers.len());
-        let widen_dtype = buffers
-            .iter()
-            .map(|shard| match shard.op() {
-                Op::Cast { src, .. } if [DType::Float16, DType::BFloat16].contains(&src.dtype()) => Some(src.dtype()),
-                _ => None,
-            })
-            .collect::<Option<Vec<_>>>()
-            .and_then(|dtypes| dtypes.iter().all(|dtype| dtype == &dtypes[0]).then(|| dtypes[0].clone()));
-
-        for shard in buffers {
-            let reduced = UOp::new(
-                Op::ReduceAxis { src: shard.clone(), reduce_op: *reduce_op, axes: axes.clone() },
-                root.dtype(),
-            );
-            local_reductions.push(match &widen_dtype {
-                Some(dtype) => reduced.cast(dtype.clone()),
-                None => reduced,
-            });
-        }
-        let collective = UOp::allreduce(UOp::mstack(local_reductions), device, *reduce_op);
-        let result = match widen_dtype {
-            Some(_) => collective.cast(root.dtype()),
-            None => collective,
-        };
-        return Some(result.rtag(root.tag().clone()));
+    if axis >= *num_axes {
+        return Some(
+            UOp::multi(local.reduce_with_num_axes(ranges.clone(), *reduce_op, *num_axes), axis - num_axes)
+                .rtag(root.tag().clone()),
+        );
     }
-    let output_axis = axis - axes.iter().filter(|&&reduced_axis| reduced_axis < axis).count();
-    Some(
-        UOp::multi(
-            UOp::new(Op::ReduceAxis { src: local, reduce_op: *reduce_op, axes: axes.clone() }, root.dtype()),
-            output_axis,
-        )
-        .rtag(root.tag().clone()),
-    )
+
+    if !matches!(reduce_op, ReduceOp::Add | ReduceOp::Max) {
+        return None;
+    }
+    let mstacks: Vec<_> = local.toposort().into_iter().filter(|node| matches!(node.op(), Op::MStack { .. })).collect();
+    let [mstack] = mstacks.as_slice() else { return None };
+    let Op::MStack { buffers } = mstack.op() else { unreachable!() };
+    if buffers.len() < 2 {
+        return None;
+    }
+    let expected_dtype = buffers[0].dtype();
+    let expected_shape = buffers[0].shape().ok()??;
+    if buffers.iter().any(|shard| {
+        shard.dtype() != expected_dtype
+            || shard.shape().ok().flatten() != Some(expected_shape)
+            || shard.device_spec().is_none()
+    }) {
+        return None;
+    }
+    let device = buffers.first()?.device_spec()?;
+    let widen_dtype = buffers
+        .iter()
+        .map(|shard| match shard.op() {
+            Op::Cast { src, .. } if [DType::Float16, DType::BFloat16].contains(&src.dtype()) => Some(src.dtype()),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()
+        .and_then(|dtypes| dtypes.iter().all(|dtype| dtype == &dtypes[0]).then(|| dtypes[0].clone()));
+
+    let mut local_reductions = SmallVec::with_capacity(buffers.len());
+    for shard in buffers {
+        #[allow(clippy::mutable_key_type)]
+        let substitutions = HashMap::from([(UOpKey(mstack.clone()), shard.clone())]);
+        let local_shard = local.substitute(&substitutions);
+        let reduced = local_shard.reduce_with_num_axes(ranges.clone(), *reduce_op, *num_axes);
+        local_reductions.push(match &widen_dtype {
+            Some(dtype) => reduced.cast(dtype.clone()),
+            None => reduced,
+        });
+    }
+    let collective = UOp::allreduce(UOp::mstack(local_reductions), device, *reduce_op);
+    let result = if widen_dtype.is_some() { collective.cast(root.dtype()) } else { collective };
+    Some(result.rtag(root.tag().clone()))
 }
 
 fn lower_host_allreduce(root: &Arc<UOp>) -> Option<Arc<UOp>> {
@@ -146,14 +146,17 @@ fn lower_host_allreduce(root: &Arc<UOp>) -> Option<Arc<UOp>> {
         return None;
     }
 
-    // Host staging reads every shard before publishing, so shard zero is a safe
-    // in-place destination and provides a concrete schedule allocation.
-    let output = buffers[0].clone();
+    // Host staging reads every shard before publishing, so materialized shard
+    // zero is a safe in-place destination. The output and first input must be
+    // the same UOp or schedule canonicalization can select the pre-reduction
+    // source allocation as the callback destination.
+    let materialized: SmallVec<[Arc<UOp>; 4]> = buffers.iter().map(|buffer| buffer.contiguous()).collect();
+    let output = materialized[0].clone();
     let mut args = SmallVec::with_capacity(buffers.len() + 1);
     args.push(output.clone());
-    args.extend(buffers.iter().map(|buffer| buffer.contiguous()));
+    args.extend(materialized.iter().cloned());
     let mut formals = smallvec![UOp::placeholder_like(&output, 0, svod_ir::AddrSpace::Global).ok()?];
-    for (slot, buffer) in buffers.iter().enumerate() {
+    for (slot, buffer) in materialized.iter().enumerate() {
         formals.push(UOp::placeholder_like(buffer, slot + 1, svod_ir::AddrSpace::Global).ok()?);
     }
     let body = UOp::custom_function(CustomFunctionKind::AllReduce { reduce_op: *reduce_op }, formals);
@@ -249,8 +252,6 @@ pub fn multi_pm() -> TypedPatternMatcher {
                 let Op::MSelect { device_index, .. } = selected.op() else { unreachable!() };
                 move_mselect_before_movement(selected, buffer, *device_index)
             },
-        root @ ReduceAxis { src: multi @ Multi { src: _ }, reduce_op: _, axes: _ }
-            => |root, multi| reduce_axis_multi(root, multi),
         root @ Reduce { src: multi @ Multi { src: _ }, ranges: _, reduce_op: _, num_axes: _ }
             => |root, multi| reduce_multi(root, multi),
         root @ Permute { src: multi @ Multi { src: _ }, axes: _ }
@@ -320,6 +321,22 @@ fn classify_supported_form(node: &Arc<UOp>) -> svod_ir::Result<()> {
                 operation: "MULTI",
                 reason: "shard axis is outside the source shape",
             });
+        }
+        if let Op::MStack { buffers } = src.op()
+            && let Some(first) = buffers.first()
+        {
+            let expected_dtype = first.dtype();
+            let expected_shape = first.shape()?.cloned();
+            if buffers.iter().any(|shard| {
+                shard.dtype() != expected_dtype
+                    || shard.shape().ok().flatten() != expected_shape.as_ref()
+                    || shard.device_spec().is_none()
+            }) {
+                return Err(svod_ir::Error::MultiUnsupported {
+                    operation: "MULTI",
+                    reason: "explicit shards must have identical dtype and shape with concrete devices",
+                });
+            }
         }
         return Ok(());
     }

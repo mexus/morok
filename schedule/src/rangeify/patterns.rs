@@ -51,14 +51,6 @@ use super::transforms::transform_sources_with_bufferize;
 // HELPER FUNCTIONS (private)
 // ============================================================================
 
-/// Check if a shape UOp represents a scalar (empty or Stack with 0 elements).
-fn is_scalar_shape(shape: &Arc<UOp>) -> bool {
-    match shape.op() {
-        Op::Stack { sources } => sources.is_empty(),
-        _ => false,
-    }
-}
-
 /// Check if a UOp has zero total size (any shape dimension is 0).
 fn has_zero_size(uop: &Arc<UOp>) -> bool {
     match uop.shape() {
@@ -86,8 +78,6 @@ pub fn is_elementwise(uop: &Arc<UOp>) -> bool {
 /// This handles schedule-specific cleanup:
 /// - DETACH removal (gradient computation marker no longer needed)
 /// - CONTIGUOUS_BACKWARD removal (gradient computation marker no longer needed)
-/// - RESHAPE to scalar (empty shape) removal
-/// - RESHAPE on REDUCE removal (REDUCE output doesn't need reshaping)
 /// - Zero-size tensor folding
 pub fn early_rewrites() -> TypedPatternMatcher {
     crate::patterns! {
@@ -100,24 +90,10 @@ pub fn early_rewrites() -> TypedPatternMatcher {
         ContiguousBackward(x) ~> |x| x.clone(),
         Copy { src, device } if src.device_spec().as_ref() == Some(device)
             ~> |src| src.clone(),
-        Reshape { src, new_shape } => |src, new_shape| {
-            // RESHAPE to scalar - always remove
-            if is_scalar_shape(new_shape) {
-                return Some(src.clone());
-            }
-
-            // RESHAPE on REDUCE - the reduce output is already "indexed" by its ranges
-            // The reshape just changes the view of the buffer, which can be done in STORE indexing
-            if matches!(src.op(), Op::Reduce { .. }) {
-                return Some(src.clone());
-            }
-
-            None
-        },
-
         // Reduce of zero-sized input → identity element.
-        reduce @ ReduceAxis { src: x } if has_zero_size(x) && !has_zero_size(reduce) => {
-            let Op::ReduceAxis { reduce_op, .. } = reduce.op() else { return None };
+        reduce @ Reduce { src: x, ranges: _, reduce_op: _, num_axes: _ }
+            if has_zero_size(x) && !has_zero_size(reduce) => {
+            let Op::Reduce { reduce_op, .. } = reduce.op() else { return None };
             Some(crate::symbolic::dce::reduce_identity(*reduce_op, reduce.dtype()))
         },
 
@@ -136,15 +112,16 @@ pub fn early_rewrites() -> TypedPatternMatcher {
 /// Create patterns for applying rangeify transformation with IndexingContext.
 ///
 /// Pattern order:
-/// 1. ReduceAxis → REDUCE conversion
+/// 1. Tensor REDUCE → ranged REDUCE conversion
 /// 2. PAD → WHERE conversion (convert_pad_to_where_to_keep_behavior_local)
 /// 3. ALL ops get source bufferization (including movement ops)
 /// 4. Movement ops get removed (simple - just return source)
 pub fn apply_rangeify_patterns() -> TypedPatternMatcher<IndexingContext> {
     crate::patterns! {
         @context IndexingContext;
-        // ReduceAxis conversion MUST come first - before stage wraps it
-        x @ ReduceAxis { src: _ } => |x, ctx| convert_reduceaxis_with_context(x, ctx),
+        // Tensor REDUCE conversion MUST come first, before STAGE wraps it.
+        x @ Reduce { src: _, ranges: _, reduce_op: _, num_axes: _ }
+            => |x, ctx| convert_reduce_with_context(x, ctx),
         // PAD → WHERE conversion BEFORE bufferization.
         x @ Pad { src: _, begin_pads: _, end_pads: _ } => |x, ctx| convert_pad_to_where(x, ctx),
         // ALL ops (including movement) get source bufferization.
@@ -206,25 +183,25 @@ fn remove_movement_op(x: &Arc<UOp>, ctx: &mut IndexingContext) -> Option<Arc<UOp
     None
 }
 
-/// Convert ReduceAxis → REDUCE using IndexingContext.
+/// Convert tensor-form REDUCE to ranged loop-form REDUCE using IndexingContext.
 ///
-/// - Filter input ranges by axis index (no AxisType validation needed)
-/// - Create REDUCE if we have ranges, return source otherwise
+/// - Tensor form has no ranges and `num_axes > 0`.
+/// - Loop form carries the leading input ranges and has `num_axes == 0`.
 /// - Transfer range_map + realize_map to new identity
-fn convert_reduceaxis_with_context(x: &Arc<UOp>, ctx: &mut IndexingContext) -> Option<Arc<UOp>> {
-    let Op::ReduceAxis { src, reduce_op, axes } = x.op() else {
+fn convert_reduce_with_context(x: &Arc<UOp>, ctx: &mut IndexingContext) -> Option<Arc<UOp>> {
+    let Op::Reduce { src, ranges, reduce_op, num_axes } = x.op() else {
         return None;
     };
+    if *num_axes == 0 {
+        return None;
+    }
+    debug_assert!(ranges.is_empty(), "tensor-form REDUCE must not already have loop ranges");
 
     let (input_ranges, output_ranges) = ctx.get_ranges(x)?.clone();
-
-    // Filter ranges by axis index (no AxisType check needed).
-    let reduce_ranges: SmallVec<[Arc<UOp>; 4]> =
-        input_ranges.iter().enumerate().filter(|(i, _)| axes.contains(i)).map(|(_, r)| Arc::clone(r)).collect();
-
-    // Determine target: REDUCE if we have ranges, source otherwise
-    let target = if reduce_ranges.is_empty() { Arc::clone(src) } else { src.reduce(reduce_ranges, *reduce_op) };
-    // Preserve tag from ReduceAxis.
+    let bx_sources = transform_sources_with_bufferize(x, ctx).unwrap_or_else(|| x.op().sources().into_iter().collect());
+    let indexed_src = bx_sources.first().cloned().unwrap_or_else(|| src.clone());
+    let reduce_ranges: SmallVec<[Arc<UOp>; 4]> = input_ranges.iter().take(*num_axes).cloned().collect();
+    let target = indexed_src.reduce(reduce_ranges, *reduce_op);
     let target = if let Some(t) = x.tag() { target.with_tag(t.clone()) } else { target };
 
     // Transfer context to new identity (range_map + realize_map only)
@@ -506,12 +483,13 @@ fn remove_bufferize(
 // REDUCTION SIMPLIFY PATTERNS
 // ============================================================================
 
-/// Pattern matcher for splitting large ReduceAxis operations.
-/// Must run BEFORE ReduceAxis → REDUCE conversion (Step 2.5).
+/// Pattern matcher for splitting large tensor-form REDUCE operations.
+/// Must run before tensor REDUCE → ranged REDUCE conversion.
 pub fn split_reduceop_patterns() -> TypedPatternMatcher<SplitReduceOpConfig> {
     crate::patterns! {
         @context SplitReduceOpConfig;
-        reduce @ ReduceAxis { src: _ } => |reduce, ctx| split_reduceop(reduce, ctx),
+        reduce @ Reduce { src: _, ranges: _, reduce_op: _, num_axes: _ }
+            => |reduce, ctx| split_reduceop(reduce, ctx),
     }
 }
 

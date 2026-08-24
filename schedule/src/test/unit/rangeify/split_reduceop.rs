@@ -156,7 +156,7 @@ fn test_split_reduceop_preserves_reduce_op() {
         let has_reduce_op = transformed.toposort().iter().any(|node| {
             matches!(
                 node.op(),
-                Op::ReduceAxis { reduce_op: op, .. } if *op == reduce_op
+                Op::Reduce { reduce_op: op, .. } if *op == reduce_op
             )
         });
         assert!(has_reduce_op, "Reduce op {:?} should be preserved", reduce_op);

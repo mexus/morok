@@ -62,6 +62,24 @@ fn test_run_rangeify_simple_const() {
 }
 
 #[test]
+fn test_run_rangeify_converts_tensor_reduce_to_loop_reduce() {
+    let source = UOp::new_buffer(DeviceSpec::Cpu, 6, DType::Float32)
+        .try_reshape(&smallvec![svod_ir::SInt::Const(2), svod_ir::SInt::Const(3)])
+        .unwrap();
+    let tensor_reduce = source.try_reduce_axis(ReduceOp::Add, vec![1]).unwrap();
+    let (rangeified, _ctx) = run_rangeify(UOp::sink(vec![tensor_reduce.contiguous()])).unwrap();
+
+    let reductions: Vec<_> =
+        rangeified.toposort().into_iter().filter(|node| matches!(node.op(), Op::Reduce { .. })).collect();
+    assert!(!reductions.is_empty());
+    assert!(
+        reductions
+            .iter()
+            .all(|node| { matches!(node.op(), Op::Reduce { ranges, num_axes: 0, .. } if !ranges.is_empty()) })
+    );
+}
+
+#[test]
 fn test_run_rangeify_preserves_call_and_function_bodies_by_default() {
     let p0 = UOp::param(0, 8, DType::Float32, None);
     let reduced = p0.try_reduce_axis(ReduceOp::Add, vec![0]).expect("reduce axis should construct");
@@ -73,7 +91,7 @@ fn test_run_rangeify_preserves_call_and_function_bodies_by_default() {
         panic!("expected CALL root after run_rangeify")
     };
     assert!(
-        call_body.toposort().iter().any(|u| matches!(u.op(), Op::ReduceAxis { .. })),
+        call_body.toposort().iter().any(|u| matches!(u.op(), Op::Reduce { num_axes: 1, .. })),
         "run_rangeify should not rewrite CALL body by default"
     );
 
@@ -83,7 +101,7 @@ fn test_run_rangeify_preserves_call_and_function_bodies_by_default() {
         panic!("expected FUNCTION root after run_rangeify")
     };
     assert!(
-        function_body.toposort().iter().any(|u| matches!(u.op(), Op::ReduceAxis { .. })),
+        function_body.toposort().iter().any(|u| matches!(u.op(), Op::Reduce { num_axes: 1, .. })),
         "run_rangeify should not rewrite FUNCTION body by default"
     );
 }

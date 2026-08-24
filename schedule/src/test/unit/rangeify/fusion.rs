@@ -123,7 +123,7 @@ fn test_reduce_fusion_basic() {
     let reshaped = UOp::new(Op::Reshape { src: a, new_shape }, DType::Float32);
 
     // Reduce on axis 1
-    let reduced = UOp::new(Op::ReduceAxis { src: reshaped, axes: vec![1], reduce_op: ReduceOp::Add }, DType::Float32);
+    let reduced = reshaped.try_reduce_axis(ReduceOp::Add, vec![1]).unwrap();
 
     let sink = UOp::sink(vec![reduced]);
 
@@ -144,7 +144,7 @@ fn test_reduce_binop_fusion() {
     let reshaped = UOp::new(Op::Reshape { src: add, new_shape }, DType::Float32);
 
     // Reduce
-    let reduced = UOp::new(Op::ReduceAxis { src: reshaped, axes: vec![1], reduce_op: ReduceOp::Add }, DType::Float32);
+    let reduced = reshaped.try_reduce_axis(ReduceOp::Add, vec![1]).unwrap();
 
     let sink = UOp::sink(vec![reduced]);
 

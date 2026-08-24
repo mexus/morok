@@ -28,8 +28,8 @@ FIRST="$TMP/first"
 SECOND="$TMP/second"
 mkdir "$FIRST" "$SECOND"
 
-# EVID-02 is a strict independent-equivalent safety gate even while broader
-# EVID-01B production graph identity remains recorded below as known gaps.
+# EVID-02 is an independent-equivalent safety gate alongside strict canonical
+# graph identity.
 for artifacts in "$FIRST" "$SECOND"; do
   cargo run --quiet --manifest-path "$ROOT/Cargo.toml" -p svod-tensor --example evid02_safety \
     >"$artifacts/evid02-safety-rust.json"
@@ -46,7 +46,7 @@ printf 'EVID-02 padded-WMMA safety stages: strict parity ok\n'
 
 for fixture in weak_int_add weak_float_neg_zero invalid_where scalar_stack shaped_stack buffer scalar_load gated_load \
                scalar_store mixed_valid_load copy allreduce multi_output_call local_wmma_staging \
-               range_split_outer range_split_inner range_split_nested program_info symbolic_function; do
+               range_split_outer range_split_inner range_split_nested program_info symbolic_function padded_reduction; do
   if [[ "$fixture" == "program_info" ]]; then stage_args=(--stage program); else stage_args=(); fi
   for artifacts in "$FIRST" "$SECOND"; do
     cargo run --quiet --manifest-path "$ROOT/Cargo.toml" -p svod-ir --example canonical_fixture -- "$fixture" \
@@ -65,6 +65,7 @@ done
 
 MANIFEST="$ROOT/scripts/CANONICAL_KNOWN_GAPS.txt"
 GENERATED_MANIFEST="$TMP/known-gaps.txt"
+: >"$GENERATED_MANIFEST"
 PRODUCTION_GAPS=()
 
 record_mismatch() {
@@ -96,19 +97,6 @@ record_mismatch() {
   cat "$first_diff" >>"$GENERATED_MANIFEST"
   printf '\n' >>"$GENERATED_MANIFEST"
 }
-
-for fixture in padded_reduction; do
-  for artifacts in "$FIRST" "$SECOND"; do
-    cargo run --quiet --manifest-path "$ROOT/Cargo.toml" -p svod-ir --example canonical_fixture -- "$fixture" \
-      >"$artifacts/$fixture-rust.json"
-    (cd "$REFERENCE" && uv run python ../../scripts/tinygrad-canonical.py "$fixture") \
-      >"$artifacts/$fixture-python.json"
-  done
-  record_mismatch expected-failure "$fixture" REDUCE-01 \
-    "$FIRST/$fixture-rust.json" "$FIRST/$fixture-python.json" \
-    "$SECOND/$fixture-rust.json" "$SECOND/$fixture-python.json"
-  printf 'canonical expected failure: %s (REDUCE-01): exact mismatch ok\n' "$fixture"
-done
 
 for artifacts in "$FIRST" "$SECOND"; do
   SVOD_CAPTURE_CANONICAL_STAGE=kernel_ast \
@@ -163,8 +151,10 @@ for stage in "${PRODUCTION_STAGES[@]}"; do
 done
 
 # record_mismatch separates sections with a blank line; keep a normal single
-# trailing newline so the checked-in text manifest is editor-friendly.
-truncate -s -1 "$GENERATED_MANIFEST"
+# trailing newline when the manifest is non-empty.
+if [[ -s "$GENERATED_MANIFEST" ]]; then
+  truncate -s -1 "$GENERATED_MANIFEST"
+fi
 
 if [[ ! -f "$MANIFEST" ]] || ! cmp -s "$MANIFEST" "$GENERATED_MANIFEST"; then
   printf 'canonical mismatch manifest differs from %s\n' "$MANIFEST" >&2
